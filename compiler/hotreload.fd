@@ -1,0 +1,635 @@
+// hotreload.fd -- Hot Reload System
+// Ported from src/hotreload.rs.
+//
+// Provides fast development iteration by:
+//   1. Function-level change detection: hash IR to detect which functions changed
+//   2. State preservation: global state survives reloads via temp file
+//   3. Watch mode: auto-recompiles and runs on file change
+//   4. Debugger integration: breakpoints and stepping tracking (structural)
+//   5. JIT execution: compile_and_run uses the IR interpreter to run source
+//
+// Native JIT (ELF64 + process execution) is wired into compiler/compiler.fd.
+// This module provides compile_and_run (interpreter-based), change detection,
+// state preservation, watcher, and debugger state tracking.
+
+module compiler::hotreload;
+
+use core;
+use vec;
+use string;
+use compiler::ir;
+use compiler::compiler;
+use compiler::interp;
+
+// === Function Change Detection ===
+
+/// A snapshot of function hashes from a compilation.
+/// Used to detect which functions changed between reloads.
+pub struct FunctionSnapshot {
+    pub hashes: Vec<(str, i64)>,
+}
+
+pub fn FunctionSnapshot_new() -> FunctionSnapshot {
+    return FunctionSnapshot { hashes: Vec::new() };
+}
+
+/// Look up a hash by function name. Returns 0 if not found.
+fn FunctionSnapshot_get_hash(self: &FunctionSnapshot, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < self.hashes.len() {
+        var entry: (str, i64) = self.hashes.get(i);
+        var (e0, e1) = entry;
+        if str_equal(e0, name) {
+            return e1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// Insert or update a hash for a function name.
+fn FunctionSnapshot_set_hash(self: &mut FunctionSnapshot, name: str, hash: i64) -> void {
+    var i: i64 = 0;
+    while i < self.hashes.len() {
+        var entry: (str, i64) = self.hashes.get(i);
+        var (s0, s1) = entry;
+        if str_equal(s0, name) {
+            self.hashes.set(i, (name, hash));
+            return;
+        }
+        i = i + 1;
+    }
+    self.hashes.push((name, hash));
+}
+
+/// Add a function hash to the snapshot.
+pub fn FunctionSnapshot_add(self: &mut FunctionSnapshot, name: str, content: str) -> void {
+    var hash: i64 = hash_str(content);
+    FunctionSnapshot_set_hash(self, name, hash);
+}
+
+/// Compare this snapshot with a previous one and return the diff.
+pub fn FunctionSnapshot_diff(self: &FunctionSnapshot, prev: &FunctionSnapshot) -> FunctionDiff {
+    var added: Vec<str> = Vec::new();
+    var modified: Vec<str> = Vec::new();
+    var removed: Vec<str> = Vec::new();
+
+    // Find added and modified
+    var i: i64 = 0;
+    while i < self.hashes.len() {
+        var entry: (str, i64) = self.hashes.get(i);
+        var (d0, d1) = entry;
+        var prev_hash: i64 = FunctionSnapshot_get_hash(prev, d0);
+        if prev_hash == 0 && !FunctionSnapshot_contains(prev, d0) {
+            added.push(d0);
+        } else if prev_hash != d1 {
+            modified.push(d0);
+        }
+        i = i + 1;
+    }
+
+    // Find removed
+    var j: i64 = 0;
+    while j < prev.hashes.len() {
+        var entry: (str, i64) = prev.hashes.get(j);
+        var (r0, r1) = entry;
+        if !FunctionSnapshot_contains(self, r0) {
+            removed.push(r0);
+        }
+        j = j + 1;
+    }
+
+    // Sort (simple bubble sort for determinism)
+    sort_str_vec(added);
+    sort_str_vec(modified);
+    sort_str_vec(removed);
+
+    return FunctionDiff_new(added, modified, removed);
+}
+
+fn FunctionSnapshot_contains(self: &FunctionSnapshot, name: str) -> bool {
+    var i: i64 = 0;
+    while i < self.hashes.len() {
+        var (c0, c1) = self.hashes.get(i);
+        if str_equal(c0, name) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Get all function names in this snapshot.
+pub fn FunctionSnapshot_function_names(self: &FunctionSnapshot) -> Vec<str> {
+    var result: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < self.hashes.len() {
+        var (fn0, fn1) = self.hashes.get(i);
+        result.push(fn0);
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Build a snapshot from an IrModule by hashing each function's content.
+/// Adapted from src/hotreload.rs:37 (FunctionSnapshot::from_l2).
+///
+/// The Rust reference builds from an L2Module (PIR L2), hashing each
+/// function's debug repr (name, params, ret_ty, entry, blocks, values).
+/// In the self-hosted Fides compiler, we adapt this to build from an IrModule
+/// (the SSA IR before PIR lowering) instead, because:
+///   1. L2Module types in compiler/pir.fd require additional PIR pipeline
+///      imports (lower_ir_to_l1, lower_l1_to_l2) that add complexity
+///   2. The IrModule is directly available from lower_to_ir_module()
+///   3. The IR captures the same function-level structure (name, params,
+///      return type, blocks, instructions, value metas)
+///
+/// The content string for each function includes:
+///   - function name
+///   - return type (via ir_type_to_str)
+///   - entry block ID
+///   - each param: value ID + type
+///   - each block: block ID + instruction value IDs + block param IDs/types
+///   - each instruction: inst_kind_name (operation kind)
+///   - each value meta: value ID + type
+/// This ensures the hash changes when any structural element of the function
+/// changes, providing equivalent change detection to the L2-based approach.
+pub fn FunctionSnapshot_from_ir(module: &IrModule) -> FunctionSnapshot {
+    var snap: FunctionSnapshot = FunctionSnapshot_new();
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var entry: IrFunctionEntry = module.functions.get(fi);
+        var func: IrFunction = entry.func;
+        var name: str = entry.name;
+
+        // Build content string from function structure
+        var content: str = name + "|" + ir_type_to_str(func.ret_ty) + "|" + int_to_str(func.entry);
+
+        // Hash params
+        var pi: i64 = 0;
+        while pi < func.params.len() {
+            var param: ValueIdType = func.params.get(pi);
+            content = content + "|p" + int_to_str(param.id) + ":" + ir_type_to_str(param.ty);
+            pi = pi + 1;
+        }
+
+        // Hash blocks and their instructions
+        var bi: i64 = 0;
+        while bi < func.blocks.len() {
+            var block: BasicBlock = func.blocks.get(bi);
+            content = content + "|bb" + int_to_str(block.id);
+            // Block params
+            var bpi: i64 = 0;
+            while bpi < block.params.len() {
+                var bp: ValueIdType = block.params.get(bpi);
+                content = content + ":" + int_to_str(bp.id) + ir_type_to_str(bp.ty);
+                bpi = bpi + 1;
+            }
+            // Block instructions (value IDs + kind names)
+            var ii: i64 = 0;
+            while ii < block.instructions.len() {
+                var inst_id: i64 = block.instructions.get(ii);
+                content = content + "," + int_to_str(inst_id);
+                match IrFunction_get_inst(&func, inst_id) {
+                    OptInst::Some(inst) => {
+                        content = content + inst_kind_name(&inst);
+                    }
+                    OptInst::None => {}
+                }
+                ii = ii + 1;
+            }
+            bi = bi + 1;
+        }
+
+        // Hash value metas (types of all values)
+        var vi: i64 = 0;
+        while vi < func.value_metas.len() {
+            var vm: ValueIdMeta = func.value_metas.get(vi);
+            content = content + "|v" + int_to_str(vm.id) + ":" + ir_type_to_str(vm.meta.ty);
+            vi = vi + 1;
+        }
+
+        var hash: i64 = hash_str(content);
+        FunctionSnapshot_set_hash(&mut snap, name, hash);
+        fi = fi + 1;
+    }
+    return snap;
+}
+
+/// The result of comparing two function snapshots.
+pub struct FunctionDiff {
+    pub added: Vec<str>,
+    pub modified: Vec<str>,
+    pub removed: Vec<str>,
+}
+
+pub fn FunctionDiff_new(added: Vec<str>, modified: Vec<str>, removed: Vec<str>) -> FunctionDiff {
+    return FunctionDiff {
+        added: added,
+        modified: modified,
+        removed: removed,
+    };
+}
+
+/// Returns true if nothing changed.
+pub fn FunctionDiff_is_empty(self: &FunctionDiff) -> bool {
+    return self.added.len() == 0 && self.modified.len() == 0 && self.removed.len() == 0;
+}
+
+/// Total number of changed functions.
+pub fn FunctionDiff_total_changes(self: &FunctionDiff) -> i64 {
+    return self.added.len() + self.modified.len() + self.removed.len();
+}
+
+/// Simple FNV-1a hash for strings.
+pub fn hash_str(s: str) -> i64 {
+    var hash: i64 = 0xcbf29ce484222325;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        hash = hash ^ str_byte_at(s, i);
+        hash = hash * 0x100000001b3;
+        i = i + 1;
+    }
+    return hash;
+}
+
+// === Native JIT Execution ===
+
+/// Result of a JIT execution.
+/// Ported from src/hotreload.rs:128.
+///
+/// In the Rust reference, this is the result of compiling to a native ELF64
+/// binary and running it as a child process. In the self-hosted Fides compiler,
+/// we adapt this to use the IR interpreter instead of native code generation,
+/// since the full PIR → codegen → ELF64 pipeline is wired into
+/// compiler/compiler.fd. The fields retain the same meaning:
+///   - exit_code: interpreter exit code (0 = success, 1 = error)
+///   - stdout/stderr: captured output (structural; interpreter prints directly)
+///   - compile_time_ms: time to lower source to IR
+///   - exec_time_ms: time to run the interpreter
+///   - binary_size: 0 (no native binary produced in interpreter mode)
+pub struct JitResult {
+    pub exit_code: i32,
+    pub stdout: str,
+    pub stderr: str,
+    pub compile_time_ms: i64,
+    pub exec_time_ms: i64,
+    pub binary_size: i64,
+}
+
+pub fn JitResult_new(
+    exit_code: i32,
+    stdout: str,
+    stderr: str,
+    compile_time_ms: i64,
+    exec_time_ms: i64,
+    binary_size: i64,
+) -> JitResult {
+    return JitResult {
+        exit_code: exit_code,
+        stdout: stdout,
+        stderr: stderr,
+        compile_time_ms: compile_time_ms,
+        exec_time_ms: exec_time_ms,
+        binary_size: binary_size,
+    };
+}
+
+/// Compile source code and run it via the IR interpreter.
+/// Adapted from src/hotreload.rs:146 (compile_and_run).
+///
+/// The Rust reference compiles to a native ELF64 executable and runs it as a
+/// child process. In the self-hosted Fides compiler, we adapt this to:
+///   1. Call lower_to_ir_module(source) to build IR (from compiler::compiler)
+///   2. Run the IR interpreter via interpret_ir_module (from compiler::interp)
+///   3. Return a JitResult with success/failure info
+///
+/// The `source_path` and `do_opt` parameters are accepted for API compatibility
+/// with the Rust reference but are not used in interpreter mode (optimization
+/// is handled by the PIR pipeline in compiler.fd when using native codegen).
+pub fn compile_and_run(source: str, source_path: str, do_opt: bool) -> JitResult {
+    var compile_start: i64 = p_clock_now_ms();
+
+    var result: ResultIrModule = lower_to_ir_module(source);
+    var exit_code: i32 = 0;
+    var stderr_msg: str = "";
+
+    match result {
+        ResultIrModule::Err(errs) => {
+            var msg: str = "Compilation error:\n";
+            var i: i64 = 0;
+            while i < errs.len() {
+                msg = msg + errs.get(i) + "\n";
+                i = i + 1;
+            }
+            stderr_msg = msg;
+            exit_code = 1;
+        }
+        ResultIrModule::Ok(ir_mod) => {
+            var compile_end: i64 = p_clock_now_ms();
+            var compile_time: i64 = compile_end - compile_start;
+
+            var exec_start: i64 = p_clock_now_ms();
+            var interp_exit: i64 = interpret_ir_module(ir_mod);
+            var exec_end: i64 = p_clock_now_ms();
+            var exec_time: i64 = exec_end - exec_start;
+
+            exit_code = interp_exit;
+            return JitResult_new(interp_exit, "", "", compile_time, exec_time, 0);
+        }
+    }
+
+    var compile_end: i64 = p_clock_now_ms();
+    var compile_time: i64 = compile_end - compile_start;
+    return JitResult_new(exit_code, "", stderr_msg, compile_time, 0, 0);
+}
+
+// === State Preservation ===
+
+/// State that persists across hot reloads.
+/// Stored in a temp file so it survives between child process executions.
+pub struct PersistentState {
+    pub state_file: str,
+    pub data: Vec<(str, str)>,
+}
+
+pub fn PersistentState_for_source(source_path: str) -> PersistentState {
+    var hash: i64 = hash_str(source_path);
+    var state_file: str = "/tmp/pledge_state_" + int_to_str(hash) + ".json";
+    var state: PersistentState = PersistentState {
+        state_file: state_file,
+        data: Vec::new(),
+    };
+    PersistentState_load(&mut state);
+    return state;
+}
+
+/// Load state from the temp file.
+pub fn PersistentState_load(self: &mut PersistentState) -> void {
+    var content: str = p_file_read(self.state_file);
+    if str_len(content) == 0 { return; }
+    // Simple line-based format: key=value
+    var lines: Vec<str> = str_lines(content);
+    var i: i64 = 0;
+    while i < lines.len() {
+        var line: str = lines.get(i);
+        var eq_pos: i64 = str_find_char(line, "=");
+        if eq_pos >= 0 {
+            var key: str = str_slice(line, 0, eq_pos);
+            var value: str = str_slice(line, eq_pos + 1, str_len(line));
+            self.data.push((key, value));
+        }
+        i = i + 1;
+    }
+}
+
+/// Save state to the temp file.
+pub fn PersistentState_save(self: &PersistentState) -> void {
+    var content: str = "";
+    var i: i64 = 0;
+    while i < self.data.len() {
+        var entry: (str, str) = self.data.get(i);
+        var (p0, p1) = entry;
+        if i > 0 { content = content + "\n"; }
+        content = content + p0 + "=" + p1;
+        i = i + 1;
+    }
+    p_file_write(self.state_file, content);
+}
+
+/// Set a state value.
+pub fn PersistentState_set(self: &mut PersistentState, key: str, value: str) -> void {
+    var i: i64 = 0;
+    while i < self.data.len() {
+        var (d0, d1) = self.data.get(i);
+        if str_equal(d0, key) {
+            self.data.set(i, (key, value));
+            return;
+        }
+        i = i + 1;
+    }
+    self.data.push((key, value));
+}
+
+/// Get a state value. Returns empty string if not found.
+pub fn PersistentState_get(self: &PersistentState, key: str) -> str {
+    var i: i64 = 0;
+    while i < self.data.len() {
+        var entry: (str, str) = self.data.get(i);
+        var (g0, g1) = entry;
+        if str_equal(g0, key) {
+            return g1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// Clear all state.
+pub fn PersistentState_clear(self: &mut PersistentState) -> void {
+    var new_data: Vec<(str, str)> = Vec::new();
+    self.data = new_data;
+    p_file_remove(self.state_file);
+}
+
+// === Watch Mode ===
+
+/// File watcher: monitors source files for changes.
+pub struct Watcher {
+    pub files: Vec<(str, i64)>,  // (path, last_modified_ms)
+}
+
+pub fn Watcher_new() -> Watcher {
+    return Watcher { files: Vec::new() };
+}
+
+/// Add a file to watch
+pub fn Watcher_watch(self: &mut Watcher, path: str) -> void {
+    var modified: i64 = p_file_modified_ms(path);
+    self.files.push((path, modified));
+}
+
+/// Check all watched files for changes. Returns index of first changed file, or -1.
+pub fn Watcher_poll(self: &mut Watcher) -> i64 {
+    var i: i64 = 0;
+    while i < self.files.len() {
+        var entry: (str, i64) = self.files.get(i);
+        var (w0, w1) = entry;
+        var modified: i64 = p_file_modified_ms(w0);
+        if modified != w1 {
+            self.files.set(i, (w0, modified));
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Run the watcher loop, polling at the given interval (in milliseconds).
+/// Adapted from src/hotreload.rs:328 (Watcher::run).
+///
+/// The Rust reference runs an infinite loop calling self.poll() and sleeping
+/// between iterations. In the self-hosted Fides compiler, we adapt this to:
+///   1. Loop with a simple counter limit (max_iterations) to avoid infinite
+///      loops in case of issues (no thread::sleep available, and an infinite
+///      loop would hang the compiler process)
+///   2. Call Watcher_poll to check for changes
+///   3. If changes detected (poll returns >= 0), call compile_and_run on the
+///      changed file's source
+///   4. Return the number of recompilations triggered
+///
+/// The `interval_ms` parameter is accepted for API compatibility but is not
+/// used (no sleep facility available in the Fides runtime).
+pub fn Watcher_run(self: &mut Watcher, interval_ms: i64) -> i64 {
+    var max_iterations: i64 = 1000;
+    var recompilations: i64 = 0;
+    var iter: i64 = 0;
+    while iter < max_iterations {
+        var changed_idx: i64 = Watcher_poll(self);
+        if changed_idx >= 0 {
+            // A file changed — read it and recompile
+            var entry: (str, i64) = self.files.get(changed_idx);
+            var (path, mtime) = entry;
+            var source: str = p_file_read(path);
+            if str_len(source) > 0 {
+                var result: JitResult = compile_and_run(source, path, false);
+                recompilations = recompilations + 1;
+            }
+        }
+        iter = iter + 1;
+    }
+    return recompilations;
+}
+
+// === Debugger Integration ===
+
+/// Debug state for the hot-reload debugger.
+/// Tracks call stack and current position for debugging hot-reloaded code.
+pub struct Debugger {
+    pub current_function: str,
+    pub has_current: bool,
+    pub current_offset: i64,
+    pub step_into: bool,
+    pub call_stack: Vec<str>,
+}
+
+pub fn Debugger_new() -> Debugger {
+    return Debugger {
+        current_function: "",
+        has_current: false,
+        current_offset: 0,
+        step_into: false,
+        call_stack: Vec::new(),
+    };
+}
+
+/// Enter a function (push onto call stack)
+pub fn Debugger_enter_function(self: &mut Debugger, name: str) -> void {
+    self.call_stack.push(name);
+    self.current_function = name;
+    self.has_current = true;
+    self.current_offset = 0;
+}
+
+/// Exit the current function (pop from call stack)
+pub fn Debugger_exit_function(self: &mut Debugger) -> void {
+    if self.call_stack.len() > 0 {
+        self.call_stack.pop();
+    }
+    if self.call_stack.len() > 0 {
+        self.current_function = self.call_stack.get(self.call_stack.len() - 1);
+        self.has_current = true;
+    } else {
+        self.current_function = "";
+        self.has_current = false;
+    }
+    self.current_offset = 0;
+}
+
+/// Advance the instruction pointer
+pub fn Debugger_step(self: &mut Debugger) -> void {
+    self.current_offset = self.current_offset + 1;
+}
+
+/// Get the current call stack depth
+pub fn Debugger_stack_depth(self: &Debugger) -> i64 {
+    return self.call_stack.len();
+}
+
+/// Get the current function name
+pub fn Debugger_current_function(self: &Debugger) -> str {
+    return self.current_function;
+}
+
+/// Get the current instruction offset
+pub fn Debugger_current_offset(self: &Debugger) -> i64 {
+    return self.current_offset;
+}
+
+// --- Local helpers ---
+
+fn sort_str_vec(v: Vec<str>) -> void {
+    // Simple bubble sort
+    var n: i64 = v.len();
+    var i: i64 = 0;
+    while i < n {
+        var j: i64 = 0;
+        while j < n - i - 1 {
+            if str_compare(v.get(j), v.get(j + 1)) > 0 {
+                var tmp: str = v.get(j);
+                v.set(j, v.get(j + 1));
+                v.set(j + 1, tmp);
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn int_to_str(n: i64) -> str {
+    if n == 0 { return "0"; }
+    var negative: bool = n < 0;
+    var num: i64 = 0;
+    if negative { num = -n; } else { num = n; }
+    var buf: str = "";
+    while num > 0 {
+        var digit: i64 = num % 10;
+        buf = char_from_digit(digit) + buf;
+        num = num / 10;
+    }
+    if negative { buf = "-" + buf; }
+    return buf;
+}
+
+pub fn char_from_digit(d: i64) -> str {
+    var buf: Vec<i64> = Vec::new();
+    buf.push(48 + d);
+    return str_from_bytes(buf);
+}
+
+fn str_lines(s: str) -> Vec<str> {
+    var result: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    var start: i64 = 0;
+    while i < str_len(s) {
+        var b: i64 = str_byte_at(s, i);
+        if b == 10 {
+            result.push(str_slice(s, start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < str_len(s) {
+        result.push(str_slice(s, start, str_len(s)));
+    }
+    return result;
+}
+
+fn str_find_char(s: str, ch: i64) -> i64 {
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if str_byte_at(s, i) == ch { return i; }
+        i = i + 1;
+    }
+    return -1;
+}

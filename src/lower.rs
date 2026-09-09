@@ -521,17 +521,22 @@ impl Lowerer {
         let repr_c = def.annotations.iter().any(|a| {
             a.name == "repr" && a.args.iter().any(|arg| arg == "C")
         });
+        // Check for @packed annotation
+        let packed = def.annotations.iter().any(|a| a.name == "packed");
 
         let mut fields = Vec::new();
         let mut offset: u64 = 0;
-        let mut max_align: u64 = if repr_c { 1 } else { 8 };
+        let mut max_align: u64 = if repr_c || packed { 1 } else { 8 };
 
         for field in &def.fields {
             let ir_ty = self.lower_type(&field.ty);
 
-            if repr_c {
-                // C-compatible layout: use natural type sizes and alignment
-                let (field_size, field_align) = self.c_type_size_align(&ir_ty);
+            if repr_c || packed {
+                // C-compatible or packed layout: use natural type sizes
+                let (field_size, mut field_align) = self.c_type_size_align(&ir_ty);
+                if packed {
+                    field_align = 1;  // Packed: no alignment padding
+                }
                 // Align offset to field's natural alignment
                 offset = (offset + field_align - 1) & !(field_align - 1);
                 fields.push((field.name.clone(), ir_ty.clone(), offset as u32));
@@ -562,8 +567,9 @@ impl Lowerer {
             name: def.name.clone(),
             fields,
             size,
-            align: if repr_c { max_align } else { 8 },
+            align: if repr_c || packed { max_align } else { 8 },
             repr_c,
+            packed_layout: packed,
         };
 
         self.module.add_struct(layout);
@@ -636,6 +642,7 @@ impl Lowerer {
             size,
             align: 8,
             repr_c: false,
+            packed_layout: false,
         };
         self.module.add_struct(layout);
     }
@@ -4363,9 +4370,23 @@ impl Lowerer {
                 let mut struct_name = match &struct_ty {
                     IrType::Ptr(inner) => match inner.as_ref() {
                         IrType::Struct(name) => Some(name.clone()),
+                        IrType::Opaque(name) => {
+                            if self.module.get_struct(name).is_some() {
+                                Some(name.clone())
+                            } else {
+                                None
+                            }
+                        }
                         _ => None,
                     },
                     IrType::Struct(name) => Some(name.clone()),
+                    IrType::Opaque(name) => {
+                        if self.module.get_struct(name).is_some() {
+                            Some(name.clone())
+                        } else {
+                            None
+                        }
+                    }
                     _ => None,
                 };
                 // Fallback: try infer_expr_type if get_value_type didn't find a struct
@@ -4375,9 +4396,23 @@ impl Lowerer {
                     struct_name = match &inferred_ty {
                         IrType::Ptr(inner) => match inner.as_ref() {
                             IrType::Struct(name) => Some(name.clone()),
+                            IrType::Opaque(name) => {
+                                if self.module.get_struct(name).is_some() {
+                                    Some(name.clone())
+                                } else {
+                                    None
+                                }
+                            }
                             _ => None,
                         },
                         IrType::Struct(name) => Some(name.clone()),
+                        IrType::Opaque(name) => {
+                            if self.module.get_struct(name).is_some() {
+                                Some(name.clone())
+                            } else {
+                                None
+                            }
+                        }
                         _ => None,
                     };
                 }
@@ -4950,7 +4985,13 @@ impl Lowerer {
                 // enum definition. If it's a struct/enum (Type::Named that
                 // resolves to a struct), store inline. If it's Box/Ptr/Vec/etc,
                 // store the pointer.
-                let declared_field_tys: Vec<Type> = self.enums.get(enum_name)
+                // NOTE: Type parameters (e.g. T in Option<T>) are NOT inline
+                // structs — they are word-sized values (i64/ptr) at runtime.
+                let enum_def = self.enums.get(enum_name);
+                let enum_type_params: Vec<String> = enum_def
+                    .map(|def| def.type_params.clone())
+                    .unwrap_or_default();
+                let declared_field_tys: Vec<Type> = enum_def
                     .and_then(|def| def.variants.iter().find(|v| v.name == *variant))
                     .and_then(|v| v.data.as_ref())
                     .map(|params| params.iter().map(|p| p.ty.clone()).collect())
@@ -4965,7 +5006,21 @@ impl Lowerer {
                     // should be stored inline (struct/enum) or as a pointer
                     // (Box/Ptr/Vec/str/etc).
                     let declared_ty = declared_field_tys.get(i);
-                    let declared_ir_ty = declared_ty.map(|t| self.lower_type(t));
+                    // Check if the declared type is a type parameter of this enum.
+                    // Type params are word-sized at runtime, not inline structs.
+                    let is_type_param = declared_ty.map(|t| {
+                        if let Type::Named(n) = t {
+                            enum_type_params.iter().any(|p| p == n)
+                        } else {
+                            false
+                        }
+                    }).unwrap_or(false);
+                    let declared_ir_ty = if is_type_param {
+                        // Type parameter: use word representation of the arg type
+                        Some(Self::word_repr(arg_ty.clone()))
+                    } else {
+                        declared_ty.map(|t| self.lower_type(t))
+                    };
                     let is_inline_struct = declared_ir_ty.as_ref()
                         .map(|t| matches!(t, IrType::Struct(_)))
                         .unwrap_or(false);
@@ -5482,6 +5537,7 @@ impl Lowerer {
                     size,
                     align: 8,
                     repr_c: false,
+                    packed_layout: false,
                 });
                 let ptr = self.emit_inst(Inst::Alloca {
                     ty: tuple_ty.clone(),

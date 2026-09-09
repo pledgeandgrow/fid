@@ -671,8 +671,10 @@ pub fn Lowerer_lookup_pattern_enum(self: &Lowerer, enum_name: str, variant: str)
 /// through `word_repr` unchanged.
 pub fn Lowerer_pattern_binding_ir_types(self: &Lowerer, enum_name: str, variant: str, bindings: Vec<Binding>) -> Vec<IrType> {
     var payload_tys: Vec<Type> = Vec::new();
+    var enum_type_params: Vec<str> = Vec::new();
     match Lowerer_lookup_pattern_enum(self, enum_name, variant) {
         OptEnumDef::Some(def) => {
+            enum_type_params = def.type_params;
             var vi: i64 = 0;
             while vi < def.variants.len() {
                 if str_equal(def.variants.get(vi).name, variant) {
@@ -699,13 +701,41 @@ pub fn Lowerer_pattern_binding_ir_types(self: &Lowerer, enum_name: str, variant:
         var binding: Binding = bindings.get(bi);
         var ir_ty: IrType = IrType::I64;
         if bi < payload_tys.len() {
-            // Keep struct/enum types as-is so load_enum_field copies the
-            // full inline data. Box<T> lowers to Ptr(Struct(T)) which is
-            // already a word - word_repr leaves it unchanged.
-            var lowered: IrType = Lowerer_lower_type(self, payload_tys.get(bi));
-            match lowered {
-                IrType::Struct(_) => { ir_ty = lowered; }
-                _ => { ir_ty = word_repr(lowered); }
+            var payload_ty: Type = payload_tys.get(bi);
+            // Check if the payload type is an unsubstituted type parameter
+            // (e.g. T in Option<T>). If so, fall back to i64 or use the
+            // binding's type annotation.
+            var is_type_param: bool = false;
+            match payload_ty {
+                Type::Named(n) => {
+                    var tpi: i64 = 0;
+                    while tpi < enum_type_params.len() {
+                        if str_equal(enum_type_params.get(tpi), n) {
+                            is_type_param = true;
+                            tpi = enum_type_params.len();
+                        }
+                        tpi = tpi + 1;
+                    }
+                }
+                _ => {}
+            }
+            if is_type_param {
+                // Type parameter: use binding annotation or i64 fallback
+                var binding_annot: str = binding.ty;
+                if !str_is_empty(binding_annot) {
+                    ir_ty = Lowerer_lower_type(self, Type::Named(binding_annot));
+                } else {
+                    ir_ty = IrType::I64;
+                }
+            } else {
+                // Keep struct/enum types as-is so load_enum_field copies the
+                // full inline data. Box<T> lowers to Ptr(Struct(T)) which is
+                // already a word - word_repr leaves it unchanged.
+                var lowered: IrType = Lowerer_lower_type(self, payload_ty);
+                match lowered {
+                    IrType::Struct(_) => { ir_ty = lowered; }
+                    _ => { ir_ty = word_repr(lowered); }
+                }
             }
         }
         result.push(ir_ty);
@@ -1300,6 +1330,7 @@ pub fn Lowerer_make_struct_layout(self: &Lowerer, def: StructDef) -> StructLayou
 
     // Check for @repr(C) annotation
     var repr_c: bool = false;
+    var packed_layout: bool = false;
     var ai: i64 = 0;
     while ai < def.annotations.len() {
         var ann: Annotation = def.annotations.get(ai);
@@ -1312,11 +1343,17 @@ pub fn Lowerer_make_struct_layout(self: &Lowerer, def: StructDef) -> StructLayou
                 bi = bi + 1;
             }
         }
+        if str_equal(ann.name, "packed") {
+            packed_layout = true;
+        }
         ai = ai + 1;
     }
 
     var max_align: i64 = 8;
     if repr_c {
+        max_align = 1;
+    }
+    if packed_layout {
         max_align = 1;
     }
 
@@ -1325,8 +1362,8 @@ pub fn Lowerer_make_struct_layout(self: &Lowerer, def: StructDef) -> StructLayou
         var field: Param = def.fields.get(i);
         var ir_ty: IrType = Lowerer_lower_type(self, field.ty);
 
-        if repr_c {
-            // C-compatible layout: use natural type sizes and alignment
+        if repr_c || packed_layout {
+            // C-compatible or packed layout: use natural type sizes and alignment
             var field_size: i64 = 8;
             var field_align: i64 = 8;
             match ir_ty {
@@ -1352,6 +1389,10 @@ pub fn Lowerer_make_struct_layout(self: &Lowerer, def: StructDef) -> StructLayou
                     }
                 }
                 _ => { field_size = 8; field_align = 8; }
+            }
+            if packed_layout {
+                // Packed: no alignment padding between fields
+                field_align = 1;
             }
             // Align offset to field's natural alignment
             offset = (offset + field_align - 1) & (0 - field_align);
@@ -1390,6 +1431,7 @@ pub fn Lowerer_make_struct_layout(self: &Lowerer, def: StructDef) -> StructLayou
     }
     layout.fields = fields;
     layout.repr_c = repr_c;
+    layout.packed_layout = packed_layout;
     return layout;
 }
 
@@ -4535,8 +4577,11 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             var tag_idx: i64 = 0;
             // Also collect declared field types to determine inline storage
             var declared_field_tys: Vec<Type> = Vec::new();
+            // Collect enum type params so we can detect type-param payloads
+            var enum_type_params: Vec<str> = Vec::new();
             match Lowerer_lookup_enum(self, enum_name) {
                 OptEnumDef::Some(def) => {
+                    enum_type_params = def.type_params;
                     var vi: i64 = 0;
                     while vi < def.variants.len() {
                         if str_equal(def.variants.get(vi).name, variant) {
@@ -4568,6 +4613,8 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             // creating function returns (C codegen uses stack alloca).
             // Box<T> fields are already pointers and stay as pointers.
             // We look at the DECLARED field type to distinguish.
+            // NOTE: Type parameters (e.g. T in Option<T>) are NOT inline
+            // structs — they are word-sized values (i64/ptr) at runtime.
             var field_idx: i64 = 1;
             var ai: i64 = 0;
             while ai < args.len() {
@@ -4579,10 +4626,32 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                 var is_inline_struct: bool = false;
                 var declared_ir_ty: IrType = IrType::I64;
                 if ai < declared_field_tys.len() {
-                    declared_ir_ty = Lowerer_lower_type(self, declared_field_tys.get(ai));
-                    match declared_ir_ty {
-                        IrType::Struct(_) => { is_inline_struct = true; }
-                        _ => { is_inline_struct = false; }
+                    var declared_ast_ty: Type = declared_field_tys.get(ai);
+                    // Check if the declared type is a type parameter of this enum.
+                    // Type params are word-sized at runtime, not inline structs.
+                    var is_type_param: bool = false;
+                    match declared_ast_ty {
+                        Type::Named(n) => {
+                            var tpi: i64 = 0;
+                            while tpi < enum_type_params.len() {
+                                if str_equal(enum_type_params.get(tpi), n) {
+                                    is_type_param = true;
+                                    tpi = enum_type_params.len();
+                                }
+                                tpi = tpi + 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if is_type_param {
+                        // Type parameter: treat as word-sized value, not inline struct
+                        declared_ir_ty = word_repr(arg_ty);
+                    } else {
+                        declared_ir_ty = Lowerer_lower_type(self, declared_ast_ty);
+                        match declared_ir_ty {
+                            IrType::Struct(_) => { is_inline_struct = true; }
+                            _ => { is_inline_struct = false; }
+                        }
                     }
                 }
 

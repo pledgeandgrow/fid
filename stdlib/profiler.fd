@@ -1,0 +1,370 @@
+// Fides Profiler standard library
+//
+// Frame profiler for CPU/GPU timing, draw call counting, and
+// performance analysis. Uses caller-owned state (pass &mut Profiler
+// to each function) to avoid global Vec runtime issues.
+//
+// Usage:
+//   use profiler;
+//
+//   var prof = profiler_create();
+//   profiler_begin_frame(&mut prof);
+//   profiler_begin(&mut prof, "physics");
+//   // ... do physics ...
+//   profiler_end(&mut prof, "physics");
+//   profiler_end_frame(&mut prof);
+//   var fps = profiler_fps(&prof);
+
+module profiler;
+
+use vec;
+use string;
+
+// ─── Profile Sample ──────────────────────────────────────────────────────
+
+pub struct ProfileSample {
+    pub name: str,
+    pub start_ms: f64,
+    pub elapsed_ms: f64,
+    pub depth: i64,
+    pub parent: i64,
+}
+
+pub struct FrameProfile {
+    pub frame_number: i64,
+    pub frame_time_ms: f64,
+    pub draw_calls: i64,
+    pub triangles: i64,
+    pub texture_binds: i64,
+    pub shader_switches: i64,
+}
+
+pub struct Profiler {
+    pub sample_names: Vec<str>,
+    pub sample_starts: Vec<f64>,
+    pub sample_elapsed: Vec<f64>,
+    pub sample_depths: Vec<i64>,
+    pub sample_parents: Vec<i64>,
+    pub sample_stack: Vec<i64>,
+    pub hist_frame_times: Vec<f64>,
+    pub hist_draw_calls: Vec<i64>,
+    pub hist_triangles: Vec<i64>,
+    pub max_frames: i64,
+    pub enabled: bool,
+    pub frame_count: i64,
+    pub avg_fps: f64,
+    pub min_frame_ms: f64,
+    pub max_frame_ms: f64,
+    pub total_draw_calls: i64,
+    pub current_depth: i64,
+    pub cur_frame_number: i64,
+    pub cur_frame_time: f64,
+    pub cur_draw_calls: i64,
+    pub cur_triangles: i64,
+    pub cur_texture_binds: i64,
+    pub cur_shader_switches: i64,
+    pub cur_frame_start: f64,
+}
+
+/// Create a new profiler.
+pub fn profiler_create() -> Profiler {
+    return Profiler {
+        sample_names: Vec::new(),
+        sample_starts: Vec::new(),
+        sample_elapsed: Vec::new(),
+        sample_depths: Vec::new(),
+        sample_parents: Vec::new(),
+        sample_stack: Vec::new(),
+        hist_frame_times: Vec::new(),
+        hist_draw_calls: Vec::new(),
+        hist_triangles: Vec::new(),
+        max_frames: 120,
+        enabled: true,
+        frame_count: 0,
+        avg_fps: 0.0,
+        min_frame_ms: 999999.0,
+        max_frame_ms: 0.0,
+        total_draw_calls: 0,
+        current_depth: 0,
+        cur_frame_number: 0,
+        cur_frame_time: 0.0,
+        cur_draw_calls: 0,
+        cur_triangles: 0,
+        cur_texture_binds: 0,
+        cur_shader_switches: 0,
+        cur_frame_start: 0.0,
+    };
+}
+
+/// Initialize/reset the profiler.
+pub fn profiler_init(p: &mut Profiler) -> void {
+    p.sample_names.clear();
+    p.sample_starts.clear();
+    p.sample_elapsed.clear();
+    p.sample_depths.clear();
+    p.sample_parents.clear();
+    p.sample_stack.clear();
+    p.hist_frame_times.clear();
+    p.hist_draw_calls.clear();
+    p.hist_triangles.clear();
+    p.enabled = true;
+    p.frame_count = 0;
+    p.avg_fps = 0.0;
+    p.min_frame_ms = 999999.0;
+    p.max_frame_ms = 0.0;
+    p.total_draw_calls = 0;
+}
+
+/// Enable/disable profiling.
+pub fn profiler_set_enabled(p: &mut Profiler, enabled: bool) -> void {
+    p.enabled = enabled;
+}
+
+/// Begin a new frame.
+pub fn profiler_begin_frame(p: &mut Profiler) -> void {
+    if !p.enabled { return; }
+    p.cur_frame_number = p.frame_count;
+    p.cur_frame_time = 0.0;
+    p.cur_draw_calls = 0;
+    p.cur_triangles = 0;
+    p.cur_texture_binds = 0;
+    p.cur_shader_switches = 0;
+    p.current_depth = 0;
+    p.sample_names.clear();
+    p.sample_starts.clear();
+    p.sample_elapsed.clear();
+    p.sample_depths.clear();
+    p.sample_parents.clear();
+    p.sample_stack.clear();
+    p.cur_frame_start = p_clock_now_ms() as f64;
+}
+
+/// Begin a profiled scope.
+pub fn profiler_begin(p: &mut Profiler, name: str) -> void {
+    if !p.enabled { return; }
+
+    var parent = -1;
+    if p.sample_stack.len() > 0 {
+        parent = p.sample_stack.get(p.sample_stack.len() - 1);
+    }
+
+    p.sample_names.push(name);
+    p.sample_starts.push(p_clock_now_ms() as f64);
+    p.sample_elapsed.push(0.0);
+    p.sample_depths.push(p.current_depth);
+    p.sample_parents.push(parent);
+
+    var idx = p.sample_names.len() - 1;
+    p.sample_stack.push(idx);
+    p.current_depth = p.current_depth + 1;
+}
+
+/// End a profiled scope.
+pub fn profiler_end(p: &mut Profiler, name: str) -> void {
+    if !p.enabled { return; }
+    if p.sample_stack.len() == 0 { return; }
+
+    var idx = p.sample_stack.get(p.sample_stack.len() - 1);
+    var elapsed = p_clock_now_ms() as f64 - p.sample_starts.get(idx);
+    p.sample_elapsed.set(idx, elapsed);
+
+    p.sample_stack.pop();
+    p.current_depth = p.current_depth - 1;
+}
+
+/// Record a draw call.
+pub fn profiler_count_draw_call(p: &mut Profiler) -> void {
+    p.cur_draw_calls = p.cur_draw_calls + 1;
+}
+
+/// Record triangles rendered.
+pub fn profiler_count_triangles(p: &mut Profiler, count: i64) -> void {
+    p.cur_triangles = p.cur_triangles + count;
+}
+
+/// Record a texture bind.
+pub fn profiler_count_texture_bind(p: &mut Profiler) -> void {
+    p.cur_texture_binds = p.cur_texture_binds + 1;
+}
+
+/// Record a shader switch.
+pub fn profiler_count_shader_switch(p: &mut Profiler) -> void {
+    p.cur_shader_switches = p.cur_shader_switches + 1;
+}
+
+/// End the current frame and store the profile.
+pub fn profiler_end_frame(p: &mut Profiler) -> void {
+    if !p.enabled { return; }
+
+    p.cur_frame_time = p_clock_now_ms() as f64 - p.cur_frame_start;
+
+    var ft = p.cur_frame_time;
+    if ft < p.min_frame_ms { p.min_frame_ms = ft; }
+    if ft > p.max_frame_ms { p.max_frame_ms = ft; }
+    p.total_draw_calls = p.total_draw_calls + p.cur_draw_calls;
+
+    // Rolling FPS average
+    if p.hist_frame_times.len() > 0 {
+        var total_time = 0.0;
+        var i = 0;
+        while i < p.hist_frame_times.len() {
+            total_time = total_time + p.hist_frame_times.get(i);
+            i = i + 1;
+        }
+        total_time = total_time + ft;
+        var count = p.hist_frame_times.len() + 1;
+        p.avg_fps = 1000.0 / (total_time / count as f64);
+    }
+
+    p.hist_frame_times.push(ft);
+    p.hist_draw_calls.push(p.cur_draw_calls);
+    p.hist_triangles.push(p.cur_triangles);
+
+    while p.hist_frame_times.len() > p.max_frames {
+        p.hist_frame_times.remove(0);
+        p.hist_draw_calls.remove(0);
+        p.hist_triangles.remove(0);
+    }
+
+    p.frame_count = p.frame_count + 1;
+}
+
+/// Get the current frame time in milliseconds.
+pub fn profiler_frame_time(p: &Profiler) -> f64 {
+    if p.hist_frame_times.len() == 0 { return 0.0; }
+    return p.hist_frame_times.get(p.hist_frame_times.len() - 1);
+}
+
+/// Get the average FPS.
+pub fn profiler_fps(p: &Profiler) -> f64 {
+    return p.avg_fps;
+}
+
+/// Get the number of draw calls in the last frame.
+pub fn profiler_draw_calls(p: &Profiler) -> i64 {
+    if p.hist_draw_calls.len() == 0 { return 0; }
+    return p.hist_draw_calls.get(p.hist_draw_calls.len() - 1);
+}
+
+/// Get the number of triangles in the last frame.
+pub fn profiler_triangles(p: &Profiler) -> i64 {
+    if p.hist_triangles.len() == 0 { return 0; }
+    return p.hist_triangles.get(p.hist_triangles.len() - 1);
+}
+
+/// Get the minimum frame time.
+pub fn profiler_min_frame(p: &Profiler) -> f64 {
+    return p.min_frame_ms;
+}
+
+/// Get the maximum frame time.
+pub fn profiler_max_frame(p: &Profiler) -> f64 {
+    return p.max_frame_ms;
+}
+
+/// Get the number of stored frames.
+pub fn profiler_frame_count(p: &Profiler) -> i64 {
+    return p.hist_frame_times.len();
+}
+
+/// Get a sample from the current frame by name.
+pub fn profiler_get_sample(p: &Profiler, name: str) -> ProfileSample {
+    var result = ProfileSample {
+        name: "", start_ms: 0.0, elapsed_ms: 0.0, depth: 0, parent: -1,
+    };
+    var i = 0;
+    while i < p.sample_names.len() {
+        if str_equal(p.sample_names.get(i), name) {
+            return ProfileSample {
+                name: p.sample_names.get(i),
+                start_ms: p.sample_starts.get(i),
+                elapsed_ms: p.sample_elapsed.get(i),
+                depth: p.sample_depths.get(i),
+                parent: p.sample_parents.get(i),
+            };
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Get the last frame profile.
+pub fn profiler_last_frame(p: &Profiler) -> FrameProfile {
+    return FrameProfile {
+        frame_number: p.frame_count - 1,
+        frame_time_ms: p.cur_frame_time,
+        draw_calls: p.cur_draw_calls,
+        triangles: p.cur_triangles,
+        texture_binds: p.cur_texture_binds,
+        shader_switches: p.cur_shader_switches,
+    };
+}
+
+/// Reset profiler statistics.
+pub fn profiler_reset(p: &mut Profiler) -> void {
+    p.hist_frame_times.clear();
+    p.hist_draw_calls.clear();
+    p.hist_triangles.clear();
+    p.frame_count = 0;
+    p.avg_fps = 0.0;
+    p.min_frame_ms = 999999.0;
+    p.max_frame_ms = 0.0;
+    p.total_draw_calls = 0;
+}
+
+/// Get the frame time history as a string.
+pub fn profiler_frame_time_history(p: &Profiler) -> str {
+    var result = "";
+    var i = 0;
+    while i < p.hist_frame_times.len() {
+        if i > 0 { result = result + ","; }
+        result = result + float_to_str(p.hist_frame_times.get(i));
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Shutdown the profiler.
+pub fn profiler_shutdown(p: &mut Profiler) -> void {
+    p.hist_frame_times.clear();
+    p.hist_draw_calls.clear();
+    p.hist_triangles.clear();
+    p.sample_names.clear();
+    p.sample_starts.clear();
+    p.sample_elapsed.clear();
+    p.sample_depths.clear();
+    p.sample_parents.clear();
+    p.sample_stack.clear();
+    p.enabled = false;
+}
+
+/// Set the maximum number of frames to keep in history.
+pub fn profiler_set_max_frames(p: &mut Profiler, max: i64) -> void {
+    p.max_frames = max;
+    while p.hist_frame_times.len() > max {
+        p.hist_frame_times.remove(0);
+        p.hist_draw_calls.remove(0);
+        p.hist_triangles.remove(0);
+    }
+}
+
+/// Get the number of samples in the current frame.
+pub fn profiler_sample_count(p: &Profiler) -> i64 {
+    return p.sample_names.len();
+}
+
+/// Get a sample by index.
+pub fn profiler_get_sample_idx(p: &Profiler, idx: i64) -> ProfileSample {
+    if idx < 0 || idx >= p.sample_names.len() {
+        return ProfileSample {
+            name: "", start_ms: 0.0, elapsed_ms: 0.0, depth: 0, parent: -1,
+        };
+    }
+    return ProfileSample {
+        name: p.sample_names.get(idx),
+        start_ms: p.sample_starts.get(idx),
+        elapsed_ms: p.sample_elapsed.get(idx),
+        depth: p.sample_depths.get(idx),
+        parent: p.sample_parents.get(idx),
+    };
+}

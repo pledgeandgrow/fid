@@ -1,0 +1,286 @@
+// Fides Replay system standard library
+//
+// Deterministic replay: record game inputs each frame, then replay
+// them to reproduce the exact same game state. Useful for:
+//   - Bug reproduction
+//   - Esports/spectator features
+//   - Debugging
+//   - Killcam/replay
+//
+// Requires the game to be deterministic (no floating-point nondeterminism,
+// no system-time-dependent logic, no threading races).
+//
+// Usage:
+//   use replay;
+//   use input;
+//
+//   // Recording:
+//   replay_start_recording();
+//   // In game loop:
+//   replay_record_frame(&input_state, dt);
+//   replay_save("replay.dat");
+//
+//   // Playback:
+//   replay_load("replay.dat");
+//   replay_start_playback();
+//   // In game loop:
+//   var frame = replay_get_frame();
+//   // Apply frame.input to game
+
+module replay;
+
+use vec;
+use string;
+
+// ─── Replay Frame ────────────────────────────────────────────────────────
+
+pub struct ReplayFrame {
+    pub frame_number: i64,
+    pub keys: Vec<i64>,        // pressed keys (scancodes)
+    pub mouse_x: i64,
+    pub mouse_y: i64,
+    pub mouse_buttons: i64,    // bitmask
+    pub dt_ms: i64,            // frame delta in ms (fixed-point for determinism)
+    pub seed: i64,             // RNG seed at this frame
+}
+
+pub struct ReplayHeader {
+    pub magic: i64,            // "FDRP" = 0x46505244
+    pub version: i64,
+    pub frame_count: i64,
+    pub start_seed: i64,
+    pub game_name: str,
+    pub game_version: str,
+    pub recorded_at: i64,
+}
+
+pub struct Replay {
+    pub header: ReplayHeader,
+    pub frames: Vec<ReplayFrame>,
+    pub current_frame: i64,
+    pub mode: i64,             // 0 = idle, 1 = recording, 2 = playing
+    pub max_frames: i64,
+}
+
+pub const REPLAY_IDLE: i64 = 0;
+pub const REPLAY_RECORDING: i64 = 1;
+pub const REPLAY_PLAYING: i64 = 2;
+pub const REPLAY_MAGIC: i64 = 0x46505244;
+pub const REPLAY_VERSION: i64 = 1;
+
+var g_replay: Replay = Replay {
+    header: ReplayHeader {
+        magic: REPLAY_MAGIC,
+        version: REPLAY_VERSION,
+        frame_count: 0,
+        start_seed: 0,
+        game_name: "",
+        game_version: "",
+        recorded_at: 0,
+    },
+    frames: Vec::new(),
+    current_frame: 0,
+    mode: REPLAY_IDLE,
+    max_frames: 3600,  // 60 seconds at 60fps
+};
+
+/// Start recording a replay.
+pub fn replay_start_recording(seed: i64, game_name: str, game_version: str) -> void {
+    g_replay.frames.clear();
+    g_replay.current_frame = 0;
+    g_replay.mode = REPLAY_RECORDING;
+    g_replay.header = ReplayHeader {
+        magic: REPLAY_MAGIC,
+        version: REPLAY_VERSION,
+        frame_count: 0,
+        start_seed: seed,
+        game_name: game_name,
+        game_version: game_version,
+        recorded_at: p_clock_now_ms(),
+    };
+}
+
+/// Record a frame of input.
+pub fn replay_record_frame(keys: Vec<i64>, mouse_x: i64, mouse_y: i64, mouse_buttons: i64, dt_ms: i64, seed: i64) -> void {
+    if g_replay.mode != REPLAY_RECORDING { return; }
+    if g_replay.frames.len() >= g_replay.max_frames { return; }
+
+    var frame = ReplayFrame {
+        frame_number: g_replay.frames.len(),
+        keys: Vec::new(),
+        mouse_x: mouse_x,
+        mouse_y: mouse_y,
+        mouse_buttons: mouse_buttons,
+        dt_ms: dt_ms,
+        seed: seed,
+    };
+
+    // Copy keys
+    var i = 0;
+    while i < keys.len() {
+        frame.keys.push(keys.get(i));
+        i = i + 1;
+    }
+
+    g_replay.frames.push(frame);
+    g_replay.header.frame_count = g_replay.frames.len();
+}
+
+/// Stop recording.
+pub fn replay_stop_recording() -> void {
+    g_replay.mode = REPLAY_IDLE;
+}
+
+/// Start playback of a loaded replay.
+pub fn replay_start_playback() -> void {
+    if g_replay.frames.len() == 0 { return; }
+    g_replay.current_frame = 0;
+    g_replay.mode = REPLAY_PLAYING;
+}
+
+/// Get the current replay frame (during playback).
+pub fn replay_get_frame() -> ReplayFrame {
+    if g_replay.mode != REPLAY_PLAYING { return ReplayFrame {
+        frame_number: -1, keys: Vec::new(),
+        mouse_x: 0, mouse_y: 0, mouse_buttons: 0,
+        dt_ms: 16, seed: 0,
+    }; }
+    if g_replay.current_frame >= g_replay.frames.len() { return ReplayFrame {
+        frame_number: -1, keys: Vec::new(),
+        mouse_x: 0, mouse_y: 0, mouse_buttons: 0,
+        dt_ms: 16, seed: 0,
+    }; }
+    return g_replay.frames.get(g_replay.current_frame);
+}
+
+/// Advance to the next frame during playback.
+pub fn replay_next_frame() -> void {
+    if g_replay.mode != REPLAY_PLAYING { return; }
+    g_replay.current_frame = g_replay.current_frame + 1;
+    if g_replay.current_frame >= g_replay.frames.len() {
+        g_replay.mode = REPLAY_IDLE;
+    }
+}
+
+/// Check if playback is finished.
+pub fn replay_is_finished() -> bool {
+    return g_replay.mode == REPLAY_PLAYING &&
+           g_replay.current_frame >= g_replay.frames.len();
+}
+
+/// Stop playback.
+pub fn replay_stop_playback() -> void {
+    g_replay.mode = REPLAY_IDLE;
+}
+
+/// Get the current replay mode.
+pub fn replay_mode() -> i64 {
+    return g_replay.mode;
+}
+
+/// Get the total number of frames.
+pub fn replay_frame_count() -> i64 {
+    return g_replay.frames.len();
+}
+
+/// Get the current frame index (during playback).
+pub fn replay_current_frame_idx() -> i64 {
+    return g_replay.current_frame;
+}
+
+/// Get the start seed from the replay.
+pub fn replay_start_seed() -> i64 {
+    return g_replay.header.start_seed;
+}
+
+/// Get the progress (0..1) of playback.
+pub fn replay_progress() -> f64 {
+    if g_replay.frames.len() == 0 { return 0.0; }
+    return g_replay.current_frame as f64 / g_replay.frames.len() as f64;
+}
+
+/// Seek to a specific frame (for scrubbing).
+pub fn replay_seek(frame: i64) -> void {
+    if frame < 0 { g_replay.current_frame = 0; return; }
+    if frame >= g_replay.frames.len() {
+        g_replay.current_frame = g_replay.frames.len() - 1;
+    } else {
+        g_replay.current_frame = frame;
+    }
+}
+
+/// Set the maximum recording length (in frames).
+pub fn replay_set_max_frames(max: i64) -> void {
+    g_replay.max_frames = max;
+}
+
+/// Save the replay to a binary format (using serialize).
+pub fn replay_save(path: str) -> bool {
+    // Write header + frames as binary
+    // For simplicity, we use a simple format:
+    //   magic (i32), version (i32), frame_count (i32), start_seed (i32)
+    //   For each frame: frame_number, mouse_x, mouse_y, mouse_buttons, dt_ms, seed, key_count, keys...
+    var data = Vec::new();
+    replay_write_i32(&mut data, REPLAY_MAGIC);
+    replay_write_i32(&mut data, REPLAY_VERSION);
+    replay_write_i32(&mut data, g_replay.frames.len());
+    replay_write_i32(&mut data, g_replay.header.start_seed);
+
+    var i = 0;
+    while i < g_replay.frames.len() {
+        var f = g_replay.frames.get(i);
+        replay_write_i32(&mut data, f.frame_number);
+        replay_write_i32(&mut data, f.mouse_x);
+        replay_write_i32(&mut data, f.mouse_y);
+        replay_write_i32(&mut data, f.mouse_buttons);
+        replay_write_i32(&mut data, f.dt_ms);
+        replay_write_i32(&mut data, f.seed);
+        replay_write_i32(&mut data, f.keys.len());
+        var j = 0;
+        while j < f.keys.len() {
+            replay_write_i32(&mut data, f.keys.get(j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return pledge_replay_save(path, data.len(), 0) == 0;
+}
+
+/// Load a replay from a file.
+pub fn replay_load(path: str) -> bool {
+    g_replay.frames.clear();
+    g_replay.current_frame = 0;
+    g_replay.mode = REPLAY_IDLE;
+
+    var size = pledge_replay_load(path, 0, 0);
+    if size <= 0 { return false; }
+
+    // In native builds, the runtime fills the buffer
+    // For now, return true if the file exists
+    return true;
+}
+
+/// Clear the replay buffer.
+pub fn replay_clear() -> void {
+    g_replay.frames.clear();
+    g_replay.current_frame = 0;
+    g_replay.mode = REPLAY_IDLE;
+    g_replay.header.frame_count = 0;
+}
+
+// ─── Binary Helpers ─────────────────────────────────────────────────────
+
+fn replay_write_i32(data: &mut Vec<i64>, val: i64) -> void {
+    data.push((val >> 24) & 0xFF);
+    data.push((val >> 16) & 0xFF);
+    data.push((val >> 8) & 0xFF);
+    data.push(val & 0xFF);
+}
+
+// ─── Native Helpers ──────────────────────────────────────────────────────
+
+extern "C" include "pledge_replay.h" link "" {
+    fn pledge_replay_save(path: str, len: i64, data: i64) -> i64;
+    fn pledge_replay_load(path: str, data: i64, max_size: i64) -> i64;
+}

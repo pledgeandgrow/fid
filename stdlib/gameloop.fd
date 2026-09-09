@@ -1,0 +1,177 @@
+// Fides Game Loop standard library
+//
+// Fixed-timestep accumulator game gl. Prevents the "spiral of death"
+// (falling further behind on slow hardware) by capping frame time and
+// decoupling update frequency from render frequency.
+//
+// Usage:
+//   use gameloop;
+//   use time;
+//
+//   var loop = gameloop_create(60);  // 60 FPS target
+//   while gl.running {
+//       var updates = gameloop_step(&mut loop);
+//       var i = 0;
+//       while i < updates {
+//           fixed_update();   // physics, AI, etc. — called 0+ times per frame
+//           i = i + 1;
+//       }
+//       render();             // called once per frame
+//   }
+//
+// The loop also tracks FPS (frames per second) and frame time.
+
+module gameloop;
+
+
+
+// ─── GameLoop State ──────────────────────────────────────────────────────
+
+pub struct GameLoop {
+    pub target_fps: i64,       // desired updates per second
+    pub fixed_dt: f64,         // seconds per fixed update (1.0 / target_fps)
+    pub running: bool,         // false = stop the loop
+    pub accumulator: f64,      // accumulated time since last fixed update
+    pub current_time: i64,     // last frame time in ms
+    pub frame_count: i64,     // frames since last FPS update
+    pub fps: i64,              // current FPS (updated every second)
+    pub fps_timer: i64,        // ms since last FPS update
+    pub max_frame_time: f64,  // cap to prevent spiral of death (seconds)
+    pub total_frames: i64,    // total frames since start
+}
+
+/// Create a game loop targeting the given FPS.
+pub fn gameloop_create(target_fps: i64) -> GameLoop {
+    var dt: f64 = 1.0;
+    if target_fps > 0 {
+        dt = 1.0 / target_fps;
+    }
+    return GameLoop {
+        target_fps: target_fps,
+        fixed_dt: dt,
+        running: true,
+        accumulator: 0.0,
+        current_time: p_clock_now_ms(),
+        frame_count: 0,
+        fps: 0,
+        fps_timer: 0,
+        max_frame_time: 0.25,
+        total_frames: 0,
+    };
+}
+
+/// Advance the game loop by one frame.
+/// Returns the number of fixed updates to run this frame (0 or more).
+/// The caller should run fixed_update() that many times, then render once.
+pub fn gameloop_step(gl: &mut GameLoop) -> i64 {
+    var new_time: i64 = p_clock_now_ms();
+    var frame_time: f64 = (new_time - gl.current_time) / 1000.0;
+    gl.current_time = new_time;
+
+    // Cap frame time to prevent spiral of death
+    if frame_time > gl.max_frame_time {
+        frame_time = gl.max_frame_time;
+    }
+
+    gl.accumulator = gl.accumulator + frame_time;
+
+    var updates: i64 = 0;
+    while gl.accumulator >= gl.fixed_dt {
+        gl.accumulator = gl.accumulator - gl.fixed_dt;
+        updates = updates + 1;
+    }
+
+    // FPS counter (updated every 1000 ms)
+    gl.frame_count = gl.frame_count + 1;
+    gl.total_frames = gl.total_frames + 1;
+    gl.fps_timer = gl.fps_timer + (frame_time * 1000.0) as i64;
+    if gl.fps_timer >= 1000 {
+        gl.fps = gl.frame_count;
+        gl.frame_count = 0;
+        gl.fps_timer = 0;
+    }
+
+    return updates;
+}
+
+/// Stop the game gl.
+pub fn gameloop_stop(gl: &mut GameLoop) -> void {
+    gl.running = false;
+}
+
+/// Get the current FPS (frames per second).
+pub fn gameloop_fps(gl: &GameLoop) -> i64 {
+    return gl.fps;
+}
+
+/// Get the fixed timestep in seconds.
+pub fn gameloop_dt(gl: &GameLoop) -> f64 {
+    return gl.fixed_dt;
+}
+
+/// Get total elapsed frames since the loop started.
+pub fn gameloop_total_frames(gl: &GameLoop) -> i64 {
+    return gl.total_frames;
+}
+
+/// Get the interpolation factor for rendering (0.0 to 1.0).
+/// This is the fraction of the way between the last fixed update and the next.
+/// Use it to interpolate physics state for smooth rendering.
+pub fn gameloop_alpha(gl: &GameLoop) -> f64 {
+    if gl.fixed_dt > 0.0 {
+        return gl.accumulator / gl.fixed_dt;
+    }
+    return 0.0;
+}
+
+// ─── Simple Variable-Timestep Loop ────────────────────────────────────────
+//
+// For games that don't need fixed-timestep physics, this simpler loop
+// just measures frame time and provides it to the update function.
+
+pub struct SimpleLoop {
+    pub running: bool,
+    pub current_time: i64,
+    pub dt: f64,            // seconds since last frame
+    pub frame_count: i64,
+    pub fps: i64,
+    pub fps_timer: i64,
+}
+
+pub fn simpleloop_create() -> SimpleLoop {
+    return SimpleLoop {
+        running: true,
+        current_time: p_clock_now_ms(),
+        dt: 0.0,
+        frame_count: 0,
+        fps: 0,
+        fps_timer: 0,
+    };
+}
+
+/// Advance the simple gl. Returns dt in seconds.
+pub fn simpleloop_step(sl: &mut SimpleLoop) -> f64 {
+    var new_time: i64 = p_clock_now_ms();
+    sl.dt = (new_time - sl.current_time) / 1000.0;
+    sl.current_time = new_time;
+
+    // Cap dt to prevent huge jumps (e.g., on first frame or after pause)
+    if sl.dt > 0.25 {
+        sl.dt = 0.25;
+    }
+
+    // FPS counter
+    sl.frame_count = sl.frame_count + 1;
+    sl.fps_timer = sl.fps_timer + (sl.dt * 1000.0) as i64;
+    if sl.fps_timer >= 1000 {
+        sl.fps = sl.frame_count;
+        sl.frame_count = 0;
+        sl.fps_timer = 0;
+    }
+
+    return sl.dt;
+}
+
+pub fn simpleloop_stop(sl: &mut SimpleLoop) -> void {
+    sl.running = false;
+}

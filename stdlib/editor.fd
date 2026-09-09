@@ -1,0 +1,363 @@
+// Fides Editor standard library
+//
+// In-game editor for level design and entity inspection.
+// Uses caller-owned state with Vec<EditorEntity>.
+//
+// Usage:
+//   use editor;
+//
+//   var ed = editor_create();
+//   editor_add_entity(&mut ed, 0, "Player", 0, 0, 0);
+//   editor_select(&mut ed, 0);
+//   editor_move_selected(&mut ed, 5, 0, 0);
+
+module editor;
+
+use vec;
+use string;
+use math;
+
+// ─── Editor Entity ───────────────────────────────────────────────────────
+
+pub struct EditorEntity {
+    pub id: i64,
+    pub name: str,
+    pub x: f64, pub y: f64, pub z: f64,
+    pub rx: f64, pub ry: f64, pub rz: f64,
+    pub sx: f64, pub sy: f64, pub sz: f64,
+    pub visible: bool,
+    pub locked: bool,
+    pub selected: bool,
+}
+
+pub struct EditorState {
+    pub entities: Vec<EditorEntity>,
+    pub selected_id: i64,
+    pub gizmo_mode: i64,
+    pub snap_enabled: bool,
+    pub snap_translate: f64,
+    pub snap_rotate: f64,
+    pub snap_scale: f64,
+    pub grid_visible: bool,
+    pub grid_size: f64,
+    pub camera_x: f64, pub camera_y: f64, pub camera_z: f64,
+    pub show_inspector: bool,
+    pub show_hierarchy: bool,
+    pub show_gizmo: bool,
+    pub max_undo: i64,
+}
+
+pub const GIZMO_TRANSLATE: i64 = 0;
+pub const GIZMO_ROTATE: i64 = 1;
+pub const GIZMO_SCALE: i64 = 2;
+
+/// Create a new editor state.
+pub fn editor_create() -> EditorState {
+    var entities = Vec::new();
+    return EditorState {
+        entities: entities,
+        selected_id: -1,
+        gizmo_mode: GIZMO_TRANSLATE,
+        snap_enabled: true,
+        snap_translate: 0.25,
+        snap_rotate: 15.0,
+        snap_scale: 0.1,
+        grid_visible: true,
+        grid_size: 1.0,
+        camera_x: 0.0, camera_y: 0.0, camera_z: 0.0,
+        show_inspector: true,
+        show_hierarchy: true,
+        show_gizmo: true,
+        max_undo: 100,
+    };
+}
+
+/// Initialize the editor.
+pub fn editor_init(ed: &mut EditorState) -> void {
+    ed.entities.clear();
+    ed.selected_id = -1;
+}
+
+/// Add an entity to the editor.
+pub fn editor_add_entity(ed: &mut EditorState, id: i64, name: str, x: f64, y: f64, z: f64) -> void {
+    ed.entities.push(EditorEntity {
+        id: id,
+        name: name,
+        x: x, y: y, z: z,
+        rx: 0.0, ry: 0.0, rz: 0.0,
+        sx: 1.0, sy: 1.0, sz: 1.0,
+        visible: true,
+        locked: false,
+        selected: false,
+    });
+}
+
+/// Select an entity by ID.
+pub fn editor_select(ed: &mut EditorState, id: i64) -> void {
+    ed.selected_id = id;
+    var i = 0;
+    while i < ed.entities.len() {
+        var e = ed.entities.get(i);
+        e.selected = (e.id == id);
+        ed.entities.set(i, e);
+        i = i + 1;
+    }
+}
+
+/// Deselect all entities.
+pub fn editor_deselect_all(ed: &mut EditorState) -> void {
+    ed.selected_id = -1;
+    var i = 0;
+    while i < ed.entities.len() {
+        var e = ed.entities.get(i);
+        e.selected = false;
+        ed.entities.set(i, e);
+        i = i + 1;
+    }
+}
+
+/// Get the selected entity index. Returns -1 if none.
+fn editor_selected_idx(ed: &EditorState) -> i64 {
+    if ed.selected_id < 0 { return -1; }
+    var i = 0;
+    while i < ed.entities.len() {
+        if ed.entities.get(i).id == ed.selected_id { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Get the selected entity.
+pub fn editor_get_selected(ed: &EditorState) -> EditorEntity {
+    var idx = editor_selected_idx(ed);
+    if idx < 0 {
+        return EditorEntity {
+            id: -1, name: "",
+            x: 0.0, y: 0.0, z: 0.0,
+            rx: 0.0, ry: 0.0, rz: 0.0,
+            sx: 1.0, sy: 1.0, sz: 1.0,
+            visible: false, locked: false, selected: false,
+        };
+    }
+    return ed.entities.get(idx);
+}
+
+/// Move the selected entity.
+pub fn editor_move_selected(ed: &mut EditorState, dx: f64, dy: f64, dz: f64) -> void {
+    var idx = editor_selected_idx(ed);
+    if idx < 0 { return; }
+    var e = ed.entities.get(idx);
+    if e.locked { return; }
+
+    e.x = e.x + dx;
+    e.y = e.y + dy;
+    e.z = e.z + dz;
+
+    if ed.snap_enabled {
+        var snap_t = ed.snap_translate;
+        if snap_t > 0.0 {
+            e.x = (e.x / snap_t) * snap_t;
+            e.y = (e.y / snap_t) * snap_t;
+            e.z = (e.z / snap_t) * snap_t;
+        }
+    }
+
+    ed.entities.set(idx, e);
+}
+
+/// Rotate the selected entity.
+pub fn editor_rotate_selected(ed: &mut EditorState, dx: f64, dy: f64, dz: f64) -> void {
+    var idx = editor_selected_idx(ed);
+    if idx < 0 { return; }
+    var e = ed.entities.get(idx);
+    if e.locked { return; }
+
+    e.rx = e.rx + dx;
+    e.ry = e.ry + dy;
+    e.rz = e.rz + dz;
+
+    if ed.snap_enabled {
+        var snap_r = ed.snap_rotate;
+        if snap_r > 0.0 {
+            e.rx = (e.rx / snap_r) * snap_r;
+            e.ry = (e.ry / snap_r) * snap_r;
+            e.rz = (e.rz / snap_r) * snap_r;
+        }
+    }
+
+    ed.entities.set(idx, e);
+}
+
+/// Scale the selected entity.
+pub fn editor_scale_selected(ed: &mut EditorState, dx: f64, dy: f64, dz: f64) -> void {
+    var idx = editor_selected_idx(ed);
+    if idx < 0 { return; }
+    var e = ed.entities.get(idx);
+    if e.locked { return; }
+
+    e.sx = e.sx + dx;
+    e.sy = e.sy + dy;
+    e.sz = e.sz + dz;
+
+    if ed.snap_enabled {
+        var snap_s = ed.snap_scale;
+        if snap_s > 0.0 {
+            e.sx = (e.sx / snap_s) * snap_s;
+            e.sy = (e.sy / snap_s) * snap_s;
+            e.sz = (e.sz / snap_s) * snap_s;
+        }
+    }
+
+    if e.sx < 0.01 { e.sx = 0.01; }
+    if e.sy < 0.01 { e.sy = 0.01; }
+    if e.sz < 0.01 { e.sz = 0.01; }
+
+    ed.entities.set(idx, e);
+}
+
+/// Set the gizmo mode.
+pub fn editor_set_gizmo_mode(ed: &mut EditorState, mode: i64) -> void {
+    ed.gizmo_mode = mode;
+}
+
+/// Toggle grid snapping.
+pub fn editor_toggle_snap(ed: &mut EditorState) -> void {
+    ed.snap_enabled = !ed.snap_enabled;
+}
+
+/// Set the snap translate value.
+pub fn editor_set_snap_translate(ed: &mut EditorState, val: f64) -> void {
+    ed.snap_translate = val;
+}
+
+/// Set the snap rotate value.
+pub fn editor_set_snap_rotate(ed: &mut EditorState, val: f64) -> void {
+    ed.snap_rotate = val;
+}
+
+/// Set the snap scale value.
+pub fn editor_set_snap_scale(ed: &mut EditorState, val: f64) -> void {
+    ed.snap_scale = val;
+}
+
+/// Set the grid size.
+pub fn editor_set_grid_size(ed: &mut EditorState, size: f64) -> void {
+    ed.grid_size = size;
+}
+
+/// Toggle grid visibility.
+pub fn editor_toggle_grid(ed: &mut EditorState) -> void {
+    ed.grid_visible = !ed.grid_visible;
+}
+
+/// Set the editor camera position.
+pub fn editor_set_camera(ed: &mut EditorState, x: f64, y: f64, z: f64) -> void {
+    ed.camera_x = x;
+    ed.camera_y = y;
+    ed.camera_z = z;
+}
+
+/// Delete the selected entity.
+pub fn editor_delete_selected(ed: &mut EditorState) -> void {
+    var idx = editor_selected_idx(ed);
+    if idx < 0 { return; }
+    ed.entities.remove(idx);
+    ed.selected_id = -1;
+}
+
+/// Duplicate the selected entity.
+pub fn editor_duplicate_selected(ed: &mut EditorState) -> void {
+    var idx = editor_selected_idx(ed);
+    if idx < 0 { return; }
+    var orig = ed.entities.get(idx);
+    var new_id = orig.id + 10000;
+    ed.entities.push(EditorEntity {
+        id: new_id,
+        name: orig.name,
+        x: orig.x + 1.0, y: orig.y, z: orig.z,
+        rx: orig.rx, ry: orig.ry, rz: orig.rz,
+        sx: orig.sx, sy: orig.sy, sz: orig.sz,
+        visible: orig.visible,
+        locked: orig.locked,
+        selected: false,
+    });
+}
+
+/// Toggle entity visibility.
+pub fn editor_toggle_visibility(ed: &mut EditorState, id: i64) -> void {
+    var i = 0;
+    while i < ed.entities.len() {
+        if ed.entities.get(i).id == id {
+            var e = ed.entities.get(i);
+            e.visible = !e.visible;
+            ed.entities.set(i, e);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+/// Toggle entity lock.
+pub fn editor_toggle_lock(ed: &mut EditorState, id: i64) -> void {
+    var i = 0;
+    while i < ed.entities.len() {
+        if ed.entities.get(i).id == id {
+            var e = ed.entities.get(i);
+            e.locked = !e.locked;
+            ed.entities.set(i, e);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+/// Get the number of entities.
+pub fn editor_entity_count(ed: &EditorState) -> i64 {
+    return ed.entities.len();
+}
+
+/// Get an entity by index.
+pub fn editor_get_entity(ed: &EditorState, idx: i64) -> EditorEntity {
+    return ed.entities.get(idx);
+}
+
+/// Get the selected entity ID.
+pub fn editor_selected_id(ed: &EditorState) -> i64 {
+    return ed.selected_id;
+}
+
+/// Get the gizmo mode.
+pub fn editor_gizmo_mode(ed: &EditorState) -> i64 {
+    return ed.gizmo_mode;
+}
+
+/// Check if snapping is enabled.
+pub fn editor_snap_enabled(ed: &EditorState) -> bool {
+    return ed.snap_enabled;
+}
+
+/// Check if grid is visible.
+pub fn editor_grid_visible(ed: &EditorState) -> bool {
+    return ed.grid_visible;
+}
+
+/// Set inspector visibility.
+pub fn editor_show_inspector(ed: &mut EditorState, show: bool) -> void {
+    ed.show_inspector = show;
+}
+
+/// Set hierarchy visibility.
+pub fn editor_show_hierarchy(ed: &mut EditorState, show: bool) -> void {
+    ed.show_hierarchy = show;
+}
+
+/// Clear all entities.
+pub fn editor_clear(ed: &mut EditorState) -> void {
+    ed.entities.clear();
+    ed.selected_id = -1;
+}
+
+/// Set the maximum undo stack depth.
+pub fn editor_set_max_undo(ed: &mut EditorState, max: i64) -> void {
+    ed.max_undo = max;
+}

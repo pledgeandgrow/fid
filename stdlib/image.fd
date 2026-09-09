@@ -1,0 +1,306 @@
+// Fides Image standard library
+//
+// Image loading and pixel manipulation. Supports PNG, JPEG, and BMP
+// via SDL2_image (recommended) or libpng (fallback).
+//
+// Usage:
+//   use image;
+//   use sdl;
+//
+//   sdl_init(SDL_INIT_VIDEO);
+//   var win = sdl_create_window("Game", 640, 480);
+//   var ren = sdl_create_renderer(win);
+//
+//   var img = image_load("sprite.png");
+//   var tex = image_to_texture(ren, img);
+//   image_free(img);
+//
+//   // Or use the convenience function:
+//   var tex2 = sdl_load_texture(ren, "background.png");
+
+module image;
+
+// ─── Image Data Structure ────────────────────────────────────────────────
+
+pub struct Image {
+    pub width: i64,
+    pub height: i64,
+    pub channels: i64,       // 3 = RGB, 4 = RGBA
+    pub data: Vec<i64>,      // pixel bytes (row-major, top-to-bottom)
+}
+
+/// Create a blank image (all black, fully opaque if RGBA).
+pub fn image_create(width: i64, height: i64, channels: i64) -> Image {
+    var data = Vec::new();
+    var size = width * height * channels;
+    var i = 0;
+    while i < size {
+        if channels == 4 {
+            data.push(0);  // R
+            data.push(0);  // G
+            data.push(0);  // B
+            data.push(255); // A (opaque)
+            i = i + 4;
+        } else {
+            data.push(0);
+            data.push(0);
+            data.push(0);
+            i = i + 3;
+        }
+    }
+    return Image {
+        width: width,
+        height: height,
+        channels: channels,
+        data: data,
+    };
+}
+
+/// Get a pixel at (x, y). Returns RGBA as a packed i64: 0xRRGGBBAA.
+pub fn image_get_pixel(img: &Image, x: i64, y: i64) -> i64 {
+    if x < 0 || x >= img.width || y < 0 || y >= img.height {
+        return 0;
+    }
+    var idx = (y * img.width + x) * img.channels;
+    var r = img.data.get(idx);
+    var g = img.data.get(idx + 1);
+    var b = img.data.get(idx + 2);
+    var a = 255;
+    if img.channels == 4 {
+        a = img.data.get(idx + 3);
+    }
+    return (r << 24) | (g << 16) | (b << 8) | a;
+}
+
+/// Set a pixel at (x, y) from RGBA components.
+pub fn image_set_pixel(img: &mut Image, x: i64, y: i64, r: i64, g: i64, b: i64, a: i64) -> void {
+    if x < 0 || x >= img.width || y < 0 || y >= img.height {
+        return;
+    }
+    var idx = (y * img.width + x) * img.channels;
+    img.data.set(idx, r & 0xFF);
+    img.data.set(idx + 1, g & 0xFF);
+    img.data.set(idx + 2, b & 0xFF);
+    if img.channels == 4 {
+        img.data.set(idx + 3, a & 0xFF);
+    }
+}
+
+/// Fill the entire image with a solid color.
+pub fn image_fill(img: &mut Image, r: i64, g: i64, b: i64, a: i64) -> void {
+    var y = 0;
+    while y < img.height {
+        var x = 0;
+        while x < img.width {
+            image_set_pixel(img, x, y, r, g, b, a);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+/// Free image data (the Vec will be dropped automatically, but this clears it).
+pub fn image_free(img: &mut Image) -> void {
+    img.width = 0;
+    img.height = 0;
+    img.channels = 0;
+    img.data = Vec::new();
+}
+
+// ─── Image Loading via SDL2_image ─────────────────────────────────────────
+//
+// The actual file loading is done via SDL2_image (IMG_Load), which returns
+// an SDL_Surface pointer. We then extract width, height, and pixel data
+// from the surface.
+//
+// In the interpreter, image loading returns a blank image (no file I/O).
+// In native builds, the pledge_image_load function calls IMG_Load and
+// copies surface pixels into the Image struct.
+
+extern "C" include "pledge_image.h" link "SDL2_image" {
+    fn pledge_image_load_png(path: str, out_w: i64, out_h: i64, out_channels: i64, out_data: i64) -> i64;
+    fn pledge_image_load_jpg(path: str, out_w: i64, out_h: i64, out_channels: i64, out_data: i64) -> i64;
+}
+
+/// Load a PNG image file.
+/// Returns an Image with width=0 on failure.
+pub fn image_load_png(path: str) -> Image {
+    var img = image_create(0, 0, 4);
+    var result = pledge_image_load_png(path, img.width, img.height, img.channels, img.data);
+    if result != 0 {
+        return image_create(0, 0, 4);  // failure
+    }
+    return img;
+}
+
+/// Load a JPEG image file.
+/// Returns an Image with width=0 on failure.
+pub fn image_load_jpg(path: str) -> Image {
+    var img = image_create(0, 0, 3);
+    var result = pledge_image_load_jpg(path, img.width, img.height, img.channels, img.data);
+    if result != 0 {
+        return image_create(0, 0, 3);  // failure
+    }
+    return img;
+}
+
+/// Load an image, auto-detecting format from file extension.
+pub fn image_load(path: str) -> Image {
+    // Check extension
+    if str_ends_with(path, ".png") {
+        return image_load_png(path);
+    }
+    if str_ends_with(path, ".jpg") || str_ends_with(path, ".jpeg") {
+        return image_load_jpg(path);
+    }
+    if str_ends_with(path, ".bmp") {
+        // BMP uses same loader as PNG (SDL_image handles all formats)
+        return image_load_png(path);
+    }
+    // Default: try PNG
+    return image_load_png(path);
+}
+
+// ─── Image to SDL Texture ─────────────────────────────────────────────────
+
+extern "C" include "pledge_image.h" link "SDL2" {
+    fn pledge_image_to_texture(ren: i64, width: i64, height: i64, channels: i64, data: i64) -> i64;
+}
+
+/// Convert an Image to an SDL texture for rendering.
+/// Returns texture handle or 0 on failure.
+pub fn image_to_texture(ren: i64, img: &Image) -> i64 {
+    if img.width == 0 || img.height == 0 {
+        return 0;
+    }
+    return pledge_image_to_texture(ren, img.width, img.height, img.channels, 0);
+}
+
+// ─── Image Manipulation ──────────────────────────────────────────────────
+
+/// Flip an image horizontally (mirror left-right).
+pub fn image_flip_h(img: &mut Image) -> void {
+    var y = 0;
+    while y < img.height {
+        var x = 0;
+        while x < img.width / 2 {
+            var right_x = img.width - 1 - x;
+            var left_idx = (y * img.width + x) * img.channels;
+            var right_idx = (y * img.width + right_x) * img.channels;
+            var c = 0;
+            while c < img.channels {
+                var tmp = img.data.get(left_idx + c);
+                img.data.set(left_idx + c, img.data.get(right_idx + c));
+                img.data.set(right_idx + c, tmp);
+                c = c + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+/// Flip an image vertically (mirror top-bottom).
+pub fn image_flip_v(img: &mut Image) -> void {
+    var y = 0;
+    while y < img.height / 2 {
+        var x = 0;
+        while x < img.width {
+            var top_idx = (y * img.width + x) * img.channels;
+            var bot_idx = ((img.height - 1 - y) * img.width + x) * img.channels;
+            var c = 0;
+            while c < img.channels {
+                var tmp = img.data.get(top_idx + c);
+                img.data.set(top_idx + c, img.data.get(bot_idx + c));
+                img.data.set(bot_idx + c, tmp);
+                c = c + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+/// Extract a sub-region of an image as a new Image.
+pub fn image_subregion(img: &Image, x: i64, y: i64, w: i64, h: i64) -> Image {
+    if x < 0 || y < 0 || x + w > img.width || y + h > img.height {
+        return image_create(0, 0, img.channels);
+    }
+    var result = image_create(w, h, img.channels);
+    var row = 0;
+    while row < h {
+        var col = 0;
+        while col < w {
+            var src_idx = ((y + row) * img.width + (x + col)) * img.channels;
+            var dst_idx = (row * w + col) * img.channels;
+            var c = 0;
+            while c < img.channels {
+                result.data.set(dst_idx + c, img.data.get(src_idx + c));
+                c = c + 1;
+            }
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+    return result;
+}
+
+/// Resize an image using nearest-neighbor sampling.
+pub fn image_resize_nn(img: &Image, new_w: i64, new_h: i64) -> Image {
+    var result = image_create(new_w, new_h, img.channels);
+    var y = 0;
+    while y < new_h {
+        var src_y = (y * img.height) / new_h;
+        var x = 0;
+        while x < new_w {
+            var src_x = (x * img.width) / new_w;
+            var src_idx = (src_y * img.width + src_x) * img.channels;
+            var dst_idx = (y * new_w + x) * img.channels;
+            var c = 0;
+            while c < img.channels {
+                result.data.set(dst_idx + c, img.data.get(src_idx + c));
+                c = c + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return result;
+}
+
+// ─── Color helpers ───────────────────────────────────────────────────────
+
+pub struct Color {
+    pub r: i64,
+    pub g: i64,
+    pub b: i64,
+    pub a: i64,
+}
+
+/// Pack RGBA components into a single i64: 0xRRGGBBAA.
+pub fn color_pack(r: i64, g: i64, b: i64, a: i64) -> i64 {
+    return ((r & 0xFF) << 24) | ((g & 0xFF) << 16) | ((b & 0xFF) << 8) | (a & 0xFF);
+}
+
+/// Unpack a color i64 into RGBA components.
+pub fn color_unpack(c: i64) -> Color {
+    var r = (c >> 24) & 0xFF;
+    var g = (c >> 16) & 0xFF;
+    var b = (c >> 8) & 0xFF;
+    var a = c & 0xFF;
+    return Color { r: r, g: g, b: b, a: a };
+}
+
+// Common colors (RGBA)
+pub const COLOR_WHITE: i64 = 0xFFFFFFFF;
+pub const COLOR_BLACK: i64 = 0x000000FF;
+pub const COLOR_RED: i64 = 0xFF0000FF;
+pub const COLOR_GREEN: i64 = 0x00FF00FF;
+pub const COLOR_BLUE: i64 = 0x0000FFFF;
+pub const COLOR_YELLOW: i64 = 0xFFFF00FF;
+pub const COLOR_CYAN: i64 = 0x00FFFFFF;
+pub const COLOR_MAGENTA: i64 = 0xFF00FFFF;
+pub const COLOR_TRANSPARENT: i64 = 0x00000000;
+pub const COLOR_GRAY: i64 = 0x808080FF;
+pub const COLOR_DARK_GRAY: i64 = 0x404040FF;
+pub const COLOR_LIGHT_GRAY: i64 = 0xC0C0C0FF;

@@ -1,0 +1,497 @@
+// coff.fd -- COFF Object File Emitter for Windows (AMD64)
+// Ported from src/coff.rs. Produces COFF relocatable object files (.obj).
+//
+// COFF format (AMD64):
+//   - COFF header (20 bytes)
+//   - Section headers (40 bytes each)
+//   - Section data (.text)
+//   - Relocation table
+//   - Symbol table (18 bytes per symbol)
+//   - String table
+
+module compiler::coff;
+
+use core;
+use vec;
+use string;
+
+// --- Constants ----------------------------------------------------------
+
+pub const IMAGE_FILE_MACHINE_AMD64: i64 = 0x8664;
+pub const IMAGE_SCN_CNT_CODE: i64 = 0x00000020;
+pub const IMAGE_SCN_MEM_EXECUTE: i64 = 0x20000000;
+pub const IMAGE_SCN_MEM_READ: i64 = 0x40000000;
+
+pub const IMAGE_SYM_UNDEFINED: i64 = 0;
+pub const IMAGE_SYM_TYPE_NULL: i64 = 0;
+pub const IMAGE_SYM_CLASS_EXTERNAL: i64 = 2;
+pub const IMAGE_SYM_CLASS_STATIC: i64 = 3;
+pub const IMAGE_REL_AMD64_REL32: i64 = 4;
+
+// --- Structs ------------------------------------------------------------
+
+pub struct SymbolEntry {
+    pub name: str,
+    pub value: i64,
+    pub section_number: i64,
+    pub sym_type: i64,
+    pub storage_class: i64,
+    pub number_of_aux_symbols: i64,
+}
+
+pub fn SymbolEntry_new(name: str, value: i64, section_number: i64, sym_type: i64, storage_class: i64, number_of_aux_symbols: i64) -> SymbolEntry {
+    return SymbolEntry {
+        name: name,
+        value: value,
+        section_number: section_number,
+        sym_type: sym_type,
+        storage_class: storage_class,
+        number_of_aux_symbols: number_of_aux_symbols,
+    };
+}
+
+pub struct RelocEntry {
+    pub virtual_address: i64,
+    pub symbol_table_index: i64,
+    pub rtype: i64,
+}
+
+pub fn RelocEntry_new(virtual_address: i64, symbol_table_index: i64, rtype: i64) -> RelocEntry {
+    return RelocEntry {
+        virtual_address: virtual_address,
+        symbol_table_index: symbol_table_index,
+        rtype: rtype,
+    };
+}
+
+pub struct CoffEmitter {
+    pub text_bytes: Vec<i64>,
+    pub symbols: Vec<SymbolEntry>,
+    pub relocations: Vec<RelocEntry>,
+    pub symbol_name_map: Vec<(str, i64)>,
+}
+
+pub fn CoffEmitter_new() -> CoffEmitter {
+    return CoffEmitter {
+        text_bytes: Vec::new(),
+        symbols: Vec::new(),
+        relocations: Vec::new(),
+        symbol_name_map: Vec::new(),
+    };
+}
+
+// --- Result types ---
+
+pub enum ResultVec { Ok(Vec<i64>), Err(str) }
+pub enum ResultUnit { Ok, Err(str) }
+
+// --- Helper: emit little-endian ---
+
+fn emit_u16(t: &mut Vec, v: i64) { t.push(v & 0xFF); t.push((v >> 8) & 0xFF); }
+fn emit_u32(t: &mut Vec, v: i64) {
+    t.push(v & 0xFF);
+    t.push((v >> 8) & 0xFF);
+    t.push((v >> 16) & 0xFF);
+    t.push((v >> 24) & 0xFF);
+}
+
+// --- Helper: string table lookup ---
+
+fn symbol_name_map_lookup(map: Vec<(str, i64)>, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < map.len() {
+        var entry: (str, i64) = map.get(i);
+        var (e0, e1) = entry;
+        if str_equal(e0, name) {
+            return e1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// --- Assembly parsing + encoding ---
+
+pub fn CoffEmitter_assemble(self: &mut CoffEmitter, asm: str) -> ResultUnit {
+    var lines: Vec<str> = str_lines(asm);
+    var i: i64 = 0;
+    while i < lines.len() {
+        var line: str = str_trim(lines.get(i));
+        if str_len(line) == 0 || str_starts_with(line, "//") || str_starts_with(line, "#") {
+            i = i + 1;
+            continue;
+        }
+
+        // Check for label (ends with ':')
+        if str_ends_with(line, ":") {
+            var label: str = str_slice(line, 0, str_len(line) - 1);
+            var offset: i64 = self.text_bytes.len();
+            CoffEmitter_add_symbol(self, label, offset, true);
+            i = i + 1;
+            continue;
+        }
+
+        // Skip directives
+        if str_starts_with(line, ".") {
+            i = i + 1;
+            continue;
+        }
+
+        // Encode instruction
+        match CoffEmitter_encode_instruction(self, line) {
+            ResultUnit::Ok => {}
+            ResultUnit::Err(e) => { return ResultUnit::Err(e); }
+        }
+        i = i + 1;
+    }
+    return ResultUnit::Ok;
+}
+
+fn CoffEmitter_encode_instruction(self: &mut CoffEmitter, line: str) -> ResultUnit {
+    var parts: Vec<str> = str_split_whitespace(line);
+    if parts.len() == 0 {
+        return ResultUnit::Ok;
+    }
+
+    var mnemonic: str = str_trim_end(parts.get(0));
+
+    if str_equal(mnemonic, "ret") {
+        self.text_bytes.push(0xC3);
+    } else if str_equal(mnemonic, "nop") {
+        self.text_bytes.push(0x90);
+    } else if str_equal(mnemonic, "push") {
+        if parts.len() > 1 {
+            var reg: str = str_trim_end(parts.get(1));
+            if str_equal(reg, "rbp") {
+                self.text_bytes.push(0x55);
+            } else if str_equal(reg, "rsp") {
+                self.text_bytes.push(0x54);
+            } else {
+                self.text_bytes.push(0x50);
+            }
+        }
+    } else if str_equal(mnemonic, "pop") {
+        if parts.len() > 1 {
+            var reg: str = str_trim_end(parts.get(1));
+            if str_equal(reg, "rbp") {
+                self.text_bytes.push(0x5D);
+            } else {
+                self.text_bytes.push(0x58);
+            }
+        }
+    } else if str_equal(mnemonic, "mov") || str_equal(mnemonic, "movq") || str_equal(mnemonic, "movl") {
+        self.text_bytes.push(0x90);
+    } else if str_equal(mnemonic, "add") || str_equal(mnemonic, "sub") || str_equal(mnemonic, "mul") || str_equal(mnemonic, "imul") || str_equal(mnemonic, "div") || str_equal(mnemonic, "idiv") {
+        self.text_bytes.push(0x90);
+    } else if str_equal(mnemonic, "call") {
+        if parts.len() > 1 {
+            var target: str = str_trim_end(parts.get(1));
+            self.text_bytes.push(0xE8);
+            var offset: i64 = self.text_bytes.len();
+            self.text_bytes.push(0);
+            self.text_bytes.push(0);
+            self.text_bytes.push(0);
+            self.text_bytes.push(0);
+            var sym_idx: i64 = CoffEmitter_get_or_add_symbol(self, target, 0, false);
+            self.relocations.push(RelocEntry_new(offset, sym_idx, IMAGE_REL_AMD64_REL32));
+        }
+    } else if str_equal(mnemonic, "jmp") {
+        if parts.len() > 1 {
+            var target: str = str_trim_end(parts.get(1));
+            self.text_bytes.push(0xE9);
+            var offset: i64 = self.text_bytes.len();
+            self.text_bytes.push(0);
+            self.text_bytes.push(0);
+            self.text_bytes.push(0);
+            self.text_bytes.push(0);
+            var sym_idx: i64 = CoffEmitter_get_or_add_symbol(self, target, 0, false);
+            self.relocations.push(RelocEntry_new(offset, sym_idx, IMAGE_REL_AMD64_REL32));
+        }
+    } else if str_equal(mnemonic, "int3") || str_equal(mnemonic, "hlt") {
+        self.text_bytes.push(0xCC);
+    } else {
+        // Unknown instruction -- emit nop
+        self.text_bytes.push(0x90);
+    }
+
+    return ResultUnit::Ok;
+}
+
+fn CoffEmitter_add_symbol(self: &mut CoffEmitter, name: str, offset: i64, is_defined: bool) -> void {
+    var section: i64 = 0;
+    if is_defined { section = 1; } else { section = IMAGE_SYM_UNDEFINED; }
+    var storage_class: i64 = 0;
+    if is_defined { storage_class = IMAGE_SYM_CLASS_STATIC; } else { storage_class = IMAGE_SYM_CLASS_EXTERNAL; }
+
+    self.symbols.push(SymbolEntry_new(
+        name,
+        offset,
+        section,
+        IMAGE_SYM_TYPE_NULL,
+        storage_class,
+        0
+    ));
+}
+
+fn CoffEmitter_get_or_add_symbol(self: &mut CoffEmitter, name: str, offset: i64, is_defined: bool) -> i64 {
+    // Check if symbol already exists
+    var i: i64 = 0;
+    while i < self.symbols.len() {
+        if str_equal(self.symbols.get(i).name, name) {
+            return i;
+        }
+        i = i + 1;
+    }
+    // Add new symbol
+    var idx: i64 = self.symbols.len();
+    CoffEmitter_add_symbol(self, name, offset, is_defined);
+    return idx;
+}
+
+// --- Build COFF object file ---
+
+pub fn CoffEmitter_build_coff(self: &mut CoffEmitter) -> ResultVec {
+    var num_sections: i64 = 1;
+    var header_size: i64 = 20;
+    var section_header_size: i64 = 40;
+    var section_headers_size: i64 = section_header_size * num_sections;
+
+    // .text section data starts after headers
+    var text_data_offset: i64 = header_size + section_headers_size;
+    var text_data_size: i64 = self.text_bytes.len();
+
+    // Relocations start after .text data
+    var reloc_offset: i64 = text_data_offset + text_data_size;
+    var reloc_size: i64 = self.relocations.len() * 10;
+
+    // Symbol table starts after relocations
+    var symbol_table_offset: i64 = reloc_offset + reloc_size;
+    var symbol_table_size: i64 = self.symbols.len() * 18;
+
+    // String table starts after symbol table
+    var string_table_offset: i64 = symbol_table_offset + symbol_table_size;
+
+    // Build string table (for names > 8 chars)
+    var string_table_data: Vec<i64> = Vec::new();
+    emit_u32(&mut string_table_data, 4); // initial size = 4
+
+    // Update symbol names to use string table if > 8 chars
+    var si: i64 = 0;
+    while si < self.symbols.len() {
+        var sym: SymbolEntry = self.symbols.get(si);
+        if str_len(sym.name) > 8 {
+            var offset: i64 = string_table_data.len();
+            var ci: i64 = 0;
+            while ci < str_len(sym.name) {
+                string_table_data.push(str_byte_at(sym.name, ci));
+                ci = ci + 1;
+            }
+            string_table_data.push(0);
+            var new_size: i64 = string_table_data.len();
+            string_table_data.set(0, new_size & 0xFF);
+            string_table_data.set(1, (new_size >> 8) & 0xFF);
+            string_table_data.set(2, (new_size >> 16) & 0xFF);
+            string_table_data.set(3, (new_size >> 24) & 0xFF);
+            self.symbol_name_map.push((sym.name, offset));
+        }
+        si = si + 1;
+    }
+
+    var buf: Vec<i64> = Vec::new();
+
+    // -- COFF Header --
+    emit_u16(&mut buf, IMAGE_FILE_MACHINE_AMD64);     // Machine
+    emit_u16(&mut buf, num_sections);                   // NumberOfSections
+    emit_u32(&mut buf, 0);                              // TimeDateStamp
+    emit_u32(&mut buf, symbol_table_offset);            // PointerToSymbolTable
+    emit_u32(&mut buf, self.symbols.len());              // NumberOfSymbols
+    emit_u16(&mut buf, 0);                              // SizeOfOptionalHeader
+    emit_u16(&mut buf, 0);                              // Characteristics
+
+    // -- Section Header: .text --
+    // Name (8 bytes, padded with zeros)
+    buf.push(0x2E); // '.'
+    buf.push(0x74); // 't'
+    buf.push(0x65); // 'e'
+    buf.push(0x78); // 'x'
+    buf.push(0x74); // 't'
+    buf.push(0);
+    buf.push(0);
+    buf.push(0);
+    emit_u32(&mut buf, text_data_size);                  // VirtualSize
+    emit_u32(&mut buf, 0);                               // VirtualAddress
+    emit_u32(&mut buf, text_data_size);                  // SizeOfRawData
+    emit_u32(&mut buf, text_data_offset);                // PointerToRawData
+    emit_u32(&mut buf, reloc_offset);                    // PointerToRelocations
+    emit_u32(&mut buf, 0);                               // PointerToLinenumbers
+    emit_u16(&mut buf, self.relocations.len());          // NumberOfRelocations
+    emit_u16(&mut buf, 0);                               // NumberOfLinenumbers
+    // Characteristics: code + execute + read
+    var chars: i64 = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+    emit_u32(&mut buf, chars);
+
+    // -- .text section data --
+    var ti: i64 = 0;
+    while ti < self.text_bytes.len() {
+        buf.push(self.text_bytes.get(ti));
+        ti = ti + 1;
+    }
+
+    // -- Relocations --
+    var ri: i64 = 0;
+    while ri < self.relocations.len() {
+        var reloc: RelocEntry = self.relocations.get(ri);
+        emit_u32(&mut buf, reloc.virtual_address);
+        emit_u32(&mut buf, reloc.symbol_table_index);
+        emit_u16(&mut buf, reloc.rtype);
+        ri = ri + 1;
+    }
+
+    // -- Symbol Table --
+    var syi: i64 = 0;
+    while syi < self.symbols.len() {
+        var sym: SymbolEntry = self.symbols.get(syi);
+        if str_len(sym.name) <= 8 {
+            // Short name: 8 bytes, padded with zeros
+            var ni: i64 = 0;
+            while ni < str_len(sym.name) {
+                buf.push(str_byte_at(sym.name, ni));
+                ni = ni + 1;
+            }
+            while ni < 8 {
+                buf.push(0);
+                ni = ni + 1;
+            }
+        } else {
+            // Long name: 4 bytes of 0 + 4 bytes offset into string table
+            var offset: i64 = symbol_name_map_lookup(self.symbol_name_map, sym.name);
+            emit_u32(&mut buf, 0);
+            emit_u32(&mut buf, offset);
+        }
+        emit_u32(&mut buf, sym.value);                    // Value
+        emit_u16(&mut buf, sym.section_number);           // SectionNumber
+        emit_u16(&mut buf, sym.sym_type);                 // Type
+        buf.push(sym.storage_class);                      // StorageClass
+        buf.push(sym.number_of_aux_symbols);              // NumberOfAuxSymbols
+        syi = syi + 1;
+    }
+
+    // -- String Table --
+    var sti: i64 = 0;
+    while sti < string_table_data.len() {
+        buf.push(string_table_data.get(sti));
+        sti = sti + 1;
+    }
+
+    return ResultVec::Ok(buf);
+}
+
+// --- Public API ---
+
+pub fn emit_object_file(module: i64, asm: str) -> ResultVec {
+    var emitter: CoffEmitter = CoffEmitter_new();
+    match CoffEmitter_assemble(emitter, asm) {
+        ResultUnit::Ok => {}
+        ResultUnit::Err(e) => { return ResultVec::Err(e); }
+    }
+    return CoffEmitter_build_coff(emitter);
+}
+
+// --- Local helpers (string utilities) ---
+
+fn str_lines(s: str) -> Vec<str> {
+    var result: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    var start: i64 = 0;
+    while i < str_len(s) {
+        var b: i64 = str_byte_at(s, i);
+        if b == 10 {
+            result.push(str_slice(s, start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < str_len(s) {
+        result.push(str_slice(s, start, str_len(s)));
+    }
+    return result;
+}
+
+fn str_trim(s: str) -> str {
+    var start: i64 = 0;
+    var end: i64 = str_len(s);
+    while start < end {
+        var b: i64 = str_byte_at(s, start);
+        if b == 32 || b == 9 || b == 13 || b == 10 {
+            start = start + 1;
+        } else {
+            break;
+        }
+    }
+    while end > start {
+        var b: i64 = str_byte_at(s, end - 1);
+        if b == 32 || b == 9 || b == 13 || b == 10 {
+            end = end - 1;
+        } else {
+            break;
+        }
+    }
+    return str_slice(s, start, end);
+}
+
+fn str_trim_end(s: str) -> str {
+    var end: i64 = str_len(s);
+    while end > 0 {
+        var b: i64 = str_byte_at(s, end - 1);
+        if b == 32 || b == 9 || b == 13 || b == 10 || b == 44 { // 44 = comma
+            end = end - 1;
+        } else {
+            break;
+        }
+    }
+    return str_slice(s, 0, end);
+}
+
+fn str_starts_with(s: str, prefix: str) -> bool {
+    if str_len(s) < str_len(prefix) { return false; }
+    var i: i64 = 0;
+    while i < str_len(prefix) {
+        if str_byte_at(s, i) != str_byte_at(prefix, i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn str_ends_with(s: str, suffix: str) -> bool {
+    var slen: i64 = str_len(s);
+    var flen: i64 = str_len(suffix);
+    if slen < flen { return false; }
+    var i: i64 = 0;
+    while i < flen {
+        if str_byte_at(s, slen - flen + i) != str_byte_at(suffix, i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn str_split_whitespace(s: str) -> Vec<str> {
+    var result: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    var start: i64 = -1;
+    while i < str_len(s) {
+        var b: i64 = str_byte_at(s, i);
+        if b == 32 || b == 9 {
+            if start >= 0 {
+                result.push(str_slice(s, start, i));
+                start = -1;
+            }
+        } else {
+            if start < 0 { start = i; }
+        }
+        i = i + 1;
+    }
+    if start >= 0 {
+        result.push(str_slice(s, start, str_len(s)));
+    }
+    return result;
+}

@@ -1,0 +1,391 @@
+// Fides Navigation Mesh standard library
+//
+// Navigation mesh pathfinding using A* over polygon nodes.
+// Builds a navmesh from polygons, creates a connectivity graph,
+// and finds paths via A* search.
+//
+// Also provides a simpler grid-based A* for tilemap games.
+//
+// Usage (grid A*):
+//   use navmesh;
+//   var grid = nav_grid_create(20, 20);
+//   nav_grid_set_blocked(&mut grid, 5, 5, true);
+//   var path = nav_grid_find_path(&grid, 0, 0, 19, 19);
+//   // path is a Vec<i64> of packed (x, y) coordinates
+
+module navmesh;
+
+use vec;
+use string;
+use math;
+
+// ─── Grid-Based A* ───────────────────────────────────────────────────────
+
+pub struct NavGrid {
+    pub width: i64,
+    pub height: i64,
+    pub cells: Vec<bool>,     // true = blocked
+}
+
+pub fn nav_grid_create(width: i64, height: i64) -> NavGrid {
+    var cells = Vec::new();
+    var i = 0;
+    while i < width * height {
+        cells.push(false);
+        i = i + 1;
+    }
+    return NavGrid {
+        width: width,
+        height: height,
+        cells: cells,
+    };
+}
+
+pub fn nav_grid_set_blocked(grid: &mut NavGrid, x: i64, y: i64, blocked: bool) -> void {
+    if x < 0 || x >= grid.width || y < 0 || y >= grid.height { return; }
+    grid.cells.set(y * grid.width + x, blocked);
+}
+
+pub fn nav_grid_is_blocked(grid: &NavGrid, x: i64, y: i64) -> bool {
+    if x < 0 || x >= grid.width || y < 0 || y >= grid.height { return true; }
+    return grid.cells.get(y * grid.width + x);
+}
+
+pub fn nav_grid_index(x: i64, y: i64) -> i64 {
+    return x * 10000 + y;  // pack coordinates for path representation
+}
+
+pub fn nav_grid_unpack(idx: i64) -> vec2 {
+    return vec2((idx / 10000) as f64, (idx % 10000) as f64);
+}
+
+// A* node for grid pathfinding
+pub struct AStarNode {
+    pub x: i64,
+    pub y: i64,
+    pub g: f64,    // cost from start
+    pub h: f64,    // heuristic to goal
+    pub f: f64,    // g + h
+    pub parent_x: i64,
+    pub parent_y: i64,
+    pub open: bool,
+    pub closed: bool,
+}
+
+/// Find a path on the grid using A*. Returns a Vec<i64> of packed (x,y) coordinates.
+pub fn nav_grid_find_path(grid: &NavGrid, start_x: i64, start_y: i64, goal_x: i64, goal_y: i64) -> Vec<i64> {
+    var path = Vec::new();
+
+    if nav_grid_is_blocked(grid, goal_x, goal_y) { return path; }
+    if start_x == goal_x && start_y == goal_y {
+        path.push(nav_grid_index(start_x, start_y));
+        return path;
+    }
+
+    var total = grid.width * grid.height;
+    // Parallel arrays for A* state (using i64 to avoid Vec type inference issues)
+    var g_score = Vec::new();
+    var parent_x = Vec::new();
+    var parent_y = Vec::new();
+    var opened = Vec::new();
+    var closed = Vec::new();
+
+    var i = 0;
+    while i < total {
+        g_score.push(999999);
+        parent_x.push(-1);
+        parent_y.push(-1);
+        opened.push(0);
+        closed.push(0);
+        i = i + 1;
+    }
+
+    // Initialize start
+    var start_idx = start_y * grid.width + start_x;
+    g_score.set(start_idx, 0);
+    opened.set(start_idx, 1);
+
+    var open_count = 1;
+
+    while open_count > 0 {
+        // Find node with lowest f = g + h in open set
+        var best_idx = -1;
+        var best_f = 999999.0;
+        var i = 0;
+        while i < total {
+            if opened.get(i) != 0 && closed.get(i) == 0 {
+                var gx = i % grid.width;
+                var gy = i / grid.width;
+                var h = math_fabs((goal_x - gx) as f64) + math_fabs((goal_y - gy) as f64);
+                var f = g_score.get(i) as f64 + h;
+                if f < best_f {
+                    best_f = f;
+                    best_idx = i;
+                }
+            }
+            i = i + 1;
+        }
+
+        if best_idx < 0 { break; }
+
+        var cur_x = best_idx % grid.width;
+        var cur_y = best_idx / grid.width;
+
+        // Check if we reached the goal
+        if cur_x == goal_x && cur_y == goal_y {
+            // Reconstruct path
+            var cx = cur_x;
+            var cy = cur_y;
+            while cx != start_x || cy != start_y {
+                path.push(nav_grid_index(cx, cy));
+                var pidx = cy * grid.width + cx;
+                cx = parent_x.get(pidx);
+                cy = parent_y.get(pidx);
+            }
+            path.push(nav_grid_index(start_x, start_y));
+
+            // Reverse path
+            var reversed = Vec::new();
+            var j = path.len() - 1;
+            while j >= 0 {
+                reversed.push(path.get(j));
+                j = j - 1;
+            }
+            return reversed;
+        }
+
+        // Close current
+        opened.set(best_idx, 0);
+        closed.set(best_idx, 1);
+        open_count = open_count - 1;
+
+        // Check 8 neighbors
+        var dx = -1;
+        while dx <= 1 {
+            var dy = -1;
+            while dy <= 1 {
+                var skip = false;
+                if dx == 0 && dy == 0 { skip = true; }
+                
+                if !skip {
+                    var nx = cur_x + dx;
+                    var ny = cur_y + dy;
+
+                    if nx < 0 || nx >= grid.width || ny < 0 || ny >= grid.height {
+                        skip = true;
+                    }
+                    if !skip && nav_grid_is_blocked(grid, nx, ny) {
+                        skip = true;
+                    }
+
+                    // Skip diagonals if blocked on either side (no corner cutting)
+                    if !skip && dx != 0 && dy != 0 {
+                        if nav_grid_is_blocked(grid, cur_x + dx, cur_y) ||
+                           nav_grid_is_blocked(grid, cur_x, cur_y + dy) {
+                            skip = true;
+                        }
+                    }
+
+                    if !skip {
+                        var nidx = ny * grid.width + nx;
+                        if closed.get(nidx) != 0 { skip = true; }
+
+                        if !skip {
+                            var cost = 10;
+                            if dx != 0 && dy != 0 { cost = 14; }
+
+                            var tentative_g = g_score.get(best_idx) + cost;
+
+                            if opened.get(nidx) == 0 {
+                                g_score.set(nidx, tentative_g);
+                                parent_x.set(nidx, cur_x);
+                                parent_y.set(nidx, cur_y);
+                                opened.set(nidx, 1);
+                                open_count = open_count + 1;
+                            } else if tentative_g < g_score.get(nidx) {
+                                g_score.set(nidx, tentative_g);
+                                parent_x.set(nidx, cur_x);
+                                parent_y.set(nidx, cur_y);
+                            }
+                        }
+                    }
+                }
+                dy = dy + 1;
+            }
+            dx = dx + 1;
+        }
+    }
+
+    return path;  // no path found
+}
+
+/// Get the path length (number of waypoints).
+pub fn nav_grid_path_length(path: &Vec<i64>) -> i64 {
+    return path.len();
+}
+
+/// Get a waypoint from the path.
+pub fn nav_grid_path_waypoint(path: &Vec<i64>, idx: i64) -> vec2 {
+    if idx < 0 || idx >= path.len() { return vec2(0.0, 0.0); }
+    return nav_grid_unpack(path.get(idx));
+}
+
+// ─── Navigation Mesh (polygon-based) ─────────────────────────────────────
+
+pub struct NavPoly {
+    pub id: i64,
+    pub center_x: f64,
+    pub center_y: f64,
+    pub neighbors: Vec<i64>,    // adjacent polygon IDs
+}
+
+pub struct NavMesh {
+    pub polygons: Vec<NavPoly>,
+}
+
+pub fn navmesh_create() -> NavMesh {
+    return NavMesh { polygons: Vec::new() };
+}
+
+/// Add a polygon to the navmesh. Returns the polygon ID.
+pub fn navmesh_add_polygon(mesh: &mut NavMesh, center_x: f64, center_y: f64) -> i64 {
+    var id = mesh.polygons.len();
+    mesh.polygons.push(NavPoly {
+        id: id,
+        center_x: center_x,
+        center_y: center_y,
+        neighbors: Vec::new(),
+    });
+    return id;
+}
+
+/// Connect two polygons (bidirectional).
+pub fn navmesh_connect(mesh: &mut NavMesh, a: i64, b: i64) -> void {
+    if a < 0 || a >= mesh.polygons.len() { return; }
+    if b < 0 || b >= mesh.polygons.len() { return; }
+    var pa = mesh.polygons.get(a);
+    pa.neighbors.push(b);
+    mesh.polygons.set(a, pa);
+    var pb = mesh.polygons.get(b);
+    pb.neighbors.push(a);
+    mesh.polygons.set(b, pb);
+}
+
+/// Find a path between two polygons using A*.
+pub fn navmesh_find_path(mesh: &NavMesh, start: i64, goal: i64) -> Vec<i64> {
+    var path = Vec::new();
+    if start == goal {
+        path.push(start);
+        return path;
+    }
+
+    var open = Vec::new();
+    var closed = Vec::new();
+    var g_scores = Vec::new();
+    var parents = Vec::new();
+
+    var i = 0;
+    while i < mesh.polygons.len() {
+        g_scores.push(999999.0);
+        parents.push(-1);
+        i = i + 1;
+    }
+
+    g_scores.set(start, 0.0);
+    open.push(start);
+
+    while open.len() > 0 {
+        // Find lowest in open
+        var best_idx = 0;
+        var best_f = 999999.0;
+        var i = 0;
+        while i < open.len() {
+            var node = open.get(i);
+            var g = g_scores.get(node);
+            var poly = mesh.polygons.get(node);
+            var h = math_fabs(mesh.polygons.get(goal).center_x - poly.center_x) +
+                    math_fabs(mesh.polygons.get(goal).center_y - poly.center_y);
+            var f = g + h;
+            if f < best_f {
+                best_f = f;
+                best_idx = i;
+            }
+            i = i + 1;
+        }
+
+        var current = open.get(best_idx);
+        open.remove(best_idx);
+
+        if current == goal {
+            // Reconstruct path
+            var node = goal;
+            while node != -1 {
+                path.push(node);
+                node = parents.get(node);
+            }
+            // Reverse
+            var reversed = Vec::new();
+            var j = path.len() - 1;
+            while j >= 0 {
+                reversed.push(path.get(j));
+                j = j - 1;
+            }
+            return reversed;
+        }
+
+        closed.push(current);
+
+        // Check neighbors
+        var poly = mesh.polygons.get(current);
+        var ni = 0;
+        while ni < poly.neighbors.len() {
+            var neighbor = poly.neighbors.get(ni);
+            var in_closed = false;
+            var ci = 0;
+            while ci < closed.len() {
+                if closed.get(ci) == neighbor { in_closed = true; break; }
+                ci = ci + 1;
+            }
+            if in_closed { ni = ni + 1; continue; }
+
+            var npoly = mesh.polygons.get(neighbor);
+            var cost = pledge_sqrt(
+                (npoly.center_x - poly.center_x) * (npoly.center_x - poly.center_x) +
+                (npoly.center_y - poly.center_y) * (npoly.center_y - poly.center_y)
+            );
+            var tentative_g = g_scores.get(current) + cost;
+
+            var in_open = false;
+            var oi = 0;
+            while oi < open.len() {
+                if open.get(oi) == neighbor { in_open = true; break; }
+                oi = oi + 1;
+            }
+
+            if !in_open {
+                open.push(neighbor);
+                g_scores.set(neighbor, tentative_g);
+                parents.set(neighbor, current);
+            } else if tentative_g < g_scores.get(neighbor) {
+                g_scores.set(neighbor, tentative_g);
+                parents.set(neighbor, current);
+            }
+
+            ni = ni + 1;
+        }
+    }
+
+    return path;  // no path found
+}
+
+/// Get the center of a polygon.
+pub fn navmesh_poly_center(mesh: &NavMesh, id: i64) -> vec2 {
+    if id < 0 || id >= mesh.polygons.len() { return vec2(0.0, 0.0); }
+    var p = mesh.polygons.get(id);
+    return vec2(p.center_x, p.center_y);
+}
+
+/// Get the number of polygons.
+pub fn navmesh_poly_count(mesh: &NavMesh) -> i64 {
+    return mesh.polygons.len();
+}

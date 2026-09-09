@@ -16,7 +16,7 @@ use string;
 use compiler::pir;
 
 // --- Local helper: split string by newlines ---
-fn str_lines(s: str) -> Vec<str> {
+pub fn str_lines(s: str) -> Vec<str> {
     var result: Vec<str> = Vec::new();
     var i: i64 = 0;
     var start: i64 = 0;
@@ -55,7 +55,9 @@ pub const SHT_PROGBITS: i64 = 1;
 pub const SHT_SYMTAB: i64 = 2;
 pub const SHT_STRTAB: i64 = 3;
 pub const SHT_RELA: i64 = 4;
+pub const SHT_NOBITS: i64 = 8;
 
+pub const SHF_WRITE: i64 = 0x1;
 pub const SHF_ALLOC: i64 = 0x2;
 pub const SHF_EXECINSTR: i64 = 0x4;
 pub const SHF_INFO_LINK: i64 = 0x40;
@@ -130,6 +132,21 @@ pub struct ElfEmitter {
     pub rodata: Vec<i64>,
     pub rodata_symbols: Vec<RodataSym>,
     pub rodata_relocations: Vec<Relocation>,
+    pub custom_sections: Vec<CustomSection>,
+}
+
+// Custom linker section for kernel/OS development.
+// Allows users to define custom sections like .data, .bss, .init, .kdata, etc.
+pub struct CustomSection {
+    pub name: str,
+    pub data: Vec<i64>,
+    pub sh_type: i64,   // SHT_PROGBITS, SHT_NOBITS, etc.
+    pub sh_flags: i64,  // SHF_ALLOC, SHF_WRITE, SHF_EXECINSTR, etc.
+    pub align: i64,     // alignment in bytes
+}
+
+pub fn CustomSection_new(name: str, data: Vec<i64>, sh_type: i64, sh_flags: i64, align: i64) -> CustomSection {
+    return CustomSection { name: name, data: data, sh_type: sh_type, sh_flags: sh_flags, align: align };
 }
 
 pub fn ElfEmitter_new() -> ElfEmitter {
@@ -147,6 +164,7 @@ pub fn ElfEmitter_new() -> ElfEmitter {
         rodata: Vec::new(),
         rodata_symbols: Vec::new(),
         rodata_relocations: Vec::new(),
+        custom_sections: Vec::new(),
     };
     e.strtab.push(0);
     e.shstrtab.push(0);
@@ -221,6 +239,18 @@ pub fn ElfEmitter_add_symbol(self: &mut ElfEmitter, name: str, value: i64, size:
     idx = self.symbols.len();
     self.symbols.push(Symbol_new(name, value, size, binding, sym_type, section, is_defined));
     symindex_set(self.symbol_index, name, idx);
+}
+
+// Add a custom linker section (for kernel/OS development).
+// section_type: SHT_PROGBITS (1) for initialized data, SHT_NOBITS (8) for .bss
+// section_flags: SHF_ALLOC (2) | SHF_WRITE (1) | SHF_EXECINSTR (4)
+// align: alignment in bytes (e.g. 16 for code, 8 for data, 1 for packed)
+pub fn ElfEmitter_add_custom_section(self: &mut ElfEmitter, name: str, data: Vec<i64>, section_type: i64, section_flags: i64, align: i64) -> i64 {
+    var section_idx: i64 = 7 + self.custom_sections.len();  // sections 0-6 are standard
+    self.custom_sections.push(CustomSection_new(name, data, section_type, section_flags, align));
+    // Register the section name in shstrtab
+    ElfEmitter_add_shstrtab(self, name);
+    return section_idx;
 }
 
 pub fn ElfEmitter_get_or_add_undef_symbol(self: &mut ElfEmitter, name: str) -> i64 {
@@ -2360,6 +2390,23 @@ pub fn ElfEmitter_build_elf(self: &ElfEmitter) -> ResultVec {
         rli = rli + 1;
     }
     var rela_size: i64 = buf.len() - rela_offset;
+    // Custom section data (emitted after .rela.text, before section headers)
+    var custom_section_offsets: Vec<i64> = Vec::new();
+    var csi: i64 = 0;
+    while csi < self.custom_sections.len() {
+        var cs: CustomSection = self.custom_sections.get(csi);
+        var cs_offset: i64 = buf.len();
+        custom_section_offsets.push(cs_offset);
+        // For SHT_NOBITS (.bss), no data is emitted — just record the offset
+        if cs.sh_type != SHT_NOBITS {
+            var di: i64 = 0;
+            while di < cs.data.len() {
+                buf.push(cs.data.get(di));
+                di = di + 1;
+            }
+        }
+        csi = csi + 1;
+    }
     // Section headers
     var shoff: i64 = buf.len();
     // Section 0: null
@@ -2383,7 +2430,26 @@ pub fn ElfEmitter_build_elf(self: &ElfEmitter) -> ResultVec {
     // Section 6: .rela.text
     var rela_name: i64 = ElfEmitter_add_shstrtab(self, ".rela.text");
     emit_u32(buf, rela_name); emit_u32(buf, SHT_RELA); emit_u64(buf, SHF_INFO_LINK); emit_u64(buf, rela_offset); emit_u64(buf, rela_size); emit_u32(buf, 1); emit_u32(buf, 3); emit_u64(buf, 8); emit_u64(buf, 24);
-    var num_sections: i64 = 7;
+    // Custom sections (starting at section index 7)
+    var csi2: i64 = 0;
+    while csi2 < self.custom_sections.len() {
+        var cs: CustomSection = self.custom_sections.get(csi2);
+        var cs_name_off: i64 = ElfEmitter_add_shstrtab(self, cs.name);
+        var cs_off: i64 = custom_section_offsets.get(csi2);
+        var cs_size: i64 = cs.data.len();
+        // For SHT_NOBITS, sh_offset is alignment-aligned and sh_size is the size
+        emit_u32(buf, cs_name_off);
+        emit_u32(buf, cs.sh_type);
+        emit_u64(buf, cs.sh_flags);
+        emit_u64(buf, cs_off);
+        emit_u64(buf, cs_size);
+        emit_u32(buf, 0);  // sh_link
+        emit_u32(buf, 0);  // sh_info
+        emit_u64(buf, cs.align);
+        emit_u64(buf, 0);  // sh_entsize
+        csi2 = csi2 + 1;
+    }
+    var num_sections: i64 = 7 + self.custom_sections.len();
     // Patch e_shoff, e_shnum, e_shstrndx
     // e_shoff at offset 40
     var p: i64 = 40;
@@ -2418,6 +2484,210 @@ pub fn encode_asm_block(asm: str) -> AsmBlockResult {
 }
 
 // --- dump_symbols (debug) ---
+// Dumps the ELF64 symbol table to stdout. Ported from src/elf64.rs:41.
+// Parses the ELF header, finds the .symtab section, and prints each symbol's
+// name, value (offset), size, binding, type, and section index.
 pub fn dump_symbols(elf: Vec) {
-    // TODO: implement ELF symbol table dump
+    if elf.len() < 64 {
+        print("ELF too small for header\n");
+        return;
+    }
+
+    // Read ELF header fields
+    var e_shoff: i64 = read_u64_at(elf, 40);
+    var e_shentsize: i64 = read_u16_at(elf, 58);
+    var e_shnum: i64 = read_u16_at(elf, 60);
+    var e_shstrndx: i64 = read_u16_at(elf, 62);
+
+    if e_shoff == 0 || e_shnum == 0 {
+        print("No section headers\n");
+        return;
+    }
+
+    // Get section header string table offset
+    var shstr_hdr_off: i64 = e_shoff + e_shstrndx * e_shentsize;
+    var shstr_offset: i64 = read_u64_at(elf, shstr_hdr_off + 24);
+
+    // Find .symtab section
+    var symtab_off: i64 = 0;
+    var symtab_size: i64 = 0;
+    var symtab_link: i64 = 0;
+    var found_symtab: bool = false;
+    var si: i64 = 0;
+    while si < e_shnum {
+        var sh_off: i64 = e_shoff + si * e_shentsize;
+        var sh_name_idx: i64 = read_u32_at(elf, sh_off);
+        var sh_type: i64 = read_u32_at(elf, sh_off + 4);
+        var sh_offset: i64 = read_u64_at(elf, sh_off + 24);
+        var sh_size: i64 = read_u64_at(elf, sh_off + 32);
+        var sh_link: i64 = read_u32_at(elf, sh_off + 40);
+
+        // Read section name from shstrtab
+        var name_start: i64 = shstr_offset + sh_name_idx;
+        var name: str = read_cstr_at(elf, name_start);
+
+        if str_equal(name, ".symtab") {
+            symtab_off = sh_offset;
+            symtab_size = sh_size;
+            symtab_link = sh_link;
+            found_symtab = true;
+        }
+        si = si + 1;
+    }
+
+    if !found_symtab {
+        print("No .symtab section found\n");
+        return;
+    }
+
+    // Get strtab offset from symtab's sh_link
+    var strtab_hdr_off: i64 = e_shoff + symtab_link * e_shentsize;
+    var strtab_offset: i64 = read_u64_at(elf, strtab_hdr_off + 24);
+
+    // Parse symbols (each entry is 24 bytes)
+    var num_syms: i64 = symtab_size / 24;
+    print("Symbol table: ");
+    print(int_to_str(num_syms));
+    print(" symbols\n");
+
+    var j: i64 = 0;
+    while j < num_syms {
+        var sym_off: i64 = symtab_off + j * 24;
+        if sym_off + 24 > elf.len() {
+            break;
+        }
+        var st_name: i64 = read_u32_at(elf, sym_off);
+        var st_info: i64 = read_u8_at(elf, sym_off + 4);
+        var st_other: i64 = read_u8_at(elf, sym_off + 5);
+        var st_shndx: i64 = read_u16_at(elf, sym_off + 6);
+        var st_value: i64 = read_u64_at(elf, sym_off + 8);
+        var st_size: i64 = read_u64_at(elf, sym_off + 16);
+
+        // Read symbol name from strtab
+        var sym_name: str = "";
+        if st_name > 0 {
+            var name_off: i64 = strtab_offset + st_name;
+            sym_name = read_cstr_at(elf, name_off);
+        }
+
+        // Skip empty names
+        if str_len(sym_name) > 0 {
+            // Determine binding (high 4 bits of st_info)
+            var binding: i64 = (st_info >> 4) & 0xF;
+            var sym_type: i64 = st_info & 0xF;
+
+            var binding_str: str = "";
+            if binding == 0 {
+                binding_str = "LOCAL";
+            } else if binding == 1 {
+                binding_str = "GLOBAL";
+            } else if binding == 2 {
+                binding_str = "WEAK";
+            } else {
+                binding_str = "UNK";
+            }
+
+            var type_str: str = "";
+            if sym_type == 0 {
+                type_str = "NOTYPE";
+            } else if sym_type == 1 {
+                type_str = "OBJECT";
+            } else if sym_type == 2 {
+                type_str = "FUNC";
+            } else if sym_type == 3 {
+                type_str = "SECTION";
+            } else if sym_type == 4 {
+                type_str = "FILE";
+            } else {
+                type_str = "UNK";
+            }
+
+            // Print: name  value  size  binding  type  shndx
+            print("  ");
+            print(sym_name);
+            print("  value=0x");
+            print(int_to_hex(st_value));
+            print("  size=");
+            print(int_to_str(st_size));
+            print("  ");
+            print(binding_str);
+            print("  ");
+            print(type_str);
+            print("  shndx=");
+            print(int_to_str(st_shndx));
+            print("\n");
+        }
+        j = j + 1;
+    }
+}
+
+// Read a little-endian u8 at the given offset in a Vec.
+fn read_u8_at(buf: Vec, offset: i64) -> i64 {
+    if offset < 0 || offset >= buf.len() { return 0; }
+    return buf.get(offset);
+}
+
+// Read a little-endian u16 at the given offset in a Vec.
+fn read_u16_at(buf: Vec, offset: i64) -> i64 {
+    if offset < 0 || offset + 1 >= buf.len() { return 0; }
+    var lo: i64 = buf.get(offset);
+    var hi: i64 = buf.get(offset + 1);
+    return lo | (hi << 8);
+}
+
+// Read a little-endian u32 at the given offset in a Vec.
+fn read_u32_at(buf: Vec, offset: i64) -> i64 {
+    if offset < 0 || offset + 3 >= buf.len() { return 0; }
+    var b0: i64 = buf.get(offset);
+    var b1: i64 = buf.get(offset + 1);
+    var b2: i64 = buf.get(offset + 2);
+    var b3: i64 = buf.get(offset + 3);
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+// Read a little-endian u64 at the given offset in a Vec.
+fn read_u64_at(buf: Vec, offset: i64) -> i64 {
+    if offset < 0 || offset + 7 >= buf.len() { return 0; }
+    var b0: i64 = buf.get(offset);
+    var b1: i64 = buf.get(offset + 1);
+    var b2: i64 = buf.get(offset + 2);
+    var b3: i64 = buf.get(offset + 3);
+    var b4: i64 = buf.get(offset + 4);
+    var b5: i64 = buf.get(offset + 5);
+    var b6: i64 = buf.get(offset + 6);
+    var b7: i64 = buf.get(offset + 7);
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56);
+}
+
+// Read a null-terminated C string at the given offset in a Vec.
+fn read_cstr_at(buf: Vec, offset: i64) -> str {
+    if offset < 0 || offset >= buf.len() { return ""; }
+    var result: str = "";
+    var i: i64 = 0;
+    while offset + i < buf.len() {
+        var b: i64 = buf.get(offset + i);
+        if b == 0 { break; }
+        result = result + char_from_byte(b);
+        i = i + 1;
+    }
+    return result;
+}
+
+// Convert an i64 to a hex string (without 0x prefix).
+fn int_to_hex(val: i64) -> str {
+    var hex_chars: str = "0123456789abcdef";
+    if val == 0 { return "0"; }
+    var result: str = "";
+    var v: i64 = val;
+    while v > 0 {
+        var nibble: i64 = v & 0xF;
+        result = char_from_byte(str_byte_at(hex_chars, nibble)) + result;
+        v = v >> 4;
+    }
+    return result;
+}
+
+// Convert a byte value to a single-character string.
+fn char_from_byte(b: i64) -> str {
+    return p_char_to_str(b);
 }

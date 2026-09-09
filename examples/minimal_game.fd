@@ -1,0 +1,281 @@
+// Minimal Game — Vertical Slice
+//
+// Demonstrates the full game pipeline end-to-end:
+//   1. Open a window (SDL2)
+//   2. Process input (keyboard + mouse)
+//   3. Update game state (player movement)
+//   4. Render a frame (colored rectangles + sprite)
+//   5. Play audio (sound effect)
+//   6. Exit cleanly
+//
+// Build: ./release/fides-c3.exe ccompile examples/minimal_game.fd -o examples/minimal_game
+// Run:   ./examples/minimal_game
+//
+// Controls:
+//   Arrow keys / WASD — move the player
+//   Space             — play sound
+//   ESC               — quit
+
+module minimal_game;
+
+use sdl;
+use gameloop;
+use math;
+use image;
+use font;
+
+// ─── Game State ──────────────────────────────────────────────────────────
+
+pub struct Player {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    pub vx: f64,
+    pub vy: f64,
+    pub speed: f64,
+    pub color_r: i64,
+    pub color_g: i64,
+    pub color_b: i64,
+}
+
+pub struct GameState {
+    pub player: Player,
+    pub running: bool,
+    pub frame: i64,
+    pub win: i64,
+    pub ren: i64,
+    pub input: SdlInputState,
+    pub beep_sound: i64,
+    pub beep_channel: i64,
+    pub font: Font,
+}
+
+// ─── Initialization ───────────────────────────────────────────────────────
+
+pub fn game_init() -> GameState {
+    // Initialize SDL
+    var flags: i64 = SDL_INIT_VIDEO | SDL_INIT_AUDIO;
+    if sdl_init(flags) != 0 {
+        p_eprint_str("Failed to init SDL\n");
+    }
+
+    // Create window
+    var win = sdl_create_window("Fides Game", 800, 600);
+    if win == 0 {
+        p_eprint_str("Failed to create window\n");
+    }
+
+    // Create renderer
+    var ren = sdl_create_renderer(win);
+    if ren == 0 {
+        p_eprint_str("Failed to create renderer\n");
+    }
+
+    // Initialize audio
+    sdl_audio_init();
+
+    // Create input state
+    var input = sdl_input_create();
+
+    // Create player
+    var player = Player {
+        x: 400.0,
+        y: 300.0,
+        w: 32.0,
+        h: 32.0,
+        vx: 0.0,
+        vy: 0.0,
+        speed: 200.0,
+        color_r: 0,
+        color_g: 255,
+        color_b: 128,
+    };
+
+    // Load font (bitmap fallback works in interpreter)
+    var fnt = font_load("DejaVuSans.ttf", 16.0);
+
+    return GameState {
+        player: player,
+        running: true,
+        frame: 0,
+        win: win,
+        ren: ren,
+        input: input,
+        beep_sound: 0,
+        beep_channel: -1,
+        font: fnt,
+    };
+}
+
+// ─── Input Handling ──────────────────────────────────────────────────────
+
+pub fn game_handle_input(state: &mut GameState, dt: f64) -> void {
+    sdl_poll_events(&mut state.input);
+
+    // Quit on ESC or window close
+    if sdl_quit_requested(&state.input) {
+        state.running = false;
+    }
+    if sdl_key_pressed(&state.input, SDL_SCANCODE_ESCAPE) {
+        state.running = false;
+    }
+
+    // Movement (arrow keys or WASD)
+    var dx: f64 = 0.0;
+    var dy: f64 = 0.0;
+
+    if sdl_key_held(&state.input, SDL_SCANCODE_LEFT) || sdl_key_held(&state.input, SDL_SCANCODE_A) {
+        dx = dx - 1.0;
+    }
+    if sdl_key_held(&state.input, SDL_SCANCODE_RIGHT) || sdl_key_held(&state.input, SDL_SCANCODE_D) {
+        dx = dx + 1.0;
+    }
+    if sdl_key_held(&state.input, SDL_SCANCODE_UP) || sdl_key_held(&state.input, SDL_SCANCODE_W) {
+        dy = dy - 1.0;
+    }
+    if sdl_key_held(&state.input, SDL_SCANCODE_DOWN) || sdl_key_held(&state.input, SDL_SCANCODE_S) {
+        dy = dy + 1.0;
+    }
+
+    // Normalize diagonal movement
+    if dx != 0.0 && dy != 0.0 {
+        dx = dx * 0.7071;
+        dy = dy * 0.7071;
+    }
+
+    state.player.vx = dx * state.player.speed;
+    state.player.vy = dy * state.player.speed;
+
+    // Play sound on space
+    if sdl_key_pressed(&state.input, SDL_SCANCODE_SPACE) {
+        if state.beep_sound != 0 {
+            state.beep_channel = sdl_audio_play(-1, state.beep_sound, 0);
+        }
+    }
+
+    // Change color on mouse click
+    if sdl_mouse_pressed(&state.input, SDL_BUTTON_LEFT) {
+        state.player.color_r = (state.player.color_r + 50) & 0xFF;
+        state.player.color_g = (state.player.color_g + 100) & 0xFF;
+        state.player.color_b = (state.player.color_b + 150) & 0xFF;
+    }
+}
+
+// ─── Update ──────────────────────────────────────────────────────────────
+
+pub fn game_update(state: &mut GameState, dt: f64) -> void {
+    // Move player
+    state.player.x = state.player.x + state.player.vx * dt;
+    state.player.y = state.player.y + state.player.vy * dt;
+
+    // Clamp to screen bounds (800x600)
+    if state.player.x < 0.0 { state.player.x = 0.0; }
+    if state.player.x + state.player.w > 800.0 { state.player.x = 800.0 - state.player.w; }
+    if state.player.y < 0.0 { state.player.y = 0.0; }
+    if state.player.y + state.player.h > 600.0 { state.player.y = 600.0 - state.player.h; }
+
+    state.frame = state.frame + 1;
+}
+
+// ─── Rendering ───────────────────────────────────────────────────────────
+
+pub fn game_render(state: &mut GameState) -> void {
+    var ren = state.ren;
+
+    // Clear screen (dark blue background)
+    sdl_set_draw_color(ren, 20, 20, 40, 255);
+    sdl_render_clear(ren);
+
+    // Draw grid (subtle)
+    sdl_set_draw_color(ren, 30, 30, 50, 255);
+    var gx = 0;
+    while gx < 800 {
+        sdl_draw_line(ren, gx, 0, gx, 600);
+        gx = gx + 40;
+    }
+    var gy = 0;
+    while gy < 600 {
+        sdl_draw_line(ren, 0, gy, 800, gy);
+        gy = gy + 40;
+    }
+
+    // Draw player as a colored rectangle
+    sdl_set_draw_color(ren, state.player.color_r, state.player.color_g, state.player.color_b, 255);
+    var px = state.player.x as i64;
+    var py = state.player.y as i64;
+    var pw = state.player.w as i64;
+    var ph = state.player.h as i64;
+
+    // Draw filled rect manually (since we can't pass SDL_Rect easily)
+    var ry = 0;
+    while ry < ph {
+        sdl_draw_line(ren, px, py + ry, px + pw, py + ry);
+        ry = ry + 1;
+    }
+
+    // Draw player outline (white)
+    sdl_set_draw_color(ren, 255, 255, 255, 255);
+    sdl_draw_line(ren, px, py, px + pw, py);             // top
+    sdl_draw_line(ren, px, py + ph, px + pw, py + ph);   // bottom
+    sdl_draw_line(ren, px, py, px, py + ph);             // left
+    sdl_draw_line(ren, px + pw, py, px + pw, py + ph);   // right
+
+    // Draw crosshair at mouse position
+    var mx = sdl_mouse_x(&state.input);
+    var my = sdl_mouse_y(&state.input);
+    sdl_set_draw_color(ren, 255, 0, 0, 255);
+    sdl_draw_line(ren, mx - 8, my, mx + 8, my);
+    sdl_draw_line(ren, mx, my - 8, mx, my + 8);
+
+    // Present frame
+    sdl_render_present(ren);
+}
+
+// ─── Cleanup ─────────────────────────────────────────────────────────────
+
+pub fn game_shutdown(state: &mut GameState) -> void {
+    sdl_audio_shutdown();
+    sdl_destroy_renderer(state.ren);
+    sdl_destroy_window(state.win);
+    sdl_quit();
+}
+
+// ─── Main Loop ───────────────────────────────────────────────────────────
+
+pub fn main() -> i64 {
+    p_eprint_str("=== Fides Minimal Game ===\n");
+    p_eprint_str("Controls:\n");
+    p_eprint_str("  Arrow keys / WASD — move\n");
+    p_eprint_str("  Space             — play sound\n");
+    p_eprint_str("  Mouse click       — change color\n");
+    p_eprint_str("  ESC               — quit\n");
+    p_eprint_str("\n");
+
+    var state = game_init();
+
+    // Variable-timestep game loop
+    var loop = simpleloop_create();
+
+    while state.running && loop.running {
+        var dt = simpleloop_step(&mut loop);
+
+        game_handle_input(&mut state, dt);
+        game_update(&mut state, dt);
+        game_render(&mut state);
+
+        // Cap frame rate to ~60 FPS by delaying if we have time
+        var frame_ms = (dt * 1000.0) as i64;
+        if frame_ms < 16 {
+            sdl_delay(16 - frame_ms);
+        }
+    }
+
+    game_shutdown(&mut state);
+
+    p_eprint_str("Game exited after ");
+    p_eprint_str(int_to_str(state.frame));
+    p_eprint_str(" frames.\n");
+
+    return 0;
+}

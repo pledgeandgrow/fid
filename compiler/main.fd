@@ -22,6 +22,11 @@ use compiler::compiler;
 use compiler::pe;
 use compiler::fmt;
 use compiler::lower;
+use compiler::scribe;
+use compiler::veil;
+use compiler::tensor;
+use compiler::gpu;
+use compiler::wasm;
 
 // --- Global flag state ---------------------------------------------------
 // Parsed from --borrowck= and --timeout flags before command dispatch.
@@ -128,6 +133,8 @@ pub fn main() -> i64 {
     if str_equal(command, "lint") { return cmd_lint(n, start); }
     if str_equal(command, "watch") { return cmd_bench(n, start); }
     if str_equal(command, "lsp") { return cmd_lsp(); }
+    if str_equal(command, "scribe") { return cmd_scribe(n, start); }
+    if str_equal(command, "veil") { return cmd_veil(n, start); }
 
     print("Unknown command: ");
     print(command);
@@ -1215,6 +1222,36 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             var is_tcc: bool = str_equal(cc, "tcc") || str_ends_with(cc, "tcc.exe");
             var is_cl: bool = str_ends_with(cc, "cl.exe") || str_equal(cc, "cl");
 
+            // Detect SDL2 usage: if source contains "use sdl;", add SDL2 link flags.
+            // Also detect "use image;" and "use font;" which need SDL2_image / stb.
+            // Also detect "use gl;" which needs OpenGL.
+            // Also detect "use net;" which needs socket libs.
+            var extra_libs: str = "";
+            if str_contains(source, "use sdl;") {
+                if is_linux() {
+                    extra_libs = extra_libs + " -lSDL2 -lSDL2_image -lSDL2_mixer";
+                } else {
+                    extra_libs = extra_libs + " -lSDL2 -lSDL2_image -lSDL2_mixer -lglu32 -lopengl32";
+                }
+                p_eprint_str("[main] Detected SDL2 usage, adding link flags\n");
+            }
+            if str_contains(source, "use gl;") {
+                if is_linux() {
+                    extra_libs = extra_libs + " -lGL -lGLU";
+                } else {
+                    extra_libs = extra_libs + " -lopengl32 -lglu32";
+                }
+                p_eprint_str("[main] Detected OpenGL usage, adding link flags\n");
+            }
+            if str_contains(source, "use net;") {
+                if is_linux() {
+                    // sockets are in libc on Linux, no extra lib needed
+                } else {
+                    extra_libs = extra_libs + " -lws2_32";
+                }
+                p_eprint_str("[main] Detected net usage, adding link flags\n");
+            }
+
             var cc_cmd: str = "";
             if is_cl {
                 // cl.exe: /O2 /Fe:output file.c
@@ -1223,16 +1260,16 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 if is_tcc {
                     // tcc: minimal flags
                     if is_linux() {
-                        cc_cmd = cc + " -O2 -w -o " + output + " " + c_file + " -lm";
+                        cc_cmd = cc + " -O2 -w -o " + output + " " + c_file + " -lm" + extra_libs;
                     } else {
-                        cc_cmd = cc + " -O2 -w -o " + output + " " + c_file + " -lws2_32";
+                        cc_cmd = cc + " -O2 -w -o " + output + " " + c_file + " -lws2_32" + extra_libs;
                     }
                 } else {
                     // gcc/clang: -O2 + hardening flags
                     if is_linux() {
-                        cc_cmd = cc + " -O2 -w -Wno-int-conversion -o " + output + " " + c_file + " -lm -lpthread";
+                        cc_cmd = cc + " -O2 -w -Wno-int-conversion -o " + output + " " + c_file + " -lm -lpthread" + extra_libs;
                     } else {
-                        cc_cmd = cc + " -O2 -w -Wno-int-conversion -o " + output + " " + c_file + " -lws2_32";
+                        cc_cmd = cc + " -O2 -w -Wno-int-conversion -o " + output + " " + c_file + " -lws2_32" + extra_libs;
                     }
                 }
             }
@@ -1443,4 +1480,48 @@ fn print_usage() {
     p_eprint_str("  fides-c bench    <file.fd> [-n <count>]   Benchmark: run N times\n");
     p_eprint_str("  fides-c lint     <file.fd>               Run lint checks\n");
     p_eprint_str("  fides-c version                          Show version\n");
+    p_eprint_str("  fides-c scribe   <file.fd|dir> [--format html|markdown] [--output <dir>]\n");
+    p_eprint_str("                                           Generate documentation\n");
+    p_eprint_str("  fides-c veil     <file.fd> [--format text|html] [--output <dir>]\n");
+    p_eprint_str("                                           Code coverage report\n");
 }
+
+
+// --- cmd_parse_header ----------------------------------------------------
+// Parse a C header file and emit Fides FFI bindings to stdout.
+// --- cmd_scribe ----------------------------------------------------------
+// Generate HTML or Markdown documentation from .fd source.
+fn cmd_scribe(n: i64, start: i64) -> i64 {
+    if start + 2 > n {
+        print("scribe -- Documentation generator for Fides\n\nUSAGE:\n    scribe <file.fd> [--output <dir>] [--format html|markdown]\n");
+        return 1;
+    }
+    var input: str = p_argv(start + 1);
+    var format: str = get_flag_value(n, start, "--format", "html");
+    var output_dir: str = get_flag_value(n, start, "--output", "docs");
+    var message: str = scribe_process_file(input, output_dir, format);
+    print(message);
+    print("\n");
+    return 0;
+}
+
+// --- cmd_veil ------------------------------------------------------------
+// Run a Fides program with coverage tracking and emit a report.
+fn cmd_veil(n: i64, start: i64) -> i64 {
+    if start + 2 > n {
+        print(veil_print_help());
+        return 1;
+    }
+    var input: str = p_argv(start + 1);
+    var format: str = get_flag_value(n, start, "--format", "text");
+    var output_dir: str = get_flag_value(n, start, "--output", "coverage");
+    var message: str = veil_run(input, format, output_dir);
+    print(message);
+    print("\n");
+    return 0;
+}
+
+// --- cmd_debug ------------------------------------------------------------
+// Interactive IR debugger. Runs the interpreter with breakpoints.
+// --- cmd_native_debug ----------------------------------------------------
+// Native binary debugger (Linux ptrace). Compiles to C, runs under ptrace.

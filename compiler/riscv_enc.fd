@@ -1,0 +1,1210 @@
+// riscv_enc.fd -- RISC-V (RV64) Instruction Encoder
+// Ported from src/riscv_enc.rs (~933 LOC)
+//
+// Assembles RISC-V assembly text into raw machine code bytes.
+// RISC-V uses 4-byte fixed-length instructions (base ISA).
+//
+// Supports the instruction subset produced by codegen_riscv.fd:
+//   - Arithmetic: add, sub, mul, div, rem, and, or, xor, sll, sra, srl, slt
+//   - Immediate: addi, andi, ori, xori, slli, srai, srli, slti
+//   - Pseudo: li, mv, neg, not, seqz, snez, j, call, ret, sext.w
+//   - Load/Store: ld, sd, lw, sw, lwu, lb, sb
+//   - Branch: beq, bne, blt, bge, beqz, bnez, bgez, bltz, bgtz, blez
+//   - Jump: j, jal, jalr
+//   - System: ecall, ebreak, nop
+//   - Float (stubs): fcvt.s.l, fcvt.l.s
+//
+// Calling convention: RISC-V LP64
+//   - Args: a0-a7 (x10-x17), Return: a0 (x10)
+//   - Callee-saved: s0-s11 (x8-x9, x18-x27), ra (x1), sp (x2)
+//
+// Relocation types (internal):
+//   20 = JAL (J/JAL/CALL)
+//   21 = BRANCH (BEQ/BNE/BLT/BGE/BEQZ/BNEZ/etc.)
+//
+// Adaptations from Rust:
+// 1. u32/u8/i32/u64 -> i64 (Fides uses i64 for all integers)
+// 2. Vec<u8> -> Vec<i64> (bytes stored as i64)
+// 3. HashMap<String, u64> -> Vec-based label map
+// 4. Result<T, String> -> custom result enums
+// 5. inst.to_le_bytes() -> push_u32_le() helper
+// 6. u32::from_le_bytes() -> read_u32_le() helper
+// 7. s[1..].parse() -> str_parse_int(str_slice(...))
+// 8. strip_prefix('#') -> manual check + slice
+// 9. struct methods -> free functions with self param
+
+module compiler::riscv_enc;
+
+use core;
+use vec;
+use string;
+
+// ===========================================================================
+// Result types
+// ===========================================================================
+
+pub enum ResultI64Str {
+    Ok(i64),
+    Err(str),
+}
+
+pub enum ResultUnit {
+    Ok,
+    Err(str),
+}
+
+// ===========================================================================
+// Public API types
+// ===========================================================================
+
+pub struct RiscVSymbol {
+    pub name: str,
+    pub offset: i64,
+}
+
+pub fn RiscVSymbol_new(name: str, offset: i64) -> RiscVSymbol {
+    return RiscVSymbol { name: name, offset: offset };
+}
+
+pub struct RiscVReloc {
+    pub offset: i64,
+    pub symbol: str,
+    pub rtype: i64,
+}
+
+pub fn RiscVReloc_new(offset: i64, symbol: str, rtype: i64) -> RiscVReloc {
+    return RiscVReloc { offset: offset, symbol: symbol, rtype: rtype };
+}
+
+pub struct RiscVAssembleResult {
+    pub text: Vec<i64>,
+    pub symbols: Vec<RiscVSymbol>,
+    pub relocations: Vec<RiscVReloc>,
+}
+
+pub enum ResultRiscVAssemble {
+    Ok(RiscVAssembleResult),
+    Err(str),
+}
+
+// ===========================================================================
+// RiscVEncodedInst -- result of encoding a single instruction
+// ===========================================================================
+
+pub struct RiscVInstReloc {
+    pub label: str,
+    pub rtype: i64,
+}
+
+pub fn RiscVInstReloc_new(label: str, rtype: i64) -> RiscVInstReloc {
+    return RiscVInstReloc { label: label, rtype: rtype };
+}
+
+pub struct RiscVEncodedInst {
+    pub bytes: Vec<i64>,
+    pub relocations: Vec<RiscVInstReloc>,
+}
+
+pub enum ResultRiscVEncodedInst {
+    Ok(RiscVEncodedInst),
+    Err(str),
+}
+
+pub fn RiscVEncodedInst_bytes(inst: i64) -> RiscVEncodedInst {
+    var bytes: Vec<i64> = Vec::new();
+    push_u32_le(bytes, inst);
+    return RiscVEncodedInst { bytes: bytes, relocations: Vec::new() };
+}
+
+pub fn RiscVEncodedInst_with_reloc(inst: i64, label: str, reloc_type: i64) -> RiscVEncodedInst {
+    var bytes: Vec<i64> = Vec::new();
+    push_u32_le(bytes, inst);
+    var relocs: Vec<RiscVInstReloc> = Vec::new();
+    relocs.push(RiscVInstReloc_new(label, reloc_type));
+    return RiscVEncodedInst { bytes: bytes, relocations: relocs };
+}
+
+pub fn RiscVEncodedInst_multi(bytes: Vec<i64>) -> RiscVEncodedInst {
+    return RiscVEncodedInst { bytes: bytes, relocations: Vec::new() };
+}
+
+// ===========================================================================
+// Byte helpers
+// ===========================================================================
+
+/// Split a string into lines by newline (LF).
+pub fn str_lines(s: str) -> Vec<str> {
+    var result: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    var start: i64 = 0;
+    while i < str_len(s) {
+        var b: i64 = str_byte_at(s, i);
+        if b == 10 {
+            result.push(str_slice(s, start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < str_len(s) {
+        result.push(str_slice(s, start, str_len(s)));
+    }
+    return result;
+}
+
+/// Push a 32-bit value in little-endian byte order.
+pub fn push_u32_le(text: &mut Vec<i64>, inst: i64) {
+    text.push(inst & 0xFF);
+    text.push((inst >> 8) & 0xFF);
+    text.push((inst >> 16) & 0xFF);
+    text.push((inst >> 24) & 0xFF);
+}
+
+/// Read a 32-bit little-endian value from a byte vector.
+pub fn read_u32_le(text: Vec<i64>, idx: i64) -> i64 {
+    return (text.get(idx) & 0xFF) | ((text.get(idx + 1) & 0xFF) << 8) | ((text.get(idx + 2) & 0xFF) << 16) | ((text.get(idx + 3) & 0xFF) << 24);
+}
+
+/// Patch a 32-bit little-endian value in a byte vector.
+pub fn patch_u32_le(text: &mut Vec<i64>, idx: i64, inst: i64) {
+    text.set(idx, inst & 0xFF);
+    text.set(idx + 1, (inst >> 8) & 0xFF);
+    text.set(idx + 2, (inst >> 16) & 0xFF);
+    text.set(idx + 3, (inst >> 24) & 0xFF);
+}
+
+// ===========================================================================
+// Public API
+// ===========================================================================
+
+/// Assemble RISC-V assembly text into machine code.
+/// Returns (text_bytes, symbols, relocations).
+pub fn assemble_riscv(asm: str) -> ResultRiscVAssemble {
+    var enc: RiscvAssembler = RiscvAssembler_new();
+    match RiscvAssembler_assemble(enc, asm) {
+        ResultUnit::Ok => {}
+        ResultUnit::Err(e) => { return ResultRiscVAssemble::Err(e); }
+    }
+    return ResultRiscVAssemble::Ok(RiscVAssembleResult {
+        text: enc.text,
+        symbols: enc.symbols,
+        relocations: enc.relocations,
+    });
+}
+
+// ===========================================================================
+// RISC-V Register encoding
+// ===========================================================================
+
+pub fn parse_reg(s: str) -> ResultI64Str {
+    var t: str = str_trim(s);
+    // ABI names
+    if str_equal(t, "zero") { return ResultI64Str::Ok(0); }
+    if str_equal(t, "ra") { return ResultI64Str::Ok(1); }
+    if str_equal(t, "sp") { return ResultI64Str::Ok(2); }
+    if str_equal(t, "gp") { return ResultI64Str::Ok(3); }
+    if str_equal(t, "tp") { return ResultI64Str::Ok(4); }
+    if str_equal(t, "t0") { return ResultI64Str::Ok(5); }
+    if str_equal(t, "t1") { return ResultI64Str::Ok(6); }
+    if str_equal(t, "t2") { return ResultI64Str::Ok(7); }
+    if str_equal(t, "s0") || str_equal(t, "fp") { return ResultI64Str::Ok(8); }
+    if str_equal(t, "s1") { return ResultI64Str::Ok(9); }
+    if str_equal(t, "a0") { return ResultI64Str::Ok(10); }
+    if str_equal(t, "a1") { return ResultI64Str::Ok(11); }
+    if str_equal(t, "a2") { return ResultI64Str::Ok(12); }
+    if str_equal(t, "a3") { return ResultI64Str::Ok(13); }
+    if str_equal(t, "a4") { return ResultI64Str::Ok(14); }
+    if str_equal(t, "a5") { return ResultI64Str::Ok(15); }
+    if str_equal(t, "a6") { return ResultI64Str::Ok(16); }
+    if str_equal(t, "a7") { return ResultI64Str::Ok(17); }
+    if str_equal(t, "s2") { return ResultI64Str::Ok(18); }
+    if str_equal(t, "s3") { return ResultI64Str::Ok(19); }
+    if str_equal(t, "s4") { return ResultI64Str::Ok(20); }
+    if str_equal(t, "s5") { return ResultI64Str::Ok(21); }
+    if str_equal(t, "s6") { return ResultI64Str::Ok(22); }
+    if str_equal(t, "s7") { return ResultI64Str::Ok(23); }
+    if str_equal(t, "s8") { return ResultI64Str::Ok(24); }
+    if str_equal(t, "s9") { return ResultI64Str::Ok(25); }
+    if str_equal(t, "s10") { return ResultI64Str::Ok(26); }
+    if str_equal(t, "s11") { return ResultI64Str::Ok(27); }
+    if str_equal(t, "t3") { return ResultI64Str::Ok(28); }
+    if str_equal(t, "t4") { return ResultI64Str::Ok(29); }
+    if str_equal(t, "t5") { return ResultI64Str::Ok(30); }
+    if str_equal(t, "t6") { return ResultI64Str::Ok(31); }
+    // x0-x31
+    if str_starts_with(t, "x") {
+        var n: i64 = str_parse_int(str_slice(t, 1, str_len(t)));
+        if n > 31 { return ResultI64Str::Err("Register out of range: " + t); }
+        return ResultI64Str::Ok(n);
+    }
+    return ResultI64Str::Err("Unknown register: " + t);
+}
+
+// ===========================================================================
+// Assembler
+// ===========================================================================
+
+pub enum RiscVSection {
+    Text,
+    Rodata,
+}
+
+pub struct LabelOffsetEntry {
+    pub label: str,
+    pub offset: i64,
+}
+
+pub fn LabelOffsetEntry_new(label: str, offset: i64) -> LabelOffsetEntry {
+    return LabelOffsetEntry { label: label, offset: offset };
+}
+
+pub struct RiscvAssembler {
+    pub text: Vec<i64>,
+    pub rodata: Vec<i64>,
+    pub symbols: Vec<RiscVSymbol>,
+    pub rodata_symbols: Vec<RiscVSymbol>,
+    pub relocations: Vec<RiscVReloc>,
+    pub current_section: RiscVSection,
+    pub label_offsets: Vec<LabelOffsetEntry>,
+    pub pending_branches: Vec<RiscVReloc>,
+}
+
+pub fn RiscvAssembler_new() -> RiscvAssembler {
+    return RiscvAssembler {
+        text: Vec::new(),
+        rodata: Vec::new(),
+        symbols: Vec::new(),
+        rodata_symbols: Vec::new(),
+        relocations: Vec::new(),
+        current_section: RiscVSection::Text,
+        label_offsets: Vec::new(),
+        pending_branches: Vec::new(),
+    };
+}
+
+// --- Label offset map helpers ---
+
+pub fn label_offset_lookup(map: Vec<LabelOffsetEntry>, label: str) -> i64 {
+    var i: i64 = 0;
+    while i < map.len() {
+        if str_equal(map.get(i).label, label) { return map.get(i).offset; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn label_offset_insert(map: &mut Vec<LabelOffsetEntry>, label: str, offset: i64) {
+    map.push(LabelOffsetEntry_new(label, offset));
+}
+
+// --- Assemble ---
+
+pub fn RiscvAssembler_assemble(self: &mut RiscvAssembler, asm: str) -> ResultUnit {
+    var lines: Vec<str> = str_lines(asm);
+    var li: i64 = 0;
+    while li < lines.len() {
+        var line: str = str_trim(lines.get(li));
+        if str_len(line) == 0 || str_starts_with(line, "#") {
+            li = li + 1;
+            continue;
+        }
+
+        // Strip inline comments (# ...)
+        var inst_line: str = line;
+        var cpos: i64 = str_find(line, "#");
+        if cpos >= 0 {
+            inst_line = str_trim(str_slice(line, 0, cpos));
+        }
+        if str_len(inst_line) == 0 { li = li + 1; continue; }
+
+        // Handle labels
+        if str_ends_with(inst_line, ":") && !str_starts_with(inst_line, " ") {
+            var label: str = str_trim(str_slice(inst_line, 0, str_len(inst_line) - 1));
+            RiscvAssembler_define_label(self, label);
+            li = li + 1;
+            continue;
+        }
+
+        // Handle directives
+        if str_starts_with(inst_line, ".") {
+            match RiscvAssembler_handle_directive(self, inst_line) {
+                ResultUnit::Ok => {}
+                ResultUnit::Err(e) => { return ResultUnit::Err(e); }
+            }
+            li = li + 1;
+            continue;
+        }
+
+        // Handle instruction
+        match RiscvAssembler_handle_instruction(self, inst_line) {
+            ResultUnit::Ok => {}
+            ResultUnit::Err(e) => { return ResultUnit::Err(e); }
+        }
+        li = li + 1;
+    }
+
+    // Resolve pending branches
+    match RiscvAssembler_resolve_branches(self) {
+        ResultUnit::Ok => {}
+        ResultUnit::Err(e) => { return ResultUnit::Err(e); }
+    }
+    return ResultUnit::Ok;
+}
+
+pub fn RiscvAssembler_define_label(self: &mut RiscvAssembler, label: str) {
+    match self.current_section {
+        RiscVSection::Text => {
+            var offset: i64 = self.text.len();
+            label_offset_insert(self.label_offsets, label, offset);
+            self.symbols.push(RiscVSymbol_new(label, offset));
+        }
+        RiscVSection::Rodata => {
+            var offset: i64 = self.rodata.len();
+            self.rodata_symbols.push(RiscVSymbol_new(label, offset));
+        }
+    }
+}
+
+pub fn RiscvAssembler_handle_directive(self: &mut RiscvAssembler, line: str) -> ResultUnit {
+    var parts: Vec<str> = str_split(line, " ");
+    var directive: str = parts.get(0);
+    if str_equal(directive, ".section") {
+        if parts.len() > 1 && str_contains(parts.get(1), ".rodata") {
+            self.current_section = RiscVSection::Rodata;
+        } else {
+            self.current_section = RiscVSection::Text;
+        }
+    } else if str_equal(directive, ".globl") || str_equal(directive, ".global") {
+        // Mark as global — we already add all labels to symbols
+    } else if str_equal(directive, ".asciz") {
+        if parts.len() > 1 {
+            var s: str = str_trim(parts.get(1));
+            if str_starts_with(s, "\"") && str_ends_with(s, "\"") {
+                var content: str = str_slice(s, 1, str_len(s) - 1);
+                var decoded: Vec<i64> = riscv_decode_string(content);
+                var di: i64 = 0;
+                while di < decoded.len() { self.rodata.push(decoded.get(di)); di = di + 1; }
+                self.rodata.push(0);
+            }
+        }
+    } else if str_equal(directive, ".ascii") {
+        if parts.len() > 1 {
+            var s: str = str_trim(parts.get(1));
+            if str_starts_with(s, "\"") && str_ends_with(s, "\"") {
+                var content: str = str_slice(s, 1, str_len(s) - 1);
+                var decoded: Vec<i64> = riscv_decode_string(content);
+                var di: i64 = 0;
+                while di < decoded.len() { self.rodata.push(decoded.get(di)); di = di + 1; }
+            }
+        }
+    } else if str_equal(directive, ".quad") {
+        if parts.len() > 1 {
+            var qv: i64 = str_parse_int(str_trim(parts.get(1)));
+            push_u32_le(self.rodata, qv & 0xFFFFFFFF);
+            push_u32_le(self.rodata, (qv >> 32) & 0xFFFFFFFF);
+        }
+    } else if str_equal(directive, ".byte") {
+        if parts.len() > 1 {
+            var bv: i64 = str_parse_int(str_trim(parts.get(1)));
+            self.rodata.push(bv & 0xFF);
+        }
+    } else if str_equal(directive, ".align") || str_equal(directive, ".p2align") {
+        if parts.len() > 1 {
+            var n: i64 = str_parse_int(str_trim(parts.get(1)));
+            var align: i64 = 1;
+            var ai: i64 = 0;
+            while ai < n { align = align * 2; ai = ai + 1; }
+            match self.current_section {
+                RiscVSection::Text => {
+                    while self.text.len() % align != 0 {
+                        push_u32_le(self.text, 0x13); // NOP
+                    }
+                }
+                RiscVSection::Rodata => {
+                    while self.rodata.len() % align != 0 { self.rodata.push(0); }
+                }
+            }
+        }
+    }
+    return ResultUnit::Ok;
+}
+
+pub fn RiscvAssembler_handle_instruction(self: &mut RiscvAssembler, line: str) -> ResultUnit {
+    match self.current_section {
+        RiscVSection::Text => {}
+        RiscVSection::Rodata => { return ResultUnit::Ok; }
+    }
+
+    match RiscvAssembler_encode_instruction(self, line) {
+        ResultRiscVEncodedInst::Ok(encoded) => {
+            var offset: i64 = self.text.len();
+            var ri: i64 = 0;
+            while ri < encoded.relocations.len() {
+                var rel: RiscVInstReloc = encoded.relocations.get(ri);
+                self.pending_branches.push(RiscVReloc_new(offset, rel.label, rel.rtype));
+                ri = ri + 1;
+            }
+            var bi: i64 = 0;
+            while bi < encoded.bytes.len() {
+                self.text.push(encoded.bytes.get(bi));
+                bi = bi + 1;
+            }
+        }
+        ResultRiscVEncodedInst::Err(e) => { return ResultUnit::Err(e); }
+    }
+    return ResultUnit::Ok;
+}
+
+pub fn RiscvAssembler_resolve_branches(self: &mut RiscvAssembler) -> ResultUnit {
+    var i: i64 = 0;
+    while i < self.pending_branches.len() {
+        var pb: RiscVReloc = self.pending_branches.get(i);
+        var target_offset: i64 = label_offset_lookup(self.label_offsets, pb.symbol);
+        if target_offset >= 0 {
+            var delta: i64 = target_offset - pb.offset;
+            var idx: i64 = pb.offset;
+            if idx + 4 <= self.text.len() {
+                var instr: i64 = read_u32_le(self.text, idx);
+                if pb.rtype == 20 {
+                    // JAL: 20-bit immediate, offset = delta
+                    var imm: i64 = delta;
+                    var imm20: i64 = (imm >> 20) & 1;
+                    var imm10_1: i64 = (imm >> 1) & 0x3FF;
+                    var imm11: i64 = (imm >> 11) & 1;
+                    var imm19_12: i64 = (imm >> 12) & 0xFF;
+                    var patched: i64 = (instr & 0x00000FFF) | (imm20 << 31) | (imm10_1 << 21) | (imm11 << 20) | (imm19_12 << 12);
+                    patch_u32_le(self.text, idx, patched);
+                } else if pb.rtype == 21 {
+                    // Branch: 13-bit immediate (bits [12:1])
+                    var imm: i64 = delta;
+                    var imm12: i64 = (imm >> 12) & 1;
+                    var imm10_5: i64 = (imm >> 5) & 0x3F;
+                    var imm4_1: i64 = (imm >> 1) & 0xF;
+                    var imm11: i64 = (imm >> 11) & 1;
+                    var patched: i64 = (instr & 0x01FFF07F) | (imm12 << 31) | (imm10_5 << 25) | (imm4_1 << 8) | (imm11 << 7);
+                    patch_u32_le(self.text, idx, patched);
+                }
+            }
+        } else {
+            // External symbol
+            self.relocations.push(RiscVReloc_new(pb.offset, pb.symbol, pb.rtype));
+        }
+        i = i + 1;
+    }
+    return ResultUnit::Ok;
+}
+
+// ===========================================================================
+// Instruction encoding
+// ===========================================================================
+
+pub fn RiscvAssembler_encode_instruction(self: &RiscvAssembler, line: str) -> ResultRiscVEncodedInst {
+    var t: str = str_trim(line);
+    var split: Vec<str> = riscv_split_mnemonic(t);
+    var mnemonic: str = split.get(0);
+    var rest: str = split.get(1);
+    var operands: Vec<str> = riscv_parse_operands(rest);
+
+    // R-type arithmetic
+    if str_equal(mnemonic, "add") { return RiscvAssembler_enc_r_type(self, operands, 0x33, 0x00, 0x00); }
+    if str_equal(mnemonic, "sub") { return RiscvAssembler_enc_r_type(self, operands, 0x33, 0x20, 0x00); }
+    if str_equal(mnemonic, "mul") { return RiscvAssembler_enc_r_type(self, operands, 0x33, 0x01, 0x00); }
+    if str_equal(mnemonic, "div") { return RiscvAssembler_enc_r_type(self, operands, 0x33, 0x01, 0x04); }
+    if str_equal(mnemonic, "rem") { return RiscvAssembler_enc_r_type(self, operands, 0x33, 0x01, 0x06); }
+    if str_equal(mnemonic, "and") { return RiscvAssembler_enc_r_type(self, operands, 0x33, 0x00, 0x07); }
+    if str_equal(mnemonic, "or") { return RiscvAssembler_enc_r_type(self, operands, 0x33, 0x00, 0x06); }
+    if str_equal(mnemonic, "xor") { return RiscvAssembler_enc_r_type(self, operands, 0x33, 0x00, 0x04); }
+    if str_equal(mnemonic, "sll") { return RiscvAssembler_enc_r_type(self, operands, 0x33, 0x00, 0x01); }
+    if str_equal(mnemonic, "sra") { return RiscvAssembler_enc_r_type(self, operands, 0x33, 0x20, 0x05); }
+    if str_equal(mnemonic, "srl") { return RiscvAssembler_enc_r_type(self, operands, 0x33, 0x00, 0x05); }
+    if str_equal(mnemonic, "slt") { return RiscvAssembler_enc_r_type(self, operands, 0x33, 0x00, 0x02); }
+
+    // I-type arithmetic
+    if str_equal(mnemonic, "addi") { return RiscvAssembler_enc_i_type(self, operands, 0x13, 0x00); }
+    if str_equal(mnemonic, "andi") { return RiscvAssembler_enc_i_type(self, operands, 0x13, 0x07); }
+    if str_equal(mnemonic, "ori") { return RiscvAssembler_enc_i_type(self, operands, 0x13, 0x06); }
+    if str_equal(mnemonic, "xori") { return RiscvAssembler_enc_i_type(self, operands, 0x13, 0x04); }
+    if str_equal(mnemonic, "slti") { return RiscvAssembler_enc_i_type(self, operands, 0x13, 0x02); }
+    if str_equal(mnemonic, "slli") { return RiscvAssembler_enc_shift_imm(self, operands, 0x13, 0x01, false); }
+    if str_equal(mnemonic, "srai") { return RiscvAssembler_enc_shift_imm(self, operands, 0x13, 0x05, true); }
+    if str_equal(mnemonic, "srli") { return RiscvAssembler_enc_shift_imm(self, operands, 0x13, 0x05, false); }
+
+    // Load/Store
+    if str_equal(mnemonic, "ld") { return RiscvAssembler_enc_load(self, operands, 0x03, 0x03); }
+    if str_equal(mnemonic, "lw") { return RiscvAssembler_enc_load(self, operands, 0x03, 0x02); }
+    if str_equal(mnemonic, "lwu") { return RiscvAssembler_enc_load(self, operands, 0x03, 0x06); }
+    if str_equal(mnemonic, "lb") { return RiscvAssembler_enc_load(self, operands, 0x03, 0x00); }
+    if str_equal(mnemonic, "sd") { return RiscvAssembler_enc_store(self, operands, 0x23, 0x03); }
+    if str_equal(mnemonic, "sw") { return RiscvAssembler_enc_store(self, operands, 0x23, 0x02); }
+    if str_equal(mnemonic, "sb") { return RiscvAssembler_enc_store(self, operands, 0x23, 0x00); }
+
+    // Branches
+    if str_equal(mnemonic, "beq") { return RiscvAssembler_enc_branch(self, operands, 0x63, 0x00); }
+    if str_equal(mnemonic, "bne") { return RiscvAssembler_enc_branch(self, operands, 0x63, 0x01); }
+    if str_equal(mnemonic, "blt") { return RiscvAssembler_enc_branch(self, operands, 0x63, 0x04); }
+    if str_equal(mnemonic, "bge") { return RiscvAssembler_enc_branch(self, operands, 0x63, 0x05); }
+    if str_equal(mnemonic, "beqz") { return RiscvAssembler_enc_branch_zero(self, operands, 0x63, 0x00); }
+    if str_equal(mnemonic, "bnez") { return RiscvAssembler_enc_branch_zero(self, operands, 0x63, 0x01); }
+    if str_equal(mnemonic, "bgez") { return RiscvAssembler_enc_branch_zero_rs(self, operands, 0x63, 0x05); }
+    if str_equal(mnemonic, "bltz") { return RiscvAssembler_enc_branch_zero_rs2(self, operands, 0x63, 0x04); }
+    if str_equal(mnemonic, "bgtz") { return RiscvAssembler_enc_branch_zero_rs2(self, operands, 0x63, 0x05); }
+    if str_equal(mnemonic, "blez") { return RiscvAssembler_enc_branch_zero_rs(self, operands, 0x63, 0x04); }
+
+    // Jump
+    if str_equal(mnemonic, "j") { return RiscvAssembler_enc_j(self, operands); }
+    if str_equal(mnemonic, "jal") { return RiscvAssembler_enc_jal(self, operands); }
+    if str_equal(mnemonic, "jalr") { return RiscvAssembler_enc_jalr(self, operands); }
+    if str_equal(mnemonic, "call") { return RiscvAssembler_enc_call(self, operands); }
+    if str_equal(mnemonic, "ret") { return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(0x00008067)); }
+
+    // Pseudo
+    if str_equal(mnemonic, "li") { return RiscvAssembler_enc_li(self, operands); }
+    if str_equal(mnemonic, "lui") { return RiscvAssembler_enc_lui(self, operands); }
+    if str_equal(mnemonic, "mv") { return RiscvAssembler_enc_mv(self, operands); }
+    if str_equal(mnemonic, "neg") { return RiscvAssembler_enc_neg(self, operands); }
+    if str_equal(mnemonic, "not") { return RiscvAssembler_enc_not(self, operands); }
+    if str_equal(mnemonic, "seqz") { return RiscvAssembler_enc_seqz(self, operands); }
+    if str_equal(mnemonic, "snez") { return RiscvAssembler_enc_snez(self, operands); }
+    if str_equal(mnemonic, "sext.w") { return RiscvAssembler_enc_sextw(self, operands); }
+
+    // System
+    if str_equal(mnemonic, "ecall") { return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(0x00000073)); }
+    if str_equal(mnemonic, "ebreak") { return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(0x00100073)); }
+    if str_equal(mnemonic, "nop") { return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(0x00000013)); }
+
+    // Float (stubs)
+    if str_equal(mnemonic, "fcvt.s.l") { return RiscvAssembler_enc_fcvt_s_l(self, operands); }
+    if str_equal(mnemonic, "fcvt.l.s") { return RiscvAssembler_enc_fcvt_l_s(self, operands); }
+
+    return ResultRiscVEncodedInst::Err("Unknown RISC-V instruction: " + mnemonic);
+}
+
+// --- R-type: funct3, funct7, opcode ---
+
+pub fn RiscvAssembler_enc_r_type(self: &RiscvAssembler, ops: Vec<str>, opcode: i64, funct7: i64, funct3: i64) -> ResultRiscVEncodedInst {
+    if ops.len() < 3 { return ResultRiscVEncodedInst::Err("R-type needs 3 operands, got " + int_to_str(ops.len())); }
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rd) => {
+            match parse_reg(ops.get(1)) {
+                ResultI64Str::Ok(rs1) => {
+                    match parse_reg(ops.get(2)) {
+                        ResultI64Str::Ok(rs2) => {
+                            var inst: i64 = (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode;
+                            return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
+                        }
+                        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+                    }
+                }
+                ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+            }
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("R-type parse error");
+}
+
+// --- I-type: imm[11:0], rs1, funct3, rd, opcode ---
+
+pub fn RiscvAssembler_enc_i_type(self: &RiscvAssembler, ops: Vec<str>, opcode: i64, funct3: i64) -> ResultRiscVEncodedInst {
+    if ops.len() < 3 { return ResultRiscVEncodedInst::Err("I-type needs 3 operands, got " + int_to_str(ops.len())); }
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rd) => {
+            match parse_reg(ops.get(1)) {
+                ResultI64Str::Ok(rs1) => {
+                    match riscv_parse_imm(ops.get(2)) {
+                        ResultI64Str::Ok(imm) => {
+                            var imm12: i64 = imm & 0xFFF;
+                            var inst: i64 = (imm12 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode;
+                            return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
+                        }
+                        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+                    }
+                }
+                ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+            }
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("I-type parse error");
+}
+
+// --- Shift immediate (SLLI/SRAI/SRLI) ---
+
+pub fn RiscvAssembler_enc_shift_imm(self: &RiscvAssembler, ops: Vec<str>, opcode: i64, funct3: i64, is_arith: bool) -> ResultRiscVEncodedInst {
+    if ops.len() < 3 { return ResultRiscVEncodedInst::Err("Shift needs 3 operands, got " + int_to_str(ops.len())); }
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rd) => {
+            match parse_reg(ops.get(1)) {
+                ResultI64Str::Ok(rs1) => {
+                    match riscv_parse_imm(ops.get(2)) {
+                        ResultI64Str::Ok(imm) => {
+                            var shamt: i64 = imm & 0x3F;
+                            var funct7: i64 = 0;
+                            if is_arith { funct7 = 0x20; }
+                            var inst: i64 = (funct7 << 25) | (shamt << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode;
+                            return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
+                        }
+                        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+                    }
+                }
+                ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+            }
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("Shift parse error");
+}
+
+// --- Load: ld rd, imm(rs1) ---
+
+pub fn RiscvAssembler_enc_load(self: &RiscvAssembler, ops: Vec<str>, opcode: i64, funct3: i64) -> ResultRiscVEncodedInst {
+    if ops.len() < 2 { return ResultRiscVEncodedInst::Err("Load needs 2 operands"); }
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rd) => {
+            var mem: RiscVMemOperand = riscv_parse_mem_operand(ops.get(1));
+            match mem {
+                RiscVMemOperand::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+                RiscVMemOperand::Ok(imm, rs1_str) => {
+                    match parse_reg(rs1_str) {
+                        ResultI64Str::Ok(rs1) => {
+                            var imm12: i64 = imm & 0xFFF;
+                            var inst: i64 = (imm12 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode;
+                            return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
+                        }
+                        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+                    }
+                }
+            }
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("Load parse error");
+}
+
+// --- Store: sd rs2, imm(rs1) ---
+
+pub fn RiscvAssembler_enc_store(self: &RiscvAssembler, ops: Vec<str>, opcode: i64, funct3: i64) -> ResultRiscVEncodedInst {
+    if ops.len() < 2 { return ResultRiscVEncodedInst::Err("Store needs 2 operands"); }
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rs2) => {
+            var mem: RiscVMemOperand = riscv_parse_mem_operand(ops.get(1));
+            match mem {
+                RiscVMemOperand::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+                RiscVMemOperand::Ok(imm, rs1_str) => {
+                    match parse_reg(rs1_str) {
+                        ResultI64Str::Ok(rs1) => {
+                            var imm11_5: i64 = (imm >> 5) & 0x7F;
+                            var imm4_0: i64 = imm & 0x1F;
+                            var inst: i64 = (imm11_5 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (imm4_0 << 7) | opcode;
+                            return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
+                        }
+                        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+                    }
+                }
+            }
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("Store parse error");
+}
+
+// --- Branch: beq rs1, rs2, label ---
+
+pub fn RiscvAssembler_enc_branch(self: &RiscvAssembler, ops: Vec<str>, opcode: i64, funct3: i64) -> ResultRiscVEncodedInst {
+    if ops.len() < 3 { return ResultRiscVEncodedInst::Err("Branch needs 3 operands"); }
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rs1) => {
+            match parse_reg(ops.get(1)) {
+                ResultI64Str::Ok(rs2) => {
+                    var label: str = ops.get(2);
+                    var inst: i64 = (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | opcode;
+                    return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_with_reloc(inst, label, 21));
+                }
+                ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+            }
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("Branch parse error");
+}
+
+// --- Branch zero: beqz rs, label (beq rs, x0, label) ---
+
+pub fn RiscvAssembler_enc_branch_zero(self: &RiscvAssembler, ops: Vec<str>, opcode: i64, funct3: i64) -> ResultRiscVEncodedInst {
+    if ops.len() < 2 { return ResultRiscVEncodedInst::Err("Branch-zero needs 2 operands"); }
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rs1) => {
+            var label: str = ops.get(1);
+            var inst: i64 = (rs1 << 15) | (funct3 << 12) | opcode;
+            return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_with_reloc(inst, label, 21));
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("Branch-zero parse error");
+}
+
+// --- bgez rs, label = bge x0, rs, label ---
+
+pub fn RiscvAssembler_enc_branch_zero_rs(self: &RiscvAssembler, ops: Vec<str>, opcode: i64, funct3: i64) -> ResultRiscVEncodedInst {
+    if ops.len() < 2 { return ResultRiscVEncodedInst::Err("bgez needs 2 operands"); }
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rs) => {
+            var label: str = ops.get(1);
+            // bge x0, rs: rs1=0, rs2=rs
+            var inst: i64 = (rs << 20) | (funct3 << 12) | opcode;
+            return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_with_reloc(inst, label, 21));
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("bgez parse error");
+}
+
+// --- bltz rs, label = blt rs, x0, label ---
+
+pub fn RiscvAssembler_enc_branch_zero_rs2(self: &RiscvAssembler, ops: Vec<str>, opcode: i64, funct3: i64) -> ResultRiscVEncodedInst {
+    if ops.len() < 2 { return ResultRiscVEncodedInst::Err("bltz needs 2 operands"); }
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rs) => {
+            var label: str = ops.get(1);
+            // blt rs, x0: rs1=rs, rs2=0
+            var inst: i64 = (rs << 15) | (funct3 << 12) | opcode;
+            return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_with_reloc(inst, label, 21));
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("bltz parse error");
+}
+
+// --- J (pseudo: JAL x0, label) ---
+
+pub fn RiscvAssembler_enc_j(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
+    if ops.len() == 0 { return ResultRiscVEncodedInst::Err("J needs 1 operand"); }
+    var label: str = ops.get(0);
+    var inst: i64 = 0x6F; // JAL x0, 0
+    return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_with_reloc(inst, label, 20));
+}
+
+// --- JAL ---
+
+pub fn RiscvAssembler_enc_jal(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
+    if ops.len() == 0 { return ResultRiscVEncodedInst::Err("JAL needs 1 operand"); }
+    if ops.len() == 1 {
+        // JAL label (pseudo for JAL ra, label)
+        var label: str = ops.get(0);
+        var inst: i64 = 0x6F | (1 << 7); // JAL ra, 0
+        return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_with_reloc(inst, label, 20));
+    }
+    // JAL rd, label
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rd) => {
+            var label: str = ops.get(1);
+            var inst: i64 = 0x6F | (rd << 7);
+            return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_with_reloc(inst, label, 20));
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("JAL parse error");
+}
+
+// --- JALR ---
+
+pub fn RiscvAssembler_enc_jalr(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
+    if ops.len() == 0 { return ResultRiscVEncodedInst::Err("JALR needs 1 operand"); }
+    if ops.len() == 1 {
+        // JALR rs (pseudo: JALR x0, 0(rs))
+        match parse_reg(ops.get(0)) {
+            ResultI64Str::Ok(rs1) => {
+                var inst: i64 = 0x67 | (rs1 << 15); // JALR x0, 0(rs)
+                return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
+            }
+            ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+        }
+        return ResultRiscVEncodedInst::Err("JALR parse error");
+    }
+    // JALR rd, rs1 or JALR rd, imm(rs1)
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rd) => {
+            if str_contains(ops.get(1), "(") {
+                var mem: RiscVMemOperand = riscv_parse_mem_operand(ops.get(1));
+                match mem {
+                    RiscVMemOperand::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+                    RiscVMemOperand::Ok(imm, rs1_str) => {
+                        match parse_reg(rs1_str) {
+                            ResultI64Str::Ok(rs1) => {
+                                var inst: i64 = ((imm & 0xFFF) << 20) | (rs1 << 15) | (rd << 7) | 0x67;
+                                return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
+                            }
+                            ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+                        }
+                    }
+                }
+            }
+            match parse_reg(ops.get(1)) {
+                ResultI64Str::Ok(rs1) => {
+                    var inst: i64 = (rs1 << 15) | (rd << 7) | 0x67;
+                    return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
+                }
+                ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+            }
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("JALR: invalid operands");
+}
+
+// --- CALL (pseudo: JAL ra, label) ---
+
+pub fn RiscvAssembler_enc_call(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
+    if ops.len() == 0 { return ResultRiscVEncodedInst::Err("CALL needs 1 operand"); }
+    var label: str = ops.get(0);
+    var inst: i64 = 0x6F | (1 << 7); // JAL ra, 0
+    return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_with_reloc(inst, label, 20));
+}
+
+// --- LI (load immediate) ---
+
+pub fn RiscvAssembler_enc_li(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
+    if ops.len() < 2 { return ResultRiscVEncodedInst::Err("LI needs 2 operands"); }
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rd) => {
+            match riscv_parse_imm_i64(ops.get(1)) {
+                ResultI64Str::Ok(imm) => {
+                    if imm >= -2048 && imm <= 2047 {
+                        // ADDI rd, x0, imm
+                        var inst: i64 = ((imm & 0xFFF) << 20) | (rd << 7) | 0x13;
+                        return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
+                    }
+                    // LUI + ADDI
+                    var hi: i64 = ((imm + 0x800) >> 12) & 0xFFFFF;
+                    var lo: i64 = imm & 0xFFF;
+                    var lui: i64 = (hi << 12) | (rd << 7) | 0x37;
+                    var addi: i64 = (lo << 20) | (rd << 15) | (rd << 7) | 0x13;
+                    var bytes: Vec<i64> = Vec::new();
+                    push_u32_le(bytes, lui);
+                    push_u32_le(bytes, addi);
+                    return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_multi(bytes));
+                }
+                ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+            }
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("LI parse error");
+}
+
+// --- LUI ---
+
+pub fn RiscvAssembler_enc_lui(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
+    if ops.len() < 2 { return ResultRiscVEncodedInst::Err("LUI needs 2 operands"); }
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rd) => {
+            match riscv_parse_imm(ops.get(1)) {
+                ResultI64Str::Ok(imm) => {
+                    var imm20: i64 = imm & 0xFFFFF;
+                    var inst: i64 = (imm20 << 12) | (rd << 7) | 0x37;
+                    return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
+                }
+                ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+            }
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("LUI parse error");
+}
+
+// --- MV (pseudo: ADDI rd, rs, 0) ---
+
+pub fn RiscvAssembler_enc_mv(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
+    if ops.len() < 2 { return ResultRiscVEncodedInst::Err("MV needs 2 operands"); }
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rd) => {
+            match parse_reg(ops.get(1)) {
+                ResultI64Str::Ok(rs1) => {
+                    var inst: i64 = (rs1 << 15) | (rd << 7) | 0x13;
+                    return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
+                }
+                ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+            }
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("MV parse error");
+}
+
+// --- NEG (pseudo: SUB rd, x0, rs) ---
+
+pub fn RiscvAssembler_enc_neg(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
+    if ops.len() < 2 { return ResultRiscVEncodedInst::Err("NEG needs 2 operands"); }
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rd) => {
+            match parse_reg(ops.get(1)) {
+                ResultI64Str::Ok(rs) => {
+                    // SUB rd, x0, rs: funct7=0x20, rs2=rs, rs1=x0, funct3=0, rd, opcode=0x33
+                    var inst: i64 = (0x20 << 25) | (rs << 20) | (rd << 7) | 0x33;
+                    return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
+                }
+                ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+            }
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("NEG parse error");
+}
+
+// --- NOT (pseudo: XORI rd, rs, -1) ---
+
+pub fn RiscvAssembler_enc_not(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
+    if ops.len() < 2 { return ResultRiscVEncodedInst::Err("NOT needs 2 operands"); }
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rd) => {
+            match parse_reg(ops.get(1)) {
+                ResultI64Str::Ok(rs) => {
+                    // XORI rd, rs, -1: imm=0xFFF, funct3=4, opcode=0x13
+                    var inst: i64 = (0xFFF << 20) | (rs << 15) | (4 << 12) | (rd << 7) | 0x13;
+                    return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
+                }
+                ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+            }
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("NOT parse error");
+}
+
+// --- SEQZ (pseudo: SLTIU rd, rs, 1) ---
+
+pub fn RiscvAssembler_enc_seqz(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
+    if ops.len() < 2 { return ResultRiscVEncodedInst::Err("SEQZ needs 2 operands"); }
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rd) => {
+            match parse_reg(ops.get(1)) {
+                ResultI64Str::Ok(rs) => {
+                    // SLTIU rd, rs, 1: imm=1, funct3=3, opcode=0x13
+                    var inst: i64 = (1 << 20) | (rs << 15) | (3 << 12) | (rd << 7) | 0x13;
+                    return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
+                }
+                ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+            }
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("SEQZ parse error");
+}
+
+// --- SNEZ (pseudo: SLTU rd, x0, rs) ---
+
+pub fn RiscvAssembler_enc_snez(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
+    if ops.len() < 2 { return ResultRiscVEncodedInst::Err("SNEZ needs 2 operands"); }
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rd) => {
+            match parse_reg(ops.get(1)) {
+                ResultI64Str::Ok(rs) => {
+                    // SLTU rd, x0, rs: funct3=3, opcode=0x33
+                    var inst: i64 = (rs << 20) | (3 << 12) | (rd << 7) | 0x33;
+                    return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
+                }
+                ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+            }
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("SNEZ parse error");
+}
+
+// --- SEXT.W (pseudo: ADDIW rd, rs, 0) ---
+
+pub fn RiscvAssembler_enc_sextw(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
+    if ops.len() < 2 { return ResultRiscVEncodedInst::Err("SEXT.W needs 2 operands"); }
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rd) => {
+            match parse_reg(ops.get(1)) {
+                ResultI64Str::Ok(rs) => {
+                    // ADDIW rd, rs, 0: imm=0, funct3=0, opcode=0x1B (RV64I)
+                    var inst: i64 = (rs << 15) | (rd << 7) | 0x1B;
+                    return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
+                }
+                ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+            }
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("SEXT.W parse error");
+}
+
+// --- FCVT.S.L (int to float) ---
+
+pub fn RiscvAssembler_enc_fcvt_s_l(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
+    if ops.len() < 2 { return ResultRiscVEncodedInst::Err("FCVT.S.L needs 2 operands"); }
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rd) => {
+            match parse_reg(ops.get(1)) {
+                ResultI64Str::Ok(rs1) => {
+                    // FCVT.S.L: funct7=0x60, rs2=0x02, funct3=0x00, opcode=0x53
+                    var inst: i64 = (0x60 << 25) | (0x02 << 20) | (rs1 << 15) | (rd << 7) | 0x53;
+                    return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
+                }
+                ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+            }
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("FCVT.S.L parse error");
+}
+
+// --- FCVT.L.S (float to int) ---
+
+pub fn RiscvAssembler_enc_fcvt_l_s(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
+    if ops.len() < 2 { return ResultRiscVEncodedInst::Err("FCVT.L.S needs 2 operands"); }
+    match parse_reg(ops.get(0)) {
+        ResultI64Str::Ok(rd) => {
+            match parse_reg(ops.get(1)) {
+                ResultI64Str::Ok(rs1) => {
+                    // FCVT.L.S: funct7=0x60, rs2=0x02, funct3=0x00, opcode=0x53
+                    var inst: i64 = (0x60 << 25) | (0x02 << 20) | (rs1 << 15) | (rd << 7) | 0x53;
+                    return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
+                }
+                ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+            }
+        }
+        ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
+    }
+    return ResultRiscVEncodedInst::Err("FCVT.L.S parse error");
+}
+
+// ===========================================================================
+// Helper types and functions
+// ===========================================================================
+
+/// Result of parsing a memory operand.
+pub enum RiscVMemOperand {
+    Ok(i64, str),
+    Err(str),
+}
+
+/// Parse an immediate value (with optional '#' prefix).
+/// Supports decimal and hex (0x) formats.
+pub fn riscv_parse_imm(s: str) -> ResultI64Str {
+    var t: str = str_trim(s);
+    if str_starts_with(t, "#") {
+        t = str_slice(t, 1, str_len(t));
+    }
+    // Handle hex
+    if str_starts_with(t, "0x") || str_starts_with(t, "-0x") {
+        var neg: bool = false;
+        var hex: str = t;
+        if str_starts_with(t, "-") {
+            neg = true;
+            hex = str_slice(t, 1, str_len(t));
+        }
+        var v: i64 = str_parse_hex(hex);
+        if neg { v = 0 - v; }
+        return ResultI64Str::Ok(v);
+    }
+    var v2: i64 = str_parse_int(t);
+    return ResultI64Str::Ok(v2);
+}
+
+/// Parse an i64 immediate value (with optional '#' prefix).
+pub fn riscv_parse_imm_i64(s: str) -> ResultI64Str {
+    return riscv_parse_imm(s);
+}
+
+/// Parse a memory operand: imm(reg) or just reg (imm=0).
+pub fn riscv_parse_mem_operand(s: str) -> RiscVMemOperand {
+    var t: str = str_trim(s);
+    var open: i64 = str_find(t, "(");
+    if open >= 0 {
+        var close: i64 = str_find(t, ")");
+        if close < 0 { return RiscVMemOperand::Err("Missing ) in memory operand"); }
+        var imm_str: str = str_trim(str_slice(t, 0, open));
+        var reg: str = str_trim(str_slice(t, open + 1, close));
+        var imm: i64 = 0;
+        if str_len(imm_str) > 0 {
+            match riscv_parse_imm(imm_str) {
+                ResultI64Str::Ok(v) => { imm = v; }
+                ResultI64Str::Err(e) => { return RiscVMemOperand::Err(e); }
+            }
+        }
+        return RiscVMemOperand::Ok(imm, reg);
+    }
+    return RiscVMemOperand::Ok(0, t);
+}
+
+/// Split a line into mnemonic and rest (operands string).
+pub fn riscv_split_mnemonic(line: str) -> Vec<str> {
+    var result: Vec<str> = Vec::new();
+    var pos: i64 = 0;
+    while pos < str_len(line) {
+        var c: i64 = str_byte_at(line, pos);
+        if c == 32 || c == 9 { // space or tab
+            break;
+        }
+        pos = pos + 1;
+    }
+    if pos < str_len(line) {
+        result.push(str_slice(line, 0, pos));
+        result.push(str_trim(str_slice(line, pos, str_len(line))));
+    } else {
+        result.push(line);
+        result.push("");
+    }
+    return result;
+}
+
+/// Parse operands string into a Vec of individual operand strings.
+/// Splits by comma, respecting parentheses.
+pub fn riscv_parse_operands(s: str) -> Vec<str> {
+    var result: Vec<str> = Vec::new();
+    if str_len(s) == 0 { return result; }
+    var current: str = "";
+    var paren_depth: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if c == 40 { // (
+            paren_depth = paren_depth + 1;
+            current = current + char_to_str(c);
+        } else if c == 41 { // )
+            paren_depth = paren_depth - 1;
+            current = current + char_to_str(c);
+        } else if c == 44 && paren_depth == 0 { // comma
+            result.push(str_trim(current));
+            current = "";
+        } else {
+            current = current + char_to_str(c);
+        }
+        i = i + 1;
+    }
+    if str_len(str_trim(current)) > 0 {
+        result.push(str_trim(current));
+    }
+    return result;
+}
+
+/// Decode escape sequences in a string literal.
+pub fn riscv_decode_string(s: str) -> Vec<i64> {
+    var result: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if c == 92 { // backslash
+            i = i + 1;
+            if i < str_len(s) {
+                var next: i64 = str_byte_at(s, i);
+                if next == 110 { result.push(10); } // \n
+                else if next == 116 { result.push(9); } // \t
+                else if next == 114 { result.push(13); } // \r
+                else if next == 48 { result.push(0); } // \0
+                else if next == 92 { result.push(92); } // \\
+                else if next == 34 { result.push(34); } // \"
+                else if next == 39 { result.push(39); } // \'
+                else { result.push(92); result.push(next); }
+            } else {
+                result.push(92);
+            }
+        } else {
+            result.push(c);
+        }
+        i = i + 1;
+    }
+    return result;
+}

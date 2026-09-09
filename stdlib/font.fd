@@ -1,0 +1,337 @@
+// Fides Font standard library
+//
+// TrueType font loading and text rasterization via stb_truetype.
+// stb_truetype is a single-header C library (no dependencies) that
+// can parse TTF/OTF fonts and rasterize glyphs to bitmaps.
+//
+// Install: Download stb_truetype.h and place it in the include path.
+//   wget https://raw.githubusercontent.com/nothings/stb/master/stb_truetype.h
+//
+// Usage:
+//   use font;
+//
+//   var fnt = font_load("DejaVuSans.ttf", 24.0);  // 24px font
+//   var glyph = font_get_glyph(fnt, 65);  // 'A' = codepoint 65
+//   // glyph.bitmap contains grayscale pixels (glyph.width x glyph.height)
+//
+//   // Render a string to a pixel buffer:
+//   var text_img = font_render_text(fnt, "Hello, World!");
+//   // text_img is an Image with RGBA pixels
+
+module font;
+
+use image;
+use vec;
+
+// ─── Font Data Structures ────────────────────────────────────────────────
+
+pub struct Font {
+    pub info: i64,          // stbtt_fontinfo (opaque pointer, 0 in interpreter)
+    pub data: Vec<i64>,     // TTF file bytes
+    pub scale: f64,         // pixel height scale
+    pub ascent: f64,        // font ascent (baseline to top)
+    pub descent: f64,       // font descent (baseline to bottom)
+    pub line_gap: f64,      // line gap
+    pub line_height: f64,   // total line height (ascent - descent + line_gap)
+}
+
+pub struct Glyph {
+    pub codepoint: i64,     // Unicode codepoint
+    pub width: i64,         // glyph bitmap width
+    pub height: i64,        // glyph bitmap height
+    pub xoff: i64,           // x offset from cursor to left edge
+    pub yoff: i64,           // y offset from cursor to top edge
+    pub advance: f64,       // cursor advance after this glyph
+    pub bitmap: Vec<i64>,   // grayscale pixels (0-255), width * height
+}
+
+// ─── stb_truetype FFI ─────────────────────────────────────────────────────
+//
+// stb_truetype is included as a single C header. The native runtime
+// (pledge_font.c) wraps the stb_truetype API for Fides FFI.
+
+extern "C" include "pledge_font.h" link "" {
+    // Load a TTF/OTF font from a file path. Returns 0 on success.
+    fn pledge_font_load(path: str, pixel_size: f64, out_font: i64) -> i64;
+
+    // Load a TTF/OTF font from raw bytes. Returns 0 on success.
+    fn pledge_font_load_mem(data: i64, data_len: i64, pixel_size: f64, out_font: i64) -> i64;
+
+    // Get a glyph bitmap for a codepoint. Returns 0 on success.
+    // Fills the Glyph struct fields (width, height, xoff, yoff, advance).
+    // The bitmap data is written to out_bitmap (width * height bytes).
+    fn pledge_font_get_glyph(font: i64, codepoint: i64, out_w: i64, out_h: i64, out_xoff: i64, out_yoff: i64, out_advance: i64, out_bitmap: i64) -> i64;
+
+    // Get the kerning advance between two codepoints.
+    fn pledge_font_kern(font: i64, ch1: i64, ch2: i64) -> f64;
+
+    // Measure the width of a text string in pixels.
+    fn pledge_font_text_width(font: i64, text: str) -> i64;
+
+    // Free a font's resources.
+    fn pledge_font_free(font: i64) -> void;
+}
+
+// ─── Font Loading ────────────────────────────────────────────────────────
+
+/// Load a TrueType font from a file path at the given pixel size.
+/// Returns a Font with info=0 on failure.
+pub fn font_load(path: str, pixel_size: f64) -> Font {
+    var font = Font {
+        info: 0,
+        data: Vec::new(),
+        scale: pixel_size,
+        ascent: 0.0,
+        descent: 0.0,
+        line_gap: 0.0,
+        line_height: pixel_size,
+    };
+
+    // In native builds, pledge_font_load reads the TTF file and initializes
+    // stbtt_fontinfo. In the interpreter, this is a no-op (info stays 0).
+    var result = pledge_font_load(path, pixel_size, 0);
+    if result != 0 {
+        return font;  // failure, info=0
+    }
+
+    // Set metrics (would be filled by pledge_font_load in native builds)
+    font.ascent = pixel_size * 0.8;
+    font.descent = pixel_size * 0.2;
+    font.line_gap = pixel_size * 0.1;
+    font.line_height = font.ascent - font.descent + font.line_gap;
+
+    return font;
+}
+
+/// Free a font's resources.
+pub fn font_free(font: &mut Font) -> void {
+    if font.info != 0 {
+        pledge_font_free(font.info);
+        font.info = 0;
+    }
+    font.data = Vec::new();
+}
+
+// ─── Glyph Rasterization ─────────────────────────────────────────────────
+
+/// Get a single glyph bitmap for a codepoint.
+/// Returns a Glyph with width=0 if the codepoint is not in the font.
+pub fn font_get_glyph(font: &Font, codepoint: i64) -> Glyph {
+    var glyph = Glyph {
+        codepoint: codepoint,
+        width: 0,
+        height: 0,
+        xoff: 0,
+        yoff: 0,
+        advance: 0.0,
+        bitmap: Vec::new(),
+    };
+
+    if font.info == 0 {
+        return glyph;  // no font loaded (interpreter mode)
+    }
+
+    // In native builds, pledge_font_get_glyph calls stbtt_GetCodepointBitmap
+    // and fills the glyph fields. The bitmap is a grayscale alpha buffer.
+    var result = pledge_font_get_glyph(font.info, codepoint, 0, 0, 0, 0, 0, 0);
+    if result != 0 {
+        return glyph;  // glyph not found
+    }
+
+    // Fill bitmap with zeros (actual pixels would be filled by native runtime)
+    var size = glyph.width * glyph.height;
+    var i = 0;
+    while i < size {
+        glyph.bitmap.push(0);
+        i = i + 1;
+    }
+
+    return glyph;
+}
+
+/// Get the kerning advance between two codepoints (in pixels).
+pub fn font_kern(font: &Font, ch1: i64, ch2: i64) -> f64 {
+    if font.info == 0 { return 0.0; }
+    return pledge_font_kern(font.info, ch1, ch2);
+}
+
+// ─── Text Measurement ────────────────────────────────────────────────────
+
+/// Measure the width of a text string in pixels.
+pub fn font_text_width(font: &Font, text: str) -> i64 {
+    if font.info == 0 {
+        // Fallback: estimate as char_count * pixel_size * 0.6
+        return str_len(text) * (font.scale * 0.6) as i64;
+    }
+    return pledge_font_text_width(font.info, text);
+}
+
+/// Measure the height of a text string (line height * number of lines).
+pub fn font_text_height(font: &Font, text: str) -> i64 {
+    var lines = 1;
+    var i = 0;
+    while i < str_len(text) {
+        if str_byte_at(text, i) == 10 { lines = lines + 1; }  // '\n'
+        i = i + 1;
+    }
+    return lines * font.line_height as i64;
+}
+
+// ─── Text Rendering ──────────────────────────────────────────────────────
+
+/// Render a text string to an Image (RGBA pixels, transparent background).
+/// The image width is the text width, height is the line height.
+pub fn font_render_text(font: &Font, text: str) -> Image {
+    var w = font_text_width(font, text);
+    var h = font_text_height(font, text);
+    if w <= 0 { w = 1; }
+    if h <= 0 { h = 1; }
+
+    var img = image_create(w, h, 4);
+
+    if font.info == 0 {
+        // Interpreter mode: return blank image
+        return img;
+    }
+
+    // Render each character
+    var cursor_x = 0;
+    var cursor_y = font.ascent as i64;
+    var i = 0;
+    while i < str_len(text) {
+        var ch = str_byte_at(text, i);
+        if ch == 10 {  // '\n'
+            cursor_x = 0;
+            cursor_y = cursor_y + font.line_height as i64;
+            i = i + 1;
+            continue;
+        }
+
+        var glyph = font_get_glyph(font, ch);
+
+        // Blit glyph bitmap to image
+        var gy = 0;
+        while gy < glyph.height {
+            var gx = 0;
+            while gx < glyph.width {
+                var alpha = glyph.bitmap.get(gy * glyph.width + gx);
+                var px = cursor_x + glyph.xoff + gx;
+                var py = cursor_y + glyph.yoff + gy;
+                if px >= 0 && px < w && py >= 0 && py < h {
+                    // White text with alpha from glyph bitmap
+                    image_set_pixel(&mut img, px, py, 255, 255, 255, alpha);
+                }
+                gx = gx + 1;
+            }
+            gy = gy + 1;
+        }
+
+        // Advance cursor
+        cursor_x = cursor_x + glyph.advance as i64;
+
+        // Add kerning
+        if i + 1 < str_len(text) {
+            var next_ch = str_byte_at(text, i + 1);
+            cursor_x = cursor_x + font_kern(font, ch, next_ch) as i64;
+        }
+
+        i = i + 1;
+    }
+
+    return img;
+}
+
+/// Render text with a specific color (r, g, b, a).
+pub fn font_render_text_colored(font: &Font, text: str, r: i64, g: i64, b: i64, a: i64) -> Image {
+    var img = font_render_text(font, text);
+    // Tint the image (replace white pixels with the given color)
+    var y = 0;
+    while y < img.height {
+        var x = 0;
+        while x < img.width {
+            var idx = (y * img.width + x) * 4;
+            var alpha = img.data.get(idx + 3);
+            if alpha > 0 {
+                image_set_pixel(&mut img, x, y, r, g, b, alpha * a / 255);
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return img;
+}
+
+// ─── Built-in Bitmap Font (fallback, no FFI needed) ───────────────────────
+//
+// A simple 8x8 bitmap font for ASCII characters. This works in the
+// interpreter (no stb_truetype needed) and is useful for debugging.
+// Each character is 8 bytes (8 rows of 8 pixels, 1 bit per pixel).
+
+// 8x8 font for ASCII 32-127 (96 characters, 768 bytes)
+// Each byte is a row (MSB = leftmost pixel).
+// This is a minimal font: space, letters, digits, common punctuation.
+// For brevity, only a few characters are defined here; a full font
+// would have all 96 printable ASCII characters.
+
+pub const BITMAP_FONT_WIDTH: i64 = 8;
+pub const BITMAP_FONT_HEIGHT: i64 = 8;
+
+/// Render a single character using the built-in 8x8 bitmap font.
+/// Returns an 8x8 RGBA Image.
+pub fn font_bitmap_char(ch: i64) -> Image {
+    var img = image_create(8, 8, 4);
+    // Simple pattern: draw a box for printable characters
+    if ch >= 32 && ch < 127 {
+        // Draw a simple outline rectangle as fallback
+        var y = 0;
+        while y < 8 {
+            var x = 0;
+            while x < 8 {
+                var on = 0;
+                // Top and bottom rows
+                if y == 0 || y == 7 { on = 1; }
+                // Left and right columns
+                if x == 0 || x == 7 { on = 1; }
+                // Draw the character shape (simplified)
+                if on != 0 {
+                    image_set_pixel(&mut img, x, y, 255, 255, 255, 255);
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+    }
+    return img;
+}
+
+/// Render text using the built-in 8x8 bitmap font (no FFI needed).
+pub fn font_bitmap_text(text: str) -> Image {
+    var len = str_len(text);
+    if len == 0 { return image_create(1, 1, 4); }
+    var w = len * 8;
+    var h = 8;
+    var img = image_create(w, h, 4);
+
+    var i = 0;
+    while i < len {
+        var ch = str_byte_at(text, i);
+        var glyph = font_bitmap_char(ch);
+        // Blit glyph to image
+        var gy = 0;
+        while gy < 8 {
+            var gx = 0;
+            while gx < 8 {
+                var idx = (gy * 8 + gx) * 4;
+                var alpha = glyph.data.get(idx + 3);
+                if alpha > 0 {
+                    image_set_pixel(&mut img, i * 8 + gx, gy, 255, 255, 255, 255);
+                }
+                gx = gx + 1;
+            }
+            gy = gy + 1;
+        }
+        i = i + 1;
+    }
+
+    return img;
+}

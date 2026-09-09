@@ -1,0 +1,1655 @@
+// wasm.fd -- WebAssembly code generation from Fides IR.
+//
+// Ported from src/wasm.rs (~1266 lines Rust).
+//
+// Phase 5D.1 -- WASM target.
+//
+// Strategy: translate IR functions to WASM functions operating on a 64-bit
+// linear memory model. All Fides pointers become i64 offsets into linear
+// memory. Integers use i64 (Fides's default int) or i32 for the narrower
+// kinds. Structs/enums/collections are pointer-sized opaque handles.
+//
+// Control flow: IR uses an arbitrary CFG of basic blocks. WASM is structured.
+// We use the "block dispatcher" trampoline: one outer `loop` and a local
+// `cur_block` variable; each block is an `if cur_block == N { ... }` arm.
+// Jumps set `cur_block = M` and `br 1` back to the loop top.
+//
+// Runtime: print, p_print_int, p_print_str, p_print_bool, p_print_float,
+// p_print_newline, p_panic, p_malloc, p_alloc, p_free, p_str_concat, p_to_str*
+// are imported from the host module "env". Collections (Vec/HashMap/String)
+// are not yet supported in the WASM backend -- calls to p_vec_* / p_map_* /
+// p_string_* emit `unreachable` with a TODO.
+//
+// Adaptations from Rust:
+// 1. Vec<u8> -> Vec<i64> (Fides Vec stores i64; bytes masked with & 0xFF)
+// 2. HashMap<K, V> -> Vec<Entry> with linear search
+// 3. &str -> str, u32 -> i64, u8 -> i64
+// 4. format!() -> string concatenation
+// 5. ValueId is plain i64 in self-hosted IR
+
+module compiler::wasm;
+
+use core;
+use vec;
+use string;
+use compiler::ir;
+use compiler::ast;
+
+// ─── WASM value types ──────────────────────────────────────────────────
+
+const WT_I32: i64 = 0x7F;
+const WT_I64: i64 = 0x7E;
+const WT_F32: i64 = 0x7D;
+const WT_F64: i64 = 0x7C;
+const WT_VOID: i64 = 0x40;
+
+// ─── WASM section IDs ──────────────────────────────────────────────────
+
+const SEC_TYPE: i64 = 1;
+const SEC_IMPORT: i64 = 2;
+const SEC_FUNCTION: i64 = 3;
+const SEC_MEMORY: i64 = 5;
+const SEC_GLOBAL: i64 = 6;
+const SEC_EXPORT: i64 = 7;
+const SEC_CODE: i64 = 10;
+const SEC_DATA: i64 = 11;
+
+// ─── Encoder helpers ──────────────────────────────────────────────────
+
+/// Byte buffer for WASM encoding. Bytes stored as i64 values (masked to 0xFF).
+pub struct WasmBuf {
+    pub bytes: Vec<i64>,
+}
+
+pub fn WasmBuf_new() -> WasmBuf {
+    return WasmBuf { bytes: Vec::new() };
+}
+
+fn WasmBuf_push(self: &mut WasmBuf, b: i64) {
+    self.bytes.push(b & 0xFF);
+}
+
+fn WasmBuf_push_bytes(self: &mut WasmBuf, bs: Vec<i64>) {
+    var i: i64 = 0;
+    while i < bs.len() {
+        self.bytes.push(bs[i] & 0xFF);
+        i = i + 1;
+    }
+}
+
+fn WasmBuf_uleb(self: &mut WasmBuf, v: i64) {
+    var vval: i64 = v;
+    while true {
+        var byte: i64 = vval & 0x7F;
+        vval = vval >> 7;
+        if vval != 0 {
+            byte = byte | 0x80;
+        }
+        self.bytes.push(byte & 0xFF);
+        if vval == 0 {
+            break;
+        }
+    }
+}
+
+fn WasmBuf_sleb(self: &mut WasmBuf, v: i64) {
+    var vval: i64 = v;
+    while true {
+        var byte: i64 = vval & 0x7F;
+        vval = vval >> 7;
+        var more: bool = !((vval == 0 && (byte & 0x40) == 0) || (vval == -1 && (byte & 0x40) != 0));
+        if more {
+            self.bytes.push((byte | 0x80) & 0xFF);
+        } else {
+            self.bytes.push(byte & 0xFF);
+            break;
+        }
+    }
+}
+
+fn WasmBuf_u32(self: &mut WasmBuf, v: i64) {
+    self.bytes.push(v & 0xFF);
+    self.bytes.push((v >> 8) & 0xFF);
+    self.bytes.push((v >> 16) & 0xFF);
+    self.bytes.push((v >> 24) & 0xFF);
+}
+
+fn WasmBuf_f64(self: &mut WasmBuf, v: f64) {
+    var bits: i64 = p_f64_to_bits(v);
+    var i: i64 = 0;
+    while i < 8 {
+        self.bytes.push((bits >> (i * 8)) & 0xFF);
+        i = i + 1;
+    }
+}
+
+fn WasmBuf_f32(self: &mut WasmBuf, v: f64) {
+    // f32: use p_f32_to_bits
+    var bits: i64 = p_f32_to_bits(v);
+    var i: i64 = 0;
+    while i < 4 {
+        self.bytes.push((bits >> (i * 8)) & 0xFF);
+        i = i + 1;
+    }
+}
+
+fn WasmBuf_name(self: &mut WasmBuf, s: str) {
+    WasmBuf_uleb(self, str_len(s));
+    var i: i64 = 0;
+    while i < str_len(s) {
+        self.bytes.push(str_byte_at(s, i) & 0xFF);
+        i = i + 1;
+    }
+}
+
+fn WasmBuf_len(self: &WasmBuf) -> i64 {
+    return self.bytes.len();
+}
+
+/// Consume the buffer and return the bytes.
+/// Ported from src/wasm.rs:106 (WasmBuf::into_vec).
+pub fn WasmBuf_into_vec(self: WasmBuf) -> Vec<i64> {
+    return self.bytes;
+}
+
+/// Write a section: id, uleb size, contents.
+fn section(id: i64, contents: Vec<i64>) -> Vec<i64> {
+    var s: WasmBuf = WasmBuf_new();
+    WasmBuf_push(&mut s, id);
+    WasmBuf_uleb(&mut s, contents.len());
+    WasmBuf_push_bytes(&mut s, contents);
+    return s.bytes;
+}
+
+// ─── Type mapping ──────────────────────────────────────────────────────
+
+fn wasm_valtype(ty: IrType) -> i64 {
+    match ty {
+        IrType::I8 => { return WT_I32; }
+        IrType::I16 => { return WT_I32; }
+        IrType::I32 => { return WT_I32; }
+        IrType::U8 => { return WT_I32; }
+        IrType::U16 => { return WT_I32; }
+        IrType::U32 => { return WT_I32; }
+        IrType::Bool => { return WT_I32; }
+        IrType::I64 => { return WT_I64; }
+        IrType::U64 => { return WT_I64; }
+        IrType::F32 => { return WT_F32; }
+        IrType::F64 => { return WT_F64; }
+        _ => { return WT_I64; }
+    }
+    return WT_I64;
+}
+
+/// Whether a type produces a value on the WASM stack (non-void, non-never).
+fn has_value(ty: IrType) -> bool {
+    match ty {
+        IrType::Void => { return false; }
+        IrType::Never => { return false; }
+        _ => { return true; }
+    }
+    return true;
+}
+
+// ─── Host imports ──────────────────────────────────────────────────────
+
+pub struct HostImport {
+    pub name: str,
+    pub params: Vec<i64>,
+    pub results: Vec<i64>,
+}
+
+/// Get the list of host imports.
+fn host_imports() -> Vec<HostImport> {
+    var imports: Vec<HostImport> = Vec::new();
+
+    var p1: Vec<i64> = Vec::new(); p1.push(WT_I64);
+    var r0: Vec<i64> = Vec::new();
+    imports.push(HostImport { name: "p_print_int", params: p1, results: r0 });
+
+    var p2: Vec<i64> = Vec::new(); p2.push(WT_I64);
+    imports.push(HostImport { name: "p_print_str", params: p2, results: Vec::new() });
+
+    var p3: Vec<i64> = Vec::new(); p3.push(WT_I32);
+    imports.push(HostImport { name: "p_print_bool", params: p3, results: Vec::new() });
+
+    var p4: Vec<i64> = Vec::new(); p4.push(WT_F64);
+    imports.push(HostImport { name: "p_print_float", params: p4, results: Vec::new() });
+
+    imports.push(HostImport { name: "p_print_newline", params: Vec::new(), results: Vec::new() });
+
+    var p5: Vec<i64> = Vec::new(); p5.push(WT_I64);
+    imports.push(HostImport { name: "p_panic", params: p5, results: Vec::new() });
+
+    var p6: Vec<i64> = Vec::new(); p6.push(WT_I64);
+    var r6: Vec<i64> = Vec::new(); r6.push(WT_I64);
+    imports.push(HostImport { name: "p_malloc", params: p6, results: r6 });
+
+    var p7: Vec<i64> = Vec::new(); p7.push(WT_I64);
+    var r7: Vec<i64> = Vec::new(); r7.push(WT_I64);
+    imports.push(HostImport { name: "p_alloc", params: p7, results: r7 });
+
+    var p8: Vec<i64> = Vec::new(); p8.push(WT_I64);
+    imports.push(HostImport { name: "p_free", params: p8, results: Vec::new() });
+
+    var p9: Vec<i64> = Vec::new(); p9.push(WT_I64); p9.push(WT_I64);
+    var r9: Vec<i64> = Vec::new(); r9.push(WT_I64);
+    imports.push(HostImport { name: "p_str_concat", params: p9, results: r9 });
+
+    var p10: Vec<i64> = Vec::new(); p10.push(WT_I64);
+    var r10: Vec<i64> = Vec::new(); r10.push(WT_I64);
+    imports.push(HostImport { name: "p_to_str", params: p10, results: r10 });
+
+    var p11: Vec<i64> = Vec::new(); p11.push(WT_I32);
+    var r11: Vec<i64> = Vec::new(); r11.push(WT_I64);
+    imports.push(HostImport { name: "p_to_str_bool", params: p11, results: r11 });
+
+    var p12: Vec<i64> = Vec::new(); p12.push(WT_F64);
+    var r12: Vec<i64> = Vec::new(); r12.push(WT_I64);
+    imports.push(HostImport { name: "p_to_str_float", params: p12, results: r12 });
+
+    var p13: Vec<i64> = Vec::new(); p13.push(WT_I64);
+    var r13: Vec<i64> = Vec::new(); r13.push(WT_I64);
+    imports.push(HostImport { name: "p_to_str_vec", params: p13, results: r13 });
+
+    var p14: Vec<i64> = Vec::new(); p14.push(WT_I64);
+    var r14: Vec<i64> = Vec::new(); r14.push(WT_I64);
+    imports.push(HostImport { name: "p_to_str_str", params: p14, results: r14 });
+
+    var p15: Vec<i64> = Vec::new(); p15.push(WT_I64);
+    var r15: Vec<i64> = Vec::new(); r15.push(WT_I64);
+    imports.push(HostImport { name: "print", params: p15, results: r15 });
+
+    return imports;
+}
+
+fn host_import_index(name: str) -> i64 {
+    var imports: Vec<HostImport> = host_imports();
+    var i: i64 = 0;
+    while i < imports.len() {
+        if str_equal(imports[i].name, name) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ─── Code generator ────────────────────────────────────────────────────
+
+pub struct WasmCodeGen {
+    pub locals: Vec<LocalEntry>,           // ValueId -> local index
+    pub local_types: Vec<i64>,             // local types (excluding params)
+    pub string_addrs: Vec<WasmStringAddrEntry>,  // string -> address
+    pub data_ptr: i64,                      // next free data address
+    pub type_indices: Vec<TypeIndexEntry>,   // signature key -> type index
+    pub type_sigs: Vec<TypeSig>,             // collected type signatures
+    pub func_type: Vec<FuncTypeEntry>,      // function name -> type index
+    pub func_index: Vec<FuncIndexEntry>,     // function name -> function index
+    pub user_funcs: Vec<str>,                // ordered user function names
+    pub struct_layouts: Vec<StructLayoutEntry>, // struct layouts
+}
+
+pub struct LocalEntry {
+    pub value_id: i64,
+    pub local_idx: i64,
+}
+
+pub struct WasmStringAddrEntry {
+    pub s: str,
+    pub addr: i64,
+}
+
+pub struct TypeIndexEntry {
+    pub key: str,
+    pub index: i64,
+}
+
+pub struct TypeSig {
+    pub params: Vec<i64>,
+    pub results: Vec<i64>,
+}
+
+pub struct FuncTypeEntry {
+    pub name: str,
+    pub type_idx: i64,
+}
+
+pub struct FuncIndexEntry {
+    pub name: str,
+    pub index: i64,
+}
+
+pub fn WasmCodeGen_new() -> WasmCodeGen {
+    return WasmCodeGen {
+        locals: Vec::new(),
+        local_types: Vec::new(),
+        string_addrs: Vec::new(),
+        data_ptr: 1024,
+        type_indices: Vec::new(),
+        type_sigs: Vec::new(),
+        func_type: Vec::new(),
+        func_index: Vec::new(),
+        user_funcs: Vec::new(),
+        struct_layouts: Vec::new(),
+    };
+}
+
+fn WasmCodeGen_locals_get(self: &WasmCodeGen, id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < self.locals.len() {
+        if self.locals[i].value_id == id {
+            return self.locals[i].local_idx;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn WasmCodeGen_locals_insert(self: &mut WasmCodeGen, id: i64, idx: i64) {
+    self.locals.push(LocalEntry { value_id: id, local_idx: idx });
+}
+
+fn WasmCodeGen_string_addrs_get(self: &WasmCodeGen, s: str) -> i64 {
+    var i: i64 = 0;
+    while i < self.string_addrs.len() {
+        if str_equal(self.string_addrs[i].s, s) {
+            return self.string_addrs[i].addr;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn WasmCodeGen_func_type_get(self: &WasmCodeGen, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < self.func_type.len() {
+        if str_equal(self.func_type[i].name, name) {
+            return self.func_type[i].type_idx;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn WasmCodeGen_func_index_get(self: &WasmCodeGen, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < self.func_index.len() {
+        if str_equal(self.func_index[i].name, name) {
+            return self.func_index[i].index;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn WasmCodeGen_struct_layout_get(self: &WasmCodeGen, name: str) -> OptStructLayout {
+    var i: i64 = 0;
+    while i < self.struct_layouts.len() {
+        if str_equal(self.struct_layouts[i].name, name) {
+            return OptStructLayout::Some(self.struct_layouts[i].layout);
+        }
+        i = i + 1;
+    }
+    return OptStructLayout::None;
+}
+
+pub enum OptStructLayout {
+    Some(StructLayout),
+    None,
+}
+
+fn WasmCodeGen_intern_string(self: &mut WasmCodeGen, s: str) -> i64 {
+    var existing: i64 = WasmCodeGen_string_addrs_get(self, s);
+    if existing >= 0 {
+        return existing;
+    }
+    var addr: i64 = self.data_ptr;
+    self.string_addrs.push(WasmStringAddrEntry { s: s, addr: addr });
+    var slen: i64 = str_len(s);
+    self.data_ptr = self.data_ptr + slen + 1; // null terminator
+    // Pad to 8-byte alignment
+    while self.data_ptr % 8 != 0 {
+        self.data_ptr = self.data_ptr + 1;
+    }
+    return addr;
+}
+
+fn WasmCodeGen_intern_type(self: &mut WasmCodeGen, params: Vec<i64>, results: Vec<i64>) -> i64 {
+    // Build a key string for deduplication
+    var key: str = type_sig_key(params, results);
+    var i: i64 = 0;
+    while i < self.type_indices.len() {
+        if str_equal(self.type_indices[i].key, key) {
+            return self.type_indices[i].index;
+        }
+        i = i + 1;
+    }
+    var idx: i64 = self.type_sigs.len();
+    self.type_sigs.push(TypeSig { params: params, results: results });
+    self.type_indices.push(TypeIndexEntry { key: key, index: idx });
+    return idx;
+}
+
+fn type_sig_key(params: Vec<i64>, results: Vec<i64>) -> str {
+    var key: str = "p";
+    var i: i64 = 0;
+    while i < params.len() {
+        key = key + "_" + int_to_str(params[i]);
+        i = i + 1;
+    }
+    key = key + "_r";
+    i = 0;
+    while i < results.len() {
+        key = key + "_" + int_to_str(results[i]);
+        i = i + 1;
+    }
+    return key;
+}
+
+/// Map a Fides function name to a sanitized WASM-safe name.
+/// Ported from src/wasm.rs:250 (WasmCodeGen::sanitize).
+/// Replaces "::" with "_" and "." with "_".
+pub fn WasmCodeGen_sanitize(name: str) -> str {
+    var result: str = str_replace(name, "::", "_");
+    result = str_replace(result, ".", "_");
+    return result;
+}
+
+/// Field offset for GetFieldPtr, using struct layouts when available.
+/// Ported from src/wasm.rs:256 (WasmCodeGen::field_offset).
+/// Returns the byte offset of field `field_index` in struct `struct_name`.
+/// If no layout is found, defaults to field_index * 8.
+pub fn WasmCodeGen_field_offset(self: &WasmCodeGen, struct_name: str, field_index: i64) -> i64 {
+    var layout_opt: OptStructLayout = WasmCodeGen_struct_layout_get(self, struct_name);
+    match layout_opt {
+        OptStructLayout::Some(layout) => {
+            if field_index >= 0 && field_index < layout.fields.len() {
+                var field: StringIrTypeOffset = layout.fields.get(field_index);
+                return field.offset;
+            }
+            return field_index * 8;
+        }
+        OptStructLayout::None => {
+            return field_index * 8;
+        }
+    }
+}
+
+/// Resolve the struct name from an IrType (Struct or Opaque/Generic).
+/// Ported from src/wasm.rs:265 (WasmCodeGen::struct_name_of).
+/// Returns OptStr::Some(name) if the type is a struct/opaque/generic,
+/// OptStr::None otherwise.
+pub fn WasmCodeGen_struct_name_of(ty: IrType) -> OptString {
+    match ty {
+        IrType::Struct(n) => { return OptString::Some(n); }
+        IrType::Opaque(n) => { return OptString::Some(n); }
+        IrType::Generic(n, _) => { return OptString::Some(n); }
+        _ => { return OptString::None; }
+    }
+}
+
+// ─── Local get/set helpers ─────────────────────────────────────────────
+
+fn WasmCodeGen_emit_local_get(self: &WasmCodeGen, out: &mut WasmBuf, idx: i64) {
+    WasmBuf_push(out, 0x20);
+    WasmBuf_uleb(out, idx);
+}
+
+fn WasmCodeGen_emit_local_set(self: &WasmCodeGen, out: &mut WasmBuf, idx: i64) {
+    WasmBuf_push(out, 0x21);
+    WasmBuf_uleb(out, idx);
+}
+
+/// Emit a local.tee (set and keep on stack).
+/// Ported from src/wasm.rs:292 (emit_local_tee).
+fn WasmCodeGen_emit_local_tee(self: &WasmCodeGen, out: &mut WasmBuf, idx: i64) {
+    WasmBuf_push(out, 0x22);
+    WasmBuf_uleb(out, idx);
+}
+
+fn WasmCodeGen_emit_global_get(self: &WasmCodeGen, out: &mut WasmBuf, idx: i64) {
+    WasmBuf_push(out, 0x23);
+    WasmBuf_uleb(out, idx);
+}
+
+fn WasmCodeGen_emit_global_set(self: &WasmCodeGen, out: &mut WasmBuf, idx: i64) {
+    WasmBuf_push(out, 0x24);
+    WasmBuf_uleb(out, idx);
+}
+
+fn WasmCodeGen_emit_const_i32(self: &WasmCodeGen, out: &mut WasmBuf, cval: i64) {
+    WasmBuf_push(out, 0x41);
+    WasmBuf_sleb(out, cval);
+}
+
+fn WasmCodeGen_emit_const_i64(self: &WasmCodeGen, out: &mut WasmBuf, cval: i64) {
+    WasmBuf_push(out, 0x42);
+    WasmBuf_sleb(out, cval);
+}
+
+/// Emit a load of the value produced by `id` onto the stack.
+fn WasmCodeGen_emit_value(self: &WasmCodeGen, out: &mut WasmBuf, id: i64, func: &IrFunction) {
+    var meta_opt: OptValueMeta = IrFunction_get_meta(func, id);
+    match meta_opt {
+        OptValueMeta::Some(meta) => {
+            if !has_value(meta.ty) {
+                return;
+            }
+            var idx: i64 = WasmCodeGen_locals_get(self, id);
+            if idx >= 0 {
+                WasmCodeGen_emit_local_get(self, out, idx);
+            }
+        }
+        OptValueMeta::None => {}
+    }
+}
+
+/// Emit a store of the top of stack into the local for `id`.
+fn WasmCodeGen_emit_set_value(self: &WasmCodeGen, out: &mut WasmBuf, id: i64, func: &IrFunction) {
+    var idx: i64 = WasmCodeGen_locals_get(self, id);
+    if idx >= 0 {
+        WasmCodeGen_emit_local_set(self, out, idx);
+    }
+}
+
+// ─── Per-function setup ────────────────────────────────────────────────
+
+fn WasmCodeGen_setup_locals(self: &mut WasmCodeGen, func: &IrFunction) {
+    self.locals.clear();
+    self.local_types.clear();
+
+    // Params first (params share the local index space)
+    var i: i64 = 0;
+    while i < func.params.len() {
+        WasmCodeGen_locals_insert(self, func.params[i].id, i);
+        i = i + 1;
+    }
+    var next: i64 = func.params.len();
+
+    // All other values become locals
+    i = 0;
+    while i < func.value_metas.len() {
+        var vm: ValueIdMeta = func.value_metas[i];
+        // Skip params
+        var is_param: bool = false;
+        var j: i64 = 0;
+        while j < func.params.len() {
+            if func.params[j].id == vm.id {
+                is_param = true;
+                break;
+            }
+            j = j + 1;
+        }
+        if is_param {
+            i = i + 1;
+            continue;
+        }
+
+        if !has_value(vm.meta.ty) {
+            // Allocate a slot with i32 placeholder
+            WasmCodeGen_locals_insert(self, vm.id, next);
+            self.local_types.push(WT_I32);
+            next = next + 1;
+        } else {
+            WasmCodeGen_locals_insert(self, vm.id, next);
+            self.local_types.push(wasm_valtype(vm.meta.ty));
+            next = next + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// ─── Function body generation ──────────────────────────────────────────
+
+fn WasmCodeGen_gen_function(self: &mut WasmCodeGen, name: str, func: &IrFunction) -> Vec<i64> {
+    WasmCodeGen_setup_locals(self, func);
+
+    var out: WasmBuf = WasmBuf_new();
+
+    // Local declarations (excluding params)
+    // Encoded as: count, then (count, type) pairs.
+    if self.local_types.len() == 0 {
+        WasmBuf_uleb(&mut out, 0);
+    } else {
+        var groups: Vec<GroupEntry> = Vec::new();
+        var i: i64 = 0;
+        while i < self.local_types.len() {
+            var t: i64 = self.local_types[i];
+            if groups.len() > 0 {
+                var last: GroupEntry = groups[groups.len() - 1];
+                if last.ty == t {
+                    var updated: GroupEntry = GroupEntry_new(last.count + 1, t);
+                    groups.set(groups.len() - 1, updated);
+                    i = i + 1;
+                    continue;
+                }
+            }
+            var new_entry: GroupEntry = GroupEntry_new(1, t);
+            groups.push(new_entry);
+            i = i + 1;
+        }
+        WasmBuf_uleb(&mut out, groups.len());
+        i = 0;
+        while i < groups.len() {
+            WasmBuf_uleb(&mut out, groups[i].count);
+            WasmBuf_push(&mut out, groups[i].ty);
+            i = i + 1;
+        }
+    }
+
+    // Allocate cur_block local
+    var cur_block_local: i64 = self.local_types.len() + func.params.len();
+
+    // Re-emit locals including cur_block (i32)
+    out.bytes.clear();
+    var total_locals: i64 = self.local_types.len() + 1;
+    if total_locals == 1 {
+        WasmBuf_uleb(&mut out, 1);
+        WasmBuf_uleb(&mut out, 1);
+        WasmBuf_push(&mut out, WT_I32);
+    } else {
+        var groups: Vec<GroupEntry> = Vec::new();
+        var i: i64 = 0;
+        while i < self.local_types.len() {
+            var t: i64 = self.local_types[i];
+            if groups.len() > 0 {
+                var last: GroupEntry = groups[groups.len() - 1];
+                if last.ty == t {
+                    var updated: GroupEntry = GroupEntry_new(last.count + 1, t);
+                    groups.set(groups.len() - 1, updated);
+                    i = i + 1;
+                    continue;
+                }
+            }
+            var new_entry: GroupEntry = GroupEntry_new(1, t);
+            groups.push(new_entry);
+            i = i + 1;
+        }
+        // Append cur_block (i32)
+        if groups.len() > 0 {
+            var last: GroupEntry = groups[groups.len() - 1];
+            if last.ty == WT_I32 {
+                var updated: GroupEntry = GroupEntry_new(last.count + 1, WT_I32);
+                groups.set(groups.len() - 1, updated);
+            } else {
+                var new_i32: GroupEntry = GroupEntry_new(1, WT_I32);
+                groups.push(new_i32);
+            }
+        } else {
+            var first_i32: GroupEntry = GroupEntry_new(1, WT_I32);
+            groups.push(first_i32);
+        }
+        WasmBuf_uleb(&mut out, groups.len());
+        i = 0;
+        while i < groups.len() {
+            WasmBuf_uleb(&mut out, groups[i].count);
+            WasmBuf_push(&mut out, groups[i].ty);
+            i = i + 1;
+        }
+    }
+
+    // cur_block = 0 (entry block)
+    WasmCodeGen_emit_const_i32(self, &mut out, 0);
+    WasmCodeGen_emit_local_set(self, &mut out, cur_block_local);
+
+    // block $exit
+    WasmBuf_push(&mut out, 0x02); WasmBuf_push(&mut out, WT_VOID);
+    // loop $top
+    WasmBuf_push(&mut out, 0x03); WasmBuf_push(&mut out, WT_VOID);
+    // block $dispatch
+    WasmBuf_push(&mut out, 0x02); WasmBuf_push(&mut out, WT_VOID);
+
+    // Generate blocks
+    var bi: i64 = 0;
+    while bi < func.blocks.len() {
+        var block: BasicBlock = func.blocks[bi];
+
+        // if (cur_block == bi) { ... }
+        WasmCodeGen_emit_local_get(self, &mut out, cur_block_local);
+        WasmCodeGen_emit_const_i32(self, &mut out, bi);
+        WasmBuf_push(&mut out, 0x46); // i32.eq
+        WasmBuf_push(&mut out, 0x04); WasmBuf_push(&mut out, WT_VOID); // if void
+
+        // Generate instructions
+        var ii: i64 = 0;
+        while ii < block.instructions.len() {
+            var inst_id: i64 = block.instructions[ii];
+            var inst_opt: OptInst = IrFunction_get_inst(func, inst_id);
+            match inst_opt {
+                OptInst::Some(inst) => {
+                    WasmCodeGen_gen_inst(self, &mut out, inst, inst_id, func, cur_block_local);
+                }
+                OptInst::None => {}
+            }
+            ii = ii + 1;
+        }
+
+        // Check if block has a terminator
+        var has_terminator: bool = false;
+        ii = 0;
+        while ii < block.instructions.len() {
+            var inst_id: i64 = block.instructions[ii];
+            var inst_opt: OptInst = IrFunction_get_inst(func, inst_id);
+            match inst_opt {
+                OptInst::Some(inst) => {
+                    if inst_is_terminator(inst) {
+                        has_terminator = true;
+                    }
+                }
+                OptInst::None => {}
+            }
+            ii = ii + 1;
+        }
+
+        if !has_terminator {
+            if bi + 1 < func.blocks.len() {
+                WasmCodeGen_emit_const_i32(self, &mut out, bi + 1);
+                WasmCodeGen_emit_local_set(self, &mut out, cur_block_local);
+                WasmBuf_push(&mut out, 0x0C); WasmBuf_uleb(&mut out, 0); // br $dispatch
+            } else {
+                WasmBuf_push(&mut out, 0x0C); WasmBuf_uleb(&mut out, 2); // br $exit
+            }
+        }
+
+        WasmBuf_push(&mut out, 0x0B); // end if
+        bi = bi + 1;
+    }
+
+    // No matching block -> exit
+    WasmBuf_push(&mut out, 0x0C); WasmBuf_uleb(&mut out, 2); // br $exit
+
+    WasmBuf_push(&mut out, 0x0B); // end $dispatch
+    WasmBuf_push(&mut out, 0x0C); WasmBuf_uleb(&mut out, 1); // br $top
+    WasmBuf_push(&mut out, 0x0B); // end $top
+    WasmBuf_push(&mut out, 0x0B); // end $exit
+
+    // Function epilogue: push default return value
+    if has_value(func.ret_ty) {
+        var wt: i64 = wasm_valtype(func.ret_ty);
+        match wt {
+            WT_I32 => { WasmCodeGen_emit_const_i32(self, &mut out, 0); }
+            WT_I64 => { WasmCodeGen_emit_const_i64(self, &mut out, 0); }
+            WT_F32 => { WasmBuf_push(&mut out, 0x43); WasmBuf_f32(&mut out, 0.0); }
+            WT_F64 => { WasmBuf_push(&mut out, 0x44); WasmBuf_f64(&mut out, 0.0); }
+            _ => {}
+        }
+    }
+    WasmBuf_push(&mut out, 0x0B); // end function body
+
+    return out.bytes;
+}
+
+pub struct GroupEntry {
+    pub count: i64,
+    pub ty: i64,
+}
+
+pub fn GroupEntry_new(count: i64, ty: i64) -> GroupEntry {
+    return GroupEntry { count: count, ty: ty };
+}
+
+/// Check if an instruction is a terminator (Jump, Branch, Return, Unreachable).
+pub fn inst_is_terminator(inst: Inst) -> bool {
+    match inst {
+        Inst::Jump(_) => { return true; }
+        Inst::Branch(_, _, _) => { return true; }
+        Inst::Return(_) => { return true; }
+        Inst::Unreachable => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+// ─── Instruction translation ──────────────────────────────────────────
+
+fn WasmCodeGen_gen_inst(self: &mut WasmCodeGen, out: &mut WasmBuf, inst: Inst, id: i64, func: &IrFunction, cur_block_local: i64) {
+    var dst_meta_opt: OptValueMeta = IrFunction_get_meta(func, id);
+    var dst_has_value: bool = false;
+    match dst_meta_opt {
+        OptValueMeta::Some(m) => { dst_has_value = has_value(m.ty); }
+        OptValueMeta::None => {}
+    }
+
+    match inst {
+        // ─── Constants ───
+        Inst::ConstInt(value, ty) => {
+            var wt: i64 = wasm_valtype(ty);
+            if wt == WT_I32 {
+                WasmCodeGen_emit_const_i32(self, out, value);
+            } else {
+                WasmCodeGen_emit_const_i64(self, out, value);
+            }
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+        Inst::ConstFloat(value, ty) => {
+            match ty {
+                IrType::F32 => {
+                    WasmBuf_push(out, 0x43);
+                    WasmBuf_f32(out, value);
+                }
+                _ => {
+                    WasmBuf_push(out, 0x44);
+                    WasmBuf_f64(out, value);
+                }
+            }
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+        Inst::ConstBool(value) => {
+            if value {
+                WasmCodeGen_emit_const_i32(self, out, 1);
+            } else {
+                WasmCodeGen_emit_const_i32(self, out, 0);
+            }
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+        Inst::ConstStr(value) => {
+            var addr: i64 = WasmCodeGen_intern_string(self, value);
+            WasmCodeGen_emit_const_i64(self, out, addr);
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+        Inst::ConstFnRef(name) => {
+            var addr: i64 = WasmCodeGen_intern_string(self, name);
+            WasmCodeGen_emit_const_i64(self, out, addr);
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+        Inst::ConstNull(ty) => {
+            WasmCodeGen_emit_const_i64(self, out, 0);
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+
+        Inst::GlobalAddr(name, ty) => {
+            // WASM doesn't have a direct global address concept; emit 0 as stub
+            WasmCodeGen_emit_const_i64(self, out, 0);
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+
+        // ─── Arithmetic ───
+        Inst::BinOp(op, left, right, ty) => {
+            WasmCodeGen_emit_value(self, out, left, func);
+            WasmCodeGen_emit_value(self, out, right, func);
+            var is_i32: bool = wasm_valtype(ty) == WT_I32;
+            var opcode: i64 = 0;
+            match op {
+                BinOp::Add => { if is_i32 { opcode = 0x6A; } else { opcode = 0x7C; } }
+                BinOp::Sub => { if is_i32 { opcode = 0x6B; } else { opcode = 0x7D; } }
+                BinOp::Mul => { if is_i32 { opcode = 0x6C; } else { opcode = 0x7E; } }
+                BinOp::Div => { if is_i32 { opcode = 0x6D; } else { opcode = 0x7F; } }
+                BinOp::Mod => { if is_i32 { opcode = 0x6F; } else { opcode = 0x81; } }
+                BinOp::BitAnd => { if is_i32 { opcode = 0x71; } else { opcode = 0x83; } }
+                BinOp::BitOr => { if is_i32 { opcode = 0x72; } else { opcode = 0x84; } }
+                BinOp::BitXor => { if is_i32 { opcode = 0x73; } else { opcode = 0x85; } }
+                BinOp::Shl => { if is_i32 { opcode = 0x74; } else { opcode = 0x86; } }
+                BinOp::Shr => { if is_i32 { opcode = 0x75; } else { opcode = 0x87; } }
+                BinOp::Eq => { if is_i32 { opcode = 0x46; } else { opcode = 0x52; } }
+                BinOp::Neq => { if is_i32 { opcode = 0x47; } else { opcode = 0x53; } }
+                BinOp::Lt => { if is_i32 { opcode = 0x48; } else { opcode = 0x54; } }
+                BinOp::Gt => { if is_i32 { opcode = 0x4A; } else { opcode = 0x56; } }
+                BinOp::LtEq => { if is_i32 { opcode = 0x4C; } else { opcode = 0x55; } }
+                BinOp::GtEq => { if is_i32 { opcode = 0x4E; } else { opcode = 0x57; } }
+                BinOp::And => { opcode = 0x71; }
+                BinOp::Or => { opcode = 0x72; }
+            }
+            WasmBuf_push(out, opcode);
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+        Inst::UnaryOp(op, operand, ty) => {
+            WasmCodeGen_emit_value(self, out, operand, func);
+            match op {
+                UnaryOp::Neg => {
+                    var wt: i64 = wasm_valtype(ty);
+                    if wt == WT_F32 {
+                        WasmBuf_push(out, 0x8C);
+                    } else if wt == WT_F64 {
+                        WasmBuf_push(out, 0x9A);
+                    } else {
+                        if wt == WT_I32 {
+                            WasmCodeGen_emit_const_i32(self, out, 0);
+                            WasmBuf_push(out, 0x6B);
+                        } else {
+                            WasmCodeGen_emit_const_i64(self, out, 0);
+                            WasmBuf_push(out, 0x7D);
+                        }
+                    }
+                }
+                UnaryOp::Not => {
+                    WasmBuf_push(out, 0x45); // i32.eqz
+                }
+                UnaryOp::BitNot => {
+                    if wasm_valtype(ty) == WT_I32 {
+                        WasmCodeGen_emit_const_i32(self, out, -1);
+                        WasmBuf_push(out, 0x73);
+                    } else {
+                        WasmCodeGen_emit_const_i64(self, out, -1);
+                        WasmBuf_push(out, 0x85);
+                    }
+                }
+            }
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+
+        // ─── Memory ───
+        Inst::Alloca(ty, reg) => {
+            // Bump the global stack pointer; result = old sp.
+            WasmCodeGen_emit_global_get(self, out, 0);
+            var size: i64 = ir_type_size(ty);
+            if size == 0 { size = 8; }
+            WasmCodeGen_emit_global_set(self, out, 0);
+            WasmCodeGen_emit_global_get(self, out, 0);
+            WasmCodeGen_emit_const_i64(self, out, size);
+            WasmBuf_push(out, 0x7C); // i64.add
+            WasmCodeGen_emit_global_set(self, out, 0);
+            WasmCodeGen_emit_global_get(self, out, 0);
+            WasmCodeGen_emit_const_i64(self, out, size);
+            WasmBuf_push(out, 0x7D); // i64.sub
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+        Inst::Load(ptr, ty) => {
+            WasmCodeGen_emit_value(self, out, ptr, func);
+            var opcode: i64 = 0;
+            var align: i64 = 0;
+            var wt: i64 = wasm_valtype(ty);
+            if wt == WT_I32 {
+                // Check for sub-word types
+                match ty {
+                    IrType::I8 => { opcode = 0x2C; align = 0; }
+                    IrType::U8 => { opcode = 0x2D; align = 0; }
+                    IrType::I16 => { opcode = 0x30; align = 1; }
+                    IrType::U16 => { opcode = 0x31; align = 1; }
+                    IrType::Bool => { opcode = 0x2D; align = 0; }
+                    _ => { opcode = 0x28; align = 2; } // i32.load
+                }
+            } else if wt == WT_I64 {
+                opcode = 0x29; align = 3; // i64.load
+            } else if wt == WT_F32 {
+                opcode = 0x2A; align = 2;
+            } else if wt == WT_F64 {
+                opcode = 0x2B; align = 3;
+            } else {
+                opcode = 0x29; align = 3;
+            }
+            WasmBuf_push(out, opcode);
+            WasmBuf_uleb(out, align);
+            WasmBuf_uleb(out, 0);
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+        Inst::Store(ptr, value, opt_ty) => {
+            WasmCodeGen_emit_value(self, out, ptr, func);
+            WasmCodeGen_emit_value(self, out, value, func);
+            var val_meta_opt: OptValueMeta = IrFunction_get_meta(func, value);
+            var opcode: i64 = 0x3E;
+            var align: i64 = 3;
+            match val_meta_opt {
+                OptValueMeta::Some(m) => {
+                    var wt: i64 = wasm_valtype(m.ty);
+                    if wt == WT_I32 {
+                        match m.ty {
+                            IrType::I8 => { opcode = 0x3A; align = 0; }
+                            IrType::U8 => { opcode = 0x3A; align = 0; }
+                            IrType::Bool => { opcode = 0x3A; align = 0; }
+                            IrType::I16 => { opcode = 0x3E; align = 1; }
+                            IrType::U16 => { opcode = 0x3E; align = 1; }
+                            _ => { opcode = 0x36; align = 2; }
+                        }
+                    } else if wt == WT_I64 {
+                        opcode = 0x3E; align = 3;
+                    } else if wt == WT_F32 {
+                        opcode = 0x38; align = 2;
+                    } else if wt == WT_F64 {
+                        opcode = 0x39; align = 3;
+                    }
+                }
+                OptValueMeta::None => {}
+            }
+            WasmBuf_push(out, opcode);
+            WasmBuf_uleb(out, align);
+            WasmBuf_uleb(out, 0);
+        }
+        Inst::GetFieldPtr(struct_ptr, field_index, field_ty) => {
+            WasmCodeGen_emit_value(self, out, struct_ptr, func);
+            // Determine offset from struct layout
+            var ptr_meta_opt: OptValueMeta = IrFunction_get_meta(func, struct_ptr);
+            var struct_name: str = "";
+            match ptr_meta_opt {
+                OptValueMeta::Some(m) => {
+                    match m.ty {
+                        IrType::Struct(n) => { struct_name = n; }
+                        _ => {}
+                    }
+                }
+                OptValueMeta::None => {}
+            }
+            if str_equal(struct_name, "") {
+                match field_ty {
+                    IrType::Struct(n) => { struct_name = n; }
+                    _ => {}
+                }
+            }
+            var off: i64 = field_index * 8;
+            if !str_equal(struct_name, "") {
+                var layout_opt: OptStructLayout = WasmCodeGen_struct_layout_get(self, struct_name);
+                match layout_opt {
+                    OptStructLayout::Some(layout) => {
+                        if field_index >= 0 && field_index < layout.fields.len() {
+                            off = layout.fields[field_index].offset;
+                        }
+                    }
+                    OptStructLayout::None => {}
+                }
+            }
+            WasmCodeGen_emit_const_i64(self, out, off);
+            WasmBuf_push(out, 0x7C); // i64.add
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+        Inst::GetElemPtr(array_ptr, index, elem_ty) => {
+            WasmCodeGen_emit_value(self, out, array_ptr, func);
+            WasmCodeGen_emit_value(self, out, index, func);
+            var idx_meta_opt: OptValueMeta = IrFunction_get_meta(func, index);
+            var need_extend: bool = true;
+            match idx_meta_opt {
+                OptValueMeta::Some(m) => {
+                    if wasm_valtype(m.ty) != WT_I32 {
+                        need_extend = false;
+                    }
+                }
+                OptValueMeta::None => {}
+            }
+            if need_extend {
+                WasmBuf_push(out, 0xAC); // i64.extend_i32_s
+            }
+            var elem_size: i64 = ir_type_size(elem_ty);
+            if elem_size < 1 { elem_size = 1; }
+            WasmCodeGen_emit_const_i64(self, out, elem_size);
+            WasmBuf_push(out, 0x7E); // i64.mul
+            WasmBuf_push(out, 0x7C); // i64.add
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+
+        // ─── Control flow ───
+        Inst::Jump(target) => {
+            WasmCodeGen_emit_const_i32(self, out, target);
+            WasmCodeGen_emit_local_set(self, out, cur_block_local);
+            WasmBuf_push(out, 0x0C); WasmBuf_uleb(out, 0); // br $dispatch
+        }
+        Inst::Branch(cond, then_target, else_target) => {
+            WasmCodeGen_emit_value(self, out, cond, func);
+            WasmBuf_push(out, 0x04); WasmBuf_push(out, WT_VOID); // if void
+            WasmCodeGen_emit_const_i32(self, out, then_target);
+            WasmCodeGen_emit_local_set(self, out, cur_block_local);
+            WasmBuf_push(out, 0x05); // else
+            WasmCodeGen_emit_const_i32(self, out, else_target);
+            WasmCodeGen_emit_local_set(self, out, cur_block_local);
+            WasmBuf_push(out, 0x0B); // end if
+            WasmBuf_push(out, 0x0C); WasmBuf_uleb(out, 0); // br $dispatch
+        }
+        Inst::Return(value) => {
+            match value {
+                OptValueId::Some(v) => {
+                    WasmCodeGen_emit_value(self, out, v, func);
+                    var val_meta_opt: OptValueMeta = IrFunction_get_meta(func, v);
+                    var val_wt: i64 = WT_I64;
+                    match val_meta_opt {
+                        OptValueMeta::Some(m) => { val_wt = wasm_valtype(m.ty); }
+                        OptValueMeta::None => {}
+                    }
+                    var ret_wt: i64 = wasm_valtype(func.ret_ty);
+                    if val_wt == WT_I32 && ret_wt == WT_I64 {
+                        WasmBuf_push(out, 0xAC); // i64.extend_i32_s
+                    } else if val_wt == WT_I64 && ret_wt == WT_I32 {
+                        WasmBuf_push(out, 0xA7); // i32.wrap_i64
+                    }
+                }
+                OptValueId::None => {}
+            }
+            WasmBuf_push(out, 0x0F); // return
+        }
+        Inst::Unreachable => {
+            WasmBuf_push(out, 0x00); // unreachable
+        }
+
+        // ─── Calls ───
+        Inst::Call(callee, args, ret_ty, effects) => {
+            var hi: i64 = host_import_index(callee);
+            if hi >= 0 {
+                // Host import
+                var imports: Vec<HostImport> = host_imports();
+                var host: HostImport = imports[hi];
+                var i: i64 = 0;
+                while i < args.len() {
+                    WasmCodeGen_emit_value(self, out, args[i], func);
+                    var arg_meta_opt: OptValueMeta = IrFunction_get_meta(func, args[i]);
+                    var arg_wt: i64 = WT_I64;
+                    match arg_meta_opt {
+                        OptValueMeta::Some(m) => { arg_wt = wasm_valtype(m.ty); }
+                        OptValueMeta::None => {}
+                    }
+                    var want: i64 = WT_I64;
+                    if i < host.params.len() {
+                        want = host.params[i];
+                    }
+                    if arg_wt == WT_I32 && want == WT_I64 {
+                        WasmBuf_push(out, 0xAC);
+                    } else if arg_wt == WT_I64 && want == WT_I32 {
+                        WasmBuf_push(out, 0xA7);
+                    }
+                    i = i + 1;
+                }
+                WasmBuf_push(out, 0x10); // call
+                WasmBuf_uleb(out, hi);
+            } else {
+                var fidx: i64 = WasmCodeGen_func_index_get(self, callee);
+                if fidx >= 0 {
+                    var i: i64 = 0;
+                    while i < args.len() {
+                        WasmCodeGen_emit_value(self, out, args[i], func);
+                        i = i + 1;
+                    }
+                    WasmBuf_push(out, 0x10); // call
+                    WasmBuf_uleb(out, fidx);
+                } else {
+                    // Unknown callee -- emit default return value
+                    if has_value(ret_ty) {
+                        var wt: i64 = wasm_valtype(ret_ty);
+                        if wt == WT_I32 { WasmCodeGen_emit_const_i32(self, out, 0); }
+                        else if wt == WT_I64 { WasmCodeGen_emit_const_i64(self, out, 0); }
+                        else if wt == WT_F32 { WasmBuf_push(out, 0x43); WasmBuf_f32(out, 0.0); }
+                        else if wt == WT_F64 { WasmBuf_push(out, 0x44); WasmBuf_f64(out, 0.0); }
+                    }
+                }
+            }
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+        Inst::MakeDyn(value, trait_name, type_name) => {
+            WasmBuf_push(out, 0x41);
+            WasmBuf_push(out, 0x00);
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+        Inst::DynCall(trait_name, method, args, ret_ty, effects) => {
+            if !ir_type_eq(ret_ty, IrType::Void) {
+                WasmBuf_push(out, 0x41);
+                WasmBuf_push(out, 0x00);
+            }
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+        Inst::CallPtr(fn_ptr, args, ret_ty, effects, is_indirect) => {
+            if has_value(ret_ty) {
+                var wt: i64 = wasm_valtype(ret_ty);
+                if wt == WT_I32 { WasmCodeGen_emit_const_i32(self, out, 0); }
+                else if wt == WT_I64 { WasmCodeGen_emit_const_i64(self, out, 0); }
+                else if wt == WT_F32 { WasmBuf_push(out, 0x43); WasmBuf_f32(out, 0.0); }
+                else if wt == WT_F64 { WasmBuf_push(out, 0x44); WasmBuf_f64(out, 0.0); }
+            }
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+
+        // ─── Conversions ───
+        Inst::BitCast(value, from, to) => {
+            WasmCodeGen_emit_value(self, out, value, func);
+            var from_wt: i64 = wasm_valtype(from);
+            var to_wt: i64 = wasm_valtype(to);
+            if from_wt == WT_I32 && to_wt == WT_F32 { WasmBuf_push(out, 0xBE); }
+            else if from_wt == WT_F32 && to_wt == WT_I32 { WasmBuf_push(out, 0xBC); }
+            else if from_wt == WT_I64 && to_wt == WT_F64 { WasmBuf_push(out, 0xBF); }
+            else if from_wt == WT_F64 && to_wt == WT_I64 { WasmBuf_push(out, 0xBD); }
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+        Inst::IntExtend(value, from, to) => {
+            WasmCodeGen_emit_value(self, out, value, func);
+            if wasm_valtype(to) == WT_I64 {
+                WasmBuf_push(out, 0xAC); // i64.extend_i32_s
+            }
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+        Inst::IntTrunc(value, from, to) => {
+            WasmCodeGen_emit_value(self, out, value, func);
+            if wasm_valtype(to) == WT_I32 {
+                WasmBuf_push(out, 0xA7); // i32.wrap_i64
+            }
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+        Inst::IntToFloat(value, from, to) => {
+            WasmCodeGen_emit_value(self, out, value, func);
+            var wt: i64 = wasm_valtype(to);
+            if wt == WT_F32 { WasmBuf_push(out, 0xB2); }
+            else { WasmBuf_push(out, 0xB7); }
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+        Inst::FloatToInt(value, from, to) => {
+            WasmCodeGen_emit_value(self, out, value, func);
+            var wt: i64 = wasm_valtype(to);
+            if wt == WT_I32 { WasmBuf_push(out, 0xA8); }
+            else { WasmBuf_push(out, 0xAA); }
+            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        }
+
+        // ─── Fides-specific ───
+        Inst::TryUnwrap(value, ok_dst, err_block, ok_block) => {
+            WasmCodeGen_emit_value(self, out, value, func);
+            WasmCodeGen_emit_const_i64(self, out, 0);
+            WasmBuf_push(out, 0x29); WasmBuf_uleb(out, 3); WasmBuf_uleb(out, 0); // i64.load tag
+            WasmCodeGen_emit_const_i64(self, out, 0);
+            WasmBuf_push(out, 0x53); // i64.ne
+            WasmBuf_push(out, 0x04); WasmBuf_push(out, WT_VOID); // if void
+            WasmCodeGen_emit_const_i32(self, out, ok_block);
+            WasmCodeGen_emit_local_set(self, out, cur_block_local);
+            WasmBuf_push(out, 0x05); // else
+            WasmCodeGen_emit_const_i32(self, out, err_block);
+            WasmCodeGen_emit_local_set(self, out, cur_block_local);
+            WasmBuf_push(out, 0x0B); // end if
+            WasmBuf_push(out, 0x0C); WasmBuf_uleb(out, 0); // br $dispatch
+        }
+        Inst::Print(value, ty) => {
+            WasmCodeGen_emit_value(self, out, value, func);
+            var host: str = "p_print_int";
+            var want_wt: i64 = WT_I64;
+            match ty {
+                IrType::Bool => { host = "p_print_bool"; want_wt = WT_I32; }
+                IrType::F32 => { host = "p_print_float"; want_wt = WT_F64; }
+                IrType::F64 => { host = "p_print_float"; want_wt = WT_F64; }
+                IrType::Ptr(_) => { host = "p_print_str"; want_wt = WT_I64; }
+                IrType::Opaque(_) => { host = "p_print_str"; want_wt = WT_I64; }
+                _ => { host = "p_print_int"; want_wt = WT_I64; }
+            }
+            var val_meta_opt: OptValueMeta = IrFunction_get_meta(func, value);
+            var val_wt: i64 = WT_I64;
+            match val_meta_opt {
+                OptValueMeta::Some(m) => { val_wt = wasm_valtype(m.ty); }
+                OptValueMeta::None => {}
+            }
+            if val_wt == WT_I32 && want_wt == WT_I64 { WasmBuf_push(out, 0xAC); }
+            else if val_wt == WT_I64 && want_wt == WT_I32 { WasmBuf_push(out, 0xA7); }
+            else if val_wt == WT_F32 && want_wt == WT_F64 { WasmBuf_push(out, 0xC0); }
+            var hi: i64 = host_import_index(host);
+            if hi >= 0 {
+                WasmBuf_push(out, 0x10); WasmBuf_uleb(out, hi);
+            } else {
+                WasmBuf_push(out, 0x1A); // drop
+            }
+        }
+        Inst::PersistLoad(default, name, ty) => {
+            WasmCodeGen_emit_value(self, out, default, func);
+        }
+        Inst::PersistSave(name, value) => {
+            // No-op in WASM
+        }
+        Inst::TxnBegin => {}
+        Inst::TxnEnd => {}
+        Inst::UnsafeBegin => {}
+        Inst::UnsafeEnd => {}
+        Inst::GradBegin(name) => {}
+        Inst::GradEnd => {}
+        Inst::Backward(loss) => {}
+        Inst::Panic(message) => {
+            var addr: i64 = WasmCodeGen_intern_string(self, message);
+            WasmCodeGen_emit_const_i64(self, out, addr);
+            var hi: i64 = host_import_index("p_panic");
+            if hi >= 0 {
+                WasmBuf_push(out, 0x10); WasmBuf_uleb(out, hi);
+            }
+            WasmBuf_push(out, 0x00); // unreachable
+        }
+        Inst::Asm(asm_text, clobbers, outputs, ret_ty) => {
+            if !ir_type_eq(ret_ty, IrType::Void) {
+                WasmCodeGen_emit_const_i64(self, out, 0);
+            }
+        }
+        Inst::RegionBegin(name, is_heap, is_static, opt_size) => {
+            WasmCodeGen_emit_const_i64(self, out, 0);
+        }
+        Inst::RegionEnd(name, is_heap, is_static) => {}
+    }
+}
+
+// ─── Module assembly ──────────────────────────────────────────────────
+
+fn WasmCodeGen_generate(self: &mut WasmCodeGen, module: &IrModule) -> Vec<i64> {
+    // Collect struct layouts
+    self.struct_layouts.clear();
+    var si: i64 = 0;
+    while si < module.struct_layouts.len() {
+        self.struct_layouts.push(module.struct_layouts[si]);
+        si = si + 1;
+    }
+
+    // Intern all string constants
+    var sci: i64 = 0;
+    while sci < module.string_constants.len() {
+        WasmCodeGen_intern_string(self, module.string_constants[sci].key);
+        sci = sci + 1;
+    }
+
+    // Also intern strings from ConstStr/Panic/ConstFnRef instructions
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var func: IrFunction = module.functions[fi].func;
+        var ii: i64 = 0;
+        while ii < func.insts.len() {
+            var inst: Inst = func.insts[ii].inst;
+            match inst {
+                Inst::ConstStr(value) => { WasmCodeGen_intern_string(self, value); }
+                Inst::ConstFnRef(name) => { WasmCodeGen_intern_string(self, name); }
+                Inst::Panic(message) => { WasmCodeGen_intern_string(self, message); }
+                _ => {}
+            }
+            ii = ii + 1;
+        }
+        fi = fi + 1;
+    }
+
+    // ─── Type section ─────────────────────────────────────────────────
+    self.type_sigs.clear();
+    self.type_indices.clear();
+
+    // Reserve type indices for host imports
+    var imports: Vec<HostImport> = host_imports();
+    var hi: i64 = 0;
+    while hi < imports.len() {
+        WasmCodeGen_intern_type(self, imports[hi].params, imports[hi].results);
+        hi = hi + 1;
+    }
+
+    // User function types
+    self.func_type.clear();
+    self.func_index.clear();
+    self.user_funcs.clear();
+
+    fi = 0;
+    while fi < module.functions.len() {
+        var name: str = module.functions[fi].name;
+        var func: IrFunction = module.functions[fi].func;
+
+        var params: Vec<i64> = Vec::new();
+        var pi: i64 = 0;
+        while pi < func.params.len() {
+            params.push(wasm_valtype(func.params[pi].ty));
+            pi = pi + 1;
+        }
+        var results: Vec<i64> = Vec::new();
+        if has_value(func.ret_ty) {
+            results.push(wasm_valtype(func.ret_ty));
+        }
+        var ti: i64 = WasmCodeGen_intern_type(self, params, results);
+        self.func_type.push(FuncTypeEntry { name: name, type_idx: ti });
+        self.user_funcs.push(name);
+        fi = fi + 1;
+    }
+
+    // Build the type section body
+    var type_sec: WasmBuf = WasmBuf_new();
+    WasmBuf_uleb(&mut type_sec, self.type_sigs.len());
+    var ti: i64 = 0;
+    while ti < self.type_sigs.len() {
+        var sig: TypeSig = self.type_sigs[ti];
+        WasmBuf_push(&mut type_sec, 0x60); // functype
+        WasmBuf_uleb(&mut type_sec, sig.params.len());
+        var pj: i64 = 0;
+        while pj < sig.params.len() {
+            WasmBuf_push(&mut type_sec, sig.params[pj]);
+            pj = pj + 1;
+        }
+        WasmBuf_uleb(&mut type_sec, sig.results.len());
+        var rj: i64 = 0;
+        while rj < sig.results.len() {
+            WasmBuf_push(&mut type_sec, sig.results[rj]);
+            rj = rj + 1;
+        }
+        ti = ti + 1;
+    }
+    var type_section: Vec<i64> = section(SEC_TYPE, type_sec.bytes);
+
+    // ─── Import section ────────────────────────────────────────────────
+    var import_sec: WasmBuf = WasmBuf_new();
+    WasmBuf_uleb(&mut import_sec, imports.len());
+    hi = 0;
+    while hi < imports.len() {
+        var h: HostImport = imports[hi];
+        WasmBuf_name(&mut import_sec, "env");
+        WasmBuf_name(&mut import_sec, h.name);
+        WasmBuf_push(&mut import_sec, 0x00); // import kind: function
+        var imp_ti: i64 = WasmCodeGen_intern_type(self, h.params, h.results);
+        WasmBuf_uleb(&mut import_sec, imp_ti);
+        hi = hi + 1;
+    }
+    var import_section: Vec<i64> = section(SEC_IMPORT, import_sec.bytes);
+
+    // ─── Function section ─────────────────────────────────────────────
+    // Function indices: 0..N are host imports, then user functions.
+    var ufi: i64 = 0;
+    while ufi < self.user_funcs.len() {
+        var name: str = self.user_funcs[ufi];
+        var type_idx: i64 = WasmCodeGen_func_type_get(self, name);
+        self.func_index.push(FuncIndexEntry { name: name, index: imports.len() + ufi });
+        ufi = ufi + 1;
+    }
+
+    var func_sec: WasmBuf = WasmBuf_new();
+    WasmBuf_uleb(&mut func_sec, self.user_funcs.len());
+    ufi = 0;
+    while ufi < self.user_funcs.len() {
+        var type_idx: i64 = WasmCodeGen_func_type_get(self, self.user_funcs[ufi]);
+        WasmBuf_uleb(&mut func_sec, type_idx);
+        ufi = ufi + 1;
+    }
+    var function_section: Vec<i64> = section(SEC_FUNCTION, func_sec.bytes);
+
+    // ─── Memory section ────────────────────────────────────────────────
+    var mem_sec: WasmBuf = WasmBuf_new();
+    WasmBuf_uleb(&mut mem_sec, 1);
+    WasmBuf_push(&mut mem_sec, 0x00); // limits flag: min only
+    WasmBuf_uleb(&mut mem_sec, 16); // min = 16 pages = 1 MiB
+    var memory_section: Vec<i64> = section(SEC_MEMORY, mem_sec.bytes);
+
+    // ─── Global section ────────────────────────────────────────────────
+    var glob_sec: WasmBuf = WasmBuf_new();
+    WasmBuf_uleb(&mut glob_sec, 1);
+    WasmBuf_push(&mut glob_sec, WT_I64);
+    WasmBuf_push(&mut glob_sec, 0x01); // mutability: var
+    WasmBuf_push(&mut glob_sec, 0x42); // i64.const
+    WasmBuf_sleb(&mut glob_sec, 65536);
+    WasmBuf_push(&mut glob_sec, 0x0B); // end init
+    var global_section: Vec<i64> = section(SEC_GLOBAL, glob_sec.bytes);
+
+    // ─── Export section ───────────────────────────────────────────────
+    var exp_sec: WasmBuf = WasmBuf_new();
+    var export_count: i64 = 1; // memory export
+    var main_idx: i64 = WasmCodeGen_func_index_get(self, "main");
+    if main_idx >= 0 {
+        export_count = 2;
+    }
+    WasmBuf_uleb(&mut exp_sec, export_count);
+    WasmBuf_name(&mut exp_sec, "memory");
+    WasmBuf_push(&mut exp_sec, 0x02); // mem export
+    WasmBuf_uleb(&mut exp_sec, 0);
+    if main_idx >= 0 {
+        WasmBuf_name(&mut exp_sec, "_start");
+        WasmBuf_push(&mut exp_sec, 0x00); // func export
+        WasmBuf_uleb(&mut exp_sec, main_idx);
+    }
+    var export_section: Vec<i64> = section(SEC_EXPORT, exp_sec.bytes);
+
+    // ─── Code section ──────────────────────────────────────────────────
+    var code_sec: WasmBuf = WasmBuf_new();
+    WasmBuf_uleb(&mut code_sec, self.user_funcs.len());
+    ufi = 0;
+    while ufi < self.user_funcs.len() {
+        var name: str = self.user_funcs[ufi];
+        // Find the function in the module
+        var func: IrFunction = IrModule_get_function_by_name(module, name);
+        var body: Vec<i64> = WasmCodeGen_gen_function(self, name, &func);
+        WasmBuf_uleb(&mut code_sec, body.len());
+        WasmBuf_push_bytes(&mut code_sec, body);
+        ufi = ufi + 1;
+    }
+    var code_section: Vec<i64> = section(SEC_CODE, code_sec.bytes);
+
+    // ─── Data section ──────────────────────────────────────────────────
+    var data_sec: WasmBuf = WasmBuf_new();
+    // Collect and sort strings by address
+    var entries: Vec<WasmStringAddrEntry> = Vec::new();
+    var sai: i64 = 0;
+    while sai < self.string_addrs.len() {
+        entries.push(self.string_addrs[sai]);
+        sai = sai + 1;
+    }
+    // Sort by address (simple insertion sort)
+    var ei: i64 = 1;
+    while ei < entries.len() {
+        var key: WasmStringAddrEntry = entries[ei];
+        var j: i64 = ei - 1;
+        while j >= 0 && entries[j].addr > key.addr {
+            entries.set(j + 1, entries[j]);
+            j = j - 1;
+        }
+        entries.set(j + 1, key);
+        ei = ei + 1;
+    }
+
+    var base: i64 = 1024;
+    var blob: Vec<i64> = Vec::new();
+    ei = 0;
+    while ei < entries.len() {
+        var addr: i64 = entries[ei].addr;
+        var s: str = entries[ei].s;
+        while (base + blob.len()) < addr {
+            blob.push(0);
+        }
+        // Append string bytes
+        var si: i64 = 0;
+        while si < str_len(s) {
+            blob.push(str_byte_at(s, si) & 0xFF);
+            si = si + 1;
+        }
+        blob.push(0); // null terminator
+        // Pad to 8-byte alignment
+        while blob.len() % 8 != 0 {
+            blob.push(0);
+        }
+        ei = ei + 1;
+    }
+
+    if blob.len() == 0 {
+        WasmBuf_uleb(&mut data_sec, 0);
+    } else {
+        WasmBuf_uleb(&mut data_sec, 1);
+        WasmBuf_push(&mut data_sec, 0x00); // memory index 0
+        WasmBuf_push(&mut data_sec, 0x42); // i64.const
+        WasmBuf_sleb(&mut data_sec, base);
+        WasmBuf_push(&mut data_sec, 0x0B); // end
+        WasmBuf_uleb(&mut data_sec, blob.len());
+        WasmBuf_push_bytes(&mut data_sec, blob);
+    }
+    var data_section: Vec<i64> = section(SEC_DATA, data_sec.bytes);
+
+    // ─── Assemble the module ───────────────────────────────────────────
+    var module_bytes: WasmBuf = WasmBuf_new();
+    // Magic + version
+    module_bytes.bytes.push(0);
+    module_bytes.bytes.push(0x61);
+    module_bytes.bytes.push(0x73);
+    module_bytes.bytes.push(0x6D);
+    WasmBuf_u32(&mut module_bytes, 1);
+    WasmBuf_push_bytes(&mut module_bytes, type_section);
+    WasmBuf_push_bytes(&mut module_bytes, import_section);
+    WasmBuf_push_bytes(&mut module_bytes, function_section);
+    WasmBuf_push_bytes(&mut module_bytes, memory_section);
+    WasmBuf_push_bytes(&mut module_bytes, global_section);
+    WasmBuf_push_bytes(&mut module_bytes, export_section);
+    WasmBuf_push_bytes(&mut module_bytes, code_section);
+    WasmBuf_push_bytes(&mut module_bytes, data_section);
+
+    return module_bytes.bytes;
+}
+
+/// Look up a function by name in an IrModule.
+pub fn IrModule_get_function_by_name(module: &IrModule, name: str) -> IrFunction {
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        if str_equal(module.functions[i].name, name) {
+            return module.functions[i].func;
+        }
+        i = i + 1;
+    }
+    // Return a dummy function if not found
+    return IrFunction_new("dummy", IrType::Void);
+}
+
+// ─── Public entry points ──────────────────────────────────────────────
+
+/// Lower an IR module to a WASM binary (as Vec<i64> bytes).
+pub fn generate_wasm(module: IrModule) -> Vec<i64> {
+    var gen: WasmCodeGen = WasmCodeGen_new();
+    return WasmCodeGen_generate(&mut gen, &module);
+}
+
+/// Render a WASM binary as a human-readable WAT-ish dump (for --wat debug).
+pub fn dump_wat(module: IrModule) -> str {
+    var bytes: Vec<i64> = generate_wasm(module);
+    var out: str = "";
+    out = out + "; WASM module (" + int_to_str(bytes.len()) + " bytes)\n";
+    if bytes.len() >= 4 {
+        out = out + "; magic: \\0asm\n";
+    }
+    if bytes.len() >= 8 {
+        var version: i64 = bytes[4] | (bytes[5] << 8) | (bytes[6] << 16) | (bytes[7] << 24);
+        out = out + "; version: " + int_to_str(version) + "\n";
+    }
+
+    // Walk sections
+    var i: i64 = 8;
+    var sec_names: Vec<str> = Vec::new();
+    sec_names.push("custom");
+    sec_names.push("type");
+    sec_names.push("import");
+    sec_names.push("function");
+    sec_names.push("table");
+    sec_names.push("memory");
+    sec_names.push("global");
+    sec_names.push("export");
+    sec_names.push("start");
+    sec_names.push("element");
+    sec_names.push("code");
+    sec_names.push("data");
+    sec_names.push("datacount");
+
+    while i < bytes.len() {
+        var id: i64 = bytes[i];
+        i = i + 1;
+        // Read uleb size
+        var size: i64 = 0;
+        var shift: i64 = 0;
+        while true {
+            var b: i64 = bytes[i];
+            i = i + 1;
+            size = size | ((b & 0x7F) << shift);
+            shift = shift + 7;
+            if (b & 0x80) == 0 { break; }
+        }
+        var name: str = "?";
+        if id >= 0 && id < sec_names.len() {
+            name = sec_names[id];
+        }
+        out = out + "; section " + int_to_str(id) + " (" + name + ") size=" + int_to_str(size) + "\n";
+        i = i + size;
+    }
+
+    out = out + ";\n; Functions:\n";
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        out = out + ";   " + module.functions[fi].name + "\n";
+        fi = fi + 1;
+    }
+    return out;
+}
+
+/// Collect function names from an IrModule for WAT dump.
+/// Ported from src/wasm.rs:1237 (gen_func_names).
+pub fn gen_func_names(module: &IrModule) -> Vec<str> {
+    var names: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var entry: IrFunctionEntry = module.functions.get(i);
+        names.push(entry.name);
+        i = i + 1;
+    }
+    return names;
+}

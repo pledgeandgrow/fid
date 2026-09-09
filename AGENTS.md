@@ -4,7 +4,7 @@
 > Fides compiler safely. Read this before making changes.
 >
 > **Fides is self-hosted and independent.** The primary compiler is in
-> `compiler/*.fd` (31 modules, 74,914 LOC). The Rust source in `src/*.rs` is
+> `compiler/*.fd` (50 modules, 91,924 LOC). The Rust source in `src/*.rs` is
 > the bootstrap reference, used only when `compiler/*.fd` changes. For everyday
 > work (writing programs, adding stdlib, adding tests, building tools), use
 > `release/fides-c3.exe` directly — no Rust build needed.
@@ -153,7 +153,7 @@ cargo build
 
 ```
 SELF-HOSTED COMPILER (primary):
-  compiler/*.fd:  31 modules, 74,914 LOC — THE COMPILER
+  compiler/*.fd:  50 modules, 91,924 LOC — THE COMPILER
   Fixpoint:       fides-c2.c == fides-c3.c (0 diffs / 701,158 lines, byte-identical)
   Bootstrap:      3 generations verified (Rust → c1 → c2 → c3, all work)
   Use:            release/fides-c3.exe for everyday work
@@ -172,6 +172,14 @@ STDLIB:
   stdlib/*.fd:    74 modules, 19,230 LOC (including rc.fd, kernel.fd, uefi.fd)
 
 RECENT IMPROVEMENTS:
+  Session 20:     12 Rust modules ported (coff, macho, cparser, embedded, tensor,
+                  wasm, scribe, veil, hotreload, debugger, native_debugger, gpu)
+                  + 7 cross-comp backends (codegen_arm64/riscv, runtime_arm64/riscv,
+                  arm64_enc, riscv_enc) — 14,577 LOC added, 50 modules total
+  PE stubs:       p_map_keys/values/get_or/clone + p_string_trim/split implemented
+  ELF dump:       dump_symbols implemented (symbol table parser)
+  @packed:        Packed struct layout (field_align=1, no padding)
+  Opaque fields:  GetFieldPtr resolves IrType::Opaque when struct exists
   ELF64 encoder:  Full x86-64 instruction encoder ported (compiler/elf64.fd, 2,423 LOC)
   Interp port:    75 missing interpreter functions ported (compiler/interp.fd, 2,839 LOC)
   Linux runtime:  Native Linux syscall runtime (compiler/runtime_linux.fd, 4,362 LOC)
@@ -245,12 +253,15 @@ touching them.
 ## Known Bugs (Do Not Re-Introduce)
 
 > **Critical Blockers:** See `docs/roadmap/roadmap-issues.md` → "Critical
-> Blockers" section for the four highest-priority issues that must be fixed
+> Blockers" section for the highest-priority issues that must be fixed
 > before production use:
-> 1. Self-hosted compiler doesn't enforce safety annotations (CB1)
-> 2. Result<T,E> and Option<T> hardcoded to i64 (CB2)
-> 3. Backend test parity not 100% (CB3)
-> 4. Parser error recovery needs hardening (CB4)
+> 1. CB1: Safety annotations — core primitives enforced (Session 19), 13 stubs remain
+> 2. CB2: Generic Option<T>/Result<T,E> — ✅ resolved (Session 19)
+> 3. CB3: Backend test parity not 100% (231/243 interp, 214/243 C, 235/243 PE)
+> 4. CB4: Parser debug prints — ✅ resolved (Session 19)
+> 5. CB5: Self-hosted compiler build fails — ✅ resolved (Session 20, all 50 modules type-check)
+> 6. CB6: PE emitter stubs — partially resolved (Session 20, 6/15 fixed, 9 p_string_* remain)
+> 7. CB7: ELF64 symbol table dump — ✅ resolved (Session 20)
 
 1. **Register allocator clobbering** (`regalloc.rs`): Previously, constants not
    loaded into registers before use could be clobbered by intervening

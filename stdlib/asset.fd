@@ -1,0 +1,364 @@
+// Fides Asset Manager standard library
+//
+// Centralized asset loading, caching, and hot-reload support.
+// Tracks loaded assets by path, prevents duplicate loads, and
+// provides a simple reference-counting mechanism.
+//
+// Supported asset types:
+//   - Textures (images)
+//   - Sounds (audio)
+//   - Fonts
+//   - Meshes (3D models)
+//   - Text files (shaders, configs)
+//
+// Usage:
+//   use asset;
+//
+//   asset_init();
+//   var tex = asset_load_texture("player.png");
+//   var snd = asset_load_sound("explosion.wav");
+//   // Hot reload changed assets:
+//   asset_hot_reload();
+//   // Shutdown:
+//   asset_shutdown();
+
+module asset;
+
+use vec;
+use string;
+
+// ─── Asset Types ─────────────────────────────────────────────────────────
+
+pub const ASSET_TEXTURE: i64 = 0;
+pub const ASSET_SOUND: i64 = 1;
+pub const ASSET_FONT: i64 = 2;
+pub const ASSET_MESH: i64 = 3;
+pub const ASSET_TEXT: i64 = 4;
+pub const ASSET_DATA: i64 = 5;
+
+// ─── Asset Entry ─────────────────────────────────────────────────────────
+
+pub struct AssetEntry {
+    pub path: str,
+    pub asset_type: i64,
+    pub handle: i64,          // native handle (texture, sound, etc.)
+    pub ref_count: i64,
+    pub loaded: bool,
+    pub last_modified: i64,   // file mtime (for hot reload)
+    pub size: i64,             // size in bytes
+}
+
+pub struct AssetManager {
+    pub assets: Vec<AssetEntry>,
+    pub root_path: str,        // base path for relative paths
+    pub auto_reload: bool,     // check for file changes each frame
+    pub total_loaded: i64,
+    pub total_memory: i64,     // estimated memory usage in bytes
+}
+
+var g_asset_mgr: AssetManager = AssetManager {
+    assets: Vec::new(),
+    root_path: "",
+    auto_reload: false,
+    total_loaded: 0,
+    total_memory: 0,
+};
+
+/// Initialize the asset manager.
+pub fn asset_init() -> void {
+    g_asset_mgr.assets.clear();
+    g_asset_mgr.total_loaded = 0;
+    g_asset_mgr.total_memory = 0;
+}
+
+/// Set the root path for asset loading.
+pub fn asset_set_root(path: str) -> void {
+    g_asset_mgr.root_path = path;
+}
+
+/// Enable or disable automatic hot-reload checking.
+pub fn asset_set_auto_reload(enabled: bool) -> void {
+    g_asset_mgr.auto_reload = enabled;
+}
+
+/// Find an asset by path. Returns index or -1.
+pub fn asset_find(path: str) -> i64 {
+    var i = 0;
+    while i < g_asset_mgr.assets.len() {
+        if str_equal(g_asset_mgr.assets.get(i).path, path) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Load a texture asset. Returns the asset index or -1 on failure.
+pub fn asset_load_texture(path: str) -> i64 {
+    var idx = asset_find(path);
+    if idx >= 0 {
+        var entry = g_asset_mgr.assets.get(idx);
+        entry.ref_count = entry.ref_count + 1;
+        g_asset_mgr.assets.set(idx, entry);
+        return idx;
+    }
+
+    // Load via SDL_image
+    var handle = pledge_asset_load_texture(path);
+    if handle == 0 { return -1; }
+
+    var entry = AssetEntry {
+        path: path,
+        asset_type: ASSET_TEXTURE,
+        handle: handle,
+        ref_count: 1,
+        loaded: true,
+        last_modified: 0,
+        size: 0,
+    };
+    g_asset_mgr.assets.push(entry);
+    g_asset_mgr.total_loaded = g_asset_mgr.total_loaded + 1;
+    return g_asset_mgr.assets.len() - 1;
+}
+
+/// Load a sound asset.
+pub fn asset_load_sound(path: str) -> i64 {
+    var idx = asset_find(path);
+    if idx >= 0 {
+        var entry = g_asset_mgr.assets.get(idx);
+        entry.ref_count = entry.ref_count + 1;
+        g_asset_mgr.assets.set(idx, entry);
+        return idx;
+    }
+
+    var handle = pledge_asset_load_sound(path);
+    if handle == 0 { return -1; }
+
+    var entry = AssetEntry {
+        path: path,
+        asset_type: ASSET_SOUND,
+        handle: handle,
+        ref_count: 1,
+        loaded: true,
+        last_modified: 0,
+        size: 0,
+    };
+    g_asset_mgr.assets.push(entry);
+    g_asset_mgr.total_loaded = g_asset_mgr.total_loaded + 1;
+    return g_asset_mgr.assets.len() - 1;
+}
+
+/// Load a font asset.
+pub fn asset_load_font(path: str, size: f64) -> i64 {
+    var idx = asset_find(path);
+    if idx >= 0 {
+        var entry = g_asset_mgr.assets.get(idx);
+        entry.ref_count = entry.ref_count + 1;
+        g_asset_mgr.assets.set(idx, entry);
+        return idx;
+    }
+
+    var handle = pledge_asset_load_font(path, size);
+    if handle == 0 { return -1; }
+
+    var entry = AssetEntry {
+        path: path,
+        asset_type: ASSET_FONT,
+        handle: handle,
+        ref_count: 1,
+        loaded: true,
+        last_modified: 0,
+        size: 0,
+    };
+    g_asset_mgr.assets.push(entry);
+    g_asset_mgr.total_loaded = g_asset_mgr.total_loaded + 1;
+    return g_asset_mgr.assets.len() - 1;
+}
+
+/// Load a mesh asset (OBJ file).
+pub fn asset_load_mesh(path: str) -> i64 {
+    var idx = asset_find(path);
+    if idx >= 0 {
+        var entry = g_asset_mgr.assets.get(idx);
+        entry.ref_count = entry.ref_count + 1;
+        g_asset_mgr.assets.set(idx, entry);
+        return idx;
+    }
+
+    var handle = pledge_asset_load_mesh(path);
+    if handle == 0 { return -1; }
+
+    var entry = AssetEntry {
+        path: path,
+        asset_type: ASSET_MESH,
+        handle: handle,
+        ref_count: 1,
+        loaded: true,
+        last_modified: 0,
+        size: 0,
+    };
+    g_asset_mgr.assets.push(entry);
+    g_asset_mgr.total_loaded = g_asset_mgr.total_loaded + 1;
+    return g_asset_mgr.assets.len() - 1;
+}
+
+/// Load a text file asset (shaders, configs).
+pub fn asset_load_text(path: str) -> i64 {
+    var idx = asset_find(path);
+    if idx >= 0 {
+        var entry = g_asset_mgr.assets.get(idx);
+        entry.ref_count = entry.ref_count + 1;
+        g_asset_mgr.assets.set(idx, entry);
+        return idx;
+    }
+
+    var source = p_file_read(path);
+    if str_len(source) == 0 { return -1; }
+
+    var entry = AssetEntry {
+        path: path,
+        asset_type: ASSET_TEXT,
+        handle: 0,
+        ref_count: 1,
+        loaded: true,
+        last_modified: 0,
+        size: str_len(source),
+    };
+    g_asset_mgr.assets.push(entry);
+    g_asset_mgr.total_loaded = g_asset_mgr.total_loaded + 1;
+    g_asset_mgr.total_memory = g_asset_mgr.total_memory + str_len(source);
+    return g_asset_mgr.assets.len() - 1;
+}
+
+/// Get the native handle for an asset.
+pub fn asset_handle(idx: i64) -> i64 {
+    if idx < 0 || idx >= g_asset_mgr.assets.len() { return 0; }
+    return g_asset_mgr.assets.get(idx).handle;
+}
+
+/// Get the asset type.
+pub fn asset_type(idx: i64) -> i64 {
+    if idx < 0 || idx >= g_asset_mgr.assets.len() { return -1; }
+    return g_asset_mgr.assets.get(idx).asset_type;
+}
+
+/// Get the asset path.
+pub fn asset_path(idx: i64) -> str {
+    if idx < 0 || idx >= g_asset_mgr.assets.len() { return ""; }
+    return g_asset_mgr.assets.get(idx).path;
+}
+
+/// Release a reference to an asset. When ref_count reaches 0, it's unloaded.
+pub fn asset_release(idx: i64) -> void {
+    if idx < 0 || idx >= g_asset_mgr.assets.len() { return; }
+    var entry = g_asset_mgr.assets.get(idx);
+    if entry.ref_count > 0 {
+        entry.ref_count = entry.ref_count - 1;
+    }
+    if entry.ref_count == 0 && entry.loaded {
+        pledge_asset_unload(entry.handle, entry.asset_type);
+        entry.loaded = false;
+        g_asset_mgr.total_loaded = g_asset_mgr.total_loaded - 1;
+    }
+    g_asset_mgr.assets.set(idx, entry);
+}
+
+/// Force unload an asset regardless of ref count.
+pub fn asset_unload(idx: i64) -> void {
+    if idx < 0 || idx >= g_asset_mgr.assets.len() { return; }
+    var entry = g_asset_mgr.assets.get(idx);
+    if entry.loaded {
+        pledge_asset_unload(entry.handle, entry.asset_type);
+        entry.loaded = false;
+        entry.ref_count = 0;
+        g_asset_mgr.total_loaded = g_asset_mgr.total_loaded - 1;
+    }
+    g_asset_mgr.assets.set(idx, entry);
+}
+
+/// Reload an asset (for hot reload).
+pub fn asset_reload(idx: i64) -> bool {
+    if idx < 0 || idx >= g_asset_mgr.assets.len() { return false; }
+    var entry = g_asset_mgr.assets.get(idx);
+
+    // Unload old
+    if entry.loaded {
+        pledge_asset_unload(entry.handle, entry.asset_type);
+    }
+
+    // Reload
+    var new_handle = 0;
+    if entry.asset_type == ASSET_TEXTURE {
+        new_handle = pledge_asset_load_texture(entry.path);
+    } else if entry.asset_type == ASSET_SOUND {
+        new_handle = pledge_asset_load_sound(entry.path);
+    } else if entry.asset_type == ASSET_FONT {
+        new_handle = pledge_asset_load_font(entry.path, 16.0);
+    } else if entry.asset_type == ASSET_MESH {
+        new_handle = pledge_asset_load_mesh(entry.path);
+    }
+
+    if new_handle != 0 {
+        entry.handle = new_handle;
+        entry.loaded = true;
+        g_asset_mgr.assets.set(idx, entry);
+        return true;
+    }
+    return false;
+}
+
+/// Check all assets for file modifications and reload changed ones.
+pub fn asset_hot_reload() -> i64 {
+    var reloaded = 0;
+    var i = 0;
+    while i < g_asset_mgr.assets.len() {
+        var entry = g_asset_mgr.assets.get(i);
+        if entry.loaded {
+            var mtime = pledge_asset_mtime(entry.path);
+            if mtime > entry.last_modified {
+                if asset_reload(i) {
+                    reloaded = reloaded + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return reloaded;
+}
+
+/// Get the total number of loaded assets.
+pub fn asset_count() -> i64 {
+    return g_asset_mgr.total_loaded;
+}
+
+/// Get estimated memory usage in bytes.
+pub fn asset_memory_usage() -> i64 {
+    return g_asset_mgr.total_memory;
+}
+
+/// Unload all assets.
+pub fn asset_unload_all() -> void {
+    var i = 0;
+    while i < g_asset_mgr.assets.len() {
+        asset_unload(i);
+        i = i + 1;
+    }
+    g_asset_mgr.assets.clear();
+}
+
+/// Shutdown the asset manager.
+pub fn asset_shutdown() -> void {
+    asset_unload_all();
+    g_asset_mgr.total_memory = 0;
+}
+
+// ─── Native Runtime Helpers ──────────────────────────────────────────────
+
+extern "C" include "pledge_asset.h" link "" {
+    fn pledge_asset_load_texture(path: str) -> i64;
+    fn pledge_asset_load_sound(path: str) -> i64;
+    fn pledge_asset_load_font(path: str, size: f64) -> i64;
+    fn pledge_asset_load_mesh(path: str) -> i64;
+    fn pledge_asset_unload(handle: i64, asset_type: i64) -> void;
+    fn pledge_asset_mtime(path: str) -> i64;
+}

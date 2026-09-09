@@ -1,0 +1,396 @@
+// Fides Network standard library
+//
+// UDP socket networking for multiplayer games.
+// Provides socket creation, send/receive, and a simple reliable
+// message layer on top of UDP (acknowledgments, retransmission).
+//
+// Usage:
+//   use net;
+//
+//   // Server
+//   var sock = net_socket_create();
+//   net_bind(sock, 8080);
+//   var buf = net_buffer_create(1024);
+//   var n = net_recv_from(sock, &buf, &addr);
+//   if n > 0 { net_send_to(sock, buf.data, n, addr); }
+//
+//   // Client
+//   var sock = net_socket_create();
+//   var server = net_addr_create("127.0.0.1", 8080);
+//   net_send_to(sock, "hello", 5, server);
+
+module net;
+
+use vec;
+use string;
+
+// ─── Socket FFI ──────────────────────────────────────────────────────────
+//
+// All socket operations go through pledge_net.h wrapper functions to
+// avoid type conflicts with system headers. The native runtime
+// (pledge_net.c) handles sockaddr_in construction and platform differences.
+
+extern "C" include "pledge_net.h" link "" {
+    fn pledge_net_socket(domain: i64, type: i64, protocol: i64) -> i64;
+    fn pledge_net_bind(sock: i64, port: i64) -> i64;
+    fn pledge_net_set_nonblocking(sock: i64) -> i64;
+    fn pledge_net_set_recv_timeout(sock: i64, timeout_ms: i64) -> i64;
+    fn pledge_net_sendto(sock: i64, data: i64, len: i64, ip: i64, port: i64) -> i64;
+    fn pledge_net_recvfrom(sock: i64, buf: i64, len: i64, from_addr: i64) -> i64;
+    fn pledge_net_connect(sock: i64, ip: i64, port: i64) -> i64;
+    fn pledge_net_send(sock: i64, data: i64, len: i64) -> i64;
+    fn pledge_net_recv(sock: i64, buf: i64, len: i64) -> i64;
+    fn pledge_net_close(sock: i64) -> i64;
+    fn pledge_net_inet_addr(ip_str: str) -> i64;
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────
+
+pub const AF_INET: i64 = 2;
+pub const SOCK_DGRAM: i64 = 2;
+pub const SOCK_STREAM: i64 = 1;
+pub const SOL_SOCKET: i64 = 1;
+pub const SO_REUSEADDR: i64 = 2;
+pub const SO_BROADCAST: i64 = 6;
+pub const SO_RCVTIMEO: i64 = 20;
+
+pub const MSG_DONTWAIT: i64 = 0x40;
+
+// ─── Address ──────────────────────────────────────────────────────────────
+
+pub struct NetAddr {
+    pub ip: i64,        // IPv4 address as i64 (from inet_addr)
+    pub port: i64,      // port number
+    pub raw: i64,       // raw sockaddr_in pointer (native)
+}
+
+/// Create a network address from IP string and port.
+pub fn net_addr_create(ip_str: str, port: i64) -> NetAddr {
+    return NetAddr {
+        ip: pledge_net_inet_addr(ip_str),
+        port: port,
+        raw: 0,
+    };
+}
+
+/// Create a "any" address (0.0.0.0) for binding.
+pub fn net_addr_any(port: i64) -> NetAddr {
+    return net_addr_create("0.0.0.0", port);
+}
+
+// ─── Socket ──────────────────────────────────────────────────────────────
+
+/// Create a UDP socket. Returns socket file descriptor or -1 on error.
+pub fn net_socket_create() -> i64 {
+    return pledge_net_socket(AF_INET, SOCK_DGRAM, 0);
+}
+
+/// Create a TCP socket. Returns socket file descriptor or -1 on error.
+pub fn net_socket_create_tcp() -> i64 {
+    return pledge_net_socket(AF_INET, SOCK_STREAM, 0);
+}
+
+/// Bind a socket to a port (for server use).
+/// Returns 0 on success, -1 on error.
+pub fn net_bind(sock: i64, port: i64) -> i64 {
+    // Build sockaddr_in: { family, port, ip, padding }
+    // In native builds, the runtime constructs this struct.
+    // For now, we use a native helper.
+    return pledge_net_bind(sock, port);
+}
+
+/// Set socket to non-blocking mode.
+pub fn net_set_nonblocking(sock: i64) -> i64 {
+    return pledge_net_set_nonblocking(sock);
+}
+
+/// Set receive timeout in milliseconds.
+pub fn net_set_recv_timeout(sock: i64, timeout_ms: i64) -> i64 {
+    return pledge_net_set_recv_timeout(sock, timeout_ms);
+}
+
+/// Enable address reuse (SO_REUSEADDR).
+pub fn net_set_reuseaddr(sock: i64) -> i64 {
+    // SO_REUSEADDR is set by pledge_net_bind automatically
+    return 0;
+}
+
+/// Close a socket.
+pub fn net_close(sock: i64) -> void {
+    pledge_net_close(sock);
+}
+
+// ─── Send / Receive ──────────────────────────────────────────────────────
+
+/// Send data to a specific address (UDP).
+/// Returns number of bytes sent, or -1 on error.
+pub fn net_send_to(sock: i64, data: i64, len: i64, addr: &NetAddr) -> i64 {
+    return pledge_net_sendto(sock, data, len, addr.ip, addr.port);
+}
+
+/// Receive data from any sender (UDP).
+/// Returns number of bytes received, or -1 on error (or timeout).
+/// The sender's address is stored in from_addr.
+pub fn net_recv_from(sock: i64, buf: i64, len: i64, from_addr: &mut NetAddr) -> i64 {
+    return pledge_net_recvfrom(sock, buf, len, from_addr);
+}
+
+/// Connect to a server (TCP).
+pub fn net_connect(sock: i64, addr: &NetAddr) -> i64 {
+    return pledge_net_connect(sock, addr.ip, addr.port);
+}
+
+/// Send data on a connected socket (TCP or connected UDP).
+pub fn net_send(sock: i64, data: i64, len: i64) -> i64 {
+    return pledge_net_send(sock, data, len);
+}
+
+/// Receive data on a connected socket.
+pub fn net_recv(sock: i64, buf: i64, len: i64) -> i64 {
+    return pledge_net_recv(sock, buf, len);
+}
+
+// ─── Network Buffer ──────────────────────────────────────────────────────
+
+pub struct NetBuffer {
+    pub data: Vec<i64>,
+    pub size: i64,
+    pub pos: i64,
+}
+
+pub fn net_buffer_create(size: i64) -> NetBuffer {
+    var data = Vec::new();
+    var i = 0;
+    while i < size {
+        data.push(0);
+        i = i + 1;
+    }
+    return NetBuffer {
+        data: data,
+        size: size,
+        pos: 0,
+    };
+}
+
+pub fn net_buffer_write_u8(buf: &mut NetBuffer, val: i64) -> void {
+    if buf.pos < buf.size {
+        buf.data.set(buf.pos, val & 0xFF);
+        buf.pos = buf.pos + 1;
+    }
+}
+
+pub fn net_buffer_write_u16(buf: &mut NetBuffer, val: i64) -> void {
+    net_buffer_write_u8(buf, (val >> 8) & 0xFF);
+    net_buffer_write_u8(buf, val & 0xFF);
+}
+
+pub fn net_buffer_write_u32(buf: &mut NetBuffer, val: i64) -> void {
+    net_buffer_write_u8(buf, (val >> 24) & 0xFF);
+    net_buffer_write_u8(buf, (val >> 16) & 0xFF);
+    net_buffer_write_u8(buf, (val >> 8) & 0xFF);
+    net_buffer_write_u8(buf, val & 0xFF);
+}
+
+pub fn net_buffer_read_u8(buf: &mut NetBuffer) -> i64 {
+    if buf.pos >= buf.size { return 0; }
+    var val = buf.data.get(buf.pos) & 0xFF;
+    buf.pos = buf.pos + 1;
+    return val;
+}
+
+pub fn net_buffer_read_u16(buf: &mut NetBuffer) -> i64 {
+    var hi = net_buffer_read_u8(buf);
+    var lo = net_buffer_read_u8(buf);
+    return (hi << 8) | lo;
+}
+
+pub fn net_buffer_read_u32(buf: &mut NetBuffer) -> i64 {
+    var b0 = net_buffer_read_u8(buf);
+    var b1 = net_buffer_read_u8(buf);
+    var b2 = net_buffer_read_u8(buf);
+    var b3 = net_buffer_read_u8(buf);
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+}
+
+pub fn net_buffer_reset(buf: &mut NetBuffer) -> void {
+    buf.pos = 0;
+}
+
+pub fn net_buffer_remaining(buf: &NetBuffer) -> i64 {
+    return buf.size - buf.pos;
+}
+
+// ─── Reliable Message Layer ─────────────────────────────────────────────
+//
+// A simple reliable messaging layer on top of UDP.
+// Provides:
+//   - Message IDs and sequence numbers
+//   - Acknowledgments (ACKs)
+//   - Retransmission of unacked messages
+//   - Duplicate detection
+//
+// This is NOT a full TCP replacement — it's for game networking
+// where low latency matters more than perfect reliability.
+
+pub const MSG_TYPE_DATA: i64 = 0;
+pub const MSG_TYPE_ACK: i64 = 1;
+pub const MSG_TYPE_PING: i64 = 2;
+pub const MSG_TYPE_PONG: i64 = 3;
+
+pub struct ReliableMessage {
+    pub msg_id: i64,
+    pub msg_type: i64,
+    pub data: Vec<i64>,
+    pub sent_time: i64,
+    pub acked: bool,
+    pub send_count: i64,
+}
+
+pub struct ReliableConnection {
+    pub sock: i64,
+    pub remote: NetAddr,
+    pub next_msg_id: i64,
+    pub pending: Vec<ReliableMessage>,
+    pub received_ids: Vec<i64>,
+    pub rtt: f64,              // round-trip time estimate (ms)
+    pub timeout_ms: i64,       // retransmission timeout
+}
+
+pub fn net_reliable_create(sock: i64, remote: NetAddr) -> ReliableConnection {
+    return ReliableConnection {
+        sock: sock,
+        remote: remote,
+        next_msg_id: 1,
+        pending: Vec::new(),
+        received_ids: Vec::new(),
+        rtt: 100.0,
+        timeout_ms: 200,
+    };
+}
+
+/// Send a reliable message (will be retransmitted until acked).
+pub fn net_reliable_send(conn: &mut ReliableConnection, data: Vec<i64>) -> i64 {
+    var msg = ReliableMessage {
+        msg_id: conn.next_msg_id,
+        msg_type: MSG_TYPE_DATA,
+        data: data,
+        sent_time: 0,  // would use clock_now_ms() in native
+        acked: false,
+        send_count: 0,
+    };
+    conn.next_msg_id = conn.next_msg_id + 1;
+    conn.pending.push(msg);
+
+    // Send immediately
+    var buf = net_buffer_create(4 + data.len());
+    net_buffer_write_u32(&mut buf, msg.msg_id);
+    var i = 0;
+    while i < data.len() {
+        net_buffer_write_u8(&mut buf, data.get(i));
+        i = i + 1;
+    }
+
+    return net_send_to(conn.sock, 0, buf.pos, &conn.remote);
+}
+
+/// Process incoming data (check for ACKs or data messages).
+pub fn net_reliable_recv(conn: &mut ReliableConnection, data: Vec<i64>) -> void {
+    if data.len() < 4 { return; }
+
+    var buf = net_buffer_create(data.len());
+    var i = 0;
+    while i < data.len() {
+        net_buffer_write_u8(&mut buf, data.get(i));
+        i = i + 1;
+    }
+    net_buffer_reset(&mut buf);
+
+    var msg_id = net_buffer_read_u32(&buf);
+
+    // Check if this is an ACK
+    if msg_id < 0 {
+        // Mark corresponding message as acked
+        var j = 0;
+        while j < conn.pending.len() {
+            var msg = conn.pending.get(j);
+            if msg.msg_id == -msg_id {
+                msg.acked = true;
+                conn.pending.set(j, msg);
+                break;
+            }
+            j = j + 1;
+        }
+    } else {
+        // Data message — send ACK and process
+        var ack_buf = net_buffer_create(4);
+        net_buffer_write_u32(&mut ack_buf, -msg_id);
+        net_send_to(conn.sock, 0, 4, &conn.remote);
+
+        // Check for duplicates
+        var is_dup = false;
+        var k = 0;
+        while k < conn.received_ids.len() {
+            if conn.received_ids.get(k) == msg_id {
+                is_dup = true;
+                break;
+            }
+            k = k + 1;
+        }
+        if !is_dup {
+            conn.received_ids.push(msg_id);
+            // Process message data here (application-specific)
+        }
+    }
+}
+
+/// Update the connection: retransmit unacked messages that have timed out.
+pub fn net_reliable_update(conn: &mut ReliableConnection, current_time: i64) -> void {
+    var i = 0;
+    while i < conn.pending.len() {
+        var msg = conn.pending.get(i);
+        if !msg.acked {
+            if current_time - msg.sent_time > conn.timeout_ms {
+                // Retransmit
+                msg.send_count = msg.send_count + 1;
+                msg.sent_time = current_time;
+
+                var buf = net_buffer_create(4 + msg.data.len());
+                net_buffer_write_u32(&mut buf, msg.msg_id);
+                var j = 0;
+                while j < msg.data.len() {
+                    net_buffer_write_u8(&mut buf, msg.data.get(j));
+                    j = j + 1;
+                }
+                net_send_to(conn.sock, 0, buf.pos, &conn.remote);
+            }
+        }
+        conn.pending.set(i, msg);
+        i = i + 1;
+    }
+
+    // Remove acked messages in-place
+    var write_idx = 0;
+    var j = 0;
+    while j < conn.pending.len() {
+        var msg = conn.pending.get(j);
+        if !msg.acked {
+            conn.pending.set(write_idx, msg);
+            write_idx = write_idx + 1;
+        }
+        j = j + 1;
+    }
+    // Truncate by popping excess elements
+    while conn.pending.len() > write_idx {
+        conn.pending.pop();
+    }
+}
+
+/// Get the number of pending (unacked) messages.
+pub fn net_reliable_pending_count(conn: &ReliableConnection) -> i64 {
+    return conn.pending.len();
+}
+
+/// Get the estimated round-trip time in milliseconds.
+pub fn net_reliable_rtt(conn: &ReliableConnection) -> f64 {
+    return conn.rtt;
+}

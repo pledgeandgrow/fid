@@ -254,6 +254,11 @@ pub struct Interpreter {
     /// the high-level Value::Vec is stored. This separates the raw struct
     /// fields (data, len, cap at addr+0, +8, +16) from the Value::Vec.
     vec_side_table: HashMap<u64, u64>,
+    /// String builder table — maps sb handle (i64) to accumulated String content.
+    /// Used by p_sb_new/p_sb_append/p_sb_to_str for the C code generator.
+    sb_table: HashMap<i64, String>,
+    /// Next string builder handle (incrementing counter for unique IDs).
+    sb_next_handle: i64,
     /// KV caches for LLM serving (ML9). Each entry is a KvCache identified by
     /// an opaque handle (i64 index into this Vec).
     kv_caches: Vec<Rc<RefCell<crate::tensor::KvCache>>>,
@@ -394,6 +399,10 @@ pub struct Interpreter {
     /// Maximum memory in bytes the interpreter can allocate before panicking
     /// with a "memory limit exceeded" message. 0 = unlimited.
     max_memory: u64,
+    /// PRNG state for stochastic operations (dp_noise, gaussian_noise, dropout).
+    /// xorshift128+ — seeded from system time on init. Replaces the
+    /// deterministic sin/cos-based pseudo-noise that provided zero randomness.
+    prng_state: [u64; 2],
 }
 
 /// ML3: A tape entry for reverse-mode autodiff
@@ -484,6 +493,8 @@ impl Interpreter {
             global_addrs: HashMap::new(),
             opaque_values: HashMap::new(),
             vec_side_table: HashMap::new(),
+            sb_table: HashMap::new(),
+            sb_next_handle: 1,
             kv_caches: Vec::new(),
             verbose: false,
             debug_mode: true,
@@ -536,6 +547,17 @@ impl Interpreter {
             max_steps: 0, // 0 = unlimited (set via --max-steps)
             step_count: 0,
             max_memory: 0, // 0 = unlimited (set via --max-memory)
+            prng_state: {
+                // Seed from system time + address of a local for entropy.
+                let ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0x9E3779B97F4A7C15);
+                let a = ns.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let b = ns.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+                // Ensure non-zero state (xorshift128+ requires non-zero).
+                [a | 1, b | 1]
+            },
         };
         // Pre-allocate string constants
         interp.init_strings();
@@ -654,6 +676,26 @@ impl Interpreter {
     /// 0 = unlimited. Prevents OOM kills by panicking with a clear message.
     pub fn set_max_memory(&mut self, bytes: u64) {
         self.max_memory = bytes;
+    }
+
+    /// Generate a uniform double in [0, 1) using xorshift128+.
+    /// Replaces the deterministic sin/cos-based pseudo-noise.
+    fn prng_next_f64(&mut self) -> f64 {
+        let mut s0 = self.prng_state[0];
+        let mut s1 = self.prng_state[1];
+        let result = s0.wrapping_add(s1);
+        s1 ^= s0;
+        self.prng_state[0] = s0.rotate_left(24).wrapping_add(s1);
+        self.prng_state[1] = s1.rotate_left(37);
+        // Convert to [0, 1) using the top 53 bits.
+        (result >> 11) as f64 * (1.0 / 9007199254740992.0)
+    }
+
+    /// Generate a standard normal sample via Box-Muller using the real PRNG.
+    fn prng_next_gaussian(&mut self) -> f64 {
+        let u1 = 0.0001 + self.prng_next_f64() * 0.9998;
+        let u2 = 0.0001 + self.prng_next_f64() * 0.9998;
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
     }
 
     /// Enable profiling mode — tracks per-function call count and time.
@@ -1375,7 +1417,7 @@ impl Interpreter {
                         // or an opaque value (Vec, Map, etc.) that was stored from a
                         // for-loop iteration variable.
                         if let Some(v) = self.opaque_values.get(&addr) {
-                            if matches!(v, Value::Ptr(_) | Value::Vec(_) | Value::Map(_) | Value::Tensor(_) | Value::Json(_) | Value::Dyn(_, _)) {
+                            if matches!(v, Value::Ptr(_) | Value::Str(_) | Value::Vec(_) | Value::Map(_) | Value::Tensor(_) | Value::Json(_) | Value::Dyn(_, _)) {
                                 return ExecOutcome::Value(v.clone());
                             }
                         }
@@ -4163,11 +4205,8 @@ impl Interpreter {
                 if let (Some(Value::Tensor(t)), Some(Value::Float(sigma))) = (args.get(0), args.get(1)) {
                     let mut noisy = t.borrow().clone();
                     for val in &mut noisy.data {
-                        // Box-Muller transform for Gaussian noise
-                        let u1 = 0.0001 + ((*val * 1000.0).fract().abs()) * 0.9998;
-                        let u2 = 0.0001 + ((val.sin() * 1000.0).fract().abs()) * 0.9998;
-                        let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                        *val += sigma * z;
+                        // Real PRNG-based Gaussian noise (xorshift128+ + Box-Muller).
+                        *val += sigma * self.prng_next_gaussian();
                     }
                     ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(noisy))))
                 } else {
@@ -4181,13 +4220,7 @@ impl Interpreter {
                 if let Some(shape) = shape {
                     let shape_usize: Vec<usize> = shape.iter().map(|&x| x as usize).collect();
                     let size: usize = shape_usize.iter().product();
-                    let data: Vec<f64> = (0..size).map(|i| {
-                        let seed = (i as f64) * 0.1;
-                        let u1 = 0.0001 + (seed.sin().abs()) * 0.9998;
-                        let u2 = 0.0001 + (seed.cos().abs()) * 0.9998;
-                        let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                        sigma * z
-                    }).collect();
+                    let data: Vec<f64> = (0..size).map(|_| sigma * self.prng_next_gaussian()).collect();
                     ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(
                         crate::tensor::Tensor::from_vec(shape_usize, data)
                     ))))
@@ -4201,9 +4234,8 @@ impl Interpreter {
                 if let (Some(Value::Tensor(t)), Some(Value::Float(p))) = (args.get(0), args.get(1)) {
                     let mut result = t.borrow().clone();
                     let scale = 1.0 / (1.0 - *p);
-                    for (i, val) in result.data.iter_mut().enumerate() {
-                        let seed = ((i as f64) * 7.0).sin().abs();
-                        if seed < *p {
+                    for val in result.data.iter_mut() {
+                        if self.prng_next_f64() < *p {
                             *val = 0.0;
                         } else {
                             *val *= scale;
@@ -5883,6 +5915,55 @@ impl Interpreter {
             "pledge_audio_load" => ExecOutcome::Value(Value::Int(0)),
             "pledge_audio_play" => ExecOutcome::Value(Value::Int(0)),
             "pledge_audio_is_playing" => ExecOutcome::Value(Value::Int(0)),
+
+            // ─── String builder (p_sb_*) ───
+            // String builders use a side-table keyed by an incrementing handle.
+            // This avoids issues with struct field storage of Str values.
+            "p_sb_new" => {
+                let handle = self.sb_next_handle;
+                self.sb_next_handle += 1;
+                self.sb_table.insert(handle, String::new());
+                ExecOutcome::Value(Value::Int(handle))
+            }
+            "p_sb_append" => {
+                if args.len() >= 2 {
+                    if let Value::Int(handle) = &args[0] {
+                        let s = self.value_to_string(&args[1]);
+                        if let Some(sb) = self.sb_table.get_mut(handle) {
+                            sb.push_str(&s);
+                        }
+                    }
+                }
+                ExecOutcome::Continue
+            }
+            "p_sb_to_str" => {
+                if args.len() >= 1 {
+                    if let Value::Int(handle) = &args[0] {
+                        if let Some(sb) = self.sb_table.get(handle) {
+                            return ExecOutcome::Value(Value::Str(sb.clone().into()));
+                        }
+                    }
+                }
+                ExecOutcome::Value(Value::Str(CompactString::new("")))
+            }
+            "p_sb_free" => {
+                if args.len() >= 1 {
+                    if let Value::Int(handle) = &args[0] {
+                        self.sb_table.remove(handle);
+                    }
+                }
+                ExecOutcome::Continue
+            }
+            "p_sb_len" => {
+                if args.len() >= 1 {
+                    if let Value::Int(handle) = &args[0] {
+                        if let Some(sb) = self.sb_table.get(handle) {
+                            return ExecOutcome::Value(Value::Int(sb.len() as i64));
+                        }
+                    }
+                }
+                ExecOutcome::Value(Value::Int(0))
+            }
 
             _ => ExecOutcome::Panic(format!("Unknown runtime function: {}", name)),
         }

@@ -1,0 +1,825 @@
+// runtime_riscv.fd -- Native Linux RISC-V (RV64) runtime stubs
+// Ported from src/runtime_riscv.rs (~868 LOC).
+//
+// Native runtime stubs for Linux RISC-V (RV64) executables. Provides
+// implementations of all p_print_*, p_panic, p_alloc, p_malloc, p_free,
+// p_str_concat, p_to_str, and Vec builtins using raw Linux syscalls.
+//
+// Uses the RISC-V assembler (riscv_enc) to assemble assembly text.
+//
+// All functions use the RISC-V LP64 ABI:
+//   - Args: a0-a7 (x10-x17)
+//   - Return: a0 (x10)
+//   - Syscalls: a7=syscall#, a0-a5 → a0
+//   - Callee-saved: s0-s11, ra, sp
+
+module compiler::runtime_riscv;
+
+use core;
+use vec;
+use string;
+use compiler::riscv_enc;
+use compiler::runtime_linux;
+
+// Shared runtime types (RuntimeSymbol, RuntimeRodataSym, RuntimeReloc, RuntimeParts)
+// are imported from compiler::runtime_linux to avoid type collisions.
+
+var g_runtime_relocations_riscv: Vec<RuntimeReloc> = Vec::new();
+
+// --- Public API ----------------------------------------------------------
+
+pub fn runtime_parts_riscv() -> RuntimeParts {
+    return runtime_parts_impl_riscv(false, 0);
+}
+
+pub fn runtime_parts_with_caps_riscv(granted_caps: i64) -> RuntimeParts {
+    return runtime_parts_impl_riscv(true, granted_caps);
+}
+
+pub fn runtime_relocations_riscv() -> Vec<RuntimeReloc> {
+    return g_runtime_relocations_riscv;
+}
+
+// --- Helpers -------------------------------------------------------------
+
+/// Determine which capability a stub name requires.
+/// Returns "Net", "FS", "Spawn", or "" (no cap required).
+fn stub_capability_riscv(name: str) -> str {
+    if str_starts_with(name, "p_socket_") || str_starts_with(name, "p_http_") { return "Net"; }
+    if str_starts_with(name, "p_file_") || str_starts_with(name, "p_read_file") || str_starts_with(name, "p_write_file") { return "FS"; }
+    if str_starts_with(name, "p_thread_") || str_equal(name, "p_spawn") { return "Spawn"; }
+    return "";
+}
+
+/// Check if a capability is granted.
+/// Simplified: caps_set is a bitfield (0 = no caps, nonzero = all caps).
+fn cap_granted_riscv(caps_set: i64, cap: str) -> bool {
+    if caps_set == 0 { return false; }
+    return true;
+}
+
+/// Push a null-terminated string into the rodata byte vector.
+fn push_str_bytes_riscv(rodata: &mut Vec<i64>, s: str) {
+    var i: i64 = 0;
+    while i < str_len(s) {
+        rodata.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+    rodata.push(0);
+}
+
+// --- Implementation -------------------------------------------------------
+
+fn runtime_parts_impl_riscv(has_caps: bool, caps_set: i64) -> RuntimeParts {
+    var rodata: Vec<i64> = Vec::new();
+    var rodata_syms: Vec<RuntimeRodataSym> = Vec::new();
+
+    // Build rodata: true, false, newline, minus, brackets, comma-space, zero, panic prefix/nl
+    var true_str_off: i64 = rodata.len();
+    push_str_bytes_riscv(rodata, "true");
+    var false_str_off: i64 = rodata.len();
+    push_str_bytes_riscv(rodata, "false");
+    var nl_str_off: i64 = rodata.len();
+    push_str_bytes_riscv(rodata, "\n");
+    var minus_str_off: i64 = rodata.len();
+    push_str_bytes_riscv(rodata, "-");
+    var bracket_open_off: i64 = rodata.len();
+    push_str_bytes_riscv(rodata, "[");
+    var bracket_close_off: i64 = rodata.len();
+    push_str_bytes_riscv(rodata, "]");
+    var comma_sp_off: i64 = rodata.len();
+    push_str_bytes_riscv(rodata, ", ");
+    var zero_char_off: i64 = rodata.len();
+    push_str_bytes_riscv(rodata, "0");
+    var panic_prefix_off: i64 = rodata.len();
+    push_str_bytes_riscv(rodata, "Panic: ");
+    var panic_nl_off: i64 = rodata.len();
+    push_str_bytes_riscv(rodata, "\n");
+
+    rodata_syms.push(RuntimeRodataSym_new(".Lpbool_true_str", true_str_off));
+    rodata_syms.push(RuntimeRodataSym_new(".Lpbool_false_str", false_str_off));
+    rodata_syms.push(RuntimeRodataSym_new(".Lpnl_str", nl_str_off));
+    rodata_syms.push(RuntimeRodataSym_new(".Lpf_minus", minus_str_off));
+    rodata_syms.push(RuntimeRodataSym_new(".Lbracket_open", bracket_open_off));
+    rodata_syms.push(RuntimeRodataSym_new(".Lbracket_close", bracket_close_off));
+    rodata_syms.push(RuntimeRodataSym_new(".Lcomma_sp", comma_sp_off));
+    rodata_syms.push(RuntimeRodataSym_new(".Lpf_zero_char", zero_char_off));
+    rodata_syms.push(RuntimeRodataSym_new(".Lpanic_prefix", panic_prefix_off));
+    rodata_syms.push(RuntimeRodataSym_new(".Lpanic_nl", panic_nl_off));
+
+    // Build the assembly text for the runtime
+    var asm: str = build_runtime_asm_riscv(has_caps, caps_set);
+
+    // Assemble it
+    var text: Vec<i64> = Vec::new();
+    var symbols: Vec<RuntimeSymbol> = Vec::new();
+    match assemble_riscv(asm) {
+        ResultRiscVAssemble::Ok(result) => {
+            // Convert symbols to RuntimeSymbol format (size = 0)
+            var si: i64 = 0;
+            while si < result.symbols.len() {
+                var sym: RiscVSymbol = result.symbols.get(si);
+                symbols.push(RuntimeSymbol_new(sym.name, sym.offset, 0));
+                si = si + 1;
+            }
+            text = result.text;
+            // Store relocations for later retrieval
+            g_runtime_relocations_riscv = Vec::new();
+            var ri: i64 = 0;
+            while ri < result.relocations.len() {
+                var rel: RiscVReloc = result.relocations.get(ri);
+                g_runtime_relocations_riscv.push(RuntimeReloc_new(rel.offset, rel.symbol, rel.rtype));
+                ri = ri + 1;
+            }
+        }
+        ResultRiscVAssemble::Err(e) => {
+            // On assembly error, return empty parts (defensive)
+            return RuntimeParts_new(Vec::new(), Vec::new(), rodata, rodata_syms);
+        }
+    }
+
+    return RuntimeParts_new(text, symbols, rodata, rodata_syms);
+}
+
+// --- Assembly text builder -----------------------------------------------
+
+fn build_runtime_asm_riscv(has_caps: bool, caps_set: i64) -> str {
+    var asm: str = "";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // _start — program entry point
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .section .text\n";
+    asm = asm + "    .globl _start\n";
+    asm = asm + "_start:\n";
+    asm = asm + "    sd ra, 8(sp)\n";
+    asm = asm + "    sd s0, 0(sp)\n";
+    asm = asm + "    addi sp, sp, -16\n";
+    asm = asm + "    call main\n";
+    asm = asm + "    mv a0, a0\n";
+    asm = asm + "    li a7, 93\n";
+    asm = asm + "    ecall\n";
+    asm = asm + "    ebreak\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // p_print_str(a0 = ptr to null-terminated string)
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_print_str\n";
+    asm = asm + "p_print_str:\n";
+    asm = asm + "    sd ra, 8(sp)\n";
+    asm = asm + "    sd s0, 0(sp)\n";
+    asm = asm + "    addi sp, sp, -16\n";
+    asm = asm + "    mv s0, a0\n";
+    asm = asm + "    mv a1, a0\n";
+    asm = asm + "    li a2, 0\n";
+    asm = asm + ".Lpstr_loop:\n";
+    asm = asm + "    lb a3, 0(a1)\n";
+    asm = asm + "    beqz a3, .Lpstr_done\n";
+    asm = asm + "    addi a1, a1, 1\n";
+    asm = asm + "    addi a2, a2, 1\n";
+    asm = asm + "    j .Lpstr_loop\n";
+    asm = asm + ".Lpstr_done:\n";
+    asm = asm + "    li a0, 1\n";
+    asm = asm + "    mv a1, s0\n";
+    asm = asm + "    li a7, 64\n";
+    asm = asm + "    ecall\n";
+    asm = asm + "    addi sp, sp, 16\n";
+    asm = asm + "    ld ra, 8(sp)\n";
+    asm = asm + "    ld s0, 0(sp)\n";
+    asm = asm + "    ret\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // p_print_int(a0 = i64 value)
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_print_int\n";
+    asm = asm + "p_print_int:\n";
+    asm = asm + "    sd ra, 8(sp)\n";
+    asm = asm + "    sd s0, 0(sp)\n";
+    asm = asm + "    sd s1, 16(sp)\n";
+    asm = asm + "    sd s2, 24(sp)\n";
+    asm = asm + "    addi sp, sp, -48\n";
+    asm = asm + "    mv s0, a0\n";
+    asm = asm + "    li s1, 0\n";
+    asm = asm + "    bgez s0, .Lpint_pos\n";
+    asm = asm + "    li s1, 1\n";
+    asm = asm + "    neg s0, s0\n";
+    asm = asm + ".Lpint_pos:\n";
+    asm = asm + "    addi s2, sp, 47\n";
+    asm = asm + "    li t0, 0\n";
+    asm = asm + "    bnez s0, .Lpint_loop\n";
+    asm = asm + "    li t1, 48\n";
+    asm = asm + "    sb t1, 0(s2)\n";
+    asm = asm + "    addi s2, s2, -1\n";
+    asm = asm + "    addi t0, t0, 1\n";
+    asm = asm + "    j .Lpint_print\n";
+    asm = asm + ".Lpint_loop:\n";
+    asm = asm + "    beqz s0, .Lpint_print\n";
+    asm = asm + "    li t1, 10\n";
+    asm = asm + "    rem t2, s0, t1\n";
+    asm = asm + "    div s0, s0, t1\n";
+    asm = asm + "    addi t2, t2, 48\n";
+    asm = asm + "    sb t2, 0(s2)\n";
+    asm = asm + "    addi s2, s2, -1\n";
+    asm = asm + "    addi t0, t0, 1\n";
+    asm = asm + "    j .Lpint_loop\n";
+    asm = asm + ".Lpint_print:\n";
+    asm = asm + "    beqz s1, .Lpint_write\n";
+    asm = asm + "    li t1, 45\n";
+    asm = asm + "    sb t1, 0(s2)\n";
+    asm = asm + "    addi s2, s2, -1\n";
+    asm = asm + "    addi t0, t0, 1\n";
+    asm = asm + ".Lpint_write:\n";
+    asm = asm + "    addi s2, s2, 1\n";
+    asm = asm + "    li a0, 1\n";
+    asm = asm + "    mv a1, s2\n";
+    asm = asm + "    mv a2, t0\n";
+    asm = asm + "    li a7, 64\n";
+    asm = asm + "    ecall\n";
+    asm = asm + "    addi sp, sp, 48\n";
+    asm = asm + "    ld ra, 8(sp)\n";
+    asm = asm + "    ld s0, 0(sp)\n";
+    asm = asm + "    ld s1, 16(sp)\n";
+    asm = asm + "    ld s2, 24(sp)\n";
+    asm = asm + "    ret\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // p_print_bool (simplified — no PC-relative rodata access)
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_print_bool\n";
+    asm = asm + "p_print_bool:\n";
+    asm = asm + "    sd ra, 8(sp)\n";
+    asm = asm + "    sd s0, 0(sp)\n";
+    asm = asm + "    addi sp, sp, -16\n";
+    asm = asm + "    bnez a0, .Lpbool_true\n";
+    asm = asm + "    li a0, 0\n";
+    asm = asm + "    j .Lpbool_done\n";
+    asm = asm + ".Lpbool_true:\n";
+    asm = asm + "    li a0, 1\n";
+    asm = asm + ".Lpbool_done:\n";
+    asm = asm + "    addi sp, sp, 16\n";
+    asm = asm + "    ld ra, 8(sp)\n";
+    asm = asm + "    ld s0, 0(sp)\n";
+    asm = asm + "    ret\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // p_print_newline (inline newline via sys_write)
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_print_newline\n";
+    asm = asm + "p_print_newline:\n";
+    asm = asm + "    sd ra, 8(sp)\n";
+    asm = asm + "    sd s0, 0(sp)\n";
+    asm = asm + "    addi sp, sp, -16\n";
+    asm = asm + "    li t0, 10\n";
+    asm = asm + "    addi sp, sp, -16\n";
+    asm = asm + "    sb t0, 0(sp)\n";
+    asm = asm + "    li a0, 1\n";
+    asm = asm + "    mv a1, sp\n";
+    asm = asm + "    li a2, 1\n";
+    asm = asm + "    li a7, 64\n";
+    asm = asm + "    ecall\n";
+    asm = asm + "    addi sp, sp, 16\n";
+    asm = asm + "    addi sp, sp, 16\n";
+    asm = asm + "    ld ra, 8(sp)\n";
+    asm = asm + "    ld s0, 0(sp)\n";
+    asm = asm + "    ret\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // p_panic(a0 = ptr to message)
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_panic\n";
+    asm = asm + "p_panic:\n";
+    asm = asm + "    sd ra, 8(sp)\n";
+    asm = asm + "    sd s0, 0(sp)\n";
+    asm = asm + "    addi sp, sp, -16\n";
+    asm = asm + "    mv s0, a0\n";
+    // Print "Panic: " inline (7 bytes)
+    asm = asm + "    li t0, 80\n";
+    asm = asm + "    sb t0, 0(sp)\n";
+    asm = asm + "    li t0, 97\n";
+    asm = asm + "    sb t0, 1(sp)\n";
+    asm = asm + "    li t0, 110\n";
+    asm = asm + "    sb t0, 2(sp)\n";
+    asm = asm + "    li t0, 105\n";
+    asm = asm + "    sb t0, 3(sp)\n";
+    asm = asm + "    li t0, 99\n";
+    asm = asm + "    sb t0, 4(sp)\n";
+    asm = asm + "    li t0, 58\n";
+    asm = asm + "    sb t0, 5(sp)\n";
+    asm = asm + "    li t0, 32\n";
+    asm = asm + "    sb t0, 6(sp)\n";
+    asm = asm + "    li a0, 1\n";
+    asm = asm + "    mv a1, sp\n";
+    asm = asm + "    li a2, 7\n";
+    asm = asm + "    li a7, 64\n";
+    asm = asm + "    ecall\n";
+    asm = asm + "    mv a0, s0\n";
+    asm = asm + "    call p_print_str\n";
+    asm = asm + "    li t0, 10\n";
+    asm = asm + "    sb t0, 0(sp)\n";
+    asm = asm + "    li a0, 1\n";
+    asm = asm + "    mv a1, sp\n";
+    asm = asm + "    li a2, 1\n";
+    asm = asm + "    li a7, 64\n";
+    asm = asm + "    ecall\n";
+    asm = asm + "    li a0, 1\n";
+    asm = asm + "    li a7, 93\n";
+    asm = asm + "    ecall\n";
+    asm = asm + "    ebreak\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // p_malloc(a0 = size) → a0 = ptr (sys_mmap = 222)
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_malloc\n";
+    asm = asm + "p_malloc:\n";
+    asm = asm + "    sd ra, 8(sp)\n";
+    asm = asm + "    sd s0, 0(sp)\n";
+    asm = asm + "    addi sp, sp, -16\n";
+    asm = asm + "    addi a0, a0, 4095\n";
+    asm = asm + "    li t0, -4096\n";
+    asm = asm + "    and a0, a0, t0\n";
+    asm = asm + "    mv a1, a0\n";
+    asm = asm + "    li a0, 0\n";
+    asm = asm + "    li a2, 3\n";
+    asm = asm + "    li a3, 34\n";
+    asm = asm + "    li a4, -1\n";
+    asm = asm + "    li a5, 0\n";
+    asm = asm + "    li a7, 222\n";
+    asm = asm + "    ecall\n";
+    asm = asm + "    addi sp, sp, 16\n";
+    asm = asm + "    ld ra, 8(sp)\n";
+    asm = asm + "    ld s0, 0(sp)\n";
+    asm = asm + "    ret\n";
+
+    // p_alloc = p_malloc
+    asm = asm + "    .globl p_alloc\n";
+    asm = asm + "p_alloc:\n";
+    asm = asm + "    j p_malloc\n";
+
+    // p_free = no-op
+    asm = asm + "    .globl p_free\n";
+    asm = asm + "p_free:\n";
+    asm = asm + "    ret\n";
+
+    // p_exit
+    asm = asm + "    .globl p_exit\n";
+    asm = asm + "p_exit:\n";
+    asm = asm + "    li a7, 93\n";
+    asm = asm + "    ecall\n";
+    asm = asm + "    ebreak\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // p_to_str(a0 = i64) → a0 = str ptr
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_to_str\n";
+    asm = asm + "p_to_str:\n";
+    asm = asm + "    sd ra, 8(sp)\n";
+    asm = asm + "    sd s0, 0(sp)\n";
+    asm = asm + "    sd s1, 16(sp)\n";
+    asm = asm + "    sd s2, 24(sp)\n";
+    asm = asm + "    addi sp, sp, -64\n";
+    asm = asm + "    mv s0, a0\n";
+    asm = asm + "    li s1, 0\n";
+    asm = asm + "    bgez s0, .Lpts_pos\n";
+    asm = asm + "    li s1, 1\n";
+    asm = asm + "    neg s0, s0\n";
+    asm = asm + ".Lpts_pos:\n";
+    asm = asm + "    addi s2, sp, 63\n";
+    asm = asm + "    li t0, 0\n";
+    asm = asm + "    bnez s0, .Lpts_loop\n";
+    asm = asm + "    li t1, 48\n";
+    asm = asm + "    sb t1, 0(s2)\n";
+    asm = asm + "    addi s2, s2, -1\n";
+    asm = asm + "    addi t0, t0, 1\n";
+    asm = asm + "    j .Lpts_alloc\n";
+    asm = asm + ".Lpts_loop:\n";
+    asm = asm + "    beqz s0, .Lpts_alloc\n";
+    asm = asm + "    li t1, 10\n";
+    asm = asm + "    rem t2, s0, t1\n";
+    asm = asm + "    div s0, s0, t1\n";
+    asm = asm + "    addi t2, t2, 48\n";
+    asm = asm + "    sb t2, 0(s2)\n";
+    asm = asm + "    addi s2, s2, -1\n";
+    asm = asm + "    addi t0, t0, 1\n";
+    asm = asm + "    j .Lpts_loop\n";
+    asm = asm + ".Lpts_alloc:\n";
+    asm = asm + "    beqz s1, .Lpts_copy\n";
+    asm = asm + "    li t1, 45\n";
+    asm = asm + "    sb t1, 0(s2)\n";
+    asm = asm + "    addi s2, s2, -1\n";
+    asm = asm + "    addi t0, t0, 1\n";
+    asm = asm + ".Lpts_copy:\n";
+    asm = asm + "    addi s2, s2, 1\n";
+    asm = asm + "    li a0, 32\n";
+    asm = asm + "    call p_malloc\n";
+    asm = asm + "    mv t3, a0\n";
+    asm = asm + "    li t4, 0\n";
+    asm = asm + ".Lpts_copy_loop:\n";
+    asm = asm + "    bge t4, t0, .Lpts_copy_done\n";
+    asm = asm + "    add t5, s2, t4\n";
+    asm = asm + "    lb t6, 0(t5)\n";
+    asm = asm + "    add a1, t3, t4\n";
+    asm = asm + "    sb t6, 0(a1)\n";
+    asm = asm + "    addi t4, t4, 1\n";
+    asm = asm + "    j .Lpts_copy_loop\n";
+    asm = asm + ".Lpts_copy_done:\n";
+    asm = asm + "    add a1, t3, t0\n";
+    asm = asm + "    sb zero, 0(a1)\n";
+    asm = asm + "    mv a0, t3\n";
+    asm = asm + "    addi sp, sp, 64\n";
+    asm = asm + "    ld ra, 8(sp)\n";
+    asm = asm + "    ld s0, 0(sp)\n";
+    asm = asm + "    ld s1, 16(sp)\n";
+    asm = asm + "    ld s2, 24(sp)\n";
+    asm = asm + "    ret\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // p_str_concat(a0 = str1, a1 = str2) → a0 = new string
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_str_concat\n";
+    asm = asm + "p_str_concat:\n";
+    asm = asm + "    sd ra, 8(sp)\n";
+    asm = asm + "    sd s0, 0(sp)\n";
+    asm = asm + "    sd s1, 16(sp)\n";
+    asm = asm + "    sd s2, 24(sp)\n";
+    asm = asm + "    sd s3, 32(sp)\n";
+    asm = asm + "    addi sp, sp, -48\n";
+    asm = asm + "    mv s0, a0\n";
+    asm = asm + "    mv s1, a1\n";
+    // strlen(str1) → s2
+    asm = asm + "    li s2, 0\n";
+    asm = asm + "    mv t0, s0\n";
+    asm = asm + ".Lpsc_len1:\n";
+    asm = asm + "    lb t1, 0(t0)\n";
+    asm = asm + "    beqz t1, .Lpsc_len1d\n";
+    asm = asm + "    addi t0, t0, 1\n";
+    asm = asm + "    addi s2, s2, 1\n";
+    asm = asm + "    j .Lpsc_len1\n";
+    asm = asm + ".Lpsc_len1d:\n";
+    // strlen(str2) → s3
+    asm = asm + "    li s3, 0\n";
+    asm = asm + "    mv t0, s1\n";
+    asm = asm + ".Lpsc_len2:\n";
+    asm = asm + "    lb t1, 0(t0)\n";
+    asm = asm + "    beqz t1, .Lpsc_len2d\n";
+    asm = asm + "    addi t0, t0, 1\n";
+    asm = asm + "    addi s3, s3, 1\n";
+    asm = asm + "    j .Lpsc_len2\n";
+    asm = asm + ".Lpsc_len2d:\n";
+    // total = s2 + s3 + 1
+    asm = asm + "    add a0, s2, s3\n";
+    asm = asm + "    addi a0, a0, 1\n";
+    asm = asm + "    call p_malloc\n";
+    asm = asm + "    mv t3, a0\n";
+    // Copy str1
+    asm = asm + "    li t4, 0\n";
+    asm = asm + ".Lpsc_c1:\n";
+    asm = asm + "    bge t4, s2, .Lpsc_c1d\n";
+    asm = asm + "    add t5, s0, t4\n";
+    asm = asm + "    lb t6, 0(t5)\n";
+    asm = asm + "    add a1, t3, t4\n";
+    asm = asm + "    sb t6, 0(a1)\n";
+    asm = asm + "    addi t4, t4, 1\n";
+    asm = asm + "    j .Lpsc_c1\n";
+    asm = asm + ".Lpsc_c1d:\n";
+    // Copy str2
+    asm = asm + "    li t4, 0\n";
+    asm = asm + ".Lpsc_c2:\n";
+    asm = asm + "    bge t4, s3, .Lpsc_c2d\n";
+    asm = asm + "    add t5, s1, t4\n";
+    asm = asm + "    lb t6, 0(t5)\n";
+    asm = asm + "    add a1, t3, s2\n";
+    asm = asm + "    add a1, a1, t4\n";
+    asm = asm + "    sb t6, 0(a1)\n";
+    asm = asm + "    addi t4, t4, 1\n";
+    asm = asm + "    j .Lpsc_c2\n";
+    asm = asm + ".Lpsc_c2d:\n";
+    asm = asm + "    add a1, t3, s2\n";
+    asm = asm + "    add a1, a1, s3\n";
+    asm = asm + "    sb zero, 0(a1)\n";
+    asm = asm + "    mv a0, t3\n";
+    asm = asm + "    addi sp, sp, 48\n";
+    asm = asm + "    ld ra, 8(sp)\n";
+    asm = asm + "    ld s0, 0(sp)\n";
+    asm = asm + "    ld s1, 16(sp)\n";
+    asm = asm + "    ld s2, 24(sp)\n";
+    asm = asm + "    ld s3, 32(sp)\n";
+    asm = asm + "    ret\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Vec operations (Vec layout: [data_ptr(8), len(8), cap(8)])
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_vec_new\n";
+    asm = asm + "p_vec_new:\n";
+    asm = asm + "    sd ra, 8(sp)\n";
+    asm = asm + "    sd s0, 0(sp)\n";
+    asm = asm + "    addi sp, sp, -16\n";
+    asm = asm + "    li a0, 4096\n";
+    asm = asm + "    call p_malloc\n";
+    asm = asm + "    addi t0, a0, 24\n";
+    asm = asm + "    sd t0, 0(a0)\n";
+    asm = asm + "    sd zero, 8(a0)\n";
+    asm = asm + "    li t0, 509\n";
+    asm = asm + "    sd t0, 16(a0)\n";
+    asm = asm + "    addi sp, sp, 16\n";
+    asm = asm + "    ld ra, 8(sp)\n";
+    asm = asm + "    ld s0, 0(sp)\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_vec_push\n";
+    asm = asm + "p_vec_push:\n";
+    asm = asm + "    ld t0, 8(a0)\n";
+    asm = asm + "    ld t1, 0(a0)\n";
+    asm = asm + "    slli t2, t0, 3\n";
+    asm = asm + "    add t2, t1, t2\n";
+    asm = asm + "    sd a1, 0(t2)\n";
+    asm = asm + "    addi t0, t0, 1\n";
+    asm = asm + "    sd t0, 8(a0)\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_vec_len\n";
+    asm = asm + "p_vec_len:\n";
+    asm = asm + "    ld a0, 8(a0)\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_vec_get\n";
+    asm = asm + "p_vec_get:\n";
+    asm = asm + "    ld t0, 0(a0)\n";
+    asm = asm + "    slli t1, a1, 3\n";
+    asm = asm + "    add t1, t0, t1\n";
+    asm = asm + "    ld a0, 0(t1)\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_vec_set\n";
+    asm = asm + "p_vec_set:\n";
+    asm = asm + "    ld t0, 0(a0)\n";
+    asm = asm + "    slli t1, a1, 3\n";
+    asm = asm + "    add t1, t0, t1\n";
+    asm = asm + "    sd a2, 0(t1)\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_vec_first\n";
+    asm = asm + "p_vec_first:\n";
+    asm = asm + "    ld t0, 0(a0)\n";
+    asm = asm + "    ld a0, 0(t0)\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_vec_last\n";
+    asm = asm + "p_vec_last:\n";
+    asm = asm + "    ld t0, 0(a0)\n";
+    asm = asm + "    ld t1, 8(a0)\n";
+    asm = asm + "    addi t1, t1, -1\n";
+    asm = asm + "    slli t1, t1, 3\n";
+    asm = asm + "    add t1, t0, t1\n";
+    asm = asm + "    ld a0, 0(t1)\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_vec_pop\n";
+    asm = asm + "p_vec_pop:\n";
+    asm = asm + "    ld t0, 8(a0)\n";
+    asm = asm + "    beqz t0, .Lpvp_empty\n";
+    asm = asm + "    addi t0, t0, -1\n";
+    asm = asm + "    sd t0, 8(a0)\n";
+    asm = asm + "    ld t1, 0(a0)\n";
+    asm = asm + "    slli t2, t0, 3\n";
+    asm = asm + "    add t2, t1, t2\n";
+    asm = asm + "    ld a0, 0(t2)\n";
+    asm = asm + "    ret\n";
+    asm = asm + ".Lpvp_empty:\n";
+    asm = asm + "    li a0, 0\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_vec_is_empty\n";
+    asm = asm + "p_vec_is_empty:\n";
+    asm = asm + "    ld a0, 8(a0)\n";
+    asm = asm + "    seqz a0, a0\n";
+    asm = asm + "    ret\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // p_print_vec — simplified (just brackets)
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_print_vec\n";
+    asm = asm + "p_print_vec:\n";
+    asm = asm + "    sd ra, 8(sp)\n";
+    asm = asm + "    sd s0, 0(sp)\n";
+    asm = asm + "    addi sp, sp, -16\n";
+    asm = asm + "    li t0, 91\n";
+    asm = asm + "    sb t0, 0(sp)\n";
+    asm = asm + "    li a0, 1\n";
+    asm = asm + "    mv a1, sp\n";
+    asm = asm + "    li a2, 1\n";
+    asm = asm + "    li a7, 64\n";
+    asm = asm + "    ecall\n";
+    asm = asm + "    li t0, 93\n";
+    asm = asm + "    sb t0, 0(sp)\n";
+    asm = asm + "    li a0, 1\n";
+    asm = asm + "    mv a1, sp\n";
+    asm = asm + "    li a2, 1\n";
+    asm = asm + "    li a7, 64\n";
+    asm = asm + "    ecall\n";
+    asm = asm + "    addi sp, sp, 16\n";
+    asm = asm + "    ld ra, 8(sp)\n";
+    asm = asm + "    ld s0, 0(sp)\n";
+    asm = asm + "    ret\n";
+
+    // Stubs
+    asm = asm + "    .globl p_region_free\n";
+    asm = asm + "p_region_free:\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl pledge_strlen\n";
+    asm = asm + "pledge_strlen:\n";
+    asm = asm + "    li a1, 0\n";
+    asm = asm + "    mv a0, a0\n";
+    asm = asm + ".Lstrlen_loop:\n";
+    asm = asm + "    lb t0, 0(a0)\n";
+    asm = asm + "    beqz t0, .Lstrlen_done\n";
+    asm = asm + "    addi a0, a0, 1\n";
+    asm = asm + "    addi a1, a1, 1\n";
+    asm = asm + "    j .Lstrlen_loop\n";
+    asm = asm + ".Lstrlen_done:\n";
+    asm = asm + "    mv a0, a1\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl pledge_strcmp\n";
+    asm = asm + "pledge_strcmp:\n";
+    asm = asm + ".Lstrcmp_loop:\n";
+    asm = asm + "    lb t0, 0(a0)\n";
+    asm = asm + "    lb t1, 0(a1)\n";
+    asm = asm + "    beqz t0, .Lstrcmp_end\n";
+    asm = asm + "    beq t0, t1, .Lstrcmp_next\n";
+    asm = asm + "    sub a0, t0, t1\n";
+    asm = asm + "    ret\n";
+    asm = asm + ".Lstrcmp_next:\n";
+    asm = asm + "    addi a0, a0, 1\n";
+    asm = asm + "    addi a1, a1, 1\n";
+    asm = asm + "    j .Lstrcmp_loop\n";
+    asm = asm + ".Lstrcmp_end:\n";
+    asm = asm + "    sub a0, t0, t1\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_getenv\n";
+    asm = asm + "p_getenv:\n";
+    asm = asm + "    li a0, 0\n";
+    asm = asm + "    ret\n";
+    asm = asm + "    .globl p_argc\n";
+    asm = asm + "p_argc:\n";
+    asm = asm + "    li a0, 1\n";
+    asm = asm + "    ret\n";
+    asm = asm + "    .globl p_argv\n";
+    asm = asm + "p_argv:\n";
+    asm = asm + "    li a0, 0\n";
+    asm = asm + "    ret\n";
+    asm = asm + "    .globl p_system\n";
+    asm = asm + "p_system:\n";
+    asm = asm + "    li a0, 0\n";
+    asm = asm + "    ret\n";
+    asm = asm + "    .globl p_regex_match\n";
+    asm = asm + "p_regex_match:\n";
+    asm = asm + "    li a0, 0\n";
+    asm = asm + "    ret\n";
+
+    // Math stubs (return 0)
+    asm = asm + append_zero_stub_riscv("pledge_sqrt");
+    asm = asm + append_zero_stub_riscv("pledge_floor");
+    asm = asm + append_zero_stub_riscv("pledge_ceil");
+    asm = asm + append_zero_stub_riscv("pledge_pow");
+    asm = asm + append_zero_stub_riscv("pledge_sin");
+    asm = asm + append_zero_stub_riscv("pledge_cos");
+    asm = asm + append_zero_stub_riscv("pledge_fabs");
+
+    // Float/bool/vec to string stubs
+    asm = asm + "    .globl p_float_to_str\n";
+    asm = asm + "p_float_to_str:\n";
+    asm = asm + "    sd ra, 8(sp)\n";
+    asm = asm + "    sd s0, 0(sp)\n";
+    asm = asm + "    addi sp, sp, -16\n";
+    asm = asm + "    li a0, 2\n";
+    asm = asm + "    call p_malloc\n";
+    asm = asm + "    li t0, 48\n";
+    asm = asm + "    sb t0, 0(a0)\n";
+    asm = asm + "    sb zero, 1(a0)\n";
+    asm = asm + "    addi sp, sp, 16\n";
+    asm = asm + "    ld ra, 8(sp)\n";
+    asm = asm + "    ld s0, 0(sp)\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_bool_to_str\n";
+    asm = asm + "p_bool_to_str:\n";
+    asm = asm + "    li a0, 0\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_vec_to_str\n";
+    asm = asm + "p_vec_to_str:\n";
+    asm = asm + "    j p_print_vec\n";
+
+    asm = asm + "    .globl p_print_float\n";
+    asm = asm + "p_print_float:\n";
+    asm = asm + "    ret\n";
+
+    // Allocator stubs
+    asm = asm + "    .globl p_allocator_create\n";
+    asm = asm + "p_allocator_create:\n";
+    asm = asm + "    li a0, 0\n";
+    asm = asm + "    ret\n";
+    asm = asm + "    .globl p_allocator_alloc\n";
+    asm = asm + "p_allocator_alloc:\n";
+    asm = asm + "    j p_malloc\n";
+    asm = asm + "    .globl p_allocator_free\n";
+    asm = asm + "p_allocator_free:\n";
+    asm = asm + "    ret\n";
+    asm = asm + "    .globl p_allocator_stats\n";
+    asm = asm + "p_allocator_stats:\n";
+    asm = asm + "    li a0, 0\n";
+    asm = asm + "    ret\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Capability-gated stubs (Net, FS, Spawn)
+    // ═══════════════════════════════════════════════════════════════════════
+    // Net stubs
+    asm = asm + append_cap_stub_riscv("p_socket_create", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_socket_connect", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_socket_bind", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_socket_listen", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_socket_accept", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_socket_send", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_socket_recv", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_socket_close", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_http_get", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_http_post", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_http_parse_request", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_http_build_response", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_net_connect", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_net_read", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_net_write", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_net_close", has_caps, caps_set);
+
+    // FS stubs
+    asm = asm + append_cap_stub_riscv("p_file_open", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_file_close", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_file_read", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_file_write", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_read_file", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_write_file", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_fs_read_async", has_caps, caps_set);
+
+    // Spawn stubs
+    asm = asm + append_cap_stub_riscv("p_thread_spawn", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_thread_join", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_thread_mutex_init", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_thread_mutex_lock", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_thread_mutex_unlock", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_spawn", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_executor_new", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_executor_spawn", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_executor_block_on", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_executor_run_all", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_executor_poll_all", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_task_poll", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_task_poll_nonblocking", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_task_is_ready", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_chan_create", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_chan_send", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_chan_recv", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_chan_try_recv", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_chan_close", has_caps, caps_set);
+    asm = asm + append_cap_stub_riscv("p_chan_is_closed", has_caps, caps_set);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Additional stubs that return 0
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + append_zero_stub_riscv("p_simd_dot");
+    asm = asm + append_zero_stub_riscv("p_db_mem_open");
+    asm = asm + append_zero_stub_riscv("p_db_mem_close");
+    asm = asm + append_zero_stub_riscv("p_db_mem_exec");
+    asm = asm + append_zero_stub_riscv("p_db_mem_query");
+    asm = asm + append_zero_stub_riscv("p_json_len");
+    asm = asm + append_zero_stub_riscv("p_json_at");
+    asm = asm + append_zero_stub_riscv("p_dl_open");
+    asm = asm + append_zero_stub_riscv("p_dl_sym");
+    asm = asm + append_zero_stub_riscv("p_dl_close");
+    asm = asm + append_zero_stub_riscv("p_dl_call");
+
+    return asm;
+}
+
+/// Generate a stub that returns 0: `    .globl NAME\nNAME:\n    li a0, 0\n    ret\n`
+fn append_zero_stub_riscv(name: str) -> str {
+    return "    .globl " + name + "\n" + name + ":\n    li a0, 0\n    ret\n";
+}
+
+/// Generate a capability-gated stub. If has_caps is true and the required
+/// capability is not granted, emit a trap (ebreak). Otherwise emit a
+/// zero-returning stub.
+fn append_cap_stub_riscv(name: str, has_caps: bool, caps_set: i64) -> str {
+    var cap: str = stub_capability_riscv(name);
+    var should_trap: bool = false;
+    if has_caps {
+        if str_len(cap) > 0 {
+            should_trap = !cap_granted_riscv(caps_set, cap);
+        }
+    }
+    if should_trap {
+        return "    .globl " + name + "\n" + name + ":\n    ebreak\n    ret\n";
+    }
+    return "    .globl " + name + "\n" + name + ":\n    li a0, 0\n    ret\n";
+}

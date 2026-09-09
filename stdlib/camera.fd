@@ -1,0 +1,303 @@
+// Fides Camera standard library
+//
+// 2D and 3D camera with follow, zoom, screen shake, and coordinate
+// conversion (screen-to-world and world-to-screen).
+//
+// Usage (2D):
+//   use camera;
+//   var cam = camera2d_create(800, 600);
+//   camera2d_follow(&mut cam, player_x, player_y);
+//   camera2d_update(&mut cam, dt);
+//   var world = camera2d_screen_to_world(&cam, mouse_x, mouse_y);
+//
+// Usage (3D):
+//   use camera;
+//   use math;
+//   var cam3 = camera3d_create(vec3(0,5,10), vec3(0,0,0), 60.0, 1.333, 0.1, 100.0);
+//   camera3d_update(&mut cam3);
+//   var view = camera3d_view_matrix(&cam3);
+//   var proj = camera3d_projection(&cam3);
+
+module camera;
+
+use math;
+use vec;
+
+// ─── 2D Camera ───────────────────────────────────────────────────────────
+
+pub struct Camera2D {
+    pub x: f64,              // center of camera in world space
+    pub y: f64,
+    pub zoom: f64,           // scale factor (1.0 = normal)
+    pub rotation: f64,       // rotation in radians
+    pub viewport_w: i64,     // screen width in pixels
+    pub viewport_h: i64,     // screen height in pixels
+    pub target_x: f64,       // follow target
+    pub target_y: f64,
+    pub follow_speed: f64,   // lerp speed (0 = instant, 1 = slow)
+    pub shake_x: f64,         // current shake offset
+    pub shake_y: f64,
+    pub shake_amount: f64,   // remaining shake intensity
+    pub shake_decay: f64,    // shake decay per second
+    pub min_x: f64,          // bounds (0 = no limit)
+    pub min_y: f64,
+    pub max_x: f64,
+    pub max_y: f64,
+    pub has_bounds: bool,
+}
+
+/// Create a 2D camera centered at (x, y).
+pub fn camera2d_create(viewport_w: i64, viewport_h: i64) -> Camera2D {
+    return Camera2D {
+        x: 0.0, y: 0.0,
+        zoom: 1.0, rotation: 0.0,
+        viewport_w: viewport_w, viewport_h: viewport_h,
+        target_x: 0.0, target_y: 0.0,
+        follow_speed: 5.0,
+        shake_x: 0.0, shake_y: 0.0,
+        shake_amount: 0.0, shake_decay: 5.0,
+        min_x: 0.0, min_y: 0.0, max_x: 0.0, max_y: 0.0,
+        has_bounds: false,
+    };
+}
+
+/// Set the camera follow target.
+pub fn camera2d_follow(cam: &mut Camera2D, tx: f64, ty: f64) -> void {
+    cam.target_x = tx;
+    cam.target_y = ty;
+}
+
+/// Set camera bounds (clamps position).
+pub fn camera2d_set_bounds(cam: &mut Camera2D, min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> void {
+    cam.min_x = min_x;
+    cam.min_y = min_y;
+    cam.max_x = max_x;
+    cam.max_y = max_y;
+    cam.has_bounds = true;
+}
+
+/// Set zoom level.
+pub fn camera2d_set_zoom(cam: &mut Camera2D, zoom: f64) -> void {
+    if zoom < 0.1 { cam.zoom = 0.1; }
+    else { cam.zoom = zoom; }
+}
+
+/// Zoom toward a world point (keeps the point under the cursor).
+pub fn camera2d_zoom_at(cam: &mut Camera2D, world_x: f64, world_y: f64, factor: f64) -> void {
+    var new_zoom = cam.zoom * factor;
+    if new_zoom < 0.1 { new_zoom = 0.1; }
+    // Adjust position so world_x/world_y stays at the same screen position
+    cam.x = world_x + (cam.x - world_x) * (cam.zoom / new_zoom);
+    cam.y = world_y + (cam.y - world_y) * (cam.zoom / new_zoom);
+    cam.zoom = new_zoom;
+}
+
+/// Trigger screen shake.
+pub fn camera2d_shake(cam: &mut Camera2D, amount: f64) -> void {
+    cam.shake_amount = cam.shake_amount + amount;
+}
+
+/// Update camera (smooth follow, shake decay).
+pub fn camera2d_update(cam: &mut Camera2D, dt: f64) -> void {
+    // Smooth follow via lerp
+    var lerp_factor = cam.follow_speed * dt;
+    if lerp_factor > 1.0 { lerp_factor = 1.0; }
+    cam.x = cam.x + (cam.target_x - cam.x) * lerp_factor;
+    cam.y = cam.y + (cam.target_y - cam.y) * lerp_factor;
+
+    // Apply bounds
+    if cam.has_bounds {
+        var half_w = (cam.viewport_w as f64) * 0.5 / cam.zoom;
+        var half_h = (cam.viewport_h as f64) * 0.5 / cam.zoom;
+        if cam.x - half_w < cam.min_x { cam.x = cam.min_x + half_w; }
+        if cam.x + half_w > cam.max_x { cam.x = cam.max_x - half_w; }
+        if cam.y - half_h < cam.min_y { cam.y = cam.min_y + half_h; }
+        if cam.y + half_h > cam.max_y { cam.y = cam.max_y - half_h; }
+    }
+
+    // Decay shake
+    if cam.shake_amount > 0.0 {
+        cam.shake_amount = cam.shake_amount - cam.shake_decay * dt;
+        if cam.shake_amount < 0.0 { cam.shake_amount = 0.0; }
+        // Pseudo-random shake offset
+        var t = p_clock_now_ms();
+        cam.shake_x = ((t * 7919) % 1000 - 500) as f64 / 500.0 * cam.shake_amount;
+        cam.shake_y = ((t * 6151) % 1000 - 500) as f64 / 500.0 * cam.shake_amount;
+    } else {
+        cam.shake_x = 0.0;
+        cam.shake_y = 0.0;
+    }
+}
+
+/// Convert screen coordinates to world coordinates.
+pub fn camera2d_screen_to_world(cam: &Camera2D, sx: i64, sy: i64) -> vec2 {
+    var cx = (sx as f64 - (cam.viewport_w as f64) * 0.5) / cam.zoom + cam.x + cam.shake_x;
+    var cy = (sy as f64 - (cam.viewport_h as f64) * 0.5) / cam.zoom + cam.y + cam.shake_y;
+    return vec2(cx, cy);
+}
+
+/// Convert world coordinates to screen coordinates.
+pub fn camera2d_world_to_screen(cam: &Camera2D, wx: f64, wy: f64) -> vec2 {
+    var sx = (wx - cam.x - cam.shake_x) * cam.zoom + (cam.viewport_w as f64) * 0.5;
+    var sy = (wy - cam.y - cam.shake_y) * cam.zoom + (cam.viewport_h as f64) * 0.5;
+    return vec2(sx, sy);
+}
+
+/// Get the camera's view offset for rendering (top-left corner in world space).
+pub fn camera2d_view_offset(cam: &Camera2D) -> vec2 {
+    var half_w = (cam.viewport_w as f64) * 0.5 / cam.zoom;
+    var half_h = (cam.viewport_h as f64) * 0.5 / cam.zoom;
+    return vec2(cam.x - half_w + cam.shake_x, cam.y - half_h + cam.shake_y);
+}
+
+/// Check if a world-space rectangle is visible on screen.
+pub fn camera2d_is_visible(cam: &Camera2D, wx: f64, wy: f64, ww: f64, wh: f64) -> bool {
+    var offset = camera2d_view_offset(cam);
+    var view_w = (cam.viewport_w as f64) / cam.zoom;
+    var view_h = (cam.viewport_h as f64) / cam.zoom;
+    return wx + ww > offset.x && wx < offset.x + view_w &&
+           wy + wh > offset.y && wy < offset.y + view_h;
+}
+
+// ─── 3D Camera ───────────────────────────────────────────────────────────
+
+pub struct Camera3D {
+    pub position: vec3,
+    pub target: vec3,
+    pub up: vec3,
+    pub fov: f64,            // field of view in radians
+    pub aspect: f64,         // width / height
+    pub near: f64,
+    pub far: f64,
+    pub yaw: f64,            // horizontal angle
+    pub pitch: f64,          // vertical angle
+    pub view_matrix: mat4,
+    pub proj_matrix: mat4,
+    pub dirty: bool,
+}
+
+/// Create a 3D camera.
+pub fn camera3d_create(pos: vec3, target: vec3, fov_deg: f64, aspect: f64, near: f64, far: f64) -> Camera3D {
+    return Camera3D {
+        position: pos,
+        target: target,
+        up: vec3(0.0, 1.0, 0.0),
+        fov: radians(fov_deg),
+        aspect: aspect,
+        near: near,
+        far: far,
+        yaw: 0.0,
+        pitch: 0.0,
+        view_matrix: mat4::identity(),
+        proj_matrix: mat4::identity(),
+        dirty: true,
+    };
+}
+
+/// Update the camera's view and projection matrices.
+pub fn camera3d_update(cam: &mut Camera3D) -> void {
+    cam.view_matrix = look_at(cam.position, cam.target, cam.up);
+    cam.proj_matrix = perspective(cam.fov, cam.aspect, cam.near, cam.far);
+    cam.dirty = false;
+}
+
+/// Get the view matrix.
+pub fn camera3d_view_matrix(cam: &Camera3D) -> mat4 {
+    return cam.view_matrix;
+}
+
+/// Get the projection matrix.
+pub fn camera3d_projection(cam: &Camera3D) -> mat4 {
+    return cam.proj_matrix;
+}
+
+/// Get the combined view-projection matrix.
+pub fn camera3d_view_proj(cam: &Camera3D) -> mat4 {
+    return cam.proj_matrix.mul(cam.view_matrix);
+}
+
+/// Get the camera's forward direction.
+pub fn camera3d_forward(cam: &Camera3D) -> vec3 {
+    return cam.target.sub(cam.position).normalize();
+}
+
+/// Get the camera's right direction.
+pub fn camera3d_right(cam: &Camera3D) -> vec3 {
+    var fwd = camera3d_forward(cam);
+    return fwd.cross(cam.up).normalize();
+}
+
+/// Orbit the camera around the target by (delta_yaw, delta_pitch).
+pub fn camera3d_orbit(cam: &mut Camera3D, dyaw: f64, dpitch: f64) -> void {
+    cam.yaw = cam.yaw + dyaw;
+    cam.pitch = cam.pitch + dpitch;
+    if cam.pitch > 1.55 { cam.pitch = 1.55; }  // ~89 degrees
+    if cam.pitch < -1.55 { cam.pitch = -1.55; }
+
+    var dist = cam.position.sub(cam.target).length();
+    var x = cam.target.x + dist * pledge_cos(cam.pitch) * pledge_cos(cam.yaw);
+    var y = cam.target.y + dist * pledge_sin(cam.pitch);
+    var z = cam.target.z + dist * pledge_cos(cam.pitch) * pledge_sin(cam.yaw);
+    cam.position = vec3(x, y, z);
+    cam.dirty = true;
+}
+
+/// Move the camera forward/backward by distance.
+pub fn camera3d_move_forward(cam: &mut Camera3D, dist: f64) -> void {
+    var fwd = camera3d_forward(cam);
+    cam.position = cam.position.add(fwd.scale(dist));
+    cam.target = cam.target.add(fwd.scale(dist));
+    cam.dirty = true;
+}
+
+/// Move the camera right/left by distance.
+pub fn camera3d_move_right(cam: &mut Camera3D, dist: f64) -> void {
+    var right = camera3d_right(cam);
+    cam.position = cam.position.add(right.scale(dist));
+    cam.target = cam.target.add(right.scale(dist));
+    cam.dirty = true;
+}
+
+/// Set aspect ratio (call on window resize).
+pub fn camera3d_set_aspect(cam: &mut Camera3D, aspect: f64) -> void {
+    cam.aspect = aspect;
+    cam.dirty = true;
+}
+
+pub struct Ray3D {
+    pub origin: vec3,
+    pub direction: vec3,
+}
+
+/// Convert a screen point (0..1) to a 3D ray (origin + direction).
+pub fn camera3d_screen_to_ray(cam: &Camera3D, ndc_x: f64, ndc_y: f64) -> Ray3D {
+    // ndc_x and ndc_y are in [-1, 1] range
+    var vp = camera3d_view_proj(cam);
+    var inv_vp = vp;  // inverse would need mat4::inverse — not yet implemented
+    // For now, compute ray from camera position through the near plane point
+    var fwd = camera3d_forward(cam);
+    var right = camera3d_right(cam);
+    var up = cam.up;
+
+    var tan_half = pledge_sin(cam.fov * 0.5) / pledge_cos(cam.fov * 0.5);
+    var h = tan_half;
+    var w = h * cam.aspect;
+
+    var dir = fwd.add(right.scale(ndc_x * w)).add(up.scale(ndc_y * h)).normalize();
+
+    return Ray3D {
+        origin: cam.position,
+        direction: dir,
+    };
+}
+
+/// Update camera position based on yaw/pitch (FPS-style).
+pub fn camera3d_fps_update(cam: &mut Camera3D) -> void {
+    var fwd = vec3(
+        pledge_cos(cam.pitch) * pledge_sin(cam.yaw),
+        pledge_sin(cam.pitch),
+        pledge_cos(cam.pitch) * pledge_cos(cam.yaw)
+    );
+    cam.target = cam.position.add(fwd);
+    cam.dirty = true;
+}

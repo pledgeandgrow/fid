@@ -1,0 +1,755 @@
+// tensor.fd -- Tensor type: n-dimensional arrays with stride info.
+// Ported from src/tensor.rs.
+//
+// Phase 5C.1: AI/ML foundation. A Tensor stores:
+//   - shape: Vec<i64> -- size of each dimension
+//   - strides: Vec<i64> -- element offset per dimension (row-major by default)
+//   - data: Vec<f64> -- flat storage (doubles for now; f32 specialization later)
+//
+// Supported operations:
+//   - create (zeros, ones, from_vec, filled)
+//   - indexing (get/set by multi-index)
+//   - shape queries (shape, ndim, size, reshape, transpose)
+//   - elementwise arithmetic (add, sub, mul, scale)
+//   - linear algebra (matmul, dot)
+//   - reductions (sum, mean, max, min)
+//   - activations (relu, sigmoid, softmax)
+//   - quantization (quantize_q8, dequantize_q8, find_quant_params)
+//   - utility (to_json, to_string)
+//
+// Also includes KvCache (ML9): LLM attention KV cache with sliding window.
+
+module compiler::tensor;
+
+use core;
+use vec;
+use string;
+
+// --- Tensor ---
+
+pub struct Tensor {
+    pub shape: Vec<i64>,    // size of each dimension, e.g. [2, 3] for a 2x3 matrix
+    pub strides: Vec<i64>,  // element offset per dimension (row-major by default)
+    pub data: Vec<f64>,    // flat data storage (f64 for now)
+}
+
+pub fn Tensor_new(shape: Vec<i64>, strides: Vec<i64>, data: Vec<f64>) -> Tensor {
+    return Tensor { shape: shape, strides: strides, data: data };
+}
+
+/// Compute row-major strides for a given shape.
+pub fn row_major_strides(shape: Vec<i64>) -> Vec<i64> {
+    var n: i64 = shape.len();
+    var strides: Vec<i64> = Vec::new();
+    if n == 0 { return strides; }
+    var i: i64 = 0;
+    while i < n {
+        strides.push(0);
+        i = i + 1;
+    }
+    strides.set(n - 1, 1);
+    i = n - 2;
+    while i >= 0 {
+        strides.set(i, strides.get(i + 1) * shape.get(i + 1));
+        i = i - 1;
+    }
+    return strides;
+}
+
+/// Total number of elements (product of shape).
+pub fn Tensor_size(self: &Tensor) -> i64 {
+    var product: i64 = 1;
+    var i: i64 = 0;
+    while i < self.shape.len() {
+        product = product * self.shape.get(i);
+        i = i + 1;
+    }
+    return product;
+}
+
+/// Number of dimensions.
+pub fn Tensor_ndim(self: &Tensor) -> i64 {
+    return self.shape.len();
+}
+
+/// Create a tensor filled with a constant value.
+pub fn Tensor_filled(shape: Vec<i64>, value: f64) -> Tensor {
+    var strides: Vec<i64> = row_major_strides(shape);
+    var size: i64 = 1;
+    var i: i64 = 0;
+    while i < shape.len() {
+        size = size * shape.get(i);
+        i = i + 1;
+    }
+    var data: Vec<f64> = Vec::new();
+    var j: i64 = 0;
+    while j < size {
+        data.push(value);
+        j = j + 1;
+    }
+    return Tensor_new(shape, strides, data);
+}
+
+/// Create a tensor of zeros.
+pub fn Tensor_zeros(shape: Vec<i64>) -> Tensor {
+    return Tensor_filled(shape, 0.0);
+}
+
+/// Create a tensor of ones.
+pub fn Tensor_ones(shape: Vec<i64>) -> Tensor {
+    return Tensor_filled(shape, 1.0);
+}
+
+/// Create a tensor from a flat Vec with a given shape.
+pub fn Tensor_from_vec(shape: Vec<i64>, data: Vec<f64>) -> Tensor {
+    var strides: Vec<i64> = row_major_strides(shape);
+    return Tensor_new(shape, strides, data);
+}
+
+/// Convert a multi-index to a flat offset.
+pub fn Tensor_flat_index(self: &Tensor, indices: Vec<i64>) -> i64 {
+    var offset: i64 = 0;
+    var i: i64 = 0;
+    while i < indices.len() && i < self.strides.len() {
+        offset = offset + indices.get(i) * self.strides.get(i);
+        i = i + 1;
+    }
+    return offset;
+}
+
+/// Get an element by multi-index.
+pub fn Tensor_get(self: &Tensor, indices: Vec<i64>) -> f64 {
+    var fi: i64 = Tensor_flat_index(self, indices);
+    if fi >= 0 && fi < self.data.len() {
+        return self.data.get(fi);
+    }
+    return 0.0;
+}
+
+/// Set an element by multi-index.
+pub fn Tensor_set(self: &mut Tensor, indices: Vec<i64>, value: f64) -> void {
+    var fi: i64 = Tensor_flat_index(self, indices);
+    if fi >= 0 && fi < self.data.len() {
+        self.data.set(fi, value);
+    }
+}
+
+// --- Result types ---
+
+pub enum ResultTensor { Ok(Tensor), Err(str) }
+pub enum ResultF64 { Ok(f64), Err(str) }
+
+/// Reshape the tensor (total size must be preserved).
+pub fn Tensor_reshape(self: &Tensor, new_shape: Vec<i64>) -> ResultTensor {
+    var new_size: i64 = 1;
+    var i: i64 = 0;
+    while i < new_shape.len() {
+        new_size = new_size * new_shape.get(i);
+        i = i + 1;
+    }
+    if new_size != Tensor_size(self) {
+        return ResultTensor::Err("reshape: size mismatch");
+    }
+    var strides: Vec<i64> = row_major_strides(new_shape);
+    return ResultTensor::Ok(Tensor_new(new_shape, strides, self.data));
+}
+
+/// Transpose: reverse the shape and rearrange data.
+pub fn Tensor_transpose(self: &Tensor) -> Tensor {
+    var n: i64 = self.shape.len();
+    var new_shape: Vec<i64> = Vec::new();
+    var i: i64 = n - 1;
+    while i >= 0 {
+        new_shape.push(self.shape.get(i));
+        i = i - 1;
+    }
+    var result: Tensor = Tensor_zeros(new_shape);
+
+    // Iterate over all indices in the original tensor
+    var idx: Vec<i64> = Vec::new();
+    i = 0;
+    while i < n {
+        idx.push(0);
+        i = i + 1;
+    }
+
+    while true {
+        var val: f64 = Tensor_get(self, idx);
+        // Reverse indices for the transposed tensor
+        var rev_idx: Vec<i64> = Vec::new();
+        var j: i64 = n - 1;
+        while j >= 0 {
+            rev_idx.push(idx.get(j));
+            j = j - 1;
+        }
+        Tensor_set(&mut result, rev_idx, val);
+
+        // Increment indices
+        var carry: bool = true;
+        var k: i64 = n - 1;
+        while k >= 0 {
+            if !carry { break; }
+            var new_val: i64 = idx.get(k) + 1;
+            idx.set(k, new_val);
+            if new_val >= self.shape.get(k) {
+                idx.set(k, 0);
+            } else {
+                carry = false;
+            }
+            k = k - 1;
+        }
+        if carry { break; }
+    }
+    return result;
+}
+
+/// Elementwise addition (shapes must match).
+pub fn Tensor_add(self: &Tensor, other: &Tensor) -> ResultTensor {
+    if !shapes_equal(self.shape, other.shape) {
+        return ResultTensor::Err("add: shape mismatch");
+    }
+    var data: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < self.data.len() {
+        data.push(self.data.get(i) + other.data.get(i));
+        i = i + 1;
+    }
+    return ResultTensor::Ok(Tensor_new(self.shape, self.strides, data));
+}
+
+/// Elementwise subtraction.
+pub fn Tensor_sub(self: &Tensor, other: &Tensor) -> ResultTensor {
+    if !shapes_equal(self.shape, other.shape) {
+        return ResultTensor::Err("sub: shape mismatch");
+    }
+    var data: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < self.data.len() {
+        data.push(self.data.get(i) - other.data.get(i));
+        i = i + 1;
+    }
+    return ResultTensor::Ok(Tensor_new(self.shape, self.strides, data));
+}
+
+/// Elementwise multiplication (Hadamard product).
+pub fn Tensor_mul(self: &Tensor, other: &Tensor) -> ResultTensor {
+    if !shapes_equal(self.shape, other.shape) {
+        return ResultTensor::Err("mul: shape mismatch");
+    }
+    var data: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < self.data.len() {
+        data.push(self.data.get(i) * other.data.get(i));
+        i = i + 1;
+    }
+    return ResultTensor::Ok(Tensor_new(self.shape, self.strides, data));
+}
+
+/// Scale by a scalar.
+pub fn Tensor_scale(self: &Tensor, scalar: f64) -> Tensor {
+    var data: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < self.data.len() {
+        data.push(self.data.get(i) * scalar);
+        i = i + 1;
+    }
+    return Tensor_new(self.shape, self.strides, data);
+}
+
+/// Matrix multiplication: (M, K) @ (K, N) -> (M, N). Both tensors must be 2D.
+pub fn Tensor_matmul(self: &Tensor, other: &Tensor) -> ResultTensor {
+    if Tensor_ndim(self) != 2 || Tensor_ndim(other) != 2 {
+        return ResultTensor::Err("matmul: requires 2D tensors");
+    }
+    var m: i64 = self.shape.get(0);
+    var k: i64 = self.shape.get(1);
+    var k2: i64 = other.shape.get(0);
+    var n: i64 = other.shape.get(1);
+    if k != k2 {
+        return ResultTensor::Err("matmul: inner dimension mismatch");
+    }
+    var result_shape: Vec<i64> = Vec::new();
+    result_shape.push(m);
+    result_shape.push(n);
+    var result: Tensor = Tensor_zeros(result_shape);
+
+    var i: i64 = 0;
+    while i < m {
+        var j: i64 = 0;
+        while j < n {
+            var sum: f64 = 0.0;
+            var kk: i64 = 0;
+            while kk < k {
+                var idx_a: Vec<i64> = Vec::new();
+                idx_a.push(i);
+                idx_a.push(kk);
+                var idx_b: Vec<i64> = Vec::new();
+                idx_b.push(kk);
+                idx_b.push(j);
+                sum = sum + Tensor_get(self, idx_a) * Tensor_get(other, idx_b);
+                kk = kk + 1;
+            }
+            var idx_r: Vec<i64> = Vec::new();
+            idx_r.push(i);
+            idx_r.push(j);
+            Tensor_set(&mut result, idx_r, sum);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return ResultTensor::Ok(result);
+}
+
+/// Dot product (1D vectors).
+pub fn Tensor_dot(self: &Tensor, other: &Tensor) -> ResultF64 {
+    if Tensor_ndim(self) != 1 || Tensor_ndim(other) != 1 {
+        return ResultF64::Err("dot: requires 1D tensors");
+    }
+    if self.shape.get(0) != other.shape.get(0) {
+        return ResultF64::Err("dot: size mismatch");
+    }
+    var sum: f64 = 0.0;
+    var i: i64 = 0;
+    while i < self.data.len() {
+        sum = sum + self.data.get(i) * other.data.get(i);
+        i = i + 1;
+    }
+    return ResultF64::Ok(sum);
+}
+
+/// Sum of all elements.
+pub fn Tensor_sum(self: &Tensor) -> f64 {
+    var sum: f64 = 0.0;
+    var i: i64 = 0;
+    while i < self.data.len() {
+        sum = sum + self.data.get(i);
+        i = i + 1;
+    }
+    return sum;
+}
+
+/// Mean of all elements.
+pub fn Tensor_mean(self: &Tensor) -> f64 {
+    if self.data.len() == 0 { return 0.0; }
+    return Tensor_sum(self) / (p_int_to_float(self.data.len()));
+}
+
+/// Maximum element.
+pub fn Tensor_max(self: &Tensor) -> f64 {
+    var max: f64 = self.data.get(0);
+    var i: i64 = 1;
+    while i < self.data.len() {
+        if self.data.get(i) > max { max = self.data.get(i); }
+        i = i + 1;
+    }
+    return max;
+}
+
+/// Minimum element.
+pub fn Tensor_min(self: &Tensor) -> f64 {
+    var min: f64 = self.data.get(0);
+    var i: i64 = 1;
+    while i < self.data.len() {
+        if self.data.get(i) < min { min = self.data.get(i); }
+        i = i + 1;
+    }
+    return min;
+}
+
+// NOTE: Rust's generic `apply<F: Fn(f64) -> f64>` (src/tensor.rs:298) is not
+// ported because Fides has no closures. The direct implementations below
+// (relu, sigmoid, softmax) cover all use cases of `apply` in the Rust source.
+// To add a new elementwise transform, write a dedicated function following
+// the same pattern (iterate data, push transformed value, return new Tensor).
+
+/// ReLU activation: max(0, x)
+pub fn Tensor_relu(self: &Tensor) -> Tensor {
+    var data: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < self.data.len() {
+        var v: f64 = self.data.get(i);
+        if v < 0.0 { v = 0.0; }
+        data.push(v);
+        i = i + 1;
+    }
+    return Tensor_new(self.shape, self.strides, data);
+}
+
+/// Sigmoid activation: 1 / (1 + e^-x)
+pub fn Tensor_sigmoid(self: &Tensor) -> Tensor {
+    var data: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < self.data.len() {
+        var x: f64 = self.data.get(i);
+        data.push(1.0 / (1.0 + tensor_exp(-x)));
+        i = i + 1;
+    }
+    return Tensor_new(self.shape, self.strides, data);
+}
+
+/// Softmax along the last axis.
+pub fn Tensor_softmax(self: &Tensor) -> Tensor {
+    if Tensor_ndim(self) == 0 { return self; }
+    var result: Tensor = Tensor_new(self.shape, self.strides, self.data);
+    var last: i64 = Tensor_ndim(self) - 1;
+    var row_size: i64 = self.shape.get(last);
+    var total: i64 = Tensor_size(self);
+    var num_rows: i64 = total / row_size;
+    var r: i64 = 0;
+    while r < num_rows {
+        var start: i64 = r * row_size;
+        var end: i64 = start + row_size;
+        // Find max for numerical stability
+        var max_val: f64 = self.data.get(start);
+        var i: i64 = start + 1;
+        while i < end {
+            if self.data.get(i) > max_val { max_val = self.data.get(i); }
+            i = i + 1;
+        }
+        // Compute exp and sum
+        var sum: f64 = 0.0;
+        var j: i64 = start;
+        while j < end {
+            var e: f64 = tensor_exp(self.data.get(j) - max_val);
+            result.data.set(j, e);
+            sum = sum + e;
+            j = j + 1;
+        }
+        // Normalize
+        var k: i64 = start;
+        while k < end {
+            result.data.set(k, result.data.get(k) / sum);
+            k = k + 1;
+        }
+        r = r + 1;
+    }
+    return result;
+}
+
+// --- ML10: Quantization ---
+
+/// Quantize a float tensor to int8 (symmetric quantization).
+pub fn Tensor_quantize_q8(self: &Tensor, scale: f64, zero_point: i64) -> Tensor {
+    var data: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < self.data.len() {
+        var v: f64 = self.data.get(i);
+        var q: i64 = (p_float_to_int(v / scale)) + zero_point;
+        if q < -128 { q = -128; }
+        if q > 127 { q = 127; }
+        data.push(p_int_to_float(q));
+        i = i + 1;
+    }
+    return Tensor_new(self.shape, self.strides, data);
+}
+
+/// Dequantize an int8 tensor back to float.
+pub fn Tensor_dequantize_q8(self: &Tensor, scale: f64, zero_point: i64) -> Tensor {
+    var data: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < self.data.len() {
+        var v: f64 = self.data.get(i);
+        data.push((v - (p_int_to_float(zero_point))) * scale);
+        i = i + 1;
+    }
+    return Tensor_new(self.shape, self.strides, data);
+}
+
+pub struct QuantParams {
+    pub scale: f64,
+    pub zero_point: i64,
+}
+
+/// Find optimal quantization parameters (scale and zero_point) for a tensor.
+/// Uses symmetric quantization: scale = max(|min|, |max|) / 127, zero_point = 0.
+pub fn Tensor_find_quant_params(self: &Tensor) -> QuantParams {
+    var min: f64 = self.data.get(0);
+    var max: f64 = self.data.get(0);
+    var i: i64 = 1;
+    while i < self.data.len() {
+        if self.data.get(i) < min { min = self.data.get(i); }
+        if self.data.get(i) > max { max = self.data.get(i); }
+        i = i + 1;
+    }
+    var abs_min: f64 = min;
+    if min < 0.0 { abs_min = -min; }
+    var abs_max: f64 = max;
+    if max < 0.0 { abs_max = -max; }
+    var abs_max_val: f64 = abs_min;
+    if abs_min > abs_max { abs_max_val = abs_min; } else { abs_max_val = abs_max; }
+    var scale: f64 = 1.0;
+    if abs_max_val > 0.0 { scale = abs_max_val / 127.0; }
+    return QuantParams { scale: scale, zero_point: 0 };
+}
+
+// --- Serialization ---
+
+/// Serialize to JSON string.
+pub fn Tensor_to_json(self: &Tensor) -> str {
+    var shape_json: str = "";
+    var i: i64 = 0;
+    while i < self.shape.len() {
+        if i > 0 { shape_json = shape_json + ","; }
+        shape_json = shape_json + int_to_str(self.shape.get(i));
+        i = i + 1;
+    }
+    var data_json: str = "";
+    i = 0;
+    while i < self.data.len() {
+        if i > 0 { data_json = data_json + ","; }
+        var v: f64 = self.data.get(i);
+        data_json = data_json + format_num(v);
+        i = i + 1;
+    }
+    return "{\"shape\":[" + shape_json + "],\"data\":[" + data_json + "]}";
+}
+
+/// Pretty-print as a nested array string.
+pub fn Tensor_to_string(self: &Tensor) -> str {
+    return format_recursive(self.data, self.shape, self.strides, 0);
+}
+
+fn format_recursive(data: Vec<f64>, shape: Vec<i64>, strides: Vec<i64>, offset: i64) -> str {
+    if shape.len() == 0 {
+        var v: f64 = 0.0;
+        if offset < data.len() { v = data.get(offset); }
+        return format_num(v);
+    }
+    if shape.len() == 1 {
+        var items: str = "";
+        var i: i64 = 0;
+        while i < shape.get(0) {
+            if i > 0 { items = items + ", "; }
+            var idx: i64 = offset + i * strides.get(0);
+            var v: f64 = 0.0;
+            if idx < data.len() { v = data.get(idx); }
+            items = items + format_num(v);
+            i = i + 1;
+        }
+        return "[" + items + "]";
+    }
+    var items: str = "";
+    var i: i64 = 0;
+    while i < shape.get(0) {
+        if i > 0 { items = items + ", "; }
+        var sub_shape: Vec<i64> = Vec::new();
+        var j: i64 = 1;
+        while j < shape.len() {
+            sub_shape.push(shape.get(j));
+            j = j + 1;
+        }
+        var sub_strides: Vec<i64> = Vec::new();
+        j = 1;
+        while j < strides.len() {
+            sub_strides.push(strides.get(j));
+            j = j + 1;
+        }
+        items = items + format_recursive(data, sub_shape, sub_strides, offset + i * strides.get(0));
+        i = i + 1;
+    }
+    return "[" + items + "]";
+}
+
+fn format_num(v: f64) -> str {
+    // Integer if no fractional part
+    var truncated: f64 = p_int_to_float(p_float_to_int(v));
+    if truncated == v && v >= -1000000000000000.0 && v <= 1000000000000000.0 {
+        return int_to_str(p_float_to_int(v));
+    }
+    // Otherwise 4 decimal places
+    var whole: i64 = p_float_to_int(v);
+    var frac: f64 = v - (p_int_to_float(whole));
+    if frac < 0.0 { frac = -frac; }
+    var frac_int: i64 = p_float_to_int(frac * 10000.0);
+    var result: str = int_to_str(whole) + ".";
+    var frac_str: str = int_to_str(frac_int);
+    while str_len(frac_str) < 4 { frac_str = "0" + frac_str; }
+    return result + frac_str;
+}
+
+// --- ML9: KV Cache ---
+
+/// A KV cache for LLM attention -- stores K and V tensors per layer.
+/// Bounded by max_seq_len with optional sliding window eviction.
+// Wrapper for Vec<i64> to avoid Vec<Vec<i64>> >> parse issue
+pub struct I64Vec {
+    pub items: Vec<i64>,
+}
+
+pub fn I64Vec_new() -> I64Vec {
+    return I64Vec { items: Vec::new() };
+}
+
+pub struct KvCache {
+    pub k_cache: Vec<I64Vec>,    // K tensors per layer (f64 as i64 bits)
+    pub v_cache: Vec<I64Vec>,    // V tensors per layer (f64 as i64 bits)
+    pub seq_len: Vec<i64>,        // Current sequence length per layer
+    pub max_seq_len: i64,         // Maximum sequence length
+    pub window_size: i64,         // Sliding window size (0 = no window)
+    pub head_dim: i64,            // Head dimension
+}
+
+pub fn KvCache_new(num_layers: i64, max_seq_len: i64, window_size: i64, head_dim: i64) -> KvCache {
+    var k_cache: Vec<I64Vec> = Vec::new();
+    var v_cache: Vec<I64Vec> = Vec::new();
+    var seq_len: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < num_layers {
+        k_cache.push(I64Vec_new());
+        v_cache.push(I64Vec_new());
+        seq_len.push(0);
+        i = i + 1;
+    }
+    return KvCache {
+        k_cache: k_cache,
+        v_cache: v_cache,
+        seq_len: seq_len,
+        max_seq_len: max_seq_len,
+        window_size: window_size,
+        head_dim: head_dim,
+    };
+}
+
+/// Append K and V for a given layer. The tensor should be 2D [seq, head_dim].
+/// If the cache exceeds max_seq_len, oldest tokens are evicted (sliding window).
+pub fn KvCache_append(self: &mut KvCache, layer: i64, k: &Tensor, v: &Tensor) -> void {
+    if layer < 0 || layer >= self.k_cache.len() { return; }
+    // Append new tokens
+    var i: i64 = 0;
+    while i < k.data.len() {
+        self.k_cache[layer].items.push(k.data[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while i < v.data.len() {
+        self.v_cache[layer].items.push(v.data[i]);
+        i = i + 1;
+    }
+    var hd: i64 = self.head_dim;
+    if hd < 1 { hd = 1; }
+    self.seq_len.set(layer, self.k_cache[layer].items.len() / hd);
+
+    // Enforce sliding window
+    var max_tokens: i64 = self.max_seq_len;
+    if self.window_size > 0 && self.window_size < max_tokens {
+        max_tokens = self.window_size;
+    }
+    var max_bytes: i64 = max_tokens * self.head_dim;
+    if self.k_cache[layer].items.len() > max_bytes {
+        var excess: i64 = self.k_cache[layer].items.len() - max_bytes;
+        // Drain oldest `excess` elements
+        var new_k: Vec<i64> = Vec::new();
+        var new_v: Vec<i64> = Vec::new();
+        var j: i64 = excess;
+        while j < self.k_cache[layer].items.len() {
+            new_k.push(self.k_cache[layer].items[j]);
+            new_v.push(self.v_cache[layer].items[j]);
+            j = j + 1;
+        }
+        self.k_cache[layer].items = new_k;
+        self.v_cache[layer].items = new_v;
+        self.seq_len.set(layer, self.k_cache[layer].items.len() / hd);
+    }
+}
+
+/// Get K and V for a layer as a concatenated tensor [2, seq, head_dim].
+pub fn KvCache_get(self: &KvCache, layer: i64) -> Tensor {
+    if layer < 0 || layer >= self.k_cache.len() {
+        var empty_shape: Vec<i64> = Vec::new();
+        empty_shape.push(0);
+        empty_shape.push(self.head_dim);
+        return Tensor_zeros(empty_shape);
+    }
+    var seq: i64 = self.seq_len[layer];
+    var data: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < self.k_cache[layer].items.len() {
+        data.push(self.k_cache[layer].items[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while i < self.v_cache[layer].items.len() {
+        data.push(self.v_cache[layer].items[i]);
+        i = i + 1;
+    }
+    var shape: Vec<i64> = Vec::new();
+    shape.push(2);
+    shape.push(seq);
+    shape.push(self.head_dim);
+    return Tensor_from_vec(shape, data);
+}
+
+/// Current sequence length for a layer.
+pub fn KvCache_len(self: &KvCache, layer: i64) -> i64 {
+    if layer >= 0 && layer < self.seq_len.len() {
+        return self.seq_len[layer];
+    }
+    return 0;
+}
+
+/// Clear all layers.
+pub fn KvCache_clear(self: &mut KvCache) -> void {
+    var i: i64 = 0;
+    while i < self.k_cache.len() {
+        self.k_cache[i].items.clear();
+        self.v_cache[i].items.clear();
+        self.seq_len.set(i, 0);
+        i = i + 1;
+    }
+}
+
+/// Evict the oldest `n` tokens from all layers (sliding window).
+pub fn KvCache_evict_oldest(self: &mut KvCache, n: i64) -> void {
+    var bytes_to_evict: i64 = n * self.head_dim;
+    var i: i64 = 0;
+    while i < self.k_cache.len() {
+        if self.k_cache[i].items.len() >= bytes_to_evict {
+            var new_k: Vec<i64> = Vec::new();
+            var new_v: Vec<i64> = Vec::new();
+            var j: i64 = bytes_to_evict;
+            while j < self.k_cache[i].items.len() {
+                new_k.push(self.k_cache[i].items[j]);
+                new_v.push(self.v_cache[i].items[j]);
+                j = j + 1;
+            }
+            self.k_cache[i].items = new_k;
+            self.v_cache[i].items = new_v;
+            var hd: i64 = self.head_dim;
+            if hd < 1 { hd = 1; }
+            self.seq_len.set(i, self.k_cache[i].items.len() / hd);
+        } else {
+            self.k_cache[i].items.clear();
+            self.v_cache[i].items.clear();
+            self.seq_len.set(i, 0);
+        }
+        i = i + 1;
+    }
+}
+
+// --- Helpers ---
+
+/// Taylor series approximation of e^x for the sigmoid/softmax activations.
+/// Uses 12 terms which is accurate enough for typical activation values.
+fn tensor_exp(x: f64) -> f64 {
+    if x < -20.0 { return 0.0; }
+    if x > 20.0 { return 100000000.0; }
+    var result: f64 = 1.0;
+    var term: f64 = 1.0;
+    var i: i64 = 1;
+    while i <= 12 {
+        term = term * x / p_int_to_float(i);
+        result = result + term;
+        i = i + 1;
+    }
+    return result;
+}
+
+fn shapes_equal(a: Vec<i64>, b: Vec<i64>) -> bool {
+    if a.len() != b.len() { return false; }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}

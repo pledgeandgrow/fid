@@ -1,0 +1,235 @@
+// Fides Particle System standard library
+//
+// GPU-free particle system for 2D and 3D games. Supports:
+//   - Emitters with configurable rate, lifetime, and spread
+//   - Particle physics (gravity, drag, velocity)
+//   - Color and size interpolation over lifetime
+//   - Burst and continuous emission modes
+//
+// Usage:
+//   use particles;
+//   var emitter = particle_emitter_create(1000);
+//   emitter.x = 400.0; emitter.y = 300.0;
+//   emitter.rate = 50.0;        // particles per second
+//   emitter.lifetime = 2.0;     // seconds
+//   emitter.gravity = 200.0;
+//   particle_emitter_burst(&mut emitter, 20);
+//   // In game loop:
+//   particle_emitter_update(&mut emitter, dt);
+//   particle_emitter_render(&emitter, ren);
+
+module particles;
+
+use vec;
+use math;
+
+// ─── Particle ────────────────────────────────────────────────────────────
+
+pub struct Particle {
+    pub x: f64, pub y: f64,
+    pub vx: f64, pub vy: f64,
+    pub life: f64,             // remaining lifetime
+    pub max_life: f64,         // initial lifetime
+    pub size: f64,             // current size
+    pub start_size: f64,
+    pub end_size: f64,
+    pub r: i64, pub g: i64, pub b: i64, pub a: i64,
+    pub start_r: i64, pub start_g: i64, pub start_b: i64, pub start_a: i64,
+    pub end_r: i64, pub end_g: i64, pub end_b: i64, pub end_a: i64,
+    pub active: bool,
+}
+
+// ─── Emitter ─────────────────────────────────────────────────────────────
+
+pub struct ParticleEmitter {
+    pub x: f64, pub y: f64,       // emitter position
+    pub rate: f64,                 // particles per second (0 = burst only)
+    pub lifetime: f64,            // particle lifetime in seconds
+    pub spread: f64,              // angle spread in radians (0 = directional)
+    pub angle: f64,               // emission direction (radians)
+    pub speed_min: f64, pub speed_max: f64,
+    pub size_start: f64, pub size_end: f64,
+    pub gravity: f64,              // downward acceleration
+    pub drag: f64,                 // velocity damping (0 = none, 1 = stop)
+    pub color_start_r: i64, pub color_start_g: i64, pub color_start_b: i64, pub color_start_a: i64,
+    pub color_end_r: i64, pub color_end_g: i64, pub color_end_b: i64, pub color_end_a: i64,
+    pub particles: Vec<Particle>,
+    pub max_particles: i64,
+    pub emit_accum: f64,          // fractional emission accumulator
+    pub active: bool,
+}
+
+/// Create a particle emitter with the given max particles.
+pub fn particle_emitter_create(max_particles: i64) -> ParticleEmitter {
+    var particles = Vec::new();
+    var i = 0;
+    while i < max_particles {
+        particles.push(Particle {
+            x: 0.0, y: 0.0, vx: 0.0, vy: 0.0,
+            life: 0.0, max_life: 0.0,
+            size: 0.0, start_size: 0.0, end_size: 0.0,
+            r: 255, g: 255, b: 255, a: 255,
+            start_r: 255, start_g: 255, start_b: 255, start_a: 255,
+            end_r: 255, end_g: 255, end_b: 255, end_a: 0,
+            active: false,
+        });
+        i = i + 1;
+    }
+    return ParticleEmitter {
+        x: 0.0, y: 0.0,
+        rate: 0.0, lifetime: 1.0,
+        spread: 6.28318,  // full circle
+        angle: 0.0,
+        speed_min: 50.0, speed_max: 150.0,
+        size_start: 4.0, size_end: 0.0,
+        gravity: 0.0, drag: 0.0,
+        color_start_r: 255, color_start_g: 255, color_start_b: 255, color_start_a: 255,
+        color_end_r: 255, color_end_g: 255, color_end_b: 255, color_end_a: 0,
+        particles: particles,
+        max_particles: max_particles,
+        emit_accum: 0.0,
+        active: true,
+    };
+}
+
+/// Emit a single particle.
+pub fn particle_emit_one(em: &mut ParticleEmitter) -> void {
+    // Find inactive particle
+    var idx = -1;
+    var i = 0;
+    while i < em.max_particles {
+        var p = em.particles.get(i);
+        if !p.active {
+            idx = i;
+            break;
+        }
+        i = i + 1;
+    }
+    if idx < 0 { return; }
+
+    // Random angle within spread
+    var t = p_clock_now_ms();
+    var rand_angle = ((t * 7919) % 1000) as f64 / 1000.0 * em.spread - em.spread * 0.5 + em.angle;
+    var rand_speed = em.speed_min + (((t * 6151) % 1000) as f64 / 1000.0) * (em.speed_max - em.speed_min);
+
+    var p = em.particles.get(idx);
+    p.x = em.x;
+    p.y = em.y;
+    p.vx = pledge_cos(rand_angle) * rand_speed;
+    p.vy = pledge_sin(rand_angle) * rand_speed;
+    p.life = em.lifetime;
+    p.max_life = em.lifetime;
+    p.size = em.size_start;
+    p.start_size = em.size_start;
+    p.end_size = em.size_end;
+    p.start_r = em.color_start_r;
+    p.start_g = em.color_start_g;
+    p.start_b = em.color_start_b;
+    p.start_a = em.color_start_a;
+    p.end_r = em.color_end_r;
+    p.end_g = em.color_end_g;
+    p.end_b = em.color_end_b;
+    p.end_a = em.color_end_a;
+    p.r = em.color_start_r;
+    p.g = em.color_start_g;
+    p.b = em.color_start_b;
+    p.a = em.color_start_a;
+    p.active = true;
+    em.particles.set(idx, p);
+}
+
+/// Emit a burst of particles.
+pub fn particle_emitter_burst(em: &mut ParticleEmitter, count: i64) -> void {
+    var i = 0;
+    while i < count {
+        particle_emit_one(em);
+        i = i + 1;
+    }
+}
+
+/// Update the emitter and all active particles.
+pub fn particle_emitter_update(em: &mut ParticleEmitter, dt: f64) -> void {
+    // Continuous emission
+    if em.active && em.rate > 0.0 {
+        em.emit_accum = em.emit_accum + em.rate * dt;
+        while em.emit_accum >= 1.0 {
+            particle_emit_one(em);
+            em.emit_accum = em.emit_accum - 1.0;
+        }
+    }
+
+    // Update particles
+    var i = 0;
+    while i < em.max_particles {
+        var p = em.particles.get(i);
+        if p.active {
+            p.life = p.life - dt;
+            if p.life <= 0.0 {
+                p.active = false;
+            } else {
+                // Apply gravity
+                p.vy = p.vy + em.gravity * dt;
+                // Apply drag
+                if em.drag > 0.0 {
+                    var damp = 1.0 - em.drag * dt;
+                    if damp < 0.0 { damp = 0.0; }
+                    p.vx = p.vx * damp;
+                    p.vy = p.vy * damp;
+                }
+                // Move
+                p.x = p.x + p.vx * dt;
+                p.y = p.y + p.vy * dt;
+
+                // Interpolate size and color
+                var t = 1.0 - p.life / p.max_life;
+                if t < 0.0 { t = 0.0; }
+                if t > 1.0 { t = 1.0; }
+                p.size = p.start_size + (p.end_size - p.start_size) * t;
+                p.r = (p.start_r + ((p.end_r - p.start_r) as f64 * t) as i64) & 0xFF;
+                p.g = (p.start_g + ((p.end_g - p.start_g) as f64 * t) as i64) & 0xFF;
+                p.b = (p.start_b + ((p.end_b - p.start_b) as f64 * t) as i64) & 0xFF;
+                p.a = (p.start_a + ((p.end_a - p.start_a) as f64 * t) as i64) & 0xFF;
+            }
+            em.particles.set(i, p);
+        }
+        i = i + 1;
+    }
+}
+
+/// Get the number of active particles.
+pub fn particle_emitter_count(em: &ParticleEmitter) -> i64 {
+    var count = 0;
+    var i = 0;
+    while i < em.max_particles {
+        if em.particles.get(i).active { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+/// Move the emitter to a new position.
+pub fn particle_emitter_set_pos(em: &mut ParticleEmitter, x: f64, y: f64) -> void {
+    em.x = x;
+    em.y = y;
+}
+
+/// Stop continuous emission.
+pub fn particle_emitter_stop(em: &mut ParticleEmitter) -> void {
+    em.active = false;
+}
+
+/// Start continuous emission.
+pub fn particle_emitter_start(em: &mut ParticleEmitter) -> void {
+    em.active = true;
+}
+
+/// Clear all particles.
+pub fn particle_emitter_clear(em: &mut ParticleEmitter) -> void {
+    var i = 0;
+    while i < em.max_particles {
+        var p = em.particles.get(i);
+        p.active = false;
+        em.particles.set(i, p);
+        i = i + 1;
+    }
+}

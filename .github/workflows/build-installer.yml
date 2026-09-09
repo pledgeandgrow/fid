@@ -1,0 +1,72 @@
+name: Build Windows Installer
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g. 1.0.0)'
+        required: true
+        default: '1.0.0'
+
+jobs:
+  build-installer:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Fides compiler
+        shell: bash
+        run: |
+          cargo build --release
+          ./target/release/fidesc build-selfhost
+
+      - name: Verify build
+        shell: bash
+        run: |
+          ./release/fides-c3.exe ccompile tests/bootstrap/hello.fd -o hello.exe
+          ./hello.exe
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          choco install nsis -y
+          echo "C:\Program Files (x86)\NSIS" >> $GITHUB_PATH
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          cd installer
+          $version = "${{ steps.version.outputs.version }}"
+          # Update version in the NSIS script
+          (Get-Content fides.nsi) -replace '!define VERSION "1.0.0"', "!define VERSION `"$version`"" | Set-Content fides.nsi
+          makensis fides.nsi
+          Rename-Item "Fides-Setup-1.0.0.exe" "Fides-Setup-$version.exe" -ErrorAction SilentlyContinue
+
+      - name: Upload installer to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: installer/Fides-Setup-*.exe
+
+      - name: Upload installer as artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fides-Setup-${{ steps.version.outputs.version }}
+          path: installer/Fides-Setup-*.exe

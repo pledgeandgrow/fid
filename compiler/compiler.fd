@@ -45,6 +45,12 @@ use compiler::peephole;
 use compiler::pir;
 use compiler::opt;
 use compiler::codegen;
+use compiler::codegen_arm64;
+use compiler::arm64_enc;
+use compiler::runtime_arm64;
+use compiler::codegen_riscv;
+use compiler::riscv_enc;
+use compiler::runtime_riscv;
 // ===========================================================================
 // Result types (Fides has no generic Result<T,E>)
 // ===========================================================================
@@ -1235,7 +1241,8 @@ pub fn interpret_source_with_options(source: str, max_recursion: i64, max_steps:
 /// Build a native executable from source.
 /// Dispatches to the appropriate backend based on target:
 ///   x86-64 / x64       -> codegen_x64 + elf64 + runtime_linux + linker
-///   arm64 / aarch64    -> codegen (legacy ARM64) + elf64 + linker
+///   arm64 / aarch64    -> codegen_arm64 + arm64_enc + runtime_arm64 + linker
+///   riscv / riscv64    -> codegen_riscv + riscv_enc + runtime_riscv + linker
 ///   windows / x64-win  -> pe::generate_pe
 ///   wasm               -> (future)
 pub fn build_executable(source: str, source_path: str, target: str, do_opt: bool, do_lto: bool) -> ResultBytes {
@@ -1317,13 +1324,136 @@ pub fn build_executable(source: str, source_path: str, target: str, do_opt: bool
                 return ResultBytes::Ok(pe_bytes);
             }
             if str_equal(target, "arm64") || str_equal(target, "aarch64") {
-                // ARM64: use legacy codegen to produce assembly text, then emit via elf64
-                var asm_arm: str = generate(program);
-                var obj_result2: ResultVec = emit_object_file_for_target(0, asm_arm, "arm64");
-                if ResultVec_is_err(obj_result2) {
-                    return ResultBytes::Err(c_vec1(ResultVec_err_msg(obj_result2)));
+                // ARM64: PIR L3 -> codegen_arm64 -> arm64_enc -> runtime_arm64 -> linker
+                var asm_arm: str = generate_asm_arm64(l3);
+                // Assemble ARM64 assembly into machine code
+                var arm_obj: Vec<i64> = Vec::new();
+                var arm_syms: Vec<LinkerSymbol> = Vec::new();
+                var arm_relocs: Vec<LinkerReloc> = Vec::new();
+                match assemble_arm64(asm_arm) {
+                    ResultArm64Assemble::Ok(arm_result) => {
+                        var oi: i64 = 0;
+                        while oi < arm_result.text.len() {
+                            arm_obj.push(arm_result.text.get(oi));
+                            oi = oi + 1;
+                        }
+                        var asi: i64 = 0;
+                        while asi < arm_result.symbols.len() {
+                            var s: Arm64Symbol = arm_result.symbols.get(asi);
+                            arm_syms.push(LinkerSymbol_new(s.name, s.offset, true));
+                            asi = asi + 1;
+                        }
+                        var ari: i64 = 0;
+                        while ari < arm_result.relocations.len() {
+                            var r: Arm64Reloc = arm_result.relocations.get(ari);
+                            arm_relocs.push(LinkerReloc_new(r.offset, r.symbol, r.rtype));
+                            ari = ari + 1;
+                        }
+                    }
+                    ResultArm64Assemble::Err(e) => {
+                        return ResultBytes::Err(c_vec1("ARM64 assembly error: " + e));
+                    }
                 }
-                return ResultBytes::Ok(ResultVec_bytes(obj_result2));
+                // Get ARM64 runtime parts
+                var rt_arm: RuntimeParts = runtime_parts_arm64();
+                var rt_arm_relocs: Vec<RuntimeReloc> = runtime_relocations_arm64();
+                var rt_arm_syms: Vec<LinkerSymbol> = Vec::new();
+                var si2: i64 = 0;
+                while si2 < rt_arm.symbols.len() {
+                    var rs2: RuntimeSymbol = rt_arm.symbols.get(si2);
+                    rt_arm_syms.push(LinkerSymbol_new(rs2.name, rs2.offset, true));
+                    si2 = si2 + 1;
+                }
+                var rt_arm_rodata_syms: Vec<LinkerRodataSym> = Vec::new();
+                var rsi2: i64 = 0;
+                while rsi2 < rt_arm.rodata_syms.len() {
+                    var rrs2: RuntimeRodataSym = rt_arm.rodata_syms.get(rsi2);
+                    rt_arm_rodata_syms.push(LinkerRodataSym_new(rrs2.name, rrs2.offset));
+                    rsi2 = rsi2 + 1;
+                }
+                var rt_arm_linker_relocs: Vec<LinkerReloc> = Vec::new();
+                var rri2: i64 = 0;
+                while rri2 < rt_arm_relocs.len() {
+                    var rr2: RuntimeReloc = rt_arm_relocs.get(rri2);
+                    rt_arm_linker_relocs.push(LinkerReloc_new(rr2.offset, rr2.symbol, rr2.rtype));
+                    rri2 = rri2 + 1;
+                }
+                var arm_link_result: LinkerResult = link_raw_with_runtime_for_target(
+                    arm_obj, arm_syms, arm_relocs, Vec::new(), Vec::new(),
+                    "_start",
+                    rt_arm.text, rt_arm_syms,
+                    rt_arm.rodata, rt_arm_rodata_syms,
+                    rt_arm_linker_relocs, "arm64"
+                );
+                if LinkerResult_is_ok(arm_link_result) {
+                    return ResultBytes::Ok(LinkerResult_bytes(arm_link_result));
+                }
+                return ResultBytes::Err(c_vec1(LinkerResult_err_msg(arm_link_result)));
+            }
+            if str_equal(target, "riscv") || str_equal(target, "riscv64") {
+                // RISC-V: PIR L3 -> codegen_riscv -> riscv_enc -> runtime_riscv -> linker
+                var asm_rv: str = generate_asm_riscv(l3);
+                var rv_obj: Vec<i64> = Vec::new();
+                var rv_syms: Vec<LinkerSymbol> = Vec::new();
+                var rv_relocs: Vec<LinkerReloc> = Vec::new();
+                match assemble_riscv(asm_rv) {
+                    ResultRiscVAssemble::Ok(rv_result) => {
+                        var oi: i64 = 0;
+                        while oi < rv_result.text.len() {
+                            rv_obj.push(rv_result.text.get(oi));
+                            oi = oi + 1;
+                        }
+                        var rsi3: i64 = 0;
+                        while rsi3 < rv_result.symbols.len() {
+                            var s: RiscVSymbol = rv_result.symbols.get(rsi3);
+                            rv_syms.push(LinkerSymbol_new(s.name, s.offset, true));
+                            rsi3 = rsi3 + 1;
+                        }
+                        var rri3: i64 = 0;
+                        while rri3 < rv_result.relocations.len() {
+                            var r: RiscVReloc = rv_result.relocations.get(rri3);
+                            rv_relocs.push(LinkerReloc_new(r.offset, r.symbol, r.rtype));
+                            rri3 = rri3 + 1;
+                        }
+                    }
+                    ResultRiscVAssemble::Err(e) => {
+                        return ResultBytes::Err(c_vec1("RISC-V assembly error: " + e));
+                    }
+                }
+                var rt_rv: RuntimeParts = runtime_parts_riscv();
+                var rt_rv_relocs: Vec<RuntimeReloc> = runtime_relocations_riscv();
+                var rt_rv_syms: Vec<LinkerSymbol> = Vec::new();
+                var si3: i64 = 0;
+                while si3 < rt_rv.symbols.len() {
+                    var rs3: RuntimeSymbol = rt_rv.symbols.get(si3);
+                    rt_rv_syms.push(LinkerSymbol_new(rs3.name, rs3.offset, true));
+                    si3 = si3 + 1;
+                }
+                var rt_rv_rodata_syms: Vec<LinkerRodataSym> = Vec::new();
+                var rsi4: i64 = 0;
+                while rsi4 < rt_rv.rodata_syms.len() {
+                    var rrs4: RuntimeRodataSym = rt_rv.rodata_syms.get(rsi4);
+                    rt_rv_rodata_syms.push(LinkerRodataSym_new(rrs4.name, rrs4.offset));
+                    rsi4 = rsi4 + 1;
+                }
+                var rt_rv_linker_relocs: Vec<LinkerReloc> = Vec::new();
+                var rri4: i64 = 0;
+                while rri4 < rt_rv_relocs.len() {
+                    var rr4: RuntimeReloc = rt_rv_relocs.get(rri4);
+                    rt_rv_linker_relocs.push(LinkerReloc_new(rr4.offset, rr4.symbol, rr4.rtype));
+                    rri4 = rri4 + 1;
+                }
+                var rv_link_result: LinkerResult = link_raw_with_runtime_for_target(
+                    rv_obj, rv_syms, rv_relocs, Vec::new(), Vec::new(),
+                    "_start",
+                    rt_rv.text, rt_rv_syms,
+                    rt_rv.rodata, rt_rv_rodata_syms,
+                    rt_rv_linker_relocs, "riscv"
+                );
+                if LinkerResult_is_ok(rv_link_result) {
+                    return ResultBytes::Ok(LinkerResult_bytes(rv_link_result));
+                }
+                return ResultBytes::Err(c_vec1(LinkerResult_err_msg(rv_link_result)));
             }
             // Unknown target
             return ResultBytes::Err(c_vec1("Unknown target: " + target));

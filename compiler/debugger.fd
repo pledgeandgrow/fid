@@ -1,0 +1,977 @@
+// debugger.fd -- Built-in interactive debugger for Fides
+// Ported from src/debugger.rs.
+//
+// Provides an interactive debugger that runs the interpreter step-by-step
+// with breakpoints, variable inspection, stack traces, and more.
+// No external tools (gdb/lldb) required.
+//
+// Commands (mirrors the Rust reference):
+//   break <func>[:<line>]  -- set a breakpoint
+//   break                  -- list breakpoints
+//   delete <n>             -- delete breakpoint n
+//   run                    -- run until breakpoint or program end
+//   step                   -- step one instruction (into calls)
+//   next                   -- step one instruction (over calls -- same as step for now)
+//   continue               -- continue execution
+//   print <var>            -- print a variable's value
+//   print                  -- print all variables in scope
+//   backtrace              -- show call stack
+//   info locals            -- show all local variables
+//   info functions         -- list all functions
+//   info breakpoints       -- list breakpoints
+//   list                   -- show source around current position
+//   ir                     -- show IR for current function
+//   effects                -- show active effects for current function
+//   watch <var>            -- watch a variable (print on change)
+//   record                 -- start recording execution trace
+//   replay <file>          -- replay a recorded trace
+//   quit                   -- exit debugger
+//
+// Note: The self-hosted interpreter (compiler/interp.fd) currently has a
+// simplified debug hook (no-op). Full interactive stepping requires the
+// interpreter to call back into the debugger on each instruction. This
+// module provides the structural debugger state, value formatting, source
+// listing, breakpoint management, and command parsing/dispatch. The
+// interactive run loop is wired through compiler/main.fd's `debug` command
+// using the available Interpreter API.
+
+module compiler::debugger;
+
+use core;
+use vec;
+use string;
+use compiler::interp;
+use compiler::ir;
+use compiler;
+use compiler::lower;
+
+// --- Breakpoint ---
+
+pub struct Breakpoint {
+    pub id: i64,
+    pub func_name: str,
+    pub line: i64,        // -1 means no specific line
+    pub hit_count: i64,
+}
+
+pub fn Breakpoint_new(id: i64, func_name: str, line: i64) -> Breakpoint {
+    return Breakpoint {
+        id: id,
+        func_name: func_name,
+        line: line,
+        hit_count: 0,
+    };
+}
+
+// --- Debugger state ---
+
+pub struct Debugger {
+    pub breakpoints: Vec<Breakpoint>,
+    pub next_bp_id: i64,
+    pub stepping: bool,
+    pub step_over: bool,
+    pub step_over_depth: i64,
+    pub watches: Vec<(str, str)>,    // (name, last_value_str)
+    pub recording: bool,
+    pub source_lines: Vec<str>,
+    pub source_path: str,
+}
+
+pub fn Debugger_new(source: str, source_path: str) -> Debugger {
+    return Debugger {
+        breakpoints: Vec::new(),
+        next_bp_id: 1,
+        stepping: true,  // Start in stepping mode
+        step_over: false,
+        step_over_depth: 0,
+        watches: Vec::new(),
+        recording: false,
+        source_lines: str_lines(source),
+        source_path: source_path,
+    };
+}
+
+/// Parse a breakpoint spec: "func", "func:42", "42" (line in any function)
+pub fn Debugger_parse_bp_spec(self: &Debugger, spec: str) -> (str, i64) {
+    var colon_pos: i64 = str_find_char(spec, ":");
+    if colon_pos >= 0 {
+        var func: str = str_slice(spec, 0, colon_pos);
+        var line_str: str = str_slice(spec, colon_pos + 1, str_len(spec));
+        var line: i64 = str_to_int(line_str);
+        return (func, line);
+    }
+    var n: i64 = str_to_int(spec);
+    if n > 0 {
+        return ("main", n);
+    }
+    return (spec, -1);
+}
+
+/// Check if we should break at the current position
+pub fn Debugger_should_break(
+    self: &mut Debugger,
+    func_name: str,
+    source_line: i64,
+    call_depth: i64
+) -> bool {
+    // Stepping mode -- break on every instruction
+    if self.stepping {
+        if self.step_over && call_depth > self.step_over_depth {
+            return false;
+        }
+        self.stepping = false;
+        self.step_over = false;
+        return true;
+    }
+
+    // Check breakpoints
+    var i: i64 = 0;
+    while i < self.breakpoints.len() {
+        var bp: Breakpoint = self.breakpoints.get(i);
+        if str_equal(bp.func_name, func_name) {
+            if bp.line < 0 || bp.line == source_line {
+                bp.hit_count = bp.hit_count + 1;
+                self.breakpoints.set(i, bp);
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+
+    return false;
+}
+
+// --- Breakpoint management ---
+
+/// Add a breakpoint. Returns the new breakpoint id.
+pub fn Debugger_add_breakpoint(self: &mut Debugger, func_name: str, line: i64) -> i64 {
+    var id: i64 = self.next_bp_id;
+    self.next_bp_id = self.next_bp_id + 1;
+    self.breakpoints.push(Breakpoint_new(id, func_name, line));
+    return id;
+}
+
+/// Delete a breakpoint by id. Returns true if deleted.
+pub fn Debugger_delete_breakpoint(self: &mut Debugger, id: i64) -> bool {
+    var i: i64 = 0;
+    while i < self.breakpoints.len() {
+        if self.breakpoints.get(i).id == id {
+            self.breakpoints.remove(i);
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// List all breakpoints as a formatted string.
+pub fn Debugger_list_breakpoints(self: &Debugger) -> str {
+    if self.breakpoints.len() == 0 {
+        return "No breakpoints set.";
+    }
+    var result: str = "";
+    var i: i64 = 0;
+    while i < self.breakpoints.len() {
+        var bp: Breakpoint = self.breakpoints.get(i);
+        var line_str: str = "";
+        if bp.line >= 0 { line_str = ":" + int_to_str(bp.line); } else { line_str = ""; }
+        result = result + "  #" + int_to_str(bp.id) + " " + bp.func_name + line_str
+            + " (hits: " + int_to_str(bp.hit_count) + ")\n";
+        i = i + 1;
+    }
+    return result;
+}
+
+// --- Watch management ---
+
+/// Add a watch on a variable.
+pub fn Debugger_add_watch(self: &mut Debugger, name: str) -> void {
+    self.watches.push((name, ""));
+}
+
+/// Update a watch's last-seen value. Returns true if value changed.
+pub fn Debugger_update_watch(self: &mut Debugger, name: str, value_str: str) -> bool {
+    var i: i64 = 0;
+    while i < self.watches.len() {
+        var entry: (str, str) = self.watches.get(i);
+        var (w0, w1) = entry;
+        if str_equal(w0, name) {
+            var changed: bool = !str_equal(w1, value_str);
+            self.watches.set(i, (name, value_str));
+            return changed;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// List all watches as a formatted string.
+pub fn Debugger_list_watches(self: &Debugger) -> str {
+    if self.watches.len() == 0 {
+        return "No watches set.";
+    }
+    var result: str = "";
+    var i: i64 = 0;
+    while i < self.watches.len() {
+        var entry: (str, str) = self.watches.get(i);
+        var (lw0, lw1) = entry;
+        result = result + "  " + lw0 + " = " + lw1 + "\n";
+        i = i + 1;
+    }
+    return result;
+}
+
+// --- Source listing ---
+
+/// Show source around a line.
+pub fn Debugger_list_source(self: &Debugger, line: i64, context: i64) -> str {
+    var start: i64 = line - context;
+    if start < 0 { start = 0; }
+    var end: i64 = line + context + 1;
+    if end > self.source_lines.len() { end = self.source_lines.len(); }
+
+    var result: str = "";
+    var i: i64 = start;
+    while i < end {
+        var marker: str = "  ";
+        if i + 1 == line { marker = "-> "; }
+        var line_num: str = int_to_str(i + 1);
+        // Pad line number to 4 chars
+        while str_len(line_num) < 4 { line_num = " " + line_num; }
+        var src: str = "";
+        if i < self.source_lines.len() {
+            src = self.source_lines.get(i);
+        }
+        result = result + marker + line_num + " | " + src + "\n";
+        i = i + 1;
+    }
+    return result;
+}
+
+// --- Value formatting ---
+
+/// Format a Value for display.
+pub fn format_value(v: Value) -> str {
+    match v {
+        Value::Int(i) => { return "i64: " + int_to_str(i); }
+        Value::Float(f) => { return "f64: " + float_to_str(f); }
+        Value::Bool(b) => { return "bool: " + bool_to_str(b); }
+        Value::Str(s) => { return "str: \"" + s + "\""; }
+        Value::Ptr(p) => { return "ptr: 0x" + int_to_hex(p); }
+        Value::Void => { return "void"; }
+        Value::Vec(idx) => { return "Vec[#" + int_to_str(idx) + "]"; }
+        Value::Map(idx) => { return "Map{#" + int_to_str(idx) + "}"; }
+    }
+    return "?";
+}
+
+// --- Help text ---
+
+pub fn print_debugger_help() -> str {
+    return "Fides Debugger Commands:\n"
+        + "  break <func>[:<line>]  Set a breakpoint\n"
+        + "  break                  List breakpoints\n"
+        + "  delete <n>             Delete breakpoint n\n"
+        + "  run                    Run until breakpoint or program end\n"
+        + "  step                   Step one instruction (into calls)\n"
+        + "  next                   Step one instruction (over calls)\n"
+        + "  continue               Continue execution\n"
+        + "  print <var>            Print a variable's value\n"
+        + "  print                  Print all variables in scope\n"
+        + "  backtrace              Show call stack\n"
+        + "  info locals            Show all local variables\n"
+        + "  info functions         List all functions\n"
+        + "  info breakpoints       List breakpoints\n"
+        + "  list                   Show source around current position\n"
+        + "  ir                     Show IR for current function\n"
+        + "  effects                Show active effects for current function\n"
+        + "  watch <var>            Watch a variable (print on change)\n"
+        + "  record                 Start recording execution trace\n"
+        + "  replay <file>          Replay a recorded trace\n"
+        + "  quit                   Exit debugger\n";
+}
+
+// --- Command parsing ---
+
+/// Parse a command line into (cmd, arg).
+pub fn parse_command(line: str) -> (str, str) {
+    var trimmed: str = str_trim(line);
+    var space_pos: i64 = str_find_char(trimmed, " ");
+    if space_pos < 0 {
+        return (trimmed, "");
+    }
+    var cmd: str = str_slice(trimmed, 0, space_pos);
+    var arg: str = str_trim(str_slice(trimmed, space_pos + 1, str_len(trimmed)));
+    return (cmd, arg);
+}
+
+// --- Local helpers ---
+
+fn int_to_hex(n: i64) -> str {
+    if n == 0 { return "0"; }
+    var num: i64 = n;
+    var buf: str = "";
+    while num > 0 {
+        var digit: i64 = num & 0xF;
+        if digit < 10 {
+            buf = char_from_digit(digit) + buf;
+        } else {
+            buf = hex_char(digit) + buf;
+        }
+        num = num >> 4;
+    }
+    return buf;
+}
+
+fn bool_to_str(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+pub fn char_from_digit(d: i64) -> str {
+    var buf: Vec<i64> = Vec::new();
+    buf.push(48 + d);
+    return str_from_bytes(buf);
+}
+
+pub fn hex_char(d: i64) -> str {
+    var buf: Vec<i64> = Vec::new();
+    buf.push(65 + d - 10);
+    return str_from_bytes(buf);
+}
+
+fn str_to_int(s: str) -> i64 {
+    var result: i64 = 0;
+    var i: i64 = 0;
+    var negative: bool = false;
+    if str_len(s) == 0 { return -1; }
+    var first: i64 = str_byte_at(s, 0);
+    if first == 45 { // '-'
+        negative = true;
+        i = 1;
+    }
+    while i < str_len(s) {
+        var b: i64 = str_byte_at(s, i);
+        if b < 48 || b > 57 { return -1; }
+        result = result * 10 + (b - 48);
+        i = i + 1;
+    }
+    if negative { return -result; }
+    return result;
+}
+
+fn str_lines(s: str) -> Vec<str> {
+    var result: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    var start: i64 = 0;
+    while i < str_len(s) {
+        var b: i64 = str_byte_at(s, i);
+        if b == 10 {
+            result.push(str_slice(s, start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < str_len(s) {
+        result.push(str_slice(s, start, str_len(s)));
+    }
+    return result;
+}
+
+fn str_find_char(s: str, ch: i64) -> i64 {
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if str_byte_at(s, i) == ch { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ===========================================================================
+// DebuggerState -- mutable state accessed by the debug hook (src/debugger.rs:649)
+// ===========================================================================
+//
+// In the Rust reference, this is stored in an Rc<RefCell<DebuggerState>> so the
+// hook closure can mutate it. In the self-hosted port, we use it as a plain
+// struct passed by reference. Full interactive stepping requires the
+// interpreter to call back into the debugger on each instruction; the
+// self-hosted interpreter (compiler/interp.fd) currently has a simplified
+// debug hook (no-op), so this struct is provided for structural parity and
+// future wiring.
+
+pub struct DebuggerState {
+    pub breakpoints: Vec<Breakpoint>,
+    pub next_bp_id: i64,
+    pub stepping: bool,
+    pub step_over: bool,
+    pub watches: Vec<(str, str)>,
+    pub recording: bool,
+    pub last_cmd: str,
+    pub quit: bool,
+    // Current position tracking (for future use when the hook is wired)
+    pub current_func: str,
+    pub current_block: str,
+    pub current_inst: i64,
+    pub current_source_line: i64,
+    pub call_depth: i64,
+    pub trace: Vec<TraceEntry>,
+}
+
+pub fn DebuggerState_new() -> DebuggerState {
+    return DebuggerState {
+        breakpoints: Vec::new(),
+        next_bp_id: 1,
+        stepping: true,
+        step_over: false,
+        watches: Vec::new(),
+        recording: false,
+        last_cmd: "step",
+        quit: false,
+        current_func: "",
+        current_block: "",
+        current_inst: 0,
+        current_source_line: 0,
+        call_depth: 0,
+        trace: Vec::new(),
+    };
+}
+
+/// Initialize DebuggerState from an existing Debugger (copies breakpoints/watches).
+pub fn DebuggerState_from_debugger(dbg: &Debugger) -> DebuggerState {
+    return DebuggerState {
+        breakpoints: dbg.breakpoints,
+        next_bp_id: dbg.next_bp_id,
+        stepping: true,
+        step_over: false,
+        watches: dbg.watches,
+        recording: dbg.recording,
+        last_cmd: "step",
+        quit: false,
+        current_func: "",
+        current_block: "",
+        current_inst: 0,
+        current_source_line: 0,
+        call_depth: 0,
+        trace: Vec::new(),
+    };
+}
+
+// ===========================================================================
+// TraceEntry -- execution trace entry (src/debugger.rs:828, src/interp.rs)
+// ===========================================================================
+
+pub struct TraceEntry {
+    pub func_name: str,
+    pub block_id: i64,
+    pub inst_id: i64,
+    pub source_line: i64,
+    pub value_repr: OptStr,
+}
+
+pub fn TraceEntry_new(func_name: str, block_id: i64, inst_id: i64, source_line: i64) -> TraceEntry {
+    return TraceEntry {
+        func_name: func_name,
+        block_id: block_id,
+        inst_id: inst_id,
+        source_line: source_line,
+        value_repr: OptStr::None,
+    };
+}
+
+// ===========================================================================
+// print_locals -- print all local variables (src/debugger.rs:152)
+// ===========================================================================
+//
+// In the Rust reference, this takes &HashMap<ValueId, Value> and &IrFunction.
+// The self-hosted interpreter stores values as Vec<Value> indexed by value_id.
+// We port this to take Vec<Value> and IrFunction, mapping locals (name -> id)
+// to their values. If no named locals are found, we print intermediate SSA
+// values (v<id>) instead.
+//
+// Limitation: The self-hosted interpreter does not expose its internal value
+// Vec to external callers yet. When wired through the debug hook, the hook
+// will pass the current values Vec. For now, this function is provided for
+// structural parity and can be called with the interpreter's value state.
+
+pub fn print_locals(values: Vec<Value>, func: IrFunction) -> str {
+    if values.len() == 0 {
+        return "  (no variables in scope)\n";
+    }
+    var result: str = "";
+    var printed: i64 = 0;
+
+    // Map value IDs to source names using func.locals
+    var li: i64 = 0;
+    while li < func.locals.len() {
+        var local: StringValueId = func.locals.get(li);
+        var vid: i64 = local.id;
+        if vid < values.len() {
+            var v: Value = values.get(vid);
+            match v {
+                Value::Void => { /* skip unbound */ }
+                _ => {
+                    result = result + "  " + local.name + " = " + format_value(v) + "\n";
+                    printed = printed + 1;
+                }
+            }
+        }
+        li = li + 1;
+    }
+
+    // Also print any values not in locals (intermediate SSA values)
+    if printed == 0 {
+        var vi: i64 = 0;
+        while vi < values.len() {
+            if vi >= 20 { break; }
+            var v: Value = values.get(vi);
+            match v {
+                Value::Void => { /* skip */ }
+                _ => {
+                    result = result + "  v" + int_to_str(vi) + " = " + format_value(v) + "\n";
+                }
+            }
+            vi = vi + 1;
+        }
+        if values.len() > 20 {
+            result = result + "  ... and " + int_to_str(values.len() - 20) + " more\n";
+        }
+    }
+
+    if printed == 0 && result == "" {
+        return "  (no variables in scope)\n";
+    }
+    return result;
+}
+
+// ===========================================================================
+// print_var -- print a single variable by name (src/debugger.rs:177)
+// ===========================================================================
+//
+// Tries to find the variable by local name first, then by v<number> syntax.
+
+pub fn print_var(name: str, values: Vec<Value>, func: IrFunction) -> str {
+    // Try to find by local name
+    var li: i64 = 0;
+    while li < func.locals.len() {
+        var local: StringValueId = func.locals.get(li);
+        if str_equal(local.name, name) {
+            var vid: i64 = local.id;
+            if vid < values.len() {
+                var v: Value = values.get(vid);
+                match v {
+                    Value::Void => { /* fall through to not found */ }
+                    _ => {
+                        return "  " + name + " = " + format_value(v) + "\n";
+                    }
+                }
+            }
+        }
+        li = li + 1;
+    }
+
+    // Try parsing as v<number>
+    if str_len(name) > 1 {
+        if str_byte_at(name, 0) == 118 { // 'v'
+            var num_str: str = str_slice(name, 1, str_len(name));
+            var n: i64 = str_to_int(num_str);
+            if n >= 0 && n < values.len() {
+                var v: Value = values.get(n);
+                match v {
+                    Value::Void => { /* fall through */ }
+                    _ => {
+                        return "  " + name + " = " + format_value(v) + "\n";
+                    }
+                }
+            }
+        }
+    }
+
+    return "  Variable '" + name + "' not found in current scope\n";
+}
+
+// ===========================================================================
+// show_ir -- dump IR for a function (src/debugger.rs:209)
+// ===========================================================================
+//
+// Prints the function signature, then each block with its instructions.
+// Uses IrFunction_get_inst and IrFunction_get_meta for lookups.
+
+pub fn show_ir(func: IrFunction) -> str {
+    // Build parameter list: "v0: i64, v1: str"
+    var params_str: str = "";
+    var pi: i64 = 0;
+    while pi < func.params.len() {
+        if pi > 0 { params_str = params_str + ", "; }
+        var param: ValueIdType = func.params.get(pi);
+        params_str = params_str + "v" + int_to_str(param.id) + ": " + ir_type_to_str(param.ty);
+        pi = pi + 1;
+    }
+
+    var result: str = "function " + func.name + "(" + params_str + ") -> "
+        + ir_type_to_str(func.ret_ty) + "\n";
+
+    // Iterate blocks
+    var bi: i64 = 0;
+    while bi < func.blocks.len() {
+        var block: BasicBlock = func.blocks.get(bi);
+        result = result + "  block " + int_to_str(bi) + ":\n";
+
+        // Iterate instructions in block
+        var ii: i64 = 0;
+        while ii < block.instructions.len() {
+            var inst_id: i64 = block.instructions.get(ii);
+            var inst_opt: OptInst = IrFunction_get_inst(&func, inst_id);
+            match inst_opt {
+                OptInst::Some(inst) => {
+                    var line_str: str = "";
+                    var meta_opt: OptValueMeta = IrFunction_get_meta(&func, inst_id);
+                    match meta_opt {
+                        OptValueMeta::Some(meta) => {
+                            match meta.source_line {
+                                OptU64::Some(line) => {
+                                    line_str = " (line " + int_to_str(line) + ")";
+                                }
+                                OptU64::None => { line_str = ""; }
+                            }
+                        }
+                        OptValueMeta::None => { line_str = ""; }
+                    }
+                    result = result + "    v" + int_to_str(inst_id) + " = "
+                        + inst_kind_name(&inst) + line_str + "\n";
+                }
+                OptInst::None => {
+                    result = result + "    v" + int_to_str(inst_id) + " (missing)\n";
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    return result;
+}
+
+// ===========================================================================
+// show_ir_with_current -- like show_ir but marks current instruction (src/debugger.rs:770)
+// ===========================================================================
+
+pub fn show_ir_with_current(func: IrFunction, current_inst: i64) -> str {
+    // Build parameter list
+    var params_str: str = "";
+    var pi: i64 = 0;
+    while pi < func.params.len() {
+        if pi > 0 { params_str = params_str + ", "; }
+        var param: ValueIdType = func.params.get(pi);
+        params_str = params_str + "v" + int_to_str(param.id) + ": " + ir_type_to_str(param.ty);
+        pi = pi + 1;
+    }
+
+    var result: str = "function " + func.name + "(" + params_str + ") -> "
+        + ir_type_to_str(func.ret_ty) + "\n";
+
+    var bi: i64 = 0;
+    while bi < func.blocks.len() {
+        var block: BasicBlock = func.blocks.get(bi);
+        result = result + "  block " + int_to_str(bi) + ":\n";
+
+        var ii: i64 = 0;
+        while ii < block.instructions.len() {
+            var inst_id: i64 = block.instructions.get(ii);
+            var inst_opt: OptInst = IrFunction_get_inst(&func, inst_id);
+            match inst_opt {
+                OptInst::Some(inst) => {
+                    var line_str: str = "";
+                    var meta_opt: OptValueMeta = IrFunction_get_meta(&func, inst_id);
+                    match meta_opt {
+                        OptValueMeta::Some(meta) => {
+                            match meta.source_line {
+                                OptU64::Some(line) => {
+                                    line_str = " (line " + int_to_str(line) + ")";
+                                }
+                                OptU64::None => { line_str = ""; }
+                            }
+                        }
+                        OptValueMeta::None => { line_str = ""; }
+                    }
+                    var marker: str = "  ";
+                    if inst_id == current_inst { marker = "-> "; }
+                    result = result + "  " + marker + "v" + int_to_str(inst_id) + " = "
+                        + inst_kind_name(&inst) + line_str + "\n";
+                }
+                OptInst::None => {
+                    result = result + "    v" + int_to_str(inst_id) + " (missing)\n";
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    return result;
+}
+
+// ===========================================================================
+// show_effects -- show effects for a function (src/debugger.rs:226)
+// ===========================================================================
+
+pub fn show_effects(func: IrFunction) -> str {
+    var result: str = "Function: " + func.name + "\n";
+    result = result + "  Effects: " + EffectSet_to_str(&func.effects) + "\n";
+    result = result + "  @wrapping: " + bool_to_str(func.is_wrapping) + "\n";
+    result = result + "  @deterministic: " + bool_to_str(func.is_deterministic) + "\n";
+    result = result + "  @crashfree: " + bool_to_str(func.is_crashfree) + "\n";
+    result = result + "  @no-alloc: " + bool_to_str(func.is_no_alloc) + "\n";
+    match func.gas_limit {
+        OptU64::Some(gas) => {
+            result = result + "  @gas: " + int_to_str(gas) + "\n";
+        }
+        OptU64::None => { /* no gas limit */ }
+    }
+    return result;
+}
+
+// ===========================================================================
+// list_functions -- list all functions in the module (src/debugger.rs:239)
+// ===========================================================================
+
+pub fn list_functions(module: IrModule) -> str {
+    if module.functions.len() == 0 {
+        return "  (no functions)\n";
+    }
+    var result: str = "";
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var entry: IrFunctionEntry = module.functions.get(i);
+        var func: IrFunction = entry.func;
+        var params: i64 = func.params.len();
+        var blocks: i64 = func.blocks.len();
+        result = result + "  " + entry.name + " (" + int_to_str(params) + " params, "
+            + int_to_str(blocks) + " blocks)\n";
+        i = i + 1;
+    }
+    return result;
+}
+
+// ===========================================================================
+// Debugger_run -- main interactive command loop (src/debugger.rs:251)
+// ===========================================================================
+//
+// In the Rust reference, this:
+//   1. Builds the program and lowers to IR
+//   2. Creates an interpreter
+//   3. Sets a debug hook closure
+//   4. Runs the interpreter (which calls the hook on each instruction)
+//   5. In the hook, checks breakpoints and pauses for interactive commands
+//
+// Limitation: The self-hosted interpreter (compiler/interp.fd) has a simplified
+// debug hook (Interpreter_set_debug_hook is a no-op that just sets debug_mode).
+// It does not call back into the debugger on each instruction. Full interactive
+// stepping requires extending the interpreter with a callback mechanism.
+//
+// This function provides the structural entry point: it compiles the source,
+// creates the interpreter, and runs it. Interactive stepping is documented as
+// a future enhancement. The function returns the program exit code.
+
+pub fn Debugger_run(self: &mut Debugger, source: str, source_path: str) -> i64 {
+    p_eprint_str("Fides Debugger -- fidesc debug ");
+    p_eprint_str(source_path);
+    p_eprint_str("\n");
+    p_eprint_str("Type 'help' for commands, 'run' to start execution.\n\n");
+
+    // Build the program
+    var program_result: ResultProgram = build_program_with_path(source, OptStr::Some(source_path));
+    match program_result {
+        ResultProgram::Err(errors) => {
+            var ei: i64 = 0;
+            while ei < errors.len() {
+                p_eprint_str(errors.get(ei));
+                p_eprint_str("\n");
+                ei = ei + 1;
+            }
+            p_eprint_str("\nCompilation failed.\n");
+            return 1;
+        }
+        ResultProgram::Ok(program) => {
+            // Lower to IR
+            var module: IrModule = lower(program);
+
+            // Create interpreter
+            var interp_inst: Interpreter = Interpreter_new(module);
+
+            // Enable debug mode (simplified: no callback hook yet)
+            Interpreter_set_debug_hook(&mut interp_inst);
+
+            // Run the interpreter
+            var result: RunResult = Interpreter_run(&mut interp_inst);
+
+            // Handle result
+            match result {
+                RunResult::Return(v) => {
+                    p_eprint_str("\nProgram returned: ");
+                    p_eprint_str(format_value(v));
+                    p_eprint_str("\n");
+                    match v {
+                        Value::Int(i) => { return i; }
+                        _ => { return 0; }
+                    }
+                }
+                RunResult::Panic(msg) => {
+                    p_eprint_str("\nProgram panicked: ");
+                    p_eprint_str(msg);
+                    p_eprint_str("\n");
+                    return 1;
+                }
+                RunResult::Paused => {
+                    p_eprint_str("\nExecution paused.\n");
+                    return 0;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// ===========================================================================
+// save_trace -- save a trace to a file (src/debugger.rs:828)
+// ===========================================================================
+//
+// Format: func_name block_id inst_id source_line [value_repr|-]
+// Lines starting with '#' are comments.
+
+pub fn save_trace(trace: Vec<TraceEntry>, path: str) -> bool {
+    var content: str = "# Fides execution trace\n";
+    content = content + "# Format: func_name block_id inst_id source_line [value]\n";
+    var i: i64 = 0;
+    while i < trace.len() {
+        var entry: TraceEntry = trace.get(i);
+        var line: str = entry.func_name + " " + int_to_str(entry.block_id) + " "
+            + int_to_str(entry.inst_id) + " " + int_to_str(entry.source_line) + " ";
+        match entry.value_repr {
+            OptStr::Some(val_str) => {
+                line = line + val_str;
+            }
+            OptStr::None => {
+                line = line + "-";
+            }
+        }
+        content = content + line + "\n";
+        i = i + 1;
+    }
+    p_file_write(path, content);
+    return true;
+}
+
+// ===========================================================================
+// load_trace -- load a trace from a file (src/debugger.rs:844)
+// ===========================================================================
+
+pub fn load_trace(path: str) -> Vec<TraceEntry> {
+    var content: str = p_file_read(path);
+    if str_len(content) == 0 {
+        return Vec::new();
+    }
+
+    var trace: Vec<TraceEntry> = Vec::new();
+    var lines: Vec<str> = str_lines(content);
+    var i: i64 = 0;
+    while i < lines.len() {
+        var line: str = str_trim(lines.get(i));
+        // Skip comments and empty lines
+        if str_len(line) == 0 { i = i + 1; continue; }
+        if str_byte_at(line, 0) == 35 { i = i + 1; continue; } // '#'
+
+        // Split by whitespace: func_name block_id inst_id source_line [value]
+        var parts: Vec<str> = split_whitespace(line);
+        if parts.len() >= 5 {
+            var func_name: str = parts.get(0);
+            var block_id: i64 = str_to_int(parts.get(1));
+            var inst_id: i64 = str_to_int(parts.get(2));
+            var source_line: i64 = str_to_int(parts.get(3));
+            var val_part: str = parts.get(4);
+
+            var entry: TraceEntry = TraceEntry_new(func_name, block_id, inst_id, source_line);
+            if !str_equal(val_part, "-") {
+                entry.value_repr = OptStr::Some(val_part);
+            }
+            trace.push(entry);
+        }
+        i = i + 1;
+    }
+    return trace;
+}
+
+// ===========================================================================
+// replay_trace -- replay a trace file (src/debugger.rs:871)
+// ===========================================================================
+//
+// In the Rust reference, this is an interactive loop reading from stdin.
+// The self-hosted port does not have stdin reading in library code, so this
+// function prints the trace entries for review. Interactive stepping through
+// a trace requires stdin support which is available in compiler/main.fd's
+// command dispatch.
+
+pub fn replay_trace(path: str) -> i64 {
+    var trace: Vec<TraceEntry> = load_trace(path);
+    if trace.len() == 0 {
+        p_eprint_str("Error loading trace '");
+        p_eprint_str(path);
+        p_eprint_str("' or trace is empty.\n");
+        return 1;
+    }
+
+    p_eprint_str("Replaying trace: ");
+    p_eprint_str(path);
+    p_eprint_str(" (");
+    p_eprint_str(int_to_str(trace.len()));
+    p_eprint_str(" entries)\n\n");
+
+    // Print all entries (non-interactive mode)
+    var idx: i64 = 0;
+    while idx < trace.len() {
+        var entry: TraceEntry = trace.get(idx);
+        var line: str = "  [" + int_to_str(idx + 1) + "/" + int_to_str(trace.len()) + "] "
+            + entry.func_name + " v" + int_to_str(entry.inst_id);
+        match entry.value_repr {
+            OptStr::Some(val_str) => {
+                line = line + " = " + val_str;
+            }
+            OptStr::None => { /* no value */ }
+        }
+        line = line + " (line " + int_to_str(entry.source_line) + ")\n";
+        p_eprint_str(line);
+        idx = idx + 1;
+    }
+
+    p_eprint_str("\nEnd of trace (");
+    p_eprint_str(int_to_str(trace.len()));
+    p_eprint_str(" entries).\n");
+    return 0;
+}
+
+// ===========================================================================
+// Local helpers for trace functions
+// ===========================================================================
+
+/// Split a string by whitespace into a Vec<str>.
+fn split_whitespace(s: str) -> Vec<str> {
+    var result: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    var start: i64 = -1;
+    while i < str_len(s) {
+        var b: i64 = str_byte_at(s, i);
+        var is_space: bool = false;
+        if b == 32 { is_space = true; }      // space
+        if b == 9 { is_space = true; }       // tab
+        if is_space {
+            if start >= 0 {
+                result.push(str_slice(s, start, i));
+                start = -1;
+            }
+        } else {
+            if start < 0 { start = i; }
+        }
+        i = i + 1;
+    }
+    if start >= 0 {
+        result.push(str_slice(s, start, str_len(s)));
+    }
+    return result;
+}

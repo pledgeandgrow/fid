@@ -1,0 +1,330 @@
+// Fides Terrain standard library
+//
+// Heightmap-based terrain with height queries, normal computation,
+// and simple LOD support. Generates terrain from a height function
+// or loads from a grayscale image.
+//
+// Usage:
+//   use terrain;
+//   use math;
+//
+//   var terrain = terrain_create(64, 64, 10.0);  // 64x64 grid, 10m spacing
+//   terrain_generate_sine(&mut terrain);         // fill with sine wave
+//   var h = terrain_height_at(&terrain, 5.0, 3.0);  // query height
+//   var n = terrain_normal_at(&terrain, 5.0, 3.0);  // query normal
+
+module terrain;
+
+use vec;
+use math;
+use mesh;
+
+// ─── Terrain Data ────────────────────────────────────────────────────────
+
+pub struct Terrain {
+    pub width: i64,           // grid width (vertices)
+    pub height: i64,          // grid height (vertices)
+    pub spacing: f64,         // distance between grid points
+    pub heights: Vec<f64>,     // height values (width * height)
+    pub origin_x: f64,         // world offset
+    pub origin_z: f64,
+    pub max_height: f64,
+    pub min_height: f64,
+}
+
+/// Create a terrain grid.
+pub fn terrain_create(width: i64, height: i64, spacing: f64) -> Terrain {
+    var heights = Vec::new();
+    var i = 0;
+    while i < width * height {
+        heights.push(0.0);
+        i = i + 1;
+    }
+    return Terrain {
+        width: width,
+        height: height,
+        spacing: spacing,
+        heights: heights,
+        origin_x: 0.0,
+        origin_z: 0.0,
+        max_height: 0.0,
+        min_height: 0.0,
+    };
+}
+
+/// Set the terrain origin (world-space offset).
+pub fn terrain_set_origin(t: &mut Terrain, x: f64, z: f64) -> void {
+    t.origin_x = x;
+    t.origin_z = z;
+}
+
+/// Set the height at a grid point.
+pub fn terrain_set_height(t: &mut Terrain, gx: i64, gy: i64, h: f64) -> void {
+    if gx < 0 || gx >= t.width || gy < 0 || gy >= t.height { return; }
+    t.heights.set(gy * t.width + gx, h);
+}
+
+/// Get the height at a grid point.
+pub fn terrain_get_height_grid(t: &Terrain, gx: i64, gy: i64) -> f64 {
+    if gx < 0 || gx >= t.width || gy < 0 || gy >= t.height { return 0.0; }
+    return t.heights.get(gy * t.width + gx);
+}
+
+/// Get the height at a world-space (x, z) position using bilinear interpolation.
+pub fn terrain_height_at(t: &Terrain, wx: f64, wz: f64) -> f64 {
+    // Convert to grid coordinates
+    var gx = (wx - t.origin_x) / t.spacing;
+    var gy = (wz - t.origin_z) / t.spacing;
+
+    var ix = gx as i64;
+    var iy = gy as i64;
+    var fx = gx - ix as f64;
+    var fy = gy - iy as f64;
+
+    // Clamp to valid range
+    if ix < 0 { ix = 0; fx = 0.0; }
+    if iy < 0 { iy = 0; fy = 0.0; }
+    if ix >= t.width - 1 { ix = t.width - 2; fx = 1.0; }
+    if iy >= t.height - 1 { iy = t.height - 2; fy = 1.0; }
+
+    // Bilinear interpolation
+    var h00 = terrain_get_height_grid(t, ix, iy);
+    var h10 = terrain_get_height_grid(t, ix + 1, iy);
+    var h01 = terrain_get_height_grid(t, ix, iy + 1);
+    var h11 = terrain_get_height_grid(t, ix + 1, iy + 1);
+
+    var h0 = h00 * (1.0 - fx) + h10 * fx;
+    var h1 = h01 * (1.0 - fx) + h11 * fx;
+    return h0 * (1.0 - fy) + h1 * fy;
+}
+
+/// Compute the normal at a world-space (x, z) position using finite differences.
+pub fn terrain_normal_at(t: &Terrain, wx: f64, wz: f64) -> vec3 {
+    var eps = t.spacing * 0.5;
+    var hL = terrain_height_at(t, wx - eps, wz);
+    var hR = terrain_height_at(t, wx + eps, wz);
+    var hD = terrain_height_at(t, wx, wz - eps);
+    var hU = terrain_height_at(t, wx, wz + eps);
+
+    var nx = hL - hR;
+    var ny = 2.0 * eps;
+    var nz = hD - hU;
+
+    var len = pledge_sqrt(nx * nx + ny * ny + nz * nz);
+    if len > 0.0 {
+        return vec3(nx / len, ny / len, nz / len);
+    }
+    return vec3(0.0, 1.0, 0.0);
+}
+
+/// Generate terrain using a sine wave pattern.
+pub fn terrain_generate_sine(t: &mut Terrain) -> void {
+    var max_h = -999999.0;
+    var min_h = 999999.0;
+
+    var gy = 0;
+    while gy < t.height {
+        var gx = 0;
+        while gx < t.width {
+            var x = ((gx as f64) / (t.width as f64)) * 6.28318;
+            var z = ((gy as f64) / (t.height as f64)) * 6.28318;
+            var h = pledge_sin(x) * pledge_cos(z) * 5.0;
+            terrain_set_height(t, gx, gy, h);
+            if h > max_h { max_h = h; }
+            if h < min_h { min_h = h; }
+            gx = gx + 1;
+        }
+        gy = gy + 1;
+    }
+    t.max_height = max_h;
+    t.min_height = min_h;
+}
+
+/// Generate flat terrain (all zeros).
+pub fn terrain_generate_flat(t: &mut Terrain) -> void {
+    var i = 0;
+    while i < t.width * t.height {
+        t.heights.set(i, 0.0);
+        i = i + 1;
+    }
+    t.max_height = 0.0;
+    t.min_height = 0.0;
+}
+
+/// Generate terrain using a pseudo-random noise function.
+pub fn terrain_generate_noise(t: &mut Terrain, amplitude: f64) -> void {
+    var max_h = -999999.0;
+    var min_h = 999999.0;
+
+    var gy = 0;
+    while gy < t.height {
+        var gx = 0;
+        while gx < t.width {
+            // Simple pseudo-random noise based on position
+            var seed = (gx * 7919 + gy * 6151) % 1000;
+            var h = (seed as f64 / 1000.0 - 0.5) * amplitude;
+            terrain_set_height(t, gx, gy, h);
+            if h > max_h { max_h = h; }
+            if h < min_h { min_h = h; }
+            gx = gx + 1;
+        }
+        gy = gy + 1;
+    }
+    t.max_height = max_h;
+    t.min_height = min_h;
+}
+
+/// Raise a circular area of the terrain.
+pub fn terrain_raise_circle(t: &mut Terrain, cx: f64, cz: f64, radius: f64, amount: f64) -> void {
+    var gx_start = ((cx - radius - t.origin_x) / t.spacing) as i64;
+    var gy_start = ((cz - radius - t.origin_z) / t.spacing) as i64;
+    var gx_end = ((cx + radius - t.origin_x) / t.spacing) as i64;
+    var gy_end = ((cz + radius - t.origin_z) / t.spacing) as i64;
+
+    if gx_start < 0 { gx_start = 0; }
+    if gy_start < 0 { gy_start = 0; }
+    if gx_end >= t.width { gx_end = t.width - 1; }
+    if gy_end >= t.height { gy_end = t.height - 1; }
+
+    var gy = gy_start;
+    while gy <= gy_end {
+        var gx = gx_start;
+        while gx <= gx_end {
+            var wx = t.origin_x + (gx as f64) * t.spacing;
+            var wz = t.origin_z + (gy as f64) * t.spacing;
+            var dx = wx - cx;
+            var dz = wz - cz;
+            var dist = pledge_sqrt(dx * dx + dz * dz);
+            if dist <= radius {
+                var falloff = 1.0 - dist / radius;
+                var h = terrain_get_height_grid(t, gx, gy);
+                terrain_set_height(t, gx, gy, h + amount * falloff);
+            }
+            gx = gx + 1;
+        }
+        gy = gy + 1;
+    }
+}
+
+/// Convert the terrain to a mesh for rendering.
+pub fn terrain_to_mesh(t: &Terrain) -> Mesh {
+    var m = mesh_create();
+
+    // Generate vertices
+    var gy = 0;
+    while gy < t.height {
+        var gx = 0;
+        while gx < t.width {
+            var wx = t.origin_x + (gx as f64) * t.spacing;
+            var wz = t.origin_z + (gy as f64) * t.spacing;
+            var h = terrain_get_height_grid(t, gx, gy);
+            terrain_push_vertex(&mut m, wx, h, wz);
+            gx = gx + 1;
+        }
+        gy = gy + 1;
+    }
+
+    // Generate triangle indices
+    gy = 0;
+    while gy < t.height - 1 {
+        var gx = 0;
+        while gx < t.width - 1 {
+            var i00 = gy * t.width + gx;
+            var i10 = gy * t.width + gx + 1;
+            var i01 = (gy + 1) * t.width + gx;
+            var i11 = (gy + 1) * t.width + gx + 1;
+
+            terrain_push_face(&mut m, i00, i10, i11);
+            terrain_push_face(&mut m, i00, i11, i01);
+            gx = gx + 1;
+        }
+        gy = gy + 1;
+    }
+
+    mesh_compute_normals(&mut m);
+    return m;
+}
+
+/// Helper to push a vertex onto a mesh.
+fn terrain_push_vertex(m: &mut Mesh, x: f64, y: f64, z: f64) -> void {
+    m.vertices.push(vertex_create(x, y, z));
+}
+
+/// Helper to push a face onto a mesh.
+fn terrain_push_face(m: &mut Mesh, v0: i64, v1: i64, v2: i64) -> void {
+    m.faces.push(face_create(v0, v1, v2));
+}
+
+/// Get the total world-space width of the terrain.
+pub fn terrain_world_width(t: &Terrain) -> f64 {
+    return ((t.width - 1) as f64) * t.spacing;
+}
+
+/// Get the total world-space depth of the terrain.
+pub fn terrain_world_depth(t: &Terrain) -> f64 {
+    return ((t.height - 1) as f64) * t.spacing;
+}
+
+/// Get the number of vertices.
+pub fn terrain_vertex_count(t: &Terrain) -> i64 {
+    return t.width * t.height;
+}
+
+/// Get the number of triangles.
+pub fn terrain_triangle_count(t: &Terrain) -> i64 {
+    return (t.width - 1) * (t.height - 1) * 2;
+}
+
+/// Check if a world-space point is within the terrain bounds.
+pub fn terrain_in_bounds(t: &Terrain, wx: f64, wz: f64) -> bool {
+    var min_x = t.origin_x;
+    var max_x = t.origin_x + terrain_world_width(t);
+    var min_z = t.origin_z;
+    var max_z = t.origin_z + terrain_world_depth(t);
+    return wx >= min_x && wx <= max_x && wz >= min_z && wz <= max_z;
+}
+
+/// Smooth the terrain using a simple box filter.
+pub fn terrain_smooth(t: &mut Terrain) -> void {
+    var new_heights = Vec::new();
+    var i = 0;
+    while i < t.width * t.height {
+        new_heights.push(0.0);
+        i = i + 1;
+    }
+
+    var gy = 0;
+    while gy < t.height {
+        var gx = 0;
+        while gx < t.width {
+            var sum = 0.0;
+            var count = 0;
+
+            var dy = -1;
+            while dy <= 1 {
+                var dx = -1;
+                while dx <= 1 {
+                    var nx = gx + dx;
+                    var ny = gy + dy;
+                    if nx >= 0 && nx < t.width && ny >= 0 && ny < t.height {
+                        sum = sum + terrain_get_height_grid(t, nx, ny);
+                        count = count + 1;
+                    }
+                    dx = dx + 1;
+                }
+                dy = dy + 1;
+            }
+
+            new_heights.set(gy * t.width + gx, sum / count as f64);
+            gx = gx + 1;
+        }
+        gy = gy + 1;
+    }
+
+    // Copy back
+    var i = 0;
+    while i < t.width * t.height {
+        t.heights.set(i, new_heights.get(i));
+        i = i + 1;
+    }
+}

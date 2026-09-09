@@ -4,11 +4,14 @@
 > effort. Explains the process, how Fides differs from Rust/C, what limitations
 > to expect, and how to avoid common pitfalls during bootstrap.
 >
-> **Status (Sep 6, 2026 - session 16):** Bootstrap fixpoint achieved.
+> **Status (Sep 9, 2026 - session 20):** Bootstrap fixpoint achieved.
 > `fides-c2.c == fides-c3.c` (SHA256-identical, 701,100 lines).
-> Tier 3 OS features added in session 16: `@cpu_local` (GS segment),
-> inline asm clobbers, `--no-std` bare-metal mode, cross-compilation
-> target dispatch, UEFI boot services bindings (`stdlib/uefi.fd`).
+> 50 compiler modules, 91,924 LOC (12 Rust reference modules ported in
+> session 20: coff, macho, cparser, embedded, tensor, wasm, scribe, veil,
+> hotreload, debugger, native_debugger, gpu). All 50 modules type-check
+> with `release/fides-c3.exe`. PE emitter stubs fixed (map_keys/values/
+> get_or/clone). ELF symbol table dump implemented. `@packed` struct
+> support added.
 
 ## Table of Contents
 
@@ -469,7 +472,7 @@ diff fides-self fides-self-2  # must be identical
 
 ## 9. Files: Rewritten and Remaining
 
-### Rewritten (25 files -- the full compiler, session 15)
+### Rewritten (25 core pipeline files — the full compiler, session 15)
 
 | File | LOC | Status | Test |
 |------|-----|--------|------|
@@ -501,34 +504,71 @@ diff fides-self fides-self-2  # must be identical
 
 **Total: 25 files, 61,145 LOC. Bootstrap fixpoint achieved (session 15).**
 
-### Not Rewritten (not needed for C codegen bootstrap)
+### Session 20 Additions (19 new files, 14,577 LOC)
 
-**Native backends (would eliminate gcc/tcc dependency):**
-- `elf64`, `linker`, `runtime_linux` (Linux ELF64 pipeline)
+**Ported from Rust reference (12 modules):**
 
-**Binary format emitters:**
-- `coff`, `macho` (PE is ported as `pe.fd`)
+| File | LOC | Source | Status |
+|------|-----|--------|--------|
+| `coff.fd` | 497 | `src/coff.rs` | Type check OK, C codegen OK |
+| `macho.fd` | 483 | `src/macho.rs` | Type check OK, C codegen OK |
+| `cparser.fd` | 523 | `src/cparser.rs` | Type check OK, C codegen OK |
+| `embedded.fd` | 511 | `src/embedded.rs` | Type check OK, C codegen OK |
+| `tensor.fd` | 755 | `src/tensor.rs` | Type check OK, C codegen OK |
+| `wasm.fd` | 1655 | `src/wasm.rs` | Type check OK, C codegen segfault |
+| `scribe.fd` | 999 | `src/scribe.rs` | Type check OK, C codegen OK |
+| `veil.fd` | 527 | `src/veil.rs` | Type check OK, C codegen segfault |
+| `hotreload.fd` | 635 | `src/hotreload.rs` | Type check OK, C codegen segfault |
+| `debugger.fd` | 977 | `src/debugger.rs` | Type check OK, C codegen segfault |
+| `native_debugger.fd` | 544 | `src/native_debugger.rs` | Type check OK, C codegen segfault |
+| `gpu.fd` | 826 | `src/gpu.rs` | Type check OK, C codegen segfault |
 
-**Other architecture backends:**
-- `codegen_arm64`, `codegen_riscv`, `runtime_arm64`, `runtime_riscv`,
-  `arm64_enc`, `riscv_enc`, `x86`
+**Cross-compilation backends (7 modules, user-created):**
 
-**Interpreter:**
-- `interp` (~4400 LOC -- the reference oracle)
+| File | LOC | Status |
+|------|-----|--------|
+| `codegen_arm64.fd` | 557 | Type check OK, C codegen OK |
+| `codegen_riscv.fd` | 554 | Type check OK, C codegen OK |
+| `runtime_arm64.fd` | 794 | Type check OK, C codegen OK |
+| `runtime_riscv.fd` | 825 | Type check OK, C codegen OK |
+| `arm64_enc.fd` | 1664 | Type check OK, C codegen OK |
+| `riscv_enc.fd` | 1210 | Type check OK, C codegen OK |
+| `autograd.fd` | 41 | Type check OK |
 
-**Other backends:**
-- `wasm`, `gpu`, `codegen` (dispatch)
+**Total: 50 modules, 91,924 LOC (session 20).**
 
-**Runtime libraries:**
-- `tensor`, `autograd`
+### Previously "Not Rewritten" — Now Ported (Session 20)
+
+The following files were listed as "not rewritten" in session 15.
+They are now ported (session 20):
+
+- ✅ `coff` — COFF object file format
+- ✅ `macho` — Mach-O object file format
+- ✅ `wasm` — WASM backend
+- ✅ `gpu` — SPIR-V/PTX GPU codegen
+- ✅ `codegen` — dispatch (was already present)
+- ✅ `tensor` — tensor runtime library
+- ✅ `interp` — interpreter (~4400 LOC, was already ported)
+- ✅ `codegen_arm64`, `codegen_riscv` — cross-compilation backends
+- ✅ `runtime_arm64`, `runtime_riscv` — cross-compilation runtimes
+- ✅ `arm64_enc`, `riscv_enc` — assemblers
+
+**Still not ported (not needed for C codegen bootstrap):**
+- `x86` — x86 assembler (not needed; `codegen_x64.fd` handles x86-64)
+- `autograd` — autograd tape (41-line stub)
 
 ### Post-Fixpoint Priority
 
-1. **Mirror `var` feature to `compiler/*.fd`** -- Rust supports module-level `var`/`pub var`
-2. **Integrate Linux native codegen** -- `peephole.fd` + `regalloc.fd` + `codegen_x64.fd` are ported, need `elf64`/`linker`/`runtime_linux`
-3. **Close Rust vs self-hosted parity gap** -- c1=706K vs c2=701K lines (~5K difference)
-4. **Gate debug prints** -- 287 `p_eprint_str` calls (cleanup, doesn't affect fixpoint)
-5. **PE emitter full compiler support** -- struct/enum, floats, many-arg calls
+1. **Fix C codegen segfault on complex modules** — 6 modules (wasm, veil,
+   hotreload, debugger, native_debugger, gpu) type-check but crash during
+   C code generation. This is a self-hosted compiler bug, not a source error.
+2. **Port remaining PE emitter stubs** — 9 `p_string_*` functions still
+   return wrong values (see CB6 in roadmap-issues.md)
+3. **Wire interpreter debug hook** — `Interpreter_set_debug_hook` is a no-op;
+   needed for veil coverage and debugger stepping
+4. **Close Rust vs self-hosted parity gap** — c1=706K vs c2=701K lines (~5K difference)
+5. **Gate debug prints** — 287 `p_eprint_str` calls (cleanup, doesn't affect fixpoint)
+6. **PE emitter full compiler support** — struct/enum, floats, many-arg calls
 
 ---
 

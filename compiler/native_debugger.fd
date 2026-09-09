@@ -1,0 +1,544 @@
+// native_debugger.fd -- Native code debugger (ptrace-based, Linux only)
+// Ported from src/native_debugger.rs.
+//
+// Compiles Fides source to a native binary (via C codegen + gcc), then runs
+// it under ptrace with breakpoint injection. Provides source-level debugging
+// of native Fides binaries on Linux.
+//
+// Breakpoints are implemented by patching the binary with `int3` (0xCC)
+// instructions and catching SIGTRAP via ptrace.
+//
+// LIMITATION: The self-hosted Fides compiler does not have direct access to
+// the `ptrace`/`fork`/`waitpid` syscalls or the libc bindings required for
+// native process control. This module provides the structural state, command
+// parsing, and register layout. The actual ptrace loop is dispatched through
+// compiler/main.fd, which shells out to gcc and uses p_process_* primitives
+// where available. On platforms without ptrace, the debugger prints an error
+// and exits.
+
+module compiler::native_debugger;
+
+use core;
+use vec;
+use string;
+use compiler::compiler;
+
+// --- Register set (x86-64) ---
+
+pub struct Regs {
+    pub rax: i64,
+    pub rbx: i64,
+    pub rcx: i64,
+    pub rdx: i64,
+    pub rsi: i64,
+    pub rdi: i64,
+    pub rsp: i64,
+    pub rbp: i64,
+    pub rip: i64,
+    pub r8: i64,
+    pub r9: i64,
+    pub r10: i64,
+    pub r11: i64,
+    pub r12: i64,
+    pub r13: i64,
+    pub r14: i64,
+    pub r15: i64,
+}
+
+pub fn Regs_new() -> Regs {
+    return Regs {
+        rax: 0, rbx: 0, rcx: 0, rdx: 0,
+        rsi: 0, rdi: 0, rsp: 0, rbp: 0,
+        rip: 0, r8: 0, r9: 0, r10: 0,
+        r11: 0, r12: 0, r13: 0, r14: 0,
+        r15: 0,
+    };
+}
+
+// --- Full ptrace register set (user_regs_struct from <sys/user.h>) ---
+// This is the raw x86-64 register layout returned by PTRACE_GETREGS.
+// Ported from src/native_debugger.rs:267 (UserRegs struct).
+
+pub struct UserRegs {
+    pub r15: i64,
+    pub r14: i64,
+    pub r13: i64,
+    pub r12: i64,
+    pub rbp: i64,
+    pub rbx: i64,
+    pub r11: i64,
+    pub r10: i64,
+    pub r9: i64,
+    pub r8: i64,
+    pub rax: i64,
+    pub rcx: i64,
+    pub rdx: i64,
+    pub rsi: i64,
+    pub rdi: i64,
+    pub orig_rax: i64,
+    pub rip: i64,
+    pub cs: i64,
+    pub eflags: i64,
+    pub rsp: i64,
+    pub ss: i64,
+    pub fs_base: i64,
+    pub gs_base: i64,
+    pub ds: i64,
+    pub es: i64,
+    pub fs: i64,
+    pub gs: i64,
+}
+
+pub fn UserRegs_new() -> UserRegs {
+    return UserRegs {
+        r15: 0, r14: 0, r13: 0, r12: 0,
+        rbp: 0, rbx: 0, r11: 0, r10: 0,
+        r9: 0, r8: 0, rax: 0, rcx: 0,
+        rdx: 0, rsi: 0, rdi: 0, orig_rax: 0,
+        rip: 0, cs: 0, eflags: 0, rsp: 0,
+        ss: 0, fs_base: 0, gs_base: 0,
+        ds: 0, es: 0, fs: 0, gs: 0,
+    };
+}
+
+/// Convert a UserRegs (full ptrace layout) to the compact Regs struct.
+pub fn UserRegs_to_regs(ur: UserRegs) -> Regs {
+    return Regs {
+        rax: ur.rax, rbx: ur.rbx, rcx: ur.rcx, rdx: ur.rdx,
+        rsi: ur.rsi, rdi: ur.rdi, rsp: ur.rsp, rbp: ur.rbp,
+        rip: ur.rip, r8: ur.r8, r9: ur.r9, r10: ur.r10,
+        r11: ur.r11, r12: ur.r12, r13: ur.r13, r14: ur.r14,
+        r15: ur.r15,
+    };
+}
+
+// --- Breakpoint ---
+
+pub struct NativeBreakpoint {
+    pub func_name: str,
+    pub line: i64,        // -1 means no specific line
+    pub address: i64,     // address in binary (0 = not yet resolved)
+}
+
+pub fn NativeBreakpoint_new(func_name: str, line: i64, address: i64) -> NativeBreakpoint {
+    return NativeBreakpoint {
+        func_name: func_name,
+        line: line,
+        address: address,
+    };
+}
+
+// --- Native debugger state ---
+
+pub struct NativeDebugger {
+    pub binary_path: str,
+    pub source_path: str,
+    pub source_lines: Vec<str>,
+    pub breakpoints: Vec<NativeBreakpoint>,
+}
+
+pub fn NativeDebugger_new(source_path: str) -> NativeDebugger {
+    return NativeDebugger {
+        binary_path: "",
+        source_path: source_path,
+        source_lines: Vec::new(),
+        breakpoints: Vec::new(),
+    };
+}
+
+// --- Compile the Fides source to a native binary via C codegen ---
+//
+// This step is dispatched through compiler/main.fd which has access to
+// ccompile_source_with_path + p_process_run (gcc). The native_debugger
+// module itself only tracks state.
+
+/// Set the source lines from the source file content.
+pub fn NativeDebugger_set_source(self: &mut NativeDebugger, source: str) -> void {
+    self.source_lines = str_lines(source);
+}
+
+/// Set the binary path after compilation.
+pub fn NativeDebugger_set_binary(self: &mut NativeDebugger, path: str) -> void {
+    self.binary_path = path;
+}
+
+// --- Breakpoint management ---
+
+/// Add a breakpoint. Returns the new breakpoint index.
+pub fn NativeDebugger_add_breakpoint(self: &mut NativeDebugger, func_name: str, line: i64) -> i64 {
+    var idx: i64 = self.breakpoints.len();
+    self.breakpoints.push(NativeBreakpoint_new(func_name, line, 0));
+    return idx;
+}
+
+/// Parse a breakpoint spec: "func", "func:42", "42" (line in any function)
+pub fn NativeDebugger_parse_bp_spec(spec: str) -> (str, i64) {
+    var colon_pos: i64 = str_find_char(spec, ":");
+    if colon_pos >= 0 {
+        var func: str = str_slice(spec, 0, colon_pos);
+        var line_str: str = str_slice(spec, colon_pos + 1, str_len(spec));
+        var line: i64 = str_to_int(line_str);
+        return (func, line);
+    }
+    var n: i64 = str_to_int(spec);
+    if n > 0 {
+        return ("main", n);
+    }
+    return (spec, -1);
+}
+
+/// List all breakpoints as a formatted string.
+pub fn NativeDebugger_list_breakpoints(self: &NativeDebugger) -> str {
+    if self.breakpoints.len() == 0 {
+        return "No breakpoints set.";
+    }
+    var result: str = "";
+    var i: i64 = 0;
+    while i < self.breakpoints.len() {
+        var bp: NativeBreakpoint = self.breakpoints.get(i);
+        var line_str: str = "";
+        if bp.line >= 0 { line_str = ":" + int_to_str(bp.line); } else { line_str = ""; }
+        var addr_str: str = "";
+        if bp.address != 0 { addr_str = " @ 0x" + int_to_hex(bp.address); } else { addr_str = " (unresolved)"; }
+        result = result + "  #" + int_to_str(i) + " " + bp.func_name + line_str + addr_str + "\n";
+        i = i + 1;
+    }
+    return result;
+}
+
+// --- Register formatting ---
+
+/// Format registers as a multi-line string.
+pub fn format_regs(r: Regs) -> str {
+    return "  RAX=0x" + int_to_hex(r.rax) + "  RBX=0x" + int_to_hex(r.rbx)
+        + "  RCX=0x" + int_to_hex(r.rcx) + "\n"
+        + "  RDX=0x" + int_to_hex(r.rdx) + "  RSI=0x" + int_to_hex(r.rsi)
+        + "  RDI=0x" + int_to_hex(r.rdi) + "\n"
+        + "  RSP=0x" + int_to_hex(r.rsp) + "  RBP=0x" + int_to_hex(r.rbp)
+        + "  RIP=0x" + int_to_hex(r.rip) + "\n"
+        + "  R8 =0x" + int_to_hex(r.r8) + "  R9 =0x" + int_to_hex(r.r9)
+        + "  R10=0x" + int_to_hex(r.r10) + "\n"
+        + "  R11=0x" + int_to_hex(r.r11) + "  R12=0x" + int_to_hex(r.r12)
+        + "  R13=0x" + int_to_hex(r.r13) + "\n"
+        + "  R14=0x" + int_to_hex(r.r14) + "  R15=0x" + int_to_hex(r.r15) + "\n";
+}
+
+// --- Help text ---
+
+pub fn print_native_help() -> str {
+    return "Native Debugger Commands:\n"
+        + "  run          Run until breakpoint or program end\n"
+        + "  step         Single-step one machine instruction\n"
+        + "  continue     Continue execution\n"
+        + "  regs         Show CPU registers\n"
+        + "  break <spec> Set a breakpoint (func or func:line)\n"
+        + "  info break   List breakpoints\n"
+        + "  quit         Exit debugger\n"
+        + "  (Note: breakpoint injection requires symbol table parsing)\n";
+}
+
+// --- Command parsing ---
+
+/// Parse a command line into (cmd, arg).
+pub fn parse_command(line: str) -> (str, str) {
+    var trimmed: str = str_trim(line);
+    var space_pos: i64 = str_find_char(trimmed, " ");
+    if space_pos < 0 {
+        return (trimmed, "");
+    }
+    var cmd: str = str_slice(trimmed, 0, space_pos);
+    var arg: str = str_trim(str_slice(trimmed, space_pos + 1, str_len(trimmed)));
+    return (cmd, arg);
+}
+
+// --- Local helpers ---
+
+fn int_to_hex(n: i64) -> str {
+    if n == 0 { return "0"; }
+    var num: i64 = n;
+    var buf: str = "";
+    while num > 0 {
+        var digit: i64 = num & 0xF;
+        if digit < 10 {
+            buf = char_from_digit(digit) + buf;
+        } else {
+            buf = hex_char(digit) + buf;
+        }
+        num = num >> 4;
+    }
+    return buf;
+}
+
+pub fn hex_char(d: i64) -> str {
+    var buf: Vec<i64> = Vec::new();
+    buf.push(65 + d - 10);
+    return str_from_bytes(buf);
+}
+
+pub fn char_from_digit(d: i64) -> str {
+    var buf: Vec<i64> = Vec::new();
+    buf.push(48 + d);
+    return str_from_bytes(buf);
+}
+
+fn str_to_int(s: str) -> i64 {
+    var result: i64 = 0;
+    var i: i64 = 0;
+    var negative: bool = false;
+    if str_len(s) == 0 { return -1; }
+    var first: i64 = str_byte_at(s, 0);
+    if first == 45 { // '-'
+        negative = true;
+        i = 1;
+    }
+    while i < str_len(s) {
+        var b: i64 = str_byte_at(s, i);
+        if b < 48 || b > 57 { return -1; }
+        result = result * 10 + (b - 48);
+        i = i + 1;
+    }
+    if negative { return -result; }
+    return result;
+}
+
+fn str_lines(s: str) -> Vec<str> {
+    var result: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    var start: i64 = 0;
+    while i < str_len(s) {
+        var b: i64 = str_byte_at(s, i);
+        if b == 10 {
+            result.push(str_slice(s, start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < str_len(s) {
+        result.push(str_slice(s, start, str_len(s)));
+    }
+    return result;
+}
+
+fn str_find_char(s: str, ch: i64) -> i64 {
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if str_byte_at(s, i) == ch { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ===========================================================================
+// compile_to_native — Compile Fides source to a native binary via C codegen
+// Reference: src/native_debugger.rs:45
+// ===========================================================================
+//
+// Steps:
+//   1. Read the source file
+//   2. Generate C code via ccompile_source_with_path
+//   3. Write C code to a temp .c file
+//   4. Invoke gcc -g -O0 to produce a native binary
+//   5. Set self.binary_path
+//
+// Returns an error string (empty = success, non-empty = error message).
+
+pub fn NativeDebugger_compile_to_native(self: &mut NativeDebugger) -> str {
+    // Read the source file
+    var source: str = c_file_read(self.source_path);
+    if str_len(source) == 0 {
+        return "Error reading '" + self.source_path + "'";
+    }
+
+    // Store source lines for later display
+    self.source_lines = str_lines(source);
+
+    // Generate C code
+    var result: ResultStr = ccompile_source_with_path(source, self.source_path);
+    var c_code: str = "";
+    var got_code: bool = false;
+    match result {
+        ResultStr::Ok(code) => {
+            c_code = code;
+            got_code = true;
+        }
+        ResultStr::Err(errs) => {
+            var msg: str = "Compilation failed:";
+            var ei: i64 = 0;
+            while ei < errs.len() {
+                msg = msg + "\n" + errs.get(ei);
+                ei = ei + 1;
+            }
+            return msg;
+        }
+    }
+    if !got_code {
+        return "Compilation failed: no code generated";
+    }
+
+    // Write C code to temp file
+    var c_path: str = self.source_path + ".c";
+    p_file_write(c_path, c_code);
+
+    // Compile with gcc -g (debug info) -O0 (no optimization for debugging)
+    self.binary_path = self.source_path + ".bin";
+    var cc_cmd: str = "gcc -g -O0 -o " + self.binary_path + " " + c_path + " -lm";
+    var ret: i64 = p_system(cc_cmd);
+    if ret != 0 {
+        return "gcc failed (exit code " + int_to_str(ret) + ")";
+    }
+
+    return "";
+}
+
+// ===========================================================================
+// run — Main entry point for the native debugger
+// Reference: src/native_debugger.rs:76
+// ===========================================================================
+//
+// Compiles the source to a native binary, then runs it under ptrace.
+// Returns 0 on success, 1 on error.
+
+pub fn NativeDebugger_run(self: &mut NativeDebugger) -> i64 {
+    print("Fides Native Debugger -- fidesc native-debug ");
+    print(self.source_path);
+    print("\n");
+    print("Compiling to native binary...\n");
+
+    var err: str = NativeDebugger_compile_to_native(self);
+    if str_len(err) > 0 {
+        p_eprint_str(err);
+        p_eprint_str("\n");
+        return 1;
+    }
+
+    print("Binary: ");
+    print(self.binary_path);
+    print("\n");
+    print("Type 'help' for commands, 'run' to start execution.\n\n");
+
+    // Check if ptrace is available (Linux only).
+    // The self-hosted Fides runtime does not yet expose ptrace/fork/waitpid
+    // syscalls. The structural command dispatch is implemented in
+    // run_ptrace, but actual process control requires OS API support.
+    return NativeDebugger_run_ptrace(self);
+}
+
+// ===========================================================================
+// run_ptrace — ptrace-based debugging loop
+// Reference: src/native_debugger.rs:103
+// ===========================================================================
+//
+// LIMITATION: The self-hosted Fides compiler runtime does not yet expose
+// the ptrace, fork, waitpid, or kill syscalls needed for native process
+// control. The Rust implementation (src/native_debugger.rs) uses libc's
+// fork/ptrace/waitpid to trace a child process.
+//
+// This function implements the structural command dispatch loop (parsing
+// commands, formatting output, managing breakpoints) but cannot actually
+// control a child process. When ptrace/fork/waitpid become available as
+// Fides runtime builtins, this function can be completed.
+//
+// Returns 0 on success, 1 on error/limitation.
+
+pub fn NativeDebugger_run_ptrace(self: &mut NativeDebugger) -> i64 {
+    // ptrace/fork/waitpid are not available in the Fides runtime.
+    // We implement the command loop structure for documentation and
+    // future completion, but cannot trace a real process.
+    p_eprint_str("Native debugging requires ptrace/fork/waitpid syscalls\n");
+    p_eprint_str("which are not yet available in the Fides runtime.\n");
+    p_eprint_str("Use 'fidesc debug' for interpreter-level debugging instead.\n");
+
+    // Structural command dispatch loop (for future completion).
+    // Reads commands from stdin and dispatches them, but since no child
+    // process is running, most commands print a limitation notice.
+    var running: bool = true;
+    while running {
+        print("(fidesc:native) > ");
+        var line: str = p_read_line();
+        if str_len(line) == 0 {
+            if p_stdin_eof() != 0 {
+                break;
+            }
+        }
+        var (cmd, arg) = parse_command(line);
+
+        if str_equal(cmd, "help") || str_equal(cmd, "h") || str_equal(cmd, "?") {
+            print(print_native_help());
+        } else {
+            if str_equal(cmd, "run") || str_equal(cmd, "continue") || str_equal(cmd, "c") {
+                print("ptrace not available -- cannot continue child process\n");
+            } else {
+                if str_equal(cmd, "step") || str_equal(cmd, "s") {
+                    print("ptrace not available -- cannot single-step\n");
+                } else {
+                    if str_equal(cmd, "regs") {
+                        print("ptrace not available -- cannot read registers\n");
+                    } else {
+                        if str_equal(cmd, "break") || str_equal(cmd, "b") {
+                            if str_len(arg) > 0 {
+                                var (func, line_num) = NativeDebugger_parse_bp_spec(arg);
+                                NativeDebugger_add_breakpoint(self, func, line_num);
+                                print("Breakpoint set (will be resolved when ptrace is available)\n");
+                            } else {
+                                print("Usage: break <func>[:<line>]\n");
+                            }
+                        } else {
+                            if str_equal(cmd, "info") {
+                                if str_equal(arg, "break") || str_equal(arg, "breakpoints") {
+                                    print(NativeDebugger_list_breakpoints(self));
+                                } else {
+                                    print("Usage: info break\n");
+                                }
+                            } else {
+                                if str_equal(cmd, "quit") || str_equal(cmd, "q") || str_equal(cmd, "exit") {
+                                    running = false;
+                                } else {
+                                    if str_len(cmd) == 0 {
+                                        // Empty line -- repeat last command (step in Rust)
+                                        print("ptrace not available -- cannot single-step\n");
+                                    } else {
+                                        print("Unknown command: '");
+                                        print(cmd);
+                                        print("'. Type 'help' for commands.\n");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Clean up temp files (best effort)
+    if str_len(self.binary_path) > 0 {
+        p_file_remove(self.binary_path);
+    }
+    p_file_remove(self.source_path + ".c");
+
+    return 1;
+}
+
+// ===========================================================================
+// get_regs — Read registers via ptrace(PTRACE_GETREGS)
+// Reference: src/native_debugger.rs:265
+// ===========================================================================
+//
+// LIMITATION: ptrace(PTRACE_GETREGS) is not available in the Fides runtime.
+// The Rust implementation reads the full user_regs_struct via ptrace and
+// converts it to the compact Regs struct.
+//
+// This function returns a Regs with all zeros, indicating that registers
+// could not be read. When ptrace becomes available, this should call
+// ptrace(PTRACE_GETREGS, pid, 0, &regs) and convert via UserRegs_to_regs.
+
+pub fn NativeDebugger_get_regs(self: &NativeDebugger, pid: i64) -> Regs {
+    // ptrace(PTRACE_GETREGS) is not available in the Fides runtime.
+    // Return zeroed registers to indicate failure.
+    // When ptrace is available, this should:
+    //   1. Allocate a UserRegs struct
+    //   2. Call ptrace(PTRACE_GETREGS, pid, 0, &user_regs)
+    //   3. If result < 0, return Regs_new() (failure)
+    //   4. Return UserRegs_to_regs(user_regs)
+    return Regs_new();
+}

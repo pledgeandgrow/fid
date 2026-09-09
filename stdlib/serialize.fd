@@ -1,0 +1,353 @@
+// Fides Serialization standard library
+//
+// Binary save/load and JSON scene serialization.
+// Provides a byte buffer with read/write primitives for binary data,
+// and a JSON reader/writer for scene files.
+//
+// Usage (binary):
+//   use serialize;
+//   var w = serialize_writer_create();
+//   serialize_write_i32(&mut w, 42);
+//   serialize_write_f64(&mut w, 3.14);
+//   serialize_write_str(&mut w, "hello");
+//   serialize_save(&w, "save.dat");
+//
+//   var r = serialize_load("save.dat");
+//   var n = serialize_read_i32(&r);
+//   var f = serialize_read_f64(&r);
+//   var s = serialize_read_str(&r);
+//
+// Usage (JSON):
+//   use serialize;
+//   var json = json_writer_create();
+//   json_object_begin(&mut json);
+//   json_key(&mut json, "name"); json_string(&mut json, "Player");
+//   json_key(&mut json, "x"); json_number(&mut json, 100.0);
+//   json_object_end(&mut json);
+//   var result = json_result(&json);  // {"name":"Player","x":100.0}
+
+module serialize;
+
+use vec;
+use string;
+
+// ─── Binary Writer ───────────────────────────────────────────────────────
+
+pub struct SerializeWriter {
+    pub data: Vec<i64>,
+}
+
+pub fn serialize_writer_create() -> SerializeWriter {
+    return SerializeWriter { data: Vec::new() };
+}
+
+pub fn serialize_write_u8(w: &mut SerializeWriter, val: i64) -> void {
+    w.data.push(val & 0xFF);
+}
+
+pub fn serialize_write_u16(w: &mut SerializeWriter, val: i64) -> void {
+    w.data.push((val >> 8) & 0xFF);
+    w.data.push(val & 0xFF);
+}
+
+pub fn serialize_write_i32(w: &mut SerializeWriter, val: i64) -> void {
+    w.data.push((val >> 24) & 0xFF);
+    w.data.push((val >> 16) & 0xFF);
+    w.data.push((val >> 8) & 0xFF);
+    w.data.push(val & 0xFF);
+}
+
+pub fn serialize_write_f64(w: &mut SerializeWriter, val: f64) -> void {
+    // Write as 8 bytes (big-endian) using bit representation
+    var bits = pledge_f64_to_bits(val);
+    var i = 0;
+    while i < 8 {
+        w.data.push((bits >> ((7 - i) * 8)) & 0xFF);
+        i = i + 1;
+    }
+}
+
+pub fn serialize_write_bool(w: &mut SerializeWriter, val: bool) -> void {
+    if val { w.data.push(1); } else { w.data.push(0); }
+}
+
+pub fn serialize_write_str(w: &mut SerializeWriter, val: str) -> void {
+    var len = str_len(val);
+    serialize_write_i32(w, len);
+    var i = 0;
+    while i < len {
+        w.data.push(str_byte_at(val, i));
+        i = i + 1;
+    }
+}
+
+pub fn serialize_write_bytes(w: &mut SerializeWriter, data: Vec<i64>) -> void {
+    serialize_write_i32(w, data.len());
+    var i = 0;
+    while i < data.len() {
+        w.data.push(data.get(i));
+        i = i + 1;
+    }
+}
+
+/// Save the writer's data to a file.
+pub fn serialize_save(w: &SerializeWriter, path: str) -> bool {
+    var result = pledge_serialize_save(path, w.data.len(), 0);
+    return result == 0;
+}
+
+/// Get the raw bytes.
+pub fn serialize_data(w: &SerializeWriter) -> Vec<i64> {
+    return w.data;
+}
+
+/// Get the size in bytes.
+pub fn serialize_size(w: &SerializeWriter) -> i64 {
+    return w.data.len();
+}
+
+// ─── Binary Reader ───────────────────────────────────────────────────────
+
+pub struct SerializeReader {
+    pub data: Vec<i64>,
+    pub pos: i64,
+}
+
+pub fn serialize_reader_create(data: Vec<i64>) -> SerializeReader {
+    return SerializeReader { data: data, pos: 0 };
+}
+
+/// Load a file into a reader.
+pub fn serialize_load(path: str) -> SerializeReader {
+    var data = Vec::new();
+    var size = pledge_serialize_load(path, 0, 0);
+    if size <= 0 {
+        return SerializeReader { data: data, pos: 0 };
+    }
+    var i = 0;
+    while i < size {
+        data.push(0);
+        i = i + 1;
+    }
+    pledge_serialize_load(path, 0, 0);  // native fills data
+    return SerializeReader { data: data, pos: 0 };
+}
+
+pub fn serialize_read_u8(r: &mut SerializeReader) -> i64 {
+    if r.pos >= r.data.len() { return 0; }
+    var val = r.data.get(r.pos) & 0xFF;
+    r.pos = r.pos + 1;
+    return val;
+}
+
+pub fn serialize_read_u16(r: &mut SerializeReader) -> i64 {
+    var hi = serialize_read_u8(r);
+    var lo = serialize_read_u8(r);
+    return (hi << 8) | lo;
+}
+
+pub fn serialize_read_i32(r: &mut SerializeReader) -> i64 {
+    var b0 = serialize_read_u8(r);
+    var b1 = serialize_read_u8(r);
+    var b2 = serialize_read_u8(r);
+    var b3 = serialize_read_u8(r);
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+}
+
+pub fn serialize_read_f64(r: &mut SerializeReader) -> f64 {
+    var bits = 0;
+    var i = 0;
+    while i < 8 {
+        bits = (bits << 8) | serialize_read_u8(r);
+        i = i + 1;
+    }
+    return pledge_bits_to_f64(bits);
+}
+
+pub fn serialize_read_bool(r: &mut SerializeReader) -> bool {
+    return serialize_read_u8(r) != 0;
+}
+
+pub fn serialize_read_str(r: &mut SerializeReader) -> str {
+    var len = serialize_read_i32(r);
+    if len <= 0 { return ""; }
+    var result = "";
+    var i = 0;
+    while i < len {
+        var b = serialize_read_u8(r);
+        result = result + pledge_char_to_str(b);
+        i = i + 1;
+    }
+    return result;
+}
+
+pub fn serialize_read_bytes(r: &mut SerializeReader) -> Vec<i64> {
+    var len = serialize_read_i32(r);
+    var data = Vec::new();
+    var i = 0;
+    while i < len {
+        data.push(serialize_read_u8(r));
+        i = i + 1;
+    }
+    return data;
+}
+
+pub fn serialize_reader_remaining(r: &SerializeReader) -> i64 {
+    return r.data.len() - r.pos;
+}
+
+pub fn serialize_reader_eof(r: &SerializeReader) -> bool {
+    return r.pos >= r.data.len();
+}
+
+pub fn serialize_reader_reset(r: &mut SerializeReader) -> void {
+    r.pos = 0;
+}
+
+// ─── JSON Writer ─────────────────────────────────────────────────────────
+
+pub struct JsonWriter {
+    pub buf: str,
+    pub indent: i64,
+    pub pretty: bool,
+}
+
+pub fn json_writer_create() -> JsonWriter {
+    return JsonWriter { buf: "", indent: 0, pretty: false };
+}
+
+pub fn json_writer_pretty() -> JsonWriter {
+    return JsonWriter { buf: "", indent: 0, pretty: true };
+}
+
+fn json_indent(w: &JsonWriter) -> str {
+    var result = "";
+    var i = 0;
+    while i < w.indent {
+        result = result + "  ";
+        i = i + 1;
+    }
+    return result;
+}
+
+fn json_newline(w: &JsonWriter) -> str {
+    if w.pretty { return "\n" + json_indent(w); }
+    return "";
+}
+
+pub fn json_object_begin(w: &mut JsonWriter) -> void {
+    w.buf = w.buf + "{" + json_newline(w);
+    w.indent = w.indent + 1;
+}
+
+pub fn json_object_end(w: &mut JsonWriter) -> void {
+    w.indent = w.indent - 1;
+    w.buf = w.buf + json_newline(w) + "}";
+}
+
+pub fn json_array_begin(w: &mut JsonWriter) -> void {
+    w.buf = w.buf + "[" + json_newline(w);
+    w.indent = w.indent + 1;
+}
+
+pub fn json_array_end(w: &mut JsonWriter) -> void {
+    w.indent = w.indent - 1;
+    w.buf = w.buf + json_newline(w) + "]";
+}
+
+pub fn json_key(w: &mut JsonWriter, key: str) -> void {
+    w.buf = w.buf + json_newline(w) + "\"" + key + "\":";
+    if w.pretty { w.buf = w.buf + " "; }
+}
+
+pub fn json_string(w: &mut JsonWriter, val: str) -> void {
+    w.buf = w.buf + "\"" + val + "\"";
+}
+
+pub fn json_number(w: &mut JsonWriter, val: f64) -> void {
+    w.buf = w.buf + float_to_str(val);
+}
+
+pub fn json_int(w: &mut JsonWriter, val: i64) -> void {
+    w.buf = w.buf + int_to_str(val);
+}
+
+pub fn json_bool(w: &mut JsonWriter, val: bool) -> void {
+    if val { w.buf = w.buf + "true"; } else { w.buf = w.buf + "false"; }
+}
+
+pub fn json_null(w: &mut JsonWriter) -> void {
+    w.buf = w.buf + "null";
+}
+
+pub fn json_comma(w: &mut JsonWriter) -> void {
+    w.buf = w.buf + ",";
+}
+
+pub fn json_result(w: &JsonWriter) -> str {
+    return w.buf;
+}
+
+/// Save JSON to a file.
+pub fn json_save(w: &JsonWriter, path: str) -> bool {
+    return p_file_write(path, w.buf);
+}
+
+// ─── JSON Reader (simplified) ───────────────────────────────────────────
+//
+// A minimal JSON parser that extracts values by key.
+// Not a full DOM parser — optimized for game config files.
+
+pub struct JsonValue {
+    pub kind: i64,     // 0=null, 1=bool, 2=int, 3=float, 4=string, 5=array, 6=object
+    pub bool_val: bool,
+    pub int_val: i64,
+    pub float_val: f64,
+    pub str_val: str,
+}
+
+pub fn json_parse_int(source: str, key: str) -> i64 {
+    var search = "\"" + key + "\":";
+    var idx = str_find(source, search);
+    if idx < 0 { return 0; }
+    var rest = str_slice(source, idx + str_len(search), str_len(source));
+    return str_parse_int(str_trim_start(rest));
+}
+
+pub fn json_parse_float(source: str, key: str) -> f64 {
+    var search = "\"" + key + "\":";
+    var idx = str_find(source, search);
+    if idx < 0 { return 0.0; }
+    var rest = str_slice(source, idx + str_len(search), str_len(source));
+    return str_parse_float(str_trim_start(rest));
+}
+
+pub fn json_parse_string(source: str, key: str) -> str {
+    var search = "\"" + key + "\":\"";
+    var idx = str_find(source, search);
+    if idx < 0 { return ""; }
+    var start = idx + str_len(search);
+    var end = str_find(str_slice(source, start, str_len(source)), "\"");
+    if end < 0 { return ""; }
+    return str_slice(source, start, start + end);
+}
+
+pub fn json_parse_bool(source: str, key: str) -> bool {
+    var search = "\"" + key + "\":";
+    var idx = str_find(source, search);
+    if idx < 0 { return false; }
+    var rest = str_slice(source, idx + str_len(search), str_len(source));
+    var trimmed = str_trim_start(rest);
+    if str_starts_with(trimmed, "true") { return true; }
+    return false;
+}
+
+// ─── Native Helpers ──────────────────────────────────────────────────────
+
+extern "C" include "pledge_serialize.h" link "" {
+    fn pledge_f64_to_bits(val: f64) -> i64;
+    fn pledge_bits_to_f64(bits: i64) -> f64;
+    fn pledge_char_to_str(ch: i64) -> str;
+    fn pledge_serialize_save(path: str, len: i64, data: i64) -> i64;
+    fn pledge_serialize_load(path: str, data: i64, max_size: i64) -> i64;
+}

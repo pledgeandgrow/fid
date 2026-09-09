@@ -1,0 +1,302 @@
+// Fides Broad-Phase Collision standard library
+//
+// Broad-phase collision detection to reduce O(n²) narrow-phase checks.
+// Implements:
+//   - Spatial hash grid (uniform grid for similar-sized objects)
+//   - Sweep-and-prune (sort by axis, check overlapping intervals)
+//
+// Usage (spatial hash):
+//   use collision_broad;
+//   var grid = spatial_hash_create(64.0);
+//   spatial_hash_insert(&mut grid, 0, 0.0, 0.0, 32.0, 32.0);
+//   spatial_hash_insert(&mut grid, 1, 10.0, 10.0, 32.0, 32.0);
+//   var pairs = spatial_hash_query_pairs(&grid);
+//   // pairs contains (0, 1) — potential collision
+//
+// Usage (sweep-and-prune):
+//   use collision_broad;
+//   var sap = sap_create();
+//   sap_insert(&mut sap, 0, 0.0, 32.0);
+//   sap_insert(&mut sap, 1, 10.0, 42.0);
+//   var pairs = sap_query_pairs(&sap);
+
+module collision_broad;
+
+use vec;
+use string;
+
+// ─── AABB ────────────────────────────────────────────────────────────────
+
+pub struct BroadAabb {
+    pub id: i64,
+    pub min_x: f64, pub min_y: f64,
+    pub max_x: f64, pub max_y: f64,
+}
+
+// ─── Spatial Hash Grid ────────────────────────────────────────────────────
+
+pub struct SpatialHashCell {
+    pub ids: Vec<i64>,
+}
+
+pub struct SpatialHashGrid {
+    pub cell_size: f64,
+    pub cells: Vec<SpatialHashCell>,
+    pub cell_count: i64,
+    pub aabbs: Vec<BroadAabb>,
+}
+
+/// Create a spatial hash grid with the given cell size.
+pub fn spatial_hash_create(cell_size: f64) -> SpatialHashGrid {
+    return SpatialHashGrid {
+        cell_size: cell_size,
+        cells: Vec::new(),
+        cell_count: 256,
+        aabbs: Vec::new(),
+    };
+}
+
+/// Hash a cell coordinate to a bucket index.
+fn spatial_hash_cell_idx(grid: &SpatialHashGrid, cx: i64, cy: i64) -> i64 {
+    // Simple hash: combine x and y
+    var h = (cx * 73856093) ^ (cy * 19349663);
+    if h < 0 { h = -h; }
+    return h % grid.cell_count;
+}
+
+/// Insert an AABB into the grid.
+pub fn spatial_hash_insert(grid: &mut SpatialHashGrid, id: i64, min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> void {
+    var aabb = BroadAabb {
+        id: id,
+        min_x: min_x, min_y: min_y,
+        max_x: max_x, max_y: max_y,
+    };
+    grid.aabbs.push(aabb);
+
+    // Insert into all overlapping cells
+    var x0 = (min_x / grid.cell_size) as i64;
+    var y0 = (min_y / grid.cell_size) as i64;
+    var x1 = (max_x / grid.cell_size) as i64;
+    var y1 = (max_y / grid.cell_size) as i64;
+
+    var cx = x0;
+    while cx <= x1 {
+        var cy = y0;
+        while cy <= y1 {
+            var idx = spatial_hash_cell_idx(grid, cx, cy);
+            // Ensure cells vector is large enough
+            while grid.cells.len() <= idx {
+                grid.cells.push(SpatialHashCell { ids: Vec::new() });
+            }
+            var cell = grid.cells.get(idx);
+            cell.ids.push(id);
+            grid.cells.set(idx, cell);
+            cy = cy + 1;
+        }
+        cx = cx + 1;
+    }
+}
+
+/// Query for all IDs that could potentially collide with the given AABB.
+pub fn spatial_hash_query(grid: &SpatialHashGrid, min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Vec<i64> {
+    var result = Vec::new();
+    var x0 = (min_x / grid.cell_size) as i64;
+    var y0 = (min_y / grid.cell_size) as i64;
+    var x1 = (max_x / grid.cell_size) as i64;
+    var y1 = (max_y / grid.cell_size) as i64;
+
+    var cx = x0;
+    while cx <= x1 {
+        var cy = y0;
+        while cy <= y1 {
+            var idx = spatial_hash_cell_idx(grid, cx, cy);
+            if idx < grid.cells.len() {
+                var cell = grid.cells.get(idx);
+                var i = 0;
+                while i < cell.ids.len() {
+                    var id = cell.ids.get(i);
+                    // Check for duplicates
+                    var found = false;
+                    var j = 0;
+                    while j < result.len() {
+                        if result.get(j) == id { found = true; break; }
+                        j = j + 1;
+                    }
+                    if !found {
+                        result.push(id);
+                    }
+                    i = i + 1;
+                }
+            }
+            cy = cy + 1;
+        }
+        cx = cx + 1;
+    }
+    return result;
+}
+
+/// Find all pairs of potentially colliding AABBs.
+pub fn spatial_hash_query_pairs(grid: &SpatialHashGrid) -> Vec<i64> {
+    var result = Vec::new();
+    var seen = Vec::new();
+
+    var i = 0;
+    while i < grid.aabbs.len() {
+        var a = grid.aabbs.get(i);
+        var candidates = spatial_hash_query(grid, a.min_x, a.min_y, a.max_x, a.max_y);
+        var j = 0;
+        while j < candidates.len() {
+            var id_b = candidates.get(j);
+            if id_b > a.id {  // avoid duplicate pairs (a,b) and (b,a)
+                var pair_key = a.id * 1000000 + id_b;
+                var found = false;
+                var k = 0;
+                while k < seen.len() {
+                    if seen.get(k) == pair_key { found = true; break; }
+                    k = k + 1;
+                }
+                if !found {
+                    seen.push(pair_key);
+                    result.push(a.id);
+                    result.push(id_b);
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Clear all entries from the grid.
+pub fn spatial_hash_clear(grid: &mut SpatialHashGrid) -> void {
+    var i = 0;
+    while i < grid.cells.len() {
+        var cell = grid.cells.get(i);
+        cell.ids.clear();
+        grid.cells.set(i, cell);
+        i = i + 1;
+    }
+    grid.aabbs.clear();
+}
+
+/// Get the number of AABBs in the grid.
+pub fn spatial_hash_count(grid: &SpatialHashGrid) -> i64 {
+    return grid.aabbs.len();
+}
+
+// ─── Sweep and Prune ──────────────────────────────────────────────────────
+
+pub struct SapEndpoint {
+    pub id: i64,
+    pub value: f64,
+    pub is_min: bool,     // true = min endpoint, false = max
+}
+
+pub struct SweepAndPrune {
+    pub endpoints: Vec<SapEndpoint>,
+    pub aabbs: Vec<BroadAabb>,
+}
+
+pub fn sap_create() -> SweepAndPrune {
+    return SweepAndPrune {
+        endpoints: Vec::new(),
+        aabbs: Vec::new(),
+    };
+}
+
+/// Insert an AABB into the sweep-and-prune structure.
+pub fn sap_insert(sap: &mut SweepAndPrune, id: i64, min_x: f64, max_x: f64) -> void {
+    var aabb = BroadAabb {
+        id: id,
+        min_x: min_x, min_y: 0.0,
+        max_x: max_x, max_y: 0.0,
+    };
+    sap.aabbs.push(aabb);
+    sap.endpoints.push(SapEndpoint { id: id, value: min_x, is_min: true });
+    sap.endpoints.push(SapEndpoint { id: id, value: max_x, is_min: false });
+}
+
+/// Sort endpoints by value (insertion sort — good for incremental updates).
+fn sap_sort_endpoints(sap: &mut SweepAndPrune) -> void {
+    var n = sap.endpoints.len();
+    var i = 1;
+    while i < n {
+        var key = sap.endpoints.get(i);
+        var j = i - 1;
+        while j >= 0 {
+            var ej = sap.endpoints.get(j);
+            if ej.value > key.value {
+                sap.endpoints.set(j + 1, ej);
+                j = j - 1;
+            } else {
+                break;
+            }
+        }
+        sap.endpoints.set(j + 1, key);
+        i = i + 1;
+    }
+}
+
+/// Query for all overlapping pairs along the X axis.
+pub fn sap_query_pairs(sap: &mut SweepAndPrune) -> Vec<i64> {
+    sap_sort_endpoints(sap);
+
+    var result = Vec::new();
+    var active = Vec::new();
+
+    var i = 0;
+    while i < sap.endpoints.len() {
+        var ep = sap.endpoints.get(i);
+        if ep.is_min {
+            // This AABB starts — check against all active AABBs
+            var j = 0;
+            while j < active.len() {
+                var active_id = active.get(j);
+                result.push(active_id);
+                result.push(ep.id);
+                j = j + 1;
+            }
+            active.push(ep.id);
+        } else {
+            // This AABB ends — remove from active set
+            var j = 0;
+            while j < active.len() {
+                if active.get(j) == ep.id {
+                    active.remove(j);
+                    break;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Clear all entries.
+pub fn sap_clear(sap: &mut SweepAndPrune) -> void {
+    sap.endpoints.clear();
+    sap.aabbs.clear();
+}
+
+/// Get the number of AABBs.
+pub fn sap_count(sap: &SweepAndPrune) -> i64 {
+    return sap.aabbs.len();
+}
+
+/// Update an existing AABB's position (removes and re-inserts).
+pub fn sap_update(sap: &mut SweepAndPrune, id: i64, min_x: f64, max_x: f64) -> void {
+    // Remove old endpoints
+    var i = 0;
+    while i < sap.endpoints.len() {
+        if sap.endpoints.get(i).id == id {
+            sap.endpoints.remove(i);
+        } else {
+            i = i + 1;
+        }
+    }
+    // Insert new endpoints
+    sap.endpoints.push(SapEndpoint { id: id, value: min_x, is_min: true });
+    sap.endpoints.push(SapEndpoint { id: id, value: max_x, is_min: false });
+}

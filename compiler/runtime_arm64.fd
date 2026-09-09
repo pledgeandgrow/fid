@@ -1,0 +1,794 @@
+// runtime_arm64.fd -- Native Linux ARM64 runtime stubs
+// Ported from src/runtime_arm64.rs (~961 LOC).
+//
+// Native runtime stubs for Linux ARM64 (AArch64) executables. Provides
+// implementations of all p_print_*, p_panic, p_alloc, p_malloc, p_free,
+// p_str_concat, p_to_str, and Vec builtins using raw Linux syscalls.
+//
+// Unlike runtime_linux.fd (which hand-encodes x86-64 bytes), this module
+// uses the ARM64 assembler (arm64_enc) to assemble assembly text into
+// machine code. This is more maintainable and easier to verify.
+//
+// All functions use the AAPCS64 ABI:
+//   - Args: X0-X7
+//   - Return: X0
+//   - Syscalls: X8=syscall#, X0-X5 → X0
+//   - Stack must be 16-byte aligned
+
+module compiler::runtime_arm64;
+
+use core;
+use vec;
+use string;
+use compiler::arm64_enc;
+use compiler::runtime_linux;
+
+// Shared runtime types (RuntimeSymbol, RuntimeRodataSym, RuntimeReloc, RuntimeParts)
+// are imported from compiler::runtime_linux to avoid type collisions.
+
+var g_runtime_relocations_arm64: Vec<RuntimeReloc> = Vec::new();
+
+// --- Public API ----------------------------------------------------------
+
+pub fn runtime_parts_arm64() -> RuntimeParts {
+    return runtime_parts_impl_arm64(false, 0);
+}
+
+pub fn runtime_parts_with_caps_arm64(granted_caps: i64) -> RuntimeParts {
+    return runtime_parts_impl_arm64(true, granted_caps);
+}
+
+pub fn runtime_relocations_arm64() -> Vec<RuntimeReloc> {
+    return g_runtime_relocations_arm64;
+}
+
+// --- Helpers -------------------------------------------------------------
+
+/// Determine which capability a stub name requires.
+/// Returns "Net", "FS", "Spawn", or "" (no cap required).
+fn stub_capability_arm64(name: str) -> str {
+    if str_starts_with(name, "p_socket_") || str_starts_with(name, "p_http_") { return "Net"; }
+    if str_starts_with(name, "p_file_") || str_starts_with(name, "p_read_file") || str_starts_with(name, "p_write_file") { return "FS"; }
+    if str_starts_with(name, "p_thread_") || str_equal(name, "p_spawn") { return "Spawn"; }
+    return "";
+}
+
+/// Check if a capability is granted.
+/// Simplified: caps_set is a bitfield (0 = no caps, nonzero = all caps).
+fn cap_granted_arm64(caps_set: i64, cap: str) -> bool {
+    if caps_set == 0 { return false; }
+    return true;
+}
+
+/// Push a null-terminated string into the rodata byte vector.
+fn push_str_bytes_arm64(rodata: &mut Vec<i64>, s: str) {
+    var i: i64 = 0;
+    while i < str_len(s) {
+        rodata.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+    rodata.push(0);
+}
+
+// --- Implementation -------------------------------------------------------
+
+fn runtime_parts_impl_arm64(has_caps: bool, caps_set: i64) -> RuntimeParts {
+    var rodata: Vec<i64> = Vec::new();
+    var rodata_syms: Vec<RuntimeRodataSym> = Vec::new();
+
+    // Build rodata: true, false, newline, minus, brackets, comma-space, zero, panic prefix/nl
+    var true_str_off: i64 = rodata.len();
+    push_str_bytes_arm64(rodata, "true");
+    var false_str_off: i64 = rodata.len();
+    push_str_bytes_arm64(rodata, "false");
+    var nl_str_off: i64 = rodata.len();
+    push_str_bytes_arm64(rodata, "\n");
+    var minus_str_off: i64 = rodata.len();
+    push_str_bytes_arm64(rodata, "-");
+    var bracket_open_off: i64 = rodata.len();
+    push_str_bytes_arm64(rodata, "[");
+    var bracket_close_off: i64 = rodata.len();
+    push_str_bytes_arm64(rodata, "]");
+    var comma_sp_off: i64 = rodata.len();
+    push_str_bytes_arm64(rodata, ", ");
+    var zero_char_off: i64 = rodata.len();
+    push_str_bytes_arm64(rodata, "0");
+    var panic_prefix_off: i64 = rodata.len();
+    push_str_bytes_arm64(rodata, "Panic: ");
+    var panic_nl_off: i64 = rodata.len();
+    push_str_bytes_arm64(rodata, "\n");
+
+    rodata_syms.push(RuntimeRodataSym_new(".Lpbool_true_str", true_str_off));
+    rodata_syms.push(RuntimeRodataSym_new(".Lpbool_false_str", false_str_off));
+    rodata_syms.push(RuntimeRodataSym_new(".Lpnl_str", nl_str_off));
+    rodata_syms.push(RuntimeRodataSym_new(".Lpf_minus", minus_str_off));
+    rodata_syms.push(RuntimeRodataSym_new(".Lbracket_open", bracket_open_off));
+    rodata_syms.push(RuntimeRodataSym_new(".Lbracket_close", bracket_close_off));
+    rodata_syms.push(RuntimeRodataSym_new(".Lcomma_sp", comma_sp_off));
+    rodata_syms.push(RuntimeRodataSym_new(".Lpf_zero_char", zero_char_off));
+    rodata_syms.push(RuntimeRodataSym_new(".Lpanic_prefix", panic_prefix_off));
+    rodata_syms.push(RuntimeRodataSym_new(".Lpanic_nl", panic_nl_off));
+
+    // Build the assembly text for the runtime
+    var asm: str = build_runtime_asm_arm64(has_caps, caps_set);
+
+    // Assemble it
+    var text: Vec<i64> = Vec::new();
+    var symbols: Vec<RuntimeSymbol> = Vec::new();
+    match assemble_arm64(asm) {
+        ResultArm64Assemble::Ok(result) => {
+            // Convert symbols to RuntimeSymbol format (size = 0)
+            var si: i64 = 0;
+            while si < result.symbols.len() {
+                var sym: Arm64Symbol = result.symbols.get(si);
+                symbols.push(RuntimeSymbol_new(sym.name, sym.offset, 0));
+                si = si + 1;
+            }
+            text = result.text;
+            // Store relocations for later retrieval
+            g_runtime_relocations_arm64 = Vec::new();
+            var ri: i64 = 0;
+            while ri < result.relocations.len() {
+                var rel: Arm64Reloc = result.relocations.get(ri);
+                g_runtime_relocations_arm64.push(RuntimeReloc_new(rel.offset, rel.symbol, rel.rtype));
+                ri = ri + 1;
+            }
+        }
+        ResultArm64Assemble::Err(e) => {
+            // On assembly error, return empty parts (defensive)
+            return RuntimeParts_new(Vec::new(), Vec::new(), rodata, rodata_syms);
+        }
+    }
+
+    return RuntimeParts_new(text, symbols, rodata, rodata_syms);
+}
+
+// --- Assembly text builder -----------------------------------------------
+
+fn build_runtime_asm_arm64(has_caps: bool, caps_set: i64) -> str {
+    var asm: str = "";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // _start — program entry point
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .section .text\n";
+    asm = asm + "    .globl _start\n";
+    asm = asm + "_start:\n";
+    asm = asm + "    stp x29, x30, [sp, #-16]!\n";
+    asm = asm + "    mov x29, sp\n";
+    asm = asm + "    bl main\n";
+    asm = asm + "    mov x0, x0\n";
+    asm = asm + "    mov x8, #93\n";
+    asm = asm + "    svc #0\n";
+    asm = asm + "    brk #0\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // p_print_str(x0 = ptr to null-terminated string)
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_print_str\n";
+    asm = asm + "p_print_str:\n";
+    asm = asm + "    stp x29, x30, [sp, #-16]!\n";
+    asm = asm + "    mov x29, sp\n";
+    asm = asm + "    mov x19, x0\n";
+    asm = asm + "    mov x1, x0\n";
+    asm = asm + "    mov x2, #0\n";
+    asm = asm + ".Lpstr_loop:\n";
+    asm = asm + "    ldrb w3, [x1]\n";
+    asm = asm + "    cmp w3, #0\n";
+    asm = asm + "    b.eq .Lpstr_done\n";
+    asm = asm + "    add x1, x1, #1\n";
+    asm = asm + "    add x2, x2, #1\n";
+    asm = asm + "    b .Lpstr_loop\n";
+    asm = asm + ".Lpstr_done:\n";
+    asm = asm + "    mov x0, #1\n";
+    asm = asm + "    mov x1, x19\n";
+    asm = asm + "    mov x8, #64\n";
+    asm = asm + "    svc #0\n";
+    asm = asm + "    ldp x29, x30, [sp], #16\n";
+    asm = asm + "    ret\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // p_print_int(x0 = i64 value)
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_print_int\n";
+    asm = asm + "p_print_int:\n";
+    asm = asm + "    stp x29, x30, [sp, #-32]!\n";
+    asm = asm + "    mov x29, sp\n";
+    asm = asm + "    sub sp, sp, #32\n";
+    asm = asm + "    mov x19, x0\n";
+    asm = asm + "    mov x20, #0\n";
+    asm = asm + "    cmp x19, #0\n";
+    asm = asm + "    b.ge .Lpint_pos\n";
+    asm = asm + "    mov x20, #1\n";
+    asm = asm + "    neg x19, x19\n";
+    asm = asm + ".Lpint_pos:\n";
+    asm = asm + "    mov x21, sp\n";
+    asm = asm + "    add x21, x21, #31\n";
+    asm = asm + "    mov x22, #0\n";
+    asm = asm + "    cmp x19, #0\n";
+    asm = asm + "    b.ne .Lpint_loop\n";
+    asm = asm + "    mov w23, #48\n";
+    asm = asm + "    strb w23, [x21]\n";
+    asm = asm + "    sub x21, x21, #1\n";
+    asm = asm + "    add x22, x22, #1\n";
+    asm = asm + "    b .Lpint_print\n";
+    asm = asm + ".Lpint_loop:\n";
+    asm = asm + "    cmp x19, #0\n";
+    asm = asm + "    b.eq .Lpint_print\n";
+    asm = asm + "    mov x3, #10\n";
+    asm = asm + "    udiv x4, x19, x3\n";
+    asm = asm + "    msub x5, x3, x4, x19\n";
+    asm = asm + "    add w5, w5, #48\n";
+    asm = asm + "    strb w5, [x21]\n";
+    asm = asm + "    sub x21, x21, #1\n";
+    asm = asm + "    add x22, x22, #1\n";
+    asm = asm + "    mov x19, x4\n";
+    asm = asm + "    b .Lpint_loop\n";
+    asm = asm + ".Lpint_print:\n";
+    asm = asm + "    cmp x20, #0\n";
+    asm = asm + "    b.eq .Lpint_write\n";
+    asm = asm + "    mov w3, #45\n";
+    asm = asm + "    strb w3, [x21]\n";
+    asm = asm + "    sub x21, x21, #1\n";
+    asm = asm + "    add x22, x22, #1\n";
+    asm = asm + ".Lpint_write:\n";
+    asm = asm + "    add x21, x21, #1\n";
+    asm = asm + "    mov x0, #1\n";
+    asm = asm + "    mov x1, x21\n";
+    asm = asm + "    mov x2, x22\n";
+    asm = asm + "    mov x8, #64\n";
+    asm = asm + "    svc #0\n";
+    asm = asm + "    add sp, sp, #32\n";
+    asm = asm + "    ldp x29, x30, [sp], #16\n";
+    asm = asm + "    ret\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // p_print_bool(x0 = i64, 0=false, nonzero=true)
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_print_bool\n";
+    asm = asm + "p_print_bool:\n";
+    asm = asm + "    stp x29, x30, [sp, #-16]!\n";
+    asm = asm + "    mov x29, sp\n";
+    asm = asm + "    cmp x0, #0\n";
+    asm = asm + "    b.ne .Lpbool_true\n";
+    asm = asm + "    adrp x0, .Lpbool_false_str\n";
+    asm = asm + "    add x0, x0, :lo12:.Lpbool_false_str\n";
+    asm = asm + "    bl p_print_str\n";
+    asm = asm + "    b .Lpbool_done\n";
+    asm = asm + ".Lpbool_true:\n";
+    asm = asm + "    adrp x0, .Lpbool_true_str\n";
+    asm = asm + "    add x0, x0, :lo12:.Lpbool_true_str\n";
+    asm = asm + "    bl p_print_str\n";
+    asm = asm + ".Lpbool_done:\n";
+    asm = asm + "    ldp x29, x30, [sp], #16\n";
+    asm = asm + "    ret\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // p_print_newline()
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_print_newline\n";
+    asm = asm + "p_print_newline:\n";
+    asm = asm + "    stp x29, x30, [sp, #-16]!\n";
+    asm = asm + "    mov x29, sp\n";
+    asm = asm + "    adrp x0, .Lpnl_str\n";
+    asm = asm + "    add x0, x0, :lo12:.Lpnl_str\n";
+    asm = asm + "    bl p_print_str\n";
+    asm = asm + "    ldp x29, x30, [sp], #16\n";
+    asm = asm + "    ret\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // p_panic(x0 = ptr to message)
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_panic\n";
+    asm = asm + "p_panic:\n";
+    asm = asm + "    stp x29, x30, [sp, #-16]!\n";
+    asm = asm + "    mov x29, sp\n";
+    asm = asm + "    mov x19, x0\n";
+    asm = asm + "    adrp x0, .Lpanic_prefix\n";
+    asm = asm + "    add x0, x0, :lo12:.Lpanic_prefix\n";
+    asm = asm + "    bl p_print_str\n";
+    asm = asm + "    mov x0, x19\n";
+    asm = asm + "    bl p_print_str\n";
+    asm = asm + "    adrp x0, .Lpanic_nl\n";
+    asm = asm + "    add x0, x0, :lo12:.Lpanic_nl\n";
+    asm = asm + "    bl p_print_str\n";
+    asm = asm + "    mov x0, #1\n";
+    asm = asm + "    mov x8, #93\n";
+    asm = asm + "    svc #0\n";
+    asm = asm + "    brk #0\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // p_malloc(x0 = size) → x0 = ptr
+    // Uses sys_mmap: mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_malloc\n";
+    asm = asm + "p_malloc:\n";
+    asm = asm + "    stp x29, x30, [sp, #-16]!\n";
+    asm = asm + "    mov x29, sp\n";
+    asm = asm + "    add x0, x0, #4095\n";
+    asm = asm + "    and x0, x0, #0xFFFFFFFFFFFFF000\n";
+    asm = asm + "    mov x1, x0\n";
+    asm = asm + "    mov x0, #0\n";
+    asm = asm + "    mov x2, #3\n";
+    asm = asm + "    mov x3, #34\n";
+    asm = asm + "    mov x4, #-1\n";
+    asm = asm + "    mov x5, #0\n";
+    asm = asm + "    mov x8, #222\n";
+    asm = asm + "    svc #0\n";
+    asm = asm + "    ldp x29, x30, [sp], #16\n";
+    asm = asm + "    ret\n";
+
+    // p_alloc (alias for p_malloc)
+    asm = asm + "    .globl p_alloc\n";
+    asm = asm + "p_alloc:\n";
+    asm = asm + "    b p_malloc\n";
+
+    // p_free (no-op)
+    asm = asm + "    .globl p_free\n";
+    asm = asm + "p_free:\n";
+    asm = asm + "    ret\n";
+
+    // p_exit(x0 = code)
+    asm = asm + "    .globl p_exit\n";
+    asm = asm + "p_exit:\n";
+    asm = asm + "    mov x8, #93\n";
+    asm = asm + "    svc #0\n";
+    asm = asm + "    brk #0\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // p_to_str(x0 = i64 value) → x0 = ptr to null-terminated decimal string
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_to_str\n";
+    asm = asm + "p_to_str:\n";
+    asm = asm + "    stp x29, x30, [sp, #-16]!\n";
+    asm = asm + "    mov x29, sp\n";
+    asm = asm + "    sub sp, sp, #32\n";
+    asm = asm + "    mov x19, x0\n";
+    asm = asm + "    mov x20, #0\n";
+    asm = asm + "    cmp x19, #0\n";
+    asm = asm + "    b.ge .Lpts_pos\n";
+    asm = asm + "    mov x20, #1\n";
+    asm = asm + "    neg x19, x19\n";
+    asm = asm + ".Lpts_pos:\n";
+    asm = asm + "    mov x21, sp\n";
+    asm = asm + "    add x21, x21, #31\n";
+    asm = asm + "    mov x22, #0\n";
+    asm = asm + "    cmp x19, #0\n";
+    asm = asm + "    b.ne .Lpts_loop\n";
+    asm = asm + "    mov w23, #48\n";
+    asm = asm + "    strb w23, [x21]\n";
+    asm = asm + "    sub x21, x21, #1\n";
+    asm = asm + "    add x22, x22, #1\n";
+    asm = asm + "    b .Lpts_alloc\n";
+    asm = asm + ".Lpts_loop:\n";
+    asm = asm + "    cmp x19, #0\n";
+    asm = asm + "    b.eq .Lpts_alloc\n";
+    asm = asm + "    mov x3, #10\n";
+    asm = asm + "    udiv x4, x19, x3\n";
+    asm = asm + "    msub x5, x3, x4, x19\n";
+    asm = asm + "    add w5, w5, #48\n";
+    asm = asm + "    strb w5, [x21]\n";
+    asm = asm + "    sub x21, x21, #1\n";
+    asm = asm + "    add x22, x22, #1\n";
+    asm = asm + "    mov x19, x4\n";
+    asm = asm + "    b .Lpts_loop\n";
+    asm = asm + ".Lpts_alloc:\n";
+    asm = asm + "    cmp x20, #0\n";
+    asm = asm + "    b.eq .Lpts_copy\n";
+    asm = asm + "    mov w3, #45\n";
+    asm = asm + "    strb w3, [x21]\n";
+    asm = asm + "    sub x21, x21, #1\n";
+    asm = asm + "    add x22, x22, #1\n";
+    asm = asm + ".Lpts_copy:\n";
+    asm = asm + "    add x21, x21, #1\n";
+    asm = asm + "    mov x0, x22\n";
+    asm = asm + "    add x0, x0, #1\n";
+    asm = asm + "    bl p_malloc\n";
+    asm = asm + "    mov x23, x0\n";
+    asm = asm + "    mov x3, #0\n";
+    asm = asm + ".Lpts_c2:\n";
+    asm = asm + "    cmp x3, x22\n";
+    asm = asm + "    b.ge .Lpts_c2d\n";
+    asm = asm + "    add x4, x21, x3\n";
+    asm = asm + "    ldrb w5, [x4]\n";
+    asm = asm + "    add x6, x23, x3\n";
+    asm = asm + "    strb w5, [x6]\n";
+    asm = asm + "    add x3, x3, #1\n";
+    asm = asm + "    b .Lpts_c2\n";
+    asm = asm + ".Lpts_c2d:\n";
+    asm = asm + "    add x6, x23, x22\n";
+    asm = asm + "    strb wzr, [x6]\n";
+    asm = asm + "    mov x0, x23\n";
+    asm = asm + "    add sp, sp, #32\n";
+    asm = asm + "    ldp x29, x30, [sp], #16\n";
+    asm = asm + "    ret\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // p_str_concat(x0 = s1, x1 = s2) → x0 = new string (s1 + s2)
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_str_concat\n";
+    asm = asm + "p_str_concat:\n";
+    asm = asm + "    stp x29, x30, [sp, #-16]!\n";
+    asm = asm + "    mov x29, sp\n";
+    asm = asm + "    mov x19, x0\n";
+    asm = asm + "    mov x20, x1\n";
+    asm = asm + "    mov x0, #0\n";
+    asm = asm + ".Lpsc_l1:\n";
+    asm = asm + "    ldrb w1, [x19, x0]\n";
+    asm = asm + "    cmp w1, #0\n";
+    asm = asm + "    b.eq .Lpsc_l1d\n";
+    asm = asm + "    add x0, x0, #1\n";
+    asm = asm + "    b .Lpsc_l1\n";
+    asm = asm + ".Lpsc_l1d:\n";
+    asm = asm + "    mov x21, x0\n";
+    asm = asm + "    mov x0, #0\n";
+    asm = asm + ".Lpsc_l2:\n";
+    asm = asm + "    ldrb w1, [x20, x0]\n";
+    asm = asm + "    cmp w1, #0\n";
+    asm = asm + "    b.eq .Lpsc_l2d\n";
+    asm = asm + "    add x0, x0, #1\n";
+    asm = asm + "    b .Lpsc_l2\n";
+    asm = asm + ".Lpsc_l2d:\n";
+    asm = asm + "    mov x22, x0\n";
+    asm = asm + "    add x0, x21, x22\n";
+    asm = asm + "    add x0, x0, #1\n";
+    asm = asm + "    bl p_malloc\n";
+    asm = asm + "    mov x24, x0\n";
+    asm = asm + "    mov x3, #0\n";
+    asm = asm + ".Lpsc_c1:\n";
+    asm = asm + "    cmp x3, x21\n";
+    asm = asm + "    b.ge .Lpsc_c1d\n";
+    asm = asm + "    add x4, x19, x3\n";
+    asm = asm + "    ldrb w5, [x4]\n";
+    asm = asm + "    add x6, x24, x3\n";
+    asm = asm + "    strb w5, [x6]\n";
+    asm = asm + "    add x3, x3, #1\n";
+    asm = asm + "    b .Lpsc_c1\n";
+    asm = asm + ".Lpsc_c1d:\n";
+    asm = asm + "    mov x3, #0\n";
+    asm = asm + ".Lpsc_c2:\n";
+    asm = asm + "    cmp x3, x22\n";
+    asm = asm + "    b.ge .Lpsc_c2d\n";
+    asm = asm + "    add x4, x20, x3\n";
+    asm = asm + "    ldrb w5, [x4]\n";
+    asm = asm + "    add x6, x24, x21\n";
+    asm = asm + "    add x6, x6, x3\n";
+    asm = asm + "    strb w5, [x6]\n";
+    asm = asm + "    add x3, x3, #1\n";
+    asm = asm + "    b .Lpsc_c2\n";
+    asm = asm + ".Lpsc_c2d:\n";
+    asm = asm + "    add x6, x24, x21\n";
+    asm = asm + "    add x6, x6, x22\n";
+    asm = asm + "    strb wzr, [x6]\n";
+    asm = asm + "    mov x0, x24\n";
+    asm = asm + "    ldp x29, x30, [sp], #16\n";
+    asm = asm + "    ret\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Vec operations (Vec layout: [data_ptr(8), len(8), cap(8)])
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_vec_new\n";
+    asm = asm + "p_vec_new:\n";
+    asm = asm + "    stp x29, x30, [sp, #-16]!\n";
+    asm = asm + "    mov x29, sp\n";
+    asm = asm + "    mov x0, #4096\n";
+    asm = asm + "    bl p_malloc\n";
+    asm = asm + "    add x1, x0, #24\n";
+    asm = asm + "    str x1, [x0]\n";
+    asm = asm + "    str xzr, [x0, #8]\n";
+    asm = asm + "    mov x1, #509\n";
+    asm = asm + "    str x1, [x0, #16]\n";
+    asm = asm + "    ldp x29, x30, [sp], #16\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_vec_push\n";
+    asm = asm + "p_vec_push:\n";
+    asm = asm + "    ldr x2, [x0, #8]\n";
+    asm = asm + "    ldr x3, [x0]\n";
+    asm = asm + "    str x1, [x3, x2, lsl #3]\n";
+    asm = asm + "    add x2, x2, #1\n";
+    asm = asm + "    str x2, [x0, #8]\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_vec_len\n";
+    asm = asm + "p_vec_len:\n";
+    asm = asm + "    ldr x0, [x0, #8]\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_vec_get\n";
+    asm = asm + "p_vec_get:\n";
+    asm = asm + "    ldr x2, [x0]\n";
+    asm = asm + "    ldr x0, [x2, x1, lsl #3]\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_vec_set\n";
+    asm = asm + "p_vec_set:\n";
+    asm = asm + "    ldr x3, [x0]\n";
+    asm = asm + "    str x2, [x3, x1, lsl #3]\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_vec_first\n";
+    asm = asm + "p_vec_first:\n";
+    asm = asm + "    ldr x1, [x0]\n";
+    asm = asm + "    ldr x0, [x1]\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_vec_last\n";
+    asm = asm + "p_vec_last:\n";
+    asm = asm + "    ldr x1, [x0]\n";
+    asm = asm + "    ldr x2, [x0, #8]\n";
+    asm = asm + "    sub x2, x2, #1\n";
+    asm = asm + "    ldr x0, [x1, x2, lsl #3]\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_vec_pop\n";
+    asm = asm + "p_vec_pop:\n";
+    asm = asm + "    ldr x1, [x0, #8]\n";
+    asm = asm + "    cmp x1, #0\n";
+    asm = asm + "    b.eq .Lpvp_empty\n";
+    asm = asm + "    sub x1, x1, #1\n";
+    asm = asm + "    str x1, [x0, #8]\n";
+    asm = asm + "    ldr x2, [x0]\n";
+    asm = asm + "    ldr x0, [x2, x1, lsl #3]\n";
+    asm = asm + "    ret\n";
+    asm = asm + ".Lpvp_empty:\n";
+    asm = asm + "    mov x0, #0\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_vec_is_empty\n";
+    asm = asm + "p_vec_is_empty:\n";
+    asm = asm + "    ldr x0, [x0, #8]\n";
+    asm = asm + "    cmp x0, #0\n";
+    asm = asm + "    cset x0, eq\n";
+    asm = asm + "    ret\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // p_print_vec(x0 = vec ptr)
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_print_vec\n";
+    asm = asm + "p_print_vec:\n";
+    asm = asm + "    stp x29, x30, [sp, #-16]!\n";
+    asm = asm + "    mov x29, sp\n";
+    asm = asm + "    mov x19, x0\n";
+    asm = asm + "    adrp x0, .Lbracket_open\n";
+    asm = asm + "    add x0, x0, :lo12:.Lbracket_open\n";
+    asm = asm + "    bl p_print_str\n";
+    asm = asm + "    ldr x20, [x19, #8]\n";
+    asm = asm + "    cmp x20, #0\n";
+    asm = asm + "    b.eq .Lppv_close\n";
+    asm = asm + "    ldr x21, [x19]\n";
+    asm = asm + "    ldr x0, [x21]\n";
+    asm = asm + "    bl p_print_int\n";
+    asm = asm + "    mov x22, #1\n";
+    asm = asm + ".Lppv_loop:\n";
+    asm = asm + "    cmp x22, x20\n";
+    asm = asm + "    b.ge .Lppv_close\n";
+    asm = asm + "    adrp x0, .Lcomma_sp\n";
+    asm = asm + "    add x0, x0, :lo12:.Lcomma_sp\n";
+    asm = asm + "    bl p_print_str\n";
+    asm = asm + "    ldr x0, [x21, x22, lsl #3]\n";
+    asm = asm + "    bl p_print_int\n";
+    asm = asm + "    add x22, x22, #1\n";
+    asm = asm + "    b .Lppv_loop\n";
+    asm = asm + ".Lppv_close:\n";
+    asm = asm + "    adrp x0, .Lbracket_close\n";
+    asm = asm + "    add x0, x0, :lo12:.Lbracket_close\n";
+    asm = asm + "    bl p_print_str\n";
+    asm = asm + "    ldp x29, x30, [sp], #16\n";
+    asm = asm + "    ret\n";
+
+    // p_region_free (no-op)
+    asm = asm + "    .globl p_region_free\n";
+    asm = asm + "p_region_free:\n";
+    asm = asm + "    ret\n";
+
+    // pledge_strlen
+    asm = asm + "    .globl pledge_strlen\n";
+    asm = asm + "pledge_strlen:\n";
+    asm = asm + "    mov x1, x0\n";
+    asm = asm + "    mov x0, #0\n";
+    asm = asm + ".Lstrlen_loop:\n";
+    asm = asm + "    ldrb w2, [x1]\n";
+    asm = asm + "    cmp w2, #0\n";
+    asm = asm + "    b.eq .Lstrlen_done\n";
+    asm = asm + "    add x1, x1, #1\n";
+    asm = asm + "    add x0, x0, #1\n";
+    asm = asm + "    b .Lstrlen_loop\n";
+    asm = asm + ".Lstrlen_done:\n";
+    asm = asm + "    ret\n";
+
+    // pledge_strcmp
+    asm = asm + "    .globl pledge_strcmp\n";
+    asm = asm + "pledge_strcmp:\n";
+    asm = asm + ".Lstrcmp_loop:\n";
+    asm = asm + "    ldrb w2, [x0]\n";
+    asm = asm + "    ldrb w3, [x1]\n";
+    asm = asm + "    cmp w2, #0\n";
+    asm = asm + "    b.eq .Lstrcmp_end\n";
+    asm = asm + "    cmp w2, w3\n";
+    asm = asm + "    b.ne .Lstrcmp_ne\n";
+    asm = asm + "    add x0, x0, #1\n";
+    asm = asm + "    add x1, x1, #1\n";
+    asm = asm + "    b .Lstrcmp_loop\n";
+    asm = asm + ".Lstrcmp_end:\n";
+    asm = asm + "    sub x0, x2, x3\n";
+    asm = asm + "    ret\n";
+    asm = asm + ".Lstrcmp_ne:\n";
+    asm = asm + "    sub x0, x2, x3\n";
+    asm = asm + "    ret\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Stubs that return 0
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + "    .globl p_getenv\n";
+    asm = asm + "p_getenv:\n";
+    asm = asm + "    mov x0, #0\n";
+    asm = asm + "    ret\n";
+    asm = asm + "    .globl p_argc\n";
+    asm = asm + "p_argc:\n";
+    asm = asm + "    mov x0, #1\n";
+    asm = asm + "    ret\n";
+    asm = asm + "    .globl p_argv\n";
+    asm = asm + "p_argv:\n";
+    asm = asm + "    mov x0, #0\n";
+    asm = asm + "    ret\n";
+    asm = asm + "    .globl p_system\n";
+    asm = asm + "p_system:\n";
+    asm = asm + "    mov x0, #0\n";
+    asm = asm + "    ret\n";
+    asm = asm + "    .globl p_regex_match\n";
+    asm = asm + "p_regex_match:\n";
+    asm = asm + "    mov x0, #0\n";
+    asm = asm + "    ret\n";
+
+    // Math stubs (return 0)
+    asm = asm + append_zero_stub_arm64("pledge_sqrt");
+    asm = asm + append_zero_stub_arm64("pledge_floor");
+    asm = asm + append_zero_stub_arm64("pledge_ceil");
+    asm = asm + append_zero_stub_arm64("pledge_pow");
+    asm = asm + append_zero_stub_arm64("pledge_sin");
+    asm = asm + append_zero_stub_arm64("pledge_cos");
+    asm = asm + append_zero_stub_arm64("pledge_fabs");
+
+    // Float/bool/vec to string stubs
+    asm = asm + "    .globl p_float_to_str\n";
+    asm = asm + "p_float_to_str:\n";
+    asm = asm + "    stp x29, x30, [sp, #-16]!\n";
+    asm = asm + "    mov x29, sp\n";
+    asm = asm + "    mov x0, #2\n";
+    asm = asm + "    bl p_malloc\n";
+    asm = asm + "    mov x1, x0\n";
+    asm = asm + "    mov w2, #48\n";
+    asm = asm + "    strb w2, [x1]\n";
+    asm = asm + "    strb wzr, [x1, #1]\n";
+    asm = asm + "    ldp x29, x30, [sp], #16\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_bool_to_str\n";
+    asm = asm + "p_bool_to_str:\n";
+    asm = asm + "    stp x29, x30, [sp, #-16]!\n";
+    asm = asm + "    mov x29, sp\n";
+    asm = asm + "    cmp x0, #0\n";
+    asm = asm + "    b.ne .Lpbts_true\n";
+    asm = asm + "    adrp x0, .Lpbool_false_str\n";
+    asm = asm + "    add x0, x0, :lo12:.Lpbool_false_str\n";
+    asm = asm + "    b .Lpbts_done\n";
+    asm = asm + ".Lpbts_true:\n";
+    asm = asm + "    adrp x0, .Lpbool_true_str\n";
+    asm = asm + "    add x0, x0, :lo12:.Lpbool_true_str\n";
+    asm = asm + ".Lpbts_done:\n";
+    asm = asm + "    ldp x29, x30, [sp], #16\n";
+    asm = asm + "    ret\n";
+
+    asm = asm + "    .globl p_vec_to_str\n";
+    asm = asm + "p_vec_to_str:\n";
+    asm = asm + "    b p_print_vec\n";
+
+    // Allocator stubs
+    asm = asm + "    .globl p_allocator_create\n";
+    asm = asm + "p_allocator_create:\n";
+    asm = asm + "    mov x0, #0\n";
+    asm = asm + "    ret\n";
+    asm = asm + "    .globl p_allocator_alloc\n";
+    asm = asm + "p_allocator_alloc:\n";
+    asm = asm + "    b p_malloc\n";
+    asm = asm + "    .globl p_allocator_free\n";
+    asm = asm + "p_allocator_free:\n";
+    asm = asm + "    ret\n";
+    asm = asm + "    .globl p_allocator_stats\n";
+    asm = asm + "p_allocator_stats:\n";
+    asm = asm + "    mov x0, #0\n";
+    asm = asm + "    ret\n";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Capability-gated stubs (Net, FS, Spawn)
+    // ═══════════════════════════════════════════════════════════════════════
+    // Net stubs
+    asm = asm + append_cap_stub_arm64("p_socket_create", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_socket_connect", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_socket_bind", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_socket_listen", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_socket_accept", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_socket_send", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_socket_recv", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_socket_close", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_http_get", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_http_post", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_http_parse_request", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_http_build_response", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_net_connect", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_net_read", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_net_write", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_net_close", has_caps, caps_set);
+
+    // FS stubs
+    asm = asm + append_cap_stub_arm64("p_file_open", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_file_close", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_file_read", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_file_write", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_read_file", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_write_file", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_fs_read_async", has_caps, caps_set);
+
+    // Spawn stubs
+    asm = asm + append_cap_stub_arm64("p_thread_spawn", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_thread_join", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_thread_mutex_init", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_thread_mutex_lock", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_thread_mutex_unlock", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_spawn", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_executor_new", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_executor_spawn", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_executor_block_on", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_executor_run_all", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_executor_poll_all", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_task_poll", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_task_poll_nonblocking", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_task_is_ready", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_chan_create", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_chan_send", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_chan_recv", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_chan_try_recv", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_chan_close", has_caps, caps_set);
+    asm = asm + append_cap_stub_arm64("p_chan_is_closed", has_caps, caps_set);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Additional stubs that return 0
+    // ═══════════════════════════════════════════════════════════════════════
+    asm = asm + append_zero_stub_arm64("p_simd_dot");
+    asm = asm + append_zero_stub_arm64("p_db_mem_open");
+    asm = asm + append_zero_stub_arm64("p_db_mem_close");
+    asm = asm + append_zero_stub_arm64("p_db_mem_exec");
+    asm = asm + append_zero_stub_arm64("p_db_mem_query");
+    asm = asm + append_zero_stub_arm64("p_json_len");
+    asm = asm + append_zero_stub_arm64("p_json_at");
+    asm = asm + append_zero_stub_arm64("p_dl_open");
+    asm = asm + append_zero_stub_arm64("p_dl_sym");
+    asm = asm + append_zero_stub_arm64("p_dl_close");
+    asm = asm + append_zero_stub_arm64("p_dl_call");
+    asm = asm + append_zero_stub_arm64("p_print_float");
+
+    return asm;
+}
+
+/// Generate a stub that returns 0: `    .globl NAME\nNAME:\n    mov x0, #0\n    ret\n`
+fn append_zero_stub_arm64(name: str) -> str {
+    return "    .globl " + name + "\n" + name + ":\n    mov x0, #0\n    ret\n";
+}
+
+/// Generate a capability-gated stub. If has_caps is true and the required
+/// capability is not granted, emit a trap (brk #1). Otherwise emit a
+/// zero-returning stub.
+fn append_cap_stub_arm64(name: str, has_caps: bool, caps_set: i64) -> str {
+    var cap: str = stub_capability_arm64(name);
+    var should_trap: bool = false;
+    if has_caps {
+        if str_len(cap) > 0 {
+            should_trap = !cap_granted_arm64(caps_set, cap);
+        }
+    }
+    if should_trap {
+        return "    .globl " + name + "\n" + name + ":\n    brk #1\n    ret\n";
+    }
+    return "    .globl " + name + "\n" + name + ":\n    mov x0, #0\n    ret\n";
+}

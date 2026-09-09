@@ -1,0 +1,557 @@
+// codegen_arm64.fd -- ARM64 (AArch64) Codegen (Phase 4C)
+// Ported from src/codegen_arm64.rs (~374 LOC)
+//
+// Instruction selector that consumes PIR L3 + a register allocation and
+// produces ARM64 assembly. This is the second target in the multi-architecture
+// codegen backend.
+//
+// Pipeline: L3Module -> (regalloc) -> [code selector] -> ARM64 asm string
+//
+// Calling convention: AAPCS64
+//   - Args: X0-X7 (first 8 integer/pointer)
+//   - Return: X0
+//   - Callee-saved: X19-X28, SP
+//   - Stack 16-byte aligned at call sites
+//
+// Adaptations from Rust:
+// 1. HashMap<K,V> -> Vec-based maps with helper structs
+// 2. String -> str, usize -> i64
+// 3. &L3Module/&L3Function/&L3Inst -> by value (Fides convention)
+// 4. struct methods -> free functions with `self: &mut Arm64CodeGen`
+// 5. format! -> string concatenation
+// 6. Option<VReg> -> OptVReg enum
+// 7. `as u64` bit extraction -> i64 with sign-aware comparisons
+// 8. strip_prefix('x') -> strip_x_prefix helper
+
+module compiler::codegen_arm64;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::pir;
+
+// ===========================================================================
+// Public API
+// ===========================================================================
+
+/// Generate ARM64 assembly for an entire L3 module.
+pub fn generate_asm_arm64(module: L3Module) -> str {
+    var gen: Arm64CodeGen = Arm64CodeGen_new();
+    Arm64CodeGen_gen_module(gen, module);
+    return gen.output;
+}
+
+// ===========================================================================
+// ARM64 Register definitions
+// ===========================================================================
+
+pub const NUM_REGS: i64 = 29; // X0-X28 (X29=FP, X30=LR, X31=SP)
+
+pub fn reg_name(idx: i64) -> str {
+    // ARM64 register names X0-X30
+    if idx == 0 { return "x0"; }
+    if idx == 1 { return "x1"; }
+    if idx == 2 { return "x2"; }
+    if idx == 3 { return "x3"; }
+    if idx == 4 { return "x4"; }
+    if idx == 5 { return "x5"; }
+    if idx == 6 { return "x6"; }
+    if idx == 7 { return "x7"; }
+    if idx == 8 { return "x8"; }
+    if idx == 9 { return "x9"; }
+    if idx == 10 { return "x10"; }
+    if idx == 11 { return "x11"; }
+    if idx == 12 { return "x12"; }
+    if idx == 13 { return "x13"; }
+    if idx == 14 { return "x14"; }
+    if idx == 15 { return "x15"; }
+    if idx == 16 { return "x16"; }
+    if idx == 17 { return "x17"; }
+    if idx == 18 { return "x18"; }
+    if idx == 19 { return "x19"; }
+    if idx == 20 { return "x20"; }
+    if idx == 21 { return "x21"; }
+    if idx == 22 { return "x22"; }
+    if idx == 23 { return "x23"; }
+    if idx == 24 { return "x24"; }
+    if idx == 25 { return "x25"; }
+    if idx == 26 { return "x26"; }
+    if idx == 27 { return "x27"; }
+    if idx == 28 { return "x28"; }
+    if idx == 29 { return "x29"; }
+    if idx == 30 { return "x30"; }
+    return "x0";
+}
+
+pub fn vreg_to_reg(vreg: VReg) -> str {
+    return reg_name(vreg.id % NUM_REGS);
+}
+
+// ===========================================================================
+// String constant table entry (Vec-based replacement for HashMap)
+// ===========================================================================
+
+pub struct ArmStringConstEntry {
+    pub content: str,
+    pub label: str,
+}
+
+pub fn ArmStringConstEntry_new(content: str, label: str) -> ArmStringConstEntry {
+    return ArmStringConstEntry { content: content, label: label };
+}
+
+pub struct ArmFloatConstEntry {
+    pub bits: i64,
+    pub label: str,
+}
+
+pub fn ArmFloatConstEntry_new(bits: i64, label: str) -> ArmFloatConstEntry {
+    return ArmFloatConstEntry { bits: bits, label: label };
+}
+
+// ===========================================================================
+// Code Generator
+// ===========================================================================
+
+pub struct Arm64CodeGen {
+    pub output: str,
+    pub label_counter: i64,
+    pub string_consts: Vec<ArmStringConstEntry>,
+    pub float_consts: Vec<ArmFloatConstEntry>,
+}
+
+pub fn Arm64CodeGen_new() -> Arm64CodeGen {
+    return Arm64CodeGen {
+        output: "",
+        label_counter: 0,
+        string_consts: Vec::new(),
+        float_consts: Vec::new(),
+    };
+}
+
+// --- Output helpers ------------------------------------------------------
+
+/// Append a string with a trailing newline.
+pub fn Arm64CodeGen_wl(self: &mut Arm64CodeGen, s: str) {
+    self.output = self.output + s + "\n";
+}
+
+// --- Module / function / block generation -------------------------------
+
+pub fn Arm64CodeGen_gen_module(self: &mut Arm64CodeGen, module: L3Module) {
+    // Text section
+    Arm64CodeGen_wl(self, "    .section .text");
+    Arm64CodeGen_wl(self, "    .globl main");
+
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        Arm64CodeGen_gen_function(self, module.functions.get(i));
+        i = i + 1;
+    }
+
+    // Data section for strings and floats (emitted after code so they're populated)
+    if self.string_consts.len() > 0 || self.float_consts.len() > 0 {
+        Arm64CodeGen_wl(self, "    .section .rodata");
+        var si: i64 = 0;
+        while si < self.string_consts.len() {
+            var entry: ArmStringConstEntry = self.string_consts.get(si);
+            Arm64CodeGen_wl(self, entry.label + ":");
+            Arm64CodeGen_wl(self, "    .asciz \"" + arm_escape_string(entry.content) + "\"");
+            si = si + 1;
+        }
+        var fi: i64 = 0;
+        while fi < self.float_consts.len() {
+            var entry: ArmFloatConstEntry = self.float_consts.get(fi);
+            Arm64CodeGen_wl(self, entry.label + ":");
+            Arm64CodeGen_wl(self, "    .quad " + int_to_str(entry.bits));
+            fi = fi + 1;
+        }
+    }
+}
+
+pub fn Arm64CodeGen_gen_function(self: &mut Arm64CodeGen, func: L3Function) {
+    Arm64CodeGen_wl(self, ".globl " + func.name);
+    Arm64CodeGen_wl(self, func.name + ":");
+
+    // Prologue: save LR and FP, allocate stack
+    Arm64CodeGen_wl(self, "    stp x29, x30, [sp, #-16]!");
+    Arm64CodeGen_wl(self, "    mov x29, sp");
+
+    // Calculate stack frame size (simplified: 256 bytes for locals)
+    var frame_size: i64 = 256;
+    if frame_size > 0 {
+        Arm64CodeGen_wl(self, "    sub sp, sp, #" + int_to_str(frame_size));
+    }
+
+    // Generate blocks
+    var i: i64 = 0;
+    while i < func.blocks.len() {
+        var block: L3Block = func.blocks.get(i);
+        Arm64CodeGen_wl(self, ".L" + func.name + int_to_str(self.label_counter) + "_b" + int_to_str(block.id) + ":");
+        Arm64CodeGen_gen_block(self, func, block);
+        i = i + 1;
+    }
+
+    self.label_counter = self.label_counter + 1;
+}
+
+pub fn Arm64CodeGen_gen_block(self: &mut Arm64CodeGen, func: L3Function, block: L3Block) {
+    var i: i64 = 0;
+    while i < block.instructions.len() {
+        Arm64CodeGen_gen_inst(self, func, block.instructions.get(i));
+        i = i + 1;
+    }
+}
+
+// --- Instruction generation ---------------------------------------------
+
+pub fn Arm64CodeGen_gen_inst(self: &mut Arm64CodeGen, func: L3Function, inst: L3Inst) {
+    match inst {
+        L3Inst::AddrOfSlot(dst, slot) => {
+            var d: str = vreg_to_reg(dst);
+            Arm64CodeGen_wl(self, "    add " + d + ", fp, #-" + int_to_str(slot.offset));
+        }
+        L3Inst::GlobalAddr(dst, name, _) => {
+            var d: str = vreg_to_reg(dst);
+            // ARM64: adrp + add for RIP-relative symbol (simplified)
+            Arm64CodeGen_wl(self, "    // global addr " + name);
+            Arm64CodeGen_wl(self, "    mov " + d + ", #0");
+        }
+        L3Inst::Mov(dst, src) => {
+            Arm64CodeGen_gen_mov(self, dst, src);
+        }
+        L3Inst::Bin(op, dst, a, b, _) => {
+            Arm64CodeGen_gen_bin(self, op, dst, a, b);
+        }
+        L3Inst::Unary(op, dst, src, _) => {
+            Arm64CodeGen_gen_unary(self, op, dst, src);
+        }
+        L3Inst::StackAlloc(dst, bytes, _) => {
+            var reg: str = vreg_to_reg(dst);
+            Arm64CodeGen_wl(self, "    sub " + reg + ", sp, #" + int_to_str(bytes));
+        }
+        L3Inst::Load(dst, ptr, _) => {
+            var d: str = vreg_to_reg(dst);
+            var p: str = arm_operand_to_reg(ptr);
+            Arm64CodeGen_wl(self, "    ldr " + d + ", [" + p + "]");
+        }
+        L3Inst::Store(ptr, value, _) => {
+            var p: str = arm_operand_to_reg(ptr);
+            var v: str = arm_operand_to_reg(value);
+            Arm64CodeGen_wl(self, "    str " + v + ", [" + p + "]");
+        }
+        L3Inst::FieldAddr(dst, base, offset, _) => {
+            var d: str = vreg_to_reg(dst);
+            var b: str = arm_operand_to_reg(base);
+            Arm64CodeGen_wl(self, "    add " + d + ", " + b + ", #" + int_to_str(offset));
+        }
+        L3Inst::ElemAddr(dst, base, index, _) => {
+            var d: str = vreg_to_reg(dst);
+            var b: str = arm_operand_to_reg(base);
+            var i: str = arm_operand_to_reg(index);
+            Arm64CodeGen_wl(self, "    lsl x8, " + i + ", #3");
+            Arm64CodeGen_wl(self, "    add " + d + ", " + b + ", x8");
+        }
+        L3Inst::Jmp(target) => {
+            Arm64CodeGen_wl(self, "    b .L" + func.name + int_to_str(self.label_counter) + "_b" + int_to_str(target));
+        }
+        L3Inst::Br(cond, then_b, else_b) => {
+            var c: str = arm_operand_to_reg(cond);
+            Arm64CodeGen_wl(self, "    cmp " + c + ", #0");
+            Arm64CodeGen_wl(self, "    b.ne .L" + func.name + int_to_str(self.label_counter) + "_b" + int_to_str(then_b));
+            Arm64CodeGen_wl(self, "    b .L" + func.name + int_to_str(self.label_counter) + "_b" + int_to_str(else_b));
+        }
+        L3Inst::Ret(value) => {
+            Arm64CodeGen_gen_ret(self, value);
+        }
+        L3Inst::Unreachable => {
+            Arm64CodeGen_wl(self, "    brk #0");
+        }
+        L3Inst::Call(dst, target, args, _) => {
+            Arm64CodeGen_gen_call(self, dst, target, args);
+        }
+        L3Inst::CallPtr(dst, fn_ptr, args, _, _) => {
+            Arm64CodeGen_gen_call_ptr(self, dst, fn_ptr, args);
+        }
+        L3Inst::DynCall(dst, trait_name, method, args, _) => {
+            Arm64CodeGen_gen_dyn_call(self, dst, trait_name, method, args);
+        }
+        L3Inst::MakeDyn(dst, value, _, _) => {
+            var d: str = vreg_to_reg(dst);
+            var v: str = arm_operand_to_reg(value);
+            if !str_equal(d, v) {
+                Arm64CodeGen_wl(self, "    mov " + d + ", " + v);
+            }
+        }
+        L3Inst::Cast(dst, src, _, _, kind) => {
+            Arm64CodeGen_gen_cast(self, dst, src, kind);
+        }
+        L3Inst::TryUnwrap(value, ok_dst, ok_block, err_block) => {
+            var v: str = arm_operand_to_reg(value);
+            var d: str = vreg_to_reg(ok_dst);
+            Arm64CodeGen_wl(self, "    cmp " + v + ", #0");
+            Arm64CodeGen_wl(self, "    b.eq .L" + func.name + int_to_str(self.label_counter) + "_b" + int_to_str(err_block));
+            Arm64CodeGen_wl(self, "    mov " + d + ", " + v);
+            Arm64CodeGen_wl(self, "    b .L" + func.name + int_to_str(self.label_counter) + "_b" + int_to_str(ok_block));
+        }
+        L3Inst::Print(value, _) => {
+            var v: str = arm_operand_to_reg(value);
+            Arm64CodeGen_wl(self, "    mov x0, " + v);
+            Arm64CodeGen_wl(self, "    bl p_print_int");
+        }
+        L3Inst::Panic(message) => {
+            Arm64CodeGen_wl(self, "    // panic: " + message);
+            Arm64CodeGen_wl(self, "    brk #1");
+        }
+    }
+}
+
+// --- Simple instruction generators ---------------------------------------
+
+pub fn Arm64CodeGen_gen_mov(self: &mut Arm64CodeGen, dst: VReg, src: Operand) {
+    var d: str = vreg_to_reg(dst);
+    match src {
+        Operand::ImmI(i) => {
+            if i >= -2048 && i <= 2047 {
+                Arm64CodeGen_wl(self, "    mov " + d + ", #" + int_to_str(i));
+            } else {
+                // Load large immediate via movz + movk sequence.
+                // Treat i as unsigned 64-bit for bit extraction (Fides i64
+                // two's complement bit pattern matches u64).
+                var v: i64 = i;
+                Arm64CodeGen_wl(self, "    movz " + d + ", #" + int_to_str(v & 0xffff));
+                // Need movk lsl #16 if bits 16-31 set OR sign bit set (v < 0)
+                if v > 0xffff || v < 0 {
+                    Arm64CodeGen_wl(self, "    movk " + d + ", #" + int_to_str((v >> 16) & 0xffff) + ", lsl #16");
+                }
+                if v > 0xffffffff || v < 0 {
+                    Arm64CodeGen_wl(self, "    movk " + d + ", #" + int_to_str((v >> 32) & 0xffff) + ", lsl #32");
+                }
+            }
+        }
+        Operand::VReg(v) => {
+            var s: str = vreg_to_reg(v);
+            if !str_equal(d, s) {
+                Arm64CodeGen_wl(self, "    mov " + d + ", " + s);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn Arm64CodeGen_gen_bin(self: &mut Arm64CodeGen, op: BinOp, dst: VReg, a: Operand, b: Operand) {
+    var d: str = vreg_to_reg(dst);
+    var l: str = arm_operand_to_reg(a);
+    var r: str = arm_operand_to_reg(b);
+    if binop_eq(op, BinOp::Add) {
+        Arm64CodeGen_wl(self, "    add " + d + ", " + l + ", " + r);
+    } else if binop_eq(op, BinOp::Sub) {
+        Arm64CodeGen_wl(self, "    sub " + d + ", " + l + ", " + r);
+    } else if binop_eq(op, BinOp::Mul) {
+        Arm64CodeGen_wl(self, "    mul " + d + ", " + l + ", " + r);
+    } else if binop_eq(op, BinOp::Div) {
+        Arm64CodeGen_wl(self, "    sdiv " + d + ", " + l + ", " + r);
+    } else if binop_eq(op, BinOp::Mod) {
+        Arm64CodeGen_wl(self, "    sdiv x8, " + l + ", " + r);
+        Arm64CodeGen_wl(self, "    msub " + d + ", " + r + ", x8, " + l);
+    } else if binop_eq(op, BinOp::BitAnd) {
+        Arm64CodeGen_wl(self, "    and " + d + ", " + l + ", " + r);
+    } else if binop_eq(op, BinOp::BitOr) {
+        Arm64CodeGen_wl(self, "    orr " + d + ", " + l + ", " + r);
+    } else if binop_eq(op, BinOp::BitXor) {
+        Arm64CodeGen_wl(self, "    eor " + d + ", " + l + ", " + r);
+    } else if binop_eq(op, BinOp::Shl) {
+        Arm64CodeGen_wl(self, "    lsl " + d + ", " + l + ", " + r);
+    } else if binop_eq(op, BinOp::Shr) {
+        Arm64CodeGen_wl(self, "    asr " + d + ", " + l + ", " + r);
+    } else if binop_eq(op, BinOp::Eq) {
+        Arm64CodeGen_wl(self, "    cmp " + l + ", " + r);
+        Arm64CodeGen_wl(self, "    cset " + d + ", eq");
+    } else if binop_eq(op, BinOp::Neq) {
+        Arm64CodeGen_wl(self, "    cmp " + l + ", " + r);
+        Arm64CodeGen_wl(self, "    cset " + d + ", ne");
+    } else if binop_eq(op, BinOp::Lt) {
+        Arm64CodeGen_wl(self, "    cmp " + l + ", " + r);
+        Arm64CodeGen_wl(self, "    cset " + d + ", lt");
+    } else if binop_eq(op, BinOp::Gt) {
+        Arm64CodeGen_wl(self, "    cmp " + l + ", " + r);
+        Arm64CodeGen_wl(self, "    cset " + d + ", gt");
+    } else if binop_eq(op, BinOp::LtEq) {
+        Arm64CodeGen_wl(self, "    cmp " + l + ", " + r);
+        Arm64CodeGen_wl(self, "    cset " + d + ", le");
+    } else if binop_eq(op, BinOp::GtEq) {
+        Arm64CodeGen_wl(self, "    cmp " + l + ", " + r);
+        Arm64CodeGen_wl(self, "    cset " + d + ", ge");
+    } else if binop_eq(op, BinOp::And) {
+        Arm64CodeGen_wl(self, "    and " + d + ", " + l + ", " + r);
+    } else if binop_eq(op, BinOp::Or) {
+        Arm64CodeGen_wl(self, "    orr " + d + ", " + l + ", " + r);
+    }
+}
+
+pub fn Arm64CodeGen_gen_unary(self: &mut Arm64CodeGen, op: UnaryOp, dst: VReg, src: Operand) {
+    var d: str = vreg_to_reg(dst);
+    var s: str = arm_operand_to_reg(src);
+    if unaryop_eq(op, UnaryOp::Neg) {
+        Arm64CodeGen_wl(self, "    neg " + d + ", " + s);
+    } else if unaryop_eq(op, UnaryOp::Not) {
+        Arm64CodeGen_wl(self, "    cmp " + s + ", #0");
+        Arm64CodeGen_wl(self, "    cset " + d + ", eq");
+    } else if unaryop_eq(op, UnaryOp::BitNot) {
+        Arm64CodeGen_wl(self, "    mvn " + d + ", " + s);
+    }
+}
+
+pub fn Arm64CodeGen_gen_ret(self: &mut Arm64CodeGen, value: OptOperand) {
+    match value {
+        OptOperand::Some(value) => {
+            var v: str = arm_operand_to_reg(value);
+            Arm64CodeGen_wl(self, "    mov x0, " + v);
+        }
+        OptOperand::None => {}
+    }
+    Arm64CodeGen_wl(self, "    mov sp, x29");
+    Arm64CodeGen_wl(self, "    ldp x29, x30, [sp], #16");
+    Arm64CodeGen_wl(self, "    return");
+}
+
+pub fn Arm64CodeGen_gen_call(self: &mut Arm64CodeGen, dst: OptVReg, target: str, args: Vec<Operand>) {
+    var i: i64 = 0;
+    while i < args.len() && i < 8 {
+        var a: str = arm_operand_to_reg(args.get(i));
+        var arg_reg: str = reg_name(i);
+        if !str_equal(a, arg_reg) {
+            Arm64CodeGen_wl(self, "    mov " + arg_reg + ", " + a);
+        }
+        i = i + 1;
+    }
+    Arm64CodeGen_wl(self, "    bl " + target);
+    match dst {
+        OptVReg::Some(d) => {
+            var dreg: str = vreg_to_reg(d);
+            if !str_equal(dreg, "x0") {
+                Arm64CodeGen_wl(self, "    mov " + dreg + ", x0");
+            }
+        }
+        OptVReg::None => {}
+    }
+}
+
+pub fn Arm64CodeGen_gen_call_ptr(self: &mut Arm64CodeGen, dst: OptVReg, fn_ptr: Operand, args: Vec<Operand>) {
+    var ptr: str = arm_operand_to_reg(fn_ptr);
+    var i: i64 = 0;
+    while i < args.len() && i < 7 {
+        var a: str = arm_operand_to_reg(args.get(i));
+        var arg_reg: str = reg_name(i);
+        if !str_equal(a, arg_reg) {
+            Arm64CodeGen_wl(self, "    mov " + arg_reg + ", " + a);
+        }
+        i = i + 1;
+    }
+    Arm64CodeGen_wl(self, "    blr " + ptr);
+    match dst {
+        OptVReg::Some(d) => {
+            var dreg: str = vreg_to_reg(d);
+            if !str_equal(dreg, "x0") {
+                Arm64CodeGen_wl(self, "    mov " + dreg + ", x0");
+            }
+        }
+        OptVReg::None => {}
+    }
+}
+
+pub fn Arm64CodeGen_gen_dyn_call(self: &mut Arm64CodeGen, dst: OptVReg, trait_name: str, method: str, args: Vec<Operand>) {
+    var callee: str = trait_name + "_" + method;
+    var i: i64 = 0;
+    while i < args.len() && i < 8 {
+        var a: str = arm_operand_to_reg(args.get(i));
+        var arg_reg: str = reg_name(i);
+        if !str_equal(a, arg_reg) {
+            Arm64CodeGen_wl(self, "    mov " + arg_reg + ", " + a);
+        }
+        i = i + 1;
+    }
+    Arm64CodeGen_wl(self, "    bl " + callee);
+    match dst {
+        OptVReg::Some(d) => {
+            var dreg: str = vreg_to_reg(d);
+            if !str_equal(dreg, "x0") {
+                Arm64CodeGen_wl(self, "    mov " + dreg + ", x0");
+            }
+        }
+        OptVReg::None => {}
+    }
+}
+
+pub fn Arm64CodeGen_gen_cast(self: &mut Arm64CodeGen, dst: VReg, src: Operand, kind: CastKind) {
+    var d: str = vreg_to_reg(dst);
+    var s: str = arm_operand_to_reg(src);
+    if cast_kind_eq(kind, CastKind::BitCast) {
+        if !str_equal(d, s) {
+            Arm64CodeGen_wl(self, "    mov " + d + ", " + s);
+        }
+    } else if cast_kind_eq(kind, CastKind::IntExtend) {
+        Arm64CodeGen_wl(self, "    sxtw " + d + ", " + s);
+    } else if cast_kind_eq(kind, CastKind::IntTrunc) {
+        Arm64CodeGen_wl(self, "    mov w" + strip_x_prefix(d) + ", w" + strip_x_prefix(s));
+    } else if cast_kind_eq(kind, CastKind::IntToFloat) {
+        Arm64CodeGen_wl(self, "    scvtf d" + strip_x_prefix(d) + ", " + s);
+    } else if cast_kind_eq(kind, CastKind::FloatToInt) {
+        Arm64CodeGen_wl(self, "    fcvtzs " + d + ", d" + strip_x_prefix(s));
+    }
+}
+
+// ===========================================================================
+// Operand helpers
+// ===========================================================================
+
+pub fn arm_operand_to_reg(op: Operand) -> str {
+    match op {
+        Operand::VReg(v) => { return vreg_to_reg(v); }
+        _ => { return "x9"; } // scratch register for immediates/slots
+    }
+    return "x9";
+}
+
+/// Strip the 'x' or 'X' prefix from a register name (e.g. "x5" -> "5").
+/// Returns "0" if the name doesn't start with 'x' (matches Rust unwrap_or).
+pub fn strip_x_prefix(s: str) -> str {
+    if str_starts_with(s, "x") {
+        return str_slice(s, 1, str_len(s));
+    }
+    if str_starts_with(s, "X") {
+        return str_slice(s, 1, str_len(s));
+    }
+    return "0";
+}
+
+/// Escape a string for .asciz emission (backslash and double-quote).
+pub fn arm_escape_string(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if c == 92 { // backslash
+            out = out + "\\\\";
+        } else if c == 34 { // double quote
+            out = out + "\\\"";
+        } else {
+            out = out + char_to_str(c);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// CastKind equality helper (mirrors ast::binop_eq pattern).
+pub fn cast_kind_eq(a: CastKind, b: CastKind) -> bool {
+    match a {
+        CastKind::BitCast => { match b { CastKind::BitCast => { return true; }, _ => { return false; } } }
+        CastKind::IntExtend => { match b { CastKind::IntExtend => { return true; }, _ => { return false; } } }
+        CastKind::IntTrunc => { match b { CastKind::IntTrunc => { return true; }, _ => { return false; } } }
+        CastKind::IntToFloat => { match b { CastKind::IntToFloat => { return true; }, _ => { return false; } } }
+        CastKind::FloatToInt => { match b { CastKind::FloatToInt => { return true; }, _ => { return false; } } }
+    }
+    return false;
+}

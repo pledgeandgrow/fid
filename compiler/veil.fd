@@ -1,0 +1,527 @@
+module compiler::veil;
+
+use core;
+use vec;
+use string;
+use compiler::ir;
+use compiler::compiler;
+use compiler::interp;
+
+pub struct CovLineEntry {
+    pub a: str,
+    pub b: i64,
+}
+
+pub fn CovLineEntry_new(a: str, b: i64) -> CovLineEntry {
+    return CovLineEntry { a: a, b: b };
+}
+
+pub struct FuncCount {
+    pub name: str,
+    pub total: i64,
+    pub covered: i64,
+}
+
+pub fn FuncCount_new(name: str, total: i64, covered: i64) -> FuncCount {
+    return FuncCount { name: name, total: total, covered: covered };
+}
+
+pub struct CoverageData {
+    pub all_functions: Vec<str>,
+    pub called_functions: Vec<str>,
+    pub all_lines: Vec<CovLineEntry>,
+    pub covered_lines: Vec<CovLineEntry>,
+    pub all_instructions: Vec<CovLineEntry>,
+    pub covered_instructions: Vec<CovLineEntry>,
+    pub func_line_counts: Vec<FuncCount>,
+}
+
+pub fn CoverageData_new() -> CoverageData {
+    return CoverageData {
+        all_functions: Vec::new(),
+        called_functions: Vec::new(),
+        all_lines: Vec::new(),
+        covered_lines: Vec::new(),
+        all_instructions: Vec::new(),
+        covered_instructions: Vec::new(),
+        func_line_counts: Vec::new(),
+    };
+}
+
+/// Result of run_with_coverage: structural coverage data plus the interpreter
+/// run outcome and an optional panic stack trace.
+/// Ported from src/veil.rs:88 (Rust returns (CoverageData, RunResult, Option<String>)).
+pub struct CoverageRunResult {
+    pub data: CoverageData,
+    pub status: str,      // "ok", "panic: <msg>", or "paused"
+    pub trace: OptStr,     // panic stack trace if the run panicked
+}
+
+pub fn CoverageRunResult_new(data: CoverageData, status: str, trace: OptStr) -> CoverageRunResult {
+    return CoverageRunResult { data: data, status: status, trace: trace };
+}
+
+fn veil_split_lines(s: str) -> Vec<str> {
+    var result: Vec<str> = Vec::new();
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if str_byte_at(s, i) == 10 {
+            result.push(str_slice(s, start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < str_len(s) {
+        result.push(str_slice(s, start, str_len(s)));
+    }
+    return result;
+}
+
+pub fn CoverageData_function_coverage_pct(self: &CoverageData) -> f64 {
+    if self.all_functions.len() == 0 { return 0.0; }
+    return 100.0 * (self.called_functions.len()) / (self.all_functions.len());
+}
+
+pub fn CoverageData_line_coverage_pct(self: &CoverageData) -> f64 {
+    if self.all_lines.len() == 0 { return 0.0; }
+    return 100.0 * (self.covered_lines.len()) / (self.all_lines.len());
+}
+
+pub fn CoverageData_instruction_coverage_pct(self: &CoverageData) -> f64 {
+    if self.all_instructions.len() == 0 { return 0.0; }
+    return 100.0 * (self.covered_instructions.len()) / (self.all_instructions.len());
+}
+
+fn str_vec_contains(v: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if str_equal(v.get(i), s) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn line_vec_contains(v: Vec<CovLineEntry>, entry: CovLineEntry) -> bool {
+    var en0: str = entry.a;
+    var en1: i64 = entry.b;
+    var i: i64 = 0;
+    while i < v.len() {
+        var e: CovLineEntry = v.get(i);
+        var e0: str = e.a;
+        var e1: i64 = e.b;
+        if str_equal(e0, en0) && e1 == en1 { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn line_in_set(set: Vec<CovLineEntry>, line_num: i64) -> bool {
+    var i: i64 = 0;
+    while i < set.len() {
+        var s0: str = set.get(i).a;
+        var s1: i64 = set.get(i).b;
+        if s1 == line_num { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn pad_str(s: str, width: i64) -> str {
+    var result: str = s;
+    while str_len(result) < width {
+        result = result + " ";
+    }
+    return result;
+}
+
+fn pad_int(n: i64, width: i64) -> str {
+    var s: str = int_to_str(n);
+    while str_len(s) < width {
+        s = " " + s;
+    }
+    return s;
+}
+
+fn float_to_str_1(f: f64) -> str {
+    var whole: i64 = f as i64;
+    var frac: f64 = f - (whole as f64);
+    if frac < 0.0 { frac = -frac; }
+    var frac_int: i64 = (frac * 10.0) as i64;
+    return int_to_str(whole) + "." + int_to_str(frac_int);
+}
+
+fn str_rfind_char(s: str, ch: i64) -> i64 {
+    var i: i64 = str_len(s) - 1;
+    while i >= 0 {
+        if str_byte_at(s, i) == ch { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+fn escape_html(s: str) -> str {
+    var result: str = str_replace(s, "&", "&" + "amp;");
+    result = str_replace(result, "<", "&" + "lt;");
+    result = str_replace(result, ">", "&" + "gt;");
+    return result;
+}
+
+fn summary_card(label: str, covered: i64, total: i64, pct: f64) -> str {
+    var cls: str = "partial";
+    if pct == 100.0 { cls = "full"; }
+    else if pct < 50.0 { cls = "low"; }
+    return "<div class=\"card " + cls + "\"><div class=\"card-label\">" + label
+        + "</div><div class=\"card-value\">" + float_to_str_1(pct) + "%</div><div class=\"card-detail\">"
+        + int_to_str(covered) + " / " + int_to_str(total) + "</div></div>\n";
+}
+
+pub fn CoverageData_mark_function_called(self: &mut CoverageData, name: str) -> void {
+    if !str_vec_contains(self.called_functions, name) {
+        self.called_functions.push(name);
+    }
+}
+
+pub fn CoverageData_mark_line_covered(self: &mut CoverageData, func_name: str, line: i64) -> void {
+    var entry: CovLineEntry = CovLineEntry_new(func_name, line);
+    if !line_vec_contains(self.covered_lines, entry) {
+        self.covered_lines.push(entry);
+    }
+}
+
+pub fn CoverageData_mark_instruction_covered(self: &mut CoverageData, func_name: str, inst_id: i64) -> void {
+    var entry: CovLineEntry = CovLineEntry_new(func_name, inst_id);
+    if !line_vec_contains(self.covered_instructions, entry) {
+        self.covered_instructions.push(entry);
+    }
+}
+
+pub fn CoverageData_compute_func_counts(self: &mut CoverageData) -> void {
+    var fi: i64 = 0;
+    while fi < self.all_functions.len() {
+        var name: str = self.all_functions.get(fi);
+        var total: i64 = 0;
+        var covered: i64 = 0;
+
+        var li: i64 = 0;
+        while li < self.all_lines.len() {
+            var entry: CovLineEntry = self.all_lines.get(li);
+            var al0: str = entry.a;
+            var al1: i64 = entry.b;
+            if str_equal(al0, name) {
+                total = total + 1;
+            }
+            li = li + 1;
+        }
+
+        var ci: i64 = 0;
+        while ci < self.covered_lines.len() {
+            var entry: CovLineEntry = self.covered_lines.get(ci);
+            var cl0: str = entry.a;
+            var cl1: i64 = entry.b;
+            if str_equal(cl0, name) {
+                covered = covered + 1;
+            }
+            ci = ci + 1;
+        }
+
+        self.func_line_counts.push(FuncCount_new(name, total, covered));
+        fi = fi + 1;
+    }
+}
+
+pub fn collect_all_coverage(module: IrModule) -> CoverageData {
+    var data: CoverageData = CoverageData_new();
+
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var entry: IrFunctionEntry = module.functions.get(fi);
+        var name: str = entry.name;
+        var func: IrFunction = entry.func;
+
+        if !str_vec_contains(data.all_functions, name) {
+            data.all_functions.push(name);
+        }
+
+        var bi: i64 = 0;
+        while bi < func.blocks.len() {
+            var block: BasicBlock = func.blocks.get(bi);
+            var ii: i64 = 0;
+            while ii < block.instructions.len() {
+                var inst_id: i64 = block.instructions.get(ii);
+                data.all_instructions.push(CovLineEntry_new(name, inst_id));
+
+                // Record source line if available
+                var meta_opt: OptValueMeta = IrFunction_get_meta(&func, inst_id);
+                match meta_opt {
+                    OptValueMeta::Some(meta) => {
+                        match meta.source_line {
+                            OptU64::Some(line) => {
+                                if line > 0 {
+                                    var line_entry: CovLineEntry = CovLineEntry_new(name, line);
+                                    if !line_vec_contains(data.all_lines, line_entry) {
+                                        data.all_lines.push(line_entry);
+                                    }
+                                }
+                            }
+                            OptU64::None => {}
+                        }
+                    }
+                    OptValueMeta::None => {}
+                }
+                ii = ii + 1;
+            }
+            bi = bi + 1;
+        }
+        fi = fi + 1;
+    }
+
+    return data;
+}
+
+/// Run the interpreter on `source` while collecting coverage data.
+/// Ported from src/veil.rs:88 (Rust: run_with_coverage).
+///
+/// Steps:
+///   1. Build IR from source via lower_to_ir_module.
+///   2. Collect all structural coverage points via collect_all_coverage.
+///   3. Run the interpreter with a debug hook that records covered
+///      lines/instructions/functions.
+///   4. Return (CoverageData, RunResult, Option<StackTrace>).
+///
+/// NOTE: Interpreter_set_debug_hook is currently a no-op in the self-hosted
+/// interpreter (compiler/interp.fd:2712), so covered_lines, covered_instructions,
+/// and called_functions remain empty until the hook is fully wired. This
+/// matches the existing veil_run pattern which only reports structural
+/// coverage. The interpreter is still run so that panics and the panic stack
+/// trace are captured.
+pub fn run_with_coverage(source: str, source_path: str) -> CoverageRunResult {
+    // 1. Build IR from source
+    var module_result: ResultIrModule = lower_to_ir_module(source);
+    var module: IrModule;
+    match module_result {
+        ResultIrModule::Ok(m) => { module = m; }
+        ResultIrModule::Err(errs) => {
+            var err_data: CoverageData = CoverageData_new();
+            var msg: str = "Compilation failed:";
+            var ei: i64 = 0;
+            while ei < errs.len() {
+                msg = msg + "\n" + errs.get(ei);
+                ei = ei + 1;
+            }
+            return CoverageRunResult_new(err_data, msg, OptStr::None);
+        }
+    }
+
+    // 2. Collect all structural coverage points
+    var data: CoverageData = collect_all_coverage(module);
+
+    // 3. Run interpreter with debug hook for coverage tracking.
+    //    The hook is a no-op in the self-hosted interpreter, so the
+    //    covered_* sets stay empty (see note above).
+    var interp: Interpreter = Interpreter_new(module);
+    Interpreter_set_debug_hook(&mut interp);
+    var result: RunResult = Interpreter_run(&mut interp);
+    var trace: OptStr = Interpreter_take_panic_stack_trace(&mut interp);
+
+    // 4. Compute per-function line counts
+    CoverageData_compute_func_counts(&mut data);
+
+    // Convert RunResult to a status string
+    var status: str = "ok";
+    match result {
+        RunResult::Return(_) => { status = "ok"; }
+        RunResult::Panic(msg) => { status = "panic: " + msg; }
+        RunResult::Paused => { status = "paused"; }
+    }
+
+    return CoverageRunResult_new(data, status, trace);
+}
+
+pub fn veil_run(input_path: str, format: str, output_dir: str) -> str {
+    var source: str = p_file_read(input_path);
+    if str_len(source) == 0 {
+        return "Cannot read " + input_path;
+    }
+
+    var module_result: ResultIrModule = lower_to_ir_module(source);
+    var module: IrModule;
+    match module_result {
+        ResultIrModule::Ok(m) => { module = m; }
+        ResultIrModule::Err(errs) => {
+            var msg: str = "Compilation failed:";
+            var ei: i64 = 0;
+            while ei < errs.len() {
+                msg = msg + "\n" + errs.get(ei);
+                ei = ei + 1;
+            }
+            return msg;
+        }
+    }
+
+    var data: CoverageData = collect_all_coverage(module);
+    CoverageData_compute_func_counts(&mut data);
+
+    var filename: str = input_path;
+    var slash: i64 = str_rfind_char(filename, 47);
+    if slash >= 0 { filename = str_slice(filename, slash + 1, str_len(filename)); }
+
+    if str_equal(format, "html") {
+        var html: str = generate_html_report(data, source, filename);
+        var path: str = output_dir + "/coverage.html";
+        p_file_write(path, html);
+        return "\nCoverage report: " + path;
+    } else {
+        var text: str = generate_text_report(data, source);
+        var path: str = output_dir + "/coverage.txt";
+        p_file_write(path, text);
+        return text + "\n\nCoverage report: " + path;
+    }
+}
+
+pub fn veil_print_help() -> str {
+    return "veil -- Code coverage tool for Fides\n\n"
+        + "USAGE:\n"
+        + "    veil <file.fd> [--format text|html] [--output <dir>]\n\n"
+        + "OPTIONS:\n"
+        + "    --format <format>   Report format: text (default) or html\n"
+        + "    --output <dir>      Output directory (default: coverage/)\n"
+        + "    --help, -h          Show this help\n\n"
+        + "TRACKS:\n"
+        + "    - Function coverage: which functions were called\n"
+        + "    - Line coverage: which source lines were executed\n"
+        + "    - Instruction coverage: which IR instructions ran\n";
+}
+
+pub fn generate_text_report(data: &CoverageData, source: str) -> str {
+    var report: str = "veil -- Coverage Report\n";
+    report = report + "=======================\n\n";
+    report = report + "Summary\n";
+    report = report + "-------\n";
+    report = report + "Functions:     " + int_to_str(data.called_functions.len()) + "/"
+        + int_to_str(data.all_functions.len()) + " ("
+        + float_to_str_1(CoverageData_function_coverage_pct(data)) + "%)\n";
+    report = report + "Lines:         " + int_to_str(data.covered_lines.len()) + "/"
+        + int_to_str(data.all_lines.len()) + " ("
+        + float_to_str_1(CoverageData_line_coverage_pct(data)) + "%)\n";
+    report = report + "Instructions:  " + int_to_str(data.covered_instructions.len()) + "/"
+        + int_to_str(data.all_instructions.len()) + " ("
+        + float_to_str_1(CoverageData_instruction_coverage_pct(data)) + "%)\n";
+    report = report + "\n";
+
+    report = report + "Per-Function Coverage\n";
+    report = report + "---------------------\n";
+    report = report + "Function                        Lines    Covered   Percent\n";
+    report = report + "--------------------------------------------------------------\n";
+    var fi: i64 = 0;
+    while fi < data.func_line_counts.len() {
+        var entry: FuncCount = data.func_line_counts.get(fi);
+        var name: str = entry.name;
+        var total: i64 = entry.total;
+        var covered: i64 = entry.covered;
+        var pct: f64 = 0.0;
+        if total > 0 { pct = 100.0 * (covered) / (total); }
+        var marker: str = "";
+        if pct == 100.0 { marker = " OK"; }
+        else if pct == 0.0 { marker = " X"; }
+        report = report + pad_str(name, 30) + "  " + pad_int(total, 6) + "  "
+            + pad_int(covered, 8) + "  " + float_to_str_1(pct) + "%" + marker + "\n";
+        fi = fi + 1;
+    }
+    report = report + "\n";
+
+    var uncovered: Vec<CovLineEntry> = Vec::new();
+    var ai: i64 = 0;
+    while ai < data.all_lines.len() {
+        var entry: CovLineEntry = data.all_lines.get(ai);
+        if !line_vec_contains(data.covered_lines, entry) {
+            uncovered.push(entry);
+        }
+        ai = ai + 1;
+    }
+    if uncovered.len() > 0 {
+        report = report + "Uncovered Lines\n";
+        report = report + "---------------\n";
+        var ui: i64 = 0;
+        while ui < uncovered.len() {
+            var entry: CovLineEntry = uncovered.get(ui);
+            report = report + "  " + entry.a + ":" + int_to_str(entry.b) + "\n";
+            ui = ui + 1;
+        }
+        report = report + "\n";
+    }
+
+    report = report + "Source Coverage\n";
+    report = report + "---------------\n";
+    var lines: Vec<str> = veil_split_lines(source);
+    var li: i64 = 0;
+    while li < lines.len() {
+        var line_num: i64 = li + 1;
+        var is_executable: bool = line_in_set(data.all_lines, line_num);
+        var is_covered: bool = line_in_set(data.covered_lines, line_num);
+        var marker: str = "  ";
+        if is_executable {
+            if is_covered { marker = "+ "; } else { marker = "! "; }
+        }
+        report = report + marker + pad_int(line_num, 4) + "  " + lines.get(li) + "\n";
+        li = li + 1;
+    }
+    return report;
+}
+
+
+pub const COVERAGE_CSS: str = "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 20px; color: #333; }\nh1 { color: #1a1a2e; }\n.file { color: #888; font-family: monospace; }\n.summary { display: flex; gap: 15px; margin: 20px 0; }\n.card { padding: 15px 25px; border-radius: 8px; text-align: center; min-width: 150px; }\n.card.full { background: #d4edda; border: 1px solid #c3e6cb; }\n.card.partial { background: #fff3cd; border: 1px solid #ffeaa7; }\n.card.low { background: #f8d7da; border: 1px solid #f5c6cb; }\n.card-label { font-size: 13px; color: #666; }\n.card-value { font-size: 28px; font-weight: bold; margin: 5px 0; }\n.card-detail { font-size: 12px; color: #888; }\ntable { border-collapse: collapse; width: 100%; margin: 15px 0; }\nth, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #eee; }\nth { background: #f5f5f5; }\ntr.full { background: #d4edda; }\ntr.none { background: #f8d7da; }\ntr.partial { background: #fff3cd; }\n.source { background: #f8f8f8; padding: 15px; border-radius: 5px; overflow-x: auto; font-family: 'Fira Code', monospace; font-size: 13px; line-height: 1.6; }\n.line { display: block; }\n.line .lnum { display: inline-block; width: 40px; color: #aaa; text-align: right; padding-right: 10px; user-select: none; }\n.line.covered { background: #e6ffed; }\n.line.uncovered { background: #ffeef0; }\n.line.neutral { background: transparent; }\nfooter { text-align: center; padding: 20px; color: #999; font-size: 13px; }\nfooter a { color: #1a1a2e; }\n";
+
+pub fn generate_html_report(data: &CoverageData, source: str, filename: str) -> str {
+    var html: str = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n";
+    html = html + "<title>Coverage Report -- " + escape_html(filename) + "</title>\n";
+    html = html + "<meta charset=\"utf-8\">\n";
+    html = html + "<style>\n" + COVERAGE_CSS + "</style>\n";
+    html = html + "</head>\n<body>\n";
+    html = html + "<h1>Coverage Report</h1>\n";
+    html = html + "<p class=\"file\">" + escape_html(filename) + "</p>\n";
+    html = html + "<div class=\"summary\">\n";
+    html = html + summary_card("Functions", data.called_functions.len(), data.all_functions.len(), CoverageData_function_coverage_pct(data));
+    html = html + summary_card("Lines", data.covered_lines.len(), data.all_lines.len(), CoverageData_line_coverage_pct(data));
+    html = html + summary_card("Instructions", data.covered_instructions.len(), data.all_instructions.len(), CoverageData_instruction_coverage_pct(data));
+    html = html + "</div>\n";
+    html = html + "<h2>Per-Function Coverage</h2>\n";
+    html = html + "<table>\n<thead><tr><th>Function</th><th>Lines</th><th>Covered</th><th>Coverage</th></tr></thead>\n<tbody>\n";
+    var fi: i64 = 0;
+    while fi < data.func_line_counts.len() {
+        var entry: FuncCount = data.func_line_counts.get(fi);
+        var name: str = entry.name;
+        var total: i64 = entry.total;
+        var covered: i64 = entry.covered;
+        var pct: f64 = 0.0;
+        if total > 0 { pct = 100.0 * (covered) / (total); }
+        var cls: str = "partial";
+        if pct == 100.0 { cls = "full"; }
+        else if pct == 0.0 { cls = "none"; }
+        html = html + "<tr class=\"" + cls + "\"><td>" + escape_html(name) + "</td><td>"
+            + int_to_str(total) + "</td><td>" + int_to_str(covered) + "</td><td>"
+            + float_to_str_1(pct) + "%</td></tr>\n";
+        fi = fi + 1;
+    }
+    html = html + "</tbody>\n</table>\n";
+    html = html + "<h2>Source</h2>\n";
+    html = html + "<pre class=\"source\">\n";
+    var lines: Vec<str> = veil_split_lines(source);
+    var li: i64 = 0;
+    while li < lines.len() {
+        var line_num: i64 = li + 1;
+        var is_executable: bool = line_in_set(data.all_lines, line_num);
+        var is_covered: bool = line_in_set(data.covered_lines, line_num);
+        var cls: str = "neutral";
+        if is_executable {
+            if is_covered { cls = "covered"; } else { cls = "uncovered"; }
+        }
+        html = html + "<span class=\"line " + cls + "\"><span class=\"lnum\">"
+            + int_to_str(line_num) + "</span> " + escape_html(lines.get(li)) + "</span>\n";
+        li = li + 1;
+    }
+    html = html + "</pre>\n";
+    html = html + "<footer><p>Generated by veil -- Fides coverage tool</p></footer>\n";
+    html = html + "</body>\n</html>\n";
+    return html;
+}

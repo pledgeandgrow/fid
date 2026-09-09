@@ -1,0 +1,483 @@
+// macho.fd -- Mach-O Object File Emitter for macOS (x86-64)
+// Ported from src/macho.rs. Produces Mach-O 64-bit relocatable object files (.o).
+//
+// Mach-O 64-bit format:
+//   - Mach-O header (32 bytes)
+//   - Load commands (LC_SEGMENT_64, LC_SYMTAB)
+//   - Sections (__TEXT,__text)
+//   - Relocation entries
+//   - Symbol table (nlist_64, 16 bytes each)
+//   - String table
+
+module compiler::macho;
+
+use core;
+use vec;
+use string;
+
+// --- Constants ----------------------------------------------------------
+
+pub const MH_MAGIC_64: i64 = 0xFEEDFACF;
+pub const CPU_TYPE_X86_64: i64 = 0x01000007;
+pub const CPU_SUBTYPE_ALL: i64 = 3;
+pub const MH_OBJECT: i64 = 1;
+
+pub const LC_SEGMENT_64: i64 = 0x19;
+pub const LC_SYMTAB: i64 = 0x2;
+
+// --- Structs ------------------------------------------------------------
+
+pub struct MachOSymbol {
+    pub name: str,
+    pub value: i64,
+    pub section_number: i64,
+    pub sym_type: i64,
+    pub description: i64,
+}
+
+pub fn MachOSymbol_new(name: str, value: i64, section_number: i64, sym_type: i64, description: i64) -> MachOSymbol {
+    return MachOSymbol {
+        name: name,
+        value: value,
+        section_number: section_number,
+        sym_type: sym_type,
+        description: description,
+    };
+}
+
+pub struct MachOReloc {
+    pub offset: i64,
+    pub symbol_index: i64,
+    pub is_pcrel: bool,
+    pub length: i64,
+    pub is_extern: bool,
+    pub rtype: i64,
+}
+
+pub fn MachOReloc_new(offset: i64, symbol_index: i64, is_pcrel: bool, length: i64, is_extern: bool, rtype: i64) -> MachOReloc {
+    return MachOReloc {
+        offset: offset,
+        symbol_index: symbol_index,
+        is_pcrel: is_pcrel,
+        length: length,
+        is_extern: is_extern,
+        rtype: rtype,
+    };
+}
+
+pub struct MachOEmitter {
+    pub text_bytes: Vec<i64>,
+    pub symbols: Vec<MachOSymbol>,
+    pub relocations: Vec<MachOReloc>,
+    pub string_table: Vec<i64>,
+}
+
+pub fn MachOEmitter_new() -> MachOEmitter {
+    return MachOEmitter {
+        text_bytes: Vec::new(),
+        symbols: Vec::new(),
+        relocations: Vec::new(),
+        string_table: Vec::new(),
+    };
+}
+
+// --- Result types ---
+
+pub enum ResultVec { Ok(Vec<i64>), Err(str) }
+pub enum ResultUnit { Ok, Err(str) }
+
+// --- Helper: emit little-endian ---
+
+fn emit_u16(t: &mut Vec, v: i64) { t.push(v & 0xFF); t.push((v >> 8) & 0xFF); }
+fn emit_u32(t: &mut Vec, v: i64) {
+    t.push(v & 0xFF);
+    t.push((v >> 8) & 0xFF);
+    t.push((v >> 16) & 0xFF);
+    t.push((v >> 24) & 0xFF);
+}
+fn emit_u64(t: &mut Vec, v: i64) {
+    var i: i64 = 0;
+    while i < 8 { t.push((v >> (i * 8)) & 0xFF); i = i + 1; }
+}
+
+// --- Assembly parsing + encoding ---
+
+pub fn MachOEmitter_assemble(self: &mut MachOEmitter, asm: str) -> ResultUnit {
+    // Initialize string table with empty string at index 0
+    self.string_table.push(0);
+
+    var lines: Vec<str> = str_lines(asm);
+    var i: i64 = 0;
+    while i < lines.len() {
+        var line: str = str_trim(lines.get(i));
+        if str_len(line) == 0 || str_starts_with(line, "//") || str_starts_with(line, "#") {
+            i = i + 1;
+            continue;
+        }
+
+        // Check for label
+        if str_ends_with(line, ":") {
+            var label: str = str_slice(line, 0, str_len(line) - 1);
+            var offset: i64 = self.text_bytes.len();
+            MachOEmitter_add_symbol(self, label, offset, true);
+            i = i + 1;
+            continue;
+        }
+
+        // Skip directives
+        if str_starts_with(line, ".") {
+            i = i + 1;
+            continue;
+        }
+
+        // Encode instruction
+        match MachOEmitter_encode_instruction(self, line) {
+            ResultUnit::Ok => {}
+            ResultUnit::Err(e) => { return ResultUnit::Err(e); }
+        }
+        i = i + 1;
+    }
+    return ResultUnit::Ok;
+}
+
+fn MachOEmitter_encode_instruction(self: &mut MachOEmitter, line: str) -> ResultUnit {
+    var parts: Vec<str> = str_split_whitespace(line);
+    if parts.len() == 0 {
+        return ResultUnit::Ok;
+    }
+
+    var mnemonic: str = str_trim_end(parts.get(0));
+
+    if str_equal(mnemonic, "ret") {
+        self.text_bytes.push(0xC3);
+    } else if str_equal(mnemonic, "nop") {
+        self.text_bytes.push(0x90);
+    } else if str_equal(mnemonic, "push") {
+        if parts.len() > 1 {
+            var reg: str = str_trim_end(parts.get(1));
+            if str_equal(reg, "rbp") {
+                self.text_bytes.push(0x55);
+            } else if str_equal(reg, "rsp") {
+                self.text_bytes.push(0x54);
+            } else {
+                self.text_bytes.push(0x50);
+            }
+        }
+    } else if str_equal(mnemonic, "pop") {
+        if parts.len() > 1 {
+            var reg: str = str_trim_end(parts.get(1));
+            if str_equal(reg, "rbp") {
+                self.text_bytes.push(0x5D);
+            } else {
+                self.text_bytes.push(0x58);
+            }
+        }
+    } else if str_equal(mnemonic, "call") {
+        if parts.len() > 1 {
+            var target: str = str_trim_end(parts.get(1));
+            self.text_bytes.push(0xE8);
+            var offset: i64 = self.text_bytes.len();
+            self.text_bytes.push(0);
+            self.text_bytes.push(0);
+            self.text_bytes.push(0);
+            self.text_bytes.push(0);
+            var sym_idx: i64 = MachOEmitter_get_or_add_symbol(self, target, 0, false);
+            self.relocations.push(MachOReloc_new(offset, sym_idx, true, 2, true, 0));
+        }
+    } else if str_equal(mnemonic, "jmp") {
+        if parts.len() > 1 {
+            var target: str = str_trim_end(parts.get(1));
+            self.text_bytes.push(0xE9);
+            var offset: i64 = self.text_bytes.len();
+            self.text_bytes.push(0);
+            self.text_bytes.push(0);
+            self.text_bytes.push(0);
+            self.text_bytes.push(0);
+            var sym_idx: i64 = MachOEmitter_get_or_add_symbol(self, target, 0, false);
+            self.relocations.push(MachOReloc_new(offset, sym_idx, true, 2, true, 0));
+        }
+    } else if str_equal(mnemonic, "int3") || str_equal(mnemonic, "hlt") {
+        self.text_bytes.push(0xCC);
+    } else {
+        self.text_bytes.push(0x90);
+    }
+
+    return ResultUnit::Ok;
+}
+
+fn MachOEmitter_add_symbol(self: &mut MachOEmitter, name: str, offset: i64, is_defined: bool) -> void {
+    var section: i64 = 0;
+    if is_defined { section = 1; } else { section = 0; }
+    var sym_type: i64 = 0;
+    if is_defined { sym_type = 0x0e; } else { sym_type = 0x01; }
+
+    self.symbols.push(MachOSymbol_new(name, offset, section, sym_type, 0));
+}
+
+fn MachOEmitter_get_or_add_symbol(self: &mut MachOEmitter, name: str, offset: i64, is_defined: bool) -> i64 {
+    var i: i64 = 0;
+    while i < self.symbols.len() {
+        if str_equal(self.symbols.get(i).name, name) {
+            return i;
+        }
+        i = i + 1;
+    }
+    var idx: i64 = self.symbols.len();
+    MachOEmitter_add_symbol(self, name, offset, is_defined);
+    return idx;
+}
+
+fn MachOEmitter_add_string(self: &mut MachOEmitter, s: str) -> i64 {
+    var offset: i64 = self.string_table.len();
+    var i: i64 = 0;
+    while i < str_len(s) {
+        self.string_table.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+    self.string_table.push(0);
+    return offset;
+}
+
+// --- Build Mach-O object file ---
+
+pub fn MachOEmitter_build_macho(self: &mut MachOEmitter) -> ResultVec {
+    var header_size: i64 = 32;
+    var segment_cmd_size: i64 = 72;
+    var section_header_size: i64 = 80;
+    var symtab_cmd_size: i64 = 24;
+
+    var load_commands_size: i64 = segment_cmd_size + section_header_size + symtab_cmd_size;
+
+    var text_data_offset: i64 = header_size + load_commands_size;
+    var text_data_size: i64 = self.text_bytes.len();
+
+    var reloc_offset: i64 = text_data_offset + text_data_size;
+    var reloc_size: i64 = self.relocations.len() * 8;
+
+    var symbol_table_offset: i64 = reloc_offset + reloc_size;
+    var symbol_table_size: i64 = self.symbols.len() * 16;
+
+    var string_table_offset: i64 = symbol_table_offset + symbol_table_size;
+
+    // Build string table entries for symbols
+    var sym_string_offsets: Vec<i64> = Vec::new();
+    var si: i64 = 0;
+    while si < self.symbols.len() {
+        var name: str = self.symbols.get(si).name;
+        var offset: i64 = MachOEmitter_add_string(self, name);
+        sym_string_offsets.push(offset);
+        si = si + 1;
+    }
+
+    var buf: Vec<i64> = Vec::new();
+
+    // -- Mach-O Header (32 bytes) --
+    emit_u32(&mut buf, MH_MAGIC_64);                     // magic
+    emit_u32(&mut buf, CPU_TYPE_X86_64);                 // cputype
+    emit_u32(&mut buf, CPU_SUBTYPE_ALL);                  // cpusubtype
+    emit_u32(&mut buf, MH_OBJECT);                        // filetype
+    emit_u32(&mut buf, 2);                               // ncmds (2: segment + symtab)
+    emit_u32(&mut buf, load_commands_size);              // sizeofcmds
+    emit_u32(&mut buf, 0);                               // flags
+    emit_u32(&mut buf, 0);                               // reserved
+
+    // -- LC_SEGMENT_64 Load Command (72 bytes) --
+    emit_u32(&mut buf, LC_SEGMENT_64);                   // cmd
+    emit_u32(&mut buf, segment_cmd_size + section_header_size); // cmdsize
+    // segname (16 bytes, padded with zeros): __TEXT
+    buf.push(0x5F); buf.push(0x5F); buf.push(0x54); buf.push(0x45); buf.push(0x58); buf.push(0x54); // __TEXT
+    var pad_i: i64 = 6;
+    while pad_i < 16 { buf.push(0); pad_i = pad_i + 1; }
+    emit_u64(&mut buf, 0);                               // vmaddr
+    emit_u64(&mut buf, text_data_size);                  // vmsize
+    emit_u64(&mut buf, text_data_offset);                // fileoff
+    emit_u64(&mut buf, text_data_size);                  // filesize
+    emit_u32(&mut buf, 0);                               // maxprot
+    emit_u32(&mut buf, 0);                               // initprot
+    emit_u32(&mut buf, 1);                               // nsects (1: __text)
+    emit_u32(&mut buf, 0);                               // flags
+
+    // -- Section Header (80 bytes) --
+    // sectname (16 bytes): __text
+    buf.push(0x5F); buf.push(0x5F); buf.push(0x74); buf.push(0x65); buf.push(0x78); buf.push(0x74); // __text
+    pad_i = 6;
+    while pad_i < 16 { buf.push(0); pad_i = pad_i + 1; }
+    // segname (16 bytes): __TEXT
+    buf.push(0x5F); buf.push(0x5F); buf.push(0x54); buf.push(0x45); buf.push(0x58); buf.push(0x54); // __TEXT
+    pad_i = 6;
+    while pad_i < 16 { buf.push(0); pad_i = pad_i + 1; }
+    emit_u64(&mut buf, 0);                               // addr
+    emit_u64(&mut buf, text_data_size);                  // size
+    emit_u32(&mut buf, text_data_offset);                // offset
+    emit_u32(&mut buf, reloc_offset);                    // reloff
+    emit_u32(&mut buf, self.relocations.len());          // nreloc
+    emit_u32(&mut buf, 0);                               // align
+    emit_u32(&mut buf, 0);                               // reloff2 (reserved)
+    emit_u32(&mut buf, 0);                               // nreloc2 (reserved)
+    emit_u32(&mut buf, 0);                               // flags
+    emit_u32(&mut buf, 0);                               // reserved1
+    emit_u32(&mut buf, 0);                               // reserved2
+    emit_u32(&mut buf, 0);                               // reserved3 (64-bit only)
+
+    // -- LC_SYMTAB Load Command (24 bytes) --
+    emit_u32(&mut buf, LC_SYMTAB);                       // cmd
+    emit_u32(&mut buf, symtab_cmd_size);                 // cmdsize
+    emit_u32(&mut buf, symbol_table_offset);             // symoff
+    emit_u32(&mut buf, self.symbols.len());              // nsyms
+    emit_u32(&mut buf, string_table_offset);             // stroff
+    emit_u32(&mut buf, self.string_table.len());         // strsize
+
+    // -- __TEXT,__text section data --
+    var ti: i64 = 0;
+    while ti < self.text_bytes.len() {
+        buf.push(self.text_bytes.get(ti));
+        ti = ti + 1;
+    }
+
+    // -- Relocations (8 bytes each) --
+    var ri: i64 = 0;
+    while ri < self.relocations.len() {
+        var reloc: MachOReloc = self.relocations.get(ri);
+        emit_u32(&mut buf, reloc.offset);                 // r_offset
+        // r_symbolnum (24 bits) + r_pcrel (1 bit) + r_length (2 bits) + r_extern (1 bit) + r_type (4 bits)
+        var packed: i64 = reloc.symbol_index & 0x00ffffff;
+        if reloc.is_pcrel { packed = packed | (1 << 24); }
+        packed = packed | ((reloc.length & 3) << 25);
+        if reloc.is_extern { packed = packed | (1 << 27); }
+        packed = packed | ((reloc.rtype & 0xf) << 28);
+        emit_u32(&mut buf, packed);
+        ri = ri + 1;
+    }
+
+    // -- Symbol Table (nlist_64, 16 bytes each) --
+    var syi: i64 = 0;
+    while syi < self.symbols.len() {
+        var sym: MachOSymbol = self.symbols.get(syi);
+        var str_offset: i64 = sym_string_offsets.get(syi);
+        emit_u32(&mut buf, str_offset);                   // n_strx
+        buf.push(sym.sym_type);                           // n_type
+        buf.push(sym.section_number);                     // n_sect
+        emit_u16(&mut buf, sym.description);              // n_desc
+        emit_u64(&mut buf, sym.value);                    // n_value
+        syi = syi + 1;
+    }
+
+    // -- String Table --
+    var sti: i64 = 0;
+    while sti < self.string_table.len() {
+        buf.push(self.string_table.get(sti));
+        sti = sti + 1;
+    }
+
+    return ResultVec::Ok(buf);
+}
+
+// --- Public API ---
+
+pub fn emit_object_file(module: i64, asm: str) -> ResultVec {
+    var emitter: MachOEmitter = MachOEmitter_new();
+    match MachOEmitter_assemble(emitter, asm) {
+        ResultUnit::Ok => {}
+        ResultUnit::Err(e) => { return ResultVec::Err(e); }
+    }
+    return MachOEmitter_build_macho(emitter);
+}
+
+// --- Local helpers (string utilities) ---
+
+fn str_lines(s: str) -> Vec<str> {
+    var result: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    var start: i64 = 0;
+    while i < str_len(s) {
+        var b: i64 = str_byte_at(s, i);
+        if b == 10 {
+            result.push(str_slice(s, start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < str_len(s) {
+        result.push(str_slice(s, start, str_len(s)));
+    }
+    return result;
+}
+
+fn str_trim(s: str) -> str {
+    var start: i64 = 0;
+    var end: i64 = str_len(s);
+    while start < end {
+        var b: i64 = str_byte_at(s, start);
+        if b == 32 || b == 9 || b == 13 || b == 10 {
+            start = start + 1;
+        } else {
+            break;
+        }
+    }
+    while end > start {
+        var b: i64 = str_byte_at(s, end - 1);
+        if b == 32 || b == 9 || b == 13 || b == 10 {
+            end = end - 1;
+        } else {
+            break;
+        }
+    }
+    return str_slice(s, start, end);
+}
+
+fn str_trim_end(s: str) -> str {
+    var end: i64 = str_len(s);
+    while end > 0 {
+        var b: i64 = str_byte_at(s, end - 1);
+        if b == 32 || b == 9 || b == 13 || b == 10 || b == 44 {
+            end = end - 1;
+        } else {
+            break;
+        }
+    }
+    return str_slice(s, 0, end);
+}
+
+fn str_starts_with(s: str, prefix: str) -> bool {
+    if str_len(s) < str_len(prefix) { return false; }
+    var i: i64 = 0;
+    while i < str_len(prefix) {
+        if str_byte_at(s, i) != str_byte_at(prefix, i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn str_ends_with(s: str, suffix: str) -> bool {
+    var slen: i64 = str_len(s);
+    var flen: i64 = str_len(suffix);
+    if slen < flen { return false; }
+    var i: i64 = 0;
+    while i < flen {
+        if str_byte_at(s, slen - flen + i) != str_byte_at(suffix, i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn str_split_whitespace(s: str) -> Vec<str> {
+    var result: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    var start: i64 = -1;
+    while i < str_len(s) {
+        var b: i64 = str_byte_at(s, i);
+        if b == 32 || b == 9 {
+            if start >= 0 {
+                result.push(str_slice(s, start, i));
+                start = -1;
+            }
+        } else {
+            if start < 0 { start = i; }
+        }
+        i = i + 1;
+    }
+    if start >= 0 {
+        result.push(str_slice(s, start, str_len(s)));
+    }
+    return result;
+}

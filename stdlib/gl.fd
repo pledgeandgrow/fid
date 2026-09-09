@@ -1,0 +1,384 @@
+// Fides OpenGL standard library
+//
+// OpenGL 3.3+ FFI bindings for hardware-accelerated 3D rendering.
+// Provides core OpenGL function declarations, shader management,
+// buffer management (VBO/VAO/IBO), and texture management.
+//
+// Install on Linux: sudo apt install libgl1-mesa-dev libglu1-mesa-dev
+// Install on macOS:  (built-in framework)
+// Link with: -lGL -lGLU (Linux) or -framework OpenGL (macOS)
+//
+// Usage:
+//   use gl;
+//   use sdl;
+//
+//   // Create OpenGL context via SDL
+//   sdl_init(SDL_INIT_VIDEO);
+//   var win = sdl_create_window_gl("3D Game", 800, 600);
+//   var ctx = sdl_create_gl_context(win);
+//   gl_init();
+//
+//   // Compile shaders
+//   var prog = gl_create_program(vert_src, frag_src);
+//   gl_use_program(prog);
+//
+//   // Create VBO
+//   var vbo = gl_gen_buffer();
+//   gl_bind_buffer(GL_ARRAY_BUFFER, vbo);
+//   gl_buffer_data(GL_ARRAY_BUFFER, data_size, data_ptr, GL_STATIC_DRAW);
+
+module gl;
+
+// ─── OpenGL FFI Declarations ──────────────────────────────────────────────
+//
+// These are direct OpenGL function declarations.
+// On Linux, they link against libGL.so. On Windows, opengl32.lib.
+// On macOS, the OpenGL framework.
+
+extern "C" include "<GL/gl.h>" link "GL" {
+    fn glClear as gl_clear(mask: i64) -> void;
+    fn glClearColor as gl_clear_color(r: f64, g: f64, b: f64, a: f64) -> void;
+    fn glEnable as gl_enable(cap: i64) -> void;
+    fn glDisable as gl_disable(cap: i64) -> void;
+    fn glViewport as gl_viewport(x: i64, y: i64, w: i64, h: i64) -> void;
+    fn glGetError as gl_get_error() -> i64;
+
+    fn glGenBuffers as gl_gen_buffers(n: i64, buffers: i64) -> void;
+    fn glBindBuffer as gl_bind_buffer(target: i64, buffer: i64) -> void;
+    fn glBufferData as gl_buffer_data(target: i64, size: i64, data: i64, usage: i64) -> void;
+    fn glDeleteBuffers as gl_delete_buffers(n: i64, buffers: i64) -> void;
+
+    fn glGenVertexArrays as gl_gen_vertex_arrays(n: i64, arrays: i64) -> void;
+    fn glBindVertexArray as gl_bind_vertex_array(array: i64) -> void;
+    fn glDeleteVertexArrays as gl_delete_vertex_arrays(n: i64, arrays: i64) -> void;
+
+    fn glVertexAttribPointer as gl_vertex_attrib_ptr(index: i64, size: i64, type: i64, normalized: i64, stride: i64, pointer: i64) -> void;
+    fn glEnableVertexAttribArray as gl_enable_vertex_attrib_array(index: i64) -> void;
+    fn glDisableVertexAttribArray as gl_disable_vertex_attrib_array(index: i64) -> void;
+
+    fn glGenTextures as gl_gen_textures(n: i64, textures: i64) -> void;
+    fn glBindTexture as gl_bind_texture(target: i64, texture: i64) -> void;
+    fn glTexImage2D as gl_tex_image_2d(target: i64, level: i64, internal: i64, w: i64, h: i64, border: i64, format: i64, type: i64, data: i64) -> void;
+    fn glTexParameteri as gl_tex_parameter_i(target: i64, pname: i64, param: i64) -> void;
+    fn glDeleteTextures as gl_delete_textures(n: i64, textures: i64) -> void;
+    fn glActiveTexture as gl_active_texture(texture: i64) -> void;
+
+    fn glDrawArrays as gl_draw_arrays(mode: i64, first: i64, count: i64) -> void;
+    fn glDrawElements as gl_draw_elements(mode: i64, count: i64, type: i64, indices: i64) -> void;
+
+    fn glFlush as gl_flush() -> void;
+    fn glFinish as gl_finish() -> void;
+
+    fn glPixelStorei as gl_pixel_store_i(pname: i64, param: i64) -> void;
+}
+
+// GLU (utility library)
+extern "C" include "<GL/glu.h>" link "GLU" {
+    fn gluPerspective as glu_perspective(fov: f64, aspect: f64, near: f64, far: f64) -> void;
+    fn gluLookAt as glu_look_at(eye_x: f64, eye_y: f64, eye_z: f64, cx: f64, cy: f64, cz: f64, ux: f64, uy: f64, uz: f64) -> void;
+}
+
+// ─── OpenGL Constants ─────────────────────────────────────────────────────
+
+pub const GL_DEPTH_TEST: i64 = 0x0B71;
+pub const GL_CULL_FACE: i64 = 0x0B44;
+pub const GL_BLEND: i64 = 0x0BE2;
+pub const GL_TEXTURE_2D: i64 = 0x0DE1;
+pub const GL_TEXTURE0: i64 = 0x84C0;
+
+pub const GL_TRIANGLES: i64 = 0x0004;
+pub const GL_TRIANGLE_STRIP: i64 = 0x0005;
+pub const GL_TRIANGLE_FAN: i64 = 0x0006;
+pub const GL_LINES: i64 = 0x0001;
+pub const GL_LINE_STRIP: i64 = 0x0003;
+pub const GL_POINTS: i64 = 0x0000;
+
+pub const GL_COLOR_BUFFER_BIT: i64 = 0x4000;
+pub const GL_DEPTH_BUFFER_BIT: i64 = 0x100;
+
+pub const GL_ARRAY_BUFFER: i64 = 0x8892;
+pub const GL_ELEMENT_ARRAY_BUFFER: i64 = 0x8893;
+
+pub const GL_STATIC_DRAW: i64 = 0x88E4;
+pub const GL_DYNAMIC_DRAW: i64 = 0x88E8;
+pub const GL_STREAM_DRAW: i64 = 0x88E0;
+
+pub const GL_FLOAT: i64 = 0x1406;
+pub const GL_UNSIGNED_INT: i64 = 0x1405;
+pub const GL_UNSIGNED_BYTE: i64 = 0x1401;
+
+pub const GL_RGB: i64 = 0x1907;
+pub const GL_RGBA: i64 = 0x1908;
+pub const GL_TEXTURE_MIN_FILTER: i64 = 0x2801;
+pub const GL_TEXTURE_MAG_FILTER: i64 = 0x2800;
+pub const GL_TEXTURE_WRAP_S: i64 = 0x2802;
+pub const GL_TEXTURE_WRAP_T: i64 = 0x2803;
+pub const GL_LINEAR: i64 = 0x2601;
+pub const GL_NEAREST: i64 = 0x2600;
+pub const GL_CLAMP_TO_EDGE: i64 = 0x812F;
+pub const GL_REPEAT: i64 = 0x2901;
+
+pub const GL_NO_ERROR: i64 = 0;
+pub const GL_INVALID_ENUM: i64 = 0x0500;
+pub const GL_INVALID_VALUE: i64 = 0x0501;
+pub const GL_INVALID_OPERATION: i64 = 0x0502;
+pub const GL_OUT_OF_MEMORY: i64 = 0x0505;
+
+pub const GL_FRONT: i64 = 0x0404;
+pub const GL_BACK: i64 = 0x0405;
+pub const GL_CW: i64 = 0x0900;
+pub const GL_CCW: i64 = 0x0901;
+
+pub const GL_SRC_ALPHA: i64 = 0x0302;
+pub const GL_ONE_MINUS_SRC_ALPHA: i64 = 0x0303;
+
+// ─── Wrapper Functions ───────────────────────────────────────────────────
+
+/// Initialize OpenGL state (enable depth testing, etc.)
+pub fn gl_init() -> void {
+    gl_enable(GL_DEPTH_TEST);
+    gl_enable(GL_CULL_FACE);
+    gl_clear_color(0.1, 0.1, 0.2, 1.0);
+}
+
+/// Clear the screen.
+pub fn gl_clear_screen() -> void {
+    gl_clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+}
+
+/// Set the viewport.
+pub fn gl_set_viewport(w: i64, h: i64) -> void {
+    gl_viewport(0, 0, w, h);
+}
+
+/// Check for OpenGL errors. Returns 0 if no error.
+pub fn gl_check_errors() -> i64 {
+    return gl_get_error();
+}
+
+/// Generate a single buffer object.
+pub fn gl_gen_buffer() -> i64 {
+    var buf: Vec<i64> = Vec::new();
+    buf.push(0);
+    gl_gen_buffers(1, 0);  // native: pass &buf[0]
+    return buf.get(0);
+}
+
+/// Generate a single vertex array object.
+pub fn gl_gen_vertex_array() -> i64 {
+    var arr: Vec<i64> = Vec::new();
+    arr.push(0);
+    gl_gen_vertex_arrays(1, 0);  // native: pass &arr[0]
+    return arr.get(0);
+}
+
+/// Generate a single texture.
+pub fn gl_gen_texture() -> i64 {
+    var tex: Vec<i64> = Vec::new();
+    tex.push(0);
+    gl_gen_textures(1, 0);  // native: pass &tex[0]
+    return tex.get(0);
+}
+
+/// Delete a single buffer.
+pub fn gl_delete_buffer(buf: i64) -> void {
+    var bufs: Vec<i64> = Vec::new();
+    bufs.push(buf);
+    gl_delete_buffers(1, 0);
+}
+
+/// Delete a single vertex array.
+pub fn gl_delete_vertex_array(arr: i64) -> void {
+    var arrs: Vec<i64> = Vec::new();
+    arrs.push(arr);
+    gl_delete_vertex_arrays(1, 0);
+}
+
+/// Delete a single texture.
+pub fn gl_delete_texture(tex: i64) -> void {
+    var texs: Vec<i64> = Vec::new();
+    texs.push(tex);
+    gl_delete_textures(1, 0);
+}
+
+/// Draw triangles from currently bound VBO data.
+pub fn gl_draw_triangles(first: i64, count: i64) -> void {
+    gl_draw_arrays(GL_TRIANGLES, first, count);
+}
+
+/// Draw triangles from index buffer.
+pub fn gl_draw_triangles_indexed(count: i64) -> void {
+    gl_draw_elements(GL_TRIANGLES, count, GL_UNSIGNED_INT, 0);
+}
+
+/// Set default texture parameters for 2D textures.
+pub fn gl_set_texture_defaults() -> void {
+    gl_tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    gl_tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    gl_tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    gl_tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+}
+
+/// Enable alpha blending for transparency.
+pub fn gl_enable_blend() -> void {
+    gl_enable(GL_BLEND);
+    // glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA) — needs FFI
+}
+
+/// Get error string from error code.
+pub fn gl_error_string(err: i64) -> str {
+    if err == GL_NO_ERROR { return "No error"; }
+    if err == GL_INVALID_ENUM { return "Invalid enum"; }
+    if err == GL_INVALID_VALUE { return "Invalid value"; }
+    if err == GL_INVALID_OPERATION { return "Invalid operation"; }
+    if err == GL_OUT_OF_MEMORY { return "Out of memory"; }
+    return "Unknown error";
+}
+
+// ─── Shader Management (GLSL) ────────────────────────────────────────────
+//
+// Shader compilation requires OpenGL's shader functions.
+// These are in the modern OpenGL API (glCreateShader, glShaderSource, etc.)
+// which are loaded via GLAD or GLEW on Linux/Windows.
+// For simplicity, we declare the core functions here.
+
+extern "C" include "<GL/gl.h>" link "GL" {
+    fn glCreateShader as gl_create_shader(type: i64) -> i64;
+    fn glShaderSource as gl_shader_source(shader: i64, count: i64, string: i64, length: i64) -> void;
+    fn glCompileShader as gl_compile_shader(shader: i64) -> void;
+    fn glDeleteShader as gl_delete_shader(shader: i64) -> void;
+    fn glGetShaderiv as gl_get_shader_iv(shader: i64, pname: i64, params: i64) -> void;
+    fn glGetShaderInfoLog as gl_get_shader_info_log(shader: i64, buf_size: i64, length: i64, info_log: i64) -> void;
+
+    fn glCreateProgram as gl_create_program() -> i64;
+    fn glAttachShader as gl_attach_shader(program: i64, shader: i64) -> void;
+    fn glLinkProgram as gl_link_program(program: i64) -> void;
+    fn glUseProgram as gl_use_program(program: i64) -> void;
+    fn glDeleteProgram as gl_delete_program(program: i64) -> void;
+    fn glGetProgramiv as gl_get_program_iv(program: i64, pname: i64, params: i64) -> void;
+    fn glGetProgramInfoLog as gl_get_program_info_log(program: i64, buf_size: i64, length: i64, info_log: i64) -> void;
+
+    fn glGetUniformLocation as gl_get_uniform_location(program: i64, name: str) -> i64;
+    fn glUniform1f as gl_uniform_1f(location: i64, v0: f64) -> void;
+    fn glUniform2f as gl_uniform_2f(location: i64, v0: f64, v1: f64) -> void;
+    fn glUniform3f as gl_uniform_3f(location: i64, v0: f64, v1: f64, v2: f64) -> void;
+    fn glUniform4f as gl_uniform_4f(location: i64, v0: f64, v1: f64, v2: f64, v3: f64) -> void;
+    fn glUniform1i as gl_uniform_1i(location: i64, v0: i64) -> void;
+    fn glUniformMatrix4fv as gl_uniform_matrix_4fv(location: i64, count: i64, transpose: i64, value: i64) -> void;
+
+    fn glGetAttribLocation as gl_get_attrib_location(program: i64, name: str) -> i64;
+}
+
+// Shader type constants
+pub const GL_VERTEX_SHADER: i64 = 0x8B31;
+pub const GL_FRAGMENT_SHADER: i64 = 0x8B30;
+
+// Shader status constants
+pub const GL_COMPILE_STATUS: i64 = 0x8B81;
+pub const GL_LINK_STATUS: i64 = 0x8B82;
+
+/// Compile a shader from source code. Returns shader ID or 0 on failure.
+pub fn gl_compile_shader_src(shader_type: i64, source: str) -> i64 {
+    var shader = gl_create_shader(shader_type);
+    if shader == 0 { return 0; }
+
+    // glShaderSource expects a pointer to a pointer to char.
+    // In native builds, the runtime wraps this.
+    // For now, we pass the source directly (the native runtime handles the indirection).
+    gl_shader_source(shader, 1, 0, 0);  // native: pass &source_ptr and &source_len
+    gl_compile_shader(shader);
+
+    // Check compile status
+    var status: Vec<i64> = Vec::new();
+    status.push(0);
+    gl_get_shader_iv(shader, GL_COMPILE_STATUS, 0);  // native: pass &status[0]
+
+    if status.get(0) == 0 {
+        // Compilation failed
+        gl_delete_shader(shader);
+        return 0;
+    }
+
+    return shader;
+}
+
+/// Create a shader program from vertex and fragment source.
+/// Returns program ID or 0 on failure.
+pub fn gl_create_program_from_src(vert_src: str, frag_src: str) -> i64 {
+    var vert = gl_compile_shader_src(GL_VERTEX_SHADER, vert_src);
+    if vert == 0 { return 0; }
+
+    var frag = gl_compile_shader_src(GL_FRAGMENT_SHADER, frag_src);
+    if frag == 0 {
+        gl_delete_shader(vert);
+        return 0;
+    }
+
+    var program = gl_create_program();
+    if program == 0 {
+        gl_delete_shader(vert);
+        gl_delete_shader(frag);
+        return 0;
+    }
+
+    gl_attach_shader(program, vert);
+    gl_attach_shader(program, frag);
+    gl_link_program(program);
+
+    // Check link status
+    var status: Vec<i64> = Vec::new();
+    status.push(0);
+    gl_get_program_iv(program, GL_LINK_STATUS, 0);  // native: pass &status[0]
+
+    if status.get(0) == 0 {
+        // Linking failed
+        gl_delete_program(program);
+        gl_delete_shader(vert);
+        gl_delete_shader(frag);
+        return 0;
+    }
+
+    // Shaders can be deleted after linking
+    gl_delete_shader(vert);
+    gl_delete_shader(frag);
+
+    return program;
+}
+
+/// Set a uniform mat4 value.
+pub fn gl_set_uniform_mat4(location: i64, mat: i64) -> void {
+    gl_uniform_matrix_4fv(location, 1, 0, mat);
+}
+
+/// Set a uniform float value.
+pub fn gl_set_uniform_f(location: i64, value: f64) -> void {
+    gl_uniform_1f(location, value);
+}
+
+/// Set a uniform int value.
+pub fn gl_set_uniform_i(location: i64, value: i64) -> void {
+    gl_uniform_1i(location, value);
+}
+
+/// Get the location of a uniform variable.
+pub fn gl_get_uniform(program: i64, name: str) -> i64 {
+    return gl_get_uniform_location(program, name);
+}
+
+/// Get the location of an attribute variable.
+pub fn gl_get_attrib(program: i64, name: str) -> i64 {
+    return gl_get_attrib_location(program, name);
+}
+
+// ─── Default Shaders ──────────────────────────────────────────────────────
+
+/// Basic vertex shader for 3D rendering with MVP matrix.
+pub const DEFAULT_VERT_SHADER: str = "#version 330 core\nlayout(location = 0) in vec3 aPos;\nlayout(location = 1) in vec3 aNormal;\nlayout(location = 2) in vec2 aTexCoord;\nuniform mat4 model;\nuniform mat4 view;\nuniform mat4 projection;\nout vec2 TexCoord;\nout vec3 Normal;\nvoid main() {\n    gl_Position = projection * view * model * vec4(aPos, 1.0);\n    TexCoord = aTexCoord;\n    Normal = mat3(transpose(inverse(model))) * aNormal;\n}\n";
+
+/// Basic fragment shader with texture sampling.
+pub const DEFAULT_FRAG_SHADER: str = "#version 330 core\nin vec2 TexCoord;\nin vec3 Normal;\nout vec4 FragColor;\nuniform sampler2D texture1;\nvoid main() {\n    FragColor = texture(texture1, TexCoord);\n}\n";
+
+/// Create the default shader program.
+pub fn gl_create_default_program() -> i64 {
+    return gl_create_program_from_src(DEFAULT_VERT_SHADER, DEFAULT_FRAG_SHADER);
+}

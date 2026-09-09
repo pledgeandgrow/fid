@@ -1,0 +1,210 @@
+// Fides 2D Animation standard library
+//
+// Sprite sheet animation with state machine support.
+// Handles frame sequences, playback timing, and state transitions.
+//
+// Usage:
+//   use animation2d;
+//   var anim = anim2d_create();
+//   anim2d_add_state(&mut anim, "idle",  0, 4, 0.15, true);
+//   anim2d_add_state(&mut anim, "walk",  4, 8, 0.10, true);
+//   anim2d_add_state(&mut anim, "jump", 12, 6, 0.08, false);
+//   anim2d_play(&mut anim, "walk");
+//   // In game loop:
+//   anim2d_update(&mut anim, dt);
+//   var frame = anim2d_current_frame(&anim);
+
+module animation2d;
+
+use vec;
+use string;
+use math;
+
+// ─── Animation State ────────────────────────────────────────────────────
+
+pub struct AnimState2D {
+    pub name: str,
+    pub start_frame: i64,     // first frame index in sprite sheet
+    pub frame_count: i64,     // number of frames in this state
+    pub frame_time: f64,      // seconds per frame
+    pub looping: bool,
+    pub row: i64,             // row in sprite sheet (for grid layout)
+}
+
+pub struct Animation2D {
+    pub states: Vec<AnimState2D>,
+    pub current_state: i64,   // index into states (-1 = none)
+    pub current_frame: i64,   // current frame within the state
+    pub elapsed: f64,          // time elapsed in current frame
+    pub finished: bool,        // true if non-looping animation finished
+    pub speed: f64,            // playback speed multiplier (1.0 = normal)
+    pub frame_w: i64,          // frame width in pixels
+    pub frame_h: i64,          // frame height in pixels
+}
+
+/// Create an animation system with the given frame dimensions.
+pub fn anim2d_create(frame_w: i64, frame_h: i64) -> Animation2D {
+    return Animation2D {
+        states: Vec::new(),
+        current_state: -1,
+        current_frame: 0,
+        elapsed: 0.0,
+        finished: false,
+        speed: 1.0,
+        frame_w: frame_w,
+        frame_h: frame_h,
+    };
+}
+
+/// Add an animation state.
+/// Returns the state index.
+pub fn anim2d_add_state(anim: &mut Animation2D, name: str, start_frame: i64, frame_count: i64, frame_time: f64, looping: bool) -> i64 {
+    var state = AnimState2D {
+        name: name,
+        start_frame: start_frame,
+        frame_count: frame_count,
+        frame_time: frame_time,
+        looping: looping,
+        row: 0,
+    };
+    anim.states.push(state);
+    return anim.states.len() - 1;
+}
+
+/// Add an animation state with a specific row in the sprite sheet.
+pub fn anim2d_add_state_row(anim: &mut Animation2D, name: str, start_frame: i64, frame_count: i64, frame_time: f64, looping: bool, row: i64) -> i64 {
+    var state = AnimState2D {
+        name: name,
+        start_frame: start_frame,
+        frame_count: frame_count,
+        frame_time: frame_time,
+        looping: looping,
+        row: row,
+    };
+    anim.states.push(state);
+    return anim.states.len() - 1;
+}
+
+/// Find a state by name. Returns index or -1.
+pub fn anim2d_find_state(anim: &Animation2D, name: str) -> i64 {
+    var i = 0;
+    while i < anim.states.len() {
+        if str_equal(anim.states.get(i).name, name) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Play an animation state by name. Returns true if found.
+pub fn anim2d_play(anim: &mut Animation2D, name: str) -> bool {
+    var idx = anim2d_find_state(anim, name);
+    if idx < 0 { return false; }
+    if anim.current_state == idx { return true; }  // already playing
+    anim.current_state = idx;
+    anim.current_frame = 0;
+    anim.elapsed = 0.0;
+    anim.finished = false;
+    return true;
+}
+
+/// Play an animation state by index.
+pub fn anim2d_play_idx(anim: &mut Animation2D, idx: i64) -> void {
+    if idx < 0 || idx >= anim.states.len() { return; }
+    if anim.current_state == idx { return; }
+    anim.current_state = idx;
+    anim.current_frame = 0;
+    anim.elapsed = 0.0;
+    anim.finished = false;
+}
+
+/// Update the animation.
+pub fn anim2d_update(anim: &mut Animation2D, dt: f64) -> void {
+    if anim.current_state < 0 || anim.finished { return; }
+
+    var state = anim.states.get(anim.current_state);
+    anim.elapsed = anim.elapsed + dt * anim.speed;
+
+    if anim.elapsed >= state.frame_time {
+        anim.elapsed = anim.elapsed - state.frame_time;
+        anim.current_frame = anim.current_frame + 1;
+
+        if anim.current_frame >= state.frame_count {
+            if state.looping {
+                anim.current_frame = 0;
+            } else {
+                anim.current_frame = state.frame_count - 1;
+                anim.finished = true;
+            }
+        }
+    }
+}
+
+/// Get the current frame index (absolute, in the sprite sheet).
+pub fn anim2d_current_frame(anim: &Animation2D) -> i64 {
+    if anim.current_state < 0 { return 0; }
+    var state = anim.states.get(anim.current_state);
+    return state.start_frame + anim.current_frame;
+}
+
+/// Get the current row in the sprite sheet.
+pub fn anim2d_current_row(anim: &Animation2D) -> i64 {
+    if anim.current_state < 0 { return 0; }
+    return anim.states.get(anim.current_state).row;
+}
+
+/// Get the source rectangle (x, y, w, h) in the sprite sheet.
+pub fn anim2d_source_rect(anim: &Animation2D, sheet_cols: i64) -> vec4 {
+    var frame = anim2d_current_frame(anim);
+    var row = anim2d_current_row(anim);
+    var sx = (frame % sheet_cols) * anim.frame_w;
+    var sy = row * anim.frame_h;
+    return vec4(sx as f64, sy as f64, anim.frame_w as f64, anim.frame_h as f64);
+}
+
+/// Get the name of the current state.
+pub fn anim2d_current_state_name(anim: &Animation2D) -> str {
+    if anim.current_state < 0 { return ""; }
+    return anim.states.get(anim.current_state).name;
+}
+
+/// Check if the current animation has finished.
+pub fn anim2d_is_finished(anim: &Animation2D) -> bool {
+    return anim.finished;
+}
+
+/// Set playback speed.
+pub fn anim2d_set_speed(anim: &mut Animation2D, speed: f64) -> void {
+    if speed < 0.0 { speed = 0.0; }
+    anim.speed = speed;
+}
+
+/// Reset the current animation to frame 0.
+pub fn anim2d_reset(anim: &mut Animation2D) -> void {
+    anim.current_frame = 0;
+    anim.elapsed = 0.0;
+    anim.finished = false;
+}
+
+/// Get the number of states.
+pub fn anim2d_state_count(anim: &Animation2D) -> i64 {
+    return anim.states.len();
+}
+
+/// Get the total duration of the current animation in seconds.
+pub fn anim2d_duration(anim: &Animation2D) -> f64 {
+    if anim.current_state < 0 { return 0.0; }
+    var state = anim.states.get(anim.current_state);
+    return state.frame_count as f64 * state.frame_time;
+}
+
+/// Get the progress (0..1) of the current animation.
+pub fn anim2d_progress(anim: &Animation2D) -> f64 {
+    if anim.current_state < 0 { return 0.0; }
+    var state = anim.states.get(anim.current_state);
+    var total = state.frame_count as f64 * state.frame_time;
+    if total <= 0.0 { return 0.0; }
+    var current = (anim.current_frame as f64 * state.frame_time) + anim.elapsed;
+    return current / total;
+}

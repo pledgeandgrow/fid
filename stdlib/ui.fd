@@ -1,0 +1,345 @@
+// Fides UI standard library
+//
+// Immediate-mode GUI (like Dear ImGui). Each frame, the application
+// declares its UI by calling widget functions. No retained state —
+// the UI is re-built every frame from the call sequence.
+//
+// Usage:
+//   use ui;
+//   use sdl;
+//
+//   var uictx = ui_create();
+//   // In the render loop:
+//   ui_begin(&mut uictx, ren, &input);
+//   if ui_button(&mut uictx, "Start Game", 10, 10, 120, 30) {
+//       start_game();
+//   }
+//   var vol = ui_slider(&mut uictx, 10, 50, 200, 20, 0.0, 1.0, volume);
+//   ui_end(&mut uictx);
+
+module ui;
+
+use sdl;
+use vec;
+use string;
+
+// ─── UI Context ──────────────────────────────────────────────────────────
+
+pub struct UiContext {
+    pub ren: i64,               // SDL renderer
+    pub mouse_x: i64,
+    pub mouse_y: i64,
+    pub mouse_down: bool,
+    pub mouse_pressed: bool,    // pressed this frame
+    pub hot: i64,                // widget ID under mouse
+    pub active: i64,             // widget ID being interacted with
+    pub next_id: i64,            // auto-incrementing widget ID
+    pub text_color_r: i64,
+    pub text_color_g: i64,
+    pub text_color_b: i64,
+    pub bg_color_r: i64,
+    pub bg_color_g: i64,
+    pub bg_color_b: i64,
+    pub hover_color_r: i64,
+    pub hover_color_g: i64,
+    pub hover_color_b: i64,
+    pub active_color_r: i64,
+    pub active_color_g: i64,
+    pub active_color_b: i64,
+}
+
+/// Create a UI context.
+pub fn ui_create() -> UiContext {
+    return UiContext {
+        ren: 0,
+        mouse_x: 0,
+        mouse_y: 0,
+        mouse_down: false,
+        mouse_pressed: false,
+        hot: 0,
+        active: 0,
+        next_id: 1,
+        text_color_r: 255,
+        text_color_g: 255,
+        text_color_b: 255,
+        bg_color_r: 60,
+        bg_color_g: 60,
+        bg_color_b: 80,
+        hover_color_r: 100,
+        hover_color_g: 100,
+        hover_color_b: 140,
+        active_color_r: 80,
+        active_color_g: 120,
+        active_color_b: 200,
+    };
+}
+
+/// Begin a UI frame. Pass the SDL renderer and input state.
+pub fn ui_begin(ctx: &mut UiContext, ren: i64, input: &SdlInputState) -> void {
+    ctx.ren = ren;
+    ctx.mouse_x = sdl_mouse_x(input);
+    ctx.mouse_y = sdl_mouse_y(input);
+    ctx.mouse_down = sdl_mouse_held(input, SDL_BUTTON_LEFT);
+    ctx.mouse_pressed = sdl_mouse_pressed(input, SDL_BUTTON_LEFT);
+    ctx.hot = 0;
+    ctx.next_id = 1;
+}
+
+/// End a UI frame.
+pub fn ui_end(ctx: &mut UiContext) -> void {
+    // If mouse is not down, nothing is active
+    if !ctx.mouse_down {
+        ctx.active = 0;
+    }
+    // If no widget was hot this frame, clear hot
+    // (hot is set by widgets when mouse is over them)
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────
+
+/// Check if a point is inside a rectangle.
+fn ui_point_in_rect(px: i64, py: i64, x: i64, y: i64, w: i64, h: i64) -> bool {
+    return px >= x && px < x + w && py >= y && py < y + h;
+}
+
+/// Draw a filled rectangle.
+fn ui_draw_rect(ctx: &UiContext, x: i64, y: i64, w: i64, h: i64, r: i64, g: i64, b: i64) -> void {
+    sdl_set_draw_color(ctx.ren, r, g, b, 255);
+    var ry = 0;
+    while ry < h {
+        sdl_draw_line(ctx.ren, x, y + ry, x + w, y + ry);
+        ry = ry + 1;
+    }
+}
+
+/// Draw a rectangle outline.
+fn ui_draw_rect_outline(ctx: &UiContext, x: i64, y: i64, w: i64, h: i64, r: i64, g: i64, b: i64) -> void {
+    sdl_set_draw_color(ctx.ren, r, g, b, 255);
+    sdl_draw_line(ctx.ren, x, y, x + w, y);
+    sdl_draw_line(ctx.ren, x, y + h, x + w, y + h);
+    sdl_draw_line(ctx.ren, x, y, x, y + h);
+    sdl_draw_line(ctx.ren, x + w, y, x + w, y + h);
+}
+
+/// Draw a simple text label (using bitmap font).
+fn ui_draw_text(ctx: &UiContext, text: str, x: i64, y: i64) -> void {
+    // Simple text rendering: draw each character as a small block pattern
+    // This is a placeholder — real text rendering uses font.fd
+    var i = 0;
+    while i < str_len(text) {
+        var ch = str_byte_at(text, i);
+        // Draw a simple 6x8 character cell
+        // For now, just draw a small filled rect for non-space characters
+        if ch != 32 {  // not space
+            sdl_set_draw_color(ctx.ren, ctx.text_color_r, ctx.text_color_g, ctx.text_color_b, 255);
+            sdl_draw_point(ctx.ren, x + i * 6, y);
+            sdl_draw_point(ctx.ren, x + i * 6 + 1, y);
+            sdl_draw_point(ctx.ren, x + i * 6, y + 1);
+        }
+        i = i + 1;
+    }
+}
+
+// ─── Widgets ─────────────────────────────────────────────────────────────
+
+/// Draw a button. Returns true if the button was clicked this frame.
+pub fn ui_button(ctx: &mut UiContext, label: str, x: i64, y: i64, w: i64, h: i64) -> bool {
+    var id = ctx.next_id;
+    ctx.next_id = ctx.next_id + 1;
+
+    var hover = ui_point_in_rect(ctx.mouse_x, ctx.mouse_y, x, y, w, h);
+    var clicked = false;
+
+    if hover {
+        ctx.hot = id;
+    }
+
+    // Check for click
+    if hover && ctx.mouse_pressed {
+        ctx.active = id;
+    }
+    if ctx.active == id && !ctx.mouse_down && hover {
+        clicked = true;
+    }
+
+    // Draw button
+    var r = ctx.bg_color_r;
+    var g = ctx.bg_color_g;
+    var b = ctx.bg_color_b;
+    if hover {
+        r = ctx.hover_color_r;
+        g = ctx.hover_color_g;
+        b = ctx.hover_color_b;
+    }
+    if ctx.active == id {
+        r = ctx.active_color_r;
+        g = ctx.active_color_g;
+        b = ctx.active_color_b;
+    }
+
+    ui_draw_rect(ctx, x, y, w, h, r, g, b);
+    ui_draw_rect_outline(ctx, x, y, w, h, 200, 200, 220);
+
+    // Draw label (centered)
+    var label_w = str_len(label) * 6;
+    var label_x = x + (w - label_w) / 2;
+    var label_y = y + (h - 8) / 2;
+    ui_draw_text(ctx, label, label_x, label_y);
+
+    return clicked;
+}
+
+/// Draw a slider. Returns the new value (or the same value if unchanged).
+pub fn ui_slider(ctx: &mut UiContext, x: i64, y: i64, w: i64, h: i64, min: f64, max: f64, value: f64) -> f64 {
+    var id = ctx.next_id;
+    ctx.next_id = ctx.next_id + 1;
+
+    var hover = ui_point_in_rect(ctx.mouse_x, ctx.mouse_y, x, y, w, h);
+    var result = value;
+
+    if hover {
+        ctx.hot = id;
+    }
+
+    if hover && ctx.mouse_pressed {
+        ctx.active = id;
+    }
+
+    // Drag slider
+    if ctx.active == id && ctx.mouse_down {
+        var t = (ctx.mouse_x - x) as f64 / w as f64;
+        if t < 0.0 { t = 0.0; }
+        if t > 1.0 { t = 1.0; }
+        result = min + t * (max - min);
+    }
+
+    // Draw slider track
+    ui_draw_rect(ctx, x, y, w, h, 40, 40, 50);
+    ui_draw_rect_outline(ctx, x, y, w, h, 100, 100, 120);
+
+    // Draw filled portion
+    var t = (result - min) / (max - min);
+    if t < 0.0 { t = 0.0; }
+    if t > 1.0 { t = 1.0; }
+    var fill_w = (t * w as f64) as i64;
+    if fill_w > 0 {
+        ui_draw_rect(ctx, x, y, fill_w, h, ctx.active_color_r, ctx.active_color_g, ctx.active_color_b);
+    }
+
+    // Draw handle
+    var handle_x = x + fill_w - 4;
+    if handle_x < x { handle_x = x; }
+    if handle_x > x + w - 8 { handle_x = x + w - 8; }
+    ui_draw_rect(ctx, handle_x, y - 2, 8, h + 4, 200, 200, 220);
+
+    return result;
+}
+
+/// Draw a checkbox. Returns the new checked state.
+pub fn ui_checkbox(ctx: &mut UiContext, label: str, x: i64, y: i64, checked: bool) -> bool {
+    var id = ctx.next_id;
+    ctx.next_id = ctx.next_id + 1;
+
+    var box_w = 16;
+    var box_h = 16;
+    var hover = ui_point_in_rect(ctx.mouse_x, ctx.mouse_y, x, y, box_w, box_h);
+    var result = checked;
+
+    if hover {
+        ctx.hot = id;
+    }
+
+    if hover && ctx.mouse_pressed {
+        result = !checked;
+    }
+
+    // Draw checkbox
+    var r = ctx.bg_color_r;
+    var g = ctx.bg_color_g;
+    var b = ctx.bg_color_b;
+    if hover {
+        r = ctx.hover_color_r;
+        g = ctx.hover_color_g;
+        b = ctx.hover_color_b;
+    }
+    ui_draw_rect(ctx, x, y, box_w, box_h, r, g, b);
+    ui_draw_rect_outline(ctx, x, y, box_w, box_h, 200, 200, 220);
+
+    // Draw checkmark if checked
+    if result {
+        sdl_set_draw_color(ctx.ren, 255, 255, 100, 255);
+        sdl_draw_line(ctx.ren, x + 3, y + 8, x + 6, y + 12);
+        sdl_draw_line(ctx.ren, x + 6, y + 12, x + 13, y + 3);
+    }
+
+    // Draw label
+    ui_draw_text(ctx, label, x + box_w + 6, y + 4);
+
+    return result;
+}
+
+/// Draw a label (non-interactive text).
+pub fn ui_label(ctx: &UiContext, text: str, x: i64, y: i64) -> void {
+    ui_draw_text(ctx, text, x, y);
+}
+
+/// Draw a panel background.
+pub fn ui_panel(ctx: &UiContext, x: i64, y: i64, w: i64, h: i64) -> void {
+    ui_draw_rect(ctx, x, y, w, h, 30, 30, 40);
+    ui_draw_rect_outline(ctx, x, y, w, h, 80, 80, 100);
+}
+
+/// Draw a progress bar.
+pub fn ui_progress_bar(ctx: &UiContext, x: i64, y: i64, w: i64, h: i64, progress: f64) -> void {
+    ui_draw_rect(ctx, x, y, w, h, 40, 40, 50);
+    ui_draw_rect_outline(ctx, x, y, w, h, 100, 100, 120);
+
+    var p = progress;
+    if p < 0.0 { p = 0.0; }
+    if p > 1.0 { p = 1.0; }
+    var fill_w = (p * w as f64) as i64;
+    if fill_w > 0 {
+        ui_draw_rect(ctx, x, y, fill_w, h, 100, 200, 100);
+    }
+}
+
+/// Draw a text input field (simplified — no actual text editing).
+pub fn ui_text_input(ctx: &mut UiContext, x: i64, y: i64, w: i64, h: i64, text: str) -> str {
+    var id = ctx.next_id;
+    ctx.next_id = id + 1;
+
+    var hover = ui_point_in_rect(ctx.mouse_x, ctx.mouse_y, x, y, w, h);
+    var focused = ctx.active == id;
+
+    if hover && ctx.mouse_pressed {
+        ctx.active = id;
+    }
+    if !hover && ctx.mouse_pressed {
+        ctx.active = 0;
+    }
+
+    var r = ctx.bg_color_r;
+    var g = ctx.bg_color_g;
+    var b = ctx.bg_color_b;
+    if focused {
+        r = 60;
+        g = 80;
+        b = 120;
+    }
+    ui_draw_rect(ctx, x, y, w, h, r, g, b);
+    ui_draw_rect_outline(ctx, x, y, w, h, 200, 200, 220);
+    ui_draw_text(ctx, text, x + 4, y + 4);
+
+    return text;  // no editing yet
+}
+
+/// Draw a separator line.
+pub fn ui_separator(ctx: &UiContext, x: i64, y: i64, w: i64) -> void {
+    sdl_set_draw_color(ctx.ren, 80, 80, 100, 255);
+    sdl_draw_line(ctx.ren, x, y, x + w, y);
+}
+
+/// Draw a column layout helper (returns next y position).
+pub fn ui_next_row(y: i64, h: i64, spacing: i64) -> i64 {
+    return y + h + spacing;
+}

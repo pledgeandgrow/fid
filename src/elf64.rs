@@ -139,8 +139,10 @@ const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHT_RELA: u32 = 4;
+const SHT_NOBITS: u32 = 8;
 
 // Section flags
+const SHF_WRITE: u64 = 0x1;
 const SHF_ALLOC: u64 = 0x2;
 const SHF_EXECINSTR: u64 = 0x4;
 const SHF_INFO_LINK: u64 = 0x40;
@@ -195,6 +197,19 @@ struct ElfEmitter {
     rodata_symbols: Vec<(String, u32)>,
     /// Relocations for rodata (e.g., vtable function pointers).
     rodata_relocations: Vec<Relocation>,
+    /// Custom linker sections (for kernel/OS development).
+    custom_sections: Vec<CustomSection>,
+}
+
+/// Custom linker section for kernel/OS development.
+/// Allows users to define custom sections like .data, .bss, .init, .kdata, etc.
+#[derive(Debug, Clone)]
+struct CustomSection {
+    name: String,
+    data: Vec<u8>,
+    sh_type: u32,   // SHT_PROGBITS, SHT_NOBITS, etc.
+    sh_flags: u64,  // SHF_ALLOC, SHF_WRITE, SHF_EXECINSTR, etc.
+    align: u64,     // alignment in bytes
 }
 
 #[derive(Debug, Clone)]
@@ -232,6 +247,7 @@ impl ElfEmitter {
             rodata: Vec::new(),
             rodata_symbols: Vec::new(),
             rodata_relocations: Vec::new(),
+            custom_sections: Vec::new(),
         };
         // Pre-populate section name string table.
         e.add_shstrtab("");
@@ -308,6 +324,23 @@ impl ElfEmitter {
         });
         self.symbol_index.insert(name.to_string(), idx);
         idx
+    }
+
+    /// Add a custom linker section (for kernel/OS development).
+    /// section_type: SHT_PROGBITS (1) for initialized data, SHT_NOBITS (8) for .bss
+    /// section_flags: SHF_ALLOC (2) | SHF_WRITE (1) | SHF_EXECINSTR (4)
+    /// align: alignment in bytes (e.g. 16 for code, 8 for data, 1 for packed)
+    fn add_custom_section(&mut self, name: &str, data: Vec<u8>, sh_type: u32, sh_flags: u64, align: u64) -> usize {
+        let section_idx = 7 + self.custom_sections.len();
+        self.custom_sections.push(CustomSection {
+            name: name.to_string(),
+            data,
+            sh_type,
+            sh_flags,
+            align,
+        });
+        self.add_shstrtab(name);
+        section_idx
     }
 
     // ─── Assembly parsing + encoding ───────────────────────────────────────
@@ -2094,12 +2127,29 @@ impl ElfEmitter {
             (0, 0)
         };
 
+        // Custom sections
+        let mut custom_section_offsets: Vec<(u64, u64)> = Vec::new();
+        for cs in &self.custom_sections {
+            let cs_off = offset;
+            let cs_size = if cs.sh_type == SHT_NOBITS {
+                // .bss: no data emitted, but size is recorded
+                cs.data.len() as u64
+            } else {
+                cs.data.len() as u64
+            };
+            if cs.sh_type != SHT_NOBITS {
+                offset += cs_size;
+            }
+            custom_section_offsets.push((cs_off, cs_size));
+        }
+
         // Section header table
         let shdr_offset = offset;
         let num_sections = 6u64
             + if has_rodata { 1 } else { 0 }
             + if has_relocations { 1 } else { 0 }
-            + if has_rodata_relocations { 1 } else { 0 };
+            + if has_rodata_relocations { 1 } else { 0 }
+            + self.custom_sections.len() as u64;
         let shdr_size = num_sections * 64;
         offset += shdr_size;
 
@@ -2140,6 +2190,13 @@ impl ElfEmitter {
         }
         if has_rodata_relocations {
             out.extend_from_slice(&rela_rodata);
+        }
+
+        // Custom section data
+        for cs in &self.custom_sections {
+            if cs.sh_type != SHT_NOBITS {
+                out.extend_from_slice(&cs.data);
+            }
         }
 
         // Section header table
@@ -2247,6 +2304,24 @@ impl ElfEmitter {
                 sh_info: rodata_idx as u32, // link to .rodata
                 sh_addralign: 8,
                 sh_entsize: 24,
+            }.to_bytes());
+        }
+
+        // Custom sections
+        for (i, cs) in self.custom_sections.iter().enumerate() {
+            let (cs_off, cs_size) = custom_section_offsets[i];
+            let cs_name = self.shstrtab_offsets.get(&cs.name).copied().unwrap_or(0);
+            out.extend_from_slice(&Elf64Shdr {
+                sh_name: cs_name,
+                sh_type: cs.sh_type,
+                sh_flags: cs.sh_flags,
+                sh_addr: 0,
+                sh_offset: cs_off,
+                sh_size: cs_size,
+                sh_link: 0,
+                sh_info: 0,
+                sh_addralign: cs.align,
+                sh_entsize: 0,
             }.to_bytes());
         }
 

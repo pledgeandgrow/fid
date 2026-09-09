@@ -1185,6 +1185,8 @@ pub struct StructLayout {
     pub align: u64,
     /// If true, uses C-compatible layout (natural type sizes, not uniform 8-byte slots)
     pub repr_c: bool,
+    /// If true, packed layout (1-byte alignment, no padding between fields)
+    pub packed_layout: bool,
 }
 
 /// Source map entry — maps an IR value to its source location

@@ -1,0 +1,414 @@
+// Fides Touch Input standard library
+//
+// Touch input for mobile games. Uses caller-owned state.
+//
+// Usage:
+//   use touch;
+//
+//   var ts = touch_create();
+//   touch_begin(&mut ts, id, x, y, pressure, timestamp);
+//   touch_update(&mut ts);
+//   if touch_pinch_active(&ts) { zoom = zoom * touch_pinch_scale(&ts); }
+
+module touch;
+
+use vec;
+use string;
+use math;
+
+// ─── Touch Phases ────────────────────────────────────────────────────────
+
+pub const TOUCH_NONE: i64 = 0;
+pub const TOUCH_BEGAN: i64 = 1;
+pub const TOUCH_MOVED: i64 = 2;
+pub const TOUCH_ENDED: i64 = 3;
+pub const TOUCH_CANCELLED: i64 = 4;
+
+pub const MAX_TOUCHES: i64 = 10;
+
+// ─── Touch State ─────────────────────────────────────────────────────────
+
+pub struct Touch {
+    pub id: i64,
+    pub x: f64,
+    pub y: f64,
+    pub prev_x: f64,
+    pub prev_y: f64,
+    pub start_x: f64,
+    pub start_y: f64,
+    pub phase: i64,
+    pub pressure: f64,
+    pub timestamp: f64,
+    pub active: bool,
+}
+
+pub struct TouchState {
+    pub touches: Vec<Touch>,
+    pub screen_width: f64,
+    pub screen_height: f64,
+    pub tap_max_distance: f64,
+    pub tap_max_duration: f64,
+    pub swipe_min_distance: f64,
+    pub pinch_active: bool,
+    pub pinch_initial_distance: f64,
+    pub pinch_current_distance: f64,
+    pub pan_active: bool,
+    pub swipe_active: bool,
+    pub swipe_direction: i64,
+}
+
+/// Create a new touch state.
+pub fn touch_create() -> TouchState {
+    var touches = Vec::new();
+    var i = 0;
+    while i < MAX_TOUCHES {
+        touches.push(Touch {
+            id: -1,
+            x: 0.0, y: 0.0,
+            prev_x: 0.0, prev_y: 0.0,
+            start_x: 0.0, start_y: 0.0,
+            phase: TOUCH_NONE,
+            pressure: 0.0,
+            timestamp: 0.0,
+            active: false,
+        });
+        i = i + 1;
+    }
+    return TouchState {
+        touches: touches,
+        screen_width: 800.0,
+        screen_height: 600.0,
+        tap_max_distance: 0.02,
+        tap_max_duration: 200.0,
+        swipe_min_distance: 0.1,
+        pinch_active: false,
+        pinch_initial_distance: 0.0,
+        pinch_current_distance: 0.0,
+        pan_active: false,
+        swipe_active: false,
+        swipe_direction: 0,
+    };
+}
+
+/// Initialize/reset the touch state.
+pub fn touch_init(ts: &mut TouchState) -> void {
+    ts.touches.clear();
+    var i = 0;
+    while i < MAX_TOUCHES {
+        ts.touches.push(Touch {
+            id: -1,
+            x: 0.0, y: 0.0,
+            prev_x: 0.0, prev_y: 0.0,
+            start_x: 0.0, start_y: 0.0,
+            phase: TOUCH_NONE,
+            pressure: 0.0,
+            timestamp: 0.0,
+            active: false,
+        });
+        i = i + 1;
+    }
+    ts.pinch_active = false;
+    ts.pan_active = false;
+    ts.swipe_active = false;
+}
+
+/// Set the screen dimensions.
+pub fn touch_set_screen_size(ts: &mut TouchState, w: f64, h: f64) -> void {
+    ts.screen_width = w;
+    ts.screen_height = h;
+}
+
+/// Find a touch by ID. Returns index or -1.
+fn touch_find_by_id(ts: &TouchState, id: i64) -> i64 {
+    var i = 0;
+    while i < ts.touches.len() {
+        if ts.touches.get(i).id == id && ts.touches.get(i).active {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Find a free touch slot. Returns index or -1.
+fn touch_find_free_slot(ts: &TouchState) -> i64 {
+    var i = 0;
+    while i < ts.touches.len() {
+        if !ts.touches.get(i).active { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Handle a touch begin event.
+pub fn touch_begin(ts: &mut TouchState, id: i64, x: f64, y: f64, pressure: f64, timestamp: f64) -> void {
+    var idx = touch_find_free_slot(ts);
+    if idx < 0 { return; }
+    var t = ts.touches.get(idx);
+    t.id = id;
+    t.x = x;
+    t.y = y;
+    t.prev_x = x;
+    t.prev_y = y;
+    t.start_x = x;
+    t.start_y = y;
+    t.phase = TOUCH_BEGAN;
+    t.pressure = pressure;
+    t.timestamp = timestamp;
+    t.active = true;
+    ts.touches.set(idx, t);
+}
+
+/// Handle a touch move event.
+pub fn touch_move(ts: &mut TouchState, id: i64, x: f64, y: f64, pressure: f64) -> void {
+    var idx = touch_find_by_id(ts, id);
+    if idx < 0 { return; }
+    var t = ts.touches.get(idx);
+    t.prev_x = t.x;
+    t.prev_y = t.y;
+    t.x = x;
+    t.y = y;
+    t.pressure = pressure;
+    t.phase = TOUCH_MOVED;
+    ts.touches.set(idx, t);
+}
+
+/// Handle a touch end event.
+pub fn touch_end(ts: &mut TouchState, id: i64) -> void {
+    var idx = touch_find_by_id(ts, id);
+    if idx < 0 { return; }
+    var t = ts.touches.get(idx);
+    t.phase = TOUCH_ENDED;
+    ts.touches.set(idx, t);
+}
+
+/// Handle a touch cancel event.
+pub fn touch_cancel(ts: &mut TouchState, id: i64) -> void {
+    var idx = touch_find_by_id(ts, id);
+    if idx < 0 { return; }
+    var t = ts.touches.get(idx);
+    t.phase = TOUCH_CANCELLED;
+    ts.touches.set(idx, t);
+}
+
+/// Update gesture detection. Call after processing all touch events.
+pub fn touch_update(ts: &mut TouchState) -> void {
+    var active_count = 0;
+    var t0_idx = -1;
+    var t1_idx = -1;
+    var i = 0;
+    while i < ts.touches.len() {
+        var t = ts.touches.get(i);
+        if t.active {
+            active_count = active_count + 1;
+            if t0_idx < 0 { t0_idx = i; }
+            else if t1_idx < 0 { t1_idx = i; }
+        }
+        i = i + 1;
+    }
+
+    if active_count == 2 && t0_idx >= 0 && t1_idx >= 0 {
+        var t0 = ts.touches.get(t0_idx);
+        var t1 = ts.touches.get(t1_idx);
+        var dx = t1.x - t0.x;
+        var dy = t1.y - t0.y;
+        var dist = pledge_sqrt(dx * dx + dy * dy);
+
+        if !ts.pinch_active {
+            ts.pinch_active = true;
+            ts.pinch_initial_distance = dist;
+        }
+        ts.pinch_current_distance = dist;
+    } else {
+        ts.pinch_active = false;
+        ts.pinch_initial_distance = 0.0;
+        ts.pinch_current_distance = 0.0;
+    }
+
+    ts.pan_active = false;
+    ts.swipe_active = false;
+    if active_count == 1 && t0_idx >= 0 {
+        var t = ts.touches.get(t0_idx);
+        var dx = t.x - t.start_x;
+        var dy = t.y - t.start_y;
+        var dist = pledge_sqrt(dx * dx + dy * dy);
+
+        if dist > ts.tap_max_distance {
+            ts.pan_active = true;
+        }
+
+        if t.phase == TOUCH_ENDED {
+            if dist > ts.swipe_min_distance {
+                ts.swipe_active = true;
+                if math_fabs(dx) > math_fabs(dy) {
+                    if dx > 0 { ts.swipe_direction = 0; }
+                    else { ts.swipe_direction = 1; }
+                } else {
+                    if dy > 0 { ts.swipe_direction = 2; }
+                    else { ts.swipe_direction = 3; }
+                }
+            }
+        }
+    }
+
+    // Clean up ended/cancelled touches
+    i = 0;
+    while i < ts.touches.len() {
+        var t = ts.touches.get(i);
+        if t.active && (t.phase == TOUCH_ENDED || t.phase == TOUCH_CANCELLED) {
+            t.active = false;
+            t.phase = TOUCH_NONE;
+            t.id = -1;
+            ts.touches.set(i, t);
+        }
+        i = i + 1;
+    }
+}
+
+/// Get the number of active touches.
+pub fn touch_count(ts: &TouchState) -> i64 {
+    var count = 0;
+    var i = 0;
+    while i < ts.touches.len() {
+        if ts.touches.get(i).active { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+/// Get a touch by index (0..count-1).
+pub fn touch_get(ts: &TouchState, idx: i64) -> Touch {
+    var count = 0;
+    var i = 0;
+    while i < ts.touches.len() {
+        if ts.touches.get(i).active {
+            if count == idx { return ts.touches.get(i); }
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return Touch {
+        id: -1, x: 0.0, y: 0.0, prev_x: 0.0, prev_y: 0.0,
+        start_x: 0.0, start_y: 0.0,
+        phase: TOUCH_NONE, pressure: 0.0, timestamp: 0.0, active: false,
+    };
+}
+
+/// Check if a tap occurred.
+pub fn touch_is_tap(ts: &TouchState) -> bool {
+    var i = 0;
+    while i < ts.touches.len() {
+        var t = ts.touches.get(i);
+        if t.phase == TOUCH_ENDED {
+            var dx = t.x - t.start_x;
+            var dy = t.y - t.start_y;
+            var dist = pledge_sqrt(dx * dx + dy * dy);
+            if dist < ts.tap_max_distance { return true; }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Get the tap position.
+pub fn touch_tap_position(ts: &TouchState) -> vec2 {
+    var i = 0;
+    while i < ts.touches.len() {
+        var t = ts.touches.get(i);
+        if t.phase == TOUCH_ENDED {
+            var dx = t.x - t.start_x;
+            var dy = t.y - t.start_y;
+            var dist = pledge_sqrt(dx * dx + dy * dy);
+            if dist < ts.tap_max_distance {
+                return vec2(t.x, t.y);
+            }
+        }
+        i = i + 1;
+    }
+    return vec2(0.0, 0.0);
+}
+
+/// Check if a pinch gesture is active.
+pub fn touch_pinch_active(ts: &TouchState) -> bool {
+    return ts.pinch_active;
+}
+
+/// Get the pinch scale factor.
+pub fn touch_pinch_scale(ts: &TouchState) -> f64 {
+    if !ts.pinch_active { return 1.0; }
+    if ts.pinch_initial_distance <= 0.0 { return 1.0; }
+    return ts.pinch_current_distance / ts.pinch_initial_distance;
+}
+
+/// Check if a pan gesture is active.
+pub fn touch_pan_active(ts: &TouchState) -> bool {
+    return ts.pan_active;
+}
+
+/// Get the pan delta.
+pub fn touch_pan_delta(ts: &TouchState) -> vec2 {
+    var i = 0;
+    while i < ts.touches.len() {
+        var t = ts.touches.get(i);
+        if t.active && (t.phase == TOUCH_MOVED || t.phase == TOUCH_BEGAN) {
+            return vec2(t.x - t.prev_x, t.y - t.prev_y);
+        }
+        i = i + 1;
+    }
+    return vec2(0.0, 0.0);
+}
+
+/// Check if a swipe just occurred.
+pub fn touch_swipe_active(ts: &TouchState) -> bool {
+    return ts.swipe_active;
+}
+
+/// Get the swipe direction (0=right, 1=left, 2=down, 3=up).
+pub fn touch_swipe_direction(ts: &TouchState) -> i64 {
+    return ts.swipe_direction;
+}
+
+/// Get the swipe delta.
+pub fn touch_swipe_delta(ts: &TouchState) -> vec2 {
+    var i = 0;
+    while i < ts.touches.len() {
+        var t = ts.touches.get(i);
+        if t.phase == TOUCH_ENDED {
+            return vec2(t.x - t.start_x, t.y - t.start_y);
+        }
+        i = i + 1;
+    }
+    return vec2(0.0, 0.0);
+}
+
+/// Convert normalized touch coordinates to screen pixels.
+pub fn touch_to_pixels(ts: &TouchState, t: &Touch) -> vec2 {
+    return vec2(t.x * ts.screen_width, t.y * ts.screen_height);
+}
+
+/// Set the tap detection threshold.
+pub fn touch_set_tap_threshold(ts: &mut TouchState, max_dist: f64, max_duration: f64) -> void {
+    ts.tap_max_distance = max_dist;
+    ts.tap_max_duration = max_duration;
+}
+
+/// Set the swipe detection threshold.
+pub fn touch_set_swipe_threshold(ts: &mut TouchState, min_dist: f64) -> void {
+    ts.swipe_min_distance = min_dist;
+}
+
+/// Clear all touch state.
+pub fn touch_clear(ts: &mut TouchState) -> void {
+    var i = 0;
+    while i < ts.touches.len() {
+        var t = ts.touches.get(i);
+        t.active = false;
+        t.phase = TOUCH_NONE;
+        t.id = -1;
+        ts.touches.set(i, t);
+        i = i + 1;
+    }
+    ts.pinch_active = false;
+    ts.pan_active = false;
+    ts.swipe_active = false;
+}

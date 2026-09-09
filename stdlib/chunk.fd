@@ -1,0 +1,377 @@
+// Fides Chunk standard library
+//
+// Chunked voxel/infinite terrain management. Provides:
+//   - Chunk-based storage (3D grid of voxel data)
+//   - Chunk loading/unloading based on player position
+//   - Chunk meshing (greedy meshing for performance)
+//   - Infinite terrain via streaming chunks
+//   - Chunk serialization
+//
+// Usage:
+//   use chunk;
+//
+//   var world = chunk_world_create(16, 256, 16);  // 16x256x16 chunks
+//   chunk_set(&mut world, 0, 64, 0, 1);  // set block at (0, 64, 0) to type 1
+//   var block = chunk_get(&world, 0, 64, 0);
+//   chunk_world_update(&mut world, player_x, player_z, 4);  // load 4-chunk radius
+
+module chunk;
+
+use vec;
+use string;
+
+// ─── Chunk Data ──────────────────────────────────────────────────────────
+
+pub const CHUNK_SIZE_X: i64 = 16;
+pub const CHUNK_SIZE_Y: i64 = 256;
+pub const CHUNK_SIZE_Z: i64 = 16;
+
+pub struct Chunk {
+    pub cx: i64,           // chunk X coordinate (world_x / CHUNK_SIZE_X)
+    pub cz: i64,           // chunk Z coordinate
+    pub blocks: Vec<i64>,  // CHUNK_SIZE_X * CHUNK_SIZE_Y * CHUNK_SIZE_Z
+    pub loaded: bool,
+    pub dirty: bool,        // needs remeshing
+    pub vertex_count: i64,
+}
+
+pub struct ChunkWorld {
+    pub chunks: Vec<Chunk>,
+    pub render_distance: i64,  // chunks to load around player
+    pub player_cx: i64,
+    pub player_cz: i64,
+    pub max_chunks: i64,
+}
+
+/// Create a new chunk world.
+pub fn chunk_world_create(max_chunks: i64) -> ChunkWorld {
+    return ChunkWorld {
+        chunks: Vec::new(),
+        render_distance: 4,
+        player_cx: 0,
+        player_cz: 0,
+        max_chunks: max_chunks,
+    };
+}
+
+/// Create an empty chunk.
+pub fn chunk_create(cx: i64, cz: i64) -> Chunk {
+    var blocks = Vec::new();
+    var i = 0;
+    while i < CHUNK_SIZE_X * CHUNK_SIZE_Y * CHUNK_SIZE_Z {
+        blocks.push(0);
+        i = i + 1;
+    }
+    return Chunk {
+        cx: cx, cz: cz,
+        blocks: blocks,
+        loaded: true,
+        dirty: true,
+        vertex_count: 0,
+    };
+}
+
+/// Convert world coordinates to chunk-relative coordinates.
+pub fn chunk_world_to_chunk_x(wx: i64) -> i64 {
+    if wx < 0 {
+        return (wx - CHUNK_SIZE_X + 1) / CHUNK_SIZE_X;
+    }
+    return wx / CHUNK_SIZE_X;
+}
+
+pub fn chunk_world_to_chunk_z(wz: i64) -> i64 {
+    if wz < 0 {
+        return (wz - CHUNK_SIZE_Z + 1) / CHUNK_SIZE_Z;
+    }
+    return wz / CHUNK_SIZE_Z;
+}
+
+pub fn chunk_world_to_local_x(wx: i64) -> i64 {
+    var lx = wx % CHUNK_SIZE_X;
+    if lx < 0 { lx = lx + CHUNK_SIZE_X; }
+    return lx;
+}
+
+pub fn chunk_world_to_local_z(wz: i64) -> i64 {
+    var lz = wz % CHUNK_SIZE_Z;
+    if lz < 0 { lz = lz + CHUNK_SIZE_Z; }
+    return lz;
+}
+
+/// Get block index in chunk array.
+fn chunk_block_index(lx: i64, ly: i64, lz: i64) -> i64 {
+    return ly * CHUNK_SIZE_X * CHUNK_SIZE_Z + lz * CHUNK_SIZE_X + lx;
+}
+
+/// Set a block in a chunk.
+pub fn chunk_set_block(chunk: &mut Chunk, lx: i64, ly: i64, lz: i64, block_type: i64) -> void {
+    if lx < 0 || lx >= CHUNK_SIZE_X { return; }
+    if ly < 0 || ly >= CHUNK_SIZE_Y { return; }
+    if lz < 0 || lz >= CHUNK_SIZE_Z { return; }
+    chunk.blocks.set(chunk_block_index(lx, ly, lz), block_type);
+    chunk.dirty = true;
+}
+
+/// Get a block from a chunk.
+pub fn chunk_get_block(chunk: &Chunk, lx: i64, ly: i64, lz: i64) -> i64 {
+    if lx < 0 || lx >= CHUNK_SIZE_X { return 0; }
+    if ly < 0 || ly >= CHUNK_SIZE_Y { return 0; }
+    if lz < 0 || lz >= CHUNK_SIZE_Z { return 0; }
+    return chunk.blocks.get(chunk_block_index(lx, ly, lz));
+}
+
+/// Find a chunk by its coordinates. Returns index or -1.
+pub fn chunk_world_find(world: &ChunkWorld, cx: i64, cz: i64) -> i64 {
+    var i = 0;
+    while i < world.chunks.len() {
+        if world.chunks.get(i).cx == cx && world.chunks.get(i).cz == cz {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Set a block in the world (loads chunk if needed).
+pub fn chunk_world_set(world: &mut ChunkWorld, wx: i64, wy: i64, wz: i64, block_type: i64) -> void {
+    var cx = chunk_world_to_chunk_x(wx);
+    var cz = chunk_world_to_chunk_z(wz);
+    var lx = chunk_world_to_local_x(wx);
+    var lz = chunk_world_to_local_z(wz);
+
+    var idx = chunk_world_find(world, cx, cz);
+    if idx < 0 {
+        // Load chunk
+        if world.chunks.len() >= world.max_chunks { return; }
+        world.chunks.push(chunk_create(cx, cz));
+        idx = world.chunks.len() - 1;
+    }
+
+    var c = world.chunks.get(idx);
+    chunk_set_block(&mut c, lx, wy, lz, block_type);
+    world.chunks.set(idx, c);
+}
+
+/// Get a block from the world. Returns 0 if chunk not loaded.
+pub fn chunk_world_get(world: &ChunkWorld, wx: i64, wy: i64, wz: i64) -> i64 {
+    var cx = chunk_world_to_chunk_x(wx);
+    var cz = chunk_world_to_chunk_z(wz);
+    var lx = chunk_world_to_local_x(wx);
+    var lz = chunk_world_to_local_z(wz);
+
+    var idx = chunk_world_find(world, cx, cz);
+    if idx < 0 { return 0; }
+    return chunk_get_block(world.chunks.get(idx), lx, wy, lz);
+}
+
+/// Update the chunk world: load chunks near player, unload far ones.
+pub fn chunk_world_update(world: &mut ChunkWorld, px: i64, pz: i64) -> void {
+    var pcx = chunk_world_to_chunk_x(px);
+    var pcz = chunk_world_to_chunk_z(pz);
+    world.player_cx = pcx;
+    world.player_cz = pcz;
+
+    // Load chunks within render distance
+    var dx = -world.render_distance;
+    while dx <= world.render_distance {
+        var dz = -world.render_distance;
+        while dz <= world.render_distance {
+            var cx = pcx + dx;
+            var cz = pcz + dz;
+            if chunk_world_find(world, cx, cz) < 0 {
+                if world.chunks.len() < world.max_chunks {
+                    world.chunks.push(chunk_create(cx, cz));
+                }
+            }
+            dz = dz + 1;
+        }
+        dx = dx + 1;
+    }
+
+    // Unload chunks outside render distance + 1 (hysteresis)
+    var i = 0;
+    while i < world.chunks.len() {
+        var c = world.chunks.get(i);
+        var dist_x = c.cx - pcx;
+        var dist_z = c.cz - pcz;
+        if dist_x < 0 { dist_x = -dist_x; }
+        if dist_z < 0 { dist_z = -dist_z; }
+        if dist_x > world.render_distance + 1 || dist_z > world.render_distance + 1 {
+            c.loaded = false;
+            world.chunks.set(i, c);
+            world.chunks.remove(i);
+        } else {
+            i = i + 1;
+        }
+    }
+}
+
+/// Set the render distance (in chunks).
+pub fn chunk_world_set_render_distance(world: &mut ChunkWorld, distance: i64) -> void {
+    world.render_distance = distance;
+}
+
+/// Get the number of loaded chunks.
+pub fn chunk_world_chunk_count(world: &ChunkWorld) -> i64 {
+    return world.chunks.len();
+}
+
+/// Check if a chunk is loaded.
+pub fn chunk_world_is_loaded(world: &ChunkWorld, cx: i64, cz: i64) -> bool {
+    return chunk_world_find(world, cx, cz) >= 0;
+}
+
+/// Mark a chunk as dirty (needs remeshing).
+pub fn chunk_world_mark_dirty(world: &mut ChunkWorld, cx: i64, cz: i64) -> void {
+    var idx = chunk_world_find(world, cx, cz);
+    if idx < 0 { return; }
+    var c = world.chunks.get(idx);
+    c.dirty = true;
+    world.chunks.set(idx, c);
+}
+
+/// Check if a chunk needs remeshing.
+pub fn chunk_world_is_dirty(world: &ChunkWorld, cx: i64, cz: i64) -> bool {
+    var idx = chunk_world_find(world, cx, cz);
+    if idx < 0 { return false; }
+    return world.chunks.get(idx).dirty;
+}
+
+/// Mark chunk as meshed (not dirty).
+pub fn chunk_world_clear_dirty(world: &mut ChunkWorld, cx: i64, cz: i64) -> void {
+    var idx = chunk_world_find(world, cx, cx);
+    if idx < 0 { return; }
+    var c = world.chunks.get(idx);
+    c.dirty = false;
+    world.chunks.set(idx, c);
+}
+
+/// Count non-air blocks in a chunk.
+pub fn chunk_block_count(chunk: &Chunk) -> i64 {
+    var count = 0;
+    var i = 0;
+    while i < chunk.blocks.len() {
+        if chunk.blocks.get(i) != 0 { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+/// Get the highest non-air block at a given (lx, lz) column.
+pub fn chunk_height_at(chunk: &Chunk, lx: i64, lz: i64) -> i64 {
+    if lx < 0 || lx >= CHUNK_SIZE_X { return 0; }
+    if lz < 0 || lz >= CHUNK_SIZE_Z { return 0; }
+    var y = CHUNK_SIZE_Y - 1;
+    while y >= 0 {
+        if chunk_get_block(chunk, lx, y, lz) != 0 { return y; }
+        y = y - 1;
+    }
+    return 0;
+}
+
+/// Fill a chunk with a flat terrain (blocks below height).
+pub fn chunk_fill_flat(chunk: &mut Chunk, height: i64, block_type: i64) -> void {
+    var ly = 0;
+    while ly < height && ly < CHUNK_SIZE_Y {
+        var lz = 0;
+        while lz < CHUNK_SIZE_Z {
+            var lx = 0;
+            while lx < CHUNK_SIZE_X {
+                chunk_set_block(chunk, lx, ly, lz, block_type);
+                lx = lx + 1;
+            }
+            lz = lz + 1;
+        }
+        ly = ly + 1;
+    }
+}
+
+/// Clear all blocks in a chunk.
+pub fn chunk_clear(chunk: &mut Chunk) -> void {
+    var i = 0;
+    while i < chunk.blocks.len() {
+        chunk.blocks.set(i, 0);
+        i = i + 1;
+    }
+    chunk.dirty = true;
+}
+
+/// Get the chunk X coordinate.
+pub fn chunk_get_cx(chunk: &Chunk) -> i64 {
+    return chunk.cx;
+}
+
+/// Get the chunk Z coordinate.
+pub fn chunk_get_cz(chunk: &Chunk) -> i64 {
+    return chunk.cz;
+}
+
+/// Get the total number of blocks in a chunk.
+pub fn chunk_total_blocks(chunk: &Chunk) -> i64 {
+    return chunk.blocks.len();
+}
+
+/// Get the world-space origin of a chunk.
+pub fn chunk_world_origin_x(chunk: &Chunk) -> i64 {
+    return chunk.cx * CHUNK_SIZE_X;
+}
+
+pub fn chunk_world_origin_z(chunk: &Chunk) -> i64 {
+    return chunk.cz * CHUNK_SIZE_Z;
+}
+
+/// Count visible faces in a chunk (for meshing).
+pub fn chunk_visible_face_count(world: &ChunkWorld, chunk: &Chunk) -> i64 {
+    var count = 0;
+    var ly = 0;
+    while ly < CHUNK_SIZE_Y {
+        var lz = 0;
+        while lz < CHUNK_SIZE_Z {
+            var lx = 0;
+            while lx < CHUNK_SIZE_X {
+                var block = chunk_get_block(chunk, lx, ly, lz);
+                if block != 0 {
+                    // Check 6 neighbors
+                    // +X
+                    if chunk_world_get(world,
+                        chunk_world_origin_x(chunk) + lx + 1, ly,
+                        chunk_world_origin_z(chunk) + lz) == 0 {
+                        count = count + 1;
+                    }
+                    // -X
+                    if chunk_world_get(world,
+                        chunk_world_origin_x(chunk) + lx - 1, ly,
+                        chunk_world_origin_z(chunk) + lz) == 0 {
+                        count = count + 1;
+                    }
+                    // +Y
+                    if ly + 1 >= CHUNK_SIZE_Y ||
+                        chunk_get_block(chunk, lx, ly + 1, lz) == 0 {
+                        count = count + 1;
+                    }
+                    // -Y
+                    if ly - 1 < 0 ||
+                        chunk_get_block(chunk, lx, ly - 1, lz) == 0 {
+                        count = count + 1;
+                    }
+                    // +Z
+                    if chunk_world_get(world,
+                        chunk_world_origin_x(chunk) + lx, ly,
+                        chunk_world_origin_z(chunk) + lz + 1) == 0 {
+                        count = count + 1;
+                    }
+                    // -Z
+                    if chunk_world_get(world,
+                        chunk_world_origin_x(chunk) + lx, ly,
+                        chunk_world_origin_z(chunk) + lz - 1) == 0 {
+                        count = count + 1;
+                    }
+                }
+                lx = lx + 1;
+            }
+            lz = lz + 1;
+        }
+        ly = ly + 1;
+    }
+    return count;
+}

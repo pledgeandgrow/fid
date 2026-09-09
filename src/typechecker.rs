@@ -1972,6 +1972,31 @@ impl TypeChecker {
             }
         }
 
+        // Build call graph for indirect recursion detection (Issue 23).
+        // Maps function name → set of directly-called function names.
+        let mut safety_call_graph: HashMap<String, HashSet<String>> = HashMap::new();
+        for func in &program.funcs {
+            let mut calls = HashSet::new();
+            scan_stmts_for_calls(&func.body, &mut calls);
+            safety_call_graph.insert(func.name.clone(), calls);
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                let mangled = format!("{}_{}", imp.struct_name, method.name);
+                let mut calls = HashSet::new();
+                scan_stmts_for_calls(&method.body, &mut calls);
+                safety_call_graph.insert(mangled, calls);
+            }
+        }
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                let mangled = format!("{}_{}", ti.type_name, method.name);
+                let mut calls = HashSet::new();
+                scan_stmts_for_calls(&method.body, &mut calls);
+                safety_call_graph.insert(mangled, calls);
+            }
+        }
+
         // Functions that allocate memory (forbidden by @no-alloc)
         let alloc_funcs: &[&str] = &[
             "p_vec_new", "p_vec_push", "p_vec_push_str", "p_vec_insert",
@@ -2100,6 +2125,9 @@ impl TypeChecker {
                     ));
                     continue;
                 }
+                // @no-recursion: indirect recursion (A → B → A) — Issue 23.
+                // After collecting all calls, check if func_name is in a cycle.
+                // This is done in a post-pass below (after the loop).
 
                 // Transitive: can only call other safety-annotated functions
                 // (with compatible or superset primitives)
@@ -2221,6 +2249,25 @@ impl TypeChecker {
                 let qualified = format!("{}_{}", ti.type_name, method.name);
                 for err in check_func(method, &qualified, &method.annotations, &func_primitives) {
                     self.errors.push(err);
+                }
+            }
+        }
+
+        // Post-pass: indirect recursion detection for @no-recursion functions.
+        // The direct self-call check above only catches A → A.
+        // This catches A → B → A (and longer cycles) using the call graph.
+        for (func_name, prims) in &func_primitives {
+            if prims.contains("no-recursion") {
+                if is_in_call_cycle(func_name, &safety_call_graph) {
+                    self.errors.push(format!(
+                        "Safety error (no-recursion): function '{}' is @no-recursion but is part of\n\
+                         \x20\x20\x20\x20an indirect recursion cycle (A → B → ... → A).\n\
+                         \x20\x20\x20\x20Indirect recursion has the same unbounded stack depth risk as direct\n\
+                         \x20\x20\x20\x20recursion — it just hides the cycle across multiple functions.\n\
+                         \x20\x20\x20\x20Fix: break the cycle by making one function in the loop iterative,\n\
+                         \x20\x20\x20\x20or remove the @no-recursion annotation.",
+                        func_name
+                    ));
                 }
             }
         }
@@ -6568,6 +6615,54 @@ fn compute_total_gas(
     let total = own + callee_total;
     cache.insert(name.to_string(), total);
     total
+}
+
+/// Detect if `target` is reachable from itself via a non-trivial path in the
+/// call graph (i.e., participates in a cycle). This catches indirect recursion
+/// (A → B → A) that the direct self-call check misses.
+fn is_in_call_cycle(
+    target: &str,
+    call_graph: &HashMap<String, HashSet<String>>,
+) -> bool {
+    // DFS from each callee of target; if we can reach target again, it's in a cycle.
+    let callees = match call_graph.get(target) {
+        Some(c) => c,
+        None => return false,
+    };
+    let mut visited: HashSet<String> = HashSet::new();
+    fn dfs(
+        node: &str,
+        target: &str,
+        call_graph: &HashMap<String, HashSet<String>>,
+        visited: &mut HashSet<String>,
+    ) -> bool {
+        if node == target {
+            return true;
+        }
+        if visited.contains(node) {
+            return false;
+        }
+        visited.insert(node.to_string());
+        if let Some(callees) = call_graph.get(node) {
+            for callee in callees {
+                if dfs(callee, target, call_graph, visited) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    for callee in callees {
+        if callee == target {
+            // Direct self-call — already handled by the direct check.
+            continue;
+        }
+        visited.clear();
+        if dfs(callee, target, call_graph, &mut visited) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Scan function body statements for all function calls.
