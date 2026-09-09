@@ -107,9 +107,22 @@ if [[ ! -x "$FIDESC" ]]; then
 fi
 
 # --- Collect test files ---
+# Skip harness tests that require file arguments (not standalone tests)
+SKIP_TESTS="test_fmt_harness.fd test_lexer_harness.fd test_parser_harness.fd test_sl_debug.fd"
+
 TEST_FILES=()
 for f in "$TEST_DIR"/*.fd; do
-    [[ -f "$f" ]] && TEST_FILES+=("$f")
+    [[ -f "$f" ]] || continue
+    # Skip harness tests that need file arguments
+    skip=0
+    for s in $SKIP_TESTS; do
+        if [[ "$(basename "$f")" == "$s" ]]; then
+            skip=1
+            break
+        fi
+    done
+    [[ $skip -eq 1 ]] && continue
+    TEST_FILES+=("$f")
 done
 
 NUM_TESTS=${#TEST_FILES[@]}

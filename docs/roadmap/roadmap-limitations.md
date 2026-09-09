@@ -22,7 +22,7 @@ This section has been **verified by reading source code, running tests, and exec
 
 **Test baseline:** See `roadmap.md` → "Verified Test Baseline" table for current
 test counts (265/265 unit, 8/8 harness, 164/165 interp/C codegen, 165/165 PE, 0 skip,
-0 known-fail, 215 .fd files, 51 .rs files, 70 stdlib modules).
+0 known-fail, 215 .fd files, 51 .rs files, 99 stdlib modules).
 
 ### Feature Verification Matrix (Code-Verified)
 
@@ -1543,7 +1543,7 @@ the "Phase 1: Fix the bugs" and "Phase 2: Close language gaps" work.
 
 **Category: Significant engineering (refocus)**
 
-**The observation**: 70 modules, 18,529 LOC. Average: 265 lines per
+**The observation**: 99 modules, 28,370 LOC. Average: 286 lines per
 module. Many are superficial (`regex.fd` is wildcard matching, not real
 regex; `crypto.fd` is 485 lines, not audited cryptography).
 

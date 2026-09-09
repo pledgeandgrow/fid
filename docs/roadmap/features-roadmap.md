@@ -217,6 +217,34 @@ S34: stdlib/regex.fd           ✅ IMPLEMENTED — regex_matches (?/* wildcards)
 S35: stdlib/sync.fd            ✅ IMPLEMENTED — Mutex<T>, RwLock<T> (atomic refcount read/write lock), AtomicU64, channels (send/recv/try_recv), barriers
 S36: stdlib/iter.fd            ✅ IMPLEMENTED — Iterator<T> trait: map, filter, reduce, for_each, collect, enumerate, zip, chain, take, skip
 
+─── Stdlib Modules — Game/Media (Phase 17, Sep 2026) ─────────────
+S37: stdlib/sdl.fd             ✅ IMPLEMENTED — SDL2 bindings (window, events, audio, GL context)
+S38: stdlib/gl.fd              ✅ IMPLEMENTED — OpenGL bindings (shaders, buffers, textures, FBO)
+S39: stdlib/image.fd           ✅ IMPLEMENTED — Image loading (PNG, JPEG, BMP) via stb_image
+S40: stdlib/font.fd            ✅ IMPLEMENTED — Font rendering (TTF, bitmap) via stb_truetype
+S41: stdlib/mesh.fd            ✅ IMPLEMENTED — 3D mesh loading (OBJ) and primitive generation
+S42: stdlib/gameloop.fd        ✅ IMPLEMENTED — Fixed-timestep game loop with accumulator
+S43: stdlib/physics3d.fd       ✅ IMPLEMENTED — 3D rigid body physics (AABB, sphere, collision)
+S44: stdlib/skel.fd            ✅ IMPLEMENTED — Skeletal animation (skeleton, skinning, pose)
+S45: stdlib/ui.fd              ✅ IMPLEMENTED — Immediate-mode UI (panels, buttons, sliders, text)
+S46: stdlib/net.fd             ✅ IMPLEMENTED — UDP networking (socket, send, recv, client/server)
+S47: stdlib/camera.fd          ✅ IMPLEMENTED — 2D/3D camera (follow, zoom, shake, screen-to-world)
+S48: stdlib/particles.fd       ✅ IMPLEMENTED — Particle system (emit, update, render)
+S49: stdlib/animation2d.fd     ✅ IMPLEMENTED — Sprite sheet animation states (idle/walk/jump)
+S50: stdlib/audio_mixer.fd     ✅ IMPLEMENTED — Multi-channel mixer, 3D positional audio, music streaming
+S51: stdlib/asset.fd           ✅ IMPLEMENTED — Asset manager (cache, load/unload, hot reload)
+S52: stdlib/serialize.fd       ✅ IMPLEMENTED — Binary save/load, JSON scene serialization
+S53: stdlib/collision_broad.fd ✅ IMPLEMENTED — Broad-phase: spatial hash grid, sweep-and-prune
+S54: stdlib/raycast.fd         ✅ IMPLEMENTED — 2D + 3D raycasting (mouse picking, line of sight)
+S55: stdlib/navmesh.fd         ✅ IMPLEMENTED — Navigation mesh pathfinding (A* on polygons)
+S56: stdlib/terrain.fd         ✅ IMPLEMENTED — Heightmap terrain, LOD, height queries
+S57: stdlib/profiler.fd        ✅ IMPLEMENTED — Frame profiler (CPU/GPU timing, draw call counter)
+S58: stdlib/replay.fd          ✅ IMPLEMENTED — Deterministic replay (record inputs, replay)
+S59: stdlib/shader.fd          ✅ IMPLEMENTED — Shader graph / material system on top of gl
+S60: stdlib/editor.fd          ✅ IMPLEMENTED — In-game editor (entity inspector, transform gizmo)
+S61: stdlib/chunk.fd           ✅ IMPLEMENTED — Chunked voxel / infinite terrain management
+S62: stdlib/touch.fd           ✅ IMPLEMENTED — Touch input for mobile games (multi-touch, gestures)
+
 ─── Debugging Tools — Phase 14 (Aug 2026) ───────────────────────
 D1: fidesc debug              ✅ IMPLEMENTED — interactive interpreter debugger: break, step, next, continue, print, backtrace, list, ir, effects, regions, capabilities, watch, reload, record
 D2: fidesc replay             ✅ IMPLEMENTED — record/replay execution trace: func_name block_id inst_id source_line [value]
@@ -265,11 +293,11 @@ C15: @validated               ❌ CUT — already covered by given/ensure contra
 | **Implemented** | 45+ | F1–F11, F16–F20, F24, F26, F28, F33, F38–F41, F43, F44, F48, F52, F56, F61–F65, F67–F68, F72, F77, F95, F53/F54 (→stdlib/can.fd), F57 (→stdlib/arinc.fd), D1–D7 | Done and tested (interpreter + C codegen where applicable) |
 | **Syntax Tier A** | 32 | F10, F13, F14, F18, F21, F23–F60 (excl. F53/F54/F57 moved to stdlib) | Compiler must understand — can't be a library |
 | **Syntax Tier B** | 12 | F6, F7, F9, F11, F12, F19, F20, F33–F37 | Ergonomic — could be library but worth the keyword |
-| **Stdlib** | 29 | S1–S29 (S6–S9, S11, S16, S19–S20, S22–S24, S26–S29 ✅, S25 ada.fd ❌ CUT) | Built in Fides, users can read/modify/replace |
+| **Stdlib** | 62 | S1–S62 (S6–S9, S11, S16, S19–S20, S22–S24, S26–S62 ✅, S25 ada.fd ❌ CUT) | Built in Fides, users can read/modify/replace |
 | **Debugging** | 7 | D1–D7 | Interactive debugger, record/replay, hot-reload, post-mortem, native debugger |
 | **Cut** | 17 | C1–C15, F15, S25 | Redundant — existing features already cover |
 
-**Total: 45+ implemented + 44 syntax + 29 stdlib + 7 debugging + 17 cut = 142 features analyzed.**
+**Total: 45+ implemented + 44 syntax + 62 stdlib + 7 debugging + 17 cut = 175 features analyzed.**
 
 ### Industry Coverage
 
@@ -282,7 +310,7 @@ C15: @validated               ❌ CUT — already covered by given/ensure contra
 | **Energy/Grid** | F59–F60 (@grid-safe, @scada) | S26–S27 (grid, SCADA) | IEC 61850 compliance + deterministic dispatch |
 | **Robotics/IoT** | F27, F29–F31, F35, F37 (@realtime, @interrupt, @firmware, @lowpower, @watchdog, @ota) | S12–S16 (HAL, sensor, motor, protocol, OTA) | WCET proof + no-malloc proof + bare metal |
 | **Blockchain** | F28, F34, F50 (@gas, @emit, @signed) | S9–S11 (crypto, consensus, storage) | Compile-time gas verification + determinism |
-| **Gaming** | F16–F18, F21, F23–F25 (vec/mat, swizzle, ECS, @shader, @simd, @crashfree, @pool) | S1–S8 (tilemap, sprite, etc.) | Crash-free game loop proof |
+| **Gaming** | F16–F18, F21, F23–F25 (vec/mat, swizzle, ECS, @shader, @simd, @crashfree, @pool) | S1–S8, S37–S62 (tilemap, sprite, sdl, gl, mesh, physics3d, camera, particles, audio_mixer, navmesh, terrain, profiler, replay, shader, editor, chunk, touch, etc.) | Crash-free game loop proof |
 | **AI/ML** | F14 (@differentiable) ✅ | — (tensor.fd exists) | Compile-time shape checking + differentiability proof + runtime tape-based autodiff (gradient computation) |
 | **Serverless/Edge** | F32, F36 (@serverless, @handler) | S17–S18 (HTTP server, WASM API) | Tiny binaries + capability-stripped |
 
@@ -2338,9 +2366,15 @@ system UpdateLOD {
 > contracts, memoization, state machines, and event handlers — all native
 > syntax, not library boilerplate.
 >
-> With the stdlib (S1–S8), Fides ships game systems as readable Fides code:
-> tilemaps, sprites, flowfields, streaming, scenes, physics, audio, input.
-> Users can read every line, modify anything, or replace it entirely.
+> With the stdlib (S1–S8, S37–S62), Fides ships game systems as readable Fides code:
+> tilemaps, sprites, flowfields, streaming, scenes, physics, audio, input,
+> SDL2/OpenGL bindings, image loading, font rendering, 3D meshes, skeletal
+> animation, 3D physics, immediate-mode UI, UDP networking, cameras, particles,
+> sprite animation, audio mixer, asset manager, serialization, broad-phase
+> collision, raycasting, navmesh pathfinding, heightmap terrain, frame profiler,
+> deterministic replay, shader/material system, in-game editor, chunked voxel
+> terrain, and touch input. Users can read every line, modify anything, or
+> replace it entirely.
 >
 > Fides follows the Rust/Zig philosophy: small language, rich stdlib, infinite
 > extensibility. Only make it syntax when the compiler must do something
@@ -2354,7 +2388,8 @@ All 5 original features (F1–F5) were implemented in a single session. Test res
 **Planned for implementation:**
 - 39 Tier A syntax features (F10, F13, F14, F16–F18, F21, F23–F60) — need compiler support
 - 7 Tier B syntax features (F12, F19, F20) — ergonomic keywords
-- 29 stdlib module slots (S1–S29) — Fides code, no compiler changes (70 actual .fd files as of Sep 2026, 18,529 LOC)
+- 29 stdlib module slots (S1–S29) — Fides code, no compiler changes (99 actual .fd files as of Sep 2026, 28,370 LOC)
+- 26 game/media stdlib modules (S37–S62) — Fides code, no compiler changes (SDL2/GL/image/font/mesh/gameloop/physics3d/skel/ui/net/camera/particles/animation2d/audio_mixer/asset/serialize/collision_broad/raycast/navmesh/terrain/profiler/replay/shader/editor/chunk/touch)
 - 15 features cut (C1–C15) — redundant, build with existing features
 
 ---

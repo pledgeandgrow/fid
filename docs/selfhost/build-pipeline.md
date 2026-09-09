@@ -410,7 +410,7 @@ p-lang/
 ├── docs/selfhost/        # This documentation (13 .md files)
 ├── release/              # Self-hosted build artifacts (gitignored)
 ├── src/                  # Rust reference compiler (52 .rs files, 84,447 LOC)
-├── stdlib/               # Fides standard library (70 .fd modules, 18,529 LOC)
+├── stdlib/               # Fides standard library (99 .fd modules, 28,370 LOC)
 ├── tests/                # Language tests (225+ .fd files)
 ├── tests/selfhost/       # Self-host module tests (23 .fd files)
 ├── tests/selfhost/       # Bootstrap probe tests

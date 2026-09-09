@@ -836,7 +836,7 @@ planned but not yet implemented.
 
 ## 9. Standard Library
 
-Fides has 70 stdlib modules (~18,529 LOC). Key modules:
+Fides has 99 stdlib modules (~28,370 LOC). Key modules:
 
 ### Core
 | Module | Description |

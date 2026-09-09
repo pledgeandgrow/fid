@@ -117,6 +117,40 @@ fn tokenize(src: &str) -> Vec<FTok> {
             continue;
         }
 
+        // Raw string: r"..." or r#"..."# (with N hash signs)
+        if c == 'r' && i + 1 < n && (chars[i + 1] == '"' || chars[i + 1] == '#') {
+            let start = i;
+            i += 1; // consume 'r'
+            // Count hash signs
+            let mut hash_count = 0;
+            while i < n && chars[i] == '#' {
+                i += 1;
+                hash_count += 1;
+            }
+            // Expect opening "
+            if i < n && chars[i] == '"' {
+                i += 1;
+                // Read until we find " followed by exactly hash_count # signs
+                while i < n {
+                    if chars[i] == '"' {
+                        // Check if followed by hash_count # signs
+                        let mut h = 0;
+                        while h < hash_count && i + 1 + h < n && chars[i + 1 + h] == '#' {
+                            h += 1;
+                        }
+                        if h == hash_count {
+                            i += 1 + hash_count;
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            let text: String = chars[start..i].iter().collect();
+            out.push(FTok::Str(text));
+            continue;
+        }
+
         // f-string: f"..." (and f'...' not supported by lexer, only f")
         if c == 'f' && i + 1 < n && chars[i + 1] == '"' {
             let start = i;
@@ -173,6 +207,16 @@ fn tokenize(src: &str) -> Vec<FTok> {
                 // fractional part
                 if i < n && chars[i] == '.' && i + 1 < n && chars[i + 1].is_ascii_digit() {
                     i += 1;
+                    while i < n && (chars[i].is_ascii_digit() || chars[i] == '_') {
+                        i += 1;
+                    }
+                }
+                // Scientific notation: e[+/-]digits (matches main lexer)
+                if i < n && (chars[i] == 'e' || chars[i] == 'E') {
+                    i += 1;
+                    if i < n && (chars[i] == '+' || chars[i] == '-') {
+                        i += 1;
+                    }
                     while i < n && (chars[i].is_ascii_digit() || chars[i] == '_') {
                         i += 1;
                     }

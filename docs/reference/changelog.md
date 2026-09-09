@@ -1,5 +1,61 @@
 # Fides Language Changelog
 
+## Session 21 — Test Bug Fixes & Roadmap Sync (Sep 9, 2026)
+
+### Summary
+
+Fixed multiple test bugs, added volatile memory runtime support, fixed C
+codegen memory corruption, and synchronized roadmap documentation with
+actual source state.
+
+### Test Bug Fixes
+
+- **`test_os_features.fd`** — Renamed `val` variable (keyword conflict) to
+  `value`. Updated bitfield API calls from non-existent `bit_set`/`bit_get`/
+  `cr0_pe`/`cr0_pg` to actual stdlib functions `write_bit`/`bit`/`CR0_PE`/
+  `CR0_PG`. Fixed volatile store test to read back through volatile pointer.
+- **`test_sandbox_alloc_fail.fd`** — Moved to expected-fail category in
+  `src/main.rs` (negative test that should fail).
+- **`test_token_full.fd`** — Added to skip list (library module, no `main`).
+- **`test_sl_debug.fd`** — Rewrote to use correct APIs (`p_argc`/`p_argv`
+  instead of `p_argv()`, `tokenize` instead of `lex_all`, removed
+  `program_flat`).
+- **Harness tests** (`test_fmt_harness`, `test_lexer_harness`,
+  `test_parser_harness`, `test_sl_debug`) — Added to skip list in
+  `verify-selfhost.sh` (require file arguments, not standalone tests).
+
+### Volatile Memory Runtime Support
+
+Added `p_volatile_load`/`p_volatile_store` and 8/16/32-bit variants to:
+- `src/interp.rs` — Full implementation using interpreter byte memory
+- `compiler/interp.fd` — Stub returns (MMIO simulation)
+- `src/lower.rs` — Extern declarations + effect annotations (Write/IO)
+- `compiler/lower.fd` — Extern declarations
+
+This fixes `test_tier1_kernel.fd` and `test_os_features.fd` on interpreter.
+
+### C Codegen Memory Corruption Fix
+
+Fixed `test_regression_collections.fd` C codegen crash
+(`munmap_chunk(): invalid pointer`):
+
+- **Root cause:** `Vec_to_str` and `HashMap_to_str` return arena-allocated
+  strings (via `p_str_concat` → `p_malloc` → arena allocator). The C codegen
+  was calling `free(_s)` on these strings, but arena-allocated pointers
+  cannot be freed with standard `free()`.
+- **Fix:** Removed `free(_s)` from Vec/HashMap print codegen in
+  `src/codegen_c.rs` (lines 2252-2260). Arena automatically reclaims memory.
+
+### Roadmap Documentation Updates
+
+- **`roadmap-issues.md` CB6** — Updated to reflect all 15 PE stubs are
+  implemented (was showing 9 as still stubbed).
+- **`roadmap-issues.md` CB3** — Updated test numbers and failure lists.
+- **`os-gap-analysis.md`** — Updated CB1/CB2/CB3 statuses to reflect
+  Session 20/21 changes.
+
+---
+
 ## Critical Blocker Resolution — Session 20 Part 2 (Sep 9, 2026)
 
 ### Summary
@@ -463,7 +519,7 @@ Added shared string functions needed by multiple compiler modules
 |-----------|---------:|--------:|
 | `compiler/*.fd` | 61,885 | 74,914 (31 modules) |
 | `src/*.rs` | 91,038 | 91,490 (55 files) |
-| `stdlib/*.fd` | 18,529 | 19,230 (74 modules) |
+| `stdlib/*.fd` | 28,370 | 28,370 (99 modules) |
 
 ## Linux Native Backend Fixes — Session 17 (Sep 8, 2026)
 

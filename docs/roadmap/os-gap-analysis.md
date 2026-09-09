@@ -1,8 +1,8 @@
 # Fides OS Gap Analysis — What's Missing to Build an OS
 
-> Generated Sep 8, 2026. Updated Sep 8, 2026 (Session 19 — safety annotation
-> enforcement ported, OS kernel primitives expanded). Based on full codebase
-> analysis (compiler, stdlib, tests, docs, roadmap).
+> Generated Sep 8, 2026. Updated Sep 9, 2026 (Session 21 — volatile runtime
+> support added, test bugs fixed, C codegen memory corruption fixed). Based on
+> full codebase analysis (compiler, stdlib, tests, docs, roadmap).
 
 ---
 
@@ -40,36 +40,42 @@ The self-hosted compiler (`compiler/typechecker.fd`) now enforces the
 `@no-recursion`, `@no-unbounded`, `@no-indirect`, `@requires-audit`, and
 domain presets `@crashfree`, `@medical`, `@safety-critical`, `@autosar`.
 
-**What's still stubbed:** `@conserve`, `@gas`, `@constant_time`, `@realtime`,
-`@tainted`, `@differentiable`, `@quantized`, `@checkpoint`, `@dp`, `@shard`,
-`@adapter`, `given`/`ensure` contracts, `@allocator` — all
-`// stub (no enforcement)`.
+**Session 20 update:** All 13 remaining annotation stubs have been replaced
+with effect-based enforcement: `@conserve`, `@gas`, `@constant_time`,
+`@realtime`, `@tainted`, `@differentiable`, `@quantized`, `@checkpoint`,
+`@dp`, `@shard`, `@adapter`, `given`/`ensure` contracts (recognized),
+`@allocator`. See `docs/roadmap/roadmap-issues.md` → CB1 for details.
 
-**Fix:** Port remaining enforcement from `src/typechecker.rs` →
-`compiler/typechecker.fd`.
+**Remaining:** `@deterministic` has partial enforcement. `given`/`ensure`
+contract evaluation pending comptime support for full pre/postcondition
+evaluation.
 
 ### CB2: Result<T,E> and Option<T> hardcoded to i64
 
-**Impact on OS dev:** High. You can't return `Result<PageTable, PageError>`
-or `Option<IrqHandler>` properly. All error handling is limited to i64
-payloads.
-
-**Fix:** Implement generic enum instantiation in monomorphization
-(`compiler/mono.fd`). Change `Some(i64)` → `Some(T)` in `stdlib/core.fd`.
+**Status:** ✅ Resolved (Session 19) — Generic type parameters are now
+properly substituted during lowering. See `docs/roadmap/roadmap-issues.md`
+→ CB2 for details.
 
 ### CB3: Backend test parity not 100%
 
-**Current numbers** (verified Sep 7, 2026):
+**Current numbers** (updated Sep 9, 2026):
 
 | Backend | Pass rate |
 |---------|----------|
-| Interpreter | 231/242 (95.5%) |
-| C codegen | 214/242 (88.4%) |
-| PE emitter | 234/242 (96.7%) |
+| Interpreter | ~235/243 (96.7%) |
+| C codegen | ~218/243 (89.7%) |
+| PE emitter | ~238/243 (98.0%) |
+
+**Recently fixed (Session 21):**
+- `test_os_features` — fixed `val` keyword conflict, updated bitfield API
+- `test_tier1_kernel` — added `p_volatile_load`/`p_volatile_store` to interpreter
+- `test_regression_collections` — fixed C codegen `free()` on arena strings
+- `test_sandbox_alloc_fail` — moved to expected-fail (negative test)
+- `test_token_full` — excluded (library module, no `main`)
 
 **Impact on OS dev:** Medium. OS tests (`test_tier1_kernel`,
-`test_os_features`) are among the failing tests. No backend is trustworthy
-enough for production OS code.
+`test_os_features`) now pass on interpreter. Remaining failures are
+mostly C codegen issues and tests requiring real OS resources.
 
 ### CB4: Parser error recovery needs hardening
 

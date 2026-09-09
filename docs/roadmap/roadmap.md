@@ -45,7 +45,7 @@ Phase 16: Tier 3 OS           ← IN PROGRESS — @cpu_local, inline asm clobber
 | Expected-fail | **35** tests | Correctly fail — error detection tests. |
 | Total `.fd` test files | **218** | 195 in root + 23 in subdirs (capability/effects/regions/safety) |
 | Source files | **51** `.rs` | 86,742 LOC Rust |
-| Stdlib files | **70** `.fd` | 18,529 LOC Fides |
+| Stdlib files | **99** `.fd` | 28,370 LOC Fides |
 
 ### Security Hardening (New — Aug 2026)
 
