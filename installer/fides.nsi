@@ -5,19 +5,6 @@
 ;
 ; Output:
 ;   installer/Fides-Setup-<version>.exe
-;
-; Requirements:
-;   - NSIS 3.x (https://nsis.sourceforge.io/)
-;   - On Linux: sudo apt install nsis
-;   - On Windows: download from nsis.sourceforge.io
-;
-; The installer will:
-;   - Install Fides to C:\Program Files\Fides\
-;   - Copy compiler (fides.exe), stdlib, runtime, docs
-;   - Add Fides to PATH
-;   - Associate .fd files with Fides
-;   - Create Start Menu shortcuts
-;   - Include uninstaller
 
 ; ─── Version ─────────────────────────────────────────────────────────────
 
@@ -27,12 +14,11 @@
 !define PRODUCT_URL "https://github.com/medzer/pledge/p-lang"
 !define PRODUCT_REGKEY "Software\Fides"
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Fides"
+!define ENV_HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
 
 ; ─── Includes ────────────────────────────────────────────────────────────
 
 !include "MUI2.nsh"
-!include "EnvVarUpdate.nsh"
-!include "FileAssociation.nsh"
 
 ; ─── General ──────────────────────────────────────────────────────────────
 
@@ -46,7 +32,7 @@ SetCompressor /SOLID lzma
 RequestExecutionLevel admin
 Unicode True
 
-; ─── Version Info (shows in file properties) ─────────────────────────────
+; ─── Version Info ─────────────────────────────────────────────────────────
 
 VIProductVersion "1.0.0.0"
 VIAddVersionKey "ProductName" "Fides Language"
@@ -59,11 +45,8 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 ; ─── Modern UI Settings ──────────────────────────────────────────────────
 
 !define MUI_ABORTWARNING
-; !define MUI_ICON "fides.ico"
-; !define MUI_UNICON "fides.ico"
 !define MUI_FINISHPAGE_RUN "$INSTDIR\fides.exe"
 !define MUI_FINISHPAGE_RUN_PARAMETERS "--version"
-!define MUI_FINISHPAGE_SHOWREADME "$INSTDIR\docs\guides\quickstart.md"
 
 ; ─── Pages ────────────────────────────────────────────────────────────────
 
@@ -113,8 +96,15 @@ Section "Fides Compiler (required)" SecCore
   ; Create uninstaller
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
-  ; Add to PATH
-  ${EnvVarUpdate} $0 "PATH" "A" "HKLM" "$INSTDIR"
+  ; Add to PATH (append to existing PATH)
+  ReadRegStr $0 HKLM "${ENV_HKLM}" "PATH"
+  StrCmp $0 "" +3
+    WriteRegExpandStr HKLM "${ENV_HKLM}" "PATH" "$0;$INSTDIR"
+    Goto +2
+  WriteRegExpandStr HKLM "${ENV_HKLM}" "PATH" "$INSTDIR"
+
+  ; Broadcast environment change
+  SendMessage HWND_BROADCAST ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
 
   DetailPrint "Fides installed to $INSTDIR"
   DetailPrint "Added $INSTDIR to PATH"
@@ -125,7 +115,7 @@ SectionEnd
 Section "Standard Library" SecStdlib
   SetOutPath "$INSTDIR\stdlib"
   File /r "..\stdlib\*.fd"
-  DetailPrint "Installed standard library (99 modules)"
+  DetailPrint "Installed standard library"
 SectionEnd
 
 ; ─── Section: C Runtime ──────────────────────────────────────────────────
@@ -156,7 +146,11 @@ SectionEnd
 ; ─── Section: File Association (.fd) ─────────────────────────────────────
 
 Section "Associate .fd files" SecAssoc
-  ${RegisterExtension} "$INSTDIR\fides.exe" ".fd" "Fides Source File"
+  ; Register .fd extension
+  WriteRegStr HKCR ".fd" "" "Fides.SourceFile"
+  WriteRegStr HKCR "Fides.SourceFile" "" "Fides Source File"
+  WriteRegStr HKCR "Fides.SourceFile\shell\open\command" "" '"$INSTDIR\fides.exe" "%1"'
+  WriteRegStr HKCR "Fides.SourceFile\DefaultIcon" "" '"$INSTDIR\fides.exe",0'
   DetailPrint "Associated .fd files with Fides"
 SectionEnd
 
@@ -166,8 +160,6 @@ Section "Start Menu Shortcuts" SecShortcuts
   CreateDirectory "$SMPROGRAMS\Fides"
   CreateShortcut "$SMPROGRAMS\Fides\Fides Compiler.lnk" "$INSTDIR\fides.exe" \
     "" "$INSTDIR\fides.exe" 0
-  CreateShortcut "$SMPROGRAMS\Fides\Documentation.lnk" "$INSTDIR\docs\guides\quickstart.md" \
-    "" "" 0
   CreateShortcut "$SMPROGRAMS\Fides\Uninstall Fides.lnk" "$INSTDIR\uninstall.exe" \
     "" "" 0
   DetailPrint "Created Start Menu shortcuts"
@@ -177,7 +169,7 @@ SectionEnd
 
 LangString DESC_Core ${LANG_ENGLISH} "The Fides compiler (fides.exe). Required."
 LangString DESC_Stdlib ${LANG_ENGLISH} "Standard library modules (core, vec, string, math, etc.)."
-LangString DESC_Runtime ${LANG_ENGLISH} "C runtime files for SDL, audio, networking, and other host functionality."
+LangString DESC_Runtime ${LANG_ENGLISH} "C runtime files for SDL, audio, networking."
 LangString DESC_Docs ${LANG_ENGLISH} "Language reference, guides, and roadmap documentation."
 LangString DESC_Examples ${LANG_ENGLISH} "Example Fides programs to get started."
 LangString DESC_Assoc ${LANG_ENGLISH} "Open .fd files with Fides when double-clicked."
@@ -209,10 +201,26 @@ Section "Uninstall"
   RMDir /r "$SMPROGRAMS\Fides"
 
   ; Remove from PATH
-  ${un.EnvVarUpdate} $0 "PATH" "R" "HKLM" "$INSTDIR"
+  ReadRegStr $0 HKLM "${ENV_HKLM}" "PATH"
+  StrCpy $1 "$0"
+  ; Replace ;$INSTDIR with nothing
+  Push "$1"
+  Push ";$INSTDIR"
+  Push ""
+  Call StrRep
+  Pop $1
+  ; Also try without leading ;
+  Push "$1"
+  Push "$INSTDIR;"
+  Push ""
+  Call StrRep
+  Pop $1
+  WriteRegExpandStr HKLM "${ENV_HKLM}" "PATH" "$1"
+  SendMessage HWND_BROADCAST ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
 
   ; Remove file association
-  ${UnRegisterExtension} ".fd" "Fides Source File"
+  DeleteRegKey HKCR ".fd"
+  DeleteRegKey HKCR "Fides.SourceFile"
 
   ; Remove registry keys
   DeleteRegKey HKLM "${PRODUCT_UNINST_KEY}"
@@ -223,3 +231,77 @@ Section "Uninstall"
 
   DetailPrint "Fides uninstalled"
 SectionEnd
+
+; ─── String Replace Helper ───────────────────────────────────────────────
+
+Function StrRep
+  Exch $0
+  Exch
+  Exch $1
+  Exch
+  Exch 2
+  Exch $2
+  Exch 2
+  Push $3
+  Push $4
+  Push $5
+  Push $6
+  Push $7
+  StrCpy $7 ""
+  StrCpy $5 $2
+  Loop:
+    StrCpy $3 $5
+    Push $3
+    Push $0
+    Call StrStr
+    Pop $4
+    StrCmp $4 "" Done
+    StrLen $6 $0
+    StrCpy $3 $3 $4
+    StrCpy $7 "$7$3$1"
+    StrCpy $5 $5 "" $4
+    StrCpy $5 $5 "" $6
+    Goto Loop
+  Done:
+    StrCpy $7 "$7$5"
+    StrCpy $0 $7
+  Pop $7
+  Pop $6
+  Pop $5
+  Pop $4
+  Pop $3
+  Pop $2
+  Pop $1
+  Exch $0
+FunctionEnd
+
+Function StrStr
+  Exch $0
+  Exch
+  Exch $1
+  Exch
+  Push $2
+  Push $3
+  Push $4
+  Push $5
+  StrLen $3 $0
+  StrCpy $4 0
+  Loop:
+    StrCpy $5 $1 $3 $4
+    StrCmp $5 $0 Found
+    StrCmp $5 "" NotFound
+    IntOp $4 $4 + 1
+    Goto Loop
+  Found:
+    StrCpy $0 $4
+    Goto Done
+  NotFound:
+    StrCpy $0 ""
+  Done:
+  Pop $5
+  Pop $4
+  Pop $3
+  Pop $2
+  Pop $1
+  Exch $0
+FunctionEnd
