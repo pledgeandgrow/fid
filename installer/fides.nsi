@@ -59,8 +59,8 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 ; ─── Modern UI Settings ──────────────────────────────────────────────────
 
 !define MUI_ABORTWARNING
-!define MUI_ICON "fides.ico"
-!define MUI_UNICON "fides.ico"
+; !define MUI_ICON "fides.ico"
+; !define MUI_UNICON "fides.ico"
 !define MUI_FINISHPAGE_RUN "$INSTDIR\fides.exe"
 !define MUI_FINISHPAGE_RUN_PARAMETERS "--version"
 !define MUI_FINISHPAGE_SHOWREADME "$INSTDIR\docs\guides\quickstart.md"
