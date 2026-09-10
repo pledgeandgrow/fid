@@ -2080,6 +2080,10 @@ impl TypeChecker {
                     "requires-audit" => { primitives.insert("requires-audit"); }
                     "bounded-stack" => { primitives.insert("bounded-stack"); }
                     "firmware" => { primitives.insert("firmware"); }
+                    "simd" => { /* F23: @simd — recognized but no safety primitives */ }
+                    "zeroize" => { /* F88: @zeroize — recognized but no safety primitives */ }
+                    "secret" => { /* F74: @secret — recognized but no safety primitives */ }
+                    "interrupt" => { /* F29: @interrupt — recognized but no safety primitives */ }
                     _ => {}
                 }
                 // Domain presets — expand to their primitives

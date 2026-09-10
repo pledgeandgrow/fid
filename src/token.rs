@@ -26,7 +26,6 @@ pub enum TokenKind {
     With,        // with — capability grant in imports
     Async,       // async
     Await,       // await
-    Parallel,    // parallel — fork-join parallel block (F13)
     Comptime,    // comptime
     Defer,       // defer
     Spawn,       // spawn
@@ -174,7 +173,7 @@ impl TokenKind {
             TokenKind::Do | TokenKind::Interrupt | TokenKind::Extern | TokenKind::Guard |
             TokenKind::Is | TokenKind::True | TokenKind::False |
             TokenKind::Layer | TokenKind::Model | TokenKind::Grad | TokenKind::Backward |
-            TokenKind::Kernel | TokenKind::Parallel |
+            TokenKind::Kernel |
             TokenKind::Component | TokenKind::System | TokenKind::Query |
             TokenKind::State | TokenKind::On
         )
@@ -220,7 +219,6 @@ impl fmt::Display for TokenKind {
             TokenKind::With => write!(f, "with"),
             TokenKind::Async => write!(f, "async"),
             TokenKind::Await => write!(f, "await"),
-            TokenKind::Parallel => write!(f, "parallel"),
             TokenKind::Comptime => write!(f, "comptime"),
             TokenKind::Defer => write!(f, "defer"),
             TokenKind::Spawn => write!(f, "spawn"),

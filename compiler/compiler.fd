@@ -51,6 +51,7 @@ use compiler::runtime_arm64;
 use compiler::codegen_riscv;
 use compiler::riscv_enc;
 use compiler::runtime_riscv;
+use compiler::wasm;
 // ===========================================================================
 // Result types (Fides has no generic Result<T,E>)
 // ===========================================================================
@@ -72,6 +73,23 @@ pub enum ResultIrModule {
 
 pub enum ResultBytes {
     Ok(Vec),
+    Err(Vec<str>),
+}
+
+/// G8.7: Result type for lint_source — Ok holds a Vec<str> of warnings.
+pub enum ResultVecStr {
+    Ok(Vec<str>),
+    Err(Vec<str>),
+}
+
+/// G8.7: Program + lint warnings (returned by build_program_with_lints).
+pub struct ProgramAndWarnings {
+    pub program: Program,
+    pub warnings: Vec<str>,
+}
+
+pub enum ResultProgramAndWarnings {
+    Ok(ProgramAndWarnings),
     Err(Vec<str>),
 }
 
@@ -801,6 +819,20 @@ var g_stdlib_struct_names: Vec<str> = Vec::new();
 var g_stdlib_enum_names: Vec<str> = Vec::new();
 var g_stdlib_cache_init: bool = false;
 
+/// G8.7: Global lint warnings populated by build_program_with_path.
+/// Read by lint_source after a successful build.
+pub var g_lint_warnings: Vec<str> = Vec::new();
+
+/// G8.2: Global borrow-checker mode. Set by the CLI before calling the pipeline.
+/// "off" = skip borrow checking, "warn" = report but don't fail, "on" = fail on errors.
+pub var g_borrowck_mode: str = "on";
+
+/// G8.2: Setter for the borrow-checker mode (called from main.fd).
+/// Fides doesn't support module-qualified assignment, so we use a function.
+pub fn set_borrowck_mode(mode: str) {
+    g_borrowck_mode = mode;
+}
+
 /// Get the cached parsed stdlib. Parses on first call, returns cache on subsequent calls.
 /// Returns (stdlib_program, struct_names, enum_names).
 pub fn get_cached_stdlib() -> OptProgram {
@@ -1241,20 +1273,39 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
 
                     // Run lints (warnings only)
                     tc.run_lints(program);
+                    // G8.7: Stash warnings for lint_source to read
+                    g_lint_warnings = tc.warnings;
 
-                    // Borrow check
-                    // TODO: wire --borrowck mode from CLI. Fides doesn't support
-                    // module-level mutable vars, so we can't store the mode globally.
-                    // For now, always use Off (matching previous behavior).
-                    var bc: BorrowChecker = BorrowChecker_new(BorrowckMode::Off);
-                    check(&mut bc, program);
-                    if bc.errors.len() > 0 {
-                        var file4: str = "<stdin>";
-                        match source_path {
-                            OptStr::Some(p4) => { file4 = p4; }
-                            OptStr::None => { }
+                    // G8.2: Borrow check — mode controlled by g_borrowck_mode.
+                    //   "off"  : skip borrow checking entirely
+                    //   "warn" : report errors as warnings, don't fail
+                    //   "on"  : report errors and fail compilation (default)
+                    if g_borrowck_mode != "off" {
+                        var bc_mode: BorrowckMode = BorrowckMode::On;
+                        if g_borrowck_mode == "warn" {
+                            bc_mode = BorrowckMode::Warn;
                         }
-                        return ResultProgram::Err(enrich_errors(bc.errors, source, file4));
+                        var bc: BorrowChecker = BorrowChecker_new(bc_mode);
+                        check(&mut bc, program);
+                        if bc.errors.len() > 0 {
+                            var file4: str = "<stdin>";
+                            match source_path {
+                                OptStr::Some(p4) => { file4 = p4; }
+                                OptStr::None => { }
+                            }
+                            if g_borrowck_mode == "warn" {
+                                // Report as warnings, don't fail
+                                var ei: i64 = 0;
+                                while ei < bc.errors.len() {
+                                    p_eprint_str("warning: ");
+                                    p_eprint_str(bc.errors.get(ei));
+                                    p_eprint_str("\n");
+                                    ei = ei + 1;
+                                }
+                            } else {
+                                return ResultProgram::Err(enrich_errors(bc.errors, source, file4));
+                            }
+                        }
                     }
 
                     // Comptime: substitute comptime expressions with their values
@@ -1267,6 +1318,16 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                     p_eprint_str("ms\n");
                     // Monomorphize generics
                     var mono_result: Program = monomorphize(program);
+                    p_eprint_str("[build] mono_result.globals.len()=");
+                    p_eprint_str(int_to_str(mono_result.globals.len()));
+                    p_eprint_str("\n");
+                    var _gdi: i64 = 0;
+                    while _gdi < mono_result.globals.len() {
+                        p_eprint_str("  mono global: ");
+                        p_eprint_str(mono_result.globals.get(_gdi).name);
+                        p_eprint_str("\n");
+                        _gdi = _gdi + 1;
+                    }
                     var t_mono_end: i64 = p_clock_now_ms();
                     p_eprint_str("[prof] mono: ");
                     p_eprint_str(int_to_str(t_mono_end - t_mono));
@@ -1336,9 +1397,105 @@ pub fn ccompile_source_with_path(source: str, source_path: str) -> ResultStr {
     return ResultStr::Err(c_vec1("unreachable"));
 }
 
+/// G8.5: Compile source to WASM binary (or WAT text if wat_mode=true).
+/// Pipeline: build_program → lower → generate_wasm/dump_wat
+pub fn compile_to_wasm(source: str, source_path: str, wat_mode: bool) -> ResultBytes {
+    var result: ResultProgram = build_program_with_path(source, OptStr::Some(source_path));
+    match result {
+        ResultProgram::Err(errs) => { return ResultBytes::Err(errs); }
+        ResultProgram::Ok(program) => {
+            var module: IrModule = lower(program);
+            if wat_mode {
+                var wat_text: str = dump_wat(module);
+                var bytes: Vec<i64> = Vec::new();
+                var n: i64 = str_len(wat_text);
+                var i: i64 = 0;
+                while i < n {
+                    bytes.push(str_byte_at(wat_text, i));
+                    i = i + 1;
+                }
+                return ResultBytes::Ok(bytes);
+            } else {
+                var wasm_bytes: Vec<i64> = generate_wasm(module);
+                return ResultBytes::Ok(wasm_bytes);
+            }
+        }
+    }
+    return ResultBytes::Err(c_vec1("unreachable"));
+}
+
+/// G8.7: Lint a source file. Returns warnings as a vector of strings.
+/// Returns Err with errors if compilation fails.
+pub fn lint_source(source: str, source_path: str) -> ResultVecStr {
+    // G8.7: Lint a source file. Returns warnings as a vector of strings.
+    // We do a minimal parse + typecheck + lint, without monomorphization.
+    g_lint_warnings = Vec::new();
+
+    // Parse user code
+    var user_result: ParseResultProgram = parse_source(source);
+    match user_result {
+        ParseResultProgram::Err(e) => { return ResultVecStr::Err(c_vec1(e)); }
+        ParseResultProgram::Ok(user) => {
+            // Load stdlib
+            var stdlib_opt: OptProgram = get_cached_stdlib();
+            match stdlib_opt {
+                OptProgram::None => {
+                    return ResultVecStr::Err(c_vec1("Stdlib not found: stdlib/core.fd (CWD must be project root)"));
+                }
+                OptProgram::Some(stdlib) => {
+                    var user_module: str = "main";
+                    match user.module {
+                        OptStr::Some(m) => { user_module = m; }
+                        OptStr::None => { }
+                    }
+                    var stdlib_module: str = "core";
+                    match stdlib.module {
+                        OptStr::Some(m2) => { stdlib_module = m2; }
+                        OptStr::None => { }
+                    }
+
+                    // Build a merged program (simplified — no import resolution)
+                    var program: Program = stdlib;
+                    program = merge_programs(program, user);
+
+                    var tc: TypeChecker = TypeChecker::new();
+                    TypeChecker_register_program(&mut tc, stdlib, stdlib_module);
+                    TypeChecker_register_program(&mut tc, user, user_module);
+                    TypeChecker_register_trait_impls(&mut tc, program);
+                    TypeChecker_collect_capabilities(&mut tc, user);
+                    TypeChecker_check_bodies(&mut tc, program);
+
+                    if tc.errors.len() > 0 {
+                        var file: str = source_path;
+                        return ResultVecStr::Err(enrich_errors(tc.errors, source, file));
+                    }
+
+                    // Run lints
+                    tc.run_lints(program);
+                    return ResultVecStr::Ok(tc.warnings);
+                }
+            }
+        }
+    }
+    return ResultVecStr::Err(c_vec1("unreachable"));
+}
+
 /// Lower source to an IR module.
 pub fn lower_to_ir_module(source: str) -> ResultIrModule {
     var result: ResultProgram = build_program(source);
+    match result {
+        ResultProgram::Err(errs) => { return ResultIrModule::Err(errs); }
+        ResultProgram::Ok(program) => {
+            var module: IrModule = lower(program);
+            return ResultIrModule::Ok(module);
+        }
+    }
+    return ResultIrModule::Err(c_vec1("unreachable"));
+}
+
+/// G8.3: Lower source to IR with source path (for import resolution).
+pub fn lower_to_ir_module_with_path(source: str, source_path: str) -> ResultIrModule {
+    var result: ResultProgram = build_program_with_path(source, OptStr::Some(source_path));
     match result {
         ResultProgram::Err(errs) => { return ResultIrModule::Err(errs); }
         ResultProgram::Ok(program) => {
@@ -1375,6 +1532,27 @@ pub fn interpret_source(source: str) -> i64 {
 /// Returns exit code (0 = success, 1 = error).
 pub fn interpret_source_with_options(source: str, max_recursion: i64, max_steps: i64, max_memory: i64, verbose: bool) -> i64 {
     var result: ResultIrModule = lower_to_ir_module(source);
+    match result {
+        ResultIrModule::Err(errs) => {
+            var msg: str = "Compilation error:\n";
+            var i: i64 = 0;
+            while i < errs.len() {
+                msg = msg + errs.get(i) + "\n";
+                i = i + 1;
+            }
+            p_eprint_str(msg);
+            return 1;
+        }
+        ResultIrModule::Ok(ir_mod2) => {
+            return interpret_ir_module_with_options(ir_mod2, max_recursion, max_steps, max_memory, verbose);
+        }
+    }
+    return 1;
+}
+
+/// G8.3: Interpret a source file with source path (for import resolution).
+pub fn interpret_source_with_path(source: str, source_path: str, max_recursion: i64, max_steps: i64, max_memory: i64, verbose: bool) -> i64 {
+    var result: ResultIrModule = lower_to_ir_module_with_path(source, source_path);
     match result {
         ResultIrModule::Err(errs) => {
             var msg: str = "Compilation error:\n";

@@ -2626,16 +2626,16 @@ library can't. These should be prioritized.
 |------|--------|--------------------------|----------|
 | **@differentiable (F14)** | roadmap.md Phase 7 | Compiler traces IR for autograd. ✅ Done — tape-based reverse-mode AD in interpreter. | **DONE** |
 | **@realtime (F27)** | features-roadmap.md | Compiler analyzes WCET, rejects malloc/blocking IO. **JUST IMPLEMENTED** (typechecker.rs diff visible). | **DONE** |
-| **@interrupt (F29)** | features-roadmap.md | Compiler generates ISR code + vector table. Needs codegen support. Critical for bare-metal/IoT. | **HIGH** |
-| **@firmware (F30)** | features-roadmap.md | Strips OS deps, bare metal startup. Needs linker/codegen support. | **HIGH** |
+| **@interrupt (F29)** | features-roadmap.md | Compiler generates ISR code + vector table. ✅ Done — `@interrupt(N)` annotation with automatic IDT setup in PE boot codegen. | **DONE** |
+| **@firmware (F30)** | features-roadmap.md | Strips OS deps, bare metal startup. ✅ Done — `@firmware` annotation rejects OS-dependent calls (file I/O, sockets, threads, env vars) at compile time. | **DONE** |
 | **@shader (F21)** | features-roadmap.md | Compiler emits SPIR-V for GPU. Fides already has SPIR-V codegen — just needs the annotation to trigger it. | **MEDIUM** |
-| **@simd (F23)** | features-roadmap.md | Compiler vectorizes loops to SSE/AVX/NEON. Needs IR transformation. | **MEDIUM** |
+| **@simd (F23)** | features-roadmap.md | Compiler vectorizes loops to SSE/AVX/NEON. ✅ Done — `@simd` annotation enables aggressive loop vectorization (wider vectors for AVX/AVX2, relaxed cost model, lower trip count threshold). | **DONE** |
 | **@pool (F25)** | features-roadmap.md | Compiler manages pool memory layout, zero alloc. Needs IR/layout support. | **MEDIUM** |
-| **@secret (F74)** | features-roadmap.md | Information flow control — secrets can't be printed/logged/sent. Extends @tainted. Needs typechecker data-flow tracking. | **HIGH** |
+| **@secret (F74)** | features-roadmap.md | Information flow control — secrets can't be printed/logged/sent. Extends @tainted. ✅ Done — secret lattice in typechecker, output sink rejection, return flow checks. | **DONE** |
 | **@cfi (F75)** | features-roadmap.md | Control flow integrity: shadow stack, CFI checks. Needs codegen support. | **MEDIUM** |
-| **@zeroize (F88)** | features-roadmap.md | Secrets wiped from memory on scope exit. Needs compiler to insert memset after last use (like defer but automatic). | **MEDIUM** |
+| **@zeroize (F88)** | features-roadmap.md | Secrets wiped from memory on scope exit. ✅ Done — compiler-inserted `p_memset(0)` at all exit points (before drops and returns) across interpreter, C codegen, and PE emitter. | **DONE** |
 | **@bit-exact (F58)** | features-roadmap.md | Bit-identical FP results across hardware. Needs compiler to disable FMA, enforce strict FP operation order. | **MEDIUM** |
-| **parallel { \| } (F13)** | features-roadmap.md | Fork-join parallelism. Compiler emits thread spawn/join. Can't be done in stdlib without spawning primitives. | **HIGH** |
+| **parallel { \| } (F13)** | features-roadmap.md | Fork-join parallelism. ✅ Done (partial) — `parallel { | branch1 | branch2 | ... }` syntax parsed, typechecked, lowered sequentially (true parallelism requires closure support). Contextual keyword preserves `use parallel;` compatibility. | **DONE** |
 | **@atomic-check (F70)** | features-roadmap.md | TOCTOU prevention — check and act are one atomic operation. Needs compiler to fuse check + act into atomic sequence. | **MEDIUM** |
 | **@no-branch-on-secret (F73)** | features-roadmap.md | Reject branches based on secret-typed data. Side-channel defense. Needs typechecker + @secret. | **MEDIUM** |
 | **@signed (F50)** | features-roadmap.md | Cryptographic signatures on state transitions. Needs compiler + runtime support for state transition tracking. | **LOW** |
@@ -2648,11 +2648,11 @@ library can't. These should be prioritized.
 **Verdict: ~20 items are genuinely valuable.** Of these, the highest
 priority for "most powerful language" are:
 
-1. **@differentiable** — without it, the AI/ML claim is hollow
-2. **@interrupt + @firmware** — without these, the bare-metal claim is incomplete
-3. **@secret + @no-branch-on-secret** — without these, the security claim has a gap
-4. **parallel { | }** — without it, no easy parallelism for researchers
-5. **@shader + @simd** — without these, the GPU/SIMD claim is incomplete
+1. **@differentiable** — without it, the AI/ML claim is hollow ✅
+2. **@interrupt + @firmware** — without these, the bare-metal claim is incomplete ✅
+3. **@secret + @no-branch-on-secret** — without these, the security claim has a gap (@secret ✅, @no-branch-on-secret pending)
+4. **parallel { | }** — without it, no easy parallelism for researchers ✅ (sequential lowering)
+5. **@shader + @simd** — without these, the GPU/SIMD claim is incomplete (@simd ✅, @shader pending)
 
 ---
 

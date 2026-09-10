@@ -6497,12 +6497,27 @@ pub fn TypeChecker_lint_unused_functions(self: &mut TypeChecker, program: Progra
         }
         impi = impi + 1;
     }
-    // Report unused functions (skip main, pub, __ prefixed)
+    var timpi: i64 = 0;
+    while timpi < program.trait_impls.len() {
+        var timp: TraitImpl = program.trait_impls.get(timpi);
+        var tmi: i64 = 0;
+        while tmi < timp.methods.len() {
+            TypeChecker_collect_called_funcs(self, timp.methods.get(tmi).body, &mut called);
+            tmi = tmi + 1;
+        }
+        timpi = timpi + 1;
+    }
+    p_eprint_str("[lint] funcs=");
+    p_eprint_str(int_to_str(program.funcs.len()));
+    p_eprint_str(" called=");
+    p_eprint_str(int_to_str(called.len()));
+    p_eprint_str("\n");
+    // Report unused functions (skip main, pub, __ prefixed, comptime)
     var fi2: i64 = 0;
     while fi2 < program.funcs.len() {
         var func: Func = program.funcs.get(fi2);
-        if !str_vec_contains(called, func.name) && !func.is_pub && !str_starts_with(func.name, "__") && func.name != "main" {
-            self.warnings.push("Warning: function '" + func.name + "' is defined but never called");
+        if !str_vec_contains(called, func.name) && !func.is_pub && !func.is_comptime && !str_starts_with(func.name, "__") && func.name != "main" {
+            self.warnings.push("unused function '" + func.name + "' — defined but never called");
         }
         fi2 = fi2 + 1;
     }
@@ -6737,13 +6752,53 @@ pub fn TypeChecker_collect_called_funcs_expr(self: &TypeChecker, expr: Expr, cal
 }
 
 pub fn TypeChecker_lint_unused_imports(self: &mut TypeChecker, program: Program) {
-    // Simplified: just check for imports with no items used
-    // Full implementation would track which imported names are referenced
+    if program.imports.len() == 0 { return; }
+
+    // Collect all function names called in the program
+    var called: Vec<str> = Vec::new();
+    var fi: i64 = 0;
+    while fi < program.funcs.len() {
+        TypeChecker_collect_called_funcs(self, program.funcs.get(fi).body, &mut called);
+        fi = fi + 1;
+    }
+    var impi: i64 = 0;
+    while impi < program.impls.len() {
+        var imp: ImplDef = program.impls.get(impi);
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            TypeChecker_collect_called_funcs(self, imp.methods.get(mi).body, &mut called);
+            mi = mi + 1;
+        }
+        impi = impi + 1;
+    }
+    var timpi: i64 = 0;
+    while timpi < program.trait_impls.len() {
+        var timp: TraitImpl = program.trait_impls.get(timpi);
+        var tmi: i64 = 0;
+        while tmi < timp.methods.len() {
+            TypeChecker_collect_called_funcs(self, timp.methods.get(tmi).body, &mut called);
+            tmi = tmi + 1;
+        }
+        timpi = timpi + 1;
+    }
+
+    // For each import, check if any called function starts with the module name
     var i: i64 = 0;
     while i < program.imports.len() {
         var imp: ImportDef = program.imports.get(i);
-        if !imp.is_glob && imp.items.len() == 0 {
-            self.warnings.push("Warning: empty import from '" + imp.path + "'");
+        if imp.path == "core" { i = i + 1; continue; }
+        var module_prefix: str = str_replace(imp.path, "::", "_") + "_";
+        var any_used: bool = false;
+        var ci: i64 = 0;
+        while ci < called.len() {
+            if str_starts_with(called.get(ci), module_prefix) {
+                any_used = true;
+                ci = called.len();
+            }
+            ci = ci + 1;
+        }
+        if !any_used {
+            self.warnings.push("unused import: '" + imp.path + "' — module is imported but none of its functions are called");
         }
         i = i + 1;
     }

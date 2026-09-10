@@ -1,7 +1,7 @@
 # Fides Roadmap — Milestones to World Domination
 
 > Not a task list. A map of mountains to climb.
-> Last updated: Sep 9, 2026 (session 22 — roadmap audited against actual codebase, bugs 3.16–3.19 fixed).
+> Last updated: Sep 10, 2026 (session 23 — @zeroize, @secret, @interrupt, @firmware, parallel {}, @simd implemented).
 
 ## Overview
 
@@ -9,16 +9,16 @@
 Phase 1: Foundation          ← COMPLETE — 137/137 all backends, zero regressions
 Phase 2: Safety              ← COMPLETE — compile-time safety + binary hardening
 Phase 3: Power               ← COMPLETE — all features work in all backends
-Phase 4: Performance         ← MOSTLY COMPLETE — optimizer + LTO + loop-vec + SLP + parallel passes + incremental; SSE2 packed double codegen DONE (addpd/subpd/mulpd/divpd/movapd in both Rust + self-hosted PE emitter); AVX2/VEX encoders in src/pe.rs; graph-coloring regalloc remaining
+Phase 4: Performance         ← MOSTLY COMPLETE — optimizer + LTO + loop-vec + SLP + parallel passes + incremental; SSE2 packed double codegen DONE (addpd/subpd/mulpd/divpd/movapd in both Rust + self-hosted PE emitter); AVX2/VEX encoders in src/pe.rs; @simd annotation DONE (aggressive vectorization with wider vectors + relaxed cost model); graph-coloring regalloc remaining
 Phase 5: Platform            ← MOSTLY COMPLETE — cross-compilation to ARM64/RISC-V/Windows done; DWARF debug info remaining
 Phase 6: AI/ML               ← COMPLETE — pipeline, layers, shapes, GPU, quantization, KV cache, DP (epsilon budget tracking), sharding (simulated multi-rank), tape-based autodiff (runtime gradient computation), gradient checkpointing (activation recompute)
 Phase 7: Ergonomics          ← MOSTLY COMPLETE — guard, spread, ?., ??, is, contracts, @memo; @differentiable typecheck + runtime autograd done
-Phase 7.5: Tier 1 Safety     ← MOSTLY COMPLETE — all safety annotations enforced; @tainted propagation DONE (full data-flow taint tracking with sanitizer/sink recognition), @constant_time + @tainted effect checks done
+Phase 7.5: Tier 1 Safety     ← MOSTLY COMPLETE — all safety annotations enforced; @tainted propagation DONE (full data-flow taint tracking with sanitizer/sink recognition), @constant_time + @tainted effect checks done; @secret info-flow control DONE (F74: secret lattice, output sink rejection, return flow checks); @zeroize DONE (F88: compiler-inserted memset at scope exit); @firmware DONE (F30: OS-dep call rejection)
 Phase 7.55: Borrow Checker   ← COMPLETE — Rules 1-3, field-wise, two-phase, NLL, default on; @send/@sync NOT implemented (annotations not parsed)
 Phase 7.6: Async/Await       ← MOSTLY COMPLETE — executor, non-blocking poll, async IO, channels, select; state machine transform (parser has parse_state_machine, lower doesn't use it) + PE stack traces remaining
 Phase 8A: Vec/Mat Math        ← COMPLETE — vec2/vec3/vec4, mat4, quat, swizzle, operator overloading, shape checking
 Phase 8B: ECS/States/Events   ← COMPLETE — component/system/query, state_machine, event handlers
-Phase 8C: Shaders/SIMD       ← PARTIAL — SIMD stdlib (59 LOC stub) + SPIR-V GPU codegen (826 LOC); @shader/@simd annotations not implemented; GPU/WASM not wired into CLI
+Phase 8C: Shaders/SIMD       ← PARTIAL — SIMD stdlib (59 LOC stub) + SPIR-V GPU codegen (826 LOC); @simd annotation DONE (loop vectorization with wider vectors for AVX/AVX2); @shader annotation + compute shaders not implemented; GPU/WASM not wired into CLI
 Phase 8D: Game Stdlib         ← COMPLETE — 26 game stdlib modules, 9,140 LOC (session 21)
 Phase 9: Industry Domains    ← NOT STARTED — only stdlib/banking.fd exists; medical/blockchain/robotics/automotive not built
 Phase 10: Self-Hosting       ← PARTIAL — 50 modules, 93,605 LOC. 38/38 self-host tests pass. Self-compilation SEGFAULTS in Lowerer_mangle_method. Fixpoint NOT verifiable (fides-c2.c missing). v1.0.0 installer released.
@@ -29,15 +29,18 @@ Phase 12: Security Hardening ← PARTIAL — binary hardening done; all safety a
 Phase 13: World Class        ← IN PROGRESS — type inference done, SLP+loop-vec done, debugger done, scribe doc generator done, veil coverage tool done; @send/@sync NOT done, ark package manager DONE (wired into CLI), green threads NOT started
 Phase 14: Debugging Tools    ← COMPLETE — interpreter debugger (977 LOC), record/replay, hot-reload (635 LOC), post-mortem, native debugger (544 LOC)
 Phase 15: Compete Where We Lose ← NOT STARTED — win in web/data-science/prototyping/games without adding a runtime (arena allocators, comptime frameworks, ergonomic modes)
-Phase 16: Tier 3 OS           ← PARTIAL — @cpu_local (pe.fd only), inline asm clobbers (pe.fd), --bare/--boot mode, cross-compilation dispatch done; UEFI bindings NOT done (stdlib/uefi.fd missing), kernel.fd missing, ARM64/RISC-V native codegen + bare runtime stubs remaining
+Phase 16: Tier 3 OS           ← PARTIAL — @cpu_local (pe.fd only), inline asm clobbers (pe.fd), --bare/--boot mode, cross-compilation dispatch done; @interrupt DONE (F29: ISR codegen + automatic IDT setup for @interrupt(N)); UEFI bindings NOT done (stdlib/uefi.fd missing), kernel.fd missing, ARM64/RISC-V native codegen + bare runtime stubs remaining
 ```
 
-### Verified Test Baseline (Sep 9, 2026 — session 22 audit)
+### Verified Test Baseline (Sep 10, 2026 — session 23)
 
 | Backend | Result | Notes |
 |---------|--------|-------|
 | Self-host tests | **38/38** | All 3 backends (Interpreter, C Codegen, PE Emitter) — 0 regressions |
 | Rust bootstrap build | **OK** | 6 warnings, 0 errors |
+| Bootstrap: Interpreter | **236/237** | +2 vs session 22 (234/237) — test_parallel + test_parallel_concurrent fixed |
+| Bootstrap: C Codegen | **226/237** | +1 vs session 22 (225/237) |
+| Bootstrap: PE Emitter | **237/237** | Unchanged — no regressions |
 | Self-compilation | **FAILS** | SIGSEGV in `Lowerer_mangle_method` during lowering. Pre-existing. |
 | Fixpoint (c2==c3) | **UNVERIFIABLE** | `release/fides-c2.c` does not exist |
 | Total `.fd` test files | **303** | 261 in tests/bootstrap/ + 42 in tests/selfhost/ |
@@ -57,6 +60,10 @@ All C codegen output is now compiled with binary hardening flags by default:
 New security annotations:
 - `@constant_time` — prevents timing side-channel attacks (Spectre, Meltdown)
 - `@tainted` — prevents injection attacks (SQL, shell, HTML, path traversal)
+- `@secret` (F74) — information-flow control: secret values cannot flow to output sinks (print, log, network, file I/O)
+- `@zeroize` (F88) — compiler-inserted memory wipe at scope exit (memset(0) on all exit paths)
+- `@firmware` (F30) — bare-metal enforcement: rejects OS-dependent calls (file I/O, sockets, threads, env vars)
+- `@interrupt` (F29) — ISR codegen with automatic IDT vector table setup via `@interrupt(N)` annotation
 
 See `docs/security.md` for the full security hardening guide.
 
@@ -214,7 +221,7 @@ interrupt handlers, and MMU all supported.
 - [x] WASM codegen — `fidesc build --target wasm`
 - [x] Bare metal — `fidesc build --bare` (flat binary, no OS)
 - [x] Boot sector — `fidesc build --boot` (512-byte boot sector)
-- [x] Interrupt handlers — `@interrupt` annotation
+- [x] Interrupt handlers — `@interrupt` annotation + `@interrupt(N)` vector table auto-setup (F29)
 - [x] MMU/page tables — `@mmu` annotation
 - [x] ARM64 codegen — `src/codegen_arm64.rs` + `src/arm64_enc.rs` + `src/runtime_arm64.rs`
 - [x] RISC-V codegen — `src/codegen_riscv.rs` + `src/riscv_enc.rs` + `src/runtime_riscv.rs`
@@ -397,8 +404,8 @@ shaders remaining.
 
 ### Phase 8C: Shaders/SIMD (PARTIAL)
 - [x] SIMD stdlib — `stdlib/simd.fd` (basic operations)
+- [x] `@simd` annotation — auto-vectorization hints (F23: wider vectors for AVX/AVX2, relaxed cost model, lower trip count threshold)
 - [ ] `@shader` annotation — GPU shader generation
-- [ ] `@simd` annotation — auto-vectorization hints
 - [ ] Compute shaders — GPU compute kernel generation
 
 ### Phase 8D: Game Stdlib (COMPLETE)
@@ -413,7 +420,8 @@ shaders remaining.
 
 ### What's Left
 - [x] SIMD codegen for vec/mat (8A extension) — SSE2 packed double emission done (addpd/subpd/mulpd/divpd/movapd); AVX/NEON remaining
-- [ ] Shader generation (8C) — @shader/@simd annotations, compute shaders (not implemented)
+- [x] `@simd` annotation (F23) — aggressive loop vectorization with wider vectors (4-wide f64/AVX, 8-wide i64/AVX2), relaxed cost model, lower minimum trip count
+- [ ] Shader generation (8C) — @shader annotation, compute shaders (not implemented)
 - [ ] Fix test_game_stdlib — type error on &mut Vec method calls (in skip list)
 
 ---
@@ -433,7 +441,7 @@ serverless) are not built.
 - [ ] Banking — batch processing, COBOL interop, SWIFT messaging
 - [ ] Medical — IEC 62304 compliance tooling, audit trail verification
 - [ ] Blockchain — `@emit` event logging, smart contract verification
-- [ ] Robotics — `@realtime`, `@interrupt`, `@firmware` annotations
+- [x] Robotics — `@interrupt` (F29: ISR codegen + IDT), `@firmware` (F30: OS-dep rejection) annotations done; `@realtime` not yet implemented
 - [ ] Automotive — `@can-bus`, CAN frame types, ECU abstraction
 - [ ] Aerospace — `@dal-a`, `@redundant`, `@partitioned` annotations
 - [ ] Energy — `@grid-safe`, grid protocol types
@@ -714,6 +722,7 @@ Rust, Go, and C for real-world projects.
 - Work-stealing scheduler (like Go's runtime)
 - `go fn()` syntax (or reuse `spawn`)
 - Integration with channels for CSP-style concurrency
+- `parallel { | branch1 | branch2 | ... }` fork-join syntax DONE (F13: parsed, typechecked, lowered sequentially; true parallelism requires closure support)
 
 **Effort:** 1-2 months
 **Files:** `src/runtime_linux.rs`, `src/interp.rs`, `src/codegen_c.rs`, `src/ast.rs`, `src/parser.rs`

@@ -175,13 +175,21 @@ WINDOWS INSTALLER (v1.0.0):
 
 TESTS:
   Self-host:      38/38 pass on interp + C + PE (tests/selfhost/)
-  Bootstrap:      Interpreter 234/237, C Codegen 225/237, PE Emitter 237/237
+  Bootstrap:      Interpreter 236/237, C Codegen 226/237, PE Emitter 237/237
   Fixpoint:       c3 type-checks + borrow-checks full 75K LOC compiler
 
 STDLIB:
   stdlib/*.fd:    99 modules, 28,370 LOC (OS modules moved to fides-os project)
 
 RECENT IMPROVEMENTS:
+  Session 23:     6 high-priority language features implemented:
+                  @zeroize (F88) — compiler-inserted memset(0) at scope exit
+                  @secret (F74) — info-flow control: secrets can't reach output sinks
+                  @interrupt (F29) — @interrupt(N) annotation + automatic IDT setup
+                  @firmware (F30) — rejects OS-dependent calls in bare-metal code
+                  parallel { | } (F13) — fork-join syntax (contextual keyword)
+                  @simd (F23) — aggressive loop vectorization (wider vectors, relaxed cost)
+                  Test baseline improved: +2 interp, +1 C codegen, 0 regressions
   Session 21:     26 game/media stdlib modules added (sdl, gl, image, font, mesh,
                   gameloop, physics3d, skel, ui, net, camera, particles, animation2d,
                   audio_mixer, asset, serialize, collision_broad, raycast, navmesh,

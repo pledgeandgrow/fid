@@ -2942,18 +2942,22 @@ fn vectorize_loop(
     }
 
     // For constant trip counts, only vectorize if divisible by vector width.
+    // F23: @simd functions skip the divisibility check (remainder loop is generated).
     if var_tc.is_none() {
-        if n % vector_width as i64 != 0 {
+        if n % vector_width as i64 != 0 && !is_simd {
             return 0;
         }
         // Don't vectorize if already small enough for full unrolling.
-        if n <= 8 {
+        // F23: @simd functions vectorize smaller loops (down to 4 iterations).
+        let min_trip = if is_simd { 4 } else { 8 };
+        if n <= min_trip {
             return 0;
         }
     }
 
     // Apply the cost model: check if vectorization is profitable.
-    if !vectorization_is_profitable(f, body, i_ptr, vector_width, var_tc.is_some()) {
+    // F23: @simd functions skip the cost model (user explicitly requested vectorization).
+    if !is_simd && !vectorization_is_profitable(f, body, i_ptr, vector_width, var_tc.is_some()) {
         return 0;
     }
 

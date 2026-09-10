@@ -1942,7 +1942,7 @@ impl PeCodeGen {
                        "p_hlt", "p_inb", "p_outb", "p_outw", "p_inw",
                        // Phase 5A.4: MMU/page table stubs
                        "p_cr3_read", "p_cr3_write", "p_cr0_read", "p_cr0_write",
-                       "p_cr4_read", "p_cr4_write", "p_invlpg",
+                       "p_cr2_read", "p_cr4_read", "p_cr4_write", "p_invlpg",
                        "p_page_map", "p_page_unmap",
                        "p_phys_read64", "p_phys_write64",
                        "p_mem_read8", "p_mem_write8",
@@ -2082,7 +2082,7 @@ impl PeCodeGen {
                        "p_hlt", "p_inb", "p_outb", "p_outw", "p_inw",
                        // Phase 5A.4: MMU/page table stubs
                        "p_cr3_read", "p_cr3_write", "p_cr0_read", "p_cr0_write",
-                       "p_cr4_read", "p_cr4_write", "p_invlpg",
+                       "p_cr2_read", "p_cr4_read", "p_cr4_write", "p_invlpg",
                        "p_page_map", "p_page_unmap",
                        "p_phys_read64", "p_phys_write64",
                        "p_mem_read8", "p_mem_write8",
@@ -2214,7 +2214,7 @@ impl PeCodeGen {
                        "p_cli", "p_sti", "p_lidt", "p_idt_set_entry",
                        "p_hlt", "p_inb", "p_outb", "p_outw", "p_inw",
                        "p_cr3_read", "p_cr3_write", "p_cr0_read", "p_cr0_write",
-                       "p_cr4_read", "p_cr4_write", "p_invlpg",
+                       "p_cr2_read", "p_cr4_read", "p_cr4_write", "p_invlpg",
                        "p_page_map", "p_page_unmap",
                        "p_phys_read64", "p_phys_write64",
                        "p_mem_read8", "p_mem_write8",
@@ -2316,19 +2316,69 @@ impl PeCodeGen {
         // rep stosd
         self.enc.emit(&[0xF3, 0xAB]); // rep stosd
 
-        // PML4[0] = 0x71000 | 7 (present + writable + user)
-        // User bit set so ring 3 can access this memory
-        // mov dword [0x70000], 0x71007
+        // PML4[0] = 0x71000 | 3 (present + writable, NO user bit — kernel only)
+        // User bit removed for page table isolation. User code uses a separate
+        // PML4 at 0x72000 that maps only user-accessible regions.
+        // mov dword [0x70000], 0x71003
         self.enc.emit(&[0xC7, 0x05]); // mov dword [addr], imm32
         self.enc.emit(&[0x00, 0x00, 0x07, 0x00]); // addr = 0x70000 (LE)
-        self.enc.emit(&[0x07, 0x10, 0x07, 0x00]); // value = 0x00071007 (LE)
+        self.enc.emit(&[0x03, 0x10, 0x07, 0x00]); // value = 0x00071003 (LE)
 
-        // PDPT[0] = 0x87 (present + writable + huge page + user, maps first 1GB)
-        // User bit set so ring 3 can access the first 1GB
-        // mov dword [0x71000], 0x87
+        // PDPT[0] = 0x83 (present + writable + huge page, NO user bit)
+        // Maps first 1GB for kernel only.
+        // mov dword [0x71000], 0x83
         self.enc.emit(&[0xC7, 0x05]); // mov dword [addr], imm32
         self.enc.emit(&[0x00, 0x10, 0x07, 0x00]); // addr = 0x71000 (LE)
-        self.enc.emit(&[0x87, 0x00, 0x00, 0x00]); // value = 0x87 (LE)
+        self.enc.emit(&[0x83, 0x00, 0x00, 0x00]); // value = 0x83 (LE)
+
+        // ─── User page tables (for ring 3 isolation) ───────────────────
+        // User PML4 at 0x72000, PDPT at 0x73000, PD at 0x74000, PT at 0x75000
+        // Maps ONLY: 0x10000 (user program, 4KB) and 0xB8000 (VGA, 4KB)
+        // All other memory is inaccessible from ring 3.
+
+        // Zero user page table memory (4 pages at 0x72000 = 16384 bytes)
+        // mov edi, 0x72000
+        self.enc.emit(&[0xBF, 0x00, 0x20, 0x07, 0x00]); // mov edi, 0x72000
+        // mov ecx, 4096 (4 pages × 512 entries × 8 bytes / 4 = 4096 dwords)
+        self.enc.emit(&[0xB9, 0x00, 0x10, 0x00, 0x00]); // mov ecx, 0x1000
+        // xor eax, eax
+        self.enc.emit(&[0x31, 0xC0]); // xor eax, eax
+        // rep stosd
+        self.enc.emit(&[0xF3, 0xAB]); // rep stosd
+
+        // User PML4[0] = 0x73000 | 7 (present + writable + user)
+        // mov dword [0x72000], 0x73007
+        self.enc.emit(&[0xC7, 0x05]);
+        self.enc.emit(&[0x00, 0x20, 0x07, 0x00]); // addr = 0x72000
+        self.enc.emit(&[0x07, 0x30, 0x07, 0x00]); // value = 0x00073007
+
+        // User PDPT[0] = 0x74000 | 7 (present + writable + user)
+        // mov dword [0x73000], 0x74007
+        self.enc.emit(&[0xC7, 0x05]);
+        self.enc.emit(&[0x00, 0x30, 0x07, 0x00]); // addr = 0x73000
+        self.enc.emit(&[0x07, 0x40, 0x07, 0x00]); // value = 0x00074007
+
+        // User PD[0] = 0x75000 | 7 (present + writable + user, points to PT)
+        // PD[0] covers first 2MB with 4KB pages.
+        // mov dword [0x74000], 0x75007
+        self.enc.emit(&[0xC7, 0x05]);
+        self.enc.emit(&[0x00, 0x40, 0x07, 0x00]); // addr = 0x74000
+        self.enc.emit(&[0x07, 0x50, 0x07, 0x00]); // value = 0x00075007
+
+        // User PT[0x10] = 0x10000 | 7 (user program at 0x10000, 4KB, present+writable+user)
+        // PT entry index 0x10 = address 0x10000 (0x10 × 4KB = 0x10000)
+        // mov dword [0x75000 + 0x10*8], 0x10007
+        self.enc.emit(&[0xC7, 0x05]);
+        self.enc.emit(&[0x80, 0x50, 0x07, 0x00]); // addr = 0x75080 (0x75000 + 0x80)
+        self.enc.emit(&[0x07, 0x00, 0x01, 0x00]); // value = 0x00010007
+
+        // User PT[0xB8] = 0xB8000 | 7 (VGA at 0xB8000, 4KB, present+writable+user)
+        // PT entry index 0xB8 = address 0xB8000 (0xB8 × 4KB = 0xB8000)
+        // mov dword [0x75000 + 0xB8*8], 0xB8007
+        // 0xB8 * 8 = 0x5C0, so addr = 0x75000 + 0x5C0 = 0x755C0
+        self.enc.emit(&[0xC7, 0x05]);
+        self.enc.emit(&[0xC0, 0x55, 0x07, 0x00]); // addr = 0x755C0
+        self.enc.emit(&[0x07, 0x00, 0xB8, 0x00]); // value = 0x00B80007
 
         // Load CR3: mov eax, 0x70000; mov cr3, eax
         self.enc.emit(&[0xB8, 0x00, 0x00, 0x07, 0x00]); // mov eax, 0x70000
@@ -2504,7 +2554,8 @@ impl PeCodeGen {
             self.enc.emit(&[0x66, 0xBA, 0xA1, 0x00]);
             self.enc.emit(&[0xEE]);
 
-            // Mask: unmask IRQ1 only (0xFD master, 0xFF slave)
+            // Mask: unmask IRQ1 (keyboard) only — 0xFD master, 0xFF slave
+            // (timer IRQ0 masked temporarily for debugging)
             self.enc.emit(&[0xB0, 0xFD]);
             self.enc.emit(&[0x66, 0xBA, 0x21, 0x00]);
             self.enc.emit(&[0xEE]);
@@ -2527,8 +2578,7 @@ impl PeCodeGen {
             // lidt qword [0x500]  → 0F 01 1C 25 00 05 00 00
             self.enc.emit(&[0x0F, 0x01, 0x1C, 0x25, 0x00, 0x05, 0x00, 0x00]);
 
-            // 6. Enable interrupts
-            self.enc.emit(&[0xFB]); // sti
+            // NOTE: sti is deferred until after @interrupt(N) handlers are wired
         }
 
         // ─── F29: @interrupt(N) — automatic IDT setup for all annotated ISRs ───
@@ -2536,6 +2586,12 @@ impl PeCodeGen {
         // The IDT is at 0x1000 (same as irq1_handler above).
         // Each IDT entry is 16 bytes at 0x1000 + vector * 16.
         self.gen_idt_setup_for_interrupts(module);
+
+        // Enable interrupts AFTER all IDT entries are wired (prevents GPF from
+        // unhandled timer/exception vectors firing before handlers are ready)
+        if self.func_labels.contains_key("irq1_handler") {
+            self.enc.emit(&[0xFB]); // sti
+        }
 
         // ─── TSS + syscall setup (always, for user-mode support) ───────
         // Zero out TSS at 0x4000 (104 bytes = 13 qwords)
@@ -2615,28 +2671,33 @@ impl PeCodeGen {
         // ─── syscall_handler stub ─────────────────────────────────────
         // Hardcoded assembly stub for int 0x80 (syscall from user mode).
         // Modifies the iret frame to return to user_return at ring 0.
-        // Stack layout after CPU pushes iret frame:
-        //   [RSP + 0]:  SS (user = 0x20)
-        //   [RSP + 8]:  RSP (user stack)
+        // Stack layout after CPU pushes iret frame (ring 3 → ring 0):
+        //   [RSP + 0]:  RIP (user return address)
+        //   [RSP + 8]:  CS (user = 0x1B)
         //   [RSP + 16]: RFLAGS
-        //   [RSP + 24]: CS (user = 0x18)
-        //   [RSP + 32]: RIP (user return address)
+        //   [RSP + 24]: RSP (user stack)
+        //   [RSP + 32]: SS (user = 0x23)
         let _syscall_handler_offset = self.enc.offset();
         let syscall_label = *self.func_labels.get("syscall_handler").unwrap();
         self.enc.place_label(syscall_label);
-        // Modify SS → 0x10 (kernel data)
-        // mov word [rsp + 0], 0x10
-        self.enc.emit(&[0x66, 0xC7, 0x04, 0x24, 0x10, 0x00]); // mov word [rsp], 0x10
-        // Modify RSP → 0x90000 (kernel stack)
-        // mov qword [rsp + 8], 0x90000
-        self.enc.emit(&[0x48, 0xC7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x09, 0x00]);
-        // Modify CS → 0x08 (kernel code)
-        // mov word [rsp + 24], 0x08
-        self.enc.emit(&[0x66, 0xC7, 0x44, 0x24, 0x18, 0x08, 0x00]);
+        // Switch CR3 back to kernel page tables (0x70000) for kernel isolation
+        // mov eax, 0x70000
+        self.enc.emit(&[0xB8, 0x00, 0x00, 0x07, 0x00]); // mov eax, 0x70000
+        // mov cr3, rax
+        self.enc.emit(&[0x0F, 0x22, 0xD8]); // mov cr3, rax
         // Modify RIP → user_return offset (will be patched)
-        // mov qword [rsp + 32], <user_return_addr>
-        self.enc.emit(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]);
+        // mov qword [rsp + 0], <user_return_addr>
+        self.enc.emit(&[0x48, 0xC7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x00]);
         let syscall_rip_patch = self.enc.offset() - 4; // patch this 4-byte immediate
+        // Modify CS → 0x08 (kernel code)
+        // mov word [rsp + 8], 0x08
+        self.enc.emit(&[0x66, 0xC7, 0x44, 0x24, 0x08, 0x08, 0x00]);
+        // Modify RSP → 0x90000 (kernel stack)
+        // mov qword [rsp + 24], 0x90000
+        self.enc.emit(&[0x48, 0xC7, 0x44, 0x24, 0x18, 0x00, 0x00, 0x09, 0x00]);
+        // Modify SS → 0x10 (kernel data)
+        // mov word [rsp + 32], 0x10
+        self.enc.emit(&[0x66, 0xC7, 0x44, 0x24, 0x20, 0x10, 0x00]);
         // iretq — return to ring 0 at user_return
         self.enc.emit(&[0x48, 0xCF]); // iretq
 
@@ -3116,8 +3177,8 @@ impl PeCodeGen {
                     self.enc.pop(Reg::Rcx);
                     self.enc.pop(Reg::Rbx);
                     self.enc.pop(Reg::Rax);
-                    // iret restores SS:RSP, RFLAGS, CS:RIP
-                    self.enc.emit(&[0xCF]); // iret
+                    // iretq restores SS:RSP, RFLAGS, CS:RIP (64-bit)
+                    self.enc.emit(&[0x48, 0xCF]); // iretq
                 } else {
                     self.enc.ret();
                 }
@@ -3899,6 +3960,17 @@ impl PeCodeGen {
         }
         self.enc.ret();
 
+        // p_cr2_read() -> rax — read CR2 (page fault address)
+        let label = *self.func_labels.get("p_cr2_read").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // mov rax, cr2
+            self.enc.emit(&[0x48, 0x0F, 0x20, 0xD0]); // mov rax, cr2
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
         // p_cr4_read() -> rax — read CR4
         let label = *self.func_labels.get("p_cr4_read").unwrap();
         self.enc.place_label(label);
@@ -4280,22 +4352,35 @@ impl PeCodeGen {
     /// p_enter_user_mode(rcx = entry_addr, rdx = stack_addr) -> void
     /// Transitions from ring 0 (kernel) to ring 3 (user) via iretq.
     /// Sets up the iret frame: SS=0x20, RSP=stack_addr, RFLAGS=0x202, CS=0x18, RIP=entry_addr
+    /// Switches CR3 to user page tables (0x72000) for isolation before iretq.
     fn gen_enter_user_mode(&mut self) {
         let label = *self.func_labels.get("p_enter_user_mode").unwrap();
         self.enc.place_label(label);
         if self.bare_mode {
             // rcx = entry_addr (RIP), rdx = stack_addr (RSP)
+            // Save entry/stack in callee-saved regs (r11, r12) before CR3 switch
+            // mov r11, rcx (entry addr)
+            self.enc.emit(&[0x49, 0x89, 0xCB]); // mov r11, rcx
+            // mov r12, rdx (stack addr)
+            self.enc.emit(&[0x49, 0x89, 0xD4]); // mov r12, rdx
+
+            // Switch CR3 to user page tables (0x72000)
+            // mov eax, 0x72000
+            self.enc.emit(&[0xB8, 0x00, 0x20, 0x07, 0x00]); // mov eax, 0x72000
+            // mov cr3, rax
+            self.enc.emit(&[0x0F, 0x22, 0xD8]); // mov cr3, rax
+
             // Build iret frame on kernel stack, then iretq
             // Push SS (user data segment = 0x23, index 4 | RPL=3)
             self.enc.emit(&[0x6A, 0x23]); // push 0x23
-            // Push RSP (user stack = rdx)
-            self.enc.push(Reg::Rdx);
+            // Push RSP (user stack = r12)
+            self.enc.push(Reg::R12);
             // Push RFLAGS = 0x202 (IF=1, bit1=1) as a constant
             self.enc.emit(&[0x68, 0x02, 0x02, 0x00, 0x00]); // push 0x202
             // Push CS (user code segment = 0x1B, index 3 | RPL=3)
             self.enc.emit(&[0x6A, 0x1B]); // push 0x1B
-            // Push RIP (entry address = rcx)
-            self.enc.push(Reg::Rcx);
+            // Push RIP (entry address = r11)
+            self.enc.push(Reg::R11);
             // iretq — pops RIP, CS, RFLAGS, RSP, SS and jumps to ring 3
             self.enc.emit(&[0x48, 0xCF]); // iretq
         } else {

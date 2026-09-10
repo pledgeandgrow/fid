@@ -1552,6 +1552,11 @@ pub fn PeCodeGen_get_func_label(self: &PeCodeGen, name: str) -> i64 {
     return -1;
 }
 
+// Check if a function exists by name
+pub fn PeCodeGen_has_func(self: &PeCodeGen, name: str) -> bool {
+    return PeCodeGen_get_func_label(self, name) >= 0;
+}
+
 // Check if a global name is @cpu_local and return its GS-relative offset.
 pub fn PeCodeGen_get_cpu_local_offset(self: &PeCodeGen, name: str) -> i64 {
     var i: i64 = 0;
@@ -1746,7 +1751,7 @@ pub fn PeCodeGen_generate_boot(self: &mut PeCodeGen, module: IrModule) -> Vec {
 
     // 4. Generate boot entry point FIRST (must be at start of code so GRUB
     //    jumps into our 32-bit → 64-bit trampoline)
-    PeCodeGen_gen_boot_entry_point(self);
+    PeCodeGen_gen_boot_entry_point(self, module);
 
     // 5. Generate code for each function
     PeCodeGen_gen_all_functions(self, module);
@@ -1937,6 +1942,12 @@ pub fn PeCodeGen_register_runtime_labels2(self: &mut PeCodeGen) {
     PeCodeGen_register_func(self, "p_serial_write");
     PeCodeGen_register_func(self, "p_serial_read");
     PeCodeGen_register_func(self, "p_serial_ready");
+    // F29: MMU + user-mode stubs
+    PeCodeGen_register_func(self, "p_cr2_read");
+    PeCodeGen_register_func(self, "p_cr3_read");
+    PeCodeGen_register_func(self, "p_cr3_write");
+    PeCodeGen_register_func(self, "p_enter_user_mode");
+    PeCodeGen_register_func(self, "syscall_handler");
 }
 
 // Helper: generate code for all functions
@@ -3303,6 +3314,12 @@ pub fn PeCodeGen_gen_runtime_stubs(self: &mut PeCodeGen) {
     PeCodeGen_gen_p_serial_write(self);
     PeCodeGen_gen_p_serial_read(self);
     PeCodeGen_gen_p_serial_ready(self);
+    // F29: MMU + user-mode stubs
+    PeCodeGen_gen_p_cr2_read(self);
+    PeCodeGen_gen_p_cr3_read(self);
+    PeCodeGen_gen_p_cr3_write(self);
+    PeCodeGen_gen_p_enter_user_mode(self);
+    PeCodeGen_gen_syscall_handler(self);
 }
 
 // p_print_int(rcx = value) -- prints an i64 followed by newline
@@ -5153,7 +5170,7 @@ pub fn PeCodeGen_gen_entry_point(self: &mut PeCodeGen) {
 // We must switch to 64-bit long mode before calling main(), because the
 // Fides compiler generates 64-bit code.
 
-pub fn PeCodeGen_gen_boot_entry_point(self: &mut PeCodeGen) {
+pub fn PeCodeGen_gen_boot_entry_point(self: &mut PeCodeGen, module: &IrModule) {
     self.entry_offset = X86Encoder_offset(&self.enc);
 
     // ─── 32-bit trampoline to switch to long mode ───────────────────
@@ -5196,6 +5213,49 @@ pub fn PeCodeGen_gen_boot_entry_point(self: &mut PeCodeGen) {
     X86Encoder_emit_u8(&mut self.enc, 0xC7); X86Encoder_emit_u8(&mut self.enc, 0x05);
     X86Encoder_emit_u32(&mut self.enc, 0x71000);
     X86Encoder_emit_u32(&mut self.enc, 0x83);
+
+    // ─── User page tables (for ring 3 isolation) ───────────────────
+    // User PML4 at 0x72000, PDPT at 0x73000, PD at 0x74000, PT at 0x75000
+    // Maps ONLY: 0x10000 (user program, 4KB) and 0xB8000 (VGA, 4KB)
+
+    // Zero user page table memory (4 pages at 0x72000)
+    // mov edi, 0x72000
+    X86Encoder_emit_u8(&mut self.enc, 0xBF);
+    X86Encoder_emit_u32(&mut self.enc, 0x72000);
+    // mov ecx, 0x1000 (4096 dwords = 16384 bytes = 4 pages)
+    X86Encoder_emit_u8(&mut self.enc, 0xB9);
+    X86Encoder_emit_u32(&mut self.enc, 0x1000);
+    // xor eax, eax
+    X86Encoder_emit_u8(&mut self.enc, 0x31); X86Encoder_emit_u8(&mut self.enc, 0xC0);
+    // rep stosd
+    X86Encoder_emit_u8(&mut self.enc, 0xF3); X86Encoder_emit_u8(&mut self.enc, 0xAB);
+
+    // User PML4[0] = 0x73000 | 7 (present + writable + user)
+    X86Encoder_emit_u8(&mut self.enc, 0xC7); X86Encoder_emit_u8(&mut self.enc, 0x05);
+    X86Encoder_emit_u32(&mut self.enc, 0x72000);
+    X86Encoder_emit_u32(&mut self.enc, 0x73007);
+
+    // User PDPT[0] = 0x74000 | 7 (present + writable + user)
+    X86Encoder_emit_u8(&mut self.enc, 0xC7); X86Encoder_emit_u8(&mut self.enc, 0x05);
+    X86Encoder_emit_u32(&mut self.enc, 0x73000);
+    X86Encoder_emit_u32(&mut self.enc, 0x74007);
+
+    // User PD[0] = 0x75000 | 7 (present + writable + user, points to PT)
+    X86Encoder_emit_u8(&mut self.enc, 0xC7); X86Encoder_emit_u8(&mut self.enc, 0x05);
+    X86Encoder_emit_u32(&mut self.enc, 0x74000);
+    X86Encoder_emit_u32(&mut self.enc, 0x75007);
+
+    // User PT[0x10] = 0x10000 | 7 (user program at 0x10000, 4KB)
+    // PT entry index 0x10, addr = 0x75000 + 0x10*8 = 0x75080
+    X86Encoder_emit_u8(&mut self.enc, 0xC7); X86Encoder_emit_u8(&mut self.enc, 0x05);
+    X86Encoder_emit_u32(&mut self.enc, 0x75080);
+    X86Encoder_emit_u32(&mut self.enc, 0x10007);
+
+    // User PT[0xB8] = 0xB8000 | 7 (VGA at 0xB8000, 4KB)
+    // PT entry index 0xB8, addr = 0x75000 + 0xB8*8 = 0x755C0
+    X86Encoder_emit_u8(&mut self.enc, 0xC7); X86Encoder_emit_u8(&mut self.enc, 0x05);
+    X86Encoder_emit_u32(&mut self.enc, 0x755C0);
+    X86Encoder_emit_u32(&mut self.enc, 0xB80007);
 
     // Load CR3: mov eax, 0x70000; mov cr3, eax
     X86Encoder_emit_u8(&mut self.enc, 0xB8);
@@ -5249,10 +5309,26 @@ pub fn PeCodeGen_gen_boot_entry_point(self: &mut PeCodeGen) {
     X86Encoder_emit_u8(&mut self.enc, 0); // flags
     X86Encoder_emit_u8(&mut self.enc, 0); // base_hi
 
+    // User code segment (64-bit): access=0xFA (user, executable, readable)
+    X86Encoder_emit_u16(&mut self.enc, 0); // limit_lo
+    X86Encoder_emit_u16(&mut self.enc, 0); // base_lo
+    X86Encoder_emit_u8(&mut self.enc, 0); // base_mid
+    X86Encoder_emit_u8(&mut self.enc, 0xFA); // access (user + code + readable)
+    X86Encoder_emit_u8(&mut self.enc, 0x20); // flags (L=1, D=0)
+    X86Encoder_emit_u8(&mut self.enc, 0); // base_hi
+
+    // User data segment (64-bit): access=0xF2 (user, writable)
+    X86Encoder_emit_u16(&mut self.enc, 0); // limit_lo
+    X86Encoder_emit_u16(&mut self.enc, 0); // base_lo
+    X86Encoder_emit_u8(&mut self.enc, 0); // base_mid
+    X86Encoder_emit_u8(&mut self.enc, 0xF2); // access (user + data + writable)
+    X86Encoder_emit_u8(&mut self.enc, 0); // flags
+    X86Encoder_emit_u8(&mut self.enc, 0); // base_hi
+
     // GDT descriptor
     var gdt_desc_offset: i64 = X86Encoder_offset(&self.enc);
-    // Size (limit): 23 bytes (3 entries * 8 - 1)
-    X86Encoder_emit_u16(&mut self.enc, 0x17);
+    // Size (limit): 39 bytes (5 entries * 8 - 1)
+    X86Encoder_emit_u16(&mut self.enc, 0x27);
     // Base address: will be patched
     var gdt_base_patch: i64 = X86Encoder_offset(&self.enc);
     X86Encoder_emit_u32(&mut self.enc, 0); // base (patch later)
@@ -5269,6 +5345,131 @@ pub fn PeCodeGen_gen_boot_entry_point(self: &mut PeCodeGen) {
 
     // Push 0 (fake return address)
     X86Encoder_emit_u8(&mut self.enc, 0x6A); X86Encoder_emit_u8(&mut self.enc, 0x00);
+
+    // ─── IDT + PIC setup (if irq1_handler exists) ──────────────────
+    // This sets up interrupt-driven keyboard before calling main().
+    var has_irq1: bool = PeCodeGen_has_func(self, "irq1_handler");
+
+    if has_irq1 {
+        // 1. Zero out IDT memory at 0x1000 (4096 bytes = 512 qwords)
+        // mov rdi, 0x1000
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xBF);
+        X86Encoder_emit_u64(&mut self.enc, 0x1000);
+        // mov ecx, 512
+        X86Encoder_emit_u8(&mut self.enc, 0xB9);
+        X86Encoder_emit_u32(&mut self.enc, 512);
+        // xor rax, rax
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0x31); X86Encoder_emit_u8(&mut self.enc, 0xC0);
+        // rep stosq
+        X86Encoder_emit_u8(&mut self.enc, 0xF3); X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xAB);
+
+        // 2. Build IDT entry for vector 0x21 (IRQ1 = keyboard)
+        // Entry at 0x1000 + 0x21 * 16 = 0x1210
+        var irq1_label: i64 = PeCodeGen_get_func_label(self, "irq1_handler");
+        X86Encoder_lea_label(&mut self.enc, REG_RAX, irq1_label);
+        // mov r11, rax (save handler addr)
+        X86Encoder_emit_u8(&mut self.enc, 0x49); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0xC3);
+        // mov rdx, 0x1210
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xBA);
+        X86Encoder_emit_u64(&mut self.enc, 0x1210);
+        // mov [rdx], ax (offset_low)
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0x02);
+        // mov word [rdx+2], 0x08 (selector)
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0xC7); X86Encoder_emit_u8(&mut self.enc, 0x42); X86Encoder_emit_u8(&mut self.enc, 0x02); X86Encoder_emit_u16(&mut self.enc, 0x08);
+        // mov byte [rdx+4], 0 (IST=0)
+        X86Encoder_emit_u8(&mut self.enc, 0xC6); X86Encoder_emit_u8(&mut self.enc, 0x42); X86Encoder_emit_u8(&mut self.enc, 0x04); X86Encoder_emit_u8(&mut self.enc, 0x00);
+        // mov byte [rdx+5], 0x8E (type_attr = interrupt gate)
+        X86Encoder_emit_u8(&mut self.enc, 0xC6); X86Encoder_emit_u8(&mut self.enc, 0x42); X86Encoder_emit_u8(&mut self.enc, 0x05); X86Encoder_emit_u8(&mut self.enc, 0x8E);
+        // offset_mid: mov rax, r11; shr rax, 16; mov [rdx+6], ax
+        X86Encoder_emit_u8(&mut self.enc, 0x4C); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0xD8);
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xC1); X86Encoder_emit_u8(&mut self.enc, 0xE8); X86Encoder_emit_u8(&mut self.enc, 0x10);
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0x42); X86Encoder_emit_u8(&mut self.enc, 0x06);
+        // offset_high: shr rax, 16; mov [rdx+8], eax
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xC1); X86Encoder_emit_u8(&mut self.enc, 0xE8); X86Encoder_emit_u8(&mut self.enc, 0x10);
+        X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0x42); X86Encoder_emit_u8(&mut self.enc, 0x08);
+
+        // 3. Remap PIC (ICW1-4)
+        // ICW1 master: outb(0x20, 0x11)
+        X86Encoder_emit_u8(&mut self.enc, 0xB0); X86Encoder_emit_u8(&mut self.enc, 0x11);
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0xBA); X86Encoder_emit_u16(&mut self.enc, 0x20);
+        X86Encoder_emit_u8(&mut self.enc, 0xEE);
+        // ICW1 slave: outb(0xA0, 0x11)
+        X86Encoder_emit_u8(&mut self.enc, 0xB0); X86Encoder_emit_u8(&mut self.enc, 0x11);
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0xBA); X86Encoder_emit_u16(&mut self.enc, 0xA0);
+        X86Encoder_emit_u8(&mut self.enc, 0xEE);
+        // ICW2 master: outb(0x21, 0x20)
+        X86Encoder_emit_u8(&mut self.enc, 0xB0); X86Encoder_emit_u8(&mut self.enc, 0x20);
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0xBA); X86Encoder_emit_u16(&mut self.enc, 0x21);
+        X86Encoder_emit_u8(&mut self.enc, 0xEE);
+        // ICW2 slave: outb(0xA1, 0x28)
+        X86Encoder_emit_u8(&mut self.enc, 0xB0); X86Encoder_emit_u8(&mut self.enc, 0x28);
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0xBA); X86Encoder_emit_u16(&mut self.enc, 0xA1);
+        X86Encoder_emit_u8(&mut self.enc, 0xEE);
+        // ICW3 master: outb(0x21, 0x04)
+        X86Encoder_emit_u8(&mut self.enc, 0xB0); X86Encoder_emit_u8(&mut self.enc, 0x04);
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0xBA); X86Encoder_emit_u16(&mut self.enc, 0x21);
+        X86Encoder_emit_u8(&mut self.enc, 0xEE);
+        // ICW3 slave: outb(0xA1, 0x02)
+        X86Encoder_emit_u8(&mut self.enc, 0xB0); X86Encoder_emit_u8(&mut self.enc, 0x02);
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0xBA); X86Encoder_emit_u16(&mut self.enc, 0xA1);
+        X86Encoder_emit_u8(&mut self.enc, 0xEE);
+        // ICW4 master: outb(0x21, 0x01)
+        X86Encoder_emit_u8(&mut self.enc, 0xB0); X86Encoder_emit_u8(&mut self.enc, 0x01);
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0xBA); X86Encoder_emit_u16(&mut self.enc, 0x21);
+        X86Encoder_emit_u8(&mut self.enc, 0xEE);
+        // ICW4 slave: outb(0xA1, 0x01)
+        X86Encoder_emit_u8(&mut self.enc, 0xB0); X86Encoder_emit_u8(&mut self.enc, 0x01);
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0xBA); X86Encoder_emit_u16(&mut self.enc, 0xA1);
+        X86Encoder_emit_u8(&mut self.enc, 0xEE);
+
+        // 4. Mask: unmask IRQ0 (timer) and IRQ1 (keyboard) — 0xFC master, 0xFF slave
+        X86Encoder_emit_u8(&mut self.enc, 0xB0); X86Encoder_emit_u8(&mut self.enc, 0xFC);
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0xBA); X86Encoder_emit_u16(&mut self.enc, 0x21);
+        X86Encoder_emit_u8(&mut self.enc, 0xEE);
+        X86Encoder_emit_u8(&mut self.enc, 0xB0); X86Encoder_emit_u8(&mut self.enc, 0xFF);
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0xBA); X86Encoder_emit_u16(&mut self.enc, 0xA1);
+        X86Encoder_emit_u8(&mut self.enc, 0xEE);
+
+        // 5. Set up IDT descriptor at 0x500
+        // mov word [0x500], 0x0FFF
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0xC7); X86Encoder_emit_u8(&mut self.enc, 0x04); X86Encoder_emit_u8(&mut self.enc, 0x25);
+        X86Encoder_emit_u32(&mut self.enc, 0x500); X86Encoder_emit_u16(&mut self.enc, 0x0FFF);
+        // mov dword [0x502], 0x1000
+        X86Encoder_emit_u8(&mut self.enc, 0xC7); X86Encoder_emit_u8(&mut self.enc, 0x04); X86Encoder_emit_u8(&mut self.enc, 0x25);
+        X86Encoder_emit_u32(&mut self.enc, 0x502); X86Encoder_emit_u32(&mut self.enc, 0x1000);
+        // mov dword [0x506], 0
+        X86Encoder_emit_u8(&mut self.enc, 0xC7); X86Encoder_emit_u8(&mut self.enc, 0x04); X86Encoder_emit_u8(&mut self.enc, 0x25);
+        X86Encoder_emit_u32(&mut self.enc, 0x506); X86Encoder_emit_u32(&mut self.enc, 0);
+
+        // 6. Load IDT: lidt [0x500]
+        X86Encoder_emit_u8(&mut self.enc, 0x0F); X86Encoder_emit_u8(&mut self.enc, 0x01); X86Encoder_emit_u8(&mut self.enc, 0x1C); X86Encoder_emit_u8(&mut self.enc, 0x25);
+        X86Encoder_emit_u32(&mut self.enc, 0x500);
+
+        // NOTE: sti is deferred until after @interrupt(N) handlers are wired
+    }
+
+    // ─── TSS setup (for user-mode support) ──────────────────────────
+    // Zero out TSS at 0x4000 (104 bytes = 13 qwords)
+    X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xBF);
+    X86Encoder_emit_u64(&mut self.enc, 0x4000);
+    X86Encoder_emit_u8(&mut self.enc, 0xB9); X86Encoder_emit_u32(&mut self.enc, 13);
+    X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0x31); X86Encoder_emit_u8(&mut self.enc, 0xC0);
+    X86Encoder_emit_u8(&mut self.enc, 0xF3); X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xAB);
+    // Set TSS.rsp0 = 0x90000 (kernel stack)
+    // mov qword [0x4004], 0x90000
+    X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xC7); X86Encoder_emit_u8(&mut self.enc, 0x04); X86Encoder_emit_u8(&mut self.enc, 0x25);
+    X86Encoder_emit_u32(&mut self.enc, 0x4004); X86Encoder_emit_u32(&mut self.enc, 0x90000);
+    X86Encoder_emit_u8(&mut self.enc, 0xC7); X86Encoder_emit_u8(&mut self.enc, 0x04); X86Encoder_emit_u8(&mut self.enc, 0x25);
+    X86Encoder_emit_u32(&mut self.enc, 0x4008); X86Encoder_emit_u32(&mut self.enc, 0);
+
+    // ─── @interrupt(N) IDT setup ─────────────────────────────────────
+    // For each function with @interrupt(N), register it in the IDT at vector N.
+    PeCodeGen_gen_idt_setup_for_interrupts(self, module);
+
+    // Enable interrupts AFTER all IDT entries are wired
+    if has_irq1 {
+        X86Encoder_emit_u8(&mut self.enc, 0xFB); // sti
+    }
 
     // ─── Direct VGA test: write 'F' to VGA memory at 0xB8000 ───────────
     // This bypasses all function calls to verify VGA memory is accessible.
@@ -5328,6 +5529,52 @@ pub fn PeCodeGen_gen_boot_entry_point(self: &mut PeCodeGen) {
     self.enc.code.set(gdt_base_patch + 1, (gdt_base >> 8) & 0xFF);
     self.enc.code.set(gdt_base_patch + 2, (gdt_base >> 16) & 0xFF);
     self.enc.code.set(gdt_base_patch + 3, (gdt_base >> 24) & 0xFF);
+}
+
+// ===========================================================================
+// F29: @interrupt(N) IDT setup — register all annotated ISRs in the IDT
+// ===========================================================================
+pub fn PeCodeGen_gen_idt_setup_for_interrupts(self: &mut PeCodeGen, module: &IrModule) {
+    // Collect all (vector, handler_label) pairs for functions with interrupt_vector >= 0
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var entry: IrFunctionEntry = module.functions.get(fi);
+        var func: IrFunction = entry.func;
+        if func.interrupt_vector >= 0 {
+            var handler_label: i64 = PeCodeGen_get_func_label(self, func.name);
+            if handler_label >= 0 {
+                var vector: i64 = func.interrupt_vector;
+                // IDT entry address = 0x1000 + vector * 16
+                var idt_entry_addr: i64 = 0x1000 + vector * 16;
+
+                // lea rax, [handler]
+                X86Encoder_lea_label(&mut self.enc, REG_RAX, handler_label);
+                // mov r11, rax (save handler addr)
+                X86Encoder_emit_u8(&mut self.enc, 0x49); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0xC3);
+
+                // mov rdx, idt_entry_addr
+                X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xBA);
+                X86Encoder_emit_u64(&mut self.enc, idt_entry_addr);
+
+                // Store offset_low: mov [rdx], ax
+                X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0x02);
+                // Store selector 0x08: mov word [rdx+2], 0x08
+                X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0xC7); X86Encoder_emit_u8(&mut self.enc, 0x42); X86Encoder_emit_u8(&mut self.enc, 0x02); X86Encoder_emit_u16(&mut self.enc, 0x08);
+                // Store IST=0: mov byte [rdx+4], 0
+                X86Encoder_emit_u8(&mut self.enc, 0xC6); X86Encoder_emit_u8(&mut self.enc, 0x42); X86Encoder_emit_u8(&mut self.enc, 0x04); X86Encoder_emit_u8(&mut self.enc, 0x00);
+                // Store type_attr=0x8E: mov byte [rdx+5], 0x8E
+                X86Encoder_emit_u8(&mut self.enc, 0xC6); X86Encoder_emit_u8(&mut self.enc, 0x42); X86Encoder_emit_u8(&mut self.enc, 0x05); X86Encoder_emit_u8(&mut self.enc, 0x8E);
+                // offset_mid: mov rax, r11; shr rax, 16; mov [rdx+6], ax
+                X86Encoder_emit_u8(&mut self.enc, 0x4C); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0xD8);
+                X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xC1); X86Encoder_emit_u8(&mut self.enc, 0xE8); X86Encoder_emit_u8(&mut self.enc, 0x10);
+                X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0x42); X86Encoder_emit_u8(&mut self.enc, 0x06);
+                // offset_high: shr rax, 16; mov [rdx+8], eax
+                X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xC1); X86Encoder_emit_u8(&mut self.enc, 0xE8); X86Encoder_emit_u8(&mut self.enc, 0x10);
+                X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0x42); X86Encoder_emit_u8(&mut self.enc, 0x08);
+            }
+        }
+        fi = fi + 1;
+    }
 }
 
 // ===========================================================================
@@ -5583,6 +5830,114 @@ pub fn PeCodeGen_gen_p_serial_ready(self: &mut PeCodeGen) {
         X86Encoder_ud2(&mut self.enc);
     }
     X86Encoder_ret(&mut self.enc);
+}
+
+// ===========================================================================
+// F29: MMU + user-mode stubs (ported from src/pe.rs)
+// ===========================================================================
+
+// p_cr2_read() -> rax — read CR2 (page fault address)
+pub fn PeCodeGen_gen_p_cr2_read(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_cr2_read");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        // mov rax, cr2
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0x0F); X86Encoder_emit_u8(&mut self.enc, 0x20); X86Encoder_emit_u8(&mut self.enc, 0xD0);
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_cr3_read() -> rax — read CR3 (page table base)
+pub fn PeCodeGen_gen_p_cr3_read(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_cr3_read");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        // mov rax, cr3
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0x0F); X86Encoder_emit_u8(&mut self.enc, 0x20); X86Encoder_emit_u8(&mut self.enc, 0xD8);
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_cr3_write(rcx = addr) — write CR3
+pub fn PeCodeGen_gen_p_cr3_write(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_cr3_write");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        // mov cr3, rcx
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0x0F); X86Encoder_emit_u8(&mut self.enc, 0x22); X86Encoder_emit_u8(&mut self.enc, 0xD9);
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_enter_user_mode(rcx = entry_addr, rdx = stack_addr) -> void
+// Transitions from ring 0 (kernel) to ring 3 (user) via iretq.
+// Switches CR3 to user page tables (0x72000) for isolation before iretq.
+pub fn PeCodeGen_gen_p_enter_user_mode(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_enter_user_mode");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        // rcx = entry_addr (RIP), rdx = stack_addr (RSP)
+        // Save entry/stack in r11, r12 before CR3 switch
+        // mov r11, rcx
+        X86Encoder_emit_u8(&mut self.enc, 0x49); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0xCB);
+        // mov r12, rdx
+        X86Encoder_emit_u8(&mut self.enc, 0x49); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0xD4);
+
+        // Switch CR3 to user page tables (0x72000)
+        X86Encoder_emit_u8(&mut self.enc, 0xB8); X86Encoder_emit_u32(&mut self.enc, 0x72000);
+        X86Encoder_emit_u8(&mut self.enc, 0x0F); X86Encoder_emit_u8(&mut self.enc, 0x22); X86Encoder_emit_u8(&mut self.enc, 0xD8);
+
+        // Build iret frame on kernel stack
+        // Push SS (user data = 0x23)
+        X86Encoder_emit_u8(&mut self.enc, 0x6A); X86Encoder_emit_u8(&mut self.enc, 0x23);
+        // Push RSP (user stack = r12)
+        X86Encoder_emit_u8(&mut self.enc, 0x41); X86Encoder_emit_u8(&mut self.enc, 0x54); // push r12
+        // Push RFLAGS = 0x202
+        X86Encoder_emit_u8(&mut self.enc, 0x68); X86Encoder_emit_u32(&mut self.enc, 0x202);
+        // Push CS (user code = 0x1B)
+        X86Encoder_emit_u8(&mut self.enc, 0x6A); X86Encoder_emit_u8(&mut self.enc, 0x1B);
+        // Push RIP (entry = r11)
+        X86Encoder_emit_u8(&mut self.enc, 0x41); X86Encoder_emit_u8(&mut self.enc, 0x53); // push r11
+        // iretq
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xCF);
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    // No ret — iretq never returns here
+}
+
+// syscall_handler — int 0x80 from user mode
+// Switches CR3 back to kernel page tables (0x70000) and returns to ring 0.
+pub fn PeCodeGen_gen_syscall_handler(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "syscall_handler");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        // Switch CR3 back to kernel page tables (0x70000)
+        X86Encoder_emit_u8(&mut self.enc, 0xB8); X86Encoder_emit_u32(&mut self.enc, 0x70000);
+        X86Encoder_emit_u8(&mut self.enc, 0x0F); X86Encoder_emit_u8(&mut self.enc, 0x22); X86Encoder_emit_u8(&mut self.enc, 0xD8);
+        // Modify RIP → user_return (will be patched by boot trampoline)
+        // For now, just halt — the full user_return trampoline is in the boot entry point
+        // mov qword [rsp + 0], <user_return_addr> — placeholder
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xC7); X86Encoder_emit_u8(&mut self.enc, 0x04); X86Encoder_emit_u8(&mut self.enc, 0x24);
+        X86Encoder_emit_u32(&mut self.enc, 0); // placeholder
+        // Modify CS → 0x08 (kernel code)
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0xC7); X86Encoder_emit_u8(&mut self.enc, 0x44); X86Encoder_emit_u8(&mut self.enc, 0x24); X86Encoder_emit_u8(&mut self.enc, 0x08); X86Encoder_emit_u16(&mut self.enc, 0x08);
+        // Modify RSP → 0x90000 (kernel stack)
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xC7); X86Encoder_emit_u8(&mut self.enc, 0x44); X86Encoder_emit_u8(&mut self.enc, 0x24); X86Encoder_emit_u8(&mut self.enc, 0x18); X86Encoder_emit_u32(&mut self.enc, 0x90000); X86Encoder_emit_u32(&mut self.enc, 0);
+        // Modify SS → 0x10 (kernel data)
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0xC7); X86Encoder_emit_u8(&mut self.enc, 0x44); X86Encoder_emit_u8(&mut self.enc, 0x24); X86Encoder_emit_u8(&mut self.enc, 0x20); X86Encoder_emit_u16(&mut self.enc, 0x10);
+        // iretq
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xCF);
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    // No ret — iretq never returns here
 }
 
 // ===========================================================================

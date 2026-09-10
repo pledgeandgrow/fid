@@ -1544,7 +1544,6 @@ impl Parser {
             }
             TokenKind::Match => self.parse_match_stmt(),
             TokenKind::Select => self.parse_select_stmt(),
-            TokenKind::Parallel => self.parse_parallel_stmt(),
             TokenKind::Use => self.parse_use_stmt(),
             TokenKind::Handle => self.parse_handle_stmt(),
             TokenKind::Do => self.parse_do_stmt(),
@@ -1580,6 +1579,14 @@ impl Parser {
                 Ok(Stmt::Expr(expr, line))
             }
             TokenKind::Guard => self.parse_guard_stmt(),
+            // F13: `parallel` is a contextual keyword — only treated as a keyword
+            // when it appears as `parallel { | ... | ... }`. Otherwise it's an identifier
+            // (e.g. `use parallel;` or `parallel.func()`).
+            TokenKind::Ident(s) if s == "parallel"
+                && self.pos + 1 < self.tokens.len()
+                && self.tokens[self.pos + 1].kind == TokenKind::LBrace => {
+                self.parse_parallel_stmt()
+            }
             _ => self.parse_assign_or_expr(),
         }
     }
@@ -1753,7 +1760,8 @@ impl Parser {
     /// before continuing.
     fn parse_parallel_stmt(&mut self) -> Result<Stmt, String> {
         let line = self.peek_token().line;
-        self.expect(TokenKind::Parallel, "parallel")?;
+        // `parallel` is a contextual keyword — consumed as an Ident
+        self.advance(); // consume the "parallel" identifier
         self.expect(TokenKind::LBrace, "{")?;
 
         let mut branches: Vec<Vec<Stmt>> = Vec::new();

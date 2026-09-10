@@ -2115,6 +2115,40 @@ pub fn Lowerer_lower_func(self: &mut Lowerer, func: Func) {
     var ret_ty: IrType = Lowerer_lower_type_sret(self, func.ret_ty);
     var ir_func: IrFunction = IrFunction_new(func.name, ret_ty);
     ir_func.is_interrupt = func.is_interrupt;
+    // F29: @interrupt(N) annotation — store the IDT vector number
+    ir_func.interrupt_vector = -1;
+    var ai: i64 = 0;
+    while ai < func.annotations.len() {
+        var ann: Annotation = func.annotations.get(ai);
+        if str_equal(ann.name, "interrupt") {
+            if ann.args.len() > 0 {
+                var vec_str: str = ann.args.get(0);
+                var result: i64 = 0;
+                var si: i64 = 0;
+                // Check for 0x prefix (hex)
+                if str_len(vec_str) >= 2 {
+                    if str_byte_at(vec_str, 0) == 48 && (str_byte_at(vec_str, 1) == 120 || str_byte_at(vec_str, 1) == 88) {
+                        si = 2;
+                        while si < str_len(vec_str) {
+                            var b: i64 = str_byte_at(vec_str, si);
+                            if b >= 48 && b <= 57 { result = result * 16 + (b - 48); }
+                            else if b >= 97 && b <= 102 { result = result * 16 + (b - 87); }
+                            else if b >= 65 && b <= 70 { result = result * 16 + (b - 55); }
+                            si = si + 1;
+                        }
+                    } else {
+                        while si < str_len(vec_str) {
+                            var b: i64 = str_byte_at(vec_str, si);
+                            if b >= 48 && b <= 57 { result = result * 10 + (b - 48); }
+                            si = si + 1;
+                        }
+                    }
+                }
+                ir_func.interrupt_vector = result;
+            }
+        }
+        ai = ai + 1;
+    }
     ir_func.is_wrapping = has_annotation(func.annotations, "wrapping");
     ir_func.is_deterministic = has_annotation(func.annotations, "deterministic");
     ir_func.is_crashfree = has_annotation(func.annotations, "crashfree");

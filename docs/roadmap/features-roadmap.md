@@ -65,10 +65,10 @@ F17: Vector swizzle (.xyz)    ✅ IMPLEMENTED — .xyz/.rgb/.stpq swizzle access
 F8:  ?. optional chaining     ✅ IMPLEMENTED — null-safe navigation, None short-circuits to 0
 F10: given/ensure contracts   ✅ IMPLEMENTED — preconditions verified at call sites with constant args (Design by Contract)
 F18: ECS (component/system)   ✅ IMPLEMENTED — component/system/query desugar to structs/functions/loops, __ecs_* runtime in interpreter
-F13: parallel { | } fork-join 🔲 PLANNED — compiler emits thread spawn/join
+F13: parallel { | } fork-join ✅ DONE (partial) — syntax parsed, typechecked, lowered sequentially; true parallelism requires closure support
 F14: @differentiable          ✅ DONE — typechecker verifies @differentiable (no IO/Net/Spawn/Diverge, transitive). Runtime tape-based reverse-mode AD in interpreter: `grad(var) { ... backward(loss) }` computes gradients. `p_grad_get` retrieves results.
 F21: @shader (vert/frag)      🔲 PLANNED — compiler emits SPIR-V for GPU
-F23: @simd                    🔲 PLANNED — compiler vectorizes loops to SSE/AVX/NEON
+F23: @simd                    ✅ DONE — aggressive loop vectorization (wider vectors for AVX/AVX2, relaxed cost model, lower trip count threshold)
 
 ─── Safety Annotations — see security.md for full reference ─────
 F24: @crashfree               ✅ IMPLEMENTED — compile-time panic prevention: rejects unwrap, p_panic, non-const div/mod, while loops, non-crashfree calls
@@ -76,8 +76,8 @@ F25: @pool                    🔲 PLANNED — compiler manages pool memory layo
 F26: @deterministic           ✅ IMPLEMENTED — compiler rejects FP/random/IO/time (medical+blockchain)
 F27: @realtime                🔲 PLANNED — compiler analyzes WCET, rejects malloc (robotics)
 F28: @gas                     ✅ IMPLEMENTED — compile-time gas budgets, AST node cost model, transitive call graph analysis (blockchain)
-F29: @interrupt               🔲 PLANNED — compiler generates ISR code, vector table (robotics+IoT)
-F30: @firmware                🔲 PLANNED — compiler strips OS deps, bare metal startup (IoT)
+F29: @interrupt               ✅ DONE — ISR codegen (register save/restore + iret) + @interrupt(N) automatic IDT vector table setup in PE boot codegen
+F30: @firmware                ✅ DONE — rejects OS-dependent calls (file I/O, sockets, threads, env vars, SQLite) at compile time
 F31: @lowpower                🔲 PLANNED — compiler inserts sleep, gates clocks (IoT)
 F32: @serverless              🔲 PLANNED — compiler tree-shakes, pre-init, WASM output (serverless)
 
@@ -150,14 +150,14 @@ F68: parameterized queries    ✅ IMPLEMENTED — no string concatenation for ty
 F69: @escaped                 🔲 PLANNED — compiler verifies output is escaped before rendering (XSS prevention)
 F70: @atomic-check            🔲 PLANNED — check and act are one atomic operation (TOCTOU prevention)
 F72: @constant-time           ✅ IMPLEMENTED — compiler verifies no data-dependent branches or memory access, no early returns, no IO/Net, transitive (side-channel)
-F74: @secret type             🔲 PLANNED — information flow control, secrets can't be printed/logged/sent (info leak)
+F74: @secret type             ✅ DONE — information flow control: secret lattice in typechecker, output sink rejection (print/log/network/file), return flow checks, transitive propagation
 F75: @cfi                     🔲 PLANNED — control flow integrity: shadow stack, CFI checks, canaries (ROP prevention)
 F76: vtable protection        🔲 PLANNED — vtables read-only, pointer-signed, no user modification (JOP prevention)
 F79: @pinned                  🔲 PLANNED — dependency pinned with content hash, tamper detection (supply chain)
 F80: @sandbox-import          🔲 PLANNED — imported modules sandboxed by default, zero capabilities (supply chain)
 F82: no auto-deserialize      🔲 PLANNED — all parsing explicit + schema-validated, no reflection-based creation (deserialization)
 F85: @thread-safe             🔲 PLANNED — compiler proves no data races, message passing only (race conditions)
-F88: @zeroize                 🔲 PLANNED — secrets wiped from memory on scope exit (info leak prevention)
+F88: @zeroize                 ✅ DONE — compiler-inserted p_memset(0) at all exit points (before drops and returns) across interpreter, C codegen, and PE emitter
 F90: @no-leak                 🔲 PLANNED — compiler verifies no secret data in error messages or logs (info leak)
 F91: @crypto-approved         🔲 PLANNED — only vetted algorithms (no MD5, SHA1, custom crypto) (crypto weakness)
 F92: @nonce-unique            🔲 PLANNED — compiler verifies nonce never reused (crypto weakness)
@@ -265,7 +265,7 @@ T7: RISC-V native codegen     🔲 PLANNED — codegen_riscv.fd module for self-
 T8: Bare runtime stubs        🔲 PLANNED — p_hlt, p_cli, p_sti, p_inb, p_outb, p_serial in PE emitter for bare-metal mode
 T9: UEFI PE32+ emission       🔲 PLANNED — self-hosted PE emitter generates UEFI PE32+ EFI applications
 T10: GS base setup            🔲 PLANNED — WRMSR(0xC0000101) runtime stubs for per-CPU GS base initialization
-T11: IRETQ epilogue           🔲 PLANNED — interrupt handler return (IRETQ vs RET) in PE emitter for @interrupt functions
+T11: IRETQ epilogue           ✅ DONE — interrupt handler return uses IRET (0xCF) in PE emitter for @interrupt functions; register save/restore in prologue/epilogue
 T12: Multiboot2 header        🔲 PLANNED — --boot mode generates Multiboot2 header for kernel boot
 
 ─── Cut — Redundant, Build with Existing Features ───────────────
@@ -2302,13 +2302,13 @@ system UpdateLOD {
 |---------|--------|--------|------------|
 | F8: `?.` chaining | ✅ Implemented | High | Typechecker narrows types through chain |
 | F10: `given`/`ensure` | 🔲 Planned | High | Typechecker verifies at all call sites |
-| F13: `parallel { \| }` | 🔲 Planned | High | Compiler emits thread spawn/join |
+| F13: `parallel { \| }` | ✅ Done (partial) | High | Fork-join syntax parsed + typechecked; lowered sequentially (true parallelism needs closures) |
 | F14: `@differentiable` | ✅ Done | High | Typechecker verifies differentiability; runtime tape-based autodiff in interpreter |
 | F16: vec/mat types | 🔲 Planned | High | Compiler emits SIMD instructions |
 | F17: swizzle `.xyz` | 🔲 Planned | High | Parser + typechecker for components |
 | F18: ECS syntax | 🔲 Planned | Very High | Compiler controls SoA memory layout |
 | F21: `@shader` | 🔲 Planned | Very High | Compiler emits SPIR-V for GPU |
-| F23: `@simd` | 🔲 Planned | High | Compiler vectorizes loops to SSE/AVX |
+| F23: `@simd` | ✅ Done | High | Aggressive loop vectorization: wider vectors (AVX/AVX2), relaxed cost model, lower trip count |
 | F24: `@crashfree` | ✅ Implemented | Very High | Compile-time panic prevention: rejects unwrap, p_panic, non-const div/mod, while loops, non-crashfree calls |
 | F25: `@pool` | 🔲 Planned | High | Compiler manages pool memory, zero alloc |
 
