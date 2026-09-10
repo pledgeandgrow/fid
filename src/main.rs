@@ -2861,19 +2861,14 @@ fn main() {
         }
 
         "sbom" => {
-            // STUB: Software Bill of Materials export.
-            // Planned: parse a Fides source file, extract its import graph
-            // with capabilities and annotations, and output a CycloneDX or
-            // SPDX JSON document. See: docs/roadmap/safety-critical.md §19
+            // SBOM export: parse a Fides source file, extract its import graph
+            // with capabilities and annotations, and output CycloneDX or SPDX JSON.
             if args.len() < 3 {
                 eprintln!("Usage: fidesc sbom <file.fd> [--format cyclonedx|spdx] [-o output]");
                 eprintln!("  Export a Software Bill of Materials for a Fides program.");
-                eprintln!("  --format cyclonedx   Output CycloneDX JSON (default)");
-                eprintln!("  --format spdx        Output SPDX JSON");
+                eprintln!("  --format cyclonedx   Output CycloneDX 1.5 JSON (default)");
+                eprintln!("  --format spdx        Output SPDX 2.3 JSON");
                 eprintln!("  -o <file>            Write to file (default: stdout)");
-                eprintln!();
-                eprintln!("  NOTE: This is a stub. Full SBOM export is not yet implemented.");
-                eprintln!("  See docs/roadmap/safety-critical.md for the implementation plan.");
                 process::exit(1);
             }
             let input = &args[2];
@@ -2990,18 +2985,22 @@ fn generate_sbom(program: &ast::Program, source_path: &str, format: &str) -> Str
     let mut components: Vec<String> = Vec::new();
     for imp in &program.imports {
         let caps = if imp.capabilities.is_empty() {
-            "none".to_string()
+            "[]".to_string()
         } else {
-            imp.capabilities.join(", ")
+            let cap_strs: Vec<String> = imp.capabilities.iter()
+                .map(|c| format!("\"{}\"", c))
+                .collect();
+            format!("[{}]", cap_strs.join(", "))
         };
         let version = imp.version.as_deref().unwrap_or("unknown");
+        // CycloneDX component entry
         components.push(format!(
-            "    {{\n      \"name\": \"{}\",\n      \"version\": \"{}\",\n      \"capabilities\": \"{}\"\n    }}",
-            imp.path, version, caps
+            "    {{\n      \"type\": \"library\",\n      \"name\": \"{}\",\n      \"version\": \"{}\",\n      \"bom-ref\": \"pkg:fides/{}@{}\",\n      \"properties\": [\n        {{\n          \"name\": \"fides:capabilities\",\n          \"value\": {}\n        }}\n      ]\n    }}",
+            imp.path, version, imp.path, version, caps
         ));
     }
 
-    // Collect annotations used in the program.
+    // Collect annotations used in the program (functions + structs + enums).
     let mut annotations: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for f in &program.funcs {
         for a in &f.annotations {
@@ -3014,26 +3013,71 @@ fn generate_sbom(program: &ast::Program, source_path: &str, format: &str) -> Str
         }
     }
 
+    // Collect function-level capability info for the dependency graph.
+    let mut func_info: Vec<String> = Vec::new();
+    for f in &program.funcs {
+        let ann_names: Vec<String> = f.annotations.iter()
+            .map(|a| a.name.clone())
+            .collect();
+        if !ann_names.is_empty() {
+            func_info.push(format!(
+                "    {{\n      \"ref\": \"pkg:fides/function/{}\",\n      \"scope\": \"required\",\n      \"properties\": [\n        {{\n          \"name\": \"fides:annotations\",\n          \"value\": \"{}\"\n        }}\n      ]\n    }}",
+                f.name, ann_names.join(",")
+            ));
+        }
+    }
+
+    // Timestamp (RFC 3339).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     match format {
         "spdx" => {
-            // Minimal SPDX 2.3 JSON stub.
+            // SPDX 2.3 JSON.
             let ann_list: Vec<String> = annotations.iter().cloned().collect();
+            let mut spdx_components: Vec<String> = Vec::new();
+            for imp in &program.imports {
+                let version = imp.version.as_deref().unwrap_or("unknown");
+                let caps = if imp.capabilities.is_empty() {
+                    "NONE".to_string()
+                } else {
+                    imp.capabilities.join(", ")
+                };
+                spdx_components.push(format!(
+                    "    {{\n      \"name\": \"{}\",\n      \"SPDXID\": \"SPDXRef-Package-{}\",\n      \"versionInfo\": \"{}\",\n      \"downloadLocation\": \"NOASSERTION\",\n      \"filesAnalyzed\": false,\n      \"licenseConcluded\": \"NOASSERTION\",\n      \"licenseDeclared\": \"NOASSERTION\",\n      \"copyrightText\": \"NOASSERTION\",\n      \"supplier\": \"Organization: Fides\",\n      \"comment\": \"Capabilities: {}\"\n    }}",
+                    imp.path, imp.path.replace('/', "-"), version, caps
+                ));
+            }
             format!(
-                "{{\n  \"spdxVersion\": \"SPDX-2.3\",\n  \"dataLicense\": \"CC0-1.0\",\n  \"SPDXID\": \"SPDXRef-DOCUMENT\",\n  \"name\": \"{}\",\n  \"documentNamespace\": \"https://fides.dev/sbom/{}\",\n  \"creationInfo\": {{\n    \"created\": \"STUB\",\n    \"creators\": [\"Tool: fidesc 0.1.0\"]\n  }},\n  \"annotations\": [\"{}\"],\n  \"components\": [\n{}\n  ]\n}}",
+                "{{\n  \"spdxVersion\": \"SPDX-2.3\",\n  \"dataLicense\": \"CC0-1.0\",\n  \"SPDXID\": \"SPDXRef-DOCUMENT\",\n  \"name\": \"{}\",\n  \"documentNamespace\": \"https://fides.dev/sbom/{}-{}\",\n  \"creationInfo\": {{\n    \"created\": \"{}\",\n    \"creators\": [\"Tool: fidesc (Fides Compiler)\"]\n  }},\n  \"annotations\": [\n    {{\n      \"annotationDate\": \"{}\",\n      \"annotationType\": \"OTHER\",\n      \"annotator\": \"Tool: fidesc\",\n      \"comment\": \"Safety annotations: {}\"\n    }}\n  ],\n  \"packages\": [\n{}\n  ]\n}}",
                 source_path,
                 source_path.replace('/', "_"),
-                ann_list.join("\", \""),
-                components.join(",\n")
+                now,
+                now,
+                now,
+                ann_list.join(", "),
+                spdx_components.join(",\n")
             )
         }
         _ => {
-            // Minimal CycloneDX 1.5 JSON stub.
+            // CycloneDX 1.5 JSON.
             let ann_list: Vec<String> = annotations.iter().cloned().collect();
+            let deps = if func_info.is_empty() {
+                "  []".to_string()
+            } else {
+                format!("  [\n{}\n  ]", func_info.join(",\n"))
+            };
             format!(
-                "{{\n  \"bomFormat\": \"CycloneDX\",\n  \"specVersion\": \"1.5\",\n  \"metadata\": {{\n    \"tools\": [{{ \"name\": \"fidesc\", \"version\": \"0.1.0\" }}],\n    \"component\": {{ \"name\": \"{}\", \"type\": \"application\" }}\n  }},\n  \"annotations\": [\"{}\"],\n  \"components\": [\n{}\n  ]\n}}",
+                "{{\n  \"bomFormat\": \"CycloneDX\",\n  \"specVersion\": \"1.5\",\n  \"serialNumber\": \"urn:uuid:fides-{}\",\n  \"version\": 1,\n  \"metadata\": {{\n    \"timestamp\": \"{}\",\n    \"tools\": [{{ \"name\": \"fidesc\", \"vendor\": \"Fides\", \"version\": \"1.0.0\" }}],\n    \"component\": {{\n      \"type\": \"application\",\n      \"name\": \"{}\",\n      \"bom-ref\": \"pkg:fides/app/{}\"\n    }}\n  }},\n  \"properties\": [\n    {{\n      \"name\": \"fides:annotations\",\n      \"value\": \"{}\"\n    }}\n  ],\n  \"components\": [\n{}\n  ],\n  \"dependencies\": {}\n}}",
+                now,
+                now,
                 source_path,
-                ann_list.join("\", \""),
-                components.join(",\n")
+                source_path.replace('/', "_"),
+                ann_list.join(","),
+                components.join(",\n"),
+                deps
             )
         }
     }

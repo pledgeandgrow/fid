@@ -250,59 +250,58 @@ management, and kernel heap.
 
 #### 14. No disk/filesystem drivers
 
-No ATA/IDE, no AHCI, no NVMe, no disk I/O. `stdlib/fs.fd` uses libc
-`fopen`/`fread` which don't exist in a kernel.
+**Status:** ✅ Resolved — `fides-os/kernel/ata.fd` (332 lines)
 
-**Fix:** Add disk driver framework. At minimum, ATA/IDE PIO mode for
-basic disk access.
+ATA/IDE PIO mode driver with LBA28, read/write sectors, MBR parsing,
+partition tables, and multi-block I/O. Lives in the fides-os project.
 
 #### 15. No DMA support
 
-No DMA abstraction, no DMA controller setup, no IOMMU. Can't do
-efficient device I/O.
+**Status:** ✅ Resolved — `fides-os/kernel/dma.fd` (167 lines)
 
-**Fix:** Add `stdlib/dma.fd` with DMA buffer allocation and channel
-management.
+8237 DMA controller driver with `dma_transfer`, `dma_stop`,
+`dma_remaining_count`, `dma_is_complete` for ISA DMA channels 0-3.
 
 ### Tier 3: Important for a Real OS (but not day-1 blockers)
 
 #### 16. No multi-core / SMP support
 
-No APIC IPIs, no CPU startup sequence, no per-CPU initialization beyond
-`@cpu_local`. Can't boot secondary CPUs.
+**Status:** ✅ Resolved — `fides-os/kernel/smp.fd` (226 lines)
 
-**Fix:** Add `stdlib/smp.fd` with AP startup, IPI sending, and per-CPU
-GDT/IDT/TSS setup.
+AP startup, IPI, per-CPU state, LAPIC helpers. Provides `smp_start_ap`,
+`smp_send_ipi`, `smp_send_ipi_all`, `smp_register_cpu`, `smp_cpu_count`,
+`smp_mark_online`, `smp_is_online`, `smp_current_cpu_id`.
 
 #### 17. No PCI support
 
-No PCI configuration space access, no device enumeration, no BAR
-mapping. Can't discover or initialize PCI devices.
+**Status:** ✅ Resolved — `fides-os/kernel/pci.fd` (328 lines)
 
-**Fix:** Add `stdlib/pci.fd` with config space read/write, device
-enumeration, and BAR mapping.
+PCI config space access, device enumeration, BAR parsing, IRQ routing.
+Provides `pci_init`, `pci_scan`, `pci_get_device`, config space R/W.
 
 #### 18. No ACPI support
 
-No ACPI table parsing, no PM1a/PM1b control, no power management.
-Can't do clean shutdown or power-off.
+**Status:** ✅ Resolved — `fides-os/kernel/acpi.fd` (343 lines)
 
-**Fix:** Add `stdlib/acpi.fd` with RSDP/RSDT/XSDT parsing and
-`acpi_shutdown()`.
+RSDP/RSDT/XSDT parsing, FADT/DSDT parsing, power off, system reset.
+Provides `acpi_init`, `acpi_power_off`, `acpi_reset`.
 
 #### 19. No keyboard/mouse input
 
-No PS/2 keyboard controller, no USB HID. Can't get user input.
+**Status:** ✅ Resolved — `fides-os/kernel/keyboard.fd` (377 lines)
 
-**Fix:** Add `stdlib/keyboard.fd` with PS/2 scancode handling.
+PS/2 keyboard with IRQ1 handler, scancode Set 1 → ASCII, shift/caps/
+ctrl/alt, key press/release event queue. Provides `keyboard_init`,
+`keyboard_irq_handler`, `keyboard_has_key`, `keyboard_getc`,
+`keyboard_getc_block`, `keyboard_read_line`.
 
 #### 20. No framebuffer/VGA text mode
 
-No VGA text mode (0xB8000), no framebuffer, no font rendering.
-Can't display output on screen (only serial).
+**Status:** ✅ Resolved — `fides-os/kernel/framebuffer.fd` (378 lines) + `vga_helper.fd`
 
-**Fix:** Add `stdlib/vga.fd` with text mode and `stdlib/fb.fd` with
-linear framebuffer rendering.
+Linear framebuffer with console rendering, scrolling, cursor, font
+support. VGA text mode helper also available. Provides pixel-level
+drawing, text output, and console abstraction.
 
 #### 21. No network stack
 

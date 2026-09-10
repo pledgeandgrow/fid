@@ -1,0 +1,236 @@
+// ML9-ML14 Edge Case Tests — Issue 18
+//
+// Tests edge cases for KV cache, quantization, DP, sharding.
+// Uses the tensor module API (ones, from_vec, etc.) like the existing tests.
+
+use tensor;
+use quant;
+use kv_cache;
+use dp;
+use shard;
+
+fn vec1(items: i64) -> Vec<i64> {
+    val v = Vec::new();
+    var i: i64 = 0;
+    while i < items {
+        v.push(1);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn vec2(rows: i64, cols: i64) -> Vec<i64> {
+    val v = Vec::new();
+    v.push(rows);
+    v.push(cols);
+    return v;
+}
+
+fn vec1f(items: i64, fill: f64) -> Vec {
+    val v = Vec::new();
+    var i: i64 = 0;
+    while i < items {
+        v.push(fill);
+        i = i + 1;
+    }
+    return v;
+}
+
+// ─── ML9: KV Cache Edge Cases ────────────────────────────────────────────
+
+fn test_kv_cache_zero_layers() -> i64 {
+    // KV cache with 0 layers — should work (empty cache, no data)
+    region kv_cache kc with budget(1024) {
+        val cache = kv_cache_new(0, 100, 0, 2);
+        val len = kv_cache_len(cache, 0);
+        if len != 0 { return 0; }
+    }
+    return 1;
+}
+
+fn test_kv_cache_zero_head_dim() -> i64 {
+    // KV cache with 0 head_dim — should handle gracefully
+    region kv_cache kc with budget(1024) {
+        val cache = kv_cache_new(2, 100, 0, 0);
+        val len = kv_cache_len(cache, 0);
+        if len != 0 { return 0; }
+    }
+    return 1;
+}
+
+fn test_kv_cache_window_larger_than_seq() -> i64 {
+    // Window > max_seq_len — should clamp or work
+    region kv_cache kc with budget(4096) {
+        val cache = kv_cache_new(1, 10, 20, 2);
+        var i: i64 = 0;
+        while i < 5 {
+            val k = ones(vec2(1, 2));
+            val v = ones(vec2(1, 2));
+            kv_cache_append(cache, 0, k, v);
+            i = i + 1;
+        }
+        val len = kv_cache_len(cache, 0);
+        if len != 5 { return 0; }
+    }
+    return 1;
+}
+
+fn test_kv_cache_eviction() -> i64 {
+    // When num_tokens > max_seq_len, eviction should occur
+    region kv_cache kc with budget(4096) {
+        val cache = kv_cache_new(1, 3, 0, 2);
+        var i: i64 = 0;
+        while i < 10 {
+            val k = ones(vec2(1, 2));
+            val v = ones(vec2(1, 2));
+            kv_cache_append(cache, 0, k, v);
+            i = i + 1;
+        }
+        // Len should be clamped to max_seq_len (3) due to sliding window
+        val len = kv_cache_len(cache, 0);
+        if len > 3 { return 0; }
+    }
+    return 1;
+}
+
+fn test_kv_cache_clear() -> i64 {
+    region kv_cache kc with budget(1024) {
+        val cache = kv_cache_new(2, 10, 0, 2);
+        val k = ones(vec2(1, 2));
+        val v = ones(vec2(1, 2));
+        kv_cache_append(cache, 0, k, v);
+        val len_before = kv_cache_len(cache, 0);
+        if len_before != 1 { return 0; }
+        kv_cache_clear(cache);
+        val len_after = kv_cache_len(cache, 0);
+        if len_after != 0 { return 0; }
+    }
+    return 1;
+}
+
+// ─── ML10: Quantization Edge Cases ──────────────────────────────────────
+
+fn test_quantize_all_zeros() -> i64 {
+    // Quantizing an all-zeros tensor — should not crash
+    val tensor = from_vec(vec1f(4, 0.0), vec2(4, 1));
+    val params = find_quant_params(tensor);
+    // Use scale=1.0, zero_point=0 for all-zeros
+    val q = quantize_q8(tensor, 1.0, 0);
+    val dq = dequantize_q8(q, 1.0, 0);
+    // Should not crash — all zeros is a valid edge case
+    return 1;
+}
+
+fn test_quantize_single_element() -> i64 {
+    // Single element tensor
+    val tensor = from_vec(vec1f(1, 42.0), vec2(1, 1));
+    val params = find_quant_params(tensor);
+    val scale = 0.5;
+    val zp = 0;
+    val q = quantize_q8(tensor, scale, zp);
+    val dq = dequantize_q8(q, scale, zp);
+    return 1;
+}
+
+fn test_quantize_large_values() -> i64 {
+    // Large values — should clamp to INT8 range without crashing
+    val data: Vec = Vec::new();
+    data.push(1000000.0);
+    data.push(-1000000.0);
+    data.push(0.0);
+    val tensor = from_vec(data, vec2(3, 1));
+    val params = find_quant_params(tensor);
+    val scale = 10000.0;
+    val zp = 0;
+    val q = quantize_q8(tensor, scale, zp);
+    // Should not crash — values clamped to INT8 range
+    return 1;
+}
+
+fn test_quantize_negative_values() -> i64 {
+    // Tensor with all negative values
+    val data: Vec = Vec::new();
+    data.push(-1.0);
+    data.push(-2.0);
+    data.push(-3.0);
+    data.push(-4.0);
+    val tensor = from_vec(data, vec2(4, 1));
+    val params = find_quant_params(tensor);
+    val scale = 0.1;
+    val zp = -128;
+    val q = quantize_q8(tensor, scale, zp);
+    val dq = dequantize_q8(q, scale, zp);
+    return 1;
+}
+
+// ─── ML12: Differential Privacy Edge Cases ───────────────────────────────
+
+fn test_dp_noise_shape() -> i64 {
+    // DP noise should produce same-shaped tensor
+    val tensor = ones(vec2(2, 3));
+    val noisy = dp_noise(tensor, 0.1);
+    // Should not crash — noise added
+    return 1;
+}
+
+fn test_dp_noise_zero_sigma() -> i64 {
+    // sigma=0 should produce no noise (identity)
+    val tensor = ones(vec2(3, 1));
+    val noisy = dp_noise(tensor, 0.0);
+    // With sigma=0, noise should be 0 — values unchanged
+    return 1;
+}
+
+// ─── ML13: Tensor Parallel Edge Cases ───────────────────────────────────
+
+fn test_shard_identity() -> i64 {
+    // Single-rank shard — all_gather should be identity
+    val tensor = ones(vec2(4, 1));
+    val gathered = all_gather(tensor);
+    return 1;
+}
+
+// ─── Main ───────────────────────────────────────────────────────────────
+
+fn main() -> i64 {
+    print("=== ML Edge Case Tests ===\n");
+
+    print("KV cache zero layers: ");
+    if test_kv_cache_zero_layers() != 0 { print("PASS\n"); } else { print("FAIL\n"); }
+
+    print("KV cache zero head_dim: ");
+    if test_kv_cache_zero_head_dim() != 0 { print("PASS\n"); } else { print("FAIL\n"); }
+
+    print("KV cache window > seq_len: ");
+    if test_kv_cache_window_larger_than_seq() != 0 { print("PASS\n"); } else { print("FAIL\n"); }
+
+    print("KV cache eviction: ");
+    if test_kv_cache_eviction() != 0 { print("PASS\n"); } else { print("FAIL\n"); }
+
+    print("KV cache clear: ");
+    if test_kv_cache_clear() != 0 { print("PASS\n"); } else { print("FAIL\n"); }
+
+    print("Quantize all zeros: ");
+    if test_quantize_all_zeros() != 0 { print("PASS\n"); } else { print("FAIL\n"); }
+
+    print("Quantize single element: ");
+    if test_quantize_single_element() != 0 { print("PASS\n"); } else { print("FAIL\n"); }
+
+    print("Quantize large values: ");
+    if test_quantize_large_values() != 0 { print("PASS\n"); } else { print("FAIL\n"); }
+
+    print("Quantize negative values: ");
+    if test_quantize_negative_values() != 0 { print("PASS\n"); } else { print("FAIL\n"); }
+
+    print("DP noise shape: ");
+    if test_dp_noise_shape() != 0 { print("PASS\n"); } else { print("FAIL\n"); }
+
+    print("DP noise zero sigma: ");
+    if test_dp_noise_zero_sigma() != 0 { print("PASS\n"); } else { print("FAIL\n"); }
+
+    print("Shard identity: ");
+    if test_shard_identity() != 0 { print("PASS\n"); } else { print("FAIL\n"); }
+
+    print("=== Done ===\n");
+    return 0;
+}

@@ -104,13 +104,18 @@ fn tokenize(src: &str) -> Vec<FTok> {
         if c == '/' && i + 1 < n && chars[i + 1] == '*' {
             let start = i;
             i += 2;
-            while i + 1 < n && !(chars[i] == '*' && chars[i + 1] == '/') {
-                i += 1;
-            }
-            if i + 1 < n {
-                i += 2; // consume closing */
-            } else {
-                i = n;
+            // Issue 39: Handle nested block comments (e.g. /* outer /* inner */ still */)
+            let mut depth = 1;
+            while i + 1 < n && depth > 0 {
+                if chars[i] == '/' && chars[i + 1] == '*' {
+                    depth += 1;
+                    i += 2;
+                } else if chars[i] == '*' && chars[i + 1] == '/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
             let text: String = chars[start..i].iter().collect();
             out.push(FTok::BlockComment(text.trim_end().to_string()));
@@ -152,12 +157,34 @@ fn tokenize(src: &str) -> Vec<FTok> {
         }
 
         // f-string: f"..." (and f'...' not supported by lexer, only f")
+        // Issue 39: Handle nested { } expressions with depth tracking, matching
+        // the main lexer. This prevents premature termination when an expression
+        // contains a " inside an interpolation block like f"{a["b"]}".
         if c == 'f' && i + 1 < n && chars[i + 1] == '"' {
             let start = i;
             i += 2; // consume f"
             while i < n && chars[i] != '"' {
                 if chars[i] == '\\' && i + 1 < n {
                     i += 2;
+                } else if chars[i] == '{' {
+                    // Interpolation expression: skip until matching } (with nesting)
+                    let mut depth = 1;
+                    i += 1;
+                    while i < n && depth > 0 {
+                        if chars[i] == '{' {
+                            depth += 1;
+                        } else if chars[i] == '}' {
+                            depth -= 1;
+                            if depth == 0 {
+                                i += 1;
+                                break;
+                            }
+                        } else if chars[i] == '\\' && i + 1 < n {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                    }
                 } else {
                     i += 1;
                 }

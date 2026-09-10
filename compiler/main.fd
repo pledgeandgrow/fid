@@ -75,9 +75,11 @@ pub fn main() -> i64 {
             var bval: str = str_substring_from(garg, 11);
             match borrowck_mode_parse(bval) {
                 OptBorrowckMode::Some(mode) => {
-                    if mode == BorrowckMode::Off { g_borrowck = "off"; }
-                    if mode == BorrowckMode::Warn { g_borrowck = "warn"; }
-                    if mode == BorrowckMode::On { g_borrowck = "on"; }
+                    match mode {
+                        BorrowckMode::Off => { g_borrowck = "off"; }
+                        BorrowckMode::Warn => { g_borrowck = "warn"; }
+                        BorrowckMode::On => { g_borrowck = "on"; }
+                    }
                 }
                 OptBorrowckMode::None => {
                     p_eprint_str("Invalid --borrowck value '");
@@ -392,7 +394,7 @@ fn cmd_dump_c(n: i64, start: i64) -> i64 {
         p_eprint_str("\n");
         return 1;
     }
-    var result: ResultStr = ccompile_source_with_path(source, input);
+    var result: ResultStr = ccompile_source_with_path(source, input, "on");
     match result {
         ResultStr::Ok(c_code) => {
             print(c_code);
@@ -634,10 +636,8 @@ fn cmd_run(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     // Convert max_memory from MB to bytes
     var max_memory_bytes: i64 = max_memory * 1048576;
 
-    // G8.2: Wire --borrowck mode into the compiler pipeline
-    set_borrowck_mode(g_borrowck);
-
-    return interpret_source_with_path(source, input, max_recursion, max_steps, max_memory_bytes, verbose);
+    // G8.2: Pass borrowck mode through the pipeline (globals don't persist in C codegen)
+    return interpret_source_with_path(source, input, max_recursion, max_steps, max_memory_bytes, verbose, g_borrowck);
 }
 
 // --- test ----------------------------------------------------------------
@@ -806,7 +806,7 @@ fn cmd_test(n: i64, start: i64) -> i64 {
 
         // -- Backend 1: C codegen --
         var c_ok: bool = false;
-        var result: ResultStr = ccompile_source_with_path(source, test_path);
+        var result: ResultStr = ccompile_source_with_path(source, test_path, "on");
         match result {
             ResultStr::Ok(c_code) => {
                 var c_file: str = "_fides_test_tmp.c";
@@ -952,7 +952,7 @@ fn cmd_bench(n: i64, start: i64) -> i64 {
     }
 
     // Compile to C
-    var result: ResultStr = ccompile_source_with_path(source, input);
+    var result: ResultStr = ccompile_source_with_path(source, input, "on");
     match result {
         ResultStr::Ok(c_code) => {
             var c_file: str = "_fides_bench_tmp.c";
@@ -1191,8 +1191,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         p_eprint_str(g_borrowck);
         p_eprint_str("\n");
     }
-    // G8.2: Wire --borrowck mode into the compiler pipeline
-    set_borrowck_mode(g_borrowck);
+    // G8.2: borrowck mode is passed through the pipeline via parameter
 
     p_eprint_str("[main] Reading source file: ");
     p_eprint_str(input);
@@ -1211,7 +1210,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         p_eprint_str("[main] C compilation tracing enabled\n");
     }
 
-    var result: ResultStr = ccompile_source_with_path(source, input);
+    var result: ResultStr = ccompile_source_with_path(source, input, g_borrowck);
     match result {
         ResultStr::Ok(c_code) => {
             p_eprint_str("[main] C code generated. Writing to file...\n");
@@ -1434,8 +1433,7 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         p_eprint_str(g_borrowck);
         p_eprint_str("\n");
     }
-    // G8.2: Wire --borrowck mode into the compiler pipeline
-    set_borrowck_mode(g_borrowck);
+    // G8.2: borrowck mode is passed through the pipeline via parameter
 
     p_eprint_str("[build] Reading source file: ");
     p_eprint_str(input);
@@ -1524,7 +1522,7 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         }
     }
 
-    var result: ResultProgram = build_program_with_path(source, OptStr::Some(input));
+    var result: ResultProgram = build_program_with_path_borrowck(source, OptStr::Some(input), g_borrowck);
     match result {
         ResultProgram::Err(errs) => {
             print("Compilation errors:\n");

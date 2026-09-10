@@ -435,6 +435,7 @@ impl Tensor {
 
 /// A KV cache for LLM attention — stores K and V tensors per layer.
 /// Bounded by max_seq_len with optional sliding window eviction.
+#[derive(Clone)]
 pub struct KvCache {
     /// K tensors per layer: shape [seq_len, head_dim]
     pub k_cache: Vec<Vec<f64>>,

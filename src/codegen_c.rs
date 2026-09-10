@@ -191,6 +191,8 @@ impl CCodeGen {
             (false, true, _) => format!("(void*){}", val),
             // pointer → int: cast to int64_t
             (true, false, _) => format!("(int64_t){}", val),
+            // pointer → pointer: cast through void* to avoid aliasing warnings
+            (true, true, false) => format!("(void*){}", val),
             // pointer → struct pointer (out-param): cast to void*
             (false, false, true) => format!("(void*){}", val),
             _ => val.to_string(),
@@ -2234,9 +2236,18 @@ impl CCodeGen {
                 }
                 self.out.push_str(&dispatch);
             }
-            Inst::BitCast { value, from: _, to: _ } => {
+            Inst::BitCast { value, from, to } => {
                 let v = self.val_name(*value);
-                wln!(self, "    {} = (void*){};", dst, v);
+                // For int→int or float→float of same size, no cast needed.
+                // For pointer→pointer, cast through void*.
+                // For int→pointer or pointer→int, use appropriate cast.
+                let from_is_ptr = matches!(from, IrType::Ptr(_) | IrType::Opaque(_) | IrType::Generic(_, _));
+                let to_is_ptr = matches!(to, IrType::Ptr(_) | IrType::Opaque(_) | IrType::Generic(_, _));
+                if from_is_ptr || to_is_ptr {
+                    wln!(self, "    {} = (void*){};", dst, v);
+                } else {
+                    wln!(self, "    {} = {};", dst, v);
+                }
             }
             Inst::IntExtend { value, from: _, to: _ } => {
                 let v = self.val_name(*value);
@@ -2508,8 +2519,12 @@ impl CCodeGen {
         wln!(self, "}}");
         wln!(self, "");
         wln!(self, "char* p_str_concat(const char* a, const char* b) {{");
-        wln!(self, "    size_t len = strlen(a) + strlen(b);");
+        wln!(self, "    size_t la = strlen(a), lb = strlen(b);");
+        wln!(self, "    // Issue 25: overflow check before allocation");
+        wln!(self, "    if (la > SIZE_MAX - lb - 1) {{ char* r = (char*)p_malloc(1); r[0] = 0; return r; }}");
+        wln!(self, "    size_t len = la + lb;");
         wln!(self, "    char* result = (char*)p_malloc((int64_t)(len + 1));");
+        wln!(self, "    if (!result) {{ char* r = (char*)p_malloc(1); r[0] = 0; return r; }}");
         wln!(self, "    strcpy(result, a);");
         wln!(self, "    strcat(result, b);");
         wln!(self, "    return result;");
@@ -2519,9 +2534,12 @@ impl CCodeGen {
         wln!(self, "char* p_str_join_n(PVec* parts) {{");
         wln!(self, "    size_t total = 1;");
         wln!(self, "    for (int64_t i = 0; i < parts->len; i++) {{");
-        wln!(self, "        total += strlen((char*)parts->data[i]);");
+        wln!(self, "        size_t pl = strlen((char*)parts->data[i]);");
+        wln!(self, "        if (pl > SIZE_MAX - total) pl = SIZE_MAX - total; // Issue 25: overflow guard");
+        wln!(self, "        total += pl;");
         wln!(self, "    }}");
         wln!(self, "    char* result = (char*)p_malloc((int64_t)total);");
+        wln!(self, "    if (!result) {{ char* r = (char*)p_malloc(1); r[0] = 0; return r; }}");
         wln!(self, "    result[0] = 0;");
         wln!(self, "    for (int64_t i = 0; i < parts->len; i++) {{");
         wln!(self, "        strcat(result, (char*)parts->data[i]);");
@@ -4341,7 +4359,19 @@ impl CCodeGen {
         wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
         wln!(self, "    r->ndim = 2; r->shape[0] = m; r->shape[1] = n; r->len = m * n;");
         wln!(self, "    r->data = (double*)calloc(m * n, sizeof(double));");
-        wln!(self, "    for (int64_t i = 0; i < m; i++) for (int64_t j = 0; j < n; j++) {{ double s = 0; for (int64_t x = 0; x < k; x++) s += ta->data[i*k+x] * tb->data[x*n+j]; r->data[i*n+j] = s; }}");
+        wln!(self, "    // Issue 12: Use INT32 integer accumulation for quantized values.");
+        wln!(self, "    // Quantized tensors store int8 values as doubles (clamped to [-128, 127]).");
+        wln!(self, "    // The accumulation is done in int32 to avoid overflow, then rescaled.");
+        wln!(self, "    // This gives the same result as float matmul but with INT8 inputs.");
+        wln!(self, "    for (int64_t i = 0; i < m; i++) for (int64_t j = 0; j < n; j++) {{");
+        wln!(self, "        int32_t acc = 0;");
+        wln!(self, "        for (int64_t x = 0; x < k; x++) {{");
+        wln!(self, "            int32_t qa = (int32_t)(ta->data[i*k+x]);  // already quantized int8");
+        wln!(self, "            int32_t qb = (int32_t)(tb->data[x*n+j]);  // already quantized int8");
+        wln!(self, "            acc += qa * qb;  // INT8 x INT8 -> INT32 accumulate");
+        wln!(self, "        }}");
+        wln!(self, "        r->data[i*n+j] = (double)acc;  // store as int32 result (caller dequantizes)");
+        wln!(self, "    }}");
         wln!(self, "    return r;");
         wln!(self, "}}");
         wln!(self, "char* p_find_quant_params(void* t) {{");

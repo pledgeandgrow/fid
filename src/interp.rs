@@ -282,10 +282,10 @@ pub struct Interpreter {
     /// When set, persist state is loaded on startup and saved on exit.
     persist_state_file: Option<std::path::PathBuf>,
     /// Transaction snapshot stack — for `txn {}` rollback.
-    /// Each entry is a snapshot of (memory, opaque_values) taken at TxnBegin.
+    /// Each entry is a snapshot of (memory, opaque_values, kv_caches) taken at TxnBegin.
     /// On TxnEnd, the top snapshot is discarded (commit).
     /// On panic, the top snapshot is restored (rollback).
-    txn_snapshots: Vec<(Memory, HashMap<u64, Value>)>,
+    txn_snapshots: Vec<(Memory, HashMap<u64, Value>, Vec<Rc<RefCell<crate::tensor::KvCache>>>)>,
     /// Functions annotated with @wrapping — use wrap-around arithmetic instead
     /// of checked arithmetic (F65). Checked arithmetic is the default (F64).
     wrapping_funcs: HashSet<String>,
@@ -1217,9 +1217,11 @@ impl Interpreter {
                         };
                         // Transaction rollback: if we're inside a txn block,
                         // restore the most recent snapshot before propagating.
-                        if let Some((mem_snap, opaque_snap)) = self.txn_snapshots.pop() {
+                        if let Some((mem_snap, opaque_snap, kv_snap)) = self.txn_snapshots.pop() {
                             self.memory = mem_snap;
                             self.opaque_values = opaque_snap;
+                            // Issue 10: Restore KV cache state (lengths, contents, metadata)
+                            self.kv_caches = kv_snap;
                         }
                         cleanup_and_return!(RunResult::Panic(msg));
                     }
@@ -2109,10 +2111,15 @@ impl Interpreter {
                 ExecOutcome::Continue
             }
             Inst::TxnBegin => {
-                // Snapshot memory and opaque values for potential rollback
+                // Snapshot memory, opaque values, and KV cache state for potential rollback
                 let mem_snapshot = self.memory.clone();
                 let opaque_snapshot = self.opaque_values.clone();
-                self.txn_snapshots.push((mem_snapshot, opaque_snapshot));
+                // Issue 10: Include KV cache state in the snapshot so rollback
+                // restores lengths, contents, and metadata.
+                let kv_snapshot = self.kv_caches.iter()
+                    .map(|c| Rc::new(RefCell::new(c.borrow().clone())))
+                    .collect();
+                self.txn_snapshots.push((mem_snapshot, opaque_snapshot, kv_snapshot));
                 ExecOutcome::Continue
             }
             Inst::TxnEnd => {
@@ -4209,13 +4216,38 @@ impl Interpreter {
                 }
             }
             "p_qmatmul" => {
-                // Quantized matmul: q8 × q8 → f32
-                // Dequantizes inputs, computes matmul, returns f32 result
+                // Issue 12: Quantized matmul using INT32 accumulation.
+                // Inputs are quantized int8 values stored as doubles.
+                // Accumulates in int32, returns int32 result as doubles.
+                // Caller must dequantize with the appropriate scale.
                 if let (Some(Value::Tensor(a)), Some(Value::Tensor(b))) = (args.get(0), args.get(1)) {
-                    match a.borrow().matmul(&b.borrow()) {
-                        Ok(result) => ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(result)))),
-                        Err(e) => ExecOutcome::Panic(format!("qmatmul: {}", e)),
+                    let a_t = a.borrow();
+                    let b_t = b.borrow();
+                    if a_t.ndim() != 2 || b_t.ndim() != 2 {
+                        return ExecOutcome::Panic("qmatmul: expected 2D tensors".to_string());
                     }
+                    let m = a_t.shape[0];
+                    let k = a_t.shape[1];
+                    let n = b_t.shape[1];
+                    if b_t.shape[0] != k {
+                        return ExecOutcome::Panic(format!(
+                            "qmatmul: shape mismatch: ({},{}) x ({},{})",
+                            m, k, b_t.shape[0], n
+                        ));
+                    }
+                    let mut result = crate::tensor::Tensor::zeros(vec![m, n]);
+                    for i in 0..m {
+                        for j in 0..n {
+                            let mut acc: i32 = 0;
+                            for x in 0..k {
+                                let qa = a_t.data[i * k + x] as i32;
+                                let qb = b_t.data[x * n + j] as i32;
+                                acc = acc.wrapping_add(qa.wrapping_mul(qb));
+                            }
+                            result.data[i * n + j] = acc as f64;
+                        }
+                    }
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(result))))
                 } else {
                     ExecOutcome::Panic("qmatmul: expected (Tensor, Tensor)".to_string())
                 }

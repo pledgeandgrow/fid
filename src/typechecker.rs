@@ -95,6 +95,9 @@ pub struct TypeChecker {
     current_type_param_bounds: HashMap<String, String>,
     /// Trait definitions: trait_name -> {method_name -> (params, ret_ty, has_self)}
     traits: HashMap<String, HashMap<String, (Vec<Type>, Type, bool)>>,
+    /// Issue 37: Source line (1-based) of each top-level item — for LSP go-to-definition.
+    /// 0 means unknown (synthetic / desugared item).
+    item_lines: HashMap<String, usize>,
     /// Trait associated type declarations: trait_name -> {assoc_type_name}
     trait_assoc_types: HashMap<String, HashSet<String>>,
     /// Trait impl associated type bindings: (trait_name, type_name) -> {assoc_name -> concrete_type}
@@ -212,6 +215,7 @@ impl TypeChecker {
             trait_impl_assoc_bindings: HashMap::new(),
             item_modules: HashMap::new(),
             item_visibility: HashMap::new(),
+            item_lines: HashMap::new(),
             module_functions: HashMap::new(),
             field_visibility: HashMap::new(),
             struct_modules: HashMap::new(),
@@ -687,6 +691,7 @@ impl TypeChecker {
             self.item_modules.insert(s.name.clone(), module.to_string());
             self.item_visibility.insert(s.name.clone(), s.is_pub);
             self.struct_modules.insert(s.name.clone(), module.to_string());
+            self.item_lines.insert(s.name.clone(), s.line);
             // Register field-level visibility
             for f in &s.fields {
                 self.field_visibility.insert((s.name.clone(), f.name.clone()), f.is_pub);
@@ -709,6 +714,7 @@ impl TypeChecker {
             self.enums.insert(e.name.clone());
             self.item_modules.insert(e.name.clone(), module.to_string());
             self.item_visibility.insert(e.name.clone(), e.is_pub);
+            self.item_lines.insert(e.name.clone(), e.line);
             let variants: Vec<(String, Vec<Type>)> = e.variants.iter().map(|v| {
                 let tys = v.data.as_ref()
                     .map(|params| params.iter().map(|p| p.ty.clone()).collect())
@@ -723,6 +729,7 @@ impl TypeChecker {
             self.consts.insert(c.name.clone(), c.ty.clone());
             self.item_modules.insert(c.name.clone(), module.to_string());
             self.item_visibility.insert(c.name.clone(), c.is_pub);
+            self.item_lines.insert(c.name.clone(), c.line);
         }
 
         for g in &program.globals {
@@ -745,6 +752,7 @@ impl TypeChecker {
             self.funcs.insert(func.name.clone(), (param_types, self.resolve_type(&func.ret_ty)));
             self.item_modules.insert(func.name.clone(), module.to_string());
             self.item_visibility.insert(func.name.clone(), func.is_pub);
+            self.item_lines.insert(func.name.clone(), func.line);
         }
 
         // Register extern function declarations
@@ -1254,6 +1262,53 @@ impl TypeChecker {
     ///   - Not call dequantize_q8 (that would defeat the purpose of quantization)
     ///   - Only use quantized ops (qmatmul, quantize_q8) or pure ops
     fn verify_quantized(&mut self, program: &Program) {
+        // Issue 15: Build transitive call graph so we can check if any
+        // function reachable from a @quantized function calls dequantize_q8.
+        // This prevents bypassing the check via helper functions.
+        let mut func_map: HashMap<String, &Func> = HashMap::new();
+        for f in &program.funcs {
+            func_map.insert(f.name.clone(), f);
+        }
+        for imp in &program.impls {
+            for m in &imp.methods {
+                func_map.insert(m.name.clone(), m);
+            }
+        }
+        for ti in &program.trait_impls {
+            for m in &ti.methods {
+                func_map.insert(m.name.clone(), m);
+            }
+        }
+
+        // For each function, compute the transitive set of all callees.
+        // Returns true if `dequantize_q8` or `p_dequantize_q8` is reachable.
+        let transitive_calls_dequant = |func_name: &str, func_map: &HashMap<String, &Func>| -> bool {
+            let mut visited: HashSet<String> = HashSet::new();
+            let mut stack: Vec<String> = vec![func_name.to_string()];
+            while let Some(cur) = stack.pop() {
+                if !visited.insert(cur.clone()) {
+                    continue;
+                }
+                if let Some(f) = func_map.get(&cur) {
+                    let mut calls = HashSet::new();
+                    scan_stmts_for_calls(&f.body, &mut calls);
+                    for c in &calls {
+                        if c == "dequantize_q8" || c == "p_dequantize_q8" {
+                            return true;
+                        }
+                        // Only recurse into non-@quantized helpers (quantized
+                        // helpers are already checked themselves, but if they
+                        // call dequant they'd be rejected — so we still need
+                        // to check them transitively for soundness).
+                        if func_map.contains_key(c) {
+                            stack.push(c.clone());
+                        }
+                    }
+                }
+            }
+            false
+        };
+
         let check_one = |func: &Func| -> Vec<String> {
             let is_quant = func.annotations.iter().any(|a| a.name == "quantized");
             if !is_quant { return Vec::new(); }
@@ -1278,12 +1333,12 @@ impl TypeChecker {
                 }
             }
 
-            // Check for dequantize_q8 calls — these defeat quantization
-            let mut found_dequant = false;
-            scan_for_calls(&func.body, &mut found_dequant, "dequantize_q8");
-            if found_dequant {
+            // Check for dequantize_q8 calls — these defeat quantization.
+            // Issue 15: Check transitively — a @quantized function that calls
+            // a helper which calls dequantize_q8 should also be rejected.
+            if transitive_calls_dequant(&func.name, &func_map) {
                 errs.push(format!(
-                    "Quantization error: function '{}' is @quantized but calls dequantize_q8.\n\
+                    "Quantization error: function '{}' is @quantized but (transitively) calls dequantize_q8.\n\
                      \x20\x20\x20\x20Dequantizing inside a @quantized function defeats the purpose of quantization\n\
                      \x20\x20\x20\x20(it silently falls back to float, losing the INT8 performance benefit).\n\
                      \x20\x20\x20\x20Fix: use qmatmul for quantized matmul, or remove the @quantized annotation.",
@@ -2079,6 +2134,7 @@ impl TypeChecker {
                     "no-indirect" => { primitives.insert("no-indirect"); }
                     "requires-audit" => { primitives.insert("requires-audit"); }
                     "bounded-stack" => { primitives.insert("bounded-stack"); }
+                    "bounded" => { primitives.insert("bounded"); }
                     "firmware" => { primitives.insert("firmware"); }
                     "simd" => { /* F23: @simd — recognized but no safety primitives */ }
                     "zeroize" => { /* F88: @zeroize — recognized but no safety primitives */ }
@@ -2371,6 +2427,26 @@ impl TypeChecker {
                          \x20\x20\x20\x20Fix: replace 'while cond {{ ... }}' with 'for i in 0..N {{ ... }}',\n\
                          \x20\x20\x20\x20or remove the safety annotation.",
                         label, line, func_name
+                    ));
+                }
+            }
+
+            // @bounded: prove all loops terminate.
+            // for loops: always OK (bounded by collection/range).
+            // while loops: OK only if body contains a decreasing assignment
+            //   to a variable used in the condition (e.g., n = n - 1, n -= 1).
+            // loop loops: always unbounded (no condition).
+            if prims.contains("bounded") {
+                let mut unbounded_sites = Vec::new();
+                scan_for_unbounded_loops(stmts, &mut unbounded_sites);
+                for (line, reason) in unbounded_sites {
+                    errs.push(format!(
+                        "Safety error ({}) (line {}): function '{}' is @bounded but has an unbounded loop.\n\
+                         \x20\x20\x20\x20{}\n\
+                         \x20\x20\x20\x20Fix: use a 'for' loop over a finite range, or ensure the 'while' loop\n\
+                         \x20\x20\x20\x20body decrements a variable used in the condition (e.g., n = n - 1),\n\
+                         \x20\x20\x20\x20or remove the @bounded annotation.",
+                        label, line, func_name, reason
                     ));
                 }
             }
@@ -4139,6 +4215,17 @@ impl TypeChecker {
         &self.traits
     }
 
+    /// Issue 37: Get the source line (1-based) of a top-level item by name.
+    /// Returns 0 if the item is synthetic or unknown.
+    pub fn get_item_line(&self, name: &str) -> usize {
+        self.item_lines.get(name).copied().unwrap_or(0)
+    }
+
+    /// Issue 37: Get the module an item belongs to, by name.
+    pub fn get_item_module(&self, name: &str) -> Option<&str> {
+        self.item_modules.get(name).map(|s| s.as_str())
+    }
+
     /// Mark a variable as consumed (moved). If it's already consumed, error.
     fn consume_var(&mut self, name: &str, line: usize) {
         if self.loop_depth > 0 {
@@ -4379,6 +4466,21 @@ impl TypeChecker {
                     let size = self.type_size(&final_ty);
                     if let Some(entry) = self.region_budgets.last_mut() {
                         entry.2 += size;
+                    }
+                    // Issue 9: KV cache region budget — p_kv_cache_new allocates
+                    // num_layers * max_seq_len * head_dim * 2 * 8 bytes (K+V, f64 each).
+                    // The typechecker only sees the i64 handle, not the actual allocation.
+                    // Estimate the allocation from the call arguments.
+                    if let Expr::Call { callee, args } = expr {
+                        if (callee == "p_kv_cache_new" || callee == "kv_cache_new") && args.len() == 4 {
+                            // Try to evaluate args as constant integers
+                            let estimate = estimate_kv_cache_size(args);
+                            if let Some(est) = estimate {
+                                if let Some(entry) = self.region_budgets.last_mut() {
+                                    entry.2 += est;
+                                }
+                            }
+                        }
                     }
                 }
                 // Track linear variables — they must be consumed before scope exit
@@ -7526,6 +7628,36 @@ fn scan_for_calls(stmts: &[Stmt], found: &mut bool, target: &str) {
     *found = calls.contains(target) || calls.contains(&format!("p_{}", target));
 }
 
+/// Issue 9: Estimate KV cache allocation size from p_kv_cache_new arguments.
+/// p_kv_cache_new(num_layers, max_seq_len, window_size, head_dim) allocates
+/// num_layers * max_seq_len * head_dim * 2 * 8 bytes (K+V tensors, f64 each).
+/// Returns None if arguments can't be evaluated as constants.
+fn estimate_kv_cache_size(args: &[Expr]) -> Option<u64> {
+    let mut vals = Vec::new();
+    for arg in args {
+        let v = match arg {
+            Expr::IntLit(n) => Some(*n as u64),
+            Expr::Ident(name) => {
+                // Could look up const values, but for now only handle literals
+                let _ = name;
+                None
+            }
+            _ => None,
+        };
+        vals.push(v?);
+    }
+    if vals.len() != 4 {
+        return None;
+    }
+    // num_layers * max_seq_len * head_dim * 2 (K+V) * 8 (bytes per f64)
+    let total = vals[0]
+        .checked_mul(vals[1])?
+        .checked_mul(vals[2])?
+        .checked_mul(2)?
+        .checked_mul(8)?;
+    Some(total)
+}
+
 /// Scan function body statements for floating-point usage.
 /// Returns a list of descriptions of where floats were found.
 fn scan_for_floats(stmts: &[Stmt]) -> Vec<String> {
@@ -7936,6 +8068,205 @@ fn scan_stmt_for_while(stmt: &Stmt, sites: &mut Vec<usize>) {
             if let Some(e) = e { scan_expr_for_while(e, sites); }
         }
         _ => {}
+    }
+}
+
+/// F46: @bounded — Scan for loops that cannot be proven to terminate.
+/// Returns (line, reason) pairs for each unbounded loop.
+/// - `for` loops: always OK (bounded by collection/range size)
+/// - `while` loops: OK only if body decrements a variable used in condition
+/// - `loop` loops: always unbounded (no exit condition)
+fn scan_for_unbounded_loops(stmts: &[Stmt], sites: &mut Vec<(usize, String)>) {
+    for stmt in stmts {
+        scan_stmt_for_unbounded(stmt, sites);
+    }
+}
+
+fn scan_stmt_for_unbounded(stmt: &Stmt, sites: &mut Vec<(usize, String)>) {
+    match stmt {
+        Stmt::While { cond, body, line } => {
+            // Extract variable names from the condition
+            let cond_vars = extract_vars_from_expr(cond);
+            // Check if the body decrements any of those variables
+            let mut has_decreasing = false;
+            for cv in &cond_vars {
+                if body_decreases_var(body, cv) {
+                    has_decreasing = true;
+                    break;
+                }
+            }
+            if !has_decreasing {
+                sites.push((*line,
+                    "while loop has no decreasing iterator in body — cannot prove termination.".to_string()));
+            }
+            // Recurse into body
+            for s in body { scan_stmt_for_unbounded(s, sites); }
+        }
+        Stmt::Loop { body, line } => {
+            // loop { } is always unbounded unless it contains a break
+            // with a constant condition — but we conservatively reject
+            if !body.iter().any(|s| matches!(s, Stmt::Break(_, _))) {
+                sites.push((*line,
+                    "loop { } has no break — infinite loop.".to_string()));
+            }
+            for s in body { scan_stmt_for_unbounded(s, sites); }
+        }
+        Stmt::For { iterator, body, .. } => {
+            // for loops are bounded by the collection/range — always OK
+            scan_expr_for_unbounded(iterator, sites);
+            for s in body { scan_stmt_for_unbounded(s, sites); }
+        }
+        Stmt::If { cond, then_block, else_block, .. } => {
+            scan_expr_for_unbounded(cond, sites);
+            for s in then_block { scan_stmt_for_unbounded(s, sites); }
+            if let Some(eb) = else_block {
+                for s in eb { scan_stmt_for_unbounded(s, sites); }
+            }
+        }
+        Stmt::Defer(stmts, _) => {
+            for s in stmts { scan_stmt_for_unbounded(s, sites); }
+        }
+        Stmt::Match { expr, arms, .. } => {
+            scan_expr_for_unbounded(expr, sites);
+            for arm in arms {
+                for s in &arm.body { scan_stmt_for_unbounded(s, sites); }
+            }
+        }
+        Stmt::RegionBlock { body, .. } | Stmt::Sandbox { body, .. } | Stmt::Unsafe { body, .. } | Stmt::Txn { body, .. } => {
+            for s in body { scan_stmt_for_unbounded(s, sites); }
+        }
+        Stmt::GradBlock { body, .. } => {
+            for s in body { scan_stmt_for_unbounded(s, sites); }
+        }
+        Stmt::ComptimeGen { block, .. } => {
+            for s in block { scan_stmt_for_unbounded(s, sites); }
+        }
+        Stmt::Let { expr, .. } | Stmt::LetTuple { expr, .. } => scan_expr_for_unbounded(expr, sites),
+        Stmt::Expr(e, _) => scan_expr_for_unbounded(e, sites),
+        Stmt::Assign { expr, .. } => scan_expr_for_unbounded(expr, sites),
+        Stmt::Return(e, _) => {
+            if let Some(e) = e { scan_expr_for_unbounded(e, sites); }
+        }
+        _ => {}
+    }
+}
+
+fn scan_expr_for_unbounded(expr: &Expr, sites: &mut Vec<(usize, String)>) {
+    match expr {
+        Expr::Closure { body, .. } => {
+            for s in body { scan_stmt_for_unbounded(s, sites); }
+        }
+        Expr::Binary { left, right, .. } => {
+            scan_expr_for_unbounded(left, sites);
+            scan_expr_for_unbounded(right, sites);
+        }
+        Expr::Call { args, .. } => {
+            for a in args { scan_expr_for_unbounded(a, sites); }
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            scan_expr_for_unbounded(receiver, sites);
+            for a in args { scan_expr_for_unbounded(a, sites); }
+        }
+        Expr::If { cond, then_block, else_block, .. } => {
+            scan_expr_for_unbounded(cond, sites);
+            for s in then_block { scan_stmt_for_unbounded(s, sites); }
+            if let Some(eb) = else_block {
+                for s in eb { scan_stmt_for_unbounded(s, sites); }
+            }
+        }
+        Expr::Match { expr, arms, .. } => {
+            scan_expr_for_unbounded(expr, sites);
+            for arm in arms {
+                if let Some(ref guard) = arm.guard {
+                    scan_expr_for_unbounded(guard, sites);
+                }
+                for s in &arm.body { scan_stmt_for_unbounded(s, sites); }
+            }
+        }
+        Expr::Block(stmts) => {
+            for s in stmts { scan_stmt_for_unbounded(s, sites); }
+        }
+        _ => {}
+    }
+}
+
+/// Extract variable names referenced in an expression.
+fn extract_vars_from_expr(expr: &Expr) -> Vec<String> {
+    let mut vars = Vec::new();
+    collect_vars(expr, &mut vars);
+    vars
+}
+
+fn collect_vars(expr: &Expr, vars: &mut Vec<String>) {
+    match expr {
+        Expr::Ident(name) => {
+            if !vars.contains(name) {
+                vars.push(name.clone());
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_vars(left, vars);
+            collect_vars(right, vars);
+        }
+        Expr::Unary { expr, .. } => collect_vars(expr, vars),
+        Expr::FieldAccess { expr, .. } => collect_vars(expr, vars),
+        Expr::Index { array, index, .. } => {
+            collect_vars(array, vars);
+            collect_vars(index, vars);
+        }
+        Expr::Call { args, .. } => {
+            for a in args { collect_vars(a, vars); }
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            collect_vars(receiver, vars);
+            for a in args { collect_vars(a, vars); }
+        }
+        _ => {}
+    }
+}
+
+/// Check if a loop body contains an assignment that decreases `var`.
+/// Recognized patterns:
+///   var = var - 1      (SubAssign or Assign with Sub)
+///   var -= 1           (SubAssign)
+///   var = var - k      (SubAssign or Assign with Sub, k is any expr)
+fn body_decreases_var(stmts: &[Stmt], var: &str) -> bool {
+    for stmt in stmts {
+        if stmt_decreases_var(stmt, var) {
+            return true;
+        }
+    }
+    false
+}
+
+fn stmt_decreases_var(stmt: &Stmt, var: &str) -> bool {
+    match stmt {
+        Stmt::Assign { target, op, expr, .. } => {
+            if target == var {
+                // var -= expr  → decreasing
+                if matches!(op, AssignOp::SubAssign) {
+                    return true;
+                }
+                // var = var - expr  → decreasing
+                if matches!(op, AssignOp::Assign) {
+                    if let Expr::Binary { left, op: BinOp::Sub, .. } = expr {
+                        if let Expr::Ident(name) = left.as_ref() {
+                            if name == var {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        }
+        Stmt::If { then_block, else_block, .. } => {
+            // Check both branches — both must decrease (conservative)
+            let then_dec = body_decreases_var(then_block, var);
+            let else_dec = else_block.as_ref().map(|eb| body_decreases_var(eb, var)).unwrap_or(true);
+            then_dec && else_dec
+        }
+        _ => false
     }
 }
 

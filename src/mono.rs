@@ -680,7 +680,13 @@ struct MonoCtx {
     seen: HashSet<String>,
     /// Trait impl associated type bindings: (trait_name, type_name) -> {assoc_name -> concrete_type}
     trait_assoc_bindings: HashMap<(String, String), HashMap<String, Type>>,
+    /// Issue 26: Current instantiation depth — prevent stack overflow on recursive generics
+    depth: usize,
 }
+
+/// Issue 26: Maximum monomorphization depth. Prevents stack overflow on
+/// pathological recursive generic instantiation (e.g. `fn f<T>() { f<T>() }`).
+const MAX_MONO_DEPTH: usize = 64;
 
 /// Main monomorphization entry point
 pub fn monomorphize(program: &Program) -> Program {
@@ -702,6 +708,7 @@ pub fn monomorphize(program: &Program) -> Program {
         instantiated: Vec::new(),
         seen: HashSet::new(),
         trait_assoc_bindings: HashMap::new(),
+        depth: 0,
     };
 
     // Register trait impl associated type bindings
@@ -1011,12 +1018,42 @@ fn process_func(func: &Func, ctx: &mut MonoCtx) -> Func {
         preconditions: func.preconditions.clone(),
         postconditions: func.postconditions.clone(),
         is_async: func.is_async,
+        line: func.line,
     }
 }
 
 /// Instantiate a generic function with a concrete substitution.
 /// Recursively processes the instantiated body to handle nested generic calls.
 fn instantiate(gen_func: &Func, subst: &Subst, mangled_name: &str, ctx: &mut MonoCtx) -> Func {
+    // Issue 26: Prevent stack overflow from recursive generic instantiation
+    ctx.depth += 1;
+    if ctx.depth > MAX_MONO_DEPTH {
+        ctx.depth -= 1;
+        eprintln!("warning: monomorphization depth limit exceeded for {} (depth > {})", mangled_name, MAX_MONO_DEPTH);
+        return Func {
+            name: mangled_name.to_string(),
+            type_params: Vec::new(),
+            type_param_bounds: Vec::new(),
+            const_params: Vec::new(),
+            params: gen_func.params.iter().map(|p| {
+                let substituted = subst_type(&p.ty, subst);
+                Param { name: p.name.clone(), ty: substituted, is_pub: p.is_pub, annotations: p.annotations.clone() }
+            }).collect(),
+            ret_ty: subst_type(&gen_func.ret_ty, subst),
+            body: Vec::new(),
+            is_pub: gen_func.is_pub,
+            is_comptime: false,
+            declared_effects: gen_func.declared_effects.clone(),
+            has_effect_annotation: gen_func.has_effect_annotation,
+            is_interrupt: gen_func.is_interrupt,
+            annotations: gen_func.annotations.clone(),
+            preconditions: gen_func.preconditions.clone(),
+            postconditions: gen_func.postconditions.clone(),
+            is_async: gen_func.is_async,
+            line: gen_func.line,
+        };
+    }
+
     // Apply substitution to params, then resolve associated types
     let new_params: Vec<Param> = gen_func.params.iter().map(|p| {
         let substituted = subst_type(&p.ty, subst);
@@ -1050,12 +1087,15 @@ fn instantiate(gen_func: &Func, subst: &Subst, mangled_name: &str, ctx: &mut Mon
         preconditions: gen_func.preconditions.clone(),
         postconditions: gen_func.postconditions.clone(),
         is_async: gen_func.is_async,
+        line: gen_func.line,
     };
 
     // Now process this concrete function — it may contain calls to other generics
     // which need to be instantiated and have their call sites rewritten.
     // process_func will handle nested generic calls recursively.
-    process_func(&temp_func, ctx)
+    let result = process_func(&temp_func, ctx);
+    ctx.depth -= 1;
+    result
 }
 
 /// Walk statements to find calls to generic functions and infer arg types

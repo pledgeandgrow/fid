@@ -590,6 +590,7 @@ fn desugar_layers_models(program: &mut Program) {
             is_pub: layer.is_pub,
             annotations: Vec::new(),
             type_params: Vec::new(),
+            line: 0,
         });
 
         // Create impl block with forward method
@@ -631,6 +632,7 @@ fn desugar_layers_models(program: &mut Program) {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
             is_async: false,
+            line: 0,
         });
     }
 
@@ -652,6 +654,7 @@ fn desugar_layers_models(program: &mut Program) {
             is_pub: model.is_pub,
             annotations: Vec::new(),
             type_params: Vec::new(),
+            line: 0,
         });
 
         // Create impl block with forward method
@@ -704,6 +707,7 @@ fn desugar_layers_models(program: &mut Program) {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
             is_async: false,
+            line: 0,
         });
     }
 }
@@ -730,6 +734,7 @@ fn desugar_phase8b(program: &mut Program) {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         is_async: false,
+        line: 0,
     };
 
     // ── F18: Desugar components → structs ──
@@ -740,6 +745,7 @@ fn desugar_phase8b(program: &mut Program) {
             is_pub: comp.is_pub,
             annotations: Vec::new(),
             type_params: Vec::new(),
+            line: 0,
         });
     }
 
@@ -771,6 +777,7 @@ fn desugar_phase8b(program: &mut Program) {
             variants,
             type_params: Vec::new(),
             is_pub: sm.is_pub,
+            line: 0,
         });
 
         // Create <SM>_initial() function — returns first state
@@ -1025,6 +1032,7 @@ fn fill_default_trait_methods(program: &mut Program) {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
             is_async: false,
+            line: 0,
             });
 
         }
@@ -1969,6 +1977,7 @@ fn process_derive(program: &mut Program) {
                             preconditions: Vec::new(),
                             postconditions: Vec::new(),
                             is_async: false,
+            line: 0,
                         };
                         generated.push(func);
                     } else if arg == "Clone" {
@@ -1991,6 +2000,7 @@ fn process_derive(program: &mut Program) {
                             preconditions: Vec::new(),
                             postconditions: Vec::new(),
                             is_async: false,
+            line: 0,
                         };
                         generated.push(func);
                     } else if arg == "Serialize" {
@@ -2020,6 +2030,7 @@ fn process_derive(program: &mut Program) {
                             preconditions: Vec::new(),
                             postconditions: Vec::new(),
                             is_async: false,
+            line: 0,
                         };
                         generated.push(func);
                     } else if arg == "Default" {
@@ -2050,6 +2061,7 @@ fn process_derive(program: &mut Program) {
                             preconditions: Vec::new(),
                             postconditions: Vec::new(),
                             is_async: false,
+            line: 0,
                         };
                         generated.push(func);
                     } else if arg == "Deserialize" {
@@ -2080,6 +2092,7 @@ fn process_derive(program: &mut Program) {
                             preconditions: Vec::new(),
                             postconditions: Vec::new(),
                             is_async: false,
+            line: 0,
                         };
                         generated.push(func);
                     } else if arg == "PartialEq" {
@@ -2135,6 +2148,7 @@ fn process_derive(program: &mut Program) {
                             preconditions: Vec::new(),
                             postconditions: Vec::new(),
                             is_async: false,
+            line: 0,
                         };
                         generated.push(func);
                     }

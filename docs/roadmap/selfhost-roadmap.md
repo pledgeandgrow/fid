@@ -467,7 +467,7 @@ fixpoint (stage2.c ≠ stage3.c).
 | B6 | **Polymorphic print/println dispatch** — Fides missing special cases for Vec/HashMap/f64/bool (Gap 10) | `src/codegen_c.rs:1643` | `compiler/codegen_c.fd:2102` | Fixpoint divergence | **AT PARITY** (already implemented) |
 | B7 | **Missing runtime sigs** — `p_malloc_persistent`, `p_arena_save`, `p_arena_restore` not registered (Gap 11) | `src/codegen_c.rs:594` | `compiler/codegen_c.fd:594` | Wrong calling convention | **AT PARITY** (already registered) |
 | B8 | **Vec method return type `word_repr`** — Self-hosted lowerer's type inference function returns `elem_ty` not `word_repr(elem_ty)` for Vec::get/pop/first/last/remove in the Generic branch | `src/lower.rs:4076` | `compiler/lower.fd:5837` | Missing Ptr(Struct) cast → wrong C type | **AT PARITY** (already fixed in lower_method_call; infer_expr_type matches Rust by design) |
-| B9 | **Async/await lowering** — Rust has 6 async + 5 await references; Fides has minimal support | `src/lower.rs` | `compiler/lower.fd` | Not used by compiler source | Open |
+| B9 | **Async/await lowering** — Rust has 6 async + 5 await references; Fides has minimal support | `src/lower.rs` | `compiler/lower.fd` | Not used by compiler source | **In Progress** — state machine struct infrastructure added (Issue 42) |
 | B10 | **Closure lowering** — Rust has 12 closure references; Fides has 7 | `src/lower.rs` | `compiler/lower.fd` | Not used by compiler source | Open |
 
 **Session 14 — Category B parity work (Sep 5, 2026):**

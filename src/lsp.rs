@@ -781,7 +781,8 @@ fn handle_hover(text: &str, line: usize, character: usize) -> JsonValue {
 }
 
 /// Handle textDocument/definition.
-/// Searches the source text for the definition of the word at the cursor.
+/// Uses the typechecker's symbol table (AST-based) to resolve definitions.
+/// Falls back to text search only for methods (which don't have line info yet).
 fn handle_definition(text: &str, uri: &str, line: usize, character: usize) -> JsonValue {
     let word = word_at_position(text, line, character);
     if word.is_empty() {
@@ -810,12 +811,54 @@ fn handle_definition(text: &str, uri: &str, line: usize, character: usize) -> Js
         return JsonValue::Null;
     }
 
-    // Search for the definition in the source text
+    // Issue 37: Use AST-based line info from the typechecker when available.
+    // The typechecker records the source line of each top-level item.
+    let item_line = tc.get_item_line(&word);
+    if item_line > 0 {
+        // Find the column of the identifier on that line.
+        // We look for the word as a whole word on the definition line.
+        let line_text = text.lines().nth(item_line.saturating_sub(1)).unwrap_or("");
+        if let Some(col) = find_ident_column(line_text, &word) {
+            return location_json(uri, item_line.saturating_sub(1), col, &word);
+        }
+        // Fallback: column 0 if we can't find the identifier on the line
+        return location_json(uri, item_line.saturating_sub(1), 0, &word);
+    }
+
+    // Fallback: text search for items without line info (e.g. synthetic items)
     if let Some((def_line, def_col)) = find_definition(text, &word, is_func) {
         return location_json(uri, def_line, def_col, &word);
     }
 
     JsonValue::Null
+}
+
+/// Find the 0-based column of `name` as a whole word in `line`.
+/// Used by handle_definition to pinpoint the identifier on a known definition line.
+fn find_ident_column(line: &str, name: &str) -> Option<usize> {
+    let mut search_from = 0;
+    while let Some(pos) = line[search_from..].find(name) {
+        let abs = search_from + pos;
+        // Check word boundary before
+        let ok_before = abs == 0 || {
+            let prev = line.chars().nth(abs.saturating_sub(1)).unwrap_or(' ');
+            !is_ident_char(prev)
+        };
+        // Check word boundary after
+        let after = abs + name.len();
+        let ok_after = after >= line.len() || {
+            let next = line.chars().nth(after).unwrap_or(' ');
+            !is_ident_char(next)
+        };
+        if ok_before && ok_after {
+            return Some(abs);
+        }
+        search_from = abs + 1;
+        if search_from >= line.len() {
+            break;
+        }
+    }
+    None
 }
 
 /// Handle textDocument/rename — find all occurrences of the symbol at the given

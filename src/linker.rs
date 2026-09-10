@@ -210,9 +210,14 @@ pub fn dead_code_elimination(
         .map(|(name, offset, size)| (name.clone(), (*offset, *size)))
         .collect();
 
+    // Issue 30: Track relocations that are NOT within any function's code range.
+    // These are typically in .data/.rodata sections (vtables, function pointer tables).
+    // Functions referenced by these relocations must be treated as roots (always reachable).
+    let mut external_roots: HashSet<String> = HashSet::new();
+
     for (offset, target) in relocations {
         // Find which symbol contains this relocation offset.
-        // If size is 0 (unknown), treat it as containing any relocation >= start.
+        let mut found_in_func = false;
         for (name, (start, size)) in &symbol_ranges {
             if *size == 0 {
                 // Unknown size: attribute to the nearest symbol at or before this offset
@@ -224,8 +229,15 @@ pub fn dead_code_elimination(
                     .entry(name.clone())
                     .or_default()
                     .push(target.clone());
+                found_in_func = true;
                 break;
             }
+        }
+        // Issue 30: If this relocation is NOT within any function's code range,
+        // it's likely in .data/.rodata (vtable, function pointer table).
+        // The target function must be treated as a root.
+        if !found_in_func {
+            external_roots.insert(target.clone());
         }
     }
 
@@ -260,6 +272,11 @@ pub fn dead_code_elimination(
     // BFS from entry point
     let mut reachable: HashSet<String> = HashSet::new();
     let mut queue: Vec<String> = vec![entry.to_string()];
+    // Issue 30: Add external roots (functions referenced from .data/.rodata)
+    // These are always reachable — they're called indirectly via vtables or function pointers.
+    for root in &external_roots {
+        queue.push(root.clone());
+    }
 
     while let Some(sym) = queue.pop() {
         if reachable.contains(&sym) {

@@ -299,6 +299,21 @@ impl Lexer {
                     '\\' => s.push('\\'),
                     '"' => s.push('"'),
                     '0' => s.push('\0'),
+                    // Issue 29: hex escape \xHH
+                    'x' => {
+                        let (ch, ok) = self.read_hex_escape(line, col);
+                        if ok { s.push(ch); }
+                    }
+                    // Issue 29: unicode escape \u{...}
+                    'u' => {
+                        if self.peek() == '{' {
+                            self.advance(); // consume {
+                            let (ch, ok) = self.read_unicode_escape(line, col);
+                            if ok { s.push(ch); }
+                        } else {
+                            self.errors.push(format!("Error:{}:{}: expected '{{' after \\u", line, col));
+                        }
+                    }
                     _ => {
                         self.errors.push(format!("Error:{}:{}: unknown escape sequence \\{}", line, col, esc));
                         s.push(esc);
@@ -355,6 +370,21 @@ impl Lexer {
                     '\\' => s.push('\\'),
                     '"' => s.push('"'),
                     '0' => s.push('\0'),
+                    // Issue 29: hex escape \xHH
+                    'x' => {
+                        let (ch, ok) = self.read_hex_escape(line, col);
+                        if ok { s.push(ch); }
+                    }
+                    // Issue 29: unicode escape \u{...}
+                    'u' => {
+                        if self.peek() == '{' {
+                            self.advance(); // consume {
+                            let (ch, ok) = self.read_unicode_escape(line, col);
+                            if ok { s.push(ch); }
+                        } else {
+                            self.errors.push(format!("Error:{}:{}: expected '{{' after \\u", line, col));
+                        }
+                    }
                     _ => {
                         self.errors.push(format!("Error:{}:{}: unknown escape sequence \\{}", line, col, esc));
                         s.push(esc);
@@ -372,6 +402,85 @@ impl Lexer {
         }
 
         Token::new(TokenKind::StringLit(s), line, col)
+    }
+
+    /// Issue 29: Read a hex escape \xHH — reads exactly 2 hex digits.
+    /// Returns (char, true) on success, (replacement char, false) on error.
+    fn read_hex_escape(&mut self, line: usize, col: usize) -> (char, bool) {
+        let mut val: u32 = 0;
+        for _ in 0..2 {
+            if self.pos < self.source.len() {
+                let c = self.peek();
+                if let Some(d) = c.to_digit(16) {
+                    val = val * 16 + d;
+                    self.advance();
+                } else {
+                    self.errors.push(format!("Error:{}:{}: \\x expects 2 hex digits", line, col));
+                    return ('\0', false);
+                }
+            } else {
+                self.errors.push(format!("Error:{}:{}: \\x expects 2 hex digits", line, col));
+                return ('\0', false);
+            }
+        }
+        if let Some(ch) = char::from_u32(val) {
+            (ch, true)
+        } else {
+            self.errors.push(format!("Error:{}:{}: \\x{:02X} is not a valid char", line, col, val));
+            ('\0', false)
+        }
+    }
+
+    /// Issue 29: Read a unicode escape \u{XXXX} — reads hex digits until }.
+    /// The opening { has already been consumed.
+    /// Returns (char, true) on success, (replacement char, false) on error.
+    fn read_unicode_escape(&mut self, line: usize, col: usize) -> (char, bool) {
+        let mut val: u32 = 0;
+        let mut count = 0;
+        while self.pos < self.source.len() && self.peek() != '}' {
+            let c = self.peek();
+            if let Some(d) = c.to_digit(16) {
+                val = val * 16 + d;
+                count += 1;
+                self.advance();
+                if count > 6 {
+                    self.errors.push(format!("Error:{}:{}: \\u{{...}} value too large", line, col));
+                    // Skip to closing }
+                    while self.pos < self.source.len() && self.peek() != '}' {
+                        self.advance();
+                    }
+                    if self.pos < self.source.len() {
+                        self.advance(); // consume }
+                    }
+                    return ('\0', false);
+                }
+            } else {
+                self.errors.push(format!("Error:{}:{}: \\u{{...}} expects hex digits", line, col));
+                while self.pos < self.source.len() && self.peek() != '}' {
+                    self.advance();
+                }
+                if self.pos < self.source.len() {
+                    self.advance(); // consume }
+                }
+                return ('\0', false);
+            }
+        }
+        if self.pos < self.source.len() {
+            self.advance(); // consume }
+        } else {
+            self.errors.push(format!("Error:{}:{}: \\u{{...}} missing closing }}", line, col));
+            return ('\0', false);
+        }
+        if count == 0 {
+            self.errors.push(format!("Error:{}:{}: \\u{{}} needs at least 1 hex digit", line, col));
+            return ('\0', false);
+        }
+        if let Some(ch) = char::from_u32(val) {
+            (ch, true)
+        } else {
+            self.errors.push(format!("Error:{}:{}: \\u{{{:X}}} is not a valid char", line, col, val));
+            ('\0', false)
+        }
     }
 
     /// Read a raw string: r"..." or r#"..."# (with N hash signs).

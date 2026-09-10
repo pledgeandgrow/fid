@@ -701,6 +701,8 @@ pub struct Func {
     /// Whether this is an async function (Phase 7.6: async/await).
     /// Async functions return Future<T> and can use `await` inside.
     pub is_async: bool,
+    /// Source line number (1-based) of the `fn` keyword — for LSP go-to-definition.
+    pub line: usize,
 }
 
 /// An annotation: @name or @name(args)
@@ -719,6 +721,8 @@ pub struct StructDef {
     pub annotations: Vec<Annotation>,
     /// Type parameters for generic structs (e.g. ["T"] for Box<T>)
     pub type_params: Vec<String>,
+    /// Source line number (1-based) of the `struct` keyword — for LSP go-to-definition.
+    pub line: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -734,6 +738,8 @@ pub struct EnumDef {
     pub is_pub: bool,
     /// Type parameters for generic enums (e.g. ["T"] for Option<T>, ["T", "E"] for Result<T, E>)
     pub type_params: Vec<String>,
+    /// Source line number (1-based) of the `enum` keyword — for LSP go-to-definition.
+    pub line: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -742,6 +748,8 @@ pub struct ConstDef {
     pub ty: Type,
     pub expr: Expr,
     pub is_pub: bool,
+    /// Source line number (1-based) of the `const` keyword — for LSP go-to-definition.
+    pub line: usize,
 }
 
 /// A module-level mutable global variable: `var g_x: i64 = 0;` or `pub var g_x: i64 = 0;`

@@ -546,8 +546,120 @@ impl Lowerer {
         // I-6B: Propagate linear_structs to the IR module
         self.module.linear_structs = self.linear_structs.clone();
 
+        // Issue 42: Register state machine structs for async functions.
+        // This is the foundational infrastructure for converting thread-based
+        // async/await to state-machine-based. The structs are generated now;
+        // the poll functions and executor integration will follow.
+        self.register_async_state_structs(program);
+
         // Take ownership of the module
         std::mem::take(&mut self.module)
+    }
+
+    /// Issue 42: Register state machine structs for async functions.
+    ///
+    /// For each `async fn`, generate a state machine struct
+    /// `__AsyncState_<name>` with fields for:
+    /// - State enum (i64): 0=initial, 1=pending, 2=ready
+    /// - Future handle (i64): the future being awaited
+    /// - Parameter fields (one per parameter)
+    /// - Result field (i64)
+    ///
+    /// This is the first step of the state machine transform. The poll
+    /// functions and executor integration will be added in subsequent work.
+    fn register_async_state_structs(&mut self, program: &Program) {
+        for func in &program.funcs {
+            if !func.is_async {
+                continue;
+            }
+
+            let struct_name = format!("__AsyncState_{}", func.name);
+            let mut fields: Vec<(String, IrType, u32)> = Vec::new();
+            let mut offset: u32 = 0;
+
+            // State field (i64): 0 = initial, 1 = pending, 2 = ready
+            fields.push(("__state".to_string(), IrType::I64, offset));
+            offset += 8;
+
+            // Future handle field (for await): stores the future being awaited
+            fields.push(("__future".to_string(), IrType::I64, offset));
+            offset += 8;
+
+            // Parameter fields
+            for param in &func.params {
+                let ir_ty = self.lower_type(&param.ty);
+                let size = self.module.type_size(&ir_ty) as u32;
+                fields.push((format!("__param_{}", param.name), ir_ty.clone(), offset));
+                offset += size;
+            }
+
+            // Result field
+            fields.push(("__result".to_string(), IrType::I64, offset));
+            offset += 8;
+
+            // Register the struct layout
+            self.module.struct_layouts.insert(struct_name.clone(), crate::ir::StructLayout {
+                name: struct_name.clone(),
+                fields,
+                size: offset as u64,
+                align: 8,
+                repr_c: false,
+                packed_layout: false,
+            });
+        }
+    }
+
+    /// Count the number of `await` expressions in a list of statements.
+    fn count_await_stmts(stmts: &[Stmt]) -> usize {
+        let mut count = 0;
+        for stmt in stmts {
+            count += Self::count_await_in_stmt(stmt);
+        }
+        count
+    }
+
+    fn count_await_in_stmt(stmt: &Stmt) -> usize {
+        use crate::ast::Stmt as S;
+        match stmt {
+            S::Expr(e, _) => Self::count_await_in_expr(e),
+            S::Let { expr, .. } => Self::count_await_in_expr(expr),
+            S::LetTuple { expr, .. } => Self::count_await_in_expr(expr),
+            S::Assign { expr, .. } => Self::count_await_in_expr(expr),
+            S::IndexAssign { index, expr, .. } => Self::count_await_in_expr(index) + Self::count_await_in_expr(expr),
+            S::DerefAssign { expr, .. } => Self::count_await_in_expr(expr),
+            S::FieldAssign { expr, .. } => Self::count_await_in_expr(expr),
+            S::Return(Some(e), _) => Self::count_await_in_expr(e),
+            S::Return(None, _) => 0,
+            S::If { then_block, else_block, cond, .. } => {
+                Self::count_await_in_expr(cond)
+                + Self::count_await_stmts(then_block)
+                + else_block.as_ref().map(|e| Self::count_await_stmts(e)).unwrap_or(0)
+            }
+            S::While { cond, body, .. } => Self::count_await_in_expr(cond) + Self::count_await_stmts(body),
+            S::For { iterator, body, .. } => Self::count_await_in_expr(iterator) + Self::count_await_stmts(body),
+            S::Loop { body, .. } => Self::count_await_stmts(body),
+            S::Defer(stmts, _) => Self::count_await_stmts(stmts),
+            S::Match { expr, arms, .. } => {
+                let base = Self::count_await_in_expr(expr);
+                let arms_count: usize = arms.iter().map(|a| Self::count_await_stmts(&a.body)).sum();
+                base + arms_count
+            }
+            _ => 0,
+        }
+    }
+
+    fn count_await_in_expr(expr: &crate::ast::Expr) -> usize {
+        use crate::ast::Expr as E;
+        match expr {
+            E::Await { expr } => 1 + Self::count_await_in_expr(expr),
+            E::Spawn { expr } => Self::count_await_in_expr(expr),
+            E::Call { args, .. } => args.iter().map(Self::count_await_in_expr).sum(),
+            E::Binary { left, right, .. } => Self::count_await_in_expr(left) + Self::count_await_in_expr(right),
+            E::Unary { expr, .. } => Self::count_await_in_expr(expr),
+            E::MethodCall { receiver, args, .. } => Self::count_await_in_expr(receiver) + args.iter().map(Self::count_await_in_expr).sum::<usize>(),
+            E::If { cond, then_block, else_block, .. } => Self::count_await_in_expr(cond) + Self::count_await_stmts(then_block) + else_block.as_ref().map(|e| Self::count_await_stmts(e)).unwrap_or(0),
+            _ => 0,
+        }
     }
 
     /// Compute the memory layout for a struct.
@@ -5800,6 +5912,7 @@ impl Lowerer {
                     preconditions: Vec::new(),
                     postconditions: Vec::new(),
             is_async: false,
+            line: 0,
                 };
 
                 // Save current function context, lower the closure, restore context.

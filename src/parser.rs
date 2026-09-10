@@ -438,6 +438,7 @@ impl Parser {
     }
 
     fn parse_struct(&mut self) -> Result<StructDef, String> {
+        let line = self.peek_token().line;
         self.expect(TokenKind::Struct, "struct")?;
         let name = self.expect_ident()?;
 
@@ -476,7 +477,7 @@ impl Parser {
         self.expect(TokenKind::RBrace, "}")?;
 
         self.struct_names.push(name.clone());
-        Ok(StructDef { name, fields, is_pub: false, annotations: Vec::new(), type_params })
+        Ok(StructDef { name, fields, is_pub: false, annotations: Vec::new(), type_params, line })
     }
 
     /// Parse a layer declaration:
@@ -702,6 +703,7 @@ impl Parser {
     }
 
     fn parse_enum(&mut self) -> Result<EnumDef, String> {
+        let line = self.peek_token().line;
         self.expect(TokenKind::Enum, "enum")?;
         let name = self.expect_ident()?;
 
@@ -763,10 +765,11 @@ impl Parser {
         self.expect(TokenKind::RBrace, "}")?;
 
         self.enum_names.push(name.clone());
-        Ok(EnumDef { name, variants, is_pub: false, type_params })
+        Ok(EnumDef { name, variants, is_pub: false, type_params, line })
     }
 
     fn parse_const(&mut self) -> Result<ConstDef, String> {
+        let line = self.peek_token().line;
         self.expect(TokenKind::Const, "const")?;
         let name = self.expect_ident()?;
         self.expect(TokenKind::Colon, ":")?;
@@ -774,7 +777,7 @@ impl Parser {
         self.expect(TokenKind::Eq, "=")?;
         let expr = self.parse_expr()?;
         self.match_tok(TokenKind::Semicolon);
-        Ok(ConstDef { name, ty, expr, is_pub: false })
+        Ok(ConstDef { name, ty, expr, is_pub: false, line })
     }
 
     /// Parse a module-level mutable global variable:
@@ -1069,6 +1072,7 @@ impl Parser {
     }
 
     fn parse_func(&mut self) -> Result<Func, String> {
+        let line = self.peek_token().line;
         self.expect(TokenKind::Fn, "fn")?;
         let name = self.expect_ident_or_keyword()?;
 
@@ -1206,6 +1210,7 @@ impl Parser {
             preconditions,
             postconditions,
             is_async: false, // set by caller when parsing `async pf`
+            line,
         })
     }
 

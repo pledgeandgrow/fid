@@ -1946,6 +1946,11 @@ pub fn PeCodeGen_register_runtime_labels2(self: &mut PeCodeGen) {
     PeCodeGen_register_func(self, "p_cr2_read");
     PeCodeGen_register_func(self, "p_cr3_read");
     PeCodeGen_register_func(self, "p_cr3_write");
+    // T10: GS base setup stubs
+    PeCodeGen_register_func(self, "p_wrmsr_gs_base");
+    PeCodeGen_register_func(self, "p_rdmsr_gs_base");
+    PeCodeGen_register_func(self, "p_wrmsr_kernel_gs_base");
+    PeCodeGen_register_func(self, "p_swapgs");
     PeCodeGen_register_func(self, "p_enter_user_mode");
     PeCodeGen_register_func(self, "syscall_handler");
 }
@@ -3318,6 +3323,11 @@ pub fn PeCodeGen_gen_runtime_stubs(self: &mut PeCodeGen) {
     PeCodeGen_gen_p_cr2_read(self);
     PeCodeGen_gen_p_cr3_read(self);
     PeCodeGen_gen_p_cr3_write(self);
+    // T10: GS base setup stubs
+    PeCodeGen_gen_p_wrmsr_gs_base(self);
+    PeCodeGen_gen_p_rdmsr_gs_base(self);
+    PeCodeGen_gen_p_wrmsr_kernel_gs_base(self);
+    PeCodeGen_gen_p_swapgs(self);
     PeCodeGen_gen_p_enter_user_mode(self);
     PeCodeGen_gen_syscall_handler(self);
 }
@@ -5874,6 +5884,81 @@ pub fn PeCodeGen_gen_p_cr3_write(self: &mut PeCodeGen) {
     }
     X86Encoder_ret(&mut self.enc);
 }
+
+// T10: p_wrmsr_gs_base(rcx = value) — write GS base (MSR 0xC0000101)
+pub fn PeCodeGen_gen_p_wrmsr_gs_base(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_wrmsr_gs_base");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        // mov rax, rcx
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0xC8);
+        // mov rdx, rax
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0xC2);
+        // shr rdx, 32
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xC1); X86Encoder_emit_u8(&mut self.enc, 0xEA); X86Encoder_emit_u8(&mut self.enc, 0x20);
+        // mov ecx, 0xC0000101
+        X86Encoder_emit_u8(&mut self.enc, 0xB9); X86Encoder_emit_u8(&mut self.enc, 0x01); X86Encoder_emit_u8(&mut self.enc, 0x01); X86Encoder_emit_u8(&mut self.enc, 0x00); X86Encoder_emit_u8(&mut self.enc, 0xC0);
+        // wrmsr
+        X86Encoder_emit_u8(&mut self.enc, 0x0F); X86Encoder_emit_u8(&mut self.enc, 0x30);
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
+}
+
+// T10: p_rdmsr_gs_base() -> rax — read GS base (MSR 0xC0000101)
+pub fn PeCodeGen_gen_p_rdmsr_gs_base(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_rdmsr_gs_base");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        // mov ecx, 0xC0000101
+        X86Encoder_emit_u8(&mut self.enc, 0xB9); X86Encoder_emit_u8(&mut self.enc, 0x01); X86Encoder_emit_u8(&mut self.enc, 0x01); X86Encoder_emit_u8(&mut self.enc, 0x00); X86Encoder_emit_u8(&mut self.enc, 0xC0);
+        // rdmsr
+        X86Encoder_emit_u8(&mut self.enc, 0x0F); X86Encoder_emit_u8(&mut self.enc, 0x32);
+        // shl rdx, 32
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xC1); X86Encoder_emit_u8(&mut self.enc, 0xE2); X86Encoder_emit_u8(&mut self.enc, 0x20);
+        // or rax, rdx
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0x09); X86Encoder_emit_u8(&mut self.enc, 0xD0);
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
+}
+
+// T10: p_wrmsr_kernel_gs_base(rcx = value) — write KernelGSBase (MSR 0xC0000102)
+pub fn PeCodeGen_gen_p_wrmsr_kernel_gs_base(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_wrmsr_kernel_gs_base");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        // mov rax, rcx
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0xC8);
+        // mov rdx, rax
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0xC2);
+        // shr rdx, 32
+        X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xC1); X86Encoder_emit_u8(&mut self.enc, 0xEA); X86Encoder_emit_u8(&mut self.enc, 0x20);
+        // mov ecx, 0xC0000102
+        X86Encoder_emit_u8(&mut self.enc, 0xB9); X86Encoder_emit_u8(&mut self.enc, 0x02); X86Encoder_emit_u8(&mut self.enc, 0x01); X86Encoder_emit_u8(&mut self.enc, 0x00); X86Encoder_emit_u8(&mut self.enc, 0xC0);
+        // wrmsr
+        X86Encoder_emit_u8(&mut self.enc, 0x0F); X86Encoder_emit_u8(&mut self.enc, 0x30);
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
+}
+
+// T10: p_swapgs() — swap GS base and KernelGSBase
+pub fn PeCodeGen_gen_p_swapgs(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_swapgs");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        // swapgs
+        X86Encoder_emit_u8(&mut self.enc, 0x0F); X86Encoder_emit_u8(&mut self.enc, 0x01); X86Encoder_emit_u8(&mut self.enc, 0xF8);
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
+}
+
 
 // p_enter_user_mode(rcx = entry_addr, rdx = stack_addr) -> void
 // Transitions from ring 0 (kernel) to ring 3 (user) via iretq.

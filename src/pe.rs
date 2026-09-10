@@ -1407,6 +1407,9 @@ const IMPORTS: &[&str] = &[
     "ReadFile",
     "CloseHandle",
     "GetFileSize",
+    "GetCommandLineA",
+    "CreateProcessA",
+    "WaitForSingleObject",
 ];
 
 /// Build the .rdata section content: string constants + import table
@@ -1814,6 +1817,9 @@ const IAT_CREATE_FILE_A: usize = 6;
 const IAT_READ_FILE: usize = 7;
 const IAT_CLOSE_HANDLE: usize = 8;
 const IAT_GET_FILE_SIZE: usize = 9;
+const IAT_GET_COMMAND_LINE_A: usize = 10;
+const IAT_CREATE_PROCESS_A: usize = 11;
+const IAT_WAIT_FOR_SINGLE_OBJECT: usize = 12;
 
 struct PeCodeGen {
     enc: X86Encoder,
@@ -1939,19 +1945,24 @@ impl PeCodeGen {
                        "p_string_repeat", "p_string_bytes", "p_string_clone",
                        // Phase 5A.3: Interrupt handler stubs
                        "p_cli", "p_sti", "p_lidt", "p_idt_set_entry",
-                       "p_hlt", "p_inb", "p_outb", "p_outw", "p_inw",
+                       "p_hlt", "p_inb", "p_outb", "p_outw", "p_inw", "p_outl", "p_inl",
                        // Phase 5A.4: MMU/page table stubs
                        "p_cr3_read", "p_cr3_write", "p_cr0_read", "p_cr0_write",
-                       "p_cr2_read", "p_cr4_read", "p_cr4_write", "p_invlpg",
+                       "p_cr2_read", "p_cr4_read", "p_cr4_write", "p_invlpg", "p_wrmsr_gs_base", "p_rdmsr_gs_base", "p_wrmsr_kernel_gs_base", "p_swapgs",
                        "p_page_map", "p_page_unmap",
                        "p_phys_read64", "p_phys_write64",
                        "p_mem_read8", "p_mem_write8",
+                       "p_mem_read32", "p_mem_write32",
+                       "p_mem_read64", "p_mem_write64",
                        // Phase 5A.5: GDT stubs
                        "p_lgdt", "p_gdt_set_entry",
                        "p_enter_user_mode",
                        "syscall_handler",
+                       "syscall_dispatch",
                        // Phase 5A.6: Serial port stubs
-                       "p_serial_init", "p_serial_write", "p_serial_read", "p_serial_ready"] {
+                       "p_serial_init", "p_serial_write", "p_serial_read", "p_serial_ready",
+                       // Native runtime stubs: argv, process exec
+                       "p_argc", "p_argv", "p_system"] {
             let label = self.enc.alloc_label();
             self.func_labels.insert(stub.to_string(), label);
         }
@@ -2079,19 +2090,24 @@ impl PeCodeGen {
                        "p_string_repeat", "p_string_bytes", "p_string_clone",
                        // Phase 5A.3: Interrupt handler stubs
                        "p_cli", "p_sti", "p_lidt", "p_idt_set_entry",
-                       "p_hlt", "p_inb", "p_outb", "p_outw", "p_inw",
+                       "p_hlt", "p_inb", "p_outb", "p_outw", "p_inw", "p_outl", "p_inl",
                        // Phase 5A.4: MMU/page table stubs
                        "p_cr3_read", "p_cr3_write", "p_cr0_read", "p_cr0_write",
-                       "p_cr2_read", "p_cr4_read", "p_cr4_write", "p_invlpg",
+                       "p_cr2_read", "p_cr4_read", "p_cr4_write", "p_invlpg", "p_wrmsr_gs_base", "p_rdmsr_gs_base", "p_wrmsr_kernel_gs_base", "p_swapgs",
                        "p_page_map", "p_page_unmap",
                        "p_phys_read64", "p_phys_write64",
                        "p_mem_read8", "p_mem_write8",
+                       "p_mem_read32", "p_mem_write32",
+                       "p_mem_read64", "p_mem_write64",
                        // Phase 5A.5: GDT stubs
                        "p_lgdt", "p_gdt_set_entry",
                        "p_enter_user_mode",
                        "syscall_handler",
+                       "syscall_dispatch",
                        // Phase 5A.6: Serial port stubs
-                       "p_serial_init", "p_serial_write", "p_serial_read", "p_serial_ready"] {
+                       "p_serial_init", "p_serial_write", "p_serial_read", "p_serial_ready",
+                       // Native runtime stubs: argv, process exec
+                       "p_argc", "p_argv", "p_system"] {
             let label = self.enc.alloc_label();
             self.func_labels.insert(stub.to_string(), label);
         }
@@ -2212,18 +2228,23 @@ impl PeCodeGen {
                        "p_string_parse_int", "p_string_find", "p_string_rfind",
                        "p_string_repeat", "p_string_bytes", "p_string_clone",
                        "p_cli", "p_sti", "p_lidt", "p_idt_set_entry",
-                       "p_hlt", "p_inb", "p_outb", "p_outw", "p_inw",
+                       "p_hlt", "p_inb", "p_outb", "p_outw", "p_inw", "p_outl", "p_inl",
                        "p_cr3_read", "p_cr3_write", "p_cr0_read", "p_cr0_write",
-                       "p_cr2_read", "p_cr4_read", "p_cr4_write", "p_invlpg",
+                       "p_cr2_read", "p_cr4_read", "p_cr4_write", "p_invlpg", "p_wrmsr_gs_base", "p_rdmsr_gs_base", "p_wrmsr_kernel_gs_base", "p_swapgs",
                        "p_page_map", "p_page_unmap",
                        "p_phys_read64", "p_phys_write64",
                        "p_mem_read8", "p_mem_write8",
+                       "p_mem_read32", "p_mem_write32",
+                       "p_mem_read64", "p_mem_write64",
                        // Phase 5A.5: GDT stubs
                        "p_lgdt", "p_gdt_set_entry",
                        "p_enter_user_mode",
                        "syscall_handler",
+                       "syscall_dispatch",
                        // Phase 5A.6: Serial port stubs
-                       "p_serial_init", "p_serial_write", "p_serial_read", "p_serial_ready"] {
+                       "p_serial_init", "p_serial_write", "p_serial_read", "p_serial_ready",
+                       // Native runtime stubs: argv, process exec
+                       "p_argc", "p_argv", "p_system"] {
             let label = self.enc.alloc_label();
             self.func_labels.insert(stub.to_string(), label);
         }
@@ -2332,15 +2353,18 @@ impl PeCodeGen {
         self.enc.emit(&[0x83, 0x00, 0x00, 0x00]); // value = 0x83 (LE)
 
         // ─── User page tables (for ring 3 isolation) ───────────────────
-        // User PML4 at 0x72000, PDPT at 0x73000, PD at 0x74000, PT at 0x75000
-        // Maps ONLY: 0x10000 (user program, 4KB) and 0xB8000 (VGA, 4KB)
-        // All other memory is inaccessible from ring 3.
+        // User PML4 at 0x72000, PDPT at 0x73000
+        // Maps first 1GB with a huge page (present + writable + user).
+        // This includes IDT (0x1000), user program (0x10000), VGA (0xB8000),
+        // and kernel code (0x100000). The user bit allows ring 3 access.
+        // TODO: For better isolation, use 4KB pages with user bit only on
+        // user-accessible regions and map kernel regions without user bit.
 
-        // Zero user page table memory (4 pages at 0x72000 = 16384 bytes)
+        // Zero user page table memory (2 pages at 0x72000 = 8192 bytes)
         // mov edi, 0x72000
         self.enc.emit(&[0xBF, 0x00, 0x20, 0x07, 0x00]); // mov edi, 0x72000
-        // mov ecx, 4096 (4 pages × 512 entries × 8 bytes / 4 = 4096 dwords)
-        self.enc.emit(&[0xB9, 0x00, 0x10, 0x00, 0x00]); // mov ecx, 0x1000
+        // mov ecx, 2048 (2 pages × 512 entries × 8 bytes / 4 = 2048 dwords)
+        self.enc.emit(&[0xB9, 0x00, 0x08, 0x00, 0x00]); // mov ecx, 0x800
         // xor eax, eax
         self.enc.emit(&[0x31, 0xC0]); // xor eax, eax
         // rep stosd
@@ -2352,33 +2376,12 @@ impl PeCodeGen {
         self.enc.emit(&[0x00, 0x20, 0x07, 0x00]); // addr = 0x72000
         self.enc.emit(&[0x07, 0x30, 0x07, 0x00]); // value = 0x00073007
 
-        // User PDPT[0] = 0x74000 | 7 (present + writable + user)
-        // mov dword [0x73000], 0x74007
+        // User PDPT[0] = 0x87 (1GB huge page, present + writable + huge + user)
+        // Maps first 1GB (0x0 - 0x3FFFFFFF) as user-accessible.
+        // mov dword [0x73000], 0x87
         self.enc.emit(&[0xC7, 0x05]);
         self.enc.emit(&[0x00, 0x30, 0x07, 0x00]); // addr = 0x73000
-        self.enc.emit(&[0x07, 0x40, 0x07, 0x00]); // value = 0x00074007
-
-        // User PD[0] = 0x75000 | 7 (present + writable + user, points to PT)
-        // PD[0] covers first 2MB with 4KB pages.
-        // mov dword [0x74000], 0x75007
-        self.enc.emit(&[0xC7, 0x05]);
-        self.enc.emit(&[0x00, 0x40, 0x07, 0x00]); // addr = 0x74000
-        self.enc.emit(&[0x07, 0x50, 0x07, 0x00]); // value = 0x00075007
-
-        // User PT[0x10] = 0x10000 | 7 (user program at 0x10000, 4KB, present+writable+user)
-        // PT entry index 0x10 = address 0x10000 (0x10 × 4KB = 0x10000)
-        // mov dword [0x75000 + 0x10*8], 0x10007
-        self.enc.emit(&[0xC7, 0x05]);
-        self.enc.emit(&[0x80, 0x50, 0x07, 0x00]); // addr = 0x75080 (0x75000 + 0x80)
-        self.enc.emit(&[0x07, 0x00, 0x01, 0x00]); // value = 0x00010007
-
-        // User PT[0xB8] = 0xB8000 | 7 (VGA at 0xB8000, 4KB, present+writable+user)
-        // PT entry index 0xB8 = address 0xB8000 (0xB8 × 4KB = 0xB8000)
-        // mov dword [0x75000 + 0xB8*8], 0xB8007
-        // 0xB8 * 8 = 0x5C0, so addr = 0x75000 + 0x5C0 = 0x755C0
-        self.enc.emit(&[0xC7, 0x05]);
-        self.enc.emit(&[0xC0, 0x55, 0x07, 0x00]); // addr = 0x755C0
-        self.enc.emit(&[0x07, 0x00, 0xB8, 0x00]); // value = 0x00B80007
+        self.enc.emit(&[0x87, 0x00, 0x00, 0x00]); // value = 0x87
 
         // Load CR3: mov eax, 0x70000; mov cr3, eax
         self.enc.emit(&[0xB8, 0x00, 0x00, 0x07, 0x00]); // mov eax, 0x70000
@@ -2457,6 +2460,17 @@ impl PeCodeGen {
         self.enc.emit(&[0x48, 0xBC, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00]); // mov rsp, 0x90000
         // mov rbp, rsp
         self.enc.emit(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
+
+        // Load segment registers with kernel data segment (0x10)
+        // The far jump only loads CS=0x08; SS/DS/ES retain their old
+        // protected-mode values (0x18 = user code segment), which causes
+        // GPF on iretq because SS must be a data segment in ring 0.
+        self.enc.emit(&[0x66, 0xB8, 0x10, 0x00]); // mov ax, 0x10
+        self.enc.emit(&[0x8E, 0xD0]);             // mov ss, ax
+        self.enc.emit(&[0x8E, 0xD8]);             // mov ds, ax
+        self.enc.emit(&[0x8E, 0xC0]);             // mov es, ax
+        self.enc.emit(&[0x8E, 0xE0]);             // mov fs, ax
+        self.enc.emit(&[0x8E, 0xE8]);             // mov gs, ax
 
         // Push 0 (fake return address)
         self.enc.emit(&[0x6A, 0x00]); // push 0
@@ -2554,9 +2568,8 @@ impl PeCodeGen {
             self.enc.emit(&[0x66, 0xBA, 0xA1, 0x00]);
             self.enc.emit(&[0xEE]);
 
-            // Mask: unmask IRQ1 (keyboard) only — 0xFD master, 0xFF slave
-            // (timer IRQ0 masked temporarily for debugging)
-            self.enc.emit(&[0xB0, 0xFD]);
+            // Mask: unmask IRQ0 (timer) and IRQ1 (keyboard) — 0xFC master, 0xFF slave
+            self.enc.emit(&[0xB0, 0xFC]);
             self.enc.emit(&[0x66, 0xBA, 0x21, 0x00]);
             self.enc.emit(&[0xEE]);
 
@@ -2587,13 +2600,9 @@ impl PeCodeGen {
         // Each IDT entry is 16 bytes at 0x1000 + vector * 16.
         self.gen_idt_setup_for_interrupts(module);
 
-        // Enable interrupts AFTER all IDT entries are wired (prevents GPF from
-        // unhandled timer/exception vectors firing before handlers are ready)
-        if self.func_labels.contains_key("irq1_handler") {
-            self.enc.emit(&[0xFB]); // sti
-        }
-
         // ─── TSS + syscall setup (always, for user-mode support) ───────
+        // This must be done BEFORE sti, because interrupt delivery may
+        // require a valid TSS (even in ring 0, some CPUs fault if TR=0).
         // Zero out TSS at 0x4000 (104 bytes = 13 qwords)
         // mov rdi, 0x4000
         self.enc.emit(&[0x48, 0xBF, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
@@ -2616,6 +2625,27 @@ impl PeCodeGen {
         self.enc.emit(&[0x66, 0xB8, 0x28, 0x00]);
         // ltr ax
         self.enc.emit(&[0x0F, 0x00, 0xD8]);
+
+        // Enable interrupts AFTER all IDT entries are wired AND TSS is loaded
+        // (prevents GPF from unhandled timer/exception vectors or missing TSS)
+        if self.func_labels.contains_key("irq1_handler") {
+            // Configure PIT (8253/8254) channel 0 to fire at ~18.2 Hz
+            // This ensures IRQ0 (timer) actually fires after sti.
+            // outb(0x43, 0x36) — channel 0, lobyte/hibyte, rate generator, binary
+            self.enc.emit(&[0xB0, 0x36]);           // mov al, 0x36
+            self.enc.emit(&[0x66, 0xBA, 0x43, 0x00]); // mov dx, 0x43
+            self.enc.emit(&[0xEE]);                 // out dx, al
+            // outb(0x40, 0xFF) — low byte of divisor (0xFFFF = slowest)
+            self.enc.emit(&[0xB0, 0xFF]);            // mov al, 0xFF
+            self.enc.emit(&[0x66, 0xBA, 0x40, 0x00]); // mov dx, 0x40
+            self.enc.emit(&[0xEE]);                 // out dx, al
+            // outb(0x40, 0xFF) — high byte of divisor
+            self.enc.emit(&[0xB0, 0xFF]);            // mov al, 0xFF
+            self.enc.emit(&[0x66, 0xBA, 0x40, 0x00]); // mov dx, 0x40
+            self.enc.emit(&[0xEE]);                 // out dx, al
+
+            self.enc.emit(&[0xFB]); // sti
+        }
 
         // Set up syscall handler (int 0x80) in IDT if syscall_handler exists
         if let Some(&syscall_label) = self.func_labels.get("syscall_handler") {
@@ -2663,43 +2693,127 @@ impl PeCodeGen {
         if let Some(&upd_label) = self.func_labels.get("user_program_done") {
             self.enc.call_label(upd_label);
         }
-        // Halt after user program returns
+        // Halt after user program returns — user_program_done handles cleanup
         self.enc.emit(&[0xFA]);       // cli
         self.enc.emit(&[0xF4]);       // hlt
         self.enc.emit(&[0xEB, 0xFD]); // jmp -3
 
         // ─── syscall_handler stub ─────────────────────────────────────
         // Hardcoded assembly stub for int 0x80 (syscall from user mode).
-        // Modifies the iret frame to return to user_return at ring 0.
-        // Stack layout after CPU pushes iret frame (ring 3 → ring 0):
-        //   [RSP + 0]:  RIP (user return address)
-        //   [RSP + 8]:  CS (user = 0x1B)
-        //   [RSP + 16]: RFLAGS
-        //   [RSP + 24]: RSP (user stack)
-        //   [RSP + 32]: SS (user = 0x23)
+        // Calls the Fides function syscall_dispatch(syscall_num, arg1, arg2, arg3).
+        // If syscall_dispatch returns 0, returns to user mode (iretq).
+        // If it returns non-zero, exits to kernel (user_return trampoline).
+        //
+        // When int 0x80 fires from ring 3:
+        //   CPU sets RSP = TSS.rsp0 = 0x90000, pushes iret frame (40 bytes)
+        //   RSP is now 0x8FFD8. iret frame: RIP, CS, RFLAGS, RSP, SS
+        //   RAX = syscall number, RCX = arg1, RDX = arg2, R8 = arg3
         let _syscall_handler_offset = self.enc.offset();
         let syscall_label = *self.func_labels.get("syscall_handler").unwrap();
         self.enc.place_label(syscall_label);
-        // Switch CR3 back to kernel page tables (0x70000) for kernel isolation
-        // mov eax, 0x70000
+
+        // Save user registers BEFORE CR3 switch (which clobbers RAX).
+        // User state at int 0x80 entry:
+        //   RAX = syscall_num, RCX = arg1, RDX = arg2, R8 = arg3
+        // Save to fixed memory at 0x50044..0x5005F
+        // mov [0x50044], rax  (syscall_num)
+        self.enc.emit(&[0x48, 0x89, 0x04, 0x25, 0x44, 0x00, 0x05, 0x00]);
+        // mov [0x5004C], rcx  (arg1)
+        self.enc.emit(&[0x48, 0x89, 0x0C, 0x25, 0x4C, 0x00, 0x05, 0x00]);
+        // mov [0x50054], rdx  (arg2)
+        self.enc.emit(&[0x48, 0x89, 0x14, 0x25, 0x54, 0x00, 0x05, 0x00]);
+        // mov [0x5005C], r8   (arg3)
+        self.enc.emit(&[0x4C, 0x89, 0x04, 0x25, 0x5C, 0x00, 0x05, 0x00]);
+
+        // Switch CR3 to kernel page tables (0x70000)
         self.enc.emit(&[0xB8, 0x00, 0x00, 0x07, 0x00]); // mov eax, 0x70000
-        // mov cr3, rax
         self.enc.emit(&[0x0F, 0x22, 0xD8]); // mov cr3, rax
-        // Modify RIP → user_return offset (will be patched)
+
+        // Fides calling convention: first arg (RCX) = env_ptr (0 for regular fns)
+        // syscall_dispatch(env_ptr, syscall_num, arg1, arg2, arg3)
+        //   RCX = 0 (env_ptr)
+        //   RDX = syscall_num (from user RAX, saved at 0x50044)
+        //   R8  = arg1 (from user RCX, saved at 0x5004C)
+        //   R9  = arg2 (from user RDX, saved at 0x50054)
+        //   stack = arg3 (from user R8, saved at 0x5005C) — 5th param
+
+        // mov rcx, 0  (env_ptr)
+        self.enc.emit(&[0x48, 0xC7, 0xC1, 0x00, 0x00, 0x00, 0x00]);
+        // mov rdx, [0x50044]  (syscall_num = user RAX)
+        self.enc.emit(&[0x48, 0x8B, 0x14, 0x25, 0x44, 0x00, 0x05, 0x00]);
+        // mov r8, [0x5004C]  (arg1 = user RCX)
+        self.enc.emit(&[0x4C, 0x8B, 0x04, 0x25, 0x4C, 0x00, 0x05, 0x00]);
+        // mov r9, [0x50054]  (arg2 = user RDX)
+        self.enc.emit(&[0x4C, 0x8B, 0x0C, 0x25, 0x54, 0x00, 0x05, 0x00]);
+
+        // 5th param (arg3 = user R8) goes on stack
+        // sub rsp, 0x30 (shadow space 32 + 8 for stack arg, aligned to 48)
+        self.enc.emit(&[0x48, 0x83, 0xEC, 0x30]);
+        // mov rax, [0x5005C]
+        self.enc.emit(&[0x48, 0x8B, 0x04, 0x25, 0x5C, 0x00, 0x05, 0x00]);
+        // mov [rsp+0x20], rax  (5th arg at rsp+32)
+        self.enc.emit(&[0x48, 0x89, 0x44, 0x24, 0x20]);
+
+        // Call syscall_dispatch (Fides function)
+        if let Some(&sd_label) = self.func_labels.get("syscall_dispatch") {
+            self.enc.call_label(sd_label);
+        } else {
+            // No syscall_dispatch — return 1 (exit)
+            self.enc.emit(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]); // mov rax, 1
+        }
+
+        // Clean up shadow space + 5th arg (add rsp, 0x30)
+        self.enc.emit(&[0x48, 0x83, 0xC4, 0x30]);
+
+        // RAX = syscall return value (e.g., PID for sys_getpid).
+        // Save it before CR3 switch clobbers it.
+        // mov [0x50060], rax  (save return value)
+        self.enc.emit(&[0x48, 0x89, 0x04, 0x25, 0x60, 0x00, 0x05, 0x00]);
+
+        // Check if this was sys_exit (syscall_num == 0)
+        // mov rax, [0x50044]  (load saved syscall_num)
+        self.enc.emit(&[0x48, 0x8B, 0x04, 0x25, 0x44, 0x00, 0x05, 0x00]);
+        // test rax, rax  (if syscall_num == 0 = sys_exit, go to exit path)
+        self.enc.emit(&[0x48, 0x85, 0xC0]);
+        // jz +offset to exit path (patch later)
+        self.enc.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]); // jz dword rel32
+        let jnz_patch = self.enc.offset() - 4;
+
+        // --- Continue path: return to user mode ---
+        // Switch CR3 back to user page tables (0x72000)
+        self.enc.emit(&[0xB8, 0x00, 0x20, 0x07, 0x00]); // mov eax, 0x72000
+        self.enc.emit(&[0x0F, 0x22, 0xD8]); // mov cr3, rax
+
+        // Restore syscall return value to RAX for the user
+        // mov rax, [0x50060]
+        self.enc.emit(&[0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x05, 0x00]);
+
+        // RSP is still at 0x8FFD8 (the iret frame is intact)
+        // iretq back to user mode
+        self.enc.emit(&[0x48, 0xCF]); // iretq
+
+        // --- Exit path: return to kernel mode (user_return trampoline) ---
+        let exit_path_offset = self.enc.offset();
+        // RSP is still at 0x8FFD8 (the iret frame is intact)
+
+        // Modify iret frame: RIP → user_return, CS → 0x08, RSP → 0x90000, SS → 0x10
         // mov qword [rsp + 0], <user_return_addr>
         self.enc.emit(&[0x48, 0xC7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x00]);
-        let syscall_rip_patch = self.enc.offset() - 4; // patch this 4-byte immediate
-        // Modify CS → 0x08 (kernel code)
-        // mov word [rsp + 8], 0x08
+        let syscall_rip_patch = self.enc.offset() - 4;
+        // mov word [rsp + 8], 0x08 (kernel code)
         self.enc.emit(&[0x66, 0xC7, 0x44, 0x24, 0x08, 0x08, 0x00]);
-        // Modify RSP → 0x90000 (kernel stack)
-        // mov qword [rsp + 24], 0x90000
+        // mov qword [rsp + 16], 0x202 (RFLAGS with IF=1, reserved bit=1)
+        self.enc.emit(&[0x48, 0xC7, 0x44, 0x24, 0x10, 0x02, 0x02, 0x00, 0x00]);
+        // mov qword [rsp + 24], 0x90000 (kernel stack)
         self.enc.emit(&[0x48, 0xC7, 0x44, 0x24, 0x18, 0x00, 0x00, 0x09, 0x00]);
-        // Modify SS → 0x10 (kernel data)
-        // mov word [rsp + 32], 0x10
+        // mov word [rsp + 32], 0x10 (kernel data)
         self.enc.emit(&[0x66, 0xC7, 0x44, 0x24, 0x20, 0x10, 0x00]);
         // iretq — return to ring 0 at user_return
         self.enc.emit(&[0x48, 0xCF]); // iretq
+
+        // Patch jnz to jump to exit path
+        let jnz_offset = exit_path_offset as i32 - (jnz_patch as i32 + 4);
+        self.enc.code[jnz_patch..jnz_patch + 4].copy_from_slice(&jnz_offset.to_le_bytes());
 
         // ─── Patch addresses ────────────────────────────────────────────
         // The binary layout is: [MB2 header (24 bytes)][code][rdata]
@@ -2744,10 +2858,12 @@ impl PeCodeGen {
         for func in module.functions.values() {
             if let Some(vector) = func.interrupt_vector {
                 if let Some(&label) = self.func_labels.get(&func.name) {
+                    eprintln!("[PE] Found ISR: {} vector={} is_interrupt={}", func.name, vector, func.is_interrupt);
                     isrs.push((vector, label));
                 }
             }
         }
+        eprintln!("[PE] gen_idt_setup_for_interrupts: {} ISRs found", isrs.len());
         if isrs.is_empty() { return; }
 
         // Zero out IDT memory at 0x1000 if not already done by irq1_handler setup
@@ -2825,6 +2941,24 @@ impl PeCodeGen {
         if func.is_interrupt {
             // Interrupt handler prologue: save all GP registers
             // The CPU already pushed SS:RSP, RFLAGS, CS:RIP on interrupt
+            // For exceptions with error codes (#PF=0x0E, #GP=0x0D, etc.),
+            // the CPU also pushed an error code before jumping here.
+            // We save it to 0x510 and remove it from the stack so the
+            // epilogue's iretq works correctly.
+
+            // Check if this vector pushes an error code
+            let has_err = func.interrupt_vector.map_or(false, |v| {
+                v == 0x08 || v == 0x0A || v == 0x0B || v == 0x0C
+                    || v == 0x0D || v == 0x0E || v == 0x11 || v == 0x1E
+            });
+
+            if has_err {
+                // Pop error code into RAX, save to 0x510, then push RAX back
+                self.enc.pop(Reg::Rax);
+                // mov [0x510], rax
+                self.enc.emit(&[0x48, 0x89, 0x04, 0x25, 0x10, 0x05, 0x00, 0x00]);
+            }
+
             // We save all general-purpose registers
             self.enc.push(Reg::Rax);
             self.enc.push(Reg::Rbx);
@@ -3177,6 +3311,16 @@ impl PeCodeGen {
                     self.enc.pop(Reg::Rcx);
                     self.enc.pop(Reg::Rbx);
                     self.enc.pop(Reg::Rax);
+                    // For exceptions with error codes, push dummy error code
+                    // so iretq sees the correct stack layout
+                    let has_err = func.interrupt_vector.map_or(false, |v| {
+                        v == 0x08 || v == 0x0A || v == 0x0B || v == 0x0C
+                            || v == 0x0D || v == 0x0E || v == 0x11 || v == 0x1E
+                    });
+                    if has_err {
+                        // push 0 (dummy error code)
+                        self.enc.emit(&[0x6A, 0x00]);
+                    }
                     // iretq restores SS:RSP, RFLAGS, CS:RIP (64-bit)
                     self.enc.emit(&[0x48, 0xCF]); // iretq
                 } else {
@@ -3740,6 +3884,10 @@ impl PeCodeGen {
         self.gen_gdt_stubs();
         // User-mode transition stub
         self.gen_enter_user_mode();
+        // Native runtime stubs: argv, process exec
+        self.gen_argc();
+        self.gen_argv();
+        self.gen_system();
     }
 
     /// Generate interrupt control stubs (Phase 5A.3)
@@ -3811,20 +3959,16 @@ impl PeCodeGen {
             // offset_low = handler_addr & 0xFFFF → [r10 + 0]
             // mov rax, r8 (handler_addr)
             self.enc.mov_rr(Reg::Rax, Reg::R8);
-            // mov [r10 + 0], ax (low 16 bits)
-            // Use: 66 4C 89 84 22 → mov [r10 + rdx*1 + 0], r8d — too complex
-            // Simpler: store via rax
-            // mov [r10], ax  → 66 41 89 02
+            // mov [r10], ax
             self.enc.emit(&[0x66, 0x41, 0x89, 0x02]); // mov [r10], ax
 
             // selector = 0x08 → [r10 + 2]
-            // mov word [r10 + 2], 0x08
             self.enc.emit(&[0x66, 0x41, 0xC7, 0x42, 0x02, 0x08, 0x00]); // mov word [r10+2], 0x0008
 
             // ist = 0 → [r10 + 4]
             self.enc.emit(&[0x41, 0xC6, 0x42, 0x04, 0x00]); // mov byte [r10+4], 0
 
-            // type_attr = flags | 0x8E (present | interrupt gate) → [r10 + 5]
+            // type_attr = flags | 0x8E → [r10 + 5]
             // r9 = flags, or with 0x8E
             self.enc.emit(&[0x41, 0x80, 0xC9, 0x8E]); // or r9b, 0x8E
             self.enc.emit(&[0x41, 0x88, 0x4A, 0x05]); // mov [r10+5], cl (r9b)
@@ -3886,7 +4030,6 @@ impl PeCodeGen {
         self.enc.place_label(label);
         if self.bare_mode {
             // rcx = port, rdx = value
-            // mov dx, cx (port to dx — overwrites rdx lower 16 bits, but we save value first)
             // mov al, dl (value to al — must do before overwriting dx)
             self.enc.emit(&[0x88, 0xD0]); // mov al, dl (value to al)
             self.enc.emit(&[0x66, 0x89, 0xCA]); // mov dx, cx (port to dx)
@@ -3908,6 +4051,35 @@ impl PeCodeGen {
             self.enc.emit(&[0x66, 0x89, 0xCA]); // mov dx, cx (port to dx)
             // out dx, ax
             self.enc.emit(&[0x66, 0xEF]); // out dx, ax
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_outl(rcx = port, rdx = value) — write 32-bit dword to I/O port
+        let label = self.func_labels.get("p_outl").unwrap();
+        self.enc.place_label(*label);
+        if self.bare_mode {
+            // rcx = port, rdx = value
+            // mov eax, edx (value to eax)
+            self.enc.emit(&[0x89, 0xD0]); // mov eax, edx
+            // mov dx, cx (port to dx)
+            self.enc.emit(&[0x66, 0x89, 0xCA]); // mov dx, cx (port to dx)
+            // out dx, eax
+            self.enc.emit(&[0xEF]); // out dx, eax
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_inl(rcx = port) -> rax — read 32-bit dword from I/O port
+        let label = self.func_labels.get("p_inl").unwrap();
+        self.enc.place_label(*label);
+        if self.bare_mode {
+            // mov dx, cx (port to dx)
+            self.enc.emit(&[0x66, 0x89, 0xCA]); // mov dx, cx
+            // in eax, dx
+            self.enc.emit(&[0xED]); // in eax, dx
         } else {
             self.enc.ud2();
         }
@@ -3999,6 +4171,76 @@ impl PeCodeGen {
         if self.bare_mode {
             // invlpg [rcx]
             self.enc.emit(&[0x48, 0x0F, 0x01, 0x39]); // invlpg [rcx]
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // T10: p_wrmsr_gs_base(rcx = value) — write GS base (MSR 0xC0000101)
+        // Used for per-CPU storage in kernel code. WRMSR writes EDX:EAX to the
+        // MSR specified by ECX. We move rcx → rax (low 32), rdx → rdx (high 32),
+        // then load the MSR address into ecx.
+        let label = *self.func_labels.get("p_wrmsr_gs_base").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // Save rcx (value) before clobbering ecx with the MSR address.
+            // mov rax, rcx            ; rax = value (low 32 will be used)
+            self.enc.emit(&[0x48, 0x89, 0xC8]); // mov rax, rcx
+            // mov rdx, rax            ; rdx = value (high 32 in edx after shift)
+            self.enc.emit(&[0x48, 0x89, 0xC2]); // mov rdx, rax
+            // shr rdx, 32             ; edx = high 32 bits
+            self.enc.emit(&[0x48, 0xC1, 0xEA, 0x20]); // shr rdx, 32
+            // mov ecx, 0xC0000101     ; MSR_GS_BASE
+            self.enc.emit(&[0xB9, 0x01, 0x01, 0x00, 0xC0]); // mov ecx, 0xC0000101
+            // wrmsr
+            self.enc.emit(&[0x0F, 0x30]); // wrmsr
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // T10: p_rdmsr_gs_base() -> rax — read GS base (MSR 0xC0000101)
+        // RDMSR reads the MSR specified by ECX into EDX:EAX. We shift and OR
+        // to produce a single 64-bit value in rax.
+        let label = *self.func_labels.get("p_rdmsr_gs_base").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // mov ecx, 0xC0000101     ; MSR_GS_BASE
+            self.enc.emit(&[0xB9, 0x01, 0x01, 0x00, 0xC0]); // mov ecx, 0xC0000101
+            // rdmsr                   ; edx:eax = MSR value
+            self.enc.emit(&[0x0F, 0x32]); // rdmsr
+            // shl rdx, 32             ; shift high 32 bits into position
+            self.enc.emit(&[0x48, 0xC1, 0xE2, 0x20]); // shl rdx, 32
+            // or rax, rdx             ; combine low and high
+            self.enc.emit(&[0x48, 0x09, 0xD0]); // or rax, rdx
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // T10: p_wrmsr_kernel_gs_base(rcx = value) — write KernelGSBase (MSR 0xC0000102)
+        // Used by swapgs to save/restore the per-CPU GS base across user/kernel transitions.
+        let label = *self.func_labels.get("p_wrmsr_kernel_gs_base").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            self.enc.emit(&[0x48, 0x89, 0xC8]); // mov rax, rcx
+            self.enc.emit(&[0x48, 0x89, 0xC2]); // mov rdx, rax
+            self.enc.emit(&[0x48, 0xC1, 0xEA, 0x20]); // shr rdx, 32
+            // mov ecx, 0xC0000102     ; MSR_KERNEL_GS_BASE
+            self.enc.emit(&[0xB9, 0x02, 0x01, 0x00, 0xC0]); // mov ecx, 0xC0000102
+            self.enc.emit(&[0x0F, 0x30]); // wrmsr
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // T10: p_swapgs() — swap GS base and KernelGSBase (instruction: swapgs)
+        // Used on kernel entry/exit to switch from user GS to kernel GS.
+        let label = *self.func_labels.get("p_swapgs").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // swapgs
+            self.enc.emit(&[0x0F, 0x01, 0xF8]); // swapgs
         } else {
             self.enc.ud2();
         }
@@ -4267,6 +4509,50 @@ impl PeCodeGen {
             self.enc.ud2();
         }
         self.enc.ret();
+
+        // p_mem_read32(rcx=addr) -> rax — read 4 bytes from memory
+        let label = *self.func_labels.get("p_mem_read32").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // mov eax, [rcx]
+            self.enc.emit(&[0x8B, 0x01]); // mov eax, [rcx]
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_mem_write32(rcx=addr, rdx=val) — write 4 bytes to memory
+        let label = *self.func_labels.get("p_mem_write32").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // mov [rcx], edx
+            self.enc.emit(&[0x89, 0x11]); // mov [rcx], edx
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_mem_read64(rcx=addr) -> rax — read 8 bytes from memory
+        let label = *self.func_labels.get("p_mem_read64").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // mov rax, [rcx]
+            self.enc.emit(&[0x48, 0x8B, 0x01]); // mov rax, [rcx]
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_mem_write64(rcx=addr, rdx=val) — write 8 bytes to memory
+        let label = *self.func_labels.get("p_mem_write64").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // mov [rcx], rdx
+            self.enc.emit(&[0x48, 0x89, 0x11]); // mov [rcx], rdx
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
     }
 
     /// Generate GDT stubs (Phase 5A.5)
@@ -4351,7 +4637,7 @@ impl PeCodeGen {
 
     /// p_enter_user_mode(rcx = entry_addr, rdx = stack_addr) -> void
     /// Transitions from ring 0 (kernel) to ring 3 (user) via iretq.
-    /// Sets up the iret frame: SS=0x20, RSP=stack_addr, RFLAGS=0x202, CS=0x18, RIP=entry_addr
+    /// Sets up the iret frame: SS=0x23, RSP=stack_addr, RFLAGS=0x202, CS=0x1B, RIP=entry_addr
     /// Switches CR3 to user page tables (0x72000) for isolation before iretq.
     fn gen_enter_user_mode(&mut self) {
         let label = *self.func_labels.get("p_enter_user_mode").unwrap();
@@ -4396,6 +4682,8 @@ impl PeCodeGen {
         let label = *self.func_labels.get("p_serial_init").unwrap();
         self.enc.place_label(label);
         if self.bare_mode {
+            // Debug: write 'S' to VGA at 0xB8002
+            self.enc.emit(&[0xC6, 0x04, 0x25, 0x02, 0x80, 0x0B, 0x00, 0x53]);
             // Disable interrupts: outb(0x3F8 + 1, 0x00)
             self.enc.mov_imm32(Reg::Rdx, 0x3F9); // COM1 + 1
             self.enc.xor_rr(Reg::Rax, Reg::Rax);
@@ -8064,6 +8352,224 @@ impl PeCodeGen {
         self.enc.add_rsp_i32(40);
         self.enc.pop(Reg::R14);
         self.enc.pop(Reg::R13);
+        self.enc.pop(Reg::R12);
+        self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
+        self.enc.pop(Reg::Rbp);
+        self.enc.ret();
+    }
+
+    // ─── p_argc() -> rax = i64 ───
+    // Returns the number of command-line arguments.
+    // On Windows, GetCommandLineA returns a single string; we count tokens.
+
+    fn gen_argc(&mut self) {
+        let label = *self.func_labels.get("p_argc").unwrap();
+        self.enc.place_label(label);
+        // GetCommandLineA() -> rax = *u8 (command line string)
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_rip(self.iat_off(IAT_GET_COMMAND_LINE_A));
+        self.enc.add_rsp_i32(32);
+        // rax = command line string (or NULL)
+        // Count whitespace-separated tokens
+        self.enc.mov_rr(Reg::Rcx, Reg::Rax); // rcx = ptr
+        self.enc.xor_self(Reg::Rax); // count = 0
+        let done = self.enc.alloc_label();
+        let loop_start = self.enc.alloc_label();
+        self.enc.test_rr(Reg::Rcx, Reg::Rcx);
+        self.enc.jcc_label(0x4, done); // jz — NULL command line
+        // Skip leading whitespace
+        self.enc.place_label(loop_start);
+        self.enc.mov_reg8_ptr(Reg::Rdx, Reg::Rcx); // load byte
+        self.enc.test_rr(Reg::Rdx, Reg::Rdx);
+        self.enc.jcc_label(0x4, done); // jz — end of string
+        // Skip whitespace
+        let not_ws = self.enc.alloc_label();
+        self.enc.cmp_r8_i8(Reg::Rdx, ' ' as i8);
+        self.enc.jcc_label(0x5, not_ws); // jne — not space
+        self.enc.inc_r(Reg::Rcx); // advance
+        self.enc.jmp_label(loop_start);
+        self.enc.place_label(not_ws);
+        // Found a token — increment count
+        self.enc.inc_r(Reg::Rax); // count++
+        // Skip token until whitespace or end
+        let skip_tok = self.enc.alloc_label();
+        self.enc.place_label(skip_tok);
+        self.enc.mov_reg8_ptr(Reg::Rdx, Reg::Rcx);
+        self.enc.test_rr(Reg::Rdx, Reg::Rdx);
+        self.enc.jcc_label(0x4, done); // jz — end of string
+        self.enc.cmp_r8_i8(Reg::Rdx, ' ' as i8);
+        self.enc.jcc_label(0x4, done); // je — space found, done with token
+        self.enc.inc_r(Reg::Rcx);
+        self.enc.jmp_label(skip_tok);
+        self.enc.place_label(done);
+        self.enc.ret();
+    }
+
+    // ─── p_argv(rcx = index) -> rax = *u8 ───
+    // Returns the command-line argument at the given index, or NULL.
+
+    fn gen_argv(&mut self) {
+        let label = *self.func_labels.get("p_argv").unwrap();
+        self.enc.place_label(label);
+        self.enc.push(Reg::Rbp);
+        self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
+        self.enc.push(Reg::R12); // index
+        self.enc.push(Reg::R13); // cmdline ptr
+        self.enc.push(Reg::R14); // current token start
+        self.enc.sub_rsp_i32(24); // align (3 pushes = 24)
+        // r12 = index
+        self.enc.mov_rr(Reg::R12, Reg::Rcx);
+        // GetCommandLineA()
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_rip(self.iat_off(IAT_GET_COMMAND_LINE_A));
+        self.enc.add_rsp_i32(32);
+        self.enc.mov_rr(Reg::R13, Reg::Rax); // r13 = cmdline
+        self.enc.xor_self(Reg::R14); // r14 = token start (NULL = not found)
+        // If cmdline is NULL, return NULL
+        let cmd_null = self.enc.alloc_label();
+        self.enc.test_rr(Reg::R13, Reg::R13);
+        self.enc.jcc_label(0x4, cmd_null); // jz
+        // Walk tokens, counting. When count == index, save token start.
+        let scan_start = self.enc.alloc_label();
+        let tok_done = self.enc.alloc_label();
+        let skip_ws = self.enc.alloc_label();
+        let found_tok = self.enc.alloc_label();
+        let skip_tok = self.enc.alloc_label();
+        // rax = current index (0)
+        self.enc.xor_self(Reg::Rax);
+        self.enc.place_label(scan_start);
+        // Skip whitespace
+        self.enc.place_label(skip_ws);
+        self.enc.mov_reg8_ptr(Reg::Rdx, Reg::R13);
+        self.enc.test_rr(Reg::Rdx, Reg::Rdx);
+        self.enc.jcc_label(0x4, tok_done); // jz — end
+        self.enc.cmp_r8_i8(Reg::Rdx, ' ' as i8);
+        self.enc.jcc_label(0x5, found_tok); // jne — not space, found token
+        self.enc.inc_r(Reg::R13);
+        self.enc.jmp_label(skip_ws);
+        self.enc.place_label(found_tok);
+        // Check if this is the token we want
+        self.enc.cmp_rr(Reg::Rax, Reg::R12);
+        let not_this = self.enc.alloc_label();
+        self.enc.jcc_label(0x5, not_this); // jne — not this index
+        // Found! Save start
+        self.enc.mov_rr(Reg::R14, Reg::R13);
+        self.enc.jmp_label(tok_done);
+        self.enc.place_label(not_this);
+        // Skip this token
+        self.enc.place_label(skip_tok);
+        self.enc.mov_reg8_ptr(Reg::Rdx, Reg::R13);
+        self.enc.test_rr(Reg::Rdx, Reg::Rdx);
+        self.enc.jcc_label(0x4, tok_done); // jz — end
+        self.enc.cmp_r8_i8(Reg::Rdx, ' ' as i8);
+        self.enc.jcc_label(0x4, tok_done); // je — space, token done
+        self.enc.inc_r(Reg::R13);
+        self.enc.jmp_label(skip_tok);
+        // After skipping token, increment index and loop
+        self.enc.inc_r(Reg::Rax);
+        self.enc.jmp_label(scan_start);
+        self.enc.place_label(tok_done);
+        // If r14 is NULL, return NULL
+        self.enc.test_rr(Reg::R14, Reg::R14);
+        self.enc.jcc_label(0x4, cmd_null); // jz
+        // Allocate a copy of the token (up to 4KB)
+        self.enc.mov_rr(Reg::Rcx, Reg::R14); // src
+        self.enc.mov_imm32(Reg::Rdx, 0x1000); // max 4KB
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_label(*self.func_labels.get("p_malloc").unwrap());
+        self.enc.add_rsp_i32(32);
+        // rax = dst buffer. Copy bytes until space or null.
+        self.enc.mov_rr(Reg::R12, Reg::Rax); // r12 = dst
+        let copy_start = self.enc.alloc_label();
+        let copy_done = self.enc.alloc_label();
+        self.enc.place_label(copy_start);
+        self.enc.mov_reg8_ptr(Reg::Rdx, Reg::R14); // load src byte
+        self.enc.test_rr(Reg::Rdx, Reg::Rdx);
+        self.enc.jcc_label(0x4, copy_done); // jz — null
+        self.enc.cmp_r8_i8(Reg::Rdx, ' ' as i8);
+        self.enc.jcc_label(0x4, copy_done); // je — space
+        self.enc.mov_mem_reg8_ptr(Reg::R12, Reg::Rdx); // store byte
+        self.enc.inc_r(Reg::R14);
+        self.enc.inc_r(Reg::R12);
+        self.enc.jmp_label(copy_start);
+        self.enc.place_label(copy_done);
+        // Null-terminate
+        self.enc.xor_self(Reg::Rdx);
+        self.enc.mov_mem_reg8_ptr(Reg::R12, Reg::Rdx);
+        // Return rax (original dst = result - bytes copied, but we saved dst in r12)
+        // Actually rax still points to the start of the buffer
+        self.enc.jmp_label(cmd_null);
+        self.enc.place_label(cmd_null);
+        // rax = result (either the buffer or NULL if not found)
+        self.enc.add_rsp_i32(24);
+        self.enc.pop(Reg::R14);
+        self.enc.pop(Reg::R13);
+        self.enc.pop(Reg::R12);
+        self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
+        self.enc.pop(Reg::Rbp);
+        self.enc.ret();
+    }
+
+    // ─── p_system(rcx = cmd) -> rax = i64 (exit code) ───
+    // Runs a command via CreateProcessA + WaitForSingleObject.
+
+    fn gen_system(&mut self) {
+        let label = *self.func_labels.get("p_system").unwrap();
+        self.enc.place_label(label);
+        self.enc.push(Reg::Rbp);
+        self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
+        self.enc.push(Reg::R12); // cmd
+        self.enc.sub_rsp_i32(104); // 32 shadow + 72 for STARTUPINFO+PROCESS_INFORMATION
+        // r12 = cmd
+        self.enc.mov_rr(Reg::R12, Reg::Rcx);
+        // Zero out STARTUPINFO (68 bytes) at rsp+32
+        // Zero out PROCESS_INFORMATION (24 bytes) at rsp+32+68 = rsp+100
+        self.enc.xor_self(Reg::Rax);
+        for off in (0..104).step_by(8) {
+            self.enc.mov_mem_disp_reg(Reg::Rsp, 32 + off, Reg::Rax);
+        }
+        // Set STARTUPINFO.cb = 68 (at rsp+32)
+        self.enc.mov_imm32(Reg::Rax, 68);
+        self.enc.mov_mem_disp_reg32(Reg::Rsp, 32, Reg::Rax);
+        // CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)
+        self.enc.xor_self(Reg::Rcx); // lpApplicationName = NULL
+        self.enc.mov_rr(Reg::Rdx, Reg::R12); // lpCommandLine = cmd
+        self.enc.xor_self(Reg::R8); // lpProcessAttributes = NULL
+        self.enc.xor_self(Reg::R9); // lpThreadAttributes = NULL
+        // Stack args: bInheritHandles=FALSE, dwCreationFlags=0, lpEnvironment=NULL,
+        //            lpCurrentDirectory=NULL, lpStartupInfo=&si, lpProcessInformation=&pi
+        self.enc.sub_rsp_i32(48); // 32 shadow + 6 stack args
+        self.enc.xor_self(Reg::Rax);
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::Rax); // bInheritHandles = FALSE
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 40, Reg::Rax); // dwCreationFlags = 0
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 48, Reg::Rax); // lpEnvironment = NULL
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 56, Reg::Rax); // lpCurrentDirectory = NULL
+        self.enc.lea_rbp(Reg::Rax, -80); // &si (at rbp-80)
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 64, Reg::Rax); // lpStartupInfo
+        self.enc.lea_rbp(Reg::Rax, -12); // &pi (at rbp-80+68 = rbp-12)
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 72, Reg::Rax); // lpProcessInformation
+        self.enc.call_rip(self.iat_off(IAT_CREATE_PROCESS_A));
+        self.enc.add_rsp_i32(48);
+        // Check if CreateProcess succeeded (rax != 0)
+        self.enc.test_rr(Reg::Rax, Reg::Rax);
+        let fail = self.enc.alloc_label();
+        self.enc.jcc_label(0x4, fail); // jz — failed
+        // WaitForSingleObject(pi.hProcess, INFINITE)
+        // hProcess is at rsp+32+68+0 = rsp+100 (first field of PROCESS_INFORMATION)
+        self.enc.mov_reg_mem_disp(Reg::Rcx, Reg::Rsp, 32 + 68); // hProcess
+        self.enc.mov_imm32(Reg::Rdx, -1); // INFINITE = 0xFFFFFFFF
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_rip(self.iat_off(IAT_WAIT_FOR_SINGLE_OBJECT));
+        self.enc.add_rsp_i32(32);
+        // Return 0 (success)
+        self.enc.xor_self(Reg::Rax);
+        let done = self.enc.alloc_label();
+        self.enc.jmp_label(done);
+        self.enc.place_label(fail);
+        // Return -1 (failure)
+        self.enc.mov_imm32(Reg::Rax, -1);
+        self.enc.place_label(done);
+        self.enc.add_rsp_i32(104);
         self.enc.pop(Reg::R12);
         self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
         self.enc.pop(Reg::Rbp);

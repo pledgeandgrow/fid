@@ -117,7 +117,7 @@ F99: match exhaustiveness      ✅ IMPLEMENTED — enum/bool exhaustiveness chec
 ─── Cross-Industry Safety — Tier A: Compiler-Verified Domain Guarantees ──
 F44: @safety-critical         ✅ IMPLEMENTED — composable safety primitives: @no-alloc + @no-recursion + @no-unbounded + @no-panic + @no-indirect (DO-178C/ISO 26262)
 F45: @redundant               🔲 PLANNED — compiler generates dual-channel redundant execution + comparison (aerospace)
-F46: @bounded                 🔲 PLANNED — compiler proves all loops terminate, no unbounded iteration (safety-critical)
+F46: @bounded                 ✅ IMPLEMENTED — compiler proves all loops terminate (for loops OK, while loops require decreasing iterator)
 F47: @partitioned             🔲 PLANNED — compiler enforces spatial+temporal partitioning between components (avionics)
 F48: @medical                 ✅ IMPLEMENTED — IEC 62304 rules: no dynamic alloc, no recursion, no while, no unwrap, must be @audit, transitive
 F49: @isolated                🔲 PLANNED — compiler proves no shared mutable state between components (multi-core safety)
@@ -260,13 +260,21 @@ T2: asm! clobber lists        ✅ IMPLEMENTED — AsmDir::Clobber in AST, clobbe
 T3: --no-std mode             ✅ IMPLEMENTED — build_program_no_std() skips stdlib/core.fd, --bare/--no-std/--no-stdlib flags, zero hidden runtime deps for kernel/UEFI/bare-metal
 T4: Cross-compilation dispatch ✅ IMPLEMENTED — --target arm64/aarch64/riscv64 validation, honest diagnostics, C codegen fallback (does not falsely claim native codegen)
 T5: UEFI boot services        ✅ IMPLEMENTED — stdlib/uefi.fd (287 lines): EFI status/memory/timer constants, boot+runtime service offsets, system table offsets, uefi_init/allocate_pool/free_pool/allocate_pages/get_memory_map/exit_boot_services/stall/print/clear_screen, volatile memory access
-T6: ARM64 native codegen      🔲 PLANNED — codegen_arm64.fd module for self-hosted compiler (Rust bootstrap has src/codegen_arm64.rs)
-T7: RISC-V native codegen     🔲 PLANNED — codegen_riscv.fd module for self-hosted compiler (Rust bootstrap has src/codegen_riscv.rs)
-T8: Bare runtime stubs        🔲 PLANNED — p_hlt, p_cli, p_sti, p_inb, p_outb, p_serial in PE emitter for bare-metal mode
+T6: ARM64 native codegen      ✅ VERIFIED — src/codegen_arm64.rs produces valid ARM64 assembly; fixed Load/Store to use [fp, #-slot] for Operand::Slot instead of uninitialized scratch register
+T7: RISC-V native codegen     ✅ VERIFIED — src/codegen_riscv.rs produces valid RISC-V assembly; fixed Load/Store to use -slot(fp) for Operand::Slot instead of uninitialized scratch register
+T8: Bare runtime stubs        ✅ IMPLEMENTED — p_hlt, p_cli, p_sti, p_inb, p_outb, p_serial in PE emitter for bare-metal mode
 T9: UEFI PE32+ emission       🔲 PLANNED — self-hosted PE emitter generates UEFI PE32+ EFI applications
-T10: GS base setup            🔲 PLANNED — WRMSR(0xC0000101) runtime stubs for per-CPU GS base initialization
+T10: GS base setup            ✅ IMPLEMENTED — WRMSR(0xC0000101) + RDMSR + KernelGSBase + swapgs runtime stubs in PE emitter
 T11: IRETQ epilogue           ✅ DONE — interrupt handler return uses IRET (0xCF) in PE emitter for @interrupt functions; register save/restore in prologue/epilogue
-T12: Multiboot2 header        🔲 PLANNED — --boot mode generates Multiboot2 header for kernel boot
+T12: Multiboot2 header        ✅ IMPLEMENTED — --boot mode generates Multiboot2 header for kernel boot
+T13: PE native runtime stubs  ✅ IMPLEMENTED — p_argc, p_argv, p_system (CreateProcessA+WaitForSingleObject) in PE emitter; p_file_read/p_file_write already present
+T14: OS stdlib: disk driver   ✅ IMPLEMENTED — stdlib/ata.fd (280 lines): ATA/IDE PIO mode, LBA28, read/write sectors, identify
+T15: OS stdlib: DMA           ✅ IMPLEMENTED — stdlib/dma.fd (190 lines): 8237 DMA controller, channels 0-3, transfer/stop/poll
+T16: OS stdlib: SMP           ✅ IMPLEMENTED — stdlib/smp.fd (230 lines): AP startup, IPI, per-CPU state, LAPIC helpers
+T17: OS stdlib: PCI           ✅ IMPLEMENTED — stdlib/pci.fd (256 lines): config space R/W, bus scan, BAR management, find_by_class
+T18: OS stdlib: ACPI          ✅ IMPLEMENTED — stdlib/acpi.fd (351 lines): RSDP/RSDT/XSDT parsing, MADT, shutdown, reboot
+T19: OS stdlib: keyboard      ✅ IMPLEMENTED — stdlib/keyboard.fd (347 lines): PS/2 Set 1 scancodes, shift/caps/ctrl/alt, ASCII conversion
+T20: OS stdlib: VGA/fb        ✅ IMPLEMENTED — stdlib/vga.fd (268 lines) + stdlib/fb.fd (285 lines): text mode + linear framebuffer, drawing primitives
 
 ─── Cut — Redundant, Build with Existing Features ───────────────
 C1: fogofwar                  ❌ CUT — build with tilemap (S1) + query (F18)

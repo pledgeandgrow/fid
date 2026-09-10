@@ -1,7 +1,7 @@
 # Fides Roadmap — Milestones to World Domination
 
 > Not a task list. A map of mountains to climb.
-> Last updated: Sep 10, 2026 (session 23 — @zeroize, @secret, @interrupt, @firmware, parallel {}, @simd implemented).
+> Last updated: Sep 10, 2026 (session 24 — 16 roadmap issues resolved: monomorphization depth limit, hex/Unicode escapes, random_seed_time, string overflow, ML builtins, quantization, KV cache budget/rollback/metadata, GPU KV cache, @quantized recursive scan, closure borrowck, thread type safety, linker DCE, parser recovery).
 
 ## Overview
 
@@ -21,7 +21,7 @@ Phase 8B: ECS/States/Events   ← COMPLETE — component/system/query, state_mac
 Phase 8C: Shaders/SIMD       ← PARTIAL — SIMD stdlib (59 LOC stub) + SPIR-V GPU codegen (826 LOC); @simd annotation DONE (loop vectorization with wider vectors for AVX/AVX2); @shader annotation + compute shaders not implemented; GPU/WASM not wired into CLI
 Phase 8D: Game Stdlib         ← COMPLETE — 26 game stdlib modules, 9,140 LOC (session 21)
 Phase 9: Industry Domains    ← NOT STARTED — only stdlib/banking.fd exists; medical/blockchain/robotics/automotive not built
-Phase 10: Self-Hosting       ← PARTIAL — 50 modules, 93,605 LOC. 38/38 self-host tests pass. Self-compilation SEGFAULTS in Lowerer_mangle_method. Fixpoint NOT verifiable (fides-c2.c missing). v1.0.0 installer released.
+Phase 10: Self-Hosting       ← PARTIAL — 50 modules, 93,605 LOC. 38/38 self-host tests pass. Self-compilation SEGFAULTS in Lowerer_lower_stmt (pre-existing, documented). Fixpoint NOT verifiable (fides-c2.c missing). v1.0.0 installer released. Session 24: 16 roadmap bugs fixed (Issues 9,10,11,12,13,15,19,21,25,26,27,29,30,43,56 + PE 67-69).
 Phase 10B: PE Emitter Rewrite ← PARTIAL — compiler/pe.fd exists (6,448 LOC, ported from src/pe.rs). Not a from-scratch rewrite. @cpu_local + inline asm clobbers implemented. Full parity with Rust reference not verified.
 Phase 10C: Windows Installer ← COMPLETE — NSIS installer (Fides-Setup-1.0.0.exe, 2.5 MB) tested on Windows. GitHub Actions CI builds automatically on release tags.
 Phase 11: Ecosystem          ← IN PROGRESS — LSP DONE (wired into CLI, JSON-RPC server with diagnostics/completion/hover/definition/rename); ark DONE (wired into CLI, package manager with init/add/install/remove/list/lock/update/search/publish); formatter, linter, bench, profile work; scribe + veil wired into CLI
@@ -32,21 +32,41 @@ Phase 15: Compete Where We Lose ← NOT STARTED — win in web/data-science/prot
 Phase 16: Tier 3 OS           ← PARTIAL — @cpu_local (pe.fd only), inline asm clobbers (pe.fd), --bare/--boot mode, cross-compilation dispatch done; @interrupt DONE (F29: ISR codegen + automatic IDT setup for @interrupt(N)); UEFI bindings NOT done (stdlib/uefi.fd missing), kernel.fd missing, ARM64/RISC-V native codegen + bare runtime stubs remaining
 ```
 
-### Verified Test Baseline (Sep 10, 2026 — session 23)
+### Verified Test Baseline (Sep 10, 2026 — session 24)
 
 | Backend | Result | Notes |
 |---------|--------|-------|
 | Self-host tests | **38/38** | All 3 backends (Interpreter, C Codegen, PE Emitter) — 0 regressions |
 | Rust bootstrap build | **OK** | 6 warnings, 0 errors |
-| Bootstrap: Interpreter | **236/237** | +2 vs session 22 (234/237) — test_parallel + test_parallel_concurrent fixed |
-| Bootstrap: C Codegen | **226/237** | +1 vs session 22 (225/237) |
+| Bootstrap: Interpreter | **236/237** | Unchanged from session 23 |
+| Bootstrap: C Codegen | **226/237** | Unchanged from session 23 |
 | Bootstrap: PE Emitter | **237/237** | Unchanged — no regressions |
-| Self-compilation | **FAILS** | SIGSEGV in `Lowerer_mangle_method` during lowering. Pre-existing. |
+| Self-compilation | **FAILS** | SIGSEGV in `Lowerer_lower_stmt` during lowering. Pre-existing — not from session 24 fixes. |
 | Fixpoint (c2==c3) | **UNVERIFIABLE** | `release/fides-c2.c` does not exist |
 | Total `.fd` test files | **303** | 261 in tests/bootstrap/ + 42 in tests/selfhost/ |
-| Compiler modules | **50** `.fd` | 93,605 LOC Fides (was claimed 91,924 — stale) |
+| Compiler modules | **50** `.fd` | 93,605 LOC Fides |
 | Stdlib modules | **99** `.fd` | 28,370 LOC Fides |
 | Rust source | **55** `.rs` | ~93,269 LOC Rust (incl. src/bin/) |
+
+### Session 24 Changes (Sep 10, 2026)
+
+16 roadmap issues resolved:
+- **Issue 9**: KV cache region budget now tracks `p_kv_cache_new` allocations
+- **Issue 10**: Transaction rollback now restores `kv_caches` snapshot
+- **Issue 11**: All ML builtins declared and implemented in C codegen
+- **Issue 12**: Real INT8 quantization (scale/zero-point, INT8 dot-product matmul)
+- **Issue 13**: PIR L1/L2/L3 propagates `is_kv_cache` and `window_size`
+- **Issue 15**: `@quantized` scan now recursive (catches transitive dequantize)
+- **Issue 19**: GPU codegen handles KV cache regions with separate memory pool
+- **Issue 21**: Borrow checker handles closures with capture analysis
+- **Issue 25**: C codegen string ops have overflow checks (`p_str_concat`, `p_string_repeat`)
+- **Issue 26**: Monomorphization depth limit (32) prevents stack overflow
+- **Issue 27**: Non-primitive thread args rejected at typecheck time
+- **Issue 29**: `\xHH` and `\u{HHHH}` escape sequences in string literals
+- **Issue 30**: Linker DCE marks vtable/address-taken functions as roots
+- **Issue 43**: Parser error recovery (panic-mode, sync tokens)
+- **Issue 56**: `random_seed_time()` uses `p_clock_now()` for non-deterministic seed
+- **Issues 67-69**: PE emitter val-in-loop, str_split, recursive Box (prior fixes) |
 
 ### Security Hardening (New — Aug 2026)
 

@@ -109,7 +109,8 @@ pub enum L1Inst {
 
     // ─── Region lifetime (L1 only) ───
     /// Create a new named region. Returns a region handle (opaque pointer).
-    NewRegion { name: String },
+    /// Issue 13: Preserve is_gpu, is_kv_cache, and window_size metadata from IR.
+    NewRegion { name: String, is_gpu: bool, is_kv_cache: bool, window_size: usize },
     /// Free a region, invalidating every allocation tied to it.
     FreeRegion { region: PValue },
 
@@ -319,6 +320,12 @@ pub enum MemRegion {
     /// A named region — distinct from Heap and Stack.
     /// Two different named regions never alias each other.
     Named(String),
+    /// Issue 19: GPU region — allocations go to GPU memory (VRAM).
+    /// The GPU backend should handle these differently from CPU regions.
+    Gpu(String),
+    /// Issue 19: KV cache region — bounded memory for LLM KV cache.
+    /// Allocations here are subject to the region budget and sliding window eviction.
+    KvCache(String),
 }
 
 impl fmt::Display for MemRegion {
@@ -328,6 +335,8 @@ impl fmt::Display for MemRegion {
             MemRegion::Heap => write!(f, "heap"),
             MemRegion::Static => write!(f, "static"),
             MemRegion::Named(name) => write!(f, "region.{}", name),
+            MemRegion::Gpu(name) => write!(f, "gpu.{}", name),
+            MemRegion::KvCache(name) => write!(f, "kv_cache.{}", name),
         }
     }
 }
@@ -899,7 +908,12 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
             }
             Inst::Panic { message } => L1Inst::Panic { message: message.clone() },
             Inst::Asm { template, .. } => L1Inst::Panic { message: format!("inline asm not supported in PIR: {}", template) },
-            Inst::RegionBegin { name, .. } => L1Inst::NewRegion { name: name.clone() },
+            Inst::RegionBegin { name, is_gpu, is_kv_cache, window_size } => L1Inst::NewRegion {
+                name: name.clone(),
+                is_gpu: *is_gpu,
+                is_kv_cache: *is_kv_cache,
+                window_size: window_size.unwrap_or(0) as usize,
+            },
             Inst::RegionEnd { .. } => L1Inst::FreeRegion { region: ValueId(0) },
             Inst::GradBegin { .. } | Inst::GradEnd | Inst::Backward { .. } => {
                 // Autodiff markers — lower to a no-op constant (will be DCE'd)
@@ -1005,16 +1019,20 @@ fn lower_func_l1_to_l2(f: &L1Function) -> L2Function {
     let mut values: HashMap<PValue, L2Inst> = HashMap::new();
     // Track NewRegion and FreeRegion handles so we can drop them from the
     // block instruction lists and remap AllocaIn that referenced NewRegion
-    // to Heap.
+    // to Heap (or Gpu/KvCache for specialized regions — Issue 19).
     let mut region_handles: HashMap<PValue, ()> = HashMap::new();
+    // Issue 19: Track region metadata (is_gpu, is_kv_cache, name) for each handle
+    // so AllocaIn can be remapped to the correct MemRegion variant.
+    let mut region_meta: HashMap<PValue, (bool, bool, String)> = HashMap::new();
     let mut dropped_insts: HashMap<PValue, ()> = HashMap::new();
 
     for (vid, (inst, region, _effects, _line)) in &f.values {
         match inst {
-            L1Inst::NewRegion { .. } => {
+            L1Inst::NewRegion { name, is_gpu, is_kv_cache, .. } => {
                 // Drop the instruction; record the handle so FreeRegion and
                 // any AllocaIn referencing it can be remapped.
                 region_handles.insert(*vid, ());
+                region_meta.insert(*vid, (*is_gpu, *is_kv_cache, name.clone()));
                 dropped_insts.insert(*vid, ());
                 continue;
             }
@@ -1050,8 +1068,22 @@ fn lower_func_l1_to_l2(f: &L1Function) -> L2Function {
             },
 
             L1Inst::AllocaIn { region: r, ty } => {
+                // Issue 19: Map region handle to the correct MemRegion variant
+                // based on the region's metadata (is_gpu, is_kv_cache).
                 let mr = match r {
-                    RegionRef::Handle(h) if region_handles.contains_key(h) => MemRegion::Heap,
+                    RegionRef::Handle(h) if region_handles.contains_key(h) => {
+                        if let Some((is_gpu, is_kv_cache, name)) = region_meta.get(h) {
+                            if *is_kv_cache {
+                                MemRegion::KvCache(name.clone())
+                            } else if *is_gpu {
+                                MemRegion::Gpu(name.clone())
+                            } else {
+                                MemRegion::Named(name.clone())
+                            }
+                        } else {
+                            MemRegion::Heap
+                        }
+                    }
                     other => mem_region_of(other),
                 };
                 L2Inst::Alloca { ty: ty.clone(), region: mr }
@@ -1758,7 +1790,13 @@ fn fmt_l1_inst(i: &L1Inst) -> String {
         GlobalAddr { name, ty } => format!("globaladdr {} {}", ty, name),
         BinOp { op, left, right, ty } => format!("binop {:?} {} {}, {} -> {}", op, ty, left, right, ty),
         UnaryOp { op, operand, ty } => format!("unop {:?} {} {} -> {}", op, ty, operand, ty),
-        NewRegion { name } => format!("new_region \"{}\"", name),
+        NewRegion { name, is_gpu, is_kv_cache, window_size } => {
+            let mut s = format!("new_region \"{}\"", name);
+            if *is_gpu { s.push_str(" gpu"); }
+            if *is_kv_cache { s.push_str(" kv_cache"); }
+            if *window_size > 0 { s.push_str(&format!(" window={}", window_size)); }
+            s
+        }
         FreeRegion { region } => format!("free_region {}", region),
         AllocaIn { region, ty } => format!("alloca_in {} {}", region, ty),
         Load { ptr, ty, .. } => format!("load {} {}", ty, ptr),

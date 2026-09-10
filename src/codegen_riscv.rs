@@ -204,14 +204,34 @@ impl RiscVCodeGen {
 
             L3Inst::Load { dst, ptr, .. } => {
                 let d = vreg_to_reg(dst);
-                let p = operand_to_reg(ptr);
-                self.emit(&format!("    ld {}, 0({})", d, p));
+                match ptr {
+                    Operand::Slot(s) => {
+                        self.emit(&format!("    ld {}, -{}(fp)", d, s.0));
+                    }
+                    Operand::VReg(v) => {
+                        let p = vreg_to_reg(v);
+                        self.emit(&format!("    ld {}, 0({})", d, p));
+                    }
+                    _ => {
+                        self.emit(&format!("    ld {}, 0(t0)", d));
+                    }
+                }
             }
 
             L3Inst::Store { ptr, val, .. } => {
-                let p = operand_to_reg(ptr);
                 let v = operand_to_reg(val);
-                self.emit(&format!("    sd {}, 0({})", v, p));
+                match ptr {
+                    Operand::Slot(s) => {
+                        self.emit(&format!("    sd {}, -{}(fp)", v, s.0));
+                    }
+                    Operand::VReg(v) => {
+                        let p = vreg_to_reg(v);
+                        self.emit(&format!("    sd {}, 0({})", v, p));
+                    }
+                    _ => {
+                        self.emit(&format!("    sd {}, 0(t0)", v));
+                    }
+                }
             }
 
             L3Inst::FieldAddr { dst, base, offset, .. } => {
