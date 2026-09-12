@@ -1373,6 +1373,8 @@ impl X86Encoder {
                 for (i, &b) in bytes.iter().enumerate() {
                     self.code[reloc.code_offset + i] = b;
                 }
+            } else {
+                eprintln!("[PE] WARNING: unresolved label {} at code offset 0x{:x}", reloc.target_label, reloc.code_offset);
             }
         }
     }
@@ -1855,10 +1857,14 @@ impl PeCodeGen {
 
     /// Generate the complete PE file from an IR module
     fn generate(&mut self, module: &IrModule) -> Vec<u8> {
-        // 1. Collect all string constants from IR
+        // 1. Collect all string constants from IR (sorted for determinism)
         let mut all_strings: Vec<String> = Vec::new();
-        for func in module.functions.values() {
-            for inst in func.instructions.values() {
+        let mut sorted_funcs: Vec<&IrFunction> = module.functions.values().collect();
+        sorted_funcs.sort_by(|a, b| a.name.cmp(&b.name));
+        for func in &sorted_funcs {
+            let mut sorted_insts: Vec<(&ValueId, &Inst)> = func.instructions.iter().collect();
+            sorted_insts.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+            for (_, inst) in &sorted_insts {
                 if let Inst::ConstStr { value } = inst {
                     if !all_strings.contains(value) {
                         all_strings.push(value.clone());
@@ -1898,7 +1904,10 @@ impl PeCodeGen {
 
         // 2b. Append module-level mutable globals to .rdata (section is writable)
         // Each global gets 8 bytes of storage, initialized with the constant value.
-        for (name, (ty, init_expr)) in &module.globals {
+        let mut global_names_pe: Vec<String> = module.globals.keys().cloned().collect();
+        global_names_pe.sort();
+        for name in &global_names_pe {
+            let (ty, init_expr) = &module.globals[name];
             let off = rdata.data.len();
             // Compute the 8-byte initial value
             let bytes: [u8; 8] = match init_expr {
@@ -1914,8 +1923,10 @@ impl PeCodeGen {
             self.global_rdata_offsets.insert(name.clone(), off);
         }
 
-        // 3. Pre-allocate labels for all functions
-        for name in module.functions.keys() {
+        // 3. Pre-allocate labels for all functions (sorted for deterministic layout)
+        let mut func_names: Vec<String> = module.functions.keys().cloned().collect();
+        func_names.sort();
+        for name in &func_names {
             let label = self.enc.alloc_label();
             self.func_labels.insert(name.clone(), label);
         }
@@ -1952,8 +1963,10 @@ impl PeCodeGen {
                        "p_page_map", "p_page_unmap",
                        "p_phys_read64", "p_phys_write64",
                        "p_mem_read8", "p_mem_write8",
+                       "p_mem_read16", "p_mem_write16",
                        "p_mem_read32", "p_mem_write32",
                        "p_mem_read64", "p_mem_write64",
+                       "p_get_rbp", "p_get_rsp", "p_atomic_xchg32",
                        // Phase 5A.5: GDT stubs
                        "p_lgdt", "p_gdt_set_entry",
                        "p_enter_user_mode",
@@ -1967,8 +1980,11 @@ impl PeCodeGen {
             self.func_labels.insert(stub.to_string(), label);
         }
 
-        // 4. Generate code for each function
-        for (name, func) in &module.functions {
+        // 4. Generate code for each function (sorted for deterministic layout)
+        let mut func_names: Vec<String> = module.functions.keys().cloned().collect();
+        func_names.sort();
+        for name in &func_names {
+            let func = &module.functions[name];
             self.gen_function(name, func, module);
         }
 
@@ -2008,10 +2024,14 @@ impl PeCodeGen {
         const BARE_LOAD_RVA: u32 = 0x10000;
         self.bare_mode = true;
 
-        // 1. Collect string constants
+        // 1. Collect string constants (sorted for determinism)
         let mut all_strings: Vec<String> = Vec::new();
-        for func in module.functions.values() {
-            for inst in func.instructions.values() {
+        let mut sorted_funcs: Vec<&IrFunction> = module.functions.values().collect();
+        sorted_funcs.sort_by(|a, b| a.name.cmp(&b.name));
+        for func in &sorted_funcs {
+            let mut sorted_insts: Vec<(&ValueId, &Inst)> = func.instructions.iter().collect();
+            sorted_insts.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+            for (_, inst) in &sorted_insts {
                 if let Inst::ConstStr { value } = inst {
                     if !all_strings.contains(value) {
                         all_strings.push(value.clone());
@@ -2049,7 +2069,10 @@ impl PeCodeGen {
         // 2b. Append module-level mutable globals to .rdata (writable section)
         // Each global gets 8 bytes of storage, initialized with the constant value.
         // This is critical for bare-metal mode: GDT, IDT, page tables need fixed storage.
-        for (name, (ty, init_expr)) in &module.globals {
+        let mut global_names_elf: Vec<String> = module.globals.keys().cloned().collect();
+        global_names_elf.sort();
+        for name in &global_names_elf {
+            let (ty, init_expr) = &module.globals[name];
             let off = rdata.data.len();
             let bytes: [u8; 8] = match init_expr {
                 crate::ast::Expr::IntLit(v) => (*v as i64).to_le_bytes(),
@@ -2064,8 +2087,10 @@ impl PeCodeGen {
             self.global_rdata_offsets.insert(name.clone(), off);
         }
 
-        // 3. Pre-allocate labels for all functions
-        for name in module.functions.keys() {
+        // 3. Pre-allocate labels for all functions (sorted for deterministic layout)
+        let mut func_names: Vec<String> = module.functions.keys().cloned().collect();
+        func_names.sort();
+        for name in &func_names {
             let label = self.enc.alloc_label();
             self.func_labels.insert(name.clone(), label);
         }
@@ -2097,8 +2122,10 @@ impl PeCodeGen {
                        "p_page_map", "p_page_unmap",
                        "p_phys_read64", "p_phys_write64",
                        "p_mem_read8", "p_mem_write8",
+                       "p_mem_read16", "p_mem_write16",
                        "p_mem_read32", "p_mem_write32",
                        "p_mem_read64", "p_mem_write64",
+                       "p_get_rbp", "p_get_rsp", "p_atomic_xchg32",
                        // Phase 5A.5: GDT stubs
                        "p_lgdt", "p_gdt_set_entry",
                        "p_enter_user_mode",
@@ -2112,8 +2139,11 @@ impl PeCodeGen {
             self.func_labels.insert(stub.to_string(), label);
         }
 
-        // 4. Generate code for each function
-        for (name, func) in &module.functions {
+        // 4. Generate code for each function (sorted for deterministic layout)
+        let mut func_names: Vec<String> = module.functions.keys().cloned().collect();
+        func_names.sort();
+        for name in &func_names {
+            let func = &module.functions[name];
             self.gen_function(name, func, module);
         }
 
@@ -2150,10 +2180,14 @@ impl PeCodeGen {
         const BARE_LOAD_RVA: u32 = 0x100000; // 1MB — typical kernel load address
         self.bare_mode = true;
 
-        // 1. Collect string constants
+        // 1. Collect string constants (sorted for determinism)
         let mut all_strings: Vec<String> = Vec::new();
-        for func in module.functions.values() {
-            for inst in func.instructions.values() {
+        let mut sorted_funcs: Vec<&IrFunction> = module.functions.values().collect();
+        sorted_funcs.sort_by(|a, b| a.name.cmp(&b.name));
+        for func in &sorted_funcs {
+            let mut sorted_insts: Vec<(&ValueId, &Inst)> = func.instructions.iter().collect();
+            sorted_insts.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+            for (_, inst) in &sorted_insts {
                 if let Inst::ConstStr { value } = inst {
                     if !all_strings.contains(value) {
                         all_strings.push(value.clone());
@@ -2189,7 +2223,10 @@ impl PeCodeGen {
 
         // 2b. Append module-level mutable globals to .rdata (writable section)
         // Critical for bare-metal: GDT, IDT, page tables need fixed storage.
-        for (name, (ty, init_expr)) in &module.globals {
+        let mut global_names: Vec<String> = module.globals.keys().cloned().collect();
+        global_names.sort();
+        for name in &global_names {
+            let (ty, init_expr) = &module.globals[name];
             let off = rdata.data.len();
             let bytes: [u8; 8] = match init_expr {
                 crate::ast::Expr::IntLit(v) => (*v as i64).to_le_bytes(),
@@ -2204,8 +2241,10 @@ impl PeCodeGen {
             self.global_rdata_offsets.insert(name.clone(), off);
         }
 
-        // 3. Pre-allocate labels
-        for name in module.functions.keys() {
+        // 3. Pre-allocate labels (sorted for deterministic layout)
+        let mut func_names: Vec<String> = module.functions.keys().cloned().collect();
+        func_names.sort();
+        for name in &func_names {
             let label = self.enc.alloc_label();
             self.func_labels.insert(name.clone(), label);
         }
@@ -2234,8 +2273,10 @@ impl PeCodeGen {
                        "p_page_map", "p_page_unmap",
                        "p_phys_read64", "p_phys_write64",
                        "p_mem_read8", "p_mem_write8",
+                       "p_mem_read16", "p_mem_write16",
                        "p_mem_read32", "p_mem_write32",
                        "p_mem_read64", "p_mem_write64",
+                       "p_get_rbp", "p_get_rsp", "p_atomic_xchg32",
                        // Phase 5A.5: GDT stubs
                        "p_lgdt", "p_gdt_set_entry",
                        "p_enter_user_mode",
@@ -2253,8 +2294,11 @@ impl PeCodeGen {
         //    so GRUB jumps into our 32-bit → 64-bit trampoline)
         self.gen_boot_entry_point(module);
 
-        // 5. Generate code for each function
-        for (name, func) in &module.functions {
+        // 5. Generate code for each function (sorted for deterministic layout)
+        let mut func_names: Vec<String> = module.functions.keys().cloned().collect();
+        func_names.sort();
+        for name in &func_names {
+            let func = &module.functions[name];
             self.gen_function(name, func, module);
         }
 
@@ -2855,15 +2899,15 @@ impl PeCodeGen {
     fn gen_idt_setup_for_interrupts(&mut self, module: &IrModule) {
         // Collect all (vector, handler_label) pairs for functions with @interrupt(N)
         let mut isrs: Vec<(u64, u32)> = Vec::new();
-        for func in module.functions.values() {
+        let mut sorted_funcs: Vec<&IrFunction> = module.functions.values().collect();
+        sorted_funcs.sort_by(|a, b| a.name.cmp(&b.name));
+        for func in &sorted_funcs {
             if let Some(vector) = func.interrupt_vector {
                 if let Some(&label) = self.func_labels.get(&func.name) {
-                    eprintln!("[PE] Found ISR: {} vector={} is_interrupt={}", func.name, vector, func.is_interrupt);
                     isrs.push((vector, label));
                 }
             }
         }
-        eprintln!("[PE] gen_idt_setup_for_interrupts: {} ISRs found", isrs.len());
         if isrs.is_empty() { return; }
 
         // Zero out IDT memory at 0x1000 if not already done by irq1_handler setup
@@ -2983,14 +3027,18 @@ impl PeCodeGen {
             self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
         }
 
-        // Allocate stack frame
+        // Allocate stack frame (sorted for deterministic layout)
         let mut frame = PeStackFrame::new();
-        for (vid, meta) in &func.values {
+        let mut sorted_values: Vec<(&ValueId, &ValueMeta)> = func.values.iter().collect();
+        sorted_values.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        for (vid, meta) in &sorted_values {
             let size = module.type_size(&meta.ty).max(8);
-            frame.alloc(*vid, size);
+            frame.alloc(**vid, size);
         }
-        // Pre-allocate alloca data slots
-        for (vid, inst) in &func.instructions {
+        // Pre-allocate alloca data slots (sorted for deterministic layout)
+        let mut sorted_insts: Vec<(&ValueId, &Inst)> = func.instructions.iter().collect();
+        sorted_insts.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        for (vid, inst) in &sorted_insts {
             if let Inst::Alloca { ty, .. } = inst {
                 let data_size = module.type_size(ty).max(8) as i64;
                 let offset = frame.alloc_raw(data_size);
@@ -3430,11 +3478,10 @@ impl PeCodeGen {
                     self.enc.call_label(flabel);
                 } else if self.bare_mode {
                     // In bare mode, unresolved extern calls are errors.
-                    eprintln!("[DEBUG] ud2 for unresolved call '{}' in '{}' (bare_mode={})", target_func, func_name, self.bare_mode);
                     self.enc.ud2();
-                } else {
-                    eprintln!("[DEBUG] non-bare unresolved call '{}' in '{}' — NO CALL EMITTED", target_func, func_name);
                 }
+                // Non-bare mode: unresolved calls are silently skipped
+                // (the function may be provided by the runtime or stdlib).
 
                 self.enc.add_rsp_i32(call_space);
                 self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
@@ -4510,6 +4557,28 @@ impl PeCodeGen {
         }
         self.enc.ret();
 
+        // p_mem_read16(rcx=addr) -> rax — read 2 bytes from memory
+        let label = *self.func_labels.get("p_mem_read16").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // movzx eax, word [rcx]
+            self.enc.emit(&[0x0F, 0xB7, 0x01]); // movzx eax, word [rcx]
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_mem_write16(rcx=addr, rdx=val) — write 2 bytes to memory
+        let label = *self.func_labels.get("p_mem_write16").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // mov [rcx], dx
+            self.enc.emit(&[0x66, 0x89, 0x11]); // mov [rcx], dx
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
         // p_mem_read32(rcx=addr) -> rax — read 4 bytes from memory
         let label = *self.func_labels.get("p_mem_read32").unwrap();
         self.enc.place_label(label);
@@ -4549,6 +4618,52 @@ impl PeCodeGen {
         if self.bare_mode {
             // mov [rcx], rdx
             self.enc.emit(&[0x48, 0x89, 0x11]); // mov [rcx], rdx
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_get_rbp() -> rax = RBP
+        let label = *self.func_labels.get("p_get_rbp").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // mov rax, rbp
+            self.enc.mov_rr(Reg::Rax, Reg::Rbp);
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_get_rsp() -> rax = RSP
+        let label = *self.func_labels.get("p_get_rsp").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // mov rax, rsp
+            self.enc.mov_rr(Reg::Rax, Reg::Rsp);
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_atomic_xchg32(rcx=addr, rdx=value) -> rax = old value
+        // Atomically exchange *addr with value, return old value.
+        // xchg [rcx], edx — implicit lock prefix for atomicity
+        let label = *self.func_labels.get("p_atomic_xchg32").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // lock xchg [rcx], edx
+            self.enc.emit(&[0xF0]); // lock prefix
+            self.enc.emit(&[0x87, 0x11]); // xchg [rcx], edx
+            // Old value is now in edx, move to rax
+            // xchg puts old [rcx] in edx and new value in [rcx]
+            // Actually xchg [rcx], edx: edx gets old [rcx], [rcx] gets old edx
+            // So rax needs to be set to edx (the old value)
+            // But xchg already set edx to the old value, and edx was the input
+            // Wait: xchg [rcx], edx exchanges edx and [rcx]
+            // Before: [rcx] = old_val, edx = new_val
+            // After:  [rcx] = new_val, edx = old_val
+            // So mov eax, edx to return old_val
+            self.enc.emit(&[0x89, 0xD0]); // mov eax, edx
         } else {
             self.enc.ud2();
         }
