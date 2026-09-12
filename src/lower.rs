@@ -3718,6 +3718,12 @@ impl Lowerer {
                 // Check if it's a module-level mutable global
                 if let Some((ir_ty, _init)) = self.module.globals.get(name).cloned() {
                     let addr = self.emit_inst(Inst::GlobalAddr { name: name.clone(), ty: ir_ty.clone() });
+                    // For struct types, GlobalAddr already gives a pointer to the struct.
+                    // Return it directly without a Load (the C codegen emits struct globals
+                    // as values, not pointers).
+                    if matches!(ir_ty, IrType::Struct(_)) {
+                        return addr;
+                    }
                     return self.emit_inst(Inst::Load { ptr: addr, ty: ir_ty });
                 }
                 // Check if it's a known function name — emit as env struct with fn addr

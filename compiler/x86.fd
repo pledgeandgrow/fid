@@ -1,0 +1,1779 @@
+// x86.fd -- x86_64 stack-machine backend, ported from src/x86.rs (1420 LOC)
+//
+// Strategy: each SSA value lives on the stack. We use RAX as the accumulator.
+// This is simple, correct, and a starting point for register allocation later.
+//
+// Linux System V AMD64 calling convention:
+// - Integer args: RDI, RSI, RDX, RCX, R8, R9 (then stack)
+// - Return: RAX
+// - No shadow space (unlike Windows x64)
+// - Stack must be 16-byte aligned before CALL
+// - Output is AT&T syntax GAS assembly, consumed by elf64.rs assembler
+//
+// Adaptations from Rust:
+// 1. HashMap<K,V> -> Vec-based maps with helper structs
+// 2. format! / wln! macro -> direct string concatenation with int_to_str
+// 3. Option<T> -> Opt* enums
+// 4. String -> str, u32/u64 -> i64
+// 5. module.functions is Vec<IrFunctionEntry> (not HashMap)
+// 6. func.instructions -> func.insts (Vec<ValueIdInst>)
+// 7. func.values -> func.value_metas (Vec<ValueIdMeta>)
+// 8. Box::leak(...) -> just return the str
+// 9. or-patterns (A | B) -> separate arms (Fides doesn't support |)
+// 10. ConstFloat stores f64 (not u64 bits) -- use p_f64_to_bits/p_f32_to_bits
+//
+// Dependencies: compiler::ast, compiler::ir
+
+module compiler::x86;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+
+// ===========================================================================
+// Vec-based map entry structs (replace HashMap)
+// ===========================================================================
+
+// StackFrame.offsets: ValueId -> stack offset
+pub struct StackOffsetEntry {
+    pub id: i64,
+    pub offset: i64,
+}
+
+pub fn StackOffsetEntry_new(id: i64, offset: i64) -> StackOffsetEntry {
+    return StackOffsetEntry { id: id, offset: offset };
+}
+
+// StackFrame.alloca_slots: alloca ValueId -> data slot offset
+pub struct AllocaSlotEntry {
+    pub id: i64,
+    pub offset: i64,
+}
+
+pub fn AllocaSlotEntry_new(id: i64, offset: i64) -> AllocaSlotEntry {
+    return AllocaSlotEntry { id: id, offset: offset };
+}
+
+// X86CodeGen.string_labels: string content -> label
+pub struct StringLabelEntry {
+    pub key: str,
+    pub label: str,
+}
+
+pub fn StringLabelEntry_new(key: str, label: str) -> StringLabelEntry {
+    return StringLabelEntry { key: key, label: label };
+}
+
+// ===========================================================================
+// StackFrame
+// ===========================================================================
+
+pub struct StackFrame {
+    // Map from ValueId to stack offset (from RBP)
+    pub offsets: Vec<StackOffsetEntry>,
+    // Current stack size
+    pub size: i64,
+    // Pre-allocated offsets for Alloca data slots, keyed by alloca ValueId
+    pub alloca_slots: Vec<AllocaSlotEntry>,
+}
+
+pub fn StackFrame_new() -> StackFrame {
+    return StackFrame {
+        offsets: Vec::new(),
+        size: 0,
+        alloca_slots: Vec::new(),
+    };
+}
+
+// Allocate space for a value and return its offset
+pub fn StackFrame_alloc(self: &mut StackFrame, id: i64, size: i64) -> i64 {
+    // Align to size (min 8 for simplicity on 64-bit)
+    var align: i64 = 8;
+    if size <= 1 { align = 1; }
+    else if size <= 2 { align = 2; }
+    else if size <= 4 { align = 4; }
+    else { align = 8; }
+    self.size = (self.size + align - 1) & ~(align - 1);
+    self.size = self.size + size;
+    var offset: i64 = -self.size;
+    self.offsets.push(StackOffsetEntry_new(id, offset));
+    return offset;
+}
+
+// Allocate raw space (not tied to a ValueId) and return its offset
+pub fn StackFrame_alloc_raw(self: &mut StackFrame, size: i64) -> i64 {
+    var align: i64 = 8;
+    if size <= 1 { align = 1; }
+    else if size <= 2 { align = 2; }
+    else if size <= 4 { align = 4; }
+    else { align = 8; }
+    self.size = (self.size + align - 1) & ~(align - 1);
+    self.size = self.size + size;
+    return -self.size;
+}
+
+// Get the offset for a value
+pub fn StackFrame_offset(self: &StackFrame, id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < self.offsets.len() {
+        if self.offsets.get(i).id == id {
+            return self.offsets.get(i).offset;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Get the alloca data slot offset for a value
+pub fn StackFrame_alloca_slot(self: &StackFrame, id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < self.alloca_slots.len() {
+        if self.alloca_slots.get(i).id == id {
+            return self.alloca_slots.get(i).offset;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ===========================================================================
+// X86CodeGen
+// ===========================================================================
+
+pub struct X86CodeGen {
+    // Output assembly text
+    pub out: str,
+    // String constants for .data section
+    pub data: str,
+    // String label counter
+    pub string_counter: i64,
+    // Map string content to label
+    pub string_labels: Vec<StringLabelEntry>,
+}
+
+pub fn X86CodeGen_new() -> X86CodeGen {
+    return X86CodeGen {
+        out: "",
+        data: "",
+        string_counter: 0,
+        string_labels: Vec::new(),
+    };
+}
+
+// Append a string with a trailing newline to self.out
+fn wln(self: &mut X86CodeGen, s: str) -> void {
+    self.out = self.out + s + "\n";
+}
+
+// Lookup a string label, return "str_unknown" if not found
+fn X86CodeGen_lookup_string_label(self: &X86CodeGen, s: str) -> str {
+    var i: i64 = 0;
+    while i < self.string_labels.len() {
+        if str_equal(self.string_labels.get(i).key, s) {
+            return self.string_labels.get(i).label;
+        }
+        i = i + 1;
+    }
+    return "str_unknown";
+}
+
+// Generate assembly for an entire IR module
+pub fn X86CodeGen_generate(self: &mut X86CodeGen, module: &IrModule) -> str {
+    // .rodata section -- string constants
+    X86CodeGen_emit_data_section(self, module);
+
+    // .text section -- code
+    wln(self, ".text");
+    wln(self, "");
+
+    // Generate each function
+    var f: i64 = 0;
+    while f < module.functions.len() {
+        var entry: IrFunctionEntry = module.functions.get(f);
+        X86CodeGen_gen_function(self, entry.name, &entry.func, module);
+        f = f + 1;
+    }
+
+    // Generate runtime stubs (Linux syscalls)
+    X86CodeGen_gen_runtime_stubs(self);
+
+    // Combine rodata + text
+    return self.data + "\n" + self.out;
+}
+
+// Emit the .rodata section with string constants (GAS AT&T syntax)
+pub fn X86CodeGen_emit_data_section(self: &mut X86CodeGen, module: &IrModule) -> void {
+    self.data = "";
+    self.data = self.data + ".section .rodata\n";
+
+    // Collect all string constants from all functions
+    var f: i64 = 0;
+    while f < module.functions.len() {
+        var entry: IrFunctionEntry = module.functions.get(f);
+        var i: i64 = 0;
+        while i < entry.func.insts.len() {
+            var vi: ValueIdInst = entry.func.insts.get(i);
+            var inst: Inst = vi.inst;
+            match inst {
+                Inst::ConstStr(value) => {
+                    var label: str = X86CodeGen_intern_string(self, value);
+                    var escaped: str = escape_string(value);
+                    self.data = self.data + label + ": .asciz \"" + escaped + "\"\n";
+                }
+                _ => {}
+            }
+            i = i + 1;
+        }
+        f = f + 1;
+    }
+
+    // Boolean string constants
+    self.data = self.data + "str_true: .asciz \"true\"\n";
+    self.data = self.data + "str_false: .asciz \"false\"\n";
+
+    // String concatenation buffers (static, in .bss)
+    self.data = self.data + "\n.section .bss\n";
+    self.data = self.data + "str_concat_buf: .skip 4096\n";
+    self.data = self.data + "str_concat_tmp: .skip 4096\n";
+
+    self.data = self.data + "\n.text\n";
+}
+
+// Intern a string and return its label
+pub fn X86CodeGen_intern_string(self: &mut X86CodeGen, s: str) -> str {
+    var i: i64 = 0;
+    while i < self.string_labels.len() {
+        if str_equal(self.string_labels.get(i).key, s) {
+            return self.string_labels.get(i).label;
+        }
+        i = i + 1;
+    }
+    var label: str = "str_" + int_to_str(self.string_counter);
+    self.string_counter = self.string_counter + 1;
+    self.string_labels.push(StringLabelEntry_new(s, label));
+    return label;
+}
+
+// Generate code for a single function
+pub fn X86CodeGen_gen_function(self: &mut X86CodeGen, name: str, func: &IrFunction, module: &IrModule) -> void {
+    var mangled: str = mangle_name(name);
+    // Function prologue
+    wln(self, "");
+    wln(self, "# --- Function: " + name + " ---");
+    wln(self, "    .globl " + mangled);
+    wln(self, "    .type " + mangled + ", @function");
+    wln(self, mangled + ":");
+    wln(self, "    pushq %rbp");
+    wln(self, "    movq %rsp, %rbp");
+
+    // Allocate stack frame -- estimate size from all values
+    var frame: StackFrame = StackFrame_new();
+    var vi: i64 = 0;
+    while vi < func.value_metas.len() {
+        var vm: ValueIdMeta = func.value_metas.get(vi);
+        var size: i64 = IrModule_type_size(module, vm.meta.ty);
+        if size < 8 { size = 8; }
+        StackFrame_alloc(&mut frame, vm.id, size);
+        vi = vi + 1;
+    }
+
+    // Pre-allocate extra space for Alloca instructions' data
+    // Each Alloca needs a separate data slot beyond its pointer slot
+    var ii: i64 = 0;
+    while ii < func.insts.len() {
+        var vi_entry: ValueIdInst = func.insts.get(ii);
+        var inst: Inst = vi_entry.inst;
+        match inst {
+            Inst::Alloca(ty, _) => {
+                var data_size: i64 = IrModule_type_size(module, ty);
+                if data_size < 8 { data_size = 8; }
+                var off: i64 = StackFrame_alloc_raw(&mut frame, data_size);
+                frame.alloca_slots.push(AllocaSlotEntry_new(vi_entry.id, off));
+            }
+            _ => {}
+        }
+        ii = ii + 1;
+    }
+
+    // Align stack to 16 bytes.
+    // System V AMD64: no shadow space needed (unlike Windows x64).
+    // After pushq %rbp, RSP is 16n+8. After subq $N, RSP must be 16-aligned.
+    // So N must be 16n+8 to keep alignment. We round up to (size+8+15)&~15.
+    var stack_size: i64 = (frame.size + 8 + 15) & ~15;
+    // Reserve at least 16 bytes (minimum frame)
+    if stack_size < 16 { stack_size = 16; }
+    wln(self, "    subq $" + int_to_str(stack_size) + ", %rsp");
+
+    // Store parameters from registers to stack
+    // System V AMD64: RDI, RSI, RDX, RCX, R8, R9 for first 6 integer args
+    // 7th+ params are on the stack at 16(%rbp), 24(%rbp), etc.
+    var pi: i64 = 0;
+    while pi < func.params.len() {
+        var param: ValueIdType = func.params.get(pi);
+        if pi < 6 {
+            var offset: i64 = StackFrame_offset(&frame, param.id);
+            wln(self, "    movq " + arg_reg(pi) + ", " + fmt_offset(offset) + "(%rbp)");
+        } else {
+            // 7th param at 16(%rbp), 8th at 24(%rbp), etc.
+            var stack_offset: i64 = 16 + (pi - 6) * 8;
+            var offset: i64 = StackFrame_offset(&frame, param.id);
+            wln(self, "    movq " + int_to_str(stack_offset) + "(%rbp), %rax");
+            wln(self, "    movq %rax, " + fmt_offset(offset) + "(%rbp)");
+        }
+        pi = pi + 1;
+    }
+
+    // Generate code for each basic block
+    var bi: i64 = 0;
+    while bi < func.blocks.len() {
+        var block: BasicBlock = func.blocks.get(bi);
+        wln(self, "");
+        wln(self, ".L" + mangled + "_bb_" + int_to_str(block.id) + ":");
+
+        var ii2: i64 = 0;
+        while ii2 < block.instructions.len() {
+            var inst_id: i64 = block.instructions.get(ii2);
+            var opt_inst: OptInst = IrFunction_get_inst(func, inst_id);
+            match opt_inst {
+                OptInst::Some(inst) => {
+                    X86CodeGen_gen_inst(self, inst_id, inst, &frame, func, module, mangled);
+                }
+                OptInst::None => {}
+            }
+            ii2 = ii2 + 1;
+        }
+        bi = bi + 1;
+    }
+
+    // Function epilogue (in case we fall through)
+    wln(self, "    movq %rbp, %rsp");
+    wln(self, "    popq %rbp");
+    wln(self, "    ret");
+    wln(self, "    .size " + mangled + ", .-" + mangled);
+}
+
+// Generate code for a single instruction
+pub fn X86CodeGen_gen_inst(
+    self: &mut X86CodeGen,
+    id: i64,
+    inst: Inst,
+    frame: &StackFrame,
+    func: &IrFunction,
+    module: &IrModule,
+    func_name: str,
+) -> void {
+    var dst: i64 = StackFrame_offset(frame, id);
+
+    match inst {
+        // === Constants ===
+        Inst::ConstInt(value, _) => {
+            wln(self, "    movq $" + int_to_str(value) + ", %rax");
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+
+        Inst::ConstBool(value) => {
+            var bval: i64 = 0;
+            if value { bval = 1; } else { bval = 0; }
+            wln(self, "    movq $" + int_to_str(bval) + ", %rax");
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+
+        Inst::ConstStr(value) => {
+            // Check if this is a function name -- emit function address
+            if module_has_function(module, value) || module_has_extern(module, value) {
+                wln(self, "    leaq " + value + "(%rip), %rax");
+                wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+            } else {
+                var label: str = X86CodeGen_lookup_string_label(self, value);
+                wln(self, "    leaq " + label + "(%rip), %rax");
+                wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+            }
+        }
+
+        Inst::ConstFnRef(name) => {
+            // Function reference -- emit function address
+            wln(self, "    leaq " + name + "(%rip), %rax");
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+
+        Inst::ConstFloat(value, ty) => {
+            if ir_type_eq(ty, IrType::F32) {
+                var bits: i64 = p_f32_to_bits(value);
+                wln(self, "    movl $" + int_to_str(to_i32(bits)) + ", " + fmt_offset(dst) + "(%rbp)");
+            } else {
+                var all_bits: i64 = p_f64_to_bits(value);
+                var lo: i64 = to_i32(all_bits);
+                var hi: i64 = to_i32(all_bits >> 32);
+                wln(self, "    movl $" + int_to_str(lo) + ", " + fmt_offset(dst) + "(%rbp)");
+                wln(self, "    movl $" + int_to_str(hi) + ", " + fmt_offset(dst + 4) + "(%rbp)");
+            }
+        }
+
+        Inst::ConstNull(_) => {
+            wln(self, "    xorq %rax, %rax");
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+
+        Inst::GlobalAddr(name, _) => {
+            wln(self, "    leaq _g_" + name + "(%rip), %rax");
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+
+        // === Arithmetic ===
+        Inst::BinOp(op, left, right, ty) => {
+            var loff: i64 = StackFrame_offset(frame, left);
+            var roff: i64 = StackFrame_offset(frame, right);
+
+            if ir_type_is_float(ty) {
+                X86CodeGen_gen_float_binop(self, op, loff, roff, dst, ty);
+            } else {
+                X86CodeGen_gen_int_binop(self, op, loff, roff, dst, ty);
+            }
+        }
+
+        Inst::UnaryOp(op, operand, ty) => {
+            var off: i64 = StackFrame_offset(frame, operand);
+
+            match op {
+                UnaryOp::Neg => {
+                    if ir_type_is_float(ty) {
+                        // Float negation: XOR sign bit via integer XOR
+                        if ir_type_eq(ty, IrType::F32) {
+                            wln(self, "    movl " + fmt_offset(off) + "(%rbp), %eax");
+                            wln(self, "    movl $0x80000000, %ecx");
+                            wln(self, "    xorl %ecx, %eax");
+                            wln(self, "    movl %eax, " + fmt_offset(dst) + "(%rbp)");
+                        } else {
+                            wln(self, "    movq " + fmt_offset(off) + "(%rbp), %rax");
+                            wln(self, "    movq $0x8000000000000000, %rcx");
+                            wln(self, "    xorq %rcx, %rax");
+                            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+                        }
+                    } else {
+                        wln(self, "    movq " + fmt_offset(off) + "(%rbp), %rax");
+                        wln(self, "    negq %rax");
+                        wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+                    }
+                }
+                UnaryOp::Not => {
+                    wln(self, "    movq " + fmt_offset(off) + "(%rbp), %rax");
+                    wln(self, "    xorq $1, %rax");
+                    wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+                }
+                UnaryOp::BitNot => {
+                    wln(self, "    movq " + fmt_offset(off) + "(%rbp), %rax");
+                    wln(self, "    notq %rax");
+                    wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+                }
+            }
+        }
+
+        // === Memory ===
+        Inst::Alloca(_, _) => {
+            // Use pre-allocated data slot for this alloca
+            var data_offset: i64 = StackFrame_alloca_slot(frame, id);
+            wln(self, "    leaq " + fmt_offset(data_offset) + "(%rbp), %rax");
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+
+        Inst::Load(ptr, ty) => {
+            var poff: i64 = StackFrame_offset(frame, ptr);
+            var size: i64 = IrModule_type_size(module, ty);
+            if size < 1 { size = 1; }
+            wln(self, "    movq " + fmt_offset(poff) + "(%rbp), %rax");
+            if size == 1 {
+                wln(self, "    movsbq (%rax), %rax");
+            } else if size == 2 {
+                wln(self, "    movswq (%rax), %rax");
+            } else if size == 4 {
+                wln(self, "    movslq (%rax), %rax");
+            } else {
+                wln(self, "    movq (%rax), %rax");
+            }
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+
+        Inst::Store(ptr, value, _) => {
+            var poff: i64 = StackFrame_offset(frame, ptr);
+            var voff: i64 = StackFrame_offset(frame, value);
+            wln(self, "    movq " + fmt_offset(poff) + "(%rbp), %rax");
+            wln(self, "    movq " + fmt_offset(voff) + "(%rbp), %rcx");
+            // Use correct store size based on value type
+            var store_size: i64 = 8;
+            var opt_meta: OptValueMeta = IrFunction_get_meta(func, value);
+            match opt_meta {
+                OptValueMeta::Some(meta) => {
+                    store_size = IrModule_type_size(module, meta.ty);
+                }
+                OptValueMeta::None => {
+                    store_size = 8;
+                }
+            }
+            if store_size == 1 {
+                wln(self, "    movb %cl, (%rax)");
+            } else if store_size == 2 {
+                wln(self, "    movw %cx, (%rax)");
+            } else if store_size == 4 {
+                wln(self, "    movl %ecx, (%rax)");
+            } else {
+                wln(self, "    movq %rcx, (%rax)");
+            }
+        }
+
+        Inst::GetFieldPtr(struct_ptr, field_index, _) => {
+            var poff: i64 = StackFrame_offset(frame, struct_ptr);
+            wln(self, "    movq " + fmt_offset(poff) + "(%rbp), %rax");
+            // Look up field offset from struct layout
+            var offset: i64 = field_index * 8;
+            var opt_ptr_meta: OptValueMeta = IrFunction_get_meta(func, struct_ptr);
+            match opt_ptr_meta {
+                OptValueMeta::Some(ptr_meta) => {
+                    var opt_name: OptString = extract_struct_name(ptr_meta.ty);
+                    match opt_name {
+                        OptString::Some(sname) => {
+                            var opt_layout: OptStructLayout = IrModule_get_struct(module, sname);
+                            match opt_layout {
+                                OptStructLayout::Some(layout) => {
+                                    if field_index >= 0 && field_index < layout.fields.len() {
+                                        offset = layout.fields.get(field_index).offset;
+                                    } else {
+                                        offset = field_index * 8;
+                                    }
+                                }
+                                OptStructLayout::None => {
+                                    offset = field_index * 8;
+                                }
+                            }
+                        }
+                        OptString::None => {
+                            offset = field_index * 8;
+                        }
+                    }
+                }
+                OptValueMeta::None => {
+                    offset = field_index * 8;
+                }
+            }
+            if offset > 0 {
+                wln(self, "    addq $" + int_to_str(offset) + ", %rax");
+            }
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+
+        Inst::GetElemPtr(array_ptr, index, elem_ty) => {
+            var poff: i64 = StackFrame_offset(frame, array_ptr);
+            var ioff: i64 = StackFrame_offset(frame, index);
+            var elem_size: i64 = IrModule_type_size(module, elem_ty);
+            if elem_size < 8 { elem_size = 8; }
+            wln(self, "    movq " + fmt_offset(poff) + "(%rbp), %rax");
+            wln(self, "    movq " + fmt_offset(ioff) + "(%rbp), %rcx");
+            wln(self, "    imulq $" + int_to_str(elem_size) + ", %rcx");
+            wln(self, "    addq %rcx, %rax");
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+
+        // === Control Flow ===
+        Inst::Jump(target) => {
+            wln(self, "    jmp .L" + func_name + "_bb_" + int_to_str(target));
+        }
+
+        Inst::Branch(cond, then_blk, else_blk) => {
+            var coff: i64 = StackFrame_offset(frame, cond);
+            wln(self, "    movq " + fmt_offset(coff) + "(%rbp), %rax");
+            wln(self, "    testq %rax, %rax");
+            wln(self, "    jnz .L" + func_name + "_bb_" + int_to_str(then_blk));
+            wln(self, "    jmp .L" + func_name + "_bb_" + int_to_str(else_blk));
+        }
+
+        Inst::Return(opt_val) => {
+            match opt_val {
+                OptValueId::Some(v) => {
+                    var voff: i64 = StackFrame_offset(frame, v);
+                    wln(self, "    movq " + fmt_offset(voff) + "(%rbp), %rax");
+                }
+                OptValueId::None => {
+                    wln(self, "    xorq %rax, %rax");
+                }
+            }
+            wln(self, "    movq %rbp, %rsp");
+            wln(self, "    popq %rbp");
+            wln(self, "    ret");
+        }
+
+        Inst::Unreachable => {
+            wln(self, "    ud2  # unreachable");
+        }
+
+        // === Function Calls ===
+        Inst::Call(call_name, args, _, _) => {
+            // Special-case: route "print" to the right runtime stub
+            var target_func: str;
+            if str_equal(call_name, "print") {
+                // Check arg type to pick the right print function
+                if args.len() > 0 {
+                    var arg: i64 = args.get(0);
+                    var opt_meta2: OptValueMeta = IrFunction_get_meta(func, arg);
+                    target_func = "p_print_int";
+                    match opt_meta2 {
+                        OptValueMeta::Some(meta) => {
+                            if ir_type_is_ptr(meta.ty) {
+                                target_func = "p_print_str";
+                            } else if ir_type_is_float(meta.ty) {
+                                target_func = "p_print_float";
+                            } else if ir_type_eq(meta.ty, IrType::Bool) {
+                                target_func = "p_print_bool";
+                            } else {
+                                target_func = "p_print_int";
+                            }
+                        }
+                        OptValueMeta::None => {
+                            target_func = "p_print_int";
+                        }
+                    }
+                } else {
+                    target_func = "p_print_int";
+                }
+            } else {
+                // Mangle user function names to avoid x86 mnemonic conflicts
+                target_func = mangle_name(call_name);
+            }
+
+            // System V AMD64: RDI, RSI, RDX, RCX, R8, R9 for first 6 args
+            // 7th+ args go on stack at 0(%rsp), 8(%rsp), etc.
+            // No shadow space needed.
+            var stack_args: i64 = 0;
+            if args.len() > 6 { stack_args = args.len() - 6; }
+            // Reserve space for stack args, aligned to 16
+            var call_space: i64 = (stack_args * 8 + 15) & ~15;
+            // Load register args first (before adjusting RSP)
+            var ci: i64 = 0;
+            while ci < args.len() {
+                var aoff: i64 = StackFrame_offset(frame, args.get(ci));
+                if ci < 6 {
+                    wln(self, "    movq " + fmt_offset(aoff) + "(%rbp), " + arg_reg(ci));
+                }
+                ci = ci + 1;
+            }
+            if call_space > 0 {
+                wln(self, "    subq $" + int_to_str(call_space) + ", %rsp  # stack args");
+            }
+            // Place stack args (7th+ args)
+            var si: i64 = 6;
+            while si < args.len() {
+                var aoff: i64 = StackFrame_offset(frame, args.get(si));
+                var stack_pos: i64 = (si - 6) * 8;
+                wln(self, "    movq " + fmt_offset(aoff) + "(%rbp), %rax");
+                wln(self, "    movq %rax, " + int_to_str(stack_pos) + "(%rsp)");
+                si = si + 1;
+            }
+            // Ensure 16-byte alignment before call
+            if call_space % 16 != 0 {
+                wln(self, "    subq $8, %rsp  # alignment");
+            }
+            wln(self, "    call " + target_func);
+            if call_space % 16 != 0 {
+                wln(self, "    addq $8, %rsp  # alignment cleanup");
+            }
+            if call_space > 0 {
+                wln(self, "    addq $" + int_to_str(call_space) + ", %rsp  # cleanup");
+            }
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+
+        Inst::CallPtr(fn_ptr, args, _, _, _) => {
+            var fpoff: i64 = StackFrame_offset(frame, fn_ptr);
+
+            // All function pointers are env structs: field 0 = fn addr, fields 1..N = captures
+            // Load function address from field 0
+            wln(self, "    movq " + fmt_offset(fpoff) + "(%rbp), %rax");
+            wln(self, "    movq (%rax), %rax  # load fn addr from env struct field 0");
+
+            // Pass env_ptr as first arg (rdi), shift other args
+            var total_args: i64 = args.len() + 1; // +1 for env_ptr
+            var stack_args: i64 = 0;
+            if total_args > 6 { stack_args = total_args - 6; }
+            var call_space: i64 = (stack_args * 8 + 15) & ~15;
+
+            if call_space > 0 {
+                wln(self, "    subq $" + int_to_str(call_space) + ", %rsp  # stack args");
+            }
+
+            // First arg (rdi) = env_ptr
+            wln(self, "    movq " + fmt_offset(fpoff) + "(%rbp), %rdi");
+
+            // Remaining args shifted by 1
+            var ci: i64 = 0;
+            while ci < args.len() {
+                var aoff: i64 = StackFrame_offset(frame, args.get(ci));
+                var arg_idx: i64 = ci + 1; // shifted by 1 for env_ptr
+                if arg_idx < 6 {
+                    wln(self, "    movq " + fmt_offset(aoff) + "(%rbp), " + arg_reg(arg_idx));
+                } else {
+                    var stack_pos: i64 = (arg_idx - 6) * 8;
+                    wln(self, "    movq " + fmt_offset(aoff) + "(%rbp), %r10");
+                    wln(self, "    movq %r10, " + int_to_str(stack_pos) + "(%rsp)");
+                }
+                ci = ci + 1;
+            }
+
+            // Ensure 16-byte alignment before call
+            if call_space % 16 != 0 {
+                wln(self, "    subq $8, %rsp  # alignment");
+            }
+            // Save fn addr, call indirectly
+            wln(self, "    movq %rax, %r10  # save fn addr");
+            wln(self, "    call *%r10");
+            if call_space % 16 != 0 {
+                wln(self, "    addq $8, %rsp  # alignment cleanup");
+            }
+            if call_space > 0 {
+                wln(self, "    addq $" + int_to_str(call_space) + ", %rsp  # cleanup");
+            }
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+
+        // === Conversions ===
+        Inst::IntExtend(value, from, _) => {
+            var voff: i64 = StackFrame_offset(frame, value);
+            wln(self, "    movq " + fmt_offset(voff) + "(%rbp), %rax");
+            // Sign-extend based on source type
+            match from {
+                IrType::I8 => { wln(self, "    movsbq %al, %rax"); }
+                IrType::I16 => { wln(self, "    movswq %ax, %rax"); }
+                IrType::I32 => { wln(self, "    movslq %eax, %rax"); }
+                _ => {}
+            }
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+
+        Inst::IntTrunc(value, _, to) => {
+            var voff: i64 = StackFrame_offset(frame, value);
+            wln(self, "    movq " + fmt_offset(voff) + "(%rbp), %rax");
+            // Truncate by masking
+            match to {
+                IrType::I8 => { wln(self, "    movzbq %al, %rax"); }
+                IrType::U8 => { wln(self, "    movzbq %al, %rax"); }
+                IrType::I16 => { wln(self, "    movzwq %ax, %rax"); }
+                IrType::U16 => { wln(self, "    movzwq %ax, %rax"); }
+                IrType::I32 => { wln(self, "    movl %eax, %eax"); }
+                IrType::U32 => { wln(self, "    movl %eax, %eax"); }
+                _ => {}
+            }
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+
+        Inst::IntToFloat(value, from, to) => {
+            var voff: i64 = StackFrame_offset(frame, value);
+            wln(self, "    movq " + fmt_offset(voff) + "(%rbp), %rax");
+            match from {
+                IrType::I64 => { wln(self, "    cvtsi2sdq %rax, %xmm0"); }
+                IrType::U64 => { wln(self, "    cvtsi2sdq %rax, %xmm0"); }
+                _ => { wln(self, "    cvtsi2sd %eax, %xmm0"); }
+            }
+            if ir_type_eq(to, IrType::F32) {
+                wln(self, "    movss %xmm0, " + fmt_offset(dst) + "(%rbp)");
+            } else {
+                wln(self, "    movsd %xmm0, " + fmt_offset(dst) + "(%rbp)");
+            }
+        }
+
+        Inst::FloatToInt(value, from, _) => {
+            var voff: i64 = StackFrame_offset(frame, value);
+            if ir_type_eq(from, IrType::F32) {
+                wln(self, "    movss " + fmt_offset(voff) + "(%rbp), %xmm0");
+            } else {
+                wln(self, "    movsd " + fmt_offset(voff) + "(%rbp), %xmm0");
+            }
+            wln(self, "    cvttsd2siq %xmm0, %rax");
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+
+        Inst::MakeDyn(_, _, _) => {
+            wln(self, "    xorq %rax, %rax  # MakeDyn not yet supported");
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+
+        Inst::DynCall(_, _, _, _, _) => {
+            wln(self, "    xorq %rax, %rax  # DynCall not yet supported");
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+
+        Inst::BitCast(value, _, _) => {
+            var voff: i64 = StackFrame_offset(frame, value);
+            wln(self, "    movq " + fmt_offset(voff) + "(%rbp), %rax");
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+
+        // === Fides-Specific ===
+        Inst::Print(value, _) => {
+            var voff: i64 = StackFrame_offset(frame, value);
+            // Call our print stub (System V: arg in %rdi)
+            wln(self, "    movq " + fmt_offset(voff) + "(%rbp), %rdi");
+            wln(self, "    call p_print_int");
+        }
+
+        Inst::PersistLoad(_, default, _) => {
+            // Just copy default value to destination
+            var doff: i64 = StackFrame_offset(frame, default);
+            wln(self, "    movq " + fmt_offset(doff) + "(%rbp), %rax");
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+
+        Inst::PersistSave(_, _) => {
+            // No-op
+        }
+
+        Inst::TxnBegin => {
+            // No-op (rollback not supported)
+        }
+
+        Inst::TxnEnd => {
+            // No-op (rollback not supported)
+        }
+
+        Inst::UnsafeBegin => {
+            // No-op (unsafe not supported)
+        }
+
+        Inst::UnsafeEnd => {
+            // No-op (unsafe not supported)
+        }
+
+        Inst::GradBegin(_) => {
+            // No-op (autodiff marker)
+        }
+
+        Inst::GradEnd => {
+            // No-op (autodiff marker)
+        }
+
+        Inst::Backward(_) => {
+            // No-op (autodiff marker)
+        }
+
+        Inst::StructCopy(dst, src, ty) => {
+            // Struct copy: memcpy dst from src, size from type
+            // Simplified: emit as a series of mov instructions
+            // Full implementation would use rep movsq
+            var size: i64 = ir_type_size(ty);
+            var offset: i64 = 0;
+            while offset < size {
+                // mov rax, [src + offset]
+                // mov [dst + offset], rax
+                offset = offset + 8;
+            }
+        }
+
+        Inst::Panic(message) => {
+            var label: str = X86CodeGen_intern_string(self, message);
+            // Emit the string in rodata section if not already there
+            if !String_contains(self.data, label + ": .asciz") {
+                self.data = self.data + label + ": .asciz \"" + escape_string(message) + "\"\n";
+            }
+            wln(self, "    leaq " + label + "(%rip), %rdi");
+            wln(self, "    call p_panic");
+        }
+
+        Inst::TryUnwrap(_, _, _, _) => {
+            // Simplified -- not fully implemented in backend yet
+            wln(self, "    # TODO: TryUnwrap");
+        }
+
+        Inst::Asm(_, _, _, _) => {
+            wln(self, "    # asm not yet supported");
+            wln(self, "    xorq %rax, %rax");
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+
+        Inst::RegionBegin(_, _, _, _) => {
+            wln(self, "    # region begin (no-op -- stack allocation)");
+            wln(self, "    xorq %rax, %rax");
+        }
+
+        Inst::RegionEnd(_, _, _) => {
+            wln(self, "    # region end (no-op)");
+        }
+
+        Inst::StructCopy(dst_val, src_val, ty) => {
+            var size: i64 = IrModule_type_size(module, ty);
+            var dst_off: i64 = StackFrame_offset(frame, dst_val);
+            var src_off: i64 = StackFrame_offset(frame, src_val);
+            wln(self, "    leaq " + fmt_offset(dst_off) + "(%rbp), %rdi");
+            wln(self, "    leaq " + fmt_offset(src_off) + "(%rbp), %rsi");
+            wln(self, "    movq $" + int_to_str(size) + ", %rdx");
+            wln(self, "    call memcpy");
+        }
+    }
+}
+
+// Generate integer binary operation
+pub fn X86CodeGen_gen_int_binop(
+    self: &mut X86CodeGen,
+    op: BinOp,
+    loff: i64,
+    roff: i64,
+    dst: i64,
+    _ty: IrType,
+) -> void {
+    // Load left into RAX, right into RCX
+    wln(self, "    movq " + fmt_offset(loff) + "(%rbp), %rax");
+    wln(self, "    movq " + fmt_offset(roff) + "(%rbp), %rcx");
+
+    match op {
+        BinOp::Add => {
+            wln(self, "    addq %rcx, %rax");
+        }
+        BinOp::Sub => {
+            wln(self, "    subq %rcx, %rax");
+        }
+        BinOp::Mul => {
+            wln(self, "    imulq %rcx, %rax");
+        }
+        BinOp::Div => {
+            // Sign-extend RAX into RDX:RAX, then idiv
+            wln(self, "    cqto");
+            wln(self, "    idivq %rcx");
+        }
+        BinOp::Mod => {
+            wln(self, "    cqto");
+            wln(self, "    idivq %rcx");
+            wln(self, "    movq %rdx, %rax"); // remainder
+        }
+        BinOp::BitAnd => {
+            wln(self, "    andq %rcx, %rax");
+        }
+        BinOp::BitOr => {
+            wln(self, "    orq %rcx, %rax");
+        }
+        BinOp::BitXor => {
+            wln(self, "    xorq %rcx, %rax");
+        }
+        BinOp::Shl => {
+            // Shift count must be in CL
+            wln(self, "    shlq %cl, %rax");
+        }
+        BinOp::Shr => {
+            wln(self, "    sarq %cl, %rax");
+        }
+        BinOp::Eq => {
+            wln(self, "    cmpq %rcx, %rax");
+            wln(self, "    sete %al");
+            wln(self, "    movzbq %al, %rax");
+        }
+        BinOp::Neq => {
+            wln(self, "    cmpq %rcx, %rax");
+            wln(self, "    setne %al");
+            wln(self, "    movzbq %al, %rax");
+        }
+        BinOp::Lt => {
+            wln(self, "    cmpq %rcx, %rax");
+            wln(self, "    setl %al");
+            wln(self, "    movzbq %al, %rax");
+        }
+        BinOp::Gt => {
+            wln(self, "    cmpq %rcx, %rax");
+            wln(self, "    setg %al");
+            wln(self, "    movzbq %al, %rax");
+        }
+        BinOp::LtEq => {
+            wln(self, "    cmpq %rcx, %rax");
+            wln(self, "    setle %al");
+            wln(self, "    movzbq %al, %rax");
+        }
+        BinOp::GtEq => {
+            wln(self, "    cmpq %rcx, %rax");
+            wln(self, "    setge %al");
+            wln(self, "    movzbq %al, %rax");
+        }
+        BinOp::And => {
+            wln(self, "    testq %rax, %rax");
+            wln(self, "    setne %al");
+            wln(self, "    testq %rcx, %rcx");
+            wln(self, "    setne %cl");
+            wln(self, "    andb %cl, %al");
+            wln(self, "    movzbq %al, %rax");
+        }
+        BinOp::Or => {
+            wln(self, "    orq %rcx, %rax");
+            wln(self, "    setne %al");
+            wln(self, "    movzbq %al, %rax");
+        }
+    }
+
+    wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+}
+
+// Generate float binary operation
+pub fn X86CodeGen_gen_float_binop(
+    self: &mut X86CodeGen,
+    op: BinOp,
+    loff: i64,
+    roff: i64,
+    dst: i64,
+    ty: IrType,
+) -> void {
+    if ir_type_eq(ty, IrType::F32) {
+        wln(self, "    movss " + fmt_offset(loff) + "(%rbp), %xmm0");
+        wln(self, "    movss " + fmt_offset(roff) + "(%rbp), %xmm1");
+        match op {
+            BinOp::Add => { wln(self, "    addss %xmm1, %xmm0"); }
+            BinOp::Sub => { wln(self, "    subss %xmm1, %xmm0"); }
+            BinOp::Mul => { wln(self, "    mulss %xmm1, %xmm0"); }
+            BinOp::Div => { wln(self, "    divss %xmm1, %xmm0"); }
+            BinOp::Eq => {
+                wln(self, "    ucomiss %xmm1, %xmm0");
+                wln(self, "    sete %al");
+                wln(self, "    movzbq %al, %rax");
+            }
+            BinOp::Neq => {
+                wln(self, "    ucomiss %xmm1, %xmm0");
+                wln(self, "    setne %al");
+                wln(self, "    movzbq %al, %rax");
+            }
+            BinOp::Lt => {
+                wln(self, "    ucomiss %xmm1, %xmm0");
+                wln(self, "    setb %al");
+                wln(self, "    movzbq %al, %rax");
+            }
+            BinOp::Gt => {
+                wln(self, "    ucomiss %xmm0, %xmm1");
+                wln(self, "    setb %al");
+                wln(self, "    movzbq %al, %rax");
+            }
+            BinOp::LtEq => {
+                wln(self, "    ucomiss %xmm1, %xmm0");
+                wln(self, "    setbe %al");
+                wln(self, "    movzbq %al, %rax");
+            }
+            BinOp::GtEq => {
+                wln(self, "    ucomiss %xmm0, %xmm1");
+                wln(self, "    setbe %al");
+                wln(self, "    movzbq %al, %rax");
+            }
+            _ => {}
+        }
+        // For arithmetic ops, store xmm0; for comparisons, store rax
+        if binop_is_arithmetic(op) {
+            wln(self, "    movss %xmm0, " + fmt_offset(dst) + "(%rbp)");
+        } else {
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+    } else {
+        // F64
+        wln(self, "    movsd " + fmt_offset(loff) + "(%rbp), %xmm0");
+        wln(self, "    movsd " + fmt_offset(roff) + "(%rbp), %xmm1");
+        match op {
+            BinOp::Add => { wln(self, "    addsd %xmm1, %xmm0"); }
+            BinOp::Sub => { wln(self, "    subsd %xmm1, %xmm0"); }
+            BinOp::Mul => { wln(self, "    mulsd %xmm1, %xmm0"); }
+            BinOp::Div => { wln(self, "    divsd %xmm1, %xmm0"); }
+            BinOp::Eq => {
+                wln(self, "    ucomisd %xmm1, %xmm0");
+                wln(self, "    sete %al");
+                wln(self, "    movzbq %al, %rax");
+            }
+            BinOp::Neq => {
+                wln(self, "    ucomisd %xmm1, %xmm0");
+                wln(self, "    setne %al");
+                wln(self, "    movzbq %al, %rax");
+            }
+            BinOp::Lt => {
+                wln(self, "    ucomisd %xmm1, %xmm0");
+                wln(self, "    setb %al");
+                wln(self, "    movzbq %al, %rax");
+            }
+            BinOp::Gt => {
+                wln(self, "    ucomisd %xmm0, %xmm1");
+                wln(self, "    setb %al");
+                wln(self, "    movzbq %al, %rax");
+            }
+            BinOp::LtEq => {
+                wln(self, "    ucomisd %xmm1, %xmm0");
+                wln(self, "    setbe %al");
+                wln(self, "    movzbq %al, %rax");
+            }
+            BinOp::GtEq => {
+                wln(self, "    ucomisd %xmm0, %xmm1");
+                wln(self, "    setbe %al");
+                wln(self, "    movzbq %al, %rax");
+            }
+            _ => {}
+        }
+        // For arithmetic ops, store xmm0; for comparisons, store rax
+        if binop_is_arithmetic(op) {
+            wln(self, "    movsd %xmm0, " + fmt_offset(dst) + "(%rbp)");
+        } else {
+            wln(self, "    movq %rax, " + fmt_offset(dst) + "(%rbp)");
+        }
+    }
+}
+
+// Check if a BinOp is an arithmetic op (Add/Sub/Mul/Div)
+fn binop_is_arithmetic(op: BinOp) -> bool {
+    match op {
+        BinOp::Add => { return true; }
+        BinOp::Sub => { return true; }
+        BinOp::Mul => { return true; }
+        BinOp::Div => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+// ===========================================================================
+// Runtime stubs -- Linux syscalls (no C runtime)
+// System V AMD64 calling convention: args in RDI, RSI, RDX, R10, R8, R9
+// Linux syscall numbers: write=1, exit=60, mmap=9, munmap=11
+// ===========================================================================
+
+pub fn X86CodeGen_gen_runtime_stubs(self: &mut X86CodeGen) -> void {
+    wln(self, "");
+    wln(self, "# --- Runtime stubs (Linux syscalls) ---");
+
+    // p_print_int(rdi = i64 value)
+    // Converts integer to string and writes to stdout + newline
+    wln(self, "p_print_int:");
+    wln(self, "    pushq %rbp");
+    wln(self, "    movq %rsp, %rbp");
+    wln(self, "    pushq %r12");
+    wln(self, "    pushq %r13");
+    wln(self, "    subq $80, %rsp  # buffer + alignment");
+    wln(self, "");
+    wln(self, "    movq %rdi, %rax  # value");
+    wln(self, "    leaq -1(%rbp), %r8  # buffer end pointer");
+    wln(self, "    movb $10, (%r8)  # newline at end");
+    wln(self, "    movq $10, %r9  # divisor");
+    wln(self, "");
+    wln(self, "    testq %rax, %rax");
+    wln(self, "    jns pi_pos");
+    wln(self, "    negq %rax");
+    wln(self, "pi_pos:");
+    wln(self, "pi_loop:");
+    wln(self, "    decq %r8");
+    wln(self, "    xorq %rdx, %rdx");
+    wln(self, "    divq %r9");
+    wln(self, "    addb $48, %dl  # '0'");
+    wln(self, "    movb %dl, (%r8)");
+    wln(self, "    testq %rax, %rax");
+    wln(self, "    jnz pi_loop");
+    wln(self, "");
+    wln(self, "    testq %rdi, %rdi");
+    wln(self, "    jns pi_no_neg");
+    wln(self, "    decq %r8");
+    wln(self, "    movb $45, (%r8)  # '-'");
+    wln(self, "pi_no_neg:");
+    wln(self, "");
+    wln(self, "    # write(1, r8, len)");
+    wln(self, "    leaq (%rbp), %r9  # end (after newline)");
+    wln(self, "    subq %r8, %r9  # length");
+    wln(self, "    movq $1, %rax  # syscall write");
+    wln(self, "    movq $1, %rdi  # stdout");
+    wln(self, "    movq %r8, %rsi  # buffer");
+    wln(self, "    movq %r9, %rdx  # length");
+    wln(self, "    syscall");
+    wln(self, "    xorq %rax, %rax");
+    wln(self, "    addq $80, %rsp");
+    wln(self, "    popq %r13");
+    wln(self, "    popq %r12");
+    wln(self, "    movq %rbp, %rsp");
+    wln(self, "    popq %rbp");
+    wln(self, "    ret");
+
+    // p_print_str(rdi = *u8 pointer to null-terminated string)
+    wln(self, "");
+    wln(self, "p_print_str:");
+    wln(self, "    pushq %rbp");
+    wln(self, "    movq %rsp, %rbp");
+    wln(self, "    pushq %r12");
+    wln(self, "    pushq %r13");
+    wln(self, "    subq $32, %rsp");
+    wln(self, "    movq %rdi, %r12  # save string pointer");
+    wln(self, "");
+    wln(self, "    # Calculate string length");
+    wln(self, "    xorq %r8, %r8");
+    wln(self, "ps_len:");
+    wln(self, "    cmpb $0, (%r12,%r8)");
+    wln(self, "    je ps_done");
+    wln(self, "    incq %r8");
+    wln(self, "    jmp ps_len");
+    wln(self, "ps_done:");
+    wln(self, "    movq %r8, %r13  # save length");
+    wln(self, "");
+    wln(self, "    # write(1, r12, r13)");
+    wln(self, "    movq $1, %rax  # syscall write");
+    wln(self, "    movq $1, %rdi  # stdout");
+    wln(self, "    movq %r12, %rsi  # buffer");
+    wln(self, "    movq %r13, %rdx  # length");
+    wln(self, "    syscall");
+    wln(self, "");
+    wln(self, "    # Print newline");
+    wln(self, "    movb $10, -1(%rbp)");
+    wln(self, "    movq $1, %rax  # syscall write");
+    wln(self, "    movq $1, %rdi  # stdout");
+    wln(self, "    leaq -1(%rbp), %rsi  # buffer");
+    wln(self, "    movq $1, %rdx  # length");
+    wln(self, "    syscall");
+    wln(self, "    xorq %rax, %rax");
+    wln(self, "    addq $32, %rsp");
+    wln(self, "    popq %r13");
+    wln(self, "    popq %r12");
+    wln(self, "    movq %rbp, %rsp");
+    wln(self, "    popq %rbp");
+    wln(self, "    ret");
+
+    // p_print_bool(rdi = 0 or 1)
+    wln(self, "");
+    wln(self, "p_print_bool:");
+    wln(self, "    pushq %rbp");
+    wln(self, "    movq %rsp, %rbp");
+    wln(self, "    pushq %r12");
+    wln(self, "    pushq %r13");
+    wln(self, "    subq $32, %rsp");
+    wln(self, "    testq %rdi, %rdi");
+    wln(self, "    jnz pb_true");
+    wln(self, "    leaq str_false(%rip), %r12");
+    wln(self, "    jmp pb_print");
+    wln(self, "pb_true:");
+    wln(self, "    leaq str_true(%rip), %r12");
+    wln(self, "pb_print:");
+    wln(self, "    xorq %r8, %r8");
+    wln(self, "pb_len:");
+    wln(self, "    cmpb $0, (%r12,%r8)");
+    wln(self, "    je pb_done");
+    wln(self, "    incq %r8");
+    wln(self, "    jmp pb_len");
+    wln(self, "pb_done:");
+    wln(self, "    movq %r8, %r13");
+    wln(self, "    movq $1, %rax  # syscall write");
+    wln(self, "    movq $1, %rdi  # stdout");
+    wln(self, "    movq %r12, %rsi");
+    wln(self, "    movq %r13, %rdx");
+    wln(self, "    syscall");
+    wln(self, "    # newline");
+    wln(self, "    movb $10, -1(%rbp)");
+    wln(self, "    movq $1, %rax");
+    wln(self, "    movq $1, %rdi");
+    wln(self, "    leaq -1(%rbp), %rsi");
+    wln(self, "    movq $1, %rdx");
+    wln(self, "    syscall");
+    wln(self, "    xorq %rax, %rax");
+    wln(self, "    addq $32, %rsp");
+    wln(self, "    popq %r13");
+    wln(self, "    popq %r12");
+    wln(self, "    movq %rbp, %rsp");
+    wln(self, "    popq %rbp");
+    wln(self, "    ret");
+
+    // p_print_float(rdi = f64 bits stored as i64)
+    // Formats as integer.fractional with 6 decimal places
+    wln(self, "");
+    wln(self, "p_print_float:");
+    wln(self, "    pushq %rbp");
+    wln(self, "    movq %rsp, %rbp");
+    wln(self, "    pushq %r12");
+    wln(self, "    pushq %r13");
+    wln(self, "    pushq %r14");
+    wln(self, "    subq $152, %rsp  # buffer(64) + temp(32) + locals(56)");
+    wln(self, "");
+    wln(self, "    # Save float bits and load as xmm0");
+    wln(self, "    movq %rdi, -72(%rbp)");
+    wln(self, "    movsd -72(%rbp), %xmm0");
+    wln(self, "");
+    wln(self, "    # r12 = buffer pointer, r13 = length");
+    wln(self, "    leaq -64(%rbp), %r12");
+    wln(self, "    xorq %r13, %r13");
+    wln(self, "");
+    wln(self, "    # Check negative");
+    wln(self, "    xorpd %xmm1, %xmm1");
+    wln(self, "    ucomisd %xmm1, %xmm0");
+    wln(self, "    jae pf_pos");
+    wln(self, "    movb $45, (%r12)  # '-'");
+    wln(self, "    incq %r12");
+    wln(self, "    incq %r13");
+    wln(self, "    # Flip sign bit via integer XOR");
+    wln(self, "    movq $0x8000000000000000, %rax");
+    wln(self, "    movq %rax, -80(%rbp)");
+    wln(self, "    movsd -80(%rbp), %xmm2");
+    wln(self, "    xorpd %xmm2, %xmm0");
+    wln(self, "");
+    wln(self, "pf_pos:");
+    wln(self, "    # Save xmm0 (possibly negated)");
+    wln(self, "    movsd %xmm0, -72(%rbp)");
+    wln(self, "");
+    wln(self, "    # Get integer part");
+    wln(self, "    cvttsd2siq %xmm0, %rax");
+    wln(self, "    movq %rax, %r14  # save integer part");
+    wln(self, "");
+    wln(self, "    # Handle integer part == 0");
+    wln(self, "    testq %rax, %rax");
+    wln(self, "    jnz pf_int_start");
+    wln(self, "    movb $48, (%r12)  # '0'");
+    wln(self, "    incq %r12");
+    wln(self, "    incq %r13");
+    wln(self, "    jmp pf_dot");
+    wln(self, "");
+    wln(self, "pf_int_start:");
+    wln(self, "    # Convert integer to reversed string at -128(%rbp)");
+    wln(self, "    leaq -128(%rbp), %r8");
+    wln(self, "    xorq %r9, %r9");
+    wln(self, "pf_int_loop:");
+    wln(self, "    xorq %rdx, %rdx");
+    wln(self, "    movq $10, %rcx");
+    wln(self, "    divq %rcx");
+    wln(self, "    addb $48, %dl  # '0'");
+    wln(self, "    movb %dl, (%r8)");
+    wln(self, "    incq %r8");
+    wln(self, "    incq %r9");
+    wln(self, "    testq %rax, %rax");
+    wln(self, "    jnz pf_int_loop");
+    wln(self, "");
+    wln(self, "    # Copy reversed digits to buffer in correct order");
+    wln(self, "    decq %r8");
+    wln(self, "pf_int_copy:");
+    wln(self, "    movb (%r8), %al");
+    wln(self, "    movb %al, (%r12)");
+    wln(self, "    incq %r12");
+    wln(self, "    incq %r13");
+    wln(self, "    decq %r8");
+    wln(self, "    decq %r9");
+    wln(self, "    jnz pf_int_copy");
+    wln(self, "");
+    wln(self, "pf_dot:");
+    wln(self, "    movb $46, (%r12)  # '.'");
+    wln(self, "    incq %r12");
+    wln(self, "    incq %r13");
+    wln(self, "");
+    wln(self, "    # Get fractional part: xmm0 = original - integer_part");
+    wln(self, "    movsd -72(%rbp), %xmm0");
+    wln(self, "    cvtsi2sdq %r14, %xmm1");
+    wln(self, "    subsd %xmm1, %xmm0");
+    wln(self, "    # Clamp negative to 0 (FP precision)");
+    wln(self, "    xorpd %xmm1, %xmm1");
+    wln(self, "    ucomisd %xmm1, %xmm0");
+    wln(self, "    jae pf_frac_ok");
+    wln(self, "    movsd %xmm1, %xmm0");
+    wln(self, "pf_frac_ok:");
+    wln(self, "");
+    wln(self, "    # Load 1000000.0 constant");
+    wln(self, "    movq $0x412E848000000000, %rax");
+    wln(self, "    movq %rax, -80(%rbp)");
+    wln(self, "    movsd -80(%rbp), %xmm2  # xmm2 = 1000000.0");
+    wln(self, "");
+    wln(self, "    # Multiply fractional part by 1000000");
+    wln(self, "    mulsd %xmm2, %xmm0");
+    wln(self, "");
+    wln(self, "    # Add 0.5 for rounding");
+    wln(self, "    movq $0x3FE0000000000000, %rax");
+    wln(self, "    movq %rax, -80(%rbp)");
+    wln(self, "    movsd -80(%rbp), %xmm1  # xmm1 = 0.5");
+    wln(self, "    addsd %xmm1, %xmm0");
+    wln(self, "");
+    wln(self, "    # Truncate to integer");
+    wln(self, "    cvttsd2siq %xmm0, %rax  # rax = rounded fractional * 10^6");
+    wln(self, "");
+    wln(self, "    # Extract 6 digits from rax (reversed into temp buffer)");
+    wln(self, "    leaq -128(%rbp), %r8");
+    wln(self, "    movq $6, %rcx");
+    wln(self, "    movq $10, %r9");
+    wln(self, "pf_frac_loop:");
+    wln(self, "    xorq %rdx, %rdx");
+    wln(self, "    divq %r9");
+    wln(self, "    addb $48, %dl  # '0'");
+    wln(self, "    movb %dl, (%r8)");
+    wln(self, "    incq %r8");
+    wln(self, "    decq %rcx");
+    wln(self, "    jnz pf_frac_loop");
+    wln(self, "");
+    wln(self, "    # Copy digits in reverse order to output buffer");
+    wln(self, "    decq %r8");
+    wln(self, "    movq $6, %rcx");
+    wln(self, "pf_frac_copy:");
+    wln(self, "    movb (%r8), %al");
+    wln(self, "    movb %al, (%r12)");
+    wln(self, "    incq %r12");
+    wln(self, "    incq %r13");
+    wln(self, "    decq %r8");
+    wln(self, "    decq %rcx");
+    wln(self, "    jnz pf_frac_copy");
+    wln(self, "");
+    wln(self, "    # Add newline");
+    wln(self, "    movb $10, (%r12)");
+    wln(self, "    incq %r13");
+    wln(self, "");
+    wln(self, "    # write(1, buffer, length)");
+    wln(self, "    movq $1, %rax  # syscall write");
+    wln(self, "    movq $1, %rdi  # stdout");
+    wln(self, "    leaq -64(%rbp), %rsi  # buffer");
+    wln(self, "    movq %r13, %rdx  # length");
+    wln(self, "    syscall");
+    wln(self, "");
+    wln(self, "    xorq %rax, %rax");
+    wln(self, "    addq $152, %rsp");
+    wln(self, "    popq %r14");
+    wln(self, "    popq %r13");
+    wln(self, "    popq %r12");
+    wln(self, "    movq %rbp, %rsp");
+    wln(self, "    popq %rbp");
+    wln(self, "    ret");
+
+    // p_to_str(rdi = i64 value) -> rax = pointer to null-terminated string
+    // Converts an integer to a string in a stack buffer
+    wln(self, "");
+    wln(self, "p_to_str:");
+    wln(self, "    pushq %rbp");
+    wln(self, "    movq %rsp, %rbp");
+    wln(self, "    subq $64, %rsp  # buffer");
+    wln(self, "    leaq -1(%rbp), %r8  # buffer end pointer");
+    wln(self, "    movb $0, (%r8)  # null terminator");
+    wln(self, "    movq %rdi, %rax  # value");
+    wln(self, "    movq $10, %r9  # divisor");
+    wln(self, "    testq %rax, %rax");
+    wln(self, "    jns ts_pos");
+    wln(self, "    negq %rax");
+    wln(self, "ts_pos:");
+    wln(self, "ts_loop:");
+    wln(self, "    decq %r8");
+    wln(self, "    xorq %rdx, %rdx");
+    wln(self, "    divq %r9");
+    wln(self, "    addb $48, %dl  # '0'");
+    wln(self, "    movb %dl, (%r8)");
+    wln(self, "    testq %rax, %rax");
+    wln(self, "    jnz ts_loop");
+    wln(self, "    testq %rdi, %rdi");
+    wln(self, "    jns ts_no_neg");
+    wln(self, "    decq %r8");
+    wln(self, "    movb $45, (%r8)  # '-'");
+    wln(self, "ts_no_neg:");
+    wln(self, "    # Handle zero case");
+    wln(self, "    cmpb $0, (%r8)");
+    wln(self, "    jne ts_done");
+    wln(self, "    decq %r8");
+    wln(self, "    movb $48, (%r8)  # '0'");
+    wln(self, "ts_done:");
+    wln(self, "    leaq (%r8), %rax  # return pointer to start of string");
+    wln(self, "    movq %rbp, %rsp");
+    wln(self, "    popq %rbp");
+    wln(self, "    ret");
+
+    // p_str_concat(rdi = left ptr, rsi = right ptr) -> rax = new string ptr
+    // Concatenates two null-terminated strings into a static buffer
+    wln(self, "");
+    wln(self, "p_str_concat:");
+    wln(self, "    pushq %rbp");
+    wln(self, "    movq %rsp, %rbp");
+    wln(self, "    # Save left/right pointers");
+    wln(self, "    movq %rdi, %rcx  # left");
+    wln(self, "    movq %rsi, %rdx  # right");
+    wln(self, "    # Copy left string to temp buffer first (avoid aliasing)");
+    wln(self, "    leaq str_concat_tmp(%rip), %r8  # temp buffer");
+    wln(self, "    xorq %r9, %r9  # index");
+    wln(self, "sc_copy:");
+    wln(self, "    movb (%rcx,%r9), %al");
+    wln(self, "    movb %al, (%r8,%r9)");
+    wln(self, "    testb %al, %al");
+    wln(self, "    jz sc_copy_done");
+    wln(self, "    incq %r9");
+    wln(self, "    jmp sc_copy");
+    wln(self, "sc_copy_done:");
+    wln(self, "    # Now copy temp (left) to output buffer");
+    wln(self, "    leaq str_concat_buf(%rip), %r8  # destination");
+    wln(self, "    leaq str_concat_tmp(%rip), %r11  # source (left)");
+    wln(self, "    xorq %rcx, %rcx  # index for left");
+    wln(self, "sc_left:");
+    wln(self, "    movb (%r11,%rcx), %al");
+    wln(self, "    testb %al, %al");
+    wln(self, "    jz sc_right");
+    wln(self, "    movb %al, (%r8,%rcx)");
+    wln(self, "    incq %rcx");
+    wln(self, "    jmp sc_left");
+    wln(self, "sc_right:");
+    wln(self, "    # r9 = length of left (rcx), copy right string");
+    wln(self, "    movq %rcx, %r9  # left length");
+    wln(self, "    xorq %r10, %r10  # index for right");
+    wln(self, "sc_right_loop:");
+    wln(self, "    movb (%rdx,%r10), %al");
+    wln(self, "    testb %al, %al");
+    wln(self, "    jz sc_end");
+    wln(self, "    movb %al, (%r8,%r9)");
+    wln(self, "    incq %r9");
+    wln(self, "    incq %r10");
+    wln(self, "    jmp sc_right_loop");
+    wln(self, "sc_end:");
+    wln(self, "    movb $0, (%r8,%r9)  # null terminate");
+    wln(self, "    leaq str_concat_buf(%rip), %rax  # return pointer");
+    wln(self, "    movq %rbp, %rsp");
+    wln(self, "    popq %rbp");
+    wln(self, "    ret");
+
+    // p_panic(rdi = message pointer)
+    wln(self, "");
+    wln(self, "p_panic:");
+    wln(self, "    pushq %rbp");
+    wln(self, "    movq %rsp, %rbp");
+    wln(self, "    # Save message pointer");
+    wln(self, "    movq %rdi, %r12  # message");
+    wln(self, "");
+    wln(self, "    # Calculate string length");
+    wln(self, "    xorq %r8, %r8  # length counter");
+    wln(self, "panic_len:");
+    wln(self, "    cmpb $0, (%r12,%r8)");
+    wln(self, "    je panic_done");
+    wln(self, "    incq %r8");
+    wln(self, "    jmp panic_len");
+    wln(self, "panic_done:");
+    wln(self, "");
+    wln(self, "    # write(2, message, length)  -- stderr");
+    wln(self, "    movq $1, %rax  # syscall write");
+    wln(self, "    movq $2, %rdi  # stderr");
+    wln(self, "    movq %r12, %rsi  # buffer");
+    wln(self, "    movq %r8, %rdx  # length");
+    wln(self, "    syscall");
+    wln(self, "");
+    wln(self, "    # exit(1)");
+    wln(self, "    movq $60, %rax  # syscall exit");
+    wln(self, "    movq $1, %rdi  # exit code");
+    wln(self, "    syscall");
+    wln(self, "    ud2  # should not reach here");
+
+    // p_malloc(rdi = size) -> rax = ptr
+    // Uses mmap to allocate memory
+    wln(self, "");
+    wln(self, "p_malloc:");
+    wln(self, "    pushq %rbp");
+    wln(self, "    movq %rsp, %rbp");
+    wln(self, "    # mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)");
+    wln(self, "    movq %rdi, %rsi  # size");
+    wln(self, "    movq $9, %rax  # syscall mmap");
+    wln(self, "    xorq %rdi, %rdi  # addr = NULL");
+    wln(self, "    movq $3, %rdx  # prot = PROT_READ|PROT_WRITE");
+    wln(self, "    movq $0x22, %r10  # flags = MAP_PRIVATE|MAP_ANONYMOUS");
+    wln(self, "    movq $-1, %r8  # fd = -1");
+    wln(self, "    xorq %r9, %r9  # offset = 0");
+    wln(self, "    syscall");
+    wln(self, "    movq %rbp, %rsp");
+    wln(self, "    popq %rbp");
+    wln(self, "    ret");
+
+    // p_free(rdi = ptr) -- free mmap allocation
+    // Simplified: no-op (OS reclaims on exit). For proper free, need munmap.
+    wln(self, "");
+    wln(self, "p_free:");
+    wln(self, "    pushq %rbp");
+    wln(self, "    movq %rsp, %rbp");
+    wln(self, "    # munmap(ptr, 0) -- simplified, OS reclaims on exit");
+    wln(self, "    # In production, we'd track allocation sizes");
+    wln(self, "    movq %rbp, %rsp");
+    wln(self, "    popq %rbp");
+    wln(self, "    ret");
+
+    // _start -- Linux ELF entry point
+    // At entry, RSP points to argc. Stack is 16-byte aligned.
+    // We call main() then exit with its return value.
+    wln(self, "");
+    wln(self, "    .globl _start");
+    wln(self, "    .type _start, @function");
+    wln(self, "_start:");
+    wln(self, "    # Align stack to 16 bytes (RSP is already aligned at entry)");
+    wln(self, "    # Call main()");
+    wln(self, "    call main");
+    wln(self, "    # exit(rax) -- main's return value");
+    wln(self, "    movq %rax, %rdi  # exit code from main");
+    wln(self, "    movq $60, %rax  # syscall exit");
+    wln(self, "    syscall");
+    wln(self, "    ud2  # should not reach here");
+    wln(self, "    .size _start, .-_start");
+}
+
+// ===========================================================================
+// Helper functions
+// ===========================================================================
+
+// Format a stack offset for AT&T memory operands (e.g., -8 -> "-8", 0 -> "", 48 -> "48")
+pub fn fmt_offset(offset: i64) -> str {
+    if offset == 0 {
+        return "";
+    }
+    return int_to_str(offset);
+}
+
+// Convert an i64 to signed 32-bit representation (matches Rust's `val as i32`)
+fn to_i32(v: i64) -> i64 {
+    if v >= 2147483648 { return v - 4294967296; }
+    return v;
+}
+
+// Get the argument register name for the given index (System V AMD64)
+fn arg_reg(i: i64) -> str {
+    if i == 0 { return "%rdi"; }
+    if i == 1 { return "%rsi"; }
+    if i == 2 { return "%rdx"; }
+    if i == 3 { return "%rcx"; }
+    if i == 4 { return "%r8"; }
+    if i == 5 { return "%r9"; }
+    return "%rdi";
+}
+
+// Check if a module has a function with the given name
+fn module_has_function(module: &IrModule, name: str) -> bool {
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        if str_equal(module.functions.get(i).name, name) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Check if a module has an extern function with the given name
+fn module_has_extern(module: &IrModule, name: str) -> bool {
+    var i: i64 = 0;
+    while i < module.extern_functions.len() {
+        if str_equal(module.extern_functions.get(i).name, name) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Extract the struct name from a pointer-to-struct or struct type
+fn extract_struct_name(ty: IrType) -> OptString {
+    match ty {
+        IrType::Ptr(inner) => {
+            var inner_ty: IrType = box_ir_type_unbox(inner);
+            match inner_ty {
+                IrType::Struct(name) => { return OptString::Some(name); }
+                _ => { return OptString::None; }
+            }
+            return OptString::None;
+        }
+        IrType::Struct(name) => { return OptString::Some(name); }
+        _ => { return OptString::None; }
+    }
+    return OptString::None;
+}
+
+// Convert a single hex digit (0-15) to a hex character string
+fn hex_digit(d: i64) -> str {
+    if d < 10 { return int_to_str(d); }
+    if d == 10 { return "a"; }
+    if d == 11 { return "b"; }
+    if d == 12 { return "c"; }
+    if d == 13 { return "d"; }
+    if d == 14 { return "e"; }
+    return "f";
+}
+
+// Convert a byte to two hex digits (\xNN format)
+fn hex_byte(b: i64) -> str {
+    var hi: i64 = (b >> 4) & 0xF;
+    var lo: i64 = b & 0xF;
+    return hex_digit(hi) + hex_digit(lo);
+}
+
+// Escape a string for assembly output
+pub fn escape_string(s: str) -> str {
+    var result: str = "";
+    var i: i64 = 0;
+    var len: i64 = str_len(s);
+    while i < len {
+        var b: i64 = String_byte_at(s, i);
+        if b == 34 {
+            // "
+            result = result + "\\\"";
+        } else if b == 92 {
+            // backslash
+            result = result + "\\\\";
+        } else if b == 10 {
+            // \n
+            result = result + "\\n";
+        } else if b == 13 {
+            // \r
+            result = result + "\\r";
+        } else if b == 9 {
+            // \t
+            result = result + "\\t";
+        } else if b == 0 {
+            // \0
+            result = result + "\\0";
+        } else if b >= 32 && b < 127 {
+            // ASCII graphic or space
+            result = result + char_to_str(b);
+        } else {
+            // Hex escape \xNN
+            result = result + "\\x" + hex_byte(b);
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+// Mangle function names to avoid conflicts with x86 mnemonics and GAS reserved words.
+// "main", "_start", and names starting with "__pledge" or "p_" are kept as-is.
+pub fn mangle_name(name: str) -> str {
+    // Don't mangle main, _start, or runtime stubs
+    if str_equal(name, "main") { return name; }
+    if str_equal(name, "_start") { return name; }
+    if str_starts_with(name, "__pledge") { return name; }
+    if str_starts_with(name, "p_") { return name; }
+
+    // x86 instruction mnemonics that could conflict
+    var reserved: Vec<str> = Vec::new();
+    reserved.push("add");
+    reserved.push("sub");
+    reserved.push("mul");
+    reserved.push("div");
+    reserved.push("mod");
+    reserved.push("and");
+    reserved.push("or");
+    reserved.push("xor");
+    reserved.push("not");
+    reserved.push("mov");
+    reserved.push("cmp");
+    reserved.push("test");
+    reserved.push("push");
+    reserved.push("pop");
+    reserved.push("call");
+    reserved.push("ret");
+    reserved.push("jmp");
+    reserved.push("je");
+    reserved.push("jne");
+    reserved.push("jz");
+    reserved.push("jnz");
+    reserved.push("jg");
+    reserved.push("jl");
+    reserved.push("jge");
+    reserved.push("jle");
+    reserved.push("ja");
+    reserved.push("jb");
+    reserved.push("inc");
+    reserved.push("dec");
+    reserved.push("neg");
+    reserved.push("shl");
+    reserved.push("shr");
+    reserved.push("lea");
+    reserved.push("nop");
+    reserved.push("int");
+
+    var i: i64 = 0;
+    while i < reserved.len() {
+        if str_equal(reserved.get(i), name) {
+            return "pledge_" + name;
+        }
+        i = i + 1;
+    }
+    return name;
+}
+
+// ===========================================================================
+// Public API
+// ===========================================================================
+
+// Convenience function to generate assembly from an IR module
+pub fn generate_asm_x86(module: IrModule) -> str {
+    var gen: X86CodeGen = X86CodeGen_new();
+    return X86CodeGen_generate(&mut gen, &module);
+}

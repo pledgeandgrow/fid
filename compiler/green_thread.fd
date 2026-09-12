@@ -1,0 +1,386 @@
+// green_thread.fd -- Cooperative green threads (ported from src/green_thread.rs)
+//
+// Implements stackful coroutines with context switching and a round-robin
+// scheduler. Green threads enable lightweight concurrency without OS thread
+// overhead.
+//
+// This module provides:
+//   1. The Fides scheduler (for the interpreter)
+//   2. The C runtime source (embedded as a string for codegen_c.rs)
+//
+// Porting notes:
+// - No Option<T> — use i64 with -1 for "none"
+// - No VecDeque — use Vec as a queue (push to end, remove from front)
+// - No closures — run_all uses a simple loop
+// - No static mut — global state via module-level vars
+
+module compiler::green_thread;
+
+use core;
+use vec;
+use string;
+
+// ===========================================================================
+// Constants
+// ===========================================================================
+
+pub const GREEN_THREAD_STACK_SIZE: i64 = 65536;  // 64 * 1024
+pub const MAX_GREEN_THREADS: i64 = 256;
+
+// Green thread states
+pub const GT_READY: i64 = 0;
+pub const GT_RUNNING: i64 = 1;
+pub const GT_SUSPENDED: i64 = 2;
+pub const GT_DONE: i64 = 3;
+
+// ===========================================================================
+// GreenThread
+// ===========================================================================
+
+pub struct GreenThread {
+    pub id: i64,
+    pub state: i64,         // GT_READY/GT_RUNNING/GT_SUSPENDED/GT_DONE
+    pub saved_sp: i64,
+    pub saved_ip: i64,
+    pub func_id: i64,
+    pub args: Vec<i64>,
+    pub result: i64,
+    pub active: bool,       // false = slot is empty (replaces Option<GreenThread>)
+}
+
+pub fn GreenThread_new(id: i64, func_id: i64, args: Vec<i64>) -> GreenThread {
+    return GreenThread {
+        id: id,
+        state: GT_READY,
+        saved_sp: 0,
+        saved_ip: 0,
+        func_id: func_id,
+        args: args,
+        result: 0,
+        active: true,
+    };
+}
+
+pub fn GreenThread_empty() -> GreenThread {
+    return GreenThread {
+        id: -1,
+        state: GT_DONE,
+        saved_sp: 0,
+        saved_ip: 0,
+        func_id: 0,
+        args: Vec::new(),
+        result: 0,
+        active: false,
+    };
+}
+
+// ===========================================================================
+// GreenThreadScheduler
+// ===========================================================================
+
+pub struct GreenThreadScheduler {
+    pub threads: Vec<GreenThread>,
+    pub ready_queue: Vec<i64>,     // thread IDs waiting to run
+    pub current: i64,              // -1 = none
+    pub next_id: i64,
+}
+
+pub fn GreenThreadScheduler_new() -> GreenThreadScheduler {
+    var threads: Vec<GreenThread> = Vec::new();
+    var i: i64 = 0;
+    while i < MAX_GREEN_THREADS {
+        threads.push(GreenThread_empty());
+        i = i + 1;
+    }
+    return GreenThreadScheduler {
+        threads: threads,
+        ready_queue: Vec::new(),
+        current: -1,
+        next_id: 0,
+    };
+}
+
+pub fn GreenThreadScheduler_spawn(self: &mut GreenThreadScheduler, func_id: i64, args: Vec<i64>) -> i64 {
+    if self.next_id >= MAX_GREEN_THREADS { return -1; }
+    var id: i64 = self.next_id;
+    self.next_id = self.next_id + 1;
+    self.threads.set(id, GreenThread_new(id, func_id, args));
+    self.ready_queue.push(id);
+    return id;
+}
+
+pub fn GreenThreadScheduler_current_thread(self: &GreenThreadScheduler) -> i64 {
+    return self.current;
+}
+
+pub fn GreenThreadScheduler_yield_current(self: &mut GreenThreadScheduler) -> bool {
+    if self.current < 0 { return false; }
+    var current_id: i64 = self.current;
+    // Mark current thread as suspended
+    var t: GreenThread = self.threads.get(current_id);
+    t.state = GT_SUSPENDED;
+    self.threads.set(current_id, t);
+    // Re-queue current thread
+    self.ready_queue.push(current_id);
+    self.current = -1;
+    // Find next ready or suspended thread
+    while self.ready_queue.len() > 0 {
+        var next_id: i64 = self.ready_queue.get(0);
+        // Remove from front of queue
+        var qi: i64 = 0;
+        while qi < self.ready_queue.len() - 1 {
+            self.ready_queue.set(qi, self.ready_queue.get(qi + 1));
+            qi = qi + 1;
+        }
+        self.ready_queue.pop();
+        // Check if this thread is ready or suspended
+        var nt: GreenThread = self.threads.get(next_id);
+        if nt.active && (nt.state == GT_SUSPENDED || nt.state == GT_READY) {
+            nt.state = GT_RUNNING;
+            self.threads.set(next_id, nt);
+            self.current = next_id;
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fn GreenThreadScheduler_finish_current(self: &mut GreenThreadScheduler, result: i64) {
+    if self.current >= 0 {
+        var t: GreenThread = self.threads.get(self.current);
+        t.state = GT_DONE;
+        t.result = result;
+        self.threads.set(self.current, t);
+        self.current = -1;
+    }
+}
+
+pub fn GreenThreadScheduler_is_done(self: &GreenThreadScheduler, id: i64) -> bool {
+    if id < 0 || id >= MAX_GREEN_THREADS { return true; }
+    var t: GreenThread = self.threads.get(id);
+    if !t.active { return true; }
+    return t.state == GT_DONE;
+}
+
+pub fn GreenThreadScheduler_get_result(self: &GreenThreadScheduler, id: i64) -> i64 {
+    if id < 0 || id >= MAX_GREEN_THREADS { return 0; }
+    var t: GreenThread = self.threads.get(id);
+    if !t.active { return 0; }
+    return t.result;
+}
+
+pub fn GreenThreadScheduler_has_ready_threads(self: &GreenThreadScheduler) -> bool {
+    return self.ready_queue.len() > 0;
+}
+
+// Run all green threads until completion (simplified — no closures in Fides).
+// In the interpreter, threads run eagerly. The C runtime handles real
+// context switching via inline asm.
+pub fn GreenThreadScheduler_run_all(self: &mut GreenThreadScheduler) -> i64 {
+    var last_result: i64 = 0;
+    var has_pending: bool = true;
+    while has_pending {
+        has_pending = false;
+        var i: i64 = 0;
+        while i < self.next_id {
+            var t: GreenThread = self.threads.get(i);
+            if t.active && (t.state == GT_READY || t.state == GT_SUSPENDED) {
+                has_pending = true;
+                // Mark as done (eager execution in interpreter)
+                t.state = GT_DONE;
+                t.result = 0;
+                self.threads.set(i, t);
+                last_result = 0;
+            }
+            i = i + 1;
+        }
+    }
+    return last_result;
+}
+
+// ===========================================================================
+// Global Scheduler (for interpreter)
+// ===========================================================================
+
+// The interpreter manages green thread state internally.
+// These are simplified accessors that don't use pub var (which would
+// generate unqualified method calls in the C backend).
+// The interpreter's green thread support is eager/simulated.
+
+pub fn gt_global_init() {
+    // No-op: interpreter manages state internally
+}
+
+pub fn gt_global_spawn(func_id: i64, arg_val: i64) -> i64 {
+    // Return a dummy thread ID (interpreter runs eagerly)
+    return 0;
+}
+
+pub fn gt_global_yield() {
+    // In interpreter, yield is a no-op (eager execution)
+}
+
+pub fn gt_global_run_all() -> i64 {
+    // In interpreter, threads run eagerly — just return 0
+    return 0;
+}
+
+pub fn gt_global_is_done(id: i64) -> bool {
+    // In interpreter, all threads are immediately done (eager execution)
+    return true;
+}
+
+pub fn gt_global_get_result(id: i64) -> i64 {
+    // In interpreter, return 0 (eager execution, result already consumed)
+    return 0;
+}
+
+pub fn gt_global_current() -> i64 {
+    // No current thread in interpreter mode
+    return -1;
+}
+
+pub fn gt_global_reset() {
+    gt_global_init();
+}
+
+// ===========================================================================
+// C Runtime Source (embedded in generated C files)
+// ===========================================================================
+
+pub fn green_thread_c_runtime() -> str {
+    return "// Green Thread Runtime (auto-generated by Fides compiler)\n" +
+           "// Cooperative green threads with context switching.\n" +
+           "#include <stdint.h>\n" +
+           "#include <stdlib.h>\n" +
+           "#include <string.h>\n" +
+           "#define GT_STACK_SIZE (64 * 1024)\n" +
+           "#define GT_MAX_THREADS 256\n" +
+           "typedef enum { GT_READY, GT_RUNNING, GT_SUSPENDED, GT_DONE } gt_state_t;\n" +
+           "typedef struct {\n" +
+           "    uint32_t id; gt_state_t state;\n" +
+           "    uint64_t saved_rsp, saved_rbp, saved_rbx;\n" +
+           "    uint64_t saved_r12, saved_r13, saved_r14, saved_r15, saved_rip;\n" +
+           "    uint8_t* stack; int64_t func_id; int64_t args[8]; int64_t result;\n" +
+           "} gt_thread_t;\n" +
+           "static gt_thread_t gt_threads[GT_MAX_THREADS];\n" +
+           "static uint32_t gt_next_id = 0;\n" +
+           "static int32_t gt_current = -1;\n" +
+           "typedef int64_t (*gt_func_t)(int64_t args[8]);\n" +
+           "static gt_func_t gt_dispatch_table[1024];\n" +
+           "void gt_register_func(int64_t id, gt_func_t func) {\n" +
+           "    if (id >= 0 && id < 1024) gt_dispatch_table[id] = func;\n" +
+           "}\n" +
+           "int32_t gt_spawn(int64_t func_id, int64_t args[8]) {\n" +
+           "    if (gt_next_id >= GT_MAX_THREADS) return -1;\n" +
+           "    uint32_t id = gt_next_id++;\n" +
+           "    gt_thread_t* t = &gt_threads[id];\n" +
+           "    t->id = id; t->state = GT_READY;\n" +
+           "    t->stack = (uint8_t*)malloc(GT_STACK_SIZE);\n" +
+           "    if (!t->stack) return -1;\n" +
+           "    t->func_id = func_id;\n" +
+           "    memcpy(t->args, args, sizeof(t->args));\n" +
+           "    t->result = 0; t->saved_rsp = 0; t->saved_rip = 0;\n" +
+           "    return (int32_t)id;\n" +
+           "}\n" +
+           "#if defined(__x86_64__) && !defined(__TINYC__)\n" +
+           "static inline void gt_save_context(gt_thread_t* t) {\n" +
+           "    __asm__ volatile(\"movq %%rsp, %0\\n\" \"movq %%rbp, %1\\n\"\n" +
+           "        \"movq %%rbx, %2\\n\" \"movq %%r12, %3\\n\" \"movq %%r13, %4\\n\"\n" +
+           "        \"movq %%r14, %5\\n\" \"movq %%r15, %6\\n\" \"leaq 1f(%%rip), %7\\n\" \"1:\\n\"\n" +
+           "        : \"=m\"(t->saved_rsp), \"=m\"(t->saved_rbp), \"=m\"(t->saved_rbx),\n" +
+           "          \"=m\"(t->saved_r12), \"=m\"(t->saved_r13), \"=m\"(t->saved_r14),\n" +
+           "          \"=m\"(t->saved_r15), \"=m\"(t->saved_rip) :: \"memory\");\n" +
+           "}\n" +
+           "static inline void gt_restore_context(gt_thread_t* t) {\n" +
+           "    __asm__ volatile(\"movq %0, %%rsp\\n\" \"movq %1, %%rbp\\n\" \"movq %2, %%rbx\\n\"\n" +
+           "        \"movq %3, %%r12\\n\" \"movq %4, %%r13\\n\" \"movq %5, %%r14\\n\"\n" +
+           "        \"movq %6, %%r15\\n\" \"jmp *%7\\n\" :: \"m\"(t->saved_rsp), \"m\"(t->saved_rbp),\n" +
+           "        \"m\"(t->saved_rbx), \"m\"(t->saved_r12), \"m\"(t->saved_r13),\n" +
+           "        \"m\"(t->saved_r14), \"m\"(t->saved_r15), \"m\"(t->saved_rip) : \"memory\");\n" +
+           "}\n" +
+           "#else\n" +
+           "static inline void gt_save_context(gt_thread_t* t) { (void)t; }\n" +
+           "static inline void gt_restore_context(gt_thread_t* t) { (void)t; }\n" +
+           "#endif\n" +
+           "void gt_yield(void) {\n" +
+           "    if (gt_current < 0) return;\n" +
+           "    gt_thread_t* current = &gt_threads[gt_current];\n" +
+           "    if (current->state != GT_RUNNING) return;\n" +
+           "    gt_save_context(current);\n" +
+           "    current->state = GT_SUSPENDED;\n" +
+           "    for (uint32_t i = 1; i < GT_MAX_THREADS; i++) {\n" +
+           "        uint32_t next = (gt_current + i) % GT_MAX_THREADS;\n" +
+           "        if (gt_threads[next].state == GT_READY || gt_threads[next].state == GT_SUSPENDED) {\n" +
+           "            gt_current = (int32_t)next;\n" +
+           "            gt_threads[next].state = GT_RUNNING;\n" +
+           "            gt_restore_context(&gt_threads[next]);\n" +
+           "            return;\n" +
+           "        }\n" +
+           "    }\n" +
+           "    current->state = GT_RUNNING;\n" +
+           "}\n" +
+           "static int64_t gt_run_thread(gt_thread_t* t) {\n" +
+           "    if (t->state == GT_READY) {\n" +
+           "        t->state = GT_RUNNING;\n" +
+           "        gt_current = (int32_t)t->id;\n" +
+           "        uint64_t stack_top = (uint64_t)t->stack + GT_STACK_SIZE;\n" +
+           "        stack_top &= ~0xFUL;\n" +
+           "        stack_top -= 8;\n" +
+           "        *(uint64_t*)stack_top = 0;\n" +
+           "#if defined(__x86_64__) && !defined(__TINYC__)\n" +
+           "        int64_t result; uint64_t old_rsp;\n" +
+           "        __asm__ volatile(\"movq %%rsp, %0\\n\" \"movq %2, %%rsp\\n\"\n" +
+           "            \"andq $-16, %%rsp\\n\" \"call *%3\\n\" \"movq %0, %%rsp\\n\"\n" +
+           "            : \"=m\"(old_rsp), \"=a\"(result)\n" +
+           "            : \"r\"(stack_top), \"r\"(gt_dispatch_table[t->func_id])\n" +
+           "            : \"rbx\", \"r12\", \"r13\", \"r14\", \"r15\", \"rcx\", \"rdx\",\n" +
+           "              \"rsi\", \"rdi\", \"r8\", \"r9\", \"r10\", \"r11\", \"memory\", \"cc\");\n" +
+           "        t->result = result;\n" +
+           "#else\n" +
+           "        if (gt_dispatch_table[t->func_id])\n" +
+           "            t->result = gt_dispatch_table[t->func_id](t->args);\n" +
+           "#endif\n" +
+           "        t->state = GT_DONE;\n" +
+           "        gt_current = -1;\n" +
+           "        return t->result;\n" +
+           "    } else if (t->state == GT_SUSPENDED) {\n" +
+           "        gt_current = (int32_t)t->id;\n" +
+           "        t->state = GT_RUNNING;\n" +
+           "        gt_restore_context(t);\n" +
+           "        t->state = GT_DONE;\n" +
+           "        gt_current = -1;\n" +
+           "        return t->result;\n" +
+           "    }\n" +
+           "    return t->result;\n" +
+           "}\n" +
+           "int64_t gt_run_all(void) {\n" +
+           "    int64_t last_result = 0;\n" +
+           "    int has_pending = 1;\n" +
+           "    while (has_pending) {\n" +
+           "        has_pending = 0;\n" +
+           "        for (uint32_t i = 0; i < gt_next_id; i++) {\n" +
+           "            if (gt_threads[i].state == GT_READY || gt_threads[i].state == GT_SUSPENDED) {\n" +
+           "                has_pending = 1;\n" +
+           "                last_result = gt_run_thread(&gt_threads[i]);\n" +
+           "            }\n" +
+           "        }\n" +
+           "    }\n" +
+           "    return last_result;\n" +
+           "}\n" +
+           "int gt_is_done(int32_t id) {\n" +
+           "    if (id < 0 || id >= (int32_t)gt_next_id) return 1;\n" +
+           "    return gt_threads[id].state == GT_DONE;\n" +
+           "}\n" +
+           "int64_t gt_get_result(int32_t id) {\n" +
+           "    if (id < 0 || id >= (int32_t)gt_next_id) return 0;\n" +
+           "    return gt_threads[id].result;\n" +
+           "}\n" +
+           "void gt_cleanup(void) {\n" +
+           "    for (uint32_t i = 0; i < gt_next_id; i++) {\n" +
+           "        if (gt_threads[i].stack) { free(gt_threads[i].stack); gt_threads[i].stack = NULL; }\n" +
+           "    }\n" +
+           "    gt_next_id = 0;\n" +
+           "    gt_current = -1;\n" +
+           "}\n";
+}

@@ -174,6 +174,16 @@ pub fn PathTokens_new(path: str, tokens: Vec<Token>) -> PathTokens {
     return PathTokens { path: path, tokens: tokens };
 }
 
+/// Cache entry: file path -> parsed Program (avoids re-parsing deferred modules)
+pub struct PathProgram {
+    pub path: str,
+    pub prog: Program,
+}
+
+pub fn PathProgram_new(path: str, prog: Program) -> PathProgram {
+    return PathProgram { path: path, prog: prog };
+}
+
 /// Cached file read -- returns cached content if available, otherwise reads from disk.
 fn cached_file_read(cache: &mut Vec<PathContent>, path: str) -> str {
     var i: i64 = 0;
@@ -202,6 +212,32 @@ fn cached_lex(token_cache: &mut Vec<PathTokens>, content_cache: &mut Vec<PathCon
     var toks: Vec<Token> = lex.tokenize();
     token_cache.push(PathTokens_new(path, toks));
     return toks;
+}
+
+/// Cached parse -- returns cached Program if available, otherwise parses.
+/// This avoids re-parsing modules that were pre-scanned then deferred due to
+/// unloaded transitive dependencies. The pre-scan parse is the most expensive
+/// step (~4s per module), and deferred modules get re-parsed on re-encounter.
+fn cached_parse(parse_cache: &mut Vec<PathProgram>, token_cache: &mut Vec<PathTokens>, content_cache: &mut Vec<PathContent>, path: str, struct_names: Vec<str>, enum_names: Vec<str>) -> OptProgram {
+    var i: i64 = 0;
+    while i < parse_cache.len() {
+        if str_equal(parse_cache.get(i).path, path) {
+            return OptProgram::Some(parse_cache.get(i).prog);
+        }
+        i = i + 1;
+    }
+    var toks: Vec<Token> = cached_lex(token_cache, content_cache, path);
+    var parser: Parser = Parser_with_names(toks, struct_names, enum_names);
+    var result: ParseResultProgram = parser.parse();
+    match result {
+        ParseResultProgram::Ok(prog) => {
+            parse_cache.push(PathProgram_new(path, prog));
+            return OptProgram::Some(prog);
+        }
+        ParseResultProgram::Err(_) => {
+            return OptProgram::None;
+        }
+    }
 }
 
 pub struct I64Pair {
@@ -961,6 +997,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     var enum_name_set: i64 = HashMap_new();
                     var content_cache: Vec<PathContent> = Vec::new();
                     var token_cache: Vec<PathTokens> = Vec::new();
+                    var parse_cache: Vec<PathProgram> = Vec::new();
                     var has_source_path: bool = false;
                     var base_dir: str = ".";
                     match source_path {
@@ -1028,16 +1065,15 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                             }
 
                             if found {
-                                // OPTIMIZATION: use cached file read + cached lex
-                                var module_source: str = cached_file_read(&mut content_cache, found_path);
+                                // OPTIMIZATION: use cached file read + cached lex + cached parse
                                 var pre_toks: Vec<Token> = cached_lex(&mut token_cache, &mut content_cache, found_path);
 
-                                // Pre-scan: parse to extract imports and type names
-                                var pre_parser: Parser = Parser_with_names(pre_toks, struct_names, enum_names);
-                                var pre_result: ParseResultProgram = pre_parser.parse();
+                                // Pre-scan: parse to extract imports and type names.
+                                // OPTIMIZATION: use cached_parse to avoid re-parsing deferred modules.
+                                var pre_result_opt: OptProgram = cached_parse(&mut parse_cache, &mut token_cache, &mut content_cache, found_path, struct_names, enum_names);
 
-                                match pre_result {
-                                    ParseResultProgram::Ok(pre_prog) => {
+                                match pre_result_opt {
+                                    OptProgram::Some(pre_prog) => {
                                         // Add this module's type names to name sets
                                         var si: i64 = 0;
                                         while si < pre_prog.structs.len() {
@@ -1160,7 +1196,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                                             }
                                         }
                                     }
-                                    ParseResultProgram::Err(_) => {
+                                    OptProgram::None => {
                                         // Pre-scan failed -- try full parse directly
                                         // OPTIMIZATION: reuse cached tokens
                                         var p2: Parser = Parser_with_names(pre_toks, struct_names, enum_names);

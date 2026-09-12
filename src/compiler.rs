@@ -1107,6 +1107,15 @@ fn merge_programs(stdlib: Program, user: Program) -> Program {
         }
     }
 
+    // Merge globals (user wins on name conflicts)
+    let user_global_names: std::collections::HashSet<String> =
+        merged.globals.iter().map(|g| g.name.clone()).collect();
+    for g in stdlib.globals {
+        if !user_global_names.contains(&g.name) {
+            merged.globals.push(g);
+        }
+    }
+
     // Merge extern_decls (user wins on conflicts by pledge_name)
     let user_extern_names: std::collections::HashSet<String> =
         merged.extern_decls.iter().map(|e| e.pledge_name.clone()).collect();

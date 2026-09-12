@@ -107,6 +107,10 @@ pub enum Pass {
     Reassociate,
     /// I-4A: Memoize @deterministic function calls.
     Memoize,
+    /// Loop-invariant code motion — hoist invariant computations out of loops.
+    Licm,
+    /// Escape analysis — promote non-escaping heap allocations to stack.
+    EscapeAnalysis,
 }
 
 impl Pass {
@@ -137,6 +141,8 @@ impl Pass {
             Pass::EffectOpt,
             Pass::Reassociate,
             Pass::Memoize,
+            Pass::Licm,
+            Pass::EscapeAnalysis,
         ]
     }
 
@@ -164,6 +170,8 @@ impl Pass {
             Pass::RegionPool => "region-pool",
             Pass::Reassociate => "reassociate",
             Pass::Memoize => "memoize",
+            Pass::Licm => "licm",
+            Pass::EscapeAnalysis => "escape-analysis",
         }
     }
 
@@ -191,6 +199,8 @@ impl Pass {
             "region-pool" | "rp" => Some(Pass::RegionPool),
             "reassociate" | "reassoc" => Some(Pass::Reassociate),
             "memoize" | "memo" => Some(Pass::Memoize),
+            "licm" => Some(Pass::Licm),
+            "escape-analysis" | "escape" | "ea" => Some(Pass::EscapeAnalysis),
             _ => None,
         }
     }
@@ -222,6 +232,8 @@ pub struct OptStats {
     pub region_pool: usize,
     pub reassociate: usize,
     pub memoize: usize,
+    pub licm: usize,
+    pub escape_analysis: usize,
     /// Number of fixed-point iterations the driver ran.
     pub iterations: usize,
 }
@@ -233,6 +245,7 @@ impl OptStats {
             + self.strength_reduce + self.gvn + self.sroa + self.dse + self.devirt
             + self.jump_thread + self.loop_rotate + self.loop_vectorize + self.effect_opt
             + self.region_pool + self.reassociate + self.memoize
+            + self.licm + self.escape_analysis
     }
 }
 
@@ -304,6 +317,8 @@ pub fn optimize_l2_with(module: &mut L2Module, passes: &[Pass], max_iters: usize
                 Pass::RegionPool => stats.region_pool += pass_region_pool(module),
                 Pass::Reassociate => stats.reassociate += pass_reassociate(module),
                 Pass::Memoize => stats.memoize += pass_memoize(module),
+                Pass::Licm => stats.licm += pass_licm(module),
+                Pass::EscapeAnalysis => stats.escape_analysis += pass_escape_analysis(module),
             }
         }
         if stats.total() == before {
@@ -422,6 +437,19 @@ fn pass_relevant_for_module(module: &L2Module, pass: Pass) -> bool {
         Pass::Memoize => {
             // S-1A: Skip memoize if no @deterministic function exists.
             module.functions.iter().any(|f| f.is_deterministic)
+        }
+        Pass::Licm => {
+            // S-1A: Skip LICM if no function has a loop.
+            module.functions.iter().any(|f| has_loops(f))
+        }
+        Pass::EscapeAnalysis => {
+            // S-1A: Skip escape analysis if no function allocates.
+            module.functions.iter().any(|f| {
+                f.values.values().any(|inst| {
+                    matches!(inst, L2Inst::Call { func, .. } if func == "p_malloc" || func == "p_vec_new")
+                        || matches!(inst, L2Inst::Alloca { region: crate::pir::MemRegion::Heap, .. })
+                })
+            })
         }
         Pass::RegionPool => {
             // S-1A: Skip region pool if no named region Alloca exists.
@@ -7075,6 +7103,167 @@ fn memoize_function(f: &mut L2Function, det_funcs: &HashSet<String>) -> usize {
     }
 
     count
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Loop-Invariant Code Motion (LICM)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Hoist loop-invariant computations out of loops.
+///
+/// A computation is loop-invariant if all operands are defined outside the
+/// loop and it has no side effects. We move it from the loop body to the
+/// preheader (the block that jumps into the loop header).
+pub fn pass_licm(module: &mut L2Module) -> usize {
+    parallel_functions(&mut module.functions, licm_function)
+}
+
+fn licm_function(f: &mut L2Function) -> usize {
+    let mut hoisted = 0;
+
+    // Find loops: body B ends with Jump(H), H is Branch(cond, B, Exit).
+    // Preheader P is a block (not B) that jumps to H.
+    let mut loop_info: Vec<(usize, usize, usize)> = Vec::new(); // (header, body, preheader)
+
+    for (bi, body) in f.blocks.iter().enumerate() {
+        let term_vid = match body.instructions.last() {
+            Some(&v) => v,
+            None => continue,
+        };
+        let header_id = match f.values.get(&term_vid) {
+            Some(L2Inst::Jump { target }) => *target,
+            _ => continue,
+        };
+        let hi = match f.blocks.iter().position(|b| b.id == header_id) {
+            Some(i) => i,
+            None => continue,
+        };
+        let hterm = match f.blocks[hi].instructions.last() {
+            Some(&v) => v,
+            None => continue,
+        };
+        match f.values.get(&hterm) {
+            Some(L2Inst::Branch { then, else_, .. }) => {
+                if *then != body.id && *else_ != body.id { continue; }
+            }
+            _ => continue,
+        }
+        // Find preheader
+        let mut preheader_idx = None;
+        for (pi, pblk) in f.blocks.iter().enumerate() {
+            if pi == bi { continue; }
+            if let Some(&pv) = pblk.instructions.last() {
+                if let Some(L2Inst::Jump { target }) = f.values.get(&pv) {
+                    if *target == header_id { preheader_idx = Some(pi); break; }
+                }
+            }
+        }
+        let pi = match preheader_idx { Some(i) => i, None => continue };
+        loop_info.push((hi, bi, pi));
+    }
+
+    for (hi, bi, pi) in loop_info {
+        // Collect PValues defined inside the loop
+        let mut loop_defined: HashSet<PValue> = HashSet::new();
+        for &idx in &[hi, bi] {
+            for &vid in &f.blocks[idx].instructions {
+                loop_defined.insert(vid);
+            }
+        }
+
+        let body_instrs: Vec<PValue> = f.blocks[bi].instructions.clone();
+        let mut to_hoist: Vec<PValue> = Vec::new();
+
+        for &vid in &body_instrs {
+            let inst = match f.values.get(&vid) { Some(i) => i.clone(), None => continue };
+            if inst.is_terminator() { continue; }
+            // Skip stores, loads, allocas — not safe to hoist
+            if matches!(inst, L2Inst::Store { .. } | L2Inst::Load { .. } | L2Inst::Alloca { .. }) { continue; }
+            // Skip calls with side effects
+            match &inst {
+                L2Inst::Call { func, .. } => {
+                    if !is_known_pure_func(func) { continue; }
+                }
+                L2Inst::CallPtr { .. } | L2Inst::DynCall { .. } => continue,
+                _ => {}
+            }
+            // Check all operands are loop-invariant
+            let refs = value_refs(&inst);
+            if refs.iter().all(|r| !loop_defined.contains(r)) {
+                to_hoist.push(vid);
+            }
+        }
+
+        if !to_hoist.is_empty() {
+            // Remove from body
+            let body_block = &mut f.blocks[bi];
+            body_block.instructions.retain(|v| !to_hoist.contains(v));
+            // Insert into preheader before terminator
+            let preheader = &mut f.blocks[pi];
+            let term = preheader.instructions.pop();
+            for &v in &to_hoist { preheader.instructions.push(v); }
+            if let Some(t) = term { preheader.instructions.push(t); }
+            hoisted += to_hoist.len();
+        }
+    }
+    hoisted
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Escape Analysis → Stack Allocation
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Promote heap allocations that don't escape to stack allocations.
+/// Conservative: only promotes when we can prove the allocation doesn't escape
+/// (not returned, not stored, not passed to non-pure functions).
+pub fn pass_escape_analysis(module: &mut L2Module) -> usize {
+    let mut count = 0;
+    for f in &mut module.functions {
+        count += escape_analysis_function(f);
+    }
+    count
+}
+
+fn escape_analysis_function(f: &mut L2Function) -> usize {
+    // Collect allocation sites (p_malloc/p_vec_new calls)
+    let alloc_sites: Vec<PValue> = f.values.iter()
+        .filter_map(|(pv, inst)| match inst {
+            L2Inst::Call { func, .. } if func == "p_malloc" || func == "p_vec_new" => Some(*pv),
+            _ => None,
+        })
+        .collect();
+
+    if alloc_sites.is_empty() { return 0; }
+
+    let mut promoted = 0;
+    for &alloc_pv in &alloc_sites {
+        let mut escapes = false;
+        for (_other_pv, inst) in &f.values {
+            match inst {
+                L2Inst::Return { value: Some(v) } if *v == alloc_pv => { escapes = true; }
+                L2Inst::Store { value, .. } if *value == alloc_pv => { escapes = true; }
+                L2Inst::Call { args, func, .. } => {
+                    if args.contains(&alloc_pv) && func != "p_free" && func != "p_vec_push" {
+                        escapes = true;
+                    }
+                }
+                L2Inst::CallPtr { args, .. } | L2Inst::DynCall { args, .. } => {
+                    if args.contains(&alloc_pv) { escapes = true; }
+                }
+                _ => {}
+            }
+            if escapes { break; }
+        }
+        if !escapes {
+            if let Some(L2Inst::Call { func, .. }) = f.values.get(&alloc_pv) {
+                let size = if func == "p_vec_new" { 32 } else { 8 };
+                let ty = PirType::Struct(format!("__promoted_{}", size));
+                f.values.insert(alloc_pv, L2Inst::Alloca { ty, region: MemRegion::Stack });
+                promoted += 1;
+            }
+        }
+    }
+    promoted
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

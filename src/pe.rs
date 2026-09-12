@@ -130,6 +130,28 @@ impl X86Encoder {
         self.labels.insert(label, self.code.len());
     }
 
+    /// Align code output to a boundary using multi-byte NOPs.
+    fn align_to(&mut self, boundary: usize) {
+        if boundary == 0 { return; }
+        let cur = self.code.len();
+        let rem = cur % boundary;
+        if rem == 0 { return; }
+        let pad = boundary - rem;
+        const NOPS: &[&[u8]] = &[
+            &[0x90],
+            &[0x66, 0x90],
+            &[0x0F, 0x1F, 0x00],
+            &[0x0F, 0x1F, 0x40, 0x00],
+            &[0x0F, 0x1F, 0x44, 0x00, 0x00],
+            &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],
+            &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],
+            &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        ];
+        let mut remaining = pad;
+        while remaining >= 8 { self.emit(NOPS[7]); remaining -= 8; }
+        if remaining > 0 { self.emit(NOPS[remaining - 1]); }
+    }
+
     /// Get current code offset
     fn offset(&self) -> usize {
         self.code.len()
@@ -2980,6 +3002,7 @@ impl PeCodeGen {
     /// Generate code for a single function
     fn gen_function(&mut self, name: &str, func: &IrFunction, module: &IrModule) {
         let label = *self.func_labels.get(name).unwrap();
+        self.enc.align_to(16);
         self.enc.place_label(label);
 
         if func.is_interrupt {

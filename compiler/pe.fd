@@ -108,6 +108,56 @@ pub fn X86Encoder_place_label(self: &mut X86Encoder, label: i64) {
     self.labels.set(label, self.code.len());
 }
 
+/// Align code output to a boundary using multi-byte NOPs.
+pub fn X86Encoder_align_to(self: &mut X86Encoder, boundary: i64) {
+    var cur: i64 = self.code.len();
+    if boundary <= 0 { return; }
+    var rem: i64 = cur % boundary;
+    if rem == 0 { return; }
+    var pad: i64 = boundary - rem;
+    var i: i64 = 0;
+    while i < pad {
+        var remaining: i64 = pad - i;
+        if remaining >= 8 {
+            X86Encoder_emit_u8(self, 0x0F); X86Encoder_emit_u8(self, 0x1F);
+            X86Encoder_emit_u8(self, 0x84); X86Encoder_emit_u8(self, 0x00);
+            X86Encoder_emit_u8(self, 0x00); X86Encoder_emit_u8(self, 0x00);
+            X86Encoder_emit_u8(self, 0x00); X86Encoder_emit_u8(self, 0x00);
+            i = i + 8;
+        } else if remaining == 7 {
+            X86Encoder_emit_u8(self, 0x0F); X86Encoder_emit_u8(self, 0x1F);
+            X86Encoder_emit_u8(self, 0x80); X86Encoder_emit_u8(self, 0x00);
+            X86Encoder_emit_u8(self, 0x00); X86Encoder_emit_u8(self, 0x00);
+            X86Encoder_emit_u8(self, 0x00);
+            i = i + 7;
+        } else if remaining == 6 {
+            X86Encoder_emit_u8(self, 0x66); X86Encoder_emit_u8(self, 0x0F);
+            X86Encoder_emit_u8(self, 0x1F); X86Encoder_emit_u8(self, 0x44);
+            X86Encoder_emit_u8(self, 0x00); X86Encoder_emit_u8(self, 0x00);
+            i = i + 6;
+        } else if remaining == 5 {
+            X86Encoder_emit_u8(self, 0x0F); X86Encoder_emit_u8(self, 0x1F);
+            X86Encoder_emit_u8(self, 0x44); X86Encoder_emit_u8(self, 0x00);
+            X86Encoder_emit_u8(self, 0x00);
+            i = i + 5;
+        } else if remaining == 4 {
+            X86Encoder_emit_u8(self, 0x0F); X86Encoder_emit_u8(self, 0x1F);
+            X86Encoder_emit_u8(self, 0x40); X86Encoder_emit_u8(self, 0x00);
+            i = i + 4;
+        } else if remaining == 3 {
+            X86Encoder_emit_u8(self, 0x0F); X86Encoder_emit_u8(self, 0x1F);
+            X86Encoder_emit_u8(self, 0x00);
+            i = i + 3;
+        } else if remaining == 2 {
+            X86Encoder_emit_u8(self, 0x66); X86Encoder_emit_u8(self, 0x90);
+            i = i + 2;
+        } else {
+            X86Encoder_emit_u8(self, 0x90);
+            i = i + 1;
+        }
+    }
+}
+
 // Current code offset
 pub fn X86Encoder_offset(self: &X86Encoder) -> i64 {
     return self.code.len();
@@ -2099,6 +2149,7 @@ pub fn PeCodeGen_gen_print_inst(self: &mut PeCodeGen, frame: &PeStackFrame, valu
 pub fn PeCodeGen_gen_function(self: &mut PeCodeGen, name: str, func: IrFunction, module: IrModule) {
     var label: i64 = PeCodeGen_get_func_label(self, name);
     if label < 0 { return; }
+    X86Encoder_align_to(&mut self.enc, 16);
     X86Encoder_place_label(&mut self.enc, label);
 
     // Check if this is an interrupt handler (name contains "interrupt" marker

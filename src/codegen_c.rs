@@ -131,6 +131,16 @@ impl CCodeGen {
         }
     }
 
+    /// C type for a global variable. Struct types are emitted as values
+    /// (not pointers) so that `memset` / `memcpy` can initialize them.
+    fn c_type_global(ty: &IrType) -> String {
+        match ty {
+            IrType::Struct(name) => format!("struct {}_s", name),
+            IrType::Array(elem, size) => format!("{}[{}]", Self::c_type_global(elem), size),
+            _ => Self::c_type(ty),
+        }
+    }
+
     /// Format a C parameter declaration with the variable name in the right position.
     /// For array types, C requires `type name[size]` not `type[size] name`.
     fn c_param_decl(ty: &IrType, name: &str) -> String {
@@ -366,11 +376,12 @@ impl CCodeGen {
         // Emit string constants
         self.emit_string_consts(module);
 
+        // Emit struct definitions (must come before globals so struct types
+        // are known when global variables are initialized)
+        self.emit_struct_defs(module);
+
         // Emit module-level mutable globals
         self.emit_globals(module);
-
-        // Emit struct definitions
-        self.emit_struct_defs(module);
 
         // Emit function prototypes
         self.emit_prototypes(module);
@@ -1257,10 +1268,15 @@ impl CCodeGen {
         if module.globals.is_empty() { return; }
         wln!(self, "// ─── Module-level mutable globals ───");
         for (name, (ty, init)) in &module.globals {
-            let c_ty = Self::c_type(ty);
+            let c_ty = Self::c_type_global(ty);
             let c_name = Self::global_c_name(name);
-            // Emit as a static global with initializer
-            let init_str = self.gen_global_init_expr(init, ty);
+            // Emit as a static global with initializer.
+            // For struct types, use {0} initializer (zero-init all fields).
+            let init_str = match ty {
+                IrType::Struct(_) => "{0}".to_string(),
+                IrType::Array(_, _) => "{0}".to_string(),
+                _ => self.gen_global_init_expr(init, ty),
+            };
             wln!(self, "static {} {} = {};", c_ty, c_name, init_str);
         }
         wln!(self, "");
