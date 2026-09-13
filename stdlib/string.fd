@@ -363,35 +363,22 @@ pub fn int_to_bin(n: i64) -> str {
 //   value heap_s = smallstr_to_str(s);     // convert to regular str
 //   value s2 = smallstr_from_str("world"); // inline if ≤ 14 bytes
 
-/// SmallStr is a 16-byte inline string. Short strings (≤ 14 bytes) are
-/// stored directly in the struct. Longer strings fall back to heap allocation.
-/// Implementation uses a single i64 pointer + i64 length to avoid array
-/// type inference issues in the current typechecker.
+/// SmallStr is a small string optimization. Current implementation uses
+/// heap-allocated strings for all cases (inline optimization deferred until
+/// the typechecker supports array literals with context-dependent types).
 struct SmallStr {
-    ptr: i64,   // pointer to inline buffer or heap allocation
-    len: i64,   // length (0-14 = inline, -1 = heap-allocated)
+    ptr: i64,   // heap-allocated string pointer (owned)
+    len: i64,   // string length
 }
 
 /// Maximum length for inline storage.
 pub fn smallstr_max_inline() -> i64 { return 14; }
 
-/// Create a SmallStr from a regular string. If the string is ≤ 14 bytes,
-/// it's stored inline (no allocation). Otherwise, it's heap-allocated.
+/// Create a SmallStr from a regular string.
 pub fn smallstr_from_str(s: str) -> SmallStr {
     var len: i64 = p_string_len(s);
-    if len <= 14 {
-        // Inline mode: allocate a small buffer and copy bytes
-        var ptr: i64 = p_malloc(16);
-        p_memset(ptr, 0, 16);
-        p_memcopy(ptr, p_string_ptr(s), len);
-        return SmallStr { ptr: ptr, len: len };
-    } else {
-        // Long mode: heap-allocate and store pointer
-        var ptr: i64 = p_malloc(len + 1);
-        p_memcopy(ptr, p_string_ptr(s), len);
-        p_memset(ptr + len, 0, 1);
-        return SmallStr { ptr: ptr, len: -1 };
-    }
+    var ptr: i64 = p_string_from(s);
+    return SmallStr { ptr: ptr, len: len };
 }
 
 /// Alias for smallstr_from_str.
@@ -401,26 +388,17 @@ pub fn smallstr_new(s: str) -> SmallStr {
 
 /// Get the length of a SmallStr.
 pub fn smallstr_len(s: SmallStr) -> i64 {
-    if s.len == -1 {
-        // Long mode: length is the string length
-        return p_string_len(p_string_from_ptr(s.ptr));
-    }
     return s.len;
 }
 
 /// Convert a SmallStr to a regular heap string.
 pub fn smallstr_to_str(s: SmallStr) -> str {
-    if s.len == -1 {
-        // Long mode: pointer is the string
-        return p_string_from_ptr(s.ptr);
-    }
-    // Inline mode: build string from inline bytes
-    return p_string_from_ptr_len(s.ptr, s.len);
+    return s.ptr;
 }
 
 /// Check if a SmallStr is stored inline (no heap allocation).
 pub fn smallstr_is_inline(s: SmallStr) -> bool {
-    return s.len != -1;
+    return false;
 }
 
 /// Compare two SmallStrs for equality.

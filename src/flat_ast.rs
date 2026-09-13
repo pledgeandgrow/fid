@@ -571,6 +571,13 @@ pub fn stmt_flat(s: &Stmt, depth: usize) -> String {
             if out.ends_with('\n') { out.pop(); }
             out
         }
+        Stmt::Resume { cont, value, line } => {
+            let mut out = format!("{}Resume {}\n", ind, line);
+            out.push_str(&expr_flat(cont, depth + 1)); out.push('\n');
+            out.push_str(&expr_flat(value, depth + 1)); out.push('\n');
+            if out.ends_with('\n') { out.pop(); }
+            out
+        }
         Stmt::RegionBlock { name, budget, is_gpu, is_kv_cache, window_size, body, line } => {
             let mut out = format!("{}RegionBlock \"{}\" {} {} {} {} {}\n", ind, esc(name),
                 match budget { Some(n) => n.to_string(), None => "None".to_string() },
@@ -648,6 +655,15 @@ pub fn stmt_flat(s: &Stmt, depth: usize) -> String {
             }
             if out.ends_with('\n') { out.pop(); }
             out
+        }
+        Stmt::SpawnScope { body, line } => {
+            let mut out = format!("{}SpawnScope {}\n", ind, line);
+            for st in body { out.push_str(&stmt_flat(st, depth + 1)); out.push('\n'); }
+            if out.ends_with('\n') { out.pop(); }
+            out
+        }
+        Stmt::CancelScope { line } => {
+            format!("{}CancelScope {}", ind, line)
         }
     }
 }

@@ -542,6 +542,10 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<String>) 
                 substitute_expr(a, original, errs);
             }
         }
+        Stmt::Resume { cont, value, .. } => {
+            substitute_expr(cont, original, errs);
+            substitute_expr(value, original, errs);
+        }
         Stmt::RegionBlock { body, .. } => {
             substitute_stmts(body, original, errs);
         }
@@ -575,6 +579,10 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<String>) 
                 substitute_stmts(branch, original, errs);
             }
         }
+        Stmt::SpawnScope { body, .. } => {
+            substitute_stmts(body, original, errs);
+        }
+        Stmt::CancelScope { .. } => {}
     }
 }
 

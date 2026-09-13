@@ -307,6 +307,10 @@ impl<'tc> BorrowChecker<'tc> {
             Stmt::Do { args, .. } => {
                 for a in args { self.collect_var_uses_expr(a, idx); }
             }
+            Stmt::Resume { cont, value, .. } => {
+                self.collect_var_uses_expr(cont, idx);
+                self.collect_var_uses_expr(value, idx);
+            }
             Stmt::RegionBlock { body, .. } => {
                 for s in body { self.collect_var_uses_stmt(s, idx); }
             }
@@ -346,6 +350,10 @@ impl<'tc> BorrowChecker<'tc> {
                     for s in branch { self.collect_var_uses_stmt(s, idx); }
                 }
             }
+            Stmt::SpawnScope { body, .. } => {
+                for s in body { self.collect_var_uses_stmt(s, idx); }
+            }
+            Stmt::CancelScope { .. } => {}
         }
     }
 
@@ -931,6 +939,10 @@ impl<'tc> BorrowChecker<'tc> {
             Stmt::Do { args, .. } => {
                 for a in args { self.check_expr(a); }
             }
+            Stmt::Resume { cont, value, .. } => {
+                self.check_expr(cont);
+                self.check_expr(value);
+            }
             Stmt::RegionBlock { body, .. } => {
                 // Region blocks create a new scope. Borrows inside don't
                 // escape (the typechecker already enforces this via
@@ -996,6 +1008,12 @@ impl<'tc> BorrowChecker<'tc> {
                     self.pop_scope();
                 }
             }
+            Stmt::SpawnScope { body, .. } => {
+                self.push_scope();
+                for s in body { self.check_stmt(s); }
+                self.pop_scope();
+            }
+            Stmt::CancelScope { .. } => {}
         }
     }
 

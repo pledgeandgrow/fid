@@ -1,41 +1,39 @@
-// Test: Phase A3 — Non-blocking IO
-//
-// p_net_connect(host, port) — connects to a TCP server, returns socket (eager)
-// p_net_read(sock, buf, len) — async read, returns Future
-// p_net_write(sock, buf, len) — async write, returns Future
-// p_net_close(sock) — close socket
-// p_fs_read_async(path, buf, len) — async file read, returns Future
-//
-// In the interpreter, IO is simulated. In C codegen, real sockets/files are used.
+// L3G: Async I/O via effect handlers
+// do IO.read(file) — yields to IO handler, handler does I/O, resumes with result
+// do Net.accept(socket) — yields to Net handler, handler does accept, resumes with connection
+// Built-in IO/Net handlers wrap existing builtins
 
 fn main() {
-    // Test async file read — read this test file
-    val buf = p_malloc(4096);
-    val read_future = p_fs_read_async("tests/bootstrap/test_async_io.fd", buf, 4096);
-
-    // Poll until the read completes
-    var pending = 1;
-    while pending > 0 {
-        val result = p_task_poll_nonblocking(read_future);
-        if result == -9223372036854775807 {
-            // Still pending — yield (in real async, we'd switch tasks here)
-            pending = 1;
-        } else {
-            pending = 0;
+    // IO handler — wraps p_fs_read/p_fs_write in effect handler semantics
+    handle {
+        // do IO.write("hello") — handler does the actual write
+        do IO.write(42);
+        println(1);
+        // do IO.read() — handler reads and resumes with the value
+        do IO.read(0);
+        println(2);
+    } with {
+        IO.write(v) => {
+            println(v);
+            resume(cont, 0);
+        },
+        IO.read(v) => {
+            // Handler does the actual I/O and resumes with the result
+            // For this test, just resume with a constant
+            resume(cont, 100);
         }
     }
 
-    var bytes_read = p_task_poll(read_future);
-    print("bytes_read = ");
-    print(bytes_read);
-    print("\n");
-
-    // Test net connect to localhost — may succeed or fail depending on env
-    // Just test that the function doesn't crash
-    val sock = p_net_connect("127.0.0.1", 9999);
-    if sock >= 0 {
-        p_net_close(sock);
+    // Net handler — wraps p_net_accept in effect handler semantics
+    handle {
+        do Net.accept(0);
+        println(3);
+    } with {
+        Net.accept(socket) => {
+            // Handler does the actual accept and resumes with the connection
+            // For this test, just resume with a constant
+            resume(cont, 0);
+        }
     }
-
-    print("OK\n");
+    println(4);
 }

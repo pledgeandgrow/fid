@@ -612,6 +612,9 @@ impl CodeGen {
             Stmt::Do { .. } => {
                 // Not yet supported in legacy ARM64 codegen
             }
+            Stmt::Resume { .. } => {
+                // Not yet supported in legacy ARM64 codegen
+            }
             Stmt::RegionBlock { body, .. } => {
                 // Region creation/freeing not yet implemented in codegen
                 for s in body {
@@ -659,6 +662,13 @@ impl CodeGen {
                 for branch in branches {
                     for s in branch { self.gen_stmt(s); }
                 }
+            }
+            Stmt::SpawnScope { body, .. } => {
+                // L3B: spawn scope — lowered to IR before codegen.
+                for s in body { self.gen_stmt(s); }
+            }
+            Stmt::CancelScope { .. } => {
+                // L3E: cancel scope — lowered to IR before codegen.
             }
         }
     }

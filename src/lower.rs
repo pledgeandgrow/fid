@@ -225,6 +225,12 @@ pub struct Lowerer {
     current_self_type: Option<String>,
     /// Stack of effect handlers (for handle/do statements)
     effect_handler_stack: Vec<Vec<crate::ast::EffectHandler>>,
+    /// L3B: Stack of scope executors for structured concurrency.
+    /// `spawn` expressions inside a `spawn scope` block use the top executor.
+    scope_executor_stack: Vec<ValueId>,
+    /// L3A: Counter for continuation closure names (avoids collisions with
+    /// functions that are being lowered but not yet stored to the module).
+    continuation_counter: u64,
     /// Stack of active named regions — allocations inside a region block
     /// use Region::Named(name) instead of Region::Stack
     region_stack: Vec<String>,
@@ -328,6 +334,8 @@ impl Lowerer {
             type_aliases: HashMap::new(),
             current_self_type: None,
             effect_handler_stack: Vec::new(),
+            scope_executor_stack: Vec::new(),
+            continuation_counter: 0,
             region_stack: Vec::new(),
             gpu_region_stack: Vec::new(),
             sandbox_depth: 0,
@@ -1131,6 +1139,8 @@ impl Lowerer {
         self.module.add_extern("p_executor_run_all", vec![IrType::I64], IrType::I64);
         // p_executor_poll_all(exec) -> i64 — non-blocking poll, returns count of pending tasks
         self.module.add_extern("p_executor_poll_all", vec![IrType::I64], IrType::I64);
+        // L3E: p_executor_cancel(exec) -> i64 — cancel all pending tasks on executor
+        self.module.add_extern("p_executor_cancel", vec![IrType::I64], IrType::I64);
         // p_task_poll_nonblocking(future) -> i64 — returns value if ready, PENDING_SENTINEL if not
         self.module.add_extern("p_task_poll_nonblocking", vec![IrType::I64], IrType::I64);
         // ─── Phase A3: Non-blocking IO ───
@@ -1464,13 +1474,23 @@ impl Lowerer {
         // If the function has a non-void return type and the last statement
         // is an expression, use it as the implicit return value.
         let mut last_expr_val: Option<ValueId> = None;
-        for stmt in &func.body {
-            if let Stmt::Expr(expr, _) = stmt {
-                // Lower the expression and remember its value
-                last_expr_val = Some(self.lower_expr(expr));
-            } else {
-                last_expr_val = None;
-                self.lower_stmt(stmt);
+        // L3A: Use lower_stmts (not lower_stmt loop) so that top-level `do`
+        // statements get continuation capture. lower_stmts returns early
+        // after a `do`, with remaining statements captured in a continuation.
+        let has_do = func.body.iter().any(|s| matches!(s, Stmt::Do { .. }));
+        if has_do {
+            // lower_stmts handles `do` with continuation capture.
+            // The continuation function handles its own implicit return.
+            self.lower_stmts(&func.body);
+        } else {
+            for stmt in &func.body {
+                if let Stmt::Expr(expr, _) = stmt {
+                    // Lower the expression and remember its value
+                    last_expr_val = Some(self.lower_expr(expr));
+                } else {
+                    last_expr_val = None;
+                    self.lower_stmt(stmt);
+                }
             }
         }
 
@@ -2712,6 +2732,41 @@ impl Lowerer {
                     }
                 }
             }
+            Stmt::SpawnScope { body, line: _ } => {
+                // L3B: spawn scope { body } — structured concurrency.
+                // Create an executor, run the body (spawn expressions use it),
+                // then join all tasks at scope exit.
+                let exec = self.emit_inst(Inst::Call {
+                    func: "p_executor_new".to_string(),
+                    args: vec![],
+                    ret_ty: IrType::I64,
+                    effects: EffectSet::new(),
+                });
+                // Push executor onto scope stack so spawn expressions can use it
+                self.scope_executor_stack.push(exec);
+                // Lower the body
+                self.lower_stmts(body);
+                // Pop executor
+                self.scope_executor_stack.pop();
+                // Join all tasks: p_executor_run_all(exec)
+                self.emit_inst(Inst::Call {
+                    func: "p_executor_run_all".to_string(),
+                    args: vec![exec],
+                    ret_ty: IrType::I64,
+                    effects: EffectSet::new(),
+                });
+            }
+            Stmt::CancelScope { line: _ } => {
+                // L3E: cancel scope; — cancel all pending tasks in current scope
+                if let Some(exec) = self.scope_executor_stack.last().copied() {
+                    self.emit_inst(Inst::Call {
+                        func: "p_executor_cancel".to_string(),
+                        args: vec![exec],
+                        ret_ty: IrType::I64,
+                        effects: EffectSet::new(),
+                    });
+                }
+            }
         }
     }
 
@@ -3702,13 +3757,15 @@ impl Lowerer {
                 }
             }
             // Bind `cont` variable in the handler's scope
+            // The continuation is a closure env struct — use Opaque type so the
+            // interpreter stores it in the side-table (preserves Value::Ptr)
             let cont_slot = self.emit_inst(Inst::Alloca {
-                ty: IrType::I64,
+                ty: IrType::Opaque("closure".to_string()),
                 region: self.current_region(),
             });
             self.emit_inst(Inst::Store { ptr: cont_slot, value: cont_val, store_ty: None });
             self.allocas.insert("cont".to_string(), cont_slot);
-            self.alloca_types.insert(cont_slot, IrType::I64);
+            self.alloca_types.insert(cont_slot, IrType::Opaque("closure".to_string()));
 
             // Lower the handler body
             self.lower_stmts(&body);
@@ -3756,7 +3813,8 @@ impl Lowerer {
     /// The closure takes one i64 parameter (the resume value) and executes
     /// the remaining statements. Captures all in-scope variables.
     fn create_continuation_closure(&mut self, remaining: &[Stmt]) -> ValueId {
-        let closure_id = self.module.functions.len();
+        self.continuation_counter += 1;
+        let closure_id = self.continuation_counter;
         let closure_name = format!("__cont_{}", closure_id);
 
         // Find free variables (captures) in the remaining statements
@@ -3829,7 +3887,8 @@ impl Lowerer {
 
     /// L3A: Create a no-op continuation (for `do` with no remaining statements)
     fn create_noop_continuation(&mut self) -> ValueId {
-        let closure_id = self.module.functions.len();
+        self.continuation_counter += 1;
+        let closure_id = self.continuation_counter;
         let closure_name = format!("__cont_noop_{}", closure_id);
 
         let resume_param = crate::ast::Param {
@@ -6326,28 +6385,42 @@ impl Lowerer {
                 })
             }
             Expr::Spawn { expr: inner } => {
-                // spawn <expr> — create a concurrent task that runs in a real OS thread.
-                // If the inner expression is a function call, we extract the function
-                // name and args, and call p_thread_spawn which creates an OS thread.
-                // If it's not a call, fall back to eager evaluation.
+                // spawn <expr> — create a concurrent task.
+                // L3B: If inside a `spawn scope` block, use the scope executor.
+                // Otherwise, use p_thread_spawn (creates an OS thread).
                 match &**inner {
                     Expr::Call { callee, args, .. } => {
-                        // spawn func(args) → p_thread_spawn(func_name, num_args, args...)
                         let func_name_val = self.emit_inst(Inst::ConstStr { value: callee.clone() });
                         let num_args_val = self.emit_inst(Inst::ConstInt {
                             value: args.len() as i64,
                             ty: IrType::I64,
                         });
-                        let mut all_args = vec![func_name_val, num_args_val];
-                        for arg in args {
-                            all_args.push(self.lower_expr(arg));
+                        // L3B: Use scope executor if available, else p_thread_spawn
+                        if let Some(exec) = self.scope_executor_stack.last().copied() {
+                            // spawn func(args) → p_executor_spawn(exec, func_name, num_args, args...)
+                            let mut all_args = vec![exec, func_name_val, num_args_val];
+                            for arg in args {
+                                all_args.push(self.lower_expr(arg));
+                            }
+                            self.emit_inst(Inst::Call {
+                                func: "p_executor_spawn".to_string(),
+                                args: all_args,
+                                ret_ty: IrType::I64,
+                                effects: EffectSet::new(),
+                            })
+                        } else {
+                            // spawn func(args) → p_thread_spawn(func_name, num_args, args...)
+                            let mut all_args = vec![func_name_val, num_args_val];
+                            for arg in args {
+                                all_args.push(self.lower_expr(arg));
+                            }
+                            self.emit_inst(Inst::Call {
+                                func: "p_thread_spawn".to_string(),
+                                args: all_args,
+                                ret_ty: IrType::I64,
+                                effects: EffectSet::new(),
+                            })
                         }
-                        self.emit_inst(Inst::Call {
-                            func: "p_thread_spawn".to_string(),
-                            args: all_args,
-                            ret_ty: IrType::I64,
-                            effects: EffectSet::new(),
-                        })
                     }
                     _ => {
                         // Non-call spawn — fall back to eager evaluation
@@ -6557,6 +6630,10 @@ impl Lowerer {
                         self.collect_free_vars(branch, free_vars, local_names);
                     }
                 }
+                Stmt::SpawnScope { body, .. } => {
+                    self.collect_free_vars(body, free_vars, local_names);
+                }
+                Stmt::CancelScope { .. } => {}
             }
         }
     }

@@ -4920,6 +4920,9 @@ impl TypeChecker {
                     for param in &handler.params {
                         self.declare(param, Type::I64);
                     }
+                    // L3A: Pre-declare `cont` — the continuation variable
+                    // available inside handler bodies for resume(cont, value)
+                    self.declare("cont", Type::I64);
                     for s in &handler.body {
                         self.check_stmt(s);
                     }
@@ -5184,6 +5187,17 @@ impl TypeChecker {
                     }
                     self.pop_scope();
                 }
+            }
+            Stmt::SpawnScope { body, .. } => {
+                // L3B: spawn scope { body } — structured concurrency
+                self.push_scope();
+                for s in body {
+                    self.check_stmt(s);
+                }
+                self.pop_scope();
+            }
+            Stmt::CancelScope { .. } => {
+                // L3E: cancel scope; — no typechecking needed
             }
         }
     }
@@ -8664,5 +8678,7 @@ fn stmt_line(stmt: &Stmt) -> usize {
         Stmt::Query { line, .. } => *line,
         Stmt::Select { line, .. } => *line,
         Stmt::Parallel { line, .. } => *line,
+        Stmt::SpawnScope { line, .. } => *line,
+        Stmt::CancelScope { line, .. } => *line,
     }
 }

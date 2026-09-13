@@ -1593,6 +1593,19 @@ impl Parser {
                 && self.tokens[self.pos + 1].kind == TokenKind::LBrace => {
                 self.parse_parallel_stmt()
             }
+            // L3B: `spawn scope { body }` — structured concurrency scope
+            TokenKind::Spawn
+                if self.pos + 2 < self.tokens.len()
+                && matches!(self.tokens[self.pos + 1].kind, TokenKind::Ident(ref s) if s == "scope")
+                && self.tokens[self.pos + 2].kind == TokenKind::LBrace => {
+                self.parse_spawn_scope_stmt()
+            }
+            // L3E: `cancel scope;` — cancel all tasks in current spawn scope
+            TokenKind::Ident(s) if s == "cancel"
+                && self.pos + 1 < self.tokens.len()
+                && matches!(self.tokens[self.pos + 1].kind, TokenKind::Ident(ref s2) if s2 == "scope") => {
+                self.parse_cancel_scope_stmt()
+            }
             _ => self.parse_assign_or_expr(),
         }
     }
@@ -1808,6 +1821,27 @@ impl Parser {
         }
 
         Ok(Stmt::Parallel { branches, line })
+    }
+
+    /// L3B: Parse `spawn scope { body }` — structured concurrency scope.
+    /// All `spawn` expressions inside are tracked and joined at scope exit.
+    fn parse_spawn_scope_stmt(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
+        self.expect(TokenKind::Spawn, "spawn")?;
+        self.expect_ident()?; // "scope"
+        self.expect(TokenKind::LBrace, "{")?;
+        let body = self.parse_block()?;
+        self.expect(TokenKind::RBrace, "}")?;
+        Ok(Stmt::SpawnScope { body, line })
+    }
+
+    /// L3E: Parse `cancel scope;` — cancel all tasks in the current spawn scope.
+    fn parse_cancel_scope_stmt(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
+        self.expect_ident()?; // "cancel"
+        self.expect_ident()?; // "scope"
+        self.match_tok(TokenKind::Semicolon);
+        Ok(Stmt::CancelScope { line })
     }
 
     /// Parse a select statement: `select { case ch => x => { body } default => { body } }`

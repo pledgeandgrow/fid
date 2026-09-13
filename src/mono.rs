@@ -558,6 +558,11 @@ fn subst_stmt(stmt: &Stmt, subst: &Subst, renames: &HashMap<String, String>, met
             args: args.iter().map(|a| subst_expr(a, subst, renames, method_renames)).collect(),
             line: *line,
         },
+        Stmt::Resume { cont, value, line } => Stmt::Resume {
+            cont: subst_expr(cont, subst, renames, method_renames),
+            value: subst_expr(value, subst, renames, method_renames),
+            line: *line,
+        },
         Stmt::RegionBlock { name, budget, is_gpu, is_kv_cache, window_size, body, line } => Stmt::RegionBlock {
             name: name.clone(),
             budget: *budget,
@@ -607,6 +612,11 @@ fn subst_stmt(stmt: &Stmt, subst: &Subst, renames: &HashMap<String, String>, met
             branches: branches.iter().map(|b| b.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect()).collect(),
             line: *line,
         },
+        Stmt::SpawnScope { body, line } => Stmt::SpawnScope {
+            body: body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
+            line: *line,
+        },
+        Stmt::CancelScope { line } => Stmt::CancelScope { line: *line },
     }
 }
 
@@ -1215,6 +1225,10 @@ fn collect_generic_calls_stmt_with_hint(
                 collect_generic_calls_expr_with_hint(arg, generics, generic_methods, calls, method_calls, current_func, None);
             }
         }
+        Stmt::Resume { cont, value, .. } => {
+            collect_generic_calls_expr_with_hint(cont, generics, generic_methods, calls, method_calls, current_func, None);
+            collect_generic_calls_expr_with_hint(value, generics, generic_methods, calls, method_calls, current_func, None);
+        }
         Stmt::RegionBlock { body, .. } => {
             for s in body {
                 collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
@@ -1264,6 +1278,12 @@ fn collect_generic_calls_stmt_with_hint(
                 }
             }
         }
+        Stmt::SpawnScope { body, .. } => {
+            for s in body {
+                collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
+            }
+        }
+        Stmt::CancelScope { .. } => {}
     }
 }
 fn collect_generic_calls_expr_with_hint(

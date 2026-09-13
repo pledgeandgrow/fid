@@ -5288,6 +5288,33 @@ impl Interpreter {
                 }
                 ExecOutcome::Value(Value::Int(count))
             }
+            "p_executor_cancel" => {
+                // L3E: p_executor_cancel(exec: i64) -> i64 (count of cancelled tasks)
+                // Cancels all pending tasks on the executor. Completed tasks
+                // are unaffected. Returns the number of tasks that were cancelled.
+                let exec_idx = match args.first() {
+                    Some(Value::Int(n)) => *n as usize,
+                    _ => 0,
+                };
+                if exec_idx >= self.executors.len() {
+                    return ExecOutcome::Value(Value::Int(0));
+                }
+                let task_indices = self.executors[exec_idx].clone();
+                let mut count = 0i64;
+                for &idx in &task_indices {
+                    if idx >= self.futures.len() { continue; }
+                    match &self.futures[idx] {
+                        FutureState::Pending(_) => {
+                            // Mark as ready with 0 (cancelled) — no join needed
+                            self.futures[idx] = FutureState::Ready(Value::Int(0));
+                            self.task_done.lock().unwrap().insert(idx, true);
+                            count += 1;
+                        }
+                        FutureState::Ready(_) => {}
+                    }
+                }
+                ExecOutcome::Value(Value::Int(count))
+            }
             "p_executor_poll_all" => {
                 // p_executor_poll_all(exec: i64) -> i64
                 // Non-blocking: returns the number of tasks still pending.

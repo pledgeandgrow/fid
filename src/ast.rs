@@ -585,6 +585,18 @@ pub enum Stmt {
         branches: Vec<Vec<Stmt>>,
         line: usize,
     },
+    /// L3B: Structured concurrency scope: `spawn scope { body }`
+    /// All `spawn` expressions inside the body are tracked and joined
+    /// at scope exit. No leaked threads — structured concurrency guarantee.
+    SpawnScope {
+        body: Vec<Stmt>,
+        line: usize,
+    },
+    /// L3E: Cancel a spawn scope: `cancel scope;`
+    /// Cancels all pending tasks in the current spawn scope.
+    CancelScope {
+        line: usize,
+    },
 }
 
 /// A case in a select statement.
@@ -645,7 +657,9 @@ impl Stmt {
             | Stmt::Backward { line, .. }
             | Stmt::Query { line, .. }
             | Stmt::Select { line, .. }
-            | Stmt::Parallel { line, .. } => *line,
+            | Stmt::Parallel { line, .. }
+            | Stmt::SpawnScope { line, .. }
+            | Stmt::CancelScope { line, .. } => *line,
         }
     }
 }
