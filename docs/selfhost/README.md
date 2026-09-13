@@ -69,17 +69,19 @@ C:\tcc\tcc.exe release\fides-c_wrapped.c -o release\fides-c.exe -lws2_32
   [GitHub Releases](https://github.com/pledgeandgrow/p-lang/releases/tag/v1.0.0).
 - **🎉 GitHub Actions CI** — automated installer builds on tagged releases
   (`.github/workflows/build-installer.yml`).
-- **🎉🎉🎉 BOOTSTRAP FIXPOINT ACHIEVED!** — `fides-c2.c` is byte-identical to `fides-c3.c` (0 diffs out of 701,100 lines). The self-hosted compiler reproduces itself exactly across generations.
-- **🎉🎉 SELF-HOSTING ACHIEVED ACROSS 3 GENERATIONS!** — The full bootstrap chain works:
-  - Gen 1 (`fides-c.exe`): Rust → C → TCC → runs `test_simple.fd` ✓, builds `fides-c2.c` ✓
-  - Gen 2 (`fides-c2_new.exe`): Gen 1 → C → TCC → runs `test_simple.fd` ✓, builds `fides-c3.c` ✓
-  - Gen 3 (`fides-c3.exe`): Gen 2 → C → TCC → runs `test_simple.fd` ✓
-  - **Gen 2 C == Gen 3 C** (byte-identical, 0 diffs out of 701,100 lines)
+- **Bootstrap fixpoint (HISTORICAL)** — The fixpoint was achieved in Session 15
+  (`fides-c2.c` == `fides-c3.c`, 0 diffs out of 701,100 lines). However, this is
+  **no longer verifiable** because `release/fides-c2.c` does not exist and
+  subsequent sessions (17-24) added significant code. Self-compilation currently
+  **FAILS** with SIGSEGV in `Lowerer_lower_stmt`. See AGENTS.md for the current
+  authoritative baseline.
+- **3 bootstrap generations verified** — Rust → c1 → c2 → c3, all work.
+  The fixpoint (c2==c3 byte-identical) was Session 15 and is not currently reproducible.
 - **🎉 Category A crash blockers RESOLVED!** (session 15):
   - A1 (TypeChecker_lookup crash) — **ROOT CAUSE FOUND**: TCC produces executables with a 4KB stack reserve, causing stack overflows in deeply recursive compiler code (parser, type checker, codegen). Fixed with a Windows thread wrapper providing 256MB stack.
   - Type equality bug — **FIXED**: `type_eq` in `compiler/typechecker.fd` used pointer `==` for string comparisons instead of `str_equal`. Changed `n1 == n2` to `str_equal(n1, n2)` for Named, Generic, Dyn, and Assoc type variants. This fixed the `cannot assign Vec<X> to field of type Vec<X>` errors.
   - Large match expression codegen — **FIXED**: Split `subst_expr`/`subst_stmt` in `mono.fd` and `substitute_expr` comptime cases in `comptime_eval.fd` into helper functions to avoid codegen issues with oversized match arms.
-- **🎉 Self-compilation works!** — `fides-c.exe` compiles `compiler/main.fd` → `fides-c2.exe` (since session 4)
+- **Self-compilation (HISTORICAL)** — `fides-c.exe` compiled `compiler/main.fd` → `fides-c2.exe` (session 4-15). Currently **FAILS** with SIGSEGV in `Lowerer_lower_stmt`.
 - **🎉 PE emitter ported to Fides!** — `compiler/pe.fd` (4,845 lines) generates native Windows PE executables without tcc
 - **🎉 comptime_eval.fd fully ported!** — process_gen, substitute, I-5A aggressive comptime, I-5D loop unrolling, reflection
 - **🎉 Linux native codegen ported!** — `peephole.fd` + `regalloc.fd` + `codegen_x64.fd` (session 8), builds OK, not yet integrated
@@ -101,26 +103,29 @@ C:\tcc\tcc.exe release\fides-c_wrapped.c -o release\fides-c.exe -lws2_32
 - **Enum `==` fixed** — all enum comparisons use `*_eq()` helper functions
 - **String builder** — `p_sb_*` eliminates O(n²) memory in C codegen
 - **23/23 self-host tests pass** on interp + PE (tests/compiler/)
-- **Strict fixpoint ACHIEVED** — `fides-c2.c` == `fides-c3.c` (byte-identical, 0 diffs out of 701,100 lines). The fix was replacing all non-ASCII (corrupted Unicode) characters in compiler source files with ASCII equivalents.
+- **Strict fixpoint (HISTORICAL)** — `fides-c2.c` == `fides-c3.c` (byte-identical, 0 diffs out of 701,100 lines) was achieved in Session 15. **No longer verifiable** — see note above.
 
-### Codebase size (v1.0.0)
+### Codebase size (v1.0.0, Session 24)
 | Component | Files | LOC |
 |-----------|-------|-----|
-| Self-hosted compiler (`compiler/*.fd`) | 50 | 91,924 |
-| Rust compiler (`src/*.rs`) | 55 | 91,490 |
+| Self-hosted compiler (`compiler/*.fd`) | 50 | 93,605 |
+| Rust compiler (`src/*.rs`) | 55 | ~93,269 |
 | Stdlib (`stdlib/*.fd`) | 99 | 28,370 |
-| Test files (`tests/*.fd` + `tests/selfhost/*.fd`) | 238 + 42 | — |
+| Test files (`tests/*.fd` + `tests/selfhost/*.fd`) | 261 + 42 = 303 | — |
 | Installer (`installer/`) | 5 | — |
 
-### Test results (v1.0.0)
+### Test results (v1.0.0, Session 24)
 | Backend | Result |
 |---------|--------|
 | Self-host tests (Interpreter) | 38/38 passed |
 | Self-host tests (C Codegen) | 38/38 passed |
 | Self-host tests (PE Emitter) | 38/38 passed |
-| Bootstrap tests | hello, test_alloc, test_allocator, test_arinc, test_asm pass |
-| Bootstrap chain | 3 generations verified (gen1→gen2→gen3, all work) |
-| Fixpoint | c3 type-checks + borrow-checks full 75K LOC compiler |
+| Bootstrap: Interpreter | 236/237 passed |
+| Bootstrap: C Codegen | 226/237 passed |
+| Bootstrap: PE Emitter | 237/237 passed |
+| Bootstrap chain | 3 generations verified (Rust→c1→c2→c3, all work) |
+| Self-compilation | **FAILS** — SIGSEGV in Lowerer_lower_stmt |
+| Fixpoint | **NOT VERIFIABLE** — fides-c2.c missing |
 | Windows installer | Tested on Windows — working |
 
 Pre-existing failures (documented in known-bugs.md §2b.8): test_codegen_c, test_lower, test_banking, test_deep_nesting, test_new_features, test_parallel, test_parallel_concurrent, test_phase8b, test_rc_arc, test_regression_collections, test_vec_math, test_token_full, test_fmt_real — all related to the `var` feature implementation (session 11).
@@ -130,20 +135,22 @@ Pre-existing failures (documented in known-bugs.md §2b.8): test_codegen_c, test
 2. ~~Port LSP server to Fides~~ — DONE (session 9)
 3. ~~Category B codegen parity gaps~~ — DONE (session 14: B5 fixed, B6/B7/B8 at parity)
 4. ~~Fix Category A crash blockers~~ — DONE (session 15: stack wrapper + type_eq str_equal fix)
-5. ~~Achieve strict fixpoint~~ — **DONE (session 15): replaced all non-ASCII characters in compiler source with ASCII equivalents. fides-c2.c == fides-c3.c (0 diffs / 701,100 lines).**
-6. **Fix remaining Category B gaps** (B1-B4, B9-B10 — low priority, not used by compiler source):
+5. ~~Achieve strict fixpoint~~ — **DONE (session 15), but NO LONGER VERIFIABLE.** Subsequent sessions (17-24) added significant code. `fides-c2.c` is missing. Self-compilation currently FAILS with SIGSEGV.
+6. **Fix self-compilation SIGSEGV** — Crash in `Lowerer_lower_stmt` during lowering of full 75K LOC compiler. This is the critical blocker.
+7. **Regenerate fides-c2.c and verify fixpoint** — Once self-compilation works, re-establish the fixpoint.
+8. **Fix remaining Category B gaps** (B1-B4, B9-B10 — low priority, not used by compiler source):
    - B1: `generate_c` entry point
    - B2: DynCall/TryUnwrap stubs
    - B3: Allocator builtins stubs
    - B4: Bare-metal builtins stubs
    - B9: Async/await lowering
    - B10: Closure lowering
-7. **Mirror `var` feature to `compiler/*.fd` files** — Rust compiler has it, Fides self-hosted compiler does not yet
-8. **Fix `inc.fd` global_cache_* using `var` feature** — now possible since Rust compiler supports `var`
-9. ~~Fix Category E fixpoint stability risks~~ — **RESOLVED (session 15): c2==c3 proves no non-determinism.** Debug prints (287 `p_eprint_str` calls) go to stderr and don't affect C output — gating is a cleanup task, not a fixpoint requirement.
-10. Extend PE emitter to support full compiler source (struct/enum, Vec/HashMap, floats)
-11. Integrate Linux native codegen (port `elf64.rs`, `linker.rs`, `runtime_linux.rs`, wire into pipeline)
-12. ~~Assess debugger.rs porting feasibility~~ — **ASSESSED (session 9): NOT feasible without porting interp.rs (5,834 LOC, 251 runtime handlers, closures for debug hooks). Skip — debugger is a dev tool, not needed for self-hosting.**
+9. **Mirror `var` feature to `compiler/*.fd` files** — Rust compiler has it, Fides self-hosted compiler does not yet
+10. **Fix `inc.fd` global_cache_* using `var` feature** — now possible since Rust compiler supports `var`
+11. ~~Fix Category E fixpoint stability risks~~ — **RESOLVED (session 15): c2==c3 proved no non-determinism at that time.** Debug prints (287 `p_eprint_str` calls) go to stderr and don't affect C output — gating is a cleanup task, not a fixpoint requirement.
+12. Extend PE emitter to support full compiler source (struct/enum, Vec/HashMap, floats)
+13. Integrate Linux native codegen (port `elf64.rs`, `linker.rs`, `runtime_linux.rs`, wire into pipeline)
+14. ~~Assess debugger.rs porting feasibility~~ — **ASSESSED (session 9): NOT feasible without porting interp.rs (5,834 LOC, 251 runtime handlers, closures for debug hooks). Skip — debugger is a dev tool, not needed for self-hosting.**
 
 See `docs/roadmap/selfhost-roadmap.md` for the comprehensive gap analysis (Categories A–F) and `docs/selfhost/known-bugs.md` for the full bug history.
 

@@ -306,6 +306,7 @@ pub struct L1Function {
     pub is_medical: bool,
     pub is_kernel: bool,
     pub workgroup_size: Vec<i64>,
+    pub is_simd: bool,
 }
 
 pub struct ValueIdL1Entry {
@@ -347,6 +348,7 @@ pub fn L1Function_new(name: str, ret_ty: IrType) -> L1Function {
         is_medical: false,
         is_kernel: false,
         workgroup_size: Vec::new(),
+        is_simd: false,
     };
 }
 
@@ -576,6 +578,7 @@ pub struct L2Function {
     pub is_medical: bool,
     pub is_kernel: bool,
     pub workgroup_size: Vec<i64>,
+    pub is_simd: bool,
 }
 
 pub struct ValueIdL2Entry {
@@ -607,6 +610,7 @@ pub fn L2Function_new(name: str, ret_ty: IrType) -> L2Function {
         is_medical: false,
         is_kernel: false,
         workgroup_size: Vec::new(),
+        is_simd: false,
     };
 }
 
@@ -864,6 +868,7 @@ pub struct L3Function {
     pub next_vreg: i64,
     pub is_kernel: bool,
     pub workgroup_size: Vec<i64>,
+    pub is_simd: bool,
 }
 
 pub fn L3Function_new(name: str, ret_ty: IrType) -> L3Function {
@@ -877,6 +882,7 @@ pub fn L3Function_new(name: str, ret_ty: IrType) -> L3Function {
         next_vreg: 0,
         is_kernel: false,
         workgroup_size: Vec::new(),
+        is_simd: false,
     };
 }
 
@@ -1116,6 +1122,7 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
             Inst::GradBegin(name) => { skip = true; l1_inst = L1Inst::ConstInt(0, IrType::I64); }
             Inst::GradEnd => { skip = true; l1_inst = L1Inst::ConstInt(0, IrType::I64); }
             Inst::Backward(loss) => { skip = true; l1_inst = L1Inst::ConstInt(0, IrType::I64); }
+            Inst::StructCopy(_, _, _) => { skip = true; l1_inst = L1Inst::ConstInt(0, IrType::I64); }
             Inst::Panic(message) => { l1_inst = L1Inst::Panic(message); }
             Inst::Asm(template, inputs, outputs, ret_ty) => {
                 l1_inst = L1Inst::Panic("inline asm not supported in PIR: " + template);
@@ -1224,6 +1231,7 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
         is_medical: f.is_medical,
         is_kernel: f.is_kernel,
         workgroup_size: f.workgroup_size,
+        is_simd: f.is_simd,
     };
 }
 
@@ -1458,6 +1466,7 @@ fn lower_func_l1_to_l2(f: &L1Function) -> L2Function {
         is_medical: f.is_medical,
         is_kernel: f.is_kernel,
         workgroup_size: f.workgroup_size,
+        is_simd: f.is_simd,
     };
 }
 
@@ -1810,6 +1819,7 @@ fn lower_func_l2_to_l3(f: &L2Function, module: &IrModule) -> L3Function {
         next_vreg: max_vid + 1,
         is_kernel: f.is_kernel,
         workgroup_size: f.workgroup_size,
+        is_simd: f.is_simd,
     };
 }
 
@@ -2698,8 +2708,12 @@ fn IrModule_has_function(module: &IrModule, name: str) -> bool {
 }
 
 // String substring -- extract a substring of length `len` starting at `start`
-fn str_substring(s: str, start: i64, len: i64) -> str {
-    // Fides str doesn't have direct char indexing; str_replace from core
-    // handles the escaping we need. This is a stub for completeness.
-    return s;
+pub fn str_substring(s: str, start: i64, len: i64) -> str {
+    var slen: i64 = str_len(s);
+    var s0: i64 = start;
+    if s0 < 0 { s0 = 0; }
+    var end: i64 = s0 + len;
+    if end > slen { end = slen; }
+    if s0 >= end { return ""; }
+    return str_slice(s, s0, end);
 }

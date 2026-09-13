@@ -110,6 +110,8 @@ pub fn box_expr_unbox(b: Box<Expr>) -> Expr {
         Expr::QuantCast(e, t) => { return Expr::QuantCast(e, t); }
         Expr::Await(e) => { return Expr::Await(e); }
         Expr::Spawn(e) => { return Expr::Spawn(e); }
+        Expr::Yield(e) => { return Expr::Yield(e); }
+        Expr::NamedArg(name, e) => { return Expr::NamedArg(name, e); }
     }
     return Expr::IntLit(0);
 }
@@ -247,10 +249,15 @@ pub fn EnumVariantEntry_new(name: str, payload_types: Vec<Type>) -> EnumVariantE
 pub struct FuncSig {
     pub param_types: Vec<Type>,
     pub ret_ty: Type,
+    pub min_args: i64,
 }
 
 pub fn FuncSig_new(param_types: Vec<Type>, ret_ty: Type) -> FuncSig {
-    return FuncSig { param_types: param_types, ret_ty: ret_ty };
+    return FuncSig { param_types: param_types, ret_ty: ret_ty, min_args: param_types.len() };
+}
+
+pub fn FuncSig_new_with_min(param_types: Vec<Type>, ret_ty: Type, min_args: i64) -> FuncSig {
+    return FuncSig { param_types: param_types, ret_ty: ret_ty, min_args: min_args };
 }
 
 // Method map entry: struct_name -> (method_name -> MethodInfo)
@@ -534,6 +541,90 @@ fn map_fieldvis_get(m: Vec<FieldVisEntry>, struct_name: str, field_name: str) ->
     return true; // default to pub
 }
 
+// --- Cached lookups using HashMap index caches ---------------------------
+// These use the func_cache/struct_cache/etc. HashMaps built by
+// TypeChecker_build_caches to convert O(n) linear scans into O(1) lookups.
+// On cache miss (cache not built or key not in cache), they fall back to
+// the linear scan. This is safe because the caches are built after all
+// modules are registered, so they contain all entries.
+
+/// Cached function signature lookup. Returns the FuncSig for `name` or
+/// OptFuncSig::None if not found. Uses func_cache for O(1) lookup.
+pub fn TypeChecker_lookup_func_cache(self: &TypeChecker, name: str) -> OptFuncSig {
+    if self.caches_built {
+        var idx: i64 = HashMap_get(self.func_cache, name);
+        if idx > 0 {
+            return OptFuncSig::Some(self.funcs.get(idx - 1).val);
+        }
+        return OptFuncSig::None;
+    }
+    // Fallback: linear scan
+    var i: i64 = 0;
+    while i < self.funcs.len() {
+        if self.funcs.get(i).key == name {
+            return OptFuncSig::Some(self.funcs.get(i).val);
+        }
+        i = i + 1;
+    }
+    return OptFuncSig::None;
+}
+
+/// Cached const lookup. Uses const_cache for O(1) lookup.
+pub fn TypeChecker_lookup_const_cache(self: &TypeChecker, name: str) -> OptType {
+    if self.caches_built {
+        var idx: i64 = HashMap_get(self.const_cache, name);
+        if idx > 0 {
+            return OptType::Some(self.consts.get(idx - 1).val);
+        }
+        return OptType::None;
+    }
+    return map_str_type_get(self.consts, name);
+}
+
+/// Cached global lookup. Uses global_cache for O(1) lookup.
+pub fn TypeChecker_lookup_global_cache(self: &TypeChecker, name: str) -> OptType {
+    if self.caches_built {
+        var idx: i64 = HashMap_get(self.global_cache, name);
+        if idx > 0 {
+            return OptType::Some(self.globals.get(idx - 1).val);
+        }
+        return OptType::None;
+    }
+    return map_str_type_get(self.globals, name);
+}
+
+/// Cached type alias lookup. Uses alias_cache for O(1) lookup.
+pub fn TypeChecker_lookup_alias_cache(self: &TypeChecker, name: str) -> OptType {
+    if self.caches_built {
+        var idx: i64 = HashMap_get(self.alias_cache, name);
+        if idx > 0 {
+            return OptType::Some(self.type_aliases.get(idx - 1).val);
+        }
+        return OptType::None;
+    }
+    return map_str_type_get(self.type_aliases, name);
+}
+
+/// Cached struct field lookup. Uses struct_cache for O(1) index resolution.
+pub fn TypeChecker_lookup_struct_cache(self: &TypeChecker, name: str) -> OptVecStructField {
+    if self.caches_built {
+        var idx: i64 = HashMap_get(self.struct_cache, name);
+        if idx > 0 {
+            return OptVecStructField::Some(self.structs.get(idx - 1).val);
+        }
+        return OptVecStructField::None;
+    }
+    // Fallback: linear scan
+    var i: i64 = 0;
+    while i < self.structs.len() {
+        if self.structs.get(i).key == name {
+            return OptVecStructField::Some(self.structs.get(i).val);
+        }
+        i = i + 1;
+    }
+    return OptVecStructField::None;
+}
+
 // --- Method map operations (struct_name -> method entries) ----------------
 
 fn map_methods_get(m: Vec<StringMethodMap>, key: str) -> OptMethodMap {
@@ -558,6 +649,16 @@ pub fn StringMethodMap_new(key: str, val: Vec<MethodMapEntry>) -> StringMethodMa
 
 pub enum OptMethodMap {
     Some(Vec<MethodMapEntry>),
+    None,
+}
+
+pub enum OptFuncSig {
+    Some(FuncSig),
+    None,
+}
+
+pub enum OptVecStructField {
+    Some(Vec<StructField>),
     None,
 }
 
@@ -697,6 +798,19 @@ pub struct TypeChecker {
     current_line: i64,
     val_vars_per_scope: Vec<StrStack>,
     check_depth: i64,
+
+    // Memoization caches — HashMap-based index caches for O(1) lookups.
+    // These are populated during register_program and used during check_bodies.
+    // They convert O(n) linear scans of the Vec<StringXxx> tables into O(1)
+    // hash lookups. With 100K+ LOC of compiler code, there are thousands of
+    // functions/structs/enums, making each linear scan expensive.
+    func_cache: i64,       // HashMap: func_name → index in funcs Vec (-1 = not found)
+    struct_cache: i64,     // HashMap: struct_name → index in structs Vec (-1 = not found)
+    enum_cache: i64,       // HashMap: enum_name → index in enums Vec (-1 = not found)
+    const_cache: i64,      // HashMap: const_name → index in consts Vec (-1 = not found)
+    global_cache: i64,     // HashMap: global_name → index in globals Vec (-1 = not found)
+    alias_cache: i64,      // HashMap: alias_name → index in type_aliases Vec (-1 = not found)
+    caches_built: bool,    // whether index caches have been populated
 }
 
 // Additional helper structs for TypeChecker fields
@@ -811,6 +925,13 @@ impl TypeChecker {
             current_line: 0,
             val_vars_per_scope: Vec::new(),
             check_depth: 0,
+            func_cache: HashMap_new(),
+            struct_cache: HashMap_new(),
+            enum_cache: HashMap_new(),
+            const_cache: HashMap_new(),
+            global_cache: HashMap_new(),
+            alias_cache: HashMap_new(),
+            caches_built: false,
         };
         // Push initial scope
         tc.scopes.push(Vec::new());
@@ -945,13 +1066,18 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
     while fi3 < program.funcs.len() {
         var func: Func = program.funcs.get(fi3);
         var param_types: Vec<Type> = Vec::new();
+        var min_args: i64 = 0;
         var pi: i64 = 0;
         while pi < func.params.len() {
             param_types.push(TypeChecker_resolve_type(self, func.params.get(pi).ty));
+            // Count required params (those without defaults)
+            if !func.params.get(pi).has_default {
+                min_args = min_args + 1;
+            }
             pi = pi + 1;
         }
         var ret_ty: Type = TypeChecker_resolve_type(self, func.ret_ty);
-        self.funcs.push(StringFuncSig_new(func.name, FuncSig_new(param_types, ret_ty)));
+        self.funcs.push(StringFuncSig_new(func.name, FuncSig_new_with_min(param_types, ret_ty, min_args)));
         map_str_str_set(&mut self.item_modules, func.name, module);
         map_str_bool_set(&mut self.item_visibility, func.name, func.is_pub);
         fi3 = fi3 + 1;
@@ -1219,7 +1345,63 @@ pub enum OptTraitDef {
 
 // --- check_bodies and verification passes --------------------------------
 
+/// Build O(1) index caches for the typechecker's symbol tables.
+/// Called after all modules are registered, before checking bodies.
+/// This converts O(n) linear scans into O(1) HashMap lookups for the
+/// hottest paths: function signature lookup, struct field lookup,
+/// enum variant lookup, const/global/type_alias resolution.
+/// With 100K+ LOC, there are thousands of entries in each table.
+pub fn TypeChecker_build_caches(self: &mut TypeChecker) -> void {
+    if self.caches_built { return; }
+
+    // Build func name → index cache
+    var fi: i64 = 0;
+    while fi < self.funcs.len() {
+        HashMap_insert(self.func_cache, self.funcs.get(fi).key, fi + 1);  // +1 so 0 = not found
+        fi = fi + 1;
+    }
+
+    // Build struct name → index cache
+    var si: i64 = 0;
+    while si < self.structs.len() {
+        HashMap_insert(self.struct_cache, self.structs.get(si).key, si + 1);
+        si = si + 1;
+    }
+
+    // Build enum name → index cache
+    var ei: i64 = 0;
+    while ei < self.enums.len() {
+        HashMap_insert(self.enum_cache, self.enums.get(ei), ei + 1);
+        ei = ei + 1;
+    }
+
+    // Build const name → index cache
+    var ci: i64 = 0;
+    while ci < self.consts.len() {
+        HashMap_insert(self.const_cache, self.consts.get(ci).key, ci + 1);
+        ci = ci + 1;
+    }
+
+    // Build global name → index cache
+    var gi: i64 = 0;
+    while gi < self.globals.len() {
+        HashMap_insert(self.global_cache, self.globals.get(gi).key, gi + 1);
+        gi = gi + 1;
+    }
+
+    // Build type_alias name → index cache
+    var ai: i64 = 0;
+    while ai < self.type_aliases.len() {
+        HashMap_insert(self.alias_cache, self.type_aliases.get(ai).key, ai + 1);
+        ai = ai + 1;
+    }
+
+    self.caches_built = true;
+}
+
 pub fn TypeChecker_check_bodies(self: &mut TypeChecker, program: Program) {
+    // Build O(1) lookup caches before checking (memoize type lookups)
+    TypeChecker_build_caches(self);
     // Pre-pass: compute direct effects of each function
     TypeChecker_compute_func_effects(self, program);
     // Verify declared effects match inferred effects
@@ -1241,6 +1423,7 @@ pub fn TypeChecker_check_bodies(self: &mut TypeChecker, program: Program) {
     TypeChecker_verify_shard(self, program);
     TypeChecker_verify_adapter(self, program);
     TypeChecker_verify_tainted(self, program);
+    TypeChecker_verify_secret(self, program);
     TypeChecker_verify_contracts(self, program);
     TypeChecker_verify_allocator_params(self, program);
     // Mark all functions as capability-verified before checking
@@ -1883,6 +2066,14 @@ pub fn expand_safety_primitives(annotations: Vec<Annotation>) -> Vec<str> {
         if str_equal(name, "no-indirect") { prims.push("no-indirect"); }
         if str_equal(name, "requires-audit") { prims.push("requires-audit"); }
         if str_equal(name, "bounded-stack") { prims.push("bounded-stack"); }
+        // F30: @firmware — bare-metal firmware (no OS-dependent calls)
+        if str_equal(name, "firmware") { prims.push("firmware"); }
+        // F23: @simd — recognized but no safety primitives
+        // F88: @zeroize — recognized but no safety primitives
+        // F29: @interrupt — recognized but no safety primitives
+        // F74: @secret — recognized but no safety primitives (handled in verify_secret)
+        // @shader/@kernel — GPU shader entry point (handled in lowerer as is_kernel)
+        // (These are recognized so the typechecker doesn't reject them as unknown)
         // Domain presets — expand to their primitives
         if str_equal(name, "crashfree") {
             prims.push("no-panic");
@@ -1925,6 +2116,9 @@ pub fn has_primitive(prims: Vec<str>, name: str) -> bool {
 
 // Get the domain label for error messages
 pub fn safety_domain_label(prims: Vec<str>) -> str {
+    if has_primitive(prims, "firmware") {
+        return "firmware (bare-metal)";
+    }
     if has_primitive(prims, "requires-audit") && has_primitive(prims, "no-indirect") {
         return "safety-critical (ISO 26262 / DO-178C)";
     }
@@ -1938,6 +2132,48 @@ pub fn safety_domain_label(prims: Vec<str>) -> str {
         return "crashfree";
     }
     return "safety-annotated";
+}
+
+// F30: Check if a function is OS-dependent (forbidden in @firmware code)
+pub fn is_os_dependent_func(name: str) -> bool {
+    // File I/O
+    if str_equal(name, "p_file_read") { return true; }
+    if str_equal(name, "p_file_write") { return true; }
+    if str_equal(name, "p_file_append") { return true; }
+    if str_equal(name, "p_file_delete") { return true; }
+    if str_equal(name, "p_file_exists") { return true; }
+    if str_equal(name, "p_file_size") { return true; }
+    if str_equal(name, "p_file_write_bin") { return true; }
+    if str_equal(name, "p_file_write_vec") { return true; }
+    // Sockets / networking
+    if str_equal(name, "p_socket_create") { return true; }
+    if str_equal(name, "p_socket_connect") { return true; }
+    if str_equal(name, "p_socket_send") { return true; }
+    if str_equal(name, "p_socket_recv") { return true; }
+    if str_equal(name, "p_socket_recv_str") { return true; }
+    if str_equal(name, "p_socket_close") { return true; }
+    if str_equal(name, "p_socket_listen") { return true; }
+    if str_equal(name, "p_socket_accept") { return true; }
+    // HTTP
+    if str_equal(name, "p_http_get") { return true; }
+    if str_equal(name, "p_http_post") { return true; }
+    if str_equal(name, "p_http_send_response") { return true; }
+    // Threads / mutexes
+    if str_equal(name, "p_thread_create") { return true; }
+    if str_equal(name, "p_thread_join") { return true; }
+    if str_equal(name, "p_mutex_create") { return true; }
+    if str_equal(name, "p_mutex_lock") { return true; }
+    if str_equal(name, "p_mutex_unlock") { return true; }
+    // Environment / args
+    if str_equal(name, "p_env_get") { return true; }
+    if str_equal(name, "p_env_set") { return true; }
+    if str_equal(name, "p_args_count") { return true; }
+    if str_equal(name, "p_args_get") { return true; }
+    // SQLite
+    if str_equal(name, "p_sqlite_open") { return true; }
+    if str_equal(name, "p_sqlite_exec") { return true; }
+    if str_equal(name, "p_sqlite_query") { return true; }
+    return false;
 }
 
 // Check a function body for safety violations
@@ -2032,6 +2268,15 @@ pub fn check_safety_body(
         if has_primitive(prims, "no-indirect") {
             if vec_contains_str(indirect_funcs, called) {
                 errs.push("Safety error (" + label + "): function '" + func_name + "' is @no-indirect but calls '" + called + "'.\n    Indirect calls (function pointers, dynamic dispatch) are forbidden.\n    Fix: use direct calls only, or remove the safety annotation.");
+                ci = ci + 1;
+                continue;
+            }
+        }
+
+        // F30: @firmware — check for OS-dependent function calls
+        if has_primitive(prims, "firmware") {
+            if is_os_dependent_func(called) {
+                errs.push("Safety error (" + label + "): function '" + func_name + "' is @firmware but calls '" + called + "'.\n    OS-dependent functions (file I/O, sockets, threads, env vars) are forbidden\n    in bare-metal firmware — they require a hosted OS environment.\n    Fix: use bare-metal alternatives (port I/O, memory-mapped I/O),\n    or remove the @firmware annotation.");
                 ci = ci + 1;
                 continue;
             }
@@ -2132,7 +2377,7 @@ pub fn scan_stmts_for_calls(stmts: Vec<Stmt>, calls: &mut Vec<str>) {
 
 pub fn scan_stmt_for_calls(stmt: Stmt, calls: &mut Vec<str>) {
     match stmt {
-        Stmt::Let(_, _, expr, _, _, _) => { scan_expr_for_calls(expr, calls); }
+        Stmt::Let(_, _, expr, _, _, _, _) => { scan_expr_for_calls(expr, calls); }
         Stmt::LetTuple(_, expr, _) => { scan_expr_for_calls(expr, calls); }
         Stmt::Expr(e, _) => { scan_expr_for_calls(e, calls); }
         Stmt::Assign(_, _, expr, _) => { scan_expr_for_calls(expr, calls); }
@@ -2325,7 +2570,7 @@ pub fn scan_for_division(stmts: Vec<Stmt>, sites: &mut Vec<str>) {
 
 pub fn scan_stmt_for_division(stmt: Stmt, sites: &mut Vec<str>) {
     match stmt {
-        Stmt::Let(_, _, expr, _, _, _) => { scan_expr_for_division(expr, sites); }
+        Stmt::Let(_, _, expr, _, _, _, _) => { scan_expr_for_division(expr, sites); }
         Stmt::LetTuple(_, expr, _) => { scan_expr_for_division(expr, sites); }
         Stmt::Expr(e, _) => { scan_expr_for_division(e, sites); }
         Stmt::Assign(_, _, expr, _) => { scan_expr_for_division(expr, sites); }
@@ -3019,6 +3264,188 @@ pub fn TypeChecker_verify_tainted(self: &mut TypeChecker, program: Program) {
     }
 }
 
+// F74: @secret info-flow control
+// Checks that @secret parameters don't flow to output sinks (print, log, network).
+pub fn TypeChecker_verify_secret(self: &mut TypeChecker, program: Program) {
+    var fi: i64 = 0;
+    while fi < program.funcs.len() {
+        var func: Func = program.funcs.get(fi);
+        // Check if any param has @secret annotation
+        var has_secret: bool = false;
+        var secret_names: Vec<str> = Vec::new();
+        var pi: i64 = 0;
+        while pi < func.params.len() {
+            var param: Param = func.params.get(pi);
+            var ai: i64 = 0;
+            while ai < param.annotations.len() {
+                if str_equal(param.annotations.get(ai).name, "secret") {
+                    has_secret = true;
+                    secret_names.push(param.name);
+                }
+                ai = ai + 1;
+            }
+            pi = pi + 1;
+        }
+        if has_secret {
+            // Walk the function body checking for secret values in output sink calls
+            check_secret_in_stmts(self, func.body, secret_names, func.name);
+        }
+        fi = fi + 1;
+    }
+    // Also check impl methods
+    var ii: i64 = 0;
+    while ii < program.impls.len() {
+        var imp: ImplDef = program.impls.get(ii);
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            var method: Func = imp.methods.get(mi);
+            var has_secret: bool = false;
+            var secret_names: Vec<str> = Vec::new();
+            var pi2: i64 = 0;
+            while pi2 < method.params.len() {
+                var param: Param = method.params.get(pi2);
+                var ai: i64 = 0;
+                while ai < param.annotations.len() {
+                    if str_equal(param.annotations.get(ai).name, "secret") {
+                        has_secret = true;
+                        secret_names.push(param.name);
+                    }
+                    ai = ai + 1;
+                }
+                pi2 = pi2 + 1;
+            }
+            if has_secret {
+                check_secret_in_stmts(self, method.body, secret_names, method.name);
+            }
+            mi = mi + 1;
+        }
+        ii = ii + 1;
+    }
+}
+
+fn is_output_sink(name: str) -> bool {
+    if str_equal(name, "print") { return true; }
+    if str_equal(name, "println") { return true; }
+    if str_equal(name, "eprint") { return true; }
+    if str_equal(name, "eprintln") { return true; }
+    if str_equal(name, "p_print_int") { return true; }
+    if str_equal(name, "p_print_str") { return true; }
+    if str_equal(name, "p_print_float") { return true; }
+    if str_equal(name, "p_print_bool") { return true; }
+    if str_equal(name, "p_print_newline") { return true; }
+    if str_equal(name, "p_eprint_str") { return true; }
+    if str_equal(name, "p_print_vec") { return true; }
+    if str_equal(name, "p_socket_send") { return true; }
+    if str_equal(name, "p_socket_send_str") { return true; }
+    if str_equal(name, "p_http_send_response") { return true; }
+    if str_equal(name, "p_file_write") { return true; }
+    if str_equal(name, "p_file_append") { return true; }
+    if str_equal(name, "p_file_write_bin") { return true; }
+    if str_equal(name, "log_info") { return true; }
+    if str_equal(name, "log_warn") { return true; }
+    if str_equal(name, "log_error") { return true; }
+    if str_equal(name, "log_debug") { return true; }
+    return false;
+}
+
+fn check_secret_in_stmts(self: &mut TypeChecker, stmts: Vec<Stmt>, secret_names: Vec<str>, func_name: str) {
+    var si: i64 = 0;
+    while si < stmts.len() {
+        check_secret_in_stmt(self, stmts.get(si), secret_names, func_name);
+        si = si + 1;
+    }
+}
+
+fn check_secret_in_stmt(self: &mut TypeChecker, stmt: Stmt, secret_names: Vec<str>, func_name: str) {
+    match stmt {
+        Stmt::Expr(e, _) => { check_secret_in_expr(self, e, secret_names, func_name); }
+        Stmt::Let(_, _, e, _, _, _, _) => { check_secret_in_expr(self, e, secret_names, func_name); }
+        Stmt::Assign(_, _, e, _) => { check_secret_in_expr(self, e, secret_names, func_name); }
+        Stmt::If(cond, then_block, else_block, _) => {
+            check_secret_in_expr(self, cond, secret_names, func_name);
+            check_secret_in_stmts(self, then_block, secret_names, func_name);
+            match else_block {
+                OptStmts::Some(blk) => { check_secret_in_stmts(self, blk, secret_names, func_name); }
+                OptStmts::None => {}
+            }
+        }
+        Stmt::While(cond, body, _) => {
+            check_secret_in_expr(self, cond, secret_names, func_name);
+            check_secret_in_stmts(self, body, secret_names, func_name);
+        }
+        Stmt::For(_, iter, body, _) => {
+            check_secret_in_expr(self, iter, secret_names, func_name);
+            check_secret_in_stmts(self, body, secret_names, func_name);
+        }
+        Stmt::Loop(body, _) => { check_secret_in_stmts(self, body, secret_names, func_name); }
+        Stmt::Return(e, _) => {
+            match e {
+                OptBoxExpr::Some(expr) => { check_secret_in_expr(self, box_expr_unbox(expr), secret_names, func_name); }
+                OptBoxExpr::None => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+fn check_secret_in_expr(self: &mut TypeChecker, expr: Expr, secret_names: Vec<str>, func_name: str) {
+    match expr {
+        Expr::Call(callee, args) => {
+            if is_output_sink(callee) {
+                // Check if any argument contains a secret variable
+                var ai: i64 = 0;
+                while ai < args.len() {
+                    if expr_contains_secret(args.get(ai), secret_names) {
+                        self.errors.push("Security error (@secret): function '" + func_name + "' calls output sink '" + callee + "' with a secret value.\n    Secret values must not be printed, logged, or sent over the network.\n    Fix: don't pass @secret-derived values to output functions, or\n    remove the @secret annotation if the value is not actually secret.");
+                        return;
+                    }
+                    ai = ai + 1;
+                }
+            }
+            // Recursively check nested calls
+            var ai2: i64 = 0;
+            while ai2 < args.len() {
+                check_secret_in_expr(self, args.get(ai2), secret_names, func_name);
+                ai2 = ai2 + 1;
+            }
+        }
+        Expr::Binary(_, left, right) => {
+            check_secret_in_expr(self, box_expr_unbox(left), secret_names, func_name);
+            check_secret_in_expr(self, box_expr_unbox(right), secret_names, func_name);
+        }
+        _ => {}
+    }
+}
+
+fn expr_contains_secret(expr: Expr, secret_names: Vec<str>) -> bool {
+    match expr {
+        Expr::Ident(name) => {
+            var si: i64 = 0;
+            while si < secret_names.len() {
+                if str_equal(secret_names.get(si), name) { return true; }
+                si = si + 1;
+            }
+            return false;
+        }
+        Expr::Binary(_, left, right) => {
+            return expr_contains_secret(box_expr_unbox(left), secret_names) || expr_contains_secret(box_expr_unbox(right), secret_names);
+        }
+        Expr::Call(_, args) => {
+            var ai: i64 = 0;
+            while ai < args.len() {
+                if expr_contains_secret(args.get(ai), secret_names) { return true; }
+                ai = ai + 1;
+            }
+            return false;
+        }
+        Expr::FieldAccess(e, _) => { return expr_contains_secret(box_expr_unbox(e), secret_names); }
+        Expr::Index(array, index) => {
+            return expr_contains_secret(box_expr_unbox(array), secret_names) || expr_contains_secret(box_expr_unbox(index), secret_names);
+        }
+        _ => { return false; }
+    }
+}
+
 pub fn TypeChecker_verify_contracts(self: &mut TypeChecker, program: Program) {
     // given/ensure contracts: verify that preconditions and postconditions exist
     // and are well-formed (non-empty expressions).
@@ -3240,7 +3667,8 @@ pub fn TypeChecker_lookup(self: &TypeChecker, name: str) -> OptType {
 pub fn TypeChecker_resolve_type(self: &TypeChecker, ty: Type) -> Type {
     match ty {
         Type::Named(name) => {
-            match map_str_type_get(self.type_aliases, name) {
+            // OPTIMIZATION: use cached alias lookup instead of O(n) linear scan
+            match TypeChecker_lookup_alias_cache(self, name) {
                 OptType::Some(alias) => { return TypeChecker_resolve_type(self, alias); }
                 OptType::None => { return ty; }
             }
@@ -3394,7 +3822,8 @@ pub fn TypeChecker_resolve_assoc_in_type(self: &TypeChecker, ty: Type, type_para
 }
 
 pub fn TypeChecker_resolve_struct_name(self: &TypeChecker, name: str) -> str {
-    match map_str_type_get(self.type_aliases, name) {
+    // OPTIMIZATION: use cached alias lookup
+    match TypeChecker_lookup_alias_cache(self, name) {
         OptType::Some(alias) => {
             match alias {
                 Type::Named(inner) => { return TypeChecker_resolve_struct_name(self, box_type_unbox(inner)); }
@@ -4218,7 +4647,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
     // Track current line for error messages
     self.current_line = stmt_line(stmt);
     match stmt {
-        Stmt::Let(name, ty, expr, is_mut, _, line) => {
+        Stmt::Let(name, ty, expr, is_mut, _, annotations, line) => {
             // Bidirectional type inference: pass declared type as hint
             var hint: Type = Type::Never;
             match ty {
@@ -4300,7 +4729,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                 }
             }
         }
-        Stmt::LetUninit(name, ty, line) => {
+        Stmt::LetUninit(name, ty, _annotations, line) => {
             var resolved_ty: Type = TypeChecker_resolve_type(self, ty);
             TypeChecker_declare(self, name, resolved_ty);
             self.uninit_vars.push(name);
@@ -4774,10 +5203,123 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                 OptStmts::None => {}
             }
         }
+        Stmt::Parallel(branches, _) => {
+            var bi: i64 = 0;
+            while bi < branches.len() {
+                var branch: Vec<Stmt> = branches.get(bi);
+                TypeChecker_push_scope(self);
+                var si: i64 = 0;
+                while si < branch.len() {
+                    TypeChecker_check_stmt(self, branch.get(si));
+                    si = si + 1;
+                }
+                TypeChecker_pop_scope(self);
+                bi = bi + 1;
+            }
+        }
     }
 }
 
 // ---- CHUNK_MARKER_7 ----
+
+// --- collect_captured_vars ----------------------------------------------
+// Walks an expression tree and collects (name, type) pairs for all
+// in-scope variables referenced (Idents that resolve to local vars).
+// Used by the @send check on spawn expressions.
+
+pub fn TypeChecker_collect_captured_vars(self: &TypeChecker, expr: Expr, captured: &mut Vec<(str, Type)>) {
+    match expr {
+        Expr::Ident(name) => {
+            var ty_opt: OptType = TypeChecker_lookup(self, name);
+            match ty_opt {
+                OptType::Some(ty) => {
+                    var found: bool = false;
+                    var i: i64 = 0;
+                    while i < captured.len() {
+                        var (cname, _cty) = captured.get(i);
+                        if str_equal(cname, name) { found = true; }
+                        i = i + 1;
+                    }
+                    if !found { captured.push((name, ty)); }
+                }
+                OptType::None => {} // not a local var
+            }
+        }
+        Expr::Call(callee, args) => {
+            var ai: i64 = 0;
+            while ai < args.len() {
+                TypeChecker_collect_captured_vars(self, args.get(ai), captured);
+                ai = ai + 1;
+            }
+        }
+        Expr::MethodCall(recv, _method, args) => {
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(recv), captured);
+            var ai: i64 = 0;
+            while ai < args.len() {
+                TypeChecker_collect_captured_vars(self, args.get(ai), captured);
+                ai = ai + 1;
+            }
+        }
+        Expr::Binary(_op, left, right) => {
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(left), captured);
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(right), captured);
+        }
+        Expr::Unary(_op, e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
+        Expr::Index(arr, idx) => {
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(arr), captured);
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(idx), captured);
+        }
+        Expr::FieldAccess(e, _field) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
+        Expr::OptionalFieldAccess(e, _field) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
+        Expr::Ref(e, _is_mut) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
+        Expr::Deref(e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
+        Expr::Try(e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
+        Expr::Coalesce(e, def) => {
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured);
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(def), captured);
+        }
+        Expr::Cast(e, _ty) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
+        Expr::Await(e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
+        Expr::StrConcat(left, right) => {
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(left), captured);
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(right), captured);
+        }
+        Expr::PipeForward(left, right) => {
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(left), captured);
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(right), captured);
+        }
+        Expr::ArrayLit(_ty, elems) => {
+            var ei: i64 = 0;
+            while ei < elems.len() {
+                TypeChecker_collect_captured_vars(self, elems.get(ei), captured);
+                ei = ei + 1;
+            }
+        }
+        Expr::TupleLit(elems) => {
+            var ei: i64 = 0;
+            while ei < elems.len() {
+                TypeChecker_collect_captured_vars(self, elems.get(ei), captured);
+                ei = ei + 1;
+            }
+        }
+        Expr::StructLit(_name, fields, spread) => {
+            var fi: i64 = 0;
+            while fi < fields.len() {
+                TypeChecker_collect_captured_vars(self, fields.get(fi).value, captured);
+                fi = fi + 1;
+            }
+            match spread {
+                OptBoxExpr::Some(s) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(s), captured); }
+                OptBoxExpr::None => {}
+            }
+        }
+        Expr::Spawn(e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
+        Expr::Yield(e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
+        Expr::NamedArg(name, e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
+        Expr::Comptime(e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
+        _ => {}
+    }
+}
 
 // --- check_expr ----------------------------------------------------------
 
@@ -4834,7 +5376,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 OptType::Some(ty) => { return ty; }
                 OptType::None => {}
             }
-            match map_str_type_get(self.consts, name) {
+            match TypeChecker_lookup_const_cache(self, name) {
                 OptType::Some(ty) => {
                     TypeChecker_check_visibility(self, name);
                     return ty;
@@ -4842,7 +5384,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 OptType::None => {}
             }
             // Check module-level mutable globals
-            match map_str_type_get(self.globals, name) {
+            match TypeChecker_lookup_global_cache(self, name) {
                 OptType::Some(ty) => {
                     TypeChecker_check_visibility(self, name);
                     return ty;
@@ -4850,13 +5392,13 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 OptType::None => {}
             }
             // Check if it's a function name -- return function type
-            var fi: i64 = 0;
-            while fi < self.funcs.len() {
-                if self.funcs.get(fi).key == name {
+            // OPTIMIZATION: use cached lookup instead of O(n) linear scan
+            match TypeChecker_lookup_func_cache(self, name) {
+                OptFuncSig::Some(sig) => {
                     TypeChecker_check_visibility(self, name);
-                    return Type::Func(self.funcs.get(fi).val.param_types, Box::new(self.funcs.get(fi).val.ret_ty));
+                    return Type::Func(sig.param_types, Box::new(sig.ret_ty));
                 }
-                fi = fi + 1;
+                OptFuncSig::None => {}
             }
             self.errors.push("Type error (line " + int_to_str(self.current_line) + "): undefined variable '" + name + "'");
             return Type::Never;
@@ -4994,13 +5536,12 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 }
             }
             // Check if callee is a known function
-            var fi: i64 = 0;
-            while fi < self.funcs.len() {
-                if self.funcs.get(fi).key == callee {
+            // OPTIMIZATION: use cached lookup instead of O(n) linear scan
+            match TypeChecker_lookup_func_cache(self, callee) {
+                OptFuncSig::Some(sig) => {
                     TypeChecker_check_visibility(self, callee);
-                    var sig: FuncSig = self.funcs.get(fi).val;
-                    if sig.param_types.len() != arg_types.len() {
-                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): function '" + callee + "' expects " + int_to_str(sig.param_types.len()) + " args, got " + int_to_str(arg_types.len()));
+                    if arg_types.len() < sig.min_args || arg_types.len() > sig.param_types.len() {
+                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): function '" + callee + "' expects " + int_to_str(sig.min_args) + "-" + int_to_str(sig.param_types.len()) + " args, got " + int_to_str(arg_types.len()));
                     }
                     // Check argument types (loose for primitives, strict for named)
                     var pi: i64 = 0;
@@ -5023,7 +5564,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                     }
                     return sig.ret_ty;
                 }
-                fi = fi + 1;
+                OptFuncSig::None => {}
             }
             // Check for ECS runtime functions
             if str_starts_with(callee, "__ecs_") {
@@ -5522,6 +6063,18 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
         }
         Expr::Spawn(inner) => {
             var inner_ty: Type = TypeChecker_check_expr(self, box_expr_unbox(inner));
+            // @send check: any variables captured in the spawn expression
+            // must be @send (safe to send across threads).
+            var captured: Vec<(str, Type)> = Vec::new();
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(inner), &mut captured);
+            var ci: i64 = 0;
+            while ci < captured.len() {
+                var (_cname, var_ty) = captured.get(ci);
+                if !TypeChecker_is_send_type(self, var_ty) {
+                    self.errors.push("Thread safety error: spawn captures variable of type " + type_to_str(var_ty) + " which is not @send. Only @send types can be safely sent across threads.");
+                }
+                ci = ci + 1;
+            }
             match inner_ty {
                 Type::Generic(name, args) => {
                     if name == "Future" { return inner_ty; }
@@ -5535,6 +6088,14 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             var future_args: Vec<Type> = Vec::new();
             future_args.push(inner_ty);
             return Type::Generic("Future", future_args);
+        }
+        Expr::Yield(inner) => {
+            TypeChecker_check_expr(self, box_expr_unbox(inner));
+            return Type::Never;
+        }
+        Expr::NamedArg(name, e) => {
+            TypeChecker_check_expr(self, box_expr_unbox(e));
+            return Type::Never;
         }
     }
     return Type::Never;
@@ -6184,7 +6745,7 @@ pub fn TypeChecker_scan_stmts_for_effects(self: &TypeChecker, stmts: Vec<Stmt>, 
 
 pub fn TypeChecker_scan_stmt_for_effects(self: &TypeChecker, stmt: Stmt, effects: &mut Vec<str>) {
     match stmt {
-        Stmt::Let(_, _, expr, _, _, _) => { TypeChecker_scan_expr_for_effects(self, expr, effects); }
+        Stmt::Let(_, _, expr, _, _, _, _) => { TypeChecker_scan_expr_for_effects(self, expr, effects); }
         Stmt::LetTuple(_, expr, _) => { TypeChecker_scan_expr_for_effects(self, expr, effects); }
         Stmt::Expr(expr, _) => { TypeChecker_scan_expr_for_effects(self, expr, effects); }
         Stmt::Assign(_, _, expr, _) => { TypeChecker_scan_expr_for_effects(self, expr, effects); }
@@ -6239,6 +6800,14 @@ pub fn TypeChecker_scan_stmt_for_effects(self: &TypeChecker, stmt: Stmt, effects
         Stmt::GradBlock(_, body, _) => { TypeChecker_scan_stmts_for_effects(self, body, effects); }
         Stmt::Backward(loss, _) => { TypeChecker_scan_expr_for_effects(self, loss, effects); }
         Stmt::Query(_, body, _) => { TypeChecker_scan_stmts_for_effects(self, body, effects); }
+        Stmt::Parallel(branches, _) => {
+            var bi: i64 = 0;
+            while bi < branches.len() {
+                var branch: Vec<Stmt> = branches.get(bi);
+                TypeChecker_scan_stmts_for_effects(self, branch, effects);
+                bi = bi + 1;
+            }
+        }
         Stmt::Select(cases, default, _) => {
             var ci: i64 = 0;
             while ci < cases.len() {
@@ -6471,6 +7040,13 @@ pub fn TypeChecker_scan_expr_for_effects(self: &TypeChecker, expr: Expr, effects
             if !str_vec_contains_ref(effects, "Spawn") { effects.push("Spawn"); }
             TypeChecker_scan_expr_for_effects(self, box_expr_unbox(e), effects);
         }
+        Expr::Yield(e) => {
+            if !str_vec_contains_ref(effects, "Yield") { effects.push("Yield"); }
+            TypeChecker_scan_expr_for_effects(self, box_expr_unbox(e), effects);
+        }
+        Expr::NamedArg(name, e) => {
+            TypeChecker_scan_expr_for_effects(self, box_expr_unbox(e), effects);
+        }
     }
 }
 
@@ -6528,7 +7104,7 @@ pub fn TypeChecker_collect_called_funcs(self: &TypeChecker, stmts: Vec<Stmt>, ca
 
 pub fn TypeChecker_collect_called_funcs_stmt(self: &TypeChecker, stmt: Stmt, called: &mut Vec<str>) {
     match stmt {
-        Stmt::Let(_, _, expr, _, _, _) => { TypeChecker_collect_called_funcs_expr(self, expr, called); }
+        Stmt::Let(_, _, expr, _, _, _, _) => { TypeChecker_collect_called_funcs_expr(self, expr, called); }
         Stmt::LetTuple(_, expr, _) => { TypeChecker_collect_called_funcs_expr(self, expr, called); }
         Stmt::Expr(expr, _) => { TypeChecker_collect_called_funcs_expr(self, expr, called); }
         Stmt::Assign(_, _, expr, _) => { TypeChecker_collect_called_funcs_expr(self, expr, called); }
@@ -6583,6 +7159,14 @@ pub fn TypeChecker_collect_called_funcs_stmt(self: &TypeChecker, stmt: Stmt, cal
         Stmt::GradBlock(_, body, _) => { TypeChecker_collect_called_funcs(self, body, called); }
         Stmt::Backward(loss, _) => { TypeChecker_collect_called_funcs_expr(self, loss, called); }
         Stmt::Query(_, body, _) => { TypeChecker_collect_called_funcs(self, body, called); }
+        Stmt::Parallel(branches, _) => {
+            var bi: i64 = 0;
+            while bi < branches.len() {
+                var branch: Vec<Stmt> = branches.get(bi);
+                TypeChecker_collect_called_funcs(self, branch, called);
+                bi = bi + 1;
+            }
+        }
         Stmt::Select(cases, default, _) => {
             var ci: i64 = 0;
             while ci < cases.len() {
@@ -6743,6 +7327,8 @@ pub fn TypeChecker_collect_called_funcs_expr(self: &TypeChecker, expr: Expr, cal
         Expr::QuantCast(e, _) => { TypeChecker_collect_called_funcs_expr(self, box_expr_unbox(e), called); }
         Expr::Await(e) => { TypeChecker_collect_called_funcs_expr(self, box_expr_unbox(e), called); }
         Expr::Spawn(e) => { TypeChecker_collect_called_funcs_expr(self, box_expr_unbox(e), called); }
+        Expr::Yield(e) => { TypeChecker_collect_called_funcs_expr(self, box_expr_unbox(e), called); }
+        Expr::NamedArg(name, e) => { TypeChecker_collect_called_funcs_expr(self, box_expr_unbox(e), called); }
     }
 }
 
@@ -6805,9 +7391,9 @@ pub fn TypeChecker_lint_unused_imports(self: &mut TypeChecker, program: Program)
 
 pub fn stmt_line(stmt: Stmt) -> i64 {
     match stmt {
-        Stmt::Let(_, _, _, _, _, line) => { return line; }
+        Stmt::Let(_, _, _, _, _, _, line) => { return line; }
         Stmt::LetTuple(_, _, line) => { return line; }
-        Stmt::LetUninit(_, _, line) => { return line; }
+        Stmt::LetUninit(_, _, _, line) => { return line; }
         Stmt::Assign(_, _, _, line) => { return line; }
         Stmt::IndexAssign(_, _, _, _, line) => { return line; }
         Stmt::DerefAssign(_, _, _, line) => { return line; }
@@ -6834,6 +7420,7 @@ pub fn stmt_line(stmt: Stmt) -> i64 {
         Stmt::Backward(_, line) => { return line; }
         Stmt::Query(_, _, line) => { return line; }
         Stmt::Select(_, _, line) => { return line; }
+        Stmt::Parallel(_, line) => { return line; }
     }
     return 0;
 }
@@ -6852,7 +7439,7 @@ pub fn scan_for_floats(stmts: Vec<Stmt>) -> Vec<str> {
 
 pub fn scan_stmt_for_floats(stmt: Stmt, found: &mut Vec<str>) {
     match stmt {
-        Stmt::Let(_, _, expr, _, _, _) => { scan_expr_for_floats(expr, found); }
+        Stmt::Let(_, _, expr, _, _, _, _) => { scan_expr_for_floats(expr, found); }
         Stmt::LetTuple(_, expr, _) => { scan_expr_for_floats(expr, found); }
         Stmt::Expr(expr, _) => { scan_expr_for_floats(expr, found); }
         Stmt::Assign(_, _, expr, _) => { scan_expr_for_floats(expr, found); }
@@ -6975,6 +7562,18 @@ pub fn scan_stmt_for_floats(stmt: Stmt, found: &mut Vec<str>) {
             while i < body.len() {
                 scan_stmt_for_floats(body.get(i), found);
                 i = i + 1;
+            }
+        }
+        Stmt::Parallel(branches, _) => {
+            var bi: i64 = 0;
+            while bi < branches.len() {
+                var branch: Vec<Stmt> = branches.get(bi);
+                var si: i64 = 0;
+                while si < branch.len() {
+                    scan_stmt_for_floats(branch.get(si), found);
+                    si = si + 1;
+                }
+                bi = bi + 1;
             }
         }
         Stmt::Select(cases, default, _) => {
@@ -7183,6 +7782,8 @@ pub fn scan_expr_for_floats(expr: Expr, found: &mut Vec<str>) {
         Expr::QuantCast(e, _) => { scan_expr_for_floats(box_expr_unbox(e), found); }
         Expr::Await(e) => { scan_expr_for_floats(box_expr_unbox(e), found); }
         Expr::Spawn(e) => { scan_expr_for_floats(box_expr_unbox(e), found); }
+        Expr::Yield(e) => { scan_expr_for_floats(box_expr_unbox(e), found); }
+        Expr::NamedArg(name, e) => { scan_expr_for_floats(box_expr_unbox(e), found); }
     }
 }
 

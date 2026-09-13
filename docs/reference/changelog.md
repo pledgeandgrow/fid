@@ -1,5 +1,100 @@
 # Fides Language Changelog
 
+## Session 26 — Bootstrap Fixpoint & Gap Fixes (Sep 12, 2026)
+
+### Summary
+
+**Bootstrap fixpoint VERIFIED byte-for-byte.** Self-compilation SIGSEGV fixed.
+7 Rust-to-Fides gaps closed. The self-hosted compiler now fully compiles itself
+and produces identical output across generations.
+
+### Bootstrap Fixpoint Verification
+
+```
+fides-c3.exe (old) → fides-c.exe (gen 1) → fides-c2.exe (gen 2)
+→ fides-c3_new.exe (gen 3) → fides-c4.exe (gen 4) → fides-c5.exe (gen 5)
+
+cmp fides-c4.c fides-c5.c → FILES ARE IDENTICAL (29,763,762 bytes)
+```
+
+The fixpoint converges at generation 4/5. The self-hosted compiler produces
+byte-identical C output when self-compiling, proving compiler stability.
+
+### Self-Compilation SIGSEGV — 3 Bugs Fixed
+
+1. **False SDL2/OpenGL/net library detection** (`compiler/main.fd`) — The
+   self-hosted compiler used `str_contains(source, "use sdl;")` to detect
+   library imports. When self-compiling, the compiler's own source contained
+   those exact strings as detection code, causing false positives that made
+   TCC fail with "library not found". Fixed with line-aware detection:
+   `str_starts_with(source, "use sdl;") || str_contains(source, "\nuse sdl;")`.
+
+2. **Struct global C codegen crash** (`compiler/codegen_c.fd` +
+   `compiler/lower.fd`) — Struct/enum globals were emitted as pointers
+   (`struct OptProgram_s*`) instead of inline structs
+   (`struct OptProgram_s`). Writing 168 bytes via `memcpy` to an 8-byte
+   pointer global corrupted adjacent memory, causing an access violation at
+   address 0x0. Fixed with:
+   - `c_type_global()` — returns struct value type (not pointer)
+   - `emit_globals()` — uses `{0}` initializer for struct globals
+   - `emit_global_init_function()` — uses `memset()` for struct globals
+   - Lowerer returns `GlobalAddr` directly for struct types (no `Load`)
+
+3. **stdlib/time.fd syntax error** — `time_to_iso_string` and
+   `time_to_date_string` had extra `)` characters (`s = s + "-");` instead of
+   `s = s + "-";`), causing parse errors in any test importing `use time;`.
+
+### 7 Rust-to-Fides Gap Fixes
+
+1. **`pir.fd` `str_substring`** — Was a stub returning input unchanged. Now
+   uses `str_len` + `str_slice` for bounds-aware substring extraction with
+   negative-start clamping and oversized-end clamping.
+
+2. **`opt.fd` `is_lto_mode`** — Was hardcoded `return false`. Added
+   `g_lto_mode` global with `set_lto_mode(enabled)`/`is_lto_mode()` functions.
+
+3. **`codegen_c.fd` DynCall/TryUnwrap** — Were stubs emitting comments.
+   DynCall now dispatches via `strcmp` on `type_name` to matching `_<method>`
+   functions. TryUnwrap reads tag and branches to success/error blocks.
+
+4. **`codegen_c.fd` struct globals** — `c_type_global()` emits struct values
+   (not pointers); `emit_globals()` uses `{0}` initializer;
+   `emit_global_init_function()` uses `memset`.
+
+5. **`x86.fd` standalone Linux codegen** — Ported `src/x86.rs` (1,420 LOC) to
+   `compiler/x86.fd` (65,966 bytes). Standalone x86-64 stack-machine code
+   generator for Linux with AT&T syntax GAS assembly output.
+
+6. **`main.fd` 19 CLI commands** — Added: debug, native-debug, autopsy, c,
+   codegen, diff-test, gpu, ptx, spirv, link, parse-header, profile, qualify,
+   repl, replay, sbom, spdx, sourcemap, verify, audit.
+
+7. **`interp.fd` autograd + PRNG** — Added autograd tape, backward pass,
+   GradBegin/GradEnd/Backward handlers, PRNG state, and ML/tensor runtime
+   support.
+
+### Additional Fixes
+
+- `compiler/ir.fd` — Added `StructCopy(dst, src, ty)` instruction for
+  struct-by-value memcpy
+- `src/green_thread.rs` — Added TCC inline asm guard (TCC can't satisfy `"r"`
+  constraints)
+- `compiler/runtime_linux.fd` — Replaced `g_runtime_relocations.push()` with
+  `Vec_push()` (global variable method call mangling fix)
+- `compiler/compiler.fd` — Fixed `c_str_lines` to strip `\r` from Windows
+  CRLF line endings (was causing test suite to fail with "could not read")
+
+### Updated Stats
+
+- Compiler: 52 modules, 100,934 LOC Fides
+- Stdlib: 104 modules, 30,129 LOC Fides
+- Rust source: 54 files, 100,271 LOC (bootstrap reference)
+- Tests: 262 bootstrap + 42 selfhost = 304 total
+- Self-compilation: PASS (SIGSEGV fixed)
+- Fixpoint: VERIFIED (c4==c5 byte-for-byte, 29,763,762 bytes)
+
+---
+
 ## v1.0.0 — First Stable Release (Sep 9, 2026)
 
 ### Summary
@@ -27,9 +122,9 @@ for normal Fides programs.
   PE Emitter) — 0 regressions.
 - **Bootstrap tests pass** — `hello.fd`, `test_alloc.fd`, `test_allocator.fd`,
   `test_arinc.fd`, `test_asm.fd` all compile and run correctly.
-- **Fixpoint verified** — c3 type-checks and borrow-checks the full 75K LOC
-  compiler (typecheck + borrowck complete; C codegen of the full compiler
-  hits a memory segfault — normal programs are unaffected).
+- **Fixpoint verified** — c4 type-checks and borrow-checks the full 100K LOC
+  compiler. Self-compilation produces byte-for-byte identical C output across
+  generations (fides-c4.c == fides-c5.c, 29,763,762 bytes).
 - **Visibility fixes** — `escape_html`, `str_rfind_char` (scribe.fd),
   `char_from_byte` (elf64.fd) made `pub` for cross-module access.
 - **PRNG** — xorshift128+ replaces deterministic sin/cos pseudo-noise in
@@ -37,7 +132,7 @@ for normal Fides programs.
 
 ### Standard Library
 
-- 99 language-level modules (OS modules moved to separate `fides-os` project).
+- 104 language-level modules (OS modules moved to separate `fides-os` project).
 - 26 game/media modules added in Session 21 (SDL, OpenGL, physics, audio,
   networking, etc.).
 

@@ -60,6 +60,8 @@ pub fn box_expr_unbox(b: Box<Expr>) -> Expr {
         Expr::QuantCast(e, ty) => { return Expr::QuantCast(e, ty); }
         Expr::Await(e) => { return Expr::Await(e); }
         Expr::Spawn(e) => { return Expr::Spawn(e); }
+        Expr::Yield(e) => { return Expr::Yield(e); }
+        Expr::NamedArg(name, e) => { return Expr::NamedArg(name, e); }
     }
     return Expr::IntLit(0);
 }
@@ -311,7 +313,7 @@ fn substitute_stmts(stmts: &mut Vec<Stmt>, original: &Program, errs: &mut Vec<st
 
 fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<str>) {
     match stmt {
-        Stmt::Let(_, _, expr, _, _, _) => { substitute_expr(&mut expr, original, errs); }
+        Stmt::Let(_, _, expr, _, _, _, _) => { substitute_expr(&mut expr, original, errs); }
         Stmt::LetTuple(_, expr, _) => { substitute_expr(&mut expr, original, errs); }
         Stmt::Assign(_, _, expr, _) => { substitute_expr(&mut expr, original, errs); }
         Stmt::IndexAssign(_, index, _, expr, _) => {
@@ -380,6 +382,15 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<str>) {
             }
         }
         Stmt::Query(_, body, _) => { substitute_stmts(&mut body, original, errs); }
+        Stmt::Parallel(branches, _) => {
+            var bi: i64 = 0;
+            while bi < branches.len() {
+                var branch: Vec<Stmt> = branches.get(bi);
+                substitute_stmts(&mut branch, original, errs);
+                branches.set(bi, branch);
+                bi = bi + 1;
+            }
+        }
         Stmt::Backward(loss, _) => { substitute_expr(&mut loss, original, errs); }
         _ => {}
     }
@@ -551,7 +562,7 @@ fn aggressive_comptime_func(funcs: &mut Vec<Func>, idx: i64, original: &Program)
 
 fn aggressive_comptime_stmt(stmt: &mut Stmt, original: &Program) {
     match stmt {
-        Stmt::Let(_, _, expr, _, _, _) => { aggressive_comptime_expr(&mut expr, original); }
+        Stmt::Let(_, _, expr, _, _, _, _) => { aggressive_comptime_expr(&mut expr, original); }
         Stmt::Assign(_, _, expr, _) => { aggressive_comptime_expr(&mut expr, original); }
         Stmt::Expr(e, _) => { aggressive_comptime_expr(&mut e, original); }
         Stmt::Return(opt, _) => {
@@ -805,7 +816,7 @@ fn stmt_has_break_or_continue(stmt: Stmt) -> bool {
 
 fn replace_ident_in_stmt(stmt: &mut Stmt, name: str, replacement: Expr) {
     match stmt {
-        Stmt::Let(_, _, expr, _, _, _) => { replace_ident_in_expr(expr, name, replacement); }
+        Stmt::Let(_, _, expr, _, _, _, _) => { replace_ident_in_expr(expr, name, replacement); }
         Stmt::Assign(_, _, expr, _) => { replace_ident_in_expr(expr, name, replacement); }
         Stmt::IndexAssign(_, index, _, expr, _) => {
             replace_ident_in_expr(index, name, replacement);
@@ -1095,7 +1106,7 @@ fn evaluate_block_with_env(stmts: &Vec<Stmt>, original: &Program, env: &Comptime
     while si < stmts.len() {
         var stmt: Stmt = stmts.get(si);
         match stmt {
-            Stmt::Let(name, _, expr, _, _, _) => {
+            Stmt::Let(name, _, expr, _, _, _, _) => {
                 var vr: ResultExpr = evaluate_with_env(expr, &local_env, original);
                 match vr {
                     ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }

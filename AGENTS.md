@@ -4,7 +4,7 @@
 > Fides compiler safely. Read this before making changes.
 >
 > **Fides is self-hosted and independent.** The primary compiler is in
-> `compiler/*.fd` (50 modules, 93,605 LOC). The Rust source in `src/*.rs` is
+> `compiler/*.fd` (52 modules, 100,934 LOC). The Rust source in `src/*.rs` is
 > the bootstrap reference, used only when `compiler/*.fd` changes. For everyday
 > work (writing programs, adding stdlib, adding tests, building tools), use
 > `release/fides-c3.exe` directly — no Rust build needed.
@@ -158,13 +158,13 @@ cargo build
 
 ```
 SELF-HOSTED COMPILER (primary):
-  compiler/*.fd:  50 modules, 93,605 LOC — THE COMPILER
-  Fixpoint:       NOT VERIFIABLE (fides-c2.c missing); self-compilation segfaults in Lowerer_mangle_method
-  Bootstrap:      3 generations verified (Rust → c1 → c2 → c3, all work)
+  compiler/*.fd:  52 modules, 100,934 LOC — THE COMPILER
+  Fixpoint:       VERIFIED byte-for-byte (fides-c4.c == fides-c5.c, 29,763,762 bytes)
+  Bootstrap:      5 generations verified (Rust → c1 → c2 → c3 → c4 → c5, all work)
   Use:            release/fides-c3.exe for everyday work
 
 RUST BOOTSTRAP (reference only):
-  src/*.rs:       55 files, 91,490 LOC — bootstrap reference
+  src/*.rs:       54 files, 100,271 LOC — bootstrap reference
   Used when:      compiler/*.fd changes (regenerate C1, verify fixpoint)
 
 WINDOWS INSTALLER (v1.0.0):
@@ -175,11 +175,11 @@ WINDOWS INSTALLER (v1.0.0):
 
 TESTS:
   Self-host:      38/38 pass on interp + C + PE (tests/selfhost/)
-  Bootstrap:      Interpreter 236/237, C Codegen 226/237, PE Emitter 237/237
-  Fixpoint:       c3 type-checks + borrow-checks full 75K LOC compiler
+  Bootstrap:      Interpreter 236/237, C Codegen 220/237, PE Emitter 236/237
+  Fixpoint:       c4 type-checks + borrow-checks full 100K LOC compiler + c4==c5 byte-for-byte
 
 STDLIB:
-  stdlib/*.fd:    99 modules, 28,370 LOC (OS modules moved to fides-os project)
+  stdlib/*.fd:    104 modules, 30,129 LOC (OS modules moved to fides-os project)
 
 RECENT IMPROVEMENTS:
   Session 23:     6 high-priority language features implemented:
@@ -225,7 +225,7 @@ Binaries:     4 (fidesc, ark, scribe, veil) — fidesc is bootstrap only
 **Build directories:**
 - `target/` — Rust bootstrap compiler output (`fidesc.exe`) — gitignored
 - `release/` — Self-hosted compiler output (`fides-c3.exe`, generated C) — gitignored
-- `compiler/` — Self-hosted compiler source (31 `.fd` modules) — THE PRIMARY COMPILER
+- `compiler/` — Self-hosted compiler source (52 `.fd` modules) — THE PRIMARY COMPILER
 
 **Changelog:** See `docs/reference/changelog.md` for the full history of
 features and fixes. (Previously duplicated here — removed to avoid maintaining

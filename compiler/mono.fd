@@ -611,6 +611,8 @@ pub fn box_expr_deref(b: Box<Expr>) -> Expr {
         Expr::QuantCast(e, t) => { return Expr::QuantCast(e, t); }
         Expr::Await(e) => { return Expr::Await(e); }
         Expr::Spawn(e) => { return Expr::Spawn(e); }
+        Expr::Yield(e) => { return Expr::Yield(e); }
+        Expr::NamedArg(name, e) => { return Expr::NamedArg(name, e); }
     }
     return Expr::IntLit(0);
 }
@@ -1105,6 +1107,12 @@ fn subst_expr_part2(
         Expr::Spawn(inner) => {
             return Expr::Spawn(box_expr_new(subst_expr(box_expr_deref(inner), subst, renames, method_renames)));
         }
+        Expr::Yield(inner) => {
+            return Expr::Yield(box_expr_new(subst_expr(box_expr_deref(inner), subst, renames, method_renames)));
+        }
+        Expr::NamedArg(name, inner) => {
+            return Expr::NamedArg(name, Box::new(subst_expr(box_expr_deref(inner), subst, renames, method_renames)));
+        }
         _ => {}
     }
     return expr;
@@ -1119,16 +1127,16 @@ pub fn subst_stmt(
     method_renames: Vec<RenameEntry>,
 ) -> Stmt {
     match stmt {
-        Stmt::Let(name, ty, expr, is_mut, is_persist, line) => {
+        Stmt::Let(name, ty, expr, is_mut, is_persist, annotations, line) => {
             var new_ty: OptType = OptType::None;
             match ty {
                 OptType::Some(t) => { new_ty = OptType::Some(subst_type(t, subst)); }
                 OptType::None => {}
             }
-            return Stmt::Let(name, new_ty, subst_expr(expr, subst, renames, method_renames), is_mut, is_persist, line);
+            return Stmt::Let(name, new_ty, subst_expr(expr, subst, renames, method_renames), is_mut, is_persist, annotations, line);
         }
-        Stmt::LetUninit(name, ty, line) => {
-            return Stmt::LetUninit(name, subst_type(ty, subst), line);
+        Stmt::LetUninit(name, ty, annotations, line) => {
+            return Stmt::LetUninit(name, subst_type(ty, subst), annotations, line);
         }
         Stmt::LetTuple(names, expr, line) => {
             return Stmt::LetTuple(names, subst_expr(expr, subst, renames, method_renames), line);
@@ -1381,6 +1389,22 @@ fn subst_stmt_part2(
                 OptStmts::None => {}
             }
             return Stmt::Select(new_cases, new_default, line);
+        }
+        Stmt::Parallel(branches, line) => {
+            var new_branches: Vec<Vec<Stmt> > = Vec::new();
+            var i: i64 = 0;
+            while i < branches.len() {
+                var branch: Vec<Stmt> = branches.get(i);
+                var new_branch: Vec<Stmt> = Vec::new();
+                var j: i64 = 0;
+                while j < branch.len() {
+                    new_branch.push(subst_stmt(branch.get(j), subst, renames, method_renames));
+                    j = j + 1;
+                }
+                new_branches.push(new_branch);
+                i = i + 1;
+            }
+            return Stmt::Parallel(new_branches, line);
         }
         _ => {}
     }
@@ -1684,8 +1708,8 @@ pub fn fixup_generic_calls_stmt(stmt: Stmt, generics: Vec<GenericFuncEntry>, cur
         Stmt::Expr(e, line) => {
             return Stmt::Expr(fixup_generic_calls_expr(e, generics, current_func), line);
         }
-        Stmt::Let(name, ty, expr, is_mut, is_persist, line) => {
-            return Stmt::Let(name, ty, fixup_generic_calls_expr(expr, generics, current_func), is_mut, is_persist, line);
+        Stmt::Let(name, ty, expr, is_mut, is_persist, annotations, line) => {
+            return Stmt::Let(name, ty, fixup_generic_calls_expr(expr, generics, current_func), is_mut, is_persist, annotations, line);
         }
         Stmt::LetTuple(names, expr, line) => {
             return Stmt::LetTuple(names, fixup_generic_calls_expr(expr, generics, current_func), line);
@@ -2002,10 +2026,10 @@ pub fn collect_generic_calls_stmt_with_hint(
     expected_ty: OptType,
 ) {
     match stmt {
-        Stmt::Let(name, ty, expr, is_mut, is_persist, line) => {
+        Stmt::Let(name, ty, expr, is_mut, is_persist, annotations, line) => {
             collect_generic_calls_expr_with_hint(expr, generics, generic_methods, calls, method_calls, current_func, ty);
         }
-        Stmt::LetUninit(name, ty, line) => {}
+        Stmt::LetUninit(name, ty, _annotations, line) => {}
         Stmt::LetTuple(names, expr, line) => {
             collect_generic_calls_expr_with_hint(expr, generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
@@ -2194,6 +2218,18 @@ pub fn collect_generic_calls_stmt_with_hint(
                     }
                 }
                 OptStmts::None => {}
+            }
+        }
+        Stmt::Parallel(branches, line) => {
+            var bi: i64 = 0;
+            while bi < branches.len() {
+                var branch: Vec<Stmt> = branches.get(bi);
+                var si: i64 = 0;
+                while si < branch.len() {
+                    collect_generic_calls_stmt_with_hint(branch.get(si), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+                    si = si + 1;
+                }
+                bi = bi + 1;
             }
         }
     }
@@ -2426,6 +2462,12 @@ pub fn collect_generic_calls_expr_with_hint(
         Expr::Spawn(inner) => {
             collect_generic_calls_expr_with_hint(box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
+        Expr::Yield(inner) => {
+            collect_generic_calls_expr_with_hint(box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+        }
+        Expr::NamedArg(name, inner) => {
+            collect_generic_calls_expr_with_hint(box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+        }
         Expr::IntLit(n) => {}
         Expr::FloatLit(f) => {}
         Expr::StringLit(s) => {}
@@ -2496,7 +2538,7 @@ pub fn infer_expr_type(expr: Expr, func: Func) -> Type {
             i = 0;
             while i < func.body.len() {
                 match func.body.get(i) {
-                    Stmt::Let(ln, ty, e, is_mut, is_persist, line) => {
+                    Stmt::Let(ln, ty, e, is_mut, is_persist, annotations, line) => {
                         match ty {
                             OptType::Some(t) => {
                                 if str_equal(ln, name) { return t; }
@@ -2512,7 +2554,7 @@ pub fn infer_expr_type(expr: Expr, func: Func) -> Type {
             i = 0;
             while i < func.body.len() {
                 match func.body.get(i) {
-                    Stmt::Let(ln, ty, e, is_mut, is_persist, line) => {
+                    Stmt::Let(ln, ty, e, is_mut, is_persist, annotations, line) => {
                         match ty {
                             OptType::None => {
                                 if str_equal(ln, name) {

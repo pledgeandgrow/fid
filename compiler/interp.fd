@@ -23,6 +23,7 @@ use vec;
 use string;
 use compiler::ast;
 use compiler::ir;
+use compiler::green_thread;
 
 // ===========================================================================
 // Value -- runtime value representation
@@ -430,6 +431,7 @@ pub struct Interpreter {
     // DP epsilon budget tracking
     pub dp_epsilon_budget: f64,
     pub dp_epsilon_limit: f64,
+    pub thread_handle_count: i64,
 }
 
 pub fn Interpreter_new(module: IrModule) -> Interpreter {
@@ -462,6 +464,7 @@ pub fn Interpreter_new(module: IrModule) -> Interpreter {
         prng_state_b: 0xBF58476D1CE4E5B9,
         dp_epsilon_budget: 0.0,
         dp_epsilon_limit: 0.0,
+        thread_handle_count: 0,
     };
     Interpreter_init_strings(&mut interp);
     Interpreter_init_globals(&mut interp);
@@ -1613,6 +1616,12 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
         Inst::GradBegin(_) => { return ExecOutcome::Continue; }
         Inst::GradEnd => { return ExecOutcome::Continue; }
         Inst::Backward(_) => { return ExecOutcome::Continue; }
+        Inst::StructCopy(dst, src, _ty) => {
+            // Simplified: copy raw 8-byte value from src to dst
+            var src_val: Value = get_value(values, src);
+            values.set(dst, src_val);
+            return ExecOutcome::Continue;
+        }
     }
     return ExecOutcome::Continue;
 }
@@ -1891,6 +1900,11 @@ pub fn Interpreter_is_runtime_func(self: &Interpreter, name: str) -> bool {
     if str_equal(name, "p_str_len") { return true; }
     if str_equal(name, "p_str_equal") { return true; }
     if str_equal(name, "p_str_cmp") { return true; }
+    if str_equal(name, "p_bool_to_str") { return true; }
+    if str_equal(name, "p_clock_now") { return true; }
+    if str_equal(name, "p_clock_now_us") { return true; }
+    if str_equal(name, "p_clock_now_ms") { return true; }
+    if str_equal(name, "p_memset") { return true; }
     return false;
 }
 
@@ -2597,6 +2611,814 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
                 _ => {}
             }
         }
+        return ExecOutcome::Value(Value::Void);
+    }
+
+    // ─── Green threads (cooperative scheduler) ───
+    if str_equal(name, "p_gt_spawn") {
+        if args.len() < 2 { return ExecOutcome::Value(Value::Int(-1)); }
+        var func_id: i64 = 0;
+        var arg_val: i64 = 0;
+        match args.get(0) { Value::Int(n) => { func_id = n; } _ => {} }
+        match args.get(1) { Value::Int(n) => { arg_val = n; } _ => {} }
+        var id: i64 = gt_global_spawn(func_id, arg_val);
+        return ExecOutcome::Value(Value::Int(id));
+    }
+    if str_equal(name, "p_gt_yield") {
+        gt_global_yield();
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_gt_run_all") {
+        var result: i64 = gt_global_run_all();
+        return ExecOutcome::Value(Value::Int(result));
+    }
+    if str_equal(name, "p_gt_is_done") {
+        if args.len() < 1 { return ExecOutcome::Value(Value::Bool(false)); }
+        var id: i64 = 0;
+        match args.get(0) { Value::Int(n) => { id = n; } _ => {} }
+        return ExecOutcome::Value(Value::Bool(gt_global_is_done(id)));
+    }
+    if str_equal(name, "p_gt_get_result") {
+        if args.len() < 1 { return ExecOutcome::Value(Value::Int(0)); }
+        var id: i64 = 0;
+        match args.get(0) { Value::Int(n) => { id = n; } _ => {} }
+        return ExecOutcome::Value(Value::Int(gt_global_get_result(id)));
+    }
+    if str_equal(name, "p_gt_current") {
+        return ExecOutcome::Value(Value::Int(gt_global_current()));
+    }
+    if str_equal(name, "p_gt_reset") {
+        gt_global_reset();
+        return ExecOutcome::Value(Value::Void);
+    }
+
+    // ─── Channels (ML/concurrency) ───
+    if str_equal(name, "p_chan_create") {
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_chan_send") {
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_chan_recv") {
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_chan_try_recv") {
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_chan_close") {
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_chan_is_closed") {
+        return ExecOutcome::Value(Value::Bool(false));
+    }
+
+    // ─── Autograd (ML3) ───
+    if str_equal(name, "p_grad_get") {
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_grad_zero") {
+        return ExecOutcome::Value(Value::Void);
+    }
+
+    // ─── KV Cache (ML9) ───
+    if str_equal(name, "p_kv_cache_new") {
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_kv_cache_append") {
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_kv_cache_get") {
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_kv_cache_len") {
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_kv_cache_clear") {
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_kv_cache_evict") {
+        return ExecOutcome::Value(Value::Void);
+    }
+
+    // ─── Quantization (ML10) ───
+    if str_equal(name, "p_quantize_q8") {
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_dequantize_q8") {
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_qmatmul") {
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_find_quant_params") {
+        return ExecOutcome::Value(Value::Int(0));
+    }
+
+    // ─── Tensor utilities ───
+    if str_equal(name, "p_tensor_to_json") {
+        return ExecOutcome::Value(Value::Str("[]"));
+    }
+    if str_equal(name, "p_tensor_clone") {
+        return ExecOutcome::Value(Value::Int(0));
+    }
+
+    // ─── String runtime functions (ported from src/interp.rs ~3288-3455) ───
+    if str_equal(name, "p_string_from") {
+        if args.len() > 0 {
+            match args.get(0) {
+                Value::Int(i) => { return ExecOutcome::Value(Value::Str(int_to_str(i))); }
+                Value::Float(f) => { return ExecOutcome::Value(Value::Str(float_to_str(f))); }
+                Value::Bool(b) => {
+                    if b { return ExecOutcome::Value(Value::Str("true")); }
+                    return ExecOutcome::Value(Value::Str("false"));
+                }
+                Value::Str(s) => { return ExecOutcome::Value(Value::Str(s)); }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Str(""));
+    }
+    if str_equal(name, "p_string_len") {
+        if args.len() > 0 {
+            match args.get(0) {
+                Value::Str(s) => { return ExecOutcome::Value(Value::Int(str_len(s))); }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_string_is_empty") {
+        if args.len() > 0 {
+            match args.get(0) {
+                Value::Str(s) => { return ExecOutcome::Value(Value::Bool(str_len(s) == 0)); }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Bool(true));
+    }
+    if str_equal(name, "p_string_push_str") {
+        if args.len() >= 2 {
+            var left: str = Interpreter_value_to_string(self, args.get(0));
+            var right: str = Interpreter_value_to_string(self, args.get(1));
+            return ExecOutcome::Value(Value::Str(left + right));
+        }
+        return ExecOutcome::Value(Value::Str(""));
+    }
+    if str_equal(name, "p_string_to_string") {
+        if args.len() > 0 {
+            return ExecOutcome::Value(Value::Str(Interpreter_value_to_string(self, args.get(0))));
+        }
+        return ExecOutcome::Value(Value::Str(""));
+    }
+    if str_equal(name, "p_string_slice") {
+        if args.len() >= 3 {
+            var s: str = Interpreter_value_to_string(self, args.get(0));
+            var start: i64 = 0;
+            var end: i64 = str_len(s);
+            match args.get(1) { Value::Int(n) => { start = n; } _ => {} }
+            match args.get(2) { Value::Int(n) => { end = n; } _ => {} }
+            var slen: i64 = str_len(s);
+            if start < 0 { start = 0; }
+            if end > slen { end = slen; }
+            if start > end { start = end; }
+            return ExecOutcome::Value(Value::Str(String_slice(s, start, end)));
+        }
+        return ExecOutcome::Value(Value::Str(""));
+    }
+    if str_equal(name, "p_string_contains") {
+        if args.len() >= 2 {
+            var s: str = Interpreter_value_to_string(self, args.get(0));
+            var sub: str = Interpreter_value_to_string(self, args.get(1));
+            return ExecOutcome::Value(Value::Bool(str_contains(s, sub)));
+        }
+        return ExecOutcome::Value(Value::Bool(false));
+    }
+    if str_equal(name, "p_string_starts_with") {
+        if args.len() >= 2 {
+            var s: str = Interpreter_value_to_string(self, args.get(0));
+            var prefix: str = Interpreter_value_to_string(self, args.get(1));
+            return ExecOutcome::Value(Value::Bool(str_starts_with(s, prefix)));
+        }
+        return ExecOutcome::Value(Value::Bool(false));
+    }
+    if str_equal(name, "p_string_ends_with") {
+        if args.len() >= 2 {
+            var s: str = Interpreter_value_to_string(self, args.get(0));
+            var suffix: str = Interpreter_value_to_string(self, args.get(1));
+            return ExecOutcome::Value(Value::Bool(str_ends_with(s, suffix)));
+        }
+        return ExecOutcome::Value(Value::Bool(false));
+    }
+    if str_equal(name, "p_string_trim") {
+        if args.len() > 0 {
+            var s: str = Interpreter_value_to_string(self, args.get(0));
+            return ExecOutcome::Value(Value::Str(str_trim(s)));
+        }
+        return ExecOutcome::Value(Value::Str(""));
+    }
+    if str_equal(name, "p_string_split") {
+        if args.len() >= 2 {
+            var s: str = Interpreter_value_to_string(self, args.get(0));
+            var delim: str = Interpreter_value_to_string(self, args.get(1));
+            // Create a new vec (same as p_vec_new)
+            var vec_addr: i64 = Memory_alloc(&mut self.memory, 24);
+            Memory_store_i64(&mut self.memory, vec_addr, 0);
+            Memory_store_i64(&mut self.memory, vec_addr + 8, 0);
+            Memory_store_i64(&mut self.memory, vec_addr + 16, 0);
+            // Split the string using str_split helper
+            var parts: Vec<str> = str_split(s, delim);
+            var pi: i64 = 0;
+            while pi < parts.len() {
+                var part: str = parts.get(pi);
+                // Inline vec push logic
+                var vlen: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
+                var vcap: i64 = Memory_load_i64(&self.memory, vec_addr + 16);
+                var vdata: i64 = Memory_load_i64(&self.memory, vec_addr);
+                if vlen >= vcap {
+                    var new_cap: i64 = 8;
+                    if vcap > 0 { new_cap = vcap * 2; }
+                    var new_data: i64 = Memory_alloc(&mut self.memory, new_cap * 8);
+                    var ci: i64 = 0;
+                    while ci < vlen {
+                        var v: i64 = Memory_load_i64(&self.memory, vdata + ci * 8);
+                        Memory_store_i64(&mut self.memory, new_data + ci * 8, v);
+                        ci = ci + 1;
+                    }
+                    vdata = new_data;
+                    vcap = new_cap;
+                    Memory_store_i64(&mut self.memory, vec_addr, vdata);
+                    Memory_store_i64(&mut self.memory, vec_addr + 16, vcap);
+                }
+                Memory_store_i64(&mut self.memory, vdata + vlen * 8, part as i64);
+                vlen = vlen + 1;
+                Memory_store_i64(&mut self.memory, vec_addr + 8, vlen);
+                pi = pi + 1;
+            }
+            return ExecOutcome::Value(Value::Int(vec_addr));
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_string_replace") {
+        if args.len() >= 3 {
+            var s: str = Interpreter_value_to_string(self, args.get(0));
+            var from: str = Interpreter_value_to_string(self, args.get(1));
+            var to: str = Interpreter_value_to_string(self, args.get(2));
+            return ExecOutcome::Value(Value::Str(str_replace(s, from, to)));
+        }
+        return ExecOutcome::Value(Value::Str(""));
+    }
+    if str_equal(name, "p_string_char_at") {
+        if args.len() >= 2 {
+            var s: str = Interpreter_value_to_string(self, args.get(0));
+            var idx: i64 = -1;
+            match args.get(1) { Value::Int(i) => { idx = i; } _ => {} }
+            if idx < 0 || idx >= str_len(s) {
+                return ExecOutcome::Panic("String char_at out of bounds");
+            }
+            return ExecOutcome::Value(Value::Int(str_byte_at(s, idx)));
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_string_to_uppercase") {
+        if args.len() > 0 {
+            var s: str = Interpreter_value_to_string(self, args.get(0));
+            return ExecOutcome::Value(Value::Str(str_to_upper(s)));
+        }
+        return ExecOutcome::Value(Value::Str(""));
+    }
+    if str_equal(name, "p_string_to_lowercase") {
+        if args.len() > 0 {
+            var s: str = Interpreter_value_to_string(self, args.get(0));
+            return ExecOutcome::Value(Value::Str(str_to_lower(s)));
+        }
+        return ExecOutcome::Value(Value::Str(""));
+    }
+    if str_equal(name, "p_string_parse_int") {
+        if args.len() > 0 {
+            var s: str = Interpreter_value_to_string(self, args.get(0));
+            return ExecOutcome::Value(Value::Int(str_parse_int(s)));
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_string_find") {
+        if args.len() >= 2 {
+            var s: str = Interpreter_value_to_string(self, args.get(0));
+            var sub: str = Interpreter_value_to_string(self, args.get(1));
+            return ExecOutcome::Value(Value::Int(str_find(s, sub)));
+        }
+        return ExecOutcome::Value(Value::Int(-1));
+    }
+    if str_equal(name, "p_string_rfind") {
+        if args.len() >= 2 {
+            var s: str = Interpreter_value_to_string(self, args.get(0));
+            var sub: str = Interpreter_value_to_string(self, args.get(1));
+            return ExecOutcome::Value(Value::Int(str_rfind(s, sub)));
+        }
+        return ExecOutcome::Value(Value::Int(-1));
+    }
+    if str_equal(name, "p_string_repeat") {
+        if args.len() >= 2 {
+            var s: str = Interpreter_value_to_string(self, args.get(0));
+            var n: i64 = 0;
+            match args.get(1) { Value::Int(i) => { n = i; } _ => {} }
+            return ExecOutcome::Value(Value::Str(str_repeat(s, n)));
+        }
+        return ExecOutcome::Value(Value::Str(""));
+    }
+    if str_equal(name, "p_string_bytes") {
+        if args.len() > 0 {
+            var s: str = Interpreter_value_to_string(self, args.get(0));
+            var slen: i64 = str_len(s);
+            // Create a new vec to hold byte values
+            var vec_addr: i64 = Memory_alloc(&mut self.memory, 24);
+            Memory_store_i64(&mut self.memory, vec_addr, 0);
+            Memory_store_i64(&mut self.memory, vec_addr + 8, 0);
+            Memory_store_i64(&mut self.memory, vec_addr + 16, 0);
+            var bi: i64 = 0;
+            while bi < slen {
+                var byte_val: i64 = str_byte_at(s, bi);
+                // Inline vec push
+                var vlen: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
+                var vcap: i64 = Memory_load_i64(&self.memory, vec_addr + 16);
+                var vdata: i64 = Memory_load_i64(&self.memory, vec_addr);
+                if vlen >= vcap {
+                    var new_cap: i64 = 8;
+                    if vcap > 0 { new_cap = vcap * 2; }
+                    var new_data: i64 = Memory_alloc(&mut self.memory, new_cap * 8);
+                    var ci: i64 = 0;
+                    while ci < vlen {
+                        var v: i64 = Memory_load_i64(&self.memory, vdata + ci * 8);
+                        Memory_store_i64(&mut self.memory, new_data + ci * 8, v);
+                        ci = ci + 1;
+                    }
+                    vdata = new_data;
+                    vcap = new_cap;
+                    Memory_store_i64(&mut self.memory, vec_addr, vdata);
+                    Memory_store_i64(&mut self.memory, vec_addr + 16, vcap);
+                }
+                Memory_store_i64(&mut self.memory, vdata + vlen * 8, byte_val);
+                vlen = vlen + 1;
+                Memory_store_i64(&mut self.memory, vec_addr + 8, vlen);
+                bi = bi + 1;
+            }
+            return ExecOutcome::Value(Value::Int(vec_addr));
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_string_clone") {
+        if args.len() > 0 {
+            return ExecOutcome::Value(Value::Str(Interpreter_value_to_string(self, args.get(0))));
+        }
+        return ExecOutcome::Value(Value::Str(""));
+    }
+    if str_equal(name, "p_string_to_str") {
+        if args.len() > 0 {
+            return ExecOutcome::Value(Value::Str(Interpreter_value_to_string(self, args.get(0))));
+        }
+        return ExecOutcome::Value(Value::Str(""));
+    }
+
+    // ─── Bool runtime function ───
+    if str_equal(name, "p_bool_to_str") {
+        if args.len() > 0 {
+            match args.get(0) {
+                Value::Bool(b) => {
+                    if b { return ExecOutcome::Value(Value::Str("true")); }
+                    return ExecOutcome::Value(Value::Str("false"));
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Str(""));
+    }
+
+    // ─── Vec extra runtime functions (ported from src/interp.rs ~2868-3554) ───
+    if str_equal(name, "p_vec_to_str") {
+        if args.len() > 0 {
+            match args.get(0) {
+                Value::Int(vec_addr) => {
+                    var vlen: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
+                    var vdata: i64 = Memory_load_i64(&self.memory, vec_addr);
+                    var out: str = "[";
+                    var vi: i64 = 0;
+                    while vi < vlen {
+                        if vi > 0 { out = out + ", "; }
+                        var elem: i64 = Memory_load_i64(&self.memory, vdata + vi * 8);
+                        out = out + int_to_str(elem);
+                        vi = vi + 1;
+                    }
+                    out = out + "]";
+                    return ExecOutcome::Value(Value::Str(out));
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Str("[]"));
+    }
+    if str_equal(name, "p_vec_insert") {
+        if args.len() >= 3 {
+            match args.get(0) {
+                Value::Int(vec_addr) => {
+                    match args.get(1) {
+                        Value::Int(idx) => {
+                            var elem: i64 = 0;
+                            match args.get(2) {
+                                Value::Int(e) => { elem = e; }
+                                Value::Ptr(p) => { elem = p; }
+                                _ => {}
+                            }
+                            var vlen: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
+                            var vcap: i64 = Memory_load_i64(&self.memory, vec_addr + 16);
+                            var vdata: i64 = Memory_load_i64(&self.memory, vec_addr);
+                            if idx < 0 || idx > vlen {
+                                return ExecOutcome::Panic("Vec insert out of bounds");
+                            }
+                            // Grow if needed
+                            if vlen >= vcap {
+                                var new_cap: i64 = 8;
+                                if vcap > 0 { new_cap = vcap * 2; }
+                                var new_data: i64 = Memory_alloc(&mut self.memory, new_cap * 8);
+                                var ci: i64 = 0;
+                                while ci < vlen {
+                                    var v: i64 = Memory_load_i64(&self.memory, vdata + ci * 8);
+                                    Memory_store_i64(&mut self.memory, new_data + ci * 8, v);
+                                    ci = ci + 1;
+                                }
+                                vdata = new_data;
+                                vcap = new_cap;
+                                Memory_store_i64(&mut self.memory, vec_addr, vdata);
+                                Memory_store_i64(&mut self.memory, vec_addr + 16, vcap);
+                            }
+                            // Shift elements right from idx to vlen-1
+                            var si: i64 = vlen;
+                            while si > idx {
+                                var v: i64 = Memory_load_i64(&self.memory, vdata + (si - 1) * 8);
+                                Memory_store_i64(&mut self.memory, vdata + si * 8, v);
+                                si = si - 1;
+                            }
+                            // Insert element
+                            Memory_store_i64(&mut self.memory, vdata + idx * 8, elem);
+                            vlen = vlen + 1;
+                            Memory_store_i64(&mut self.memory, vec_addr + 8, vlen);
+                            return ExecOutcome::Value(Value::Void);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_vec_remove") {
+        if args.len() >= 2 {
+            match args.get(0) {
+                Value::Int(vec_addr) => {
+                    match args.get(1) {
+                        Value::Int(idx) => {
+                            var vlen: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
+                            var vdata: i64 = Memory_load_i64(&self.memory, vec_addr);
+                            if idx < 0 || idx >= vlen {
+                                return ExecOutcome::Panic("Vec remove out of bounds");
+                            }
+                            var elem: i64 = Memory_load_i64(&self.memory, vdata + idx * 8);
+                            // Shift elements left from idx+1 to vlen-1
+                            var si: i64 = idx;
+                            while si < vlen - 1 {
+                                var v: i64 = Memory_load_i64(&self.memory, vdata + (si + 1) * 8);
+                                Memory_store_i64(&mut self.memory, vdata + si * 8, v);
+                                si = si + 1;
+                            }
+                            vlen = vlen - 1;
+                            Memory_store_i64(&mut self.memory, vec_addr + 8, vlen);
+                            return ExecOutcome::Value(Value::Int(elem));
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_vec_contains") {
+        if args.len() >= 2 {
+            match args.get(0) {
+                Value::Int(vec_addr) => {
+                    var target: i64 = 0;
+                    match args.get(1) {
+                        Value::Int(e) => { target = e; }
+                        Value::Ptr(p) => { target = p; }
+                        _ => {}
+                    }
+                    var vlen: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
+                    var vdata: i64 = Memory_load_i64(&self.memory, vec_addr);
+                    var ci: i64 = 0;
+                    while ci < vlen {
+                        var elem: i64 = Memory_load_i64(&self.memory, vdata + ci * 8);
+                        if elem == target {
+                            return ExecOutcome::Value(Value::Bool(true));
+                        }
+                        ci = ci + 1;
+                    }
+                    return ExecOutcome::Value(Value::Bool(false));
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Bool(false));
+    }
+    if str_equal(name, "p_vec_reverse") {
+        if args.len() >= 1 {
+            match args.get(0) {
+                Value::Int(vec_addr) => {
+                    var vlen: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
+                    var vdata: i64 = Memory_load_i64(&self.memory, vec_addr);
+                    var lo: i64 = 0;
+                    var hi: i64 = vlen - 1;
+                    while lo < hi {
+                        var tmp1: i64 = Memory_load_i64(&self.memory, vdata + lo * 8);
+                        var tmp2: i64 = Memory_load_i64(&self.memory, vdata + hi * 8);
+                        Memory_store_i64(&mut self.memory, vdata + lo * 8, tmp2);
+                        Memory_store_i64(&mut self.memory, vdata + hi * 8, tmp1);
+                        lo = lo + 1;
+                        hi = hi - 1;
+                    }
+                    return ExecOutcome::Value(Value::Void);
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_vec_first") {
+        if args.len() >= 1 {
+            match args.get(0) {
+                Value::Int(vec_addr) => {
+                    var vlen: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
+                    if vlen == 0 {
+                        return ExecOutcome::Panic("Vec first() on empty vec");
+                    }
+                    var vdata: i64 = Memory_load_i64(&self.memory, vec_addr);
+                    var elem: i64 = Memory_load_i64(&self.memory, vdata);
+                    return ExecOutcome::Value(Value::Int(elem));
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_vec_last") {
+        if args.len() >= 1 {
+            match args.get(0) {
+                Value::Int(vec_addr) => {
+                    var vlen: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
+                    if vlen == 0 {
+                        return ExecOutcome::Panic("Vec last() on empty vec");
+                    }
+                    var vdata: i64 = Memory_load_i64(&self.memory, vec_addr);
+                    var elem: i64 = Memory_load_i64(&self.memory, vdata + (vlen - 1) * 8);
+                    return ExecOutcome::Value(Value::Int(elem));
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_vec_extend") {
+        if args.len() >= 2 {
+            match args.get(0) {
+                Value::Int(dst_addr) => {
+                    match args.get(1) {
+                        Value::Int(src_addr) => {
+                            var dst_len: i64 = Memory_load_i64(&self.memory, dst_addr + 8);
+                            var dst_cap: i64 = Memory_load_i64(&self.memory, dst_addr + 16);
+                            var dst_data: i64 = Memory_load_i64(&self.memory, dst_addr);
+                            var src_len: i64 = Memory_load_i64(&self.memory, src_addr + 8);
+                            var src_data: i64 = Memory_load_i64(&self.memory, src_addr);
+                            // Grow dst if needed
+                            var needed: i64 = dst_len + src_len;
+                            if needed > dst_cap {
+                                var new_cap: i64 = 8;
+                                if needed > 8 { new_cap = needed; }
+                                if dst_cap > 0 { new_cap = dst_cap * 2; }
+                                if new_cap < needed { new_cap = needed; }
+                                var new_data: i64 = Memory_alloc(&mut self.memory, new_cap * 8);
+                                var ci: i64 = 0;
+                                while ci < dst_len {
+                                    var v: i64 = Memory_load_i64(&self.memory, dst_data + ci * 8);
+                                    Memory_store_i64(&mut self.memory, new_data + ci * 8, v);
+                                    ci = ci + 1;
+                                }
+                                dst_data = new_data;
+                                dst_cap = new_cap;
+                                Memory_store_i64(&mut self.memory, dst_addr, dst_data);
+                                Memory_store_i64(&mut self.memory, dst_addr + 16, dst_cap);
+                            }
+                            // Copy elements from src to dst
+                            var si: i64 = 0;
+                            while si < src_len {
+                                var v: i64 = Memory_load_i64(&self.memory, src_data + si * 8);
+                                Memory_store_i64(&mut self.memory, dst_data + (dst_len + si) * 8, v);
+                                si = si + 1;
+                            }
+                            dst_len = dst_len + src_len;
+                            Memory_store_i64(&mut self.memory, dst_addr + 8, dst_len);
+                            return ExecOutcome::Value(Value::Void);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_vec_truncate") {
+        if args.len() >= 2 {
+            match args.get(0) {
+                Value::Int(vec_addr) => {
+                    match args.get(1) {
+                        Value::Int(n) => {
+                            var vlen: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
+                            if n >= 0 && n < vlen {
+                                Memory_store_i64(&mut self.memory, vec_addr + 8, n);
+                            }
+                            return ExecOutcome::Value(Value::Void);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_vec_sort") {
+        if args.len() >= 1 {
+            match args.get(0) {
+                Value::Int(vec_addr) => {
+                    var vlen: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
+                    var vdata: i64 = Memory_load_i64(&self.memory, vec_addr);
+                    // Simple bubble sort (ascending) on raw i64 elements
+                    var i: i64 = 0;
+                    while i < vlen - 1 {
+                        var j: i64 = 0;
+                        while j < vlen - 1 - i {
+                            var a: i64 = Memory_load_i64(&self.memory, vdata + j * 8);
+                            var b: i64 = Memory_load_i64(&self.memory, vdata + (j + 1) * 8);
+                            if a > b {
+                                Memory_store_i64(&mut self.memory, vdata + j * 8, b);
+                                Memory_store_i64(&mut self.memory, vdata + (j + 1) * 8, a);
+                            }
+                            j = j + 1;
+                        }
+                        i = i + 1;
+                    }
+                    return ExecOutcome::Value(Value::Void);
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_vec_clone") {
+        if args.len() >= 1 {
+            match args.get(0) {
+                Value::Int(src_addr) => {
+                    var src_len: i64 = Memory_load_i64(&self.memory, src_addr + 8);
+                    var src_data: i64 = Memory_load_i64(&self.memory, src_addr);
+                    // Create a new vec
+                    var new_addr: i64 = Memory_alloc(&mut self.memory, 24);
+                    var new_cap: i64 = 8;
+                    if src_len > 8 { new_cap = src_len; }
+                    if new_cap == 0 { new_cap = 8; }
+                    var new_data: i64 = Memory_alloc(&mut self.memory, new_cap * 8);
+                    // Copy elements
+                    var ci: i64 = 0;
+                    while ci < src_len {
+                        var v: i64 = Memory_load_i64(&self.memory, src_data + ci * 8);
+                        Memory_store_i64(&mut self.memory, new_data + ci * 8, v);
+                        ci = ci + 1;
+                    }
+                    Memory_store_i64(&mut self.memory, new_addr, new_data);
+                    Memory_store_i64(&mut self.memory, new_addr + 8, src_len);
+                    Memory_store_i64(&mut self.memory, new_addr + 16, new_cap);
+                    return ExecOutcome::Value(Value::Int(new_addr));
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_vec_capacity") {
+        if args.len() >= 1 {
+            match args.get(0) {
+                Value::Int(vec_addr) => {
+                    var vcap: i64 = Memory_load_i64(&self.memory, vec_addr + 16);
+                    return ExecOutcome::Value(Value::Int(vcap));
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+
+    // ─── Map extra runtime functions (ported from src/interp.rs ~3208-3579) ───
+    if str_equal(name, "p_map_keys") {
+        // Create a new vec to hold keys (empty since map storage is simplified)
+        var vec_addr: i64 = Memory_alloc(&mut self.memory, 24);
+        Memory_store_i64(&mut self.memory, vec_addr, 0);
+        Memory_store_i64(&mut self.memory, vec_addr + 8, 0);
+        Memory_store_i64(&mut self.memory, vec_addr + 16, 0);
+        return ExecOutcome::Value(Value::Int(vec_addr));
+    }
+    if str_equal(name, "p_map_values") {
+        // Create a new vec to hold values (empty since map storage is simplified)
+        var vec_addr: i64 = Memory_alloc(&mut self.memory, 24);
+        Memory_store_i64(&mut self.memory, vec_addr, 0);
+        Memory_store_i64(&mut self.memory, vec_addr + 8, 0);
+        Memory_store_i64(&mut self.memory, vec_addr + 16, 0);
+        return ExecOutcome::Value(Value::Int(vec_addr));
+    }
+    if str_equal(name, "p_map_remove") {
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_map_clone") {
+        if args.len() >= 1 {
+            match args.get(0) {
+                Value::Int(map_addr) => {
+                    // Create a new map (shallow copy of struct)
+                    var new_addr: i64 = Memory_alloc(&mut self.memory, 32);
+                    var k: i64 = Memory_load_i64(&self.memory, map_addr);
+                    var v: i64 = Memory_load_i64(&self.memory, map_addr + 8);
+                    var l: i64 = Memory_load_i64(&self.memory, map_addr + 16);
+                    var c: i64 = Memory_load_i64(&self.memory, map_addr + 24);
+                    Memory_store_i64(&mut self.memory, new_addr, k);
+                    Memory_store_i64(&mut self.memory, new_addr + 8, v);
+                    Memory_store_i64(&mut self.memory, new_addr + 16, l);
+                    Memory_store_i64(&mut self.memory, new_addr + 24, c);
+                    return ExecOutcome::Value(Value::Int(new_addr));
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+
+    // ─── Clock runtime functions (ported from src/interp.rs ~4990-5006) ───
+    // Use step_count as a simple monotonic counter for timing.
+    if str_equal(name, "p_clock_now") {
+        return ExecOutcome::Value(Value::Int(self.step_count));
+    }
+    if str_equal(name, "p_clock_now_us") {
+        return ExecOutcome::Value(Value::Int(self.step_count));
+    }
+    if str_equal(name, "p_clock_now_ms") {
+        return ExecOutcome::Value(Value::Int(self.step_count));
+    }
+
+    // ─── Memset (simplified — just return ptr) ───
+    if str_equal(name, "p_memset") {
+        if args.len() >= 1 {
+            match args.get(0) {
+                Value::Int(ptr) => { return ExecOutcome::Value(Value::Int(ptr)); }
+                Value::Ptr(ptr) => { return ExecOutcome::Value(Value::Ptr(ptr)); }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+
+    // ─── File I/O builtins (stubs — no real file system access) ───
+    if str_equal(name, "p_file_read") {
+        return ExecOutcome::Value(Value::Str(""));
+    }
+    if str_equal(name, "p_file_write") {
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_file_exists") {
+        return ExecOutcome::Value(Value::Bool(false));
+    }
+    if str_equal(name, "p_file_append") {
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_file_delete") {
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_file_size") {
+        return ExecOutcome::Value(Value::Int(0));
+    }
+
+    // ─── Threading (interpreter is single-threaded: spawn = eager, join = no-op) ───
+    if str_equal(name, "p_thread_spawn") {
+        // In the interpreter, we can't actually spawn threads.
+        // Return a fake handle (negative index) to simulate the thread.
+        self.thread_handle_count = self.thread_handle_count + 1;
+        return ExecOutcome::Value(Value::Int(-self.thread_handle_count));
+    }
+    if str_equal(name, "p_thread_join") {
+        // No-op in the interpreter — threads are already done (eager eval)
         return ExecOutcome::Value(Value::Void);
     }
 

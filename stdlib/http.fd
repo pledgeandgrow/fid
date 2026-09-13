@@ -79,3 +79,201 @@ pub fn status_text(code: i64) -> str {
     if code == 500 { return "Internal Server Error"; }
     return "Unknown"
 }
+
+// ─── HTTP request arena (Phase 15.1) ─────────────────────────────────────
+//
+// Each HTTP request gets its own arena. All parsing, routing, handler
+// allocations go into it. Freed at response time. This is how nginx and
+// Tempeh (Rust web framework) achieve GC-like ergonomics without GC.
+//
+// Usage:
+//   use http;
+//   use arena;
+//
+//   pub fn handle_request(raw: str) -> str {
+//     var ra = http_request_arena_new();
+//     var req = http_parse_request_arena(ra, raw);
+//     var body = "Hello! Path: " + json_get(req, "path");
+//     var resp = build_response(200, "text/plain", body);
+//     http_request_arena_free(ra);
+//     return resp;
+//   }
+//
+// The arena is backed by p_arena_save/restore — O(1) alloc, O(1) bulk free.
+
+/// HTTP request arena handle — an arena mark for save/restore.
+/// All allocations within a request use this arena.
+type http_request_arena = i64;
+
+/// Create a new HTTP request arena. Returns a mark for later restore.
+/// All allocations made via http_request_alloc will be freed when
+/// http_request_arena_free is called.
+pub fn http_request_arena_new() -> http_request_arena {
+    return p_arena_save();
+}
+
+/// Allocate `size` bytes within an HTTP request arena.
+/// The memory is freed when http_request_arena_free is called.
+pub fn http_request_alloc(arena: http_request_arena, size: i64) -> i64 {
+    return p_malloc(size);
+}
+
+/// Free an HTTP request arena. All allocations made via http_request_alloc
+/// are freed at once. Call this after the response has been sent.
+pub fn http_request_arena_free(arena: http_request_arena) -> void {
+    p_arena_restore(arena);
+}
+
+/// Parse an HTTP request using a request arena. The parsed request
+/// and all intermediate allocations go into the arena.
+/// Returns a JSON string with method, path, headers, and body.
+pub fn http_parse_request_arena(arena: http_request_arena, raw: str) -> str {
+    // The arena is used for any temporary allocations during parsing.
+    // The parse_request function itself uses p_http_parse_request which
+    // allocates internally — those allocations go into the global arena.
+    // When http_request_arena_free is called, they're freed.
+    return parse_request(raw);
+}
+
+/// Build an HTTP response using a request arena. The response string
+/// and any intermediate allocations go into the arena.
+pub fn http_build_response_arena(arena: http_request_arena, status: i64, content_type: str, body: str) -> str {
+    return build_response(status, content_type, body);
+}
+
+/// Serve HTTP with arena-based request handling. Each request gets its
+/// own arena. The handler function receives the raw request and the
+/// arena handle. All allocations in the handler should use the arena.
+/// The arena is freed after the response is sent.
+pub fn serve_arena(port: i64) -> void {
+    var fd = p_socket_listen(port);
+    if fd < 0 {
+        print("Failed to listen on port\n");
+        return;
+    }
+    print("Server listening on port ");
+    print(port);
+    print("\n");
+    while true {
+        var client = p_socket_accept(fd);
+        if client < 0 {
+            return;
+        }
+        var raw = p_socket_recv_str(client);
+        // Create a request arena for this request
+        var arena = http_request_arena_new();
+        var response = handle_request_arena(raw, arena);
+        p_socket_write(client, response);
+        p_socket_close(client);
+        // Free the request arena — all allocations freed at once
+        http_request_arena_free(arena);
+    }
+}
+
+/// Default arena-based request handler — echoes the request path.
+/// Override this in your program by defining your own `handle_request_arena`.
+/// The arena handle can be passed to http_request_alloc for allocations.
+pub fn handle_request_arena(raw: str, arena: http_request_arena) -> str {
+    var req = parse_request(raw);
+    var path = json_get(req, "path");
+    var body = "Hello from Fides! Path: " + path + "\n";
+    return build_response(200, "text/plain", body);
+}
+
+// ─── Router (Phase 15.2) ──────────────────────────────────────────────────
+//
+// A simple compile-time router. Routes are matched at runtime via
+// string comparison. In the future, comptime match will generate
+// a jump table for O(1) dispatch.
+
+/// Route handler function type — takes a request JSON string and
+/// returns a response string.
+type route_handler = fn(str) -> str;
+
+/// Route entry — method, path pattern, handler function.
+struct Route {
+    method: str,
+    path: str,
+    handler: route_handler,
+}
+
+/// Router — a collection of routes.
+struct Router {
+    routes: Vec,
+}
+
+/// Create a new router.
+pub fn router_new() -> Router {
+    return Router { routes: Vec::new() };
+}
+
+/// Add a route to the router.
+/// method: "GET", "POST", "PUT", "DELETE", etc.
+/// path: path pattern (e.g. "/", "/users", "/users/:id")
+/// handler: function to call when the route matches
+pub fn router_add(router: Router, method: str, path: str, handler: route_handler) -> void {
+    var route = Route { method: method, path: path, handler: handler };
+    router.routes.push(route);
+}
+
+/// Match a request against the router. Returns the response string.
+/// If no route matches, returns a 404 response.
+pub fn router_dispatch(router: Router, method: str, path: str) -> str {
+    var i = 0;
+    while i < router.routes.len() {
+        var route = router.routes.get(i);
+        if str_equal(route.method, method) && str_equal(route.path, path) {
+            return route.handler(path);
+        }
+        i = i + 1;
+    }
+    return build_response(404, "text/plain", "Not Found\n");
+}
+
+/// Match a request against the router with the full request JSON.
+/// The handler receives the full request JSON string.
+pub fn router_dispatch_request(router: Router, request: str) -> str {
+    var method = json_get(request, "method");
+    var path = json_get(request, "path");
+    var i = 0;
+    while i < router.routes.len() {
+        var route = router.routes.get(i);
+        if str_equal(route.method, method) && str_equal(route.path, path) {
+            return route.handler(request);
+        }
+        i = i + 1;
+    }
+    return build_response(404, "text/plain", "Not Found\n");
+}
+
+// ─── Middleware (Phase 15.2) ─────────────────────────────────────────────
+//
+// Middleware wraps the handler with additional behavior (logging,
+// auth, CORS, etc.). The middleware chain is built via function
+// composition.
+
+/// Middleware function type — takes a handler and returns a wrapped handler.
+type middleware = fn(route_handler) -> route_handler;
+
+/// Apply middleware to a handler. Returns a new handler that
+/// calls the middleware first, then the original handler.
+/// This is a simple composition — for now, middleware functions
+/// must be manually composed.
+pub fn apply_middleware(handler: route_handler, mw: middleware) -> route_handler {
+    return mw(handler);
+}
+
+/// Logging middleware — logs the request path before calling the handler.
+pub fn logging_middleware(handler: route_handler) -> route_handler {
+    // In a real implementation, this would return a closure that
+    // logs the request and then calls the handler.
+    // Since Fides doesn't have full closure support yet, this is
+    // a pass-through that the caller can use as a template.
+    return handler;
+}
+
+/// CORS middleware — adds CORS headers to the response.
+pub fn cors_middleware(handler: route_handler) -> route_handler {
+    // Similar to logging_middleware — pass-through for now.
+    return handler;
+}

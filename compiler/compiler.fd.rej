@@ -1,0 +1,134 @@
+diff a/compiler/compiler.fd b/compiler/compiler.fd	(rejected hunks)
+@@ -204,6 +205,67 @@ fn cached_lex(token_cache: &mut Vec<PathTokens>, content_cache: &mut Vec<PathCon
+     return toks;
+ }
+ 
++/// Cache entry: file path -> parsed Program (avoids re-parsing).
++/// This is the parse cache for imports — on a cache hit, the already-parsed
++/// AST is reused, skipping both lexing and parsing entirely.
++pub struct PathProgram {
++    pub path: str,
++    pub program: Program,
++}
++
++pub fn PathProgram_new(path: str, program: Program) -> PathProgram {
++    return PathProgram { path: path, program: program };
++}
++
++/// Global parse cache for imported modules. Persists across ccompile calls
++/// within a single process. Keyed by file path. On a cache hit, the parsed
++/// Program is reused — no file read, no lex, no parse.
++/// This is the biggest win for repeated compilations: the 52-module compiler
++/// has ~50 imports that get re-parsed on every ccompile call. With this cache,
++/// only the first compilation parses them; subsequent calls skip all parsing.
++pub var g_parse_cache: Vec<PathProgram> = Vec::new();
++var g_parse_cache_init: bool = false;
++
++/// Look up a cached parsed Program by file path.
++/// Returns OptProgram::Some(program) on hit, OptProgram::None on miss.
++pub fn parse_cache_get(path: str) -> OptProgram {
++    if !g_parse_cache_init { return OptProgram::None; }
++    var i: i64 = 0;
++    while i < g_parse_cache.len() {
++        if str_equal(g_parse_cache.get(i).path, path) {
++            return OptProgram::Some(g_parse_cache.get(i).program);
++        }
++        i = i + 1;
++    }
++    return OptProgram::None;
++}
++
++/// Store a parsed Program in the global parse cache.
++pub fn parse_cache_store(path: str, program: Program) -> void {
++    if !g_parse_cache_init {
++        g_parse_cache = Vec::new();
++        g_parse_cache_init = true;
++    }
++    // Check if path already cached — replace if so
++    var i: i64 = 0;
++    while i < g_parse_cache.len() {
++        if str_equal(g_parse_cache.get(i).path, path) {
++            g_parse_cache.set(i, PathProgram_new(path, program));
++            return;
++        }
++        i = i + 1;
++    }
++    g_parse_cache.push(PathProgram_new(path, program));
++}
++
++/// Clear the global parse cache (e.g., when file content may have changed).
++pub fn parse_cache_clear() -> void {
++    while g_parse_cache.len() > 0 {
++        g_parse_cache.pop();
++    }
++    g_parse_cache_init = false;
++}
++
+ pub struct I64Pair {
+     pub first: i64,
+     pub second: i64,
+@@ -1028,7 +1091,63 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
+                             }
+ 
+                             if found {
+-                                // OPTIMIZATION: use cached file read + cached lex
++                                // OPTIMIZATION (parse cache): check global parse cache first.
++                                // On a cache hit, skip file read + lex + parse entirely.
++                                // This is the biggest win for repeated compilations: the
++                                // 52-module compiler has ~50 imports that get re-parsed on
++                                // every ccompile call. With this cache, only the first
++                                // compilation parses them.
++                                match parse_cache_get(found_path) {
++                                    OptProgram::Some(cached_prog) => {
++                                        // Cache hit — reuse parsed Program directly
++                                        var mod_name: str = import_path;
++                                        match cached_prog.module {
++                                            OptStr::Some(mn) => { mod_name = mn; }
++                                            OptStr::None => { }
++                                        }
++                                        loaded_module_names.push(import_path);
++                                        loaded_module_names.push(mod_name);
++                                        HashMap_insert(loaded_module_set, import_path, 1);
++                                        HashMap_insert(loaded_module_set, mod_name, 1);
++
++                                        // Add type names from cached program
++                                        var si_c: i64 = 0;
++                                        while si_c < cached_prog.structs.len() {
++                                            var sn_c: str = cached_prog.structs.get(si_c).name;
++                                            if HashMap_get(struct_name_set, sn_c) == 0 {
++                                                struct_names.push(sn_c);
++                                                HashMap_insert(struct_name_set, sn_c, 1);
++                                            }
++                                            si_c = si_c + 1;
++                                        }
++                                        var ei_c: i64 = 0;
++                                        while ei_c < cached_prog.enums.len() {
++                                            var en_c: str = cached_prog.enums.get(ei_c).name;
++                                            if HashMap_get(enum_name_set, en_c) == 0 {
++                                                enum_names.push(en_c);
++                                                HashMap_insert(enum_name_set, en_c, 1);
++                                            }
++                                            ei_c = ei_c + 1;
++                                        }
++
++                                        // Add transitive imports
++                                        var ti_c: i64 = 0;
++                                        while ti_c < cached_prog.imports.len() {
++                                            var tpath_c: str = cached_prog.imports.get(ti_c).path;
++                                            if HashMap_get(loaded_module_set, tpath_c) == 0 {
++                                                imports_to_process.push(tpath_c);
++                                            }
++                                            ti_c = ti_c + 1;
++                                        }
++
++                                        imported_modules.push(cached_prog);
++                                        imported_module_names.push(mod_name);
++                                        continue;
++                                    }
++                                    OptProgram::None => { }
++                                }
++
++                                // Cache miss — parse the module
+                                 var module_source: str = cached_file_read(&mut content_cache, found_path);
+                                 var pre_toks: Vec<Token> = cached_lex(&mut token_cache, &mut content_cache, found_path);
+ 

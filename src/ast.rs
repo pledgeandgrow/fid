@@ -483,6 +483,14 @@ pub enum Stmt {
         args: Vec<Expr>,
         line: usize,
     },
+    /// Resume a continuation: `resume(cont, value)` — calls the continuation
+    /// captured by the enclosing effect handler with the given value.
+    /// L3A: Full continuation semantics for effect handlers.
+    Resume {
+        cont: Expr,
+        value: Expr,
+        line: usize,
+    },
     /// Region block: `region r { body }` — creates a named region,
     /// allocates within it, and frees it at the end of the block.
     /// References to region-allocated data cannot escape the block.
@@ -627,6 +635,7 @@ impl Stmt {
             | Stmt::Use { line, .. }
             | Stmt::Handle { line, .. }
             | Stmt::Do { line, .. }
+            | Stmt::Resume { line, .. }
             | Stmt::RegionBlock { line, .. }
             | Stmt::Sandbox { line, .. }
             | Stmt::Unsafe { line, .. }

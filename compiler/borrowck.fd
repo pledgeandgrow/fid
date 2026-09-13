@@ -145,6 +145,8 @@ pub fn box_expr_unbox(b: Box<Expr>) -> Expr {
         Expr::QuantCast(e, ty) => { return Expr::QuantCast(e, ty); }
         Expr::Await(e) => { return Expr::Await(e); }
         Expr::Spawn(e) => { return Expr::Spawn(e); }
+        Expr::Yield(e) => { return Expr::Yield(e); }
+        Expr::NamedArg(name, e) => { return Expr::NamedArg(name, e); }
     }
     return Expr::IntLit(0);
 }
@@ -355,7 +357,7 @@ fn compute_last_use(self: &mut BorrowChecker, body: Vec<Stmt>) -> void {
 // their last-use index.
 fn collect_var_uses_stmt(self: &mut BorrowChecker, stmt: Stmt, idx: i64) -> void {
     match stmt {
-        Stmt::Let(name, _, expr, _, _, _) => {
+        Stmt::Let(name, _, expr, _, _, _, _) => {
             collect_var_uses_expr(self, expr, idx);
             // Do NOT set last_use for the defined name -- a definition is
             // not a "use" in NLL.  The borrow should persist until the
@@ -366,7 +368,7 @@ fn collect_var_uses_stmt(self: &mut BorrowChecker, stmt: Stmt, idx: i64) -> void
             collect_var_uses_expr(self, expr, idx);
             // Do NOT set last_use for the defined names (same reasoning).
         }
-        Stmt::LetUninit(name, _, _) => {
+        Stmt::LetUninit(name, _, _, _) => {
             // Do NOT set last_use -- the variable is declared but not used.
         }
         Stmt::Assign(target, _, expr, _) => {
@@ -579,6 +581,18 @@ fn collect_var_uses_stmt(self: &mut BorrowChecker, stmt: Stmt, idx: i64) -> void
                 OptStmts::None => {}
             }
         }
+        Stmt::Parallel(branches, _) => {
+            var bi: i64 = 0;
+            while bi < branches.len() {
+                var branch: Vec<Stmt> = branches.get(bi);
+                var si: i64 = 0;
+                while si < branch.len() {
+                    collect_var_uses_stmt(self, branch.get(si), idx);
+                    si = si + 1;
+                }
+                bi = bi + 1;
+            }
+        }
     }
 }
 
@@ -723,6 +737,8 @@ fn collect_var_uses_expr(self: &mut BorrowChecker, expr: Expr, idx: i64) -> void
         }
         Expr::Await(e) => { collect_var_uses_expr(self, box_expr_unbox(e), idx); }
         Expr::Spawn(e) => { collect_var_uses_expr(self, box_expr_unbox(e), idx); }
+        Expr::Yield(e) => { collect_var_uses_expr(self, box_expr_unbox(e), idx); }
+        Expr::NamedArg(name, e) => { collect_var_uses_expr(self, box_expr_unbox(e), idx); }
         _ => {}
     }
 }
@@ -1240,7 +1256,7 @@ fn violation(self: &mut BorrowChecker, line: i64, msg: str) -> void {
 
 fn check_stmt(self: &mut BorrowChecker, stmt: Stmt) -> void {
     match stmt {
-        Stmt::Let(name, _, expr, _, _, line) => {
+        Stmt::Let(name, _, expr, _, _, _, line) => {
             // Check the initializer first (it may borrow from other vars).
             check_expr(self, expr);
             // Then declare the new variable (releases any old borrow it held).
@@ -1256,7 +1272,7 @@ fn check_stmt(self: &mut BorrowChecker, stmt: Stmt) -> void {
                 n = n + 1;
             }
         }
-        Stmt::LetUninit(name, _, _) => {
+        Stmt::LetUninit(name, _, _, _) => {
             declare_var(self, name);
         }
         Stmt::Assign(target, _, expr, line) => {
@@ -1517,6 +1533,20 @@ fn check_stmt(self: &mut BorrowChecker, stmt: Stmt) -> void {
                 OptStmts::None => {}
             }
         }
+        Stmt::Parallel(branches, _) => {
+            var bi: i64 = 0;
+            while bi < branches.len() {
+                var branch: Vec<Stmt> = branches.get(bi);
+                push_scope(self);
+                var si: i64 = 0;
+                while si < branch.len() {
+                    check_stmt(self, branch.get(si));
+                    si = si + 1;
+                }
+                pop_scope(self);
+                bi = bi + 1;
+            }
+        }
     }
 }
 
@@ -1734,6 +1764,8 @@ fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
         }
         Expr::Await(e) => { check_expr(self, box_expr_unbox(e)); }
         Expr::Spawn(e) => { check_expr(self, box_expr_unbox(e)); }
+        Expr::Yield(e) => { check_expr(self, box_expr_unbox(e)); }
+        Expr::NamedArg(name, e) => { check_expr(self, box_expr_unbox(e)); }
         Expr::Closure(_, body, _) => {
             // Closures capture variables from the enclosing scope. Check the
             // body in a new scope -- captured variables are treated as
@@ -1875,7 +1907,7 @@ pub fn str_to_lower(s: str) -> str {
 // locally-declared variables). These are closure captures.
 fn collect_captures_stmt_fd(stmt: Stmt, captured: &mut Vec<str>) -> void {
     match stmt {
-        Stmt::Let(_, _, expr, _, _, _) => {
+        Stmt::Let(_, _, expr, _, _, _, _) => {
             collect_captures_expr_fd(expr, captured);
         }
         Stmt::Assign(target, _, expr, _) => {

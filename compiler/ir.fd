@@ -76,6 +76,15 @@ pub fn ValueIdString_new(id: i64, name: str) -> ValueIdString {
     return ValueIdString { id: id, name: name };
 }
 
+pub struct ValueIdU64 {
+    pub id: i64,
+    pub val: i64,
+}
+
+pub fn ValueIdU64_new(id: i64, val: i64) -> ValueIdU64 {
+    return ValueIdU64 { id: id, val: val };
+}
+
 pub struct StringVecIrType {
     pub name: str,
     pub params: Vec<IrType>,
@@ -1060,6 +1069,9 @@ pub enum Inst {
     GradBegin(str),
     GradEnd,
     Backward(i64),
+
+    // --- Struct Copy ---
+    StructCopy(i64, i64, IrType),  // (dst, src, ty) — memcpy struct by value
 }
 
 // --- Inst methods --------------------------------------------------------
@@ -1108,6 +1120,7 @@ pub fn inst_result_type(inst: Inst) -> IrType {
         Inst::GradBegin(_) => { return IrType::Void; }
         Inst::GradEnd => { return IrType::Void; }
         Inst::Backward(_) => { return IrType::Void; }
+        Inst::StructCopy(_, _, _) => { return IrType::Void; }
     }
     return IrType::Void;
 }
@@ -1361,6 +1374,8 @@ pub struct IrFunction {
     pub is_medical: bool,
     pub is_kernel: bool,
     pub workgroup_size: Vec<i64>,
+    pub is_simd: bool,           // F23: @simd — aggressive loop vectorization
+    pub zeroize_locals: Vec<ValueIdU64>,  // F88: @zeroize — locals to zero at scope exit
 }
 
 pub struct ValueIdMeta {
@@ -1407,6 +1422,8 @@ pub fn IrFunction_new(name: str, ret_ty: IrType) -> IrFunction {
         is_medical: false,
         is_kernel: false,
         workgroup_size: Vec::new(),
+        is_simd: false,
+        zeroize_locals: Vec::new(),
     };
     func.workgroup_size.push(1);
     func.workgroup_size.push(1);

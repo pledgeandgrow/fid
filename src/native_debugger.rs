@@ -16,7 +16,6 @@
 //!   backtrace              — show call stack (from debug info)
 //!   quit                   — exit debugger
 
-use std::io::{self, BufRead, Write};
 use std::process::Command;
 
 /// Native debugger state

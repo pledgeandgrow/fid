@@ -37,6 +37,7 @@ use compiler::comptime_eval;
 use compiler::pe;
 use compiler::inc;
 use compiler::interp;
+use compiler::green_thread;
 use compiler::elf64;
 use compiler::linker;
 use compiler::runtime_linux;
@@ -799,6 +800,7 @@ pub fn build_program_no_std(source: str, source_path: OptStr) -> ResultProgram {
 
             // Apply desugar and default trait methods
             desugar_layers_models(&mut program);
+            desugar_phase8b(&mut program);
             program = process_gen(program);
             fill_default_trait_methods(&mut program);
 
@@ -1127,74 +1129,70 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                                             continue;
                                         }
 
-                                        // All deps loaded -- full parse with all names
-                                        // OPTIMIZATION: reuse cached tokens (pre_toks) -- tokens
-                                        // don't depend on name sets, only parsing does.
-                                        var p2: Parser = Parser_with_names(pre_toks, struct_names, enum_names);
-                                        var full_result: ParseResultProgram = p2.parse();
+                                        // All deps loaded — reuse pre-scan result as the
+                                        // final parse. The pre-scan already parsed the
+                                        // module successfully; the only difference between
+                                        // pre-scan and full parse is the name sets, but a
+                                        // module rarely needs its own type names
+                                        // pre-registered to parse correctly (the pre-scan
+                                        // already succeeded without them).
+                                        // OPTIMIZATION: this eliminates the second parse
+                                        // (pre-scan + full → just pre-scan), cutting parse
+                                        // time in half for the import phase.
+                                        var imported: Program = pre_prog;
 
-                                        match full_result {
-                                            ParseResultProgram::Ok(imported) => {
-                                                var mod_name: str = import_path;
-                                                match imported.module {
-                                                    OptStr::Some(mn) => { mod_name = mn; }
-                                                    OptStr::None => { }
-                                                }
-                                                loaded_module_names.push(import_path);
-                                                loaded_module_names.push(mod_name);
-                                                HashMap_insert(loaded_module_set, import_path, 1);
-                                                HashMap_insert(loaded_module_set, mod_name, 1);
-
-                                                // Clear from deferred set -- successfully loaded
-                                                var deferred_idx: i64 = 0;
-                                                while deferred_idx < currently_deferred.len() {
-                                                    if str_equal(currently_deferred.get(deferred_idx), import_path) {
-                                                        currently_deferred.remove(deferred_idx);
-                                                        break;
-                                                    }
-                                                    deferred_idx = deferred_idx + 1;
-                                                }
-
-                                                // Extract names for future imports
-                                                var si2: i64 = 0;
-                                                while si2 < imported.structs.len() {
-                                                    var sn2: str = imported.structs.get(si2).name;
-                                                    if HashMap_get(struct_name_set, sn2) == 0 {
-                                                        struct_names.push(sn2);
-                                                        HashMap_insert(struct_name_set, sn2, 1);
-                                                    }
-                                                    si2 = si2 + 1;
-                                                }
-                                                var ei2: i64 = 0;
-                                                while ei2 < imported.enums.len() {
-                                                    var en2: str = imported.enums.get(ei2).name;
-                                                    if HashMap_get(enum_name_set, en2) == 0 {
-                                                        enum_names.push(en2);
-                                                        HashMap_insert(enum_name_set, en2, 1);
-                                                    }
-                                                    ei2 = ei2 + 1;
-                                                }
-
-                                                // Add transitive imports
-                                                var ti: i64 = 0;
-                                                while ti < imported.imports.len() {
-                                                    var tpath: str = imported.imports.get(ti).path;
-                                                    if HashMap_get(loaded_module_set, tpath) == 0 {
-                                                        imports_to_process.push(tpath);
-                                                    }
-                                                    ti = ti + 1;
-                                                }
-
-                                                imported_modules.push(imported);
-                                                imported_module_names.push(mod_name);
-                                            }
-                                            ParseResultProgram::Err(errs) => {
-                                                // Full parse failed -- return error (do not silently skip)
-                                                var err_msg: str = "Import error: failed to parse module '" + import_path + "'";
-                                                err_msg = err_msg + ": " + errs;
-                                                return ResultProgram::Err(c_vec1(err_msg));
-                                            }
+                                        var mod_name: str = import_path;
+                                        match imported.module {
+                                            OptStr::Some(mn) => { mod_name = mn; }
+                                            OptStr::None => { }
                                         }
+                                        loaded_module_names.push(import_path);
+                                        loaded_module_names.push(mod_name);
+                                        HashMap_insert(loaded_module_set, import_path, 1);
+                                        HashMap_insert(loaded_module_set, mod_name, 1);
+
+                                        // Clear from deferred set -- successfully loaded
+                                        var deferred_idx: i64 = 0;
+                                        while deferred_idx < currently_deferred.len() {
+                                            if str_equal(currently_deferred.get(deferred_idx), import_path) {
+                                                currently_deferred.remove(deferred_idx);
+                                                break;
+                                            }
+                                            deferred_idx = deferred_idx + 1;
+                                        }
+
+                                        // Extract names for future imports
+                                        var si2: i64 = 0;
+                                        while si2 < imported.structs.len() {
+                                            var sn2: str = imported.structs.get(si2).name;
+                                            if HashMap_get(struct_name_set, sn2) == 0 {
+                                                struct_names.push(sn2);
+                                                HashMap_insert(struct_name_set, sn2, 1);
+                                            }
+                                            si2 = si2 + 1;
+                                        }
+                                        var ei2: i64 = 0;
+                                        while ei2 < imported.enums.len() {
+                                            var en2: str = imported.enums.get(ei2).name;
+                                            if HashMap_get(enum_name_set, en2) == 0 {
+                                                enum_names.push(en2);
+                                                HashMap_insert(enum_name_set, en2, 1);
+                                            }
+                                            ei2 = ei2 + 1;
+                                        }
+
+                                        // Add transitive imports
+                                        var ti: i64 = 0;
+                                        while ti < imported.imports.len() {
+                                            var tpath: str = imported.imports.get(ti).path;
+                                            if HashMap_get(loaded_module_set, tpath) == 0 {
+                                                imports_to_process.push(tpath);
+                                            }
+                                            ti = ti + 1;
+                                        }
+
+                                        imported_modules.push(imported);
+                                        imported_module_names.push(mod_name);
                                     }
                                     OptProgram::None => {
                                         // Pre-scan failed -- try full parse directly
@@ -1262,6 +1260,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
 
                     // Desugar layer/model declarations
                     desugar_layers_models(&mut program);
+                    desugar_phase8b(&mut program);
 
                     // Comptime: process gen blocks (before typechecking so generated code is visible)
                     program = process_gen(program);
@@ -2311,6 +2310,108 @@ pub fn desugar_layers_models(program: &mut Program) {
     program.models = empty_models;
 }
 
+// ===========================================================================
+// desugar_phase8b -- desugar components, event handlers, state machines
+// ===========================================================================
+
+/// Desugar F18 components → structs, F20 event handlers → functions,
+/// F19 state machines → enum + initial/handle functions.
+pub fn desugar_phase8b(program: &mut Program) {
+    // F18: Desugar components → structs
+    var ci: i64 = 0;
+    while ci < program.components.len() {
+        var comp: ComponentDef = program.components.get(ci);
+        var new_struct: StructDef = StructDef_new_full(comp.name, comp.fields, comp.is_pub, Vec::new(), Vec::new());
+        program.structs.push(new_struct);
+        ci = ci + 1;
+    }
+    var empty_comps: Vec<ComponentDef> = Vec::new();
+    program.components = empty_comps;
+
+    // F20: Desugar event handlers → functions
+    var ei: i64 = 0;
+    while ei < program.event_handlers.len() {
+        var eh: EventHandlerDef = program.event_handlers.get(ei);
+        var func_name: str = str_concat("__on_", eh.event_name);
+        program.funcs.push(Func_new_full(func_name, eh.params, Type::Void, eh.body, eh.is_pub));
+        ei = ei + 1;
+    }
+    var empty_ehs: Vec<EventHandlerDef> = Vec::new();
+    program.event_handlers = empty_ehs;
+
+    // F19: Desugar state machines → enum + initial/handle functions
+    var si: i64 = 0;
+    while si < program.state_machines.len() {
+        var sm: StateMachineDef = program.state_machines.get(si);
+        var sm_name: str = sm.name;
+
+        // Create enum with one variant per state (no data)
+        var variants: Vec<EnumVariant> = Vec::new();
+        var sti: i64 = 0;
+        while sti < sm.states.len() {
+            var state: StateDef = sm.states.get(sti);
+            variants.push(EnumVariant_new(state.name, OptParams::None));
+            sti = sti + 1;
+        }
+        program.enums.push(EnumDef_new(sm_name, variants, sm.is_pub));
+
+        // Create <SM>_initial() function — returns first state
+        var first_state: str = "Error";
+        if sm.states.len() > 0 {
+            first_state = sm.states.get(0).name;
+        }
+        var initial_name: str = str_concat(sm_name, "_initial");
+        var initial_body: Vec<Stmt> = Vec::new();
+        var initial_args: Vec<Expr> = Vec::new();
+        initial_body.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::EnumLit(sm_name, first_state, initial_args))), 0));
+        program.funcs.push(Func_new_full(initial_name, Vec::new(), Type::Named(sm_name), initial_body, sm.is_pub));
+
+        // Create <SM>_handle(state, event) -> state function
+        var handle_name: str = str_concat(sm_name, "_handle");
+        var arms: Vec<MatchArm> = Vec::new();
+        var si2: i64 = 0;
+        while si2 < sm.states.len() {
+            var state: StateDef = sm.states.get(si2);
+            // Pattern: StateName
+            var pattern: Pattern = Pattern::EnumVariant(sm_name, state.name, Vec::new());
+            // Body: match on event string
+            var event_arms: Vec<MatchArm> = Vec::new();
+            var ti: i64 = 0;
+            while ti < state.transitions.len() {
+                var trans: StateTransition = state.transitions.get(ti);
+                var trans_body: Vec<Stmt> = Vec::new();
+                var trans_args: Vec<Expr> = Vec::new();
+                trans_body.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::EnumLit(sm_name, trans.target, trans_args))), 0));
+                event_arms.push(MatchArm_new(Pattern::StrLit(trans.event), OptBoxExpr::None, trans_body));
+                ti = ti + 1;
+            }
+            // Default arm: return current state (no transition)
+            var default_body: Vec<Stmt> = Vec::new();
+            default_body.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::Ident("__state"))), 0));
+            event_arms.push(MatchArm_new(Pattern::Wildcard, OptBoxExpr::None, default_body));
+            var inner_body: Vec<Stmt> = Vec::new();
+            inner_body.push(Stmt::Match(Expr::Ident("__event_type"), event_arms, 0));
+            arms.push(MatchArm_new(pattern, OptBoxExpr::None, inner_body));
+            si2 = si2 + 1;
+        }
+        // Default arm for unknown state
+        var unk_body: Vec<Stmt> = Vec::new();
+        unk_body.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::Ident("__state"))), 0));
+        arms.push(MatchArm_new(Pattern::Wildcard, OptBoxExpr::None, unk_body));
+
+        var handle_params: Vec<Param> = Vec::new();
+        handle_params.push(Param_new("__state", Type::Named(sm_name), false));
+        handle_params.push(Param_new("__event_type", Type::Str, false));
+        var handle_body: Vec<Stmt> = Vec::new();
+        handle_body.push(Stmt::Match(Expr::Ident("__state"), arms, 0));
+        program.funcs.push(Func_new_full(handle_name, handle_params, Type::Named(sm_name), handle_body, sm.is_pub));
+
+        si = si + 1;
+    }
+    var empty_sms: Vec<StateMachineDef> = Vec::new();
+    program.state_machines = empty_sms;
+}
+
 /// Helper: create a Vec with one Func element.
 fn c_vec1_func(f: Func) -> Vec<Func> {
     var v: Vec<Func> = Vec::new();
@@ -2581,7 +2682,24 @@ pub fn c_str_split_n(s: str, delim: str, n: i64) -> Vec<str> {
 
 /// Split a string into lines.
 pub fn c_str_lines(s: str) -> Vec<str> {
-    return str_split(s, "\n");
+    var lines: Vec<str> = str_split(s, "\n");
+    var result: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < lines.len() {
+        var line: str = lines.get(i);
+        // Strip trailing \r (Windows CRLF line endings)
+        if str_len(line) > 0 {
+            var last: str = str_slice(line, str_len(line) - 1, str_len(line));
+            if last == "\r" {
+                line = str_slice(line, 0, str_len(line) - 1);
+            }
+        }
+        if str_len(line) > 0 {
+            result.push(line);
+        }
+        i = i + 1;
+    }
+    return result;
 }
 
 /// Get a substring from start (inclusive) to end (exclusive).

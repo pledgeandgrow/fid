@@ -1694,13 +1694,20 @@ if self.check(TokenKind::RParen) {
     return ParseResultParams::Ok(params);
 }
 loop {
+    // Check for variadic: ... before the parameter name
+    var is_variadic: bool = false;
+    if self.match_tok(TokenKind::DotDotDot) {
+        is_variadic = true;
+    }
     var name: str = "";
     match self.expect_ident_or_keyword() {
         ParseResultStr::Ok(s) => { name = s; }
         ParseResultStr::Err(e) => { return ParseResultParams::Err(e); }
     }
     if name == "self" && !self.check(TokenKind::Colon) {
-        params.push(Param_new("self", Type::Named("Self"), false));
+        var param: Param = Param_new("self", Type::Named("Self"), false);
+        param.is_variadic = is_variadic;
+        params.push(param);
     } else {
         match self.expect(TokenKind::Colon, ":") {
             ParseResultUnit::Err(e) => { return ParseResultParams::Err(e); }
@@ -1711,7 +1718,16 @@ loop {
             ParseResultType::Ok(t) => { ty = t; }
             ParseResultType::Err(e) => { return ParseResultParams::Err(e); }
         }
-        params.push(Param_new(name, ty, false));
+        var param: Param = Param_new(name, ty, false);
+        param.is_variadic = is_variadic;
+        // Check for default value: = expr
+        if self.match_tok(TokenKind::Eq) {
+            match self.parse_expr() {
+                ParseResultExpr::Ok(e) => { param.has_default = true; param.default_expr = e; }
+                ParseResultExpr::Err(e) => { return ParseResultParams::Err(e); }
+            }
+        }
+        params.push(param);
     }
     if !self.match_tok(TokenKind::Comma) { break; }
     if self.check(TokenKind::RParen) { break; }
@@ -2368,6 +2384,39 @@ return ParseResultStmts::Ok(stmts);
 fn parse_stmt(self: &mut Parser) -> ParseResultStmt {
 var k: TokenKind = self.peek();
 
+// @annotation(s) on local variable declarations (e.g. @zeroize, @secret)
+if token_kind_eq(k, TokenKind::At) {
+    var annotations: Vec<Annotation> = Vec::new();
+    while self.check(TokenKind::At) {
+        match self.parse_at_annotation() {
+            ParseResultAnnotation::Ok(a) => { annotations.push(a); }
+            ParseResultAnnotation::Err(e) => { return ParseResultStmt::Err(e); }
+        }
+    }
+    // The annotated statement must be a val/var declaration
+    var k2: TokenKind = self.peek();
+    if token_kind_eq(k2, TokenKind::Val) || token_kind_eq(k2, TokenKind::Var) {
+        match self.parse_let() {
+            ParseResultStmt::Ok(stmt) => {
+                // Inject annotations into the Let/LetUninit statement
+                match stmt {
+                    Stmt::Let(n, ty, e, im, p, _anns, ln) => {
+                        return ParseResultStmt::Ok(Stmt::Let(n, ty, e, im, p, annotations, ln));
+                    }
+                    Stmt::LetUninit(n, t, _anns, ln) => {
+                        return ParseResultStmt::Ok(Stmt::LetUninit(n, t, annotations, ln));
+                    }
+                    _ => {
+                        return ParseResultStmt::Err("@annotations can only be applied to val/var declarations at line " + int_to_str(self.peek_token().line));
+                    }
+                }
+            }
+            ParseResultStmt::Err(e) => { return ParseResultStmt::Err(e); }
+        }
+    }
+    return ParseResultStmt::Err("@annotations on statements require a val/var declaration at line " + int_to_str(self.peek_token().line));
+}
+
 if token_kind_eq(k, TokenKind::Persist) { return self.parse_persist_let(); }
 if token_kind_eq(k, TokenKind::Val) { return self.parse_let(); }
 if token_kind_eq(k, TokenKind::Var) { return self.parse_let(); }
@@ -2493,6 +2542,17 @@ if token_kind_eq(k, TokenKind::Comptime) {
     return ParseResultStmt::Ok(Stmt::Expr(expr, line));
 }
 if token_kind_eq(k, TokenKind::Guard) { return self.parse_guard_stmt(); }
+
+// F13: parallel { | branch1 | branch2 | ... } — contextual keyword
+if token_kind_eq(k, TokenKind::Ident("")) {
+    match k {
+        TokenKind::Ident(s: str) => {
+            if s == "parallel" {
+                return self.parse_parallel_stmt();
+            }
+        }
+    }
+}
 
 return self.parse_assign_or_expr();
 }
@@ -2879,6 +2939,42 @@ match self.expect(TokenKind::RBrace, "}") {
 return ParseResultStmt::Ok(Stmt::Select(cases, default, line));
 }
 
+fn parse_parallel_stmt(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+// Consume 'parallel' keyword (contextual keyword — an Ident)
+self.advance();
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var branches: Vec<Vec<Stmt> > = Vec::new();
+// Parse branches separated by '|'
+// Optional leading '|' before the first branch
+self.match_tok(TokenKind::Pipe);
+while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+    var branch: Vec<Stmt> = Vec::new();
+    while !self.check(TokenKind::Pipe) && !self.check(TokenKind::RBrace) && !self.is_at_end() {
+        match self.parse_stmt() {
+            ParseResultStmt::Ok(stmt) => { branch.push(stmt); }
+            ParseResultStmt::Err(e) => {
+                self.errors.push(e);
+                self.recover_to_sync_token();
+            }
+        }
+    }
+    branches.push(branch);
+    // Consume the '|' separator
+    if self.check(TokenKind::Pipe) {
+        self.advance();
+    }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+return ParseResultStmt::Ok(Stmt::Parallel(branches, line));
+}
+
 fn parse_let(self: &mut Parser) -> ParseResultStmt {
 var line: i64 = self.peek_token().line;
 var k: TokenKind = self.peek();
@@ -2944,7 +3040,7 @@ if is_mut && self.check(TokenKind::Semicolon) {
     self.advance();
     match ty {
         OptType::Some(t) => {
-            return ParseResultStmt::Ok(Stmt::LetUninit(name, t, line));
+            return ParseResultStmt::Ok(Stmt::LetUninit(name, t, Vec::new(), line));
         }
         OptType::None => {
             return ParseResultStmt::Err("var " + name + " needs type annotation for uninitialized declaration at line " + int_to_str(line));
@@ -2955,7 +3051,7 @@ if is_mut && !self.check(TokenKind::Eq) {
     match ty {
         OptType::Some(t) => {
             self.match_tok(TokenKind::Semicolon);
-            return ParseResultStmt::Ok(Stmt::LetUninit(name, t, line));
+            return ParseResultStmt::Ok(Stmt::LetUninit(name, t, Vec::new(), line));
         }
         OptType::None => {
             return ParseResultStmt::Err("var " + name + " needs type annotation for uninitialized declaration at line " + int_to_str(line));
@@ -2973,7 +3069,7 @@ match self.parse_expr() {
     ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
 }
 self.match_tok(TokenKind::Semicolon);
-return ParseResultStmt::Ok(Stmt::Let(name, ty, expr, is_mut, false, line));
+return ParseResultStmt::Ok(Stmt::Let(name, ty, expr, is_mut, false, Vec::new(), line));
 }
 
 fn parse_persist_let(self: &mut Parser) -> ParseResultStmt {
@@ -3014,7 +3110,7 @@ match self.parse_expr() {
     ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
 }
 self.match_tok(TokenKind::Semicolon);
-return ParseResultStmt::Ok(Stmt::Let(name, ty, expr, is_mut, true, line));
+return ParseResultStmt::Ok(Stmt::Let(name, ty, expr, is_mut, true, Vec::new(), line));
 }
 
 fn parse_return(self: &mut Parser) -> ParseResultStmt {
@@ -4126,9 +4222,40 @@ fn parse_call_expr(self: &mut Parser, callee: str) -> ParseResultExpr {
 var args: Vec<Expr> = Vec::new();
 if !self.check(TokenKind::RParen) {
     loop {
-        match self.parse_expr() {
-            ParseResultExpr::Ok(e) => { args.push(e); }
-            ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+        // Check for named argument: ident : expr
+        var tok = self.peek_token();
+        var is_named = false;
+        match tok.kind {
+            TokenKind::Ident(name) => {
+                if self.pos + 1 < self.tokens.len() {
+                    var next_tok = self.tokens.get(self.pos + 1);
+                    match next_tok.kind {
+                        TokenKind::Colon => { is_named = true; }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        if is_named {
+            var arg_name: str = "";
+            match self.expect_ident_or_keyword() {
+                ParseResultStr::Ok(s) => { arg_name = s; }
+                ParseResultStr::Err(e) => { return ParseResultExpr::Err(e); }
+            }
+            match self.expect(TokenKind::Colon, ":") {
+                ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+                ParseResultUnit::Ok => {}
+            }
+            match self.parse_expr() {
+                ParseResultExpr::Ok(e) => { args.push(Expr::NamedArg(arg_name, Box::new(e))); }
+                ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+            }
+        } else {
+            match self.parse_expr() {
+                ParseResultExpr::Ok(e) => { args.push(e); }
+                ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+            }
         }
         if !self.match_tok(TokenKind::Comma) { break; }
     }
@@ -4469,6 +4596,16 @@ if token_kind_eq(k, TokenKind::Spawn) {
         ParseResultExpr::Err(e2) => { return ParseResultExpr::Err(e2); }
     }
     return ParseResultExpr::Ok(Expr::Spawn(Box::new(e)));
+}
+// Yield
+if token_kind_eq(k, TokenKind::Yield) {
+    self.advance();
+    var e: Expr = Expr::IntLit(0);
+    match self.parse_unary() {
+        ParseResultExpr::Ok(ae) => { e = ae; }
+        ParseResultExpr::Err(e2) => { return ParseResultExpr::Err(e2); }
+    }
+    return ParseResultExpr::Ok(Expr::Yield(Box::new(e)));
 }
 // Word keywords as identifiers (e.g. query, move as variable names)
 if is_word_keyword(k) {

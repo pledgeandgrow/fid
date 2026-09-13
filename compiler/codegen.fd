@@ -516,7 +516,7 @@ pub fn CodeGen_gen_epilogue(self: &mut CodeGen) {
 
 pub fn CodeGen_gen_stmt(self: &mut CodeGen, stmt: Stmt) {
     match stmt {
-        Stmt::Let(name, _ty, expr, _is_mut, _is_persist, _line) => {
+        Stmt::Let(name, _ty, expr, _is_mut, _is_persist, _annotations, _line) => {
             // Track struct type for method call resolution
             var struct_name: ArmOptStr = ArmOptStr::None;
             match expr {
@@ -537,7 +537,7 @@ pub fn CodeGen_gen_stmt(self: &mut CodeGen, stmt: Stmt) {
             }
             CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(offset) + "]");
         }
-        Stmt::LetUninit(name, _ty, _line) => {
+        Stmt::LetUninit(name, _ty, _annotations, _line) => {
             // Just declare the variable — no initialization
             CodeGen_declare_var(self, name);
         }
@@ -916,6 +916,18 @@ pub fn CodeGen_gen_stmt(self: &mut CodeGen, stmt: Stmt) {
                     }
                 }
                 OptStmts::None => {}
+            }
+        }
+        Stmt::Parallel(branches, _line) => {
+            var bi: i64 = 0;
+            while bi < branches.len() {
+                var branch: Vec<Stmt> = branches.get(bi);
+                var si: i64 = 0;
+                while si < branch.len() {
+                    CodeGen_gen_stmt(self, branch.get(si));
+                    si = si + 1;
+                }
+                bi = bi + 1;
             }
         }
     }
@@ -1411,6 +1423,13 @@ pub fn CodeGen_gen_expr(self: &mut CodeGen, expr: Expr) {
             }
             CodeGen_pop_scope(self);
         }
+        Expr::Yield(e) => {
+            // Yield - evaluate inner expression, return unit
+            CodeGen_gen_expr(self, box_expr_unbox(e));
+        }
+        Expr::NamedArg(name, e) => {
+            CodeGen_gen_expr(self, box_expr_unbox(e));
+        }
         _ => {}
     }
 }
@@ -1424,7 +1443,7 @@ pub fn count_lets(stmts: Vec<Stmt>) -> i64 {
     var i: i64 = 0;
     while i < stmts.len() {
         match stmts.get(i) {
-            Stmt::Let(_name, _ty, _expr, _is_mut, _is_persist, _line) => {
+            Stmt::Let(_name, _ty, _expr, _is_mut, _is_persist, _annotations, _line) => {
                 count = count + 1;
             }
             Stmt::LetTuple(_names, _expr, _line) => {

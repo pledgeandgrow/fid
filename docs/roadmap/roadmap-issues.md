@@ -6,6 +6,38 @@
 
 ---
 
+## Session 26 (Sep 12, 2026) — Bootstrap Fixpoint & Gap Fixes
+
+**Bootstrap fixpoint VERIFIED byte-for-byte** (fides-c4.c == fides-c5.c, 29,763,762 bytes).
+
+**3 self-compilation SIGSEGV bugs fixed:**
+
+| Bug | Title | Status |
+|-----|-------|--------|
+| SDL | False SDL2/OpenGL/net library detection during self-compilation | ✅ Fixed |
+| Struct | Struct global C codegen emitted pointers instead of values | ✅ Fixed |
+| Time | stdlib/time.fd had extra `)` causing parse errors | ✅ Fixed |
+
+**7 Rust-to-Fides gaps closed:**
+
+| Gap | Title | Status |
+|-----|-------|--------|
+| 1 | pir.fd str_substring was a stub | ✅ Fixed |
+| 2 | opt.fd is_lto_mode hardcoded false | ✅ Fixed |
+| 3 | codegen_c.fd DynCall/TryUnwrap were stubs | ✅ Fixed |
+| 4 | codegen_c.fd struct globals emitted as pointers | ✅ Fixed |
+| 5 | x86.rs standalone Linux codegen not ported | ✅ Ported to x86.fd |
+| 6 | 19 CLI commands missing (debug, REPL, GPU, profiling, etc.) | ✅ Added |
+| 7 | interp.fd autograd + PRNG missing | ✅ Added |
+
+**Additional fixes:**
+- `c_str_lines` CRLF bug — Windows `dir /b` produces `\r\n`, str_split left `\r` on filenames
+- `StructCopy` instruction added to ir.fd for struct-by-value memcpy
+- TCC inline asm guard in green_thread.rs
+- `Vec_push` for global variable method calls in runtime_linux.fd
+
+---
+
 ## Session 24 (Sep 10, 2026) — Roadmap Bug Fixes
 
 **16 roadmap issues resolved:**
@@ -27,7 +59,7 @@
 | 30 | Linker DCE doesn't handle indirect calls | ✅ Fixed |
 | 43 | No error recovery in parser | ✅ Resolved |
 | 56 | random_seed_time() is a stub | ✅ Fixed |
-| 67-69 | PE emitter: val-in-loop, str_split, recursive Box<T> | ✅ Fixed (prior) |
+| 67-69 | PE emitter: val-in-loop, str_split, recursive Box<T> | ✅ Fixed — Issue 67 via L1B regalloc; Issue 68 via p_string_split + Vec known type; Issue 69 via Store memcpy for struct types |
 
 **Remaining open:**
 - Issue 18: No tests for ML9-ML14 edge cases (test-only work, pending)
@@ -153,8 +185,14 @@ Current test results from `./target/release/fidesc test`:
 **Remaining failures include:**
 - `real_crypto`, `real_database`, `real_threads` — require real OS resources
 - `test_sqlite` — interpreter doesn't support SQLite
-- `test_phase8b` — state machine C codegen crash (pre-existing)
+- ~~`test_phase8b`~~ — ✅ Fixed: assignment lowering emitted a struct-content
+  `memcpy` into a pointer-holding slot when reassigning an inferred `var`
+  holding a struct pointer. `store_ty: Struct` is now only emitted when the
+  alloca slot actually stores the struct inline (`src/lower.rs`). Passes on
+  interpreter and C codegen.
 - `test_banking`, `test_game_stdlib`, `test_parallel` — C codegen mismatches
+- ~~`test_time`, `test_time_edge`, `test_new_features`~~ — ✅ Fixed: commit 47e7321 accidentally committed `stdlib/time.fd` with stray `)` tokens after 15 string-concat assignments (`s = s + "-");`), breaking the parse of every program using `use time;`. All three tests now pass on all backends.
+- `test_ast` (selfhost) — in-flight `@zeroize` port adding `annotations` to `Stmt::Let` (7-field constructor) hasn't updated `tests/selfhost/test_ast.fd` yet
 - `test_fmt_harness`, `test_lexer_harness`, `test_parser_harness` — harness tests requiring file args
 - `test_sl_debug` — harness test requiring file args
 
@@ -393,19 +431,21 @@ in the interpreter. ML10 (quantization) already had runtime support. ML14
 - `@shard(dim=0)` — ✅ Simulated multi-rank runtime implemented:
   `tp_rank`/`tp_world_size` in interpreter. `p_tp_rank`/`p_tp_world_size`
   return rank info. `p_all_reduce` is identity in single-rank mode.
-- `@adapter` — `src/typechecker.rs:1483` says "Only modify adapter weights
-  (not base weights) — verified by checking that the function does not call
-  base weight mutation ops" — but the implementation only checks effects
-  (IO/Net/Spawn/Diverge). There is **no check** that base weights aren't
-  modified. The comment is a lie.
+- `@adapter` — ✅ Base-weight immutability check implemented
+  (`verify_adapter` in `src/typechecker.rs`): an `@adapter` function that
+  writes to a module-level global (base weights / shared state) is a
+  compile error. Adapter weights must arrive as parameters or be declared
+  as locals. Local shadowing of a global is handled — the lowerer now
+  resolves assignment targets locals-first (matching the read path), so
+  `var w` shadowing a global `w` assigns the local slot, not the global.
 
 **Remaining limitation:** C codegen does not implement the autograd tape
 runtime. The interpreter-based implementations are sufficient for model
 development and testing.
 
 **Remaining fix plan (for annotations still without runtime):**
-4. `@adapter` — needs base-weight immutability check (write to non-adapter
-   persist vars inside `@adapter` = error)
+4. ~~`@adapter` — needs base-weight immutability check~~ ✅ Done — compile
+   error on global writes inside `@adapter`
 5. `@quantized` — needs INT8 GEMM in codegen (currently float matmul)
 6. `@kv_cache` — needs runtime cache in native backends (currently interp-only)
 
@@ -979,7 +1019,9 @@ if (sz < 0) { fclose(f); return NULL; }
 
 ## Issue 34: HTTP Response Always Says "OK" Regardless of Status Code
 
-**Status:** Open — protocol violation
+**Status:** ✅ Fixed — status-code → reason-phrase lookup implemented
+(`src/codegen_c.rs` emits an if/else chain covering 200/201/204/301/302/
+404/500 etc.)
 
 `src/codegen_c.rs:3400`:
 ```c
@@ -1074,7 +1116,9 @@ instead of text search.
 
 ## Issue 38: LSP Re-parses Entire Stdlib on Every Request
 
-**Status:** Open — performance issue
+**Status:** ✅ Fixed — `STDLIB_CACHE: OnceLock<Program>` in `src/compiler.rs`
+parses the stdlib once per process; `build_program_for_lsp` clones the
+cached `Program`, so each request only parses user code.
 
 `src/lsp.rs:636` — `handle_completion` calls
 `compiler::build_program_for_lsp(text)` on every request. This function
@@ -1610,19 +1654,19 @@ checklist of bugs to fix and consolidations to make before self-hosting:
 
 ### Consolidate (Code Duplication)
 
-| # | Issue | Files | Effort |
-|---|-------|------|--------|
-| 52 | `result.fd` vs `core.fd` Result | result.fd, core.fd | Small |
-| 53 | `fs.fd` vs `file.fd` | fs.fd, file.fd | Small |
-| 54 | `os.fd` vs `env.fd` + `args.fd` | os.fd, env.fd, args.fd | Small |
-| 57 | Redundant `use core;` | 26 stdlib files | Trivial |
-| 58 | `str_concat` → `+` | 89 call sites | Trivial |
+| # | Issue | Files | Effort | Status |
+|---|-------|------|--------|--------|
+| 52 | `result.fd` vs `core.fd` Result | result.fd, core.fd | Small | Open (tests import both) |
+| 53 | `fs.fd` vs `file.fd` | fs.fd, file.fd | Small | Open (tests import both) |
+| 54 | `os.fd` vs `env.fd` + `args.fd` | os.fd, env.fd, args.fd | Small | Open (tests import both) |
+| 57 | Redundant `use core;` | 26 stdlib files | Trivial | ✅ Fixed (only commented refs remain) |
+| 58 | `str_concat` → `+` | 89 call sites | Trivial | ✅ Fixed (remaining `p_str_concat` uses are internals) |
 
 ### Clean Up (Compiler Hygiene)
 
 | # | Issue | File | Effort |
 |---|-------|------|--------|
-| 55 | Debug print in lower.rs | lower.rs:3472 | Trivial |
+| 55 | Debug print in lower.rs | lower.rs:3472 | ✅ Fixed (verified absent) |
 | — | 207 compiler warnings | all src/*.rs | Medium |
 | — | 7 unreachable patterns | ir.rs, mono.rs | Trivial |
 | — | Dead code (5+ functions/variants) | x86.rs, opt.rs, etc. | Small |
@@ -2282,7 +2326,7 @@ library can't. These should be prioritized.
 | **@simd (F23)** | features-roadmap.md | Compiler vectorizes loops to SSE/AVX/NEON. ✅ Done — `@simd` annotation enables aggressive loop vectorization (wider vectors for AVX/AVX2, relaxed cost model, lower trip count threshold). | **DONE** |
 | **@pool (F25)** | features-roadmap.md | Compiler manages pool memory layout, zero alloc. Needs IR/layout support. | **MEDIUM** |
 | **@secret (F74)** | features-roadmap.md | Information flow control — secrets can't be printed/logged/sent. Extends @tainted. ✅ Done — secret lattice in typechecker, output sink rejection, return flow checks. | **DONE** |
-| **@cfi (F75)** | features-roadmap.md | Control flow integrity: shadow stack, CFI checks. Needs codegen support. | **MEDIUM** |
+| **@cfi (F75)** | features-roadmap.md | Control flow integrity: shadow stack, CFI checks. ✅ Done — Phase 12: forward-edge indirect-call protection (null-check + bounds validation) for `CallPtr`, `L3Inst::CallPtr`, and `DynCall` in PE backend. Closure pointer dereference bug fixed (load fn addr from closure field 0). | **DONE** |
 | **@zeroize (F88)** | features-roadmap.md | Secrets wiped from memory on scope exit. ✅ Done — compiler-inserted `p_memset(0)` at all exit points (before drops and returns) across interpreter, C codegen, and PE emitter. | **DONE** |
 | **@bit-exact (F58)** | features-roadmap.md | Bit-identical FP results across hardware. Needs compiler to disable FMA, enforce strict FP operation order. | **MEDIUM** |
 | **parallel { \| } (F13)** | features-roadmap.md | Fork-join parallelism. ✅ Done (partial) — `parallel { | branch1 | branch2 | ... }` syntax parsed, typechecked, lowered sequentially (true parallelism requires closure support). Contextual keyword preserves `use parallel;` compatibility. | **DONE** |

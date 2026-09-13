@@ -388,6 +388,10 @@ impl TypeChecker {
             Stmt::Do { args, .. } => {
                 for a in args { self.collect_called_funcs_expr(a, called); }
             }
+            Stmt::Resume { cont, value, .. } => {
+                self.collect_called_funcs_expr(cont, called);
+                self.collect_called_funcs_expr(value, called);
+            }
             Stmt::RegionBlock { body, .. } => self.collect_called_funcs(body, called),
             _ => {}
         }
@@ -3716,6 +3720,9 @@ impl TypeChecker {
             Stmt::Do { effect, .. } => {
                 effects.insert(effect.clone());
             }
+            Stmt::Resume { .. } => {
+                // resume doesn't add effects — it's a continuation call
+            }
             Stmt::RegionBlock { body, .. } => {
                 self.scan_stmts_for_effects(body, effects);
             }
@@ -4923,6 +4930,11 @@ impl TypeChecker {
                 for arg in args {
                     self.check_expr(arg);
                 }
+            }
+            Stmt::Resume { cont, value, line: _ } => {
+                // L3A: resume(cont, value) — typecheck both expressions
+                self.check_expr(cont);
+                self.check_expr(value);
             }
             Stmt::RegionBlock { name, budget, is_gpu, is_kv_cache, window_size, body, line } => {
                 // Push region scope
@@ -7747,6 +7759,10 @@ fn scan_stmt_for_floats(stmt: &Stmt, found: &mut Vec<String>) {
         Stmt::Do { args, .. } => {
             for a in args { scan_expr_for_floats(a, found); }
         }
+        Stmt::Resume { cont, value, .. } => {
+            scan_expr_for_floats(cont, found);
+            scan_expr_for_floats(value, found);
+        }
         Stmt::ComptimeGen { block, .. } => {
             for s in block { scan_stmt_for_floats(s, found); }
         }
@@ -8637,6 +8653,7 @@ fn stmt_line(stmt: &Stmt) -> usize {
         Stmt::Use { line, .. } => *line,
         Stmt::Handle { line, .. } => *line,
         Stmt::Do { line, .. } => *line,
+        Stmt::Resume { line, .. } => *line,
         Stmt::RegionBlock { line, .. } => *line,
         Stmt::Sandbox { line, .. } => *line,
         Stmt::Unsafe { line, .. } => *line,

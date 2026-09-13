@@ -151,7 +151,7 @@ F69: @escaped                 🔲 PLANNED — compiler verifies output is escap
 F70: @atomic-check            🔲 PLANNED — check and act are one atomic operation (TOCTOU prevention)
 F72: @constant-time           ✅ IMPLEMENTED — compiler verifies no data-dependent branches or memory access, no early returns, no IO/Net, transitive (side-channel)
 F74: @secret type             ✅ DONE — information flow control: secret lattice in typechecker, output sink rejection (print/log/network/file), return flow checks, transitive propagation
-F75: @cfi                     🔲 PLANNED — control flow integrity: shadow stack, CFI checks, canaries (ROP prevention)
+F75: @cfi                     ✅ DONE — Phase 12: forward-edge indirect-call protection (null-check + bounds validation) for CallPtr/L3Inst::CallPtr/DynCall in PE backend; closure pointer deref bug fixed
 F76: vtable protection        🔲 PLANNED — vtables read-only, pointer-signed, no user modification (JOP prevention)
 F79: @pinned                  🔲 PLANNED — dependency pinned with content hash, tamper detection (supply chain)
 F80: @sandbox-import          🔲 PLANNED — imported modules sandboxed by default, zero capabilities (supply chain)

@@ -80,6 +80,51 @@ where
 // Public API
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Optimization level (mirrors `--opt-level 0|1|2|3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OptLevel {
+    O0,
+    O1,
+    O2,
+    O3,
+}
+
+impl OptLevel {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "0" | "O0" | "o0" => Some(OptLevel::O0),
+            "1" | "O1" | "o1" => Some(OptLevel::O1),
+            "2" | "O2" | "o2" => Some(OptLevel::O2),
+            "3" | "O3" | "o3" => Some(OptLevel::O3),
+            _ => None,
+        }
+    }
+
+    pub fn passes(self) -> &'static [Pass] {
+        match self {
+            OptLevel::O0 => &[],
+            OptLevel::O1 => &[
+                Pass::ConstFold,
+                Pass::Cse,
+                Pass::Dce,
+                Pass::StrengthReduce,
+                Pass::EffectOpt,
+            ],
+            OptLevel::O2 => Pass::all(),
+            OptLevel::O3 => Pass::all(),
+        }
+    }
+
+    pub fn max_iters(self) -> usize {
+        match self {
+            OptLevel::O0 => 0,
+            OptLevel::O1 => 4,
+            OptLevel::O2 => 8,
+            OptLevel::O3 => 16,
+        }
+    }
+}
+
 /// Which passes are available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Pass {
@@ -268,6 +313,23 @@ pub fn optimize_l2_lto(module: &mut L2Module) -> OptStats {
     set_lto_mode(true);
     let stats = optimize_l2_with(module, Pass::all(), 16);
     set_lto_mode(false);
+    stats
+}
+
+/// Run optimization at a specific `OptLevel`.
+pub fn optimize_l2_with_level(module: &mut L2Module, level: OptLevel) -> OptStats {
+    let passes = level.passes();
+    if passes.is_empty() {
+        return OptStats::default();
+    }
+    let max_iters = level.max_iters();
+    if level == OptLevel::O3 {
+        set_lto_mode(true);
+    }
+    let stats = optimize_l2_with(module, passes, max_iters);
+    if level == OptLevel::O3 {
+        set_lto_mode(false);
+    }
     stats
 }
 

@@ -3,14 +3,16 @@
 > Navigation hub for the Fides compiler. Every file in the project, grouped by
 > directory, with a one-line description. Use this to find anything fast.
 >
-> **Fides is self-hosted.** The primary compiler is in `compiler/*.fd` (26 modules, 61,885 LOC).
-> The Rust source in `src/*.rs` is the bootstrap reference implementation, used only when
-> changing compiler internals. For everyday work, use `release/fides-c3.exe`.
+> **Fides is self-hosted and released (v1.0.0).** The primary compiler is in `compiler/*.fd`
+> (50 modules, 93,605 LOC). The Rust source in `src/*.rs` (55 files, ~93,269 LOC) is the
+> bootstrap reference implementation, used only when changing compiler internals.
+> For everyday work, use `release/fides-c3.exe`.
 >
-> **Stats:** 26 self-hosted `.fd` compiler modules (61,885 LOC) · 52 `.rs` bootstrap files (84,447 LOC) ·
-> 70 stdlib modules (18,529 LOC) · 215+ `.fd` test files · 38 .md docs · 4 examples · 4 binaries.
-> Bootstrap fixpoint: `fides-c2.c == fides-c3.c` (701,158 lines, 0 diffs).
-> Tier 3 OS features (session 16): @cpu_local, inline asm clobbers, --no-std, UEFI bindings.
+> **Stats:** 50 self-hosted `.fd` compiler modules (93,605 LOC) · 55 `.rs` bootstrap files (~93,269 LOC) ·
+> 99 stdlib modules (28,370 LOC) · 303 `.fd` test files (261 bootstrap + 42 selfhost) · 4 examples · 4 binaries.
+> Bootstrap: 3 generations verified (Rust → c1 → c2 → c3).
+> Fixpoint: NOT VERIFIABLE (fides-c2.c missing). Self-compilation FAILS (SIGSEGV in Lowerer_lower_stmt).
+> v1.0.0 released Sep 9, 2026 with Windows installer (Fides-Setup-1.0.0.exe, 2.5 MB).
 
 ---
 

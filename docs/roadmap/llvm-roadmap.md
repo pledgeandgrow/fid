@@ -78,7 +78,7 @@ These are language-independent. Every compiler needs them. Fides must match LLVM
 
 **Why we need it:** SLP vectorization (F64 pairs → SSE2) exists. But loop vectorization is the bigger win — `for i in 0..N { a[i] += b[i] }` should become 4-wide SIMD. For ML/physics/graphics, this is 4-8x.
 
-**Status:** SLP done (F64 pairs → `p_simd_*` SSE2). Loop vectorization pass exists (`pass_loop_vectorize` in `opt.rs`, in default pass list).
+**Status:** SLP done (F64 + I64 pairs → `p_simd_*` SSE2). Loop vectorization pass exists (`pass_loop_vectorize` in `opt.rs`, in default pass list). SLP vectorizer (`Pass::Vectorize`) extended to support both F64 and I64 element types, generating `p_simd_add_i64`/`p_simd_sub_i64` for I64 arithmetic. PE backend emits actual SSE2 packed instructions (`addpd`/`subpd`/`mulpd`/`divpd` for F64, `paddq`/`psubq` for I64).
 
 #### F-2A: Counted Loop Detection ✅
 - [x] Detect `for i in 0..N` loops with constant or provably-bounded trip counts
@@ -172,9 +172,12 @@ These are language-independent. Every compiler needs them. Fides must match LLVM
 - [x] **Implementation:** `gen_call_abi` in `src/codegen_x64.rs` handles System V AMD64 ABI: integer args in RDI/RSI/RDX/RCX/R8/R9, float args in XMM0-XMM7, struct args by value, 16-byte stack alignment. `gen_prologue_abi` saves XMM argument registers for extern functions. Old `gen_call` removed as dead code.
 
 #### F-4B: ARM64 + RISC-V Maturity
+- [x] **FIXED (build pipeline):** `build --target arm64/riscv` previously failed at the assemble stage for all real programs — Store operand shadowing emitted raw `VReg` names (`str v6, [x6]`), `return` was emitted where the assemblers implement `ret`, `arm64_enc` lacked the `fp` alias, negative ADD immediates weren't canonicalized to SUB, and negative LDR/STR offsets lacked LDUR/STUR forms. All fixed; full stdlib-linked executables now build on both targets
+- [x] **FIXED (linker):** ARM64 BL/B/B.cond relocations were patched with an x86-style `P+4` base — ARM64 branches are P-relative; external calls previously landed 4 bytes short of their targets
+- [x] **FIXED (objects):** `codegen --target arm64/riscv --elf` now emits real machine code in `.text` (previously: assembly text stuffed into `.comment`, empty `.text`) with proper ELF relocations (R_AARCH64_CALL26/JUMP26/CONDBR19/ADR_PREL_PG_HI21/ADD_ABS_LO12_NC, R_RISCV_JAL/BRANCH)
 - [ ] Verify AAPCS64 / RISC-V calling conventions
 - [ ] NEON / RVV vector instruction emission
-- [ ] Test via QEMU cross-compilation
+- [ ] Test via QEMU cross-compilation (executables build; execution unverified — no target hardware in dev environment)
 
 #### F-4C: Instruction Selection ✅
 - [x] Pattern matcher for strength reduction (see F-3H)
@@ -487,7 +490,7 @@ These phases use Fides's semantic information to optimize in ways LLVM fundament
 | Phase | Priority | Effort | Why | Status |
 |-------|----------|--------|-----|--------|
 | **F-1** (Regalloc) | 🔴 Critical | Medium | Foundation — everything depends on it | Linear scan exists, bug exists |
-| **F-2** (Loop Vec) | 🔴 Critical | Large | 4-8x for numerical code | SLP done, loop vec missing |
+| **F-2** (Loop Vec) | 🔴 Critical | Large | 4-8x for numerical code | SLP done (F64+I64), loop vec partial |
 | **F-3** (Opt Passes) | 🔴 Critical | Medium | Closes the quality gap | 10 passes exist, need 8 more |
 | **I-1** (Region Memory) | 🔴 Critical | Medium | **Biggest Fides advantage** — 2x+ over LLVM | Region system exists, not exploited |
 | **I-2** (Effect Opt) | 🟡 High | Medium | 10-20% fewer spills in pure code | Effect-reorder exists, limited |

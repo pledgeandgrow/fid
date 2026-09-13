@@ -1847,8 +1847,21 @@ impl Lowerer {
 
     /// Lower a sequence of statements
     fn lower_stmts(&mut self, stmts: &[Stmt]) {
-        for stmt in stmts {
-            self.lower_stmt(stmt);
+        // L3A: When we encounter a `do` statement, the remaining statements
+        // become the continuation. We create a continuation closure and pass
+        // it to the handler. The handler can call `resume(cont, value)` to
+        // run the continuation.
+        let mut i = 0;
+        while i < stmts.len() {
+            if let Stmt::Do { effect, op, args, line } = &stmts[i] {
+                let remaining = &stmts[i + 1..];
+                self.lower_do_with_continuation(effect, op, args, *line, remaining);
+                // After `do` with continuation capture, the remaining statements
+                // are in the continuation closure — stop processing this block.
+                return;
+            }
+            self.lower_stmt(&stmts[i]);
+            i += 1;
         }
     }
 
@@ -2464,33 +2477,29 @@ impl Lowerer {
             }
 
             Stmt::Do { effect, op, args, .. } => {
-                // Look up the handler for this effect.op
-                let handler_info = self.effect_handler_stack.iter().rev().find_map(|handlers| {
-                    handlers.iter().find(|h| h.effect == *effect && h.op == *op)
-                        .map(|h| (h.params.clone(), h.body.clone()))
+                // This is reached when `do` is nested inside other statements
+                // (e.g., inside an if branch). In this case, we can't easily
+                // capture the continuation (the remaining statements are not
+                // in the same block). Fall back to inlining the handler body.
+                // The continuation-aware path is in lower_stmts → lower_do_with_continuation.
+                self.lower_do_inlined(effect, op, args);
+            }
+            Stmt::Resume { cont, value, .. } => {
+                // L3A: resume(cont, value) — call the continuation closure.
+                // The continuation is a closure value (fn pointer + env).
+                // We call it with the resume value as the argument.
+                let cont_val = self.lower_expr(cont);
+                let value_val = self.lower_expr(value);
+                // Call the continuation: cont(value)
+                // The continuation closure has signature (env: *u8, value: i64) -> i64
+                // We use CallPtr which passes env_ptr as first arg automatically.
+                self.emit_inst(Inst::CallPtr {
+                    fn_ptr: cont_val,
+                    args: vec![value_val],
+                    ret_ty: IrType::I64,
+                    effects: EffectSet::new(),
+                    has_env: true,
                 });
-
-                if let Some((params, body)) = handler_info {
-                    // Lower the handler body with the args bound to params
-                    for (i, arg) in args.iter().enumerate() {
-                        if i < params.len() {
-                            let arg_val = self.lower_expr(arg);
-                            let slot = self.emit_inst(Inst::Alloca {
-                                ty: IrType::I64,
-                                region: self.current_region(),
-                            });
-                            self.emit_inst(Inst::Store { ptr: slot, value: arg_val, store_ty: None });
-                            self.allocas.insert(params[i].clone(), slot);
-                            self.alloca_types.insert(slot, IrType::I64);
-                        }
-                    }
-                    self.lower_stmts(&body);
-                } else {
-                    // No handler found — just lower the args (no-op)
-                    for arg in args {
-                        self.lower_expr(arg);
-                    }
-                }
             }
             Stmt::RegionBlock { name, budget: _, is_gpu, is_kv_cache, window_size, body, .. } => {
                 // Emit RegionBegin — marks the start of a named region.
@@ -3644,6 +3653,227 @@ impl Lowerer {
             }
         }
         IrType::I64
+    }
+
+    /// L3A: Lower `do Effect.op(args)` with continuation capture.
+    /// The remaining statements in the block become a continuation closure.
+    /// The handler receives the args + a `cont` closure that it can `resume`.
+    fn lower_do_with_continuation(
+        &mut self,
+        effect: &str,
+        op: &str,
+        args: &[Expr],
+        _line: usize,
+        remaining: &[Stmt],
+    ) {
+        // Look up the handler for this effect.op
+        let handler_info = self.effect_handler_stack.iter().rev().find_map(|handlers| {
+            handlers.iter().find(|h| h.effect == effect && h.op == op)
+                .map(|h| (h.params.clone(), h.body.clone()))
+        });
+
+        if let Some((params, body)) = handler_info {
+            // Lower the args
+            let arg_vals: Vec<ValueId> = args.iter()
+                .map(|a| self.lower_expr(a))
+                .collect();
+
+            // Create a continuation closure from the remaining statements.
+            // The closure takes one parameter (the resume value) and executes
+            // the remaining statements.
+            let has_continuation = !remaining.is_empty();
+            let cont_val = if has_continuation {
+                self.create_continuation_closure(remaining)
+            } else {
+                // No remaining statements — create a no-op continuation
+                self.create_noop_continuation()
+            };
+
+            // Bind handler params: args first, then `cont` as last param
+            for (i, arg_val) in arg_vals.iter().enumerate() {
+                if i < params.len() {
+                    let slot = self.emit_inst(Inst::Alloca {
+                        ty: IrType::I64,
+                        region: self.current_region(),
+                    });
+                    self.emit_inst(Inst::Store { ptr: slot, value: *arg_val, store_ty: None });
+                    self.allocas.insert(params[i].clone(), slot);
+                    self.alloca_types.insert(slot, IrType::I64);
+                }
+            }
+            // Bind `cont` variable in the handler's scope
+            let cont_slot = self.emit_inst(Inst::Alloca {
+                ty: IrType::I64,
+                region: self.current_region(),
+            });
+            self.emit_inst(Inst::Store { ptr: cont_slot, value: cont_val, store_ty: None });
+            self.allocas.insert("cont".to_string(), cont_slot);
+            self.alloca_types.insert(cont_slot, IrType::I64);
+
+            // Lower the handler body
+            self.lower_stmts(&body);
+        } else {
+            // No handler found — just lower the args (no-op)
+            for arg in args {
+                self.lower_expr(arg);
+            }
+            // Also lower remaining statements (no handler = passthrough)
+            for s in remaining {
+                self.lower_stmt(s);
+            }
+        }
+    }
+
+    /// L3A: Inlined `do` (fallback for nested do inside if/for/etc.)
+    fn lower_do_inlined(&mut self, effect: &str, op: &str, args: &[Expr]) {
+        let handler_info = self.effect_handler_stack.iter().rev().find_map(|handlers| {
+            handlers.iter().find(|h| h.effect == effect && h.op == op)
+                .map(|h| (h.params.clone(), h.body.clone()))
+        });
+
+        if let Some((params, body)) = handler_info {
+            for (i, arg) in args.iter().enumerate() {
+                if i < params.len() {
+                    let arg_val = self.lower_expr(arg);
+                    let slot = self.emit_inst(Inst::Alloca {
+                        ty: IrType::I64,
+                        region: self.current_region(),
+                    });
+                    self.emit_inst(Inst::Store { ptr: slot, value: arg_val, store_ty: None });
+                    self.allocas.insert(params[i].clone(), slot);
+                    self.alloca_types.insert(slot, IrType::I64);
+                }
+            }
+            self.lower_stmts(&body);
+        } else {
+            for arg in args {
+                self.lower_expr(arg);
+            }
+        }
+    }
+
+    /// L3A: Create a continuation closure from remaining statements.
+    /// The closure takes one i64 parameter (the resume value) and executes
+    /// the remaining statements. Captures all in-scope variables.
+    fn create_continuation_closure(&mut self, remaining: &[Stmt]) -> ValueId {
+        let closure_id = self.module.functions.len();
+        let closure_name = format!("__cont_{}", closure_id);
+
+        // Find free variables (captures) in the remaining statements
+        let param_names: Vec<String> = vec!["__resume_val".to_string()];
+        let captures = self.find_captures(remaining, &param_names);
+
+        // Save current captures and set new ones for this closure
+        let saved_captures = std::mem::take(&mut self.current_captures);
+        for (i, (cap_name, cap_ty)) in captures.iter().enumerate() {
+            self.current_captures.push((cap_name.clone(), i + 1, cap_ty.clone()));
+        }
+
+        // Build the closure function
+        let resume_param = crate::ast::Param {
+            name: "__resume_val".to_string(),
+            ty: Type::I64,
+            is_pub: false,
+            annotations: vec![],
+        };
+
+        let closure_func = crate::ast::Func {
+            name: closure_name.clone(),
+            type_params: vec![],
+            type_param_bounds: vec![],
+            const_params: vec![],
+            params: vec![resume_param],
+            ret_ty: Type::I64,
+            body: remaining.to_vec(),
+            is_pub: false,
+            is_comptime: false,
+            declared_effects: vec![],
+            has_effect_annotation: false,
+            is_interrupt: false,
+            annotations: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            is_async: false,
+            line: 0,
+        };
+
+        // Save current function context
+        let saved_func = self.current_func.take();
+        let saved_allocas = std::mem::take(&mut self.allocas);
+        let saved_alloca_types = std::mem::take(&mut self.alloca_types);
+        let saved_var_ast_types = std::mem::take(&mut self.var_ast_types);
+        let saved_vec_allocas = std::mem::take(&mut self.vec_allocas);
+        let saved_block = self.current_block;
+        self.lower_func(&closure_func);
+        self.current_func = saved_func;
+        self.allocas = saved_allocas;
+        self.alloca_types = saved_alloca_types;
+        self.var_ast_types = saved_var_ast_types;
+        self.vec_allocas = saved_vec_allocas;
+        self.current_block = saved_block;
+        self.current_captures = saved_captures;
+
+        // Build env struct with captures at the creation site
+        if captures.is_empty() {
+            self.make_fn_env(&closure_name, &[])
+        } else {
+            let cap_vals: Vec<(String, ValueId)> = captures.iter()
+                .map(|(name, _)| {
+                    let val = self.lower_expr(&Expr::Ident(name.clone()));
+                    (name.clone(), val)
+                })
+                .collect();
+            self.make_fn_env(&closure_name, &cap_vals)
+        }
+    }
+
+    /// L3A: Create a no-op continuation (for `do` with no remaining statements)
+    fn create_noop_continuation(&mut self) -> ValueId {
+        let closure_id = self.module.functions.len();
+        let closure_name = format!("__cont_noop_{}", closure_id);
+
+        let resume_param = crate::ast::Param {
+            name: "__resume_val".to_string(),
+            ty: Type::I64,
+            is_pub: false,
+            annotations: vec![],
+        };
+
+        let closure_func = crate::ast::Func {
+            name: closure_name.clone(),
+            type_params: vec![],
+            type_param_bounds: vec![],
+            const_params: vec![],
+            params: vec![resume_param],
+            ret_ty: Type::I64,
+            body: vec![Stmt::Return(Some(Expr::IntLit(0)), 0)],
+            is_pub: false,
+            is_comptime: false,
+            declared_effects: vec![],
+            has_effect_annotation: false,
+            is_interrupt: false,
+            annotations: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            is_async: false,
+            line: 0,
+        };
+
+        let saved_func = self.current_func.take();
+        let saved_allocas = std::mem::take(&mut self.allocas);
+        let saved_alloca_types = std::mem::take(&mut self.alloca_types);
+        let saved_var_ast_types = std::mem::take(&mut self.var_ast_types);
+        let saved_vec_allocas = std::mem::take(&mut self.vec_allocas);
+        let saved_block = self.current_block;
+        self.lower_func(&closure_func);
+        self.current_func = saved_func;
+        self.allocas = saved_allocas;
+        self.alloca_types = saved_alloca_types;
+        self.var_ast_types = saved_var_ast_types;
+        self.vec_allocas = saved_vec_allocas;
+        self.current_block = saved_block;
+
+        self.make_fn_env(&closure_name, &[])
     }
 
     /// Lower an expression to an SSA value
@@ -6289,6 +6519,10 @@ impl Lowerer {
                     for arg in args {
                         self.collect_free_vars_expr(arg, free_vars, local_names);
                     }
+                }
+                Stmt::Resume { cont, value, .. } => {
+                    self.collect_free_vars_expr(cont, free_vars, local_names);
+                    self.collect_free_vars_expr(value, free_vars, local_names);
                 }
                 Stmt::RegionBlock { body, .. } => {
                     self.collect_free_vars(body, free_vars, local_names);

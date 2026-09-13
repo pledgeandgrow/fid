@@ -280,6 +280,8 @@ pub enum Expr {
     QuantCast(Box<Expr>, Type),
     Await(Box<Expr>),
     Spawn(Box<Expr>),
+    Yield(Box<Expr>),
+    NamedArg(str, Box<Expr>),
 }
 
 // --- Patterns -------------------------------------------------------------
@@ -310,9 +312,9 @@ pub struct EffectHandler {
 }
 
 pub enum Stmt {
-    Let(str, OptType, Expr, bool, bool, i64),
+    Let(str, OptType, Expr, bool, bool, Vec<Annotation>, i64),
     LetTuple(Vec<str>, Expr, i64),
-    LetUninit(str, Type, i64),
+    LetUninit(str, Type, Vec<Annotation>, i64),
     Assign(str, AssignOp, Expr, i64),
     IndexAssign(str, Expr, AssignOp, Expr, i64),
     DerefAssign(Expr, AssignOp, Expr, i64),
@@ -339,6 +341,7 @@ pub enum Stmt {
     Backward(Expr, i64),
     Query(Vec<str>, Vec<Stmt>, i64),
     Select(Vec<SelectCase>, OptStmts, i64),
+    Parallel(Vec<Vec<Stmt> >, i64),  // F13: parallel { | branch1 | branch2 | ... }
 }
 
 // --- Declarations ---------------------------------------------------------
@@ -348,6 +351,9 @@ pub struct Param {
     pub ty: Type,
     pub is_pub: bool,
     pub annotations: Vec<Annotation>,
+    pub has_default: bool,
+    pub default_expr: Expr,
+    pub is_variadic: bool,
 }
 
 pub struct Annotation {
@@ -577,9 +583,9 @@ pub fn program_new() -> Program {
 
 pub fn stmt_line(s: Stmt) -> i64 {
     match s {
-        Stmt::Let(_, _, _, _, _, line) => { return line; }
+        Stmt::Let(_, _, _, _, _, _, line) => { return line; }
         Stmt::LetTuple(_, _, line) => { return line; }
-        Stmt::LetUninit(_, _, line) => { return line; }
+        Stmt::LetUninit(_, _, _, line) => { return line; }
         Stmt::Assign(_, _, _, line) => { return line; }
         Stmt::IndexAssign(_, _, _, _, line) => { return line; }
         Stmt::DerefAssign(_, _, _, line) => { return line; }
@@ -606,6 +612,7 @@ pub fn stmt_line(s: Stmt) -> i64 {
         Stmt::Backward(_, line) => { return line; }
         Stmt::Query(_, _, line) => { return line; }
         Stmt::Select(_, _, line) => { return line; }
+        Stmt::Parallel(_, line) => { return line; }
     }
 }
 
@@ -780,7 +787,7 @@ pub fn LayerInst_new(field: str, layer_type: str, args: Vec<str>) -> LayerInst {
 }
 
 pub fn Param_new(name: str, ty: Type, is_pub: bool) -> Param {
-    return Param { name: name, ty: ty, is_pub: is_pub, annotations: Vec::new() };
+    return Param { name: name, ty: ty, is_pub: is_pub, annotations: Vec::new(), has_default: false, default_expr: Expr::IntLit(0), is_variadic: false };
 }
 
 pub fn Annotation_new(name: str, args: Vec<str>) -> Annotation {
@@ -1031,6 +1038,8 @@ pub fn box_expr_unbox(b: Box<Expr>) -> Expr {
         Expr::QuantCast(e, target_ty) => { return Expr::QuantCast(e, target_ty); }
         Expr::Await(e) => { return Expr::Await(e); }
         Expr::Spawn(e) => { return Expr::Spawn(e); }
+        Expr::Yield(e) => { return Expr::Yield(e); }
+        Expr::NamedArg(name, e) => { return Expr::NamedArg(name, e); }
     }
     return Expr::IntLit(0);
 }

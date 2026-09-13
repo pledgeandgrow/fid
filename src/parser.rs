@@ -1552,6 +1552,7 @@ impl Parser {
             TokenKind::Use => self.parse_use_stmt(),
             TokenKind::Handle => self.parse_handle_stmt(),
             TokenKind::Do => self.parse_do_stmt(),
+            TokenKind::Resume => self.parse_resume_stmt(),
             TokenKind::Region => self.parse_region_block(),
             TokenKind::Sandbox => self.parse_sandbox_block(),
             TokenKind::Unsafe => self.parse_unsafe_block(),
@@ -3283,6 +3284,21 @@ impl Parser {
         self.expect(TokenKind::RParen, ")")?;
         self.match_tok(TokenKind::Semicolon);
         Ok(Stmt::Do { effect, op, args, line })
+    }
+
+    /// Parse `resume(cont, value)` — resume a continuation (L3A: effect handlers)
+    fn parse_resume_stmt(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
+        self.expect(TokenKind::Resume, "resume")?;
+        self.expect(TokenKind::LParen, "(")?;
+        // Parse continuation expression (usually just `cont`)
+        let cont = self.parse_expr()?;
+        self.expect(TokenKind::Comma, ",")?;
+        // Parse value to resume with
+        let value = self.parse_expr()?;
+        self.expect(TokenKind::RParen, ")")?;
+        self.match_tok(TokenKind::Semicolon);
+        Ok(Stmt::Resume { cont, value, line })
     }
 
     /// Parse `region r { body }`, `region r with budget(N) { body }`,

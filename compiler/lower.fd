@@ -108,6 +108,8 @@ pub fn box_expr_unbox(b: Box<Expr>) -> Expr {
         Expr::QuantCast(e, ty) => { return Expr::QuantCast(e, ty); }
         Expr::Await(e) => { return Expr::Await(e); }
         Expr::Spawn(e) => { return Expr::Spawn(e); }
+        Expr::Yield(e) => { return Expr::Yield(e); }
+        Expr::NamedArg(name, e) => { return Expr::NamedArg(name, e); }
     }
     return Expr::IntLit(0);
 }
@@ -158,6 +160,24 @@ pub struct StringTypeEntry {
 
 pub fn StringTypeEntry_new(key: str, val: Type) -> StringTypeEntry {
     return StringTypeEntry { key: key, val: val };
+}
+
+pub struct StringVecStrEntry {
+    pub key: str,
+    pub val: Vec<str>,
+}
+
+pub fn StringVecStrEntry_new(key: str, val: Vec<str>) -> StringVecStrEntry {
+    return StringVecStrEntry { key: key, val: val };
+}
+
+pub struct StringVecExprEntry {
+    pub key: str,
+    pub val: Vec<Expr>,
+}
+
+pub fn StringVecExprEntry_new(key: str, val: Vec<Expr>) -> StringVecExprEntry {
+    return StringVecExprEntry { key: key, val: val };
 }
 
 pub struct StringExprEntry {
@@ -484,6 +504,8 @@ pub struct Lowerer {
     pub vec_allocas: Vec<i64>,
     pub linear_structs: Vec<str>,
     pub let_hint: OptType,
+    pub func_param_names: Vec<StringVecStrEntry>,
+    pub func_defaults: Vec<StringVecExprEntry>,
 }
 
 // --- Lowerer methods ------------------------------------------------------
@@ -534,6 +556,8 @@ pub fn Lowerer_new() -> Lowerer {
         vec_allocas: Vec::new(),
         linear_structs: Vec::new(),
         let_hint: OptType::None,
+        func_param_names: Vec::new(),
+        func_defaults: Vec::new(),
     };
 }
 
@@ -1089,6 +1113,16 @@ pub fn Lowerer_add_extern_4(self: &mut Lowerer, name: str, p1: IrType, p2: IrTyp
     IrModule_add_extern(&mut self.module, name, params, ret);
 }
 
+pub fn Lowerer_add_extern_5(self: &mut Lowerer, name: str, p1: IrType, p2: IrType, p3: IrType, p4: IrType, p5: IrType, ret: IrType) {
+    var params: Vec<IrType> = Vec::new();
+    params.push(p1);
+    params.push(p2);
+    params.push(p3);
+    params.push(p4);
+    params.push(p5);
+    IrModule_add_extern(&mut self.module, name, params, ret);
+}
+
 // Common type aliases
 pub fn ptr_u8() -> IrType { return IrType::Ptr(Box::new(IrType::U8)); }
 pub fn opaque_ty(name: str) -> IrType { return IrType::Opaque(name); }
@@ -1514,6 +1548,7 @@ pub fn Lowerer_register_runtime(self: &mut Lowerer) {
 
     // String conversions
     Lowerer_add_extern_2(self, "p_str_concat", ptr_u8(), ptr_u8(), ptr_u8());
+    Lowerer_add_extern_1(self, "p_str_join_n", ptr_u8(), ptr_u8());
     // Mutable string builder (avoids O(n^2) memory from string concat)
     Lowerer_add_extern_0(self, "p_sb_new", IrType::I64);
     Lowerer_add_extern_2(self, "p_sb_append", IrType::I64, ptr_u8(), IrType::Void);
@@ -1645,6 +1680,7 @@ pub fn Lowerer_register_runtime(self: &mut Lowerer) {
     // File I/O
     Lowerer_add_extern_1(self, "p_file_read", ptr_u8(), ptr_u8());
     Lowerer_add_extern_2(self, "p_file_write", ptr_u8(), ptr_u8(), IrType::I64);
+    Lowerer_add_extern_3(self, "p_file_write_bin", ptr_u8(), ptr_u8(), IrType::I64, IrType::I64);
     Lowerer_add_extern_2(self, "p_file_write_vec", ptr_u8(), vec_i64_ty, IrType::I64);
     Lowerer_add_extern_1(self, "p_file_exists", ptr_u8(), IrType::Bool);
     Lowerer_add_extern_2(self, "p_file_append", ptr_u8(), ptr_u8(), IrType::I64);
@@ -1675,10 +1711,31 @@ pub fn Lowerer_register_runtime(self: &mut Lowerer) {
     Lowerer_add_extern_0(self, "p_cli", IrType::Void);
     Lowerer_add_extern_0(self, "p_sti", IrType::Void);
     Lowerer_add_extern_1(self, "p_lidt", ptr_u8(), IrType::Void);
-    Lowerer_add_extern_2(self, "p_idt_set_entry", IrType::I64, IrType::I64, IrType::Void);
+    // F29: p_idt_set_entry(idt_ptr, vector, handler, flags) — 4 params
+    Lowerer_add_extern_4(self, "p_idt_set_entry", IrType::I64, IrType::I64, IrType::I64, IrType::I64, IrType::Void);
     Lowerer_add_extern_0(self, "p_hlt", IrType::Void);
     Lowerer_add_extern_1(self, "p_inb", IrType::I64, IrType::I64);
     Lowerer_add_extern_2(self, "p_outb", IrType::I64, IrType::I64, IrType::Void);
+    Lowerer_add_extern_1(self, "p_inw", IrType::I64, IrType::I64);
+    Lowerer_add_extern_2(self, "p_outw", IrType::I64, IrType::I64, IrType::Void);
+    Lowerer_add_extern_1(self, "p_inl", IrType::I64, IrType::I64);
+    Lowerer_add_extern_2(self, "p_outl", IrType::I64, IrType::I64, IrType::Void);
+
+    // GDT
+    Lowerer_add_extern_1(self, "p_lgdt", IrType::I64, IrType::Void);
+    Lowerer_add_extern_5(self, "p_gdt_set_entry", IrType::I64, IrType::I64, IrType::I64, IrType::I64, IrType::I64, IrType::Void);
+
+    // Serial port (bare-metal)
+    Lowerer_add_extern_0(self, "p_serial_init", IrType::Void);
+    Lowerer_add_extern_1(self, "p_serial_write", IrType::I64, IrType::Void);
+    Lowerer_add_extern_0(self, "p_serial_read", IrType::I64);
+    Lowerer_add_extern_0(self, "p_serial_ready", IrType::I64);
+
+    // User mode transition
+    Lowerer_add_extern_2(self, "p_enter_user_mode", IrType::I64, IrType::I64, IrType::Void);
+
+    // Memory
+    Lowerer_add_extern_3(self, "p_memset", IrType::I64, IrType::I32, IrType::I64, IrType::Void);
 
     // MMU/page table
     Lowerer_add_extern_0(self, "p_cr3_read", IrType::I64);
@@ -1725,6 +1782,7 @@ pub fn Lowerer_register_runtime(self: &mut Lowerer) {
 
     // Threads/executor
     Lowerer_add_extern_2(self, "p_thread_spawn", ptr_u8(), IrType::I64, IrType::I64);
+    Lowerer_add_extern_1(self, "p_thread_join", IrType::I64, IrType::Void);
     Lowerer_add_extern_0(self, "p_executor_new", IrType::I64);
     Lowerer_add_extern_3(self, "p_executor_spawn", IrType::I64, ptr_u8(), IrType::I64, IrType::I64);
     Lowerer_add_extern_2(self, "p_executor_block_on", IrType::I64, IrType::I64, IrType::I64);
@@ -1732,6 +1790,15 @@ pub fn Lowerer_register_runtime(self: &mut Lowerer) {
     Lowerer_add_extern_1(self, "p_task_is_ready", IrType::I64, IrType::Bool);
     Lowerer_add_extern_1(self, "p_executor_run_all", IrType::I64, IrType::I64);
     Lowerer_add_extern_1(self, "p_executor_poll_all", IrType::I64, IrType::I64);
+
+    // Green threads (cooperative scheduler)
+    Lowerer_add_extern_2(self, "p_gt_spawn", IrType::I64, IrType::I64, IrType::I64);
+    Lowerer_add_extern_0(self, "p_gt_yield", IrType::Void);
+    Lowerer_add_extern_0(self, "p_gt_run_all", IrType::I64);
+    Lowerer_add_extern_1(self, "p_gt_is_done", IrType::I64, IrType::Bool);
+    Lowerer_add_extern_1(self, "p_gt_get_result", IrType::I64, IrType::I64);
+    Lowerer_add_extern_0(self, "p_gt_current", IrType::I64);
+    Lowerer_add_extern_0(self, "p_gt_reset", IrType::Void);
     Lowerer_add_extern_1(self, "p_task_poll_nonblocking", IrType::I64, IrType::I64);
 
     // Non-blocking IO
@@ -2002,6 +2069,21 @@ pub fn Lowerer_lower_program(self: &mut Lowerer, program: Program) -> IrModule {
         if func.is_async {
             Lowerer_insert_async_func(self, func.name);
         }
+        // Store parameter names for named argument resolution
+        var param_names: Vec<str> = Vec::new();
+        var defaults: Vec<Expr> = Vec::new();
+        var pi: i64 = 0;
+        while pi < func.params.len() {
+            param_names.push(func.params.get(pi).name);
+            if func.params.get(pi).has_default {
+                defaults.push(func.params.get(pi).default_expr);
+            } else {
+                defaults.push(Expr::IntLit(0));
+            }
+            pi = pi + 1;
+        }
+        self.func_param_names.push(StringVecStrEntry_new(func.name, param_names));
+        self.func_defaults.push(StringVecExprEntry_new(func.name, defaults));
         i = i + 1;
     }
 
@@ -2154,7 +2236,8 @@ pub fn Lowerer_lower_func(self: &mut Lowerer, func: Func) {
     ir_func.is_crashfree = has_annotation(func.annotations, "crashfree");
     ir_func.is_no_alloc = has_annotation(func.annotations, "no-alloc") || has_annotation(func.annotations, "medical");
     ir_func.is_medical = has_annotation(func.annotations, "medical");
-    ir_func.is_kernel = has_annotation(func.annotations, "kernel");
+    ir_func.is_kernel = has_annotation(func.annotations, "kernel") || has_annotation(func.annotations, "shader");
+    ir_func.is_simd = has_annotation(func.annotations, "simd");
 
     // Parse @gas(N) annotation
     match find_annotation(func.annotations, "gas") {
@@ -2169,9 +2252,14 @@ pub fn Lowerer_lower_func(self: &mut Lowerer, func: Func) {
         OptAnnotation::None => {}
     }
 
-    // Parse @kernel workgroup size
+    // Parse @kernel/@shader workgroup size
     if ir_func.is_kernel {
-        match find_annotation(func.annotations, "kernel") {
+        var kern_ann: OptAnnotation = find_annotation(func.annotations, "kernel");
+        match kern_ann {
+            OptAnnotation::Some(_) => {}
+            OptAnnotation::None => { kern_ann = find_annotation(func.annotations, "shader"); }
+        }
+        match kern_ann {
             OptAnnotation::Some(kann) => {
                 if kann.args.len() > 0 {
                     // Join args with "," and parse as [x,y,z] or x,y,z
@@ -2421,7 +2509,7 @@ pub fn Lowerer_lower_stmts(self: &mut Lowerer, stmts: Vec<Stmt>) {
 // --- Lowerer_lower_stmt helper functions ----------------------------------
 // Split out to avoid the statement-dropping bug in long functions.
 
-fn Lowerer_lower_let_stmt(self: &mut Lowerer, name: str, ty: OptType, expr: Expr, _is_mut: bool, is_persist: bool, _line: i64) {
+fn Lowerer_lower_let_stmt(self: &mut Lowerer, name: str, ty: OptType, expr: Expr, _is_mut: bool, is_persist: bool, annotations: Vec<Annotation>, _line: i64) {
     var saved_hint: OptType = self.let_hint;
     match ty {
         OptType::Some(t) => {
@@ -2527,6 +2615,13 @@ fn Lowerer_lower_let_stmt(self: &mut Lowerer, name: str, ty: OptType, expr: Expr
             self.current_func.drop_locals.push(ValueIdString_new(alloca, struct_name));
         }
         OptStringLower::None => {}
+    }
+    // F88: @zeroize — track locals to zero at scope exit
+    if has_annotation(annotations, "zeroize") {
+        var size: i64 = ir_type_size(ir_ty);
+        if size > 0 {
+            self.current_func.zeroize_locals.push(ValueIdU64_new(alloca, size));
+        }
     }
 }
 
@@ -2774,15 +2869,22 @@ fn Lowerer_lower_select_stmt(self: &mut Lowerer, cases: Vec<SelectCase>, default
 
 pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
     match stmt {
-        Stmt::Let(name, ty, expr, _is_mut, is_persist, _line) => {
-            Lowerer_lower_let_stmt(self, name, ty, expr, _is_mut, is_persist, _line);
+        Stmt::Let(name, ty, expr, _is_mut, is_persist, annotations, _line) => {
+            Lowerer_lower_let_stmt(self, name, ty, expr, _is_mut, is_persist, annotations, _line);
         }
-        Stmt::LetUninit(name, ty, _line) => {
+        Stmt::LetUninit(name, ty, annotations, _line) => {
             var ir_ty: IrType = Lowerer_lower_type(self, ty);
             var alloca: i64 = Lowerer_emit_inst(self, Inst::Alloca(ir_ty, Lowerer_current_region(self)));
             Lowerer_insert_alloca_type(self, alloca, ir_ty);
             Lowerer_insert_alloca(self, name, alloca);
             Lowerer_bind_local(self, name, alloca);
+            // F88: @zeroize — track locals to zero at scope exit
+            if has_annotation(annotations, "zeroize") {
+                var size: i64 = ir_type_size(ir_ty);
+                if size > 0 {
+                    self.current_func.zeroize_locals.push(ValueIdU64_new(alloca, size));
+                }
+            }
         }
         Stmt::LetTuple(names, expr, _line) => {
             var tuple_ptr: i64 = Lowerer_lower_expr(self, expr);
@@ -3140,6 +3242,63 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
         }
         Stmt::Select(cases, default, _line) => {
             Lowerer_lower_select_stmt(self, cases, default, _line);
+        }
+        Stmt::Parallel(branches, _line) => {
+            // F13: parallel { | branch1 | branch2 | ... }
+            // Fork-join parallelism: spawn each branch as a thread, then join all.
+            // For branches that are a single call expression, spawn via p_thread_spawn.
+            // For complex branches, execute sequentially (semantics preserved).
+            // All spawned threads are joined before continuing.
+            var thread_handles: Vec<i64> = Vec::new();
+            var bi: i64 = 0;
+            while bi < branches.len() {
+                var branch: Vec<Stmt> = branches.get(bi);
+                // Check if branch is a single expression statement that is a call
+                var spawned: bool = false;
+                if branch.len() == 1 {
+                    match branch.get(0) {
+                        Stmt::Expr(e, _l) => {
+                            match e {
+                                Expr::Call(callee, args) => {
+                                    // Spawn: p_thread_spawn(func_name, num_args, args...)
+                                    var func_name_val: i64 = Lowerer_emit_inst(self, Inst::ConstStr(callee));
+                                    var num_args_val: i64 = Lowerer_emit_inst(self, Inst::ConstInt(args.len(), IrType::I64));
+                                    var all_args: Vec<i64> = Vec::new();
+                                    all_args.push(func_name_val);
+                                    all_args.push(num_args_val);
+                                    var ai: i64 = 0;
+                                    while ai < args.len() {
+                                        all_args.push(Lowerer_lower_expr(self, args.get(ai)));
+                                        ai = ai + 1;
+                                    }
+                                    var handle: i64 = Lowerer_emit_inst(self, Inst::Call("p_thread_spawn", all_args, IrType::I64, EffectSet_new()));
+                                    thread_handles.push(handle);
+                                    spawned = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !spawned {
+                    // Complex branch — execute sequentially
+                    var si: i64 = 0;
+                    while si < branch.len() {
+                        Lowerer_lower_stmt(self, branch.get(si));
+                        si = si + 1;
+                    }
+                }
+                bi = bi + 1;
+            }
+            // Join all spawned threads
+            var ji: i64 = 0;
+            while ji < thread_handles.len() {
+                var join_args: Vec<i64> = Vec::new();
+                join_args.push(thread_handles.get(ji));
+                var _v: i64 = Lowerer_emit_inst(self, Inst::Call("p_thread_join", join_args, IrType::Void, EffectSet_new()));
+                ji = ji + 1;
+            }
         }
         Stmt::Handle(body, handlers, _line) => {
             // Effect handler: lower the body. When a `do Effect.op(args)` is
@@ -3627,11 +3786,143 @@ pub fn Lowerer_box_struct_arg(self: &mut Lowerer, call_args: Vec<i64>, struct_ty
 // These are split out from Lowerer_lower_expr to avoid the statement-dropping
 // bug that affects very long functions in the self-hosted compiler.
 
-fn Lowerer_lower_call_expr(self: &mut Lowerer, callee: str, args: Vec<Expr>) -> i64 {
-    var arg_vals: Vec<i64> = Vec::new();
+fn Lowerer_resolve_call_args(self: &mut Lowerer, callee: str, args: Vec<Expr>) -> Vec<Expr> {
+    // Look up param names and defaults for this function
+    var param_names: Vec<str> = Lowerer_lookup_param_names(self, callee);
+    var defaults: Vec<Expr> = Lowerer_lookup_defaults(self, callee);
+    var n_params: i64 = param_names.len();
+    if n_params == 0 {
+        // Unknown function — can't resolve, return as-is
+        return args;
+    }
+
+    // Check if any args are named
+    var has_named: bool = false;
     var ai: i64 = 0;
     while ai < args.len() {
-        arg_vals.push(Lowerer_lower_expr(self, args.get(ai)));
+        match args.get(ai) {
+            Expr::NamedArg(_, _) => { has_named = true; }
+            _ => {}
+        }
+        ai = ai + 1;
+    }
+
+    if !has_named {
+        // No named args — fill in defaults for missing args
+        if args.len() >= n_params {
+            return args;
+        }
+        var result: Vec<Expr> = Vec::new();
+        ai = 0;
+        while ai < args.len() {
+            result.push(args.get(ai));
+            ai = ai + 1;
+        }
+        // Fill in defaults for remaining params
+        ai = args.len();
+        while ai < n_params {
+            if ai < defaults.len() {
+                result.push(defaults.get(ai));
+            } else {
+                result.push(Expr::IntLit(0));
+            }
+            ai = ai + 1;
+        }
+        return result;
+    }
+
+    // Named args present — resolve to positional order using param names
+    // Build positional array — use a Vec<Expr> and a Vec<bool> to track filled slots
+    var positional: Vec<Expr> = Vec::new();
+    var filled: Vec<bool> = Vec::new();
+    var pi: i64 = 0;
+    while pi < n_params {
+        positional.push(Expr::IntLit(0));
+        filled.push(false);
+        pi = pi + 1;
+    }
+
+    // Place positional args first, then named args by name
+    var pos_idx: i64 = 0;
+    ai = 0;
+    while ai < args.len() {
+        match args.get(ai) {
+            Expr::NamedArg(name, e) => {
+                // Find the param index by name
+                var found_idx: i64 = -1;
+                var ni: i64 = 0;
+                while ni < n_params {
+                    if str_equal(param_names.get(ni), name) {
+                        found_idx = ni;
+                    }
+                    ni = ni + 1;
+                }
+                if found_idx >= 0 {
+                    positional.set(found_idx, box_expr_unbox(e));
+                    filled.set(found_idx, true);
+                }
+            }
+            other => {
+                if pos_idx < n_params {
+                    positional.set(pos_idx, other);
+                    filled.set(pos_idx, true);
+                    pos_idx = pos_idx + 1;
+                }
+            }
+        }
+        ai = ai + 1;
+    }
+
+    // Build result — filled slots get their value, unfilled get defaults
+    var result: Vec<Expr> = Vec::new();
+    pi = 0;
+    while pi < n_params {
+        if filled.get(pi) {
+            result.push(positional.get(pi));
+        } else if pi < defaults.len() {
+            result.push(defaults.get(pi));
+        } else {
+            result.push(Expr::IntLit(0));
+        }
+        pi = pi + 1;
+    }
+    return result;
+}
+
+fn Lowerer_lookup_defaults(self: &mut Lowerer, callee: str) -> Vec<Expr> {
+    var result: Vec<Expr> = Vec::new();
+    var fi: i64 = 0;
+    while fi < self.func_defaults.len() {
+        var entry: StringVecExprEntry = self.func_defaults.get(fi);
+        if str_equal(entry.key, callee) {
+            return entry.val;
+        }
+        fi = fi + 1;
+    }
+    return result;
+}
+
+fn Lowerer_lookup_param_names(self: &mut Lowerer, callee: str) -> Vec<str> {
+    // Look up function param names from the func_param_names table
+    var result: Vec<str> = Vec::new();
+    var fi: i64 = 0;
+    while fi < self.func_param_names.len() {
+        var entry: StringVecStrEntry = self.func_param_names.get(fi);
+        if str_equal(entry.key, callee) {
+            return entry.val;
+        }
+        fi = fi + 1;
+    }
+    return result;
+}
+
+fn Lowerer_lower_call_expr(self: &mut Lowerer, callee: str, args: Vec<Expr>) -> i64 {
+    // Resolve named arguments to positional order and fill in defaults
+    var resolved_args: Vec<Expr> = Lowerer_resolve_call_args(self, callee, args);
+    var arg_vals: Vec<i64> = Vec::new();
+    var ai: i64 = 0;
+    while ai < resolved_args.len() {
+        arg_vals.push(Lowerer_lower_expr(self, resolved_args.get(ai)));
         ai = ai + 1;
     }
 
@@ -4362,6 +4653,13 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             match IrModule_get_global(&self.module, name) {
                 OptGlobalLookup::Some(ir_ty, _init) => {
                     var addr: i64 = Lowerer_emit_inst(self, Inst::GlobalAddr(name, ir_ty));
+                    // For struct/enum types, the GlobalAddr already gives a
+                    // pointer to the struct. Return it directly without a Load
+                    // (matching the pattern for struct locals above).
+                    match ir_ty {
+                        IrType::Struct(_) => { return addr; }
+                        _ => {}
+                    }
                     return Lowerer_emit_inst(self, Inst::Load(addr, ir_ty));
                 }
                 OptGlobalLookup::None => {}
@@ -5031,6 +5329,13 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                 }
             }
         }
+        Expr::Yield(e) => {
+            // yield <expr> - evaluate the inner expression (no-op for now)
+            return Lowerer_lower_expr(self, box_expr_unbox(e));
+        }
+        Expr::NamedArg(name, e) => {
+            return Lowerer_lower_expr(self, box_expr_unbox(e));
+        }
         Expr::ComptimeReflect(op, ty) => {
             return Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
         }
@@ -5123,11 +5428,11 @@ pub fn Lowerer_collect_free_vars(self: &Lowerer, stmts: Vec<Stmt>, free_vars: &m
 /// Collect free variables from a single statement.
 pub fn Lowerer_collect_free_vars_stmt(self: &Lowerer, stmt: Stmt, free_vars: &mut Vec<str>, local_names: &mut Vec<str>) {
     match stmt {
-        Stmt::Let(name, _ty, expr, _is_mut, _is_persist, _line) => {
+        Stmt::Let(name, _ty, expr, _is_mut, _is_persist, _annotations, _line) => {
             Lowerer_collect_free_vars_expr(self, expr, free_vars, local_names);
             local_names.push(name);
         }
-        Stmt::LetUninit(name, _ty, _line) => {
+        Stmt::LetUninit(name, _ty, _annotations, _line) => {
             local_names.push(name);
         }
         Stmt::LetTuple(names, expr, _line) => {
@@ -5342,6 +5647,8 @@ pub fn Lowerer_collect_free_vars_expr(self: &Lowerer, expr: Expr, free_vars: &mu
         Expr::QuantCast(e) => { Lowerer_collect_free_vars_expr(self, box_expr_unbox(e), free_vars, local_names); }
         Expr::Await(e) => { Lowerer_collect_free_vars_expr(self, box_expr_unbox(e), free_vars, local_names); }
         Expr::Spawn(e) => { Lowerer_collect_free_vars_expr(self, box_expr_unbox(e), free_vars, local_names); }
+        Expr::Yield(e) => { Lowerer_collect_free_vars_expr(self, box_expr_unbox(e), free_vars, local_names); }
+        Expr::NamedArg(name, e) => { Lowerer_collect_free_vars_expr(self, box_expr_unbox(e), free_vars, local_names); }
     }
 }
 
@@ -5987,6 +6294,8 @@ pub fn Lowerer_has_drop_impl(self: &Lowerer, struct_name: str) -> bool {
 }
 
 pub fn Lowerer_emit_drops(self: &mut Lowerer) {
+    // F88: @zeroize — emit memset(0) for zeroize_locals before drops
+    Lowerer_emit_zeroize(self);
     // Emit drop calls for locals with Drop impls, in reverse order
     var i: i64 = self.current_func.drop_locals.len() - 1;
     while i >= 0 {
@@ -5997,6 +6306,27 @@ pub fn Lowerer_emit_drops(self: &mut Lowerer) {
         args.push(Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64)));  // __env
         args.push(entry.id);
         var _v: i64 = Lowerer_emit_inst(self, Inst::Call(drop_name, args, IrType::Void, EffectSet_new()));
+        i = i - 1;
+    }
+}
+
+/// F88: Emit compiler-inserted memset(0) calls for all @zeroize locals.
+/// Called before drops and returns. Wipes secrets from memory at scope exit.
+/// Emits in reverse declaration order (LIFO — last declared wiped first).
+pub fn Lowerer_emit_zeroize(self: &mut Lowerer) {
+    var i: i64 = self.current_func.zeroize_locals.len() - 1;
+    while i >= 0 {
+        var entry: ValueIdU64 = self.current_func.zeroize_locals.get(i);
+        // Emit: p_memset(alloca_ptr, 0, size)
+        var zero_val: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I32));
+        var size_val: i64 = Lowerer_emit_inst(self, Inst::ConstInt(entry.val, IrType::I64));
+        var args: Vec<i64> = Vec::new();
+        args.push(entry.id);
+        args.push(zero_val);
+        args.push(size_val);
+        var eff: EffectSet = EffectSet_new();
+        EffectSet_add(eff, Effect::Write);
+        var _v: i64 = Lowerer_emit_inst(self, Inst::Call("p_memset", args, IrType::Void, eff));
         i = i - 1;
     }
 }
@@ -6202,6 +6532,8 @@ pub fn Lowerer_infer_expr_type(self: &Lowerer, expr: Expr) -> IrType {
             }
             return Lowerer_lookup_func_ret_ty_ir(self, method);
         }
+        Expr::Yield(e) => { return Lowerer_infer_expr_type(self, box_expr_unbox(e)); }
+        Expr::NamedArg(name, e) => { return Lowerer_infer_expr_type(self, box_expr_unbox(e)); }
         _ => { return IrType::I64; }
     }
     return IrType::I64;

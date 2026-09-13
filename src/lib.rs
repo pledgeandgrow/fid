@@ -1,6 +1,18 @@
 // lib.rs — Library target for fidesc, exposing modules to other binaries
 // (scribe, veil, ark). The main.rs binary also uses these modules.
 
+// The Fides compiler is a multi-backend compiler (interpreter, PE, ELF, C,
+// WASM, ARM64, RISC-V). Not all code paths are exercised in every build
+// configuration, but all backends must remain available. Suppress dead-code
+// warnings at the crate level rather than deleting unused code.
+#![allow(dead_code)]
+#![allow(unused_variables)]
+#![allow(unused_imports)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unreachable_patterns)]
+#![allow(non_snake_case)]
+
 pub mod ast;
 pub mod borrowck;
 pub mod codegen;

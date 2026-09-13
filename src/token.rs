@@ -48,6 +48,7 @@ pub enum TokenKind {
     Continue,    // continue
     Handle,      // handle — effect handler
     Do,          // do — perform effect operation
+    Resume,      // resume — resume a continuation (effect handlers)
     Interrupt,   // interrupt — interrupt handler (bare-metal)
     Extern,      // extern — FFI declarations
     Guard,       // guard — early exit: guard cond => action
@@ -170,7 +171,7 @@ impl TokenKind {
             TokenKind::Where | TokenKind::Region | TokenKind::Sandbox | TokenKind::Unsafe |
             TokenKind::Txn | TokenKind::Persist | TokenKind::For | TokenKind::While |
             TokenKind::Loop | TokenKind::Break | TokenKind::Continue | TokenKind::Handle |
-            TokenKind::Do | TokenKind::Interrupt | TokenKind::Extern | TokenKind::Guard |
+            TokenKind::Do | TokenKind::Resume | TokenKind::Interrupt | TokenKind::Extern | TokenKind::Guard |
             TokenKind::Is | TokenKind::True | TokenKind::False |
             TokenKind::Layer | TokenKind::Model | TokenKind::Grad | TokenKind::Backward |
             TokenKind::Kernel |
@@ -241,6 +242,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Continue => write!(f, "continue"),
             TokenKind::Handle => write!(f, "handle"),
             TokenKind::Do => write!(f, "do"),
+            TokenKind::Resume => write!(f, "resume"),
             TokenKind::Interrupt => write!(f, "interrupt"),
             TokenKind::Guard => write!(f, "guard"),
             TokenKind::Is => write!(f, "is"),

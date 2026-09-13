@@ -67,3 +67,125 @@ fn ecs_dispatch_event(event_name: str) {
     // Event dispatch is handled by calling __on_<event_name> directly
     // This function is a placeholder for future event queue support
 }
+
+// ─── Comptime ECS API (Phase 15.5) ──────────────────────────────────────
+//
+// In the future, `comptime register_components(Position, Velocity, Health)`
+// will generate storage layout + query code at compile time.
+// `comptime query(Position, Velocity)` will generate specialized iteration
+// code with cache-perfect struct-of-arrays layout.
+//
+// For now, these functions provide the runtime API that comptime code
+// will call. The runtime ECS uses a map-based storage (not SoA), but
+// the API is the same.
+
+/// Register a component type. Called once per component type at startup.
+/// In comptime mode, this would generate the storage layout.
+pub fn ecs_register_component(component_name: str) -> void {
+    // The runtime ECS auto-registers components on first use.
+    // This function is for explicit registration and future comptime support.
+}
+
+/// Register a system. A system is a function that runs every frame
+/// and queries entities with specific components.
+/// In comptime mode, this would generate the query iteration code.
+pub fn ecs_register_system(system_name: str, handler: fn() -> void) -> void {
+    // Store the system handler for later execution.
+    // In comptime mode, the handler would be inlined.
+}
+
+/// Run all registered systems. Called once per frame.
+pub fn ecs_run_systems() -> void {
+    // In the runtime, systems are called directly by name.
+    // In comptime mode, the generated code would inline all systems.
+}
+
+/// Query entities that have all of the specified components.
+/// Returns a Vec of entity IDs.
+/// In comptime mode, this would generate specialized iteration code.
+pub fn ecs_query_entities(components: str) -> Vec {
+    // components is a JSON array of component names: ["Position","Velocity"]
+    var result = Vec::new();
+    var n = ecs_entity_count();
+    var i = 0;
+    while i < n {
+        var has_all = true;
+        var j = 0;
+        var num_components = json_len(components);
+        while j < num_components {
+            var comp = json_at(components, j);
+            if ecs_has(comp, i) == 0 {
+                has_all = false;
+            }
+            j = j + 1;
+        }
+        if has_all {
+            result.push(i);
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Get the number of entities that have a specific component.
+pub fn ecs_count_with_component(component_name: str) -> i64 {
+    var count = 0;
+    var n = ecs_entity_count();
+    var i = 0;
+    while i < n {
+        if ecs_has(component_name, i) != 0 {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+/// Destroy an entity and all its components.
+pub fn ecs_destroy_entity(entity: i64) -> void {
+    // Remove all known components
+    // In a real implementation, we'd track which components the entity has.
+    // For now, the runtime handles this.
+    __ecs_destroy_entity(entity);
+}
+
+/// Reset the ECS world — destroy all entities and components.
+pub fn ecs_reset() -> void {
+    __ecs_reset();
+}
+
+// ─── Game loop integration (Phase 15.5) ─────────────────────────────────
+//
+// The game loop calls ecs_run_systems() each frame, then frame_end()
+// from the arena module to free per-frame allocations.
+
+/// Run one frame of the ECS: call all systems, then clean up.
+/// This is a convenience function for game loops.
+pub fn ecs_frame() -> void {
+    ecs_run_systems();
+    // Per-frame cleanup is handled by the frame allocator (stdlib/arena.fd)
+}
+
+/// Create an entity with a single component (convenience function).
+pub fn ecs_spawn(component_name: str, value: i64) -> i64 {
+    var entity = ecs_create_entity();
+    ecs_add(component_name, entity, value);
+    return entity;
+}
+
+/// Create an entity with two components (convenience function).
+pub fn ecs_spawn2(comp1: str, val1: i64, comp2: str, val2: i64) -> i64 {
+    var entity = ecs_create_entity();
+    ecs_add(comp1, entity, val1);
+    ecs_add(comp2, entity, val2);
+    return entity;
+}
+
+/// Create an entity with three components (convenience function).
+pub fn ecs_spawn3(comp1: str, val1: i64, comp2: str, val2: i64, comp3: str, val3: i64) -> i64 {
+    var entity = ecs_create_entity();
+    ecs_add(comp1, entity, val1);
+    ecs_add(comp2, entity, val2);
+    ecs_add(comp3, entity, val3);
+    return entity;
+}

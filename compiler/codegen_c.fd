@@ -166,6 +166,40 @@ pub fn c_type(ty: IrType) -> str {
     return "void";
 }
 
+// Like c_type but returns value type (not pointer) for structs.
+// Used for global variable declarations which need inline struct storage.
+pub fn c_type_global(ty: IrType) -> str {
+    match ty {
+        IrType::I8 => { return "int8_t"; }
+        IrType::I16 => { return "int16_t"; }
+        IrType::I32 => { return "int32_t"; }
+        IrType::I64 => { return "int64_t"; }
+        IrType::U8 => { return "uint8_t"; }
+        IrType::U16 => { return "uint16_t"; }
+        IrType::U32 => { return "uint32_t"; }
+        IrType::U64 => { return "uint64_t"; }
+        IrType::F32 => { return "float"; }
+        IrType::F64 => { return "double"; }
+        IrType::Bool => { return "bool"; }
+        IrType::Ptr(_) => { return "void*"; }
+        IrType::Struct(name) => { return "struct " + name + "_s"; }
+        IrType::Array(elem, size) => { return c_type_global(box_ir_type_unbox(elem)) + "[" + int_to_str(size) + "]"; }
+        IrType::Void => { return "void"; }
+        IrType::Never => { return "void"; }
+        IrType::Opaque(name) => {
+            if str_equal(name, "String") { return "const char*"; }
+            if str_equal(name, "Vec") || str_equal(name, "HashMap") { return "void*"; }
+            return "void*";
+        }
+        IrType::Generic(name, _) => {
+            if str_equal(name, "String") { return "const char*"; }
+            if str_equal(name, "Vec") || str_equal(name, "HashMap") { return "void*"; }
+            return "void*";
+        }
+    }
+    return "void";
+}
+
 // Box<IrType> unbox helper
 pub fn box_ir_type_unbox(b: Box<IrType>) -> IrType {
     match b {
@@ -874,6 +908,7 @@ fn CCodeGen_insert_runtime_sigs(self: &mut CCodeGen) -> void {
 
     // Varargs (fixed prefix only)
     fn_param_types_set(self, "p_thread_spawn", t2(ptr_u8(), IrType::I64));
+    fn_param_types_set(self, "p_thread_join", t1(IrType::I64));
     fn_param_types_set(self, "p_executor_spawn", t3(IrType::I64, ptr_u8(), IrType::I64));
 
     // Channels
@@ -1376,9 +1411,15 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_cmos_read(int64_t reg);");
     wln(self, "void p_cmos_write(int64_t reg, int64_t val);");
     wln(self, "void p_serial_init(void);");
+    wln(self, "void p_serial_write(int64_t c);");
+    wln(self, "int64_t p_serial_read(void);");
+    wln(self, "int64_t p_serial_ready(void);");
     wln(self, "void p_serial_putc(int64_t c);");
     wln(self, "int64_t p_serial_getc(void);");
     wln(self, "int64_t p_serial_available(void);");
+    wln(self, "void p_memset(void* ptr, int val, int64_t size);");
+    wln(self, "void p_lgdt(int64_t gdt_desc);");
+    wln(self, "void p_enter_user_mode(int64_t entry, int64_t stack);");
     wln(self, "void p_pit_set_frequency(int64_t hz);");
     wln(self, "int64_t p_hpet_read(int64_t reg);");
     wln(self, "void p_hpet_write(int64_t reg, int64_t val);");
@@ -1595,6 +1636,7 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_future_ready(int64_t value);");
     wln(self, "int64_t p_future_poll(int64_t future);");
     wln(self, "int64_t p_thread_spawn(const char* func_name, int64_t num_args, ...);");
+    wln(self, "void p_thread_join(int64_t handle);");
     wln(self, "int64_t p_executor_new(void);");
     wln(self, "int64_t p_executor_spawn(int64_t exec, const char* func_name, int64_t num_args, ...);");
     wln(self, "int64_t p_executor_block_on(int64_t exec, int64_t future);");
@@ -1986,10 +2028,19 @@ fn emit_globals(self: &mut CCodeGen, module: IrModule) -> void {
     var gi: i64 = 0;
     while gi < module.globals.len() {
         var entry: GlobalEntry = module.globals.get(gi);
-        var c_ty: str = c_type(entry.ty);
+        var c_ty: str = c_type_global(entry.ty);
         var c_name: str = global_c_name(entry.name);
-        var init_str: str = gen_global_init_expr(entry.init);
-        wln(self, "static " + c_ty + " " + c_name + " = " + init_str + ";");
+        var is_struct: bool = false;
+        match entry.ty {
+            IrType::Struct(_) => { is_struct = true; }
+            _ => {}
+        }
+        if is_struct {
+            wln(self, "static " + c_ty + " " + c_name + " = {0};");
+        } else {
+            var init_str: str = gen_global_init_expr(entry.init);
+            wln(self, "static " + c_ty + " " + c_name + " = " + init_str + ";");
+        }
         gi = gi + 1;
     }
     wln(self, "");
@@ -2031,8 +2082,25 @@ fn emit_global_init_function(self: &CCodeGen, module: IrModule) -> void {
         var entry: GlobalEntry = module.globals.get(gi);
         if !is_simple_init_expr(entry.init) {
             var c_name: str = global_c_name(entry.name);
-            var val_str: str = gen_global_runtime_expr(self, entry.init);
-            wln(self, "    " + c_name + " = " + val_str + ";");
+            var is_struct_global: bool = false;
+            match entry.ty {
+                IrType::Struct(sname) => {
+                    is_struct_global = true;
+                    var size: i64 = 8;
+                    var si: i64 = 0;
+                    while si < module.struct_layouts.len() {
+                        var sl: StructLayoutEntry = module.struct_layouts.get(si);
+                        if str_equal(sl.name, sname) { size = sl.layout.size; break; }
+                        si = si + 1;
+                    }
+                    wln(self, "    memset(&" + c_name + ", 0, " + int_to_str(size) + ");");
+                }
+                _ => {}
+            }
+            if !is_struct_global {
+                var val_str: str = gen_global_runtime_expr(self, entry.init);
+                wln(self, "    " + c_name + " = " + val_str + ";");
+            }
         }
         gi = gi + 1;
     }
@@ -2987,8 +3055,47 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
             }
             wln(self, "    }");
         }
-        Inst::DynCall(_, _, _, _, _) => {
-            wln(self, "    // DynCall not implemented in C backend");
+        Inst::DynCall(trait_name, method, args, ret_ty, _) => {
+            var void_ret: bool = str_equal(c_ret_type(ret_ty), "void");
+            wln(self, "    /* dyncall " + trait_name + "::" + method + " */");
+            if args.len() > 0 {
+                var type_arg: str = val_name(self, args.get(0));
+                var candidates: Vec<str> = Vec::new();
+                var ci: i64 = 0;
+                while ci < self.user_functions.len() {
+                    var fname: str = self.user_functions.get(ci);
+                    if str_ends_with(fname, "_" + method) {
+                        candidates.push(fname);
+                    }
+                    ci = ci + 1;
+                }
+                wln(self, "    { struct { const char* type_name; void* ptr; }* _dyn = (void*)" + type_arg + ";");
+                wln(self, "    const char* _t = _dyn ? _dyn->type_name : \"\";");
+                wln(self, "    void* _recv = _dyn ? _dyn->ptr : NULL;");
+                wln(self, "    if (false) {}");
+                var ci2: i64 = 0;
+                while ci2 < candidates.len() {
+                    var cname: str = candidates.get(ci2);
+                    var method_suffix: str = "_" + method;
+                    var type_part: str = str_slice(cname, 0, str_len(cname) - str_len(method_suffix));
+                    var call_args: str = "NULL, _recv";
+                    var ai: i64 = 1;
+                    while ai < args.len() {
+                        call_args = call_args + ", " + val_name(self, args.get(ai));
+                        ai = ai + 1;
+                    }
+                    if void_ret {
+                        wln(self, "    else if (strcmp(_t, \"" + type_part + "\") == 0) " + cname + "(" + call_args + ");");
+                    } else {
+                        wln(self, "    else if (strcmp(_t, \"" + type_part + "\") == 0) " + dst + " = " + cname + "(" + call_args + ");");
+                    }
+                    ci2 = ci2 + 1;
+                }
+                if !void_ret {
+                    wln(self, "    else { abort(); }");
+                }
+                wln(self, "    }");
+            }
         }
         Inst::MakeDyn(value, type_name, trait_name) => {
             var val_str: str = val_name(self, value);
@@ -3019,8 +3126,16 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
             var v: str = val_name(self, value);
             wln(self, "    " + dst + " = (int64_t)" + v + ";");
         }
-        Inst::TryUnwrap(_, _, _, _) => {
-            wln(self, "    // TryUnwrap not implemented in C backend");
+        Inst::TryUnwrap(value, ok_dst, err_block, ok_block) => {
+            var v: str = val_name(self, value);
+            var ok_dst_str: str = val_name(self, ok_dst);
+            wln(self, "    { int64_t _tag = *(int64_t*)" + v + ";");
+            wln(self, "    if (_tag == 0) {");
+            wln(self, "        " + ok_dst_str + " = *((int64_t*)" + v + " + 1);");
+            wln(self, "        goto bb" + int_to_str(ok_block) + ";");
+            wln(self, "    } else {");
+            wln(self, "        goto bb" + int_to_str(err_block) + ";");
+            wln(self, "    } }");
         }
         Inst::Print(value, ty) => {
             var v: str = val_name(self, value);
@@ -3088,6 +3203,25 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
         }
         Inst::Backward(_) => {
             wln(self, "    p_autograd_backward(NULL);");
+        }
+        Inst::StructCopy(dst, src, ty) => {
+            var d: str = val_name(self, dst);
+            var s: str = val_name(self, src);
+            var size: i64 = 8;
+            match ty {
+                IrType::Struct(sName) => {
+                    var si: i64 = 0;
+                    while si < self.struct_layouts.len() {
+                        if self.struct_layouts.get(si).name == sName {
+                            size = self.struct_layouts.get(si).layout.size;
+                            break;
+                        }
+                        si = si + 1;
+                    }
+                }
+                _ => {}
+            }
+            wln(self, "    memcpy(" + d + ", " + s + ", " + int_to_str(size) + ");");
         }
     }
 }
@@ -3858,6 +3992,14 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    p_thread_handles[idx] = tid;");
     wln(self, "    return -(int64_t)(idx + 1);");
     wln(self, "}");
+    // p_thread_join — join a thread spawned by p_thread_spawn
+    // handle is the negative value returned by p_thread_spawn: -(idx+1)
+    wln(self, "void p_thread_join(int64_t handle) {");
+    wln(self, "    if (handle >= 0) return; // not a thread handle");
+    wln(self, "    int64_t idx = -handle - 1;");
+    wln(self, "    if (idx < 0 || idx >= p_thread_handle_count) return;");
+    wln(self, "    pthread_join(p_thread_handles[idx], NULL);");
+    wln(self, "}");
     // Shared memory - simple malloc-based, atomics use C11 stdatomic
     wln(self, "int64_t p_shared_alloc(int64_t size) { if (size < 0) return 0; return (int64_t)(intptr_t)malloc((size_t)size); }");
     wln(self, "int64_t p_atomic_load(int64_t addr) { return atomic_load((atomic_int_least64_t*)(intptr_t)addr); }");
@@ -4390,9 +4532,15 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_cmos_read(int64_t reg) { (void)reg; return 0; }");
     wln(self, "void p_cmos_write(int64_t reg, int64_t val) { (void)reg; (void)val; }");
     wln(self, "void p_serial_init(void) {}");
+    wln(self, "void p_serial_write(int64_t c) { (void)c; }");
+    wln(self, "int64_t p_serial_read(void) { return 0; }");
+    wln(self, "int64_t p_serial_ready(void) { return 0; }");
     wln(self, "void p_serial_putc(int64_t c) { (void)c; }");
     wln(self, "int64_t p_serial_getc(void) { return 0; }");
     wln(self, "int64_t p_serial_available(void) { return 0; }");
+    wln(self, "void p_memset(void* ptr, int val, int64_t size) { if (ptr && size > 0) memset(ptr, val, (size_t)size); }");
+    wln(self, "void p_lgdt(int64_t gdt_desc) { (void)gdt_desc; }");
+    wln(self, "void p_enter_user_mode(int64_t entry, int64_t stack) { (void)entry; (void)stack; }");
     wln(self, "void p_pit_set_frequency(int64_t hz) { (void)hz; }");
     wln(self, "int64_t p_hpet_read(int64_t reg) { (void)reg; return 0; }");
     wln(self, "void p_hpet_write(int64_t reg, int64_t val) { (void)reg; (void)val; }");

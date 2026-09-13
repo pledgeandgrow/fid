@@ -1,9 +1,14 @@
 # Port Gap Analysis — Rust vs Fides Module Comparison
 
+> **HISTORICAL DOCUMENT — Last updated Session 16 (Sep 6, 2026).**
+> Many gaps listed below have been resolved in Sessions 17-24.
+> See `AGENTS.md` → "Current Baseline" for the authoritative current state.
+> This document is preserved for reference but should not be used to assess
+> current port completeness.
+>
 > Systematic comparison of every ported module's Rust source vs Fides port.
 > Identifies incomplete ports — functionality present in Rust but missing in Fides.
 >
-> Last updated: Sep 6, 2026 (session 16 — Tier 3 OS features added: @cpu_local, inline asm clobbers, --no-std, UEFI bindings. Bootstrap fixpoint preserved.).
 > Line counts are current as of session 15. Source line numbers in detailed
 > sections below may be from session 11 and are approximate.
 

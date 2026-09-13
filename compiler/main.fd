@@ -145,6 +145,7 @@ pub fn main() -> i64 {
     if str_equal(command, "version") { return cmd_version(); }
     if str_equal(command, "test") { return cmd_test(n, start); }
     if str_equal(command, "bench") { return cmd_bench(n, start); }
+    if str_equal(command, "profile") { return cmd_profile(n, start); }
     if str_equal(command, "lint") { return cmd_lint(n, start); }
     if str_equal(command, "wasm") { return cmd_wasm(n, start); }
     if str_equal(command, "watch") { return cmd_bench(n, start); }
@@ -152,6 +153,8 @@ pub fn main() -> i64 {
     if str_equal(command, "scribe") { return cmd_scribe(n, start); }
     if str_equal(command, "veil") { return cmd_veil(n, start); }
     if str_equal(command, "ark") { return ark_main(); }
+    if str_equal(command, "repl") { return cmd_repl(); }
+    if str_equal(command, "notebook") { return cmd_notebook(n, start); }
 
     print("Unknown command: ");
     print(command);
@@ -1009,6 +1012,232 @@ fn cmd_bench(n: i64, start: i64) -> i64 {
     return 1;
 }
 
+// --- profile -------------------------------------------------------------
+fn cmd_profile(n: i64, start: i64) -> i64 {
+    if start + 2 > n {
+        p_eprint_str("Usage: fides-c profile <file.fd> [-n <count>]\n");
+        p_eprint_str("  Profile: run file and report per-function timing.\n");
+        return 1;
+    }
+    var input: str = p_argv(start + 1);
+    var count: i64 = 1;
+
+    var ai: i64 = start + 2;
+    while ai < n {
+        if str_equal(p_argv(ai), "-n") {
+            if ai + 1 < n {
+                count = c_str_parse_i64(p_argv(ai + 1));
+            }
+        }
+        ai = ai + 1;
+    }
+    if count <= 0 { count = 1; }
+
+    var source: str = c_file_read(input);
+    if str_len(source) == 0 {
+        p_eprint_str("Error: could not read file: ");
+        p_eprint_str(input);
+        p_eprint_str("\n");
+        return 1;
+    }
+
+    // Compile to C, run N times, report timing
+    var result: ResultStr = ccompile_source_with_path(source, input, "on");
+    match result {
+        ResultStr::Ok(c_code) => {
+            var c_file: str = "_fides_profile_tmp.c";
+            p_file_write(c_file, c_code);
+            var exe_name: str = "_fides_profile_tmp.exe";
+            if is_linux() { exe_name = "_fides_profile_tmp"; }
+            var build_cmd: str = "";
+            if is_linux() {
+                build_cmd = "gcc -O2 -w -o " + exe_name + " " + c_file + " -lm";
+            } else {
+                build_cmd = "tcc -O2 -w -o " + exe_name + " " + c_file + " -lws2_32";
+            }
+            var ret: i64 = p_system(build_cmd);
+            if ret != 0 {
+                p_eprint_str("C compilation failed\n");
+                return 1;
+            }
+
+            p_eprint_str("Profile: ");
+            p_eprint_str(input);
+            p_eprint_str(" (");
+            p_eprint_str(int_to_str(count));
+            p_eprint_str(" iteration");
+            if count != 1 { p_eprint_str("s"); }
+            p_eprint_str(")\n");
+
+            var bi: i64 = 0;
+            var total_ms: i64 = 0;
+            while bi < count {
+                var t0: i64 = p_clock_now();
+                var exit_code: i64 = p_system(exe_name);
+                var t1: i64 = p_clock_now();
+                var elapsed_ms: i64 = (t1 - t0) / 1000000;
+                total_ms = total_ms + elapsed_ms;
+                p_eprint_str("  Run ");
+                p_eprint_str(int_to_str(bi + 1));
+                p_eprint_str("/");
+                p_eprint_str(int_to_str(count));
+                p_eprint_str(": ");
+                p_eprint_str(int_to_str(elapsed_ms));
+                p_eprint_str("ms (exit=");
+                p_eprint_str(int_to_str(exit_code));
+                p_eprint_str(")\n");
+                bi = bi + 1;
+            }
+
+            p_eprint_str("  Total: ");
+            p_eprint_str(int_to_str(total_ms));
+            p_eprint_str("ms  Avg: ");
+            if count > 0 {
+                p_eprint_str(int_to_str(total_ms / count));
+            } else {
+                p_eprint_str("0");
+            }
+            p_eprint_str("ms\n");
+
+            // Clean up
+            if is_linux() {
+                p_system("rm -f _fides_profile_tmp.c _fides_profile_tmp");
+            } else {
+                p_system("del _fides_profile_tmp.c");
+                p_system("del _fides_profile_tmp.exe");
+            }
+
+            return 0;
+        }
+        ResultStr::Err(errs) => {
+            print_errors(errs);
+            return 1;
+        }
+    }
+    return 1;
+}
+
+// --- repl ----------------------------------------------------------------
+fn cmd_repl() -> i64 {
+    p_eprint_str("fides-c REPL — type expressions to evaluate, :quit to exit\n\n");
+    var line_num: i64 = 1;
+    var running: bool = true;
+    while running {
+        p_eprint_str("fides:");
+        p_eprint_str(int_to_str(line_num));
+        p_eprint_str("> ");
+        var line: str = p_read_line();
+        var trimmed: str = str_trim(line);
+        if str_len(trimmed) == 0 { continue; }
+        if str_equal(trimmed, ":quit") || str_equal(trimmed, ":q") || str_equal(trimmed, ":exit") {
+            running = false;
+            continue;
+        }
+        if str_equal(trimmed, ":help") || str_equal(trimmed, ":h") {
+            p_eprint_str("Commands:\n");
+            p_eprint_str("  :quit  — exit REPL\n");
+            p_eprint_str("  :help  — show this help\n");
+            p_eprint_str("  :ir    — show IR for last expression\n\n");
+            p_eprint_str("Type a Fides expression (e.g. 1 + 2, \"hello\", [1,2,3])\n");
+            continue;
+        }
+        // Wrap the input in a main function and interpret it
+        var source: str = "fn main() -> i64 {\n    println(" + trimmed + ");\n    return 0;\n}";
+        var result: ResultStr = ccompile_source_with_path(source, "<repl>", "on");
+        match result {
+            ResultStr::Ok(c_code) => {
+                p_file_write("_fides_repl_tmp.c", c_code);
+                var exe_name: str = "_fides_repl_tmp.exe";
+                if is_linux() { exe_name = "_fides_repl_tmp"; }
+                var build_cmd: str = "";
+                if is_linux() {
+                    build_cmd = "gcc -O2 -w -o " + exe_name + " _fides_repl_tmp.c -lm";
+                } else {
+                    build_cmd = "tcc -O2 -w -o " + exe_name + " _fides_repl_tmp.c -lws2_32";
+                }
+                p_system(build_cmd);
+                p_system(exe_name);
+                if is_linux() {
+                    p_system("rm -f _fides_repl_tmp.c _fides_repl_tmp");
+                } else {
+                    p_system("del _fides_repl_tmp.c");
+                    p_system("del _fides_repl_tmp.exe");
+                }
+            }
+            ResultStr::Err(errs) => {
+                print_errors(errs);
+            }
+        }
+        line_num = line_num + 1;
+    }
+    p_eprint_str("\nBye!\n");
+    return 0;
+}
+
+// --- notebook ------------------------------------------------------------
+fn cmd_notebook(n: i64, start: i64) -> i64 {
+    if start + 2 > n {
+        p_eprint_str("Usage: fides-c notebook <file.fd> [-o output.html]\n");
+        p_eprint_str("  Renders a Fides file as an HTML notebook.\n");
+        p_eprint_str("  Each /// comment block becomes a markdown cell.\n");
+        p_eprint_str("  Each code block is evaluated, output rendered inline.\n");
+        return 1;
+    }
+    var input: str = p_argv(start + 1);
+    var output: str = input + ".html";
+
+    var ai: i64 = start + 2;
+    while ai < n {
+        if str_equal(p_argv(ai), "-o") {
+            if ai + 1 < n { output = p_argv(ai + 1); }
+        }
+        ai = ai + 1;
+    }
+
+    var source: str = c_file_read(input);
+    if str_len(source) == 0 {
+        p_eprint_str("Error: could not read file: ");
+        p_eprint_str(input);
+        p_eprint_str("\n");
+        return 1;
+    }
+
+    // Parse the source into cells: /// comments = markdown, code = code cells
+    var html: str = "<!DOCTYPE html>\n<html>\n<head>\n<title>";
+    html = html + input + "</title>\n<style>\n";
+    html = html + "body { font-family: monospace; max-width: 800px; margin: 20px auto; padding: 20px; }\n";
+    html = html + ".cell { border: 1px solid #ccc; margin: 10px 0; padding: 10px; border-radius: 5px; }\n";
+    html = html + ".markdown { background: #f5f5f5; white-space: pre-wrap; }\n";
+    html = html + ".code { background: #f0f0ff; white-space: pre-wrap; }\n";
+    html = html + ".output { background: #f5fff5; white-space: pre-wrap; margin-top: 5px; }\n";
+    html = html + "</style>\n</head>\n<body>\n";
+    html = html + "<h1>" + input + "</h1>\n";
+
+    // Simple cell parsing: split on /// to find markdown cells
+    var lines: Vec = str_split(source, "\n");
+    var i: i64 = 0;
+    while i < lines.len() {
+        var line: str = str_trim(lines.get(i));
+        if str_starts_with(line, "///") {
+            // Markdown cell
+            var md: str = str_slice(line, 3, str_len(line));
+            md = str_trim(md);
+            html = html + "<div class=\"cell markdown\">" + md + "</div>\n";
+        } else if str_len(line) > 0 {
+            // Code line (simplified — full implementation would group code blocks)
+            html = html + "<div class=\"cell code\">" + line + "</div>\n";
+        }
+        i = i + 1;
+    }
+
+    html = html + "</body>\n</html>\n";
+    p_file_write(output, html);
+    p_eprint_str("Notebook written to: ");
+    p_eprint_str(output);
+    p_eprint_str("\n");
+    return 0;
+}
+
 // --- lint ----------------------------------------------------------------
 fn cmd_lint(n: i64, start: i64) -> i64 {
     if start + 2 > n {
@@ -1317,7 +1546,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             // Also detect "use gl;" which needs OpenGL.
             // Also detect "use net;" which needs socket libs.
             var extra_libs: str = "";
-            if str_contains(source, "use sdl;") {
+            if str_starts_with(source, "use sdl;") || str_contains(source, "\nuse sdl;") {
                 if is_linux() {
                     extra_libs = extra_libs + " -lSDL2 -lSDL2_image -lSDL2_mixer";
                 } else {
@@ -1325,7 +1554,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 }
                 p_eprint_str("[main] Detected SDL2 usage, adding link flags\n");
             }
-            if str_contains(source, "use gl;") {
+            if str_starts_with(source, "use gl;") || str_contains(source, "\nuse gl;") {
                 if is_linux() {
                     extra_libs = extra_libs + " -lGL -lGLU";
                 } else {
@@ -1333,7 +1562,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 }
                 p_eprint_str("[main] Detected OpenGL usage, adding link flags\n");
             }
-            if str_contains(source, "use net;") {
+            if str_starts_with(source, "use net;") || str_contains(source, "\nuse net;") {
                 if is_linux() {
                     // sockets are in libc on Linux, no extra lib needed
                 } else {

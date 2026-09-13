@@ -1,0 +1,255 @@
+// Fides Data Science Library — Phase 15.3
+//
+// Comptime-ready data loading and schema inference.
+// In the future, `comptime load_csv("data.csv")` will parse the header at
+// compile time and generate a typed struct matching the columns.
+// For now, this module provides the runtime API that comptime code will call.
+//
+// Usage:
+//   use data;
+//   var csv = data_load_csv("data.csv");
+//   var headers = data_csv_headers(csv);
+//   var row = data_csv_row(csv, 0);
+//   var val = data_csv_get(row, "name");
+//
+//   var json = data_load_json("config.json");
+//   var val = data_json_get(json, "database.host");
+
+module data;
+
+use json;
+
+// ─── CSV loading ─────────────────────────────────────────────────────────
+
+/// CSV data — stored as a JSON array of objects (one per row).
+/// Each object has keys = column headers, values = string cells.
+/// This format works with the existing json module.
+
+/// Load a CSV file and parse it into a JSON array of row objects.
+/// The first line is treated as the header row.
+/// Returns a JSON string: [{"col1":"val1","col2":"val2"}, ...]
+pub fn load_csv(path: str) -> str {
+    var content = p_file_read(path);
+    return parse_csv(content);
+}
+
+/// Parse CSV text into a JSON array of row objects.
+/// Handles quoted fields with commas, but not multi-line quoted fields.
+pub fn parse_csv(content: str) -> str {
+    var lines = str_split(content, "\n");
+    if lines.len() == 0 { return "[]"; }
+
+    // Parse header row
+    var header_line = lines.get(0);
+    header_line = str_trim(header_line);
+    var headers = parse_csv_row(header_line);
+
+    // Build JSON array
+    var result = "[";
+    var i = 1;
+    var first = true;
+    while i < lines.len() {
+        var line = str_trim(lines.get(i));
+        if str_len(line) == 0 { i = i + 1; continue; }
+        var cells = parse_csv_row(line);
+        if !first { result = result + ","; }
+        first = false;
+        result = result + "{";
+        var j = 0;
+        while j < headers.len() && j < cells.len() {
+            if j > 0 { result = result + ","; }
+            var header = json_escape_string(headers.get(j));
+            var value = json_escape_string(cells.get(j));
+            result = result + "\"" + header + "\":\"" + value + "\"";
+            j = j + 1;
+        }
+        result = result + "}";
+        i = i + 1;
+    }
+    result = result + "]";
+    return result;
+}
+
+/// Parse a single CSV row into a Vec of cell values.
+/// Handles quoted fields: "hello, world" → hello, world
+pub fn parse_csv_row(line: str) -> Vec {
+    var cells = Vec::new();
+    var current = "";
+    var in_quotes = false;
+    var i = 0;
+    var len = str_len(line);
+    while i < len {
+        var c = str_char_at(line, i);
+        if in_quotes {
+            if c == 34 {  // "
+                in_quotes = false;
+            } else {
+                current = current + str_from_char(c);
+            }
+        } else {
+            if c == 34 {  // "
+                in_quotes = true;
+            } else if c == 44 {  // ,
+                cells.push(current);
+                current = "";
+            } else {
+                current = current + str_from_char(c);
+            }
+        }
+        i = i + 1;
+    }
+    cells.push(current);
+    return cells;
+}
+
+/// Get the column headers from a parsed CSV (as JSON array of objects).
+/// Returns a JSON array of header strings.
+pub fn csv_headers(csv_json: str) -> str {
+    if json_len(csv_json) == 0 { return "[]"; }
+    var first_row = json_at(csv_json, 0);
+    return json_keys(first_row);
+}
+
+/// Get a specific row from a parsed CSV.
+/// Returns a JSON object with column→value mappings.
+pub fn csv_row(csv_json: str, row_idx: i64) -> str {
+    return json_at(csv_json, row_idx);
+}
+
+/// Get a cell value from a CSV row by column name.
+pub fn csv_get(row_json: str, col_name: str) -> str {
+    return json_get(row_json, col_name);
+}
+
+/// Get the number of rows in a parsed CSV.
+pub fn csv_row_count(csv_json: str) -> i64 {
+    return json_len(csv_json);
+}
+
+// ─── JSON data loading ───────────────────────────────────────────────────
+
+/// Load a JSON file and return the parsed JSON string.
+pub fn load_json(path: str) -> str {
+    var content = p_file_read(path);
+    return content;
+}
+
+/// Get a value from a JSON object by key.
+pub fn json_get_value(json_str: str, key: str) -> str {
+    return json_get(json_str, key);
+}
+
+/// Infer the "schema" of a JSON object — return a description of the
+/// types of each top-level key. Returns a JSON object mapping keys to
+/// type names: {"name":"string","age":"number","active":"boolean"}
+pub fn infer_json_schema(json_str: str) -> str {
+    // This is a simplified version — in the future, comptime will
+    // generate a typed struct from this schema.
+    var keys = json_keys(json_str);
+    var result = "{";
+    var i = 0;
+    while i < json_len(keys) {
+        if i > 0 { result = result + ","; }
+        var key = json_at(keys, i);
+        var value = json_get(json_str, key);
+        var type_name = "string";
+        if str_starts_with(value, "{") { type_name = "object"; }
+        else if str_starts_with(value, "[") { type_name = "array"; }
+        else if str_equal(value, "true") || str_equal(value, "false") { type_name = "boolean"; }
+        else if str_len(value) > 0 {
+            var c = str_char_at(value, 0);
+            if c >= 48 && c <= 57 { type_name = "number"; }
+            if c == 45 { type_name = "number"; }  // negative number
+        }
+        result = result + "\"" + key + "\":\"" + type_name + "\"";
+        i = i + 1;
+    }
+    result = result + "}";
+    return result;
+}
+
+// ─── Comptime-ready API ──────────────────────────────────────────────────
+//
+// When comptime code generation is fully available:
+//
+//   comptime load_csv("data.csv")
+//
+// This will parse the CSV header at compile time and generate a typed
+// struct + load function. The generated code will have zero runtime
+// parsing overhead — just typed field access.
+//
+//   comptime load_json("config.json")
+//
+// This will infer types from the JSON structure at compile time and
+// generate a typed struct. No runtime schema parsing needed.
+
+/// Comptime CSV schema inference placeholder.
+/// When comptime gen is available, this will be replaced by a comptime
+/// function that generates a typed struct from the CSV header.
+pub fn comptime_csv_schema(path: str) -> str {
+    var content = p_file_read(path);
+    var lines = str_split(content, "\n");
+    if lines.len() == 0 { return "[]"; }
+    var headers = parse_csv_row(str_trim(lines.get(0)));
+    var schema = "[";
+    var i = 0;
+    while i < headers.len() {
+        if i > 0 { schema = schema + ","; }
+        schema = schema + "{\"name\":\"" + headers.get(i) + "\",\"type\":\"string\"}";
+        i = i + 1;
+    }
+    schema = schema + "]";
+    return schema;
+}
+
+/// Comptime JSON schema inference placeholder.
+pub fn comptime_json_schema(path: str) -> str {
+    var content = p_file_read(path);
+    return infer_json_schema(content);
+}
+
+// ─── Tensor shape inference (comptime-ready) ────────────────────────────
+//
+// `comptime infer_shapes(model)` traces the computation graph at compile
+// time, inserts shape checks, generates specialized kernels.
+// This is what JAX and torch.compile do, but natively.
+
+/// Infer the output shape of a tensor operation.
+/// Returns a JSON array representing the shape, e.g. [3, 224, 224]
+pub fn infer_op_shape(op: str, input_shape: str) -> str {
+    // Simplified shape inference for common ops
+    if str_equal(op, "relu") || str_equal(op, "sigmoid") || str_equal(op, "tanh") {
+        return input_shape;  // elementwise: same shape
+    }
+    if str_equal(op, "flatten") {
+        // Flatten to 1D: product of all dims
+        var total = 1;
+        var i = 0;
+        while i < json_len(input_shape) {
+            var dim = c_str_parse_i64(json_at(input_shape, i));
+            total = total * dim;
+            i = i + 1;
+        }
+        return "[" + int_to_str(total) + "]";
+    }
+    if str_equal(op, "softmax") {
+        return input_shape;  // same shape
+    }
+    // Default: same shape
+    return input_shape;
+}
+
+/// Infer shapes through a sequence of operations.
+/// ops: JSON array of operation names
+/// input_shape: JSON array of dimension sizes
+/// Returns: JSON array of output shape
+pub fn infer_shapes(ops: str, input_shape: str) -> str {
+    var current_shape = input_shape;
+    var i = 0;
+    while i < json_len(ops) {
+        var op = json_at(ops, i);
+        current_shape = infer_op_shape(op, current_shape);
+        i = i + 1;
+    }
+    return current_shape;
+}

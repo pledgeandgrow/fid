@@ -1,3 +1,11 @@
+// Suppress warnings for the multi-backend compiler CLI. Not all code paths
+// are exercised in every build; dead code is retained for backend parity.
+#![allow(dead_code)]
+#![allow(unused_variables)]
+#![allow(unused_imports)]
+#![allow(unused_assignments)]
+#![allow(unused_mut)]
+
 use std::env;
 use std::fs;
 use std::process;
@@ -151,12 +159,13 @@ fn main() {
         }
         "build" => {
             if args.len() < 3 {
-                eprintln!("Usage: fidesc build <file.fd> [-o output] [--target x86-64|arm64|riscv|riscv64-linux|arm64-linux|x86-64-windows] [--no-opt] [--lto] [--caps \"IO,FS\"]");
+                eprintln!("Usage: fidesc build <file.fd> [-o output] [--target x86-64|arm64|riscv|riscv64-linux|arm64-linux|x86-64-windows] [--opt-level 0|1|2|3] [--no-opt] [--lto] [--caps \"IO,FS\"]");
                 eprintln!("       Compiles and links a Fides program into a native executable in one step");
-                eprintln!("       --target  Target architecture (default: x86-64). Supports cross-compilation to ARM64, RISC-V, and Windows.");
-                eprintln!("       --no-opt  Disable PIR optimizer (enabled by default)");
-                eprintln!("       --lto     Enable cross-module LTO (aggressive inlining)");
-                eprintln!("       --caps    Grant only these capabilities (e.g. \"IO,FS\"). Strips code requiring ungranted caps.");
+                eprintln!("       --target     Target architecture (default: x86-64). Supports cross-compilation to ARM64, RISC-V, and Windows.");
+                eprintln!("       --opt-level  Optimization level 0-3 (default: 2). 0=no opt, 1=minimal, 2=full, 3=aggressive+LTO.");
+                eprintln!("       --no-opt     Disable PIR optimizer (equivalent to --opt-level 0)");
+                eprintln!("       --lto        Enable cross-module LTO (equivalent to --opt-level 3)");
+                eprintln!("       --caps       Grant only these capabilities (e.g. \"IO,FS\"). Strips code requiring ungranted caps.");
                 process::exit(1);
             }
             let input = &args[2];
@@ -167,9 +176,19 @@ fn main() {
             // Parse target triple: "arch-os" format (e.g., "arm64-linux", "riscv64-linux")
             // If no OS specified, default to linux
             let target = parse_target_triple(raw_target);
-            // Optimization is enabled by default. Use --no-opt to disable.
-            let do_opt = !args.iter().any(|a| a == "--no-opt");
-            let do_lto = args.iter().any(|a| a == "--lto");
+            // Parse --opt-level (default O2). --no-opt overrides to O0.
+            // --lto overrides to O3. Explicit --opt-level takes precedence.
+            let opt_level = if args.iter().any(|a| a == "--no-opt") {
+                opt::OptLevel::O0
+            } else if args.iter().any(|a| a == "--lto") {
+                opt::OptLevel::O3
+            } else {
+                args.iter().position(|a| a == "--opt-level")
+                    .and_then(|i| args.get(i + 1))
+                    .and_then(|s| opt::OptLevel::parse(s))
+                    .unwrap_or(opt::OptLevel::O2)
+            };
+            let do_lto = opt_level == opt::OptLevel::O3 || args.iter().any(|a| a == "--lto");
             let granted_caps: Option<Vec<String>> = args.iter().position(|a| a == "--caps")
                 .and_then(|i| args.get(i + 1))
                 .map(|s| s.split(',').map(|c| c.trim().to_string()).collect());
@@ -187,7 +206,7 @@ fn main() {
                     process::exit(1);
                 }
             };
-            match compiler::build_executable_with_lto(&source, input, target, do_opt, do_lto, granted_caps.as_deref()) {
+            match compiler::build_executable_with_level(&source, input, target, opt_level, do_lto, granted_caps.as_deref()) {
                 Ok(exe_bytes) => {
                     fs::write(&output, &exe_bytes).unwrap_or_else(|e| {
                         eprintln!("Error writing '{}': {}", output, e);
@@ -250,11 +269,16 @@ fn main() {
 
         "emit" => {
             if args.len() < 3 {
-                eprintln!("Usage: fidesc emit <file.fd> [-o output.exe] [--bare] [--boot] [--load-addr <hex>] [--linker-script <file>]");
+                eprintln!("Usage: fidesc emit <file.fd> [-o output.exe] [--bare] [--boot] [--opt-level 0|1|2|3] [--load-addr <hex>] [--linker-script <file>]");
                 process::exit(1);
             }
             let bare_mode = args.iter().any(|a| a == "--bare");
             let boot_mode = args.iter().any(|a| a == "--boot");
+            // Parse --opt-level (default O2 for the regular PE path).
+            let opt_level = args.iter().position(|a| a == "--opt-level")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| opt::OptLevel::parse(s))
+                .unwrap_or(opt::OptLevel::O2);
             // --load-addr: override the default load address (default: 0x10000 for bare, 0x100000 for boot)
             let load_addr: Option<u64> = args.iter().position(|a| a == "--load-addr")
                 .and_then(|i| args.get(i + 1))
@@ -334,7 +358,7 @@ fn main() {
                     }
                 }
             } else {
-                match compiler::emit_source_with_path(&source, input) {
+                match compiler::emit_source_with_level(&source, input, opt_level) {
                     Ok(pe_bytes) => {
                         fs::write(&output, &pe_bytes).unwrap_or_else(|e| {
                             eprintln!("Error writing '{}': {}", output, e);

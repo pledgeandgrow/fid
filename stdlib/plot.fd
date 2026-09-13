@@ -1,0 +1,297 @@
+// Fides Plotting standard library — Phase 15.3
+//
+// SVG plot generation for line plots, bar charts, and scatter plots.
+// Pure string building — no external dependencies. Output SVG strings
+// can be written to file or wrapped in HTML for browser viewing.
+//
+// Usage:
+//   use plot;
+//   use vec;
+//
+//   val xs: Vec<f64> = Vec::new();
+//   val ys: Vec<f64> = Vec::new();
+//   xs.push(0.0); xs.push(1.0); xs.push(2.0); xs.push(3.0);
+//   ys.push(1.0); ys.push(4.0); ys.push(9.0); ys.push(16.0);
+//
+//   var svg = plot_line(xs, ys, "Squares", "x", "y");
+//   plot_to_file(svg, "squares.svg");
+//   plot_render_html(svg, "Squares", "squares.html");
+
+module plot;
+
+use vec;
+use math;
+
+// ─── Canvas constants ────────────────────────────────────────────────────
+
+const PLOT_W: i64 = 600;
+const PLOT_H: i64 = 400;
+const MARGIN_L: i64 = 60;
+const MARGIN_R: i64 = 20;
+const MARGIN_T: i64 = 40;
+const MARGIN_B: i64 = 50;
+
+// ─── Helpers ────────────────────────────────────────────────────────────
+
+/// Compute the minimum value in a Vec<f64>.
+fn plot_min(data: Vec<f64>) -> f64 {
+    var n = data.len();
+    if n == 0 { return 0.0; }
+    var m: f64 = data.get(0);
+    var i = 1;
+    while i < n {
+        var v: f64 = data.get(i);
+        if v < m { m = v; }
+        i = i + 1;
+    }
+    return m;
+}
+
+/// Compute the maximum value in a Vec<f64>.
+fn plot_max(data: Vec<f64>) -> f64 {
+    var n = data.len();
+    if n == 0 { return 0.0; }
+    var m: f64 = data.get(0);
+    var i = 1;
+    while i < n {
+        var v: f64 = data.get(i);
+        if v > m { m = v; }
+        i = i + 1;
+    }
+    return m;
+}
+
+/// Build the SVG header with title and white background.
+fn plot_header(title: str) -> str {
+    var s = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"";
+    s = s + int_to_str(PLOT_W);
+    s = s + "\" height=\"";
+    s = s + int_to_str(PLOT_H);
+    s = s + "\" viewBox=\"0 0 ";
+    s = s + int_to_str(PLOT_W);
+    s = s + " ";
+    s = s + int_to_str(PLOT_H);
+    s = s + "\">\n";
+    s = s + "<rect width=\"100%\" height=\"100%\" fill=\"white\"/>\n";
+    // Title
+    s = s + "<text x=\"";
+    s = s + int_to_str(PLOT_W / 2);
+    s = s + "\" y=\"24\" text-anchor=\"middle\" font-size=\"16\" font-weight=\"bold\">";
+    s = s + title;
+    s = s + "</text>\n";
+    return s;
+}
+
+/// Draw the plot frame: axes and labels.
+fn plot_frame(x_label: str, y_label: str) -> str {
+    var s = "";
+    var left = MARGIN_L;
+    var right = PLOT_W - MARGIN_R;
+    var top = MARGIN_T;
+    var bottom = PLOT_H - MARGIN_B;
+    // Y axis
+    s = s + "<line x1=\"" + int_to_str(left) + "\" y1=\"" + int_to_str(top);
+    s = s + "\" x2=\"" + int_to_str(left) + "\" y2=\"" + int_to_str(bottom);
+    s = s + "\" stroke=\"black\" stroke-width=\"1\"/>\n";
+    // X axis
+    s = s + "<line x1=\"" + int_to_str(left) + "\" y1=\"" + int_to_str(bottom);
+    s = s + "\" x2=\"" + int_to_str(right) + "\" y2=\"" + int_to_str(bottom);
+    s = s + "\" stroke=\"black\" stroke-width=\"1\"/>\n";
+    // X axis label
+    s = s + "<text x=\"" + int_to_str((left + right) / 2) + "\" y=\"";
+    s = s + int_to_str(PLOT_H - 8) + "\" text-anchor=\"middle\" font-size=\"12\">";
+    s = s + x_label + "</text>\n";
+    // Y axis label
+    s = s + "<text x=\"14\" y=\"" + int_to_str((top + bottom) / 2);
+    s = s + "\" text-anchor=\"middle\" font-size=\"12\" transform=\"rotate(-90 14 ";
+    s = s + int_to_str((top + bottom) / 2) + ")\">";
+    s = s + y_label + "</text>\n";
+    return s;
+}
+
+/// Scale a data value to canvas y coordinate (inverted: high data → low y).
+fn plot_scale_y(v: f64, dmin: f64, dmax: f64) -> i64 {
+    var top = MARGIN_T as f64;
+    var bottom = (PLOT_H - MARGIN_B) as f64;
+    var range = bottom - top;
+    var span = dmax - dmin;
+    if span == 0.0 { return bottom as i64; }
+    var t = (v - dmin) / span;
+    var y = bottom - t * range;
+    return y as i64;
+}
+
+/// Scale a data value to canvas x coordinate.
+fn plot_scale_x(v: f64, dmin: f64, dmax: f64) -> i64 {
+    var left = MARGIN_L as f64;
+    var right = (PLOT_W - MARGIN_R) as f64;
+    var range = right - left;
+    var span = dmax - dmin;
+    if span == 0.0 { return ((left + right) / 2.0) as i64; }
+    var t = (v - dmin) / span;
+    var x = left + t * range;
+    return x as i64;
+}
+
+// ─── Public plot functions ──────────────────────────────────────────────
+
+/// Generate an SVG line plot from two data series.
+/// data_x and data_y must be the same length (Vec<f64>).
+pub fn plot_line(data_x: Vec<f64>, data_y: Vec<f64>, title: str, x_label: str, y_label: str) -> str {
+    var svg = plot_header(title);
+    svg = svg + plot_frame(x_label, y_label);
+
+    var n = data_x.len();
+    if n < 2 {
+        svg = svg + "<text x=\"300\" y=\"200\" text-anchor=\"middle\">No data</text>\n";
+        svg = svg + "</svg>\n";
+        return svg;
+    }
+
+    var xmin = plot_min(data_x);
+    var xmax = plot_max(data_x);
+    var ymin = plot_min(data_y);
+    var ymax = plot_max(data_y);
+    if xmax == xmin { xmax = xmin + 1.0; }
+    if ymax == ymin { ymax = ymin + 1.0; }
+
+    // Build polyline points
+    var points = "";
+    var i = 0;
+    while i < n {
+        var xv: f64 = data_x.get(i);
+        var yv: f64 = data_y.get(i);
+        var x = plot_scale_x(xv, xmin, xmax);
+        var y = plot_scale_y(yv, ymin, ymax);
+        points = points + int_to_str(x) + "," + int_to_str(y);
+        if i < n - 1 { points = points + " "; }
+        i = i + 1;
+    }
+    svg = svg + "<polyline points=\"" + points + "\" fill=\"none\" stroke=\"blue\" stroke-width=\"2\"/>\n";
+
+    // Draw data points as small circles
+    i = 0;
+    while i < n {
+        var xv: f64 = data_x.get(i);
+        var yv: f64 = data_y.get(i);
+        var x = plot_scale_x(xv, xmin, xmax);
+        var y = plot_scale_y(yv, ymin, ymax);
+        svg = svg + "<circle cx=\"" + int_to_str(x) + "\" cy=\"" + int_to_str(y);
+        svg = svg + "\" r=\"3\" fill=\"blue\"/>\n";
+        i = i + 1;
+    }
+
+    svg = svg + "</svg>\n";
+    return svg;
+}
+
+/// Generate an SVG bar chart from values and labels.
+/// data is Vec<f64>, labels is Vec<str>.
+pub fn plot_bar(data: Vec<f64>, labels: Vec<str>, title: str) -> str {
+    var svg = plot_header(title);
+    svg = svg + plot_frame("Category", "Value");
+
+    var n = data.len();
+    if n == 0 {
+        svg = svg + "<text x=\"300\" y=\"200\" text-anchor=\"middle\">No data</text>\n";
+        svg = svg + "</svg>\n";
+        return svg;
+    }
+
+    var vmin = plot_min(data);
+    var vmax = plot_max(data);
+    if vmin > 0.0 { vmin = 0.0; }
+    if vmax == vmin { vmax = vmin + 1.0; }
+
+    var left = MARGIN_L as f64;
+    var right = (PLOT_W - MARGIN_R) as f64;
+    var bottom = (PLOT_H - MARGIN_B) as f64;
+    var plot_w = right - left;
+    var slot = plot_w / (n as f64);
+    var bar_w = slot * 0.7;
+    var gap = slot * 0.3;
+
+    var i = 0;
+    while i < n {
+        var val: f64 = data.get(i);
+        var y_top = plot_scale_y(val, vmin, vmax);
+        var y_base = plot_scale_y(vmin, vmin, vmax);
+        var bar_h = y_base - y_top;
+        if bar_h < 0 { bar_h = -bar_h; y_top = y_base; }
+        var bx = (left + (i as f64) * slot + gap / 2.0) as i64;
+        svg = svg + "<rect x=\"" + int_to_str(bx) + "\" y=\"" + int_to_str(y_top);
+        svg = svg + "\" width=\"" + int_to_str(bar_w as i64) + "\" height=\"" + int_to_str(bar_h);
+        svg = svg + "\" fill=\"steelblue\" stroke=\"navy\" stroke-width=\"1\"/>\n";
+        // Label below bar
+        var lx = (bx as f64 + bar_w / 2.0) as i64;
+        var ly = (bottom + 16.0) as i64;
+        var label: str = labels.get(i);
+        svg = svg + "<text x=\"" + int_to_str(lx) + "\" y=\"" + int_to_str(ly);
+        svg = svg + "\" text-anchor=\"middle\" font-size=\"10\">" + label + "</text>\n";
+        i = i + 1;
+    }
+
+    svg = svg + "</svg>\n";
+    return svg;
+}
+
+/// Generate an SVG scatter plot from two data series.
+/// data_x and data_y must be the same length (Vec<f64>).
+pub fn plot_scatter(data_x: Vec<f64>, data_y: Vec<f64>, title: str) -> str {
+    var svg = plot_header(title);
+    svg = svg + plot_frame("x", "y");
+
+    var n = data_x.len();
+    if n == 0 {
+        svg = svg + "<text x=\"300\" y=\"200\" text-anchor=\"middle\">No data</text>\n";
+        svg = svg + "</svg>\n";
+        return svg;
+    }
+
+    var xmin = plot_min(data_x);
+    var xmax = plot_max(data_x);
+    var ymin = plot_min(data_y);
+    var ymax = plot_max(data_y);
+    if xmax == xmin { xmax = xmin + 1.0; }
+    if ymax == ymin { ymax = ymin + 1.0; }
+
+    var i = 0;
+    while i < n {
+        var xv: f64 = data_x.get(i);
+        var yv: f64 = data_y.get(i);
+        var x = plot_scale_x(xv, xmin, xmax);
+        var y = plot_scale_y(yv, ymin, ymax);
+        svg = svg + "<circle cx=\"" + int_to_str(x) + "\" cy=\"" + int_to_str(y);
+        svg = svg + "\" r=\"4\" fill=\"red\" stroke=\"darkred\" stroke-width=\"1\"/>\n";
+        i = i + 1;
+    }
+
+    svg = svg + "</svg>\n";
+    return svg;
+}
+
+// ─── File output ─────────────────────────────────────────────────────────
+
+/// Write an SVG string to a file.
+pub fn plot_to_file(svg: str, path: str) -> void {
+    p_file_write(path, svg);
+}
+
+/// Wrap an SVG string in a full HTML document.
+pub fn plot_html(svg: str, title: str) -> str {
+    var html = "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n";
+    html = html + "<title>" + title + "</title>\n";
+    html = html + "<style>body{margin:0;padding:20px;font-family:sans-serif;}";
+    html = html + " svg{display:block;margin:auto;}</style>\n";
+    html = html + "</head>\n<body>\n";
+    html = html + "<h2 style=\"text-align:center;\">" + title + "</h2>\n";
+    html = html + svg;
+    html = html + "</body>\n</html>\n";
+    return html;
+}
+
+/// Wrap an SVG string in HTML and write it to a file.
+pub fn plot_render_html(svg: str, title: str, path: str) -> void {
+    var html = plot_html(svg, title);
+    p_file_write(path, html);
+}

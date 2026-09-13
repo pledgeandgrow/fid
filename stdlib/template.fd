@@ -1,0 +1,192 @@
+// Fides Template Engine — Phase 15.2
+//
+// Template engine via comptime gen. Templates are parsed at compile time
+// and generate typed rendering functions. No runtime parsing, no runtime
+// type checking — just function calls.
+//
+// Since Fides doesn't yet have full comptime code generation for arbitrary
+// template parsing, this module provides a runtime template engine that
+// can be used as the basis for future comptime optimization.
+//
+// Usage:
+//   use template;
+//
+//   var tmpl = template_parse("Hello, {{name}}! You are {{age}} years old.");
+//   var result = template_render(tmpl, "{\"name\":\"Alice\",\"age\":30}");
+//   print(result);  // "Hello, Alice! You are 30 years old."
+//
+// Template syntax:
+//   {{variable}}           — variable substitution
+//   {{variable|upper}}    — filter: uppercase
+//   {{variable|lower}}    — filter: lowercase
+//   {% if condition %}...{% endif %}  — conditional (not yet implemented)
+//   {% for item in list %}...{% endfor %}  — loop (not yet implemented)
+
+module template;
+
+use json;
+
+/// Template part types.
+/// Literal parts are output as-is.
+/// Variable parts are substituted from the data context.
+/// Filter parts apply a transformation to the variable.
+struct TemplatePart {
+    is_literal: bool,      // true = literal text, false = variable
+    text: str,             // literal text (if is_literal) or variable name
+    filter: str,           // filter name ("" = no filter)
+}
+
+/// Template — a parsed template with parts.
+struct Template {
+    parts: Vec,            // Vec<TemplatePart>
+}
+
+/// Parse a template string into a Template struct.
+/// Extracts {{variable}} and {{variable|filter}} parts.
+/// Everything else is treated as literal text.
+pub fn template_parse(source: str) -> Template {
+    var parts: Vec = Vec::new();
+    var i = 0;
+    var len = str_len(source);
+    var literal_start = 0;
+
+    while i < len {
+        // Look for {{ to start a variable
+        if i + 1 < len {
+            var c0 = str_char_at(source, i);
+            var c1 = str_char_at(source, i + 1);
+            if c0 == 123 && c1 == 123 {  // {{
+                // Add literal before the variable
+                if i > literal_start {
+                    var lit = str_slice(source, literal_start, i);
+                    parts.push(TemplatePart { is_literal: true, text: lit, filter: "" });
+                }
+                // Find the closing }}
+                var j = i + 2;
+                var found = false;
+                while j + 1 < len {
+                    var j0 = str_char_at(source, j);
+                    var j1 = str_char_at(source, j + 1);
+                    if j0 == 125 && j1 == 125 {  // }}
+                        found = true;
+                        break;
+                    }
+                    j = j + 1;
+                }
+                if found {
+                    // Extract the variable expression
+                    var expr = str_slice(source, i + 2, j);
+                    expr = str_trim(expr);
+                    // Check for filter: {{variable|filter}}
+                    var filter = "";
+                    var var_name = expr;
+                    var pipe_idx = str_index_of(expr, "|");
+                    if pipe_idx >= 0 {
+                        var_name = str_trim(str_slice(expr, 0, pipe_idx));
+                        filter = str_trim(str_slice(expr, pipe_idx + 1, str_len(expr)));
+                    }
+                    parts.push(TemplatePart { is_literal: false, text: var_name, filter: filter });
+                    i = j + 2;
+                    literal_start = i;
+                } else {
+                    // No closing }} — treat as literal
+                    i = i + 1;
+                }
+            } else {
+                i = i + 1;
+            }
+        } else {
+            i = i + 1;
+        }
+    }
+
+    // Add remaining literal
+    if literal_start < len {
+        var lit = str_slice(source, literal_start, len);
+        parts.push(TemplatePart { is_literal: true, text: lit, filter: "" });
+    }
+
+    return Template { parts: parts };
+}
+
+/// Render a template with a JSON data context.
+/// The data context is a JSON object string (e.g. {"name":"Alice","age":30}).
+/// Variables in the template are looked up by name in the JSON object.
+pub fn template_render(tmpl: Template, data: str) -> str {
+    var result = "";
+    var i = 0;
+    var n = tmpl.parts.len();
+    while i < n {
+        var part = tmpl.parts.get(i);
+        if part.is_literal {
+            result = result + part.text;
+        } else {
+            // Look up the variable in the data context
+            var value = json_get(data, part.text);
+            // Apply filter if present
+            if str_len(part.filter) > 0 {
+                value = apply_filter(value, part.filter);
+            }
+            result = result + value;
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Apply a filter to a value.
+/// Supported filters: upper, lower, trim, default
+pub fn apply_filter(value: str, filter: str) -> str {
+    if str_equal(filter, "upper") {
+        return str_to_upper(value);
+    }
+    if str_equal(filter, "lower") {
+        return str_to_lower(value);
+    }
+    if str_equal(filter, "trim") {
+        return str_trim(value);
+    }
+    if str_equal(filter, "default") {
+        // The default filter is applied as {{var|default}}
+        // If the value is empty, return a default (not yet supported —
+        // would need the default value as a parameter)
+        return value;
+    }
+    // Unknown filter — return value unchanged
+    return value;
+}
+
+/// Convenience: parse and render a template in one call.
+pub fn render(source: str, data: str) -> str {
+    var tmpl = template_parse(source);
+    return template_render(tmpl, data);
+}
+
+/// Render a template from a file.
+/// Reads the file, parses it, and renders with the given data context.
+pub fn render_file(path: str, data: str) -> str {
+    var source = p_file_read(path);
+    return render(source, data);
+}
+
+// ─── Comptime-ready API ──────────────────────────────────────────────────
+//
+// When comptime code generation is fully available, the following
+// functions will be replaced by comptime-generated code:
+//
+//   comptime template("index.html")
+//
+// This will parse the template at compile time and generate a typed
+// rendering function that takes a typed struct (not a JSON string).
+// The generated function will be a series of string concatenations
+// with no runtime parsing, no JSON lookup, no filter dispatch.
+//
+// For now, the runtime API above provides the same functionality
+// with the overhead of runtime parsing and JSON lookup.
+
+/// Comptime template placeholder — when comptime gen is available,
+/// this will be replaced by a comptime function that generates
+/// a typed rendering function from the template source.
+pub fn comptime_template(source: str) -> Template {
+    return template_parse(source);
+}

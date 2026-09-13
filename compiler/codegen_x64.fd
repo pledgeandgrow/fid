@@ -109,6 +109,7 @@ pub struct X64CodeGen {
     pub wrapping_functions: Vec<str>,
     pub panic_label_counter: i64,
     pub pending_panic_stubs: Vec<PanicStub>,
+    pub struct_layouts: Vec<StructLayoutEntry>,
 }
 
 pub fn X64CodeGen_new(allocs: ModuleAllocation) -> X64CodeGen {
@@ -125,6 +126,7 @@ pub fn X64CodeGen_new(allocs: ModuleAllocation) -> X64CodeGen {
         wrapping_functions: Vec::new(),
         panic_label_counter: 0,
         pending_panic_stubs: Vec::new(),
+        struct_layouts: Vec::new(),
     };
 }
 
@@ -282,6 +284,8 @@ pub fn X64CodeGen_gen_module(self: &mut X64CodeGen, module: L3Module) {
     self.trait_methods = module.trait_methods;
     // Copy wrapping function set for overflow check suppression (F65).
     self.wrapping_functions = module.wrapping_functions;
+    // Copy struct layouts for struct copy support.
+    self.struct_layouts = module.struct_layouts;
 
     // Collect string constants from the module.
     var i: i64 = 0;
@@ -1313,7 +1317,14 @@ pub fn X64CodeGen_gen_load(self: &mut X64CodeGen, dst: VReg, ptr: Operand, ty: I
 
 /// Generate a typed store instruction.
 pub fn X64CodeGen_gen_store(self: &mut X64CodeGen, ptr: Operand, value: Operand, ty: IrType) {
-    var size: i64 = ir_type_size(ty);
+    var size: i64 = X64CodeGen_struct_type_size(self, ty);
+
+    // Struct copy: when storing a struct larger than 8 bytes, copy word-by-word.
+    if size > 8 {
+        X64CodeGen_gen_struct_copy(self, ptr, value, size);
+        return;
+    }
+
     var store_op: str = "movq";
     if size == 1 { store_op = "movb"; }
     if size == 2 { store_op = "movw"; }
@@ -1354,6 +1365,54 @@ pub fn X64CodeGen_gen_store(self: &mut X64CodeGen, ptr: Operand, value: Operand,
         X64CodeGen_wl(self, "    " + store_op + " " + sub_reg + ", (%" + physreg_name(ptr_reg) + ")");
     } else {
         X64CodeGen_wl(self, "    " + store_op + " %rax, (%" + physreg_name(ptr_reg) + ")");
+    }
+}
+
+/// Look up struct size from struct_layouts (falls back to ir_type_size for non-structs).
+pub fn X64CodeGen_struct_type_size(self: &X64CodeGen, ty: IrType) -> i64 {
+    match ty {
+        IrType::Struct(name) => {
+            var i: i64 = 0;
+            while i < self.struct_layouts.len() {
+                var sl: StructLayoutEntry = self.struct_layouts.get(i);
+                if str_equal(sl.name, name) {
+                    return sl.layout.size;
+                }
+                i = i + 1;
+            }
+            return 8;
+        }
+        _ => { return ir_type_size(ty); }
+    }
+}
+
+/// Copy a struct word-by-word from src_ptr to dst_ptr.
+pub fn X64CodeGen_gen_struct_copy(self: &mut X64CodeGen, dst_ptr: Operand, src_ptr: Operand, size: i64) {
+    // Load source pointer into RSI, destination pointer into RDI.
+    X64CodeGen_gen_operand_to_reg(self, src_ptr, REG_RSI);
+    X64CodeGen_gen_operand_to_reg(self, dst_ptr, REG_RDI);
+
+    var n_words: i64 = size / 8;
+    var remainder: i64 = size % 8;
+
+    var i: i64 = 0;
+    while i < n_words {
+        var off: i64 = i * 8;
+        X64CodeGen_wl(self, "    movq " + int_to_str(off) + "(%rsi), %rax");
+        X64CodeGen_wl(self, "    movq %rax, " + int_to_str(off) + "(%rdi)");
+        i = i + 1;
+    }
+
+    // Handle remaining bytes (1-7) if any.
+    if remainder > 0 {
+        var off: i64 = n_words * 8;
+        if remainder <= 4 {
+            X64CodeGen_wl(self, "    movl " + int_to_str(off) + "(%rsi), %eax");
+            X64CodeGen_wl(self, "    movl %eax, " + int_to_str(off) + "(%rdi)");
+        } else {
+            X64CodeGen_wl(self, "    movq " + int_to_str(off) + "(%rsi), %rax");
+            X64CodeGen_wl(self, "    movq %rax, " + int_to_str(off) + "(%rdi)");
+        }
     }
 }
 

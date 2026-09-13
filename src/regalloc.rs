@@ -504,7 +504,8 @@ pub fn allocate_graph_coloring(
     // Only allocate non-preassigned VRegs.
     let allocatable_intervals: Vec<&LiveInterval> = intervals
         .iter()
-        .filter(|i| !preassigned.contains(&i.vreg))
+        .filter(|(vr, _)| !preassigned.contains(vr))
+        .map(|(_, iv)| iv)
         .collect();
 
     // Build interference graph.
@@ -606,7 +607,7 @@ pub fn allocate_graph_coloring(
         let iv = allocatable_intervals[i];
         for (pv, pr) in &preassigned_regs {
             // Check if the preassigned VReg's interval overlaps
-            if let Some(pi) = intervals.iter().find(|p| p.vreg == *pv) {
+            if let Some(pi) = intervals.get(pv) {
                 if iv.overlaps(pi) {
                     neighbor_colors.insert(*pr);
                 }

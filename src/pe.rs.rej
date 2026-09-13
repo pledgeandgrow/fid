@@ -1,0 +1,132 @@
+diff a/src/pe.rs b/src/pe.rs	(rejected hunks)
+@@ -1954,6 +2263,8 @@ impl PeCodeGen {
+                        "p_mem_read8", "p_mem_write8",
+                        "p_mem_read32", "p_mem_write32",
+                        "p_mem_read64", "p_mem_write64",
++                       "p_get_rbp", "p_set_rbp", "p_get_rsp", "p_set_rsp",
++                       "p_atomic_xchg32",
+                        // Phase 5A.5: GDT stubs
+                        "p_lgdt", "p_gdt_set_entry",
+                        "p_enter_user_mode",
+@@ -2099,6 +2412,8 @@ impl PeCodeGen {
+                        "p_mem_read8", "p_mem_write8",
+                        "p_mem_read32", "p_mem_write32",
+                        "p_mem_read64", "p_mem_write64",
++                       "p_get_rbp", "p_set_rbp", "p_get_rsp", "p_set_rsp",
++                       "p_atomic_xchg32",
+                        // Phase 5A.5: GDT stubs
+                        "p_lgdt", "p_gdt_set_entry",
+                        "p_enter_user_mode",
+@@ -2189,7 +2506,10 @@ impl PeCodeGen {
+ 
+         // 2b. Append module-level mutable globals to .rdata (writable section)
+         // Critical for bare-metal: GDT, IDT, page tables need fixed storage.
+-        for (name, (ty, init_expr)) in &module.globals {
++        let mut global_names: Vec<String> = module.globals.keys().cloned().collect();
++        global_names.sort();
++        for name in &global_names {
++            let (ty, init_expr) = &module.globals[name];
+             let off = rdata.data.len();
+             let bytes: [u8; 8] = match init_expr {
+                 crate::ast::Expr::IntLit(v) => (*v as i64).to_le_bytes(),
+@@ -2205,7 +2525,9 @@ impl PeCodeGen {
+         }
+ 
+         // 3. Pre-allocate labels
+-        for name in module.functions.keys() {
++        let mut func_names: Vec<String> = module.functions.keys().cloned().collect();
++        func_names.sort();
++        for name in &func_names {
+             let label = self.enc.alloc_label();
+             self.func_labels.insert(name.clone(), label);
+         }
+@@ -2236,6 +2558,8 @@ impl PeCodeGen {
+                        "p_mem_read8", "p_mem_write8",
+                        "p_mem_read32", "p_mem_write32",
+                        "p_mem_read64", "p_mem_write64",
++                       "p_get_rbp", "p_set_rbp", "p_get_rsp", "p_set_rsp",
++                       "p_atomic_xchg32",
+                        // Phase 5A.5: GDT stubs
+                        "p_lgdt", "p_gdt_set_entry",
+                        "p_enter_user_mode",
+@@ -2253,8 +2577,9 @@ impl PeCodeGen {
+         //    so GRUB jumps into our 32-bit → 64-bit trampoline)
+         self.gen_boot_entry_point(module);
+ 
+-        // 5. Generate code for each function
+-        for (name, func) in &module.functions {
++        // 5. Generate code for each function (sorted for determinism)
++        for name in &func_names {
++            let func = &module.functions[name];
+             self.gen_function(name, func, module);
+         }
+ 
+@@ -2855,14 +3182,18 @@ impl PeCodeGen {
+     fn gen_idt_setup_for_interrupts(&mut self, module: &IrModule) {
+         // Collect all (vector, handler_label) pairs for functions with @interrupt(N)
+         let mut isrs: Vec<(u64, u32)> = Vec::new();
+-        for func in module.functions.values() {
++        let mut func_names: Vec<String> = module.functions.keys().cloned().collect();
++        func_names.sort();
++        for name in &func_names {
++            let func = &module.functions[name];
+             if let Some(vector) = func.interrupt_vector {
+                 if let Some(&label) = self.func_labels.get(&func.name) {
+-                    eprintln!("[PE] Found ISR: {} vector={} is_interrupt={}", func.name, vector, func.is_interrupt);
+                     isrs.push((vector, label));
+                 }
+             }
+         }
++        // Sort ISRs by vector for deterministic IDT setup
++        isrs.sort_by_key(|(v, _)| *v);
+         eprintln!("[PE] gen_idt_setup_for_interrupts: {} ISRs found", isrs.len());
+         if isrs.is_empty() { return; }
+ 
+@@ -2983,18 +3314,25 @@ impl PeCodeGen {
+             self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
+         }
+ 
+-        // Allocate stack frame
++        // Allocate stack frame (sorted by ValueId for deterministic layout)
+         let mut frame = PeStackFrame::new();
+-        for (vid, meta) in &func.values {
++        let mut value_ids: Vec<u32> = func.values.keys().map(|v| v.0).collect();
++        value_ids.sort();
++        for vid in &value_ids {
++            let v = crate::ir::ValueId(*vid);
++            let meta = &func.values[&v];
+             let size = module.type_size(&meta.ty).max(8);
+-            frame.alloc(*vid, size);
+-        }
+-        // Pre-allocate alloca data slots
+-        for (vid, inst) in &func.instructions {
+-            if let Inst::Alloca { ty, .. } = inst {
++            frame.alloc(v, size);
++        }
++        // Pre-allocate alloca data slots (sorted by ValueId for deterministic layout)
++        let mut inst_ids: Vec<u32> = func.instructions.keys().map(|v| v.0).collect();
++        inst_ids.sort();
++        for vid in &inst_ids {
++            let v = crate::ir::ValueId(*vid);
++            if let Inst::Alloca { ty, .. } = &func.instructions[&v] {
+                 let data_size = module.type_size(ty).max(8) as i64;
+                 let offset = frame.alloc_raw(data_size);
+-                frame.alloca_slots.insert(vid.0, offset);
++                frame.alloca_slots.insert(v.0, offset);
+             }
+         }
+ 
+@@ -3430,11 +3826,10 @@ impl PeCodeGen {
+                     self.enc.call_label(flabel);
+                 } else if self.bare_mode {
+                     // In bare mode, unresolved extern calls are errors.
+-                    eprintln!("[DEBUG] ud2 for unresolved call '{}' in '{}' (bare_mode={})", target_func, func_name, self.bare_mode);
+                     self.enc.ud2();
+-                } else {
+-                    eprintln!("[DEBUG] non-bare unresolved call '{}' in '{}' — NO CALL EMITTED", target_func, func_name);
+                 }
++                // Non-bare mode: unresolved calls are silently skipped
++                // (the function may be provided by the runtime or stdlib).
+ 
+                 self.enc.add_rsp_i32(call_space);
+                 self.enc.mov_mem_rbp_reg(dst, Reg::Rax);

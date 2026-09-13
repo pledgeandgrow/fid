@@ -974,3 +974,135 @@ impl BTreeSet {
         return result;
     }
 }
+
+// ─── RingBuffer (fixed-size circular buffer) ───────────────────────────
+//
+// A fixed-capacity circular buffer. O(1) push/pop at both ends.
+// Overwrites oldest elements when full (configurable via `push_overwrite`).
+// For an unbounded queue, use Deque instead.
+
+pub struct RingBuffer {
+    pub data: Vec,    // backing storage
+    pub capacity: i64, // max elements
+    pub head: i64,    // index of oldest element
+    pub len: i64,     // number of live elements
+}
+
+impl RingBuffer {
+    /// Create a new ring buffer with the given capacity.
+    pub fn new(cap: i64) -> RingBuffer {
+        var rb = RingBuffer {
+            data: Vec::new(),
+            capacity: cap,
+            head: 0,
+            len: 0,
+        };
+        // Pre-allocate the backing storage.
+        var i = 0;
+        while i < cap {
+            rb.data.push(0);
+            i = i + 1;
+        }
+        return rb;
+    }
+
+    /// Push a value to the back. If full, overwrites the oldest element.
+    pub fn push(self: RingBuffer, value: i64) -> void {
+        var write_idx = (self.head + self.len) % self.capacity;
+        if self.len < self.capacity {
+            self.data.set(write_idx, value);
+            self.len = self.len + 1;
+        } else {
+            // Buffer full — overwrite oldest, advance head
+            self.data.set(self.head, value);
+            self.head = (self.head + 1) % self.capacity;
+        }
+    }
+
+    /// Push a value to the back. If full, returns false (no overwrite).
+    pub fn try_push(self: RingBuffer, value: i64) -> bool {
+        if self.len >= self.capacity { return false; }
+        var write_idx = (self.head + self.len) % self.capacity;
+        self.data.set(write_idx, value);
+        self.len = self.len + 1;
+        return true;
+    }
+
+    /// Remove and return the front (oldest) value. Returns 0 if empty.
+    pub fn pop_front(self: RingBuffer) -> i64 {
+        if self.len == 0 { return 0; }
+        var value = self.data.get(self.head);
+        self.head = (self.head + 1) % self.capacity;
+        self.len = self.len - 1;
+        return value;
+    }
+
+    /// Peek at the front value without removing it. Returns 0 if empty.
+    pub fn peek_front(self: RingBuffer) -> i64 {
+        if self.len == 0 { return 0; }
+        return self.data.get(self.head);
+    }
+
+    /// Peek at the back (newest) value without removing it. Returns 0 if empty.
+    pub fn peek_back(self: RingBuffer) -> i64 {
+        if self.len == 0 { return 0; }
+        var back_idx = (self.head + self.len - 1) % self.capacity;
+        return self.data.get(back_idx);
+    }
+
+    /// Check if the buffer is empty.
+    pub fn is_empty(self: RingBuffer) -> bool {
+        return self.len == 0;
+    }
+
+    /// Check if the buffer is full.
+    pub fn is_full(self: RingBuffer) -> bool {
+        return self.len >= self.capacity;
+    }
+
+    /// Get the number of live elements.
+    pub fn len(self: RingBuffer) -> i64 {
+        return self.len;
+    }
+
+    /// Get the capacity.
+    pub fn cap(self: RingBuffer) -> i64 {
+        return self.capacity;
+    }
+
+    /// Get the number of free slots.
+    pub fn free(self: RingBuffer) -> i64 {
+        return self.capacity - self.len;
+    }
+
+    /// Clear all elements.
+    pub fn clear(self: RingBuffer) -> void {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    /// Get element at logical index (0 = front).
+    pub fn get(self: RingBuffer, idx: i64) -> i64 {
+        if idx < 0 || idx >= self.len { return 0; }
+        var real_idx = (self.head + idx) % self.capacity;
+        return self.data.get(real_idx);
+    }
+
+    /// Set element at logical index (0 = front).
+    pub fn set(self: RingBuffer, idx: i64, value: i64) -> void {
+        if idx < 0 || idx >= self.len { return; }
+        var real_idx = (self.head + idx) % self.capacity;
+        self.data.set(real_idx, value);
+    }
+
+    /// Convert to a Vec (front to back order).
+    pub fn to_vec(self: RingBuffer) -> Vec {
+        var result = Vec::new();
+        var i = 0;
+        while i < self.len {
+            result.push(self.get(i));
+            i = i + 1;
+        }
+        return result;
+    }
+}

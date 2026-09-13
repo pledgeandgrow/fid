@@ -3,13 +3,14 @@
 > **Goal:** The Fides compiler compiles itself, producing identical output
 > across generations (bootstrap fixpoint).
 >
-> **Last updated:** Sep 9, 2026 (session 22 audit — bugs 3.16–3.19 fixed, roadmap verified against codebase)
+> **Last updated:** Sep 12, 2026 (session 26 — bootstrap fixpoint VERIFIED byte-for-byte, self-compilation SIGSEGV fixed, 7 Rust-to-Fides gaps closed)
 >
-> **Current status (audited):**
-> - 50 modules, 93,605 LOC — all type-check with `release/fides-c3.exe`
+> **Current status:**
+> - 52 modules, 100,934 LOC — all type-check with `release/fides-c3.exe`
 > - 38/38 self-host tests pass on all 3 backends
-> - **Self-compilation FAILS** — SIGSEGV in `Lowerer_mangle_method` during lowering
-> - **Fixpoint NOT verifiable** — `release/fides-c2.c` does not exist
+> - **Self-compilation PASSES** — SIGSEGV fixed (struct global C codegen + SDL detection + time.fd)
+> - **Fixpoint VERIFIED** — `release/fides-c4.c` == `release/fides-c5.c` byte-for-byte (29,763,762 bytes)
+> - 7 Rust-to-Fides gaps closed (str_substring, is_lto_mode, DynCall/TryUnwrap, x86.fd, 19 CLI commands, interp autograd/PRNG, runtime_linux TODOs)
 > - Bugs 3.16–3.19 (global Vec, struct overflow, Vec<f64>) — all FIXED in session 22
 
 ---

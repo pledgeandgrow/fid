@@ -1,0 +1,58 @@
+// Binary-safe file I/O — regression test for known-bug 3.14 (p_file_write
+// truncated at NUL bytes). Verifies that byte vectors containing 0x00
+// round-trip through file_write_bytes / file_read_bytes, and that
+// p_file_write text semantics stop at the first NUL (matching C fputs).
+use core;
+use vec;
+use file;
+
+fn test_write_read_with_nulls() -> i64 {
+    // PE-header-like data: contains embedded 0x00 bytes.
+    val bytes = Vec::new();
+    bytes.push(0x50);  // 'P'
+    bytes.push(0x45);  // 'E'
+    bytes.push(0x00);  // <- the byte that used to be truncated
+    bytes.push(0x00);
+    bytes.push(0x01);
+    bytes.push(0x00);
+    bytes.push(0xFF);  // high byte too
+    val rc = file_write_bytes("_fides_bin_io_test.tmp", bytes);
+    if rc != 0 { return 0; }
+    val sz = file_size("_fides_bin_io_test.tmp");
+    if sz != 7 { return 0; }
+    val back = file_read_bytes("_fides_bin_io_test.tmp");
+    if back.len() != 7 { return 0; }
+    if back.get(0) != 0x50 { return 0; }
+    if back.get(1) != 0x45 { return 0; }
+    if back.get(2) != 0x00 { return 0; }
+    if back.get(3) != 0x00 { return 0; }
+    if back.get(4) != 0x01 { return 0; }
+    if back.get(5) != 0x00 { return 0; }
+    if back.get(6) != 0xFF { return 0; }
+    val drc = file_delete("_fides_bin_io_test.tmp");
+    if drc != 0 { return 0; }
+    return 1;
+}
+
+fn test_file_write_text_stops_at_nul() -> i64 {
+    // p_file_write is a text builtin: content stops at the first NUL byte
+    // (matches C fputs semantics on both interpreter and C backend).
+    val rc = p_file_write("_fides_bin_io_text.tmp", "AB\x00CD");
+    if rc != 0 { return 0; }
+    val sz = file_size("_fides_bin_io_text.tmp");
+    if sz != 2 { return 0; }
+    val back = file_read_bytes("_fides_bin_io_text.tmp");
+    if back.len() != 2 { return 0; }
+    if back.get(0) != 65 { return 0; }
+    if back.get(1) != 66 { return 0; }
+    val drc = file_delete("_fides_bin_io_text.tmp");
+    if drc != 0 { return 0; }
+    return 1;
+}
+
+fn main() -> i64 {
+    if test_write_read_with_nulls() != 1 { println("FAIL: write_read_with_nulls"); return 1; }
+    if test_file_write_text_stops_at_nul() != 1 { println("FAIL: file_write_text_stops_at_nul"); return 1; }
+    println("All binary I/O tests passed");
+    return 0;
+}

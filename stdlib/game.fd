@@ -1,0 +1,233 @@
+// Fides Game Engine Framework — Phase 15.5
+//
+// Game engine framework built on ECS + frame arenas.
+// Fides is its own scripting language — no Lua, no embedded VM.
+// ECS layouts are generated at compile time (comptime gen).
+// Frame arenas handle per-frame allocations.
+//
+// Usage:
+//   use game;
+//   use ecs;
+//   use arena;
+//
+//   component Position { x: f64, y: f64 }
+//   component Velocity { dx: f64, dy: f64 }
+//
+//   fn main() {
+//     var fa = frame_new();
+//     var running = true;
+//     while running {
+//       frame_begin(fa);
+//       game_update(0.016);  // 60 FPS
+//       game_render();
+//       frame_end(fa);
+//     }
+//     frame_free(fa);
+//   }
+
+module game;
+
+use ecs;
+use arena;
+
+// ─── Game loop ───────────────────────────────────────────────────────────
+
+/// Game configuration — timing, window, etc.
+struct GameConfig {
+    target_fps: i64,       // target frames per second
+    frame_time: f64,        // seconds per frame (1.0 / target_fps)
+    max_entities: i64,     // maximum number of entities
+    running: bool,          // whether the game is running
+}
+
+/// Create a default game configuration.
+pub fn game_config_new() -> GameConfig {
+    return GameConfig {
+        target_fps: 60,
+        frame_time: 0.016666666666666666,
+        max_entities: 10000,
+        running: true,
+    };
+}
+
+/// Create a game configuration with a custom FPS.
+pub fn game_config_with_fps(fps: i64) -> GameConfig {
+    var config = game_config_new();
+    config.target_fps = fps;
+    config.frame_time = 1.0 / float_from_i64(fps);
+    return config;
+}
+
+/// Run the game loop. Calls update and render functions each frame.
+/// Uses a frame allocator for per-frame allocations.
+pub fn game_loop(config: GameConfig, update_fn: fn(f64) -> void, render_fn: fn() -> void) -> void {
+    var fa = frame_new();
+    while config.running {
+        frame_begin(fa);
+        update_fn(config.frame_time);
+        render_fn();
+        frame_end(fa);
+    }
+    frame_free(fa);
+}
+
+/// Run one frame of the game. Useful for testing.
+pub fn game_frame(config: GameConfig, update_fn: fn(f64) -> void, render_fn: fn() -> void) -> void {
+    var fa = frame_new();
+    frame_begin(fa);
+    update_fn(config.frame_time);
+    render_fn();
+    frame_end(fa);
+    frame_free(fa);
+}
+
+// ─── Asset management ────────────────────────────────────────────────────
+//
+// Assets are loaded via @derive(Serialize, Deserialize) — no reflection.
+// Deserialization code is generated at compile time.
+
+/// Asset handle — an opaque reference to a loaded asset.
+type AssetHandle = i64;
+
+/// Load an asset from a JSON file. The asset type is determined by the
+/// caller (via @derive(Deserialize)). Returns an asset handle.
+pub fn load_asset(path: str) -> AssetHandle {
+    // In a full implementation, this would use @derive(Deserialize)
+    // to parse the JSON into a typed struct at compile time.
+    // For now, return the file content as a handle.
+    var content = p_file_read(path);
+    return c_str_to_handle(content);
+}
+
+/// Load a texture asset.
+pub fn load_texture(path: str) -> AssetHandle {
+    return load_asset(path);
+}
+
+/// Load a sound asset.
+pub fn load_sound(path: str) -> AssetHandle {
+    return load_asset(path);
+}
+
+/// Load a 3D model asset.
+pub fn load_model(path: str) -> AssetHandle {
+    return load_asset(path);
+}
+
+// ─── Input handling ──────────────────────────────────────────────────────
+//
+// Input is handled via the event system. The game loop dispatches
+// events to handlers registered with the ECS.
+
+/// Input event types.
+const INPUT_KEY_DOWN: i64 = 1;
+const INPUT_KEY_UP: i64 = 2;
+const INPUT_MOUSE_MOVE: i64 = 3;
+const INPUT_MOUSE_DOWN: i64 = 4;
+const INPUT_MOUSE_UP: i64 = 5;
+
+/// Dispatch a key down event.
+pub fn input_key_down(key: i64) -> void {
+    ecs_dispatch_event("on_key_down");
+}
+
+/// Dispatch a key up event.
+pub fn input_key_up(key: i64) -> void {
+    ecs_dispatch_event("on_key_up");
+}
+
+/// Dispatch a mouse move event.
+pub fn input_mouse_move(x: i64, y: i64) -> void {
+    ecs_dispatch_event("on_mouse_move");
+}
+
+// ─── Rendering ───────────────────────────────────────────────────────────
+//
+// Rendering is done via the plot module (for 2D) or via GPU shaders
+// (for 3D). The game engine provides a simple 2D rendering API.
+
+/// Clear the screen with a color.
+pub fn render_clear(r: f64, g: f64, b: f64) -> void {
+    // In a real implementation, this would call the GPU.
+    // For now, it's a no-op.
+}
+
+/// Draw a rectangle.
+pub fn render_rect(x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64) -> void {
+    // No-op placeholder
+}
+
+/// Draw a circle.
+pub fn render_circle(x: f64, y: f64, radius: f64, r: f64, g: f64, b: f64) -> void {
+    // No-op placeholder
+}
+
+/// Draw text.
+pub fn render_text(x: f64, y: f64, text: str) -> void {
+    // No-op placeholder
+}
+
+/// Present the rendered frame to the screen.
+pub fn render_present() -> void {
+    // No-op placeholder
+}
+
+// ─── Scripting via comptime gen ───────────────────────────────────────────
+//
+// Game scripts are Fides code compiled with `comptime gen { ... }`.
+// The "scripting language" is Fides itself — no Lua, no separate VM.
+// Scripts can be hot-reloaded via dev JIT (fidesc watch).
+//
+// In the future:
+//   comptime gen {
+//     system Move(dt: f64) {
+//       query(Position, Velocity) {
+//         Position.x = Position.x + Velocity.dx * dt;
+//         Position.y = Position.y + Velocity.dy * dt;
+//       }
+//     }
+//   }
+//
+// This would generate specialized iteration code at compile time.
+
+/// Compile a game script. In comptime mode, this generates native code.
+/// For now, it's a no-op (scripts are compiled normally).
+pub fn compile_script(source: str) -> void {
+    // In comptime mode, this would generate and compile the script.
+    // For now, scripts are compiled as part of the main program.
+}
+
+// ─── Hot-reload dev mode ─────────────────────────────────────────────────
+//
+// Hot-reload is handled by `fidesc watch` (already implemented).
+// Changed systems are recompiled and hot-swapped into the running game.
+// Production builds are fully AOT-compiled, no JIT.
+
+/// Reload changed systems. Called when a file changes during development.
+/// In production, this is a no-op.
+pub fn hot_reload() -> void {
+    // Hot-reload is handled by `fidesc watch` at the compiler level.
+    // This function is a placeholder for game-level reload hooks.
+}
+
+// ─── Physics (basic) ─────────────────────────────────────────────────────
+//
+// Basic 2D physics for game prototypes. Not a full physics engine.
+
+/// Apply velocity to a position over a time step.
+pub fn physics_move(pos_x: f64, pos_y: f64, vel_x: f64, vel_y: f64, dt: f64) -> (f64, f64) {
+    var new_x = pos_x + vel_x * dt;
+    var new_y = pos_y + vel_y * dt;
+    return (new_x, new_y);
+}
+
+/// Apply gravity to a velocity.
+pub fn physics_gravity(vel_y: f64, gravity: f64, dt: f64) -> f64 {
+    return vel_y + gravity * dt;
+}
+
+/// Check if two axis-aligned bounding boxes overlap.
+pub fn physics_aabb_overlap(x1: f64, y1: f64, w1: f64, h1: f64,
+                            x2: f64, y2: f64, w2: f64, h2: f64) -> bool {
+    return x1 < x2 + w2 && x1 + w1 > x2 && y1 < y2 + h2 && y1 + h1 > y2;
+}
