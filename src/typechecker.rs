@@ -104,6 +104,8 @@ pub struct TypeChecker {
     trait_impl_assoc_bindings: HashMap<(String, String), HashMap<String, Type>>,
     /// Track which module each item belongs to ("func_name" → "core")
     item_modules: HashMap<String, String>,
+    /// Names of `extern "C"` functions (FFI boundary: handles pass as pointers).
+    extern_fns: HashSet<String>,
     /// Track visibility of each item ("func_name" → true if pub)
     item_visibility: HashMap<String, bool>,
     /// Track functions defined in each module (module_name → set of function names)
@@ -148,6 +150,9 @@ pub struct TypeChecker {
     current_func_name: Option<String>,
     /// Collected return expression types for the current function (for `-> _` inference)
     current_return_types: Vec<Type>,
+    /// Declared return type of the function or closure body being checked
+    /// (None for `-> _` inference or unannotated closures).
+    current_ret_ty: Option<Type>,
     /// Current Self type (set when checking impl methods, for bare `self` params)
     current_self_type: Option<String>,
     /// Sandbox depth — when > 0, all capabilities are revoked.
@@ -214,6 +219,7 @@ impl TypeChecker {
             trait_assoc_types: HashMap::new(),
             trait_impl_assoc_bindings: HashMap::new(),
             item_modules: HashMap::new(),
+            extern_fns: HashSet::new(),
             item_visibility: HashMap::new(),
             item_lines: HashMap::new(),
             module_functions: HashMap::new(),
@@ -232,6 +238,7 @@ impl TypeChecker {
             cap_verified: HashSet::new(),
             current_func_name: None,
             current_return_types: Vec::new(),
+            current_ret_ty: None,
             current_self_type: None,
             sandbox_depth: 0,
             gpu_region_depth: 0,
@@ -765,6 +772,7 @@ impl TypeChecker {
             self.funcs.insert(ext.pledge_name.clone(), (param_types, self.resolve_type(&ext.ret_ty)));
             self.item_modules.insert(ext.pledge_name.clone(), module.to_string());
             self.item_visibility.insert(ext.pledge_name.clone(), true);
+            self.extern_fns.insert(ext.pledge_name.clone());
         }
 
         for imp in &program.impls {
@@ -4357,6 +4365,14 @@ impl TypeChecker {
     fn check_func(&mut self, func: &Func) {
         self.current_func_name = Some(func.name.clone());
         self.current_return_types.clear();
+        let saved_ret_ty = self.current_ret_ty.take();
+        if func.ret_ty != Type::Infer {
+            let declared = self.resolve_self_type(&func.ret_ty);
+            self.current_ret_ty = Some(match &declared {
+                Type::Generic { name, args } if func.is_async && name == "Future" && args.len() == 1 => args[0].clone(),
+                _ => declared,
+            });
+        }
         // Set current_module to the module where this function was defined,
         // so field privacy checks work correctly (private fields are accessible
         // from within their defining module).
@@ -4424,8 +4440,21 @@ impl TypeChecker {
         self.current_type_params = saved_tp;
         self.current_type_param_bounds = saved_bounds;
         self.pop_scope();
+        // A function declared to return a value must not fall off the end
+        // of its body (parse_match_expr in the self-hosted parser did, and its
+        // callers received garbage).
+        if let Some(declared) = self.current_ret_ty.clone() {
+            let returns_value = !matches!(declared, Type::Void | Type::Never | Type::Infer);
+            if returns_value && func.name != "main" && !Self::always_leaves(&func.body) {
+                self.errors.push(format!(
+                    "Type error (line {}): '{}' is declared to return {} but can reach the end of its body without returning",
+                    func.line, func.name, declared
+                ));
+            }
+        }
         self.consumed_vars = saved_consumed;
         self.current_module = saved_module;
+        self.current_ret_ty = saved_ret_ty;
         self.current_func_name = None;
     }
 
@@ -4440,7 +4469,8 @@ impl TypeChecker {
                 // Consume linear values in the initializer expression
                 self.consume_linear_in_expr(expr, *line);
                 let final_ty = if let Some(declared) = ty {
-                    if !self.types_compatible(declared, &expr_ty) {
+                    if !self.types_compatible(declared, &expr_ty)
+                        && !(Self::is_runtime_layer(&self.current_module) && Self::is_handle_int_pair(declared, &expr_ty)) {
                         self.errors.push(format!(
                             "Type error (line {}): cannot assign {} to variable '{}' of type {}.\n\
                              \x20\x20\x20\x20Expected: {}\n\
@@ -4547,9 +4577,11 @@ impl TypeChecker {
                 if let Some(e) = expr {
                     let ret_ty = self.check_expr(e);
                     self.consume_linear_in_expr(e, *line);
+                    self.check_return_type(&ret_ty, *line);
                     // Collect for `-> _` inference
                     self.current_return_types.push(ret_ty);
                 } else {
+                    self.check_return_type(&Type::Void, *line);
                     self.current_return_types.push(Type::Void);
                 }
             }
@@ -4719,8 +4751,8 @@ impl TypeChecker {
                 }
                 // Unwrap references (&T, &mut T) to get the underlying struct type.
                 let effective_ty = match &obj_ty {
-                    Type::Ref { inner, .. } => (**inner).clone(),
-                    _ => obj_ty.clone(),
+                    Type::Ref { inner, .. } => Self::unbox_ty(inner),
+                    _ => Self::unbox_ty(&obj_ty),
                 };
                 if let Type::Named(name) = &effective_ty {
                     // Clone fields to avoid borrowing self while checking expr
@@ -4839,7 +4871,7 @@ impl TypeChecker {
                 self.pop_scope();
             }
             Stmt::Match { expr, arms, line: _ } => {
-                let match_ty = self.check_expr(expr);
+                let match_ty = Self::unbox_ty(&self.check_expr(expr));
                 for arm in arms {
                     self.push_scope();
                     // Bind pattern variables
@@ -4848,6 +4880,7 @@ impl TypeChecker {
                             self.declare(name, match_ty.clone());
                         }
                         Pattern::EnumVariant { enum_name, variant, bindings } => {
+                            self.check_enum_pattern(&match_ty, enum_name, variant, bindings);
                             let tys = self.pattern_binding_types(&match_ty, enum_name, variant, bindings);
                             for ((bname, _), ty) in bindings.iter().zip(tys) {
                                 self.declare(bname, ty);
@@ -5698,6 +5731,25 @@ impl TypeChecker {
                     _ => {}
                 }
 
+                // Locals shadow globals: a parameter or variable holding a
+                // function value wins over a global function of the same name
+                // (core's `Option_map(self, f)` calling `f(v)` used to bind to a
+                // user's global `fn f`).
+                if let Some(var_ty) = self.lookup(callee).cloned() {
+                    let resolved_ty = self.resolve_type(&var_ty);
+                    if let Type::Func { params, ret } = &resolved_ty {
+                        if params.len() != arg_types.len() {
+                            self.errors.push(format!(
+                                "Type error: function variable '{}' expects {} args, got {}",
+                                callee,
+                                params.len(),
+                                arg_types.len()
+                            ));
+                        }
+                        return (**ret).clone();
+                    }
+                }
+
                 // Check if callee is a known function
                 if let Some((params, ret)) = self.funcs.get(callee).cloned() {
                     self.check_visibility(callee);
@@ -5716,16 +5768,23 @@ impl TypeChecker {
                             arg_types.len()
                         ));
                     }
-                    // Check argument types match parameter types
-                    // Only enforce strict checking for named struct types (e.g. SQLString)
-                    // to prevent injection via typed strings. Primitive types (str, i64, etc.)
-                    // are checked loosely since the IR represents strings as pointers (i64).
+                    let runtime_call = self.item_modules.get(callee).map_or(false, |m| Self::is_runtime_layer(m))
+                        || Self::is_runtime_layer(&self.current_module)
+                        || self.extern_fns.contains(callee);
+                    // print/println/eprint/eprintln accept any printable value.
+                    let polymorphic_builtin = matches!(callee.as_str(), "print" | "println" | "eprint" | "eprintln");
+                    // Check argument types match parameter types (every parameter;
+                    // generic parameters are resolved by monomorphization).
                     for (i, (param, arg)) in params.iter().zip(arg_types.iter()).enumerate() {
-                        let param_is_named = matches!(self.resolve_type(param), Type::Named(_));
-                        let is_generic_param = matches!(param, Type::Named(name) if name.len() == 1 && name.chars().next().unwrap().is_uppercase());
-                        if param_is_named && !is_generic_param && !self.types_compatible(param, arg) {
+                        let is_generic_param = matches!(param, Type::Named(name) if name.len() == 1 && name.chars().next().unwrap().is_uppercase())
+                            || self.type_contains_param(param);
+                        if !is_generic_param && !polymorphic_builtin && !self.arg_compatible(param, arg)
+                            && !(runtime_call && Self::is_handle_int_pair(param, arg))
+                            && !(self.extern_fns.contains(callee) && Self::is_ffi_pointer_pair(param, arg)) {
                             self.errors.push(format!(
-                                "Type error: function '{}' parameter {} expects '{}', got '{}'",
+                                "Type error (line {}{}): function '{}' parameter {} expects '{}', got '{}'",
+                                self.current_line,
+                                self.current_func_name.as_ref().map(|f| format!(", in '{}'", f)).unwrap_or_default(),
                                 callee, i + 1, param, arg
                             ));
                         }
@@ -5783,6 +5842,15 @@ impl TypeChecker {
                         "p_bool_to_str" => {
                             return Type::Str;
                         }
+                        "p_all_reduce" | "p_all_gather" if !arg_types.is_empty() => {
+                            return arg_types[0].clone();
+                        }
+                        "p_vec_new" | "p_vec_clone" | "p_file_read_bytes" => {
+                            return Type::Named("Vec".to_string());
+                        }
+                        "p_vec_is_empty" | "p_vec_contains" => {
+                            return Type::Bool;
+                        }
                         "p_string_contains" | "p_string_starts_with"
                         | "p_string_ends_with" | "p_string_is_empty" => {
                             return Type::Bool;
@@ -5806,8 +5874,8 @@ impl TypeChecker {
                 let obj_ty = self.check_expr(expr);
                 // Unwrap references (&T, &mut T) to get the underlying struct type.
                 let effective_ty = match &obj_ty {
-                    Type::Ref { inner, .. } => (**inner).clone(),
-                    _ => obj_ty.clone(),
+                    Type::Ref { inner, .. } => Self::unbox_ty(inner),
+                    _ => Self::unbox_ty(&obj_ty),
                 };
                 // Swizzle access for vec types (Phase 8A)
                 // .xyz/.rgb/.yzx/.xxx etc. on vec3/vec4 → return vec type based on swizzle length
@@ -5921,19 +5989,16 @@ impl TypeChecker {
                 else_block,
             } => {
                 self.check_expr(cond);
-                self.push_scope();
-                for s in then_block {
-                    self.check_stmt(s);
-                }
-                self.pop_scope();
-                if let Some(else_b) = else_block {
-                    self.push_scope();
-                    for s in else_b {
-                        self.check_stmt(s);
+                let then_ty = self.check_block_value(then_block);
+                match else_block {
+                    // `if c { a } else { b }` has the type of its branches;
+                    // a diverging branch takes the other branch's type.
+                    Some(else_b) => {
+                        let else_ty = self.check_block_value(else_b);
+                        if then_ty == Type::Never { else_ty } else { then_ty }
                     }
-                    self.pop_scope();
+                    None => Type::Void,
                 }
-                Type::Void
             }
             Expr::Range { start, end, .. } => {
                 let st = self.check_expr(start);
@@ -5965,7 +6030,7 @@ impl TypeChecker {
                 if let Expr::Ident(name) = receiver.as_ref() {
                     if name == "Box" && method == "new" {
                         let arg_ty = self.check_expr(&args[0]);
-                        return Type::Ref { inner: Box::new(arg_ty), is_mut: true };
+                        return Type::Generic { name: "Box".to_string(), args: vec![arg_ty] };
                     }
                     // Rc::new(x) — single-threaded reference counting
                     if name == "Rc" && method == "new" {
@@ -6390,7 +6455,8 @@ impl TypeChecker {
                 Type::Str
             }
             Expr::Match { expr, arms } => {
-                let match_ty = self.check_expr(expr);
+                let match_ty = Self::unbox_ty(&self.check_expr(expr));
+                let mut arm_tys: Vec<Type> = Vec::new();
                 for arm in arms {
                     self.push_scope();
                     match &arm.pattern {
@@ -6398,6 +6464,7 @@ impl TypeChecker {
                             self.declare(name, match_ty.clone());
                         }
                         Pattern::EnumVariant { enum_name, variant, bindings } => {
+                            self.check_enum_pattern(&match_ty, enum_name, variant, bindings);
                             let tys = self.pattern_binding_types(&match_ty, enum_name, variant, bindings);
                             for ((bname, _), ty) in bindings.iter().zip(tys) {
                                 self.declare(bname, ty);
@@ -6410,11 +6477,13 @@ impl TypeChecker {
                     if let Some(guard) = &arm.guard {
                         self.check_expr(guard);
                     }
-                    for s in &arm.body {
-                        self.check_stmt(s);
-                    }
+                    arm_tys.push(self.check_stmts_value(&arm.body));
                     self.pop_scope();
                 }
+                // `match` as a value: the first non-diverging arm's type
+                // (Never if every arm leaves the block).
+                let match_value_ty = arm_tys.iter().find(|t| **t != Type::Never).cloned()
+                    .unwrap_or(if arm_tys.is_empty() { Type::Void } else { Type::Never });
                 // Issue 49: Non-exhaustive match checking.
                 // If there's no wildcard/ident arm, verify all enum variants are covered.
                 let has_catchall = arms.iter().any(|a| matches!(a.pattern, Pattern::Wildcard | Pattern::Ident(_)));
@@ -6459,12 +6528,11 @@ impl TypeChecker {
                         }
                     }
                 }
-                Type::Void
+                match_value_ty
             }
-            Expr::EnumLit { enum_name, variant: _, args } => {
-                for a in args {
-                    self.check_expr(a);
-                }
+            Expr::EnumLit { enum_name, variant, args } => {
+                let arg_tys: Vec<Type> = args.iter().map(|a| self.check_expr(a)).collect();
+                self.check_enum_constructor(enum_name, variant, &arg_tys);
                 Type::Named(enum_name.clone())
             }
             Expr::Ref { expr, is_mut } => {
@@ -6476,6 +6544,7 @@ impl TypeChecker {
                 match ty {
                     Type::Ref { inner, .. } => *inner,
                     Type::RawPtr { inner, .. } => *inner,
+                    Type::Generic { ref name, ref args } if name == "Box" && args.len() == 1 => args[0].clone(),
                     _ => {
                         self.errors.push(format!(
                             "Type error: cannot dereference non-reference type {}",
@@ -6625,11 +6694,21 @@ impl TypeChecker {
                 for p in params {
                     self.declare(&p.name, self.resolve_type(&p.ty));
                 }
-                for s in body {
-                    self.check_stmt(s);
-                }
+                let saved_ret_ty = std::mem::replace(&mut self.current_ret_ty, ret_ty.clone());
+                let outer_returns = self.current_return_types.len();
+                let body_ty = self.check_stmts_value(body);
+                // The closure's own `return`s belong to it, not the enclosing fn.
+                let closure_returns = self.current_return_types.split_off(outer_returns);
+                self.current_ret_ty = saved_ret_ty;
                 self.pop_scope();
-                ret_ty.clone().unwrap_or(Type::Void)
+                // Unannotated closures (`fn(x) => x + n`) infer their return type.
+                let inferred = closure_returns.into_iter()
+                    .find(|t| *t != Type::Void && *t != Type::Never)
+                    .unwrap_or(if body_ty == Type::Never { Type::Void } else { body_ty });
+                Type::Func {
+                    params: params.iter().map(|p| self.resolve_type(&p.ty)).collect(),
+                    ret: Box::new(ret_ty.clone().unwrap_or(inferred)),
+                }
             }
             Expr::Cast { expr, target_ty } => {
                 self.check_expr(expr);
@@ -7221,6 +7300,250 @@ impl TypeChecker {
     ///   2. An explicit annotation on the binding (`Some(x: Token)`), used when
     ///      the declared payload is an unsubstituted type param.
     ///   3. `Type::I64` — the uniform fallback representation.
+    /// Reject enum patterns that name a variant the enum does not have, or
+    /// bind a different number of payload fields than the variant carries.
+    /// Without this, `match op { BinOp::Ne => .. }` (no such variant) type-
+    /// checked and silently never matched.
+    fn check_enum_pattern(&mut self, match_ty: &Type, enum_name: &str, variant: &str, bindings: &[(String, String)]) {
+        let Some(ename) = self.resolve_pattern_enum(match_ty, enum_name, variant) else { return };
+        let Some(variants) = self.enum_variants.get(&ename) else { return };
+        match variants.iter().find(|(vname, _)| vname == variant) {
+            None => self.errors.push(format!(
+                "Type error (line {}): enum '{}' has no variant '{}'",
+                self.current_line, ename, variant
+            )),
+            Some((_, payload)) if !bindings.is_empty() && bindings.len() != payload.len() => {
+                self.errors.push(format!(
+                    "Type error (line {}): pattern {}::{} binds {} field(s) but the variant has {}",
+                    self.current_line, ename, variant, bindings.len(), payload.len()
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Argument passing: like `types_compatible`, plus the call-site
+    /// coercions Fides performs — a `&mut T` reborrows as `&T`, and a value
+    /// `T` is auto-borrowed for a `&T` / `&mut T` parameter. Passing a `&T`
+    /// where `&mut T` is required stays an error (mutation through a shared
+    /// reference).
+    fn arg_compatible(&self, param: &Type, arg: &Type) -> bool {
+        if self.types_compatible(param, arg) {
+            return true;
+        }
+        let param = self.resolve_type(param);
+        let arg = self.resolve_type(arg);
+        let is_box = |t: &Type| matches!(t, Type::Generic { name, args } if name == "Box" && args.len() == 1);
+        let arg_is_boxed = is_box(&arg) || matches!(&arg, Type::Ref { inner, .. } if is_box(inner));
+        if is_box(&param) && !arg_is_boxed {
+            // A Box owns a heap copy made by Box::new; storing a bare value
+            // (often a pointer into the caller's stack frame) dangles.
+            return false;
+        }
+        // Aggregates (structs, enums, Vec, Box) are passed as a pointer at
+        // runtime, so `T`, `&T` and `Box<T>` share a representation; accept
+        // them interchangeably at call sites (TODO: real Box/ownership).
+        let strip = |t: &Type| -> Type {
+            let t = match t {
+                Type::Generic { name, args } if name == "Box" && args.len() == 1 => args[0].clone(),
+                _ => t.clone(),
+            };
+            self.resolve_type(&t)
+        };
+        if let (Type::Func { params: pp, ret: pr }, Type::Func { params: ap, ret: ar }) = (&param, &arg) {
+            return pp.len() == ap.len()
+                && pp.iter().zip(ap.iter()).all(|(x, y)| self.arg_compatible(x, y))
+                && (self.arg_compatible(pr, ar) || **ar == Type::Void && **pr == Type::Void);
+        }
+        // Only user structs and enums are represented as a pointer to their
+        // data, so only for them is `T` interchangeable with `&T` / `Box<T>`.
+        // A Vec/HashMap/str/number value is itself the handle or value, and
+        // `&v` is a pointer to the variable holding it: mixing the two passes
+        // the wrong thing (e.g. `count(&mut v)` read garbage, and `push(v)`
+        // into a `&mut Vec` parameter was silently lost).
+        let shares_repr = |t: &Type| -> bool {
+            match t {
+                Type::Named(n) | Type::Generic { name: n, .. } => {
+                    !matches!(n.as_str(), "Vec" | "HashMap" | "String" | "Box")
+                        && (self.structs.contains_key(n) || self.enums.contains(n))
+                }
+                _ => false,
+            }
+        };
+        match (&param, &arg) {
+            (Type::Ref { inner: p, is_mut: false }, Type::Ref { inner: a, .. }) => self.types_compatible(&strip(p), &strip(a)),
+            (Type::Ref { is_mut: true, .. }, Type::Ref { is_mut: false, .. }) => false,
+            (Type::Ref { inner: p, is_mut: true }, Type::Ref { inner: a, is_mut: true }) => self.types_compatible(&strip(p), &strip(a)),
+            (Type::Ref { inner: p, .. }, a) => shares_repr(&strip(p)) && self.types_compatible(&strip(p), &strip(a)),
+            (p, Type::Ref { inner: a, .. }) => shares_repr(&strip(p)) && self.types_compatible(&strip(p), &strip(a)),
+            (p, a) => {
+                let (sp, sa) = (strip(p), strip(a));
+                (shares_repr(&sp) || (sp == *p && sa == *a)) && self.types_compatible(&sp, &sa)
+            }
+        }
+    }
+
+    /// Whether control can never reach the end of `stmts`: it ends in
+    /// `return`, a diverging call, an if/else or match whose branches all
+    /// leave, or an infinite loop without `break`. A trailing expression
+    /// statement counts as the block's value.
+    fn always_leaves(stmts: &[Stmt]) -> bool {
+        match stmts.last() {
+            None => false,
+            Some(Stmt::Return(..)) => true,
+            Some(Stmt::Expr(..)) => true,
+            Some(Stmt::If { then_block, else_block: Some(else_block), .. }) => {
+                Self::always_leaves(then_block) && Self::always_leaves(else_block)
+            }
+            Some(Stmt::Match { arms, .. }) => {
+                !arms.is_empty() && arms.iter().all(|a| Self::always_leaves(&a.body))
+            }
+            Some(Stmt::Loop { body, .. }) => !Self::has_break(body),
+            Some(Stmt::Unsafe { body, .. })
+            | Some(Stmt::RegionBlock { body, .. })
+            | Some(Stmt::Sandbox { body, .. })
+            | Some(Stmt::Txn { body, .. })
+            | Some(Stmt::Handle { body, .. }) => Self::always_leaves(body),
+            Some(Stmt::While { cond: Expr::BoolLit(true), body, .. }) => !Self::has_break(body),
+            _ => false,
+        }
+    }
+
+    /// A `break` that exits the loop whose body is `stmts` (breaks inside
+    /// nested loops belong to those loops).
+    fn has_break(stmts: &[Stmt]) -> bool {
+        stmts.iter().any(|s| match s {
+            Stmt::Break(..) => true,
+            Stmt::If { then_block, else_block, .. } => {
+                Self::has_break(then_block) || else_block.as_ref().map_or(false, |b| Self::has_break(b))
+            }
+            Stmt::Match { arms, .. } => arms.iter().any(|a| Self::has_break(&a.body)),
+            _ => false,
+        })
+    }
+
+    /// The stdlib modules that implement the runtime handles themselves
+    /// (Vec/HashMap are raw pointers manipulated as i64 there).
+    fn is_runtime_layer(module: &str) -> bool {
+        matches!(module, "core" | "vec")
+    }
+
+    /// An opaque runtime handle (Vec, HashMap, Allocator, Tensor) paired with
+    /// i64 — interchangeable only inside the runtime layer (TODO R1.4: a
+    /// layout-aware Vec removes the need for this).
+    fn is_handle_int_pair(a: &Type, b: &Type) -> bool {
+        let is_handle = |t: &Type| match t {
+            Type::Named(n) | Type::Generic { name: n, .. } => matches!(n.as_str(), "Vec" | "HashMap" | "Allocator" | "Tensor"),
+            _ => false,
+        };
+        (is_handle(a) && matches!(b, Type::I64)) || (is_handle(b) && matches!(a, Type::I64))
+    }
+
+    /// At the C FFI boundary a reference, str, raw pointer or runtime handle
+    /// is passed as a pointer-sized integer or raw pointer.
+    fn is_ffi_pointer_pair(param: &Type, arg: &Type) -> bool {
+        let param_is_ptr = matches!(param, Type::I64 | Type::RawPtr { .. });
+        let arg_is_ptr = matches!(arg, Type::Ref { .. } | Type::Str | Type::RawPtr { .. })
+            || matches!(arg, Type::Named(n) | Type::Generic { name: n, .. } if matches!(n.as_str(), "Vec" | "HashMap" | "Allocator" | "Tensor"));
+        param_is_ptr && arg_is_ptr
+    }
+
+    /// Check a block in its own scope and return the type of its trailing
+    /// expression statement (Void if it has none).
+    fn check_block_value(&mut self, stmts: &[Stmt]) -> Type {
+        self.push_scope();
+        let last = self.check_stmts_value(stmts);
+        self.pop_scope();
+        last
+    }
+
+    /// Check statements in the current scope; the value is the trailing
+    /// expression's type, `Never` if the list ends by leaving the block
+    /// (`return`/`break`/`continue`), else Void.
+    fn check_stmts_value(&mut self, stmts: &[Stmt]) -> Type {
+        let mut last = Type::Void;
+        for (i, s) in stmts.iter().enumerate() {
+            let is_last = i + 1 == stmts.len();
+            match s {
+                Stmt::Expr(e, line) if is_last => {
+                    last = self.check_expr(e);
+                    self.consume_linear_in_expr(e, *line);
+                }
+                _ => {
+                    self.check_stmt(s);
+                    if is_last && matches!(s, Stmt::Return(..) | Stmt::Break(..) | Stmt::Continue(..)) {
+                        last = Type::Never;
+                    }
+                }
+            }
+        }
+        last
+    }
+
+    /// `return e` must match the declared return type of the enclosing
+    /// function or closure.
+    fn check_return_type(&mut self, actual: &Type, line: usize) {
+        let Some(declared) = self.current_ret_ty.clone() else { return };
+        let declared = self.resolve_self_type(&declared);
+        let is_main = self.current_func_name.as_deref() == Some("main");
+        let ok = match (&declared, actual) {
+            (Type::Void, Type::Void) => true,
+            (Type::Void, a) if is_main && self.is_numeric(a) => true,
+            (Type::Void, _) | (_, Type::Void) => false,
+            _ => self.arg_compatible(&declared, actual)
+                || (Self::is_runtime_layer(&self.current_module) && Self::is_handle_int_pair(&declared, actual)),
+        };
+        if !ok {
+            let name = self.current_func_name.clone().unwrap_or_else(|| "<closure>".to_string());
+            self.errors.push(format!(
+                "Type error (line {}): '{}' returns {} but is declared to return {}",
+                line, name, actual, declared
+            ));
+        }
+    }
+
+    /// `Enum::Variant(args)` must name an existing variant with matching arity.
+    fn check_enum_constructor(&mut self, enum_name: &str, variant: &str, arg_tys: &[Type]) {
+        let n_args = arg_tys.len();
+        let resolved = self.resolve_struct_name(enum_name);
+        let key = if self.enum_variants.contains_key(&resolved) {
+            resolved
+        } else if self.enum_variants.contains_key(enum_name) {
+            enum_name.to_string()
+        } else {
+            return;
+        };
+        let payload = self.enum_variants[&key].iter()
+            .find(|(vname, _)| vname == variant)
+            .map(|(_, tys)| tys.clone());
+        match payload {
+            None => self.errors.push(format!(
+                "Type error (line {}): enum '{}' has no variant '{}'",
+                self.current_line, key, variant
+            )),
+            Some(tys) if tys.len() != n_args => self.errors.push(format!(
+                "Type error (line {}): {}::{} takes {} value(s), got {}",
+                self.current_line, key, variant, tys.len(), n_args
+            )),
+            Some(tys) => {
+                let enum_params = self.enum_type_params.get(&key).cloned().unwrap_or_default();
+                for (i, (expected, actual)) in tys.iter().zip(arg_tys.iter()).enumerate() {
+                    // Generic payloads are checked after monomorphization.
+                    if self.type_contains_param(expected) || self.is_type_param_name_ty(expected)
+                        || enum_params.iter().any(|p| Self::type_mentions(expected, p)) {
+                        continue;
+                    }
+                    if !self.arg_compatible(expected, actual) {
+                        self.errors.push(format!(
+                            "Type error (line {}): {}::{} field {} expects '{}', got '{}'",
+                            self.current_line, key, variant, i + 1, expected, actual
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     fn pattern_binding_types(
         &self,
         match_ty: &Type,
@@ -7258,6 +7581,30 @@ impl TypeChecker {
                 _ => self.type_from_name(annot).unwrap_or(Type::I64),
             }
         }).collect()
+    }
+
+    /// Whether `t` names `param` anywhere (e.g. `E`, `Vec<E>`, `&E`).
+    fn type_mentions(t: &Type, param: &str) -> bool {
+        match t {
+            Type::Named(n) => n == param,
+            Type::Generic { name, args } => name == param || args.iter().any(|a| Self::type_mentions(a, param)),
+            Type::Ref { inner, .. } | Type::RawPtr { inner, .. } => Self::type_mentions(inner, param),
+            Type::Array { elem, .. } => Self::type_mentions(elem, param),
+            Type::Tuple(ts) => ts.iter().any(|a| Self::type_mentions(a, param)),
+            _ => false,
+        }
+    }
+
+    /// `Box<T>` auto-derefs to `T` for field access, `*`, and `match`.
+    fn unbox_ty(t: &Type) -> Type {
+        match t {
+            Type::Generic { name, args } if name == "Box" && args.len() == 1 => args[0].clone(),
+            _ => t.clone(),
+        }
+    }
+
+    fn is_type_param_name_ty(&self, t: &Type) -> bool {
+        matches!(t, Type::Named(n) if self.is_type_param_name(n))
     }
 
     /// Whether `name` is a type parameter of some generic enum rather than a

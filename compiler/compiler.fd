@@ -186,10 +186,10 @@ pub fn PathProgram_new(path: str, prog: Program) -> PathProgram {
 }
 
 /// Cached file read -- returns cached content if available, otherwise reads from disk.
-fn cached_file_read(cache: &mut Vec<PathContent>, path: str) -> str {
+fn cached_file_read(cache: Vec<PathContent>, path: str) -> str {
     var i: i64 = 0;
     while i < cache.len() {
-        if str_equal(cache.get(i).path, path) {
+        if cache.get(i).path == path {
             return cache.get(i).content;
         }
         i = i + 1;
@@ -200,10 +200,10 @@ fn cached_file_read(cache: &mut Vec<PathContent>, path: str) -> str {
 }
 
 /// Cached lex -- returns cached tokens if available, otherwise lexes.
-fn cached_lex(token_cache: &mut Vec<PathTokens>, content_cache: &mut Vec<PathContent>, path: str) -> Vec<Token> {
+fn cached_lex(token_cache: Vec<PathTokens>, content_cache: Vec<PathContent>, path: str) -> Vec<Token> {
     var i: i64 = 0;
     while i < token_cache.len() {
-        if str_equal(token_cache.get(i).path, path) {
+        if token_cache.get(i).path == path {
             return token_cache.get(i).tokens;
         }
         i = i + 1;
@@ -219,10 +219,10 @@ fn cached_lex(token_cache: &mut Vec<PathTokens>, content_cache: &mut Vec<PathCon
 /// This avoids re-parsing modules that were pre-scanned then deferred due to
 /// unloaded transitive dependencies. The pre-scan parse is the most expensive
 /// step (~4s per module), and deferred modules get re-parsed on re-encounter.
-fn cached_parse(parse_cache: &mut Vec<PathProgram>, token_cache: &mut Vec<PathTokens>, content_cache: &mut Vec<PathContent>, path: str, struct_names: Vec<str>, enum_names: Vec<str>) -> OptProgram {
+fn cached_parse(parse_cache: Vec<PathProgram>, token_cache: Vec<PathTokens>, content_cache: Vec<PathContent>, path: str, struct_names: Vec<str>, enum_names: Vec<str>) -> OptProgram {
     var i: i64 = 0;
     while i < parse_cache.len() {
-        if str_equal(parse_cache.get(i).path, path) {
+        if parse_cache.get(i).path == path {
             return OptProgram::Some(parse_cache.get(i).prog);
         }
         i = i + 1;
@@ -711,12 +711,12 @@ pub fn build_program_no_std(source: str, source_path: OptStr) -> ResultProgram {
                     var import_path: str = imports_to_process.get(imports_to_process.len() - 1);
                     imports_to_process.pop();
                     // Skip "core" -- not available in no-std mode
-                    if str_equal(import_path, "core") { continue; }
+                    if import_path == "core" { continue; }
                     // Skip already-loaded modules
                     var already_loaded: bool = false;
                     var li: i64 = 0;
                     while li < loaded_module_names.len() {
-                        if str_equal(loaded_module_names.get(li), import_path) {
+                        if loaded_module_names.get(li) == import_path {
                             already_loaded = true;
                             break;
                         }
@@ -778,13 +778,13 @@ pub fn build_program_no_std(source: str, source_path: OptStr) -> ResultProgram {
                                     var trans_loaded: bool = false;
                                     var tli: i64 = 0;
                                     while tli < loaded_module_names.len() {
-                                        if str_equal(loaded_module_names.get(tli), trans_path) {
+                                        if loaded_module_names.get(tli) == trans_path {
                                             trans_loaded = true;
                                             break;
                                         }
                                         tli = tli + 1;
                                     }
-                                    if !trans_loaded && !str_equal(trans_path, "core") {
+                                    if !trans_loaded && trans_path != "core" {
                                         imports_to_process.push(trans_path);
                                     }
                                     ti = ti + 1;
@@ -1039,7 +1039,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                             p_eprint_str("\n");
 
                             // Skip "core" -- auto-included
-                            if str_equal(import_path, "core") { continue; }
+                            if import_path == "core" { continue; }
 
                             // Skip already-loaded modules -- O(1) HashMap lookup
                             if HashMap_get(loaded_module_set, import_path) != 0 { continue; }
@@ -1068,11 +1068,11 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
 
                             if found {
                                 // OPTIMIZATION: use cached file read + cached lex + cached parse
-                                var pre_toks: Vec<Token> = cached_lex(&mut token_cache, &mut content_cache, found_path);
+                                var pre_toks: Vec<Token> = cached_lex(token_cache, content_cache, found_path);
 
                                 // Pre-scan: parse to extract imports and type names.
                                 // OPTIMIZATION: use cached_parse to avoid re-parsing deferred modules.
-                                var pre_result_opt: OptProgram = cached_parse(&mut parse_cache, &mut token_cache, &mut content_cache, found_path, struct_names, enum_names);
+                                var pre_result_opt: OptProgram = cached_parse(parse_cache, token_cache, content_cache, found_path, struct_names, enum_names);
 
                                 match pre_result_opt {
                                     OptProgram::Some(pre_prog) => {
@@ -1101,7 +1101,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                                         var di: i64 = 0;
                                         while di < pre_prog.imports.len() {
                                             var dep: str = pre_prog.imports.get(di).path;
-                                            if !str_equal(dep, "core") && HashMap_get(loaded_module_set, dep) == 0 {
+                                            if dep != "core" && HashMap_get(loaded_module_set, dep) == 0 {
                                                 unloaded_deps.push(dep);
                                             }
                                             di = di + 1;
@@ -1154,7 +1154,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                                         // Clear from deferred set -- successfully loaded
                                         var deferred_idx: i64 = 0;
                                         while deferred_idx < currently_deferred.len() {
-                                            if str_equal(currently_deferred.get(deferred_idx), import_path) {
+                                            if currently_deferred.get(deferred_idx) == import_path {
                                                 currently_deferred.remove(deferred_idx);
                                                 break;
                                             }
@@ -1257,6 +1257,9 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
 
                     // Phase 7.7: Process @derive annotations
                     process_derive(&mut program);
+
+                    // R1.2: structural `==` for enums (the lowerer calls `__eq_<Enum>`).
+                    synthesize_enum_eq(&mut program);
 
                     // Desugar layer/model declarations
                     desugar_layers_models(&mut program);
@@ -1635,7 +1638,7 @@ pub fn build_executable(source: str, source_path: str, target: str, do_opt: bool
             var l3: L3Module = lower_l2_to_l3(&l2, &module);
 
             // Dispatch to backend
-            if str_equal(target, "x86-64") || str_equal(target, "x64") {
+            if target == "x86-64" || target == "x64" {
                 // Generate x86-64 assembly
                 var asm: str = generate_asm(l3);
                 // Run peephole optimization
@@ -1687,12 +1690,12 @@ pub fn build_executable(source: str, source_path: str, target: str, do_opt: bool
                 }
                 return ResultBytes::Err(c_vec1(LinkerResult_err_msg(link_result)));
             }
-            if str_equal(target, "x86-64-windows") || str_equal(target, "x64-windows") || str_equal(target, "windows") {
+            if target == "x86-64-windows" || target == "x64-windows" || target == "windows" {
                 // Windows PE cross-compilation
                 var pe_bytes: Vec = generate_pe(module);
                 return ResultBytes::Ok(pe_bytes);
             }
-            if str_equal(target, "arm64") || str_equal(target, "aarch64") {
+            if target == "arm64" || target == "aarch64" {
                 // ARM64: PIR L3 -> codegen_arm64 -> arm64_enc -> runtime_arm64 -> linker
                 var asm_arm: str = generate_asm_arm64(l3);
                 // Assemble ARM64 assembly into machine code
@@ -1759,7 +1762,7 @@ pub fn build_executable(source: str, source_path: str, target: str, do_opt: bool
                 }
                 return ResultBytes::Err(c_vec1(LinkerResult_err_msg(arm_link_result)));
             }
-            if str_equal(target, "riscv") || str_equal(target, "riscv64") {
+            if target == "riscv" || target == "riscv64" {
                 // RISC-V: PIR L3 -> codegen_riscv -> riscv_enc -> runtime_riscv -> linker
                 var asm_rv: str = generate_asm_riscv(l3);
                 var rv_obj: Vec<i64> = Vec::new();
@@ -2070,6 +2073,84 @@ fn check_cfg(annotations: Vec<Annotation>, is_linux: bool, is_debug: bool) -> bo
 
 /// Process @derive annotations -- generate methods based on the derive list.
 /// Supported derives: Debug, Clone, Serialize, Default, Deserialize, PartialEq
+// R1.2: `==` / `!=` on enum values compare tag and payload. For every
+// non-generic enum, synthesize `__eq_<Enum>(__eq_a, __eq_b) -> bool` (a match
+// on both values; payload fields compared with `==`, so strings compare by
+// content and nested enums recursively), and the lowerer turns `==` on enum
+// operands into a call. Mirrors synthesize_enum_eq in src/compiler.rs.
+fn enum_eq_pattern(enum_name: str, variant: str, prefix: str, n: i64) -> Pattern {
+    var binds: Vec<Binding> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        binds.push(Binding_new(prefix + int_to_str(i), ""));
+        i = i + 1;
+    }
+    return Pattern::EnumVariant(enum_name, variant, binds);
+}
+
+pub fn synthesize_enum_eq(program: &mut Program) {
+    var generated: Vec<Func> = Vec::new();
+    var ei: i64 = 0;
+    while ei < program.enums.len() {
+        var e: EnumDef = program.enums.get(ei);
+        ei = ei + 1;
+        if e.type_params.len() > 0 { continue; }
+        var fname: str = "__eq_" + e.name;
+        var exists: bool = false;
+        var fi: i64 = 0;
+        while fi < program.funcs.len() {
+            if program.funcs.get(fi).name == fname { exists = true; }
+            fi = fi + 1;
+        }
+        if exists { continue; }
+
+        var arms: Vec<MatchArm> = Vec::new();
+        var vi: i64 = 0;
+        while vi < e.variants.len() {
+            var v: EnumVariant = e.variants.get(vi);
+            var n: i64 = 0;
+            match v.data {
+                OptParams::Some(ps) => { n = ps.len(); }
+                OptParams::None => {}
+            }
+            var same: Expr = Expr::BoolLit(true);
+            var i: i64 = 0;
+            while i < n {
+                var field_eq: Expr = Expr::Binary(BinOp::Eq, Box::new(Expr::Ident("__a" + int_to_str(i))), Box::new(Expr::Ident("__b" + int_to_str(i))));
+                if i == 0 {
+                    same = field_eq;
+                } else {
+                    same = Expr::Binary(BinOp::And, Box::new(same), Box::new(field_eq));
+                }
+                i = i + 1;
+            }
+            var same_body: Vec<Stmt> = Vec::new();
+            same_body.push(Stmt::Return(OptBoxExpr::Some(Box::new(same)), 0));
+            var differ_body: Vec<Stmt> = Vec::new();
+            differ_body.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::BoolLit(false))), 0));
+            var inner_arms: Vec<MatchArm> = Vec::new();
+            inner_arms.push(MatchArm_new(enum_eq_pattern(e.name, v.name, "__b", n), OptBoxExpr::None, same_body));
+            inner_arms.push(MatchArm_new(Pattern::Wildcard, OptBoxExpr::None, differ_body));
+            var outer_body: Vec<Stmt> = Vec::new();
+            outer_body.push(Stmt::Match(Expr::Ident("__eq_b"), inner_arms, 0));
+            arms.push(MatchArm_new(enum_eq_pattern(e.name, v.name, "__a", n), OptBoxExpr::None, outer_body));
+            vi = vi + 1;
+        }
+        var params: Vec<Param> = Vec::new();
+        params.push(Param_new("__eq_a", Type::Named(e.name), false));
+        params.push(Param_new("__eq_b", Type::Named(e.name), false));
+        var body: Vec<Stmt> = Vec::new();
+        body.push(Stmt::Match(Expr::Ident("__eq_a"), arms, 0));
+        body.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::BoolLit(false))), 0));
+        generated.push(Func_new_full(fname, params, Type::Bool, body, true));
+    }
+    var gi: i64 = 0;
+    while gi < generated.len() {
+        program.funcs.push(generated.get(gi));
+        gi = gi + 1;
+    }
+}
+
 pub fn process_derive(program: &mut Program) {
     var generated: Vec<Func> = Vec::new();
 
@@ -2727,16 +2808,6 @@ pub fn c_str_trim_quotes(s: str) -> str {
     return s;
 }
 
-/// Check if a Vec<str> contains a string.
-pub fn c_str_vec_contains(vec: Vec<str>, s: str) -> bool {
-    var i: i64 = 0;
-    while i < vec.len() {
-        if str_equal(vec.get(i), s) { return true; }
-        i = i + 1;
-    }
-    return false;
-}
-
 /// Fast contains check using pointer equality (==) instead of str_equal.
 /// Only safe to use when all strings in the vec AND the search string are
 /// interned (i.e., produced by Lexer_intern or from the same str_slice).
@@ -2796,7 +2867,7 @@ pub fn c_vec1(s: str) -> Vec<str> {
 
 /// Check if a file exists.
 pub fn c_file_exists(path: str) -> bool {
-    return p_file_exists(path);
+    return p_file_exists(path) != 0;
 }
 pub fn c_vec0_str() -> Vec<str> {
     return Vec::new();

@@ -2123,9 +2123,9 @@ impl CCodeGen {
                         if cast == "void*" || cast.starts_with("struct ") {
                             call_args.push(format!("(void*){}", arg));
                         } else if cast == "double" {
-                            call_args.push(format!("(double){}", arg));
+                            call_args.push(format!("(double)(intptr_t){}", arg));
                         } else if cast == "float" {
-                            call_args.push(format!("(float){}", arg));
+                            call_args.push(format!("(float)(intptr_t){}", arg));
                         } else if cast == "bool" {
                             call_args.push(format!("(bool){}", arg));
                         } else if cast.contains('[') {

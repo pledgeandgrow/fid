@@ -378,10 +378,29 @@ fn recover_to_sync_token(self: &mut Parser) {
     }
 
 }
+// R1.5: split a compound token starting with `>` so a generic list can close
+// on its first char: `>>` -> `>`, `>>=` -> `>=`, `>=` -> `=`. Returns false if
+// the current token does not start with `>`.
+fn split_gt(self: &mut Parser) -> bool {
+    var tok: Token = self.peek_token();
+    var rest: TokenKind = TokenKind::Eof;
+    if token_kind_eq(tok.kind, TokenKind::Shr) { rest = TokenKind::Gt; }
+    else if token_kind_eq(tok.kind, TokenKind::ShrEq) { rest = TokenKind::GtEq; }
+    else if token_kind_eq(tok.kind, TokenKind::GtEq) { rest = TokenKind::Eq; }
+    else { return false; }
+    self.tokens.set(self.pos, token_new(rest, tok.line, tok.col + 1));
+    return true;
+}
+
 fn expect(self: &mut Parser, kind: TokenKind, msg: str) -> ParseResultUnit {
     if self.check(kind) {
         self.advance();
         return ParseResultUnit::Ok;
+    }
+    if token_kind_eq(kind, TokenKind::Gt) {
+        if self.split_gt() {
+            return ParseResultUnit::Ok;
+        }
     }
     var tok: Token = self.peek_token();
     return ParseResultUnit::Err(
@@ -429,7 +448,7 @@ fn is_struct_name(self: &Parser, name: str) -> bool {
     // Check aliases (small list, linear scan is fine)
     var j: i64 = 0;
     while j < self.alias_to_struct.len() {
-        if str_equal(self.alias_to_struct.get(j), name) { return true; }
+        if self.alias_to_struct.get(j) == name { return true; }
         j = j + 1;
     }
     return false;
@@ -1159,7 +1178,7 @@ match alias_for {
     Type::Named(target) => {
         var i: i64 = 0;
         while i < self.struct_names.len() {
-            if str_equal(self.struct_names.get(i), target) {
+            if self.struct_names.get(i) == target {
                 self.alias_to_struct.push(name);
             }
             i = i + 1;
@@ -2697,6 +2716,8 @@ if self.check(TokenKind::LBrace) {
         ParseResultStmt::Err(e) => { return ParseResultStmt::Err(e); }
     }
 }
+// Desugar: guard cond => action  ->  if !cond { action }
+return ParseResultStmt::Ok(Stmt::If(Expr::Unary(UnaryOp::Not, Box::new(cond)), then_block, OptStmts::None, line));
 }
 
 fn parse_for(self: &mut Parser) -> ParseResultStmt {
@@ -2947,7 +2968,7 @@ match self.expect(TokenKind::LBrace, "{") {
     ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
     ParseResultUnit::Ok => {}
 }
-var branches: Vec<Vec<Stmt> > = Vec::new();
+var branches: Vec<Vec<Stmt>> = Vec::new();
 // Parse branches separated by '|'
 // Optional leading '|' before the first branch
 self.match_tok(TokenKind::Pipe);
@@ -3236,6 +3257,7 @@ if self.match_tok(TokenKind::LBrace) {
         ParseResultUnit::Ok => {}
     }
 }
+return ParseResultStmt::Ok(Stmt::Use(path, items, line));
 }
 
 fn parse_handle_stmt(self: &mut Parser) -> ParseResultStmt {
@@ -4078,6 +4100,48 @@ if self.check(TokenKind::LBrace) {
     self.match_tok(TokenKind::Semicolon);
     return ParseResultExpr::Ok(Expr::ComptimeBlock(stmts));
 }
+// comptime type_name(T) / is_struct(T) / ... -- compile-time reflection
+match self.peek() {
+    TokenKind::Ident(name) => {
+        var has_op: bool = true;
+        var op: ReflectOp = ReflectOp::TypeName;
+        if name == "type_name" { op = ReflectOp::TypeName; }
+        else if name == "is_struct" { op = ReflectOp::IsStruct; }
+        else if name == "is_enum" { op = ReflectOp::IsEnum; }
+        else if name == "field_count" { op = ReflectOp::FieldCount; }
+        else if name == "field_names" { op = ReflectOp::FieldNames; }
+        else if name == "field_types" { op = ReflectOp::FieldTypes; }
+        else if name == "enum_variants" { op = ReflectOp::EnumVariants; }
+        else { has_op = false; }
+        if has_op {
+            self.advance();
+            match self.expect(TokenKind::LParen, "(") {
+                ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+                ParseResultUnit::Ok => {}
+            }
+            var ty: Type = Type::Infer;
+            match self.parse_type() {
+                ParseResultType::Ok(t) => { ty = t; }
+                ParseResultType::Err(e) => { return ParseResultExpr::Err(e); }
+            }
+            match self.expect(TokenKind::RParen, ")") {
+                ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+                ParseResultUnit::Ok => {}
+            }
+            self.match_tok(TokenKind::Semicolon);
+            return ParseResultExpr::Ok(Expr::ComptimeReflect(op, ty));
+        }
+    }
+    _ => {}
+}
+// comptime <expr>
+var inner: Expr = Expr::IntLit(0);
+match self.parse_unary() {
+    ParseResultExpr::Ok(e) => { inner = e; }
+    ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+}
+self.match_tok(TokenKind::Semicolon);
+return ParseResultExpr::Ok(Expr::Comptime(Box::new(inner)));
 }
 
 fn parse_postfix(self: &mut Parser) -> ParseResultExpr {
@@ -4214,6 +4278,7 @@ match self.expect(TokenKind::RBrace, "}") {
     ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
     ParseResultUnit::Ok => {}
 }
+return ParseResultExpr::Ok(Expr::Match(Box::new(expr), arms));
 }
 
 // Helper: parse call arguments and build a Call expr.
@@ -4550,7 +4615,7 @@ if token_kind_eq(k, TokenKind::LParen) {
 if token_kind_eq(k, TokenKind::If) {
     match self.parse_if_expr() {
         ParseResultIfExpr::Ok(ie) => {
-            return ParseResultExpr::Ok(Expr::If(ie.cond, ie.then_block, ie.else_block));
+            return ParseResultExpr::Ok(Expr::If(Box::new(ie.cond), ie.then_block, ie.else_block));
         }
         ParseResultIfExpr::Err(e) => { return ParseResultExpr::Err(e); }
     }
@@ -4641,6 +4706,7 @@ if str_len(template) == 0 {
 var operands: Vec<AsmOperand> = Vec::new();
 while self.match_tok(TokenKind::Comma) {
     var direction: AsmDir = AsmDir::In;
+    var is_clobber: bool = false;
     var dtok: Token = self.peek_token();
     var got_dir: bool = true;
     if token_kind_eq(dtok.kind, TokenKind::In) {
@@ -4655,6 +4721,7 @@ while self.match_tok(TokenKind::Comma) {
                 } else if s == "clobber" {
                     self.advance();
                     direction = AsmDir::Clobber;
+                    is_clobber = true;
                 } else {
                     got_dir = false;
                 }
@@ -4685,7 +4752,7 @@ while self.match_tok(TokenKind::Comma) {
     }
     // Clobber operands don't have an expression — use IntLit(0) as placeholder
     var expr: Expr = Expr::IntLit(0);
-    if direction != AsmDir::Clobber {
+    if !is_clobber {
         match self.parse_expr() {
             ParseResultExpr::Ok(e) => { expr = e; }
             ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
@@ -5195,47 +5262,6 @@ pub fn Parser_with_names(tokens: Vec<Token>, struct_names: Vec<str>, enum_names:
 }
 
 // Helper: extract Expr from Box<Expr> (Fides has no * deref for Box)
-pub fn box_expr_deref(b: Box<Expr>) -> Expr {
-    match b {
-        Expr::IntLit(v) => { return Expr::IntLit(v); }
-        Expr::FloatLit(v) => { return Expr::FloatLit(v); }
-        Expr::StringLit(v) => { return Expr::StringLit(v); }
-        Expr::BoolLit(v) => { return Expr::BoolLit(v); }
-        Expr::CharLit(v) => { return Expr::CharLit(v); }
-        Expr::Ident(v) => { return Expr::Ident(v); }
-        Expr::Binary(op, l, r) => { return Expr::Binary(op, l, r); }
-        Expr::Unary(op, e) => { return Expr::Unary(op, e); }
-        Expr::Assign(op, l, r) => { return Expr::Assign(op, l, r); }
-        Expr::Call(f, args) => { return Expr::Call(f, args); }
-        Expr::MethodCall(obj, name, args) => { return Expr::MethodCall(obj, name, args); }
-        Expr::FieldAccess(obj, field) => { return Expr::FieldAccess(obj, field); }
-        Expr::Index(arr, idx) => { return Expr::Index(arr, idx); }
-        Expr::TupleLit(args) => { return Expr::TupleLit(args); }
-        Expr::ArrayLit(args) => { return Expr::ArrayLit(args); }
-        Expr::StructLit(name, fields, spread) => { return Expr::StructLit(name, fields, spread); }
-        Expr::EnumLit(name, variant, payload) => { return Expr::EnumLit(name, variant, payload); }
-        Expr::Lambda(params, ret, body) => { return Expr::Lambda(params, ret, body); }
-        Expr::If(cond, then, els) => { return Expr::If(cond, then, els); }
-        Expr::Match(expr, arms) => { return Expr::Match(expr, arms); }
-        Expr::Block(stmts) => { return Expr::Block(stmts); }
-        Expr::ComptimeBlock(stmts) => { return Expr::ComptimeBlock(stmts); }
-        Expr::Asm(template, operands) => { return Expr::Asm(template, operands); }
-        Expr::FString(parts) => { return Expr::FString(parts); }
-        Expr::Deref(e) => { return Expr::Deref(e); }
-        Expr::Try(e) => { return Expr::Try(e); }
-        Expr::Cast(e, ty) => { return Expr::Cast(e, ty); }
-        Expr::SizeOf(ty) => { return Expr::SizeOf(ty); }
-        Expr::AlignOf(ty) => { return Expr::AlignOf(ty); }
-        Expr::OffsetOf(ty, field) => { return Expr::OffsetOf(ty, field); }
-        Expr::Range(l, r) => { return Expr::Range(l, r); }
-        Expr::PipeForward(l, r) => { return Expr::PipeForward(l, r); }
-        Expr::Coalesce(l, r) => { return Expr::Coalesce(l, r); }
-        Expr::Path(p) => { return Expr::Path(p); }
-        Expr::UnitLit => { return Expr::UnitLit; }
-    }
-    return Expr::UnitLit;
-}
-
 pub fn vec_str_join(v: Vec<str>, sep: str) -> str {
 var result: str = "";
 var i: i64 = 0;
@@ -5318,7 +5344,7 @@ pub fn BinOpInfo_new(op: BinOp, prec: i64, found: bool) -> BinOpInfo {
 return BinOpInfo { op: op, prec: prec, found: found };
 }
 
-pub fn reduce_one_op(vals: &mut Vec<Expr>, ops: &mut Vec<OpEntry>) -> bool {
+pub fn reduce_one_op(vals: Vec<Expr>, ops: Vec<OpEntry>) -> bool {
 if ops.len() == 0 { return false; }
 if vals.len() < 2 { return false; }
 var op_entry: OpEntry = ops.pop();

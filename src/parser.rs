@@ -353,6 +353,13 @@ impl Parser {
     fn expect(&mut self, kind: TokenKind, msg: &str) -> Result<Token, String> {
         if self.check(&kind) {
             Ok(self.advance())
+        } else if matches!(kind, TokenKind::Gt) && self.split_gt() {
+            // R1.5: `>>`, `>>=`, `>=` closing a generic list — one `>` consumed,
+            // the remainder stays as the current token.
+            let mut tok = self.peek_token().clone();
+            tok.kind = TokenKind::Gt;
+            tok.col = tok.col.saturating_sub(1);
+            Ok(tok)
         } else {
             let tok = self.peek_token();
             Err(format!(
@@ -363,6 +370,22 @@ impl Parser {
                 tok.kind
             ))
         }
+    }
+
+    /// Split a compound token starting with `>` so a generic list can close on
+    /// its first char: `>>` → `>`, `>>=` → `>=`, `>=` → `=`. Returns false if
+    /// the current token does not start with `>`.
+    fn split_gt(&mut self) -> bool {
+        let rest = match self.peek() {
+            TokenKind::Shr => TokenKind::Gt,
+            TokenKind::ShrEq => TokenKind::GtEq,
+            TokenKind::GtEq => TokenKind::Eq,
+            _ => return false,
+        };
+        let tok = &mut self.tokens[self.pos];
+        tok.kind = rest;
+        tok.col += 1;
+        true
     }
 
     fn expect_ident(&mut self) -> Result<String, String> {
