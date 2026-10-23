@@ -463,6 +463,20 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
         // that the first parse already caught).
     }
 
+    // Two non-stdlib modules defining the same top-level item used to collapse
+    // silently into one (merge_programs keeps the later one), miscompiling every
+    // caller of the shadowed definition. Reject it instead.
+    {
+        let user_module = user.module.clone().unwrap_or_else(|| "main".to_string());
+        let mut all_modules: Vec<(&String, &Program)> =
+            imported_modules.iter().map(|(n, p)| (n, p)).collect();
+        all_modules.push((&user_module, &user));
+        let conflicts = find_module_conflicts(&all_modules);
+        if !conflicts.is_empty() {
+            return Err(conflicts);
+        }
+    }
+
     // Merge: start with stdlib, then add imported modules, then user (user wins)
     let mut program = stdlib.clone();
 
@@ -1037,6 +1051,56 @@ fn fill_default_trait_methods(program: &mut Program) {
 
         }
     }
+}
+
+/// Report top-level items defined in more than one (non-stdlib) module.
+/// Functions and consts conflict on name alone; structs and enums conflict only
+/// when their definitions differ (identical re-declarations are tolerated).
+fn find_module_conflicts(modules: &[(&String, &Program)]) -> Vec<String> {
+    use std::collections::HashMap;
+    let mut errors = Vec::new();
+    let mut funcs: HashMap<&str, &str> = HashMap::new();
+    let mut consts: HashMap<&str, &str> = HashMap::new();
+    let mut types: HashMap<&str, (&str, String)> = HashMap::new();
+    for (module, prog) in modules {
+        for f in &prog.funcs {
+            if let Some(prev) = funcs.insert(&f.name, module) {
+                if prev != module.as_str() {
+                    errors.push(format!(
+                        "Duplicate definition: function '{}' is defined in both module '{}' and module '{}' (line {})",
+                        f.name, prev, module, f.line
+                    ));
+                }
+            }
+        }
+        for c in &prog.consts {
+            if let Some(prev) = consts.insert(&c.name, module) {
+                if prev != module.as_str() {
+                    errors.push(format!(
+                        "Duplicate definition: const '{}' is defined in both module '{}' and module '{}'",
+                        c.name, prev, module
+                    ));
+                }
+            }
+        }
+        let shapes = prog.structs.iter()
+            .map(|s| (s.name.as_str(), format!("struct{:?}{:?}", s.type_params, s.fields)))
+            .chain(prog.enums.iter()
+                .map(|e| (e.name.as_str(), format!("enum{:?}{:?}", e.type_params, e.variants))));
+        for (name, shape) in shapes {
+            match types.get(name) {
+                Some((prev, prev_shape)) if *prev != module.as_str() && *prev_shape != shape => {
+                    errors.push(format!(
+                        "Duplicate definition: type '{}' is defined differently in module '{}' and module '{}'",
+                        name, prev, module
+                    ));
+                }
+                Some(_) => {}
+                None => { types.insert(name, (module, shape)); }
+            }
+        }
+    }
+    errors
 }
 
 fn merge_programs(stdlib: Program, user: Program) -> Program {

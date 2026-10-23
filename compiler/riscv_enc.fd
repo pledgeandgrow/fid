@@ -27,8 +27,8 @@
 // 2. Vec<u8> -> Vec<i64> (bytes stored as i64)
 // 3. HashMap<String, u64> -> Vec-based label map
 // 4. Result<T, String> -> custom result enums
-// 5. inst.to_le_bytes() -> push_u32_le() helper
-// 6. u32::from_le_bytes() -> read_u32_le() helper
+// 5. inst.to_le_bytes() -> rv_push_u32_le() helper
+// 6. u32::from_le_bytes() -> rv_read_u32_le() helper
 // 7. s[1..].parse() -> str_parse_int(str_slice(...))
 // 8. strip_prefix('#') -> manual check + slice
 // 9. struct methods -> free functions with self param
@@ -112,13 +112,13 @@ pub enum ResultRiscVEncodedInst {
 
 pub fn RiscVEncodedInst_bytes(inst: i64) -> RiscVEncodedInst {
     var bytes: Vec<i64> = Vec::new();
-    push_u32_le(bytes, inst);
+    rv_push_u32_le(bytes, inst);
     return RiscVEncodedInst { bytes: bytes, relocations: Vec::new() };
 }
 
 pub fn RiscVEncodedInst_with_reloc(inst: i64, label: str, reloc_type: i64) -> RiscVEncodedInst {
     var bytes: Vec<i64> = Vec::new();
-    push_u32_le(bytes, inst);
+    rv_push_u32_le(bytes, inst);
     var relocs: Vec<RiscVInstReloc> = Vec::new();
     relocs.push(RiscVInstReloc_new(label, reloc_type));
     return RiscVEncodedInst { bytes: bytes, relocations: relocs };
@@ -133,7 +133,7 @@ pub fn RiscVEncodedInst_multi(bytes: Vec<i64>) -> RiscVEncodedInst {
 // ===========================================================================
 
 /// Split a string into lines by newline (LF).
-pub fn str_lines(s: str) -> Vec<str> {
+pub fn rv_str_lines(s: str) -> Vec<str> {
     var result: Vec<str> = Vec::new();
     var i: i64 = 0;
     var start: i64 = 0;
@@ -152,7 +152,7 @@ pub fn str_lines(s: str) -> Vec<str> {
 }
 
 /// Push a 32-bit value in little-endian byte order.
-pub fn push_u32_le(text: &mut Vec<i64>, inst: i64) {
+pub fn rv_push_u32_le(text: &mut Vec<i64>, inst: i64) {
     text.push(inst & 0xFF);
     text.push((inst >> 8) & 0xFF);
     text.push((inst >> 16) & 0xFF);
@@ -160,12 +160,12 @@ pub fn push_u32_le(text: &mut Vec<i64>, inst: i64) {
 }
 
 /// Read a 32-bit little-endian value from a byte vector.
-pub fn read_u32_le(text: Vec<i64>, idx: i64) -> i64 {
+pub fn rv_read_u32_le(text: Vec<i64>, idx: i64) -> i64 {
     return (text.get(idx) & 0xFF) | ((text.get(idx + 1) & 0xFF) << 8) | ((text.get(idx + 2) & 0xFF) << 16) | ((text.get(idx + 3) & 0xFF) << 24);
 }
 
 /// Patch a 32-bit little-endian value in a byte vector.
-pub fn patch_u32_le(text: &mut Vec<i64>, idx: i64, inst: i64) {
+pub fn rv_patch_u32_le(text: &mut Vec<i64>, idx: i64, inst: i64) {
     text.set(idx, inst & 0xFF);
     text.set(idx + 1, (inst >> 8) & 0xFF);
     text.set(idx + 2, (inst >> 16) & 0xFF);
@@ -195,7 +195,7 @@ pub fn assemble_riscv(asm: str) -> ResultRiscVAssemble {
 // RISC-V Register encoding
 // ===========================================================================
 
-pub fn parse_reg(s: str) -> ResultI64Str {
+pub fn rv_parse_reg(s: str) -> ResultI64Str {
     var t: str = str_trim(s);
     // ABI names
     if str_equal(t, "zero") { return ResultI64Str::Ok(0); }
@@ -253,7 +253,7 @@ pub struct LabelOffsetEntry {
     pub offset: i64,
 }
 
-pub fn LabelOffsetEntry_new(label: str, offset: i64) -> LabelOffsetEntry {
+pub fn rv_LabelOffsetEntry_new(label: str, offset: i64) -> LabelOffsetEntry {
     return LabelOffsetEntry { label: label, offset: offset };
 }
 
@@ -283,7 +283,7 @@ pub fn RiscvAssembler_new() -> RiscvAssembler {
 
 // --- Label offset map helpers ---
 
-pub fn label_offset_lookup(map: Vec<LabelOffsetEntry>, label: str) -> i64 {
+pub fn rv_label_offset_lookup(map: Vec<LabelOffsetEntry>, label: str) -> i64 {
     var i: i64 = 0;
     while i < map.len() {
         if str_equal(map.get(i).label, label) { return map.get(i).offset; }
@@ -292,14 +292,14 @@ pub fn label_offset_lookup(map: Vec<LabelOffsetEntry>, label: str) -> i64 {
     return -1;
 }
 
-pub fn label_offset_insert(map: &mut Vec<LabelOffsetEntry>, label: str, offset: i64) {
-    map.push(LabelOffsetEntry_new(label, offset));
+pub fn rv_label_offset_insert(map: &mut Vec<LabelOffsetEntry>, label: str, offset: i64) {
+    map.push(rv_LabelOffsetEntry_new(label, offset));
 }
 
 // --- Assemble ---
 
 pub fn RiscvAssembler_assemble(self: &mut RiscvAssembler, asm: str) -> ResultUnit {
-    var lines: Vec<str> = str_lines(asm);
+    var lines: Vec<str> = rv_str_lines(asm);
     var li: i64 = 0;
     while li < lines.len() {
         var line: str = str_trim(lines.get(li));
@@ -354,7 +354,7 @@ pub fn RiscvAssembler_define_label(self: &mut RiscvAssembler, label: str) {
     match self.current_section {
         RiscVSection::Text => {
             var offset: i64 = self.text.len();
-            label_offset_insert(self.label_offsets, label, offset);
+            rv_label_offset_insert(self.label_offsets, label, offset);
             self.symbols.push(RiscVSymbol_new(label, offset));
         }
         RiscVSection::Rodata => {
@@ -399,8 +399,8 @@ pub fn RiscvAssembler_handle_directive(self: &mut RiscvAssembler, line: str) -> 
     } else if str_equal(directive, ".quad") {
         if parts.len() > 1 {
             var qv: i64 = str_parse_int(str_trim(parts.get(1)));
-            push_u32_le(self.rodata, qv & 0xFFFFFFFF);
-            push_u32_le(self.rodata, (qv >> 32) & 0xFFFFFFFF);
+            rv_push_u32_le(self.rodata, qv & 0xFFFFFFFF);
+            rv_push_u32_le(self.rodata, (qv >> 32) & 0xFFFFFFFF);
         }
     } else if str_equal(directive, ".byte") {
         if parts.len() > 1 {
@@ -416,7 +416,7 @@ pub fn RiscvAssembler_handle_directive(self: &mut RiscvAssembler, line: str) -> 
             match self.current_section {
                 RiscVSection::Text => {
                     while self.text.len() % align != 0 {
-                        push_u32_le(self.text, 0x13); // NOP
+                        rv_push_u32_le(self.text, 0x13); // NOP
                     }
                 }
                 RiscVSection::Rodata => {
@@ -458,12 +458,12 @@ pub fn RiscvAssembler_resolve_branches(self: &mut RiscvAssembler) -> ResultUnit 
     var i: i64 = 0;
     while i < self.pending_branches.len() {
         var pb: RiscVReloc = self.pending_branches.get(i);
-        var target_offset: i64 = label_offset_lookup(self.label_offsets, pb.symbol);
+        var target_offset: i64 = rv_label_offset_lookup(self.label_offsets, pb.symbol);
         if target_offset >= 0 {
             var delta: i64 = target_offset - pb.offset;
             var idx: i64 = pb.offset;
             if idx + 4 <= self.text.len() {
-                var instr: i64 = read_u32_le(self.text, idx);
+                var instr: i64 = rv_read_u32_le(self.text, idx);
                 if pb.rtype == 20 {
                     // JAL: 20-bit immediate, offset = delta
                     var imm: i64 = delta;
@@ -472,7 +472,7 @@ pub fn RiscvAssembler_resolve_branches(self: &mut RiscvAssembler) -> ResultUnit 
                     var imm11: i64 = (imm >> 11) & 1;
                     var imm19_12: i64 = (imm >> 12) & 0xFF;
                     var patched: i64 = (instr & 0x00000FFF) | (imm20 << 31) | (imm10_1 << 21) | (imm11 << 20) | (imm19_12 << 12);
-                    patch_u32_le(self.text, idx, patched);
+                    rv_patch_u32_le(self.text, idx, patched);
                 } else if pb.rtype == 21 {
                     // Branch: 13-bit immediate (bits [12:1])
                     var imm: i64 = delta;
@@ -481,7 +481,7 @@ pub fn RiscvAssembler_resolve_branches(self: &mut RiscvAssembler) -> ResultUnit 
                     var imm4_1: i64 = (imm >> 1) & 0xF;
                     var imm11: i64 = (imm >> 11) & 1;
                     var patched: i64 = (instr & 0x01FFF07F) | (imm12 << 31) | (imm10_5 << 25) | (imm4_1 << 8) | (imm11 << 7);
-                    patch_u32_le(self.text, idx, patched);
+                    rv_patch_u32_le(self.text, idx, patched);
                 }
             }
         } else {
@@ -582,11 +582,11 @@ pub fn RiscvAssembler_encode_instruction(self: &RiscvAssembler, line: str) -> Re
 
 pub fn RiscvAssembler_enc_r_type(self: &RiscvAssembler, ops: Vec<str>, opcode: i64, funct7: i64, funct3: i64) -> ResultRiscVEncodedInst {
     if ops.len() < 3 { return ResultRiscVEncodedInst::Err("R-type needs 3 operands, got " + int_to_str(ops.len())); }
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rd) => {
-            match parse_reg(ops.get(1)) {
+            match rv_parse_reg(ops.get(1)) {
                 ResultI64Str::Ok(rs1) => {
-                    match parse_reg(ops.get(2)) {
+                    match rv_parse_reg(ops.get(2)) {
                         ResultI64Str::Ok(rs2) => {
                             var inst: i64 = (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode;
                             return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
@@ -606,9 +606,9 @@ pub fn RiscvAssembler_enc_r_type(self: &RiscvAssembler, ops: Vec<str>, opcode: i
 
 pub fn RiscvAssembler_enc_i_type(self: &RiscvAssembler, ops: Vec<str>, opcode: i64, funct3: i64) -> ResultRiscVEncodedInst {
     if ops.len() < 3 { return ResultRiscVEncodedInst::Err("I-type needs 3 operands, got " + int_to_str(ops.len())); }
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rd) => {
-            match parse_reg(ops.get(1)) {
+            match rv_parse_reg(ops.get(1)) {
                 ResultI64Str::Ok(rs1) => {
                     match riscv_parse_imm(ops.get(2)) {
                         ResultI64Str::Ok(imm) => {
@@ -631,9 +631,9 @@ pub fn RiscvAssembler_enc_i_type(self: &RiscvAssembler, ops: Vec<str>, opcode: i
 
 pub fn RiscvAssembler_enc_shift_imm(self: &RiscvAssembler, ops: Vec<str>, opcode: i64, funct3: i64, is_arith: bool) -> ResultRiscVEncodedInst {
     if ops.len() < 3 { return ResultRiscVEncodedInst::Err("Shift needs 3 operands, got " + int_to_str(ops.len())); }
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rd) => {
-            match parse_reg(ops.get(1)) {
+            match rv_parse_reg(ops.get(1)) {
                 ResultI64Str::Ok(rs1) => {
                     match riscv_parse_imm(ops.get(2)) {
                         ResultI64Str::Ok(imm) => {
@@ -658,13 +658,13 @@ pub fn RiscvAssembler_enc_shift_imm(self: &RiscvAssembler, ops: Vec<str>, opcode
 
 pub fn RiscvAssembler_enc_load(self: &RiscvAssembler, ops: Vec<str>, opcode: i64, funct3: i64) -> ResultRiscVEncodedInst {
     if ops.len() < 2 { return ResultRiscVEncodedInst::Err("Load needs 2 operands"); }
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rd) => {
             var mem: RiscVMemOperand = riscv_parse_mem_operand(ops.get(1));
             match mem {
                 RiscVMemOperand::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
                 RiscVMemOperand::Ok(imm, rs1_str) => {
-                    match parse_reg(rs1_str) {
+                    match rv_parse_reg(rs1_str) {
                         ResultI64Str::Ok(rs1) => {
                             var imm12: i64 = imm & 0xFFF;
                             var inst: i64 = (imm12 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode;
@@ -684,13 +684,13 @@ pub fn RiscvAssembler_enc_load(self: &RiscvAssembler, ops: Vec<str>, opcode: i64
 
 pub fn RiscvAssembler_enc_store(self: &RiscvAssembler, ops: Vec<str>, opcode: i64, funct3: i64) -> ResultRiscVEncodedInst {
     if ops.len() < 2 { return ResultRiscVEncodedInst::Err("Store needs 2 operands"); }
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rs2) => {
             var mem: RiscVMemOperand = riscv_parse_mem_operand(ops.get(1));
             match mem {
                 RiscVMemOperand::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
                 RiscVMemOperand::Ok(imm, rs1_str) => {
-                    match parse_reg(rs1_str) {
+                    match rv_parse_reg(rs1_str) {
                         ResultI64Str::Ok(rs1) => {
                             var imm11_5: i64 = (imm >> 5) & 0x7F;
                             var imm4_0: i64 = imm & 0x1F;
@@ -711,9 +711,9 @@ pub fn RiscvAssembler_enc_store(self: &RiscvAssembler, ops: Vec<str>, opcode: i6
 
 pub fn RiscvAssembler_enc_branch(self: &RiscvAssembler, ops: Vec<str>, opcode: i64, funct3: i64) -> ResultRiscVEncodedInst {
     if ops.len() < 3 { return ResultRiscVEncodedInst::Err("Branch needs 3 operands"); }
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rs1) => {
-            match parse_reg(ops.get(1)) {
+            match rv_parse_reg(ops.get(1)) {
                 ResultI64Str::Ok(rs2) => {
                     var label: str = ops.get(2);
                     var inst: i64 = (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | opcode;
@@ -731,7 +731,7 @@ pub fn RiscvAssembler_enc_branch(self: &RiscvAssembler, ops: Vec<str>, opcode: i
 
 pub fn RiscvAssembler_enc_branch_zero(self: &RiscvAssembler, ops: Vec<str>, opcode: i64, funct3: i64) -> ResultRiscVEncodedInst {
     if ops.len() < 2 { return ResultRiscVEncodedInst::Err("Branch-zero needs 2 operands"); }
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rs1) => {
             var label: str = ops.get(1);
             var inst: i64 = (rs1 << 15) | (funct3 << 12) | opcode;
@@ -746,7 +746,7 @@ pub fn RiscvAssembler_enc_branch_zero(self: &RiscvAssembler, ops: Vec<str>, opco
 
 pub fn RiscvAssembler_enc_branch_zero_rs(self: &RiscvAssembler, ops: Vec<str>, opcode: i64, funct3: i64) -> ResultRiscVEncodedInst {
     if ops.len() < 2 { return ResultRiscVEncodedInst::Err("bgez needs 2 operands"); }
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rs) => {
             var label: str = ops.get(1);
             // bge x0, rs: rs1=0, rs2=rs
@@ -762,7 +762,7 @@ pub fn RiscvAssembler_enc_branch_zero_rs(self: &RiscvAssembler, ops: Vec<str>, o
 
 pub fn RiscvAssembler_enc_branch_zero_rs2(self: &RiscvAssembler, ops: Vec<str>, opcode: i64, funct3: i64) -> ResultRiscVEncodedInst {
     if ops.len() < 2 { return ResultRiscVEncodedInst::Err("bltz needs 2 operands"); }
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rs) => {
             var label: str = ops.get(1);
             // blt rs, x0: rs1=rs, rs2=0
@@ -794,7 +794,7 @@ pub fn RiscvAssembler_enc_jal(self: &RiscvAssembler, ops: Vec<str>) -> ResultRis
         return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_with_reloc(inst, label, 20));
     }
     // JAL rd, label
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rd) => {
             var label: str = ops.get(1);
             var inst: i64 = 0x6F | (rd << 7);
@@ -811,7 +811,7 @@ pub fn RiscvAssembler_enc_jalr(self: &RiscvAssembler, ops: Vec<str>) -> ResultRi
     if ops.len() == 0 { return ResultRiscVEncodedInst::Err("JALR needs 1 operand"); }
     if ops.len() == 1 {
         // JALR rs (pseudo: JALR x0, 0(rs))
-        match parse_reg(ops.get(0)) {
+        match rv_parse_reg(ops.get(0)) {
             ResultI64Str::Ok(rs1) => {
                 var inst: i64 = 0x67 | (rs1 << 15); // JALR x0, 0(rs)
                 return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
@@ -821,14 +821,14 @@ pub fn RiscvAssembler_enc_jalr(self: &RiscvAssembler, ops: Vec<str>) -> ResultRi
         return ResultRiscVEncodedInst::Err("JALR parse error");
     }
     // JALR rd, rs1 or JALR rd, imm(rs1)
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rd) => {
             if str_contains(ops.get(1), "(") {
                 var mem: RiscVMemOperand = riscv_parse_mem_operand(ops.get(1));
                 match mem {
                     RiscVMemOperand::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
                     RiscVMemOperand::Ok(imm, rs1_str) => {
-                        match parse_reg(rs1_str) {
+                        match rv_parse_reg(rs1_str) {
                             ResultI64Str::Ok(rs1) => {
                                 var inst: i64 = ((imm & 0xFFF) << 20) | (rs1 << 15) | (rd << 7) | 0x67;
                                 return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
@@ -838,7 +838,7 @@ pub fn RiscvAssembler_enc_jalr(self: &RiscvAssembler, ops: Vec<str>) -> ResultRi
                     }
                 }
             }
-            match parse_reg(ops.get(1)) {
+            match rv_parse_reg(ops.get(1)) {
                 ResultI64Str::Ok(rs1) => {
                     var inst: i64 = (rs1 << 15) | (rd << 7) | 0x67;
                     return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
@@ -864,7 +864,7 @@ pub fn RiscvAssembler_enc_call(self: &RiscvAssembler, ops: Vec<str>) -> ResultRi
 
 pub fn RiscvAssembler_enc_li(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
     if ops.len() < 2 { return ResultRiscVEncodedInst::Err("LI needs 2 operands"); }
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rd) => {
             match riscv_parse_imm_i64(ops.get(1)) {
                 ResultI64Str::Ok(imm) => {
@@ -879,8 +879,8 @@ pub fn RiscvAssembler_enc_li(self: &RiscvAssembler, ops: Vec<str>) -> ResultRisc
                     var lui: i64 = (hi << 12) | (rd << 7) | 0x37;
                     var addi: i64 = (lo << 20) | (rd << 15) | (rd << 7) | 0x13;
                     var bytes: Vec<i64> = Vec::new();
-                    push_u32_le(bytes, lui);
-                    push_u32_le(bytes, addi);
+                    rv_push_u32_le(bytes, lui);
+                    rv_push_u32_le(bytes, addi);
                     return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_multi(bytes));
                 }
                 ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }
@@ -895,7 +895,7 @@ pub fn RiscvAssembler_enc_li(self: &RiscvAssembler, ops: Vec<str>) -> ResultRisc
 
 pub fn RiscvAssembler_enc_lui(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
     if ops.len() < 2 { return ResultRiscVEncodedInst::Err("LUI needs 2 operands"); }
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rd) => {
             match riscv_parse_imm(ops.get(1)) {
                 ResultI64Str::Ok(imm) => {
@@ -915,9 +915,9 @@ pub fn RiscvAssembler_enc_lui(self: &RiscvAssembler, ops: Vec<str>) -> ResultRis
 
 pub fn RiscvAssembler_enc_mv(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
     if ops.len() < 2 { return ResultRiscVEncodedInst::Err("MV needs 2 operands"); }
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rd) => {
-            match parse_reg(ops.get(1)) {
+            match rv_parse_reg(ops.get(1)) {
                 ResultI64Str::Ok(rs1) => {
                     var inst: i64 = (rs1 << 15) | (rd << 7) | 0x13;
                     return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_bytes(inst));
@@ -934,9 +934,9 @@ pub fn RiscvAssembler_enc_mv(self: &RiscvAssembler, ops: Vec<str>) -> ResultRisc
 
 pub fn RiscvAssembler_enc_neg(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
     if ops.len() < 2 { return ResultRiscVEncodedInst::Err("NEG needs 2 operands"); }
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rd) => {
-            match parse_reg(ops.get(1)) {
+            match rv_parse_reg(ops.get(1)) {
                 ResultI64Str::Ok(rs) => {
                     // SUB rd, x0, rs: funct7=0x20, rs2=rs, rs1=x0, funct3=0, rd, opcode=0x33
                     var inst: i64 = (0x20 << 25) | (rs << 20) | (rd << 7) | 0x33;
@@ -954,9 +954,9 @@ pub fn RiscvAssembler_enc_neg(self: &RiscvAssembler, ops: Vec<str>) -> ResultRis
 
 pub fn RiscvAssembler_enc_not(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
     if ops.len() < 2 { return ResultRiscVEncodedInst::Err("NOT needs 2 operands"); }
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rd) => {
-            match parse_reg(ops.get(1)) {
+            match rv_parse_reg(ops.get(1)) {
                 ResultI64Str::Ok(rs) => {
                     // XORI rd, rs, -1: imm=0xFFF, funct3=4, opcode=0x13
                     var inst: i64 = (0xFFF << 20) | (rs << 15) | (4 << 12) | (rd << 7) | 0x13;
@@ -974,9 +974,9 @@ pub fn RiscvAssembler_enc_not(self: &RiscvAssembler, ops: Vec<str>) -> ResultRis
 
 pub fn RiscvAssembler_enc_seqz(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
     if ops.len() < 2 { return ResultRiscVEncodedInst::Err("SEQZ needs 2 operands"); }
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rd) => {
-            match parse_reg(ops.get(1)) {
+            match rv_parse_reg(ops.get(1)) {
                 ResultI64Str::Ok(rs) => {
                     // SLTIU rd, rs, 1: imm=1, funct3=3, opcode=0x13
                     var inst: i64 = (1 << 20) | (rs << 15) | (3 << 12) | (rd << 7) | 0x13;
@@ -994,9 +994,9 @@ pub fn RiscvAssembler_enc_seqz(self: &RiscvAssembler, ops: Vec<str>) -> ResultRi
 
 pub fn RiscvAssembler_enc_snez(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
     if ops.len() < 2 { return ResultRiscVEncodedInst::Err("SNEZ needs 2 operands"); }
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rd) => {
-            match parse_reg(ops.get(1)) {
+            match rv_parse_reg(ops.get(1)) {
                 ResultI64Str::Ok(rs) => {
                     // SLTU rd, x0, rs: funct3=3, opcode=0x33
                     var inst: i64 = (rs << 20) | (3 << 12) | (rd << 7) | 0x33;
@@ -1014,9 +1014,9 @@ pub fn RiscvAssembler_enc_snez(self: &RiscvAssembler, ops: Vec<str>) -> ResultRi
 
 pub fn RiscvAssembler_enc_sextw(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
     if ops.len() < 2 { return ResultRiscVEncodedInst::Err("SEXT.W needs 2 operands"); }
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rd) => {
-            match parse_reg(ops.get(1)) {
+            match rv_parse_reg(ops.get(1)) {
                 ResultI64Str::Ok(rs) => {
                     // ADDIW rd, rs, 0: imm=0, funct3=0, opcode=0x1B (RV64I)
                     var inst: i64 = (rs << 15) | (rd << 7) | 0x1B;
@@ -1034,9 +1034,9 @@ pub fn RiscvAssembler_enc_sextw(self: &RiscvAssembler, ops: Vec<str>) -> ResultR
 
 pub fn RiscvAssembler_enc_fcvt_s_l(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
     if ops.len() < 2 { return ResultRiscVEncodedInst::Err("FCVT.S.L needs 2 operands"); }
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rd) => {
-            match parse_reg(ops.get(1)) {
+            match rv_parse_reg(ops.get(1)) {
                 ResultI64Str::Ok(rs1) => {
                     // FCVT.S.L: funct7=0x60, rs2=0x02, funct3=0x00, opcode=0x53
                     var inst: i64 = (0x60 << 25) | (0x02 << 20) | (rs1 << 15) | (rd << 7) | 0x53;
@@ -1054,9 +1054,9 @@ pub fn RiscvAssembler_enc_fcvt_s_l(self: &RiscvAssembler, ops: Vec<str>) -> Resu
 
 pub fn RiscvAssembler_enc_fcvt_l_s(self: &RiscvAssembler, ops: Vec<str>) -> ResultRiscVEncodedInst {
     if ops.len() < 2 { return ResultRiscVEncodedInst::Err("FCVT.L.S needs 2 operands"); }
-    match parse_reg(ops.get(0)) {
+    match rv_parse_reg(ops.get(0)) {
         ResultI64Str::Ok(rd) => {
-            match parse_reg(ops.get(1)) {
+            match rv_parse_reg(ops.get(1)) {
                 ResultI64Str::Ok(rs1) => {
                     // FCVT.L.S: funct7=0x60, rs2=0x02, funct3=0x00, opcode=0x53
                     var inst: i64 = (0x60 << 25) | (0x02 << 20) | (rs1 << 15) | (rd << 7) | 0x53;

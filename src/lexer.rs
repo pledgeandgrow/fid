@@ -42,6 +42,8 @@ impl Lexer {
                 tokens.push(self.read_number());
             } else if c == '"' {
                 tokens.push(self.read_string());
+            } else if c == '\'' {
+                tokens.push(self.read_char_lit());
             } else {
                 tokens.push(self.read_operator());
             }
@@ -403,6 +405,51 @@ impl Lexer {
         }
 
         Token::new(TokenKind::StringLit(s), line, col)
+    }
+
+    /// R1.7: char literal `'c'` → IntLit holding the Unicode scalar value, so
+    /// it compares directly against `str_byte_at` results. Supports the same
+    /// escapes as strings plus `\'`.
+    fn read_char_lit(&mut self) -> Token {
+        let line = self.line;
+        let col = self.col;
+        self.advance(); // consume opening '
+
+        let ch = if self.pos >= self.source.len() || self.peek() == '\'' || self.peek() == '\n' {
+            self.errors.push(format!("Error:{}:{}: empty char literal", line, col));
+            '\0'
+        } else if self.peek() == '\\' {
+            self.advance();
+            let esc = self.advance();
+            match esc {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                '\\' => '\\',
+                '\'' => '\'',
+                '"' => '"',
+                '0' => '\0',
+                'x' => self.read_hex_escape(line, col).0,
+                'u' if self.peek() == '{' => {
+                    self.advance(); // consume {
+                    self.read_unicode_escape(line, col).0
+                }
+                _ => {
+                    self.errors.push(format!("Error:{}:{}: unknown escape sequence \\{}", line, col, esc));
+                    esc
+                }
+            }
+        } else {
+            self.advance()
+        };
+
+        if self.peek() == '\'' {
+            self.advance(); // consume closing '
+        } else {
+            self.errors.push(format!("Error:{}:{}: unterminated char literal", line, col));
+        }
+
+        Token::new(TokenKind::IntLit(ch as i64), line, col)
     }
 
     /// Issue 29: Read a hex escape \xHH — reads exactly 2 hex digits.

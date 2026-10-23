@@ -5,7 +5,7 @@
 // Supports:
 //   - Full ELF executable emission (no external ld needed)
 //   - Link-time dead code elimination (remove unused functions)
-//   - R_X86_64_PC32, R_X86_64_PLT32, R_X86_64_64 relocations
+//   - LK_R_X86_64_PC32, LK_R_X86_64_PLT32, LK_R_X86_64_64 relocations
 //   - ARM64 and RISC-V internal relocation types
 //   - Runtime symbol resolution
 
@@ -17,9 +17,9 @@ use string;
 
 // --- Constants ------------------------------------------------------------
 
-pub const R_X86_64_64: i64 = 1;
-pub const R_X86_64_PC32: i64 = 2;
-pub const R_X86_64_PLT32: i64 = 4;
+pub const LK_R_X86_64_64: i64 = 1;
+pub const LK_R_X86_64_PC32: i64 = 2;
+pub const LK_R_X86_64_PLT32: i64 = 4;
 
 // ARM64 internal relocation codes
 pub const R_ARM64_BL: i64 = 10;
@@ -196,16 +196,21 @@ fn read_i64(buf: Vec, off: i64) -> i64 {
 // --- Helper: write little-endian integers to Vec ---
 
 fn write_u32(buf: &mut Vec, off: i64, val: i64) {
-    buf.set(off, val & 0xFF);
-    buf.set(off + 1, (val >> 8) & 0xFF);
-    buf.set(off + 2, (val >> 16) & 0xFF);
-    buf.set(off + 3, (val >> 24) & 0xFF);
+    var i: i64 = 0;
+    while i < 4 {
+        var b: i64 = (val >> (i * 8)) & 0xFF;
+        if off + i < buf.len() { buf.set(off + i, b); }
+        else { buf.push(b); }
+        i = i + 1;
+    }
 }
 
 fn write_u64(buf: &mut Vec, off: i64, val: i64) {
     var i: i64 = 0;
     while i < 8 {
-        buf.set(off + i, (val >> (i * 8)) & 0xFF);
+        var b: i64 = (val >> (i * 8)) & 0xFF;
+        if off + i < buf.len() { buf.set(off + i, b); }
+        else { buf.push(b); }
         i = i + 1;
     }
 }
@@ -809,18 +814,18 @@ pub fn Linker_link(self: &mut Linker, entry: str) -> LinkerResult {
         if sym_offset >= 0 {
             var patch_offset: i64 = offset;
             if patch_offset + 4 <= self.text_bytes.len() {
-                if r_type == R_X86_64_PC32 {
-                    // R_X86_64_PC32: PC-relative 32-bit
+                if r_type == LK_R_X86_64_PC32 {
+                    // LK_R_X86_64_PC32: PC-relative 32-bit
                     var next_rip: i64 = patch_offset + 4;
                     var delta: i64 = sym_offset - next_rip;
                     write_u32(self.text_bytes, patch_offset, delta);
-                } else if r_type == R_X86_64_PLT32 {
-                    // R_X86_64_PLT32: same as PC32 for our purposes
+                } else if r_type == LK_R_X86_64_PLT32 {
+                    // LK_R_X86_64_PLT32: same as PC32 for our purposes
                     var next_rip2: i64 = patch_offset + 4;
                     var delta2: i64 = sym_offset - next_rip2;
                     write_u32(self.text_bytes, patch_offset, delta2);
-                } else if r_type == R_X86_64_64 {
-                    // R_X86_64_64: absolute 64-bit
+                } else if r_type == LK_R_X86_64_64 {
+                    // LK_R_X86_64_64: absolute 64-bit
                     if patch_offset + 8 <= self.text_bytes.len() {
                         var abs_addr: i64 = sym_offset + 0x400078;
                         write_u64(self.text_bytes, patch_offset, abs_addr);
@@ -938,8 +943,8 @@ pub fn Linker_link(self: &mut Linker, entry: str) -> LinkerResult {
 
         if sym_offset2 >= 0 {
             var patch_offset2: i64 = offset2;
-            if r_type2 == R_X86_64_64 {
-                // R_X86_64_64: absolute 64-bit
+            if r_type2 == LK_R_X86_64_64 {
+                // LK_R_X86_64_64: absolute 64-bit
                 if patch_offset2 + 8 <= self.rodata.len() {
                     var abs_addr2: i64 = text_vaddr3 + sym_offset2;
                     write_u64(self.rodata, patch_offset2, abs_addr2);

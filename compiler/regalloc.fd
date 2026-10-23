@@ -353,8 +353,8 @@ pub fn allocate(func: &L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<str
         var interval: LiveInterval = sorted.get(si);
 
         // Handle pre-assigned VRegs (function params).
-        if vec_contains_i64(preassigned_all_ids, interval.vreg_id) {
-            var pre_idx: i64 = vec_find_i64(preassigned_reg_ids, interval.vreg_id);
+        if ra_vec_contains_i64(preassigned_all_ids, interval.vreg_id) {
+            var pre_idx: i64 = ra_vec_find_i64(preassigned_reg_ids, interval.vreg_id);
             if pre_idx >= 0 {
                 var reg: i64 = preassigned_reg_vals.get(pre_idx);
                 // Check if the pre-assigned register is clobbered during this VReg's live range.
@@ -411,7 +411,7 @@ pub fn allocate(func: &L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<str
         var fi: i64 = 0;
         while fi < to_free.len() {
             var r: i64 = to_free.get(fi);
-            if !vec_contains_i64(preassigned_reg_vals, r) {
+            if !ra_vec_contains_i64(preassigned_reg_vals, r) {
                 if !pool_contains(free_pool, r) {
                     free_pool.push(r);
                 }
@@ -438,7 +438,7 @@ pub fn allocate(func: &L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<str
                 vreg_to_loc.push(VRegLocEntry_new(interval.vreg_id, Location::Reg(reg)));
                 active.push(interval);
                 sort_active_by_end(&mut active);
-                if physreg_is_callee_saved(reg) && !vec_contains_i64(used_callee_saved, reg) {
+                if physreg_is_callee_saved(reg) && !ra_vec_contains_i64(used_callee_saved, reg) {
                     used_callee_saved.push(reg);
                 }
             }
@@ -460,7 +460,7 @@ pub fn allocate(func: &L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<str
                 if is_current {
                     // Spill the current interval.
                     // F-1A: If this VReg is a constant, rematerialize it.
-                    var const_idx: i64 = vec_find_i64(constant_vreg_ids, interval.vreg_id);
+                    var const_idx: i64 = ra_vec_find_i64(constant_vreg_ids, interval.vreg_id);
                     if const_idx >= 0 {
                         vreg_to_loc.push(VRegLocEntry_new(interval.vreg_id, Location::Remat(constant_vreg_vals.get(const_idx))));
                     } else {
@@ -480,7 +480,7 @@ pub fn allocate(func: &L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<str
 
                     if !got_reg {
                         // Fallback: just spill current.
-                        var const_idx: i64 = vec_find_i64(constant_vreg_ids, interval.vreg_id);
+                        var const_idx: i64 = ra_vec_find_i64(constant_vreg_ids, interval.vreg_id);
                         if const_idx >= 0 {
                             vreg_to_loc.push(VRegLocEntry_new(interval.vreg_id, Location::Remat(constant_vreg_vals.get(const_idx))));
                         } else {
@@ -495,7 +495,7 @@ pub fn allocate(func: &L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<str
                     // Check if the register is clobbered in the current interval's range.
                     if is_reg_clobbered_in_range(func, interval.start, interval.end, reg, pure_funcs, no_alloc_funcs) {
                         // Can't use this register -- spill current instead.
-                        var const_idx2: i64 = vec_find_i64(constant_vreg_ids, interval.vreg_id);
+                        var const_idx2: i64 = ra_vec_find_i64(constant_vreg_ids, interval.vreg_id);
                         if const_idx2 >= 0 {
                             vreg_to_loc.push(VRegLocEntry_new(interval.vreg_id, Location::Remat(constant_vreg_vals.get(const_idx2))));
                         } else {
@@ -508,7 +508,7 @@ pub fn allocate(func: &L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<str
                     }
 
                     // F-1A: If the evicted VReg is a constant, rematerialize it.
-                    var const_idx3: i64 = vec_find_i64(constant_vreg_ids, spill_vreg_id);
+                    var const_idx3: i64 = ra_vec_find_i64(constant_vreg_ids, spill_vreg_id);
                     if const_idx3 >= 0 {
                         set_loc_in_vec(&mut vreg_to_loc, spill_vreg_id, Location::Remat(constant_vreg_vals.get(const_idx3)));
                     } else {
@@ -531,7 +531,7 @@ pub fn allocate(func: &L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<str
                     vreg_to_loc.push(VRegLocEntry_new(interval.vreg_id, Location::Reg(reg)));
                     active.push(interval);
                     sort_active_by_end(&mut active);
-                    if physreg_is_callee_saved(reg) && !vec_contains_i64(used_callee_saved, reg) {
+                    if physreg_is_callee_saved(reg) && !ra_vec_contains_i64(used_callee_saved, reg) {
                         used_callee_saved.push(reg);
                     }
                 }
@@ -690,7 +690,7 @@ pub fn compute_live_intervals(func: &L3Function) -> Vec<LiveInterval> {
                             var ui2: i64 = 0;
                             while ui2 < uses2.len() {
                                 var vreg_id: i64 = uses2.get(ui2);
-                                var int_idx: i64 = vec_find_i64(interval_ids, vreg_id);
+                                var int_idx: i64 = ra_vec_find_i64(interval_ids, vreg_id);
                                 if int_idx >= 0 {
                                     if loop_end > interval_ends.get(int_idx) {
                                         interval_ends.set(int_idx, loop_end);
@@ -725,8 +725,8 @@ pub fn compute_live_intervals(func: &L3Function) -> Vec<LiveInterval> {
     }
 
     // Compute per-block use/def sets (as Vec<i64> of vreg IDs).
-    var block_uses: Vec<Vec<i64> > = Vec::new();
-    var block_defs: Vec<Vec<i64> > = Vec::new();
+    var block_uses: Vec<Vec<i64>> = Vec::new();
+    var block_defs: Vec<Vec<i64>> = Vec::new();
     bi = 0;
     while bi < func.blocks.len() {
         var block: L3Block = func.blocks.get(bi);
@@ -745,8 +745,8 @@ pub fn compute_live_intervals(func: &L3Function) -> Vec<LiveInterval> {
             var ui: i64 = 0;
             while ui < inst_uses_vec.len() {
                 var vreg_id: i64 = inst_uses_vec.get(ui);
-                if !vec_contains_i64(defs, vreg_id) {
-                    if !vec_contains_i64(uses, vreg_id) {
+                if !ra_vec_contains_i64(defs, vreg_id) {
+                    if !ra_vec_contains_i64(uses, vreg_id) {
                         uses.push(vreg_id);
                     }
                 }
@@ -755,7 +755,7 @@ pub fn compute_live_intervals(func: &L3Function) -> Vec<LiveInterval> {
             var dst_opt: OptVReg = inst_def(inst);
             match dst_opt {
                 OptVReg::Some(dst) => {
-                    if !vec_contains_i64(defs, dst.id) {
+                    if !ra_vec_contains_i64(defs, dst.id) {
                         defs.push(dst.id);
                     }
                 }
@@ -769,7 +769,7 @@ pub fn compute_live_intervals(func: &L3Function) -> Vec<LiveInterval> {
     }
 
     // Compute successors for each block.
-    var successors: Vec<Vec<i64> > = Vec::new();
+    var successors: Vec<Vec<i64>> = Vec::new();
     bi = 0;
     while bi < func.blocks.len() {
         successors.push(block_targets(func.blocks.get(bi)));
@@ -778,8 +778,8 @@ pub fn compute_live_intervals(func: &L3Function) -> Vec<LiveInterval> {
 
     // Backward dataflow: live_out[B] = union of live_in[S] for all successors S.
     // live_in[B] = use[B] + (live_out[B] - def[B]).
-    var live_in: Vec<Vec<i64> > = Vec::new();
-    var live_out: Vec<Vec<i64> > = Vec::new();
+    var live_in: Vec<Vec<i64>> = Vec::new();
+    var live_out: Vec<Vec<i64>> = Vec::new();
     bi = 0;
     while bi < func.blocks.len() {
         live_in.push(Vec::new());
@@ -797,12 +797,12 @@ pub fn compute_live_intervals(func: &L3Function) -> Vec<LiveInterval> {
             var si: i64 = 0;
             while si < successors.get(bi).len() {
                 var succ_id: i64 = successors.get(bi).get(si);
-                var succ_idx: i64 = vec_find_i64(block_idx_ids, succ_id);
+                var succ_idx: i64 = ra_vec_find_i64(block_idx_ids, succ_id);
                 if succ_idx >= 0 {
                     var succ_live_in: Vec<i64> = live_in.get(succ_idx);
                     var sli: i64 = 0;
                     while sli < succ_live_in.len() {
-                        if !vec_contains_i64(new_out, succ_live_in.get(sli)) {
+                        if !ra_vec_contains_i64(new_out, succ_live_in.get(sli)) {
                             new_out.push(succ_live_in.get(sli));
                         }
                         sli = sli + 1;
@@ -814,7 +814,7 @@ pub fn compute_live_intervals(func: &L3Function) -> Vec<LiveInterval> {
             var new_in: Vec<i64> = Vec::new();
             var ui: i64 = 0;
             while ui < block_uses.get(bi).len() {
-                if !vec_contains_i64(new_in, block_uses.get(bi).get(ui)) {
+                if !ra_vec_contains_i64(new_in, block_uses.get(bi).get(ui)) {
                     new_in.push(block_uses.get(bi).get(ui));
                 }
                 ui = ui + 1;
@@ -822,8 +822,8 @@ pub fn compute_live_intervals(func: &L3Function) -> Vec<LiveInterval> {
             var oi: i64 = 0;
             while oi < new_out.len() {
                 var vreg_id: i64 = new_out.get(oi);
-                if !vec_contains_i64(block_defs.get(bi), vreg_id) {
-                    if !vec_contains_i64(new_in, vreg_id) {
+                if !ra_vec_contains_i64(block_defs.get(bi), vreg_id) {
+                    if !ra_vec_contains_i64(new_in, vreg_id) {
                         new_in.push(vreg_id);
                     }
                 }
@@ -848,7 +848,7 @@ pub fn compute_live_intervals(func: &L3Function) -> Vec<LiveInterval> {
         var li: i64 = 0;
         while li < live_in.get(bi).len() {
             var vreg_id: i64 = live_in.get(bi).get(li);
-            var int_idx: i64 = vec_find_i64(interval_ids, vreg_id);
+            var int_idx: i64 = ra_vec_find_i64(interval_ids, vreg_id);
             if int_idx >= 0 {
                 if interval_ends.get(int_idx) < block_start_pos {
                     interval_ends.set(int_idx, block_start_pos);
@@ -860,7 +860,7 @@ pub fn compute_live_intervals(func: &L3Function) -> Vec<LiveInterval> {
         var lo: i64 = 0;
         while lo < live_out.get(bi).len() {
             var vreg_id: i64 = live_out.get(bi).get(lo);
-            var int_idx: i64 = vec_find_i64(interval_ids, vreg_id);
+            var int_idx: i64 = ra_vec_find_i64(interval_ids, vreg_id);
             if int_idx >= 0 {
                 if interval_ends.get(int_idx) < block_end_pos {
                     interval_ends.set(int_idx, block_end_pos);
@@ -883,7 +883,7 @@ pub fn compute_live_intervals(func: &L3Function) -> Vec<LiveInterval> {
 
 /// Record a def (start of interval).
 pub fn record_def(ids: &mut Vec<i64>, starts: &mut Vec<i64>, ends: &mut Vec<i64>, vreg_id: i64, pos: i64) {
-    var idx: i64 = vec_find_i64(ids, vreg_id);
+    var idx: i64 = ra_vec_find_i64(ids, vreg_id);
     if idx < 0 {
         ids.push(vreg_id);
         starts.push(pos);
@@ -897,7 +897,7 @@ pub fn record_def(ids: &mut Vec<i64>, starts: &mut Vec<i64>, ends: &mut Vec<i64>
 
 /// Record a use (extends end of interval).
 pub fn record_use(ids: &mut Vec<i64>, starts: &mut Vec<i64>, ends: &mut Vec<i64>, vreg_id: i64, pos: i64) {
-    var idx: i64 = vec_find_i64(ids, vreg_id);
+    var idx: i64 = ra_vec_find_i64(ids, vreg_id);
     if idx < 0 {
         ids.push(vreg_id);
         starts.push(pos);
@@ -944,10 +944,10 @@ pub fn inst_clobbers(inst: L3Inst, pure_funcs: Vec<str>, no_alloc_funcs: Vec<str
             result.push(REG_R11);
         }
         L3Inst::Call(_, target, _, _) => {
-            if vec_contains_str(pure_funcs, target) {
+            if ra_vec_contains_str(pure_funcs, target) {
                 // Pure function: only RAX clobbered (return value).
                 result.push(REG_RAX);
-            } else if vec_contains_str(no_alloc_funcs, target) {
+            } else if ra_vec_contains_str(no_alloc_funcs, target) {
                 // @no-alloc: only RAX clobbered.
                 result.push(REG_RAX);
             } else {
@@ -1029,7 +1029,7 @@ pub fn is_reg_clobbered_in_range(func: &L3Function, start: i64, end: i64, reg: i
         while ii < block.instructions.len() {
             if idx >= start && idx <= end {
                 var clobbers: Vec<i64> = inst_clobbers(block.instructions.get(ii), pure_funcs, no_alloc_funcs);
-                if vec_contains_i64(clobbers, reg) {
+                if ra_vec_contains_i64(clobbers, reg) {
                     return true;
                 }
             }
@@ -1176,7 +1176,7 @@ pub fn block_targets(block: L3Block) -> Vec<i64> {
 // Vec helper functions
 // ===========================================================================
 
-pub fn vec_contains_i64(vec: Vec<i64>, value: i64) -> bool {
+pub fn ra_vec_contains_i64(vec: Vec<i64>, value: i64) -> bool {
     var i: i64 = 0;
     while i < vec.len() {
         if vec.get(i) == value { return true; }
@@ -1190,13 +1190,13 @@ pub fn vec_i64_eq(a: Vec<i64>, b: Vec<i64>) -> bool {
     if a.len() != b.len() { return false; }
     var i: i64 = 0;
     while i < a.len() {
-        if !vec_contains_i64(b, a.get(i)) { return false; }
+        if !ra_vec_contains_i64(b, a.get(i)) { return false; }
         i = i + 1;
     }
     return true;
 }
 
-pub fn vec_contains_str(vec: Vec<str>, value: str) -> bool {
+pub fn ra_vec_contains_str(vec: Vec<str>, value: str) -> bool {
     var i: i64 = 0;
     while i < vec.len() {
         if str_equal(vec.get(i), value) { return true; }
@@ -1205,7 +1205,7 @@ pub fn vec_contains_str(vec: Vec<str>, value: str) -> bool {
     return false;
 }
 
-pub fn vec_find_i64(vec: Vec<i64>, value: i64) -> i64 {
+pub fn ra_vec_find_i64(vec: Vec<i64>, value: i64) -> i64 {
     var i: i64 = 0;
     while i < vec.len() {
         if vec.get(i) == value { return i; }
@@ -1233,7 +1233,7 @@ pub fn remove_from_pool(pool: &mut Vec<i64>, value: i64) {
 }
 
 pub fn pool_contains(pool: Vec<i64>, value: i64) -> bool {
-    return vec_contains_i64(pool, value);
+    return ra_vec_contains_i64(pool, value);
 }
 
 pub fn sort_pool(pool: &mut Vec<i64>) {

@@ -378,10 +378,29 @@ fn recover_to_sync_token(self: &mut Parser) {
     }
 
 }
+// R1.5: split a compound token starting with `>` so a generic list can close
+// on its first char: `>>` -> `>`, `>>=` -> `>=`, `>=` -> `=`. Returns false if
+// the current token does not start with `>`.
+fn split_gt(self: &mut Parser) -> bool {
+    var tok: Token = self.peek_token();
+    var rest: TokenKind = TokenKind::Eof;
+    if token_kind_eq(tok.kind, TokenKind::Shr) { rest = TokenKind::Gt; }
+    else if token_kind_eq(tok.kind, TokenKind::ShrEq) { rest = TokenKind::GtEq; }
+    else if token_kind_eq(tok.kind, TokenKind::GtEq) { rest = TokenKind::Eq; }
+    else { return false; }
+    self.tokens.set(self.pos, token_new(rest, tok.line, tok.col + 1));
+    return true;
+}
+
 fn expect(self: &mut Parser, kind: TokenKind, msg: str) -> ParseResultUnit {
     if self.check(kind) {
         self.advance();
         return ParseResultUnit::Ok;
+    }
+    if token_kind_eq(kind, TokenKind::Gt) {
+        if self.split_gt() {
+            return ParseResultUnit::Ok;
+        }
     }
     var tok: Token = self.peek_token();
     return ParseResultUnit::Err(
@@ -2947,7 +2966,7 @@ match self.expect(TokenKind::LBrace, "{") {
     ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
     ParseResultUnit::Ok => {}
 }
-var branches: Vec<Vec<Stmt> > = Vec::new();
+var branches: Vec<Vec<Stmt>> = Vec::new();
 // Parse branches separated by '|'
 // Optional leading '|' before the first branch
 self.match_tok(TokenKind::Pipe);

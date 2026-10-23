@@ -35,13 +35,13 @@ pub enum CType {
 }
 
 /// A function parameter
-pub struct Param {
+pub struct CParam {
     pub name: str,
     pub ty: CType,
 }
 
-pub fn Param_new(name: str, ty: CType) -> Param {
-    return Param { name: name, ty: ty };
+pub fn CParam_new(name: str, ty: CType) -> CParam {
+    return CParam { name: name, ty: ty };
 }
 
 /// An extern declaration
@@ -49,13 +49,13 @@ pub struct CExternDecl {
     pub abi: str,
     pub c_name: str,
     pub pledge_name: str,
-    pub params: Vec<Param>,
+    pub params: Vec<CParam>,
     pub ret_ty: CType,
     pub include: str,
     pub link_lib: str,
 }
 
-pub fn CExternDecl_new(abi: str, c_name: str, pledge_name: str, params: Vec<Param>, ret_ty: CType, include: str, link_lib: str) -> CExternDecl {
+pub fn CExternDecl_new(abi: str, c_name: str, pledge_name: str, params: Vec<CParam>, ret_ty: CType, include: str, link_lib: str) -> CExternDecl {
     return CExternDecl {
         abi: abi,
         c_name: c_name,
@@ -78,7 +78,7 @@ pub fn parse_header(source: str, include: str) -> Vec<CExternDecl> {
     var cleaned: str = strip_comments(source);
 
     // Tokenize into lines and look for function declarations
-    var lines: Vec<str> = str_lines(cleaned);
+    var lines: Vec<str> = cp_str_lines(cleaned);
     var i: i64 = 0;
     while i < lines.len() {
         var line: str = str_trim(lines.get(i));
@@ -95,12 +95,12 @@ pub fn parse_header(source: str, include: str) -> Vec<CExternDecl> {
 
         // Collect lines until we find a semicolon
         var full_decl: str = line;
-        while !str_contains(full_decl, ";") && i + 1 < lines.len() {
+        while !cp_str_contains(full_decl, ";") && i + 1 < lines.len() {
             i = i + 1;
             full_decl = full_decl + " " + str_trim(lines.get(i));
         }
 
-        if str_contains(full_decl, "(") && str_contains(full_decl, ")") && str_contains(full_decl, ";") {
+        if cp_str_contains(full_decl, "(") && cp_str_contains(full_decl, ")") && cp_str_contains(full_decl, ";") {
             var decl_result: OptionCExternDecl = parse_c_function(full_decl, include);
             match decl_result {
                 OptionCExternDecl::Some(decl) => {
@@ -167,17 +167,17 @@ pub enum OptionCExternDecl { Some(CExternDecl), None }
 fn parse_c_function(decl: str, include: str) -> OptionCExternDecl {
     // Trim and remove trailing semicolon
     var d: str = str_trim(decl);
-    d = str_trim_end_char(d, ";");
+    d = cp_str_trim_end_char(d, ";");
     d = str_trim(d);
 
     // Find the opening paren
-    var paren_pos: i64 = str_find_char(d, "(");
+    var paren_pos: i64 = cp_str_find_char(d, "(");
     if paren_pos < 0 { return OptionCExternDecl::None; }
 
     var before_paren: str = str_slice(d, 0, paren_pos);
     before_paren = str_trim(before_paren);
     var params_str: str = str_slice(d, paren_pos + 1, str_len(d));
-    params_str = str_trim_end_char(params_str, ")");
+    params_str = cp_str_trim_end_char(params_str, ")");
     params_str = str_trim(params_str);
 
     // The function name is the last identifier before the paren
@@ -204,7 +204,7 @@ fn parse_c_function(decl: str, include: str) -> OptionCExternDecl {
         OptionCType::None => { return OptionCExternDecl::None; }
     }
 
-    var params: Vec<Param> = parse_c_params(params_str);
+    var params: Vec<CParam> = parse_c_params(params_str);
 
     return OptionCExternDecl::Some(CExternDecl_new(
         "C",
@@ -298,8 +298,8 @@ fn parse_c_type(c_type: str) -> OptionCType {
 
 // --- Parse C function parameters ---
 
-fn parse_c_params(params_str: str) -> Vec<Param> {
-    var params: Vec<Param> = Vec::new();
+fn parse_c_params(params_str: str) -> Vec<CParam> {
+    var params: Vec<CParam> = Vec::new();
     var trimmed: str = str_trim(params_str);
     if str_len(trimmed) == 0 || str_equal(trimmed, "void") {
         return params;
@@ -341,9 +341,9 @@ fn parse_c_params(params_str: str) -> Vec<Param> {
     return params;
 }
 
-// --- Option type for Param ---
+// --- Option type for CParam ---
 
-pub enum OptionParam { Some(Param), None }
+pub enum OptionParam { Some(CParam), None }
 
 // --- Parse a single C parameter ---
 
@@ -355,9 +355,9 @@ fn parse_c_param(param: str) -> OptionParam {
     p = str_trim(p);
 
     // Handle pointer types -- name is after the last *
-    if str_contains(p, "*") {
+    if cp_str_contains(p, "*") {
         // Find the last *
-        var star_pos: i64 = str_rfind_char(p, "*");
+        var star_pos: i64 = cp_str_rfind_char(p, "*");
         var base_type: str = str_trim(str_slice(p, 0, star_pos));
         var name: str = str_trim(str_slice(p, star_pos + 1, str_len(p)));
         var ty: CType;
@@ -372,7 +372,7 @@ fn parse_c_param(param: str) -> OptionParam {
         }
         var pname: str = name;
         if str_len(pname) == 0 { pname = "arg0"; }
-        return OptionParam::Some(Param_new(pname, ty));
+        return OptionParam::Some(CParam_new(pname, ty));
     }
 
     // Non-pointer: split type and name
@@ -386,7 +386,7 @@ fn parse_c_param(param: str) -> OptionParam {
         OptionCType::Some(ty) => {
             var pname: str = name;
             if str_len(pname) == 0 { pname = "arg"; }
-            return OptionParam::Some(Param_new(pname, ty));
+            return OptionParam::Some(CParam_new(pname, ty));
         }
         OptionCType::None => { return OptionParam::None; }
     }
@@ -405,7 +405,7 @@ pub fn generate_pledge_bindings(decls: Vec<CExternDecl>, include: str) -> str {
         var params_str: str = "";
         var j: i64 = 0;
         while j < decl.params.len() {
-            var p: Param = decl.params.get(j);
+            var p: CParam = decl.params.get(j);
             if j > 0 { params_str = params_str + ", "; }
             params_str = params_str + p.name + ": " + type_to_pledge(p.ty);
             j = j + 1;
@@ -459,7 +459,7 @@ pub fn str_from_byte(b: i64) -> str {
     return str_from_bytes(buf);
 }
 
-fn str_lines(s: str) -> Vec<str> {
+fn cp_str_lines(s: str) -> Vec<str> {
     var result: Vec<str> = Vec::new();
     var i: i64 = 0;
     var start: i64 = 0;
@@ -477,7 +477,7 @@ fn str_lines(s: str) -> Vec<str> {
     return result;
 }
 
-fn str_trim_end_char(s: str, ch: i64) -> str {
+fn cp_str_trim_end_char(s: str, ch: i64) -> str {
     var end: i64 = str_len(s);
     while end > 0 {
         var b: i64 = str_byte_at(s, end - 1);
@@ -490,11 +490,11 @@ fn str_trim_end_char(s: str, ch: i64) -> str {
     return str_slice(s, 0, end);
 }
 
-fn str_contains(s: str, substr: str) -> bool {
+fn cp_str_contains(s: str, substr: str) -> bool {
     return str_find(s, substr) >= 0;
 }
 
-fn str_find_char(s: str, ch: i64) -> i64 {
+fn cp_str_find_char(s: str, ch: i64) -> i64 {
     var i: i64 = 0;
     while i < str_len(s) {
         if str_byte_at(s, i) == ch { return i; }
@@ -503,7 +503,7 @@ fn str_find_char(s: str, ch: i64) -> i64 {
     return -1;
 }
 
-fn str_rfind_char(s: str, ch: i64) -> i64 {
+fn cp_str_rfind_char(s: str, ch: i64) -> i64 {
     var i: i64 = str_len(s) - 1;
     while i >= 0 {
         if str_byte_at(s, i) == ch { return i; }

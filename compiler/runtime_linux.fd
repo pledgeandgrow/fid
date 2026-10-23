@@ -12,6 +12,7 @@ module compiler::runtime_linux;
 use core;
 use vec;
 use string;
+use compiler::elf64;
 
 // --- Structs -------------------------------------------------------------
 
@@ -59,15 +60,15 @@ var g_runtime_relocations: Vec<RuntimeReloc> = Vec::new();
 
 // --- Helpers --------------------------------------------------------------
 
-fn pb2(t: &mut Vec, a: i64, b: i64) { t.push(a & 0xFF); t.push(b & 0xFF); }
-fn pb1(t: &mut Vec, a: i64) { t.push(a & 0xFF); }
-fn pb3(t: &mut Vec, a: i64, b: i64, c: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); }
-fn pb4(t: &mut Vec, a: i64, b: i64, c: i64, d: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); t.push(d & 0xFF); }
-fn pb5(t: &mut Vec, a: i64, b: i64, c: i64, d: i64, e: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); t.push(d & 0xFF); t.push(e & 0xFF); }
-fn pb6(t: &mut Vec, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); t.push(d & 0xFF); t.push(e & 0xFF); t.push(f & 0xFF); }
-fn pb7(t: &mut Vec, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); t.push(d & 0xFF); t.push(e & 0xFF); t.push(f & 0xFF); t.push(g & 0xFF); }
-fn pb8(t: &mut Vec, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); t.push(d & 0xFF); t.push(e & 0xFF); t.push(f & 0xFF); t.push(g & 0xFF); t.push(h & 0xFF); }
-fn pb9(t: &mut Vec, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); t.push(d & 0xFF); t.push(e & 0xFF); t.push(f & 0xFF); t.push(g & 0xFF); t.push(h & 0xFF); t.push(i & 0xFF); }
+fn rl_pb2(t: &mut Vec, a: i64, b: i64) { t.push(a & 0xFF); t.push(b & 0xFF); }
+fn rl_pb1(t: &mut Vec, a: i64) { t.push(a & 0xFF); }
+fn rl_pb3(t: &mut Vec, a: i64, b: i64, c: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); }
+fn rl_pb4(t: &mut Vec, a: i64, b: i64, c: i64, d: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); t.push(d & 0xFF); }
+fn rl_pb5(t: &mut Vec, a: i64, b: i64, c: i64, d: i64, e: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); t.push(d & 0xFF); t.push(e & 0xFF); }
+fn rl_pb6(t: &mut Vec, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); t.push(d & 0xFF); t.push(e & 0xFF); t.push(f & 0xFF); }
+fn rl_pb7(t: &mut Vec, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); t.push(d & 0xFF); t.push(e & 0xFF); t.push(f & 0xFF); t.push(g & 0xFF); }
+fn rl_pb8(t: &mut Vec, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); t.push(d & 0xFF); t.push(e & 0xFF); t.push(f & 0xFF); t.push(g & 0xFF); t.push(h & 0xFF); }
+fn rl_pb9(t: &mut Vec, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); t.push(d & 0xFF); t.push(e & 0xFF); t.push(f & 0xFF); t.push(g & 0xFF); t.push(h & 0xFF); t.push(i & 0xFF); }
 
 fn add_sym(symbols: &mut Vec<RuntimeSymbol>, text: &Vec, name: str) {
     symbols.push(RuntimeSymbol { name: name, offset: text.len(), size: 0 });
@@ -87,9 +88,11 @@ fn stub_capability(name: str) -> str {
 }
 
 fn cap_granted(caps_set: i64, cap: str) -> bool {
-    // Simplified: caps_set is a bitfield (0 = no caps, -1 = all caps)
-    if caps_set == 0 { return false; }
-    return true;
+    // caps_set bitfield: bit0 = FS/IO, bit1 = Net, bit2 = Spawn
+    if str_equal(cap, "FS") || str_equal(cap, "IO") { return (caps_set & 1) != 0; }
+    if str_equal(cap, "Net") { return (caps_set & 2) != 0; }
+    if str_equal(cap, "Spawn") { return (caps_set & 4) != 0; }
+    return false;
 }
 
 fn trap_stub(text: &mut Vec) {
@@ -182,20 +185,20 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // =======================================================================
     add_sym(symbols, text, "_start");
     // andq $-16, %rsp  -> 48 83 e4 f0
-    pb4(text, 0x48, 0x83, 0xe4, 0xf0);
+    rl_pb4(text, 0x48, 0x83, 0xe4, 0xf0);
     // call main (rel32 placeholder -- linker patches with R_X86_64_PLT32)
-    pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
     // This call needs a relocation -- we'll handle it specially in the linker
     // For now, store the relocation offset
     var _start_call_offset: i64 = text.len() - 4;
     // movq %rax, %rdi  -> 48 89 c7
-    pb3(text, 0x48, 0x89, 0xc7);
+    rl_pb3(text, 0x48, 0x89, 0xc7);
     // movq $60, %rax   -> 48 c7 c0 3c 00 00 00
-    pb7(text, 0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00);
     // syscall           -> 0f 05
-    pb2(text, 0x0f, 0x05);
+    rl_pb2(text, 0x0f, 0x05);
     // ud2              -> 0f 0b
-    pb2(text, 0x0f, 0x0b);
+    rl_pb2(text, 0x0f, 0x0b);
     // =======================================================================
     // p_print_str(rdi = *u8 null-terminated string)
     // Writes the string to stdout (fd=1) using sys_write.
@@ -223,25 +226,25 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // =======================================================================
     add_sym(symbols, text, "p_print_str");
     text.push(0x53 & 0xFF);
-    pb3(text, 0x48, 0x89, 0xfb);
-    pb3(text, 0x48, 0x89, 0xf9);
-    pb3(text, 0x48, 0x31, 0xc0);
+    rl_pb3(text, 0x48, 0x89, 0xfb);
+    rl_pb3(text, 0x48, 0x89, 0xf9);
+    rl_pb3(text, 0x48, 0x31, 0xc0);
     var pstr_loop: i64 = text.len();
-    pb3(text, 0x80, 0x39, 0x00);
+    rl_pb3(text, 0x80, 0x39, 0x00);
     // je done (skip incq %rcx [3] + incq %rax [3] + jmp loop [2] = 8 bytes)
-    pb2(text, 0x74, 0x08);
-    pb3(text, 0x48, 0xff, 0xc1);
-    pb3(text, 0x48, 0xff, 0xc0);
+    rl_pb2(text, 0x74, 0x08);
+    rl_pb3(text, 0x48, 0xff, 0xc1);
+    rl_pb3(text, 0x48, 0xff, 0xc0);
     // jmp loop: backward to pstr_loop
     var jmp_back: i64 = text.len();
     var back_offset: i64 = pstr_loop - jmp_back - 2;
-    pb2(text, 0xeb, (back_offset) & 0xFF);
+    rl_pb2(text, 0xeb, (back_offset) & 0xFF);
     // done:
-    pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
-    pb3(text, 0x48, 0x89, 0xde);
-    pb3(text, 0x48, 0x89, 0xc2);
-    pb7(text, 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00);
-    pb2(text, 0x0f, 0x05);
+    rl_pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
+    rl_pb3(text, 0x48, 0x89, 0xde);
+    rl_pb3(text, 0x48, 0x89, 0xc2);
+    rl_pb7(text, 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00);
+    rl_pb2(text, 0x0f, 0x05);
     text.push(0x5b & 0xFF);
     text.push(0xc3 & 0xFF);
     // =======================================================================
@@ -295,102 +298,102 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // =======================================================================
     add_sym(symbols, text, "p_print_int");
     text.push(0x53 & 0xFF);
-    pb2(text, 0x41, 0x54);
-    pb2(text, 0x41, 0x55);
-    pb4(text, 0x48, 0x83, 0xec, 0x20);
-    pb3(text, 0x49, 0x89, 0xfc);
+    rl_pb2(text, 0x41, 0x54);
+    rl_pb2(text, 0x41, 0x55);
+    rl_pb4(text, 0x48, 0x83, 0xec, 0x20);
+    rl_pb3(text, 0x49, 0x89, 0xfc);
     // leaq 31(%rsp), %r13 -> 4C 8D 6C 24 1F
-    pb5(text, 0x4c, 0x8d, 0x6c, 0x24, 0x1f);
+    rl_pb5(text, 0x4c, 0x8d, 0x6c, 0x24, 0x1f);
     // movb $0, (%r13) -> 41 C6 45 00 00 (REX.B, C6, ModRM=45: mod=01 rm=101(r13), disp8=0, imm8=0)
-    pb5(text, 0x41, 0xc6, 0x45, 0x00, 0x00);
+    rl_pb5(text, 0x41, 0xc6, 0x45, 0x00, 0x00);
     // testq %r12, %r12 -> 4D 85 E4
-    pb3(text, 0x4d, 0x85, 0xe4);
+    rl_pb3(text, 0x4d, 0x85, 0xe4);
     // jne .notzero -> 75 XX (need to calculate offset)
     var pint_jne1: i64 = text.len();
-    pb2(text, 0x75, 0x00);
+    rl_pb2(text, 0x75, 0x00);
     // zero case:
     // decq %r13 -> 49 ff cd
-    pb3(text, 0x49, 0xff, 0xcd);
+    rl_pb3(text, 0x49, 0xff, 0xcd);
     // movb $48, (%r13) -> 41 C6 45 00 30 (mod=01, disp8=0, imm8='0')
-    pb5(text, 0x41, 0xc6, 0x45, 0x00, 0x30);
+    rl_pb5(text, 0x41, 0xc6, 0x45, 0x00, 0x30);
     // jmp .print -> eb XX
     var pint_jmp_print1: i64 = text.len();
-    pb2(text, 0xeb, 0x00);
+    rl_pb2(text, 0xeb, 0x00);
     // .notzero:
     var pint_notzero: i64 = text.len();
     // Patch jne to jump here
     text.set(pint_jne1 + 1, (pint_notzero - pint_jne1 - 2) & 0xFF);
     // testq %r12, %r12 -> 4D 85 E4
-    pb3(text, 0x4d, 0x85, 0xe4);
+    rl_pb3(text, 0x4d, 0x85, 0xe4);
     // jns .pos -> 79 XX
     var pint_jns: i64 = text.len();
-    pb2(text, 0x79, 0x00);
+    rl_pb2(text, 0x79, 0x00);
     // negq %r12 -> 49 F7 DC
-    pb3(text, 0x49, 0xf7, 0xdc);
+    rl_pb3(text, 0x49, 0xf7, 0xdc);
     // .pos:
     var pint_pos: i64 = text.len();
     text.set(pint_jns + 1, (pint_pos - pint_jns - 2) & 0xFF);
     // .digit_loop:
     var pint_loop: i64 = text.len();
     // testq %r12, %r12 -> 4D 85 E4
-    pb3(text, 0x4d, 0x85, 0xe4);
+    rl_pb3(text, 0x4d, 0x85, 0xe4);
     // je .digits_done -> 74 XX
     var pint_je_done: i64 = text.len();
-    pb2(text, 0x74, 0x00);
+    rl_pb2(text, 0x74, 0x00);
     // movq %r12, %rax -> 4C 89 E0
-    pb3(text, 0x4c, 0x89, 0xe0);
+    rl_pb3(text, 0x4c, 0x89, 0xe0);
     // xorq %rdx, %rdx -> 48 31 D2
-    pb3(text, 0x48, 0x31, 0xd2);
+    rl_pb3(text, 0x48, 0x31, 0xd2);
     // movq $10, %rcx -> 48 C7 C1 0A 00 00 00
-    pb7(text, 0x48, 0xc7, 0xc1, 0x0a, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0xc7, 0xc1, 0x0a, 0x00, 0x00, 0x00);
     // divq %rcx -> 48 F7 F1
-    pb3(text, 0x48, 0xf7, 0xf1);
+    rl_pb3(text, 0x48, 0xf7, 0xf1);
     // movq %rax, %r12 -> 49 89 C4 (REX.W=1, REX.B=1 for r12, 89, ModRM=C4: mod=11 reg=000(rax) rm=100(r12))
-    pb3(text, 0x49, 0x89, 0xc4);
+    rl_pb3(text, 0x49, 0x89, 0xc4);
     // addq $48, %rdx -> 48 83 C2 30
-    pb4(text, 0x48, 0x83, 0xc2, 0x30);
+    rl_pb4(text, 0x48, 0x83, 0xc2, 0x30);
     // decq %r13 -> 49 FF CD
-    pb3(text, 0x49, 0xff, 0xcd);
+    rl_pb3(text, 0x49, 0xff, 0xcd);
     // movb %dl, (%r13) -> 41 88 55 00 (REX.B, 88, ModRM=55: mod=01 reg=010(dl) rm=101(r13), disp8=0)
-    pb4(text, 0x41, 0x88, 0x55, 0x00);
+    rl_pb4(text, 0x41, 0x88, 0x55, 0x00);
     // jmp .digit_loop -> eb XX (backward)
     var jmp_back2: i64 = text.len();
     var back2: i64 = pint_loop - jmp_back2 - 2;
-    pb2(text, 0xeb, (back2) & 0xFF);
+    rl_pb2(text, 0xeb, (back2) & 0xFF);
     // .digits_done:
     var pint_digits_done: i64 = text.len();
     text.set(pint_je_done + 1, (pint_digits_done - pint_je_done - 2) & 0xFF);
     // testq %rdi, %rdi -> 48 85 FF
-    pb3(text, 0x48, 0x85, 0xff);
+    rl_pb3(text, 0x48, 0x85, 0xff);
     // jns .print -> 79 XX
     var pint_jns2: i64 = text.len();
-    pb2(text, 0x79, 0x00);
+    rl_pb2(text, 0x79, 0x00);
     // decq %r13 -> 49 FF CD
-    pb3(text, 0x49, 0xff, 0xcd);
+    rl_pb3(text, 0x49, 0xff, 0xcd);
     // movb $45, (%r13) -> 41 C6 45 00 2D (mod=01, disp8=0, imm8='-')
-    pb5(text, 0x41, 0xc6, 0x45, 0x00, 0x2d);
+    rl_pb5(text, 0x41, 0xc6, 0x45, 0x00, 0x2d);
     // .print:
     var pint_print: i64 = text.len();
     text.set(pint_jns2 + 1, (pint_print - pint_jns2 - 2) & 0xFF);
     text.set(pint_jmp_print1 + 1, (pint_print - pint_jmp_print1 - 2) & 0xFF);
     // movl $1, %edi -> BF 01 00 00 00
-    pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
     // movq %r13, %rsi -> 4C 89 EE
-    pb3(text, 0x4c, 0x89, 0xee);
+    rl_pb3(text, 0x4c, 0x89, 0xee);
     // leaq 31(%rsp), %rax -> 48 8D 44 24 1F
-    pb5(text, 0x48, 0x8d, 0x44, 0x24, 0x1f);
+    rl_pb5(text, 0x48, 0x8d, 0x44, 0x24, 0x1f);
     // subq %r13, %rax -> 4C 29 E8
-    pb3(text, 0x4c, 0x29, 0xe8);
+    rl_pb3(text, 0x4c, 0x29, 0xe8);
     // movq %rax, %rdx -> 48 89 C2
-    pb3(text, 0x48, 0x89, 0xc2);
+    rl_pb3(text, 0x48, 0x89, 0xc2);
     // movq $1, %rax -> 48 C7 C0 01 00 00 00
-    pb7(text, 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00);
     // syscall -> 0F 05
-    pb2(text, 0x0f, 0x05);
+    rl_pb2(text, 0x0f, 0x05);
     // addq $32, %rsp -> 48 83 C4 20
-    pb4(text, 0x48, 0x83, 0xc4, 0x20);
-    pb2(text, 0x41, 0x5d);
-    pb2(text, 0x41, 0x5c);
+    rl_pb4(text, 0x48, 0x83, 0xc4, 0x20);
+    rl_pb2(text, 0x41, 0x5d);
+    rl_pb2(text, 0x41, 0x5c);
     text.push(0x5b & 0xFF);
     text.push(0xc3 & 0xFF);
     // =======================================================================
@@ -402,39 +405,39 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // movl $1, %edi ; leaq false_str(%rip), %rsi ; movl $5, %edx ; movl $1, %eax ; syscall ; ret
     // =======================================================================
     add_sym(symbols, text, "p_print_bool");
-    pb3(text, 0x48, 0x85, 0xff);
+    rl_pb3(text, 0x48, 0x85, 0xff);
     var pbool_je: i64 = text.len();
-    pb2(text, 0x74, 0x00);
+    rl_pb2(text, 0x74, 0x00);
     // true:
-    pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
     // leaq true_str(%rip), %rsi -> 48 8D 35 XX XX XX XX (RIP-relative)
-    pb7(text, 0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00);
     var pbool_true_lea: i64 = text.len() - 4;
-    pb5(text, 0xba, 0x04, 0x00, 0x00, 0x00);
-    pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
-    pb2(text, 0x0f, 0x05);
+    rl_pb5(text, 0xba, 0x04, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
+    rl_pb2(text, 0x0f, 0x05);
     text.push(0xc3 & 0xFF);
     // false:
     var pbool_false: i64 = text.len();
     text.set(pbool_je + 1, (pbool_false - pbool_je - 2) & 0xFF);
-    pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
-    pb7(text, 0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00);
     var pbool_false_lea: i64 = text.len() - 4;
-    pb5(text, 0xba, 0x05, 0x00, 0x00, 0x00);
-    pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
-    pb2(text, 0x0f, 0x05);
+    rl_pb5(text, 0xba, 0x05, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
+    rl_pb2(text, 0x0f, 0x05);
     text.push(0xc3 & 0xFF);
     // =======================================================================
     // p_print_newline()
     // write(1, "\n", 1)
     // =======================================================================
     add_sym(symbols, text, "p_print_newline");
-    pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
-    pb7(text, 0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00);
     var pnl_lea: i64 = text.len() - 4;
-    pb5(text, 0xba, 0x01, 0x00, 0x00, 0x00);
-    pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
-    pb2(text, 0x0f, 0x05);
+    rl_pb5(text, 0xba, 0x01, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
+    rl_pb2(text, 0x0f, 0x05);
     text.push(0xc3 & 0xFF);
     // =======================================================================
     // p_print_float(rdi = double bits)
@@ -444,33 +447,33 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     add_sym(symbols, text, "p_print_float");
     // pushq %rbx ; pushq %r12 ; pushq %r13 ; pushq %r14
     text.push(0x53 & 0xFF);
-    pb2(text, 0x41, 0x54);
-    pb2(text, 0x41, 0x55);
-    pb2(text, 0x41, 0x56);
+    rl_pb2(text, 0x41, 0x54);
+    rl_pb2(text, 0x41, 0x55);
+    rl_pb2(text, 0x41, 0x56);
     // subq $56, %rsp -- 4 pushes (32) + ret (8) = 40. 40+56=96. 96%16=0.
-    pb4(text, 0x48, 0x83, 0xec, 0x38);
+    rl_pb4(text, 0x48, 0x83, 0xec, 0x38);
     // Store double bits at (%rsp), load into xmm0
-    pb4(text, 0x48, 0x89, 0x3c, 0x24);
-    pb5(text, 0xf2, 0x0f, 0x10, 0x04, 0x24);
+    rl_pb4(text, 0x48, 0x89, 0x3c, 0x24);
+    rl_pb5(text, 0xf2, 0x0f, 0x10, 0x04, 0x24);
     // Check if zero: store 0.0 at 8(%rsp), compare
-    pb9(text, 0x48, 0xc7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x00);
-    pb6(text, 0xf2, 0x0f, 0x10, 0x4c, 0x24, 0x08);
-    pb4(text, 0x66, 0x0f, 0x2e, 0xc1);
+    rl_pb9(text, 0x48, 0xc7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x00);
+    rl_pb6(text, 0xf2, 0x0f, 0x10, 0x4c, 0x24, 0x08);
+    rl_pb4(text, 0x66, 0x0f, 0x2e, 0xc1);
     // jp .not_zero
     var pfloat_jp: i64 = text.len();
-    pb2(text, 0x7a, 0x00);
+    rl_pb2(text, 0x7a, 0x00);
     // jne .not_zero
     var pfloat_jne: i64 = text.len();
-    pb2(text, 0x75, 0x00);
+    rl_pb2(text, 0x75, 0x00);
     // .print_zero: print "0" and return
-    pb5(text, 0xc6, 0x44, 0x24, 0x10, 0x30);
-    pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
-    pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
-    pb5(text, 0x48, 0x8d, 0x74, 0x24, 0x10);
-    pb5(text, 0xba, 0x01, 0x00, 0x00, 0x00);
-    pb2(text, 0x0f, 0x05);
+    rl_pb5(text, 0xc6, 0x44, 0x24, 0x10, 0x30);
+    rl_pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0x48, 0x8d, 0x74, 0x24, 0x10);
+    rl_pb5(text, 0xba, 0x01, 0x00, 0x00, 0x00);
+    rl_pb2(text, 0x0f, 0x05);
     // jmp .done (use rel32 since distance > 127)
-    pb5(text, 0xe9, 0x00, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xe9, 0x00, 0x00, 0x00, 0x00);
     var pfloat_jmp_done: i64 = text.len() - 4;
     // .not_zero:
     var pfloat_notzero: i64 = text.len();
@@ -479,125 +482,125 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     var jne_off: i64 = (pfloat_notzero - pfloat_jne - 2) & 0xFF;
     text.set(pfloat_jne + 1, (jne_off) & 0xFF);
     // Check negative: test sign bit
-    pb4(text, 0x48, 0x8b, 0x04, 0x24);
-    pb5(text, 0x48, 0x0f, 0xba, 0xe0, 0x3f);
+    rl_pb4(text, 0x48, 0x8b, 0x04, 0x24);
+    rl_pb5(text, 0x48, 0x0f, 0xba, 0xe0, 0x3f);
     var pfloat_jnc: i64 = text.len();
-    pb2(text, 0x73, 0x00);
+    rl_pb2(text, 0x73, 0x00);
     // Negative: negate first, then print '-'
-    pb5(text, 0x48, 0x0f, 0xba, 0xf8, 0x3f);
-    pb4(text, 0x48, 0x89, 0x04, 0x24);
-    pb5(text, 0xf2, 0x0f, 0x10, 0x04, 0x24);
+    rl_pb5(text, 0x48, 0x0f, 0xba, 0xf8, 0x3f);
+    rl_pb4(text, 0x48, 0x89, 0x04, 0x24);
+    rl_pb5(text, 0xf2, 0x0f, 0x10, 0x04, 0x24);
     // Now print '-' (syscall clobbers rax/rdi/rsi/rdx but xmm0 is preserved)
-    pb5(text, 0xc6, 0x44, 0x24, 0x10, 0x2d);
-    pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
-    pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
-    pb5(text, 0x48, 0x8d, 0x74, 0x24, 0x10);
-    pb5(text, 0xba, 0x01, 0x00, 0x00, 0x00);
-    pb2(text, 0x0f, 0x05);
+    rl_pb5(text, 0xc6, 0x44, 0x24, 0x10, 0x2d);
+    rl_pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0x48, 0x8d, 0x74, 0x24, 0x10);
+    rl_pb5(text, 0xba, 0x01, 0x00, 0x00, 0x00);
+    rl_pb2(text, 0x0f, 0x05);
     // .positive:
     var pfloat_positive: i64 = text.len();
     var jnc_offset: i64 = (pfloat_positive - pfloat_jnc - 2) & 0xFF;
     text.set(pfloat_jnc + 1, (jnc_offset) & 0xFF);
     // cvttsd2siq %xmm0, %r12 (integer part)
     // REX: W=1, R=1(r12), X=0, B=0 -> 0x4C; ModRM: mod=11, reg=100(r12), rm=000(xmm0) -> 0xE0
-    pb5(text, 0xf2, 0x4c, 0x0f, 0x2c, 0xe0);
+    rl_pb5(text, 0xf2, 0x4c, 0x0f, 0x2c, 0xe0);
     // Compute frac = xmm0 - (double)r12
     // cvtsi2sdq %r12, %xmm1: REX W=1,B=1 -> 0x49; ModRM reg=001(xmm1),rm=100(r12) -> 0xCC
-    pb5(text, 0xf2, 0x49, 0x0f, 0x2a, 0xcc);
+    rl_pb5(text, 0xf2, 0x49, 0x0f, 0x2a, 0xcc);
     // subsd %xmm1, %xmm0
-    pb4(text, 0xf2, 0x0f, 0x5c, 0xc1);
+    rl_pb4(text, 0xf2, 0x0f, 0x5c, 0xc1);
     // Multiply frac by 10^6 and add 0.5 for rounding
     // 10^6 = 1000000.0 as f64 = 0x41312D0000000000
-    pb8(text, 0xc7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x00);
-    pb8(text, 0xc7, 0x44, 0x24, 0x0c, 0x80, 0x84, 0x2e, 0x41);
-    pb6(text, 0xf2, 0x0f, 0x10, 0x4c, 0x24, 0x08);
-    pb4(text, 0xf2, 0x0f, 0x59, 0xc1);
+    rl_pb8(text, 0xc7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x00);
+    rl_pb8(text, 0xc7, 0x44, 0x24, 0x0c, 0x80, 0x84, 0x2e, 0x41);
+    rl_pb6(text, 0xf2, 0x0f, 0x10, 0x4c, 0x24, 0x08);
+    rl_pb4(text, 0xf2, 0x0f, 0x59, 0xc1);
     // 0.5 as f64 = 0x3FE0000000000000
-    pb8(text, 0xc7, 0x44, 0x24, 0x10, 0x00, 0x00, 0x00, 0x00);
-    pb8(text, 0xc7, 0x44, 0x24, 0x14, 0x00, 0x00, 0xe0, 0x3f);
-    pb6(text, 0xf2, 0x0f, 0x10, 0x4c, 0x24, 0x10);
-    pb4(text, 0xf2, 0x0f, 0x58, 0xc1);
+    rl_pb8(text, 0xc7, 0x44, 0x24, 0x10, 0x00, 0x00, 0x00, 0x00);
+    rl_pb8(text, 0xc7, 0x44, 0x24, 0x14, 0x00, 0x00, 0xe0, 0x3f);
+    rl_pb6(text, 0xf2, 0x0f, 0x10, 0x4c, 0x24, 0x10);
+    rl_pb4(text, 0xf2, 0x0f, 0x58, 0xc1);
     // cvttsd2siq %xmm0, %r13 (rounded 6-digit value)
-    pb5(text, 0xf2, 0x4c, 0x0f, 0x2c, 0xe8);
+    rl_pb5(text, 0xf2, 0x4c, 0x0f, 0x2c, 0xe8);
     // Handle overflow: if r13 >= 1000000, increment r12, sub 1000000 from r13
-    pb7(text, 0x49, 0x81, 0xfd, 0x40, 0x42, 0x0f, 0x00);
+    rl_pb7(text, 0x49, 0x81, 0xfd, 0x40, 0x42, 0x0f, 0x00);
     var pfloat_jl_ovf: i64 = text.len();
-    pb2(text, 0x7c, 0x00);
-    pb3(text, 0x49, 0xff, 0xc4);
-    pb7(text, 0x49, 0x81, 0xed, 0x40, 0x42, 0x0f, 0x00);
+    rl_pb2(text, 0x7c, 0x00);
+    rl_pb3(text, 0x49, 0xff, 0xc4);
+    rl_pb7(text, 0x49, 0x81, 0xed, 0x40, 0x42, 0x0f, 0x00);
     var pfloat_no_ovf: i64 = text.len();
     var jl_ovf_off: i64 = (pfloat_no_ovf - pfloat_jl_ovf - 2) & 0xFF;
     text.set(pfloat_jl_ovf + 1, (jl_ovf_off) & 0xFF);
     // Print integer part: movq %r12, %rdi ; call p_print_int
-    pb3(text, 0x4c, 0x89, 0xe7);
-    pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
+    rl_pb3(text, 0x4c, 0x89, 0xe7);
+    rl_pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
     var pfloat_call1_off: i64 = text.len() - 4;
     // Check if r13 (frac digits) is zero
-    pb3(text, 0x4d, 0x85, 0xed);
+    rl_pb3(text, 0x4d, 0x85, 0xed);
     // je .done (no fractional part) -- use rel32
     var pfloat_je_done: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0x00, 0x00, 0x00, 0x00);
+    rl_pb6(text, 0x0f, 0x84, 0x00, 0x00, 0x00, 0x00);
     // Print "."
-    pb5(text, 0xc6, 0x44, 0x24, 0x10, 0x2e);
-    pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
-    pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
-    pb5(text, 0x48, 0x8d, 0x74, 0x24, 0x10);
-    pb5(text, 0xba, 0x01, 0x00, 0x00, 0x00);
-    pb2(text, 0x0f, 0x05);
+    rl_pb5(text, 0xc6, 0x44, 0x24, 0x10, 0x2e);
+    rl_pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0x48, 0x8d, 0x74, 0x24, 0x10);
+    rl_pb5(text, 0xba, 0x01, 0x00, 0x00, 0x00);
+    rl_pb2(text, 0x0f, 0x05);
     // Convert r13 to 6-digit zero-padded string (build in reverse at 24..30(%rsp))
     // leaq 30(%rsp), %r14 (buffer end, fill backwards)
-    pb5(text, 0x4c, 0x8d, 0x74, 0x24, 0x1e);
+    rl_pb5(text, 0x4c, 0x8d, 0x74, 0x24, 0x1e);
     // movq %r13, %rax
-    pb3(text, 0x4c, 0x89, 0xe8);
+    rl_pb3(text, 0x4c, 0x89, 0xe8);
     // movl $6, %r12d (digit counter)
-    pb6(text, 0x41, 0xbc, 0x06, 0x00, 0x00, 0x00);
+    rl_pb6(text, 0x41, 0xbc, 0x06, 0x00, 0x00, 0x00);
     // .digit_loop:
     var pfloat_dloop: i64 = text.len();
-    pb3(text, 0x49, 0xff, 0xce);
-    pb3(text, 0x48, 0x31, 0xd2);
-    pb5(text, 0xb9, 0x0a, 0x00, 0x00, 0x00);
-    pb3(text, 0x48, 0xf7, 0xf1);
-    pb3(text, 0x80, 0xc2, 0x30);
-    pb3(text, 0x41, 0x88, 0x16);
-    pb3(text, 0x49, 0xff, 0xcc);
-    pb3(text, 0x4d, 0x85, 0xe4);
+    rl_pb3(text, 0x49, 0xff, 0xce);
+    rl_pb3(text, 0x48, 0x31, 0xd2);
+    rl_pb5(text, 0xb9, 0x0a, 0x00, 0x00, 0x00);
+    rl_pb3(text, 0x48, 0xf7, 0xf1);
+    rl_pb3(text, 0x80, 0xc2, 0x30);
+    rl_pb3(text, 0x41, 0x88, 0x16);
+    rl_pb3(text, 0x49, 0xff, 0xcc);
+    rl_pb3(text, 0x4d, 0x85, 0xe4);
     var pfloat_dloop_jne: i64 = text.len();
-    pb2(text, 0x75, 0x00);
+    rl_pb2(text, 0x75, 0x00);
     var pfloat_dloop_end: i64 = text.len();
     var dloop_offset: i64 = (pfloat_dloop - pfloat_dloop_end) & 0xFF;
     text.set(pfloat_dloop_jne + 1, (dloop_offset) & 0xFF);
     // r14 points to start of 6-digit string. Set r12 = 6 for strip_zeros.
-    pb6(text, 0x41, 0xbc, 0x06, 0x00, 0x00, 0x00);
+    rl_pb6(text, 0x41, 0xbc, 0x06, 0x00, 0x00, 0x00);
     // .strip_zeros: find last non-'0' digit
-    pb3(text, 0x4d, 0x89, 0xe5);
+    rl_pb3(text, 0x4d, 0x89, 0xe5);
     // .strip_loop:
     var pfloat_strip_loop: i64 = text.len();
-    pb3(text, 0x4d, 0x85, 0xed);
+    rl_pb3(text, 0x4d, 0x85, 0xed);
     var pfloat_jz_print: i64 = text.len();
-    pb2(text, 0x74, 0x00);
-    pb3(text, 0x49, 0xff, 0xcd);
+    rl_pb2(text, 0x74, 0x00);
+    rl_pb3(text, 0x49, 0xff, 0xcd);
     // cmpb '0', (%r14,%r13): REX.X=1(r13), REX.B=1(r14) -> 0x43
     // ModRM: mod=00, reg=111(cmp), rm=100(SIB) -> 0x3C
     // SIB: scale=00, index=101(r13), base=110(r14) -> 0x2E
-    pb5(text, 0x43, 0x80, 0x3c, 0x2e, 0x30);
+    rl_pb5(text, 0x43, 0x80, 0x3c, 0x2e, 0x30);
     var je_strip_loop: i64 = text.len();
     var strip_rel: i64 = (pfloat_strip_loop - je_strip_loop - 2) & 0xFF;
-    pb2(text, 0x74, (strip_rel) & 0xFF);
-    pb3(text, 0x49, 0xff, 0xc5);
+    rl_pb2(text, 0x74, (strip_rel) & 0xFF);
+    rl_pb3(text, 0x49, 0xff, 0xc5);
     // .print_digits:
     var pfloat_print_dig: i64 = text.len();
     var jz_print_off: i64 = (pfloat_print_dig - pfloat_jz_print - 2) & 0xFF;
     text.set(pfloat_jz_print + 1, (jz_print_off) & 0xFF);
     // If r13 == 0, skip
-    pb3(text, 0x4d, 0x85, 0xed);
+    rl_pb3(text, 0x4d, 0x85, 0xed);
     var pfloat_jz_done: i64 = text.len();
-    pb2(text, 0x74, 0x00);
+    rl_pb2(text, 0x74, 0x00);
     // write(1, %r14, %r13)
-    pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
-    pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
-    pb3(text, 0x4c, 0x89, 0xf6);
-    pb3(text, 0x4c, 0x89, 0xea);
-    pb2(text, 0x0f, 0x05);
+    rl_pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
+    rl_pb3(text, 0x4c, 0x89, 0xf6);
+    rl_pb3(text, 0x4c, 0x89, 0xea);
+    rl_pb2(text, 0x0f, 0x05);
     // .done:
     var pfloat_done: i64 = text.len();
     var jz_done_off: i64 = (pfloat_done - pfloat_jz_done - 2) & 0xFF;
@@ -615,10 +618,10 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.set(pfloat_jmp_done + 2, (jmp_done_off >> 16) & 0xFF);
     text.set(pfloat_jmp_done + 3, (jmp_done_off >> 24) & 0xFF);
     // Epilogue
-    pb4(text, 0x48, 0x83, 0xc4, 0x38);
-    pb2(text, 0x41, 0x5e);
-    pb2(text, 0x41, 0x5d);
-    pb2(text, 0x41, 0x5c);
+    rl_pb4(text, 0x48, 0x83, 0xc4, 0x38);
+    rl_pb2(text, 0x41, 0x5e);
+    rl_pb2(text, 0x41, 0x5d);
+    rl_pb2(text, 0x41, 0x5c);
     text.push(0x5b & 0xFF);
     text.push(0xc3 & 0xFF);
     // p_panic(rdi = *u8 message)
@@ -649,35 +652,35 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // =======================================================================
     add_sym(symbols, text, "p_panic");
     text.push(0x53 & 0xFF);
-    pb3(text, 0x48, 0x89, 0xfb);
-    pb3(text, 0x48, 0x89, 0xf9);
-    pb3(text, 0x48, 0x31, 0xc0);
+    rl_pb3(text, 0x48, 0x89, 0xfb);
+    rl_pb3(text, 0x48, 0x89, 0xf9);
+    rl_pb3(text, 0x48, 0x31, 0xc0);
     var panic_loop: i64 = text.len();
-    pb3(text, 0x80, 0x39, 0x00);
-    pb2(text, 0x74, 0x08);
-    pb3(text, 0x48, 0xff, 0xc1);
-    pb3(text, 0x48, 0xff, 0xc0);
+    rl_pb3(text, 0x80, 0x39, 0x00);
+    rl_pb2(text, 0x74, 0x08);
+    rl_pb3(text, 0x48, 0xff, 0xc1);
+    rl_pb3(text, 0x48, 0xff, 0xc0);
     var jmp_back3: i64 = text.len();
     var back3: i64 = panic_loop - jmp_back3 - 2;
-    pb2(text, 0xeb, (back3) & 0xFF);
+    rl_pb2(text, 0xeb, (back3) & 0xFF);
     // done:
-    pb5(text, 0xbf, 0x02, 0x00, 0x00, 0x00);
-    pb3(text, 0x48, 0x89, 0xde);
-    pb3(text, 0x48, 0x89, 0xc2);
-    pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
-    pb2(text, 0x0f, 0x05);
+    rl_pb5(text, 0xbf, 0x02, 0x00, 0x00, 0x00);
+    rl_pb3(text, 0x48, 0x89, 0xde);
+    rl_pb3(text, 0x48, 0x89, 0xc2);
+    rl_pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
+    rl_pb2(text, 0x0f, 0x05);
     // write newline
-    pb5(text, 0xbf, 0x02, 0x00, 0x00, 0x00);
-    pb7(text, 0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xbf, 0x02, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00);
     var panic_nl_lea: i64 = text.len() - 4;
-    pb5(text, 0xba, 0x01, 0x00, 0x00, 0x00);
-    pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
-    pb2(text, 0x0f, 0x05);
+    rl_pb5(text, 0xba, 0x01, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
+    rl_pb2(text, 0x0f, 0x05);
     // exit(1)
-    pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
-    pb5(text, 0xb8, 0x3c, 0x00, 0x00, 0x00);
-    pb2(text, 0x0f, 0x05);
-    pb2(text, 0x0f, 0x0b);
+    rl_pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xb8, 0x3c, 0x00, 0x00, 0x00);
+    rl_pb2(text, 0x0f, 0x05);
+    rl_pb2(text, 0x0f, 0x0b);
     // =======================================================================
     // p_malloc(rdi = size) -> rax = pointer
     // Uses mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
@@ -698,33 +701,33 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // =======================================================================
     add_sym(symbols, text, "p_malloc");
     // addq $4095, %rdi -> 48 81 C7 FF 0F 00 00
-    pb7(text, 0x48, 0x81, 0xc7, 0xff, 0x0f, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0x81, 0xc7, 0xff, 0x0f, 0x00, 0x00);
     // andq $-4096, %rdi -> 48 81 E7 00 F0 FF FF
-    pb7(text, 0x48, 0x81, 0xe7, 0x00, 0xf0, 0xff, 0xff);
+    rl_pb7(text, 0x48, 0x81, 0xe7, 0x00, 0xf0, 0xff, 0xff);
     // movq %rdi, %rsi -> 48 89 FE
-    pb3(text, 0x48, 0x89, 0xfe);
+    rl_pb3(text, 0x48, 0x89, 0xfe);
     // xorq %rdi, %rdi -> 48 31 FF
-    pb3(text, 0x48, 0x31, 0xff);
+    rl_pb3(text, 0x48, 0x31, 0xff);
     // movl $3, %edx -> BA 03 00 00 00
-    pb5(text, 0xba, 0x03, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xba, 0x03, 0x00, 0x00, 0x00);
     // movl $34, %r10d -> 41 BA 22 00 00 00
-    pb6(text, 0x41, 0xba, 0x22, 0x00, 0x00, 0x00);
+    rl_pb6(text, 0x41, 0xba, 0x22, 0x00, 0x00, 0x00);
     // movl $-1, %r8d -> 41 B8 FF FF FF FF
     // movq $-1, %r8 -> 49 C7 C0 FF FF FF FF (REX.W+B, C7 /0, imm32 sign-extended)
-    pb7(text, 0x49, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff);
+    rl_pb7(text, 0x49, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff);
     // xorq %r9, %r9 -> 4D 31 C9
-    pb3(text, 0x4d, 0x31, 0xc9);
+    rl_pb3(text, 0x4d, 0x31, 0xc9);
     // movl $9, %eax -> B8 09 00 00 00
-    pb5(text, 0xb8, 0x09, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xb8, 0x09, 0x00, 0x00, 0x00);
     // syscall -> 0F 05
-    pb2(text, 0x0f, 0x05);
+    rl_pb2(text, 0x0f, 0x05);
     text.push(0xc3 & 0xFF);
     // =======================================================================
     // p_alloc(rdi = size) -> rax = pointer (alias for p_malloc)
     // jmp p_malloc -> E9 XX XX XX XX
     // =======================================================================
     add_sym(symbols, text, "p_alloc");
-    pb5(text, 0xe9, 0x00, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xe9, 0x00, 0x00, 0x00, 0x00);
     var palloc_jmp_off: i64 = text.len() - 4;
     // =======================================================================
     // p_free(rdi = pointer)
@@ -735,9 +738,9 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // ret -> C3
     // =======================================================================
     add_sym(symbols, text, "p_free");
-    pb5(text, 0xbe, 0x00, 0x10, 0x00, 0x00);
-    pb5(text, 0xb8, 0x0b, 0x00, 0x00, 0x00);
-    pb2(text, 0x0f, 0x05);
+    rl_pb5(text, 0xbe, 0x00, 0x10, 0x00, 0x00);
+    rl_pb5(text, 0xb8, 0x0b, 0x00, 0x00, 0x00);
+    rl_pb2(text, 0x0f, 0x05);
     text.push(0xc3 & 0xFF);
     // =======================================================================
     // p_region_free(rdi = pointer) -- I-1C: Region Bulk Free
@@ -748,7 +751,7 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // jmp p_free -> E9 XX XX XX XX
     // =======================================================================
     add_sym(symbols, text, "p_region_free");
-    pb5(text, 0xe9, 0x00, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xe9, 0x00, 0x00, 0x00, 0x00);
     var pregion_free_jmp_off: i64 = text.len() - 4;
     // Simplified: allocate 4096 bytes, copy both strings.
     // pushq %rbx ; pushq %r12 ; pushq %r13 ; pushq %r14
@@ -766,40 +769,40 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // =======================================================================
     add_sym(symbols, text, "p_str_concat");
     text.push(0x53 & 0xFF);
-    pb2(text, 0x41, 0x54);
-    pb2(text, 0x41, 0x55);
-    pb2(text, 0x41, 0x56);
-    pb3(text, 0x48, 0x89, 0xfb);
-    pb3(text, 0x49, 0x89, 0xf4);
-    pb5(text, 0xbf, 0x00, 0x10, 0x00, 0x00);
-    pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
+    rl_pb2(text, 0x41, 0x54);
+    rl_pb2(text, 0x41, 0x55);
+    rl_pb2(text, 0x41, 0x56);
+    rl_pb3(text, 0x48, 0x89, 0xfb);
+    rl_pb3(text, 0x49, 0x89, 0xf4);
+    rl_pb5(text, 0xbf, 0x00, 0x10, 0x00, 0x00);
+    rl_pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
     var pstrcat_call_off: i64 = text.len() - 4;
-    pb3(text, 0x49, 0x89, 0xc5);
-    pb3(text, 0x48, 0x89, 0xc1);
-    pb3(text, 0x48, 0x89, 0xde);
+    rl_pb3(text, 0x49, 0x89, 0xc5);
+    rl_pb3(text, 0x48, 0x89, 0xc1);
+    rl_pb3(text, 0x48, 0x89, 0xde);
     // copy_loop_a:
     var concat_loop_a: i64 = text.len();
     // movb (%rsi), %al -> 8A 06
-    pb2(text, 0x8a, 0x06);
+    rl_pb2(text, 0x8a, 0x06);
     // testq %rax, %rax -> 84 C0
-    pb2(text, 0x84, 0xc0);
+    rl_pb2(text, 0x84, 0xc0);
     // je copy_b -> 74 XX
     var concat_je_a: i64 = text.len();
-    pb2(text, 0x74, 0x00);
+    rl_pb2(text, 0x74, 0x00);
     // movb %al, (%rcx) -> 88 01
-    pb2(text, 0x88, 0x01);
+    rl_pb2(text, 0x88, 0x01);
     // incq %rsi -> 48 FF C6
-    pb3(text, 0x48, 0xff, 0xc6);
+    rl_pb3(text, 0x48, 0xff, 0xc6);
     // incq %rcx -> 48 FF C1
-    pb3(text, 0x48, 0xff, 0xc1);
+    rl_pb3(text, 0x48, 0xff, 0xc1);
     // jmp copy_loop_a
     var jmp_back4: i64 = text.len();
     var back4: i64 = concat_loop_a - jmp_back4 - 2;
-    pb2(text, 0xeb, (back4) & 0xFF);
+    rl_pb2(text, 0xeb, (back4) & 0xFF);
     // copy_b:
     var concat_copy_b: i64 = text.len();
     text.set(concat_je_a + 1, (concat_copy_b - concat_je_a - 2) & 0xFF);
-    pb3(text, 0x48, 0x89, 0xe6);
+    rl_pb3(text, 0x48, 0x89, 0xe6);
     // Actually: movq %r12, %rsi -> 4C 89 E6
     // I wrote 48 89 E6 which is movq %rsp, %rsi -- wrong! Fix:
     // Let me redo this. The previous bytes were wrong. Let me overwrite.
@@ -812,26 +815,26 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.set(concat_copy_b, 0x4c & 0xFF); // Fix: REX.R for r12
     // copy_loop_b:
     var concat_loop_b: i64 = concat_copy_b + 3;
-    pb2(text, 0x8a, 0x06);
-    pb2(text, 0x84, 0xc0);
+    rl_pb2(text, 0x8a, 0x06);
+    rl_pb2(text, 0x84, 0xc0);
     var concat_je_b: i64 = text.len();
-    pb2(text, 0x74, 0x00);
-    pb2(text, 0x88, 0x01);
-    pb3(text, 0x48, 0xff, 0xc6);
-    pb3(text, 0x48, 0xff, 0xc1);
+    rl_pb2(text, 0x74, 0x00);
+    rl_pb2(text, 0x88, 0x01);
+    rl_pb3(text, 0x48, 0xff, 0xc6);
+    rl_pb3(text, 0x48, 0xff, 0xc1);
     var jmp_back5: i64 = text.len();
     var back5: i64 = concat_loop_b - jmp_back5 - 2;
-    pb2(text, 0xeb, (back5) & 0xFF);
+    rl_pb2(text, 0xeb, (back5) & 0xFF);
     // done:
     var concat_done: i64 = text.len();
     text.set(concat_je_b + 1, (concat_done - concat_je_b - 2) & 0xFF);
     // movb $0, (%rcx) -> C6 01 00
-    pb3(text, 0xc6, 0x01, 0x00);
+    rl_pb3(text, 0xc6, 0x01, 0x00);
     // movq %r13, %rax -> 4C 89 E8
-    pb3(text, 0x4c, 0x89, 0xe8);
-    pb2(text, 0x41, 0x5e);
-    pb2(text, 0x41, 0x5d);
-    pb2(text, 0x41, 0x5c);
+    rl_pb3(text, 0x4c, 0x89, 0xe8);
+    rl_pb2(text, 0x41, 0x5e);
+    rl_pb2(text, 0x41, 0x5d);
+    rl_pb2(text, 0x41, 0x5c);
     text.push(0x5b & 0xFF);
     text.push(0xc3 & 0xFF);
     // =======================================================================
@@ -858,125 +861,125 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     add_sym(symbols, text, "p_to_str");
     // pushq %rbx ; pushq %r12 ; pushq %r13 ; pushq %r14
     text.push(0x53 & 0xFF);
-    pb2(text, 0x41, 0x54);
-    pb2(text, 0x41, 0x55);
-    pb2(text, 0x41, 0x56);
-    pb4(text, 0x48, 0x83, 0xec, 0x20);
+    rl_pb2(text, 0x41, 0x54);
+    rl_pb2(text, 0x41, 0x55);
+    rl_pb2(text, 0x41, 0x56);
+    rl_pb4(text, 0x48, 0x83, 0xec, 0x20);
     // movq %rdi, %r12  (working copy for digit conversion)
-    pb3(text, 0x49, 0x89, 0xfc);
+    rl_pb3(text, 0x49, 0x89, 0xfc);
     // movq %rdi, %r14  (save original value for sign check -- rdi gets clobbered by p_malloc)
-    pb3(text, 0x49, 0x89, 0xfe);
+    rl_pb3(text, 0x49, 0x89, 0xfe);
     // movl $32, %edi ; call p_malloc
-    pb5(text, 0xbf, 0x20, 0x00, 0x00, 0x00);
-    pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xbf, 0x20, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
     var pts_call_off: i64 = text.len() - 4;
     // movq %rax, %rbx  (buffer pointer)
-    pb3(text, 0x48, 0x89, 0xc3);
+    rl_pb3(text, 0x48, 0x89, 0xc3);
     // leaq 31(%rbx), %r13  (r13 = buffer end, write backwards)
     // 4C 8D 6B 1F
-    pb4(text, 0x4c, 0x8d, 0x6b, 0x1f);
+    rl_pb4(text, 0x4c, 0x8d, 0x6b, 0x1f);
     // movb $0, (%r13)  (null terminator)
     // 41 C6 45 00 00
-    pb5(text, 0x41, 0xc6, 0x45, 0x00, 0x00);
+    rl_pb5(text, 0x41, 0xc6, 0x45, 0x00, 0x00);
     // testq %r12, %r12 -> 4D 85 E4
-    pb3(text, 0x4d, 0x85, 0xe4);
+    rl_pb3(text, 0x4d, 0x85, 0xe4);
     // jne .notzero
     var pts_jne: i64 = text.len();
-    pb2(text, 0x75, 0x00);
+    rl_pb2(text, 0x75, 0x00);
     // zero case: decq %r13; movb $48, (%r13) ('0'); jmp .done
-    pb3(text, 0x49, 0xff, 0xcd);
-    pb5(text, 0x41, 0xc6, 0x45, 0x00, 0x30);
+    rl_pb3(text, 0x49, 0xff, 0xcd);
+    rl_pb5(text, 0x41, 0xc6, 0x45, 0x00, 0x30);
     var pts_jmp_done: i64 = text.len();
-    pb2(text, 0xeb, 0x00);
+    rl_pb2(text, 0xeb, 0x00);
     // .notzero:
     var pts_notzero: i64 = text.len();
     text.set(pts_jne + 1, (pts_notzero - pts_jne - 2) & 0xFF);
     // jns .pos -> 79 XX
     var pts_jns: i64 = text.len();
-    pb2(text, 0x79, 0x00);
+    rl_pb2(text, 0x79, 0x00);
     // negq %r12 -> 49 F7 DC
-    pb3(text, 0x49, 0xf7, 0xdc);
+    rl_pb3(text, 0x49, 0xf7, 0xdc);
     // .pos:
     var pts_pos: i64 = text.len();
     text.set(pts_jns + 1, (pts_pos - pts_jns - 2) & 0xFF);
     // .digit_loop:
     var pts_loop: i64 = text.len();
     // testq %r12, %r12 -> 4D 85 E4
-    pb3(text, 0x4d, 0x85, 0xe4);
+    rl_pb3(text, 0x4d, 0x85, 0xe4);
     // je .digits_done
     var pts_je_done: i64 = text.len();
-    pb2(text, 0x74, 0x00);
+    rl_pb2(text, 0x74, 0x00);
     // movq %r12, %rax -> 4C 89 E0
-    pb3(text, 0x4c, 0x89, 0xe0);
+    rl_pb3(text, 0x4c, 0x89, 0xe0);
     // xorq %rdx, %rdx -> 48 31 D2
-    pb3(text, 0x48, 0x31, 0xd2);
+    rl_pb3(text, 0x48, 0x31, 0xd2);
     // movq $10, %rcx -> 48 C7 C1 0A 00 00 00
-    pb7(text, 0x48, 0xc7, 0xc1, 0x0a, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0xc7, 0xc1, 0x0a, 0x00, 0x00, 0x00);
     // divq %rcx -> 48 F7 F1
-    pb3(text, 0x48, 0xf7, 0xf1);
+    rl_pb3(text, 0x48, 0xf7, 0xf1);
     // movq %rax, %r12 -> 4C 89 E4 (wait, that's movq %r12, %rsp! Need 4C 89 C4)
     // Actually: movq %rax, %r12 -> REX.R=1, ModRM C4 -> 4C 89 C4
-    pb3(text, 0x49, 0x89, 0xc4);
+    rl_pb3(text, 0x49, 0x89, 0xc4);
     // addq $48, %rdx -> 48 83 C2 30
-    pb4(text, 0x48, 0x83, 0xc2, 0x30);
+    rl_pb4(text, 0x48, 0x83, 0xc2, 0x30);
     // decq %r13 -> 49 FF CD
-    pb3(text, 0x49, 0xff, 0xcd);
+    rl_pb3(text, 0x49, 0xff, 0xcd);
     // movb %dl, (%r13) -> 41 88 55 00
-    pb4(text, 0x41, 0x88, 0x55, 0x00);
+    rl_pb4(text, 0x41, 0x88, 0x55, 0x00);
     // jmp .digit_loop
     var pts_jmp_loop: i64 = text.len();
     var pts_back: i64 = pts_loop - pts_jmp_loop - 2;
-    pb2(text, 0xeb, (pts_back) & 0xFF);
+    rl_pb2(text, 0xeb, (pts_back) & 0xFF);
     // .digits_done:
     var pts_digits_done: i64 = text.len();
     text.set(pts_je_done + 1, (pts_digits_done - pts_je_done - 2) & 0xFF);
     // Check original sign: testq %r14, %r14 -> 4D 85 F6
-    pb3(text, 0x4d, 0x85, 0xf6);
+    rl_pb3(text, 0x4d, 0x85, 0xf6);
     // jns .done
     var pts_jns2: i64 = text.len();
-    pb2(text, 0x79, 0x00);
+    rl_pb2(text, 0x79, 0x00);
     // decq %r13; movb $45, (%r13) ('-')
-    pb3(text, 0x49, 0xff, 0xcd);
-    pb5(text, 0x41, 0xc6, 0x45, 0x00, 0x2d);
+    rl_pb3(text, 0x49, 0xff, 0xcd);
+    rl_pb5(text, 0x41, 0xc6, 0x45, 0x00, 0x2d);
     // .done:
     var pts_done: i64 = text.len();
     text.set(pts_jmp_done + 1, (pts_done - pts_jmp_done - 2) & 0xFF);
     text.set(pts_jns2 + 1, (pts_done - pts_jns2 - 2) & 0xFF);
     // Now r13 points to the start of the string. Copy it to the beginning of the buffer (rbx).
     // movq %r13, %rsi -> 4C 89 EE
-    pb3(text, 0x4c, 0x89, 0xee);
+    rl_pb3(text, 0x4c, 0x89, 0xee);
     // movq %rbx, %rdi -> 48 89 DF
-    pb3(text, 0x48, 0x89, 0xdf);
+    rl_pb3(text, 0x48, 0x89, 0xdf);
     // .copy_loop:
     var pts_copy_loop: i64 = text.len();
     // movb (%rsi), %al -> 8A 06
-    pb2(text, 0x8a, 0x06);
+    rl_pb2(text, 0x8a, 0x06);
     // movb %al, (%rdi) -> 88 07
-    pb2(text, 0x88, 0x07);
+    rl_pb2(text, 0x88, 0x07);
     // testq %rax, %rax -> 84 C0
-    pb2(text, 0x84, 0xc0);
+    rl_pb2(text, 0x84, 0xc0);
     // je .copy_done
     var pts_je_copy: i64 = text.len();
-    pb2(text, 0x74, 0x00);
+    rl_pb2(text, 0x74, 0x00);
     // incq %rsi -> 48 FF C6
-    pb3(text, 0x48, 0xff, 0xc6);
+    rl_pb3(text, 0x48, 0xff, 0xc6);
     // incq %rdi -> 48 FF C7
-    pb3(text, 0x48, 0xff, 0xc7);
+    rl_pb3(text, 0x48, 0xff, 0xc7);
     // jmp .copy_loop
     var pts_jmp_copy: i64 = text.len();
     var pts_copy_back: i64 = pts_copy_loop - pts_jmp_copy - 2;
-    pb2(text, 0xeb, (pts_copy_back) & 0xFF);
+    rl_pb2(text, 0xeb, (pts_copy_back) & 0xFF);
     // .copy_done:
     var pts_copy_done: i64 = text.len();
     text.set(pts_je_copy + 1, (pts_copy_done - pts_je_copy - 2) & 0xFF);
     // movq %rbx, %rax -> 48 89 D8
-    pb3(text, 0x48, 0x89, 0xd8);
+    rl_pb3(text, 0x48, 0x89, 0xd8);
     // addq $32, %rsp
-    pb4(text, 0x48, 0x83, 0xc4, 0x20);
+    rl_pb4(text, 0x48, 0x83, 0xc4, 0x20);
     // popq %r14 ; popq %r13 ; popq %r12 ; popq %rbx
-    pb2(text, 0x41, 0x5e);
-    pb2(text, 0x41, 0x5d);
-    pb2(text, 0x41, 0x5c);
+    rl_pb2(text, 0x41, 0x5e);
+    rl_pb2(text, 0x41, 0x5d);
+    rl_pb2(text, 0x41, 0x5c);
     text.push(0x5b & 0xFF);
     text.push(0xc3 & 0xFF);
     // =======================================================================
@@ -987,177 +990,177 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     add_sym(symbols, text, "p_float_to_str");
     // pushq %rbx ; pushq %r12 ; pushq %r13 ; pushq %r14
     text.push(0x53 & 0xFF);
-    pb2(text, 0x41, 0x54);
-    pb2(text, 0x41, 0x55);
-    pb2(text, 0x41, 0x56);
+    rl_pb2(text, 0x41, 0x54);
+    rl_pb2(text, 0x41, 0x55);
+    rl_pb2(text, 0x41, 0x56);
     // subq $56, %rsp
-    pb4(text, 0x48, 0x83, 0xec, 0x38);
+    rl_pb4(text, 0x48, 0x83, 0xec, 0x38);
     // Store double bits at (%rsp), load into xmm0
-    pb4(text, 0x48, 0x89, 0x3c, 0x24);
-    pb5(text, 0xf2, 0x0f, 0x10, 0x04, 0x24);
+    rl_pb4(text, 0x48, 0x89, 0x3c, 0x24);
+    rl_pb5(text, 0xf2, 0x0f, 0x10, 0x04, 0x24);
     // Allocate 32-byte buffer with p_malloc
-    pb5(text, 0xbf, 0x20, 0x00, 0x00, 0x00);
-    pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xbf, 0x20, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
     var pfts_malloc_off: i64 = text.len() - 4;
-    pb3(text, 0x48, 0x89, 0xc3);
-    pb3(text, 0x49, 0x89, 0xde);
+    rl_pb3(text, 0x48, 0x89, 0xc3);
+    rl_pb3(text, 0x49, 0x89, 0xde);
     // Check if zero
-    pb9(text, 0x48, 0xc7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x00);
-    pb6(text, 0xf2, 0x0f, 0x10, 0x4c, 0x24, 0x08);
-    pb4(text, 0x66, 0x0f, 0x2e, 0xc1);
+    rl_pb9(text, 0x48, 0xc7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x00);
+    rl_pb6(text, 0xf2, 0x0f, 0x10, 0x4c, 0x24, 0x08);
+    rl_pb4(text, 0x66, 0x0f, 0x2e, 0xc1);
     var pfts_jp: i64 = text.len();
-    pb2(text, 0x7a, 0x00);
+    rl_pb2(text, 0x7a, 0x00);
     var pfts_jne: i64 = text.len();
-    pb2(text, 0x75, 0x00);
+    rl_pb2(text, 0x75, 0x00);
     // .print_zero: write "0"
-    pb4(text, 0x41, 0xc6, 0x06, 0x30);
-    pb3(text, 0x49, 0xff, 0xc6);
+    rl_pb4(text, 0x41, 0xc6, 0x06, 0x30);
+    rl_pb3(text, 0x49, 0xff, 0xc6);
     // jmp .null_term (use rel32 since distance > 127)
-    pb5(text, 0xe9, 0x00, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xe9, 0x00, 0x00, 0x00, 0x00);
     var pfts_jmp_null: i64 = text.len() - 4;
     // .not_zero:
     var pfts_notzero: i64 = text.len();
     text.set(pfts_jp + 1, (pfts_notzero - pfts_jp - 2) & 0xFF);
     text.set(pfts_jne + 1, (pfts_notzero - pfts_jne - 2) & 0xFF);
     // Check negative
-    pb4(text, 0x48, 0x8b, 0x04, 0x24);
-    pb5(text, 0x48, 0x0f, 0xba, 0xe0, 0x3f);
+    rl_pb4(text, 0x48, 0x8b, 0x04, 0x24);
+    rl_pb5(text, 0x48, 0x0f, 0xba, 0xe0, 0x3f);
     var pfts_jnc: i64 = text.len();
-    pb2(text, 0x73, 0x00);
+    rl_pb2(text, 0x73, 0x00);
     // Negative: negate, write '-'
-    pb5(text, 0x48, 0x0f, 0xba, 0xf8, 0x3f);
-    pb4(text, 0x48, 0x89, 0x04, 0x24);
-    pb5(text, 0xf2, 0x0f, 0x10, 0x04, 0x24);
-    pb4(text, 0x41, 0xc6, 0x06, 0x2d);
-    pb3(text, 0x49, 0xff, 0xc6);
+    rl_pb5(text, 0x48, 0x0f, 0xba, 0xf8, 0x3f);
+    rl_pb4(text, 0x48, 0x89, 0x04, 0x24);
+    rl_pb5(text, 0xf2, 0x0f, 0x10, 0x04, 0x24);
+    rl_pb4(text, 0x41, 0xc6, 0x06, 0x2d);
+    rl_pb3(text, 0x49, 0xff, 0xc6);
     // .positive:
     var pfts_positive: i64 = text.len();
     text.set(pfts_jnc + 1, (pfts_positive - pfts_jnc - 2) & 0xFF);
     // cvttsd2siq %xmm0, %r12 (integer part)
-    pb5(text, 0xf2, 0x4c, 0x0f, 0x2c, 0xe0);
+    rl_pb5(text, 0xf2, 0x4c, 0x0f, 0x2c, 0xe0);
     // cvtsi2sdq %r12, %xmm1 ; subsd -> frac
-    pb5(text, 0xf2, 0x49, 0x0f, 0x2a, 0xcc);
-    pb4(text, 0xf2, 0x0f, 0x5c, 0xc1);
+    rl_pb5(text, 0xf2, 0x49, 0x0f, 0x2a, 0xcc);
+    rl_pb4(text, 0xf2, 0x0f, 0x5c, 0xc1);
     // Multiply frac by 10^6 + 0.5
-    pb8(text, 0xc7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x00);
-    pb8(text, 0xc7, 0x44, 0x24, 0x0c, 0x80, 0x84, 0x2e, 0x41);
-    pb6(text, 0xf2, 0x0f, 0x10, 0x4c, 0x24, 0x08);
-    pb4(text, 0xf2, 0x0f, 0x59, 0xc1);
-    pb8(text, 0xc7, 0x44, 0x24, 0x10, 0x00, 0x00, 0x00, 0x00);
-    pb8(text, 0xc7, 0x44, 0x24, 0x14, 0x00, 0x00, 0xe0, 0x3f);
-    pb6(text, 0xf2, 0x0f, 0x10, 0x4c, 0x24, 0x10);
-    pb4(text, 0xf2, 0x0f, 0x58, 0xc1);
-    pb5(text, 0xf2, 0x4c, 0x0f, 0x2c, 0xe8);
+    rl_pb8(text, 0xc7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x00);
+    rl_pb8(text, 0xc7, 0x44, 0x24, 0x0c, 0x80, 0x84, 0x2e, 0x41);
+    rl_pb6(text, 0xf2, 0x0f, 0x10, 0x4c, 0x24, 0x08);
+    rl_pb4(text, 0xf2, 0x0f, 0x59, 0xc1);
+    rl_pb8(text, 0xc7, 0x44, 0x24, 0x10, 0x00, 0x00, 0x00, 0x00);
+    rl_pb8(text, 0xc7, 0x44, 0x24, 0x14, 0x00, 0x00, 0xe0, 0x3f);
+    rl_pb6(text, 0xf2, 0x0f, 0x10, 0x4c, 0x24, 0x10);
+    rl_pb4(text, 0xf2, 0x0f, 0x58, 0xc1);
+    rl_pb5(text, 0xf2, 0x4c, 0x0f, 0x2c, 0xe8);
     // Overflow check
-    pb7(text, 0x49, 0x81, 0xfd, 0x40, 0x42, 0x0f, 0x00);
+    rl_pb7(text, 0x49, 0x81, 0xfd, 0x40, 0x42, 0x0f, 0x00);
     var pfts_jl_ovf: i64 = text.len();
-    pb2(text, 0x7c, 0x00);
-    pb3(text, 0x49, 0xff, 0xc4);
-    pb7(text, 0x49, 0x81, 0xed, 0x40, 0x42, 0x0f, 0x00);
+    rl_pb2(text, 0x7c, 0x00);
+    rl_pb3(text, 0x49, 0xff, 0xc4);
+    rl_pb7(text, 0x49, 0x81, 0xed, 0x40, 0x42, 0x0f, 0x00);
     var pfts_no_ovf: i64 = text.len();
     text.set(pfts_jl_ovf + 1, (pfts_no_ovf - pfts_jl_ovf - 2) & 0xFF);
     // Convert integer part (r12) to string at r14 (build in reverse at 24(%rsp))
     // leaq 30(%rsp), %rsi
-    pb5(text, 0x48, 0x8d, 0x74, 0x24, 0x1e);
+    rl_pb5(text, 0x48, 0x8d, 0x74, 0x24, 0x1e);
     // .int_loop:
     var pfts_int_loop: i64 = text.len();
-    pb3(text, 0x4d, 0x85, 0xe4);
+    rl_pb3(text, 0x4d, 0x85, 0xe4);
     var pfts_je_intdone: i64 = text.len();
-    pb2(text, 0x74, 0x00);
-    pb3(text, 0x48, 0x31, 0xd2);
-    pb5(text, 0xb9, 0x0a, 0x00, 0x00, 0x00);
-    pb3(text, 0x4c, 0x89, 0xe0);
-    pb3(text, 0x48, 0xf7, 0xf1);
-    pb3(text, 0x49, 0x89, 0xc4);
-    pb3(text, 0x80, 0xc2, 0x30);
-    pb3(text, 0x48, 0xff, 0xce);
-    pb2(text, 0x88, 0x16);
+    rl_pb2(text, 0x74, 0x00);
+    rl_pb3(text, 0x48, 0x31, 0xd2);
+    rl_pb5(text, 0xb9, 0x0a, 0x00, 0x00, 0x00);
+    rl_pb3(text, 0x4c, 0x89, 0xe0);
+    rl_pb3(text, 0x48, 0xf7, 0xf1);
+    rl_pb3(text, 0x49, 0x89, 0xc4);
+    rl_pb3(text, 0x80, 0xc2, 0x30);
+    rl_pb3(text, 0x48, 0xff, 0xce);
+    rl_pb2(text, 0x88, 0x16);
     var pfts_jmp_intloop: i64 = text.len();
     var int_loop_back: i64 = pfts_int_loop - pfts_jmp_intloop - 2;
-    pb2(text, 0xeb, (int_loop_back) & 0xFF);
+    rl_pb2(text, 0xeb, (int_loop_back) & 0xFF);
     // .int_done:
     var pfts_int_done: i64 = text.len();
     text.set(pfts_je_intdone + 1, (pfts_int_done - pfts_je_intdone - 2) & 0xFF);
     // If no digits written (rsi == 30(%rsp)), write '0'
-    pb5(text, 0x48, 0x8d, 0x44, 0x24, 0x1e);
-    pb3(text, 0x48, 0x39, 0xc6);
+    rl_pb5(text, 0x48, 0x8d, 0x44, 0x24, 0x1e);
+    rl_pb3(text, 0x48, 0x39, 0xc6);
     var pfts_jne_copyint: i64 = text.len();
-    pb2(text, 0x75, 0x00);
-    pb3(text, 0x48, 0xff, 0xce);
-    pb3(text, 0xc6, 0x06, 0x30);
+    rl_pb2(text, 0x75, 0x00);
+    rl_pb3(text, 0x48, 0xff, 0xce);
+    rl_pb3(text, 0xc6, 0x06, 0x30);
     // .copy_int: copy from rsi to 30(%rsp) to r14
     var pfts_copy_int: i64 = text.len();
     text.set(pfts_jne_copyint + 1, (pfts_copy_int - pfts_jne_copyint - 2) & 0xFF);
     // .copy_int_loop:
     var pfts_copy_int_loop: i64 = text.len();
-    pb5(text, 0x48, 0x8d, 0x44, 0x24, 0x1e);
-    pb3(text, 0x48, 0x39, 0xc6);
+    rl_pb5(text, 0x48, 0x8d, 0x44, 0x24, 0x1e);
+    rl_pb3(text, 0x48, 0x39, 0xc6);
     var pfts_jge_copydone: i64 = text.len();
-    pb2(text, 0x7d, 0x00);
-    pb2(text, 0x8a, 0x06);
-    pb3(text, 0x41, 0x88, 0x06);
-    pb3(text, 0x48, 0xff, 0xc6);
-    pb3(text, 0x49, 0xff, 0xc6);
+    rl_pb2(text, 0x7d, 0x00);
+    rl_pb2(text, 0x8a, 0x06);
+    rl_pb3(text, 0x41, 0x88, 0x06);
+    rl_pb3(text, 0x48, 0xff, 0xc6);
+    rl_pb3(text, 0x49, 0xff, 0xc6);
     var pfts_jmp_copyint: i64 = text.len();
     var copy_int_back: i64 = pfts_copy_int_loop - pfts_jmp_copyint - 2;
-    pb2(text, 0xeb, (copy_int_back) & 0xFF);
+    rl_pb2(text, 0xeb, (copy_int_back) & 0xFF);
     // .copy_int_done:
     var pfts_copy_int_done: i64 = text.len();
     text.set(pfts_jge_copydone + 1, (pfts_copy_int_done - pfts_jge_copydone - 2) & 0xFF);
     // Check if frac (r13) is zero
-    pb3(text, 0x4d, 0x85, 0xed);
+    rl_pb3(text, 0x4d, 0x85, 0xed);
     var pfts_je_nullterm: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0x00, 0x00, 0x00, 0x00);
+    rl_pb6(text, 0x0f, 0x84, 0x00, 0x00, 0x00, 0x00);
     // Write '.'
-    pb4(text, 0x41, 0xc6, 0x06, 0x2e);
-    pb3(text, 0x49, 0xff, 0xc6);
+    rl_pb4(text, 0x41, 0xc6, 0x06, 0x2e);
+    rl_pb3(text, 0x49, 0xff, 0xc6);
     // Convert r13 to 6-digit zero-padded string (reverse at 24..30(%rsp))
-    pb5(text, 0x48, 0x8d, 0x74, 0x24, 0x1e);
-    pb6(text, 0x41, 0xbc, 0x06, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0x48, 0x8d, 0x74, 0x24, 0x1e);
+    rl_pb6(text, 0x41, 0xbc, 0x06, 0x00, 0x00, 0x00);
     // .frac_loop:
     var pfts_frac_loop: i64 = text.len();
-    pb3(text, 0x48, 0xff, 0xce);
-    pb3(text, 0x48, 0x31, 0xd2);
-    pb5(text, 0xb9, 0x0a, 0x00, 0x00, 0x00);
-    pb3(text, 0x4c, 0x89, 0xe8);
-    pb3(text, 0x48, 0xf7, 0xf1);
-    pb3(text, 0x49, 0x89, 0xc5);
-    pb3(text, 0x80, 0xc2, 0x30);
-    pb2(text, 0x88, 0x16);
-    pb3(text, 0x49, 0xff, 0xcc);
-    pb3(text, 0x4d, 0x85, 0xe4);
+    rl_pb3(text, 0x48, 0xff, 0xce);
+    rl_pb3(text, 0x48, 0x31, 0xd2);
+    rl_pb5(text, 0xb9, 0x0a, 0x00, 0x00, 0x00);
+    rl_pb3(text, 0x4c, 0x89, 0xe8);
+    rl_pb3(text, 0x48, 0xf7, 0xf1);
+    rl_pb3(text, 0x49, 0x89, 0xc5);
+    rl_pb3(text, 0x80, 0xc2, 0x30);
+    rl_pb2(text, 0x88, 0x16);
+    rl_pb3(text, 0x49, 0xff, 0xcc);
+    rl_pb3(text, 0x4d, 0x85, 0xe4);
     var pfts_jne_fracloop: i64 = text.len();
-    pb2(text, 0x75, 0x00);
+    rl_pb2(text, 0x75, 0x00);
     var frac_loop_back: i64 = pfts_frac_loop - (text.len());
     text.set(pfts_jne_fracloop + 1, (frac_loop_back) & 0xFF);
     // Strip trailing zeros: find last non-'0' from end
-    pb5(text, 0x48, 0x8d, 0x54, 0x24, 0x1e);
+    rl_pb5(text, 0x48, 0x8d, 0x54, 0x24, 0x1e);
     // .strip_loop:
     var pfts_strip_loop: i64 = text.len();
-    pb3(text, 0x48, 0x39, 0xf2);
+    rl_pb3(text, 0x48, 0x39, 0xf2);
     var pfts_je_stripdone: i64 = text.len();
-    pb2(text, 0x74, 0x00);
-    pb3(text, 0x48, 0xff, 0xca);
-    pb3(text, 0x80, 0x3a, 0x30);
+    rl_pb2(text, 0x74, 0x00);
+    rl_pb3(text, 0x48, 0xff, 0xca);
+    rl_pb3(text, 0x80, 0x3a, 0x30);
     var pfts_je_striploop: i64 = text.len();
     var strip_back: i64 = pfts_strip_loop - pfts_je_striploop - 2;
-    pb2(text, 0x74, (strip_back) & 0xFF);
+    rl_pb2(text, 0x74, (strip_back) & 0xFF);
     // .strip_done:
     var pfts_strip_done: i64 = text.len();
     text.set(pfts_je_stripdone + 1, (pfts_strip_done - pfts_je_stripdone - 2) & 0xFF);
     // Copy stripped frac from rsi..rdx (inclusive) to r14
     // .frac_copy_loop:
     var pfts_frac_copy: i64 = text.len();
-    pb3(text, 0x48, 0x39, 0xd6);
+    rl_pb3(text, 0x48, 0x39, 0xd6);
     var pfts_je_fracdone: i64 = text.len();
-    pb2(text, 0x77, 0x00);
-    pb2(text, 0x8a, 0x06);
-    pb3(text, 0x41, 0x88, 0x06);
-    pb3(text, 0x48, 0xff, 0xc6);
-    pb3(text, 0x49, 0xff, 0xc6);
+    rl_pb2(text, 0x77, 0x00);
+    rl_pb2(text, 0x8a, 0x06);
+    rl_pb3(text, 0x41, 0x88, 0x06);
+    rl_pb3(text, 0x48, 0xff, 0xc6);
+    rl_pb3(text, 0x49, 0xff, 0xc6);
     var pfts_jmp_fraccopy: i64 = text.len();
     var frac_copy_back: i64 = pfts_frac_copy - pfts_jmp_fraccopy - 2;
-    pb2(text, 0xeb, (frac_copy_back) & 0xFF);
+    rl_pb2(text, 0xeb, (frac_copy_back) & 0xFF);
     // .frac_copy_done:
     var pfts_frac_copy_done: i64 = text.len();
     text.set(pfts_je_fracdone + 1, (pfts_frac_copy_done - pfts_je_fracdone - 2) & 0xFF);
@@ -1174,14 +1177,14 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.set(pfts_jmp_null + 2, (jmp_null_off >> 16) & 0xFF);
     text.set(pfts_jmp_null + 3, (jmp_null_off >> 24) & 0xFF);
     // movb $0, (%r14) -- null terminate
-    pb4(text, 0x41, 0xc6, 0x06, 0x00);
+    rl_pb4(text, 0x41, 0xc6, 0x06, 0x00);
     // movq %rbx, %rax (return buffer)
-    pb3(text, 0x48, 0x89, 0xd8);
+    rl_pb3(text, 0x48, 0x89, 0xd8);
     // Epilogue
-    pb4(text, 0x48, 0x83, 0xc4, 0x38);
-    pb2(text, 0x41, 0x5e);
-    pb2(text, 0x41, 0x5d);
-    pb2(text, 0x41, 0x5c);
+    rl_pb4(text, 0x48, 0x83, 0xc4, 0x38);
+    rl_pb2(text, 0x41, 0x5e);
+    rl_pb2(text, 0x41, 0x5d);
+    rl_pb2(text, 0x41, 0x5c);
     text.push(0x5b & 0xFF);
     text.push(0xc3 & 0xFF);
     // =======================================================================
@@ -1192,60 +1195,60 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // pushq %rbx
     text.push(0x53 & 0xFF);
     // subq $16, %rsp (alignment + save rsi across malloc call)
-    pb4(text, 0x48, 0x83, 0xec, 0x10);
+    rl_pb4(text, 0x48, 0x83, 0xec, 0x10);
     // testq %rdi, %rdi
-    pb3(text, 0x48, 0x85, 0xff);
+    rl_pb3(text, 0x48, 0x85, 0xff);
     // jne .true
     var pbts_jne: i64 = text.len();
-    pb2(text, 0x75, 0x00);
+    rl_pb2(text, 0x75, 0x00);
     // .false: movl $6, %edi (len of "false\0")
-    pb5(text, 0xbf, 0x06, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xbf, 0x06, 0x00, 0x00, 0x00);
     // leaq .Lfalse_str(%rip), %rsi
-    pb7(text, 0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00);
     var pbts_false_lea: i64 = text.len() - 4;
     // jmp .copy (skip over .true path: movl $5 + leaq = 12 bytes)
-    pb2(text, 0xeb, 0x0c);
+    rl_pb2(text, 0xeb, 0x0c);
     // .true:
     var pbts_true: i64 = text.len();
     text.set(pbts_jne + 1, (pbts_true - pbts_jne - 2) & 0xFF);
     // movl $5, %edi (len of "true\0")
-    pb5(text, 0xbf, 0x05, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xbf, 0x05, 0x00, 0x00, 0x00);
     // leaq .Ltrue_str(%rip), %rsi
-    pb7(text, 0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00);
     var pbts_true_lea: i64 = text.len() - 4;
     // .copy: (both paths converge here)
     // Save rsi to stack (p_malloc clobbers caller-saved regs)
-    pb5(text, 0x48, 0x89, 0x74, 0x24, 0x08);
+    rl_pb5(text, 0x48, 0x89, 0x74, 0x24, 0x08);
     // Save len in rbx, call p_malloc
-    pb3(text, 0x48, 0x89, 0xfb);
-    pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
+    rl_pb3(text, 0x48, 0x89, 0xfb);
+    rl_pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
     var pbts_malloc_off: i64 = text.len() - 4;
     // Restore rsi from stack
-    pb5(text, 0x48, 0x8b, 0x74, 0x24, 0x08);
+    rl_pb5(text, 0x48, 0x8b, 0x74, 0x24, 0x08);
     // Now copy from rsi to rax, rbx bytes
     // movq %rax, %rdi (dest)
-    pb3(text, 0x48, 0x89, 0xc7);
+    rl_pb3(text, 0x48, 0x89, 0xc7);
     // movq %rbx, %rcx (count)
-    pb3(text, 0x48, 0x89, 0xd9);
+    rl_pb3(text, 0x48, 0x89, 0xd9);
     // .copy_loop:
     var pbts_copy_loop: i64 = text.len();
     // testq %rcx, %rcx
-    pb3(text, 0x48, 0x85, 0xc9);
+    rl_pb3(text, 0x48, 0x85, 0xc9);
     // je .copy_done
     var pbts_je: i64 = text.len();
-    pb2(text, 0x74, 0x00);
+    rl_pb2(text, 0x74, 0x00);
     // movb (%rsi), %al
-    pb2(text, 0x8a, 0x06);
+    rl_pb2(text, 0x8a, 0x06);
     // movb %al, (%rdi)
-    pb2(text, 0x88, 0x07);
+    rl_pb2(text, 0x88, 0x07);
     // incq %rsi ; incq %rdi ; decq %rcx
-    pb3(text, 0x48, 0xff, 0xc6);
-    pb3(text, 0x48, 0xff, 0xc7);
-    pb3(text, 0x48, 0xff, 0xc9);
+    rl_pb3(text, 0x48, 0xff, 0xc6);
+    rl_pb3(text, 0x48, 0xff, 0xc7);
+    rl_pb3(text, 0x48, 0xff, 0xc9);
     // jmp .copy_loop
     var pbts_jmp: i64 = text.len();
     var pbts_back: i64 = pbts_copy_loop - pbts_jmp - 2;
-    pb2(text, 0xeb, (pbts_back) & 0xFF);
+    rl_pb2(text, 0xeb, (pbts_back) & 0xFF);
     // .copy_done:
     var pbts_copy_done: i64 = text.len();
     text.set(pbts_je + 1, (pbts_copy_done - pbts_je - 2) & 0xFF);
@@ -1253,7 +1256,7 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // Actually, rdi has been advanced. We need the original rax.
     // rax still holds the malloc result (not clobbered by copy loop).
     // addq $16, %rsp ; popq %rbx ; ret
-    pb4(text, 0x48, 0x83, 0xc4, 0x10);
+    rl_pb4(text, 0x48, 0x83, 0xc4, 0x10);
     text.push(0x5b & 0xFF);
     text.push(0xc3 & 0xFF);
     // =======================================================================
@@ -1263,92 +1266,92 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     add_sym(symbols, text, "p_vec_to_str");
     // pushq %rbx ; pushq %r12 ; pushq %r13 ; pushq %r14 ; pushq %r15
     text.push(0x53 & 0xFF);
-    pb2(text, 0x41, 0x54);
-    pb2(text, 0x41, 0x55);
-    pb2(text, 0x41, 0x56);
-    pb2(text, 0x41, 0x57);
+    rl_pb2(text, 0x41, 0x54);
+    rl_pb2(text, 0x41, 0x55);
+    rl_pb2(text, 0x41, 0x56);
+    rl_pb2(text, 0x41, 0x57);
     // subq $40, %rsp
-    pb4(text, 0x48, 0x83, 0xec, 0x28);
+    rl_pb4(text, 0x48, 0x83, 0xec, 0x28);
     // movq %rdi, %rbx (save vec ptr)
-    pb3(text, 0x48, 0x89, 0xfb);
+    rl_pb3(text, 0x48, 0x89, 0xfb);
     // malloc 256 bytes for result buffer
-    pb5(text, 0xbf, 0x00, 0x01, 0x00, 0x00);
-    pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xbf, 0x00, 0x01, 0x00, 0x00);
+    rl_pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
     var pvts_malloc_off: i64 = text.len() - 4;
     // movq %rax, %r15 (buffer ptr)
-    pb3(text, 0x49, 0x89, 0xc7);
+    rl_pb3(text, 0x49, 0x89, 0xc7);
     // movq %r15, %r14 (write ptr = buffer start)
-    pb3(text, 0x4d, 0x89, 0xfe);
+    rl_pb3(text, 0x4d, 0x89, 0xfe);
     // Write '['
-    pb4(text, 0x41, 0xc6, 0x06, 0x5b);
-    pb3(text, 0x49, 0xff, 0xc6);
+    rl_pb4(text, 0x41, 0xc6, 0x06, 0x5b);
+    rl_pb3(text, 0x49, 0xff, 0xc6);
     // Call p_vec_len(rdi=rbx) to get len
-    pb3(text, 0x48, 0x89, 0xdf);
-    pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
+    rl_pb3(text, 0x48, 0x89, 0xdf);
+    rl_pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
     var pvts_len_call_off: i64 = text.len() - 4;
     // movq %rax, %r12 (remaining len)
-    pb3(text, 0x49, 0x89, 0xc4);
+    rl_pb3(text, 0x49, 0x89, 0xc4);
     // movq (%rbx), %rbx (data_ptr = vec[0])
-    pb3(text, 0x48, 0x8b, 0x1b);
+    rl_pb3(text, 0x48, 0x8b, 0x1b);
     // xorq %r13, %r13 (index = 0, for comma check)
-    pb3(text, 0x4d, 0x31, 0xed);
+    rl_pb3(text, 0x4d, 0x31, 0xed);
     // .loop: testq %r12, %r12
     var pvts_loop: i64 = text.len();
-    pb3(text, 0x4d, 0x85, 0xe4);
+    rl_pb3(text, 0x4d, 0x85, 0xe4);
     // jz .done
     var pvts_jz: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0x00, 0x00, 0x00, 0x00);
+    rl_pb6(text, 0x0f, 0x84, 0x00, 0x00, 0x00, 0x00);
     // If not first element, write ", "
-    pb3(text, 0x4d, 0x85, 0xed);
+    rl_pb3(text, 0x4d, 0x85, 0xed);
     // je .skip_comma
     var pvts_je_comma: i64 = text.len();
-    pb2(text, 0x74, 0x00);
+    rl_pb2(text, 0x74, 0x00);
     // Write ", "
-    pb4(text, 0x41, 0xc6, 0x06, 0x2c);
-    pb3(text, 0x49, 0xff, 0xc6);
-    pb4(text, 0x41, 0xc6, 0x06, 0x20);
-    pb3(text, 0x49, 0xff, 0xc6);
+    rl_pb4(text, 0x41, 0xc6, 0x06, 0x2c);
+    rl_pb3(text, 0x49, 0xff, 0xc6);
+    rl_pb4(text, 0x41, 0xc6, 0x06, 0x20);
+    rl_pb3(text, 0x49, 0xff, 0xc6);
     // .skip_comma:
     var pvts_skip_comma: i64 = text.len();
     text.set(pvts_je_comma + 1, (pvts_skip_comma - pvts_je_comma - 2) & 0xFF);
     // Load element: movq (%rbx), %rdi
-    pb3(text, 0x48, 0x8b, 0x3b);
+    rl_pb3(text, 0x48, 0x8b, 0x3b);
     // call p_to_str
-    pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
     var pvts_tostr_call_off: i64 = text.len() - 4;
     // Copy result string (rax) to r14
     // movq %rax, %rsi (src)
-    pb3(text, 0x48, 0x89, 0xc6);
+    rl_pb3(text, 0x48, 0x89, 0xc6);
     // .copy_elem_loop:
     var pvts_copy_elem: i64 = text.len();
     // movb (%rsi), %al
-    pb2(text, 0x8a, 0x06);
+    rl_pb2(text, 0x8a, 0x06);
     // testq %rax, %rax
-    pb2(text, 0x84, 0xc0);
+    rl_pb2(text, 0x84, 0xc0);
     // je .elem_done
     var pvts_je_elem: i64 = text.len();
-    pb2(text, 0x74, 0x00);
+    rl_pb2(text, 0x74, 0x00);
     // movb %al, (%r14)
-    pb3(text, 0x41, 0x88, 0x06);
+    rl_pb3(text, 0x41, 0x88, 0x06);
     // incq %rsi ; incq %r14
-    pb3(text, 0x48, 0xff, 0xc6);
-    pb3(text, 0x49, 0xff, 0xc6);
+    rl_pb3(text, 0x48, 0xff, 0xc6);
+    rl_pb3(text, 0x49, 0xff, 0xc6);
     // jmp .copy_elem_loop
     var pvts_jmp_elem: i64 = text.len();
     var pvts_elem_back: i64 = pvts_copy_elem - pvts_jmp_elem - 2;
-    pb2(text, 0xeb, (pvts_elem_back) & 0xFF);
+    rl_pb2(text, 0xeb, (pvts_elem_back) & 0xFF);
     // .elem_done:
     var pvts_elem_done: i64 = text.len();
     text.set(pvts_je_elem + 1, (pvts_elem_done - pvts_je_elem - 2) & 0xFF);
     // addq $8, %rbx (advance data_ptr)
-    pb4(text, 0x48, 0x83, 0xc3, 0x08);
+    rl_pb4(text, 0x48, 0x83, 0xc3, 0x08);
     // decq %r12 ; incq %r13
-    pb3(text, 0x49, 0xff, 0xcc);
-    pb3(text, 0x49, 0xff, 0xc5);
+    rl_pb3(text, 0x49, 0xff, 0xcc);
+    rl_pb3(text, 0x49, 0xff, 0xc5);
     // jmp .loop
     var pvts_jmp_loop: i64 = text.len();
     var pvts_loop_back: i64 = pvts_loop - pvts_jmp_loop - 2;
-    pb2(text, 0xeb, (pvts_loop_back) & 0xFF);
+    rl_pb2(text, 0xeb, (pvts_loop_back) & 0xFF);
     // .done:
     var pvts_done: i64 = text.len();
     var pvts_done_rel: i64 = (pvts_done - pvts_jz - 6);
@@ -1357,18 +1360,18 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.set(pvts_jz + 4, (pvts_done_rel >> 16) & 0xFF);
     text.set(pvts_jz + 5, (pvts_done_rel >> 24) & 0xFF);
     // Write ']'
-    pb4(text, 0x41, 0xc6, 0x06, 0x5d);
-    pb3(text, 0x49, 0xff, 0xc6);
+    rl_pb4(text, 0x41, 0xc6, 0x06, 0x5d);
+    rl_pb3(text, 0x49, 0xff, 0xc6);
     // Write null terminator
-    pb4(text, 0x41, 0xc6, 0x06, 0x00);
+    rl_pb4(text, 0x41, 0xc6, 0x06, 0x00);
     // movq %r15, %rax (return buffer)
-    pb3(text, 0x4c, 0x89, 0xf8);
+    rl_pb3(text, 0x4c, 0x89, 0xf8);
     // Epilogue
-    pb4(text, 0x48, 0x83, 0xc4, 0x28);
-    pb2(text, 0x41, 0x5f);
-    pb2(text, 0x41, 0x5e);
-    pb2(text, 0x41, 0x5d);
-    pb2(text, 0x41, 0x5c);
+    rl_pb4(text, 0x48, 0x83, 0xc4, 0x28);
+    rl_pb2(text, 0x41, 0x5f);
+    rl_pb2(text, 0x41, 0x5e);
+    rl_pb2(text, 0x41, 0x5d);
+    rl_pb2(text, 0x41, 0x5c);
     text.push(0x5b & 0xFF);
     text.push(0xc3 & 0xFF);
     // =======================================================================
@@ -1376,23 +1379,23 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // =======================================================================
     // p_allocator_create() -> rax = 1 (dummy non-null)
     add_sym(symbols, text, "p_allocator_create");
-    pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
     text.push(0xc3 & 0xFF);
     // p_allocator_alloc(rdi=alloc, rsi=size) -> rax = ptr
     // movq %rsi, %rdi ; jmp p_malloc
     add_sym(symbols, text, "p_allocator_alloc");
-    pb3(text, 0x48, 0x89, 0xf7);
-    pb5(text, 0xe9, 0x00, 0x00, 0x00, 0x00);
+    rl_pb3(text, 0x48, 0x89, 0xf7);
+    rl_pb5(text, 0xe9, 0x00, 0x00, 0x00, 0x00);
     var palloc_alloc_jmp_off: i64 = text.len() - 4;
     // p_allocator_free(rdi=alloc, rsi=ptr) -> void
     // movq %rsi, %rdi ; jmp p_free
     add_sym(symbols, text, "p_allocator_free");
-    pb3(text, 0x48, 0x89, 0xf7);
-    pb5(text, 0xe9, 0x00, 0x00, 0x00, 0x00);
+    rl_pb3(text, 0x48, 0x89, 0xf7);
+    rl_pb5(text, 0xe9, 0x00, 0x00, 0x00, 0x00);
     var palloc_free_jmp_off: i64 = text.len() - 4;
     // p_allocator_stats(rdi=alloc) -> rax = 0
     add_sym(symbols, text, "p_allocator_stats");
-    pb3(text, 0x48, 0x31, 0xc0);
+    rl_pb3(text, 0x48, 0x31, 0xc0);
     text.push(0xc3 & 0xFF);
     // =======================================================================
     // String / Vec / HashMap runtime functions (encoded from assembly text)
@@ -2848,14 +2851,40 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     runtime_asm = runtime_asm + "popq %r12\n";
     runtime_asm = runtime_asm + "popq %rbx\n";
     runtime_asm = runtime_asm + "ret\n";
-    // Encode the assembly text to machine code
-    // TODO: call elf64::encode_asm_block(runtime_asm) when elf64.fd is ported
-    var asm_bytes: Vec = Vec::new();
-    var asm_syms: Vec<RuntimeSymbol> = Vec::new();
-    var asm_relocs: Vec<RuntimeReloc> = Vec::new();
+    // Encode the assembly text to machine code via the elf64 assembler.
+    // Matches src/runtime_linux.rs:2876-2895: append bytes, register defined
+    // .text symbols, and collect relocations (merged into `relocations` below
+    // with asm_base applied).
+    var asm_res: AsmBlockResult = encode_asm_block(runtime_asm);
+    var asm_bytes: Vec = asm_res.bytes;
     var asm_base: i64 = text.len();
-    // For now, the assembly-encoded functions are stubs
-    // They will be properly encoded once elf64.fd is available
+    var abi: i64 = 0;
+    while abi < asm_bytes.len() {
+        text.push(asm_bytes.get(abi));
+        abi = abi + 1;
+    }
+    var asi: i64 = 0;
+    while asi < asm_res.symbols.len() {
+        var asym: Symbol = asm_res.symbols.get(asi);
+        if asym.is_defined && asym.section == 1 {
+            symbols.push(RuntimeSymbol_new(asym.name, asm_base + asym.value, 0));
+        }
+        asi = asi + 1;
+    }
+    // Reloc targets arrive as symbol indices -- resolve to names.
+    // rtype values already match the linker's codes (1/2/4); default to PC32.
+    var asm_relocs: Vec<RuntimeReloc> = Vec::new();
+    var arr: i64 = 0;
+    while arr < asm_res.relocations.len() {
+        var arel: Relocation = asm_res.relocations.get(arr);
+        if arel.symbol >= 0 && arel.symbol < asm_res.symbols.len() {
+            var rsym: Symbol = asm_res.symbols.get(arel.symbol);
+            var rrt: i64 = arel.rtype;
+            if rrt != 1 && rrt != 2 && rrt != 4 { rrt = 2; }
+            asm_relocs.push(RuntimeReloc_new(arel.offset, rsym.name, rrt));
+        }
+        arr = arr + 1;
+    }
     // =======================================================================
     // Stub functions -- return 0/NULL for all other externs
     // Each stub: xorq %rax, %rax ; ret  (or just ret for void functions)
@@ -2871,9 +2900,9 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // We allocate 4096 bytes initially; data starts at offset 24.
     add_sym(symbols, text, "p_vec_new");
     // movq $4096, %rdi  (size for mmap)
-    pb7(text, 0x48, 0xc7, 0xc7, 0x00, 0x10, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0xc7, 0xc7, 0x00, 0x10, 0x00, 0x00);
     // jmp p_malloc
-    pb5(text, 0xe9, 0x00, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xe9, 0x00, 0x00, 0x00, 0x00);
     var pvec_new_jmp_off: i64 = text.len() - 4;
     // After mmap returns, zero out the 3 header fields:
     // Actually, mmap returns zeroed memory (MAP_ANONYMOUS), so len=0, cap=0.
@@ -2884,95 +2913,95 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // movq $4096, %rdi
     // (already emitted above)
     // call p_malloc
-    pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
     var pvec_new_call_off: i64 = text.len() - 4;
     // leaq 24(%rax), %rcx  (data_ptr = vec + 24)
-    pb4(text, 0x48, 0x8d, 0x48, 0x18);
+    rl_pb4(text, 0x48, 0x8d, 0x48, 0x18);
     // movq %rcx, (%rax)  (store data_ptr)
-    pb3(text, 0x48, 0x89, 0x08);
+    rl_pb3(text, 0x48, 0x89, 0x08);
     // movq $0, 8(%rax)  (len = 0) -- already zero from mmap
     // movq $509, 16(%rax)  (cap = (4096-24)/8 = 509)
-    pb8(text, 0x48, 0xc7, 0x40, 0x10, 0xfd, 0x01, 0x00, 0x00);
+    rl_pb8(text, 0x48, 0xc7, 0x40, 0x10, 0xfd, 0x01, 0x00, 0x00);
     text.push(0xc3 & 0xFF);
     // p_vec_push(rdi = vec, rsi = value) -> void
     // Grows the vec if needed. Simplified: no growth (cap=509 is enough for tests).
     add_sym(symbols, text, "p_vec_push");
     // movq 8(%rdi), %rax  (len)
-    pb4(text, 0x48, 0x8b, 0x47, 0x08);
+    rl_pb4(text, 0x48, 0x8b, 0x47, 0x08);
     // movq (%rdi), %rcx  (data_ptr)
-    pb3(text, 0x48, 0x8b, 0x0f);
+    rl_pb3(text, 0x48, 0x8b, 0x0f);
     // movq %rsi, (%rcx,%rax,8)  (data[len] = value)
-    pb4(text, 0x48, 0x89, 0x34, 0xc1);
+    rl_pb4(text, 0x48, 0x89, 0x34, 0xc1);
     // incq 8(%rdi)  (len++)
-    pb4(text, 0x48, 0xff, 0x47, 0x08);
+    rl_pb4(text, 0x48, 0xff, 0x47, 0x08);
     text.push(0xc3 & 0xFF);
     // p_vec_len(rdi = vec) -> rax = len
     add_sym(symbols, text, "p_vec_len");
     // movq 8(%rdi), %rax
-    pb4(text, 0x48, 0x8b, 0x47, 0x08);
+    rl_pb4(text, 0x48, 0x8b, 0x47, 0x08);
     text.push(0xc3 & 0xFF);
     // p_vec_get(rdi = vec, rsi = index) -> rax = value
     add_sym(symbols, text, "p_vec_get");
     // movq (%rdi), %rcx  (data_ptr)
-    pb3(text, 0x48, 0x8b, 0x0f);
+    rl_pb3(text, 0x48, 0x8b, 0x0f);
     // movq (%rcx,%rsi,8), %rax  (data[index])
-    pb4(text, 0x48, 0x8b, 0x04, 0xf1);
+    rl_pb4(text, 0x48, 0x8b, 0x04, 0xf1);
     text.push(0xc3 & 0xFF);
     // p_vec_first(rdi = vec) -> rax = first element
     add_sym(symbols, text, "p_vec_first");
     // movq (%rdi), %rax  (data_ptr)
-    pb3(text, 0x48, 0x8b, 0x07);
+    rl_pb3(text, 0x48, 0x8b, 0x07);
     // movq (%rax), %rax  (first element)
-    pb3(text, 0x48, 0x8b, 0x00);
+    rl_pb3(text, 0x48, 0x8b, 0x00);
     text.push(0xc3 & 0xFF);
     // p_vec_last(rdi = vec) -> rax = last element
     add_sym(symbols, text, "p_vec_last");
     // movq (%rdi), %rcx  (data_ptr)
-    pb3(text, 0x48, 0x8b, 0x0f);
+    rl_pb3(text, 0x48, 0x8b, 0x0f);
     // movq 8(%rdi), %rax  (len)
-    pb4(text, 0x48, 0x8b, 0x47, 0x08);
+    rl_pb4(text, 0x48, 0x8b, 0x47, 0x08);
     // decq %rax  (len - 1)
-    pb3(text, 0x48, 0xff, 0xc8);
+    rl_pb3(text, 0x48, 0xff, 0xc8);
     // movq (%rcx,%rax,8), %rax  (data[len-1])
-    pb4(text, 0x48, 0x8b, 0x04, 0xc1);
+    rl_pb4(text, 0x48, 0x8b, 0x04, 0xc1);
     text.push(0xc3 & 0xFF);
     // p_vec_pop(rdi = vec) -> rax = value (or 0 if empty)
     add_sym(symbols, text, "p_vec_pop");
     // movq 8(%rdi), %rax  (len)
-    pb4(text, 0x48, 0x8b, 0x47, 0x08);
+    rl_pb4(text, 0x48, 0x8b, 0x47, 0x08);
     // testq %rax, %rax
-    pb3(text, 0x48, 0x85, 0xc0);
+    rl_pb3(text, 0x48, 0x85, 0xc0);
     // je .empty
-    pb2(text, 0x74, 0x0b);
+    rl_pb2(text, 0x74, 0x0b);
     // decq %rax  (len-1)
-    pb3(text, 0x48, 0xff, 0xc8);
+    rl_pb3(text, 0x48, 0xff, 0xc8);
     // movq %rax, 8(%rdi)  (store new len)
-    pb4(text, 0x48, 0x89, 0x47, 0x08);
+    rl_pb4(text, 0x48, 0x89, 0x47, 0x08);
     // movq (%rdi), %rcx  (data_ptr)
-    pb3(text, 0x48, 0x8b, 0x0f);
+    rl_pb3(text, 0x48, 0x8b, 0x0f);
     // movq (%rcx,%rax,8), %rax  (data[len-1])
-    pb4(text, 0x48, 0x8b, 0x04, 0xc1);
+    rl_pb4(text, 0x48, 0x8b, 0x04, 0xc1);
     text.push(0xc3 & 0xFF);
     // .empty: xorq %rax, %rax; ret
-    pb3(text, 0x48, 0x31, 0xc0);
+    rl_pb3(text, 0x48, 0x31, 0xc0);
     text.push(0xc3 & 0xFF);
     // p_vec_is_empty(rdi = vec) -> rax = 1 if empty, 0 otherwise
     add_sym(symbols, text, "p_vec_is_empty");
     // movq 8(%rdi), %rax
-    pb4(text, 0x48, 0x8b, 0x47, 0x08);
+    rl_pb4(text, 0x48, 0x8b, 0x47, 0x08);
     // testq %rax, %rax
-    pb3(text, 0x48, 0x85, 0xc0);
+    rl_pb3(text, 0x48, 0x85, 0xc0);
     // sete %al
-    pb3(text, 0x0f, 0x94, 0xc0);
+    rl_pb3(text, 0x0f, 0x94, 0xc0);
     // movzbq %al, %rax
-    pb4(text, 0x48, 0x0f, 0xb6, 0xc0);
+    rl_pb4(text, 0x48, 0x0f, 0xb6, 0xc0);
     text.push(0xc3 & 0xFF);
     // p_vec_set(rdi = vec, rsi = index, rdx = value) -> void
     add_sym(symbols, text, "p_vec_set");
     // movq (%rdi), %rcx  (data_ptr)
-    pb3(text, 0x48, 0x8b, 0x0f);
+    rl_pb3(text, 0x48, 0x8b, 0x0f);
     // movq %rdx, (%rcx,%rsi,8)  (data[index] = value)
-    pb4(text, 0x48, 0x89, 0x14, 0xf1);
+    rl_pb4(text, 0x48, 0x89, 0x14, 0xf1);
     text.push(0xc3 & 0xFF);
     // p_map_new is implemented in the assembly block above
     // p_print_vec(rdi = vec) -- prints [1, 2, 3]
@@ -2980,63 +3009,63 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     add_sym(symbols, text, "p_print_vec");
     // Save callee-saved registers
     text.push(0x53 & 0xFF);
-    pb2(text, 0x41, 0x54);
-    pb2(text, 0x41, 0x55);
+    rl_pb2(text, 0x41, 0x54);
+    rl_pb2(text, 0x41, 0x55);
     // movq %rdi, %rbx  (save vec ptr)
-    pb3(text, 0x48, 0x89, 0xfb);
+    rl_pb3(text, 0x48, 0x89, 0xfb);
     // Call p_vec_len(rdi) to get len
-    pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
     var pvec_len_call_off: i64 = text.len() - 4;
     // movq %rax, %r12  (len)
-    pb3(text, 0x49, 0x89, 0xc4);
+    rl_pb3(text, 0x49, 0x89, 0xc4);
     // movq (%rbx), %rbx  (data_ptr = vec[0])
-    pb3(text, 0x48, 0x8b, 0x1b);
+    rl_pb3(text, 0x48, 0x8b, 0x1b);
     // xorq %r13, %r13  (index = 0)
-    pb3(text, 0x4d, 0x31, 0xed);
+    rl_pb3(text, 0x4d, 0x31, 0xed);
     // Write '['
-    pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
-    pb7(text, 0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00);
     var pvec_open_lea: i64 = text.len() - 4;
-    pb5(text, 0xba, 0x01, 0x00, 0x00, 0x00);
-    pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
-    pb2(text, 0x0f, 0x05);
+    rl_pb5(text, 0xba, 0x01, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
+    rl_pb2(text, 0x0f, 0x05);
     // .loop: testq %r12, %r12 (if remaining len == 0, done)
     var pvec_loop: i64 = text.len();
-    pb3(text, 0x4d, 0x85, 0xe4);
+    rl_pb3(text, 0x4d, 0x85, 0xe4);
     // jz .done
     var pvec_jge_off: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0x00, 0x00, 0x00, 0x00);
+    rl_pb6(text, 0x0f, 0x84, 0x00, 0x00, 0x00, 0x00);
     // If not first element, write ", "
-    pb3(text, 0x4d, 0x85, 0xed);
+    rl_pb3(text, 0x4d, 0x85, 0xed);
     // je .skip_comma
     var pvec_je_off: i64 = text.len();
-    pb2(text, 0x74, 0x00);
+    rl_pb2(text, 0x74, 0x00);
     // Write ", "
-    pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
-    pb7(text, 0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00);
     var pvec_comma_lea: i64 = text.len() - 4;
-    pb5(text, 0xba, 0x02, 0x00, 0x00, 0x00);
-    pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
-    pb2(text, 0x0f, 0x05);
+    rl_pb5(text, 0xba, 0x02, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
+    rl_pb2(text, 0x0f, 0x05);
     // .skip_comma:
     var pvec_skip_comma: i64 = text.len();
     var skip_comma_rel: i64 = (pvec_skip_comma - pvec_je_off - 2);
     text.set(pvec_je_off + 1, (skip_comma_rel) & 0xFF);
     // Load element: movq (%rbx), %rdi
-    pb3(text, 0x48, 0x8b, 0x3b);
+    rl_pb3(text, 0x48, 0x8b, 0x3b);
     // call p_print_int
-    pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xe8, 0x00, 0x00, 0x00, 0x00);
     var pvec_print_call_off: i64 = text.len() - 4;
     // addq $8, %rbx (advance data_ptr)
-    pb4(text, 0x48, 0x83, 0xc3, 0x08);
+    rl_pb4(text, 0x48, 0x83, 0xc3, 0x08);
     // decq %r12 (decrement remaining len)
-    pb3(text, 0x49, 0xff, 0xcc);
+    rl_pb3(text, 0x49, 0xff, 0xcc);
     // incq %r13 (increment index for comma check)
-    pb3(text, 0x49, 0xff, 0xc5);
+    rl_pb3(text, 0x49, 0xff, 0xc5);
     // jmp .loop
     var pvec_jmp_back: i64 = text.len();
     var loop_rel: i64 = (pvec_loop - pvec_jmp_back - 2) & 0xFF;
-    pb2(text, 0xeb, (loop_rel) & 0xFF);
+    rl_pb2(text, 0xeb, (loop_rel) & 0xFF);
     // .done:
     var pvec_done: i64 = text.len();
     var done_rel: i64 = (pvec_done - pvec_jge_off - 6);
@@ -3045,119 +3074,119 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.set(pvec_jge_off + 4, ((done_rel >> 16) & 0xFF));
     text.set(pvec_jge_off + 5, ((done_rel >> 24) & 0xFF));
     // Write ']'
-    pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
-    pb7(text, 0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xbf, 0x01, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00);
     var pvec_close_lea: i64 = text.len() - 4;
-    pb5(text, 0xba, 0x01, 0x00, 0x00, 0x00);
-    pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
-    pb2(text, 0x0f, 0x05);
+    rl_pb5(text, 0xba, 0x01, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xb8, 0x01, 0x00, 0x00, 0x00);
+    rl_pb2(text, 0x0f, 0x05);
     // Restore callee-saved registers
-    pb2(text, 0x41, 0x5d);
-    pb2(text, 0x41, 0x5c);
+    rl_pb2(text, 0x41, 0x5d);
+    rl_pb2(text, 0x41, 0x5c);
     text.push(0x5b & 0xFF);
     text.push(0xc3 & 0xFF);
     // p_print_map is implemented in the assembly block above
     // JSON stubs
     add_sym(symbols, text, "p_json_parse");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_json_dump");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_json_get");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_json_type");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     // p_json_len and p_json_at are implemented below (needed by test_db)
     add_sym(symbols, text, "p_json_pretty");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_json_string");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     // Tensor stubs
     add_sym(symbols, text, "p_tensor_zeros");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_ones");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_filled");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_from_vec");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_get");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_set");
     text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_shape");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_ndim");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_size");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_reshape");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_transpose");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_add");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_sub");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_mul");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_scale");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_matmul");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_dot");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_sum");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_mean");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_max");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_min");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_relu");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_sigmoid");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_softmax");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_to_str");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_to_json");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_tensor_clone");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     // SIMD stubs (actual SIMD ops are inlined by codegen)
     // p_simd_dot(rdi = vec_a, rsi = vec_b) -> rax = f64 dot product
@@ -3165,60 +3194,60 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     add_sym(symbols, text, "p_simd_dot");
     // pushq %rbx ; pushq %r12 ; pushq %r13 ; pushq %r14
     text.push(0x53 & 0xFF);
-    pb2(text, 0x41, 0x54);
-    pb2(text, 0x41, 0x55);
-    pb2(text, 0x41, 0x56);
+    rl_pb2(text, 0x41, 0x54);
+    rl_pb2(text, 0x41, 0x55);
+    rl_pb2(text, 0x41, 0x56);
     // subq $32, %rsp
-    pb4(text, 0x48, 0x83, 0xec, 0x20);
+    rl_pb4(text, 0x48, 0x83, 0xec, 0x20);
     // movq %rdi, %rbx (vec_a)
-    pb3(text, 0x48, 0x89, 0xfb);
+    rl_pb3(text, 0x48, 0x89, 0xfb);
     // movq %rsi, %r12 (vec_b)
-    pb3(text, 0x49, 0x89, 0xf4);
+    rl_pb3(text, 0x49, 0x89, 0xf4);
     // movq 8(%rbx), %r13 (len_a)
-    pb4(text, 0x4c, 0x8b, 0x6b, 0x08);
+    rl_pb4(text, 0x4c, 0x8b, 0x6b, 0x08);
     // movq (%rbx), %rbx (data_a)
-    pb3(text, 0x48, 0x8b, 0x1b);
+    rl_pb3(text, 0x48, 0x8b, 0x1b);
     // movq (%r12), %r12 (data_b)
-    pb4(text, 0x4d, 0x8b, 0x24, 0x24);
+    rl_pb4(text, 0x4d, 0x8b, 0x24, 0x24);
     // xorq %r14, %r14 (index = 0)
-    pb3(text, 0x4d, 0x31, 0xf6);
+    rl_pb3(text, 0x4d, 0x31, 0xf6);
     // Store 0.0 at 16(%rsp) (accumulator -- 8 bytes zeroed)
-    pb9(text, 0x48, 0xc7, 0x44, 0x24, 0x10, 0x00, 0x00, 0x00, 0x00);
+    rl_pb9(text, 0x48, 0xc7, 0x44, 0x24, 0x10, 0x00, 0x00, 0x00, 0x00);
     // .loop:
     var psdot_loop: i64 = text.len();
     // cmpq %r14, %r13
-    pb3(text, 0x4d, 0x39, 0xf5);
+    rl_pb3(text, 0x4d, 0x39, 0xf5);
     // je .done
     var psdot_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0x00, 0x00, 0x00, 0x00);
+    rl_pb6(text, 0x0f, 0x84, 0x00, 0x00, 0x00, 0x00);
     // movq (%rbx,%r14,8), %rax (a[i] as f64 bits)
     // REX.WX=0x4a to extend SIB index to r14
-    pb4(text, 0x4a, 0x8b, 0x04, 0xf3);
+    rl_pb4(text, 0x4a, 0x8b, 0x04, 0xf3);
     // movq %rax, (%rsp)
-    pb4(text, 0x48, 0x89, 0x04, 0x24);
+    rl_pb4(text, 0x48, 0x89, 0x04, 0x24);
     // movsd (%rsp), %xmm0
-    pb5(text, 0xf2, 0x0f, 0x10, 0x04, 0x24);
+    rl_pb5(text, 0xf2, 0x0f, 0x10, 0x04, 0x24);
     // movq (%r12,%r14,8), %rax (b[i] as f64 bits)
     // REX.WXB=0x4b to extend SIB index to r14 and base to r12
-    pb4(text, 0x4b, 0x8b, 0x04, 0xf4);
+    rl_pb4(text, 0x4b, 0x8b, 0x04, 0xf4);
     // movq %rax, (%rsp)
-    pb4(text, 0x48, 0x89, 0x04, 0x24);
+    rl_pb4(text, 0x48, 0x89, 0x04, 0x24);
     // movsd (%rsp), %xmm1
-    pb5(text, 0xf2, 0x0f, 0x10, 0x0c, 0x24);
+    rl_pb5(text, 0xf2, 0x0f, 0x10, 0x0c, 0x24);
     // mulsd %xmm1, %xmm0 (a[i] * b[i])
-    pb4(text, 0xf2, 0x0f, 0x59, 0xc1);
+    rl_pb4(text, 0xf2, 0x0f, 0x59, 0xc1);
     // movsd 16(%rsp), %xmm1 (accumulator)
-    pb6(text, 0xf2, 0x0f, 0x10, 0x4c, 0x24, 0x10);
+    rl_pb6(text, 0xf2, 0x0f, 0x10, 0x4c, 0x24, 0x10);
     // addsd %xmm0, %xmm1 (accumulator += a[i]*b[i])
-    pb4(text, 0xf2, 0x0f, 0x58, 0xc8);
+    rl_pb4(text, 0xf2, 0x0f, 0x58, 0xc8);
     // movsd %xmm1, 16(%rsp)
-    pb6(text, 0xf2, 0x0f, 0x11, 0x4c, 0x24, 0x10);
+    rl_pb6(text, 0xf2, 0x0f, 0x11, 0x4c, 0x24, 0x10);
     // incq %r14
-    pb3(text, 0x49, 0xff, 0xc6);
+    rl_pb3(text, 0x49, 0xff, 0xc6);
     // jmp .loop
     var psdot_jmp: i64 = text.len();
     var psdot_back: i64 = psdot_loop - psdot_jmp - 2;
-    pb2(text, 0xeb, (psdot_back) & 0xFF);
+    rl_pb2(text, 0xeb, (psdot_back) & 0xFF);
     // .done:
     var psdot_done: i64 = text.len();
     var psdot_done_rel: i64 = (psdot_done - psdot_je - 6);
@@ -3227,51 +3256,51 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.set(psdot_je + 4, (psdot_done_rel >> 16) & 0xFF);
     text.set(psdot_je + 5, (psdot_done_rel >> 24) & 0xFF);
     // movq 16(%rsp), %rax (return accumulator as f64 bits)
-    pb5(text, 0x48, 0x8b, 0x44, 0x24, 0x10);
+    rl_pb5(text, 0x48, 0x8b, 0x44, 0x24, 0x10);
     // addq $32, %rsp
-    pb4(text, 0x48, 0x83, 0xc4, 0x20);
+    rl_pb4(text, 0x48, 0x83, 0xc4, 0x20);
     // popq %r14 ; popq %r13 ; popq %r12 ; popq %rbx
-    pb2(text, 0x41, 0x5e);
-    pb2(text, 0x41, 0x5d);
-    pb2(text, 0x41, 0x5c);
+    rl_pb2(text, 0x41, 0x5e);
+    rl_pb2(text, 0x41, 0x5d);
+    rl_pb2(text, 0x41, 0x5c);
     text.push(0x5b & 0xFF);
     text.push(0xc3 & 0xFF);
     add_sym(symbols, text, "p_simd_sum");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_simd_scale");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_simd_from_vec");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_simd_to_str");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     // HTTP stubs
     add_sym(symbols, text, "p_socket_listen");
-    if has_caps && !cap_granted(caps_set, "Net") { trap_stub(text); } else { pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3); }
+    if has_caps && !cap_granted(caps_set, "Net") { trap_stub(text); } else { rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3); }
 
     add_sym(symbols, text, "p_socket_accept");
-    if has_caps && !cap_granted(caps_set, "Net") { trap_stub(text); } else { pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3); }
+    if has_caps && !cap_granted(caps_set, "Net") { trap_stub(text); } else { rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3); }
 
     add_sym(symbols, text, "p_socket_read");
-    if has_caps && !cap_granted(caps_set, "Net") { trap_stub(text); } else { pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3); }
+    if has_caps && !cap_granted(caps_set, "Net") { trap_stub(text); } else { rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3); }
 
     add_sym(symbols, text, "p_socket_write");
-    if has_caps && !cap_granted(caps_set, "Net") { trap_stub(text); } else { pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3); }
+    if has_caps && !cap_granted(caps_set, "Net") { trap_stub(text); } else { rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3); }
 
     add_sym(symbols, text, "p_socket_close");
     if has_caps && !cap_granted(caps_set, "Net") { trap_stub(text); } else { text.push(0xc3); }
 
     add_sym(symbols, text, "p_socket_recv_str");
-    if has_caps && !cap_granted(caps_set, "Net") { trap_stub(text); } else { pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3); }
+    if has_caps && !cap_granted(caps_set, "Net") { trap_stub(text); } else { rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3); }
 
     add_sym(symbols, text, "p_http_parse_request");
-    if has_caps && !cap_granted(caps_set, "Net") { trap_stub(text); } else { pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3); }
+    if has_caps && !cap_granted(caps_set, "Net") { trap_stub(text); } else { rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3); }
 
     add_sym(symbols, text, "p_http_build_response");
-    if has_caps && !cap_granted(caps_set, "Net") { trap_stub(text); } else { pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3); }
+    if has_caps && !cap_granted(caps_set, "Net") { trap_stub(text); } else { rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3); }
 
     // Database functions -- implemented below
     // p_db_mem_open, p_db_mem_close, p_db_mem_exec, p_db_mem_query
@@ -3292,25 +3321,25 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.push(0xc3);
 
     add_sym(symbols, text, "p_inb");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_outb");
     text.push(0xc3);
 
     add_sym(symbols, text, "p_cr3_read");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_cr3_write");
     text.push(0xc3);
 
     add_sym(symbols, text, "p_cr0_read");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_cr0_write");
     text.push(0xc3);
 
     add_sym(symbols, text, "p_cr4_read");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_cr4_write");
     text.push(0xc3);
@@ -3325,7 +3354,7 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.push(0xc3);
 
     add_sym(symbols, text, "p_phys_read64");
-    pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
+    rl_pb3(text, 0x48, 0x31, 0xc0); text.push(0xc3);
 
     add_sym(symbols, text, "p_phys_write64");
     text.push(0xc3);
@@ -3338,15 +3367,15 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // p_db_mem_open() -> rax = db pointer
     // Allocates 4096 bytes, sets count=0
     add_sym(symbols, text, "p_db_mem_open");
-    pb7(text, 0x48, 0xc7, 0xc7, 0x00, 0x10, 0x00, 0x00);
-    pb5(text, 0xe8, 0, 0, 0, 0);
+    rl_pb7(text, 0x48, 0xc7, 0xc7, 0x00, 0x10, 0x00, 0x00);
+    rl_pb5(text, 0xe8, 0, 0, 0, 0);
     var dbopen_call_off: i64 = text.len() - 4;
-    pb7(text, 0x48, 0xc7, 0x00, 0x00, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0xc7, 0x00, 0x00, 0x00, 0x00, 0x00);
     text.push(0xc3 & 0xFF);
     // p_db_mem_close(rdi = db) -> void
     // Just calls p_free
     add_sym(symbols, text, "p_db_mem_close");
-    pb5(text, 0xe8, 0, 0, 0, 0);
+    rl_pb5(text, 0xe8, 0, 0, 0, 0);
     var dbclose_call_off: i64 = text.len() - 4;
     text.push(0xc3 & 0xFF);
     // p_db_mem_exec(rdi = db, rsi = query) -> rax = 1 on success, 0 on failure
@@ -3358,26 +3387,26 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     add_sym(symbols, text, "p_db_mem_exec");
     // pushq %rbx, %r12, %r13
     text.push(0x53 & 0xFF);
-    pb2(text, 0x41, 0x54);
-    pb2(text, 0x41, 0x55);
+    rl_pb2(text, 0x41, 0x54);
+    rl_pb2(text, 0x41, 0x55);
     // (3 pushes = 24 bytes, rsp = 8+24 = 32  0 mod 16 -- aligned, no subq needed)
     // rbx = db, r12 = query cursor
-    pb3(text, 0x48, 0x89, 0xfb);
-    pb3(text, 0x49, 0x89, 0xf4);
+    rl_pb3(text, 0x48, 0x89, 0xfb);
+    rl_pb3(text, 0x49, 0x89, 0xf4);
     // Find first space: advance r12 until ' '
     // .find_space:
     var dbexec_fs: i64 = text.len();
-    pb5(text, 0x41, 0x0f, 0xb6, 0x04, 0x24);
-    pb2(text, 0x84, 0xc0);
+    rl_pb5(text, 0x41, 0x0f, 0xb6, 0x04, 0x24);
+    rl_pb2(text, 0x84, 0xc0);
     var dbexec_fail1_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
-    pb2(text, 0x3c, 0x20);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb2(text, 0x3c, 0x20);
     var dbexec_found_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
-    pb3(text, 0x49, 0xff, 0xc4);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb3(text, 0x49, 0xff, 0xc4);
     var dbexec_fs_jmp: i64 = text.len();
     var dbexec_fs_back: i64 = dbexec_fs - dbexec_fs_jmp - 2;
-    pb2(text, 0xeb, (dbexec_fs_back) & 0xFF);
+    rl_pb2(text, 0xeb, (dbexec_fs_back) & 0xFF);
     // .found_space:
     var dbexec_found: i64 = text.len();
     var dbexec_found_rel: i64 = (dbexec_found - dbexec_found_je - 6);
@@ -3388,14 +3417,14 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // Skip spaces
     // .skip_spaces:
     var dbexec_skip: i64 = text.len();
-    pb5(text, 0x41, 0x0f, 0xb6, 0x04, 0x24);
-    pb2(text, 0x3c, 0x20);
+    rl_pb5(text, 0x41, 0x0f, 0xb6, 0x04, 0x24);
+    rl_pb2(text, 0x3c, 0x20);
     var dbexec_keystart_jne: i64 = text.len();
-    pb6(text, 0x0f, 0x85, 0, 0, 0, 0);
-    pb3(text, 0x49, 0xff, 0xc4);
+    rl_pb6(text, 0x0f, 0x85, 0, 0, 0, 0);
+    rl_pb3(text, 0x49, 0xff, 0xc4);
     var dbexec_skip_jmp: i64 = text.len();
     var dbexec_skip_back: i64 = dbexec_skip - dbexec_skip_jmp - 2;
-    pb2(text, 0xeb, (dbexec_skip_back) & 0xFF);
+    rl_pb2(text, 0xeb, (dbexec_skip_back) & 0xFF);
     // .key_start:
     var dbexec_keystart: i64 = text.len();
     var dbexec_keystart_rel: i64 = (dbexec_keystart - dbexec_keystart_jne - 6);
@@ -3404,21 +3433,21 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.set(dbexec_keystart_jne + 4, (dbexec_keystart_rel >> 16) & 0xFF);
     text.set(dbexec_keystart_jne + 5, (dbexec_keystart_rel >> 24) & 0xFF);
     // r13 = r12 (key start pointer)
-    pb3(text, 0x4d, 0x89, 0xe5);
+    rl_pb3(text, 0x4d, 0x89, 0xe5);
     // Find end of key: advance r12 until ' ' or '\0'
     // .find_key_end:
     var dbexec_keyend: i64 = text.len();
-    pb5(text, 0x41, 0x0f, 0xb6, 0x04, 0x24);
-    pb2(text, 0x84, 0xc0);
+    rl_pb5(text, 0x41, 0x0f, 0xb6, 0x04, 0x24);
+    rl_pb2(text, 0x84, 0xc0);
     var dbexec_havekey_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
-    pb2(text, 0x3c, 0x20);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb2(text, 0x3c, 0x20);
     var dbexec_havekey_je2: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
-    pb3(text, 0x49, 0xff, 0xc4);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb3(text, 0x49, 0xff, 0xc4);
     var dbexec_keyend_jmp: i64 = text.len();
     var dbexec_keyend_back: i64 = dbexec_keyend - dbexec_keyend_jmp - 2;
-    pb2(text, 0xeb, (dbexec_keyend_back) & 0xFF);
+    rl_pb2(text, 0xeb, (dbexec_keyend_back) & 0xFF);
     // .have_key:
     var dbexec_havekey: i64 = text.len();
     var dbexec_havekey_rel: i64 = (dbexec_havekey - dbexec_havekey_je - 6);
@@ -3432,24 +3461,24 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.set(dbexec_havekey_je2 + 4, (dbexec_havekey_rel2 >> 16) & 0xFF);
     text.set(dbexec_havekey_je2 + 5, (dbexec_havekey_rel2 >> 24) & 0xFF);
     // r12 = r12 - r13 (key length)
-    pb3(text, 0x4d, 0x29, 0xec);
+    rl_pb3(text, 0x4d, 0x29, 0xec);
     // Store key_ptr and key_len in database at entry[count]
     // rax = count = *(%rbx)
-    pb3(text, 0x48, 0x8b, 0x03);
+    rl_pb3(text, 0x48, 0x8b, 0x03);
     // rcx = rbx + 8 + count*16 = rbx + 8 + (count << 4)
-    pb4(text, 0x48, 0xc1, 0xe0, 0x04);
-    pb5(text, 0x48, 0x8d, 0x4c, 0x03, 0x08);
+    rl_pb4(text, 0x48, 0xc1, 0xe0, 0x04);
+    rl_pb5(text, 0x48, 0x8d, 0x4c, 0x03, 0x08);
     // movq %r13, (%rcx) -- store key_ptr
-    pb3(text, 0x4c, 0x89, 0x29);
+    rl_pb3(text, 0x4c, 0x89, 0x29);
     // movq %r12, 8(%rcx) -- store key_len
-    pb4(text, 0x4c, 0x89, 0x61, 0x08);
+    rl_pb4(text, 0x4c, 0x89, 0x61, 0x08);
     // incq (%rbx) -- count++
-    pb3(text, 0x48, 0xff, 0x03);
+    rl_pb3(text, 0x48, 0xff, 0x03);
     // Return 1
-    pb7(text, 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00);
     // jmp .done
     var dbexec_done_jmp: i64 = text.len();
-    pb2(text, 0xeb, 0x00);
+    rl_pb2(text, 0xeb, 0x00);
     // .fail:
     var dbexec_fail: i64 = text.len();
     var dbexec_fail1_rel: i64 = (dbexec_fail - dbexec_fail1_je - 6);
@@ -3457,14 +3486,14 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.set(dbexec_fail1_je + 3, (dbexec_fail1_rel >> 8) & 0xFF);
     text.set(dbexec_fail1_je + 4, (dbexec_fail1_rel >> 16) & 0xFF);
     text.set(dbexec_fail1_je + 5, (dbexec_fail1_rel >> 24) & 0xFF);
-    pb7(text, 0x48, 0xc7, 0xc0, 0x00, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0xc7, 0xc0, 0x00, 0x00, 0x00, 0x00);
     // .done:
     var dbexec_done: i64 = text.len();
     var dbexec_done_rel: i64 = (dbexec_done - dbexec_done_jmp - 2) & 0xFF;
     text.set(dbexec_done_jmp + 1, (dbexec_done_rel) & 0xFF);
     // popq %r13, %r12, %rbx
-    pb2(text, 0x41, 0x5d);
-    pb2(text, 0x41, 0x5c);
+    rl_pb2(text, 0x41, 0x5d);
+    rl_pb2(text, 0x41, 0x5c);
     text.push(0x5b & 0xFF);
     text.push(0xc3 & 0xFF);
     // p_db_mem_query(rdi = db, rsi = query) -> rax = JSON string pointer
@@ -3473,42 +3502,42 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     add_sym(symbols, text, "p_db_mem_query");
     // pushq %rbx, %r12, %r13, %r14, %r15
     text.push(0x53 & 0xFF);
-    pb2(text, 0x41, 0x54);
-    pb2(text, 0x41, 0x55);
-    pb2(text, 0x41, 0x56);
-    pb2(text, 0x41, 0x57);
-    pb4(text, 0x48, 0x83, 0xec, 0x10);
+    rl_pb2(text, 0x41, 0x54);
+    rl_pb2(text, 0x41, 0x55);
+    rl_pb2(text, 0x41, 0x56);
+    rl_pb2(text, 0x41, 0x57);
+    rl_pb4(text, 0x48, 0x83, 0xec, 0x10);
     // rbx = db
-    pb3(text, 0x48, 0x89, 0xfb);
+    rl_pb3(text, 0x48, 0x89, 0xfb);
     // Allocate output buffer: 4096 bytes
-    pb7(text, 0x48, 0xc7, 0xc7, 0x00, 0x10, 0x00, 0x00);
-    pb5(text, 0xe8, 0, 0, 0, 0);
+    rl_pb7(text, 0x48, 0xc7, 0xc7, 0x00, 0x10, 0x00, 0x00);
+    rl_pb5(text, 0xe8, 0, 0, 0, 0);
     var dbquery_malloc_call: i64 = text.len() - 4;
     // r13 = rax (output buffer)
-    pb3(text, 0x49, 0x89, 0xc5);
+    rl_pb3(text, 0x49, 0x89, 0xc5);
     // r14 = 0 (write index)
-    pb3(text, 0x4d, 0x31, 0xf6);
+    rl_pb3(text, 0x4d, 0x31, 0xf6);
     // Write '[' at output[0]
-    pb5(text, 0x41, 0xc6, 0x45, 0x00, 0x5b);
-    pb3(text, 0x49, 0xff, 0xc6);
+    rl_pb5(text, 0x41, 0xc6, 0x45, 0x00, 0x5b);
+    rl_pb3(text, 0x49, 0xff, 0xc6);
     // r15 = 0 (key index)
-    pb3(text, 0x4d, 0x31, 0xff);
+    rl_pb3(text, 0x4d, 0x31, 0xff);
     // r12 = count = *(%rbx)
-    pb3(text, 0x4c, 0x8b, 0x23);
+    rl_pb3(text, 0x4c, 0x8b, 0x23);
     // .query_loop:
     var dbquery_loop: i64 = text.len();
-    pb3(text, 0x4d, 0x39, 0xfc);
+    rl_pb3(text, 0x4d, 0x39, 0xfc);
     var dbquery_done_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
     // If not first key, write ','
-    pb4(text, 0x49, 0x83, 0xff, 0x00);
+    rl_pb4(text, 0x49, 0x83, 0xff, 0x00);
     var dbquery_nocomma_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
     // Write ',' at output[r14]: leaq (%r13,%r14,1), %rax ; movb $',', (%rax)
     // REX.WXB=0x4b, SIB index=6(r14), base=5(r13) -> 0x35
-    pb5(text, 0x4b, 0x8d, 0x44, 0x35, 0x00);
-    pb3(text, 0xc6, 0x00, 0x2c);
-    pb3(text, 0x49, 0xff, 0xc6);
+    rl_pb5(text, 0x4b, 0x8d, 0x44, 0x35, 0x00);
+    rl_pb3(text, 0xc6, 0x00, 0x2c);
+    rl_pb3(text, 0x49, 0xff, 0xc6);
     // .no_comma:
     var dbquery_nocomma: i64 = text.len();
     var dbquery_nocomma_rel: i64 = (dbquery_nocomma - dbquery_nocomma_je - 6);
@@ -3517,44 +3546,44 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.set(dbquery_nocomma_je + 4, (dbquery_nocomma_rel >> 16) & 0xFF);
     text.set(dbquery_nocomma_je + 5, (dbquery_nocomma_rel >> 24) & 0xFF);
     // Write '"'
-    pb5(text, 0x4b, 0x8d, 0x44, 0x35, 0x00);
-    pb3(text, 0xc6, 0x00, 0x22);
-    pb3(text, 0x49, 0xff, 0xc6);
+    rl_pb5(text, 0x4b, 0x8d, 0x44, 0x35, 0x00);
+    rl_pb3(text, 0xc6, 0x00, 0x22);
+    rl_pb3(text, 0x49, 0xff, 0xc6);
     // Get entry address: r15 * 16 + 8 + rbx
     // rax = r15 ; shlq $4, rax ; leaq 8(%rbx,%rax,1), %rax
-    pb3(text, 0x4c, 0x89, 0xf8);
-    pb4(text, 0x48, 0xc1, 0xe0, 0x04);
-    pb5(text, 0x48, 0x8d, 0x44, 0x03, 0x08);
+    rl_pb3(text, 0x4c, 0x89, 0xf8);
+    rl_pb4(text, 0x48, 0xc1, 0xe0, 0x04);
+    rl_pb5(text, 0x48, 0x8d, 0x44, 0x03, 0x08);
     // rax = &entry.key_ptr. Load key_ptr and key_len.
     // Save entry addr on stack: movq %rax, (%rsp)
-    pb4(text, 0x48, 0x89, 0x04, 0x24);
+    rl_pb4(text, 0x48, 0x89, 0x04, 0x24);
     // rcx = key_ptr = *(%rax)
-    pb3(text, 0x48, 0x8b, 0x08);
+    rl_pb3(text, 0x48, 0x8b, 0x08);
     // rdx = key_len = 8(%rax)
-    pb4(text, 0x48, 0x8b, 0x50, 0x08);
+    rl_pb4(text, 0x48, 0x8b, 0x50, 0x08);
     // Save key_len on stack: movq %rdx, 8(%rsp)
-    pb5(text, 0x48, 0x89, 0x54, 0x24, 0x08);
+    rl_pb5(text, 0x48, 0x89, 0x54, 0x24, 0x08);
     // .key_copy_loop:
     var dbquery_kcl: i64 = text.len();
     // cmpq $0, 8(%rsp) -- compare remaining len with 0
-    pb6(text, 0x48, 0x83, 0x7c, 0x24, 0x08, 0x00);
+    rl_pb6(text, 0x48, 0x83, 0x7c, 0x24, 0x08, 0x00);
     var dbquery_kcdone_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
     // movzbl (%rcx), %eax
-    pb3(text, 0x0f, 0xb6, 0x01);
+    rl_pb3(text, 0x0f, 0xb6, 0x01);
     // Store byte: leaq (%r13,%r14,1), %rdx ; movb %al, (%rdx)
-    pb5(text, 0x4b, 0x8d, 0x54, 0x35, 0x00);
-    pb2(text, 0x88, 0x02);
+    rl_pb5(text, 0x4b, 0x8d, 0x54, 0x35, 0x00);
+    rl_pb2(text, 0x88, 0x02);
     // incq %r14
-    pb3(text, 0x49, 0xff, 0xc6);
+    rl_pb3(text, 0x49, 0xff, 0xc6);
     // incq %rcx (key cursor)
-    pb3(text, 0x48, 0xff, 0xc1);
+    rl_pb3(text, 0x48, 0xff, 0xc1);
     // decq 8(%rsp) (remaining len--)
-    pb5(text, 0x48, 0xff, 0x4c, 0x24, 0x08);
+    rl_pb5(text, 0x48, 0xff, 0x4c, 0x24, 0x08);
     // jmp .key_copy_loop
     var dbquery_kcl_jmp: i64 = text.len();
     var dbquery_kcl_back: i64 = dbquery_kcl - dbquery_kcl_jmp - 2;
-    pb2(text, 0xeb, (dbquery_kcl_back) & 0xFF);
+    rl_pb2(text, 0xeb, (dbquery_kcl_back) & 0xFF);
     // .key_copy_done:
     var dbquery_kcdone: i64 = text.len();
     var dbquery_kcdone_rel: i64 = (dbquery_kcdone - dbquery_kcdone_je - 6);
@@ -3563,15 +3592,15 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.set(dbquery_kcdone_je + 4, (dbquery_kcdone_rel >> 16) & 0xFF);
     text.set(dbquery_kcdone_je + 5, (dbquery_kcdone_rel >> 24) & 0xFF);
     // Write closing '"'
-    pb5(text, 0x4b, 0x8d, 0x44, 0x35, 0x00);
-    pb3(text, 0xc6, 0x00, 0x22);
-    pb3(text, 0x49, 0xff, 0xc6);
+    rl_pb5(text, 0x4b, 0x8d, 0x44, 0x35, 0x00);
+    rl_pb3(text, 0xc6, 0x00, 0x22);
+    rl_pb3(text, 0x49, 0xff, 0xc6);
     // incq %r15 (key index)
-    pb3(text, 0x49, 0xff, 0xc7);
+    rl_pb3(text, 0x49, 0xff, 0xc7);
     // jmp .query_loop
     var dbquery_loop_jmp: i64 = text.len();
     var dbquery_loop_back: i64 = dbquery_loop - dbquery_loop_jmp - 2;
-    pb2(text, 0xeb, (dbquery_loop_back) & 0xFF);
+    rl_pb2(text, 0xeb, (dbquery_loop_back) & 0xFF);
     // .query_done:
     var dbquery_done: i64 = text.len();
     var dbquery_done_rel: i64 = (dbquery_done - dbquery_done_je - 6);
@@ -3580,21 +3609,21 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.set(dbquery_done_je + 4, (dbquery_done_rel >> 16) & 0xFF);
     text.set(dbquery_done_je + 5, (dbquery_done_rel >> 24) & 0xFF);
     // Write ']'
-    pb5(text, 0x4b, 0x8d, 0x44, 0x35, 0x00);
-    pb3(text, 0xc6, 0x00, 0x5d);
-    pb3(text, 0x49, 0xff, 0xc6);
+    rl_pb5(text, 0x4b, 0x8d, 0x44, 0x35, 0x00);
+    rl_pb3(text, 0xc6, 0x00, 0x5d);
+    rl_pb3(text, 0x49, 0xff, 0xc6);
     // Null-terminate
-    pb5(text, 0x4b, 0x8d, 0x44, 0x35, 0x00);
-    pb3(text, 0xc6, 0x00, 0x00);
+    rl_pb5(text, 0x4b, 0x8d, 0x44, 0x35, 0x00);
+    rl_pb3(text, 0xc6, 0x00, 0x00);
     // rax = r13 (return output buffer)
-    pb3(text, 0x4c, 0x89, 0xe8);
+    rl_pb3(text, 0x4c, 0x89, 0xe8);
     // addq $16, %rsp
-    pb4(text, 0x48, 0x83, 0xc4, 0x10);
+    rl_pb4(text, 0x48, 0x83, 0xc4, 0x10);
     // popq %r15, %r14, %r13, %r12, %rbx
-    pb2(text, 0x41, 0x5f);
-    pb2(text, 0x41, 0x5e);
-    pb2(text, 0x41, 0x5d);
-    pb2(text, 0x41, 0x5c);
+    rl_pb2(text, 0x41, 0x5f);
+    rl_pb2(text, 0x41, 0x5e);
+    rl_pb2(text, 0x41, 0x5d);
+    rl_pb2(text, 0x41, 0x5c);
     text.push(0x5b & 0xFF);
     text.push(0xc3 & 0xFF);
     // =======================================================================
@@ -3605,31 +3634,31 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     add_sym(symbols, text, "p_json_len");
     // pushq %rbx, %r12
     text.push(0x53 & 0xFF);
-    pb2(text, 0x41, 0x54);
+    rl_pb2(text, 0x41, 0x54);
     // rbx = json_str, r12 = 0 (count)
-    pb3(text, 0x48, 0x89, 0xfb);
-    pb3(text, 0x4d, 0x31, 0xe4);
+    rl_pb3(text, 0x48, 0x89, 0xfb);
+    rl_pb3(text, 0x4d, 0x31, 0xe4);
     // Skip to '[': find first '['
     // .find_bracket:
     var jlen_fb: i64 = text.len();
     // movzbl (%rbx), %eax
-    pb3(text, 0x0f, 0xb6, 0x03);
+    rl_pb3(text, 0x0f, 0xb6, 0x03);
     // testb %al, %al -> end of string, return 0
-    pb2(text, 0x84, 0xc0);
+    rl_pb2(text, 0x84, 0xc0);
     // jz .done
     var jlen_done1_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
     // cmpb $0x5b, %al -> '['
-    pb2(text, 0x3c, 0x5b);
+    rl_pb2(text, 0x3c, 0x5b);
     // je .in_array
     var jlen_inarr_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
     // incq %rbx
-    pb3(text, 0x48, 0xff, 0xc3);
+    rl_pb3(text, 0x48, 0xff, 0xc3);
     // jmp .find_bracket
     var jlen_fb_jmp: i64 = text.len();
     var jlen_fb_back: i64 = jlen_fb - jlen_fb_jmp - 2;
-    pb2(text, 0xeb, (jlen_fb_back) & 0xFF);
+    rl_pb2(text, 0xeb, (jlen_fb_back) & 0xFF);
     // .in_array:
     var jlen_inarr: i64 = text.len();
     var jlen_inarr_rel: i64 = (jlen_inarr - jlen_inarr_je - 6);
@@ -3638,36 +3667,36 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.set(jlen_inarr_je + 4, (jlen_inarr_rel >> 16) & 0xFF);
     text.set(jlen_inarr_je + 5, (jlen_inarr_rel >> 24) & 0xFF);
     // incq %rbx (skip past '[')
-    pb3(text, 0x48, 0xff, 0xc3);
+    rl_pb3(text, 0x48, 0xff, 0xc3);
     // Check for empty array: movzbl (%rbx), %eax ; cmpb $']', %al
-    pb3(text, 0x0f, 0xb6, 0x03);
-    pb2(text, 0x3c, 0x5d);
+    rl_pb3(text, 0x0f, 0xb6, 0x03);
+    rl_pb2(text, 0x3c, 0x5d);
     // je .done (empty array -> count = 0)
     var jlen_done2_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
     // Not empty -> count = 1
-    pb7(text, 0x49, 0xc7, 0xc4, 0x01, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x49, 0xc7, 0xc4, 0x01, 0x00, 0x00, 0x00);
     // .scan:
     var jlen_scan: i64 = text.len();
     // movzbl (%rbx), %eax
-    pb3(text, 0x0f, 0xb6, 0x03);
+    rl_pb3(text, 0x0f, 0xb6, 0x03);
     // testb %al, %al -> end of string
-    pb2(text, 0x84, 0xc0);
+    rl_pb2(text, 0x84, 0xc0);
     // jz .done
     var jlen_done3_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
     // cmpb $0x5d, %al -> ']'
-    pb2(text, 0x3c, 0x5d);
+    rl_pb2(text, 0x3c, 0x5d);
     // je .done
     var jlen_done4_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
     // cmpb $0x2c, %al -> ','
-    pb2(text, 0x3c, 0x2c);
+    rl_pb2(text, 0x3c, 0x2c);
     // jne .next
     var jlen_next_jne: i64 = text.len();
-    pb6(text, 0x0f, 0x85, 0, 0, 0, 0);
+    rl_pb6(text, 0x0f, 0x85, 0, 0, 0, 0);
     // incq %r12 (count++)
-    pb3(text, 0x49, 0xff, 0xc4);
+    rl_pb3(text, 0x49, 0xff, 0xc4);
     // .next:
     var jlen_next: i64 = text.len();
     var jlen_next_rel: i64 = (jlen_next - jlen_next_jne - 6);
@@ -3676,11 +3705,11 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.set(jlen_next_jne + 4, (jlen_next_rel >> 16) & 0xFF);
     text.set(jlen_next_jne + 5, (jlen_next_rel >> 24) & 0xFF);
     // incq %rbx
-    pb3(text, 0x48, 0xff, 0xc3);
+    rl_pb3(text, 0x48, 0xff, 0xc3);
     // jmp .scan
     var jlen_scan_jmp: i64 = text.len();
     var jlen_scan_back: i64 = jlen_scan - jlen_scan_jmp - 2;
-    pb2(text, 0xeb, (jlen_scan_back) & 0xFF);
+    rl_pb2(text, 0xeb, (jlen_scan_back) & 0xFF);
     // .done:
     var jlen_done: i64 = text.len();
     // Patch all je's to here
@@ -3694,9 +3723,9 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     var jlen_done_rel4: i64 = jlen_done - jlen_done4_je - 6;
     text.set(jlen_done4_je + 2, (jlen_done_rel4 & 0xFF)); text.set(jlen_done4_je + 3, ((jlen_done_rel4 >> 8) & 0xFF)); text.set(jlen_done4_je + 4, ((jlen_done_rel4 >> 16) & 0xFF)); text.set(jlen_done4_je + 5, ((jlen_done_rel4 >> 24) & 0xFF));
     // rax = r12 (count)
-    pb3(text, 0x4c, 0x89, 0xe0);
+    rl_pb3(text, 0x4c, 0x89, 0xe0);
     // popq %r12, %rbx
-    pb2(text, 0x41, 0x5c);
+    rl_pb2(text, 0x41, 0x5c);
     text.push(0x5b & 0xFF);
     text.push(0xc3 & 0xFF);
     // p_json_at(rdi = json_str, rsi = index) -> rax = element string pointer
@@ -3705,31 +3734,31 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     add_sym(symbols, text, "p_json_at");
     // pushq %rbx, %r12, %r13, %r14
     text.push(0x53 & 0xFF);
-    pb2(text, 0x41, 0x54);
-    pb2(text, 0x41, 0x55);
-    pb2(text, 0x41, 0x56);
-    pb4(text, 0x48, 0x83, 0xec, 0x08);
+    rl_pb2(text, 0x41, 0x54);
+    rl_pb2(text, 0x41, 0x55);
+    rl_pb2(text, 0x41, 0x56);
+    rl_pb4(text, 0x48, 0x83, 0xec, 0x08);
     // rbx = json_str, r12 = target index
-    pb3(text, 0x48, 0x89, 0xfb);
-    pb3(text, 0x49, 0x89, 0xf4);
+    rl_pb3(text, 0x48, 0x89, 0xfb);
+    rl_pb3(text, 0x49, 0x89, 0xf4);
     // r13 = 0 (current index)
-    pb3(text, 0x4d, 0x31, 0xed);
+    rl_pb3(text, 0x4d, 0x31, 0xed);
     // Skip to '['
     // .find_bracket:
     var jat_fb: i64 = text.len();
-    pb3(text, 0x0f, 0xb6, 0x03);
-    pb2(text, 0x84, 0xc0);
+    rl_pb3(text, 0x0f, 0xb6, 0x03);
+    rl_pb2(text, 0x84, 0xc0);
     // jz .ret_empty
     var jat_empty_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
-    pb2(text, 0x3c, 0x5b);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb2(text, 0x3c, 0x5b);
     // je .in_array
     var jat_inarr_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
-    pb3(text, 0x48, 0xff, 0xc3);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb3(text, 0x48, 0xff, 0xc3);
     var jat_fb_jmp: i64 = text.len();
     var jat_fb_back: i64 = jat_fb - jat_fb_jmp - 2;
-    pb2(text, 0xeb, (jat_fb_back) & 0xFF);
+    rl_pb2(text, 0xeb, (jat_fb_back) & 0xFF);
     // .in_array:
     var jat_inarr: i64 = text.len();
     var jat_inarr_rel: i64 = (jat_inarr - jat_inarr_je - 6);
@@ -3738,25 +3767,25 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.set(jat_inarr_je + 4, (jat_inarr_rel >> 16) & 0xFF);
     text.set(jat_inarr_je + 5, (jat_inarr_rel >> 24) & 0xFF);
     // incq %rbx (skip '[')
-    pb3(text, 0x48, 0xff, 0xc3);
+    rl_pb3(text, 0x48, 0xff, 0xc3);
     // .find_quote:
     var jat_fq: i64 = text.len();
     // movzbl (%rbx), %eax
-    pb3(text, 0x0f, 0xb6, 0x03);
-    pb2(text, 0x84, 0xc0);
+    rl_pb3(text, 0x0f, 0xb6, 0x03);
+    rl_pb2(text, 0x84, 0xc0);
     // jz .ret_empty
     var jat_empty2_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
     // cmpb $0x22, %al -> '"'
-    pb2(text, 0x3c, 0x22);
+    rl_pb2(text, 0x3c, 0x22);
     // je .found_quote
     var jat_fqfound_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
     // incq %rbx
-    pb3(text, 0x48, 0xff, 0xc3);
+    rl_pb3(text, 0x48, 0xff, 0xc3);
     var jat_fq_jmp: i64 = text.len();
     var jat_fq_back: i64 = jat_fq - jat_fq_jmp - 2;
-    pb2(text, 0xeb, (jat_fq_back) & 0xFF);
+    rl_pb2(text, 0xeb, (jat_fq_back) & 0xFF);
     // .found_quote:
     var jat_fqfound: i64 = text.len();
     var jat_fqfound_rel: i64 = (jat_fqfound - jat_fqfound_je - 6);
@@ -3767,27 +3796,27 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // Check if this is the target index
     // cmpq %r13, %r12 -> compares target with current
     // je .extract -- if target == current, extract this string
-    pb3(text, 0x4d, 0x39, 0xec);
+    rl_pb3(text, 0x4d, 0x39, 0xec);
     var jat_extract_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
     // Not target -> skip this string, find next quote
     // incq %rbx (skip past opening quote)
-    pb3(text, 0x48, 0xff, 0xc3);
+    rl_pb3(text, 0x48, 0xff, 0xc3);
     // .skip_str:
     var jat_skip: i64 = text.len();
-    pb3(text, 0x0f, 0xb6, 0x03);
-    pb2(text, 0x84, 0xc0);
+    rl_pb3(text, 0x0f, 0xb6, 0x03);
+    rl_pb2(text, 0x84, 0xc0);
     // jz .ret_empty
     var jat_empty3_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
-    pb2(text, 0x3c, 0x22);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb2(text, 0x3c, 0x22);
     // je .str_end
     var jat_strend_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
-    pb3(text, 0x48, 0xff, 0xc3);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb3(text, 0x48, 0xff, 0xc3);
     var jat_skip_jmp: i64 = text.len();
     var jat_skip_back: i64 = jat_skip - jat_skip_jmp - 2;
-    pb2(text, 0xeb, (jat_skip_back) & 0xFF);
+    rl_pb2(text, 0xeb, (jat_skip_back) & 0xFF);
     // .str_end:
     var jat_strend: i64 = text.len();
     var jat_strend_rel: i64 = (jat_strend - jat_strend_je - 6);
@@ -3796,13 +3825,13 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.set(jat_strend_je + 4, (jat_strend_rel >> 16) & 0xFF);
     text.set(jat_strend_je + 5, (jat_strend_rel >> 24) & 0xFF);
     // incq %rbx (skip past closing quote)
-    pb3(text, 0x48, 0xff, 0xc3);
+    rl_pb3(text, 0x48, 0xff, 0xc3);
     // incq %r13 (current index++)
-    pb3(text, 0x49, 0xff, 0xc5);
+    rl_pb3(text, 0x49, 0xff, 0xc5);
     // jmp .find_quote (find next opening quote)
     var jat_fq2_jmp: i64 = text.len();
     var jat_fq2_back: i64 = jat_fq - jat_fq2_jmp - 2;
-    pb2(text, 0xeb, (jat_fq2_back) & 0xFF);
+    rl_pb2(text, 0xeb, (jat_fq2_back) & 0xFF);
     // .extract:
     var jat_extract: i64 = text.len();
     var jat_extract_rel: i64 = (jat_extract - jat_extract_je - 6);
@@ -3813,24 +3842,24 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // rbx points to opening quote of target string
     // Find closing quote
     // incq %rbx (skip opening quote)
-    pb3(text, 0x48, 0xff, 0xc3);
+    rl_pb3(text, 0x48, 0xff, 0xc3);
     // r14 = rbx (start of string content)
-    pb3(text, 0x49, 0x89, 0xde);
+    rl_pb3(text, 0x49, 0x89, 0xde);
     // .find_close:
     var jat_fclose: i64 = text.len();
-    pb3(text, 0x0f, 0xb6, 0x03);
-    pb2(text, 0x84, 0xc0);
+    rl_pb3(text, 0x0f, 0xb6, 0x03);
+    rl_pb2(text, 0x84, 0xc0);
     // jz .ret_empty
     var jat_empty4_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
-    pb2(text, 0x3c, 0x22);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb2(text, 0x3c, 0x22);
     // je .copy_str
     var jat_copy_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
-    pb3(text, 0x48, 0xff, 0xc3);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb3(text, 0x48, 0xff, 0xc3);
     var jat_fclose_jmp: i64 = text.len();
     var jat_fclose_back: i64 = jat_fclose - jat_fclose_jmp - 2;
-    pb2(text, 0xeb, (jat_fclose_back) & 0xFF);
+    rl_pb2(text, 0xeb, (jat_fclose_back) & 0xFF);
     // .copy_str:
     var jat_copy: i64 = text.len();
     var jat_copy_rel: i64 = (jat_copy - jat_copy_je - 6);
@@ -3844,42 +3873,42 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // We need to return "string" (with quotes) as per json::dump
     // Allocate (rbx - r14 + 3) bytes: " + string + " + \0
     // rax = rbx - r14 (string length)
-    pb3(text, 0x48, 0x89, 0xd8);
+    rl_pb3(text, 0x48, 0x89, 0xd8);
     // subq %r14, %rax -> REX.WR (W=1, R=1 for r14 in reg field), 29, ModRM=F0 (mod=11, reg=110=r14, rm=000=rax)
-    pb3(text, 0x4c, 0x29, 0xf0);
+    rl_pb3(text, 0x4c, 0x29, 0xf0);
     // rax = length + 3 (for two quotes and null)
-    pb4(text, 0x48, 0x83, 0xc0, 0x03);
+    rl_pb4(text, 0x48, 0x83, 0xc0, 0x03);
     // movq %rax, %rdi
-    pb3(text, 0x48, 0x89, 0xc7);
+    rl_pb3(text, 0x48, 0x89, 0xc7);
     // call p_malloc
-    pb5(text, 0xe8, 0, 0, 0, 0);
+    rl_pb5(text, 0xe8, 0, 0, 0, 0);
     var jat_malloc_call: i64 = text.len() - 4;
     // r13 = rax (output buffer)
-    pb3(text, 0x49, 0x89, 0xc5);
+    rl_pb3(text, 0x49, 0x89, 0xc5);
     // Write opening quote: movb $0x22, 0(%r13)
-    pb5(text, 0x41, 0xc6, 0x45, 0x00, 0x22);
+    rl_pb5(text, 0x41, 0xc6, 0x45, 0x00, 0x22);
     // r12 = 1 (write index, after opening quote)
-    pb7(text, 0x49, 0xc7, 0xc4, 0x01, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x49, 0xc7, 0xc4, 0x01, 0x00, 0x00, 0x00);
     // Copy string bytes from r14 to r13+r12
     // .copy_loop:
     var jat_cploop: i64 = text.len();
     // cmpq %r14, %rbx -> sets flags for rbx - r14, je when rbx == r14 (src reached end)
-    pb3(text, 0x49, 0x39, 0xde);
+    rl_pb3(text, 0x49, 0x39, 0xde);
     // je .copy_done (when rbx == r14, i.e., src reached end)
     var jat_cpdone_je: i64 = text.len();
-    pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
+    rl_pb6(text, 0x0f, 0x84, 0, 0, 0, 0);
     // movzbl (%r14), %eax
-    pb4(text, 0x41, 0x0f, 0xb6, 0x06);
+    rl_pb4(text, 0x41, 0x0f, 0xb6, 0x06);
     // movb %al, 0(%r13,%r12,1) -- use mod=01 with disp8=0 to avoid r13-as-base bug
-    pb5(text, 0x43, 0x88, 0x44, 0x25, 0x00);
+    rl_pb5(text, 0x43, 0x88, 0x44, 0x25, 0x00);
     // incq %r12
-    pb3(text, 0x49, 0xff, 0xc4);
+    rl_pb3(text, 0x49, 0xff, 0xc4);
     // incq %r14
-    pb3(text, 0x49, 0xff, 0xc6);
+    rl_pb3(text, 0x49, 0xff, 0xc6);
     // jmp .copy_loop
     var jat_cploop_jmp: i64 = text.len();
     var jat_cploop_back: i64 = jat_cploop - jat_cploop_jmp - 2;
-    pb2(text, 0xeb, (jat_cploop_back) & 0xFF);
+    rl_pb2(text, 0xeb, (jat_cploop_back) & 0xFF);
     // .copy_done:
     var jat_cpdone: i64 = text.len();
     var jat_cpdone_rel: i64 = (jat_cpdone - jat_cpdone_je - 6);
@@ -3888,16 +3917,16 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.set(jat_cpdone_je + 4, (jat_cpdone_rel >> 16) & 0xFF);
     text.set(jat_cpdone_je + 5, (jat_cpdone_rel >> 24) & 0xFF);
     // Write closing quote: movb $0x22, 0(%r13,%r12,1)
-    pb6(text, 0x43, 0xc6, 0x44, 0x25, 0x00, 0x22);
+    rl_pb6(text, 0x43, 0xc6, 0x44, 0x25, 0x00, 0x22);
     // incq %r12
-    pb3(text, 0x49, 0xff, 0xc4);
+    rl_pb3(text, 0x49, 0xff, 0xc4);
     // Null-terminate: movb $0, 0(%r13,%r12,1)
-    pb6(text, 0x43, 0xc6, 0x44, 0x25, 0x00, 0x00);
+    rl_pb6(text, 0x43, 0xc6, 0x44, 0x25, 0x00, 0x00);
     // rax = r13 (return output)
-    pb3(text, 0x4c, 0x89, 0xe8);
+    rl_pb3(text, 0x4c, 0x89, 0xe8);
     // jmp .jat_done
     var jat_done_jmp: i64 = text.len();
-    pb2(text, 0xeb, 0x00);
+    rl_pb2(text, 0xeb, 0x00);
     // .ret_empty:
     var jat_empty: i64 = text.len();
     // Patch all empty je's
@@ -3910,20 +3939,20 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     var jat_empty_rel4: i64 = jat_empty - jat_empty4_je - 6;
     text.set(jat_empty4_je + 2, (jat_empty_rel4 & 0xFF)); text.set(jat_empty4_je + 3, ((jat_empty_rel4 >> 8) & 0xFF)); text.set(jat_empty4_je + 4, ((jat_empty_rel4 >> 16) & 0xFF)); text.set(jat_empty4_je + 5, ((jat_empty_rel4 >> 24) & 0xFF));
     // Return empty string: allocate 1 byte, store 0
-    pb7(text, 0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00);
-    pb5(text, 0xe8, 0, 0, 0, 0);
+    rl_pb7(text, 0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00);
+    rl_pb5(text, 0xe8, 0, 0, 0, 0);
     var jat_empty_malloc: i64 = text.len() - 4;
-    pb3(text, 0xc6, 0x00, 0x00);
+    rl_pb3(text, 0xc6, 0x00, 0x00);
     // .jat_done:
     var jat_done: i64 = text.len();
     var jat_done_rel: i64 = (jat_done - jat_done_jmp - 2) & 0xFF;
     text.set(jat_done_jmp + 1, (jat_done_rel) & 0xFF);
     // addq $8, %rsp
-    pb4(text, 0x48, 0x83, 0xc4, 0x08);
+    rl_pb4(text, 0x48, 0x83, 0xc4, 0x08);
     // popq %r14, %r13, %r12, %rbx
-    pb2(text, 0x41, 0x5e);
-    pb2(text, 0x41, 0x5d);
-    pb2(text, 0x41, 0x5c);
+    rl_pb2(text, 0x41, 0x5e);
+    rl_pb2(text, 0x41, 0x5d);
+    rl_pb2(text, 0x41, 0x5c);
     text.push(0x5b & 0xFF);
     text.push(0xc3 & 0xFF);
     // =======================================================================
@@ -3933,37 +3962,37 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // pledge_sqrt(rdi = double bits) -> rax = double bits
     // sqrtsd %xmm0, %xmm0 ; movsd %xmm0, (%rsp) ; movq (%rsp), %rax
     add_sym(symbols, text, "pledge_sqrt");
-    pb4(text, 0x48, 0x83, 0xec, 0x10);
-    pb4(text, 0x48, 0x89, 0x3c, 0x24);
-    pb5(text, 0xf2, 0x0f, 0x10, 0x04, 0x24);
-    pb4(text, 0xf2, 0x0f, 0x51, 0xc0);
-    pb5(text, 0xf2, 0x0f, 0x11, 0x04, 0x24);
-    pb4(text, 0x48, 0x8b, 0x04, 0x24);
-    pb4(text, 0x48, 0x83, 0xc4, 0x10);
+    rl_pb4(text, 0x48, 0x83, 0xec, 0x10);
+    rl_pb4(text, 0x48, 0x89, 0x3c, 0x24);
+    rl_pb5(text, 0xf2, 0x0f, 0x10, 0x04, 0x24);
+    rl_pb4(text, 0xf2, 0x0f, 0x51, 0xc0);
+    rl_pb5(text, 0xf2, 0x0f, 0x11, 0x04, 0x24);
+    rl_pb4(text, 0x48, 0x8b, 0x04, 0x24);
+    rl_pb4(text, 0x48, 0x83, 0xc4, 0x10);
     text.push(0xc3 & 0xFF);
     // pledge_floor(rdi = double bits) -> rax = double bits
     // roundsd $1, %xmm0, %xmm0 (round toward -inf)
     add_sym(symbols, text, "pledge_floor");
-    pb4(text, 0x48, 0x83, 0xec, 0x10);
-    pb4(text, 0x48, 0x89, 0x3c, 0x24);
-    pb5(text, 0xf2, 0x0f, 0x10, 0x04, 0x24);
+    rl_pb4(text, 0x48, 0x83, 0xec, 0x10);
+    rl_pb4(text, 0x48, 0x89, 0x3c, 0x24);
+    rl_pb5(text, 0xf2, 0x0f, 0x10, 0x04, 0x24);
     // roundsd $1, %xmm0, %xmm0 -- 66 0F 3A 0B C0 01
-    pb6(text, 0x66, 0x0f, 0x3a, 0x0b, 0xc0, 0x01);
-    pb5(text, 0xf2, 0x0f, 0x11, 0x04, 0x24);
-    pb4(text, 0x48, 0x8b, 0x04, 0x24);
-    pb4(text, 0x48, 0x83, 0xc4, 0x10);
+    rl_pb6(text, 0x66, 0x0f, 0x3a, 0x0b, 0xc0, 0x01);
+    rl_pb5(text, 0xf2, 0x0f, 0x11, 0x04, 0x24);
+    rl_pb4(text, 0x48, 0x8b, 0x04, 0x24);
+    rl_pb4(text, 0x48, 0x83, 0xc4, 0x10);
     text.push(0xc3 & 0xFF);
     // pledge_ceil(rdi = double bits) -> rax = double bits
     // roundsd $2, %xmm0, %xmm0 (round toward +inf)
     add_sym(symbols, text, "pledge_ceil");
-    pb4(text, 0x48, 0x83, 0xec, 0x10);
-    pb4(text, 0x48, 0x89, 0x3c, 0x24);
-    pb5(text, 0xf2, 0x0f, 0x10, 0x04, 0x24);
+    rl_pb4(text, 0x48, 0x83, 0xec, 0x10);
+    rl_pb4(text, 0x48, 0x89, 0x3c, 0x24);
+    rl_pb5(text, 0xf2, 0x0f, 0x10, 0x04, 0x24);
     // roundsd $2, %xmm0, %xmm0 -- 66 0F 3A 0B C0 02
-    pb6(text, 0x66, 0x0f, 0x3a, 0x0b, 0xc0, 0x02);
-    pb5(text, 0xf2, 0x0f, 0x11, 0x04, 0x24);
-    pb4(text, 0x48, 0x8b, 0x04, 0x24);
-    pb4(text, 0x48, 0x83, 0xc4, 0x10);
+    rl_pb6(text, 0x66, 0x0f, 0x3a, 0x0b, 0xc0, 0x02);
+    rl_pb5(text, 0xf2, 0x0f, 0x11, 0x04, 0x24);
+    rl_pb4(text, 0x48, 0x8b, 0x04, 0x24);
+    rl_pb4(text, 0x48, 0x83, 0xc4, 0x10);
     text.push(0xc3 & 0xFF);
     // pledge_pow(rdi = base bits, rsi = exp bits) -> rax = double bits
     // For integer exponents, uses iterative multiplication.
@@ -3971,80 +4000,80 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     add_sym(symbols, text, "pledge_pow");
     // pushq %rbx ; pushq %r12
     text.push(0x53 & 0xFF);
-    pb2(text, 0x41, 0x54);
+    rl_pb2(text, 0x41, 0x54);
     // subq $40, %rsp
-    pb4(text, 0x48, 0x83, 0xec, 0x28);
+    rl_pb4(text, 0x48, 0x83, 0xec, 0x28);
     // Store base at 8(%rsp), exp at 16(%rsp)
-    pb5(text, 0x48, 0x89, 0x7c, 0x24, 0x08);
-    pb5(text, 0x48, 0x89, 0x74, 0x24, 0x10);
+    rl_pb5(text, 0x48, 0x89, 0x7c, 0x24, 0x08);
+    rl_pb5(text, 0x48, 0x89, 0x74, 0x24, 0x10);
     // Load exp into xmm0
-    pb6(text, 0xf2, 0x0f, 0x10, 0x44, 0x24, 0x10);
+    rl_pb6(text, 0xf2, 0x0f, 0x10, 0x44, 0x24, 0x10);
     // cvttsd2siq %xmm0, %r12 (integer exp)
-    pb5(text, 0xf2, 0x4c, 0x0f, 0x2c, 0xe0);
+    rl_pb5(text, 0xf2, 0x4c, 0x0f, 0x2c, 0xe0);
     // cvtsi2sdq %r12, %xmm1 (back to double)
-    pb5(text, 0xf2, 0x49, 0x0f, 0x2a, 0xcc);
+    rl_pb5(text, 0xf2, 0x49, 0x0f, 0x2a, 0xcc);
     // ucomisd %xmm1, %xmm0 -- check if exp is integer
-    pb4(text, 0x66, 0x0f, 0x2e, 0xc1);
+    rl_pb4(text, 0x66, 0x0f, 0x2e, 0xc1);
     // jne .float_pow (non-integer exponent)
     var ppow_jne: i64 = text.len();
-    pb6(text, 0x0f, 0x85, 0x00, 0x00, 0x00, 0x00);
+    rl_pb6(text, 0x0f, 0x85, 0x00, 0x00, 0x00, 0x00);
     // Integer exponent path: result = 1.0, loop r12 times multiplying by base
     // Store 1.0 at 24(%rsp)
     // 1.0 = 0x3FF0000000000000
-    pb8(text, 0xc7, 0x44, 0x24, 0x18, 0x00, 0x00, 0x00, 0x00);
-    pb8(text, 0xc7, 0x44, 0x24, 0x1c, 0x00, 0x00, 0xf0, 0x3f);
+    rl_pb8(text, 0xc7, 0x44, 0x24, 0x18, 0x00, 0x00, 0x00, 0x00);
+    rl_pb8(text, 0xc7, 0x44, 0x24, 0x1c, 0x00, 0x00, 0xf0, 0x3f);
     // movsd 24(%rsp), %xmm0 (result = 1.0)
-    pb6(text, 0xf2, 0x0f, 0x10, 0x44, 0x24, 0x18);
+    rl_pb6(text, 0xf2, 0x0f, 0x10, 0x44, 0x24, 0x18);
     // movq %r12, %rbx (loop counter)
-    pb3(text, 0x4c, 0x89, 0xe3);
+    rl_pb3(text, 0x4c, 0x89, 0xe3);
     // Handle negative exponents: if r12 < 0, negate and track sign
     // testq %rbx, %rbx
-    pb3(text, 0x48, 0x85, 0xdb);
+    rl_pb3(text, 0x48, 0x85, 0xdb);
     // jns .int_loop_start
     var ppow_jns: i64 = text.len();
-    pb2(text, 0x79, 0x00);
+    rl_pb2(text, 0x79, 0x00);
     // negq %rbx
-    pb3(text, 0x48, 0xf7, 0xdb);
+    rl_pb3(text, 0x48, 0xf7, 0xdb);
     // .int_loop_start:
     var ppow_int_loop_start: i64 = text.len();
     text.set(ppow_jns + 1, (ppow_int_loop_start - ppow_jns - 2) & 0xFF);
     // .int_loop:
     var ppow_int_loop: i64 = text.len();
     // testq %rbx, %rbx
-    pb3(text, 0x48, 0x85, 0xdb);
+    rl_pb3(text, 0x48, 0x85, 0xdb);
     // je .int_done
     var ppow_je_int: i64 = text.len();
-    pb2(text, 0x74, 0x00);
+    rl_pb2(text, 0x74, 0x00);
     // movsd 8(%rsp), %xmm1 (base)
-    pb6(text, 0xf2, 0x0f, 0x10, 0x4c, 0x24, 0x08);
+    rl_pb6(text, 0xf2, 0x0f, 0x10, 0x4c, 0x24, 0x08);
     // mulsd %xmm1, %xmm0 (result *= base)
-    pb4(text, 0xf2, 0x0f, 0x59, 0xc1);
+    rl_pb4(text, 0xf2, 0x0f, 0x59, 0xc1);
     // decq %rbx
-    pb3(text, 0x48, 0xff, 0xcb);
+    rl_pb3(text, 0x48, 0xff, 0xcb);
     // jmp .int_loop
     var ppow_jmp_int: i64 = text.len();
     var ppow_int_back: i64 = ppow_int_loop - ppow_jmp_int - 2;
-    pb2(text, 0xeb, (ppow_int_back) & 0xFF);
+    rl_pb2(text, 0xeb, (ppow_int_back) & 0xFF);
     // .int_done:
     var ppow_int_done: i64 = text.len();
     text.set(ppow_je_int + 1, (ppow_int_done - ppow_je_int - 2) & 0xFF);
     // Check if original exp was negative -- if so, result = 1.0 / result
     // testq %r12, %r12
-    pb3(text, 0x4d, 0x85, 0xe4);
+    rl_pb3(text, 0x4d, 0x85, 0xe4);
     // jns .int_store
     var ppow_jns2: i64 = text.len();
-    pb2(text, 0x79, 0x00);
+    rl_pb2(text, 0x79, 0x00);
     // 1.0 in xmm1
-    pb6(text, 0xf2, 0x0f, 0x10, 0x4c, 0x24, 0x18);
+    rl_pb6(text, 0xf2, 0x0f, 0x10, 0x4c, 0x24, 0x18);
     // divsd %xmm0, %xmm1 (1.0 / result)
-    pb4(text, 0xf2, 0x0f, 0x5e, 0xc8);
+    rl_pb4(text, 0xf2, 0x0f, 0x5e, 0xc8);
     // movsd %xmm1, %xmm0
-    pb4(text, 0xf2, 0x0f, 0x10, 0xc1);
+    rl_pb4(text, 0xf2, 0x0f, 0x10, 0xc1);
     // .int_store:
     var ppow_int_store: i64 = text.len();
     text.set(ppow_jns2 + 1, (ppow_int_store - ppow_jns2 - 2) & 0xFF);
     // jmp .store_result
-    pb2(text, 0xeb, 0x00);
+    rl_pb2(text, 0xeb, 0x00);
     var ppow_jmp_store: i64 = text.len() - 1;
     // .float_pow: (non-integer exponent -- use x87 FPU)
     var ppow_float_pow: i64 = text.len();
@@ -4055,68 +4084,68 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     text.set(ppow_jne + 4, (ppow_jne_rel >> 16) & 0xFF);
     text.set(ppow_jne + 5, (ppow_jne_rel >> 24) & 0xFF);
     // fld exp -> st(0) = exp
-    pb4(text, 0xdd, 0x44, 0x24, 0x10);
+    rl_pb4(text, 0xdd, 0x44, 0x24, 0x10);
     // fld base -> st(0) = base, st(1) = exp
-    pb4(text, 0xdd, 0x44, 0x24, 0x08);
+    rl_pb4(text, 0xdd, 0x44, 0x24, 0x08);
     // fyl2x: st(0) = exp * log2(base), pop
-    pb2(text, 0xd9, 0xf1);
+    rl_pb2(text, 0xd9, 0xf1);
     // Now st(0) = y * log2(x)
     // fld st(0) -> duplicate: st(0) = st(1) = y*log2(x)
-    pb2(text, 0xd9, 0xc0);
+    rl_pb2(text, 0xd9, 0xc0);
     // frndint -> st(0) = floor(y*log2(x))
-    pb2(text, 0xd9, 0xfc);
+    rl_pb2(text, 0xd9, 0xfc);
     // fsub st(1), st(0) -> st(0) = floor - original = -(fractional part)
     // Actually: fsubp st(1), st(0) = st(1) - st(0), pop -> st(0) = frac
-    pb2(text, 0xde, 0xe1);
+    rl_pb2(text, 0xde, 0xe1);
     // Now st(0) = frac, st(1) = floor_val
     // f2xm1: st(0) = 2^frac - 1
-    pb2(text, 0xd9, 0xf0);
+    rl_pb2(text, 0xd9, 0xf0);
     // fld1 -> st(0) = 1.0, st(1) = 2^frac - 1, st(2) = floor_val
-    pb2(text, 0xd9, 0xe8);
+    rl_pb2(text, 0xd9, 0xe8);
     // faddp st(1), st(0) -> st(0) = 2^frac, st(1) = floor_val
-    pb2(text, 0xde, 0xc1);
+    rl_pb2(text, 0xde, 0xc1);
     // fscale: st(0) = st(0) * 2^floor(st(1))
-    pb2(text, 0xd9, 0xfd);
+    rl_pb2(text, 0xd9, 0xfd);
     // fstp st(1) -- pop floor_val, leave result
-    pb2(text, 0xde, 0xd1);
+    rl_pb2(text, 0xde, 0xd1);
     // Store result to 24(%rsp)
-    pb4(text, 0xdd, 0x5c, 0x24, 0x18);
+    rl_pb4(text, 0xdd, 0x5c, 0x24, 0x18);
     // movsd 24(%rsp), %xmm0
-    pb6(text, 0xf2, 0x0f, 0x10, 0x44, 0x24, 0x18);
+    rl_pb6(text, 0xf2, 0x0f, 0x10, 0x44, 0x24, 0x18);
     // .store_result:
     var ppow_store_result: i64 = text.len();
     // Patch jmp_store
     var ppow_store_rel: i64 = (ppow_store_result - ppow_jmp_store - 1) & 0xFF;
     text.set(ppow_jmp_store, ppow_store_rel & 0xFF);
     // movsd %xmm0, 24(%rsp)
-    pb6(text, 0xf2, 0x0f, 0x11, 0x44, 0x24, 0x18);
+    rl_pb6(text, 0xf2, 0x0f, 0x11, 0x44, 0x24, 0x18);
     // movq 24(%rsp), %rax
-    pb5(text, 0x48, 0x8b, 0x44, 0x24, 0x18);
+    rl_pb5(text, 0x48, 0x8b, 0x44, 0x24, 0x18);
     // addq $40, %rsp
-    pb4(text, 0x48, 0x83, 0xc4, 0x28);
+    rl_pb4(text, 0x48, 0x83, 0xc4, 0x28);
     // popq %r12 ; popq %rbx
-    pb2(text, 0x41, 0x5c);
+    rl_pb2(text, 0x41, 0x5c);
     text.push(0x5b & 0xFF);
     text.push(0xc3 & 0xFF);
     // pledge_strlen(rdi = str ptr) -> rax = length
     // Simple loop: count bytes until null terminator
     add_sym(symbols, text, "pledge_strlen");
     // xorq %rax, %rax (counter = 0)
-    pb3(text, 0x48, 0x31, 0xc0);
+    rl_pb3(text, 0x48, 0x31, 0xc0);
     // .loop:
     var pstrlen_loop: i64 = text.len();
     // cmpb $0, (%rdi)
-    pb3(text, 0x80, 0x3f, 0x00);
+    rl_pb3(text, 0x80, 0x3f, 0x00);
     // je .done
     var pstrlen_je: i64 = text.len();
-    pb2(text, 0x74, 0x00);
+    rl_pb2(text, 0x74, 0x00);
     // incq %rax ; incq %rdi
-    pb3(text, 0x48, 0xff, 0xc0);
-    pb3(text, 0x48, 0xff, 0xc7);
+    rl_pb3(text, 0x48, 0xff, 0xc0);
+    rl_pb3(text, 0x48, 0xff, 0xc7);
     // jmp .loop
     var pstrlen_jmp: i64 = text.len();
     var pstrlen_back: i64 = pstrlen_loop - pstrlen_jmp - 2;
-    pb2(text, 0xeb, (pstrlen_back) & 0xFF);
+    rl_pb2(text, 0xeb, (pstrlen_back) & 0xFF);
     // .done:
     var pstrlen_done: i64 = text.len();
     text.set(pstrlen_je + 1, (pstrlen_done - pstrlen_je - 2) & 0xFF);
@@ -4127,35 +4156,35 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // pledge_sin / c_sin(rdi = double bits) -> rax = double bits
     // Uses x87 FPU: fsin
     add_sym(symbols, text, "pledge_sin");
-    pb4(text, 0x48, 0x83, 0xec, 0x10);
-    pb4(text, 0x48, 0x89, 0x3c, 0x24);
-    pb3(text, 0xdd, 0x04, 0x24);
-    pb2(text, 0xd9, 0xfe);
-    pb3(text, 0xdd, 0x1c, 0x24);
-    pb4(text, 0x48, 0x8b, 0x04, 0x24);
-    pb4(text, 0x48, 0x83, 0xc4, 0x10);
+    rl_pb4(text, 0x48, 0x83, 0xec, 0x10);
+    rl_pb4(text, 0x48, 0x89, 0x3c, 0x24);
+    rl_pb3(text, 0xdd, 0x04, 0x24);
+    rl_pb2(text, 0xd9, 0xfe);
+    rl_pb3(text, 0xdd, 0x1c, 0x24);
+    rl_pb4(text, 0x48, 0x8b, 0x04, 0x24);
+    rl_pb4(text, 0x48, 0x83, 0xc4, 0x10);
     text.push(0xc3 & 0xFF);
     // pledge_cos / c_cos(rdi = double bits) -> rax = double bits
     // Uses x87 FPU: fcos
     add_sym(symbols, text, "pledge_cos");
-    pb4(text, 0x48, 0x83, 0xec, 0x10);
-    pb4(text, 0x48, 0x89, 0x3c, 0x24);
-    pb3(text, 0xdd, 0x04, 0x24);
-    pb2(text, 0xd9, 0xff);
-    pb3(text, 0xdd, 0x1c, 0x24);
-    pb4(text, 0x48, 0x8b, 0x04, 0x24);
-    pb4(text, 0x48, 0x83, 0xc4, 0x10);
+    rl_pb4(text, 0x48, 0x83, 0xec, 0x10);
+    rl_pb4(text, 0x48, 0x89, 0x3c, 0x24);
+    rl_pb3(text, 0xdd, 0x04, 0x24);
+    rl_pb2(text, 0xd9, 0xff);
+    rl_pb3(text, 0xdd, 0x1c, 0x24);
+    rl_pb4(text, 0x48, 0x8b, 0x04, 0x24);
+    rl_pb4(text, 0x48, 0x83, 0xc4, 0x10);
     text.push(0xc3 & 0xFF);
     // pledge_fabs / c_fabs(rdi = double bits) -> rax = double bits
     // Clears the sign bit: rax = rdi & 0x7FFFFFFFFFFFFFFF
     add_sym(symbols, text, "pledge_fabs");
     // movq %rdi, %rax
-    pb3(text, 0x48, 0x89, 0xf8);
+    rl_pb3(text, 0x48, 0x89, 0xf8);
     // movabsq $0x7FFFFFFFFFFFFFFF, %rcx
     // 48 b9 FF FF FF FF FF FF FF 7F
-    pb9(text, 0x48, 0xb9, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff) ; pb1(text, 0x7f);
+    rl_pb9(text, 0x48, 0xb9, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff) ; rl_pb1(text, 0x7f);
     // andq %rcx, %rax
-    pb3(text, 0x48, 0x21, 0xc8);
+    rl_pb3(text, 0x48, 0x21, 0xc8);
     text.push(0xc3 & 0xFF);
     // pledge_strcmp / c_strcmp(rdi = a, rsi = b) -> rax = 0/1/-1
     // Simple byte-by-byte comparison
@@ -4163,43 +4192,43 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // .loop:
     var pstrcmp_loop: i64 = text.len();
     // movb (%rdi), %al
-    pb2(text, 0x8a, 0x07);
+    rl_pb2(text, 0x8a, 0x07);
     // movb (%rsi), %cl
-    pb2(text, 0x8a, 0x0e);
+    rl_pb2(text, 0x8a, 0x0e);
     // cmpb %cl, %al
-    pb2(text, 0x38, 0xc1);
+    rl_pb2(text, 0x38, 0xc1);
     // jne .diff
     var pstrcmp_jne: i64 = text.len();
-    pb2(text, 0x75, 0x00);
+    rl_pb2(text, 0x75, 0x00);
     // testq %rax, %rax (end of string)
-    pb2(text, 0x84, 0xc0);
+    rl_pb2(text, 0x84, 0xc0);
     // je .equal
     var pstrcmp_je: i64 = text.len();
-    pb2(text, 0x74, 0x00);
+    rl_pb2(text, 0x74, 0x00);
     // incq %rdi ; incq %rsi
-    pb3(text, 0x48, 0xff, 0xc7);
-    pb3(text, 0x48, 0xff, 0xc6);
+    rl_pb3(text, 0x48, 0xff, 0xc7);
+    rl_pb3(text, 0x48, 0xff, 0xc6);
     // jmp .loop
     var pstrcmp_jmp: i64 = text.len();
     var pstrcmp_back: i64 = pstrcmp_loop - pstrcmp_jmp - 2;
-    pb2(text, 0xeb, (pstrcmp_back) & 0xFF);
+    rl_pb2(text, 0xeb, (pstrcmp_back) & 0xFF);
     // .diff:
     var pstrcmp_diff: i64 = text.len();
     text.set(pstrcmp_jne + 1, (pstrcmp_diff - pstrcmp_jne - 2) & 0xFF);
     // movzbq %al, %rax
-    pb4(text, 0x48, 0x0f, 0xb6, 0xc0);
+    rl_pb4(text, 0x48, 0x0f, 0xb6, 0xc0);
     // movzbq %cl, %rcx
-    pb4(text, 0x48, 0x0f, 0xb6, 0xc9);
+    rl_pb4(text, 0x48, 0x0f, 0xb6, 0xc9);
     // subq %rcx, %rax
-    pb3(text, 0x48, 0x29, 0xc8);
+    rl_pb3(text, 0x48, 0x29, 0xc8);
     // jmp .ret
     var pstrcmp_jmp_ret: i64 = text.len();
-    pb2(text, 0xeb, 0x00);
+    rl_pb2(text, 0xeb, 0x00);
     // .equal:
     var pstrcmp_equal: i64 = text.len();
     text.set(pstrcmp_je + 1, (pstrcmp_equal - pstrcmp_je - 2) & 0xFF);
     // xorq %rax, %rax
-    pb3(text, 0x48, 0x31, 0xc0);
+    rl_pb3(text, 0x48, 0x31, 0xc0);
     // .ret:
     var pstrcmp_ret: i64 = text.len();
     text.set(pstrcmp_jmp_ret, ((pstrcmp_ret - pstrcmp_jmp_ret - 1) & 0xFF) & 0xFF);
@@ -4214,31 +4243,31 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // Actually: sys_exit(code) -> rax=60, rdi=code, syscall
     // rdi already has the code, just set rax=60 and syscall
     // movq $60, %rax  -> 48 c7 c0 3c 00 00 00
-    pb7(text, 0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00);
     // syscall  -> 0f 05
-    pb2(text, 0x0f, 0x05);
+    rl_pb2(text, 0x0f, 0x05);
     // ud2 (should not return)
-    pb2(text, 0x0f, 0x0b);
+    rl_pb2(text, 0x0f, 0x0b);
     // p_getenv(rdi = name ptr) -> *u8
     // Stub: returns NULL (0) -- full implementation requires environ access
     // TODO: Save environ from _start and search it
     add_sym(symbols, text, "p_getenv");
     // xorq %rax, %rax  -> 48 31 c0
-    pb3(text, 0x48, 0x31, 0xc0);
+    rl_pb3(text, 0x48, 0x31, 0xc0);
     text.push(0xc3 & 0xFF);
     // p_argc() -> i64
     // Stub: returns 1 (just program name)
     // TODO: Save argc from _start
     add_sym(symbols, text, "p_argc");
     // movq $1, %rax  -> 48 c7 c0 01 00 00 00
-    pb7(text, 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00);
+    rl_pb7(text, 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00);
     text.push(0xc3 & 0xFF);
     // p_argv(rdi = index) -> *u8
     // Stub: returns NULL -- full implementation requires argv access
     // TODO: Save argv from _start
     add_sym(symbols, text, "p_argv");
     // xorq %rax, %rax  -> 48 31 c0
-    pb3(text, 0x48, 0x31, 0xc0);
+    rl_pb3(text, 0x48, 0x31, 0xc0);
     text.push(0xc3 & 0xFF);
     // p_system(rdi = cmd ptr) -> i64
     // Uses sys_execve via /bin/sh -c <cmd>
@@ -4247,14 +4276,14 @@ fn runtime_parts_impl(has_caps: bool, caps_set: i64) -> RuntimeParts {
     // TODO: Implement fork+execve with syscall 57+59
     add_sym(symbols, text, "p_system");
     // movq $-1, %rax  -> 48 c7 c0 ff ff ff ff
-    pb7(text, 0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff);
+    rl_pb7(text, 0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff);
     text.push(0xc3 & 0xFF);
     // p_regex_match(rdi = s ptr, rsi = pattern ptr) -> bool
     // Stub: returns false -- full implementation would need string matching in assembly
     // TODO: Implement wildcard match in assembly
     add_sym(symbols, text, "p_regex_match");
     // xorq %rax, %rax  -> 48 31 c0
-    pb3(text, 0x48, 0x31, 0xc0);
+    rl_pb3(text, 0x48, 0x31, 0xc0);
     text.push(0xc3 & 0xFF);
     // =======================================================================
     // FFI function aliases -- c_* names used by test_ffi_full

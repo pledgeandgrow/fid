@@ -4086,11 +4086,15 @@ impl Lowerer {
                     });
                 }
 
-                // String equality: when == or != is used with two str operands,
-                // emit a call to p_str_equal for content comparison.
+                // String equality: when == or != has a str operand, emit a call
+                // to p_str_equal for content comparison. R1.1: either side
+                // suffices — the typechecker already forces both operands to the
+                // same type, and the other side may have an erased (i64) IR type
+                // (Vec<str>.get(), enum payloads). p_str_equal checks pointer
+                // identity and null first, so `s == 0`-style checks still hold.
                 // Without this, native codegen does pointer comparison (wrong).
                 if matches!(op, BinOp::Eq | BinOp::Neq)
-                    && left_ir_ty == str_ty && right_ir_ty == str_ty
+                    && (left_ir_ty == str_ty || right_ir_ty == str_ty)
                 {
                     let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
                     let eq_val = self.emit_inst(Inst::Call {

@@ -1,0 +1,112 @@
+// SH: tests that the Fides interpreter (compiler/interp.fd) runs spawn/await
+// and p_gt_* builtins with REAL semantics (was: fake handles + Int(0) results).
+// The outer program lowers a small source snippet to IR via compiler::compiler,
+// then executes it inside the self-hosted Interpreter.
+use core;
+use compiler::compiler;
+use compiler::ir;
+use compiler::interp;
+
+var failures: i64 = 0;
+
+fn check_run(src: str, expected: i64, label: str) {
+    match lower_to_ir_module_with_path(src, "test.fd", "off") {
+        ResultIrModule::Ok(m) => {
+            var it: Interpreter = Interpreter_new(m);
+            match Interpreter_run(&mut it) {
+                RunResult::Return(v) => {
+                    match v {
+                        Value::Int(n) => {
+                            if n == expected {
+                                print("  OK: " + label + "\n");
+                            } else {
+                                print("FAIL: " + label + " expected " + int_to_str(expected) + " got " + int_to_str(n) + "\n");
+                                failures = failures + 1;
+                            }
+                        }
+                        Value::Void => {
+                            print("FAIL: " + label + " returned void\n");
+                            failures = failures + 1;
+                        }
+                        _ => {
+                            print("FAIL: " + label + " non-int result\n");
+                            failures = failures + 1;
+                        }
+                    }
+                }
+                RunResult::Panic(msg) => {
+                    print("FAIL: " + label + " panic: " + msg + "\n");
+                    failures = failures + 1;
+                }
+                RunResult::Paused => {
+                    print("FAIL: " + label + " paused\n");
+                    failures = failures + 1;
+                }
+            }
+        }
+        ResultIrModule::Err(errs) => {
+            print("FAIL: " + label + " did not lower\n");
+            var i: i64 = 0;
+            while i < errs.len() {
+                print("    " + errs.get(i) + "\n");
+                i = i + 1;
+            }
+            failures = failures + 1;
+        }
+    }
+}
+
+fn main() -> i64 {
+    // spawn worker(20) eagerly runs worker(20)=41; await returns the real result.
+    check_run(
+        "fn worker(x: i64) -> i64 { return x * 2 + 1; }\n" +
+        "fn main() -> i64 {\n" +
+        "    var f = spawn worker(20);\n" +
+        "    var r = await f;\n" +
+        "    return r;\n" +
+        "}\n",
+        41, "spawn/await returns real result");
+
+    // Two spawned tasks: futures are independent.
+    check_run(
+        "fn dbl(x: i64) -> i64 { return x * 2; }\n" +
+        "fn main() -> i64 {\n" +
+        "    var a = spawn dbl(10);\n" +
+        "    var b = spawn dbl(50);\n" +
+        "    return await a + await b;\n" +
+        "}\n",
+        120, "two spawns -> two futures");
+
+    // p_gt_* builtins: spawn queues, run_all executes, get_result is real.
+    check_run(
+        "fn worker(x: i64) -> i64 { return x + 7; }\n" +
+        "fn main() -> i64 {\n" +
+        "    var id = p_gt_spawn(\"worker\", 5);\n" +
+        "    if p_gt_is_done(id) { return 90; }\n" +
+        "    var last = p_gt_run_all();\n" +
+        "    if last != 12 { return 91; }\n" +
+        "    if !p_gt_is_done(id) { return 92; }\n" +
+        "    var res = p_gt_get_result(id);\n" +
+        "    if res != 12 { return 93; }\n" +
+        "    return 42;\n" +
+        "}\n",
+        42, "green-thread spawn/run_all/get_result real");
+
+    // Multiple green threads run in spawn order.
+    check_run(
+        "fn inc(x: i64) -> i64 { return x + 1; }\n" +
+        "fn main() -> i64 {\n" +
+        "    var a = p_gt_spawn(\"inc\", 10);\n" +
+        "    var b = p_gt_spawn(\"inc\", 20);\n" +
+        "    p_gt_run_all();\n" +
+        "    return p_gt_get_result(a) + p_gt_get_result(b);\n" +
+        "}\n",
+        32, "two green threads -> two results");
+
+    if failures == 0 {
+        print("All tests passed!\n");
+        return 0;
+    }
+    print(int_to_str(failures) + " test(s) failed\n");
+    return 1;
+}

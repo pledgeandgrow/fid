@@ -1,7 +1,7 @@
-// tensor.fd -- Tensor type: n-dimensional arrays with stride info.
+// tensor.fd -- TensorData type: n-dimensional arrays with stride info.
 // Ported from src/tensor.rs.
 //
-// Phase 5C.1: AI/ML foundation. A Tensor stores:
+// Phase 5C.1: AI/ML foundation. A TensorData stores:
 //   - shape: Vec<i64> -- size of each dimension
 //   - strides: Vec<i64> -- element offset per dimension (row-major by default)
 //   - data: Vec<f64> -- flat storage (doubles for now; f32 specialization later)
@@ -25,16 +25,16 @@ use core;
 use vec;
 use string;
 
-// --- Tensor ---
+// --- TensorData ---
 
-pub struct Tensor {
+pub struct TensorData {
     pub shape: Vec<i64>,    // size of each dimension, e.g. [2, 3] for a 2x3 matrix
     pub strides: Vec<i64>,  // element offset per dimension (row-major by default)
     pub data: Vec<f64>,    // flat data storage (f64 for now)
 }
 
-pub fn Tensor_new(shape: Vec<i64>, strides: Vec<i64>, data: Vec<f64>) -> Tensor {
-    return Tensor { shape: shape, strides: strides, data: data };
+pub fn Tensor_new(shape: Vec<i64>, strides: Vec<i64>, data: Vec<f64>) -> TensorData {
+    return TensorData { shape: shape, strides: strides, data: data };
 }
 
 /// Compute row-major strides for a given shape.
@@ -57,7 +57,7 @@ pub fn row_major_strides(shape: Vec<i64>) -> Vec<i64> {
 }
 
 /// Total number of elements (product of shape).
-pub fn Tensor_size(self: &Tensor) -> i64 {
+pub fn Tensor_size(self: &TensorData) -> i64 {
     var product: i64 = 1;
     var i: i64 = 0;
     while i < self.shape.len() {
@@ -68,12 +68,12 @@ pub fn Tensor_size(self: &Tensor) -> i64 {
 }
 
 /// Number of dimensions.
-pub fn Tensor_ndim(self: &Tensor) -> i64 {
+pub fn Tensor_ndim(self: &TensorData) -> i64 {
     return self.shape.len();
 }
 
 /// Create a tensor filled with a constant value.
-pub fn Tensor_filled(shape: Vec<i64>, value: f64) -> Tensor {
+pub fn Tensor_filled(shape: Vec<i64>, value: f64) -> TensorData {
     var strides: Vec<i64> = row_major_strides(shape);
     var size: i64 = 1;
     var i: i64 = 0;
@@ -91,23 +91,23 @@ pub fn Tensor_filled(shape: Vec<i64>, value: f64) -> Tensor {
 }
 
 /// Create a tensor of zeros.
-pub fn Tensor_zeros(shape: Vec<i64>) -> Tensor {
+pub fn Tensor_zeros(shape: Vec<i64>) -> TensorData {
     return Tensor_filled(shape, 0.0);
 }
 
 /// Create a tensor of ones.
-pub fn Tensor_ones(shape: Vec<i64>) -> Tensor {
+pub fn Tensor_ones(shape: Vec<i64>) -> TensorData {
     return Tensor_filled(shape, 1.0);
 }
 
 /// Create a tensor from a flat Vec with a given shape.
-pub fn Tensor_from_vec(shape: Vec<i64>, data: Vec<f64>) -> Tensor {
+pub fn Tensor_from_vec(shape: Vec<i64>, data: Vec<f64>) -> TensorData {
     var strides: Vec<i64> = row_major_strides(shape);
     return Tensor_new(shape, strides, data);
 }
 
 /// Convert a multi-index to a flat offset.
-pub fn Tensor_flat_index(self: &Tensor, indices: Vec<i64>) -> i64 {
+pub fn Tensor_flat_index(self: &TensorData, indices: Vec<i64>) -> i64 {
     var offset: i64 = 0;
     var i: i64 = 0;
     while i < indices.len() && i < self.strides.len() {
@@ -118,7 +118,7 @@ pub fn Tensor_flat_index(self: &Tensor, indices: Vec<i64>) -> i64 {
 }
 
 /// Get an element by multi-index.
-pub fn Tensor_get(self: &Tensor, indices: Vec<i64>) -> f64 {
+pub fn Tensor_get(self: &TensorData, indices: Vec<i64>) -> f64 {
     var fi: i64 = Tensor_flat_index(self, indices);
     if fi >= 0 && fi < self.data.len() {
         return self.data.get(fi);
@@ -127,7 +127,7 @@ pub fn Tensor_get(self: &Tensor, indices: Vec<i64>) -> f64 {
 }
 
 /// Set an element by multi-index.
-pub fn Tensor_set(self: &mut Tensor, indices: Vec<i64>, value: f64) -> void {
+pub fn Tensor_set(self: &mut TensorData, indices: Vec<i64>, value: f64) -> void {
     var fi: i64 = Tensor_flat_index(self, indices);
     if fi >= 0 && fi < self.data.len() {
         self.data.set(fi, value);
@@ -136,11 +136,11 @@ pub fn Tensor_set(self: &mut Tensor, indices: Vec<i64>, value: f64) -> void {
 
 // --- Result types ---
 
-pub enum ResultTensor { Ok(Tensor), Err(str) }
+pub enum ResultTensor { Ok(TensorData), Err(str) }
 pub enum ResultF64 { Ok(f64), Err(str) }
 
 /// Reshape the tensor (total size must be preserved).
-pub fn Tensor_reshape(self: &Tensor, new_shape: Vec<i64>) -> ResultTensor {
+pub fn Tensor_reshape(self: &TensorData, new_shape: Vec<i64>) -> ResultTensor {
     var new_size: i64 = 1;
     var i: i64 = 0;
     while i < new_shape.len() {
@@ -155,7 +155,7 @@ pub fn Tensor_reshape(self: &Tensor, new_shape: Vec<i64>) -> ResultTensor {
 }
 
 /// Transpose: reverse the shape and rearrange data.
-pub fn Tensor_transpose(self: &Tensor) -> Tensor {
+pub fn Tensor_transpose(self: &TensorData) -> TensorData {
     var n: i64 = self.shape.len();
     var new_shape: Vec<i64> = Vec::new();
     var i: i64 = n - 1;
@@ -163,7 +163,7 @@ pub fn Tensor_transpose(self: &Tensor) -> Tensor {
         new_shape.push(self.shape.get(i));
         i = i - 1;
     }
-    var result: Tensor = Tensor_zeros(new_shape);
+    var result: TensorData = Tensor_zeros(new_shape);
 
     // Iterate over all indices in the original tensor
     var idx: Vec<i64> = Vec::new();
@@ -204,7 +204,7 @@ pub fn Tensor_transpose(self: &Tensor) -> Tensor {
 }
 
 /// Elementwise addition (shapes must match).
-pub fn Tensor_add(self: &Tensor, other: &Tensor) -> ResultTensor {
+pub fn Tensor_add(self: &TensorData, other: &TensorData) -> ResultTensor {
     if !shapes_equal(self.shape, other.shape) {
         return ResultTensor::Err("add: shape mismatch");
     }
@@ -218,7 +218,7 @@ pub fn Tensor_add(self: &Tensor, other: &Tensor) -> ResultTensor {
 }
 
 /// Elementwise subtraction.
-pub fn Tensor_sub(self: &Tensor, other: &Tensor) -> ResultTensor {
+pub fn Tensor_sub(self: &TensorData, other: &TensorData) -> ResultTensor {
     if !shapes_equal(self.shape, other.shape) {
         return ResultTensor::Err("sub: shape mismatch");
     }
@@ -232,7 +232,7 @@ pub fn Tensor_sub(self: &Tensor, other: &Tensor) -> ResultTensor {
 }
 
 /// Elementwise multiplication (Hadamard product).
-pub fn Tensor_mul(self: &Tensor, other: &Tensor) -> ResultTensor {
+pub fn Tensor_mul(self: &TensorData, other: &TensorData) -> ResultTensor {
     if !shapes_equal(self.shape, other.shape) {
         return ResultTensor::Err("mul: shape mismatch");
     }
@@ -246,7 +246,7 @@ pub fn Tensor_mul(self: &Tensor, other: &Tensor) -> ResultTensor {
 }
 
 /// Scale by a scalar.
-pub fn Tensor_scale(self: &Tensor, scalar: f64) -> Tensor {
+pub fn Tensor_scale(self: &TensorData, scalar: f64) -> TensorData {
     var data: Vec<f64> = Vec::new();
     var i: i64 = 0;
     while i < self.data.len() {
@@ -257,7 +257,7 @@ pub fn Tensor_scale(self: &Tensor, scalar: f64) -> Tensor {
 }
 
 /// Matrix multiplication: (M, K) @ (K, N) -> (M, N). Both tensors must be 2D.
-pub fn Tensor_matmul(self: &Tensor, other: &Tensor) -> ResultTensor {
+pub fn Tensor_matmul(self: &TensorData, other: &TensorData) -> ResultTensor {
     if Tensor_ndim(self) != 2 || Tensor_ndim(other) != 2 {
         return ResultTensor::Err("matmul: requires 2D tensors");
     }
@@ -271,7 +271,7 @@ pub fn Tensor_matmul(self: &Tensor, other: &Tensor) -> ResultTensor {
     var result_shape: Vec<i64> = Vec::new();
     result_shape.push(m);
     result_shape.push(n);
-    var result: Tensor = Tensor_zeros(result_shape);
+    var result: TensorData = Tensor_zeros(result_shape);
 
     var i: i64 = 0;
     while i < m {
@@ -301,7 +301,7 @@ pub fn Tensor_matmul(self: &Tensor, other: &Tensor) -> ResultTensor {
 }
 
 /// Dot product (1D vectors).
-pub fn Tensor_dot(self: &Tensor, other: &Tensor) -> ResultF64 {
+pub fn Tensor_dot(self: &TensorData, other: &TensorData) -> ResultF64 {
     if Tensor_ndim(self) != 1 || Tensor_ndim(other) != 1 {
         return ResultF64::Err("dot: requires 1D tensors");
     }
@@ -318,7 +318,7 @@ pub fn Tensor_dot(self: &Tensor, other: &Tensor) -> ResultF64 {
 }
 
 /// Sum of all elements.
-pub fn Tensor_sum(self: &Tensor) -> f64 {
+pub fn Tensor_sum(self: &TensorData) -> f64 {
     var sum: f64 = 0.0;
     var i: i64 = 0;
     while i < self.data.len() {
@@ -329,13 +329,13 @@ pub fn Tensor_sum(self: &Tensor) -> f64 {
 }
 
 /// Mean of all elements.
-pub fn Tensor_mean(self: &Tensor) -> f64 {
+pub fn Tensor_mean(self: &TensorData) -> f64 {
     if self.data.len() == 0 { return 0.0; }
     return Tensor_sum(self) / (p_int_to_float(self.data.len()));
 }
 
 /// Maximum element.
-pub fn Tensor_max(self: &Tensor) -> f64 {
+pub fn Tensor_max(self: &TensorData) -> f64 {
     var max: f64 = self.data.get(0);
     var i: i64 = 1;
     while i < self.data.len() {
@@ -346,7 +346,7 @@ pub fn Tensor_max(self: &Tensor) -> f64 {
 }
 
 /// Minimum element.
-pub fn Tensor_min(self: &Tensor) -> f64 {
+pub fn Tensor_min(self: &TensorData) -> f64 {
     var min: f64 = self.data.get(0);
     var i: i64 = 1;
     while i < self.data.len() {
@@ -360,10 +360,10 @@ pub fn Tensor_min(self: &Tensor) -> f64 {
 // ported because Fides has no closures. The direct implementations below
 // (relu, sigmoid, softmax) cover all use cases of `apply` in the Rust source.
 // To add a new elementwise transform, write a dedicated function following
-// the same pattern (iterate data, push transformed value, return new Tensor).
+// the same pattern (iterate data, push transformed value, return new TensorData).
 
 /// ReLU activation: max(0, x)
-pub fn Tensor_relu(self: &Tensor) -> Tensor {
+pub fn Tensor_relu(self: &TensorData) -> TensorData {
     var data: Vec<f64> = Vec::new();
     var i: i64 = 0;
     while i < self.data.len() {
@@ -376,7 +376,7 @@ pub fn Tensor_relu(self: &Tensor) -> Tensor {
 }
 
 /// Sigmoid activation: 1 / (1 + e^-x)
-pub fn Tensor_sigmoid(self: &Tensor) -> Tensor {
+pub fn Tensor_sigmoid(self: &TensorData) -> TensorData {
     var data: Vec<f64> = Vec::new();
     var i: i64 = 0;
     while i < self.data.len() {
@@ -388,9 +388,9 @@ pub fn Tensor_sigmoid(self: &Tensor) -> Tensor {
 }
 
 /// Softmax along the last axis.
-pub fn Tensor_softmax(self: &Tensor) -> Tensor {
+pub fn Tensor_softmax(self: &TensorData) -> TensorData {
     if Tensor_ndim(self) == 0 { return self; }
-    var result: Tensor = Tensor_new(self.shape, self.strides, self.data);
+    var result: TensorData = Tensor_new(self.shape, self.strides, self.data);
     var last: i64 = Tensor_ndim(self) - 1;
     var row_size: i64 = self.shape.get(last);
     var total: i64 = Tensor_size(self);
@@ -429,7 +429,7 @@ pub fn Tensor_softmax(self: &Tensor) -> Tensor {
 // --- ML10: Quantization ---
 
 /// Quantize a float tensor to int8 (symmetric quantization).
-pub fn Tensor_quantize_q8(self: &Tensor, scale: f64, zero_point: i64) -> Tensor {
+pub fn Tensor_quantize_q8(self: &TensorData, scale: f64, zero_point: i64) -> TensorData {
     var data: Vec<f64> = Vec::new();
     var i: i64 = 0;
     while i < self.data.len() {
@@ -444,7 +444,7 @@ pub fn Tensor_quantize_q8(self: &Tensor, scale: f64, zero_point: i64) -> Tensor 
 }
 
 /// Dequantize an int8 tensor back to float.
-pub fn Tensor_dequantize_q8(self: &Tensor, scale: f64, zero_point: i64) -> Tensor {
+pub fn Tensor_dequantize_q8(self: &TensorData, scale: f64, zero_point: i64) -> TensorData {
     var data: Vec<f64> = Vec::new();
     var i: i64 = 0;
     while i < self.data.len() {
@@ -462,7 +462,7 @@ pub struct QuantParams {
 
 /// Find optimal quantization parameters (scale and zero_point) for a tensor.
 /// Uses symmetric quantization: scale = max(|min|, |max|) / 127, zero_point = 0.
-pub fn Tensor_find_quant_params(self: &Tensor) -> QuantParams {
+pub fn Tensor_find_quant_params(self: &TensorData) -> QuantParams {
     var min: f64 = self.data.get(0);
     var max: f64 = self.data.get(0);
     var i: i64 = 1;
@@ -485,7 +485,7 @@ pub fn Tensor_find_quant_params(self: &Tensor) -> QuantParams {
 // --- Serialization ---
 
 /// Serialize to JSON string.
-pub fn Tensor_to_json(self: &Tensor) -> str {
+pub fn Tensor_to_json(self: &TensorData) -> str {
     var shape_json: str = "";
     var i: i64 = 0;
     while i < self.shape.len() {
@@ -505,7 +505,7 @@ pub fn Tensor_to_json(self: &Tensor) -> str {
 }
 
 /// Pretty-print as a nested array string.
-pub fn Tensor_to_string(self: &Tensor) -> str {
+pub fn Tensor_to_string(self: &TensorData) -> str {
     return format_recursive(self.data, self.shape, self.strides, 0);
 }
 
@@ -612,7 +612,7 @@ pub fn KvCache_new(num_layers: i64, max_seq_len: i64, window_size: i64, head_dim
 
 /// Append K and V for a given layer. The tensor should be 2D [seq, head_dim].
 /// If the cache exceeds max_seq_len, oldest tokens are evicted (sliding window).
-pub fn KvCache_append(self: &mut KvCache, layer: i64, k: &Tensor, v: &Tensor) -> void {
+pub fn KvCache_append(self: &mut KvCache, layer: i64, k: &TensorData, v: &TensorData) -> void {
     if layer < 0 || layer >= self.k_cache.len() { return; }
     // Append new tokens
     var i: i64 = 0;
@@ -653,7 +653,7 @@ pub fn KvCache_append(self: &mut KvCache, layer: i64, k: &Tensor, v: &Tensor) ->
 }
 
 /// Get K and V for a layer as a concatenated tensor [2, seq, head_dim].
-pub fn KvCache_get(self: &KvCache, layer: i64) -> Tensor {
+pub fn KvCache_get(self: &KvCache, layer: i64) -> TensorData {
     if layer < 0 || layer >= self.k_cache.len() {
         var empty_shape: Vec<i64> = Vec::new();
         empty_shape.push(0);

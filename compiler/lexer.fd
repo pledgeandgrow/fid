@@ -72,6 +72,9 @@ impl Lexer {
             } else if c == 34 {
                 // '"'
                 tokens.push(self.read_string());
+            } else if c == 39 {
+                // '\''
+                tokens.push(self.read_char_lit());
             } else {
                 tokens.push(self.read_operator());
             }
@@ -162,6 +165,92 @@ impl Lexer {
             self.col = self.col + 1;
         }
         return s;
+    }
+
+    /// Decode one UTF-8 scalar at the cursor and advance past it.
+    fn read_codepoint(self: &mut Lexer) -> i64 {
+        var c: i64 = self.peek();
+        if c < 128 { return self.advance(); }
+        var extra: i64 = 1;
+        var cp: i64 = c & 31;
+        if c >= 240 { extra = 3; cp = c & 7; }
+        else if c >= 224 { extra = 2; cp = c & 15; }
+        var i: i64 = 1;
+        while i <= extra && self.pos + i < self.src_len {
+            cp = cp * 64 + (str_byte_at(self.source, self.pos + i) & 63);
+            i = i + 1;
+        }
+        self.advance(); // consumes the lead byte and its continuation bytes
+        return cp;
+    }
+
+    /// Read N hex digits (N = 2 for \xHH) or up to '}' (for \u{...}).
+    fn read_hex_value(self: &mut Lexer, line: i64, col: i64, max_digits: i64, until_brace: bool) -> i64 {
+        var v: i64 = 0;
+        var n: i64 = 0;
+        while self.pos < self.src_len && n < max_digits {
+            var d: i64 = self.peek();
+            if until_brace && d == 125 { break; }
+            if !lex_is_hexdigit(d) {
+                self.errors.push(lex_error(line, col, "invalid hex digit in escape"));
+                return 0;
+            }
+            if d <= 57 { v = v * 16 + (d - 48); }
+            else if d <= 70 { v = v * 16 + (d - 55); }
+            else { v = v * 16 + (d - 87); }
+            self.advance();
+            n = n + 1;
+        }
+        if until_brace {
+            if self.peek() == 125 { self.advance(); }
+            else { self.errors.push(lex_error(line, col, "expected '}' to close \\u{...}")); }
+        } else if n != max_digits {
+            self.errors.push(lex_error(line, col, "\\x expects 2 hex digits"));
+        }
+        return v;
+    }
+
+    /// R1.7: char literal 'c' -> IntLit holding the Unicode scalar value, so it
+    /// compares directly against str_byte_at results. Same escapes as strings
+    /// plus \' (and \x / \u{...}).
+    fn read_char_lit(self: &mut Lexer) -> Token {
+        var line: i64 = self.line;
+        var col: i64 = self.col;
+        self.advance(); // consume opening '\''
+
+        var v: i64 = 0;
+        var c: i64 = self.peek();
+        if self.pos >= self.src_len || c == 39 || c == 10 {
+            self.errors.push(lex_error(line, col, "empty char literal"));
+        } else if c == 92 {
+            self.advance();
+            var esc: i64 = self.advance();
+            if esc == 110 { v = 10; }                // n
+            else if esc == 116 { v = 9; }            // t
+            else if esc == 114 { v = 13; }           // r
+            else if esc == 92 { v = 92; }            // backslash
+            else if esc == 39 { v = 39; }            // '\''
+            else if esc == 34 { v = 34; }            // '"'
+            else if esc == 48 { v = 0; }             // NUL
+            else if esc == 120 { v = self.read_hex_value(line, col, 2, false); }   // \xHH
+            else if esc == 117 && self.peek() == 123 {                              // \u{...}
+                self.advance();
+                v = self.read_hex_value(line, col, 6, true);
+            } else {
+                self.errors.push(lex_error(line, col, "unknown escape sequence \\" + byte_to_str(esc)));
+                v = esc;
+            }
+        } else {
+            v = self.read_codepoint();
+        }
+
+        if self.peek() == 39 {
+            self.advance(); // consume closing '\''
+        } else {
+            self.errors.push(lex_error(line, col, "unterminated char literal"));
+        }
+
+        return token_new(TokenKind::IntLit(v), line, col);
     }
 
     fn skip_line_comment(self: &mut Lexer) {

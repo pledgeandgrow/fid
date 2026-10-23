@@ -20,7 +20,7 @@ use compiler::parser;
 // Each module defines its own box_expr_unbox because Fides has no trait-based
 // generic unbox. This mirrors the pattern in lower.fd, typechecker.fd, etc.
 
-pub fn box_expr_unbox(b: Box<Expr>) -> Expr {
+pub fn ct_box_expr_unbox(b: Box<Expr>) -> Expr {
     match b {
         Expr::IntLit(v) => { return Expr::IntLit(v); }
         Expr::FloatLit(v) => { return Expr::FloatLit(v); }
@@ -332,7 +332,7 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<str>) {
         Stmt::Return(opt, _) => {
             match opt {
                 OptBoxExpr::Some(e) => {
-                    var inner: Expr = box_expr_unbox(e);
+                    var inner: Expr = ct_box_expr_unbox(e);
                     substitute_expr(&mut inner, original, errs);
                     // Can't re-wrap into Box easily; skip for now
                 }
@@ -399,14 +399,14 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<str>) {
 fn substitute_expr(expr: &mut Expr, original: &Program, errs: &mut Vec<str>) {
     match expr {
         Expr::Binary(op, left, right) => {
-            var l: Expr = box_expr_unbox(left);
-            var r: Expr = box_expr_unbox(right);
+            var l: Expr = ct_box_expr_unbox(left);
+            var r: Expr = ct_box_expr_unbox(right);
             substitute_expr(&mut l, original, errs);
             substitute_expr(&mut r, original, errs);
             *expr = Expr::Binary(op, box_expr_new(l), box_expr_new(r));
         }
         Expr::Unary(op, inner) => {
-            var e: Expr = box_expr_unbox(inner);
+            var e: Expr = ct_box_expr_unbox(inner);
             substitute_expr(&mut e, original, errs);
             *expr = Expr::Unary(op, box_expr_new(e));
         }
@@ -420,7 +420,7 @@ fn substitute_expr(expr: &mut Expr, original: &Program, errs: &mut Vec<str>) {
             }
         }
         Expr::MethodCall(receiver, mname, args) => {
-            var r: Expr = box_expr_unbox(receiver);
+            var r: Expr = ct_box_expr_unbox(receiver);
             substitute_expr(&mut r, original, errs);
             var ai: i64 = 0;
             while ai < args.len() {
@@ -432,7 +432,7 @@ fn substitute_expr(expr: &mut Expr, original: &Program, errs: &mut Vec<str>) {
             *expr = Expr::MethodCall(box_expr_new(r), mname, args);
         }
         Expr::FieldAccess(inner, field) => {
-            var e: Expr = box_expr_unbox(inner);
+            var e: Expr = ct_box_expr_unbox(inner);
             substitute_expr(&mut e, original, errs);
             *expr = Expr::FieldAccess(box_expr_new(e), field);
         }
@@ -455,8 +455,8 @@ fn substitute_expr(expr: &mut Expr, original: &Program, errs: &mut Vec<str>) {
         }
         Expr::Block(stmts) => { substitute_stmts(&mut stmts, original, errs); }
         Expr::Index(array, index) => {
-            var a: Expr = box_expr_unbox(array);
-            var i: Expr = box_expr_unbox(index);
+            var a: Expr = ct_box_expr_unbox(array);
+            var i: Expr = ct_box_expr_unbox(index);
             substitute_expr(&mut a, original, errs);
             substitute_expr(&mut i, original, errs);
             *expr = Expr::Index(box_expr_new(a), box_expr_new(i));
@@ -481,31 +481,31 @@ fn substitute_expr(expr: &mut Expr, original: &Program, errs: &mut Vec<str>) {
             }
         }
         Expr::Range(start, end, inclusive) => {
-            var s: Expr = box_expr_unbox(start);
-            var e: Expr = box_expr_unbox(end);
+            var s: Expr = ct_box_expr_unbox(start);
+            var e: Expr = ct_box_expr_unbox(end);
             substitute_expr(&mut s, original, errs);
             substitute_expr(&mut e, original, errs);
             *expr = Expr::Range(box_expr_new(s), box_expr_new(e), inclusive);
         }
         Expr::Ref(inner, is_mut) => {
-            var e: Expr = box_expr_unbox(inner);
+            var e: Expr = ct_box_expr_unbox(inner);
             substitute_expr(&mut e, original, errs);
             *expr = Expr::Ref(box_expr_new(e), is_mut);
         }
         Expr::Deref(inner) => {
-            var e: Expr = box_expr_unbox(inner);
+            var e: Expr = ct_box_expr_unbox(inner);
             substitute_expr(&mut e, original, errs);
             *expr = Expr::Deref(box_expr_new(e));
         }
         Expr::StrConcat(left, right) => {
-            var l: Expr = box_expr_unbox(left);
-            var r: Expr = box_expr_unbox(right);
+            var l: Expr = ct_box_expr_unbox(left);
+            var r: Expr = ct_box_expr_unbox(right);
             substitute_expr(&mut l, original, errs);
             substitute_expr(&mut r, original, errs);
             *expr = Expr::StrConcat(box_expr_new(l), box_expr_new(r));
         }
         Expr::Cast(inner, ty) => {
-            var e: Expr = box_expr_unbox(inner);
+            var e: Expr = ct_box_expr_unbox(inner);
             substitute_expr(&mut e, original, errs);
             *expr = Expr::Cast(box_expr_new(e), ty);
         }
@@ -517,7 +517,7 @@ fn substitute_expr(expr: &mut Expr, original: &Program, errs: &mut Vec<str>) {
 }
 
 fn substitute_expr_comptime(expr: &mut Expr, inner: Box<Expr>, original: &Program, errs: &mut Vec<str>) {
-    var e: Expr = box_expr_unbox(inner);
+    var e: Expr = ct_box_expr_unbox(inner);
     substitute_expr(&mut e, original, errs);
     // Now evaluate the comptime expression
     var result: ResultExpr = evaluate(&e, original);
@@ -568,7 +568,7 @@ fn aggressive_comptime_stmt(stmt: &mut Stmt, original: &Program) {
         Stmt::Return(opt, _) => {
             match opt {
                 OptBoxExpr::Some(e) => {
-                    var inner: Expr = box_expr_unbox(e);
+                    var inner: Expr = ct_box_expr_unbox(e);
                     aggressive_comptime_expr(&mut inner, original);
                 }
                 OptBoxExpr::None => {}
@@ -625,8 +625,8 @@ fn aggressive_comptime_stmt(stmt: &mut Stmt, original: &Program) {
             // literal bounds and body is small (<=16 stmts), unroll at AST level
             match iterator {
                 Expr::Range(start_box, end_box, inclusive) => {
-                    var start_e: Expr = box_expr_unbox(start_box);
-                    var end_e: Expr = box_expr_unbox(end_box);
+                    var start_e: Expr = ct_box_expr_unbox(start_box);
+                    var end_e: Expr = ct_box_expr_unbox(end_box);
                     match start_e {
                         Expr::IntLit(s) => {
                             match end_e {
@@ -688,14 +688,14 @@ fn aggressive_comptime_expr(expr: &mut Expr, original: &Program) {
     // First recurse into children
     match expr {
         Expr::Binary(op, left, right) => {
-            var l: Expr = box_expr_unbox(left);
-            var r: Expr = box_expr_unbox(right);
+            var l: Expr = ct_box_expr_unbox(left);
+            var r: Expr = ct_box_expr_unbox(right);
             aggressive_comptime_expr(&mut l, original);
             aggressive_comptime_expr(&mut r, original);
             *expr = Expr::Binary(op, box_expr_new(l), box_expr_new(r));
         }
         Expr::Unary(op, inner) => {
-            var e: Expr = box_expr_unbox(inner);
+            var e: Expr = ct_box_expr_unbox(inner);
             aggressive_comptime_expr(&mut e, original);
             *expr = Expr::Unary(op, box_expr_new(e));
         }
@@ -710,7 +710,7 @@ fn aggressive_comptime_expr(expr: &mut Expr, original: &Program) {
             *expr = Expr::Call(callee, args);
         }
         Expr::MethodCall(receiver, mname, args) => {
-            var r: Expr = box_expr_unbox(receiver);
+            var r: Expr = ct_box_expr_unbox(receiver);
             aggressive_comptime_expr(&mut r, original);
             var ai: i64 = 0;
             while ai < args.len() {
@@ -826,7 +826,7 @@ fn replace_ident_in_stmt(stmt: &mut Stmt, name: str, replacement: Expr) {
         Stmt::Return(opt, _) => {
             match opt {
                 OptBoxExpr::Some(e) => {
-                    var inner: Expr = box_expr_unbox(e);
+                    var inner: Expr = ct_box_expr_unbox(e);
                     replace_ident_in_expr(&mut inner, name, replacement);
                 }
                 OptBoxExpr::None => {}
@@ -886,14 +886,14 @@ fn replace_ident_in_expr(expr: &mut Expr, name: str, replacement: Expr) {
             if str_equal(n, name) { *expr = replacement; }
         }
         Expr::Binary(op, left, right) => {
-            var l: Expr = box_expr_unbox(left);
-            var r: Expr = box_expr_unbox(right);
+            var l: Expr = ct_box_expr_unbox(left);
+            var r: Expr = ct_box_expr_unbox(right);
             replace_ident_in_expr(&mut l, name, replacement);
             replace_ident_in_expr(&mut r, name, replacement);
             *expr = Expr::Binary(op, box_expr_new(l), box_expr_new(r));
         }
         Expr::Unary(op, inner) => {
-            var e: Expr = box_expr_unbox(inner);
+            var e: Expr = ct_box_expr_unbox(inner);
             replace_ident_in_expr(&mut e, name, replacement);
             *expr = Expr::Unary(op, box_expr_new(e));
         }
@@ -908,7 +908,7 @@ fn replace_ident_in_expr(expr: &mut Expr, name: str, replacement: Expr) {
             *expr = Expr::Call(callee, args);
         }
         Expr::MethodCall(receiver, mname, args) => {
-            var r: Expr = box_expr_unbox(receiver);
+            var r: Expr = ct_box_expr_unbox(receiver);
             replace_ident_in_expr(&mut r, name, replacement);
             var ai: i64 = 0;
             while ai < args.len() {
@@ -920,13 +920,13 @@ fn replace_ident_in_expr(expr: &mut Expr, name: str, replacement: Expr) {
             *expr = Expr::MethodCall(box_expr_new(r), mname, args);
         }
         Expr::FieldAccess(inner, field) => {
-            var e: Expr = box_expr_unbox(inner);
+            var e: Expr = ct_box_expr_unbox(inner);
             replace_ident_in_expr(&mut e, name, replacement);
             *expr = Expr::FieldAccess(box_expr_new(e), field);
         }
         Expr::Index(array, index) => {
-            var a: Expr = box_expr_unbox(array);
-            var i: Expr = box_expr_unbox(index);
+            var a: Expr = ct_box_expr_unbox(array);
+            var i: Expr = ct_box_expr_unbox(index);
             replace_ident_in_expr(&mut a, name, replacement);
             replace_ident_in_expr(&mut i, name, replacement);
             *expr = Expr::Index(box_expr_new(a), box_expr_new(i));
@@ -973,24 +973,24 @@ fn replace_ident_in_expr(expr: &mut Expr, name: str, replacement: Expr) {
             }
         }
         Expr::Range(start, end, incl) => {
-            var s: Expr = box_expr_unbox(start);
-            var e: Expr = box_expr_unbox(end);
+            var s: Expr = ct_box_expr_unbox(start);
+            var e: Expr = ct_box_expr_unbox(end);
             replace_ident_in_expr(&mut s, name, replacement);
             replace_ident_in_expr(&mut e, name, replacement);
             *expr = Expr::Range(box_expr_new(s), box_expr_new(e), incl);
         }
         Expr::Ref(inner, is_mut) => {
-            var e: Expr = box_expr_unbox(inner);
+            var e: Expr = ct_box_expr_unbox(inner);
             replace_ident_in_expr(&mut e, name, replacement);
             *expr = Expr::Ref(box_expr_new(e), is_mut);
         }
         Expr::Deref(inner) => {
-            var e: Expr = box_expr_unbox(inner);
+            var e: Expr = ct_box_expr_unbox(inner);
             replace_ident_in_expr(&mut e, name, replacement);
             *expr = Expr::Deref(box_expr_new(e));
         }
         Expr::Cast(inner, ty) => {
-            var e: Expr = box_expr_unbox(inner);
+            var e: Expr = ct_box_expr_unbox(inner);
             replace_ident_in_expr(&mut e, name, replacement);
             *expr = Expr::Cast(box_expr_new(e), ty);
         }
@@ -1012,8 +1012,8 @@ fn evaluate(expr: &Expr, original: &Program) -> ResultExpr {
         Expr::StringLit(s) => { return ResultExpr::Ok(Expr::StringLit(s)); }
         Expr::BoolLit(b) => { return ResultExpr::Ok(Expr::BoolLit(b)); }
         Expr::Binary(op, left, right) => {
-            var l: Expr = box_expr_unbox(left);
-            var r: Expr = box_expr_unbox(right);
+            var l: Expr = ct_box_expr_unbox(left);
+            var r: Expr = ct_box_expr_unbox(right);
             var lr: ResultExpr = evaluate(&l, original);
             match lr {
                 ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
@@ -1027,7 +1027,7 @@ fn evaluate(expr: &Expr, original: &Program) -> ResultExpr {
             }
         }
         Expr::Unary(op, inner) => {
-            var e: Expr = box_expr_unbox(inner);
+            var e: Expr = ct_box_expr_unbox(inner);
             var vr: ResultExpr = evaluate(&e, original);
             match vr {
                 ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
@@ -1084,7 +1084,7 @@ fn evaluate(expr: &Expr, original: &Program) -> ResultExpr {
         }
         Expr::Block(stmts) => { return evaluate_block(stmts, original); }
         Expr::Comptime(inner) => {
-            var e: Expr = box_expr_unbox(inner);
+            var e: Expr = ct_box_expr_unbox(inner);
             return evaluate(&e, original);
         }
         Expr::ComptimeBlock(stmts) => { return evaluate_block(stmts, original); }
@@ -1155,7 +1155,7 @@ fn evaluate_block_with_env(stmts: &Vec<Stmt>, original: &Program, env: &Comptime
             Stmt::Return(opt, _) => {
                 match opt {
                     OptBoxExpr::Some(e) => {
-                        var inner: Expr = box_expr_unbox(e);
+                        var inner: Expr = ct_box_expr_unbox(e);
                         return evaluate_with_env(&inner, &local_env, original);
                     }
                     OptBoxExpr::None => { return ResultExpr::Ok(Expr::IntLit(0)); }
@@ -1201,8 +1201,8 @@ fn evaluate_block_with_env(stmts: &Vec<Stmt>, original: &Program, env: &Comptime
                     ResultExpr::Ok(iv) => {
                         match iv {
                             Expr::Range(start_box, end_box, _) => {
-                                var start_e: Expr = box_expr_unbox(start_box);
-                                var end_e: Expr = box_expr_unbox(end_box);
+                                var start_e: Expr = ct_box_expr_unbox(start_box);
+                                var end_e: Expr = ct_box_expr_unbox(end_box);
                                 var sr: ResultExpr = evaluate_with_env(&start_e, &local_env, original);
                                 var er: ResultExpr = evaluate_with_env(&end_e, &local_env, original);
                                 match sr {
@@ -1262,8 +1262,8 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
         Expr::StringLit(s) => { return ResultExpr::Ok(Expr::StringLit(s)); }
         Expr::BoolLit(b) => { return ResultExpr::Ok(Expr::BoolLit(b)); }
         Expr::Binary(op, left, right) => {
-            var l: Expr = box_expr_unbox(left);
-            var r: Expr = box_expr_unbox(right);
+            var l: Expr = ct_box_expr_unbox(left);
+            var r: Expr = ct_box_expr_unbox(right);
             var lr: ResultExpr = evaluate_with_env(&l, env, original);
             match lr {
                 ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
@@ -1277,7 +1277,7 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
             }
         }
         Expr::Unary(op, inner) => {
-            var e: Expr = box_expr_unbox(inner);
+            var e: Expr = ct_box_expr_unbox(inner);
             var vr: ResultExpr = evaluate_with_env(&e, env, original);
             match vr {
                 ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
@@ -1332,8 +1332,8 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
         }
         Expr::Block(stmts) => { return evaluate_block_with_env(stmts, original, env); }
         Expr::StrConcat(left, right) => {
-            var l: Expr = box_expr_unbox(left);
-            var r: Expr = box_expr_unbox(right);
+            var l: Expr = ct_box_expr_unbox(left);
+            var r: Expr = ct_box_expr_unbox(right);
             var lr: ResultExpr = evaluate_with_env(&l, env, original);
             match lr {
                 ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }

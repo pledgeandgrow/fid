@@ -72,6 +72,7 @@ and `AGENTS.md` first when working on the compiler.
 | [roadmap/features-roadmap.md](roadmap/features-roadmap.md) | New language features roadmap (track of additions). |
 | [roadmap/llvm-roadmap.md](roadmap/llvm-roadmap.md) | LLVM parity & superset roadmap — compete, don't copy. |
 | [roadmap/roadmap-limitations.md](roadmap/roadmap-limitations.md) | Limitations & pain points to address. |
+| [roadmap/release-roadmap.md](roadmap/release-roadmap.md) | Release goals derived from self-hosted code analysis — close the grammar-vs-usable gap. |
 | [roadmap/opportunities.md](roadmap/opportunities.md) | AI/ML feature opportunities + where Fides could be groundbreaking by industry. |
 
 ### Other

@@ -765,7 +765,7 @@ pub fn is_pure(inst: L2Inst) -> bool {
 /// Check if an instruction is a call to a @deterministic user function.
 pub fn is_cseable_call(inst: L2Inst, det_funcs: Vec<str>) -> bool {
     match inst {
-        L2Inst::Call(func, _, _) => { return str_vec_contains(det_funcs, func); }
+        L2Inst::Call(func, _, _) => { return opt_str_vec_contains(det_funcs, func); }
         _ => { return false; }
     }
     return false;
@@ -928,7 +928,7 @@ pub fn i64_vec_contains(vec: Vec<i64>, v: i64) -> bool {
 }
 
 /// Check if a string is in a Vec<str>.
-pub fn str_vec_contains(vec: Vec<str>, s: str) -> bool {
+pub fn opt_str_vec_contains(vec: Vec<str>, s: str) -> bool {
     var i: i64 = 0;
     while i < vec.len() {
         if str_equal(vec.get(i), s) { return true; }
@@ -1392,7 +1392,7 @@ fn opt_eval_binop_int(op: BinOp, l: i64, r: i64, ty: IrType) -> OptI64 {
         BinOp::BitOr => { result = l | r; }
         BinOp::BitXor => { result = l ^ r; }
         BinOp::Shl => { result = l << r; }
-        BinOp::Shr => { result = shr_i64(l, r); }
+        BinOp::Shr => { result = l >> r; }
         BinOp::Eq => { if l == r { result = 1; } else { result = 0; } }
         BinOp::Neq => { if l != r { result = 1; } else { result = 0; } }
         BinOp::Lt => { if l < r { result = 1; } else { result = 0; } }
@@ -2742,7 +2742,7 @@ fn dse_function(f: &mut L2Function) -> i64 {
     // A store to a local pointer in block B is dead if ALL successors
     // store to the same pointer before loading it. Uses backward dataflow.
     // Compute per-block "store_before_load" sets (walking forward).
-    var block_sbl: Vec<Vec<i64> > = Vec::new();
+    var block_sbl: Vec<Vec<i64>> = Vec::new();
     bi = 0;
     while bi < f.blocks.len() {
         var stored: Vec<i64> = Vec::new();
@@ -2821,7 +2821,7 @@ fn dse_function(f: &mut L2Function) -> i64 {
     }
 
     // Compute successors for each block.
-    var block_succs: Vec<Vec<i64> > = Vec::new();
+    var block_succs: Vec<Vec<i64>> = Vec::new();
     bi = 0;
     while bi < f.blocks.len() {
         var succs: Vec<i64> = Vec::new();
@@ -2839,7 +2839,7 @@ fn dse_function(f: &mut L2Function) -> i64 {
 
     // Backward dataflow: sbl_out[B] = intersection over all successors S of
     // (block_sbl[S] + sbl_out[S]).
-    var sbl_out: Vec<Vec<i64> > = Vec::new();
+    var sbl_out: Vec<Vec<i64>> = Vec::new();
     bi = 0;
     while bi < f.blocks.len() {
         sbl_out.push(Vec::new());
@@ -4152,7 +4152,7 @@ fn inline_into(caller: &mut L2Function, eligible_names: Vec<str>, eligible_funcs
     // Find call sites to inline
     var call_vids: Vec<i64> = Vec::new();
     var call_callees: Vec<str> = Vec::new();
-    var call_args_list: Vec<Vec<i64> > = Vec::new();
+    var call_args_list: Vec<Vec<i64>> = Vec::new();
 
     var vi: i64 = 0;
     while vi < caller.values.len() {
@@ -4161,7 +4161,7 @@ fn inline_into(caller: &mut L2Function, eligible_names: Vec<str>, eligible_funcs
         var call_info: OptCallInfo = extract_call_info(inst);
         match call_info {
             OptCallInfo::Some(info) => {
-                if str_vec_contains(eligible_names, info.callee) {
+                if opt_str_vec_contains(eligible_names, info.callee) {
                     call_vids.push(vid);
                     call_callees.push(info.callee);
                     call_args_list.push(info.args);
@@ -4538,7 +4538,7 @@ fn topo_sort_block(b: &mut L2Block, values: Vec<ValueIdL2Entry>) {
 
     // Build dependency info: for each instruction, which other instructions
     // in this block must come before it?
-    var deps: Vec<Vec<i64> > = Vec::new();
+    var deps: Vec<Vec<i64>> = Vec::new();
     var ii: i64 = 0;
     while ii < insts.len() {
         var dep_list: Vec<i64> = Vec::new();
@@ -6282,7 +6282,7 @@ pub fn pass_partial_eval(module: &mut L2Module) -> i64 {
             var call_info: OptCallInfo = extract_call_info(inst);
             match call_info {
                 OptCallInfo::Some(info) => {
-                    if str_vec_contains(pure_funcs, info.callee) {
+                    if opt_str_vec_contains(pure_funcs, info.callee) {
                         // Check if all arguments are constants
                         var all_const: bool = true;
                         var ai: i64 = 0;
@@ -6482,7 +6482,7 @@ fn eval_binop_int_pe(op: BinOp, l: i64, r: i64) -> i64 {
         BinOp::BitOr => { return l | r; }
         BinOp::BitXor => { return l ^ r; }
         BinOp::Shl => { return l << r; }
-        BinOp::Shr => { return shr_i64(l, r); }
+        BinOp::Shr => { return l >> r; }
         BinOp::Eq => { if l == r { return 1; } return 0; }
         BinOp::Neq => { if l != r { return 1; } return 0; }
         BinOp::Lt => { if l < r { return 1; } return 0; }
@@ -6729,7 +6729,7 @@ fn slp_vectorize_block(f: &mut L2Function, bi: i64) -> i64 {
     while i < binop_vids.len() {
         var j: i64 = i + 1;
         while j < binop_vids.len() {
-            if binop_eq(binop_ops.get(i), binop_ops.get(j)) {
+            if opt_binop_eq(binop_ops.get(i), binop_ops.get(j)) {
                 var li_simd: i64 = slp_lookup(load_to_simd_keys, load_to_simd_vals, binop_lefts.get(i));
                 var lj_simd: i64 = slp_lookup(load_to_simd_keys, load_to_simd_vals, binop_lefts.get(j));
                 var ri_simd: i64 = slp_lookup(load_to_simd_keys, load_to_simd_vals, binop_rights.get(i));
@@ -6852,7 +6852,7 @@ fn slp_binop_to_simd(op: BinOp) -> str {
 }
 
 /// Check if two BinOps are equal.
-pub fn binop_eq(a: BinOp, b: BinOp) -> bool {
+pub fn opt_binop_eq(a: BinOp, b: BinOp) -> bool {
     match a {
         BinOp::Add => { match b { BinOp::Add => { return true; }, _ => { return false; } } }
         BinOp::Sub => { match b { BinOp::Sub => { return true; }, _ => { return false; } } }
@@ -7077,22 +7077,10 @@ pub fn exact_log2(n: i64) -> i64 {
     var shift: i64 = 0;
     while v > 1 {
         if (v & 1) != 0 { return -1; }
-        v = shr_i64(v, 1);
+        v = v >> 1;
         shift = shift + 1;
     }
     return shift;
-}
-
-/// Right shift helper (Fides parser has issues with >> in expressions)
-fn shr_i64(v: i64, amount: i64) -> i64 {
-    // Use division by 2^amount as a workaround
-    var result: i64 = v;
-    var i: i64 = 0;
-    while i < amount {
-        result = result / 2;
-        i = i + 1;
-    }
-    return result;
 }
 
 // ===========================================================================
@@ -7193,7 +7181,7 @@ fn effect_optimize_function(f: &mut L2Function, pure_funcs: Vec<str>, hoistable_
         var inst: L2Inst = f.values.get(vi2).inst;
         match inst {
             L2Inst::Call(fname, _, _) => {
-                var is_pure: bool = str_vec_contains(pure_funcs, fname) || is_known_pure_func(fname);
+                var is_pure: bool = opt_str_vec_contains(pure_funcs, fname) || is_known_pure_func(fname);
                 if is_pure {
                     // Check if vid is used
                     var is_used: bool = false;
@@ -7257,7 +7245,7 @@ fn effect_optimize_function(f: &mut L2Function, pure_funcs: Vec<str>, hoistable_
 
     // Build predecessor map
     var pred_counts: Vec<i64> = Vec::new();
-    var pred_lists: Vec<Vec<i64> > = Vec::new();
+    var pred_lists: Vec<Vec<i64>> = Vec::new();
     var bi3: i64 = 0;
     while bi3 < f.blocks.len() {
         pred_lists.push(Vec::new());
@@ -7292,7 +7280,7 @@ fn effect_optimize_function(f: &mut L2Function, pure_funcs: Vec<str>, hoistable_
 
     // Find loop headers: blocks with a predecessor that comes after them
     var loop_headers: Vec<i64> = Vec::new();
-    var loop_bodies: Vec<Vec<i64> > = Vec::new();
+    var loop_bodies: Vec<Vec<i64>> = Vec::new();
     var bi5: i64 = 0;
     while bi5 < f.blocks.len() {
         var pi2: i64 = 0;
@@ -7357,7 +7345,7 @@ fn effect_optimize_function(f: &mut L2Function, pure_funcs: Vec<str>, hoistable_
                             _ => {}
                         }
                         if matched2 {
-                            var is_hoistable: bool = str_vec_contains(hoistable_funcs, fname2) || is_known_pure_func(fname2);
+                            var is_hoistable: bool = opt_str_vec_contains(hoistable_funcs, fname2) || is_known_pure_func(fname2);
                             if is_hoistable {
                                 // Check if all args are loop-invariant
                                 var all_invariant: bool = true;
@@ -7898,7 +7886,7 @@ fn memoize_function(f: &mut L2Function, det_funcs: Vec<str>) -> i64 {
             var inst: L2Inst = get_inst(f, vid);
             match inst {
                 L2Inst::Call(func, args, ret_ty) => {
-                    if str_vec_contains(det_funcs, func) {
+                    if opt_str_vec_contains(det_funcs, func) {
                         // Build memo key
                         var key: str = func;
                         var k: i64 = 0;

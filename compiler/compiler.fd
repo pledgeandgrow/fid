@@ -52,6 +52,7 @@ use compiler::runtime_arm64;
 use compiler::codegen_riscv;
 use compiler::riscv_enc;
 use compiler::runtime_riscv;
+use compiler::x86;
 use compiler::wasm;
 // ===========================================================================
 // Result types (Fides has no generic Result<T,E>)
@@ -246,7 +247,7 @@ pub struct I64Pair {
     pub second: i64,
 }
 
-pub fn I64Pair_new(first: i64, second: i64) -> I64Pair {
+pub fn cc_I64Pair_new(first: i64, second: i64) -> I64Pair {
     return I64Pair { first: first, second: second };
 }
 
@@ -280,7 +281,7 @@ pub fn extract_line_col(err: str) -> I64Pair {
             var line_str: str = c_str_substr(rest, 0, end);
             var line: i64 = c_str_parse_i64(line_str);
             if line > 0 {
-                return I64Pair_new(line, 1);
+                return cc_I64Pair_new(line, 1);
             }
         }
     }
@@ -300,10 +301,10 @@ pub fn extract_line_col(err: str) -> I64Pair {
                     var col_str: str = c_str_substr(after_colon, 0, end2);
                     var col: i64 = c_str_parse_i64(col_str);
                     if col > 0 {
-                        return I64Pair_new(line2, col);
+                        return cc_I64Pair_new(line2, col);
                     }
                 }
-                return I64Pair_new(line2, 1);
+                return cc_I64Pair_new(line2, 1);
             }
         }
     }
@@ -322,15 +323,15 @@ pub fn extract_line_col(err: str) -> I64Pair {
                     var col_str2: str = c_str_substr(after, 0, colon2);
                     var col2: i64 = c_str_parse_i64(col_str2);
                     if col2 > 0 {
-                        return I64Pair_new(line3, col2);
+                        return cc_I64Pair_new(line3, col2);
                     }
                 }
-                return I64Pair_new(line3, 1);
+                return cc_I64Pair_new(line3, 1);
             }
         }
     }
 
-    return I64Pair_new(0, 0);
+    return cc_I64Pair_new(0, 0);
 }
 
 /// Parse an error string to extract (line, column, message).
@@ -653,6 +654,16 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
 /// This is for kernel/UEFI/bare-metal development where the program
 /// must have ZERO hidden runtime dependencies.
 pub fn build_program_no_std(source: str, source_path: OptStr) -> ResultProgram {
+    // Legacy entry point used by main.fd (--boot / --bare). Those callers do
+    // not pass the --borrowck mode through, so no-std builds reached via this
+    // function skip borrow checking entirely. Callers that have the mode
+    // should use build_program_no_std_borrowck instead.
+    return build_program_no_std_borrowck(source, source_path, "off");
+}
+
+/// No-std build that honors the borrow-checker mode ("off", "warn", "on")
+/// exactly like build_program_with_path_borrowck does for the stdlib path.
+pub fn build_program_no_std_borrowck(source: str, source_path: OptStr, borrowck_mode: str) -> ResultProgram {
     p_eprint_str("[build] No-stdlib mode: skipping stdlib/core.fd\n");
     // Parse user code without stdlib names
     var lex: Lexer = Lexer::new(source);
@@ -844,8 +855,41 @@ pub fn build_program_no_std(source: str, source_path: OptStr) -> ResultProgram {
                 }
                 return ResultProgram::Err(enrich_errors(tc.errors, source, file3));
             }
-            // Borrow check (off by default in no-std mode)
-            var bc: BorrowChecker = BorrowChecker_new(BorrowckMode::Off);
+            // G8.2: Borrow check -- same mode handling as the stdlib path.
+            //   "off"  : skip borrow checking entirely
+            //   "warn" : report errors as warnings, don't fail
+            //   "on"   : report errors and fail compilation
+            if borrowck_mode != "off" {
+                p_eprint_str("[build] No-std: borrow checking (mode=");
+                p_eprint_str(borrowck_mode);
+                p_eprint_str(")...\n");
+                var bc_mode: BorrowckMode = BorrowckMode::On;
+                if borrowck_mode == "warn" {
+                    bc_mode = BorrowckMode::Warn;
+                }
+                var bc: BorrowChecker = BorrowChecker_new(bc_mode);
+                check(&mut bc, program);
+                if bc.errors.len() > 0 {
+                    var file4: str = "<stdin>";
+                    match source_path {
+                        OptStr::Some(p4) => { file4 = p4; }
+                        OptStr::None => { }
+                    }
+                    if borrowck_mode == "warn" {
+                        var ei: i64 = 0;
+                        while ei < bc.errors.len() {
+                            p_eprint_str("warning: ");
+                            p_eprint_str(bc.errors.get(ei));
+                            p_eprint_str("\n");
+                            ei = ei + 1;
+                        }
+                    } else {
+                        return ResultProgram::Err(enrich_errors(bc.errors, source, file4));
+                    }
+                }
+            } else {
+                p_eprint_str("[build] No-std: borrow checking skipped (mode=off).\n");
+            }
             // Monomorphize
             p_eprint_str("[build] No-std: monomorphizing...\n");
             var mono_result: Program = monomorphize(program);
@@ -1110,7 +1154,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                                         if unloaded_deps.len() > 0 {
                                             // Cycle detection: if this module is already deferred,
                                             // it means we're in a cyclic import chain.
-                                            if c_str_vec_contains(currently_deferred, import_path) {
+                                            if cc_c_str_vec_contains(currently_deferred, import_path) {
                                                 p_eprint_str("[build] WARNING: cyclic import detected involving '");
                                                 p_eprint_str(import_path);
                                                 p_eprint_str("' -- skipping\n");
@@ -1614,13 +1658,33 @@ pub fn interpret_source_with_path(source: str, source_path: str, max_recursion: 
 ///   riscv / riscv64    -> codegen_riscv + riscv_enc + runtime_riscv + linker
 ///   windows / x64-win  -> pe::generate_pe
 ///   wasm               -> (future)
-pub fn build_executable(source: str, source_path: str, target: str, do_opt: bool, do_lto: bool) -> ResultBytes {
+/// Convert a capability name list to the runtime bitfield:
+///   bit0 = FS (also covers IO), bit1 = Net, bit2 = Spawn.
+fn caps_to_bits(caps: Vec<str>) -> i64 {
+    var bits: i64 = 0;
+    var ci: i64 = 0;
+    while ci < caps.len() {
+        var c: str = caps.get(ci);
+        if str_equal(c, "FS") || str_equal(c, "IO") { bits = bits | 1; }
+        if str_equal(c, "Net") { bits = bits | 2; }
+        if str_equal(c, "Spawn") { bits = bits | 4; }
+        ci = ci + 1;
+    }
+    return bits;
+}
+
+pub fn build_executable(source: str, source_path: str, target: str, do_opt: bool, do_lto: bool, granted_caps: Vec<str>) -> ResultBytes {
     // Parse + lower to IR
     var prog_result: ResultProgram = build_program_with_path(source, OptStr::Some(source_path));
     match prog_result {
         ResultProgram::Err(errs) => { return ResultBytes::Err(errs); }
         ResultProgram::Ok(program) => {
             var module: IrModule = lower(program);
+
+            // F5: Capability-aware linking — strip functions requiring ungranted capabilities
+            if granted_caps.len() > 0 {
+                strip_ungranted_caps(&mut module, granted_caps);
+            }
 
             // PIR pipeline: IR -> L1 -> L2 -> (optimize) -> L3
             var l1: L1Module = lower_ir_to_l1(&module);
@@ -1646,8 +1710,11 @@ pub fn build_executable(source: str, source_path: str, target: str, do_opt: bool
                     return ResultBytes::Err(c_vec1(ResultVec_err_msg(obj_result)));
                 }
                 var obj: Vec<i64> = ResultVec_bytes(obj_result);
-                // Get runtime parts
+                // Get runtime parts — F-1B: capability-aware runtime when caps are granted
                 var rt: RuntimeParts = runtime_parts();
+                if granted_caps.len() > 0 {
+                    rt = runtime_parts_with_caps(caps_to_bits(granted_caps));
+                }
                 var rt_relocs: Vec<RuntimeReloc> = runtime_relocations();
                 // Link
                 var objects: Vec<Vec> = Vec::new();
@@ -1723,8 +1790,11 @@ pub fn build_executable(source: str, source_path: str, target: str, do_opt: bool
                         return ResultBytes::Err(c_vec1("ARM64 assembly error: " + e));
                     }
                 }
-                // Get ARM64 runtime parts
+                // Get ARM64 runtime parts — capability-aware when caps are granted
                 var rt_arm: RuntimeParts = runtime_parts_arm64();
+                if granted_caps.len() > 0 {
+                    rt_arm = runtime_parts_with_caps_arm64(caps_to_bits(granted_caps));
+                }
                 var rt_arm_relocs: Vec<RuntimeReloc> = runtime_relocations_arm64();
                 var rt_arm_syms: Vec<LinkerSymbol> = Vec::new();
                 var si2: i64 = 0;
@@ -1790,6 +1860,9 @@ pub fn build_executable(source: str, source_path: str, target: str, do_opt: bool
                     }
                 }
                 var rt_rv: RuntimeParts = runtime_parts_riscv();
+                if granted_caps.len() > 0 {
+                    rt_rv = runtime_parts_with_caps_riscv(caps_to_bits(granted_caps));
+                }
                 var rt_rv_relocs: Vec<RuntimeReloc> = runtime_relocations_riscv();
                 var rt_rv_syms: Vec<LinkerSymbol> = Vec::new();
                 var si3: i64 = 0;
@@ -1830,6 +1903,50 @@ pub fn build_executable(source: str, source_path: str, target: str, do_opt: bool
     }
     return ResultBytes::Err(c_vec1("unreachable"));
 }
+
+/// Build a native Linux ELF executable using the x86.rs stack-machine backend.
+/// This is the simpler backend (no PIR, no register allocation) — each SSA value
+/// lives on the stack. Emits AT&T assembly -> elf64 assembler -> linker with no
+/// runtime (the x86 backend includes its own runtime stubs).
+/// Mirrors src/compiler.rs::build_x86_linux.
+pub fn build_x86_linux(source: str, source_path: str) -> ResultBytes {
+    var mod_result: ResultIrModule = lower_to_ir_module_with_path(source, source_path, "on");
+    match mod_result {
+        ResultIrModule::Err(errs) => { return ResultBytes::Err(errs); }
+        ResultIrModule::Ok(ir_mod) => {
+            // Generate AT&T assembly via the x86 backend
+            var asm: str = generate_asm_x86(ir_mod);
+
+            // Assemble to ELF64 object (module param unused — assembler only reads asm text)
+            var obj_result: ResultVec = emit_object_file(0, asm);
+            match obj_result {
+                ResultVec::Err(e) => { return ResultBytes::Err(c_vec1(e)); }
+                ResultVec::Ok(obj) => {
+                    // Link with an empty runtime — the x86 backend emits its own _start + stubs
+                    var objects: Vec<Vec> = Vec::new();
+                    objects.push(obj);
+                    var empty_text: Vec = Vec::new();
+                    var empty_rodata: Vec = Vec::new();
+                    var empty_syms: Vec<LinkerSymbol> = Vec::new();
+                    var empty_rodata_syms: Vec<LinkerRodataSym> = Vec::new();
+                    var empty_relocs: Vec<LinkerReloc> = Vec::new();
+                    var link_result: LinkerResult = link_with_runtime(
+                        objects, "_start",
+                        empty_text, empty_syms,
+                        empty_rodata, empty_rodata_syms,
+                        empty_relocs
+                    );
+                    if LinkerResult_is_ok(link_result) {
+                        return ResultBytes::Ok(LinkerResult_bytes(link_result));
+                    }
+                    return ResultBytes::Err(c_vec1(LinkerResult_err_msg(link_result)));
+                }
+            }
+        }
+    }
+    return ResultBytes::Err(c_vec1("unreachable"));
+}
+
 pub fn get_diagnostics(source: str, source_path: OptStr) -> Vec<StrTriple> {
     var result: ResultProgram = build_program_with_path(source, source_path);
     match result {
@@ -1898,42 +2015,42 @@ pub fn merge_programs(stdlib: Program, user: Program) -> Program {
     // Add stdlib items that don't conflict with user definitions
     i = 0;
     while i < stdlib.funcs.len() {
-        if !c_str_vec_contains(user_func_names, stdlib.funcs.get(i).name) {
+        if !cc_c_str_vec_contains(user_func_names, stdlib.funcs.get(i).name) {
             merged.funcs.push(stdlib.funcs.get(i));
         }
         i = i + 1;
     }
     i = 0;
     while i < stdlib.structs.len() {
-        if !c_str_vec_contains(user_struct_names, stdlib.structs.get(i).name) {
+        if !cc_c_str_vec_contains(user_struct_names, stdlib.structs.get(i).name) {
             merged.structs.push(stdlib.structs.get(i));
         }
         i = i + 1;
     }
     i = 0;
     while i < stdlib.enums.len() {
-        if !c_str_vec_contains(user_enum_names, stdlib.enums.get(i).name) {
+        if !cc_c_str_vec_contains(user_enum_names, stdlib.enums.get(i).name) {
             merged.enums.push(stdlib.enums.get(i));
         }
         i = i + 1;
     }
     i = 0;
     while i < stdlib.consts.len() {
-        if !c_str_vec_contains(user_const_names, stdlib.consts.get(i).name) {
+        if !cc_c_str_vec_contains(user_const_names, stdlib.consts.get(i).name) {
             merged.consts.push(stdlib.consts.get(i));
         }
         i = i + 1;
     }
     i = 0;
     while i < stdlib.globals.len() {
-        if !c_str_vec_contains(user_global_names, stdlib.globals.get(i).name) {
+        if !cc_c_str_vec_contains(user_global_names, stdlib.globals.get(i).name) {
             merged.globals.push(stdlib.globals.get(i));
         }
         i = i + 1;
     }
     i = 0;
     while i < stdlib.type_aliases.len() {
-        if !c_str_vec_contains(user_alias_names, stdlib.type_aliases.get(i).name) {
+        if !cc_c_str_vec_contains(user_alias_names, stdlib.type_aliases.get(i).name) {
             merged.type_aliases.push(stdlib.type_aliases.get(i));
         }
         i = i + 1;
@@ -2461,7 +2578,7 @@ pub fn fill_default_trait_methods(program: &mut Program) {
         var m: i64 = 0;
         while m < trait_def.methods.len() {
             var tm: TraitMethod = trait_def.methods.get(m);
-            if c_str_vec_contains(provided, tm.name) {
+            if cc_c_str_vec_contains(provided, tm.name) {
                 m = m + 1;
                 continue;
             }
@@ -2505,9 +2622,9 @@ pub fn fill_default_trait_methods(program: &mut Program) {
 /// through the stripped functions.
 pub fn strip_ungranted_caps(module: &mut IrModule, granted_caps: Vec<str>) {
     // Map capability names to the effects they grant
-    var granted_io: bool = c_str_vec_contains(granted_caps, "IO") || c_str_vec_contains(granted_caps, "FS");
-    var granted_net: bool = c_str_vec_contains(granted_caps, "Net");
-    var granted_spawn: bool = c_str_vec_contains(granted_caps, "Spawn");
+    var granted_io: bool = cc_c_str_vec_contains(granted_caps, "IO") || cc_c_str_vec_contains(granted_caps, "FS");
+    var granted_net: bool = cc_c_str_vec_contains(granted_caps, "Net");
+    var granted_spawn: bool = cc_c_str_vec_contains(granted_caps, "Spawn");
 
     // Find functions that require effects not in the granted set.
     // Entry points (main, _start) are never stripped.
@@ -2526,21 +2643,21 @@ pub fn strip_ungranted_caps(module: &mut IrModule, granted_caps: Vec<str>) {
             match eff {
                 Effect::IO => {
                     if !granted_io {
-                        if !c_str_vec_contains(to_remove, entry.name) {
+                        if !cc_c_str_vec_contains(to_remove, entry.name) {
                             to_remove.push(entry.name);
                         }
                     }
                 }
                 Effect::Net => {
                     if !granted_net {
-                        if !c_str_vec_contains(to_remove, entry.name) {
+                        if !cc_c_str_vec_contains(to_remove, entry.name) {
                             to_remove.push(entry.name);
                         }
                     }
                 }
                 Effect::Spawn => {
                     if !granted_spawn {
-                        if !c_str_vec_contains(to_remove, entry.name) {
+                        if !cc_c_str_vec_contains(to_remove, entry.name) {
                             to_remove.push(entry.name);
                         }
                     }
@@ -2569,12 +2686,12 @@ pub fn strip_ungranted_caps(module: &mut IrModule, granted_caps: Vec<str>) {
                     callees.push(callee);
                 }
                 Inst::ConstStr(value) => {
-                    if c_str_vec_contains(all_func_names, value) {
+                    if cc_c_str_vec_contains(all_func_names, value) {
                         callees.push(value);
                     }
                 }
                 Inst::ConstFnRef(name) => {
-                    if c_str_vec_contains(all_func_names, name) {
+                    if cc_c_str_vec_contains(all_func_names, name) {
                         callees.push(name);
                     }
                 }
@@ -2590,17 +2707,17 @@ pub fn strip_ungranted_caps(module: &mut IrModule, granted_caps: Vec<str>) {
     var queue: Vec<str> = Vec::new();
 
     // Start from all entry points
-    if c_str_vec_contains(all_func_names, "main") && !c_str_vec_contains(to_remove, "main") {
+    if cc_c_str_vec_contains(all_func_names, "main") && !cc_c_str_vec_contains(to_remove, "main") {
         queue.push("main");
     }
-    if c_str_vec_contains(all_func_names, "_start") && !c_str_vec_contains(to_remove, "_start") {
+    if cc_c_str_vec_contains(all_func_names, "_start") && !cc_c_str_vec_contains(to_remove, "_start") {
         queue.push("_start");
     }
 
     while queue.len() > 0 {
         var name: str = queue.get(0);
         queue = c_vec_remove_first(queue);
-        if c_str_vec_contains(reachable, name) || c_str_vec_contains(to_remove, name) {
+        if cc_c_str_vec_contains(reachable, name) || cc_c_str_vec_contains(to_remove, name) {
             continue;
         }
         reachable.push(name);
@@ -2615,7 +2732,7 @@ pub fn strip_ungranted_caps(module: &mut IrModule, granted_caps: Vec<str>) {
         }
         var c2: i64 = 0;
         while c2 < callees2.len() {
-            if !c_str_vec_contains(reachable, callees2.get(c2)) {
+            if !cc_c_str_vec_contains(reachable, callees2.get(c2)) {
                 queue.push(callees2.get(c2));
             }
             c2 = c2 + 1;
@@ -2627,14 +2744,14 @@ pub fn strip_ungranted_caps(module: &mut IrModule, granted_caps: Vec<str>) {
     var new_function_effects: Vec<StringEffectSetEntry> = Vec::new();
     i = 0;
     while i < module.functions.len() {
-        if c_str_vec_contains(reachable, module.functions.get(i).name) {
+        if cc_c_str_vec_contains(reachable, module.functions.get(i).name) {
             new_functions.push(module.functions.get(i));
         }
         i = i + 1;
     }
     i = 0;
     while i < module.function_effects.len() {
-        if c_str_vec_contains(reachable, module.function_effects.get(i).name) {
+        if cc_c_str_vec_contains(reachable, module.function_effects.get(i).name) {
             new_function_effects.push(module.function_effects.get(i));
         }
         i = i + 1;
@@ -2728,7 +2845,7 @@ pub fn c_str_trim_quotes(s: str) -> str {
 }
 
 /// Check if a Vec<str> contains a string.
-pub fn c_str_vec_contains(vec: Vec<str>, s: str) -> bool {
+pub fn cc_c_str_vec_contains(vec: Vec<str>, s: str) -> bool {
     var i: i64 = 0;
     while i < vec.len() {
         if str_equal(vec.get(i), s) { return true; }

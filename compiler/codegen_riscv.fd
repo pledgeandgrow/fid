@@ -45,7 +45,7 @@ pub fn generate_asm_riscv(module: L3Module) -> str {
 // RISC-V Register definitions
 // ===========================================================================
 
-pub fn reg_name(idx: i64) -> str {
+pub fn rv_reg_name(idx: i64) -> str {
     // RISC-V register names (ABI names), 32 registers.
     // Map VReg to a usable register (skip x0-x4 which are special).
     var mapped: i64 = 5 + (idx % 23);
@@ -84,8 +84,8 @@ pub fn reg_name(idx: i64) -> str {
     return "t0";
 }
 
-pub fn vreg_to_reg(vreg: VReg) -> str {
-    return reg_name(vreg.id);
+pub fn rv_vreg_to_reg(vreg: VReg) -> str {
+    return rv_reg_name(vreg.id);
 }
 
 // ===========================================================================
@@ -210,11 +210,11 @@ pub fn RiscVCodeGen_gen_block(self: &mut RiscVCodeGen, func: L3Function, block: 
 pub fn RiscVCodeGen_gen_inst(self: &mut RiscVCodeGen, func: L3Function, inst: L3Inst) {
     match inst {
         L3Inst::AddrOfSlot(dst, slot) => {
-            var d: str = vreg_to_reg(dst);
+            var d: str = rv_vreg_to_reg(dst);
             RiscVCodeGen_wl(self, "    addi " + d + ", fp, -" + int_to_str(slot.offset));
         }
         L3Inst::GlobalAddr(dst, name, _) => {
-            var d: str = vreg_to_reg(dst);
+            var d: str = rv_vreg_to_reg(dst);
             RiscVCodeGen_wl(self, "    # global addr " + name);
             RiscVCodeGen_wl(self, "    li " + d + ", 0");
         }
@@ -228,11 +228,11 @@ pub fn RiscVCodeGen_gen_inst(self: &mut RiscVCodeGen, func: L3Function, inst: L3
             RiscVCodeGen_gen_unary(self, op, dst, src);
         }
         L3Inst::StackAlloc(dst, bytes, _) => {
-            var reg: str = vreg_to_reg(dst);
+            var reg: str = rv_vreg_to_reg(dst);
             RiscVCodeGen_wl(self, "    sub " + reg + ", sp, " + int_to_str(bytes));
         }
         L3Inst::Load(dst, ptr, _) => {
-            var d: str = vreg_to_reg(dst);
+            var d: str = rv_vreg_to_reg(dst);
             var p: str = riscv_operand_to_reg(ptr);
             RiscVCodeGen_wl(self, "    ld " + d + ", 0(" + p + ")");
         }
@@ -242,12 +242,12 @@ pub fn RiscVCodeGen_gen_inst(self: &mut RiscVCodeGen, func: L3Function, inst: L3
             RiscVCodeGen_wl(self, "    sd " + v + ", 0(" + p + ")");
         }
         L3Inst::FieldAddr(dst, base, offset, _) => {
-            var d: str = vreg_to_reg(dst);
+            var d: str = rv_vreg_to_reg(dst);
             var b: str = riscv_operand_to_reg(base);
             RiscVCodeGen_wl(self, "    addi " + d + ", " + b + ", " + int_to_str(offset));
         }
         L3Inst::ElemAddr(dst, base, index, _) => {
-            var d: str = vreg_to_reg(dst);
+            var d: str = rv_vreg_to_reg(dst);
             var b: str = riscv_operand_to_reg(base);
             var i: str = riscv_operand_to_reg(index);
             RiscVCodeGen_wl(self, "    slli t0, " + i + ", 3");
@@ -277,7 +277,7 @@ pub fn RiscVCodeGen_gen_inst(self: &mut RiscVCodeGen, func: L3Function, inst: L3
             RiscVCodeGen_gen_dyn_call(self, dst, trait_name, method, args);
         }
         L3Inst::MakeDyn(dst, value, _, _) => {
-            var d: str = vreg_to_reg(dst);
+            var d: str = rv_vreg_to_reg(dst);
             var v: str = riscv_operand_to_reg(value);
             if !str_equal(d, v) {
                 RiscVCodeGen_wl(self, "    mv " + d + ", " + v);
@@ -288,7 +288,7 @@ pub fn RiscVCodeGen_gen_inst(self: &mut RiscVCodeGen, func: L3Function, inst: L3
         }
         L3Inst::TryUnwrap(value, ok_dst, ok_block, err_block) => {
             var v: str = riscv_operand_to_reg(value);
-            var d: str = vreg_to_reg(ok_dst);
+            var d: str = rv_vreg_to_reg(ok_dst);
             RiscVCodeGen_wl(self, "    beqz " + v + ", .L" + func.name + int_to_str(self.label_counter) + "_b" + int_to_str(err_block));
             RiscVCodeGen_wl(self, "    mv " + d + ", " + v);
             RiscVCodeGen_wl(self, "    j .L" + func.name + int_to_str(self.label_counter) + "_b" + int_to_str(ok_block));
@@ -308,7 +308,7 @@ pub fn RiscVCodeGen_gen_inst(self: &mut RiscVCodeGen, func: L3Function, inst: L3
 // --- Simple instruction generators ---------------------------------------
 
 pub fn RiscVCodeGen_gen_mov(self: &mut RiscVCodeGen, dst: VReg, src: Operand) {
-    var d: str = vreg_to_reg(dst);
+    var d: str = rv_vreg_to_reg(dst);
     match src {
         Operand::ImmI(i) => {
             if i >= -2048 && i <= 2047 {
@@ -327,7 +327,7 @@ pub fn RiscVCodeGen_gen_mov(self: &mut RiscVCodeGen, dst: VReg, src: Operand) {
             }
         }
         Operand::VReg(v) => {
-            var s: str = vreg_to_reg(v);
+            var s: str = rv_vreg_to_reg(v);
             if !str_equal(d, s) {
                 RiscVCodeGen_wl(self, "    mv " + d + ", " + s);
             }
@@ -337,7 +337,7 @@ pub fn RiscVCodeGen_gen_mov(self: &mut RiscVCodeGen, dst: VReg, src: Operand) {
 }
 
 pub fn RiscVCodeGen_gen_bin(self: &mut RiscVCodeGen, op: BinOp, dst: VReg, a: Operand, b: Operand) {
-    var d: str = vreg_to_reg(dst);
+    var d: str = rv_vreg_to_reg(dst);
     var l: str = riscv_operand_to_reg(a);
     var r: str = riscv_operand_to_reg(b);
     if binop_eq(op, BinOp::Add) {
@@ -386,7 +386,7 @@ pub fn RiscVCodeGen_gen_bin(self: &mut RiscVCodeGen, op: BinOp, dst: VReg, a: Op
 }
 
 pub fn RiscVCodeGen_gen_unary(self: &mut RiscVCodeGen, op: UnaryOp, dst: VReg, src: Operand) {
-    var d: str = vreg_to_reg(dst);
+    var d: str = rv_vreg_to_reg(dst);
     var s: str = riscv_operand_to_reg(src);
     if unaryop_eq(op, UnaryOp::Neg) {
         RiscVCodeGen_wl(self, "    neg " + d + ", " + s);
@@ -425,7 +425,7 @@ pub fn RiscVCodeGen_gen_call(self: &mut RiscVCodeGen, dst: OptVReg, target: str,
     RiscVCodeGen_wl(self, "    call " + target);
     match dst {
         OptVReg::Some(d) => {
-            var dreg: str = vreg_to_reg(d);
+            var dreg: str = rv_vreg_to_reg(d);
             if !str_equal(dreg, "a0") {
                 RiscVCodeGen_wl(self, "    mv " + dreg + ", a0");
             }
@@ -448,7 +448,7 @@ pub fn RiscVCodeGen_gen_call_ptr(self: &mut RiscVCodeGen, dst: OptVReg, fn_ptr: 
     RiscVCodeGen_wl(self, "    jalr " + ptr);
     match dst {
         OptVReg::Some(d) => {
-            var dreg: str = vreg_to_reg(d);
+            var dreg: str = rv_vreg_to_reg(d);
             if !str_equal(dreg, "a0") {
                 RiscVCodeGen_wl(self, "    mv " + dreg + ", a0");
             }
@@ -471,7 +471,7 @@ pub fn RiscVCodeGen_gen_dyn_call(self: &mut RiscVCodeGen, dst: OptVReg, trait_na
     RiscVCodeGen_wl(self, "    call " + callee);
     match dst {
         OptVReg::Some(d) => {
-            var dreg: str = vreg_to_reg(d);
+            var dreg: str = rv_vreg_to_reg(d);
             if !str_equal(dreg, "a0") {
                 RiscVCodeGen_wl(self, "    mv " + dreg + ", a0");
             }
@@ -481,7 +481,7 @@ pub fn RiscVCodeGen_gen_dyn_call(self: &mut RiscVCodeGen, dst: OptVReg, trait_na
 }
 
 pub fn RiscVCodeGen_gen_cast(self: &mut RiscVCodeGen, dst: VReg, src: Operand, kind: CastKind) {
-    var d: str = vreg_to_reg(dst);
+    var d: str = rv_vreg_to_reg(dst);
     var s: str = riscv_operand_to_reg(src);
     if riscv_cast_kind_eq(kind, CastKind::BitCast) {
         if !str_equal(d, s) {
@@ -504,7 +504,7 @@ pub fn RiscVCodeGen_gen_cast(self: &mut RiscVCodeGen, dst: VReg, src: Operand, k
 
 pub fn riscv_operand_to_reg(op: Operand) -> str {
     match op {
-        Operand::VReg(v) => { return vreg_to_reg(v); }
+        Operand::VReg(v) => { return rv_vreg_to_reg(v); }
         _ => { return "t0"; } // scratch register for immediates/slots
     }
     return "t0";

@@ -29,6 +29,14 @@ use compiler::gpu;
 use compiler::wasm;
 use compiler::lsp;
 use compiler::ark;
+use compiler::codegen_x64;
+use compiler::codegen_arm64;
+use compiler::codegen_riscv;
+use compiler::peephole;
+use compiler::elf64;
+use compiler::coff;
+use compiler::macho;
+use compiler::cparser;
 
 // --- Global flag state ---------------------------------------------------
 // Parsed from --borrowck= and --timeout flags before command dispatch.
@@ -128,6 +136,7 @@ pub fn main() -> i64 {
     if str_equal(command, "ccompile") { return cmd_ccompile(n, start, g_borrowck, g_timeout); }
     if str_equal(command, "build") { return cmd_build(n, start, g_borrowck, g_timeout); }
     if str_equal(command, "emit") { return cmd_build(n, start, g_borrowck, g_timeout); }
+    if str_equal(command, "build-x86") { return cmd_build_x86(n, start); }
     if str_equal(command, "run") { return cmd_run(n, start, g_borrowck, g_timeout); }
     if str_equal(command, "tokens") { return cmd_tokens(n, start); }
     if str_equal(command, "dump-tokens") { return cmd_tokens(n, start); }
@@ -154,6 +163,11 @@ pub fn main() -> i64 {
     if str_equal(command, "veil") { return cmd_veil(n, start); }
     if str_equal(command, "ark") { return ark_main(); }
     if str_equal(command, "repl") { return cmd_repl(); }
+    if str_equal(command, "codegen") { return cmd_codegen(n, start); }
+    if str_equal(command, "gpu") { return cmd_gpu(n, start); }
+    if str_equal(command, "verify") || str_equal(command, "audit") { return cmd_verify(n, start); }
+    if str_equal(command, "sourcemap") { return cmd_sourcemap(n, start); }
+    if str_equal(command, "parse-header") { return cmd_parse_header(n, start); }
     if str_equal(command, "notebook") { return cmd_notebook(n, start); }
 
     print("Unknown command: ");
@@ -1631,6 +1645,317 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
 // --- build (PE emitter) --------------------------------------------------
 // Reference: src/main.rs:151
 // Flags: -o <output>, --target <triple>, --no-opt, --lto, --caps <list>
+// --- cmd_build_x86 -------------------------------------------------------
+// Build a Linux ELF via the x86.rs stack-machine backend (no PIR/regalloc).
+fn cmd_build_x86(n: i64, start: i64) -> i64 {
+    if start + 2 > n {
+        p_eprint_str("Usage: fides-c build-x86 <file.fd> [-o output]\n");
+        p_eprint_str("       Builds a Linux ELF executable using the x86 stack-machine backend (AT&T syntax)\n");
+        return 1;
+    }
+    var input: str = p_argv(start + 1);
+    var output: str = find_output_arg(n, start, "a.out");
+    var source: str = c_file_read(input);
+    if str_len(source) == 0 {
+        print("Error: could not read file: ");
+        print(input);
+        print("\n");
+        return 1;
+    }
+    var result: ResultBytes = build_x86_linux(source, input);
+    match result {
+        ResultBytes::Ok(exe_bytes) => {
+            p_file_write_vec(output, exe_bytes);
+            p_eprint_str("Built native executable: ");
+            p_eprint_str(output);
+            p_eprint_str(" (x86 backend)\n");
+            return 0;
+        }
+        ResultBytes::Err(errors) => {
+            print_errors(errors);
+            return 1;
+        }
+    }
+    return 1;
+}
+
+// --- cmd_codegen ---------------------------------------------------------
+// Emit assembly via the custom PIR L3 -> target codegen.
+// Mirrors Rust: fidesc codegen <file> [--target] [--peephole] [--elf|--coff|--macho <o>]
+fn cmd_codegen(n: i64, start: i64) -> i64 {
+    if start + 2 > n {
+        p_eprint_str("Usage: fides-c codegen <file.fd> [--target x86-64|arm64|riscv] [--peephole] [--elf <o>] [--coff <o>] [--macho <o>]\n");
+        return 1;
+    }
+    var input: str = p_argv(start + 1);
+    var target: str = get_flag_value(n, start, "--target", "x86-64");
+    var do_peephole: bool = has_flag(n, start, "--peephole");
+    var elf_out: str = get_flag_value(n, start, "--elf", "");
+    var coff_out: str = get_flag_value(n, start, "--coff", "");
+    var macho_out: str = get_flag_value(n, start, "--macho", "");
+    var source: str = c_file_read(input);
+    if str_len(source) == 0 {
+        p_eprint_str("Error: could not read file: ");
+        p_eprint_str(input);
+        p_eprint_str("\n");
+        return 1;
+    }
+    var mod_result: ResultIrModule = lower_to_ir_module_with_path(source, input, "on");
+    match mod_result {
+        ResultIrModule::Err(errors) => { print_errors(errors); return 1; }
+        ResultIrModule::Ok(ir_mod) => {
+            var l1: L1Module = lower_ir_to_l1(&ir_mod);
+            var l2: L2Module = lower_l1_to_l2(&l1);
+            var l3: L3Module = lower_l2_to_l3(&l2, &ir_mod);
+            if str_equal(target, "x86-64") || str_equal(target, "x64") {
+                var asm: str = generate_asm(l3);
+                if do_peephole { asm = peephole_optimize(asm); }
+                if str_len(elf_out) > 0 {
+                    match emit_object_file(0, asm) {
+                        ResultVec::Ok(bytes) => {
+                            p_file_write_vec(elf_out, bytes);
+                            p_eprint_str("Wrote " + int_to_str(bytes.len()) + " bytes to " + elf_out + "\n");
+                            return 0;
+                        }
+                        ResultVec::Err(e) => { p_eprint_str("ELF emission error: " + e + "\n"); return 1; }
+                    }
+                }
+                if str_len(coff_out) > 0 {
+                    match emit_coff_file(0, asm) {
+                        ResultVec::Ok(bytes2) => {
+                            p_file_write_vec(coff_out, bytes2);
+                            p_eprint_str("Wrote " + int_to_str(bytes2.len()) + " bytes to " + coff_out + "\n");
+                            return 0;
+                        }
+                        ResultVec::Err(e2) => { p_eprint_str("COFF emission error: " + e2 + "\n"); return 1; }
+                    }
+                }
+                if str_len(macho_out) > 0 {
+                    match emit_macho_file(0, asm) {
+                        ResultVec::Ok(bytes3) => {
+                            p_file_write_vec(macho_out, bytes3);
+                            p_eprint_str("Wrote " + int_to_str(bytes3.len()) + " bytes to " + macho_out + "\n");
+                            return 0;
+                        }
+                        ResultVec::Err(e3) => { p_eprint_str("Mach-O emission error: " + e3 + "\n"); return 1; }
+                    }
+                }
+                print(asm);
+                return 0;
+            }
+            if str_equal(target, "arm64") || str_equal(target, "aarch64") {
+                var asm_arm: str = generate_asm_arm64(l3);
+                if str_len(elf_out) > 0 {
+                    match emit_object_file_for_target(0, asm_arm, "arm64") {
+                        ResultVec::Ok(barm) => {
+                            p_file_write_vec(elf_out, barm);
+                            p_eprint_str("Wrote " + int_to_str(barm.len()) + " bytes to " + elf_out + " (ELF64 AArch64)\n");
+                            return 0;
+                        }
+                        ResultVec::Err(earm) => { p_eprint_str("ELF emission error: " + earm + "\n"); return 1; }
+                    }
+                }
+                print(asm_arm);
+                return 0;
+            }
+            if str_equal(target, "riscv") || str_equal(target, "riscv64") {
+                var asm_rv: str = generate_asm_riscv(l3);
+                if str_len(elf_out) > 0 {
+                    match emit_object_file_for_target(0, asm_rv, "riscv") {
+                        ResultVec::Ok(brv) => {
+                            p_file_write_vec(elf_out, brv);
+                            p_eprint_str("Wrote " + int_to_str(brv.len()) + " bytes to " + elf_out + " (ELF64 RISC-V)\n");
+                            return 0;
+                        }
+                        ResultVec::Err(erv) => { p_eprint_str("ELF emission error: " + erv + "\n"); return 1; }
+                    }
+                }
+                print(asm_rv);
+                return 0;
+            }
+            p_eprint_str("Unknown target: " + target + " (supported: x86-64, arm64, riscv)\n");
+            return 1;
+        }
+    }
+    return 1;
+}
+
+// --- cmd_gpu -------------------------------------------------------------
+// Generate GPU code (SPIR-V or PTX) from a Fides program.
+fn cmd_gpu(n: i64, start: i64) -> i64 {
+    if start + 2 > n {
+        p_eprint_str("Usage: fides-c gpu <file.fd> --target spirv|ptx [-o output] [--text]\n");
+        p_eprint_str("       --target spirv  SPIR-V bytecode (Vulkan compute)\n");
+        p_eprint_str("       --target ptx    PTX assembly (NVIDIA)\n");
+        p_eprint_str("       --text          For spirv: emit text disassembly\n");
+        return 1;
+    }
+    var input: str = p_argv(start + 1);
+    var target: str = get_flag_value(n, start, "--target", "spirv");
+    var output: str = get_flag_value(n, start, "-o", "");
+    var text_mode: bool = has_flag(n, start, "--text");
+    var source: str = c_file_read(input);
+    if str_len(source) == 0 {
+        p_eprint_str("Error: could not read file: ");
+        p_eprint_str(input);
+        p_eprint_str("\n");
+        return 1;
+    }
+    var mod_result: ResultIrModule = lower_to_ir_module_with_path(source, input, "on");
+    match mod_result {
+        ResultIrModule::Err(errors) => { print_errors(errors); return 1; }
+        ResultIrModule::Ok(ir_mod) => {
+            var l1: L1Module = lower_ir_to_l1(&ir_mod);
+            var l2: L2Module = lower_l1_to_l2(&l1);
+            var l3: L3Module = lower_l2_to_l3(&l2, &ir_mod);
+            if str_equal(target, "spirv") {
+                if text_mode {
+                    var text: str = generate_spirv_text(l3);
+                    if str_len(output) > 0 {
+                        p_file_write(output, text);
+                        p_eprint_str("Generated SPIR-V text: " + output + "\n");
+                    } else {
+                        print(text);
+                    }
+                } else {
+                    var words: Vec<i64> = generate_spirv(l3);
+                    var bytes: Vec<i64> = Vec::new();
+                    var wi: i64 = 0;
+                    while wi < words.len() {
+                        var w: i64 = words.get(wi);
+                        bytes.push(w & 0xFF);
+                        bytes.push((w >> 8) & 0xFF);
+                        bytes.push((w >> 16) & 0xFF);
+                        bytes.push((w >> 24) & 0xFF);
+                        wi = wi + 1;
+                    }
+                    if str_len(output) > 0 {
+                        p_file_write_vec(output, bytes);
+                        p_eprint_str("Generated SPIR-V bytecode: " + output + " (" + int_to_str(words.len()) + " words)\n");
+                    } else {
+                        p_eprint_str("Generated " + int_to_str(words.len()) + " SPIR-V words (use -o to write binary)\n");
+                    }
+                }
+                return 0;
+            }
+            if str_equal(target, "ptx") {
+                var ptx: str = generate_ptx(l3);
+                if str_len(output) > 0 {
+                    p_file_write(output, ptx);
+                    p_eprint_str("Generated PTX assembly: " + output + "\n");
+                } else {
+                    print(ptx);
+                }
+                return 0;
+            }
+            p_eprint_str("Unknown GPU target '" + target + "'. Use --target spirv or --target ptx\n");
+            return 1;
+        }
+    }
+    return 1;
+}
+
+// --- cmd_verify ----------------------------------------------------------
+// Verify IR correctness for a Fides source file.
+fn cmd_verify(n: i64, start: i64) -> i64 {
+    if start + 2 > n {
+        p_eprint_str("Usage: fides-c verify <file.fd>\n");
+        return 1;
+    }
+    var input: str = p_argv(start + 1);
+    var source: str = c_file_read(input);
+    if str_len(source) == 0 {
+        p_eprint_str("Error: could not read file: ");
+        p_eprint_str(input);
+        p_eprint_str("\n");
+        return 1;
+    }
+    var mod_result: ResultIrModule = lower_to_ir_module_with_path(source, input, "on");
+    match mod_result {
+        ResultIrModule::Err(errors) => { print_errors(errors); return 1; }
+        ResultIrModule::Ok(ir_mod) => {
+            var result: VerificationResult = IrModule_verify(&ir_mod);
+            var wi: i64 = 0;
+            while wi < result.warnings.len() {
+                p_eprint_str("warning: " + result.warnings.get(wi) + "\n");
+                wi = wi + 1;
+            }
+            var ei: i64 = 0;
+            while ei < result.errors.len() {
+                p_eprint_str("error: " + result.errors.get(ei) + "\n");
+                ei = ei + 1;
+            }
+            if VerificationResult_is_valid(&result) {
+                print("IR verification passed (" + int_to_str(result.warnings.len()) + " warnings)\n");
+                return 0;
+            }
+            p_eprint_str("IR verification failed with " + int_to_str(result.errors.len()) + " errors\n");
+            return 1;
+        }
+    }
+    return 1;
+}
+
+// --- cmd_sourcemap -------------------------------------------------------
+// Print the IR-to-source mapping for a Fides file.
+fn cmd_sourcemap(n: i64, start: i64) -> i64 {
+    if start + 2 > n {
+        p_eprint_str("Usage: fides-c sourcemap <file.fd>\n");
+        return 1;
+    }
+    var input: str = p_argv(start + 1);
+    var source: str = c_file_read(input);
+    if str_len(source) == 0 {
+        p_eprint_str("Error: could not read file: ");
+        p_eprint_str(input);
+        p_eprint_str("\n");
+        return 1;
+    }
+    var mod_result: ResultIrModule = lower_to_ir_module_with_path(source, input, "on");
+    match mod_result {
+        ResultIrModule::Err(errors) => { print_errors(errors); return 1; }
+        ResultIrModule::Ok(ir_mod) => {
+            var sm: SourceMap = IrModule_source_map(&ir_mod);
+            if sm.entries.len() == 0 {
+                print("Source map is empty (no source line info available).\n");
+            } else {
+                print(SourceMap_to_str(&sm));
+            }
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// --- cmd_parse_header ----------------------------------------------------
+// Parse a C header file and emit Fides FFI bindings.
+fn cmd_parse_header(n: i64, start: i64) -> i64 {
+    if start + 2 > n {
+        p_eprint_str("Usage: fides-c parse-header <file.h> [-o output.fd]\n");
+        return 1;
+    }
+    var input: str = p_argv(start + 1);
+    var output: str = find_output_arg(n, start, "");
+    var source: str = c_file_read(input);
+    if str_len(source) == 0 {
+        p_eprint_str("Error reading '" + input + "'\n");
+        return 1;
+    }
+    var base: str = input;
+    var slash: i64 = str_rfind_char(input, 47);
+    if slash >= 0 { base = str_slice(input, slash + 1, str_len(input)); }
+    var include: str = "\"" + base + "\"";
+    var decls: Vec<CExternDecl> = parse_header(source, include);
+    var bindings: str = generate_pledge_bindings(decls, include);
+    if str_len(output) > 0 {
+        p_file_write(output, bindings);
+        p_eprint_str("Generated " + input + " bindings -> " + output + "\n");
+    } else {
+        print(bindings);
+    }
+    return 0;
+}
+
 fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     if start + 2 > n {
         print("Usage: fides-c build <file.fd> [-o output] [--target <triple>] [--no-opt] [--lto] [--caps <list>]\n");
@@ -1655,6 +1980,17 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     var boot_mode: bool = has_flag(n, start, "--boot");
     // --caps <list>: capability restrictions
     var caps: str = get_flag_value(n, start, "--caps", "");
+    // Split "IO,Net" -> ["IO","Net"] for build_executable's granted_caps
+    var granted_caps: Vec<str> = Vec::new();
+    if str_len(caps) > 0 {
+        var cap_parts: Vec<str> = str_split(caps, ",");
+        var ci: i64 = 0;
+        while ci < cap_parts.len() {
+            var cap_name: str = str_trim(cap_parts.get(ci));
+            if str_len(cap_name) > 0 { granted_caps.push(cap_name); }
+            ci = ci + 1;
+        }
+    }
 
     // Report global flags
     if g_borrowck != "on" {
@@ -1770,7 +2106,7 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             // Try native backend if --native flag is set
             if use_native {
                 p_eprint_str("[build] Using native backend...\n");
-                var native_result: ResultBytes = build_executable(source, input, target, do_opt, do_lto);
+                var native_result: ResultBytes = build_executable(source, input, target, do_opt, do_lto, granted_caps);
                 match native_result {
                     ResultBytes::Err(nerrs) => {
                         p_eprint_str("[build] Native backend failed, falling back to C codegen:\n");
@@ -1854,6 +2190,7 @@ fn print_usage() {
     p_eprint_str("  fides-c ccompile <file.fd> -o <output>    Compile via C codegen (tcc)\n");
     p_eprint_str("  fides-c build    <file.fd> -o <output>    Compile to native executable\n");
     p_eprint_str("  fides-c emit     <file.fd> -o <output>    Alias for build\n");
+    p_eprint_str("  fides-c build-x86 <file.fd> [-o <out>]    Linux ELF via x86 stack-machine backend\n");
     p_eprint_str("  fides-c emit     <file.fd> --boot -o <out>  Multiboot2 kernel binary\n");
     p_eprint_str("  fides-c emit     <file.fd> --bare -o <out>  Bare-metal flat binary\n");
     p_eprint_str("  fides-c run      <file.fd>                Compile + execute\n");
@@ -1873,6 +2210,14 @@ fn print_usage() {
     p_eprint_str("                                           Generate documentation\n");
     p_eprint_str("  fides-c veil     <file.fd> [--format text|html] [--output <dir>]\n");
     p_eprint_str("                                           Code coverage report\n");
+    p_eprint_str("  fides-c codegen  <file.fd> [--target x86-64|arm64|riscv] [--peephole]\n");
+    p_eprint_str("                       [--elf <o>] [--coff <o>] [--macho <o>]\n");
+    p_eprint_str("                                           Emit assembly / object files\n");
+    p_eprint_str("  fides-c gpu      <file.fd> --target spirv|ptx [-o <out>] [--text]\n");
+    p_eprint_str("                                           Generate GPU code\n");
+    p_eprint_str("  fides-c verify   <file.fd>              Verify IR correctness\n");
+    p_eprint_str("  fides-c sourcemap <file.fd>             Show IR-to-source mapping\n");
+    p_eprint_str("  fides-c parse-header <file.h> [-o <fd>] Generate FFI bindings from C header\n");
 }
 
 
