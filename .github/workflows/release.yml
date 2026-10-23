@@ -93,8 +93,15 @@ jobs:
 
       - name: Pack (zip)
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: Compress-Archive -Path stage/* -DestinationPath "${{ matrix.artifact }}" -Force
+        shell: bash
+        # 7-Zip (preinstalled on the Windows runners) writes forward-slash
+        # entry names; Compress-Archive from Windows PowerShell writes
+        # backslashes, which unzip on other platforms mishandles.
+        run: |
+          cd stage
+          7z a -tzip "../${{ matrix.artifact }}" . >/dev/null
+          cd ..
+          7z l "${{ matrix.artifact }}" | grep -E "bin/fidesc|stdlib/core.fd|LICENSE"
 
       - name: Smoke test the archive exactly as the install script would
         shell: bash
@@ -108,9 +115,22 @@ jobs:
           fi
           chmod +x "$home"/bin/* 2>/dev/null || true
           "$home/bin/fidesc${{ matrix.ext }}" version
-          "$home/bin/fidesc${{ matrix.ext }}" run tests/bootstrap/hello.fd
-          "$home/bin/ark${{ matrix.ext }}" --help >/dev/null 2>&1 || true
           test -d "$home/stdlib" && test -f "$home/LICENSE"
+          # Run a program that imports stdlib modules from a directory that is
+          # NOT the repository, so the exe-relative stdlib lookup is what
+          # resolves `use vec;` — exactly the situation an installed user is in.
+          proj="$(mktemp -d)"
+          cat > "$proj/main.fd" <<'EOF'
+          use vec;
+          fn main() {
+              var v: Vec<i64> = Vec::new();
+              v.push(40);
+              v.push(2);
+              println(v.len());
+          }
+          EOF
+          (cd "$proj" && "$home/bin/fidesc${{ matrix.ext }}" run main.fd | tee out.txt && grep -q '^2' out.txt)
+          "$home/bin/ark${{ matrix.ext }}" --help >/dev/null 2>&1 || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

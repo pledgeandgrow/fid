@@ -218,6 +218,39 @@ fn find_project_root(start: &Path) -> PathBuf {
     start.to_path_buf()
 }
 
+/// `stdlib/` directories of an *installed* toolchain, tried after the
+/// source-relative and project-root candidates. Covers the layouts the
+/// release artifacts produce:
+///   - `$FID_HOME/stdlib`            (install.sh / install.ps1: ~/.fid)
+///   - `<exe dir>/stdlib`             (Windows installer: C:\Program Files\Fides)
+///   - `<exe dir>/../stdlib`          (archives: ~/.fid/bin/fidesc → ~/.fid/stdlib)
+/// Without these, `use vec;` only resolves when the program lives inside the
+/// repository or the CWD is the repository root.
+fn installed_stdlib_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(home) = std::env::var("FID_HOME") {
+        dirs.push(Path::new(&home).join("stdlib"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            dirs.push(exe_dir.join("stdlib"));
+            if let Some(parent) = exe_dir.parent() {
+                dirs.push(parent.join("stdlib"));
+            }
+        }
+    }
+    dirs.retain(|d| d.is_dir());
+    dirs
+}
+
+/// `<dir>/<path>.fd` and `<dir>/<path>/mod.fd` for every installed stdlib dir.
+fn installed_stdlib_candidates(path_str: &str) -> Vec<PathBuf> {
+    installed_stdlib_dirs()
+        .into_iter()
+        .flat_map(|d| [d.join(format!("{}.fd", path_str)), d.join(format!("{}/mod.fd", path_str))])
+        .collect()
+}
+
 fn parse_source(source: &str) -> Result<Program, Vec<String>> {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize();
@@ -313,7 +346,7 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
             ];
 
             let mut found = None;
-            for candidate in &candidates {
+            for candidate in candidates.iter().chain(installed_stdlib_candidates(&path_str).iter()) {
                 if candidate.exists() {
                     found = Some(candidate.clone());
                     break;
@@ -1437,7 +1470,7 @@ fn build_program_with_lints(source: &str, source_path: Option<&str>) -> Result<(
             ];
 
             let mut found = None;
-            for candidate in &candidates {
+            for candidate in candidates.iter().chain(installed_stdlib_candidates(&path_str).iter()) {
                 if candidate.exists() {
                     found = Some(candidate.clone());
                     break;
@@ -1930,7 +1963,7 @@ pub fn emit_boot(source: &str, source_path: &str) -> Result<Vec<u8>, Vec<String>
         ];
 
         let mut found = None;
-        for candidate in &candidates {
+        for candidate in candidates.iter().chain(installed_stdlib_candidates(&path_str).iter()) {
             if candidate.exists() {
                 found = Some(candidate.clone());
                 break;
