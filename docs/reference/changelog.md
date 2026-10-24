@@ -1,5 +1,64 @@
 # Fides Language Changelog
 
+## Session 29b — Security Annotations Made Sound (Oct 25, 2026)
+
+Every safety annotation was probed with programs that should be rejected;
+these are the holes that were found, and closed, in both compilers.
+
+### `@secret` information flow (`src/secrecy.rs`, `compiler/secrecy.fd`)
+
+Rewritten as a whole-program pass: values carry labels (a real secret, or
+"the function's parameter i"), and per-function summaries (parameters it
+outputs, parameters reaching its result, whether it outputs at all) are
+inferred to a fixpoint. The old check only ran inside functions with a
+`@secret` parameter and missed most flows.
+
+| Leak (accepted before, rejected now) | Example |
+|--------------------------------------|---------|
+| Through a helper | `fn show(x: i64) { println(x); }` then `show(k)` |
+| Implicit flow | `if k > 5 { println(1); }` |
+| Containers | `v.push(k); println(v.get(0))`, `S { v: k }` |
+| Globals | `g = k;` |
+| Nested blocks, closures, `unsafe` | `{ println(k); }`, `fn() { println(k) }` |
+| `@secret` functions and locals | `println(load_key())`, `@secret val k = ...; println(k)` |
+
+New: `@secret` locals, and `@declassify` functions, the auditable way to
+release a value derived from a secret (e.g. "did the password match").
+Guide: `docs/guides/secrets.md`.
+
+### `@constant_time`
+
+Its documented rules were not implemented. Rejected now: a branch, `while`
+condition, `for` range, `match`, short-circuit `&&`/`||`, memory index or
+division (`/`, `%`) that depends on secret data (every parameter not marked
+`@public`; lengths are public). `test_constant_time.fd`'s `ct_eq` branched on
+its inputs and is now branch-free. The self-hosted check, which only looked at
+effects, now also rejects non-constant-time calls and early returns.
+
+### `@crashfree` (and `@medical`, `@safety-critical`, `@autosar`)
+
+Rejected now: indexing (`v[i]`, `.get`, `.set`, `.remove`, `.pop`, `.insert`)
+that can be out of bounds, and integer `+`/`-`/`*` that can overflow unless the
+function is `@wrapping`. Indexing inside `for i in 0..v.len()` is accepted; new
+`vec_get_or(v, i, default)` never panics. Real bugs found in the stdlib:
+`scada.modbus_crc_verify` could panic on a short Modbus frame (now uses
+`vec_get_or`), `crypto.rotr32` could overflow (now `@wrapping`).
+
+### Other fixes
+
+| Bug | Fix |
+|-----|-----|
+| `return <expr>` ran `defer` blocks, drops and `@zeroize` wipes before evaluating `<expr>`: `defer { x = 0 } return x * 2` returned 0, `return f(key)` read a wiped key | The value is computed first (`src/lower.rs`, `compiler/lower.fd`) |
+| A closure capturing a linear value (`Money`) could spend it on every call | Rejected |
+
+New tests: `test_secret` and five `test_secret_*_fail`, `test_return_order`,
+`test_crashfree_bounds`, `test_crashfree_{index,overflow}_fail`,
+`test_constant_time_{branch,index}_fail`, `test_linear_closure_fail`.
+
+Known cost: the self-hosted compiler now peaks at about 4 GB while compiling
+itself (was about 1.3 GB), mostly label allocations in `compiler/secrecy.fd`;
+reducing it is next.
+
 ## Session 29 — References Can No Longer Dangle (Oct 24, 2026)
 
 ### Reference escape check (`src/escape.rs`, `compiler/escape.fd`)

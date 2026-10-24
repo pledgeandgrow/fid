@@ -30,6 +30,7 @@ use core;
 use vec;
 use string;
 use compiler::ast;
+use compiler::escape;
 
 // --- Box unbox helpers ---------------------------------------------------
 // box_type_unbox / box_expr_unbox / stmt_line are provided by compiler::ast
@@ -1349,7 +1350,7 @@ pub fn TypeChecker_check_bodies(self: &mut TypeChecker, program: Program) {
     TypeChecker_verify_shard(self, program);
     TypeChecker_verify_adapter(self, program);
     TypeChecker_verify_tainted(self, program);
-    TypeChecker_verify_secret(self, program);
+    // (@secret is checked by compiler::secrecy.)
     TypeChecker_verify_contracts(self, program);
     TypeChecker_verify_allocator_params(self, program);
     // Mark all functions as capability-verified before checking
@@ -2262,6 +2263,26 @@ pub fn check_safety_body(
         }
     }
 
+    // @no-panic: indexing (out of bounds) and integer arithmetic (overflow)
+    // panic too.
+    if has_primitive(prims, "no-panic") {
+        var wrapping: bool = false;
+        var wai: i64 = 0;
+        while wai < anns.len() {
+            if anns.get(wai).name == "wrapping" { wrapping = true; }
+            wai = wai + 1;
+        }
+        var risk_lines: Vec<i64> = Vec::new();
+        var risk_msgs: Vec<str> = Vec::new();
+        scan_for_panic_risks(body, wrapping, risk_lines, risk_msgs);
+        var rk: i64 = 0;
+        while rk < risk_lines.len() {
+            errs.push("Safety error (" + label + ") (line " + int_to_str(risk_lines.get(rk)) + "): function '" + func_name + "' " + risk_msgs.get(rk) + ".
+    Crashfree functions must never panic.");
+            rk = rk + 1;
+        }
+    }
+
     // @no-unbounded: check for while loops
     if has_primitive(prims, "no-unbounded") {
         var while_sites: Vec<i64> = Vec::new();
@@ -2480,6 +2501,359 @@ pub fn scan_expr_for_calls(expr: Expr, calls: Vec<str>) {
 }
 
 // --- Division scanning helpers ---
+
+// Panic risks the no-panic primitive rejects besides panicking calls and
+// division: indexing (out of bounds) and, unless `wrapping`, integer
+// arithmetic (overflow). One (line, what) per site. Inside
+// `for i in 0..v.len()`, `v[i]` / `v.get(i)` / `v.set(i, ..)` are in bounds
+// (unless the body reassigns `i` or resizes `v`).
+pub fn scan_for_panic_risks(stmts: Vec<Stmt>, wrapping: bool, lines: Vec<i64>, msgs: Vec<str>) {
+    var safe_idx: Vec<str> = Vec::new();
+    var safe_vec: Vec<str> = Vec::new();
+    pr_stmts(stmts, wrapping, safe_idx, safe_vec, lines, msgs);
+}
+
+// `a`, `a.b.c`: the textual path of a place ("" if it is not one).
+fn pr_place(e: Expr) -> str {
+    match e {
+        Expr::Ident(n) => { return n; }
+        Expr::FieldAccess(x, field) => {
+            var p: str = pr_place(box_expr_deref(x));
+            if p == "" { return ""; }
+            return p + "." + field;
+        }
+        _ => { return ""; }
+    }
+    return "";
+}
+
+// `for i in 0..v.len()` -> the path of `v` ("" otherwise).
+fn pr_len_bound(iterator: Expr) -> str {
+    match iterator {
+        Expr::Range(start, end, inclusive) => {
+            if inclusive { return ""; }
+            match box_expr_deref(start) {
+                Expr::IntLit(z) => { if z != 0 { return ""; } }
+                _ => { return ""; }
+            }
+            match box_expr_deref(end) {
+                Expr::MethodCall(recv, method, args) => {
+                    if method == "len" && args.len() == 0 { return pr_place(box_expr_deref(recv)); }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    return "";
+}
+
+// Whether `body` reassigns `i` or resizes the Vec at path `v`.
+fn pr_disturbs(body: Vec<Stmt>, i: str, v: str) -> bool {
+    var k: i64 = 0;
+    while k < body.len() {
+        if pr_disturbs_stmt(body.get(k), i, v) { return true; }
+        k = k + 1;
+    }
+    return false;
+}
+
+fn pr_disturbs_stmt(s: Stmt, i: str, v: str) -> bool {
+    match s {
+        Stmt::Assign(target, _, expr, _) => { return target == i || target == v || pr_disturbs_expr(expr, i, v); }
+        Stmt::Let(_, _, expr, _, _, _, _) => { return pr_disturbs_expr(expr, i, v); }
+        Stmt::Expr(expr, _) => { return pr_disturbs_expr(expr, i, v); }
+        Stmt::If(_, then_block, else_block, _) => {
+            if pr_disturbs(then_block, i, v) { return true; }
+            match else_block {
+                OptStmts::Some(b) => { return pr_disturbs(b, i, v); }
+                OptStmts::None => {}
+            }
+            return false;
+        }
+        Stmt::While(_, body, _) => { return pr_disturbs(body, i, v); }
+        Stmt::For(_, _, body, _) => { return pr_disturbs(body, i, v); }
+        Stmt::Loop(body, _) => { return pr_disturbs(body, i, v); }
+        Stmt::Unsafe(body, _) => { return pr_disturbs(body, i, v); }
+        Stmt::Match(_, arms, _) => {
+            var a: i64 = 0;
+            while a < arms.len() {
+                if pr_disturbs(arms.get(a).body, i, v) { return true; }
+                a = a + 1;
+            }
+            return false;
+        }
+        _ => { return false; }
+    }
+    return false;
+}
+
+fn pr_disturbs_expr(e: Expr, i: str, v: str) -> bool {
+    match e {
+        Expr::MethodCall(recv, method, args) => {
+            var r: Expr = box_expr_deref(recv);
+            var resizes: bool = method == "pop" || method == "remove" || method == "clear" || method == "truncate" || method == "drain";
+            if resizes && pr_place(r) == v { return true; }
+            if pr_disturbs_expr(r, i, v) { return true; }
+            var a: i64 = 0;
+            while a < args.len() {
+                if pr_disturbs_expr(args.get(a), i, v) { return true; }
+                a = a + 1;
+            }
+            return false;
+        }
+        Expr::Call(_, args) => {
+            var c: i64 = 0;
+            while c < args.len() {
+                if pr_disturbs_expr(args.get(c), i, v) { return true; }
+                c = c + 1;
+            }
+            return false;
+        }
+        Expr::Binary(_, l, r) => { return pr_disturbs_expr(box_expr_deref(l), i, v) || pr_disturbs_expr(box_expr_deref(r), i, v); }
+        _ => { return false; }
+    }
+    return false;
+}
+
+fn pr_in_bounds(safe_idx: Vec<str>, safe_vec: Vec<str>, vec: Expr, index: Expr) -> bool {
+    var vp: str = pr_place(vec);
+    if vp == "" { return false; }
+    match index {
+        Expr::Ident(i) => {
+            var k: i64 = 0;
+            while k < safe_idx.len() {
+                if safe_idx.get(k) == i && safe_vec.get(k) == vp { return true; }
+                k = k + 1;
+            }
+        }
+        _ => {}
+    }
+    return false;
+}
+
+fn pr_push(lines: Vec<i64>, msgs: Vec<str>, line: i64, what: str) {
+    var k: i64 = 0;
+    while k < lines.len() {
+        if lines.get(k) == line && msgs.get(k) == what { return; }
+        k = k + 1;
+    }
+    lines.push(line);
+    msgs.push(what);
+}
+
+fn pr_stmts(stmts: Vec<Stmt>, wrapping: bool, safe_idx: Vec<str>, safe_vec: Vec<str>, lines: Vec<i64>, msgs: Vec<str>) {
+    var k: i64 = 0;
+    while k < stmts.len() {
+        var s: Stmt = stmts.get(k);
+        var line: i64 = stmt_line(s);
+        match s {
+            Stmt::IndexAssign(array, index, _, expr, _) => {
+                if !pr_in_bounds(safe_idx, safe_vec, Expr::Ident(array), index) {
+                    pr_push(lines, msgs, line, "assigns through `[...]`, which panics when the index is out of bounds");
+                }
+                pr_expr(index, wrapping, safe_idx, safe_vec, line, lines, msgs);
+                pr_expr(expr, wrapping, safe_idx, safe_vec, line, lines, msgs);
+            }
+            Stmt::Let(_, _, expr, _, _, _, _) => { pr_expr(expr, wrapping, safe_idx, safe_vec, line, lines, msgs); }
+            Stmt::LetTuple(_, expr, _) => { pr_expr(expr, wrapping, safe_idx, safe_vec, line, lines, msgs); }
+            Stmt::Assign(_, _, expr, _) => { pr_expr(expr, wrapping, safe_idx, safe_vec, line, lines, msgs); }
+            Stmt::Expr(expr, _) => { pr_expr(expr, wrapping, safe_idx, safe_vec, line, lines, msgs); }
+            Stmt::Return(value, _) => {
+                match value {
+                    OptBoxExpr::Some(e) => { pr_expr(box_expr_deref(e), wrapping, safe_idx, safe_vec, line, lines, msgs); }
+                    OptBoxExpr::None => {}
+                }
+            }
+            Stmt::Break(value, _) => {
+                match value {
+                    OptBoxExpr::Some(e) => { pr_expr(box_expr_deref(e), wrapping, safe_idx, safe_vec, line, lines, msgs); }
+                    OptBoxExpr::None => {}
+                }
+            }
+            Stmt::FieldAssign(object, _, _, expr, _) => {
+                pr_expr(object, wrapping, safe_idx, safe_vec, line, lines, msgs);
+                pr_expr(expr, wrapping, safe_idx, safe_vec, line, lines, msgs);
+            }
+            Stmt::DerefAssign(ptr_expr, _, expr, _) => {
+                pr_expr(ptr_expr, wrapping, safe_idx, safe_vec, line, lines, msgs);
+                pr_expr(expr, wrapping, safe_idx, safe_vec, line, lines, msgs);
+            }
+            Stmt::If(cond, then_block, else_block, _) => {
+                pr_expr(cond, wrapping, safe_idx, safe_vec, line, lines, msgs);
+                pr_stmts(then_block, wrapping, safe_idx, safe_vec, lines, msgs);
+                match else_block {
+                    OptStmts::Some(b) => { pr_stmts(b, wrapping, safe_idx, safe_vec, lines, msgs); }
+                    OptStmts::None => {}
+                }
+            }
+            Stmt::While(cond, body, _) => {
+                pr_expr(cond, wrapping, safe_idx, safe_vec, line, lines, msgs);
+                pr_stmts(body, wrapping, safe_idx, safe_vec, lines, msgs);
+            }
+            Stmt::For(var_name, iterator, body, _) => {
+                pr_expr(iterator, wrapping, safe_idx, safe_vec, line, lines, msgs);
+                var bound: str = pr_len_bound(iterator);
+                if bound != "" && pr_disturbs(body, var_name, bound) { bound = ""; }
+                if bound != "" {
+                    safe_idx.push(var_name);
+                    safe_vec.push(bound);
+                }
+                pr_stmts(body, wrapping, safe_idx, safe_vec, lines, msgs);
+                if bound != "" {
+                    safe_idx.pop();
+                    safe_vec.pop();
+                }
+            }
+            Stmt::Match(expr, arms, _) => {
+                pr_expr(expr, wrapping, safe_idx, safe_vec, line, lines, msgs);
+                var a: i64 = 0;
+                while a < arms.len() {
+                    pr_stmts(arms.get(a).body, wrapping, safe_idx, safe_vec, lines, msgs);
+                    a = a + 1;
+                }
+            }
+            Stmt::Loop(body, _) => { pr_stmts(body, wrapping, safe_idx, safe_vec, lines, msgs); }
+            Stmt::Unsafe(body, _) => { pr_stmts(body, wrapping, safe_idx, safe_vec, lines, msgs); }
+            Stmt::Sandbox(body, _) => { pr_stmts(body, wrapping, safe_idx, safe_vec, lines, msgs); }
+            Stmt::Txn(body, _) => { pr_stmts(body, wrapping, safe_idx, safe_vec, lines, msgs); }
+            Stmt::RegionBlock(_, _, _, _, _, body, _) => { pr_stmts(body, wrapping, safe_idx, safe_vec, lines, msgs); }
+            Stmt::Defer(body, _) => { pr_stmts(body, wrapping, safe_idx, safe_vec, lines, msgs); }
+            _ => {}
+        }
+        k = k + 1;
+    }
+}
+
+// Whether `e` is plainly not an integer (string or float), so `+` cannot overflow-panic.
+fn pr_non_integer(e: Expr) -> bool {
+    match e {
+        Expr::StringLit(_) => { return true; }
+        Expr::FloatLit(_) => { return true; }
+        Expr::StrConcat(_, _) => { return true; }
+        Expr::FString(_) => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+fn pr_is_int_lit(e: Expr) -> bool {
+    match e {
+        Expr::IntLit(_) => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+fn pr_exprs(es: Vec<Expr>, wrapping: bool, safe_idx: Vec<str>, safe_vec: Vec<str>, line: i64, lines: Vec<i64>, msgs: Vec<str>) {
+    var k: i64 = 0;
+    while k < es.len() {
+        pr_expr(es.get(k), wrapping, safe_idx, safe_vec, line, lines, msgs);
+        k = k + 1;
+    }
+}
+
+fn pr_expr(e: Expr, wrapping: bool, safe_idx: Vec<str>, safe_vec: Vec<str>, line: i64, lines: Vec<i64>, msgs: Vec<str>) {
+    match e {
+        Expr::Index(a, x) => {
+            var arr: Expr = box_expr_deref(a);
+            var index: Expr = box_expr_deref(x);
+            if !pr_in_bounds(safe_idx, safe_vec, arr, index) {
+                pr_push(lines, msgs, line, "indexes with `[...]`, which panics when the index is out of bounds");
+            }
+            pr_expr(arr, wrapping, safe_idx, safe_vec, line, lines, msgs);
+            pr_expr(index, wrapping, safe_idx, safe_vec, line, lines, msgs);
+        }
+        Expr::MethodCall(recv, method, args) => {
+            var r: Expr = box_expr_deref(recv);
+            var in_bounds: bool = false;
+            if (method == "get" || method == "set") && args.len() > 0 {
+                in_bounds = pr_in_bounds(safe_idx, safe_vec, r, args.get(0));
+            }
+            var panics: bool = method == "get" || method == "set" || method == "remove" || method == "pop" || method == "insert";
+            if panics && !in_bounds {
+                pr_push(lines, msgs, line, "calls `." + method + "()`, which panics when the index is out of bounds (or the Vec is empty); use `.get_or(i, default)` or loop over `0..v.len()`");
+            }
+            pr_expr(r, wrapping, safe_idx, safe_vec, line, lines, msgs);
+            pr_exprs(args, wrapping, safe_idx, safe_vec, line, lines, msgs);
+        }
+        Expr::Binary(op, l, r) => {
+            var left: Expr = box_expr_deref(l);
+            var right: Expr = box_expr_deref(r);
+            var arith: bool = false;
+            match op {
+                BinOp::Add => { arith = true; }
+                BinOp::Sub => { arith = true; }
+                BinOp::Mul => { arith = true; }
+                _ => {}
+            }
+            var constant: bool = pr_is_int_lit(left) && pr_is_int_lit(right);
+            if arith && !wrapping && !constant && !pr_non_integer(left) && !pr_non_integer(right) {
+                pr_push(lines, msgs, line, "uses integer `+`/`-`/`*`, which panics on overflow (mark the function @wrapping for two's-complement arithmetic)");
+            }
+            pr_expr(left, wrapping, safe_idx, safe_vec, line, lines, msgs);
+            pr_expr(right, wrapping, safe_idx, safe_vec, line, lines, msgs);
+        }
+        Expr::Unary(_, x) => { pr_expr(box_expr_deref(x), wrapping, safe_idx, safe_vec, line, lines, msgs); }
+        Expr::FieldAccess(x, _) => { pr_expr(box_expr_deref(x), wrapping, safe_idx, safe_vec, line, lines, msgs); }
+        Expr::OptionalFieldAccess(x, _) => { pr_expr(box_expr_deref(x), wrapping, safe_idx, safe_vec, line, lines, msgs); }
+        Expr::Ref(x, _) => { pr_expr(box_expr_deref(x), wrapping, safe_idx, safe_vec, line, lines, msgs); }
+        Expr::Deref(x) => { pr_expr(box_expr_deref(x), wrapping, safe_idx, safe_vec, line, lines, msgs); }
+        Expr::Try(x) => { pr_expr(box_expr_deref(x), wrapping, safe_idx, safe_vec, line, lines, msgs); }
+        Expr::IsCheck(x, _) => { pr_expr(box_expr_deref(x), wrapping, safe_idx, safe_vec, line, lines, msgs); }
+        Expr::Cast(x, _) => { pr_expr(box_expr_deref(x), wrapping, safe_idx, safe_vec, line, lines, msgs); }
+        Expr::QuantCast(x, _) => { pr_expr(box_expr_deref(x), wrapping, safe_idx, safe_vec, line, lines, msgs); }
+        Expr::Await(x) => { pr_expr(box_expr_deref(x), wrapping, safe_idx, safe_vec, line, lines, msgs); }
+        Expr::Spawn(x) => { pr_expr(box_expr_deref(x), wrapping, safe_idx, safe_vec, line, lines, msgs); }
+        Expr::StrConcat(l, r) => {
+            pr_expr(box_expr_deref(l), wrapping, safe_idx, safe_vec, line, lines, msgs);
+            pr_expr(box_expr_deref(r), wrapping, safe_idx, safe_vec, line, lines, msgs);
+        }
+        Expr::Range(l, r, _) => {
+            pr_expr(box_expr_deref(l), wrapping, safe_idx, safe_vec, line, lines, msgs);
+            pr_expr(box_expr_deref(r), wrapping, safe_idx, safe_vec, line, lines, msgs);
+        }
+        Expr::Coalesce(l, r) => {
+            pr_expr(box_expr_deref(l), wrapping, safe_idx, safe_vec, line, lines, msgs);
+            pr_expr(box_expr_deref(r), wrapping, safe_idx, safe_vec, line, lines, msgs);
+        }
+        Expr::PipeForward(l, r) => {
+            pr_expr(box_expr_deref(l), wrapping, safe_idx, safe_vec, line, lines, msgs);
+            pr_expr(box_expr_deref(r), wrapping, safe_idx, safe_vec, line, lines, msgs);
+        }
+        Expr::Call(_, args) => { pr_exprs(args, wrapping, safe_idx, safe_vec, line, lines, msgs); }
+        Expr::EnumLit(_, _, args) => { pr_exprs(args, wrapping, safe_idx, safe_vec, line, lines, msgs); }
+        Expr::TupleLit(args) => { pr_exprs(args, wrapping, safe_idx, safe_vec, line, lines, msgs); }
+        Expr::ArrayLit(_, args) => { pr_exprs(args, wrapping, safe_idx, safe_vec, line, lines, msgs); }
+        Expr::StructLit(_, fields, _) => {
+            var f: i64 = 0;
+            while f < fields.len() {
+                pr_expr(fields.get(f).value, wrapping, safe_idx, safe_vec, line, lines, msgs);
+                f = f + 1;
+            }
+        }
+        Expr::If(cond, then_block, else_block) => {
+            pr_expr(box_expr_deref(cond), wrapping, safe_idx, safe_vec, line, lines, msgs);
+            pr_stmts(then_block, wrapping, safe_idx, safe_vec, lines, msgs);
+            match else_block {
+                OptStmts::Some(b) => { pr_stmts(b, wrapping, safe_idx, safe_vec, lines, msgs); }
+                OptStmts::None => {}
+            }
+        }
+        Expr::Match(x, arms) => {
+            pr_expr(box_expr_deref(x), wrapping, safe_idx, safe_vec, line, lines, msgs);
+            var a: i64 = 0;
+            while a < arms.len() {
+                pr_stmts(arms.get(a).body, wrapping, safe_idx, safe_vec, lines, msgs);
+                a = a + 1;
+            }
+        }
+        Expr::Block(b) => { pr_stmts(b, wrapping, safe_idx, safe_vec, lines, msgs); }
+        Expr::TryBlock(b) => { pr_stmts(b, wrapping, safe_idx, safe_vec, lines, msgs); }
+        Expr::Closure(_, b, _) => { pr_stmts(b, wrapping, safe_idx, safe_vec, lines, msgs); }
+        _ => {}
+    }
+}
 
 pub fn scan_for_division(stmts: Vec<Stmt>, sites: Vec<str>) {
     var i: i64 = 0;
@@ -2799,18 +3173,30 @@ pub fn scan_expr_for_while(expr: Expr, sites: Vec<i64>) {
 }
 
 pub fn TypeChecker_verify_constant_time(self: &mut TypeChecker, program: Program) {
-    // @constant_time: constant-time execution (side-channel resistance)
-    // Rejects IO/Net effects and calls to non-constant-time functions.
+    // @constant_time: constant-time execution (side-channel resistance).
+    // Rejects IO/Net effects, calls to non-constant-time functions, early
+    // returns, and branches, loops, short-circuits, memory indexing or
+    // division that depend on secret data (every parameter not @public).
+    var ct_names: Vec<str> = Vec::new();
+    var ci: i64 = 0;
+    while ci < program.funcs.len() {
+        if ct_has_annotation(program.funcs.get(ci).annotations, "constant_time") { ct_names.push(program.funcs.get(ci).name); }
+        ci = ci + 1;
+    }
+    var ii: i64 = 0;
+    while ii < program.impls.len() {
+        var imp: ImplDef = program.impls.get(ii);
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            if ct_has_annotation(imp.methods.get(mi).annotations, "constant_time") { ct_names.push(imp.struct_name + "_" + imp.methods.get(mi).name); }
+            mi = mi + 1;
+        }
+        ii = ii + 1;
+    }
     var fi: i64 = 0;
     while fi < program.funcs.len() {
         var func: Func = program.funcs.get(fi);
-        var is_ct: bool = false;
-        var ai: i64 = 0;
-        while ai < func.annotations.len() {
-            if func.annotations.get(ai).name == "constant_time" { is_ct = true; }
-            ai = ai + 1;
-        }
-        if is_ct {
+        if ct_has_annotation(func.annotations, "constant_time") {
             var effects: Vec<str> = TypeChecker_get_func_effects(self, func.name);
             var ei: i64 = 0;
             while ei < effects.len() {
@@ -2820,8 +3206,506 @@ pub fn TypeChecker_verify_constant_time(self: &mut TypeChecker, program: Program
                 }
                 ei = ei + 1;
             }
+            // Only other @constant_time functions (and runtime builtins) may be called.
+            var calls: Vec<str> = Vec::new();
+            scan_stmts_for_calls(func.body, calls);
+            var ki: i64 = 0;
+            while ki < calls.len() {
+                var called: str = calls.get(ki);
+                var is_user: bool = false;
+                match TypeChecker_lookup_func_cache(self, called) {
+                    OptFuncSig::Some(_) => { is_user = true; }
+                    OptFuncSig::None => {}
+                }
+                if is_user && !str_vec_contains(ct_names, called) && !str_starts_with(called, "p_") && !str_starts_with(called, "__") {
+                    self.errors.push("Security error (constant_time): function '" + func.name + "' calls '" + called + "', which is not @constant_time.");
+                }
+                ki = ki + 1;
+            }
+            var ret_lines: Vec<i64> = Vec::new();
+            ct_scan_early_returns(func.body, ret_lines);
+            var ri: i64 = 0;
+            while ri < ret_lines.len() {
+                self.errors.push("Security error (constant_time) (line " + int_to_str(ret_lines.get(ri)) + "): function '" + func.name + "' has an early return.");
+                ri = ri + 1;
+            }
+            var out_lines: Vec<i64> = Vec::new();
+            var out_msgs: Vec<str> = Vec::new();
+            ct_secret_dependence(func, out_lines, out_msgs);
+            var oi: i64 = 0;
+            while oi < out_lines.len() {
+                self.errors.push("Security error (constant_time) (line " + int_to_str(out_lines.get(oi)) + "): function '" + func.name + "' " + out_msgs.get(oi) + ".");
+                oi = oi + 1;
+            }
         }
         fi = fi + 1;
+    }
+}
+
+fn ct_has_annotation(anns: Vec<Annotation>, name: str) -> bool {
+    var i: i64 = 0;
+    while i < anns.len() {
+        if anns.get(i).name == name { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Any `return` inside a branch or loop, or before the last statement.
+fn ct_scan_early_returns(stmts: Vec<Stmt>, lines: Vec<i64>) {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        var s: Stmt = stmts.get(i);
+        match s {
+            Stmt::Return(_, line) => {
+                if i < stmts.len() - 1 { lines.push(line); }
+            }
+            _ => { ct_scan_nested_returns(s, lines); }
+        }
+        i = i + 1;
+    }
+}
+
+fn ct_scan_nested_returns(s: Stmt, lines: Vec<i64>) {
+    match s {
+        Stmt::Return(_, line) => { lines.push(line); }
+        Stmt::If(_, then_block, else_block, _) => {
+            ct_scan_nested_returns_all(then_block, lines);
+            match else_block {
+                OptStmts::Some(b) => { ct_scan_nested_returns_all(b, lines); }
+                OptStmts::None => {}
+            }
+        }
+        Stmt::Match(_, arms, _) => {
+            var ai: i64 = 0;
+            while ai < arms.len() {
+                ct_scan_nested_returns_all(arms.get(ai).body, lines);
+                ai = ai + 1;
+            }
+        }
+        Stmt::For(_, _, body, _) => { ct_scan_nested_returns_all(body, lines); }
+        Stmt::While(_, body, _) => { ct_scan_nested_returns_all(body, lines); }
+        Stmt::Loop(body, _) => { ct_scan_nested_returns_all(body, lines); }
+        Stmt::RegionBlock(_, _, _, _, _, body, _) => { ct_scan_nested_returns_all(body, lines); }
+        Stmt::Sandbox(body, _) => { ct_scan_nested_returns_all(body, lines); }
+        Stmt::Unsafe(body, _) => { ct_scan_nested_returns_all(body, lines); }
+        Stmt::Txn(body, _) => { ct_scan_nested_returns_all(body, lines); }
+        _ => {}
+    }
+}
+
+fn ct_scan_nested_returns_all(stmts: Vec<Stmt>, lines: Vec<i64>) {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        ct_scan_nested_returns(stmts.get(i), lines);
+        i = i + 1;
+    }
+}
+
+// Secret-dependent timing: one (line, what) per branch, loop, short-circuit,
+// memory index or division whose operand depends on a parameter not marked
+// @public. Lengths (`x.len()`) are public.
+fn ct_secret_dependence(func: Func, out_lines: Vec<i64>, out_msgs: Vec<str>) {
+    var secret: Vec<str> = Vec::new();
+    var pi: i64 = 0;
+    while pi < func.params.len() {
+        var p: Param = func.params.get(pi);
+        if !ct_has_annotation(p.annotations, "public") { secret.push(p.name); }
+        pi = pi + 1;
+    }
+    // Values computed from secrets are secret (flow-insensitive, to a fixpoint).
+    var before: i64 = -1;
+    while before != secret.len() {
+        before = secret.len();
+        ct_propagate(func.body, secret);
+    }
+    ct_check_stmts(func.body, secret, out_lines, out_msgs);
+}
+
+fn ct_mark(secret: Vec<str>, name: str) {
+    if !str_vec_contains(secret, name) { secret.push(name); }
+}
+
+// Whether `e` mentions a secret variable outside a length query.
+fn ct_secret(e: Expr, secret: Vec<str>) -> bool {
+    match e {
+        Expr::Ident(n) => { return str_vec_contains(secret, n); }
+        Expr::MethodCall(recv, method, args) => {
+            if method == "len" { return false; }
+            return ct_secret(box_expr_deref(recv), secret) || ct_any_secret(args, secret);
+        }
+        Expr::Call(callee, args) => {
+            if callee == "len" || str_ends_with(callee, "_len") { return false; }
+            return ct_any_secret(args, secret);
+        }
+        Expr::Binary(_, l, r) => { return ct_secret(box_expr_deref(l), secret) || ct_secret(box_expr_deref(r), secret); }
+        Expr::StrConcat(l, r) => { return ct_secret(box_expr_deref(l), secret) || ct_secret(box_expr_deref(r), secret); }
+        Expr::Range(l, r, _) => { return ct_secret(box_expr_deref(l), secret) || ct_secret(box_expr_deref(r), secret); }
+        Expr::Coalesce(l, r) => { return ct_secret(box_expr_deref(l), secret) || ct_secret(box_expr_deref(r), secret); }
+        Expr::PipeForward(l, r) => { return ct_secret(box_expr_deref(l), secret) || ct_secret(box_expr_deref(r), secret); }
+        Expr::Index(l, r) => { return ct_secret(box_expr_deref(l), secret) || ct_secret(box_expr_deref(r), secret); }
+        Expr::Unary(_, x) => { return ct_secret(box_expr_deref(x), secret); }
+        Expr::FieldAccess(x, _) => { return ct_secret(box_expr_deref(x), secret); }
+        Expr::OptionalFieldAccess(x, _) => { return ct_secret(box_expr_deref(x), secret); }
+        Expr::Ref(x, _) => { return ct_secret(box_expr_deref(x), secret); }
+        Expr::Deref(x) => { return ct_secret(box_expr_deref(x), secret); }
+        Expr::Try(x) => { return ct_secret(box_expr_deref(x), secret); }
+        Expr::IsCheck(x, _) => { return ct_secret(box_expr_deref(x), secret); }
+        Expr::Cast(x, _) => { return ct_secret(box_expr_deref(x), secret); }
+        Expr::QuantCast(x, _) => { return ct_secret(box_expr_deref(x), secret); }
+        Expr::Await(x) => { return ct_secret(box_expr_deref(x), secret); }
+        Expr::Spawn(x) => { return ct_secret(box_expr_deref(x), secret); }
+        Expr::StructLit(_, fields, spread) => {
+            var fi: i64 = 0;
+            while fi < fields.len() {
+                if ct_secret(fields.get(fi).value, secret) { return true; }
+                fi = fi + 1;
+            }
+            match spread {
+                OptBoxExpr::Some(sp) => { return ct_secret(box_expr_deref(sp), secret); }
+                OptBoxExpr::None => {}
+            }
+            return false;
+        }
+        Expr::EnumLit(_, _, args) => { return ct_any_secret(args, secret); }
+        Expr::TupleLit(args) => { return ct_any_secret(args, secret); }
+        Expr::ArrayLit(_, args) => { return ct_any_secret(args, secret); }
+        Expr::If(cond, then_block, else_block) => {
+            if ct_secret(box_expr_deref(cond), secret) || ct_stmts_secret(then_block, secret) { return true; }
+            match else_block {
+                OptStmts::Some(b) => { return ct_stmts_secret(b, secret); }
+                OptStmts::None => {}
+            }
+            return false;
+        }
+        Expr::Match(x, arms) => {
+            if ct_secret(box_expr_deref(x), secret) { return true; }
+            var ai: i64 = 0;
+            while ai < arms.len() {
+                if ct_stmts_secret(arms.get(ai).body, secret) { return true; }
+                ai = ai + 1;
+            }
+            return false;
+        }
+        Expr::Block(b) => { return ct_stmts_secret(b, secret); }
+        Expr::TryBlock(b) => { return ct_stmts_secret(b, secret); }
+        Expr::Closure(_, b, _) => { return ct_stmts_secret(b, secret); }
+        Expr::FString(parts) => {
+            var pi: i64 = 0;
+            while pi < parts.len() {
+                var part: FStringPart = parts.get(pi);
+                match part {
+                    FStringPart::Expr(x2) => { if ct_secret(x2, secret) { return true; } }
+                    FStringPart::Literal(_) => {}
+                }
+                pi = pi + 1;
+            }
+            return false;
+        }
+        _ => { return false; }
+    }
+    return false;
+}
+
+fn ct_any_secret(es: Vec<Expr>, secret: Vec<str>) -> bool {
+    var i: i64 = 0;
+    while i < es.len() {
+        if ct_secret(es.get(i), secret) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Whether the value of `stmts` (their last expression) mentions a secret.
+fn ct_stmts_secret(stmts: Vec<Stmt>, secret: Vec<str>) -> bool {
+    if stmts.len() == 0 { return false; }
+    match stmts.get(stmts.len() - 1) {
+        Stmt::Expr(e, _) => { return ct_secret(e, secret); }
+        _ => { return false; }
+    }
+    return false;
+}
+
+// The variable a place expression writes into ("" for none).
+fn ct_base(e: Expr) -> str {
+    match e {
+        Expr::Ident(n) => { return n; }
+        Expr::FieldAccess(x, _) => { return ct_base(box_expr_deref(x)); }
+        Expr::Deref(x) => { return ct_base(box_expr_deref(x)); }
+        Expr::Index(x, _) => { return ct_base(box_expr_deref(x)); }
+        _ => { return ""; }
+    }
+    return "";
+}
+
+fn ct_propagate(stmts: Vec<Stmt>, secret: Vec<str>) {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        var s: Stmt = stmts.get(i);
+        match s {
+            Stmt::Let(name, _, expr, _, _, _, _) => { if ct_secret(expr, secret) { ct_mark(secret, name); } }
+            Stmt::LetTuple(names, expr, _) => {
+                if ct_secret(expr, secret) {
+                    var ni: i64 = 0;
+                    while ni < names.len() {
+                        ct_mark(secret, names.get(ni));
+                        ni = ni + 1;
+                    }
+                }
+            }
+            Stmt::Assign(target, _, expr, _) => { if ct_secret(expr, secret) { ct_mark(secret, target); } }
+            Stmt::IndexAssign(array, index, _, expr, _) => {
+                if ct_secret(expr, secret) || ct_secret(index, secret) { ct_mark(secret, array); }
+            }
+            Stmt::FieldAssign(object, _, _, expr, _) => {
+                if ct_secret(expr, secret) && ct_base(object) != "" { ct_mark(secret, ct_base(object)); }
+            }
+            Stmt::DerefAssign(ptr_expr, _, expr, _) => {
+                if ct_secret(expr, secret) && ct_base(ptr_expr) != "" { ct_mark(secret, ct_base(ptr_expr)); }
+            }
+            Stmt::Expr(e, _) => {
+                // A mutating method stores its arguments in its receiver.
+                match e {
+                    Expr::MethodCall(recv, method, args) => {
+                        var rb: str = ct_base(box_expr_deref(recv));
+                        if method != "len" && ct_any_secret(args, secret) && rb != "" { ct_mark(secret, rb); }
+                    }
+                    _ => {}
+                }
+            }
+            Stmt::For(var_name, iterator, body, _) => {
+                if ct_secret(iterator, secret) { ct_mark(secret, var_name); }
+                ct_propagate(body, secret);
+            }
+            Stmt::Match(expr, arms, _) => {
+                var sm: bool = ct_secret(expr, secret);
+                var ai: i64 = 0;
+                while ai < arms.len() {
+                    var arm: MatchArm = arms.get(ai);
+                    if sm {
+                        match arm.pattern {
+                            Pattern::Ident(n) => { ct_mark(secret, n); }
+                            Pattern::EnumVariant(_, _, bindings) => {
+                                var bi: i64 = 0;
+                                while bi < bindings.len() {
+                                    ct_mark(secret, bindings.get(bi).name);
+                                    bi = bi + 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    ct_propagate(arm.body, secret);
+                    ai = ai + 1;
+                }
+            }
+            Stmt::If(_, then_block, else_block, _) => {
+                ct_propagate(then_block, secret);
+                match else_block {
+                    OptStmts::Some(b) => { ct_propagate(b, secret); }
+                    OptStmts::None => {}
+                }
+            }
+            Stmt::While(_, body, _) => { ct_propagate(body, secret); }
+            Stmt::Loop(body, _) => { ct_propagate(body, secret); }
+            Stmt::Unsafe(body, _) => { ct_propagate(body, secret); }
+            Stmt::Sandbox(body, _) => { ct_propagate(body, secret); }
+            Stmt::Txn(body, _) => { ct_propagate(body, secret); }
+            Stmt::RegionBlock(_, _, _, _, _, body, _) => { ct_propagate(body, secret); }
+            Stmt::Defer(body, _) => { ct_propagate(body, secret); }
+            _ => {}
+        }
+        i = i + 1;
+    }
+}
+
+fn ct_push(out_lines: Vec<i64>, out_msgs: Vec<str>, line: i64, what: str) {
+    var i: i64 = 0;
+    while i < out_lines.len() {
+        if out_lines.get(i) == line && out_msgs.get(i) == what { return; }
+        i = i + 1;
+    }
+    out_lines.push(line);
+    out_msgs.push(what);
+}
+
+fn ct_check_stmts(stmts: Vec<Stmt>, secret: Vec<str>, out_lines: Vec<i64>, out_msgs: Vec<str>) {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        var s: Stmt = stmts.get(i);
+        var line: i64 = stmt_line(s);
+        match s {
+            Stmt::If(cond, then_block, else_block, _) => {
+                if ct_secret(cond, secret) { ct_push(out_lines, out_msgs, line, "branches on secret data (`if`)"); }
+                ct_check_expr(cond, secret, line, out_lines, out_msgs);
+                ct_check_stmts(then_block, secret, out_lines, out_msgs);
+                match else_block {
+                    OptStmts::Some(b) => { ct_check_stmts(b, secret, out_lines, out_msgs); }
+                    OptStmts::None => {}
+                }
+            }
+            Stmt::While(cond, body, _) => {
+                if ct_secret(cond, secret) { ct_push(out_lines, out_msgs, line, "loops on secret data (`while` condition)"); }
+                ct_check_expr(cond, secret, line, out_lines, out_msgs);
+                ct_check_stmts(body, secret, out_lines, out_msgs);
+            }
+            Stmt::For(_, iterator, body, _) => {
+                if ct_secret(iterator, secret) { ct_push(out_lines, out_msgs, line, "loops over secret data (`for`)"); }
+                ct_check_expr(iterator, secret, line, out_lines, out_msgs);
+                ct_check_stmts(body, secret, out_lines, out_msgs);
+            }
+            Stmt::Match(expr, arms, _) => {
+                if ct_secret(expr, secret) { ct_push(out_lines, out_msgs, line, "branches on secret data (`match`)"); }
+                ct_check_expr(expr, secret, line, out_lines, out_msgs);
+                var ai: i64 = 0;
+                while ai < arms.len() {
+                    ct_check_stmts(arms.get(ai).body, secret, out_lines, out_msgs);
+                    ai = ai + 1;
+                }
+            }
+            Stmt::IndexAssign(_, index, _, expr, _) => {
+                if ct_secret(index, secret) { ct_push(out_lines, out_msgs, line, "indexes memory with secret data"); }
+                ct_check_expr(index, secret, line, out_lines, out_msgs);
+                ct_check_expr(expr, secret, line, out_lines, out_msgs);
+            }
+            Stmt::Let(_, _, expr, _, _, _, _) => { ct_check_expr(expr, secret, line, out_lines, out_msgs); }
+            Stmt::LetTuple(_, expr, _) => { ct_check_expr(expr, secret, line, out_lines, out_msgs); }
+            Stmt::Assign(_, _, expr, _) => { ct_check_expr(expr, secret, line, out_lines, out_msgs); }
+            Stmt::Expr(expr, _) => { ct_check_expr(expr, secret, line, out_lines, out_msgs); }
+            Stmt::Return(value, _) => {
+                match value {
+                    OptBoxExpr::Some(e) => { ct_check_expr(box_expr_deref(e), secret, line, out_lines, out_msgs); }
+                    OptBoxExpr::None => {}
+                }
+            }
+            Stmt::Break(value, _) => {
+                match value {
+                    OptBoxExpr::Some(e) => { ct_check_expr(box_expr_deref(e), secret, line, out_lines, out_msgs); }
+                    OptBoxExpr::None => {}
+                }
+            }
+            Stmt::FieldAssign(object, _, _, expr, _) => {
+                ct_check_expr(object, secret, line, out_lines, out_msgs);
+                ct_check_expr(expr, secret, line, out_lines, out_msgs);
+            }
+            Stmt::DerefAssign(ptr_expr, _, expr, _) => {
+                ct_check_expr(ptr_expr, secret, line, out_lines, out_msgs);
+                ct_check_expr(expr, secret, line, out_lines, out_msgs);
+            }
+            Stmt::Loop(body, _) => { ct_check_stmts(body, secret, out_lines, out_msgs); }
+            Stmt::Unsafe(body, _) => { ct_check_stmts(body, secret, out_lines, out_msgs); }
+            Stmt::Sandbox(body, _) => { ct_check_stmts(body, secret, out_lines, out_msgs); }
+            Stmt::Txn(body, _) => { ct_check_stmts(body, secret, out_lines, out_msgs); }
+            Stmt::RegionBlock(_, _, _, _, _, body, _) => { ct_check_stmts(body, secret, out_lines, out_msgs); }
+            Stmt::Defer(body, _) => { ct_check_stmts(body, secret, out_lines, out_msgs); }
+            _ => {}
+        }
+        i = i + 1;
+    }
+}
+
+fn ct_check_exprs(es: Vec<Expr>, secret: Vec<str>, line: i64, out_lines: Vec<i64>, out_msgs: Vec<str>) {
+    var i: i64 = 0;
+    while i < es.len() {
+        ct_check_expr(es.get(i), secret, line, out_lines, out_msgs);
+        i = i + 1;
+    }
+}
+
+fn ct_check_expr(e: Expr, secret: Vec<str>, line: i64, out_lines: Vec<i64>, out_msgs: Vec<str>) {
+    match e {
+        Expr::Binary(op, l, r) => {
+            var left: Expr = box_expr_deref(l);
+            var right: Expr = box_expr_deref(r);
+            var either: bool = ct_secret(left, secret) || ct_secret(right, secret);
+            if either {
+                match op {
+                    BinOp::And => { ct_push(out_lines, out_msgs, line, "short-circuits on secret data (`&&`/`||`; use `&`/`|`)"); }
+                    BinOp::Or => { ct_push(out_lines, out_msgs, line, "short-circuits on secret data (`&&`/`||`; use `&`/`|`)"); }
+                    BinOp::Div => { ct_push(out_lines, out_msgs, line, "divides secret data (`/` or `%` take variable time on most CPUs)"); }
+                    BinOp::Mod => { ct_push(out_lines, out_msgs, line, "divides secret data (`/` or `%` take variable time on most CPUs)"); }
+                    _ => {}
+                }
+            }
+            ct_check_expr(left, secret, line, out_lines, out_msgs);
+            ct_check_expr(right, secret, line, out_lines, out_msgs);
+        }
+        Expr::Index(a, x) => {
+            var index: Expr = box_expr_deref(x);
+            if ct_secret(index, secret) { ct_push(out_lines, out_msgs, line, "indexes memory with secret data"); }
+            ct_check_expr(box_expr_deref(a), secret, line, out_lines, out_msgs);
+            ct_check_expr(index, secret, line, out_lines, out_msgs);
+        }
+        Expr::MethodCall(recv, method, args) => {
+            var indexes: bool = method == "get" || method == "set" || method == "remove" || method == "insert" || method == "get_or";
+            if indexes && args.len() > 0 && ct_secret(args.get(0), secret) {
+                ct_push(out_lines, out_msgs, line, "indexes memory with secret data");
+            }
+            ct_check_expr(box_expr_deref(recv), secret, line, out_lines, out_msgs);
+            ct_check_exprs(args, secret, line, out_lines, out_msgs);
+        }
+        Expr::If(cond, then_block, else_block) => {
+            var c: Expr = box_expr_deref(cond);
+            if ct_secret(c, secret) { ct_push(out_lines, out_msgs, line, "branches on secret data (`if`)"); }
+            ct_check_expr(c, secret, line, out_lines, out_msgs);
+            ct_check_stmts(then_block, secret, out_lines, out_msgs);
+            match else_block {
+                OptStmts::Some(b) => { ct_check_stmts(b, secret, out_lines, out_msgs); }
+                OptStmts::None => {}
+            }
+        }
+        Expr::Match(x, arms) => {
+            var scrut: Expr = box_expr_deref(x);
+            if ct_secret(scrut, secret) { ct_push(out_lines, out_msgs, line, "branches on secret data (`match`)"); }
+            ct_check_expr(scrut, secret, line, out_lines, out_msgs);
+            var ai: i64 = 0;
+            while ai < arms.len() {
+                ct_check_stmts(arms.get(ai).body, secret, out_lines, out_msgs);
+                ai = ai + 1;
+            }
+        }
+        Expr::Unary(_, x) => { ct_check_expr(box_expr_deref(x), secret, line, out_lines, out_msgs); }
+        Expr::FieldAccess(x, _) => { ct_check_expr(box_expr_deref(x), secret, line, out_lines, out_msgs); }
+        Expr::OptionalFieldAccess(x, _) => { ct_check_expr(box_expr_deref(x), secret, line, out_lines, out_msgs); }
+        Expr::Ref(x, _) => { ct_check_expr(box_expr_deref(x), secret, line, out_lines, out_msgs); }
+        Expr::Deref(x) => { ct_check_expr(box_expr_deref(x), secret, line, out_lines, out_msgs); }
+        Expr::Try(x) => { ct_check_expr(box_expr_deref(x), secret, line, out_lines, out_msgs); }
+        Expr::IsCheck(x, _) => { ct_check_expr(box_expr_deref(x), secret, line, out_lines, out_msgs); }
+        Expr::Cast(x, _) => { ct_check_expr(box_expr_deref(x), secret, line, out_lines, out_msgs); }
+        Expr::QuantCast(x, _) => { ct_check_expr(box_expr_deref(x), secret, line, out_lines, out_msgs); }
+        Expr::Await(x) => { ct_check_expr(box_expr_deref(x), secret, line, out_lines, out_msgs); }
+        Expr::Spawn(x) => { ct_check_expr(box_expr_deref(x), secret, line, out_lines, out_msgs); }
+        Expr::StrConcat(l, r) => {
+            ct_check_expr(box_expr_deref(l), secret, line, out_lines, out_msgs);
+            ct_check_expr(box_expr_deref(r), secret, line, out_lines, out_msgs);
+        }
+        Expr::Range(l, r, _) => {
+            ct_check_expr(box_expr_deref(l), secret, line, out_lines, out_msgs);
+            ct_check_expr(box_expr_deref(r), secret, line, out_lines, out_msgs);
+        }
+        Expr::Coalesce(l, r) => {
+            ct_check_expr(box_expr_deref(l), secret, line, out_lines, out_msgs);
+            ct_check_expr(box_expr_deref(r), secret, line, out_lines, out_msgs);
+        }
+        Expr::PipeForward(l, r) => {
+            ct_check_expr(box_expr_deref(l), secret, line, out_lines, out_msgs);
+            ct_check_expr(box_expr_deref(r), secret, line, out_lines, out_msgs);
+        }
+        Expr::Call(_, args) => { ct_check_exprs(args, secret, line, out_lines, out_msgs); }
+        Expr::EnumLit(_, _, args) => { ct_check_exprs(args, secret, line, out_lines, out_msgs); }
+        Expr::TupleLit(args) => { ct_check_exprs(args, secret, line, out_lines, out_msgs); }
+        Expr::ArrayLit(_, args) => { ct_check_exprs(args, secret, line, out_lines, out_msgs); }
+        Expr::StructLit(_, fields, _) => {
+            var fi: i64 = 0;
+            while fi < fields.len() {
+                ct_check_expr(fields.get(fi).value, secret, line, out_lines, out_msgs);
+                fi = fi + 1;
+            }
+        }
+        Expr::Block(b) => { ct_check_stmts(b, secret, out_lines, out_msgs); }
+        Expr::TryBlock(b) => { ct_check_stmts(b, secret, out_lines, out_msgs); }
+        Expr::Closure(_, b, _) => { ct_check_stmts(b, secret, out_lines, out_msgs); }
+        _ => {}
     }
 }
 
@@ -3182,188 +4066,6 @@ pub fn TypeChecker_verify_tainted(self: &mut TypeChecker, program: Program) {
             }
         }
         fi = fi + 1;
-    }
-}
-
-// F74: @secret info-flow control
-// Checks that @secret parameters don't flow to output sinks (print, log, network).
-pub fn TypeChecker_verify_secret(self: &mut TypeChecker, program: Program) {
-    var fi: i64 = 0;
-    while fi < program.funcs.len() {
-        var func: Func = program.funcs.get(fi);
-        // Check if any param has @secret annotation
-        var has_secret: bool = false;
-        var secret_names: Vec<str> = Vec::new();
-        var pi: i64 = 0;
-        while pi < func.params.len() {
-            var param: Param = func.params.get(pi);
-            var ai: i64 = 0;
-            while ai < param.annotations.len() {
-                if param.annotations.get(ai).name == "secret" {
-                    has_secret = true;
-                    secret_names.push(param.name);
-                }
-                ai = ai + 1;
-            }
-            pi = pi + 1;
-        }
-        if has_secret {
-            // Walk the function body checking for secret values in output sink calls
-            check_secret_in_stmts(self, func.body, secret_names, func.name);
-        }
-        fi = fi + 1;
-    }
-    // Also check impl methods
-    var ii: i64 = 0;
-    while ii < program.impls.len() {
-        var imp: ImplDef = program.impls.get(ii);
-        var mi: i64 = 0;
-        while mi < imp.methods.len() {
-            var method: Func = imp.methods.get(mi);
-            var has_secret: bool = false;
-            var secret_names: Vec<str> = Vec::new();
-            var pi2: i64 = 0;
-            while pi2 < method.params.len() {
-                var param: Param = method.params.get(pi2);
-                var ai: i64 = 0;
-                while ai < param.annotations.len() {
-                    if param.annotations.get(ai).name == "secret" {
-                        has_secret = true;
-                        secret_names.push(param.name);
-                    }
-                    ai = ai + 1;
-                }
-                pi2 = pi2 + 1;
-            }
-            if has_secret {
-                check_secret_in_stmts(self, method.body, secret_names, method.name);
-            }
-            mi = mi + 1;
-        }
-        ii = ii + 1;
-    }
-}
-
-fn is_output_sink(name: str) -> bool {
-    if name == "print" { return true; }
-    if name == "println" { return true; }
-    if name == "eprint" { return true; }
-    if name == "eprintln" { return true; }
-    if name == "p_print_int" { return true; }
-    if name == "p_print_str" { return true; }
-    if name == "p_print_float" { return true; }
-    if name == "p_print_bool" { return true; }
-    if name == "p_print_newline" { return true; }
-    if name == "p_eprint_str" { return true; }
-    if name == "p_print_vec" { return true; }
-    if name == "p_socket_send" { return true; }
-    if name == "p_socket_send_str" { return true; }
-    if name == "p_http_send_response" { return true; }
-    if name == "p_file_write" { return true; }
-    if name == "p_file_append" { return true; }
-    if name == "p_file_write_bin" { return true; }
-    if name == "log_info" { return true; }
-    if name == "log_warn" { return true; }
-    if name == "log_error" { return true; }
-    if name == "log_debug" { return true; }
-    return false;
-}
-
-fn check_secret_in_stmts(self: &mut TypeChecker, stmts: Vec<Stmt>, secret_names: Vec<str>, func_name: str) {
-    var si: i64 = 0;
-    while si < stmts.len() {
-        check_secret_in_stmt(self, stmts.get(si), secret_names, func_name);
-        si = si + 1;
-    }
-}
-
-fn check_secret_in_stmt(self: &mut TypeChecker, stmt: Stmt, secret_names: Vec<str>, func_name: str) {
-    match stmt {
-        Stmt::Expr(e, _) => { check_secret_in_expr(self, e, secret_names, func_name); }
-        Stmt::Let(_, _, e, _, _, _, _) => { check_secret_in_expr(self, e, secret_names, func_name); }
-        Stmt::Assign(_, _, e, _) => { check_secret_in_expr(self, e, secret_names, func_name); }
-        Stmt::If(cond, then_block, else_block, _) => {
-            check_secret_in_expr(self, cond, secret_names, func_name);
-            check_secret_in_stmts(self, then_block, secret_names, func_name);
-            match else_block {
-                OptStmts::Some(blk) => { check_secret_in_stmts(self, blk, secret_names, func_name); }
-                OptStmts::None => {}
-            }
-        }
-        Stmt::While(cond, body, _) => {
-            check_secret_in_expr(self, cond, secret_names, func_name);
-            check_secret_in_stmts(self, body, secret_names, func_name);
-        }
-        Stmt::For(_, iter, body, _) => {
-            check_secret_in_expr(self, iter, secret_names, func_name);
-            check_secret_in_stmts(self, body, secret_names, func_name);
-        }
-        Stmt::Loop(body, _) => { check_secret_in_stmts(self, body, secret_names, func_name); }
-        Stmt::Return(e, _) => {
-            match e {
-                OptBoxExpr::Some(expr) => { check_secret_in_expr(self, box_expr_unbox(expr), secret_names, func_name); }
-                OptBoxExpr::None => {}
-            }
-        }
-        _ => {}
-    }
-}
-
-fn check_secret_in_expr(self: &mut TypeChecker, expr: Expr, secret_names: Vec<str>, func_name: str) {
-    match expr {
-        Expr::Call(callee, args) => {
-            if is_output_sink(callee) {
-                // Check if any argument contains a secret variable
-                var ai: i64 = 0;
-                while ai < args.len() {
-                    if expr_contains_secret(args.get(ai), secret_names) {
-                        self.errors.push("Security error (@secret): function '" + func_name + "' calls output sink '" + callee + "' with a secret value.\n    Secret values must not be printed, logged, or sent over the network.\n    Fix: don't pass @secret-derived values to output functions, or\n    remove the @secret annotation if the value is not actually secret.");
-                        return;
-                    }
-                    ai = ai + 1;
-                }
-            }
-            // Recursively check nested calls
-            var ai2: i64 = 0;
-            while ai2 < args.len() {
-                check_secret_in_expr(self, args.get(ai2), secret_names, func_name);
-                ai2 = ai2 + 1;
-            }
-        }
-        Expr::Binary(_, left, right) => {
-            check_secret_in_expr(self, box_expr_unbox(left), secret_names, func_name);
-            check_secret_in_expr(self, box_expr_unbox(right), secret_names, func_name);
-        }
-        _ => {}
-    }
-}
-
-fn expr_contains_secret(expr: Expr, secret_names: Vec<str>) -> bool {
-    match expr {
-        Expr::Ident(name) => {
-            var si: i64 = 0;
-            while si < secret_names.len() {
-                if secret_names.get(si) == name { return true; }
-                si = si + 1;
-            }
-            return false;
-        }
-        Expr::Binary(_, left, right) => {
-            return expr_contains_secret(box_expr_unbox(left), secret_names) || expr_contains_secret(box_expr_unbox(right), secret_names);
-        }
-        Expr::Call(_, args) => {
-            var ai: i64 = 0;
-            while ai < args.len() {
-                if expr_contains_secret(args.get(ai), secret_names) { return true; }
-                ai = ai + 1;
-            }
-            return false;
-        }
-        Expr::FieldAccess(e, _) => { return expr_contains_secret(box_expr_unbox(e), secret_names); }
-        Expr::Index(array, index) => {
-            return expr_contains_secret(box_expr_unbox(array), secret_names) || expr_contains_secret(box_expr_unbox(index), secret_names);
-        }
-        _ => { return false; }
     }
 }
 
@@ -4653,8 +5355,57 @@ pub fn TypeChecker_consume_linear_in_expr(self: &mut TypeChecker, expr: Expr, li
             TypeChecker_consume_linear_in_expr(self, box_expr_unbox(s), line);
             TypeChecker_consume_linear_in_expr(self, box_expr_unbox(e), line);
         }
+        Expr::Closure(params, body, _) => {
+            // A closure can be called any number of times, so it must not
+            // capture a linear value (each call could use it again).
+            var used: Vec<str> = Vec::new();
+            esc_idents_stmts(body, used);
+            var captured: Vec<str> = Vec::new();
+            var ui: i64 = 0;
+            while ui < used.len() {
+                var name: str = used.get(ui);
+                var is_param: bool = false;
+                var pi: i64 = 0;
+                while pi < params.len() {
+                    if params.get(pi).name == name { is_param = true; }
+                    pi = pi + 1;
+                }
+                if !is_param {
+                    match TypeChecker_lookup(self, name) {
+                        OptType::Some(t) => { if TypeChecker_is_linear_type(self, t) { captured = tc_insert_sorted(captured, name); } }
+                        OptType::None => {}
+                    }
+                }
+                ui = ui + 1;
+            }
+            var ci: i64 = 0;
+            while ci < captured.len() {
+                var cn: str = captured.get(ci);
+                self.errors.push("Linear type error (line " + int_to_str(line) + "): a closure captures linear variable '" + cn + "'.
+    A closure can be called more than once, so it could use '" + cn + "' twice.
+    Fix: pass '" + cn + "' to the closure as an argument instead.");
+                ci = ci + 1;
+            }
+        }
         _ => {}
     }
+}
+
+// A new Vec with `s` inserted in byte order (as Rust sorts Strings).
+fn tc_insert_sorted(v: Vec<str>, s: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var placed: bool = false;
+    var i: i64 = 0;
+    while i < v.len() {
+        if !placed && str_compare(s, v.get(i)) < 0 {
+            out.push(s);
+            placed = true;
+        }
+        out.push(v.get(i));
+        i = i + 1;
+    }
+    if !placed { out.push(s); }
+    return out;
 }
 
 // ---- CHUNK_MARKER_6 ----

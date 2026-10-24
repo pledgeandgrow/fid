@@ -2417,6 +2417,27 @@ impl Lowerer {
             }
 
             Stmt::Return(expr, _) => {
+                // Evaluate the returned value first. Drops, @zeroize wipes,
+                // defers and persist saves then run, as at the closing brace;
+                // running them first made `return f(key)` read a wiped key
+                // and `defer { x = 0 } return x` return 0.
+                let ret_val = if self.current_sret.is_some() {
+                    // Struct-returning function: copy struct data to sret, return void
+                    if let Some(e) = expr {
+                        let val = self.lower_expr(e);
+                        self.emit_sret_copy(val);
+                    }
+                    None
+                } else {
+                    match expr {
+                        Some(e) => {
+                            let v = self.lower_expr(e);
+                            Some(self.coerce_return(v))
+                        }
+                        None => None,
+                    }
+                };
+
                 // Emit compiler-inserted drops for locals with Drop impls
                 self.emit_drops();
 
@@ -2426,23 +2447,7 @@ impl Lowerer {
                 // Save persist variables before returning
                 self.emit_persist_saves();
 
-                if self.current_sret.is_some() {
-                    // Struct-returning function: copy struct data to sret, return void
-                    if let Some(e) = expr {
-                        let val = self.lower_expr(e);
-                        self.emit_sret_copy(val);
-                    }
-                    self.emit_terminator(Inst::Return { value: None });
-                } else {
-                    let ret_val = match expr {
-                        Some(e) => {
-                            let v = self.lower_expr(e);
-                            Some(self.coerce_return(v))
-                        }
-                        None => None,
-                    };
-                    self.emit_terminator(Inst::Return { value: ret_val });
-                }
+                self.emit_terminator(Inst::Return { value: ret_val });
             }
 
             Stmt::If { cond, then_block, else_block, line: _ } => {

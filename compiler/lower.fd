@@ -2953,30 +2953,30 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
             var _v: i64 = Lowerer_lower_expr(self, expr);
         }
         Stmt::Return(expr, _line) => {
-            // Emit drops, defers, and persist saves before return
-            Lowerer_emit_drops(self);
-            Lowerer_emit_defers(self);
-            Lowerer_emit_persist_saves(self);
-
+            // Evaluate the returned value first. Drops, @zeroize wipes,
+            // defers and persist saves then run, as at the closing brace;
+            // running them first made `return f(key)` read a wiped key and
+            // `defer { x = 0 } return x` return 0.
+            var ret_val: OptValueId = OptValueId::None;
             match expr {
                 OptBoxExpr::Some(e) => {
                     match self.current_sret {
                         OptValueId::Some(sret) => {
                             var val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(e));
                             Lowerer_emit_sret_copy(self, val);
-                            Lowerer_emit_terminator(self, Inst::Return(OptValueId::None));
                         }
                         OptValueId::None => {
                             var val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(e));
-                            var coerced: i64 = Lowerer_coerce_return(self, val);
-                            Lowerer_emit_terminator(self, Inst::Return(OptValueId::Some(coerced)));
+                            ret_val = OptValueId::Some(Lowerer_coerce_return(self, val));
                         }
                     }
                 }
-                OptBoxExpr::None => {
-                    Lowerer_emit_terminator(self, Inst::Return(OptValueId::None));
-                }
+                OptBoxExpr::None => {}
             }
+            Lowerer_emit_drops(self);
+            Lowerer_emit_defers(self);
+            Lowerer_emit_persist_saves(self);
+            Lowerer_emit_terminator(self, Inst::Return(ret_val));
         }
         Stmt::If(cond, then_block, else_block, _line) => {
             var cond_val: i64 = Lowerer_lower_expr(self, cond);

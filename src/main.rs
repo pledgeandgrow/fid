@@ -1527,8 +1527,11 @@ fn main() {
                 "test_banking_double_credit_fail",
                 "test_banking_lost_money_fail",
                 "test_loop_linear_fail",
+                "test_linear_closure_fail",
                 "test_gas_fail",
                 "test_crashfree_fail",
+                "test_crashfree_index_fail",
+                "test_crashfree_overflow_fail",
                 "test_txn_rollback_fail",
                 "test_typed_strings_fail",
                 "test_init_guarantee_fail",
@@ -1546,6 +1549,8 @@ fn main() {
                 // @constant_time fail tests — early return + IO violation
                 "test_constant_time_fail",
                 "test_constant_time_fail2",
+                "test_constant_time_branch_fail",
+                "test_constant_time_index_fail",
                 // @send fail test — sending reference through channel
                 "test_send_fail",
                 // ML1: GPU region budget exceeded
@@ -1586,6 +1591,12 @@ fn main() {
                 "test_escape_scope_fail",
                 "test_escape_store_fail",
                 "test_escape_closure_fail",
+                // @secret information flow
+                "test_secret_output_fail",
+                "test_secret_helper_fail",
+                "test_secret_branch_fail",
+                "test_secret_global_fail",
+                "test_secret_return_fail",
             ];
 
 

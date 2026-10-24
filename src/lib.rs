@@ -16,6 +16,7 @@
 pub mod ast;
 pub mod borrowck;
 pub mod escape;
+pub mod secrecy;
 pub mod codegen;
 pub mod codegen_c;
 pub mod compiler;

@@ -69,7 +69,7 @@ fn union(sets: &[Roots]) -> Roots {
 }
 
 /// Names of the variables a closure body reads (a superset of its captures).
-fn idents_in_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
+pub(crate) fn idents_in_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
     for s in stmts {
         idents_in_stmt(s, out);
     }

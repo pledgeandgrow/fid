@@ -2151,6 +2151,7 @@ impl TypeChecker {
                     "simd" => { /* F23: @simd — recognized but no safety primitives */ }
                     "zeroize" => { /* F88: @zeroize — recognized but no safety primitives */ }
                     "secret" => { /* F74: @secret — recognized but no safety primitives */ }
+                    "declassify" => { /* audited release of @secret values (secrecy.rs) */ }
                     "interrupt" => { /* F29: @interrupt — recognized but no safety primitives */ }
                     _ => {}
                 }
@@ -2496,6 +2497,21 @@ impl TypeChecker {
 
             // Check body for all primitives
             errs.extend(check_body(&func.body, qualified_name, prims, func_primitives));
+
+            // no-panic: indexing (out of bounds) and integer arithmetic
+            // (overflow) panic too.
+            if prims.contains("no-panic") {
+                let wrapping = annotations.iter().any(|a| a.name == "wrapping");
+                let mut risks = Vec::new();
+                scan_for_panic_risks(&func.body, wrapping, &mut risks);
+                for (line, what) in risks {
+                    errs.push(format!(
+                        "Safety error ({}) (line {}): function '{}' {}.
+                             Crashfree functions must never panic.",
+                        label, line, qualified_name, what
+                    ));
+                }
+            }
             errs
         };
 
@@ -2668,10 +2684,17 @@ impl TypeChecker {
                 ));
             }
 
-            // Rule 3: No data-dependent array indexing (conservative: flag all Vec_get/HashMap_get)
-            // This is conservative — not all array indexing is secret-dependent.
-            // Users should use @secret to mark which values are sensitive.
-            // For now, we flag array access inside if/match conditions as suspicious.
+            // Rules 1 and 3: no branch, short-circuit, memory index or division
+            // that depends on secret data (every parameter not marked @public).
+            for (line, what) in ct_secret_dependence(func) {
+                errs.push(format!(
+                    "Security error (constant_time) (line {}): function '{}' {}.\n\
+                     \x20\x20\x20\x20Its running time would depend on secret data.\n\
+                     \x20\x20\x20\x20Fix: compute branch-free (masks, `&`/`|`, a select such as `(a & m) | (b & ~m)`),\n\
+                     \x20\x20\x20\x20or mark the parameter @public if it is not secret.",
+                    line, name, what
+                ));
+            }
 
             for err in errs {
                 self.errors.push(err);
@@ -2972,16 +2995,6 @@ impl TypeChecker {
             .copied()
             .collect();
 
-        // Output sinks — must not receive Secret input (F74: @secret info-flow control)
-        let output_sinks: &[&str] = &[
-            "print", "println", "eprint", "eprintln",
-            "p_print_int", "p_print_str", "p_print_float", "p_print_bool", "p_print_newline",
-            "p_eprint_str", "p_print_vec",
-            "p_socket_send", "p_socket_send_str", "p_http_send_response",
-            "p_file_write", "p_file_append", "p_file_write_bin",
-            "log_info", "log_warn", "log_error", "log_debug",
-        ];
-
         // Known sanitizer functions (cleanse taint → result is Sanitized)
         let sanitizers: &[&str] = &[
             "sql_escape", "shell_escape", "html_escape", "path_normalize",
@@ -2993,10 +3006,8 @@ impl TypeChecker {
             let has_tainted = func.params.iter().any(|p| {
                 p.annotations.iter().any(|a| a.name == "tainted")
             });
-            let has_secret = func.params.iter().any(|p| {
-                p.annotations.iter().any(|a| a.name == "secret")
-            });
-            if !has_tainted && !has_secret { continue; }
+            // (@secret is checked by secrecy.rs.)
+            if !has_tainted { continue; }
 
             // Build initial taint map: @tainted params → Tainted, @secret → Secret, rest → Untainted
             let mut taint_map: HashMap<String, TaintState> = HashMap::new();
@@ -3013,8 +3024,6 @@ impl TypeChecker {
 
             // Walk statements in order, propagating taint
             self.propagate_taint_stmts(&func.body, &mut taint_map, &all_sinks, sanitizers, &func.name, program);
-            // Also check for secret flow to output sinks
-            self.propagate_secret_stmts(&func.body, &taint_map, output_sinks, &func.name);
         }
     }
 
@@ -3030,139 +3039,6 @@ impl TypeChecker {
     ) {
         for stmt in stmts {
             self.propagate_taint_stmt(stmt, taint_map, sinks, sanitizers, func_name, program);
-        }
-    }
-
-    /// Walk statements checking for @secret values flowing to output sinks.
-    /// This is the F74 info-flow control check: secrets must not be printed, logged, or sent.
-    fn propagate_secret_stmts(
-        &mut self,
-        stmts: &[Stmt],
-        taint_map: &HashMap<String, TaintState>,
-        output_sinks: &[&str],
-        func_name: &str,
-    ) {
-        for stmt in stmts {
-            self.propagate_secret_stmt(stmt, taint_map, output_sinks, func_name);
-        }
-    }
-
-    fn propagate_secret_stmt(
-        &mut self,
-        stmt: &Stmt,
-        taint_map: &HashMap<String, TaintState>,
-        output_sinks: &[&str],
-        func_name: &str,
-    ) {
-        match stmt {
-            Stmt::Expr(expr, _) => {
-                self.check_secret_sink(expr, taint_map, output_sinks, func_name);
-            }
-            Stmt::If { cond, then_block, else_block, .. } => {
-                self.check_secret_sink(cond, taint_map, output_sinks, func_name);
-                self.propagate_secret_stmts(then_block, taint_map, output_sinks, func_name);
-                if let Some(else_blk) = else_block {
-                    self.propagate_secret_stmts(else_blk, taint_map, output_sinks, func_name);
-                }
-            }
-            Stmt::While { cond, body, .. } => {
-                self.check_secret_sink(cond, taint_map, output_sinks, func_name);
-                self.propagate_secret_stmts(body, taint_map, output_sinks, func_name);
-            }
-            Stmt::For { iterator, body, .. } => {
-                self.check_secret_sink(iterator, taint_map, output_sinks, func_name);
-                self.propagate_secret_stmts(body, taint_map, output_sinks, func_name);
-            }
-            Stmt::Loop { body, .. } => {
-                self.propagate_secret_stmts(body, taint_map, output_sinks, func_name);
-            }
-            Stmt::Match { expr, arms, .. } => {
-                self.check_secret_sink(expr, taint_map, output_sinks, func_name);
-                for arm in arms {
-                    self.propagate_secret_stmts(&arm.body, taint_map, output_sinks, func_name);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Check if an expression is a call to an output sink with a Secret argument.
-    fn check_secret_sink(
-        &mut self,
-        expr: &Expr,
-        taint_map: &HashMap<String, TaintState>,
-        output_sinks: &[&str],
-        func_name: &str,
-    ) {
-        match expr {
-            Expr::Call { callee, args, .. } => {
-                if output_sinks.contains(&callee.as_str()) {
-                    for arg in args {
-                        if self.expr_contains_secret(arg, taint_map) {
-                            self.errors.push(format!(
-                                "Security error (@secret): function '{}' calls output sink '{}' with a secret value.\n\
-                                 \x20\x20\x20\x20Secret values must not be printed, logged, or sent over the network.\n\
-                                 \x20\x20\x20\x20Fix: don't pass @secret-derived values to output functions, or\n\
-                                 \x20\x20\x20\x20remove the @secret annotation if the value is not actually secret.",
-                                func_name, callee
-                            ));
-                            return;
-                        }
-                    }
-                }
-                // Recursively check nested calls
-                for arg in args {
-                    self.check_secret_sink(arg, taint_map, output_sinks, func_name);
-                }
-            }
-            Expr::MethodCall { receiver, args, .. } => {
-                // Check if the method is an output sink
-                if let Expr::Ident(name) = receiver.as_ref() {
-                    if output_sinks.contains(&name.as_str()) {
-                        for arg in args {
-                            if self.expr_contains_secret(arg, taint_map) {
-                                self.errors.push(format!(
-                                    "Security error (@secret): function '{}' calls output sink '{}' with a secret value.",
-                                    func_name, name
-                                ));
-                                return;
-                            }
-                        }
-                    }
-                }
-                self.check_secret_sink(receiver, taint_map, output_sinks, func_name);
-                for arg in args {
-                    self.check_secret_sink(arg, taint_map, output_sinks, func_name);
-                }
-            }
-            Expr::Binary { left, right, .. } => {
-                self.check_secret_sink(left, taint_map, output_sinks, func_name);
-                self.check_secret_sink(right, taint_map, output_sinks, func_name);
-            }
-            _ => {}
-        }
-    }
-
-    /// Check if an expression contains a secret-typed variable.
-    fn expr_contains_secret(&self, expr: &Expr, taint_map: &HashMap<String, TaintState>) -> bool {
-        match expr {
-            Expr::Ident(name) => {
-                taint_map.get(name) == Some(&TaintState::Secret)
-            }
-            Expr::Binary { left, right, .. } => {
-                self.expr_contains_secret(left, taint_map) || self.expr_contains_secret(right, taint_map)
-            }
-            Expr::Call { args, .. } => {
-                args.iter().any(|a| self.expr_contains_secret(a, taint_map))
-            }
-            Expr::MethodCall { receiver, args, .. } => {
-                self.expr_contains_secret(receiver, taint_map) || args.iter().any(|a| self.expr_contains_secret(a, taint_map))
-            }
-            Expr::FieldAccess { expr, .. } => self.expr_contains_secret(expr, taint_map),
-            Expr::Index { array, index, .. } => {
-                self.expr_contains_secret(array, taint_map) || self.expr_contains_secret(index, taint_map)
-            }
-            _ => false,
         }
     }
 
@@ -3203,23 +3079,6 @@ impl TypeChecker {
                              \x20\x20\x20\x20before returning to prevent injection attacks.\n\
                              \x20\x20\x20\x20Fix: sanitize the return value with a sanitizer function\n\
                              \x20\x20\x20\x20(e.g. sql_escape, html_escape), or annotate the function @tainted.",
-                            func_name
-                        ));
-                    }
-                }
-                if taint == TaintState::Secret {
-                    // Check if the function itself is @secret (allowed to return secret)
-                    let func_is_secret = program.funcs.iter()
-                        .find(|f| f.name == func_name)
-                        .map(|f| f.annotations.iter().any(|a| a.name == "secret"))
-                        .unwrap_or(false);
-                    if !func_is_secret {
-                        self.errors.push(format!(
-                            "Security error (@secret): function '{}' returns a secret value.\n\
-                             \x20\x20\x20\x20The return value is derived from @secret input but the function\n\
-                             \x20\x20\x20\x20is not annotated @secret. Secret values must not leak through\n\
-                             \x20\x20\x20\x20return values to prevent information disclosure.\n\
-                             \x20\x20\x20\x20Fix: don't return secret-derived values, or annotate the function @secret.",
                             func_name
                         ));
                     }
@@ -4357,6 +4216,26 @@ impl TypeChecker {
             Expr::Range { start, end, .. } => {
                 self.consume_linear_in_expr(start, line);
                 self.consume_linear_in_expr(end, line);
+            }
+            Expr::Closure { params, body, .. } => {
+                // A closure can be called any number of times, so it must not
+                // capture a linear value (each call could use it again).
+                let mut used = HashSet::new();
+                crate::escape::idents_in_stmts(body, &mut used);
+                let mut captured: Vec<&String> = used
+                    .iter()
+                    .filter(|n| !params.iter().any(|p| &p.name == *n))
+                    .filter(|n| self.lookup(n).map_or(false, |t| self.is_linear_type(t)))
+                    .collect();
+                captured.sort();
+                for name in captured {
+                    self.errors.push(format!(
+                        "Linear type error (line {}): a closure captures linear variable '{}'.\n\
+                         \x20\x20\x20\x20A closure can be called more than once, so it could use '{}' twice.\n\
+                         \x20\x20\x20\x20Fix: pass '{}' to the closure as an argument instead.",
+                        line, name, name, name
+                    ));
+                }
             }
             _ => {}
         }
@@ -8233,6 +8112,212 @@ fn scan_expr_for_floats(expr: &Expr, found: &mut Vec<String>) {
 
 /// Scan statements for division/modulo operations.
 /// Returns (line, operator_string) for each div/mod site.
+/// Panic risks the no-panic primitive rejects besides panicking calls and
+/// division: indexing (out of bounds) and, unless `wrapping`, integer
+/// arithmetic (overflow). One (line, what) per site. Inside
+/// `for i in 0..v.len()`, `v[i]` / `v.get(i)` / `v.set(i, ..)` are in bounds
+/// (unless the body reassigns `i` or resizes `v`).
+fn scan_for_panic_risks(stmts: &[Stmt], wrapping: bool, out: &mut Vec<(usize, String)>) {
+    let mut safe: Vec<(String, String)> = Vec::new();
+    pr_stmts(stmts, wrapping, &mut safe, out);
+}
+
+/// `a`, `a.b.c`: the textual path of a place, for matching `v` in `0..v.len()`.
+fn pr_place(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Ident(n) => Some(n.clone()),
+        Expr::FieldAccess { expr, field } => pr_place(expr).map(|p| format!("{}.{}", p, field)),
+        _ => None,
+    }
+}
+
+/// `for i in 0..v.len()` → the path of `v`.
+fn pr_len_bound(iterator: &Expr) -> Option<String> {
+    if let Expr::Range { start, end, inclusive: false } = iterator {
+        if matches!(start.as_ref(), Expr::IntLit(0)) {
+            if let Expr::MethodCall { receiver, method, args } = end.as_ref() {
+                if method == "len" && args.is_empty() {
+                    return pr_place(receiver);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether `body` reassigns `i` or resizes the Vec at path `v`.
+fn pr_disturbs(body: &[Stmt], i: &str, v: &str) -> bool {
+    fn stmt(s: &Stmt, i: &str, v: &str) -> bool {
+        match s {
+            Stmt::Assign { target, expr, .. } => target == i || target == v || expr_(expr, i, v),
+            Stmt::Let { expr, .. } | Stmt::Expr(expr, _) | Stmt::Return(Some(expr), _) => expr_(expr, i, v),
+            Stmt::If { then_block, else_block, .. } => {
+                then_block.iter().any(|x| stmt(x, i, v)) || else_block.as_ref().map_or(false, |b| b.iter().any(|x| stmt(x, i, v)))
+            }
+            Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::Loop { body, .. } | Stmt::Unsafe { body, .. } => {
+                body.iter().any(|x| stmt(x, i, v))
+            }
+            Stmt::Match { arms, .. } => arms.iter().any(|a| a.body.iter().any(|x| stmt(x, i, v))),
+            _ => false,
+        }
+    }
+    fn expr_(e: &Expr, i: &str, v: &str) -> bool {
+        match e {
+            Expr::MethodCall { receiver, method, args } => {
+                (matches!(method.as_str(), "pop" | "remove" | "clear" | "truncate" | "drain")
+                    && pr_place(receiver).as_deref() == Some(v))
+                    || expr_(receiver, i, v)
+                    || args.iter().any(|a| expr_(a, i, v))
+            }
+            Expr::Call { args, .. } => args.iter().any(|a| expr_(a, i, v)),
+            Expr::Binary { left, right, .. } => expr_(left, i, v) || expr_(right, i, v),
+            _ => false,
+        }
+    }
+    body.iter().any(|s| stmt(s, i, v))
+}
+
+fn pr_in_bounds(safe: &[(String, String)], vec: &Expr, index: &Expr) -> bool {
+    match (pr_place(vec), index) {
+        (Some(v), Expr::Ident(i)) => safe.iter().any(|(si, sv)| si == i && *sv == v),
+        _ => false,
+    }
+}
+
+fn pr_stmts(stmts: &[Stmt], wrapping: bool, safe: &mut Vec<(String, String)>, out: &mut Vec<(usize, String)>) {
+    for s in stmts {
+        let line = s.line();
+        match s {
+            Stmt::IndexAssign { array, index, expr, .. } => {
+                if !pr_in_bounds(safe, &Expr::Ident(array.clone()), index) {
+                    pr_push(out, line, "assigns through `[...]`, which panics when the index is out of bounds");
+                }
+                pr_expr(index, wrapping, safe, line, out);
+                pr_expr(expr, wrapping, safe, line, out);
+            }
+            Stmt::Let { expr, .. } | Stmt::LetTuple { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr(expr, _)
+            | Stmt::Return(Some(expr), _) | Stmt::Break(Some(expr), _) => pr_expr(expr, wrapping, safe, line, out),
+            Stmt::FieldAssign { object, expr, .. } | Stmt::DerefAssign { ptr_expr: object, expr, .. } => {
+                pr_expr(object, wrapping, safe, line, out);
+                pr_expr(expr, wrapping, safe, line, out);
+            }
+            Stmt::If { cond, then_block, else_block, .. } => {
+                pr_expr(cond, wrapping, safe, line, out);
+                pr_stmts(then_block, wrapping, safe, out);
+                if let Some(b) = else_block {
+                    pr_stmts(b, wrapping, safe, out);
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                pr_expr(cond, wrapping, safe, line, out);
+                pr_stmts(body, wrapping, safe, out);
+            }
+            Stmt::For { var, iterator, body, .. } => {
+                pr_expr(iterator, wrapping, safe, line, out);
+                let bound = pr_len_bound(iterator).filter(|v| !pr_disturbs(body, var, v));
+                if let Some(v) = &bound {
+                    safe.push((var.clone(), v.clone()));
+                }
+                pr_stmts(body, wrapping, safe, out);
+                if bound.is_some() {
+                    safe.pop();
+                }
+            }
+            Stmt::Match { expr, arms, .. } => {
+                pr_expr(expr, wrapping, safe, line, out);
+                for a in arms {
+                    pr_stmts(&a.body, wrapping, safe, out);
+                }
+            }
+            Stmt::Loop { body, .. } | Stmt::Unsafe { body, .. } | Stmt::Sandbox { body, .. } | Stmt::Txn { body, .. }
+            | Stmt::RegionBlock { body, .. } | Stmt::Defer(body, _) => pr_stmts(body, wrapping, safe, out),
+            _ => {}
+        }
+    }
+}
+
+fn pr_push(out: &mut Vec<(usize, String)>, line: usize, what: &str) {
+    let item = (line, what.to_string());
+    if !out.contains(&item) {
+        out.push(item);
+    }
+}
+
+/// Whether `e` is plainly not an integer (string or float), so `+` cannot overflow-panic.
+fn pr_non_integer(e: &Expr) -> bool {
+    matches!(e, Expr::StringLit(_) | Expr::FloatLit(_) | Expr::StrConcat { .. } | Expr::FString { .. })
+}
+
+fn pr_expr(e: &Expr, wrapping: bool, safe: &mut Vec<(String, String)>, line: usize, out: &mut Vec<(usize, String)>) {
+    match e {
+        Expr::Index { array, index } => {
+            if !pr_in_bounds(safe, array, index) {
+                pr_push(out, line, "indexes with `[...]`, which panics when the index is out of bounds");
+            }
+            pr_expr(array, wrapping, safe, line, out);
+            pr_expr(index, wrapping, safe, line, out);
+        }
+        Expr::MethodCall { receiver, method, args } => {
+            let indexing = matches!(method.as_str(), "get" | "set");
+            let in_bounds = indexing && args.first().map_or(false, |a| pr_in_bounds(safe, receiver, a));
+            if matches!(method.as_str(), "get" | "set" | "remove" | "pop" | "insert") && !in_bounds {
+                pr_push(out, line, &format!(
+                    "calls `.{}()`, which panics when the index is out of bounds (or the Vec is empty); use `.get_or(i, default)` or loop over `0..v.len()`",
+                    method
+                ));
+            }
+            pr_expr(receiver, wrapping, safe, line, out);
+            for a in args {
+                pr_expr(a, wrapping, safe, line, out);
+            }
+        }
+        Expr::Binary { op, left, right } => {
+            let arith = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul);
+            let constant = matches!((left.as_ref(), right.as_ref()), (Expr::IntLit(_), Expr::IntLit(_)));
+            if arith && !wrapping && !constant && !pr_non_integer(left) && !pr_non_integer(right) {
+                pr_push(out, line, "uses integer `+`/`-`/`*`, which panics on overflow (mark the function @wrapping for two's-complement arithmetic)");
+            }
+            pr_expr(left, wrapping, safe, line, out);
+            pr_expr(right, wrapping, safe, line, out);
+        }
+        Expr::Unary { expr, .. } | Expr::FieldAccess { expr, .. } | Expr::OptionalFieldAccess { expr, .. }
+        | Expr::Ref { expr, .. } | Expr::Deref { expr } | Expr::Try { expr } | Expr::IsCheck { expr, .. }
+        | Expr::Cast { expr, .. } | Expr::QuantCast { expr, .. } | Expr::Await { expr } | Expr::Spawn { expr } => {
+            pr_expr(expr, wrapping, safe, line, out)
+        }
+        Expr::StrConcat { left, right } | Expr::Range { start: left, end: right, .. }
+        | Expr::Coalesce { expr: left, default: right } | Expr::PipeForward { left, right } => {
+            pr_expr(left, wrapping, safe, line, out);
+            pr_expr(right, wrapping, safe, line, out);
+        }
+        Expr::Call { args, .. } | Expr::EnumLit { args, .. } | Expr::TupleLit(args) | Expr::ArrayLit { elements: args, .. } => {
+            for a in args {
+                pr_expr(a, wrapping, safe, line, out);
+            }
+        }
+        Expr::StructLit { fields, .. } => {
+            for (_, v) in fields {
+                pr_expr(v, wrapping, safe, line, out);
+            }
+        }
+        Expr::If { cond, then_block, else_block } => {
+            pr_expr(cond, wrapping, safe, line, out);
+            pr_stmts(then_block, wrapping, safe, out);
+            if let Some(b) = else_block {
+                pr_stmts(b, wrapping, safe, out);
+            }
+        }
+        Expr::Match { expr, arms } => {
+            pr_expr(expr, wrapping, safe, line, out);
+            for a in arms {
+                pr_stmts(&a.body, wrapping, safe, out);
+            }
+        }
+        Expr::Block(b) | Expr::TryBlock { body: b } | Expr::Closure { body: b, .. } => pr_stmts(b, wrapping, safe, out),
+        _ => {}
+    }
+}
+
 fn scan_for_division(stmts: &[Stmt], sites: &mut Vec<(usize, &'static str)>) {
     for stmt in stmts {
         scan_stmt_for_division(stmt, sites);
@@ -8655,6 +8740,292 @@ fn stmt_decreases_var(stmt: &Stmt, var: &str) -> bool {
 
 /// Scan for early returns (ret before the last statement in a block).
 /// Used by @constant_time to detect timing leaks from early exits.
+/// Secret-dependent timing in a `@constant_time` function: one (line, what)
+/// per branch, loop, short-circuit, memory index or division whose operand
+/// depends on a parameter not marked `@public`. Lengths (`x.len()`) are public.
+fn ct_secret_dependence(func: &Func) -> Vec<(usize, String)> {
+    let mut secret: HashSet<String> = func
+        .params
+        .iter()
+        .filter(|p| !p.annotations.iter().any(|a| a.name == "public"))
+        .map(|p| p.name.clone())
+        .collect();
+    // Values computed from secrets are secret (flow-insensitive, to a fixpoint).
+    loop {
+        let before = secret.len();
+        ct_propagate(&func.body, &mut secret);
+        if secret.len() == before {
+            break;
+        }
+    }
+    let mut out: Vec<(usize, String)> = Vec::new();
+    ct_check_stmts(&func.body, &secret, &mut out);
+    out
+}
+
+/// Whether `e` mentions a secret variable outside a length query.
+fn ct_secret(e: &Expr, secret: &HashSet<String>) -> bool {
+    match e {
+        Expr::Ident(n) => secret.contains(n),
+        Expr::MethodCall { receiver, method, args } => {
+            method != "len" && (ct_secret(receiver, secret) || args.iter().any(|a| ct_secret(a, secret)))
+        }
+        Expr::Call { callee, args } => {
+            !(callee == "len" || callee.ends_with("_len")) && args.iter().any(|a| ct_secret(a, secret))
+        }
+        Expr::Binary { left, right, .. } | Expr::StrConcat { left, right } | Expr::Range { start: left, end: right, .. }
+        | Expr::Coalesce { expr: left, default: right } | Expr::PipeForward { left, right }
+        | Expr::Index { array: left, index: right } => ct_secret(left, secret) || ct_secret(right, secret),
+        Expr::Unary { expr, .. } | Expr::FieldAccess { expr, .. } | Expr::OptionalFieldAccess { expr, .. }
+        | Expr::Ref { expr, .. } | Expr::Deref { expr } | Expr::Try { expr } | Expr::IsCheck { expr, .. }
+        | Expr::Cast { expr, .. } | Expr::QuantCast { expr, .. } | Expr::Await { expr } | Expr::Spawn { expr } => ct_secret(expr, secret),
+        Expr::StructLit { fields, spread, .. } => {
+            fields.iter().any(|(_, v)| ct_secret(v, secret)) || spread.as_ref().map_or(false, |s| ct_secret(s, secret))
+        }
+        Expr::EnumLit { args, .. } | Expr::TupleLit(args) | Expr::ArrayLit { elements: args, .. } => args.iter().any(|a| ct_secret(a, secret)),
+        Expr::If { cond, then_block, else_block } => {
+            ct_secret(cond, secret) || ct_stmts_secret(then_block, secret) || else_block.as_ref().map_or(false, |b| ct_stmts_secret(b, secret))
+        }
+        Expr::Match { expr, arms } => ct_secret(expr, secret) || arms.iter().any(|a| ct_stmts_secret(&a.body, secret)),
+        Expr::Block(b) | Expr::TryBlock { body: b } | Expr::Closure { body: b, .. } => ct_stmts_secret(b, secret),
+        Expr::FString { parts } => parts.iter().any(|p| matches!(p, FStringPart::Expr(x) if ct_secret(x, secret))),
+        _ => false,
+    }
+}
+
+/// Whether the value of `stmts` (their last expression) mentions a secret.
+fn ct_stmts_secret(stmts: &[Stmt], secret: &HashSet<String>) -> bool {
+    match stmts.last() {
+        Some(Stmt::Expr(e, _)) => ct_secret(e, secret),
+        _ => false,
+    }
+}
+
+/// The variable a place expression writes into.
+fn ct_base(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Ident(n) => Some(n),
+        Expr::FieldAccess { expr, .. } | Expr::Deref { expr } => ct_base(expr),
+        Expr::Index { array, .. } => ct_base(array),
+        _ => None,
+    }
+}
+
+fn ct_propagate(stmts: &[Stmt], secret: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Let { name, expr, .. } => {
+                if ct_secret(expr, secret) {
+                    secret.insert(name.clone());
+                }
+            }
+            Stmt::LetTuple { names, expr, .. } => {
+                if ct_secret(expr, secret) {
+                    secret.extend(names.iter().cloned());
+                }
+            }
+            Stmt::Assign { target, expr, .. } => {
+                if ct_secret(expr, secret) {
+                    secret.insert(target.clone());
+                }
+            }
+            Stmt::IndexAssign { array, index, expr, .. } => {
+                if ct_secret(expr, secret) || ct_secret(index, secret) {
+                    secret.insert(array.clone());
+                }
+            }
+            Stmt::FieldAssign { object, expr, .. } | Stmt::DerefAssign { ptr_expr: object, expr, .. } => {
+                if ct_secret(expr, secret) {
+                    if let Some(b) = ct_base(object) {
+                        secret.insert(b.to_string());
+                    }
+                }
+            }
+            Stmt::Expr(Expr::MethodCall { receiver, method, args }, _) => {
+                // A mutating method stores its arguments in its receiver.
+                if method != "len" && args.iter().any(|a| ct_secret(a, secret)) {
+                    if let Some(b) = ct_base(receiver) {
+                        secret.insert(b.to_string());
+                    }
+                }
+            }
+            Stmt::For { var, iterator, body, .. } => {
+                if ct_secret(iterator, secret) {
+                    secret.insert(var.clone());
+                }
+                ct_propagate(body, secret);
+            }
+            Stmt::Match { expr, arms, .. } => {
+                let s = ct_secret(expr, secret);
+                for arm in arms {
+                    if s {
+                        match &arm.pattern {
+                            Pattern::Ident(n) => {
+                                secret.insert(n.clone());
+                            }
+                            Pattern::EnumVariant { bindings, .. } => {
+                                secret.extend(bindings.iter().map(|(n, _)| n.clone()));
+                            }
+                            _ => {}
+                        }
+                    }
+                    ct_propagate(&arm.body, secret);
+                }
+            }
+            Stmt::If { then_block, else_block, .. } => {
+                ct_propagate(then_block, secret);
+                if let Some(b) = else_block {
+                    ct_propagate(b, secret);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::Loop { body, .. } | Stmt::Unsafe { body, .. } | Stmt::Sandbox { body, .. }
+            | Stmt::Txn { body, .. } | Stmt::RegionBlock { body, .. } | Stmt::Defer(body, _) => ct_propagate(body, secret),
+            _ => {}
+        }
+    }
+}
+
+fn ct_push(out: &mut Vec<(usize, String)>, line: usize, what: &str) {
+    let item = (line, what.to_string());
+    if !out.contains(&item) {
+        out.push(item);
+    }
+}
+
+fn ct_check_stmts(stmts: &[Stmt], secret: &HashSet<String>, out: &mut Vec<(usize, String)>) {
+    for s in stmts {
+        let line = s.line();
+        match s {
+            Stmt::If { cond, then_block, else_block, .. } => {
+                if ct_secret(cond, secret) {
+                    ct_push(out, line, "branches on secret data (`if`)");
+                }
+                ct_check_expr(cond, secret, line, out);
+                ct_check_stmts(then_block, secret, out);
+                if let Some(b) = else_block {
+                    ct_check_stmts(b, secret, out);
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                if ct_secret(cond, secret) {
+                    ct_push(out, line, "loops on secret data (`while` condition)");
+                }
+                ct_check_expr(cond, secret, line, out);
+                ct_check_stmts(body, secret, out);
+            }
+            Stmt::For { iterator, body, .. } => {
+                if ct_secret(iterator, secret) {
+                    ct_push(out, line, "loops over secret data (`for`)");
+                }
+                ct_check_expr(iterator, secret, line, out);
+                ct_check_stmts(body, secret, out);
+            }
+            Stmt::Match { expr, arms, .. } => {
+                if ct_secret(expr, secret) {
+                    ct_push(out, line, "branches on secret data (`match`)");
+                }
+                ct_check_expr(expr, secret, line, out);
+                for arm in arms {
+                    ct_check_stmts(&arm.body, secret, out);
+                }
+            }
+            Stmt::IndexAssign { index, expr, .. } => {
+                if ct_secret(index, secret) {
+                    ct_push(out, line, "indexes memory with secret data");
+                }
+                ct_check_expr(index, secret, line, out);
+                ct_check_expr(expr, secret, line, out);
+            }
+            Stmt::Let { expr, .. } | Stmt::LetTuple { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr(expr, _)
+            | Stmt::Return(Some(expr), _) | Stmt::Break(Some(expr), _) => ct_check_expr(expr, secret, line, out),
+            Stmt::FieldAssign { object, expr, .. } | Stmt::DerefAssign { ptr_expr: object, expr, .. } => {
+                ct_check_expr(object, secret, line, out);
+                ct_check_expr(expr, secret, line, out);
+            }
+            Stmt::Loop { body, .. } | Stmt::Unsafe { body, .. } | Stmt::Sandbox { body, .. } | Stmt::Txn { body, .. }
+            | Stmt::RegionBlock { body, .. } | Stmt::Defer(body, _) => ct_check_stmts(body, secret, out),
+            _ => {}
+        }
+    }
+}
+
+fn ct_check_expr(e: &Expr, secret: &HashSet<String>, line: usize, out: &mut Vec<(usize, String)>) {
+    match e {
+        Expr::Binary { op, left, right } => {
+            let either = ct_secret(left, secret) || ct_secret(right, secret);
+            match op {
+                BinOp::And | BinOp::Or if either => {
+                    ct_push(out, line, "short-circuits on secret data (`&&`/`||`; use `&`/`|`)")
+                }
+                BinOp::Div | BinOp::Mod if either => {
+                    ct_push(out, line, "divides secret data (`/` or `%` take variable time on most CPUs)")
+                }
+                _ => {}
+            }
+            ct_check_expr(left, secret, line, out);
+            ct_check_expr(right, secret, line, out);
+        }
+        Expr::Index { array, index } => {
+            if ct_secret(index, secret) {
+                ct_push(out, line, "indexes memory with secret data");
+            }
+            ct_check_expr(array, secret, line, out);
+            ct_check_expr(index, secret, line, out);
+        }
+        Expr::MethodCall { receiver, method, args } => {
+            let indexes = matches!(method.as_str(), "get" | "set" | "remove" | "insert" | "get_or");
+            if indexes && args.first().map_or(false, |a| ct_secret(a, secret)) {
+                ct_push(out, line, "indexes memory with secret data");
+            }
+            ct_check_expr(receiver, secret, line, out);
+            for a in args {
+                ct_check_expr(a, secret, line, out);
+            }
+        }
+        Expr::If { cond, then_block, else_block } => {
+            if ct_secret(cond, secret) {
+                ct_push(out, line, "branches on secret data (`if`)");
+            }
+            ct_check_expr(cond, secret, line, out);
+            ct_check_stmts(then_block, secret, out);
+            if let Some(b) = else_block {
+                ct_check_stmts(b, secret, out);
+            }
+        }
+        Expr::Match { expr, arms } => {
+            if ct_secret(expr, secret) {
+                ct_push(out, line, "branches on secret data (`match`)");
+            }
+            ct_check_expr(expr, secret, line, out);
+            for arm in arms {
+                ct_check_stmts(&arm.body, secret, out);
+            }
+        }
+        Expr::Unary { expr, .. } | Expr::FieldAccess { expr, .. } | Expr::OptionalFieldAccess { expr, .. }
+        | Expr::Ref { expr, .. } | Expr::Deref { expr } | Expr::Try { expr } | Expr::IsCheck { expr, .. }
+        | Expr::Cast { expr, .. } | Expr::QuantCast { expr, .. } | Expr::Await { expr } | Expr::Spawn { expr } => {
+            ct_check_expr(expr, secret, line, out)
+        }
+        Expr::StrConcat { left, right } | Expr::Range { start: left, end: right, .. }
+        | Expr::Coalesce { expr: left, default: right } | Expr::PipeForward { left, right } => {
+            ct_check_expr(left, secret, line, out);
+            ct_check_expr(right, secret, line, out);
+        }
+        Expr::Call { args, .. } | Expr::EnumLit { args, .. } | Expr::TupleLit(args) | Expr::ArrayLit { elements: args, .. } => {
+            for a in args {
+                ct_check_expr(a, secret, line, out);
+            }
+        }
+        Expr::StructLit { fields, .. } => {
+            for (_, v) in fields {
+                ct_check_expr(v, secret, line, out);
+            }
+        }
+        Expr::Block(b) | Expr::TryBlock { body: b } | Expr::Closure { body: b, .. } => ct_check_stmts(b, secret, out),
+        _ => {}
+    }
+}
+
 fn scan_for_early_returns(stmts: &[Stmt], sites: &mut Vec<usize>) {
     for (i, stmt) in stmts.iter().enumerate() {
         let is_last = i == stmts.len() - 1;

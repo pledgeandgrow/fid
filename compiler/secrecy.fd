@@ -1,0 +1,916 @@
+// secrecy.fd -- @secret information-flow check, rewritten from src/secrecy.rs
+//
+// A secret never reaches an output. Sources: @secret parameters and locals,
+// and the results of @secret functions. Sinks: output and logging calls,
+// network and file writes, globals, writes through reference parameters,
+// spawn, and calls through function values. Per-function summaries (which
+// parameters a function outputs, which reach its result, whether it outputs
+// at all) are inferred to a fixpoint; code under a branch or loop on a secret
+// carries the secret. src/secrecy.rs explains the rules;
+// docs/guides/secrets.md explains the design.
+//
+// Adaptations from Rust:
+// 1. Label (BTreeSet<Origin>) -> sorted Vec<i64>: -1 = Secret, i = Param(i)
+//    (the same order Rust derives: Secret before every Param)
+// 2. HashMap<String, _> -> core HashMap (str -> index + 1) over Vecs
+//
+// Dependencies: compiler::ast, compiler::escape (identifier walker)
+
+module compiler::secrecy;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::escape;
+
+pub struct SecSummary {
+    pub leaks: Vec<i64>,
+    pub returns: Vec<i64>,
+    pub outputs: bool,
+}
+
+pub struct SecFunc {
+    pub key: str,
+    pub func: Func,
+}
+
+pub struct SecrecyChecker {
+    pub all: Vec<SecFunc>,
+    pub func_index: i64,        // HashMap: key -> index + 1 into all
+    pub method_index: i64,      // HashMap: method name -> index + 1 into method_keys
+    pub method_keys: Vec<Vec<str>>,
+    pub globals: i64,           // HashMap: global or const name -> 1
+    pub summary_index: i64,     // HashMap: key -> index + 1 into summaries
+    pub summaries: Vec<SecSummary>,
+    // Per-function state; labels are flow-insensitive.
+    pub var_index: i64,         // HashMap: name -> index + 1 into var_labels
+    pub var_labels: Vec<Vec<i64>>,
+    pub ref_params: Vec<str>,
+    pub pc: Vec<Vec<i64>>,
+    pub func_name: str,
+    pub may_return_secret: bool,
+    pub declassify: bool,
+    pub cur_leaks: Vec<i64>,
+    pub cur_returns: Vec<i64>,
+    pub cur_outputs: bool,
+    pub changed: bool,
+    pub line: i64,
+    pub report: bool,
+    pub errors: Vec<str>,
+}
+
+// --- Labels ---------------------------------------------------------------
+
+fn sec_union(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    var j: i64 = 0;
+    while i < a.len() || j < b.len() {
+        if j >= b.len() || (i < a.len() && a.get(i) < b.get(j)) {
+            out.push(a.get(i));
+            i = i + 1;
+        } else if i >= a.len() || b.get(j) < a.get(i) {
+            out.push(b.get(j));
+            j = j + 1;
+        } else {
+            out.push(a.get(i));
+            i = i + 1;
+            j = j + 1;
+        }
+    }
+    return out;
+}
+
+fn sec_has(l: Vec<i64>, x: i64) -> bool {
+    var i: i64 = 0;
+    while i < l.len() {
+        if l.get(i) == x { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn sec_one(x: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(x);
+    return out;
+}
+
+fn sec_none() -> Vec<i64> {
+    return Vec::new();
+}
+
+fn sec_is_output_sink(name: str) -> bool {
+    return name == "print" || name == "println" || name == "eprint" || name == "eprintln"
+        || name == "p_print_int" || name == "p_print_str" || name == "p_print_float" || name == "p_print_bool" || name == "p_print_newline"
+        || name == "p_eprint_str" || name == "p_print_vec"
+        || name == "p_socket_send" || name == "p_socket_send_str" || name == "p_http_send_response"
+        || name == "p_file_write" || name == "p_file_append" || name == "p_file_write_bin"
+        || name == "log_info" || name == "log_warn" || name == "log_error" || name == "log_debug"
+        || name == "p_chan_send";
+}
+
+/// Methods that read their receiver without storing their arguments in it.
+fn sec_read_only_method(name: str) -> bool {
+    return name == "get" || name == "len" || name == "is_empty" || name == "contains" || name == "index_of" || name == "find"
+        || name == "starts_with" || name == "ends_with" || name == "first" || name == "last" || name == "eq" || name == "cmp"
+        || name == "compare" || name == "to_str" || name == "to_string" || name == "clone" || name == "get_or";
+}
+
+fn sec_has_annotation(anns: Vec<Annotation>, name: str) -> bool {
+    var i: i64 = 0;
+    while i < anns.len() {
+        if anns.get(i).name == name { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// --- Setup ----------------------------------------------------------------
+
+pub fn SecrecyChecker_new(program: Program) -> SecrecyChecker {
+    var all: Vec<SecFunc> = Vec::new();
+    var i: i64 = 0;
+    while i < program.funcs.len() {
+        var f: Func = program.funcs.get(i);
+        all.push(SecFunc { key: f.name, func: f });
+        i = i + 1;
+    }
+    var ii: i64 = 0;
+    while ii < program.impls.len() {
+        var imp: ImplDef = program.impls.get(ii);
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            var m: Func = imp.methods.get(mi);
+            all.push(SecFunc { key: imp.struct_name + "_" + m.name, func: m });
+            mi = mi + 1;
+        }
+        ii = ii + 1;
+    }
+    var ti: i64 = 0;
+    while ti < program.trait_impls.len() {
+        var timp: TraitImpl = program.trait_impls.get(ti);
+        var tmi: i64 = 0;
+        while tmi < timp.methods.len() {
+            var tm: Func = timp.methods.get(tmi);
+            all.push(SecFunc { key: timp.type_name + "_" + tm.name, func: tm });
+            tmi = tmi + 1;
+        }
+        ti = ti + 1;
+    }
+    var func_index: i64 = HashMap_new();
+    var method_index: i64 = HashMap_new();
+    var method_keys: Vec<Vec<str>> = Vec::new();
+    var k: i64 = 0;
+    while k < all.len() {
+        var key: str = all.get(k).key;
+        if HashMap_get(func_index, key) == 0 {
+            HashMap_insert(func_index, key, k + 1);
+        }
+        var p: i64 = 0;
+        while p < str_len(key) {
+            if str_byte_at(key, p) == 95 {
+                var suffix: str = str_slice(key, p + 1, str_len(key));
+                var slot: i64 = HashMap_get(method_index, suffix);
+                if slot == 0 {
+                    method_keys.push(Vec::new());
+                    slot = method_keys.len();
+                    HashMap_insert(method_index, suffix, slot);
+                }
+                var keys: Vec<str> = method_keys.get(slot - 1);
+                keys.push(key);
+            }
+            p = p + 1;
+        }
+        k = k + 1;
+    }
+    var globals: i64 = HashMap_new();
+    var gi: i64 = 0;
+    while gi < program.globals.len() {
+        HashMap_insert(globals, program.globals.get(gi).name, 1);
+        gi = gi + 1;
+    }
+    var ci: i64 = 0;
+    while ci < program.consts.len() {
+        HashMap_insert(globals, program.consts.get(ci).name, 1);
+        ci = ci + 1;
+    }
+    return SecrecyChecker {
+        all: all,
+        func_index: func_index,
+        method_index: method_index,
+        method_keys: method_keys,
+        globals: globals,
+        summary_index: HashMap_new(),
+        summaries: Vec::new(),
+        var_index: HashMap_new(),
+        var_labels: Vec::new(),
+        ref_params: Vec::new(),
+        pc: Vec::new(),
+        func_name: "",
+        may_return_secret: false,
+        declassify: false,
+        cur_leaks: Vec::new(),
+        cur_returns: Vec::new(),
+        cur_outputs: false,
+        changed: false,
+        line: 0,
+        report: false,
+        errors: Vec::new(),
+    };
+}
+
+fn sec_error(self: &mut SecrecyChecker, msg: str) {
+    if self.report {
+        var full: str = "Security error (@secret) (line " + int_to_str(self.line) + "): in '" + self.func_name + "', " + msg;
+        if !str_vec_contains(self.errors, full) {
+            self.errors.push(full);
+        }
+    }
+}
+
+fn sec_summary(self: &SecrecyChecker, key: str) -> SecSummary {
+    var slot: i64 = HashMap_get(self.summary_index, key);
+    if slot == 0 {
+        var empty: Vec<i64> = Vec::new();
+        var empty2: Vec<i64> = Vec::new();
+        return SecSummary { leaks: empty, returns: empty2, outputs: false };
+    }
+    return self.summaries.get(slot - 1);
+}
+
+fn sec_set_summary(self: &mut SecrecyChecker, key: str, s: SecSummary) {
+    var slot: i64 = HashMap_get(self.summary_index, key);
+    if slot == 0 {
+        self.summaries.push(s);
+        HashMap_insert(self.summary_index, key, self.summaries.len());
+    } else {
+        self.summaries.set(slot - 1, s);
+    }
+}
+
+// A number that grows whenever any summary grows (summaries only grow).
+fn sec_summary_total(self: &SecrecyChecker) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < self.summaries.len() {
+        var s: SecSummary = self.summaries.get(i);
+        n = n + s.leaks.len() + s.returns.len();
+        if s.outputs { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// --- Variables and context ------------------------------------------------
+
+fn sec_var(self: &SecrecyChecker, name: str) -> Vec<i64> {
+    var slot: i64 = HashMap_get(self.var_index, name);
+    if slot == 0 { return sec_none(); }
+    return self.var_labels.get(slot - 1);
+}
+
+fn sec_has_var(self: &SecrecyChecker, name: str) -> bool {
+    return HashMap_get(self.var_index, name) != 0;
+}
+
+/// Give `name` (at least) the label `l`.
+fn sec_assign(self: &mut SecrecyChecker, name: str, l: Vec<i64>) {
+    var slot: i64 = HashMap_get(self.var_index, name);
+    if slot == 0 {
+        self.var_labels.push(l);
+        HashMap_insert(self.var_index, name, self.var_labels.len());
+        if l.len() > 0 { self.changed = true; }
+        return;
+    }
+    var before: Vec<i64> = self.var_labels.get(slot - 1);
+    var merged: Vec<i64> = sec_union(before, l);
+    if merged.len() != before.len() {
+        self.var_labels.set(slot - 1, merged);
+        self.changed = true;
+    }
+}
+
+fn sec_pc(self: &SecrecyChecker) -> Vec<i64> {
+    if self.pc.len() == 0 { return sec_none(); }
+    return self.pc.get(self.pc.len() - 1);
+}
+
+fn sec_push_pc(self: &mut SecrecyChecker, extra: Vec<i64>) {
+    var next: Vec<i64> = sec_union(sec_pc(self), extra);
+    self.pc.push(next);
+}
+
+fn sec_pop_pc(self: &mut SecrecyChecker) {
+    self.pc.pop();
+}
+
+fn sec_note_leak(self: &mut SecrecyChecker, i: i64) {
+    if !sec_has(self.cur_leaks, i) {
+        self.cur_leaks = sec_union(self.cur_leaks, sec_one(i));
+        self.changed = true;
+    }
+}
+
+fn sec_note_output(self: &mut SecrecyChecker) {
+    if !self.cur_outputs {
+        self.cur_outputs = true;
+        self.changed = true;
+    }
+}
+
+/// `data` reaches the output `what` while the code runs under `pc`.
+fn sec_sink(self: &mut SecrecyChecker, what: str, data: Vec<i64>, pc: Vec<i64>) {
+    sec_note_output(self);
+    if sec_has(data, -1) {
+        sec_error(self, "a secret value reaches " + what);
+    } else if sec_has(pc, -1) {
+        sec_error(self, what + " runs inside a branch or loop that depends on a secret");
+    }
+    var both: Vec<i64> = sec_union(data, pc);
+    var i: i64 = 0;
+    while i < both.len() {
+        if both.get(i) >= 0 { sec_note_leak(self, both.get(i)); }
+        i = i + 1;
+    }
+}
+
+fn sec_ret(self: &mut SecrecyChecker, l: Vec<i64>) {
+    if self.declassify { return; }
+    var i: i64 = 0;
+    while i < l.len() {
+        var o: i64 = l.get(i);
+        if o >= 0 {
+            if !sec_has(self.cur_returns, o) {
+                self.cur_returns = sec_union(self.cur_returns, sec_one(o));
+                self.changed = true;
+            }
+        } else if !self.may_return_secret {
+            sec_error(self, "returns a secret value; mark the function @secret (callers keep its result secret) or @declassify (an audited release)");
+        }
+        i = i + 1;
+    }
+}
+
+// --- Functions ------------------------------------------------------------
+
+fn sec_analyze_func(self: &mut SecrecyChecker, key: str, f: Func) {
+    self.func_name = f.name;
+    self.line = 0;
+    self.may_return_secret = sec_has_annotation(f.annotations, "secret");
+    self.declassify = sec_has_annotation(f.annotations, "declassify");
+    var prev: SecSummary = sec_summary(self, key);
+    self.cur_leaks = prev.leaks;
+    self.cur_returns = prev.returns;
+    self.cur_outputs = prev.outputs;
+    self.var_index = HashMap_new();
+    var no_labels: Vec<Vec<i64>> = Vec::new();
+    self.var_labels = no_labels;
+    var no_refs: Vec<str> = Vec::new();
+    self.ref_params = no_refs;
+    var i: i64 = 0;
+    while i < f.params.len() {
+        var p: Param = f.params.get(i);
+        if sec_has_annotation(p.annotations, "secret") {
+            sec_assign(self, p.name, sec_one(-1));
+        } else {
+            sec_assign(self, p.name, sec_one(i));
+        }
+        match p.ty {
+            Type::Ref(_, _) => { self.ref_params.push(p.name); }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    var is_void: bool = false;
+    match f.ret_ty {
+        Type::Void => { is_void = true; }
+        _ => {}
+    }
+    // Labels only grow, so a few passes reach the function's fixpoint.
+    var pass: i64 = 0;
+    while pass < 8 {
+        self.changed = false;
+        var no_pc: Vec<Vec<i64>> = Vec::new();
+        self.pc = no_pc;
+        var tail: Vec<i64> = sec_stmts_value(self, f.body);
+        if !is_void { sec_ret(self, tail); }
+        if !self.changed { pass = 8; }
+        pass = pass + 1;
+    }
+    sec_set_summary(self, key, SecSummary { leaks: self.cur_leaks, returns: self.cur_returns, outputs: self.cur_outputs });
+}
+
+// --- Statements -----------------------------------------------------------
+
+fn sec_stmts(self: &mut SecrecyChecker, stmts: Vec<Stmt>) {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        sec_stmt(self, stmts.get(i));
+        i = i + 1;
+    }
+}
+
+/// Process `stmts` and return the label of their value (the last statement's).
+fn sec_stmts_value(self: &mut SecrecyChecker, stmts: Vec<Stmt>) -> Vec<i64> {
+    var n: i64 = stmts.len();
+    if n == 0 { return sec_none(); }
+    var i: i64 = 0;
+    while i < n - 1 {
+        sec_stmt(self, stmts.get(i));
+        i = i + 1;
+    }
+    var last: Stmt = stmts.get(n - 1);
+    self.line = stmt_line(last);
+    match last {
+        Stmt::Expr(e, _) => { return sec_expr(self, e); }
+        Stmt::If(cond, then_block, else_block, _) => {
+            var c: Vec<i64> = sec_expr(self, cond);
+            sec_push_pc(self, c);
+            var l: Vec<i64> = sec_stmts_value(self, then_block);
+            match else_block {
+                OptStmts::Some(b) => { l = sec_union(l, sec_stmts_value(self, b)); }
+                OptStmts::None => {}
+            }
+            sec_pop_pc(self);
+            return sec_union(l, c);
+        }
+        Stmt::Match(expr, arms, _) => {
+            var s: Vec<i64> = sec_expr(self, expr);
+            var ml: Vec<i64> = sec_arms(self, arms, s);
+            return sec_union(ml, s);
+        }
+        _ => {
+            sec_stmt(self, last);
+            return sec_none();
+        }
+    }
+    return sec_none();
+}
+
+fn sec_arms(self: &mut SecrecyChecker, arms: Vec<MatchArm>, scrutinee: Vec<i64>) -> Vec<i64> {
+    sec_push_pc(self, scrutinee);
+    var pc: Vec<i64> = sec_pc(self);
+    var out: Vec<i64> = Vec::new();
+    var ai: i64 = 0;
+    while ai < arms.len() {
+        var arm: MatchArm = arms.get(ai);
+        var bound: Vec<i64> = sec_union(scrutinee, pc);
+        match arm.pattern {
+            Pattern::Ident(name) => { sec_assign(self, name, bound); }
+            Pattern::EnumVariant(_, _, bindings) => {
+                var bi: i64 = 0;
+                while bi < bindings.len() {
+                    sec_assign(self, bindings.get(bi).name, bound);
+                    bi = bi + 1;
+                }
+            }
+            _ => {}
+        }
+        match arm.guard {
+            OptBoxExpr::Some(g) => { sec_expr(self, box_expr_deref(g)); }
+            OptBoxExpr::None => {}
+        }
+        out = sec_union(out, sec_stmts_value(self, arm.body));
+        ai = ai + 1;
+    }
+    sec_pop_pc(self);
+    return out;
+}
+
+/// The variable a place expression (`x`, `x.f`, `x[i]`, `*x`) writes into.
+fn sec_base_var(e: Expr) -> OptStr {
+    match e {
+        Expr::Ident(n) => { return OptStr::Some(n); }
+        Expr::FieldAccess(inner, _) => { return sec_base_var(box_expr_deref(inner)); }
+        Expr::OptionalFieldAccess(inner, _) => { return sec_base_var(box_expr_deref(inner)); }
+        Expr::Deref(inner) => { return sec_base_var(box_expr_deref(inner)); }
+        Expr::Index(array, _) => { return sec_base_var(box_expr_deref(array)); }
+        _ => { return OptStr::None; }
+    }
+    return OptStr::None;
+}
+
+/// `name` (directly or through a field, element or dereference) receives `l`.
+fn sec_store(self: &mut SecrecyChecker, name: str, l: Vec<i64>) {
+    if sec_has_var(self, name) || HashMap_get(self.globals, name) == 0 {
+        sec_assign(self, name, l);
+        if str_vec_contains(self.ref_params, name) && sec_has(l, -1) && !self.may_return_secret && !self.declassify {
+            // The caller sees what is written through a reference parameter.
+            sec_error(self, "writes a secret value through reference parameter '" + name + "'; mark the function @secret or @declassify");
+        }
+    } else {
+        sec_sink(self, "global '" + name + "'", l, sec_none());
+    }
+}
+
+fn sec_store_place(self: &mut SecrecyChecker, place: Expr, l: Vec<i64>) {
+    match sec_base_var(place) {
+        OptStr::Some(base) => { sec_store(self, base, l); }
+        OptStr::None => {}
+    }
+}
+
+fn sec_has_secret_annotation(anns: Vec<Annotation>) -> bool {
+    return sec_has_annotation(anns, "secret");
+}
+
+fn sec_stmt(self: &mut SecrecyChecker, s: Stmt) {
+    self.line = stmt_line(s);
+    var pc: Vec<i64> = sec_pc(self);
+    match s {
+        Stmt::Let(name, _, expr, _, _, annotations, _) => {
+            var l: Vec<i64> = sec_union(sec_expr(self, expr), pc);
+            if sec_has_secret_annotation(annotations) { l = sec_union(l, sec_one(-1)); }
+            sec_assign(self, name, l);
+        }
+        Stmt::LetTuple(names, expr, _) => {
+            var tl: Vec<i64> = sec_union(sec_expr(self, expr), pc);
+            var ni: i64 = 0;
+            while ni < names.len() {
+                sec_assign(self, names.get(ni), tl);
+                ni = ni + 1;
+            }
+        }
+        Stmt::LetUninit(name, _, annotations, _) => {
+            var ul: Vec<i64> = pc;
+            if sec_has_secret_annotation(annotations) { ul = sec_union(ul, sec_one(-1)); }
+            sec_assign(self, name, ul);
+        }
+        Stmt::Assign(target, _, expr, _) => {
+            var al: Vec<i64> = sec_union(sec_expr(self, expr), pc);
+            sec_store(self, target, al);
+        }
+        Stmt::IndexAssign(array, index, _, expr, _) => {
+            var il: Vec<i64> = sec_union(sec_expr(self, expr), pc);
+            il = sec_union(il, sec_expr(self, index));
+            sec_store(self, array, il);
+        }
+        Stmt::FieldAssign(object, _, _, expr, _) => {
+            sec_expr(self, object);
+            var fl: Vec<i64> = sec_union(sec_expr(self, expr), pc);
+            sec_store_place(self, object, fl);
+        }
+        Stmt::DerefAssign(ptr_expr, _, expr, _) => {
+            sec_expr(self, ptr_expr);
+            var dl: Vec<i64> = sec_union(sec_expr(self, expr), pc);
+            sec_store_place(self, ptr_expr, dl);
+        }
+        Stmt::Expr(e, _) => { sec_expr(self, e); }
+        Stmt::Return(value, _) => {
+            match value {
+                OptBoxExpr::Some(e) => {
+                    var rl: Vec<i64> = sec_union(sec_expr(self, box_expr_deref(e)), pc);
+                    sec_ret(self, rl);
+                }
+                OptBoxExpr::None => {}
+            }
+        }
+        Stmt::Break(value, _) => {
+            match value {
+                OptBoxExpr::Some(e) => { sec_expr(self, box_expr_deref(e)); }
+                OptBoxExpr::None => {}
+            }
+        }
+        Stmt::If(cond, then_block, else_block, _) => {
+            var c: Vec<i64> = sec_expr(self, cond);
+            sec_push_pc(self, c);
+            sec_stmts(self, then_block);
+            match else_block {
+                OptStmts::Some(b) => { sec_stmts(self, b); }
+                OptStmts::None => {}
+            }
+            sec_pop_pc(self);
+        }
+        Stmt::While(cond, body, _) => {
+            var wc: Vec<i64> = sec_expr(self, cond);
+            sec_push_pc(self, wc);
+            sec_stmts(self, body);
+            sec_pop_pc(self);
+        }
+        Stmt::For(var_name, iterator, body, _) => {
+            var it: Vec<i64> = sec_expr(self, iterator);
+            sec_assign(self, var_name, sec_union(it, pc));
+            // The number of iterations depends on the iterator.
+            sec_push_pc(self, it);
+            sec_stmts(self, body);
+            sec_pop_pc(self);
+        }
+        Stmt::Match(expr, arms, _) => {
+            var ml: Vec<i64> = sec_expr(self, expr);
+            sec_arms(self, arms, ml);
+        }
+        Stmt::Loop(body, _) => { sec_stmts(self, body); }
+        Stmt::Defer(body, _) => { sec_stmts(self, body); }
+        Stmt::Unsafe(body, _) => { sec_stmts(self, body); }
+        Stmt::Sandbox(body, _) => { sec_stmts(self, body); }
+        Stmt::Txn(body, _) => { sec_stmts(self, body); }
+        Stmt::Handle(body, _, _) => { sec_stmts(self, body); }
+        Stmt::RegionBlock(_, _, _, _, _, body, _) => { sec_stmts(self, body); }
+        Stmt::SpawnScope(body, _) => { sec_stmts(self, body); }
+        Stmt::Query(_, body, _) => { sec_stmts(self, body); }
+        Stmt::GradBlock(_, body, _) => { sec_stmts(self, body); }
+        Stmt::Parallel(branches, _) => {
+            var bi: i64 = 0;
+            while bi < branches.len() {
+                sec_stmts(self, branches.get(bi));
+                bi = bi + 1;
+            }
+        }
+        Stmt::Select(cases, default, _) => {
+            var ci: i64 = 0;
+            while ci < cases.len() {
+                var c2: SelectCase = cases.get(ci);
+                var chl: Vec<i64> = sec_expr(self, c2.channel);
+                sec_assign(self, c2.var_name, sec_union(chl, pc));
+                sec_stmts(self, c2.body);
+                ci = ci + 1;
+            }
+            match default {
+                OptStmts::Some(d) => { sec_stmts(self, d); }
+                OptStmts::None => {}
+            }
+        }
+        Stmt::Do(_, _, args, _) => { sec_exprs(self, args); }
+        Stmt::Resume(cont, value, _) => {
+            sec_expr(self, cont);
+            sec_expr(self, value);
+        }
+        Stmt::Backward(loss, _) => { sec_expr(self, loss); }
+        _ => {}
+    }
+}
+
+// --- Expressions ----------------------------------------------------------
+
+fn sec_exprs(self: &mut SecrecyChecker, es: Vec<Expr>) -> Vec<Vec<i64>> {
+    var out: Vec<Vec<i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < es.len() {
+        out.push(sec_expr(self, es.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn sec_union_all(ls: Vec<Vec<i64>>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < ls.len() {
+        out = sec_union(out, ls.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn sec_expr2(self: &mut SecrecyChecker, a: Box<Expr>, b: Box<Expr>) -> Vec<i64> {
+    var l: Vec<i64> = sec_expr(self, box_expr_deref(a));
+    return sec_union(l, sec_expr(self, box_expr_deref(b)));
+}
+
+fn sec_expr(self: &mut SecrecyChecker, e: Expr) -> Vec<i64> {
+    match e {
+        Expr::Ident(n) => { return sec_var(self, n); }
+        Expr::Binary(_, l, r) => { return sec_expr2(self, l, r); }
+        Expr::StrConcat(l, r) => { return sec_expr2(self, l, r); }
+        Expr::Range(l, r, _) => { return sec_expr2(self, l, r); }
+        Expr::Coalesce(l, r) => { return sec_expr2(self, l, r); }
+        Expr::PipeForward(l, r) => { return sec_expr2(self, l, r); }
+        Expr::Index(l, r) => { return sec_expr2(self, l, r); }
+        Expr::Unary(_, x) => { return sec_expr(self, box_expr_deref(x)); }
+        Expr::FieldAccess(x, _) => { return sec_expr(self, box_expr_deref(x)); }
+        Expr::OptionalFieldAccess(x, _) => { return sec_expr(self, box_expr_deref(x)); }
+        Expr::Ref(x, _) => { return sec_expr(self, box_expr_deref(x)); }
+        Expr::Deref(x) => { return sec_expr(self, box_expr_deref(x)); }
+        Expr::Try(x) => { return sec_expr(self, box_expr_deref(x)); }
+        Expr::IsCheck(x, _) => { return sec_expr(self, box_expr_deref(x)); }
+        Expr::Cast(x, _) => { return sec_expr(self, box_expr_deref(x)); }
+        Expr::QuantCast(x, _) => { return sec_expr(self, box_expr_deref(x)); }
+        Expr::Await(x) => { return sec_expr(self, box_expr_deref(x)); }
+        Expr::NamedArg(_, x) => { return sec_expr(self, box_expr_deref(x)); }
+        Expr::Spawn(x) => {
+            var task: Expr = box_expr_deref(x);
+            var sl: Vec<i64> = sec_expr(self, task);
+            match task {
+                Expr::Call(_, args) => { sl = sec_union(sl, sec_union_all(sec_exprs(self, args))); }
+                _ => {}
+            }
+            sec_sink(self, "another task (spawn)", sl, sec_pc(self));
+            return sec_none();
+        }
+        Expr::Call(callee, args) => { return sec_call(self, callee, args); }
+        Expr::MethodCall(receiver, method, args) => { return sec_method_call(self, box_expr_deref(receiver), method, args); }
+        Expr::StructLit(_, fields, spread) => {
+            var fl: Vec<i64> = Vec::new();
+            var fi: i64 = 0;
+            while fi < fields.len() {
+                fl = sec_union(fl, sec_expr(self, fields.get(fi).value));
+                fi = fi + 1;
+            }
+            match spread {
+                OptBoxExpr::Some(sp) => { fl = sec_union(fl, sec_expr(self, box_expr_deref(sp))); }
+                OptBoxExpr::None => {}
+            }
+            return fl;
+        }
+        Expr::EnumLit(_, _, args) => { return sec_union_all(sec_exprs(self, args)); }
+        Expr::TupleLit(args) => { return sec_union_all(sec_exprs(self, args)); }
+        Expr::ArrayLit(_, args) => { return sec_union_all(sec_exprs(self, args)); }
+        Expr::If(cond, then_block, else_block) => {
+            var c: Vec<i64> = sec_expr(self, box_expr_deref(cond));
+            sec_push_pc(self, c);
+            var il: Vec<i64> = sec_stmts_value(self, then_block);
+            match else_block {
+                OptStmts::Some(b) => { il = sec_union(il, sec_stmts_value(self, b)); }
+                OptStmts::None => {}
+            }
+            sec_pop_pc(self);
+            return sec_union(il, c);
+        }
+        Expr::Match(x, arms) => {
+            var s: Vec<i64> = sec_expr(self, box_expr_deref(x));
+            var ml: Vec<i64> = sec_arms(self, arms, s);
+            return sec_union(ml, s);
+        }
+        Expr::Block(b) => { return sec_stmts_value(self, b); }
+        Expr::TryBlock(b) => { return sec_stmts_value(self, b); }
+        Expr::Closure(params, body, _) => { return sec_closure(self, params, body); }
+        Expr::FString(parts) => {
+            var pl: Vec<i64> = Vec::new();
+            var pi: i64 = 0;
+            while pi < parts.len() {
+                var part: FStringPart = parts.get(pi);
+                match part {
+                    FStringPart::Expr(x2) => { pl = sec_union(pl, sec_expr(self, x2)); }
+                    FStringPart::Literal(_) => {}
+                }
+                pi = pi + 1;
+            }
+            return pl;
+        }
+        _ => { return sec_none(); }
+    }
+    return sec_none();
+}
+
+fn sec_closure(self: &mut SecrecyChecker, params: Vec<Param>, body: Vec<Stmt>) -> Vec<i64> {
+    // The body runs where the closure is called; check it here with the
+    // captured labels, and give the closure those labels.
+    var used: Vec<str> = Vec::new();
+    esc_idents_stmts(body, used);
+    var captured: Vec<i64> = Vec::new();
+    var ui: i64 = 0;
+    while ui < used.len() {
+        var name: str = used.get(ui);
+        var is_param: bool = false;
+        var pi: i64 = 0;
+        while pi < params.len() {
+            if params.get(pi).name == name { is_param = true; }
+            pi = pi + 1;
+        }
+        if !is_param && sec_has_var(self, name) {
+            captured = sec_union(captured, sec_var(self, name));
+        }
+        ui = ui + 1;
+    }
+    var saved_returns: Vec<i64> = self.cur_returns;
+    var saved_secret: bool = self.may_return_secret;
+    var saved_declassify: bool = self.declassify;
+    // A closure's `return` is its own, not the function's.
+    self.may_return_secret = true;
+    self.declassify = false;
+    sec_stmts_value(self, body);
+    self.cur_returns = saved_returns;
+    self.may_return_secret = saved_secret;
+    self.declassify = saved_declassify;
+    return captured;
+}
+
+fn sec_call(self: &mut SecrecyChecker, callee: str, args: Vec<Expr>) -> Vec<i64> {
+    var ls: Vec<Vec<i64>> = sec_exprs(self, args);
+    var all: Vec<i64> = sec_union_all(ls);
+    var pc: Vec<i64> = sec_pc(self);
+    if sec_is_output_sink(callee) {
+        sec_sink(self, "output '" + callee + "'", all, pc);
+        return sec_none();
+    }
+    // A function value: it could output its arguments.
+    if sec_has_var(self, callee) {
+        var fl: Vec<i64> = sec_var(self, callee);
+        sec_sink(self, "a call through the function value '" + callee + "'", all, pc);
+        return sec_union(fl, all);
+    }
+    var slot: i64 = HashMap_get(self.func_index, callee);
+    if slot == 0 {
+        // A builtin computes its result from its arguments.
+        return all;
+    }
+    var f: Func = self.all.get(slot - 1).func;
+    return sec_apply_summary(self, callee, f, sec_summary(self, callee), ls, pc);
+}
+
+/// Apply callee `f`'s summary to argument labels `ls` (`ls[i]` is parameter `i`).
+fn sec_apply_summary(self: &mut SecrecyChecker, name: str, f: Func, summ: SecSummary, ls: Vec<Vec<i64>>, pc: Vec<i64>) -> Vec<i64> {
+    var li: i64 = 0;
+    while li < summ.leaks.len() {
+        var i: i64 = summ.leaks.get(li);
+        if i < ls.len() {
+            var l: Vec<i64> = ls.get(i);
+            var pname: str = "";
+            if i < f.params.len() { pname = f.params.get(i).name; }
+            if sec_has(l, -1) {
+                sec_error(self, "a secret value is passed to '" + name + "', which outputs its parameter '" + pname + "'");
+            }
+            var oi: i64 = 0;
+            while oi < l.len() {
+                if l.get(oi) >= 0 { sec_note_leak(self, l.get(oi)); }
+                oi = oi + 1;
+            }
+        }
+        li = li + 1;
+    }
+    if summ.outputs {
+        sec_note_output(self);
+        if sec_has(pc, -1) {
+            sec_error(self, "'" + name + "' produces output and is called inside a branch or loop that depends on a secret");
+        }
+        var pi: i64 = 0;
+        while pi < pc.len() {
+            if pc.get(pi) >= 0 { sec_note_leak(self, pc.get(pi)); }
+            pi = pi + 1;
+        }
+    }
+    var out: Vec<i64> = Vec::new();
+    var ri: i64 = 0;
+    while ri < summ.returns.len() {
+        var r: i64 = summ.returns.get(ri);
+        if r < ls.len() { out = sec_union(out, ls.get(r)); }
+        ri = ri + 1;
+    }
+    if sec_has_annotation(f.annotations, "secret") { out = sec_union(out, sec_one(-1)); }
+    if sec_has_annotation(f.annotations, "declassify") { out = sec_none(); }
+    return out;
+}
+
+fn sec_method_call(self: &mut SecrecyChecker, receiver: Expr, method: str, args: Vec<Expr>) -> Vec<i64> {
+    var recv: Vec<i64> = sec_expr(self, receiver);
+    var ls: Vec<Vec<i64>> = Vec::new();
+    ls.push(recv);
+    var argls: Vec<Vec<i64>> = sec_exprs(self, args);
+    var ai: i64 = 0;
+    while ai < argls.len() {
+        ls.push(argls.get(ai));
+        ai = ai + 1;
+    }
+    var all: Vec<i64> = sec_union_all(ls);
+    var pc: Vec<i64> = sec_pc(self);
+    var keys: Vec<str> = Vec::new();
+    var mslot: i64 = HashMap_get(self.method_index, method);
+    if mslot != 0 { keys = self.method_keys.get(mslot - 1); }
+    // A method may store its arguments into its receiver.
+    if !sec_read_only_method(method) {
+        var stored: Vec<i64> = sec_union(sec_union_all(argls), pc);
+        if stored.len() > 0 { sec_store_place(self, receiver, stored); }
+    }
+    if keys.len() == 0 {
+        if method == "send" {
+            sec_sink(self, "a channel or socket ('send')", all, pc);
+        }
+        return all;
+    }
+    var out: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < keys.len() {
+        var key: str = keys.get(k);
+        var f: Func = self.all.get(HashMap_get(self.func_index, key) - 1).func;
+        out = sec_union(out, sec_apply_summary(self, method, f, sec_summary(self, key), ls, pc));
+        k = k + 1;
+    }
+    return out;
+}
+
+// --- Entry point ----------------------------------------------------------
+
+/// Run the @secret check over every function of `program`.
+pub fn secrecy_check(program: Program) -> Vec<str> {
+    var c: SecrecyChecker = SecrecyChecker_new(program);
+    var before: i64 = -1;
+    while before != sec_summary_total(&c) {
+        before = sec_summary_total(&c);
+        var i: i64 = 0;
+        while i < c.all.len() {
+            var sf: SecFunc = c.all.get(i);
+            sec_analyze_func(&mut c, sf.key, sf.func);
+            i = i + 1;
+        }
+    }
+    c.report = true;
+    var j: i64 = 0;
+    while j < c.all.len() {
+        var sf2: SecFunc = c.all.get(j);
+        sec_analyze_func(&mut c, sf2.key, sf2.func);
+        j = j + 1;
+    }
+    return c.errors;
+}
