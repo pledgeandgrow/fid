@@ -1,5 +1,37 @@
 # Fides Language Changelog
 
+## Session 28 — Branch Consolidation (Oct 24, 2026)
+
+All work is now on `main`: `release-infra` ("Stabilise for release V2") was
+merged on top of the soundness pass (merge commit `63e88f4`), and the
+`soundness-pass`, `release-infra` and agent branches were retired.
+
+### Merge notes
+
+- Conflicts in 10 compiler modules (`arm64_enc`, `coff`, `compiler`, `elf64`,
+  `lexer`, `linker`, `macho`, `opt`, `pe`, `runtime_arm64`) were all places
+  where `main` had only rewritten code mechanically while `release-infra`
+  restructured it. Took `release-infra`'s version and re-applied the
+  mechanical rewrites to its code: 15 `Vec` parameters made by-value, 92 call
+  sites no longer pass `&mut`, 82 `str_equal` calls converted to `==`.
+- Verified: the compiler type-checks with 0 errors; all 2,813 string
+  comparisons in the compiler still lower to `p_str_equal`; the type-check
+  sweep of `tests/` and `examples/` has no regressions (failing files 75 → 70);
+  `fidesc test` (interp / C / PE) matches the pre-merge compiler (C: 200 → 202).
+
+### Bugs fixed (included in the merge commit)
+
+| Bug | Fix |
+|-----|-----|
+| Self-hosted C backend emitted `(double)p_vec_get(...)` (pointer cast to `double`, invalid C) when a `Vec<f64>` element was read, so the self-hosted compiler could not rebuild itself at stage 2 | A `void*`-returning call into an `f64`/`f32` destination type-puns the bit pattern via `intptr_t`, like the `int64_t` case (`compiler/codegen_c.fd`) |
+| A `break` inside `unsafe`/`sandbox`/`txn`/`handle`/region/`spawn scope` blocks was not seen by the missing-return check, so `loop { unsafe { break; } }` could fall off the end of a non-void function | `has_break` / `stmts_have_break` descend into those blocks (both type checkers); new expected-fail test `test_missing_return_break_fail` |
+
+### Known issue found
+
+- `Vec<f64>` elements are stored as raw bit patterns: `println(v[0])` prints
+  the bits (interpreter and C), and in the C backend `val x: f64 = v[0]` holds
+  the wrong value. Belongs to R1.4 (layout-aware `Vec<T>`).
+
 ## Session 27 — Soundness Pass & v1.1 Start (Oct 23, 2026)
 
 ### Summary
