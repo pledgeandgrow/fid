@@ -149,7 +149,7 @@ pub fn c_type(ty: IrType) -> str {
         IrType::Bool => { return "bool"; }
         IrType::Ptr(_) => { return "void*"; }
         IrType::Struct(name) => { return "struct " + name + "_s*"; }
-        IrType::Array(elem, size) => { return c_type(box_ir_type_unbox(elem)) + "[" + int_to_str(size) + "]"; }
+        IrType::Array(elem, size) => { return c_type(cc_box_ir_type_unbox(elem)) + "[" + int_to_str(size) + "]"; }
         IrType::Void => { return "void"; }
         IrType::Never => { return "void"; }
         IrType::Opaque(name) => {
@@ -183,7 +183,7 @@ pub fn c_type_global(ty: IrType) -> str {
         IrType::Bool => { return "bool"; }
         IrType::Ptr(_) => { return "void*"; }
         IrType::Struct(name) => { return "struct " + name + "_s"; }
-        IrType::Array(elem, size) => { return c_type_global(box_ir_type_unbox(elem)) + "[" + int_to_str(size) + "]"; }
+        IrType::Array(elem, size) => { return c_type_global(cc_box_ir_type_unbox(elem)) + "[" + int_to_str(size) + "]"; }
         IrType::Void => { return "void"; }
         IrType::Never => { return "void"; }
         IrType::Opaque(name) => {
@@ -201,11 +201,35 @@ pub fn c_type_global(ty: IrType) -> str {
 }
 
 // Box<IrType> unbox helper
+pub fn cc_box_ir_type_unbox(b: Box<IrType>) -> IrType {
+    match b {
+        IrType::I8 => { return IrType::I8; }
+        IrType::I16 => { return IrType::I16; }
+        IrType::I32 => { return IrType::I32; }
+        IrType::I64 => { return IrType::I64; }
+        IrType::U8 => { return IrType::U8; }
+        IrType::U16 => { return IrType::U16; }
+        IrType::U32 => { return IrType::U32; }
+        IrType::U64 => { return IrType::U64; }
+        IrType::F32 => { return IrType::F32; }
+        IrType::F64 => { return IrType::F64; }
+        IrType::Bool => { return IrType::Bool; }
+        IrType::Ptr(inner) => { return IrType::Ptr(inner); }
+        IrType::Struct(name) => { return IrType::Struct(name); }
+        IrType::Array(elem, size) => { return IrType::Array(elem, size); }
+        IrType::Void => { return IrType::Void; }
+        IrType::Never => { return IrType::Never; }
+        IrType::Opaque(name) => { return IrType::Opaque(name); }
+        IrType::Generic(name, args) => { return IrType::Generic(name, args); }
+    }
+    return IrType::Void;
+}
+
 // Format a C parameter declaration with the variable name in the right position.
 fn c_param_decl(ty: IrType, name: str) -> str {
     match ty {
         IrType::Array(elem, size) => {
-            return c_type(box_ir_type_unbox(elem)) + " " + name + "[" + int_to_str(size) + "]";
+            return c_type(cc_box_ir_type_unbox(elem)) + " " + name + "[" + int_to_str(size) + "]";
         }
         _ => {
             return c_type(ty) + " " + name;
@@ -278,7 +302,7 @@ fn cast_arg(val: str, from: IrType, to: IrType) -> str {
     match to {
         IrType::Array(elem, _) => {
             to_is_array = true;
-            to_array_elem = box_ir_type_unbox(elem);
+            to_array_elem = cc_box_ir_type_unbox(elem);
         }
         _ => {}
     }
@@ -1226,6 +1250,40 @@ fn str_contains_char(chars: str, ch: i64) -> bool {
 }
 
 // Convert an AST type to a C type string
+pub fn cc_box_type_unbox(b: Box<Type>) -> Type {
+    match b {
+        Type::I8 => { return Type::I8; }
+        Type::I16 => { return Type::I16; }
+        Type::I32 => { return Type::I32; }
+        Type::I64 => { return Type::I64; }
+        Type::I128 => { return Type::I128; }
+        Type::U8 => { return Type::U8; }
+        Type::U16 => { return Type::U16; }
+        Type::U32 => { return Type::U32; }
+        Type::U64 => { return Type::U64; }
+        Type::U128 => { return Type::U128; }
+        Type::F32 => { return Type::F32; }
+        Type::F64 => { return Type::F64; }
+        Type::Bool => { return Type::Bool; }
+        Type::Str => { return Type::Str; }
+        Type::Void => { return Type::Void; }
+        Type::Never => { return Type::Never; }
+        Type::Infer => { return Type::Infer; }
+        Type::Named(n) => { return Type::Named(n); }
+        Type::Array(e, s) => { return Type::Array(e, s); }
+        Type::ArrayConst(e, s) => { return Type::ArrayConst(e, s); }
+        Type::Ref(e, m) => { return Type::Ref(e, m); }
+        Type::RawPtr(e, m) => { return Type::RawPtr(e, m); }
+        Type::Generic(n, a) => { return Type::Generic(n, a); }
+        Type::Tuple(a) => { return Type::Tuple(a); }
+        Type::Func(a, r) => { return Type::Func(a, r); }
+        Type::Assoc(a, b, c, d) => { return Type::Assoc(a, b, c, d); }
+        Type::Dyn(n) => { return Type::Dyn(n); }
+        Type::ShapedTensor(e, d) => { return Type::ShapedTensor(e, d); }
+    }
+    return Type::Void;
+}
+
 fn c_type_from_ast(ty: Type) -> str {
     match ty {
         Type::I8 => { return "int8_t"; }
@@ -1247,7 +1305,7 @@ fn c_type_from_ast(ty: Type) -> str {
             if n == "str" { return "const char*"; }
             return n;
         }
-        Type::Ref(inner, _) => { return c_type_from_ast(box_type_unbox(inner)) + "*"; }
+        Type::Ref(inner, _) => { return c_type_from_ast(cc_box_type_unbox(inner)) + "*"; }
         _ => { return "void*"; }
     }
     return "void*";
@@ -2470,7 +2528,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                     match ptr_meta_ty {
                         IrType::Ptr(inner) => {
                             // Use the pointee type for the store (matches Rust codegen)
-                            effective_ty = box_ir_type_unbox(inner);
+                            effective_ty = cc_box_ir_type_unbox(inner);
                         }
                         _ => {}
                     }
@@ -2532,7 +2590,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
             var offset: i64 = field_index * 8;
             match ptr_ty {
                 IrType::Ptr(inner) => {
-                    match box_ir_type_unbox(inner) {
+                    match cc_box_ir_type_unbox(inner) {
                         IrType::Struct(sn) => {
                             offset = lookup_field_offset(self, sn, field_index, offset);
                         }

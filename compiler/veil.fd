@@ -93,6 +93,15 @@ pub fn CoverageData_instruction_coverage_pct(self: &CoverageData) -> f64 {
     return 100.0 * (self.covered_instructions.len()) / (self.all_instructions.len());
 }
 
+fn vl_str_vec_contains(v: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == s { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
 fn line_vec_contains(v: Vec<CovLineEntry>, entry: CovLineEntry) -> bool {
     var en0: str = entry.a;
     var en1: i64 = entry.b;
@@ -142,6 +151,22 @@ fn float_to_str_1(f: f64) -> str {
     return int_to_str(whole) + "." + int_to_str(frac_int);
 }
 
+fn vl_str_rfind_char(s: str, ch: i64) -> i64 {
+    var i: i64 = str_len(s) - 1;
+    while i >= 0 {
+        if str_byte_at(s, i) == ch { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+fn vl_escape_html(s: str) -> str {
+    var result: str = str_replace(s, "&", "&" + "amp;");
+    result = str_replace(result, "<", "&" + "lt;");
+    result = str_replace(result, ">", "&" + "gt;");
+    return result;
+}
+
 fn summary_card(label: str, covered: i64, total: i64, pct: f64) -> str {
     var cls: str = "partial";
     if pct == 100.0 { cls = "full"; }
@@ -152,7 +177,7 @@ fn summary_card(label: str, covered: i64, total: i64, pct: f64) -> str {
 }
 
 pub fn CoverageData_mark_function_called(self: &mut CoverageData, name: str) -> void {
-    if !str_vec_contains(self.called_functions, name) {
+    if !vl_str_vec_contains(self.called_functions, name) {
         self.called_functions.push(name);
     }
 }
@@ -214,7 +239,7 @@ pub fn collect_all_coverage(module: IrModule) -> CoverageData {
         var name: str = entry.name;
         var func: IrFunction = entry.func;
 
-        if !str_vec_contains(data.all_functions, name) {
+        if !vl_str_vec_contains(data.all_functions, name) {
             data.all_functions.push(name);
         }
 
@@ -319,38 +344,27 @@ pub fn veil_run(input_path: str, format: str, output_dir: str) -> str {
         return "Cannot read " + input_path;
     }
 
-    var module_result: ResultIrModule = lower_to_ir_module(source);
-    var module: IrModule;
-    match module_result {
-        ResultIrModule::Ok(m) => { module = m; }
-        ResultIrModule::Err(errs) => {
-            var msg: str = "Compilation failed:";
-            var ei: i64 = 0;
-            while ei < errs.len() {
-                msg = msg + "\n" + errs.get(ei);
-                ei = ei + 1;
-            }
-            return msg;
-        }
+    var cov: CoverageRunResult = run_with_coverage(source, input_path);
+    var data: CoverageData = cov.data;
+    var status_line: str = "";
+    if cov.status != "ok" {
+        status_line = cov.status + "\n";
     }
 
-    var data: CoverageData = collect_all_coverage(module);
-    CoverageData_compute_func_counts(&mut data);
-
     var filename: str = input_path;
-    var slash: i64 = str_rfind_char(filename, 47);
+    var slash: i64 = vl_str_rfind_char(filename, 47);
     if slash >= 0 { filename = str_slice(filename, slash + 1, str_len(filename)); }
 
     if format == "html" {
         var html: str = generate_html_report(data, source, filename);
         var path: str = output_dir + "/coverage.html";
         p_file_write(path, html);
-        return "\nCoverage report: " + path;
+        return status_line + "\nCoverage report: " + path;
     } else {
         var text: str = generate_text_report(data, source);
         var path: str = output_dir + "/coverage.txt";
         p_file_write(path, text);
-        return text + "\n\nCoverage report: " + path;
+        return status_line + text + "\n\nCoverage report: " + path;
     }
 }
 
@@ -449,12 +463,12 @@ pub const COVERAGE_CSS: str = "body { font-family: -apple-system, BlinkMacSystem
 
 pub fn generate_html_report(data: &CoverageData, source: str, filename: str) -> str {
     var html: str = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n";
-    html = html + "<title>Coverage Report -- " + escape_html(filename) + "</title>\n";
+    html = html + "<title>Coverage Report -- " + vl_escape_html(filename) + "</title>\n";
     html = html + "<meta charset=\"utf-8\">\n";
     html = html + "<style>\n" + COVERAGE_CSS + "</style>\n";
     html = html + "</head>\n<body>\n";
     html = html + "<h1>Coverage Report</h1>\n";
-    html = html + "<p class=\"file\">" + escape_html(filename) + "</p>\n";
+    html = html + "<p class=\"file\">" + vl_escape_html(filename) + "</p>\n";
     html = html + "<div class=\"summary\">\n";
     html = html + summary_card("Functions", data.called_functions.len(), data.all_functions.len(), CoverageData_function_coverage_pct(data));
     html = html + summary_card("Lines", data.covered_lines.len(), data.all_lines.len(), CoverageData_line_coverage_pct(data));
@@ -473,7 +487,7 @@ pub fn generate_html_report(data: &CoverageData, source: str, filename: str) -> 
         var cls: str = "partial";
         if pct == 100.0 { cls = "full"; }
         else if pct == 0.0 { cls = "none"; }
-        html = html + "<tr class=\"" + cls + "\"><td>" + escape_html(name) + "</td><td>"
+        html = html + "<tr class=\"" + cls + "\"><td>" + vl_escape_html(name) + "</td><td>"
             + int_to_str(total) + "</td><td>" + int_to_str(covered) + "</td><td>"
             + float_to_str_1(pct) + "%</td></tr>\n";
         fi = fi + 1;
@@ -492,7 +506,7 @@ pub fn generate_html_report(data: &CoverageData, source: str, filename: str) -> 
             if is_covered { cls = "covered"; } else { cls = "uncovered"; }
         }
         html = html + "<span class=\"line " + cls + "\"><span class=\"lnum\">"
-            + int_to_str(line_num) + "</span> " + escape_html(lines.get(li)) + "</span>\n";
+            + int_to_str(line_num) + "</span> " + vl_escape_html(lines.get(li)) + "</span>\n";
         li = li + 1;
     }
     html = html + "</pre>\n";

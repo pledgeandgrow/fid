@@ -556,7 +556,11 @@ fn box_type_new(ty: Type) -> Box<Type> {
 
 // --- Box<Expr> constructor/deref helpers ---------------------------------
 
-pub fn box_expr_deref(b: Box<Expr>) -> Expr {
+pub fn mn_box_expr_new(e: Expr) -> Box<Expr> {
+    return Box::new(e);
+}
+
+pub fn mn_box_expr_deref(b: Box<Expr>) -> Expr {
     match b {
         Expr::IntLit(v) => { return Expr::IntLit(v); }
         Expr::FloatLit(v) => { return Expr::FloatLit(v); }
@@ -816,11 +820,11 @@ pub fn subst_expr(
         Expr::StringLit(s) => { return Expr::StringLit(s); }
         Expr::Binary(op, left, right) => {
             return Expr::Binary(op,
-                box_expr_new(subst_expr(box_expr_deref(left), subst, renames, method_renames)),
-                box_expr_new(subst_expr(box_expr_deref(right), subst, renames, method_renames)));
+                mn_box_expr_new(subst_expr(mn_box_expr_deref(left), subst, renames, method_renames)),
+                mn_box_expr_new(subst_expr(mn_box_expr_deref(right), subst, renames, method_renames)));
         }
         Expr::Unary(op, operand) => {
-            return Expr::Unary(op, box_expr_new(subst_expr(box_expr_deref(operand), subst, renames, method_renames)));
+            return Expr::Unary(op, mn_box_expr_new(subst_expr(mn_box_expr_deref(operand), subst, renames, method_renames)));
         }
         Expr::If(cond, then_block, else_block) => {
             var new_then: Vec<Stmt> = Vec::new();
@@ -843,7 +847,7 @@ pub fn subst_expr(
                 OptStmts::None => {}
             }
             return Expr::If(
-                box_expr_new(subst_expr(box_expr_deref(cond), subst, renames, method_renames)),
+                mn_box_expr_new(subst_expr(mn_box_expr_deref(cond), subst, renames, method_renames)),
                 new_then, new_else);
         }
         Expr::Block(stmts) => {
@@ -856,10 +860,10 @@ pub fn subst_expr(
             return Expr::Block(new_stmts);
         }
         Expr::FieldAccess(e, field) => {
-            return Expr::FieldAccess(box_expr_new(subst_expr(box_expr_deref(e), subst, renames, method_renames)), field);
+            return Expr::FieldAccess(mn_box_expr_new(subst_expr(mn_box_expr_deref(e), subst, renames, method_renames)), field);
         }
         Expr::OptionalFieldAccess(e, field) => {
-            return Expr::OptionalFieldAccess(box_expr_new(subst_expr(box_expr_deref(e), subst, renames, method_renames)), field);
+            return Expr::OptionalFieldAccess(mn_box_expr_new(subst_expr(mn_box_expr_deref(e), subst, renames, method_renames)), field);
         }
         Expr::MethodCall(receiver, method, args) => {
             // Check if this method call should be rewritten to a monomorphized function call
@@ -867,7 +871,7 @@ pub fn subst_expr(
                 OptStr::Some(mangled) => {
                     // Rewrite to a regular Call with receiver as first arg
                     var all_args: Vec<Expr> = Vec::new();
-                    all_args.push(subst_expr(box_expr_deref(receiver), subst, renames, method_renames));
+                    all_args.push(subst_expr(mn_box_expr_deref(receiver), subst, renames, method_renames));
                     var i: i64 = 0;
                     while i < args.len() {
                         all_args.push(subst_expr(args.get(i), subst, renames, method_renames));
@@ -883,7 +887,7 @@ pub fn subst_expr(
                         i = i + 1;
                     }
                     return Expr::MethodCall(
-                        box_expr_new(subst_expr(box_expr_deref(receiver), subst, renames, method_renames)),
+                        mn_box_expr_new(subst_expr(mn_box_expr_deref(receiver), subst, renames, method_renames)),
                         method, new_args);
                 }
             }
@@ -891,8 +895,8 @@ pub fn subst_expr(
         }
         Expr::Index(array, index) => {
             return Expr::Index(
-                box_expr_new(subst_expr(box_expr_deref(array), subst, renames, method_renames)),
-                box_expr_new(subst_expr(box_expr_deref(index), subst, renames, method_renames)));
+                mn_box_expr_new(subst_expr(mn_box_expr_deref(array), subst, renames, method_renames)),
+                mn_box_expr_new(subst_expr(mn_box_expr_deref(index), subst, renames, method_renames)));
         }
         Expr::ArrayLit(elem_type, elements) => {
             var new_elements: Vec<Expr> = Vec::new();
@@ -905,8 +909,8 @@ pub fn subst_expr(
         }
         Expr::Range(start, end, inclusive) => {
             return Expr::Range(
-                box_expr_new(subst_expr(box_expr_deref(start), subst, renames, method_renames)),
-                box_expr_new(subst_expr(box_expr_deref(end), subst, renames, method_renames)),
+                mn_box_expr_new(subst_expr(mn_box_expr_deref(start), subst, renames, method_renames)),
+                mn_box_expr_new(subst_expr(mn_box_expr_deref(end), subst, renames, method_renames)),
                 inclusive);
         }
         _ => { return subst_expr_part2(expr, subst, renames, method_renames); }
@@ -931,7 +935,7 @@ fn subst_expr_part2(
             var new_spread: OptBoxExpr = OptBoxExpr::None;
             match spread {
                 OptBoxExpr::Some(e) => {
-                    new_spread = OptBoxExpr::Some(box_expr_new(subst_expr(box_expr_deref(e), subst, renames, method_renames)));
+                    new_spread = OptBoxExpr::Some(mn_box_expr_new(subst_expr(mn_box_expr_deref(e), subst, renames, method_renames)));
                 }
                 OptBoxExpr::None => {}
             }
@@ -945,7 +949,7 @@ fn subst_expr_part2(
                 var new_guard: OptBoxExpr = OptBoxExpr::None;
                 match arm.guard {
                     OptBoxExpr::Some(g) => {
-                        new_guard = OptBoxExpr::Some(box_expr_new(subst_expr(box_expr_deref(g), subst, renames, method_renames)));
+                        new_guard = OptBoxExpr::Some(mn_box_expr_new(subst_expr(mn_box_expr_deref(g), subst, renames, method_renames)));
                     }
                     OptBoxExpr::None => {}
                 }
@@ -958,18 +962,18 @@ fn subst_expr_part2(
                 new_arms.push(MatchArm_new(arm.pattern, new_guard, new_body));
                 i = i + 1;
             }
-            return Expr::Match(box_expr_new(subst_expr(box_expr_deref(e), subst, renames, method_renames)), new_arms);
+            return Expr::Match(mn_box_expr_new(subst_expr(mn_box_expr_deref(e), subst, renames, method_renames)), new_arms);
         }
         Expr::Try(e) => {
-            return Expr::Try(box_expr_new(subst_expr(box_expr_deref(e), subst, renames, method_renames)));
+            return Expr::Try(mn_box_expr_new(subst_expr(mn_box_expr_deref(e), subst, renames, method_renames)));
         }
         Expr::Coalesce(e, default) => {
             return Expr::Coalesce(
-                box_expr_new(subst_expr(box_expr_deref(e), subst, renames, method_renames)),
-                box_expr_new(subst_expr(box_expr_deref(default), subst, renames, method_renames)));
+                mn_box_expr_new(subst_expr(mn_box_expr_deref(e), subst, renames, method_renames)),
+                mn_box_expr_new(subst_expr(mn_box_expr_deref(default), subst, renames, method_renames)));
         }
         Expr::IsCheck(e, type_name) => {
-            return Expr::IsCheck(box_expr_new(subst_expr(box_expr_deref(e), subst, renames, method_renames)), type_name);
+            return Expr::IsCheck(mn_box_expr_new(subst_expr(mn_box_expr_deref(e), subst, renames, method_renames)), type_name);
         }
         Expr::TryBlock(body) => {
             var new_body: Vec<Stmt> = Vec::new();
@@ -1020,7 +1024,7 @@ fn subst_expr_part2(
             return Expr::FString(new_parts);
         }
         Expr::Cast(e, target_ty) => {
-            return Expr::Cast(box_expr_new(subst_expr(box_expr_deref(e), subst, renames, method_renames)), subst_type(target_ty, subst));
+            return Expr::Cast(mn_box_expr_new(subst_expr(mn_box_expr_deref(e), subst, renames, method_renames)), subst_type(target_ty, subst));
         }
         Expr::Asm(template, operands) => {
             var new_operands: Vec<AsmOperand> = Vec::new();
@@ -1035,15 +1039,15 @@ fn subst_expr_part2(
             return Expr::Asm(template, new_operands);
         }
         Expr::Ref(e, is_mut) => {
-            return Expr::Ref(box_expr_new(subst_expr(box_expr_deref(e), subst, renames, method_renames)), is_mut);
+            return Expr::Ref(mn_box_expr_new(subst_expr(mn_box_expr_deref(e), subst, renames, method_renames)), is_mut);
         }
         Expr::Deref(e) => {
-            return Expr::Deref(box_expr_new(subst_expr(box_expr_deref(e), subst, renames, method_renames)));
+            return Expr::Deref(mn_box_expr_new(subst_expr(mn_box_expr_deref(e), subst, renames, method_renames)));
         }
         Expr::StrConcat(left, right) => {
             return Expr::StrConcat(
-                box_expr_new(subst_expr(box_expr_deref(left), subst, renames, method_renames)),
-                box_expr_new(subst_expr(box_expr_deref(right), subst, renames, method_renames)));
+                mn_box_expr_new(subst_expr(mn_box_expr_deref(left), subst, renames, method_renames)),
+                mn_box_expr_new(subst_expr(mn_box_expr_deref(right), subst, renames, method_renames)));
         }
         Expr::TupleLit(exprs) => {
             var new_exprs: Vec<Expr> = Vec::new();
@@ -1064,7 +1068,7 @@ fn subst_expr_part2(
             return Expr::EnumLit(enum_name, variant, new_args);
         }
         Expr::Comptime(inner) => {
-            return Expr::Comptime(box_expr_new(subst_expr(box_expr_deref(inner), subst, renames, method_renames)));
+            return Expr::Comptime(mn_box_expr_new(subst_expr(mn_box_expr_deref(inner), subst, renames, method_renames)));
         }
         Expr::ComptimeBlock(stmts) => {
             var new_stmts: Vec<Stmt> = Vec::new();
@@ -1080,23 +1084,23 @@ fn subst_expr_part2(
         }
         Expr::PipeForward(left, right) => {
             return Expr::PipeForward(
-                box_expr_new(subst_expr(box_expr_deref(left), subst, renames, method_renames)),
-                box_expr_new(subst_expr(box_expr_deref(right), subst, renames, method_renames)));
+                mn_box_expr_new(subst_expr(mn_box_expr_deref(left), subst, renames, method_renames)),
+                mn_box_expr_new(subst_expr(mn_box_expr_deref(right), subst, renames, method_renames)));
         }
         Expr::QuantCast(e, target_ty) => {
-            return Expr::QuantCast(box_expr_new(subst_expr(box_expr_deref(e), subst, renames, method_renames)), subst_type(target_ty, subst));
+            return Expr::QuantCast(mn_box_expr_new(subst_expr(mn_box_expr_deref(e), subst, renames, method_renames)), subst_type(target_ty, subst));
         }
         Expr::Await(inner) => {
-            return Expr::Await(box_expr_new(subst_expr(box_expr_deref(inner), subst, renames, method_renames)));
+            return Expr::Await(mn_box_expr_new(subst_expr(mn_box_expr_deref(inner), subst, renames, method_renames)));
         }
         Expr::Spawn(inner) => {
-            return Expr::Spawn(box_expr_new(subst_expr(box_expr_deref(inner), subst, renames, method_renames)));
+            return Expr::Spawn(mn_box_expr_new(subst_expr(mn_box_expr_deref(inner), subst, renames, method_renames)));
         }
         Expr::Yield(inner) => {
-            return Expr::Yield(box_expr_new(subst_expr(box_expr_deref(inner), subst, renames, method_renames)));
+            return Expr::Yield(mn_box_expr_new(subst_expr(mn_box_expr_deref(inner), subst, renames, method_renames)));
         }
         Expr::NamedArg(name, inner) => {
-            return Expr::NamedArg(name, Box::new(subst_expr(box_expr_deref(inner), subst, renames, method_renames)));
+            return Expr::NamedArg(name, Box::new(subst_expr(mn_box_expr_deref(inner), subst, renames, method_renames)));
         }
         _ => {}
     }
@@ -1144,7 +1148,7 @@ pub fn subst_stmt(
         Stmt::Return(opt, line) => {
             match opt {
                 OptBoxExpr::Some(e) => {
-                    return Stmt::Return(OptBoxExpr::Some(box_expr_new(subst_expr(box_expr_deref(e), subst, renames, method_renames))), line);
+                    return Stmt::Return(OptBoxExpr::Some(mn_box_expr_new(subst_expr(mn_box_expr_deref(e), subst, renames, method_renames))), line);
                 }
                 OptBoxExpr::None => { return Stmt::Return(OptBoxExpr::None, line); }
             }
@@ -1202,7 +1206,7 @@ pub fn subst_stmt(
         Stmt::Break(opt, line) => {
             match opt {
                 OptBoxExpr::Some(e) => {
-                    return Stmt::Break(OptBoxExpr::Some(box_expr_new(subst_expr(box_expr_deref(e), subst, renames, method_renames))), line);
+                    return Stmt::Break(OptBoxExpr::Some(mn_box_expr_new(subst_expr(mn_box_expr_deref(e), subst, renames, method_renames))), line);
                 }
                 OptBoxExpr::None => { return Stmt::Break(OptBoxExpr::None, line); }
             }
@@ -1241,7 +1245,7 @@ fn subst_stmt_part2(
                 var new_guard: OptBoxExpr = OptBoxExpr::None;
                 match arm.guard {
                     OptBoxExpr::Some(g) => {
-                        new_guard = OptBoxExpr::Some(box_expr_new(subst_expr(box_expr_deref(g), subst, renames, method_renames)));
+                        new_guard = OptBoxExpr::Some(mn_box_expr_new(subst_expr(mn_box_expr_deref(g), subst, renames, method_renames)));
                     }
                     OptBoxExpr::None => {}
                 }
@@ -1702,7 +1706,7 @@ pub fn fixup_generic_calls_stmt(stmt: Stmt, generics: Vec<GenericFuncEntry>, cur
         Stmt::Return(opt, line) => {
             match opt {
                 OptBoxExpr::Some(e) => {
-                    return Stmt::Return(OptBoxExpr::Some(box_expr_new(fixup_generic_calls_expr(box_expr_deref(e), generics, current_func))), line);
+                    return Stmt::Return(OptBoxExpr::Some(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(e), generics, current_func))), line);
                 }
                 OptBoxExpr::None => { return Stmt::Return(OptBoxExpr::None, line); }
             }
@@ -1770,11 +1774,11 @@ pub fn fixup_generic_calls_expr(expr: Expr, generics: Vec<GenericFuncEntry>, cur
         }
         Expr::Binary(op, left, right) => {
             return Expr::Binary(op,
-                box_expr_new(fixup_generic_calls_expr(box_expr_deref(left), generics, current_func)),
-                box_expr_new(fixup_generic_calls_expr(box_expr_deref(right), generics, current_func)));
+                mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(left), generics, current_func)),
+                mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(right), generics, current_func)));
         }
         Expr::Unary(op, inner) => {
-            return Expr::Unary(op, box_expr_new(fixup_generic_calls_expr(box_expr_deref(inner), generics, current_func)));
+            return Expr::Unary(op, mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(inner), generics, current_func)));
         }
         Expr::MethodCall(receiver, method, args) => {
             var new_args: Vec<Expr> = Vec::new();
@@ -1783,15 +1787,15 @@ pub fn fixup_generic_calls_expr(expr: Expr, generics: Vec<GenericFuncEntry>, cur
                 new_args.push(fixup_generic_calls_expr(args.get(i), generics, current_func));
                 i = i + 1;
             }
-            return Expr::MethodCall(box_expr_new(fixup_generic_calls_expr(box_expr_deref(receiver), generics, current_func)), method, new_args);
+            return Expr::MethodCall(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(receiver), generics, current_func)), method, new_args);
         }
         Expr::FieldAccess(inner, field) => {
-            return Expr::FieldAccess(box_expr_new(fixup_generic_calls_expr(box_expr_deref(inner), generics, current_func)), field);
+            return Expr::FieldAccess(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(inner), generics, current_func)), field);
         }
         Expr::Index(array, index) => {
             return Expr::Index(
-                box_expr_new(fixup_generic_calls_expr(box_expr_deref(array), generics, current_func)),
-                box_expr_new(fixup_generic_calls_expr(box_expr_deref(index), generics, current_func)));
+                mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(array), generics, current_func)),
+                mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(index), generics, current_func)));
         }
         Expr::If(cond, then_block, else_block) => {
             var new_then: Vec<Stmt> = fixup_generic_calls(then_block, generics, current_func);
@@ -1802,7 +1806,7 @@ pub fn fixup_generic_calls_expr(expr: Expr, generics: Vec<GenericFuncEntry>, cur
                 }
                 OptStmts::None => {}
             }
-            return Expr::If(box_expr_new(fixup_generic_calls_expr(box_expr_deref(cond), generics, current_func)), new_then, new_else);
+            return Expr::If(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(cond), generics, current_func)), new_then, new_else);
         }
         Expr::Block(stmts) => {
             return Expr::Block(fixup_generic_calls(stmts, generics, current_func));
@@ -2039,7 +2043,7 @@ pub fn collect_generic_calls_stmt_with_hint(
         Stmt::Return(opt, line) => {
             match opt {
                 OptBoxExpr::Some(e) => {
-                    collect_generic_calls_expr_with_hint(box_expr_deref(e), generics, generic_methods, calls, method_calls, current_func, OptType::Some(current_func.ret_ty));
+                    collect_generic_calls_expr_with_hint(mn_box_expr_deref(e), generics, generic_methods, calls, method_calls, current_func, OptType::Some(current_func.ret_ty));
                 }
                 OptBoxExpr::None => {}
             }
@@ -2088,7 +2092,7 @@ pub fn collect_generic_calls_stmt_with_hint(
         Stmt::Break(opt, line) => {
             match opt {
                 OptBoxExpr::Some(e) => {
-                    collect_generic_calls_expr_with_hint(box_expr_deref(e), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+                    collect_generic_calls_expr_with_hint(mn_box_expr_deref(e), generics, generic_methods, calls, method_calls, current_func, OptType::None);
                 }
                 OptBoxExpr::None => {}
             }
@@ -2249,14 +2253,14 @@ pub fn collect_generic_calls_expr_with_hint(
             }
         }
         Expr::Binary(op, left, right) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(left), generics, generic_methods, calls, method_calls, current_func, OptType::None);
-            collect_generic_calls_expr_with_hint(box_expr_deref(right), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(left), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(right), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::Unary(op, inner) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::If(cond, then_block, else_block) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(cond), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(cond), generics, generic_methods, calls, method_calls, current_func, OptType::None);
             var i: i64 = 0;
             while i < then_block.len() {
                 collect_generic_calls_stmt_with_hint(then_block.get(i), generics, generic_methods, calls, method_calls, current_func, OptType::None);
@@ -2281,14 +2285,14 @@ pub fn collect_generic_calls_expr_with_hint(
             }
         }
         Expr::FieldAccess(inner, field) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::OptionalFieldAccess(inner, field) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::MethodCall(receiver, method, args) => {
             // Unbox receiver once to avoid codegen issues with repeated box_expr_deref
-            var recv_expr: Expr = box_expr_deref(receiver);
+            var recv_expr: Expr = mn_box_expr_deref(receiver);
             // Check if this is a call to a generic method
             var struct_name: OptStr = infer_receiver_struct_name(recv_expr, current_func);
             match struct_name {
@@ -2314,8 +2318,8 @@ pub fn collect_generic_calls_expr_with_hint(
             }
         }
         Expr::Index(array, index) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(array), generics, generic_methods, calls, method_calls, current_func, OptType::None);
-            collect_generic_calls_expr_with_hint(box_expr_deref(index), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(array), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(index), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::ArrayLit(elem_type, elements) => {
             var i: i64 = 0;
@@ -2325,8 +2329,8 @@ pub fn collect_generic_calls_expr_with_hint(
             }
         }
         Expr::Range(start, end, inclusive) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(start), generics, generic_methods, calls, method_calls, current_func, OptType::None);
-            collect_generic_calls_expr_with_hint(box_expr_deref(end), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(start), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(end), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::StructLit(name, fields, spread) => {
             var i: i64 = 0;
@@ -2336,13 +2340,13 @@ pub fn collect_generic_calls_expr_with_hint(
             }
             match spread {
                 OptBoxExpr::Some(se) => {
-                    collect_generic_calls_expr_with_hint(box_expr_deref(se), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+                    collect_generic_calls_expr_with_hint(mn_box_expr_deref(se), generics, generic_methods, calls, method_calls, current_func, OptType::None);
                 }
                 OptBoxExpr::None => {}
             }
         }
         Expr::Match(e, arms) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(e), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(e), generics, generic_methods, calls, method_calls, current_func, OptType::None);
             var i: i64 = 0;
             while i < arms.len() {
                 var j: i64 = 0;
@@ -2354,14 +2358,14 @@ pub fn collect_generic_calls_expr_with_hint(
             }
         }
         Expr::Try(inner) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::Coalesce(e, default) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(e), generics, generic_methods, calls, method_calls, current_func, OptType::None);
-            collect_generic_calls_expr_with_hint(box_expr_deref(default), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(e), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(default), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::IsCheck(inner, type_name) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::TryBlock(body) => {
             var i: i64 = 0;
@@ -2390,7 +2394,7 @@ pub fn collect_generic_calls_expr_with_hint(
             }
         }
         Expr::Cast(inner, target_ty) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::Asm(template, operands) => {
             var i: i64 = 0;
@@ -2400,14 +2404,14 @@ pub fn collect_generic_calls_expr_with_hint(
             }
         }
         Expr::Ref(inner, is_mut) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::Deref(inner) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::StrConcat(left, right) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(left), generics, generic_methods, calls, method_calls, current_func, OptType::None);
-            collect_generic_calls_expr_with_hint(box_expr_deref(right), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(left), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(right), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::TupleLit(exprs) => {
             var i: i64 = 0;
@@ -2424,7 +2428,7 @@ pub fn collect_generic_calls_expr_with_hint(
             }
         }
         Expr::Comptime(inner) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::ComptimeBlock(stmts) => {
             var i: i64 = 0;
@@ -2435,23 +2439,23 @@ pub fn collect_generic_calls_expr_with_hint(
         }
         Expr::ComptimeReflect(op, ty) => {}
         Expr::PipeForward(left, right) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(left), generics, generic_methods, calls, method_calls, current_func, OptType::None);
-            collect_generic_calls_expr_with_hint(box_expr_deref(right), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(left), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(right), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::QuantCast(inner, target_ty) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::Await(inner) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::Spawn(inner) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::Yield(inner) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::NamedArg(name, inner) => {
-            collect_generic_calls_expr_with_hint(box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            collect_generic_calls_expr_with_hint(mn_box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::IntLit(n) => {}
         Expr::FloatLit(f) => {}
@@ -2577,8 +2581,8 @@ pub fn infer_expr_type(expr: Expr, func: Func) -> Type {
                 BinOp::LtEq => { return Type::Bool; }
                 BinOp::GtEq => { return Type::Bool; }
                 _ => {
-                    var lt: Type = infer_expr_type(box_expr_deref(left), func);
-                    var rt: Type = infer_expr_type(box_expr_deref(right), func);
+                    var lt: Type = infer_expr_type(mn_box_expr_deref(left), func);
+                    var rt: Type = infer_expr_type(mn_box_expr_deref(right), func);
                     // If left is not Named, use it; else use right
                     match lt {
                         Type::Named(_) => { return rt; }
@@ -2591,7 +2595,7 @@ pub fn infer_expr_type(expr: Expr, func: Func) -> Type {
         Expr::Unary(op, inner) => {
             match op {
                 UnaryOp::Not => { return Type::Bool; }
-                _ => { return infer_expr_type(box_expr_deref(inner), func); }
+                _ => { return infer_expr_type(mn_box_expr_deref(inner), func); }
             }
         }
         Expr::StructLit(name, fields, spread) => { return Type::Named(name); }
@@ -2601,14 +2605,61 @@ pub fn infer_expr_type(expr: Expr, func: Func) -> Type {
         Expr::MethodCall(receiver, method, args) => {
             // For associated function calls like Point::new(x, y),
             // the receiver is Expr::Ident("Point")
-            match box_expr_deref(receiver) {
+            match mn_box_expr_deref(receiver) {
                 Expr::Ident(name) => {
                     return Type::Named(name);
                 }
-                _ => { return infer_expr_type(box_expr_deref(receiver), func); }
+                _ => { return infer_expr_type(mn_box_expr_deref(receiver), func); }
             }
         }
         _ => { return Type::I64; }
     }
     return Type::I64;
+}
+
+// Shared helper (canonical copy; the module-prefixed copies are equivalent).
+pub fn box_expr_deref(b: Box<Expr>) -> Expr {
+    match b {
+        Expr::IntLit(v) => { return Expr::IntLit(v); }
+        Expr::FloatLit(v) => { return Expr::FloatLit(v); }
+        Expr::StringLit(v) => { return Expr::StringLit(v); }
+        Expr::BoolLit(v) => { return Expr::BoolLit(v); }
+        Expr::Ident(n) => { return Expr::Ident(n); }
+        Expr::Binary(op, l, r) => { return Expr::Binary(op, l, r); }
+        Expr::Unary(op, e) => { return Expr::Unary(op, e); }
+        Expr::Call(n, a) => { return Expr::Call(n, a); }
+        Expr::FieldAccess(e, f) => { return Expr::FieldAccess(e, f); }
+        Expr::OptionalFieldAccess(e, f) => { return Expr::OptionalFieldAccess(e, f); }
+        Expr::StructLit(n, f, s) => { return Expr::StructLit(n, f, s); }
+        Expr::If(c, t, e) => { return Expr::If(c, t, e); }
+        Expr::Range(s, e2, i) => { return Expr::Range(s, e2, i); }
+        Expr::Block(s) => { return Expr::Block(s); }
+        Expr::MethodCall(r, m, a) => { return Expr::MethodCall(r, m, a); }
+        Expr::ArrayLit(t, e) => { return Expr::ArrayLit(t, e); }
+        Expr::Index(a, i) => { return Expr::Index(a, i); }
+        Expr::FString(p) => { return Expr::FString(p); }
+        Expr::Match(e, a) => { return Expr::Match(e, a); }
+        Expr::EnumLit(en, v, a) => { return Expr::EnumLit(en, v, a); }
+        Expr::Ref(e, m) => { return Expr::Ref(e, m); }
+        Expr::Deref(e) => { return Expr::Deref(e); }
+        Expr::StrConcat(l, r) => { return Expr::StrConcat(l, r); }
+        Expr::Try(e) => { return Expr::Try(e); }
+        Expr::Coalesce(e, d) => { return Expr::Coalesce(e, d); }
+        Expr::IsCheck(e, t) => { return Expr::IsCheck(e, t); }
+        Expr::TryBlock(b) => { return Expr::TryBlock(b); }
+        Expr::TupleLit(e) => { return Expr::TupleLit(e); }
+        Expr::Closure(p, b, r) => { return Expr::Closure(p, b, r); }
+        Expr::Cast(e, t) => { return Expr::Cast(e, t); }
+        Expr::Asm(t, o) => { return Expr::Asm(t, o); }
+        Expr::Comptime(e) => { return Expr::Comptime(e); }
+        Expr::ComptimeBlock(s) => { return Expr::ComptimeBlock(s); }
+        Expr::ComptimeReflect(op, t) => { return Expr::ComptimeReflect(op, t); }
+        Expr::PipeForward(l, r) => { return Expr::PipeForward(l, r); }
+        Expr::QuantCast(e, t) => { return Expr::QuantCast(e, t); }
+        Expr::Await(e) => { return Expr::Await(e); }
+        Expr::Spawn(e) => { return Expr::Spawn(e); }
+        Expr::Yield(e) => { return Expr::Yield(e); }
+        Expr::NamedArg(name, e) => { return Expr::NamedArg(name, e); }
+    }
+    return Expr::IntLit(0);
 }

@@ -24,6 +24,7 @@ use string;
 use compiler::ast;
 use compiler::ir;
 use compiler::green_thread;
+use compiler::tensor;
 
 // ===========================================================================
 // Value -- runtime value representation
@@ -388,6 +389,17 @@ pub struct MapValueEntry {
     pub vals: Vec<Value>,
 }
 
+// Tensor side-table: maps an opaque Ptr addr -> index into interp.tensors.
+// Value::Ptr(addr) stands in for Rust's Value::Tensor (see file header).
+pub struct TensorSideEntry {
+    pub addr: i64,
+    pub handle: i64,
+}
+
+pub fn TensorSideEntry_new(addr: i64, handle: i64) -> TensorSideEntry {
+    return TensorSideEntry { addr: addr, handle: handle };
+}
+
 pub fn MapValueEntry_new(handle: i64) -> MapValueEntry {
     return MapValueEntry { handle: handle, keys: Vec::new(), vals: Vec::new() };
 }
@@ -409,6 +421,9 @@ pub struct Interpreter {
     pub vec_side_table: Vec<VecSideEntry>,
     pub vec_values: Vec<VecValueEntry>,
     pub map_values: Vec<MapValueEntry>,
+    pub tensors: Vec<TensorData>,
+    pub tensor_side_table: Vec<TensorSideEntry>,
+    pub kv_caches: Vec<KvCache>,
     pub verbose: bool,
     pub debug_mode: bool,
     pub array_bounds: Vec<ArrayBoundEntry>,
@@ -432,6 +447,11 @@ pub struct Interpreter {
     pub dp_epsilon_budget: f64,
     pub dp_epsilon_limit: f64,
     pub thread_handle_count: i64,
+    // Spawn/future results — p_thread_spawn/p_executor_spawn run eagerly and
+    // store the thread's return Value here; the Int handle indexes this table.
+    pub future_values: Vec<Value>,
+    // Cooperative green-thread scheduler (p_gt_* builtins).
+    pub gt_scheduler: GreenThreadScheduler,
 }
 
 pub fn Interpreter_new(module: IrModule) -> Interpreter {
@@ -444,6 +464,9 @@ pub fn Interpreter_new(module: IrModule) -> Interpreter {
         vec_side_table: Vec::new(),
         vec_values: Vec::new(),
         map_values: Vec::new(),
+        tensors: Vec::new(),
+        tensor_side_table: Vec::new(),
+        kv_caches: Vec::new(),
         verbose: false,
         debug_mode: true,
         array_bounds: Vec::new(),
@@ -465,6 +488,8 @@ pub fn Interpreter_new(module: IrModule) -> Interpreter {
         dp_epsilon_budget: 0.0,
         dp_epsilon_limit: 0.0,
         thread_handle_count: 0,
+        future_values: Vec::new(),
+        gt_scheduler: GreenThreadScheduler_new(),
     };
     Interpreter_init_strings(&mut interp);
     Interpreter_init_globals(&mut interp);
@@ -2615,40 +2640,92 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     }
 
     // ─── Green threads (cooperative scheduler) ───
+    // p_gt_spawn(func_name: *u8, arg: i64) queues a READY thread.
+    // p_gt_run_all() resolves each queued thread's func_name and executes it
+    // eagerly (interpreter is single-threaded — cooperative ordering, eager
+    // bodies). is_done/get_result reflect the scheduler's real state.
     if name == "p_gt_spawn" {
         if args.len() < 2 { return ExecOutcome::Value(Value::Int(-1)); }
-        var func_id: i64 = 0;
+        var func_name: str = "";
+        match args.get(0) {
+            Value::Str(s) => { func_name = s; }
+            Value::Ptr(a) => { func_name = Memory_load_cstr(&self.memory, a); }
+            _ => {}
+        }
         var arg_val: i64 = 0;
-        match args.get(0) { Value::Int(n) => { func_id = n; } _ => {} }
         match args.get(1) { Value::Int(n) => { arg_val = n; } _ => {} }
-        var id: i64 = gt_global_spawn(func_id, arg_val);
+        var gt_args: Vec<i64> = Vec::new();
+        gt_args.push(arg_val);
+        var id: i64 = GreenThreadScheduler_spawn(&mut self.gt_scheduler, func_name, gt_args);
         return ExecOutcome::Value(Value::Int(id));
     }
     if name == "p_gt_yield" {
-        gt_global_yield();
+        GreenThreadScheduler_yield_current(&mut self.gt_scheduler);
         return ExecOutcome::Value(Value::Void);
     }
     if name == "p_gt_run_all" {
-        var result: i64 = gt_global_run_all();
-        return ExecOutcome::Value(Value::Int(result));
+        var last_result: i64 = 0;
+        var gi: i64 = 0;
+        while gi < self.gt_scheduler.next_id {
+            var gt: GreenThread = self.gt_scheduler.threads.get(gi);
+            if gt.active && (gt.state == GT_READY || gt.state == GT_SUSPENDED) {
+                gt.state = GT_RUNNING;
+                self.gt_scheduler.current = gi;
+                self.gt_scheduler.threads.set(gi, gt);
+                var gt_vals: Vec<Value> = Vec::new();
+                gt_vals.push(Value::Int(0));   // dummy __env
+                var gai: i64 = 0;
+                while gai < gt.args.len() {
+                    gt_vals.push(Value::Int(gt.args.get(gai)));
+                    gai = gai + 1;
+                }
+                var gt_result: Value = Value::Int(0);
+                match IrModule_get_function(&self.module, gt.func_name) {
+                    OptIrFunction::Some(gfunc) => {
+                        match Interpreter_run_function(self, gfunc, gt_vals) {
+                            RunResult::Return(gv) => { gt_result = gv; }
+                            RunResult::Panic(gmsg) => {
+                                p_eprint_str("Green thread panic: " + gmsg + "\n");
+                            }
+                            RunResult::Paused => { }
+                        }
+                    }
+                    OptIrFunction::None => {
+                        p_eprint_str("Green thread: unknown function '" + gt.func_name + "'\n");
+                    }
+                }
+                match gt_result {
+                    Value::Int(gn) => { gt.result = gn; }
+                    Value::Bool(gb) => { if gb { gt.result = 1; } }
+                    Value::Ptr(gp) => { gt.result = gp; }
+                    _ => { }
+                }
+                gt.state = GT_DONE;
+                self.gt_scheduler.current = -1;
+                self.gt_scheduler.threads.set(gi, gt);
+                last_result = gt.result;
+            }
+            gi = gi + 1;
+        }
+        return ExecOutcome::Value(Value::Int(last_result));
     }
     if name == "p_gt_is_done" {
         if args.len() < 1 { return ExecOutcome::Value(Value::Bool(false)); }
         var id: i64 = 0;
         match args.get(0) { Value::Int(n) => { id = n; } _ => {} }
-        return ExecOutcome::Value(Value::Bool(gt_global_is_done(id)));
+        return ExecOutcome::Value(Value::Bool(GreenThreadScheduler_is_done(&self.gt_scheduler, id)));
     }
     if name == "p_gt_get_result" {
         if args.len() < 1 { return ExecOutcome::Value(Value::Int(0)); }
         var id: i64 = 0;
         match args.get(0) { Value::Int(n) => { id = n; } _ => {} }
-        return ExecOutcome::Value(Value::Int(gt_global_get_result(id)));
+        return ExecOutcome::Value(Value::Int(GreenThreadScheduler_get_result(&self.gt_scheduler, id)));
     }
     if name == "p_gt_current" {
-        return ExecOutcome::Value(Value::Int(gt_global_current()));
+        return ExecOutcome::Value(Value::Int(GreenThreadScheduler_current_thread(&self.gt_scheduler)));
     }
     if name == "p_gt_reset" {
-        gt_global_reset();
+        self.gt_scheduler = GreenThreadScheduler_new();
         return ExecOutcome::Value(Value::Void);
     }
 
@@ -2680,46 +2757,371 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         return ExecOutcome::Value(Value::Void);
     }
 
+    // ─── Tensor builtins (Phase 5C.1) — wired to compiler::tensor ───
+    // Value::Ptr(addr) stands in for Rust's Value::Tensor (see file header).
+    if name == "p_tensor_zeros" {
+        match Interpreter_arg_to_vec_i64(self, args.get(0)) {
+            OptVecI64::Some(shape) => { return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_zeros(shape))); }
+            _ => { return ExecOutcome::Panic("tensor_zeros: expected Vec"); }
+        }
+    }
+    if name == "p_tensor_ones" {
+        match Interpreter_arg_to_vec_i64(self, args.get(0)) {
+            OptVecI64::Some(shape) => { return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_ones(shape))); }
+            _ => { return ExecOutcome::Panic("tensor_ones: expected Vec"); }
+        }
+    }
+    if name == "p_tensor_filled" {
+        var fill: f64 = 0.0;
+        var fill_ok: bool = false;
+        match args.get(1) {
+            Value::Float(f) => { fill = f; fill_ok = true; }
+            _ => {}
+        }
+        match Interpreter_arg_to_vec_i64(self, args.get(0)) {
+            OptVecI64::Some(shape) => {
+                if fill_ok { return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_filled(shape, fill))); }
+                return ExecOutcome::Panic("tensor_filled: expected Vec, f64");
+            }
+            _ => { return ExecOutcome::Panic("tensor_filled: expected Vec, f64"); }
+        }
+    }
+    if name == "p_tensor_from_vec" {
+        // stdlib calls from_vec(data, shape) — args are (data, shape)
+        var data_opt: OptVecF64 = Interpreter_args_to_f64_vec(self, args, 0);
+        var shape_opt: OptVecI64 = Interpreter_arg_to_vec_i64(self, args.get(1));
+        match data_opt {
+            OptVecF64::Some(d) => {
+                match shape_opt {
+                    OptVecI64::Some(sh) => { return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_from_vec(sh, d))); }
+                    _ => { return ExecOutcome::Panic("tensor_from_vec: expected Vec, Vec"); }
+                }
+            }
+            _ => { return ExecOutcome::Panic("tensor_from_vec: expected Vec, Vec"); }
+        }
+    }
+    if name == "p_tensor_get" {
+        var th: i64 = Interpreter_tensor_handle(self, args.get(0));
+        var idx_opt: OptVecI64 = Interpreter_arg_to_vec_i64(self, args.get(1));
+        if th < 0 { return ExecOutcome::Panic("tensor_get: expected Tensor, Vec"); }
+        match idx_opt {
+            OptVecI64::Some(idx) => { return ExecOutcome::Value(Value::Float(Tensor_get(&self.tensors.get(th), idx))); }
+            _ => { return ExecOutcome::Panic("tensor_get: expected Tensor, Vec"); }
+        }
+    }
+    if name == "p_tensor_set" {
+        var th2: i64 = Interpreter_tensor_handle(self, args.get(0));
+        var idx_opt2: OptVecI64 = Interpreter_arg_to_vec_i64(self, args.get(1));
+        var setv: f64 = 0.0;
+        var setv_ok: bool = false;
+        match args.get(2) {
+            Value::Float(f2) => { setv = f2; setv_ok = true; }
+            _ => {}
+        }
+        if th2 < 0 || !setv_ok { return ExecOutcome::Panic("tensor_set: expected Tensor, Vec, f64"); }
+        match idx_opt2 {
+            OptVecI64::Some(idx2) => {
+                var tm: TensorData = self.tensors.get(th2);
+                Tensor_set(&mut tm, idx2, setv);
+                self.tensors.set(th2, tm);
+                return ExecOutcome::Value(Value::Void);
+            }
+            _ => { return ExecOutcome::Panic("tensor_set: expected Tensor, Vec, f64"); }
+        }
+    }
+    if name == "p_tensor_shape" {
+        var th3: i64 = Interpreter_tensor_handle(self, args.get(0));
+        if th3 < 0 { return ExecOutcome::Panic("tensor_shape: expected Tensor"); }
+        var tsh: TensorData = self.tensors.get(th3);
+        var shlen: i64 = tsh.shape.len();
+        var struct_addr: i64 = Memory_alloc(&mut self.memory, 24);
+        var data_addr: i64 = 0;
+        if shlen > 0 {
+            data_addr = Memory_alloc(&mut self.memory, shlen * 8);
+            var si: i64 = 0;
+            while si < shlen {
+                Memory_store_i64(&mut self.memory, data_addr + si * 8, tsh.shape.get(si));
+                si = si + 1;
+            }
+        }
+        Memory_store_i64(&mut self.memory, struct_addr, data_addr);
+        Memory_store_i64(&mut self.memory, struct_addr + 8, shlen);
+        Memory_store_i64(&mut self.memory, struct_addr + 16, shlen);
+        return ExecOutcome::Value(Value::Int(struct_addr));
+    }
+    if name == "p_tensor_ndim" {
+        var th4: i64 = Interpreter_tensor_handle(self, args.get(0));
+        if th4 < 0 { return ExecOutcome::Panic("tensor_ndim: expected Tensor"); }
+        return ExecOutcome::Value(Value::Int(Tensor_ndim(&self.tensors.get(th4))));
+    }
+    if name == "p_tensor_size" {
+        var th5: i64 = Interpreter_tensor_handle(self, args.get(0));
+        if th5 < 0 { return ExecOutcome::Panic("tensor_size: expected Tensor"); }
+        return ExecOutcome::Value(Value::Int(Tensor_size(&self.tensors.get(th5))));
+    }
+    if name == "p_tensor_reshape" {
+        var th6: i64 = Interpreter_tensor_handle(self, args.get(0));
+        var nshape_opt: OptVecI64 = Interpreter_arg_to_vec_i64(self, args.get(1));
+        if th6 < 0 { return ExecOutcome::Panic("tensor_reshape: expected Tensor, Vec"); }
+        match nshape_opt {
+            OptVecI64::Some(nshape) => {
+                match Tensor_reshape(&self.tensors.get(th6), nshape) {
+                    ResultTensor::Ok(nt) => { return ExecOutcome::Value(Interpreter_alloc_tensor(self, nt)); }
+                    ResultTensor::Err(e) => { return ExecOutcome::Panic(e); }
+                }
+            }
+            _ => { return ExecOutcome::Panic("tensor_reshape: expected Tensor, Vec"); }
+        }
+    }
+    if name == "p_tensor_transpose" {
+        var th7: i64 = Interpreter_tensor_handle(self, args.get(0));
+        if th7 < 0 { return ExecOutcome::Panic("tensor_transpose: expected Tensor"); }
+        return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_transpose(&self.tensors.get(th7))));
+    }
+    if name == "p_tensor_add" {
+        var ha1: i64 = Interpreter_tensor_handle(self, args.get(0));
+        var hb1: i64 = Interpreter_tensor_handle(self, args.get(1));
+        if ha1 < 0 || hb1 < 0 { return ExecOutcome::Panic("tensor_add: expected Tensor, Tensor"); }
+        match Tensor_add(&self.tensors.get(ha1), &self.tensors.get(hb1)) {
+            ResultTensor::Ok(r) => { return ExecOutcome::Value(Interpreter_alloc_tensor(self, r)); }
+            ResultTensor::Err(e2) => { return ExecOutcome::Panic(e2); }
+        }
+    }
+    if name == "p_tensor_sub" {
+        var ha2: i64 = Interpreter_tensor_handle(self, args.get(0));
+        var hb2: i64 = Interpreter_tensor_handle(self, args.get(1));
+        if ha2 < 0 || hb2 < 0 { return ExecOutcome::Panic("tensor_sub: expected Tensor, Tensor"); }
+        match Tensor_sub(&self.tensors.get(ha2), &self.tensors.get(hb2)) {
+            ResultTensor::Ok(r2) => { return ExecOutcome::Value(Interpreter_alloc_tensor(self, r2)); }
+            ResultTensor::Err(e3) => { return ExecOutcome::Panic(e3); }
+        }
+    }
+    if name == "p_tensor_mul" {
+        var ha3: i64 = Interpreter_tensor_handle(self, args.get(0));
+        var hb3: i64 = Interpreter_tensor_handle(self, args.get(1));
+        if ha3 < 0 || hb3 < 0 { return ExecOutcome::Panic("tensor_mul: expected Tensor, Tensor"); }
+        match Tensor_mul(&self.tensors.get(ha3), &self.tensors.get(hb3)) {
+            ResultTensor::Ok(r3) => { return ExecOutcome::Value(Interpreter_alloc_tensor(self, r3)); }
+            ResultTensor::Err(e4) => { return ExecOutcome::Panic(e4); }
+        }
+    }
+    if name == "p_tensor_scale" {
+        var th8: i64 = Interpreter_tensor_handle(self, args.get(0));
+        var sc: f64 = 0.0;
+        var sc_ok: bool = false;
+        match args.get(1) {
+            Value::Float(f3) => { sc = f3; sc_ok = true; }
+            _ => {}
+        }
+        if th8 < 0 || !sc_ok { return ExecOutcome::Panic("tensor_scale: expected Tensor, f64"); }
+        return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_scale(&self.tensors.get(th8), sc)));
+    }
+    if name == "p_tensor_matmul" {
+        var ha4: i64 = Interpreter_tensor_handle(self, args.get(0));
+        var hb4: i64 = Interpreter_tensor_handle(self, args.get(1));
+        if ha4 < 0 || hb4 < 0 { return ExecOutcome::Panic("tensor_matmul: expected Tensor, Tensor"); }
+        match Tensor_matmul(&self.tensors.get(ha4), &self.tensors.get(hb4)) {
+            ResultTensor::Ok(r4) => { return ExecOutcome::Value(Interpreter_alloc_tensor(self, r4)); }
+            ResultTensor::Err(e5) => { return ExecOutcome::Panic(e5); }
+        }
+    }
+    if name == "p_tensor_dot" {
+        var ha5: i64 = Interpreter_tensor_handle(self, args.get(0));
+        var hb5: i64 = Interpreter_tensor_handle(self, args.get(1));
+        if ha5 < 0 || hb5 < 0 { return ExecOutcome::Panic("tensor_dot: expected Tensor, Tensor"); }
+        match Tensor_dot(&self.tensors.get(ha5), &self.tensors.get(hb5)) {
+            ResultF64::Ok(r5) => { return ExecOutcome::Value(Value::Float(r5)); }
+            ResultF64::Err(e6) => { return ExecOutcome::Panic(e6); }
+        }
+    }
+    if name == "p_tensor_sum" {
+        var th9: i64 = Interpreter_tensor_handle(self, args.get(0));
+        if th9 < 0 { return ExecOutcome::Panic("tensor_sum: expected Tensor"); }
+        return ExecOutcome::Value(Value::Float(Tensor_sum(&self.tensors.get(th9))));
+    }
+    if name == "p_tensor_mean" {
+        var th10: i64 = Interpreter_tensor_handle(self, args.get(0));
+        if th10 < 0 { return ExecOutcome::Panic("tensor_mean: expected Tensor"); }
+        return ExecOutcome::Value(Value::Float(Tensor_mean(&self.tensors.get(th10))));
+    }
+    if name == "p_tensor_max" {
+        var th11: i64 = Interpreter_tensor_handle(self, args.get(0));
+        if th11 < 0 { return ExecOutcome::Panic("tensor_max: expected Tensor"); }
+        return ExecOutcome::Value(Value::Float(Tensor_max(&self.tensors.get(th11))));
+    }
+    if name == "p_tensor_min" {
+        var th12: i64 = Interpreter_tensor_handle(self, args.get(0));
+        if th12 < 0 { return ExecOutcome::Panic("tensor_min: expected Tensor"); }
+        return ExecOutcome::Value(Value::Float(Tensor_min(&self.tensors.get(th12))));
+    }
+    if name == "p_tensor_relu" {
+        var th13: i64 = Interpreter_tensor_handle(self, args.get(0));
+        if th13 < 0 { return ExecOutcome::Panic("tensor_relu: expected Tensor"); }
+        return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_relu(&self.tensors.get(th13))));
+    }
+    if name == "p_tensor_sigmoid" {
+        var th14: i64 = Interpreter_tensor_handle(self, args.get(0));
+        if th14 < 0 { return ExecOutcome::Panic("tensor_sigmoid: expected Tensor"); }
+        return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_sigmoid(&self.tensors.get(th14))));
+    }
+    if name == "p_tensor_softmax" {
+        var th15: i64 = Interpreter_tensor_handle(self, args.get(0));
+        if th15 < 0 { return ExecOutcome::Panic("tensor_softmax: expected Tensor"); }
+        return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_softmax(&self.tensors.get(th15))));
+    }
+    if name == "p_tensor_to_str" {
+        var th16: i64 = Interpreter_tensor_handle(self, args.get(0));
+        if th16 < 0 { return ExecOutcome::Panic("tensor_to_str: expected Tensor"); }
+        return ExecOutcome::Value(Value::Str(Tensor_to_string(&self.tensors.get(th16))));
+    }
+
     // ─── KV Cache (ML9) ───
     if name == "p_kv_cache_new" {
-        return ExecOutcome::Value(Value::Int(0));
+        var n_layers: i64 = 0;
+        var max_seq: i64 = 0;
+        var win_size: i64 = 0;
+        var h_dim: i64 = 0;
+        match args.get(0) { Value::Int(a0) => { n_layers = a0; } _ => {} }
+        match args.get(1) { Value::Int(a1) => { max_seq = a1; } _ => {} }
+        match args.get(2) { Value::Int(a2) => { win_size = a2; } _ => {} }
+        match args.get(3) { Value::Int(a3) => { h_dim = a3; } _ => {} }
+        var cache_id: i64 = self.kv_caches.len();
+        self.kv_caches.push(KvCache_new(n_layers, max_seq, win_size, h_dim));
+        return ExecOutcome::Value(Value::Int(cache_id));
     }
     if name == "p_kv_cache_append" {
+        var cid: i64 = 0;
+        var lyr: i64 = 0;
+        match args.get(0) { Value::Int(c0) => { cid = c0; } _ => {} }
+        match args.get(1) { Value::Int(l0) => { lyr = l0; } _ => {} }
+        var kh: i64 = Interpreter_tensor_handle(self, args.get(2));
+        var vh: i64 = Interpreter_tensor_handle(self, args.get(3));
+        if cid < 0 || cid >= self.kv_caches.len() { return ExecOutcome::Panic("kv_cache_append: invalid cache id"); }
+        if kh < 0 || vh < 0 { return ExecOutcome::Panic("kv_cache_append: expected (cache_id, layer, k_tensor, v_tensor)"); }
+        var cache: KvCache = self.kv_caches.get(cid);
+        KvCache_append(&mut cache, lyr, &self.tensors.get(kh), &self.tensors.get(vh));
+        self.kv_caches.set(cid, cache);
         return ExecOutcome::Value(Value::Void);
     }
     if name == "p_kv_cache_get" {
-        return ExecOutcome::Value(Value::Int(0));
+        var cid2: i64 = 0;
+        var lyr2: i64 = 0;
+        match args.get(0) { Value::Int(c1) => { cid2 = c1; } _ => {} }
+        match args.get(1) { Value::Int(l1) => { lyr2 = l1; } _ => {} }
+        if cid2 < 0 || cid2 >= self.kv_caches.len() { return ExecOutcome::Panic("kv_cache_get: invalid cache id"); }
+        var cache2: KvCache = self.kv_caches.get(cid2);
+        return ExecOutcome::Value(Interpreter_alloc_tensor(self, KvCache_get(&cache2, lyr2)));
     }
     if name == "p_kv_cache_len" {
-        return ExecOutcome::Value(Value::Int(0));
+        var cid3: i64 = 0;
+        var lyr3: i64 = 0;
+        match args.get(0) { Value::Int(c2) => { cid3 = c2; } _ => {} }
+        match args.get(1) { Value::Int(l2) => { lyr3 = l2; } _ => {} }
+        if cid3 < 0 || cid3 >= self.kv_caches.len() { return ExecOutcome::Panic("kv_cache_len: invalid cache id"); }
+        var cache3: KvCache = self.kv_caches.get(cid3);
+        return ExecOutcome::Value(Value::Int(KvCache_len(&cache3, lyr3)));
     }
     if name == "p_kv_cache_clear" {
+        var cid4: i64 = 0;
+        match args.get(0) { Value::Int(c3) => { cid4 = c3; } _ => {} }
+        if cid4 < 0 || cid4 >= self.kv_caches.len() { return ExecOutcome::Panic("kv_cache_clear: invalid cache id"); }
+        var cache4: KvCache = self.kv_caches.get(cid4);
+        KvCache_clear(&mut cache4);
+        self.kv_caches.set(cid4, cache4);
         return ExecOutcome::Value(Value::Void);
     }
     if name == "p_kv_cache_evict" {
+        var cid5: i64 = 0;
+        var ntok: i64 = 0;
+        match args.get(0) { Value::Int(c4) => { cid5 = c4; } _ => {} }
+        match args.get(1) { Value::Int(n0) => { ntok = n0; } _ => {} }
+        if cid5 < 0 || cid5 >= self.kv_caches.len() { return ExecOutcome::Panic("kv_cache_evict: invalid cache id"); }
+        var cache5: KvCache = self.kv_caches.get(cid5);
+        KvCache_evict_oldest(&mut cache5, ntok);
+        self.kv_caches.set(cid5, cache5);
         return ExecOutcome::Value(Value::Void);
     }
 
     // ─── Quantization (ML10) ───
     if name == "p_quantize_q8" {
-        return ExecOutcome::Value(Value::Int(0));
+        var thq: i64 = Interpreter_tensor_handle(self, args.get(0));
+        var qscale: f64 = 0.0;
+        var qzp: i64 = 0;
+        var q_ok: bool = false;
+        match args.get(1) { Value::Float(qf) => { qscale = qf; } _ => {} }
+        match args.get(2) { Value::Int(qz) => { qzp = qz; q_ok = true; } _ => {} }
+        if thq < 0 || !q_ok { return ExecOutcome::Panic("quantize_q8: expected (Tensor, f64, i64)"); }
+        return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_quantize_q8(&self.tensors.get(thq), qscale, qzp)));
     }
     if name == "p_dequantize_q8" {
-        return ExecOutcome::Value(Value::Int(0));
+        var thd: i64 = Interpreter_tensor_handle(self, args.get(0));
+        var dscale: f64 = 0.0;
+        var dzp: i64 = 0;
+        var d_ok: bool = false;
+        match args.get(1) { Value::Float(df) => { dscale = df; } _ => {} }
+        match args.get(2) { Value::Int(dz) => { dzp = dz; d_ok = true; } _ => {} }
+        if thd < 0 || !d_ok { return ExecOutcome::Panic("dequantize_q8: expected (Tensor, f64, i64)"); }
+        return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_dequantize_q8(&self.tensors.get(thd), dscale, dzp)));
     }
     if name == "p_qmatmul" {
-        return ExecOutcome::Value(Value::Int(0));
+        // Issue 12: Quantized matmul using i32 accumulation (ported inline,
+        // mirrors src/interp.rs — tensor.fd has no Tensor_qmatmul).
+        var qha: i64 = Interpreter_tensor_handle(self, args.get(0));
+        var qhb: i64 = Interpreter_tensor_handle(self, args.get(1));
+        if qha < 0 || qhb < 0 { return ExecOutcome::Panic("qmatmul: expected (Tensor, Tensor)"); }
+        var qa_t: TensorData = self.tensors.get(qha);
+        var qb_t: TensorData = self.tensors.get(qhb);
+        if Tensor_ndim(&qa_t) != 2 || Tensor_ndim(&qb_t) != 2 {
+            return ExecOutcome::Panic("qmatmul: expected 2D tensors");
+        }
+        var qm: i64 = qa_t.shape.get(0);
+        var qk: i64 = qa_t.shape.get(1);
+        var qn: i64 = qb_t.shape.get(1);
+        if qb_t.shape.get(0) != qk {
+            return ExecOutcome::Panic("qmatmul: shape mismatch");
+        }
+        var qshape: Vec<i64> = Vec::new();
+        qshape.push(qm);
+        qshape.push(qn);
+        var qres: TensorData = Tensor_zeros(qshape);
+        var qi: i64 = 0;
+        while qi < qm {
+            var qj: i64 = 0;
+            while qj < qn {
+                var acc: i64 = 0;
+                var qx: i64 = 0;
+                while qx < qk {
+                    var qa: i64 = p_float_to_int(qa_t.data.get(qi * qk + qx));
+                    var qb: i64 = p_float_to_int(qb_t.data.get(qx * qn + qj));
+                    acc = (acc + qa * qb) & 0xFFFFFFFF;
+                    if acc >= 0x80000000 { acc = acc - 0x100000000; }
+                    qx = qx + 1;
+                }
+                qres.data.set(qi * qn + qj, p_int_to_float(acc));
+                qj = qj + 1;
+            }
+            qi = qi + 1;
+        }
+        return ExecOutcome::Value(Interpreter_alloc_tensor(self, qres));
     }
     if name == "p_find_quant_params" {
-        return ExecOutcome::Value(Value::Int(0));
+        var thp: i64 = Interpreter_tensor_handle(self, args.get(0));
+        if thp < 0 { return ExecOutcome::Panic("find_quant_params: expected Tensor"); }
+        var qp: QuantParams = Tensor_find_quant_params(&self.tensors.get(thp));
+        return ExecOutcome::Value(Value::Str(float_to_str(qp.scale) + "," + int_to_str(qp.zero_point)));
     }
 
     // ─── Tensor utilities ───
     if name == "p_tensor_to_json" {
-        return ExecOutcome::Value(Value::Str("[]"));
+        var thj: i64 = Interpreter_tensor_handle(self, args.get(0));
+        if thj < 0 { return ExecOutcome::Panic("tensor_to_json: expected Tensor"); }
+        return ExecOutcome::Value(Value::Str(Tensor_to_json(&self.tensors.get(thj))));
     }
     if name == "p_tensor_clone" {
-        return ExecOutcome::Value(Value::Int(0));
+        var thc: i64 = Interpreter_tensor_handle(self, args.get(0));
+        if thc < 0 { return ExecOutcome::Panic("tensor_clone: expected Tensor"); }
+        var tclone: TensorData = self.tensors.get(thc);
+        return ExecOutcome::Value(Interpreter_alloc_tensor(self, tclone));
     }
 
     // ─── String runtime functions (ported from src/interp.rs ~3288-3455) ───
@@ -3410,16 +3812,92 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         return ExecOutcome::Value(Value::Int(0));
     }
 
-    // ─── Threading (interpreter is single-threaded: spawn = eager, join = no-op) ───
-    if name == "p_thread_spawn" {
-        // In the interpreter, we can't actually spawn threads.
-        // Return a fake handle (negative index) to simulate the thread.
-        self.thread_handle_count = self.thread_handle_count + 1;
-        return ExecOutcome::Value(Value::Int(-self.thread_handle_count));
+    // ─── Threading (interpreter is single-threaded: spawn runs eagerly) ───
+    // Mirrors src/interp.rs: spawn resolves func_name, runs it immediately
+    // (preserves Vec/Map side-table access), and stores the result in
+    // future_values; the Int handle indexes that table via p_future_poll.
+    if name == "p_thread_spawn" || name == "p_executor_spawn" {
+        var base: i64 = 0;
+        if name == "p_executor_spawn" { base = 1; }
+        var func_name: str = "";
+        match args.get(base) {
+            Value::Str(s) => { func_name = s; }
+            Value::Ptr(a) => { func_name = Memory_load_cstr(&self.memory, a); }
+            _ => {}
+        }
+        var num_args: i64 = 0;
+        match args.get(base + 1) { Value::Int(n) => { num_args = n; } _ => {} }
+        var thread_values: Vec<Value> = Vec::new();
+        thread_values.push(Value::Int(0));   // dummy __env
+        var tai: i64 = 0;
+        while tai < num_args {
+            var av: i64 = base + 2 + tai;
+            if av < args.len() { thread_values.push(args.get(av)); }
+            tai = tai + 1;
+        }
+        var spawn_result: Value = Value::Int(0);
+        match IrModule_get_function(&self.module, func_name) {
+            OptIrFunction::Some(func2) => {
+                match Interpreter_run_function(self, func2, thread_values) {
+                    RunResult::Return(v5) => { spawn_result = v5; }
+                    RunResult::Panic(pmsg) => {
+                        p_eprint_str("Thread panic: " + pmsg + "\n");
+                    }
+                    RunResult::Paused => { }
+                }
+            }
+            OptIrFunction::None => {
+                p_eprint_str("Thread: unknown function '" + func_name + "'\n");
+            }
+        }
+        var fidx: i64 = self.future_values.len();
+        self.future_values.push(spawn_result);
+        return ExecOutcome::Value(Value::Int(fidx));
     }
     if name == "p_thread_join" {
-        // No-op in the interpreter — threads are already done (eager eval)
+        // Threads already ran eagerly at spawn — join is a no-op.
         return ExecOutcome::Value(Value::Void);
+    }
+    if name == "p_executor_new" {
+        self.thread_handle_count = self.thread_handle_count + 1;
+        return ExecOutcome::Value(Value::Int(self.thread_handle_count));
+    }
+    if name == "p_executor_block_on" {
+        // block_on(exec, future) -> i64 — return the (already-resolved) result.
+        var bf: i64 = -1;
+        match args.get(1) { Value::Int(n) => { bf = n; } _ => {} }
+        if bf >= 0 && bf < self.future_values.len() {
+            match self.future_values.get(bf) {
+                Value::Int(bn) => { return ExecOutcome::Value(Value::Int(bn)); }
+                _ => { }
+            }
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if name == "p_executor_run_all" || name == "p_executor_poll_all" {
+        // Everything already ran eagerly at spawn.
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if name == "p_future_poll" || name == "p_future_ready" ||
+       name == "p_task_poll" || name == "p_task_poll_nonblocking" {
+        var fh: i64 = -1;
+        match args.get(0) { Value::Int(n) => { fh = n; } _ => {} }
+        if fh >= 0 && fh < self.future_values.len() {
+            var fv: Value = self.future_values.get(fh);
+            match fv {
+                Value::Int(fn2) => { return ExecOutcome::Value(Value::Int(fn2)); }
+                Value::Bool(fb) => {
+                    if fb { return ExecOutcome::Value(Value::Int(1)); }
+                    return ExecOutcome::Value(Value::Int(0));
+                }
+                Value::Ptr(fp) => { return ExecOutcome::Value(Value::Int(fp)); }
+                _ => { }
+            }
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if name == "p_task_is_ready" {
+        return ExecOutcome::Value(Value::Bool(true));
     }
 
     // ─── Default: return 0 for unknown runtime functions ───
@@ -3684,6 +4162,36 @@ pub fn Interpreter_arg_to_vec_i64(self: &Interpreter, arg: Value) -> OptVecI64 {
         }
         _ => { return OptVecI64::None; }
     }
+}
+
+/// alloc_tensor — store a Tensor in the side table and return an opaque Ptr.
+/// Value::Ptr(addr) stands in for Rust's Value::Tensor (see file header).
+pub fn Interpreter_alloc_tensor(self: &mut Interpreter, t: TensorData) -> Value {
+    var addr: i64 = Memory_alloc(&mut self.memory, 8);
+    var handle: i64 = self.tensors.len();
+    self.tensors.push(t);
+    self.tensor_side_table.push(TensorSideEntry_new(addr, handle));
+    Memory_store_i64(&mut self.memory, addr, handle);
+    return Value::Ptr(addr);
+}
+
+/// tensor_handle — resolve a Value::Ptr/Int addr to a tensors index, or -1.
+pub fn Interpreter_tensor_handle(self: &Interpreter, arg: Value) -> i64 {
+    var addr: i64 = -1;
+    match arg {
+        Value::Ptr(a) => { addr = a; }
+        Value::Int(a) => { addr = a; }
+        _ => {}
+    }
+    if addr < 0 { return -1; }
+    var i: i64 = 0;
+    while i < self.tensor_side_table.len() {
+        if self.tensor_side_table.get(i).addr == addr {
+            return self.tensor_side_table.get(i).handle;
+        }
+        i = i + 1;
+    }
+    return -1;
 }
 
 /// args_to_f64_vec — extract a Vec<f64> from args[idx].
