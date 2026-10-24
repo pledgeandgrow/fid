@@ -1,0 +1,531 @@
+// runtime.fd — Fides-authored runtime (native backends)
+//
+// WHY THIS FILE EXISTS
+//   Before: three hand-written runtimes, one per arch —
+//     runtime_linux.fd  (4,370 LOC of hand-encoded x86-64 machine bytes)
+//     runtime_arm64.fd  (  794 LOC of text asm)
+//     runtime_riscv.fd  (  825 LOC of text asm)
+//   Every new builtin cost 3 manual encodings and the three drifted
+//   (runtime_linux dropped a 1,450-line asm block — all string/map
+//   builtins silently absent from ELF output).
+//
+//   After: this file implements the builtin LOGIC once, in Fides, and
+//   each arch keeps ONLY a thin asm stub layer (~150 lines):
+//
+// LAYER MAP
+//   user code ─► core.fd (Vec/String/Map — already Fides over p_malloc)
+//            ─► p_* builtins = THIS FILE (Fides logic)
+//            ─► rt_sys_* ABI boundary (the ONLY per-arch asm that remains)
+//
+// ==========================================================================
+// PER-ARCH STUB CONTRACT
+//   Each architecture runtime must provide exactly these symbols:
+//
+//   _start                                    — process entry: set up stack,
+//                                               save argc/argv, call main,
+//                                               exit(main_result)
+//   rt_sys_write(fd: i64, buf: i64, len: i64) -> i64
+//   rt_sys_read(fd: i64, buf: i64, len: i64) -> i64
+//   rt_sys_open(path: i64, flags: i64, mode: i64) -> i64   (fd or -errno)
+//   rt_sys_close(fd: i64) -> i64
+//   rt_sys_mmap(size: i64) -> i64             — anonymous pages; 0 on failure
+//   rt_sys_exit(code: i64)                    — noreturn
+//   rt_sys_argc() -> i64                      — argc captured by _start
+//   rt_sys_argv(i: i64) -> i64                — argv[i] as NUL-terminated str
+//   rt_sys_getenv(name: i64) -> i64           — env lookup (0 if absent)
+//   rt_sys_clock_ns() -> i64                  — monotonic nanoseconds
+//
+//   Green threads (Phase 2 — not yet wired):
+//   rt_ctx_save(buf: i64) -> i64              — save callee-saved regs+sp+pc
+//   rt_ctx_restore(buf: i64)                  — restore; never returns here
+//   Atomics:
+//   rt_atomic_add(p: i64, v: i64) -> i64      — lock xadd / ldaddal
+//   rt_atomic_cmpxchg(p: i64, old: i64, new: i64) -> i64
+//
+// REFERENCE ENCODINGS (what each arch's stub does):
+//   x86-64 Linux : rax=nr, rdi/rsi/rdx/r10/r8/r9, `syscall`
+//                  read=0 write=1 open=2 close=3 mmap=9 munmap=11
+//                  clock_gettime=228 exit=60
+//   aarch64 Linux: x8=nr, x0-x5 args, `svc #0` (same numbers mostly;
+//                  openat=56 replaces open — path/fd/flags/mode)
+//   riscv64 Linux: a7=nr, a0-a5 args, `ecall` (same as aarch64)
+//   x86-64 Win   : NtWriteFile/NtReadFile/NtCreateFile via ntdll, or
+//                  kernel32 WriteFile/ReadFile/CreateFileA/HeapAlloc via IAT
+//
+// INTEGRATION
+//   The native pipeline prepends this file to the program (same mechanism
+//   as core.fd) and links the per-arch stub object. The C backend does
+//   NOT use this file — codegen_c emits its own p_* C runtime. Symbols
+//   defined here shadow the builtin extern declarations: when runtime.fd
+//   is in the program, `p_malloc` resolves to THIS p_malloc.
+//
+// STATUS: scaffold. Compile-checkable; the open()/flags numbers below are
+// Linux x86-64. A `RT_TARGET` comptime flag should eventually select the
+// per-OS syscall numbers.
+
+module compiler::runtime;
+
+use core;
+use vec;
+use string;
+
+// ==========================================================================
+// Per-arch ABI boundary (provided by the runtime stub object, not this file)
+// ==========================================================================
+
+extern "C" {
+    fn rt_sys_write(fd: i64, buf: i64, len: i64) -> i64;
+    fn rt_sys_read(fd: i64, buf: i64, len: i64) -> i64;
+    fn rt_sys_open(path: i64, flags: i64, mode: i64) -> i64;
+    fn rt_sys_close(fd: i64) -> i64;
+    fn rt_sys_mmap(size: i64) -> i64;
+    fn rt_sys_exit(code: i64) -> void;
+    fn rt_sys_argc() -> i64;
+    fn rt_sys_argv(i: i64) -> i64;
+    fn rt_sys_getenv(name: i64) -> i64;
+    fn rt_sys_clock_ns() -> i64;
+}
+
+// ==========================================================================
+// Allocator — first-fit free list over rt_sys_mmap
+// ==========================================================================
+// Block layout: [size: i64][free: i64][next_free: i64][payload...]
+//   - 24-byte header; payload 16-byte aligned
+//   - free==1 means on the free list (next_free links free blocks)
+//   - heap grows by RT_PAGE_CHUNK (64KB) chunks via rt_sys_mmap
+
+const RT_HDR_SIZE: i64 = 24;
+const RT_ALIGN: i64 = 16;
+const RT_PAGE_CHUNK: i64 = 65536;
+
+// Global free-list head (Fides is single-threaded per the opt.fd note).
+var rt_free_head: i64 = 0;
+
+fn rt_align_up(n: i64, a: i64) -> i64 {
+    var r: i64 = n % a;
+    if r == 0 { return n; }
+    return n + (a - r);
+}
+
+// Carve a chunk of `total` fresh mmap bytes into [header][payload],
+// splice the remainder onto the free list.
+fn rt_grow_heap(need: i64) -> i64 {
+    var chunk: i64 = RT_PAGE_CHUNK;
+    if need + RT_HDR_SIZE > chunk { chunk = rt_align_up(need + RT_HDR_SIZE, 4096); }
+    var base: i64 = rt_sys_mmap(chunk);
+    if base == 0 { return 0; }
+    var hdr: i64 = base;
+    var p_size: *mut i64 = hdr;
+    var p_free: *mut i64 = hdr + 8;
+    var p_next: *mut i64 = hdr + 16;
+    unsafe {
+        *p_size = chunk - RT_HDR_SIZE;
+        *p_free = 1;
+        *p_next = rt_free_head;
+    }
+    rt_free_head = hdr;
+    return base;
+}
+
+// First-fit: find a free block >= need, split if oversized.
+pub fn p_malloc(size: i64) -> i64 {
+    var need: i64 = rt_align_up(size, RT_ALIGN);
+    if need <= 0 { need = RT_ALIGN; }
+
+    var prev: i64 = 0;
+    var cur: i64 = rt_free_head;
+    while cur != 0 {
+        var b_size: i64 = 0;
+        var b_free: i64 = 0;
+        var b_next: i64 = 0;
+        var sp: *mut i64 = cur;
+        var fp: *mut i64 = cur + 8;
+        var np: *mut i64 = cur + 16;
+        unsafe {
+            b_size = *sp;
+            b_free = *fp;
+            b_next = *np;
+        }
+        if b_free == 1 && b_size >= need {
+            // Split: leave remainder as a new free block if it can hold
+            // header + a minimum payload.
+            if b_size >= need + RT_HDR_SIZE + RT_ALIGN {
+                var rem: i64 = cur + RT_HDR_SIZE + need;
+                var rs: *mut i64 = rem;
+                var rf: *mut i64 = rem + 8;
+                var rn: *mut i64 = rem + 16;
+                unsafe {
+                    *rs = b_size - need - RT_HDR_SIZE;
+                    *rf = 1;
+                    *rn = b_next;
+                }
+                unsafe {
+                    *sp = need;
+                    *fp = 0;
+                    *np = rem;
+                }
+                // unlink `cur`, point its slot-chain at `rem` instead
+                if prev == 0 {
+                    rt_free_head = rem;
+                } else {
+                    var pnext: *mut i64 = prev + 16;
+                    unsafe { *pnext = rem; }
+                }
+            } else {
+                // consume whole block
+                if prev == 0 {
+                    rt_free_head = b_next;
+                } else {
+                    var pnext2: *mut i64 = prev + 16;
+                    unsafe { *pnext2 = b_next; }
+                }
+                unsafe { *fp = 0; }
+            }
+            return cur + RT_HDR_SIZE;
+        }
+        prev = cur;
+        cur = b_next;
+    }
+
+    // Nothing free — grow the heap and retry once.
+    if rt_grow_heap(need) == 0 { return 0; }
+    return p_malloc(size);
+}
+
+pub fn p_free(ptr: i64) {
+    if ptr == 0 { return; }
+    var hdr: i64 = ptr - RT_HDR_SIZE;
+    var fp: *mut i64 = hdr + 8;
+    var np: *mut i64 = hdr + 16;
+    unsafe {
+        *fp = 1;
+        *np = rt_free_head;
+    }
+    rt_free_head = hdr;
+    // NOTE: no coalescing yet — adjacent free blocks stay fragmented.
+    // Acceptable for the scaffold; a real allocator adds boundary-tag
+    // coalescing on free.
+}
+
+pub fn p_alloc(size: i64) -> i64 { return p_malloc(size); }
+
+// ==========================================================================
+// Raw memory — byte loops (the fast SIMD versions belong in the stubs
+// only if profiling demands it; correctness first)
+// ==========================================================================
+
+pub fn p_memset(dst: i64, byte: i64, n: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        var p: *mut i64 = dst + i;
+        unsafe { *p = byte & 0xFF; }
+        i = i + 1;
+    }
+    return dst;
+}
+
+pub fn p_memcpy(dst: i64, src: i64, n: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        var d: *mut i64 = dst + i;
+        var s: *mut i64 = src + i;
+        unsafe { *d = *s; }
+        i = i + 1;
+    }
+    return dst;
+}
+
+// ==========================================================================
+// C-string layer (str = NUL-terminated char*)
+// ==========================================================================
+
+pub fn p_str_length(s: i64) -> i64 {
+    var n: i64 = 0;
+    var p: *mut i64 = s;
+    unsafe {
+        var b: i64 = *p;
+        while b != 0 {
+            n = n + 1;
+            p = s + n;
+            b = *p;
+        }
+    }
+    return n;
+}
+
+pub fn p_str_concat(a: i64, b: i64) -> i64 {
+    var la: i64 = p_str_length(a);
+    var lb: i64 = p_str_length(b);
+    var out: i64 = p_malloc(la + lb + 1);
+    if out == 0 { return 0; }
+    p_memcpy(out, a, la);
+    p_memcpy(out + la, b, lb);
+    var z: *mut i64 = out + la + lb;
+    unsafe { *z = 0; }
+    return out;
+}
+
+pub fn p_str_equal(a: i64, b: i64) -> bool {
+    var i: i64 = 0;
+    var pa: *mut i64 = a;
+    var pb: *mut i64 = b;
+    unsafe {
+        var ba: i64 = *pa;
+        var bb: i64 = *pb;
+        while ba != 0 && bb != 0 {
+            if ba != bb { return false; }
+            i = i + 1;
+            pa = a + i;
+            pb = b + i;
+            ba = *pa;
+            bb = *pb;
+        }
+        return ba == bb;
+    }
+    return true;
+}
+
+pub fn p_str_compare(a: i64, b: i64) -> i64 {
+    var i: i64 = 0;
+    var pa: *mut i64 = a;
+    var pb: *mut i64 = b;
+    unsafe {
+        var ba: i64 = *pa;
+        var bb: i64 = *pb;
+        while ba != 0 && bb != 0 {
+            if ba != bb { return ba - bb; }
+            i = i + 1;
+            pa = a + i;
+            pb = b + i;
+            ba = *pa;
+            bb = *pb;
+        }
+        return ba - bb;
+    }
+    return 0;
+}
+
+// ==========================================================================
+// Integer → string
+// ==========================================================================
+
+pub fn p_to_str(n: i64) -> i64 {
+    if n == 0 {
+        var z: i64 = p_malloc(2);
+        var zp: *mut i64 = z;
+        unsafe { *zp = 48; }
+        var zn: *mut i64 = z + 1;
+        unsafe { *zn = 0; }
+        return z;
+    }
+    var neg: bool = n < 0;
+    var m: i64 = n;
+    if neg { m = -n; }
+    // digits (reverse into a 24-byte scratch on the stack? Fides has no
+    // VLAs — use a small heap scratch then reverse into place)
+    var scratch: i64 = p_malloc(32);
+    var cnt: i64 = 0;
+    while m > 0 {
+        var d: i64 = m % 10;
+        var dp: *mut i64 = scratch + cnt;
+        unsafe { *dp = 48 + d; }
+        cnt = cnt + 1;
+        m = m / 10;
+    }
+    var out: i64 = p_malloc(cnt + 2);
+    var oi: i64 = 0;
+    if neg {
+        var mp: *mut i64 = out;
+        unsafe { *mp = 45; }
+        oi = 1;
+    }
+    var ri: i64 = cnt - 1;
+    while ri >= 0 {
+        var sp: *mut i64 = scratch + ri;
+        var op: *mut i64 = out + oi;
+        unsafe { *op = *sp; }
+        oi = oi + 1;
+        if ri == 0 { break; }
+        ri = ri - 1;
+    }
+    var zp2: *mut i64 = out + oi;
+    unsafe { *zp2 = 0; }
+    p_free(scratch);
+    return out;
+}
+
+pub fn p_char_to_str(b: i64) -> i64 {
+    var out: i64 = p_malloc(2);
+    var p: *mut i64 = out;
+    unsafe { *p = b & 0xFF; }
+    var z: *mut i64 = out + 1;
+    unsafe { *z = 0; }
+    return out;
+}
+
+pub fn p_bool_to_str(b: bool) -> i64 {
+    if b { return p_str_literal_dup("true"); }
+    return p_str_literal_dup("false");
+}
+
+// String literals are read-only in the image — duplicate into the heap
+// so callers can always treat results as owned.
+fn p_str_literal_dup(s: str) -> i64 {
+    var sa: i64 = s;
+    var n: i64 = p_str_length(sa);
+    var out: i64 = p_malloc(n + 1);
+    p_memcpy(out, sa, n + 1);
+    return out;
+}
+
+// ==========================================================================
+// I/O — write / print / panic / exit
+// ==========================================================================
+
+pub fn p_write_str(fd: i64, s: i64) -> i64 {
+    return rt_sys_write(fd, s, p_str_length(s));
+}
+
+pub fn p_print_str(s: i64) {
+    p_write_str(1, s);
+}
+
+pub fn p_eprint_str(s: i64) {
+    p_write_str(2, s);
+}
+
+pub fn p_print_int(n: i64) {
+    var s: i64 = p_to_str(n);
+    p_write_str(1, s);
+    p_free(s);
+}
+
+pub fn p_print_bool(b: bool) {
+    if b { p_print_str_raw("true"); } else { p_print_str_raw("false"); }
+}
+
+fn p_print_str_raw(s: str) {
+    var sa: i64 = s;
+    p_write_str(1, sa);
+}
+
+pub fn p_print_newline() {
+    p_print_str_raw("\n");
+}
+
+pub fn p_print(s: str) {
+    p_print_str_raw(s);
+}
+
+pub fn p_eprint(s: str) {
+    var sa: i64 = s;
+    p_write_str(2, sa);
+}
+
+pub fn p_panic(msg: i64) {
+    p_write_str(2, msg);
+    p_eprint("\n");
+    p_exit(1);
+}
+
+pub fn p_exit(code: i64) {
+    rt_sys_exit(code);
+}
+
+// ==========================================================================
+// Files — Linux x86-64 flag/number reference set
+// ==========================================================================
+// open flags (Linux): O_RDONLY=0 O_WRONLY=1 O_RDWR=2 O_CREAT=64 O_TRUNC=512
+// mode for O_CREAT: 0644 = 420
+
+const RT_O_RDONLY: i64 = 0;
+const RT_O_WRONLY: i64 = 1;
+const RT_O_RDWR: i64 = 2;
+const RT_O_CREAT: i64 = 64;
+const RT_O_TRUNC: i64 = 512;
+const RT_O_APPEND: i64 = 1024;
+const RT_MODE_644: i64 = 420;
+
+pub fn p_file_write(path: i64, content: i64) -> i64 {
+    var fd: i64 = rt_sys_open(path, RT_O_WRONLY | RT_O_CREAT | RT_O_TRUNC, RT_MODE_644);
+    if fd < 0 { return fd; }
+    var n: i64 = p_str_length(content);
+    var w: i64 = rt_sys_write(fd, content, n);
+    rt_sys_close(fd);
+    return w;
+}
+
+pub fn p_file_append(path: i64, content: i64) -> i64 {
+    var fd: i64 = rt_sys_open(path, RT_O_WRONLY | RT_O_CREAT | RT_O_APPEND, RT_MODE_644);
+    if fd < 0 { return fd; }
+    var n: i64 = p_str_length(content);
+    var w: i64 = rt_sys_write(fd, content, n);
+    rt_sys_close(fd);
+    return w;
+}
+
+pub fn p_file_exists(path: i64) -> bool {
+    var fd: i64 = rt_sys_open(path, RT_O_RDONLY, 0);
+    if fd < 0 { return false; }
+    rt_sys_close(fd);
+    return true;
+}
+
+// Read whole file into a NUL-terminated heap buffer. Grows by doubling.
+pub fn p_file_read(path: i64) -> i64 {
+    var fd: i64 = rt_sys_open(path, RT_O_RDONLY, 0);
+    if fd < 0 { return 0; }
+    var cap: i64 = 4096;
+    var buf: i64 = p_malloc(cap + 1);
+    var total: i64 = 0;
+    var r: i64 = 1;
+    while r > 0 {
+        if total + 4096 > cap {
+            var ncap: i64 = cap * 2;
+            var nbuf: i64 = p_malloc(ncap + 1);
+            p_memcpy(nbuf, buf, total);
+            p_free(buf);
+            buf = nbuf;
+            cap = ncap;
+        }
+        r = rt_sys_read(fd, buf + total, 4096);
+        if r > 0 { total = total + r; }
+    }
+    var z: *mut i64 = buf + total;
+    unsafe { *z = 0; }
+    rt_sys_close(fd);
+    return buf;
+}
+
+// ==========================================================================
+// Process args / environment / clock
+// ==========================================================================
+
+pub fn p_argc() -> i64 { return rt_sys_argc(); }
+
+pub fn p_argv(i: i64) -> i64 { return rt_sys_argv(i); }
+
+pub fn p_getenv(name: i64) -> i64 { return rt_sys_getenv(name); }
+
+pub fn p_clock_now() -> i64 { return rt_sys_clock_ns(); }
+
+pub fn p_clock_now_ms() -> i64 { return rt_sys_clock_ns() / 1000000; }
+
+pub fn p_clock_now_us() -> i64 { return rt_sys_clock_ns() / 1000; }
+
+// ==========================================================================
+// TODO — the rest of the builtin surface (tracked by layer)
+// ==========================================================================
+// Strings (pure Fides, no syscalls): p_str_join_n, p_string_contains,
+//   p_string_replace, p_string_starts_with/ends_with/find, p_intern_str,
+//   p_sb_new/p_sb_append/p_sb_to_str (string builder = growable buffer)
+// Floats: p_float_to_str (needs a dtoa — shortest-roundtrip or fixed
+//   %.6f), p_str_to_float, p_f64_to_bits (bitcast — needs codegen support)
+// Maps: p_map_* over open-addressing table (Fides over p_malloc)
+// Channels/mutexes: need rt_futex_* per arch (Linux futex=202) or a
+//   spin-lock via rt_atomic_* for single-proc correctness
+// Green threads: rt_ctx_save/rt_ctx_restore + this file's scheduler
+//   (green_thread.fd's gt_* becomes the Fides impl over those two stubs)
+// Sockets/net/http/db/dl/tensor/grad/dp/checkpoint: out of scaffold scope —
+//   each maps onto a small rt_sys_* addition (socket/bind/connect or
+//   dlopen-family on POSIX; LoadLibrary on Windows)

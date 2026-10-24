@@ -1470,6 +1470,23 @@ impl CCodeGen {
         }
     }
 
+    fn alloca_size(&self, ty: &IrType) -> u64 {
+        let size = match ty {
+            IrType::Struct(name) => self
+                .struct_layouts
+                .get(name)
+                .map(|l| l.size)
+                .unwrap_or(0),
+            _ => ty.size(),
+        };
+        // Ensure at least 1 byte to avoid malloc(0) undefined behavior
+        if size == 0 {
+            8
+        } else {
+            size
+        }
+    }
+
     fn gen_function(&mut self, name: &str, func: &IrFunction) {
         self.value_names.clear();
         self.temp_counter = 0;
@@ -1525,6 +1542,22 @@ impl CCodeGen {
                     }
                 }
                 self.value_names.insert(id.0, format!("v{}", id.0));
+            }
+        }
+
+        // Prologue alloca pre-pass: bind one stack slot per Inst::Alloca at
+        // function entry. An alloca emitted inside a loop block burns fresh
+        // stack on every iteration — alloca memory is only reclaimed at
+        // function return — so high-trip-count loops overflow the native
+        // stack. The slot is reused across iterations; the zero-init memset
+        // stays at the instruction's own site so each iteration still sees
+        // cleared storage.
+        for block in &func.blocks {
+            for &inst_id in &block.instructions {
+                if let Some(Inst::Alloca { ty, .. }) = func.instructions.get(&inst_id) {
+                    let size = self.alloca_size(ty);
+                    wln!(self, "    v{} = alloca({});", inst_id.0, size);
+                }
             }
         }
 
@@ -1646,17 +1679,11 @@ impl CCodeGen {
                 wln!(self, "    {} = {}{};", dst, uop, o);
             }
             Inst::Alloca { ty, .. } => {
-                let size = match ty {
-                    IrType::Struct(name) => {
-                        self.struct_layouts.get(name).map(|l| l.size).unwrap_or(0)
-                    }
-                    _ => ty.size(),
-                };
-                // Ensure at least 1 byte to avoid malloc(0) undefined behavior
-                let size = if size == 0 { 8 } else { size };
-                // Use alloca() for stack allocation instead of calloc() for heap.
-                // This is dramatically faster — no syscall, no malloc overhead.
-                wln!(self, "    {} = alloca({});", dst, size);
+                // The alloca() call itself was emitted once in the function
+                // prologue (see gen_function's alloca pre-pass). Only the
+                // zero-init runs here so each loop iteration still sees
+                // cleared storage while the stack grows once per call.
+                let size = self.alloca_size(ty);
                 wln!(self, "    memset({}, 0, {});", dst, size);
             }
             Inst::Load { ptr, ty } => {

@@ -1,6 +1,8 @@
 # pir.fd — PIR L1/L2/L3 transforms
 
-> **Re-verified 2026-10-23:** confirmed — StructCopy still dropped at L1 (:1125 → `ConstInt(0)`), `is_pure` propagation still carries the missing-effects bug into the optimizer. `borrow_kinds` still populated but consumed nowhere (compounds opt.md).
+> > **FIXED 2026-10-23 (v2):** `StructCopy` at :1125 now lowers to `L1Inst::Store(dst, src, OptIrType::Some(ty), {write})` matching src/pir.rs:801 (was `skip→ConstInt(0)`). `codegen_x64::gen_store` already handles struct stores via `gen_struct_copy`. `is_pure` now sees Write effects from the ir.fd fix. `borrow_kinds` still unconsumed (opt.md).
+
+> *Superseded re-verify:* confirmed — StructCopy still dropped at L1 (:1125 → `ConstInt(0)`), `is_pure` propagation still carries the missing-effects bug into the optimizer. `borrow_kinds` still populated but consumed nowhere (compounds opt.md).
 
 - **Path:** `compiler/pir.fd` — **2,719 LOC** (Rust `src/pir.rs` = 2,262, ~120%)
 - **Role:** the three-stage PIR lowering — `lower_ir_to_l1` (region/effect/capability annotation), `lower_l1_to_l2` (region resolution + drop), `lower_l2_to_l3` (vreg assignment, stack-frame/slot layout, materialization) — plus `generate_pir` pretty-printers for `pir`/`dump-pir`.

@@ -1,18 +1,38 @@
-# pe.fd — PE emitter + second x86-64 codegen
+# pe.fd — PE format writer + runtime stubs (was: emitter + 2nd codegen)
 
-> **Re-verified 2026-10-23:** all findings confirmed — SizeOfStackReserve/HeapCommit fields still pasted (:1391/:1397), FloatLit globals still 8 zero bytes (:2078-2081, `f64_to_bits` still stubbed), `pe_debug.txt` instrumentation still writing truncate-mode files (:1673/1897/2043+).
+> **CONSOLIDATED 2026-10-23 (v3, ~6,850 LOC):** the embedded second x86-64
+> codegen is **deleted** (~1,000+ LOC: `PeCodeGen_gen_all_functions`,
+> `gen_function`, all `gen_inst_*`/`gen_*_binop`/`gen_call*`, `PeStackFrame`,
+> `collect_strings`, `pe_debug.txt` instrumentation). `generate_pe` now takes
+> `(module: IrModule, l3: L3Module)` — user code is emitted by the shared
+> `codegen_x64` → assembled by `ElfEmitter` → PE writer resolves symbols/
+> relocs and lays out sections. **Windows builds now go through the full
+> L1/L2/L3 + optimizer pipeline** (previously bypassed).
+>
+> What remains in the file: `X86Encoder` (for runtime stubs + boot code),
+> all ~90 Win64 runtime stub bodies, `register_runtime_labels`, IAT/import
+> machinery (`RdataBuilder_build_imports` — now dynamic, externs collected
+> from the shared assembler's undefined syms), PE headers/sections, entry
+> point, bare-metal + multiboot paths.
+>
+> New glue: `pe_emit_sysv_prologue` (SysV→Win64 arg shuffle wrappers in
+> front of the raw stub bodies), `pe_emit_import_tramps` (call-thunks into
+> the IAT), `pe_apply_text_relocs`/`pe_apply_rodata_relocs`,
+> `pe_sym_text_off`, `PeLinked`, `pe_build`, `PendingUserRef` for
+> user-fn references (`main`, IDT handlers).
+>
+> **STATUS: typechecks clean; end-to-end output still UNVERIFIED** — the
+> `--native` pipeline was blocked by a pre-existing `rpo_dfs` stack
+> overflow (iterative fix applied in opt.fd same day). ABI caveat: shared
+> codegen is SysV — wrappers convert at p_* boundaries; user functions
+> calling each other stay SysV internally, which is fine.
+>
+> Findings below describe the **deleted** codegen where noted; PE-format
+> findings (stack/heap fields, FloatLit globals) apply to the writer that
+> survived — verify against the new code.
 
-- **Path:** `compiler/pe.fd` — **7,860 LOC** (Rust `src/pe.rs` = 8,966, ~88%)
-- **Role:** `PeCodeGen` — a complete *second* x86-64 codegen that emits machine code directly (own `X86Encoder`, label/reloc fixup, `.rdata` builder, IAT/import machinery), wrapped in a PE32+ image — plus a flat-binary bare-metal mode with ported CR0/CR3/CR4/IDT/GDT/port-I/O stubs. Independent of the codegen_x64 → elf64 → linker path.
-
-## Where it is called
-
-| Caller | Site | Mechanism |
-|---|---|---|
-| `compiler.fd` | :1735 | `generate_pe(module)` — `build --target windows/x64-windows/x86-64-windows` |
-| `main.fd` | :1739 | `generate_flat_binary(ir_mod)` — `build --bare` (no-std flat binary, load @ 0x10000) |
-
-Both live. Note `generate_pe` takes the **raw `IrModule`** — it bypasses the L1/L2/L3 + optimizer pipeline entirely (its own codegen consumes IR directly).
+- **Path:** `compiler/pe.fd` — **6,852 LOC** (was 7,860)
+- **Role:** PE32+ format writer + runtime stub library + bare-metal emitters.
 
 ## Verified faithful (code inspection)
 

@@ -1,10 +1,19 @@
-# coff.fd — COFF (.obj) emitter for Windows AMD64 (497 LOC)
+# coff.fd — COFF (.obj) emitter for Windows AMD64 (424 LOC)
+
+> **CONSOLIDATED 2026-10-23 (v2):** the entire hand-rolled asm parser +
+> nop-sled encoder (F1–F3) **deleted** — file now assembles via the shared
+> `ElfEmitter` and translates (bytes, symbols, relocs) into COFF records.
+> Real instructions encode correctly; `.rdata` section emitted for rodata;
+> `main`/pub syms get EXTERNAL storage class via ELF binding (F4 fixed).
+> F1/F2/F3 died by deletion — they cannot regress without resurrecting the
+> parser.
 
 ## Role
 
-Produces COFF relocatable objects: hand-rolled asm parser + minimal x86-64
-encoder + COFF header/section/symbol/string tables. Port of `src/coff.rs`
-(385 LOC). Third dead/stranded module after `autograd.fd` and `codegen.fd`.
+Format-only COFF writer: `emit_coff_file` → `ElfEmitter_assemble` (shared
+encoder) → `CoffEmitter_import` translates ELF symbols/relocs/sections →
+COFF header + .text/.rdata sections + per-section relocs + symtab/strtab.
+Wired at `main.fd:1724` (`codegen --emit-coff`).
 
 ## Where it's called
 
@@ -74,13 +83,14 @@ the bytes inside that are hollow.
 
 ## Verification state
 
-- Faithful port — every defect above exists verbatim in `src/coff.rs`
-  (Rust comments admit "Simplified x86-64 encoding… For now, just emit a
-  nop"). No port regressions; the only regression is the lost call site.
-- Unverifiable live: no importer + `>>` parse blocker.
-- Recommendation: either delete, or wire `--emit-coff` *and* port the
-  elf64.fd encoder (the real 2,423-LOC one) to drive it — this file's own
-  encoder can't be salvaged.
+- **RESOLVED BY REWRITE (2026-10-23):** the recommendation above was taken —
+  the file's own encoder was deleted entirely and `ElfEmitter` now drives
+  it. Findings F1–F3 describe deleted code (kept for history); F4 fixed in
+  the same pass (storage class now from ELF binding); F5 signature still
+  `(module: i64, asm: str)` — unchanged, still degraded vs Rust's
+  `&L3Module`.
+- Typecheck: `use compiler::coff` probes clean post-rewrite.
+- Live output still unverified end-to-end (needs a COFF consumer/objdump).
 
 ## Next
 

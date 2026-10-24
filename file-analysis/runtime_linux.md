@@ -1,6 +1,6 @@
 # runtime_linux.fd
 
-> **Re-verified 2026-10-23:** HIGH confirmed — the ~1,450-line `runtime_asm` block is still built then dropped (`encode_asm_block` at elf64.fd:2477 is never called from this file) → all `p_string_*`/`p_map_*` builtins still missing from the ELF symbol table; call relocs land rel32=0 → fall-through garbage returns. Caps still unwired.
+> **Corrected 2026-10-23 (v2):** the earlier re-verify note was stale — `encode_asm_block` **is** called at :2858 (A1 fix): bytes appended at `asm_base`, defined `.text` symbols merged, reloc indices resolved to names. `p_string_*`/`p_map_*` builtins are now in the runtime symbol table. `cap_granted` now does per-bit checks (`FS/IO`=1, `Net`=2, `Spawn`=4) and `runtime_parts_with_caps` is called from `build_executable`. Remaining from the original findings: linker call relocs still land rel32=0 for *unknown* symbols (linker.md).
 
 - **Path:** `compiler/runtime_linux.fd`
 - **LOC:** ~4,370 (Rust `src/runtime_linux.rs`: ~4,383 — near-identical size)

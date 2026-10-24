@@ -1,8 +1,13 @@
 # File Analysis: compiler/linker.fd
 
-> **Re-verified 2026-10-23:** CRITICAL confirmed — `build_executable` writes all 9 u64 header fields via `write_u64(buf, buf.len())` at :998-1034; `buf` is only ever `push`ed (never pre-extended), so `set(len)` is out-of-bounds → interp panic / codegen_c silent drop → emitted ELF has no e_entry/phdr contents. Highest-blast-radius bug in the repo.
+> > **FIXED 2026-10-23 (v2):** `write_u32`/`write_u64` now append when `off >= len` (:198-219) — `set(len)` no longer called OOB, e_entry/phdrs written. Malformed-ELF output resolved.
+
+> *Superseded re-verify:* CRITICAL confirmed — `build_executable` writes all 9 u64 header fields via `write_u64(buf, buf.len())` at :998-1034; `buf` is only ever `push`ed (never pre-extended), so `set(len)` is out-of-bounds → interp panic / codegen_c silent drop → emitted ELF has no e_entry/phdr contents. Highest-blast-radius bug in the repo.
 
 **Run:** 29/52 | **LOC:** 1,051 (src/linker.rs: 968) | **Status:** LIVE — `build` path for x86-64/arm64/riscv
+
+
+> C2 fixed 2026-10-23 (v3): unknown-symbol skip → `LinkerResult::Err("Undefined symbols: …")` in both text and rodata reloc passes (was rel32=0 fallthrough).
 
 ## Where it's called
 

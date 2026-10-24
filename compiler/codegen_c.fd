@@ -2335,6 +2335,30 @@ fn unaryop_to_str(op: UnaryOp) -> str {
 
 // --- Function / instruction emission --------------------------------------
 
+fn alloca_size(self: &CCodeGen, ty: IrType) -> i64 {
+    // For struct types, look up the actual size from struct_layouts.
+    // ir_type_size() returns 0 for structs because it doesn't have
+    // access to the module. Without this lookup, alloca only
+    // allocates 8 bytes (the fallback), causing buffer overflows
+    // when memcpy copies the full struct data.
+    var size: i64 = 0;
+    match ty {
+        IrType::Struct(sname) => {
+            var si: i64 = 0;
+            while si < self.struct_layouts.len() {
+                if self.struct_layouts.get(si).name == sname {
+                    size = self.struct_layouts.get(si).layout.size;
+                    break;
+                }
+                si = si + 1;
+            }
+        }
+        _ => { size = ir_type_size(ty); }
+    }
+    if size == 0 { size = 8; }
+    return size;
+}
+
 fn gen_function(self: &mut CCodeGen, name: str, func: IrFunction) -> void {
     value_names_clear(self);
     self.temp_counter = 0;
@@ -2388,7 +2412,33 @@ fn gen_function(self: &mut CCodeGen, name: str, func: IrFunction) -> void {
         i = i + 1;
     }
 
+    // Prologue alloca pre-pass: bind one stack slot per Inst::Alloca at
+    // function entry. The zero-init memset is still emitted at the
+    // instruction's own site, so loop iterations re-clear the slot while
+    // the stack itself grows only once per call instead of per iteration.
     var b: i64 = 0;
+    while b < func.blocks.len() {
+        var ablock: BasicBlock = func.blocks.get(b);
+        var j: i64 = 0;
+        while j < ablock.instructions.len() {
+            var ainst_id: i64 = ablock.instructions.get(j);
+            match find_inst(func.insts, ainst_id) {
+                OptInst::Some(ait) => {
+                    match ait {
+                        Inst::Alloca(aty, _) => {
+                            wln(self, "    v" + int_to_str(ainst_id) + " = alloca(" + int_to_str(alloca_size(self, aty)) + ");");
+                        }
+                        _ => {}
+                    }
+                }
+                OptInst::None => {}
+            }
+            j = j + 1;
+        }
+        b = b + 1;
+    }
+
+    b = 0;
     while b < func.blocks.len() {
         var block: BasicBlock = func.blocks.get(b);
         if b > 0 {
@@ -2504,30 +2554,15 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
             wln(self, "    " + dst + " = " + uop + o + ";");
         }
         Inst::Alloca(ty, _) => {
-            // For struct types, look up the actual size from struct_layouts.
-            // ir_type_size() returns 0 for structs because it doesn't have
-            // access to the module. Without this lookup, alloca only
-            // allocates 8 bytes (the fallback), causing buffer overflows
-            // when memcpy copies the full struct data.
-            var size: i64 = 0;
-            match ty {
-                IrType::Struct(sname) => {
-                    var si: i64 = 0;
-                    while si < self.struct_layouts.len() {
-                        if self.struct_layouts.get(si).name == sname {
-                            size = self.struct_layouts.get(si).layout.size;
-                            break;
-                        }
-                        si = si + 1;
-                    }
-                }
-                _ => { size = ir_type_size(ty); }
-            }
-            if size == 0 { size = 8; }
-            // Use alloca() for stack allocation instead of calloc() for heap.
-            // This is dramatically faster - no syscall, no malloc overhead.
-            // Memory is automatically freed when the function returns.
-            wln(self, "    " + dst + " = alloca(" + int_to_str(size) + ");");
+            // The alloca() call itself is emitted once in the function
+            // prologue (see gen_function's alloca pre-pass): an alloca
+            // inside a loop block would otherwise burn fresh stack on
+            // every iteration — alloca memory is only reclaimed at
+            // function return — and overflow the native stack on
+            // high-trip-count loops. The slot is reused across
+            // iterations; only the zero-init stays here so each
+            // iteration still sees cleared storage.
+            var size: i64 = alloca_size(self, ty);
             wln(self, "    memset(" + dst + ", 0, " + int_to_str(size) + ");");
         }
         Inst::Load(ptr, ty) => {

@@ -1,13 +1,27 @@
-# green_thread.fd — cooperative green threads (386 LOC)
+# green_thread.fd — cooperative green threads (207 LOC)
+
+> **CONSOLIDATED + VERIFIED LIVE 2026-10-23 (v2):** the three-layer fiction
+> is one real layer now —
+> * `gt_global_*` constant stubs **deleted**; `green_thread_c_runtime`
+>   130-line C blob **deleted** (F3's name-mismatch stranded code gone).
+> * `GreenThread.func_id` → `func_name: str` — matches the C backend's
+>   name→fnptr dispatch model.
+> * `interp.fd` owns an `Interpreter.gt_scheduler`; `p_gt_spawn` queues a
+>   READY thread, `p_gt_run_all` resolves the name and **executes** it,
+>   `p_gt_is_done`/`p_gt_get_result` return real state (F1, F4 fixed).
+>   `p_thread_spawn`/`p_future_poll`/`p_executor_*` given the same real
+>   treatment — `spawn f(x)`/`await` now return actual results.
+> * VERIFIED: spawn/await → 41; multi-spawn `9 16 25` → 50 aggregate.
+> * F2 (no C backend for `p_gt_*`) **remains**: C-compiled programs calling
+>   gt builtins still fail to link — pending a C-runtime table or
+>   runtime.fd fold-in (Phase 2).
 
 ## Role
 
-`GreenThread`/`GreenThreadScheduler` (in-process simulation),
-`gt_global_*` interpreter-facing API, and `green_thread_c_runtime()`
-— a ~130-line embedded C source with real x86-64 context switching
-(`gt_save_context`/`gt_restore_context` via inline asm, 64KB stacks,
-256 threads, function dispatch table). Port of `src/green_thread.rs`
-(600 LOC — dead there too: zero `green_thread::` refs in `src/`).
+`GreenThread`/`GreenThreadScheduler` — the single scheduler layer, driven
+by `compiler/interp.fd`'s `p_gt_*` handlers (lazy cooperative semantics:
+spawn queues, run_all executes by name). Port of `src/green_thread.rs`
+(600 LOC — dead there too).
 
 ## Where it's called
 
@@ -57,16 +71,13 @@ touch a scheduler. `run_all` (:179-199) also just marks every thread
 
 ## Verification state
 
-- Stub constants verified by reading every `gt_global_*` body.
-- **Re-verified 2026-10-23:** F1–F4 all still stand. `p_gt_*` in interp does call
-  `gt_global_*` — but `gt_global_spawn` returns 0 without evaluating the fn
-  (:214-216), `run_all` returns 0, `is_done` true. And `codegen_c.fd` still has
-  zero `p_gt_*` implementations → C-path link failure on any gt program.
-- `p_gt_*` absence in codegen_c verified by grep; lower externs
-  confirmed at :1768-1774.
-- Dead-in-Rust confirmed: no `green_thread::`/`p_gt_` references
-  in `src/`.
-- Net: interp = silent no-op spawn; C = link failure; runtime = dead.
+- **LIVE-VERIFIED 2026-10-23:** self-hosted compiler runs `spawn worker(20)`
+  → `await f` → 41 (real result, not 0); three spawned computations →
+  `9 16 25` → aggregate 50. `is_done`/`get_result` read actual scheduler
+  state. tests/selfhost/test_spawn_gt.fd covers 4 cases.
+- F2 still open: `codegen_c.fd` has zero `p_gt_*` → C-path link failure on
+  gt programs (needs a name→fnptr table like `p_thread_spawn` uses).
+- Dead-in-Rust confirmed: no `green_thread::`/`p_gt_` refs in `src/`.
 
 ## Next
 

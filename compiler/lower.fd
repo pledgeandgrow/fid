@@ -466,6 +466,7 @@ pub struct Lowerer {
     pub current_captures: Vec<ClosureCapture>,
     pub try_stack: Vec<TryContext>,
     pub effect_handler_stack: Vec<Vec<EffectHandler>>,
+    pub scope_executor_stack: Vec<i64>,
     pub current_line: OptU64,
     pub type_aliases: Vec<StringTypeEntry>,
     pub current_self_type: OptStringLower,
@@ -517,6 +518,7 @@ pub fn Lowerer_new() -> Lowerer {
         current_captures: Vec::new(),
         try_stack: Vec::new(),
         effect_handler_stack: Vec::new(),
+        scope_executor_stack: Vec::new(),
         current_line: OptU64::None,
         type_aliases: Vec::new(),
         current_self_type: OptStringLower::None,
@@ -880,10 +882,6 @@ pub fn Lowerer_is_extern_func(self: &Lowerer, name: str) -> bool {
         i = i + 1;
     }
     return false;
-}
-
-fn lower_str_starts_with(s: str, prefix: str) -> bool {
-    return p_string_starts_with(s, prefix);
 }
 
 pub fn Lowerer_lookup_param_type(self: &Lowerer, name: str) -> OptType {
@@ -1763,6 +1761,7 @@ pub fn Lowerer_register_runtime(self: &mut Lowerer) {
     Lowerer_add_extern_1(self, "p_task_is_ready", IrType::I64, IrType::Bool);
     Lowerer_add_extern_1(self, "p_executor_run_all", IrType::I64, IrType::I64);
     Lowerer_add_extern_1(self, "p_executor_poll_all", IrType::I64, IrType::I64);
+    Lowerer_add_extern_1(self, "p_executor_cancel", IrType::I64, IrType::I64);
 
     // Green threads (cooperative scheduler)
     Lowerer_add_extern_2(self, "p_gt_spawn", IrType::I64, lw_ptr_u8(), IrType::I64);
@@ -3331,6 +3330,30 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
         Stmt::Use(_path, _items, _line) => {
             // Use statements are resolved at import time - no-op in lowering
         }
+        Stmt::Resume(cont, value, _line) => {
+            // L3A: resume(cont, value) — call the continuation closure.
+            // Closure ABI: (env: *u8, value: i64) -> i64; CallPtr passes the
+            // env pointer as first arg automatically (has_env = true).
+            var cont_val: i64 = Lowerer_lower_expr(self, cont);
+            var value_val: i64 = Lowerer_lower_expr(self, value);
+            var _r: i64 = Lowerer_emit_inst(self, Inst::CallPtr(cont_val, lw_c_vec1_i64(value_val), IrType::I64, EffectSet_new(), true));
+        }
+        Stmt::SpawnScope(body, _line) => {
+            // L3B: spawn scope { body } — create an executor, lower the body
+            // (spawn exprs use the top-of-stack executor), then join at exit.
+            var exec: i64 = Lowerer_emit_inst(self, Inst::Call("p_executor_new", Vec::new(), IrType::I64, EffectSet_new()));
+            self.scope_executor_stack.push(exec);
+            Lowerer_lower_stmts(self, body);
+            self.scope_executor_stack.pop();
+            var _j: i64 = Lowerer_emit_inst(self, Inst::Call("p_executor_run_all", lw_c_vec1_i64(exec), IrType::I64, EffectSet_new()));
+        }
+        Stmt::CancelScope(_line) => {
+            // L3E: cancel scope; — cancel all pending tasks in current scope
+            if self.scope_executor_stack.len() > 0 {
+                var exec2: i64 = self.scope_executor_stack.get(self.scope_executor_stack.len() - 1);
+                var _c: i64 = Lowerer_emit_inst(self, Inst::Call("p_executor_cancel", lw_c_vec1_i64(exec2), IrType::I64, EffectSet_new()));
+            }
+        }
     }
 }
 
@@ -3959,7 +3982,7 @@ fn Lowerer_lower_call_expr(self: &mut Lowerer, callee: str, args: Vec<Expr>) -> 
 
     var call_args: Vec<i64> = Vec::new();
     var is_user_func: bool = Lowerer_is_user_func(self, callee);
-    var is_runtime: bool = !is_user_func && (lower_str_starts_with(callee, "p_") || lower_str_starts_with(callee, "__ecs_"));
+    var is_runtime: bool = !is_user_func && (str_starts_with(callee, "p_") || str_starts_with(callee, "__ecs_"));
     if is_user_func && !is_runtime {
         call_args.push(Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64)));
     }

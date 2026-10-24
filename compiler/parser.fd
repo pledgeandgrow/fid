@@ -2503,6 +2503,38 @@ if token_kind_eq(k, TokenKind::Select) { return self.parse_select_stmt(); }
 if token_kind_eq(k, TokenKind::Use) { return self.parse_use_stmt(); }
 if token_kind_eq(k, TokenKind::Handle) { return self.parse_handle_stmt(); }
 if token_kind_eq(k, TokenKind::Do) { return self.parse_do_stmt(); }
+if token_kind_eq(k, TokenKind::Resume) { return self.parse_resume_stmt(); }
+// L3B: `spawn scope { body }` — structured concurrency scope (contextual:
+// only when spawn is followed by ident "scope" and '{')
+if token_kind_eq(k, TokenKind::Spawn) && self.pos + 2 < self.tokens.len() {
+    var ss_next: Token = self.tokens.get(self.pos + 1);
+    var ss_next2: Token = self.tokens.get(self.pos + 2);
+    match ss_next.kind {
+        TokenKind::Ident(scope_name) => {
+            if str_equal(scope_name, "scope") && token_kind_eq(ss_next2.kind, TokenKind::LBrace) {
+                return self.parse_spawn_scope_stmt();
+            }
+        }
+        _ => {}
+    }
+}
+// L3E: `cancel scope;` — cancel all tasks in the current spawn scope
+match k {
+    TokenKind::Ident(cancel_name) => {
+        if str_equal(cancel_name, "cancel") && self.pos + 1 < self.tokens.len() {
+            var c_next: Token = self.tokens.get(self.pos + 1);
+            match c_next.kind {
+                TokenKind::Ident(scope_name2) => {
+                    if str_equal(scope_name2, "scope") {
+                        return self.parse_cancel_scope_stmt();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    _ => {}
+}
 if token_kind_eq(k, TokenKind::Region) { return self.parse_region_block(); }
 if token_kind_eq(k, TokenKind::Sandbox) { return self.parse_sandbox_block(); }
 if token_kind_eq(k, TokenKind::Unsafe) { return self.parse_unsafe_block(); }
@@ -3387,6 +3419,83 @@ match self.expect(TokenKind::RParen, ")") {
 }
 self.match_tok(TokenKind::Semicolon);
 return ParseResultStmt::Ok(Stmt::Do(effect, op, args, line));
+}
+
+// L3A: `resume(cont, value)` — call the continuation captured by the
+// enclosing effect handler with the given value.
+fn parse_resume_stmt(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect(TokenKind::Resume, "resume") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+match self.expect(TokenKind::LParen, "(") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var cont: Expr = Expr::IntLit(0);
+match self.parse_expr() {
+    ParseResultExpr::Ok(e) => { cont = e; }
+    ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::Comma, ",") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var value: Expr = Expr::IntLit(0);
+match self.parse_expr() {
+    ParseResultExpr::Ok(e2) => { value = e2; }
+    ParseResultExpr::Err(e2) => { return ParseResultStmt::Err(e2); }
+}
+match self.expect(TokenKind::RParen, ")") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+self.match_tok(TokenKind::Semicolon);
+return ParseResultStmt::Ok(Stmt::Resume(cont, value, line));
+}
+
+// L3B: `spawn scope { body }` — structured concurrency scope
+fn parse_spawn_scope_stmt(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect(TokenKind::Spawn, "spawn") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+// "scope" is a contextual identifier, not a keyword
+match self.expect_ident() {
+    ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultStr::Ok(_) => {}
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var body: Vec<Stmt> = Vec::new();
+match self.parse_block() {
+    ParseResultStmts::Ok(b) => { body = b; }
+    ParseResultStmts::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+return ParseResultStmt::Ok(Stmt::SpawnScope(body, line));
+}
+
+// L3E: `cancel scope;` — cancel all pending tasks in the current spawn scope
+fn parse_cancel_scope_stmt(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect_ident() {
+    ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultStr::Ok(_) => {}
+}
+match self.expect_ident() {
+    ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultStr::Ok(_) => {}
+}
+self.match_tok(TokenKind::Semicolon);
+return ParseResultStmt::Ok(Stmt::CancelScope(line));
 }
 
 fn parse_region_block(self: &mut Parser) -> ParseResultStmt {
@@ -5164,15 +5273,13 @@ if c == 123 {
         }
     }
     // Re-lex and parse the expression
-    // TODO: Re-enable when cross-module Lexer usage is fixed
-    // var sub_lexer: Lexer = Lexer::new(expr_src);
-    // var sub_tokens: Vec<Token> = sub_lexer.tokenize();
-    // var sub_parser: Parser = Parser::new(sub_tokens);
-    // match sub_parser.parse_expr() {
-    //     ParseResultExpr::Ok(e) => { parts.push(FStringPart::Expr(e)); }
-    //     ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
-    // }
-    parts.push(FStringPart::Literal(expr_src));
+    var sub_lexer: Lexer = Lexer::new(expr_src);
+    var sub_tokens: Vec<Token> = sub_lexer.tokenize();
+    var sub_parser: Parser = Parser::new(sub_tokens);
+    match sub_parser.parse_expr() {
+        ParseResultExpr::Ok(e) => { parts.push(FStringPart::Expr(e)); }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
 } else {
     current = current + byte_to_str(c);
     i = i + 1;

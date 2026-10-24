@@ -1755,8 +1755,9 @@ pub fn build_executable(source: str, source_path: str, target: str, do_opt: bool
                 return ResultBytes::Err(c_vec1(LinkerResult_err_msg(link_result)));
             }
             if str_equal(target, "x86-64-windows") || str_equal(target, "x64-windows") || str_equal(target, "windows") {
-                // Windows PE cross-compilation
-                var pe_bytes: Vec = generate_pe(module);
+                // Windows PE — user code flows through the shared
+                // codegen_x64 pipeline (L3 -> asm -> ElfEmitter -> PE)
+                var pe_bytes: Vec = generate_pe(module, l3);
                 return ResultBytes::Ok(pe_bytes);
             }
             if str_equal(target, "arm64") || str_equal(target, "aarch64") {
@@ -1764,7 +1765,9 @@ pub fn build_executable(source: str, source_path: str, target: str, do_opt: bool
                 var asm_arm: str = generate_asm_arm64(l3);
                 // Assemble ARM64 assembly into machine code
                 var arm_obj: Vec<i64> = Vec::new();
+                var arm_rodata: Vec<i64> = Vec::new();
                 var arm_syms: Vec<LinkerSymbol> = Vec::new();
+                var arm_rodata_syms: Vec<LinkerRodataSym> = Vec::new();
                 var arm_relocs: Vec<LinkerReloc> = Vec::new();
                 match assemble_arm64(asm_arm) {
                     ResultArm64Assemble::Ok(arm_result) => {
@@ -1773,11 +1776,22 @@ pub fn build_executable(source: str, source_path: str, target: str, do_opt: bool
                             arm_obj.push(arm_result.text.get(oi));
                             oi = oi + 1;
                         }
+                        var roi: i64 = 0;
+                        while roi < arm_result.rodata.len() {
+                            arm_rodata.push(arm_result.rodata.get(roi));
+                            roi = roi + 1;
+                        }
                         var asi: i64 = 0;
                         while asi < arm_result.symbols.len() {
                             var s: Arm64Symbol = arm_result.symbols.get(asi);
                             arm_syms.push(LinkerSymbol_new(s.name, s.offset, true));
                             asi = asi + 1;
+                        }
+                        var rasi: i64 = 0;
+                        while rasi < arm_result.rodata_symbols.len() {
+                            var rs: Arm64Symbol = arm_result.rodata_symbols.get(rasi);
+                            arm_rodata_syms.push(LinkerRodataSym_new(rs.name, rs.offset));
+                            rasi = rasi + 1;
                         }
                         var ari: i64 = 0;
                         while ari < arm_result.relocations.len() {
@@ -1818,7 +1832,7 @@ pub fn build_executable(source: str, source_path: str, target: str, do_opt: bool
                     rri2 = rri2 + 1;
                 }
                 var arm_link_result: LinkerResult = link_raw_with_runtime_for_target(
-                    arm_obj, arm_syms, arm_relocs, Vec::new(), Vec::new(),
+                    arm_obj, arm_syms, arm_relocs, arm_rodata, arm_rodata_syms,
                     "_start",
                     rt_arm.text, rt_arm_syms,
                     rt_arm.rodata, rt_arm_rodata_syms,

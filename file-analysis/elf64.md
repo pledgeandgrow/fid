@@ -1,6 +1,11 @@
 # elf64.fd — ELF64 assembler + object writer (2,693 LOC)
 
-> **Re-verified 2026-10-23:** all CRITICAL findings confirmed — `offset*256+base` pack + trunc-division decode (:624, ~40 sites incl. the `off+256` pseudo-fix at :857), `.rela.rodata` collected never emitted, `jo`/`movapd` unhandled while codegen_x64 emits `movapd` (:1896/1910). `encode_asm_block` exists (:2477) but runtime_linux never calls it.
+> > **FIXED 2026-10-23 (v2):** (a) `offset*256+base` decode → `floor_div`/`floor_mod` at all 68 sites; wrong `off+=256` pseudo-fix removed. (b) `movapd`/`movupd`/`movaps`/`movups` + `jo`(0x80)/`jno`(0x81) + `addpd`-`xorpd` encoders wired. (c) `.rela.rodata` emitted as sec 7 + header (was collected, never emitted); `.rela.text` `sh_link`/`sh_info` un-swapped (1/3→3/1). `encode_asm_block` IS called now (runtime_linux:2858).
+
+> *Superseded re-verify:* all CRITICAL findings confirmed — `offset*256+base` pack + trunc-division decode (:624, ~40 sites incl. the `off+256` pseudo-fix at :857), `.rela.rodata` collected never emitted, `jo`/`movapd` unhandled while codegen_x64 emits `movapd` (:1896/1910). `encode_asm_block` exists (:2477) but runtime_linux never calls it.
+
+
+> C1 also fixed 2026-10-23 (v3): hex-immediate parse added via `parse_dollar_imm` — `xorq $0x5DEADBEEFCAFEBABE` canary no longer encodes as `xor $0` (was F4). Applied to encode_alu, encode_cmp, mov imm→mem.
 
 ## Role
 
