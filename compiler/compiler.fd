@@ -32,6 +32,7 @@ use compiler::typechecker;
 use compiler::lower;
 use compiler::mono;
 use compiler::borrowck;
+use compiler::escape;
 use compiler::codegen_c;
 use compiler::comptime_eval;
 use compiler::pe;
@@ -855,6 +856,15 @@ pub fn build_program_no_std_borrowck(source: str, source_path: OptStr, borrowck_
                 }
                 return ResultProgram::Err(enrich_errors(tc.errors, source, file3));
             }
+            var escape_errors: Vec<str> = escape_check(program);
+            if escape_errors.len() > 0 {
+                var file6: str = "<stdin>";
+                match source_path {
+                    OptStr::Some(p6) => { file6 = p6; }
+                    OptStr::None => { }
+                }
+                return ResultProgram::Err(enrich_errors(escape_errors, source, file6));
+            }
             // G8.2: Borrow check -- same mode handling as the stdlib path.
             //   "off"  : skip borrow checking entirely
             //   "warn" : report errors as warnings, don't fail
@@ -1353,6 +1363,17 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         }
                         return ResultProgram::Err(enrich_errors(tc.errors, source, file3));
                     }
+                    // References are second-class: none may outlive what it points to.
+                    var escape_errors: Vec<str> = escape_check(program);
+                    if escape_errors.len() > 0 {
+                        p_eprint_str("[build] FAILED: reference errors\n");
+                        var file5: str = "<stdin>";
+                        match source_path {
+                            OptStr::Some(p5) => { file5 = p5; }
+                            OptStr::None => { }
+                        }
+                        return ResultProgram::Err(enrich_errors(escape_errors, source, file5));
+                    }
                     p_eprint_str("[build] Type check ok.\n");
                     var t_bc: i64 = p_clock_now_ms();
                     p_eprint_str("[prof] typecheck: ");
@@ -1551,6 +1572,10 @@ pub fn lint_source(source: str, source_path: str) -> ResultVecStr {
                     if tc.errors.len() > 0 {
                         var file: str = source_path;
                         return ResultVecStr::Err(enrich_errors(tc.errors, source, file));
+                    }
+                    var escape_errors: Vec<str> = escape_check(program);
+                    if escape_errors.len() > 0 {
+                        return ResultVecStr::Err(enrich_errors(escape_errors, source, source_path));
                     }
 
                     // Run lints

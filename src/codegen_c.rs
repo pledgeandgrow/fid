@@ -2064,6 +2064,21 @@ impl CCodeGen {
                             // add a (void*) cast to satisfy C type checking.
                             let dst_is_ptr = matches!(dst_ty, Some(IrType::Ptr(_)) | Some(IrType::Opaque(_)) | Some(IrType::Generic(_, _)));
                             let callee_returns_int = callee_c_ret == "int64_t" || callee_c_ret == "int32_t" || callee_c_ret == "int16_t" || callee_c_ret == "int8_t";
+                            // A float destination fed by an int- or pointer-returning
+                            // callee holds the 8-byte word a generic container stored
+                            // (Vec_get on a Vec<f64>): reinterpret the bits, as the
+                            // self-hosted backend does, instead of converting them.
+                            let callee_returns_word = callee_returns_int || callee_c_ret.ends_with('*');
+                            let pun = match dst_ty {
+                                Some(IrType::F64) if callee_returns_word => Some(("int64_t", "double", "d")),
+                                Some(IrType::F32) if callee_returns_word => Some(("int32_t", "float", "f")),
+                                _ => None,
+                            };
+                            if let Some((int_ty, float_ty, member)) = pun {
+                                wln!(self, "    {} = ((union {{ {} i; {} {}; }}){{ .i = ({})(intptr_t){}({}) }}).{};",
+                                    dst, int_ty, float_ty, member, int_ty, c_fname, args_joined, member);
+                                return;
+                            }
                             let cast = match dst_ty {
                                 Some(IrType::Ptr(_)) | Some(IrType::Opaque(_)) | Some(IrType::Generic(_, _)) => {
                                     if dst_is_ptr && callee_returns_int {

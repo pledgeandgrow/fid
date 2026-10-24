@@ -1013,6 +1013,18 @@ impl Interpreter {
         self.panic_stack_trace.clone()
     }
 
+    /// A generic container hands back the 8-byte word it stored; a call
+    /// typed f64/f32 (a `Vec<f64>` element via `Vec_get`) reads those bits as
+    /// a float. (Functions declared `-> f64` convert integer results at
+    /// `return`, so an Int reaching such a call is always a stored word.)
+    fn reinterpret_word(v: Value, ty: &IrType) -> Value {
+        match (ty, &v) {
+            (IrType::F64, Value::Int(bits)) => Value::Float(f64::from_bits(*bits as u64)),
+            (IrType::F32, Value::Int(bits)) => Value::Float(f32::from_bits(*bits as u32) as f64),
+            _ => v,
+        }
+    }
+
     /// Run a specific function with arguments
     fn run_function(&mut self, func: &IrFunction, args: &[Value]) -> RunResult {
         // SH-1.4: Recursion depth limit — check before pushing to call_stack.
@@ -1722,7 +1734,7 @@ impl Interpreter {
             }
 
             // ─── Function Calls ───
-            Inst::Call { func: name, args, .. } => {
+            Inst::Call { func: name, args, ret_ty, .. } => {
                 let arg_vals: Vec<Value> = args.iter()
                     .map(|a| values.get(a).cloned().unwrap_or(Value::Void))
                     .collect();
@@ -1736,7 +1748,7 @@ impl Interpreter {
                 if let Some(callee) = self.module.functions.get(name).cloned() {
                     self.pending_call_site = func.values.get(&inst_id).and_then(|m| m.source_line);
                     return match self.run_function(&callee, &arg_vals) {
-                        RunResult::Return(v) => ExecOutcome::Value(v),
+                        RunResult::Return(v) => ExecOutcome::Value(Self::reinterpret_word(v, ret_ty)),
                         RunResult::Panic(msg) => ExecOutcome::Panic(msg),
                         RunResult::Paused => ExecOutcome::Continue,
                     };

@@ -1581,6 +1581,11 @@ fn main() {
                 "test_box_owned_fail",
                 "test_duplicate_fn_fail",
                 "test_missing_return_break_fail",
+                // Reference escape check: references outliving what they point to
+                "test_escape_return_fail",
+                "test_escape_scope_fail",
+                "test_escape_store_fail",
+                "test_escape_closure_fail",
             ];
 
 

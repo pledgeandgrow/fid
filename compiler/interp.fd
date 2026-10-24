@@ -47,6 +47,23 @@ pub enum Value {
 }
 
 pub fn Value_int(v: i64) -> Value { return Value::Int(v); }
+
+// A generic container hands back the 8-byte word it stored; a call typed f64
+// (a Vec<f64> element via Vec_get) reads those bits as a float. Functions
+// declared `-> f64` convert integer results at `return`, so an Int reaching
+// such a call is always a stored word.
+pub fn interp_reinterpret_word(v: Value, ty: IrType) -> Value {
+    match ty {
+        IrType::F64 => {
+            match v {
+                Value::Int(bits) => { return Value::Float(p_f64_from_bits(bits)); }
+                _ => { return v; }
+            }
+        }
+        _ => { return v; }
+    }
+    return v;
+}
 pub fn Value_float(v: f64) -> Value { return Value::Float(v); }
 pub fn Value_bool(v: bool) -> Value { return Value::Bool(v); }
 pub fn Value_str(v: str) -> Value { return Value::Str(v); }
@@ -1366,7 +1383,7 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
         }
 
         // ─── Function Calls ───
-        Inst::Call(name, arg_ids, _, _) => {
+        Inst::Call(name, arg_ids, call_ret_ty, _) => {
             var arg_vals: Vec<Value> = Vec::new();
             var ai: i64 = 0;
             while ai < arg_ids.len() {
@@ -1393,7 +1410,7 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                     }
                     var result: RunResult = Interpreter_run_function(self, callee, arg_vals);
                     match result {
-                        RunResult::Return(v) => { return ExecOutcome::Value(v); }
+                        RunResult::Return(v) => { return ExecOutcome::Value(interp_reinterpret_word(v, call_ret_ty)); }
                         RunResult::Panic(msg) => { return ExecOutcome::Panic(msg); }
                         RunResult::Paused => { return ExecOutcome::Continue; }
                     }

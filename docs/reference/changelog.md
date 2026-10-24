@@ -1,5 +1,45 @@
 # Fides Language Changelog
 
+## Session 29 — References Can No Longer Dangle (Oct 24, 2026)
+
+### Reference escape check (`src/escape.rs`, `compiler/escape.fd`)
+
+References are now second-class, as in Swift (`inout`) and Hylo: a reference
+may be passed to a call, held in a local and returned when it comes from a
+reference parameter, and is never kept anywhere it could outlive its target.
+No lifetime annotations: which parameters reach each function's result is
+inferred to a fixpoint. Rejected now (all accepted before, several
+memory-unsafe in the C backend):
+
+| Rejected | Example |
+|----------|---------|
+| Returning a reference to a local or by-value parameter | `fn f() -> &i64 { var x = 1; return &x; }` |
+| Storing a reference (field, collection, global, `&&T`) | `struct S { r: &i64 }`, `v.push(&x)` |
+| A reference outliving its block | `{ var b = 2; r = &b; } use(r)` |
+| A block value pointing at its own local | `val r = { var t = 5; &t };` |
+| References as generic arguments, sent to tasks | `id(&x)`, `spawn work(&x)` |
+| Escaping closures that capture a reference | `return fn() { *r };` with `r = &local` |
+
+The compiler, stdlib, tests and examples needed no changes except one real
+bug the check found: `Tensor_softmax` (`compiler/tensor.fd`) returned its
+input for 0-dim tensors and otherwise wrote its result into the input
+tensor's shared data `Vec`. Design and rules: `docs/guides/references.md`.
+
+### Bugs fixed
+
+| Bug | Fix |
+|-----|-----|
+| `Vec<f64>` elements read as raw bits: `v[0] + v[1]` added bit patterns as integers (interpreter panicked with overflow) and the Rust C backend converted them numerically | The interpreter and the Rust C backend reinterpret the 8-byte word a call returns when it is typed `f64`/`f32` (`src/interp.rs`, `src/codegen_c.rs`, `compiler/interp.fd`) |
+| `fn f() -> f64 { return 1; }` returned an integer (`f() + 0.5` panicked; PE returned 0.5) | `return` and the implicit tail convert an integer result of a float function numerically (`src/lower.rs`, `compiler/lower.fd`) |
+| Self-hosted C backend cast a `void*` straight to `double` for `p_vec_get` on a `Vec<f64>`, so the self-hosted compiler could not rebuild itself | `p_vec_get`/`first`/`last`/`remove` registered as pointer-returning; the call result is type-punned (`compiler/codegen_c.fd`) |
+
+### Verification
+
+Self-hosting fixpoint holds (stage 2 == stage 3, line endings normalized);
+the compiler, all tests and examples type-check with no regression;
+`fidesc test` (interpreter / C / PE) has no regression. New tests:
+`test_references`, `test_vec_f64`, `test_escape_{return,scope,store,closure}_fail`.
+
 ## Session 28 — Branch Consolidation (Oct 24, 2026)
 
 All work is now on `main`: `release-infra` ("Stabilise for release V2") was

@@ -1523,6 +1523,11 @@ impl Lowerer {
                 self.emit_terminator(Inst::Return { value: None });
             } else {
                 // Non-struct return: use the function's return type
+                let is_void = self.current_func.as_ref().map_or(true, |f| f.ret_ty == IrType::Void);
+                let last_expr_val = match last_expr_val {
+                    Some(val) if !is_void => Some(self.coerce_return(val)),
+                    other => other,
+                };
                 let ret_val = if let Some(ref f) = self.current_func {
                     if f.ret_ty == IrType::Void {
                         None
@@ -2430,7 +2435,10 @@ impl Lowerer {
                     self.emit_terminator(Inst::Return { value: None });
                 } else {
                     let ret_val = match expr {
-                        Some(e) => Some(self.lower_expr(e)),
+                        Some(e) => {
+                            let v = self.lower_expr(e);
+                            Some(self.coerce_return(v))
+                        }
                         None => None,
                     };
                     self.emit_terminator(Inst::Return { value: ret_val });
@@ -6839,6 +6847,20 @@ impl Lowerer {
                 self.collect_free_vars_expr(inner, free_vars, local_names);
             }
         }
+    }
+
+    /// A function declared `-> f64`/`-> f32` may return an integer expression
+    /// (`return 1;`): convert it numerically, as `val x: f64 = 1;` does.
+    fn coerce_return(&mut self, val: ValueId) -> ValueId {
+        let ret_ty = match &self.current_func {
+            Some(f) => f.ret_ty.clone(),
+            None => return val,
+        };
+        let val_ty = self.get_value_type(val);
+        if ret_ty.is_float() && val_ty.is_int() {
+            return self.lower_cast(val, val_ty, ret_ty);
+        }
+        val
     }
 
     /// Lower a type cast (expr as Type)

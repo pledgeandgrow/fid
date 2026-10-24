@@ -579,6 +579,13 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
         return Err(enrich_errors(&tc.errors, source, file));
     }
 
+    // References are second-class: none may outlive what it points to.
+    let escape_errors = crate::escape::check(&program);
+    if !escape_errors.is_empty() {
+        let file = source_path.unwrap_or("<stdin>");
+        return Err(enrich_errors(&escape_errors, source, file));
+    }
+
     // Run lint checks (warnings only, never errors)
     tc.run_lints(&program);
 
@@ -1549,6 +1556,11 @@ fn build_program_with_lints(source: &str, source_path: Option<&str>) -> Result<(
         let file = source_path.unwrap_or("<stdin>");
         return Err(enrich_errors(&tc.errors, source, file));
     }
+    let escape_errors = crate::escape::check(&program);
+    if !escape_errors.is_empty() {
+        let file = source_path.unwrap_or("<stdin>");
+        return Err(enrich_errors(&escape_errors, source, file));
+    }
 
     // Run lints
     tc.run_lints(&program);
@@ -1924,6 +1936,10 @@ pub fn emit_bare(source: &str, _source_path: &str) -> Result<Vec<u8>, Vec<String
     if !tc.errors.is_empty() {
         return Err(tc.errors);
     }
+    let escape_errors = crate::escape::check(&user);
+    if !escape_errors.is_empty() {
+        return Err(escape_errors);
+    }
 
     // Lower to IR
     let module = lower::lower(&user);
@@ -2025,6 +2041,10 @@ pub fn emit_boot(source: &str, source_path: &str) -> Result<Vec<u8>, Vec<String>
     }
     if !tc.errors.is_empty() {
         return Err(tc.errors);
+    }
+    let escape_errors = crate::escape::check(&user);
+    if !escape_errors.is_empty() {
+        return Err(escape_errors);
     }
 
     // Merge: start with imported modules, then user (user wins)

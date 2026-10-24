@@ -2422,7 +2422,8 @@ pub fn Lowerer_lower_func(self: &mut Lowerer, func: Func) {
                 } else {
                     match last_expr_val {
                         OptValueId::Some(ret_val) => {
-                            Lowerer_emit_terminator(self, Inst::Return(OptValueId::Some(ret_val)));
+                            var coerced: i64 = Lowerer_coerce_return(self, ret_val);
+                            Lowerer_emit_terminator(self, Inst::Return(OptValueId::Some(coerced)));
                         }
                         OptValueId::None => {
                             // Implicit return of 0 for non-void functions
@@ -2967,7 +2968,8 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
                         }
                         OptValueId::None => {
                             var val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(e));
-                            Lowerer_emit_terminator(self, Inst::Return(OptValueId::Some(val)));
+                            var coerced: i64 = Lowerer_coerce_return(self, val);
+                            Lowerer_emit_terminator(self, Inst::Return(OptValueId::Some(coerced)));
                         }
                     }
                 }
@@ -6644,6 +6646,17 @@ pub fn Lowerer_lookup_func_ret_ty_ir(self: &Lowerer, name: str) -> IrType {
     // Check impl methods (mangled name)
     // The name should already be mangled at this point
     return IrType::I64;
+}
+
+/// A function declared `-> f64`/`-> f32` may return an integer expression
+/// (`return 1;`): convert it numerically, as `val x: f64 = 1;` does.
+pub fn Lowerer_coerce_return(self: &mut Lowerer, val: i64) -> i64 {
+    var ret_ty: IrType = self.current_func.ret_ty;
+    var val_ty: IrType = Lowerer_get_value_type(self, val);
+    if ir_type_is_float(ret_ty) && ir_type_is_int(val_ty) {
+        return Lowerer_lower_cast(self, val, val_ty, ret_ty);
+    }
+    return val;
 }
 
 pub fn Lowerer_lower_cast(self: &mut Lowerer, val: i64, src_ty: IrType, dst_ty: IrType) -> i64 {
