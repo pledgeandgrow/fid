@@ -2785,6 +2785,11 @@ impl Interpreter {
                 }
                 ExecOutcome::Value(Value::Void)
             }
+            "p_str_zeroize" | "p_vec_zeroize" => {
+                // @zeroize heap wipe: interpreter strings and Vecs are
+                // managed values, not raw memory, so there is nothing to wipe.
+                ExecOutcome::Value(Value::Void)
+            }
             "p_region_free" => {
                 // I-1C: Region bulk free — interpreter doesn't actually free
                 ExecOutcome::Value(Value::Void)

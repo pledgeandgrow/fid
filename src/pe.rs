@@ -4990,8 +4990,9 @@ impl PeCodeGen {
         self.enc.mov_rr(Reg::Rcx, Reg::R12); // handle
         self.enc.mov_rr(Reg::Rdx, Reg::R8);  // buffer
         self.enc.mov_rr(Reg::R8, Reg::R9);   // length
-        // r9 = &written = [rbp-32]
-        self.enc.lea_rbp(Reg::R9, -32);
+        // r9 = &written = [rbp-64]: below the digit buffer, which grows down
+        // from rbp-24 (at rbp-32 the zeroed count erased digits 2-5)
+        self.enc.lea_rbp(Reg::R9, -64);
         // zero the written count
         self.enc.xor_self(Reg::Rax);
         self.enc.mov_mem_disp_reg32(Reg::R9, 0, Reg::Rax);
@@ -5635,17 +5636,18 @@ impl PeCodeGen {
         let loop_end = self.enc.alloc_label();
         // if size <= 0, skip
         self.enc.test_rr(Reg::R8, Reg::R8);
-        self.enc.jcc_label(0x84, loop_end); // jz (ZF=1) → end
+        self.enc.jcc_label(0x4, loop_end); // jz (ZF=1) → end (cc 4: jcc_label adds 0x80; 0x84 wrapped to the invalid 0F 04)
         self.enc.place_label(loop_start);
         // Store byte: mov byte [rcx], dl
         self.enc.emit(&[0x88, 0x11]); // mov [rcx], dl
         // rcx++
         self.enc.emit(&[0x48, 0xFF, 0xC1]); // inc rcx
-        // r8--
-        self.enc.emit(&[0x48, 0xFF, 0xC8]); // dec r8
+        // r8-- (REX.B selects r8; 48 FF C8 would be `dec rax`, leaving the
+        // count unchanged so the loop zeroed the stack until it crashed)
+        self.enc.emit(&[0x49, 0xFF, 0xC8]); // dec r8
         // if r8 != 0, loop
         self.enc.test_rr(Reg::R8, Reg::R8);
-        self.enc.jcc_label(0x85, loop_start); // jnz → loop_start
+        self.enc.jcc_label(0x5, loop_start); // jnz → loop_start
         self.enc.place_label(loop_end);
         self.enc.ret();
     }

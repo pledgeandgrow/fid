@@ -55,6 +55,27 @@ fn print_errors(errors: &[String]) {
     }
 }
 
+/// Run `path` and capture its output, killing it after `limit`.
+fn run_with_timeout(path: &str, limit: std::time::Duration) -> Option<process::Output> {
+    let mut child = process::Command::new(path)
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if start.elapsed() < limit => std::thread::sleep(std::time::Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -1851,10 +1872,26 @@ fn main() {
                 let pe_out = process::Command::new(&current_exe)
                     .args(["emit", test_file, "-o", &pe_exe])
                     .output();
-                let pe_ok = pe_out
+                let pe_emitted = pe_out
                     .as_ref()
                     .map(|o| o.status.success() && std::path::Path::new(&pe_exe).exists())
                     .unwrap_or(false);
+                // Run the binary and compare its output with the interpreter's,
+                // as for C. (Bare-metal tests the C backend skips cannot run
+                // under an OS; for them a valid binary is the check.)
+                let pe_ok = if !pe_emitted {
+                    false
+                } else if c_skipped {
+                    true
+                } else {
+                    match run_with_timeout(&pe_exe, std::time::Duration::from_secs(30)) {
+                        Some(out) => {
+                            let pe_norm = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+                            pe_norm == interp_stdout.replace("\r\n", "\n")
+                        }
+                        None => false,
+                    }
+                };
                 let _ = fs::remove_file(&pe_exe);
 
                 if fail_only {
@@ -1891,7 +1928,7 @@ fn main() {
                 // Normal tests: only count non-known-fail tests in denominator
                 println!("Interpreter:  {}/{} passed", interp_pass, tested_count);
                 println!("C Codegen:    {}/{} matched", c_pass, tested_count);
-                println!("PE Emitter:   {}/{} valid", pe_pass, tested_count);
+                println!("PE Emitter:   {}/{} matched", pe_pass, tested_count);
 
                 // Report known-fail tests separately
                 let known_total = known_fail.len();

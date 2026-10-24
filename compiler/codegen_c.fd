@@ -1398,6 +1398,8 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_serial_getc(void);");
     wln(self, "int64_t p_serial_available(void);");
     wln(self, "void p_memset(void* ptr, int val, int64_t size);");
+    wln(self, "void p_str_zeroize(void* s);");
+    wln(self, "void p_vec_zeroize(void* v);");
     wln(self, "void p_lgdt(int64_t gdt_desc);");
     wln(self, "void p_enter_user_mode(int64_t entry, int64_t stack);");
     wln(self, "void p_pit_set_frequency(int64_t hz);");
@@ -4561,6 +4563,25 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_serial_getc(void) { return 0; }");
     wln(self, "int64_t p_serial_available(void) { return 0; }");
     wln(self, "void p_memset(void* ptr, int val, int64_t size) { if (ptr && size > 0) memset(ptr, val, (size_t)size); }");
+    // @zeroize: wipe a string's bytes when it lives in the arena (string
+    // literals are read-only and part of the binary anyway), and a Vec's
+    // whole element buffer. Volatile stores so the wipe is not elided.
+    wln(self, "void p_str_zeroize(void* s) {");
+    wln(self, "    if (!s) return;");
+    wln(self, "    for (__p_arena_chunk* c = __p_arena_head; c; c = c->next) {");
+    wln(self, "        if ((char*)s >= c->base && (char*)s < c->end) {");
+    wln(self, "            volatile char* p = (volatile char*)s;");
+    wln(self, "            while (p < (volatile char*)c->end && *p) { *p = 0; p++; }");
+    wln(self, "            return;");
+    wln(self, "        }");
+    wln(self, "    }");
+    wln(self, "}");
+    wln(self, "void p_vec_zeroize(void* v) {");
+    wln(self, "    PVec* pv = (PVec*)v;");
+    wln(self, "    if (!pv || !pv->data) return;");
+    wln(self, "    volatile char* p = (volatile char*)pv->data;");
+    wln(self, "    for (int64_t i = 0; i < pv->cap * (int64_t)sizeof(void*); i++) p[i] = 0;");
+    wln(self, "}");
     wln(self, "void p_lgdt(int64_t gdt_desc) { (void)gdt_desc; }");
     wln(self, "void p_enter_user_mode(int64_t entry, int64_t stack) { (void)entry; (void)stack; }");
     wln(self, "void p_pit_set_frequency(int64_t hz) { (void)hz; }");

@@ -1707,6 +1707,9 @@ pub fn Lowerer_register_runtime(self: &mut Lowerer) {
 
     // Memory
     Lowerer_add_extern_3(self, "p_memset", IrType::I64, IrType::I32, IrType::I64, IrType::Void);
+    // @zeroize: wipe the bytes a str / the buffer a Vec owns
+    Lowerer_add_extern_1(self, "p_str_zeroize", lw_ptr_u8(), IrType::Void);
+    Lowerer_add_extern_1(self, "p_vec_zeroize", IrType::I64, IrType::Void);
 
     // MMU/page table
     Lowerer_add_extern_0(self, "p_cr3_read", IrType::I64);
@@ -6407,6 +6410,33 @@ pub fn Lowerer_emit_zeroize(self: &mut Lowerer) {
     var i: i64 = self.current_func.zeroize_locals.len() - 1;
     while i >= 0 {
         var entry: ValueIdU64 = self.current_func.zeroize_locals.get(i);
+        // A str or Vec slot holds a pointer: wipe the bytes it points to too
+        // (a string in the arena, a Vec's element buffer), not just the
+        // 8-byte pointer.
+        match Lowerer_lookup_alloca_type(self, entry.id) {
+            OptIrType::Some(slot_ty) => {
+                var wipe: str = "";
+                match slot_ty {
+                    IrType::Ptr(inner) => {
+                        match box_ir_type_unbox(inner) {
+                            IrType::U8 => { wipe = "p_str_zeroize"; }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+                if ir_type_is_opaque_named(slot_ty, "Vec") { wipe = "p_vec_zeroize"; }
+                if wipe != "" {
+                    var held: i64 = Lowerer_emit_inst(self, Inst::Load(entry.id, slot_ty));
+                    var wargs: Vec<i64> = Vec::new();
+                    wargs.push(held);
+                    var weff: EffectSet = EffectSet_new();
+                    EffectSet_add(weff, Effect::Write);
+                    var _w: i64 = Lowerer_emit_inst(self, Inst::Call(wipe, wargs, IrType::Void, weff));
+                }
+            }
+            OptIrType::None => {}
+        }
         // Emit: p_memset(alloca_ptr, 0, size)
         var zero_val: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I32));
         var size_val: i64 = Lowerer_emit_inst(self, Inst::ConstInt(entry.val, IrType::I64));

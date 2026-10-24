@@ -27,7 +27,7 @@ fn runtime_effects(name: &str) -> Option<EffectSet> {
         "p_vec_push" | "p_vec_push_str" | "p_vec_set" | "p_vec_clear"
         | "p_vec_insert" | "p_vec_remove" | "p_vec_reverse" | "p_vec_extend"
         | "p_vec_truncate" | "p_vec_sort" | "p_vec_resize"
-        | "p_memset"
+        | "p_memset" | "p_str_zeroize" | "p_vec_zeroize"
     ) {
         effects.add(Effect::Write);
         return Some(effects);
@@ -1035,6 +1035,9 @@ impl Lowerer {
 
         // ─── @zeroize: memory wiping builtin ───
         self.module.add_extern("p_memset", vec![IrType::I64, IrType::I32, IrType::I64], IrType::Void); // memset(ptr, val, size)
+        // @zeroize: wipe the bytes a str / the buffer a Vec owns
+        self.module.add_extern("p_str_zeroize", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Void);
+        self.module.add_extern("p_vec_zeroize", vec![IrType::I64], IrType::Void);
 
         // ─── Phase 5A.4: MMU/page table management (bare-metal) ───
         self.module.add_extern("p_cr3_read", vec![], IrType::I64);         // read CR3 (page table base)
@@ -7554,6 +7557,26 @@ impl Lowerer {
         for (alloca, size) in zeroize_locals.into_iter().rev() {
             if self.current_block_has_terminator() {
                 break;
+            }
+            // A str or Vec slot holds a pointer: wipe the bytes it points to
+            // too (a string in the arena, a Vec's element buffer), not just
+            // the 8-byte pointer.
+            let slot_ty = self.alloca_types.get(&alloca).cloned();
+            let heap_wipe = match &slot_ty {
+                Some(IrType::Ptr(inner)) if **inner == IrType::U8 => Some("p_str_zeroize"),
+                Some(t) if t.is_opaque_named("Vec") => Some("p_vec_zeroize"),
+                _ => None,
+            };
+            if let (Some(func), Some(ty)) = (heap_wipe, slot_ty) {
+                let held = self.emit_inst(Inst::Load { ptr: alloca, ty });
+                let mut effects = EffectSet::new();
+                effects.add(Effect::Write);
+                self.emit_inst(Inst::Call {
+                    func: func.to_string(),
+                    args: vec![held],
+                    ret_ty: IrType::Void,
+                    effects,
+                });
             }
             // Emit: p_memset(alloca_ptr, 0, size)
             // The alloca is a pointer to the variable's storage.

@@ -1128,6 +1128,8 @@ impl CCodeGen {
         wln!(self, "void* p_alloc(int64_t size);");
         wln!(self, "void p_free(void* ptr);");
         wln!(self, "void p_memset(void* ptr, int val, int64_t size);");
+        wln!(self, "void p_str_zeroize(void* s);");
+        wln!(self, "void p_vec_zeroize(void* v);");
         // File I/O builtins
         wln!(self, "char* p_file_read(const char* path);");
         wln!(self, "int64_t p_file_write(const char* path, const char* content);");
@@ -2733,6 +2735,25 @@ impl CCodeGen {
         // pointer-sized types, but to be safe we match the forward declaration.
         wln!(self, "void p_free(void* ptr) { /* arena memory — no individual frees */ }");
         wln!(self, "void p_memset(void* ptr, int val, int64_t size) { if (ptr && size > 0) memset(ptr, val, (size_t)size); }");
+        // @zeroize: wipe a string's bytes when it lives in the arena (string
+        // literals are read-only and part of the binary anyway), and a Vec's
+        // whole element buffer. Volatile stores so the wipe is not elided.
+        wln!(self, "void p_str_zeroize(void* s) {{");
+        wln!(self, "    if (!s) return;");
+        wln!(self, "    for (__p_arena_chunk* c = __p_arena_head; c; c = c->next) {{");
+        wln!(self, "        if ((char*)s >= c->base && (char*)s < c->end) {{");
+        wln!(self, "            volatile char* p = (volatile char*)s;");
+        wln!(self, "            while (p < (volatile char*)c->end && *p) {{ *p = 0; p++; }}");
+        wln!(self, "            return;");
+        wln!(self, "        }}");
+        wln!(self, "    }}");
+        wln!(self, "}}");
+        wln!(self, "void p_vec_zeroize(void* v) {{");
+        wln!(self, "    PVec* pv = (PVec*)v;");
+        wln!(self, "    if (!pv || !pv->data) return;");
+        wln!(self, "    volatile char* p = (volatile char*)pv->data;");
+        wln!(self, "    for (int64_t i = 0; i < pv->cap * (int64_t)sizeof(void*); i++) p[i] = 0;");
+        wln!(self, "}}");
         wln!(self, "int64_t p_arena_save(void) { return 0; }");
         wln!(self, "void p_arena_restore(int64_t mark) {");
         wln!(self, "    __p_arena_chunk* c = __p_arena_head;");

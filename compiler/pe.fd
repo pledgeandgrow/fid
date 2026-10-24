@@ -2478,7 +2478,9 @@ pub fn PeCodeGen_gen_print_int(self: &mut PeCodeGen) {
     X86Encoder_mov_rr(&mut self.enc, PE_REG_RCX, PE_REG_R12); // handle
     X86Encoder_mov_rr(&mut self.enc, PE_REG_RDX, PE_REG_R8);  // buffer
     X86Encoder_mov_rr(&mut self.enc, PE_REG_R8, PE_REG_R9);   // length
-    X86Encoder_lea_rbp(&mut self.enc, PE_REG_R9, -32);     // &written
+    // &written = [rbp-64]: below the digit buffer, which grows down from
+    // rbp-24 (at rbp-32 the zeroed count erased digits 2-5)
+    X86Encoder_lea_rbp(&mut self.enc, PE_REG_R9, -64);     // &written
     X86Encoder_xor_self(&mut self.enc, PE_REG_RAX);
     X86Encoder_mov_mem_disp_reg32(&mut self.enc, PE_REG_R9, 0, PE_REG_RAX);
 
@@ -2760,17 +2762,18 @@ pub fn PeCodeGen_gen_memset(self: &mut PeCodeGen) {
     var loop_end: i64 = X86Encoder_alloc_label(&mut self.enc);
     // if size <= 0, skip
     X86Encoder_test_rr(&mut self.enc, PE_REG_R8, PE_REG_R8);
-    X86Encoder_jcc_label(&mut self.enc, 0x84, loop_end); // jz -> end
+    X86Encoder_jcc_label(&mut self.enc, 0x4, loop_end); // jz -> end (cc 4: jcc_label adds 0x80; 0x84 wrapped to the invalid 0F 04)
     X86Encoder_place_label(&mut self.enc, loop_start);
     // Store byte: mov byte [rcx], dl
     X86Encoder_emit_u8(&mut self.enc, 0x88); X86Encoder_emit_u8(&mut self.enc, 0x11);
     // rcx++
     X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xFF); X86Encoder_emit_u8(&mut self.enc, 0xC1);
-    // r8--
-    X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0xFF); X86Encoder_emit_u8(&mut self.enc, 0xC8);
+    // r8-- (REX.B selects r8; 48 FF C8 would be `dec rax`, leaving the count
+    // unchanged so the loop zeroed the stack until it crashed)
+    X86Encoder_emit_u8(&mut self.enc, 0x49); X86Encoder_emit_u8(&mut self.enc, 0xFF); X86Encoder_emit_u8(&mut self.enc, 0xC8);
     // if r8 != 0, loop
     X86Encoder_test_rr(&mut self.enc, PE_REG_R8, PE_REG_R8);
-    X86Encoder_jcc_label(&mut self.enc, 0x85, loop_start); // jnz -> loop_start
+    X86Encoder_jcc_label(&mut self.enc, 0x5, loop_start); // jnz -> loop_start
     X86Encoder_place_label(&mut self.enc, loop_end);
     X86Encoder_ret(&mut self.enc);
 }

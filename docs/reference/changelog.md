@@ -1,5 +1,43 @@
 # Fides Language Changelog
 
+## Session 29c — `@zeroize` Wipes Heap Data, PE Output Fixed and Tested (Oct 25, 2026)
+
+### `@zeroize`
+
+A `@zeroize` `str` or `Vec` local used to wipe only its 8-byte pointer, leaving
+the secret bytes in memory. It now also wipes what the pointer owns: a
+string's bytes when the string lives in the arena (literals are part of the
+binary and are left alone), and a Vec's whole element buffer. The C backend
+does this (`p_str_zeroize` / `p_vec_zeroize`, volatile stores); the
+interpreters hold strings and Vecs as managed values and wipe nothing, and
+PE does not wipe heap bytes yet. Every other handle to the same string or Vec
+sees the zeros, so a `@zeroize` string or Vec must not be returned or kept
+under another handle if its data has to outlive the function.
+
+### PE backend
+
+| Bug | Fix |
+|-----|-----|
+| Every program using `@zeroize` crashed (illegal instruction) | `p_memset` jumped with `jcc_label(0x84)`, which adds 0x80 and wraps to the undefined opcode `0F 04`; and its counter decrement was encoded `48 FF C8` (`dec rax`), not `49 FF C8` (`dec r8`), so the loop never ended |
+| `println` of any integer with 5+ digits printed garbage (`123456790` → `1\0\0\0\06790`) | `p_print_int`'s WriteFile byte-count slot overlapped its digit buffer; moved below it |
+
+Both in `src/pe.rs` and `compiler/pe.fd`.
+
+### Test harness
+
+`fidesc test` reported PE as "valid" when a binary was produced, never
+running it, which is how the two bugs above went unnoticed. It now runs each
+PE binary (with a 30 s limit) and compares its output with the interpreter's,
+like the C backend: **158/281 PE tests match** (was "232/281 valid"). The
+remaining PE mismatches are now visible instead of hidden.
+
+### Other
+
+- The self-hosted `@secret` and escape passes no longer allocate a new set
+  for every union with an empty side: self-hosted build peak memory 4.1 GB →
+  2.9 GB, stage-3 time 1982 s → 1351 s.
+- `@crashfree` error messages: proper line breaks.
+
 ## Session 29b — Security Annotations Made Sound (Oct 25, 2026)
 
 Every safety annotation was probed with programs that should be rejected;

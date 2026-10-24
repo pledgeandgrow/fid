@@ -2506,8 +2506,8 @@ impl TypeChecker {
                 scan_for_panic_risks(&func.body, wrapping, &mut risks);
                 for (line, what) in risks {
                     errs.push(format!(
-                        "Safety error ({}) (line {}): function '{}' {}.
-                             Crashfree functions must never panic.",
+                        "Safety error ({}) (line {}): function '{}' {}.\n\
+                         \x20\x20\x20\x20Crashfree functions must never panic.",
                         label, line, qualified_name, what
                     ));
                 }
