@@ -76,7 +76,9 @@ pub fn Arm64Reloc_new(offset: i64, symbol: str, rtype: i64) -> Arm64Reloc {
 
 pub struct Arm64AssembleResult {
     pub text: Vec<i64>,
+    pub rodata: Vec<i64>,
     pub symbols: Vec<Arm64Symbol>,
+    pub rodata_symbols: Vec<Arm64Symbol>,
     pub relocations: Vec<Arm64Reloc>,
 }
 
@@ -110,13 +112,13 @@ pub enum ResultArm64EncodedInst {
 
 pub fn Arm64EncodedInst_bytes(inst: i64) -> Arm64EncodedInst {
     var bytes: Vec<i64> = Vec::new();
-    push_u32_le(bytes, inst);
+    bytes = push_u32_le(bytes, inst);
     return Arm64EncodedInst { bytes: bytes, relocations: Vec::new() };
 }
 
 pub fn Arm64EncodedInst_with_reloc(inst: i64, label: str, reloc_type: i64) -> Arm64EncodedInst {
     var bytes: Vec<i64> = Vec::new();
-    push_u32_le(bytes, inst);
+    bytes = push_u32_le(bytes, inst);
     var relocs: Vec<Arm64InstReloc> = Vec::new();
     relocs.push(Arm64InstReloc_new(label, reloc_type));
     return Arm64EncodedInst { bytes: bytes, relocations: relocs };
@@ -130,31 +132,16 @@ pub fn Arm64EncodedInst_multi(bytes: Vec<i64>) -> Arm64EncodedInst {
 // Byte helpers
 // ===========================================================================
 
-/// Split a string into lines by newline (LF).
-pub fn a64_str_lines(s: str) -> Vec<str> {
-    var result: Vec<str> = Vec::new();
-    var i: i64 = 0;
-    var start: i64 = 0;
-    while i < str_len(s) {
-        var b: i64 = str_byte_at(s, i);
-        if b == 10 {
-            result.push(str_slice(s, start, i));
-            start = i + 1;
-        }
-        i = i + 1;
-    }
-    if start < str_len(s) {
-        result.push(str_slice(s, start, str_len(s)));
-    }
-    return result;
-}
-
 /// Push a 32-bit value in little-endian byte order.
-pub fn push_u32_le(text: Vec<i64>, inst: i64) {
+// NOTE: takes Vec by value + returns it — `&mut Vec` params don't write back
+// under the current Fides backends (codegen_c marshals `&mut` struct params by
+// value), so callers must reassign: `bytes = push_u32_le(bytes, inst)`.
+pub fn push_u32_le(text: Vec<i64>, inst: i64) -> Vec<i64> {
     text.push(inst & 0xFF);
     text.push((inst >> 8) & 0xFF);
     text.push((inst >> 16) & 0xFF);
     text.push((inst >> 24) & 0xFF);
+    return text;
 }
 
 /// Read a 32-bit little-endian value from a byte vector.
@@ -163,11 +150,13 @@ pub fn read_u32_le(text: Vec<i64>, idx: i64) -> i64 {
 }
 
 /// Patch a 32-bit little-endian value in a byte vector.
-pub fn patch_u32_le(text: Vec<i64>, idx: i64, inst: i64) {
+/// Same by-value + return contract as push_u32_le (see note above).
+pub fn patch_u32_le(text: Vec<i64>, idx: i64, inst: i64) -> Vec<i64> {
     text.set(idx, inst & 0xFF);
     text.set(idx + 1, (inst >> 8) & 0xFF);
     text.set(idx + 2, (inst >> 16) & 0xFF);
     text.set(idx + 3, (inst >> 24) & 0xFF);
+    return text;
 }
 
 // ===========================================================================
@@ -184,7 +173,9 @@ pub fn assemble_arm64(asm: str) -> ResultArm64Assemble {
     }
     return ResultArm64Assemble::Ok(Arm64AssembleResult {
         text: enc.text,
+        rodata: enc.rodata,
         symbols: enc.symbols,
+        rodata_symbols: enc.rodata_symbols,
         relocations: enc.relocations,
     });
 }
@@ -196,22 +187,30 @@ pub fn assemble_arm64(asm: str) -> ResultArm64Assemble {
 pub fn parse_reg(s: str) -> ResultI64Str {
     var t: str = str_trim(s);
     if t == "sp" || t == "SP" { return ResultI64Str::Ok(31); }
+    if t == "wsp" || t == "WSP" { return ResultI64Str::Ok(31); }
     if t == "xzr" || t == "XZR" || t == "wzr" || t == "WZR" { return ResultI64Str::Ok(31); }
+    if t == "fp" || t == "FP" { return ResultI64Str::Ok(29); }
+    if t == "lr" || t == "LR" { return ResultI64Str::Ok(30); }
     if str_starts_with(t, "x") || str_starts_with(t, "X") {
-        var n: i64 = str_parse_int(str_slice(t, 1, str_len(t)));
+        var suffix: str = str_slice(t, 1, str_len(t));
+        if !str_is_numeric(suffix) { return ResultI64Str::Err("Bad register name: " + t); }
+        var n: i64 = str_parse_int(suffix);
         if n > 30 { return ResultI64Str::Err("Register out of range: " + t); }
         return ResultI64Str::Ok(n);
     }
     if str_starts_with(t, "w") || str_starts_with(t, "W") {
-        var n: i64 = str_parse_int(str_slice(t, 1, str_len(t)));
-        if n > 30 { return ResultI64Str::Err("Register out of range: " + t); }
-        return ResultI64Str::Ok(n);
+        var suffix2: str = str_slice(t, 1, str_len(t));
+        if !str_is_numeric(suffix2) { return ResultI64Str::Err("Bad register name: " + t); }
+        var n2: i64 = str_parse_int(suffix2);
+        if n2 > 30 { return ResultI64Str::Err("Register out of range: " + t); }
+        return ResultI64Str::Ok(n2);
     }
     return ResultI64Str::Err("Unknown register: " + t);
 }
 
 pub fn is_64bit_reg(s: str) -> bool {
-    return str_starts_with(s, "x") || str_starts_with(s, "X") || s == "sp" || s == "SP";
+    return str_starts_with(s, "x") || str_starts_with(s, "X") || s == "sp" || (s == "SP")
+        || s == "fp" || s == "FP" || s == "lr" || s == "LR";
 }
 
 /// Condition codes for B.cond / CSET
@@ -311,14 +310,16 @@ pub fn label_offset_lookup(map: Vec<LabelOffsetEntry>, label: str) -> i64 {
     return -1;
 }
 
-pub fn label_offset_insert(map: Vec<LabelOffsetEntry>, label: str, offset: i64) {
+// Same by-value + return contract as push_u32_le (see note above).
+pub fn label_offset_insert(map: Vec<LabelOffsetEntry>, label: str, offset: i64) -> Vec<LabelOffsetEntry> {
     map.push(LabelOffsetEntry_new(label, offset));
+    return map;
 }
 
 // --- Assemble ---
 
 pub fn Arm64Assembler_assemble(self: &mut Arm64Assembler, asm: str) -> ResultUnit {
-    var lines: Vec<str> = a64_str_lines(asm);
+    var lines: Vec<str> = str_lines(asm);
     var li: i64 = 0;
     while li < lines.len() {
         var line: str = str_trim(lines.get(li));
@@ -372,7 +373,7 @@ pub fn Arm64Assembler_define_label(self: &mut Arm64Assembler, label: str) {
     match self.current_section {
         Arm64Section::Text => {
             var offset: i64 = self.text.len();
-            label_offset_insert(self.label_offsets, label, offset);
+            self.label_offsets = label_offset_insert(self.label_offsets, label, offset);
             self.symbols.push(Arm64Symbol_new(label, offset));
         }
         Arm64Section::Rodata => {
@@ -420,8 +421,8 @@ pub fn Arm64Assembler_handle_directive(self: &mut Arm64Assembler, line: str) -> 
         // .quad value — 8-byte value
         if parts.len() > 1 {
             var qv: i64 = str_parse_int(str_trim(parts.get(1)));
-            push_u32_le(self.rodata, qv & 0xFFFFFFFF);
-            push_u32_le(self.rodata, (qv >> 32) & 0xFFFFFFFF);
+            self.rodata = push_u32_le(self.rodata, qv & 0xFFFFFFFF);
+            self.rodata = push_u32_le(self.rodata, (qv >> 32) & 0xFFFFFFFF);
         }
     } else if directive == ".byte" {
         if parts.len() > 1 {
@@ -490,17 +491,17 @@ pub fn Arm64Assembler_resolve_branches(self: &mut Arm64Assembler) -> ResultUnit 
                     // BL: 26-bit immediate, offset = delta/4
                     var imm26: i64 = (delta / 4) & 0x03FFFFFF;
                     var patched: i64 = (instr & 0xFC000000) | imm26;
-                    patch_u32_le(self.text, idx, patched);
+                    self.text = patch_u32_le(self.text, idx, patched);
                 } else if pb.rtype == 11 {
                     // B: 26-bit immediate
                     var imm26: i64 = (delta / 4) & 0x03FFFFFF;
                     var patched: i64 = (instr & 0xFC000000) | imm26;
-                    patch_u32_le(self.text, idx, patched);
+                    self.text = patch_u32_le(self.text, idx, patched);
                 } else if pb.rtype == 12 {
                     // B.cond: 19-bit immediate
                     var imm19: i64 = (delta / 4) & 0x0007FFFF;
                     var patched: i64 = (instr & 0xFF00001F) | (imm19 << 5);
-                    patch_u32_le(self.text, idx, patched);
+                    self.text = patch_u32_le(self.text, idx, patched);
                 }
             }
         } else {
@@ -657,7 +658,35 @@ pub fn Arm64Assembler_enc_mov(self: &Arm64Assembler, ops: Vec<str>) -> ResultArm
         return Arm64Assembler_emit_movz_imm(self, dst, imm);
     }
 
-    // MOV reg, reg -> ORR reg, XZR, reg
+    // MOV reg, reg -> ORR reg, XZR, reg — except SP operands: in data-
+    // processing register fields 31 means XZR, not SP, so `mov xN, sp` /
+    // `mov sp, xN` must alias to `add Xd, SP, #0` / `add SP, Xn, #0` instead.
+    var src_is_sp: bool = src == "sp" || src == "SP" || src == "wsp" || src == "WSP";
+    var dst_is_sp: bool = dst == "sp" || dst == "SP" || dst == "wsp" || dst == "WSP";
+    if src_is_sp || dst_is_sp {
+        var sf2: i64 = 1;
+        if src_is_sp { if !is_64bit_reg(dst) { sf2 = 0; } }
+        else { if !is_64bit_reg(src) { sf2 = 0; } }
+        var base2: i64 = 0x91000000;
+        if sf2 == 0 { base2 = 0x11000000; }
+        var other: str = src;
+        if src_is_sp { other = dst; }
+        match parse_reg(other) {
+            ResultI64Str::Ok(rn) => {
+                var inst2: i64 = 0;
+                if src_is_sp {
+                    // add Rd, SP, #0: Rn[9:5] = 31
+                    inst2 = base2 | (31 << 5) | rn;
+                } else {
+                    // add SP, Rn, #0: Rd[4:0] = 31
+                    inst2 = base2 | (rn << 5) | 31;
+                }
+                return ResultArm64EncodedInst::Ok(Arm64EncodedInst_bytes(inst2));
+            }
+            ResultI64Str::Err(e2) => { return ResultArm64EncodedInst::Err(e2); }
+        }
+    }
+
     var sf: i64 = 1;
     if !is_64bit_reg(dst) { sf = 0; }
     match parse_reg(dst) {
@@ -696,21 +725,21 @@ pub fn Arm64Assembler_emit_movz_imm(self: &Arm64Assembler, dst: str, imm: i64) -
             var v: i64 = imm;
             // MOVZ Xd, #(v & 0xFFFF)
             var inst1: i64 = base | ((v & 0xFFFF) << 5) | rd;
-            push_u32_le(bytes, inst1);
+            bytes = push_u32_le(bytes, inst1);
             // MOVK Xd, #((v >> 16) & 0xFFFF), lsl #16
             if v > 0xFFFF || v < 0 {
                 var inst2: i64 = movk_base | (1 << 21) | (((v >> 16) & 0xFFFF) << 5) | rd;
-                push_u32_le(bytes, inst2);
+                bytes = push_u32_le(bytes, inst2);
             }
             // MOVK Xd, #((v >> 32) & 0xFFFF), lsl #32
             if v > 0xFFFFFFFF || v < 0 {
                 var inst3: i64 = movk_base | (2 << 21) | (((v >> 32) & 0xFFFF) << 5) | rd;
-                push_u32_le(bytes, inst3);
+                bytes = push_u32_le(bytes, inst3);
             }
             // MOVK Xd, #((v >> 48) & 0xFFFF), lsl #48
             if v > 0xFFFFFFFFFFFF || v < 0 {
                 var inst4: i64 = movk_base | (3 << 21) | (((v >> 48) & 0xFFFF) << 5) | rd;
-                push_u32_le(bytes, inst4);
+                bytes = push_u32_le(bytes, inst4);
             }
             return ResultArm64EncodedInst::Ok(Arm64EncodedInst_multi(bytes));
         }
@@ -793,7 +822,11 @@ pub fn Arm64Assembler_enc_add(self: &Arm64Assembler, ops: Vec<str>) -> ResultArm
                     }
                     if str_starts_with(rm_str, "#") {
                         var imm: i64 = str_parse_int(str_slice(rm_str, 1, str_len(rm_str)));
-                        var inst: i64 = (sf << 31) | 0x11000000 | ((imm & 0xFFF) << 10) | (rn << 5) | rd;
+                        // Negative imm: A64 has no add-#neg — emit sub #+imm
+                        // (codegen_arm64 emits `add d, fp, #-N` for slots).
+                        var base: i64 = 0x11000000;
+                        if imm < 0 { base = 0x51000000; imm = -imm; }
+                        var inst: i64 = (sf << 31) | base | ((imm & 0xFFF) << 10) | (rn << 5) | rd;
                         return ResultArm64EncodedInst::Ok(Arm64EncodedInst_bytes(inst));
                     }
                     match parse_reg(rm_str) {
@@ -827,7 +860,10 @@ pub fn Arm64Assembler_enc_sub(self: &Arm64Assembler, ops: Vec<str>) -> ResultArm
                 ResultI64Str::Ok(rn) => {
                     if str_starts_with(rm_str, "#") {
                         var imm: i64 = str_parse_int(str_slice(rm_str, 1, str_len(rm_str)));
-                        var inst: i64 = (sf << 31) | 0x51000000 | ((imm & 0xFFF) << 10) | (rn << 5) | rd;
+                        // Negative imm: emit add #+imm (mirror of enc_add).
+                        var base: i64 = 0x51000000;
+                        if imm < 0 { base = 0x11000000; imm = -imm; }
+                        var inst: i64 = (sf << 31) | base | ((imm & 0xFFF) << 10) | (rn << 5) | rd;
                         return ResultArm64EncodedInst::Ok(Arm64EncodedInst_bytes(inst));
                     }
                     match parse_reg(rm_str) {
@@ -1101,12 +1137,13 @@ pub fn Arm64Assembler_enc_lsl(self: &Arm64Assembler, ops: Vec<str>) -> ResultArm
                         if sf == 1 {
                             var immr: i64 = (64 - shift) % 64;
                             var imms: i64 = 63 - shift;
-                            var inst: i64 = 0xD3400000 | (imms << 16) | (immr << 6) | (rn << 5) | rd;
+                            // UBFM layout: immr[21:16] | imms[15:10] | Rn[9:5] | Rd[4:0]
+                            var inst: i64 = 0xD3400000 | (immr << 16) | (imms << 10) | (rn << 5) | rd;
                             return ResultArm64EncodedInst::Ok(Arm64EncodedInst_bytes(inst));
                         }
                         var immr32: i64 = (32 - shift) % 32;
                         var imms32: i64 = 31 - shift;
-                        var inst32: i64 = 0x53000000 | (imms32 << 16) | (immr32 << 6) | (rn << 5) | rd;
+                        var inst32: i64 = 0x53000000 | (immr32 << 16) | (imms32 << 10) | (rn << 5) | rd;
                         return ResultArm64EncodedInst::Ok(Arm64EncodedInst_bytes(inst32));
                     }
                     match parse_reg(ops.get(2)) {
@@ -1139,12 +1176,10 @@ pub fn Arm64Assembler_enc_asr(self: &Arm64Assembler, ops: Vec<str>) -> ResultArm
                         var shift: i64 = str_parse_int(str_slice(ops.get(2), 1, str_len(ops.get(2))));
                         // ASR Xd, Xn, #shift → SBFM Xd, Xn, #shift, #(63 or 31)
                         if sf == 1 {
-                            // 64-bit: 0xD3400000 | (63 << 16) | (shift << 6) | (rn << 5) | rd
-                            var inst: i64 = 0xD3400000 | (63 << 16) | (shift << 6) | (rn << 5) | rd;
+                            var inst: i64 = 0xD3400000 | (shift << 16) | (63 << 10) | (rn << 5) | rd;
                             return ResultArm64EncodedInst::Ok(Arm64EncodedInst_bytes(inst));
                         }
-                        // 32-bit: 0x13000000 | (31 << 16) | (shift << 6) | (rn << 5) | rd
-                        var inst32: i64 = 0x13000000 | (31 << 16) | (shift << 6) | (rn << 5) | rd;
+                        var inst32: i64 = 0x13000000 | (shift << 16) | (31 << 10) | (rn << 5) | rd;
                         return ResultArm64EncodedInst::Ok(Arm64EncodedInst_bytes(inst32));
                     }
                     match parse_reg(ops.get(2)) {
@@ -1228,19 +1263,78 @@ pub fn Arm64Assembler_enc_ldr(self: &Arm64Assembler, ops: Vec<str>) -> ResultArm
             var mem: Arm64MemOperand = arm64_parse_mem_operand(ops.get(1));
             match mem {
                 Arm64MemOperand::Err(e) => { return ResultArm64EncodedInst::Err(e); }
+                Arm64MemOperand::OkReg(rn_r, rm_r, shift_amt) => {
+                    match parse_reg(rn_r) {
+                        ResultI64Str::Ok(rn2) => {
+                            match parse_reg(rm_r) {
+                                ResultI64Str::Ok(rm2) => {
+                                    // LDR Xt, [Xn, Xm, lsl #s] — option=011(LSL), S=1 iff s==log2(size)
+                                    var want_s: i64 = 0;
+                                    if sf == 1 { if shift_amt == 3 { want_s = 1; } }
+                                    else { if shift_amt == 2 { want_s = 1; } }
+                                    if shift_amt != 0 && want_s == 0 {
+                                        return ResultArm64EncodedInst::Err("LDR reg-offset: unsupported shift " + int_to_str(shift_amt));
+                                    }
+                                    var rbase: i64 = 0xF8606800;
+                                    if sf == 0 { rbase = 0xB8606800; }
+                                    var rinst: i64 = rbase | (rm2 << 16) | (want_s << 12) | (rn2 << 5) | rt;
+                                    return ResultArm64EncodedInst::Ok(Arm64EncodedInst_bytes(rinst));
+                                }
+                                ResultI64Str::Err(e2) => { return ResultArm64EncodedInst::Err(e2); }
+                            }
+                        }
+                        ResultI64Str::Err(e) => { return ResultArm64EncodedInst::Err(e); }
+                    }
+                }
+                Arm64MemOperand::OkPre(rn_p, imm_p) => {
+                    // LDR Xt, [Xn, #imm]! — pre-index writeback, signed imm9
+                    match parse_reg(rn_p) {
+                        ResultI64Str::Ok(rn) => {
+                            if imm_p < -256 || imm_p > 255 {
+                                return ResultArm64EncodedInst::Err("LDR pre-index imm out of range: " + int_to_str(imm_p));
+                            }
+                            var pbase: i64 = 0xF8400C00;
+                            if sf == 0 { pbase = 0xB8400C00; }
+                            var pinst: i64 = pbase | ((imm_p & 0x1FF) << 12) | (rn << 5) | rt;
+                            return ResultArm64EncodedInst::Ok(Arm64EncodedInst_bytes(pinst));
+                        }
+                        ResultI64Str::Err(e) => { return ResultArm64EncodedInst::Err(e); }
+                    }
+                }
                 Arm64MemOperand::Ok(rn_str, imm) => {
                     match parse_reg(rn_str) {
                         ResultI64Str::Ok(rn) => {
                             var base: i64 = 0xF9400000;
                             if sf == 0 { base = 0xB9400000; }
-                            if imm == 0 && !str_contains(ops.get(1), "!") {
+                            if imm == 0 && !str_contains(ops.get(1), "!") && ops.len() < 3 {
                                 // LDR Xt, [Xn] → LDR Xt, [Xn, #0]
                                 var inst: i64 = base | (rn << 5) | rt;
                                 return ResultArm64EncodedInst::Ok(Arm64EncodedInst_bytes(inst));
                             }
-                            // LDR Xt, [Xn, #imm] — scale by 8 (64-bit) or 4 (32-bit)
+                            if ops.len() > 2 {
+                                // Post-index: LDR Xt, [Xn], #imm — signed imm9
+                                var post_imm: i64 = arm64_strip_hash(ops.get(2));
+                                if post_imm < -256 || post_imm > 255 {
+                                    return ResultArm64EncodedInst::Err("LDR post-index imm out of range: " + int_to_str(post_imm));
+                                }
+                                var pobase: i64 = 0xF8400400;
+                                if sf == 0 { pobase = 0xB8400400; }
+                                var post_inst: i64 = pobase | ((post_imm & 0x1FF) << 12) | (rn << 5) | rt;
+                                return ResultArm64EncodedInst::Ok(Arm64EncodedInst_bytes(post_inst));
+                            }
                             var scale: i64 = 8;
                             if sf == 0 { scale = 4; }
+                            // Negative or non-scaled offset → LDUR unscaled (signed imm9)
+                            if imm < 0 || (imm % scale) != 0 {
+                                if imm < -256 || imm > 255 {
+                                    return ResultArm64EncodedInst::Err("LDR unscaled imm out of range: " + int_to_str(imm));
+                                }
+                                var ubase: i64 = 0xF8400000;
+                                if sf == 0 { ubase = 0xB8400000; }
+                                var uinst: i64 = ubase | ((imm & 0x1FF) << 12) | (rn << 5) | rt;
+                                return ResultArm64EncodedInst::Ok(Arm64EncodedInst_bytes(uinst));
+                            }
+                            // LDR Xt, [Xn, #imm] — scale by 8 (64-bit) or 4 (32-bit)
                             var imm12: i64 = imm / scale;
                             var inst: i64 = base | (imm12 << 10) | (rn << 5) | rt;
                             return ResultArm64EncodedInst::Ok(Arm64EncodedInst_bytes(inst));
@@ -1266,18 +1360,76 @@ pub fn Arm64Assembler_enc_str(self: &Arm64Assembler, ops: Vec<str>) -> ResultArm
             var mem: Arm64MemOperand = arm64_parse_mem_operand(ops.get(1));
             match mem {
                 Arm64MemOperand::Err(e) => { return ResultArm64EncodedInst::Err(e); }
+                Arm64MemOperand::OkReg(rn_r, rm_r, shift_amt) => {
+                    match parse_reg(rn_r) {
+                        ResultI64Str::Ok(rn2) => {
+                            match parse_reg(rm_r) {
+                                ResultI64Str::Ok(rm2) => {
+                                    var want_s2: i64 = 0;
+                                    if sf == 1 { if shift_amt == 3 { want_s2 = 1; } }
+                                    else { if shift_amt == 2 { want_s2 = 1; } }
+                                    if shift_amt != 0 && want_s2 == 0 {
+                                        return ResultArm64EncodedInst::Err("STR reg-offset: unsupported shift " + int_to_str(shift_amt));
+                                    }
+                                    var rbase2: i64 = 0xF8206800;
+                                    if sf == 0 { rbase2 = 0xB8206800; }
+                                    var rinst2: i64 = rbase2 | (rm2 << 16) | (want_s2 << 12) | (rn2 << 5) | rt;
+                                    return ResultArm64EncodedInst::Ok(Arm64EncodedInst_bytes(rinst2));
+                                }
+                                ResultI64Str::Err(e2) => { return ResultArm64EncodedInst::Err(e2); }
+                            }
+                        }
+                        ResultI64Str::Err(e) => { return ResultArm64EncodedInst::Err(e); }
+                    }
+                }
+                Arm64MemOperand::OkPre(rn_p, imm_p) => {
+                    // STR Xt, [Xn, #imm]! — pre-index writeback, signed imm9
+                    match parse_reg(rn_p) {
+                        ResultI64Str::Ok(rn) => {
+                            if imm_p < -256 || imm_p > 255 {
+                                return ResultArm64EncodedInst::Err("STR pre-index imm out of range: " + int_to_str(imm_p));
+                            }
+                            var pbase: i64 = 0xF8000C00;
+                            if sf == 0 { pbase = 0xB8000C00; }
+                            var pinst: i64 = pbase | ((imm_p & 0x1FF) << 12) | (rn << 5) | rt;
+                            return ResultArm64EncodedInst::Ok(Arm64EncodedInst_bytes(pinst));
+                        }
+                        ResultI64Str::Err(e) => { return ResultArm64EncodedInst::Err(e); }
+                    }
+                }
                 Arm64MemOperand::Ok(rn_str, imm) => {
                     match parse_reg(rn_str) {
                         ResultI64Str::Ok(rn) => {
                             var base: i64 = 0xF9000000;
                             if sf == 0 { base = 0xB9000000; }
-                            if imm == 0 {
+                            if imm == 0 && ops.len() < 3 {
                                 var inst: i64 = base | (rn << 5) | rt;
                                 return ResultArm64EncodedInst::Ok(Arm64EncodedInst_bytes(inst));
                             }
-                            // STR Xt, [Xn, #imm] — scale by 8 (64-bit) or 4 (32-bit)
+                            if ops.len() > 2 {
+                                // Post-index: STR Xt, [Xn], #imm — signed imm9
+                                var post_imm: i64 = arm64_strip_hash(ops.get(2));
+                                if post_imm < -256 || post_imm > 255 {
+                                    return ResultArm64EncodedInst::Err("STR post-index imm out of range: " + int_to_str(post_imm));
+                                }
+                                var pobase: i64 = 0xF8000400;
+                                if sf == 0 { pobase = 0xB8000400; }
+                                var post_inst: i64 = pobase | ((post_imm & 0x1FF) << 12) | (rn << 5) | rt;
+                                return ResultArm64EncodedInst::Ok(Arm64EncodedInst_bytes(post_inst));
+                            }
                             var scale: i64 = 8;
                             if sf == 0 { scale = 4; }
+                            // Negative or non-scaled offset → STUR unscaled (signed imm9)
+                            if imm < 0 || (imm % scale) != 0 {
+                                if imm < -256 || imm > 255 {
+                                    return ResultArm64EncodedInst::Err("STR unscaled imm out of range: " + int_to_str(imm));
+                                }
+                                var ubase: i64 = 0xF8000000;
+                                if sf == 0 { ubase = 0xB8000000; }
+                                var uinst: i64 = ubase | ((imm & 0x1FF) << 12) | (rn << 5) | rt;
+                                return ResultArm64EncodedInst::Ok(Arm64EncodedInst_bytes(uinst));
+                            }
+                            // STR Xt, [Xn, #imm] — scale by 8 (64-bit) or 4 (32-bit)
                             var imm12: i64 = imm / scale;
                             var inst: i64 = base | (imm12 << 10) | (rn << 5) | rt;
                             return ResultArm64EncodedInst::Ok(Arm64EncodedInst_bytes(inst));
@@ -1301,6 +1453,8 @@ pub fn Arm64Assembler_enc_ldrb(self: &Arm64Assembler, ops: Vec<str>) -> ResultAr
             var mem: Arm64MemOperand = arm64_parse_mem_operand(ops.get(1));
             match mem {
                 Arm64MemOperand::Err(e) => { return ResultArm64EncodedInst::Err(e); }
+                Arm64MemOperand::OkReg(_, _, _) => { return ResultArm64EncodedInst::Err("LDRB register-offset form unsupported"); }
+                Arm64MemOperand::OkPre(_, _) => { return ResultArm64EncodedInst::Err("LDRB pre-index form unsupported"); }
                 Arm64MemOperand::Ok(rn_str, imm) => {
                     match parse_reg(rn_str) {
                         ResultI64Str::Ok(rn) => {
@@ -1326,6 +1480,8 @@ pub fn Arm64Assembler_enc_strb(self: &Arm64Assembler, ops: Vec<str>) -> ResultAr
             var mem: Arm64MemOperand = arm64_parse_mem_operand(ops.get(1));
             match mem {
                 Arm64MemOperand::Err(e) => { return ResultArm64EncodedInst::Err(e); }
+                Arm64MemOperand::OkReg(_, _, _) => { return ResultArm64EncodedInst::Err("STRB register-offset form unsupported"); }
+                Arm64MemOperand::OkPre(_, _) => { return ResultArm64EncodedInst::Err("STRB pre-index form unsupported"); }
                 Arm64MemOperand::Ok(rn_str, imm) => {
                     match parse_reg(rn_str) {
                         ResultI64Str::Ok(rn) => {
@@ -1522,6 +1678,10 @@ pub enum Arm64StpLdpResult {
 /// Result of parsing a memory operand.
 pub enum Arm64MemOperand {
     Ok(str, i64),
+    // [Xn, Xm{, lsl #s}] — register-offset addressing
+    OkReg(str, str, i64),
+    // [Xn, #imm]! — pre-index writeback
+    OkPre(str, i64),
     Err(str),
 }
 
@@ -1561,6 +1721,17 @@ pub fn arm64_parse_stp_ldp_operands(ops: Vec<str>) -> Arm64StpLdpResult {
 
 pub fn arm64_parse_mem_operand(s: str) -> Arm64MemOperand {
     var t: str = str_trim(s);
+    // Pre-index: [Xn, #imm]! — operand ends with "]!"
+    if str_ends_with(t, "]!") && str_starts_with(t, "[") {
+        var inner_p: str = str_slice(t, 1, str_len(t) - 2);
+        var parts_p: Vec<str> = str_split(inner_p, ",");
+        var rn_p: str = str_trim(parts_p.get(0));
+        var imm_p: i64 = 0;
+        if parts_p.len() > 1 {
+            imm_p = arm64_strip_hash(str_trim(parts_p.get(1)));
+        }
+        return Arm64MemOperand::OkPre(rn_p, imm_p);
+    }
     if !str_starts_with(t, "[") || !str_ends_with(t, "]") {
         return Arm64MemOperand::Err("Invalid memory operand: " + t);
     }
@@ -1569,7 +1740,23 @@ pub fn arm64_parse_mem_operand(s: str) -> Arm64MemOperand {
     var rn: str = str_trim(parts.get(0));
     var imm: i64 = 0;
     if parts.len() > 1 {
-        imm = arm64_strip_hash(str_trim(parts.get(1)));
+        var off_str: str = str_trim(parts.get(1));
+        // [Xn, Xm{, lsl #s}] — register offset, not an immediate
+        if str_starts_with(off_str, "x") || str_starts_with(off_str, "X")
+            || str_starts_with(off_str, "w") || str_starts_with(off_str, "W") {
+            var shift_amt: i64 = 0;
+            if parts.len() > 2 {
+                var shift_str: str = str_trim(parts.get(2));
+                if str_contains(shift_str, "#") {
+                    var hash_pos: i64 = str_find(shift_str, "#");
+                    if hash_pos >= 0 {
+                        shift_amt = str_parse_int(str_slice(shift_str, hash_pos + 1, str_len(shift_str)));
+                    }
+                }
+            }
+            return Arm64MemOperand::OkReg(rn, off_str, shift_amt);
+        }
+        imm = arm64_strip_hash(off_str);
     }
     return Arm64MemOperand::Ok(rn, imm);
 }

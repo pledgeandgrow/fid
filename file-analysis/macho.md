@@ -1,16 +1,23 @@
 # macho.fd — Mach-O Object Writer (x86-64)
 
-**483 LOC** vs `src/macho.rs` 374 LOC (~129% — growth is entry structs + local str helpers).
-**Was the eleventh dead module — WIRED since 2026-10-23.**
+> **CONSOLIDATED 2026-10-23 (v2):** the 7-mnemonic toy encoder + 5 local str
+> helpers **deleted** — file now assembles via shared `ElfEmitter` and
+> translates to Mach-O records: `__text` + `__const` sections, per-section
+> relocs, n_type from ELF binding (local→N_SECT, global→N_SECT_EXT), and
+> *correct* reloc rtypes — `X86_64_RELOC_BRANCH` for call/jmp sites
+> (detected from the opcode byte before the reloc) / `SIGNED` for lea /
+> `UNSIGNED` for `.quad` (was rtype=0 for everything — the inherited bug
+> noted below is gone).
+> 445 LOC, format-only writer.
+
+**445 LOC** vs `src/macho.rs` 374 LOC. Wired since 2026-10-23 at
+`main.fd:40` + `:1734` (`codegen --macho`).
 
 ## Where it's called
 
 - `main.fd` :40 `use compiler::macho`, :1734 `cmd_codegen` →
-  `fidesc codegen --macho <file> -o out.o` → `emit_macho_file` →
-  `emit_object_file` — mirrors Rust's `fidesc codegen --macho`
-  (src/main.rs:2075/2132-2139). Reachable, though the encoder below is still
-  a 7-mnemonic toy — the wired path produces nop-heavy objects just like
-  coff's.
+  `fidesc codegen --macho <file> -o out.o` → `emit_macho_file` → shared
+  `ElfEmitter` → Mach-O writer. Real instructions now encode (was nop-sled).
 
 ## What it is
 
@@ -50,5 +57,10 @@ A **toy** emitter — in both implementations:
 
 A faithful port of a deliberately-minimal Rust scaffolding file — dead on both sides
 (`--macho` is Rust-only) and worth ~nothing until a real ARM64 or full x86 encoder backs
-it. If kept, fix the `push`/`pop` register encoding and the branch rtype; more likely it
-should be deleted with its siblings (coff/cparser/debugger/embedded/gpu/hotreload).
+it.
+
+**Update 2026-10-23:** both recommendations executed — the toy encoder was deleted
+(fixing `push`/`pop` and branch-rtype by deletion, not repair) and the file now
+consumes the shared `ElfEmitter` output. The remaining gap: still x86-only inside
+(`CPU_TYPE_X86_64`) — arm64 Mach-O needs a separate emitter once arm64_enc output
+is consumable the same way. Live output unverified end-to-end (needs `otool`/ld64).

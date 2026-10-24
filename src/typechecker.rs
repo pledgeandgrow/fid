@@ -7418,6 +7418,12 @@ impl TypeChecker {
                 Self::has_break(then_block) || else_block.as_ref().map_or(false, |b| Self::has_break(b))
             }
             Stmt::Match { arms, .. } => arms.iter().any(|a| Self::has_break(&a.body)),
+            Stmt::Unsafe { body, .. }
+            | Stmt::RegionBlock { body, .. }
+            | Stmt::Sandbox { body, .. }
+            | Stmt::Txn { body, .. }
+            | Stmt::Handle { body, .. }
+            | Stmt::SpawnScope { body, .. } => Self::has_break(body),
             _ => false,
         })
     }

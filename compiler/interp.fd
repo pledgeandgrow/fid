@@ -231,6 +231,12 @@ pub fn Memory_store_i32(self: &mut Memory, addr: i64, val: i64) {
     }
 }
 
+// Store an i16 (2 bytes, little-endian) at addr
+pub fn Memory_store_i16(self: &mut Memory, addr: i64, val: i64) {
+    Memory_store_byte(self, addr, val & 0xFF);
+    Memory_store_byte(self, addr + 1, (val >> 8) & 0xFF);
+}
+
 // Load an i32 (4 bytes, little-endian) from addr
 pub fn Memory_load_i32(self: &Memory, addr: i64) -> i64 {
     var result: i64 = 0;
@@ -354,6 +360,14 @@ pub fn OpaqueEntry_new(addr: i64, value: Value) -> OpaqueEntry {
     return OpaqueEntry { addr: addr, value: value };
 }
 
+pub struct OpaqueSnapshot {
+    pub entries: Vec<OpaqueEntry>,
+}
+
+fn Memory_clone(m: &Memory) -> Memory {
+    return Memory { data: m.data.clone(), next_alloc: m.next_alloc };
+}
+
 pub struct ArrayBoundEntry {
     pub addr: i64,
     pub size: i64,
@@ -434,7 +448,7 @@ pub struct Interpreter {
     pub panic_stack_trace: OptStr,
     pub interp_unsafe_depth: i64,
     pub txn_mem_snapshots: Vec<Memory>,
-    pub txn_opaque_snapshots: Vec<OpaqueEntry>,
+    pub txn_opaque_snapshots: Vec<OpaqueSnapshot>,
     pub max_recursion: i64,
     pub max_steps: i64,
     pub step_count: i64,
@@ -907,7 +921,11 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
                                 var snap_mem: Memory = self.txn_mem_snapshots.get(self.txn_mem_snapshots.len() - 1);
                                 self.memory = snap_mem;
                                 self.txn_mem_snapshots.pop();
-                                // Also restore opaque snapshots (simplified)
+                            }
+                            if self.txn_opaque_snapshots.len() > 0 {
+                                var snap_opaque: OpaqueSnapshot = self.txn_opaque_snapshots.get(self.txn_opaque_snapshots.len() - 1);
+                                self.opaque_values = snap_opaque.entries;
+                                self.txn_opaque_snapshots.pop();
                             }
                             result = RunResult::Panic(msg);
                             done = true;
@@ -1185,7 +1203,7 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
             }
         }
 
-        Inst::Store(ptr, value, _) => {
+        Inst::Store(ptr, value, sty_opt) => {
             var addr: i64 = 0;
             match get_value(values, ptr) {
                 Value::Ptr(a) => { addr = a; }
@@ -1194,12 +1212,36 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
             var v: Value = get_value(values, value);
             // Clear any stale opaque entry
             Interpreter_remove_opaque(self, addr);
+            // Resolve store width: explicit OptIrType wins, else the value's
+            // declared meta type, else I64 (matches src/interp.rs:1497-1512).
+            var sty: IrType = IrType::I64;
+            match sty_opt {
+                OptIrType::Some(t) => { sty = t; }
+                OptIrType::None => {
+                    match IrFunction_get_meta(func, value) {
+                        OptValueMeta::Some(vm) => { sty = vm.ty; }
+                        OptValueMeta::None => {}
+                    }
+                }
+            }
             match v {
                 Value::Int(iv) => {
-                    Memory_store_i64(&mut self.memory, addr, iv);
+                    match sty {
+                        IrType::I8 => { Memory_store_byte(&mut self.memory, addr, iv & 0xFF); }
+                        IrType::U8 => { Memory_store_byte(&mut self.memory, addr, iv & 0xFF); }
+                        IrType::Bool => { Memory_store_byte(&mut self.memory, addr, iv & 1); }
+                        IrType::I16 => { Memory_store_i16(&mut self.memory, addr, iv); }
+                        IrType::U16 => { Memory_store_i16(&mut self.memory, addr, iv); }
+                        IrType::I32 => { Memory_store_i32(&mut self.memory, addr, iv); }
+                        IrType::U32 => { Memory_store_i32(&mut self.memory, addr, iv); }
+                        _ => { Memory_store_i64(&mut self.memory, addr, iv); }
+                    }
                 }
                 Value::Float(fv) => {
-                    Memory_store_f64(&mut self.memory, addr, fv);
+                    match sty {
+                        IrType::F32 => { Memory_store_f32(&mut self.memory, addr, fv); }
+                        _ => { Memory_store_f64(&mut self.memory, addr, fv); }
+                    }
                 }
                 Value::Bool(bv) => {
                     Memory_store_bool(&mut self.memory, addr, bv);
@@ -1614,13 +1656,18 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
 
         // ─── Transaction Blocks ───
         Inst::TxnBegin => {
-            // Snapshot memory (simplified: just push current next_alloc)
-            self.txn_mem_snapshots.push(self.memory);
+            // Deep snapshot — a struct copy would share the Vec backing, so
+            // post-snapshot writes would already be visible in the "snapshot".
+            self.txn_mem_snapshots.push(Memory_clone(&self.memory));
+            self.txn_opaque_snapshots.push(OpaqueSnapshot { entries: self.opaque_values.clone() });
             return ExecOutcome::Continue;
         }
         Inst::TxnEnd => {
             if self.txn_mem_snapshots.len() > 0 {
                 self.txn_mem_snapshots.pop();
+            }
+            if self.txn_opaque_snapshots.len() > 0 {
+                self.txn_opaque_snapshots.pop();
             }
             return ExecOutcome::Continue;
         }
@@ -1641,10 +1688,27 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
         Inst::GradBegin(_) => { return ExecOutcome::Continue; }
         Inst::GradEnd => { return ExecOutcome::Continue; }
         Inst::Backward(_) => { return ExecOutcome::Continue; }
-        Inst::StructCopy(dst, src, _ty) => {
-            // Simplified: copy raw 8-byte value from src to dst
-            var src_val: Value = get_value(values, src);
-            values.set(dst, src_val);
+        Inst::StructCopy(dst, src, ty) => {
+            // memcpy struct data src -> dst (src/interp.rs:1604)
+            var dst_addr: i64 = 0;
+            match get_value(values, dst) {
+                Value::Ptr(a) => { dst_addr = a; }
+                Value::Int(n) => { dst_addr = n; }
+                _ => {}
+            }
+            var src_addr: i64 = 0;
+            match get_value(values, src) {
+                Value::Ptr(a) => { src_addr = a; }
+                Value::Int(n) => { src_addr = n; }
+                _ => {}
+            }
+            var size: i64 = IrModule_type_size(&self.module, ty);
+            var ci: i64 = 0;
+            while ci < size {
+                var b: i64 = Memory_load_byte(&self.memory, src_addr + ci);
+                Memory_store_byte(&mut self.memory, dst_addr + ci, b);
+                ci = ci + 1;
+            }
             return ExecOutcome::Continue;
         }
     }
@@ -1660,23 +1724,50 @@ pub fn Interpreter_eval_binop(self: &Interpreter, op: BinOp, l: Value, r: Value)
         Value::Int(a) => {
             match r {
                 Value::Int(b) => {
+                    var i64_max: i64 = 9223372036854775807;
+                    var i64_min: i64 = 0 - 9223372036854775807 - 1;
+                    var use_wrapping: bool = Interpreter_is_wrapping_func(self);
                     match op {
                         BinOp::Add => {
-                            // Checked addition (simplified: wrapping for now)
+                            if !use_wrapping {
+                                // Pre-check: computing a+b under a checked host would
+                                // trap before we can test the result.
+                                if b > 0 && a > i64_max - b { return Value::Void; }
+                                if b < 0 && a < i64_min - b { return Value::Void; }
+                            }
                             return Value::Int(a + b);
                         }
                         BinOp::Sub => {
+                            if !use_wrapping {
+                                if b > 0 && a < i64_min + b { return Value::Void; }
+                                if b < 0 && a > i64_max + b { return Value::Void; }
+                            }
                             return Value::Int(a - b);
                         }
                         BinOp::Mul => {
+                            if !use_wrapping {
+                                // CERT-style division pre-checks; all divisions are
+                                // exact-or-toward-zero and cannot themselves overflow.
+                                var mul_ovf: bool = false;
+                                if a > 0 {
+                                    if b > 0 { mul_ovf = a > i64_max / b; }
+                                    else if b < 0 { mul_ovf = b < i64_min / a; }
+                                } else if a < 0 {
+                                    if b > 0 { mul_ovf = a < i64_min / b; }
+                                    else if b < 0 { mul_ovf = a < i64_max / b; }
+                                }
+                                if mul_ovf { return Value::Void; }
+                            }
                             return Value::Int(a * b);
                         }
                         BinOp::Div => {
                             if b == 0 { return Value::Void; }
+                            if b == -1 && a == i64_min { return Value::Int(i64_min); }
                             return Value::Int(a / b);
                         }
                         BinOp::Mod => {
                             if b == 0 { return Value::Void; }
+                            if b == -1 && a == i64_min { return Value::Int(0); }
                             return Value::Int(a % b);
                         }
                         BinOp::Eq => { return Value::Bool(a == b); }
@@ -3900,14 +3991,11 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         return ExecOutcome::Value(Value::Bool(true));
     }
 
-    // ─── Default: return 0 for unknown runtime functions ───
-    // This handles stubs for advanced features (tensors, networking, etc.)
-    if self.verbose {
-        p_eprint_str("[interp] unimplemented runtime func: ");
-        p_eprint_str(name);
-        p_eprint_str("\n");
-    }
-    return ExecOutcome::Value(Value::Int(0));
+    // ─── Default: panic for unknown runtime functions ───
+    // Matches src/interp.rs:6165 — ExecOutcome::Panic("Unknown runtime
+    // function: {name}"). is_runtime_func claims far more names than this
+    // dispatch implements; returning Int(0) fabricated results silently.
+    return ExecOutcome::Panic("Unknown runtime function: " + name);
 }
 
 // ===========================================================================

@@ -1,11 +1,15 @@
 // macho.fd -- Mach-O Object File Emitter for macOS (x86-64)
 // Ported from src/macho.rs. Produces Mach-O 64-bit relocatable object files (.o).
 //
+// Instruction encoding is shared: this file assembles via ElfEmitter
+// (compiler::elf64) and translates its (bytes, symbols, relocations) into
+// Mach-O records — it is a format writer only, not a second assembler.
+//
 // Mach-O 64-bit format:
 //   - Mach-O header (32 bytes)
-//   - Load commands (LC_SEGMENT_64, LC_SYMTAB)
-//   - Sections (__TEXT,__text)
-//   - Relocation entries
+//   - Load commands (LC_SEGMENT_64 + section headers, LC_SYMTAB)
+//   - Sections (__TEXT,__text and __TEXT,__const)
+//   - Per-section relocation entries
 //   - Symbol table (nlist_64, 16 bytes each)
 //   - String table
 
@@ -14,6 +18,7 @@ module compiler::macho;
 use core;
 use vec;
 use string;
+use compiler::elf64;
 
 // --- Constants ----------------------------------------------------------
 
@@ -24,6 +29,16 @@ pub const MH_OBJECT: i64 = 1;
 
 pub const LC_SEGMENT_64: i64 = 0x19;
 pub const LC_SYMTAB: i64 = 0x2;
+
+// n_type values
+pub const N_UNDF_EXT: i64 = 0x01;   // undefined external
+pub const N_SECT: i64 = 0x0e;       // defined in section (local)
+pub const N_SECT_EXT: i64 = 0x0f;   // defined external
+
+// x86-64 relocation types
+pub const XR_UNSIGNED: i64 = 0;
+pub const XR_SIGNED: i64 = 1;
+pub const XR_BRANCH: i64 = 2;
 
 // --- Structs ------------------------------------------------------------
 
@@ -52,9 +67,10 @@ pub struct MachOReloc {
     pub length: i64,
     pub is_extern: bool,
     pub rtype: i64,
+    pub section: i64,   // 1 = __text, 2 = __const
 }
 
-pub fn MachOReloc_new(offset: i64, symbol_index: i64, is_pcrel: bool, length: i64, is_extern: bool, rtype: i64) -> MachOReloc {
+pub fn MachOReloc_new(offset: i64, symbol_index: i64, is_pcrel: bool, length: i64, is_extern: bool, rtype: i64, section: i64) -> MachOReloc {
     return MachOReloc {
         offset: offset,
         symbol_index: symbol_index,
@@ -62,29 +78,33 @@ pub fn MachOReloc_new(offset: i64, symbol_index: i64, is_pcrel: bool, length: i6
         length: length,
         is_extern: is_extern,
         rtype: rtype,
+        section: section,
     };
 }
 
 pub struct MachOEmitter {
     pub text_bytes: Vec<i64>,
+    pub const_bytes: Vec<i64>,
     pub symbols: Vec<MachOSymbol>,
     pub relocations: Vec<MachOReloc>,
     pub string_table: Vec<i64>,
+    pub sym_names: Vec<str>,
 }
 
 pub fn MachOEmitter_new() -> MachOEmitter {
     return MachOEmitter {
         text_bytes: Vec::new(),
+        const_bytes: Vec::new(),
         symbols: Vec::new(),
         relocations: Vec::new(),
         string_table: Vec::new(),
+        sym_names: Vec::new(),
     };
 }
 
 // --- Result types ---
 
 pub enum ResultVec { Ok(Vec<i64>), Err(str) }
-pub enum ResultUnit { Ok, Err(str) }
 
 // --- Helper: emit little-endian ---
 
@@ -100,131 +120,103 @@ fn mo_emit_u64(t: Vec, v: i64) {
     while i < 8 { t.push((v >> (i * 8)) & 0xFF); i = i + 1; }
 }
 
-// --- Assembly parsing + encoding ---
-
-pub fn MachOEmitter_assemble(self: &mut MachOEmitter, asm: str) -> ResultUnit {
-    // Initialize string table with empty string at index 0
-    self.string_table.push(0);
-
-    var lines: Vec<str> = mo_str_lines(asm);
+fn mo_sym_index(e: &MachOEmitter, name: str) -> i64 {
     var i: i64 = 0;
-    while i < lines.len() {
-        var line: str = mo_str_trim(lines.get(i));
-        if str_len(line) == 0 || mo_str_starts_with(line, "//") || mo_str_starts_with(line, "#") {
-            i = i + 1;
-            continue;
-        }
-
-        // Check for label
-        if mo_str_ends_with(line, ":") {
-            var label: str = str_slice(line, 0, str_len(line) - 1);
-            var offset: i64 = self.text_bytes.len();
-            MachOEmitter_add_symbol(self, label, offset, true);
-            i = i + 1;
-            continue;
-        }
-
-        // Skip directives
-        if mo_str_starts_with(line, ".") {
-            i = i + 1;
-            continue;
-        }
-
-        // Encode instruction
-        match MachOEmitter_encode_instruction(self, line) {
-            ResultUnit::Ok => {}
-            ResultUnit::Err(e) => { return ResultUnit::Err(e); }
-        }
+    while i < e.sym_names.len() {
+        if e.sym_names.get(i) == name { return i; }
         i = i + 1;
     }
-    return ResultUnit::Ok;
+    return 0;
 }
 
-fn MachOEmitter_encode_instruction(self: &mut MachOEmitter, line: str) -> ResultUnit {
-    var parts: Vec<str> = mo_str_split_whitespace(line);
-    if parts.len() == 0 {
-        return ResultUnit::Ok;
-    }
-
-    var mnemonic: str = mo_str_trim_end(parts.get(0));
-
-    if mnemonic == "ret" {
-        self.text_bytes.push(0xC3);
-    } else if mnemonic == "nop" {
-        self.text_bytes.push(0x90);
-    } else if mnemonic == "push" {
-        if parts.len() > 1 {
-            var reg: str = mo_str_trim_end(parts.get(1));
-            if reg == "rbp" {
-                self.text_bytes.push(0x55);
-            } else if reg == "rsp" {
-                self.text_bytes.push(0x54);
-            } else {
-                self.text_bytes.push(0x50);
-            }
-        }
-    } else if mnemonic == "pop" {
-        if parts.len() > 1 {
-            var reg: str = mo_str_trim_end(parts.get(1));
-            if reg == "rbp" {
-                self.text_bytes.push(0x5D);
-            } else {
-                self.text_bytes.push(0x58);
-            }
-        }
-    } else if mnemonic == "call" {
-        if parts.len() > 1 {
-            var target: str = mo_str_trim_end(parts.get(1));
-            self.text_bytes.push(0xE8);
-            var offset: i64 = self.text_bytes.len();
-            self.text_bytes.push(0);
-            self.text_bytes.push(0);
-            self.text_bytes.push(0);
-            self.text_bytes.push(0);
-            var sym_idx: i64 = MachOEmitter_get_or_add_symbol(self, target, 0, false);
-            self.relocations.push(MachOReloc_new(offset, sym_idx, true, 2, true, 0));
-        }
-    } else if mnemonic == "jmp" {
-        if parts.len() > 1 {
-            var target: str = mo_str_trim_end(parts.get(1));
-            self.text_bytes.push(0xE9);
-            var offset: i64 = self.text_bytes.len();
-            self.text_bytes.push(0);
-            self.text_bytes.push(0);
-            self.text_bytes.push(0);
-            self.text_bytes.push(0);
-            var sym_idx: i64 = MachOEmitter_get_or_add_symbol(self, target, 0, false);
-            self.relocations.push(MachOReloc_new(offset, sym_idx, true, 2, true, 0));
-        }
-    } else if mnemonic == "int3" || mnemonic == "hlt" {
-        self.text_bytes.push(0xCC);
-    } else {
-        self.text_bytes.push(0x90);
-    }
-
-    return ResultUnit::Ok;
-}
-
-fn MachOEmitter_add_symbol(self: &mut MachOEmitter, name: str, offset: i64, is_defined: bool) -> void {
-    var section: i64 = 0;
-    if is_defined { section = 1; } else { section = 0; }
-    var sym_type: i64 = 0;
-    if is_defined { sym_type = 0x0e; } else { sym_type = 0x01; }
-
-    self.symbols.push(MachOSymbol_new(name, offset, section, sym_type, 0));
-}
-
-fn MachOEmitter_get_or_add_symbol(self: &mut MachOEmitter, name: str, offset: i64, is_defined: bool) -> i64 {
+fn mo_add_symbol(e: &mut MachOEmitter, name: str, value: i64, sect: i64, sym_type: i64) -> i64 {
     var i: i64 = 0;
-    while i < self.symbols.len() {
-        if self.symbols.get(i).name == name {
-            return i;
-        }
+    while i < e.sym_names.len() {
+        if e.sym_names.get(i) == name { return i; }
         i = i + 1;
     }
-    var idx: i64 = self.symbols.len();
-    MachOEmitter_add_symbol(self, name, offset, is_defined);
+    var idx: i64 = e.symbols.len();
+    e.symbols.push(MachOSymbol_new(name, value, sect, sym_type, 0));
+    e.sym_names.push(name);
     return idx;
+}
+
+fn mo_rodata_find(em: &ElfEmitter, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < em.rodata_symbols.len() {
+        if em.rodata_symbols.get(i).name == name { return em.rodata_symbols.get(i).offset; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Assemble via the shared encoder, then translate results into Mach-O
+// symbols/relocations/section bytes.
+pub fn MachOEmitter_import(self: &mut MachOEmitter, em: &ElfEmitter) {
+    var i: i64 = 0;
+    while i < em.text.len() {
+        self.text_bytes.push(em.text.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < em.rodata.len() {
+        self.const_bytes.push(em.rodata.get(i));
+        i = i + 1;
+    }
+
+    // Symbols: defined text syms -> sect 1, rodata syms -> sect 2,
+    // undefined -> N_UNDF_EXT
+    i = 0;
+    while i < em.symbols.len() {
+        var s: Symbol = em.symbols.get(i);
+        if s.is_defined {
+            var t: i64 = N_SECT_EXT;
+            if s.binding == 0 { t = N_SECT; }
+            mo_add_symbol(self, s.name, s.value, 1, t);
+        } else {
+            // skip .rodata labels — emitted as section-2 symbols below
+            if mo_rodata_find(em, s.name) < 0 {
+                mo_add_symbol(self, s.name, 0, 0, N_UNDF_EXT);
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < em.rodata_symbols.len() {
+        var rs: RodataSym = em.rodata_symbols.get(i);
+        mo_add_symbol(self, rs.name, rs.offset, 2, N_SECT);
+        i = i + 1;
+    }
+
+    // .text relocations — PC32 sites that are call/jmp targets get
+    // X86_64_RELOC_BRANCH; other PC32 sites (lea/rip-rel data) get SIGNED.
+    i = 0;
+    while i < em.relocations.len() {
+        var rel: Relocation = em.relocations.get(i);
+        var name: str = em.symbols.get(rel.symbol).name;
+        var idx: i64 = mo_sym_index(self, name);
+        if rel.rtype == 1 {
+            // R_X86_64_64: absolute 8-byte reference
+            self.relocations.push(MachOReloc_new(rel.offset, idx, false, 3, true, XR_UNSIGNED, 1));
+        } else {
+            // PC32/PLT32 — peek at the byte before the disp field to
+            // distinguish call/jmp (0xE8/0xE9, or jcc 0x0F) from lea
+            var opcode: i64 = self.text_bytes.get(rel.offset - 1);
+            var rt: i64 = XR_SIGNED;
+            if opcode == 0xE8 || opcode == 0xE9 || opcode == 0x0F { rt = XR_BRANCH; }
+            self.relocations.push(MachOReloc_new(rel.offset, idx, true, 2, true, rt, 1));
+        }
+        i = i + 1;
+    }
+    // .rdata relocations (absolute addrs, e.g. vtables)
+    i = 0;
+    while i < em.rodata_relocations.len() {
+        var rrel: Relocation = em.rodata_relocations.get(i);
+        var rname: str = em.symbols.get(rrel.symbol).name;
+        var ridx: i64 = mo_sym_index(self, rname);
+        self.relocations.push(MachOReloc_new(rrel.offset, ridx, false, 3, true, XR_UNSIGNED, 2));
+        i = i + 1;
+    }
 }
 
 fn MachOEmitter_add_string(self: &mut MachOEmitter, s: str) -> i64 {
@@ -238,26 +230,60 @@ fn MachOEmitter_add_string(self: &mut MachOEmitter, s: str) -> i64 {
     return offset;
 }
 
+fn mo_sectname(buf: Vec, name: str) {
+    var i: i64 = 0;
+    while i < str_len(name) {
+        buf.push(str_byte_at(name, i));
+        i = i + 1;
+    }
+    while i < 16 {
+        buf.push(0);
+        i = i + 1;
+    }
+}
+
+fn mo_count_relocs_in(e: &MachOEmitter, sect: i64) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < e.relocations.len() {
+        if e.relocations.get(i).section == sect { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
 // --- Build Mach-O object file ---
 
 pub fn MachOEmitter_build_macho(self: &mut MachOEmitter) -> ResultVec {
+    var has_const: bool = self.const_bytes.len() > 0;
+    var nsects: i64 = 1;
+    if has_const { nsects = 2; }
+
     var header_size: i64 = 32;
     var segment_cmd_size: i64 = 72;
     var section_header_size: i64 = 80;
     var symtab_cmd_size: i64 = 24;
 
-    var load_commands_size: i64 = segment_cmd_size + section_header_size + symtab_cmd_size;
+    var load_commands_size: i64 = segment_cmd_size + section_header_size * nsects + symtab_cmd_size;
 
     var text_data_offset: i64 = header_size + load_commands_size;
     var text_data_size: i64 = self.text_bytes.len();
 
-    var reloc_offset: i64 = text_data_offset + text_data_size;
-    var reloc_size: i64 = self.relocations.len() * 8;
+    var text_reloc_count: i64 = mo_count_relocs_in(self, 1);
+    var const_reloc_count: i64 = mo_count_relocs_in(self, 2);
 
-    var symbol_table_offset: i64 = reloc_offset + reloc_size;
+    var text_reloc_offset: i64 = text_data_offset + text_data_size;
+    var const_data_offset: i64 = text_reloc_offset + text_reloc_count * 8;
+    var const_data_size: i64 = 0;
+    if has_const { const_data_size = self.const_bytes.len(); }
+    var const_reloc_offset: i64 = const_data_offset + const_data_size;
+
+    var symbol_table_offset: i64 = const_reloc_offset + const_reloc_count * 8;
     var symbol_table_size: i64 = self.symbols.len() * 16;
-
     var string_table_offset: i64 = symbol_table_offset + symbol_table_size;
+
+    // Initialize string table (index 0 = empty)
+    self.string_table.push(0);
 
     // Build string table entries for symbols
     var sym_string_offsets: Vec<i64> = Vec::new();
@@ -276,48 +302,57 @@ pub fn MachOEmitter_build_macho(self: &mut MachOEmitter) -> ResultVec {
     mo_emit_u32(buf, CPU_TYPE_X86_64);                 // cputype
     mo_emit_u32(buf, CPU_SUBTYPE_ALL);                  // cpusubtype
     mo_emit_u32(buf, MH_OBJECT);                        // filetype
-    mo_emit_u32(buf, 2);                               // ncmds (2: segment + symtab)
+    mo_emit_u32(buf, 2);                               // ncmds (segment + symtab)
     mo_emit_u32(buf, load_commands_size);              // sizeofcmds
     mo_emit_u32(buf, 0);                               // flags
     mo_emit_u32(buf, 0);                               // reserved
 
-    // -- LC_SEGMENT_64 Load Command (72 bytes) --
+    // -- LC_SEGMENT_64 Load Command --
     mo_emit_u32(buf, LC_SEGMENT_64);                   // cmd
-    mo_emit_u32(buf, segment_cmd_size + section_header_size); // cmdsize
-    // segname (16 bytes, padded with zeros): __TEXT
-    buf.push(0x5F); buf.push(0x5F); buf.push(0x54); buf.push(0x45); buf.push(0x58); buf.push(0x54); // __TEXT
-    var pad_i: i64 = 6;
-    while pad_i < 16 { buf.push(0); pad_i = pad_i + 1; }
+    mo_emit_u32(buf, segment_cmd_size + section_header_size * nsects); // cmdsize
+    mo_sectname(buf, "__TEXT");                        // segname
     mo_emit_u64(buf, 0);                               // vmaddr
-    mo_emit_u64(buf, text_data_size);                  // vmsize
+    mo_emit_u64(buf, text_data_size + const_data_size); // vmsize
     mo_emit_u64(buf, text_data_offset);                // fileoff
-    mo_emit_u64(buf, text_data_size);                  // filesize
+    mo_emit_u64(buf, text_data_size + const_data_size); // filesize
     mo_emit_u32(buf, 0);                               // maxprot
     mo_emit_u32(buf, 0);                               // initprot
-    mo_emit_u32(buf, 1);                               // nsects (1: __text)
+    mo_emit_u32(buf, nsects);                          // nsects
     mo_emit_u32(buf, 0);                               // flags
 
-    // -- Section Header (80 bytes) --
-    // sectname (16 bytes): __text
-    buf.push(0x5F); buf.push(0x5F); buf.push(0x74); buf.push(0x65); buf.push(0x78); buf.push(0x74); // __text
-    pad_i = 6;
-    while pad_i < 16 { buf.push(0); pad_i = pad_i + 1; }
-    // segname (16 bytes): __TEXT
-    buf.push(0x5F); buf.push(0x5F); buf.push(0x54); buf.push(0x45); buf.push(0x58); buf.push(0x54); // __TEXT
-    pad_i = 6;
-    while pad_i < 16 { buf.push(0); pad_i = pad_i + 1; }
+    // -- Section Header 1: __text (80 bytes) --
+    mo_sectname(buf, "__text");
+    mo_sectname(buf, "__TEXT");
     mo_emit_u64(buf, 0);                               // addr
     mo_emit_u64(buf, text_data_size);                  // size
     mo_emit_u32(buf, text_data_offset);                // offset
-    mo_emit_u32(buf, reloc_offset);                    // reloff
-    mo_emit_u32(buf, self.relocations.len());          // nreloc
+    mo_emit_u32(buf, text_reloc_offset);               // reloff
+    mo_emit_u32(buf, text_reloc_count);                // nreloc
     mo_emit_u32(buf, 0);                               // align
-    mo_emit_u32(buf, 0);                               // reloff2 (reserved)
-    mo_emit_u32(buf, 0);                               // nreloc2 (reserved)
+    mo_emit_u32(buf, 0);                               // reserved
+    mo_emit_u32(buf, 0);                               // reserved
     mo_emit_u32(buf, 0);                               // flags
     mo_emit_u32(buf, 0);                               // reserved1
     mo_emit_u32(buf, 0);                               // reserved2
-    mo_emit_u32(buf, 0);                               // reserved3 (64-bit only)
+    mo_emit_u32(buf, 0);                               // reserved3
+
+    // -- Section Header 2: __const --
+    if has_const {
+        mo_sectname(buf, "__const");
+        mo_sectname(buf, "__TEXT");
+        mo_emit_u64(buf, text_data_size);              // addr
+        mo_emit_u64(buf, const_data_size);             // size
+        mo_emit_u32(buf, const_data_offset);           // offset
+        mo_emit_u32(buf, const_reloc_offset);          // reloff
+        mo_emit_u32(buf, const_reloc_count);           // nreloc
+        mo_emit_u32(buf, 0);                           // align
+        mo_emit_u32(buf, 0);                           // reserved
+        mo_emit_u32(buf, 0);                           // reserved
+        mo_emit_u32(buf, 0);                           // flags
+        mo_emit_u32(buf, 0);                           // reserved1
+        mo_emit_u32(buf, 0);                           // reserved2
+        mo_emit_u32(buf, 0);                           // reserved3
+    }
 
     // -- LC_SYMTAB Load Command (24 bytes) --
     mo_emit_u32(buf, LC_SYMTAB);                       // cmd
@@ -327,26 +362,50 @@ pub fn MachOEmitter_build_macho(self: &mut MachOEmitter) -> ResultVec {
     mo_emit_u32(buf, string_table_offset);             // stroff
     mo_emit_u32(buf, self.string_table.len());         // strsize
 
-    // -- __TEXT,__text section data --
+    // -- __text section data --
     var ti: i64 = 0;
     while ti < self.text_bytes.len() {
         buf.push(self.text_bytes.get(ti));
         ti = ti + 1;
     }
 
-    // -- Relocations (8 bytes each) --
+    // -- __text relocations (8 bytes each) --
     var ri: i64 = 0;
     while ri < self.relocations.len() {
         var reloc: MachOReloc = self.relocations.get(ri);
-        mo_emit_u32(buf, reloc.offset);                 // r_offset
-        // r_symbolnum (24 bits) + r_pcrel (1 bit) + r_length (2 bits) + r_extern (1 bit) + r_type (4 bits)
-        var packed: i64 = reloc.symbol_index & 0x00ffffff;
-        if reloc.is_pcrel { packed = packed | (1 << 24); }
-        packed = packed | ((reloc.length & 3) << 25);
-        if reloc.is_extern { packed = packed | (1 << 27); }
-        packed = packed | ((reloc.rtype & 0xf) << 28);
-        mo_emit_u32(buf, packed);
+        if reloc.section == 1 {
+            mo_emit_u32(buf, reloc.offset);
+            var packed: i64 = reloc.symbol_index & 0x00ffffff;
+            if reloc.is_pcrel { packed = packed | (1 << 24); }
+            packed = packed | ((reloc.length & 3) << 25);
+            if reloc.is_extern { packed = packed | (1 << 27); }
+            packed = packed | ((reloc.rtype & 0xf) << 28);
+            mo_emit_u32(buf, packed);
+        }
         ri = ri + 1;
+    }
+
+    // -- __const section data + relocations --
+    if has_const {
+        var di: i64 = 0;
+        while di < self.const_bytes.len() {
+            buf.push(self.const_bytes.get(di));
+            di = di + 1;
+        }
+        var rri: i64 = 0;
+        while rri < self.relocations.len() {
+            var rreloc: MachOReloc = self.relocations.get(rri);
+            if rreloc.section == 2 {
+                mo_emit_u32(buf, rreloc.offset);
+                var rpacked: i64 = rreloc.symbol_index & 0x00ffffff;
+                if rreloc.is_pcrel { rpacked = rpacked | (1 << 24); }
+                rpacked = rpacked | ((rreloc.length & 3) << 25);
+                if rreloc.is_extern { rpacked = rpacked | (1 << 27); }
+                rpacked = rpacked | ((rreloc.rtype & 0xf) << 28);
+                mo_emit_u32(buf, rpacked);
+            }
+            rri = rri + 1;
+        }
     }
 
     // -- Symbol Table (nlist_64, 16 bytes each) --
@@ -375,109 +434,12 @@ pub fn MachOEmitter_build_macho(self: &mut MachOEmitter) -> ResultVec {
 // --- Public API ---
 
 pub fn emit_macho_file(module: i64, asm: str) -> ResultVec {
-    var emitter: MachOEmitter = MachOEmitter_new();
-    match MachOEmitter_assemble(emitter, asm) {
+    var em: ElfEmitter = ElfEmitter_new();
+    match ElfEmitter_assemble(&mut em, asm) {
         ResultUnit::Ok => {}
         ResultUnit::Err(e) => { return ResultVec::Err(e); }
     }
+    var emitter: MachOEmitter = MachOEmitter_new();
+    MachOEmitter_import(&mut emitter, &em);
     return MachOEmitter_build_macho(emitter);
-}
-
-// --- Local helpers (string utilities) ---
-
-fn mo_str_lines(s: str) -> Vec<str> {
-    var result: Vec<str> = Vec::new();
-    var i: i64 = 0;
-    var start: i64 = 0;
-    while i < str_len(s) {
-        var b: i64 = str_byte_at(s, i);
-        if b == 10 {
-            result.push(str_slice(s, start, i));
-            start = i + 1;
-        }
-        i = i + 1;
-    }
-    if start < str_len(s) {
-        result.push(str_slice(s, start, str_len(s)));
-    }
-    return result;
-}
-
-fn mo_str_trim(s: str) -> str {
-    var start: i64 = 0;
-    var end: i64 = str_len(s);
-    while start < end {
-        var b: i64 = str_byte_at(s, start);
-        if b == 32 || b == 9 || b == 13 || b == 10 {
-            start = start + 1;
-        } else {
-            break;
-        }
-    }
-    while end > start {
-        var b: i64 = str_byte_at(s, end - 1);
-        if b == 32 || b == 9 || b == 13 || b == 10 {
-            end = end - 1;
-        } else {
-            break;
-        }
-    }
-    return str_slice(s, start, end);
-}
-
-fn mo_str_trim_end(s: str) -> str {
-    var end: i64 = str_len(s);
-    while end > 0 {
-        var b: i64 = str_byte_at(s, end - 1);
-        if b == 32 || b == 9 || b == 13 || b == 10 || b == 44 {
-            end = end - 1;
-        } else {
-            break;
-        }
-    }
-    return str_slice(s, 0, end);
-}
-
-fn mo_str_starts_with(s: str, prefix: str) -> bool {
-    if str_len(s) < str_len(prefix) { return false; }
-    var i: i64 = 0;
-    while i < str_len(prefix) {
-        if str_byte_at(s, i) != str_byte_at(prefix, i) { return false; }
-        i = i + 1;
-    }
-    return true;
-}
-
-fn mo_str_ends_with(s: str, suffix: str) -> bool {
-    var slen: i64 = str_len(s);
-    var flen: i64 = str_len(suffix);
-    if slen < flen { return false; }
-    var i: i64 = 0;
-    while i < flen {
-        if str_byte_at(s, slen - flen + i) != str_byte_at(suffix, i) { return false; }
-        i = i + 1;
-    }
-    return true;
-}
-
-fn mo_str_split_whitespace(s: str) -> Vec<str> {
-    var result: Vec<str> = Vec::new();
-    var i: i64 = 0;
-    var start: i64 = -1;
-    while i < str_len(s) {
-        var b: i64 = str_byte_at(s, i);
-        if b == 32 || b == 9 {
-            if start >= 0 {
-                result.push(str_slice(s, start, i));
-                start = -1;
-            }
-        } else {
-            if start < 0 { start = i; }
-        }
-        i = i + 1;
-    }
-    if start >= 0 {
-        result.push(str_slice(s, start, str_len(s)));
-    }
-    return result;
 }

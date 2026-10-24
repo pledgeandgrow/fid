@@ -1,8 +1,13 @@
 # File Analysis: compiler/ir.fd
 
-> **Re-verified 2026-10-23:** all findings confirmed — `inst_effects` catch-all `_ => {}` (:1163) returns *empty* EffectSet (worse than reported: StructCopy isn't the only silent case — any new instruction is invisible to the optimizer), StructCopy absent from inst_value_refs, O(N²) linear lookups confirmed (:1509-1528).
+> > **FIXED 2026-10-23 (v2):** `StructCopy` added to `inst_effects` (Write) and `inst_value_refs` (dst+src pushed) — no longer invisible to optimizer. Other catch-all `_ => {}` gaps and O(N²) linear lookups remain.
+
+> *Superseded re-verify:* all findings confirmed — `inst_effects` catch-all `_ => {}` (:1163) returns *empty* EffectSet (worse than reported: StructCopy isn't the only silent case — any new instruction is invisible to the optimizer), StructCopy absent from inst_value_refs, O(N²) linear lookups confirmed (:1509-1528).
 
 **Run:** 26/52 | **LOC:** 2,551 (src/ir.rs: 1,811, 141% — Vec-entry structs + Opt* enums + constructor shims account for the growth) | **Status:** LIVE — central type definitions
+
+
+> C5/C6 fixed 2026-10-23 (v3): verify Branch field order corrected; DCE keeps ConstFnRef-address-taken fns on indirect calls; get_inst/get_meta O(1) index-by-id fast path.
 
 ## Where it's called
 

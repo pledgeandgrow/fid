@@ -1160,6 +1160,7 @@ pub fn inst_effects(inst: &Inst) -> EffectSet {
         Inst::GradBegin(_) => { EffectSet_add(&mut effects, Effect::Diff); }
         Inst::GradEnd => { EffectSet_add(&mut effects, Effect::Diff); }
         Inst::Backward(_) => { EffectSet_add(&mut effects, Effect::Diff); }
+        Inst::StructCopy(_, _, _) => { EffectSet_add(&mut effects, Effect::Write); }
         _ => {}
     }
     return effects;
@@ -1251,6 +1252,10 @@ pub fn inst_value_refs(inst: &Inst) -> Vec<i64> {
         Inst::Store(ptr, value, _) => {
             refs.push(ptr);
             refs.push(value);
+        }
+        Inst::StructCopy(dst, src, _) => {
+            refs.push(dst);
+            refs.push(src);
         }
         Inst::GetFieldPtr(struct_ptr, _, _) => {
             refs.push(struct_ptr);
@@ -1507,6 +1512,12 @@ pub fn IrFunction_lookup_local(self: &IrFunction, name: str) -> OptValueId {
 }
 
 pub fn IrFunction_get_inst(self: &IrFunction, id: i64) -> OptInst {
+    // Fast path: ids are dense counters starting at 0, so id == index in the
+    // common case. Verified by the id check — falls back to scan otherwise.
+    if id >= 0 && id < self.insts.len() {
+        var e: ValueIdInst = self.insts.get(id);
+        if e.id == id { return OptInst::Some(e.inst); }
+    }
     var i: i64 = 0;
     while i < self.insts.len() {
         if self.insts.get(i).id == id {
@@ -1518,6 +1529,10 @@ pub fn IrFunction_get_inst(self: &IrFunction, id: i64) -> OptInst {
 }
 
 pub fn IrFunction_get_meta(self: &IrFunction, id: i64) -> OptValueMeta {
+    if id >= 0 && id < self.value_metas.len() {
+        var e: ValueIdMeta = self.value_metas.get(id);
+        if e.id == id { return OptValueMeta::Some(e.meta); }
+    }
     var i: i64 = 0;
     while i < self.value_metas.len() {
         if self.value_metas.get(i).id == id {
@@ -2002,6 +2017,38 @@ pub fn IrModule_dead_function_elimination(self: &mut IrModule) -> i64 {
         i = i + 1;
     }
 
+    // Pre-pass: collect address-taken functions (ConstFnRef targets). These are
+    // the only possible CallPtr/DynCall targets, so on any indirect call we keep
+    // the whole set rather than stripping every closure/dispatch callee.
+    var addr_taken: Vec<str> = Vec::new();
+    var fi0: i64 = 0;
+    while fi0 < self.functions.len() {
+        var f0: IrFunction = self.functions.get(fi0).func;
+        var b0: i64 = 0;
+        while b0 < f0.blocks.len() {
+            var blk0: BasicBlock = f0.blocks.get(b0);
+            var i0: i64 = 0;
+            while i0 < blk0.instructions.len() {
+                match IrFunction_get_inst(&f0, blk0.instructions.get(i0)) {
+                    OptInst::Some(inst0) => {
+                        match inst0 {
+                            Inst::ConstFnRef(fn_name) => {
+                                if !ir_c_str_vec_contains(addr_taken, fn_name) {
+                                    addr_taken.push(fn_name);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    OptInst::None => {}
+                }
+                i0 = i0 + 1;
+            }
+            b0 = b0 + 1;
+        }
+        fi0 = fi0 + 1;
+    }
+
     // BFS: for each reachable function, find all Call targets
     while worklist.len() > 0 {
         var fname: str = worklist.get(worklist.len() - 1);
@@ -2029,6 +2076,38 @@ pub fn IrModule_dead_function_elimination(self: &mut IrModule) -> i64 {
                                                 }
                                                 OptIrFunction::None => {}
                                             }
+                                        }
+                                    }
+                                    Inst::CallPtr(_, _, _, _, _) => {
+                                        var ati: i64 = 0;
+                                        while ati < addr_taken.len() {
+                                            var atn: str = addr_taken.get(ati);
+                                            if !ir_c_str_vec_contains(reachable, atn) {
+                                                match IrModule_get_function(self, atn) {
+                                                    OptIrFunction::Some(_) => {
+                                                        reachable.push(atn);
+                                                        worklist.push(atn);
+                                                    }
+                                                    OptIrFunction::None => {}
+                                                }
+                                            }
+                                            ati = ati + 1;
+                                        }
+                                    }
+                                    Inst::DynCall(_, _, _, _, _) => {
+                                        var ati2: i64 = 0;
+                                        while ati2 < addr_taken.len() {
+                                            var atn2: str = addr_taken.get(ati2);
+                                            if !ir_c_str_vec_contains(reachable, atn2) {
+                                                match IrModule_get_function(self, atn2) {
+                                                    OptIrFunction::Some(_) => {
+                                                        reachable.push(atn2);
+                                                        worklist.push(atn2);
+                                                    }
+                                                    OptIrFunction::None => {}
+                                                }
+                                            }
+                                            ati2 = ati2 + 1;
                                         }
                                     }
                                     _ => {}
@@ -2334,7 +2413,7 @@ pub fn IrModule_verify(self: &IrModule) -> VerificationResult {
                                     result.errors.push("function '" + name + "': block " + int_to_str(block.id) + " jumps to invalid block " + int_to_str(target));
                                 }
                             }
-                            Inst::Branch(then_b, else_b, _) => {
+                            Inst::Branch(_, then_b, else_b) => {
                                 if !vec_contains(valid_blocks, then_b) {
                                     result.errors.push("function '" + name + "': block " + int_to_str(block.id) + " branches to invalid then-block " + int_to_str(then_b));
                                 }

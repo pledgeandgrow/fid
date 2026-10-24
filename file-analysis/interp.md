@@ -2,6 +2,9 @@
 
 **Run:** 25/52 | **LOC:** 3,967 (src/interp.rs: 6,358, ~62%) | **Status:** LIVE — the `run` path
 
+
+> C3/C4 fixed 2026-10-23 (v3): checked add/sub/mul via pre-checks + @wrapping honored (`is_wrapping_func` live); MIN/-1 div/mod edge; txn rollback now deep-copies Memory + restores opaque_values.
+
 ## Where it's called
 
 - `compiler/compiler.fd:1604,1626,1647` — `interpret_ir_module` / `interpret_ir_module_with_options` (the `fidesc run` execution path, `--max-recursion`/`--max-steps`/`--max-memory` options)

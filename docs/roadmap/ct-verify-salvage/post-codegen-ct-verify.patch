@@ -1,0 +1,781 @@
+diff --git a/src/codegen_x64.rs b/src/codegen_x64.rs
+index 360facb..74789c7 100644
+--- a/src/codegen_x64.rs
++++ b/src/codegen_x64.rs
+@@ -2050,63 +2050,293 @@ fn escape_str(s: &str) -> String {
+ }
+ 
+ // ═══════════════════════════════════════════════════════════════════════════
+-// Post-codegen constant-time verification (STUB)
++// Post-codegen constant-time verification
+ // ═══════════════════════════════════════════════════════════════════════════
+ 
++/// Class of constant-time violation found in generated assembly.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum CtViolationKind {
++    /// A conditional jump (`jcc`) or indirect jump (`jmp *...`).
++    ConditionalJump,
++    /// A `cmov*` whose source operand is in memory.
++    CmovMemory,
++    /// A memory operand that uses an index register (`(%base,%index,scale)`).
++    IndexedMemory,
++    /// A variable-latency instruction (`div`, `idiv`, `divss/sd`, `sqrt*`).
++    VariableLatency,
++    /// A direct call to a function that is neither `@constant_time` nor in
++    /// [`CT_RUNTIME_ALLOWLIST`].
++    UnverifiedCall,
++    /// An indirect call (`call *...`) whose target cannot be verified.
++    IndirectCall,
++}
++
++impl CtViolationKind {
++    pub fn label(self) -> &'static str {
++        match self {
++            CtViolationKind::ConditionalJump => "conditional jump",
++            CtViolationKind::CmovMemory => "cmov with memory operand",
++            CtViolationKind::IndexedMemory => "indexed memory access",
++            CtViolationKind::VariableLatency => "variable-latency instruction",
++            CtViolationKind::UnverifiedCall => "call to unverified function",
++            CtViolationKind::IndirectCall => "indirect call",
++        }
++    }
++}
++
+ /// Result of a constant-time verification check on generated assembly.
+-#[derive(Debug)]
++#[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct CtViolation {
+     pub function: String,
++    /// 1-based line number in the assembly text.
+     pub line: usize,
+     pub instruction: String,
+     pub reason: String,
++    pub kind: CtViolationKind,
++}
++
++impl std::fmt::Display for CtViolation {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(
++            f,
++            "Security error (constant_time, post-codegen): function '{}' asm line {}: `{}`\n\
++             \x20\x20\x20\x20{}: {}",
++            self.function, self.line, self.instruction, self.kind.label(), self.reason
++        )
++    }
+ }
+ 
+-/// Verify that generated x86-64 assembly is constant-time for `@constant_time` functions.
++/// Runtime helpers a `@constant_time` function may call without being
++/// reported. This list is deliberately tiny: only `p_panic` is included,
++/// because it never returns (its timing cannot leak anything about a
++/// completed computation) and the codegen emits it unconditionally in the
++/// stack-canary / recursion-guard / overflow trap stubs. No other runtime
++/// helper has been audited for constant-time behaviour, so none is allowed.
++pub const CT_RUNTIME_ALLOWLIST: &[&str] = &["p_panic"];
++
++/// Verify that generated x86-64 assembly is constant-time for `@constant_time`
++/// functions. Runs on the final (post-peephole) AT&T-syntax text that
++/// `generate_asm` + `peephole::optimize` produce, so it sees exactly what gets
++/// encoded into the object file.
+ ///
+-/// This is a STUB for a planned post-codegen verification pass. The compile-time
+-/// `verify_constant_time` in typechecker.rs checks source-level rules (no IO,
+-/// no early returns, transitive @constant_time calls). However, the optimizer
+-/// and code generator can introduce branches that the source-level check cannot
+-/// catch — for example:
++/// The source-level check (`TypeChecker::verify_constant_time`) only enforces
++/// no IO/Net/Spawn effects, no early returns, and transitive `@constant_time`
++/// calls. It does NOT reject `if`/`match`/`while` on data, so a data-dependent
++/// branch in the source reaches codegen untouched. This pass is where such
++/// branches are caught. It is purely syntactic — it does not track which
++/// values are secret, so every finding is a *possible* leak.
+ ///
+-///   - Strength reduction turning a multiply into a shift+add sequence with
+-///     a branch on the multiplier's sign
+-///   - Register allocator spilling a secret value to the stack, creating
+-///     cache-timing-dependent memory access patterns
+-///   - Peephole optimizer converting a CMOV to a Jcc (branch)
+-///   - Bounds-check elimination introducing a data-dependent branch
++/// What is reported inside a `@constant_time` function body:
++///   (a) every conditional jump (`je/jne/jz/jnz/jg/jl/ja/jb/jo/js/...`) and
++///       every indirect `jmp *`. No loop-trip-count proof is attempted, so
++///       loop back-edges are reported too. Exactly two compiler-inserted
++///       checks are exempt because their condition depends only on the stack
++///       pointer / saved return address, never on function data:
++///         - the recursion guard  `cmpq $0x7F0000000000, %rsp` + `jle`
++///         - the stack-canary check `xorq $0x5DEADBEEFCAFEBABE, %rdx` +
++///           `cmpq %rax, %rdx` + `jne`
++///       Overflow traps (`jo` after add/sub/mul) ARE reported — their
++///       condition is a function of the operands. Mark the function
++///       `@wrapping` to get branch-free arithmetic.
++///   (b) `cmov*` with a memory source operand (cache-timing dependent).
++///   (c) memory operands with an index register — `(%b,%i)`, `(%b,%i,s)`,
++///       `(,%i,s)` — on any instruction except `lea*` (which computes an
++///       address but does not access memory).
++///   (d) variable-latency instructions: `div*`, `idiv*`, `divss/divsd/divps/
++///       divpd`, `sqrt*`, `rsqrt*` and their `v`-prefixed AVX forms.
++///   (e) `call` to a function that is not in `ct_functions` and not in
++///       `CT_RUNTIME_ALLOWLIST`; any `call *` (indirect) is reported as well.
+ ///
+-/// Planned full verification:
+-///   1. Identify @constant_time functions in the assembly (by function label)
+-///   2. Scan each instruction in those functions
+-///   3. Flag: Jcc/JMP with register operands (data-dependent branches)
+-///   4. Flag: CMOV with memory operand (cache-dependent)
+-///   5. Flag: memory access with secret-derived index (leaks via cache)
+-///   6. Flag: DIV/IDIV (variable-latency on most x86 CPUs)
+-///   7. Report violations with function name, line, and instruction
++/// What is NOT checked: plain `(%base)` / `disp(%base)` loads and stores
++/// (register spills included) — their address is fixed per program point,
++/// but this pass cannot tell whether `%base` itself was derived from a
++/// secret; `jmp` to a fixed label; `setcc`; multiplication (`imul` is
++/// constant-latency on modern x86-64 but not on every microarchitecture).
+ ///
+-/// See: docs/roadmap/safety-critical.md §20
++/// Function boundaries are recognised from the codegen's own layout:
++/// `name:` at column 0 (not starting with `.L`) opens a function and
++/// `.size name, .-name` closes it. Local labels (`.Lname_bbN:`,
++/// `.Lname_epilogue:`, `.Lname_panicN:`) do not change the current function,
++/// so the panic stubs are scanned as part of the function that owns them.
+ pub fn verify_constant_time_asm(asm: &str, ct_functions: &[String]) -> Vec<CtViolation> {
+-    // STUB: post-codegen constant-time verification is not yet implemented.
+-    // The source-level check in typechecker.rs (verify_constant_time) provides
+-    // basic protection but does not inspect generated machine code.
+-    //
+-    // When implemented, this function will:
+-    //   - Parse the assembly string line by line
+-    //   - Track which function we're currently in (by label)
+-    //   - For functions in ct_functions, scan for:
+-    //     * Conditional jumps (jne, je, jg, jl, ja, jb, jge, jle, etc.)
+-    //       whose condition depends on a register (not a constant)
+-    //     * CMOV instructions with memory operands
+-    //     * Memory accesses with computed (non-constant) indices
+-    //     * DIV/IDIV instructions
+-    //   - Return a list of CtViolation with precise locations
+-    //
+-    // For now, return empty (no violations detected) — the stub is a no-op.
+-    let _ = asm;
+-    let _ = ct_functions;
+-    Vec::new()
++    let mut violations = Vec::new();
++    if ct_functions.is_empty() {
++        return violations;
++    }
++    let ct_set: std::collections::HashSet<&str> = ct_functions.iter().map(|s| s.as_str()).collect();
++
++    let mut current_func: Option<String> = None;
++    // Previous two instruction lines (comment-stripped, trimmed) of the current
++    // function, used to recognise the exempt prologue/epilogue checks.
++    let mut prev1 = String::new();
++    let mut prev2 = String::new();
++
++    for (idx, raw) in asm.lines().enumerate() {
++        let line_no = idx + 1;
++        let line = raw.trim();
++        if line.is_empty() {
++            continue;
++        }
++
++        // Section switch: leaving .text ends any function.
++        if line.starts_with(".section") || line == ".data" || line == ".bss" {
++            current_func = None;
++            continue;
++        }
++        // `.size name, .-name` closes the function.
++        if let Some(rest) = line.strip_prefix(".size ") {
++            let name = rest.split(',').next().unwrap_or("").trim();
++            if current_func.as_deref() == Some(name) {
++                current_func = None;
++            }
++            continue;
++        }
++        // Other directives carry no instructions.
++        if line.starts_with('.') && !line.starts_with(".L") {
++            continue;
++        }
++        // Labels. A global label `name:` opens a function; `.L...:` is local.
++        if line.ends_with(':') && !line.contains(' ') {
++            let name = &line[..line.len() - 1];
++            if !name.starts_with(".L") {
++                current_func = Some(name.to_string());
++                prev1.clear();
++                prev2.clear();
++            }
++            continue;
++        }
++
++        let func = match current_func.as_deref() {
++            Some(f) if ct_set.contains(f) => f.to_string(),
++            _ => continue,
++        };
++
++        // Strip a trailing `# comment` (codegen uses `#` for comments).
++        let code = match line.find('#') {
++            Some(p) => line[..p].trim(),
++            None => line,
++        };
++        if code.is_empty() {
++            continue;
++        }
++        let (mnemonic, operands) = match code.find(char::is_whitespace) {
++            Some(p) => (&code[..p], code[p..].trim()),
++            None => (code, ""),
++        };
++
++        let mut report = |kind: CtViolationKind, reason: String| {
++            violations.push(CtViolation {
++                function: func.clone(),
++                line: line_no,
++                instruction: code.to_string(),
++                reason,
++                kind,
++            });
++        };
++
++        // (a) conditional / indirect jumps
++        if mnemonic.starts_with('j') {
++            if mnemonic == "jmp" {
++                if operands.starts_with('*') {
++                    report(
++                        CtViolationKind::ConditionalJump,
++                        "indirect jump target is computed at run time".to_string(),
++                    );
++                }
++            } else {
++                let is_recursion_guard =
++                    mnemonic == "jle" && prev1 == "cmpq $0x7F0000000000, %rsp";
++                let is_canary_check = mnemonic == "jne"
++                    && prev1 == "cmpq %rax, %rdx"
++                    && prev2 == "xorq $0x5DEADBEEFCAFEBABE, %rdx";
++                if !is_recursion_guard && !is_canary_check {
++                    let reason = if (mnemonic == "jo" || mnemonic == "jc") && operands.contains("_panic") {
++                        "arithmetic overflow trap branches on the operand values; \
++                         mark the function @wrapping for branch-free arithmetic"
++                            .to_string()
++                    } else {
++                        "control flow depends on a run-time condition; the source-level check \
++                         does not reject if/match/while in @constant_time functions, so this is \
++                         where data-dependent branches are caught"
++                            .to_string()
++                    };
++                    report(CtViolationKind::ConditionalJump, reason);
++                }
++            }
++        }
++
++        // (b) cmov with memory operand
++        if mnemonic.starts_with("cmov") && operands.contains('(') {
++            report(
++                CtViolationKind::CmovMemory,
++                "conditional move reads memory; the load's cache timing depends on the condition".to_string(),
++            );
++        }
++
++        // (c) indexed memory operands (SIB with index register), except lea
++        if !mnemonic.starts_with("lea") && has_indexed_memory_operand(operands) {
++            report(
++                CtViolationKind::IndexedMemory,
++                "memory address uses an index register; a secret-derived index leaks through the cache".to_string(),
++            );
++        }
++
++        // (d) variable-latency instructions
++        if is_variable_latency(mnemonic) {
++            report(
++                CtViolationKind::VariableLatency,
++                "instruction latency depends on operand values on most x86-64 cores".to_string(),
++            );
++        }
++
++        // (e) calls
++        if mnemonic == "call" || mnemonic == "callq" {
++            if operands.starts_with('*') {
++                report(
++                    CtViolationKind::IndirectCall,
++                    "call target is computed at run time and cannot be verified".to_string(),
++                );
++            } else {
++                let target = operands.split_whitespace().next().unwrap_or("");
++                if !ct_set.contains(target) && !CT_RUNTIME_ALLOWLIST.contains(&target) {
++                    report(
++                        CtViolationKind::UnverifiedCall,
++                        format!(
++                            "'{}' is not @constant_time and not in the constant-time runtime allowlist",
++                            target
++                        ),
++                    );
++                }
++            }
++        }
++
++        prev2 = std::mem::take(&mut prev1);
++        prev1 = code.to_string();
++    }
++
++    violations
++}
++
++/// True if any memory operand in `operands` has an index register:
++/// `(%b,%i)`, `(%b,%i,s)` or `(,%i,s)`. Memory operands are the only place
++/// AT&T syntax puts a comma inside parentheses.
++fn has_indexed_memory_operand(operands: &str) -> bool {
++    let mut depth = 0usize;
++    for c in operands.chars() {
++        match c {
++            '(' => depth += 1,
++            ')' => depth = depth.saturating_sub(1),
++            ',' if depth > 0 => return true,
++            _ => {}
++        }
++    }
++    false
++}
++
++/// True for mnemonics whose latency depends on operand values.
++fn is_variable_latency(mnemonic: &str) -> bool {
++    let m = mnemonic.strip_prefix('v').unwrap_or(mnemonic);
++    m.starts_with("div") || m.starts_with("idiv") || m.starts_with("sqrt") || m.starts_with("rsqrt")
+ }
+ 
+ // ═══════════════════════════════════════════════════════════════════════════
+@@ -2127,6 +2357,179 @@ mod tests {
+         generate_asm(&l3)
+     }
+ 
++    // ─── Post-codegen constant-time verifier ───
++
++    /// Mirror of the `build` pipeline for x86-64: typecheck → lower → L1/L2
++    /// (optimized at `level`) → L3 → asm → peephole. Returns the final text
++    /// and the names of all @constant_time functions.
++    fn build_asm_like_build(src: &str, level: crate::opt::OptLevel) -> (String, Vec<String>) {
++        let program = compiler::build_program(src).expect("compile failed");
++        let ct = compiler::constant_time_function_names(&program);
++        let module = crate::lower::lower(&program);
++        let l1 = lower_ir_to_l1(&module);
++        let mut l2 = lower_l1_to_l2(&l1);
++        let _ = crate::opt::optimize_l2_with_level(&mut l2, level);
++        let l3 = lower_l2_to_l3(&l2, &module);
++        let asm = generate_asm(&l3);
++        (crate::peephole::optimize(&asm), ct)
++    }
++
++    fn fixture(name: &str) -> String {
++        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++            .join("tests/bootstrap")
++            .join(name);
++        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e))
++    }
++
++    fn ct_names(names: &[&str]) -> Vec<String> {
++        names.iter().map(|s| s.to_string()).collect()
++    }
++
++    fn kinds(v: &[CtViolation]) -> Vec<CtViolationKind> {
++        v.iter().map(|x| x.kind).collect()
++    }
++
++    /// A function body laid out exactly like the codegen's: prologue with
++    /// recursion guard, epilogue with canary check, a panic stub, `.size`.
++    fn wrap_fn(name: &str, body: &str) -> String {
++        format!(
++            "    .globl {n}\n    .type {n}, @function\n{n}:\n    pushq %rbp\n    movq %rsp, %rbp\n    subq $32, %rsp\n    movq 8(%rbp), %rax\n    xorq $0x5DEADBEEFCAFEBABE, %rax\n    movq %rax, -8(%rbp)\n    cmpq $0x7F0000000000, %rsp\n    jle .L{n}_panic0\n.L{n}_bb0:\n{body}    jmp .L{n}_epilogue\n.L{n}_epilogue:\n    movq %rax, %rcx\n    movq -8(%rbp), %rax\n    movq 8(%rbp), %rdx\n    xorq $0x5DEADBEEFCAFEBABE, %rdx\n    cmpq %rax, %rdx\n    jne .L{n}_panic1\n    movq %rcx, %rax\n    leave\n    ret\n.L{n}_panic0:\n    leaq .str_0(%rip), %rdi\n    call p_panic\n    ud2\n.L{n}_panic1:\n    leaq .str_1(%rip), %rdi\n    call p_panic\n    ud2\n    .size {n}, .-{n}\n",
++            n = name,
++            body = body
++        )
++    }
++
++    #[test]
++    fn ct_verifier_clean_function_has_no_violations() {
++        let asm = format!(
++            "    .text\n{}\n    .section .rodata\n.str_0: .asciz \"a\"\n.str_1: .asciz \"b\"\n",
++            wrap_fn(
++                "ct_sel",
++                "    movq %rsi, %rbx\n    subq %rdi, %rbx    # comment with (%rax,%rcx) inside\n    andq %rbx, %rdx\n    notq %rbx\n    andq %rbx, %rcx\n    orq %rcx, %rdx\n    movq %rdx, -16(%rbp)\n    movq -16(%rbp), %rax\n    leaq (%rax,%rcx,8), %r8\n    call ct_helper\n"
++            )
++        );
++        let v = verify_constant_time_asm(&asm, &ct_names(&["ct_sel", "ct_helper"]));
++        assert!(v.is_empty(), "expected clean, got: {:#?}", v);
++    }
++
++    #[test]
++    fn ct_verifier_empty_ct_list_is_noop() {
++        let asm = wrap_fn("f", "    idivq %rcx\n    jne .Lf_bb0\n");
++        assert!(verify_constant_time_asm(&asm, &[]).is_empty());
++    }
++
++    #[test]
++    fn ct_verifier_ignores_non_ct_functions() {
++        let asm = format!("{}{}", wrap_fn("plain", "    idivq %rcx\n    jne .Lplain_bb0\n"), wrap_fn("ct", "    addq %rdi, %rax\n"));
++        let v = verify_constant_time_asm(&asm, &ct_names(&["ct"]));
++        assert!(v.is_empty(), "violations leaked from non-ct function: {:#?}", v);
++    }
++
++    #[test]
++    fn ct_verifier_reports_conditional_jumps() {
++        let asm = wrap_fn("ct", "    cmpq %rsi, %rdi\n    sete %al\n    testq %rax, %rax\n    jne .Lct_bb1\n    jmp .Lct_bb2\n.Lct_bb1:\n    movq $1, %rax\n.Lct_bb2:\n");
++        let v = verify_constant_time_asm(&asm, &ct_names(&["ct"]));
++        assert_eq!(kinds(&v), vec![CtViolationKind::ConditionalJump], "{:#?}", v);
++        assert_eq!(v[0].function, "ct");
++        assert_eq!(v[0].instruction, "jne .Lct_bb1");
++        // Line is 1-based and points at the jne.
++        let jne_line = asm.lines().position(|l| l.trim() == "jne .Lct_bb1").unwrap() + 1;
++        assert_eq!(v[0].line, jne_line);
++    }
++
++    #[test]
++    fn ct_verifier_reports_overflow_trap_and_indirect_jump() {
++        let asm = wrap_fn("ct", "    addq %rsi, %rax\n    jo .Lct_panic0\n    jmp *%r11\n");
++        let v = verify_constant_time_asm(&asm, &ct_names(&["ct"]));
++        assert_eq!(kinds(&v), vec![CtViolationKind::ConditionalJump, CtViolationKind::ConditionalJump], "{:#?}", v);
++        assert!(v[0].reason.contains("@wrapping"), "{}", v[0].reason);
++        assert!(v[1].reason.contains("indirect"), "{}", v[1].reason);
++    }
++
++    #[test]
++    fn ct_verifier_reports_cmov_memory_but_not_cmov_register() {
++        let asm = wrap_fn("ct", "    cmpq %rsi, %rdi\n    cmoveq %rcx, %rax\n    cmoveq -16(%rbp), %rax\n");
++        let v = verify_constant_time_asm(&asm, &ct_names(&["ct"]));
++        assert_eq!(kinds(&v), vec![CtViolationKind::CmovMemory], "{:#?}", v);
++        assert_eq!(v[0].instruction, "cmoveq -16(%rbp), %rax");
++    }
++
++    #[test]
++    fn ct_verifier_reports_indexed_memory_operands() {
++        let asm = wrap_fn(
++            "ct",
++            "    movq (%rdi,%rsi,8), %rax\n    movq %rax, 16(%rdi,%rsi)\n    movq (,%rsi,8), %rcx\n    movq 8(%rdi), %rdx\n    leaq (%rdi,%rsi,8), %r8\n",
++        );
++        let v = verify_constant_time_asm(&asm, &ct_names(&["ct"]));
++        assert_eq!(
++            kinds(&v),
++            vec![CtViolationKind::IndexedMemory, CtViolationKind::IndexedMemory, CtViolationKind::IndexedMemory],
++            "{:#?}",
++            v
++        );
++    }
++
++    #[test]
++    fn ct_verifier_reports_variable_latency_instructions() {
++        let asm = wrap_fn("ct", "    cqto\n    idivq %rcx\n    divq %rcx\n    divsd %xmm1, %xmm0\n    sqrtsd %xmm0, %xmm0\n    vsqrtsd %xmm0, %xmm0, %xmm0\n    imulq %rcx, %rax\n");
++        let v = verify_constant_time_asm(&asm, &ct_names(&["ct"]));
++        assert_eq!(v.len(), 5, "{:#?}", v);
++        assert!(v.iter().all(|x| x.kind == CtViolationKind::VariableLatency));
++        assert!(!v.iter().any(|x| x.instruction.starts_with("imulq")));
++    }
++
++    #[test]
++    fn ct_verifier_reports_calls() {
++        let asm = wrap_fn("ct", "    call ct_other\n    call p_panic\n    call p_vec_get\n    call *%r11\n    call *8(%r11)\n");
++        let v = verify_constant_time_asm(&asm, &ct_names(&["ct", "ct_other"]));
++        assert_eq!(
++            kinds(&v),
++            vec![CtViolationKind::UnverifiedCall, CtViolationKind::IndirectCall, CtViolationKind::IndirectCall],
++            "{:#?}",
++            v
++        );
++        assert!(v[0].reason.contains("p_vec_get"));
++    }
++
++    #[test]
++    fn ct_verifier_exempts_only_exact_frame_checks() {
++        // Same `jle`/`jne` mnemonics but without the guard/canary compare
++        // immediately before them must be reported.
++        let asm = wrap_fn("ct", "    cmpq $5, %rdi\n    jle .Lct_bb0\n    cmpq %rax, %rdx\n    jne .Lct_bb0\n");
++        let v = verify_constant_time_asm(&asm, &ct_names(&["ct"]));
++        assert_eq!(kinds(&v), vec![CtViolationKind::ConditionalJump, CtViolationKind::ConditionalJump], "{:#?}", v);
++    }
++
++    #[test]
++    fn ct_asm_fixture_is_clean_at_all_opt_levels() {
++        let src = fixture("test_ct_asm.fd");
++        for level in [crate::opt::OptLevel::O0, crate::opt::OptLevel::O2] {
++            let (asm, ct) = build_asm_like_build(&src, level);
++            assert_eq!(ct.len(), 3, "expected 3 @constant_time functions, got {:?}", ct);
++            let v = verify_constant_time_asm(&asm, &ct);
++            assert!(v.is_empty(), "level {:?}: {:#?}", level, v);
++        }
++    }
++
++    #[test]
++    fn ct_asm_fail_fixture_is_rejected() {
++        let src = fixture("test_ct_asm_fail.fd");
++        for level in [crate::opt::OptLevel::O0, crate::opt::OptLevel::O2] {
++            let (asm, ct) = build_asm_like_build(&src, level);
++            assert_eq!(ct, vec!["leaky_eq".to_string()]);
++            let v = verify_constant_time_asm(&asm, &ct);
++            assert!(
++                v.iter().any(|x| x.kind == CtViolationKind::ConditionalJump && x.function == "leaky_eq"),
++                "level {:?}: expected a conditional-jump violation in leaky_eq, got {:#?}",
++                level,
++                v
++            );
++            // The build pipeline turns these into errors.
++            let errs: Vec<String> = v.iter().map(|x| x.to_string()).collect();
++            assert!(errs[0].contains("Security error (constant_time, post-codegen)"));
++        }
++    }
++
+     #[test]
+     fn generates_function_label() {
+         let asm = compile_to_x64("fn main() -> i64 { return 42; }\n");
+diff --git a/src/compiler.rs b/src/compiler.rs
+index d08748d..6c73d7a 100644
+--- a/src/compiler.rs
++++ b/src/compiler.rs
+@@ -1642,6 +1642,39 @@ pub fn build_executable(source: &str, source_path: &str, target: &str, do_opt: b
+     build_executable_with_level(source, source_path, target, level, false, granted_caps)
+ }
+ 
++/// Targets on which `build_executable_with_level` runs the post-codegen
++/// constant-time verifier (`codegen_x64::verify_constant_time_asm`) and fails
++/// the build on violations. Other targets rely on the source-level check only.
++pub const POST_CODEGEN_CT_CHECK_TARGETS: &[&str] = &["x86-64"];
++
++/// Names of all `@constant_time` functions in a (post-monomorphization)
++/// program, using the same naming the lowering gives their assembly labels:
++/// free functions keep their name, impl/trait methods are `Type_method`.
++pub fn constant_time_function_names(program: &Program) -> Vec<String> {
++    let is_ct = |anns: &[crate::ast::Annotation]| anns.iter().any(|a| a.name == "constant_time");
++    let mut names = Vec::new();
++    for f in &program.funcs {
++        if is_ct(&f.annotations) {
++            names.push(f.name.clone());
++        }
++    }
++    for imp in &program.impls {
++        for m in &imp.methods {
++            if is_ct(&m.annotations) {
++                names.push(format!("{}_{}", imp.struct_name, m.name));
++            }
++        }
++    }
++    for ti in &program.trait_impls {
++        for m in &ti.methods {
++            if is_ct(&m.annotations) {
++                names.push(format!("{}_{}", ti.type_name, m.name));
++            }
++        }
++    }
++    names
++}
++
+ /// Build a native executable with optional LTO (Link-Time Optimization).
+ /// LTO mode uses more aggressive inline limits for cross-module inlining.
+ pub fn build_executable_with_lto(source: &str, source_path: &str, target: &str, do_opt: bool, do_lto: bool, granted_caps: Option<&[String]>) -> Result<Vec<u8>, Vec<String>> {
+@@ -1671,7 +1704,7 @@ pub fn build_executable_with_level(source: &str, source_path: &str, target: &str
+     let cache = crate::inc::global_cache();
+     let cached_l2 = cache.get(source_path, source_hash);
+ 
+-    let (l2, module) = if let Some(cached) = cached_l2 {
++    let (l2, module, program) = if let Some(cached) = cached_l2 {
+         // Cache hit: reuse the cached (already-optimized) L2 module.
+         let program = build_program_with_path(source, Some(source_path))?;
+         let mut module = lower::lower(&program);
+@@ -1679,7 +1712,7 @@ pub fn build_executable_with_level(source: &str, source_path: &str, target: &str
+         if let Some(caps) = granted_caps {
+             strip_ungranted_caps(&mut module, caps);
+         }
+-        (cached, module)
++        (cached, module, program)
+     } else {
+         // Cache miss: full pipeline.
+         let program = build_program_with_path(source, Some(source_path))?;
+@@ -1705,7 +1738,7 @@ pub fn build_executable_with_level(source: &str, source_path: &str, target: &str
+         // Store the optimized L2 in the cache for future reuse.
+         cache.store(source_path, source_hash, l2.clone());
+ 
+-        (l2, module)
++        (l2, module, program)
+     };
+ 
+     let l3 = pir::lower_l2_to_l3(&l2, &module);
+@@ -1717,6 +1750,17 @@ pub fn build_executable_with_level(source: &str, source_path: &str, target: &str
+             // this catches redundant moves, zero idioms, dead stores, etc.
+             // These are safe local transformations that don't affect semantics.
+             let asm = crate::peephole::optimize(&asm);
++            // Post-codegen constant-time verification: scan the final text
++            // of every @constant_time function for branches, indexed loads,
++            // variable-latency instructions and unverified calls. This runs
++            // after peephole so it sees exactly what gets encoded.
++            let ct_funcs = constant_time_function_names(&program);
++            if !ct_funcs.is_empty() {
++                let violations = crate::codegen_x64::verify_constant_time_asm(&asm, &ct_funcs);
++                if !violations.is_empty() {
++                    return Err(violations.iter().map(|v| v.to_string()).collect());
++                }
++            }
+             let obj = crate::elf64::emit_object_file(&l3, &asm)
+                 .map_err(|e| vec![e])?;
+             // Link with the pre-compiled Linux runtime (raw machine code)
+diff --git a/src/main.rs b/src/main.rs
+index 05c1c93..8200a8d 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -3134,38 +3134,82 @@ fn generate_qualification_manifest(program: &ast::Program, source_path: &str) ->
+     // Optimizer passes (from opt::Pass::all()).
+     let passes: Vec<&str> = opt::Pass::all().iter().map(|p| p.name()).collect();
+ 
+-    // Annotations that are enforced vs stubbed (in the Rust bootstrap).
+-    // The Rust bootstrap enforces most annotations; the self-hosted compiler
+-    // has stubs for many. This manifest reflects the Rust bootstrap status.
+-    let enforced: &[&str] = &[
+-        "linear", "send", "sync", "wrapping", "deterministic", "crashfree",
+-        "no-alloc", "no-recursion", "no-unbounded", "no-indirect",
+-        "requires-audit", "medical", "safety-critical", "autosar",
+-        "conserve", "gas", "tainted", "constant_time", "realtime",
+-        "differentiable", "quantized", "checkpoint", "dp", "shard", "adapter",
+-        "audit", "repr(C)", "kernel",
+-    ];
+-    let stubbed_in_selfhost: &[&str] = &[
+-        "conserve", "gas", "safety-critical", "constant_time", "realtime",
+-        "differentiable", "quantized", "checkpoint", "dp", "shard", "adapter",
+-        "tainted",
+-    ];
++    // Annotations enforced in the Rust bootstrap — single source of truth is
++    // typechecker::enforced_annotations() (annotations with a verify_* pass).
++    let enforced: &[&str] = fidesc::typechecker::enforced_annotations();
++
++    // Self-hosted compiler size, measured from the compiler/ directory at
++    // run time (never hardcoded; "unknown" when the tree is not found).
++    let self_hosted = match selfhost_stats() {
++        Some((modules, loc)) => format!("compiler/*.fd ({} modules, {} LOC)", modules, loc),
++        None => "compiler/*.fd (unknown: compiler/ directory not found relative to the executable or cwd)".to_string(),
++    };
++
++    // Post-codegen constant-time verifier: wired in compiler::build_executable_with_level
++    // for the targets listed in compiler::POST_CODEGEN_CT_CHECK_TARGETS.
++    let ct_targets: Vec<&str> = compiler::POST_CODEGEN_CT_CHECK_TARGETS.to_vec();
++    let ct_status = if ct_targets.is_empty() { "not wired" } else { "implemented" };
+ 
+     let used_ann: Vec<&str> = annotations.iter().map(|s| s.as_str()).collect();
+     let used_caps: Vec<&str> = caps.iter().map(|s| s.as_str()).collect();
+ 
+     format!(
+-        "{{\n  \"manifestVersion\": \"0.1\",\n  \"compiler\": {{\n    \"name\": \"fidesc\",\n    \"version\": \"0.1.0\",\n    \"implementation\": \"Rust bootstrap (src/*.rs)\",\n    \"selfHosted\": \"compiler/*.fd (26 modules, 61,885 LOC)\"\n  }},\n  \"source\": {{\n    \"path\": \"{}\",\n    \"annotations\": [\"{}\"],\n    \"capabilities\": [\"{}\"]\n  }},\n  \"optimizer\": {{\n    \"passes\": [\"{}\"],\n    \"passCount\": {}\n  }},\n  \"annotationEnforcement\": {{\n    \"enforcedInBootstrap\": [\"{}\"],\n    \"stubbedInSelfHost\": [\"{}\"]\n  }},\n  \"qualificationStatus\": \"NOT_QUALIFIED\",\n  \"note\": \"This manifest is generated by a stub. Full IEC 62304 / DO-178C tool qualification requires certification body partnership. See docs/roadmap/safety-critical.md.\"\n}}",
++        "{{\n  \"manifestVersion\": \"0.2\",\n  \"compiler\": {{\n    \"name\": \"fidesc\",\n    \"version\": \"{}\",\n    \"implementation\": \"Rust bootstrap (src/*.rs)\",\n    \"selfHosted\": \"{}\"\n  }},\n  \"source\": {{\n    \"path\": \"{}\",\n    \"annotations\": [\"{}\"],\n    \"capabilities\": [\"{}\"]\n  }},\n  \"optimizer\": {{\n    \"passes\": [\"{}\"],\n    \"passCount\": {}\n  }},\n  \"annotationEnforcement\": {{\n    \"enforcedInBootstrap\": [\"{}\"],\n    \"enforcedInBootstrapMeaning\": \"annotations with a dedicated verify_* pass in the Rust bootstrap typechecker (typechecker::enforced_annotations)\",\n    \"selfHostEnforcementNote\": \"The self-hosted checker (compiler/*.fd) status is tracked in docs/roadmap/roadmap-issues.md (CB1) and is not asserted by this manifest.\",\n    \"postCodegenConstantTimeCheck\": {{\n      \"status\": \"{}\",\n      \"targets\": [\"{}\"],\n      \"runsIn\": \"fidesc build (compiler::build_executable_with_level → codegen_x64::verify_constant_time_asm)\"\n    }}\n  }},\n  \"qualificationStatus\": \"NOT_QUALIFIED\",\n  \"note\": \"This is not a certified toolchain. Full IEC 62304 / DO-178C tool qualification requires certification body partnership. See docs/roadmap/safety-critical.md.\"\n}}",
++        env!("CARGO_PKG_VERSION"),
++        self_hosted,
+         source_path,
+         used_ann.join("\", \""),
+         used_caps.join("\", \""),
+         passes.join("\", \""),
+         passes.len(),
+         enforced.join("\", \""),
+-        stubbed_in_selfhost.join("\", \""),
++        ct_status,
++        ct_targets.join("\", \""),
+     )
+ }
+ 
++/// Locate the repository's `compiler/` directory (self-hosted compiler
++/// source) and return `(module_count, total_lines)` over its `*.fd` files.
++/// Searches upward from the executable's directory, then from the current
++/// working directory. Returns None if no directory containing both
++/// `compiler/*.fd` and `stdlib/` is found.
++fn selfhost_stats() -> Option<(usize, usize)> {
++    fn find_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
++        let mut cur = start.to_path_buf();
++        loop {
++            if cur.join("compiler").is_dir() && cur.join("stdlib").is_dir() {
++                return Some(cur);
++            }
++            if !cur.pop() {
++                return None;
++            }
++        }
++    }
++    let mut starts: Vec<std::path::PathBuf> = Vec::new();
++    if let Ok(exe) = std::env::current_exe() {
++        if let Some(dir) = exe.parent() {
++            starts.push(dir.to_path_buf());
++        }
++    }
++    if let Ok(cwd) = std::env::current_dir() {
++        starts.push(cwd);
++    }
++    let root = starts.iter().find_map(|s| find_root(s))?;
++    let entries = fs::read_dir(root.join("compiler")).ok()?;
++    let mut modules = 0usize;
++    let mut loc = 0usize;
++    for entry in entries.flatten() {
++        let path = entry.path();
++        if path.extension().map_or(false, |e| e == "fd") {
++            if let Ok(text) = fs::read_to_string(&path) {
++                modules += 1;
++                loc += text.lines().count();
++            }
++        }
++    }
++    if modules == 0 { None } else { Some((modules, loc)) }
++}
++
+ /// Parse a target triple string into the canonical target name used by the compiler.
+ /// Supports formats:
+ ///   - "x86-64", "x64", "x86-64-linux", "x86_64-linux"
+diff --git a/src/typechecker.rs b/src/typechecker.rs
+index fcf229c..57047dd 100644
+--- a/src/typechecker.rs
++++ b/src/typechecker.rs
+@@ -8300,6 +8300,62 @@ fn stmt_decreases_var(stmt: &Stmt, var: &str) -> bool {
+     }
+ }
+ 
++/// Annotations that have a dedicated `verify_*` pass in `TypeChecker::check`
++/// (the Rust bootstrap). This is the single source of truth consumed by
++/// `fidesc qualify` for `enforcedInBootstrap`; keep it in sync when adding or
++/// removing a `verify_*` pass.
++///
++/// Mapping (pass → annotations it enforces):
++///   verify_deterministic        → deterministic
++///   verify_conserve             → conserve
++///   verify_gas                  → gas
++///   verify_safety_annotations   → no-alloc, no-recursion, no-unbounded,
++///                                 no-indirect, requires-audit, bounded,
++///                                 firmware, crashfree, medical,
++///                                 safety-critical, autosar
++///   verify_constant_time        → constant_time
++///   verify_realtime             → realtime
++///   verify_differentiable       → differentiable
++///   verify_quantized            → quantized
++///   verify_checkpoint           → checkpoint
++///   verify_dp                   → dp
++///   verify_shard                → shard
++///   verify_adapter              → adapter
++///   verify_taint_propagation    → tainted, secret
++///
++/// Deliberately NOT listed: `bounded-stack` (collected as a primitive but
++/// never checked), and annotations enforced outside a `verify_*` pass
++/// (`linear`/`send`/`sync` via struct registration + borrowck, `wrapping`,
++/// `repr(C)`, `kernel`, `audit` via lowering/codegen flags).
++pub fn enforced_annotations() -> &'static [&'static str] {
++    &[
++        "deterministic",
++        "conserve",
++        "gas",
++        "no-alloc",
++        "no-recursion",
++        "no-unbounded",
++        "no-indirect",
++        "requires-audit",
++        "bounded",
++        "firmware",
++        "crashfree",
++        "medical",
++        "safety-critical",
++        "autosar",
++        "constant_time",
++        "realtime",
++        "differentiable",
++        "quantized",
++        "checkpoint",
++        "dp",
++        "shard",
++        "adapter",
++        "tainted",
++        "secret",
++    ]
++}
++
+ /// Scan for early returns (ret before the last statement in a block).
+ /// Used by @constant_time to detect timing leaks from early exits.
+ fn scan_for_early_returns(stmts: &[Stmt], sites: &mut Vec<usize>) {

@@ -149,6 +149,15 @@ fn linker_find_rodata_sym(rodata_syms: Vec<LinkerRodataSym>, name: str) -> i64 {
     return -1;
 }
 
+fn linker_push_unique(v: Vec<str>, s: str) {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == s { return; }
+        i = i + 1;
+    }
+    v.push(s);
+}
+
 fn linker_set_symbol(symbols: Vec<LinkerSymbol>, name: str, offset: i64, is_defined: bool) {
     var idx: i64 = linker_find_symbol(symbols, name);
     if idx >= 0 {
@@ -771,6 +780,7 @@ pub fn Linker_link(self: &mut Linker, entry: str) -> LinkerResult {
     }
 
     // Resolve relocations and patch the text
+    var undefined_syms: Vec<str> = Vec::new();
     var text_size: i64 = self.text_bytes.len();
     var ri3: i64 = 0;
     while ri3 < self.relocations.len() {
@@ -806,7 +816,9 @@ pub fn Linker_link(self: &mut Linker, entry: str) -> LinkerResult {
                 // Rodata symbol: offset is text_size + rodata_offset
                 sym_offset = text_size + rod_off;
             } else {
-                // Unknown symbol -- skip
+                // Unknown symbol -- record it; skipping would leave a 0 patch
+                // (e.g. `call next_rip` fallthrough) and silently corrupt output.
+                linker_push_unique(undefined_syms, sym_name);
                 ri3 = ri3 + 1; continue;
             }
         }
@@ -831,17 +843,15 @@ pub fn Linker_link(self: &mut Linker, entry: str) -> LinkerResult {
                         write_u64(self.text_bytes, patch_offset, abs_addr);
                     }
                 } else if r_type == R_ARM64_BL || r_type == R_ARM64_B {
-                    // BL/B: 26-bit PC-relative offset / 4
-                    var next_pc: i64 = patch_offset + 4;
-                    var delta3: i64 = sym_offset - next_pc;
+                    // BL/B: 26-bit offset /4 relative to the branch's own PC
+                    var delta3: i64 = sym_offset - patch_offset;
                     var imm26: i64 = (delta3 / 4) & 0x03FFFFFF;
                     var instr: i64 = read_u32(self.text_bytes, patch_offset);
                     var patched: i64 = (instr & 0xFC000000) | imm26;
                     write_u32(self.text_bytes, patch_offset, patched);
                 } else if r_type == R_ARM64_BCOND {
-                    // B.cond: 19-bit PC-relative offset / 4
-                    var next_pc2: i64 = patch_offset + 4;
-                    var delta4: i64 = sym_offset - next_pc2;
+                    // B.cond: 19-bit offset /4 relative to the branch's own PC
+                    var delta4: i64 = sym_offset - patch_offset;
                     var imm19: i64 = (delta4 / 4) & 0x0007FFFF;
                     var instr2: i64 = read_u32(self.text_bytes, patch_offset);
                     var patched2: i64 = (instr2 & 0xFF00001F) | (imm19 << 5);
@@ -937,6 +947,7 @@ pub fn Linker_link(self: &mut Linker, entry: str) -> LinkerResult {
             if rod_off2 >= 0 {
                 sym_offset2 = text_size2 + rod_off2;
             } else {
+                linker_push_unique(undefined_syms, sym_name2);
                 ri4 = ri4 + 1; continue;
             }
         }
@@ -952,6 +963,16 @@ pub fn Linker_link(self: &mut Linker, entry: str) -> LinkerResult {
             }
         }
         ri4 = ri4 + 1;
+    }
+
+    if undefined_syms.len() > 0 {
+        var msg: str = "Undefined symbols:";
+        var ui: i64 = 0;
+        while ui < undefined_syms.len() {
+            msg = msg + " " + undefined_syms.get(ui);
+            ui = ui + 1;
+        }
+        return LinkerResult::Err(msg);
     }
 
     // Build ELF64 executable

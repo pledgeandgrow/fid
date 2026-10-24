@@ -5448,22 +5448,49 @@ pub fn compute_rpo(f: &L2Function, entry: i64) -> Vec<i64> {
 }
 
 fn rpo_dfs(f: &L2Function, block: i64, visited: Vec<i64>, postorder: Vec<i64>) {
-    if i64_vec_contains(visited, block) { return; }
+    // Iterative DFS with an explicit stack — deep CFGs (large stdlib
+    // functions) would overflow the native call stack in compiled code.
+    var stack: Vec<I64Pair> = Vec::new();
+    var succ_cache: Vec<I64VecI64> = Vec::new();
     visited.push(block);
-    // Find the block and get successors
+    stack.push(I64Pair_new(block, 0));
+    while stack.len() > 0 {
+        var top: I64Pair = stack.get(stack.len() - 1);
+        var succs: Vec<i64> = rpo_dfs_succs(f, top.first, succ_cache);
+        if top.second < succs.len() {
+            var succ: i64 = succs.get(top.second);
+            stack.pop();
+            stack.push(I64Pair_new(top.first, top.second + 1));
+            if !i64_vec_contains(visited, succ) {
+                visited.push(succ);
+                stack.push(I64Pair_new(succ, 0));
+            }
+        } else {
+            postorder.push(top.first);
+            stack.pop();
+        }
+    }
+}
+
+// Successors of `block`, cached in succ_cache (block id -> succs) so each
+// block's terminator is examined once.
+fn rpo_dfs_succs(f: &L2Function, block: i64, succ_cache: Vec<I64VecI64>) -> Vec<i64> {
+    var ci: i64 = 0;
+    while ci < succ_cache.len() {
+        if succ_cache.get(ci).a == block { return succ_cache.get(ci).b; }
+        ci = ci + 1;
+    }
+    var result: Vec<i64> = Vec::new();
     var bi: i64 = 0;
     while bi < f.blocks.len() {
         if f.blocks.get(bi).id == block {
-            var succs: Vec<i64> = block_successors(f.blocks.get(bi), f);
-            var si: i64 = 0;
-            while si < succs.len() {
-                rpo_dfs(f, succs.get(si), visited, postorder);
-                si = si + 1;
-            }
+            result = block_successors(f.blocks.get(bi), f);
+            break;
         }
         bi = bi + 1;
     }
-    postorder.push(block);
+    succ_cache.push(I64VecI64_new(block, result));
+    return result;
 }
 
 /// Compute dominator tree for a function.

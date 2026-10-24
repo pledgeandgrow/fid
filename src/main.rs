@@ -1572,13 +1572,15 @@ fn main() {
                 // Shape mismatch: vec3 + vec2 should fail (compile-time error detection)
                 "test_vec_shape_fail",
                 // Soundness checks: nonexistent variants, return/argument types,
-                // &T passed as &mut T, bare value stored in a Box, duplicate fns
+                // &T passed as &mut T, bare value stored in a Box, duplicate fns,
+                // missing return after a break out of a nested block
                 "test_unknown_variant_fail",
                 "test_return_type_fail",
                 "test_arg_type_fail",
                 "test_mut_ref_fail",
                 "test_box_owned_fail",
                 "test_duplicate_fn_fail",
+                "test_missing_return_break_fail",
             ];
 
 

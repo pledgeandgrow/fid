@@ -590,6 +590,19 @@ fn parse_xmm_reg(s: str) -> OptI64 {
     return OptI64::None;
 }
 
+/// Floor division/modulo for negative packed mem-operand decode.
+/// `packed / N` truncates toward zero, which misdecodes negative offsets
+/// (e.g. -8(%rbp) packs as -2043 -> trunc gives off=-7,base=-3; floor gives -8,5).
+fn floor_div(a: i64, b: i64) -> i64 {
+    var q: i64 = a / b;
+    if a % b != 0 && (a < 0) != (b < 0) { q = q - 1; }
+    return q;
+}
+
+fn floor_mod(a: i64, b: i64) -> i64 {
+    return a - floor_div(a, b) * b;
+}
+
 /// Parse a memory operand like "-16(%rbp)" -> (offset, base_reg).
 /// Returns OptI64::Some(packed) or None.
 /// We use a MemInfo struct to return the result.
@@ -852,9 +865,8 @@ pub fn ElfEmitter_encode_instruction(self: &mut ElfEmitter, line: str) {
                 OptI64::None => {
                     match try_parse_mem(operands.get(0)) {
                         OptI64::Some(packed) => {
-                            var off: i64 = packed / 256;
-                            var base: i64 = packed % 256;
-                            if off < 0 { off = off + 256; } // handle negative
+                            var off: i64 = floor_div(packed, 256);
+                            var base: i64 = floor_mod(packed, 256);
                             var rex: i64 = 0x48 | ((base >> 3) << 0);
                             self.text.push(rex & 0xFF);
                             self.text.push(0xff);
@@ -1027,6 +1039,8 @@ pub fn ElfEmitter_encode_instruction(self: &mut ElfEmitter, line: str) {
     if mnemonic == "ja" { ElfEmitter_encode_jcc(self, 0x87, operands); return; }
     if mnemonic == "jbe" { ElfEmitter_encode_jcc(self, 0x86, operands); return; }
     if mnemonic == "jae" { ElfEmitter_encode_jcc(self, 0x83, operands); return; }
+    if mnemonic == "jo" { ElfEmitter_encode_jcc(self, 0x80, operands); return; }
+    if mnemonic == "jno" { ElfEmitter_encode_jcc(self, 0x81, operands); return; }
 
     // ─── call ───
     if mnemonic == "call" {
@@ -1112,6 +1126,44 @@ pub fn ElfEmitter_encode_instruction(self: &mut ElfEmitter, line: str) {
         return;
     }
 
+    // ─── SSE2 packed-double ───
+    if mnemonic == "movapd" {
+        if operands.len() == 2 { ElfEmitter_encode_mov_xmm(self, operands.get(0), operands.get(1), 0x66, 0x28, 0x29); }
+        return;
+    }
+    if mnemonic == "movupd" {
+        if operands.len() == 2 { ElfEmitter_encode_mov_xmm(self, operands.get(0), operands.get(1), 0, 0x10, 0x11); }
+        return;
+    }
+    if mnemonic == "movaps" {
+        if operands.len() == 2 { ElfEmitter_encode_mov_xmm(self, operands.get(0), operands.get(1), 0, 0x28, 0x29); }
+        return;
+    }
+    if mnemonic == "movups" {
+        if operands.len() == 2 { ElfEmitter_encode_mov_xmm(self, operands.get(0), operands.get(1), 0, 0x10, 0x11); }
+        return;
+    }
+    if mnemonic == "addpd" {
+        if operands.len() == 2 { ElfEmitter_encode_sse2_arith_66(self, 0x58, operands.get(0), operands.get(1)); }
+        return;
+    }
+    if mnemonic == "subpd" {
+        if operands.len() == 2 { ElfEmitter_encode_sse2_arith_66(self, 0x5c, operands.get(0), operands.get(1)); }
+        return;
+    }
+    if mnemonic == "mulpd" {
+        if operands.len() == 2 { ElfEmitter_encode_sse2_arith_66(self, 0x59, operands.get(0), operands.get(1)); }
+        return;
+    }
+    if mnemonic == "divpd" {
+        if operands.len() == 2 { ElfEmitter_encode_sse2_arith_66(self, 0x5e, operands.get(0), operands.get(1)); }
+        return;
+    }
+    if mnemonic == "xorpd" {
+        if operands.len() == 2 { ElfEmitter_encode_sse2_arith_66(self, 0x57, operands.get(0), operands.get(1)); }
+        return;
+    }
+
     // ─── SSE single-precision ───
     if mnemonic == "movss" {
         if operands.len() == 2 { ElfEmitter_encode_movss(self, operands.get(0), operands.get(1)); }
@@ -1183,6 +1235,18 @@ fn ElfEmitter_encode_pop(self: &mut ElfEmitter, op: str) {
         }
         OptI64::None => {}
     }
+}
+
+// Parse a "$imm" operand's numeric part; accepts decimal or 0x-hex.
+fn parse_dollar_imm(src: str) -> i64 {
+    var imm_str: str = str_slice(src, 1, str_len(src));
+    var imm: i64 = str_parse_int(imm_str);
+    if imm == 0 && imm_str != "0" {
+        if str_starts_with(imm_str, "0x") || str_starts_with(imm_str, "0X") {
+            imm = str_parse_hex(str_slice(imm_str, 2, str_len(imm_str)));
+        }
+    }
+    return imm;
 }
 
 fn ElfEmitter_encode_mov(self: &mut ElfEmitter, src: str, dst: str, size: i64) {
@@ -1283,10 +1347,10 @@ fn ElfEmitter_encode_mov(self: &mut ElfEmitter, src: str, dst: str, size: i64) {
     // Try SIB first
     match try_parse_mem_indexed(dst) {
         OptI64::Some(packed) => {
-            var off: i64 = packed / 4096;
-            var base: i64 = (packed / 256) % 16;
-            var index: i64 = (packed / 16) % 16;
-            var sc: i64 = packed % 16;
+            var off: i64 = floor_div(packed, 4096);
+            var base: i64 = floor_mod(floor_div(packed, 256), 16);
+            var index: i64 = floor_mod(floor_div(packed, 16), 16);
+            var sc: i64 = floor_mod(packed, 16);
             match src_reg {
                 OptI64::Some(s) => {
                     if size == 1 {
@@ -1309,8 +1373,8 @@ fn ElfEmitter_encode_mov(self: &mut ElfEmitter, src: str, dst: str, size: i64) {
     }
     match try_parse_mem(dst) {
         OptI64::Some(packed) => {
-            var off: i64 = packed / 256;
-            var base: i64 = packed % 256;
+            var off: i64 = floor_div(packed, 256);
+            var base: i64 = floor_mod(packed, 256);
             match src_reg {
                 OptI64::Some(s) => {
                     if size == 1 {
@@ -1341,10 +1405,10 @@ fn ElfEmitter_encode_mov(self: &mut ElfEmitter, src: str, dst: str, size: i64) {
 
     match try_parse_mem_indexed(src) {
         OptI64::Some(packed) => {
-            var off: i64 = packed / 4096;
-            var base: i64 = (packed / 256) % 16;
-            var index: i64 = (packed / 16) % 16;
-            var sc: i64 = packed % 16;
+            var off: i64 = floor_div(packed, 4096);
+            var base: i64 = floor_mod(floor_div(packed, 256), 16);
+            var index: i64 = floor_mod(floor_div(packed, 16), 16);
+            var sc: i64 = floor_mod(packed, 16);
             match dst_reg {
                 OptI64::Some(d) => {
                     if size == 1 {
@@ -1367,8 +1431,8 @@ fn ElfEmitter_encode_mov(self: &mut ElfEmitter, src: str, dst: str, size: i64) {
     }
     match try_parse_mem(src) {
         OptI64::Some(packed) => {
-            var off: i64 = packed / 256;
-            var base: i64 = packed % 256;
+            var off: i64 = floor_div(packed, 256);
+            var base: i64 = floor_mod(packed, 256);
             match dst_reg {
                 OptI64::Some(d) => {
                     if size == 1 {
@@ -1392,13 +1456,13 @@ fn ElfEmitter_encode_mov(self: &mut ElfEmitter, src: str, dst: str, size: i64) {
 
     // movq $imm, mem (immediate to memory)
     if str_starts_with(src, "$") {
-        var imm: i64 = str_parse_int(str_slice(src, 1, str_len(src)));
+        var imm: i64 = parse_dollar_imm(src);
         match try_parse_mem_indexed(dst) {
             OptI64::Some(packed) => {
-                var off: i64 = packed / 4096;
-                var base: i64 = (packed / 256) % 16;
-                var index: i64 = (packed / 16) % 16;
-                var sc: i64 = packed % 16;
+                var off: i64 = floor_div(packed, 4096);
+                var base: i64 = floor_mod(floor_div(packed, 256), 16);
+                var index: i64 = floor_mod(floor_div(packed, 16), 16);
+                var sc: i64 = floor_mod(packed, 16);
                 if size == 1 {
                     var rex: i64 = 0x40 | ((index >> 3) << 1) | ((base >> 3) << 0);
                     self.text.push(rex & 0xFF);
@@ -1418,8 +1482,8 @@ fn ElfEmitter_encode_mov(self: &mut ElfEmitter, src: str, dst: str, size: i64) {
         }
         match try_parse_mem(dst) {
             OptI64::Some(packed) => {
-                var off: i64 = packed / 256;
-                var base: i64 = packed % 256;
+                var off: i64 = floor_div(packed, 256);
+                var base: i64 = floor_mod(packed, 256);
                 if size == 1 {
                     var rex: i64 = 0x40 | ((base >> 3) << 0);
                     self.text.push(rex & 0xFF);
@@ -1493,7 +1557,7 @@ fn ElfEmitter_encode_alu(self: &mut ElfEmitter, opcode_base: i64, operands: Vec<
 
     // ALU $imm, %reg
     if str_starts_with(src, "$") {
-        var imm: i64 = str_parse_int(str_slice(src, 1, str_len(src)));
+        var imm: i64 = parse_dollar_imm(src);
         match try_parse_reg(dst) {
             OptI64::Some(d) => {
                 var dst_is_32: bool = is_reg32(dst);
@@ -1532,8 +1596,8 @@ fn ElfEmitter_encode_alu(self: &mut ElfEmitter, opcode_base: i64, operands: Vec<
         OptI64::Some(s) => {
             match try_parse_mem(dst) {
                 OptI64::Some(packed) => {
-                    var off: i64 = packed / 256;
-                    var base: i64 = packed % 256;
+                    var off: i64 = floor_div(packed, 256);
+                    var base: i64 = floor_mod(packed, 256);
                     var rex: i64 = rex_w(size) | ((s >> 3) << 2) | ((base >> 3) << 0);
                     self.text.push(rex & 0xFF);
                     self.text.push((opcode_base | 0x01) & 0xFF);
@@ -1548,8 +1612,8 @@ fn ElfEmitter_encode_alu(self: &mut ElfEmitter, opcode_base: i64, operands: Vec<
     // ALU mem, %reg
     match try_parse_mem(src) {
         OptI64::Some(packed) => {
-            var off: i64 = packed / 256;
-            var base: i64 = packed % 256;
+            var off: i64 = floor_div(packed, 256);
+            var base: i64 = floor_mod(packed, 256);
             match try_parse_reg(dst) {
                 OptI64::Some(d) => {
                     var rex: i64 = rex_w(size) | ((d >> 3) << 2) | ((base >> 3) << 0);
@@ -1593,7 +1657,7 @@ fn ElfEmitter_encode_shift(self: &mut ElfEmitter, modrm_base: i64, operands: Vec
 fn ElfEmitter_encode_cmp(self: &mut ElfEmitter, src: str, dst: str, size: i64) {
     // cmpq $imm, %reg
     if str_starts_with(src, "$") {
-        var imm: i64 = str_parse_int(str_slice(src, 1, str_len(src)));
+        var imm: i64 = parse_dollar_imm(src);
         match try_parse_reg(dst) {
             OptI64::Some(d) => {
                 if imm >= -128 && imm <= 127 {
@@ -1636,10 +1700,10 @@ fn ElfEmitter_encode_cmp(self: &mut ElfEmitter, src: str, dst: str, size: i64) {
     // cmpq mem, %reg (SIB)
     match try_parse_mem_indexed(src) {
         OptI64::Some(packed) => {
-            var off: i64 = packed / 4096;
-            var base: i64 = (packed / 256) % 16;
-            var index: i64 = (packed / 16) % 16;
-            var sc: i64 = packed % 16;
+            var off: i64 = floor_div(packed, 4096);
+            var base: i64 = floor_mod(floor_div(packed, 256), 16);
+            var index: i64 = floor_mod(floor_div(packed, 16), 16);
+            var sc: i64 = floor_mod(packed, 16);
             match try_parse_reg(dst) {
                 OptI64::Some(d) => {
                     var rex: i64 = rex_w(size) | ((d >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
@@ -1656,8 +1720,8 @@ fn ElfEmitter_encode_cmp(self: &mut ElfEmitter, src: str, dst: str, size: i64) {
     // cmpq mem, %reg
     match try_parse_mem(src) {
         OptI64::Some(packed) => {
-            var off: i64 = packed / 256;
-            var base: i64 = packed % 256;
+            var off: i64 = floor_div(packed, 256);
+            var base: i64 = floor_mod(packed, 256);
             match try_parse_reg(dst) {
                 OptI64::Some(d) => {
                     var rex: i64 = rex_w(size) | ((d >> 3) << 2) | ((base >> 3) << 0);
@@ -1676,10 +1740,10 @@ fn ElfEmitter_encode_cmp(self: &mut ElfEmitter, src: str, dst: str, size: i64) {
         OptI64::Some(s) => {
             match try_parse_mem_indexed(dst) {
                 OptI64::Some(packed) => {
-                    var off: i64 = packed / 4096;
-                    var base: i64 = (packed / 256) % 16;
-                    var index: i64 = (packed / 16) % 16;
-                    var sc: i64 = packed % 16;
+                    var off: i64 = floor_div(packed, 4096);
+                    var base: i64 = floor_mod(floor_div(packed, 256), 16);
+                    var index: i64 = floor_mod(floor_div(packed, 16), 16);
+                    var sc: i64 = floor_mod(packed, 16);
                     var rex: i64 = rex_w(size) | ((s >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
                     self.text.push(rex & 0xFF);
                     self.text.push(0x39);
@@ -1690,8 +1754,8 @@ fn ElfEmitter_encode_cmp(self: &mut ElfEmitter, src: str, dst: str, size: i64) {
             }
             match try_parse_mem(dst) {
                 OptI64::Some(packed) => {
-                    var off: i64 = packed / 256;
-                    var base: i64 = packed % 256;
+                    var off: i64 = floor_div(packed, 256);
+                    var base: i64 = floor_mod(packed, 256);
                     var rex: i64 = rex_w(size) | ((s >> 3) << 2) | ((base >> 3) << 0);
                     self.text.push(rex & 0xFF);
                     self.text.push(0x39);
@@ -1727,8 +1791,8 @@ fn ElfEmitter_encode_movsx(self: &mut ElfEmitter, opcode: i64, operands: Vec<str
             // Memory source
             match try_parse_mem(operands.get(0)) {
                 OptI64::Some(packed) => {
-                    var off: i64 = packed / 256;
-                    var base: i64 = packed % 256;
+                    var off: i64 = floor_div(packed, 256);
+                    var base: i64 = floor_mod(packed, 256);
                     var rex: i64 = 0x48 | (((d >> 3) & 1) << 2) | (((base >> 3) & 1) << 0);
                     self.text.push(rex & 0xFF);
                     self.text.push(0x0f);
@@ -1767,10 +1831,10 @@ fn ElfEmitter_encode_movzx(self: &mut ElfEmitter, opcode: i64, operands: Vec<str
             // SIB memory source
             match try_parse_mem_indexed(operands.get(0)) {
                 OptI64::Some(packed) => {
-                    var off: i64 = packed / 4096;
-                    var base: i64 = (packed / 256) % 16;
-                    var index: i64 = (packed / 16) % 16;
-                    var sc: i64 = packed % 16;
+                    var off: i64 = floor_div(packed, 4096);
+                    var base: i64 = floor_mod(floor_div(packed, 256), 16);
+                    var index: i64 = floor_mod(floor_div(packed, 16), 16);
+                    var sc: i64 = floor_mod(packed, 16);
                     var rex: i64 = 0x48 | (((d >> 3) & 1) << 2) | (((index >> 3) & 1) << 1) | (((base >> 3) & 1) << 0);
                     self.text.push(rex & 0xFF);
                     self.text.push(0x0f);
@@ -1783,8 +1847,8 @@ fn ElfEmitter_encode_movzx(self: &mut ElfEmitter, opcode: i64, operands: Vec<str
             // Memory source
             match try_parse_mem(operands.get(0)) {
                 OptI64::Some(packed) => {
-                    var off: i64 = packed / 256;
-                    var base: i64 = packed % 256;
+                    var off: i64 = floor_div(packed, 256);
+                    var base: i64 = floor_mod(packed, 256);
                     var rex: i64 = 0x48 | (((d >> 3) & 1) << 2) | (((base >> 3) & 1) << 0);
                     self.text.push(rex & 0xFF);
                     self.text.push(0x0f);
@@ -1857,8 +1921,8 @@ fn ElfEmitter_encode_call(self: &mut ElfEmitter, target: str) {
     if str_starts_with(target, "*") {
         match try_parse_mem(str_slice(target, 1, str_len(target))) {
             OptI64::Some(packed) => {
-                var off: i64 = packed / 256;
-                var base: i64 = packed % 256;
+                var off: i64 = floor_div(packed, 256);
+                var base: i64 = floor_mod(packed, 256);
                 if base >= 8 { self.text.push(0x41); }
                 self.text.push(0xff);
                 var modrm: i64 = 0x50 | (2 << 3) | (base & 7);
@@ -1908,10 +1972,10 @@ fn ElfEmitter_encode_lea(self: &mut ElfEmitter, src: str, dst: str) {
             // leaq (%base,%index,scale), %reg — SIB
             match try_parse_mem_indexed(src) {
                 OptI64::Some(packed) => {
-                    var off: i64 = packed / 4096;
-                    var base: i64 = (packed / 256) % 16;
-                    var index: i64 = (packed / 16) % 16;
-                    var sc: i64 = packed % 16;
+                    var off: i64 = floor_div(packed, 4096);
+                    var base: i64 = floor_mod(floor_div(packed, 256), 16);
+                    var index: i64 = floor_mod(floor_div(packed, 16), 16);
+                    var sc: i64 = floor_mod(packed, 16);
                     var rex: i64 = 0x48 | ((d >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
                     self.text.push(rex & 0xFF);
                     self.text.push(0x8d);
@@ -1923,8 +1987,8 @@ fn ElfEmitter_encode_lea(self: &mut ElfEmitter, src: str, dst: str) {
             // leaq offset(%base), %reg
             match try_parse_mem(src) {
                 OptI64::Some(packed) => {
-                    var off: i64 = packed / 256;
-                    var base: i64 = packed % 256;
+                    var off: i64 = floor_div(packed, 256);
+                    var base: i64 = floor_mod(packed, 256);
                     var rex: i64 = 0x48 | ((d >> 3) << 2) | ((base >> 3) << 0);
                     self.text.push(rex & 0xFF);
                     self.text.push(0x8d);
@@ -1942,7 +2006,15 @@ fn ElfEmitter_encode_lea(self: &mut ElfEmitter, src: str, dst: str) {
 // --- SSE2/SSE encoders ---
 
 fn ElfEmitter_encode_movsd(self: &mut ElfEmitter, src: str, dst: str) {
-    // movsd label(%rip), %xmmN
+    ElfEmitter_encode_mov_xmm(self, src, dst, 0xF2, 0x10, 0x11);
+}
+
+/// Generic xmm move encoder: rip-load / reg-reg / mem-store / mem-load.
+/// prefix: 0xF2 (movsd), 0x66 (movapd), 0 (movupd/movaps/movups)
+/// ld_opc/st_opc: opcode bytes (movapd 0x28/0x29, movsd/upd 0x10/0x11,
+///                movaps 0x28/0x29, movups 0x10/0x11)
+fn ElfEmitter_encode_mov_xmm(self: &mut ElfEmitter, src: str, dst: str, prefix: i64, ld_opc: i64, st_opc: i64) {
+    // movX label(%rip), %xmmN
     if str_contains(src, "(%rip)") {
         match parse_xmm_reg(dst) {
             OptI64::Some(dst_xmm) => {
@@ -1955,10 +2027,10 @@ fn ElfEmitter_encode_movsd(self: &mut ElfEmitter, src: str, dst: str) {
                 }
                 var rex: i64 = 0x40;
                 if dst_xmm >= 8 { rex = 0x44; }
-                self.text.push(0xf2);
+                if prefix != 0 { self.text.push(prefix & 0xFF); }
                 self.text.push(rex & 0xFF);
                 self.text.push(0x0f);
-                self.text.push(0x10);
+                self.text.push(ld_opc & 0xFF);
                 var modrm: i64 = 0x05 | ((dst_xmm & 7) << 3);
                 self.text.push(modrm & 0xFF);
                 var reloc_offset: i64 = self.text.len();
@@ -1978,10 +2050,10 @@ fn ElfEmitter_encode_movsd(self: &mut ElfEmitter, src: str, dst: str) {
                     if s_xmm >= 8 || d_xmm >= 8 {
                         rex = 0x40 | ((s_xmm >> 3) << 2) | ((d_xmm >> 3) << 0);
                     }
-                    self.text.push(0xf2);
+                    if prefix != 0 { self.text.push(prefix & 0xFF); }
                     if rex != 0 { self.text.push(rex & 0xFF); }
                     self.text.push(0x0f);
-                    self.text.push(0x10);
+                    self.text.push(ld_opc & 0xFF);
                     var modrm: i64 = 0xc0 | ((d_xmm & 7) << 3) | (s_xmm & 7);
                     self.text.push(modrm & 0xFF);
                     return;
@@ -1996,15 +2068,15 @@ fn ElfEmitter_encode_movsd(self: &mut ElfEmitter, src: str, dst: str) {
         OptI64::Some(s_xmm) => {
             match try_parse_mem_indexed(dst) {
                 OptI64::Some(packed) => {
-                    var off: i64 = packed / 4096;
-                    var base: i64 = (packed / 256) % 16;
-                    var index: i64 = (packed / 16) % 16;
-                    var sc: i64 = packed % 16;
+                    var off: i64 = floor_div(packed, 4096);
+                    var base: i64 = floor_mod(floor_div(packed, 256), 16);
+                    var index: i64 = floor_mod(floor_div(packed, 16), 16);
+                    var sc: i64 = floor_mod(packed, 16);
                     var rex: i64 = 0x40 | ((s_xmm >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
-                    self.text.push(0xf2);
+                    if prefix != 0 { self.text.push(prefix & 0xFF); }
                     self.text.push(rex & 0xFF);
                     self.text.push(0x0f);
-                    self.text.push(0x11);
+                    self.text.push(st_opc & 0xFF);
                     ElfEmitter_encode_modrm_sib(self, s_xmm, off, base, index, sc);
                     return;
                 }
@@ -2012,13 +2084,13 @@ fn ElfEmitter_encode_movsd(self: &mut ElfEmitter, src: str, dst: str) {
             }
             match try_parse_mem(dst) {
                 OptI64::Some(packed) => {
-                    var off: i64 = packed / 256;
-                    var base: i64 = packed % 256;
+                    var off: i64 = floor_div(packed, 256);
+                    var base: i64 = floor_mod(packed, 256);
                     var rex: i64 = 0x40 | ((s_xmm >> 3) << 2) | ((base >> 3) << 0);
-                    self.text.push(0xf2);
+                    if prefix != 0 { self.text.push(prefix & 0xFF); }
                     self.text.push(rex & 0xFF);
                     self.text.push(0x0f);
-                    self.text.push(0x11);
+                    self.text.push(st_opc & 0xFF);
                     ElfEmitter_encode_modrm_mem(self, s_xmm, off, base);
                     return;
                 }
@@ -2032,15 +2104,15 @@ fn ElfEmitter_encode_movsd(self: &mut ElfEmitter, src: str, dst: str) {
         OptI64::Some(d_xmm) => {
             match try_parse_mem_indexed(src) {
                 OptI64::Some(packed) => {
-                    var off: i64 = packed / 4096;
-                    var base: i64 = (packed / 256) % 16;
-                    var index: i64 = (packed / 16) % 16;
-                    var sc: i64 = packed % 16;
+                    var off: i64 = floor_div(packed, 4096);
+                    var base: i64 = floor_mod(floor_div(packed, 256), 16);
+                    var index: i64 = floor_mod(floor_div(packed, 16), 16);
+                    var sc: i64 = floor_mod(packed, 16);
                     var rex: i64 = 0x40 | ((d_xmm >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
-                    self.text.push(0xf2);
+                    if prefix != 0 { self.text.push(prefix & 0xFF); }
                     self.text.push(rex & 0xFF);
                     self.text.push(0x0f);
-                    self.text.push(0x10);
+                    self.text.push(ld_opc & 0xFF);
                     ElfEmitter_encode_modrm_sib(self, d_xmm, off, base, index, sc);
                     return;
                 }
@@ -2048,13 +2120,13 @@ fn ElfEmitter_encode_movsd(self: &mut ElfEmitter, src: str, dst: str) {
             }
             match try_parse_mem(src) {
                 OptI64::Some(packed) => {
-                    var off: i64 = packed / 256;
-                    var base: i64 = packed % 256;
+                    var off: i64 = floor_div(packed, 256);
+                    var base: i64 = floor_mod(packed, 256);
                     var rex: i64 = 0x40 | ((d_xmm >> 3) << 2) | ((base >> 3) << 0);
-                    self.text.push(0xf2);
+                    if prefix != 0 { self.text.push(prefix & 0xFF); }
                     self.text.push(rex & 0xFF);
                     self.text.push(0x0f);
-                    self.text.push(0x10);
+                    self.text.push(ld_opc & 0xFF);
                     ElfEmitter_encode_modrm_mem(self, d_xmm, off, base);
                     return;
                 }
@@ -2213,8 +2285,8 @@ fn ElfEmitter_encode_movss(self: &mut ElfEmitter, src: str, dst: str) {
         OptI64::Some(s_xmm) => {
             match try_parse_mem(dst) {
                 OptI64::Some(packed) => {
-                    var off: i64 = packed / 256;
-                    var base: i64 = packed % 256;
+                    var off: i64 = floor_div(packed, 256);
+                    var base: i64 = floor_mod(packed, 256);
                     var rex: i64 = 0x40 | ((s_xmm >> 3) << 2) | ((base >> 3) << 0);
                     self.text.push(0xf3);
                     self.text.push(rex & 0xFF);
@@ -2233,8 +2305,8 @@ fn ElfEmitter_encode_movss(self: &mut ElfEmitter, src: str, dst: str) {
         OptI64::Some(d_xmm) => {
             match try_parse_mem(src) {
                 OptI64::Some(packed) => {
-                    var off: i64 = packed / 256;
-                    var base: i64 = packed % 256;
+                    var off: i64 = floor_div(packed, 256);
+                    var base: i64 = floor_mod(packed, 256);
                     var rex: i64 = 0x40 | ((d_xmm >> 3) << 2) | ((base >> 3) << 0);
                     self.text.push(0xf3);
                     self.text.push(rex & 0xFF);
@@ -2390,6 +2462,18 @@ pub fn ElfEmitter_build_elf(self: &mut ElfEmitter) -> ResultVec {
         rli = rli + 1;
     }
     var rela_size: i64 = buf.len() - rela_offset;
+    // .rela.rodata section (relocations inside .rodata — e.g. vtable entries)
+    var rela_rodata_offset: i64 = buf.len();
+    var rrli: i64 = 0;
+    while rrli < self.rodata_relocations.len() {
+        var rrel: Relocation = self.rodata_relocations.get(rrli);
+        emit_u64(buf, rrel.offset);
+        emit_u32(buf, rrel.symbol);
+        emit_u32(buf, rrel.rtype);
+        emit_u64(buf, rrel.addend);
+        rrli = rrli + 1;
+    }
+    var rela_rodata_size: i64 = buf.len() - rela_rodata_offset;
     // Custom section data (emitted after .rela.text, before section headers)
     var custom_section_offsets: Vec<i64> = Vec::new();
     var csi: i64 = 0;
@@ -2427,10 +2511,13 @@ pub fn ElfEmitter_build_elf(self: &mut ElfEmitter) -> ResultVec {
     // Section 5: .shstrtab
     var shstrtab_name: i64 = ElfEmitter_add_shstrtab(self, ".shstrtab");
     emit_u32(buf, shstrtab_name); emit_u32(buf, SHT_STRTAB); emit_u64(buf, 0); emit_u64(buf, shstrtab_offset); emit_u64(buf, self.shstrtab.len()); emit_u32(buf, 0); emit_u32(buf, 0); emit_u64(buf, 1); emit_u64(buf, 0);
-    // Section 6: .rela.text
+    // Section 6: .rela.text — sh_link=.symtab(3), sh_info=.text(1)
     var rela_name: i64 = ElfEmitter_add_shstrtab(self, ".rela.text");
-    emit_u32(buf, rela_name); emit_u32(buf, SHT_RELA); emit_u64(buf, SHF_INFO_LINK); emit_u64(buf, rela_offset); emit_u64(buf, rela_size); emit_u32(buf, 1); emit_u32(buf, 3); emit_u64(buf, 8); emit_u64(buf, 24);
-    // Custom sections (starting at section index 7)
+    emit_u32(buf, rela_name); emit_u32(buf, SHT_RELA); emit_u64(buf, SHF_INFO_LINK); emit_u64(buf, rela_offset); emit_u64(buf, rela_size); emit_u32(buf, 3); emit_u32(buf, 1); emit_u64(buf, 8); emit_u64(buf, 24);
+    // Section 7: .rela.rodata — sh_link=.symtab(3), sh_info=.rodata(2)
+    var rela_rodata_name: i64 = ElfEmitter_add_shstrtab(self, ".rela.rodata");
+    emit_u32(buf, rela_rodata_name); emit_u32(buf, SHT_RELA); emit_u64(buf, SHF_INFO_LINK); emit_u64(buf, rela_rodata_offset); emit_u64(buf, rela_rodata_size); emit_u32(buf, 3); emit_u32(buf, 2); emit_u64(buf, 8); emit_u64(buf, 24);
+    // Custom sections (starting at section index 8)
     var csi2: i64 = 0;
     while csi2 < self.custom_sections.len() {
         var cs: CustomSection = self.custom_sections.get(csi2);
@@ -2449,7 +2536,7 @@ pub fn ElfEmitter_build_elf(self: &mut ElfEmitter) -> ResultVec {
         emit_u64(buf, 0);  // sh_entsize
         csi2 = csi2 + 1;
     }
-    var num_sections: i64 = 7 + self.custom_sections.len();
+    var num_sections: i64 = 8 + self.custom_sections.len();
     // Patch e_shoff, e_shnum, e_shstrndx
     // e_shoff at offset 40
     var p: i64 = 40;

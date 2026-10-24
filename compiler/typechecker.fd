@@ -2156,7 +2156,7 @@ pub fn check_safety_body(
         var called: str = calls.get(ci);
 
         // Skip built-in runtime functions (p_print_*, etc.) unless they're in a forbidden list
-        if tc_str_starts_with(called, "p_") {
+        if str_starts_with(called, "p_") {
             if !tc_vec_contains_str(panic_funcs, called) && !tc_vec_contains_str(alloc_funcs, called) && !tc_vec_contains_str(indirect_funcs, called) {
                 ci = ci + 1;
                 continue;
@@ -2284,11 +2284,6 @@ pub fn tc_vec_contains_str(v: Vec<str>, s: str) -> bool {
         i = i + 1;
     }
     return false;
-}
-
-// --- Helper: check if a string starts with a prefix ---
-pub fn tc_str_starts_with(s: str, prefix: str) -> bool {
-    return p_string_starts_with(s, prefix);
 }
 
 // --- Call scanning helpers ---
@@ -2959,7 +2954,7 @@ pub fn TypeChecker_verify_dp(self: &mut TypeChecker, program: Program) {
                 var argi: i64 = 0;
                 while argi < ann.args.len() {
                     var arg: str = ann.args.get(argi);
-                    if tc_str_starts_with(arg, "epsilon=") {
+                    if str_starts_with(arg, "epsilon=") {
                         var val_str: str = str_slice(arg, 8, str_len(arg));
                         epsilon = dp_parse_float(val_str);
                     }
@@ -3627,6 +3622,12 @@ pub fn stmts_have_break(stmts: Vec<Stmt>) -> bool {
                     ai = ai + 1;
                 }
             }
+            Stmt::Unsafe(body, _) => { if stmts_have_break(body) { return true; } }
+            Stmt::Sandbox(body, _) => { if stmts_have_break(body) { return true; } }
+            Stmt::Txn(body, _) => { if stmts_have_break(body) { return true; } }
+            Stmt::Handle(body, _, _) => { if stmts_have_break(body) { return true; } }
+            Stmt::RegionBlock(_, _, _, _, _, body, _) => { if stmts_have_break(body) { return true; } }
+            Stmt::SpawnScope(body, _) => { if stmts_have_break(body) { return true; } }
             _ => {}
         }
         i = i + 1;
@@ -5250,6 +5251,20 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                 bi = bi + 1;
             }
         }
+        Stmt::Resume(cont, value, _) => {
+            TypeChecker_check_expr(self, cont);
+            TypeChecker_check_expr(self, value);
+        }
+        Stmt::SpawnScope(body, _) => {
+            TypeChecker_push_scope(self);
+            var si5: i64 = 0;
+            while si5 < body.len() {
+                TypeChecker_check_stmt(self, body.get(si5));
+                si5 = si5 + 1;
+            }
+            TypeChecker_pop_scope(self);
+        }
+        Stmt::CancelScope(_) => {}
     }
 }
 
@@ -5622,7 +5637,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 OptFuncSig::None => {}
             }
             // Check for ECS runtime functions
-            if tc_str_starts_with(callee, "__ecs_") {
+            if str_starts_with(callee, "__ecs_") {
                 if callee == "__ecs_create_entity" || callee == "__ecs_entity_count" || callee == "__ecs_has" || callee == "__ecs_get" {
                     return Type::I64;
                 }
@@ -5632,11 +5647,11 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 return Type::I64;
             }
             // Check for event handler functions
-            if tc_str_starts_with(callee, "__on_") {
+            if str_starts_with(callee, "__on_") {
                 return Type::Void;
             }
             // Check for runtime builtin functions (p_*)
-            if tc_str_starts_with(callee, "p_") {
+            if str_starts_with(callee, "p_") {
                 if callee == "p_str_concat" || callee == "p_to_str" || callee == "p_float_to_str" || callee == "p_string_replace" || callee == "p_string_trim" || callee == "p_string_to_uppercase" || callee == "p_string_to_lowercase" || callee == "p_string_char_at" || callee == "p_string_repeat" || callee == "p_char_to_str" || callee == "p_bool_to_str" || callee == "p_sb_to_str" {
                     return Type::Str;
                 }
@@ -7317,6 +7332,12 @@ pub fn TypeChecker_scan_stmt_for_effects(self: &TypeChecker, stmt: Stmt, effects
                 bi = bi + 1;
             }
         }
+        Stmt::Resume(cont, value, _) => {
+            TypeChecker_scan_expr_for_effects(self, cont, effects);
+            TypeChecker_scan_expr_for_effects(self, value, effects);
+        }
+        Stmt::SpawnScope(body, _) => { TypeChecker_scan_stmts_for_effects(self, body, effects); }
+        Stmt::CancelScope(_) => {}
         Stmt::Select(cases, default, _) => {
             var ci: i64 = 0;
             while ci < cases.len() {
@@ -7375,7 +7396,7 @@ pub fn TypeChecker_scan_expr_for_effects(self: &TypeChecker, expr: Expr, effects
                 if !str_vec_contains_ref(effects, "Spawn") { effects.push("Spawn"); }
             }
             // Check p_* builtins
-            if tc_str_starts_with(callee, "p_") {
+            if str_starts_with(callee, "p_") {
                 if callee == "p_vec_new" || callee == "p_vec_push" || callee == "p_hashmap_new" || callee == "p_alloc" {
                     if !str_vec_contains_ref(effects, "Alloc") { effects.push("Alloc"); }
                 }
@@ -7596,7 +7617,7 @@ pub fn TypeChecker_lint_unused_functions(self: &mut TypeChecker, program: Progra
     var fi2: i64 = 0;
     while fi2 < program.funcs.len() {
         var func: Func = program.funcs.get(fi2);
-        if !tc_str_vec_contains(called, func.name) && !func.is_pub && !func.is_comptime && !tc_str_starts_with(func.name, "__") && func.name != "main" {
+        if !tc_str_vec_contains(called, func.name) && !func.is_pub && !func.is_comptime && !str_starts_with(func.name, "__") && func.name != "main" {
             self.warnings.push("unused function '" + func.name + "' — defined but never called");
         }
         fi2 = fi2 + 1;
@@ -7676,6 +7697,12 @@ pub fn TypeChecker_collect_called_funcs_stmt(self: &TypeChecker, stmt: Stmt, cal
                 bi = bi + 1;
             }
         }
+        Stmt::Resume(cont, value, _) => {
+            TypeChecker_collect_called_funcs_expr(self, cont, called);
+            TypeChecker_collect_called_funcs_expr(self, value, called);
+        }
+        Stmt::SpawnScope(body, _) => { TypeChecker_collect_called_funcs(self, body, called); }
+        Stmt::CancelScope(_) => {}
         Stmt::Select(cases, default, _) => {
             var ci: i64 = 0;
             while ci < cases.len() {
@@ -7881,7 +7908,7 @@ pub fn TypeChecker_lint_unused_imports(self: &mut TypeChecker, program: Program)
         var any_used: bool = false;
         var ci: i64 = 0;
         while ci < called.len() {
-            if tc_str_starts_with(called.get(ci), module_prefix) {
+            if str_starts_with(called.get(ci), module_prefix) {
                 any_used = true;
                 ci = called.len();
             }
@@ -8047,6 +8074,18 @@ pub fn scan_stmt_for_floats(stmt: Stmt, found: Vec<str>) {
                 bi = bi + 1;
             }
         }
+        Stmt::Resume(cont, value, _) => {
+            scan_expr_for_floats(cont, found);
+            scan_expr_for_floats(value, found);
+        }
+        Stmt::SpawnScope(body, _) => {
+            var si6: i64 = 0;
+            while si6 < body.len() {
+                scan_stmt_for_floats(body.get(si6), found);
+                si6 = si6 + 1;
+            }
+        }
+        Stmt::CancelScope(_) => {}
         Stmt::Select(cases, default, _) => {
             var ci: i64 = 0;
             while ci < cases.len() {
