@@ -24,25 +24,35 @@ jobs:
           if [ -n "${{ github.event.inputs.version }}" ]; then
             echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
           else
-            echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+            # Tags are v1.2.3; the installer file name and VIProductVersion
+            # want 1.2.3 — strip the leading v.
+            echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
           fi
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build Fides compiler
+      - name: Build Fides toolchain
         shell: bash
         run: |
           cargo build --release
-          # The Rust bootstrap compiler (fidesc) is the shipped binary.
-          # It has the same functionality as the self-hosted compiler.
-          cp target/release/fidesc.exe target/release/fides.exe
+          # Stage the binaries where fides.nsi expects them. fides.exe is the
+          # bootstrap compiler under the name the installer has always used;
+          # fidesc.exe is the same binary under its canonical name, alongside
+          # the companion tools.
+          mkdir -p release
+          cp target/release/fidesc.exe release/fides-c3.exe
+          cp target/release/fidesc.exe release/fidesc.exe
+          cp target/release/ark.exe    release/ark.exe
+          cp target/release/scribe.exe release/scribe.exe
+          cp target/release/veil.exe   release/veil.exe
 
       - name: Verify build
         shell: bash
-        continue-on-error: true
         run: |
-          ./target/release/fides.exe run tests/bootstrap/hello.fd
+          ./release/fidesc.exe version
+          ./release/fidesc.exe run tests/bootstrap/hello.fd
+          ./release/ark.exe --help >/dev/null 2>&1 || ./release/ark.exe >/dev/null 2>&1 || true
 
       - name: Install NSIS
         shell: bash
@@ -54,10 +64,6 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: |
-          # Copy the compiler binary to the location the NSIS script expects
-          New-Item -ItemType Directory -Force -Path release
-          Copy-Item target/release/fides.exe release/fides-c3.exe
-
           cd installer
           $version = "${{ steps.version.outputs.version }}"
           # Update version in the NSIS script
@@ -67,7 +73,7 @@ jobs:
 
       - name: Upload installer to release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: installer/Fides-Setup-*.exe
 

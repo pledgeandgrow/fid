@@ -1,0 +1,173 @@
+name: Release archives
+
+# Builds the prebuilt toolchain archives that the website's install scripts
+# download from `releases/latest/download/`:
+#
+#   fid-x86_64-linux.tar.gz    fid-aarch64-linux.tar.gz
+#   fid-x86_64-macos.tar.gz    fid-aarch64-macos.tar.gz
+#   fid-x86_64-windows.zip
+#
+# Every archive has the same layout, extracted straight into $FID_HOME:
+#
+#   bin/fidesc  bin/ark  bin/scribe  bin/veil   (+ .exe on Windows)
+#   stdlib/*.fd
+#   runtime/*.c, *.h
+#   LICENSE
+#
+# The Windows NSIS installer is built separately by build-installer.yml.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: fid-x86_64-linux.tar.gz
+            ext: ''
+          # GitHub-hosted ARM64 Linux runners are available to public
+          # repositories. If this job cannot be scheduled, drop the entry and
+          # install.sh will fall back to a source build on aarch64 Linux.
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: fid-aarch64-linux.tar.gz
+            ext: ''
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: fid-x86_64-macos.tar.gz
+            ext: ''
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: fid-aarch64-macos.tar.gz
+            ext: ''
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: fid-x86_64-windows.zip
+            ext: '.exe'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage the archive layout
+        shell: bash
+        run: |
+          set -eu
+          out="target/${{ matrix.target }}/release"
+          rm -rf stage && mkdir -p stage/bin
+          for b in fidesc ark scribe veil; do
+            cp "$out/$b${{ matrix.ext }}" stage/bin/
+          done
+          cp -r stdlib stage/stdlib
+          cp -r runtime stage/runtime
+          cp LICENSE stage/LICENSE
+          ls -la stage/bin
+
+      - name: Pack (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: tar -czf "${{ matrix.artifact }}" -C stage .
+
+      - name: Pack (zip)
+        if: runner.os == 'Windows'
+        shell: bash
+        # 7-Zip (preinstalled on the Windows runners) writes forward-slash
+        # entry names; Compress-Archive from Windows PowerShell writes
+        # backslashes, which unzip on other platforms mishandles.
+        run: |
+          cd stage
+          7z a -tzip "../${{ matrix.artifact }}" . >/dev/null
+          cd ..
+          7z l "${{ matrix.artifact }}" | grep -E "bin/fidesc|stdlib/core.fd|LICENSE"
+
+      - name: Smoke test the archive exactly as the install script would
+        shell: bash
+        run: |
+          set -eu
+          home="$(mktemp -d)"
+          if [[ "${{ matrix.artifact }}" == *.zip ]]; then
+            unzip -q "${{ matrix.artifact }}" -d "$home"
+          else
+            tar -xzf "${{ matrix.artifact }}" -C "$home"
+          fi
+          chmod +x "$home"/bin/* 2>/dev/null || true
+          "$home/bin/fidesc${{ matrix.ext }}" version
+          test -d "$home/stdlib" && test -f "$home/LICENSE"
+          # Run a program that imports stdlib modules from a directory that is
+          # NOT the repository, so the exe-relative stdlib lookup is what
+          # resolves `use vec;` — exactly the situation an installed user is in.
+          proj="$(mktemp -d)"
+          cat > "$proj/main.fd" <<'EOF'
+          use vec;
+          fn main() {
+              var v: Vec<i64> = Vec::new();
+              v.push(40);
+              v.push(2);
+              println(v.len());
+          }
+          EOF
+          (cd "$proj" && "$home/bin/fidesc${{ matrix.ext }}" run main.fd | tee out.txt && grep -q '^2' out.txt)
+          "$home/bin/ark${{ matrix.ext }}" --help >/dev/null 2>&1 || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+  publish:
+    name: Checksums and release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all archives
+        uses: actions/download-artifact@v4
+        with:
+          path: archives
+          merge-multiple: true
+
+      - name: Write SHA256SUMS
+        shell: bash
+        run: |
+          cd archives
+          sha256sum fid-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attach to the GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            archives/fid-*
+            archives/SHA256SUMS
+
+      - name: Keep the archives as a workflow artifact (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fid-archives
+          path: archives/*
