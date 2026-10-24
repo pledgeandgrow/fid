@@ -87,8 +87,8 @@ pub enum ResultUnit { Ok, Err(str) }
 
 // --- Helper: emit little-endian ---
 
-fn co_emit_u16(t: &mut Vec, v: i64) { t.push(v & 0xFF); t.push((v >> 8) & 0xFF); }
-fn co_emit_u32(t: &mut Vec, v: i64) {
+fn co_emit_u16(t: Vec, v: i64) { t.push(v & 0xFF); t.push((v >> 8) & 0xFF); }
+fn co_emit_u32(t: Vec, v: i64) {
     t.push(v & 0xFF);
     t.push((v >> 8) & 0xFF);
     t.push((v >> 16) & 0xFF);
@@ -102,7 +102,7 @@ fn symbol_name_map_lookup(map: Vec<(str, i64)>, name: str) -> i64 {
     while i < map.len() {
         var entry: (str, i64) = map.get(i);
         var (e0, e1) = entry;
-        if str_equal(e0, name) {
+        if e0 == name {
             return e1;
         }
         i = i + 1;
@@ -155,35 +155,35 @@ fn CoffEmitter_encode_instruction(self: &mut CoffEmitter, line: str) -> ResultUn
 
     var mnemonic: str = co_str_trim_end(parts.get(0));
 
-    if str_equal(mnemonic, "ret") {
+    if mnemonic == "ret" {
         self.text_bytes.push(0xC3);
-    } else if str_equal(mnemonic, "nop") {
+    } else if mnemonic == "nop" {
         self.text_bytes.push(0x90);
-    } else if str_equal(mnemonic, "push") {
+    } else if mnemonic == "push" {
         if parts.len() > 1 {
             var reg: str = co_str_trim_end(parts.get(1));
-            if str_equal(reg, "rbp") {
+            if reg == "rbp" {
                 self.text_bytes.push(0x55);
-            } else if str_equal(reg, "rsp") {
+            } else if reg == "rsp" {
                 self.text_bytes.push(0x54);
             } else {
                 self.text_bytes.push(0x50);
             }
         }
-    } else if str_equal(mnemonic, "pop") {
+    } else if mnemonic == "pop" {
         if parts.len() > 1 {
             var reg: str = co_str_trim_end(parts.get(1));
-            if str_equal(reg, "rbp") {
+            if reg == "rbp" {
                 self.text_bytes.push(0x5D);
             } else {
                 self.text_bytes.push(0x58);
             }
         }
-    } else if str_equal(mnemonic, "mov") || str_equal(mnemonic, "movq") || str_equal(mnemonic, "movl") {
+    } else if mnemonic == "mov" || mnemonic == "movq" || mnemonic == "movl" {
         self.text_bytes.push(0x90);
-    } else if str_equal(mnemonic, "add") || str_equal(mnemonic, "sub") || str_equal(mnemonic, "mul") || str_equal(mnemonic, "imul") || str_equal(mnemonic, "div") || str_equal(mnemonic, "idiv") {
+    } else if mnemonic == "add" || mnemonic == "sub" || mnemonic == "mul" || mnemonic == "imul" || mnemonic == "div" || mnemonic == "idiv" {
         self.text_bytes.push(0x90);
-    } else if str_equal(mnemonic, "call") {
+    } else if mnemonic == "call" {
         if parts.len() > 1 {
             var target: str = co_str_trim_end(parts.get(1));
             self.text_bytes.push(0xE8);
@@ -195,7 +195,7 @@ fn CoffEmitter_encode_instruction(self: &mut CoffEmitter, line: str) -> ResultUn
             var sym_idx: i64 = CoffEmitter_get_or_add_symbol(self, target, 0, false);
             self.relocations.push(RelocEntry_new(offset, sym_idx, IMAGE_REL_AMD64_REL32));
         }
-    } else if str_equal(mnemonic, "jmp") {
+    } else if mnemonic == "jmp" {
         if parts.len() > 1 {
             var target: str = co_str_trim_end(parts.get(1));
             self.text_bytes.push(0xE9);
@@ -207,7 +207,7 @@ fn CoffEmitter_encode_instruction(self: &mut CoffEmitter, line: str) -> ResultUn
             var sym_idx: i64 = CoffEmitter_get_or_add_symbol(self, target, 0, false);
             self.relocations.push(RelocEntry_new(offset, sym_idx, IMAGE_REL_AMD64_REL32));
         }
-    } else if str_equal(mnemonic, "int3") || str_equal(mnemonic, "hlt") {
+    } else if mnemonic == "int3" || mnemonic == "hlt" {
         self.text_bytes.push(0xCC);
     } else {
         // Unknown instruction -- emit nop
@@ -237,7 +237,7 @@ fn CoffEmitter_get_or_add_symbol(self: &mut CoffEmitter, name: str, offset: i64,
     // Check if symbol already exists
     var i: i64 = 0;
     while i < self.symbols.len() {
-        if str_equal(self.symbols.get(i).name, name) {
+        if self.symbols.get(i).name == name {
             return i;
         }
         i = i + 1;
@@ -273,7 +273,7 @@ pub fn CoffEmitter_build_coff(self: &mut CoffEmitter) -> ResultVec {
 
     // Build string table (for names > 8 chars)
     var string_table_data: Vec<i64> = Vec::new();
-    co_emit_u32(&mut string_table_data, 4); // initial size = 4
+    co_emit_u32(string_table_data, 4); // initial size = 4
 
     // Update symbol names to use string table if > 8 chars
     var si: i64 = 0;
@@ -300,13 +300,13 @@ pub fn CoffEmitter_build_coff(self: &mut CoffEmitter) -> ResultVec {
     var buf: Vec<i64> = Vec::new();
 
     // -- COFF Header --
-    co_emit_u16(&mut buf, IMAGE_FILE_MACHINE_AMD64);     // Machine
-    co_emit_u16(&mut buf, num_sections);                   // NumberOfSections
-    co_emit_u32(&mut buf, 0);                              // TimeDateStamp
-    co_emit_u32(&mut buf, symbol_table_offset);            // PointerToSymbolTable
-    co_emit_u32(&mut buf, self.symbols.len());              // NumberOfSymbols
-    co_emit_u16(&mut buf, 0);                              // SizeOfOptionalHeader
-    co_emit_u16(&mut buf, 0);                              // Characteristics
+    co_emit_u16(buf, IMAGE_FILE_MACHINE_AMD64);     // Machine
+    co_emit_u16(buf, num_sections);                   // NumberOfSections
+    co_emit_u32(buf, 0);                              // TimeDateStamp
+    co_emit_u32(buf, symbol_table_offset);            // PointerToSymbolTable
+    co_emit_u32(buf, self.symbols.len());              // NumberOfSymbols
+    co_emit_u16(buf, 0);                              // SizeOfOptionalHeader
+    co_emit_u16(buf, 0);                              // Characteristics
 
     // -- Section Header: .text --
     // Name (8 bytes, padded with zeros)
@@ -318,17 +318,17 @@ pub fn CoffEmitter_build_coff(self: &mut CoffEmitter) -> ResultVec {
     buf.push(0);
     buf.push(0);
     buf.push(0);
-    co_emit_u32(&mut buf, text_data_size);                  // VirtualSize
-    co_emit_u32(&mut buf, 0);                               // VirtualAddress
-    co_emit_u32(&mut buf, text_data_size);                  // SizeOfRawData
-    co_emit_u32(&mut buf, text_data_offset);                // PointerToRawData
-    co_emit_u32(&mut buf, reloc_offset);                    // PointerToRelocations
-    co_emit_u32(&mut buf, 0);                               // PointerToLinenumbers
-    co_emit_u16(&mut buf, self.relocations.len());          // NumberOfRelocations
-    co_emit_u16(&mut buf, 0);                               // NumberOfLinenumbers
+    co_emit_u32(buf, text_data_size);                  // VirtualSize
+    co_emit_u32(buf, 0);                               // VirtualAddress
+    co_emit_u32(buf, text_data_size);                  // SizeOfRawData
+    co_emit_u32(buf, text_data_offset);                // PointerToRawData
+    co_emit_u32(buf, reloc_offset);                    // PointerToRelocations
+    co_emit_u32(buf, 0);                               // PointerToLinenumbers
+    co_emit_u16(buf, self.relocations.len());          // NumberOfRelocations
+    co_emit_u16(buf, 0);                               // NumberOfLinenumbers
     // Characteristics: code + execute + read
     var chars: i64 = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
-    co_emit_u32(&mut buf, chars);
+    co_emit_u32(buf, chars);
 
     // -- .text section data --
     var ti: i64 = 0;
@@ -341,9 +341,9 @@ pub fn CoffEmitter_build_coff(self: &mut CoffEmitter) -> ResultVec {
     var ri: i64 = 0;
     while ri < self.relocations.len() {
         var reloc: RelocEntry = self.relocations.get(ri);
-        co_emit_u32(&mut buf, reloc.virtual_address);
-        co_emit_u32(&mut buf, reloc.symbol_table_index);
-        co_emit_u16(&mut buf, reloc.rtype);
+        co_emit_u32(buf, reloc.virtual_address);
+        co_emit_u32(buf, reloc.symbol_table_index);
+        co_emit_u16(buf, reloc.rtype);
         ri = ri + 1;
     }
 
@@ -365,12 +365,12 @@ pub fn CoffEmitter_build_coff(self: &mut CoffEmitter) -> ResultVec {
         } else {
             // Long name: 4 bytes of 0 + 4 bytes offset into string table
             var offset: i64 = symbol_name_map_lookup(self.symbol_name_map, sym.name);
-            co_emit_u32(&mut buf, 0);
-            co_emit_u32(&mut buf, offset);
+            co_emit_u32(buf, 0);
+            co_emit_u32(buf, offset);
         }
-        co_emit_u32(&mut buf, sym.value);                    // Value
-        co_emit_u16(&mut buf, sym.section_number);           // SectionNumber
-        co_emit_u16(&mut buf, sym.sym_type);                 // Type
+        co_emit_u32(buf, sym.value);                    // Value
+        co_emit_u16(buf, sym.section_number);           // SectionNumber
+        co_emit_u16(buf, sym.sym_type);                 // Type
         buf.push(sym.storage_class);                      // StorageClass
         buf.push(sym.number_of_aux_symbols);              // NumberOfAuxSymbols
         syi = syi + 1;

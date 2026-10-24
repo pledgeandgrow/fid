@@ -81,7 +81,7 @@ pub fn ComptimeEnv_new() -> ComptimeEnv {
 pub fn ComptimeEnv_get(env: &ComptimeEnv, name: str) -> OptExpr {
     var i: i64 = 0;
     while i < env.names.len() {
-        if str_equal(env.names.get(i), name) {
+        if env.names.get(i) == name {
             return OptExpr::Some(env.values.get(i));
         }
         i = i + 1;
@@ -92,7 +92,7 @@ pub fn ComptimeEnv_get(env: &ComptimeEnv, name: str) -> OptExpr {
 pub fn ComptimeEnv_set(env: &mut ComptimeEnv, name: str, v: Expr) {
     var i: i64 = 0;
     while i < env.names.len() {
-        if str_equal(env.names.get(i), name) {
+        if env.names.get(i) == name {
             env.values.set(i, v);
             return;
         }
@@ -136,7 +136,7 @@ pub fn process_gen(program: Program) -> Program {
     var errs: Vec<str> = Vec::new();
     var fi: i64 = 0;
     while fi < prog.funcs.len() {
-        substitute_comptime_gen_blocks(&mut prog.funcs, fi, &prog, &mut errs);
+        substitute_comptime_gen_blocks(prog.funcs, fi, &prog, errs);
         fi = fi + 1;
     }
 
@@ -146,7 +146,7 @@ pub fn process_gen(program: Program) -> Program {
     var func_count: i64 = prog.funcs.len();
     var idx: i64 = 0;
     while idx < func_count {
-        process_comptime_gen_in_func(&mut prog.funcs, idx, &prog, &mut generated_funcs, &mut generated_structs, &mut errs);
+        process_comptime_gen_in_func(prog.funcs, idx, &prog, generated_funcs, generated_structs, errs);
         idx = idx + 1;
     }
 
@@ -165,14 +165,14 @@ pub fn process_gen(program: Program) -> Program {
     return prog;
 }
 
-fn substitute_comptime_gen_blocks(funcs: &mut Vec<Func>, idx: i64, original: &Program, errs: &mut Vec<str>) {
+fn substitute_comptime_gen_blocks(funcs: Vec<Func>, idx: i64, original: &Program, errs: Vec<str>) {
     var func: Func = funcs.get(idx);
     var si: i64 = 0;
     while si < func.body.len() {
         match func.body.get(si) {
             Stmt::ComptimeGen(block, _) => {
                 var block_copy: Vec<Stmt> = block;
-                substitute_stmts(&mut block_copy, original, errs);
+                substitute_stmts(block_copy, original, errs);
                 func.body.set(si, Stmt::ComptimeGen(block_copy, 0));
             }
             _ => {}
@@ -182,7 +182,7 @@ fn substitute_comptime_gen_blocks(funcs: &mut Vec<Func>, idx: i64, original: &Pr
     funcs.set(idx, func);
 }
 
-fn process_comptime_gen_in_func(funcs: &mut Vec<Func>, idx: i64, original: &Program, generated_funcs: &mut Vec<Func>, generated_structs: &mut Vec<StructDef>, errs: &mut Vec<str>) {
+fn process_comptime_gen_in_func(funcs: Vec<Func>, idx: i64, original: &Program, generated_funcs: Vec<Func>, generated_structs: Vec<StructDef>, errs: Vec<str>) {
     var func: Func = funcs.get(idx);
     var new_body: Vec<Stmt> = Vec::new();
     var si: i64 = 0;
@@ -261,7 +261,7 @@ pub fn substitute(program: Program) -> Program {
     while iter < 8 {
         var fi: i64 = 0;
         while fi < prog.funcs.len() {
-            substitute_func(&mut prog.funcs, fi, &prog, &mut errs);
+            substitute_func(prog.funcs, fi, &prog, errs);
             fi = fi + 1;
         }
         iter = iter + 1;
@@ -270,7 +270,7 @@ pub fn substitute(program: Program) -> Program {
     // Phase 2: Substitute comptime expressions everywhere
     var fi2: i64 = 0;
     while fi2 < prog.funcs.len() {
-        substitute_func(&mut prog.funcs, fi2, &prog, &mut errs);
+        substitute_func(prog.funcs, fi2, &prog, errs);
         fi2 = fi2 + 1;
     }
 
@@ -280,7 +280,7 @@ pub fn substitute(program: Program) -> Program {
     while iter2 < 4 {
         var fi3: i64 = 0;
         while fi3 < prog.funcs.len() {
-            aggressive_comptime_func(&mut prog.funcs, fi3, &prog);
+            aggressive_comptime_func(prog.funcs, fi3, &prog);
             fi3 = fi3 + 1;
         }
         iter2 = iter2 + 1;
@@ -289,7 +289,7 @@ pub fn substitute(program: Program) -> Program {
     return prog;
 }
 
-fn substitute_func(funcs: &mut Vec<Func>, idx: i64, original: &Program, errs: &mut Vec<str>) {
+fn substitute_func(funcs: Vec<Func>, idx: i64, original: &Program, errs: Vec<str>) {
     var func: Func = funcs.get(idx);
     var si: i64 = 0;
     while si < func.body.len() {
@@ -301,7 +301,7 @@ fn substitute_func(funcs: &mut Vec<Func>, idx: i64, original: &Program, errs: &m
     funcs.set(idx, func);
 }
 
-fn substitute_stmts(stmts: &mut Vec<Stmt>, original: &Program, errs: &mut Vec<str>) {
+fn substitute_stmts(stmts: Vec<Stmt>, original: &Program, errs: Vec<str>) {
     var si: i64 = 0;
     while si < stmts.len() {
         var stmt: Stmt = stmts.get(si);
@@ -311,7 +311,7 @@ fn substitute_stmts(stmts: &mut Vec<Stmt>, original: &Program, errs: &mut Vec<st
     }
 }
 
-fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<str>) {
+fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: Vec<str>) {
     match stmt {
         Stmt::Let(_, _, expr, _, _, _, _) => { substitute_expr(&mut expr, original, errs); }
         Stmt::LetTuple(_, expr, _) => { substitute_expr(&mut expr, original, errs); }
@@ -341,52 +341,52 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<str>) {
         }
         Stmt::If(cond, then_block, else_block, _) => {
             substitute_expr(&mut cond, original, errs);
-            substitute_stmts(&mut then_block, original, errs);
+            substitute_stmts(then_block, original, errs);
             match else_block {
-                OptStmts::Some(eb) => { substitute_stmts(&mut eb, original, errs); }
+                OptStmts::Some(eb) => { substitute_stmts(eb, original, errs); }
                 OptStmts::None => {}
             }
         }
         Stmt::While(cond, body, _) => {
             substitute_expr(&mut cond, original, errs);
-            substitute_stmts(&mut body, original, errs);
+            substitute_stmts(body, original, errs);
         }
         Stmt::For(_, iterator, body, _) => {
             substitute_expr(&mut iterator, original, errs);
-            substitute_stmts(&mut body, original, errs);
+            substitute_stmts(body, original, errs);
         }
         Stmt::Match(expr, arms, _) => {
             substitute_expr(&mut expr, original, errs);
             var ai: i64 = 0;
             while ai < arms.len() {
                 var arm: MatchArm = arms.get(ai);
-                substitute_stmts(&mut arm.body, original, errs);
+                substitute_stmts(arm.body, original, errs);
                 arms.set(ai, arm);
                 ai = ai + 1;
             }
         }
-        Stmt::Defer(body, _) => { substitute_stmts(&mut body, original, errs); }
-        Stmt::Txn(body, _) => { substitute_stmts(&mut body, original, errs); }
-        Stmt::RegionBlock(_, _, _, _, _, body, _) => { substitute_stmts(&mut body, original, errs); }
-        Stmt::Sandbox(body, _) => { substitute_stmts(&mut body, original, errs); }
-        Stmt::Unsafe(body, _) => { substitute_stmts(&mut body, original, errs); }
-        Stmt::ComptimeGen(block, _) => { substitute_stmts(&mut block, original, errs); }
+        Stmt::Defer(body, _) => { substitute_stmts(body, original, errs); }
+        Stmt::Txn(body, _) => { substitute_stmts(body, original, errs); }
+        Stmt::RegionBlock(_, _, _, _, _, body, _) => { substitute_stmts(body, original, errs); }
+        Stmt::Sandbox(body, _) => { substitute_stmts(body, original, errs); }
+        Stmt::Unsafe(body, _) => { substitute_stmts(body, original, errs); }
+        Stmt::ComptimeGen(block, _) => { substitute_stmts(block, original, errs); }
         Stmt::Handle(body, handlers, _) => {
-            substitute_stmts(&mut body, original, errs);
+            substitute_stmts(body, original, errs);
             var hi: i64 = 0;
             while hi < handlers.len() {
                 var h: EffectHandler = handlers.get(hi);
-                substitute_stmts(&mut h.body, original, errs);
+                substitute_stmts(h.body, original, errs);
                 handlers.set(hi, h);
                 hi = hi + 1;
             }
         }
-        Stmt::Query(_, body, _) => { substitute_stmts(&mut body, original, errs); }
+        Stmt::Query(_, body, _) => { substitute_stmts(body, original, errs); }
         Stmt::Parallel(branches, _) => {
             var bi: i64 = 0;
             while bi < branches.len() {
                 var branch: Vec<Stmt> = branches.get(bi);
-                substitute_stmts(&mut branch, original, errs);
+                substitute_stmts(branch, original, errs);
                 branches.set(bi, branch);
                 bi = bi + 1;
             }
@@ -396,7 +396,7 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<str>) {
     }
 }
 
-fn substitute_expr(expr: &mut Expr, original: &Program, errs: &mut Vec<str>) {
+fn substitute_expr(expr: &mut Expr, original: &Program, errs: Vec<str>) {
     match expr {
         Expr::Binary(op, left, right) => {
             var l: Expr = ct_box_expr_unbox(left);
@@ -447,13 +447,13 @@ fn substitute_expr(expr: &mut Expr, original: &Program, errs: &mut Vec<str>) {
         }
         Expr::If(cond, then_block, else_block) => {
             substitute_expr(&mut cond, original, errs);
-            substitute_stmts(&mut then_block, original, errs);
+            substitute_stmts(then_block, original, errs);
             match else_block {
-                OptStmts::Some(eb) => { substitute_stmts(&mut eb, original, errs); }
+                OptStmts::Some(eb) => { substitute_stmts(eb, original, errs); }
                 OptStmts::None => {}
             }
         }
-        Expr::Block(stmts) => { substitute_stmts(&mut stmts, original, errs); }
+        Expr::Block(stmts) => { substitute_stmts(stmts, original, errs); }
         Expr::Index(array, index) => {
             var a: Expr = ct_box_expr_unbox(array);
             var i: Expr = ct_box_expr_unbox(index);
@@ -475,7 +475,7 @@ fn substitute_expr(expr: &mut Expr, original: &Program, errs: &mut Vec<str>) {
             var ai: i64 = 0;
             while ai < arms.len() {
                 var arm: MatchArm = arms.get(ai);
-                substitute_stmts(&mut arm.body, original, errs);
+                substitute_stmts(arm.body, original, errs);
                 arms.set(ai, arm);
                 ai = ai + 1;
             }
@@ -516,7 +516,7 @@ fn substitute_expr(expr: &mut Expr, original: &Program, errs: &mut Vec<str>) {
     }
 }
 
-fn substitute_expr_comptime(expr: &mut Expr, inner: Box<Expr>, original: &Program, errs: &mut Vec<str>) {
+fn substitute_expr_comptime(expr: &mut Expr, inner: Box<Expr>, original: &Program, errs: Vec<str>) {
     var e: Expr = ct_box_expr_unbox(inner);
     substitute_expr(&mut e, original, errs);
     // Now evaluate the comptime expression
@@ -527,8 +527,8 @@ fn substitute_expr_comptime(expr: &mut Expr, inner: Box<Expr>, original: &Progra
     }
 }
 
-fn substitute_expr_comptime_block(expr: &mut Expr, stmts: Vec<Stmt>, original: &Program, errs: &mut Vec<str>) {
-    substitute_stmts(&mut stmts, original, errs);
+fn substitute_expr_comptime_block(expr: &mut Expr, stmts: Vec<Stmt>, original: &Program, errs: Vec<str>) {
+    substitute_stmts(stmts, original, errs);
     var result: ResultExpr = evaluate_block(stmts, original);
     match result {
         ResultExpr::Ok(v) => { *expr = v; }
@@ -536,7 +536,7 @@ fn substitute_expr_comptime_block(expr: &mut Expr, stmts: Vec<Stmt>, original: &
     }
 }
 
-fn substitute_expr_comptime_reflect(expr: &mut Expr, op: ReflectOp, ty: Type, original: &Program, errs: &mut Vec<str>) {
+fn substitute_expr_comptime_reflect(expr: &mut Expr, op: ReflectOp, ty: Type, original: &Program, errs: Vec<str>) {
     var result: ResultExpr = evaluate_reflect(op, ty, original);
     match result {
         ResultExpr::Ok(v) => { *expr = v; }
@@ -548,7 +548,7 @@ fn substitute_expr_comptime_reflect(expr: &mut Expr, op: ReflectOp, ty: Type, or
 // Auto-evaluate calls to `comptime fn` functions when ALL arguments are
 // literals, without requiring an explicit `comptime` wrapper.
 
-fn aggressive_comptime_func(funcs: &mut Vec<Func>, idx: i64, original: &Program) {
+fn aggressive_comptime_func(funcs: Vec<Func>, idx: i64, original: &Program) {
     var func: Func = funcs.get(idx);
     var si: i64 = 0;
     while si < func.body.len() {
@@ -731,7 +731,7 @@ fn aggressive_comptime_expr(expr: &mut Expr, original: &Program) {
             var fi: i64 = 0;
             while fi < original.funcs.len() {
                 var f: Func = original.funcs.get(fi);
-                if str_equal(f.name, callee) && f.is_comptime { is_comptime_fn = true; }
+                if f.name == callee && f.is_comptime { is_comptime_fn = true; }
                 fi = fi + 1;
             }
             if is_comptime_fn {
@@ -855,7 +855,7 @@ fn replace_ident_in_stmt(stmt: &mut Stmt, name: str, replacement: Expr) {
             }
         }
         Stmt::For(v, iterator, body, _) => {
-            if !str_equal(v, name) {
+            if v != name {
                 replace_ident_in_expr(iterator, name, replacement);
                 var si: i64 = 0;
                 while si < body.len() {
@@ -883,7 +883,7 @@ fn replace_ident_in_stmt(stmt: &mut Stmt, name: str, replacement: Expr) {
 fn replace_ident_in_expr(expr: &mut Expr, name: str, replacement: Expr) {
     match expr {
         Expr::Ident(n) => {
-            if str_equal(n, name) { *expr = replacement; }
+            if n == name { *expr = replacement; }
         }
         Expr::Binary(op, left, right) => {
             var l: Expr = ct_box_expr_unbox(left);
@@ -1000,11 +1000,6 @@ fn replace_ident_in_expr(expr: &mut Expr, name: str, replacement: Expr) {
 
 // --- Evuation ----------------------------------------------------------
 
-pub fn box_expr_new(e: Expr) -> Box<Expr> {
-    // Box::new is the standard way to create a Box<T> in Fides
-    return Box::new(e);
-}
-
 fn evaluate(expr: &Expr, original: &Program) -> ResultExpr {
     match expr {
         Expr::IntLit(n) => { return ResultExpr::Ok(Expr::IntLit(n)); }
@@ -1040,7 +1035,7 @@ fn evaluate(expr: &Expr, original: &Program) -> ResultExpr {
             var fi: i64 = 0;
             while fi < original.funcs.len() {
                 var f: Func = original.funcs.get(fi);
-                if str_equal(f.name, callee) && f.is_comptime { func_idx = fi; }
+                if f.name == callee && f.is_comptime { func_idx = fi; }
                 fi = fi + 1;
             }
             if func_idx < 0 {
@@ -1094,12 +1089,12 @@ fn evaluate(expr: &Expr, original: &Program) -> ResultExpr {
     return ResultExpr::Ok(Expr::IntLit(0));
 }
 
-fn evaluate_block(stmts: &Vec<Stmt>, original: &Program) -> ResultExpr {
+fn evaluate_block(stmts: Vec<Stmt>, original: &Program) -> ResultExpr {
     var env: ComptimeEnv = ComptimeEnv_new();
     return evaluate_block_with_env(stmts, original, &env);
 }
 
-fn evaluate_block_with_env(stmts: &Vec<Stmt>, original: &Program, env: &ComptimeEnv) -> ResultExpr {
+fn evaluate_block_with_env(stmts: Vec<Stmt>, original: &Program, env: &ComptimeEnv) -> ResultExpr {
     var local_env: ComptimeEnv = ComptimeEnv_clone(env);
     var result: Expr = Expr::IntLit(0);
     var si: i64 = 0;
@@ -1289,7 +1284,7 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
             var fi: i64 = 0;
             while fi < original.funcs.len() {
                 var f: Func = original.funcs.get(fi);
-                if str_equal(f.name, callee) && f.is_comptime { func_idx = fi; }
+                if f.name == callee && f.is_comptime { func_idx = fi; }
                 fi = fi + 1;
             }
             if func_idx < 0 {
@@ -1400,7 +1395,7 @@ fn call_comptime_func(func: Func, args: Vec<Expr>, original: &Program) -> Result
         ComptimeEnv_set(&mut env, func.params.get(i).name, args.get(i));
         i = i + 1;
     }
-    return evaluate_block_with_env(&func.body, original, &env);
+    return evaluate_block_with_env(func.body, original, &env);
 }
 
 // --- Binary/unary operation evuation -----------------------------------
@@ -1465,8 +1460,8 @@ fn eval_binop(op: BinOp, l: Expr, r: Expr) -> ResultExpr {
                 Expr::StringLit(b) => {
                     match op {
                         BinOp::Add => { return ResultExpr::Ok(Expr::StringLit(a + b)); }
-                        BinOp::Eq => { return ResultExpr::Ok(Expr::BoolLit(str_equal(a, b))); }
-                        BinOp::Neq => { return ResultExpr::Ok(Expr::BoolLit(!str_equal(a, b))); }
+                        BinOp::Eq => { return ResultExpr::Ok(Expr::BoolLit(a == b)); }
+                        BinOp::Neq => { return ResultExpr::Ok(Expr::BoolLit(a != b)); }
                         _ => { return ResultExpr::Err("unsupported string binop"); }
                     }
                 }
@@ -1551,7 +1546,7 @@ fn evaluate_reflect(op: ReflectOp, ty: Type, original: &Program) -> ResultExpr {
             var found: bool = false;
             var si: i64 = 0;
             while si < original.structs.len() {
-                if str_equal(original.structs.get(si).name, type_name) { found = true; }
+                if original.structs.get(si).name == type_name { found = true; }
                 si = si + 1;
             }
             return ResultExpr::Ok(Expr::BoolLit(found));
@@ -1560,7 +1555,7 @@ fn evaluate_reflect(op: ReflectOp, ty: Type, original: &Program) -> ResultExpr {
             var found: bool = false;
             var ei: i64 = 0;
             while ei < original.enums.len() {
-                if str_equal(original.enums.get(ei).name, type_name) { found = true; }
+                if original.enums.get(ei).name == type_name { found = true; }
                 ei = ei + 1;
             }
             return ResultExpr::Ok(Expr::BoolLit(found));
@@ -1569,7 +1564,7 @@ fn evaluate_reflect(op: ReflectOp, ty: Type, original: &Program) -> ResultExpr {
             var si: i64 = 0;
             while si < original.structs.len() {
                 var s: StructDef = original.structs.get(si);
-                if str_equal(s.name, type_name) {
+                if s.name == type_name {
                     return ResultExpr::Ok(Expr::IntLit(s.fields.len()));
                 }
                 si = si + 1;
@@ -1580,7 +1575,7 @@ fn evaluate_reflect(op: ReflectOp, ty: Type, original: &Program) -> ResultExpr {
             var si: i64 = 0;
             while si < original.structs.len() {
                 var s: StructDef = original.structs.get(si);
-                if str_equal(s.name, type_name) {
+                if s.name == type_name {
                     var elements: Vec<Expr> = Vec::new();
                     var fi: i64 = 0;
                     while fi < s.fields.len() {
@@ -1597,7 +1592,7 @@ fn evaluate_reflect(op: ReflectOp, ty: Type, original: &Program) -> ResultExpr {
             var si: i64 = 0;
             while si < original.structs.len() {
                 var s: StructDef = original.structs.get(si);
-                if str_equal(s.name, type_name) {
+                if s.name == type_name {
                     var elements: Vec<Expr> = Vec::new();
                     var fi: i64 = 0;
                     while fi < s.fields.len() {
@@ -1614,7 +1609,7 @@ fn evaluate_reflect(op: ReflectOp, ty: Type, original: &Program) -> ResultExpr {
             var ei: i64 = 0;
             while ei < original.enums.len() {
                 var e: EnumDef = original.enums.get(ei);
-                if str_equal(e.name, type_name) {
+                if e.name == type_name {
                     var elements: Vec<Expr> = Vec::new();
                     var vi: i64 = 0;
                     while vi < e.variants.len() {

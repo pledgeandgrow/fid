@@ -41,6 +41,21 @@ if [ ! -f "release/fides-c3.exe" ]; then
 fi
 echo "  OK: $(ls -lh release/fides-c3.exe | awk '{print $5}')"
 
+echo "[check] Companion tools (fidesc, ark, scribe, veil)..."
+# The installer ships the canonical fidesc.exe and the companion tools next
+# to fides.exe. Stage them from the Cargo build if they are not there yet.
+for tool in fidesc ark scribe veil; do
+    if [ ! -f "release/$tool.exe" ]; then
+        if [ -f "target/release/$tool.exe" ]; then
+            cp "target/release/$tool.exe" "release/$tool.exe"
+        else
+            echo "ERROR: release/$tool.exe not found (run: cargo build --release)."
+            exit 1
+        fi
+    fi
+done
+echo "  OK"
+
 echo "[check] Standard library..."
 if [ ! -d "stdlib" ] || [ -z "$(ls stdlib/*.fd 2>/dev/null)" ]; then
     echo "ERROR: stdlib/ directory is empty or missing."

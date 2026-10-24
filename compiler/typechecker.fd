@@ -294,7 +294,7 @@ pub fn tc_str_vec_contains(v: Vec<str>, s: str) -> bool {
 /// Same as str_vec_contains but takes a &mut Vec<str> reference.
 /// This is needed because the codegen doesn't auto-deref &mut T to T
 /// for function call arguments.
-pub fn str_vec_contains_ref(v: &mut Vec<str>, s: str) -> bool {
+pub fn str_vec_contains_ref(v: Vec<str>, s: str) -> bool {
     var i: i64 = 0;
     while i < v.len() {
         if v.get(i) == s { return true; }
@@ -303,7 +303,7 @@ pub fn str_vec_contains_ref(v: &mut Vec<str>, s: str) -> bool {
     return false;
 }
 
-fn str_vec_remove(v: &mut Vec<str>, s: str) {
+fn str_vec_remove(v: Vec<str>, s: str) {
     var i: i64 = 0;
     while i < v.len() {
         if v.get(i) == s {
@@ -336,7 +336,7 @@ fn map_str_type_get(m: Vec<StringType>, key: str) -> OptType {
     return OptType::None;
 }
 
-fn map_str_type_set(m: &mut Vec<StringType>, key: str, val: Type) {
+fn map_str_type_set(m: Vec<StringType>, key: str, val: Type) {
     var i: i64 = 0;
     while i < m.len() {
         if m.get(i).key == key {
@@ -408,7 +408,7 @@ fn map_str_bool_get(m: Vec<StringBool>, key: str) -> bool {
     return false;
 }
 
-fn map_str_bool_set(m: &mut Vec<StringBool>, key: str, val: bool) {
+fn map_str_bool_set(m: Vec<StringBool>, key: str, val: bool) {
     var i: i64 = 0;
     while i < m.len() {
         if m.get(i).key == key {
@@ -435,7 +435,7 @@ fn map_str_str_get(m: Vec<StringString>, key: str) -> OptString {
     return OptString::None;
 }
 
-fn map_str_str_set(m: &mut Vec<StringString>, key: str, val: str) {
+fn map_str_str_set(m: Vec<StringString>, key: str, val: str) {
     var i: i64 = 0;
     while i < m.len() {
         if m.get(i).key == key {
@@ -599,7 +599,7 @@ pub enum OptMethodInfo {
     None,
 }
 
-fn method_map_set_entry(m: &mut Vec<MethodMapEntry>, method_name: str, info: MethodInfo) {
+fn method_map_set_entry(m: Vec<MethodMapEntry>, method_name: str, info: MethodInfo) {
     var i: i64 = 0;
     while i < m.len() {
         if m.get(i).key == method_name {
@@ -702,12 +702,14 @@ pub struct TypeChecker {
     cap_verified: Vec<str>,
     current_func_name: OptString,
     current_return_types: Vec<Type>,
+    current_ret_ty: OptType,                         // declared return type of the body being checked
+    extern_fns: Vec<str>,                            // extern "C" function names (FFI boundary)
     current_self_type: OptString,
     sandbox_depth: i64,
     gpu_region_depth: i64,
     region_budgets: Vec<RegionBudget>,
-    region_lines: Vec<StringI64>,
-    var_alloc_lines: Vec<StringI64>,
+    region_lines: Vec<StringString>,
+    var_alloc_lines: Vec<StringString>,
     linear_structs: Vec<str>,
     send_structs: Vec<str>,
     sync_structs: Vec<str>,
@@ -829,6 +831,8 @@ impl TypeChecker {
             cap_verified: Vec::new(),
             current_func_name: OptString::None,
             current_return_types: Vec::new(),
+            current_ret_ty: OptType::None,
+            extern_fns: Vec::new(),
             current_self_type: OptString::None,
             sandbox_depth: 0,
             gpu_region_depth: 0,
@@ -900,9 +904,9 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
             fi = fi + 1;
         }
         self.structs.push(StringStructFields_new(s.name, fields));
-        map_str_str_set(&mut self.item_modules, s.name, module);
-        map_str_bool_set(&mut self.item_visibility, s.name, s.is_pub);
-        map_str_str_set(&mut self.struct_modules, s.name, module);
+        map_str_str_set(self.item_modules, s.name, module);
+        map_str_bool_set(self.item_visibility, s.name, s.is_pub);
+        map_str_str_set(self.struct_modules, s.name, module);
         // Field-level visibility
         var fi2: i64 = 0;
         while fi2 < s.fields.len() {
@@ -927,8 +931,8 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
     while ei < program.enums.len() {
         var e: EnumDef = program.enums.get(ei);
         self.enums.push(e.name);
-        map_str_str_set(&mut self.item_modules, e.name, module);
-        map_str_bool_set(&mut self.item_visibility, e.name, e.is_pub);
+        map_str_str_set(self.item_modules, e.name, module);
+        map_str_bool_set(self.item_visibility, e.name, e.is_pub);
         var variants: Vec<EnumVariantEntry> = Vec::new();
         var vi: i64 = 0;
         while vi < e.variants.len() {
@@ -956,9 +960,9 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
     var ci: i64 = 0;
     while ci < program.consts.len() {
         var c: ConstDef = program.consts.get(ci);
-        map_str_type_set(&mut self.consts, c.name, c.ty);
-        map_str_str_set(&mut self.item_modules, c.name, module);
-        map_str_bool_set(&mut self.item_visibility, c.name, c.is_pub);
+        map_str_type_set(self.consts, c.name, c.ty);
+        map_str_str_set(self.item_modules, c.name, module);
+        map_str_bool_set(self.item_visibility, c.name, c.is_pub);
         ci = ci + 1;
     }
 
@@ -966,9 +970,9 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
     var gi: i64 = 0;
     while gi < program.globals.len() {
         var g: GlobalVar = program.globals.get(gi);
-        map_str_type_set(&mut self.globals, g.name, g.ty);
-        map_str_str_set(&mut self.item_modules, g.name, module);
-        map_str_bool_set(&mut self.item_visibility, g.name, g.is_pub);
+        map_str_type_set(self.globals, g.name, g.ty);
+        map_str_str_set(self.item_modules, g.name, module);
+        map_str_bool_set(self.item_visibility, g.name, g.is_pub);
         gi = gi + 1;
     }
 
@@ -976,9 +980,9 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
     var tai: i64 = 0;
     while tai < program.type_aliases.len() {
         var ta: TypeAlias = program.type_aliases.get(tai);
-        map_str_type_set(&mut self.type_aliases, ta.name, ta.alias_for);
-        map_str_str_set(&mut self.item_modules, ta.name, module);
-        map_str_bool_set(&mut self.item_visibility, ta.name, ta.is_pub);
+        map_str_type_set(self.type_aliases, ta.name, ta.alias_for);
+        map_str_str_set(self.item_modules, ta.name, module);
+        map_str_bool_set(self.item_visibility, ta.name, ta.is_pub);
         tai = tai + 1;
     }
 
@@ -999,8 +1003,8 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
         }
         var ret_ty: Type = TypeChecker_resolve_type(self, func.ret_ty);
         self.funcs.push(StringFuncSig_new(func.name, FuncSig_new_with_min(param_types, ret_ty, min_args)));
-        map_str_str_set(&mut self.item_modules, func.name, module);
-        map_str_bool_set(&mut self.item_visibility, func.name, func.is_pub);
+        map_str_str_set(self.item_modules, func.name, module);
+        map_str_bool_set(self.item_visibility, func.name, func.is_pub);
         fi3 = fi3 + 1;
     }
 
@@ -1016,8 +1020,9 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
         }
         var ret_ty: Type = TypeChecker_resolve_type(self, ext.ret_ty);
         self.funcs.push(StringFuncSig_new(ext.pledge_name, FuncSig_new(param_types, ret_ty)));
-        map_str_str_set(&mut self.item_modules, ext.pledge_name, module);
-        map_str_bool_set(&mut self.item_visibility, ext.pledge_name, true);
+        map_str_str_set(self.item_modules, ext.pledge_name, module);
+        self.extern_fns.push(ext.pledge_name);
+        map_str_bool_set(self.item_visibility, ext.pledge_name, true);
         exti = exti + 1;
     }
 
@@ -1041,9 +1046,9 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
                 if method.params.get(0).name == "self" { has_self = true; }
             }
             method_entries.push(MethodMapEntry_new(method.name, MethodInfo_new(param_types, TypeChecker_resolve_type(self, method.ret_ty), has_self, method.is_pub)));
-            map_str_str_set(&mut self.item_modules, method.name, self.current_module);
+            map_str_str_set(self.item_modules, method.name, self.current_module);
             var mangled: str = struct_name + "_" + method.name;
-            map_str_str_set(&mut self.item_modules, mangled, module);
+            map_str_str_set(self.item_modules, mangled, module);
             mi = mi + 1;
         }
         // Don't overwrite if struct already has methods from another module
@@ -1080,7 +1085,7 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
                 if method.params.get(0).name == "self" { has_self = true; }
             }
             new_methods.push(MethodMapEntry_new(method.name, MethodInfo_new(param_types, TypeChecker_resolve_type(self, method.ret_ty), has_self, method.is_pub)));
-            map_str_str_set(&mut self.item_modules, method.name, self.current_module);
+            map_str_str_set(self.item_modules, method.name, self.current_module);
             mi = mi + 1;
         }
         // Merge into existing method map or create new
@@ -1091,7 +1096,7 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
                 var existing_val: Vec<MethodMapEntry> = self.methods.get(mi2).val;
                 var ni: i64 = 0;
                 while ni < new_methods.len() {
-                    method_map_set_entry(&mut existing_val, new_methods.get(ni).key, new_methods.get(ni).val);
+                    method_map_set_entry(existing_val, new_methods.get(ni).key, new_methods.get(ni).val);
                     ni = ni + 1;
                 }
                 var m_entry: StringMethodMap = self.methods.get(mi2);
@@ -1168,7 +1173,7 @@ pub fn TypeChecker_register_trait_impls(self: &mut TypeChecker, program: Program
                 var existing_val: Vec<MethodMapEntry> = self.methods.get(mi2).val;
                 var ni: i64 = 0;
                 while ni < new_methods.len() {
-                    method_map_set_entry(&mut existing_val, new_methods.get(ni).key, new_methods.get(ni).val);
+                    method_map_set_entry(existing_val, new_methods.get(ni).key, new_methods.get(ni).val);
                     ni = ni + 1;
                 }
                 var m_entry: StringMethodMap = self.methods.get(mi2);
@@ -1500,7 +1505,7 @@ pub fn TypeChecker_compute_func_effects(self: &mut TypeChecker, program: Program
             pi = pi + 1;
         }
         var effects: Vec<str> = Vec::new();
-        TypeChecker_scan_stmts_for_effects(self, func.body, &mut effects);
+        TypeChecker_scan_stmts_for_effects(self, func.body, effects);
         // Add conservative effects from function-typed params.
         pi = 0;
         while pi < func.params.len() {
@@ -1543,7 +1548,7 @@ pub fn TypeChecker_compute_func_effects(self: &mut TypeChecker, program: Program
                 pi = pi + 1;
             }
             var effects: Vec<str> = Vec::new();
-            TypeChecker_scan_stmts_for_effects(self, method.body, &mut effects);
+            TypeChecker_scan_stmts_for_effects(self, method.body, effects);
             pi = 0;
             while pi < method.params.len() {
                 var param: Param = method.params.get(pi);
@@ -1582,7 +1587,7 @@ pub fn TypeChecker_compute_func_effects(self: &mut TypeChecker, program: Program
             match body_opt {
                 OptStmtList::Some(body) => {
                     var new_effects: Vec<str> = Vec::new();
-                    TypeChecker_scan_stmts_for_effects(self, body, &mut new_effects);
+                    TypeChecker_scan_stmts_for_effects(self, body, new_effects);
                     // Check if new_effects has any effect not already in func_effects for this name
                     var existing: Vec<str> = TypeChecker_get_func_effects(self, fname);
                     var has_new: bool = false;
@@ -1612,7 +1617,7 @@ pub fn TypeChecker_find_body(self: &mut TypeChecker, program: Program, name: str
     var fi: i64 = 0;
     while fi < program.funcs.len() {
         var func: Func = program.funcs.get(fi);
-        if str_equal(func.name, name) {
+        if func.name == name {
             return OptStmtList::Some(func.body);
         }
         fi = fi + 1;
@@ -1623,7 +1628,7 @@ pub fn TypeChecker_find_body(self: &mut TypeChecker, program: Program, name: str
         var mi: i64 = 0;
         while mi < imp.methods.len() {
             var method: Func = imp.methods.get(mi);
-            if str_equal(method.name, name) {
+            if method.name == name {
                 return OptStmtList::Some(method.body);
             }
             mi = mi + 1;
@@ -1715,7 +1720,7 @@ pub fn TypeChecker_verify_conserve(self: &mut TypeChecker, program: Program) {
         var is_conserve: bool = false;
         var ai: i64 = 0;
         while ai < func.annotations.len() {
-            if str_equal(func.annotations.get(ai).name, "conserve") { is_conserve = true; }
+            if func.annotations.get(ai).name == "conserve" { is_conserve = true; }
             ai = ai + 1;
         }
         if is_conserve {
@@ -1723,7 +1728,7 @@ pub fn TypeChecker_verify_conserve(self: &mut TypeChecker, program: Program) {
             var ei: i64 = 0;
             while ei < effects.len() {
                 var eff: str = effects.get(ei);
-                if str_equal(eff, "IO") || str_equal(eff, "Net") || str_equal(eff, "Spawn") || str_equal(eff, "Diverge") {
+                if eff == "IO" || eff == "Net" || eff == "Spawn" || eff == "Diverge" {
                     self.errors.push("Conservation error: function '" + func.name + "' is @conserve but has effect '!" + eff + "'");
                 }
                 ei = ei + 1;
@@ -1740,7 +1745,7 @@ pub fn TypeChecker_verify_conserve(self: &mut TypeChecker, program: Program) {
             var is_conserve: bool = false;
             var ai: i64 = 0;
             while ai < method.annotations.len() {
-                if str_equal(method.annotations.get(ai).name, "conserve") { is_conserve = true; }
+                if method.annotations.get(ai).name == "conserve" { is_conserve = true; }
                 ai = ai + 1;
             }
             if is_conserve {
@@ -1749,7 +1754,7 @@ pub fn TypeChecker_verify_conserve(self: &mut TypeChecker, program: Program) {
                 var ei: i64 = 0;
                 while ei < effects.len() {
                     var eff: str = effects.get(ei);
-                    if str_equal(eff, "IO") || str_equal(eff, "Net") || str_equal(eff, "Spawn") || str_equal(eff, "Diverge") {
+                    if eff == "IO" || eff == "Net" || eff == "Spawn" || eff == "Diverge" {
                         self.errors.push("Conservation error: method '" + qname + "' is @conserve but has effect '!" + eff + "'");
                     }
                     ei = ei + 1;
@@ -1770,7 +1775,7 @@ pub fn TypeChecker_verify_gas(self: &mut TypeChecker, program: Program) {
         var ai: i64 = 0;
         while ai < func.annotations.len() {
             var ann: Annotation = func.annotations.get(ai);
-            if str_equal(ann.name, "gas") {
+            if ann.name == "gas" {
                 if ann.args.len() == 0 {
                     self.errors.push("Gas error: function '" + func.name + "' has @gas but no gas limit argument");
                 } else {
@@ -1876,7 +1881,7 @@ pub fn TypeChecker_verify_safety_annotations(self: &mut TypeChecker, program: Pr
     while cgi < func_names.len() {
         var body: Vec<Stmt> = func_bodies.get(cgi);
         var calls: Vec<str> = Vec::new();
-        scan_stmts_for_calls(body, &mut calls);
+        scan_stmts_for_calls(body, calls);
         cg_names.push(func_names.get(cgi));
         cg_offsets.push(cg_calls.len());
         var cli: i64 = 0;
@@ -1908,7 +1913,7 @@ fn is_in_call_cycle_fd(target: str, cg_names: Vec<str>, cg_calls: Vec<str>, cg_o
     var target_idx: i64 = -1;
     var ni: i64 = 0;
     while ni < cg_names.len() {
-        if str_equal(cg_names.get(ni), target) { target_idx = ni; }
+        if cg_names.get(ni) == target { target_idx = ni; }
         ni = ni + 1;
     }
     if target_idx < 0 { return false; }
@@ -1923,10 +1928,10 @@ fn is_in_call_cycle_fd(target: str, cg_names: Vec<str>, cg_calls: Vec<str>, cg_o
     var ci: i64 = start;
     while ci < end {
         var callee: str = cg_calls.get(ci);
-        if !str_equal(callee, target) {
+        if callee != target {
             // DFS from callee to target
             var visited: Vec<str> = Vec::new();
-            if dfs_reaches_fd(callee, target, cg_names, cg_calls, cg_offsets, &mut visited) {
+            if dfs_reaches_fd(callee, target, cg_names, cg_calls, cg_offsets, visited) {
                 return true;
             }
         }
@@ -1935,12 +1940,12 @@ fn is_in_call_cycle_fd(target: str, cg_names: Vec<str>, cg_calls: Vec<str>, cg_o
     return false;
 }
 
-fn dfs_reaches_fd(node: str, target: str, cg_names: Vec<str>, cg_calls: Vec<str>, cg_offsets: Vec<i64>, visited: &mut Vec<str>) -> bool {
-    if str_equal(node, target) { return true; }
+fn dfs_reaches_fd(node: str, target: str, cg_names: Vec<str>, cg_calls: Vec<str>, cg_offsets: Vec<i64>, visited: Vec<str>) -> bool {
+    if node == target { return true; }
     // Check visited
     var vi: i64 = 0;
     while vi < visited.len() {
-        if str_equal(visited.get(vi), node) { return false; }
+        if visited.get(vi) == node { return false; }
         vi = vi + 1;
     }
     visited.push(node);
@@ -1948,7 +1953,7 @@ fn dfs_reaches_fd(node: str, target: str, cg_names: Vec<str>, cg_calls: Vec<str>
     var node_idx: i64 = -1;
     var ni: i64 = 0;
     while ni < cg_names.len() {
-        if str_equal(cg_names.get(ni), node) { node_idx = ni; }
+        if cg_names.get(ni) == node { node_idx = ni; }
         ni = ni + 1;
     }
     if node_idx < 0 { return false; }
@@ -1981,14 +1986,14 @@ pub fn expand_safety_primitives(annotations: Vec<Annotation>) -> Vec<str> {
         var ann: Annotation = annotations.get(ai);
         var name: str = ann.name;
         // Direct primitives
-        if str_equal(name, "no-alloc") { prims.push("no-alloc"); }
-        if str_equal(name, "no-recursion") { prims.push("no-recursion"); }
-        if str_equal(name, "no-unbounded") { prims.push("no-unbounded"); }
-        if str_equal(name, "no-indirect") { prims.push("no-indirect"); }
-        if str_equal(name, "requires-audit") { prims.push("requires-audit"); }
-        if str_equal(name, "bounded-stack") { prims.push("bounded-stack"); }
+        if name == "no-alloc" { prims.push("no-alloc"); }
+        if name == "no-recursion" { prims.push("no-recursion"); }
+        if name == "no-unbounded" { prims.push("no-unbounded"); }
+        if name == "no-indirect" { prims.push("no-indirect"); }
+        if name == "requires-audit" { prims.push("requires-audit"); }
+        if name == "bounded-stack" { prims.push("bounded-stack"); }
         // F30: @firmware — bare-metal firmware (no OS-dependent calls)
-        if str_equal(name, "firmware") { prims.push("firmware"); }
+        if name == "firmware" { prims.push("firmware"); }
         // F23: @simd — recognized but no safety primitives
         // F88: @zeroize — recognized but no safety primitives
         // F29: @interrupt — recognized but no safety primitives
@@ -1996,25 +2001,25 @@ pub fn expand_safety_primitives(annotations: Vec<Annotation>) -> Vec<str> {
         // @shader/@kernel — GPU shader entry point (handled in lowerer as is_kernel)
         // (These are recognized so the typechecker doesn't reject them as unknown)
         // Domain presets — expand to their primitives
-        if str_equal(name, "crashfree") {
+        if name == "crashfree" {
             prims.push("no-panic");
             prims.push("no-unbounded");
         }
-        if str_equal(name, "medical") {
+        if name == "medical" {
             prims.push("no-alloc");
             prims.push("no-recursion");
             prims.push("no-unbounded");
             prims.push("no-panic");
             prims.push("requires-audit");
         }
-        if str_equal(name, "safety-critical") {
+        if name == "safety-critical" {
             prims.push("no-alloc");
             prims.push("no-recursion");
             prims.push("no-unbounded");
             prims.push("no-panic");
             prims.push("no-indirect");
         }
-        if str_equal(name, "autosar") {
+        if name == "autosar" {
             prims.push("no-alloc");
             prims.push("no-recursion");
             prims.push("no-unbounded");
@@ -2029,7 +2034,7 @@ pub fn expand_safety_primitives(annotations: Vec<Annotation>) -> Vec<str> {
 pub fn has_primitive(prims: Vec<str>, name: str) -> bool {
     var i: i64 = 0;
     while i < prims.len() {
-        if str_equal(prims.get(i), name) { return true; }
+        if prims.get(i) == name { return true; }
         i = i + 1;
     }
     return false;
@@ -2058,42 +2063,42 @@ pub fn safety_domain_label(prims: Vec<str>) -> str {
 // F30: Check if a function is OS-dependent (forbidden in @firmware code)
 pub fn is_os_dependent_func(name: str) -> bool {
     // File I/O
-    if str_equal(name, "p_file_read") { return true; }
-    if str_equal(name, "p_file_write") { return true; }
-    if str_equal(name, "p_file_append") { return true; }
-    if str_equal(name, "p_file_delete") { return true; }
-    if str_equal(name, "p_file_exists") { return true; }
-    if str_equal(name, "p_file_size") { return true; }
-    if str_equal(name, "p_file_write_bin") { return true; }
-    if str_equal(name, "p_file_write_vec") { return true; }
+    if name == "p_file_read" { return true; }
+    if name == "p_file_write" { return true; }
+    if name == "p_file_append" { return true; }
+    if name == "p_file_delete" { return true; }
+    if name == "p_file_exists" { return true; }
+    if name == "p_file_size" { return true; }
+    if name == "p_file_write_bin" { return true; }
+    if name == "p_file_write_vec" { return true; }
     // Sockets / networking
-    if str_equal(name, "p_socket_create") { return true; }
-    if str_equal(name, "p_socket_connect") { return true; }
-    if str_equal(name, "p_socket_send") { return true; }
-    if str_equal(name, "p_socket_recv") { return true; }
-    if str_equal(name, "p_socket_recv_str") { return true; }
-    if str_equal(name, "p_socket_close") { return true; }
-    if str_equal(name, "p_socket_listen") { return true; }
-    if str_equal(name, "p_socket_accept") { return true; }
+    if name == "p_socket_create" { return true; }
+    if name == "p_socket_connect" { return true; }
+    if name == "p_socket_send" { return true; }
+    if name == "p_socket_recv" { return true; }
+    if name == "p_socket_recv_str" { return true; }
+    if name == "p_socket_close" { return true; }
+    if name == "p_socket_listen" { return true; }
+    if name == "p_socket_accept" { return true; }
     // HTTP
-    if str_equal(name, "p_http_get") { return true; }
-    if str_equal(name, "p_http_post") { return true; }
-    if str_equal(name, "p_http_send_response") { return true; }
+    if name == "p_http_get" { return true; }
+    if name == "p_http_post" { return true; }
+    if name == "p_http_send_response" { return true; }
     // Threads / mutexes
-    if str_equal(name, "p_thread_create") { return true; }
-    if str_equal(name, "p_thread_join") { return true; }
-    if str_equal(name, "p_mutex_create") { return true; }
-    if str_equal(name, "p_mutex_lock") { return true; }
-    if str_equal(name, "p_mutex_unlock") { return true; }
+    if name == "p_thread_create" { return true; }
+    if name == "p_thread_join" { return true; }
+    if name == "p_mutex_create" { return true; }
+    if name == "p_mutex_lock" { return true; }
+    if name == "p_mutex_unlock" { return true; }
     // Environment / args
-    if str_equal(name, "p_env_get") { return true; }
-    if str_equal(name, "p_env_set") { return true; }
-    if str_equal(name, "p_args_count") { return true; }
-    if str_equal(name, "p_args_get") { return true; }
+    if name == "p_env_get" { return true; }
+    if name == "p_env_set" { return true; }
+    if name == "p_args_count" { return true; }
+    if name == "p_args_get" { return true; }
     // SQLite
-    if str_equal(name, "p_sqlite_open") { return true; }
-    if str_equal(name, "p_sqlite_exec") { return true; }
-    if str_equal(name, "p_sqlite_query") { return true; }
+    if name == "p_sqlite_open" { return true; }
+    if name == "p_sqlite_exec" { return true; }
+    if name == "p_sqlite_query" { return true; }
     return false;
 }
 
@@ -2114,7 +2119,7 @@ pub fn check_safety_body(
         var has_audit: bool = false;
         var ai: i64 = 0;
         while ai < anns.len() {
-            if str_equal(anns.get(ai).name, "audit") { has_audit = true; ai = anns.len(); }
+            if anns.get(ai).name == "audit" { has_audit = true; ai = anns.len(); }
             ai = ai + 1;
         }
         if !has_audit {
@@ -2124,7 +2129,7 @@ pub fn check_safety_body(
 
     // Collect all calls in the body
     var calls: Vec<str> = Vec::new();
-    scan_stmts_for_calls(body, &mut calls);
+    scan_stmts_for_calls(body, calls);
 
     // Alloc functions (forbidden by @no-alloc)
     var alloc_funcs: Vec<str> = Vec::new();
@@ -2157,7 +2162,7 @@ pub fn check_safety_body(
                 continue;
             }
         }
-        if str_equal(called, "print") || str_equal(called, "println") || str_equal(called, "print_str") || str_equal(called, "print_nl") || str_equal(called, "print_int") {
+        if called == "print" || called == "println" || called == "print_str" || called == "print_nl" || called == "print_int" {
             ci = ci + 1;
             continue;
         }
@@ -2178,7 +2183,7 @@ pub fn check_safety_body(
                 ci = ci + 1;
                 continue;
             }
-            if str_equal(called, "unwrap") {
+            if called == "unwrap" {
                 errs.push("Safety error (" + label + "): function '" + func_name + "' calls 'unwrap'.\n    unwrap() panics on None/Err — crashfree functions must never panic.\n    Fix: use match, unwrap_or, or the ? operator instead.");
                 ci = ci + 1;
                 continue;
@@ -2204,7 +2209,7 @@ pub fn check_safety_body(
         }
 
         // @no-recursion: check for direct self-call
-        if has_primitive(prims, "no-recursion") && str_equal(called, func_name) {
+        if has_primitive(prims, "no-recursion") && called == func_name {
             errs.push("Safety error (" + label + "): function '" + func_name + "' is @no-recursion but calls itself.\n    Recursion is forbidden — stack overflow is a safety risk.\n    Fix: convert to an iterative loop, or remove the safety annotation.");
             ci = ci + 1;
             continue;
@@ -2216,7 +2221,7 @@ pub fn check_safety_body(
         var callee_prims: Vec<str> = Vec::new();
         var fi: i64 = 0;
         while fi < all_func_names.len() {
-            if str_equal(all_func_names.get(fi), called) {
+            if all_func_names.get(fi) == called {
                 is_known_func = true;
                 callee_prims = all_func_prims.get(fi);
                 fi = all_func_names.len();
@@ -2249,7 +2254,7 @@ pub fn check_safety_body(
     // @no-panic: check for division/modulo (division by zero risk)
     if has_primitive(prims, "no-panic") {
         var div_sites: Vec<str> = Vec::new();
-        scan_for_division(body, &mut div_sites);
+        scan_for_division(body, div_sites);
         var di: i64 = 0;
         while di < div_sites.len() {
             errs.push("Safety error (" + label + "): function '" + func_name + "' uses '" + div_sites.get(di) + "'.\n    Division/modulo by zero aborts at runtime.\n    Crashfree functions cannot use '" + div_sites.get(di) + "' unless the divisor is proven non-zero.\n    Fix: use a checked-divide helper, or remove the safety annotation.");
@@ -2260,7 +2265,7 @@ pub fn check_safety_body(
     // @no-unbounded: check for while loops
     if has_primitive(prims, "no-unbounded") {
         var while_sites: Vec<i64> = Vec::new();
-        scan_for_while_loops(body, &mut while_sites);
+        scan_for_while_loops(body, while_sites);
         var wi: i64 = 0;
         while wi < while_sites.len() {
             errs.push("Safety error (" + label + ") (line " + int_to_str(while_sites.get(wi)) + "): function '" + func_name + "' is @no-unbounded but uses a 'while' loop.\n    While loops are unbounded — use 'for' loops over finite ranges/arrays.\n    Fix: replace 'while cond { ... }' with 'for i in 0..N { ... }', or remove the safety annotation.");
@@ -2275,7 +2280,7 @@ pub fn check_safety_body(
 pub fn tc_vec_contains_str(v: Vec<str>, s: str) -> bool {
     var i: i64 = 0;
     while i < v.len() {
-        if str_equal(v.get(i), s) { return true; }
+        if v.get(i) == s { return true; }
         i = i + 1;
     }
     return false;
@@ -2288,7 +2293,7 @@ pub fn tc_str_starts_with(s: str, prefix: str) -> bool {
 
 // --- Call scanning helpers ---
 
-pub fn scan_stmts_for_calls(stmts: Vec<Stmt>, calls: &mut Vec<str>) {
+pub fn scan_stmts_for_calls(stmts: Vec<Stmt>, calls: Vec<str>) {
     var i: i64 = 0;
     while i < stmts.len() {
         scan_stmt_for_calls(stmts.get(i), calls);
@@ -2296,7 +2301,7 @@ pub fn scan_stmts_for_calls(stmts: Vec<Stmt>, calls: &mut Vec<str>) {
     }
 }
 
-pub fn scan_stmt_for_calls(stmt: Stmt, calls: &mut Vec<str>) {
+pub fn scan_stmt_for_calls(stmt: Stmt, calls: Vec<str>) {
     match stmt {
         Stmt::Let(_, _, expr, _, _, _, _) => { scan_expr_for_calls(expr, calls); }
         Stmt::LetTuple(_, expr, _) => { scan_expr_for_calls(expr, calls); }
@@ -2378,7 +2383,7 @@ pub fn scan_stmt_for_calls(stmt: Stmt, calls: &mut Vec<str>) {
     }
 }
 
-pub fn scan_expr_for_calls(expr: Expr, calls: &mut Vec<str>) {
+pub fn scan_expr_for_calls(expr: Expr, calls: Vec<str>) {
     match expr {
         Expr::Call(callee, args) => {
             calls.push(callee);
@@ -2457,7 +2462,7 @@ pub fn scan_expr_for_calls(expr: Expr, calls: &mut Vec<str>) {
             scan_expr_for_calls(box_expr_unbox(start), calls);
             scan_expr_for_calls(box_expr_unbox(end), calls);
         }
-        Expr::Match(expr, arms, _) => {
+        Expr::Match(expr, arms) => {
             scan_expr_for_calls(box_expr_unbox(expr), calls);
             var ai: i64 = 0;
             while ai < arms.len() {
@@ -2481,7 +2486,7 @@ pub fn scan_expr_for_calls(expr: Expr, calls: &mut Vec<str>) {
 
 // --- Division scanning helpers ---
 
-pub fn scan_for_division(stmts: Vec<Stmt>, sites: &mut Vec<str>) {
+pub fn scan_for_division(stmts: Vec<Stmt>, sites: Vec<str>) {
     var i: i64 = 0;
     while i < stmts.len() {
         scan_stmt_for_division(stmts.get(i), sites);
@@ -2489,7 +2494,7 @@ pub fn scan_for_division(stmts: Vec<Stmt>, sites: &mut Vec<str>) {
     }
 }
 
-pub fn scan_stmt_for_division(stmt: Stmt, sites: &mut Vec<str>) {
+pub fn scan_stmt_for_division(stmt: Stmt, sites: Vec<str>) {
     match stmt {
         Stmt::Let(_, _, expr, _, _, _, _) => { scan_expr_for_division(expr, sites); }
         Stmt::LetTuple(_, expr, _) => { scan_expr_for_division(expr, sites); }
@@ -2558,7 +2563,7 @@ pub fn scan_stmt_for_division(stmt: Stmt, sites: &mut Vec<str>) {
     }
 }
 
-pub fn scan_stmts_for_division(stmts: Vec<Stmt>, sites: &mut Vec<str>) {
+pub fn scan_stmts_for_division(stmts: Vec<Stmt>, sites: Vec<str>) {
     var i: i64 = 0;
     while i < stmts.len() {
         scan_stmt_for_division(stmts.get(i), sites);
@@ -2566,7 +2571,7 @@ pub fn scan_stmts_for_division(stmts: Vec<Stmt>, sites: &mut Vec<str>) {
     }
 }
 
-pub fn scan_expr_for_division(expr: Expr, sites: &mut Vec<str>) {
+pub fn scan_expr_for_division(expr: Expr, sites: Vec<str>) {
     match expr {
         Expr::Binary(op, left, right) => {
             var is_div: bool = false;
@@ -2649,7 +2654,7 @@ pub fn scan_expr_for_division(expr: Expr, sites: &mut Vec<str>) {
             }
         }
         Expr::Block(stmts) => { scan_stmts_for_division(stmts, sites); }
-        Expr::Match(expr, arms, _) => {
+        Expr::Match(expr, arms) => {
             scan_expr_for_division(box_expr_unbox(expr), sites);
             var ai: i64 = 0;
             while ai < arms.len() {
@@ -2682,7 +2687,7 @@ pub fn scan_expr_for_division(expr: Expr, sites: &mut Vec<str>) {
 
 // --- While loop scanning helpers ---
 
-pub fn scan_for_while_loops(stmts: Vec<Stmt>, sites: &mut Vec<i64>) {
+pub fn scan_for_while_loops(stmts: Vec<Stmt>, sites: Vec<i64>) {
     var i: i64 = 0;
     while i < stmts.len() {
         scan_stmt_for_while(stmts.get(i), sites);
@@ -2690,7 +2695,7 @@ pub fn scan_for_while_loops(stmts: Vec<Stmt>, sites: &mut Vec<i64>) {
     }
 }
 
-pub fn scan_stmt_for_while(stmt: Stmt, sites: &mut Vec<i64>) {
+pub fn scan_stmt_for_while(stmt: Stmt, sites: Vec<i64>) {
     match stmt {
         Stmt::While(cond, body, line) => {
             sites.push(line);
@@ -2737,7 +2742,7 @@ pub fn scan_stmt_for_while(stmt: Stmt, sites: &mut Vec<i64>) {
     }
 }
 
-pub fn scan_stmts_for_while(stmts: Vec<Stmt>, sites: &mut Vec<i64>) {
+pub fn scan_stmts_for_while(stmts: Vec<Stmt>, sites: Vec<i64>) {
     var i: i64 = 0;
     while i < stmts.len() {
         scan_stmt_for_while(stmts.get(i), sites);
@@ -2745,7 +2750,7 @@ pub fn scan_stmts_for_while(stmts: Vec<Stmt>, sites: &mut Vec<i64>) {
     }
 }
 
-pub fn scan_expr_for_while(expr: Expr, sites: &mut Vec<i64>) {
+pub fn scan_expr_for_while(expr: Expr, sites: Vec<i64>) {
     match expr {
         Expr::Binary(_, left, right) => {
             scan_expr_for_while(box_expr_unbox(left), sites);
@@ -2782,7 +2787,7 @@ pub fn scan_expr_for_while(expr: Expr, sites: &mut Vec<i64>) {
             }
         }
         Expr::Block(stmts) => { scan_stmts_for_while(stmts, sites); }
-        Expr::Match(expr, arms, _) => {
+        Expr::Match(expr, arms) => {
             scan_expr_for_while(box_expr_unbox(expr), sites);
             var ai: i64 = 0;
             while ai < arms.len() {
@@ -2807,7 +2812,7 @@ pub fn TypeChecker_verify_constant_time(self: &mut TypeChecker, program: Program
         var is_ct: bool = false;
         var ai: i64 = 0;
         while ai < func.annotations.len() {
-            if str_equal(func.annotations.get(ai).name, "constant_time") { is_ct = true; }
+            if func.annotations.get(ai).name == "constant_time" { is_ct = true; }
             ai = ai + 1;
         }
         if is_ct {
@@ -2815,7 +2820,7 @@ pub fn TypeChecker_verify_constant_time(self: &mut TypeChecker, program: Program
             var ei: i64 = 0;
             while ei < effects.len() {
                 var eff: str = effects.get(ei);
-                if str_equal(eff, "IO") || str_equal(eff, "Net") || str_equal(eff, "Spawn") || str_equal(eff, "Diverge") {
+                if eff == "IO" || eff == "Net" || eff == "Spawn" || eff == "Diverge" {
                     self.errors.push("Constant-time error: function '" + func.name + "' is @constant_time but has effect '!" + eff + "'");
                 }
                 ei = ei + 1;
@@ -2834,7 +2839,7 @@ pub fn TypeChecker_verify_realtime(self: &mut TypeChecker, program: Program) {
         var is_rt: bool = false;
         var ai: i64 = 0;
         while ai < func.annotations.len() {
-            if str_equal(func.annotations.get(ai).name, "realtime") { is_rt = true; }
+            if func.annotations.get(ai).name == "realtime" { is_rt = true; }
             ai = ai + 1;
         }
         if is_rt {
@@ -2842,7 +2847,7 @@ pub fn TypeChecker_verify_realtime(self: &mut TypeChecker, program: Program) {
             var ei: i64 = 0;
             while ei < effects.len() {
                 var eff: str = effects.get(ei);
-                if str_equal(eff, "IO") || str_equal(eff, "Net") || str_equal(eff, "Spawn") {
+                if eff == "IO" || eff == "Net" || eff == "Spawn" {
                     self.errors.push("Realtime error: function '" + func.name + "' is @realtime but has effect '!" + eff + "' which may block");
                 }
                 ei = ei + 1;
@@ -2861,7 +2866,7 @@ pub fn TypeChecker_verify_differentiable(self: &mut TypeChecker, program: Progra
         var is_diff: bool = false;
         var ai: i64 = 0;
         while ai < func.annotations.len() {
-            if str_equal(func.annotations.get(ai).name, "differentiable") { is_diff = true; }
+            if func.annotations.get(ai).name == "differentiable" { is_diff = true; }
             ai = ai + 1;
         }
         if is_diff {
@@ -2869,7 +2874,7 @@ pub fn TypeChecker_verify_differentiable(self: &mut TypeChecker, program: Progra
             var ei: i64 = 0;
             while ei < effects.len() {
                 var eff: str = effects.get(ei);
-                if str_equal(eff, "IO") || str_equal(eff, "Net") || str_equal(eff, "Spawn") || str_equal(eff, "Diverge") {
+                if eff == "IO" || eff == "Net" || eff == "Spawn" || eff == "Diverge" {
                     self.errors.push("Differentiability error: function '" + func.name + "' is @differentiable but has effect '!" + eff + "'");
                 }
                 ei = ei + 1;
@@ -2888,7 +2893,7 @@ pub fn TypeChecker_verify_quantized(self: &mut TypeChecker, program: Program) {
         var is_quant: bool = false;
         var ai: i64 = 0;
         while ai < func.annotations.len() {
-            if str_equal(func.annotations.get(ai).name, "quantized") { is_quant = true; }
+            if func.annotations.get(ai).name == "quantized" { is_quant = true; }
             ai = ai + 1;
         }
         if is_quant {
@@ -2896,7 +2901,7 @@ pub fn TypeChecker_verify_quantized(self: &mut TypeChecker, program: Program) {
             var ei: i64 = 0;
             while ei < effects.len() {
                 var eff: str = effects.get(ei);
-                if str_equal(eff, "IO") || str_equal(eff, "Net") || str_equal(eff, "Spawn") || str_equal(eff, "Diverge") {
+                if eff == "IO" || eff == "Net" || eff == "Spawn" || eff == "Diverge" {
                     self.errors.push("Quantization error: function '" + func.name + "' is @quantized but has effect '!" + eff + "'");
                 }
                 ei = ei + 1;
@@ -2917,8 +2922,8 @@ pub fn TypeChecker_verify_checkpoint(self: &mut TypeChecker, program: Program) {
         var ai: i64 = 0;
         while ai < func.annotations.len() {
             var ann_name: str = func.annotations.get(ai).name;
-            if str_equal(ann_name, "checkpoint") { is_checkpoint = true; }
-            if str_equal(ann_name, "differentiable") { is_differentiable = true; }
+            if ann_name == "checkpoint" { is_checkpoint = true; }
+            if ann_name == "differentiable" { is_differentiable = true; }
             ai = ai + 1;
         }
         if is_checkpoint && !is_differentiable {
@@ -2948,7 +2953,7 @@ pub fn TypeChecker_verify_dp(self: &mut TypeChecker, program: Program) {
         var ai: i64 = 0;
         while ai < func.annotations.len() {
             var ann: Annotation = func.annotations.get(ai);
-            if str_equal(ann.name, "dp") {
+            if ann.name == "dp" {
                 is_dp = true;
                 // Parse epsilon=N from args (simple parser — handles N.M format)
                 var argi: i64 = 0;
@@ -2973,7 +2978,7 @@ pub fn TypeChecker_verify_dp(self: &mut TypeChecker, program: Program) {
         }
         // Build call graph entry for this function
         var calls: Vec<str> = Vec::new();
-        scan_stmts_for_calls(func.body, &mut calls);
+        scan_stmts_for_calls(func.body, calls);
         dp_call_names.push(func.name);
         dp_call_offsets.push(dp_call_flat.len());
         var ci: i64 = 0;
@@ -2988,7 +2993,7 @@ pub fn TypeChecker_verify_dp(self: &mut TypeChecker, program: Program) {
             var ei: i64 = 0;
             while ei < effects.len() {
                 var eff: str = effects.get(ei);
-                if str_equal(eff, "IO") || str_equal(eff, "Net") || str_equal(eff, "Spawn") || str_equal(eff, "Diverge") {
+                if eff == "IO" || eff == "Net" || eff == "Spawn" || eff == "Diverge" {
                     self.errors.push("DP error: function '" + func.name + "' is @dp but has effect '!" + eff + "'");
                 }
                 ei = ei + 1;
@@ -3005,7 +3010,7 @@ pub fn TypeChecker_verify_dp(self: &mut TypeChecker, program: Program) {
         var declared: f64 = dp_epsilons.get(nri);
         // DFS to sum epsilon of all @dp callees reachable from target
         var visited: Vec<str> = Vec::new();
-        var total: f64 = dp_compute_total_epsilon(target, dp_names, dp_epsilons, dp_call_names, dp_call_offsets, dp_call_flat, &mut visited);
+        var total: f64 = dp_compute_total_epsilon(target, dp_names, dp_epsilons, dp_call_names, dp_call_offsets, dp_call_flat, visited);
         if total > declared {
             self.errors.push("Differential privacy error: function '" + target + "' declares @dp(epsilon=" + float_to_str(declared) + ") but total epsilon across @dp callees is " + float_to_str(total));
         }
@@ -3051,11 +3056,11 @@ fn dp_parse_float(s: str) -> f64 {
 }
 
 // Compute total epsilon (own + transitive @dp callees) via DFS.
-fn dp_compute_total_epsilon(target: str, dp_names: Vec<str>, dp_epsilons: Vec<f64>, cg_names: Vec<str>, cg_offsets: Vec<i64>, cg_calls: Vec<str>, visited: &mut Vec<str>) -> f64 {
+fn dp_compute_total_epsilon(target: str, dp_names: Vec<str>, dp_epsilons: Vec<f64>, cg_names: Vec<str>, cg_offsets: Vec<i64>, cg_calls: Vec<str>, visited: Vec<str>) -> f64 {
     // Check if already visited (cycle)
     var vi: i64 = 0;
     while vi < visited.len() {
-        if str_equal(visited.get(vi), target) { return 0.0; }
+        if visited.get(vi) == target { return 0.0; }
         vi = vi + 1;
     }
     visited.push(target);
@@ -3065,7 +3070,7 @@ fn dp_compute_total_epsilon(target: str, dp_names: Vec<str>, dp_epsilons: Vec<f6
     var found: bool = false;
     var ni: i64 = 0;
     while ni < dp_names.len() {
-        if str_equal(dp_names.get(ni), target) {
+        if dp_names.get(ni) == target {
             own = dp_epsilons.get(ni);
             found = true;
             ni = dp_names.len();
@@ -3077,7 +3082,7 @@ fn dp_compute_total_epsilon(target: str, dp_names: Vec<str>, dp_epsilons: Vec<f6
     var target_idx: i64 = -1;
     ni = 0;
     while ni < cg_names.len() {
-        if str_equal(cg_names.get(ni), target) { target_idx = ni; }
+        if cg_names.get(ni) == target { target_idx = ni; }
         ni = ni + 1;
     }
     if target_idx < 0 { return own; }
@@ -3098,7 +3103,7 @@ fn dp_compute_total_epsilon(target: str, dp_names: Vec<str>, dp_epsilons: Vec<f6
         var is_dp: bool = false;
         ni = 0;
         while ni < dp_names.len() {
-            if str_equal(dp_names.get(ni), callee) { is_dp = true; }
+            if dp_names.get(ni) == callee { is_dp = true; }
             ni = ni + 1;
         }
         if is_dp {
@@ -3119,7 +3124,7 @@ pub fn TypeChecker_verify_shard(self: &mut TypeChecker, program: Program) {
         var is_shard: bool = false;
         var ai: i64 = 0;
         while ai < func.annotations.len() {
-            if str_equal(func.annotations.get(ai).name, "shard") { is_shard = true; }
+            if func.annotations.get(ai).name == "shard" { is_shard = true; }
             ai = ai + 1;
         }
         if is_shard {
@@ -3127,7 +3132,7 @@ pub fn TypeChecker_verify_shard(self: &mut TypeChecker, program: Program) {
             var ei: i64 = 0;
             while ei < effects.len() {
                 var eff: str = effects.get(ei);
-                if str_equal(eff, "IO") || str_equal(eff, "Net") || str_equal(eff, "Spawn") || str_equal(eff, "Diverge") {
+                if eff == "IO" || eff == "Net" || eff == "Spawn" || eff == "Diverge" {
                     self.errors.push("Shard error: function '" + func.name + "' is @shard but has effect '!" + eff + "'");
                 }
                 ei = ei + 1;
@@ -3146,7 +3151,7 @@ pub fn TypeChecker_verify_adapter(self: &mut TypeChecker, program: Program) {
         var is_adapter: bool = false;
         var ai: i64 = 0;
         while ai < func.annotations.len() {
-            if str_equal(func.annotations.get(ai).name, "adapter") { is_adapter = true; }
+            if func.annotations.get(ai).name == "adapter" { is_adapter = true; }
             ai = ai + 1;
         }
         if is_adapter {
@@ -3167,7 +3172,7 @@ pub fn TypeChecker_verify_tainted(self: &mut TypeChecker, program: Program) {
         var is_tainted: bool = false;
         var ai: i64 = 0;
         while ai < func.annotations.len() {
-            if str_equal(func.annotations.get(ai).name, "tainted") { is_tainted = true; }
+            if func.annotations.get(ai).name == "tainted" { is_tainted = true; }
             ai = ai + 1;
         }
         if is_tainted {
@@ -3175,7 +3180,7 @@ pub fn TypeChecker_verify_tainted(self: &mut TypeChecker, program: Program) {
             var ei: i64 = 0;
             while ei < effects.len() {
                 var eff: str = effects.get(ei);
-                if str_equal(eff, "IO") || str_equal(eff, "Net") {
+                if eff == "IO" || eff == "Net" {
                     self.errors.push("Taint error: function '" + func.name + "' is @tainted but has effect '!" + eff + "' which could leak tainted data");
                 }
                 ei = ei + 1;
@@ -3199,7 +3204,7 @@ pub fn TypeChecker_verify_secret(self: &mut TypeChecker, program: Program) {
             var param: Param = func.params.get(pi);
             var ai: i64 = 0;
             while ai < param.annotations.len() {
-                if str_equal(param.annotations.get(ai).name, "secret") {
+                if param.annotations.get(ai).name == "secret" {
                     has_secret = true;
                     secret_names.push(param.name);
                 }
@@ -3227,7 +3232,7 @@ pub fn TypeChecker_verify_secret(self: &mut TypeChecker, program: Program) {
                 var param: Param = method.params.get(pi2);
                 var ai: i64 = 0;
                 while ai < param.annotations.len() {
-                    if str_equal(param.annotations.get(ai).name, "secret") {
+                    if param.annotations.get(ai).name == "secret" {
                         has_secret = true;
                         secret_names.push(param.name);
                     }
@@ -3245,27 +3250,27 @@ pub fn TypeChecker_verify_secret(self: &mut TypeChecker, program: Program) {
 }
 
 fn is_output_sink(name: str) -> bool {
-    if str_equal(name, "print") { return true; }
-    if str_equal(name, "println") { return true; }
-    if str_equal(name, "eprint") { return true; }
-    if str_equal(name, "eprintln") { return true; }
-    if str_equal(name, "p_print_int") { return true; }
-    if str_equal(name, "p_print_str") { return true; }
-    if str_equal(name, "p_print_float") { return true; }
-    if str_equal(name, "p_print_bool") { return true; }
-    if str_equal(name, "p_print_newline") { return true; }
-    if str_equal(name, "p_eprint_str") { return true; }
-    if str_equal(name, "p_print_vec") { return true; }
-    if str_equal(name, "p_socket_send") { return true; }
-    if str_equal(name, "p_socket_send_str") { return true; }
-    if str_equal(name, "p_http_send_response") { return true; }
-    if str_equal(name, "p_file_write") { return true; }
-    if str_equal(name, "p_file_append") { return true; }
-    if str_equal(name, "p_file_write_bin") { return true; }
-    if str_equal(name, "log_info") { return true; }
-    if str_equal(name, "log_warn") { return true; }
-    if str_equal(name, "log_error") { return true; }
-    if str_equal(name, "log_debug") { return true; }
+    if name == "print" { return true; }
+    if name == "println" { return true; }
+    if name == "eprint" { return true; }
+    if name == "eprintln" { return true; }
+    if name == "p_print_int" { return true; }
+    if name == "p_print_str" { return true; }
+    if name == "p_print_float" { return true; }
+    if name == "p_print_bool" { return true; }
+    if name == "p_print_newline" { return true; }
+    if name == "p_eprint_str" { return true; }
+    if name == "p_print_vec" { return true; }
+    if name == "p_socket_send" { return true; }
+    if name == "p_socket_send_str" { return true; }
+    if name == "p_http_send_response" { return true; }
+    if name == "p_file_write" { return true; }
+    if name == "p_file_append" { return true; }
+    if name == "p_file_write_bin" { return true; }
+    if name == "log_info" { return true; }
+    if name == "log_warn" { return true; }
+    if name == "log_error" { return true; }
+    if name == "log_debug" { return true; }
     return false;
 }
 
@@ -3343,7 +3348,7 @@ fn expr_contains_secret(expr: Expr, secret_names: Vec<str>) -> bool {
         Expr::Ident(name) => {
             var si: i64 = 0;
             while si < secret_names.len() {
-                if str_equal(secret_names.get(si), name) { return true; }
+                if secret_names.get(si) == name { return true; }
                 si = si + 1;
             }
             return false;
@@ -3403,7 +3408,7 @@ pub fn TypeChecker_verify_allocator_params(self: &mut TypeChecker, program: Prog
         var ai: i64 = 0;
         while ai < func.annotations.len() {
             var ann: Annotation = func.annotations.get(ai);
-            if str_equal(ann.name, "allocator") {
+            if ann.name == "allocator" {
                 // @allocator requires at least one arg (the allocator name or type)
                 if ann.args.len() == 0 {
                     self.errors.push("Allocator error: function '" + func.name + "' has @allocator but no allocator parameter specified");
@@ -3421,6 +3426,24 @@ pub fn TypeChecker_check_func(self: &mut TypeChecker, func: Func) {
     self.current_func_name = OptString::Some(func.name);
     var empty_ret: Vec<Type> = Vec::new();
     self.current_return_types = empty_ret;
+    var saved_ret_ty: OptType = self.current_ret_ty;
+    self.current_ret_ty = OptType::None;
+    match func.ret_ty {
+        Type::Infer => {}
+        _ => {
+            var declared_ret: Type = TypeChecker_resolve_self_type(self, func.ret_ty);
+            // async fn: the body returns T for a declared Future<T>
+            if func.is_async {
+                match declared_ret {
+                    Type::Generic(gname, gargs) => {
+                        if gname == "Future" && gargs.len() == 1 { declared_ret = gargs.get(0); }
+                    }
+                    _ => {}
+                }
+            }
+            self.current_ret_ty = OptType::Some(declared_ret);
+        }
+    }
     // Set current_module to the module where this function was defined
     var saved_module: str = self.current_module;
     var mangled: str = "";
@@ -3520,9 +3543,95 @@ pub fn TypeChecker_check_func(self: &mut TypeChecker, func: Func) {
     self.current_type_params = saved_tp;
     self.current_type_param_bounds = saved_bounds;
     TypeChecker_pop_scope(self);
+    // A function declared to return a value must not fall off the end of its
+    // body (mirrors src/typechecker.rs).
+    match self.current_ret_ty {
+        OptType::Some(declared) => {
+            var returns_value: bool = true;
+            match declared {
+                Type::Void => { returns_value = false; }
+                Type::Never => { returns_value = false; }
+                Type::Infer => { returns_value = false; }
+                _ => {}
+            }
+            if returns_value && func.name != "main" && !stmts_always_leave(func.body) {
+                self.errors.push("Type error: '" + func.name + "' is declared to return " + type_to_str(declared) + " but can reach the end of its body without returning");
+            }
+        }
+        OptType::None => {}
+    }
     self.consumed_vars = saved_consumed;
     self.current_module = saved_module;
+    self.current_ret_ty = saved_ret_ty;
     self.current_func_name = OptString::None;
+}
+
+// Whether control can never reach the end of `stmts`: it ends in `return`, a
+// trailing expression (the block's value), an if/else or match whose branches
+// all leave, an infinite loop without `break`, or a block that always leaves.
+pub fn stmts_always_leave(stmts: Vec<Stmt>) -> bool {
+    if stmts.len() == 0 { return false; }
+    match stmts.get(stmts.len() - 1) {
+        Stmt::Return(_, _) => { return true; }
+        Stmt::Expr(_, _) => { return true; }
+        Stmt::If(_, then_block, else_block, _) => {
+            match else_block {
+                OptStmts::Some(eb) => { return stmts_always_leave(then_block) && stmts_always_leave(eb); }
+                OptStmts::None => { return false; }
+            }
+        }
+        Stmt::Match(_, arms, _) => {
+            if arms.len() == 0 { return false; }
+            var ai: i64 = 0;
+            while ai < arms.len() {
+                if !stmts_always_leave(arms.get(ai).body) { return false; }
+                ai = ai + 1;
+            }
+            return true;
+        }
+        Stmt::Loop(body, _) => { return !stmts_have_break(body); }
+        Stmt::While(cond, body, _) => {
+            match cond {
+                Expr::BoolLit(b) => { return b && !stmts_have_break(body); }
+                _ => { return false; }
+            }
+        }
+        Stmt::Unsafe(body, _) => { return stmts_always_leave(body); }
+        Stmt::Sandbox(body, _) => { return stmts_always_leave(body); }
+        Stmt::Txn(body, _) => { return stmts_always_leave(body); }
+        Stmt::Handle(body, _, _) => { return stmts_always_leave(body); }
+        Stmt::RegionBlock(_, _, _, _, _, body, _) => { return stmts_always_leave(body); }
+        _ => { return false; }
+    }
+    return false;
+}
+
+// A `break` that exits the loop whose body is `stmts` (breaks inside nested
+// loops belong to those loops).
+pub fn stmts_have_break(stmts: Vec<Stmt>) -> bool {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        match stmts.get(i) {
+            Stmt::Break(_, _) => { return true; }
+            Stmt::If(_, then_block, else_block, _) => {
+                if stmts_have_break(then_block) { return true; }
+                match else_block {
+                    OptStmts::Some(eb) => { if stmts_have_break(eb) { return true; } }
+                    OptStmts::None => {}
+                }
+            }
+            Stmt::Match(_, arms, _) => {
+                var ai: i64 = 0;
+                while ai < arms.len() {
+                    if stmts_have_break(arms.get(ai).body) { return true; }
+                    ai = ai + 1;
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    return false;
 }
 
 // --- Scope operations ----------------------------------------------------
@@ -3747,7 +3856,7 @@ pub fn TypeChecker_resolve_struct_name(self: &TypeChecker, name: str) -> str {
     match TypeChecker_lookup_alias_cache(self, name) {
         OptType::Some(alias) => {
             match alias {
-                Type::Named(inner) => { return TypeChecker_resolve_struct_name(self, box_type_unbox(inner)); }
+                Type::Named(inner) => { return TypeChecker_resolve_struct_name(self, inner); }
                 _ => { return name; }
             }
             return name;
@@ -3899,7 +4008,7 @@ pub fn type_eq(a: Type, b: Type) -> bool {
         Type::Infer => { match b { Type::Infer => { return true; }, _ => { return false; } } }
         Type::Named(n1) => {
             match b {
-                Type::Named(n2) => { return str_equal(n1, n2); }
+                Type::Named(n2) => { return n1 == n2; }
                 _ => { return false; }
             }
             return false;
@@ -3907,7 +4016,7 @@ pub fn type_eq(a: Type, b: Type) -> bool {
         Type::Generic(n1, a1) => {
             match b {
                 Type::Generic(n2, a2) => {
-                    if !str_equal(n1, n2) { return false; }
+                    if n1 != n2 { return false; }
                     if a1.len() != a2.len() { return false; }
                     var i: i64 = 0;
                     while i < a1.len() {
@@ -3992,7 +4101,7 @@ pub fn type_eq(a: Type, b: Type) -> bool {
         }
         Type::Dyn(n1) => {
             match b {
-                Type::Dyn(n2) => { return str_equal(n1, n2); }
+                Type::Dyn(n2) => { return n1 == n2; }
                 _ => { return false; }
             }
             return false;
@@ -4000,9 +4109,9 @@ pub fn type_eq(a: Type, b: Type) -> bool {
         Type::Assoc(t1, n1, f1, a1) => {
             match b {
                 Type::Assoc(t2, n2, f2, a2) => {
-                    if !str_equal(t1, t2) { return false; }
-                    if !str_equal(n1, n2) { return false; }
-                    if !str_equal(f1, f2) { return false; }
+                    if t1 != t2 { return false; }
+                    if n1 != n2 { return false; }
+                    if f1 != f2 { return false; }
                     if a1.len() != a2.len() { return false; }
                     var i: i64 = 0;
                     while i < a1.len() {
@@ -4580,7 +4689,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             var final_ty: Type = expr_ty;
             match ty {
                 OptType::Some(declared) => {
-                    if !TypeChecker_types_compatible(self, declared, expr_ty) {
+                    if !TypeChecker_types_compatible(self, declared, expr_ty) && !(is_runtime_layer(self.current_module) && is_handle_int_pair(declared, expr_ty)) {
                         self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign " + type_to_str(expr_ty) + " to variable '" + name + "' of type " + type_to_str(declared));
                     }
                     final_ty = declared;
@@ -4597,15 +4706,15 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             } else {
                 if self.val_vars_per_scope.len() > 0 {
                     var scope: Vec<str> = self.val_vars_per_scope.pop();
-                    str_vec_remove(&mut scope, name);
+                    str_vec_remove(scope, name);
                     self.val_vars_per_scope.push(scope);
                 }
             }
             // Track region: if inside a region block, record the allocation region
             if self.region_stack.len() > 0 {
                 var region: str = self.region_stack.get(self.region_stack.len() - 1);
-                map_str_str_set(&mut self.var_regions, name, region);
-                map_str_str_set(&mut self.var_alloc_lines, name, int_to_str(line));
+                map_str_str_set(self.var_regions, name, region);
+                map_str_str_set(self.var_alloc_lines, name, int_to_str(line));
                 var size: i64 = TypeChecker_type_size(self, final_ty);
                 if self.region_budgets.len() > 0 {
                     var budget: RegionBudget = self.region_budgets.pop();
@@ -4671,9 +4780,11 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                 OptBoxExpr::Some(e) => {
                     var ret_ty: Type = TypeChecker_check_expr(self, box_expr_unbox(e));
                     TypeChecker_consume_linear_in_expr(self, box_expr_unbox(e), self.current_line);
+                    TypeChecker_check_return_type(self, ret_ty);
                     self.current_return_types.push(ret_ty);
                 }
                 OptBoxExpr::None => {
+                    TypeChecker_check_return_type(self, Type::Void);
                     self.current_return_types.push(Type::Void);
                 }
             }
@@ -4788,8 +4899,8 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             // Unwrap references
             var effective_ty: Type = obj_ty;
             match obj_ty {
-                Type::Ref(inner, _) => { effective_ty = box_type_unbox(inner); }
-                _ => { effective_ty = obj_ty; }
+                Type::Ref(inner, _) => { effective_ty = unbox_ty(box_type_unbox(inner)); }
+                _ => { effective_ty = unbox_ty(obj_ty); }
             }
             match effective_ty {
                 Type::Named(name) => {
@@ -4904,7 +5015,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             TypeChecker_pop_scope(self);
         }
         Stmt::Match(expr, arms, _) => {
-            var match_ty: Type = TypeChecker_check_expr(self, expr);
+            var match_ty: Type = unbox_ty(TypeChecker_check_expr(self, expr));
             var ai: i64 = 0;
             while ai < arms.len() {
                 var arm: MatchArm = arms.get(ai);
@@ -4915,6 +5026,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                         TypeChecker_declare(self, name, match_ty);
                     }
                     Pattern::EnumVariant(enum_name, variant, bindings) => {
+                        TypeChecker_check_enum_pattern(self, match_ty, enum_name, variant, bindings);
                         var tys: Vec<Type> = TypeChecker_pattern_binding_types(self, match_ty, enum_name, variant, bindings);
                         var bi: i64 = 0;
                         while bi < bindings.len() && bi < tys.len() {
@@ -4979,7 +5091,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             self.region_stack.push(name);
             TypeChecker_push_scope(self);
             self.region_budgets.push(RegionBudget_new(name, budget, 0));
-            map_str_str_set(&mut self.region_lines, name, int_to_str(line));
+            map_str_str_set(self.region_lines, name, int_to_str(line));
             if is_gpu { self.gpu_region_depth = self.gpu_region_depth + 1; }
             if is_kv_cache {
                 match budget {
@@ -5158,7 +5270,7 @@ pub fn TypeChecker_collect_captured_vars(self: &TypeChecker, expr: Expr, capture
                     var i: i64 = 0;
                     while i < captured.len() {
                         var (cname, _cty) = captured.get(i);
-                        if str_equal(cname, name) { found = true; }
+                        if cname == name { found = true; }
                         i = i + 1;
                     }
                     if !found { captured.push((name, ty)); }
@@ -5456,6 +5568,22 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                     }
                 }
             }
+            // Locals shadow globals: a parameter or variable holding a function
+            // value wins over a global function of the same name.
+            match TypeChecker_lookup(self, callee) {
+                OptType::Some(local_ty) => {
+                    match TypeChecker_resolve_type(self, local_ty) {
+                        Type::Func(lparams, lret) => {
+                            if lparams.len() != arg_types.len() {
+                                self.errors.push("Type error: function variable '" + callee + "' expects " + int_to_str(lparams.len()) + " args, got " + int_to_str(arg_types.len()));
+                            }
+                            return box_type_unbox(lret);
+                        }
+                        _ => {}
+                    }
+                }
+                OptType::None => {}
+            }
             // Check if callee is a known function
             // OPTIMIZATION: use cached lookup instead of O(n) linear scan
             match TypeChecker_lookup_func_cache(self, callee) {
@@ -5464,18 +5592,24 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                     if arg_types.len() < sig.min_args || arg_types.len() > sig.param_types.len() {
                         self.errors.push("Type error (line " + int_to_str(self.current_line) + "): function '" + callee + "' expects " + int_to_str(sig.min_args) + "-" + int_to_str(sig.param_types.len()) + " args, got " + int_to_str(arg_types.len()));
                     }
-                    // Check argument types (loose for primitives, strict for named)
+                    // Check every argument (generic parameters are resolved by
+                    // monomorphization).
                     var pi: i64 = 0;
                     while pi < sig.param_types.len() && pi < arg_types.len() {
-                        var param: Type = TypeChecker_resolve_type(self, sig.param_types.get(pi));
+                        var raw_param: Type = sig.param_types.get(pi);
+                        var param: Type = TypeChecker_resolve_type(self, raw_param);
                         var arg: Type = arg_types.get(pi);
-                        var param_is_named: bool = false;
-                        match param {
-                            Type::Named(_) => { param_is_named = true; }
-                            _ => { param_is_named = false; }
-                        }
-                        if param_is_named && !TypeChecker_types_compatible(self, param, arg) {
-                            self.errors.push("Type error: function '" + callee + "' parameter " + int_to_str(pi + 1) + " expects '" + type_to_str(param) + "', got '" + type_to_str(arg) + "'");
+                        if !TypeChecker_type_contains_param(self, raw_param) && !is_single_upper_name(raw_param)
+                            && !(callee == "print" || callee == "println" || callee == "eprint" || callee == "eprintln")
+                            && !TypeChecker_arg_compatible(self, param, arg)
+                            && !(is_handle_int_pair(param, arg) && TypeChecker_is_runtime_call(self, callee))
+                            && !(str_vec_contains(self.extern_fns, callee) && is_ffi_pointer_pair(param, arg)) {
+                            var in_fn: str = "";
+                            match self.current_func_name {
+                                OptString::Some(fname) => { in_fn = ", in '" + fname + "'"; }
+                                OptString::None => {}
+                            }
+                            self.errors.push("Type error (line " + int_to_str(self.current_line) + in_fn + "): function '" + callee + "' parameter " + int_to_str(pi + 1) + " expects '" + type_to_str(param) + "', got '" + type_to_str(arg) + "'");
                         }
                         pi = pi + 1;
                     }
@@ -5509,6 +5643,15 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 if callee == "p_string_contains" || callee == "p_string_starts_with" || callee == "p_string_ends_with" || callee == "p_string_is_empty" {
                     return Type::Bool;
                 }
+                if callee == "p_vec_new" || callee == "p_vec_clone" || callee == "p_file_read_bytes" {
+                    return Type::Named("Vec");
+                }
+                if callee == "p_vec_is_empty" || callee == "p_vec_contains" {
+                    return Type::Bool;
+                }
+                if (callee == "p_all_reduce" || callee == "p_all_gather") && arg_types.len() > 0 {
+                    return arg_types.get(0);
+                }
                 if callee == "p_string_len" || callee == "p_string_find" || callee == "p_string_rfind" || callee == "p_string_bytes" || callee == "p_string_parse_int" {
                     return Type::I64;
                 }
@@ -5540,8 +5683,8 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             // Unwrap references
             var effective_ty: Type = obj_ty;
             match obj_ty {
-                Type::Ref(inner, _) => { effective_ty = box_type_unbox(inner); }
-                _ => { effective_ty = obj_ty; }
+                Type::Ref(inner, _) => { effective_ty = unbox_ty(box_type_unbox(inner)); }
+                _ => { effective_ty = unbox_ty(obj_ty); }
             }
             match effective_ty {
                 Type::Named(name) => {
@@ -5646,22 +5789,16 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
         }
         Expr::If(cond, then_block, else_block) => {
             TypeChecker_check_expr(self, box_expr_unbox(cond));
-            TypeChecker_push_scope(self);
-            var si: i64 = 0;
-            while si < then_block.len() {
-                TypeChecker_check_stmt(self, then_block.get(si));
-                si = si + 1;
-            }
-            TypeChecker_pop_scope(self);
+            var then_ty: Type = TypeChecker_check_block_value(self, then_block);
             match else_block {
                 OptStmts::Some(else_b) => {
-                    TypeChecker_push_scope(self);
-                    var si2: i64 = 0;
-                    while si2 < else_b.len() {
-                        TypeChecker_check_stmt(self, else_b.get(si2));
-                        si2 = si2 + 1;
+                    // `if c { a } else { b }` has the type of its branches;
+                    // a diverging branch takes the other branch's type.
+                    var else_ty: Type = TypeChecker_check_block_value(self, else_b);
+                    match then_ty {
+                        Type::Never => { return else_ty; }
+                        _ => { return then_ty; }
                     }
-                    TypeChecker_pop_scope(self);
                 }
                 OptStmts::None => {}
             }
@@ -5746,7 +5883,9 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             return Type::Str;
         }
         Expr::Match(expr, arms) => {
-            var match_ty: Type = TypeChecker_check_expr(self, box_expr_unbox(expr));
+            var match_ty: Type = unbox_ty(TypeChecker_check_expr(self, box_expr_unbox(expr)));
+            var match_value_ty: Type = Type::Never;
+            var match_has_value: bool = false;
             var ai: i64 = 0;
             while ai < arms.len() {
                 var arm: MatchArm = arms.get(ai);
@@ -5754,6 +5893,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 match arm.pattern {
                     Pattern::Ident(name) => { TypeChecker_declare(self, name, match_ty); }
                     Pattern::EnumVariant(enum_name, variant, bindings) => {
+                        TypeChecker_check_enum_pattern(self, match_ty, enum_name, variant, bindings);
                         var tys: Vec<Type> = TypeChecker_pattern_binding_types(self, match_ty, enum_name, variant, bindings);
                         var bi: i64 = 0;
                         while bi < bindings.len() && bi < tys.len() {
@@ -5769,22 +5909,28 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                     OptBoxExpr::Some(g) => { TypeChecker_check_expr(self, box_expr_unbox(g)); }
                     OptBoxExpr::None => {}
                 }
-                var si: i64 = 0;
-                while si < arm.body.len() {
-                    TypeChecker_check_stmt(self, arm.body.get(si));
-                    si = si + 1;
+                // `match` as a value: the first non-diverging arm's type.
+                var arm_ty: Type = TypeChecker_check_stmts_value(self, arm.body);
+                match arm_ty {
+                    Type::Never => {}
+                    _ => {
+                        if !match_has_value { match_value_ty = arm_ty; match_has_value = true; }
+                    }
                 }
                 TypeChecker_pop_scope(self);
                 ai = ai + 1;
             }
-            return Type::Void;
+            if arms.len() == 0 { return Type::Void; }
+            return match_value_ty;
         }
-        Expr::EnumLit(enum_name, _, args) => {
+        Expr::EnumLit(enum_name, variant, args) => {
+            var ctor_arg_tys: Vec<Type> = Vec::new();
             var i: i64 = 0;
             while i < args.len() {
-                TypeChecker_check_expr(self, args.get(i));
+                ctor_arg_tys.push(TypeChecker_check_expr(self, args.get(i)));
                 i = i + 1;
             }
+            TypeChecker_check_enum_constructor(self, enum_name, variant, ctor_arg_tys);
             return Type::Named(enum_name);
         }
         Expr::Ref(e, is_mut) => {
@@ -5796,6 +5942,11 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             match ty {
                 Type::Ref(inner, _) => { var t: Type = box_type_unbox(inner); return t; }
                 Type::RawPtr(inner, _) => { var t: Type = box_type_unbox(inner); return t; }
+                Type::Generic(gname, gargs) => {
+                    if gname == "Box" && gargs.len() == 1 { return gargs.get(0); }
+                    self.errors.push("Type error: cannot dereference non-reference type " + type_to_str(ty));
+                    return Type::Never;
+                }
                 _ => {
                     self.errors.push("Type error: cannot dereference non-reference type " + type_to_str(ty));
                     return Type::Never;
@@ -5884,17 +6035,42 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 TypeChecker_declare(self, params.get(pi).name, TypeChecker_resolve_type(self, params.get(pi).ty));
                 pi = pi + 1;
             }
-            var si: i64 = 0;
-            while si < body.len() {
-                TypeChecker_check_stmt(self, body.get(si));
-                si = si + 1;
+            var saved_closure_ret: OptType = self.current_ret_ty;
+            self.current_ret_ty = ret_ty;
+            var outer_returns: i64 = self.current_return_types.len();
+            var body_ty: Type = TypeChecker_check_stmts_value(self, body);
+            // The closure's own `return`s belong to it, not the enclosing fn;
+            // unannotated closures infer their return type from them.
+            var inferred_ret: Type = body_ty;
+            match body_ty {
+                Type::Never => { inferred_ret = Type::Void; }
+                _ => {}
             }
+            var cri: i64 = self.current_return_types.len() - 1;
+            while cri >= outer_returns {
+                var crt: Type = self.current_return_types.get(cri);
+                match crt {
+                    Type::Void => {}
+                    Type::Never => {}
+                    _ => { inferred_ret = crt; }
+                }
+                cri = cri - 1;
+            }
+            self.current_return_types.truncate(outer_returns);
+            self.current_ret_ty = saved_closure_ret;
             TypeChecker_pop_scope(self);
-            match ret_ty {
-                OptType::Some(t) => { return t; }
-                OptType::None => { return Type::Void; }
+            var closure_params: Vec<Type> = Vec::new();
+            var cpi: i64 = 0;
+            while cpi < params.len() {
+                closure_params.push(TypeChecker_resolve_type(self, params.get(cpi).ty));
+                cpi = cpi + 1;
             }
-            return Type::Void;
+            var closure_ret: Type = inferred_ret;
+            match ret_ty {
+                OptType::Some(t) => { closure_ret = t; }
+                OptType::None => {}
+            }
+            return Type::Func(closure_params, Box::new(closure_ret));
         }
         Expr::Cast(e, target_ty) => {
             TypeChecker_check_expr(self, box_expr_unbox(e));
@@ -6033,7 +6209,9 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
             if name == "Box" && method == "new" {
                 if args.len() > 0 {
                     var arg_ty: Type = TypeChecker_check_expr(self, args.get(0));
-                    return Type::Ref(Box::new(arg_ty), true);
+                    var box_args: Vec<Type> = Vec::new();
+                    box_args.push(arg_ty);
+                    return Type::Generic("Box", box_args);
                 }
             }
             if name == "Rc" && method == "new" {
@@ -6557,6 +6735,416 @@ pub fn TypeChecker_resolve_pattern_enum(self: &TypeChecker, match_ty: Type, enum
     return found;
 }
 
+// --- soundness helpers (mirror src/typechecker.rs) -------------------------
+
+// A type written by name in a pattern binding (`Some(v: i64)`): primitive names
+// map to primitive types (as in Rust's type_from_name), others stay Named.
+pub fn type_from_annotation(name: str) -> Type {
+    if name == "i8" { return Type::I8; }
+    if name == "i16" { return Type::I16; }
+    if name == "i32" { return Type::I32; }
+    if name == "i64" { return Type::I64; }
+    if name == "i128" { return Type::I128; }
+    if name == "u8" { return Type::U8; }
+    if name == "u16" { return Type::U16; }
+    if name == "u32" { return Type::U32; }
+    if name == "u64" { return Type::U64; }
+    if name == "u128" { return Type::U128; }
+    if name == "f32" { return Type::F32; }
+    if name == "f64" { return Type::F64; }
+    if name == "bool" { return Type::Bool; }
+    if name == "str" { return Type::Str; }
+    if name == "void" { return Type::Void; }
+    return Type::Named(name);
+}
+
+// The stdlib modules that implement the runtime handles themselves (Vec/HashMap
+// are raw pointers manipulated as i64 there).
+pub fn is_runtime_layer(module: str) -> bool {
+    return module == "core" || module == "vec";
+}
+
+fn is_handle_type(t: Type) -> bool {
+    match t {
+        Type::Named(n) => { return n == "Vec" || n == "HashMap" || n == "Allocator" || n == "Tensor"; }
+        Type::Generic(n, _) => { return n == "Vec" || n == "HashMap" || n == "Allocator" || n == "Tensor"; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+fn is_i64_type(t: Type) -> bool {
+    match t {
+        Type::I64 => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+// An opaque runtime handle paired with i64 -- interchangeable only inside the
+// runtime layer (TODO R1.4: a layout-aware Vec removes the need for this).
+pub fn is_handle_int_pair(a: Type, b: Type) -> bool {
+    return (is_handle_type(a) && is_i64_type(b)) || (is_handle_type(b) && is_i64_type(a));
+}
+
+// `T` written as a single uppercase letter is a generic parameter.
+fn is_single_upper_name(t: Type) -> bool {
+    match t {
+        Type::Named(n) => {
+            if str_len(n) == 1 {
+                var c: i64 = str_byte_at(n, 0);
+                return c >= 'A' && c <= 'Z';
+            }
+            return false;
+        }
+        _ => { return false; }
+    }
+    return false;
+}
+
+pub fn TypeChecker_is_runtime_call(self: &TypeChecker, callee: str) -> bool {
+    if is_runtime_layer(self.current_module) { return true; }
+    if str_vec_contains(self.extern_fns, callee) { return true; }
+    match map_str_str_get(self.item_modules, callee) {
+        OptString::Some(m) => { return is_runtime_layer(m); }
+        OptString::None => {}
+    }
+    return false;
+}
+
+fn strip_box(t: Type) -> Type {
+    match t {
+        Type::Generic(n, args) => {
+            if n == "Box" && args.len() == 1 { return args.get(0); }
+            return t;
+        }
+        _ => { return t; }
+    }
+    return t;
+}
+
+// Argument passing: types_compatible plus the call-site coercions Fides
+// performs -- a `&mut T` reborrows as `&T`, a value `T` is auto-borrowed for a
+// `&T` / `&mut T` parameter, and aggregates share a representation with their
+// Box. Passing `&T` where `&mut T` is required stays an error.
+pub fn TypeChecker_arg_compatible(self: &TypeChecker, param: Type, arg: Type) -> bool {
+    if TypeChecker_types_compatible(self, param, arg) { return true; }
+    var p: Type = TypeChecker_resolve_type(self, param);
+    var a: Type = TypeChecker_resolve_type(self, arg);
+    // A Box owns a heap copy made by Box::new; storing a bare value (often a
+    // pointer into the caller's stack frame) dangles.
+    var a_boxed: bool = is_box_type(a);
+    match a {
+        Type::Ref(inner, _) => { if is_box_type(box_type_unbox(inner)) { a_boxed = true; } }
+        _ => {}
+    }
+    if is_box_type(p) && !a_boxed { return false; }
+    // Function types compare structurally.
+    match p {
+        Type::Func(pp, pr) => {
+            match a {
+                Type::Func(ap, ar) => {
+                    if pp.len() != ap.len() { return false; }
+                    var fi: i64 = 0;
+                    while fi < pp.len() {
+                        if !TypeChecker_arg_compatible(self, pp.get(fi), ap.get(fi)) { return false; }
+                        fi = fi + 1;
+                    }
+                    return TypeChecker_arg_compatible(self, box_type_unbox(pr), box_type_unbox(ar))
+                        || (type_eq(box_type_unbox(pr), Type::Void) && type_eq(box_type_unbox(ar), Type::Void));
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    var p_is_ref: bool = false;
+    var p_mut: bool = false;
+    var p_inner: Type = p;
+    match p {
+        Type::Ref(inner, m) => { p_is_ref = true; p_mut = m; p_inner = box_type_unbox(inner); }
+        _ => {}
+    }
+    var a_is_ref: bool = false;
+    var a_mut: bool = false;
+    var a_inner: Type = a;
+    match a {
+        Type::Ref(inner, m) => { a_is_ref = true; a_mut = m; a_inner = box_type_unbox(inner); }
+        _ => {}
+    }
+    if p_is_ref && p_mut && a_is_ref && !a_mut { return false; }
+    var ps: Type = TypeChecker_resolve_type(self, strip_box(p_inner));
+    var as2: Type = TypeChecker_resolve_type(self, strip_box(a_inner));
+    // Only user structs and enums are represented as a pointer to their data,
+    // so only for them is `T` interchangeable with `&T` / `Box<T>`. A Vec,
+    // HashMap, str or number value is itself the handle or value, and `&v` is
+    // a pointer to the variable holding it (mirrors src/typechecker.rs).
+    var stripped_any: bool = (p_is_ref != a_is_ref) || is_box_type(p_inner) || is_box_type(a_inner);
+    if stripped_any && !TypeChecker_shares_repr(self, ps) { return false; }
+    return TypeChecker_types_compatible(self, ps, as2);
+}
+
+pub fn TypeChecker_shares_repr(self: &TypeChecker, t: Type) -> bool {
+    var n: str = "";
+    match t {
+        Type::Named(nm) => { n = nm; }
+        Type::Generic(nm, _) => { n = nm; }
+        _ => { return false; }
+    }
+    if n == "Vec" || n == "HashMap" || n == "String" || n == "Box" { return false; }
+    if str_vec_contains(self.enums, n) { return true; }
+    match TypeChecker_lookup_struct_cache(self, n) {
+        OptVecStructField::Some(_) => { return true; }
+        OptVecStructField::None => {}
+    }
+    return false;
+}
+
+// `return e` must match the declared return type of the enclosing function or
+// closure.
+pub fn TypeChecker_check_return_type(self: &mut TypeChecker, actual: Type) {
+    var declared: Type = Type::Infer;
+    match self.current_ret_ty {
+        OptType::Some(t) => { declared = TypeChecker_resolve_self_type(self, t); }
+        OptType::None => { return; }
+    }
+    var decl_void: bool = false;
+    match declared {
+        Type::Void => { decl_void = true; }
+        _ => {}
+    }
+    var act_void: bool = false;
+    match actual {
+        Type::Void => { act_void = true; }
+        _ => {}
+    }
+    var ok: bool = false;
+    var is_main: bool = false;
+    match self.current_func_name {
+        OptString::Some(n) => { is_main = n == "main"; }
+        OptString::None => {}
+    }
+    if decl_void && is_main && TypeChecker_is_numeric(self, actual) {
+        ok = true;   // main may return an integer exit status
+    } else if decl_void || act_void {
+        ok = decl_void && act_void;
+    } else {
+        ok = TypeChecker_arg_compatible(self, declared, actual)
+            || (is_runtime_layer(self.current_module) && is_handle_int_pair(declared, actual));
+    }
+    if !ok {
+        var fname: str = "<closure>";
+        match self.current_func_name {
+            OptString::Some(n) => { fname = n; }
+            OptString::None => {}
+        }
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): '" + fname + "' returns " + type_to_str(actual) + " but is declared to return " + type_to_str(declared));
+    }
+}
+
+// `Enum::Variant(args)` must name an existing variant with matching arity.
+pub fn TypeChecker_check_enum_constructor(self: &mut TypeChecker, enum_name: str, variant: str, arg_tys: Vec<Type>) {
+    var n_args: i64 = arg_tys.len();
+    var resolved: str = TypeChecker_resolve_struct_name(self, enum_name);
+    var ei: i64 = 0;
+    while ei < self.enum_variants.len() {
+        var key: str = self.enum_variants.get(ei).key;
+        if key == resolved || key == enum_name {
+            var variants: Vec<EnumVariantEntry> = self.enum_variants.get(ei).val;
+            var vi: i64 = 0;
+            while vi < variants.len() {
+                if variants.get(vi).name == variant {
+                    var payload: Vec<Type> = variants.get(vi).payload_types;
+                    var n: i64 = payload.len();
+                    if n != n_args {
+                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + key + "::" + variant + " takes " + int_to_str(n) + " value(s), got " + int_to_str(n_args));
+                        return;
+                    }
+                    var fi: i64 = 0;
+                    while fi < n {
+                        var expected: Type = payload.get(fi);
+                        // Generic payloads are checked after monomorphization.
+                        if !TypeChecker_type_contains_param(self, expected) && !TypeChecker_is_enum_type_param(self, expected)
+                            && !type_mentions_any(expected, TypeChecker_enum_params_of(self, key))
+                            && !TypeChecker_arg_compatible(self, expected, arg_tys.get(fi)) {
+                            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + key + "::" + variant + " field " + int_to_str(fi + 1) + " expects '" + type_to_str(expected) + "', got '" + type_to_str(arg_tys.get(fi)) + "'");
+                        }
+                        fi = fi + 1;
+                    }
+                    return;
+                }
+                vi = vi + 1;
+            }
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): enum '" + key + "' has no variant '" + variant + "'");
+            return;
+        }
+        ei = ei + 1;
+    }
+}
+
+// Check a block in its own scope and return the type of its trailing
+// expression statement (Void if it has none).
+pub fn TypeChecker_check_block_value(self: &mut TypeChecker, stmts: Vec<Stmt>) -> Type {
+    TypeChecker_push_scope(self);
+    var last: Type = TypeChecker_check_stmts_value(self, stmts);
+    TypeChecker_pop_scope(self);
+    return last;
+}
+
+// Check statements in the current scope; the value is the trailing
+// expression's type, Never if the list ends by leaving the block
+// (return/break/continue), else Void.
+pub fn TypeChecker_check_stmts_value(self: &mut TypeChecker, stmts: Vec<Stmt>) -> Type {
+    var last: Type = Type::Void;
+    var i: i64 = 0;
+    while i < stmts.len() {
+        var st: Stmt = stmts.get(i);
+        var handled: bool = false;
+        if i + 1 == stmts.len() {
+            match st {
+                Stmt::Expr(e, line) => {
+                    last = TypeChecker_check_expr(self, e);
+                    TypeChecker_consume_linear_in_expr(self, e, line);
+                    handled = true;
+                }
+                _ => {}
+            }
+        }
+        if !handled {
+            TypeChecker_check_stmt(self, st);
+            if i + 1 == stmts.len() {
+                match st {
+                    Stmt::Return(_, _) => { last = Type::Never; }
+                    Stmt::Break(_, _) => { last = Type::Never; }
+                    Stmt::Continue(_) => { last = Type::Never; }
+                    _ => {}
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return last;
+}
+
+fn is_box_type(t: Type) -> bool {
+    match t {
+        Type::Generic(n, args) => { return n == "Box" && args.len() == 1; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+// Box<T> auto-derefs to T for field access, `*`, and `match`.
+pub fn unbox_ty(t: Type) -> Type {
+    match t {
+        Type::Generic(n, args) => {
+            if n == "Box" && args.len() == 1 { return args.get(0); }
+            return t;
+        }
+        _ => { return t; }
+    }
+    return t;
+}
+
+// At the C FFI boundary a reference, str, raw pointer or runtime handle is
+// passed as a pointer-sized integer or raw pointer.
+pub fn is_ffi_pointer_pair(param: Type, arg: Type) -> bool {
+    var param_is_ptr: bool = false;
+    match param {
+        Type::I64 => { param_is_ptr = true; }
+        Type::RawPtr(_, _) => { param_is_ptr = true; }
+        _ => {}
+    }
+    var arg_is_ptr: bool = is_handle_type(arg);
+    match arg {
+        Type::Ref(_, _) => { arg_is_ptr = true; }
+        Type::Str => { arg_is_ptr = true; }
+        Type::RawPtr(_, _) => { arg_is_ptr = true; }
+        _ => {}
+    }
+    return param_is_ptr && arg_is_ptr;
+}
+
+// The type parameters declared by enum `name` (empty if not generic).
+pub fn TypeChecker_enum_params_of(self: &TypeChecker, name: str) -> Vec<str> {
+    var ti: i64 = 0;
+    while ti < self.enum_type_params.len() {
+        if self.enum_type_params.get(ti).key == name { return self.enum_type_params.get(ti).val; }
+        ti = ti + 1;
+    }
+    return Vec::new();
+}
+
+// Whether `t` names any of `params` anywhere (e.g. `E`, `Vec<E>`, `&E`).
+pub fn type_mentions_any(t: Type, params: Vec<str>) -> bool {
+    match t {
+        Type::Named(n) => { return str_vec_contains(params, n); }
+        Type::Generic(n, args) => {
+            if str_vec_contains(params, n) { return true; }
+            var i: i64 = 0;
+            while i < args.len() {
+                if type_mentions_any(args.get(i), params) { return true; }
+                i = i + 1;
+            }
+            return false;
+        }
+        Type::Ref(inner, _) => { return type_mentions_any(box_type_unbox(inner), params); }
+        Type::RawPtr(inner, _) => { return type_mentions_any(box_type_unbox(inner), params); }
+        _ => { return false; }
+    }
+    return false;
+}
+
+// A bare type-parameter name of some generic enum (e.g. T in Option<T>).
+pub fn TypeChecker_is_enum_type_param(self: &TypeChecker, t: Type) -> bool {
+    match t {
+        Type::Named(n) => {
+            var ti: i64 = 0;
+            while ti < self.enum_type_params.len() {
+                if str_vec_contains(self.enum_type_params.get(ti).val, n) { return true; }
+                ti = ti + 1;
+            }
+            return str_vec_contains(self.current_type_params, n);
+        }
+        _ => { return false; }
+    }
+    return false;
+}
+
+// --- check_enum_pattern --------------------------------------------------
+// Reject enum patterns naming a variant the enum does not have, or binding a
+// different number of payload fields than the variant carries. Without this,
+// `match op { BinOp::Ne => .. }` (no such variant) type-checked and silently
+// never matched.
+
+pub fn TypeChecker_check_enum_pattern(self: &mut TypeChecker, match_ty: Type, enum_name: str, variant: str, bindings: Vec<Binding>) {
+    var ename: str = "";
+    match TypeChecker_resolve_pattern_enum(self, match_ty, enum_name, variant) {
+        OptString::Some(n) => { ename = n; }
+        OptString::None => { return; }
+    }
+    var ei: i64 = 0;
+    while ei < self.enum_variants.len() {
+        if self.enum_variants.get(ei).key == ename {
+            var variants: Vec<EnumVariantEntry> = self.enum_variants.get(ei).val;
+            var vi: i64 = 0;
+            while vi < variants.len() {
+                if variants.get(vi).name == variant {
+                    var n_payload: i64 = variants.get(vi).payload_types.len();
+                    if bindings.len() > 0 && bindings.len() != n_payload {
+                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): pattern " + ename + "::" + variant + " binds " + int_to_str(bindings.len()) + " field(s) but the variant has " + int_to_str(n_payload));
+                    }
+                    return;
+                }
+                vi = vi + 1;
+            }
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): enum '" + ename + "' has no variant '" + variant + "'");
+            return;
+        }
+        ei = ei + 1;
+    }
+}
+
 // --- pattern_binding_types -----------------------------------------------
 
 pub fn TypeChecker_pattern_binding_types(self: &TypeChecker, match_ty: Type, enum_name: str, variant: str, bindings: Vec<Binding>) -> Vec<Type> {
@@ -6586,7 +7174,7 @@ pub fn TypeChecker_pattern_binding_types(self: &TypeChecker, match_ty: Type, enu
                     var generic_args: Vec<Type> = Vec::new();
                     match match_ty {
                         Type::Generic(name, args) => {
-                            if str_equal(name, enum_name) {
+                            if name == enum_name {
                                 generic_args = args;
                             }
                         }
@@ -6610,7 +7198,7 @@ pub fn TypeChecker_pattern_binding_types(self: &TypeChecker, match_ty: Type, enu
                                 // Check if n is a type param of this enum
                                 var tpi: i64 = 0;
                                 while tpi < type_params.len() {
-                                    if str_equal(type_params.get(tpi), n) {
+                                    if type_params.get(tpi) == n {
                                         is_type_param = true;
                                         tpi = type_params.len();
                                     }
@@ -6626,7 +7214,7 @@ pub fn TypeChecker_pattern_binding_types(self: &TypeChecker, match_ty: Type, enu
                             // Unsubstituted type param: use binding annotation or i64 fallback
                             var binding_annot: str = bindings.get(pi).ty;
                             if !str_is_empty(binding_annot) {
-                                result.push(Type::Named(binding_annot));
+                                result.push(type_from_annotation(binding_annot));
                             } else {
                                 result.push(Type::I64);
                             }
@@ -6656,7 +7244,7 @@ pub fn TypeChecker_pattern_binding_types(self: &TypeChecker, match_ty: Type, enu
 
 // --- scan_stmts_for_effects ----------------------------------------------
 
-pub fn TypeChecker_scan_stmts_for_effects(self: &TypeChecker, stmts: Vec<Stmt>, effects: &mut Vec<str>) {
+pub fn TypeChecker_scan_stmts_for_effects(self: &TypeChecker, stmts: Vec<Stmt>, effects: Vec<str>) {
     var i: i64 = 0;
     while i < stmts.len() {
         TypeChecker_scan_stmt_for_effects(self, stmts.get(i), effects);
@@ -6664,7 +7252,7 @@ pub fn TypeChecker_scan_stmts_for_effects(self: &TypeChecker, stmts: Vec<Stmt>, 
     }
 }
 
-pub fn TypeChecker_scan_stmt_for_effects(self: &TypeChecker, stmt: Stmt, effects: &mut Vec<str>) {
+pub fn TypeChecker_scan_stmt_for_effects(self: &TypeChecker, stmt: Stmt, effects: Vec<str>) {
     match stmt {
         Stmt::Let(_, _, expr, _, _, _, _) => { TypeChecker_scan_expr_for_effects(self, expr, effects); }
         Stmt::LetTuple(_, expr, _) => { TypeChecker_scan_expr_for_effects(self, expr, effects); }
@@ -6760,7 +7348,7 @@ pub fn TypeChecker_scan_stmt_for_effects(self: &TypeChecker, stmt: Stmt, effects
     }
 }
 
-pub fn TypeChecker_scan_expr_for_effects(self: &TypeChecker, expr: Expr, effects: &mut Vec<str>) {
+pub fn TypeChecker_scan_expr_for_effects(self: &TypeChecker, expr: Expr, effects: Vec<str>) {
     match expr {
         Expr::IntLit(_) => {}
         Expr::FloatLit(_) => {}
@@ -6981,7 +7569,7 @@ pub fn TypeChecker_lint_unused_functions(self: &mut TypeChecker, program: Progra
     // Collect all called functions
     var fi: i64 = 0;
     while fi < program.funcs.len() {
-        TypeChecker_collect_called_funcs(self, program.funcs.get(fi).body, &mut called);
+        TypeChecker_collect_called_funcs(self, program.funcs.get(fi).body, called);
         fi = fi + 1;
     }
     var impi: i64 = 0;
@@ -6989,7 +7577,7 @@ pub fn TypeChecker_lint_unused_functions(self: &mut TypeChecker, program: Progra
         var imp: ImplDef = program.impls.get(impi);
         var mi: i64 = 0;
         while mi < imp.methods.len() {
-            TypeChecker_collect_called_funcs(self, imp.methods.get(mi).body, &mut called);
+            TypeChecker_collect_called_funcs(self, imp.methods.get(mi).body, called);
             mi = mi + 1;
         }
         impi = impi + 1;
@@ -6999,7 +7587,7 @@ pub fn TypeChecker_lint_unused_functions(self: &mut TypeChecker, program: Progra
         var timp: TraitImpl = program.trait_impls.get(timpi);
         var tmi: i64 = 0;
         while tmi < timp.methods.len() {
-            TypeChecker_collect_called_funcs(self, timp.methods.get(tmi).body, &mut called);
+            TypeChecker_collect_called_funcs(self, timp.methods.get(tmi).body, called);
             tmi = tmi + 1;
         }
         timpi = timpi + 1;
@@ -7015,7 +7603,7 @@ pub fn TypeChecker_lint_unused_functions(self: &mut TypeChecker, program: Progra
     }
 }
 
-pub fn TypeChecker_collect_called_funcs(self: &TypeChecker, stmts: Vec<Stmt>, called: &mut Vec<str>) {
+pub fn TypeChecker_collect_called_funcs(self: &TypeChecker, stmts: Vec<Stmt>, called: Vec<str>) {
     var i: i64 = 0;
     while i < stmts.len() {
         TypeChecker_collect_called_funcs_stmt(self, stmts.get(i), called);
@@ -7023,7 +7611,7 @@ pub fn TypeChecker_collect_called_funcs(self: &TypeChecker, stmts: Vec<Stmt>, ca
     }
 }
 
-pub fn TypeChecker_collect_called_funcs_stmt(self: &TypeChecker, stmt: Stmt, called: &mut Vec<str>) {
+pub fn TypeChecker_collect_called_funcs_stmt(self: &TypeChecker, stmt: Stmt, called: Vec<str>) {
     match stmt {
         Stmt::Let(_, _, expr, _, _, _, _) => { TypeChecker_collect_called_funcs_expr(self, expr, called); }
         Stmt::LetTuple(_, expr, _) => { TypeChecker_collect_called_funcs_expr(self, expr, called); }
@@ -7119,7 +7707,7 @@ pub fn TypeChecker_collect_called_funcs_stmt(self: &TypeChecker, stmt: Stmt, cal
     }
 }
 
-pub fn TypeChecker_collect_called_funcs_expr(self: &TypeChecker, expr: Expr, called: &mut Vec<str>) {
+pub fn TypeChecker_collect_called_funcs_expr(self: &TypeChecker, expr: Expr, called: Vec<str>) {
     match expr {
         Expr::IntLit(_) => {}
         Expr::FloatLit(_) => {}
@@ -7260,7 +7848,7 @@ pub fn TypeChecker_lint_unused_imports(self: &mut TypeChecker, program: Program)
     var called: Vec<str> = Vec::new();
     var fi: i64 = 0;
     while fi < program.funcs.len() {
-        TypeChecker_collect_called_funcs(self, program.funcs.get(fi).body, &mut called);
+        TypeChecker_collect_called_funcs(self, program.funcs.get(fi).body, called);
         fi = fi + 1;
     }
     var impi: i64 = 0;
@@ -7268,7 +7856,7 @@ pub fn TypeChecker_lint_unused_imports(self: &mut TypeChecker, program: Program)
         var imp: ImplDef = program.impls.get(impi);
         var mi: i64 = 0;
         while mi < imp.methods.len() {
-            TypeChecker_collect_called_funcs(self, imp.methods.get(mi).body, &mut called);
+            TypeChecker_collect_called_funcs(self, imp.methods.get(mi).body, called);
             mi = mi + 1;
         }
         impi = impi + 1;
@@ -7278,7 +7866,7 @@ pub fn TypeChecker_lint_unused_imports(self: &mut TypeChecker, program: Program)
         var timp: TraitImpl = program.trait_impls.get(timpi);
         var tmi: i64 = 0;
         while tmi < timp.methods.len() {
-            TypeChecker_collect_called_funcs(self, timp.methods.get(tmi).body, &mut called);
+            TypeChecker_collect_called_funcs(self, timp.methods.get(tmi).body, called);
             tmi = tmi + 1;
         }
         timpi = timpi + 1;
@@ -7314,13 +7902,13 @@ pub fn scan_for_floats(stmts: Vec<Stmt>) -> Vec<str> {
     var found: Vec<str> = Vec::new();
     var i: i64 = 0;
     while i < stmts.len() {
-        scan_stmt_for_floats(stmts.get(i), &mut found);
+        scan_stmt_for_floats(stmts.get(i), found);
         i = i + 1;
     }
     return found;
 }
 
-pub fn scan_stmt_for_floats(stmt: Stmt, found: &mut Vec<str>) {
+pub fn scan_stmt_for_floats(stmt: Stmt, found: Vec<str>) {
     match stmt {
         Stmt::Let(_, _, expr, _, _, _, _) => { scan_expr_for_floats(expr, found); }
         Stmt::LetTuple(_, expr, _) => { scan_expr_for_floats(expr, found); }
@@ -7499,7 +8087,7 @@ pub fn scan_stmt_for_floats(stmt: Stmt, found: &mut Vec<str>) {
     }
 }
 
-pub fn scan_expr_for_floats(expr: Expr, found: &mut Vec<str>) {
+pub fn scan_expr_for_floats(expr: Expr, found: Vec<str>) {
     match expr {
         Expr::FloatLit(_) => { found.push("float_literal"); }
         Expr::IntLit(_) => {}

@@ -76,7 +76,7 @@ pub fn value_eq(a: Value, b: Value) -> bool {
         }
         Value::Str(x) => {
             match b {
-                Value::Str(y) => { return str_equal(x, y); }
+                Value::Str(y) => { return x == y; }
                 _ => { return false; }
             }
         }
@@ -519,7 +519,7 @@ pub fn Interpreter_set_max_memory(self: &mut Interpreter, bytes: i64) {
 pub fn Interpreter_lookup_string_addr(self: &Interpreter, content: str) -> i64 {
     var i: i64 = 0;
     while i < self.string_addrs.len() {
-        if str_equal(self.string_addrs.get(i).content, content) {
+        if self.string_addrs.get(i).content == content {
             return self.string_addrs.get(i).addr;
         }
         i = i + 1;
@@ -530,7 +530,7 @@ pub fn Interpreter_lookup_string_addr(self: &Interpreter, content: str) -> i64 {
 pub fn Interpreter_lookup_global_addr(self: &Interpreter, name: str) -> i64 {
     var i: i64 = 0;
     while i < self.global_addrs.len() {
-        if str_equal(self.global_addrs.get(i).name, name) {
+        if self.global_addrs.get(i).name == name {
             return self.global_addrs.get(i).addr;
         }
         i = i + 1;
@@ -876,7 +876,7 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
             match inst_opt {
                 OptInst::None => { }
                 OptInst::Some(inst) => {
-                    var outcome: ExecOutcome = Interpreter_execute_inst(self, inst, inst_id, &mut values, &func);
+                    var outcome: ExecOutcome = Interpreter_execute_inst(self, inst, inst_id, values, &func);
                     match outcome {
                         ExecOutcome::Continue => { }
                         ExecOutcome::Value(v) => {
@@ -947,7 +947,7 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
 // get_value -- safe lookup from the value table
 // ===========================================================================
 
-pub fn get_value(values: &Vec<Value>, id: i64) -> Value {
+pub fn get_value(values: Vec<Value>, id: i64) -> Value {
     if id >= 0 && id < values.len() {
         return values.get(id);
     }
@@ -958,7 +958,7 @@ pub fn get_value(values: &Vec<Value>, id: i64) -> Value {
 // execute_inst -- execute a single IR instruction
 // ===========================================================================
 
-pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64, values: &mut Vec<Value>, func: &IrFunction) -> ExecOutcome {
+pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64, values: Vec<Value>, func: &IrFunction) -> ExecOutcome {
     match inst {
         // ─── Constants ───
         Inst::ConstInt(value, ty) => {
@@ -1036,12 +1036,12 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                     BinOp::Eq => {
                         var l_str: str = Interpreter_value_to_string(self, l);
                         var r_str: str = Interpreter_value_to_string(self, r);
-                        return ExecOutcome::Value(Value::Bool(str_equal(l_str, r_str)));
+                        return ExecOutcome::Value(Value::Bool(l_str == r_str));
                     }
                     BinOp::Neq => {
                         var l_str2: str = Interpreter_value_to_string(self, l);
                         var r_str2: str = Interpreter_value_to_string(self, r);
-                        return ExecOutcome::Value(Value::Bool(!str_equal(l_str2, r_str2)));
+                        return ExecOutcome::Value(Value::Bool(l_str2 != r_str2));
                     }
                     _ => {}
                 }
@@ -1748,8 +1748,8 @@ pub fn Interpreter_eval_binop(self: &Interpreter, op: BinOp, l: Value, r: Value)
             match r {
                 Value::Str(b) => {
                     match op {
-                        BinOp::Eq => { return Value::Bool(str_equal(a, b)); }
-                        BinOp::Neq => { return Value::Bool(!str_equal(a, b)); }
+                        BinOp::Eq => { return Value::Bool(a == b); }
+                        BinOp::Neq => { return Value::Bool(a != b); }
                         _ => { return Value::Void; }
                     }
                 }
@@ -1869,13 +1869,13 @@ pub fn Interpreter_is_runtime_func(self: &Interpreter, name: str) -> bool {
     // Check if it's an extern function
     var i: i64 = 0;
     while i < self.module.extern_functions.len() {
-        if str_equal(self.module.extern_functions.get(i).name, name) {
+        if self.module.extern_functions.get(i).name == name {
             return true;
         }
         i = i + 1;
     }
     // Check known runtime prefixes
-    if str_equal(name, "print") { return true; }
+    if name == "print" { return true; }
     if str_starts_with(name, "p_vec_") { return true; }
     if str_starts_with(name, "p_map_") { return true; }
     if str_starts_with(name, "p_string_") { return true; }
@@ -1898,38 +1898,38 @@ pub fn Interpreter_is_runtime_func(self: &Interpreter, name: str) -> bool {
     if str_starts_with(name, "p_volatile_") { return true; }
     if str_starts_with(name, "p_sb_") { return true; }
     // PRNG and noise builtins
-    if str_equal(name, "p_prng_next") { return true; }
-    if str_equal(name, "p_prng_uniform") { return true; }
-    if str_equal(name, "p_prng_gaussian") { return true; }
-    if str_equal(name, "p_dp_noise") { return true; }
-    if str_equal(name, "p_gaussian_noise") { return true; }
-    if str_equal(name, "p_dropout") { return true; }
+    if name == "p_prng_next" { return true; }
+    if name == "p_prng_uniform" { return true; }
+    if name == "p_prng_gaussian" { return true; }
+    if name == "p_dp_noise" { return true; }
+    if name == "p_gaussian_noise" { return true; }
+    if name == "p_dropout" { return true; }
     // Check common p_ builtins
-    if str_equal(name, "p_print_int") { return true; }
-    if str_equal(name, "p_print_float") { return true; }
-    if str_equal(name, "p_print_bool") { return true; }
-    if str_equal(name, "p_print_str") { return true; }
-    if str_equal(name, "p_eprint_str") { return true; }
-    if str_equal(name, "p_print_newline") { return true; }
-    if str_equal(name, "p_panic") { return true; }
-    if str_equal(name, "p_alloc") { return true; }
-    if str_equal(name, "p_malloc") { return true; }
-    if str_equal(name, "p_free") { return true; }
-    if str_equal(name, "p_region_free") { return true; }
-    if str_equal(name, "p_str_concat") { return true; }
-    if str_equal(name, "p_to_str") { return true; }
-    if str_equal(name, "p_char_to_str") { return true; }
-    if str_equal(name, "p_float_to_str") { return true; }
-    if str_equal(name, "p_str_to_float") { return true; }
-    if str_equal(name, "p_str_to_int") { return true; }
-    if str_equal(name, "p_str_len") { return true; }
-    if str_equal(name, "p_str_equal") { return true; }
-    if str_equal(name, "p_str_cmp") { return true; }
-    if str_equal(name, "p_bool_to_str") { return true; }
-    if str_equal(name, "p_clock_now") { return true; }
-    if str_equal(name, "p_clock_now_us") { return true; }
-    if str_equal(name, "p_clock_now_ms") { return true; }
-    if str_equal(name, "p_memset") { return true; }
+    if name == "p_print_int" { return true; }
+    if name == "p_print_float" { return true; }
+    if name == "p_print_bool" { return true; }
+    if name == "p_print_str" { return true; }
+    if name == "p_eprint_str" { return true; }
+    if name == "p_print_newline" { return true; }
+    if name == "p_panic" { return true; }
+    if name == "p_alloc" { return true; }
+    if name == "p_malloc" { return true; }
+    if name == "p_free" { return true; }
+    if name == "p_region_free" { return true; }
+    if name == "p_str_concat" { return true; }
+    if name == "p_to_str" { return true; }
+    if name == "p_char_to_str" { return true; }
+    if name == "p_float_to_str" { return true; }
+    if name == "p_str_to_float" { return true; }
+    if name == "p_str_to_int" { return true; }
+    if name == "p_str_len" { return true; }
+    if name == "p_str_equal" { return true; }
+    if name == "p_str_cmp" { return true; }
+    if name == "p_bool_to_str" { return true; }
+    if name == "p_clock_now" { return true; }
+    if name == "p_clock_now_us" { return true; }
+    if name == "p_clock_now_ms" { return true; }
+    if name == "p_memset" { return true; }
     return false;
 }
 
@@ -1944,7 +1944,7 @@ pub fn Interpreter_is_runtime_func(self: &Interpreter, name: str) -> bool {
 
 pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Value>) -> ExecOutcome {
     // ─── Printing ───
-    if str_equal(name, "p_print_int") {
+    if name == "p_print_int" {
         if args.len() > 0 {
             match args.get(0) {
                 Value::Int(i) => { p_print_int(i); }
@@ -1953,7 +1953,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_print_float") {
+    if name == "p_print_float" {
         if args.len() > 0 {
             match args.get(0) {
                 Value::Float(f) => { p_print_float(f); }
@@ -1962,7 +1962,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_print_bool") {
+    if name == "p_print_bool" {
         if args.len() > 0 {
             match args.get(0) {
                 Value::Bool(b) => { p_print_bool(b); }
@@ -1971,7 +1971,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_print_str") {
+    if name == "p_print_str" {
         if args.len() > 0 {
             match args.get(0) {
                 Value::Str(s) => { p_print_str(s); }
@@ -1984,7 +1984,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_eprint_str") {
+    if name == "p_eprint_str" {
         if args.len() > 0 {
             match args.get(0) {
                 Value::Str(s) => { p_eprint_str(s); }
@@ -1997,11 +1997,11 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_print_newline") {
+    if name == "p_print_newline" {
         p_print_str("\n");
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "print") {
+    if name == "print" {
         if args.len() > 0 {
             match args.get(0) {
                 Value::Int(i) => { p_print_int(i); }
@@ -2019,7 +2019,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     }
 
     // ─── Panic ───
-    if str_equal(name, "p_panic") {
+    if name == "p_panic" {
         var msg: str = "panic";
         if args.len() > 0 {
             msg = Interpreter_value_to_string(self, args.get(0));
@@ -2028,7 +2028,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     }
 
     // ─── Allocation ───
-    if str_equal(name, "p_alloc") || str_equal(name, "p_malloc") {
+    if name == "p_alloc" || name == "p_malloc" {
         var size: i64 = 0;
         if args.len() > 0 {
             match args.get(0) {
@@ -2041,26 +2041,26 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         var addr: i64 = Memory_alloc(&mut self.memory, size);
         return ExecOutcome::Value(Value::Ptr(addr));
     }
-    if str_equal(name, "p_free") || str_equal(name, "p_region_free") {
+    if name == "p_free" || name == "p_region_free" {
         // Interpreter doesn't actually free — memory is arena-based
         return ExecOutcome::Value(Value::Void);
     }
 
     // ─── String Operations ───
-    if str_equal(name, "p_str_concat") {
+    if name == "p_str_concat" {
         var left: str = "";
         var right: str = "";
         if args.len() > 0 { left = Interpreter_value_to_string(self, args.get(0)); }
         if args.len() > 1 { right = Interpreter_value_to_string(self, args.get(1)); }
         return ExecOutcome::Value(Value::Str(left + right));
     }
-    if str_equal(name, "p_to_str") {
+    if name == "p_to_str" {
         if args.len() > 0 {
             return ExecOutcome::Value(Value::Str(Interpreter_value_to_string(self, args.get(0))));
         }
         return ExecOutcome::Value(Value::Str(""));
     }
-    if str_equal(name, "p_char_to_str") {
+    if name == "p_char_to_str" {
         if args.len() > 0 {
             match args.get(0) {
                 Value::Int(i) => { return ExecOutcome::Value(Value::Str(p_char_to_str(i))); }
@@ -2069,7 +2069,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Str(""));
     }
-    if str_equal(name, "p_float_to_str") {
+    if name == "p_float_to_str" {
         if args.len() > 0 {
             match args.get(0) {
                 Value::Float(f) => { return ExecOutcome::Value(Value::Str(float_to_str(f))); }
@@ -2078,21 +2078,21 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Str(""));
     }
-    if str_equal(name, "p_str_to_float") {
+    if name == "p_str_to_float" {
         if args.len() > 0 {
             var s: str = Interpreter_value_to_string(self, args.get(0));
             return ExecOutcome::Value(Value::Float(p_str_to_float(s)));
         }
         return ExecOutcome::Value(Value::Float(0.0));
     }
-    if str_equal(name, "p_str_to_int") {
+    if name == "p_str_to_int" {
         if args.len() > 0 {
             var s: str = Interpreter_value_to_string(self, args.get(0));
             return ExecOutcome::Value(Value::Int(p_str_to_int(s)));
         }
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_str_len") {
+    if name == "p_str_len" {
         if args.len() > 0 {
             match args.get(0) {
                 Value::Str(s) => { return ExecOutcome::Value(Value::Int(str_len(s))); }
@@ -2105,7 +2105,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_str_equal") {
+    if name == "p_str_equal" {
         // p_str_equal(a, b, n) — compare n bytes
         if args.len() >= 3 {
             var a_str: str = Interpreter_value_to_string(self, args.get(0));
@@ -2113,7 +2113,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
             match args.get(2) {
                 Value::Int(n) => {
                     if n >= str_len(a_str) && n >= str_len(b_str) {
-                        return ExecOutcome::Value(Value::Bool(str_equal(a_str, b_str)));
+                        return ExecOutcome::Value(Value::Bool(a_str == b_str));
                     }
                     // Compare first n characters
                     var i: i64 = 0;
@@ -2140,11 +2140,11 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Bool(false));
     }
-    if str_equal(name, "p_str_cmp") {
+    if name == "p_str_cmp" {
         if args.len() >= 2 {
             var a_str2: str = Interpreter_value_to_string(self, args.get(0));
             var b_str2: str = Interpreter_value_to_string(self, args.get(1));
-            if str_equal(a_str2, b_str2) { return ExecOutcome::Value(Value::Int(0)); }
+            if a_str2 == b_str2 { return ExecOutcome::Value(Value::Int(0)); }
             // Simplified: return 1 if a > b, -1 if a < b
             return ExecOutcome::Value(Value::Int(1));
         }
@@ -2154,7 +2154,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     // ─── Vec Operations ───
     // p_vec_new() -> returns a raw Fides Vec struct (24 bytes: data, len, cap)
     // The interpreter allocates this in simulated memory and tracks it.
-    if str_equal(name, "p_vec_new") {
+    if name == "p_vec_new" {
         // Allocate 24 bytes for the Vec struct {data: i64, len: i64, cap: i64}
         var vec_addr: i64 = Memory_alloc(&mut self.memory, 24);
         // Initialize: data=0, len=0, cap=0
@@ -2167,7 +2167,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         self.vec_side_table.push(VecSideEntry_new(vec_addr, handle));
         return ExecOutcome::Value(Value::Int(vec_addr));
     }
-    if str_equal(name, "p_vec_push") {
+    if name == "p_vec_push" {
         // p_vec_push(vec_addr, elem) — elem is an i64 (raw value)
         if args.len() >= 2 {
             match args.get(0) {
@@ -2210,7 +2210,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_vec_get") {
+    if name == "p_vec_get" {
         if args.len() >= 2 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
@@ -2232,7 +2232,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_vec_set") {
+    if name == "p_vec_set" {
         if args.len() >= 3 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
@@ -2260,7 +2260,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_vec_len") {
+    if name == "p_vec_len" {
         if args.len() >= 1 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
@@ -2272,7 +2272,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_vec_is_empty") {
+    if name == "p_vec_is_empty" {
         if args.len() >= 1 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
@@ -2284,7 +2284,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Bool(true));
     }
-    if str_equal(name, "p_vec_pop") {
+    if name == "p_vec_pop" {
         if args.len() >= 1 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
@@ -2303,7 +2303,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_vec_clear") {
+    if name == "p_vec_clear" {
         if args.len() >= 1 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
@@ -2317,7 +2317,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     }
 
     // ─── Map Operations (simplified) ───
-    if str_equal(name, "p_map_new") {
+    if name == "p_map_new" {
         // Allocate a HashMap struct (simplified: 32 bytes)
         var map_addr: i64 = Memory_alloc(&mut self.memory, 32);
         Memory_store_i64(&mut self.memory, map_addr, 0);     // keys ptr
@@ -2326,64 +2326,64 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         Memory_store_i64(&mut self.memory, map_addr + 24, 0); // cap
         return ExecOutcome::Value(Value::Int(map_addr));
     }
-    if str_equal(name, "p_map_insert") {
+    if name == "p_map_insert" {
         // p_map_insert(map_addr, key, value) — simplified linear scan
         // For now, just return void (full implementation would use
         // a side-table for key-value pairs)
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_map_get") || str_equal(name, "p_map_get_or") {
+    if name == "p_map_get" || name == "p_map_get_or" {
         // Simplified: return 0 if not found
-        if str_equal(name, "p_map_get_or") && args.len() >= 3 {
+        if name == "p_map_get_or" && args.len() >= 3 {
             return ExecOutcome::Value(args.get(2));
         }
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_map_contains") {
+    if name == "p_map_contains" {
         return ExecOutcome::Value(Value::Bool(false));
     }
-    if str_equal(name, "p_map_len") {
+    if name == "p_map_len" {
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_map_is_empty") {
+    if name == "p_map_is_empty" {
         return ExecOutcome::Value(Value::Bool(true));
     }
-    if str_equal(name, "p_map_clear") {
+    if name == "p_map_clear" {
         return ExecOutcome::Value(Value::Void);
     }
 
     // ─── Volatile memory access (MMIO simulation) ───
-    if str_equal(name, "p_volatile_load") {
+    if name == "p_volatile_load" {
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_volatile_store") {
+    if name == "p_volatile_store" {
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_volatile_load8") {
+    if name == "p_volatile_load8" {
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_volatile_store8") {
+    if name == "p_volatile_store8" {
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_volatile_load16") {
+    if name == "p_volatile_load16" {
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_volatile_store16") {
+    if name == "p_volatile_store16" {
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_volatile_load32") {
+    if name == "p_volatile_load32" {
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_volatile_store32") {
+    if name == "p_volatile_store32" {
         return ExecOutcome::Value(Value::Void);
     }
 
     // ─── String builder (p_sb_*) ───
     // String builders are represented as Str values that accumulate content.
-    if str_equal(name, "p_sb_new") {
+    if name == "p_sb_new" {
         return ExecOutcome::Value(Value::Str(""));
     }
-    if str_equal(name, "p_sb_append") {
+    if name == "p_sb_append" {
         if args.len() >= 2 {
             match args.get(0) {
                 Value::Str(sb) => {
@@ -2399,7 +2399,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_sb_to_str") {
+    if name == "p_sb_to_str" {
         if args.len() >= 1 {
             match args.get(0) {
                 Value::Str(sb) => {
@@ -2410,10 +2410,10 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Str(""));
     }
-    if str_equal(name, "p_sb_free") {
+    if name == "p_sb_free" {
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_sb_len") {
+    if name == "p_sb_len" {
         if args.len() >= 1 {
             match args.get(0) {
                 Value::Str(sb) => {
@@ -2426,7 +2426,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     }
 
     // ─── PRNG (xorshift128+) for DP noise ───
-    if str_equal(name, "p_prng_next") {
+    if name == "p_prng_next" {
         // xorshift128+ — returns a u64 value as i64
         var a: u64 = self.prng_state_a;
         var b: u64 = self.prng_state_b;
@@ -2438,7 +2438,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         self.prng_state_b = a;
         return ExecOutcome::Value(Value::Int(a as i64));
     }
-    if str_equal(name, "p_prng_uniform") {
+    if name == "p_prng_uniform" {
         // Returns a uniform random f64 in [0, 1)
         var a: u64 = self.prng_state_a;
         var b: u64 = self.prng_state_b;
@@ -2453,7 +2453,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         var result: f64 = (bits as f64) / (9007199254740992.0);
         return ExecOutcome::Value(Value::Float(result));
     }
-    if str_equal(name, "p_prng_gaussian") {
+    if name == "p_prng_gaussian" {
         // Box-Muller transform: generates a standard normal random f64
         var a: u64 = self.prng_state_a;
         var b: u64 = self.prng_state_b;
@@ -2502,7 +2502,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     }
 
     // ─── DP noise functions (use PRNG, not deterministic formulas) ───
-    if str_equal(name, "p_dp_noise") {
+    if name == "p_dp_noise" {
         // p_dp_noise(epsilon, sensitivity, value) -> noisy value
         if args.len() >= 3 {
             match args.get(0) {
@@ -2543,7 +2543,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Float(0.0));
     }
-    if str_equal(name, "p_gaussian_noise") {
+    if name == "p_gaussian_noise" {
         // p_gaussian_noise(sigma, value) -> noisy value
         if args.len() >= 2 {
             match args.get(0) {
@@ -2576,7 +2576,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Float(0.0));
     }
-    if str_equal(name, "p_dropout") {
+    if name == "p_dropout" {
         // p_dropout(prob, value) -> value * 0 with probability prob, else value
         if args.len() >= 2 {
             match args.get(0) {
@@ -2606,7 +2606,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Float(0.0));
     }
-    if str_equal(name, "p_dp_budget_check") {
+    if name == "p_dp_budget_check" {
         if args.len() >= 2 {
             match args.get(0) {
                 Value::Float(epsilon) => {
@@ -2626,7 +2626,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Panic("dp_budget_check: expected (f64, f64)");
     }
-    if str_equal(name, "p_dp_budget_reset") {
+    if name == "p_dp_budget_reset" {
         self.dp_epsilon_budget = 0.0;
         if args.len() >= 1 {
             match args.get(0) {
@@ -2644,7 +2644,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     // p_gt_run_all() resolves each queued thread's func_name and executes it
     // eagerly (interpreter is single-threaded — cooperative ordering, eager
     // bodies). is_done/get_result reflect the scheduler's real state.
-    if str_equal(name, "p_gt_spawn") {
+    if name == "p_gt_spawn" {
         if args.len() < 2 { return ExecOutcome::Value(Value::Int(-1)); }
         var func_name: str = "";
         match args.get(0) {
@@ -2659,11 +2659,11 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         var id: i64 = GreenThreadScheduler_spawn(&mut self.gt_scheduler, func_name, gt_args);
         return ExecOutcome::Value(Value::Int(id));
     }
-    if str_equal(name, "p_gt_yield") {
+    if name == "p_gt_yield" {
         GreenThreadScheduler_yield_current(&mut self.gt_scheduler);
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_gt_run_all") {
+    if name == "p_gt_run_all" {
         var last_result: i64 = 0;
         var gi: i64 = 0;
         while gi < self.gt_scheduler.next_id {
@@ -2709,69 +2709,69 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Int(last_result));
     }
-    if str_equal(name, "p_gt_is_done") {
+    if name == "p_gt_is_done" {
         if args.len() < 1 { return ExecOutcome::Value(Value::Bool(false)); }
         var id: i64 = 0;
         match args.get(0) { Value::Int(n) => { id = n; } _ => {} }
         return ExecOutcome::Value(Value::Bool(GreenThreadScheduler_is_done(&self.gt_scheduler, id)));
     }
-    if str_equal(name, "p_gt_get_result") {
+    if name == "p_gt_get_result" {
         if args.len() < 1 { return ExecOutcome::Value(Value::Int(0)); }
         var id: i64 = 0;
         match args.get(0) { Value::Int(n) => { id = n; } _ => {} }
         return ExecOutcome::Value(Value::Int(GreenThreadScheduler_get_result(&self.gt_scheduler, id)));
     }
-    if str_equal(name, "p_gt_current") {
+    if name == "p_gt_current" {
         return ExecOutcome::Value(Value::Int(GreenThreadScheduler_current_thread(&self.gt_scheduler)));
     }
-    if str_equal(name, "p_gt_reset") {
+    if name == "p_gt_reset" {
         self.gt_scheduler = GreenThreadScheduler_new();
         return ExecOutcome::Value(Value::Void);
     }
 
     // ─── Channels (ML/concurrency) ───
-    if str_equal(name, "p_chan_create") {
+    if name == "p_chan_create" {
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_chan_send") {
+    if name == "p_chan_send" {
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_chan_recv") {
+    if name == "p_chan_recv" {
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_chan_try_recv") {
+    if name == "p_chan_try_recv" {
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_chan_close") {
+    if name == "p_chan_close" {
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_chan_is_closed") {
+    if name == "p_chan_is_closed" {
         return ExecOutcome::Value(Value::Bool(false));
     }
 
     // ─── Autograd (ML3) ───
-    if str_equal(name, "p_grad_get") {
+    if name == "p_grad_get" {
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_grad_zero") {
+    if name == "p_grad_zero" {
         return ExecOutcome::Value(Value::Void);
     }
 
     // ─── Tensor builtins (Phase 5C.1) — wired to compiler::tensor ───
     // Value::Ptr(addr) stands in for Rust's Value::Tensor (see file header).
-    if str_equal(name, "p_tensor_zeros") {
+    if name == "p_tensor_zeros" {
         match Interpreter_arg_to_vec_i64(self, args.get(0)) {
             OptVecI64::Some(shape) => { return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_zeros(shape))); }
             _ => { return ExecOutcome::Panic("tensor_zeros: expected Vec"); }
         }
     }
-    if str_equal(name, "p_tensor_ones") {
+    if name == "p_tensor_ones" {
         match Interpreter_arg_to_vec_i64(self, args.get(0)) {
             OptVecI64::Some(shape) => { return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_ones(shape))); }
             _ => { return ExecOutcome::Panic("tensor_ones: expected Vec"); }
         }
     }
-    if str_equal(name, "p_tensor_filled") {
+    if name == "p_tensor_filled" {
         var fill: f64 = 0.0;
         var fill_ok: bool = false;
         match args.get(1) {
@@ -2786,7 +2786,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
             _ => { return ExecOutcome::Panic("tensor_filled: expected Vec, f64"); }
         }
     }
-    if str_equal(name, "p_tensor_from_vec") {
+    if name == "p_tensor_from_vec" {
         // stdlib calls from_vec(data, shape) — args are (data, shape)
         var data_opt: OptVecF64 = Interpreter_args_to_f64_vec(self, args, 0);
         var shape_opt: OptVecI64 = Interpreter_arg_to_vec_i64(self, args.get(1));
@@ -2800,7 +2800,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
             _ => { return ExecOutcome::Panic("tensor_from_vec: expected Vec, Vec"); }
         }
     }
-    if str_equal(name, "p_tensor_get") {
+    if name == "p_tensor_get" {
         var th: i64 = Interpreter_tensor_handle(self, args.get(0));
         var idx_opt: OptVecI64 = Interpreter_arg_to_vec_i64(self, args.get(1));
         if th < 0 { return ExecOutcome::Panic("tensor_get: expected Tensor, Vec"); }
@@ -2809,7 +2809,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
             _ => { return ExecOutcome::Panic("tensor_get: expected Tensor, Vec"); }
         }
     }
-    if str_equal(name, "p_tensor_set") {
+    if name == "p_tensor_set" {
         var th2: i64 = Interpreter_tensor_handle(self, args.get(0));
         var idx_opt2: OptVecI64 = Interpreter_arg_to_vec_i64(self, args.get(1));
         var setv: f64 = 0.0;
@@ -2829,7 +2829,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
             _ => { return ExecOutcome::Panic("tensor_set: expected Tensor, Vec, f64"); }
         }
     }
-    if str_equal(name, "p_tensor_shape") {
+    if name == "p_tensor_shape" {
         var th3: i64 = Interpreter_tensor_handle(self, args.get(0));
         if th3 < 0 { return ExecOutcome::Panic("tensor_shape: expected Tensor"); }
         var tsh: TensorData = self.tensors.get(th3);
@@ -2849,17 +2849,17 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         Memory_store_i64(&mut self.memory, struct_addr + 16, shlen);
         return ExecOutcome::Value(Value::Int(struct_addr));
     }
-    if str_equal(name, "p_tensor_ndim") {
+    if name == "p_tensor_ndim" {
         var th4: i64 = Interpreter_tensor_handle(self, args.get(0));
         if th4 < 0 { return ExecOutcome::Panic("tensor_ndim: expected Tensor"); }
         return ExecOutcome::Value(Value::Int(Tensor_ndim(&self.tensors.get(th4))));
     }
-    if str_equal(name, "p_tensor_size") {
+    if name == "p_tensor_size" {
         var th5: i64 = Interpreter_tensor_handle(self, args.get(0));
         if th5 < 0 { return ExecOutcome::Panic("tensor_size: expected Tensor"); }
         return ExecOutcome::Value(Value::Int(Tensor_size(&self.tensors.get(th5))));
     }
-    if str_equal(name, "p_tensor_reshape") {
+    if name == "p_tensor_reshape" {
         var th6: i64 = Interpreter_tensor_handle(self, args.get(0));
         var nshape_opt: OptVecI64 = Interpreter_arg_to_vec_i64(self, args.get(1));
         if th6 < 0 { return ExecOutcome::Panic("tensor_reshape: expected Tensor, Vec"); }
@@ -2873,12 +2873,12 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
             _ => { return ExecOutcome::Panic("tensor_reshape: expected Tensor, Vec"); }
         }
     }
-    if str_equal(name, "p_tensor_transpose") {
+    if name == "p_tensor_transpose" {
         var th7: i64 = Interpreter_tensor_handle(self, args.get(0));
         if th7 < 0 { return ExecOutcome::Panic("tensor_transpose: expected Tensor"); }
         return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_transpose(&self.tensors.get(th7))));
     }
-    if str_equal(name, "p_tensor_add") {
+    if name == "p_tensor_add" {
         var ha1: i64 = Interpreter_tensor_handle(self, args.get(0));
         var hb1: i64 = Interpreter_tensor_handle(self, args.get(1));
         if ha1 < 0 || hb1 < 0 { return ExecOutcome::Panic("tensor_add: expected Tensor, Tensor"); }
@@ -2887,7 +2887,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
             ResultTensor::Err(e2) => { return ExecOutcome::Panic(e2); }
         }
     }
-    if str_equal(name, "p_tensor_sub") {
+    if name == "p_tensor_sub" {
         var ha2: i64 = Interpreter_tensor_handle(self, args.get(0));
         var hb2: i64 = Interpreter_tensor_handle(self, args.get(1));
         if ha2 < 0 || hb2 < 0 { return ExecOutcome::Panic("tensor_sub: expected Tensor, Tensor"); }
@@ -2896,7 +2896,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
             ResultTensor::Err(e3) => { return ExecOutcome::Panic(e3); }
         }
     }
-    if str_equal(name, "p_tensor_mul") {
+    if name == "p_tensor_mul" {
         var ha3: i64 = Interpreter_tensor_handle(self, args.get(0));
         var hb3: i64 = Interpreter_tensor_handle(self, args.get(1));
         if ha3 < 0 || hb3 < 0 { return ExecOutcome::Panic("tensor_mul: expected Tensor, Tensor"); }
@@ -2905,7 +2905,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
             ResultTensor::Err(e4) => { return ExecOutcome::Panic(e4); }
         }
     }
-    if str_equal(name, "p_tensor_scale") {
+    if name == "p_tensor_scale" {
         var th8: i64 = Interpreter_tensor_handle(self, args.get(0));
         var sc: f64 = 0.0;
         var sc_ok: bool = false;
@@ -2916,7 +2916,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         if th8 < 0 || !sc_ok { return ExecOutcome::Panic("tensor_scale: expected Tensor, f64"); }
         return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_scale(&self.tensors.get(th8), sc)));
     }
-    if str_equal(name, "p_tensor_matmul") {
+    if name == "p_tensor_matmul" {
         var ha4: i64 = Interpreter_tensor_handle(self, args.get(0));
         var hb4: i64 = Interpreter_tensor_handle(self, args.get(1));
         if ha4 < 0 || hb4 < 0 { return ExecOutcome::Panic("tensor_matmul: expected Tensor, Tensor"); }
@@ -2925,7 +2925,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
             ResultTensor::Err(e5) => { return ExecOutcome::Panic(e5); }
         }
     }
-    if str_equal(name, "p_tensor_dot") {
+    if name == "p_tensor_dot" {
         var ha5: i64 = Interpreter_tensor_handle(self, args.get(0));
         var hb5: i64 = Interpreter_tensor_handle(self, args.get(1));
         if ha5 < 0 || hb5 < 0 { return ExecOutcome::Panic("tensor_dot: expected Tensor, Tensor"); }
@@ -2934,49 +2934,49 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
             ResultF64::Err(e6) => { return ExecOutcome::Panic(e6); }
         }
     }
-    if str_equal(name, "p_tensor_sum") {
+    if name == "p_tensor_sum" {
         var th9: i64 = Interpreter_tensor_handle(self, args.get(0));
         if th9 < 0 { return ExecOutcome::Panic("tensor_sum: expected Tensor"); }
         return ExecOutcome::Value(Value::Float(Tensor_sum(&self.tensors.get(th9))));
     }
-    if str_equal(name, "p_tensor_mean") {
+    if name == "p_tensor_mean" {
         var th10: i64 = Interpreter_tensor_handle(self, args.get(0));
         if th10 < 0 { return ExecOutcome::Panic("tensor_mean: expected Tensor"); }
         return ExecOutcome::Value(Value::Float(Tensor_mean(&self.tensors.get(th10))));
     }
-    if str_equal(name, "p_tensor_max") {
+    if name == "p_tensor_max" {
         var th11: i64 = Interpreter_tensor_handle(self, args.get(0));
         if th11 < 0 { return ExecOutcome::Panic("tensor_max: expected Tensor"); }
         return ExecOutcome::Value(Value::Float(Tensor_max(&self.tensors.get(th11))));
     }
-    if str_equal(name, "p_tensor_min") {
+    if name == "p_tensor_min" {
         var th12: i64 = Interpreter_tensor_handle(self, args.get(0));
         if th12 < 0 { return ExecOutcome::Panic("tensor_min: expected Tensor"); }
         return ExecOutcome::Value(Value::Float(Tensor_min(&self.tensors.get(th12))));
     }
-    if str_equal(name, "p_tensor_relu") {
+    if name == "p_tensor_relu" {
         var th13: i64 = Interpreter_tensor_handle(self, args.get(0));
         if th13 < 0 { return ExecOutcome::Panic("tensor_relu: expected Tensor"); }
         return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_relu(&self.tensors.get(th13))));
     }
-    if str_equal(name, "p_tensor_sigmoid") {
+    if name == "p_tensor_sigmoid" {
         var th14: i64 = Interpreter_tensor_handle(self, args.get(0));
         if th14 < 0 { return ExecOutcome::Panic("tensor_sigmoid: expected Tensor"); }
         return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_sigmoid(&self.tensors.get(th14))));
     }
-    if str_equal(name, "p_tensor_softmax") {
+    if name == "p_tensor_softmax" {
         var th15: i64 = Interpreter_tensor_handle(self, args.get(0));
         if th15 < 0 { return ExecOutcome::Panic("tensor_softmax: expected Tensor"); }
         return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_softmax(&self.tensors.get(th15))));
     }
-    if str_equal(name, "p_tensor_to_str") {
+    if name == "p_tensor_to_str" {
         var th16: i64 = Interpreter_tensor_handle(self, args.get(0));
         if th16 < 0 { return ExecOutcome::Panic("tensor_to_str: expected Tensor"); }
         return ExecOutcome::Value(Value::Str(Tensor_to_string(&self.tensors.get(th16))));
     }
 
     // ─── KV Cache (ML9) ───
-    if str_equal(name, "p_kv_cache_new") {
+    if name == "p_kv_cache_new" {
         var n_layers: i64 = 0;
         var max_seq: i64 = 0;
         var win_size: i64 = 0;
@@ -2989,7 +2989,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         self.kv_caches.push(KvCache_new(n_layers, max_seq, win_size, h_dim));
         return ExecOutcome::Value(Value::Int(cache_id));
     }
-    if str_equal(name, "p_kv_cache_append") {
+    if name == "p_kv_cache_append" {
         var cid: i64 = 0;
         var lyr: i64 = 0;
         match args.get(0) { Value::Int(c0) => { cid = c0; } _ => {} }
@@ -3003,7 +3003,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         self.kv_caches.set(cid, cache);
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_kv_cache_get") {
+    if name == "p_kv_cache_get" {
         var cid2: i64 = 0;
         var lyr2: i64 = 0;
         match args.get(0) { Value::Int(c1) => { cid2 = c1; } _ => {} }
@@ -3012,7 +3012,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         var cache2: KvCache = self.kv_caches.get(cid2);
         return ExecOutcome::Value(Interpreter_alloc_tensor(self, KvCache_get(&cache2, lyr2)));
     }
-    if str_equal(name, "p_kv_cache_len") {
+    if name == "p_kv_cache_len" {
         var cid3: i64 = 0;
         var lyr3: i64 = 0;
         match args.get(0) { Value::Int(c2) => { cid3 = c2; } _ => {} }
@@ -3021,7 +3021,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         var cache3: KvCache = self.kv_caches.get(cid3);
         return ExecOutcome::Value(Value::Int(KvCache_len(&cache3, lyr3)));
     }
-    if str_equal(name, "p_kv_cache_clear") {
+    if name == "p_kv_cache_clear" {
         var cid4: i64 = 0;
         match args.get(0) { Value::Int(c3) => { cid4 = c3; } _ => {} }
         if cid4 < 0 || cid4 >= self.kv_caches.len() { return ExecOutcome::Panic("kv_cache_clear: invalid cache id"); }
@@ -3030,7 +3030,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         self.kv_caches.set(cid4, cache4);
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_kv_cache_evict") {
+    if name == "p_kv_cache_evict" {
         var cid5: i64 = 0;
         var ntok: i64 = 0;
         match args.get(0) { Value::Int(c4) => { cid5 = c4; } _ => {} }
@@ -3043,7 +3043,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     }
 
     // ─── Quantization (ML10) ───
-    if str_equal(name, "p_quantize_q8") {
+    if name == "p_quantize_q8" {
         var thq: i64 = Interpreter_tensor_handle(self, args.get(0));
         var qscale: f64 = 0.0;
         var qzp: i64 = 0;
@@ -3053,7 +3053,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         if thq < 0 || !q_ok { return ExecOutcome::Panic("quantize_q8: expected (Tensor, f64, i64)"); }
         return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_quantize_q8(&self.tensors.get(thq), qscale, qzp)));
     }
-    if str_equal(name, "p_dequantize_q8") {
+    if name == "p_dequantize_q8" {
         var thd: i64 = Interpreter_tensor_handle(self, args.get(0));
         var dscale: f64 = 0.0;
         var dzp: i64 = 0;
@@ -3063,7 +3063,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         if thd < 0 || !d_ok { return ExecOutcome::Panic("dequantize_q8: expected (Tensor, f64, i64)"); }
         return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_dequantize_q8(&self.tensors.get(thd), dscale, dzp)));
     }
-    if str_equal(name, "p_qmatmul") {
+    if name == "p_qmatmul" {
         // Issue 12: Quantized matmul using i32 accumulation (ported inline,
         // mirrors src/interp.rs — tensor.fd has no Tensor_qmatmul).
         var qha: i64 = Interpreter_tensor_handle(self, args.get(0));
@@ -3104,7 +3104,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Interpreter_alloc_tensor(self, qres));
     }
-    if str_equal(name, "p_find_quant_params") {
+    if name == "p_find_quant_params" {
         var thp: i64 = Interpreter_tensor_handle(self, args.get(0));
         if thp < 0 { return ExecOutcome::Panic("find_quant_params: expected Tensor"); }
         var qp: QuantParams = Tensor_find_quant_params(&self.tensors.get(thp));
@@ -3112,12 +3112,12 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     }
 
     // ─── Tensor utilities ───
-    if str_equal(name, "p_tensor_to_json") {
+    if name == "p_tensor_to_json" {
         var thj: i64 = Interpreter_tensor_handle(self, args.get(0));
         if thj < 0 { return ExecOutcome::Panic("tensor_to_json: expected Tensor"); }
         return ExecOutcome::Value(Value::Str(Tensor_to_json(&self.tensors.get(thj))));
     }
-    if str_equal(name, "p_tensor_clone") {
+    if name == "p_tensor_clone" {
         var thc: i64 = Interpreter_tensor_handle(self, args.get(0));
         if thc < 0 { return ExecOutcome::Panic("tensor_clone: expected Tensor"); }
         var tclone: TensorData = self.tensors.get(thc);
@@ -3125,7 +3125,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     }
 
     // ─── String runtime functions (ported from src/interp.rs ~3288-3455) ───
-    if str_equal(name, "p_string_from") {
+    if name == "p_string_from" {
         if args.len() > 0 {
             match args.get(0) {
                 Value::Int(i) => { return ExecOutcome::Value(Value::Str(int_to_str(i))); }
@@ -3140,7 +3140,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Str(""));
     }
-    if str_equal(name, "p_string_len") {
+    if name == "p_string_len" {
         if args.len() > 0 {
             match args.get(0) {
                 Value::Str(s) => { return ExecOutcome::Value(Value::Int(str_len(s))); }
@@ -3149,7 +3149,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_string_is_empty") {
+    if name == "p_string_is_empty" {
         if args.len() > 0 {
             match args.get(0) {
                 Value::Str(s) => { return ExecOutcome::Value(Value::Bool(str_len(s) == 0)); }
@@ -3158,7 +3158,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Bool(true));
     }
-    if str_equal(name, "p_string_push_str") {
+    if name == "p_string_push_str" {
         if args.len() >= 2 {
             var left: str = Interpreter_value_to_string(self, args.get(0));
             var right: str = Interpreter_value_to_string(self, args.get(1));
@@ -3166,13 +3166,13 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Str(""));
     }
-    if str_equal(name, "p_string_to_string") {
+    if name == "p_string_to_string" {
         if args.len() > 0 {
             return ExecOutcome::Value(Value::Str(Interpreter_value_to_string(self, args.get(0))));
         }
         return ExecOutcome::Value(Value::Str(""));
     }
-    if str_equal(name, "p_string_slice") {
+    if name == "p_string_slice" {
         if args.len() >= 3 {
             var s: str = Interpreter_value_to_string(self, args.get(0));
             var start: i64 = 0;
@@ -3187,7 +3187,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Str(""));
     }
-    if str_equal(name, "p_string_contains") {
+    if name == "p_string_contains" {
         if args.len() >= 2 {
             var s: str = Interpreter_value_to_string(self, args.get(0));
             var sub: str = Interpreter_value_to_string(self, args.get(1));
@@ -3195,7 +3195,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Bool(false));
     }
-    if str_equal(name, "p_string_starts_with") {
+    if name == "p_string_starts_with" {
         if args.len() >= 2 {
             var s: str = Interpreter_value_to_string(self, args.get(0));
             var prefix: str = Interpreter_value_to_string(self, args.get(1));
@@ -3203,7 +3203,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Bool(false));
     }
-    if str_equal(name, "p_string_ends_with") {
+    if name == "p_string_ends_with" {
         if args.len() >= 2 {
             var s: str = Interpreter_value_to_string(self, args.get(0));
             var suffix: str = Interpreter_value_to_string(self, args.get(1));
@@ -3211,14 +3211,14 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Bool(false));
     }
-    if str_equal(name, "p_string_trim") {
+    if name == "p_string_trim" {
         if args.len() > 0 {
             var s: str = Interpreter_value_to_string(self, args.get(0));
             return ExecOutcome::Value(Value::Str(str_trim(s)));
         }
         return ExecOutcome::Value(Value::Str(""));
     }
-    if str_equal(name, "p_string_split") {
+    if name == "p_string_split" {
         if args.len() >= 2 {
             var s: str = Interpreter_value_to_string(self, args.get(0));
             var delim: str = Interpreter_value_to_string(self, args.get(1));
@@ -3260,7 +3260,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_string_replace") {
+    if name == "p_string_replace" {
         if args.len() >= 3 {
             var s: str = Interpreter_value_to_string(self, args.get(0));
             var from: str = Interpreter_value_to_string(self, args.get(1));
@@ -3269,7 +3269,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Str(""));
     }
-    if str_equal(name, "p_string_char_at") {
+    if name == "p_string_char_at" {
         if args.len() >= 2 {
             var s: str = Interpreter_value_to_string(self, args.get(0));
             var idx: i64 = -1;
@@ -3281,28 +3281,28 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_string_to_uppercase") {
+    if name == "p_string_to_uppercase" {
         if args.len() > 0 {
             var s: str = Interpreter_value_to_string(self, args.get(0));
             return ExecOutcome::Value(Value::Str(str_to_upper(s)));
         }
         return ExecOutcome::Value(Value::Str(""));
     }
-    if str_equal(name, "p_string_to_lowercase") {
+    if name == "p_string_to_lowercase" {
         if args.len() > 0 {
             var s: str = Interpreter_value_to_string(self, args.get(0));
             return ExecOutcome::Value(Value::Str(str_to_lower(s)));
         }
         return ExecOutcome::Value(Value::Str(""));
     }
-    if str_equal(name, "p_string_parse_int") {
+    if name == "p_string_parse_int" {
         if args.len() > 0 {
             var s: str = Interpreter_value_to_string(self, args.get(0));
             return ExecOutcome::Value(Value::Int(str_parse_int(s)));
         }
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_string_find") {
+    if name == "p_string_find" {
         if args.len() >= 2 {
             var s: str = Interpreter_value_to_string(self, args.get(0));
             var sub: str = Interpreter_value_to_string(self, args.get(1));
@@ -3310,7 +3310,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Int(-1));
     }
-    if str_equal(name, "p_string_rfind") {
+    if name == "p_string_rfind" {
         if args.len() >= 2 {
             var s: str = Interpreter_value_to_string(self, args.get(0));
             var sub: str = Interpreter_value_to_string(self, args.get(1));
@@ -3318,7 +3318,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Int(-1));
     }
-    if str_equal(name, "p_string_repeat") {
+    if name == "p_string_repeat" {
         if args.len() >= 2 {
             var s: str = Interpreter_value_to_string(self, args.get(0));
             var n: i64 = 0;
@@ -3327,7 +3327,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Str(""));
     }
-    if str_equal(name, "p_string_bytes") {
+    if name == "p_string_bytes" {
         if args.len() > 0 {
             var s: str = Interpreter_value_to_string(self, args.get(0));
             var slen: i64 = str_len(s);
@@ -3367,13 +3367,13 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_string_clone") {
+    if name == "p_string_clone" {
         if args.len() > 0 {
             return ExecOutcome::Value(Value::Str(Interpreter_value_to_string(self, args.get(0))));
         }
         return ExecOutcome::Value(Value::Str(""));
     }
-    if str_equal(name, "p_string_to_str") {
+    if name == "p_string_to_str" {
         if args.len() > 0 {
             return ExecOutcome::Value(Value::Str(Interpreter_value_to_string(self, args.get(0))));
         }
@@ -3381,7 +3381,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     }
 
     // ─── Bool runtime function ───
-    if str_equal(name, "p_bool_to_str") {
+    if name == "p_bool_to_str" {
         if args.len() > 0 {
             match args.get(0) {
                 Value::Bool(b) => {
@@ -3395,7 +3395,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     }
 
     // ─── Vec extra runtime functions (ported from src/interp.rs ~2868-3554) ───
-    if str_equal(name, "p_vec_to_str") {
+    if name == "p_vec_to_str" {
         if args.len() > 0 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
@@ -3417,7 +3417,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Str("[]"));
     }
-    if str_equal(name, "p_vec_insert") {
+    if name == "p_vec_insert" {
         if args.len() >= 3 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
@@ -3472,7 +3472,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_vec_remove") {
+    if name == "p_vec_remove" {
         if args.len() >= 2 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
@@ -3503,7 +3503,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_vec_contains") {
+    if name == "p_vec_contains" {
         if args.len() >= 2 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
@@ -3530,7 +3530,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Bool(false));
     }
-    if str_equal(name, "p_vec_reverse") {
+    if name == "p_vec_reverse" {
         if args.len() >= 1 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
@@ -3553,7 +3553,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_vec_first") {
+    if name == "p_vec_first" {
         if args.len() >= 1 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
@@ -3570,7 +3570,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_vec_last") {
+    if name == "p_vec_last" {
         if args.len() >= 1 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
@@ -3587,7 +3587,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_vec_extend") {
+    if name == "p_vec_extend" {
         if args.len() >= 2 {
             match args.get(0) {
                 Value::Int(dst_addr) => {
@@ -3636,7 +3636,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_vec_truncate") {
+    if name == "p_vec_truncate" {
         if args.len() >= 2 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
@@ -3656,7 +3656,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_vec_sort") {
+    if name == "p_vec_sort" {
         if args.len() >= 1 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
@@ -3684,7 +3684,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_vec_clone") {
+    if name == "p_vec_clone" {
         if args.len() >= 1 {
             match args.get(0) {
                 Value::Int(src_addr) => {
@@ -3713,7 +3713,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_vec_capacity") {
+    if name == "p_vec_capacity" {
         if args.len() >= 1 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
@@ -3727,7 +3727,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     }
 
     // ─── Map extra runtime functions (ported from src/interp.rs ~3208-3579) ───
-    if str_equal(name, "p_map_keys") {
+    if name == "p_map_keys" {
         // Create a new vec to hold keys (empty since map storage is simplified)
         var vec_addr: i64 = Memory_alloc(&mut self.memory, 24);
         Memory_store_i64(&mut self.memory, vec_addr, 0);
@@ -3735,7 +3735,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         Memory_store_i64(&mut self.memory, vec_addr + 16, 0);
         return ExecOutcome::Value(Value::Int(vec_addr));
     }
-    if str_equal(name, "p_map_values") {
+    if name == "p_map_values" {
         // Create a new vec to hold values (empty since map storage is simplified)
         var vec_addr: i64 = Memory_alloc(&mut self.memory, 24);
         Memory_store_i64(&mut self.memory, vec_addr, 0);
@@ -3743,10 +3743,10 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         Memory_store_i64(&mut self.memory, vec_addr + 16, 0);
         return ExecOutcome::Value(Value::Int(vec_addr));
     }
-    if str_equal(name, "p_map_remove") {
+    if name == "p_map_remove" {
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_map_clone") {
+    if name == "p_map_clone" {
         if args.len() >= 1 {
             match args.get(0) {
                 Value::Int(map_addr) => {
@@ -3770,18 +3770,18 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
 
     // ─── Clock runtime functions (ported from src/interp.rs ~4990-5006) ───
     // Use step_count as a simple monotonic counter for timing.
-    if str_equal(name, "p_clock_now") {
+    if name == "p_clock_now" {
         return ExecOutcome::Value(Value::Int(self.step_count));
     }
-    if str_equal(name, "p_clock_now_us") {
+    if name == "p_clock_now_us" {
         return ExecOutcome::Value(Value::Int(self.step_count));
     }
-    if str_equal(name, "p_clock_now_ms") {
+    if name == "p_clock_now_ms" {
         return ExecOutcome::Value(Value::Int(self.step_count));
     }
 
     // ─── Memset (simplified — just return ptr) ───
-    if str_equal(name, "p_memset") {
+    if name == "p_memset" {
         if args.len() >= 1 {
             match args.get(0) {
                 Value::Int(ptr) => { return ExecOutcome::Value(Value::Int(ptr)); }
@@ -3793,22 +3793,22 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     }
 
     // ─── File I/O builtins (stubs — no real file system access) ───
-    if str_equal(name, "p_file_read") {
+    if name == "p_file_read" {
         return ExecOutcome::Value(Value::Str(""));
     }
-    if str_equal(name, "p_file_write") {
+    if name == "p_file_write" {
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_file_exists") {
+    if name == "p_file_exists" {
         return ExecOutcome::Value(Value::Bool(false));
     }
-    if str_equal(name, "p_file_append") {
+    if name == "p_file_append" {
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_file_delete") {
+    if name == "p_file_delete" {
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_file_size") {
+    if name == "p_file_size" {
         return ExecOutcome::Value(Value::Int(0));
     }
 
@@ -3816,9 +3816,9 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     // Mirrors src/interp.rs: spawn resolves func_name, runs it immediately
     // (preserves Vec/Map side-table access), and stores the result in
     // future_values; the Int handle indexes that table via p_future_poll.
-    if str_equal(name, "p_thread_spawn") || str_equal(name, "p_executor_spawn") {
+    if name == "p_thread_spawn" || name == "p_executor_spawn" {
         var base: i64 = 0;
-        if str_equal(name, "p_executor_spawn") { base = 1; }
+        if name == "p_executor_spawn" { base = 1; }
         var func_name: str = "";
         match args.get(base) {
             Value::Str(s) => { func_name = s; }
@@ -3854,15 +3854,15 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         self.future_values.push(spawn_result);
         return ExecOutcome::Value(Value::Int(fidx));
     }
-    if str_equal(name, "p_thread_join") {
+    if name == "p_thread_join" {
         // Threads already ran eagerly at spawn — join is a no-op.
         return ExecOutcome::Value(Value::Void);
     }
-    if str_equal(name, "p_executor_new") {
+    if name == "p_executor_new" {
         self.thread_handle_count = self.thread_handle_count + 1;
         return ExecOutcome::Value(Value::Int(self.thread_handle_count));
     }
-    if str_equal(name, "p_executor_block_on") {
+    if name == "p_executor_block_on" {
         // block_on(exec, future) -> i64 — return the (already-resolved) result.
         var bf: i64 = -1;
         match args.get(1) { Value::Int(n) => { bf = n; } _ => {} }
@@ -3874,12 +3874,12 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_executor_run_all") || str_equal(name, "p_executor_poll_all") {
+    if name == "p_executor_run_all" || name == "p_executor_poll_all" {
         // Everything already ran eagerly at spawn.
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_future_poll") || str_equal(name, "p_future_ready") ||
-       str_equal(name, "p_task_poll") || str_equal(name, "p_task_poll_nonblocking") {
+    if name == "p_future_poll" || name == "p_future_ready" ||
+       name == "p_task_poll" || name == "p_task_poll_nonblocking" {
         var fh: i64 = -1;
         match args.get(0) { Value::Int(n) => { fh = n; } _ => {} }
         if fh >= 0 && fh < self.future_values.len() {
@@ -3896,7 +3896,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
         return ExecOutcome::Value(Value::Int(0));
     }
-    if str_equal(name, "p_task_is_ready") {
+    if name == "p_task_is_ready" {
         return ExecOutcome::Value(Value::Bool(true));
     }
 
@@ -4005,12 +4005,12 @@ pub fn Interpreter_parse_persisted_value(self: &Interpreter, saved: str, default
     if colon_idx >= 0 {
         var prefix: str = str_slice(saved, 0, colon_idx + 1);
         var rest: str = str_slice(saved, colon_idx + 1, str_len(saved));
-        if str_equal(prefix, "i:") { return Value::Int(str_parse_int(rest)); }
-        if str_equal(prefix, "b:") { return Value::Bool(str_equal(rest, "true")); }
-        if str_equal(prefix, "f:") { return Value::Float(str_parse_float(rest)); }
-        if str_equal(prefix, "s:") { return Value::Str(rest); }
-        if str_equal(prefix, "ps:") { return Value::Str(rest); }
-        if str_equal(prefix, "p:") { return Value::Ptr(str_parse_int(rest)); }
+        if prefix == "i:" { return Value::Int(str_parse_int(rest)); }
+        if prefix == "b:" { return Value::Bool(rest == "true"); }
+        if prefix == "f:" { return Value::Float(str_parse_float(rest)); }
+        if prefix == "s:" { return Value::Str(rest); }
+        if prefix == "ps:" { return Value::Str(rest); }
+        if prefix == "p:" { return Value::Ptr(str_parse_int(rest)); }
     }
     return default;
 }

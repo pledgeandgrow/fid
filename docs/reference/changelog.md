@@ -1,5 +1,105 @@
 # Fides Language Changelog
 
+## Session 27 — Soundness Pass & v1.1 Start (Oct 23, 2026)
+
+### Summary
+
+The type checker now rejects whole classes of wrong programs that used to
+compile silently, and the compiler's own source passes every new check.
+Turning each check on surfaced latent bugs in `compiler/*.fd`, the stdlib and
+the tests; all of them are fixed below. The compiler source passes every new
+check with 0 errors, and a full sweep of `tests/` and `examples/` shows no
+regression against the previous baseline (only the new expected-fail tests
+fail). The bootstrap fixpoint (stage 2 == stage 3, line endings normalized)
+was verified for the state through the new checks and the self-hosted
+miscompile fixes; the run covering the final changes (by-value `Vec`
+parameters, R1.1, R1.2, missing-return check) was still in progress at
+commit time.
+
+### New compiler checks (Rust bootstrap and self-hosted typechecker)
+
+| Check | What used to happen |
+|-------|---------------------|
+| Duplicate definitions (across and within modules) | One definition silently replaced the other for every caller |
+| Match patterns naming a nonexistent variant | The arm silently never matched (`BinOp::Ne` instead of `Neq`) |
+| Pattern arity vs. variant payload | Extra bindings read garbage |
+| Enum constructors: variant, arity, payload types | `E::Nope` and wrong payloads accepted |
+| `return` vs. declared return type | Not checked at all |
+| Every call argument | Only named-struct parameters were checked |
+| `&T` passed where `&mut T` is required | Accepted (mutation through a shared reference) |
+| Bare value stored where `Box<T>` is required | Accepted; kept a pointer into the caller's stack frame |
+| `Vec`/`str`/number passed where `&T` is declared, or `&T` where the value is | Accepted; wrote through or read the wrong pointer |
+| Non-void function that can fall off the end of its body | Accepted; callers received garbage |
+
+Supporting type-system fixes: if/match expressions have a type (were always
+`void`); a block ending in `return`/`break`/`continue` is `Never`; closures have
+a function type with inferred return type; `Box::new(x)` is `Box<T>` (was
+`&mut T`) with auto-deref for field access, `*` and `match`; locals shadow
+global functions in calls; `print`/`println` are polymorphic; `main` may
+return an exit code; `async fn -> Future<T>` bodies return `T`; FFI calls
+accept references/str/handles as pointers; `Vec` runtime builtins are typed.
+
+### Bugs fixed
+
+- **`&Vec` vs `Vec` mixups (about 160 call sites).** A `Vec` value is a handle;
+  `&v` points at the variable holding it. Passing one where the other was
+  declared lost writes silently (the ELF/x86 byte emitters `pb2`..`pb8`,
+  `emit_u32`, ...) or read garbage (the self-hosted borrow checker crashed on
+  every closure that captures a variable). `Vec` parameters are now by value
+  and the type checker rejects the mismatch.
+- **Functions that fell off the end** without returning: `parse_match_expr`
+  (match expressions evaluated to 0 in self-hosted builds), `parse_use_stmt`,
+  `parse_guard_stmt`, `parse_comptime_expr` (no `comptime <expr>` form).
+
+- **Silent symbol collisions (81 removed).** Among them: the RISC-V backend
+  ran ARM64's `parse_reg`/`reg_name`/`vreg_to_reg`; the whole compiler ran
+  `opt.fd`'s `binop_eq`, which matched nonexistent variants, so `!=` on
+  strings compared pointers; `scribe --help` printed ark's help; `Panic` was
+  not a block terminator.
+- **Self-hosted compiler miscompiles:** `v[i] = x` passed the array *name*
+  where an expression was expected (null deref) and dropped the hidden env
+  argument; f-string literal parts were dropped (`FStringPart::Str` arm never
+  matched); if-expressions always took the else branch (the parser stored the
+  condition without `Box::new`, leaving a dangling pointer) and never stored
+  their value; a named function used as a value lowered to `0`; inline-asm
+  clobbers were misparsed (`AsmDir::Clobber` missing from the AST);
+  type-alias resolution recursed on garbage; `>>` constant-folding truncated
+  negative numbers; the C backend emitted `(double)` casts of pointers, which
+  only tcc accepted.
+- **Parser/lexer:** `Vec<Vec<T>>` (`>>` closing two generic lists) now parses;
+  char literals (`'/'`, `'\n'`, `'\x41'`, `'\u{1F600}'`) added (R1.7).
+- **Strings (R1.1):** `==`/`!=` lower to a content comparison whenever either
+  side is `str`, and all 1,973 `str_equal(a, b)` calls in `compiler/*.fd`
+  were rewritten as `a == b` (verified per function: every comparison still
+  lowers to `p_str_equal`).
+- **Compiler source:** four functions mutated through `&self`; two maps had
+  the wrong value type; a signature named a nonexistent type (`Stmts`); the
+  formatter compared tokens with a string compare; the x64 backend used a
+  nonexistent `Operand::Imm`.
+- **Stdlib/tests:** bool wrappers returned C-style `i64`; `vec.fd`/`parallel.fd`
+  helpers typed vectors as `i64`; 55 test call sites passed `&x` to `&mut`
+  parameters; self-host tests built AST nodes with stale field counts.
+
+### Tooling
+
+- `scripts/bootstrap.sh` — reproducible 3-stage bootstrap with any C compiler
+  (tcc, gcc, clang or `zig cc`), 256MB-stack wrapper on Windows and POSIX,
+  and a line-ending-insensitive fixpoint check.
+- New regression tests: `test_shr_generics`, `test_char_literals`,
+  `test_str_eq_contexts`, `test_expr_values`, and expected-fail
+  `test_unknown_variant_fail`, `test_return_type_fail`, `test_arg_type_fail`,
+  `test_mut_ref_fail`, `test_box_owned_fail`, `test_duplicate_fn_fail`.
+
+### Known issues (next)
+
+- Remaining v1.1 items: R1.2 (enum `==`), R1.6 (cross-module enum/struct
+  syntax), R1.3 (`Option<T>` layouts), R1.4 (layout-aware `Vec<T>`).
+- `val x: str = <i64>` is still accepted: `str` and `i64` remain mutually
+  compatible until `str` stops being a raw pointer.
+- Self-hosted builds: fixed-size arrays emit invalid C; f-string `{expr}`
+  parts are not interpolated.
+- Self-hosted diagnostics attribute stdlib errors to the wrong file.
+
 ## Session 26 — Bootstrap Fixpoint & Gap Fixes (Sep 12, 2026)
 
 ### Summary

@@ -218,6 +218,39 @@ fn find_project_root(start: &Path) -> PathBuf {
     start.to_path_buf()
 }
 
+/// `stdlib/` directories of an *installed* toolchain, tried after the
+/// source-relative and project-root candidates. Covers the layouts the
+/// release artifacts produce:
+///   - `$FID_HOME/stdlib`            (install.sh / install.ps1: ~/.fid)
+///   - `<exe dir>/stdlib`             (Windows installer: C:\Program Files\Fides)
+///   - `<exe dir>/../stdlib`          (archives: ~/.fid/bin/fidesc → ~/.fid/stdlib)
+/// Without these, `use vec;` only resolves when the program lives inside the
+/// repository or the CWD is the repository root.
+fn installed_stdlib_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(home) = std::env::var("FID_HOME") {
+        dirs.push(Path::new(&home).join("stdlib"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            dirs.push(exe_dir.join("stdlib"));
+            if let Some(parent) = exe_dir.parent() {
+                dirs.push(parent.join("stdlib"));
+            }
+        }
+    }
+    dirs.retain(|d| d.is_dir());
+    dirs
+}
+
+/// `<dir>/<path>.fd` and `<dir>/<path>/mod.fd` for every installed stdlib dir.
+fn installed_stdlib_candidates(path_str: &str) -> Vec<PathBuf> {
+    installed_stdlib_dirs()
+        .into_iter()
+        .flat_map(|d| [d.join(format!("{}.fd", path_str)), d.join(format!("{}/mod.fd", path_str))])
+        .collect()
+}
+
 fn parse_source(source: &str) -> Result<Program, Vec<String>> {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize();
@@ -313,7 +346,7 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
             ];
 
             let mut found = None;
-            for candidate in &candidates {
+            for candidate in candidates.iter().chain(installed_stdlib_candidates(&path_str).iter()) {
                 if candidate.exists() {
                     found = Some(candidate.clone());
                     break;
@@ -494,6 +527,9 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
 
     // Phase 7.7: Process @derive annotations — generate Debug/Clone impl methods
     process_derive(&mut program);
+
+    // R1.2: structural `==` for enums (the lowerer calls `__eq_<Enum>`).
+    synthesize_enum_eq(&mut program);
 
     // Desugar layer/model declarations into structs + impls + functions
     desugar_layers_models(&mut program);
@@ -1054,7 +1090,7 @@ fn fill_default_trait_methods(program: &mut Program) {
 }
 
 /// Report top-level items defined in more than one (non-stdlib) module.
-/// Functions and consts conflict on name alone; structs and enums conflict only
+/// Functions (even within one module) and consts conflict on name alone; structs and enums conflict only
 /// when their definitions differ (identical re-declarations are tolerated).
 fn find_module_conflicts(modules: &[(&String, &Program)]) -> Vec<String> {
     use std::collections::HashMap;
@@ -1064,13 +1100,18 @@ fn find_module_conflicts(modules: &[(&String, &Program)]) -> Vec<String> {
     let mut types: HashMap<&str, (&str, String)> = HashMap::new();
     for (module, prog) in modules {
         for f in &prog.funcs {
+            // Platform alternatives selected by @cfg are filtered later.
+            if f.annotations.iter().any(|a| a.name == "cfg") {
+                continue;
+            }
             if let Some(prev) = funcs.insert(&f.name, module) {
-                if prev != module.as_str() {
-                    errors.push(format!(
-                        "Duplicate definition: function '{}' is defined in both module '{}' and module '{}' (line {})",
-                        f.name, prev, module, f.line
-                    ));
-                }
+                errors.push(if prev == module.as_str() {
+                    format!("Duplicate definition: function '{}' is defined twice in module '{}' (line {})",
+                        f.name, module, f.line)
+                } else {
+                    format!("Duplicate definition: function '{}' is defined in both module '{}' and module '{}' (line {})",
+                        f.name, prev, module, f.line)
+                });
             }
         }
         for c in &prog.consts {
@@ -1437,7 +1478,7 @@ fn build_program_with_lints(source: &str, source_path: Option<&str>) -> Result<(
             ];
 
             let mut found = None;
-            for candidate in &candidates {
+            for candidate in candidates.iter().chain(installed_stdlib_candidates(&path_str).iter()) {
                 if candidate.exists() {
                     found = Some(candidate.clone());
                     break;
@@ -1930,7 +1971,7 @@ pub fn emit_boot(source: &str, source_path: &str) -> Result<Vec<u8>, Vec<String>
         ];
 
         let mut found = None;
-        for candidate in &candidates {
+        for candidate in candidates.iter().chain(installed_stdlib_candidates(&path_str).iter()) {
             if candidate.exists() {
                 found = Some(candidate.clone());
                 break;
@@ -2053,6 +2094,96 @@ fn default_expr_for_type(ty: &crate::ast::Type) -> crate::ast::Expr {
 ///   @derive(Clone)  — generates a clone() method that copies the struct
 ///   @derive(Default) — generates a default() method that returns a zero-initialized struct
 ///   @derive(PartialEq) — generates an equals() method that compares all fields with ==
+/// R1.2: `==` / `!=` on enum values compare tag and payload. For every
+/// non-generic enum, synthesize
+///
+///     fn __eq_E(__eq_a: E, __eq_b: E) -> bool {
+///         match __eq_a {
+///             E::V(__a0, __a1) => { match __eq_b { E::V(__b0, __b1) => { return __a0 == __b0 && __a1 == __b1; } _ => { return false; } } }
+///             ...
+///         }
+///         return false;
+///     }
+///
+/// and the lowerer turns `==` on enum operands into a call. Payload fields are
+/// compared with `==` themselves: strings by content, nested enums
+/// recursively, numbers by value. (Generic enums such as Option<T> are left to
+/// R1.3.)
+pub fn synthesize_enum_eq(program: &mut Program) {
+    use crate::ast::{Func, Param, Type, Expr, Stmt, MatchArm, Pattern, BinOp};
+    let mut generated: Vec<Func> = Vec::new();
+    for e in &program.enums {
+        if !e.type_params.is_empty() {
+            continue;
+        }
+        let fname = format!("__eq_{}", e.name);
+        if program.funcs.iter().any(|f| f.name == fname) {
+            continue;
+        }
+        let pattern = |prefix: &str, variant: &str, n: usize| Pattern::EnumVariant {
+            enum_name: e.name.clone(),
+            variant: variant.to_string(),
+            bindings: (0..n).map(|i| (format!("{}{}", prefix, i), String::new())).collect(),
+        };
+        let ret = |value: Expr| Stmt::Return(Some(value), 0);
+        let mut arms = Vec::new();
+        for v in &e.variants {
+            let n = v.data.as_ref().map_or(0, |d| d.len());
+            let mut same = Expr::BoolLit(true);
+            for i in 0..n {
+                let field_eq = Expr::Binary {
+                    op: BinOp::Eq,
+                    left: Box::new(Expr::Ident(format!("__a{}", i))),
+                    right: Box::new(Expr::Ident(format!("__b{}", i))),
+                };
+                same = if i == 0 {
+                    field_eq
+                } else {
+                    Expr::Binary { op: BinOp::And, left: Box::new(same), right: Box::new(field_eq) }
+                };
+            }
+            let inner = Stmt::Match {
+                expr: Expr::Ident("__eq_b".to_string()),
+                arms: vec![
+                    MatchArm { pattern: pattern("__b", &v.name, n), guard: None, body: vec![ret(same)] },
+                    MatchArm { pattern: Pattern::Wildcard, guard: None, body: vec![ret(Expr::BoolLit(false))] },
+                ],
+                line: 0,
+            };
+            arms.push(MatchArm { pattern: pattern("__a", &v.name, n), guard: None, body: vec![inner] });
+        }
+        let param = |name: &str| Param {
+            name: name.to_string(),
+            ty: Type::Named(e.name.clone()),
+            is_pub: false,
+            annotations: Vec::new(),
+        };
+        generated.push(Func {
+            name: fname,
+            type_params: Vec::new(),
+            type_param_bounds: Vec::new(),
+            const_params: Vec::new(),
+            params: vec![param("__eq_a"), param("__eq_b")],
+            ret_ty: Type::Bool,
+            body: vec![
+                Stmt::Match { expr: Expr::Ident("__eq_a".to_string()), arms, line: 0 },
+                ret(Expr::BoolLit(false)),
+            ],
+            is_pub: true,
+            is_comptime: false,
+            declared_effects: Vec::new(),
+            has_effect_annotation: false,
+            is_interrupt: false,
+            annotations: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            is_async: false,
+            line: 0,
+        });
+    }
+    program.funcs.extend(generated);
+}
+
 fn process_derive(program: &mut Program) {
     use crate::ast::{Func, Param, Type, Expr, Stmt};
 

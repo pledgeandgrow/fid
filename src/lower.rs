@@ -4113,6 +4113,43 @@ impl Lowerer {
                     return eq_val;
                 }
 
+                // R1.2: `==` / `!=` on enum values call the synthesized
+                // `__eq_<Enum>` (tag + payload) instead of comparing pointers.
+                if matches!(op, BinOp::Eq | BinOp::Neq) {
+                    let enum_of = |t: &IrType| -> Option<String> {
+                        match t {
+                            IrType::Struct(n) => Some(n.clone()),
+                            IrType::Ptr(inner) => match inner.as_ref() {
+                                IrType::Struct(n) => Some(n.clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        }
+                    };
+                    let eq_func = enum_of(&left_ir_ty)
+                        .or_else(|| enum_of(&right_ir_ty))
+                        .filter(|n| self.enums.contains_key(n))
+                        .map(|n| format!("__eq_{}", n))
+                        .filter(|f| self.module.functions.contains_key(f));
+                    if let Some(func) = eq_func {
+                        let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                        let eq_val = self.emit_inst(Inst::Call {
+                            func,
+                            args: vec![dummy_env, left_val, right_val],
+                            ret_ty: IrType::Bool,
+                            effects: EffectSet::new(),
+                        });
+                        if matches!(op, BinOp::Neq) {
+                            return self.emit_inst(Inst::UnaryOp {
+                                op: UnaryOp::Not,
+                                operand: eq_val,
+                                ty: IrType::Bool,
+                            });
+                        }
+                        return eq_val;
+                    }
+                }
+
                 self.emit_inst(Inst::BinOp {
                     op: op.clone(),
                     left: left_val,

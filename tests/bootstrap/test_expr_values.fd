@@ -1,0 +1,52 @@
+// Test: values of if/match expressions, functions passed as values,
+// closures with inferred return types, and index assignment.
+// Each of these miscompiled in the self-hosted compiler before.
+
+fn twice(x: i64) -> i64 { return x * 2; }
+fn apply(f: fn(i64) -> i64, v: i64) -> i64 { return f(v); }
+
+fn make_adder(n: i64) -> fn(i64) -> i64 {
+    return fn(x: i64) => x + n;
+}
+
+enum Shape { Circle(i64), Square(i64), Empty }
+
+fn area(s: Shape) -> i64 {
+    val a = match s {
+        Shape::Circle(r) => { 3 * r * r }
+        Shape::Square(w) => { w * w }
+        Shape::Empty => { return 0; }
+    };
+    return a;
+}
+
+fn id(x: i64) -> i64 { return x; }
+
+fn main() {
+    // if-expression values (the condition used to dangle -> else branch always)
+    val x = if 1 > 0 { 7 } else { 9 };
+    assert_msg(x == 7, "if-expression takes the then-branch");
+    val y = if id(0) > 1 { 7 } else { 9 };
+    assert_msg(y == 9, "if-expression takes the else-branch");
+
+    // match-expression values, including a diverging arm
+    assert_msg(area(Shape::Square(4)) == 16, "match value");
+    assert_msg(area(Shape::Circle(2)) == 12, "match value with payload");
+    assert_msg(area(Shape::Empty) == 0, "diverging match arm");
+
+    // a named function passed as a value (used to be lowered as 0)
+    assert_msg(apply(twice, 21) == 42, "function passed as a value");
+
+    // closure with an inferred return type
+    val add5 = make_adder(5);
+    assert_msg(add5(10) == 15, "closure return type inferred");
+
+    // index assignment on Vec (used to crash in self-hosted builds)
+    var v: Vec<i64> = Vec::new();
+    v.push(1);
+    v.push(2);
+    v[0] = 40;
+    v[1] += 2;
+    assert_msg(v.get(0) + v.get(1) == 44, "Vec index assignment");
+    print("expr values OK\n");
+}

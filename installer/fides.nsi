@@ -10,8 +10,8 @@
 
 !define VERSION "1.0.0"
 !define PRODUCT_NAME "Fides"
-!define PRODUCT_PUBLISHER "Pledge"
-!define PRODUCT_URL "https://github.com/medzer/pledge/p-lang"
+!define PRODUCT_PUBLISHER "Pledge & Grow"
+!define PRODUCT_URL "https://github.com/pledgeandgrow/p-lang"
 !define PRODUCT_REGKEY "Software\Fides"
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Fides"
 !define ENV_HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
@@ -73,8 +73,16 @@ Section "Fides Compiler (required)" SecCore
 
   SetOutPath "$INSTDIR"
 
-  ; Compiler binary (renamed from fides-c3.exe to fides.exe)
+  ; Compiler binary (renamed from fides-c3.exe to fides.exe — kept for
+  ; backwards compatibility with docs and shortcuts that say `fides`)
   File /oname=fides.exe "..\release\fides-c3.exe"
+
+  ; The same compiler under its canonical name, plus the companion tools.
+  ; Stage them in release\ first (build-installer.sh / build-installer.yml do).
+  File "..\release\fidesc.exe"
+  File "..\release\ark.exe"
+  File "..\release\scribe.exe"
+  File "..\release\veil.exe"
 
   ; License file
   File "license.txt"
@@ -167,7 +175,7 @@ SectionEnd
 
 ; ─── Section Descriptions ────────────────────────────────────────────────
 
-LangString DESC_Core ${LANG_ENGLISH} "The Fides compiler (fides.exe). Required."
+LangString DESC_Core ${LANG_ENGLISH} "The Fides compiler (fides.exe / fidesc.exe) and the companion tools ark, scribe, and veil. Required."
 LangString DESC_Stdlib ${LANG_ENGLISH} "Standard library modules (core, vec, string, math, etc.)."
 LangString DESC_Runtime ${LANG_ENGLISH} "C runtime files for SDL, audio, networking."
 LangString DESC_Docs ${LANG_ENGLISH} "Language reference, guides, and roadmap documentation."
@@ -190,6 +198,10 @@ LangString DESC_Shortcuts ${LANG_ENGLISH} "Create Start Menu shortcuts for Fides
 Section "Uninstall"
   ; Remove files
   Delete "$INSTDIR\fides.exe"
+  Delete "$INSTDIR\fidesc.exe"
+  Delete "$INSTDIR\ark.exe"
+  Delete "$INSTDIR\scribe.exe"
+  Delete "$INSTDIR\veil.exe"
   Delete "$INSTDIR\license.txt"
   Delete "$INSTDIR\uninstall.exe"
   RMDir /r "$INSTDIR\stdlib"
