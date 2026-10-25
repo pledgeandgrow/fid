@@ -55,14 +55,24 @@ fn is_skip_test(name: &str) -> bool {
         // Benchmark files produce timing-dependent output that differs
         // between interpreter and native codegen — not correctness tests.
         | "bench_stringbuilder.fd"
+        // A library module with no main(), not a standalone program.
+        | "test_token_full.fd"
+        // Links SQLite, which Fides does not ship (`fidesc test` runs it
+        // only with FIDES_TEST_EXTERNAL=1).
+        | "test_sqlite.fd"
         // Borrow checker fail test is now in the expected-fail list
         // (borrow checking is on by default as of Phase 5).
     )
 }
 
-/// Tests that are expected to fail (they test error detection).
+/// Tests that are expected to fail (they test error detection): every
+/// `*_fail.fd` / `*_fail2.fd` file, as in `fidesc test --fail`, plus the
+/// ones listed by name.
 fn is_expect_fail_test(name: &str) -> bool {
-    matches!(
+    name.ends_with("_fail.fd") || name.ends_with("_fail2.fd") || matches!(
+        name,
+        "test_never_type2.fd"
+    ) || matches!(
         name,
         "test_trait_verify_fail.fd" | "test_budget_fail.fd" | "test_sandbox_fail.fd"
         | "test_deterministic_fail.fd" | "test_field_privacy_fail.fd"
@@ -120,21 +130,22 @@ fn discover_tests() -> Vec<PathBuf> {
     tests
 }
 
-/// Build the fidesc binary if not already built.
+/// The fidesc binary Cargo built for this test run (whatever the profile
+/// or target directory; a hard-coded `target/debug/fidesc` was stale or
+/// missing under `--release` and `CARGO_TARGET_DIR`).
 fn ensure_binary() -> PathBuf {
-    let bin = PathBuf::from("target/debug/fidesc");
-    if !bin.exists() {
-        let status = Command::new("cargo")
-            .args(["build"])
-            .status()
-            .expect("Failed to run `cargo build`");
-        assert!(status.success(), "cargo build failed");
-    }
-    bin.canonicalize().unwrap_or(bin)
+    PathBuf::from(env!("CARGO_BIN_EXE_fidesc"))
 }
 
 /// Run a test file through the interpreter and return (exit_code, stdout).
 fn run_interpreter(bin: &Path, test: &Path) -> Option<(i32, String)> {
+    run_interpreter_checked(bin, test).map(|(code, stdout, _)| (code, stdout))
+}
+
+/// Like `run_interpreter`, plus whether the run failed: it panicked or
+/// reported an error. (The exit code alone does not say: it is main's
+/// return value.)
+fn run_interpreter_checked(bin: &Path, test: &Path) -> Option<(i32, String, bool)> {
     let output = Command::new(bin)
         .arg("run")
         .arg(test)
@@ -142,7 +153,16 @@ fn run_interpreter(bin: &Path, test: &Path) -> Option<(i32, String)> {
         .ok()?;
     let code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    Some((code, stdout))
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    // The same rule as `fidesc test` ("Panic: ...", "Type error ...").
+    let failed = stderr.contains("panic:") || stderr.contains("error");
+    Some((code, stdout, failed))
+}
+
+/// The PE backend refused the program because the native runtime lacks a
+/// function it calls (`fidesc test` reports these as unsupported).
+fn is_pe_unsupported(err: &str) -> bool {
+    err.contains("not available in native Windows executables")
 }
 
 /// Run a test file through the PE emitter and validate the PE structure.
@@ -262,11 +282,11 @@ fn interpreter_all_tests() {
             continue;
         }
 
-        match run_interpreter(&bin, test) {
-            Some((code, _stdout)) => {
-                // Tests that expect to fail: non-zero exit is a pass
+        match run_interpreter_checked(&bin, test) {
+            Some((code, _stdout, run_failed)) => {
+                // Tests that expect to fail: a rejection or a panic is a pass
                 if is_expect_fail_test(&name) {
-                    if code != 0 {
+                    if code != 0 || run_failed {
                         passed += 1;
                     } else {
                         failed += 1;
@@ -274,13 +294,13 @@ fn interpreter_all_tests() {
                     }
                     continue;
                 }
-                // Interpreter should not panic (exit code 1 with "Panic:" is a
-                // failure). A normal return with any exit code is a pass.
-                if code == 1 && _stdout.is_empty() {
+                // The interpreter must not panic or report an error. The
+                // exit code is main's return value, so any code is fine.
+                if run_failed {
                     failed += 1;
                     failures.push(format!(
-                        "{}: exit=1 with no output",
-                        name
+                        "{}: panicked or reported an error (exit={})",
+                        name, code
                     ));
                 } else {
                     passed += 1;
@@ -323,6 +343,7 @@ fn pe_emitter_all_tests() {
 
     let mut passed = 0;
     let mut failed = 0;
+    let mut unsupported = 0;
     let mut failures: Vec<String> = Vec::new();
 
     for test in &tests {
@@ -332,6 +353,7 @@ fn pe_emitter_all_tests() {
         }
         match run_pe_emitter(&bin, test, &tmp) {
             Ok(()) => passed += 1,
+            Err(e) if is_pe_unsupported(&e) => unsupported += 1,
             Err(e) => {
                 failed += 1;
                 failures.push(format!(
@@ -354,7 +376,8 @@ fn pe_emitter_all_tests() {
             failures.join("\n")
         );
     }
-    println!("PE Emitter: {}/{} tests passed (structure validated)", passed, tests.len());
+    println!("PE Emitter: {}/{} tests passed (structure validated), {} unsupported by the native runtime",
+        passed, tests.len(), unsupported);
 }
 
 #[test]
@@ -473,11 +496,12 @@ fn golden_files_match() {
             continue;
         }
 
-        let golden = fs::read_to_string(&golden_path).unwrap_or_default();
+        // Line endings depend on how the golden file was checked out.
+        let golden = fs::read_to_string(&golden_path).unwrap_or_default().replace("\r\n", "\n");
 
         match run_interpreter(&bin, test) {
             Some((_code, stdout)) => {
-                if stdout == golden {
+                if stdout.replace("\r\n", "\n") == golden {
                     matched += 1;
                 } else {
                     mismatched += 1;

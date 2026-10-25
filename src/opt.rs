@@ -3596,7 +3596,7 @@ pub fn pass_inline(module: &mut L2Module) -> usize {
 /// Topologically sort a block's instruction list so that every value is
 /// defined before it is used. This is needed after inlining, which can
 /// insert instructions at positions that violate SSA ordering.
-fn topo_sort_block(b: &mut L2Block, values: &HashMap<PValue, L2Inst>) {
+fn topo_sort_block(b: &mut L2Block, values: &std::collections::BTreeMap<PValue, L2Inst>) {
     use std::collections::HashSet;
 
     let insts: Vec<PValue> = b.instructions.clone();
@@ -5693,7 +5693,7 @@ fn verify_reorder_safety(
     new_insts: &[PValue],
     pure_indices: &[usize],
     side_effect_indices: &[usize],
-    values: &std::collections::HashMap<PValue, L2Inst>,
+    values: &std::collections::BTreeMap<PValue, L2Inst>,
 ) -> bool {
     // Collect all values produced by side-effecting instructions
     let side_effect_values: std::collections::HashSet<PValue> = side_effect_indices
@@ -5819,7 +5819,7 @@ fn pass_partial_eval(module: &mut L2Module) -> usize {
 }
 
 /// Check if a PValue is a constant
-fn is_constant_pv(pv: &PValue, values: &std::collections::HashMap<PValue, L2Inst>) -> bool {
+fn is_constant_pv(pv: &PValue, values: &std::collections::BTreeMap<PValue, L2Inst>) -> bool {
     if let Some(inst) = values.get(pv) {
         matches!(
             inst,
@@ -5876,7 +5876,7 @@ fn eval_const_call(
     callee: &str,
     args: &[PValue],
     all_funcs: &[L2Function],
-    caller_values: &std::collections::HashMap<PValue, L2Inst>,
+    caller_values: &std::collections::BTreeMap<PValue, L2Inst>,
 ) -> Option<ConstResult> {
     // Get the constant argument values
     let mut arg_vals: Vec<i64> = Vec::new();
@@ -5945,7 +5945,7 @@ fn eval_const_call(
 /// Get a constant integer value for a PValue, either directly or from params
 fn get_const_int(
     pv: &PValue,
-    values: &std::collections::HashMap<PValue, L2Inst>,
+    values: &std::collections::BTreeMap<PValue, L2Inst>,
     params: &[i64],
 ) -> Option<i64> {
     if let Some(inst) = values.get(pv) {
@@ -7583,7 +7583,7 @@ mod tests {
         // If a struct's address is passed to a call, SROA should not touch it.
         let src = "
             struct Point { x: i32, y: i32 }
-            fn use_point(p: *Point) -> void { }
+            fn use_point(p: &Point) -> void { }
             fn main() -> void {
                 val p = Point { x: 1, y: 2 };
                 use_point(&p);
@@ -7627,7 +7627,7 @@ mod tests {
             params: vec![],
             ret_ty: IrType::I64,
             blocks: vec![L2Block { id: BlockId(0), instructions: vec![], predecessors: vec![], params: vec![] }],
-            values: std::collections::HashMap::new(),
+            values: std::collections::BTreeMap::new(),
             entry: BlockId(0),
             is_pure: false,
             is_wrapping: false,
@@ -7640,6 +7640,7 @@ mod tests {
             is_no_alloc: false,
             is_medical: false,
             is_kernel: false,
+            is_simd: false,
             workgroup_size: [1, 1, 1],
         };
 
@@ -8296,16 +8297,16 @@ mod tests {
     fn i1a_call_invalidation_by_region() {
         // I-1A: A call that receives a pointer to region R invalidates loads
         // from region R, but NOT loads from other regions.
-        let src = "fn helper(a: *[i64; 4], n: i64) -> i64 !IO {
+        let src = "fn helper(a: &mut [i64; 4], n: i64) -> i64 !IO {
             if n > 0 { val _ = helper(a, n - 1); }
             a[0] = 99;
             return 0;
         }
         fn main() -> i64 !IO {
             region r1 {
-                val a = [1, 2, 3, 4];
+                var a = [1, 2, 3, 4];
                 val x = a[0];
-                val _ = helper(a, 3);
+                val _ = helper(&mut a, 3);
                 val y = a[0];
                 return x + y;
             }
@@ -8387,7 +8388,7 @@ mod tests {
         // F-3F: @crashfree functions should have lower inline cost than
         // non-crashfree functions of the same size.
         let src_normal = "fn compute(a: i64) -> i64 { val x = a + 1; val y = x + 2; return y; }\n";
-        let src_crashfree = "@crashfree fn compute(a: i64) -> i64 { val x = a + 1; val y = x + 2; return y; }\n";
+        let src_crashfree = "@crashfree @wrapping fn compute(a: i64) -> i64 { val x = a + 1; val y = x + 2; return y; }\n";
         let l2_normal = compile_to_l2(src_normal);
         let l2_crashfree = compile_to_l2(src_crashfree);
         let f_normal = l2_normal.functions.iter().find(|f| f.name == "compute").unwrap();
@@ -8473,7 +8474,7 @@ mod tests {
     fn i4b_crashfree_call_hoisted_from_loop() {
         // I-4B: @crashfree calls with loop-invariant args should be hoisted
         // out of loops (in addition to pure calls).
-        let src = "@crashfree fn safe_compute(x: i64) -> i64 { return x * 2; }
+        let src = "@crashfree @wrapping fn safe_compute(x: i64) -> i64 { return x * 2; }
         fn main() -> i64 !IO { val sum: i64 = 0; for i in 0..5 { sum = sum + safe_compute(10); } print(sum); return 0; }\n";
         let mut l2 = compile_to_l2(src);
         let n = pass_effect_optimize(&mut l2);
@@ -8556,7 +8557,7 @@ mod tests {
     fn i4d_medical_implies_no_alloc() {
         // I-4D: @medical should imply @no-alloc for regalloc purposes
         // @medical requires @audit, so include both
-        let src = "@medical @audit fn compute(x: i64) -> i64 { return x + 1; }\n";
+        let src = "@medical @audit @wrapping fn compute(x: i64) -> i64 { return x + 1; }\n";
         let l2 = compile_to_l2(src);
         let f = l2.functions.iter().find(|f| f.name == "compute").unwrap();
         assert!(f.is_medical, "expected is_medical to be true");

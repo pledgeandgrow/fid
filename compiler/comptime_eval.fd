@@ -1524,6 +1524,186 @@ fn eval_unaryop(op: UnaryOp, v: Expr) -> ResultExpr {
 
 // --- Reflection ----------------------------------------------------------
 
+fn ce_find_struct(original: &Program, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < original.structs.len() {
+        if original.structs.get(i).name == name { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn ce_has_annotation(anns: Vec<Annotation>, name: str, arg: str) -> bool {
+    var i: i64 = 0;
+    while i < anns.len() {
+        var a: Annotation = anns.get(i);
+        if a.name == name {
+            if arg == "" { return true; }
+            var j: i64 = 0;
+            while j < a.args.len() {
+                if a.args.get(j) == arg { return true; }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Bytes a field of type `ty` takes with the default struct layout (see
+/// the lowerer): one 8-byte slot, except an inline struct (its whole
+/// layout) and an enum with payloads ((1 + largest payload) slots).
+fn ce_slot_size(ty: Type, original: &Program, depth: i64) -> i64 {
+    match ty {
+        Type::Named(n) => {
+            var si: i64 = ce_find_struct(original, n);
+            if si >= 0 && depth < 32 {
+                return ce_struct_layout(original.structs.get(si), original, depth + 1, "");
+            }
+            var ei: i64 = 0;
+            while ei < original.enums.len() {
+                var e: EnumDef = original.enums.get(ei);
+                if e.name == n {
+                    var payload: i64 = 0;
+                    var vi: i64 = 0;
+                    while vi < e.variants.len() {
+                        match e.variants.get(vi).data {
+                            OptParams::Some(d) => { if d.len() > payload { payload = d.len(); } }
+                            OptParams::None => {}
+                        }
+                        vi = vi + 1;
+                    }
+                    if payload > 0 { return (1 + payload) * 8; }
+                    return 8;
+                }
+                ei = ei + 1;
+            }
+        }
+        _ => {}
+    }
+    return 8;
+}
+
+/// With `field` empty: the struct's size. Otherwise the offset of `field`
+/// (-1 if absent). @repr(C) and @packed use natural sizes, the default
+/// layout 8-byte slots, as the lowerer does.
+fn ce_struct_layout(s: StructDef, original: &Program, depth: i64, field: str) -> i64 {
+    var c_layout: bool = ce_has_annotation(s.annotations, "repr", "C");
+    var packed: bool = ce_has_annotation(s.annotations, "packed", "");
+    var natural: bool = c_layout || packed;
+    var offset: i64 = 0;
+    var max_align: i64 = 8;
+    if natural { max_align = 1; }
+    var i: i64 = 0;
+    while i < s.fields.len() {
+        var f: Param = s.fields.get(i);
+        var size: i64 = 8;
+        if natural {
+            match f.ty {
+                Type::I8 => { size = 1; }
+                Type::U8 => { size = 1; }
+                Type::Bool => { size = 1; }
+                Type::I16 => { size = 2; }
+                Type::U16 => { size = 2; }
+                Type::I32 => { size = 4; }
+                Type::U32 => { size = 4; }
+                Type::F32 => { size = 4; }
+                _ => {}
+            }
+            var align: i64 = size;
+            if packed { align = 1; }
+            offset = (offset + align - 1) / align * align;
+            if align > max_align { max_align = align; }
+        } else {
+            size = ce_slot_size(f.ty, original, depth);
+        }
+        if field != "" && f.name == field { return offset; }
+        offset = offset + size;
+        i = i + 1;
+    }
+    if field != "" { return 0 - 1; }
+    return (offset + max_align - 1) / max_align * max_align;
+}
+
+fn ce_str_array(items: Vec<str>) -> Expr {
+    var elements: Vec<Expr> = Vec::new();
+    var i: i64 = 0;
+    while i < items.len() {
+        elements.push(Expr::StringLit(items.get(i)));
+        i = i + 1;
+    }
+    return Expr::ArrayLit(Box::new(Type::Str), elements);
+}
+
+fn ce_find_func(funcs: Vec<Func>, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < funcs.len() {
+        if funcs.get(i).name == name { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+/// Effects declared on function (or method) `name`; Err if there is none.
+fn ce_function_effects(original: &Program, name: str) -> ResultExpr {
+    var fi: i64 = ce_find_func(original.funcs, name);
+    if fi >= 0 { return ResultExpr::Ok(ce_str_array(original.funcs.get(fi).declared_effects)); }
+    var i: i64 = 0;
+    while i < original.impls.len() {
+        var ms: Vec<Func> = original.impls.get(i).methods;
+        var mi: i64 = ce_find_func(ms, name);
+        if mi >= 0 { return ResultExpr::Ok(ce_str_array(ms.get(mi).declared_effects)); }
+        i = i + 1;
+    }
+    i = 0;
+    while i < original.trait_impls.len() {
+        var ms2: Vec<Func> = original.trait_impls.get(i).methods;
+        var mi2: i64 = ce_find_func(ms2, name);
+        if mi2 >= 0 { return ResultExpr::Ok(ce_str_array(ms2.get(mi2).declared_effects)); }
+        i = i + 1;
+    }
+    return ResultExpr::Err("function_effects: no function '" + name + "'");
+}
+
+/// The traits implemented by the type that defines method `name`.
+fn ce_function_capabilities(original: &Program, name: str) -> ResultExpr {
+    var owner: str = "";
+    var i: i64 = 0;
+    while i < original.trait_impls.len() && owner == "" {
+        var ti: TraitImpl = original.trait_impls.get(i);
+        if ce_find_func(ti.methods, name) >= 0 { owner = ti.type_name; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < original.impls.len() && owner == "" {
+        var im: ImplDef = original.impls.get(i);
+        if ce_find_func(im.methods, name) >= 0 { owner = im.struct_name; }
+        i = i + 1;
+    }
+    var traits: Vec<str> = Vec::new();
+    if owner == "" {
+        if ce_find_func(original.funcs, name) < 0 {
+            return ResultExpr::Err("function_capabilities: no function '" + name + "'");
+        }
+        return ResultExpr::Ok(ce_str_array(traits));
+    }
+    i = 0;
+    while i < original.trait_impls.len() {
+        var t2: TraitImpl = original.trait_impls.get(i);
+        if t2.type_name == owner {
+            var seen: bool = false;
+            var k: i64 = 0;
+            while k < traits.len() {
+                if traits.get(k) == t2.trait_name { seen = true; }
+                k = k + 1;
+            }
+            if !seen { traits.push(t2.trait_name); }
+        }
+        i = i + 1;
+    }
+    return ResultExpr::Ok(ce_str_array(traits));
+}
+
 fn evaluate_reflect(op: ReflectOp, ty: Type, original: &Program) -> ResultExpr {
     var type_name: str = "";
     match ty {
@@ -1628,6 +1808,44 @@ fn evaluate_reflect(op: ReflectOp, ty: Type, original: &Program) -> ResultExpr {
             }
             return ResultExpr::Err("enum_variants: '" + type_name + "' is not an enum");
         }
+        ReflectOp::StructSize => {
+            var ssi: i64 = ce_find_struct(original, type_name);
+            if ssi < 0 { return ResultExpr::Err("struct_size: '" + type_name + "' is not a struct"); }
+            return ResultExpr::Ok(Expr::IntLit(ce_struct_layout(original.structs.get(ssi), original, 0, "")));
+        }
+        ReflectOp::FieldOffset => {
+            var dot: i64 = str_find(type_name, ".");
+            if dot < 0 { return ResultExpr::Err("field_offset: expected Owner.member, got '" + type_name + "'"); }
+            var owner: str = str_slice(type_name, 0, dot);
+            var field: str = str_slice(type_name, dot + 1, str_len(type_name));
+            var osi: i64 = ce_find_struct(original, owner);
+            if osi < 0 { return ResultExpr::Err("field_offset: '" + owner + "' is not a struct"); }
+            var off: i64 = ce_struct_layout(original.structs.get(osi), original, 0, field);
+            if off < 0 { return ResultExpr::Err("field_offset: struct '" + owner + "' has no field '" + field + "'"); }
+            return ResultExpr::Ok(Expr::IntLit(off));
+        }
+        ReflectOp::EnumDiscriminant => {
+            var dot2: i64 = str_find(type_name, ".");
+            if dot2 < 0 { return ResultExpr::Err("enum_discriminant: expected Owner.member, got '" + type_name + "'"); }
+            var eowner: str = str_slice(type_name, 0, dot2);
+            var variant: str = str_slice(type_name, dot2 + 1, str_len(type_name));
+            var dei: i64 = 0;
+            while dei < original.enums.len() {
+                var de: EnumDef = original.enums.get(dei);
+                if de.name == eowner {
+                    var dvi: i64 = 0;
+                    while dvi < de.variants.len() {
+                        if de.variants.get(dvi).name == variant { return ResultExpr::Ok(Expr::IntLit(dvi)); }
+                        dvi = dvi + 1;
+                    }
+                    return ResultExpr::Err("enum_discriminant: enum '" + eowner + "' has no variant '" + variant + "'");
+                }
+                dei = dei + 1;
+            }
+            return ResultExpr::Err("enum_discriminant: '" + eowner + "' is not an enum");
+        }
+        ReflectOp::FunctionEffects => { return ce_function_effects(original, type_name); }
+        ReflectOp::FunctionCapabilities => { return ce_function_capabilities(original, type_name); }
     }
     return ResultExpr::Err("unreachable");
 }

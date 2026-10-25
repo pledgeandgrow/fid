@@ -315,6 +315,16 @@ pub enum ReflectOp {
     FieldNames,
     FieldTypes,
     EnumVariants,
+    /// struct_size(T): bytes of T's layout.
+    StructSize,
+    /// field_offset(T.field): the operand is `Type::Named("T.field")`.
+    FieldOffset,
+    /// enum_discriminant(E.Variant): the operand is `Type::Named("E.Variant")`.
+    EnumDiscriminant,
+    /// function_effects(f): the operand is `Type::Named("f")`.
+    FunctionEffects,
+    /// function_capabilities(f): traits implemented by the type defining method f.
+    FunctionCapabilities,
 }
 
 #[derive(Debug, Clone)]
@@ -807,6 +817,8 @@ pub struct TraitDef {
     /// (name, type_params) — type_params is empty for non-GAT associated types
     pub associated_types: Vec<(String, Vec<String>)>,
     pub is_pub: bool,
+    /// `cap Sub: A + B { .. }`: traits whose methods Sub inherits.
+    pub supertraits: Vec<String>,
 }
 
 /// A method signature in a trait definition

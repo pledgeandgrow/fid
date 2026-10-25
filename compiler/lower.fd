@@ -363,6 +363,7 @@ pub fn runtime_effects(name: str) -> OptEffectSet {
     // Allocating functions
     if name == "p_vec_new" || name == "p_vec_new_with" || name == "p_vec_clone" ||
        name == "p_malloc" || name == "p_alloc" || name == "p_free" ||
+       name == "p_arena_save" || name == "p_arena_restore" ||
        name == "p_str_concat" || name == "p_to_str" || name == "p_char_to_str" ||
        name == "p_float_to_str" || name == "p_bool_to_str" || name == "p_str_to_float" ||
        name == "p_string_replace" || name == "p_string_split" || name == "p_string_trim" ||
@@ -1516,6 +1517,9 @@ pub fn Lowerer_register_runtime(self: &mut Lowerer) {
     Lowerer_add_extern_1(self, "p_alloc", IrType::I64, lw_ptr_u8());
     Lowerer_add_extern_1(self, "p_malloc", IrType::I64, lw_ptr_u8());
     Lowerer_add_extern_1(self, "p_free", lw_ptr_u8(), IrType::Void);
+    // Arena marks: save returns a mark, restore frees what came after it.
+    Lowerer_add_extern_0(self, "p_arena_save", IrType::I64);
+    Lowerer_add_extern_1(self, "p_arena_restore", IrType::I64, IrType::Void);
 
     // String conversions
     Lowerer_add_extern_2(self, "p_str_concat", lw_ptr_u8(), lw_ptr_u8(), lw_ptr_u8());
@@ -1653,10 +1657,12 @@ pub fn Lowerer_register_runtime(self: &mut Lowerer) {
     Lowerer_add_extern_2(self, "p_file_write", lw_ptr_u8(), lw_ptr_u8(), IrType::I64);
     Lowerer_add_extern_3(self, "p_file_write_bin", lw_ptr_u8(), lw_ptr_u8(), IrType::I64, IrType::I64);
     Lowerer_add_extern_2(self, "p_file_write_vec", lw_ptr_u8(), vec_i64_ty, IrType::I64);
+    Lowerer_add_extern_1(self, "p_file_read_bytes", lw_ptr_u8(), vec_i64_ty);
     Lowerer_add_extern_1(self, "p_file_exists", lw_ptr_u8(), IrType::Bool);
     Lowerer_add_extern_2(self, "p_file_append", lw_ptr_u8(), lw_ptr_u8(), IrType::I64);
     Lowerer_add_extern_1(self, "p_file_delete", lw_ptr_u8(), IrType::I64);
     Lowerer_add_extern_1(self, "p_file_size", lw_ptr_u8(), IrType::I64);
+    Lowerer_add_extern_1(self, "p_file_hash", lw_ptr_u8(), IrType::I64);
 
     // Timing
     Lowerer_add_extern_0(self, "p_clock_now", IrType::I64);
@@ -2910,15 +2916,21 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
                     var val: i64 = Lowerer_lower_expr(self, expr);
                     match op {
                         AssignOp::Assign => {
-                            // For struct-typed variables, use store_ty to
-                            // emit memcpy (full struct copy). Without this,
-                            // only 8 bytes (the pointer) are copied.
+                            // A slot holding the struct itself takes a full
+                            // copy (memcpy); a slot holding a pointer to the
+                            // struct takes the new pointer: copying the struct
+                            // into an 8-byte pointer slot overflowed it.
                             var val_ty: IrType = Lowerer_get_value_type(self, val);
                             var store_ty: OptIrType = OptIrType::None;
+                            var slot_holds_ptr: bool = false;
+                            match Lowerer_lookup_alloca_type(self, alloca) {
+                                OptIrType::Some(slot_ty) => { slot_holds_ptr = ir_type_is_ptr(slot_ty); }
+                                OptIrType::None => {}
+                            }
                             match val_ty {
                                 IrType::Ptr(inner) => {
                                     var inner_ty: IrType = box_ir_type_unbox(inner);
-                                    if ir_type_is_aggregate(inner_ty) {
+                                    if ir_type_is_aggregate(inner_ty) && !slot_holds_ptr {
                                         store_ty = OptIrType::Some(inner_ty);
                                     }
                                 }
@@ -4772,6 +4784,26 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             return Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
         }
         Expr::Binary(op, left, right) => {
+            if binop_eq(op, BinOp::And) || binop_eq(op, BinOp::Or) {
+                // Short-circuit: the right operand runs only when it decides
+                // the result (`i < n && v[i] == x` must not read v[n]).
+                var slot: i64 = Lowerer_emit_inst(self, Inst::Alloca(IrType::Bool, Lowerer_current_region(self)));
+                var lhs: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(left));
+                Lowerer_emit_inst(self, Inst::Store(slot, lhs, OptIrType::None));
+                var rhs_bb: i64 = Lowerer_new_block(self);
+                var merge_bb: i64 = Lowerer_new_block(self);
+                if binop_eq(op, BinOp::And) {
+                    Lowerer_emit_terminator(self, Inst::Branch(lhs, rhs_bb, merge_bb));
+                } else {
+                    Lowerer_emit_terminator(self, Inst::Branch(lhs, merge_bb, rhs_bb));
+                }
+                Lowerer_set_current_block(self, rhs_bb);
+                var rhs: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(right));
+                Lowerer_emit_inst(self, Inst::Store(slot, rhs, OptIrType::None));
+                Lowerer_emit_terminator(self, Inst::Jump(merge_bb));
+                Lowerer_set_current_block(self, merge_bb);
+                return Lowerer_emit_inst(self, Inst::Load(slot, IrType::Bool));
+            }
             var left_val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(left));
             var right_val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(right));
             var result_ty: IrType = Lowerer_infer_binop_type(self, op, lw_box_expr_unbox(left), lw_box_expr_unbox(right));
@@ -4779,6 +4811,25 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             // String concatenation: str + str - p_str_concat
             var left_ir_ty: IrType = Lowerer_get_value_type(self, left_val);
             var right_ir_ty: IrType = Lowerer_get_value_type(self, right_val);
+
+            // An integer operand next to a float one is converted to that
+            // float type (C's usual arithmetic conversion): `f < 0`, `2 * f`.
+            var numeric: bool = binop_eq(op, BinOp::Add) || binop_eq(op, BinOp::Sub) || binop_eq(op, BinOp::Mul)
+                || binop_eq(op, BinOp::Div) || binop_eq(op, BinOp::Mod) || binop_eq(op, BinOp::Eq)
+                || binop_eq(op, BinOp::Neq) || binop_eq(op, BinOp::Lt) || binop_eq(op, BinOp::Gt)
+                || binop_eq(op, BinOp::LtEq) || binop_eq(op, BinOp::GtEq);
+            var left_int: bool = ir_type_is_int(left_ir_ty) && !ir_type_eq(left_ir_ty, IrType::Bool);
+            var right_int: bool = ir_type_is_int(right_ir_ty) && !ir_type_eq(right_ir_ty, IrType::Bool);
+            var result_is_bool: bool = ir_type_eq(result_ty, IrType::Bool);
+            if numeric && ir_type_is_float(left_ir_ty) && right_int {
+                right_val = Lowerer_emit_inst(self, Inst::IntToFloat(right_val, right_ir_ty, left_ir_ty));
+                right_ir_ty = left_ir_ty;
+                if !result_is_bool { result_ty = left_ir_ty; }
+            } else if numeric && left_int && ir_type_is_float(right_ir_ty) {
+                left_val = Lowerer_emit_inst(self, Inst::IntToFloat(left_val, left_ir_ty, right_ir_ty));
+                left_ir_ty = right_ir_ty;
+                if !result_is_bool { result_ty = right_ir_ty; }
+            }
             if binop_eq(op, BinOp::Add) && ir_type_eq(left_ir_ty, lw_ptr_u8()) && ir_type_eq(right_ir_ty, lw_ptr_u8()) {
                 var args: Vec<i64> = Vec::new();
                 args.push(left_val);

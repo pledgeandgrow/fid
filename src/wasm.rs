@@ -335,8 +335,10 @@ impl WasmCodeGen {
             self.locals.insert(pid.0, i as u32);
         }
         let mut next = func.params.len() as u32;
-        // All other values become locals.
-        for (id, meta) in &func.values {
+        // All other values become locals (in id order: deterministic output).
+        let mut values: Vec<_> = func.values.iter().collect();
+        values.sort_by_key(|(id, _)| **id);
+        for (id, meta) in values {
             if func.params.iter().any(|(pid, _)| pid == id) {
                 continue;
             }
@@ -1018,7 +1020,9 @@ impl WasmCodeGen {
         // Also intern strings that appear in ConstStr instructions (the
         // string_constants map may not include all of them).
         for (_, func) in &module.functions {
-            for (_, inst) in &func.instructions {
+            let mut insts: Vec<_> = func.instructions.iter().collect();
+            insts.sort_by_key(|(id, _)| **id);
+            for (_, inst) in insts {
                 if let Inst::ConstStr { value } = inst {
                     self.intern_string(value);
                 }

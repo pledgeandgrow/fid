@@ -1136,6 +1136,7 @@ mod tests {
             next_vreg: 100,
             is_kernel: false,
             workgroup_size: [1, 1, 1],
+            is_simd: false,
         }
     }
 
@@ -1303,6 +1304,7 @@ mod tests {
             next_vreg: 10,
             is_kernel: false,
             workgroup_size: [1, 1, 1],
+            is_simd: false,
         };
         let alloc = allocate(&func, &HashSet::new(), &HashSet::new());
         assert_eq!(alloc.reg(vreg(0)), Some(PhysReg::Rdi));
@@ -1333,6 +1335,7 @@ mod tests {
             next_vreg: 20,
             is_kernel: false,
             workgroup_size: [1, 1, 1],
+            is_simd: false,
         };
         let alloc = allocate(&func, &HashSet::new(), &HashSet::new());
         // First 6 in registers

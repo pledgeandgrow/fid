@@ -484,6 +484,8 @@ mod tests {
     }
 
     #[test]
+    // Builds and runs a Linux ELF executable.
+    #[cfg_attr(not(target_os = "linux"), ignore)]
     fn test_compile_and_run_hello() {
         let source = "fn main() {\n    print(\"hot reload works!\");\n}\n";
         let result = compile_and_run(source, "test.fd", false);
@@ -495,6 +497,8 @@ mod tests {
     }
 
     #[test]
+    // Builds and runs a Linux ELF executable.
+    #[cfg_attr(not(target_os = "linux"), ignore)]
     fn test_compile_and_run_with_opt() {
         let source = "fn main() {\n    print(\"optimized!\");\n}\n";
         let result = compile_and_run(source, "test.fd", true);

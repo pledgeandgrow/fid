@@ -7,6 +7,13 @@ type Subst = HashMap<String, Type>;
 /// A substitution mapping const generic parameters to their integer values
 type ConstSubst = HashMap<String, i64>;
 
+/// `stmts` with every call to a key of `renames` pointing at its value.
+pub(crate) fn rename_calls(stmts: &[Stmt], renames: &HashMap<String, String>) -> Vec<Stmt> {
+    let none: Subst = HashMap::new();
+    let no_methods: HashMap<String, String> = HashMap::new();
+    stmts.iter().map(|s| subst_stmt(s, &none, renames, &no_methods)).collect()
+}
+
 /// Mangled name for a monomorphized function: `name__T1_T2`
 fn mangle(name: &str, subst: &Subst, type_params: &[String]) -> String {
     let type_strs: Vec<String> = type_params.iter()

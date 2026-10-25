@@ -131,6 +131,10 @@ etc.).
 4. Pre-scan imports for transitive dependencies
 5. Re-parse with full struct/enum name set (for `EnumName::Variant` parsing)
 6. Merge: stdlib → imported modules → user program (user wins on conflicts)
+   A user function with the same name as a function of one imported
+   module does not replace it: the module's copy is renamed
+   `module__name`, so code in the module keeps calling its own function.
+   A name defined by two imported modules is an error.
 
 #### 2.4 Type Checking (`typechecker.rs` / `typechecker.fd`)
 
@@ -289,6 +293,25 @@ impl Display for Point {
 - Associated types are supported (`type Item;`)
 - Default method bodies are supported
 - Trait objects via `dyn Trait` (dispatch by type name string at runtime)
+- Supertraits: `cap NamedGreet: Greet + Show { ... }`. A subtrait inherits
+  every method of its supertraits, so `impl NamedGreet for T` must provide
+  them too, and a `dyn NamedGreet` value can call them.
+
+A function that never returns (it always panics or loops) declares `-> !`;
+a call to it fits wherever a value of any type is expected.
+
+#### Compile-time reflection
+
+`comptime op(...)` is replaced by a literal while compiling:
+
+| Expression | Result |
+|------------|--------|
+| `type_name(T)`, `is_struct(T)`, `is_enum(T)` | `str`, `bool` |
+| `field_count(T)`, `field_names(T)`, `field_types(T)` | `i64`, `[str]` |
+| `enum_variants(E)`, `enum_discriminant(E.Variant)` | `[str]`, `i64` |
+| `struct_size(T)`, `field_offset(T.field)` | bytes, as laid out by the compiler |
+| `function_effects(f)` | the effects `f` declares |
+| `function_capabilities(m)` | the traits implemented by the type defining method `m` |
 
 ### 3.6 Type Compatibility Rules
 
@@ -296,7 +319,11 @@ impl Display for Point {
 - `Never` is compatible with anything (bottom type)
 - `Infer` (`_`) is compatible with anything
 - Integer widening (i32 → i64) is implicit
-- Int → Float conversion is implicit in comparisons
+- Int → Float conversion is implicit in comparisons and arithmetic with a
+  float operand (`f < 0`, `2 * f`)
+- `&&` and `||` short-circuit: the right operand is evaluated only when it
+  decides the result, so `i < v.len() && v.get(i) == x` never reads past
+  the end
 - `str` ↔ `i64` is allowed (pointer representation)
 - Type parameters are compatible with anything in their scope
 - `dyn Trait` is compatible with any concrete impl

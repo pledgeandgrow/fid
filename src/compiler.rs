@@ -265,7 +265,34 @@ pub fn build_program(source: &str) -> Result<Program, Vec<String>> {
 /// Build a program with optional file path for resolving `use` imports.
 /// When source_path is provided, `use foo::bar;` will look for `foo.fd` or
 /// `foo/mod.fd` relative to the source file's directory.
+/// With FIDES_TIME_PASSES set, prints how long each frontend pass took.
+struct PassTimer {
+    on: bool,
+    last: std::cell::Cell<std::time::Instant>,
+}
+
+impl PassTimer {
+    fn new() -> Self {
+        PassTimer {
+            on: std::env::var_os("FIDES_TIME_PASSES").is_some(),
+            last: std::cell::Cell::new(std::time::Instant::now()),
+        }
+    }
+
+    fn mark(&self, pass: &str) {
+        if self.on {
+            let now = std::time::Instant::now();
+            eprintln!("[time] {}: {} ms", pass, now.duration_since(self.last.get()).as_millis());
+            self.last.set(now);
+        }
+    }
+}
+
 pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Result<Program, Vec<String>> {
+    let timer = PassTimer::new();
+    if let Some(p) = source_path {
+        crate::inc::record_file(Path::new(p), source);
+    }
     // Auto-detect color from TTY (can be overridden by main.rs before calling)
     use std::io::IsTerminal;
     crate::diag::set_color(std::io::stderr().is_terminal());
@@ -351,11 +378,14 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
                     found = Some(candidate.clone());
                     break;
                 }
+                // A file created here later would change this import.
+                crate::inc::record_absent(candidate);
             }
 
             if let Some(file_path) = found {
                 let module_source = std::fs::read_to_string(&file_path)
                     .map_err(|e| vec![format!("Error reading '{}': {}", file_path.display(), e)])?;
+                crate::inc::record_file(&file_path, &module_source);
 
                 // Pre-scan: tokenize and extract just the imports, so we can
                 // load this module's dependencies BEFORE parsing it fully.
@@ -483,6 +513,8 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
         }
     }
 
+    timer.mark("parse + imports");
+
     // Re-parse user code with full name set (including imported module names).
     // The first parse only knew stdlib + user names. Now that imports are loaded,
     // enum/struct names from imported modules are available, allowing the parser
@@ -494,6 +526,18 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
         }
         // If re-parsing fails, keep the original parse (it's likely a real error
         // that the first parse already caught).
+    }
+
+    timer.mark("re-parse");
+
+    // A user function named like a function of one imported module: each
+    // side keeps its own (the module's copy is renamed module__name).
+    qualify_shadowed_imports(&mut imported_modules, &user);
+
+    // `cap Sub: Super`: Sub carries Super's methods (impl checks, vtables).
+    let super_errors = inherit_supertrait_methods(&stdlib, &mut imported_modules, &mut user);
+    if !super_errors.is_empty() {
+        return Err(super_errors);
     }
 
     // Two non-stdlib modules defining the same top-level item used to collapse
@@ -510,6 +554,8 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
         }
     }
 
+    timer.mark("module checks");
+
     // Merge: start with stdlib, then add imported modules, then user (user wins)
     let mut program = stdlib.clone();
 
@@ -520,6 +566,7 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
 
     // Merge user code (highest priority)
     program = merge_programs(program, user.clone());
+    timer.mark("merge");
 
     // Phase 7.7: Conditional compilation — filter out items with @cfg annotations
     // that don't match the current platform/features.
@@ -537,12 +584,16 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
     // Phase 8B: Desugar ECS/StateMachine/EventHandler declarations
     desugar_phase8b(&mut program);
 
+    timer.mark("derive + desugar");
+
     // Phase 3A: Process comptime gen blocks (before typechecking so generated
     // code is visible to the typechecker)
     program = comptime::process_gen(program);
+    timer.mark("comptime gen");
 
     // Phase 3B.1: Fill in default trait methods.
     fill_default_trait_methods(&mut program);
+    timer.mark("default trait methods");
 
     // Type check — register each module with its own name for visibility enforcement
     let mut tc = TypeChecker::new();
@@ -572,20 +623,24 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
     tc.collect_capabilities(&user);
 
     // Check bodies of the merged program from the user's module context
+    timer.mark("typecheck: register");
     tc.current_module = user_module.clone();
     tc.check_bodies(&program);
     if !tc.errors.is_empty() {
         let file = source_path.unwrap_or("<stdin>");
         return Err(enrich_errors(&tc.errors, source, file));
     }
+    timer.mark("typecheck: bodies");
 
     // References are second-class: none may outlive what it points to.
     let escape_errors = crate::escape::check(&program);
+    timer.mark("escape check");
     if !escape_errors.is_empty() {
         let file = source_path.unwrap_or("<stdin>");
         return Err(enrich_errors(&escape_errors, source, file));
     }
     let secret_errors = crate::secrecy::check(&program);
+    timer.mark("secrecy check");
     if !secret_errors.is_empty() {
         let file = source_path.unwrap_or("<stdin>");
         return Err(enrich_errors(&secret_errors, source, file));
@@ -593,6 +648,7 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
 
     // Run lint checks (warnings only, never errors)
     tc.run_lints(&program);
+    timer.mark("lints");
 
     // Borrow check — runs after typecheck succeeds, before comptime/mono.
     // Mode is controlled by the global BORROWCK_MODE (set via --borrowck CLI flag).
@@ -617,14 +673,19 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
         }
     }
 
+    timer.mark("borrow check");
+
     // Phase 3A: comptime substitution
     let program = match comptime::substitute(&program) {
         Ok(p) => p,
         Err(errs) => return Err(errs),
     };
+    timer.mark("comptime");
 
     // Monomorphize generics
-    Ok(mono::monomorphize(&program))
+    let program = mono::monomorphize(&program);
+    timer.mark("monomorphize");
+    Ok(program)
 }
 
 /// Desugar layer/model declarations into structs + impls + constructor functions.
@@ -1104,6 +1165,120 @@ fn fill_default_trait_methods(program: &mut Program) {
 /// Report top-level items defined in more than one (non-stdlib) module.
 /// Functions (even within one module) and consts conflict on name alone; structs and enums conflict only
 /// when their definitions differ (identical re-declarations are tolerated).
+/// The user's program may define a function whose name an imported module
+/// also defines. The imported copy is renamed `module__name`, and calls inside
+/// the imported modules follow it: they cannot see the user's definitions,
+/// so every caller keeps the function it was written against. A name defined
+/// by two imported modules stays a conflict (find_module_conflicts).
+fn qualify_shadowed_imports(imported: &mut [(String, Program)], user: &Program) {
+    let is_cfg = |f: &crate::ast::Func| f.annotations.iter().any(|a| a.name == "cfg");
+    let user_funcs: HashSet<&str> = user.funcs.iter()
+        .filter(|f| !is_cfg(f))
+        .map(|f| f.name.as_str())
+        .collect();
+    let mut definers: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, (_, prog)) in imported.iter().enumerate() {
+        for f in &prog.funcs {
+            if !is_cfg(f) && user_funcs.contains(f.name.as_str()) {
+                definers.entry(f.name.clone()).or_default().push(i);
+            }
+        }
+    }
+    let mut renames: HashMap<String, String> = HashMap::new();
+    for (name, mods) in &definers {
+        if mods.len() == 1 {
+            let module = imported[mods[0]].0.replace("::", "__");
+            renames.insert(name.clone(), format!("{}__{}", module, name));
+        }
+    }
+    if renames.is_empty() {
+        return;
+    }
+    for (_, prog) in imported.iter_mut() {
+        let rename_func = |f: &mut crate::ast::Func| {
+            f.body = crate::mono::rename_calls(&f.body, &renames);
+        };
+        for f in prog.funcs.iter_mut() {
+            if !is_cfg(f) {
+                if let Some(q) = renames.get(&f.name) {
+                    f.name = q.clone();
+                }
+            }
+            rename_func(f);
+        }
+        for imp in prog.impls.iter_mut() {
+            imp.methods.iter_mut().for_each(rename_func);
+        }
+        for ti in prog.trait_impls.iter_mut() {
+            ti.methods.iter_mut().for_each(rename_func);
+        }
+    }
+}
+
+/// `cap Sub: Super { .. }`: a subtrait inherits its supertraits' methods
+/// (transitively, supertrait methods first), so an impl of Sub must provide
+/// them and a `dyn Sub` vtable carries them. A method Sub redeclares keeps
+/// Sub's signature. Returns an error for each supertrait that is not defined.
+fn inherit_supertrait_methods(
+    stdlib: &Program,
+    imported: &mut [(String, Program)],
+    user: &mut Program,
+) -> Vec<String> {
+    fn collect(
+        name: &str,
+        defs: &HashMap<String, crate::ast::TraitDef>,
+        seen: &mut HashSet<String>,
+        out: &mut Vec<crate::ast::TraitMethod>,
+    ) {
+        if !seen.insert(name.to_string()) {
+            return;
+        }
+        if let Some(t) = defs.get(name) {
+            for s in &t.supertraits {
+                collect(s, defs, seen, out);
+            }
+            for m in &t.methods {
+                match out.iter().position(|o| o.name == m.name) {
+                    Some(i) => out[i] = m.clone(),
+                    None => out.push(m.clone()),
+                }
+            }
+        }
+    }
+    let mut defs: HashMap<String, crate::ast::TraitDef> = HashMap::new();
+    for t in stdlib.traits.iter()
+        .chain(imported.iter().flat_map(|(_, p)| p.traits.iter()))
+        .chain(user.traits.iter())
+    {
+        defs.insert(t.name.clone(), t.clone());
+    }
+    let mut errors = Vec::new();
+    for t in defs.values() {
+        for s in &t.supertraits {
+            if !defs.contains_key(s) {
+                errors.push(format!("Type error: trait '{}' is not defined (supertrait of '{}')", s, t.name));
+            }
+        }
+    }
+    if !errors.is_empty() || !defs.values().any(|t| !t.supertraits.is_empty()) {
+        return errors;
+    }
+    let flatten = |p: &mut Program| {
+        for t in p.traits.iter_mut() {
+            if !t.supertraits.is_empty() {
+                let mut out = Vec::new();
+                collect(&t.name, &defs, &mut HashSet::new(), &mut out);
+                t.methods = out;
+            }
+        }
+    };
+    for (_, p) in imported.iter_mut() {
+        flatten(p);
+    }
+    flatten(user);
+    errors
+}
+
 fn find_module_conflicts(modules: &[(&String, &Program)]) -> Vec<String> {
     use std::collections::HashMap;
     let mut errors = Vec::new();
@@ -1495,11 +1670,14 @@ fn build_program_with_lints(source: &str, source_path: Option<&str>) -> Result<(
                     found = Some(candidate.clone());
                     break;
                 }
+                // A file created here later would change this import.
+                crate::inc::record_absent(candidate);
             }
 
             if let Some(file_path) = found {
                 let module_source = std::fs::read_to_string(&file_path)
                     .map_err(|e| vec![format!("Error reading '{}': {}", file_path.display(), e)])?;
+                crate::inc::record_file(&file_path, &module_source);
                 let mut lex2 = Lexer::new(&module_source);
                 let toks2 = lex2.tokenize();
                 let mut p2 = Parser::new(toks2);
@@ -1729,24 +1907,15 @@ pub fn emit_source_with_level(source: &str, source_path: &str, level: crate::opt
     let program = build_program_with_path(source, Some(source_path))?;
     let module = lower::lower(&program);
 
-    // Run the optimizer at the requested level. This was previously
-    // skipped, making `emit` produce unoptimized code. Now `emit`
-    // and `build` share the same optimization pipeline.
-    if level != crate::opt::OptLevel::O0 {
-        let l1 = pir::lower_ir_to_l1(&module);
-        let mut l2 = pir::lower_l1_to_l2(&l1);
-        let _ = crate::opt::optimize_l2_with_level(&mut l2, level);
-        // Note: We currently use the legacy IR-based PE codegen which
-        // doesn't consume the optimized L2. The L3 path with register
-        // allocation (generate_pe_from_l3) is planned but not yet
-        // stable enough for the default path. For now, the optimizer
-        // runs but the PE codegen works from the IR module directly.
-        // TODO: Wire optimized L2 → L3 → generate_pe_from_l3 once
-        // the L3 PE backend is stable.
-    }
+    // The PE backend generates code from the IR module; it does not consume
+    // optimized PIR yet (the L3 path, generate_pe_from_l3, is planned), so
+    // the optimization level has no effect here. Running the optimizer
+    // anyway only cost time (minutes on large programs): its result was
+    // discarded.
+    let _ = level;
 
     // Generate PE file directly from IR module.
-    Ok(pe::generate_pe(&module))
+    pe::generate_pe(&module)
 }
 
 /// Compile to WASM binary (Phase 5D.1).
@@ -1788,19 +1957,18 @@ pub fn build_executable_with_lto(source: &str, source_path: &str, target: &str, 
 /// `O0` skips optimization entirely. `O1` runs only cheap passes. `O2` is the
 /// default full pipeline. `O3` enables LTO-style inline thresholds.
 pub fn build_executable_with_level(source: &str, source_path: &str, target: &str, level: crate::opt::OptLevel, do_lto: bool, granted_caps: Option<&[String]>) -> Result<Vec<u8>, Vec<String>> {
-    // S-1B: Incremental compilation — try to reuse a cached L2 module when the
-    // source content hasn't changed. This skips parse/typecheck/lower/optimize.
-    // The cache key incorporates the opt level + lto flags so that compiling
-    // the same source with different optimization settings doesn't return a
-    // stale L2.
-    let mut source_hash = crate::inc::hash_source(source);
+    // S-1B: Incremental compilation — reuse a cached optimized L2 module when
+    // no input changed. The key covers every file the build read (imported
+    // modules too: keying on the main file alone reused stale code after an
+    // import changed) plus the opt level and lto flags.
+    let program = build_program_with_path(source, Some(source_path))?;
+    let mut source_hash = crate::inc::deps_snapshot().hash();
     source_hash ^= (level as u8 as u64).wrapping_shl(1) ^ (do_lto as u64);
     let cache = crate::inc::global_cache();
     let cached_l2 = cache.get(source_path, source_hash);
 
     let (l2, module) = if let Some(cached) = cached_l2 {
         // Cache hit: reuse the cached (already-optimized) L2 module.
-        let program = build_program_with_path(source, Some(source_path))?;
         let mut module = lower::lower(&program);
         autograd::process_module(&mut module);
         if let Some(caps) = granted_caps {
@@ -1809,7 +1977,6 @@ pub fn build_executable_with_level(source: &str, source_path: &str, target: &str
         (cached, module)
     } else {
         // Cache miss: full pipeline.
-        let program = build_program_with_path(source, Some(source_path))?;
         let mut module = lower::lower(&program);
 
         // Autograd pass: process grad blocks, generate backward code
@@ -1921,7 +2088,7 @@ pub fn build_executable_with_level(source: &str, source_path: &str, target: &str
         "x86-64-windows" | "x64-windows" | "windows" => {
             // Windows PE cross-compilation — use the direct PE emitter
             // which generates x86-64 Windows .exe files with kernel32.dll imports
-            Ok(crate::pe::generate_pe(&module))
+            crate::pe::generate_pe(&module)
         }
         _ => Err(vec![format!("Unknown target: {}", target)])
     }
@@ -2375,8 +2542,11 @@ fn process_derive(program: &mut Program) {
             line: 0,
                         };
                         generated.push(func);
-                    } else if arg == "PartialEq" {
+                    } else if arg == "PartialEq"
+                        || (arg == "Eq" && !ann.args.iter().any(|a| a.trim() == "PartialEq"))
+                    {
                         // Generate: pf {name}_equals(self: {name}, other: {name}) -> bool
+                        // (Eq is PartialEq plus a promise; one function serves both.)
                         // Compares all fields with == and ANDs the results.
                         let func_name = format!("{}_equals", s.name);
                         let self_type = Type::Named(s.name.clone());
@@ -2431,6 +2601,68 @@ fn process_derive(program: &mut Program) {
             line: 0,
                         };
                         generated.push(func);
+                    } else if arg == "Hash" {
+                        // Generate: pf {name}_hash(self: {name}) -> i64, combining
+                        // the fields as h = h * 31 + field (strings via
+                        // p_str_hash, bools as 0/1). @wrapping: it never panics.
+                        let self_type = Type::Named(s.name.clone());
+                        let h = || Expr::Ident("__h".to_string());
+                        let mut body = vec![Stmt::Let {
+                            name: "__h".to_string(),
+                            ty: Some(Type::I64),
+                            expr: Expr::IntLit(17),
+                            is_mut: true,
+                            is_persist: false,
+                            annotations: Vec::new(),
+                            line: 0,
+                        }];
+                        for f in &s.fields {
+                            let field = Expr::FieldAccess {
+                                expr: Box::new(Expr::Ident("self".to_string())),
+                                field: f.name.clone(),
+                            };
+                            let part = match &f.ty {
+                                Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::U8 | Type::U16 | Type::U32 | Type::U64 => field,
+                                Type::Str => Expr::Call { callee: "p_str_hash".to_string(), args: vec![field] },
+                                Type::Bool => Expr::Cast { expr: Box::new(field), target_ty: Type::I64 },
+                                _ => continue,
+                            };
+                            let mixed = Expr::Binary {
+                                op: crate::ast::BinOp::Add,
+                                left: Box::new(Expr::Binary {
+                                    op: crate::ast::BinOp::Mul,
+                                    left: Box::new(h()),
+                                    right: Box::new(Expr::IntLit(31)),
+                                }),
+                                right: Box::new(part),
+                            };
+                            body.push(Stmt::Assign {
+                                target: "__h".to_string(),
+                                op: crate::ast::AssignOp::Assign,
+                                expr: mixed,
+                                line: 0,
+                            });
+                        }
+                        body.push(Stmt::Return(Some(h()), 0));
+                        generated.push(Func {
+                            name: format!("{}_hash", s.name),
+                            type_params: Vec::new(),
+                            type_param_bounds: Vec::new(),
+                            const_params: Vec::new(),
+                            params: vec![Param { name: "self".to_string(), ty: self_type, is_pub: false, annotations: Vec::new() }],
+                            ret_ty: Type::I64,
+                            body,
+                            is_pub: true,
+                            is_comptime: false,
+                            declared_effects: Vec::new(),
+                            has_effect_annotation: false,
+                            is_interrupt: false,
+                            annotations: vec![crate::ast::Annotation { name: "wrapping".to_string(), args: Vec::new() }],
+                            preconditions: Vec::new(),
+                            postconditions: Vec::new(),
+                            is_async: false,
+                            line: 0,
+                        });
                     }
                 }
             }

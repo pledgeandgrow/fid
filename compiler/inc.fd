@@ -48,12 +48,200 @@ pub fn hash_str(s: str) -> i64 {
     return hash_source(s);
 }
 
+// --- Build inputs and on-disk stamps (as src/inc.rs) ---------------------
+// A build records every file it reads (the program and each imported
+// module) and every import candidate it found missing (creating that file
+// would change what the import resolves to). `<output>.fides-stamp` keeps
+// them with a key (compiler identity, command line, CC): a later build whose
+// inputs are all unchanged and whose output exists is up to date; a build
+// that produces the same C as the last one skips the C compiler. The
+// in-memory cache above checks the same inputs before reusing a module.
+
+var g_dep_files: Vec<str> = Vec::new();
+var g_dep_hashes: Vec<i64> = Vec::new();
+var g_dep_absent: Vec<str> = Vec::new();
+var g_deps_init: bool = false;
+
+fn inc_deps_ensure() {
+    if !g_deps_init {
+        var files: Vec<str> = Vec::new();
+        var hashes: Vec<i64> = Vec::new();
+        var absent: Vec<str> = Vec::new();
+        g_dep_files = files;
+        g_dep_hashes = hashes;
+        g_dep_absent = absent;
+        g_deps_init = true;
+    }
+}
+
+/// Start recording the inputs of a new build.
+pub fn inc_deps_reset() {
+    g_deps_init = false;
+    inc_deps_ensure();
+}
+
+fn inc_str_vec_has(v: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == s { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Record that the build read the file at `path`.
+pub fn inc_record_file(path: str) {
+    inc_deps_ensure();
+    if inc_str_vec_has(g_dep_files, path) { return; }
+    g_dep_files.push(path);
+    g_dep_hashes.push(p_file_hash(path));
+}
+
+/// Record that the build looked for `path` and found nothing there.
+pub fn inc_record_absent(path: str) {
+    inc_deps_ensure();
+    if inc_str_vec_has(g_dep_absent, path) { return; }
+    g_dep_absent.push(path);
+}
+
+/// Every file still has its recorded hash and every missing path is
+/// still missing.
+pub fn inc_deps_unchanged(files: Vec<str>, hashes: Vec<i64>, absent: Vec<str>) -> bool {
+    var i: i64 = 0;
+    while i < files.len() {
+        if p_file_hash(files.get(i)) != hashes.get(i) { return false; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < absent.len() {
+        if p_file_exists(absent.get(i)) != 0 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A recorded build: what it read, under which key, and its C's hash.
+pub struct IncStamp {
+    pub ok: bool,
+    pub key: i64,
+    pub has_c: bool,
+    pub c_hash: i64,
+    pub files: Vec<str>,
+    pub hashes: Vec<i64>,
+    pub absent: Vec<str>,
+}
+
+fn IncStamp_none() -> IncStamp {
+    var files: Vec<str> = Vec::new();
+    var hashes: Vec<i64> = Vec::new();
+    var absent: Vec<str> = Vec::new();
+    return IncStamp { ok: false, key: 0, has_c: false, c_hash: 0, files: files, hashes: hashes, absent: absent };
+}
+
+/// The key of a build: compiler identity, command, arguments, CC and
+/// FIDES_CC_OPT.
+pub fn inc_build_key(command: str, n: i64, start: i64) -> i64 {
+    var exe: str = p_argv(0);
+    var ident: i64 = p_file_hash(exe);
+    if ident == 0 { ident = p_file_hash(exe + ".exe"); }
+    var k: str = int_to_str(ident) + " " + command;
+    var i: i64 = start + 1;
+    while i < n {
+        var a: str = p_argv(i);
+        if a != "--no-cache" { k = k + " " + a; }
+        i = i + 1;
+    }
+    k = k + " CC=" + p_getenv("CC") + " FIDES_CC_OPT=" + p_getenv("FIDES_CC_OPT");
+    return hash_source(k);
+}
+
+/// Read `<output>.fides-stamp` (ok = false when missing or unreadable).
+pub fn inc_stamp_read(path: str) -> IncStamp {
+    var st: IncStamp = IncStamp_none();
+    if p_file_exists(path) == 0 { return st; }
+    var text: str = p_file_read(path);
+    var lines: Vec<str> = str_split(text, "\n");
+    if lines.len() == 0 { return st; }
+    if lines.get(0) != "fides-stamp-fd 1" { return st; }
+    var has_key: bool = false;
+    var i: i64 = 1;
+    while i < lines.len() {
+        var line: str = lines.get(i);
+        if str_starts_with(line, "key ") {
+            st.key = str_parse_int(str_slice(line, 4, str_len(line)));
+            has_key = true;
+        } else if str_starts_with(line, "c ") {
+            st.c_hash = str_parse_int(str_slice(line, 2, str_len(line)));
+            st.has_c = true;
+        } else if str_starts_with(line, "file ") {
+            var rest: str = str_slice(line, 5, str_len(line));
+            var sp: i64 = str_find(rest, " ");
+            if sp < 0 { return IncStamp_none(); }
+            st.hashes.push(str_parse_int(str_slice(rest, 0, sp)));
+            st.files.push(str_slice(rest, sp + 1, str_len(rest)));
+        } else if str_starts_with(line, "absent ") {
+            st.absent.push(str_slice(line, 7, str_len(line)));
+        } else if str_len(line) > 0 {
+            return IncStamp_none();
+        }
+        i = i + 1;
+    }
+    st.ok = has_key;
+    return st;
+}
+
+/// Nothing changed since the build that wrote `output`.
+pub fn inc_up_to_date(st: IncStamp, key: i64, output: str) -> bool {
+    if !st.ok || st.key != key || st.files.len() == 0 { return false; }
+    if p_file_exists(output) == 0 { return false; }
+    return inc_deps_unchanged(st.files, st.hashes, st.absent);
+}
+
+/// The previous build produced `output` from exactly this C code.
+pub fn inc_c_unchanged(st: IncStamp, key: i64, output: str, c_hash: i64) -> bool {
+    if !st.ok || st.key != key || !st.has_c { return false; }
+    return st.c_hash == c_hash && p_file_exists(output) != 0;
+}
+
+/// Record a successful build. Nothing is written unless the build recorded
+/// `main_input`: a pipeline that does not record its inputs must never be
+/// reported up to date.
+pub fn inc_stamp_commit(path: str, key: i64, c_hash: i64, main_input: str) {
+    inc_deps_ensure();
+    if !inc_str_vec_has(g_dep_files, main_input) {
+        p_file_delete(path);
+        return;
+    }
+    var s: str = "fides-stamp-fd 1\nkey " + int_to_str(key) + "\nc " + int_to_str(c_hash) + "\n";
+    var i: i64 = 0;
+    while i < g_dep_files.len() {
+        s = s + "file " + int_to_str(g_dep_hashes.get(i)) + " " + g_dep_files.get(i) + "\n";
+        i = i + 1;
+    }
+    i = 0;
+    while i < g_dep_absent.len() {
+        s = s + "absent " + g_dep_absent.get(i) + "\n";
+        i = i + 1;
+    }
+    p_file_write(path, s);
+}
+
+/// Snapshot of the recorded inputs (for the in-memory cache).
+pub fn inc_deps_files() -> Vec<str> { inc_deps_ensure(); return g_dep_files; }
+pub fn inc_deps_hashes() -> Vec<i64> { inc_deps_ensure(); return g_dep_hashes; }
+pub fn inc_deps_absent() -> Vec<str> { inc_deps_ensure(); return g_dep_absent; }
+
 // --- Cache entry ---------------------------------------------------------
 
 pub struct IncCacheEntry {
     pub path: str,
     pub hash: i64,
     pub module: IrModule,
+    // The build's inputs: the entry is valid only while they are unchanged
+    // (keying on the main file alone reused a module after an import changed).
+    pub dep_files: Vec<str>,
+    pub dep_hashes: Vec<i64>,
+    pub dep_absent: Vec<str>,
 }
 
 // --- Incremental cache --------------------------------------------------
@@ -76,7 +264,8 @@ pub fn IncrementalCache_get(self: &IncrementalCache, source_path: str, source_ha
     var i: i64 = 0;
     while i < self.entries.len() {
         var entry: IncCacheEntry = self.entries.get(i);
-        if entry.path == source_path && entry.hash == source_hash {
+        if entry.path == source_path && entry.hash == source_hash
+            && inc_deps_unchanged(entry.dep_files, entry.dep_hashes, entry.dep_absent) {
             return OptIrModule::Some(entry.module);
         }
         i = i + 1;
@@ -94,6 +283,9 @@ pub fn IncrementalCache_store(self: &mut IncrementalCache, source_path: str, sou
                 path: source_path,
                 hash: source_hash,
                 module: module,
+                dep_files: inc_deps_files(),
+                dep_hashes: inc_deps_hashes(),
+                dep_absent: inc_deps_absent(),
             });
             return;
         }
@@ -103,6 +295,9 @@ pub fn IncrementalCache_store(self: &mut IncrementalCache, source_path: str, sou
         path: source_path,
         hash: source_hash,
         module: module,
+        dep_files: inc_deps_files(),
+        dep_hashes: inc_deps_hashes(),
+        dep_absent: inc_deps_absent(),
     });
 }
 

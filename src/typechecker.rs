@@ -2239,7 +2239,7 @@ impl TypeChecker {
         // F30: OS-dependent functions (forbidden by @firmware)
         // These functions require a hosted OS environment and cannot be used in bare-metal firmware.
         let os_dep_funcs: &[&str] = &[
-            "p_file_read", "p_file_write", "p_file_append", "p_file_delete", "p_file_exists", "p_file_size",
+            "p_file_read", "p_file_write", "p_file_append", "p_file_delete", "p_file_exists", "p_file_size", "p_file_hash",
             "p_file_write_bin", "p_file_write_vec",
             "p_socket_create", "p_socket_connect", "p_socket_send", "p_socket_recv", "p_socket_recv_str",
             "p_socket_close", "p_socket_listen", "p_socket_accept",
@@ -4592,7 +4592,8 @@ impl TypeChecker {
                 if let Some(idx_val) = const_idx {
                     if let Some(var_ty) = self.lookup(array) {
                         match &var_ty {
-                            Type::Array { size, .. } => {
+                            // Size 0: length not known yet (comptime reflection, const generics).
+                            Type::Array { size, .. } if *size > 0 => {
                                 let len = *size as i64;
                                 if idx_val < 0 || idx_val >= len {
                                     self.errors.push(format!(
@@ -6296,7 +6297,8 @@ impl TypeChecker {
                 };
                 if let Some(idx_val) = const_idx {
                     match &arr_ty {
-                        Type::Array { size, .. } => {
+                        // Size 0: length not known yet (comptime reflection, const generics).
+                        Type::Array { size, .. } if *size > 0 => {
                             let len = *size as i64;
                             if idx_val < 0 || idx_val >= len {
                                 self.errors.push(format!(
@@ -6630,8 +6632,10 @@ impl TypeChecker {
                 match op {
                     ReflectOp::TypeName => Type::Str,
                     ReflectOp::IsStruct | ReflectOp::IsEnum => Type::Bool,
-                    ReflectOp::FieldCount => Type::I64,
-                    ReflectOp::FieldNames | ReflectOp::FieldTypes | ReflectOp::EnumVariants => {
+                    ReflectOp::FieldCount | ReflectOp::StructSize | ReflectOp::FieldOffset
+                    | ReflectOp::EnumDiscriminant => Type::I64,
+                    ReflectOp::FieldNames | ReflectOp::FieldTypes | ReflectOp::EnumVariants
+                    | ReflectOp::FunctionEffects | ReflectOp::FunctionCapabilities => {
                         Type::Array { elem: Box::new(Type::Str), size: 0 }
                     }
                 }
@@ -7908,9 +7912,10 @@ fn estimate_kv_cache_size(args: &[Expr]) -> Option<u64> {
         return None;
     }
     // num_layers * max_seq_len * head_dim * 2 (K+V) * 8 (bytes per f64)
+    // (args: num_layers, max_seq_len, window_size, head_dim)
     let total = vals[0]
         .checked_mul(vals[1])?
-        .checked_mul(vals[2])?
+        .checked_mul(vals[3])?
         .checked_mul(2)?
         .checked_mul(8)?;
     Some(total)

@@ -970,6 +970,10 @@ pub fn get_cached_stdlib() -> OptProgram {
 /// G8.2: borrowck_mode is "off", "warn", or "on" (default).
 pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrowck_mode: str) -> ResultProgram {
     var t0: i64 = p_clock_now_ms();
+    match source_path {
+        OptStr::Some(main_path) => { inc_record_file(main_path); }
+        OptStr::None => {}
+    }
     // Parse stdlib first (use cache if available)
     var stdlib_opt: OptProgram = get_cached_stdlib();
     match stdlib_opt {
@@ -1127,10 +1131,13 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                                     found = true;
                                     break;
                                 }
+                                // A file created here later would change this import.
+                                inc_record_absent(candidates.get(ci));
                                 ci = ci + 1;
                             }
 
                             if found {
+                                inc_record_file(found_path);
                                 // OPTIMIZATION: use cached file read + cached lex + cached parse
                                 var pre_toks: Vec<Token> = cached_lex(token_cache, content_cache, found_path);
 
@@ -1301,6 +1308,30 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                             }
                             ParseResultProgram::Err(_) => { }
                         }
+                    }
+
+                    // A user function named like a function of one imported
+                    // module: each side keeps its own (module__name).
+                    cc_qualify_shadowed_imports(imported_modules, imported_module_names, user);
+
+                    // `cap Sub: Super`: Sub carries Super's methods.
+                    var trait_defs: Vec<TraitDef> = Vec::new();
+                    cc_push_traits(trait_defs, stdlib);
+                    var tmi: i64 = 0;
+                    while tmi < imported_modules.len() {
+                        cc_push_traits(trait_defs, imported_modules.get(tmi));
+                        tmi = tmi + 1;
+                    }
+                    cc_push_traits(trait_defs, user);
+                    var super_errors: Vec<str> = Vec::new();
+                    tmi = 0;
+                    while tmi < imported_modules.len() {
+                        cc_inherit_supertraits(imported_modules.get(tmi), trait_defs, super_errors);
+                        tmi = tmi + 1;
+                    }
+                    cc_inherit_supertraits(user, trait_defs, super_errors);
+                    if super_errors.len() > 0 {
+                        return ResultProgram::Err(super_errors);
                     }
 
                     // Merge: start with stdlib, then imported modules, then user
@@ -2419,7 +2450,9 @@ pub fn process_derive(program: &mut Program) {
                         generated.push(Func_new_full(func_name5, params5, Type::Named(s.name), body5, true));
                     }
 
-                    if arg == "PartialEq" {
+                    // Eq is PartialEq plus a promise; one function serves both.
+                    var eq_alias: bool = arg == "Eq" && !str_vec_contains(args, "PartialEq");
+                    if arg == "PartialEq" || eq_alias {
                         var func_name6: str = str_concat(s.name, "_equals");
                         var params6: Vec<Param> = Vec::new();
                         params6.push(Param_new("self", Type::Named(s.name), false));
@@ -2446,6 +2479,49 @@ pub fn process_derive(program: &mut Program) {
                             body6.push(Stmt::Return(OptBoxExpr::Some(Box::new(result_expr)), 0));
                         }
                         generated.push(Func_new_full(func_name6, params6, Type::Bool, body6, true));
+                    }
+
+                    if arg == "Hash" {
+                        // {name}_hash(self) -> i64: h = h * 31 + field (strings via
+                        // p_str_hash, bools as 0/1). @wrapping: it never panics.
+                        var params7: Vec<Param> = Vec::new();
+                        params7.push(Param_new("self", Type::Named(s.name), false));
+                        var body7: Vec<Stmt> = Vec::new();
+                        body7.push(Stmt::Let("__h", OptType::Some(Type::I64), Expr::IntLit(17), true, false, Vec::new(), 0));
+                        var f7: i64 = 0;
+                        while f7 < s.fields.len() {
+                            var fld: Param = s.fields.get(f7);
+                            var access: Expr = Expr::FieldAccess(Box::new(Expr::Ident("self")), fld.name);
+                            var part: Expr = Expr::IntLit(0);
+                            var use_part: bool = true;
+                            match fld.ty {
+                                Type::I8 => { part = access; }
+                                Type::I16 => { part = access; }
+                                Type::I32 => { part = access; }
+                                Type::I64 => { part = access; }
+                                Type::U8 => { part = access; }
+                                Type::U16 => { part = access; }
+                                Type::U32 => { part = access; }
+                                Type::U64 => { part = access; }
+                                Type::Str => {
+                                    var hargs: Vec<Expr> = Vec::new();
+                                    hargs.push(access);
+                                    part = Expr::Call("p_str_hash", hargs);
+                                }
+                                Type::Bool => { part = Expr::Cast(Box::new(access), Type::I64); }
+                                _ => { use_part = false; }
+                            }
+                            if use_part {
+                                var times: Expr = Expr::Binary(BinOp::Mul, Box::new(Expr::Ident("__h")), Box::new(Expr::IntLit(31)));
+                                var mixed: Expr = Expr::Binary(BinOp::Add, Box::new(times), Box::new(part));
+                                body7.push(Stmt::Assign("__h", AssignOp::Assign, mixed, 0));
+                            }
+                            f7 = f7 + 1;
+                        }
+                        body7.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::Ident("__h"))), 0));
+                        var hash_fn: Func = Func_new_full(str_concat(s.name, "_hash"), params7, Type::I64, body7, true);
+                        hash_fn.annotations.push(Annotation_new("wrapping", Vec::new()));
+                        generated.push(hash_fn);
                     }
 
                     k = k + 1;
@@ -2955,9 +3031,9 @@ pub fn c_str_lines(s: str) -> Vec<str> {
                 line = str_slice(line, 0, str_len(line) - 1);
             }
         }
-        if str_len(line) > 0 {
-            result.push(line);
-        }
+        // Every line is kept, empty ones too: callers index the result
+        // by line number (enrich_errors).
+        result.push(line);
         i = i + 1;
     }
     return result;
@@ -2989,6 +3065,173 @@ pub fn c_str_trim_quotes(s: str) -> str {
 }
 
 /// Check if a Vec<str> contains a string.
+fn cc_is_cfg(f: Func) -> bool {
+    var i: i64 = 0;
+    while i < f.annotations.len() {
+        if f.annotations.get(i).name == "cfg" { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// `funcs` with names and calls rewritten through `renames`.
+fn cc_rename_funcs(funcs: Vec<Func>, renames: Vec<RenameEntry>, rename_defs: bool) {
+    var empty_subst: Vec<SubstEntry> = subst_new();
+    var no_methods: Vec<RenameEntry> = rename_new();
+    var fi: i64 = 0;
+    while fi < funcs.len() {
+        var f: Func = funcs.get(fi);
+        if rename_defs && !cc_is_cfg(f) {
+            match rename_get(renames, f.name) {
+                OptStr::Some(q) => { f.name = q; }
+                OptStr::None => {}
+            }
+        }
+        var body: Vec<Stmt> = Vec::new();
+        var si: i64 = 0;
+        while si < f.body.len() {
+            body.push(subst_stmt(f.body.get(si), empty_subst, renames, no_methods));
+            si = si + 1;
+        }
+        f.body = body;
+        funcs.set(fi, f);
+        fi = fi + 1;
+    }
+}
+
+/// The user's program may define a function whose name an imported module
+/// also defines. The imported copy is renamed `module__name`, and calls inside
+/// the imported modules follow it: they cannot see the user's definitions,
+/// so every caller keeps the function it was written against. A name that
+/// two imported modules define is left alone.
+fn cc_qualify_shadowed_imports(imported: Vec<Program>, names: Vec<str>, user: Program) {
+    // name -> 1 + index of the one module defining it, or -1 for several
+    var definer: i64 = HashMap_new();
+    var mi: i64 = 0;
+    while mi < imported.len() {
+        var fs: Vec<Func> = imported.get(mi).funcs;
+        var fi: i64 = 0;
+        while fi < fs.len() {
+            var f: Func = fs.get(fi);
+            if !cc_is_cfg(f) {
+                var prev: i64 = HashMap_get(definer, f.name);
+                if prev == 0 {
+                    HashMap_insert(definer, f.name, mi + 1);
+                } else if prev != mi + 1 {
+                    HashMap_insert(definer, f.name, 0 - 1);
+                }
+            }
+            fi = fi + 1;
+        }
+        mi = mi + 1;
+    }
+    var renames: Vec<RenameEntry> = rename_new();
+    var any: bool = false;
+    var ui: i64 = 0;
+    while ui < user.funcs.len() {
+        var uf: Func = user.funcs.get(ui);
+        var d: i64 = HashMap_get(definer, uf.name);
+        if d > 0 && !cc_is_cfg(uf) {
+            var module: str = str_replace(names.get(d - 1), "::", "__");
+            rename_set(renames, uf.name, module + "__" + uf.name);
+            any = true;
+        }
+        ui = ui + 1;
+    }
+    if !any { return; }
+    mi = 0;
+    while mi < imported.len() {
+        var prog: Program = imported.get(mi);
+        cc_rename_funcs(prog.funcs, renames, true);
+        var ii: i64 = 0;
+        while ii < prog.impls.len() {
+            cc_rename_funcs(prog.impls.get(ii).methods, renames, false);
+            ii = ii + 1;
+        }
+        ii = 0;
+        while ii < prog.trait_impls.len() {
+            cc_rename_funcs(prog.trait_impls.get(ii).methods, renames, false);
+            ii = ii + 1;
+        }
+        mi = mi + 1;
+    }
+}
+
+fn cc_push_traits(defs: Vec<TraitDef>, p: Program) {
+    var i: i64 = 0;
+    while i < p.traits.len() {
+        defs.push(p.traits.get(i));
+        i = i + 1;
+    }
+}
+
+/// Supertrait methods first (transitively), then the trait's own; a method
+/// the trait redeclares keeps its signature.
+fn cc_collect_trait_methods(name: str, defs: Vec<TraitDef>, seen: Vec<str>, out: Vec<TraitMethod>) {
+    if cc_c_str_vec_contains(seen, name) { return; }
+    seen.push(name);
+    var i: i64 = 0;
+    while i < defs.len() {
+        var t: TraitDef = defs.get(i);
+        if t.name == name {
+            var s: i64 = 0;
+            while s < t.supertraits.len() {
+                cc_collect_trait_methods(t.supertraits.get(s), defs, seen, out);
+                s = s + 1;
+            }
+            var m: i64 = 0;
+            while m < t.methods.len() {
+                var tm: TraitMethod = t.methods.get(m);
+                var replaced: bool = false;
+                var o: i64 = 0;
+                while o < out.len() {
+                    if out.get(o).name == tm.name {
+                        out.set(o, tm);
+                        replaced = true;
+                        break;
+                    }
+                    o = o + 1;
+                }
+                if !replaced { out.push(tm); }
+                m = m + 1;
+            }
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+/// `cap Sub: Super { .. }`: a subtrait inherits its supertraits' methods, so
+/// an impl of Sub must provide them and a `dyn Sub` vtable carries them.
+fn cc_inherit_supertraits(p: Program, defs: Vec<TraitDef>, errors: Vec<str>) {
+    var i: i64 = 0;
+    while i < p.traits.len() {
+        var t: TraitDef = p.traits.get(i);
+        if t.supertraits.len() > 0 {
+            var s: i64 = 0;
+            while s < t.supertraits.len() {
+                var sup: str = t.supertraits.get(s);
+                var found: bool = false;
+                var d: i64 = 0;
+                while d < defs.len() {
+                    if defs.get(d).name == sup { found = true; break; }
+                    d = d + 1;
+                }
+                if !found {
+                    errors.push("Type error: trait '" + sup + "' is not defined (supertrait of '" + t.name + "')");
+                }
+                s = s + 1;
+            }
+            var out: Vec<TraitMethod> = Vec::new();
+            var seen: Vec<str> = Vec::new();
+            cc_collect_trait_methods(t.name, defs, seen, out);
+            t.methods = out;
+            p.traits.set(i, t);
+        }
+        i = i + 1;
+    }
+}
+
 pub fn cc_c_str_vec_contains(vec: Vec<str>, s: str) -> bool {
     var i: i64 = 0;
     while i < vec.len() {

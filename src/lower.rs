@@ -35,7 +35,7 @@ fn runtime_effects(name: &str) -> Option<EffectSet> {
     // Allocating functions
     if matches!(name,
         "p_vec_new" | "p_vec_new_with" | "p_vec_clone"
-        | "p_malloc" | "p_alloc" | "p_free"
+        | "p_malloc" | "p_alloc" | "p_free" | "p_arena_save" | "p_arena_restore"
         | "p_str_concat" | "p_to_str" | "p_char_to_str" | "p_float_to_str" | "p_bool_to_str" | "p_str_to_float"
         | "p_string_replace" | "p_string_split" | "p_string_trim"
         | "p_string_to_uppercase" | "p_string_to_lowercase"
@@ -242,6 +242,8 @@ pub struct Lowerer {
     /// AST function return types — maps function name to AST return type
     /// Used by LetTuple to determine tuple element types
     func_ret_types: HashMap<String, Type>,
+    /// (trait, method) -> declared return type, for `dyn Trait` calls
+    trait_method_rets: HashMap<(String, String), Type>,
     /// Async function names — functions declared with `async pf`
     /// Calls to these functions are wrapped in p_future_ready
     async_funcs: std::collections::HashSet<String>,
@@ -340,6 +342,7 @@ impl Lowerer {
             gpu_region_stack: Vec::new(),
             sandbox_depth: 0,
             func_ret_types: HashMap::new(),
+            trait_method_rets: HashMap::new(),
             async_funcs: std::collections::HashSet::new(),
             current_func_param_types: HashMap::new(),
             vec_allocas: std::collections::HashSet::new(),
@@ -424,6 +427,9 @@ impl Lowerer {
         for td in &program.traits {
             let methods: Vec<String> = td.methods.iter().map(|m| m.name.clone()).collect();
             self.module.trait_methods.insert(td.name.clone(), methods);
+            for m in &td.methods {
+                self.trait_method_rets.insert((td.name.clone(), m.name.clone()), m.ret_ty.clone());
+            }
         }
 
         // Register trait implementations for devirtualization (F-3D)
@@ -552,7 +558,7 @@ impl Lowerer {
         }
 
         // I-6B: Propagate linear_structs to the IR module
-        self.module.linear_structs = self.linear_structs.clone();
+        self.module.linear_structs = self.linear_structs.iter().cloned().collect();
 
         // Issue 42: Register state machine structs for async functions.
         // This is the foundational infrastructure for converting thread-based
@@ -817,6 +823,9 @@ impl Lowerer {
         self.module.add_extern("p_alloc", vec![IrType::I64], IrType::Ptr(Box::new(IrType::U8)));
         self.module.add_extern("p_malloc", vec![IrType::I64], IrType::Ptr(Box::new(IrType::U8)));
         self.module.add_extern("p_free", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Void);
+        // Arena marks: save returns a mark, restore frees what came after it.
+        self.module.add_extern("p_arena_save", vec![], IrType::I64);
+        self.module.add_extern("p_arena_restore", vec![IrType::I64], IrType::Void);
         self.module.add_extern("p_str_concat",
             vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))],
             IrType::Ptr(Box::new(IrType::U8)));
@@ -1003,12 +1012,15 @@ impl Lowerer {
         self.module.add_extern("p_file_write", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
         self.module.add_extern("p_file_write_bin", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8)), IrType::I64], IrType::I64);
         self.module.add_extern("p_file_write_vec", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
+        self.module.add_extern("p_file_read_bytes", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Generic("Vec".to_string(), vec![IrType::I64]));
         self.module.add_extern("p_file_exists", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Bool);
         self.module.add_extern("p_file_append", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
         // p_file_delete(path: *u8) -> i64  — delete a file, returns 0 on success
         self.module.add_extern("p_file_delete", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
         // p_file_size(path: *u8) -> i64  — get file size in bytes, or -1
         self.module.add_extern("p_file_size", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
+        // p_file_hash(path: *u8) -> i64 — FNV-1a 64 of the file's bytes, 0 if unreadable
+        self.module.add_extern("p_file_hash", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
 
         // ─── Phase 5D.4: Database driver framework ───
         let db_ty = IrType::Opaque("Database".to_string());
@@ -2137,13 +2149,14 @@ impl Lowerer {
                     match op {
                         AssignOp::Assign => {
                             let val = self.lower_expr(expr);
-                            // For struct-typed variables, use store_ty to
-                            // emit memcpy (full struct copy). Without this,
-                            // only 8 bytes (the pointer) are copied, truncating
-                            // the struct data.
+                            // A slot holding the struct itself takes a full
+                            // copy (memcpy); a slot holding a pointer to the
+                            // struct takes the new pointer: copying the struct
+                            // into an 8-byte pointer slot overflowed it.
                             let val_ty = self.get_value_type(val);
+                            let slot_holds_ptr = matches!(self.alloca_types.get(&ptr), Some(IrType::Ptr(_)));
                             let store_ty = match &val_ty {
-                                IrType::Ptr(inner) if inner.is_aggregate() => {
+                                IrType::Ptr(inner) if inner.is_aggregate() && !slot_holds_ptr => {
                                     Some(inner.as_ref().clone())
                                 }
                                 _ => None,
@@ -4039,6 +4052,23 @@ impl Lowerer {
                 self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 })
             }
 
+            Expr::Binary { op: op @ (BinOp::And | BinOp::Or), left, right } => {
+                // Short-circuit: the right operand runs only when it decides
+                // the result (`i < n && v[i] == x` must not read v[n]).
+                let slot = self.emit_inst(Inst::Alloca { ty: IrType::Bool, region: self.current_region() });
+                let left_val = self.lower_expr(left);
+                self.emit_inst(Inst::Store { ptr: slot, value: left_val, store_ty: None });
+                let rhs_bb = self.new_block();
+                let merge_bb = self.new_block();
+                let (then, else_) = if matches!(op, BinOp::And) { (rhs_bb, merge_bb) } else { (merge_bb, rhs_bb) };
+                self.emit_terminator(Inst::Branch { cond: left_val, then, else_ });
+                self.set_current_block(rhs_bb);
+                let right_val = self.lower_expr(right);
+                self.emit_inst(Inst::Store { ptr: slot, value: right_val, store_ty: None });
+                self.emit_terminator(Inst::Jump { target: merge_bb });
+                self.set_current_block(merge_bb);
+                self.emit_inst(Inst::Load { ptr: slot, ty: IrType::Bool })
+            }
             Expr::Binary { op, left, right } => {
                 // Operator overloading for vec types (Phase 8A)
                 // Check if either operand is a vec type
@@ -4078,9 +4108,23 @@ impl Lowerer {
                     }
                 }
 
-                let left_val = self.lower_expr(left);
-                let right_val = self.lower_expr(right);
-                let result_ty = self.infer_binop_type(op, left, right);
+                let mut left_val = self.lower_expr(left);
+                let mut right_val = self.lower_expr(right);
+                let mut result_ty = self.infer_binop_type(op, left, right);
+
+                // An integer operand next to a float one is converted to that
+                // float type (C's usual arithmetic conversion): `f < 0`, `2 * f`.
+                let numeric = matches!(op,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+                    | BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq);
+                let plain_int = |t: &IrType| t.is_int() && *t != IrType::Bool;
+                if numeric && left_ir_ty.is_float() && plain_int(&right_ir_ty) {
+                    right_val = self.emit_inst(Inst::IntToFloat { value: right_val, from: right_ir_ty.clone(), to: left_ir_ty.clone() });
+                    if !matches!(result_ty, IrType::Bool) { result_ty = left_ir_ty.clone(); }
+                } else if numeric && plain_int(&left_ir_ty) && right_ir_ty.is_float() {
+                    left_val = self.emit_inst(Inst::IntToFloat { value: left_val, from: left_ir_ty.clone(), to: right_ir_ty.clone() });
+                    if !matches!(result_ty, IrType::Bool) { result_ty = right_ir_ty.clone(); }
+                }
 
                 // String concatenation: when + is used with two str operands,
                 // emit a call to p_str_concat instead of integer addition.
@@ -4889,8 +4933,15 @@ impl Lowerer {
                 if let IrType::Opaque(ref name) = recv_ty {
                     if name.starts_with("dyn:") {
                         let trait_name = name[4..].to_string();
-                        let ret_ty = IrType::I64;
-                        let effects = EffectSet::new();
+                        let ret_ty = match self.trait_method_rets.get(&(trait_name.clone(), method.clone())) {
+                            Some(t) => self.lower_type(&t.clone()),
+                            None => IrType::I64,
+                        };
+                        // Any implementation may run: assume every effect.
+                        let mut effects = EffectSet::new();
+                        for e in [Effect::Read, Effect::Write, Effect::IO, Effect::Alloc] {
+                            effects.add(e);
+                        }
                         return self.emit_inst(Inst::DynCall {
                             trait_name,
                             method: method.clone(),
@@ -5359,6 +5410,11 @@ impl Lowerer {
 
                 let elem_ty = match &arr_ty {
                     IrType::Array(inner, _) => *inner.clone(),
+                    // An array variable holds a pointer to its array.
+                    IrType::Ptr(p) => match p.as_ref() {
+                        IrType::Array(inner, _) => *inner.clone(),
+                        _ => IrType::I64,
+                    },
                     _ => IrType::I64,
                 };
                 let elem_ptr = self.emit_inst(Inst::GetElemPtr {
@@ -7467,8 +7523,10 @@ impl Lowerer {
                 match op {
                     ReflectOp::TypeName => IrType::Ptr(Box::new(IrType::U8)),
                     ReflectOp::IsStruct | ReflectOp::IsEnum => IrType::Bool,
-                    ReflectOp::FieldCount => IrType::I64,
-                    ReflectOp::FieldNames | ReflectOp::FieldTypes | ReflectOp::EnumVariants => {
+                    ReflectOp::FieldCount | ReflectOp::StructSize | ReflectOp::FieldOffset
+                    | ReflectOp::EnumDiscriminant => IrType::I64,
+                    ReflectOp::FieldNames | ReflectOp::FieldTypes | ReflectOp::EnumVariants
+                    | ReflectOp::FunctionEffects | ReflectOp::FunctionCapabilities => {
                         IrType::Array(Box::new(IrType::Ptr(Box::new(IrType::U8))), 0)
                     }
                 }

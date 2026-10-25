@@ -247,6 +247,29 @@ fidesc audit <file.fd>        # verify IR correctness
 
 ---
 
+## Incremental Builds
+
+`ccompile`, `build` and `emit` (Rust and self-hosted compilers) keep a stamp
+next to the output, `<output>.fides-stamp`, listing every file the build
+read (the program and each imported module), each import location that was
+empty, the compiler's identity, the command line and `CC`:
+
+- If nothing changed and the output exists, the build is skipped
+  (`... is up to date`).
+- If the generated C is identical to the last build's (a comment or
+  formatting change), the C compiler is not run again.
+- Creating a file that would change what an import resolves to, rebuilding
+  the compiler, or changing flags or `CC` invalidates the stamp.
+- `--no-cache` or `FIDES_NO_CACHE=1` builds from scratch.
+
+`FIDES_TIME_PASSES=1` prints how long each frontend pass took.
+
+`ccompile --cc-opt 0|1|2|3|s` (or `FIDES_CC_OPT`) sets the C compiler's
+optimization level: `-O2` by default, `-O0` for a program over 16 MB of C
+(gcc and clang take tens of minutes to optimize one that large).
+
+---
+
 ## Design Principles
 
 1. **One word, lowercase, no prefix.** No `fides-fmt`, no `fidesc-lint`.

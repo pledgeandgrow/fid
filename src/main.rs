@@ -77,6 +77,18 @@ fn run_with_timeout(path: &str, limit: std::time::Duration) -> Option<process::O
 }
 
 fn main() {
+    // Deeply nested programs recurse deeply in the parser, the checkers and
+    // lowering; the default main-thread stack (1 MB on Windows) overflows.
+    let compiler = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(real_main)
+        .expect("failed to start the compiler thread");
+    if compiler.join().is_err() {
+        process::exit(101);
+    }
+}
+
+fn real_main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
@@ -227,12 +239,18 @@ fn main() {
                     process::exit(1);
                 }
             };
+            let build_cache = fidesc::inc::BuildCache::open("build", &args[2..], input, &output, &[]);
+            if build_cache.up_to_date() {
+                println!("{} is up to date", output);
+                return;
+            }
             match compiler::build_executable_with_level(&source, input, target, opt_level, do_lto, granted_caps.as_deref()) {
                 Ok(exe_bytes) => {
                     fs::write(&output, &exe_bytes).unwrap_or_else(|e| {
                         eprintln!("Error writing '{}': {}", output, e);
                         process::exit(1);
                     });
+                    build_cache.commit(None);
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
@@ -379,12 +397,18 @@ fn main() {
                     }
                 }
             } else {
+                let build_cache = fidesc::inc::BuildCache::open("emit", &args[2..], input, &output, &[]);
+                if build_cache.up_to_date() {
+                    println!("{} is up to date", output);
+                    return;
+                }
                 match compiler::emit_source_with_level(&source, input, opt_level) {
                     Ok(pe_bytes) => {
                         fs::write(&output, &pe_bytes).unwrap_or_else(|e| {
                             eprintln!("Error writing '{}': {}", output, e);
                             process::exit(1);
                         });
+                        build_cache.commit(None);
                         println!("Emitted native executable: {} ({} bytes, no ml64.exe/link.exe)", output, pe_bytes.len());
                     }
                     Err(errors) => {
@@ -1207,7 +1231,7 @@ fn main() {
 
         "ccompile" => {
             if args.len() < 3 {
-                eprintln!("Usage: fidesc ccompile <file.fd> [-o output.exe] [--target <triple>] [--trace]");
+                eprintln!("Usage: fidesc ccompile <file.fd> [-o output.exe] [--target <triple>] [--cc-opt 0|1|2|3|s] [--trace]");
                 process::exit(1);
             }
             let input = &args[2];
@@ -1230,9 +1254,16 @@ fn main() {
                     process::exit(1);
                 }
             };
+            // Incremental build: skip all work when no input changed.
+            let build_cache = fidesc::inc::BuildCache::open("ccompile", &args[2..], input, &output, &["CC", "FIDES_CC_OPT"]);
+            if build_cache.up_to_date() {
+                println!("{} is up to date", output);
+                return;
+            }
 
             match compiler::ccompile_source_traced(&source, input, trace) {
                 Ok(c_code) => {
+                    let c_hash = fidesc::inc::hash_source(&c_code);
                     // Write C source
                     let c_path = if output.ends_with(".exe") {
                         output.replace(".exe", ".c")
@@ -1244,6 +1275,42 @@ fn main() {
                         process::exit(1);
                     });
                     println!("Generated C source: {}", c_path);
+                    // Same C as the build that produced the output: no need
+                    // to run the C compiler again.
+                    if build_cache.c_unchanged(c_hash) {
+                        build_cache.commit(Some(c_hash));
+                        println!("C translation unchanged; {} is up to date", output);
+                        return;
+                    }
+
+                    // C optimization level: --cc-opt, else FIDES_CC_OPT, else -O2.
+                    // gcc and clang need tens of minutes for a very large
+                    // translation unit at -O1/-O2 (the self-hosted compiler is
+                    // ~35 MB of C: 26 min at -O2, 40 s at -O0), so one gets -O0.
+                    const LARGE_C_BYTES: usize = 16 << 20;
+                    let cc_opt = args.iter().position(|a| a == "--cc-opt")
+                        .and_then(|i| args.get(i + 1))
+                        .cloned()
+                        .or_else(|| std::env::var("FIDES_CC_OPT").ok())
+                        .unwrap_or_else(|| {
+                            if c_code.len() > LARGE_C_BYTES {
+                                println!("Large program ({} MB of C): compiling with -O0 (use --cc-opt 2 for -O2)",
+                                    c_code.len() >> 20);
+                                "0".to_string()
+                            } else {
+                                "2".to_string()
+                            }
+                        });
+                    if !matches!(cc_opt.as_str(), "0" | "1" | "2" | "3" | "s") {
+                        eprintln!("Invalid --cc-opt '{}': use 0, 1, 2, 3 or s", cc_opt);
+                        process::exit(1);
+                    }
+                    let gcc_opt = format!("-O{}", cc_opt);
+                    let cl_opt = match cc_opt.as_str() {
+                        "0" => "/Od",
+                        "1" | "s" => "/O1",
+                        _ => "/O2",
+                    };
 
                     // Find a C compiler: try --target prefix, then CC env var, then gcc, clang, cl.exe
                     let cc = if let Some(ref target) = target {
@@ -1280,8 +1347,8 @@ fn main() {
                         let vcvars = find_vcvarsall();
                         if let Some(vcvars) = vcvars {
                             let cmd_str = format!(
-                                "\"{}\" x64 >nul 2>&1 && \"{}\" /O2 /nologo /Fe:{} {}",
-                                vcvars, cc, output, c_path
+                                "\"{}\" x64 >nul 2>&1 && \"{}\" {} /nologo /Fe:{} {}",
+                                vcvars, cc, cl_opt, output, c_path
                             );
                             process::Command::new("cmd")
                                 .args(["/C", &cmd_str])
@@ -1289,7 +1356,7 @@ fn main() {
                         } else {
                             // No vcvarsall — try direct
                             process::Command::new(&cc)
-                                .args(["/O2", "/nologo", &format!("/Fe:{}", output), &c_path])
+                                .args([cl_opt, "/nologo", &format!("/Fe:{}", output), &c_path])
                                 .output()
                         }
                     } else {
@@ -1345,7 +1412,7 @@ fn main() {
                         if is_tcc {
                             // TCC: minimal flags — it doesn't support -fstack-protector,
                             // -fPIE, -pie, -Wl,-z,relro, etc.
-                            cmd.arg("-O2")
+                            cmd.arg(&gcc_opt)
                                 .arg("-Wno-int-conversion")
                                 .arg("-o").arg(&output).arg(&c_path);
                             // TCC on Windows: math is built-in (no -lm needed).
@@ -1356,7 +1423,7 @@ fn main() {
                                 }
                             }
                         } else {
-                            cmd.arg("-O2")
+                            cmd.arg(&gcc_opt)
                                 // Fides FFI uses i64 for all handle types (FILE*, DIR*, etc.)
                                 // and struct pointers are passed as int64_t values.
                                 // Safe on x86-64 where pointers are 8 bytes.
@@ -1386,16 +1453,19 @@ fn main() {
                     match status {
                         Ok(out) => {
                             if !out.status.success() {
-                                eprintln!("{} failed:", cc);
+                                // Some compilers (or wrappers) report on stdout.
+                                eprintln!("{} failed ({}):", cc, out.status);
+                                eprintln!("{}", String::from_utf8_lossy(&out.stdout));
                                 eprintln!("{}", String::from_utf8_lossy(&out.stderr));
                                 process::exit(1);
                             }
+                            build_cache.commit(Some(c_hash));
                             println!("Built native executable: {}", output);
                         }
                         Err(e) => {
                             eprintln!("Failed to run {}: {}", cc, e);
                             eprintln!("C source left at: {}", c_path);
-                            eprintln!("Compile manually: {} -O2 -o {} {}", cc, output, c_path);
+                            eprintln!("Compile manually: {} {} -o {} {}", cc, gcc_opt, output, c_path);
                             process::exit(1);
                         }
                     }
@@ -1549,6 +1619,8 @@ fn main() {
                 "test_banking_lost_money_fail",
                 "test_loop_linear_fail",
                 "test_linear_closure_fail",
+                // A `-> !` function that panics: the run must fail.
+                "test_never_type2",
                 "test_gas_fail",
                 "test_crashfree_fail",
                 "test_crashfree_index_fail",
@@ -1696,6 +1768,11 @@ fn main() {
             let mut interp_known_pass = 0;  // bonus: known-fail test suddenly passes
             let mut c_known_pass = 0;
             let mut pe_known_pass = 0;
+            // Programs the PE backend refuses (runtime features it lacks)
+            let mut pe_unsupported = 0;
+            // Tests a backend does not run (interp_skip_tests, c_skip_tests)
+            let mut interp_skipped_count = 0;
+            let mut c_skipped_count = 0;
             let mut tested_count = 0;  // tests counted in main denominator
 
             // Known-fail tests: these are normal tests that have pre-existing
@@ -1726,32 +1803,87 @@ fn main() {
                 // test_dp uses real PRNG noise (xorshift128+) — output is
                 // intentionally non-deterministic, so interp vs C can't match.
                 "test_dp",
+                // They print their own argv, which differs per backend.
+                "probe_argc",
+                "probe_argc2",
             ];
 
-            for test_file in &test_files {
+            // Tests that run the whole self-hosted compiler (parsing core.fd
+            // and more): far beyond the interpreter's step budget. They run
+            // compiled; the C binary's output is the reference for PE.
+            let interp_skip_tests: &[&str] = &[
+                "probe_lower",
+                "test_spawn_gt",
+            ];
+
+            // Tests that link a system library Fides does not ship. They run
+            // only with FIDES_TEST_EXTERNAL=1 (the library must be installed).
+            let external_lib_tests: &[(&str, &str)] = &[
+                ("test_sqlite", "libsqlite3"),
+            ];
+            let run_external = std::env::var("FIDES_TEST_EXTERNAL").map_or(false, |v| v == "1");
+
+            // Each test's raw results. With --jobs N they are computed on N
+            // threads (each its own C compiler cache); either way they are
+            // reported in test order below.
+            struct TestRun {
+                name: String,
+                /// Not run here: reported, not counted
+                skip_note: Option<String>,
+                interp_skipped: bool,
+                interp_ok: bool,
+                c_skipped: bool,
+                c_ok: bool,
+                /// The PE backend refused the program: the missing functions
+                pe_refused: Option<String>,
+                pe_ok: bool,
+            }
+            let jobs: usize = args.iter()
+                .position(|a| a == "--jobs" || a == "-j")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1)
+                .max(1);
+            let run_test = |test_file: &String, worker: usize| -> Option<TestRun> {
                 let name = std::path::Path::new(test_file)
                     .file_stem()
                     .unwrap()
                     .to_string_lossy()
                     .to_string();
+                let mut run = TestRun {
+                    name: name.clone(),
+                    skip_note: None,
+                    interp_skipped: false,
+                    interp_ok: false,
+                    c_skipped: false,
+                    c_ok: false,
+                    pe_refused: None,
+                    pe_ok: false,
+                };
 
                 // Skip tests for C codegen limitations (pass on interp + PE)
                 if skip_tests.contains(&name.as_str()) {
-                    continue;
+                    return None;
                 }
-
-                let is_known = known_fail.contains(&name.as_str());
-                if !is_known {
-                    tested_count += 1;
+                if let Some((_, lib)) = external_lib_tests.iter().find(|(t, _)| *t == name) {
+                    if !run_external {
+                        run.skip_note = Some(format!("needs {} (set FIDES_TEST_EXTERNAL=1)", lib));
+                        return Some(run);
+                    }
                 }
 
                 // Interpreter — a test "passes" if it doesn't panic.
                 // The exit code may be non-zero (e.g. `ret 42` exits with 42).
                 // Use --max-steps to prevent infinite loops from hanging the test suite.
-                let interp_out = process::Command::new(&current_exe)
-                    .args(["run", test_file, "--max-steps", "50000000"])
-                    .output();
-                let interp_ok = interp_out
+                run.interp_skipped = interp_skip_tests.contains(&name.as_str());
+                let interp_out = if run.interp_skipped {
+                    Err(std::io::Error::new(std::io::ErrorKind::Other, "skipped"))
+                } else {
+                    process::Command::new(&current_exe)
+                        .args(["run", test_file, "--max-steps", "50000000"])
+                        .output()
+                };
+                run.interp_ok = interp_out
                     .as_ref()
                     .map(|o| {
                         // Check stderr for "Panic:" or compilation errors.
@@ -1761,12 +1893,153 @@ fn main() {
                         !stderr.contains("panic:") && !stderr.contains("error")
                     })
                     .unwrap_or(false);
-                let interp_stdout = interp_out
+                let mut interp_stdout = interp_out
                     .as_ref()
                     .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
                     .unwrap_or_default();
 
-                if fail_only {
+                // C codegen — use a platform-appropriate temp path
+                let c_exe = if cfg!(windows) {
+                    format!("{}\\{}_test_c.exe", std::env::temp_dir().to_string_lossy(), name)
+                } else {
+                    format!("/tmp/{}_test_c.exe", name)
+                };
+                let _ = fs::remove_file(&c_exe);
+                // A C compiler cache per worker: concurrent zig builds of the
+                // same cache entry collide.
+                let cc_cache = std::env::temp_dir().join(format!("fides-test-cc-cache-{}", worker));
+
+                // Skip C codegen for bare-metal tests that use externs not
+                // available in the C runtime (p_idt_set_entry, p_serial_*, etc.)
+                run.c_skipped = c_skip_tests.contains(&name.as_str());
+                let c_compile = if run.c_skipped {
+                    // Mark as "skipped" — don't count as pass or fail
+                    None
+                } else {
+                    let compile = || {
+                        let mut cmd = process::Command::new(&current_exe);
+                        cmd.args(["ccompile", test_file, "-o", &c_exe, "--no-cache"]);
+                        if jobs > 1 {
+                            cmd.env("ZIG_GLOBAL_CACHE_DIR", &cc_cache).env("ZIG_LOCAL_CACHE_DIR", &cc_cache);
+                        }
+                        cmd.output()
+                    };
+                    let mut out = compile();
+                    // Under parallel load the C compiler fails now and then on
+                    // its own files (zig: "file_open Unexpected"): one retry
+                    // of the compile, never of the comparison.
+                    if jobs > 1 && matches!(&out, Ok(o) if !o.status.success()) {
+                        out = compile();
+                    }
+                    Some(out)
+                };
+                run.c_ok = if let Some(Ok(compile_out)) = c_compile.as_ref() {
+                    if compile_out.status.success() {
+                        if let Ok(c_out) = process::Command::new(&c_exe).output() {
+                            let c_stdout = String::from_utf8_lossy(&c_out.stdout).to_string();
+                            if run.interp_skipped {
+                                // The compiled run is the reference: it must succeed.
+                                interp_stdout = c_stdout.clone();
+                            }
+                            // Normalize CRLF → LF: the C binary uses printf("\n")
+                            // which on Windows produces \r\n, while the interpreter
+                            // produces \n. Normalize both sides before comparing.
+                            let c_norm = c_stdout.replace("\r\n", "\n");
+                            let i_norm = interp_stdout.replace("\r\n", "\n");
+                            // An expected-fail test that panics at run time
+                            // has failed, whatever it printed before.
+                            c_norm == i_norm && (!fail_only || c_out.status.success())
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                let _ = fs::remove_file(&c_exe);
+                let _ = fs::remove_file(&c_exe.replace(".exe", ".c"));
+                let _ = fs::remove_file(format!("{}.fides-stamp", c_exe));
+
+                // PE emitter — use a platform-appropriate temp path
+                let pe_exe = if cfg!(windows) {
+                    format!("{}\\{}_test_pe.exe", std::env::temp_dir().to_string_lossy(), name)
+                } else {
+                    format!("/tmp/{}_test_pe.exe", name)
+                };
+                let _ = fs::remove_file(&pe_exe);
+                let pe_out = process::Command::new(&current_exe)
+                    .args(["emit", test_file, "-o", &pe_exe, "--no-cache"])
+                    .output();
+                let pe_emitted = pe_out
+                    .as_ref()
+                    .map(|o| o.status.success() && std::path::Path::new(&pe_exe).exists())
+                    .unwrap_or(false);
+                // Refused at compile time for lack of runtime support: not a
+                // pass, not a wrong result.
+                if !pe_emitted {
+                    let why = pe_out.as_ref().map(|o| String::from_utf8_lossy(&o.stderr).to_string()).unwrap_or_default();
+                    if why.contains("not available in native Windows executables") {
+                        let missing = why.split("executables: ").nth(1).and_then(|r| r.split(" (").next()).unwrap_or("");
+                        run.pe_refused = Some(missing.to_string());
+                    }
+                }
+                // Run the binary and compare its output with the interpreter's,
+                // as for C. (Bare-metal tests the C backend skips cannot run
+                // under an OS; for them a valid binary is the check.)
+                run.pe_ok = if !pe_emitted {
+                    false
+                } else if run.c_skipped {
+                    true
+                } else {
+                    match run_with_timeout(&pe_exe, std::time::Duration::from_secs(30)) {
+                        Some(out) => {
+                            let pe_norm = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+                            pe_norm == interp_stdout.replace("\r\n", "\n")
+                                && (!fail_only || out.status.success())
+                        }
+                        None => false,
+                    }
+                };
+                let _ = fs::remove_file(&pe_exe);
+                let _ = fs::remove_file(format!("{}.fides-stamp", pe_exe));
+                Some(run)
+            };
+
+            let next_test = std::sync::atomic::AtomicUsize::new(0);
+            let slots: std::sync::Mutex<Vec<Option<TestRun>>> =
+                std::sync::Mutex::new((0..test_files.len()).map(|_| None).collect());
+            std::thread::scope(|scope| {
+                for worker in 0..jobs {
+                    let (next_test, slots, run_test, test_files) = (&next_test, &slots, &run_test, &test_files);
+                    scope.spawn(move || loop {
+                        let i = next_test.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if i >= test_files.len() {
+                            break;
+                        }
+                        let r = run_test(&test_files[i], worker);
+                        slots.lock().unwrap()[i] = r;
+                    });
+                }
+            });
+
+            for run in slots.into_inner().unwrap().into_iter().flatten() {
+                let name = run.name.clone();
+                if let Some(note) = &run.skip_note {
+                    eprintln!("  [SKIP] {}: {}", name, note);
+                    continue;
+                }
+                let is_known = known_fail.contains(&name.as_str());
+                if !is_known {
+                    tested_count += 1;
+                }
+                let (interp_ok, c_ok, pe_ok) = (run.interp_ok, run.c_ok, run.pe_ok);
+
+                if run.interp_skipped {
+                    // Not run on the interpreter; counted on C and PE only.
+                    if !is_known { interp_skipped_count += 1; }
+                } else if fail_only {
                     // For expected-fail tests, failing = correct, passing = regression
                     if interp_ok {
                         interp_fail += 1;  // unexpected pass!
@@ -1791,54 +2064,9 @@ fn main() {
                     }
                 }
 
-                // C codegen — use a platform-appropriate temp path
-                let c_exe = if cfg!(windows) {
-                    format!("{}\\{}_test_c.exe", std::env::temp_dir().to_string_lossy(), name)
-                } else {
-                    format!("/tmp/{}_test_c.exe", name)
-                };
-                let _ = fs::remove_file(&c_exe);
-
-                // Skip C codegen for bare-metal tests that use externs not
-                // available in the C runtime (p_idt_set_entry, p_serial_*, etc.)
-                let c_skipped = c_skip_tests.contains(&name.as_str());
-                let c_compile = if c_skipped {
-                    // Mark as "skipped" — don't count as pass or fail
-                    None
-                } else {
-                    Some(process::Command::new(&current_exe)
-                        .args(["ccompile", test_file, "-o", &c_exe])
-                        .output())
-                };
-                let c_ok = if let Some(Ok(compile_out)) = c_compile.as_ref() {
-                    if compile_out.status.success() {
-                        if let Ok(c_out) = process::Command::new(&c_exe).output() {
-                            let c_stdout = String::from_utf8_lossy(&c_out.stdout).to_string();
-                            // Normalize CRLF → LF: the C binary uses printf("\n")
-                            // which on Windows produces \r\n, while the interpreter
-                            // produces \n. Normalize both sides before comparing.
-                            let c_norm = c_stdout.replace("\r\n", "\n");
-                            let i_norm = interp_stdout.replace("\r\n", "\n");
-                            let match_result = c_norm == i_norm;
-                            match_result
-                        } else {
-                            false
-                        }
-                    } else {
-                        if name == "test_borrowck" {
-                            let cc = String::from_utf8_lossy(&compile_out.stderr).to_string();
-                            eprintln!("  [DEBUG] test_borrowck: ccompile failed, stderr={}", cc);
-                        }
-                        false
-                    }
-                } else {
-                    false
-                };
-                let _ = fs::remove_file(&c_exe);
-                let _ = fs::remove_file(&c_exe.replace(".exe", ".c"));
-
-                if c_skipped {
+                if run.c_skipped {
                     // C codegen skipped for this test (bare-metal externs, etc.)
+                    if !is_known { c_skipped_count += 1; }
                 } else if fail_only {
                     if c_ok {
                         c_fail += 1;  // unexpected pass!
@@ -1862,39 +2090,10 @@ fn main() {
                     }
                 }
 
-                // PE emitter — use a platform-appropriate temp path
-                let pe_exe = if cfg!(windows) {
-                    format!("{}\\{}_test_pe.exe", std::env::temp_dir().to_string_lossy(), name)
-                } else {
-                    format!("/tmp/{}_test_pe.exe", name)
-                };
-                let _ = fs::remove_file(&pe_exe);
-                let pe_out = process::Command::new(&current_exe)
-                    .args(["emit", test_file, "-o", &pe_exe])
-                    .output();
-                let pe_emitted = pe_out
-                    .as_ref()
-                    .map(|o| o.status.success() && std::path::Path::new(&pe_exe).exists())
-                    .unwrap_or(false);
-                // Run the binary and compare its output with the interpreter's,
-                // as for C. (Bare-metal tests the C backend skips cannot run
-                // under an OS; for them a valid binary is the check.)
-                let pe_ok = if !pe_emitted {
-                    false
-                } else if c_skipped {
-                    true
-                } else {
-                    match run_with_timeout(&pe_exe, std::time::Duration::from_secs(30)) {
-                        Some(out) => {
-                            let pe_norm = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
-                            pe_norm == interp_stdout.replace("\r\n", "\n")
-                        }
-                        None => false,
-                    }
-                };
-                let _ = fs::remove_file(&pe_exe);
-
-                if fail_only {
+                if let (Some(missing), false) = (&run.pe_refused, fail_only) {
+                    pe_unsupported += 1;
+                    eprintln!("  [UNSUPPORTED] pe emit: {} (needs {})", name, missing);
+                } else if fail_only {
                     if pe_ok {
                         pe_fail += 1;  // unexpected pass!
                         eprintln!("  [UNEXPECTED PASS] pe emit: {} (should have failed)", name);
@@ -1926,9 +2125,10 @@ fn main() {
                 println!("PE Emitter:   {}/{} correctly failed", pe_pass, test_files.len());
             } else {
                 // Normal tests: only count non-known-fail tests in denominator
-                println!("Interpreter:  {}/{} passed", interp_pass, tested_count);
-                println!("C Codegen:    {}/{} matched", c_pass, tested_count);
-                println!("PE Emitter:   {}/{} matched", pe_pass, tested_count);
+                println!("Interpreter:  {}/{} passed", interp_pass, tested_count - interp_skipped_count);
+                println!("C Codegen:    {}/{} matched", c_pass, tested_count - c_skipped_count);
+                println!("PE Emitter:   {}/{} matched, {} unsupported by the native runtime",
+                    pe_pass, tested_count - pe_unsupported, pe_unsupported);
 
                 // Report known-fail tests separately
                 let known_total = known_fail.len();

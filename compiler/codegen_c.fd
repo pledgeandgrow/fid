@@ -76,10 +76,15 @@ pub struct CCodeGen {
     // O(n^2) memory blowup from string concatenation.
     pub sb: i64,
     pub out: str,
-    // Map from ValueId to C variable name
-    pub value_names: Vec<ValueNameEntry>,
-    // String constants collected from the module
+    // C variable name of each ValueId, indexed by id ("" = not named). A
+    // name depends only on the id, so the table is shared by all functions.
+    pub value_names: Vec<str>,
+    // String constants collected from the module, in emission order
     pub string_consts: Vec<StringConstEntry>,
+    // HashMap key -> 1 + index into string_consts / fn_param_types / fn_ret_types
+    pub string_const_index: i64,
+    pub fn_param_index: i64,
+    pub fn_ret_index: i64,
     // Counter for unique labels
     pub label_counter: i64,
     // Counter for temp variables
@@ -108,6 +113,9 @@ pub fn CCodeGen_new() -> CCodeGen {
         out: "",
         value_names: Vec::new(),
         string_consts: Vec::new(),
+        string_const_index: HashMap_new(),
+        fn_param_index: HashMap_new(),
+        fn_ret_index: HashMap_new(),
         label_counter: 0,
         temp_counter: 0,
         cur_fn_c_ret_is_void: true,
@@ -477,61 +485,47 @@ fn fresh_temp(self: &mut CCodeGen) -> str {
 // --- Map helpers ----------------------------------------------------------
 
 fn value_names_set(self: &mut CCodeGen, id: i64, name: str) -> void {
-    var i: i64 = 0;
-    while i < self.value_names.len() {
-        if self.value_names.get(i).id == id {
-            self.value_names.get(i).name = name;
-            return;
-        }
-        i = i + 1;
+    if id < 0 { return; }
+    while self.value_names.len() <= id {
+        self.value_names.push("");
     }
-    self.value_names.push(ValueNameEntry_new(id, name));
+    self.value_names.set(id, name);
 }
 
 fn string_consts_get(self: &CCodeGen, key: str) -> OptStr {
-    var i: i64 = 0;
-    while i < self.string_consts.len() {
-        if self.string_consts.get(i).key == key {
-            return OptStr::Some(self.string_consts.get(i).val);
-        }
-        i = i + 1;
+    var idx: i64 = HashMap_get(self.string_const_index, key);
+    if idx > 0 {
+        return OptStr::Some(self.string_consts.get(idx - 1).val);
     }
     return OptStr::None;
 }
 
 fn string_consts_set(self: &mut CCodeGen, key: str, val: str) -> void {
-    var i: i64 = 0;
-    while i < self.string_consts.len() {
-        if self.string_consts.get(i).key == key {
-            self.string_consts.get(i).val = val;
-            return;
-        }
-        i = i + 1;
+    var idx: i64 = HashMap_get(self.string_const_index, key);
+    if idx > 0 {
+        self.string_consts.set(idx - 1, StringConstEntry_new(key, val));
+        return;
     }
     self.string_consts.push(StringConstEntry_new(key, val));
+    HashMap_insert(self.string_const_index, key, self.string_consts.len());
 }
 
 fn fn_param_types_get(self: &CCodeGen, key: str) -> OptVecIrType {
-    var i: i64 = 0;
-    while i < self.fn_param_types.len() {
-        if self.fn_param_types.get(i).key == key {
-            return OptVecIrType::Some(self.fn_param_types.get(i).types);
-        }
-        i = i + 1;
+    var idx: i64 = HashMap_get(self.fn_param_index, key);
+    if idx > 0 {
+        return OptVecIrType::Some(self.fn_param_types.get(idx - 1).types);
     }
     return OptVecIrType::None;
 }
 
 fn fn_param_types_set(self: &mut CCodeGen, key: str, types: Vec<IrType>) -> void {
-    var i: i64 = 0;
-    while i < self.fn_param_types.len() {
-        if self.fn_param_types.get(i).key == key {
-            self.fn_param_types.get(i).types = types;
-            return;
-        }
-        i = i + 1;
+    var idx: i64 = HashMap_get(self.fn_param_index, key);
+    if idx > 0 {
+        self.fn_param_types.set(idx - 1, FnParamTypesEntry_new(key, types));
+        return;
     }
     self.fn_param_types.push(FnParamTypesEntry_new(key, types));
+    HashMap_insert(self.fn_param_index, key, self.fn_param_types.len());
 }
 
 pub enum OptVecIrType {
@@ -545,26 +539,21 @@ pub enum OptIrType {
 }
 
 fn fn_ret_types_get(self: &CCodeGen, key: str) -> OptIrType {
-    var i: i64 = 0;
-    while i < self.fn_ret_types.len() {
-        if self.fn_ret_types.get(i).key == key {
-            return OptIrType::Some(self.fn_ret_types.get(i).ty);
-        }
-        i = i + 1;
+    var idx: i64 = HashMap_get(self.fn_ret_index, key);
+    if idx > 0 {
+        return OptIrType::Some(self.fn_ret_types.get(idx - 1).ty);
     }
     return OptIrType::None;
 }
 
 fn fn_ret_types_set(self: &mut CCodeGen, key: str, ty: IrType) -> void {
-    var i: i64 = 0;
-    while i < self.fn_ret_types.len() {
-        if self.fn_ret_types.get(i).key == key {
-            self.fn_ret_types.get(i).ty = ty;
-            return;
-        }
-        i = i + 1;
+    var idx: i64 = HashMap_get(self.fn_ret_index, key);
+    if idx > 0 {
+        self.fn_ret_types.set(idx - 1, FnRetTypeEntry_new(key, ty));
+        return;
     }
     self.fn_ret_types.push(FnRetTypeEntry_new(key, ty));
+    HashMap_insert(self.fn_ret_index, key, self.fn_ret_types.len());
 }
 
 // --- Helpers for building small Vec<IrType> -------------------------------
@@ -872,6 +861,7 @@ fn CCodeGen_insert_runtime_sigs(self: &mut CCodeGen) -> void {
     fn_param_types_set(self, "p_file_append", t2(ptr_u8(), ptr_u8()));
     fn_param_types_set(self, "p_file_delete", t1(ptr_u8()));
     fn_param_types_set(self, "p_file_size", t1(ptr_u8()));
+    fn_param_types_set(self, "p_file_hash", t1(ptr_u8()));
     fn_param_types_set(self, "p_read_line", t0());
     fn_param_types_set(self, "p_read_stdin", t1(IrType::I64));
     fn_param_types_set(self, "p_stdin_eof", t0());
@@ -1074,6 +1064,12 @@ fn vec_push_unique(v: Vec<str>, s: str) -> void {
 
 fn emit_runtime_header(self: &mut CCodeGen) -> void {
     wln(self, "// Auto-generated C code from Fides IR");
+    wln(self, "// IEEE arithmetic exactly as written: no fused multiply-add contraction.");
+    wln(self, "#if defined(__clang__)");
+    wln(self, "#pragma STDC FP_CONTRACT OFF");
+    wln(self, "#elif defined(__GNUC__)");
+    wln(self, "#pragma GCC optimize (\"fp-contract=off\")");
+    wln(self, "#endif");
     wln(self, "#include <stdio.h>");
     wln(self, "#include <stdlib.h>");
     wln(self, "#include <string.h>");
@@ -1087,6 +1083,8 @@ fn emit_runtime_header(self: &mut CCodeGen) -> void {
     wln(self, "#ifdef _WIN32");
     wln(self, "#include <winsock2.h>");
     wln(self, "#include <ws2tcpip.h>");
+    wln(self, "#include <io.h>");
+    wln(self, "#include <fcntl.h>");
     wln(self, "// PLINK: ws2_32");
     wln(self, "#else");
     wln(self, "#include <sys/socket.h>");
@@ -1574,8 +1572,16 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "void p_flush_stdout(void);");
     wln(self, "void p_panic(const char* msg);");
     wln(self, "// Call stack for panic traces + recursion limit");
-    wln(self, "static const char* p_call_stack[2048];");
-    wln(self, "static int p_call_stack_depth = 0;");
+    wln(self, "// Per-thread runtime state (arena, call stack): no locks needed.");
+    wln(self, "#if defined(_MSC_VER)");
+    wln(self, "#define P_THREAD_LOCAL __declspec(thread)");
+    wln(self, "#elif defined(__TINYC__)");
+    wln(self, "#define P_THREAD_LOCAL /* TCC has no thread-local storage */");
+    wln(self, "#else");
+    wln(self, "#define P_THREAD_LOCAL __thread");
+    wln(self, "#endif");
+    wln(self, "static P_THREAD_LOCAL const char* p_call_stack[2048];");
+    wln(self, "static P_THREAD_LOCAL int p_call_stack_depth = 0;");
     wln(self, "static int p_max_recursion = 10000; // default limit");
     wln(self, "void p_call_stack_push(const char* name) {");
     wln(self, "    if (p_call_stack_depth >= p_max_recursion) {");
@@ -1592,10 +1598,14 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "void p_set_max_recursion(int limit) { p_max_recursion = limit; }");
     wln(self, "void* p_malloc(int64_t size);");
     wln(self, "void* p_malloc_persistent(int64_t size);");
+    wln(self, "int64_t p_arena_save(void);");
+    wln(self, "void p_arena_restore(int64_t mark);");
+    wln(self, "void p_region_free(void* region);");
     wln(self, "void p_free(void* ptr);");
     wln(self, "char* p_file_read(const char* path);");
     wln(self, "int64_t p_file_write(const char* path, const char* content);");
     wln(self, "int64_t p_file_write_vec(const char* path, PVec* v);");
+    wln(self, "PVec* p_file_read_bytes(const char* path);");
     wln(self, "bool p_file_exists(const char* path);");
     wln(self, "int64_t p_file_append(const char* path, const char* content);");
     wln(self, "int64_t p_file_delete(const char* path);");
@@ -1603,6 +1613,7 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "char* p_read_stdin(int64_t n);");
     wln(self, "int64_t p_stdin_eof(void);");
     wln(self, "int64_t p_file_size(const char* path);");
+    wln(self, "int64_t p_file_hash(const char* path);");
     wln(self, "char* p_getenv(const char* name);");
     wln(self, "static int __p_argc = 0;");
     wln(self, "static char** __p_argv = NULL;");
@@ -1625,6 +1636,7 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_task_poll(int64_t future);");
     wln(self, "bool p_task_is_ready(int64_t future);");
     wln(self, "int64_t p_executor_run_all(int64_t exec);");
+    wln(self, "int64_t p_executor_cancel(int64_t exec);");
     wln(self, "int64_t p_executor_poll_all(int64_t exec);");
     wln(self, "int64_t p_task_poll_nonblocking(int64_t future);");
     wln(self, "int64_t p_net_connect(const char* host, int64_t port);");
@@ -1708,7 +1720,7 @@ fn emit_string_consts(self: &mut CCodeGen, module: IrModule) -> void {
                                     idx = idx + 1;
                                     var escaped: str = escape_c_string(value);
                                     wln(self, "static const char " + name + "[] = \"" + escaped + "\";");
-                                    self.string_consts.push(StringConstEntry_new(value, name));
+                                    string_consts_set(self, value, name);
                                 }
                             }
                             Inst::ConstFnRef(name) => {
@@ -1717,7 +1729,7 @@ fn emit_string_consts(self: &mut CCodeGen, module: IrModule) -> void {
                                     idx = idx + 1;
                                     var escaped: str = escape_c_string(name);
                                     wln(self, "static const char " + cname + "[] = \"" + escaped + "\";");
-                                    self.string_consts.push(StringConstEntry_new(name, cname));
+                                    string_consts_set(self, name, cname);
                                 }
                             }
                             _ => {}
@@ -1735,17 +1747,23 @@ fn emit_string_consts(self: &mut CCodeGen, module: IrModule) -> void {
 }
 
 fn string_consts_contains(self: &CCodeGen, value: str) -> bool {
-    var i: i64 = 0;
-    while i < self.string_consts.len() {
-        if self.string_consts.get(i).key == value {
-            return true;
-        }
-        i = i + 1;
-    }
-    return false;
+    return HashMap_get(self.string_const_index, value) > 0;
 }
 
 fn find_inst(insts: Vec<ValueIdInst>, id: i64) -> OptInst {
+    // A function's instructions are appended in increasing id order
+    // (IrFunction_emit), so binary search finds one in O(log n).
+    var lo: i64 = 0;
+    var hi: i64 = insts.len() - 1;
+    while lo <= hi {
+        var mid: i64 = (lo + hi) / 2;
+        var mv: ValueIdInst = insts.get(mid);
+        if mv.id == id {
+            return OptInst::Some(mv.inst);
+        }
+        if mv.id < id { lo = mid + 1; } else { hi = mid - 1; }
+    }
+    // Not found that way: the order did not hold; scan.
     var i: i64 = 0;
     while i < insts.len() {
         var vi: ValueIdInst = insts.get(i);
@@ -2165,6 +2183,12 @@ fn emit_main_wrapper(self: &mut CCodeGen, module: IrModule) -> void {
         wln(self, "#endif");
         wln(self, "    setvbuf(stdout, NULL, _IONBF, 0);");
         wln(self, "    setvbuf(stderr, NULL, _IONBF, 0);");
+        // Windows: binary stdout/stderr, so a newline is not written as CR LF
+        // (output then matches the interpreter and Rust-built programs).
+        wln(self, "#ifdef _WIN32");
+        wln(self, "    _setmode(_fileno(stdout), _O_BINARY);");
+        wln(self, "    _setmode(_fileno(stderr), _O_BINARY);");
+        wln(self, "#endif");
         wln(self, "    __p_argc = argc; __p_argv = argv;");
         wln(self, "    // Register functions for p_thread_spawn lookup");
         var f: i64 = 0;
@@ -2214,19 +2238,12 @@ fn is_internal_function(name: str) -> bool {
 
 // --- Value / name helpers -------------------------------------------------
 
-fn value_names_clear(self: &mut CCodeGen) -> void {
-    while self.value_names.len() > 0 {
-        self.value_names.pop();
-    }
-}
-
 fn value_names_get(self: &CCodeGen, id: i64) -> OptStr {
-    var i: i64 = 0;
-    while i < self.value_names.len() {
-        if self.value_names.get(i).id == id {
-            return OptStr::Some(self.value_names.get(i).name);
+    if id >= 0 && id < self.value_names.len() {
+        var name: str = self.value_names.get(id);
+        if name != "" {
+            return OptStr::Some(name);
         }
-        i = i + 1;
     }
     return OptStr::None;
 }
@@ -2251,6 +2268,22 @@ fn lookup_field_offset(self: &CCodeGen, struct_name: str, field_index: i64, defa
         i = i + 1;
     }
     return default_offset;
+}
+
+/// "(T)(intptr_t)" for the C type T a value is declared with: converts an
+/// integer or a pointer to it, so an int/pointer mismatch between the IR and
+/// the declaration compiles under -Werror=int-conversion (GCC 14, Clang 16+).
+/// Empty for float and array types.
+fn int_ptr_cast(ty: IrType) -> str {
+    match ty {
+        IrType::F32 => { return ""; }
+        IrType::F64 => { return ""; }
+        IrType::Array(_, _) => { return ""; }
+        IrType::Void => { return "(int64_t)(intptr_t)"; }
+        IrType::Never => { return "(int64_t)(intptr_t)"; }
+        _ => {}
+    }
+    return "(" + c_type(ty) + ")(intptr_t)";
 }
 
 fn value_ty_for_id(func: IrFunction, id: i64) -> IrType {
@@ -2341,8 +2374,88 @@ fn alloca_size(self: &CCodeGen, ty: IrType) -> i64 {
     return size;
 }
 
+fn fn_has_const_str(func: IrFunction, s: str) -> bool {
+    var i: i64 = 0;
+    while i < func.insts.len() {
+        match func.insts.get(i).inst {
+            Inst::ConstStr(v) => { if v == s { return true; } }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// C bodies for core.fd's Vec_new/len/is_empty/get/set/push/pop, with core's
+/// exact semantics: the header is {data, len, cap} (three i64), growth
+/// doubles from 8 through p_malloc, a bad index panics with core's message.
+/// Used only when the function has core's signature (an env parameter, i64
+/// arguments, the same return type, and for get/set core's panic string),
+/// so a user's own function of that name keeps its body. Empty: no fast body.
+fn fast_core_vec_body(name: str, func: IrFunction, c_ret: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var n: i64 = func.params.len();
+    var i: i64 = 1;
+    while i < n {
+        var ok: bool = false;
+        match func.params.get(i).ty {
+            IrType::I64 => { ok = true; }
+            _ => {}
+        }
+        if !ok { return out; }
+        i = i + 1;
+    }
+    var p: Vec<str> = Vec::new();
+    i = 0;
+    while i < n {
+        p.push("v" + int_to_str(func.params.get(i).id));
+        i = i + 1;
+    }
+    var bounds: bool = fn_has_const_str(func, "Vec index out of bounds");
+    if name == "Vec_new" && n == 1 && c_ret == "int64_t" {
+        out.push("    int64_t* __h = (int64_t*)p_malloc(24);");
+        out.push("    __h[0] = 0; __h[1] = 0; __h[2] = 0;");
+        out.push("    return (int64_t)(intptr_t)__h;");
+    } else if name == "Vec_len" && n == 2 && c_ret == "int64_t" {
+        out.push("    int64_t* __h = (int64_t*)(intptr_t)" + p.get(1) + ";");
+        out.push("    return __h[1];");
+    } else if name == "Vec_is_empty" && n == 2 && c_ret == "bool" {
+        out.push("    int64_t* __h = (int64_t*)(intptr_t)" + p.get(1) + ";");
+        out.push("    return __h[1] == 0;");
+    } else if name == "Vec_get" && n == 3 && c_ret == "int64_t" && bounds {
+        out.push("    int64_t* __h = (int64_t*)(intptr_t)" + p.get(1) + ";");
+        out.push("    if (" + p.get(2) + " >= __h[1]) p_panic(\"Vec index out of bounds\");");
+        out.push("    if (" + p.get(2) + " < 0) p_panic(\"Vec index out of bounds\");");
+        out.push("    return ((int64_t*)(intptr_t)__h[0])[" + p.get(2) + "];");
+    } else if name == "Vec_set" && n == 4 && c_ret == "void" && bounds {
+        out.push("    int64_t* __h = (int64_t*)(intptr_t)" + p.get(1) + ";");
+        out.push("    if (" + p.get(2) + " >= __h[1]) p_panic(\"Vec index out of bounds\");");
+        out.push("    if (" + p.get(2) + " < 0) p_panic(\"Vec index out of bounds\");");
+        out.push("    ((int64_t*)(intptr_t)__h[0])[" + p.get(2) + "] = " + p.get(3) + ";");
+    } else if name == "Vec_push" && n == 3 && c_ret == "void" {
+        out.push("    int64_t* __h = (int64_t*)(intptr_t)" + p.get(1) + ";");
+        out.push("    int64_t __len = __h[1], __cap = __h[2];");
+        out.push("    if (__len >= __cap) {");
+        out.push("        int64_t __nc = __cap > 0 ? __cap * 2 : 8;");
+        out.push("        int64_t* __nd = (int64_t*)p_malloc(__nc * 8);");
+        out.push("        int64_t* __od = (int64_t*)(intptr_t)__h[0];");
+        out.push("        for (int64_t __i = 0; __i < __len; __i++) __nd[__i] = __od[__i];");
+        out.push("        if (__od) p_free(__od);");
+        out.push("        __h[0] = (int64_t)(intptr_t)__nd;");
+        out.push("        __h[2] = __nc;");
+        out.push("    }");
+        out.push("    ((int64_t*)(intptr_t)__h[0])[__len] = " + p.get(2) + ";");
+        out.push("    __h[1] = __len + 1;");
+    } else if name == "Vec_pop" && n == 2 && c_ret == "int64_t" {
+        out.push("    int64_t* __h = (int64_t*)(intptr_t)" + p.get(1) + ";");
+        out.push("    if (__h[1] == 0) return 0;");
+        out.push("    __h[1] = __h[1] - 1;");
+        out.push("    return ((int64_t*)(intptr_t)__h[0])[__h[1]];");
+    }
+    return out;
+}
+
 fn gen_function(self: &mut CCodeGen, name: str, func: IrFunction) -> void {
-    value_names_clear(self);
     self.temp_counter = 0;
     self.label_counter = 0;
     var c_name: str = sanitize_c_name(self, name);
@@ -2372,6 +2485,19 @@ fn gen_function(self: &mut CCodeGen, name: str, func: IrFunction) -> void {
         i = i + 1;
     }
     wln(self, ret_ty + " " + c_name + "(" + params_str + ") {");
+    // Core's hottest Vec functions: a few C statements instead of the
+    // lowered Fides body (much faster in the -O0 self-hosted build).
+    var fast: Vec<str> = fast_core_vec_body(name, func, ret_ty);
+    if fast.len() > 0 {
+        var fi: i64 = 0;
+        while fi < fast.len() {
+            wln(self, fast.get(fi));
+            fi = fi + 1;
+        }
+        wln(self, "}");
+        wln(self, "");
+        return;
+    }
     wln(self, "    p_call_stack_push(\"" + name + "\");");
 
     i = 0;
@@ -2499,7 +2625,9 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
             wln(self, "    " + dst + " = NULL;");
         }
         Inst::GlobalAddr(name, _) => {
-            wln(self, "    " + dst + " = (int64_t)&" + global_c_name(name) + ";");
+            var cast: str = int_ptr_cast(value_ty_for_id(func, id));
+            if cast == "" { cast = "(int64_t)(intptr_t)"; }
+            wln(self, "    " + dst + " = " + cast + "&" + global_c_name(name) + ";");
         }
         Inst::BinOp(op, left, right, ty) => {
             var l_raw: str = val_name(self, left);
@@ -2668,7 +2796,24 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                     if self.cur_fn_c_ret_is_void {
                         wln(self, "    return;");
                     } else {
+                        // Cast a pointer returned from an integer function,
+                        // or an integer from a pointer function (as the Rust
+                        // backend does; GCC 14 / Clang 16+ reject it bare).
                         var vn: str = val_name(self, v);
+                        var val_is_ptr: bool = false;
+                        match value_ty_for_id(func, v) {
+                            IrType::Ptr(_) => { val_is_ptr = true; }
+                            IrType::Opaque(_) => { val_is_ptr = true; }
+                            IrType::Generic(_, _) => { val_is_ptr = true; }
+                            _ => {}
+                        }
+                        var ret: str = self.cur_fn_c_ret_type;
+                        var ret_is_ptr: bool = ret == "void*" || str_starts_with(ret, "struct ");
+                        if val_is_ptr && !ret_is_ptr {
+                            vn = "(" + ret + ")(intptr_t)" + vn;
+                        } else if !val_is_ptr && ret_is_ptr {
+                            vn = "(void*)(intptr_t)" + vn;
+                        }
                         wln(self, "    return " + vn + ";");
                     }
                 }
@@ -2937,13 +3082,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
             var ci: i64 = 0;
             while ci < self.user_functions.len() {
                 var name: str = self.user_functions.get(ci);
-                var is_user: bool = false;
-                var ui: i64 = 0;
-                while ui < self.user_functions.len() {
-                    if self.user_functions.get(ui) == name { is_user = true; }
-                    ui = ui + 1;
-                }
-                if is_user {
+                if name != "" {
                     var pts_opt: OptVecIrType = fn_param_types_get(self, name);
                     match pts_opt {
                         OptVecIrType::Some(pts) => {
@@ -3132,7 +3271,9 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
         }
         Inst::BitCast(value, _, _) => {
             var v: str = val_name(self, value);
-            wln(self, "    " + dst + " = (void*)" + v + ";");
+            var cast: str = int_ptr_cast(value_ty_for_id(func, id));
+            if cast == "" { cast = "(void*)"; }
+            wln(self, "    " + dst + " = " + cast + v + ";");
         }
         Inst::IntExtend(value, _, _) => {
             var v: str = val_name(self, value);
@@ -3310,6 +3451,15 @@ fn extract_param_types(params: Vec<ValueIdType>) -> Vec<IrType> {
 }
 
 fn emit_file_write_bin_impl(self: &mut CCodeGen) -> void {
+    // Every byte of a file as one Vec element (binary-safe: keeps 0x00).
+    wln(self, "PVec* p_file_read_bytes(const char* path) {");
+    wln(self, "    PVec* v = p_vec_new();");
+    wln(self, "    FILE* f = fopen(path, \"rb\");");
+    wln(self, "    if (!f) return v;");
+    wln(self, "    int c;");
+    wln(self, "    while ((c = fgetc(f)) != EOF) p_vec_push(v, (void*)(intptr_t)c);");
+    wln(self, "    fclose(f); return v;");
+    wln(self, "}");
     wln(self, "int64_t p_file_write_vec(const char* path, PVec* v) {");
     wln(self, "    FILE* f = fopen(path, \"wb\");");
     wln(self, "    if (!f) return -1;");
@@ -3559,8 +3709,8 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     // This NEVER invalidates existing pointers (unlike realloc-based growth).
     wln(self, "#define __P_ARENA_CHUNK_SIZE (4*1024*1024)");
     wln(self, "typedef struct __p_arena_chunk { char* base; char* ptr; char* end; struct __p_arena_chunk* next; } __p_arena_chunk;");
-    wln(self, "static __p_arena_chunk* __p_arena_head = NULL;");
-    wln(self, "static __p_arena_chunk* __p_arena_cur = NULL;");
+    wln(self, "static P_THREAD_LOCAL __p_arena_chunk* __p_arena_head = NULL;");
+    wln(self, "static P_THREAD_LOCAL __p_arena_chunk* __p_arena_cur = NULL;");
     wln(self, "static __p_arena_chunk* __p_arena_new_chunk(void) {");
     wln(self, "    __p_arena_chunk* c = (__p_arena_chunk*)malloc(sizeof(__p_arena_chunk));");
     wln(self, "    if (!c) return NULL;");
@@ -3601,11 +3751,33 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "}");
     wln(self, "void* p_malloc_persistent(int64_t size) { if (size < 0) return NULL; return malloc((size_t)size); }");
     wln(self, "void p_free(void* ptr) { /* arena memory - no individual frees */ }");
-    wln(self, "int64_t p_arena_save(void) { return 0; }");
+    // stdlib regions allocate from the arena, so it releases them too.
+    wln(self, "void p_region_free(void* region) { (void)region; }");
+    // Arena mark: (1-based chunk index << 32) | offset in that chunk.
+    // Restoring frees the chunks after the marked one: they only hold
+    // memory allocated after the save.
+    wln(self, "int64_t p_arena_save(void) {");
+    wln(self, "    int64_t idx = 0;");
+    wln(self, "    for (__p_arena_chunk* c = __p_arena_head; c; c = c->next) {");
+    wln(self, "        idx++;");
+    wln(self, "        if (c == __p_arena_cur) return (idx << 32) | (int64_t)(c->ptr - c->base);");
+    wln(self, "    }");
+    wln(self, "    return 0;");
+    wln(self, "}");
     wln(self, "void p_arena_restore(int64_t mark) {");
-    wln(self, "    __p_arena_chunk* c = __p_arena_head;");
-    wln(self, "    while (c) { c->ptr = c->base; c = c->next; }");
-    wln(self, "    __p_arena_cur = __p_arena_head;");
+    wln(self, "    int64_t idx = mark >> 32, off = mark & 0xffffffffLL, i = 0;");
+    wln(self, "    __p_arena_chunk* keep = __p_arena_head;");
+    wln(self, "    if (!keep) return;");
+    wln(self, "    if (idx == 0) { keep->ptr = keep->base; }");
+    wln(self, "    else {");
+    wln(self, "        for (__p_arena_chunk* c = __p_arena_head; c; c = c->next) { if (++i == idx) { keep = c; break; } }");
+    wln(self, "        if (i != idx) return;");
+    wln(self, "        keep->ptr = keep->base + off;");
+    wln(self, "    }");
+    wln(self, "    __p_arena_chunk* c = keep->next;");
+    wln(self, "    keep->next = NULL;");
+    wln(self, "    while (c) { __p_arena_chunk* n = c->next; free(c->base); free(c); c = n; }");
+    wln(self, "    __p_arena_cur = keep;");
     wln(self, "}");
     // File I/O builtins
     wln(self, "char* p_file_read(const char* path) {");
@@ -3637,6 +3809,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "}");
     wln(self, "int64_t p_file_delete(const char* path) { return remove(path) == 0 ? 0 : -1; }");
     wln(self, "int64_t p_file_size(const char* path) { FILE* f = fopen(path, \"rb\"); if (!f) return -1; fseek(f, 0, SEEK_END); int64_t sz = ftell(f); fclose(f); return sz < 0 ? -1 : sz; }");
+    wln(self, "int64_t p_file_hash(const char* path) { FILE* f = fopen(path, \"rb\"); if (!f) return 0; uint64_t h = 0xcbf29ce484222325ULL; unsigned char buf[65536]; size_t n; while ((n = fread(buf, 1, sizeof buf, f)) > 0) { for (size_t i = 0; i < n; i++) { h ^= buf[i]; h *= 0x100000001b3ULL; } } fclose(f); return (int64_t)h; }");
     // Read a line from stdin - returns malloc'd string (caller must not free,
     // arena-managed). Returns NULL on EOF. Strips trailing \n and \r\n.
     wln(self, "char* p_read_line(void) {");
@@ -3758,9 +3931,11 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "static inline int pthread_cond_wait(pthread_cond_t* c, pthread_mutex_t* m) { (void)c; (void)m; return 0; }");
     wln(self, "static inline int pthread_cond_signal(pthread_cond_t* c) { (void)c; return 0; }");
     wln(self, "static inline int pthread_cond_broadcast(pthread_cond_t* c) { (void)c; return 0; }");
-    wln(self, "static inline int pthread_key_create(pthread_key_t* k, void(*d)(void*)) { (void)d; *k = 0; return 0; }");
-    wln(self, "static inline void* pthread_getspecific(pthread_key_t k) { (void)k; return NULL; }");
-    wln(self, "static inline int pthread_setspecific(pthread_key_t k, const void* v) { (void)k; (void)v; return 0; }");
+    wln(self, "static void* __p_tls_values[1024];");
+    wln(self, "static int __p_tls_next = 0;");
+    wln(self, "static inline int pthread_key_create(pthread_key_t* k, void(*d)(void*)) { (void)d; if (__p_tls_next >= 1024) return -1; *k = __p_tls_next++; return 0; }");
+    wln(self, "static inline void* pthread_getspecific(pthread_key_t k) { return (k >= 0 && k < 1024) ? __p_tls_values[k] : NULL; }");
+    wln(self, "static inline int pthread_setspecific(pthread_key_t k, const void* v) { if (k < 0 || k >= 1024) return -1; __p_tls_values[k] = (void*)v; return 0; }");
     wln(self, "#else");
     wln(self, "#include <pthread.h>");
     wln(self, "#endif");
@@ -3874,6 +4049,22 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_executor_block_on(int64_t exec, int64_t future) {");
     wln(self, "    (void)exec;");
     wln(self, "    return p_future_poll(future);");
+    wln(self, "}");
+    // Cancel the tasks of a scope: a task cannot be stopped mid-way, so
+    // wait for any still running (no task outlives its scope), drop their
+    // results (0, as in the interpreter), and return how many were cancelled.
+    wln(self, "int64_t p_executor_cancel(int64_t exec) {");
+    wln(self, "    (void)exec;");
+    wln(self, "    int64_t count = 0;");
+    wln(self, "    for (int i = 0; i < p_thread_handle_count; i++) {");
+    wln(self, "        if (p_thread_handles[i] == 0) continue; // already joined");
+    wln(self, "        int was_done = atomic_load(&p_task_done_flags[i]);");
+    wln(self, "        void* ret = NULL; pthread_join(p_thread_handles[i], &ret);");
+    wln(self, "        p_task_results[i] = was_done ? (int64_t)(intptr_t)ret : 0;");
+    wln(self, "        if (!was_done) count++;");
+    wln(self, "        p_thread_handles[i] = 0;");
+    wln(self, "    }");
+    wln(self, "    return count;");
     wln(self, "}");
     wln(self, "int64_t p_executor_run_all(int64_t exec) {");
     wln(self, "    (void)exec;");
@@ -5257,29 +5448,31 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    if (layer < 0 || layer >= c->num_layers) return;");
     wln(self, "    PTensor* kt = (PTensor*)k; PTensor* vt = (PTensor*)v;");
     wln(self, "    if (!kt || !vt) return;");
-    wln(self, "    int64_t new_tokens = kt->shape[0];");
-    wln(self, "    int64_t new_len = c->layers[layer].seq_len + new_tokens;");
-    wln(self, "    if (c->window_size > 0 && new_len > c->window_size) {");
-    wln(self, "        int64_t evict = new_len - c->window_size;");
-    wln(self, "        if (c->layers[layer].k_data) {");
-    wln(self, "            int64_t remain = c->layers[layer].seq_len - evict;");
-    wln(self, "            if (remain > 0) { memmove(c->layers[layer].k_data->data, c->layers[layer].k_data->data + evict * c->head_dim, remain * c->head_dim * sizeof(double)); memmove(c->layers[layer].v_data->data, c->layers[layer].v_data->data + evict * c->head_dim, remain * c->head_dim * sizeof(double)); }");
-    wln(self, "            c->layers[layer].seq_len = remain;");
-    wln(self, "        } else c->layers[layer].seq_len = 0;");
-    wln(self, "        new_len = c->layers[layer].seq_len + new_tokens;");
+    wln(self, "    KVLayer* L = &c->layers[layer];");
+    wln(self, "    if (!L->k_data) {");
+    wln(self, "        L->k_data = (PTensor*)calloc(1, sizeof(PTensor)); L->k_data->ndim = 2; L->k_data->shape[1] = c->head_dim;");
+    wln(self, "        L->v_data = (PTensor*)calloc(1, sizeof(PTensor)); L->v_data->ndim = 2; L->v_data->shape[1] = c->head_dim;");
     wln(self, "    }");
-    wln(self, "    int64_t total = new_len * c->head_dim;");
-    wln(self, "    if (!c->layers[layer].k_data) {");
-    wln(self, "        c->layers[layer].k_data = (PTensor*)malloc(sizeof(PTensor)); c->layers[layer].k_data->ndim = 2; c->layers[layer].k_data->shape[0] = new_len; c->layers[layer].k_data->shape[1] = c->head_dim; c->layers[layer].k_data->len = total; c->layers[layer].k_data->data = (double*)malloc(total * sizeof(double));");
-    wln(self, "        c->layers[layer].v_data = (PTensor*)malloc(sizeof(PTensor)); c->layers[layer].v_data->ndim = 2; c->layers[layer].v_data->shape[0] = new_len; c->layers[layer].v_data->shape[1] = c->head_dim; c->layers[layer].v_data->len = total; c->layers[layer].v_data->data = (double*)malloc(total * sizeof(double));");
-    wln(self, "    } else {");
-    wln(self, "        c->layers[layer].k_data->data = (double*)realloc(c->layers[layer].k_data->data, total * sizeof(double)); c->layers[layer].k_data->len = total; c->layers[layer].k_data->shape[0] = new_len;");
-    wln(self, "        c->layers[layer].v_data->data = (double*)realloc(c->layers[layer].v_data->data, total * sizeof(double)); c->layers[layer].v_data->len = total; c->layers[layer].v_data->shape[0] = new_len;");
+    wln(self, "    // Append every new value, then drop the oldest beyond the limit.");
+    wln(self, "    PTensor* dst[2] = { L->k_data, L->v_data };");
+    wln(self, "    PTensor* src[2] = { kt, vt };");
+    wln(self, "    int64_t max_tokens = c->window_size > 0 && c->window_size < c->max_seq_len ? c->window_size : c->max_seq_len;");
+    wln(self, "    int64_t max_vals = max_tokens * c->head_dim;");
+    wln(self, "    if (max_vals < 0) max_vals = 0;");
+    wln(self, "    for (int t = 0; t < 2; t++) {");
+    wln(self, "        int64_t total = dst[t]->len + src[t]->len;");
+    wln(self, "        dst[t]->data = (double*)realloc(dst[t]->data, (total > 0 ? total : 1) * sizeof(double));");
+    wln(self, "        for (int64_t i = 0; i < src[t]->len; i++) dst[t]->data[dst[t]->len + i] = src[t]->data[i];");
+    wln(self, "        dst[t]->len = total;");
+    wln(self, "        if (dst[t]->len > max_vals) {");
+    wln(self, "            int64_t excess = dst[t]->len - max_vals;");
+    wln(self, "            memmove(dst[t]->data, dst[t]->data + excess, max_vals * sizeof(double));");
+    wln(self, "            dst[t]->len = max_vals;");
+    wln(self, "        }");
     wln(self, "    }");
-    wln(self, "    int64_t offset = c->layers[layer].seq_len * c->head_dim;");
-    wln(self, "    for (int64_t i = 0; i < kt->len; i++) c->layers[layer].k_data->data[offset + i] = kt->data[i];");
-    wln(self, "    for (int64_t i = 0; i < vt->len; i++) c->layers[layer].v_data->data[offset + i] = vt->data[i];");
-    wln(self, "    c->layers[layer].seq_len = new_len;");
+    wln(self, "    int64_t hd = c->head_dim > 0 ? c->head_dim : 1;");
+    wln(self, "    L->seq_len = L->k_data->len / hd;");
+    wln(self, "    L->k_data->shape[0] = L->seq_len; L->v_data->shape[0] = L->seq_len;");
     wln(self, "}");
     wln(self, "void* p_kv_cache_get(int64_t cache_id, int64_t layer) {");
     wln(self, "    if (cache_id < 0 || cache_id >= kv_cache_count) return NULL;");
@@ -5791,6 +5984,12 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    PMemDB* db = (PMemDB*)calloc(1, sizeof(PMemDB));");
     wln(self, "    return db;");
     wln(self, "}");
+    wln(self, "static int64_t p_db_mem_find(PMemDB* mdb, const char* k, size_t kl) {");
+    wln(self, "    for (int64_t i = 0; i < mdb->len; i++) {");
+    wln(self, "        if (strlen(mdb->keys[i]) == kl && memcmp(mdb->keys[i], k, kl) == 0) return i;");
+    wln(self, "    }");
+    wln(self, "    return -1;");
+    wln(self, "}");
     wln(self, "int64_t p_db_mem_exec(void* db, const char* query) {");
     wln(self, "    PMemDB* mdb = (PMemDB*)db;");
     wln(self, "    if (!mdb || !query) return 0;");
@@ -5807,18 +6006,29 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    while (*p) p++;");
     wln(self, "    size_t vlen = p - vstart;");
     wln(self, "    if ((strcmp(cmd, \"insert\") == 0 || strcmp(cmd, \"set\") == 0) && klen > 0) {");
+    wln(self, "        char* v = (char*)malloc(vlen+1); memcpy(v, vstart, vlen); v[vlen] = 0;");
+    wln(self, "        int64_t at = p_db_mem_find(mdb, kstart, klen);");
+    wln(self, "        if (at >= 0) { free(mdb->vals[at]); mdb->vals[at] = v; return 1; }");
     wln(self, "        if (mdb->len >= mdb->cap) { mdb->cap = mdb->cap ? mdb->cap*2 : 8; mdb->keys = (char**)realloc(mdb->keys, mdb->cap*sizeof(char*)); mdb->vals = (char**)realloc(mdb->vals, mdb->cap*sizeof(char*)); }");
     wln(self, "        mdb->keys[mdb->len] = (char*)malloc(klen+1); memcpy(mdb->keys[mdb->len], kstart, klen); mdb->keys[mdb->len][klen] = 0;");
-    wln(self, "        mdb->vals[mdb->len] = (char*)malloc(vlen+1); memcpy(mdb->vals[mdb->len], vstart, vlen); mdb->vals[mdb->len][vlen] = 0;");
+    wln(self, "        mdb->vals[mdb->len] = v;");
     wln(self, "        mdb->len++;");
     wln(self, "        return 1;");
     wln(self, "    }");
     wln(self, "    return 0;");
     wln(self, "}");
     wln(self, "char* p_db_mem_query(void* db, const char* query) {");
-    wln(self, "    (void)query;");
     wln(self, "    PMemDB* mdb = (PMemDB*)db;");
     wln(self, "    if (!mdb) return strdup(\"[]\");");
+    wln(self, "    const char* w = query ? strstr(query, \"key=\") : NULL;");
+    wln(self, "    if (w) {");
+    wln(self, "        const char* k = w + 4;");
+    wln(self, "        while (*k == '\\'' || *k == '\"') k++;");
+    wln(self, "        size_t kl = 0;");
+    wln(self, "        while (k[kl] && k[kl] != ' ' && k[kl] != ';' && k[kl] != '\\'' && k[kl] != '\"') kl++;");
+    wln(self, "        int64_t at = p_db_mem_find(mdb, k, kl);");
+    wln(self, "        return strdup(at >= 0 ? mdb->vals[at] : \"\");");
+    wln(self, "    }");
     wln(self, "    size_t cap = 64; char* result = (char*)malloc(cap); size_t pos = 0;");
     wln(self, "    result[pos++] = '[';");
     wln(self, "    for (int64_t i = 0; i < mdb->len; i++) {");

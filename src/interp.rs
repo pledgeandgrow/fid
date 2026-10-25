@@ -269,7 +269,8 @@ pub struct Interpreter {
     /// Array bounds tracking — maps base address to array size
     array_bounds: HashMap<u64, usize>,
     /// In-memory databases for p_db_* builtins (Phase 5D.4)
-    databases: HashMap<u64, hashbrown::HashMap<String, Value>>,
+    /// (key, value) rows in insertion order, as the C runtime keeps them.
+    databases: HashMap<u64, Vec<(String, Value)>>,
     /// Next database handle
     next_db_handle: u64,
     /// Persistent state for `persist` variables (F2/ML4)
@@ -1025,6 +1026,38 @@ impl Interpreter {
         }
     }
 
+    /// The elements of a Fides Vec handle: the managed side-table value when
+    /// it holds the data, otherwise the `{data, len, cap}` struct in memory.
+    fn fides_vec_items(&self, v: &Value) -> Vec<i64> {
+        if let Some(Value::Vec(arr)) = self.lookup_vec_value(Some(v)) {
+            let arr = arr.borrow();
+            if !arr.is_empty() {
+                return arr.iter().map(|x| match x { Value::Int(n) => *n, Value::Bool(b) => *b as i64, _ => 0 }).collect();
+            }
+        }
+        let addr = match v {
+            Value::Int(a) if *a > 0 => *a as u64,
+            Value::Ptr(a) if *a > 0 => *a,
+            _ => return Vec::new(),
+        };
+        let data = self.memory.load_i64(addr) as u64;
+        let len = self.memory.load_i64(addr + 8).max(0) as u64;
+        (0..len).map(|i| self.memory.load_i64(data + i * 8)).collect()
+    }
+
+    /// A new Fides Vec (`{data, len, cap}` in memory) holding `items`.
+    fn make_fides_vec(&mut self, items: &[i64]) -> Value {
+        let addr = self.memory.alloc(24);
+        let data = self.memory.alloc((items.len().max(1) * 8) as u64);
+        for (i, x) in items.iter().enumerate() {
+            self.memory.store_i64(data + (i as u64) * 8, *x);
+        }
+        self.memory.store_i64(addr, data as i64);
+        self.memory.store_i64(addr + 8, items.len() as i64);
+        self.memory.store_i64(addr + 16, items.len().max(1) as i64);
+        Value::Int(addr as i64)
+    }
+
     /// Run a specific function with arguments
     fn run_function(&mut self, func: &IrFunction, args: &[Value]) -> RunResult {
         // SH-1.4: Recursion depth limit — check before pushing to call_stack.
@@ -1355,7 +1388,7 @@ impl Interpreter {
                             if let Value::Int(b) = r { b.to_string() } else { "?".to_string() }),
                         BinOp::Div => "Division by zero".to_string(),
                         BinOp::Mod => "Modulo by zero".to_string(),
-                        _ => "Arithmetic error".to_string(),
+                        _ => format!("Arithmetic error: {:?} on {:?} and {:?}", op, l, r),
                     };
                     return ExecOutcome::Panic(msg);
                 }
@@ -1486,8 +1519,15 @@ impl Interpreter {
                 // the source pointer to the destination.
                 if let Some(IrType::Struct(_)) = &explicit_store_ty {
                     let size = self.module.type_size(explicit_store_ty.as_ref().unwrap()) as usize;
-                    if let Some(Value::Ptr(src_addr)) = values.get(value) {
-                        let src_bytes = self.memory.load(*src_addr, size);
+                    // The source address may arrive as an Int: a struct read
+                    // back from a Vec element (stored as a 64-bit word).
+                    let src = match values.get(value) {
+                        Some(Value::Ptr(a)) => Some(*a),
+                        Some(Value::Int(a)) if *a > 0 && self.memory.is_valid_addr(*a as u64) => Some(*a as u64),
+                        _ => None,
+                    };
+                    if let Some(src_addr) = src {
+                        let src_bytes = self.memory.load(src_addr, size);
                         self.memory.store(addr, &src_bytes);
                         return ExecOutcome::Continue;
                     }
@@ -2019,14 +2059,14 @@ impl Interpreter {
                                     bytes.push(b[0]);
                                     offset += 1;
                                 }
-                                if !bytes.is_empty() {
-                                    print!("{}", String::from_utf8_lossy(&bytes));
-                                    return ExecOutcome::Continue;
-                                }
+                                // A str: print it even when it is empty.
+                                print!("{}", String::from_utf8_lossy(&bytes));
+                                return ExecOutcome::Continue;
                             }
                         }
                     }
                 }
+                let is_str = matches!(ty, IrType::Ptr(inner) if matches!(inner.as_ref(), IrType::U8));
                 match &v {
                     Value::Int(i) => print!("{}", i),
                     Value::Float(f) => print!("{}", f),
@@ -2042,7 +2082,7 @@ impl Interpreter {
                             bytes.push(b[0]);
                             offset += 1;
                         }
-                        if bytes.is_empty() {
+                        if bytes.is_empty() && !is_str {
                             // Not a string — print as pointer
                             print!("ptr(0x{:x})", addr);
                         } else {
@@ -2393,6 +2433,13 @@ impl Interpreter {
         // F64/F65: checked arithmetic is the default. @wrapping functions
         // use wrap-around arithmetic. Division by zero always panics.
         let use_wrapping = self.is_wrapping_func();
+        // A bool compared with an integer is 0 or 1, as in C (runtime
+        // predicates return bool; `p_file_exists(p) != 0` must work).
+        match (l, r) {
+            (Value::Bool(a), Value::Int(_)) => return self.eval_binop(op, &Value::Int(*a as i64), r),
+            (Value::Int(_), Value::Bool(b)) => return self.eval_binop(op, l, &Value::Int(*b as i64)),
+            _ => {}
+        }
         match (l, r) {
             (Value::Int(a), Value::Int(b)) => {
                 match op {
@@ -2772,6 +2819,10 @@ impl Interpreter {
                 // Interpreter doesn't actually free — memory is arena-based
                 ExecOutcome::Value(Value::Void)
             }
+            // Interpreter memory is never reused, so a mark has nothing to
+            // restore (use after restore is the program's error).
+            "p_arena_save" => ExecOutcome::Value(Value::Int(0)),
+            "p_arena_restore" => ExecOutcome::Value(Value::Void),
             "p_memset" => {
                 // @zeroize: wipe memory at ptr for size bytes with val
                 if let (Some(Value::Ptr(addr)), Some(Value::Int(val)), Some(Value::Int(size))) =
@@ -4583,7 +4634,7 @@ impl Interpreter {
             "p_db_mem_open" => {
                 let handle = self.next_db_handle;
                 self.next_db_handle += 1;
-                self.databases.insert(handle, hashbrown::HashMap::new());
+                self.databases.insert(handle, Vec::new());
                 ExecOutcome::Value(Value::Int(handle as i64))
             }
             "p_db_mem_close" => {
@@ -4593,12 +4644,21 @@ impl Interpreter {
                 ExecOutcome::Continue
             }
             "p_db_mem_query" => {
-                // Query: SELECT key FROM db -> return JSON array of all keys
-                // Sort keys for deterministic output (matches C codegen's insertion-order array)
+                // `... key=K ...` returns K's value ("" if absent); any other
+                // query returns the keys, in insertion order, as a JSON array.
                 if let Some(Value::Int(h)) = args.first() {
+                    let query = args.get(1).map(|q| self.value_to_string(q)).unwrap_or_default();
                     if let Some(db) = self.databases.get(&(*h as u64)) {
-                        let mut keys: Vec<&str> = db.keys().map(|k| k.as_str()).collect();
-                        keys.sort();
+                        if let Some(at) = query.find("key=") {
+                            let k = query[at + 4..].trim_start_matches(|c| c == '\'' || c == '"');
+                            let end = k.find(|c| c == ' ' || c == ';' || c == '\'' || c == '"').unwrap_or(k.len());
+                            let k = &k[..end];
+                            let v = db.iter().find(|(key, _)| key == k)
+                                .map(|(_, v)| self.value_to_string(v))
+                                .unwrap_or_default();
+                            return ExecOutcome::Value(Value::Str(CompactString::from(v)));
+                        }
+                        let keys: Vec<&str> = db.iter().map(|(k, _)| k.as_str()).collect();
                         let arr: Vec<json::Json> = keys.into_iter()
                             .map(|k| json::Json::String(k.to_string()))
                             .collect();
@@ -4616,7 +4676,11 @@ impl Interpreter {
                     let parts: Vec<&str> = query_str.splitn(3, ' ').collect();
                     if parts.len() >= 3 && (parts[0].eq_ignore_ascii_case("set") || parts[0].eq_ignore_ascii_case("insert")) {
                         if let Some(db) = self.databases.get_mut(&(*h as u64)) {
-                            db.insert(parts[1].to_string(), Value::Str(CompactString::from(parts[2])));
+                            let v = Value::Str(CompactString::from(parts[2]));
+                            match db.iter_mut().find(|(k, _)| k == parts[1]) {
+                                Some(row) => row.1 = v,
+                                None => db.push((parts[1].to_string(), v)),
+                            }
                             return ExecOutcome::Value(Value::Int(1));
                         }
                     }
@@ -4664,10 +4728,33 @@ impl Interpreter {
                 }
                 ExecOutcome::Value(Value::Ptr(0))
             }
+            "p_file_write_vec" => {
+                // Write each Vec element as one byte (binary-safe).
+                if let (Some(path_arg), Some(vec_arg)) = (args.get(0), args.get(1)) {
+                    let path_str = self.value_to_string(path_arg);
+                    let bytes: Vec<u8> = self.fides_vec_items(vec_arg).iter().map(|b| *b as u8).collect();
+                    if !path_str.is_empty() {
+                        return match std::fs::write(&path_str, &bytes) {
+                            Ok(_) => ExecOutcome::Value(Value::Int(0)),
+                            Err(_) => ExecOutcome::Value(Value::Int(-1)),
+                        };
+                    }
+                }
+                ExecOutcome::Value(Value::Int(-1))
+            }
+            "p_file_read_bytes" => {
+                // Every byte of the file as one Vec element (binary-safe).
+                let path_str = args.first().map(|a| self.value_to_string(a)).unwrap_or_default();
+                let bytes = std::fs::read(&path_str).unwrap_or_default();
+                let items: Vec<i64> = bytes.iter().map(|b| *b as i64).collect();
+                ExecOutcome::Value(self.make_fides_vec(&items))
+            }
             "p_file_write" => {
                 if let (Some(path_arg), Some(content_arg)) = (args.get(0), args.get(1)) {
                     let path_str = self.value_to_string(path_arg);
-                    let content_str = self.value_to_string(content_arg);
+                    // A text write stops at the first NUL, as C's fputs does.
+                    let full = self.value_to_string(content_arg);
+                    let content_str = full.split('\0').next().unwrap_or("").to_string();
                     if !path_str.is_empty() {
                         match std::fs::write(&path_str, &content_str) {
                             Ok(_) => return ExecOutcome::Value(Value::Int(0)),
@@ -4716,6 +4803,12 @@ impl Interpreter {
                     }
                 }
                 ExecOutcome::Value(Value::Int(-1))
+            }
+            "p_file_hash" => {
+                // FNV-1a 64 of the file's bytes, 0 if unreadable.
+                let path = args.first().map(|a| self.value_to_string(a)).unwrap_or_default();
+                let h = std::fs::read(&path).map_or(0, |b| crate::inc::hash_bytes(&b) as i64);
+                ExecOutcome::Value(Value::Int(h))
             }
             "p_file_size" => {
                 if let Some(path_arg) = args.get(0) {

@@ -263,7 +263,7 @@ pub struct L1Function {
     pub ret_ty: PirType,
     pub blocks: Vec<L1Block>,
     /// value id -> (instruction, region, effects, source_line)
-    pub values: HashMap<PValue, (L1Inst, RegionRef, EffectSet, Option<usize>)>,
+    pub values: std::collections::BTreeMap<PValue, (L1Inst, RegionRef, EffectSet, Option<usize>)>,
     pub effects: EffectSet,
     pub caps: CapSet,
     pub entry: PBlock,
@@ -443,7 +443,8 @@ pub struct L2Function {
     pub params: Vec<(PValue, PirType)>,
     pub ret_ty: PirType,
     pub blocks: Vec<L2Block>,
-    pub values: HashMap<PValue, L2Inst>,
+    // Ordered: optimizer passes iterate it, and output must be reproducible.
+    pub values: std::collections::BTreeMap<PValue, L2Inst>,
     pub entry: PBlock,
     /// Whether this function is pure (no side effects).
     /// Used by the inline cost model (F-3F) to inline pure functions more aggressively.
@@ -690,12 +691,12 @@ pub struct L3Module {
 /// per-instruction effects via `Inst::effects()`.
 pub fn lower_ir_to_l1(module: &IrModule) -> L1Module {
     let mut l1 = L1Module::default();
-    l1.struct_layouts = module.struct_layouts.clone();
-    l1.string_constants = module.string_constants.clone();
-    l1.extern_functions = module.extern_functions.clone();
-    l1.trait_methods = module.trait_methods.clone();
-    l1.trait_impls = module.trait_impls.clone();
-    l1.linear_structs = module.linear_structs.clone();
+    l1.struct_layouts = module.struct_layouts.clone().into_iter().collect();
+    l1.string_constants = module.string_constants.clone().into_iter().collect();
+    l1.extern_functions = module.extern_functions.clone().into_iter().collect();
+    l1.trait_methods = module.trait_methods.clone().into_iter().collect();
+    l1.trait_impls = module.trait_impls.clone().into_iter().collect();
+    l1.linear_structs = module.linear_structs.clone().into_iter().collect();
 
     // Process functions in a deterministic order (sorted by name) for stable
     // printer output.
@@ -729,8 +730,8 @@ fn caps_for_call(func: &str, module: &IrModule) -> CapSet {
 }
 
 fn lower_func_to_l1(f: &IrFunction) -> L1Function {
-    let mut values: HashMap<PValue, (L1Inst, RegionRef, EffectSet, Option<usize>)> =
-        HashMap::new();
+    let mut values: std::collections::BTreeMap<PValue, (L1Inst, RegionRef, EffectSet, Option<usize>)> =
+        std::collections::BTreeMap::new();
 
     // First pass: build a region map for each value (from ValueMeta + Alloca).
     // The IR stores region in ValueMeta (defaulting to Stack) and on Alloca.
@@ -1016,7 +1017,7 @@ fn mem_region_of(r: &RegionRef) -> MemRegion {
 }
 
 fn lower_func_l1_to_l2(f: &L1Function) -> L2Function {
-    let mut values: HashMap<PValue, L2Inst> = HashMap::new();
+    let mut values: std::collections::BTreeMap<PValue, L2Inst> = std::collections::BTreeMap::new();
     // Track NewRegion and FreeRegion handles so we can drop them from the
     // block instruction lists and remap AllocaIn that referenced NewRegion
     // to Heap (or Gpu/KvCache for specialized regions — Issue 19).

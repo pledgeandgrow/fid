@@ -440,7 +440,7 @@ impl fmt::Display for Region {
 
 /// A unique SSA value identifier.
 /// Values are numbered per-function, starting from 0.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ValueId(pub u32);
 
 impl fmt::Display for ValueId {
@@ -1263,46 +1263,48 @@ impl SourceMap {
 }
 
 /// A Fides IR module — the top-level container for a compilation unit.
+/// Its tables are ordered maps so every backend emits the same output for
+/// the same input (reproducible builds; HashMap order differs per run).
 /// Contains functions, global data, struct layouts, and metadata.
 #[derive(Debug, Clone)]
 pub struct IrModule {
-    pub functions: HashMap<String, IrFunction>,
-    pub struct_layouts: HashMap<String, StructLayout>,
+    pub functions: std::collections::BTreeMap<String, IrFunction>,
+    pub struct_layouts: std::collections::BTreeMap<String, StructLayout>,
     /// Global string constants — maps string content to a label
-    pub string_constants: HashMap<String, String>,
+    pub string_constants: std::collections::BTreeMap<String, String>,
     /// Module-level mutable global variables: maps name → (type, initializer expr)
-    pub globals: HashMap<String, (IrType, crate::ast::Expr)>,
+    pub globals: std::collections::BTreeMap<String, (IrType, crate::ast::Expr)>,
     /// Function signatures for external/runtime functions
-    pub extern_functions: HashMap<String, (Vec<IrType>, IrType)>,
+    pub extern_functions: std::collections::BTreeMap<String, (Vec<IrType>, IrType)>,
     /// Effects of each function (computed from function body)
-    pub function_effects: HashMap<String, EffectSet>,
+    pub function_effects: std::collections::BTreeMap<String, EffectSet>,
     /// User-defined extern declarations for FFI (C codegen uses these)
     pub extern_decls: Vec<crate::ast::ExternDecl>,
     /// Trait method names in order, for vtable dispatch.
     /// Maps trait name → list of method names.
-    pub trait_methods: HashMap<String, Vec<String>>,
+    pub trait_methods: std::collections::BTreeMap<String, Vec<String>>,
     /// Trait implementations: maps trait name → list of type names that implement it.
     /// Used by devirtualization (F-3D) to replace DynCall with direct Call
     /// when only one impl exists.
-    pub trait_impls: HashMap<String, Vec<String>>,
+    pub trait_impls: std::collections::BTreeMap<String, Vec<String>>,
     /// I-6B: Set of @linear struct names. Propagated from the lowerer
     /// for use by alias analysis and other optimizations.
-    pub linear_structs: std::collections::HashSet<String>,
+    pub linear_structs: std::collections::BTreeSet<String>,
 }
 
 impl IrModule {
     pub fn new() -> Self {
         IrModule {
-            functions: HashMap::new(),
-            struct_layouts: HashMap::new(),
-            string_constants: HashMap::new(),
-            globals: HashMap::new(),
-            extern_functions: HashMap::new(),
-            function_effects: HashMap::new(),
+            functions: std::collections::BTreeMap::new(),
+            struct_layouts: std::collections::BTreeMap::new(),
+            string_constants: std::collections::BTreeMap::new(),
+            globals: std::collections::BTreeMap::new(),
+            extern_functions: std::collections::BTreeMap::new(),
+            function_effects: std::collections::BTreeMap::new(),
             extern_decls: Vec::new(),
-            trait_methods: HashMap::new(),
-            trait_impls: HashMap::new(),
-            linear_structs: std::collections::HashSet::new(),
+            trait_methods: std::collections::BTreeMap::new(),
+            trait_impls: std::collections::BTreeMap::new(),
+            linear_structs: std::collections::BTreeSet::new(),
         }
     }
 

@@ -1,0 +1,57 @@
+// Arena marks: restoring a mark frees only what was allocated after it.
+// Data allocated before arena_save() must survive arena_restore(), even
+// when the scratch work in between spans several arena chunks (4 MB each)
+// and one allocation larger than a chunk.
+
+use arena;
+
+// Allocates `count` blocks of `size` bytes, writes the first byte of each,
+// and returns the sum of those bytes read back.
+fn scratch(mark: i64, count: i64, size: i64) -> i64 {
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < count {
+        val p = arena_alloc(mark, size);
+        var b: *mut u8 = p;
+        unsafe { *b = 7; }
+        unsafe { sum = sum + *b; }
+        i = i + 1;
+    }
+    return sum;
+}
+
+fn main() {
+    val kept = "kept: " + int_to_str(42);
+    val names: Vec<str> = Vec::new();
+    names.push("alpha" + "!");
+    names.push("beta" + "?");
+
+    val mark = arena_save();
+    val a = scratch(mark, 3, 3000000);   // three chunks
+    val b = scratch(mark, 1, 9000000);   // larger than a chunk
+    arena_restore(mark);
+
+    print(kept);
+    print("\n");
+    print(names.get(0) + " " + names.get(1));
+    print("\n");
+    print(a + b);
+    print("\n");
+
+    // The arena is usable again after the restore.
+    val again = "after restore " + int_to_str(scratch(mark, 2, 1000));
+    print(again);
+    print("\n");
+
+    // Nested marks.
+    val outer = arena_save();
+    val s = "outer " + int_to_str(1);
+    val inner = arena_save();
+    val c = scratch(inner, 2, 3000000);
+    arena_restore(inner);
+    print(s + " " + int_to_str(c));
+    print("\n");
+    arena_restore(outer);
+    print(kept + " still");
+    print("\n");
+}

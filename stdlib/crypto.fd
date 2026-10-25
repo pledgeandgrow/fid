@@ -154,8 +154,12 @@ fn small_sigma1(x: i64) -> i64 {
 /// Compute SHA-256 hash of a string.
 /// Returns a 32-byte Vec of hash values (each byte 0-255).
 pub fn crypto_sha256(input: str) -> Vec {
-    // Get message bytes
-    var msg: Vec = str_bytes(input);
+    return crypto_sha256_bytes(str_bytes(input));
+}
+
+/// Compute SHA-256 of a byte vector (each element 0-255): binary-safe.
+/// Returns a 32-byte Vec.
+pub fn crypto_sha256_bytes(msg: Vec) -> Vec {
     var msg_len = msg.len();
 
     // Create padded message
@@ -437,9 +441,17 @@ pub fn crypto_hmac_sha256(key: str, message: str) -> Vec {
         outer_key.push(key_block.get(i) ^ 0x5c);
     }
 
-    // Inner hash: H(ipad || message)
-    var inner_input = str_from_bytes(inner_key) + message;
-    var inner_hash: Vec = crypto_sha256(inner_input);
+    // Inner hash: H(ipad || message), all in bytes (the key and the digest
+    // are binary: going through a string would cut them at a 0x00 byte).
+    var message_bytes: Vec = str_bytes(message);
+    var inner_input = Vec::new();
+    for i in 0..64 {
+        inner_input.push(inner_key.get(i));
+    }
+    for i in 0..message_bytes.len() {
+        inner_input.push(message_bytes.get(i));
+    }
+    var inner_hash: Vec = crypto_sha256_bytes(inner_input);
 
     // Outer hash: H(opad || inner_hash)
     var outer_input_bytes = Vec::new();
@@ -449,7 +461,7 @@ pub fn crypto_hmac_sha256(key: str, message: str) -> Vec {
     for i in 0..32 {
         outer_input_bytes.push(inner_hash.get(i));
     }
-    return crypto_sha256(str_from_bytes(outer_input_bytes));
+    return crypto_sha256_bytes(outer_input_bytes);
 }
 
 // ─── Constant-time comparison ──────────────────────────────────────────

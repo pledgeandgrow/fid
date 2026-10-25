@@ -1,5 +1,139 @@
 # Fides Language Changelog
 
+## Session 31 — Fast, Reproducible and Incremental Builds; Backend Fixes (Oct 25, 2026)
+
+### Build speed
+
+The compiler compiling itself (`compiler/main.fd`, 100K lines):
+
+| Compiler | Before | After |
+|----------|--------|-------|
+| Rust bootstrap (`fidesc dump-c`) | 335 s | 16 s |
+| Self-hosted (stage 2, built with `zig cc -O0`) | 1,939 s | 488 s |
+
+Causes, all quadratic work:
+
+- `comptime::process_gen` cloned the whole program once per function (310 s).
+  It now snapshots only for a function that has a `comptime gen` block.
+- The self-hosted lexer sliced every token out of the source with
+  `str_slice`, which ran `strlen` over the whole source each time: lexing
+  `typechecker.fd` took about 150 s. New `str_slice_len` takes the known length.
+  The import phase went from 1,095 s to 25 s. (The repeated
+  "Processing import: core" lines were only a log message printed before the
+  already-loaded check; each module is read and parsed once.)
+- The self-hosted C backend looked up every value name, string constant,
+  function signature and instruction by scanning a list, and scanned all
+  user functions twice for each indirect call (336 s). Now hash maps, a
+  per-id table and binary search: 27 s.
+- `@secret` analysis re-ran every function each round; it now uses a
+  worklist (only callers of a changed summary are re-analyzed).
+- At `-O0` (how the self-hosted compiler is built) core's `Vec` functions
+  cost several times a few C statements; the C backends now give
+  `Vec_new/len/is_empty/get/set/push/pop` hand-written C bodies with exactly
+  core's semantics (a Vec-heavy benchmark: 4,480 ms to 969 ms).
+- `ccompile` built every program at `-O2`; for the compiler itself (about
+  35 MB of C) clang took 26 minutes, and the tests that compile the whole
+  compiler timed out. A translation unit over 16 MB is now compiled at
+  `-O0` (40 s) unless `--cc-opt 0|1|2|3|s` or `FIDES_CC_OPT` says
+  otherwise. When the C compiler fails, its stdout is shown as well.
+- `FIDES_TIME_PASSES=1` prints the time of each frontend pass.
+
+### Incremental builds
+
+`ccompile`, `build` and `emit` (Rust and self-hosted) record every file a
+build reads and every import location it found empty, and write
+`<output>.fides-stamp`. A rebuild with no changed input is skipped
+("... is up to date", 0.17 s instead of 6 s for a small program); a change
+that leaves the generated C identical (comments, formatting) skips the C
+compiler. Creating a file that would change which module an import resolves
+to, a rebuilt compiler, or different flags/`CC` all invalidate the stamp.
+`--no-cache` or `FIDES_NO_CACHE` disables it. The in-memory module cache
+(watch mode, LSP) was keyed on the main file only and reused stale code after
+an imported module changed; it now checks every input.
+
+### Reproducible output
+
+The Rust compiler emitted functions, struct layouts and string constants in
+`HashMap` order, so every build of the same program produced a different C
+file and a different `.exe`. IR and PIR tables are now ordered maps or are
+iterated in a fixed order: C, PE and native ELF output are byte-for-byte
+reproducible.
+
+### Bugs fixed
+
+| Area | Bug | Fix |
+|------|-----|-----|
+| Lowering | `a && b` and `a \|\| b` evaluated both operands (`i < v.len() && v.get(i) == x` read past the end) | Short-circuit: the right operand runs only when it decides the result |
+| Lowering | `f < 0`, `2 * f` with an `f64` `f`: the integer operand was not converted; the interpreter rejected it and PE compared raw bits | Integer operand converted with `IntToFloat` |
+| Lowering | Reassigning a struct `var` copied the struct into its 8-byte pointer slot (memory overrun; wrong values on every backend) | The new pointer is stored |
+| Lowering | `dyn Trait` method calls always returned `i64` and were marked pure | Return type from the trait, effects of an unknown callee |
+| Lowering | Indexing an array variable used element type `i64` (a `[str]` element printed as a number) | Element type taken through the pointer |
+| Types | `cap Sub: Super` was a parse error | Supertraits: `Sub` inherits `Super`'s methods (impl checks, vtables) |
+| Types | `-> !` was a parse error | Never type parsed |
+| Types | A user function named like a function of an imported module was a "duplicate definition" | The module's copy is renamed `module__name`; each side calls its own |
+| Comptime | `struct_size`, `field_offset`, `enum_discriminant`, `function_effects`, `function_capabilities` did not exist | Implemented in both compilers |
+| Typechecker | KV-cache budget estimate multiplied by the window instead of `head_dim` | Fixed |
+| stdlib | HMAC-SHA256 was wrong on every backend: the binary inner digest went through a string and lost bytes | HMAC is computed on bytes (`crypto_sha256_bytes`); test pins the RFC 4231 values |
+| Interpreter | Copying a struct out of a `Vec` element read it as an integer | Struct copies accept an address |
+| Interpreter | An empty string passed to a function printed as `ptr(0x...)` | Printed as empty |
+| Interpreter | `p_db_mem_*` returned keys sorted and ignored queries | Insertion order; `key=K` queries return the value (all backends) |
+| C runtime | `p_arena_save` always returned 0 and `p_arena_restore` wiped the whole arena, including data allocated before the save | Real marks (chunk, offset); later chunks are freed |
+| C runtime | The arena and the panic call stack were shared by all threads without a lock (data race with real pthreads) | Thread-local |
+| C runtime | Windows TLS shim: `pthread_getspecific` always returned NULL | Per-key values |
+| C runtime | `p_executor_cancel` (`cancel scope`), `p_region_free`, `p_file_read_bytes` missing; arena functions had no prototypes | Added |
+| C runtime | A KV cache without a window grew without bound (`max_seq_len` ignored) | Same limit as the interpreter |
+| C codegen | A global's address, pointer/integer casts and (self-hosted) returned values were assigned to a variable of the other kind (`void* v = (int64_t)&g`); GCC 14 and Clang 16+ reject that, so the compiler's own C did not build without `-Wno-int-conversion` | Converted through `intptr_t` to the declared type |
+| C codegen | `a*b + c` could be fused into one FMA (results differed from the interpreter in the last bit) | `FP_CONTRACT OFF` |
+| Self-hosted | Programs built by the self-hosted compiler wrote CRLF on Windows | Binary stdout, as with the Rust compiler |
+| Self-hosted | Diagnostics showed the wrong source line in any file with a blank line (`c_str_lines` dropped empty lines) | Every line kept |
+| Self-hosted | The interpreter's file builtins were stubs | Real file I/O through the host runtime |
+| stdlib | `use vec` mixed the module's runtime-backed methods with core's: `sort`, `insert`, `reverse`, `extend` were lost in the interpreter | `vec` keeps only the higher-order helpers; the basics are core's everywhere; `sort` is now an O(n log n) heapsort |
+| stdlib | `str_index_of` called but never defined (`db`, `template`); `plot_debug_*` missing | Fixed |
+| Rust CLI | Deeply nested programs overflowed the 1 MB main-thread stack | The compiler runs on a 256 MB stack |
+
+### PE backend (native Windows `.exe`, no external tools)
+
+- A call to a function the native runtime does not provide used to be
+  dropped silently (the program ran on with a garbage result). `emit` now
+  refuses such a program and names the missing functions; the test harness
+  reports it as unsupported, not as a pass.
+- Runtime "stubs" that only pretended to work were removed
+  (`p_string_contains` always true, `p_string_find` always 0, `p_vec_sort` a
+  no-op, `p_string_replace` returning its input, ...). The stdlib uses its
+  Fides implementations instead.
+- Struct stores copied 8 bytes (the source pointer) instead of the struct;
+  a string constant equal to a function name (`"main"`) became that
+  function's address; negative numbers converted to strings printed as
+  unsigned (wrong condition code); `Vec`/`HashMap` printed as addresses;
+  `dyn Trait` values and calls produced 0; `p_file_read` returned a garbage
+  length and stopped at 1 MB; `emit` of a file without `main` panicked
+  instead of reporting it. All fixed.
+
+### Test harness
+
+- `fidesc test -j N` runs tests in parallel (each worker has its own C
+  compiler cache; a C compile that fails under the load is retried once).
+- `fidesc test --fail` counted a compiled program that panicked before
+  printing anything as an unexpected pass (only stdout was compared); a
+  compiled expected-fail run must now also exit successfully to count as a
+  pass.
+- Tests that need a system library (`test_sqlite`) run only with
+  `FIDES_TEST_EXTERNAL=1`; tests that run the whole self-hosted compiler
+  (`probe_lower`, `test_spawn_gt`) are checked on C and PE, with the C output
+  as reference; tests that print their own argv are not compared.
+- Stale self-hosted tests updated to the current compiler APIs
+  (`test_compiler`, `test_mono`, `test_opt`, `test_pir`); Rust unit tests
+  pass (`cargo test --lib`: the two hot-reload tests that execute x86-64
+  Linux code run on Linux only).
+- `cargo test --test harness` (the Cargo integration tests) used a
+  hard-coded `target/debug/fidesc`, so under `--release` or
+  `CARGO_TARGET_DIR` every test failed; it now uses the binary Cargo
+  built. Its rules now match `fidesc test`: every `*_fail.fd` test is
+  expected to fail, an interpreter run fails only when it panics or reports
+  an error (the exit code is main's return value), PE refusals are
+  unsupported rather than failures, and golden files are compared without
+  regard to line endings.
+
 ## Session 29c — `@zeroize` Wipes Heap Data, PE Output Fixed and Tested (Oct 25, 2026)
 
 ### `@zeroize`

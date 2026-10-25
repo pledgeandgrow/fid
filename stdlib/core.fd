@@ -636,6 +636,10 @@ pub fn Vec_truncate(v: i64, n: i64) {
 }
 
 pub fn Vec_reverse(v: i64) {
+    vec_raw_reverse(v);
+}
+
+pub fn vec_raw_reverse(v: i64) {
     var len_ptr: *mut i64 = v + 8;
     var data_ptr_ptr: *mut i64 = v;
 
@@ -666,6 +670,10 @@ pub fn Vec_reverse(v: i64) {
 }
 
 pub fn Vec_extend(v: i64, other: i64) {
+    vec_raw_extend(v, other);
+}
+
+pub fn vec_raw_extend(v: i64, other: i64) {
     var other_len_ptr: *mut i64 = other + 8;
     var other_data_ptr_ptr: *mut i64 = other;
 
@@ -693,6 +701,10 @@ pub fn Vec_extend(v: i64, other: i64) {
 }
 
 pub fn Vec_insert(v: i64, idx: i64, value: i64) {
+    vec_raw_insert(v, idx, value);
+}
+
+pub fn vec_raw_insert(v: i64, idx: i64, value: i64) {
     var len_ptr: *mut i64 = v + 8;
     var data_ptr_ptr: *mut i64 = v;
 
@@ -743,6 +755,10 @@ pub fn Vec_insert(v: i64, idx: i64, value: i64) {
 }
 
 pub fn Vec_remove(v: i64, idx: i64) -> i64 {
+    return vec_raw_remove(v, idx);
+}
+
+pub fn vec_raw_remove(v: i64, idx: i64) -> i64 {
     var len_ptr: *mut i64 = v + 8;
     var data_ptr_ptr: *mut i64 = v;
 
@@ -857,8 +873,13 @@ pub fn Vec_to_str(v: i64) -> str {
     return result;
 }
 
+/// Sort ascending (elements compared as i64), in place: heapsort,
+/// O(n log n) time and no extra memory.
 pub fn Vec_sort(v: i64) {
-    // Simple bubble sort
+    vec_raw_sort(v);
+}
+
+pub fn vec_raw_sort(v: i64) {
     var len_ptr: *mut i64 = v + 8;
     var data_ptr_ptr: *mut i64 = v;
 
@@ -876,25 +897,54 @@ pub fn Vec_sort(v: i64) {
         return;
     }
 
-    var swapped: bool = true;
-    while swapped {
-        swapped = false;
-        var i: i64 = 0;
-        while i < len - 1 {
-            var addr0: i64 = data + i * 8;
-            var addr1: i64 = data + (i + 1) * 8;
-            var ptr0: *mut i64 = addr0;
-            var ptr1: *mut i64 = addr1;
-            unsafe {
-                var v0: i64 = *ptr0;
-                var v1: i64 = *ptr1;
-                if v0 > v1 {
-                    *ptr0 = v1;
-                    *ptr1 = v0;
-                    swapped = true;
-                }
+    var start: i64 = len / 2 - 1;
+    while start >= 0 {
+        vec_sift_down(data, start, len);
+        start = start - 1;
+    }
+    var end: i64 = len - 1;
+    while end > 0 {
+        vec_swap_slots(data, 0, end);
+        vec_sift_down(data, 0, end);
+        end = end - 1;
+    }
+}
+
+fn vec_slot(data: i64, i: i64) -> i64 {
+    var p: *mut i64 = data + i * 8;
+    var x: i64 = 0;
+    unsafe { x = *p; }
+    return x;
+}
+
+fn vec_swap_slots(data: i64, i: i64, j: i64) {
+    var pi: *mut i64 = data + i * 8;
+    var pj: *mut i64 = data + j * 8;
+    unsafe {
+        var a: i64 = *pi;
+        *pi = *pj;
+        *pj = a;
+    }
+}
+
+/// Restore the max-heap property below `root` among the first `n` slots.
+fn vec_sift_down(data: i64, root: i64, n: i64) {
+    var r: i64 = root;
+    var done: bool = false;
+    while !done {
+        var child: i64 = 2 * r + 1;
+        if child >= n {
+            done = true;
+        } else {
+            if child + 1 < n && vec_slot(data, child) < vec_slot(data, child + 1) {
+                child = child + 1;
             }
-            i = i + 1;
+            if vec_slot(data, r) >= vec_slot(data, child) {
+                done = true;
+            } else {
+                vec_swap_slots(data, r, child);
+                r = child;
+            }
         }
     }
 }
@@ -1813,7 +1863,12 @@ pub fn String_slice(s: i64, start: i64, end: i64) -> i64 {
         unsafe { *ptr = 0; }
         return result;
     }
-    var len: i64 = p_str_length(s);
+    return String_slice_len(s, p_str_length(s), start, end);
+}
+
+/// String_slice for a caller that already knows `s` is `len` bytes long:
+/// no strlen scan, so slicing a large source token by token stays linear.
+pub fn String_slice_len(s: i64, len: i64, start: i64, end: i64) -> i64 {
     var st: i64 = start;
     var en: i64 = end;
     if st < 0 { st = 0; }
@@ -2334,6 +2389,11 @@ pub fn str_slice(s: str, start: i64, end: i64) -> str {
     if e0 > slen { e0 = slen; }
     if s0 >= e0 { return ""; }
     return String_slice(s, s0, e0);
+}
+
+/// str_slice when the length of `s` is already known (`len` bytes).
+pub fn str_slice_len(s: str, len: i64, start: i64, end: i64) -> str {
+    return String_slice_len(s, len, start, end);
 }
 
 /// Check if a string starts with a prefix.

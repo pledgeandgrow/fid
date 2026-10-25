@@ -33,6 +33,10 @@ pub fn process_gen(program: Program) -> Program {
     let mut generated_structs: Vec<StructDef> = Vec::new();
     let func_count = prog.funcs.len();
     for idx in 0..func_count {
+        // The snapshot is a whole-program clone: take it only when needed.
+        if !prog.funcs[idx].body.iter().any(|s| matches!(s, Stmt::ComptimeGen { .. })) {
+            continue;
+        }
         let snapshot = prog.clone();
         let func = &mut prog.funcs[idx];
         process_comptime_gen_in_func(func, &snapshot, &mut generated_funcs, &mut generated_structs, &mut errs);
@@ -1282,6 +1286,71 @@ fn eval_unaryop(op: &UnaryOp, v: &Expr) -> Result<Expr, ComptimeError> {
 
 // ─── Reflection ───────────────────────────────────────────────────────────
 
+/// Bytes a field of type `ty` takes in a struct with the default layout
+/// (lower.rs compute_struct_layout): one 8-byte slot, except an inline struct
+/// (its whole layout) and an enum with payloads ((1 + largest payload) slots).
+fn reflect_slot_size(ty: &Type, original: &Program, depth: usize) -> i64 {
+    if let Type::Named(n) = ty {
+        if let Some(s) = original.structs.iter().find(|s| s.name == *n) {
+            if depth < 32 {
+                return reflect_struct_layout(s, original, depth + 1).0;
+            }
+        }
+        if let Some(e) = original.enums.iter().find(|e| e.name == *n) {
+            let payload = e.variants.iter()
+                .map(|v| v.data.as_ref().map_or(0, |d| d.len()))
+                .max()
+                .unwrap_or(0);
+            if payload > 0 {
+                return (1 + payload as i64) * 8;
+            }
+        }
+    }
+    8
+}
+
+/// (size, field offsets) of a struct, matching the lowerer's layout:
+/// @repr(C) and @packed use natural sizes, the default is 8-byte slots.
+fn reflect_struct_layout(s: &crate::ast::StructDef, original: &Program, depth: usize) -> (i64, Vec<(String, i64)>) {
+    let c_layout = s.annotations.iter().any(|a| a.name == "repr" && a.args.iter().any(|x| x == "C"));
+    let packed = s.annotations.iter().any(|a| a.name == "packed");
+    let mut offset = 0i64;
+    let mut max_align = if c_layout || packed { 1 } else { 8 };
+    let mut offsets = Vec::new();
+    for f in &s.fields {
+        if c_layout || packed {
+            let size = match f.ty {
+                Type::I8 | Type::U8 | Type::Bool => 1,
+                Type::I16 | Type::U16 => 2,
+                Type::I32 | Type::U32 | Type::F32 => 4,
+                _ => 8,
+            };
+            let align = if packed { 1 } else { size };
+            offset = (offset + align - 1) / align * align;
+            offsets.push((f.name.clone(), offset));
+            offset += size;
+            max_align = max_align.max(align);
+        } else {
+            offsets.push((f.name.clone(), offset));
+            offset += reflect_slot_size(&f.ty, original, depth);
+        }
+    }
+    ((offset + max_align - 1) / max_align * max_align, offsets)
+}
+
+fn reflect_split(name: &str, op: &str) -> Result<(String, String), ComptimeError> {
+    name.split_once('.')
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .ok_or_else(|| ComptimeError(format!("{}: expected Owner.member, got '{}'", op, name)))
+}
+
+fn str_array(items: Vec<String>) -> Expr {
+    Expr::ArrayLit {
+        elem_type: Box::new(Type::Str),
+        elements: items.into_iter().map(Expr::StringLit).collect(),
+    }
+}
+
 fn evaluate_reflect(op: &ReflectOp, ty: &Type, original: &Program) -> Result<Expr, ComptimeError> {
     let type_name = match ty {
         Type::Named(name) => name.clone(),
@@ -1353,6 +1422,60 @@ fn evaluate_reflect(op: &ReflectOp, ty: &Type, original: &Program) -> Result<Exp
                 elem_type: Box::new(Type::Str),
                 elements,
             })
+        }
+        ReflectOp::StructSize => {
+            let s = original.structs.iter()
+                .find(|s| s.name == type_name)
+                .ok_or_else(|| ComptimeError(format!("struct_size: '{}' is not a struct", type_name)))?;
+            Ok(Expr::IntLit(reflect_struct_layout(s, original, 0).0))
+        }
+        ReflectOp::FieldOffset => {
+            let (owner, field) = reflect_split(&type_name, "field_offset")?;
+            let s = original.structs.iter()
+                .find(|s| s.name == owner)
+                .ok_or_else(|| ComptimeError(format!("field_offset: '{}' is not a struct", owner)))?;
+            reflect_struct_layout(s, original, 0).1.into_iter()
+                .find(|(n, _)| *n == field)
+                .map(|(_, off)| Expr::IntLit(off))
+                .ok_or_else(|| ComptimeError(format!("field_offset: struct '{}' has no field '{}'", owner, field)))
+        }
+        ReflectOp::EnumDiscriminant => {
+            let (owner, variant) = reflect_split(&type_name, "enum_discriminant")?;
+            let e = original.enums.iter()
+                .find(|e| e.name == owner)
+                .ok_or_else(|| ComptimeError(format!("enum_discriminant: '{}' is not an enum", owner)))?;
+            e.variants.iter()
+                .position(|v| v.name == variant)
+                .map(|i| Expr::IntLit(i as i64))
+                .ok_or_else(|| ComptimeError(format!("enum_discriminant: enum '{}' has no variant '{}'", owner, variant)))
+        }
+        ReflectOp::FunctionEffects => {
+            let f = original.funcs.iter()
+                .chain(original.impls.iter().flat_map(|i| i.methods.iter()))
+                .chain(original.trait_impls.iter().flat_map(|i| i.methods.iter()))
+                .find(|f| f.name == type_name)
+                .ok_or_else(|| ComptimeError(format!("function_effects: no function '{}'", type_name)))?;
+            Ok(str_array(f.declared_effects.clone()))
+        }
+        ReflectOp::FunctionCapabilities => {
+            // The type defining method `type_name`, then every trait it implements.
+            let owner = original.trait_impls.iter()
+                .find(|ti| ti.methods.iter().any(|m| m.name == type_name))
+                .map(|ti| ti.type_name.clone())
+                .or_else(|| original.impls.iter()
+                    .find(|i| i.methods.iter().any(|m| m.name == type_name))
+                    .map(|i| i.struct_name.clone()));
+            let mut traits: Vec<String> = Vec::new();
+            if let Some(owner) = owner {
+                for ti in original.trait_impls.iter().filter(|ti| ti.type_name == owner) {
+                    if !traits.contains(&ti.trait_name) {
+                        traits.push(ti.trait_name.clone());
+                    }
+                }
+            } else if !original.funcs.iter().any(|f| f.name == type_name) {
+                return Err(ComptimeError(format!("function_capabilities: no function '{}'", type_name)));
+            }
+            Ok(str_array(traits))
         }
     }
 }

@@ -1596,18 +1596,18 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
         Inst::Print(value, ty) => {
             var v: Value = get_value(values, value);
             // Ptr(U8) typed values stored as Int should be printed as strings
+            var is_str: bool = false;
             match ty {
                 IrType::Ptr(inner) => {
                     match inner {
                         IrType::U8 => {
+                            is_str = true;
                             match v {
                                 Value::Int(addr) => {
                                     if addr > 0 && Memory_is_valid_addr(&self.memory, addr) {
-                                        var s: str = Memory_load_cstr(&self.memory, addr);
-                                        if str_len(s) > 0 {
-                                            p_print_str(s);
-                                            return ExecOutcome::Continue;
-                                        }
+                                        // A str: print it even when it is empty.
+                                        p_print_str(Memory_load_cstr(&self.memory, addr));
+                                        return ExecOutcome::Continue;
                                     }
                                 }
                                 _ => {}
@@ -1626,7 +1626,7 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                 Value::Str(s) => { p_print_str(s); }
                 Value::Ptr(addr2) => {
                     var s2: str = Memory_load_cstr(&self.memory, addr2);
-                    if str_len(s2) > 0 {
+                    if str_len(s2) > 0 || is_str {
                         p_print_str(s2);
                     } else {
                         p_print_str("ptr(0x");
@@ -1737,6 +1737,31 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
 // ===========================================================================
 
 pub fn Interpreter_eval_binop(self: &Interpreter, op: BinOp, l: Value, r: Value) -> Value {
+    // A bool compared with an integer is 0 or 1, as in C (runtime predicates
+    // return bool; `p_file_exists(p) != 0` must work).
+    match l {
+        Value::Bool(lb) => {
+            match r {
+                Value::Int(_) => {
+                    var li: i64 = 0;
+                    if lb { li = 1; }
+                    return Interpreter_eval_binop(self, op, Value::Int(li), r);
+                }
+                _ => {}
+            }
+        }
+        Value::Int(_) => {
+            match r {
+                Value::Bool(rb) => {
+                    var ri: i64 = 0;
+                    if rb { ri = 1; }
+                    return Interpreter_eval_binop(self, op, l, Value::Int(ri));
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
     match l {
         Value::Int(a) => {
             match r {
@@ -2155,6 +2180,9 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         // Interpreter doesn't actually free — memory is arena-based
         return ExecOutcome::Value(Value::Void);
     }
+    // Interpreter memory is never reused, so a mark has nothing to restore.
+    if name == "p_arena_save" { return ExecOutcome::Value(Value::Int(0)); }
+    if name == "p_arena_restore" { return ExecOutcome::Value(Value::Void); }
 
     // ─── String Operations ───
     if name == "p_str_concat" {
@@ -3907,24 +3935,62 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         return ExecOutcome::Value(Value::Int(0));
     }
 
-    // ─── File I/O builtins (stubs — no real file system access) ───
-    if name == "p_file_read" {
-        return ExecOutcome::Value(Value::Str(""));
-    }
-    if name == "p_file_write" {
-        return ExecOutcome::Value(Value::Int(0));
-    }
-    if name == "p_file_exists" {
-        return ExecOutcome::Value(Value::Bool(false));
-    }
-    if name == "p_file_append" {
-        return ExecOutcome::Value(Value::Int(0));
-    }
-    if name == "p_file_delete" {
-        return ExecOutcome::Value(Value::Int(0));
-    }
-    if name == "p_file_size" {
-        return ExecOutcome::Value(Value::Int(0));
+    // ─── File I/O builtins: the interpreter is itself a native program,
+    // so it performs them with the host runtime. ───
+    if str_starts_with(name, "p_file_") {
+        var fpath: str = "";
+        if args.len() >= 1 { fpath = Interpreter_value_to_string(self, args.get(0)); }
+        var farg: str = "";
+        if args.len() >= 2 { farg = Interpreter_value_to_string(self, args.get(1)); }
+        if name == "p_file_read" { return ExecOutcome::Value(Value::Str(p_file_read(fpath))); }
+        if name == "p_file_write" { return ExecOutcome::Value(Value::Int(p_file_write(fpath, farg))); }
+        if name == "p_file_exists" { return ExecOutcome::Value(Value::Bool(p_file_exists(fpath) != 0)); }
+        if name == "p_file_append" { return ExecOutcome::Value(Value::Int(p_file_append(fpath, farg))); }
+        if name == "p_file_delete" { return ExecOutcome::Value(Value::Int(p_file_delete(fpath))); }
+        if name == "p_file_size" { return ExecOutcome::Value(Value::Int(p_file_size(fpath))); }
+        if name == "p_file_hash" { return ExecOutcome::Value(Value::Int(p_file_hash(fpath))); }
+        if name == "p_file_write_vec" {
+            // Each element of the interpreted Vec {data, len, cap} is one byte.
+            var bytes: Vec<i64> = Vec::new();
+            if args.len() >= 2 {
+                var vaddr: i64 = 0;
+                match args.get(1) {
+                    Value::Int(a) => { vaddr = a; }
+                    Value::Ptr(a) => { vaddr = a; }
+                    _ => {}
+                }
+                if vaddr > 0 {
+                    var vdata: i64 = Memory_load_i64(&self.memory, vaddr);
+                    var vlen: i64 = Memory_load_i64(&self.memory, vaddr + 8);
+                    var bi: i64 = 0;
+                    while bi < vlen {
+                        bytes.push(Memory_load_i64(&self.memory, vdata + bi * 8));
+                        bi = bi + 1;
+                    }
+                }
+            }
+            return ExecOutcome::Value(Value::Int(p_file_write_vec(fpath, bytes)));
+        }
+        if name == "p_file_read_bytes" {
+            var read: Vec<i64> = p_file_read_bytes(fpath);
+            var n: i64 = read.len();
+            var cap: i64 = n;
+            if cap < 1 { cap = 1; }
+            var rdata: i64 = Memory_alloc(&mut self.memory, cap * 8);
+            var ri: i64 = 0;
+            while ri < n {
+                Memory_store_i64(&mut self.memory, rdata + ri * 8, read.get(ri));
+                ri = ri + 1;
+            }
+            var raddr: i64 = Memory_alloc(&mut self.memory, 24);
+            Memory_store_i64(&mut self.memory, raddr, rdata);
+            Memory_store_i64(&mut self.memory, raddr + 8, n);
+            Memory_store_i64(&mut self.memory, raddr + 16, cap);
+            var rhandle: i64 = self.vec_values.len();
+            self.vec_values.push(VecValueEntry_new(rhandle));
+            self.vec_side_table.push(VecSideEntry_new(raddr, rhandle));
+            return ExecOutcome::Value(Value::Int(raddr));
+        }
     }
 
     // ─── Threading (interpreter is single-threaded: spawn runs eagerly) ───

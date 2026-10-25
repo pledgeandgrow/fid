@@ -77,6 +77,8 @@ pub struct SecrecyChecker<'a> {
     methods: HashMap<String, Vec<String>>,
     globals: HashSet<String>,
     summaries: HashMap<String, Summary>,
+    // Summaries the current function's analysis read (its callees).
+    reads: HashSet<String>,
     // Per-function state. Labels are flow-insensitive: a variable's label is
     // the union over every value it is ever given.
     vars: HashMap<String, Label>,
@@ -124,6 +126,7 @@ impl<'a> SecrecyChecker<'a> {
             methods,
             globals,
             summaries: HashMap::new(),
+            reads: HashSet::new(),
             vars: HashMap::new(),
             ref_params: HashSet::new(),
             pc: Vec::new(),
@@ -589,6 +592,7 @@ impl<'a> SecrecyChecker<'a> {
             // A builtin computes its result from its arguments.
             return all;
         };
+        self.reads.insert(callee.to_string());
         let summ = self.summaries.get(callee).cloned().unwrap_or_default();
         self.apply_summary(callee, f, &summ, &ls, &pc, 0)
     }
@@ -666,6 +670,7 @@ impl<'a> SecrecyChecker<'a> {
         }
         let mut out = Label::new();
         for (key, f) in &candidates {
+            self.reads.insert(key.clone());
             let summ = self.summaries.get(key).cloned().unwrap_or_default();
             out.extend(self.apply_summary(method, f, &summ, &ls, &pc, 0));
         }
@@ -677,13 +682,30 @@ impl<'a> SecrecyChecker<'a> {
 pub fn check(program: &Program) -> Vec<String> {
     let mut c = SecrecyChecker::new(program);
     let all = c.all.clone();
-    loop {
-        let before = c.summaries.clone();
-        for (key, f) in &all {
-            c.analyze_func(key, f);
+    // Worklist fixpoint: every function once, then again whenever a summary
+    // it read has grown. Summaries only grow, so this terminates, and it
+    // reaches the same fixpoint as re-analyzing everything until stable.
+    let mut readers: HashMap<String, HashSet<usize>> = HashMap::new();
+    let mut queue: std::collections::VecDeque<usize> = (0..all.len()).collect();
+    let mut queued = vec![true; all.len()];
+    while let Some(i) = queue.pop_front() {
+        queued[i] = false;
+        let (key, f) = &all[i];
+        let before = c.summaries.get(key).cloned();
+        c.reads.clear();
+        c.analyze_func(key, f);
+        for r in c.reads.drain() {
+            readers.entry(r).or_default().insert(i);
         }
-        if c.summaries == before {
-            break;
+        if c.summaries.get(key) != before.as_ref() {
+            if let Some(rs) = readers.get(key) {
+                for &r in rs {
+                    if !queued[r] {
+                        queued[r] = true;
+                        queue.push_back(r);
+                    }
+                }
+            }
         }
     }
     c.report = true;

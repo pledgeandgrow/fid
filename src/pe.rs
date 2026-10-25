@@ -1485,8 +1485,11 @@ impl RdataBuilder {
     /// Build the complete .rdata section
     /// string_constants: all string literals from the IR
     fn build(&mut self, string_constants: &HashMap<String, String>) {
-        // 1. String constants from user code
-        for s in string_constants.keys() {
+        // 1. String constants from user code (sorted: HashMap order would
+        //    make the .rdata layout, and so the binary, differ per build)
+        let mut keys: Vec<&String> = string_constants.keys().collect();
+        keys.sort();
+        for s in keys {
             self.add_string(s);
         }
 
@@ -1861,6 +1864,13 @@ struct PeCodeGen {
     entry_offset: usize,
     /// Bare-metal mode: no IAT, no OS calls, flat binary
     bare_mode: bool,
+    /// Function being generated
+    cur_func: String,
+    /// Type ids of dyn values (type name -> id, from 1)
+    dyn_type_ids: std::collections::BTreeMap<String, i64>,
+    /// Called functions that neither the program nor this runtime defines,
+    /// with the functions that call them
+    unresolved: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
 }
 
 impl PeCodeGen {
@@ -1874,6 +1884,9 @@ impl PeCodeGen {
             block_labels: HashMap::new(),
             entry_offset: 0,
             bare_mode: false,
+            cur_func: String::new(),
+            dyn_type_ids: std::collections::BTreeMap::new(),
+            unresolved: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1964,18 +1977,15 @@ impl PeCodeGen {
                        "p_str_join_n",
                        "p_vec_new", "p_vec_push", "p_vec_len", "p_vec_get", "p_vec_pop", "p_print_vec",
                        "p_vec_set", "p_vec_is_empty", "p_vec_clear", "p_vec_capacity",
-                       "p_vec_insert", "p_vec_remove", "p_vec_contains", "p_vec_reverse",
-                       "p_vec_first", "p_vec_last", "p_vec_extend", "p_vec_truncate",
-                       "p_vec_sort", "p_vec_clone",
+                       "p_vec_contains",
+                       "p_vec_first", "p_vec_last", "p_vec_truncate",
+                       "p_vec_clone",
                        "p_map_new", "p_map_insert", "p_map_get", "p_map_contains", "p_map_remove", "p_map_len", "p_map_is_empty", "p_print_map",
-                       "p_map_clear", "p_map_keys", "p_map_values", "p_map_get_or", "p_map_clone",
-                       "p_string_from", "p_string_len", "p_string_is_empty", "p_string_push_str",
-                       "p_string_to_string", "p_string_slice",
-                       "p_string_contains", "p_string_starts_with", "p_string_ends_with",
-                       "p_string_trim", "p_string_split", "p_string_replace",
-                       "p_string_char_at", "p_string_to_uppercase", "p_string_to_lowercase",
-                       "p_string_parse_int", "p_string_find", "p_string_rfind",
-                       "p_string_repeat", "p_string_bytes", "p_string_clone",
+                       "p_map_clear", "p_map_get_or",
+                       "p_string_len", "p_string_is_empty",
+                       "p_string_starts_with",
+                       "p_string_parse_int",
+                       "p_string_bytes", "p_string_clone",
                        // Phase 5A.3: Interrupt handler stubs
                        "p_cli", "p_sti", "p_lidt", "p_idt_set_entry",
                        "p_hlt", "p_inb", "p_outb", "p_outw", "p_inw", "p_outl", "p_inl",
@@ -1997,7 +2007,9 @@ impl PeCodeGen {
                        // Phase 5A.6: Serial port stubs
                        "p_serial_init", "p_serial_write", "p_serial_read", "p_serial_ready",
                        // Native runtime stubs: argv, process exec
-                       "p_argc", "p_argv", "p_system"] {
+                       "p_argc", "p_argv", "p_system",
+                       // Arena marks / region frees (memory is never reused here)
+                       "p_arena_save", "p_arena_restore", "p_region_free"] {
             let label = self.enc.alloc_label();
             self.func_labels.insert(stub.to_string(), label);
         }
@@ -3001,6 +3013,7 @@ impl PeCodeGen {
 
     /// Generate code for a single function
     fn gen_function(&mut self, name: &str, func: &IrFunction, module: &IrModule) {
+        self.cur_func = name.to_string();
         let label = *self.func_labels.get(name).unwrap();
         self.enc.align_to(16);
         self.enc.place_label(label);
@@ -3138,19 +3151,12 @@ impl PeCodeGen {
             }
 
             Inst::ConstStr { value } => {
-                if module.functions.contains_key(value) || module.extern_functions.contains_key(value) {
-                    // Function pointer — load address of the function label
-                    if let Some(&flabel) = self.func_labels.get(value) {
-                        self.enc.lea_label(Reg::Rax, flabel);
-                    } else {
-                        self.enc.mov_imm64(Reg::Rax, 0);
-                    }
-                    self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
-                } else {
-                    let off = self.str_off(value);
-                    self.enc.lea_rip(Reg::Rax, off);
-                    self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
-                }
+                // Always a string, even one spelling a function's name (the
+                // string "main" was emitted as the address of fn main):
+                // function values are ConstFnRef.
+                let off = self.str_off(value);
+                self.enc.lea_rip(Reg::Rax, off);
+                self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
             }
 
             Inst::ConstFnRef { name } => {
@@ -3264,18 +3270,36 @@ impl PeCodeGen {
                 self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
             }
 
-            Inst::Store { ptr, value, .. } => {
+            Inst::Store { ptr, value, store_ty: explicit_ty } => {
                 let poff = frame.offset(*ptr) as i32;
                 let voff = frame.offset(*value) as i32;
                 self.enc.mov_reg_mem_rbp(Reg::Rax, poff);
                 self.enc.mov_reg_mem_rbp(Reg::Rcx, voff);
-                let val_ty = func.values.get(value).map(|m| &m.ty);
-                let store_size = val_ty.map(|t| module.type_size(t)).unwrap_or(8);
-                match store_size {
-                    1 => self.enc.mov_mem_reg8(Reg::Rax, Reg::Rcx),
-                    2 => self.enc.mov_ptr_reg16(Reg::Rax, Reg::Rcx),
-                    4 => self.enc.mov_ptr_reg32(Reg::Rax, Reg::Rcx),
-                    _ => self.enc.mov_ptr_reg(Reg::Rax, Reg::Rcx),
+                // As in the C backend: the explicit store type, else the
+                // pointee type, else the value's type.
+                let pointee = func.values.get(ptr).and_then(|m| match &m.ty {
+                    IrType::Ptr(inner) => Some(inner.as_ref().clone()),
+                    _ => None,
+                });
+                let store_ty = explicit_ty.clone()
+                    .or(pointee)
+                    .or_else(|| func.values.get(value).map(|m| m.ty.clone()))
+                    .unwrap_or(IrType::I64);
+                match &store_ty {
+                    // Structs are passed by pointer: copy the struct itself.
+                    IrType::Struct(_) => {
+                        let size = module.type_size(&store_ty) as i32;
+                        self.emit_copy_rcx_to_rax(size);
+                    }
+                    IrType::Array(..) | IrType::Ptr(_) | IrType::Opaque(_) | IrType::Generic(..) => {
+                        self.enc.mov_ptr_reg(Reg::Rax, Reg::Rcx)
+                    }
+                    t => match module.type_size(t) {
+                        1 => self.enc.mov_mem_reg8(Reg::Rax, Reg::Rcx),
+                        2 => self.enc.mov_ptr_reg16(Reg::Rax, Reg::Rcx),
+                        4 => self.enc.mov_ptr_reg32(Reg::Rax, Reg::Rcx),
+                        _ => self.enc.mov_ptr_reg(Reg::Rax, Reg::Rcx),
+                    },
                 }
             }
 
@@ -3284,16 +3308,9 @@ impl PeCodeGen {
                 let dst_off = frame.offset(*dst) as i32;
                 let src_off = frame.offset(*src) as i32;
                 let size = module.type_size(ty) as i32;
-                // Simple byte-by-byte copy using RAX as temp
                 self.enc.mov_reg_mem_rbp(Reg::Rax, dst_off); // dst ptr
                 self.enc.mov_reg_mem_rbp(Reg::Rcx, src_off); // src ptr
-                // Copy 8 bytes at a time using RDX as temp
-                let mut offset: i32 = 0;
-                while offset < size {
-                    self.enc.mov_reg_mem_disp(Reg::Rdx, Reg::Rcx, offset); // load from src
-                    self.enc.mov_mem_disp_reg(Reg::Rax, offset, Reg::Rdx); // store to dst
-                    offset += 8;
-                }
+                self.emit_copy_rcx_to_rax(size);
             }
 
             Inst::GetFieldPtr { struct_ptr, field_index, .. } => {
@@ -3472,7 +3489,7 @@ impl PeCodeGen {
                         "p_to_str"
                     }
                 } else {
-                    call_name.as_str()
+                    pe_runtime_alias(call_name)
                 };
 
                 let arg_regs = [Reg::Rcx, Reg::Rdx, Reg::R8, Reg::R9];
@@ -3496,15 +3513,17 @@ impl PeCodeGen {
                     self.enc.mov_mem_disp_reg(Reg::Rsp, stack_pos, Reg::Rax);
                 }
 
-                // Call the function
+                // Call the function. A function nobody defines would leave a
+                // garbage result: trap, and (outside bare mode, where kernels
+                // may rely on the trap) refuse the program in generate_pe.
                 if let Some(&flabel) = self.func_labels.get(target_func) {
                     self.enc.call_label(flabel);
-                } else if self.bare_mode {
-                    // In bare mode, unresolved extern calls are errors.
+                } else {
+                    if !self.bare_mode {
+                        self.unresolved.entry(target_func.to_string()).or_default().insert(self.cur_func.clone());
+                    }
                     self.enc.ud2();
                 }
-                // Non-bare mode: unresolved calls are silently skipped
-                // (the function may be provided by the runtime or stdlib).
 
                 self.enc.add_rsp_i32(call_space);
                 self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
@@ -3597,12 +3616,79 @@ impl PeCodeGen {
                 self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
             }
 
-            Inst::MakeDyn { .. } => {
-                self.enc.xor_self(Reg::Rax);
+            Inst::MakeDyn { value, type_name, .. } => {
+                // A dyn value: 16 bytes {type id, receiver}.
+                let tid = self.dyn_type_id(type_name);
+                let voff = frame.offset(*value) as i32;
+                self.enc.mov_imm32(Reg::Rcx, 16);
+                self.enc.sub_rsp_i32(32);
+                self.call_runtime("p_malloc");
+                self.enc.add_rsp_i32(32);
+                self.enc.mov_imm64(Reg::R10, tid as u64);
+                self.enc.mov_mem_disp_reg(Reg::Rax, 0, Reg::R10);
+                self.enc.mov_reg_mem_rbp(Reg::R10, voff);
+                self.enc.mov_mem_disp_reg(Reg::Rax, 8, Reg::R10);
                 self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
             }
-            Inst::DynCall { .. } => {
-                self.enc.xor_self(Reg::Rax);
+            Inst::DynCall { method, args, .. } => {
+                // Candidates: every type made into a dyn value or named by a
+                // trait impl that has `Type_method`.
+                let mut types: std::collections::BTreeSet<String> = module.trait_impls
+                    .values().flatten().cloned().collect();
+                for f in module.functions.values() {
+                    for inst in f.instructions.values() {
+                        if let Inst::MakeDyn { type_name, .. } = inst {
+                            types.insert(type_name.clone());
+                        }
+                    }
+                }
+                let mut candidates: Vec<(i64, u32)> = Vec::new();
+                for t in &types {
+                    if let Some(&flabel) = self.func_labels.get(&format!("{}_{}", t, method)) {
+                        candidates.push((self.dyn_type_id(t), flabel));
+                    }
+                }
+                // Arguments: env (0), receiver, then args[1..].
+                let total_args = args.len() + 1;
+                let stack_args = if total_args > 4 { total_args - 4 } else { 0 };
+                let call_space = ((32 + stack_args * 8 + 15) & !15) as i32;
+                let arg_regs = [Reg::Rcx, Reg::Rdx, Reg::R8, Reg::R9];
+                self.enc.sub_rsp_i32(call_space);
+                for (i, arg) in args.iter().enumerate().skip(1) {
+                    let arg_idx = i + 1;
+                    if arg_idx >= 4 {
+                        let aoff = frame.offset(*arg) as i32;
+                        self.enc.mov_reg_mem_rbp(Reg::Rax, aoff);
+                        self.enc.mov_mem_disp_reg(Reg::Rsp, 32 + ((arg_idx - 4) as i32) * 8, Reg::Rax);
+                    }
+                }
+                for (i, arg) in args.iter().enumerate().skip(1) {
+                    let arg_idx = i + 1;
+                    if arg_idx < 4 {
+                        let aoff = frame.offset(*arg) as i32;
+                        self.enc.mov_reg_mem_rbp(arg_regs[arg_idx], aoff);
+                    }
+                }
+                if let Some(obj) = args.first() {
+                    let ooff = frame.offset(*obj) as i32;
+                    self.enc.mov_reg_mem_rbp(Reg::R10, ooff);
+                    self.enc.mov_reg_mem_disp(Reg::R11, Reg::R10, 0); // type id
+                    self.enc.mov_reg_mem_disp(Reg::Rdx, Reg::R10, 8); // receiver
+                }
+                self.enc.xor_rr(Reg::Rcx, Reg::Rcx);
+                let done = self.enc.alloc_label();
+                for (tid, flabel) in candidates {
+                    let next = self.enc.alloc_label();
+                    self.enc.mov_imm64(Reg::R10, tid as u64);
+                    self.enc.cmp_rr(Reg::R11, Reg::R10);
+                    self.enc.jcc_label(0x5, next); // jne
+                    self.enc.call_label(flabel);
+                    self.enc.jmp_label(done);
+                    self.enc.place_label(next);
+                }
+                self.enc.ud2(); // no implementation for this type
+                self.enc.place_label(done);
+                self.enc.add_rsp_i32(call_space);
                 self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
             }
             Inst::BitCast { value, .. } => {
@@ -3614,17 +3700,27 @@ impl PeCodeGen {
             // ─── Fides-Specific ───
             Inst::Print { value, ty } => {
                 let voff = frame.offset(*value) as i32;
-                self.enc.mov_reg_mem_rbp(Reg::Rcx, voff);
                 self.enc.sub_rsp_i32(32);
-                // Route to the correct print function based on type
-                let print_fn = match ty {
-                    IrType::Ptr(_) => "p_print_str",
-                    IrType::F64 | IrType::F32 => "p_print_float",
-                    IrType::Bool => "p_print_bool",
-                    _ => "p_print_int",
-                };
-                if let Some(&flabel) = self.func_labels.get(print_fn) {
-                    self.enc.call_label(flabel);
+                if let Some(formatter) = print_formatter(ty) {
+                    // Collections print through their Fides formatter (as in
+                    // the C backend): formatter(env = 0, value) -> str.
+                    self.enc.xor_rr(Reg::Rcx, Reg::Rcx);
+                    self.enc.mov_reg_mem_rbp(Reg::Rdx, voff);
+                    self.call_runtime(formatter);
+                    self.enc.mov_rr(Reg::Rcx, Reg::Rax);
+                    self.call_runtime("p_print_str");
+                } else {
+                    self.enc.mov_reg_mem_rbp(Reg::Rcx, voff);
+                    // Route to the correct print function based on type
+                    let print_fn = match ty {
+                        IrType::Ptr(_) => "p_print_str",
+                        IrType::Opaque(n) if n == "String" => "p_print_str",
+                        IrType::Opaque(n) if n == "Tensor" => "p_tensor_to_str",
+                        IrType::F64 | IrType::F32 => "p_print_float",
+                        IrType::Bool => "p_print_bool",
+                        _ => "p_print_int",
+                    };
+                    self.call_runtime(print_fn);
                 }
                 self.enc.add_rsp_i32(32);
             }
@@ -3864,6 +3960,10 @@ impl PeCodeGen {
             self.gen_memset();
             return;
         }
+        // Runtime functions that only pretended to work (string search,
+        // replace, case, trim, vec sort/insert, map keys...) are not
+        // generated: a program calling one is refused (see generate_pe).
+        self.gen_arena_stubs();
         self.gen_print_int();
         self.gen_print_str();
         self.gen_print_bool();
@@ -3913,37 +4013,14 @@ impl PeCodeGen {
         self.gen_vec_contains();
         self.gen_vec_truncate();
         self.gen_vec_clone();
-        self.gen_vec_insert();
-        self.gen_vec_remove();
-        self.gen_vec_reverse();
-        self.gen_vec_extend();
-        self.gen_vec_sort();
         // New HashMap stubs
         self.gen_map_clear();
-        self.gen_map_keys();
-        self.gen_map_values();
         self.gen_map_get_or();
-        self.gen_map_clone();
         // String stubs
-        self.gen_string_from();
         self.gen_string_len();
         self.gen_string_is_empty();
-        self.gen_string_push_str();
-        self.gen_string_to_string();
-        self.gen_string_slice();
-        self.gen_string_contains();
         self.gen_string_starts_with();
-        self.gen_string_ends_with();
-        self.gen_string_trim();
-        self.gen_string_split();
-        self.gen_string_replace();
-        self.gen_string_char_at();
-        self.gen_string_to_uppercase();
-        self.gen_string_to_lowercase();
         self.gen_string_parse_int();
-        self.gen_string_find();
-        self.gen_string_rfind();
-        self.gen_string_repeat();
         self.gen_string_bytes();
         self.gen_string_clone();
         // Phase 5A.3: Interrupt handler stubs
@@ -5586,6 +5663,62 @@ impl PeCodeGen {
     }
 
     /// p_free(rcx = ptr)
+    /// The id of dyn values of type `name` (stable within one binary).
+    fn dyn_type_id(&mut self, name: &str) -> i64 {
+        let next = self.dyn_type_ids.len() as i64 + 1;
+        *self.dyn_type_ids.entry(name.to_string()).or_insert(next)
+    }
+
+    /// Call runtime or program function `name`; one nobody defines traps,
+    /// and (outside bare mode) makes generate_pe refuse the program.
+    fn call_runtime(&mut self, name: &str) {
+        if let Some(&label) = self.func_labels.get(name) {
+            self.enc.call_label(label);
+        } else {
+            if !self.bare_mode {
+                self.unresolved.entry(name.to_string()).or_default().insert(self.cur_func.clone());
+            }
+            self.enc.ud2();
+        }
+    }
+
+    /// Copy `size` bytes from [rcx] to [rax] (clobbers rax, rcx, rdx):
+    /// 8 bytes at a time, then single bytes, never past `size`.
+    fn emit_copy_rcx_to_rax(&mut self, size: i32) {
+        let mut offset: i32 = 0;
+        while offset + 8 <= size {
+            self.enc.mov_reg_mem_disp(Reg::Rdx, Reg::Rcx, offset);
+            self.enc.mov_mem_disp_reg(Reg::Rax, offset, Reg::Rdx);
+            offset += 8;
+        }
+        if offset < size {
+            self.enc.add_r_i32(Reg::Rcx, offset);
+            self.enc.add_r_i32(Reg::Rax, offset);
+            while offset < size {
+                self.enc.mov_reg8_mem(Reg::Rdx, Reg::Rcx);
+                self.enc.mov_mem_reg8(Reg::Rax, Reg::Rdx);
+                self.enc.add_r_i8(Reg::Rcx, 1);
+                self.enc.add_r_i8(Reg::Rax, 1);
+                offset += 1;
+            }
+        }
+    }
+
+    /// p_arena_save -> 0, p_arena_restore / p_region_free: no-ops. Heap
+    /// memory here is never reused, so there is nothing to give back (as in
+    /// the interpreter).
+    fn gen_arena_stubs(&mut self) {
+        for (name, returns_zero) in [("p_arena_save", true), ("p_arena_restore", false), ("p_region_free", false)] {
+            if let Some(&label) = self.func_labels.get(name) {
+                self.enc.place_label(label);
+                if returns_zero {
+                    self.enc.xor_rr(Reg::Rax, Reg::Rax);
+                }
+                self.enc.ret();
+            }
+        }
+    }
+
     fn gen_free(&mut self) {
         let label = *self.func_labels.get("p_free").unwrap();
         self.enc.place_label(label);
@@ -5798,7 +5931,7 @@ impl PeCodeGen {
         self.enc.xor_self(Reg::R8); // r8 = sign flag (0 = positive)
         self.enc.test_rr(Reg::R12, Reg::R12);
         let ts_pos = self.enc.alloc_label();
-        self.enc.jcc_label(0x3, ts_pos); // jns — positive
+        self.enc.jcc_label(0x9, ts_pos); // jns — positive (0x3 was jae: CF is always 0 after test, so negatives printed unsigned)
         // Negative: negate using xor rax,rax; sub rax,r12; mov r12,rax
         self.enc.xor_self(Reg::Rax);
         self.enc.sub_rr(Reg::Rax, Reg::R12);
@@ -7536,46 +7669,6 @@ impl PeCodeGen {
         self.enc.ret();
     }
 
-    /// p_vec_insert — stub: returns 0 (void)
-    fn gen_vec_insert(&mut self) {
-        let label = *self.func_labels.get("p_vec_insert").unwrap();
-        self.enc.place_label(label);
-        self.enc.xor_self(Reg::Rax);
-        self.enc.ret();
-    }
-
-    /// p_vec_remove — stub: returns 0
-    fn gen_vec_remove(&mut self) {
-        let label = *self.func_labels.get("p_vec_remove").unwrap();
-        self.enc.place_label(label);
-        self.enc.xor_self(Reg::Rax);
-        self.enc.ret();
-    }
-
-    /// p_vec_reverse — stub: returns 0 (void)
-    fn gen_vec_reverse(&mut self) {
-        let label = *self.func_labels.get("p_vec_reverse").unwrap();
-        self.enc.place_label(label);
-        self.enc.xor_self(Reg::Rax);
-        self.enc.ret();
-    }
-
-    /// p_vec_extend — stub: returns 0 (void)
-    fn gen_vec_extend(&mut self) {
-        let label = *self.func_labels.get("p_vec_extend").unwrap();
-        self.enc.place_label(label);
-        self.enc.xor_self(Reg::Rax);
-        self.enc.ret();
-    }
-
-    /// p_vec_sort — stub: returns 0 (void)
-    fn gen_vec_sort(&mut self) {
-        let label = *self.func_labels.get("p_vec_sort").unwrap();
-        self.enc.place_label(label);
-        self.enc.xor_self(Reg::Rax);
-        self.enc.ret();
-    }
-
     // ─── New HashMap runtime stubs ───
 
     /// p_map_clear(rcx=*Map) — set count=0
@@ -7584,38 +7677,6 @@ impl PeCodeGen {
         self.enc.place_label(label);
         self.enc.xor_self(Reg::Rax);
         self.enc.mov_mem_disp_reg(Reg::Rcx, 8, Reg::Rax); // count = 0
-        self.enc.ret();
-    }
-
-    /// p_map_keys — stub: returns empty Vec
-    fn gen_map_keys(&mut self) {
-        let label = *self.func_labels.get("p_map_keys").unwrap();
-        self.enc.place_label(label);
-        self.enc.push(Reg::Rbp);
-        self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
-        self.enc.mov_imm32(Reg::Rcx, 24);
-        self.enc.call_label(*self.func_labels.get("p_malloc").unwrap());
-        self.enc.xor_self(Reg::Rcx);
-        self.enc.mov_ptr_reg(Reg::Rax, Reg::Rcx);
-        self.enc.mov_mem_disp_reg(Reg::Rax, 8, Reg::Rcx);
-        self.enc.mov_mem_disp_reg(Reg::Rax, 16, Reg::Rcx);
-        self.enc.pop(Reg::Rbp);
-        self.enc.ret();
-    }
-
-    /// p_map_values — stub: returns empty Vec
-    fn gen_map_values(&mut self) {
-        let label = *self.func_labels.get("p_map_values").unwrap();
-        self.enc.place_label(label);
-        self.enc.push(Reg::Rbp);
-        self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
-        self.enc.mov_imm32(Reg::Rcx, 24);
-        self.enc.call_label(*self.func_labels.get("p_malloc").unwrap());
-        self.enc.xor_self(Reg::Rcx);
-        self.enc.mov_ptr_reg(Reg::Rax, Reg::Rcx);
-        self.enc.mov_mem_disp_reg(Reg::Rax, 8, Reg::Rcx);
-        self.enc.mov_mem_disp_reg(Reg::Rax, 16, Reg::Rcx);
-        self.enc.pop(Reg::Rbp);
         self.enc.ret();
     }
 
@@ -7649,35 +7710,8 @@ impl PeCodeGen {
         self.enc.ret();
     }
 
-    /// p_map_clone — stub: returns empty Map
-    fn gen_map_clone(&mut self) {
-        let label = *self.func_labels.get("p_map_clone").unwrap();
-        self.enc.place_label(label);
-        self.enc.push(Reg::Rbp);
-        self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
-        self.enc.mov_imm32(Reg::Rcx, 24);
-        self.enc.call_label(*self.func_labels.get("p_malloc").unwrap());
-        self.enc.xor_self(Reg::Rcx);
-        self.enc.mov_ptr_reg(Reg::Rax, Reg::Rcx);
-        self.enc.mov_mem_disp_reg(Reg::Rax, 8, Reg::Rcx);
-        self.enc.mov_mem_disp_reg(Reg::Rax, 16, Reg::Rcx);
-        self.enc.pop(Reg::Rbp);
-        self.enc.ret();
-    }
-
     // ─── String runtime stubs ───
     // Strings in PE are null-terminated *u8 (C strings)
-
-    /// p_string_from(rcx=*u8 or i64) -> rax = *u8 (new string)
-    fn gen_string_from(&mut self) {
-        let label = *self.func_labels.get("p_string_from").unwrap();
-        self.enc.place_label(label);
-        // For now, just return the input (if it's a string) or call p_to_str
-        // This is a simplification — p_string_from should handle int/float/bool too
-        // For strings, just return rcx
-        self.enc.mov_rr(Reg::Rax, Reg::Rcx);
-        self.enc.ret();
-    }
 
     /// p_string_len(rcx=*u8) -> rax = i64 (strlen)
     fn gen_string_len(&mut self) {
@@ -7712,43 +7746,6 @@ impl PeCodeGen {
         self.enc.test_rr(Reg::Rax, Reg::Rax);
         self.enc.setcc_r(0x4, Reg::Rax);
         self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
-        self.enc.ret();
-    }
-
-    /// p_string_push_str(rcx=*u8 left, rdx=*u8 right) -> rax = *u8 (concatenated)
-    fn gen_string_push_str(&mut self) {
-        let label = *self.func_labels.get("p_string_push_str").unwrap();
-        self.enc.place_label(label);
-        // Same as p_str_concat
-        self.enc.call_label(*self.func_labels.get("p_str_concat").unwrap());
-        self.enc.ret();
-    }
-
-    /// p_string_to_string(rcx=*u8) -> rax = *u8
-    fn gen_string_to_string(&mut self) {
-        let label = *self.func_labels.get("p_string_to_string").unwrap();
-        self.enc.place_label(label);
-        // For strings, just return input; for int/float, call p_to_str
-        self.enc.mov_rr(Reg::Rax, Reg::Rcx);
-        self.enc.ret();
-    }
-
-    /// p_string_slice(rcx=*u8, rdx=i64 start, r8=i64 end) -> rax = *u8
-    fn gen_string_slice(&mut self) {
-        let label = *self.func_labels.get("p_string_slice").unwrap();
-        self.enc.place_label(label);
-        // Simplified: return pointer to start offset
-        self.enc.mov_rr(Reg::Rax, Reg::Rcx);
-        self.enc.add_rr(Reg::Rax, Reg::Rdx);
-        self.enc.ret();
-    }
-
-    /// p_string_contains(rcx=*u8 haystack, rdx=*u8 needle) -> rax = bool
-    fn gen_string_contains(&mut self) {
-        let label = *self.func_labels.get("p_string_contains").unwrap();
-        self.enc.place_label(label);
-        // Simplified: return true as a stub
-        self.enc.mov_imm32(Reg::Rax, 1);
         self.enc.ret();
     }
 
@@ -7794,72 +7791,6 @@ impl PeCodeGen {
         self.enc.ret();
     }
 
-    /// p_string_ends_with — stub: returns true
-    fn gen_string_ends_with(&mut self) {
-        let label = *self.func_labels.get("p_string_ends_with").unwrap();
-        self.enc.place_label(label);
-        self.enc.mov_imm32(Reg::Rax, 1);
-        self.enc.ret();
-    }
-
-    /// p_string_trim — stub: returns input string
-    fn gen_string_trim(&mut self) {
-        let label = *self.func_labels.get("p_string_trim").unwrap();
-        self.enc.place_label(label);
-        self.enc.mov_rr(Reg::Rax, Reg::Rcx);
-        self.enc.ret();
-    }
-
-    /// p_string_split — stub: returns empty Vec
-    fn gen_string_split(&mut self) {
-        let label = *self.func_labels.get("p_string_split").unwrap();
-        self.enc.place_label(label);
-        self.enc.push(Reg::Rbp);
-        self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
-        self.enc.mov_imm32(Reg::Rcx, 24);
-        self.enc.call_label(*self.func_labels.get("p_malloc").unwrap());
-        self.enc.xor_self(Reg::Rcx);
-        self.enc.mov_ptr_reg(Reg::Rax, Reg::Rcx);
-        self.enc.mov_mem_disp_reg(Reg::Rax, 8, Reg::Rcx);
-        self.enc.mov_mem_disp_reg(Reg::Rax, 16, Reg::Rcx);
-        self.enc.pop(Reg::Rbp);
-        self.enc.ret();
-    }
-
-    /// p_string_replace — stub: returns input string
-    fn gen_string_replace(&mut self) {
-        let label = *self.func_labels.get("p_string_replace").unwrap();
-        self.enc.place_label(label);
-        self.enc.mov_rr(Reg::Rax, Reg::Rcx);
-        self.enc.ret();
-    }
-
-    /// p_string_char_at(rcx=*u8, rdx=i64 idx) -> rax = *u8 (1-char string)
-    fn gen_string_char_at(&mut self) {
-        let label = *self.func_labels.get("p_string_char_at").unwrap();
-        self.enc.place_label(label);
-        // Return pointer to the character (simplified)
-        self.enc.mov_rr(Reg::Rax, Reg::Rcx);
-        self.enc.add_rr(Reg::Rax, Reg::Rdx);
-        self.enc.ret();
-    }
-
-    /// p_string_to_uppercase — stub: returns input
-    fn gen_string_to_uppercase(&mut self) {
-        let label = *self.func_labels.get("p_string_to_uppercase").unwrap();
-        self.enc.place_label(label);
-        self.enc.mov_rr(Reg::Rax, Reg::Rcx);
-        self.enc.ret();
-    }
-
-    /// p_string_to_lowercase — stub: returns input
-    fn gen_string_to_lowercase(&mut self) {
-        let label = *self.func_labels.get("p_string_to_lowercase").unwrap();
-        self.enc.place_label(label);
-        self.enc.mov_rr(Reg::Rax, Reg::Rcx);
-        self.enc.ret();
-    }
-
     /// p_string_parse_int(rcx=*u8) -> rax = i64 (atoi)
     fn gen_string_parse_int(&mut self) {
         let label = *self.func_labels.get("p_string_parse_int").unwrap();
@@ -7889,32 +7820,6 @@ impl PeCodeGen {
         self.enc.place_label(done);
         self.enc.pop(Reg::R12);
         self.enc.pop(Reg::Rbp);
-        self.enc.ret();
-    }
-
-    /// p_string_find(rcx=*u8, rdx=*u8 needle) -> rax = i64 (index or -1)
-    fn gen_string_find(&mut self) {
-        let label = *self.func_labels.get("p_string_find").unwrap();
-        self.enc.place_label(label);
-        // Simplified: return 0 as stub
-        self.enc.xor_self(Reg::Rax);
-        self.enc.ret();
-    }
-
-    /// p_string_rfind — stub: returns 0
-    fn gen_string_rfind(&mut self) {
-        let label = *self.func_labels.get("p_string_rfind").unwrap();
-        self.enc.place_label(label);
-        self.enc.xor_self(Reg::Rax);
-        self.enc.ret();
-    }
-
-    /// p_string_repeat(rcx=*u8, rdx=i64 n) -> rax = *u8
-    fn gen_string_repeat(&mut self) {
-        let label = *self.func_labels.get("p_string_repeat").unwrap();
-        self.enc.place_label(label);
-        // Simplified: return input
-        self.enc.mov_rr(Reg::Rax, Reg::Rcx);
         self.enc.ret();
     }
 
@@ -8376,19 +8281,35 @@ impl PeCodeGen {
         self.enc.pop(Reg::Rbp);
         self.enc.ret();
         self.enc.place_label(fr_ok);
-        // Allocate 1MB buffer for reading
-        self.enc.mov_imm32(Reg::Rcx, 0x100000); // 1MB
+        // r12 = GetFileSize(handle, NULL): the path is no longer needed.
+        // (Files up to 4 GB; INVALID_FILE_SIZE reads nothing.)
+        self.enc.mov_rr(Reg::Rcx, Reg::R13);
+        self.enc.xor_self(Reg::Rdx);
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_rip(self.iat_off(IAT_GET_FILE_SIZE));
+        self.enc.add_rsp_i32(32);
+        self.enc.mov_rr(Reg::R12, Reg::Rax);
+        self.enc.mov_imm64(Reg::Rdx, 0xFFFF_FFFF);
+        self.enc.cmp_rr(Reg::R12, Reg::Rdx);
+        let fr_size_ok = self.enc.alloc_label();
+        self.enc.jcc_label(0x5, fr_size_ok); // jne
+        self.enc.xor_self(Reg::R12);
+        self.enc.place_label(fr_size_ok);
+        // r14 = buf = p_malloc(size + 1)
+        self.enc.mov_rr(Reg::Rcx, Reg::R12);
+        self.enc.inc_r(Reg::Rcx);
         self.enc.sub_rsp_i32(32);
         self.enc.call_label(*self.func_labels.get("p_malloc").unwrap());
         self.enc.add_rsp_i32(32);
         self.enc.mov_rr(Reg::R14, Reg::Rax); // r14 = buf
-        // ReadFile(handle, buf, 1MB, &bytesRead, NULL)
+        // ReadFile(handle, buf, size, &bytesRead, NULL)
         self.enc.mov_rr(Reg::Rcx, Reg::R13); // handle
         self.enc.mov_rr(Reg::Rdx, Reg::R14); // buf
-        self.enc.mov_imm32(Reg::R8, 0x100000); // 1MB max
+        self.enc.mov_rr(Reg::R8, Reg::R12); // size
         self.enc.lea_rbp(Reg::R9, -32); // &bytesRead
         self.enc.xor_self(Reg::Rax);
-        self.enc.mov_mem_disp_reg32(Reg::R9, 0, Reg::Rax); // zero bytesRead
+        // Zero all 8 bytes: ReadFile writes a DWORD, the count is read as 64 bits.
+        self.enc.mov_mem_disp_reg(Reg::R9, 0, Reg::Rax);
         self.enc.sub_rsp_i32(48);
         self.enc.xor_self(Reg::Rax);
         self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::Rax); // NULL (lpOverlapped)
@@ -8831,10 +8752,80 @@ impl PeCodeGen {
     }
 }
 
-/// Public entry point: generate a PE file from an IR module
-pub fn generate_pe(module: &IrModule) -> Vec<u8> {
+/// Public entry point: generate a PE file from an IR module. Fails when the
+/// program calls runtime functions this native backend does not provide.
+pub fn generate_pe(module: &IrModule) -> Result<Vec<u8>, Vec<String>> {
+    // The entry point calls main (it used to panic when there was none).
+    if !module.functions.contains_key("main") {
+        return Err(vec!["PE backend: the program has no `main` function".to_string()]);
+    }
     let mut gen = PeCodeGen::new();
-    gen.generate(module)
+    let bytes = gen.generate(module);
+    let reachable = reachable_functions(module);
+    let names: Vec<String> = gen.unresolved.into_iter()
+        .filter(|(_, callers)| callers.iter().any(|c| reachable.contains(c)))
+        .map(|(callee, _)| callee)
+        .collect();
+    if !names.is_empty() {
+        return Err(vec![format!(
+            "PE backend: not available in native Windows executables: {} (build with `fidesc ccompile` instead)",
+            names.join(", ")
+        )]);
+    }
+    Ok(bytes)
+}
+
+/// Runtime builtins this backend implements with core's Fides code.
+fn pe_runtime_alias(name: &str) -> &str {
+    match name {
+        "p_vec_insert" => "vec_raw_insert",
+        "p_vec_remove" => "vec_raw_remove",
+        "p_vec_reverse" => "vec_raw_reverse",
+        "p_vec_extend" => "vec_raw_extend",
+        "p_vec_sort" => "vec_raw_sort",
+        _ => name,
+    }
+}
+
+/// The Fides function that formats a printed collection, if any.
+fn print_formatter(ty: &IrType) -> Option<&'static str> {
+    match ty {
+        IrType::Generic(n, _) | IrType::Opaque(n) if n == "Vec" => Some("Vec_to_str"),
+        IrType::Generic(n, _) | IrType::Opaque(n) if n == "HashMap" => Some("HashMap_to_str"),
+        _ => None,
+    }
+}
+
+/// Functions reachable from `main`: through calls, function references
+/// (closures, thread entries) and `dyn` method dispatch. Everything, when
+/// there is no `main`.
+fn reachable_functions(module: &IrModule) -> std::collections::BTreeSet<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    if !module.functions.contains_key("main") {
+        seen.extend(module.functions.keys().cloned());
+        return seen;
+    }
+    let mut work = vec!["main".to_string()];
+    while let Some(f) = work.pop() {
+        if !seen.insert(f.clone()) {
+            continue;
+        }
+        if let Some(func) = module.functions.get(&f) {
+            for inst in func.instructions.values() {
+                match inst {
+                    Inst::Call { func: callee, .. } => work.push(pe_runtime_alias(callee).to_string()),
+                    Inst::ConstFnRef { name } => work.push(name.clone()),
+                    Inst::Print { ty, .. } => work.extend(print_formatter(ty).map(String::from)),
+                    Inst::DynCall { method, .. } => {
+                        let suffix = format!("_{}", method);
+                        work.extend(module.functions.keys().filter(|k| k.ends_with(&suffix)).cloned());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    seen
 }
 
 /// Generate a flat binary (no PE headers, no imports, no IAT).

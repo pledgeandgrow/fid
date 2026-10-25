@@ -19,6 +19,7 @@ use compiler::ir;
 use compiler::pir;
 use compiler::opt;
 use compiler::compiler;
+use compiler::inc;
 use compiler::pe;
 use compiler::fmt;
 use compiler::lower;
@@ -684,8 +685,14 @@ fn cmd_test(n: i64, start: i64) -> i64 {
         return 1;
     }
 
-    // Parse file listing (one filename per line)
-    var files: Vec<str> = c_str_lines(listing);
+    // Parse file listing (one filename per line; skip blank lines)
+    var listed: Vec<str> = c_str_lines(listing);
+    var files: Vec<str> = Vec::new();
+    var li: i64 = 0;
+    while li < listed.len() {
+        if str_len(listed.get(li)) > 0 { files.push(listed.get(li)); }
+        li = li + 1;
+    }
     if files.len() == 0 {
         if fail_only {
             p_eprint_str("No expected-fail tests found in tests/bootstrap/\n");
@@ -1453,9 +1460,22 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         p_eprint_str("[main] C compilation tracing enabled\n");
     }
 
+    // Incremental build: skip all work when no input changed.
+    var no_cache: bool = has_flag(n, start, "--no-cache") || str_len(p_getenv("FIDES_NO_CACHE")) > 0;
+    var stamp_path: str = output + ".fides-stamp";
+    var build_key: i64 = inc_build_key("ccompile", n, start);
+    var stamp: IncStamp = inc_stamp_read(stamp_path);
+    if no_cache { stamp.ok = false; }
+    if inc_up_to_date(stamp, build_key, output) {
+        print(output + " is up to date\n");
+        return 0;
+    }
+    inc_deps_reset();
+
     var result: ResultStr = ccompile_source_with_path(source, input, g_borrowck);
     match result {
         ResultStr::Ok(c_code) => {
+            var c_hash: i64 = hash_source(c_code);
             p_eprint_str("[main] C code generated. Writing to file...\n");
             // Derive the C source path from the executable path
             var c_file: str = "";
@@ -1466,6 +1486,13 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             }
             p_file_write(c_file, c_code);
             p_eprint_str("[main] C file written. ");
+            // Same C as the build that produced the output: no need to run
+            // the C compiler again.
+            if inc_c_unchanged(stamp, build_key, output, c_hash) {
+                inc_stamp_commit(stamp_path, build_key, c_hash, input);
+                print("C translation unchanged; " + output + " is up to date\n");
+                return 0;
+            }
 
             // Find a C compiler: check CC env var, then gcc, clang, tcc
             var cc: str = p_getenv("CC");
@@ -1585,24 +1612,47 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 p_eprint_str("[main] Detected net usage, adding link flags\n");
             }
 
+            // C optimization level: --cc-opt, else FIDES_CC_OPT, else -O2.
+            // gcc and clang need tens of minutes for a very large
+            // translation unit at -O1/-O2 (the compiler itself is ~35 MB of
+            // C: 26 min at -O2, 40 s at -O0), so one gets -O0.
+            var cc_opt: str = get_flag_value(n, start, "--cc-opt", "");
+            if str_len(cc_opt) == 0 { cc_opt = p_getenv("FIDES_CC_OPT"); }
+            if str_len(cc_opt) == 0 {
+                if str_len(c_code) > 16777216 {
+                    print("Large program (" + int_to_str(str_len(c_code) / 1048576) + " MB of C): compiling with -O0 (use --cc-opt 2 for -O2)\n");
+                    cc_opt = "0";
+                } else {
+                    cc_opt = "2";
+                }
+            }
+            if cc_opt != "0" && cc_opt != "1" && cc_opt != "2" && cc_opt != "3" && cc_opt != "s" {
+                print("Invalid --cc-opt '" + cc_opt + "': use 0, 1, 2, 3 or s\n");
+                return 1;
+            }
+            var gcc_opt: str = "-O" + cc_opt;
+            var cl_opt: str = "/O2";
+            if cc_opt == "0" { cl_opt = "/Od"; }
+            if cc_opt == "1" || cc_opt == "s" { cl_opt = "/O1"; }
+
             var cc_cmd: str = "";
             if is_cl {
                 // cl.exe: /O2 /Fe:output file.c
-                cc_cmd = cc + " /O2 /nologo /Fe:" + output + " " + c_file;
+                cc_cmd = cc + " " + cl_opt + " /nologo /Fe:" + output + " " + c_file;
             } else {
                 if is_tcc {
                     // tcc: minimal flags
                     if is_linux() {
-                        cc_cmd = cc + " -O2 -w -o " + output + " " + c_file + " -lm" + extra_libs;
+                        cc_cmd = cc + " " + gcc_opt + " -w -o " + output + " " + c_file + " -lm" + extra_libs;
                     } else {
-                        cc_cmd = cc + " -O2 -w -o " + output + " " + c_file + " -lws2_32" + extra_libs;
+                        cc_cmd = cc + " " + gcc_opt + " -w -o " + output + " " + c_file + " -lws2_32" + extra_libs;
                     }
                 } else {
                     // gcc/clang: -O2 + hardening flags
                     if is_linux() {
-                        cc_cmd = cc + " -O2 -w -Wno-int-conversion -o " + output + " " + c_file + " -lm -lpthread" + extra_libs;
+                        cc_cmd = cc + " " + gcc_opt + " -w -Wno-int-conversion -o " + output + " " + c_file + " -lm -lpthread" + extra_libs;
                     } else {
-                        cc_cmd = cc + " -O2 -w -Wno-int-conversion -o " + output + " " + c_file + " -lws2_32" + extra_libs;
+                        cc_cmd = cc + " " + gcc_opt + " -w -Wno-int-conversion -o " + output + " " + c_file + " -lws2_32" + extra_libs;
                     }
                 }
             }
@@ -1622,6 +1672,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             if !is_linux() {
                 patch_pe_stack(output);
             }
+            inc_stamp_commit(stamp_path, build_key, c_hash, input);
 
             print("Built native executable: ");
             print(output);

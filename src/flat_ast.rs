@@ -390,6 +390,10 @@ pub fn expr_flat(e: &Expr, depth: usize) -> String {
                 ReflectOp::IsEnum => "IsEnum", ReflectOp::FieldCount => "FieldCount",
                 ReflectOp::FieldNames => "FieldNames", ReflectOp::FieldTypes => "FieldTypes",
                 ReflectOp::EnumVariants => "EnumVariants",
+                ReflectOp::StructSize => "StructSize", ReflectOp::FieldOffset => "FieldOffset",
+                ReflectOp::EnumDiscriminant => "EnumDiscriminant",
+                ReflectOp::FunctionEffects => "FunctionEffects",
+                ReflectOp::FunctionCapabilities => "FunctionCapabilities",
             };
             let mut s = format!("{}ComptimeReflect {}\n", ind, op_str);
             s.push_str(&type_flat(ty, depth + 1));

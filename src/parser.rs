@@ -947,6 +947,16 @@ impl Parser {
     fn parse_trait(&mut self) -> Result<TraitDef, String> {
         self.expect(TokenKind::Cap, "cap")?;
         let name = self.expect_ident()?;
+        // Supertraits: `cap NamedGreet: Greet + Show {`
+        let mut supertraits = Vec::new();
+        if self.match_tok(TokenKind::Colon) {
+            loop {
+                supertraits.push(self.expect_ident()?);
+                if !self.match_tok(TokenKind::Plus) {
+                    break;
+                }
+            }
+        }
         self.expect(TokenKind::LBrace, "{")?;
 
         let mut methods = Vec::new();
@@ -1061,7 +1071,7 @@ impl Parser {
         }
         self.expect(TokenKind::RBrace, "}")?;
 
-        Ok(TraitDef { name, methods, associated_types, is_pub: false })
+        Ok(TraitDef { name, methods, associated_types, is_pub: false, supertraits })
     }
 
     /// Parse an extern function declaration (pf keyword already consumed)
@@ -1311,6 +1321,8 @@ impl Parser {
             TokenKind::Bool => Type::Bool,
             TokenKind::Str => Type::Str,
             TokenKind::Void => Type::Void,
+            // `-> !`: the function never returns.
+            TokenKind::Bang => Type::Never,
             TokenKind::Dyn => {
                 self.advance();
                 let trait_name = self.expect_ident()?;
@@ -2526,12 +2538,31 @@ impl Parser {
                 "field_names" => Some(ReflectOp::FieldNames),
                 "field_types" => Some(ReflectOp::FieldTypes),
                 "enum_variants" => Some(ReflectOp::EnumVariants),
+                "struct_size" => Some(ReflectOp::StructSize),
+                "field_offset" => Some(ReflectOp::FieldOffset),
+                "enum_discriminant" => Some(ReflectOp::EnumDiscriminant),
+                "function_effects" => Some(ReflectOp::FunctionEffects),
+                "function_capabilities" => Some(ReflectOp::FunctionCapabilities),
                 _ => None,
             };
             if let Some(op) = reflect_op {
                 self.advance();
                 self.expect(TokenKind::LParen, "(")?;
-                let ty = self.parse_type()?;
+                let ty = match op {
+                    // Owner.member (or Owner::member), kept as "Owner.member"
+                    ReflectOp::FieldOffset | ReflectOp::EnumDiscriminant => {
+                        let owner = self.expect_ident()?;
+                        if !self.match_tok(TokenKind::Dot) {
+                            self.expect(TokenKind::DoubleColon, ".")?;
+                        }
+                        let member = self.expect_ident_or_keyword()?;
+                        Type::Named(format!("{}.{}", owner, member))
+                    }
+                    ReflectOp::FunctionEffects | ReflectOp::FunctionCapabilities => {
+                        Type::Named(self.expect_ident_or_keyword()?)
+                    }
+                    _ => self.parse_type()?,
+                };
                 self.expect(TokenKind::RParen, ")")?;
                 self.match_tok(TokenKind::Semicolon);
                 return Ok(Expr::ComptimeReflect { op, ty });

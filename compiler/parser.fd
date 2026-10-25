@@ -1353,6 +1353,18 @@ match self.expect_ident() {
     ParseResultStr::Ok(s) => { name = s; }
     ParseResultStr::Err(e) => { return ParseResultTraitDef::Err(e); }
 }
+// Supertraits: `cap NamedGreet: Greet + Show {`
+var supertraits: Vec<str> = Vec::new();
+if self.match_tok(TokenKind::Colon) {
+    var more_supers: bool = true;
+    while more_supers {
+        match self.expect_ident() {
+            ParseResultStr::Ok(sup) => { supertraits.push(sup); }
+            ParseResultStr::Err(e) => { return ParseResultTraitDef::Err(e); }
+        }
+        more_supers = self.match_tok(TokenKind::Plus);
+    }
+}
 match self.expect(TokenKind::LBrace, "{") {
     ParseResultUnit::Err(e) => { return ParseResultTraitDef::Err(e); }
     ParseResultUnit::Ok => {}
@@ -1497,6 +1509,7 @@ while !self.check(TokenKind::RBrace) && !self.is_at_end() {
     }
     var __td0: TraitDef = TraitDef_new(name, methods);
     __td0.associated_types = associated_types;
+    __td0.supertraits = supertraits;
     return ParseResultTraitDef::Ok(__td0);
 }
 
@@ -2167,6 +2180,8 @@ if token_kind_eq(k, TokenKind::U128) { self.advance(); return ParseResultType::O
 if token_kind_eq(k, TokenKind::F32) { self.advance(); return ParseResultType::Ok(Type::F32); }
 if token_kind_eq(k, TokenKind::F64) { self.advance(); return ParseResultType::Ok(Type::F64); }
 if token_kind_eq(k, TokenKind::Bool) { self.advance(); return ParseResultType::Ok(Type::Bool); }
+// `-> !`: the function never returns.
+if token_kind_eq(k, TokenKind::Bang) { self.advance(); return ParseResultType::Ok(Type::Never); }
 if token_kind_eq(k, TokenKind::Str) { self.advance(); return ParseResultType::Ok(Type::Str); }
 if token_kind_eq(k, TokenKind::Void) { self.advance(); return ParseResultType::Ok(Type::Void); }
 
@@ -4221,6 +4236,11 @@ match self.peek() {
         else if name == "field_names" { op = ReflectOp::FieldNames; }
         else if name == "field_types" { op = ReflectOp::FieldTypes; }
         else if name == "enum_variants" { op = ReflectOp::EnumVariants; }
+        else if name == "struct_size" { op = ReflectOp::StructSize; }
+        else if name == "field_offset" { op = ReflectOp::FieldOffset; }
+        else if name == "enum_discriminant" { op = ReflectOp::EnumDiscriminant; }
+        else if name == "function_effects" { op = ReflectOp::FunctionEffects; }
+        else if name == "function_capabilities" { op = ReflectOp::FunctionCapabilities; }
         else { has_op = false; }
         if has_op {
             self.advance();
@@ -4229,9 +4249,42 @@ match self.peek() {
                 ParseResultUnit::Ok => {}
             }
             var ty: Type = Type::Infer;
-            match self.parse_type() {
-                ParseResultType::Ok(t) => { ty = t; }
-                ParseResultType::Err(e) => { return ParseResultExpr::Err(e); }
+            var member_op: bool = false;
+            var func_op: bool = false;
+            match op {
+                ReflectOp::FieldOffset => { member_op = true; }
+                ReflectOp::EnumDiscriminant => { member_op = true; }
+                ReflectOp::FunctionEffects => { func_op = true; }
+                ReflectOp::FunctionCapabilities => { func_op = true; }
+                _ => {}
+            }
+            if member_op {
+                // Owner.member (or Owner::member), kept as "Owner.member"
+                var owner: str = "";
+                match self.expect_ident() {
+                    ParseResultStr::Ok(o) => { owner = o; }
+                    ParseResultStr::Err(e) => { return ParseResultExpr::Err(e); }
+                }
+                if !self.match_tok(TokenKind::Dot) {
+                    match self.expect(TokenKind::DoubleColon, ".") {
+                        ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+                        ParseResultUnit::Ok => {}
+                    }
+                }
+                match self.expect_ident_or_keyword() {
+                    ParseResultStr::Ok(m) => { ty = Type::Named(owner + "." + m); }
+                    ParseResultStr::Err(e) => { return ParseResultExpr::Err(e); }
+                }
+            } else if func_op {
+                match self.expect_ident_or_keyword() {
+                    ParseResultStr::Ok(fname) => { ty = Type::Named(fname); }
+                    ParseResultStr::Err(e) => { return ParseResultExpr::Err(e); }
+                }
+            } else {
+                match self.parse_type() {
+                    ParseResultType::Ok(t) => { ty = t; }
+                    ParseResultType::Err(e) => { return ParseResultExpr::Err(e); }
+                }
             }
             match self.expect(TokenKind::RParen, ")") {
                 ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
