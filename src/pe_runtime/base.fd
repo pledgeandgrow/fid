@@ -1,0 +1,693 @@
+// src/pe_runtime/base.fd — the Fides runtime of native Windows executables
+//
+// The PE backend (src/pe.rs) has machine code for the core builtins
+// (printing, strings, Vec, HashMap, memory). Every other builtin p_X is
+// implemented by this runtime as pert_X, in Fides, over:
+//   - C functions of msvcrt.dll and kernel32.dll, declared extern "C" (the
+//     backend calls each through a thunk: see CThunk in pe.rs)
+//   - machine-code primitives pe_* (atomics, float bits, calling a function
+//     by address: see gen_pe_primitives in pe.rs)
+// A call to p_X runs pert_X with the same arguments; an executable gets only
+// the functions it uses. The behaviour is the C backend's (src/codegen_c.rs),
+// which matches the interpreter's.
+//
+// This file: numbers and their text, files, clocks, the environment,
+// wildcard matching, volatile memory access, SIMD vectors, simulated
+// dynamic loading and allocators, the entity-component store.
+
+extern "C" {
+    // msvcrt.dll
+    fn fopen as pe_c_fopen(path: str, mode: str) -> i64;
+    fn fclose as pe_c_fclose(f: i64) -> i32;
+    fn fread as pe_c_fread(buf: i64, size: i64, count: i64, f: i64) -> i64;
+    fn fwrite as pe_c_fwrite(buf: i64, size: i64, count: i64, f: i64) -> i64;
+    fn fputs as pe_c_fputs(s: str, f: i64) -> i32;
+    fn fseek as pe_c_fseek(f: i64, offset: i64, whence: i64) -> i32;
+    fn ftell as pe_c_ftell(f: i64) -> i32;
+    fn remove as pe_c_remove(path: str) -> i32;
+    fn getenv as pe_c_getenv(name: str) -> str;
+    fn atof as pe_c_atof(s: str) -> f64;
+    fn _strtoi64 as pe_c_strtoi64(s: str, end: i64, base: i64) -> i64;
+    fn strtod as pe_c_strtod(s: str, end: i64) -> f64;
+    fn _snprintf as pe_c_fmt_prec(buf: i64, size: i64, fmt: str, prec: i64, x: f64) -> i32;
+    fn _snprintf as pe_c_fmt_f64(buf: i64, size: i64, fmt: str, x: f64) -> i32;
+    // kernel32.dll
+    fn GetSystemTimeAsFileTime as pe_k_system_time(out: i64);
+    // Machine-code primitives (pe.rs): a float travels as its bits
+    fn pe_f64_to_bits(x: f64) -> i64;
+    fn pe_bits_to_f64(bits: i64) -> f64;
+    fn pe_f64_to_bits as pe_f32_raw_bits(x: f32) -> i64;
+    fn pe_f64_to_bits as pe_raw_bits_f32(bits: i64) -> f32;
+}
+
+// ─── Numbers ────────────────────────────────────────────────────────────
+
+pub fn pert_int_to_float(x: i64) -> f64 {
+    return x as f64;
+}
+
+pub fn pert_float_to_int(x: f64) -> i64 {
+    return x as i64;
+}
+
+pub fn pert_f64_to_bits(x: f64) -> i64 {
+    return pe_f64_to_bits(x);
+}
+
+pub fn pert_f64_from_bits(bits: i64) -> f64 {
+    return pe_bits_to_f64(bits);
+}
+
+/// The bits of an f32, sign-extended (C: (int64_t) of an int32_t).
+pub fn pert_f32_to_bits(x: f32) -> i64 {
+    var b: i64 = pe_f32_raw_bits(x) & 4294967295;
+    if b >= 2147483648 {
+        b = b - 4294967296;
+    }
+    return b;
+}
+
+pub fn pert_f32_from_bits(bits: i64) -> f32 {
+    return pe_raw_bits_f32(bits & 4294967295);
+}
+
+/// atof: 0.0 when the text is not a number.
+pub fn pert_str_to_float(s: str) -> f64 {
+    if pe_str_is_null(s) {
+        return 0.0;
+    }
+    return pe_c_atof(s);
+}
+
+/// atoll: base 10, 0 when the text is not a number.
+pub fn pert_str_to_int(s: str) -> i64 {
+    if pe_str_is_null(s) {
+        return 0;
+    }
+    return pe_c_strtoi64(s, 0, 10);
+}
+
+/// (A str argument passes as its address.)
+fn pe_str_is_null(s: i64) -> bool {
+    return s == 0;
+}
+
+/// A float as the interpreter prints it (Rust's Display): the shortest
+/// fixed-point text that reads back as the same number, no exponent.
+pub fn pert_to_str_float(val: f64) -> str {
+    if val != val {
+        return "NaN";
+    }
+    // val - val is 0 for a finite value, NaN for an infinite one
+    var d: f64 = val - val;
+    if d != d {
+        if val > 0.0 {
+            return "inf";
+        }
+        return "-inf";
+    }
+    if val == 0.0 {
+        if pe_f64_to_bits(val) < 0 {
+            return "-0";
+        }
+        return "0";
+    }
+    // Digits needed: 17 significant ones, after any leading zeros
+    var a: f64 = val;
+    if a < 0.0 {
+        a = 0.0 - a;
+    }
+    var exp: i64 = 0;
+    if a >= 1.0 {
+        while a >= 10.0 {
+            a = a / 10.0;
+            exp = exp + 1;
+        }
+    } else {
+        while a < 1.0 {
+            a = a * 10.0;
+            exp = exp - 1;
+        }
+    }
+    var max_prec: i64 = 17;
+    if exp < 0 {
+        max_prec = 17 - exp;
+    }
+    if max_prec > 350 {
+        max_prec = 350;
+    }
+    var buf: i64 = p_malloc(512);
+    var prec: i64 = 0;
+    while prec <= max_prec {
+        pe_c_fmt_prec(buf, 511, "%.*f", prec, val);
+        var back: str = pe_buf_str(buf);
+        if pe_c_strtod(back, 0) == val {
+            return pe_trim_fraction_zeros(buf);
+        }
+        prec = prec + 1;
+    }
+    pe_c_fmt_prec(buf, 511, "%.*f", max_prec, val);
+    return pe_buf_str(buf);
+}
+
+pub fn pert_float_to_str(val: f64) -> str {
+    return pert_to_str_float(val);
+}
+
+pub fn pert_print_float(val: f64) {
+    p_print_str(pert_to_str_float(val));
+}
+
+/// A NUL-terminated buffer as a str.
+fn pe_buf_str(buf: i64) -> str {
+    return buf;
+}
+
+/// "10.500" -> "10.5", "10.000" -> "10" (in place).
+fn pe_trim_fraction_zeros(buf: i64) -> str {
+    var len: i64 = p_str_length(pe_buf_str(buf));
+    var dot: i64 = -1;
+    var i: i64 = 0;
+    while i < len {
+        if pe_byte_at(buf, i) == 46 {
+            dot = i;
+        }
+        i = i + 1;
+    }
+    if dot >= 0 {
+        var end: i64 = len - 1;
+        while end > dot && pe_byte_at(buf, end) == 48 {
+            pe_set_byte(buf, end, 0);
+            end = end - 1;
+        }
+        if end == dot {
+            pe_set_byte(buf, dot, 0);
+        }
+    }
+    return pe_buf_str(buf);
+}
+
+fn pe_byte_at(buf: i64, i: i64) -> i64 {
+    var p: *mut u8 = buf + i;
+    var b: i64 = 0;
+    unsafe { b = *p; }
+    return b;
+}
+
+fn pe_set_byte(buf: i64, i: i64, b: i64) {
+    var p: *mut u8 = buf + i;
+    unsafe { *p = b; }
+}
+
+fn pe_str_addr(s: i64) -> i64 {
+    return s;
+}
+
+// ─── Files (C stdio, binary mode) ───────────────────────────────────────
+
+pub fn pert_file_exists(path: str) -> bool {
+    var f: i64 = pe_c_fopen(path, "rb");
+    if f == 0 {
+        return false;
+    }
+    pe_c_fclose(f);
+    return true;
+}
+
+pub fn pert_file_append(path: str, content: str) -> i64 {
+    var f: i64 = pe_c_fopen(path, "ab");
+    if f == 0 {
+        return -1;
+    }
+    pe_c_fputs(content, f);
+    pe_c_fclose(f);
+    return 0;
+}
+
+pub fn pert_file_delete(path: str) -> i64 {
+    if pe_c_remove(path) == 0 {
+        return 0;
+    }
+    return -1;
+}
+
+pub fn pert_file_size(path: str) -> i64 {
+    var f: i64 = pe_c_fopen(path, "rb");
+    if f == 0 {
+        return -1;
+    }
+    pe_c_fseek(f, 0, 2);
+    var size: i64 = pe_c_ftell(f);
+    pe_c_fclose(f);
+    if size < 0 {
+        return -1;
+    }
+    return size;
+}
+
+/// Every byte of the file as one element (binary-safe); empty if unreadable.
+pub fn pert_file_read_bytes(path: str) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var f: i64 = pe_c_fopen(path, "rb");
+    if f == 0 {
+        return v;
+    }
+    var buf: i64 = p_malloc(65536);
+    var n: i64 = pe_c_fread(buf, 1, 65536, f);
+    while n > 0 {
+        var i: i64 = 0;
+        while i < n {
+            v.push(pe_byte_at(buf, i));
+            i = i + 1;
+        }
+        n = pe_c_fread(buf, 1, 65536, f);
+    }
+    pe_c_fclose(f);
+    return v;
+}
+
+/// Each element's low byte, in order.
+pub fn pert_file_write_vec(path: str, v: Vec<i64>) -> i64 {
+    var f: i64 = pe_c_fopen(path, "wb");
+    if f == 0 {
+        return -1;
+    }
+    var n: i64 = v.len();
+    if n > 0 {
+        var buf: i64 = p_malloc(n);
+        var i: i64 = 0;
+        while i < n {
+            pe_set_byte(buf, i, v.get(i) & 255);
+            i = i + 1;
+        }
+        pe_c_fwrite(buf, 1, n, f);
+    }
+    pe_c_fclose(f);
+    return 0;
+}
+
+/// 64-bit FNV-1a of the file's bytes; 0 if it cannot be read.
+@wrapping
+pub fn pert_file_hash(path: str) -> i64 {
+    var f: i64 = pe_c_fopen(path, "rb");
+    if f == 0 {
+        return 0;
+    }
+    var h: i64 = -3750763034362895579;
+    var buf: i64 = p_malloc(65536);
+    var n: i64 = pe_c_fread(buf, 1, 65536, f);
+    while n > 0 {
+        var i: i64 = 0;
+        while i < n {
+            h = (h ^ pe_byte_at(buf, i)) * 1099511628211;
+            i = i + 1;
+        }
+        n = pe_c_fread(buf, 1, 65536, f);
+    }
+    pe_c_fclose(f);
+    return h;
+}
+
+// ─── C stdio output ─────────────────────────────────────────────────────
+// `extern "C"` putchar / puts write through this backend's own stdout, in
+// order with print (C stdio would buffer them separately): see c_override
+// in pe.rs.
+
+pub fn pert_c_putchar(c: i64) -> i64 {
+    p_print_str(p_char_to_str(c & 255));
+    return c & 255;
+}
+
+pub fn pert_c_puts(s: str) -> i64 {
+    p_print_str(s);
+    p_print_str("\n");
+    return 0;
+}
+
+// ─── Clocks, the environment ────────────────────────────────────────────
+
+/// Wall-clock time in 100 ns units since 1970.
+fn pe_time_100ns() -> i64 {
+    var ft: i64 = p_malloc(8);
+    pe_k_system_time(ft);
+    var p: *mut i64 = ft;
+    var t: i64 = 0;
+    unsafe { t = *p; }
+    return t - 116444736000000000;
+}
+
+pub fn pert_clock_now() -> i64 {
+    return pe_time_100ns() * 100;
+}
+
+pub fn pert_clock_now_us() -> i64 {
+    return pe_time_100ns() / 10;
+}
+
+pub fn pert_clock_now_ms() -> i64 {
+    return pe_time_100ns() / 10000;
+}
+
+/// The variable's value; null when it is not set.
+pub fn pert_getenv(name: str) -> str {
+    return pe_c_getenv(name);
+}
+
+// ─── Wildcard matching ('?' one byte, '*' any run) ──────────────────────
+
+pub fn pert_regex_match(s: str, pattern: str) -> bool {
+    if pe_str_is_null(s) || pe_str_is_null(pattern) {
+        return false;
+    }
+    var sa: i64 = pe_str_addr(s);
+    var pa: i64 = pe_str_addr(pattern);
+    var s_len: i64 = p_str_length(s);
+    var p_len: i64 = p_str_length(pattern);
+    var si: i64 = 0;
+    var pi: i64 = 0;
+    var star_s: i64 = -1;
+    var star_p: i64 = -1;
+    while si < s_len {
+        if pi < p_len && (pe_byte_at(pa, pi) == 63 || pe_byte_at(pa, pi) == pe_byte_at(sa, si)) {
+            si = si + 1;
+            pi = pi + 1;
+        } else if pi < p_len && pe_byte_at(pa, pi) == 42 {
+            star_p = pi;
+            star_s = si;
+            pi = pi + 1;
+        } else if star_p >= 0 {
+            pi = star_p + 1;
+            si = star_s + 1;
+            star_s = si;
+        } else {
+            return false;
+        }
+    }
+    while pi < p_len && pe_byte_at(pa, pi) == 42 {
+        pi = pi + 1;
+    }
+    return pi == p_len;
+}
+
+// ─── Memory ─────────────────────────────────────────────────────────────
+
+pub fn pert_alloc(size: i64) -> i64 {
+    return p_malloc(size);
+}
+
+pub fn pert_volatile_load(addr: i64) -> i64 {
+    var p: *mut i64 = addr;
+    var v: i64 = 0;
+    unsafe { v = *p; }
+    return v;
+}
+
+pub fn pert_volatile_store(addr: i64, val: i64) {
+    var p: *mut i64 = addr;
+    unsafe { *p = val; }
+}
+
+pub fn pert_volatile_load8(addr: i64) -> i64 {
+    return pe_byte_at(addr, 0);
+}
+
+pub fn pert_volatile_store8(addr: i64, val: i64) {
+    pe_set_byte(addr, 0, val);
+}
+
+pub fn pert_volatile_load32(addr: i64) -> i64 {
+    var p: *mut u32 = addr;
+    var v: i64 = 0;
+    unsafe { v = *p; }
+    return v;
+}
+
+pub fn pert_volatile_store32(addr: i64, val: i64) {
+    var p: *mut u32 = addr;
+    unsafe { *p = val; }
+}
+
+// ─── SIMD vectors: Vec<f64> of any length, elementwise ──────────────────
+
+pub fn pert_simd_add(a: Vec<f64>, b: Vec<f64>) -> Vec<f64> {
+    var r: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < a.len() {
+        r.push(a.get(i) + b.get(i));
+        i = i + 1;
+    }
+    return r;
+}
+
+pub fn pert_simd_sub(a: Vec<f64>, b: Vec<f64>) -> Vec<f64> {
+    var r: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < a.len() {
+        r.push(a.get(i) - b.get(i));
+        i = i + 1;
+    }
+    return r;
+}
+
+pub fn pert_simd_mul(a: Vec<f64>, b: Vec<f64>) -> Vec<f64> {
+    var r: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < a.len() {
+        r.push(a.get(i) * b.get(i));
+        i = i + 1;
+    }
+    return r;
+}
+
+/// x / 0 is 0.
+pub fn pert_simd_div(a: Vec<f64>, b: Vec<f64>) -> Vec<f64> {
+    var r: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < a.len() {
+        var d: f64 = b.get(i);
+        if d != 0.0 {
+            r.push(a.get(i) / d);
+        } else {
+            r.push(0.0);
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+pub fn pert_simd_dot(a: Vec<f64>, b: Vec<f64>) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < a.len() {
+        s = s + a.get(i) * b.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+pub fn pert_simd_sum(a: Vec<f64>) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < a.len() {
+        s = s + a.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+pub fn pert_simd_scale(a: Vec<f64>, k: f64) -> Vec<f64> {
+    var r: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < a.len() {
+        r.push(a.get(i) * k);
+        i = i + 1;
+    }
+    return r;
+}
+
+pub fn pert_simd_from_vec(v: Vec<i64>) -> Vec<f64> {
+    var r: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        r.push(v.get(i) as f64);
+        i = i + 1;
+    }
+    return r;
+}
+
+/// "[1, 2.5]": whole numbers as integers, others as %g.
+pub fn pert_simd_to_str(a: Vec<f64>) -> str {
+    var out: str = "[";
+    var buf: i64 = p_malloc(64);
+    var i: i64 = 0;
+    while i < a.len() {
+        if i > 0 {
+            out = out + ", ";
+        }
+        var d: f64 = a.get(i);
+        var n: i64 = d as i64;
+        if d == (n as f64) {
+            out = out + int_to_str(n);
+        } else {
+            pe_c_fmt_f64(buf, 63, "%g", d);
+            out = out + pe_buf_str(buf);
+        }
+        i = i + 1;
+    }
+    return out + "]";
+}
+
+// ─── Dynamic loading: simulated, as in the C backend and interpreter ───
+
+var pert_dl_handles: i64 = 0;
+
+/// Sequential handles 1, 2, ...; 0 for an empty path.
+pub fn pert_dl_open(path: str) -> i64 {
+    if pe_str_is_null(path) || p_str_length(path) == 0 {
+        return 0;
+    }
+    pert_dl_handles = pert_dl_handles + 1;
+    return pert_dl_handles;
+}
+
+pub fn pert_dl_sym(handle: i64, symbol: str) -> i64 {
+    if handle == 0 || pe_str_is_null(symbol) || p_str_length(symbol) == 0 {
+        return 0;
+    }
+    return 4096 + handle * 256;
+}
+
+pub fn pert_dl_close(handle: i64) {
+}
+
+/// Simulated: the argument back.
+pub fn pert_dl_call(func: i64, arg: i64) -> i64 {
+    return arg;
+}
+
+// ─── Allocators: the general heap ───────────────────────────────────────
+
+pub fn pert_allocator_create(arg: i64) -> i64 {
+    return 1;
+}
+
+pub fn pert_allocator_alloc(alloc: i64, size: i64) -> i64 {
+    if size < 0 {
+        return 0;
+    }
+    return p_malloc(size);
+}
+
+pub fn pert_allocator_free(alloc: i64, ptr: i64) {
+    p_free(ptr);
+}
+
+pub fn pert_allocator_stats(alloc: i64) -> i64 {
+    return 0;
+}
+
+// ─── Entity-component store ─────────────────────────────────────────────
+// Per component name: a Vec of (entity, value) pairs, flattened.
+
+var pert_ecs_entities: i64 = 0;
+var pert_ecs_names: i64 = 0;
+var pert_ecs_tables: i64 = 0;
+
+/// The table of component `name`, created when `create` (else 0).
+fn pe_ecs_table(name: str, create: bool) -> i64 {
+    if pert_ecs_names == 0 {
+        pert_ecs_names = Vec_new();
+        pert_ecs_tables = Vec_new();
+    }
+    var i: i64 = 0;
+    while i < Vec_len(pert_ecs_names) {
+        if p_str_equal(Vec_get(pert_ecs_names, i), name) {
+            return Vec_get(pert_ecs_tables, i);
+        }
+        i = i + 1;
+    }
+    if !create {
+        return 0;
+    }
+    var table: i64 = Vec_new();
+    Vec_push(pert_ecs_names, pe_str_addr(name));
+    Vec_push(pert_ecs_tables, table);
+    return table;
+}
+
+pub fn pert_ecs_create_entity() -> i64 {
+    var e: i64 = pert_ecs_entities;
+    pert_ecs_entities = e + 1;
+    return e;
+}
+
+pub fn pert_ecs_entity_count() -> i64 {
+    return pert_ecs_entities;
+}
+
+pub fn pert_ecs_has(name: str, entity: i64) -> i64 {
+    var t: i64 = pe_ecs_table(name, false);
+    if t == 0 {
+        return 0;
+    }
+    var i: i64 = 0;
+    while i < Vec_len(t) {
+        if Vec_get(t, i) == entity {
+            return 1;
+        }
+        i = i + 2;
+    }
+    return 0;
+}
+
+pub fn pert_ecs_get(name: str, entity: i64) -> i64 {
+    var t: i64 = pe_ecs_table(name, false);
+    if t == 0 {
+        return 0;
+    }
+    var i: i64 = 0;
+    while i < Vec_len(t) {
+        if Vec_get(t, i) == entity {
+            return Vec_get(t, i + 1);
+        }
+        i = i + 2;
+    }
+    return 0;
+}
+
+/// Set the entity's value (a new entry, or the existing one updated).
+pub fn pert_ecs_add(name: str, entity: i64, value: i64) -> i64 {
+    var t: i64 = pe_ecs_table(name, true);
+    var i: i64 = 0;
+    while i < Vec_len(t) {
+        if Vec_get(t, i) == entity {
+            Vec_set(t, i + 1, value);
+            return 0;
+        }
+        i = i + 2;
+    }
+    Vec_push(t, entity);
+    Vec_push(t, value);
+    return 0;
+}
+
+/// Remove the entity's entry: the last entry takes its place.
+pub fn pert_ecs_remove(name: str, entity: i64) -> i64 {
+    var t: i64 = pe_ecs_table(name, false);
+    if t == 0 {
+        return 0;
+    }
+    var i: i64 = 0;
+    var n: i64 = Vec_len(t);
+    while i < n {
+        if Vec_get(t, i) == entity {
+            Vec_set(t, i, Vec_get(t, n - 2));
+            Vec_set(t, i + 1, Vec_get(t, n - 1));
+            Vec_pop(t);
+            Vec_pop(t);
+            return 0;
+        }
+        i = i + 2;
+    }
+    return 0;
+}

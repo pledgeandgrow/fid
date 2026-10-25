@@ -1419,7 +1419,8 @@ impl X86Encoder {
 
 // ─── Import table ───────────────────────────────────────────────────────
 
-/// Names of kernel32.dll functions we import
+/// Names of kernel32.dll functions we import (the first 13 have IAT_*
+/// constants; the rest are reached by name through `import_slot`).
 const IMPORTS: &[&str] = &[
     "GetStdHandle",
     "WriteFile",
@@ -1434,7 +1435,62 @@ const IMPORTS: &[&str] = &[
     "GetCommandLineA",
     "CreateProcessA",
     "WaitForSingleObject",
+    // Threads, locks, thread-local storage, clocks, files, libraries
+    "CreateThread",
+    "Sleep",
+    "GetTickCount64",
+    "QueryPerformanceCounter",
+    "QueryPerformanceFrequency",
+    "GetSystemTimeAsFileTime",
+    "DeleteFileA",
+    "GetFileAttributesA",
+    "InitializeSRWLock",
+    "AcquireSRWLockExclusive",
+    "ReleaseSRWLockExclusive",
+    "InitializeConditionVariable",
+    "SleepConditionVariableSRW",
+    "WakeConditionVariable",
+    "WakeAllConditionVariable",
+    "TlsAlloc",
+    "TlsGetValue",
+    "TlsSetValue",
+    "LoadLibraryA",
+    "GetProcAddress",
+    "FreeLibrary",
 ];
+
+/// msvcrt.dll functions: the C library behind `extern "C"` declarations
+/// (math.h, string.h, stdio.h, stdlib.h, ctype.h) and the Fides PE runtime
+/// (src/pe_runtime/). Every name here must be an msvcrt.dll export: the
+/// loader refuses to start a program importing one that is not.
+const MSVCRT_IMPORTS: &[&str] = &[
+    "sqrt", "pow", "floor", "ceil", "fabs", "fmod", "exp", "log", "log10",
+    "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh",
+    "strtod", "_strtoi64", "atof", "atoi", "atol",
+    "strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strcat", "strchr", "strstr",
+    "memcpy", "memmove", "memset", "memcmp",
+    "toupper", "tolower", "isalpha", "isdigit", "isspace", "isalnum",
+    "abs", "labs", "_abs64", "rand", "srand", "time", "clock",
+    "malloc", "calloc", "realloc", "free", "getenv", "exit", "qsort",
+    "_snprintf", "putchar", "puts", "getchar",
+    "fopen", "fclose", "fread", "fwrite", "fflush", "fgets", "fputs",
+    "fseek", "ftell", "_fseeki64", "remove", "rename", "_access",
+];
+
+/// The DLLs of the import table, in IAT order.
+const DLL_IMPORTS: [(&str, &[&str]); 2] = [("kernel32.dll", IMPORTS), ("msvcrt.dll", MSVCRT_IMPORTS)];
+
+/// The IAT slot of an imported function (an index into `iat_rdata_offsets`).
+fn import_slot(name: &str) -> Option<usize> {
+    let mut base = 0;
+    for (_, names) in DLL_IMPORTS.iter() {
+        if let Some(i) = names.iter().position(|n| *n == name) {
+            return Some(base + i);
+        }
+        base += names.len();
+    }
+    None
+}
 
 /// Build the .rdata section content: string constants + import table
 /// Returns (rdata_bytes, iat_offsets, import_dir_rva_offset)
@@ -1446,13 +1502,16 @@ struct RdataBuilder {
     import_dir_offset: usize,
     /// Offset of each string constant within .rdata
     string_offsets: HashMap<String, usize>,
-    /// Offset of ILT within .rdata
-    ilt_offset: usize,
-    /// Offset of IAT within .rdata
+    /// Offset of each DLL's ILT within .rdata
+    ilt_offsets: Vec<usize>,
+    /// Offset of the whole IAT within .rdata, and its size in bytes
     iat_offset: usize,
-    /// Offset of DLL name string within .rdata
-    dll_name_off: usize,
-    /// Offsets of IMAGE_IMPORT_BY_NAME entries within .rdata
+    iat_size: usize,
+    /// Offset of each DLL's part of the IAT within .rdata
+    dll_iat_offsets: Vec<usize>,
+    /// Offset of each DLL name string within .rdata
+    dll_name_offs: Vec<usize>,
+    /// Offsets of IMAGE_IMPORT_BY_NAME entries within .rdata (IAT order)
     import_by_name_offsets: Vec<usize>,
 }
 
@@ -1463,9 +1522,11 @@ impl RdataBuilder {
             iat_offsets: Vec::new(),
             import_dir_offset: 0,
             string_offsets: HashMap::new(),
-            ilt_offset: 0,
+            ilt_offsets: Vec::new(),
             iat_offset: 0,
-            dll_name_off: 0,
+            iat_size: 0,
+            dll_iat_offsets: Vec::new(),
+            dll_name_offs: Vec::new(),
             import_by_name_offsets: Vec::new(),
         }
     }
@@ -1497,19 +1558,24 @@ impl RdataBuilder {
         let _true_off = self.add_string("true");
         let _false_off = self.add_string("false");
 
-        // 3. DLL name
-        let dll_name_off = self.add_string("kernel32.dll");
+        // 3. DLL names
+        self.dll_name_offs = DLL_IMPORTS.iter().map(|(dll, _)| self.add_string(dll)).collect();
 
-        // 4. IMAGE_IMPORT_BY_NAME for each import
+        // 4. IMAGE_IMPORT_BY_NAME for each import, in IAT order
         // Each: 2-byte hint (0) + null-terminated name
         let mut import_by_name_offsets: Vec<usize> = Vec::new();
-        for name in IMPORTS {
-            let off = self.data.len();
-            self.data.push(0); // hint low
-            self.data.push(0); // hint high
-            self.data.extend_from_slice(name.as_bytes());
-            self.data.push(0); // null terminator
-            import_by_name_offsets.push(off);
+        for (_, names) in DLL_IMPORTS.iter() {
+            for name in names.iter() {
+                if self.data.len() % 2 != 0 {
+                    self.data.push(0); // entries are 2-byte aligned
+                }
+                let off = self.data.len();
+                self.data.push(0); // hint low
+                self.data.push(0); // hint high
+                self.data.extend_from_slice(name.as_bytes());
+                self.data.push(0); // null terminator
+                import_by_name_offsets.push(off);
+            }
         }
 
         // Align to 8 bytes for tables
@@ -1517,95 +1583,79 @@ impl RdataBuilder {
             self.data.push(0);
         }
 
-        // 5. Import Lookup Table (ILT) — 8-byte entries, null-terminated
-        let ilt_offset = self.data.len();
-        for &off in &import_by_name_offsets {
-            // RVA will be filled later; store placeholder
-            self.data.extend_from_slice(&0u64.to_le_bytes());
+        // 5. Import Lookup Tables (ILT), one per DLL — 8-byte entries,
+        //    null-terminated (RVAs filled in by patch_rvas)
+        self.ilt_offsets.clear();
+        for (_, names) in DLL_IMPORTS.iter() {
+            self.ilt_offsets.push(self.data.len());
+            for _ in names.iter() {
+                self.data.extend_from_slice(&0u64.to_le_bytes());
+            }
+            self.data.extend_from_slice(&0u64.to_le_bytes()); // null terminator
         }
-        self.data.extend_from_slice(&0u64.to_le_bytes()); // null terminator
 
-        // 6. Import Address Table (IAT) — 8-byte entries, null-terminated
-        let iat_offset = self.data.len();
+        // 6. Import Address Table (IAT): one null-terminated part per DLL,
+        //    contiguous, so a single data directory entry covers it
+        self.iat_offset = self.data.len();
         self.iat_offsets.clear();
-        for &off in &import_by_name_offsets {
-            let entry_offset = self.data.len();
-            self.iat_offsets.push(entry_offset);
-            // Store RVA to IMAGE_IMPORT_BY_NAME (placeholder, filled later)
-            self.data.extend_from_slice(&(off as u64).to_le_bytes());
+        self.dll_iat_offsets.clear();
+        let mut k = 0;
+        for (_, names) in DLL_IMPORTS.iter() {
+            self.dll_iat_offsets.push(self.data.len());
+            for _ in names.iter() {
+                self.iat_offsets.push(self.data.len());
+                // RVA to IMAGE_IMPORT_BY_NAME (placeholder, filled later)
+                self.data.extend_from_slice(&(import_by_name_offsets[k] as u64).to_le_bytes());
+                k += 1;
+            }
+            self.data.extend_from_slice(&0u64.to_le_bytes()); // null terminator
         }
-        self.data.extend_from_slice(&0u64.to_le_bytes()); // null terminator
+        self.iat_size = self.data.len() - self.iat_offset;
 
-        // 7. Import Directory Table — 20-byte entries, null-terminated
-        while self.data.len() % 4 != 0 {
-            self.data.push(0);
-        }
-        self.import_dir_offset = self.data.len();
-
-        // IMAGE_IMPORT_DESCRIPTOR (20 bytes)
+        // 7. Import Directory Table — one 20-byte IMAGE_IMPORT_DESCRIPTOR
+        //    per DLL, then a null one:
         // OriginalFirstThunk (4): RVA to ILT
         // TimeDateStamp (4): 0
         // ForwarderChain (4): 0
         // Name (4): RVA to DLL name
         // FirstThunk (4): RVA to IAT
-        // Store placeholders (RVAs filled later)
-        self.data.extend_from_slice(&0u32.to_le_bytes()); // OriginalFirstThunk
-        self.data.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
-        self.data.extend_from_slice(&0u32.to_le_bytes()); // ForwarderChain
-        self.data.extend_from_slice(&0u32.to_le_bytes()); // Name RVA
-        self.data.extend_from_slice(&0u32.to_le_bytes()); // FirstThunk
+        // (placeholders; RVAs filled in by patch_rvas)
+        while self.data.len() % 4 != 0 {
+            self.data.push(0);
+        }
+        self.import_dir_offset = self.data.len();
+        for _ in DLL_IMPORTS.iter() {
+            self.data.extend_from_slice(&[0u8; 20]);
+        }
+        self.data.extend_from_slice(&[0u8; 20]); // null terminator descriptor
 
-        // Null terminator descriptor (20 bytes of zeros)
-        self.data.extend_from_slice(&[0u8; 20]);
-
-        // Store offsets for later RVA patching
-        // We'll store them as instance fields accessed during finalization
-        self.ilt_offset = ilt_offset;
-        self.iat_offset = iat_offset;
-        self.dll_name_off = dll_name_off;
         self.import_by_name_offsets = import_by_name_offsets;
     }
 
     /// Patch RVAs in the import table now that we know the .rdata RVA
     fn patch_rvas(&mut self, rdata_rva: u32) {
-        // Patch ILT entries: each 8-byte entry = RVA to IMAGE_IMPORT_BY_NAME
-        for (i, &off) in self.import_by_name_offsets.iter().enumerate() {
-            let ilt_entry = self.ilt_offset + i * 8;
-            let rva = rdata_rva + off as u32;
-            let bytes = rva.to_le_bytes();
-            for (j, &b) in bytes.iter().enumerate() {
-                self.data[ilt_entry + j] = b;
+        fn put_u32(data: &mut [u8], at: usize, v: u32) {
+            data[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let mut k = 0;
+        for (d, (_, names)) in DLL_IMPORTS.iter().enumerate() {
+            // ILT and IAT entries: RVAs to IMAGE_IMPORT_BY_NAME
+            for j in 0..names.len() {
+                let rva = rdata_rva + self.import_by_name_offsets[k] as u32;
+                let ilt_entry = self.ilt_offsets[d] + j * 8;
+                let iat_entry = self.dll_iat_offsets[d] + j * 8;
+                put_u32(&mut self.data, ilt_entry, rva);
+                put_u32(&mut self.data, iat_entry, rva);
+                k += 1;
             }
-        }
-
-        // Patch IAT entries: same as ILT (RVAs to IMAGE_IMPORT_BY_NAME)
-        for (i, &off) in self.import_by_name_offsets.iter().enumerate() {
-            let iat_entry = self.iat_offset + i * 8;
-            let rva = rdata_rva + off as u32;
-            let bytes = rva.to_le_bytes();
-            for (j, &b) in bytes.iter().enumerate() {
-                self.data[iat_entry + j] = b;
-            }
-        }
-
-        // Patch import descriptor
-        let dir = self.import_dir_offset;
-        let ilt_rva = rdata_rva + self.ilt_offset as u32;
-        let iat_rva = rdata_rva + self.iat_offset as u32;
-        let name_rva = rdata_rva + self.dll_name_off as u32;
-
-        let bytes = ilt_rva.to_le_bytes();
-        for (j, &b) in bytes.iter().enumerate() {
-            self.data[dir + j] = b;
-        }
-        // TimeDateStamp and ForwarderChain are already 0
-        let name_bytes = name_rva.to_le_bytes();
-        for (j, &b) in name_bytes.iter().enumerate() {
-            self.data[dir + 12 + j] = b;
-        }
-        let iat_bytes = iat_rva.to_le_bytes();
-        for (j, &b) in iat_bytes.iter().enumerate() {
-            self.data[dir + 16 + j] = b;
+            // Import descriptor (TimeDateStamp and ForwarderChain stay 0)
+            let dir = self.import_dir_offset + d * 20;
+            let ilt_rva = rdata_rva + self.ilt_offsets[d] as u32;
+            let name_rva = rdata_rva + self.dll_name_offs[d] as u32;
+            let iat_rva = rdata_rva + self.dll_iat_offsets[d] as u32;
+            put_u32(&mut self.data, dir, ilt_rva);
+            put_u32(&mut self.data, dir + 12, name_rva);
+            put_u32(&mut self.data, dir + 16, iat_rva);
         }
     }
 }
@@ -1871,6 +1921,56 @@ struct PeCodeGen {
     /// Called functions that neither the program nor this runtime defines,
     /// with the functions that call them
     unresolved: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// The program's Fides functions (they take `__env` first)
+    module_fns: std::collections::BTreeSet<String>,
+    /// `extern "C"` functions called through the import table
+    c_thunks: Vec<CThunk>,
+    /// `extern "C"` functions of a missing local header: stubs returning 0
+    stub_externs: Vec<String>,
+    /// `extern "C"` functions the Fides runtime replaces (see c_override)
+    c_overrides: std::collections::BTreeMap<String, String>,
+    /// Functions a program refers to by name (thread and task entry points):
+    /// what `pe_fn_lookup` can find
+    named_fns: Vec<String>,
+}
+
+/// An `extern "C"` function of msvcrt.dll or kernel32.dll: called through a
+/// thunk that moves Fides arguments (all in integer registers, floats as
+/// raw bits) into the Windows x64 C convention, and the result back.
+struct CThunk {
+    name: String,
+    slot: usize,
+    params: Vec<IrType>,
+    ret: IrType,
+}
+
+/// Machine-code primitives of the Fides PE runtime (src/pe_runtime/), which
+/// declares them `extern "C"`: called without `__env`, arguments from rcx.
+const PE_PRIMITIVES: &[&str] = &[
+    "pe_atomic_load", "pe_atomic_store", "pe_atomic_add", "pe_atomic_cas",
+    "pe_f64_to_bits", "pe_bits_to_f64", "pe_f64_to_f32_bits", "pe_f32_bits_to_f64",
+    "pe_fn_lookup", "pe_call_fn",
+];
+
+/// Machine code that only exists with the Fides function it hands over to:
+/// (stub, Fides runtime function).
+const PE_STUB_DEPS: &[(&str, &str)] = &[
+    // p_thread_spawn(name, nargs, ...): varargs, captured into an array
+    ("p_thread_spawn", "pert_thread_spawn_v"),
+    ("p_executor_spawn", "pert_executor_spawn_v"),
+    // The C-convention thread start routine runs pert_thread_main(arg)
+    ("pe_thread_entry_addr", "pert_thread_main"),
+];
+
+/// A function of the Fides PE runtime (src/pe_runtime/): builtins `pert_*`
+/// and the helpers of each file (`pe_*`, `pet_*` tensors, `ped_*` data).
+fn is_pe_runtime_fn(name: &str) -> bool {
+    ["pert_", "pe_", "pet_", "ped_"].iter().any(|p| name.starts_with(p))
+}
+
+/// The Fides runtime's stand-in for runtime builtin `p_X` / `__X`: `pert_X`.
+fn pert_name(name: &str) -> Option<String> {
+    name.strip_prefix("p_").or_else(|| name.strip_prefix("__")).map(|rest| format!("pert_{}", rest))
 }
 
 impl PeCodeGen {
@@ -1887,7 +1987,41 @@ impl PeCodeGen {
             cur_func: String::new(),
             dyn_type_ids: std::collections::BTreeMap::new(),
             unresolved: std::collections::BTreeMap::new(),
+            module_fns: std::collections::BTreeSet::new(),
+            c_thunks: Vec::new(),
+            stub_externs: Vec::new(),
+            c_overrides: std::collections::BTreeMap::new(),
+            named_fns: Vec::new(),
         }
+    }
+
+    /// The function a call to `name` runs: a `pe_runtime_alias`, the Fides
+    /// runtime's `pert_X` for builtin `p_X` (it replaces a machine-code stub
+    /// of the same builtin), else `name` (a stub, a thunk, a program function).
+    fn resolve_call(&self, name: &str) -> String {
+        if let Some(over) = self.c_overrides.get(name) {
+            return over.clone();
+        }
+        let alias = pe_runtime_alias(name);
+        if alias != name {
+            return alias.to_string();
+        }
+        pert_name(name).filter(|p| self.module_fns.contains(p)).unwrap_or_else(|| name.to_string())
+    }
+
+    /// Call runtime builtin `name` with `nargs` (at most 3) arguments already
+    /// in rcx, rdx, r8. A Fides stand-in takes `__env` first: the arguments
+    /// move up one register and rcx gets a null environment.
+    fn call_builtin(&mut self, name: &str, nargs: usize) {
+        let target = self.resolve_call(name);
+        if self.module_fns.contains(&target) && !self.module_fns.contains(name) {
+            debug_assert!(nargs <= 3);
+            if nargs > 2 { self.enc.mov_rr(Reg::R9, Reg::R8); }
+            if nargs > 1 { self.enc.mov_rr(Reg::R8, Reg::Rdx); }
+            if nargs > 0 { self.enc.mov_rr(Reg::Rdx, Reg::Rcx); }
+            self.enc.xor_rr(Reg::Rcx, Reg::Rcx);
+        }
+        self.call_runtime(&target);
     }
 
     /// Generate the complete PE file from an IR module
@@ -2014,16 +2148,84 @@ impl PeCodeGen {
             self.func_labels.insert(stub.to_string(), label);
         }
 
-        // 4. Generate code for each function (sorted for deterministic layout)
+        // 3b. The Fides runtime (src/pe_runtime/): its machine-code
+        //     primitives, the stubs that hand over to it, and every
+        //     `extern "C"` function of msvcrt.dll / kernel32.dll (a thunk each)
+        self.module_fns = module.functions.keys().cloned().collect();
+        for prim in PE_PRIMITIVES {
+            let label = self.enc.alloc_label();
+            self.func_labels.insert(prim.to_string(), label);
+        }
+        // (only those the program reaches: the runtime function they hand
+        // over to is left out otherwise)
+        let needed = needed_functions(module);
+        for (stub, dep) in PE_STUB_DEPS {
+            if self.module_fns.contains(*dep) && needed.contains(*stub) {
+                let label = self.enc.alloc_label();
+                self.func_labels.insert(stub.to_string(), label);
+            }
+        }
+        for ext in &module.extern_decls {
+            if self.func_labels.contains_key(&ext.pledge_name) {
+                continue;
+            }
+            if let Some(over) = c_override(module, &ext.pledge_name) {
+                self.c_overrides.insert(ext.pledge_name.clone(), over);
+                continue;
+            }
+            // `fn pe_f64_to_bits as pe_f32_raw(x: f32) -> i64`: another name
+            // (and Fides type) for a primitive
+            if let Some(&label) = PE_PRIMITIVES.contains(&ext.c_name.as_str()).then(|| &self.func_labels[&ext.c_name]) {
+                self.func_labels.insert(ext.pledge_name.clone(), label);
+                continue;
+            }
+            if let (Some(slot), Some((params, ret))) = (import_slot(&ext.c_name), module.extern_functions.get(&ext.pledge_name)) {
+                let label = self.enc.alloc_label();
+                self.func_labels.insert(ext.pledge_name.clone(), label);
+                self.c_thunks.push(CThunk { name: ext.pledge_name.clone(), slot, params: params.clone(), ret: ret.clone() });
+                continue;
+            }
+            // As in the C backend: the functions of a local header that does
+            // not exist (`include "pledge_audio.h"`) are stubs returning 0
+            let missing_local_header = ext.include.as_ref().map_or(false, |inc| {
+                !inc.starts_with('<') && !std::path::Path::new(inc.trim_matches(|c| c == '"' || c == '<' || c == '>')).exists()
+            });
+            if missing_local_header {
+                let label = self.enc.alloc_label();
+                self.func_labels.insert(ext.pledge_name.clone(), label);
+                self.stub_externs.push(ext.pledge_name.clone());
+            }
+        }
+        // Functions named by a string constant can be looked up by name
+        self.named_fns = all_strings.iter()
+            .filter(|s| self.module_fns.contains(*s) && !is_pe_runtime_fn(s))
+            .cloned()
+            .collect();
+
+        // 4. Generate code for each function (sorted for deterministic layout);
+        //    of the Fides runtime only what the program uses
         let mut func_names: Vec<String> = module.functions.keys().cloned().collect();
         func_names.sort();
         for name in &func_names {
+            if is_pe_runtime_fn(name) && !needed.contains(name) {
+                continue;
+            }
             let func = &module.functions[name];
             self.gen_function(name, func, module);
         }
 
         // 5. Generate runtime stubs
         self.gen_runtime_stubs();
+        self.gen_pe_primitives();
+        let thunks = std::mem::take(&mut self.c_thunks);
+        for t in &thunks {
+            self.gen_c_thunk(t);
+        }
+        for name in std::mem::take(&mut self.stub_externs) {
+            self.place_fn(&name);
+            self.enc.xor_rr(Reg::Rax, Reg::Rax);
+            self.enc.ret();
+        }
 
         // 6. Generate entry point (_main)
         self.gen_entry_point();
@@ -2043,7 +2245,7 @@ impl PeCodeGen {
         // 11. Calculate PE metadata
         let import_dir_rva = rdata_rva + rdata.import_dir_offset as u32;
         let iat_rva = rdata_rva + rdata.iat_offset as u32;
-        let iat_size = (IMPORTS.len() + 1) as u32 * 8; // entries + null terminator
+        let iat_size = rdata.iat_size as u32; // every DLL's entries + null terminators
         let entry_rva = TEXT_RVA + self.entry_offset as u32;
 
         // 12. Build PE file
@@ -3196,8 +3398,12 @@ impl PeCodeGen {
             Inst::BinOp { op, left, right, ty } => {
                 let loff = frame.offset(*left) as i32;
                 let roff = frame.offset(*right) as i32;
+                // A comparison's type is Bool: its operands' type decides
+                let operand_ty = func.values.get(left).map(|m| m.ty.clone()).unwrap_or(IrType::I64);
                 if ty.is_float() {
                     self.gen_float_binop(op, loff, roff, dst, ty);
+                } else if operand_ty.is_float() {
+                    self.gen_float_binop(op, loff, roff, dst, &operand_ty);
                 } else {
                     self.gen_int_binop(op, loff, roff, dst);
                 }
@@ -3248,20 +3454,34 @@ impl PeCodeGen {
             Inst::Load { ptr, ty } => {
                 let poff = frame.offset(*ptr) as i32;
                 let size = module.type_size(ty).max(1);
+                // Unsigned values zero-extend (a u8 255 stays 255), as in C
+                let unsigned = matches!(ty, IrType::U8 | IrType::U16 | IrType::U32 | IrType::Bool);
                 self.enc.mov_reg_mem_rbp(Reg::Rax, poff);
                 match size {
                     1 => {
-                        // movzx eax, byte [rax] then sign-extend
+                        // mov al, [rax] (the rest of rax still holds the
+                        // address), then extend al over all of rax
                         self.enc.mov_reg8_ptr(Reg::Rax, Reg::Rax);
-                        self.enc.movsx_r64_r8(Reg::Rax, Reg::Rax);
+                        if unsigned {
+                            self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
+                        } else {
+                            self.enc.movsx_r64_r8(Reg::Rax, Reg::Rax);
+                        }
                     }
                     2 => {
                         self.enc.mov_reg16_ptr(Reg::Rax, Reg::Rax);
-                        self.enc.movsx_r64_r16(Reg::Rax, Reg::Rax);
+                        if unsigned {
+                            self.enc.movzx_r32_r16(Reg::Rax, Reg::Rax);
+                        } else {
+                            self.enc.movsx_r64_r16(Reg::Rax, Reg::Rax);
+                        }
                     }
                     4 => {
+                        // mov eax, [rax] zero-extends into rax
                         self.enc.mov_reg32_ptr(Reg::Rax, Reg::Rax);
-                        self.enc.movsxd_rr(Reg::Rax, Reg::Rax);
+                        if !unsigned {
+                            self.enc.movsxd_rr(Reg::Rax, Reg::Rax);
+                        }
                     }
                     _ => {
                         self.enc.mov_reg_ptr(Reg::Rax, Reg::Rax);
@@ -3422,46 +3642,24 @@ impl PeCodeGen {
 
             // ─── Function Calls ───
             Inst::Call { func: call_name, args, .. } => {
-                // SIMD intrinsics: emit hardware SSE2 instructions instead of calls
-                if call_name == "p_simd_add" && args.len() == 2 {
-                    let a_off = frame.offset(args[0]) as i32;
-                    let b_off = frame.offset(args[1]) as i32;
-                    // Load a into xmm0, load b into xmm1, addpd xmm0, xmm1, store xmm0
-                    self.enc.movapd_rbp_reg(XmmReg::Xmm0, a_off);
-                    self.enc.movapd_rbp_reg(XmmReg::Xmm1, b_off);
-                    self.enc.addpd_rr(XmmReg::Xmm0, XmmReg::Xmm1);
-                    self.enc.movapd_mem_rbp(dst, XmmReg::Xmm0);
-                    return;
-                }
-                if call_name == "p_simd_sub" && args.len() == 2 {
-                    let a_off = frame.offset(args[0]) as i32;
-                    let b_off = frame.offset(args[1]) as i32;
-                    self.enc.movapd_rbp_reg(XmmReg::Xmm0, a_off);
-                    self.enc.movapd_rbp_reg(XmmReg::Xmm1, b_off);
-                    self.enc.subpd_rr(XmmReg::Xmm0, XmmReg::Xmm1);
-                    self.enc.movapd_mem_rbp(dst, XmmReg::Xmm0);
-                    return;
-                }
-                if call_name == "p_simd_mul" && args.len() == 2 {
-                    let a_off = frame.offset(args[0]) as i32;
-                    let b_off = frame.offset(args[1]) as i32;
-                    self.enc.movapd_rbp_reg(XmmReg::Xmm0, a_off);
-                    self.enc.movapd_rbp_reg(XmmReg::Xmm1, b_off);
-                    self.enc.mulpd_rr(XmmReg::Xmm0, XmmReg::Xmm1);
-                    self.enc.movapd_mem_rbp(dst, XmmReg::Xmm0);
-                    return;
-                }
-                if call_name == "p_simd_div" && args.len() == 2 {
-                    let a_off = frame.offset(args[0]) as i32;
-                    let b_off = frame.offset(args[1]) as i32;
-                    self.enc.movapd_rbp_reg(XmmReg::Xmm0, a_off);
-                    self.enc.movapd_rbp_reg(XmmReg::Xmm1, b_off);
-                    self.enc.divpd_rr(XmmReg::Xmm0, XmmReg::Xmm1);
-                    self.enc.movapd_mem_rbp(dst, XmmReg::Xmm0);
-                    return;
+                // print(tensor): the runtime formats it, then the string prints
+                if call_name == "print" {
+                    if let Some(arg) = args.first() {
+                        if func.values.get(arg).map_or(false, |m| m.ty.is_opaque_named("Tensor")) {
+                            let aoff = frame.offset(*arg) as i32;
+                            self.enc.sub_rsp_i32(32);
+                            self.enc.mov_reg_mem_rbp(Reg::Rcx, aoff);
+                            self.call_builtin("p_tensor_to_str", 1);
+                            self.enc.mov_rr(Reg::Rcx, Reg::Rax);
+                            self.call_runtime("p_print_str");
+                            self.enc.add_rsp_i32(32);
+                            self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
+                            return;
+                        }
+                    }
                 }
 
-                let target_func = if call_name == "print" {
+                let target_func: String = if call_name == "print" {
                     if let Some(arg) = args.first() {
                         let arg_ty = func.values.get(arg).map(|m| &m.ty);
                         match arg_ty {
@@ -3474,7 +3672,7 @@ impl PeCodeGen {
                         }
                     } else {
                         "p_print_int"
-                    }
+                    }.to_string()
                 } else if call_name == "p_to_str" {
                     if let Some(arg) = args.first() {
                         let arg_ty = func.values.get(arg).map(|m| &m.ty);
@@ -3487,29 +3685,42 @@ impl PeCodeGen {
                         }
                     } else {
                         "p_to_str"
-                    }
+                    }.to_string()
                 } else {
-                    pe_runtime_alias(call_name)
+                    call_name.to_string()
                 };
+                let target_func = self.resolve_call(&target_func);
+                let target_func = target_func.as_str();
+
+                // A Fides function standing in for a runtime builtin (called
+                // without one) takes a null `__env` first
+                let mut call_args: Vec<Option<ValueId>> = args.iter().map(|a| Some(*a)).collect();
+                if self.module_fns.contains(target_func) && !self.module_fns.contains(call_name.as_str()) {
+                    call_args.insert(0, None);
+                }
 
                 let arg_regs = [Reg::Rcx, Reg::Rdx, Reg::R8, Reg::R9];
-                let stack_args = if args.len() > 4 { args.len() - 4 } else { 0 };
+                let stack_args = if call_args.len() > 4 { call_args.len() - 4 } else { 0 };
                 let call_space = ((32 + stack_args * 8 + 15) & !15) as i32;
 
                 // Load args into registers
-                for (i, arg) in args.iter().enumerate() {
+                for (i, arg) in call_args.iter().enumerate() {
                     if i < 4 {
-                        let aoff = frame.offset(*arg) as i32;
-                        self.enc.mov_reg_mem_rbp(arg_regs[i], aoff);
+                        match arg {
+                            Some(a) => self.enc.mov_reg_mem_rbp(arg_regs[i], frame.offset(*a) as i32),
+                            None => self.enc.xor_rr(arg_regs[i], arg_regs[i]),
+                        }
                     }
                 }
 
                 self.enc.sub_rsp_i32(call_space);
                 // Place stack args
-                for (i, arg) in args.iter().enumerate().skip(4) {
-                    let aoff = frame.offset(*arg) as i32;
+                for (i, arg) in call_args.iter().enumerate().skip(4) {
                     let stack_pos = 32 + ((i - 4) as i32) * 8;
-                    self.enc.mov_reg_mem_rbp(Reg::Rax, aoff);
+                    match arg {
+                        Some(a) => self.enc.mov_reg_mem_rbp(Reg::Rax, frame.offset(*a) as i32),
+                        None => self.enc.xor_rr(Reg::Rax, Reg::Rax),
+                    }
                     self.enc.mov_mem_disp_reg(Reg::Rsp, stack_pos, Reg::Rax);
                 }
 
@@ -3715,12 +3926,11 @@ impl PeCodeGen {
                     let print_fn = match ty {
                         IrType::Ptr(_) => "p_print_str",
                         IrType::Opaque(n) if n == "String" => "p_print_str",
-                        IrType::Opaque(n) if n == "Tensor" => "p_tensor_to_str",
                         IrType::F64 | IrType::F32 => "p_print_float",
                         IrType::Bool => "p_print_bool",
                         _ => "p_print_int",
                     };
-                    self.call_runtime(print_fn);
+                    self.call_builtin(print_fn, 1);
                 }
                 self.enc.add_rsp_i32(32);
             }
@@ -3735,8 +3945,17 @@ impl PeCodeGen {
             Inst::PersistSave { .. } => {
                 // No-op in PE emitter
             }
-            Inst::TxnBegin | Inst::TxnEnd | Inst::UnsafeBegin | Inst::UnsafeEnd | Inst::GradBegin { .. } | Inst::GradEnd | Inst::Backward { .. } => {
+            Inst::TxnBegin | Inst::TxnEnd | Inst::UnsafeBegin | Inst::UnsafeEnd => {
                 // No-op in PE emitter (rollback/unsafe not supported)
+            }
+            Inst::GradBegin { .. } | Inst::GradEnd | Inst::Backward { .. } => {
+                // Autograd, as in the C backend: start/stop recording the
+                // tape, run the backward pass (loss argument: NULL)
+                let builtin = autograd_builtin(inst);
+                self.enc.sub_rsp_i32(32);
+                self.enc.xor_rr(Reg::Rcx, Reg::Rcx);
+                self.call_builtin(builtin, if matches!(inst, Inst::Backward { .. }) { 1 } else { 0 });
+                self.enc.add_rsp_i32(32);
             }
             Inst::Panic { message } => {
                 let off = self.str_off(message);
@@ -3843,107 +4062,66 @@ impl PeCodeGen {
 
     /// Generate float binary operation
     fn gen_float_binop(&mut self, op: &BinOp, loff: i32, roff: i32, dst: i32, ty: &IrType) {
-        if *ty == IrType::F32 {
+        let f32 = *ty == IrType::F32;
+        if f32 {
             self.enc.movss_xmm_mem_rbp(0, loff);
             self.enc.movss_xmm_mem_rbp(1, roff);
-            match op {
-                BinOp::Add => self.enc.addss(0, 1),
-                BinOp::Sub => self.enc.subss(0, 1),
-                BinOp::Mul => self.enc.mulss(0, 1),
-                BinOp::Div => self.enc.divss(0, 1),
-                BinOp::Eq => {
-                    self.enc.ucomiss(0, 1);
-                    self.enc.setcc_r(0x4, Reg::Rax);
-                    self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
-                }
-                BinOp::Neq => {
-                    self.enc.ucomiss(0, 1);
-                    self.enc.setcc_r(0x5, Reg::Rax);
-                    self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
-                }
-                BinOp::Lt => {
-                    self.enc.ucomiss(0, 1);
-                    self.enc.setcc_r(0x2, Reg::Rax); // setb
-                    self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
-                }
-                BinOp::Gt => {
-                    self.enc.ucomiss(1, 0);
-                    self.enc.setcc_r(0x2, Reg::Rax); // setb
-                    self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
-                }
-                BinOp::LtEq => {
-                    self.enc.ucomiss(0, 1);
-                    self.enc.setcc_r(0x6, Reg::Rax); // setbe
-                    self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
-                }
-                BinOp::GtEq => {
-                    self.enc.ucomiss(1, 0);
-                    self.enc.setcc_r(0x6, Reg::Rax); // setbe
-                    self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
-                }
-                _ => {}
-            }
-            match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
-                    self.enc.movss_mem_rbp_xmm(dst, 0);
-                }
-                _ => {
-                    self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
-                }
-            }
         } else {
-            // F64
             self.enc.movsd_xmm_mem_rbp(0, loff);
             self.enc.movsd_xmm_mem_rbp(1, roff);
-            match op {
-                BinOp::Add => self.enc.addsd(0, 1),
-                BinOp::Sub => self.enc.subsd(0, 1),
-                BinOp::Mul => self.enc.mulsd(0, 1),
-                BinOp::Div => self.enc.divsd(0, 1),
-                BinOp::Eq => {
-                    self.enc.ucomisd(0, 1);
-                    self.enc.setcc_r(0x4, Reg::Rax);
-                    self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
+        }
+        match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                match (op, f32) {
+                    (BinOp::Add, true) => self.enc.addss(0, 1),
+                    (BinOp::Sub, true) => self.enc.subss(0, 1),
+                    (BinOp::Mul, true) => self.enc.mulss(0, 1),
+                    (BinOp::Div, true) => self.enc.divss(0, 1),
+                    (BinOp::Add, false) => self.enc.addsd(0, 1),
+                    (BinOp::Sub, false) => self.enc.subsd(0, 1),
+                    (BinOp::Mul, false) => self.enc.mulsd(0, 1),
+                    _ => self.enc.divsd(0, 1),
                 }
-                BinOp::Neq => {
-                    self.enc.ucomisd(0, 1);
-                    self.enc.setcc_r(0x5, Reg::Rax);
-                    self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
-                }
-                BinOp::Lt => {
-                    self.enc.ucomisd(0, 1);
-                    self.enc.setcc_r(0x2, Reg::Rax); // setb
-                    self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
-                }
-                BinOp::Gt => {
-                    self.enc.ucomisd(1, 0);
-                    self.enc.setcc_r(0x2, Reg::Rax); // setb
-                    self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
-                }
-                BinOp::LtEq => {
-                    self.enc.ucomisd(0, 1);
-                    self.enc.setcc_r(0x6, Reg::Rax); // setbe
-                    self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
-                }
-                BinOp::GtEq => {
-                    self.enc.ucomisd(1, 0);
-                    self.enc.setcc_r(0x6, Reg::Rax); // setbe
-                    self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
-                }
-                _ => {}
-            }
-            match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                if f32 {
+                    self.enc.movss_mem_rbp_xmm(dst, 0);
+                } else {
                     self.enc.movsd_mem_rbp_xmm(dst, 0);
                 }
-                _ => {
-                    self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
-                }
             }
+            BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
+                // IEEE: every comparison with NaN is false, except !=. An
+                // unordered ucomis sets ZF, PF and CF, so: a < b is b > a
+                // (seta: CF = ZF = 0), a <= b is b >= a (setae: CF = 0), and
+                // == / != also look at PF.
+                let (a, b) = match op {
+                    BinOp::Lt | BinOp::LtEq => (1, 0),
+                    _ => (0, 1),
+                };
+                if f32 {
+                    self.enc.ucomiss(a, b);
+                } else {
+                    self.enc.ucomisd(a, b);
+                }
+                match op {
+                    BinOp::Eq => {
+                        self.enc.setcc_r(0x4, Reg::Rax); // sete al
+                        self.enc.setcc_r(0xB, Reg::Rcx); // setnp cl
+                        self.enc.emit(&[0x20, 0xC8]);     // and al, cl
+                    }
+                    BinOp::Neq => {
+                        self.enc.setcc_r(0x5, Reg::Rax); // setne al
+                        self.enc.setcc_r(0xA, Reg::Rcx); // setp cl
+                        self.enc.emit(&[0x08, 0xC8]);     // or al, cl
+                    }
+                    BinOp::Lt | BinOp::Gt => self.enc.setcc_r(0x7, Reg::Rax), // seta
+                    _ => self.enc.setcc_r(0x3, Reg::Rax),                      // setae
+                }
+                self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
+                self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
+            }
+            _ => {}
         }
     }
-
-    /// Generate runtime stubs — direct Windows API calls through IAT
     fn gen_runtime_stubs(&mut self) {
         if self.bare_mode {
             // In bare-metal mode, skip runtime stubs that depend on OS calls
@@ -4031,6 +4209,13 @@ impl PeCodeGen {
         self.gen_gdt_stubs();
         // User-mode transition stub
         self.gen_enter_user_mode();
+        // Serial port: no port I/O in a Windows process. As in the C backend,
+        // init and write do nothing, read and ready return 0.
+        for stub in ["p_serial_init", "p_serial_write", "p_serial_read", "p_serial_ready"] {
+            self.place_fn(stub);
+            self.enc.xor_rr(Reg::Rax, Reg::Rax);
+            self.enc.ret();
+        }
         // Native runtime stubs: argv, process exec
         self.gen_argc();
         self.gen_argv();
@@ -5682,6 +5867,205 @@ impl PeCodeGen {
         }
     }
 
+    /// Place the label of function `name` (16-byte aligned).
+    fn place_fn(&mut self, name: &str) {
+        let label = self.func_labels[name];
+        self.enc.align_to(16);
+        self.enc.place_label(label);
+    }
+
+    /// A thunk from the Fides convention (arguments in rcx, rdx, r8, r9 and
+    /// then the stack, floats as raw bits in integer registers, the result
+    /// in rax) to a C function of the import table (float arguments in
+    /// xmm0-3, a float result in xmm0, an `int` result in eax).
+    fn gen_c_thunk(&mut self, t: &CThunk) {
+        self.place_fn(&t.name);
+        let stack_args = t.params.len().saturating_sub(4) as i32;
+        // On entry rsp = 8 (mod 16): the frame realigns it for the call
+        let mut frame = 32 + 8 * stack_args;
+        if frame % 16 == 0 {
+            frame += 8;
+        }
+        self.enc.sub_rsp_i32(frame);
+        for i in 0..stack_args {
+            // The caller's fifth and later arguments: above our frame and
+            // the return address, past the caller's 32-byte shadow space
+            self.enc.mov_reg_mem_disp(Reg::Rax, Reg::Rsp, frame + 8 + 32 + 8 * i);
+            self.enc.mov_mem_disp_reg(Reg::Rsp, 32 + 8 * i, Reg::Rax);
+        }
+        let regs = [Reg::Rcx, Reg::Rdx, Reg::R8, Reg::R9];
+        for (i, ty) in t.params.iter().enumerate().take(4) {
+            match ty {
+                // The integer register keeps its copy: a variadic function
+                // (_snprintf) reads a double from there
+                IrType::F64 => self.enc.movq_xmm_r64(i as u8, regs[i]),
+                IrType::F32 => {
+                    // movd xmm_i, r32
+                    self.enc.emit_u8(0x66);
+                    if regs[i].is_extended() {
+                        self.enc.emit_u8(0x41);
+                    }
+                    self.enc.emit(&[0x0F, 0x6E]);
+                    self.enc.modrm(0b11, i as u8, regs[i].code());
+                }
+                _ => {}
+            }
+        }
+        self.enc.call_rip(self.iat_off(t.slot));
+        match &t.ret {
+            IrType::F64 => self.enc.emit(&[0x66, 0x48, 0x0F, 0x7E, 0xC0]), // movq rax, xmm0
+            IrType::F32 => self.enc.emit(&[0x66, 0x0F, 0x7E, 0xC0]),       // movd eax, xmm0
+            IrType::I32 => self.enc.emit(&[0x48, 0x63, 0xC0]),             // movsxd rax, eax
+            IrType::U32 => self.enc.emit(&[0x89, 0xC0]),                   // mov eax, eax
+            IrType::I16 => self.enc.emit(&[0x48, 0x0F, 0xBF, 0xC0]),       // movsx rax, ax
+            IrType::U16 => self.enc.emit(&[0x0F, 0xB7, 0xC0]),             // movzx eax, ax
+            IrType::I8 => self.enc.emit(&[0x48, 0x0F, 0xBE, 0xC0]),        // movsx rax, al
+            IrType::U8 => self.enc.emit(&[0x0F, 0xB6, 0xC0]),              // movzx eax, al
+            // A C truth value is any non-zero int
+            IrType::Bool => self.enc.emit(&[0x85, 0xC0, 0x0F, 0x95, 0xC0, 0x0F, 0xB6, 0xC0]),
+            _ => {}
+        }
+        self.enc.add_rsp_i32(frame);
+        self.enc.ret();
+    }
+
+    /// The machine-code primitives of the Fides PE runtime (PE_PRIMITIVES),
+    /// and the stubs that hand over to it (PE_STUB_DEPS).
+    fn gen_pe_primitives(&mut self) {
+        // pe_atomic_load(addr) -> i64: an aligned 8-byte load is atomic
+        self.place_fn("pe_atomic_load");
+        self.enc.emit(&[0x48, 0x8B, 0x01, 0xC3]); // mov rax, [rcx]; ret
+        // pe_atomic_store(addr, v): xchg locks and is a full barrier
+        self.place_fn("pe_atomic_store");
+        self.enc.emit(&[0x48, 0x87, 0x11, 0xC3]); // xchg [rcx], rdx; ret
+        // pe_atomic_add(addr, v) -> previous value
+        self.place_fn("pe_atomic_add");
+        self.enc.emit(&[0x48, 0x89, 0xD0]);       // mov rax, rdx
+        self.enc.emit(&[0xF0, 0x48, 0x0F, 0xC1, 0x01, 0xC3]); // lock xadd [rcx], rax; ret
+        // pe_atomic_cas(addr, expected, new) -> bool (swapped)
+        self.place_fn("pe_atomic_cas");
+        self.enc.emit(&[0x48, 0x89, 0xD0]);       // mov rax, rdx
+        self.enc.emit(&[0xF0, 0x4C, 0x0F, 0xB1, 0x01]); // lock cmpxchg [rcx], r8
+        self.enc.emit(&[0x0F, 0x94, 0xC0, 0x0F, 0xB6, 0xC0, 0xC3]); // sete al; movzx eax, al; ret
+        // pe_f64_to_bits / pe_bits_to_f64: Fides passes a float as its bits
+        let bits = self.func_labels["pe_bits_to_f64"];
+        self.place_fn("pe_f64_to_bits");
+        self.enc.place_label(bits);
+        self.enc.emit(&[0x48, 0x89, 0xC8, 0xC3]); // mov rax, rcx; ret
+        // pe_f64_to_f32_bits(x) -> the bits of (f32)x
+        self.place_fn("pe_f64_to_f32_bits");
+        self.enc.movq_xmm_r64(0, Reg::Rcx);
+        self.enc.emit(&[0xF2, 0x0F, 0x5A, 0xC0]); // cvtsd2ss xmm0, xmm0
+        self.enc.emit(&[0x66, 0x0F, 0x7E, 0xC0, 0xC3]); // movd eax, xmm0; ret
+        // pe_f32_bits_to_f64(bits) -> (f64) of the f32 with those bits
+        self.place_fn("pe_f32_bits_to_f64");
+        self.enc.emit(&[0x66, 0x0F, 0x6E, 0xC1]); // movd xmm0, ecx
+        self.enc.emit(&[0xF3, 0x0F, 0x5A, 0xC0]); // cvtss2sd xmm0, xmm0
+        self.enc.emit(&[0x66, 0x48, 0x0F, 0x7E, 0xC0, 0xC3]); // movq rax, xmm0; ret
+
+        // pe_fn_lookup(name) -> the address of the program function of that
+        // name (one named by a string constant), or 0
+        self.place_fn("pe_fn_lookup");
+        self.enc.push(Reg::Rbx);
+        self.enc.sub_rsp_i32(32);
+        self.enc.mov_rr(Reg::Rbx, Reg::Rcx);
+        let done = self.enc.alloc_label();
+        let strcmp = self.iat_off(import_slot("strcmp").unwrap());
+        for f in self.named_fns.clone() {
+            let next = self.enc.alloc_label();
+            self.enc.mov_rr(Reg::Rcx, Reg::Rbx);
+            let off = self.str_off(&f);
+            self.enc.lea_rip(Reg::Rdx, off);
+            self.enc.call_rip(strcmp);
+            self.enc.emit(&[0x85, 0xC0]); // test eax, eax
+            self.enc.jcc_label(0x5, next); // jne
+            let flabel = self.func_labels[&f];
+            self.enc.lea_label(Reg::Rax, flabel);
+            self.enc.jmp_label(done);
+            self.enc.place_label(next);
+        }
+        self.enc.xor_rr(Reg::Rax, Reg::Rax);
+        self.enc.place_label(done);
+        self.enc.add_rsp_i32(32);
+        self.enc.pop(Reg::Rbx);
+        self.enc.ret();
+
+        // pe_call_fn(addr, nargs, argv) -> result: call the Fides function at
+        // addr with a null __env and argv[0..8] (argv has 8 slots; the
+        // function reads the ones it has parameters for)
+        self.place_fn("pe_call_fn");
+        self.enc.push(Reg::Rbx);
+        self.enc.push(Reg::Rsi);
+        self.enc.sub_rsp_i32(72); // 8 + 16 + 72: aligned, shadow + 5 stack args
+        self.enc.mov_rr(Reg::Rbx, Reg::Rcx);
+        self.enc.mov_rr(Reg::Rsi, Reg::R8);
+        for i in 3..8 {
+            // argv[i] is parameter i + 1 (after __env): a stack argument
+            self.enc.mov_reg_mem_disp(Reg::Rax, Reg::Rsi, 8 * i);
+            self.enc.mov_mem_disp_reg(Reg::Rsp, 32 + 8 * (i - 3), Reg::Rax);
+        }
+        self.enc.mov_reg_mem_disp(Reg::Rdx, Reg::Rsi, 0);
+        self.enc.mov_reg_mem_disp(Reg::R8, Reg::Rsi, 8);
+        self.enc.mov_reg_mem_disp(Reg::R9, Reg::Rsi, 16);
+        self.enc.xor_rr(Reg::Rcx, Reg::Rcx);
+        self.enc.call_reg(Reg::Rbx);
+        self.enc.add_rsp_i32(72);
+        self.enc.pop(Reg::Rsi);
+        self.enc.pop(Reg::Rbx);
+        self.enc.ret();
+
+        // The thread start routine (C convention: rcx = the argument) runs
+        // pert_thread_main(arg); Windows expects the callee-saved registers
+        // back. pe_thread_entry_addr() gives its address for CreateThread.
+        if self.func_labels.contains_key("pe_thread_entry_addr") {
+            let entry = self.enc.alloc_label();
+            self.enc.align_to(16);
+            self.enc.place_label(entry);
+            let saved = [Reg::Rbx, Reg::Rsi, Reg::Rdi, Reg::R12, Reg::R13, Reg::R14, Reg::R15, Reg::Rbp];
+            for r in saved {
+                self.enc.push(r);
+            }
+            self.enc.sub_rsp_i32(40); // 8 + 64 + 40: aligned
+            self.enc.mov_rr(Reg::Rdx, Reg::Rcx);
+            self.enc.xor_rr(Reg::Rcx, Reg::Rcx);
+            self.call_runtime("pert_thread_main");
+            self.enc.add_rsp_i32(40);
+            for r in saved.iter().rev() {
+                self.enc.pop(*r);
+            }
+            self.enc.ret();
+            self.place_fn("pe_thread_entry_addr");
+            self.enc.lea_label(Reg::Rax, entry);
+            self.enc.ret();
+        }
+
+        // p_thread_spawn(name, nargs, args...): varargs. The first two
+        // arguments go to the caller's shadow slots, next to the ones on
+        // the stack: one array, handed to pert_thread_spawn_v(name, nargs,
+        // argv) (still inside the caller's frame while it runs).
+        if self.func_labels.contains_key("p_thread_spawn") {
+            self.place_fn("p_thread_spawn");
+            self.enc.mov_mem_disp_reg(Reg::Rsp, 24, Reg::R8);
+            self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::R9);
+            self.enc.mov_rr(Reg::R8, Reg::Rdx);
+            self.enc.mov_rr(Reg::Rdx, Reg::Rcx);
+            self.enc.xor_rr(Reg::Rcx, Reg::Rcx);
+            self.enc.emit(&[0x4C, 0x8D, 0x4C, 0x24, 0x18]); // lea r9, [rsp+24]
+            let target = self.func_labels["pert_thread_spawn_v"];
+            self.enc.jmp_label(target);
+        }
+        // p_executor_spawn(exec, name, nargs, args...): likewise, from the
+        // fourth argument; pert_executor_spawn_v(name, nargs, argv)
+        if self.func_labels.contains_key("p_executor_spawn") {
+            self.place_fn("p_executor_spawn");
+            self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::R9);
+            self.enc.xor_rr(Reg::Rcx, Reg::Rcx);
+            self.enc.emit(&[0x4C, 0x8D, 0x4C, 0x24, 0x20]); // lea r9, [rsp+32]
+            let target = self.func_labels["pert_executor_spawn_v"];
+            self.enc.jmp_label(target);
+        }
+    }
+
     /// Copy `size` bytes from [rcx] to [rax] (clobbers rax, rcx, rdx):
     /// 8 bytes at a time, then single bytes, never past `size`.
     fn emit_copy_rcx_to_rax(&mut self, size: i32) {
@@ -6987,6 +7371,9 @@ impl PeCodeGen {
         self.enc.jmp_label(mi_copy);
         self.enc.place_label(mi_copydone);
 
+        // Update ptr first: r11 does not survive the call to p_free
+        self.enc.mov_ptr_reg(Reg::R12, Reg::R11); // [r12] = new ptr
+
         // Free old if non-null
         self.enc.test_rr(Reg::Rax, Reg::Rax);
         let mi_nofree = self.enc.alloc_label();
@@ -6995,8 +7382,7 @@ impl PeCodeGen {
         self.enc.call_label(*self.func_labels.get("p_free").unwrap());
         self.enc.place_label(mi_nofree);
 
-        // Update ptr and cap
-        self.enc.mov_ptr_reg(Reg::R12, Reg::R11); // [r12] = new ptr
+        // Update cap
         self.enc.mov_reg_mem_rbp(Reg::R10, -16); // restore new_cap
         self.enc.mov_rr(Reg::Rax, Reg::R12);
         self.enc.add_r_i32(Reg::Rax, 16);
@@ -8134,13 +8520,13 @@ impl PeCodeGen {
         self.enc.inc_r(Reg::R10);
         self.enc.jmp_label(sa_copy);
         self.enc.place_label(sa_copy_done);
+        // Store new buffer first: r9 does not survive the call to p_free
+        self.enc.mov_mem_disp_reg(Reg::R12, 0, Reg::R9);
         // Free old buffer
         self.enc.mov_rr(Reg::Rcx, Reg::R8);
         self.enc.sub_rsp_i32(32);
         self.enc.call_label(*self.func_labels.get("p_free").unwrap());
         self.enc.add_rsp_i32(32);
-        // Store new buffer
-        self.enc.mov_mem_disp_reg(Reg::R12, 0, Reg::R9);
         self.enc.place_label(sa_no_grow);
         // memcpy(sb->buf + sb->len, s, slen)
         // r8 = sb->buf, r9 = sb->len, r10 = 0
@@ -8775,6 +9161,44 @@ pub fn generate_pe(module: &IrModule) -> Result<Vec<u8>, Vec<String>> {
     Ok(bytes)
 }
 
+/// The builtins `print`, `p_to_str` and the Print instruction dispatch to.
+const PRINT_BUILTINS: &[&str] = &[
+    "p_print_float", "p_print_int", "p_print_str", "p_print_bool",
+    "p_to_str_float", "p_to_str", "p_to_str_str", "p_to_str_bool",
+];
+
+/// The runtime builtin an autograd instruction calls (as in the C backend).
+fn autograd_builtin(inst: &Inst) -> &'static str {
+    match inst {
+        Inst::GradBegin { .. } => "p_autograd_begin",
+        Inst::GradEnd => "p_autograd_end",
+        _ => "p_autograd_backward",
+    }
+}
+
+/// `PeCodeGen::resolve_call` for the call graph: an alias, or the Fides
+/// runtime's `pert_X` for builtin `p_X` when the program has it.
+fn resolve_callee(module: &IrModule, name: &str) -> String {
+    if let Some(over) = c_override(module, name) {
+        return over;
+    }
+    let alias = pe_runtime_alias(name);
+    if alias != name {
+        return alias.to_string();
+    }
+    pert_name(name).filter(|p| module.functions.contains_key(p)).unwrap_or_else(|| name.to_string())
+}
+
+/// A C library function the Fides runtime implements itself, for `extern
+/// "C"` function `name`: `pert_c_<C name>` (putchar, puts: stdout goes
+/// through this backend's own output, unbuffered and in order with print,
+/// as all of it goes through C stdio in the C backend).
+fn c_override(module: &IrModule, name: &str) -> Option<String> {
+    let ext = module.extern_decls.iter().find(|e| e.pledge_name == name)?;
+    let over = format!("pert_c_{}", ext.c_name);
+    module.functions.contains_key(&over).then_some(over)
+}
+
 /// Runtime builtins this backend implements with core's Fides code.
 fn pe_runtime_alias(name: &str) -> &str {
     match name {
@@ -8792,6 +9216,8 @@ fn print_formatter(ty: &IrType) -> Option<&'static str> {
     match ty {
         IrType::Generic(n, _) | IrType::Opaque(n) if n == "Vec" => Some("Vec_to_str"),
         IrType::Generic(n, _) | IrType::Opaque(n) if n == "HashMap" => Some("HashMap_to_str"),
+        // The Fides runtime's p_tensor_to_str (src/pe_runtime/)
+        IrType::Opaque(n) if n == "Tensor" => Some("pert_tensor_to_str"),
         _ => None,
     }
 }
@@ -8800,22 +9226,62 @@ fn print_formatter(ty: &IrType) -> Option<&'static str> {
 /// (closures, thread entries) and `dyn` method dispatch. Everything, when
 /// there is no `main`.
 fn reachable_functions(module: &IrModule) -> std::collections::BTreeSet<String> {
-    let mut seen = std::collections::BTreeSet::new();
     if !module.functions.contains_key("main") {
-        seen.extend(module.functions.keys().cloned());
-        return seen;
+        return module.functions.keys().cloned().collect();
     }
-    let mut work = vec!["main".to_string()];
+    reachable_from(module, vec!["main".to_string()])
+}
+
+/// The Fides runtime functions an executable needs: those reachable from
+/// the functions it is made of (every program and stdlib function is
+/// compiled, used or not).
+fn needed_functions(module: &IrModule) -> std::collections::BTreeSet<String> {
+    let roots = module.functions.keys().filter(|f| !is_pe_runtime_fn(f)).cloned().collect();
+    reachable_from(module, roots)
+}
+
+/// Functions reachable from `roots` (see reachable_functions).
+fn reachable_from(module: &IrModule, roots: Vec<String>) -> std::collections::BTreeSet<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut work = roots;
     while let Some(f) = work.pop() {
         if !seen.insert(f.clone()) {
             continue;
         }
+        // A stub that hands over to the Fides runtime needs that function
+        for (stub, dep) in PE_STUB_DEPS {
+            if f == *stub {
+                work.push(dep.to_string());
+            }
+        }
         if let Some(func) = module.functions.get(&f) {
             for inst in func.instructions.values() {
                 match inst {
-                    Inst::Call { func: callee, .. } => work.push(pe_runtime_alias(callee).to_string()),
+                    Inst::Call { func: callee, args, .. } => {
+                        work.push(resolve_callee(module, callee));
+                        // print / p_to_str dispatch on the argument type (see
+                        // gen_inst): the Fides runtime may replace any of them
+                        if callee == "print" || callee == "p_to_str" {
+                            work.extend(PRINT_BUILTINS.iter().map(|b| resolve_callee(module, b)));
+                        }
+                        // print(tensor) formats it with p_tensor_to_str
+                        let tensor_arg = args.first()
+                            .and_then(|a| func.values.get(a))
+                            .map_or(false, |m| m.ty.is_opaque_named("Tensor"));
+                        if callee == "print" && tensor_arg {
+                            work.push(resolve_callee(module, "p_tensor_to_str"));
+                        }
+                    }
+                    Inst::GradBegin { .. } | Inst::GradEnd | Inst::Backward { .. } => {
+                        work.push(resolve_callee(module, autograd_builtin(inst)));
+                    }
+                    // A function named in a string: a thread or task entry point
+                    Inst::ConstStr { value } if module.functions.contains_key(value) => work.push(value.clone()),
                     Inst::ConstFnRef { name } => work.push(name.clone()),
-                    Inst::Print { ty, .. } => work.extend(print_formatter(ty).map(String::from)),
+                    Inst::Print { ty, .. } => {
+                        work.extend(print_formatter(ty).map(String::from));
+                        work.extend(PRINT_BUILTINS.iter().map(|b| resolve_callee(module, b)));
+                    }
                     Inst::DynCall { method, .. } => {
                         let suffix = format!("_{}", method);
                         work.extend(module.functions.keys().filter(|k| k.ends_with(&suffix)).cloned());

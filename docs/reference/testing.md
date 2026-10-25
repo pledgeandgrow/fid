@@ -209,9 +209,14 @@ backends and compares each compiled program's output with the interpreter's:
 - `fidesc test -j 8` runs eight tests at a time (each worker with its own C
   compiler cache); results are reported in test order as before.
 - `fidesc test --fail` runs the expected-fail tests (they must be rejected).
-- A program the PE backend refuses because the native runtime lacks a
-  function it calls (threads, tensors, JSON, ...) is reported as
-  `[UNSUPPORTED]` with the missing functions, not as a pass.
+- A program the PE backend refuses because nothing provides a function it
+  calls (no machine code, no `pert_` function in src/pe_runtime/, no
+  msvcrt/kernel32 export for an `extern "C"` declaration) is reported as
+  `[UNSUPPORTED]` with the missing functions, not as a pass. Every test
+  program builds today.
+- `cargo test --test harness` runs the same programs through `fidesc` from
+  Cargo (interpreter, PE structure, C against the interpreter, golden
+  files, the safety/capability/effect/region checks).
 - Tests that link a system library Fides does not ship (`test_sqlite`) run
   only with `FIDES_TEST_EXTERNAL=1`. Tests that run the whole self-hosted
   compiler are checked on C and PE, with the C output as the reference.

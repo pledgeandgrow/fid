@@ -289,6 +289,23 @@ impl PassTimer {
 }
 
 pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Result<Program, Vec<String>> {
+    build_program_with_runtime(source, source_path, &[])
+}
+
+/// The Fides runtime of native Windows executables: implementations of the
+/// runtime builtins the PE backend has no machine code for. A call to
+/// builtin `p_X` runs `pert_X` (see `pe::PeCodeGen::resolve_call`); the
+/// functions a program does not use are left out of the executable.
+pub const PE_RUNTIME: &[&str] = &[
+    include_str!("pe_runtime/base.fd"),
+    include_str!("pe_runtime/conc.fd"),
+    include_str!("pe_runtime/tensor.fd"),
+    include_str!("pe_runtime/data.fd"),
+];
+
+/// `build_program_with_path`, with `runtime` sources merged into
+/// stdlib/core.fd (type-checked with it, as module core).
+pub fn build_program_with_runtime(source: &str, source_path: Option<&str>, runtime: &[&str]) -> Result<Program, Vec<String>> {
     let timer = PassTimer::new();
     if let Some(p) = source_path {
         crate::inc::record_file(Path::new(p), source);
@@ -298,11 +315,20 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
     crate::diag::set_color(std::io::stderr().is_terminal());
 
     // Parse stdlib first
-    let stdlib = parse_source(STDLIB_CORE)?;
+    let mut stdlib = parse_source(STDLIB_CORE)?;
 
     // Extract stdlib struct/enum names so the user parser recognizes them
     let mut struct_names: Vec<String> = stdlib.structs.iter().map(|s| s.name.clone()).collect();
     let mut enum_names: Vec<String> = stdlib.enums.iter().map(|e| e.name.clone()).collect();
+
+    // A backend's Fides runtime joins core (core's definitions win)
+    for rt in runtime {
+        let mut parser = Parser::with_names(Lexer::new(rt).tokenize(), struct_names.clone(), enum_names.clone());
+        let rt_program = parser.parse().map_err(|e| vec![format!("PE runtime: {}", e)])?;
+        struct_names.extend(rt_program.structs.iter().map(|s| s.name.clone()));
+        enum_names.extend(rt_program.enums.iter().map(|e| e.name.clone()));
+        stdlib = merge_programs(rt_program, stdlib);
+    }
 
     // Parse user code with stdlib names pre-populated
     let mut lexer = Lexer::new(source);
@@ -1904,7 +1930,7 @@ pub fn emit_source_with_path(source: &str, source_path: &str) -> Result<Vec<u8>,
 /// on L2 before generating PE. This closes the stale roadmap gap where
 /// `emit` was documented as "bypasses the optimizer."
 pub fn emit_source_with_level(source: &str, source_path: &str, level: crate::opt::OptLevel) -> Result<Vec<u8>, Vec<String>> {
-    let program = build_program_with_path(source, Some(source_path))?;
+    let program = build_program_with_runtime(source, Some(source_path), PE_RUNTIME)?;
     let module = lower::lower(&program);
 
     // The PE backend generates code from the IR module; it does not consume
@@ -1961,7 +1987,8 @@ pub fn build_executable_with_level(source: &str, source_path: &str, target: &str
     // no input changed. The key covers every file the build read (imported
     // modules too: keying on the main file alone reused stale code after an
     // import changed) plus the opt level and lto flags.
-    let program = build_program_with_path(source, Some(source_path))?;
+    let windows = matches!(target, "x86-64-windows" | "x64-windows" | "windows");
+    let program = build_program_with_runtime(source, Some(source_path), if windows { PE_RUNTIME } else { &[] })?;
     let mut source_hash = crate::inc::deps_snapshot().hash();
     source_hash ^= (level as u8 as u64).wrapping_shl(1) ^ (do_lto as u64);
     let cache = crate::inc::global_cache();

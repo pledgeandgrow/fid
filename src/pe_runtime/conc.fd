@@ -1,0 +1,427 @@
+// src/pe_runtime/conc.fd — threads, futures, executors, atomics, mutexes,
+// thread-local storage and channels for native Windows executables (see
+// base.fd for how this runtime works). The behaviour is the C backend's:
+//   - p_thread_spawn(name, nargs, args...) runs the program function of that
+//     name on a new thread and returns a future: -(index + 1) into a table
+//     of 256 threads; p_future_poll / p_task_poll join it and return its
+//     result (a value >= 0 is an already-ready future)
+//   - an executor is only a number: its tasks are threads of the same table
+//   - a channel is a bounded queue under a lock with two condition variables
+// The backend passes the varargs of p_thread_spawn / p_executor_spawn as an
+// array (pert_thread_spawn_v), and starts each thread in pert_thread_main.
+
+extern "C" {
+    // kernel32.dll
+    fn CreateThread as pe_k_create_thread(attrs: i64, stack: i64, start: i64, arg: i64, flags: i64, id: i64) -> i64;
+    fn WaitForSingleObject as pe_k_wait(handle: i64, ms: i64) -> u32;
+    fn CloseHandle as pe_k_close_handle(handle: i64) -> i32;
+    fn InitializeSRWLock as pe_k_lock_init(lock: i64);
+    fn AcquireSRWLockExclusive as pe_k_lock(lock: i64);
+    fn ReleaseSRWLockExclusive as pe_k_unlock(lock: i64);
+    fn InitializeConditionVariable as pe_k_cond_init(cond: i64);
+    fn SleepConditionVariableSRW as pe_k_cond_wait(cond: i64, lock: i64, ms: i64, flags: i64) -> i32;
+    fn WakeConditionVariable as pe_k_cond_signal(cond: i64);
+    fn WakeAllConditionVariable as pe_k_cond_broadcast(cond: i64);
+    fn TlsAlloc as pe_k_tls_alloc() -> u32;
+    fn TlsGetValue as pe_k_tls_get(key: i64) -> i64;
+    fn TlsSetValue as pe_k_tls_set(key: i64, value: i64) -> i32;
+    // Machine-code primitives (pe.rs)
+    fn pe_atomic_load(addr: i64) -> i64;
+    fn pe_atomic_store(addr: i64, value: i64);
+    fn pe_atomic_add(addr: i64, value: i64) -> i64;
+    fn pe_atomic_cas(addr: i64, expected: i64, new_value: i64) -> bool;
+    fn pe_fn_lookup(name: str) -> i64;
+    fn pe_call_fn(addr: i64, nargs: i64, argv: i64) -> i64;
+    fn pe_thread_entry_addr() -> i64;
+}
+
+/// WaitForSingleObject / SleepConditionVariableSRW: no timeout.
+fn pe_infinite() -> i64 {
+    return 4294967295;
+}
+
+/// What a non-blocking poll returns for a task still running, and a
+/// receive on a channel closed and empty (C: 0x8000000000000001).
+fn pe_pending() -> i64 {
+    return -9223372036854775807;
+}
+
+fn pe_load(addr: i64) -> i64 {
+    var p: *mut i64 = addr;
+    var v: i64 = 0;
+    unsafe { v = *p; }
+    return v;
+}
+
+fn pe_store(addr: i64, value: i64) {
+    var p: *mut i64 = addr;
+    unsafe { *p = value; }
+}
+
+/// n zeroed 8-byte slots.
+fn pe_zeroed(n: i64) -> i64 {
+    var block: i64 = p_malloc(n * 8);
+    var i: i64 = 0;
+    while i < n {
+        pe_store(block + i * 8, 0);
+        i = i + 1;
+    }
+    return block;
+}
+
+// ─── The thread table ───────────────────────────────────────────────────
+// Per thread i: its handle (0 once joined), its start block, its result.
+// Start block: [0] function, [1] nargs, [2..10) args, [10] done flag,
+// [11] result.
+
+var pert_thread_count: i64 = 0;
+var pert_thread_handles: i64 = 0;
+var pert_thread_blocks: i64 = 0;
+var pert_task_results: i64 = 0;
+var pert_executor_count: i64 = 0;
+
+fn pe_thread_tables() {
+    if pert_thread_handles == 0 {
+        pert_thread_handles = pe_zeroed(256);
+        pert_thread_blocks = pe_zeroed(256);
+        pert_task_results = pe_zeroed(256);
+    }
+}
+
+/// Start the program function `name` with argv[0..nargs) on a new thread.
+pub fn pert_thread_spawn_v(name: str, nargs: i64, argv: i64) -> i64 {
+    var fn_addr: i64 = pe_fn_lookup(name);
+    if fn_addr == 0 {
+        return -1;
+    }
+    pe_thread_tables();
+    var idx: i64 = pert_thread_count;
+    if idx >= 256 {
+        return -1;
+    }
+    pert_thread_count = idx + 1;
+    var block: i64 = pe_zeroed(12);
+    pe_store(block, fn_addr);
+    pe_store(block + 8, nargs);
+    var i: i64 = 0;
+    while i < nargs && i < 8 {
+        pe_store(block + 16 + i * 8, pe_load(argv + i * 8));
+        i = i + 1;
+    }
+    pe_store(pert_thread_blocks + idx * 8, block);
+    var handle: i64 = pe_k_create_thread(0, 0, pe_thread_entry_addr(), block, 0, 0);
+    pe_store(pert_thread_handles + idx * 8, handle);
+    return 0 - (idx + 1);
+}
+
+pub fn pert_executor_spawn_v(name: str, nargs: i64, argv: i64) -> i64 {
+    return pert_thread_spawn_v(name, nargs, argv);
+}
+
+/// Runs on the new thread: the function, then its result and done flag.
+pub fn pert_thread_main(block: i64) -> i64 {
+    var result: i64 = pe_call_fn(pe_load(block), pe_load(block + 8), block + 16);
+    pe_store(block + 88, result);
+    pe_atomic_store(block + 80, 1);
+    return result;
+}
+
+/// The table index of future f, or -1 (a ready value or an unknown handle).
+fn pe_task_index(f: i64) -> i64 {
+    if f >= 0 {
+        return -1;
+    }
+    var idx: i64 = 0 - (f + 1);
+    if idx >= pert_thread_count {
+        return -1;
+    }
+    return idx;
+}
+
+fn pe_task_done(idx: i64) -> bool {
+    return pe_atomic_load(pe_load(pert_thread_blocks + idx * 8) + 80) != 0;
+}
+
+/// Join thread idx (once) and return its result.
+fn pe_join(idx: i64) -> i64 {
+    var handle: i64 = pe_load(pert_thread_handles + idx * 8);
+    if handle != 0 {
+        pe_k_wait(handle, pe_infinite());
+        pe_k_close_handle(handle);
+        pe_store(pert_task_results + idx * 8, pe_load(pe_load(pert_thread_blocks + idx * 8) + 88));
+        pe_store(pert_thread_handles + idx * 8, 0);
+    }
+    return pe_load(pert_task_results + idx * 8);
+}
+
+pub fn pert_future_ready(value: i64) -> i64 {
+    return value;
+}
+
+pub fn pert_future_poll(f: i64) -> i64 {
+    if f >= 0 {
+        return f;
+    }
+    var idx: i64 = pe_task_index(f);
+    if idx < 0 {
+        return 0;
+    }
+    return pe_join(idx);
+}
+
+pub fn pert_task_poll(f: i64) -> i64 {
+    return pert_future_poll(f);
+}
+
+pub fn pert_task_is_ready(f: i64) -> bool {
+    if f >= 0 {
+        return true;
+    }
+    var idx: i64 = pe_task_index(f);
+    if idx < 0 {
+        return false;
+    }
+    return pe_task_done(idx);
+}
+
+pub fn pert_task_poll_nonblocking(f: i64) -> i64 {
+    if f >= 0 {
+        return f;
+    }
+    var idx: i64 = pe_task_index(f);
+    if idx < 0 {
+        return 0;
+    }
+    if !pe_task_done(idx) {
+        return pe_pending();
+    }
+    return pe_join(idx);
+}
+
+pub fn pert_executor_new() -> i64 {
+    var e: i64 = pert_executor_count;
+    pert_executor_count = e + 1;
+    return e;
+}
+
+pub fn pert_executor_block_on(exec: i64, f: i64) -> i64 {
+    return pert_future_poll(f);
+}
+
+/// Join every task still running; the number joined.
+pub fn pert_executor_run_all(exec: i64) -> i64 {
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < pert_thread_count {
+        if pe_load(pert_thread_handles + i * 8) != 0 {
+            pe_join(i);
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+/// Join the finished tasks; the number still running.
+pub fn pert_executor_poll_all(exec: i64) -> i64 {
+    var pending: i64 = 0;
+    var i: i64 = 0;
+    while i < pert_thread_count {
+        if pe_load(pert_thread_handles + i * 8) != 0 {
+            if pe_task_done(i) {
+                pe_join(i);
+            } else {
+                pending = pending + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return pending;
+}
+
+/// Cancel the tasks of a scope: a task cannot be stopped mid-way, so wait
+/// for those still running (none outlives its scope), drop their results
+/// (0), and return how many were cancelled.
+pub fn pert_executor_cancel(exec: i64) -> i64 {
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < pert_thread_count {
+        if pe_load(pert_thread_handles + i * 8) != 0 {
+            var was_done: bool = pe_task_done(i);
+            pe_join(i);
+            if !was_done {
+                pe_store(pert_task_results + i * 8, 0);
+                count = count + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+// ─── Shared memory, atomics, mutexes, thread-local storage ─────────────
+
+pub fn pert_shared_alloc(size: i64) -> i64 {
+    if size < 0 {
+        return 0;
+    }
+    return p_malloc(size);
+}
+
+pub fn pert_atomic_load(addr: i64) -> i64 {
+    return pe_atomic_load(addr);
+}
+
+pub fn pert_atomic_store(addr: i64, value: i64) {
+    pe_atomic_store(addr, value);
+}
+
+/// The previous value.
+pub fn pert_atomic_add(addr: i64, value: i64) -> i64 {
+    return pe_atomic_add(addr, value);
+}
+
+/// The previous value.
+@wrapping
+pub fn pert_atomic_sub(addr: i64, value: i64) -> i64 {
+    return pe_atomic_add(addr, 0 - value);
+}
+
+pub fn pert_atomic_cas(addr: i64, expected: i64, new_value: i64) -> bool {
+    return pe_atomic_cas(addr, expected, new_value);
+}
+
+/// A mutex: an SRW lock (not recursive, released by its owner, as a
+/// default pthread mutex).
+pub fn pert_mutex_init() -> i64 {
+    var m: i64 = pe_zeroed(1);
+    pe_k_lock_init(m);
+    return m;
+}
+
+pub fn pert_mutex_lock(m: i64) {
+    pe_k_lock(m);
+}
+
+pub fn pert_mutex_unlock(m: i64) {
+    pe_k_unlock(m);
+}
+
+pub fn pert_tls_create() -> i64 {
+    return pe_k_tls_alloc();
+}
+
+pub fn pert_tls_get(key: i64) -> i64 {
+    return pe_k_tls_get(key);
+}
+
+pub fn pert_tls_set(key: i64, value: i64) {
+    pe_k_tls_set(key, value);
+}
+
+// ─── Channels ───────────────────────────────────────────────────────────
+// [0] lock, [1] not_empty, [2] not_full, [3] head (next read), [4] tail
+// (next write), [5] count, [6] capacity, [7] closed, [8..] buffer.
+
+pub fn pert_chan_create(capacity: i64) -> i64 {
+    var cap: i64 = capacity;
+    if cap < 1 {
+        cap = 1;
+    }
+    var ch: i64 = pe_zeroed(8 + cap);
+    pe_k_lock_init(ch);
+    pe_k_cond_init(ch + 8);
+    pe_k_cond_init(ch + 16);
+    pe_store(ch + 48, cap);
+    return ch;
+}
+
+/// Block until there is room or the channel is closed; false if closed.
+pub fn pert_chan_send(ch: i64, value: i64) -> bool {
+    if ch == 0 {
+        return false;
+    }
+    pe_k_lock(ch);
+    while pe_load(ch + 40) == pe_load(ch + 48) && pe_load(ch + 56) == 0 {
+        pe_k_cond_wait(ch + 16, ch, pe_infinite(), 0);
+    }
+    if pe_load(ch + 56) != 0 {
+        pe_k_unlock(ch);
+        return false;
+    }
+    var tail: i64 = pe_load(ch + 32);
+    pe_store(ch + 64 + tail * 8, value);
+    pe_store(ch + 32, (tail + 1) % pe_load(ch + 48));
+    pe_store(ch + 40, pe_load(ch + 40) + 1);
+    pe_k_cond_signal(ch + 8);
+    pe_k_unlock(ch);
+    return true;
+}
+
+/// The oldest value; with the channel closed and empty, the pending value.
+fn pe_chan_take(ch: i64) -> i64 {
+    var head: i64 = pe_load(ch + 24);
+    var value: i64 = pe_load(ch + 64 + head * 8);
+    pe_store(ch + 24, (head + 1) % pe_load(ch + 48));
+    pe_store(ch + 40, pe_load(ch + 40) - 1);
+    pe_k_cond_signal(ch + 16);
+    return value;
+}
+
+/// Block until there is a value or the channel is closed and empty.
+pub fn pert_chan_recv(ch: i64) -> i64 {
+    if ch == 0 {
+        return 0;
+    }
+    pe_k_lock(ch);
+    while pe_load(ch + 40) == 0 && pe_load(ch + 56) == 0 {
+        pe_k_cond_wait(ch + 8, ch, pe_infinite(), 0);
+    }
+    if pe_load(ch + 40) == 0 {
+        pe_k_unlock(ch);
+        return pe_pending();
+    }
+    var value: i64 = pe_chan_take(ch);
+    pe_k_unlock(ch);
+    return value;
+}
+
+/// A value if one is waiting; else 0 if closed, the pending value if not.
+pub fn pert_chan_try_recv(ch: i64) -> i64 {
+    if ch == 0 {
+        return pe_pending();
+    }
+    pe_k_lock(ch);
+    if pe_load(ch + 40) == 0 {
+        var closed: i64 = pe_load(ch + 56);
+        pe_k_unlock(ch);
+        if closed != 0 {
+            return 0;
+        }
+        return pe_pending();
+    }
+    var value: i64 = pe_chan_take(ch);
+    pe_k_unlock(ch);
+    return value;
+}
+
+pub fn pert_chan_close(ch: i64) {
+    if ch == 0 {
+        return;
+    }
+    pe_k_lock(ch);
+    pe_store(ch + 56, 1);
+    pe_k_cond_broadcast(ch + 8);
+    pe_k_cond_broadcast(ch + 16);
+    pe_k_unlock(ch);
+}
+
+pub fn pert_chan_is_closed(ch: i64) -> bool {
+    if ch == 0 {
+        return true;
+    }
+    pe_k_lock(ch);
+    var closed: i64 = pe_load(ch + 56);
+    pe_k_unlock(ch);
+    return closed != 0;
+}

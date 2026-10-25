@@ -1,5 +1,57 @@
 # Fides Language Changelog
 
+## Session 32 — Native Windows Executables Run Every Test (Oct 25, 2026)
+
+### A Fides runtime for the PE backend
+
+`fidesc emit` (native Windows `.exe`, no external tools) refused 62 of the
+test programs: they called runtime builtins the PE backend had no machine
+code for (threads, channels, async executors, tensors and autograd, JSON,
+HTTP, the in-memory DB, files, number parsing, C math). It now builds all
+of them (all 281 test programs build and print what the interpreter prints; the 59
+expected-fail programs are rejected).
+
+- **src/pe_runtime/** — the missing builtins written in Fides, once
+  (`base.fd`: numbers and their text, files, clocks, the environment,
+  SIMD, dlopen/allocator simulation, ECS; `conc.fd`: threads, futures,
+  executors, atomics, mutexes, TLS, channels; `tensor.fd`: tensors,
+  autograd, checkpoints, KV cache, quantization, DP noise, sharding;
+  `data.fd`: JSON, HTTP, in-memory DB). A call to builtin `p_X` runs
+  `pert_X`; an executable contains only the runtime functions it uses
+  (hello: 133 KB). The behaviour is the C backend's.
+- **C library and Win32 calls** — the import table now has msvcrt.dll
+  besides kernel32.dll. Every `extern "C"` function whose C name is a
+  msvcrt/kernel32 export (sqrt, pow, strtod, fopen, CreateThread,
+  SleepConditionVariableSRW, ...) is called through a generated thunk that
+  moves floats into xmm registers and widens `int` results. User FFI
+  works too: `test_ffi`, `test_ffi_full`, `test_ffi_header` run natively.
+  Functions of a missing local header are stubs returning 0, as in C.
+- **Machine-code primitives** — atomics (`lock xadd`, `lock cmpxchg`,
+  `xchg`), float bit casts, looking up a program function by name, calling
+  a function pointer with N arguments, the thread start routine, and the
+  varargs `p_thread_spawn` / `p_executor_spawn` stubs.
+
+### PE backend bugs fixed
+
+| Bug | Fix |
+|-----|-----|
+| Float comparisons (`<`, `>`, `==`, ...) compared the bit patterns as integers: wrong for negative numbers (`-1.0 > -0.5` was true) | Compared as floats, by operand type |
+| Float comparisons with NaN: `NaN == NaN` and `NaN < x` were true | IEEE semantics (`seta`/`setae`, parity flag for `==`/`!=`) |
+| Loads of `u8`/`u16`/`u32` sign-extended (a byte 255 read as -1) | Unsigned types zero-extend |
+| `p_sb_append` and `p_map_insert` kept the new buffer in a volatile register across `HeapFree`, then stored it: heap corruption once a string builder or map grew (also in compiler/pe.fd) | The new buffer is stored before the old one is freed |
+| Floats printed with 6 significant digits (`3.741657`) | Shortest text that reads back, as the interpreter (`3.7416573867739413`, `NaN`, `inf`, `-0`) |
+| `p_simd_add/sub/mul/div` were "intrinsics" adding two packed doubles of the stack slot: garbage for SIMD vectors (`Vec<f64>`) | Elementwise over the vectors, as in C |
+| `print(tensor)` formatted the tensor and printed nothing; `grad {}` and `backward` did nothing | Printed; the autograd tape runs |
+| `putchar` / `puts` output came out after everything else (C stdio buffer) | Written through the backend's own stdout |
+| `p_serial_*` had labels but no code outside bare-metal mode | No-ops, as in C |
+
+### Other fixes
+
+- The self-hosted `ccompile` crashed when `CC` or `FIDES_CC_OPT` was not
+  set (`p_getenv` returns null): `env_or_empty`.
+- `test_spawn_scope` printed from three threads at once (the order varied
+  between runs); it now checks the joined tasks' combined effect.
+
 ## Session 31 — Fast, Reproducible and Incremental Builds; Backend Fixes (Oct 25, 2026)
 
 ### Build speed

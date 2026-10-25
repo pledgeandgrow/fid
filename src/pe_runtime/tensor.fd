@@ -1,0 +1,1534 @@
+// src/pe_runtime/tensor.fd — tensors, autograd, KV caches, quantization,
+// differential privacy and tensor parallelism for native Windows executables
+//
+// The interpreter (src/interp.rs, src/tensor.rs) is the reference: a tensor
+// is a flat f64 array with a row-major shape. Here a Tensor value is the
+// address of a 32-byte block:
+//   [0] data (f64 array)   [8] data length   [16] ndim   [24] shape (i64 array)
+// The data length is the number of stored values (from_vec keeps the Vec's
+// length), the size is the product of the shape, as in the interpreter.
+//
+// Private helpers are pet_*, state lives in pet_* globals; the builtins
+// p_X are pert_X.
+
+extern "C" {
+    // msvcrt.dll
+    fn calloc as pet_c_calloc(count: i64, size: i64) -> i64;
+    fn memcpy as pet_c_memcpy(dst: i64, src: i64, n: i64) -> i64;
+    fn memmove as pet_c_memmove(dst: i64, src: i64, n: i64) -> i64;
+    fn floor as pet_c_floor(x: f64) -> f64;
+    fn fabs as pet_c_fabs(x: f64) -> f64;
+    fn exp as pet_c_exp(x: f64) -> f64;
+    fn log as pet_c_log(x: f64) -> f64;
+    fn sqrt as pet_c_sqrt(x: f64) -> f64;
+    fn cos as pet_c_cos(x: f64) -> f64;
+    fn _snprintf as pet_c_fmt_int(buf: i64, size: i64, fmt: str, x: i64) -> i32;
+}
+
+// ─── State ──────────────────────────────────────────────────────────────
+
+var pet_ag_on: i64 = 0;        // recording the autograd tape
+var pet_ag_ckpt: i64 = 0;      // checkpoint mode: the tape keeps inputs
+var pet_ag_tape: i64 = 0;      // growable array, 8 slots per entry
+var pet_ag_gkeys: i64 = 0;     // gradients: tensor address ...
+var pet_ag_gvals: i64 = 0;     // ... -> gradient tensor
+var pet_kv_reg: i64 = 0;       // the KV caches, by id
+var pet_dp_used: i64 = 0;      // f64 bits: epsilon consumed
+var pet_dp_limit: i64 = 0;     // f64 bits
+var pet_rng_s0: i64 = 0;       // xorshift128+ state (0: not seeded)
+var pet_rng_s1: i64 = 0;
+
+// ─── Memory ─────────────────────────────────────────────────────────────
+
+fn pet_alloc(n: i64) -> i64 {
+    var size: i64 = n;
+    if size < 8 {
+        size = 8;
+    }
+    return pet_c_calloc(1, size);
+}
+
+fn pet_ld(addr: i64) -> i64 {
+    var p: *mut i64 = addr;
+    var v: i64 = 0;
+    unsafe { v = *p; }
+    return v;
+}
+
+fn pet_st(addr: i64, v: i64) {
+    var p: *mut i64 = addr;
+    unsafe { *p = v; }
+}
+
+fn pet_ldf(addr: i64) -> f64 {
+    var p: *mut f64 = addr;
+    var v: f64 = 0.0;
+    unsafe { v = *p; }
+    return v;
+}
+
+fn pet_stf(addr: i64, v: f64) {
+    var p: *mut f64 = addr;
+    unsafe { *p = v; }
+}
+
+// A growable array of 8-byte values: [0] items  [8] length  [16] capacity
+
+fn pet_arr_new() -> i64 {
+    return pet_alloc(24);
+}
+
+fn pet_arr_reserve(a: i64, extra: i64) {
+    var need: i64 = pet_ld(a + 8) + extra;
+    var cap: i64 = pet_ld(a + 16);
+    if need <= cap {
+        return;
+    }
+    var ncap: i64 = cap * 2;
+    if ncap < 16 {
+        ncap = 16;
+    }
+    if ncap < need {
+        ncap = need;
+    }
+    var items: i64 = pet_alloc(ncap * 8);
+    if pet_ld(a + 8) > 0 {
+        pet_c_memcpy(items, pet_ld(a), pet_ld(a + 8) * 8);
+    }
+    pet_st(a, items);
+    pet_st(a + 16, ncap);
+}
+
+fn pet_arr_push(a: i64, v: i64) {
+    pet_arr_reserve(a, 1);
+    var n: i64 = pet_ld(a + 8);
+    pet_st(pet_ld(a) + n * 8, v);
+    pet_st(a + 8, n + 1);
+}
+
+/// Append n values from src.
+fn pet_arr_extend(a: i64, src: i64, n: i64) {
+    if n <= 0 {
+        return;
+    }
+    pet_arr_reserve(a, n);
+    var len: i64 = pet_ld(a + 8);
+    pet_c_memcpy(pet_ld(a) + len * 8, src, n * 8);
+    pet_st(a + 8, len + n);
+}
+
+/// Remove the first n values.
+fn pet_arr_drain(a: i64, n: i64) {
+    var len: i64 = pet_ld(a + 8);
+    var k: i64 = n;
+    if k > len {
+        k = len;
+    }
+    if k <= 0 {
+        return;
+    }
+    if len - k > 0 {
+        pet_c_memmove(pet_ld(a), pet_ld(a) + k * 8, (len - k) * 8);
+    }
+    pet_st(a + 8, len - k);
+}
+
+fn pet_arr_len(a: i64) -> i64 {
+    return pet_ld(a + 8);
+}
+
+fn pet_arr_at(a: i64, i: i64) -> i64 {
+    return pet_ld(pet_ld(a) + i * 8);
+}
+
+// ─── Floats ─────────────────────────────────────────────────────────────
+
+fn pet_inf() -> f64 {
+    return pe_bits_to_f64(9218868437227405312);
+}
+
+fn pet_neg_inf() -> f64 {
+    return pe_bits_to_f64(-4503599627370496);
+}
+
+fn pet_f(bits: i64) -> f64 {
+    return pe_bits_to_f64(bits);
+}
+
+fn pet_bits(x: f64) -> i64 {
+    return pe_f64_to_bits(x);
+}
+
+/// Rust's f64::round: half away from zero.
+fn pet_round(x: f64) -> f64 {
+    if x != x {
+        return x;
+    }
+    var a: f64 = pet_c_fabs(x);
+    var f: f64 = pet_c_floor(a);
+    if a - f >= 0.5 {
+        f = f + 1.0;
+    }
+    if x < 0.0 {
+        return 0.0 - f;
+    }
+    return f;
+}
+
+/// Whether the value prints as an integer (v == v.trunc(), finite, < 1e15).
+fn pet_is_int(v: f64) -> bool {
+    if pet_c_fabs(v) < 1000000000000000.0 {
+        var i: i64 = v as i64;
+        if (i as f64) == v {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ─── Text ───────────────────────────────────────────────────────────────
+
+fn pet_int_str(x: i64) -> str {
+    var buf: i64 = pet_alloc(32);
+    pet_c_fmt_int(buf, 31, "%I64d", x);
+    return pe_buf_str(buf);
+}
+
+/// An element as tensor printing shows it: an integer, else 4 decimals.
+fn pet_elem_str(v: f64) -> str {
+    if pet_is_int(v) {
+        var i: i64 = v as i64;
+        return pet_int_str(i);
+    }
+    var d: f64 = v - v;
+    if d != d {
+        // NaN, inf, -inf
+        return pert_to_str_float(v);
+    }
+    var buf: i64 = pet_alloc(400);
+    pe_c_fmt_prec(buf, 399, "%.*f", 4, v);
+    return pe_buf_str(buf);
+}
+
+/// An element as to_json shows it: an integer, else Rust's Display.
+fn pet_json_elem_str(v: f64) -> str {
+    if pet_is_int(v) {
+        var i: i64 = v as i64;
+        return pet_int_str(i);
+    }
+    return pert_to_str_float(v);
+}
+
+// A text builder: [0] bytes  [8] length  [16] capacity
+
+fn pet_sb_new() -> i64 {
+    var sb: i64 = pet_alloc(24);
+    pet_st(sb, pet_alloc(64));
+    pet_st(sb + 16, 64);
+    return sb;
+}
+
+/// (A str argument passes as its address.)
+fn pet_sb_add(sb: i64, s: i64) {
+    var n: i64 = p_str_length(pe_buf_str(s));
+    var len: i64 = pet_ld(sb + 8);
+    var cap: i64 = pet_ld(sb + 16);
+    if len + n + 1 > cap {
+        var ncap: i64 = cap * 2;
+        if ncap < len + n + 1 {
+            ncap = len + n + 1;
+        }
+        var nb: i64 = pet_alloc(ncap);
+        pet_c_memcpy(nb, pet_ld(sb), len);
+        pet_st(sb, nb);
+        pet_st(sb + 16, ncap);
+    }
+    pet_c_memcpy(pet_ld(sb) + len, s, n);
+    pe_set_byte(pet_ld(sb), len + n, 0);
+    pet_st(sb + 8, len + n);
+}
+
+fn pet_sb_str(sb: i64) -> str {
+    return pe_buf_str(pet_ld(sb));
+}
+
+// ─── Tensors ────────────────────────────────────────────────────────────
+
+/// A tensor of ndim dimensions (all 0) holding len zeros.
+fn pet_t_new(ndim: i64, len: i64) -> i64 {
+    var t: i64 = pet_alloc(32);
+    var n: i64 = len;
+    if n < 0 {
+        n = 0;
+    }
+    pet_st(t, pet_alloc(n * 8));
+    pet_st(t + 8, n);
+    pet_st(t + 16, ndim);
+    pet_st(t + 24, pet_alloc(ndim * 8));
+    return t;
+}
+
+fn pet_t_len(t: i64) -> i64 {
+    return pet_ld(t + 8);
+}
+
+fn pet_t_ndim(t: i64) -> i64 {
+    return pet_ld(t + 16);
+}
+
+fn pet_t_dim(t: i64, i: i64) -> i64 {
+    return pet_ld(pet_ld(t + 24) + i * 8);
+}
+
+fn pet_t_set_dim(t: i64, i: i64, d: i64) {
+    pet_st(pet_ld(t + 24) + i * 8, d);
+}
+
+/// The stored value at flat index i (0 past the end).
+fn pet_t_at(t: i64, i: i64) -> f64 {
+    if i < 0 || i >= pet_t_len(t) {
+        return 0.0;
+    }
+    return pet_ldf(pet_ld(t) + i * 8);
+}
+
+fn pet_t_put(t: i64, i: i64, v: f64) {
+    if i < 0 || i >= pet_t_len(t) {
+        return;
+    }
+    pet_stf(pet_ld(t) + i * 8, v);
+}
+
+/// The number of elements: the product of the shape.
+fn pet_t_size(t: i64) -> i64 {
+    var n: i64 = 1;
+    var i: i64 = 0;
+    var nd: i64 = pet_t_ndim(t);
+    while i < nd {
+        n = n * pet_t_dim(t, i);
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Row-major stride of dimension k.
+fn pet_t_stride(t: i64, k: i64) -> i64 {
+    var s: i64 = 1;
+    var j: i64 = k + 1;
+    var nd: i64 = pet_t_ndim(t);
+    while j < nd {
+        s = s * pet_t_dim(t, j);
+        j = j + 1;
+    }
+    return s;
+}
+
+/// A tensor of t's shape holding len zeros.
+fn pet_t_shaped_like(t: i64, len: i64) -> i64 {
+    var nd: i64 = pet_t_ndim(t);
+    var r: i64 = pet_t_new(nd, len);
+    var i: i64 = 0;
+    while i < nd {
+        pet_t_set_dim(r, i, pet_t_dim(t, i));
+        i = i + 1;
+    }
+    return r;
+}
+
+fn pet_t_clone(t: i64) -> i64 {
+    var r: i64 = pet_t_shaped_like(t, pet_t_len(t));
+    if pet_t_len(t) > 0 {
+        pet_c_memcpy(pet_ld(r), pet_ld(t), pet_t_len(t) * 8);
+    }
+    return r;
+}
+
+/// A tensor of t's shape, every element v.
+fn pet_t_filled_like(t: i64, v: f64) -> i64 {
+    var n: i64 = pet_t_size(t);
+    var r: i64 = pet_t_shaped_like(t, n);
+    var i: i64 = 0;
+    while i < n {
+        pet_t_put(r, i, v);
+        i = i + 1;
+    }
+    return r;
+}
+
+fn pet_t_from_shape(shape: Vec<i64>, v: f64) -> i64 {
+    var nd: i64 = shape.len();
+    var n: i64 = 1;
+    var i: i64 = 0;
+    while i < nd {
+        n = n * shape.get(i);
+        i = i + 1;
+    }
+    var t: i64 = pet_t_new(nd, n);
+    i = 0;
+    while i < nd {
+        pet_t_set_dim(t, i, shape.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        pet_t_put(t, i, v);
+        i = i + 1;
+    }
+    return t;
+}
+
+/// Flat offset of a multi-index (-1 when out of range).
+fn pet_t_offset(t: i64, idx: Vec<i64>) -> i64 {
+    var off: i64 = 0;
+    var n: i64 = idx.len();
+    var nd: i64 = pet_t_ndim(t);
+    if n > nd {
+        n = nd;
+    }
+    var i: i64 = 0;
+    while i < n {
+        var x: i64 = idx.get(i);
+        if x < 0 {
+            return -1;
+        }
+        off = off + x * pet_t_stride(t, i);
+        i = i + 1;
+    }
+    if off >= pet_t_len(t) {
+        return -1;
+    }
+    return off;
+}
+
+fn pet_same_shape(a: i64, b: i64) -> bool {
+    var nd: i64 = pet_t_ndim(a);
+    if nd != pet_t_ndim(b) {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < nd {
+        if pet_t_dim(a, i) != pet_t_dim(b, i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// "[2, 3]" (Rust's {:?} of the shape).
+fn pet_shape_str(t: i64) -> str {
+    var sb: i64 = pet_sb_new();
+    pet_sb_add(sb, "[");
+    var i: i64 = 0;
+    while i < pet_t_ndim(t) {
+        if i > 0 {
+            pet_sb_add(sb, ", ");
+        }
+        pet_sb_add(sb, pet_int_str(pet_t_dim(t, i)));
+        i = i + 1;
+    }
+    pet_sb_add(sb, "]");
+    return pet_sb_str(sb);
+}
+
+fn pet_fail(msg: str) {
+    p_panic(msg);
+}
+
+/// Elementwise a op b (op: 1 add, 2 sub, 3 mul), shapes must match.
+fn pet_t_zip(a: i64, b: i64, op: i64, name: str) -> i64 {
+    if !pet_same_shape(a, b) {
+        pet_fail(p_str_concat(p_str_concat(p_str_concat(p_str_concat(name, ": shape mismatch "), pet_shape_str(a)), " vs "), pet_shape_str(b)));
+        return 0;
+    }
+    var n: i64 = pet_t_len(a);
+    if pet_t_len(b) < n {
+        n = pet_t_len(b);
+    }
+    var r: i64 = pet_t_shaped_like(a, n);
+    var i: i64 = 0;
+    while i < n {
+        var x: f64 = pet_t_at(a, i);
+        var y: f64 = pet_t_at(b, i);
+        if op == 1 {
+            pet_t_put(r, i, x + y);
+        } else if op == 2 {
+            pet_t_put(r, i, x - y);
+        } else {
+            pet_t_put(r, i, x * y);
+        }
+        i = i + 1;
+    }
+    pet_ag_record(op, r, a, b, 0.0);
+    return r;
+}
+
+pub fn pert_tensor_zeros(shape: Vec<i64>) -> i64 {
+    return pet_t_from_shape(shape, 0.0);
+}
+
+pub fn pert_tensor_ones(shape: Vec<i64>) -> i64 {
+    return pet_t_from_shape(shape, 1.0);
+}
+
+pub fn pert_tensor_filled(shape: Vec<i64>, v: f64) -> i64 {
+    return pet_t_from_shape(shape, v);
+}
+
+/// The data's integers as floats, with the given shape.
+pub fn pert_tensor_from_vec(data: Vec<i64>, shape: Vec<i64>) -> i64 {
+    var nd: i64 = shape.len();
+    var n: i64 = data.len();
+    var t: i64 = pet_t_new(nd, n);
+    var i: i64 = 0;
+    while i < nd {
+        pet_t_set_dim(t, i, shape.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        var x: i64 = data.get(i);
+        pet_t_put(t, i, x as f64);
+        i = i + 1;
+    }
+    return t;
+}
+
+pub fn pert_tensor_clone(t: i64) -> i64 {
+    return pet_t_clone(t);
+}
+
+pub fn pert_tensor_get(t: i64, idx: Vec<i64>) -> f64 {
+    var off: i64 = pet_t_offset(t, idx);
+    if off < 0 {
+        return 0.0;
+    }
+    return pet_t_at(t, off);
+}
+
+pub fn pert_tensor_set(t: i64, idx: Vec<i64>, v: f64) {
+    var off: i64 = pet_t_offset(t, idx);
+    if off >= 0 {
+        pet_t_put(t, off, v);
+    }
+}
+
+pub fn pert_tensor_shape(t: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < pet_t_ndim(t) {
+        v.push(pet_t_dim(t, i));
+        i = i + 1;
+    }
+    return v;
+}
+
+pub fn pert_tensor_ndim(t: i64) -> i64 {
+    return pet_t_ndim(t);
+}
+
+pub fn pert_tensor_size(t: i64) -> i64 {
+    return pet_t_size(t);
+}
+
+pub fn pert_tensor_len(t: i64) -> i64 {
+    return pet_t_size(t);
+}
+
+pub fn pert_tensor_reshape(t: i64, shape: Vec<i64>) -> i64 {
+    var nd: i64 = shape.len();
+    var n: i64 = 1;
+    var i: i64 = 0;
+    while i < nd {
+        n = n * shape.get(i);
+        i = i + 1;
+    }
+    if n != pet_t_size(t) {
+        pet_fail(p_str_concat(p_str_concat(p_str_concat(p_str_concat("reshape: size mismatch (", pet_int_str(pet_t_size(t))), " -> "), pet_int_str(n)), ")"));
+        return 0;
+    }
+    var r: i64 = pet_t_new(nd, pet_t_len(t));
+    i = 0;
+    while i < nd {
+        pet_t_set_dim(r, i, shape.get(i));
+        i = i + 1;
+    }
+    if pet_t_len(t) > 0 {
+        pet_c_memcpy(pet_ld(r), pet_ld(t), pet_t_len(t) * 8);
+    }
+    return r;
+}
+
+/// All axes reversed.
+pub fn pert_tensor_transpose(t: i64) -> i64 {
+    var nd: i64 = pet_t_ndim(t);
+    var r: i64 = pet_t_new(nd, pet_t_size(t));
+    var i: i64 = 0;
+    while i < nd {
+        pet_t_set_dim(r, i, pet_t_dim(t, nd - 1 - i));
+        i = i + 1;
+    }
+    var idx: i64 = pet_alloc(nd * 8);
+    var done: bool = false;
+    while !done {
+        // value at idx -> result at the reversed idx
+        var src: i64 = 0;
+        var dst: i64 = 0;
+        var k: i64 = 0;
+        while k < nd {
+            var x: i64 = pet_ld(idx + k * 8);
+            src = src + x * pet_t_stride(t, k);
+            dst = dst + x * pet_t_stride(r, nd - 1 - k);
+            k = k + 1;
+        }
+        pet_t_put(r, dst, pet_t_at(t, src));
+        // next index (row-major)
+        var carry: bool = true;
+        k = nd - 1;
+        while k >= 0 && carry {
+            var x: i64 = pet_ld(idx + k * 8) + 1;
+            if x >= pet_t_dim(t, k) {
+                pet_st(idx + k * 8, 0);
+            } else {
+                pet_st(idx + k * 8, x);
+                carry = false;
+            }
+            k = k - 1;
+        }
+        if carry {
+            done = true;
+        }
+    }
+    return r;
+}
+
+pub fn pert_tensor_add(a: i64, b: i64) -> i64 {
+    return pet_t_zip(a, b, 1, "add");
+}
+
+pub fn pert_tensor_sub(a: i64, b: i64) -> i64 {
+    return pet_t_zip(a, b, 2, "sub");
+}
+
+pub fn pert_tensor_mul(a: i64, b: i64) -> i64 {
+    return pet_t_zip(a, b, 3, "mul");
+}
+
+pub fn pert_tensor_scale(t: i64, s: f64) -> i64 {
+    var n: i64 = pet_t_len(t);
+    var r: i64 = pet_t_shaped_like(t, n);
+    var i: i64 = 0;
+    while i < n {
+        pet_t_put(r, i, pet_t_at(t, i) * s);
+        i = i + 1;
+    }
+    pet_ag_record(5, r, t, 0, s);
+    return r;
+}
+
+pub fn pert_tensor_matmul(a: i64, b: i64) -> i64 {
+    if pet_t_ndim(a) != 2 || pet_t_ndim(b) != 2 {
+        pet_fail(p_str_concat(p_str_concat(p_str_concat(p_str_concat("matmul: requires 2D tensors (got ", pet_int_str(pet_t_ndim(a))), "D and "), pet_int_str(pet_t_ndim(b))), "D)"));
+        return 0;
+    }
+    var m: i64 = pet_t_dim(a, 0);
+    var k: i64 = pet_t_dim(a, 1);
+    var n: i64 = pet_t_dim(b, 1);
+    if k != pet_t_dim(b, 0) {
+        pet_fail(p_str_concat(p_str_concat(p_str_concat(p_str_concat("matmul: inner dimension mismatch (", pet_int_str(k)), " vs "), pet_int_str(pet_t_dim(b, 0))), ")"));
+        return 0;
+    }
+    var r: i64 = pet_t_new(2, m * n);
+    pet_t_set_dim(r, 0, m);
+    pet_t_set_dim(r, 1, n);
+    var i: i64 = 0;
+    while i < m {
+        var j: i64 = 0;
+        while j < n {
+            var s: f64 = 0.0;
+            var x: i64 = 0;
+            while x < k {
+                s = s + pet_t_at(a, i * k + x) * pet_t_at(b, x * n + j);
+                x = x + 1;
+            }
+            pet_t_put(r, i * n + j, s);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    pet_ag_record(4, r, a, b, 0.0);
+    return r;
+}
+
+pub fn pert_tensor_dot(a: i64, b: i64) -> f64 {
+    if pet_t_ndim(a) != 1 || pet_t_ndim(b) != 1 {
+        pet_fail(p_str_concat(p_str_concat(p_str_concat(p_str_concat("dot: requires 1D tensors (got ", pet_int_str(pet_t_ndim(a))), "D and "), pet_int_str(pet_t_ndim(b))), "D)"));
+        return 0.0;
+    }
+    if pet_t_dim(a, 0) != pet_t_dim(b, 0) {
+        pet_fail(p_str_concat(p_str_concat(p_str_concat(p_str_concat("dot: size mismatch (", pet_int_str(pet_t_dim(a, 0))), " vs "), pet_int_str(pet_t_dim(b, 0))), ")"));
+        return 0.0;
+    }
+    var n: i64 = pet_t_len(a);
+    if pet_t_len(b) < n {
+        n = pet_t_len(b);
+    }
+    var s: f64 = -1.0 * 0.0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + pet_t_at(a, i) * pet_t_at(b, i);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// Sum of the stored values (Rust's f64 sum starts at -0.0).
+fn pet_t_sum(t: i64) -> f64 {
+    var s: f64 = -1.0 * 0.0;
+    var i: i64 = 0;
+    var n: i64 = pet_t_len(t);
+    while i < n {
+        s = s + pet_t_at(t, i);
+        i = i + 1;
+    }
+    return s;
+}
+
+pub fn pert_tensor_sum(t: i64) -> f64 {
+    var s: f64 = pet_t_sum(t);
+    pet_ag_record(8, 0, t, 0, 0.0);
+    return s;
+}
+
+pub fn pert_tensor_mean(t: i64) -> f64 {
+    var r: f64 = 0.0;
+    var n: i64 = pet_t_len(t);
+    if n > 0 {
+        r = pet_t_sum(t) / (n as f64);
+    }
+    pet_ag_record(9, 0, t, 0, 0.0);
+    return r;
+}
+
+pub fn pert_tensor_max(t: i64) -> f64 {
+    var m: f64 = pet_neg_inf();
+    var i: i64 = 0;
+    var n: i64 = pet_t_len(t);
+    while i < n {
+        var x: f64 = pet_t_at(t, i);
+        if x > m {
+            m = x;
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+pub fn pert_tensor_min(t: i64) -> f64 {
+    var m: f64 = pet_inf();
+    var i: i64 = 0;
+    var n: i64 = pet_t_len(t);
+    while i < n {
+        var x: f64 = pet_t_at(t, i);
+        if x < m {
+            m = x;
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+fn pet_relu1(x: f64) -> f64 {
+    if x > 0.0 {
+        return x;
+    }
+    return 0.0;
+}
+
+fn pet_sigmoid1(x: f64) -> f64 {
+    return 1.0 / (1.0 + pet_c_exp(0.0 - x));
+}
+
+/// A copy of t's stored values (for the tape).
+fn pet_copy_data(t: i64) -> i64 {
+    var n: i64 = pet_t_len(t);
+    var d: i64 = pet_alloc(n * 8);
+    if n > 0 {
+        pet_c_memcpy(d, pet_ld(t), n * 8);
+    }
+    return d;
+}
+
+/// relu (kind 6) / sigmoid (kind 7), recorded with the result's values, or
+/// in checkpoint mode the input's.
+fn pet_t_activation(t: i64, kind: i64) -> i64 {
+    var n: i64 = pet_t_len(t);
+    var r: i64 = pet_t_shaped_like(t, n);
+    var i: i64 = 0;
+    while i < n {
+        if kind == 6 {
+            pet_t_put(r, i, pet_relu1(pet_t_at(t, i)));
+        } else {
+            pet_t_put(r, i, pet_sigmoid1(pet_t_at(t, i)));
+        }
+        i = i + 1;
+    }
+    if pet_ag_on != 0 {
+        var e: i64 = pet_ag_record(kind, r, t, 0, 0.0);
+        if pet_ag_ckpt != 0 {
+            pet_st(e + 40, pet_copy_data(t));
+            pet_st(e + 48, n);
+            pet_st(e + 56, 1);
+        } else {
+            pet_st(e + 40, pet_copy_data(r));
+            pet_st(e + 48, n);
+            pet_st(e + 56, 0);
+        }
+    }
+    return r;
+}
+
+pub fn pert_tensor_relu(t: i64) -> i64 {
+    return pet_t_activation(t, 6);
+}
+
+pub fn pert_tensor_sigmoid(t: i64) -> i64 {
+    return pet_t_activation(t, 7);
+}
+
+/// Softmax along the last axis.
+pub fn pert_tensor_softmax(t: i64) -> i64 {
+    var r: i64 = pet_t_clone(t);
+    var nd: i64 = pet_t_ndim(t);
+    if nd == 0 {
+        return r;
+    }
+    var row: i64 = pet_t_dim(t, nd - 1);
+    if row <= 0 {
+        return r;
+    }
+    var rows: i64 = pet_t_size(t) / row;
+    var q: i64 = 0;
+    while q < rows {
+        var start: i64 = q * row;
+        var mx: f64 = pet_neg_inf();
+        var i: i64 = 0;
+        while i < row {
+            var x: f64 = pet_t_at(t, start + i);
+            if x > mx {
+                mx = x;
+            }
+            i = i + 1;
+        }
+        var s: f64 = -1.0 * 0.0;
+        i = 0;
+        while i < row {
+            var e: f64 = pet_c_exp(pet_t_at(t, start + i) - mx);
+            pet_t_put(r, start + i, e);
+            s = s + e;
+            i = i + 1;
+        }
+        i = 0;
+        while i < row {
+            pet_t_put(r, start + i, pet_t_at(r, start + i) / s);
+            i = i + 1;
+        }
+        q = q + 1;
+    }
+    return r;
+}
+
+/// The nested-bracket text of dimensions k.. starting at flat offset off.
+fn pet_t_text(t: i64, sb: i64, k: i64, off: i64) {
+    var nd: i64 = pet_t_ndim(t);
+    if nd == 0 {
+        pet_sb_add(sb, pert_to_str_float(pet_t_at(t, off)));
+        return;
+    }
+    var d: i64 = pet_t_dim(t, k);
+    var stride: i64 = pet_t_stride(t, k);
+    pet_sb_add(sb, "[");
+    var i: i64 = 0;
+    while i < d {
+        if i > 0 {
+            pet_sb_add(sb, ", ");
+        }
+        if k == nd - 1 {
+            pet_sb_add(sb, pet_elem_str(pet_t_at(t, off + i * stride)));
+        } else {
+            pet_t_text(t, sb, k + 1, off + i * stride);
+        }
+        i = i + 1;
+    }
+    pet_sb_add(sb, "]");
+}
+
+pub fn pert_tensor_to_str(t: i64) -> str {
+    if t == 0 {
+        return "[]";
+    }
+    var sb: i64 = pet_sb_new();
+    pet_t_text(t, sb, 0, 0);
+    return pet_sb_str(sb);
+}
+
+pub fn pert_tensor_to_json(t: i64) -> str {
+    var sb: i64 = pet_sb_new();
+    pet_sb_add(sb, "{\"shape\":[");
+    var i: i64 = 0;
+    while i < pet_t_ndim(t) {
+        if i > 0 {
+            pet_sb_add(sb, ",");
+        }
+        pet_sb_add(sb, pet_int_str(pet_t_dim(t, i)));
+        i = i + 1;
+    }
+    pet_sb_add(sb, "],\"data\":[");
+    i = 0;
+    while i < pet_t_len(t) {
+        if i > 0 {
+            pet_sb_add(sb, ",");
+        }
+        pet_sb_add(sb, pet_json_elem_str(pet_t_at(t, i)));
+        i = i + 1;
+    }
+    pet_sb_add(sb, "]}");
+    return pet_sb_str(sb);
+}
+
+// ─── Autograd ───────────────────────────────────────────────────────────
+//
+// A tape entry is 8 slots: [0] op (1 add, 2 sub, 3 mul, 4 matmul, 5 scale,
+// 6 relu, 7 sigmoid, 8 sum, 9 mean)  [8] result (0 for a scalar)  [16] a
+// [24] b  [32] scalar (f64 bits)  [40] saved values  [48] their count
+// [56] 1 when the saved values are the input's (checkpoint mode).
+
+fn pet_tape() -> i64 {
+    if pet_ag_tape == 0 {
+        pet_ag_tape = pet_arr_new();
+    }
+    return pet_ag_tape;
+}
+
+fn pet_tape_len() -> i64 {
+    return pet_arr_len(pet_tape()) / 8;
+}
+
+/// The address of entry i.
+fn pet_tape_entry(i: i64) -> i64 {
+    return pet_ld(pet_tape()) + i * 64;
+}
+
+/// Records an op when the tape is on; the entry's address (0 when off).
+fn pet_ag_record(op: i64, result: i64, a: i64, b: i64, s: f64) -> i64 {
+    if pet_ag_on == 0 {
+        return 0;
+    }
+    var tape: i64 = pet_tape();
+    pet_arr_push(tape, op);
+    pet_arr_push(tape, result);
+    pet_arr_push(tape, a);
+    pet_arr_push(tape, b);
+    pet_arr_push(tape, pet_bits(s));
+    pet_arr_push(tape, 0);
+    pet_arr_push(tape, 0);
+    pet_arr_push(tape, 0);
+    return pet_tape_entry(pet_tape_len() - 1);
+}
+
+fn pet_grads_init() {
+    if pet_ag_gkeys == 0 {
+        pet_ag_gkeys = pet_arr_new();
+        pet_ag_gvals = pet_arr_new();
+    }
+}
+
+fn pet_grads_clear() {
+    pet_grads_init();
+    pet_st(pet_ag_gkeys + 8, 0);
+    pet_st(pet_ag_gvals + 8, 0);
+}
+
+/// The gradient of the tensor at addr (0: none).
+fn pet_grad_find(addr: i64) -> i64 {
+    pet_grads_init();
+    var i: i64 = 0;
+    var n: i64 = pet_arr_len(pet_ag_gkeys);
+    while i < n {
+        if pet_arr_at(pet_ag_gkeys, i) == addr {
+            return pet_arr_at(pet_ag_gvals, i);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn pet_grad_put(addr: i64, g: i64) {
+    pet_grads_init();
+    var i: i64 = 0;
+    var n: i64 = pet_arr_len(pet_ag_gkeys);
+    while i < n {
+        if pet_arr_at(pet_ag_gkeys, i) == addr {
+            pet_st(pet_ld(pet_ag_gvals) + i * 8, g);
+            return;
+        }
+        i = i + 1;
+    }
+    pet_arr_push(pet_ag_gkeys, addr);
+    pet_arr_push(pet_ag_gvals, g);
+}
+
+/// Adds g into the gradient of addr (a copy of g when there is none).
+fn pet_grad_accum(addr: i64, g: i64) {
+    var ex: i64 = pet_grad_find(addr);
+    if ex == 0 {
+        pet_grad_put(addr, pet_t_clone(g));
+        return;
+    }
+    var c: i64 = pet_t_clone(ex);
+    var i: i64 = 0;
+    var n: i64 = pet_t_len(g);
+    while i < n {
+        if i < pet_t_len(c) {
+            pet_t_put(c, i, pet_t_at(c, i) + pet_t_at(g, i));
+        }
+        i = i + 1;
+    }
+    pet_grad_put(addr, c);
+}
+
+/// grad_out with every value multiplied by m.
+fn pet_t_times(g: i64, m: f64) -> i64 {
+    var r: i64 = pet_t_clone(g);
+    var i: i64 = 0;
+    while i < pet_t_len(r) {
+        pet_t_put(r, i, pet_t_at(r, i) * m);
+        i = i + 1;
+    }
+    return r;
+}
+
+/// The gradient through relu / sigmoid from the entry's saved values.
+fn pet_activation_grad(e: i64, g: i64) -> i64 {
+    var op: i64 = pet_ld(e);
+    var saved: i64 = pet_ld(e + 40);
+    var ns: i64 = pet_ld(e + 48);
+    var from_input: i64 = pet_ld(e + 56);
+    var n: i64 = pet_t_len(g);
+    if ns < n {
+        n = ns;
+    }
+    var r: i64 = pet_t_shaped_like(g, n);
+    var i: i64 = 0;
+    while i < n {
+        var v: f64 = pet_ldf(saved + i * 8);
+        var f: f64 = 0.0;
+        if op == 6 {
+            if from_input != 0 {
+                v = pet_relu1(v);
+            }
+            if v > 0.0 {
+                f = 1.0;
+            }
+        } else if from_input != 0 {
+            v = pet_sigmoid1(v);
+        }
+        if op == 6 {
+            pet_t_put(r, i, pet_t_at(g, i) * f);
+        } else {
+            pet_t_put(r, i, pet_t_at(g, i) * v * (1.0 - v));
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+/// grad(x) { ... }: a new tape, no gradients.
+pub fn pert_autograd_begin() {
+    pet_ag_on = 1;
+    pet_st(pet_tape() + 8, 0);
+    pet_grads_clear();
+}
+
+pub fn pert_autograd_end() {
+    pet_ag_on = 0;
+}
+
+/// Reverse-mode pass over the tape, seeded with 1.0 at the last sum/mean.
+pub fn pert_autograd_backward(loss: i64) {
+    pet_grads_clear();
+    var n: i64 = pet_tape_len();
+    var seeded: bool = false;
+    var i: i64 = n - 1;
+    while i >= 0 && !seeded {
+        var e: i64 = pet_tape_entry(i);
+        var op: i64 = pet_ld(e);
+        var a: i64 = pet_ld(e + 16);
+        if op == 8 {
+            pet_grad_put(a, pet_t_filled_like(a, 1.0));
+            seeded = true;
+        } else if op == 9 {
+            pet_grad_put(a, pet_t_filled_like(a, 1.0 / (pet_t_size(a) as f64)));
+            seeded = true;
+        }
+        i = i - 1;
+    }
+    if !seeded && n > 0 {
+        var last: i64 = pet_ld(pet_tape_entry(n - 1) + 8);
+        if last != 0 {
+            var g: i64 = pet_t_new(1, 1);
+            pet_t_set_dim(g, 0, 1);
+            pet_t_put(g, 0, 1.0);
+            pet_grad_put(last, g);
+        }
+    }
+    i = n - 1;
+    while i >= 0 {
+        var e: i64 = pet_tape_entry(i);
+        var op: i64 = pet_ld(e);
+        var res: i64 = pet_ld(e + 8);
+        var a: i64 = pet_ld(e + 16);
+        var b: i64 = pet_ld(e + 24);
+        var found: i64 = pet_grad_find(res);
+        if found != 0 {
+            var g: i64 = pet_t_clone(found);
+            if op == 1 || op == 3 {
+                pet_grad_accum(a, g);
+                pet_grad_accum(b, g);
+            } else if op == 2 {
+                pet_grad_accum(a, g);
+                pet_grad_accum(b, pet_t_times(g, -1.0));
+            } else if op == 4 {
+                pet_grad_accum(a, pet_t_filled_like(a, 1.0));
+                pet_grad_accum(b, pet_t_filled_like(b, 1.0));
+            } else if op == 5 {
+                pet_grad_accum(a, pet_t_times(g, pet_f(pet_ld(e + 32))));
+            } else if op == 6 || op == 7 {
+                pet_grad_accum(a, pet_activation_grad(e, g));
+            } else if op == 8 {
+                pet_grad_accum(a, pet_t_filled_like(a, 1.0));
+            } else if op == 9 {
+                pet_grad_accum(a, pet_t_filled_like(a, 1.0 / (pet_t_size(a) as f64)));
+            }
+        }
+        i = i - 1;
+    }
+}
+
+/// The gradient of t after backward (zeros of t's shape when there is none).
+pub fn pert_grad_get(t: i64) -> i64 {
+    var g: i64 = pet_grad_find(t);
+    if g != 0 {
+        return pet_t_clone(g);
+    }
+    return pet_t_filled_like(t, 0.0);
+}
+
+pub fn pert_grad_zero() {
+    pet_grads_clear();
+}
+
+pub fn pert_checkpoint_begin() {
+    pet_ag_ckpt = 1;
+}
+
+pub fn pert_checkpoint_end() {
+    pet_ag_ckpt = 0;
+}
+
+// ─── Differential privacy ───────────────────────────────────────────────
+
+pub fn pert_dp_budget_reset(limit: f64) {
+    pet_dp_used = pet_bits(0.0);
+    pet_dp_limit = pet_bits(limit);
+}
+
+pub fn pert_dp_budget_check(epsilon: f64, limit: f64) {
+    var used: f64 = pet_f(pet_dp_used) + epsilon;
+    pet_dp_used = pet_bits(used);
+    if used > limit {
+        pet_fail(p_str_concat(p_str_concat(p_str_concat("DP budget exhausted: consumed ", pert_to_str_float(used)), " > limit "), pert_to_str_float(limit)));
+    }
+}
+
+/// x >> n with zeros shifted in.
+@wrapping
+fn pet_lsr(x: i64, n: i64) -> i64 {
+    if n == 0 {
+        return x;
+    }
+    return (x >> n) & ((1 << (64 - n)) - 1);
+}
+
+@wrapping
+fn pet_rotl(x: i64, r: i64) -> i64 {
+    return (x << r) | pet_lsr(x, 64 - r);
+}
+
+/// xorshift128+, seeded from the clock (as the interpreter).
+@wrapping
+fn pet_rng_next() -> f64 {
+    if pet_rng_s0 == 0 && pet_rng_s1 == 0 {
+        var ns: i64 = pe_time_100ns() * 100;
+        pet_rng_s0 = (ns * 6364136223846793005 + 1442695040888963407) | 1;
+        pet_rng_s1 = (ns * 2862933555777941757 + 3037000493) | 1;
+    }
+    var s0: i64 = pet_rng_s0;
+    var s1: i64 = pet_rng_s1;
+    var result: i64 = s0 + s1;
+    s1 = s1 ^ s0;
+    pet_rng_s0 = pet_rotl(s0, 24) + s1;
+    pet_rng_s1 = pet_rotl(s1, 37);
+    var top: i64 = pet_lsr(result, 11);
+    return (top as f64) * (1.0 / 9007199254740992.0);
+}
+
+/// A standard normal sample (Box-Muller).
+fn pet_gaussian() -> f64 {
+    var u1: f64 = 0.0001 + pet_rng_next() * 0.9998;
+    var u2: f64 = 0.0001 + pet_rng_next() * 0.9998;
+    return pet_c_sqrt(-2.0 * pet_c_log(u1)) * pet_c_cos(2.0 * 3.141592653589793 * u2);
+}
+
+pub fn pert_dp_noise(t: i64, sigma: f64) -> i64 {
+    var r: i64 = pet_t_clone(t);
+    var i: i64 = 0;
+    while i < pet_t_len(r) {
+        pet_t_put(r, i, pet_t_at(r, i) + sigma * pet_gaussian());
+        i = i + 1;
+    }
+    return r;
+}
+
+pub fn pert_gaussian_noise(shape: Vec<i64>, sigma: f64) -> i64 {
+    var r: i64 = pet_t_from_shape(shape, 0.0);
+    var i: i64 = 0;
+    while i < pet_t_len(r) {
+        pet_t_put(r, i, sigma * pet_gaussian());
+        i = i + 1;
+    }
+    return r;
+}
+
+pub fn pert_dropout(t: i64, p: f64) -> i64 {
+    var r: i64 = pet_t_clone(t);
+    var scale: f64 = 1.0 / (1.0 - p);
+    var i: i64 = 0;
+    while i < pet_t_len(r) {
+        if pet_rng_next() < p {
+            pet_t_put(r, i, 0.0);
+        } else {
+            pet_t_put(r, i, pet_t_at(r, i) * scale);
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+// ─── Tensor parallelism (one device: rank 0 of 1) ───────────────────────
+
+pub fn pert_tp_rank() -> i64 {
+    return 0;
+}
+
+pub fn pert_tp_world_size() -> i64 {
+    return 1;
+}
+
+pub fn pert_all_reduce(t: i64) -> i64 {
+    return pet_t_clone(t);
+}
+
+pub fn pert_broadcast(t: i64) -> i64 {
+    return pet_t_clone(t);
+}
+
+pub fn pert_all_gather(t: i64) -> i64 {
+    return pet_t_clone(t);
+}
+
+pub fn pert_scatter(t: i64) -> i64 {
+    return pet_t_clone(t);
+}
+
+// ─── KV caches ──────────────────────────────────────────────────────────
+//
+// A cache: [0] layers  [8] max_seq_len  [16] window  [24] head_dim
+// [32] per layer 8 slots: K values (arr, 24 bytes inline at +0), V values
+// (arr at +24), sequence length at +48.
+
+fn pet_kv_registry() -> i64 {
+    if pet_kv_reg == 0 {
+        pet_kv_reg = pet_arr_new();
+    }
+    return pet_kv_reg;
+}
+
+/// The cache with that id (0 when there is none).
+fn pet_kv(id: i64) -> i64 {
+    if id < 0 || id >= pet_arr_len(pet_kv_registry()) {
+        return 0;
+    }
+    return pet_arr_at(pet_kv_registry(), id);
+}
+
+fn pet_kv_layer(c: i64, layer: i64) -> i64 {
+    return pet_ld(c + 32) + layer * 64;
+}
+
+fn pet_kv_hd1(c: i64) -> i64 {
+    var hd: i64 = pet_ld(c + 24);
+    if hd < 1 {
+        return 1;
+    }
+    return hd;
+}
+
+pub fn pert_kv_cache_new(num_layers: i64, max_seq_len: i64, window_size: i64, head_dim: i64) -> i64 {
+    var nl: i64 = num_layers;
+    if nl < 0 {
+        nl = 0;
+    }
+    var c: i64 = pet_alloc(40);
+    pet_st(c, nl);
+    pet_st(c + 8, max_seq_len);
+    pet_st(c + 16, window_size);
+    pet_st(c + 24, head_dim);
+    pet_st(c + 32, pet_alloc(nl * 64));
+    var reg: i64 = pet_kv_registry();
+    var id: i64 = pet_arr_len(reg);
+    pet_arr_push(reg, c);
+    return id;
+}
+
+pub fn pert_kv_cache_append(id: i64, layer: i64, k: i64, v: i64) {
+    var c: i64 = pet_kv(id);
+    if c == 0 {
+        pet_fail("kv_cache_append: invalid cache id");
+        return;
+    }
+    if layer < 0 || layer >= pet_ld(c) {
+        return;
+    }
+    var l: i64 = pet_kv_layer(c, layer);
+    pet_arr_extend(l, pet_ld(k), pet_t_len(k));
+    pet_arr_extend(l + 24, pet_ld(v), pet_t_len(v));
+    pet_st(l + 48, pet_arr_len(l) / pet_kv_hd1(c));
+    var max_seq: i64 = pet_ld(c + 8);
+    var window: i64 = pet_ld(c + 16);
+    var max_tokens: i64 = max_seq;
+    if window > 0 && window < max_seq {
+        max_tokens = window;
+    }
+    var max_vals: i64 = max_tokens * pet_ld(c + 24);
+    if pet_arr_len(l) > max_vals {
+        var excess: i64 = pet_arr_len(l) - max_vals;
+        pet_arr_drain(l, excess);
+        pet_arr_drain(l + 24, excess);
+        pet_st(l + 48, pet_arr_len(l) / pet_kv_hd1(c));
+    }
+}
+
+/// [K; V] of the layer, shape [2, seq_len, head_dim].
+pub fn pert_kv_cache_get(id: i64, layer: i64) -> i64 {
+    var c: i64 = pet_kv(id);
+    if c == 0 {
+        pet_fail("kv_cache_get: invalid cache id");
+        return 0;
+    }
+    if layer < 0 || layer >= pet_ld(c) {
+        var z: i64 = pet_t_new(2, 0);
+        pet_t_set_dim(z, 1, pet_ld(c + 24));
+        return z;
+    }
+    var l: i64 = pet_kv_layer(c, layer);
+    var nk: i64 = pet_arr_len(l);
+    var nv: i64 = pet_arr_len(l + 24);
+    var r: i64 = pet_t_new(3, nk + nv);
+    pet_t_set_dim(r, 0, 2);
+    pet_t_set_dim(r, 1, pet_ld(l + 48));
+    pet_t_set_dim(r, 2, pet_ld(c + 24));
+    if nk > 0 {
+        pet_c_memcpy(pet_ld(r), pet_ld(l), nk * 8);
+    }
+    if nv > 0 {
+        pet_c_memcpy(pet_ld(r) + nk * 8, pet_ld(l + 24), nv * 8);
+    }
+    return r;
+}
+
+pub fn pert_kv_cache_len(id: i64, layer: i64) -> i64 {
+    var c: i64 = pet_kv(id);
+    if c == 0 {
+        pet_fail("kv_cache_len: invalid cache id");
+        return 0;
+    }
+    if layer < 0 || layer >= pet_ld(c) {
+        return 0;
+    }
+    return pet_ld(pet_kv_layer(c, layer) + 48);
+}
+
+pub fn pert_kv_cache_clear(id: i64) {
+    var c: i64 = pet_kv(id);
+    if c == 0 {
+        pet_fail("kv_cache_clear: invalid cache id");
+        return;
+    }
+    var i: i64 = 0;
+    while i < pet_ld(c) {
+        var l: i64 = pet_kv_layer(c, i);
+        pet_st(l + 8, 0);
+        pet_st(l + 32, 0);
+        pet_st(l + 48, 0);
+        i = i + 1;
+    }
+}
+
+/// Drops the oldest n tokens of every layer.
+pub fn pert_kv_cache_evict(id: i64, n: i64) {
+    var c: i64 = pet_kv(id);
+    if c == 0 {
+        pet_fail("kv_cache_evict: invalid cache id");
+        return;
+    }
+    var vals: i64 = n * pet_ld(c + 24);
+    var i: i64 = 0;
+    while i < pet_ld(c) {
+        var l: i64 = pet_kv_layer(c, i);
+        if pet_arr_len(l) >= vals {
+            pet_arr_drain(l, vals);
+            pet_arr_drain(l + 24, vals);
+            pet_st(l + 48, pet_arr_len(l) / pet_kv_hd1(c));
+        } else {
+            pet_st(l + 8, 0);
+            pet_st(l + 32, 0);
+            pet_st(l + 48, 0);
+        }
+        i = i + 1;
+    }
+}
+
+// ─── Quantization (int8 values held as floats) ──────────────────────────
+
+/// round(v / scale) as i32 + zero_point, clamped to [-128, 127].
+pub fn pert_quantize_q8(t: i64, scale: f64, zero_point: i64) -> i64 {
+    var r: i64 = pet_t_clone(t);
+    var i: i64 = 0;
+    while i < pet_t_len(r) {
+        var q: f64 = pet_round(pet_t_at(t, i) / scale);
+        if q != q {
+            q = 0.0;
+        }
+        if q > 2147483647.0 {
+            q = 2147483647.0;
+        }
+        if q < -2147483648.0 {
+            q = -2147483648.0;
+        }
+        var qi: i64 = (q as i64) + zero_point;
+        if qi < -128 {
+            qi = -128;
+        }
+        if qi > 127 {
+            qi = 127;
+        }
+        pet_t_put(r, i, qi as f64);
+        i = i + 1;
+    }
+    return r;
+}
+
+pub fn pert_dequantize_q8(t: i64, scale: f64, zero_point: i64) -> i64 {
+    var r: i64 = pet_t_clone(t);
+    var zp: f64 = zero_point as f64;
+    var i: i64 = 0;
+    while i < pet_t_len(r) {
+        pet_t_put(r, i, (pet_t_at(t, i) - zp) * scale);
+        i = i + 1;
+    }
+    return r;
+}
+
+/// f64 as i32 (saturating, NaN -> 0).
+fn pet_to_i32(x: f64) -> i64 {
+    if x != x {
+        return 0;
+    }
+    if x >= 2147483647.0 {
+        return 2147483647;
+    }
+    if x <= -2147483648.0 {
+        return -2147483648;
+    }
+    return x as i64;
+}
+
+/// Wraps to a signed 32-bit value.
+@wrapping
+fn pet_wrap32(x: i64) -> i64 {
+    return ((x + 2147483648) & 4294967295) - 2147483648;
+}
+
+/// Matrix product with int32 (wrapping) accumulation.
+@wrapping
+pub fn pert_qmatmul(a: i64, b: i64) -> i64 {
+    if pet_t_ndim(a) != 2 || pet_t_ndim(b) != 2 {
+        pet_fail("qmatmul: expected 2D tensors");
+        return 0;
+    }
+    var m: i64 = pet_t_dim(a, 0);
+    var k: i64 = pet_t_dim(a, 1);
+    var n: i64 = pet_t_dim(b, 1);
+    if pet_t_dim(b, 0) != k {
+        pet_fail(p_str_concat(p_str_concat(p_str_concat(p_str_concat(p_str_concat(p_str_concat(p_str_concat(p_str_concat("qmatmul: shape mismatch: (", pet_int_str(m)), ","), pet_int_str(k)), ") x ("), pet_int_str(pet_t_dim(b, 0))), ","), pet_int_str(n)), ")"));
+        return 0;
+    }
+    var r: i64 = pet_t_new(2, m * n);
+    pet_t_set_dim(r, 0, m);
+    pet_t_set_dim(r, 1, n);
+    var i: i64 = 0;
+    while i < m {
+        var j: i64 = 0;
+        while j < n {
+            var acc: i64 = 0;
+            var x: i64 = 0;
+            while x < k {
+                var qa: i64 = pet_to_i32(pet_t_at(a, i * k + x));
+                var qb: i64 = pet_to_i32(pet_t_at(b, x * n + j));
+                acc = pet_wrap32(acc + pet_wrap32(qa * qb));
+                x = x + 1;
+            }
+            pet_t_put(r, i * n + j, acc as f64);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+/// "scale,zero_point": symmetric, scale = max(|min|, |max|) / 127.
+pub fn pert_find_quant_params(t: i64) -> str {
+    var mn: f64 = pet_inf();
+    var mx: f64 = pet_neg_inf();
+    var i: i64 = 0;
+    while i < pet_t_len(t) {
+        var x: f64 = pet_t_at(t, i);
+        if x < mn {
+            mn = x;
+        }
+        if x > mx {
+            mx = x;
+        }
+        i = i + 1;
+    }
+    var abs_max: f64 = pet_c_fabs(mn);
+    if pet_c_fabs(mx) > abs_max {
+        abs_max = pet_c_fabs(mx);
+    }
+    var scale: f64 = 1.0;
+    if abs_max > 0.0 {
+        scale = abs_max / 127.0;
+    }
+    return p_str_concat(pert_to_str_float(scale), ",0");
+}
