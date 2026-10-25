@@ -36,22 +36,34 @@ jobs:
         shell: bash
         run: |
           cargo build --release
-          # Stage the binaries where fides.nsi expects them. fides.exe is the
-          # bootstrap compiler under the name the installer has always used;
-          # fidesc.exe is the same binary under its canonical name, alongside
-          # the companion tools.
+          # Stage the binaries where fides.nsi expects them: fidesc.exe (the
+          # Rust bootstrap compiler) and the companion tools.
           mkdir -p release
-          cp target/release/fidesc.exe release/fides-c3.exe
           cp target/release/fidesc.exe release/fidesc.exe
           cp target/release/ark.exe    release/ark.exe
           cp target/release/scribe.exe release/scribe.exe
           cp target/release/veil.exe   release/veil.exe
+
+      - name: Install zig (C compiler for the self-hosted build)
+        shell: bash
+        run: choco install zig -y
+
+      - name: Build the self-hosted compiler (3 stages, fixpoint)
+        shell: bash
+        run: |
+          # fides.exe is the self-hosted compiler: built by the Rust compiler,
+          # then by itself twice; stage 2 and 3 must emit identical C. The
+          # stage-3 binary becomes release/fides-c3.exe, after a check that it
+          # runs a program from an installed layout.
+          RELEASE=1 STAGE0=./target/release/fidesc.exe CC="zig cc" ./scripts/bootstrap.sh build/bootstrap 3
 
       - name: Verify build
         shell: bash
         run: |
           ./release/fidesc.exe version
           ./release/fidesc.exe run tests/bootstrap/hello.fd
+          ./release/fides-c3.exe version
+          ./release/fides-c3.exe run tests/bootstrap/hello.fd
           ./release/ark.exe --help >/dev/null 2>&1 || ./release/ark.exe >/dev/null 2>&1 || true
 
       - name: Install NSIS

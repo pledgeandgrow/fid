@@ -840,6 +840,8 @@ pub fn build_program_no_std_borrowck(source: str, source_path: OptStr, borrowck_
             }
             TypeChecker_register_program(&mut tc, user, user_module);
             TypeChecker_register_trait_impls(&mut tc, program);
+            TypeChecker_register_generated_decls(&mut tc, program);
+            TypeChecker_verify_trait_impls(&mut tc, program);
             TypeChecker_collect_capabilities(&mut tc, user);
             TypeChecker_check_bodies(&mut tc, program);
             // Also check imported module bodies
@@ -925,6 +927,62 @@ pub var g_stdlib_cache: OptProgram = OptProgram::None;
 var g_stdlib_struct_names: Vec<str> = Vec::new();
 var g_stdlib_enum_names: Vec<str> = Vec::new();
 var g_stdlib_cache_init: bool = false;
+var g_stdlib_dir_found: bool = false;
+var g_stdlib_dir: str = "stdlib";
+
+/// The standard library's directory: ./stdlib (the repository), else that
+/// of an installed toolchain: $FID_HOME/stdlib, <exe dir>/stdlib,
+/// <exe dir>/../stdlib (as the Rust compiler looks).
+pub fn stdlib_dir() -> str {
+    if g_stdlib_dir_found {
+        return g_stdlib_dir;
+    }
+    g_stdlib_dir_found = true;
+    var candidates: Vec<str> = Vec::new();
+    candidates.push("stdlib");
+    var home: str = env_or_empty("FID_HOME");
+    if str_len(home) > 0 {
+        candidates.push(c_path_join(home, "stdlib"));
+    }
+    var dir: str = exe_dir();
+    candidates.push(c_path_join(dir, "stdlib"));
+    candidates.push(c_path_join(c_path_dirname(dir), "stdlib"));
+    var i: i64 = 0;
+    while i < candidates.len() {
+        if c_file_exists(c_path_join(candidates.get(i), "core.fd")) {
+            g_stdlib_dir = candidates.get(i);
+            return g_stdlib_dir;
+        }
+        i = i + 1;
+    }
+    return g_stdlib_dir;
+}
+
+/// The directory of this compiler's executable: from argv[0], or (started
+/// by name, as `fides run x.fd`) the PATH entry that holds it.
+fn exe_dir() -> str {
+    var exe: str = p_argv(0);
+    if str_contains(exe, "/") || str_contains(exe, "\\") {
+        return c_path_dirname(exe);
+    }
+    var path: str = env_or_empty("PATH");
+    var sep: str = ":";
+    if str_contains(path, ";") {
+        sep = ";";
+    }
+    var dirs: Vec<str> = str_split(path, sep);
+    var i: i64 = 0;
+    while i < dirs.len() {
+        var d: str = dirs.get(i);
+        if str_len(d) > 0 {
+            if c_file_exists(c_path_join(d, exe)) || c_file_exists(c_path_join(d, exe + ".exe")) {
+                return d;
+            }
+        }
+        i = i + 1;
+    }
+    return ".";
+}
 
 /// G8.7: Global lint warnings populated by build_program_with_path.
 /// Read by lint_source after a successful build.
@@ -947,7 +1005,7 @@ pub fn get_cached_stdlib() -> OptProgram {
         return g_stdlib_cache;
     }
     // Parse stdlib/core.fd
-    var stdlib_raw: str = p_file_read("stdlib/core.fd");
+    var stdlib_raw: str = p_file_read(c_path_join(stdlib_dir(), "core.fd"));
     if stdlib_raw == 0 {
         return OptProgram::None;
     }
@@ -1117,8 +1175,8 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                             var candidates: Vec<str> = Vec::new();
                             candidates.push(c_path_join(base_dir, str_concat(path_str, ".fd")));
                             candidates.push(c_path_join(base_dir, c_path_join(path_str, "mod.fd")));
-                            candidates.push(c_path_join("stdlib", str_concat(path_str, ".fd")));
-                            candidates.push(c_path_join("stdlib", c_path_join(path_str, "mod.fd")));
+                            candidates.push(c_path_join(stdlib_dir(), str_concat(path_str, ".fd")));
+                            candidates.push(c_path_join(stdlib_dir(), c_path_join(path_str, "mod.fd")));
                             candidates.push(c_path_join(project_root, str_concat(path_str, ".fd")));
                             candidates.push(c_path_join(project_root, c_path_join(path_str, "mod.fd")));
 
@@ -1334,6 +1392,24 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         return ResultProgram::Err(super_errors);
                     }
 
+                    // A function defined twice in one module used to collapse
+                    // silently into one (src/compiler.rs find_module_conflicts).
+                    var dup_errors: Vec<str> = Vec::new();
+                    var dmi: i64 = 0;
+                    while dmi < imported_modules.len() {
+                        cc_find_duplicate_funcs(imported_modules.get(dmi), imported_module_names.get(dmi), dup_errors);
+                        dmi = dmi + 1;
+                    }
+                    var dup_user_module: str = "main";
+                    match user.module {
+                        OptStr::Some(um) => { dup_user_module = um; }
+                        OptStr::None => {}
+                    }
+                    cc_find_duplicate_funcs(user, dup_user_module, dup_errors);
+                    if dup_errors.len() > 0 {
+                        return ResultProgram::Err(dup_errors);
+                    }
+
                     // Merge: start with stdlib, then imported modules, then user
                     var program: Program = stdlib;
 
@@ -1392,6 +1468,8 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     TypeChecker_register_program(&mut tc, user, user_module);
 
                     TypeChecker_register_trait_impls(&mut tc, program);
+                    TypeChecker_register_generated_decls(&mut tc, program);
+                    TypeChecker_verify_trait_impls(&mut tc, program);
                     TypeChecker_collect_capabilities(&mut tc, user);
                     TypeChecker_check_bodies(&mut tc, program);
 
@@ -1617,6 +1695,8 @@ pub fn lint_source(source: str, source_path: str) -> ResultVecStr {
                     TypeChecker_register_program(&mut tc, stdlib, stdlib_module);
                     TypeChecker_register_program(&mut tc, user, user_module);
                     TypeChecker_register_trait_impls(&mut tc, program);
+                    TypeChecker_register_generated_decls(&mut tc, program);
+                    TypeChecker_verify_trait_impls(&mut tc, program);
                     TypeChecker_collect_capabilities(&mut tc, user);
                     TypeChecker_check_bodies(&mut tc, program);
 
@@ -2067,6 +2147,30 @@ pub fn get_diagnostics(source: str, source_path: OptStr) -> Vec<StrTriple> {
 // ===========================================================================
 
 /// Merge two programs: user definitions take priority over stdlib.
+/// Report functions defined twice within one module (platform
+/// alternatives selected by @cfg are filtered later and are skipped).
+fn cc_find_duplicate_funcs(prog: Program, module: str, errors: Vec<str>) {
+    var seen: Vec<str> = Vec::new();
+    var fi: i64 = 0;
+    while fi < prog.funcs.len() {
+        var f: Func = prog.funcs.get(fi);
+        var is_cfg: bool = false;
+        var ai: i64 = 0;
+        while ai < f.annotations.len() {
+            if f.annotations.get(ai).name == "cfg" { is_cfg = true; }
+            ai = ai + 1;
+        }
+        if !is_cfg {
+            if cc_c_str_vec_contains(seen, f.name) {
+                errors.push("Duplicate definition: function '" + f.name + "' is defined twice in module '" + module + "'");
+            } else {
+                seen.push(f.name);
+            }
+        }
+        fi = fi + 1;
+    }
+}
+
 pub fn merge_programs(stdlib: Program, user: Program) -> Program {
     // Build sets of user-defined names for conflict detection
     var user_func_names: Vec<str> = Vec::new();
@@ -2747,6 +2851,168 @@ pub fn desugar_phase8b(program: &mut Program) {
     }
     var empty_sms: Vec<StateMachineDef> = Vec::new();
     program.state_machines = empty_sms;
+
+    // F18: Desugar systems -> functions (their query statements are
+    // desugared below with every other function body).
+    var syi: i64 = 0;
+    while syi < program.systems.len() {
+        var sys: SystemDef = program.systems.get(syi);
+        program.funcs.push(Func_new_full(sys.name, sys.params, Type::Void, sys.body, sys.is_pub));
+        syi = syi + 1;
+    }
+    var empty_systems: Vec<SystemDef> = Vec::new();
+    program.systems = empty_systems;
+
+    // F18: Desugar query statements -> loops over entities.
+    var qfi: i64 = 0;
+    while qfi < program.funcs.len() {
+        var qf: Func = program.funcs.get(qfi);
+        if stmts_have_query(qf.body) {
+            qf.body = desugar_query_stmts(qf.body);
+            program.funcs.set(qfi, qf);
+        }
+        qfi = qfi + 1;
+    }
+    var qii: i64 = 0;
+    while qii < program.impls.len() {
+        var qimp: ImplDef = program.impls.get(qii);
+        var changed: bool = false;
+        var qmi: i64 = 0;
+        while qmi < qimp.methods.len() {
+            var qm: Func = qimp.methods.get(qmi);
+            if stmts_have_query(qm.body) {
+                qm.body = desugar_query_stmts(qm.body);
+                qimp.methods.set(qmi, qm);
+                changed = true;
+            }
+            qmi = qmi + 1;
+        }
+        if changed { program.impls.set(qii, qimp); }
+        qii = qii + 1;
+    }
+}
+
+/// Whether any statement (at any depth) is a `query`.
+fn stmts_have_query(stmts: Vec<Stmt>) -> bool {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        match stmts.get(i) {
+            Stmt::Query(_, _, _) => { return true; }
+            Stmt::If(_, tb, eb, _) => {
+                if stmts_have_query(tb) { return true; }
+                match eb {
+                    OptStmts::Some(e) => { if stmts_have_query(e) { return true; } }
+                    OptStmts::None => {}
+                }
+            }
+            Stmt::While(_, b, _) => { if stmts_have_query(b) { return true; } }
+            Stmt::For(_, _, b, _) => { if stmts_have_query(b) { return true; } }
+            Stmt::Loop(b, _) => { if stmts_have_query(b) { return true; } }
+            Stmt::Defer(b, _) => { if stmts_have_query(b) { return true; } }
+            Stmt::Match(_, arms, _) => {
+                var ai: i64 = 0;
+                while ai < arms.len() {
+                    if stmts_have_query(arms.get(ai).body) { return true; }
+                    ai = ai + 1;
+                }
+            }
+            Stmt::Handle(b, hs, _) => {
+                if stmts_have_query(b) { return true; }
+                var hi: i64 = 0;
+                while hi < hs.len() {
+                    if stmts_have_query(hs.get(hi).body) { return true; }
+                    hi = hi + 1;
+                }
+            }
+            Stmt::RegionBlock(_, _, _, _, _, b, _) => { if stmts_have_query(b) { return true; } }
+            Stmt::Sandbox(b, _) => { if stmts_have_query(b) { return true; } }
+            Stmt::Unsafe(b, _) => { if stmts_have_query(b) { return true; } }
+            Stmt::Txn(b, _) => { if stmts_have_query(b) { return true; } }
+            Stmt::ComptimeGen(b, _) => { if stmts_have_query(b) { return true; } }
+            Stmt::GradBlock(_, b, _) => { if stmts_have_query(b) { return true; } }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// `query (A, B) { body }` -> `for entity in 0..__ecs_entity_count() {
+/// if __ecs_has("A", entity) != 0 && __ecs_has("B", entity) != 0 { body } }`
+/// (src/compiler.rs desugar_query_stmts), recursively.
+fn desugar_query_stmts(stmts: Vec<Stmt>) -> Vec<Stmt> {
+    var out: Vec<Stmt> = Vec::new();
+    var i: i64 = 0;
+    while i < stmts.len() {
+        var st: Stmt = stmts.get(i);
+        match st {
+            Stmt::Query(components, body, _) => {
+                var qbody: Vec<Stmt> = desugar_query_stmts(body);
+                var cond: Expr = Expr::BoolLit(true);
+                var has_cond: bool = false;
+                var ci: i64 = 0;
+                while ci < components.len() {
+                    var has_args: Vec<Expr> = Vec::new();
+                    has_args.push(Expr::StringLit(components.get(ci)));
+                    has_args.push(Expr::Ident("entity"));
+                    var check: Expr = Expr::Binary(BinOp::Neq, Box::new(Expr::Call("__ecs_has", has_args)), Box::new(Expr::IntLit(0)));
+                    if has_cond {
+                        cond = Expr::Binary(BinOp::And, Box::new(cond), Box::new(check));
+                    } else {
+                        cond = check;
+                        has_cond = true;
+                    }
+                    ci = ci + 1;
+                }
+                var for_body: Vec<Stmt> = Vec::new();
+                for_body.push(Stmt::If(cond, qbody, OptStmts::None, 0));
+                var range: Expr = Expr::Range(Box::new(Expr::IntLit(0)), Box::new(Expr::Call("__ecs_entity_count", Vec::new())), false);
+                out.push(Stmt::For("entity", range, for_body, 0));
+            }
+            Stmt::If(c, tb, eb, line) => {
+                var neb: OptStmts = OptStmts::None;
+                match eb {
+                    OptStmts::Some(e) => { neb = OptStmts::Some(desugar_query_stmts(e)); }
+                    OptStmts::None => {}
+                }
+                out.push(Stmt::If(c, desugar_query_stmts(tb), neb, line));
+            }
+            Stmt::While(c, b, line) => { out.push(Stmt::While(c, desugar_query_stmts(b), line)); }
+            Stmt::For(v, it, b, line) => { out.push(Stmt::For(v, it, desugar_query_stmts(b), line)); }
+            Stmt::Loop(b, line) => { out.push(Stmt::Loop(desugar_query_stmts(b), line)); }
+            Stmt::Defer(b, line) => { out.push(Stmt::Defer(desugar_query_stmts(b), line)); }
+            Stmt::Match(e, arms, line) => {
+                var narms: Vec<MatchArm> = Vec::new();
+                var ai: i64 = 0;
+                while ai < arms.len() {
+                    var arm: MatchArm = arms.get(ai);
+                    narms.push(MatchArm_new(arm.pattern, arm.guard, desugar_query_stmts(arm.body)));
+                    ai = ai + 1;
+                }
+                out.push(Stmt::Match(e, narms, line));
+            }
+            Stmt::Handle(b, hs, line) => {
+                var nhs: Vec<EffectHandler> = Vec::new();
+                var hi: i64 = 0;
+                while hi < hs.len() {
+                    var h: EffectHandler = hs.get(hi);
+                    h.body = desugar_query_stmts(h.body);
+                    nhs.push(h);
+                    hi = hi + 1;
+                }
+                out.push(Stmt::Handle(desugar_query_stmts(b), nhs, line));
+            }
+            Stmt::RegionBlock(n, bud, g, kv, ws, b, line) => { out.push(Stmt::RegionBlock(n, bud, g, kv, ws, desugar_query_stmts(b), line)); }
+            Stmt::Sandbox(b, line) => { out.push(Stmt::Sandbox(desugar_query_stmts(b), line)); }
+            Stmt::Unsafe(b, line) => { out.push(Stmt::Unsafe(desugar_query_stmts(b), line)); }
+            Stmt::Txn(b, line) => { out.push(Stmt::Txn(desugar_query_stmts(b), line)); }
+            Stmt::ComptimeGen(b, line) => { out.push(Stmt::ComptimeGen(desugar_query_stmts(b), line)); }
+            Stmt::GradBlock(n, b, line) => { out.push(Stmt::GradBlock(n, desugar_query_stmts(b), line)); }
+            _ => { out.push(st); }
+        }
+        i = i + 1;
+    }
+    return out;
 }
 
 /// Helper: create a Vec with one Func element.
@@ -2795,6 +3061,7 @@ pub fn fill_default_trait_methods(program: &mut Program) {
         }
 
         // For each trait method with a default body not in provided, add it
+        var added: bool = false;
         var m: i64 = 0;
         while m < trait_def.methods.len() {
             var tm: TraitMethod = trait_def.methods.get(m);
@@ -2820,15 +3087,13 @@ pub fn fill_default_trait_methods(program: &mut Program) {
                     }
                     // Add the method to the trait impl
                     var new_func: Func = Func_new_full(tm.name, params, tm.ret_ty, default_body, tm.is_pub);
-                    // We can't mutate trait_impls in place easily in Fides,
-                    // so we collect new methods and rebuild
-                    // Actually, since trait_impls is Vec<TraitImpl>, we need
-                    // to push the method into the impl's methods vec
-                    // This is a limitation -- for now, skip this
+                    ti.methods.push(new_func);
+                    added = true;
                 }
             }
             m = m + 1;
         }
+        if added { program.trait_impls.set(i, ti); }
         i = i + 1;
     }
 }
@@ -3322,7 +3587,10 @@ pub fn c_file_read(path: str) -> str {
 
 /// Get the directory part of a path (everything before the last /).
 pub fn c_path_dirname(path: str) -> str {
+    // Either separator (a Windows path: C:\Fides\fides.exe)
     var idx: i64 = c_str_find_last(path, "/");
+    var bidx: i64 = c_str_find_last(path, "\\");
+    if bidx > idx { idx = bidx; }
     if idx < 0 { return "."; }
     if idx == 0 { return "/"; }
     return c_str_substr(path, 0, idx);

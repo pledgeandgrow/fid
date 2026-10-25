@@ -385,6 +385,7 @@ impl Lexer {
         self.advance(); // consume opening '"'
 
         var s: str = "";
+        var nul_at: i64 = -1;
         while self.pos < self.src_len && self.peek() != 34 {
             var c: i64 = self.peek();
             if c == 92 {
@@ -396,7 +397,14 @@ impl Lexer {
                 else if esc == 114 { s = str_concat(s, "\r"); }  // r
                 else if esc == 92 { s = str_concat(s, "\\"); }   // backslash
                 else if esc == 34 { s = str_concat(s, "\""); }   // '"'
-                else if esc == 48 { s = str_concat(s, byte_to_str(0)); } // NUL
+                else if esc == 48 { if nul_at < 0 { nul_at = str_len(s); } } // NUL: the C string ends here
+                else if esc == 120 || (esc == 117 && self.peek() == 123) {    // xHH, u{...}
+                    var hv: i64 = 0;
+                    if esc == 120 { hv = self.read_hex_value(line, col, 2, false); }
+                    else { self.advance(); hv = self.read_hex_value(line, col, 6, true); }
+                    if hv == 0 { if nul_at < 0 { nul_at = str_len(s); } }   // NUL: the C string ends here
+                    else { s = str_concat(s, lex_utf8_encode(hv)); }
+                }
                 else {
                     self.errors.push(lex_error(line, col, "unknown escape sequence \\" + byte_to_str(esc)));
                     s = str_concat(s, byte_to_str(esc));
@@ -434,6 +442,7 @@ impl Lexer {
         } else {
             self.errors.push(lex_error(line, col, "unterminated f-string"));
         }
+        if nul_at >= 0 { s = str_slice(s, 0, nul_at); }
 
         return token_new(TokenKind::FString(s), line, col);
     }
@@ -444,6 +453,7 @@ impl Lexer {
         self.advance(); // consume opening '"'
 
         var s: str = "";
+        var nul_at: i64 = -1;
         while self.pos < self.src_len && self.peek() != 34 {
             var c: i64 = self.peek();
             if c == 92 {
@@ -455,7 +465,14 @@ impl Lexer {
                 else if esc == 114 { s = str_concat(s, "\r"); }  // r
                 else if esc == 92 { s = str_concat(s, "\\"); }   // backslash
                 else if esc == 34 { s = str_concat(s, "\""); }   // '"'
-                else if esc == 48 { s = str_concat(s, byte_to_str(0)); } // NUL
+                else if esc == 48 { if nul_at < 0 { nul_at = str_len(s); } } // NUL: the C string ends here
+                else if esc == 120 || (esc == 117 && self.peek() == 123) {    // xHH, u{...}
+                    var hv: i64 = 0;
+                    if esc == 120 { hv = self.read_hex_value(line, col, 2, false); }
+                    else { self.advance(); hv = self.read_hex_value(line, col, 6, true); }
+                    if hv == 0 { if nul_at < 0 { nul_at = str_len(s); } }   // NUL: the C string ends here
+                    else { s = str_concat(s, lex_utf8_encode(hv)); }
+                }
                 else {
                     self.errors.push(lex_error(line, col, "unknown escape sequence \\" + byte_to_str(esc)));
                     s = str_concat(s, byte_to_str(esc));
@@ -470,6 +487,7 @@ impl Lexer {
         } else {
             self.errors.push(lex_error(line, col, "unterminated string"));
         }
+        if nul_at >= 0 { s = str_slice(s, 0, nul_at); }
 
         return token_new(TokenKind::StringLit(s), line, col);
     }
@@ -862,6 +880,19 @@ pub fn lex_is_digit(c: i64) -> bool {
 
 pub fn lex_is_alphanumeric(c: i64) -> bool {
     return lex_is_alpha(c) || lex_is_digit(c);
+}
+
+/// UTF-8 encoding of the scalar `cp` (escape sequences in strings: Rust's
+/// String::push(char) in src/lexer.rs stores the char as UTF-8).
+pub fn lex_utf8_encode(cp: i64) -> str {
+    if cp < 128 { return byte_to_str(cp); }
+    if cp < 2048 {
+        return byte_to_str(192 + cp / 64) + byte_to_str(128 + cp % 64);
+    }
+    if cp < 65536 {
+        return byte_to_str(224 + cp / 4096) + byte_to_str(128 + (cp / 64) % 64) + byte_to_str(128 + cp % 64);
+    }
+    return byte_to_str(240 + cp / 262144) + byte_to_str(128 + (cp / 4096) % 64) + byte_to_str(128 + (cp / 64) % 64) + byte_to_str(128 + cp % 64);
 }
 
 pub fn lex_is_hexdigit(c: i64) -> bool {

@@ -3,7 +3,9 @@
 #
 # Requirements:
 #   - NSIS 3.x installed (sudo apt install nsis on Ubuntu/Debian)
-#   - The Fides compiler built at release/fides-c3.exe
+#   - The self-hosted compiler at release/fides-c3.exe (built here when
+#     missing: RELEASE=1 ./scripts/bootstrap.sh, which needs
+#     target/release/fidesc and a C compiler)
 #   - stdlib/ and runtime/ directories present
 #
 # Usage:
@@ -36,8 +38,12 @@ echo "  OK: $(makensis /VERSION)"
 
 echo "[check] Compiler..."
 if [ ! -f "release/fides-c3.exe" ]; then
-    echo "ERROR: release/fides-c3.exe not found. Build the compiler first."
-    exit 1
+    # The self-hosted compiler: 3-stage bootstrap with a fixpoint check
+    echo "  release/fides-c3.exe not found: building it (scripts/bootstrap.sh)..."
+    if ! RELEASE=1 ./scripts/bootstrap.sh build/bootstrap 3; then
+        echo "ERROR: the self-hosted build failed (see above)."
+        exit 1
+    fi
 fi
 echo "  OK: $(ls -lh release/fides-c3.exe | awk '{print $5}')"
 

@@ -1947,8 +1947,12 @@ fn real_main() {
                             let c_norm = c_stdout.replace("\r\n", "\n");
                             let i_norm = interp_stdout.replace("\r\n", "\n");
                             // An expected-fail test that panics at run time
-                            // has failed, whatever it printed before.
-                            c_norm == i_norm && (!fail_only || c_out.status.success())
+                            // has failed, whatever it printed before; a
+                            // reference run must exit successfully (its
+                            // output is compared with itself).
+                            c_norm == i_norm
+                                && (!fail_only || c_out.status.success())
+                                && (!run.interp_skipped || c_out.status.success())
                         } else {
                             false
                         }

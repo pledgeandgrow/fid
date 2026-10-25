@@ -1,5 +1,84 @@
 # Fides Language Changelog
 
+## Session 33 — The Self-Hosted Compiler Is the Release Compiler (Oct 25, 2026)
+
+### `fides run` and `fides ccompile` now match the Rust compiler
+
+The self-hosted compiler (`compiler/*.fd`) compiled itself to a fixpoint,
+but on other programs it was far from the Rust compiler: of the 243 test
+programs that must run, its interpreter printed the right output for 79 and
+its C path for 164. Now:
+
+| Self-hosted | `run` | `ccompile` |
+|-------------|-------|------------|
+| Test programs (of 243) | 241 | 238 |
+| Examples (of 10) | 10 | 8 |
+
+What is left: two tests print timings or random noise (they differ from run
+to run on any compiler), `test_sqlite` needs libsqlite3, `test_token_full`
+has no `main`, `minimal_game` needs SDL2 and `riscv_blink` has a syntax
+error in the example itself. One expected-fail test,
+`test_money_conserve_fail`, is accepted by the self-hosted compiler (the
+Rust compiler rejects it).
+
+**Interpreter (`compiler/interp.fd`)**, ported from `src/interp.rs`:
+
+- A jump between basic blocks ended the function: any `if`, loop or `match`
+  stopped it.
+- A byte load at a string's address returned the whole string (string loops
+  never ended); a builtin of the same name replaced core's own
+  `p_str_equal`, `p_str_length`, ... (map lookups failed).
+- Stores (struct copies, pointee widths, side table), printing,
+  float bit casts, globals beyond the first megabyte, trait objects.
+- The builtins: futures, threads and executors, atomics, mutexes, TLS,
+  channels, JSON, HTTP and DB simulation, SIMD, C math, ECS, tensors with
+  the autograd tape, volatile memory, the environment.
+- Speed: a hash table for the side table, cached function lookups (the
+  test survey runs in half the time).
+- `run` exits with main's result and prints `Panic: ...` with the stack
+  trace, as `fidesc run` does.
+
+**Front end and C backend** (lower, typechecker, comptime_eval, compiler,
+codegen_c, lexer, parser), ported from their Rust counterparts:
+
+- The comptime loop unroller put the first iteration's value in every
+  iteration (`for i in 0..5 { sum += i }` gave 0).
+- String and HashMap method results were typed i64 (they printed as
+  numbers); generic enum payloads, tuples, array literals, type aliases,
+  struct spread, match guards and shadowing, `??`, `is`, closures' return
+  types, `dyn` calls, vec swizzles, effect-handler continuations, `@audit`.
+- The checks the Rust typechecker makes: field privacy, @checkpoint, @dp,
+  @shard, @quantized, @gas, @realtime, `given` contracts, duplicate
+  functions, default trait methods, second `impl` blocks.
+- Comptime functions and reflection evaluate; `\xHH` and `\u{...}` escapes;
+  `static` globals.
+- C runtime: float printing freed arena memory (crashed), conflicting
+  `printf` declarations, JSON, autograd and volatile builtins; the C
+  compiler gets `-fno-strict-aliasing -fno-strict-overflow` as with the
+  Rust compiler.
+- The self-hosted `ccompile` crashed when `CC` was not set.
+- `p_gt_is_done` was typed i64 by the self-hosted typechecker (its
+  lowering says bool): `!p_gt_is_done(id)` was rejected.
+
+### Test harness and PE runtime
+
+- For the tests that run the whole self-hosted compiler, the C build's
+  output is the reference, so it was compared with itself and could not
+  fail (`test_spawn_gt` had been failing unseen). The reference run must
+  now exit successfully.
+- `p_exit` on native Windows executables (`ExitProcess`).
+
+### Installed toolchain
+
+- The self-hosted compiler finds the standard library next to itself
+  (`$FID_HOME/stdlib`, `<exe dir>/stdlib`, `<exe dir>/../stdlib`), also when
+  started by name from PATH; before, only from the repository root.
+- `RELEASE=1 ./scripts/bootstrap.sh` builds it in three stages, checks the
+  fixpoint and installs `release/fides-c3.exe`, after running a program from
+  an installed layout. The installer workflow builds it this way and ships
+  it as `fides.exe` (with `fidesc.exe`, the Rust compiler, beside it), and
+  the installer includes the example programs.
+
 ## Session 32 — Native Windows Executables Run Every Test (Oct 25, 2026)
 
 ### A Fides runtime for the PE backend

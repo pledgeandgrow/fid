@@ -3,6 +3,10 @@
 #
 # Usage:
 #   ./scripts/bootstrap.sh [out_dir] [stages]     (defaults: build/bootstrap, 3)
+#   RELEASE=1 ./scripts/bootstrap.sh              also install the verified
+#                                                 stage-3 compiler as
+#                                                 release/fides-c3(.exe) (what
+#                                                 the installer ships as fides)
 #
 # Stage 0 is the Rust bootstrap compiler (target/release/fidesc). Each stage N
 # runs the previous compiler's `dump-c compiler/main.fd`, wraps `main` in a
@@ -34,7 +38,8 @@ case "${CC_CMD[*]}" in
               -Wno-implicit-function-declaration -Wno-return-type) ;;
 esac
 LIBS=()
-case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) LIBS=(-lws2_32) ;; *) LIBS=(-lm -lpthread) ;; esac
+EXE=""
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) LIBS=(-lws2_32); EXE=".exe" ;; *) LIBS=(-lm -lpthread) ;; esac
 
 # Rename main and run it on a thread with a 256MB stack.
 wrap() {
@@ -79,11 +84,11 @@ for n in $(seq 1 "$STAGES"); do
   echo "[stage $n] dump-c ok in $(( $(date +%s) - start ))s ($(wc -c < "$OUT/c$n.c") bytes)"
   wrap "$OUT/c$n.c" "$OUT/c${n}_wrapped.c"
   start=$(date +%s)
-  if ! "${CC_CMD[@]}" "${CFLAGS[@]}" "$OUT/c${n}_wrapped.c" -o "$OUT/fides-c$n" "${LIBS[@]}" > "$OUT/c$n.cc.log" 2>&1; then
+  if ! "${CC_CMD[@]}" "${CFLAGS[@]}" "$OUT/c${n}_wrapped.c" -o "$OUT/fides-c$n$EXE" "${LIBS[@]}" > "$OUT/c$n.cc.log" 2>&1; then
     echo "[stage $n] C compile failed:"; grep -E "error" "$OUT/c$n.cc.log" | head -20; exit 1
   fi
   echo "[stage $n] C compile ok in $(( $(date +%s) - start ))s"
-  prev="$OUT/fides-c$n"
+  prev="$OUT/fides-c$n$EXE"
 done
 
 if [ "$STAGES" -ge 3 ]; then
@@ -94,4 +99,27 @@ if [ "$STAGES" -ge 3 ]; then
     diff <(tr -d '\r' < "$OUT/c2.c") <(tr -d '\r' < "$OUT/c3.c") | head -20
     exit 1
   fi
+fi
+
+# RELEASE=1: the stage-3 compiler (it compiled itself to the fixpoint) is
+# the release binary. Check it runs and builds a program outside the
+# repository too: an installed compiler finds stdlib/ next to itself.
+if [ -n "${RELEASE:-}" ]; then
+  if [ "$STAGES" -lt 3 ]; then echo "RELEASE needs 3 stages"; exit 1; fi
+  mkdir -p release
+  cp "$OUT/fides-c3$EXE" "release/fides-c3$EXE"
+  # The installed layout: fides(.exe) with stdlib/ beside it, started by
+  # name from PATH, in a directory with no stdlib/
+  smoke="$(pwd)/$OUT/smoke"
+  rm -rf "$smoke"; mkdir -p "$smoke/install" "$smoke/work"
+  cp "release/fides-c3$EXE" "$smoke/install/fides$EXE"
+  cp -r stdlib "$smoke/install/stdlib"
+  cp tests/bootstrap/hello.fd "$smoke/work/hello.fd"
+  expected=$("$STAGE0" run tests/bootstrap/hello.fd 2>/dev/null)
+  got=$(cd "$smoke/work" && PATH="$smoke/install:$PATH" fides run hello.fd 2>/dev/null)
+  if [ "$got" != "$expected" ]; then
+    echo "RELEASE FAILED: release/fides-c3$EXE run hello.fd printed '$got', expected '$expected'"
+    exit 1
+  fi
+  echo "RELEASE OK: release/fides-c3$EXE ($(wc -c < "release/fides-c3$EXE") bytes)"
 fi

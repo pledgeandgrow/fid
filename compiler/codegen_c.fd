@@ -1184,13 +1184,20 @@ fn emit_extern_decls(self: &mut CCodeGen, module: IrModule) -> void {
         }
 
         var inc_missing: bool = false;
+        // A system header (<...>) already declares the function: emit only
+        // the #define rename, not a conflicting forward declaration (printf
+        // is variadic in <stdio.h> but the FFI decl has fixed args).
+        var is_system_include: bool = false;
         match ext.include {
             OptStr::Some(inc) => {
                 inc_missing = vec_contains_str(missing_includes, inc);
+                is_system_include = str_starts_with(inc, "<");
             }
             OptStr::None => {}
         }
-        if inc_missing {
+        if !inc_missing && is_system_include && ext.pledge_name != ext.c_name {
+            wln(self, "#define " + ext.pledge_name + " " + ext.c_name);
+        } else if inc_missing {
             var ret_default: str = "0";
             match ext.ret_ty {
                 Type::F32 => { ret_default = "0.0"; }
@@ -1358,6 +1365,14 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "void p_page_unmap(int64_t cr3, int64_t virt);");
     wln(self, "int64_t p_phys_read64(int64_t addr);");
     wln(self, "void p_phys_write64(int64_t addr, int64_t val);");
+    wln(self, "int64_t p_volatile_load(int64_t addr);");
+    wln(self, "void p_volatile_store(int64_t addr, int64_t val);");
+    wln(self, "int64_t p_volatile_load8(int64_t addr);");
+    wln(self, "int64_t p_volatile_load16(int64_t addr);");
+    wln(self, "int64_t p_volatile_load32(int64_t addr);");
+    wln(self, "void p_volatile_store8(int64_t addr, int64_t val);");
+    wln(self, "void p_volatile_store16(int64_t addr, int64_t val);");
+    wln(self, "void p_volatile_store32(int64_t addr, int64_t val);");
     wln(self, "int64_t p_phys_read8(int64_t addr);");
     wln(self, "void p_phys_write8(int64_t addr, int64_t val);");
     wln(self, "int64_t p_phys_read16(int64_t addr);");
@@ -1598,6 +1613,7 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "void p_set_max_recursion(int limit) { p_max_recursion = limit; }");
     wln(self, "void* p_malloc(int64_t size);");
     wln(self, "void* p_malloc_persistent(int64_t size);");
+    wln(self, "void* p_alloc(int64_t size);");
     wln(self, "int64_t p_arena_save(void);");
     wln(self, "void p_arena_restore(int64_t mark);");
     wln(self, "void p_region_free(void* region);");
@@ -2221,7 +2237,6 @@ fn has_main(module: IrModule) -> bool {
 
 fn is_internal_function(name: str) -> bool {
     if str_starts_with(name, "p_") { return true; }
-    if str_starts_with(name, "__") { return true; }
     if str_starts_with(name, "box_") { return true; }
     if str_starts_with(name, "type_") { return true; }
     if str_starts_with(name, "stmt_") { return true; }
@@ -2972,6 +2987,13 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                 return;
             }
 
+            // Special-case: p_socket_write is called with 2 args (fd, str) by
+            // stdlib but the C implementation needs 3 args (fd, buf, len).
+            if fname == "p_socket_write" && args.len() == 2 {
+                wln(self, "    " + dst + " = p_socket_write_str(" + val_name(self, args.get(0)) + ", " + val_name(self, args.get(1)) + ");");
+                return;
+            }
+
             var param_types: OptVecIrType = fn_param_types_get(self, fname);
             var arg_strs: str = "";
             var i: i64 = 0;
@@ -3310,16 +3332,20 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                 IrType::Ptr(_) => { wln(self, "    p_print_str(" + v + ");"); }
                 IrType::Generic(name, _) => {
                     if name == "Vec" {
-                        wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + v + "); p_print_str(_s); free(_s); }");
+                        wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + v + "); p_print_str(_s); }");
                     } else if name == "HashMap" {
-                        wln(self, "    { char* _s = (char*)HashMap_to_str(0, (int64_t)" + v + "); p_print_str(_s); free(_s); }");
+                        wln(self, "    { char* _s = (char*)HashMap_to_str(0, (int64_t)" + v + "); p_print_str(_s); }");
                     } else {
                         wln(self, "    p_print_int((int64_t)" + v + ");");
                     }
                 }
                 IrType::Opaque(name) => {
                     if name == "Vec" {
-                        wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + v + "); p_print_str(_s); free(_s); }");
+                        wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + v + "); p_print_str(_s); }");
+                    } else if name == "HashMap" {
+                        // The self-hosted lowerer types HashMap::new() as
+                        // Opaque("HashMap") (src/lower.rs: Generic).
+                        wln(self, "    { char* _s = (char*)HashMap_to_str(0, (int64_t)" + v + "); p_print_str(_s); }");
                     } else if name == "String" {
                         wln(self, "    p_print_str((char*)" + v + ");");
                     } else if name == "Tensor" {
@@ -3750,6 +3776,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return result;");
     wln(self, "}");
     wln(self, "void* p_malloc_persistent(int64_t size) { if (size < 0) return NULL; return malloc((size_t)size); }");
+    wln(self, "void* p_alloc(int64_t size) { return p_malloc(size); }");
     wln(self, "void p_free(void* ptr) { /* arena memory - no individual frees */ }");
     // stdlib regions allocate from the arena, so it releases them too.
     wln(self, "void p_region_free(void* region) { (void)region; }");
@@ -4557,7 +4584,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "char* p_char_to_str(int64_t val) { char* s = (char*)p_malloc(2); s[0] = (char)val; s[1] = 0; return s; }");
     wln(self, "char* p_to_str_bool(bool val) { char* r = (char*)p_malloc(6); strcpy(r, val ? \"true\" : \"false\"); return r; }");
     wln(self, "char* p_to_str_float(double val) {");
-    wln(self, "    char* buf = (char*)p_malloc(512);");
+    wln(self, "    char* buf = (char*)malloc(512);");
     wln(self, "    // Match Rust's {} format: shortest representation that round-trips.");
     wln(self, "    // Rust's Display for f64 always uses fixed-point (never scientific notation).");
     wln(self, "    if (val == 0.0) { snprintf(buf, 512, \"0\"); return buf; }");
@@ -4716,6 +4743,14 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "static int64_t _phys_mem[65536];");
     wln(self, "int64_t p_phys_read64(int64_t addr) { return _phys_mem[(addr/8) & 65535]; }");
     wln(self, "void p_phys_write64(int64_t addr, int64_t val) { _phys_mem[(addr/8) & 65535] = val; }");
+    wln(self, "int64_t p_volatile_load(int64_t addr) { volatile int64_t* p = (volatile int64_t*)(intptr_t)addr; return *p; }");
+    wln(self, "void p_volatile_store(int64_t addr, int64_t val) { volatile int64_t* p = (volatile int64_t*)(intptr_t)addr; *p = val; }");
+    wln(self, "int64_t p_volatile_load8(int64_t addr) { volatile uint8_t* p = (volatile uint8_t*)(intptr_t)addr; return (int64_t)*p; }");
+    wln(self, "int64_t p_volatile_load16(int64_t addr) { volatile uint16_t* p = (volatile uint16_t*)(intptr_t)addr; return (int64_t)*p; }");
+    wln(self, "int64_t p_volatile_load32(int64_t addr) { volatile uint32_t* p = (volatile uint32_t*)(intptr_t)addr; return (int64_t)*p; }");
+    wln(self, "void p_volatile_store8(int64_t addr, int64_t val) { volatile uint8_t* p = (volatile uint8_t*)(intptr_t)addr; *p = (uint8_t)val; }");
+    wln(self, "void p_volatile_store16(int64_t addr, int64_t val) { volatile uint16_t* p = (volatile uint16_t*)(intptr_t)addr; *p = (uint16_t)val; }");
+    wln(self, "void p_volatile_store32(int64_t addr, int64_t val) { volatile uint32_t* p = (volatile uint32_t*)(intptr_t)addr; *p = (uint32_t)val; }");
     wln(self, "int64_t p_phys_read8(int64_t addr) { return _phys_mem[(addr/8) & 65535] & 0xFF; }");
     wln(self, "void p_phys_write8(int64_t addr, int64_t val) { _phys_mem[(addr/8) & 65535] = (_phys_mem[(addr/8) & 65535] & ~0xFF) | (val & 0xFF); }");
     wln(self, "int64_t p_phys_read16(int64_t addr) { return _phys_mem[(addr/8) & 65535] & 0xFFFF; }");
@@ -4883,12 +4918,14 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    int64_t b_shape[8]; int64_t b_ndim;");
     wln(self, "    double* stored_data; int64_t stored_len; int is_checkpoint;");
     wln(self, "} AGEntry;");
-    wln(self, "static AGEntry ag_tape[256];");
+    wln(self, "static AGEntry* ag_tape = NULL;");
+    wln(self, "static int64_t ag_tape_cap = 0;");
     wln(self, "static int64_t ag_tape_len = 0;");
     wln(self, "static int ag_mode = 0;");
     wln(self, "static int ag_checkpoint_mode = 0;");
-    wln(self, "static void* ag_grad_ptrs[256];");
-    wln(self, "static PTensor* ag_grads[256];");
+    wln(self, "static void** ag_grad_ptrs = NULL;");
+    wln(self, "static PTensor** ag_grads = NULL;");
+    wln(self, "static int64_t ag_grad_cap = 0;");
     wln(self, "static int64_t ag_grad_len = 0;");
     wln(self, "static double ag_dp_budget = 0.0;");
     wln(self, "static double ag_dp_limit = 0.0;");
@@ -4901,7 +4938,15 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "static void ag_accum_grad(void* ptr, PTensor* grad) {");
     wln(self, "    PTensor* ex = ag_get_grad(ptr);");
     wln(self, "    if (ex) { for (int64_t i = 0; i < ex->len && i < grad->len; i++) ex->data[i] += grad->data[i]; }");
-    wln(self, "    else { if (ag_grad_len < 256) { ag_grad_ptrs[ag_grad_len] = ptr; ag_grads[ag_grad_len] = grad; ag_grad_len++; } }");
+    wln(self, "    else {");
+    wln(self, "        if (ag_grad_len >= ag_grad_cap) {");
+    wln(self, "            int64_t new_cap = ag_grad_cap == 0 ? 64 : ag_grad_cap * 2;");
+    wln(self, "            ag_grad_ptrs = (void**)realloc(ag_grad_ptrs, new_cap * sizeof(void*));");
+    wln(self, "            ag_grads = (PTensor**)realloc(ag_grads, new_cap * sizeof(PTensor*));");
+    wln(self, "            ag_grad_cap = new_cap;");
+    wln(self, "        }");
+    wln(self, "        ag_grad_ptrs[ag_grad_len] = ptr; ag_grads[ag_grad_len] = grad; ag_grad_len++;");
+    wln(self, "    }");
     wln(self, "}");
     wln(self, "static PTensor* ag_clone_tensor(PTensor* t) {");
     wln(self, "    if (!t) return NULL;");
@@ -4929,7 +4974,12 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return r;");
     wln(self, "}");
     wln(self, "static void ag_record(AGOpKind op, void* result, void* a, void* b, double s) {");
-    wln(self, "    if (!ag_mode || ag_tape_len >= 256) return;");
+    wln(self, "    if (!ag_mode) return;");
+    wln(self, "    if (ag_tape_len >= ag_tape_cap) {");
+    wln(self, "        int64_t new_cap = ag_tape_cap == 0 ? 64 : ag_tape_cap * 2;");
+    wln(self, "        ag_tape = (AGEntry*)realloc(ag_tape, new_cap * sizeof(AGEntry));");
+    wln(self, "        ag_tape_cap = new_cap;");
+    wln(self, "    }");
     wln(self, "    AGEntry* e = &ag_tape[ag_tape_len++];");
     wln(self, "    e->op = op; e->result = result; e->a = a; e->b = b; e->scalar = s;");
     wln(self, "    e->stored_data = NULL; e->stored_len = 0; e->is_checkpoint = 0;");
@@ -4937,6 +4987,16 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    if (ta) { e->a_ndim = ta->ndim; for (int64_t i = 0; i < ta->ndim && i < 8; i++) e->a_shape[i] = ta->shape[i]; } else e->a_ndim = 0;");
     wln(self, "    PTensor* tb = (PTensor*)b;");
     wln(self, "    if (tb) { e->b_ndim = tb->ndim; for (int64_t i = 0; i < tb->ndim && i < 8; i++) e->b_shape[i] = tb->shape[i]; } else e->b_ndim = 0;");
+    wln(self, "}");
+    wln(self, "static AGEntry* ag_grow(void) {");
+    wln(self, "    if (!ag_mode) return NULL;");
+    wln(self, "    if (ag_tape_len >= ag_tape_cap) {");
+    wln(self, "        int64_t new_cap = ag_tape_cap == 0 ? 64 : ag_tape_cap * 2;");
+    wln(self, "        AGEntry* nt = (AGEntry*)realloc(ag_tape, new_cap * sizeof(AGEntry));");
+    wln(self, "        if (!nt) return NULL;");
+    wln(self, "        ag_tape = nt; ag_tape_cap = new_cap;");
+    wln(self, "    }");
+    wln(self, "    return &ag_tape[ag_tape_len++];");
     wln(self, "}");
     wln(self, "");
     wln(self, "void* p_tensor_new(int64_t ndim, int64_t* shape) {");
@@ -5012,13 +5072,14 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = pt->shape[i];");
     wln(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
     wln(self, "    for (int64_t i = 0; i < r->len; i++) r->data[i] = pt->data[i] > 0 ? pt->data[i] : 0;");
-    wln(self, "    if (ag_mode && ag_tape_len < 256) {");
-    wln(self, "        AGEntry* e = &ag_tape[ag_tape_len++];");
+    wln(self, "    { AGEntry* e = ag_grow();");
+    wln(self, "        if (e) {");
     wln(self, "        e->op = AG_RELU; e->result = r; e->a = t; e->b = NULL; e->scalar = 0;");
     wln(self, "        e->a_ndim = pt->ndim; for (int64_t i = 0; i < pt->ndim && i < 8; i++) e->a_shape[i] = pt->shape[i];");
     wln(self, "        e->b_ndim = 0;");
     wln(self, "        if (ag_checkpoint_mode) { e->is_checkpoint = 1; e->stored_len = pt->len; e->stored_data = (double*)malloc(pt->len * sizeof(double)); for (int64_t i = 0; i < pt->len; i++) e->stored_data[i] = pt->data[i]; }");
     wln(self, "        else { e->is_checkpoint = 0; e->stored_len = r->len; e->stored_data = (double*)malloc(r->len * sizeof(double)); for (int64_t i = 0; i < r->len; i++) e->stored_data[i] = r->data[i]; }");
+    wln(self, "        }");
     wln(self, "    }");
     wln(self, "    return r;");
     wln(self, "}");
@@ -5136,13 +5197,14 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = pt->shape[i];");
     wln(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
     wln(self, "    for (int64_t i = 0; i < r->len; i++) r->data[i] = 1.0 / (1.0 + exp(-pt->data[i]));");
-    wln(self, "    if (ag_mode && ag_tape_len < 256) {");
-    wln(self, "        AGEntry* e = &ag_tape[ag_tape_len++];");
+    wln(self, "    { AGEntry* e = ag_grow();");
+    wln(self, "        if (e) {");
     wln(self, "        e->op = AG_SIGMOID; e->result = r; e->a = t; e->b = NULL; e->scalar = 0;");
     wln(self, "        e->a_ndim = pt->ndim; for (int64_t i = 0; i < pt->ndim && i < 8; i++) e->a_shape[i] = pt->shape[i];");
     wln(self, "        e->b_ndim = 0;");
     wln(self, "        if (ag_checkpoint_mode) { e->is_checkpoint = 1; e->stored_len = pt->len; e->stored_data = (double*)malloc(pt->len * sizeof(double)); for (int64_t i = 0; i < pt->len; i++) e->stored_data[i] = pt->data[i]; }");
     wln(self, "        else { e->is_checkpoint = 0; e->stored_len = r->len; e->stored_data = (double*)malloc(r->len * sizeof(double)); for (int64_t i = 0; i < r->len; i++) e->stored_data[i] = r->data[i]; }");
+    wln(self, "        }");
     wln(self, "    }");
     wln(self, "    return r;");
     wln(self, "}");
@@ -5158,7 +5220,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return r;");
     wln(self, "}");
     wln(self, "double p_tensor_sum(void* t) { PTensor* pt = (PTensor*)t; if (!pt) return 0; double s=0; for (int64_t i=0;i<pt->len;i++) s+=pt->data[i]; ag_record(AG_SUM, (void*)pt, t, NULL, 0); return s; }");
-    wln(self, "double p_tensor_mean(void* t) { PTensor* pt = (PTensor*)t; if (!pt || pt->len==0) return 0; double r=p_tensor_sum(t)/pt->len; if (ag_mode && ag_tape_len < 256) { AGEntry* e=&ag_tape[ag_tape_len-1]; e->op=AG_MEAN; e->scalar=(double)pt->len; } return r; }");
+    wln(self, "double p_tensor_mean(void* t) { PTensor* pt = (PTensor*)t; if (!pt || pt->len==0) return 0; double r=p_tensor_sum(t)/pt->len; if (ag_mode && ag_tape_len > 0) { AGEntry* e=&ag_tape[ag_tape_len-1]; e->op=AG_MEAN; e->scalar=(double)pt->len; } return r; }");
     wln(self, "double p_tensor_min(void* t) { PTensor* pt = (PTensor*)t; if (!pt || pt->len==0) return 0; double m=pt->data[0]; for (int64_t i=1;i<pt->len;i++) if (pt->data[i]<m) m=pt->data[i]; return m; }");
     wln(self, "double p_tensor_max(void* t) { PTensor* pt = (PTensor*)t; if (!pt || pt->len==0) return 0; double m=pt->data[0]; for (int64_t i=1;i<pt->len;i++) if (pt->data[i]>m) m=pt->data[i]; return m; }");
     wln(self, "double p_tensor_dot(void* a, void* b) { PTensor* ta=(PTensor*)a; PTensor* tb=(PTensor*)b; if (!ta||!tb) return 0; double s=0; for (int64_t i=0;i<ta->len&&i<tb->len;i++) s+=ta->data[i]*tb->data[i]; return s; }");
@@ -5173,22 +5235,28 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return r;");
     wln(self, "}");
     wln(self, "char* p_tensor_to_json(void* t) {");
+    wln(self, "    // Same text as the interpreter (src/tensor.rs to_json): integral");
+    wln(self, "    // values print as integers, others in shortest fixed-point form.");
     wln(self, "    PTensor* pt = (PTensor*)t;");
     wln(self, "    if (!pt) return strdup(\"{}\");");
-    wln(self, "    size_t cap = 128; char* result = (char*)malloc(cap); size_t pos = 0;");
-    wln(self, "    pos += snprintf(result+pos, cap-pos, \"{\\\"shape\\\": [\");");
+    wln(self, "    size_t cap = 64 + (size_t)pt->ndim * 24 + (size_t)pt->len * 8; char* result = (char*)malloc(cap); size_t pos = 0;");
+    wln(self, "    pos += snprintf(result+pos, cap-pos, \"{\\\"shape\\\":[\");");
     wln(self, "    for (int64_t i = 0; i < pt->ndim; i++) {");
-    wln(self, "        if (i > 0) pos += snprintf(result+pos, cap-pos, \",\");");
+    wln(self, "        if (i > 0) result[pos++] = ',';");
     wln(self, "        pos += snprintf(result+pos, cap-pos, \"%lld\", (long long)pt->shape[i]);");
     wln(self, "    }");
-    wln(self, "    pos += snprintf(result+pos, cap-pos, \"], \\\"data\\\": [\");");
+    wln(self, "    pos += snprintf(result+pos, cap-pos, \"],\\\"data\\\":[\");");
     wln(self, "    for (int64_t i = 0; i < pt->len; i++) {");
-    wln(self, "        if (i > 0) pos += snprintf(result+pos, cap-pos, \",\");");
     wln(self, "        double d = pt->data[i];");
-    wln(self, "        if (d == (int64_t)d && d < 1e15 && d > -1e15) pos += snprintf(result+pos, cap-pos, \"%lld\", (long long)d);");
-    wln(self, "        else pos += snprintf(result+pos, cap-pos, \"%g\", d);");
+    wln(self, "        char nb[40]; char* fs = 0; const char* s;");
+    wln(self, "        if (d == trunc(d) && isfinite(d) && fabs(d) < 1e15) { snprintf(nb, sizeof nb, \"%lld\", (long long)d); s = nb; }");
+    wln(self, "        else { fs = p_to_str_float(d); s = fs; }");
+    wln(self, "        size_t l = strlen(s);");
+    wln(self, "        if (pos + l + 4 > cap) { while (pos + l + 4 > cap) cap *= 2; result = (char*)realloc(result, cap); }");
+    wln(self, "        if (i > 0) result[pos++] = ',';");
+    wln(self, "        memcpy(result+pos, s, l); pos += l;");
     wln(self, "    }");
-    wln(self, "    pos += snprintf(result+pos, cap-pos, \"]}\");");
+    wln(self, "    result[pos++] = ']'; result[pos++] = '}'; result[pos] = 0;");
     wln(self, "    return result;");
     wln(self, "}");
     wln(self, "char* p_tensor_to_str(void* t) {");
@@ -5331,9 +5399,14 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "");
     wln(self, "void* p_grad_get(void* t) {");
     wln(self, "    PTensor* g = ag_get_grad(t);");
-    wln(self, "    if (!g) return NULL;");
-    wln(self, "    PTensor* r = ag_clone_tensor(g);");
-    wln(self, "    return r;");
+    wln(self, "    if (g) return g;");
+    wln(self, "    // No gradient - return zero tensor of same shape");
+    wln(self, "    PTensor* pt = (PTensor*)t;");
+    wln(self, "    if (!pt) return NULL;");
+    wln(self, "    return (void*)ag_zeros_like(pt);");
+    wln(self, "}");
+    wln(self, "void p_grad_zero(void) {");
+    wln(self, "    ag_grad_len = 0;");
     wln(self, "}");
     wln(self, "bool p_requires_grad(void* t) { return ag_mode != 0; }");
     wln(self, "void p_set_checkpoint(int64_t v) { ag_checkpoint_mode = v; }");
@@ -5717,81 +5790,49 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "char* p_json_get(void* j, const char* key) {");
     wln(self, "    const char* s = (const char*)j;");
     wln(self, "    if (!s || !key) return strdup(\"null\");");
-    wln(self, "    // Structural scanner: parse object structure instead of strstr.");
-    wln(self, "    // Skip to opening brace.");
-    wln(self, "    while (*s && *s != '{') s++;");
-    wln(self, "    if (*s != '{') return strdup(\"null\");");
-    wln(self, "    s++; // skip '{'");
-    wln(self, "    while (*s) {");
-    wln(self, "        while (*s == ' ' || *s == '\\t' || *s == '\\n' || *s == '\\r' || *s == ',') s++;");
-    wln(self, "        if (*s == '}') return strdup(\"null\"); // end of object, key not found");
-    wln(self, "        if (*s != '\"') return strdup(\"null\"); // malformed");
-    wln(self, "        // Read key");
-    wln(self, "        s++; // skip opening quote");
-    wln(self, "        const char* key_start = s;");
-    wln(self, "        while (*s && *s != '\"') { if (*s == '\\\\' && s[1]) s += 2; else s++; }");
-    wln(self, "        if (*s != '\"') return strdup(\"null\");");
-    wln(self, "        size_t key_len = s - key_start;");
-    wln(self, "        s++; // skip closing quote");
-    wln(self, "        while (*s == ' ' || *s == '\\t' || *s == '\\n' || *s == '\\r') s++;");
-    wln(self, "        if (*s != ':') return strdup(\"null\");");
-    wln(self, "        s++; // skip ':'");
-    wln(self, "        while (*s == ' ' || *s == '\\t' || *s == '\\n' || *s == '\\r') s++;");
-    wln(self, "        // Compare key");
-    wln(self, "        size_t target_len = strlen(key);");
-    wln(self, "        int match = (key_len == target_len);");
-    wln(self, "        if (match) {");
-    wln(self, "            size_t ki = 0;");
-    wln(self, "            while (ki < key_len && match) {");
-    wln(self, "                char kc = key_start[ki];");
-    wln(self, "                if (kc == '\\\\' && ki + 1 < key_len) { ki++; kc = key_start[ki]; }");
-    wln(self, "                if (kc != key[ki]) match = 0;");
-    wln(self, "                ki++;");
-    wln(self, "            }");
-    wln(self, "        }");
-    wln(self, "        if (match) {");
-    wln(self, "            // Return the raw JSON value");
-    wln(self, "            if (*s == '\"') {");
-    wln(self, "                const char* end = s + 1;");
-    wln(self, "                while (*end) { if (*end == '\\\\' && end[1]) end += 2; else if (*end == '\"') break; else end++; }");
-    wln(self, "                size_t len = end - s + 1;");
-    wln(self, "                char* result = (char*)malloc(len+1); memcpy(result, s, len); result[len] = 0;");
-    wln(self, "                return result;");
-    wln(self, "            }");
-    wln(self, "            if (*s == '{' || *s == '[') {");
-    wln(self, "                char open = *s; char close = open == '{' ? '}' : ']';");
-    wln(self, "                int depth = 1; const char* end = s + 1;");
-    wln(self, "                while (*end && depth > 0) {");
-    wln(self, "                    if (*end == '\"') { end++; while (*end) { if (*end == '\\\\' && end[1]) end += 2; else if (*end == '\"') break; else end++; } }");
-    wln(self, "                    if (*end == open) depth++;");
-    wln(self, "                    if (*end == close) depth--;");
-    wln(self, "                    if (depth > 0) end++;");
+    wln(self, "    size_t klen = strlen(key);");
+    wln(self, "    const char* p = s;");
+    wln(self, "    while (*p) {");
+    wln(self, "        if (*p == '\"') {");
+    wln(self, "            const char* ks = p + 1;");
+    wln(self, "            const char* ke = ks;");
+    wln(self, "            while (*ke && *ke != '\"') { if (*ke == '\\\\' && ke[1]) ke += 2; else ke++; }");
+    wln(self, "            if (*ke == '\"' && (size_t)(ke - ks) == klen && strncmp(ks, key, klen) == 0) {");
+    wln(self, "                const char* c = ke + 1;");
+    wln(self, "                while (*c == ' ' || *c == '\\t') c++;");
+    wln(self, "                if (*c == ':') {");
+    wln(self, "                    c++;");
+    wln(self, "                    while (*c == ' ' || *c == '\\t') c++;");
+    wln(self, "                    if (*c == '\"') {");
+    wln(self, "                        const char* end = c + 1;");
+    wln(self, "                        while (*end) { if (*end == '\\\\' && end[1]) end += 2; else if (*end == '\"') break; else end++; }");
+    wln(self, "                        size_t len = end - c + 1;");
+    wln(self, "                        char* result = (char*)malloc(len+1); memcpy(result, c, len); result[len] = 0;");
+    wln(self, "                        return result;");
+    wln(self, "                    }");
+    wln(self, "                    if (*c == '{' || *c == '[') {");
+    wln(self, "                        char open = *c; char close = open == '{' ? '}' : ']';");
+    wln(self, "                        int depth = 1; const char* end = c + 1;");
+    wln(self, "                        while (*end && depth > 0) {");
+    wln(self, "                            if (*end == '\"') { const char* se = end + 1; while (*se) { if (*se == '\\\\' && se[1]) se += 2; else if (*se == '\"') { end = se; break; } else se++; } if (*se != '\"') { end = se; break; } end++; continue; }");
+    wln(self, "                            if (*end == open) depth++;");
+    wln(self, "                            if (*end == close) depth--;");
+    wln(self, "                            if (depth > 0) end++;");
+    wln(self, "                        }");
+    wln(self, "                        size_t len = end - c + 1;");
+    wln(self, "                        char* result = (char*)malloc(len+1); memcpy(result, c, len); result[len] = 0;");
+    wln(self, "                        char* canonical = p_json_parse(result); free(result);");
+    wln(self, "                        return canonical;");
+    wln(self, "                    }");
+    wln(self, "                    const char* end = c;");
+    wln(self, "                    while (*end && *end != ',' && *end != '}' && *end != ']' && *end != ' ' && *end != '\\n') end++;");
+    wln(self, "                    size_t len = end - c;");
+    wln(self, "                    char* result = (char*)malloc(len+1); memcpy(result, c, len); result[len] = 0;");
+    wln(self, "                    return result;");
     wln(self, "                }");
-    wln(self, "                size_t len = end - s + 1;");
-    wln(self, "                char* result = (char*)malloc(len+1); memcpy(result, s, len); result[len] = 0;");
-    wln(self, "                return result;");
     wln(self, "            }");
-    wln(self, "            const char* end = s;");
-    wln(self, "            while (*end && *end != ',' && *end != '}' && *end != ']' && *end != '\\n') end++;");
-    wln(self, "            size_t len = end - s;");
-    wln(self, "            char* result = (char*)malloc(len+1); memcpy(result, s, len); result[len] = 0;");
-    wln(self, "            return result;");
-    wln(self, "        }");
-    wln(self, "        // Skip this value");
-    wln(self, "        if (*s == '\"') {");
-    wln(self, "            s++; while (*s) { if (*s == '\\\\' && s[1]) s += 2; else if (*s == '\"') { s++; break; } else s++; }");
-    wln(self, "        } else if (*s == '{' || *s == '[') {");
-    wln(self, "            char open = *s; char close = open == '{' ? '}' : ']';");
-    wln(self, "            int depth = 1; s++;");
-    wln(self, "            while (*s && depth > 0) {");
-    wln(self, "                if (*s == '\"') { s++; while (*s) { if (*s == '\\\\' && s[1]) s += 2; else if (*s == '\"') { s++; break; } else s++; } }");
-    wln(self, "                if (*s == open) depth++;");
-    wln(self, "                if (*s == close) depth--;");
-    wln(self, "                if (depth > 0) s++;");
-    wln(self, "            }");
-    wln(self, "        } else {");
-    wln(self, "            while (*s && *s != ',' && *s != '}' && *s != ']') s++;");
-    wln(self, "        }");
+    wln(self, "            p = ke + 1;");
+    wln(self, "        } else { p++; }");
     wln(self, "    }");
     wln(self, "    return strdup(\"null\");");
     wln(self, "}");

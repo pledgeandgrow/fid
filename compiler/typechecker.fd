@@ -735,6 +735,10 @@ pub struct TypeChecker {
     global_cache: i64,     // HashMap: global_name → index in globals Vec (-1 = not found)
     alias_cache: i64,      // HashMap: alias_name → index in type_aliases Vec (-1 = not found)
     caches_built: bool,    // whether index caches have been populated
+    // "Struct.field" -> 1 + index into private_field_modules, for fields
+    // not marked pub (field privacy, src/typechecker.rs).
+    private_fields: i64,
+    private_field_modules: Vec<str>,
 }
 
 // Additional helper structs for TypeChecker fields
@@ -852,6 +856,8 @@ impl TypeChecker {
             val_vars_per_scope: Vec::new(),
             check_depth: 0,
             func_cache: HashMap_new(),
+            private_fields: HashMap_new(),
+            private_field_modules: Vec::new(),
             struct_cache: HashMap_new(),
             enum_cache: HashMap_new(),
             const_cache: HashMap_new(),
@@ -913,6 +919,12 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
         while fi2 < s.fields.len() {
             var f2: Param = s.fields.get(fi2);
             self.field_visibility.push(FieldVisEntry_new(FieldVisKey_new(s.name, f2.name), f2.is_pub));
+            // The first module to register the struct owns it (as
+            // struct_modules: a later program may repeat the definition).
+            if !f2.is_pub && HashMap_get(self.private_fields, s.name + "." + f2.name) == 0 {
+                self.private_field_modules.push(module);
+                HashMap_insert(self.private_fields, s.name + "." + f2.name, self.private_field_modules.len());
+            }
             fi2 = fi2 + 1;
         }
         // Check for @linear, @send, @sync annotations
@@ -1278,6 +1290,103 @@ pub enum OptTraitDef {
 /// hottest paths: function signature lookup, struct field lookup,
 /// enum variant lookup, const/global/type_alias resolution.
 /// With 100K+ LOC, there are thousands of entries in each table.
+/// Register the functions, structs and impl methods of the merged program
+/// that the per-module registration did not see (src/typechecker.rs
+/// register_generated_decls): comptime-generated or desugared items, and
+/// the methods of a second `impl T` block for a type.
+pub fn TypeChecker_register_generated_decls(self: &mut TypeChecker, program: Program) {
+    var si: i64 = 0;
+    while si < program.structs.len() {
+        var s: StructDef = program.structs.get(si);
+        var known: bool = false;
+        var k: i64 = 0;
+        while k < self.structs.len() && !known {
+            if self.structs.get(k).key == s.name { known = true; }
+            k = k + 1;
+        }
+        if !known {
+            var fields: Vec<StructField> = Vec::new();
+            var fi: i64 = 0;
+            while fi < s.fields.len() {
+                fields.push(StructField_new(s.fields.get(fi).name, TypeChecker_resolve_type(self, s.fields.get(fi).ty)));
+                fi = fi + 1;
+            }
+            self.structs.push(StringStructFields_new(s.name, fields));
+        }
+        si = si + 1;
+    }
+    var fni: i64 = 0;
+    while fni < program.funcs.len() {
+        var func: Func = program.funcs.get(fni);
+        var fknown: bool = false;
+        var k2: i64 = 0;
+        while k2 < self.funcs.len() && !fknown {
+            if self.funcs.get(k2).key == func.name { fknown = true; }
+            k2 = k2 + 1;
+        }
+        if !fknown {
+            var param_types: Vec<Type> = Vec::new();
+            var pi: i64 = 0;
+            while pi < func.params.len() {
+                param_types.push(TypeChecker_resolve_type(self, func.params.get(pi).ty));
+                pi = pi + 1;
+            }
+            self.funcs.push(StringFuncSig_new(func.name, FuncSig_new(param_types, TypeChecker_resolve_type(self, func.ret_ty))));
+        }
+        fni = fni + 1;
+    }
+    var impi: i64 = 0;
+    while impi < program.impls.len() {
+        var imp: ImplDef = program.impls.get(impi);
+        var idx: i64 = -1;
+        var k3: i64 = 0;
+        while k3 < self.methods.len() && idx < 0 {
+            if self.methods.get(k3).key == imp.struct_name { idx = k3; }
+            k3 = k3 + 1;
+        }
+        var existing_val: Vec<MethodMapEntry> = Vec::new();
+        if idx >= 0 { existing_val = self.methods.get(idx).val; }
+        var to_add: Vec<MethodMapEntry> = Vec::new();
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            var method: Func = imp.methods.get(mi);
+            var mknown: bool = false;
+            var ek: i64 = 0;
+            while ek < existing_val.len() && !mknown {
+                if existing_val.get(ek).key == method.name { mknown = true; }
+                ek = ek + 1;
+            }
+            if !mknown {
+                var mparams: Vec<Type> = Vec::new();
+                var mpi: i64 = 0;
+                while mpi < method.params.len() {
+                    mparams.push(TypeChecker_resolve_type(self, method.params.get(mpi).ty));
+                    mpi = mpi + 1;
+                }
+                var has_self: bool = false;
+                if method.params.len() > 0 {
+                    if method.params.get(0).name == "self" { has_self = true; }
+                }
+                to_add.push(MethodMapEntry_new(method.name, MethodInfo_new(mparams, TypeChecker_resolve_type(self, method.ret_ty), has_self, method.is_pub)));
+            }
+            mi = mi + 1;
+        }
+        if idx < 0 {
+            self.methods.push(StringMethodMap_new(imp.struct_name, to_add));
+        } else if to_add.len() > 0 {
+            var ai: i64 = 0;
+            while ai < to_add.len() {
+                method_map_set_entry(existing_val, to_add.get(ai).key, to_add.get(ai).val);
+                ai = ai + 1;
+            }
+            var m_entry: StringMethodMap = self.methods.get(idx);
+            m_entry.val = existing_val;
+            self.methods.set(idx, m_entry);
+        }
+        impi = impi + 1;
+    }
+}
+
 pub fn TypeChecker_build_caches(self: &mut TypeChecker) -> void {
     if self.caches_built { return; }
 
@@ -1768,29 +1877,222 @@ pub fn TypeChecker_verify_conserve(self: &mut TypeChecker, program: Program) {
 }
 
 pub fn TypeChecker_verify_gas(self: &mut TypeChecker, program: Program) {
-    // @gas(N): gas cost analysis
-    // Verifies that the gas limit argument is a positive integer.
+    // @gas(N): the function's cost (AST node count of its body) plus the
+    // cost of everything it calls must not exceed N (src/typechecker.rs
+    // verify_gas). Impl methods are named Type_method.
+    var names: Vec<str> = Vec::new();
+    var bodies: Vec<StmtList> = Vec::new();
+    var limit_names: Vec<str> = Vec::new();
+    var limits: Vec<i64> = Vec::new();
     var fi: i64 = 0;
     while fi < program.funcs.len() {
         var func: Func = program.funcs.get(fi);
-        var ai: i64 = 0;
-        while ai < func.annotations.len() {
-            var ann: Annotation = func.annotations.get(ai);
-            if ann.name == "gas" {
-                if ann.args.len() == 0 {
-                    self.errors.push("Gas error: function '" + func.name + "' has @gas but no gas limit argument");
-                } else {
-                    var gas_str: str = ann.args.get(0);
-                    var gas_val: i64 = str_parse_int(gas_str);
-                    if gas_val <= 0 {
-                        self.errors.push("Gas error: function '" + func.name + "' has @gas with non-positive limit: " + gas_str);
-                    }
-                }
-            }
-            ai = ai + 1;
-        }
+        gas_collect(func, func.name, names, bodies, limit_names, limits);
         fi = fi + 1;
     }
+    var ii: i64 = 0;
+    while ii < program.impls.len() {
+        var imp: ImplDef = program.impls.get(ii);
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            gas_collect(imp.methods.get(mi), imp.struct_name + "_" + imp.methods.get(mi).name, names, bodies, limit_names, limits);
+            mi = mi + 1;
+        }
+        ii = ii + 1;
+    }
+    var ti: i64 = 0;
+    while ti < program.trait_impls.len() {
+        var timp: TraitImpl = program.trait_impls.get(ti);
+        var tmi: i64 = 0;
+        while tmi < timp.methods.len() {
+            gas_collect(timp.methods.get(tmi), timp.type_name + "_" + timp.methods.get(tmi).name, names, bodies, limit_names, limits);
+            tmi = tmi + 1;
+        }
+        ti = ti + 1;
+    }
+    var cache_names: Vec<str> = Vec::new();
+    var cache_vals: Vec<i64> = Vec::new();
+    var li: i64 = 0;
+    while li < limit_names.len() {
+        var lname: str = limit_names.get(li);
+        var visited: Vec<str> = Vec::new();
+        var total: i64 = gas_total(lname, names, bodies, visited, cache_names, cache_vals);
+        if total > limits.get(li) {
+            var own: i64 = gas_own(lname, names, bodies);
+            self.errors.push("Gas error: function '" + lname + "' has @gas(" + int_to_str(limits.get(li)) + ") but total gas cost is " + int_to_str(total) + " (own: " + int_to_str(own) + " + callees: " + int_to_str(total - own) + ").");
+        }
+        li = li + 1;
+    }
+}
+
+fn gas_collect(func: Func, name: str, names: Vec<str>, bodies: Vec<StmtList>, limit_names: Vec<str>, limits: Vec<i64>) {
+    names.push(name);
+    bodies.push(func.body);
+    var ai: i64 = 0;
+    while ai < func.annotations.len() {
+        var ann: Annotation = func.annotations.get(ai);
+        if ann.name == "gas" && ann.args.len() > 0 {
+            var lim: i64 = str_parse_int(ann.args.get(0));
+            if lim >= 0 && ann.args.get(0) != "" {
+                limit_names.push(name);
+                limits.push(lim);
+            }
+        }
+        ai = ai + 1;
+    }
+}
+
+fn gas_index(name: str, names: Vec<str>) -> i64 {
+    var i: i64 = 0;
+    while i < names.len() {
+        if names.get(i) == name { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn gas_own(name: str, names: Vec<str>, bodies: Vec<StmtList>) -> i64 {
+    var idx: i64 = gas_index(name, names);
+    if idx < 0 { return 0; }
+    return gas_cost_stmts(bodies.get(idx));
+}
+
+/// Own cost plus the (memoized) totals of the distinct callees; a callee
+/// already on the current path counts only its own cost (cycles).
+fn gas_total(name: str, names: Vec<str>, bodies: Vec<StmtList>, visited: Vec<str>, cache_names: Vec<str>, cache_vals: Vec<i64>) -> i64 {
+    var ci: i64 = gas_index(name, cache_names);
+    if ci >= 0 { return cache_vals.get(ci); }
+    if gas_index(name, visited) >= 0 { return gas_own(name, names, bodies); }
+    visited.push(name);
+    var own: i64 = gas_own(name, names, bodies);
+    var callee_total: i64 = 0;
+    var idx: i64 = gas_index(name, names);
+    if idx >= 0 {
+        var calls: Vec<str> = Vec::new();
+        scan_stmts_for_calls(bodies.get(idx), calls);
+        var seen: Vec<str> = Vec::new();
+        var k: i64 = 0;
+        while k < calls.len() {
+            var c: str = calls.get(k);
+            if gas_index(c, seen) < 0 {
+                seen.push(c);
+                callee_total = callee_total + gas_total(c, names, bodies, visited, cache_names, cache_vals);
+            }
+            k = k + 1;
+        }
+    }
+    var total: i64 = own + callee_total;
+    cache_names.push(name);
+    cache_vals.push(total);
+    return total;
+}
+
+fn gas_cost_stmts(stmts: Vec<Stmt>) -> i64 {
+    var c: i64 = 0;
+    var i: i64 = 0;
+    while i < stmts.len() {
+        c = c + gas_cost_stmt(stmts.get(i));
+        i = i + 1;
+    }
+    return c;
+}
+
+fn gas_cost_opt_stmts(o: OptStmts) -> i64 {
+    match o {
+        OptStmts::Some(b) => { return gas_cost_stmts(b); }
+        OptStmts::None => {}
+    }
+    return 0;
+}
+
+fn gas_cost_arms(arms: Vec<MatchArm>) -> i64 {
+    var c: i64 = 0;
+    var i: i64 = 0;
+    while i < arms.len() {
+        c = c + gas_cost_stmts(arms.get(i).body);
+        i = i + 1;
+    }
+    return c;
+}
+
+fn gas_cost_exprs(es: Vec<Expr>) -> i64 {
+    var c: i64 = 0;
+    var i: i64 = 0;
+    while i < es.len() {
+        c = c + gas_cost_expr(es.get(i));
+        i = i + 1;
+    }
+    return c;
+}
+
+fn gas_cost_stmt(stmt: Stmt) -> i64 {
+    var cost: i64 = 1;
+    match stmt {
+        Stmt::Let(_, _, e, _, _, _, _) => { cost = cost + gas_cost_expr(e); }
+        Stmt::LetTuple(_, e, _) => { cost = cost + gas_cost_expr(e); }
+        Stmt::Expr(e, _) => { cost = cost + gas_cost_expr(e); }
+        Stmt::Assign(_, _, e, _) => { cost = cost + gas_cost_expr(e); }
+        Stmt::IndexAssign(_, idx, _, e, _) => { cost = cost + gas_cost_expr(idx) + gas_cost_expr(e); }
+        Stmt::DerefAssign(pe, _, e, _) => { cost = cost + gas_cost_expr(pe) + gas_cost_expr(e); }
+        Stmt::FieldAssign(obj, _, _, e, _) => { cost = cost + gas_cost_expr(obj) + gas_cost_expr(e); }
+        Stmt::Return(oe, _) => {
+            match oe {
+                OptBoxExpr::Some(re) => { cost = cost + gas_cost_expr(box_expr_unbox(re)); }
+                OptBoxExpr::None => {}
+            }
+        }
+        Stmt::If(c, tb, eb, _) => { cost = cost + gas_cost_expr(c) + gas_cost_stmts(tb) + gas_cost_opt_stmts(eb); }
+        Stmt::While(c, b, _) => { cost = cost + gas_cost_expr(c) + gas_cost_stmts(b); }
+        Stmt::Loop(b, _) => { cost = cost + gas_cost_stmts(b); }
+        Stmt::For(_, it, b, _) => { cost = cost + gas_cost_expr(it) + gas_cost_stmts(b); }
+        Stmt::Defer(b, _) => { cost = cost + gas_cost_stmts(b); }
+        Stmt::Match(e, arms, _) => { cost = cost + gas_cost_expr(e) + gas_cost_arms(arms); }
+        Stmt::RegionBlock(_, _, _, _, _, b, _) => { cost = cost + gas_cost_stmts(b); }
+        Stmt::Sandbox(b, _) => { cost = cost + gas_cost_stmts(b); }
+        Stmt::Unsafe(b, _) => { cost = cost + gas_cost_stmts(b); }
+        Stmt::Txn(b, _) => { cost = cost + gas_cost_stmts(b); }
+        Stmt::GradBlock(_, b, _) => { cost = cost + gas_cost_stmts(b); }
+        Stmt::ComptimeGen(b, _) => { cost = cost + gas_cost_stmts(b); }
+        _ => {}
+    }
+    return cost;
+}
+
+fn gas_cost_expr(expr: Expr) -> i64 {
+    var cost: i64 = 1;
+    match expr {
+        Expr::Binary(_, l, r) => { cost = cost + gas_cost_expr(box_expr_unbox(l)) + gas_cost_expr(box_expr_unbox(r)); }
+        Expr::Unary(_, e) => { cost = cost + gas_cost_expr(box_expr_unbox(e)); }
+        Expr::Call(_, args) => { cost = cost + gas_cost_exprs(args); }
+        Expr::MethodCall(recv, _, args) => { cost = cost + gas_cost_expr(box_expr_unbox(recv)) + gas_cost_exprs(args); }
+        Expr::FieldAccess(e, _) => { cost = cost + gas_cost_expr(box_expr_unbox(e)); }
+        Expr::Index(_, idx) => { cost = cost + gas_cost_expr(box_expr_unbox(idx)); }
+        Expr::StructLit(_, fields, spread) => {
+            var fi: i64 = 0;
+            while fi < fields.len() {
+                cost = cost + gas_cost_expr(fields.get(fi).value);
+                fi = fi + 1;
+            }
+            match spread {
+                OptBoxExpr::Some(sp) => { cost = cost + gas_cost_expr(box_expr_unbox(sp)); }
+                OptBoxExpr::None => {}
+            }
+        }
+        Expr::ArrayLit(_, elements) => { cost = cost + gas_cost_exprs(elements); }
+        Expr::TupleLit(elems) => { cost = cost + gas_cost_exprs(elems); }
+        Expr::Ref(e, _) => { cost = cost + gas_cost_expr(box_expr_unbox(e)); }
+        Expr::Deref(e) => { cost = cost + gas_cost_expr(box_expr_unbox(e)); }
+        Expr::Cast(e, _) => { cost = cost + gas_cost_expr(box_expr_unbox(e)); }
+        Expr::If(c, tb, eb) => { cost = cost + gas_cost_expr(box_expr_unbox(c)) + gas_cost_stmts(tb) + gas_cost_opt_stmts(eb); }
+        Expr::Block(b) => { cost = cost + gas_cost_stmts(b); }
+        Expr::Match(e, arms) => { cost = cost + gas_cost_expr(box_expr_unbox(e)) + gas_cost_arms(arms); }
+        Expr::Coalesce(e, d) => { cost = cost + gas_cost_expr(box_expr_unbox(e)) + gas_cost_expr(box_expr_unbox(d)); }
+        Expr::Try(e) => { cost = cost + gas_cost_expr(box_expr_unbox(e)); }
+        Expr::StrConcat(l, r) => { cost = cost + gas_cost_expr(box_expr_unbox(l)) + gas_cost_expr(box_expr_unbox(r)); }
+        Expr::Range(st, en, _) => { cost = cost + gas_cost_expr(box_expr_unbox(st)) + gas_cost_expr(box_expr_unbox(en)); }
+        _ => {}
+    }
+    return cost;
 }
 
 pub fn TypeChecker_verify_safety_annotations(self: &mut TypeChecker, program: Program) {
@@ -3710,6 +4012,13 @@ fn ct_check_expr(e: Expr, secret: Vec<str>, line: i64, out_lines: Vec<i64>, out_
     }
 }
 
+/// Calls forbidden in @realtime code: allocation, blocking IO, spawning,
+/// dynamic dispatch (the lists of src/typechecker.rs verify_realtime).
+fn tc_rt_forbidden_call(c: str) -> bool {
+    var names: str = " p_malloc p_free p_realloc p_alloc p_vec_new p_vec_push p_vec_push_str p_vec_insert p_vec_resize p_vec_extend p_hashmap_new p_hashmap_insert p_string_new p_string_push p_string_concat p_arena_new p_arena_alloc Vec_new Vec_push Vec_insert Vec_resize HashMap_new HashMap_insert String_new String_push push insert resize extend push_str p_file_read p_file_write p_file_open p_file_close p_socket_listen p_socket_accept p_socket_read p_socket_write p_socket_connect p_socket_close p_net_connect p_net_listen p_net_accept p_fs_read_async p_fs_write_async p_print p_print_int p_print_str p_eprint_str p_print_nl print println print_str print_nl print_int p_db_open p_db_query p_db_exec p_sleep p_usleep p_thread_spawn p_chan_send p_chan_recv p_executor_submit p_future_ready spawn p_make_dyn p_call_ptr p_dyn_call ";
+    return str_contains(names, " " + c + " ");
+}
+
 pub fn TypeChecker_verify_realtime(self: &mut TypeChecker, program: Program) {
     // @realtime: real-time deadline guarantee
     // Rejects IO/Net/Spawn effects that could block indefinitely.
@@ -3731,6 +4040,29 @@ pub fn TypeChecker_verify_realtime(self: &mut TypeChecker, program: Program) {
                     self.errors.push("Realtime error: function '" + func.name + "' is @realtime but has effect '!" + eff + "' which may block");
                 }
                 ei = ei + 1;
+            }
+            // Calls that allocate, block, spawn, dispatch dynamically or
+            // recurse (src/typechecker.rs verify_realtime rules 1-5).
+            var calls: Vec<str> = Vec::new();
+            scan_stmts_for_calls(func.body, calls);
+            var while_sites: Vec<i64> = Vec::new();
+            scan_for_while_loops(func.body, while_sites);
+            if while_sites.len() > 0 {
+                self.errors.push("Real-time error: function '" + func.name + "' contains a 'while' loop. While loops have unbounded iteration counts.");
+            }
+            var reported: Vec<str> = Vec::new();
+            var ci: i64 = 0;
+            while ci < calls.len() {
+                var c: str = calls.get(ci);
+                if !tc_str_vec_contains(reported, c) && (tc_rt_forbidden_call(c) || c == func.name) {
+                    reported.push(c);
+                    if c == func.name {
+                        self.errors.push("Real-time error: function '" + func.name + "' calls itself. Recursion has unbounded stack depth.");
+                    } else {
+                        self.errors.push("Real-time error: function '" + func.name + "' calls '" + c + "'.");
+                    }
+                }
+                ci = ci + 1;
             }
         }
         fi = fi + 1;
@@ -3764,6 +4096,62 @@ pub fn TypeChecker_verify_differentiable(self: &mut TypeChecker, program: Progra
     }
 }
 
+/// The body of the function or (unmangled) method `name`, if any.
+fn tc_body_by_name(program: Program, name: str, out: Vec<StmtList>) -> bool {
+    var fi: i64 = 0;
+    while fi < program.funcs.len() {
+        if program.funcs.get(fi).name == name { out.push(program.funcs.get(fi).body); return true; }
+        fi = fi + 1;
+    }
+    var ii: i64 = 0;
+    while ii < program.impls.len() {
+        var imp: ImplDef = program.impls.get(ii);
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            if imp.methods.get(mi).name == name { out.push(imp.methods.get(mi).body); return true; }
+            mi = mi + 1;
+        }
+        ii = ii + 1;
+    }
+    var ti: i64 = 0;
+    while ti < program.trait_impls.len() {
+        var timp: TraitImpl = program.trait_impls.get(ti);
+        var tmi: i64 = 0;
+        while tmi < timp.methods.len() {
+            if timp.methods.get(tmi).name == name { out.push(timp.methods.get(tmi).body); return true; }
+            tmi = tmi + 1;
+        }
+        ti = ti + 1;
+    }
+    return false;
+}
+
+/// Whether `start` reaches dequantize_q8 through calls (src/typechecker.rs).
+fn tc_transitively_calls_dequant(program: Program, start: str) -> bool {
+    var visited: Vec<str> = Vec::new();
+    var stack: Vec<str> = Vec::new();
+    stack.push(start);
+    while stack.len() > 0 {
+        var cur: str = stack.pop();
+        if !tc_str_vec_contains(visited, cur) {
+            visited.push(cur);
+            var body: Vec<StmtList> = Vec::new();
+            if tc_body_by_name(program, cur, body) {
+                var calls: Vec<str> = Vec::new();
+                scan_stmts_for_calls(body.get(0), calls);
+                var ci: i64 = 0;
+                while ci < calls.len() {
+                    var c: str = calls.get(ci);
+                    if c == "dequantize_q8" || c == "p_dequantize_q8" { return true; }
+                    stack.push(c);
+                    ci = ci + 1;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 pub fn TypeChecker_verify_quantized(self: &mut TypeChecker, program: Program) {
     // @quantized: quantization annotation
     // Rejects IO/Net/Spawn/Diverge effects (same as @differentiable).
@@ -3786,9 +4174,22 @@ pub fn TypeChecker_verify_quantized(self: &mut TypeChecker, program: Program) {
                 }
                 ei = ei + 1;
             }
+            // Dequantizing inside a @quantized function defeats it.
+            if tc_transitively_calls_dequant(program, func.name) {
+                self.errors.push("Quantization error: function '" + func.name + "' is @quantized but (transitively) calls dequantize_q8.");
+            }
         }
         fi = fi + 1;
     }
+}
+
+fn tc_anns_have(anns: Vec<Annotation>, name: str) -> bool {
+    var i: i64 = 0;
+    while i < anns.len() {
+        if anns.get(i).name == name { return true; }
+        i = i + 1;
+    }
+    return false;
 }
 
 pub fn TypeChecker_verify_checkpoint(self: &mut TypeChecker, program: Program) {
@@ -3808,6 +4209,10 @@ pub fn TypeChecker_verify_checkpoint(self: &mut TypeChecker, program: Program) {
         }
         if is_checkpoint && !is_differentiable {
             self.errors.push("Checkpoint error: function '" + func.name + "' is @checkpoint but not @differentiable");
+        }
+        // Recompute in the backward pass must give the same values.
+        if is_checkpoint && !tc_anns_have(func.annotations, "deterministic") {
+            self.errors.push("Checkpoint error: function '" + func.name + "' is @checkpoint but not @deterministic. Fix: add @deterministic annotation to '" + func.name + "'.");
         }
         fi = fi + 1;
     }
@@ -3870,6 +4275,10 @@ pub fn TypeChecker_verify_dp(self: &mut TypeChecker, program: Program) {
         // Check effects
         if is_dp {
             var effects: Vec<str> = TypeChecker_get_func_effects(self, func.name);
+            // DP needs noise added to the data/gradients.
+            if !str_vec_contains_ref(effects, "Noise") {
+                self.errors.push("Differential privacy error: function '" + func.name + "' is @dp but has no '!Noise' effect.");
+            }
             var ei: i64 = 0;
             while ei < effects.len() {
                 var eff: str = effects.get(ei);
@@ -4009,6 +4418,9 @@ pub fn TypeChecker_verify_shard(self: &mut TypeChecker, program: Program) {
         }
         if is_shard {
             var effects: Vec<str> = TypeChecker_get_func_effects(self, func.name);
+            if !str_vec_contains_ref(effects, "Comm") {
+                self.errors.push("Shard error: function '" + func.name + "' is @shard but has no '!Comm' effect.");
+            }
             var ei: i64 = 0;
             while ei < effects.len() {
                 var eff: str = effects.get(ei);
@@ -4071,30 +4483,242 @@ pub fn TypeChecker_verify_tainted(self: &mut TypeChecker, program: Program) {
 }
 
 pub fn TypeChecker_verify_contracts(self: &mut TypeChecker, program: Program) {
-    // given/ensure contracts: verify that preconditions and postconditions exist
-    // and are well-formed (non-empty expressions).
+    // `given` preconditions (F10): a call whose constant arguments make a
+    // precondition false is rejected at compile time (src/typechecker.rs
+    // verify_contracts; non-constant arguments are left to runtime).
+    var pre_names: Vec<str> = Vec::new();
+    var pre_funcs: Vec<Func> = Vec::new();
     var fi: i64 = 0;
     while fi < program.funcs.len() {
         var func: Func = program.funcs.get(fi);
-        var has_given: bool = func.preconditions.len() > 0;
-        var has_ensure: bool = func.postconditions.len() > 0;
-        // If function has contracts, verify they're non-trivial
-        if has_given {
-            var pi: i64 = 0;
-            while pi < func.preconditions.len() {
-                // Preconditions are expressions — we verify they exist
-                // (full evaluation would require comptime evaluation)
-                pi = pi + 1;
-            }
-        }
-        if has_ensure {
-            var pi: i64 = 0;
-            while pi < func.postconditions.len() {
-                pi = pi + 1;
-            }
+        if func.preconditions.len() > 0 {
+            pre_names.push(func.name);
+            pre_funcs.push(func);
         }
         fi = fi + 1;
     }
+    var ii: i64 = 0;
+    while ii < program.impls.len() {
+        var imp: ImplDef = program.impls.get(ii);
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            if imp.methods.get(mi).preconditions.len() > 0 {
+                pre_names.push(imp.struct_name + "_" + imp.methods.get(mi).name);
+                pre_funcs.push(imp.methods.get(mi));
+            }
+            mi = mi + 1;
+        }
+        ii = ii + 1;
+    }
+    if pre_names.len() == 0 { return; }
+    var bodies: Vec<StmtList> = Vec::new();
+    var bi: i64 = 0;
+    while bi < program.funcs.len() {
+        bodies.push(program.funcs.get(bi).body);
+        bi = bi + 1;
+    }
+    var ii2: i64 = 0;
+    while ii2 < program.impls.len() {
+        var imp2: ImplDef = program.impls.get(ii2);
+        var mi2: i64 = 0;
+        while mi2 < imp2.methods.len() {
+            bodies.push(imp2.methods.get(mi2).body);
+            mi2 = mi2 + 1;
+        }
+        ii2 = ii2 + 1;
+    }
+    var k: i64 = 0;
+    while k < bodies.len() {
+        var callees: Vec<str> = Vec::new();
+        var argss: Vec<Vec<Expr>> = Vec::new();
+        cs_stmts(bodies.get(k), callees, argss);
+        var ci: i64 = 0;
+        while ci < callees.len() {
+            var pi: i64 = 0;
+            while pi < pre_names.len() {
+                if pre_names.get(pi) == callees.get(ci) {
+                    var pf: Func = pre_funcs.get(pi);
+                    var bnames: Vec<str> = Vec::new();
+                    var bvals: Vec<i64> = Vec::new();
+                    var args: Vec<Expr> = argss.get(ci);
+                    var ai: i64 = 0;
+                    while ai < pf.params.len() && ai < args.len() {
+                        var cv: Vec<i64> = Vec::new();
+                        if ct_eval_int(args.get(ai), Vec::new(), Vec::new(), cv) {
+                            bnames.push(pf.params.get(ai).name);
+                            bvals.push(cv.get(0));
+                        }
+                        ai = ai + 1;
+                    }
+                    var qi: i64 = 0;
+                    while qi < pf.preconditions.len() {
+                        // 1 = true, 0 = false, -1 = unknown
+                        if ct_eval_bool(pf.preconditions.get(qi), bnames, bvals) == 0 {
+                            self.errors.push("Contract error (F10): precondition violated in call to '" + callees.get(ci) + "'. The 'given' contract is not satisfied with the provided arguments.");
+                        }
+                        qi = qi + 1;
+                    }
+                }
+                pi = pi + 1;
+            }
+            ci = ci + 1;
+        }
+        k = k + 1;
+    }
+}
+
+/// Collect the direct calls (callee, args) in statements, at any depth.
+fn cs_stmts(stmts: Vec<Stmt>, callees: Vec<str>, argss: Vec<Vec<Expr>>) {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        match stmts.get(i) {
+            Stmt::Let(_, _, e, _, _, _, _) => { cs_expr(e, callees, argss); }
+            Stmt::LetTuple(_, e, _) => { cs_expr(e, callees, argss); }
+            Stmt::Expr(e, _) => { cs_expr(e, callees, argss); }
+            Stmt::Assign(_, _, e, _) => { cs_expr(e, callees, argss); }
+            Stmt::IndexAssign(_, ix, _, e, _) => { cs_expr(ix, callees, argss); cs_expr(e, callees, argss); }
+            Stmt::DerefAssign(pe, _, e, _) => { cs_expr(pe, callees, argss); cs_expr(e, callees, argss); }
+            Stmt::FieldAssign(o, _, _, e, _) => { cs_expr(o, callees, argss); cs_expr(e, callees, argss); }
+            Stmt::Return(oe, _) => {
+                match oe {
+                    OptBoxExpr::Some(re) => { cs_expr(box_expr_unbox(re), callees, argss); }
+                    OptBoxExpr::None => {}
+                }
+            }
+            Stmt::If(c, tb, eb, _) => {
+                cs_expr(c, callees, argss);
+                cs_stmts(tb, callees, argss);
+                match eb {
+                    OptStmts::Some(e2) => { cs_stmts(e2, callees, argss); }
+                    OptStmts::None => {}
+                }
+            }
+            Stmt::While(c, b, _) => { cs_expr(c, callees, argss); cs_stmts(b, callees, argss); }
+            Stmt::For(_, it, b, _) => { cs_expr(it, callees, argss); cs_stmts(b, callees, argss); }
+            Stmt::Loop(b, _) => { cs_stmts(b, callees, argss); }
+            Stmt::Defer(b, _) => { cs_stmts(b, callees, argss); }
+            Stmt::Match(e, arms, _) => {
+                cs_expr(e, callees, argss);
+                var ai: i64 = 0;
+                while ai < arms.len() {
+                    cs_stmts(arms.get(ai).body, callees, argss);
+                    ai = ai + 1;
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+}
+
+fn cs_exprs(es: Vec<Expr>, callees: Vec<str>, argss: Vec<Vec<Expr>>) {
+    var i: i64 = 0;
+    while i < es.len() {
+        cs_expr(es.get(i), callees, argss);
+        i = i + 1;
+    }
+}
+
+fn cs_expr(expr: Expr, callees: Vec<str>, argss: Vec<Vec<Expr>>) {
+    match expr {
+        Expr::Call(callee, args) => {
+            callees.push(callee);
+            argss.push(args);
+            cs_exprs(args, callees, argss);
+        }
+        Expr::MethodCall(recv, _, args) => { cs_expr(box_expr_unbox(recv), callees, argss); cs_exprs(args, callees, argss); }
+        Expr::Binary(_, l, r) => { cs_expr(box_expr_unbox(l), callees, argss); cs_expr(box_expr_unbox(r), callees, argss); }
+        Expr::Unary(_, e) => { cs_expr(box_expr_unbox(e), callees, argss); }
+        Expr::FieldAccess(e, _) => { cs_expr(box_expr_unbox(e), callees, argss); }
+        Expr::Index(a, ix) => { cs_expr(box_expr_unbox(a), callees, argss); cs_expr(box_expr_unbox(ix), callees, argss); }
+        Expr::If(c, tb, eb) => {
+            cs_expr(box_expr_unbox(c), callees, argss);
+            cs_stmts(tb, callees, argss);
+            match eb {
+                OptStmts::Some(e2) => { cs_stmts(e2, callees, argss); }
+                OptStmts::None => {}
+            }
+        }
+        Expr::Block(b) => { cs_stmts(b, callees, argss); }
+        _ => {}
+    }
+}
+
+/// Constant integer value of `expr` under the bindings (pushed to `out`).
+fn ct_eval_int(expr: Expr, bnames: Vec<str>, bvals: Vec<i64>, out: Vec<i64>) -> bool {
+    match expr {
+        Expr::IntLit(n) => { out.push(n); return true; }
+        Expr::Ident(name) => {
+            var i: i64 = 0;
+            while i < bnames.len() {
+                if bnames.get(i) == name { out.push(bvals.get(i)); return true; }
+                i = i + 1;
+            }
+            return false;
+        }
+        Expr::Unary(op, e) => {
+            if unaryop_eq(op, UnaryOp::Neg) {
+                var v: Vec<i64> = Vec::new();
+                if ct_eval_int(box_expr_unbox(e), bnames, bvals, v) { out.push(0 - v.get(0)); return true; }
+            }
+            return false;
+        }
+        Expr::Binary(op, l, r) => {
+            var lv: Vec<i64> = Vec::new();
+            var rv: Vec<i64> = Vec::new();
+            if !ct_eval_int(box_expr_unbox(l), bnames, bvals, lv) { return false; }
+            if !ct_eval_int(box_expr_unbox(r), bnames, bvals, rv) { return false; }
+            var a: i64 = lv.get(0);
+            var b: i64 = rv.get(0);
+            if binop_eq(op, BinOp::Add) { out.push(a + b); return true; }
+            if binop_eq(op, BinOp::Sub) { out.push(a - b); return true; }
+            if binop_eq(op, BinOp::Mul) { out.push(a * b); return true; }
+            if binop_eq(op, BinOp::Div) && b != 0 { out.push(a / b); return true; }
+            if binop_eq(op, BinOp::Mod) && b != 0 { out.push(a % b); return true; }
+            return false;
+        }
+        _ => {}
+    }
+    return false;
+}
+
+/// 1 = true, 0 = false, -1 = unknown.
+fn ct_eval_bool(expr: Expr, bnames: Vec<str>, bvals: Vec<i64>) -> i64 {
+    match expr {
+        Expr::BoolLit(bv) => { if bv { return 1; } return 0; }
+        Expr::Binary(op, l, r) => {
+            if binop_eq(op, BinOp::And) {
+                var lb: i64 = ct_eval_bool(box_expr_unbox(l), bnames, bvals);
+                if lb < 0 { return -1; }
+                if lb == 0 { return 0; }
+                return ct_eval_bool(box_expr_unbox(r), bnames, bvals);
+            }
+            if binop_eq(op, BinOp::Or) {
+                var lb2: i64 = ct_eval_bool(box_expr_unbox(l), bnames, bvals);
+                if lb2 < 0 { return -1; }
+                if lb2 == 1 { return 1; }
+                return ct_eval_bool(box_expr_unbox(r), bnames, bvals);
+            }
+            var lv: Vec<i64> = Vec::new();
+            var rv: Vec<i64> = Vec::new();
+            if !ct_eval_int(box_expr_unbox(l), bnames, bvals, lv) { return -1; }
+            if !ct_eval_int(box_expr_unbox(r), bnames, bvals, rv) { return -1; }
+            var a: i64 = lv.get(0);
+            var b: i64 = rv.get(0);
+            var res: bool = false;
+            if binop_eq(op, BinOp::Lt) { res = a < b; }
+            else if binop_eq(op, BinOp::Gt) { res = a > b; }
+            else if binop_eq(op, BinOp::LtEq) { res = a <= b; }
+            else if binop_eq(op, BinOp::GtEq) { res = a >= b; }
+            else if binop_eq(op, BinOp::Eq) { res = a == b; }
+            else if binop_eq(op, BinOp::Neq) { res = a != b; }
+            else { return -1; }
+            if res { return 1; }
+            return 0;
+        }
+        _ => {}
+    }
+    return -1;
 }
 
 pub fn TypeChecker_verify_allocator_params(self: &mut TypeChecker, program: Program) {
@@ -5004,8 +5628,23 @@ pub fn TypeChecker_types_compatible(self: &TypeChecker, declared: Type, actual: 
 
 pub fn TypeChecker_type_contains_param(self: &TypeChecker, ty: Type) -> bool {
     match ty {
+        // A named type that is neither a struct nor an enum is a type
+        // parameter (of the callee: src/typechecker.rs type_contains_param);
+        // the caller's own type params are not the ones to look at.
         Type::Named(name) => {
-            return tc_str_vec_contains(self.current_type_params, name);
+            match TypeChecker_lookup_struct_cache(self, name) {
+                OptVecStructField::Some(_) => { return false; }
+                OptVecStructField::None => {}
+            }
+            return !TypeChecker_is_known_enum(self, name);
+        }
+        Type::Func(fparams, fret) => {
+            var fi: i64 = 0;
+            while fi < fparams.len() {
+                if TypeChecker_type_contains_param(self, fparams.get(fi)) { return true; }
+                fi = fi + 1;
+            }
+            return TypeChecker_type_contains_param(self, box_type_unbox(fret));
         }
         Type::Ref(inner, _) => { return TypeChecker_type_contains_param(self, box_type_unbox(inner)); }
         Type::RawPtr(inner, _) => { return TypeChecker_type_contains_param(self, box_type_unbox(inner)); }
@@ -5176,6 +5815,43 @@ pub fn TypeChecker_is_linear_type(self: &TypeChecker, ty: Type) -> bool {
         _ => { return false; }
     }
     return false;
+}
+
+/// Result type of a swizzle (src/typechecker.rs swizzle_result_type):
+/// 2-4 components, all from one of xyzw / rgba / stpq.
+fn tc_str_has_byte(chars: str, ch: i64) -> bool {
+    var i: i64 = 0;
+    while i < str_len(chars) {
+        if str_byte_at(chars, i) == ch { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn tc_swizzle_result_type(field: str) -> OptType {
+    var n: i64 = str_len(field);
+    if n <= 1 || n > 4 { return OptType::None; }
+    var xyzw: str = "xyzw";
+    var rgba: str = "rgba";
+    var stpq: str = "stpq";
+    var group: str = "";
+    var first: i64 = str_byte_at(field, 0);
+    if tc_str_has_byte(xyzw, first) { group = xyzw; }
+    else if tc_str_has_byte(rgba, first) { group = rgba; }
+    else if tc_str_has_byte(stpq, first) { group = stpq; }
+    else { return OptType::None; }
+    var i: i64 = 0;
+    while i < n {
+        if !tc_str_has_byte(group, str_byte_at(field, i)) { return OptType::None; }
+        i = i + 1;
+    }
+    if n == 2 { return OptType::Some(Type::Named("vec2")); }
+    if n == 3 { return OptType::Some(Type::Named("vec3")); }
+    return OptType::Some(Type::Named("vec4"));
+}
+
+pub fn tc_is_vec_type(name: str) -> bool {
+    return name == "vec2" || name == "vec3" || name == "vec4";
 }
 
 pub fn TypeChecker_is_send_type(self: &TypeChecker, ty: Type) -> bool {
@@ -5824,10 +6500,13 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                     TypeChecker_declare(self, handler.params.get(pi), Type::I64);
                     pi = pi + 1;
                 }
+                // L3A: `cont`, the continuation, is in scope in handler
+                // bodies for resume(cont, value).
+                TypeChecker_declare(self, "cont", Type::I64);
                 var si2: i64 = 0;
                 while si2 < handler.body.len() {
                     TypeChecker_check_stmt(self, handler.body.get(si2));
-                    si2 = si + 1;
+                    si2 = si2 + 1;
                 }
                 TypeChecker_pop_scope(self);
                 hi = hi + 1;
@@ -6027,7 +6706,9 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
 // in-scope variables referenced (Idents that resolve to local vars).
 // Used by the @send check on spawn expressions.
 
-pub fn TypeChecker_collect_captured_vars(self: &TypeChecker, expr: Expr, captured: &mut Vec<(str, Type)>) {
+// Names and types are kept in two parallel Vecs: a Vec of tuples held
+// pointers to stack temporaries (crash in is_send_type).
+pub fn TypeChecker_collect_captured_vars(self: &TypeChecker, expr: Expr, cap_names: &mut Vec<str>, cap_types: &mut Vec<Type>) {
     match expr {
         Expr::Ident(name) => {
             var ty_opt: OptType = TypeChecker_lookup(self, name);
@@ -6035,12 +6716,14 @@ pub fn TypeChecker_collect_captured_vars(self: &TypeChecker, expr: Expr, capture
                 OptType::Some(ty) => {
                     var found: bool = false;
                     var i: i64 = 0;
-                    while i < captured.len() {
-                        var (cname, _cty) = captured.get(i);
-                        if cname == name { found = true; }
+                    while i < cap_names.len() {
+                        if cap_names.get(i) == name { found = true; }
                         i = i + 1;
                     }
-                    if !found { captured.push((name, ty)); }
+                    if !found {
+                        cap_names.push(name);
+                        cap_types.push(ty);
+                    }
                 }
                 OptType::None => {} // not a local var
             }
@@ -6048,75 +6731,75 @@ pub fn TypeChecker_collect_captured_vars(self: &TypeChecker, expr: Expr, capture
         Expr::Call(callee, args) => {
             var ai: i64 = 0;
             while ai < args.len() {
-                TypeChecker_collect_captured_vars(self, args.get(ai), captured);
+                TypeChecker_collect_captured_vars(self, args.get(ai), cap_names, cap_types);
                 ai = ai + 1;
             }
         }
         Expr::MethodCall(recv, _method, args) => {
-            TypeChecker_collect_captured_vars(self, box_expr_unbox(recv), captured);
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(recv), cap_names, cap_types);
             var ai: i64 = 0;
             while ai < args.len() {
-                TypeChecker_collect_captured_vars(self, args.get(ai), captured);
+                TypeChecker_collect_captured_vars(self, args.get(ai), cap_names, cap_types);
                 ai = ai + 1;
             }
         }
         Expr::Binary(_op, left, right) => {
-            TypeChecker_collect_captured_vars(self, box_expr_unbox(left), captured);
-            TypeChecker_collect_captured_vars(self, box_expr_unbox(right), captured);
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(left), cap_names, cap_types);
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(right), cap_names, cap_types);
         }
-        Expr::Unary(_op, e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
+        Expr::Unary(_op, e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), cap_names, cap_types); }
         Expr::Index(arr, idx) => {
-            TypeChecker_collect_captured_vars(self, box_expr_unbox(arr), captured);
-            TypeChecker_collect_captured_vars(self, box_expr_unbox(idx), captured);
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(arr), cap_names, cap_types);
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(idx), cap_names, cap_types);
         }
-        Expr::FieldAccess(e, _field) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
-        Expr::OptionalFieldAccess(e, _field) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
-        Expr::Ref(e, _is_mut) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
-        Expr::Deref(e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
-        Expr::Try(e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
+        Expr::FieldAccess(e, _field) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), cap_names, cap_types); }
+        Expr::OptionalFieldAccess(e, _field) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), cap_names, cap_types); }
+        Expr::Ref(e, _is_mut) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), cap_names, cap_types); }
+        Expr::Deref(e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), cap_names, cap_types); }
+        Expr::Try(e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), cap_names, cap_types); }
         Expr::Coalesce(e, def) => {
-            TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured);
-            TypeChecker_collect_captured_vars(self, box_expr_unbox(def), captured);
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(e), cap_names, cap_types);
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(def), cap_names, cap_types);
         }
-        Expr::Cast(e, _ty) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
-        Expr::Await(e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
+        Expr::Cast(e, _ty) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), cap_names, cap_types); }
+        Expr::Await(e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), cap_names, cap_types); }
         Expr::StrConcat(left, right) => {
-            TypeChecker_collect_captured_vars(self, box_expr_unbox(left), captured);
-            TypeChecker_collect_captured_vars(self, box_expr_unbox(right), captured);
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(left), cap_names, cap_types);
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(right), cap_names, cap_types);
         }
         Expr::PipeForward(left, right) => {
-            TypeChecker_collect_captured_vars(self, box_expr_unbox(left), captured);
-            TypeChecker_collect_captured_vars(self, box_expr_unbox(right), captured);
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(left), cap_names, cap_types);
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(right), cap_names, cap_types);
         }
         Expr::ArrayLit(_ty, elems) => {
             var ei: i64 = 0;
             while ei < elems.len() {
-                TypeChecker_collect_captured_vars(self, elems.get(ei), captured);
+                TypeChecker_collect_captured_vars(self, elems.get(ei), cap_names, cap_types);
                 ei = ei + 1;
             }
         }
         Expr::TupleLit(elems) => {
             var ei: i64 = 0;
             while ei < elems.len() {
-                TypeChecker_collect_captured_vars(self, elems.get(ei), captured);
+                TypeChecker_collect_captured_vars(self, elems.get(ei), cap_names, cap_types);
                 ei = ei + 1;
             }
         }
         Expr::StructLit(_name, fields, spread) => {
             var fi: i64 = 0;
             while fi < fields.len() {
-                TypeChecker_collect_captured_vars(self, fields.get(fi).value, captured);
+                TypeChecker_collect_captured_vars(self, fields.get(fi).value, cap_names, cap_types);
                 fi = fi + 1;
             }
             match spread {
-                OptBoxExpr::Some(s) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(s), captured); }
+                OptBoxExpr::Some(s) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(s), cap_names, cap_types); }
                 OptBoxExpr::None => {}
             }
         }
-        Expr::Spawn(e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
-        Expr::Yield(e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
-        Expr::NamedArg(name, e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
-        Expr::Comptime(e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), captured); }
+        Expr::Spawn(e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), cap_names, cap_types); }
+        Expr::Yield(e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), cap_names, cap_types); }
+        Expr::NamedArg(name, e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), cap_names, cap_types); }
+        Expr::Comptime(e) => { TypeChecker_collect_captured_vars(self, box_expr_unbox(e), cap_names, cap_types); }
         _ => {}
     }
 }
@@ -6237,6 +6920,39 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 BinOp::BitXor => {}
                 BinOp::Shl => {}
                 BinOp::Shr => {}
+            }
+            // Operator overloading for vec types (Phase 8A): vec +/- vec of
+            // one shape, vec * scalar, vec / scalar and scalar * vec.
+            var is_addsub: bool = binop_eq(op, BinOp::Add) || binop_eq(op, BinOp::Sub);
+            var is_arith: bool = is_addsub || binop_eq(op, BinOp::Mul) || binop_eq(op, BinOp::Div) || binop_eq(op, BinOp::Mod);
+            if is_arith {
+                match lt_r {
+                    Type::Named(ln) => {
+                        match rt_r {
+                            Type::Named(rn) => {
+                                if tc_is_vec_type(ln) && tc_is_vec_type(rn) {
+                                    if ln == rn {
+                                        if is_addsub { return lt_r; }
+                                    } else {
+                                        self.errors.push("Type error: shape mismatch in binary operation. Left operand: " + ln + ", Right operand: " + rn);
+                                        return Type::Never;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        if tc_is_vec_type(ln) && TypeChecker_is_float(self, rt_r) {
+                            if binop_eq(op, BinOp::Mul) || binop_eq(op, BinOp::Div) { return lt_r; }
+                        }
+                    }
+                    _ => {}
+                }
+                match rt_r {
+                    Type::Named(rn2) => {
+                        if tc_is_vec_type(rn2) && TypeChecker_is_float(self, lt_r) && binop_eq(op, BinOp::Mul) { return rt_r; }
+                    }
+                    _ => {}
+                }
             }
             // Arithmetic/bitwise ops
             // String concatenation with +
@@ -6416,6 +7132,10 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 if callee == "p_vec_is_empty" || callee == "p_vec_contains" {
                     return Type::Bool;
                 }
+                // Green threads (as lower.fd declares it)
+                if callee == "p_gt_is_done" {
+                    return Type::Bool;
+                }
                 if (callee == "p_all_reduce" || callee == "p_all_gather") && arg_types.len() > 0 {
                     return arg_types.get(0);
                 }
@@ -6453,6 +7173,19 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 Type::Ref(inner, _) => { effective_ty = unbox_ty(box_type_unbox(inner)); }
                 _ => { effective_ty = unbox_ty(obj_ty); }
             }
+            // Swizzle access for vec types (Phase 8A): .xyz/.rgb/.yzx/.xxx
+            // on vecN gives the vec type of the swizzle's length.
+            match effective_ty {
+                Type::Named(vname) => {
+                    if tc_is_vec_type(vname) {
+                        match tc_swizzle_result_type(field) {
+                            OptType::Some(sw) => { return sw; }
+                            OptType::None => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
             match effective_ty {
                 Type::Named(name) => {
                     // Find struct fields
@@ -6463,10 +7196,15 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                             var fi: i64 = 0;
                             while fi < fields.len() {
                                 if fields.get(fi).name == field {
-                                    // Field privacy check disabled for bootstrap --
-                                    // the Rust compiler doesn't enforce field privacy,
-                                    // and the self-hosted compiler doesn't track
-                                    // which module each impl was defined in.
+                                    // Field privacy: a private field is only
+                                    // accessible from its defining module.
+                                    var pidx: i64 = HashMap_get(self.private_fields, name + "." + field);
+                                    if pidx > 0 {
+                                        var struct_module: str = self.private_field_modules.get(pidx - 1);
+                                        if struct_module != self.current_module {
+                                            self.errors.push("Privacy error: field '" + field + "' of struct '" + name + "' is private. It was defined in module '" + struct_module + "', which is not the current module '" + self.current_module + "'.");
+                                        }
+                                    }
                                     return fields.get(fi).ty;
                                 }
                                 fi = fi + 1;
@@ -6934,11 +7672,12 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             var inner_ty: Type = TypeChecker_check_expr(self, box_expr_unbox(inner));
             // @send check: any variables captured in the spawn expression
             // must be @send (safe to send across threads).
-            var captured: Vec<(str, Type)> = Vec::new();
-            TypeChecker_collect_captured_vars(self, box_expr_unbox(inner), &mut captured);
+            var cap_names: Vec<str> = Vec::new();
+            var cap_types: Vec<Type> = Vec::new();
+            TypeChecker_collect_captured_vars(self, box_expr_unbox(inner), &mut cap_names, &mut cap_types);
             var ci: i64 = 0;
-            while ci < captured.len() {
-                var (_cname, var_ty) = captured.get(ci);
+            while ci < cap_types.len() {
+                var var_ty: Type = cap_types.get(ci);
                 if !TypeChecker_is_send_type(self, var_ty) {
                     self.errors.push("Thread safety error: spawn captures variable of type " + type_to_str(var_ty) + " which is not @send. Only @send types can be safely sent across threads.");
                 }
@@ -8139,37 +8878,38 @@ pub fn TypeChecker_scan_expr_for_effects(self: &TypeChecker, expr: Expr, effects
         }
         Expr::Unary(_, e) => { TypeChecker_scan_expr_for_effects(self, box_expr_unbox(e), effects); }
         Expr::Call(callee, args) => {
-            // Map builtin calls to effects
-            if callee == "print" || callee == "println" || callee == "print_int" || callee == "print_float" || callee == "print_str" {
-                if !str_vec_contains_ref(effects, "IO") { effects.push("IO"); }
+            // Map builtin calls to effects (the table of src/typechecker.rs
+            // scan_expr_for_effects).
+            var ce: str = "";
+            if callee == "print" || callee == "println" || callee == "print_int" || callee == "print_float" || callee == "print_str"
+                || callee == "p_print_str" || callee == "p_eprint_str" || callee == "p_print_int" || callee == "p_println_str" || callee == "p_println_int"
+                || callee == "p_fs_read" || callee == "p_fs_write" { ce = "IO"; }
+            else if callee == "p_net_connect" || callee == "p_net_send" || callee == "p_net_recv" || callee == "p_http_get" { ce = "Net"; }
+            else if callee == "p_spawn_process" || callee == "p_spawn_thread" || callee == "p_thread_spawn" { ce = "Spawn"; }
+            else if callee == "p_panic" { ce = "Diverge"; }
+            else if callee == "p_vec_new" || callee == "p_map_new" || callee == "p_vec_push" || callee == "p_vec_insert"
+                || callee == "p_map_insert" || callee == "p_string_concat" || callee == "p_vec_clone"
+                || callee == "p_map_clone" || callee == "p_string_clone" || callee == "p_vec_new_with"
+                || callee == "p_alloc_new" { ce = "Alloc"; }
+            else if callee == "p_tensor_matmul" || callee == "p_tensor_add" || callee == "p_tensor_sub"
+                || callee == "p_tensor_mul" || callee == "p_tensor_scale" || callee == "p_tensor_relu"
+                || callee == "p_tensor_sigmoid" || callee == "p_tensor_softmax" || callee == "p_tensor_dot"
+                || callee == "p_tensor_sum" || callee == "p_tensor_mean" || callee == "p_tensor_transpose"
+                || callee == "p_tensor_reshape" || callee == "p_tensor_zeros" || callee == "p_tensor_ones"
+                || callee == "p_tensor_from_vec" || callee == "p_tensor_filled"
+                || callee == "p_quantize_q8" || callee == "p_dequantize_q8" || callee == "p_qmatmul"
+                || callee == "p_find_quant_params" { ce = "Diff"; }
+            else if callee == "p_dp_noise" || callee == "p_dropout" || callee == "p_gaussian_noise" { ce = "Noise"; }
+            else if callee == "p_all_reduce" || callee == "p_broadcast" || callee == "p_all_gather" || callee == "p_scatter"
+                || callee == "p_send_tensor" || callee == "p_recv_tensor" { ce = "Comm"; }
+            if ce != "" {
+                if !str_vec_contains_ref(effects, ce) { effects.push(ce); }
             }
-            if callee == "read_file" || callee == "write_file" || callee == "file_open" || callee == "file_read" || callee == "file_write" {
-                if !str_vec_contains_ref(effects, "FS") { effects.push("FS"); }
-            }
-            if callee == "http_get" || callee == "http_post" || callee == "socket_connect" || callee == "socket_send" || callee == "socket_recv" {
-                if !str_vec_contains_ref(effects, "Net") { effects.push("Net"); }
-            }
-            if callee == "spawn" || callee == "exec" || callee == "system" || callee == "p_thread_spawn" {
-                if !str_vec_contains_ref(effects, "Spawn") { effects.push("Spawn"); }
-            }
-            // Check p_* builtins
-            if str_starts_with(callee, "p_") {
-                if callee == "p_vec_new" || callee == "p_vec_push" || callee == "p_hashmap_new" || callee == "p_alloc" {
-                    if !str_vec_contains_ref(effects, "Alloc") { effects.push("Alloc"); }
-                }
-                if callee == "p_panic" || callee == "p_unreachable" {
-                    if !str_vec_contains_ref(effects, "Diverge") { effects.push("Diverge"); }
-                }
-                if callee == "p_print" || callee == "p_println" || callee == "p_print_int" || callee == "p_print_float" || callee == "p_print_str" || callee == "p_eprint_str" {
-                    if !str_vec_contains_ref(effects, "IO") { effects.push("IO"); }
-                    if !str_vec_contains_ref(effects, "Read") { effects.push("Read"); }
-                }
-                if callee == "p_vec_get" || callee == "p_hashmap_get" || callee == "p_string_contains" {
-                    if !str_vec_contains_ref(effects, "Read") { effects.push("Read"); }
-                }
-                if callee == "p_vec_set" || callee == "p_hashmap_insert" || callee == "p_string_replace" {
-                    if !str_vec_contains_ref(effects, "Write") { effects.push("Write"); }
-                }
+            if callee == "p_kv_cache_new" || callee == "p_kv_cache_append" || callee == "p_kv_cache_get"
+                || callee == "p_kv_cache_len" || callee == "p_kv_cache_clear" || callee == "p_kv_cache_evict" {
+                if !str_vec_contains_ref(effects, "Alloc") { effects.push("Alloc"); }
+                if !str_vec_contains_ref(effects, "Read") { effects.push("Read"); }
+                if !str_vec_contains_ref(effects, "Write") { effects.push("Write"); }
             }
             // Check user-defined function effects
             var fi: i64 = 0;
@@ -8324,8 +9064,9 @@ pub fn TypeChecker_scan_expr_for_effects(self: &TypeChecker, expr: Expr, effects
         Expr::QuantCast(e, _) => { TypeChecker_scan_expr_for_effects(self, box_expr_unbox(e), effects); }
         Expr::Await(e) => { TypeChecker_scan_expr_for_effects(self, box_expr_unbox(e), effects); }
         Expr::Spawn(e) => {
-            if !str_vec_contains_ref(effects, "Spawn") { effects.push("Spawn"); }
-            TypeChecker_scan_expr_for_effects(self, box_expr_unbox(e), effects);
+            // As src/typechecker.rs: a `spawn` expression contributes no
+            // effect to the spawning function (the task runs elsewhere);
+            // only explicit p_thread_spawn/p_spawn_* calls are !Spawn.
         }
         Expr::Yield(e) => {
             if !str_vec_contains_ref(effects, "Yield") { effects.push("Yield"); }

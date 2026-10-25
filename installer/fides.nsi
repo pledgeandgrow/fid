@@ -73,11 +73,12 @@ Section "Fides Compiler (required)" SecCore
 
   SetOutPath "$INSTDIR"
 
-  ; Compiler binary (renamed from fides-c3.exe to fides.exe — kept for
-  ; backwards compatibility with docs and shortcuts that say `fides`)
+  ; The self-hosted compiler (written in Fides, compiled by itself to the
+  ; fixpoint by scripts/bootstrap.sh) as fides.exe. It finds the standard
+  ; library in $INSTDIR\stdlib.
   File /oname=fides.exe "..\release\fides-c3.exe"
 
-  ; The same compiler under its canonical name, plus the companion tools.
+  ; The Rust bootstrap compiler (fidesc.exe), plus the companion tools.
   ; Stage them in release\ first (build-installer.sh / build-installer.yml do).
   File "..\release\fidesc.exe"
   File "..\release\ark.exe"
@@ -148,6 +149,8 @@ SectionEnd
 Section "Example Programs" SecExamples
   SetOutPath "$INSTDIR\examples"
   File "..\tests\bootstrap\hello.fd"
+  File "..\examples\*.fd"
+  File "..\examples\README.md"
   DetailPrint "Installed examples"
 SectionEnd
 

@@ -25,6 +25,8 @@ use compiler::ast;
 use compiler::ir;
 use compiler::green_thread;
 use compiler::tensor;
+use compiler::json;
+use math;
 
 // ===========================================================================
 // Value -- runtime value representation
@@ -56,7 +58,13 @@ pub fn interp_reinterpret_word(v: Value, ty: IrType) -> Value {
     match ty {
         IrType::F64 => {
             match v {
-                Value::Int(bits) => { return Value::Float(p_f64_from_bits(bits)); }
+                Value::Int(bits) => { return Value::Float(f64_from_bits_i(bits)); }
+                _ => { return v; }
+            }
+        }
+        IrType::F32 => {
+            match v {
+                Value::Int(bits32) => { return Value::Float(f32_from_bits_i(bits32)); }
                 _ => { return v; }
             }
         }
@@ -187,9 +195,13 @@ pub fn Memory_is_valid_addr(self: &Memory, addr: i64) -> bool {
 
 // Store a single byte at addr
 pub fn Memory_store_byte(self: &mut Memory, addr: i64, b: i64) {
-    if addr >= 0 && addr < self.data.len() {
-        self.data.set(addr, b & 0xFF);
+    if addr < 0 { return; }
+    if addr >= self.data.len() {
+        // Grow, as Memory::store (globals live at 0x400000)
+        var target: i64 = addr + 1024;
+        while self.data.len() < target { self.data.push(0); }
     }
+    self.data.set(addr, b & 0xFF);
 }
 
 // Load a single byte from addr
@@ -276,10 +288,42 @@ pub fn Memory_store_f64(self: &mut Memory, addr: i64, val: f64) {
     Memory_store_i64(self, addr, bits);
 }
 
+// Bit reinterpretation through an 8-byte scratch cell (the bootstrap types
+// the p_f64_from_bits / p_int_to_float builtins as returning i64).
+pub fn f64_from_bits_i(bits: i64) -> f64 {
+    var cell: i64 = p_malloc(8);
+    var ip: *mut i64 = cell;
+    unsafe { *ip = bits; }
+    var fp: *mut f64 = cell;
+    var f: f64 = 0.0;
+    unsafe { f = *fp; }
+    p_free(cell);
+    return f;
+}
+
+pub fn f32_from_bits_i(bits: i64) -> f64 {
+    // IEEE single -> double, by fields (no f32 arithmetic)
+    var b: i64 = bits & 0xFFFFFFFF;
+    var neg: bool = ((b >> 31) & 1) == 1;
+    var e: i64 = (b >> 23) & 0xFF;
+    var m: i64 = b & 0x7FFFFF;
+    var v: f64 = 0.0;
+    if e == 0 {
+        // zero / subnormal: m * 2^-149
+        v = (m as f64) * f64_from_bits_i(874 * 4503599627370496);
+    } else if e == 255 {
+        v = f64_from_bits_i(2047 * 4503599627370496 + m * 536870912);
+    } else {
+        v = f64_from_bits_i((e - 127 + 1023) * 4503599627370496 + m * 536870912);
+    }
+    if neg { v = -v; }
+    return v;
+}
+
 // Load an f64 (8 bytes) from addr using p_f64_from_bits
 pub fn Memory_load_f64(self: &Memory, addr: i64) -> f64 {
     var bits: i64 = Memory_load_i64(self, addr);
-    return p_f64_from_bits(bits);
+    return f64_from_bits_i(bits);
 }
 
 // Store an f32 (4 bytes) at addr
@@ -291,7 +335,31 @@ pub fn Memory_store_f32(self: &mut Memory, addr: i64, val: f64) {
 // Load an f32 (4 bytes) from addr
 pub fn Memory_load_f32(self: &Memory, addr: i64) -> f64 {
     var bits: i64 = Memory_load_i32(self, addr);
-    return p_f32_from_bits(bits);
+    return f32_from_bits_i(bits);
+}
+
+// Copy `size` bytes from src to dst
+pub fn Memory_copy(self: &mut Memory, dst: i64, src: i64, size: i64) {
+    if size <= 0 { return; }
+    // Grow so the destination range exists (as Memory::store)
+    while dst + size >= self.data.len() {
+        var gi: i64 = 0;
+        while gi < 4096 {
+            self.data.push(0);
+            gi = gi + 1;
+        }
+    }
+    var tmp: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < size {
+        tmp.push(Memory_load_byte(self, src + i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < size {
+        Memory_store_byte(self, dst + i, tmp.get(i));
+        i = i + 1;
+    }
 }
 
 // Store a null-terminated string at addr, return the address
@@ -378,7 +446,205 @@ pub fn OpaqueEntry_new(addr: i64, value: Value) -> OpaqueEntry {
 }
 
 pub struct OpaqueSnapshot {
-    pub entries: Vec<OpaqueEntry>,
+    pub entries: I64Table,
+}
+
+// ---------------------------------------------------------------------------
+// I64Table -- open-addressing hash map i64 -> Value (Rust's HashMap<u64, Value>
+// for the opaque side table). state: 0 empty, 1 live, 2 deleted.
+// ---------------------------------------------------------------------------
+
+pub struct I64Table {
+    pub keys: Vec<i64>,
+    pub vals: Vec<Value>,
+    pub state: Vec<i64>,
+    pub live: i64,
+    pub filled: i64,
+}
+
+pub fn I64Table_new() -> I64Table {
+    var t: I64Table = I64Table { keys: Vec::new(), vals: Vec::new(), state: Vec::new(), live: 0, filled: 0 };
+    I64Table_init(&mut t, 256);
+    return t;
+}
+
+fn I64Table_init(t: &mut I64Table, cap: i64) {
+    var k: Vec<i64> = Vec::new();
+    var v: Vec<Value> = Vec::new();
+    var s: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < cap {
+        k.push(0);
+        v.push(Value::Void);
+        s.push(0);
+        i = i + 1;
+    }
+    t.keys = k;
+    t.vals = v;
+    t.state = s;
+    t.live = 0;
+    t.filled = 0;
+}
+
+fn i64_hash_slot(key: i64, mask: i64) -> i64 {
+    var h: i64 = key ^ (key >> 16);
+    h = h ^ (h >> 5);
+    return h & mask;
+}
+
+pub fn I64Table_find(t: &I64Table, key: i64) -> i64 {
+    var cap: i64 = t.keys.len();
+    var mask: i64 = cap - 1;
+    var i: i64 = i64_hash_slot(key, mask);
+    while true {
+        var st: i64 = t.state.get(i);
+        if st == 0 { return -1; }
+        if st == 1 {
+            if t.keys.get(i) == key { return i; }
+        }
+        i = (i + 1) & mask;
+    }
+    return -1;
+}
+
+pub fn I64Table_get(t: &I64Table, key: i64) -> OptValue {
+    var s: i64 = I64Table_find(t, key);
+    if s < 0 { return OptValue::None; }
+    return OptValue::Some(t.vals.get(s));
+}
+
+fn I64Table_rehash(t: &mut I64Table) {
+    var old_keys: Vec<i64> = t.keys;
+    var old_vals: Vec<Value> = t.vals;
+    var old_state: Vec<i64> = t.state;
+    var cap: i64 = old_keys.len();
+    if t.live * 4 >= cap { cap = cap * 2; }
+    I64Table_init(t, cap);
+    var i: i64 = 0;
+    while i < old_keys.len() {
+        if old_state.get(i) == 1 {
+            I64Table_set(t, old_keys.get(i), old_vals.get(i));
+        }
+        i = i + 1;
+    }
+}
+
+pub fn I64Table_set(t: &mut I64Table, key: i64, val: Value) {
+    var s: i64 = I64Table_find(t, key);
+    if s >= 0 {
+        t.vals.set(s, val);
+        return;
+    }
+    if (t.filled + 1) * 2 > t.keys.len() { I64Table_rehash(t); }
+    var mask: i64 = t.keys.len() - 1;
+    var i: i64 = i64_hash_slot(key, mask);
+    while t.state.get(i) == 1 { i = (i + 1) & mask; }
+    if t.state.get(i) == 0 { t.filled = t.filled + 1; }
+    t.keys.set(i, key);
+    t.vals.set(i, val);
+    t.state.set(i, 1);
+    t.live = t.live + 1;
+}
+
+pub fn I64Table_remove(t: &mut I64Table, key: i64) {
+    var s: i64 = I64Table_find(t, key);
+    if s >= 0 {
+        t.state.set(s, 2);
+        t.vals.set(s, Value::Void);
+        t.live = t.live - 1;
+    }
+}
+
+pub fn I64Table_clone(t: &I64Table) -> I64Table {
+    return I64Table { keys: t.keys.clone(), vals: t.vals.clone(), state: t.state.clone(), live: t.live, filled: t.filled };
+}
+
+// ---------------------------------------------------------------------------
+// StrTable -- open-addressing hash map str -> i64 (function / runtime-name
+// caches). No deletion.
+// ---------------------------------------------------------------------------
+
+pub struct StrTable {
+    pub keys: Vec<str>,
+    pub vals: Vec<i64>,
+    pub used: Vec<bool>,
+    pub count: i64,
+}
+
+pub fn StrTable_new(cap: i64) -> StrTable {
+    var k: Vec<str> = Vec::new();
+    var v: Vec<i64> = Vec::new();
+    var u: Vec<bool> = Vec::new();
+    var i: i64 = 0;
+    while i < cap {
+        k.push("");
+        v.push(0);
+        u.push(false);
+        i = i + 1;
+    }
+    return StrTable { keys: k, vals: v, used: u, count: 0 };
+}
+
+fn str_hash_i(s: str) -> i64 {
+    var n: i64 = str_len(s);
+    var h: i64 = n;
+    var i: i64 = 0;
+    while i < n && i < 48 {
+        var ap: i64 = s + i;
+        var bp: *mut u8 = ap;
+        var b: i64 = 0;
+        unsafe { b = *bp; }
+        h = ((h * 31) + b) & 0x3FFFFFFFFFFF;
+        i = i + 1;
+    }
+    return h;
+}
+
+/// Slot of `key`, or -1.
+pub fn StrTable_find(t: &StrTable, key: str) -> i64 {
+    var mask: i64 = t.keys.len() - 1;
+    var i: i64 = str_hash_i(key) & mask;
+    while t.used.get(i) {
+        if t.keys.get(i) == key { return i; }
+        i = (i + 1) & mask;
+    }
+    return -1;
+}
+
+pub fn StrTable_get(t: &StrTable, key: str, dflt: i64) -> i64 {
+    var s: i64 = StrTable_find(t, key);
+    if s < 0 { return dflt; }
+    return t.vals.get(s);
+}
+
+pub fn StrTable_set(t: &mut StrTable, key: str, val: i64) {
+    var s: i64 = StrTable_find(t, key);
+    if s >= 0 {
+        t.vals.set(s, val);
+        return;
+    }
+    if (t.count + 1) * 2 > t.keys.len() {
+        var old_k: Vec<str> = t.keys;
+        var old_v: Vec<i64> = t.vals;
+        var old_u: Vec<bool> = t.used;
+        var nt: StrTable = StrTable_new(old_k.len() * 2);
+        t.keys = nt.keys;
+        t.vals = nt.vals;
+        t.used = nt.used;
+        t.count = 0;
+        var j: i64 = 0;
+        while j < old_k.len() {
+            if old_u.get(j) { StrTable_set(t, old_k.get(j), old_v.get(j)); }
+            j = j + 1;
+        }
+    }
+    var mask: i64 = t.keys.len() - 1;
+    var i: i64 = str_hash_i(key) & mask;
+    while t.used.get(i) { i = (i + 1) & mask; }
+    t.keys.set(i, key);
+    t.vals.set(i, val);
+    t.used.set(i, true);
+    t.count = t.count + 1;
 }
 
 fn Memory_clone(m: &Memory) -> Memory {
@@ -448,12 +714,21 @@ pub struct Interpreter {
     pub memory: Memory,
     pub string_addrs: Vec<StringAddrEntry>,
     pub global_addrs: Vec<GlobalAddrEntry>,
-    pub opaque_values: Vec<OpaqueEntry>,
+    pub opaque_values: I64Table,
+    // MakeDyn: data pointer -> concrete type name (Rust's Value::Dyn)
+    pub dyn_types: I64Table,
+    // name -> index in module.functions (-1: none)
+    pub fn_cache: StrTable,
+    // name -> 1 runtime builtin / 0 not (memo of is_runtime_func)
+    pub rt_cache: StrTable,
+    // is the current function @wrapping
+    pub cur_wrapping: bool,
     pub vec_side_table: Vec<VecSideEntry>,
     pub vec_values: Vec<VecValueEntry>,
     pub map_values: Vec<MapValueEntry>,
     pub tensors: Vec<TensorData>,
     pub tensor_side_table: Vec<TensorSideEntry>,
+    pub tensor_index: I64Table,
     pub kv_caches: Vec<KvCache>,
     pub verbose: bool,
     pub debug_mode: bool,
@@ -481,6 +756,30 @@ pub struct Interpreter {
     // Spawn/future results — p_thread_spawn/p_executor_spawn run eagerly and
     // store the thread's return Value here; the Int handle indexes this table.
     pub future_values: Vec<Value>,
+    pub future_exec: Vec<i64>,
+    pub executor_count: i64,
+    pub shared_mem: I64Table,
+    pub next_shared_addr: i64,
+    pub next_mutex_handle: i64,
+    pub tls: I64Table,
+    pub next_tls_key: i64,
+    pub chans: Vec<ChanState>,
+    pub dl_handles: I64Table,
+    pub next_dl_handle: i64,
+    pub ecs_entity_count: i64,
+    pub ecs_comps: Vec<EcsComp>,
+    pub sb_strs: Vec<str>,
+    pub db_rows: Vec<DbRow>,
+    pub next_db_handle: i64,
+    pub closed_dbs: Vec<i64>,
+    pub alloc_ptr: i64,
+    pub persist_keys: Vec<str>,
+    pub persist_vals: Vec<str>,
+    pub ag_enabled: bool,
+    pub ag_checkpoint: bool,
+    pub ag_tape: Vec<AgEntry>,
+    pub ag_grad_keys: Vec<i64>,
+    pub ag_grad_vals: Vec<TensorData>,
     // Cooperative green-thread scheduler (p_gt_* builtins).
     pub gt_scheduler: GreenThreadScheduler,
 }
@@ -491,12 +790,17 @@ pub fn Interpreter_new(module: IrModule) -> Interpreter {
         memory: Memory_new(),
         string_addrs: Vec::new(),
         global_addrs: Vec::new(),
-        opaque_values: Vec::new(),
+        opaque_values: I64Table_new(),
+        dyn_types: I64Table_new(),
+        fn_cache: StrTable_new(1024),
+        rt_cache: StrTable_new(256),
+        cur_wrapping: false,
         vec_side_table: Vec::new(),
         vec_values: Vec::new(),
         map_values: Vec::new(),
         tensors: Vec::new(),
         tensor_side_table: Vec::new(),
+        tensor_index: I64Table_new(),
         kv_caches: Vec::new(),
         verbose: false,
         debug_mode: true,
@@ -520,11 +824,51 @@ pub fn Interpreter_new(module: IrModule) -> Interpreter {
         dp_epsilon_limit: 0.0,
         thread_handle_count: 0,
         future_values: Vec::new(),
+        future_exec: Vec::new(),
+        executor_count: 0,
+        shared_mem: I64Table_new(),
+        next_shared_addr: 0x10000000,
+        next_mutex_handle: 1,
+        tls: I64Table_new(),
+        next_tls_key: 0,
+        chans: Vec::new(),
+        dl_handles: I64Table_new(),
+        next_dl_handle: 1,
+        ecs_entity_count: 0,
+        ecs_comps: Vec::new(),
+        sb_strs: Vec::new(),
+        db_rows: Vec::new(),
+        next_db_handle: 1,
+        closed_dbs: Vec::new(),
+        alloc_ptr: 0x10000,
+        persist_keys: Vec::new(),
+        persist_vals: Vec::new(),
+        ag_enabled: false,
+        ag_checkpoint: false,
+        ag_tape: Vec::new(),
+        ag_grad_keys: Vec::new(),
+        ag_grad_vals: Vec::new(),
         gt_scheduler: GreenThreadScheduler_new(),
     };
+    // Function index (first definition wins, as IrModule_get_function)
+    var fi: i64 = 0;
+    while fi < interp.module.functions.len() {
+        var fname: str = interp.module.functions.get(fi).name;
+        if StrTable_find(&interp.fn_cache, fname) < 0 {
+            StrTable_set(&mut interp.fn_cache, fname, fi);
+        }
+        fi = fi + 1;
+    }
     Interpreter_init_strings(&mut interp);
     Interpreter_init_globals(&mut interp);
     return interp;
+}
+
+/// IrModule_get_function through the name index.
+pub fn Interpreter_get_function(self: &Interpreter, name: str) -> OptIrFunction {
+    var idx: i64 = StrTable_get(&self.fn_cache, name, -1);
+    if idx < 0 { return OptIrFunction::None; }
+    return OptIrFunction::Some(self.module.functions.get(idx).func);
 }
 
 pub fn Interpreter_verbose(self: &mut Interpreter) {
@@ -570,39 +914,15 @@ pub fn Interpreter_lookup_global_addr(self: &Interpreter, name: str) -> i64 {
 }
 
 pub fn Interpreter_lookup_opaque(self: &Interpreter, addr: i64) -> OptValue {
-    var i: i64 = 0;
-    while i < self.opaque_values.len() {
-        if self.opaque_values.get(i).addr == addr {
-            return OptValue::Some(self.opaque_values.get(i).value);
-        }
-        i = i + 1;
-    }
-    return OptValue::None;
+    return I64Table_get(&self.opaque_values, addr);
 }
 
 pub fn Interpreter_set_opaque(self: &mut Interpreter, addr: i64, value: Value) {
-    // Replace existing or add new
-    var i: i64 = 0;
-    while i < self.opaque_values.len() {
-        if self.opaque_values.get(i).addr == addr {
-            self.opaque_values.set(i, OpaqueEntry_new(addr, value));
-            return;
-        }
-        i = i + 1;
-    }
-    self.opaque_values.push(OpaqueEntry_new(addr, value));
+    I64Table_set(&mut self.opaque_values, addr, value);
 }
 
 pub fn Interpreter_remove_opaque(self: &mut Interpreter, addr: i64) {
-    // Mark as Void (removing would shift indices; instead set to Void)
-    var i: i64 = 0;
-    while i < self.opaque_values.len() {
-        if self.opaque_values.get(i).addr == addr {
-            self.opaque_values.set(i, OpaqueEntry_new(addr, Value::Void));
-            return;
-        }
-        i = i + 1;
-    }
+    I64Table_remove(&mut self.opaque_values, addr);
 }
 
 pub fn Interpreter_lookup_array_bound(self: &Interpreter, addr: i64) -> i64 {
@@ -707,18 +1027,147 @@ pub fn Interpreter_value_to_string(self: &Interpreter, v: Value) -> str {
     match v {
         Value::Str(s) => { return s; }
         Value::Ptr(addr) => { return Memory_load_cstr(&self.memory, addr); }
+        Value::Int(i) => {
+            // An Int may be a string pointer (a Str passed to an i64 param)
+            if i > 0 {
+                match Interpreter_lookup_opaque(self, i) {
+                    OptValue::Some(ov) => {
+                        match ov {
+                            Value::Str(os) => { return os; }
+                            _ => {}
+                        }
+                    }
+                    OptValue::None => {}
+                }
+            }
+            if i > 0 && Memory_is_valid_addr(&self.memory, i) {
+                var out: str = "";
+                var n: i64 = 0;
+                while n < 256 {
+                    var b: i64 = Memory_load_byte(&self.memory, i + n);
+                    if b == 0 { break; }
+                    out = out + p_char_to_str(b);
+                    n = n + 1;
+                }
+                if n > 0 { return out; }
+            }
+            return int_to_str(i);
+        }
+        _ => { return ""; }
+    }
+    return "";
+}
+
+/// Rust's `Display for Value`.
+pub fn Interpreter_display_value(self: &Interpreter, v: Value) -> str {
+    match v {
         Value::Int(i) => { return int_to_str(i); }
         Value::Float(f) => { return float_to_str(f); }
         Value::Bool(b) => {
             if b { return "true"; }
             return "false";
         }
+        Value::Str(s) => { return s; }
+        Value::Ptr(p) => {
+            var dth: i64 = Interpreter_tensor_handle(self, v);
+            if dth >= 0 { return interp_tensor_to_string(&self.tensors.get(dth)); }
+            return "ptr(0x" + int_to_hex(p) + ")";
+        }
         Value::Void => { return "void"; }
-        _ => { return ""; }
+        Value::Vec(h) => {
+            var out: str = "[";
+            if h >= 0 && h < self.vec_values.len() {
+                var elems: Vec<Value> = self.vec_values.get(h).elements;
+                var i: i64 = 0;
+                while i < elems.len() {
+                    if i > 0 { out = out + ", "; }
+                    out = out + Interpreter_display_value(self, elems.get(i));
+                    i = i + 1;
+                }
+            }
+            return out + "]";
+        }
+        Value::Map(mh) => {
+            var mout: str = "{";
+            if mh >= 0 && mh < self.map_values.len() {
+                var me: MapValueEntry = self.map_values.get(mh);
+                var order: Vec<i64> = sorted_key_order(me.keys);
+                var j: i64 = 0;
+                while j < order.len() {
+                    if j > 0 { mout = mout + ", "; }
+                    var k: i64 = order.get(j);
+                    mout = mout + me.keys.get(k) + ": " + Interpreter_display_value(self, me.vals.get(k));
+                    j = j + 1;
+                }
+            }
+            return mout + "}";
+        }
     }
     return "";
 }
 
+/// Indices of `keys` in ascending string order (insertion sort).
+pub fn sorted_key_order(keys: Vec<str>) -> Vec<i64> {
+    var order: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < keys.len() {
+        var j: i64 = order.len();
+        order.push(i);
+        while j > 0 && str_lt(keys.get(i), keys.get(order.get(j - 1))) {
+            order.set(j, order.get(j - 1));
+            j = j - 1;
+        }
+        order.set(j, i);
+        i = i + 1;
+    }
+    return order;
+}
+
+/// Byte-wise string ordering (Rust's str Ord).
+pub fn str_lt(a: str, b: str) -> bool {
+    var la: i64 = str_len(a);
+    var lb: i64 = str_len(b);
+    var i: i64 = 0;
+    while i < la && i < lb {
+        var ca: i64 = str_byte_at(a, i);
+        var cb: i64 = str_byte_at(b, i);
+        if ca != cb { return ca < cb; }
+        i = i + 1;
+    }
+    return la < lb;
+}
+
+/// Print `v` with the Fides formatter `fname` (Vec_to_str, HashMap_to_str).
+/// Continue / Panic when handled; Value(Void) when the caller should fall
+/// back to the default printing.
+pub fn Interpreter_print_via(self: &mut Interpreter, fname: str, v: Value) -> ExecOutcome {
+    match Interpreter_get_function(self, fname) {
+        OptIrFunction::Some(callee) => {
+            var fargs: Vec<Value> = Vec::new();
+            fargs.push(Value::Int(0));
+            fargs.push(v);
+            match Interpreter_run_function(self, callee, fargs) {
+                RunResult::Return(rv) => {
+                    match rv {
+                        Value::Str(rs) => {
+                            p_print_str(rs);
+                            return ExecOutcome::Continue;
+                        }
+                        Value::Ptr(ra) => {
+                            p_print_str(Memory_load_cstr(&self.memory, ra));
+                            return ExecOutcome::Continue;
+                        }
+                        _ => {}
+                    }
+                }
+                RunResult::Panic(msg) => { return ExecOutcome::Panic(msg); }
+                RunResult::Paused => {}
+            }
+        }
+        OptIrFunction::None => {}
+    }
+    return ExecOutcome::Value(Value::Void);
+}
 // ===========================================================================
 // format_call_stack -- for panic stack traces
 // ===========================================================================
@@ -738,9 +1187,9 @@ pub fn Interpreter_format_call_stack(self: &Interpreter) -> str {
             }
         }
         if idx == 0 {
-            out = out + "    -> " + name + suffix + "\n";
+            out = out + "    → " + name + suffix + "\n";
         } else {
-            out = out + "    called from " + name + suffix + "\n";
+            out = out + "    ↳ called from " + name + suffix + "\n";
         }
         i = i - 1;
         idx = idx + 1;
@@ -753,7 +1202,7 @@ pub fn Interpreter_format_call_stack(self: &Interpreter) -> str {
 // ===========================================================================
 
 pub fn Interpreter_run(self: &mut Interpreter) -> RunResult {
-    match IrModule_get_function(&self.module, "main") {
+    match Interpreter_get_function(self, "main") {
         OptIrFunction::Some(main_fn) => {
             return Interpreter_run_function(self, main_fn, Vec::new());
         }
@@ -781,7 +1230,9 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
     }
 
     var saved_func_name: str = self.current_func_name;
+    var saved_wrapping: bool = self.cur_wrapping;
     self.current_func_name = func.name;
+    self.cur_wrapping = func.is_wrapping;
     self.call_stack.push(func.name);
     var saved_call_site: OptU64 = self.pending_call_site;
     self.pending_call_site = OptU64::None;
@@ -916,8 +1367,9 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
                             }
                         }
                         ExecOutcome::Jump(target) => {
+                            // On to the target block (`done` is for leaving
+                            // the function: return or panic)
                             next_block = target;
-                            done = true;
                             break;
                         }
                         ExecOutcome::Return(rv) => {
@@ -944,7 +1396,21 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
                                 self.opaque_values = snap_opaque.entries;
                                 self.txn_opaque_snapshots.pop();
                             }
-                            result = RunResult::Panic(msg);
+                            // The panicking instruction's source line (as
+                            // src/interp.rs), unless the message has one
+                            var pmsg: str = msg;
+                            if !str_contains(pmsg, " at line ") {
+                                match IrFunction_get_meta(&func, inst_id) {
+                                    OptValueMeta::Some(pm) => {
+                                        match pm.source_line {
+                                            OptU64::Some(pl) => { pmsg = pmsg + " at line " + int_to_str(pl); }
+                                            OptU64::None => {}
+                                        }
+                                    }
+                                    OptValueMeta::None => {}
+                                }
+                            }
+                            result = RunResult::Panic(pmsg);
                             done = true;
                             break;
                         }
@@ -972,6 +1438,7 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
         self.region_stack.pop();
     }
     self.current_func_name = saved_func_name;
+    self.cur_wrapping = saved_wrapping;
     self.call_stack.pop();
     self.call_site_lines.pop();
 
@@ -981,6 +1448,41 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
 // ===========================================================================
 // get_value -- safe lookup from the value table
 // ===========================================================================
+
+/// What an 8-byte integer load at `addr` reads from the side table: a
+/// pointer, string, Vec or map stored there (else None: read memory).
+fn Interpreter_load_side_word(self: &Interpreter, addr: i64) -> OptValue {
+    match Interpreter_lookup_opaque(self, addr) {
+        OptValue::Some(ov) => {
+            match ov {
+                Value::Ptr(_) => { return OptValue::Some(ov); }
+                Value::Str(_) => { return OptValue::Some(ov); }
+                Value::Vec(_) => { return OptValue::Some(ov); }
+                Value::Map(_) => { return OptValue::Some(ov); }
+                _ => {}
+            }
+        }
+        OptValue::None => {}
+    }
+    return OptValue::None;
+}
+
+/// The 8-byte word a raw (core) Vec stores for `v`.
+pub fn Interpreter_value_word(self: &mut Interpreter, v: Value) -> i64 {
+    match v {
+        Value::Int(i) => { return i; }
+        Value::Ptr(p) => { return p; }
+        Value::Float(f) => { return p_f64_to_bits(f); }
+        Value::Bool(b) => { if b { return 1; } return 0; }
+        Value::Str(s) => {
+            var sa: i64 = Memory_store_cstr(&mut self.memory, s);
+            Interpreter_set_opaque(self, sa, Value::Str(s));
+            return sa;
+        }
+        _ => {}
+    }
+    return 0;
+}
 
 pub fn get_value(values: Vec<Value>, id: i64) -> Value {
     if id >= 0 && id < values.len() {
@@ -1085,9 +1587,9 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
             if value_is_void(result) {
                 var msg: str = "Arithmetic error";
                 match op {
-                    BinOp::Add => { msg = "Integer overflow on addition"; }
-                    BinOp::Sub => { msg = "Integer overflow on subtraction"; }
-                    BinOp::Mul => { msg = "Integer overflow on multiplication"; }
+                    BinOp::Add => { msg = "Integer overflow on addition: " + int_or_q(l) + " + " + int_or_q(r); }
+                    BinOp::Sub => { msg = "Integer overflow on subtraction: " + int_or_q(l) + " - " + int_or_q(r); }
+                    BinOp::Mul => { msg = "Integer overflow on multiplication: " + int_or_q(l) + " * " + int_or_q(r); }
                     BinOp::Div => { msg = "Division by zero"; }
                     BinOp::Mod => { msg = "Modulo by zero"; }
                     _ => { msg = "Arithmetic error"; }
@@ -1136,20 +1638,10 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                 }
                 _ => { addr = 0; }
             }
-            // Check opaque side-table first (for Vec, Map, Str, Ptr values)
-            match Interpreter_lookup_opaque(self, addr) {
-                OptValue::Some(ov) => {
-                    match ov {
-                        Value::Ptr(_) => { return ExecOutcome::Value(ov); }
-                        Value::Vec(_) => { return ExecOutcome::Value(ov); }
-                        Value::Map(_) => { return ExecOutcome::Value(ov); }
-                        Value::Str(_) => { return ExecOutcome::Value(ov); }
-                        _ => {}
-                    }
-                }
-                OptValue::None => {}
-            }
-            // Load from byte memory based on type
+            // Load from byte memory based on type. Only a word-sized load can
+            // read a value the side table holds (a Vec, map or string stored
+            // there): a byte load at a string's address reads its first byte.
+            // (As in src/interp.rs.)
             match ty {
                 IrType::I8 => {
                     var b: i64 = Memory_load_byte(&self.memory, addr);
@@ -1179,9 +1671,17 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                     return ExecOutcome::Value(Value::Int(Memory_load_i32(&self.memory, addr)));
                 }
                 IrType::I64 => {
+                    match Interpreter_load_side_word(self, addr) {
+                        OptValue::Some(sv) => { return ExecOutcome::Value(sv); }
+                        OptValue::None => {}
+                    }
                     return ExecOutcome::Value(Value::Int(Memory_load_i64(&self.memory, addr)));
                 }
                 IrType::U64 => {
+                    match Interpreter_load_side_word(self, addr) {
+                        OptValue::Some(sv) => { return ExecOutcome::Value(sv); }
+                        OptValue::None => {}
+                    }
                     return ExecOutcome::Value(Value::Int(Memory_load_i64(&self.memory, addr)));
                 }
                 IrType::F32 => {
@@ -1194,10 +1694,21 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                     return ExecOutcome::Value(Value::Bool(Memory_load_bool(&self.memory, addr)));
                 }
                 IrType::Ptr(_) => {
+                    // A stored string (str fields have IR type Ptr(U8)) or pointer
+                    match Interpreter_lookup_opaque(self, addr) {
+                        OptValue::Some(pv) => {
+                            match pv {
+                                Value::Str(_) => { return ExecOutcome::Value(pv); }
+                                Value::Ptr(_) => { return ExecOutcome::Value(pv); }
+                                _ => {}
+                            }
+                        }
+                        OptValue::None => {}
+                    }
                     return ExecOutcome::Value(Value::Ptr(Memory_load_i64(&self.memory, addr)));
                 }
                 IrType::Opaque(_) => {
-                    // Check side-table again for opaque types
+                    // Check side-table for opaque types
                     match Interpreter_lookup_opaque(self, addr) {
                         OptValue::Some(ov2) => { return ExecOutcome::Value(ov2); }
                         OptValue::None => {
@@ -1227,26 +1738,109 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                 _ => { addr = 0; }
             }
             var v: Value = get_value(values, value);
-            // Clear any stale opaque entry
-            Interpreter_remove_opaque(self, addr);
-            // Resolve store width: explicit OptIrType wins, else the value's
-            // declared meta type, else I64 (matches src/interp.rs:1497-1512).
-            var sty: IrType = IrType::I64;
+            // An explicit Struct store type is an inline struct copy (an enum
+            // payload, a by-value struct): copy the bytes from the source.
             match sty_opt {
-                OptIrType::Some(t) => { sty = t; }
-                OptIrType::None => {
-                    match IrFunction_get_meta(func, value) {
-                        OptValueMeta::Some(vm) => { sty = vm.ty; }
-                        OptValueMeta::None => {}
+                OptIrType::Some(est) => {
+                    match est {
+                        IrType::Struct(_) => {
+                            var esize: i64 = IrModule_type_size(&self.module, est);
+                            var src: i64 = -1;
+                            match v {
+                                Value::Ptr(sa) => { src = sa; }
+                                Value::Int(si) => {
+                                    if si > 0 && Memory_is_valid_addr(&self.memory, si) { src = si; }
+                                }
+                                _ => {}
+                            }
+                            if src >= 0 {
+                                Memory_copy(&mut self.memory, addr, src, esize);
+                                return ExecOutcome::Continue;
+                            }
+                        }
+                        _ => {}
                     }
                 }
+                OptIrType::None => {}
+            }
+            // Pointer / value types (src/interp.rs Store)
+            var has_ptr_ty: bool = false;
+            var ptr_ty: IrType = IrType::Void;
+            match IrFunction_get_meta(func, ptr) {
+                OptValueMeta::Some(pm) => { ptr_ty = pm.ty; has_ptr_ty = true; }
+                OptValueMeta::None => {}
+            }
+            var has_val_ty: bool = false;
+            var val_ty: IrType = IrType::I64;
+            match IrFunction_get_meta(func, value) {
+                OptValueMeta::Some(vm) => { val_ty = vm.ty; has_val_ty = true; }
+                OptValueMeta::None => {}
+            }
+            var is_opaque: bool = false;
+            var is_deref_store: bool = false;
+            var has_pointee: bool = false;
+            var pointee_ty: IrType = IrType::Void;
+            if has_ptr_ty {
+                match ptr_ty {
+                    IrType::Opaque(_) => { is_opaque = true; }
+                    IrType::Generic(_, _) => { is_opaque = true; }
+                    IrType::Ptr(inner) => {
+                        pointee_ty = box_ir_type_unbox(inner);
+                        has_pointee = true;
+                        is_deref_store = true;
+                        match inner {
+                            IrType::Opaque(_) => { is_opaque = true; }
+                            IrType::Generic(_, _) => { is_opaque = true; }
+                            IrType::I64 => { is_deref_store = false; }
+                            IrType::U64 => { is_deref_store = false; }
+                            IrType::Ptr(_) => { is_deref_store = false; }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            var sty: IrType = IrType::I64;
+            if has_val_ty { sty = val_ty; }
+            if is_deref_store && has_pointee { sty = pointee_ty; }
+            if is_opaque {
+                // Opaque-typed slots always use the side table (and byte
+                // memory for primitives, as a fallback)
+                Interpreter_set_opaque(self, addr, v);
+                match v {
+                    Value::Int(oi) => { Memory_store_i64(&mut self.memory, addr, oi); }
+                    Value::Float(of) => { Memory_store_f64(&mut self.memory, addr, of); }
+                    Value::Bool(ob) => { Memory_store_bool(&mut self.memory, addr, ob); }
+                    Value::Ptr(op) => { Memory_store_i64(&mut self.memory, addr, op); }
+                    Value::Str(os) => {
+                        var osa: i64 = Memory_store_cstr(&mut self.memory, os);
+                        Memory_store_i64(&mut self.memory, addr, osa);
+                    }
+                    _ => {}
+                }
+                return ExecOutcome::Continue;
+            }
+            // Clear any stale opaque entry
+            Interpreter_remove_opaque(self, addr);
+            // Struct store: copy the struct bytes from the source pointer
+            match sty {
+                IrType::Struct(_) => {
+                    match v {
+                        Value::Ptr(src_addr) => {
+                            var ssize: i64 = IrModule_type_size(&self.module, sty);
+                            Memory_copy(&mut self.memory, addr, src_addr, ssize);
+                            return ExecOutcome::Continue;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
             }
             match v {
                 Value::Int(iv) => {
                     match sty {
                         IrType::I8 => { Memory_store_byte(&mut self.memory, addr, iv & 0xFF); }
                         IrType::U8 => { Memory_store_byte(&mut self.memory, addr, iv & 0xFF); }
-                        IrType::Bool => { Memory_store_byte(&mut self.memory, addr, iv & 1); }
                         IrType::I16 => { Memory_store_i16(&mut self.memory, addr, iv); }
                         IrType::U16 => { Memory_store_i16(&mut self.memory, addr, iv); }
                         IrType::I32 => { Memory_store_i32(&mut self.memory, addr, iv); }
@@ -1265,20 +1859,15 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                 }
                 Value::Ptr(pv) => {
                     Memory_store_i64(&mut self.memory, addr, pv);
+                    if I64Table_find(&self.tensor_index, pv) >= 0 { Interpreter_set_opaque(self, addr, v); }
                 }
                 Value::Str(s) => {
                     var str_addr: i64 = Memory_store_cstr(&mut self.memory, s);
                     Memory_store_i64(&mut self.memory, addr, str_addr);
                     Interpreter_set_opaque(self, addr, Value::Str(s));
                 }
-                Value::Vec(_) => {
-                    // Opaque values stored in side-table
-                    Interpreter_set_opaque(self, addr, v);
-                }
-                Value::Map(_) => {
-                    // Opaque values stored in side-table
-                    Interpreter_set_opaque(self, addr, v);
-                }
+                Value::Vec(_) => { Interpreter_set_opaque(self, addr, v); }
+                Value::Map(_) => { Interpreter_set_opaque(self, addr, v); }
                 _ => {}
             }
             return ExecOutcome::Continue;
@@ -1392,10 +1981,19 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
             }
             // Check if it's a runtime function
             if Interpreter_is_runtime_func(self, name) {
+                if name == "p_vec_get" || name == "p_vec_pop" {
+                    // A raw Vec element is the stored 8-byte word
+                    var vout: ExecOutcome = Interpreter_call_runtime(self, name, arg_vals);
+                    match vout {
+                        ExecOutcome::Value(rv) => { return ExecOutcome::Value(interp_reinterpret_word(rv, call_ret_ty)); }
+                        _ => {}
+                    }
+                    return vout;
+                }
                 return Interpreter_call_runtime(self, name, arg_vals);
             }
             // Check if it's a user function
-            match IrModule_get_function(&self.module, name) {
+            match Interpreter_get_function(self, name) {
                 OptIrFunction::Some(callee) => {
                     // Record call site
                     var meta_opt2: OptValueMeta = IrFunction_get_meta(func, inst_id);
@@ -1448,7 +2046,7 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
             if Interpreter_is_runtime_func(self, fn_name) {
                 return Interpreter_call_runtime(self, fn_name, arg_vals2);
             }
-            match IrModule_get_function(&self.module, fn_name) {
+            match Interpreter_get_function(self, fn_name) {
                 OptIrFunction::Some(callee2) => {
                     var all_args: Vec<Value> = Vec::new();
                     if callee2.params.len() > arg_vals2.len() {
@@ -1483,8 +2081,10 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                 Value::Int(i) => { data_ptr = i; }
                 _ => { data_ptr = 0; }
             }
-            // Store type_name as a string for DynCall lookup
-            return ExecOutcome::Value(Value::Str(type_name));
+            // Rust's Value::Dyn(type, data_ptr): the data pointer, with its
+            // concrete type in the dyn side table
+            I64Table_set(&mut self.dyn_types, data_ptr, Value::Str(type_name));
+            return ExecOutcome::Value(Value::Ptr(data_ptr));
         }
 
         Inst::DynCall(trait_name, method, arg_ids, _, _) => {
@@ -1497,14 +2097,36 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
             // First arg is the receiver (Dyn or Str with type name)
             var type_name: str = "";
             var all_args3: Vec<Value> = Vec::new();
+            var recv_ok: bool = false;
             if arg_vals3.len() > 0 {
+                var recv_ptr: i64 = -1;
                 match arg_vals3.get(0) {
-                    Value::Str(s) => { type_name = s; }
-                    _ => { type_name = ""; }
+                    Value::Str(s) => { type_name = s; recv_ok = true; }
+                    Value::Ptr(rp) => { recv_ptr = rp; }
+                    Value::Int(ri) => { recv_ptr = ri; }
+                    _ => {}
+                }
+                if recv_ptr >= 0 {
+                    match I64Table_get(&self.dyn_types, recv_ptr) {
+                        OptValue::Some(tv) => {
+                            match tv {
+                                Value::Str(tn) => {
+                                    type_name = tn;
+                                    recv_ok = true;
+                                    arg_vals3.set(0, Value::Ptr(recv_ptr));
+                                }
+                                _ => {}
+                            }
+                        }
+                        OptValue::None => {}
+                    }
                 }
             }
+            if !recv_ok {
+                return ExecOutcome::Panic("DynCall: receiver is not a trait object (" + trait_name + "::" + method + ")");
+            }
             var mangled: str = type_name + "_" + method;
-            match IrModule_get_function(&self.module, mangled) {
+            match Interpreter_get_function(self, mangled) {
                 OptIrFunction::Some(callee3) => {
                     if callee3.params.len() > arg_vals3.len() {
                         all_args3.push(Value::Int(0));
@@ -1572,7 +2194,7 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
             var v: Value = get_value(values, value);
             match v {
                 Value::Int(i) => {
-                    var f: f64 = p_int_to_float(i);
+                    var f: f64 = (i as f64);
                     return ExecOutcome::Value(Value::Float(f));
                 }
                 _ => { return ExecOutcome::Value(Value::Float(0.0)); }
@@ -1582,7 +2204,7 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
             var v: Value = get_value(values, value);
             match v {
                 Value::Float(f) => {
-                    var i: i64 = p_float_to_int(f);
+                    var i: i64 = (f as i64);
                     return ExecOutcome::Value(Value::Int(i));
                 }
                 _ => { return ExecOutcome::Value(Value::Int(0)); }
@@ -1595,46 +2217,87 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
         }
         Inst::Print(value, ty) => {
             var v: Value = get_value(values, value);
-            // Ptr(U8) typed values stored as Int should be printed as strings
+            var is_int_or_ptr: bool = false;
+            var raw: i64 = 0;
+            match v {
+                Value::Int(ri) => { is_int_or_ptr = true; raw = ri; }
+                Value::Ptr(rp) => { is_int_or_ptr = true; raw = rp; }
+                _ => {}
+            }
+            // Vec / HashMap values are raw pointers: format with the Fides
+            // Vec_to_str / HashMap_to_str (src/interp.rs Print)
+            if is_int_or_ptr && ir_type_is_opaque_named(ty, "Vec") {
+                match Interpreter_print_via(self, "Vec_to_str", v) {
+                    ExecOutcome::Continue => { return ExecOutcome::Continue; }
+                    ExecOutcome::Panic(pm) => { return ExecOutcome::Panic(pm); }
+                    _ => {}
+                }
+            }
+            if is_int_or_ptr && ir_type_is_opaque_named(ty, "HashMap") {
+                match Interpreter_print_via(self, "HashMap_to_str", v) {
+                    ExecOutcome::Continue => { return ExecOutcome::Continue; }
+                    ExecOutcome::Panic(pm2) => { return ExecOutcome::Panic(pm2); }
+                    _ => {}
+                }
+            }
+            if ir_type_is_opaque_named(ty, "String") {
+                match v {
+                    Value::Int(saddr) => {
+                        if saddr > 0 && Memory_is_valid_addr(&self.memory, saddr) {
+                            var ss: str = Memory_load_cstr(&self.memory, saddr);
+                            if str_len(ss) > 0 {
+                                p_print_str(ss);
+                                return ExecOutcome::Continue;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
             var is_str: bool = false;
             match ty {
                 IrType::Ptr(inner) => {
                     match inner {
-                        IrType::U8 => {
-                            is_str = true;
-                            match v {
-                                Value::Int(addr) => {
-                                    if addr > 0 && Memory_is_valid_addr(&self.memory, addr) {
-                                        // A str: print it even when it is empty.
-                                        p_print_str(Memory_load_cstr(&self.memory, addr));
-                                        return ExecOutcome::Continue;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
+                        IrType::U8 => { is_str = true; }
                         _ => {}
                     }
                 }
                 _ => {}
             }
-            // Default printing
+            if is_str {
+                match v {
+                    Value::Int(addr) => {
+                        if addr > 0 && Memory_is_valid_addr(&self.memory, addr) {
+                            // A str: print it even when it is empty.
+                            p_print_str(Memory_load_cstr(&self.memory, addr));
+                            return ExecOutcome::Continue;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            var tens_h: i64 = -1;
             match v {
-                Value::Int(i) => { p_print_int(i); }
-                Value::Float(f) => { p_print_float(f); }
-                Value::Bool(b) => { p_print_bool(b); }
-                Value::Str(s) => { p_print_str(s); }
+                Value::Ptr(tp) => { tens_h = Interpreter_tensor_handle(self, v); }
+                Value::Int(ti) => {
+                    if ir_type_is_opaque_named(ty, "Tensor") { tens_h = Interpreter_tensor_handle(self, v); }
+                }
+                _ => {}
+            }
+            if tens_h >= 0 {
+                p_print_str(interp_tensor_to_string(&self.tensors.get(tens_h)));
+                return ExecOutcome::Continue;
+            }
+            match v {
                 Value::Ptr(addr2) => {
                     var s2: str = Memory_load_cstr(&self.memory, addr2);
-                    if str_len(s2) > 0 || is_str {
-                        p_print_str(s2);
+                    if str_len(s2) == 0 && !is_str {
+                        p_print_str("ptr(0x" + int_to_hex(addr2) + ")");
                     } else {
-                        p_print_str("ptr(0x");
-                        p_print_str(int_to_str(addr2));
-                        p_print_str(")");
+                        p_print_str(s2);
                     }
                 }
-                _ => { p_print_str("void"); }
+                _ => { p_print_str(Interpreter_display_value(self, v)); }
             }
             return ExecOutcome::Continue;
         }
@@ -1663,11 +2326,29 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
 
         // ─── Persist Variables ───
         Inst::PersistLoad(name, default, _) => {
-            // Simplified: just use the default value
+            // A value saved earlier (src/interp.rs persist_state), else the default
             var dv: Value = get_value(values, default);
+            var pk: i64 = 0;
+            while pk < self.persist_keys.len() {
+                if self.persist_keys.get(pk) == name {
+                    return ExecOutcome::Value(Interpreter_parse_persisted_value(self, self.persist_vals.get(pk), dv));
+                }
+                pk = pk + 1;
+            }
             return ExecOutcome::Value(dv);
         }
-        Inst::PersistSave(_, _) => {
+        Inst::PersistSave(pname, pvalue) => {
+            var ps: str = Interpreter_stringify_value(self, get_value(values, pvalue));
+            var pj: i64 = 0;
+            while pj < self.persist_keys.len() {
+                if self.persist_keys.get(pj) == pname {
+                    self.persist_vals.set(pj, ps);
+                    return ExecOutcome::Continue;
+                }
+                pj = pj + 1;
+            }
+            self.persist_keys.push(pname);
+            self.persist_vals.push(ps);
             return ExecOutcome::Continue;
         }
 
@@ -1676,7 +2357,7 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
             // Deep snapshot — a struct copy would share the Vec backing, so
             // post-snapshot writes would already be visible in the "snapshot".
             self.txn_mem_snapshots.push(Memory_clone(&self.memory));
-            self.txn_opaque_snapshots.push(OpaqueSnapshot { entries: self.opaque_values.clone() });
+            self.txn_opaque_snapshots.push(OpaqueSnapshot { entries: I64Table_clone(&self.opaque_values) });
             return ExecOutcome::Continue;
         }
         Inst::TxnEnd => {
@@ -1702,9 +2383,24 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
         }
 
         // ─── Autograd (stubbed) ───
-        Inst::GradBegin(_) => { return ExecOutcome::Continue; }
-        Inst::GradEnd => { return ExecOutcome::Continue; }
-        Inst::Backward(_) => { return ExecOutcome::Continue; }
+        Inst::GradBegin(_) => {
+            self.ag_enabled = true;
+            var fresh_tape: Vec<AgEntry> = Vec::new();
+            self.ag_tape = fresh_tape;
+            var fresh_keys: Vec<i64> = Vec::new();
+            self.ag_grad_keys = fresh_keys;
+            var fresh_vals: Vec<TensorData> = Vec::new();
+            self.ag_grad_vals = fresh_vals;
+            return ExecOutcome::Continue;
+        }
+        Inst::GradEnd => {
+            self.ag_enabled = false;
+            return ExecOutcome::Continue;
+        }
+        Inst::Backward(_) => {
+            Interpreter_run_backward(self);
+            return ExecOutcome::Continue;
+        }
         Inst::StructCopy(dst, src, ty) => {
             // memcpy struct data src -> dst (src/interp.rs:1604)
             var dst_addr: i64 = 0;
@@ -1777,6 +2473,7 @@ pub fn Interpreter_eval_binop(self: &Interpreter, op: BinOp, l: Value, r: Value)
                                 if b > 0 && a > i64_max - b { return Value::Void; }
                                 if b < 0 && a < i64_min - b { return Value::Void; }
                             }
+                            if use_wrapping { return Value::Int(wrap_add(a, b)); }
                             return Value::Int(a + b);
                         }
                         BinOp::Sub => {
@@ -1784,6 +2481,7 @@ pub fn Interpreter_eval_binop(self: &Interpreter, op: BinOp, l: Value, r: Value)
                                 if b > 0 && a < i64_min + b { return Value::Void; }
                                 if b < 0 && a > i64_max + b { return Value::Void; }
                             }
+                            if use_wrapping { return Value::Int(wrap_sub(a, b)); }
                             return Value::Int(a - b);
                         }
                         BinOp::Mul => {
@@ -1800,6 +2498,7 @@ pub fn Interpreter_eval_binop(self: &Interpreter, op: BinOp, l: Value, r: Value)
                                 }
                                 if mul_ovf { return Value::Void; }
                             }
+                            if use_wrapping { return Value::Int(wrap_mul(a, b)); }
                             return Value::Int(a * b);
                         }
                         BinOp::Div => {
@@ -1823,8 +2522,8 @@ pub fn Interpreter_eval_binop(self: &Interpreter, op: BinOp, l: Value, r: Value)
                         BinOp::BitAnd => { return Value::Int(a & b); }
                         BinOp::BitOr => { return Value::Int(a | b); }
                         BinOp::BitXor => { return Value::Int(a ^ b); }
-                        BinOp::Shl => { return Value::Int(a << b); }
-                        BinOp::Shr => { return Value::Int(a >> b); }
+                        BinOp::Shl => { return Value::Int(a << (b & 63)); }
+                        BinOp::Shr => { return Value::Int(a >> (b & 63)); }
                     }
                 }
                 Value::Ptr(b_addr) => {
@@ -1836,6 +2535,13 @@ pub fn Interpreter_eval_binop(self: &Interpreter, op: BinOp, l: Value, r: Value)
                         BinOp::LtEq => { return Value::Bool(a <= b_addr); }
                         BinOp::Gt => { return Value::Bool(a > b_addr); }
                         BinOp::GtEq => { return Value::Bool(a >= b_addr); }
+                        _ => { return Value::Void; }
+                    }
+                }
+                Value::Str(bs) => {
+                    match op {
+                        BinOp::Eq => { return Value::Bool(str_len(bs) == 0 && a == 0); }
+                        BinOp::Neq => { return Value::Bool(!(str_len(bs) == 0 && a == 0)); }
                         _ => { return Value::Void; }
                     }
                 }
@@ -1893,6 +2599,14 @@ pub fn Interpreter_eval_binop(self: &Interpreter, op: BinOp, l: Value, r: Value)
                         _ => { return Value::Void; }
                     }
                 }
+                Value::Ptr(pb) => {
+                    var ps: str = Memory_load_cstr(&self.memory, pb);
+                    match op {
+                        BinOp::Eq => { return Value::Bool(a == ps); }
+                        BinOp::Neq => { return Value::Bool(a != ps); }
+                        _ => { return Value::Void; }
+                    }
+                }
                 _ => { return Value::Void; }
             }
         }
@@ -1908,6 +2622,14 @@ pub fn Interpreter_eval_binop(self: &Interpreter, op: BinOp, l: Value, r: Value)
                         BinOp::LtEq => { return Value::Bool(a_addr <= b3); }
                         BinOp::Gt => { return Value::Bool(a_addr > b3); }
                         BinOp::GtEq => { return Value::Bool(a_addr >= b3); }
+                        _ => { return Value::Void; }
+                    }
+                }
+                Value::Str(sb) => {
+                    var pa: str = Memory_load_cstr(&self.memory, a_addr);
+                    match op {
+                        BinOp::Eq => { return Value::Bool(pa == sb); }
+                        BinOp::Neq => { return Value::Bool(pa != sb); }
                         _ => { return Value::Void; }
                     }
                 }
@@ -1968,15 +2690,15 @@ pub fn Interpreter_cast_value(self: &Interpreter, v: Value, to: IrType) -> Value
     match v {
         Value::Int(i) => {
             match to {
-                IrType::F32 => { return Value::Float(p_int_to_float(i)); }
-                IrType::F64 => { return Value::Float(p_int_to_float(i)); }
+                IrType::F32 => { return Value::Float((i as f64)); }
+                IrType::F64 => { return Value::Float((i as f64)); }
                 _ => { return Value::Int(i); }
             }
         }
         Value::Float(f) => {
             match to {
-                IrType::I64 => { return Value::Int(p_float_to_int(f)); }
-                IrType::I32 => { return Value::Int(p_float_to_int(f)); }
+                IrType::I64 => { return Value::Int((f as i64)); }
+                IrType::I32 => { return Value::Int((f as i64)); }
                 _ => { return Value::Float(f); }
             }
         }
@@ -1998,7 +2720,15 @@ pub fn Interpreter_cast_value(self: &Interpreter, v: Value, to: IrType) -> Value
 // is_runtime_func -- check if a name is a runtime function
 // ===========================================================================
 
-pub fn Interpreter_is_runtime_func(self: &Interpreter, name: str) -> bool {
+pub fn Interpreter_is_runtime_func(self: &mut Interpreter, name: str) -> bool {
+    var cached: i64 = StrTable_get(&self.rt_cache, name, -1);
+    if cached >= 0 { return cached == 1; }
+    var r: bool = Interpreter_is_runtime_func_uncached(self, name);
+    if r { StrTable_set(&mut self.rt_cache, name, 1); } else { StrTable_set(&mut self.rt_cache, name, 0); }
+    return r;
+}
+
+pub fn Interpreter_is_runtime_func_uncached(self: &Interpreter, name: str) -> bool {
     // Check if it's an extern function
     var i: i64 = 0;
     while i < self.module.extern_functions.len() {
@@ -2025,10 +2755,19 @@ pub fn Interpreter_is_runtime_func(self: &Interpreter, name: str) -> bool {
     if str_starts_with(name, "p_shared_") { return true; }
     if str_starts_with(name, "p_future_") { return true; }
     if str_starts_with(name, "p_grad_") { return true; }
-    if str_starts_with(name, "p_dp_") { return true; }
+    if str_starts_with(name, "__ecs_") { return true; }
+    if str_starts_with(name, "p_dp_budget_") { return true; }
     if str_starts_with(name, "p_tp_") { return true; }
     if str_starts_with(name, "p_checkpoint_") { return true; }
     if str_starts_with(name, "p_volatile_") { return true; }
+    // The runtime set of src/interp.rs ends here. A name the program or
+    // core defines as a Fides function runs that function (core implements
+    // p_str_equal, p_str_length, ... itself): the builtins below are only
+    // for names nothing defines.
+    match Interpreter_get_function(self, name) {
+        OptIrFunction::Some(_) => { return false; }
+        OptIrFunction::None => {}
+    }
     if str_starts_with(name, "p_sb_") { return true; }
     // PRNG and noise builtins
     if name == "p_prng_next" { return true; }
@@ -2078,6 +2817,16 @@ pub fn Interpreter_is_runtime_func(self: &Interpreter, name: str) -> bool {
 // Advanced builtins (tensors, networking, threads, etc.) return defaults.
 
 pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Value>) -> ExecOutcome {
+    // A raw Vec handle may arrive as a Ptr (loaded from a by-value struct
+    // copy's Vec field): the p_vec_* builtins take its address.
+    if str_starts_with(name, "p_vec_") && args.len() > 0 {
+        match args.get(0) {
+            Value::Ptr(vp) => { args.set(0, Value::Int(vp)); }
+            _ => {}
+        }
+    }
+    var tout: ExecOutcome = Interpreter_call_tensor(self, name, args);
+    if !outcome_is_unhandled(tout) { return tout; }
     // ─── Printing ───
     if name == "p_print_int" {
         if args.len() > 0 {
@@ -2139,15 +2888,10 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     if name == "print" {
         if args.len() > 0 {
             match args.get(0) {
-                Value::Int(i) => { p_print_int(i); }
-                Value::Float(f) => { p_print_float(f); }
-                Value::Bool(b) => { p_print_bool(b); }
-                Value::Str(s) => { p_print_str(s); }
-                Value::Ptr(addr) => {
-                    var loaded: str = Memory_load_cstr(&self.memory, addr);
-                    p_print_str(loaded);
-                }
-                _ => { p_print_str("void"); }
+                Value::Ptr(addr) => { p_print_str(Memory_load_cstr(&self.memory, addr)); }
+                Value::Vec(pvh) => { p_print_str(Interpreter_display_vec_quoted(self, pvh)); }
+                Value::Void => { p_print_str("Void"); }
+                _ => { p_print_str(Interpreter_display_value(self, args.get(0))); }
             }
         }
         return ExecOutcome::Value(Value::Void);
@@ -2194,7 +2938,18 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     }
     if name == "p_to_str" {
         if args.len() > 0 {
-            return ExecOutcome::Value(Value::Str(Interpreter_value_to_string(self, args.get(0))));
+            match args.get(0) {
+                Value::Int(ti) => { return ExecOutcome::Value(Value::Str(int_to_str(ti))); }
+                Value::Float(tf) => { return ExecOutcome::Value(Value::Str(float_to_str(tf))); }
+                Value::Bool(tb) => {
+                    if tb { return ExecOutcome::Value(Value::Str("true")); }
+                    return ExecOutcome::Value(Value::Str("false"));
+                }
+                Value::Str(ts) => { return ExecOutcome::Value(Value::Str(ts)); }
+                Value::Vec(tvh) => { return ExecOutcome::Value(Value::Str(Interpreter_display_vec_quoted(self, tvh))); }
+                Value::Map(_) => { return ExecOutcome::Value(Value::Str(Interpreter_display_value(self, args.get(0)))); }
+                _ => {}
+            }
         }
         return ExecOutcome::Value(Value::Str(""));
     }
@@ -2310,12 +3065,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         if args.len() >= 2 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
-                    var elem: i64 = 0;
-                    match args.get(1) {
-                        Value::Int(e) => { elem = e; }
-                        Value::Ptr(p) => { elem = p; }
-                        _ => {}
-                    }
+                    var elem: i64 = Interpreter_value_word(self, args.get(1));
                     // Read current len and cap
                     var len: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
                     var cap: i64 = Memory_load_i64(&self.memory, vec_addr + 16);
@@ -2376,12 +3126,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
                 Value::Int(vec_addr) => {
                     match args.get(1) {
                         Value::Int(idx) => {
-                            var elem2: i64 = 0;
-                            match args.get(2) {
-                                Value::Int(e2) => { elem2 = e2; }
-                                Value::Ptr(p2) => { elem2 = p2; }
-                                _ => {}
-                            }
+                            var elem2: i64 = Interpreter_value_word(self, args.get(2));
                             var len2: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
                             if idx < 0 || idx >= len2 {
                                 return ExecOutcome::Panic("Vec index out of bounds");
@@ -2490,77 +3235,73 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         return ExecOutcome::Value(Value::Void);
     }
 
-    // ─── Volatile memory access (MMIO simulation) ───
-    if name == "p_volatile_load" {
-        return ExecOutcome::Value(Value::Int(0));
-    }
-    if name == "p_volatile_store" {
-        return ExecOutcome::Value(Value::Void);
-    }
-    if name == "p_volatile_load8" {
-        return ExecOutcome::Value(Value::Int(0));
-    }
-    if name == "p_volatile_store8" {
-        return ExecOutcome::Value(Value::Void);
-    }
-    if name == "p_volatile_load16" {
-        return ExecOutcome::Value(Value::Int(0));
-    }
-    if name == "p_volatile_store16" {
-        return ExecOutcome::Value(Value::Void);
-    }
-    if name == "p_volatile_load32" {
-        return ExecOutcome::Value(Value::Int(0));
-    }
-    if name == "p_volatile_store32" {
+    // ─── Volatile memory access: the interpreter's byte memory ───
+    if str_starts_with(name, "p_volatile_") {
+        var va: i64 = -1;
+        match args.get(0) { Value::Int(vn) => { va = vn; } _ => {} }
+        var vval: i64 = 0;
+        var vval_ok: bool = false;
+        if args.len() > 1 {
+            match args.get(1) { Value::Int(vv) => { vval = vv; vval_ok = true; } _ => {} }
+        }
+        var width: i64 = 8;
+        if str_ends_with(name, "8") { width = 1; }
+        if str_ends_with(name, "16") { width = 2; }
+        if str_ends_with(name, "32") { width = 4; }
+        var is_load: bool = str_starts_with(name, "p_volatile_load");
+        var in_range: bool = va >= 0 && Memory_is_valid_addr(&self.memory, va) && Memory_is_valid_addr(&self.memory, va + width - 1);
+        if is_load {
+            if in_range {
+                if width == 1 { return ExecOutcome::Value(Value::Int(Memory_load_byte(&self.memory, va))); }
+                if width == 8 { return ExecOutcome::Value(Value::Int(Memory_load_i64(&self.memory, va))); }
+                return ExecOutcome::Value(Value::Int(Memory_load_i32(&self.memory, va)));
+            }
+            return ExecOutcome::Value(Value::Int(0));
+        }
+        if in_range && vval_ok {
+            if width == 1 { Memory_store_byte(&mut self.memory, va, vval & 0xFF); }
+            else if width == 8 { Memory_store_i64(&mut self.memory, va, vval); }
+            else { Memory_store_i32(&mut self.memory, va, vval); }
+        }
         return ExecOutcome::Value(Value::Void);
     }
 
-    // ─── String builder (p_sb_*) ───
-    // String builders are represented as Str values that accumulate content.
+    // ─── String builder (p_sb_*): handles index sb_strs (from 1) ───
     if name == "p_sb_new" {
-        return ExecOutcome::Value(Value::Str(""));
+        self.sb_strs.push("");
+        return ExecOutcome::Value(Value::Int(self.sb_strs.len()));
     }
     if name == "p_sb_append" {
         if args.len() >= 2 {
             match args.get(0) {
-                Value::Str(sb) => {
-                    match args.get(1) {
-                        Value::Str(s) => {
-                            return ExecOutcome::Value(Value::Str(sb + s));
-                        }
-                        _ => {}
+                Value::Int(sbh) => {
+                    if sbh >= 1 && sbh <= self.sb_strs.len() {
+                        var piece: str = Interpreter_value_to_string(self, args.get(1));
+                        self.sb_strs.set(sbh - 1, self.sb_strs.get(sbh - 1) + piece);
                     }
                 }
                 _ => {}
             }
         }
-        return ExecOutcome::Value(Value::Void);
+        return ExecOutcome::Continue;
     }
-    if name == "p_sb_to_str" {
+    if name == "p_sb_to_str" || name == "p_sb_len" {
         if args.len() >= 1 {
             match args.get(0) {
-                Value::Str(sb) => {
-                    return ExecOutcome::Value(Value::Str(sb));
+                Value::Int(sbh2) => {
+                    if sbh2 >= 1 && sbh2 <= self.sb_strs.len() {
+                        if name == "p_sb_len" { return ExecOutcome::Value(Value::Int(str_len(self.sb_strs.get(sbh2 - 1)))); }
+                        return ExecOutcome::Value(Value::Str(self.sb_strs.get(sbh2 - 1)));
+                    }
                 }
                 _ => {}
             }
         }
+        if name == "p_sb_len" { return ExecOutcome::Value(Value::Int(0)); }
         return ExecOutcome::Value(Value::Str(""));
     }
     if name == "p_sb_free" {
-        return ExecOutcome::Value(Value::Void);
-    }
-    if name == "p_sb_len" {
-        if args.len() >= 1 {
-            match args.get(0) {
-                Value::Str(sb) => {
-                    return ExecOutcome::Value(Value::Int(str_len(sb)));
-                }
-                _ => {}
-            }
-        }
-        return ExecOutcome::Value(Value::Int(0));
+        return ExecOutcome::Continue;
     }
 
     // ─── PRNG (xorshift128+) for DP noise ───
@@ -2818,7 +3559,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
                     gai = gai + 1;
                 }
                 var gt_result: Value = Value::Int(0);
-                match IrModule_get_function(&self.module, gt.func_name) {
+                match Interpreter_get_function(self, gt.func_name) {
                     OptIrFunction::Some(gfunc) => {
                         match Interpreter_run_function(self, gfunc, gt_vals) {
                             RunResult::Return(gv) => { gt_result = gv; }
@@ -2865,26 +3606,6 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     if name == "p_gt_reset" {
         self.gt_scheduler = GreenThreadScheduler_new();
         return ExecOutcome::Value(Value::Void);
-    }
-
-    // ─── Channels (ML/concurrency) ───
-    if name == "p_chan_create" {
-        return ExecOutcome::Value(Value::Int(0));
-    }
-    if name == "p_chan_send" {
-        return ExecOutcome::Value(Value::Void);
-    }
-    if name == "p_chan_recv" {
-        return ExecOutcome::Value(Value::Int(0));
-    }
-    if name == "p_chan_try_recv" {
-        return ExecOutcome::Value(Value::Int(0));
-    }
-    if name == "p_chan_close" {
-        return ExecOutcome::Value(Value::Void);
-    }
-    if name == "p_chan_is_closed" {
-        return ExecOutcome::Value(Value::Bool(false));
     }
 
     // ─── Autograd (ML3) ───
@@ -3110,7 +3831,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     if name == "p_tensor_to_str" {
         var th16: i64 = Interpreter_tensor_handle(self, args.get(0));
         if th16 < 0 { return ExecOutcome::Panic("tensor_to_str: expected Tensor"); }
-        return ExecOutcome::Value(Value::Str(Tensor_to_string(&self.tensors.get(th16))));
+        return ExecOutcome::Value(Value::Str(interp_tensor_to_string(&self.tensors.get(th16))));
     }
 
     // ─── KV Cache (ML9) ───
@@ -3189,7 +3910,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         match args.get(1) { Value::Float(qf) => { qscale = qf; } _ => {} }
         match args.get(2) { Value::Int(qz) => { qzp = qz; q_ok = true; } _ => {} }
         if thq < 0 || !q_ok { return ExecOutcome::Panic("quantize_q8: expected (Tensor, f64, i64)"); }
-        return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_quantize_q8(&self.tensors.get(thq), qscale, qzp)));
+        return ExecOutcome::Value(Interpreter_alloc_tensor(self, interp_quantize_q8(&self.tensors.get(thq), qscale, qzp)));
     }
     if name == "p_dequantize_q8" {
         var thd: i64 = Interpreter_tensor_handle(self, args.get(0));
@@ -3199,7 +3920,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         match args.get(1) { Value::Float(df) => { dscale = df; } _ => {} }
         match args.get(2) { Value::Int(dz) => { dzp = dz; d_ok = true; } _ => {} }
         if thd < 0 || !d_ok { return ExecOutcome::Panic("dequantize_q8: expected (Tensor, f64, i64)"); }
-        return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_dequantize_q8(&self.tensors.get(thd), dscale, dzp)));
+        return ExecOutcome::Value(Interpreter_alloc_tensor(self, interp_dequantize_q8(&self.tensors.get(thd), dscale, dzp)));
     }
     if name == "p_qmatmul" {
         // Issue 12: Quantized matmul using i32 accumulation (ported inline,
@@ -3235,7 +3956,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
                     if acc >= 0x80000000 { acc = acc - 0x100000000; }
                     qx = qx + 1;
                 }
-                qres.data.set(qi * qn + qj, p_int_to_float(acc));
+                qres.data.set(qi * qn + qj, (acc as f64));
                 qj = qj + 1;
             }
             qi = qi + 1;
@@ -3258,8 +3979,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     if name == "p_tensor_clone" {
         var thc: i64 = Interpreter_tensor_handle(self, args.get(0));
         if thc < 0 { return ExecOutcome::Panic("tensor_clone: expected Tensor"); }
-        var tclone: TensorData = self.tensors.get(thc);
-        return ExecOutcome::Value(Interpreter_alloc_tensor(self, tclone));
+        return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_clone_data(&self.tensors.get(thc))));
     }
 
     // ─── String runtime functions (ported from src/interp.rs ~3288-3455) ───
@@ -3993,93 +4713,8 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         }
     }
 
-    // ─── Threading (interpreter is single-threaded: spawn runs eagerly) ───
-    // Mirrors src/interp.rs: spawn resolves func_name, runs it immediately
-    // (preserves Vec/Map side-table access), and stores the result in
-    // future_values; the Int handle indexes that table via p_future_poll.
-    if name == "p_thread_spawn" || name == "p_executor_spawn" {
-        var base: i64 = 0;
-        if name == "p_executor_spawn" { base = 1; }
-        var func_name: str = "";
-        match args.get(base) {
-            Value::Str(s) => { func_name = s; }
-            Value::Ptr(a) => { func_name = Memory_load_cstr(&self.memory, a); }
-            _ => {}
-        }
-        var num_args: i64 = 0;
-        match args.get(base + 1) { Value::Int(n) => { num_args = n; } _ => {} }
-        var thread_values: Vec<Value> = Vec::new();
-        thread_values.push(Value::Int(0));   // dummy __env
-        var tai: i64 = 0;
-        while tai < num_args {
-            var av: i64 = base + 2 + tai;
-            if av < args.len() { thread_values.push(args.get(av)); }
-            tai = tai + 1;
-        }
-        var spawn_result: Value = Value::Int(0);
-        match IrModule_get_function(&self.module, func_name) {
-            OptIrFunction::Some(func2) => {
-                match Interpreter_run_function(self, func2, thread_values) {
-                    RunResult::Return(v5) => { spawn_result = v5; }
-                    RunResult::Panic(pmsg) => {
-                        p_eprint_str("Thread panic: " + pmsg + "\n");
-                    }
-                    RunResult::Paused => { }
-                }
-            }
-            OptIrFunction::None => {
-                p_eprint_str("Thread: unknown function '" + func_name + "'\n");
-            }
-        }
-        var fidx: i64 = self.future_values.len();
-        self.future_values.push(spawn_result);
-        return ExecOutcome::Value(Value::Int(fidx));
-    }
-    if name == "p_thread_join" {
-        // Threads already ran eagerly at spawn — join is a no-op.
-        return ExecOutcome::Value(Value::Void);
-    }
-    if name == "p_executor_new" {
-        self.thread_handle_count = self.thread_handle_count + 1;
-        return ExecOutcome::Value(Value::Int(self.thread_handle_count));
-    }
-    if name == "p_executor_block_on" {
-        // block_on(exec, future) -> i64 — return the (already-resolved) result.
-        var bf: i64 = -1;
-        match args.get(1) { Value::Int(n) => { bf = n; } _ => {} }
-        if bf >= 0 && bf < self.future_values.len() {
-            match self.future_values.get(bf) {
-                Value::Int(bn) => { return ExecOutcome::Value(Value::Int(bn)); }
-                _ => { }
-            }
-        }
-        return ExecOutcome::Value(Value::Int(0));
-    }
-    if name == "p_executor_run_all" || name == "p_executor_poll_all" {
-        // Everything already ran eagerly at spawn.
-        return ExecOutcome::Value(Value::Int(0));
-    }
-    if name == "p_future_poll" || name == "p_future_ready" ||
-       name == "p_task_poll" || name == "p_task_poll_nonblocking" {
-        var fh: i64 = -1;
-        match args.get(0) { Value::Int(n) => { fh = n; } _ => {} }
-        if fh >= 0 && fh < self.future_values.len() {
-            var fv: Value = self.future_values.get(fh);
-            match fv {
-                Value::Int(fn2) => { return ExecOutcome::Value(Value::Int(fn2)); }
-                Value::Bool(fb) => {
-                    if fb { return ExecOutcome::Value(Value::Int(1)); }
-                    return ExecOutcome::Value(Value::Int(0));
-                }
-                Value::Ptr(fp) => { return ExecOutcome::Value(Value::Int(fp)); }
-                _ => { }
-            }
-        }
-        return ExecOutcome::Value(Value::Int(0));
-    }
-    if name == "p_task_is_ready" {
-        return ExecOutcome::Value(Value::Bool(true));
-    }
+    var rout: ExecOutcome = Interpreter_call_runtime2(self, name, args);
+    if !outcome_is_unhandled(rout) { return rout; }
 
     // ─── Default: panic for unknown runtime functions ───
     // Matches src/interp.rs:6165 — ExecOutcome::Panic("Unknown runtime
@@ -4095,24 +4730,25 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
 // This wraps Interpreter_run and handles printing the result.
 // Returns 0 on success, 1 on panic/error.
 
+/// Run main, as `fidesc run` does: the exit code is main's integer result
+/// (0 otherwise); a panic prints "Panic: <message>" and the stack trace.
 pub fn Interpreter_run_and_print(self: &mut Interpreter) -> i64 {
     var result: RunResult = Interpreter_run(self);
     match result {
         RunResult::Return(v) => {
             match v {
-                Value::Void => { }
-                _ => {
-                    p_print_str("=> ");
-                    p_print_str(Interpreter_value_to_string(self, v));
-                    p_print_str("\n");
-                }
+                Value::Int(code) => { return code; }
+                _ => { return 0; }
             }
-            return 0;
         }
         RunResult::Panic(msg) => {
-            p_eprint_str("Runtime panic: ");
+            p_eprint_str("Panic: ");
             p_eprint_str(msg);
             p_eprint_str("\n");
+            match Interpreter_take_panic_stack_trace(self) {
+                OptStr::Some(trace) => { p_eprint_str(trace); }
+                OptStr::None => {}
+            }
             return 1;
         }
         RunResult::Paused => {
@@ -4141,12 +4777,7 @@ pub fn Interpreter_coerce_str_to_int(self: &mut Interpreter, v: Value) -> Value 
 
 /// is_wrapping_func — check if the currently executing function is @wrapping.
 pub fn Interpreter_is_wrapping_func(self: &Interpreter) -> bool {
-    if str_len(self.current_func_name) == 0 { return false; }
-    var func_opt: OptIrFunction = IrModule_get_function(&self.module, self.current_func_name);
-    match func_opt {
-        OptIrFunction::Some(f) => { return f.is_wrapping; }
-        OptIrFunction::None => { return false; }
-    }
+    return self.cur_wrapping;
 }
 
 /// stringify_value — serialize a Value to a type-prefixed string for persistence.
@@ -4289,46 +4920,34 @@ pub fn Interpreter_read_raw_vec_i64(self: &Interpreter, addr: i64) -> OptVecI64 
     return OptVecI64::Some(result);
 }
 
-/// arg_to_vec_i64 — extract a Vec<i64> from an argument.
+//// arg_to_vec_i64 — extract a Vec<i64> from an argument.
 /// Handles Value::Vec (interpreter builtin) and Value::Int/Ptr (raw Fides Vec).
 pub fn Interpreter_arg_to_vec_i64(self: &Interpreter, arg: Value) -> OptVecI64 {
     match arg {
         Value::Vec(vec_handle) => {
-            // Read from vec_values side table
-            if vec_handle >= 0 && vec_handle < self.vec_values.len() {
-                // This is a simplified version — returns empty for now
-                return OptVecI64::Some(Vec::new());
-            }
-            return OptVecI64::None;
+            return OptVecI64::Some(Interpreter_vec_handle_i64s(self, vec_handle));
         }
         Value::Int(addr) => {
             if addr > 0 {
-                // First try the side-table
-                var lookup: OptValue = Interpreter_lookup_vec_value(self, arg);
-                match lookup {
+                match Interpreter_lookup_vec_value(self, arg) {
                     OptValue::Some(v) => {
                         match v {
-                            Value::Vec(_) => {
-                                // Simplified — would extract elements
-                                return OptVecI64::Some(Vec::new());
-                            }
+                            Value::Vec(h) => { return OptVecI64::Some(Interpreter_vec_handle_i64s(self, h)); }
                             _ => {}
                         }
                     }
                     OptValue::None => {}
                 }
-                // Try reading as raw Fides Vec
                 return Interpreter_read_raw_vec_i64(self, addr);
             }
             return OptVecI64::None;
         }
         Value::Ptr(addr) => {
             if addr > 0 {
-                var lookup2: OptValue = Interpreter_lookup_vec_value(self, arg);
-                match lookup2 {
+                match Interpreter_lookup_vec_value(self, arg) {
                     OptValue::Some(v2) => {
                         match v2 {
-                            Value::Vec(_) => { return OptVecI64::Some(Vec::new()); }
+                            Value::Vec(h2) => { return OptVecI64::Some(Interpreter_vec_handle_i64s(self, h2)); }
                             _ => {}
                         }
                     }
@@ -4340,6 +4959,62 @@ pub fn Interpreter_arg_to_vec_i64(self: &Interpreter, arg: Value) -> OptVecI64 {
         }
         _ => { return OptVecI64::None; }
     }
+    return OptVecI64::None;
+}
+
+/// The elements of side-table Vec `h` as i64 (non-Int elements read as 0).
+pub fn Interpreter_vec_handle_i64s(self: &Interpreter, h: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if h < 0 || h >= self.vec_values.len() { return out; }
+    var elems: Vec<Value> = self.vec_values.get(h).elements;
+    var i: i64 = 0;
+    while i < elems.len() {
+        match elems.get(i) {
+            Value::Int(n) => { out.push(n); }
+            _ => { out.push(0); }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The elements of side-table Vec `h` as f64: an Int is a stored f64 word.
+pub fn Interpreter_vec_handle_f64s(self: &Interpreter, h: i64, int_is_bits: bool) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    if h < 0 || h >= self.vec_values.len() { return out; }
+    var elems: Vec<Value> = self.vec_values.get(h).elements;
+    var i: i64 = 0;
+    while i < elems.len() {
+        match elems.get(i) {
+            Value::Int(n) => {
+                if int_is_bits { out.push(f64_from_bits_i(n)); } else { out.push(n as f64); }
+            }
+            Value::Float(f) => { out.push(f); }
+            _ => { out.push(0.0); }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// A new side-table Vec holding `elems`.
+pub fn Interpreter_new_vec_value(self: &mut Interpreter, elems: Vec<Value>) -> Value {
+    var handle: i64 = self.vec_values.len();
+    var e: VecValueEntry = VecValueEntry_new(handle);
+    e.elements = elems;
+    self.vec_values.push(e);
+    return Value::Vec(handle);
+}
+
+/// A side-table Vec of floats.
+pub fn Interpreter_new_float_vec(self: &mut Interpreter, fs: Vec<f64>) -> Value {
+    var elems: Vec<Value> = Vec::new();
+    var i: i64 = 0;
+    while i < fs.len() {
+        elems.push(Value::Float(fs.get(i)));
+        i = i + 1;
+    }
+    return Interpreter_new_vec_value(self, elems);
 }
 
 /// alloc_tensor — store a Tensor in the side table and return an opaque Ptr.
@@ -4349,6 +5024,7 @@ pub fn Interpreter_alloc_tensor(self: &mut Interpreter, t: TensorData) -> Value 
     var handle: i64 = self.tensors.len();
     self.tensors.push(t);
     self.tensor_side_table.push(TensorSideEntry_new(addr, handle));
+    I64Table_set(&mut self.tensor_index, addr, Value::Int(handle));
     Memory_store_i64(&mut self.memory, addr, handle);
     return Value::Ptr(addr);
 }
@@ -4362,12 +5038,14 @@ pub fn Interpreter_tensor_handle(self: &Interpreter, arg: Value) -> i64 {
         _ => {}
     }
     if addr < 0 { return -1; }
-    var i: i64 = 0;
-    while i < self.tensor_side_table.len() {
-        if self.tensor_side_table.get(i).addr == addr {
-            return self.tensor_side_table.get(i).handle;
+    match I64Table_get(&self.tensor_index, addr) {
+        OptValue::Some(hv) => {
+            match hv {
+                Value::Int(h) => { return h; }
+                _ => {}
+            }
         }
-        i = i + 1;
+        OptValue::None => {}
     }
     return -1;
 }
@@ -4377,46 +5055,33 @@ pub fn Interpreter_tensor_handle(self: &Interpreter, arg: Value) -> i64 {
 pub fn Interpreter_args_to_f64_vec(self: &mut Interpreter, args: Vec<Value>, idx: i64) -> OptVecF64 {
     if idx < 0 || idx >= args.len() { return OptVecF64::None; }
     var arg: Value = args.get(idx);
+    var ptr: i64 = 0;
     match arg {
-        Value::Vec(_) => {
-            // Simplified — would extract float elements
-            return OptVecF64::Some(Vec::new());
-        }
-        Value::Int(ptr) => {
-            // Fides Vec — convert via fides_vec_to_value_vec
-            var v: Value = Interpreter_fides_vec_to_value_vec(self, ptr);
-            match v {
-                Value::Vec(_) => { return OptVecF64::Some(Vec::new()); }
-                _ => { return OptVecF64::None; }
-            }
-        }
-        Value::Ptr(ptr) => {
-            var v2: Value = Interpreter_fides_vec_to_value_vec(self, ptr);
-            match v2 {
-                Value::Vec(_) => { return OptVecF64::Some(Vec::new()); }
-                _ => { return OptVecF64::None; }
-            }
-        }
+        Value::Vec(h) => { return OptVecF64::Some(Interpreter_vec_handle_f64s(self, h, true)); }
+        Value::Int(p) => { ptr = p; }
+        Value::Ptr(p2) => { ptr = p2; }
         _ => { return OptVecF64::None; }
     }
+    match Interpreter_fides_vec_to_value_vec(self, ptr) {
+        Value::Vec(h2) => { return OptVecF64::Some(Interpreter_vec_handle_f64s(self, h2, true)); }
+        _ => {}
+    }
+    return OptVecF64::None;
 }
 
-/// fides_vec_to_value_vec — convert a Fides Vec (i64 pointer) to a Value::Vec.
-/// Uses Vec_len and Vec_get functions if available.
+/// fides_vec_to_value_vec — convert a Fides Vec (i64 pointer) to a Value::Vec
+/// by running the program's Vec_len / Vec_get.
 pub fn Interpreter_fides_vec_to_value_vec(self: &mut Interpreter, vec_ptr: i64) -> Value {
-    // Try using Vec_len/Vec_get from the module
-    var len_fn_opt: OptIrFunction = IrModule_get_function(&self.module, "Vec_len");
-    var get_fn_opt: OptIrFunction = IrModule_get_function(&self.module, "Vec_get");
-    match len_fn_opt {
+    var elems: Vec<Value> = Vec::new();
+    match Interpreter_get_function(self, "Vec_len") {
         OptIrFunction::Some(len_fn) => {
-            match get_fn_opt {
+            match Interpreter_get_function(self, "Vec_get") {
                 OptIrFunction::Some(get_fn) => {
                     var len_args: Vec<Value> = Vec::new();
                     len_args.push(Value::Int(0));
                     len_args.push(Value::Int(vec_ptr));
-                    var len_result: RunResult = Interpreter_run_function(self, len_fn, len_args);
                     var len: i64 = 0;
-                    match len_result {
+                    match Interpreter_run_function(self, len_fn, len_args) {
                         RunResult::Return(v) => {
                             match v {
                                 Value::Int(n) => { len = n; }
@@ -4425,15 +5090,25 @@ pub fn Interpreter_fides_vec_to_value_vec(self: &mut Interpreter, vec_ptr: i64) 
                         }
                         _ => {}
                     }
-                    // Simplified — return empty Vec Value
-                    return Value::Void;
+                    var i: i64 = 0;
+                    while i < len {
+                        var get_args: Vec<Value> = Vec::new();
+                        get_args.push(Value::Int(0));
+                        get_args.push(Value::Int(vec_ptr));
+                        get_args.push(Value::Int(i));
+                        match Interpreter_run_function(self, get_fn, get_args) {
+                            RunResult::Return(gv) => { elems.push(gv); }
+                            _ => {}
+                        }
+                        i = i + 1;
+                    }
                 }
                 OptIrFunction::None => {}
             }
         }
         OptIrFunction::None => {}
     }
-    return Value::Void;
+    return Interpreter_new_vec_value(self, elems);
 }
 
 /// find_vec_addr — find the Vec struct address for a Value::Vec by scanning vec_side_table.
@@ -4453,7 +5128,7 @@ pub fn Interpreter_find_vec_addr(self: &Interpreter, v: Value) -> i64 {
     return 0;
 }
 
-/// format_panic_trace — format the panic stack trace as a string.
+// format_panic_trace — format the panic stack trace as a string.
 pub fn Interpreter_format_panic_trace(self: &Interpreter) -> OptStr {
     match self.panic_stack_trace {
         OptStr::Some(s) => { return OptStr::Some(s); }
@@ -4650,4 +5325,1660 @@ pub fn interpret_ir_module_with_options(ir_mod: IrModule, max_recursion: i64, ma
     if max_steps > 0 { Interpreter_set_max_steps(&mut interp_inst, max_steps); }
     if max_memory > 0 { Interpreter_set_max_memory(&mut interp_inst, max_memory); }
     return Interpreter_run_and_print(&mut interp_inst);
+}
+
+// ===========================================================================
+// call_runtime2 -- builtins ported from src/interp.rs call_runtime that the
+// first dispatch does not handle. Returns ExecOutcome::Jump(-99) for a name
+// it does not know.
+// ===========================================================================
+
+pub struct ChanState {
+    pub buf: Vec<i64>,
+    pub head: i64,
+    pub cap: i64,
+    pub closed: bool,
+}
+
+pub struct DbRow {
+    pub db: i64,
+    pub key: str,
+    pub val: Value,
+}
+
+pub struct EcsComp {
+    pub name: str,
+    pub table: I64Table,
+}
+
+fn arg_int(args: Vec<Value>, i: i64, dflt: i64) -> i64 {
+    if i < 0 || i >= args.len() { return dflt; }
+    match args.get(i) {
+        Value::Int(n) => { return n; }
+        _ => {}
+    }
+    return dflt;
+}
+
+fn arg_int_or_ptr(args: Vec<Value>, i: i64) -> i64 {
+    if i < 0 || i >= args.len() { return 0; }
+    match args.get(i) {
+        Value::Int(n) => { return n; }
+        Value::Ptr(p) => { return p; }
+        _ => {}
+    }
+    return 0;
+}
+
+fn arg_value(args: Vec<Value>, i: i64) -> Value {
+    if i < 0 || i >= args.len() { return Value::Int(0); }
+    return args.get(i);
+}
+
+fn arg_float_opt_ok(args: Vec<Value>, i: i64) -> bool {
+    if i < 0 || i >= args.len() { return false; }
+    match args.get(i) {
+        Value::Float(_) => { return true; }
+        _ => {}
+    }
+    return false;
+}
+
+fn arg_float(args: Vec<Value>, i: i64) -> f64 {
+    if i < 0 || i >= args.len() { return 0.0; }
+    match args.get(i) {
+        Value::Float(f) => { return f; }
+        _ => {}
+    }
+    return 0.0;
+}
+
+/// Rust's arg_string: Some(text) for a Str / Ptr / string-pointer Int.
+pub fn Interpreter_arg_str_ok(self: &Interpreter, v: Value) -> bool {
+    match Interpreter_arg_string(self, v) {
+        OptStr::Some(_) => { return true; }
+        OptStr::None => {}
+    }
+    return false;
+}
+
+pub fn Interpreter_arg_str(self: &Interpreter, v: Value) -> str {
+    match Interpreter_arg_string(self, v) {
+        OptStr::Some(s) => { return s; }
+        OptStr::None => {}
+    }
+    return "";
+}
+
+fn json_type_name(j: Json) -> str {
+    match j {
+        Json::Null => { return "null"; }
+        Json::Bool(_) => { return "boolean"; }
+        Json::Num(_) => { return "number"; }
+        Json::Str(_) => { return "string"; }
+        Json::Arr(_) => { return "array"; }
+        Json::Obj(_) => { return "object"; }
+    }
+    return "null";
+}
+
+/// JSON string-literal escaping (Rust's p_json_string / http esc).
+pub fn json_escape_body(s: str) -> str {
+    var out: str = "";
+    var n: i64 = str_len(s);
+    var i: i64 = 0;
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if c == 34 { out = out + "\\\""; }
+        else if c == 92 { out = out + "\\\\"; }
+        else if c == 10 { out = out + "\\n"; }
+        else if c == 13 { out = out + "\\r"; }
+        else if c == 9 { out = out + "\\t"; }
+        else if c < 32 {
+            var hx: str = int_to_hex(c);
+            while str_len(hx) < 4 { hx = "0" + hx; }
+            out = out + "\\u" + hx;
+        }
+        else { out = out + p_char_to_str(c); }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Index of `sub` in `s` at or after `from`, or -1.
+fn str_find_from(s: str, sub: str, from: i64) -> i64 {
+    var n: i64 = str_len(s);
+    var m: i64 = str_len(sub);
+    var i: i64 = from;
+    while i + m <= n {
+        var j: i64 = 0;
+        var ok: bool = true;
+        while j < m {
+            if str_byte_at(s, i + j) != str_byte_at(sub, j) {
+                ok = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if ok { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Run `func_name` eagerly with `targs` (a spawned thread / task); the
+/// thread's return value (Int(0) on panic).
+pub fn Interpreter_run_eager(self: &mut Interpreter, func_name: str, targs: Vec<Value>, what: str) -> Value {
+    var tv: Vec<Value> = Vec::new();
+    tv.push(Value::Int(0));
+    var i: i64 = 0;
+    while i < targs.len() {
+        tv.push(targs.get(i));
+        i = i + 1;
+    }
+    match Interpreter_get_function(self, func_name) {
+        OptIrFunction::Some(f) => {
+            match Interpreter_run_function(self, f, tv) {
+                RunResult::Return(v) => { return v; }
+                RunResult::Panic(msg) => {
+                    p_eprint_str("Thread panic: " + msg + "\n");
+                    return Value::Int(0);
+                }
+                RunResult::Paused => { return Value::Int(0); }
+            }
+        }
+        OptIrFunction::None => {
+            p_eprint_str(what + ": unknown function '" + func_name + "'\n");
+        }
+    }
+    return Value::Int(0);
+}
+
+pub fn Interpreter_ecs_comp(self: &mut Interpreter, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < self.ecs_comps.len() {
+        if self.ecs_comps.get(i).name == name { return i; }
+        i = i + 1;
+    }
+    self.ecs_comps.push(EcsComp { name: name, table: I64Table_new() });
+    return self.ecs_comps.len() - 1;
+}
+
+/// The (component name, entity) of an __ecs_* call: args (name, e) or
+/// (env, name, e).
+fn ecs_name_entity_ok(args: Vec<Value>) -> i64 {
+    if args.len() >= 2 {
+        match args.get(0) {
+            Value::Str(_) => {
+                match args.get(1) { Value::Int(_) => { return 0; } _ => {} }
+            }
+            _ => {}
+        }
+    }
+    if args.len() >= 3 {
+        match args.get(1) {
+            Value::Str(_) => {
+                match args.get(2) { Value::Int(_) => { return 1; } _ => {} }
+            }
+            _ => {}
+        }
+    }
+    return -1;
+}
+
+fn arg_str_raw(args: Vec<Value>, i: i64) -> str {
+    match args.get(i) {
+        Value::Str(s) => { return s; }
+        _ => {}
+    }
+    return "";
+}
+
+pub fn Interpreter_call_runtime2(self: &mut Interpreter, name: str, args: Vec<Value>) -> ExecOutcome {
+    // ─── Futures / threads / executors (eager, as src/interp.rs) ───
+    if name == "p_future_ready" {
+        var fidx: i64 = self.future_values.len();
+        self.future_values.push(arg_value(args, 0));
+        self.future_exec.push(-1);
+        return ExecOutcome::Value(Value::Int(fidx));
+    }
+    if name == "p_future_poll" || name == "p_task_poll" || name == "p_task_poll_nonblocking" || name == "p_executor_block_on" {
+        var ai: i64 = 0;
+        if name == "p_executor_block_on" { ai = 1; }
+        var idx: i64 = -1;
+        var ok: bool = false;
+        if ai < args.len() {
+            match args.get(ai) {
+                Value::Int(n) => { idx = n; ok = true; }
+                _ => {}
+            }
+        }
+        if !ok { return ExecOutcome::Panic("Future poll: not a Future value"); }
+        if idx < 0 || idx >= self.future_values.len() {
+            return ExecOutcome::Panic("Future poll: invalid handle " + int_to_str(idx));
+        }
+        return ExecOutcome::Value(self.future_values.get(idx));
+    }
+    if name == "p_thread_spawn" || name == "p_executor_spawn" {
+        var base: i64 = 0;
+        var exec_idx: i64 = -1;
+        if name == "p_executor_spawn" {
+            base = 1;
+            exec_idx = arg_int(args, 0, 0);
+        }
+        var func_name: str = Interpreter_value_to_string(self, arg_value(args, base));
+        var num_args: i64 = arg_int(args, base + 1, 0);
+        var targs: Vec<Value> = Vec::new();
+        var tai: i64 = base + 2;
+        while tai < args.len() && tai < base + 2 + num_args {
+            targs.push(args.get(tai));
+            tai = tai + 1;
+        }
+        var what: str = "Thread";
+        if name == "p_executor_spawn" { what = "Executor"; }
+        var res: Value = Interpreter_run_eager(self, func_name, targs, what);
+        var fidx2: i64 = self.future_values.len();
+        self.future_values.push(res);
+        if exec_idx >= 0 && exec_idx < self.executor_count {
+            self.future_exec.push(exec_idx);
+        } else {
+            self.future_exec.push(-1);
+        }
+        return ExecOutcome::Value(Value::Int(fidx2));
+    }
+    if name == "p_thread_join" {
+        return ExecOutcome::Value(Value::Void);
+    }
+    if name == "p_executor_new" {
+        var eidx: i64 = self.executor_count;
+        self.executor_count = self.executor_count + 1;
+        return ExecOutcome::Value(Value::Int(eidx));
+    }
+    if name == "p_task_is_ready" {
+        var tidx: i64 = -1;
+        match arg_value(args, 0) {
+            Value::Int(n) => { tidx = n; }
+            _ => { return ExecOutcome::Value(Value::Bool(false)); }
+        }
+        return ExecOutcome::Value(Value::Bool(tidx >= 0 && tidx < self.future_values.len()));
+    }
+    if name == "p_executor_run_all" {
+        var ex: i64 = arg_int(args, 0, 0);
+        if ex < 0 || ex >= self.executor_count { return ExecOutcome::Value(Value::Int(0)); }
+        var cnt: i64 = 0;
+        var fi: i64 = 0;
+        while fi < self.future_exec.len() {
+            if self.future_exec.get(fi) == ex { cnt = cnt + 1; }
+            fi = fi + 1;
+        }
+        return ExecOutcome::Value(Value::Int(cnt));
+    }
+    if name == "p_executor_cancel" || name == "p_executor_poll_all" {
+        // Every task ran eagerly: nothing pending, nothing to cancel
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    // ─── Simulated async IO: the futures resolve to the thread's result ───
+    if name == "p_net_connect" {
+        var cfi: i64 = self.future_values.len();
+        self.future_values.push(Value::Int(arg_int(args, 1, 0) + 0x10000));
+        self.future_exec.push(-1);
+        return ExecOutcome::Value(Value::Int(cfi));
+    }
+    if name == "p_net_read" {
+        var rlen: i64 = arg_int(args, 2, 0);
+        if rlen > 13 { rlen = 13; }
+        var rfi: i64 = self.future_values.len();
+        self.future_values.push(Value::Int(rlen));
+        self.future_exec.push(-1);
+        return ExecOutcome::Value(Value::Int(rfi));
+    }
+    if name == "p_net_write" {
+        var wfi: i64 = self.future_values.len();
+        self.future_values.push(Value::Int(arg_int(args, 2, 0)));
+        self.future_exec.push(-1);
+        return ExecOutcome::Value(Value::Int(wfi));
+    }
+    if name == "p_fs_read_async" {
+        var fpath: str = Interpreter_value_to_string(self, arg_value(args, 0));
+        var flen: i64 = arg_int(args, 2, 1024);
+        var fsz: i64 = 0;
+        if p_file_exists(fpath) != 0 { fsz = p_file_size(fpath); }
+        if fsz < 0 { fsz = 0; }
+        if fsz > flen { fsz = flen; }
+        var ffi: i64 = self.future_values.len();
+        self.future_values.push(Value::Int(fsz));
+        self.future_exec.push(-1);
+        return ExecOutcome::Value(Value::Int(ffi));
+    }
+    if name == "p_net_close" { return ExecOutcome::Continue; }
+
+    // ─── Shared memory, atomics, Rc, mutexes, TLS ───
+    if name == "p_shared_alloc" {
+        var saddr: i64 = self.next_shared_addr;
+        self.next_shared_addr = self.next_shared_addr + 8;
+        I64Table_set(&mut self.shared_mem, saddr, Value::Int(0));
+        return ExecOutcome::Value(Value::Int(saddr));
+    }
+    if name == "p_atomic_load" {
+        return ExecOutcome::Value(Value::Int(Interpreter_shared_get(self, arg_int(args, 0, 0))));
+    }
+    if name == "p_atomic_store" {
+        I64Table_set(&mut self.shared_mem, arg_int(args, 0, 0), Value::Int(arg_int(args, 1, 0)));
+        return ExecOutcome::Continue;
+    }
+    if name == "p_atomic_cas" {
+        var caddr: i64 = arg_int(args, 0, 0);
+        var cur: i64 = Interpreter_shared_get(self, caddr);
+        if cur == arg_int(args, 1, 0) {
+            I64Table_set(&mut self.shared_mem, caddr, Value::Int(arg_int(args, 2, 0)));
+            return ExecOutcome::Value(Value::Bool(true));
+        }
+        return ExecOutcome::Value(Value::Bool(false));
+    }
+    if name == "p_atomic_add" || name == "p_atomic_sub" {
+        var aaddr: i64 = arg_int(args, 0, 0);
+        var old: i64 = Interpreter_shared_get(self, aaddr);
+        var delta: i64 = arg_int(args, 1, 0);
+        if name == "p_atomic_add" {
+            I64Table_set(&mut self.shared_mem, aaddr, Value::Int(old + delta));
+        } else {
+            I64Table_set(&mut self.shared_mem, aaddr, Value::Int(old - delta));
+        }
+        return ExecOutcome::Value(Value::Int(old));
+    }
+    if name == "p_rc_incr" {
+        var rca: i64 = arg_int_or_ptr(args, 0);
+        var rcv: i64 = arg_int_or_ptr(args, 1);
+        Memory_store_i64(&mut self.memory, rca, Memory_load_i64(&self.memory, rca) + 1);
+        return ExecOutcome::Value(Value::Int(rcv));
+    }
+    if name == "p_rc_decr" {
+        var rcd: i64 = arg_int_or_ptr(args, 0);
+        Memory_store_i64(&mut self.memory, rcd, Memory_load_i64(&self.memory, rcd) - 1);
+        return ExecOutcome::Value(Value::Void);
+    }
+    if name == "p_mutex_init" {
+        var mh: i64 = self.next_mutex_handle;
+        self.next_mutex_handle = self.next_mutex_handle + 1;
+        I64Table_set(&mut self.shared_mem, mh, Value::Int(0));
+        return ExecOutcome::Value(Value::Int(mh));
+    }
+    if name == "p_mutex_lock" {
+        I64Table_set(&mut self.shared_mem, arg_int(args, 0, 0), Value::Int(1));
+        return ExecOutcome::Continue;
+    }
+    if name == "p_mutex_unlock" {
+        I64Table_set(&mut self.shared_mem, arg_int(args, 0, 0), Value::Int(0));
+        return ExecOutcome::Continue;
+    }
+    if name == "p_tls_create" {
+        var tk: i64 = self.next_tls_key;
+        self.next_tls_key = self.next_tls_key + 1;
+        return ExecOutcome::Value(Value::Int(tk));
+    }
+    if name == "p_tls_get" {
+        match I64Table_get(&self.tls, arg_int(args, 0, 0)) {
+            OptValue::Some(tv) => { return ExecOutcome::Value(tv); }
+            OptValue::None => {}
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if name == "p_tls_set" {
+        I64Table_set(&mut self.tls, arg_int(args, 0, 0), Value::Int(arg_int(args, 1, 0)));
+        return ExecOutcome::Continue;
+    }
+
+    // ─── Channels (bounded queue; single-threaded) ───
+    if name == "p_chan_create" {
+        var ccap: i64 = arg_int(args, 0, 1);
+        if ccap < 1 { ccap = 1; }
+        self.chans.push(ChanState { buf: Vec::new(), head: 0, cap: ccap, closed: false });
+        return ExecOutcome::Value(Value::Int(self.chans.len()));
+    }
+    if name == "p_chan_send" || name == "p_chan_recv" || name == "p_chan_try_recv" || name == "p_chan_close" || name == "p_chan_is_closed" {
+        var ch: i64 = arg_int(args, 0, 0);
+        var pending: i64 = 0 - 9223372036854775807;
+        if ch < 1 || ch > self.chans.len() {
+            if name == "p_chan_send" { return ExecOutcome::Value(Value::Bool(false)); }
+            if name == "p_chan_close" { return ExecOutcome::Continue; }
+            if name == "p_chan_is_closed" { return ExecOutcome::Value(Value::Bool(true)); }
+            return ExecOutcome::Value(Value::Int(pending));
+        }
+        var cs: ChanState = self.chans.get(ch - 1);
+        if name == "p_chan_send" {
+            if cs.closed { return ExecOutcome::Value(Value::Bool(false)); }
+            cs.buf.push(arg_int(args, 1, 0));
+            self.chans.set(ch - 1, cs);
+            return ExecOutcome::Value(Value::Bool(true));
+        }
+        if name == "p_chan_close" {
+            cs.closed = true;
+            self.chans.set(ch - 1, cs);
+            return ExecOutcome::Continue;
+        }
+        if name == "p_chan_is_closed" {
+            return ExecOutcome::Value(Value::Bool(cs.closed));
+        }
+        if cs.head < cs.buf.len() {
+            var cv: i64 = cs.buf.get(cs.head);
+            cs.head = cs.head + 1;
+            self.chans.set(ch - 1, cs);
+            return ExecOutcome::Value(Value::Int(cv));
+        }
+        if name == "p_chan_try_recv" && cs.closed { return ExecOutcome::Value(Value::Int(0)); }
+        return ExecOutcome::Value(Value::Int(pending));
+    }
+
+    // ─── C library stubs ───
+    if name == "abs" || name == "labs" {
+        var av: i64 = arg_int(args, 0, 0);
+        if av < 0 { av = 0 - av; }
+        return ExecOutcome::Value(Value::Int(av));
+    }
+    if name == "sqrt" || name == "c_sqrt" || name == "pledge_sqrt" {
+        match arg_value(args, 0) {
+            Value::Float(sf) => { return ExecOutcome::Value(Value::Float(math_sqrt(sf))); }
+            Value::Int(si) => { return ExecOutcome::Value(Value::Float(math_sqrt(si as f64))); }
+            _ => {}
+        }
+        return ExecOutcome::Value(Value::Float(0.0));
+    }
+    if name == "pow" || name == "c_pow" || name == "pledge_pow" {
+        if arg_float_opt_ok(args, 0) && arg_float_opt_ok(args, 1) {
+            return ExecOutcome::Value(Value::Float(math_pow(arg_float(args, 0), arg_float(args, 1))));
+        }
+        return ExecOutcome::Value(Value::Float(0.0));
+    }
+    if name == "floor" || name == "c_floor" || name == "pledge_floor" || name == "ceil" || name == "c_ceil" || name == "pledge_ceil" || name == "sin" || name == "c_sin" || name == "pledge_sin" || name == "cos" || name == "c_cos" || name == "pledge_cos" || name == "fabs" || name == "c_fabs" || name == "pledge_fabs" {
+        if !arg_float_opt_ok(args, 0) { return ExecOutcome::Value(Value::Float(0.0)); }
+        var x: f64 = arg_float(args, 0);
+        if str_ends_with(name, "floor") { return ExecOutcome::Value(Value::Float(math_floor(x))); }
+        if str_ends_with(name, "ceil") { return ExecOutcome::Value(Value::Float(math_ceil(x))); }
+        if str_ends_with(name, "sin") { return ExecOutcome::Value(Value::Float(math_sin(x))); }
+        if str_ends_with(name, "cos") { return ExecOutcome::Value(Value::Float(math_cos(x))); }
+        return ExecOutcome::Value(Value::Float(math_fabs(x)));
+    }
+    if name == "strcmp" || name == "c_strcmp" {
+        match arg_value(args, 0) {
+            Value::Str(sa) => {
+                match arg_value(args, 1) {
+                    Value::Str(sb) => {
+                        if sa == sb { return ExecOutcome::Value(Value::Int(0)); }
+                        if str_lt(sa, sb) { return ExecOutcome::Value(Value::Int(-1)); }
+                        return ExecOutcome::Value(Value::Int(1));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if name == "strlen" || name == "c_strlen" || name == "pledge_strlen" {
+        match arg_value(args, 0) {
+            Value::Str(ls) => { return ExecOutcome::Value(Value::Int(str_len(ls))); }
+            _ => {}
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if name == "printf" {
+        match arg_value(args, 0) {
+            Value::Str(ps) => { p_print_str(ps); }
+            _ => {}
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+
+    // ─── Dynamic loading (simulated) ───
+    if name == "p_dl_open" {
+        var dpath: str = Interpreter_value_to_string(self, arg_value(args, 0));
+        if str_len(dpath) == 0 { return ExecOutcome::Value(Value::Int(0)); }
+        var dh: i64 = self.next_dl_handle;
+        self.next_dl_handle = self.next_dl_handle + 1;
+        I64Table_set(&mut self.dl_handles, dh, Value::Str(dpath));
+        return ExecOutcome::Value(Value::Int(dh));
+    }
+    if name == "p_dl_sym" {
+        var dsh: i64 = arg_int(args, 0, 0);
+        var sym: str = Interpreter_value_to_string(self, arg_value(args, 1));
+        if dsh == 0 || I64Table_find(&self.dl_handles, dsh) < 0 || str_len(sym) == 0 {
+            return ExecOutcome::Value(Value::Int(0));
+        }
+        return ExecOutcome::Value(Value::Int(0x1000 + dsh * 0x100));
+    }
+    if name == "p_dl_close" {
+        I64Table_remove(&mut self.dl_handles, arg_int(args, 0, 0));
+        return ExecOutcome::Continue;
+    }
+    if name == "p_dl_call" {
+        return ExecOutcome::Value(Value::Int(arg_int(args, 1, 0)));
+    }
+
+    // ─── ECS ───
+    if name == "__ecs_create_entity" {
+        self.ecs_entity_count = self.ecs_entity_count + 1;
+        return ExecOutcome::Value(Value::Int(self.ecs_entity_count - 1));
+    }
+    if name == "__ecs_entity_count" {
+        return ExecOutcome::Value(Value::Int(self.ecs_entity_count));
+    }
+    if name == "__ecs_has" || name == "__ecs_get" || name == "__ecs_remove" {
+        var off: i64 = ecs_name_entity_ok(args);
+        if off < 0 {
+            if name == "__ecs_remove" { return ExecOutcome::Continue; }
+            return ExecOutcome::Value(Value::Int(0));
+        }
+        var cname: str = arg_str_raw(args, off);
+        var ent: i64 = arg_int(args, off + 1, 0);
+        var ci: i64 = Interpreter_ecs_comp(self, cname);
+        var comp: EcsComp = self.ecs_comps.get(ci);
+        if name == "__ecs_remove" {
+            I64Table_remove(&mut comp.table, ent);
+            self.ecs_comps.set(ci, comp);
+            return ExecOutcome::Continue;
+        }
+        match I64Table_get(&comp.table, ent) {
+            OptValue::Some(ev) => {
+                if name == "__ecs_has" { return ExecOutcome::Value(Value::Int(1)); }
+                return ExecOutcome::Value(ev);
+            }
+            OptValue::None => {}
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if name == "__ecs_add" {
+        var have_name: bool = false;
+        var have_ent: bool = false;
+        var have_val: bool = false;
+        var an: str = "";
+        var ae: i64 = 0;
+        var avv: Value = Value::Int(0);
+        var ei: i64 = 0;
+        while ei < args.len() {
+            match args.get(ei) {
+                Value::Str(es) => { if !have_name { an = es; have_name = true; } }
+                Value::Int(en) => { if !have_ent && ei > 0 { ae = en; have_ent = true; } }
+                Value::Ptr(_) => { if !have_val { avv = args.get(ei); have_val = true; } }
+                _ => {}
+            }
+            ei = ei + 1;
+        }
+        if have_name && have_ent {
+            var ci2: i64 = Interpreter_ecs_comp(self, an);
+            var comp2: EcsComp = self.ecs_comps.get(ci2);
+            I64Table_set(&mut comp2.table, ae, avv);
+            self.ecs_comps.set(ci2, comp2);
+        }
+        return ExecOutcome::Continue;
+    }
+
+    // ─── FFI stubs (audio, input) ───
+    if name == "pledge_putchar" {
+        match arg_value(args, 0) {
+            Value::Int(pc) => { p_print_str(p_char_to_str(pc & 0xFF)); }
+            _ => {}
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if name == "pledge_printf" {
+        match arg_value(args, 0) {
+            Value::Ptr(pa) => { p_print_str(Memory_load_cstr(&self.memory, pa)); }
+            _ => {}
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if name == "pledge_fgets" { return ExecOutcome::Value(Value::Ptr(0)); }
+    if name == "pledge_getchar" || name == "pledge_fputs" || name == "pledge_fflush" || name == "pledge_audio_init" || name == "pledge_audio_load" || name == "pledge_audio_play" || name == "pledge_audio_is_playing" {
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if name == "pledge_audio_shutdown" || name == "pledge_audio_stop" || name == "pledge_audio_pause" || name == "pledge_audio_resume" || name == "pledge_audio_stop_all" || name == "pledge_audio_set_volume" || name == "pledge_audio_set_loop" || name == "pledge_audio_set_pan" || name == "pledge_audio_master_volume" {
+        return ExecOutcome::Continue;
+    }
+
+    // ─── JSON (over JSON text strings) ───
+    if str_starts_with(name, "p_json_") {
+        if args.len() == 0 { return ExecOutcome::Panic(str_slice(name, 2, str_len(name)) + ": missing argument"); }
+        var short: str = str_slice(name, 2, str_len(name));
+        if !Interpreter_arg_str_ok(self, args.get(0)) { return ExecOutcome::Panic(short + ": expected string"); }
+        var text: str = Interpreter_arg_str(self, args.get(0));
+        if name == "p_json_string" {
+            return ExecOutcome::Value(Value::Str("\"" + json_escape_body(text) + "\""));
+        }
+        var jr: JsonResult = json_parse(text);
+        var jv: Json = Json::Null;
+        match jr {
+            JsonResult::Ok(pj) => { jv = pj; }
+            JsonResult::Err(e) => {
+                if name == "p_json_get" { return ExecOutcome::Panic("json_get: not an object"); }
+                if name == "p_json_len" { return ExecOutcome::Panic("json_len: not array or object"); }
+                if name == "p_json_at" { return ExecOutcome::Panic("json_at: not an array"); }
+                return ExecOutcome::Panic(short + ": " + e);
+            }
+        }
+        if name == "p_json_parse" || name == "p_json_dump" {
+            return ExecOutcome::Value(Value::Str(json_dump(jv, false)));
+        }
+        if name == "p_json_pretty" {
+            return ExecOutcome::Value(Value::Str(json_dump(jv, true)));
+        }
+        if name == "p_json_type" {
+            return ExecOutcome::Value(Value::Str(json_type_name(jv)));
+        }
+        if name == "p_json_get" {
+            if args.len() < 2 { return ExecOutcome::Panic("json_get: missing args"); }
+            if !Interpreter_arg_str_ok(self, args.get(1)) { return ExecOutcome::Panic("json_get: key must be string"); }
+            var key: str = Interpreter_arg_str(self, args.get(1));
+            match jv {
+                Json::Obj(o) => {
+                    if o.contains(key) { return ExecOutcome::Value(Value::Str(json_dump(o.get(key), false))); }
+                    return ExecOutcome::Value(Value::Str("null"));
+                }
+                _ => {}
+            }
+            return ExecOutcome::Panic("json_get: not an object");
+        }
+        if name == "p_json_len" {
+            match jv {
+                Json::Arr(ja) => { return ExecOutcome::Value(Value::Int(ja.len())); }
+                Json::Obj(jo) => { return ExecOutcome::Value(Value::Int(jo.len())); }
+                _ => {}
+            }
+            return ExecOutcome::Panic("json_len: not array or object");
+        }
+        if name == "p_json_at" {
+            var jidx: i64 = 0;
+            var jidx_ok: bool = false;
+            if args.len() >= 2 {
+                match args.get(1) { Value::Int(n) => { jidx = n; jidx_ok = true; } _ => {} }
+            }
+            if !jidx_ok { return ExecOutcome::Panic("json_at: missing args"); }
+            match jv {
+                Json::Arr(ja2) => {
+                    if jidx >= 0 && jidx < ja2.len() { return ExecOutcome::Value(Value::Str(json_dump(ja2.get(jidx), false))); }
+                    return ExecOutcome::Panic("json_at: index " + int_to_str(jidx) + " out of bounds");
+                }
+                _ => {}
+            }
+            return ExecOutcome::Panic("json_at: not an array");
+        }
+    }
+
+    // ─── Distributed tensors (single device) ───
+    if name == "p_all_reduce" || name == "p_broadcast" || name == "p_all_gather" || name == "p_scatter" {
+        var th: i64 = Interpreter_tensor_handle(self, arg_value(args, 0));
+        if th < 0 { return ExecOutcome::Panic(str_slice(name, 2, str_len(name)) + ": expected Tensor"); }
+        return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_clone_data(&self.tensors.get(th))));
+    }
+    if name == "p_send_tensor" { return ExecOutcome::Continue; }
+    if name == "p_recv_tensor" {
+        match Interpreter_arg_to_vec_i64(self, arg_value(args, 0)) {
+            OptVecI64::Some(rs) => { return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_zeros(rs))); }
+            OptVecI64::None => {}
+        }
+        return ExecOutcome::Panic("recv_tensor: expected Vec");
+    }
+    if name == "p_tp_rank" { return ExecOutcome::Value(Value::Int(0)); }
+    if name == "p_tp_world_size" { return ExecOutcome::Value(Value::Int(1)); }
+    if name == "p_checkpoint_begin" || name == "p_checkpoint_end" { return ExecOutcome::Continue; }
+
+    // ─── SIMD (Vec<f64> values) ───
+    if name == "p_simd_add" || name == "p_simd_sub" || name == "p_simd_mul" || name == "p_simd_div" || name == "p_simd_dot" {
+        var sa_opt: OptVecF64 = Interpreter_args_to_f64_vec(self, args, 0);
+        var sb_opt: OptVecF64 = Interpreter_args_to_f64_vec(self, args, 1);
+        match sa_opt {
+            OptVecF64::Some(va) => {
+                match sb_opt {
+                    OptVecF64::Some(vb) => {
+                        var n: i64 = va.len();
+                        if vb.len() < n { n = vb.len(); }
+                        var outv: Vec<f64> = Vec::new();
+                        var dot: f64 = 0.0;
+                        var k: i64 = 0;
+                        while k < n {
+                            var x: f64 = va.get(k);
+                            var y: f64 = vb.get(k);
+                            if name == "p_simd_add" { outv.push(x + y); }
+                            if name == "p_simd_sub" { outv.push(x - y); }
+                            if name == "p_simd_mul" { outv.push(x * y); }
+                            if name == "p_simd_div" {
+                                if y != 0.0 { outv.push(x / y); } else { outv.push(0.0); }
+                            }
+                            if name == "p_simd_dot" { dot = dot + x * y; }
+                            k = k + 1;
+                        }
+                        if name == "p_simd_dot" { return ExecOutcome::Value(Value::Float(dot)); }
+                        return ExecOutcome::Value(Interpreter_new_float_vec(self, outv));
+                    }
+                    OptVecF64::None => {}
+                }
+            }
+            OptVecF64::None => {}
+        }
+        return ExecOutcome::Panic(str_slice(name, 2, str_len(name)) + ": expected Vec, Vec");
+    }
+    if name == "p_simd_sum" || name == "p_simd_from_vec" || name == "p_simd_scale" {
+        match Interpreter_args_to_f64_vec(self, args, 0) {
+            OptVecF64::Some(sv) => {
+                if name == "p_simd_sum" {
+                    var ssum: f64 = 0.0;
+                    var si: i64 = 0;
+                    while si < sv.len() { ssum = ssum + sv.get(si); si = si + 1; }
+                    return ExecOutcome::Value(Value::Float(ssum));
+                }
+                if name == "p_simd_from_vec" { return ExecOutcome::Value(Interpreter_new_float_vec(self, sv)); }
+                if arg_float_opt_ok(args, 1) {
+                    var scl: f64 = arg_float(args, 1);
+                    var scaled: Vec<f64> = Vec::new();
+                    var sj: i64 = 0;
+                    while sj < sv.len() { scaled.push(sv.get(sj) * scl); sj = sj + 1; }
+                    return ExecOutcome::Value(Interpreter_new_float_vec(self, scaled));
+                }
+                return ExecOutcome::Panic("simd_scale: expected Vec, f64");
+            }
+            OptVecF64::None => {}
+        }
+        if name == "p_simd_sum" { return ExecOutcome::Panic("simd_sum: expected Vec"); }
+        if name == "p_simd_from_vec" { return ExecOutcome::Panic("simd_from_vec: expected Vec"); }
+        return ExecOutcome::Panic("simd_scale: expected Vec, f64");
+    }
+    if name == "p_simd_to_str" {
+        match arg_value(args, 0) {
+            Value::Vec(svh) => {
+                var fl: Vec<f64> = Interpreter_vec_handle_f64s(self, svh, false);
+                var st: str = "[";
+                var sk: i64 = 0;
+                while sk < fl.len() {
+                    if sk > 0 { st = st + ", "; }
+                    st = st + float_to_str(fl.get(sk));
+                    sk = sk + 1;
+                }
+                return ExecOutcome::Value(Value::Str(st + "]"));
+            }
+            _ => {}
+        }
+        return ExecOutcome::Panic("simd_to_str: expected Vec");
+    }
+
+    // ─── Sockets / HTTP (simulated) ───
+    if name == "p_socket_listen" { return ExecOutcome::Value(Value::Int(1)); }
+    if name == "p_socket_accept" { return ExecOutcome::Value(Value::Int(2)); }
+    if name == "p_socket_read" { return ExecOutcome::Value(Interpreter_new_vec_value(self, Vec::new())); }
+    if name == "p_socket_write" {
+        match arg_value(args, 1) {
+            Value::Vec(wh) => {
+                if wh >= 0 && wh < self.vec_values.len() { return ExecOutcome::Value(Value::Int(self.vec_values.get(wh).elements.len())); }
+            }
+            _ => {}
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if name == "p_socket_close" { return ExecOutcome::Continue; }
+    if name == "p_socket_recv_str" { return ExecOutcome::Value(Value::Str("")); }
+    if name == "p_http_parse_request" {
+        if args.len() == 0 || !Interpreter_arg_str_ok(self, args.get(0)) {
+            return ExecOutcome::Panic("http_parse_request: expected string");
+        }
+        var raw: str = Interpreter_arg_str(self, args.get(0));
+        var rlen2: i64 = str_len(raw);
+        var le: i64 = str_find_from(raw, "\r\n", 0);
+        var req_line: str = raw;
+        var pos: i64 = rlen2;
+        if le >= 0 {
+            req_line = str_slice(raw, 0, le);
+            pos = le + 2;
+        }
+        // METHOD PATH VERSION (splitn(3, ' '))
+        var method: str = "GET";
+        var path: str = "/";
+        var version_full: str = "HTTP/1.1";
+        var sp1: i64 = str_find_from(req_line, " ", 0);
+        if sp1 < 0 {
+            method = req_line;
+        } else {
+            method = str_slice(req_line, 0, sp1);
+            var sp2: i64 = str_find_from(req_line, " ", sp1 + 1);
+            if sp2 < 0 {
+                path = str_slice(req_line, sp1 + 1, str_len(req_line));
+            } else {
+                path = str_slice(req_line, sp1 + 1, sp2);
+                version_full = str_slice(req_line, sp2 + 1, str_len(req_line));
+            }
+        }
+        var version: str = version_full;
+        if str_starts_with(version_full, "HTTP/") { version = str_slice(version_full, 5, str_len(version_full)); }
+        else { version = "1.1"; }
+        var headers: str = "{";
+        var first_hdr: bool = true;
+        var saw_blank: bool = false;
+        while pos <= rlen2 && le >= 0 {
+            var nle: i64 = str_find_from(raw, "\r\n", pos);
+            var line: str = "";
+            if nle < 0 { line = str_slice(raw, pos, rlen2); } else { line = str_slice(raw, pos, nle); }
+            if str_len(line) == 0 {
+                saw_blank = true;
+                break;
+            }
+            var colon: i64 = str_find_from(line, ":", 0);
+            if colon >= 0 {
+                if !first_hdr { headers = headers + ","; }
+                first_hdr = false;
+                headers = headers + "\"" + str_trim(str_slice(line, 0, colon)) + "\":\"" + str_trim(str_slice(line, colon + 1, str_len(line))) + "\"";
+            }
+            if nle < 0 { break; }
+            pos = nle + 2;
+        }
+        headers = headers + "}";
+        var body: str = "";
+        if saw_blank {
+            var bb: i64 = str_find_from(raw, "\r\n\r\n", 0);
+            if bb >= 0 {
+                var bstart: i64 = bb + 4;
+                var bend: i64 = str_find_from(raw, "\r\n\r\n", bstart);
+                if bend < 0 { bend = rlen2; }
+                body = str_slice(raw, bstart, bend);
+            }
+        }
+        var js: str = "{\"method\":\"" + json_escape_body(method) + "\",\"path\":\"" + json_escape_body(path) + "\",\"version\":\"" + json_escape_body(version) + "\",\"headers\":" + headers + ",\"body\":\"" + json_escape_body(body) + "\"}";
+        return ExecOutcome::Value(Value::Str(js));
+    }
+    if name == "p_http_build_response" {
+        var status_ok: bool = false;
+        var status: i64 = 0;
+        if args.len() >= 3 {
+            match args.get(0) { Value::Int(st2) => { status = st2; status_ok = true; } _ => {} }
+        }
+        if status_ok {
+            var body2: str = Interpreter_arg_str(self, args.get(2));
+            return ExecOutcome::Value(Value::Str("HTTP/1.1 " + int_to_str(status) + " OK\r\nContent-Length: " + int_to_str(str_len(body2)) + "\r\n\r\n" + body2));
+        }
+        return ExecOutcome::Value(Value::Str("HTTP/1.1 500 Internal Server Error\r\n\r\n"));
+    }
+
+    // ─── In-memory KV database ───
+    if name == "p_db_mem_open" {
+        var dbh: i64 = self.next_db_handle;
+        self.next_db_handle = self.next_db_handle + 1;
+        return ExecOutcome::Value(Value::Int(dbh));
+    }
+    if name == "p_db_mem_close" {
+        var cdb: i64 = arg_int(args, 0, -1);
+        var ri: i64 = 0;
+        while ri < self.db_rows.len() {
+            var row: DbRow = self.db_rows.get(ri);
+            if row.db == cdb {
+                row.db = -1;
+                self.db_rows.set(ri, row);
+            }
+            ri = ri + 1;
+        }
+        self.closed_dbs.push(cdb);
+        return ExecOutcome::Continue;
+    }
+    if name == "p_db_mem_query" {
+        var qdb: i64 = -1;
+        match arg_value(args, 0) { Value::Int(qh) => { qdb = qh; } _ => {} }
+        if qdb >= 1 && qdb < self.next_db_handle && !vec_i64_contains(self.closed_dbs, qdb) {
+            var qtext: str = "";
+            if args.len() > 1 { qtext = Interpreter_value_to_string(self, args.get(1)); }
+            var at: i64 = str_find(qtext, "key=");
+            if at >= 0 {
+                var k: str = str_slice(qtext, at + 4, str_len(qtext));
+                while str_len(k) > 0 && (str_byte_at(k, 0) == 39 || str_byte_at(k, 0) == 34) { k = str_slice(k, 1, str_len(k)); }
+                var kend: i64 = 0;
+                while kend < str_len(k) {
+                    var kc: i64 = str_byte_at(k, kend);
+                    if kc == 32 || kc == 59 || kc == 39 || kc == 34 { break; }
+                    kend = kend + 1;
+                }
+                k = str_slice(k, 0, kend);
+                var qi: i64 = 0;
+                while qi < self.db_rows.len() {
+                    var qrow: DbRow = self.db_rows.get(qi);
+                    if qrow.db == qdb && qrow.key == k {
+                        return ExecOutcome::Value(Value::Str(Interpreter_value_to_string(self, qrow.val)));
+                    }
+                    qi = qi + 1;
+                }
+                return ExecOutcome::Value(Value::Str(""));
+            }
+            var arr: str = "[";
+            var first: bool = true;
+            var qj: i64 = 0;
+            while qj < self.db_rows.len() {
+                var krow: DbRow = self.db_rows.get(qj);
+                if krow.db == qdb {
+                    if !first { arr = arr + ","; }
+                    first = false;
+                    arr = arr + json_escape_string(krow.key);
+                }
+                qj = qj + 1;
+            }
+            return ExecOutcome::Value(Value::Str(arr + "]"));
+        }
+        return ExecOutcome::Value(Value::Str("[]"));
+    }
+    if name == "p_db_mem_exec" {
+        var edb: i64 = -1;
+        match arg_value(args, 0) { Value::Int(eh) => { edb = eh; } _ => {} }
+        if edb >= 0 && args.len() >= 2 {
+            var q: str = Interpreter_value_to_string(self, args.get(1));
+            var s1: i64 = str_find_from(q, " ", 0);
+            if s1 >= 0 {
+                var s2: i64 = str_find_from(q, " ", s1 + 1);
+                if s2 >= 0 {
+                    var verb: str = str_to_lower(str_slice(q, 0, s1));
+                    var ekey: str = str_slice(q, s1 + 1, s2);
+                    var evalue: str = str_slice(q, s2 + 1, str_len(q));
+                    if (verb == "set" || verb == "insert") && edb >= 1 && edb < self.next_db_handle && !vec_i64_contains(self.closed_dbs, edb) {
+                        var ej: i64 = 0;
+                        while ej < self.db_rows.len() {
+                            var erow: DbRow = self.db_rows.get(ej);
+                            if erow.db == edb && erow.key == ekey {
+                                erow.val = Value::Str(evalue);
+                                self.db_rows.set(ej, erow);
+                                return ExecOutcome::Value(Value::Int(1));
+                            }
+                            ej = ej + 1;
+                        }
+                        self.db_rows.push(DbRow { db: edb, key: ekey, val: Value::Str(evalue) });
+                        return ExecOutcome::Value(Value::Int(1));
+                    }
+                }
+            }
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    // ─── SQLite stubs ───
+    if name == "p_sqlite3_prepare_v2" { return ExecOutcome::Value(Value::Int(1)); }
+    if name == "p_sqlite3_step" { return ExecOutcome::Value(Value::Int(101)); }
+    if name == "p_sqlite3_column_type" { return ExecOutcome::Value(Value::Int(5)); }
+    if name == "p_sqlite3_column_double" { return ExecOutcome::Value(Value::Float(0.0)); }
+    if name == "p_sqlite3_column_name" || name == "p_sqlite3_column_text" { return ExecOutcome::Value(Value::Str("")); }
+    if name == "p_sqlite3_errmsg" { return ExecOutcome::Value(Value::Str("interpreter does not support SQLite")); }
+    if name == "p_sqlite3_free" { return ExecOutcome::Continue; }
+    if str_starts_with(name, "p_sqlite3_") { return ExecOutcome::Value(Value::Int(0)); }
+
+    // ─── Bare-metal stubs ───
+    if name == "p_cli" || name == "p_sti" || name == "p_lidt" || name == "p_idt_set_entry" || name == "p_hlt" || name == "p_outb" || name == "p_cr3_write" || name == "p_cr0_write" || name == "p_cr4_write" || name == "p_invlpg" || name == "p_page_map" || name == "p_page_unmap" || name == "p_phys_write64" || name == "p_lgdt" || name == "p_gdt_set_entry" || name == "p_serial_init" || name == "p_serial_write" {
+        return ExecOutcome::Value(Value::Void);
+    }
+    if name == "p_inb" || name == "p_phys_read64" || name == "p_serial_read" || name == "p_serial_ready" { return ExecOutcome::Value(Value::Int(0)); }
+    if name == "p_cr3_read" { return ExecOutcome::Value(Value::Int(0x10000)); }
+    if name == "p_cr0_read" { return ExecOutcome::Value(Value::Int(0x80000011)); }
+    if name == "p_cr4_read" { return ExecOutcome::Value(Value::Int(0x20)); }
+
+    // ─── Allocators ───
+    if name == "p_allocator_create" {
+        match arg_value(args, 0) {
+            Value::Str(an2) => { return ExecOutcome::Value(Value::Str("alloc(" + an2 + ")")); }
+            _ => {}
+        }
+        return ExecOutcome::Value(Value::Str("alloc(default)"));
+    }
+    if name == "p_allocator_alloc" {
+        match arg_value(args, 1) {
+            Value::Int(asz) => {
+                self.alloc_ptr = self.alloc_ptr + asz;
+                return ExecOutcome::Value(Value::Ptr(self.alloc_ptr));
+            }
+            _ => {}
+        }
+        return ExecOutcome::Value(Value::Ptr(0));
+    }
+    if name == "p_allocator_free" { return ExecOutcome::Value(Value::Void); }
+    if name == "p_allocator_stats" { return ExecOutcome::Value(Value::Int(0)); }
+
+    // ─── Environment, process ───
+    if name == "p_getenv" {
+        var en2: str = Interpreter_value_to_string(self, arg_value(args, 0));
+        if str_len(en2) > 0 {
+            var ev2: str = p_getenv(en2);
+            var evp: i64 = ev2 + 0;
+            if evp != 0 { return ExecOutcome::Value(Value::Str(ev2)); }
+        }
+        return ExecOutcome::Value(Value::Ptr(0));
+    }
+    if name == "p_argc" { return ExecOutcome::Value(Value::Int(p_argc())); }
+    if name == "p_argv" {
+        match arg_value(args, 0) {
+            Value::Int(ai2) => {
+                if ai2 >= 0 && ai2 < p_argc() { return ExecOutcome::Value(Value::Str(p_argv(ai2))); }
+            }
+            _ => {}
+        }
+        return ExecOutcome::Value(Value::Ptr(0));
+    }
+    if name == "p_system" {
+        var cmd: str = Interpreter_value_to_string(self, arg_value(args, 0));
+        if str_len(cmd) > 0 { return ExecOutcome::Value(Value::Int(p_system(cmd))); }
+        return ExecOutcome::Value(Value::Int(-1));
+    }
+    if name == "p_exit" {
+        p_exit(arg_int(args, 0, 0));
+        return ExecOutcome::Continue;
+    }
+    if name == "p_regex_match" {
+        var rs: str = Interpreter_value_to_string(self, arg_value(args, 0));
+        var rp: str = Interpreter_value_to_string(self, arg_value(args, 1));
+        return ExecOutcome::Value(Value::Bool(wildcard_match(rs, rp)));
+    }
+    if name == "p_f64_to_bits" {
+        match arg_value(args, 0) {
+            Value::Float(bf) => { return ExecOutcome::Value(Value::Int(p_f64_to_bits(bf))); }
+            Value::Int(bi) => { return ExecOutcome::Value(Value::Int(p_f64_to_bits(bi as f64))); }
+            _ => {}
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if name == "p_f64_from_bits" {
+        return ExecOutcome::Value(Value::Float(f64_from_bits_i(arg_int(args, 0, 0))));
+    }
+    return ExecOutcome::Jump(-99);
+}
+
+fn vec_i64_contains(v: Vec<i64>, x: i64) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == x { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn Interpreter_shared_get(self: &Interpreter, addr: i64) -> i64 {
+    match I64Table_get(&self.shared_mem, addr) {
+        OptValue::Some(v) => {
+            match v {
+                Value::Int(n) => { return n; }
+                _ => {}
+            }
+        }
+        OptValue::None => {}
+    }
+    return 0;
+}
+
+pub fn Tensor_clone_data(t: &TensorData) -> TensorData {
+    return Tensor_new(t.shape.clone(), t.strides.clone(), t.data.clone());
+}
+
+// ===========================================================================
+// Tensor builtins with the autograd tape (src/interp.rs ML3/ML11/ML12)
+// ===========================================================================
+
+// Tape op kinds
+pub fn agop_add() -> i64 { return 1; }
+pub fn agop_sub() -> i64 { return 2; }
+pub fn agop_mul() -> i64 { return 3; }
+pub fn agop_matmul() -> i64 { return 4; }
+pub fn agop_scale() -> i64 { return 5; }
+pub fn agop_relu() -> i64 { return 6; }
+pub fn agop_sigmoid() -> i64 { return 7; }
+pub fn agop_sum() -> i64 { return 8; }
+pub fn agop_mean() -> i64 { return 9; }
+
+pub struct AgEntry {
+    pub result: i64,
+    pub op: i64,
+    pub a: i64,
+    pub b: i64,
+    pub s: f64,
+    pub a_shape: Vec<i64>,
+    pub b_shape: Vec<i64>,
+    pub a_size: i64,
+    pub data: Vec<f64>,
+    pub has_input: bool,
+    pub input: Vec<f64>,
+}
+
+fn AgEntry_new(result: i64, op: i64, a: i64, b: i64) -> AgEntry {
+    return AgEntry { result: result, op: op, a: a, b: b, s: 0.0, a_shape: Vec::new(), b_shape: Vec::new(), a_size: 0, data: Vec::new(), has_input: false, input: Vec::new() };
+}
+
+fn tensor_addr_of(v: Value) -> i64 {
+    match v {
+        Value::Ptr(p) => { return p; }
+        Value::Int(i) => { return i; }
+        _ => {}
+    }
+    return 0;
+}
+
+pub fn Interpreter_record_ag(self: &mut Interpreter, e: AgEntry) {
+    if self.ag_enabled { self.ag_tape.push(e); }
+}
+
+fn tensor_map_data(t: &TensorData, data: Vec<f64>) -> TensorData {
+    return Tensor_new(t.shape.clone(), t.strides.clone(), data);
+}
+
+/// accum_grad: add `g` into the gradient for `addr`.
+pub fn Interpreter_accum_grad(self: &mut Interpreter, keys: Vec<i64>, vals: Vec<TensorData>, addr: i64, g: TensorData) {
+    var i: i64 = 0;
+    while i < keys.len() {
+        if keys.get(i) == addr {
+            var ex: TensorData = vals.get(i);
+            var nd: Vec<f64> = ex.data.clone();
+            var j: i64 = 0;
+            while j < g.data.len() {
+                if j < nd.len() { nd.set(j, nd.get(j) + g.data.get(j)); }
+                j = j + 1;
+            }
+            vals.set(i, Tensor_new(ex.shape.clone(), ex.strides.clone(), nd));
+            return;
+        }
+        i = i + 1;
+    }
+    keys.push(addr);
+    vals.push(Tensor_new(g.shape.clone(), g.strides.clone(), g.data.clone()));
+}
+
+fn grad_find(keys: Vec<i64>, addr: i64) -> i64 {
+    var i: i64 = 0;
+    while i < keys.len() {
+        if keys.get(i) == addr { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn Interpreter_run_backward(self: &mut Interpreter) {
+    var loss_grad: f64 = 1.0;
+    var keys: Vec<i64> = Vec::new();
+    var vals: Vec<TensorData> = Vec::new();
+    var seed_set: bool = false;
+    var n: i64 = self.ag_tape.len();
+    var ti: i64 = n - 1;
+    while ti >= 0 {
+        var e: AgEntry = self.ag_tape.get(ti);
+        if e.op == agop_sum() {
+            keys.push(e.a);
+            vals.push(Tensor_filled(e.a_shape.clone(), loss_grad));
+            seed_set = true;
+            break;
+        }
+        if e.op == agop_mean() {
+            keys.push(e.a);
+            vals.push(Tensor_filled(e.a_shape.clone(), loss_grad / (e.a_size as f64)));
+            seed_set = true;
+            break;
+        }
+        ti = ti - 1;
+    }
+    if !seed_set && n > 0 {
+        var last: AgEntry = self.ag_tape.get(n - 1);
+        if last.result != 0 {
+            var one: Vec<i64> = Vec::new();
+            one.push(1);
+            keys.push(last.result);
+            vals.push(Tensor_filled(one, loss_grad));
+        }
+    }
+    var k: i64 = n - 1;
+    while k >= 0 {
+        var node: AgEntry = self.ag_tape.get(k);
+        k = k - 1;
+        var gi: i64 = grad_find(keys, node.result);
+        if gi < 0 { continue; }
+        var go: TensorData = vals.get(gi);
+        var gout: TensorData = Tensor_new(go.shape.clone(), go.strides.clone(), go.data.clone());
+        if node.op == agop_add() || node.op == agop_mul() {
+            Interpreter_accum_grad(self, keys, vals, node.a, gout);
+            Interpreter_accum_grad(self, keys, vals, node.b, gout);
+        } else if node.op == agop_sub() {
+            Interpreter_accum_grad(self, keys, vals, node.a, gout);
+            var neg: Vec<f64> = Vec::new();
+            var i1: i64 = 0;
+            while i1 < gout.data.len() { neg.push(0.0 - gout.data.get(i1)); i1 = i1 + 1; }
+            Interpreter_accum_grad(self, keys, vals, node.b, tensor_map_data(&gout, neg));
+        } else if node.op == agop_matmul() {
+            Interpreter_accum_grad(self, keys, vals, node.a, Tensor_filled(node.a_shape.clone(), 1.0));
+            Interpreter_accum_grad(self, keys, vals, node.b, Tensor_filled(node.b_shape.clone(), 1.0));
+        } else if node.op == agop_scale() {
+            var sc: Vec<f64> = Vec::new();
+            var i2: i64 = 0;
+            while i2 < gout.data.len() { sc.push(gout.data.get(i2) * node.s); i2 = i2 + 1; }
+            Interpreter_accum_grad(self, keys, vals, node.a, tensor_map_data(&gout, sc));
+        } else if node.op == agop_relu() {
+            var eff: Vec<f64> = node.data;
+            if node.has_input {
+                eff = Vec::new();
+                var i3: i64 = 0;
+                while i3 < node.input.len() {
+                    var x: f64 = node.input.get(i3);
+                    if x > 0.0 { eff.push(x); } else { eff.push(0.0); }
+                    i3 = i3 + 1;
+                }
+            }
+            var rg: Vec<f64> = Vec::new();
+            var i4: i64 = 0;
+            while i4 < gout.data.len() && i4 < eff.len() {
+                if eff.get(i4) > 0.0 { rg.push(gout.data.get(i4)); } else { rg.push(gout.data.get(i4) * 0.0); }
+                i4 = i4 + 1;
+            }
+            Interpreter_accum_grad(self, keys, vals, node.a, tensor_map_data(&gout, rg));
+        } else if node.op == agop_sigmoid() {
+            var eff2: Vec<f64> = node.data;
+            if node.has_input {
+                eff2 = Vec::new();
+                var i5: i64 = 0;
+                while i5 < node.input.len() {
+                    eff2.push(1.0 / (1.0 + math_exp(0.0 - node.input.get(i5))));
+                    i5 = i5 + 1;
+                }
+            }
+            var sg: Vec<f64> = Vec::new();
+            var i6: i64 = 0;
+            while i6 < gout.data.len() && i6 < eff2.len() {
+                var sv: f64 = eff2.get(i6);
+                sg.push(gout.data.get(i6) * sv * (1.0 - sv));
+                i6 = i6 + 1;
+            }
+            Interpreter_accum_grad(self, keys, vals, node.a, tensor_map_data(&gout, sg));
+        } else if node.op == agop_sum() {
+            Interpreter_accum_grad(self, keys, vals, node.a, Tensor_filled(node.a_shape.clone(), loss_grad));
+        } else if node.op == agop_mean() {
+            Interpreter_accum_grad(self, keys, vals, node.a, Tensor_filled(node.a_shape.clone(), loss_grad / (node.a_size as f64)));
+        }
+    }
+    self.ag_grad_keys = keys;
+    self.ag_grad_vals = vals;
+}
+
+/// A uniform f64 in [0, 1) (xorshift128+, as src/interp.rs prng_next_f64)
+@wrapping
+pub fn Interpreter_prng_f64(self: &mut Interpreter) -> f64 {
+    var s0: u64 = self.prng_state_a;
+    var s1: u64 = self.prng_state_b;
+    var result: u64 = s0 + s1;
+    s1 = s1 ^ s0;
+    self.prng_state_a = ((s0 << 24) | (s0 >> 40)) + s1;
+    self.prng_state_b = (s1 << 37) | (s1 >> 27);
+    var top: i64 = (result >> 11) as i64;
+    if top < 0 { top = 0 - top; }
+    return (top as f64) * (1.0 / 9007199254740992.0);
+}
+
+pub fn Interpreter_prng_gaussian(self: &mut Interpreter) -> f64 {
+    var u1: f64 = 0.0001 + Interpreter_prng_f64(self) * 0.9998;
+    var u2: f64 = 0.0001 + Interpreter_prng_f64(self) * 0.9998;
+    return math_sqrt(-2.0 * math_log(u1)) * math_cos(2.0 * 3.141592653589793 * u2);
+}
+
+pub fn Interpreter_call_tensor(self: &mut Interpreter, name: str, args: Vec<Value>) -> ExecOutcome {
+    if !str_starts_with(name, "p_tensor_") && !str_starts_with(name, "p_grad_") && !str_starts_with(name, "p_checkpoint_") && name != "p_dp_noise" && name != "p_gaussian_noise" && name != "p_dropout" {
+        return ExecOutcome::Jump(-99);
+    }
+    if name == "p_checkpoint_begin" { self.ag_checkpoint = true; return ExecOutcome::Value(Value::Void); }
+    if name == "p_checkpoint_end" { self.ag_checkpoint = false; return ExecOutcome::Value(Value::Void); }
+    if name == "p_tensor_from_vec" {
+        var d_opt: OptVecI64 = Interpreter_arg_to_vec_i64(self, arg_value(args, 0));
+        var s_opt: OptVecI64 = Interpreter_arg_to_vec_i64(self, arg_value(args, 1));
+        match d_opt {
+            OptVecI64::Some(di) => {
+                match s_opt {
+                    OptVecI64::Some(sh) => {
+                        var df: Vec<f64> = Vec::new();
+                        var i: i64 = 0;
+                        while i < di.len() { df.push(di.get(i) as f64); i = i + 1; }
+                        return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_from_vec(sh, df)));
+                    }
+                    OptVecI64::None => {}
+                }
+            }
+            OptVecI64::None => {}
+        }
+        return ExecOutcome::Panic("tensor_from_vec: expected Vec, Vec");
+    }
+    if name == "p_tensor_get" || name == "p_tensor_set" {
+        var th: i64 = Interpreter_tensor_handle(self, arg_value(args, 0));
+        var idx_opt: OptVecI64 = Interpreter_arg_to_vec_i64(self, arg_value(args, 1));
+        match idx_opt {
+            OptVecI64::Some(idx) => {
+                if th >= 0 {
+                    if name == "p_tensor_get" {
+                        return ExecOutcome::Value(Value::Float(Tensor_get(&self.tensors.get(th), idx)));
+                    }
+                    if arg_float_opt_ok(args, 2) {
+                        var tm: TensorData = self.tensors.get(th);
+                        Tensor_set(&mut tm, idx, arg_float(args, 2));
+                        self.tensors.set(th, tm);
+                        return ExecOutcome::Continue;
+                    }
+                }
+            }
+            OptVecI64::None => {}
+        }
+        if name == "p_tensor_get" { return ExecOutcome::Panic("tensor_get: expected Tensor, Vec"); }
+        return ExecOutcome::Panic("tensor_set: expected Tensor, Vec, f64");
+    }
+    if name == "p_tensor_add" || name == "p_tensor_sub" || name == "p_tensor_mul" || name == "p_tensor_matmul" {
+        var ha: i64 = Interpreter_tensor_handle(self, arg_value(args, 0));
+        var hb: i64 = Interpreter_tensor_handle(self, arg_value(args, 1));
+        var short: str = str_slice(name, 2, str_len(name));
+        if ha < 0 || hb < 0 { return ExecOutcome::Panic(short + ": expected Tensor, Tensor"); }
+        var ta: TensorData = self.tensors.get(ha);
+        var tb: TensorData = self.tensors.get(hb);
+        var rr: ResultTensor = ResultTensor::Err("");
+        var op: i64 = agop_add();
+        if name == "p_tensor_add" { rr = Tensor_add(&ta, &tb); }
+        if name == "p_tensor_sub" { rr = Tensor_sub(&ta, &tb); op = agop_sub(); }
+        if name == "p_tensor_mul" { rr = Tensor_mul(&ta, &tb); op = agop_mul(); }
+        if name == "p_tensor_matmul" { rr = Tensor_matmul(&ta, &tb); op = agop_matmul(); }
+        match rr {
+            ResultTensor::Ok(r) => {
+                var rv: Value = Interpreter_alloc_tensor(self, r);
+                var e: AgEntry = AgEntry_new(tensor_addr_of(rv), op, tensor_addr_of(args.get(0)), tensor_addr_of(args.get(1)));
+                if op == agop_matmul() {
+                    e.a_shape = ta.shape.clone();
+                    e.b_shape = tb.shape.clone();
+                }
+                Interpreter_record_ag(self, e);
+                return ExecOutcome::Value(rv);
+            }
+            ResultTensor::Err(msg) => { return ExecOutcome::Panic(msg); }
+        }
+    }
+    if name == "p_tensor_scale" {
+        var hs: i64 = Interpreter_tensor_handle(self, arg_value(args, 0));
+        if hs < 0 || !arg_float_opt_ok(args, 1) { return ExecOutcome::Panic("tensor_scale: expected Tensor, f64"); }
+        var s: f64 = arg_float(args, 1);
+        var sv: Value = Interpreter_alloc_tensor(self, Tensor_scale(&self.tensors.get(hs), s));
+        var se: AgEntry = AgEntry_new(tensor_addr_of(sv), agop_scale(), tensor_addr_of(args.get(0)), 0);
+        se.s = s;
+        Interpreter_record_ag(self, se);
+        return ExecOutcome::Value(sv);
+    }
+    if name == "p_tensor_sum" || name == "p_tensor_mean" {
+        var hm: i64 = Interpreter_tensor_handle(self, arg_value(args, 0));
+        if hm < 0 { return ExecOutcome::Panic(str_slice(name, 2, str_len(name)) + ": expected Tensor"); }
+        var tsum: TensorData = self.tensors.get(hm);
+        var res: f64 = 0.0;
+        var mop: i64 = agop_sum();
+        if name == "p_tensor_sum" { res = Tensor_sum(&tsum); } else { res = Tensor_mean(&tsum); mop = agop_mean(); }
+        if self.ag_enabled {
+            var me: AgEntry = AgEntry_new(0, mop, tensor_addr_of(args.get(0)), 0);
+            me.a_shape = tsum.shape.clone();
+            me.a_size = Tensor_size(&tsum);
+            self.ag_tape.push(me);
+        }
+        return ExecOutcome::Value(Value::Float(res));
+    }
+    if name == "p_tensor_relu" || name == "p_tensor_sigmoid" {
+        var hr: i64 = Interpreter_tensor_handle(self, arg_value(args, 0));
+        if hr < 0 { return ExecOutcome::Panic(str_slice(name, 2, str_len(name)) + ": expected Tensor"); }
+        var tin: TensorData = self.tensors.get(hr);
+        var tout: TensorData = Tensor_relu(&tin);
+        var aop: i64 = agop_relu();
+        if name == "p_tensor_sigmoid" { tout = interp_tensor_sigmoid(&tin); aop = agop_sigmoid(); }
+        var odata: Vec<f64> = tout.data.clone();
+        var ov: Value = Interpreter_alloc_tensor(self, tout);
+        var re: AgEntry = AgEntry_new(tensor_addr_of(ov), aop, tensor_addr_of(args.get(0)), 0);
+        re.data = odata;
+        if self.ag_checkpoint {
+            re.has_input = true;
+            re.input = tin.data.clone();
+        }
+        Interpreter_record_ag(self, re);
+        return ExecOutcome::Value(ov);
+    }
+    if name == "p_tensor_softmax" || name == "p_tensor_to_json" {
+        var hx: i64 = Interpreter_tensor_handle(self, arg_value(args, 0));
+        if hx < 0 { return ExecOutcome::Panic(str_slice(name, 2, str_len(name)) + ": expected Tensor"); }
+        if name == "p_tensor_to_json" { return ExecOutcome::Value(Value::Str(interp_tensor_to_json(&self.tensors.get(hx)))); }
+        return ExecOutcome::Value(Interpreter_alloc_tensor(self, interp_tensor_softmax(&self.tensors.get(hx))));
+    }
+    if name == "p_grad_get" {
+        var hg: i64 = Interpreter_tensor_handle(self, arg_value(args, 0));
+        if hg < 0 { return ExecOutcome::Panic("grad_get: expected Tensor"); }
+        var gidx: i64 = grad_find(self.ag_grad_keys, tensor_addr_of(args.get(0)));
+        if gidx >= 0 {
+            return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_clone_data(&self.ag_grad_vals.get(gidx))));
+        }
+        return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_filled(self.tensors.get(hg).shape.clone(), 0.0)));
+    }
+    if name == "p_grad_zero" {
+        var zk: Vec<i64> = Vec::new();
+        self.ag_grad_keys = zk;
+        var zv: Vec<TensorData> = Vec::new();
+        self.ag_grad_vals = zv;
+        return ExecOutcome::Value(Value::Void);
+    }
+    if name == "p_dp_noise" || name == "p_dropout" {
+        var hn: i64 = Interpreter_tensor_handle(self, arg_value(args, 0));
+        if hn < 0 || !arg_float_opt_ok(args, 1) {
+            if name == "p_dp_noise" { return ExecOutcome::Panic("dp_noise: expected (Tensor, f64)"); }
+            return ExecOutcome::Panic("dropout: expected (Tensor, f64)");
+        }
+        var pf: f64 = arg_float(args, 1);
+        var src: TensorData = self.tensors.get(hn);
+        var nd: Vec<f64> = Vec::new();
+        var di2: i64 = 0;
+        var dscale: f64 = 1.0 / (1.0 - pf);
+        while di2 < src.data.len() {
+            var x2: f64 = src.data.get(di2);
+            if name == "p_dp_noise" {
+                nd.push(x2 + pf * Interpreter_prng_gaussian(self));
+            } else {
+                if Interpreter_prng_f64(self) < pf { nd.push(0.0); } else { nd.push(x2 * dscale); }
+            }
+            di2 = di2 + 1;
+        }
+        return ExecOutcome::Value(Interpreter_alloc_tensor(self, tensor_map_data(&src, nd)));
+    }
+    if name == "p_gaussian_noise" {
+        var sigma: f64 = arg_float(args, 1);
+        match Interpreter_arg_to_vec_i64(self, arg_value(args, 0)) {
+            OptVecI64::Some(gs) => {
+                var size: i64 = 1;
+                var gi2: i64 = 0;
+                while gi2 < gs.len() { size = size * gs.get(gi2); gi2 = gi2 + 1; }
+                var gd: Vec<f64> = Vec::new();
+                var gk: i64 = 0;
+                while gk < size { gd.push(sigma * Interpreter_prng_gaussian(self)); gk = gk + 1; }
+                return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_from_vec(gs, gd)));
+            }
+            OptVecI64::None => {}
+        }
+        return ExecOutcome::Panic("gaussian_noise: expected (Vec, f64)");
+    }
+    return ExecOutcome::Jump(-99);
+}
+
+// Tensor math with the real exp (tensor.fd's tensor_exp is a short Taylor
+// series, far off for |x| > 5): matches src/tensor.rs.
+pub fn interp_tensor_sigmoid(t: &TensorData) -> TensorData {
+    var d: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < t.data.len() {
+        d.push(1.0 / (1.0 + math_exp(0.0 - t.data.get(i))));
+        i = i + 1;
+    }
+    return Tensor_new(t.shape.clone(), t.strides.clone(), d);
+}
+
+pub fn interp_tensor_softmax(t: &TensorData) -> TensorData {
+    var d: Vec<f64> = t.data.clone();
+    if t.shape.len() == 0 { return Tensor_new(t.shape.clone(), t.strides.clone(), d); }
+    var row: i64 = t.shape.get(t.shape.len() - 1);
+    if row <= 0 { return Tensor_new(t.shape.clone(), t.strides.clone(), d); }
+    var rows: i64 = Tensor_size(t) / row;
+    var r: i64 = 0;
+    while r < rows {
+        var start: i64 = r * row;
+        var mx: f64 = t.data.get(start);
+        var i: i64 = start + 1;
+        while i < start + row {
+            if t.data.get(i) > mx { mx = t.data.get(i); }
+            i = i + 1;
+        }
+        var sum: f64 = 0.0;
+        var j: i64 = start;
+        while j < start + row {
+            var e: f64 = math_exp(t.data.get(j) - mx);
+            d.set(j, e);
+            sum = sum + e;
+            j = j + 1;
+        }
+        var k: i64 = start;
+        while k < start + row {
+            d.set(k, d.get(k) / sum);
+            k = k + 1;
+        }
+        r = r + 1;
+    }
+    return Tensor_new(t.shape.clone(), t.strides.clone(), d);
+}
+
+pub fn interp_tensor_to_json(t: &TensorData) -> str {
+    var sh: str = "";
+    var i: i64 = 0;
+    while i < t.shape.len() {
+        if i > 0 { sh = sh + ","; }
+        sh = sh + int_to_str(t.shape.get(i));
+        i = i + 1;
+    }
+    var dj: str = "";
+    var j: i64 = 0;
+    while j < t.data.len() {
+        if j > 0 { dj = dj + ","; }
+        var v: f64 = t.data.get(j);
+        var av: f64 = v;
+        if av < 0.0 { av = 0.0 - av; }
+        var is_int: bool = false;
+        if av < 1000000000000000.0 {
+            var iv: i64 = v as i64;
+            if (iv as f64) == v { is_int = true; }
+        }
+        if is_int { dj = dj + int_to_str(v as i64); } else { dj = dj + float_to_str(v); }
+        j = j + 1;
+    }
+    return "{\"shape\":[" + sh + "],\"data\":[" + dj + "]}";
+}
+
+/// Rust's `{:.4}` (round half away from zero on the binary value).
+pub fn fmt_fixed4(v: f64) -> str {
+    var neg: bool = v < 0.0;
+    var a: f64 = v;
+    if neg { a = 0.0 - v; }
+    var scaled: f64 = a * 10000.0 + 0.5;
+    var r: i64 = scaled as i64;
+    var whole: i64 = r / 10000;
+    var frac: i64 = r % 10000;
+    var fs: str = int_to_str(frac);
+    while str_len(fs) < 4 { fs = "0" + fs; }
+    var out: str = int_to_str(whole) + "." + fs;
+    if neg { out = "-" + out; }
+    return out;
+}
+
+fn tensor_fmt_elem(v: f64) -> str {
+    var av: f64 = v;
+    if av < 0.0 { av = 0.0 - av; }
+    if av < 1000000000000000.0 {
+        var iv: i64 = v as i64;
+        if (iv as f64) == v { return int_to_str(iv); }
+    }
+    return fmt_fixed4(v);
+}
+
+fn tensor_fmt_rec(data: Vec<f64>, shape: Vec<i64>, strides: Vec<i64>, dim: i64, offset: i64) -> str {
+    if dim >= shape.len() {
+        var v: f64 = 0.0;
+        if offset < data.len() { v = data.get(offset); }
+        return float_to_str(v);
+    }
+    var out: str = "[";
+    var i: i64 = 0;
+    while i < shape.get(dim) {
+        if i > 0 { out = out + ", "; }
+        var idx: i64 = offset + i * strides.get(dim);
+        if dim == shape.len() - 1 {
+            var ev: f64 = 0.0;
+            if idx < data.len() { ev = data.get(idx); }
+            out = out + tensor_fmt_elem(ev);
+        } else {
+            out = out + tensor_fmt_rec(data, shape, strides, dim + 1, idx);
+        }
+        i = i + 1;
+    }
+    return out + "]";
+}
+
+/// src/tensor.rs Tensor::to_string
+pub fn interp_tensor_to_string(t: &TensorData) -> str {
+    return tensor_fmt_rec(t.data, t.shape, t.strides, 0, 0);
+}
+
+// src/tensor.rs quantize_q8 / dequantize_q8 (tensor.fd pushes
+// p_int_to_float results, which the bootstrap types as i64 words)
+pub fn interp_quantize_q8(t: &TensorData, scale: f64, zp: i64) -> TensorData {
+    var d: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < t.data.len() {
+        var x: f64 = t.data.get(i) / scale;
+        var r: f64 = 0.0;
+        if x < 0.0 { r = 0.0 - math_floor(0.5 - x); } else { r = math_floor(x + 0.5); }
+        var q: i64 = (r as i64) + zp;
+        if q < -128 { q = -128; }
+        if q > 127 { q = 127; }
+        d.push(q as f64);
+        i = i + 1;
+    }
+    return Tensor_new(t.shape.clone(), t.strides.clone(), d);
+}
+
+pub fn interp_dequantize_q8(t: &TensorData, scale: f64, zp: i64) -> TensorData {
+    var d: Vec<f64> = Vec::new();
+    var zf: f64 = zp as f64;
+    var i: i64 = 0;
+    while i < t.data.len() {
+        d.push((t.data.get(i) - zf) * scale);
+        i = i + 1;
+    }
+    return Tensor_new(t.shape.clone(), t.strides.clone(), d);
+}
+
+fn int_or_q(v: Value) -> str {
+    match v {
+        Value::Int(n) => { return int_to_str(n); }
+        _ => {}
+    }
+    return "?";
+}
+
+// Wrap-around arithmetic for @wrapping programs (the interpreter's own
+// arithmetic is checked).
+@wrapping
+fn wrap_add(a: i64, b: i64) -> i64 { return a + b; }
+@wrapping
+fn wrap_sub(a: i64, b: i64) -> i64 { return a - b; }
+@wrapping
+fn wrap_mul(a: i64, b: i64) -> i64 { return a * b; }
+
+/// A side-table Vec as `[a, "s", ...]` (string elements quoted).
+pub fn Interpreter_display_vec_quoted(self: &Interpreter, h: i64) -> str {
+    var out: str = "[";
+    if h >= 0 && h < self.vec_values.len() {
+        var elems: Vec<Value> = self.vec_values.get(h).elements;
+        var i: i64 = 0;
+        while i < elems.len() {
+            if i > 0 { out = out + ", "; }
+            match elems.get(i) {
+                Value::Str(es) => { out = out + "\"" + es + "\""; }
+                _ => { out = out + Interpreter_display_value(self, elems.get(i)); }
+            }
+            i = i + 1;
+        }
+    }
+    return out + "]";
+}
+
+/// ExecOutcome::Jump(-99): a builtin dispatcher did not know the name.
+fn outcome_is_unhandled(o: ExecOutcome) -> bool {
+    match o {
+        ExecOutcome::Jump(j) => { return j == -99; }
+        _ => {}
+    }
+    return false;
 }

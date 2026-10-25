@@ -1104,9 +1104,12 @@ return ParseResultConstDef::Ok(__ret_ConstDef);
 // Parse a module-level mutable global variable:
 // `var name: Type = expr;` or `var name: Type;` (zero-initialized)
 fn parse_global_var(self: &mut Parser) -> ParseResultGlobalVar {
-match self.expect(TokenKind::Var, "var") {
-    ParseResultUnit::Err(e) => { return ParseResultGlobalVar::Err(e); }
-    ParseResultUnit::Ok => {}
+// Accept either `var` or `static` (static is an alias for var).
+if !self.match_tok(TokenKind::Var) {
+    match self.expect(TokenKind::Static, "var or static") {
+        ParseResultUnit::Err(e) => { return ParseResultGlobalVar::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
 }
 var name: str = "";
 match self.expect_ident() {
@@ -1726,6 +1729,14 @@ if self.check(TokenKind::RParen) {
     return ParseResultParams::Ok(params);
 }
 loop {
+    // Optional @annotations on the parameter (e.g. @secret, @tainted)
+    var param_annotations: Vec<Annotation> = Vec::new();
+    while self.check(TokenKind::At) {
+        match self.parse_at_annotation() {
+            ParseResultAnnotation::Ok(ann) => { param_annotations.push(ann); }
+            ParseResultAnnotation::Err(e) => { return ParseResultParams::Err(e); }
+        }
+    }
     // Check for variadic: ... before the parameter name
     var is_variadic: bool = false;
     if self.match_tok(TokenKind::DotDotDot) {
@@ -1739,6 +1750,7 @@ loop {
     if name == "self" && !self.check(TokenKind::Colon) {
         var param: Param = Param_new("self", Type::Named("Self"), false);
         param.is_variadic = is_variadic;
+        param.annotations = param_annotations;
         params.push(param);
     } else {
         match self.expect(TokenKind::Colon, ":") {
@@ -1752,6 +1764,7 @@ loop {
         }
         var param: Param = Param_new(name, ty, false);
         param.is_variadic = is_variadic;
+        param.annotations = param_annotations;
         // Check for default value: = expr
         if self.match_tok(TokenKind::Eq) {
             match self.parse_expr() {
