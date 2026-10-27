@@ -1,5 +1,60 @@
 # Fides Language Changelog
 
+## Session 34 — Every Test Passes on the Self-Hosted Compiler (Oct 27, 2026)
+
+The self-hosted compiler now matches `fidesc` on all 302 test programs with
+`run`, and on 242 of 243 with `ccompile` (`test_sqlite` needs libsqlite3,
+which is not installed here; the Rust compiler fails the same way). All 59
+expected-fail tests are rejected, and all 10 examples run identically.
+
+**Self-hosted compiler fixes:**
+
+- `@conserve` only checked effects. It now also rejects calls to functions
+  that are not @conserve, calls that create Money, and floating point, with
+  the Rust compiler's messages (`test_money_conserve_fail` was accepted).
+- A second `impl` block of a struct in an imported module was dropped:
+  `merge_programs` shares `merged.impls` with `user.impls`, so the first
+  pushed impl made the second look like a user impl. The typechecker also
+  did not add a second block's methods to the struct's method map. Both
+  fixed (`test_sqlite`: "no method 'exec' on struct 'SQLite'").
+- `ccompile` did not link the libraries of `extern "C" link "lib"` blocks
+  (the `// PLINK:` lines of the generated C), as `fidesc ccompile` does.
+
+**Rust compiler fix:**
+
+- `p_tensor_to_json` in the C runtime printed non-integral values with `%g`
+  (`1.523e-08` where the interpreter prints `0.00000001522997951276035`)
+  and wrote into a fixed 128-byte buffer, overflowing it for tensors of more
+  than about 15 values. It now matches the interpreter and grows the buffer
+  (`examples/neural_network.fd` differed on C).
+
+**Tests that could never match, now real tests:**
+
+- `test_dp` printed random noise; it now checks that noise was added and
+  stays within 10 sigma.
+- `bench_stringbuilder` printed timings; they go to stderr, so stdout is the
+  same on every run.
+- `test_token_full` had no `main` (a copy of the token module); it now has a
+  test driver.
+- These three left the skip lists of `fidesc test` and `cargo test`.
+- `examples/riscv_blink.fd` used `val val = ...` (a keyword as a name) and
+  reassigned `val` bindings; it now uses `var`.
+
+**The release compiler is `fid.exe`:**
+
+- `RELEASE=1 ./scripts/bootstrap.sh` writes the verified stage-3 compiler to
+  `release/fid.exe` (was `release/fides-c3.exe`) and smoke-tests it as `fid`
+  from an installed layout.
+- The installer ships it as `fid.exe` (was `fides.exe`), beside
+  `fidesc.exe`; `.fd` files open with it, and the uninstaller also removes a
+  `fides.exe` left by v1.0.0.
+- The compiler's version and usage text call it `fid` (was `fides-c`).
+
+**Docs:** README, CURRENT, CONTRIBUTING, INDEX, AGENTS and the reference
+docs describe the self-hosted compiler as the release compiler, with the
+current results; the stale "self-hosted binary crashes on the stdlib" notes
+are gone.
+
 ## Session 33 — The Self-Hosted Compiler Is the Release Compiler (Oct 25, 2026)
 
 ### `fides run` and `fides ccompile` now match the Rust compiler

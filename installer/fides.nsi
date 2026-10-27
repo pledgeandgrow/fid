@@ -45,7 +45,7 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 ; ─── Modern UI Settings ──────────────────────────────────────────────────
 
 !define MUI_ABORTWARNING
-!define MUI_FINISHPAGE_RUN "$INSTDIR\fides.exe"
+!define MUI_FINISHPAGE_RUN "$INSTDIR\fid.exe"
 !define MUI_FINISHPAGE_RUN_PARAMETERS "--version"
 
 ; ─── Pages ────────────────────────────────────────────────────────────────
@@ -74,9 +74,9 @@ Section "Fides Compiler (required)" SecCore
   SetOutPath "$INSTDIR"
 
   ; The self-hosted compiler (written in Fides, compiled by itself to the
-  ; fixpoint by scripts/bootstrap.sh) as fides.exe. It finds the standard
+  ; fixpoint by scripts/bootstrap.sh) as fid.exe. It finds the standard
   ; library in $INSTDIR\stdlib.
-  File /oname=fides.exe "..\release\fides-c3.exe"
+  File "..\release\fid.exe"
 
   ; The Rust bootstrap compiler (fidesc.exe), plus the companion tools.
   ; Stage them in release\ first (build-installer.sh / build-installer.yml do).
@@ -95,7 +95,7 @@ Section "Fides Compiler (required)" SecCore
   ; Write uninstall info
   WriteRegStr HKLM "${PRODUCT_UNINST_KEY}" "DisplayName" "Fides Language"
   WriteRegStr HKLM "${PRODUCT_UNINST_KEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'
-  WriteRegStr HKLM "${PRODUCT_UNINST_KEY}" "DisplayIcon" '"$INSTDIR\fides.exe"'
+  WriteRegStr HKLM "${PRODUCT_UNINST_KEY}" "DisplayIcon" '"$INSTDIR\fid.exe"'
   WriteRegStr HKLM "${PRODUCT_UNINST_KEY}" "DisplayVersion" "${VERSION}"
   WriteRegStr HKLM "${PRODUCT_UNINST_KEY}" "Publisher" "${PRODUCT_PUBLISHER}"
   WriteRegStr HKLM "${PRODUCT_UNINST_KEY}" "URLInfoAbout" "${PRODUCT_URL}"
@@ -160,8 +160,8 @@ Section "Associate .fd files" SecAssoc
   ; Register .fd extension
   WriteRegStr HKCR ".fd" "" "Fides.SourceFile"
   WriteRegStr HKCR "Fides.SourceFile" "" "Fides Source File"
-  WriteRegStr HKCR "Fides.SourceFile\shell\open\command" "" '"$INSTDIR\fides.exe" "%1"'
-  WriteRegStr HKCR "Fides.SourceFile\DefaultIcon" "" '"$INSTDIR\fides.exe",0'
+  WriteRegStr HKCR "Fides.SourceFile\shell\open\command" "" '"$INSTDIR\fid.exe" "%1"'
+  WriteRegStr HKCR "Fides.SourceFile\DefaultIcon" "" '"$INSTDIR\fid.exe",0'
   DetailPrint "Associated .fd files with Fides"
 SectionEnd
 
@@ -169,8 +169,8 @@ SectionEnd
 
 Section "Start Menu Shortcuts" SecShortcuts
   CreateDirectory "$SMPROGRAMS\Fides"
-  CreateShortcut "$SMPROGRAMS\Fides\Fides Compiler.lnk" "$INSTDIR\fides.exe" \
-    "" "$INSTDIR\fides.exe" 0
+  CreateShortcut "$SMPROGRAMS\Fides\Fides Compiler.lnk" "$INSTDIR\fid.exe" \
+    "" "$INSTDIR\fid.exe" 0
   CreateShortcut "$SMPROGRAMS\Fides\Uninstall Fides.lnk" "$INSTDIR\uninstall.exe" \
     "" "" 0
   DetailPrint "Created Start Menu shortcuts"
@@ -178,7 +178,7 @@ SectionEnd
 
 ; ─── Section Descriptions ────────────────────────────────────────────────
 
-LangString DESC_Core ${LANG_ENGLISH} "The Fides compiler (fides.exe / fidesc.exe) and the companion tools ark, scribe, and veil. Required."
+LangString DESC_Core ${LANG_ENGLISH} "The Fides compiler (fid.exe / fidesc.exe) and the companion tools ark, scribe, and veil. Required."
 LangString DESC_Stdlib ${LANG_ENGLISH} "Standard library modules (core, vec, string, math, etc.)."
 LangString DESC_Runtime ${LANG_ENGLISH} "C runtime files for SDL, audio, networking."
 LangString DESC_Docs ${LANG_ENGLISH} "Language reference, guides, and roadmap documentation."
@@ -200,6 +200,8 @@ LangString DESC_Shortcuts ${LANG_ENGLISH} "Create Start Menu shortcuts for Fides
 
 Section "Uninstall"
   ; Remove files
+  Delete "$INSTDIR\fid.exe"
+  ; fides.exe: the name in v1.0.0
   Delete "$INSTDIR\fides.exe"
   Delete "$INSTDIR\fidesc.exe"
   Delete "$INSTDIR\ark.exe"

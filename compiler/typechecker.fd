@@ -1064,16 +1064,34 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
             map_str_str_set(self.item_modules, mangled, module);
             mi = mi + 1;
         }
-        // Don't overwrite if struct already has methods from another module
-        var existing: OptMethodMap = map_methods_get(self.methods, struct_name);
-        match existing {
-            OptMethodMap::Some(_) => {
-                // Merge -- add new methods to existing map
-                // (simplified: just push the new map if not present)
+        // A second `impl` block for the struct adds its methods to the
+        // existing map (a method already there keeps its first definition).
+        var found: bool = false;
+        var mi2: i64 = 0;
+        while mi2 < self.methods.len() {
+            if self.methods.get(mi2).key == struct_name {
+                var existing_val: Vec<MethodMapEntry> = self.methods.get(mi2).val;
+                var ni: i64 = 0;
+                while ni < method_entries.len() {
+                    var have: bool = false;
+                    var ei: i64 = 0;
+                    while ei < existing_val.len() {
+                        if existing_val.get(ei).key == method_entries.get(ni).key { have = true; }
+                        ei = ei + 1;
+                    }
+                    if !have { existing_val.push(method_entries.get(ni)); }
+                    ni = ni + 1;
+                }
+                var m_entry: StringMethodMap = self.methods.get(mi2);
+                m_entry.val = existing_val;
+                self.methods.set(mi2, m_entry);
+                found = true;
+                break;
             }
-            OptMethodMap::None => {
-                self.methods.push(StringMethodMap_new(struct_name, method_entries));
-            }
+            mi2 = mi2 + 1;
+        }
+        if !found {
+            self.methods.push(StringMethodMap_new(struct_name, method_entries));
         }
         impi = impi + 1;
     }
@@ -1822,28 +1840,14 @@ pub fn TypeChecker_verify_deterministic(self: &mut TypeChecker, program: Program
 // uses these annotations without false rejections.
 
 pub fn TypeChecker_verify_conserve(self: &mut TypeChecker, program: Program) {
-    // @conserve: energy/money conservation
-    // Rejects IO/Net/Spawn/Diverge effects and floating-point usage.
+    // @conserve: money conservation (src/typechecker.rs verify_conserve).
+    // A @conserve function has no IO/Net/Spawn/Diverge effect, no floats,
+    // calls only @conserve functions and never a mint function.
+    var conserve_funcs: Vec<str> = Vec::new();
     var fi: i64 = 0;
     while fi < program.funcs.len() {
-        var func: Func = program.funcs.get(fi);
-        var is_conserve: bool = false;
-        var ai: i64 = 0;
-        while ai < func.annotations.len() {
-            if func.annotations.get(ai).name == "conserve" { is_conserve = true; }
-            ai = ai + 1;
-        }
-        if is_conserve {
-            var effects: Vec<str> = TypeChecker_get_func_effects(self, func.name);
-            var ei: i64 = 0;
-            while ei < effects.len() {
-                var eff: str = effects.get(ei);
-                if eff == "IO" || eff == "Net" || eff == "Spawn" || eff == "Diverge" {
-                    self.errors.push("Conservation error: function '" + func.name + "' is @conserve but has effect '!" + eff + "'");
-                }
-                ei = ei + 1;
-            }
-        }
+        var f: Func = program.funcs.get(fi);
+        if tc_has_conserve(f) { conserve_funcs.push(f.name); }
         fi = fi + 1;
     }
     var ii: i64 = 0;
@@ -1851,29 +1855,197 @@ pub fn TypeChecker_verify_conserve(self: &mut TypeChecker, program: Program) {
         var imp: ImplDef = program.impls.get(ii);
         var mi: i64 = 0;
         while mi < imp.methods.len() {
-            var method: Func = imp.methods.get(mi);
-            var is_conserve: bool = false;
-            var ai: i64 = 0;
-            while ai < method.annotations.len() {
-                if method.annotations.get(ai).name == "conserve" { is_conserve = true; }
-                ai = ai + 1;
+            var m: Func = imp.methods.get(mi);
+            if tc_has_conserve(m) { conserve_funcs.push(imp.struct_name + "::" + m.name); }
+            mi = mi + 1;
+        }
+        ii = ii + 1;
+    }
+    var ti: i64 = 0;
+    while ti < program.trait_impls.len() {
+        var timp: TraitImpl = program.trait_impls.get(ti);
+        var mi: i64 = 0;
+        while mi < timp.methods.len() {
+            var m: Func = timp.methods.get(mi);
+            if tc_has_conserve(m) { conserve_funcs.push(timp.trait_name + "::" + m.name); }
+            mi = mi + 1;
+        }
+        ti = ti + 1;
+    }
+
+    fi = 0;
+    while fi < program.funcs.len() {
+        var func: Func = program.funcs.get(fi);
+        if tc_has_conserve(func) {
+            // 1. Effects
+            var effects: Vec<str> = TypeChecker_get_func_effects(self, func.name);
+            var ei: i64 = 0;
+            while ei < effects.len() {
+                var eff: str = effects.get(ei);
+                if eff == "IO" || eff == "Net" || eff == "Spawn" || eff == "Diverge" {
+                    self.errors.push("Conservation error: function '" + func.name + "' is @conserve but has effect '!" + eff + "'.\n    @conserve functions must not interact with external state —\n    IO/Net can bring in external money, Spawn introduces concurrency,\n    Diverge introduces control flow uncertainty.\n    Fix: remove the @conserve annotation, or remove the '!" + eff + "' effect.");
+                }
+                ei = ei + 1;
             }
-            if is_conserve {
+            // 2. No floating-point
+            var fp: Vec<str> = tc_conserve_floats(func);
+            if fp.len() > 0 {
+                self.errors.push("Conservation error: function '" + func.name + "' is @conserve but uses floating-point.\n    Floating-point arithmetic is not exact — money could be lost\n    to rounding errors, violating conservation.\n    Found float in: " + tc_join(fp, ", ") + ".\n    Fix: use integer arithmetic (fixed-point with i64) instead.");
+            }
+            // 3. Every called function is @conserve
+            var called: Vec<str> = tc_conserve_calls(func);
+            var ci: i64 = 0;
+            while ci < called.len() {
+                var c: str = called.get(ci);
+                if !tc_vec_contains_str(conserve_funcs, c) && TypeChecker_has_func(self, c) {
+                    self.errors.push("Conservation error: function '" + func.name + "' is @conserve but calls '" + c + "',\n    which is not @conserve.\n    A @conserve function can only call other @conserve functions —\n    otherwise the callee could create or destroy money.\n    Fix: add @conserve to '" + c + "', or remove the call from '" + func.name + "'.");
+                }
+                ci = ci + 1;
+            }
+            // 4. No mint function
+            ci = 0;
+            while ci < called.len() {
+                var c: str = called.get(ci);
+                if tc_is_mint_call(c) {
+                    self.errors.push("Conservation error: function '" + func.name + "' is @conserve but calls '" + c + "',\n    which creates new Money. @conserve functions cannot mint money —\n    they can only move, split, and merge existing Money.\n    Fix: remove the @conserve annotation, or remove the mint call.");
+                }
+                if c == "Money::new" || c == "Money::from_cents" {
+                    self.errors.push("Conservation error: function '" + func.name + "' is @conserve but calls '" + c + "',\n    which creates new Money. @conserve functions cannot mint money.\n    Fix: remove the @conserve annotation, or remove the mint call.");
+                }
+                ci = ci + 1;
+            }
+        }
+        fi = fi + 1;
+    }
+
+    ii = 0;
+    while ii < program.impls.len() {
+        var imp: ImplDef = program.impls.get(ii);
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            var method: Func = imp.methods.get(mi);
+            if tc_has_conserve(method) {
                 var qname: str = imp.struct_name + "::" + method.name;
                 var effects: Vec<str> = TypeChecker_get_func_effects(self, qname);
                 var ei: i64 = 0;
                 while ei < effects.len() {
                     var eff: str = effects.get(ei);
                     if eff == "IO" || eff == "Net" || eff == "Spawn" || eff == "Diverge" {
-                        self.errors.push("Conservation error: method '" + qname + "' is @conserve but has effect '!" + eff + "'");
+                        self.errors.push("Conservation error: method '" + qname + "' is @conserve but has effect '!" + eff + "'.");
                     }
                     ei = ei + 1;
+                }
+                var fp: Vec<str> = tc_conserve_floats(method);
+                if fp.len() > 0 {
+                    self.errors.push("Conservation error: method '" + qname + "' is @conserve but uses floating-point. Found: " + tc_join(fp, ", ") + ".");
+                }
+                var called: Vec<str> = tc_conserve_calls(method);
+                var ci: i64 = 0;
+                while ci < called.len() {
+                    var c: str = called.get(ci);
+                    if c == "Money::new" || c == "Money::from_cents" {
+                        self.errors.push("Conservation error: method '" + qname + "' is @conserve but calls mint function '" + c + "'.");
+                    }
+                    if TypeChecker_has_func(self, c) && !tc_vec_contains_str(conserve_funcs, c) {
+                        self.errors.push("Conservation error: method '" + qname + "' is @conserve but calls '" + c + "', which is not @conserve.");
+                    }
+                    ci = ci + 1;
                 }
             }
             mi = mi + 1;
         }
         ii = ii + 1;
     }
+}
+
+fn tc_join(v: Vec<str>, sep: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { out = out + sep; }
+        out = out + v.get(i);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn tc_has_conserve(f: Func) -> bool {
+    var ai: i64 = 0;
+    while ai < f.annotations.len() {
+        if f.annotations.get(ai).name == "conserve" { return true; }
+        ai = ai + 1;
+    }
+    return false;
+}
+
+fn TypeChecker_has_func(self: &TypeChecker, name: str) -> bool {
+    match TypeChecker_lookup_func_cache(self, name) {
+        OptFuncSig::Some(_) => { return true; }
+        OptFuncSig::None => { return false; }
+    }
+    return false;
+}
+
+// The functions a @conserve body calls, each once, minus runtime builtins
+// (p_*) and printing.
+fn tc_conserve_calls(f: Func) -> Vec<str> {
+    var raw: Vec<str> = Vec::new();
+    scan_stmts_for_calls(f.body, raw);
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < raw.len() {
+        var c: str = raw.get(i);
+        var skip: bool = str_starts_with(c, "p_") || c == "print" || c == "println" || c == "print_str" || c == "print_nl" || c == "print_int" || c == "print_map" || c == "print_vec";
+        if !skip && !tc_vec_contains_str(out, c) { out.push(c); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn tc_is_mint_call(c: str) -> bool {
+    if c == "Money::new" || c == "Money::from_cents" { return true; }
+    return str_ends_with(c, "::Money::new") || str_ends_with(c, "::Money::from_cents");
+}
+
+// Where a @conserve function uses floating point: its body, parameters
+// and return type.
+fn tc_conserve_floats(f: Func) -> Vec<str> {
+    var found: Vec<str> = scan_for_floats(f.body);
+    var pi: i64 = 0;
+    while pi < f.params.len() {
+        var p: Param = f.params.get(pi);
+        if tc_type_contains_float(p.ty) {
+            found.push("parameter '" + p.name + ": " + type_to_str(p.ty) + "'");
+        }
+        pi = pi + 1;
+    }
+    if tc_type_contains_float(f.ret_ty) {
+        found.push("return type '" + type_to_str(f.ret_ty) + "'");
+    }
+    return found;
+}
+
+fn tc_type_contains_float(ty: Type) -> bool {
+    match ty {
+        Type::F32 => { return true; }
+        Type::F64 => { return true; }
+        Type::Generic(_, args) => { return tc_types_contain_float(args); }
+        Type::Tuple(types) => { return tc_types_contain_float(types); }
+        Type::Func(params, ret) => {
+            return tc_types_contain_float(params) || tc_type_contains_float(box_type_unbox(ret));
+        }
+        _ => { return false; }
+    }
+    return false;
+}
+
+fn tc_types_contain_float(types: Vec<Type>) -> bool {
+    var i: i64 = 0;
+    while i < types.len() {
+        if tc_type_contains_float(types.get(i)) { return true; }
+        i = i + 1;
+    }
+    return false;
 }
 
 pub fn TypeChecker_verify_gas(self: &mut TypeChecker, program: Program) {

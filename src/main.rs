@@ -1786,8 +1786,6 @@ fn real_main() {
             // Skip list — tests that fail on C codegen due to missing builtins
             // or legitimate design differences. These pass on interpreter + PE.
             let skip_tests: &[&str] = &[
-                // Library modules with no main() — not standalone tests
-                "test_token_full",
                 // Harness tests that require file arguments — not standalone
                 "test_fmt_harness",
                 "test_lexer_harness",
@@ -1800,9 +1798,6 @@ fn real_main() {
             let c_skip_tests: &[&str] = &[
                 "test_kernel_serial",
                 "test_os_gaps",
-                // test_dp uses real PRNG noise (xorshift128+) — output is
-                // intentionally non-deterministic, so interp vs C can't match.
-                "test_dp",
                 // They print their own argv, which differs per backend.
                 "probe_argc",
                 "probe_argc2",

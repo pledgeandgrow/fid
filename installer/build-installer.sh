@@ -3,7 +3,7 @@
 #
 # Requirements:
 #   - NSIS 3.x installed (sudo apt install nsis on Ubuntu/Debian)
-#   - The self-hosted compiler at release/fides-c3.exe (built here when
+#   - The self-hosted compiler at release/fid.exe (built here when
 #     missing: RELEASE=1 ./scripts/bootstrap.sh, which needs
 #     target/release/fidesc and a C compiler)
 #   - stdlib/ and runtime/ directories present
@@ -37,19 +37,19 @@ fi
 echo "  OK: $(makensis /VERSION)"
 
 echo "[check] Compiler..."
-if [ ! -f "release/fides-c3.exe" ]; then
+if [ ! -f "release/fid.exe" ]; then
     # The self-hosted compiler: 3-stage bootstrap with a fixpoint check
-    echo "  release/fides-c3.exe not found: building it (scripts/bootstrap.sh)..."
+    echo "  release/fid.exe not found: building it (scripts/bootstrap.sh)..."
     if ! RELEASE=1 ./scripts/bootstrap.sh build/bootstrap 3; then
         echo "ERROR: the self-hosted build failed (see above)."
         exit 1
     fi
 fi
-echo "  OK: $(ls -lh release/fides-c3.exe | awk '{print $5}')"
+echo "  OK: $(ls -lh release/fid.exe | awk '{print $5}')"
 
 echo "[check] Companion tools (fidesc, ark, scribe, veil)..."
 # The installer ships the canonical fidesc.exe and the companion tools next
-# to fides.exe. Stage them from the Cargo build if they are not there yet.
+# to fid.exe. Stage them from the Cargo build if they are not there yet.
 for tool in fidesc ark scribe veil; do
     if [ ! -f "release/$tool.exe" ]; then
         if [ -f "target/release/$tool.exe" ]; then
@@ -123,7 +123,7 @@ if [ -f "$INSTALLER" ]; then
     echo "  Users can download and run this .exe to install Fides."
     echo "  It will:"
     echo "    - Install to C:\\Program Files\\Fides\\"
-    echo "    - Add fides.exe to PATH"
+    echo "    - Add fid.exe to PATH"
     echo "    - Associate .fd files"
     echo "    - Create Start Menu shortcuts"
     echo "    - Include uninstaller"

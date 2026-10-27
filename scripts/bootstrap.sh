@@ -5,8 +5,8 @@
 #   ./scripts/bootstrap.sh [out_dir] [stages]     (defaults: build/bootstrap, 3)
 #   RELEASE=1 ./scripts/bootstrap.sh              also install the verified
 #                                                 stage-3 compiler as
-#                                                 release/fides-c3(.exe) (what
-#                                                 the installer ships as fides)
+#                                                 release/fid(.exe) (what the
+#                                                 installer ships)
 #
 # Stage 0 is the Rust bootstrap compiler (target/release/fidesc). Each stage N
 # runs the previous compiler's `dump-c compiler/main.fd`, wraps `main` in a
@@ -107,19 +107,19 @@ fi
 if [ -n "${RELEASE:-}" ]; then
   if [ "$STAGES" -lt 3 ]; then echo "RELEASE needs 3 stages"; exit 1; fi
   mkdir -p release
-  cp "$OUT/fides-c3$EXE" "release/fides-c3$EXE"
-  # The installed layout: fides(.exe) with stdlib/ beside it, started by
+  cp "$OUT/fides-c3$EXE" "release/fid$EXE"
+  # The installed layout: fid(.exe) with stdlib/ beside it, started by
   # name from PATH, in a directory with no stdlib/
   smoke="$(pwd)/$OUT/smoke"
   rm -rf "$smoke"; mkdir -p "$smoke/install" "$smoke/work"
-  cp "release/fides-c3$EXE" "$smoke/install/fides$EXE"
+  cp "release/fid$EXE" "$smoke/install/fid$EXE"
   cp -r stdlib "$smoke/install/stdlib"
   cp tests/bootstrap/hello.fd "$smoke/work/hello.fd"
   expected=$("$STAGE0" run tests/bootstrap/hello.fd 2>/dev/null)
-  got=$(cd "$smoke/work" && PATH="$smoke/install:$PATH" fides run hello.fd 2>/dev/null)
+  got=$(cd "$smoke/work" && PATH="$smoke/install:$PATH" fid run hello.fd 2>/dev/null)
   if [ "$got" != "$expected" ]; then
-    echo "RELEASE FAILED: release/fides-c3$EXE run hello.fd printed '$got', expected '$expected'"
+    echo "RELEASE FAILED: release/fid$EXE run hello.fd printed '$got', expected '$expected'"
     exit 1
   fi
-  echo "RELEASE OK: release/fides-c3$EXE ($(wc -c < "release/fides-c3$EXE") bytes)"
+  echo "RELEASE OK: release/fid$EXE ($(wc -c < "release/fid$EXE") bytes)"
 fi

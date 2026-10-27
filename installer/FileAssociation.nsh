@@ -5,7 +5,7 @@
 ;   ${UnRegisterExtension}  - Remove association
 ;
 ; Usage:
-;   ${RegisterExtension} "$INSTDIR\fides.exe" ".fd" "Fides Source File"
+;   ${RegisterExtension} "$INSTDIR\fid.exe" ".fd" "Fides Source File"
 ;   ${UnRegisterExtension} ".fd" "Fides Source File"
 
 !ifndef FILEASSOCIATION_NSH

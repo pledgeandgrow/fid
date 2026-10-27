@@ -29,7 +29,6 @@ fn is_skip_test(name: &str) -> bool {
         | "test_kv_cache.fd"
         | "test_quantization.fd"
         | "test_checkpoint.fd"
-        | "test_dp.fd"
         | "test_shard.fd"
         | "test_lora.fd"
         | "test_simd.fd"
@@ -52,11 +51,6 @@ fn is_skip_test(name: &str) -> bool {
         | "test_phase8b.fd"
         | "test_vec_math.fd"
         | "test_vec_shape_fail.fd"
-        // Benchmark files produce timing-dependent output that differs
-        // between interpreter and native codegen — not correctness tests.
-        | "bench_stringbuilder.fd"
-        // A library module with no main(), not a standalone program.
-        | "test_token_full.fd"
         // Links SQLite, which Fides does not ship (`fidesc test` runs it
         // only with FIDES_TEST_EXTERNAL=1).
         | "test_sqlite.fd"
