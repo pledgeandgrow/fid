@@ -1,71 +1,490 @@
-// Pledge JSON standard library — Phase 5D.2
+// Fides JSON standard library
 //
-// JSON support for the "Web & Cloud" platform milestone.
-//
-// Design: JSON values are represented as strings (the serialized form) and
-// manipulated via builtin functions implemented natively in the compiler.
-// This avoids needing a recursive enum type in Pledge's current type system
-// (which doesn't yet support self-referential generics). When comptime
-// reflection (Phase 3A) lands, this will be replaced with a proper `Json`
-// ADT and comptime-derived serialization.
+// JSON values are represented as strings (the serialized form) and
+// manipulated via builtin functions plus a pure-Fides helper layer:
+//   - p_json_* builtins parse/dump/index natively (they PANIC on bad input)
+//   - this module adds a validator, an unescaper, key enumeration, typed
+//     getters, path access, and safe wrappers that never panic
 //
 // Builtins (implemented in interp.rs / codegen_c.rs / pe.rs):
-//   p_json_parse(s: str) -> str      — parse JSON, return canonical form
-//   p_json_dump(s: str) -> str       — alias for parse (canonicalize)
-//   p_json_get(s: str, key: str) -> str   — extract object field as string
-//   p_json_at(s: str, idx: i64) -> str    — extract array element as string
-//   p_json_type(s: str) -> str       — "object"|"array"|"string"|"number"|
-//                                       "boolean"|"null"
-//   p_json_len(s: str) -> i64        — object key count or array length
-//   p_json_pretty(s: str) -> str     — pretty-print with 2-space indent
+//   p_json_parse(s)  — parse JSON, return canonical form   (panics on bad)
+//   p_json_dump(s)   — alias for parse (canonicalize)      (panics on bad)
+//   p_json_get(s, k) — object field as JSON string         (panics on non-obj)
+//   p_json_at(s, i)  — array element as JSON string        (panics on OOB)
+//   p_json_type(s)   — "object"|"array"|"string"|"number"|"boolean"|"null"
+//   p_json_len(s)    — object key count or array length    (panics otherwise)
+//   p_json_pretty(s) — pretty-print with 2-space indent    (panics on bad)
+//   p_json_string(s) — escape + quote a plain string
+//
+// Rule: call json_is_valid() (pure Fides, never panics) before any p_json_*
+// builtin, or use the json_safe_* / typed helpers here which do it for you.
 
 module json;
 
+use vec;
+
+// ─── Pure-Fides JSON scanner ────────────────────────────────────────────
+// Position-based scanning over a str. Whitespace and literals per RFC 8259.
+
+fn j_ws(s: str, i: i64) -> i64 {
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if c == 32 || c == 9 || c == 10 || c == 13 { i = i + 1; } else { return i; }
+    }
+    return i;
+}
+
+fn j_lit(s: str, i: i64, lit: str) -> i64 {
+    // returns index past the literal, or -1 if it doesn't match
+    var k: i64 = 0;
+    while k < str_len(lit) {
+        if i + k >= str_len(s) { return -1; }
+        if str_byte_at(s, i + k) != str_byte_at(lit, k) { return -1; }
+        k = k + 1;
+    }
+    return i + k;
+}
+
+fn j_scan_str(s: str, i: i64) -> i64 {
+    // i at '"'; returns index past the closing quote, or -1 on malformed
+    if i >= str_len(s) || str_byte_at(s, i) != 34 { return -1; }
+    i = i + 1;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if c == 92 {
+            i = i + 2;  // skip escaped char (incl. uXXXX handled loosely: 'u' + next chars scanned as normal)
+            continue;
+        }
+        if c == 34 { return i + 1; }
+        if c < 32 { return -1; }  // control chars must be escaped
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn j_scan_num(s: str, i: i64) -> i64 {
+    var j: i64 = i;
+    if j < str_len(s) && str_byte_at(s, j) == 45 { j = j + 1; }
+    var digits: i64 = 0;
+    while j < str_len(s) && str_byte_at(s, j) >= 48 && str_byte_at(s, j) <= 57 {
+        j = j + 1;
+        digits = digits + 1;
+    }
+    if j < str_len(s) && str_byte_at(s, j) == 46 {
+        j = j + 1;
+        while j < str_len(s) && str_byte_at(s, j) >= 48 && str_byte_at(s, j) <= 57 {
+            j = j + 1;
+            digits = digits + 1;
+        }
+    }
+    if digits == 0 { return -1; }
+    if j < str_len(s) && (str_byte_at(s, j) == 101 || str_byte_at(s, j) == 69) {
+        j = j + 1;
+        if j < str_len(s) && (str_byte_at(s, j) == 43 || str_byte_at(s, j) == 45) { j = j + 1; }
+        var ed: i64 = 0;
+        while j < str_len(s) && str_byte_at(s, j) >= 48 && str_byte_at(s, j) <= 57 {
+            j = j + 1;
+            ed = ed + 1;
+        }
+        if ed == 0 { return -1; }
+    }
+    return j;
+}
+
+fn j_scan_val(s: str, i: i64) -> i64 {
+    var j: i64 = j_ws(s, i);
+    if j >= str_len(s) { return -1; }
+    var c: i64 = str_byte_at(s, j);
+    if c == 34 { return j_scan_str(s, j); }
+    if c == 91 { return j_scan_arr(s, j); }
+    if c == 123 { return j_scan_obj(s, j); }
+    if c == 116 { return j_lit(s, j, "true"); }
+    if c == 102 { return j_lit(s, j, "false"); }
+    if c == 110 { return j_lit(s, j, "null"); }
+    return j_scan_num(s, j);
+}
+
+fn j_scan_arr(s: str, i: i64) -> i64 {
+    // i at '['
+    var j: i64 = j_ws(s, i + 1);
+    if j < str_len(s) && str_byte_at(s, j) == 93 { return j + 1; }
+    while true {
+        j = j_scan_val(s, j);
+        if j < 0 { return -1; }
+        j = j_ws(s, j);
+        if j >= str_len(s) { return -1; }
+        var c: i64 = str_byte_at(s, j);
+        if c == 44 { j = j_ws(s, j + 1); continue; }
+        if c == 93 { return j + 1; }
+        return -1;
+    }
+    return -1;
+}
+
+fn j_scan_obj(s: str, i: i64) -> i64 {
+    // i at '{'
+    var j: i64 = j_ws(s, i + 1);
+    if j < str_len(s) && str_byte_at(s, j) == 125 { return j + 1; }
+    while true {
+        j = j_ws(s, j);
+        j = j_scan_str(s, j);
+        if j < 0 { return -1; }
+        j = j_ws(s, j);
+        if j >= str_len(s) || str_byte_at(s, j) != 58 { return -1; }
+        j = j_scan_val(s, j + 1);
+        if j < 0 { return -1; }
+        j = j_ws(s, j);
+        if j >= str_len(s) { return -1; }
+        var c: i64 = str_byte_at(s, j);
+        if c == 44 { continue; }
+        if c == 125 { return j + 1; }
+        return -1;
+    }
+    return -1;
+}
+
+/// True when `s` is well-formed JSON (RFC 8259 grammar, no trailing junk).
+/// Pure Fides — never panics. Call this before any p_json_* builtin.
+pub fn json_is_valid(s: str) -> bool {
+    var end: i64 = j_scan_val(s, 0);
+    if end < 0 { return false; }
+    return j_ws(s, end) == str_len(s);
+}
+
+// ─── Builtin wrappers (existing semantics preserved) ────────────────────
+
 /// Parse a JSON string and return its canonical (minified) form.
-/// Returns the empty string on parse error.
+/// PANICS on parse error — use json_parse_safe for a non-panicking version.
 pub fn json_parse(s: str) -> str {
     p_json_parse(s)
 }
 
-/// Serialize a Pledge string as a JSON string literal (with quotes and
-/// escaping). Useful for building JSON by hand.
+/// Serialize a plain string as a JSON string literal (quotes + escaping).
 pub fn json_string(s: str) -> str {
     p_json_string(s)
 }
 
 /// Extract a field from a JSON object. Returns the raw JSON value as a
-/// string (which may itself be an object, array, string, number, etc.).
-/// Returns the empty string if the key is not found or the input is not a
-/// JSON object.
+/// string, or "null" when the key is absent.
+/// PANICS if `s` is not a JSON object — use json_get_safe instead.
 pub fn json_get(s: str, key: str) -> str {
     p_json_get(s, key)
 }
 
-/// Extract an element from a JSON array by index. Returns the raw JSON
-/// value as a string. Returns the empty string if out of bounds or the
-/// input is not a JSON array.
+/// Extract an element from a JSON array by index.
+/// PANICS on out-of-bounds or non-array — use json_at_safe instead.
 pub fn json_at(s: str, idx: i64) -> str {
     p_json_at(s, idx)
 }
 
-/// Get the type name of a JSON value: "object", "array", "string",
-/// "number", "boolean", or "null". Returns "error" on parse failure.
+/// Type name of a JSON value. PANICS on invalid JSON — use
+/// json_type_safe / json_is_valid instead.
 pub fn json_type(s: str) -> str {
     p_json_type(s)
 }
 
-/// Get the length of a JSON object (key count) or array. Returns -1 on
-/// error or for non-collection types.
+/// Length of a JSON object or array. PANICS for scalar types —
+/// use json_len_safe instead.
 pub fn json_len(s: str) -> i64 {
     p_json_len(s)
 }
 
 /// Pretty-print a JSON string with 2-space indentation.
+/// PANICS on invalid JSON.
 pub fn json_pretty(s: str) -> str {
     p_json_pretty(s)
 }
 
-/// Build a JSON object from a key and value. Returns {"key":value}.
+/// Build a JSON object from a key and raw JSON value. Returns {"key":value}.
 pub fn json_pair(key: str, value: str) -> str {
-    return "{\"" + key + "\":" + value + "}";
+    return "{" + json_string(key) + ":" + value + "}";
+}
+
+// ─── Safe wrappers (never panic) ────────────────────────────────────────
+
+/// Canonicalize `s`, or "" when it is not valid JSON.
+pub fn json_parse_safe(s: str) -> str {
+    if !json_is_valid(s) { return ""; }
+    return p_json_parse(s);
+}
+
+/// Type name of a JSON value, or "error" when `s` is not valid JSON.
+pub fn json_type_safe(s: str) -> str {
+    if !json_is_valid(s) { return "error"; }
+    return p_json_type(s);
+}
+
+/// Field of a JSON object as raw JSON text; "" on any failure.
+pub fn json_get_safe(s: str, key: str) -> str {
+    if json_type_safe(s) != "object" { return ""; }
+    return p_json_get(s, key);
+}
+
+/// Element of a JSON array as raw JSON text; "" on any failure.
+pub fn json_at_safe(s: str, idx: i64) -> str {
+    if json_type_safe(s) != "array" { return ""; }
+    if idx < 0 || idx >= p_json_len(s) { return ""; }
+    return p_json_at(s, idx);
+}
+
+/// Length of a JSON object/array; -1 otherwise.
+pub fn json_len_safe(s: str) -> i64 {
+    var t: str = json_type_safe(s);
+    if t != "object" && t != "array" { return -1; }
+    return p_json_len(s);
+}
+
+/// Pretty-print, or "" on invalid JSON.
+pub fn json_pretty_safe(s: str) -> str {
+    if !json_is_valid(s) { return ""; }
+    return p_json_pretty(s);
+}
+
+// ─── Unescape / typed getters ───────────────────────────────────────────
+
+/// Decode a JSON string literal (with surrounding quotes) to plain text.
+/// Handles \" \\ \/ \n \r \t \b \f and \uXXXX (via UTF-8 encoding).
+/// On malformed input returns the input unchanged.
+pub fn json_unescape(lit: str) -> str {
+    var n: i64 = str_len(lit);
+    if n < 2 || str_byte_at(lit, 0) != 34 || str_byte_at(lit, n - 1) != 34 {
+        return lit;
+    }
+    var out: str = "";
+    var i: i64 = 1;
+    while i < n - 1 {
+        var c: i64 = str_byte_at(lit, i);
+        if c != 92 {
+            out = out + str_slice(lit, i, i + 1);
+            i = i + 1;
+            continue;
+        }
+        i = i + 1;
+        if i >= n - 1 { return lit; }
+        var e: i64 = str_byte_at(lit, i);
+        if e == 110 { out = out + "\n"; }
+        else if e == 116 { out = out + "\t"; }
+        else if e == 114 { out = out + "\r"; }
+        else if e == 98 { out = out + char_to_str(8); }
+        else if e == 102 { out = out + char_to_str(12); }
+        else if e == 117 {
+            // \uXXXX — hex codepoint, encode as UTF-8 bytes
+            var cp: i64 = 0;
+            var k: i64 = 1;
+            var ok: bool = true;
+            while k <= 4 {
+                if i + k > n - 1 { ok = false; break; }
+                var h: i64 = str_byte_at(lit, i + k);
+                var d: i64 = -1;
+                if h >= 48 && h <= 57 { d = h - 48; }
+                if h >= 97 && h <= 102 { d = h - 87; }
+                if h >= 65 && h <= 70 { d = h - 55; }
+                if d < 0 { ok = false; break; }
+                cp = cp * 16 + d;
+                k = k + 1;
+            }
+            if !ok { return lit; }
+            out = out + char_to_str(cp);
+            i = i + 4;
+        }
+        else { out = out + str_slice(lit, i, i + 1); }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Field of an object as a plain (unescaped) string; "" when the field is
+/// missing, not a string, or the input is invalid.
+pub fn json_get_str(s: str, key: str) -> str {
+    var v: str = json_get_safe(s, key);
+    if json_type_safe(v) != "string" { return ""; }
+    return json_unescape(v);
+}
+
+/// Field of an object as an integer; `def` when missing/not a number.
+pub fn json_get_int(s: str, key: str, def: i64) -> i64 {
+    var v: str = json_get_safe(s, key);
+    if json_type_safe(v) != "number" { return def; }
+    return str_parse_int(v);
+}
+
+/// Field of an object as a float; `def` when missing/not a number.
+pub fn json_get_num(s: str, key: str, def: f64) -> f64 {
+    var v: str = json_get_safe(s, key);
+    if json_type_safe(v) != "number" { return def; }
+    return str_parse_float(v);
+}
+
+/// Field of an object as a bool; `def` when missing/not a boolean.
+pub fn json_get_bool(s: str, key: str, def: bool) -> bool {
+    var v: str = json_get_safe(s, key);
+    if str_equal(v, "true") { return true; }
+    if str_equal(v, "false") { return false; }
+    return def;
+}
+
+/// True when `key` exists on object `s` (even if its value is null).
+pub fn json_has(s: str, key: str) -> bool {
+    var keys: Vec = json_keys(s);
+    var i: i64 = 0;
+    while i < keys.len() {
+        var k: str = keys.get(i);
+        if str_equal(k, key) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Array element as a plain string; "" when out of bounds or not a string.
+pub fn json_at_str(s: str, idx: i64) -> str {
+    var v: str = json_at_safe(s, idx);
+    if json_type_safe(v) != "string" { return ""; }
+    return json_unescape(v);
+}
+
+/// Array element as an integer; `def` otherwise.
+pub fn json_at_int(s: str, idx: i64, def: i64) -> i64 {
+    var v: str = json_at_safe(s, idx);
+    if json_type_safe(v) != "number" { return def; }
+    return str_parse_int(v);
+}
+
+// ─── Key enumeration ────────────────────────────────────────────────────
+
+/// Top-level keys of a JSON object as a Vec of plain strings, in document
+/// order. Empty Vec when `s` is not an object.
+pub fn json_keys(s: str) -> Vec {
+    var out: Vec = Vec::new();
+    var i: i64 = j_ws(s, 0);
+    if i >= str_len(s) || str_byte_at(s, i) != 123 { return out; }
+    var j: i64 = j_ws(s, i + 1);
+    if j < str_len(s) && str_byte_at(s, j) == 125 { return out; }
+    while j < str_len(s) {
+        j = j_ws(s, j);
+        if j >= str_len(s) || str_byte_at(s, j) != 34 { return Vec::new(); }
+        var kend: i64 = j_scan_str(s, j);
+        if kend < 0 { return Vec::new(); }
+        out.push(json_unescape(str_slice(s, j, kend)));
+        j = j_ws(s, kend);
+        if j >= str_len(s) || str_byte_at(s, j) != 58 { return Vec::new(); }
+        j = j_scan_val(s, j + 1);
+        if j < 0 { return Vec::new(); }
+        j = j_ws(s, j);
+        if j >= str_len(s) { return Vec::new(); }
+        var c: i64 = str_byte_at(s, j);
+        if c == 44 { j = j + 1; continue; }
+        if c == 125 { return out; }
+        return Vec::new();
+    }
+    return Vec::new();
+}
+
+/// Top-level elements of a JSON array as a Vec of raw JSON strings.
+/// Empty Vec when `s` is not an array.
+pub fn json_items(s: str) -> Vec {
+    var out: Vec = Vec::new();
+    var i: i64 = j_ws(s, 0);
+    if i >= str_len(s) || str_byte_at(s, i) != 91 { return out; }
+    var j: i64 = j_ws(s, i + 1);
+    if j < str_len(s) && str_byte_at(s, j) == 93 { return out; }
+    while j < str_len(s) {
+        var vstart: i64 = j_ws(s, j);
+        var vend: i64 = j_scan_val(s, vstart);
+        if vend < 0 { return Vec::new(); }
+        out.push(str_slice(s, vstart, vend));
+        j = j_ws(s, vend);
+        if j >= str_len(s) { return Vec::new(); }
+        var c: i64 = str_byte_at(s, j);
+        if c == 44 { j = j + 1; continue; }
+        if c == 93 { return out; }
+        return Vec::new();
+    }
+    return Vec::new();
+}
+
+// ─── Path access ────────────────────────────────────────────────────────
+
+/// Navigate a dot-separated path: "a.b.0.c" reads field a, then b, then
+/// array index 0, then c. Returns raw JSON text or "" on any miss.
+pub fn json_path(s: str, path: str) -> str {
+    var cur: str = s;
+    var segs: Vec = str_split(path, ".");
+    var i: i64 = 0;
+    while i < segs.len() {
+        var seg: str = segs.get(i);
+        var t: str = json_type_safe(cur);
+        if t == "object" {
+            cur = json_get_safe(cur, seg);
+        } else if t == "array" {
+            var idx: i64 = str_parse_int(seg);
+            cur = json_at_safe(cur, idx);
+        } else {
+            return "";
+        }
+        if str_len(cur) == 0 { return ""; }
+        i = i + 1;
+    }
+    return cur;
+}
+
+// ─── Builders ───────────────────────────────────────────────────────────
+
+/// Set (or replace) field `key` on JSON object `obj` with raw JSON `value`.
+/// Works on any valid object text; returns obj unchanged if invalid.
+pub fn json_obj_set(obj: str, key: str, value: str) -> str {
+    if json_type_safe(obj) != "object" { return obj; }
+    if json_has(obj, key) {
+        // Replace: rebuild the object text around the existing pair.
+        // Find "key"(ws): and splice the new raw value in.
+        var needle: str = json_string(key);
+        var pos: i64 = str_find(obj, needle);
+        if pos >= 0 {
+            var j: i64 = pos + str_len(needle);
+            j = j_ws(obj, j);
+            if j < str_len(obj) && str_byte_at(obj, j) == 58 {
+                var vend: i64 = j_scan_val(obj, j + 1);
+                if vend > 0 {
+                    return str_slice(obj, 0, j + 1) + " " + value + str_slice(obj, vend, str_len(obj));
+                }
+            }
+        }
+        return obj;
+    }
+    var trimmed: str = str_trim(obj);
+    if str_len(trimmed) < 2 { return obj; }
+    var inner: str = str_slice(trimmed, 1, str_len(trimmed) - 1);
+    inner = str_trim(inner);
+    var pair: str = json_string(key) + ":" + value;
+    if str_len(inner) == 0 {
+        return "{" + pair + "}";
+    }
+    return "{" + inner + "," + pair + "}";
+}
+
+/// Append raw JSON `value` to JSON array `arr`; returns arr if invalid.
+pub fn json_arr_push(arr: str, value: str) -> str {
+    if json_type_safe(arr) != "array" { return arr; }
+    var trimmed: str = str_trim(arr);
+    var inner: str = str_slice(trimmed, 1, str_len(trimmed) - 1);
+    inner = str_trim(inner);
+    if str_len(inner) == 0 {
+        return "[" + value + "]";
+    }
+    return "[" + inner + "," + value + "]";
+}
+
+/// Number literal for building JSON.
+pub fn json_num(n: i64) -> str {
+    return int_to_str(n);
+}
+
+/// Bool literal for building JSON.
+pub fn json_bool(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+/// Null literal.
+pub fn json_null() -> str {
+    return "null";
 }

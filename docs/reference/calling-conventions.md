@@ -7,7 +7,7 @@
 > **Last updated:** Sep 6, 2026 (session 16 — Tier 3 OS features added: @cpu_local, inline asm clobbers, --no-std, UEFI bindings)
 >
 > **Important:** Sections 3 and 5 were updated in session 14 to reflect the
-> **pointer-based enum payload approach** (COORDINATION.md [D1]). The old
+> **pointer-based enum payload approach** (selfhost.md § Coordination, decision D1). The old
 > inline-struct + `memcpy` approach has been superseded.
 
 ---
@@ -112,7 +112,7 @@ of `fname(&result, ...)`.
 
 ## 3. Enum Layout
 
-> **Updated session 14:** The pointer-based approach (COORDINATION.md [D1])
+> **Updated session 14:** The pointer-based approach (selfhost.md § Coordination, decision D1)
 > is now the canonical direction. Each payload field gets exactly 8 bytes
 > (a pointer), regardless of the field's actual type.
 

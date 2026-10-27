@@ -34,7 +34,8 @@ the packages (like crates). Package manifests are `ark.toml`, lock files are
 **Status: ✅ Implemented (Rust + self-hosted)** — Two implementations:
 - **Rust ark** (`src/ark.rs`, `src/bin/ark.rs`) — the bootstrap version
 - **Self-hosted ark** (`compiler/ark.fd`) — written in Fides, compiled by
-  the self-hosted compiler (`fides-c3.exe dump-c compiler/ark.fd`)
+  the self-hosted compiler (`fid ccompile compiler/ark.fd`, or
+  `fidesc dump-c compiler/ark.fd`)
 
 Supports path dependencies (files and directories), git dependencies (clone
 with `--depth 1`, branch/tag support), lock file generation, and a custom

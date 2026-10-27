@@ -1444,6 +1444,12 @@ const IMPORTS: &[&str] = &[
     "GetSystemTimeAsFileTime",
     "DeleteFileA",
     "GetFileAttributesA",
+    "GetCurrentProcessId",
+    "CreateDirectoryA",
+    "RemoveDirectoryA",
+    "FindFirstFileA",
+    "FindNextFileA",
+    "FindClose",
     "InitializeSRWLock",
     "AcquireSRWLockExclusive",
     "ReleaseSRWLockExclusive",
@@ -1475,6 +1481,7 @@ const MSVCRT_IMPORTS: &[&str] = &[
     "_snprintf", "putchar", "puts", "getchar",
     "fopen", "fclose", "fread", "fwrite", "fflush", "fgets", "fputs",
     "fseek", "ftell", "_fseeki64", "remove", "rename", "_access",
+    "system",
 ];
 
 /// The DLLs of the import table, in IAT order.

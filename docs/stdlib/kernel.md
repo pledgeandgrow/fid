@@ -1,5 +1,9 @@
 # kernel — Fides Documentation
 
+> **Moved (2026-10-24):** `stdlib/kernel.fd` moved out of this repo to the
+> separate **fides-os** project. The content below is historical and documents
+> the module as it existed before the move.
+
 ## Contents
 
 - [gdt_init_flat](#gdt_init_flat) (function)

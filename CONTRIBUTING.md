@@ -7,15 +7,17 @@ where a mistake can break every program silently.
 ## The two compilers
 
 Fides is self-hosted. The primary compiler is written in Fides
-(`compiler/*.fd`, 52 modules) and is what everyday work uses. A Rust
-implementation (`src/*.rs`) remains as the bootstrap reference and is only
-needed when the self-hosted compiler itself changes.
+(`compiler/*.fd`, 54 modules) and is the release compiler (the installer
+ships it as `fid.exe`). A Rust implementation (`src/*.rs`) remains as the
+bootstrap reference: it builds stage 1 of the self-hosted compiler and runs
+the test harness. Both give the same output on the test programs.
 
 | You want to…                                      | Use                                                     |
 | ------------------------------------------------- | ------------------------------------------------------- |
-| Write Fides programs, add tests, add stdlib modules | the self-hosted compiler (`release/fides-c3.exe`)     |
-| Build tools (`ark`, `scribe`, `veil`)             | the self-hosted compiler                                |
+| Write Fides programs, add tests, add stdlib modules | either compiler; check with `fidesc test`             |
+| Build tools (`ark`, `scribe`, `veil`)             | `cargo build --release`                                 |
 | Change the language or compiler internals         | the Rust compiler first, then port to `compiler/*.fd`   |
+| Check a `compiler/*.fd` change                    | `RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh` (fixpoint) |
 
 ## Setting up
 
@@ -58,10 +60,9 @@ lists them with the risk level of each. For those:
 1. Run `./verify.sh` first to confirm a clean baseline.
 2. Make the smallest possible change — one change, one commit, one
    verification run. Do not refactor while fixing.
-3. If a test regresses, `./scripts/bisect.sh <test>` tells you which stage
-   (lowering, PIR, codegen, peephole) is responsible.
-4. If you changed codegen, regalloc, peephole, or an emitter, regenerate the
-   golden files (`./scripts/gen_golden.sh`) so future bisects stay accurate.
+3. If a test regresses, bisect stages manually with the dump commands
+   (`fidesc dump-ir|dump-pir|dump-c`, `fidesc codegen`) — a bisect script
+   (`scripts/bisect.sh`) is planned but not yet written.
 5. Large changes go behind a flag so both paths can be tested before the old
    one is removed.
 

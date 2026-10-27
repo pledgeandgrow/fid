@@ -1964,6 +1964,39 @@ pub fn build_executable(source: &str, source_path: &str, target: &str, do_opt: b
     build_executable_with_level(source, source_path, target, level, false, granted_caps)
 }
 
+/// Targets on which `build_executable_with_level` runs the post-codegen
+/// constant-time verifier (`codegen_x64::verify_constant_time_asm`) and fails
+/// the build on violations. Other targets rely on the source-level check only.
+pub const POST_CODEGEN_CT_CHECK_TARGETS: &[&str] = &["x86-64"];
+
+/// Names of all `@constant_time` functions in a (post-monomorphization)
+/// program, using the same naming the lowering gives their assembly labels:
+/// free functions keep their name, impl/trait methods are `Type_method`.
+pub fn constant_time_function_names(program: &Program) -> Vec<String> {
+    let is_ct = |anns: &[crate::ast::Annotation]| anns.iter().any(|a| a.name == "constant_time");
+    let mut names = Vec::new();
+    for f in &program.funcs {
+        if is_ct(&f.annotations) {
+            names.push(f.name.clone());
+        }
+    }
+    for imp in &program.impls {
+        for m in &imp.methods {
+            if is_ct(&m.annotations) {
+                names.push(format!("{}_{}", imp.struct_name, m.name));
+            }
+        }
+    }
+    for ti in &program.trait_impls {
+        for m in &ti.methods {
+            if is_ct(&m.annotations) {
+                names.push(format!("{}_{}", ti.type_name, m.name));
+            }
+        }
+    }
+    names
+}
+
 /// Build a native executable with optional LTO (Link-Time Optimization).
 /// LTO mode uses more aggressive inline limits for cross-module inlining.
 pub fn build_executable_with_lto(source: &str, source_path: &str, target: &str, do_opt: bool, do_lto: bool, granted_caps: Option<&[String]>) -> Result<Vec<u8>, Vec<String>> {
@@ -1994,14 +2027,14 @@ pub fn build_executable_with_level(source: &str, source_path: &str, target: &str
     let cache = crate::inc::global_cache();
     let cached_l2 = cache.get(source_path, source_hash);
 
-    let (l2, module) = if let Some(cached) = cached_l2 {
+    let (l2, module, program) = if let Some(cached) = cached_l2 {
         // Cache hit: reuse the cached (already-optimized) L2 module.
         let mut module = lower::lower(&program);
         autograd::process_module(&mut module);
         if let Some(caps) = granted_caps {
             strip_ungranted_caps(&mut module, caps);
         }
-        (cached, module)
+        (cached, module, program)
     } else {
         // Cache miss: full pipeline.
         let mut module = lower::lower(&program);
@@ -2026,7 +2059,7 @@ pub fn build_executable_with_level(source: &str, source_path: &str, target: &str
         // Store the optimized L2 in the cache for future reuse.
         cache.store(source_path, source_hash, l2.clone());
 
-        (l2, module)
+        (l2, module, program)
     };
 
     let l3 = pir::lower_l2_to_l3(&l2, &module);
@@ -2038,6 +2071,17 @@ pub fn build_executable_with_level(source: &str, source_path: &str, target: &str
             // this catches redundant moves, zero idioms, dead stores, etc.
             // These are safe local transformations that don't affect semantics.
             let asm = crate::peephole::optimize(&asm);
+            // Post-codegen constant-time verification: scan the final text
+            // of every @constant_time function for branches, indexed loads,
+            // variable-latency instructions and unverified calls. This runs
+            // after peephole so it sees exactly what gets encoded.
+            let ct_funcs = constant_time_function_names(&program);
+            if !ct_funcs.is_empty() {
+                let violations = crate::codegen_x64::verify_constant_time_asm(&asm, &ct_funcs);
+                if !violations.is_empty() {
+                    return Err(violations.iter().map(|v| v.to_string()).collect());
+                }
+            }
             let obj = crate::elf64::emit_object_file(&l3, &asm)
                 .map_err(|e| vec![e])?;
             // Link with the pre-compiled Linux runtime (raw machine code)

@@ -1,20 +1,30 @@
 <h1 align="center">Fides Language — Self-Hosted Compiler</h1>
 
-**Fides is a self-hosted systems programming language.** The Fides compiler is written in Fides, compiles itself, and produces byte-identical output across generations (bootstrap fixpoint). The Rust compiler (`src/`) served as the bootstrap reference implementation and is no longer the primary development path — everyday work uses the self-hosted compiler (`compiler/*.fd`).
+**Fides is a self-hosted systems programming language.** The Fides compiler is written in Fides, compiles itself, and produces byte-identical output across generations (bootstrap fixpoint). It is the release compiler: the Windows installer ships it as `fid.exe`. The Rust compiler (`src/`) is the bootstrap reference implementation, used to build the self-hosted compiler and shipped beside it as `fidesc.exe`.
 
 The self-hosted compiler generates **native PE executables on Windows** and **C code** for portability. It includes a full IR interpreter, a PE emitter for direct native code generation, multi-arch assembly codegen (x86-64, ARM64, RISC-V), and a bare-metal flat binary mode for OS kernel development.
 
 ## Status
 
-**Self-Hosting — Bootstrap fixpoint achieved and verified.** The Fides compiler compiles itself to byte-identical C across generations: `fides-c2.c == fides-c3.c` (701,158 lines, 0 diffs). Three generations verified end-to-end. The self-hosted compiler is the primary tool for all everyday work.
+**Self-Hosting — Bootstrap fixpoint achieved and verified.** The Fides compiler compiles itself to byte-identical C across generations (stage 2 == stage 3, ~38 MB of C). `RELEASE=1 ./scripts/bootstrap.sh` checks this on every release build.
 
-**26 self-hosted modules** (61,885 LOC) in `compiler/*.fd` — lexer, parser, typechecker, borrow checker, monomorphizer, IR lowering, PIR optimizer (23 passes), C codegen, PE emitter, x86-64 codegen, register allocator, peephole optimizer, comptime evaluator, LSP server, formatter, diagnostics, JSON, incremental compilation, and the Ark package manager.
+**54 self-hosted modules** (104,439 LOC) in `compiler/*.fd` — lexer, parser, typechecker, borrow checker, escape analyzer, monomorphizer, IR lowering, PIR optimizer, C codegen, PE emitter, x86-64/ARM64/RISC-V codegen, register allocator, peephole optimizer, comptime evaluator, LSP server, formatter, diagnostics, JSON, incremental compilation, ELF/COFF/Mach-O writers, per-arch runtimes, and the Ark package manager.
 
-**Independent of Rust for everyday work.** The Rust compiler (`src/*.rs`) remains as the bootstrap reference and for adding new language features that require compiler internals changes. For writing programs, adding stdlib modules, adding tests, and building tools — use the self-hosted compiler directly.
+**The self-hosted compiler matches the Rust compiler.** Comparing their output test by test (Oct 27, 2026):
 
-**Test results:** 231/242 on interpreter, 213/242 C codegen matched, 233/242 PE emitter valid. 23/23 self-host tests pass. 265/265 unit tests. See `AGENTS.md` → "Current Baseline" for authoritative counts.
+| Self-hosted (`fid`) | Matches `fidesc` |
+|---|---|
+| `fid run` (interpreter) | all 302 test programs, all 10 examples |
+| `fid ccompile` (C backend) | 242 of 243 test programs (`test_sqlite` needs libsqlite3), 9 of 10 examples (`minimal_game` needs SDL2) |
+| Expected-fail tests | all 59 rejected |
 
-**Phase status:** See `docs/roadmap/roadmap.md` for full phase status. See `docs/roadmap/selfhost-roadmap.md` for the self-hosting plan.
+The Rust compiler passes its own suite on all three backends: interpreter 280/280, C 278/278, native Windows (PE) 282/282, expected-fail 59/59.
+
+**Limits:** the self-hosted `ccompile` and `build` go through C, so they need a C compiler (`$CC`, gcc, clang, `zig cc` or tcc). Its own native backend (`build --native`) is not working yet; for native Windows executables without a C compiler, use `fidesc emit`. See `AGENTS.md` → Known Bugs #1.
+
+**Test results:** See `AGENTS.md` → "Current Baseline" for authoritative counts (`tests/bootstrap/baseline/test_results.txt`).
+
+**Phase status:** See `docs/roadmap/roadmap.md` for the consolidated roadmap (features, release, self-host, limitations, opportunities).
 
 ### Financial Safety Features (New)
 
@@ -53,7 +63,7 @@ The self-hosted compiler generates **native PE executables on Windows** and **C 
 | Inline asm clobbers | `asm!("...", clobber("rax"))` | Clobber lists for inline assembly — compiler saves/restores clobbered registers |
 | No-stdlib mode | `--bare` / `--no-std` / `--no-stdlib` | Skips stdlib/core.fd entirely — zero hidden runtime dependencies for kernel/UEFI |
 | Cross-compilation dispatch | `--target arm64` / `--target riscv64` | Target validation with honest diagnostics, C codegen fallback |
-| UEFI boot services | `use uefi;` | `stdlib/uefi.fd` — AllocatePool, FreePool, GetMemoryMap, ExitBootServices, console output |
+| UEFI boot services | `use uefi;` | Moved to the `fides-os` project — AllocatePool, FreePool, GetMemoryMap, ExitBootServices, console output |
 
 ### What Works (Verified End-to-End)
 
@@ -194,53 +204,55 @@ The self-hosted compiler generates **native PE executables on Windows** and **C 
 
 - **ELF64 executable emission works on Linux** — `fidesc build <file> --target x86-64` produces working ELF64 executables directly (zero external tools). `fidesc codegen --elf <out.o>` emits valid relocatable objects (readelf compatible). `fidesc codegen --macho` and `--coff` also produce valid object files.
 - **Cross-compilation to ARM64, RISC-V, and Windows** — `fidesc build --target arm64-linux`, `--target riscv64-linux`, and `--target x86-64-windows` all produce valid executables with zero external tools. ARM64 and RISC-V use built-in instruction encoders (`arm64_enc.rs`, `riscv_enc.rs`) and runtime libraries (`runtime_arm64.rs`, `runtime_riscv.rs`) with raw Linux syscalls. Windows uses the PE emitter (`pe.rs`) with kernel32.dll imports.
-- **PE emitter targets Windows x64 only** — `fidesc emit` or `fidesc build --target x86-64-windows` produces PE32+ executables; tested via `fidesc test` (165/165 valid)
+- **PE emitter targets Windows x64 only** — `fidesc emit` or `fidesc build --target x86-64-windows` produces PE32+ executables; tested via `fidesc test` (282/282 match the interpreter)
 - **Register allocator** — Linear scan allocator with constant rematerialization (F-1A). Effect-aware allocation (F-1D): pure/@no-alloc calls only clobber RAX. Works correctly for all passing tests.
 - **Peephole optimizer always on** — 9 passes run automatically in the `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection
 - **L2 optimizer enabled by default** — PIR optimizer runs automatically in `build` (use `--no-opt` to disable) with 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. `--lto` enables aggressive cross-module inlining.
 - **`#[test]` attribute** — parsed but not executed by `fidesc test` (tests are file-based)
-- **C codegen coverage** — 164/165 normal tests match interpreter output (1 fail: test_compiler_sized, user-added). Phase 10B: Vec/HashMap/String now implemented in Fides stdlib using raw pointers. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack.
+- **C codegen coverage** — 278/278 normal tests match interpreter output. Phase 10B: Vec/HashMap/String now implemented in Fides stdlib using raw pointers. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack.
 - **214 compiler warnings** — dead code, unused variables (cleanup needed)
 
 ---
 
 ## Quick Start
 
-### Using the self-hosted compiler (everyday work)
+### Using the self-hosted compiler
 
 ```bash
-# The self-hosted compiler is in release/fides-c3.exe
-# It was built by the bootstrap chain and is byte-identical across generations
+# Installed: the installer puts fid.exe (self-hosted) and fidesc.exe
+# (Rust) on PATH, with the stdlib beside them.
+fid run      examples/json_parser.fd
+fid ccompile examples/json_parser.fd -o json_parser.exe   # needs a C compiler
 
-# Compile a Fides program to C, then to a native executable
-.\release\fides-c3.exe ccompile tests/bootstrap/hello.fd -o hello.exe
-
-# Run a Fides file in the IR interpreter
-.\release\fides-c3.exe run tests/bootstrap/hello.fd
-
-# Dump C code (for inspection or manual compilation)
-.\release\fides-c3.exe dump-c tests/bootstrap/hello.fd > hello.c
-
-# View tokens, AST, or IR
-.\release\fides-c3.exe tokens tests/bootstrap/hello.fd
-.\release\fides-c3.exe ast tests/bootstrap/hello.fd
-.\release\fides-c3.exe ir tests/bootstrap/hello.fd
-
-# Format a Fides source file
-.\release\fides-c3.exe fmt tests/bootstrap/hello.fd
-
-# Run the LSP server (for editor integration)
-.\release\fides-c3.exe lsp
+# From the repository: build it in 3 stages (checks the fixpoint) into
+# release/fid.exe
+cargo build --release
+RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh
+.\release\fid.exe run tests/bootstrap/hello.fd
 ```
 
-### Using the Rust bootstrap compiler (only when changing compiler internals)
+The self-hosted compiler finds the stdlib through `$FID_HOME/stdlib`,
+`<exe dir>/stdlib` or `<exe dir>/../stdlib`, so it runs from any folder.
+
+### Using the Rust bootstrap compiler
 
 ```bash
-# Build the Rust bootstrap compiler (only needed when compiler/*.fd changes)
+# Build the Rust bootstrap compiler
 cargo build --release
 
-# Generate the first-generation C from the Fides compiler source
-.\target\release\fidesc.exe dump-c compiler\main.fd > release\fides-c.c
+# Run / compile / inspect a Fides program
+.\target\release\fidesc.exe run      tests/bootstrap/hello.fd
+.\target\release\fidesc.exe ccompile tests/bootstrap/hello.fd -o hello.exe
+.\target\release\fidesc.exe dump-c   tests/bootstrap/hello.fd > hello.c
+.\target\release\fidesc.exe ir       tests/bootstrap/hello.fd
+.\target\release\fidesc.exe fmt      tests/bootstrap/hello.fd
+.\target\release\fidesc.exe lsp
+
+# Rebuild the self-hosted compiler: 3 stages + fixpoint → release/fid.exe
+RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh
+# or a single stage for development (dump-c + compile → release/fid.exe,
+# same name, no fixpoint check)
+./scripts/build-selfhost.sh
 
 # Build a native ELF64 executable on Linux (zero external tools needed)
 cargo run -- build tests/bootstrap/hello.fd -o hello
@@ -258,11 +270,10 @@ cargo run -- test
 
 | Task | Use | Why |
 |------|-----|-----|
-| Writing Fides programs | `fides-c3.exe` | Self-hosted, no Rust needed |
-| Adding stdlib modules | `fides-c3.exe` | Stdlib doesn't affect the compiler |
-| Adding tests | `fides-c3.exe` | Tests don't affect the compiler |
-| Building tools (ark, etc.) | `fides-c3.exe` | Tools are just Fides programs |
-| Changing `compiler/*.fd` | `fidesc.exe` (Rust) | Need to regenerate C1, then verify fixpoint |
+| Writing and running Fides programs | `fid.exe` (self-hosted) or `fidesc.exe` | Both give the same output |
+| Native Windows .exe with no C compiler | `fidesc.exe emit` | The self-hosted native backend is not working yet |
+| Adding stdlib modules, tests | either; run `fidesc test` | The test harness is in the Rust compiler |
+| Changing `compiler/*.fd` | `fidesc.exe` (Rust) to build stage 1 | Then `RELEASE=1 scripts/bootstrap.sh` to check the fixpoint |
 | Adding new language features | `fidesc.exe` (Rust) first, then port to `compiler/*.fd` | New features need both compilers |
 
 ### CLI Commands
@@ -282,7 +293,7 @@ cargo run -- test
 | `gpu <file.fd>` | SPIR-V GPU backend: PIR → SPIR-V binary |
 | `tokens <file.fd>` | Lex only — print token stream |
 | `ast <file.fd>` | Lex + parse — print AST tree |
-| `test` | Run all 159 normal tests across interpreter, PE emitter, and C codegen |
+| `test` | Run every test in `tests/bootstrap/` across interpreter, PE emitter, and C codegen (`--fail` for the expected-fail tests) |
 | `repl` | Interactive REPL — evaluate Fides expressions |
 | `verify <file.fd>` | Verify IR correctness (terminators, block refs, value refs) |
 | `sourcemap <file.fd>` | Show source map (IR value → source line mapping) |
@@ -314,25 +325,16 @@ The project includes automated verification scripts for ensuring correctness acr
 # Quick build check (no tests)
 ./verify.sh --quick
 
-# Bisect which compiler layer broke a test
-./scripts/bisect.sh <test_name>
-# Example: ./scripts/bisect.sh strings
-
-# Generate golden files for intermediate compiler stages
-./scripts/gen_golden.sh
+# Bisect which compiler layer broke a test — no script exists; do it manually:
+./target/release/fidesc dump-ir  tests/bootstrap/<name>.fd
+./target/release/fidesc dump-pir tests/bootstrap/<name>.fd 3
+./target/release/fidesc codegen  tests/bootstrap/<name>.fd --target x86-64 --peephole
 ```
 
-**Before making any change:** run `./verify.sh` to confirm you're starting from a known-good state. After changes, run `./verify.sh` again to check for regressions. If a test regresses, use `./scripts/bisect.sh <test_name>` to identify which compiler layer (lowering, PIR, codegen, or peephole) is responsible.
+**Before making any change:** run `./verify.sh` to confirm you're starting from a known-good state. After changes, run `./verify.sh` again to check for regressions. If a test regresses, bisect manually with the `dump-*`/`codegen` commands above to identify which compiler layer (lowering, PIR, codegen, or peephole) is responsible.
 
-Current baseline:
-```
-Unit tests:   265/265 passed  (All passing — incl. 47 cross-compilation encoder/runtime tests + 7 incremental compilation)
-Harness:      8/8 passed
-Interpreter:  164/165 normal
-C Codegen:    164/165 matched
-PE Emitter:   165/165 valid
-Cross-compilation: x86-64, ARM64, RISC-V, Windows — all producing valid executables
-```
+Current baseline is stored in `tests/bootstrap/baseline/test_results.txt` —
+`./verify.sh` prints the diff against it.
 
 ---
 
@@ -670,7 +672,7 @@ const MAX_PLAYERS: i32 = 64;
 | `spawn` | Task spawning | N/A |
 | `region` | Explicit memory region | `'a` lifetimes |
 
-See `docs/syntax-spec.md` for the complete syntax specification.
+See `docs/reference/syntax.md` for the complete syntax specification.
 
 ---
 
@@ -678,50 +680,43 @@ See `docs/syntax-spec.md` for the complete syntax specification.
 
 ```
 p-lang/
-├── compiler/               # 26 self-hosted Fides modules (61,885 LOC) — THE COMPILER
-│   ├── main.fd             # CLI entry point (23 commands: compile, run, dump-c, test, fmt, lsp, etc.)
-│   ├── lexer.fd            # Tokenizer (source -> tokens)
-│   ├── parser.fd           # Recursive descent parser (tokens -> AST)
-│   ├── ast.fd              # AST node types (Expr, Stmt, Func, StructDef, EnumDef, etc.)
-│   ├── token.fd            # Token kind definitions
-│   ├── typechecker.fd      # Type checking + capability + effect + region + sandbox enforcement
-│   ├── borrowck.fd         # Borrow checker (NLL, field-wise, two-phase, off/warn/on modes)
+├── compiler/               # 54 self-hosted Fides modules (104,439 LOC) — THE COMPILER
+│   ├── main.fd             # CLI entry point (command dispatch)
+│   ├── lexer.fd / parser.fd / ast.fd / token.fd   # Front end
+│   ├── typechecker.fd      # Type checking + capability + effect + region + sandbox
+│   ├── borrowck.fd         # Borrow checker (NLL, field-wise, two-phase)
+│   ├── escape.fd           # Reference escape analysis (session 29)
 │   ├── mono.fd             # Generic monomorphization
-│   ├── ir.fd               # SSA IR definitions
-│   ├── lower.fd            # AST -> SSA IR lowering
-│   ├── pir.fd              # PIR (Fides Intermediate Representation) -- L1/L2/L3
-│   ├── opt.fd              # PIR optimizer (23 passes)
-│   ├── peephole.fd         # Peephole optimizer
-│   ├── regalloc.fd         # Linear scan register allocator
+│   ├── ir.fd / lower.fd    # SSA IR + AST → IR lowering
+│   ├── pir.fd / opt.fd / peephole.fd / regalloc.fd  # Middle end
 │   ├── codegen_c.fd        # C codegen backend (IR -> .c)
-│   ├── codegen_x64.fd      # x86-64 native codegen
-│   ├── pe.fd               # PE emitter (direct native .exe, no external tools)
-│   ├── comptime_eval.fd    # Compile-time evaluation engine
-│   ├── compiler.fd         # Pipeline orchestration
-│   ├── flat_ast.fd         # Flat AST serialization
-│   ├── diag.fd             # Diagnostics with error codes
-│   ├── fmt.fd              # Source code formatter
-│   ├── json.fd             # JSON parser/serializer
-│   ├── lsp.fd              # Language Server Protocol (completion, hover, definition, rename)
-│   ├── inc.fd              # Incremental compilation cache
-│   └── ark.fd              # Package manager (self-hosted Ark)
-├── src/                    # Rust bootstrap reference (52 files, 84,447 LOC) -- BOOTSTRAP ONLY
+│   ├── codegen_x64.fd / codegen_arm64.fd / codegen_riscv.fd / x86.fd  # asm backends
+│   ├── elf64.fd / pe.fd / coff.fd / macho.fd / linker.fd  # object/executable writers
+│   ├── runtime.fd / runtime_linux.fd / runtime_arm64.fd / runtime_riscv.fd
+│   ├── arm64_enc.fd / riscv_enc.fd  # instruction encoders
+│   ├── comptime_eval.fd / flat_ast.fd / inc.fd   # compile-time + caching
+│   ├── diag.fd / fmt.fd / json.fd / lsp.fd       # tooling
+│   ├── scribe.fd / veil.fd / ark.fd              # doc gen / coverage / pkg manager
+│   ├── wasm.fd / gpu.fd / tensor.fd / autograd.fd # wasm / GPU / ML
+│   ├── embedded.fd / green_thread.fd / debugger.fd / native_debugger.fd / hotreload.fd
+│   └── cparser.fd          # C header parser → FFI bindings
+├── src/                    # Rust bootstrap reference (55 files, 100,935 LOC)
 │   ├── main.rs             # CLI entry point (used to generate first-generation C)
+│   ├── escape.rs           # Reference escape analysis (Rust twin of escape.fd)
+│   ├── dwarf.rs            # DWARF debug info (started)
 │   ├── ...                 # Mirrors compiler/*.fd in Rust (reference implementation)
 │   └── bin/                # Binary entry points (fidesc, ark, scribe, veil)
-├── stdlib/                 # 70 standard library modules (18,529 LOC)
+├── stdlib/                 # 104 standard library modules (30,446 LOC)
 │   ├── core.fd             # Option, Result, println, assert, max, min, abs, clamp
 │   ├── vec.fd              # Vec<T> with iterator adapters
-│   ├── rc.fd               # Rc<T> / Arc<T> reference counting (NEW)
-│   ├── kernel.fd           # OS kernel primitives (GDT, IDT, serial, paging) (NEW)
-│   └── ...                 # 66 more modules (math, banking, medical, tensor, etc.)
-├── tests/                  # 215+ .fd test files + harness
-├── examples/               # 4 example programs
+│   ├── rc.fd               # Rc<T> / Arc<T> reference counting
+│   └── ...                 # 101 more modules (math, banking, medical, tensor, game/*)
+│                           #   kernel.fd + uefi.fd moved to the fides-os project
+├── tests/                  # 348 .fd test files (302 bootstrap + 46 selfhost) + harness
+├── examples/               # 10 example programs
 ├── release/                # Self-hosted compiler binaries + generated C (gitignored)
-│   ├── fides-c3.exe        # The self-hosted compiler (use this for everyday work)
-│   ├── fides-c2.c          # Second-generation C source (701,158 lines)
-│   ├── fides-c3.c          # Third-generation C source (byte-identical to c2)
-│   └── ark_selfhost.exe    # Self-hosted Ark package manager
+│   └── fid.exe             # Self-hosted compiler (RELEASE=1 scripts/bootstrap.sh: 3 stages,
+│                           #   fixpoint; scripts/build-selfhost.sh: 1 stage)
 └── docs/                   # Documentation (reference, guides, meta, roadmap, selfhost)
 ```
 
@@ -729,7 +724,7 @@ p-lang/
 
 ## Test Programs
 
-188 test files across `tests/` and subdirectories. Key tests:
+348 test files across `tests/bootstrap/` and `tests/selfhost/`. Key tests:
 
 | Test File | What It Tests |
 |-----------|---------------|
@@ -786,7 +781,7 @@ p-lang/
 | `test_vec_math.fd` | Vec2/3/4 + mat4 + quat math types |
 | `test_constant_time*.fd` | `@constant_time` security annotation (pass + fail tests) |
 
-Run all tests: `cargo test --test harness`
+Run all tests: `./target/release/fidesc test` (or `cargo test --test harness`)
 
 ---
 
@@ -795,18 +790,18 @@ Run all tests: `cargo test --test harness`
 - `docs/reference/syntax.md` — Complete Fides syntax specification (current `fn`/`val`/`const` syntax + proposed `fn`/`val`/`var` migration)
 - `docs/reference/architecture.md` — Compiler architecture, pipeline stages, and internal design
 - `docs/roadmap/roadmap.md` — Full 8-phase roadmap (currently at Phase 8 in progress)
-- `docs/roadmap/roadmap-limitations.md` — Verified gap analysis (claimed vs actual)
+- `docs/roadmap/roadmap.md` § Limitations — Verified gap analysis (claimed vs actual)
 - `docs/reference/vision.md` — Language vision and 8 pillars (Originality, Security, Performance, etc.)
-- `docs/meta/strategy.md` — Design principles + direction analysis
+- `docs/reference/vision.md` — Vision, design principles, decisions, future direction
 - `docs/reference/changelog.md` — Version history and detailed change log
 - `docs/reference/features.md` — Feature list and status
-- `docs/meta/positioning.md` — Competitive analysis (vs Rust/Zig/Go/Swift) + adoption strategy + industry conversion guide
-- `docs/meta/lessons.md` — PL history lessons + IBM AIX/z/OS lessons
-- `docs/guides/architecture-overview.md` — Custom toolchain (no LLVM) + full-stack architecture
-- `docs/meta/future.md` — Innovation (AI/robotics) + community goals
-- `docs/guides/best-practices.md` — Best practices guide
-- `docs/guides/borrowchecker.md` — Borrow checker documentation
-- `docs/roadmap/opportunities.md` — AI/ML + industry opportunities
+- `docs/reference/positioning.md` — Competitive analysis (vs Rust/Zig/Go/Swift) + adoption strategy
+- `docs/reference/lessons.md` — PL history lessons + IBM AIX/z/OS lessons
+- `docs/reference/architecture.md` — Custom toolchain rationale (§0) + full pipeline reference
+- `docs/reference/vision.md` § Future — Innovation (AI/robotics) + community goals
+- `docs/reference/best-practices.md` — Best practices guide
+- `docs/reference/borrowchecker.md` — Borrow checker documentation
+- `docs/roadmap/roadmap.md` § Opportunities — AI/ML + industry opportunities
 - `docs/reference/testing.md` — Test results across all backends + test batch specifications
 - `docs/reference/tool.md` — Tooling guide
 
@@ -815,6 +810,6 @@ Run all tests: `cargo test --test harness`
 ## Roadmap
 
 See `docs/roadmap/roadmap.md` for the full phase status and milestones.
-See `docs/roadmap/selfhost-roadmap.md` for the self-hosting plan.
+See `docs/roadmap/roadmap.md` § Self-Host Details for the self-hosting plan.
 
-**Self-hosting status:** Bootstrap fixpoint achieved. 26 self-hosted modules (61,885 LOC) in `compiler/*.fd`. The self-hosted compiler (`fides-c3.exe`) is the primary tool for everyday work. The Rust compiler (`src/*.rs`) is the bootstrap reference and is only needed when changing compiler internals.
+**Self-hosting status:** Bootstrap fixpoint verified (stage 2 == stage 3 byte-for-byte, checked on every release build). 54 self-hosted modules (~105K LOC) in `compiler/*.fd`. The self-hosted compiler is the release compiler (`fides.exe`); its `run` and `ccompile` match the Rust compiler (`fidesc.exe`) on the test programs and examples.

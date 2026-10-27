@@ -1,58 +1,42 @@
 # Fides Example Projects
 
-These examples exercise the patterns a self-hosted Fides compiler would need.
+Small complete programs: compiler pieces, a JSON parser, a neural network,
+a server, a game and bare-metal blinkers.
 
 ## Examples
 
-| Example | Description | Interp | C Codegen | PE Emitter |
-|---------|-------------|--------|-----------|------------|
-| `lexer.fd` | Tokenizer for arithmetic expressions | PASS | PASS | PARTIAL |
-| `parser.fd` | Recursive-descent parser with Box<T> AST | PASS | PASS | FAIL |
-| `codegen.fd` | x86-64 assembly text emitter | PASS | PASS | PARTIAL |
-| `mini_compiler.fd` | Full lex→parse→codegen pipeline | PASS | PASS | FAIL |
-| `json_parser.fd` | JSON parser with arrays/objects | PASS | PASS | FAIL |
+Results on Oct 27, 2026. "Same" means the output equals the interpreter's
+(`fidesc run`); `fid` is the self-hosted compiler.
 
-## PE Emitter Issues
+| Example | Description | `fidesc` C | `fidesc` PE | `fid run` | `fid ccompile` |
+|---------|-------------|-----------|-------------|-------------|------------------|
+| `lexer.fd` | Tokenizer for arithmetic expressions | same | same | same | same |
+| `parser.fd` | Recursive-descent parser with Box<T> AST | same | same | same | same |
+| `codegen.fd` | x86-64 assembly text emitter | same | same | same | same |
+| `mini_compiler.fd` | Full lex→parse→codegen pipeline | same | same | same | same |
+| `json_parser.fd` | JSON parser with arrays/objects | same | same | same | same |
+| `neural_network.fd` | Neural network forward pass | same | same | same | same |
+| `http_server.fd` | HTTP server (runs until stopped) | same | no sockets in the PE runtime | same | same |
+| `riscv_blink.fd` | Bare-metal LED blink, SiFive HiFive1 (loops forever) | same | same | same | same |
+| `rpi_led_blink.fd` | Bare-metal LED blink, Raspberry Pi 3 (loops forever) | same | same | same | same |
+| `minimal_game.fd` | SDL2 game vertical slice | needs SDL2 | needs SDL2 | same | needs SDL2 |
 
-The PE emitter has 3 critical bugs that prevent self-hosting on that backend
-(see `docs/roadmap/roadmap-issues.md` Issues 67-69):
-
-1. **Issue 67**: `val` inside a loop body corrupts the loop variable
-   (stack slot overlap). Workaround: use `var` inside loops.
-2. **Issue 68**: `str_split` returns an empty Vec in the PE emitter.
-3. **Issue 69**: Recursive `Box<T>` causes segfault in complex programs.
-
-The interpreter and C codegen backends work correctly for all examples.
+The programs that run forever are compared on what they print before a
+timeout. Without SDL2 installed, `minimal_game` fails the same way on every
+compiler.
 
 ## Running
 
 ```bash
-# Interpreter (all work)
-fidesc run examples/lexer.fd
-fidesc run examples/parser.fd
-fidesc run examples/codegen.fd
-fidesc run examples/mini_compiler.fd
-fidesc run examples/json_parser.fd
+# Interpreter
+fid run examples/json_parser.fd          # self-hosted
+fidesc run examples/json_parser.fd         # Rust compiler
 
-# C codegen (all work)
-fidesc ccompile examples/mini_compiler.fd -o examples/mini_compiler
-./examples/mini_compiler
+# C backend (needs a C compiler: $CC, gcc, clang, zig cc or tcc)
+fid ccompile examples/mini_compiler.fd -o mini_compiler.exe
+./mini_compiler.exe
 
-# PE emitter (lexer + codegen partially work; others segfault)
-fidesc build examples/lexer.fd -o examples/lexer
-./examples/lexer
+# Native Windows executable, no C compiler needed
+fidesc emit examples/lexer.fd -o lexer.exe
+./lexer.exe
 ```
-
-## Self-Host Readiness
-
-The examples demonstrate that Fides can express all the core patterns
-needed for a self-hosted compiler:
-
-- **Tokenization**: Character scanning, string building, Vec<T> ✅
-- **Parsing**: Recursive descent, precedence climbing, Box<T> AST ✅
-- **Code generation**: String concatenation, recursive traversal ✅
-- **Full pipeline**: Lex → parse → eval → codegen in one program ✅
-- **Real-world parsing**: JSON with arrays, objects, escape sequences ✅
-
-**Conclusion**: Self-hosting is ready to start on the **C codegen backend**.
-The PE emitter needs Issues 67-69 fixed first.

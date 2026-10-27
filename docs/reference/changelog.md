@@ -320,6 +320,61 @@ reproducible.
   unsupported rather than failures, and golden files are compared without
   regard to line endings.
 
+## Session 30 — Post-Codegen Constant-Time Verification + ABI Repair (Oct 25, 2026)
+
+### Post-codegen `@constant_time` verification (`src/codegen_x64.rs`)
+
+`@constant_time` used to be checked only at source level, which cannot see
+branches that lowering/optimization/codegen introduce. A post-codegen
+verifier now scans the **final** x86-64 assembly (after peephole) for every
+`@constant_time` function and turns violations into build errors:
+
+- conditional jumps (`jcc`) and indirect jumps,
+- `cmov*` with a memory operand,
+- indexed memory operands (`(%base,%index,scale)`),
+- variable-latency instructions (`div`, `idiv`, FP `div`/`sqrt`/`rsqrt`,
+  incl. `v`-prefixed forms),
+- direct calls to non-`@constant_time` functions (runtime allowlist:
+  `p_panic` only) and indirect calls.
+
+Compiler-generated recursion-guard and stack-canary sequences are exempt;
+`@wrapping` exempts generated overflow branches (the diagnostic names the
+remedy). `lea` with indexed addressing and register-only `cmov` are allowed.
+Scope: **x86-64 ELF path only** — PE, ARM64, and RISC-V are not yet covered
+(the PE emitter produces machine code directly, with no asm text to scan).
+New fixtures: `tests/bootstrap/test_ct_asm.fd` (passes) and
+`test_ct_asm_fail.fd` (source-level OK, rejected post-codegen).
+
+### `Vec` argument ABI — `cast_arg` (`src/codegen_c.rs`, `compiler/codegen_c.fd`)
+
+Passing a `Ptr(inner)` value (e.g. an `&mut Vec<T>` parameter slot) to a
+`Generic`/`Opaque` parameter of that same inner type emitted **no** deref,
+so callees like `ra_vec_find_i64` received a slot pointer where they
+expected a `Vec` header → `Vec_len` read garbage → crash in
+`compiler/regalloc.fd`. `cast_arg` now emits `*(void**)` when the pointee
+type equals the destination type. The equality check is deliberate: an
+earlier broader version dereferenced `str` (`*u8`) into generic params and
+corrupted `Parser_new`.
+
+### Tooling fixes
+
+- **`cl.exe` invocation on Windows** (`src/main.rs`): `cmd /C` strips the
+  first quote when the command string starts with `"` and contains
+  `&&`/`>` — the `vcvarsall.bat` chain ran as `'C:\Program'` and failed with
+  empty stderr, taking down **every** C-codegen test on this machine. The
+  command string is now wrapped in an outer quote pair.
+- **Alloca hoisting** (`src/compiler.rs` / `src/lower.rs` path): entry-block
+  allocas are now handled so the `--native` path no longer dies on them —
+  unblocks self-hosted `--native` end-to-end runs.
+
+### Known issues confirmed (not yet fixed)
+
+- `release/fid.exe` still crashes parsing the stdlib — a second,
+  independent corruption path exists beyond the `cast_arg` fix (see
+  `AGENTS.md` Known Bugs #1).
+- Self-hosted typecheck/borrowck is nondeterministic across identical runs
+  (HashMap-order instability); retry builds before assuming regressions.
+
 ## Session 29c — `@zeroize` Wipes Heap Data, PE Output Fixed and Tested (Oct 25, 2026)
 
 ### `@zeroize`
@@ -1140,7 +1195,9 @@ section has: name, data, sh_type, sh_flags, alignment.
 - **CB6:** PE emitter has 15 stubbed runtime functions
 - **CB7:** ELF64 symbol table dump not implemented
 
-See `docs/roadmap/roadmap-issues.md` for full details.
+See `docs/selfhost/known-bugs.md` for the current consolidated bug list
+(the session-16 `roadmap-issues.md` file this entry referenced has been
+merged into `docs/roadmap/roadmap.md`).
 
 ### Test Results
 

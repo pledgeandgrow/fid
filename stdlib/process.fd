@@ -1,14 +1,17 @@
 // Fides Process Control standard library
 //
-// Provides process control: exit, system commands.
+// Provides process control: exit, system commands, and subprocess
+// execution with captured stdout/stderr and exit code.
 // In the interpreter, these use Rust's std::process.
-// In C codegen, these use C's system() and exit().
-// In native builds, p_exit works (syscall 60), p_system is a stub.
+// In C codegen, they use system() + temp-file capture.
+// In PE builds, they use msvcrt system() + stdio.
 //
 // Usage:
 //   use process;
-//   process_exit(0);     // exit with code 0
-//   value status = process_system("ls -la");
+//   val r = process_run("echo hello");
+//   println(process_stdout(r));   // "hello\n"
+//   println(process_code(r));     // 0
+//   process_close(r);
 
 module process;
 
@@ -21,4 +24,62 @@ pub fn process_exit(code: i64) -> void {
 /// Returns -1 on failure.
 pub fn process_system(cmd: str) -> i64 {
     return p_system(cmd);
+}
+
+// ─── Captured subprocess ────────────────────────────────────────────────
+// A "result" is an opaque i64 handle owned by the runtime. It holds the
+// captured stdout, stderr and exit code of a finished process. Release it
+// with process_close() when done.
+
+/// Run `cmd` through the platform shell (sh -c / cmd /C) capturing its
+/// stdout, stderr and exit code. Returns an opaque result handle, or 0 if
+/// the process could not be started.
+pub fn process_run(cmd: str) -> i64 {
+    return p_process_run(cmd);
+}
+
+/// True when `h` is a live process result.
+pub fn process_ok(h: i64) -> bool {
+    return h != 0;
+}
+
+/// The captured standard output of a finished process ("" on bad handle).
+pub fn process_stdout(h: i64) -> str {
+    return p_process_stdout(h);
+}
+
+/// The captured standard error of a finished process ("" on bad handle).
+pub fn process_stderr(h: i64) -> str {
+    return p_process_stderr(h);
+}
+
+/// The process exit code (-1 on a bad handle).
+pub fn process_code(h: i64) -> i64 {
+    return p_process_code(h);
+}
+
+/// Release a process result handle.
+pub fn process_close(h: i64) -> void {
+    p_process_close(h);
+}
+
+/// The current process id.
+pub fn process_pid() -> i64 {
+    return p_getpid();
+}
+
+/// Convenience: run `cmd`, return (stdout, code) after releasing the
+/// handle. Useful when stderr is not needed.
+pub fn process_capture(cmd: str) -> Vec {
+    var out: Vec = Vec::new();
+    var h: i64 = process_run(cmd);
+    if h == 0 {
+        out.push("");
+        out.push("-1");
+        return out;
+    }
+    out.push(process_stdout(h));
+    out.push(int_to_str(process_code(h)));
+    process_close(h);
+    return out;
 }

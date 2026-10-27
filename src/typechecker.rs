@@ -2248,6 +2248,9 @@ impl TypeChecker {
             "p_env_get", "p_env_set",
             "p_args_count", "p_args_get",
             "p_sqlite_open", "p_sqlite_exec", "p_sqlite_query",
+            "p_dir_list", "p_is_dir", "p_mkdir", "p_rmdir", "p_rename",
+            "p_process_run", "p_process_stdout", "p_process_stderr", "p_process_code", "p_process_close",
+            "p_getpid", "p_system", "p_exit",
         ];
 
         // Domain label for error messages (use the original annotation name)
@@ -8741,6 +8744,62 @@ fn stmt_decreases_var(stmt: &Stmt, var: &str) -> bool {
         }
         _ => false
     }
+}
+
+/// Annotations that have a dedicated `verify_*` pass in `TypeChecker::check`
+/// (the Rust bootstrap). This is the single source of truth consumed by
+/// `fidesc qualify` for `enforcedInBootstrap`; keep it in sync when adding or
+/// removing a `verify_*` pass.
+///
+/// Mapping (pass → annotations it enforces):
+///   verify_deterministic        → deterministic
+///   verify_conserve             → conserve
+///   verify_gas                  → gas
+///   verify_safety_annotations   → no-alloc, no-recursion, no-unbounded,
+///                                 no-indirect, requires-audit, bounded,
+///                                 firmware, crashfree, medical,
+///                                 safety-critical, autosar
+///   verify_constant_time        → constant_time
+///   verify_realtime             → realtime
+///   verify_differentiable       → differentiable
+///   verify_quantized            → quantized
+///   verify_checkpoint           → checkpoint
+///   verify_dp                   → dp
+///   verify_shard                → shard
+///   verify_adapter              → adapter
+///   verify_taint_propagation    → tainted, secret
+///
+/// Deliberately NOT listed: `bounded-stack` (collected as a primitive but
+/// never checked), and annotations enforced outside a `verify_*` pass
+/// (`linear`/`send`/`sync` via struct registration + borrowck, `wrapping`,
+/// `repr(C)`, `kernel`, `audit` via lowering/codegen flags).
+pub fn enforced_annotations() -> &'static [&'static str] {
+    &[
+        "deterministic",
+        "conserve",
+        "gas",
+        "no-alloc",
+        "no-recursion",
+        "no-unbounded",
+        "no-indirect",
+        "requires-audit",
+        "bounded",
+        "firmware",
+        "crashfree",
+        "medical",
+        "safety-critical",
+        "autosar",
+        "constant_time",
+        "realtime",
+        "differentiable",
+        "quantized",
+        "checkpoint",
+        "dp",
+        "shard",
+        "adapter",
+        "tainted",
+        "secret",
+    ]
 }
 
 /// Scan for early returns (ret before the last statement in a block).

@@ -22,7 +22,7 @@
 //! treat its result as secret) or `@declassify` (an audited release: callers
 //! treat its result as public).
 //!
-//! Runs after type checking. See `docs/guides/secrets.md`.
+//! Runs after type checking. See `docs/reference/language-guide.md`.
 
 use crate::ast::{Expr, FStringPart, Func, MatchArm, Pattern, Program, Stmt};
 use std::collections::{BTreeSet, HashMap, HashSet};

@@ -392,6 +392,91 @@ Structs annotated `@linear` are tracked as linear types:
 - Used for resource handles, database connections, financial transactions
 - Alias analysis uses linear pointers to prove non-aliasing
 
+### 4.6 Second-Class References
+
+Fides references (`&T`, `&mut T`) are **second-class**: they let a function
+read or update a value its caller owns, but they can never be kept anywhere
+that could outlive that value. The compiler enforces this with no lifetime
+annotations. Swift's `inout` and Hylo use the same approach.
+
+The borrow checker (`docs/reference/borrowchecker.md`) makes sure a value is not
+mutated while it is borrowed. The escape check described here makes sure a
+reference never outlives what it points to. Together they rule out dangling
+references.
+
+### What you can do with a reference
+
+```fides
+struct Point { x: i64, y: i64 }
+
+// Borrow for the duration of a call.
+fn norm1(p: &Point) -> i64 { return p.x + p.y; }
+
+// Hold one in a local.
+var a: i64 = 1;
+var r: &i64 = &a;
+
+// Return one that comes from a reference parameter.
+fn x_of(p: &Point) -> &i64 { return &p.x; }
+
+// Option, Result and tuples pass a reference through.
+fn pick(a: &i64, b: &i64, first: bool) -> Option<&i64> {
+    if first { return Option::Some(a); }
+    return Option::Some(b);
+}
+```
+
+The compiler works out which parameters can reach a function's result, so a
+caller of `x_of(&p)` knows the result points into `p`. No annotation says so.
+
+### What the compiler rejects
+
+| Rule | Rejected example | Why |
+|------|------------------|-----|
+| A returned reference must come from a reference parameter | `fn f() -> &i64 { var x = 1; return &x; }` | `x` is freed when `f` returns |
+| | `fn f(p: Point) -> &i64 { return &p.x; }` | A by-value parameter is a local of `f` |
+| References are not stored | `struct S { r: &i64 }`, `Vec<&i64>`, `Box<&T>`, a global of type `&T` | Storage can outlive the referent |
+| | `v.push(&x)`, `S { r: &x }`, `arr[i] = &x` | Same, at the point of storing |
+| No reference to a reference | `&&T`, `&mut &T` | A callee could store a reference into the caller's variable |
+| A reference must not outlive its block | `var r = &a; { var b = 2; r = &b; } use(r)` | `b` is freed at the end of the block |
+| | `val r = { var t = 5; &t };` | The block's value points at its own local |
+| References are not generic arguments | `id(&x)` where `fn id<T>(v: T) -> T` | Generic code may store its arguments |
+| A closure holding a reference is rooted like that reference | `fn mk() -> fn() -> i64 { var x = 1; val r = &x; return fn() { *r }; }` | Closures capture by value, so the closure carries `r` |
+| References are not sent to other tasks | `spawn work(&x)` | The task may outlive `x` |
+
+Code inside `unsafe { }` is not checked.
+
+### How it works
+
+For every expression the compiler computes its **roots**: the variables a
+reference in it may point into.
+
+- `&x` is rooted at the local `x`; `&p.field` where `p` is a reference
+  parameter is rooted at that parameter.
+- A call's result is rooted at the arguments of the parameters that reach the
+  callee's result (inferred per function, iterated to a fixpoint).
+- `if`, `match`, blocks, `Option`/`Result` constructors and tuples combine the
+  roots of their parts; a closure takes the roots of the references it
+  captures.
+- Arithmetic, field reads of non-tuple values, element reads and dereferences
+  produce plain values with no roots.
+
+The check then looks at the places a value can escape: `return`, assignment
+to a variable in an outer block, a block's value, stores into fields,
+elements or globals, generic parameters and `spawn`. A root that would be
+freed before the destination is a compile error naming both.
+
+The pass is `src/escape.rs` (Rust bootstrap) and `compiler/escape.fd`
+(self-hosted). It runs right after type checking.
+
+### Limits
+
+Being annotation-free, the check is deliberately conservative: a function
+returning a reference is assumed to point into every reference parameter that
+can reach its result, and references cannot be stored even where a lifetime
+system could prove it safe. None of the existing compiler, standard library,
+tests or examples needed either.
+
 ---
 
 ## 5. Effects & Capabilities
@@ -456,6 +541,104 @@ use net::http with { Net };
 | `@linear` | Struct type is linear (must be consumed) |
 | `@send` | Struct can be sent between threads |
 | `@sync` | Struct can be shared between threads |
+
+### 5.4 Secrets (`@secret`)
+
+`@secret` marks data that must never be revealed: keys, passwords, tokens,
+patient records. The compiler proves that no secret, and nothing computed
+from one, reaches an output.
+
+### Marking secrets
+
+```fides
+// A parameter: this function receives a secret and promises not to leak it.
+fn sign(@secret key: str, msg: str) -> i64 { ... }
+
+// A local.
+@secret val key = load_from_vault();
+
+// A function whose result is secret wherever it is called.
+@secret
+fn load_key() -> str { ... }
+```
+
+### What counts as a leak
+
+| Leak | Example |
+|------|---------|
+| Output, logging, network, files | `println(key)`, `log_info(key)`, `p_socket_send(s, key)` |
+| Through any helper | `fn show(x: str) { println(x); }` then `show(key)` |
+| Through containers and copies | `v.push(key); println(v.get(0))`, `S { k: key }`, `val y = key + "!"` |
+| Through control flow | `if key == "x" { println("yes"); }` (which line prints reveals the key) |
+| Globals | `g_last = key;` |
+| Other tasks | `spawn work(key)` |
+| Calls through function values | `callback(key)` (the callee is unknown) |
+| Return values | `return key;` from a function not marked `@secret` or `@declassify` |
+| Writes through `&mut` parameters | `*out = key;` |
+
+Code inside nested blocks, loops, closures and `unsafe { }` is checked like
+any other code.
+
+### Releasing a value on purpose
+
+Some results derived from a secret are meant to be public, such as whether a
+password matched. Write the release as a function marked `@declassify`;
+callers treat its result as public:
+
+```fides
+@declassify
+fn password_matches(@secret stored: str, attempt: str) -> bool {
+    return stored == attempt;
+}
+```
+
+Every release point is then easy to find and review (`grep @declassify`).
+
+### How it works
+
+Every value carries a label: whether it may hold a secret, and which of the
+function's parameters it may come from. A parameter label that reaches an
+output means the function outputs that parameter; that becomes part of the
+function's summary, together with which parameters reach its result and
+whether it produces output at all. Summaries are inferred for every function
+to a fixpoint, so a secret passed to a helper is caught at the call, however
+deep the helper chain. Inside a branch or loop whose condition depends on a
+secret, everything carries that secret too.
+
+The pass is `src/secrecy.rs` (Rust bootstrap) and `compiler/secrecy.fd`
+(self-hosted). It runs after type checking and the reference escape check.
+
+### Wiping secrets from memory (`@zeroize`)
+
+`@zeroize` on a local wipes it when the function returns (after the return
+value is computed, together with `defer` blocks and drops):
+
+```fides
+fn sign(msg: str) -> i64 {
+    @zeroize val key: str = load_key();
+    @zeroize var scratch: Vec<i64> = Vec::new();
+    ...
+    return mac(key, msg);   // computed first, then key and scratch are wiped
+}
+```
+
+For a `str` the string's bytes are overwritten (string literals are part of
+the program and are left alone); for a `Vec` its whole element buffer is.
+Every other handle to the same string or Vec sees the zeros afterwards, so do
+not return a `@zeroize` string or Vec, or keep another handle to it, if the
+data must outlive the function.
+
+The C backend wipes heap data; the interpreters keep strings and Vecs as
+managed values and wipe nothing, and the PE backend wipes the variable itself
+but not yet the heap bytes.
+
+### Limits
+
+The analysis is conservative: a variable's label is the union of everything
+it is ever assigned, so a variable reused for a secret and then for public
+data stays secret. Lengths are not treated specially (`key.len()` is
+secret). Timing is a separate concern: use `@constant_time` for code whose
+running time must not depend on a secret.
 
 ---
 

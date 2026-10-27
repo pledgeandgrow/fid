@@ -31,9 +31,18 @@ extern "C" {
     fn strtod as pe_c_strtod(s: str, end: i64) -> f64;
     fn _snprintf as pe_c_fmt_prec(buf: i64, size: i64, fmt: str, prec: i64, x: f64) -> i32;
     fn _snprintf as pe_c_fmt_f64(buf: i64, size: i64, fmt: str, x: f64) -> i32;
+    fn system as pe_c_system(cmd: str) -> i64;
+    fn rename as pe_c_rename(a: str, b: str) -> i32;
     // kernel32.dll
     fn GetSystemTimeAsFileTime as pe_k_system_time(out: i64);
     fn ExitProcess as pe_k_exit_process(code: i64);
+    fn GetCurrentProcessId as pe_k_getpid() -> i64;
+    fn GetFileAttributesA as pe_k_attrs(path: str) -> i64;
+    fn CreateDirectoryA as pe_k_mkdir(path: str, sa: i64) -> i32;
+    fn RemoveDirectoryA as pe_k_rmdir(path: str) -> i32;
+    fn FindFirstFileA as pe_k_find_first(pat: str, data: i64) -> i64;
+    fn FindNextFileA as pe_k_find_next(h: i64, data: i64) -> i32;
+    fn FindClose as pe_k_find_close(h: i64) -> i32;
     // Machine-code primitives (pe.rs): a float travels as its bits
     fn pe_f64_to_bits(x: f64) -> i64;
     fn pe_bits_to_f64(bits: i64) -> f64;
@@ -358,6 +367,185 @@ pub fn pert_exit(code: i64) {
 /// The variable's value; null when it is not set.
 pub fn pert_getenv(name: str) -> str {
     return pe_c_getenv(name);
+}
+
+// ─── Directories, processes ─────────────────────────────────────────────
+
+pub fn pert_is_dir(path: str) -> bool {
+    if pe_str_is_null(path) {
+        return false;
+    }
+    // GetFileAttributesA: -1 on failure, bit 4 (FILE_ATTRIBUTE_DIRECTORY) set for dirs
+    var a: i64 = pe_k_attrs(path);
+    return a != -1 && (a & 16) != 0;
+}
+
+pub fn pert_rename(a: str, b: str) -> i64 {
+    if pe_c_rename(a, b) == 0 {
+        return 0;
+    }
+    return -1;
+}
+
+pub fn pert_mkdir(path: str) -> i64 {
+    if pe_k_mkdir(path, 0) != 0 {
+        return 0;
+    }
+    return -1;
+}
+
+/// Remove an EMPTY directory (fs_rmdir_all does the walk-delete).
+pub fn pert_rmdir(path: str) -> i64 {
+    if pe_k_rmdir(path) != 0 {
+        return 0;
+    }
+    return -1;
+}
+
+pub fn pert_getpid() -> i64 {
+    return pe_k_getpid();
+}
+
+/// Read a whole file into a NUL-terminated heap str; "" on failure.
+fn pe_read_all(path: str) -> str {
+    var f: i64 = pe_c_fopen(path, "rb");
+    if f == 0 {
+        return "";
+    }
+    pe_c_fseek(f, 0, 2);
+    var n: i64 = pe_c_ftell(f);
+    pe_c_fseek(f, 0, 0);
+    if n < 0 {
+        n = 0;
+    }
+    var buf: i64 = p_malloc(n + 1);
+    var got: i64 = 0;
+    if n > 0 {
+        got = pe_c_fread(buf, 1, n, f);
+    }
+    if got < 0 {
+        got = 0;
+    }
+    pe_set_byte(buf, got, 0);
+    pe_c_fclose(f);
+    return pe_buf_str(buf);
+}
+
+/// Entry names of a directory joined by '\n' (no "./.."); "" on failure.
+pub fn pert_dir_list(path: str) -> str {
+    if pe_str_is_null(path) {
+        return "";
+    }
+    var pat: str = path + "\\*";
+    // WIN32_FIND_DATAA: 318 bytes; cFileName[260] at offset 44.
+    var data: i64 = p_malloc(592);
+    var h: i64 = pe_k_find_first(pat, data);
+    if h == -1 {
+        return "";
+    }
+    var need: i64 = 1;
+    var more: i64 = 1;
+    while more != 0 {
+        var name_len: i64 = 0;
+        while pe_byte_at(data + 44, name_len) != 0 {
+            name_len = name_len + 1;
+        }
+        var first_ch: i64 = pe_byte_at(data + 44, 0);
+        var is_dot: bool = first_ch == 46 && (name_len == 1 || (name_len == 2 && pe_byte_at(data + 44, 1) == 46));
+        if !is_dot {
+            need = need + name_len + 1;
+        }
+        more = pe_k_find_next(h, data);
+    }
+    pe_k_find_close(h);
+    var out: i64 = p_malloc(need);
+    pe_set_byte(out, 0, 0);
+    var pos: i64 = 0;
+    h = pe_k_find_first(pat, data);
+    if h == -1 {
+        return pe_buf_str(out);
+    }
+    more = 1;
+    while more != 0 {
+        var name_len2: i64 = 0;
+        while pe_byte_at(data + 44, name_len2) != 0 {
+            name_len2 = name_len2 + 1;
+        }
+        var first_ch2: i64 = pe_byte_at(data + 44, 0);
+        var is_dot2: bool = first_ch2 == 46 && (name_len2 == 1 || (name_len2 == 2 && pe_byte_at(data + 44, 1) == 46));
+        if !is_dot2 {
+            if pos > 0 {
+                pe_set_byte(out, pos, 10);
+                pos = pos + 1;
+            }
+            var ci: i64 = 0;
+            while ci < name_len2 {
+                pe_set_byte(out, pos + ci, pe_byte_at(data + 44, ci));
+                ci = ci + 1;
+            }
+            pos = pos + name_len2;
+        }
+        more = pe_k_find_next(h, data);
+    }
+    pe_k_find_close(h);
+    pe_set_byte(out, pos, 0);
+    return pe_buf_str(out);
+}
+
+/// Run a shell command capturing stdout/stderr/exit code. The handle is a
+/// heap record [out ptr, err ptr, code]; 0 on failure to start.
+pub fn pert_process_run(cmd: str) -> i64 {
+    if pe_str_is_null(cmd) || p_str_length(cmd) == 0 {
+        return 0;
+    }
+    var rec: i64 = p_malloc(24);
+    // The record address is unique per live call — a safe temp-name tag.
+    var of: str = ".fprc_" + int_to_str(rec) + ".out";
+    var ef: str = ".fprc_" + int_to_str(rec) + ".err";
+    var code: i64 = pe_c_system(cmd + " > \"" + of + "\" 2> \"" + ef + "\"");
+    var outp: *mut i64 = rec;
+    var errp: *mut i64 = rec + 8;
+    var codep: *mut i64 = rec + 16;
+    var outv: i64 = pe_str_addr(pe_read_all(of));
+    var errv: i64 = pe_str_addr(pe_read_all(ef));
+    unsafe { *outp = outv; *errp = errv; *codep = code; }
+    pe_c_remove(of);
+    pe_c_remove(ef);
+    return rec;
+}
+
+fn pe_proc_field(h: i64, off: i64) -> i64 {
+    if h == 0 {
+        return 0;
+    }
+    var p: *mut i64 = h + off;
+    var v: i64 = 0;
+    unsafe { v = *p; }
+    return v;
+}
+
+pub fn pert_process_stdout(h: i64) -> str {
+    return pe_proc_field(h, 0);
+}
+
+pub fn pert_process_stderr(h: i64) -> str {
+    return pe_proc_field(h, 8);
+}
+
+pub fn pert_process_code(h: i64) -> i64 {
+    if h == 0 {
+        return -1;
+    }
+    return pe_proc_field(h, 16);
+}
+
+pub fn pert_process_close(h: i64) {
+    if h == 0 {
+        return;
+    }
+    p_free(pe_proc_field(h, 0));
+    p_free(pe_proc_field(h, 8));
+    p_free(h);
 }
 
 // ─── Wildcard matching ('?' one byte, '*' any run) ──────────────────────

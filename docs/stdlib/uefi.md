@@ -1,5 +1,10 @@
 # uefi — Fides Documentation
 
+> **Moved (2026-10-24):** `stdlib/uefi.fd` moved out of this repo to the
+> separate **fides-os** project (UEFI bootstrap now lives in `boot/uefi.fd`
+> there). The content below is historical and documents the module as it
+> existed before the move.
+
 ## Contents
 
 - [EFI_SUCCESS:](#efi_success:) (const)

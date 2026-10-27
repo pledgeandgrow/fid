@@ -769,19 +769,20 @@ enabling editor integration (VS Code, Neovim, Emacs, etc.) with live diagnostics
 ### Test Coverage
 
 **See `AGENTS.md` → "Current Baseline"** for authoritative test counts.
-(209/211 on interpreter, 198/211 C codegen, 209/211 PE, 265/265 unit tests,
-225+ .fd test files, 99 stdlib modules, 52 source files, 4 binaries.)
+The snapshot above (and the session-15 table below) is historical; the
+current baseline is in `tests/bootstrap/baseline/test_results.txt` and
+`tests/selfhost/baseline/test_results.txt`.
 
-### Self-Hosting (session 15)
+### Self-Hosting (session 15 — historical; current state in `docs/selfhost/selfhost.md`)
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Self-compilation | ✅ | `fides-c.exe` compiles `compiler/main.fd` → `fides-c2.exe` (EXIT 0) |
-| Bootstrap fixpoint | ✅ | `fides-c2.c` == `fides-c3.c` (SHA256-identical, 701,100 lines) |
-| Three generations | ✅ | Rust → c1 → c2 → c3, all run test_simple.fd correctly |
-| Self-host modules | ✅ | 25 `.fd` modules, 61,145 LOC |
-| Self-host tests | ✅ | 23/23 pass on interpreter + PE |
-| PE emitter (self-hosted) | ✅ | `compiler/pe.fd` generates native Windows PE executables |
+| Self-compilation | ✅ | `fides-c.exe` compiles `compiler/main.fd` → up to `fides-c5.exe` (5 generations; session-24 regression fixed in session 26) |
+| Bootstrap fixpoint | ✅ | stage 2 == stage 3 byte-identical (~38 MB of C), checked by `RELEASE=1 scripts/bootstrap.sh` on every release build |
+| Self-host modules | ✅ | 54 `.fd` modules, 104,439 LOC (was 25/61K in session 15) |
+| Self-host tests | ✅ | 38/38 pass on interp + C + PE (`tests/selfhost/`) |
+| PE emitter (self-hosted) | ❌ | `compiler/pe.fd` exists, but its pipeline (`build --native`: PIR → x86-64 → PE) crashes in the optimizer and register allocator; native Windows executables come from `fidesc emit` |
 | LSP server (self-hosted) | ✅ | `compiler/lsp.fd` (1,082 lines) — JSON-RPC over stdio |
-| Linux native codegen (self-hosted) | ⚠️ | `peephole.fd` + `regalloc.fd` + `codegen_x64.fd` ported but not integrated |
-| Module-level `var` in self-hosted | ❌ | Rust compiler supports it, self-hosted compiler does not yet |
+| Linux native codegen (self-hosted) | ✅ | `peephole.fd` + `regalloc.fd` + `codegen_x64.fd` — wired into the unified L3 → x86-64 → asm pipeline (session 28-29) |
+| Module-level `var` in self-hosted | ✅ | Supported on all backends since session 11 |
+| Standalone binary | ✅ | `release/fid.exe` (`RELEASE=1 scripts/bootstrap.sh`, fixpoint checked), shipped as `fid.exe`; `run` and `ccompile` match `fidesc` on the test programs |

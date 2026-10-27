@@ -86,7 +86,10 @@ fn runtime_effects(name: &str) -> Option<EffectSet> {
         return Some(effects);
     }
     // File/IO operations
-    if name.starts_with("p_file_") || name.starts_with("p_fs_") || name.starts_with("p_socket_") {
+    if name.starts_with("p_file_") || name.starts_with("p_fs_") || name.starts_with("p_socket_")
+        || name.starts_with("p_dir_") || name.starts_with("p_process_")
+        || name == "p_mkdir" || name == "p_rmdir" || name == "p_rename" || name == "p_is_dir" || name == "p_getpid"
+    {
         effects.add(Effect::IO);
         return Some(effects);
     }
@@ -1099,8 +1102,34 @@ impl Lowerer {
         // ─── Process control builtins ───
         // p_system(cmd: *u8) -> i64  — run a shell command, return exit status
         self.module.add_extern("p_system", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
+        // p_process_run(cmd: *u8) -> i64  — run a shell command capturing
+        //   stdout/stderr/exit code into a result handle (0 = failed to start)
+        self.module.add_extern("p_process_run", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
+        // p_process_stdout(h: i64) -> *u8 — captured stdout of a finished process
+        self.module.add_extern("p_process_stdout", vec![IrType::I64], IrType::Ptr(Box::new(IrType::U8)));
+        // p_process_stderr(h: i64) -> *u8 — captured stderr of a finished process
+        self.module.add_extern("p_process_stderr", vec![IrType::I64], IrType::Ptr(Box::new(IrType::U8)));
+        // p_process_code(h: i64) -> i64 — exit code (-1 if the handle is bad)
+        self.module.add_extern("p_process_code", vec![IrType::I64], IrType::I64);
+        // p_process_close(h: i64) -> void — release a process result handle
+        self.module.add_extern("p_process_close", vec![IrType::I64], IrType::Void);
+        // p_getpid() -> i64 — current process id (used for temp file names)
+        self.module.add_extern("p_getpid", vec![], IrType::I64);
         // p_exit(code: i64) -> void  — exit the process with a code
         self.module.add_extern("p_exit", vec![IrType::I64], IrType::Void);
+
+        // ─── Filesystem builtins beyond p_file_* ───
+        // p_dir_list(path: *u8) -> *u8 — entry names joined by '\n' (no ./..),
+        //   "" when the directory can't be read
+        self.module.add_extern("p_dir_list", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Ptr(Box::new(IrType::U8)));
+        // p_is_dir(path: *u8) -> bool — path exists and is a directory
+        self.module.add_extern("p_is_dir", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Bool);
+        // p_mkdir(path: *u8) -> i64 — create one directory level, 0 on success
+        self.module.add_extern("p_mkdir", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
+        // p_rmdir(path: *u8) -> i64 — remove an EMPTY directory, 0 on success
+        self.module.add_extern("p_rmdir", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
+        // p_rename(old: *u8, new: *u8) -> i64 — rename/move, 0 on success
+        self.module.add_extern("p_rename", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
         // p_clock_now() -> i64  — wall-clock time in nanoseconds since Unix epoch
         self.module.add_extern("p_clock_now", vec![], IrType::I64);
         // p_clock_now_us() -> i64  — wall-clock time in microseconds since Unix epoch

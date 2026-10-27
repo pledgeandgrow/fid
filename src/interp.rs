@@ -259,6 +259,10 @@ pub struct Interpreter {
     sb_table: HashMap<i64, String>,
     /// Next string builder handle (incrementing counter for unique IDs).
     sb_next_handle: i64,
+    /// Finished process results for p_process_*: handle -> (stdout, stderr, exit code).
+    proc_table: HashMap<i64, (String, String, i64)>,
+    /// Next process result handle.
+    next_proc_handle: i64,
     /// KV caches for LLM serving (ML9). Each entry is a KvCache identified by
     /// an opaque handle (i64 index into this Vec).
     kv_caches: Vec<Rc<RefCell<crate::tensor::KvCache>>>,
@@ -496,6 +500,8 @@ impl Interpreter {
             vec_side_table: HashMap::new(),
             sb_table: HashMap::new(),
             sb_next_handle: 1,
+            proc_table: HashMap::new(),
+            next_proc_handle: 1,
             kv_caches: Vec::new(),
             verbose: false,
             debug_mode: true,
@@ -2698,6 +2704,8 @@ impl Interpreter {
             || name.starts_with("p_http_")
             || name.starts_with("p_db_")
             || name.starts_with("p_file_")
+            || name.starts_with("p_dir_")
+            || name.starts_with("p_process_")
             || name.starts_with("p_thread_")
             || name.starts_with("p_atomic_")
             || name.starts_with("p_mutex_")
@@ -5086,6 +5094,105 @@ impl Interpreter {
                     }
                 }
                 ExecOutcome::Value(Value::Int(-1))
+            }
+
+            // ─── Captured subprocess results ───
+            "p_process_run" => {
+                // Run a shell command, capture stdout/stderr/exit code into
+                // proc_table, return a handle (0 = failed to start).
+                let cmd_str = args.first().map(|a| self.value_to_string(a)).unwrap_or_default();
+                if cmd_str.is_empty() {
+                    return ExecOutcome::Value(Value::Int(0));
+                }
+                #[cfg(windows)]
+                let spawned = std::process::Command::new("cmd")
+                    .args(["/C", &cmd_str])
+                    .output();
+                #[cfg(not(windows))]
+                let spawned = std::process::Command::new("sh")
+                    .args(["-c", &cmd_str])
+                    .output();
+                match spawned {
+                    Ok(out) => {
+                        let h = self.next_proc_handle;
+                        self.next_proc_handle += 1;
+                        let code = out.status.code().unwrap_or(-1) as i64;
+                        self.proc_table.insert(h, (
+                            String::from_utf8_lossy(&out.stdout).to_string(),
+                            String::from_utf8_lossy(&out.stderr).to_string(),
+                            code,
+                        ));
+                        ExecOutcome::Value(Value::Int(h))
+                    }
+                    Err(_) => ExecOutcome::Value(Value::Int(0)),
+                }
+            }
+            "p_process_stdout" | "p_process_stderr" => {
+                let h = match args.first() {
+                    Some(Value::Int(h)) => *h,
+                    _ => 0,
+                };
+                let s = self.proc_table.get(&h).map(|t| {
+                    if name == "p_process_stdout" { t.0.clone() } else { t.1.clone() }
+                }).unwrap_or_default();
+                ExecOutcome::Value(Value::Str(CompactString::from(s)))
+            }
+            "p_process_code" => {
+                let h = match args.first() {
+                    Some(Value::Int(h)) => *h,
+                    _ => 0,
+                };
+                let code = self.proc_table.get(&h).map(|t| t.2).unwrap_or(-1);
+                ExecOutcome::Value(Value::Int(code))
+            }
+            "p_process_close" => {
+                if let Some(Value::Int(h)) = args.first() {
+                    self.proc_table.remove(h);
+                }
+                ExecOutcome::Continue
+            }
+            "p_getpid" => ExecOutcome::Value(Value::Int(std::process::id() as i64)),
+
+            // ─── Filesystem builtins beyond p_file_* ───
+            "p_dir_list" => {
+                // Entry names joined by '\n' (no "."/".."); "" on failure.
+                let path = args.first().map(|a| self.value_to_string(a)).unwrap_or_default();
+                let listing = match std::fs::read_dir(&path) {
+                    Ok(rd) => rd.flatten()
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    Err(_) => String::new(),
+                };
+                ExecOutcome::Value(Value::Str(CompactString::from(listing)))
+            }
+            "p_is_dir" => {
+                let path = args.first().map(|a| self.value_to_string(a)).unwrap_or_default();
+                ExecOutcome::Value(Value::Bool(!path.is_empty() && std::path::Path::new(&path).is_dir()))
+            }
+            "p_mkdir" => {
+                // One level only — fs_mkdir_all does the recursion in Fides.
+                let path = args.first().map(|a| self.value_to_string(a)).unwrap_or_default();
+                match std::fs::create_dir(&path) {
+                    Ok(()) => ExecOutcome::Value(Value::Int(0)),
+                    Err(_) => ExecOutcome::Value(Value::Int(-1)),
+                }
+            }
+            "p_rmdir" => {
+                // Empty directory only — fs_rmdir_all does the walk-delete.
+                let path = args.first().map(|a| self.value_to_string(a)).unwrap_or_default();
+                match std::fs::remove_dir(&path) {
+                    Ok(()) => ExecOutcome::Value(Value::Int(0)),
+                    Err(_) => ExecOutcome::Value(Value::Int(-1)),
+                }
+            }
+            "p_rename" => {
+                let a = args.first().map(|v| self.value_to_string(v)).unwrap_or_default();
+                let b = args.get(1).map(|v| self.value_to_string(v)).unwrap_or_default();
+                match std::fs::rename(&a, &b) {
+                    Ok(()) => ExecOutcome::Value(Value::Int(0)),
+                    Err(_) => ExecOutcome::Value(Value::Int(-1)),
+                }
             }
             "p_exit" => {
                 if let Some(Value::Int(code)) = args.first() {

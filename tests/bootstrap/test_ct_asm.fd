@@ -1,0 +1,44 @@
+// test_ct_asm.fd — @constant_time functions that pass the post-codegen
+// assembly verifier (codegen_x64::verify_constant_time_asm).
+// Expected: PASS on interp / C / PE, and `fidesc build --target x86-64`
+// succeeds (no conditional jumps, no div/sqrt, no indexed loads, no calls
+// to non-constant-time functions in the generated x86-64 text).
+//
+// @wrapping is required: without it the codegen emits a `jo` overflow trap
+// after every add/sub/mul, and the verifier reports that branch.
+
+@constant_time
+@wrapping
+fn ct_select(condition: i64, a: i64, b: i64) -> i64 {
+    // mask = 0 - condition: all ones if condition == 1, zero if 0
+    val mask = 0 - condition;
+    val result = (a & mask) | (b & ~mask);
+    return result;
+}
+
+@constant_time
+@wrapping
+fn ct_is_nonzero(x: i64) -> i64 {
+    // sign bit of (x | -x) is set iff x != 0
+    val folded = x | (0 - x);
+    val nz = (folded >> 63) & 1;
+    return nz;
+}
+
+@constant_time
+@wrapping
+fn ct_eq(a: i64, b: i64) -> i64 {
+    val d = a ^ b;
+    val nz = ct_is_nonzero(d);
+    val eq = 1 - nz;
+    return eq;
+}
+
+fn main() {
+    print(ct_select(1, 100, 200));
+    print(ct_select(0, 100, 200));
+    print(ct_eq(5, 5));
+    print(ct_eq(5, 6));
+    print(ct_is_nonzero(0));
+    print(ct_is_nonzero(-7));
+}

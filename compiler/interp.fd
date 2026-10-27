@@ -2749,6 +2749,10 @@ pub fn Interpreter_is_runtime_func_uncached(self: &Interpreter, name: str) -> bo
     if str_starts_with(name, "p_http_") { return true; }
     if str_starts_with(name, "p_db_") { return true; }
     if str_starts_with(name, "p_file_") { return true; }
+    if str_starts_with(name, "p_dir_") { return true; }
+    if str_starts_with(name, "p_process_") { return true; }
+    if name == "p_mkdir" || name == "p_rmdir" || name == "p_rename" || name == "p_is_dir" { return true; }
+    if name == "p_getpid" { return true; }
     if str_starts_with(name, "p_thread_") { return true; }
     if str_starts_with(name, "p_atomic_") { return true; }
     if str_starts_with(name, "p_mutex_") { return true; }
@@ -4711,6 +4715,42 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
             self.vec_side_table.push(VecSideEntry_new(raddr, rhandle));
             return ExecOutcome::Value(Value::Int(raddr));
         }
+    }
+
+    // ─── Directory / path builtins: delegate to the host runtime. ───
+    if str_starts_with(name, "p_dir_") || name == "p_mkdir" || name == "p_rmdir" || name == "p_rename" || name == "p_is_dir" || name == "p_getpid" {
+        var dpath: str = "";
+        if args.len() >= 1 { dpath = Interpreter_value_to_string(self, args.get(0)); }
+        if name == "p_dir_list" { return ExecOutcome::Value(Value::Str(p_dir_list(dpath))); }
+        if name == "p_is_dir" { return ExecOutcome::Value(Value::Bool(p_is_dir(dpath))); }
+        if name == "p_mkdir" { return ExecOutcome::Value(Value::Int(p_mkdir(dpath))); }
+        if name == "p_rmdir" { return ExecOutcome::Value(Value::Int(p_rmdir(dpath))); }
+        if name == "p_rename" {
+            var dst: str = "";
+            if args.len() >= 2 { dst = Interpreter_value_to_string(self, args.get(1)); }
+            return ExecOutcome::Value(Value::Int(p_rename(dpath, dst)));
+        }
+        if name == "p_getpid" { return ExecOutcome::Value(Value::Int(p_getpid())); }
+    }
+
+    // ─── Captured subprocess: the host runtime keeps the result table. ───
+    if str_starts_with(name, "p_process_") {
+        var ph: i64 = 0;
+        if args.len() >= 1 {
+            match args.get(0) {
+                Value::Int(a) => { ph = a; }
+                Value::Ptr(a) => { ph = a; }
+                _ => {}
+            }
+        }
+        if name == "p_process_run" {
+            var pcmd: str = Interpreter_value_to_string(self, args.get(0));
+            return ExecOutcome::Value(Value::Int(p_process_run(pcmd)));
+        }
+        if name == "p_process_stdout" { return ExecOutcome::Value(Value::Str(p_process_stdout(ph))); }
+        if name == "p_process_stderr" { return ExecOutcome::Value(Value::Str(p_process_stderr(ph))); }
+        if name == "p_process_code" { return ExecOutcome::Value(Value::Int(p_process_code(ph))); }
+        if name == "p_process_close" { p_process_close(ph); return ExecOutcome::Value(Value::Void); }
     }
 
     var rout: ExecOutcome = Interpreter_call_runtime2(self, name, args);

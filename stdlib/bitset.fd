@@ -1,0 +1,321 @@
+// Fides BitSet standard library
+//
+// A growable set of bits, packed 63 per i64 word (bit 63 is left unused so
+// every word stays non-negative — no signed-shift edge cases).
+//
+// Useful for schedulers, allocators, compiler liveness sets, Bloom filters.
+//
+// Usage:
+//   use bitset;
+//   value bs = bitset_new(100);
+//   bitset_set(bs, 42);
+//   if bitset_get(bs, 42) { ... }
+//   value both = bitset_and(a, b);
+//   value n = bitset_next_set(bs, 0);   // -1 when none
+
+module bitset;
+
+use vec;
+
+const BITS_PER_WORD: i64 = 63;
+
+/// A set of bits. `words` holds BITS_PER_WORD bits per element.
+pub struct BitSet {
+    pub words: Vec,    // Vec<i64>, each element holds 63 bits
+    pub nbits: i64,    // logical size in bits
+}
+
+// ─── Construction ───────────────────────────────────────────────────────
+
+fn bitset_words_for(nbits: i64) -> i64 {
+    var w = nbits / BITS_PER_WORD;
+    if nbits % BITS_PER_WORD != 0 { w = w + 1; }
+    return w;
+}
+
+/// A BitSet of `nbits` bits, all clear.
+pub fn bitset_new(nbits: i64) -> BitSet {
+    var n = nbits;
+    if n < 0 { n = 0; }
+    var wcount = bitset_words_for(n);
+    var words = Vec::new();
+    var i = 0;
+    while i < wcount {
+        words.push(0);
+        i = i + 1;
+    }
+    return BitSet { words: words, nbits: n };
+}
+
+/// A BitSet of `nbits` bits, all set.
+pub fn bitset_new_full(nbits: i64) -> BitSet {
+    var bs = bitset_new(nbits);
+    bitset_fill_all(bs);
+    return bs;
+}
+
+/// A BitSet from a "0101" string (char index = bit index).
+pub fn bitset_from_string(s: str) -> BitSet {
+    var bs = bitset_new(str_len(s));
+    var i = 0;
+    while i < str_len(s) {
+        if str_byte_at(s, i) == 49 {                  // '1'
+            bitset_set(bs, i);
+        }
+        i = i + 1;
+    }
+    return bs;
+}
+
+// ─── Single bits ────────────────────────────────────────────────────────
+
+fn bitset_in_range(bs: BitSet, i: i64) -> bool {
+    return i >= 0 && i < bs.nbits;
+}
+
+/// Set bit `i`. Out-of-range indices are ignored.
+pub fn bitset_set(bs: BitSet, i: i64) -> void {
+    if !bitset_in_range(bs, i) { return; }
+    var w = i / BITS_PER_WORD;
+    var k = i % BITS_PER_WORD;
+    bs.words.set(w, bs.words.get(w) | (1 << k));
+}
+
+/// Clear bit `i`. Out-of-range indices are ignored.
+pub fn bitset_clear(bs: BitSet, i: i64) -> void {
+    if !bitset_in_range(bs, i) { return; }
+    var w = i / BITS_PER_WORD;
+    var k = i % BITS_PER_WORD;
+    var mask = 1 << k;
+    var word = bs.words.get(w);
+    if (word & mask) != 0 {
+        bs.words.set(w, word ^ mask);                 // clears the bit w/o '~'
+    }
+}
+
+/// Flip bit `i`. Out-of-range indices are ignored.
+pub fn bitset_flip(bs: BitSet, i: i64) -> void {
+    if !bitset_in_range(bs, i) { return; }
+    var w = i / BITS_PER_WORD;
+    var k = i % BITS_PER_WORD;
+    bs.words.set(w, bs.words.get(w) ^ (1 << k));
+}
+
+/// Is bit `i` set? Out-of-range reads return false.
+pub fn bitset_get(bs: BitSet, i: i64) -> bool {
+    if !bitset_in_range(bs, i) { return false; }
+    var w = i / BITS_PER_WORD;
+    var k = i % BITS_PER_WORD;
+    return (bs.words.get(w) & (1 << k)) != 0;
+}
+
+// ─── Bulk operations ────────────────────────────────────────────────────
+
+/// Set every bit in range.
+pub fn bitset_fill_all(bs: BitSet) -> void {
+    var i = 0;
+    while i < bs.nbits {
+        bitset_set(bs, i);
+        i = i + 1;
+    }
+}
+
+/// Clear every bit.
+pub fn bitset_clear_all(bs: BitSet) -> void {
+    var w = 0;
+    while w < bs.words.len() {
+        bs.words.set(w, 0);
+        w = w + 1;
+    }
+}
+
+/// Number of set bits.
+pub fn bitset_count(bs: BitSet) -> i64 {
+    var total = 0;
+    var i = 0;
+    while i < bs.nbits {
+        if bitset_get(bs, i) { total = total + 1; }
+        i = i + 1;
+    }
+    return total;
+}
+
+/// Any bit set?
+pub fn bitset_any(bs: BitSet) -> bool {
+    return bitset_count(bs) > 0;
+}
+
+/// All bits set?
+pub fn bitset_all(bs: BitSet) -> bool {
+    return bitset_count(bs) == bs.nbits;
+}
+
+/// No bits set?
+pub fn bitset_none(bs: BitSet) -> bool {
+    return bitset_count(bs) == 0;
+}
+
+/// Index of the first set bit at or after `from`, or -1.
+pub fn bitset_next_set(bs: BitSet, from: i64) -> i64 {
+    var i = from;
+    if i < 0 { i = 0; }
+    while i < bs.nbits {
+        if bitset_get(bs, i) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Index of the first clear bit at or after `from`, or -1.
+pub fn bitset_next_clear(bs: BitSet, from: i64) -> i64 {
+    var i = from;
+    if i < 0 { i = 0; }
+    while i < bs.nbits {
+        if !bitset_get(bs, i) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ─── Set algebra (new BitSets, sizes must match) ────────────────────────
+
+fn bitset_check_same(a: BitSet, b: BitSet) -> void {
+    if a.nbits != b.nbits {
+        p_panic("bitset: size mismatch");
+    }
+}
+
+/// a AND b.
+pub fn bitset_and(a: BitSet, b: BitSet) -> BitSet {
+    bitset_check_same(a, b);
+    var out = bitset_new(a.nbits);
+    var w = 0;
+    while w < a.words.len() {
+        out.words.set(w, a.words.get(w) & b.words.get(w));
+        w = w + 1;
+    }
+    return out;
+}
+
+/// a OR b.
+pub fn bitset_or(a: BitSet, b: BitSet) -> BitSet {
+    bitset_check_same(a, b);
+    var out = bitset_new(a.nbits);
+    var w = 0;
+    while w < a.words.len() {
+        out.words.set(w, a.words.get(w) | b.words.get(w));
+        w = w + 1;
+    }
+    return out;
+}
+
+/// a XOR b.
+pub fn bitset_xor(a: BitSet, b: BitSet) -> BitSet {
+    bitset_check_same(a, b);
+    var out = bitset_new(a.nbits);
+    var w = 0;
+    while w < a.words.len() {
+        out.words.set(w, a.words.get(w) ^ b.words.get(w));
+        w = w + 1;
+    }
+    return out;
+}
+
+/// a AND (NOT b) — the bits in a that are not in b.
+pub fn bitset_andnot(a: BitSet, b: BitSet) -> BitSet {
+    bitset_check_same(a, b);
+    var out = bitset_new(a.nbits);
+    var w = 0;
+    while w < a.words.len() {
+        var av = a.words.get(w);
+        var bv = b.words.get(w);
+        out.words.set(w, av & (av ^ bv));            // av & ~bv without '~'
+        w = w + 1;
+    }
+    return out;
+}
+
+/// Do a and b share at least one set bit?
+pub fn bitset_intersects(a: BitSet, b: BitSet) -> bool {
+    bitset_check_same(a, b);
+    var w = 0;
+    while w < a.words.len() {
+        if (a.words.get(w) & b.words.get(w)) != 0 { return true; }
+        w = w + 1;
+    }
+    return false;
+}
+
+/// Every set bit of b is also set in a?
+pub fn bitset_contains_all(a: BitSet, b: BitSet) -> bool {
+    bitset_check_same(a, b);
+    var w = 0;
+    while w < a.words.len() {
+        var av = a.words.get(w);
+        var bv = b.words.get(w);
+        if (av & bv) != bv { return false; }
+        w = w + 1;
+    }
+    return true;
+}
+
+/// Same bits set in both?
+pub fn bitset_equals(a: BitSet, b: BitSet) -> bool {
+    if a.nbits != b.nbits { return false; }
+    var w = 0;
+    while w < a.words.len() {
+        if a.words.get(w) != b.words.get(w) { return false; }
+        w = w + 1;
+    }
+    return true;
+}
+
+/// A copy of the BitSet.
+pub fn bitset_clone(bs: BitSet) -> BitSet {
+    var out = bitset_new(bs.nbits);
+    var w = 0;
+    while w < bs.words.len() {
+        out.words.set(w, bs.words.get(w));
+        w = w + 1;
+    }
+    return out;
+}
+
+/// Bitwise NOT within the set's size (bits past nbits stay clear).
+pub fn bitset_not(bs: BitSet) -> BitSet {
+    var out = bitset_new(bs.nbits);
+    var i = 0;
+    while i < bs.nbits {
+        if !bitset_get(bs, i) { bitset_set(out, i); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── String / Vec conversions ───────────────────────────────────────────
+
+/// "01011..." — one char per bit in index order.
+pub fn bitset_to_string(bs: BitSet) -> str {
+    var out = "";
+    var i = 0;
+    while i < bs.nbits {
+        if bitset_get(bs, i) {
+            out = out + "1";
+        } else {
+            out = out + "0";
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// All set indices as a Vec<i64>, ascending.
+pub fn bitset_to_vec(bs: BitSet) -> Vec {
+    var out = Vec::new();
+    var i = 0;
+    while i < bs.nbits {
+        if bitset_get(bs, i) { out.push(i); }
+        i = i + 1;
+    }
+    return out;
+}

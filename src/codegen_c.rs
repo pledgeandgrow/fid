@@ -258,6 +258,18 @@ impl CCodeGen {
 
         let to_is_int = matches!(to, IrType::I64 | IrType::I32 | IrType::I16 | IrType::I8 | IrType::Bool);
 
+        // `Ptr(G)` arg → `G` param (Generic/Opaque): the arg is a `&mut T`-style
+        // slot but the callee expects the handle value. Emit the pointee so
+        // the callee sees the header, not the slot. Only fires when the
+        // pointee IS the param's type — generic type vars (e.g. `K` in
+        // HashMap<K,V>) legitimately hold raw pointers like str.
+        let to_is_handle = matches!(to, IrType::Generic(_, _) | IrType::Opaque(_));
+        if let (IrType::Ptr(inner), true) = (from, to_is_handle) {
+            if **inner == *to {
+                return format!("*(void**){}", val);
+            }
+        }
+
         // Array params decay to pointers in C — cast to element pointer type
         if to_is_array {
             if let IrType::Array(elem, _) = to {
@@ -673,6 +685,17 @@ impl CCodeGen {
             ("p_file_delete", &[p()]),
             ("p_file_size", &[p()]),
             ("p_file_hash", &[p()]),
+            ("p_dir_list", &[p()]),
+            ("p_is_dir", &[p()]),
+            ("p_mkdir", &[p()]),
+            ("p_rmdir", &[p()]),
+            ("p_rename", &[p(), p()]),
+            ("p_getpid", &[]),
+            ("p_process_run", &[p()]),
+            ("p_process_stdout", &[I64]),
+            ("p_process_stderr", &[I64]),
+            ("p_process_code", &[I64]),
+            ("p_process_close", &[I64]),
             // Varargs functions: register the fixed prefix (non-varargs params).
             // p_thread_spawn(func_name: const char*, num_args: i64, ...args)
             // p_executor_spawn(exec: i64, func_name: const char*, num_args: i64, ...args)
@@ -820,6 +843,16 @@ impl CCodeGen {
         wln!(self, "#include <arpa/inet.h>");
         wln!(self, "#include <unistd.h>");
         wln!(self, "#include <fcntl.h>");
+        wln!(self, "#endif");
+        // Directory listing + process capture (fs/process stdlib builtins)
+        wln!(self, "#include <sys/stat.h>");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "#include <windows.h>");
+        wln!(self, "#include <direct.h>");
+        wln!(self, "#include <process.h>");
+        wln!(self, "#else");
+        wln!(self, "#include <dirent.h>");
+        wln!(self, "#include <sys/wait.h>");
         wln!(self, "#endif");
         wln!(self, "");
         // Undefine MSVC macros that conflict with function names
@@ -1245,7 +1278,19 @@ impl CCodeGen {
         wln!(self, "char* p_argv(int64_t index);");
         // Process control builtins
         wln!(self, "int64_t p_system(const char* cmd);");
+        wln!(self, "int64_t p_process_run(const char* cmd);");
+        wln!(self, "char* p_process_stdout(int64_t h);");
+        wln!(self, "char* p_process_stderr(int64_t h);");
+        wln!(self, "int64_t p_process_code(int64_t h);");
+        wln!(self, "void p_process_close(int64_t h);");
+        wln!(self, "int64_t p_getpid(void);");
         wln!(self, "void p_exit(int64_t code);");
+        // Filesystem builtins beyond p_file_*
+        wln!(self, "char* p_dir_list(const char* path);");
+        wln!(self, "bool p_is_dir(const char* path);");
+        wln!(self, "int64_t p_mkdir(const char* path);");
+        wln!(self, "int64_t p_rmdir(const char* path);");
+        wln!(self, "int64_t p_rename(const char* a, const char* b);");
         // Wall-clock timing builtins
         wln!(self, "int64_t p_clock_now(void);");
         wln!(self, "int64_t p_clock_now_us(void);");
@@ -2956,7 +3001,136 @@ impl CCodeGen {
         wln!(self, "char* p_argv(int64_t index) {{ if (index < 0 || index >= __p_argc) return NULL; return __p_argv[index]; }}");
         // Process control builtins
         wln!(self, "int64_t p_system(const char* cmd) {{ return (int64_t)system(cmd); }}");
+        wln!(self, "int64_t p_getpid(void) {{");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    return (int64_t)_getpid();");
+        wln!(self, "#else");
+        wln!(self, "    return (int64_t)getpid();");
+        wln!(self, "#endif");
+        wln!(self, "}}");
+        // Captured subprocess results: run stores (out, err, code) in a slot
+        // table; the readers return the fields; close frees the slot.
+        wln!(self, "typedef struct {{ char* out; char* err; int64_t code; int used; }} PProc;");
+        wln!(self, "static PProc __p_proc_table[128];");
+        wln!(self, "static char* __p_read_all(const char* path) {{");
+        wln!(self, "    FILE* f = fopen(path, \"rb\");");
+        wln!(self, "    if (!f) {{ char* e = (char*)malloc(1); e[0] = 0; return e; }}");
+        wln!(self, "    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);");
+        wln!(self, "    if (n < 0) n = 0;");
+        wln!(self, "    char* buf = (char*)malloc((size_t)n + 1);");
+        wln!(self, "    size_t got = fread(buf, 1, (size_t)n, f);");
+        wln!(self, "    buf[got] = 0; fclose(f); return buf;");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_process_run(const char* cmd) {{");
+        wln!(self, "    if (!cmd || !*cmd) return 0;");
+        wln!(self, "    static int ctr = 0;");
+        wln!(self, "    int slot = -1;");
+        wln!(self, "    for (int i = 0; i < 128; i++) if (!__p_proc_table[i].used) {{ slot = i; break; }}");
+        wln!(self, "    if (slot < 0) return 0;");
+        wln!(self, "    char of[128], ef[128], full[8192];");
+        wln!(self, "    snprintf(of, sizeof of, \".fides_proc_%ld_%d.out\", (long)p_getpid(), ctr);");
+        wln!(self, "    snprintf(ef, sizeof ef, \".fides_proc_%ld_%d.err\", (long)p_getpid(), ctr);");
+        wln!(self, "    ctr++;");
+        wln!(self, "    snprintf(full, sizeof full, \"%s > \\\"%s\\\" 2> \\\"%s\\\"\", cmd, of, ef);");
+        wln!(self, "    int st = system(full);");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    __p_proc_table[slot].code = (int64_t)st;");
+        wln!(self, "#else");
+        wln!(self, "    __p_proc_table[slot].code = WIFEXITED(st) ? (int64_t)WEXITSTATUS(st) : -1;");
+        wln!(self, "#endif");
+        wln!(self, "    __p_proc_table[slot].out = __p_read_all(of);");
+        wln!(self, "    __p_proc_table[slot].err = __p_read_all(ef);");
+        wln!(self, "    remove(of); remove(ef);");
+        wln!(self, "    __p_proc_table[slot].used = 1;");
+        wln!(self, "    return (int64_t)slot + 1;");
+        wln!(self, "}}");
+        wln!(self, "char* p_process_stdout(int64_t h) {{");
+        wln!(self, "    if (h < 1 || h > 128 || !__p_proc_table[h-1].used) return \"\";");
+        wln!(self, "    return __p_proc_table[h-1].out;");
+        wln!(self, "}}");
+        wln!(self, "char* p_process_stderr(int64_t h) {{");
+        wln!(self, "    if (h < 1 || h > 128 || !__p_proc_table[h-1].used) return \"\";");
+        wln!(self, "    return __p_proc_table[h-1].err;");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_process_code(int64_t h) {{");
+        wln!(self, "    if (h < 1 || h > 128 || !__p_proc_table[h-1].used) return -1;");
+        wln!(self, "    return __p_proc_table[h-1].code;");
+        wln!(self, "}}");
+        wln!(self, "void p_process_close(int64_t h) {{");
+        wln!(self, "    if (h < 1 || h > 128 || !__p_proc_table[h-1].used) return;");
+        wln!(self, "    free(__p_proc_table[h-1].out); free(__p_proc_table[h-1].err);");
+        wln!(self, "    __p_proc_table[h-1].used = 0;");
+        wln!(self, "}}");
         wln!(self, "void p_exit(int64_t code) {{ exit((int)code); }}");
+        // Filesystem builtins beyond p_file_*
+        wln!(self, "int64_t p_mkdir(const char* path) {{");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    return _mkdir(path) == 0 ? 0 : -1;");
+        wln!(self, "#else");
+        wln!(self, "    return mkdir(path, 0755) == 0 ? 0 : -1;");
+        wln!(self, "#endif");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_rmdir(const char* path) {{");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    return _rmdir(path) == 0 ? 0 : -1;");
+        wln!(self, "#else");
+        wln!(self, "    return rmdir(path) == 0 ? 0 : -1;");
+        wln!(self, "#endif");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_rename(const char* a, const char* b) {{ return rename(a, b) == 0 ? 0 : -1; }}");
+        wln!(self, "bool p_is_dir(const char* path) {{");
+        wln!(self, "    struct stat st;");
+        wln!(self, "    if (stat(path, &st) != 0) return false;");
+        wln!(self, "    return (st.st_mode & S_IFMT) == S_IFDIR;");
+        wln!(self, "}}");
+        wln!(self, "char* p_dir_list(const char* path) {{");
+        wln!(self, "    // entry names joined by '\\n', no \".\"/\"..\"; \"\" on failure");
+        wln!(self, "    size_t need = 1;");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    WIN32_FIND_DATAA fd; char pat[2056];");
+        wln!(self, "    snprintf(pat, sizeof pat, \"%s\\\\*\", path);");
+        wln!(self, "    HANDLE h = FindFirstFileA(pat, &fd);");
+        wln!(self, "    if (h == INVALID_HANDLE_VALUE) {{ char* e = (char*)malloc(1); e[0] = 0; return e; }}");
+        wln!(self, "    do {{");
+        wln!(self, "        if (strcmp(fd.cFileName, \".\") && strcmp(fd.cFileName, \"..\"))");
+        wln!(self, "            need += strlen(fd.cFileName) + 1;");
+        wln!(self, "    }} while (FindNextFileA(h, &fd));");
+        wln!(self, "    FindClose(h);");
+        wln!(self, "    char* out = (char*)malloc(need);");
+        wln!(self, "    out[0] = 0;");
+        wln!(self, "    h = FindFirstFileA(pat, &fd);");
+        wln!(self, "    if (h == INVALID_HANDLE_VALUE) return out;");
+        wln!(self, "    int first = 1;");
+        wln!(self, "    do {{");
+        wln!(self, "        if (strcmp(fd.cFileName, \".\") && strcmp(fd.cFileName, \"..\")) {{");
+        wln!(self, "            if (!first) strcat(out, \"\\n\");");
+        wln!(self, "            strcat(out, fd.cFileName); first = 0;");
+        wln!(self, "        }}");
+        wln!(self, "    }} while (FindNextFileA(h, &fd));");
+        wln!(self, "    FindClose(h);");
+        wln!(self, "    return out;");
+        wln!(self, "#else");
+        wln!(self, "    DIR* d = opendir(path);");
+        wln!(self, "    if (!d) {{ char* e = (char*)malloc(1); e[0] = 0; return e; }}");
+        wln!(self, "    struct dirent* ent;");
+        wln!(self, "    while ((ent = readdir(d)) != NULL) {{");
+        wln!(self, "        if (strcmp(ent->d_name, \".\") && strcmp(ent->d_name, \"..\"))");
+        wln!(self, "            need += strlen(ent->d_name) + 1;");
+        wln!(self, "    }}");
+        wln!(self, "    rewinddir(d);");
+        wln!(self, "    char* out = (char*)malloc(need);");
+        wln!(self, "    out[0] = 0;");
+        wln!(self, "    int first = 1;");
+        wln!(self, "    while ((ent = readdir(d)) != NULL) {{");
+        wln!(self, "        if (strcmp(ent->d_name, \".\") && strcmp(ent->d_name, \"..\")) {{");
+        wln!(self, "            if (!first) strcat(out, \"\\n\");");
+        wln!(self, "            strcat(out, ent->d_name); first = 0;");
+        wln!(self, "        }}");
+        wln!(self, "    }}");
+        wln!(self, "    closedir(d);");
+        wln!(self, "    return out;");
+        wln!(self, "#endif");
+        wln!(self, "}}");
         // Wall-clock timing builtins — use clock_gettime(CLOCK_REALTIME)
         wln!(self, "#if defined(__linux__) || defined(__APPLE__)");
         wln!(self, "#include <time.h>");

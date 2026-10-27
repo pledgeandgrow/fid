@@ -4,36 +4,36 @@
 > Fides compiler safely. Read this before making changes.
 >
 > **Fides is self-hosted and independent.** The primary compiler is in
-> `compiler/*.fd` (52 modules, 100,934 LOC). The Rust source in `src/*.rs` is
-> the bootstrap reference, used only when `compiler/*.fd` changes. For everyday
-> work (writing programs, adding stdlib, adding tests, building tools), use
-> `release/fides-c3.exe` directly — no Rust build needed.
+> `compiler/*.fd` (54 modules, 104,439 LOC). The Rust source in `src/*.rs`
+> (55 files, 100,935 LOC) is the bootstrap reference, used when
+> `compiler/*.fd` changes.
+>
+> **The self-hosted compiler is the release compiler:** `RELEASE=1
+> ./scripts/bootstrap.sh` builds it in 3 stages (fixpoint checked) into
+> `release/fid.exe`, which the installer ships as `fid.exe`. Its
+> `run` and `ccompile` match the Rust compiler on the test programs and
+> examples (see "Known Bugs" #1 for the few exceptions).
 
 ## Build & Test Commands
 
-### Self-hosted compiler (everyday work)
+### Self-hosted compiler
 
 ```bash
-# The self-hosted compiler is already built in release/fides-c3.exe
-# Use it directly for compiling Fides programs:
+# Release build: 3 stages, fixpoint checked, installed as
+# release/fid.exe (the installer ships it as fid.exe)
+RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh
+.\release\fid.exe run      tests/bootstrap/hello.fd
+.\release\fid.exe ccompile tests/bootstrap/hello.fd -o hello.exe  # needs a C compiler
 
-# Compile a Fides program to C, then to a native executable
-.\release\fides-c3.exe ccompile tests/bootstrap/hello.fd -o hello.exe
+# Single stage (development; same output name, not fixpoint-checked):
+# release/fid-dev.c (generated C) + release/fid-dev(.exe)
+./scripts/build-selfhost.sh          # fidesc dump-c + C compile → release/fid-dev.exe
 
-# Run a Fides file in the IR interpreter
-.\release\fides-c3.exe run tests/bootstrap/hello.fd
-
-# Dump C code (for inspection)
-.\release\fides-c3.exe dump-c tests/bootstrap/hello.fd > hello.c
-
-# Run the LSP server
-.\release\fides-c3.exe lsp
-
-# Format a file
-.\release\fides-c3.exe fmt tests/bootstrap/hello.fd
+.\release\fid.exe dump-c compiler/main.fd > c2.c   # self-compile (fixpoint)
+.\release\fid.exe run tests/bootstrap/hello.fd    # interpreter (as fidesc run)
 ```
 
-### Rust bootstrap compiler (only when changing compiler/*.fd)
+### Rust bootstrap compiler (builds stage 1; runs the test harness)
 
 ```bash
 # Build (release — what verify.sh uses)
@@ -61,18 +61,14 @@ cargo build
 ./verify-selfhost.sh --save
 ./verify-selfhost.sh --list
 
-# Build the self-hosted compiler into release/ (Windows PowerShell)
-.\build-selfhost.ps1              # Build release/fides-c.exe
-.\build-selfhost.ps1 -Bootstrap   # Build + test self-compilation (fixpoint check)
-.\build-selfhost.ps1 -Test <file> # Build + test on a .fd file
-.\build-selfhost.ps1 -Clean       # Clean release/ and rebuild
+# Build the self-hosted compiler into release/ (manual two-step)
+#   1. fidesc ccompile compiler\main.fd -o ... generates C via the Rust bootstrap
+#   2. link the generated C with a C compiler (zig cc / cl / tcc)
+#   See docs/selfhost/selfhost.md § Build Pipeline for details.
+# (build-selfhost.ps1 no longer exists — do not reference it.)
 
-# Generate golden files for intermediate compiler stages
-./scripts/gen_golden.sh
-
-# Bisect which layer broke a test
-./scripts/bisect.sh <test_name>
-# Example: ./scripts/bisect.sh strings
+# NOTE: scripts/gen_golden.sh and scripts/bisect.sh do NOT exist —
+# verify.sh --golden currently fails; bisect via dump-* commands instead.
 
 # Run a single test through the interpreter
 ./target/release/fidesc run tests/bootstrap/<name>.fd
@@ -154,34 +150,55 @@ cargo build
 # Manual trigger: gh workflow run build-installer.yml -f version=1.0.0
 ```
 
-## Current Baseline (v1.0.0 — released Sep 9, 2026)
+## Current Baseline (post-session-34, Oct 27 2026)
 
 ```
-SELF-HOSTED COMPILER (primary):
-  compiler/*.fd:  52 modules, 100,934 LOC — THE COMPILER
-  Fixpoint:       VERIFIED byte-for-byte (fides-c4.c == fides-c5.c, 29,763,762 bytes)
-  Bootstrap:      5 generations verified (Rust → c1 → c2 → c3 → c4 → c5, all work)
-  Use:            release/fides-c3.exe for everyday work
+SELF-HOSTED COMPILER (primary source):
+  compiler/*.fd:  54 modules, 104,439 LOC — THE COMPILER
+  Fixpoint:       VERIFIED byte-for-byte (fides-c4.c == fides-c5.c, ~29.7 MB;
+                  re-verified stage2==stage3 in session 29)
+  Bootstrap:      5 generations verified (Rust → c1 → c2 → c3 → c4 → c5)
+  Binary:         release/fid.exe (RELEASE=1 scripts/bootstrap.sh):
+                  fixpoint; run 302/302 and ccompile 242/243 test programs
+                  match fidesc (Known Bugs #1). Shipped as fid.exe.
 
-RUST BOOTSTRAP (reference only):
-  src/*.rs:       54 files, 100,271 LOC — bootstrap reference
-  Used when:      compiler/*.fd changes (regenerate C1, verify fixpoint)
+RUST BOOTSTRAP (reference + test harness):
+  src/*.rs:       55 files, 100,935 LOC — bootstrap reference
+  Used when:      compiler/*.fd changes (builds stage 1); runs `fidesc test`
+  Suite (Oct 27): interp 280/280, C 278/278, PE 282/282, expected-fail 59/59
 
 WINDOWS INSTALLER (v1.0.0):
   installer/:     NSIS script + build helper
   CI:            .github/workflows/build-installer.yml (builds on release tags)
   Output:        Fides-Setup-1.0.0.exe (2.5 MB, tested on Windows)
-  Ships:         fidesc.exe renamed as fides.exe (fully functional)
+  Ships:         fid.exe = self-hosted (release/fid.exe), fidesc.exe =
+                 Rust compiler, stdlib/ and examples/ beside them
 
 TESTS:
-  Self-host:      38/38 pass on interp + C + PE (tests/selfhost/)
-  Bootstrap:      Interpreter 236/237, C Codegen 220/237, PE Emitter 236/237
-  Fixpoint:       c4 type-checks + borrow-checks full 100K LOC compiler + c4==c5 byte-for-byte
+  tests/bootstrap/: 302 .fd files (fidesc test)
+  tests/selfhost/:  46 .fd files (verify-selfhost.sh; baseline saved 38/38×3)
+  Baseline:         tests/bootstrap/baseline/test_results.txt
 
 STDLIB:
-  stdlib/*.fd:    104 modules, 30,129 LOC (OS modules moved to fides-os project)
+  stdlib/*.fd:    104 modules, 30,446 LOC (kernel/uefi moved to fides-os project)
 
 RECENT IMPROVEMENTS:
+  Session 30:     Post-codegen constant-time verifier on the x86-64 ELF path:
+                  after peephole, `verify_constant_time_asm` scans final asm for
+                  conditional/indirect jumps, memory cmov, indexed memory ops,
+                  variable-latency ops, and calls to non-CT functions; violations
+                  become build errors (test_ct_asm.fd / test_ct_asm_fail.fd).
+                  cast_arg in both C codegens now dereferences Ptr(inner)→Generic
+                  when inner == the generic type (heals &mut Vec → Vec forwards).
+                  cl.exe invocation fixed (cmd /C quote-stripping).
+  Session 29:     Reference escape check (src/escape.rs, compiler/escape.fd):
+                  references are second-class — cannot be stored, returned from
+                  locals, sent to tasks, or captured by escaping closures.
+                  Vec<f64> element reads + f64 return conversion fixed on all
+                  backends. Fixpoint re-verified (stage2==stage3).
+  Session 26-28:  Branch consolidation (release-infra → main), fixpoint
+                  re-verified (c4==c5 byte-for-byte), file-analysis/ audit of
+                  all compiler/*.fd modules, B/C/D remediation batches.
   Session 23:     6 high-priority language features implemented:
                   @zeroize (F88) — compiler-inserted memset(0) at scope exit
                   @secret (F74) — info-flow control: secrets can't reach output sinks
@@ -212,20 +229,21 @@ RECENT IMPROVEMENTS:
   Sandbox:        Alloc capability enforced (p_malloc/p_free blocked in sandbox)
   Rc/Arc:         stdlib/rc.fd — reference counting (rc_new, rc_clone, rc_drop, etc.)
   @repr(C):       C-compatible struct layout for hardware/FFI/kernel
-  Kernel:         stdlib/kernel.fd — OS kernel primitives started
+  Kernel:         stdlib/kernel.fd — MOVED to the fides-os project (Oct 24)
   @cpu_local:     Per-CPU variables via GS segment (compiler/pe.fd)
   Inline asm:     Clobber lists, 50+ x86 instructions encoded (compiler/pe.fd)
   --no-std:       Bare-metal mode skips stdlib/core.fd (compiler/compiler.fd)
-  UEFI:           stdlib/uefi.fd — boot services bindings (AllocatePool, ExitBootServices, etc.)
+  UEFI:           stdlib/uefi.fd — MOVED to the fides-os project (Oct 24)
   Cross-comp:     --target arm64/riscv64 validation with C codegen fallback
 
-Binaries:     4 (fidesc, ark, scribe, veil) — fidesc is bootstrap only
+Binaries:     4 (fidesc, ark, scribe, veil) + the self-hosted fid
 ```
 
 **Build directories:**
 - `target/` — Rust bootstrap compiler output (`fidesc.exe`) — gitignored
-- `release/` — Self-hosted compiler output (`fides-c3.exe`, generated C) — gitignored
-- `compiler/` — Self-hosted compiler source (52 `.fd` modules) — THE PRIMARY COMPILER
+- `release/` — Self-hosted compiler output: `fid.exe` (from the release
+  bootstrap, or a single stage with `fid.c` from build-selfhost.sh) — gitignored
+- `compiler/` — Self-hosted compiler source (54 `.fd` modules) — THE PRIMARY COMPILER
 
 **Changelog:** See `docs/reference/changelog.md` for the full history of
 features and fixes. (Previously duplicated here — removed to avoid maintaining
@@ -244,7 +262,8 @@ touching them.
 | `src/regalloc.rs` | **CRITICAL** | Linear scan allocator (~1100 LOC). F-1A: constant rematerialization (`Location::Remat`). F-1D: effect-aware register allocation — calls to pure functions (in `L3Module.pure_functions`) only clobber RAX, not all caller-saved registers. I-2D: calls to `@no-alloc` functions (in `L3Module.no_alloc_functions`) also only clobber RAX. `@medical` functions included in no-alloc set. S-17: deterministic interval sorting (secondary key: vreg ID) to prevent non-deterministic codegen from HashMap iteration order. Any change here affects EVERY function. |
 | `src/peephole.rs` | **CRITICAL** | 9 passes, always on in `build`. A wrong transform silently corrupts all output. |
 | `src/elf64.rs` | **HIGH** | ELF64 header bytes, section layout, relocations (R_X86_64_PC32/PLT32/64). Off-by-one = corrupt binary. Self-hosted port in `compiler/elf64.fd` (2,423 LOC, 85% parity) includes full x86-64 instruction encoder, assembly parser, and ELF builder. |
-| `src/pe.rs` | **HIGH** | PE header bytes, import table, section layout. Off-by-one = corrupt .exe. |
+| `src/pe.rs` | **HIGH** | PE header bytes, import table (kernel32.dll + msvcrt.dll: every name in `IMPORTS`/`MSVCRT_IMPORTS` must be a real export, or no program starts), section layout. Off-by-one = corrupt .exe. Machine-code stubs must not keep a value in a volatile register (rcx, rdx, r8–r11) across a call (HeapFree clobbers them). |
+| `src/pe_runtime/*.fd` | **MEDIUM** | The Fides runtime of native Windows executables: builtin `p_X` runs `pert_X` (base, conc, tensor, data). Merged into every `emit`: a type error here breaks every PE build. C functions via `extern "C"` thunks; helpers prefixed `pe_`/`pet_`/`ped_` (unused ones are left out of the .exe). |
 | `src/coff.rs` | **HIGH** | COFF object file format. Same byte-level risk as PE/ELF. |
 | `src/macho.rs` | **HIGH** | Mach-O object file format. Same byte-level risk. |
 | `src/codegen_x64.rs` | **HIGH** | PIR L3 → x86-64 instruction encoding. ModRM/SIB bytes, REX prefixes, ABI rules. |
@@ -273,22 +292,78 @@ touching them.
 | `src/compiler.rs` | LOW | Pipeline orchestration — changes are visible. Phase 12: `enrich_errors()` post-processes errors with source context + error codes. |
 | `src/diag.rs` | LOW | Diagnostic system — structured error/warning/note/help with error codes, source context, color. Zero external deps. |
 | `src/lsp.rs` | LOW | LSP server — JSON-RPC over stdio, no external deps. |
-| `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. 99 stdlib modules: core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can, uefi, kernel, rc, volatile, test, sqlite, sdl, gl, image, font, mesh, gameloop, physics3d, skel, ui, net, camera, particles, animation2d, audio_mixer, asset, serialize, collision_broad, raycast, navmesh, terrain, profiler, replay, shader, editor, chunk, touch. |
+| `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. 104 stdlib modules: alloc, animation2d, arena, args, arinc, asset, audio, audio_mixer, banking, bitfield, bits, buffer, camera, can, channel, chunk, clinical, collections, collision_broad, core, crypto, data, db, dp, ecs, ecu, editor, env, events, file, flowfield, fmt, font, fs, game, gameloop, gl, grid, hash, http, image, input, io, iter, json, kv_cache, math, medical, memo, mesh, money, navmesh, net, os, ota, parallel, particles, path, physics, physics3d, plot, privacy, process, profiler, quant, queue, random, raycast, rc, regex, replay, result, scada, scene, sdl, serialize, shader, shape, shard, simd, skel, sort, sprite, sqlite, stack, storage, streaming, string, swift, sync, sys, template, tensor, terrain, test, tilemap, time, touch, typed_strings, ui, units, uuid, vec, volatile. (kernel.fd + uefi.fd moved to the fides-os project.) |
 
 ## Known Bugs (Do Not Re-Introduce)
 
-> **Critical Blockers:** See `docs/roadmap/roadmap-issues.md` → "Critical
+> **Critical Blockers:** See `docs/roadmap/roadmap.md` § Issues & Debates → "Critical
 > Blockers" section for the highest-priority issues that must be fixed
 > before production use:
 > 1. CB1: Safety annotations — core primitives enforced (Session 19), 13 stubs remain
 > 2. CB2: Generic Option<T>/Result<T,E> — ✅ resolved (Session 19)
-> 3. CB3: Backend test parity not 100% (231/243 interp, 214/243 C, 235/243 PE)
+> 3. CB3: Backend test parity — ✅ resolved (Oct 27: 280/280 interp, 278/278 C, 282/282 PE)
 > 4. CB4: Parser debug prints — ✅ resolved (Session 19)
 > 5. CB5: Self-hosted compiler build fails — ✅ resolved (Session 20, all 50 modules type-check)
 > 6. CB6: PE emitter stubs — partially resolved (Session 20, 6/15 fixed, 9 p_string_* remain)
 > 7. CB7: ELF64 symbol table dump — ✅ resolved (Session 20)
 
-1. **Register allocator clobbering** (`regalloc.rs`): Previously, constants not
+1. **Self-hosted compiler: what still differs from `fidesc`** (Oct 27).
+   `run` matches on all 302 test programs and all 10 examples; `ccompile`
+   on 242 of 243 test programs and 9 of 10 examples; all 59 expected-fail
+   tests are rejected. The rest:
+   - `test_sqlite` needs libsqlite3 and `examples/minimal_game` needs SDL2
+     (the Rust compiler fails the same way without them).
+   - Its native backend (`build --native`, compiler/pe.fd via PIR) crashes
+     (optimizer `pass_dse`, register allocation): `build`/`ccompile` go
+     through C and need a C compiler.
+   Fixed Oct 25–27 (docs/reference/known-bugs.md §2e): block jumps ended
+   functions, byte loads read side-table strings, builtins shadowed core
+   functions, the comptime loop unroller, String/HashMap result types,
+   stdlib lookup from an installed location, `ccompile` without `CC`, a
+   second `impl` block in an imported module was dropped (`merge_programs`
+   aliasing), @conserve checked only effects, `extern "C" link` libraries
+   not linked.
+
+2. **Nondeterministic self-hosted typecheck/borrowck**: regenerating
+   `release/fid-dev.c` from identical `compiler/*.fd` input can fail with
+   *different* errors per run (e.g. `Vec<i64>` vs `Vec<Vec<EscVar>>`
+   assignment, or a reference-escape error) or succeed. HashMap iteration
+   order in the self-hosted typechecker/inference is the suspected source.
+   Retry the build before assuming a regression. (Not reproduced on
+   Oct 25: five 3-stage bootstraps all type-checked and reached the
+   fixpoint.)
+
+3. **`cmd /C` quote stripping** (`src/main.rs`): the `vcvarsall.bat && cl.exe`
+   link path failed on Windows because `cmd /C` strips the first quote when
+   the command string begins with `"` and contains `&&`/`>` — `cl.exe` then
+   ran as `'C:\Program'` and produced empty stderr. **Fixed:** `cmd_str` is
+   wrapped in an outer quote pair.
+
+4. **`Vec` argument ABI at `cast_arg`** (`src/codegen_c.rs`,
+   `compiler/codegen_c.fd`): when a `Ptr(inner)` value (e.g. an
+   `&mut Vec<T>` parameter slot) is passed to a `Generic`/`Opaque` parameter
+   of exactly that inner type, the caller must emit `*(void**)` to load the
+   handle. Without the deref, `Vec_len`/`Vec_get` read the slot pointer as a
+   header → garbage lengths and crashes (seen in `record_def` →
+   `ra_vec_find_i64`). The deref fires **only** when the pointee type equals
+   the destination type — a broader version dereferenced `str` (which is
+   `*u8`) passed to generic params and corrupted `Parser_new`.
+
+5. **Post-codegen constant-time verification** (`src/codegen_x64.rs`):
+   `verify_constant_time_asm` runs on the x86-64 ELF path after peephole. It
+   rejects `jcc`/indirect jumps, `cmov` with memory operands, indexed
+   memory, variable-latency ops, and calls to non-`@constant_time` functions
+   in annotated code. `@wrapping` exempts generated overflow branches.
+   The recursion-guard and stack-canary sequences are exempt. **x86-64 ELF
+   only** — the PE path emits machine code directly and is not yet covered;
+   ARM64/RISC-V are not covered.
+
+6. **Session-16 regression — bare runtime stubs**: the `p_hlt`/`p_cli`/
+   `p_sti`/`p_inb`/`p_outb`/`p_serial_*` stubs lost in the
+   `git checkout -- compiler/pe.fd` incident (known-bugs.md §1.37) were
+   re-added; verify `emit --bare` still emits them before touching pe.fd.
+
+7. **Register allocator clobbering** (`regalloc.rs`): Previously, constants not
    loaded into registers before use could be clobbered by intervening
    instructions. **Fixed by F-1A (Constant Rematerialization):** constants are
    now rematerialized at each use site via `Location::Remat(i64)` instead of
@@ -296,11 +371,11 @@ touching them.
    fixed to respect memory dependencies and keep terminators last. Test with
    `--no-opt` when changing regalloc to isolate issues.
 
-2. **Debug `eprintln!` statements**: Temporary debug prints (DBG ASM, DBG ALU,
+8. **Debug `eprintln!` statements**: Temporary debug prints (DBG ASM, DBG ALU,
    DEBUG gen_store, DEBUG struct_layouts) were added during debugging sessions
    and have been removed. Do not re-add them.
 
-3. **PIR L2 GetFieldPtr offset** (`pir.rs`): Previously used `field_index * 8`
+9. **PIR L2 GetFieldPtr offset** (`pir.rs`): Previously used `field_index * 8`
    as the byte offset, which was correct when all struct fields were 8 bytes.
    **Fixed (SH-6.1):** Now looks up real offsets from `struct_layouts` using a
    `value_types` map built during L2→L3 lowering. This was necessary because
@@ -308,14 +383,14 @@ touching them.
    `compute_struct_layout()` in `lower.rs` now uses enum sizes for enum-typed
    fields, and the PIR L2→L3 lowering looks up the real offset.
 
-4. **Native codegen bugs** (not optimizer-related): All previously failing
+10. **Native codegen bugs** (not optimizer-related): All previously failing
    native ELF64 tests (`test_collections`, `test_db`, `test_match_range`,
    `test_matrix_mul`) are now FIXED. The root cause was a single wrong REX
    prefix byte in `p_json_at` (`0x49` instead of `0x4C` — see changelog for
    details). The `--opt` flag produces identical output to non-opt for all
    tests except 3 closure tests that are broken in both paths.
 
-5. **Non-deterministic register allocation** (`src/regalloc.rs`): The linear
+11. **Non-deterministic register allocation** (`src/regalloc.rs`): The linear
    scan allocator sorted live intervals by start point only. When multiple
    intervals shared the same start, HashMap iteration order (non-deterministic
    due to random seeding) determined their relative order, producing different
@@ -324,7 +399,7 @@ touching them.
    self-hosted compiler (`compiler/regalloc.fd`) was already deterministic
    (uses Vec, not HashMap).
 
-6. **SROA + CSE dangling reference** (`src/opt.rs`): SROA replaces struct
+12. **SROA + CSE dangling reference** (`src/opt.rs`): SROA replaces struct
    field loads with `Copy` instructions. CSE then eliminates duplicate
    constants and calls `replace_all_refs` to update references — but
    `replace_refs_in_inst` did not handle `L2Inst::Copy`, leaving dangling
@@ -336,7 +411,7 @@ touching them.
    `gvn_key`). The self-hosted compiler (`compiler/opt.fd`) already handled
    `Copy` correctly — the bug was only in the Rust bootstrap.
 
-7. **Stack canary / float scratch overlap** (`compiler/pir.fd`,
+13. **Stack canary / float scratch overlap** (`compiler/pir.fd`,
    `compiler/codegen_x64.fd`): PIR frame allocation started at offset 0,
    causing the first alloca slot to overlap with the canary at `-8(%rbp)`.
    Float conversion also used `-8(%rbp)`, overlapping the canary.
@@ -377,24 +452,28 @@ These rules apply to ALL sessions and agents. No exceptions.
    to update the baseline. If the test exercises a not-yet-implemented feature,
    add it to `is_skip_test()` in `tests/harness.rs`.
 
-5. **Adding a new backend stage**: add a golden file capture in
-   `scripts/gen_golden.sh` and a check in `scripts/bisect.sh`.
+5. **Adding a new backend stage**: `scripts/gen_golden.sh` and
+   `scripts/bisect.sh` do not exist yet — when they are written, add a
+   golden-file capture and a bisect check there. Until then use the
+   `dump-*`/`codegen`/`pir` commands to inspect stages manually.
 
 ## Debugging Workflow (When Tests Break)
 
 1. **Don't panic.** Run `./verify.sh` to see exactly which tests regressed.
 
-2. **Bisect the layer.** For a failing test, run:
+2. **Bisect the layer.** There is no `scripts/bisect.sh` — bisect manually:
    ```bash
-   ./scripts/bisect.sh <test_name>
+   ./target/release/fidesc dump-ir  tests/bootstrap/<name>.fd   # AST→IR
+   ./target/release/fidesc dump-pir tests/bootstrap/<name>.fd 3 # L1→L3
+   ./target/release/fidesc codegen  tests/bootstrap/<name>.fd --target x86-64 --peephole
    ```
    This tells you whether the regression is in lowering, PIR, codegen, or
    peephole.
 
 3. **Check if it's a real regression or a "was passing for the wrong reason".**
-   Compare the failing test's golden output to the new output. If the new
-   output is *correct* and the golden was *wrong*, the test was passing by
-   accident — update the golden file.
+   Compare the failing test's golden output (`tests/bootstrap/golden/`) to the
+   new output. If the new output is *correct* and the golden was *wrong*, the
+   test was passing by accident — update the golden file.
 
 4. **Make the smallest possible fix.** Don't refactor while fixing. One change,
    one commit, one `./verify.sh` run.
@@ -424,15 +503,15 @@ These rules apply to ALL sessions and agents. No exceptions.
 # 1. Run verification
 ./verify.sh
 
-# 2. If regressions: bisect to find the layer
-./scripts/bisect.sh <failing_test>
+# 2. If regressions: bisect the layer manually with dump-ir / dump-pir /
+#    codegen --peephole (scripts/bisect.sh does not exist)
 
 # 3. If no regressions and tests improved: update baseline
 ./verify.sh --save
 
-# 4. If you changed codegen/regalloc/peephole/elf64/pe: also regenerate golden
-#    files so future bisects are accurate
-./scripts/gen_golden.sh
+# 4. If you changed codegen/regalloc/peephole/elf64/pe: regenerate golden
+#    files (scripts/gen_golden.sh does not exist yet — capture dumps by hand
+#    into tests/bootstrap/golden/)
 ```
 
 ## CRITICAL RULES — NEVER DO THESE
@@ -475,6 +554,7 @@ or `git diff <path>` — these are read-only and safe.
 | `src/mono.rs` | Generic monomorphization |
 | `src/comptime.rs` | Compile-time eval + reflection |
 | `src/pe.rs` | PE emitter (Windows) |
+| `src/pe_runtime/*.fd` | Fides runtime of the PE backend |
 | `src/elf64.rs` | ELF64 emitter (Linux) |
 | `src/macho.rs` | Mach-O emitter (macOS) |
 | `src/coff.rs` | COFF emitter (Windows) |

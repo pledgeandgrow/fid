@@ -1,0 +1,503 @@
+// Fides Datetime standard library
+//
+// Calendar formatting and parsing on top of time.fd's LogicalTime
+// (i64 Unix seconds, always UTC — no timezones, no clock skew).
+//
+//   - dt_parse(s):            ISO 8601 -> unix seconds ("YYYY-MM-DD[ T]HH[:MM[:SS]][.frac][Z|±HH[:MM]]")
+//   - dt_format(t, fmt):      strftime-style formatting (%Y %m %d %H %M %S %F %T %R %j %A %a %B %b %e %p %y %z %Z %%)
+//   - dt_to_iso / dt_to_rfc2822 / dt_to_date
+//   - Duration:               relative timespans with parse/format and arithmetic
+//
+// Usage:
+//   use datetime;
+//   value (ok, ts) = dt_parse("2026-10-27T14:30:00Z");
+//   value t = time_from_timestamp(ts);
+//   println(dt_format(t, "%F %T"));       // "2026-10-27 14:30:00"
+//   value later = dt_add(t, dur_hours(2));
+
+module datetime;
+
+use time;
+use vec;
+use string;
+
+
+// ─── Digit parsing helpers ──────────────────────────────────────────────
+
+fn dt_is_digit(b: i64) -> bool {
+    return b >= 48 && b <= 57;
+}
+
+/// Read exactly `count` digits starting at index `i`.
+/// Returns (ok, value); ok is false when the digits are missing.
+fn dt_digits(s: str, i: i64, count: i64) -> (bool, i64) {
+    var n = str_len(s);
+    if i < 0 || i + count > n { return (false, 0); }
+    var v = 0;
+    var k = 0;
+    while k < count {
+        var b = str_byte_at(s, i + k);
+        if !dt_is_digit(b) { return (false, 0); }
+        v = v * 10 + (b - 48);
+        k = k + 1;
+    }
+    return (true, v);
+}
+
+/// Read 1..2 digits starting at index `i`. Returns (ok, value, consumed).
+fn dt_digits_12(s: str, i: i64) -> (bool, i64, i64) {
+    var n = str_len(s);
+    if i >= n { return (false, 0, 0); }
+    var b = str_byte_at(s, i);
+    if !dt_is_digit(b) { return (false, 0, 0); }
+    var v = b - 48;
+    var used = 1;
+    if i + 1 < n {
+        var b2 = str_byte_at(s, i + 1);
+        if dt_is_digit(b2) {
+            v = v * 10 + (b2 - 48);
+            used = 2;
+        }
+    }
+    return (true, v, used);
+}
+
+// ─── ISO 8601 parsing ───────────────────────────────────────────────────
+
+/// Parse an ISO 8601 datetime to (ok, unix_seconds).
+///
+/// Accepted forms:
+///   YYYY-MM-DD
+///   YYYY-MM-DD HH:MM[:SS]            (space or 'T' separator)
+///   YYYY-MM-DDTHH:MM[:SS][.frac]
+///   any of the above + "Z" or ±HH / ±HHMM / ±HH:MM zone offset
+///
+/// The zone offset is applied (result is always UTC seconds).
+/// Dates before 1970 produce negative seconds — fine.
+pub fn dt_parse(s: str) -> (bool, i64) {
+    var n = str_len(s);
+    var i = 0;
+
+    // ── date: YYYY-MM-DD ──
+    var (ok4, year) = dt_digits(s, i, 4);
+    if !ok4 { return (false, 0); }
+    i = i + 4;
+    if i >= n || str_byte_at(s, i) != 45 { return (false, 0); }
+    i = i + 1;
+    var (okm, month, usedm) = dt_digits_12(s, i);
+    if !okm { return (false, 0); }
+    i = i + usedm;
+    if i >= n || str_byte_at(s, i) != 45 { return (false, 0); }
+    i = i + 1;
+    var (okd, day, usedd) = dt_digits_12(s, i);
+    if !okd { return (false, 0); }
+    i = i + usedd;
+
+    if month < 1 || month > 12 { return (false, 0); }
+    if day < 1 || day > days_in_month(year, month) { return (false, 0); }
+
+    var hour = 0;
+    var min = 0;
+    var sec = 0;
+    var off = 0;
+    var done = i >= n;
+
+    // ── optional time ──
+    if !done {
+        var sep = str_byte_at(s, i);
+        if sep == 84 || sep == 32 {                    // 'T' or ' '
+            i = i + 1;
+            var (okh, hh, usedh) = dt_digits_12(s, i);
+            if !okh { return (false, 0); }
+            i = i + usedh;
+            hour = hh;
+            if i < n && str_byte_at(s, i) == 58 {      // ':'
+                i = i + 1;
+                var (okmi, mi, usedmi) = dt_digits_12(s, i);
+                if !okmi { return (false, 0); }
+                i = i + usedmi;
+                min = mi;
+                if i < n && str_byte_at(s, i) == 58 {
+                    i = i + 1;
+                    var (oks, ss, useds) = dt_digits_12(s, i);
+                    if !oks { return (false, 0); }
+                    i = i + useds;
+                    sec = ss;
+                }
+            }
+            // optional fractional seconds: '.' digits — parsed, ignored
+            if i < n && str_byte_at(s, i) == 46 {      // '.'
+                i = i + 1;
+                if i >= n || !dt_is_digit(str_byte_at(s, i)) { return (false, 0); }
+                while i < n && dt_is_digit(str_byte_at(s, i)) {
+                    i = i + 1;
+                }
+            }
+        }
+
+        // ── optional zone offset ──
+        if i < n {
+            var z = str_byte_at(s, i);
+            if z == 90 || z == 122 {                   // 'Z' or 'z'
+                i = i + 1;
+            } else if z == 43 || z == 45 {             // '+' or '-'
+                var sign = 1;
+                if z == 45 { sign = -1; }
+                i = i + 1;
+                var (okzh, zh, usedzh) = dt_digits_12(s, i);
+                if !okzh { return (false, 0); }
+                i = i + usedzh;
+                var zm = 0;
+                if i < n && str_byte_at(s, i) == 58 {
+                    i = i + 1;
+                    var (okzm, zmv, usedzm) = dt_digits_12(s, i);
+                    if !okzm { return (false, 0); }
+                    i = i + usedzm;
+                    zm = zmv;
+                } else if i < n && dt_is_digit(str_byte_at(s, i)) {
+                    // compact ±HHMM
+                    var (okzm2, zmv2, usedzm2) = dt_digits_12(s, i);
+                    if !okzm2 { return (false, 0); }
+                    i = i + usedzm2;
+                    zm = zmv2;
+                }
+                if zh > 23 || zm > 59 { return (false, 0); }
+                off = sign * (zh * 3600 + zm * 60);
+            }
+        }
+        if i != n { return (false, 0); }               // trailing garbage
+    }
+
+    if hour > 23 || min > 59 || sec > 59 { return (false, 0); }
+
+    var t = time_new(year, month, day, hour, min, sec);
+    return (true, t.seconds - off);
+}
+
+/// Parse an ISO 8601 datetime; returns the unix timestamp, or 0 on failure
+/// (combine with dt_parse when the distinction matters).
+pub fn dt_parse_or_epoch(s: str) -> i64 {
+    var (ok, ts) = dt_parse(s);
+    if ok { return ts; }
+    return 0;
+}
+
+/// Parse an ISO 8601 datetime to a LogicalTime; the epoch on failure.
+pub fn dt_parse_time(s: str) -> LogicalTime {
+    return time_from_timestamp(dt_parse_or_epoch(s));
+}
+
+/// Is the string a valid ISO 8601 datetime in the forms dt_parse accepts?
+pub fn dt_is_valid(s: str) -> bool {
+    var (ok, _) = dt_parse(s);
+    return ok;
+}
+
+// ─── Names ──────────────────────────────────────────────────────────────
+
+/// Full weekday name ("Monday") for weekday index 0=Sunday..6=Saturday.
+pub fn dt_weekday_name(wd: i64) -> str {
+    if wd == 0 { return "Sunday"; }
+    if wd == 1 { return "Monday"; }
+    if wd == 2 { return "Tuesday"; }
+    if wd == 3 { return "Wednesday"; }
+    if wd == 4 { return "Thursday"; }
+    if wd == 5 { return "Friday"; }
+    if wd == 6 { return "Saturday"; }
+    return "?";
+}
+
+/// Short weekday name ("Mon").
+pub fn dt_weekday_short(wd: i64) -> str {
+    return str_slice(dt_weekday_name(wd), 0, 3);
+}
+
+/// Full month name ("January") for month 1..12.
+pub fn dt_month_name(m: i64) -> str {
+    if m == 1 { return "January"; }
+    if m == 2 { return "February"; }
+    if m == 3 { return "March"; }
+    if m == 4 { return "April"; }
+    if m == 5 { return "May"; }
+    if m == 6 { return "June"; }
+    if m == 7 { return "July"; }
+    if m == 8 { return "August"; }
+    if m == 9 { return "September"; }
+    if m == 10 { return "October"; }
+    if m == 11 { return "November"; }
+    if m == 12 { return "December"; }
+    return "?";
+}
+
+/// Short month name ("Jan").
+pub fn dt_month_short(m: i64) -> str {
+    return str_slice(dt_month_name(m), 0, 3);
+}
+
+// ─── Formatting ─────────────────────────────────────────────────────────
+
+fn dt_pad2(n: i64) -> str {
+    if n < 0 { return "-" + dt_pad2(-n); }
+    if n < 10 { return "0" + p_to_str(n); }
+    return p_to_str(n);
+}
+
+fn dt_pad4(n: i64) -> str {
+    if n < 0 { return "-" + dt_pad4(-n); }
+    if n < 10 { return "000" + p_to_str(n); }
+    if n < 100 { return "00" + p_to_str(n); }
+    if n < 1000 { return "0" + p_to_str(n); }
+    return p_to_str(n);
+}
+
+/// Format a LogicalTime with strftime-style codes.
+///
+/// Supported: %Y %y %m %d %e %H %I %M %S %p %A %a %B %b %j %F %T %R %D %z %Z %%
+/// Unknown codes are emitted literally (the '%' is kept).
+pub fn dt_format(t: LogicalTime, fmt: str) -> str {
+    var out = "";
+    var i = 0;
+    var n = str_len(fmt);
+    var year = time_get_year(t);
+    var month = time_get_month(t);
+    var day = time_get_day(t);
+    var hour = time_get_hour(t);
+    var min = time_get_minute(t);
+    var sec = time_get_second(t);
+    var wd = time_get_weekday(t);
+    while i < n {
+        var c = str_byte_at(fmt, i);
+        if c != 37 {                                  // not '%'
+            out = out + char_to_str(c);
+            i = i + 1;
+        } else if i + 1 >= n {
+            out = out + "%";
+            i = i + 1;
+        } else {
+            var code = str_byte_at(fmt, i + 1);
+            if code == 89 { out = out + dt_pad4(year); }            // %Y
+            else if code == 121 { out = out + dt_pad2(year % 100); }// %y
+            else if code == 109 { out = out + dt_pad2(month); }     // %m
+            else if code == 100 { out = out + dt_pad2(day); }       // %d
+            else if code == 101 {                                   // %e
+                if day < 10 { out = out + " " + p_to_str(day); }
+                else { out = out + p_to_str(day); }
+            }
+            else if code == 72 { out = out + dt_pad2(hour); }       // %H
+            else if code == 73 {                                    // %I 12-hour
+                var h12 = hour % 12;
+                if h12 == 0 { h12 = 12; }
+                out = out + dt_pad2(h12);
+            }
+            else if code == 77 { out = out + dt_pad2(min); }        // %M
+            else if code == 83 { out = out + dt_pad2(sec); }        // %S
+            else if code == 112 {                                   // %p
+                if hour < 12 { out = out + "AM"; }
+                else { out = out + "PM"; }
+            }
+            else if code == 65 { out = out + dt_weekday_name(wd); } // %A
+            else if code == 97 { out = out + dt_weekday_short(wd); }// %a
+            else if code == 66 { out = out + dt_month_name(month); }// %B
+            else if code == 98 { out = out + dt_month_short(month);}// %b
+            else if code == 106 {                                   // %j day of year
+                var doy = time_get_day_of_year(t);
+                if doy < 10 { out = out + "00" + p_to_str(doy); }
+                else if doy < 100 { out = out + "0" + p_to_str(doy); }
+                else { out = out + p_to_str(doy); }
+            }
+            else if code == 70 {                                    // %F
+                out = out + dt_pad4(year) + "-" + dt_pad2(month) + "-" + dt_pad2(day);
+            }
+            else if code == 84 {                                    // %T
+                out = out + dt_pad2(hour) + ":" + dt_pad2(min) + ":" + dt_pad2(sec);
+            }
+            else if code == 82 {                                    // %R
+                out = out + dt_pad2(hour) + ":" + dt_pad2(min);
+            }
+            else if code == 68 {                                    // %D mm/dd/yy
+                out = out + dt_pad2(month) + "/" + dt_pad2(day) + "/" + dt_pad2(year % 100);
+            }
+            else if code == 122 { out = out + "+00:00"; }           // %z (always UTC)
+            else if code == 90 { out = out + "UTC"; }               // %Z
+            else if code == 37 { out = out + "%"; }                 // %%
+            else {
+                out = out + "%" + char_to_str(code);                // unknown: literal
+            }
+            i = i + 2;
+        }
+    }
+    return out;
+}
+
+/// ISO 8601 "YYYY-MM-DDTHH:MM:SSZ" (same as time_to_iso).
+pub fn dt_to_iso(t: LogicalTime) -> str {
+    return time_to_iso(t);
+}
+
+/// Date only "YYYY-MM-DD".
+pub fn dt_to_date(t: LogicalTime) -> str {
+    return time_to_date_string(t);
+}
+
+/// RFC 2822 style: "Tue, 27 Oct 2026 14:30:00 +0000".
+pub fn dt_to_rfc2822(t: LogicalTime) -> str {
+    return dt_weekday_short(time_get_weekday(t)) + ", "
+         + dt_pad2(time_get_day(t)) + " "
+         + dt_month_short(time_get_month(t)) + " "
+         + dt_pad4(time_get_year(t)) + " "
+         + dt_pad2(time_get_hour(t)) + ":"
+         + dt_pad2(time_get_minute(t)) + ":"
+         + dt_pad2(time_get_second(t)) + " +0000";
+}
+
+/// Unix seconds -> LogicalTime.
+pub fn dt_from_seconds(ts: i64) -> LogicalTime {
+    return time_from_timestamp(ts);
+}
+
+/// LogicalTime -> unix seconds.
+pub fn dt_to_seconds(t: LogicalTime) -> i64 {
+    return t.seconds;
+}
+
+/// The current wall-clock time as a LogicalTime (NOT deterministic —
+/// reads CLOCK_REALTIME).
+pub fn dt_now() -> LogicalTime {
+    return time_from_timestamp(p_clock_now_ms() / 1000);
+}
+
+// ─── Duration ───────────────────────────────────────────────────────────
+
+/// A signed relative timespan in seconds.
+pub struct Duration {
+    pub seconds: i64,
+}
+
+pub fn dur_seconds(n: i64) -> Duration { return Duration { seconds: n }; }
+pub fn dur_minutes(n: i64) -> Duration { return Duration { seconds: n * 60 }; }
+pub fn dur_hours(n: i64) -> Duration { return Duration { seconds: n * 3600 }; }
+pub fn dur_days(n: i64) -> Duration { return Duration { seconds: n * 86400 }; }
+pub fn dur_weeks(n: i64) -> Duration { return Duration { seconds: n * 604800 }; }
+/// Milliseconds truncated to whole seconds.
+pub fn dur_millis(n: i64) -> Duration { return Duration { seconds: n / 1000 }; }
+
+pub fn dur_to_seconds(d: Duration) -> i64 { return d.seconds; }
+pub fn dur_to_millis(d: Duration) -> i64 { return d.seconds * 1000; }
+
+pub fn dur_add(a: Duration, b: Duration) -> Duration {
+    return Duration { seconds: a.seconds + b.seconds };
+}
+pub fn dur_sub(a: Duration, b: Duration) -> Duration {
+    return Duration { seconds: a.seconds - b.seconds };
+}
+pub fn dur_neg(d: Duration) -> Duration {
+    return Duration { seconds: 0 - d.seconds };
+}
+pub fn dur_abs(d: Duration) -> Duration {
+    if d.seconds < 0 { return Duration { seconds: 0 - d.seconds }; }
+    return d;
+}
+
+/// Difference between two times as a Duration (a - b).
+pub fn dt_diff(a: LogicalTime, b: LogicalTime) -> Duration {
+    return Duration { seconds: a.seconds - b.seconds };
+}
+
+/// Shift a time by a Duration.
+pub fn dt_add(t: LogicalTime, d: Duration) -> LogicalTime {
+    return time_from_timestamp(t.seconds + d.seconds);
+}
+pub fn dt_sub(t: LogicalTime, d: Duration) -> LogicalTime {
+    return time_from_timestamp(t.seconds - d.seconds);
+}
+
+/// Parse a duration like "90s", "1h30m", "2d", "1w2d3h4m5s", "-5m".
+/// Units: s, m, h, d, w (also "ms" is NOT supported — ambiguity with 'm').
+/// Returns (ok, seconds).
+pub fn dur_parse(s: str) -> (bool, i64) {
+    var n = str_len(s);
+    var i = 0;
+    var sign = 1;
+    if i < n && str_byte_at(s, i) == 45 {            // '-'
+        sign = -1;
+        i = i + 1;
+    } else if i < n && str_byte_at(s, i) == 43 {     // '+'
+        i = i + 1;
+    }
+    var total = 0;
+    var any = false;
+    while i < n {
+        var j = i;
+        var num = 0;
+        var digits = 0;
+        while j < n && dt_is_digit(str_byte_at(s, j)) {
+            num = num * 10 + (str_byte_at(s, j) - 48);
+            j = j + 1;
+            digits = digits + 1;
+        }
+        if digits == 0 { return (false, 0); }
+        i = j;
+        if i >= n { return (false, 0); }
+        var unit = str_byte_at(s, i);
+        i = i + 1;
+        if unit == 115 { total = total + num; }              // s
+        else if unit == 109 { total = total + num * 60; }    // m
+        else if unit == 104 { total = total + num * 3600; }  // h
+        else if unit == 100 { total = total + num * 86400; } // d
+        else if unit == 119 { total = total + num * 604800; }// w
+        else { return (false, 0); }
+        any = true;
+    }
+    if !any { return (false, 0); }
+    return (true, sign * total);
+}
+
+/// Parse a duration string, returning 0 seconds on failure.
+pub fn dur_parse_or_zero(s: str) -> Duration {
+    var (ok, secs) = dur_parse(s);
+    if ok { return Duration { seconds: secs }; }
+    return Duration { seconds: 0 };
+}
+
+/// Format a Duration compactly: "2d3h4m5s", "-1h30m", "0s".
+/// Zero value formats as "0s".
+pub fn dur_format(d: Duration) -> str {
+    var secs = d.seconds;
+    var neg = false;
+    if secs < 0 {
+        neg = true;
+        secs = 0 - secs;
+    }
+    if secs == 0 { return "0s"; }
+    var out = "";
+    if neg { out = "-"; }
+    var w = secs / 604800;
+    var rem = secs % 604800;
+    var days = rem / 86400;
+    rem = rem % 86400;
+    var h = rem / 3600;
+    rem = rem % 3600;
+    var m = rem / 60;
+    var s = rem % 60;
+    if w > 0 { out = out + p_to_str(w) + "w"; }
+    if days > 0 { out = out + p_to_str(days) + "d"; }
+    if h > 0 { out = out + p_to_str(h) + "h"; }
+    if m > 0 { out = out + p_to_str(m) + "m"; }
+    if s > 0 { out = out + p_to_str(s) + "s"; }
+    return out;
+}
+
+/// Format a Duration as "HH:MM:SS" (sign applied to the whole value;
+/// hours can exceed 23 — this is a timespan, not a clock).
+pub fn dur_format_hms(d: Duration) -> str {
+    var secs = d.seconds;
+    var sign = "";
+    if secs < 0 {
+        sign = "-";
+        secs = 0 - secs;
+    }
+    var h = secs / 3600;
+    var m = (secs % 3600) / 60;
+    var s = secs % 60;
+    return sign + dt_pad2(h) + ":" + dt_pad2(m) + ":" + dt_pad2(s);
+}

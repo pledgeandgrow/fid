@@ -18,7 +18,7 @@
 //!    rooted like that reference and may not escape further than it.
 //! 5. Code inside `unsafe { }` is not checked.
 //!
-//! Runs after type checking. See `docs/guides/references.md`.
+//! Runs after type checking. See `docs/reference/language-guide.md`.
 
 use crate::ast::{Expr, Func, MatchArm, Pattern, Program, Stmt, Type};
 use std::collections::{BTreeSet, HashMap, HashSet};

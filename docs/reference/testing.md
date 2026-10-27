@@ -1,6 +1,29 @@
 # TEST.md — Fides Test Results
 
-*Last updated: Sep 10, 2026 (session 24 — v1.0.0 released). Test baseline from `docs/roadmap/roadmap.md` Session 24. Self-host tests: 38/38 pass on all 3 backends. Bootstrap: Interpreter 236/237, C Codegen 226/237, PE 237/237. Self-compilation FAILS (SIGSEGV in Lowerer_lower_stmt). Fixpoint NOT VERIFIABLE (fides-c2.c missing). 303 total .fd test files (261 bootstrap + 42 selfhost). The Session 16 test counts below are preserved for historical reference — see AGENTS.md for the authoritative current baseline.*
+*Last updated: Oct 27, 2026 (session 34). The bootstrap fixpoint is VERIFIED byte-for-byte (stage 2 == stage 3, checked by `RELEASE=1 scripts/bootstrap.sh`). 348 total .fd test files: 302 in `tests/bootstrap/` + 46 in `tests/selfhost/`. Current results are in "Current Results" below; the Session-16-era tables after it are kept for history — see `tests/bootstrap/baseline/test_results.txt` (via `./verify.sh`) for the saved baseline.*
+
+## Current Results (Oct 27, 2026)
+
+**Rust compiler (`fidesc test`, `fidesc test --fail`, `cargo test`):**
+
+| Backend | Result |
+|---|---|
+| Interpreter | 280/280 |
+| C codegen | 278/278 match the interpreter |
+| PE emitter (native Windows) | 282/282 match, 0 unsupported |
+| Expected-fail | 59/59 rejected on all three |
+| `cargo test --lib` | 265 passed |
+
+**Self-hosted compiler vs `fidesc`** (same program, outputs compared):
+
+| | Result |
+|---|---|
+| `fid run` | 302/302 test programs, 10/10 examples |
+| `fid ccompile` | 242/243 test programs (`test_sqlite` needs libsqlite3), 9/10 examples (`minimal_game` needs SDL2) |
+| Expected-fail | 59/59 rejected |
+
+There is no harness command for the self-hosted comparison yet; it runs
+each test through both compilers and diffs stdout and the exit code.
 
 ## Legend
 
@@ -219,7 +242,11 @@ backends and compares each compiled program's output with the interpreter's:
   files, the safety/capability/effect/region checks).
 - Tests that link a system library Fides does not ship (`test_sqlite`) run
   only with `FIDES_TEST_EXTERNAL=1`. Tests that run the whole self-hosted
-  compiler are checked on C and PE, with the C output as the reference.
+  compiler are checked on C and PE, with the C output as the reference
+  (the reference run must exit successfully).
+- Every test's stdout must be the same on every run: a test with random
+  values (`test_dp`) prints properties of them, and a benchmark
+  (`bench_stringbuilder`) prints its timings to stderr.
 
 ---
 

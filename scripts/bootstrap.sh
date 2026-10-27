@@ -5,8 +5,7 @@
 #   ./scripts/bootstrap.sh [out_dir] [stages]     (defaults: build/bootstrap, 3)
 #   RELEASE=1 ./scripts/bootstrap.sh              also install the verified
 #                                                 stage-3 compiler as
-#                                                 release/fid(.exe) (what the
-#                                                 installer ships)
+#                                                 release/fid(.exe)
 #
 # Stage 0 is the Rust bootstrap compiler (target/release/fidesc). Each stage N
 # runs the previous compiler's `dump-c compiler/main.fd`, wraps `main` in a
@@ -108,7 +107,7 @@ if [ -n "${RELEASE:-}" ]; then
   if [ "$STAGES" -lt 3 ]; then echo "RELEASE needs 3 stages"; exit 1; fi
   mkdir -p release
   cp "$OUT/fides-c3$EXE" "release/fid$EXE"
-  # The installed layout: fid(.exe) with stdlib/ beside it, started by
+  # The installed layout: fides(.exe) with stdlib/ beside it, started by
   # name from PATH, in a directory with no stdlib/
   smoke="$(pwd)/$OUT/smoke"
   rm -rf "$smoke"; mkdir -p "$smoke/install" "$smoke/work"

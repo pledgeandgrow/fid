@@ -2,151 +2,136 @@
 
 > Single source of truth for "what are we doing right now."
 > Read this first every session. Updated after every milestone change.
-> Last updated: Session 24 — **v1.0.0 released, Windows installer shipped.**
+> Last updated: Oct 27, 2026 — post-Session 34 (self-hosted parity).
 
-## Current direction: Fides is independent and released
+## Current direction: the self-hosted compiler is the release compiler
 
-The self-hosted compiler (`compiler/*.fd`, 50 modules, 93,605 LOC) is the
-primary development path. The Rust compiler (`src/*.rs`, 55 files, ~93,269 LOC)
-is the bootstrap reference, used only when `compiler/*.fd` changes.
+The self-hosted compiler (`compiler/*.fd`, **54 modules, ~105K LOC**) is the
+primary artifact and the compiler the installer ships (`fid.exe`). The Rust
+compiler (`src/*.rs`, **55 files, ~101K LOC**) is the bootstrap reference: it
+builds stage 1 of the self-hosted compiler and holds the test harness
+(`fidesc test`); it ships beside it as `fidesc.exe`.
 
 **v1.0.0 was released Sep 9, 2026** with a Windows installer
-(`Fides-Setup-1.0.0.exe`, 2.5 MB). GitHub Actions CI builds the installer
-automatically on release tags.
+(`Fides-Setup-1.0.0.exe`).
 
-### Honest self-hosting status
+### Honest status — what is actually true today
 
-- **Bootstrap:** 3 generations verified (Rust → c1 → c2 → c3, all work)
-- **Self-host tests:** 38/38 pass on all 3 backends (interp, C, PE)
-- **Self-compilation:** **FAILS** — SIGSEGV in `Lowerer_lower_stmt` during
-  lowering of the full 75K LOC compiler. This is a pre-existing known issue.
-- **Fixpoint:** **NOT VERIFIABLE** — `release/fides-c2.c` does not exist.
-  The fixpoint was achieved in Session 15 (701,100 lines, 0 diffs) but is
-  no longer reproducible because the artifact was lost and subsequent
-  sessions (17-24) added significant code that has not been re-verified.
+- **Bootstrap fixpoint:** VERIFIED byte-for-byte (stage 2 == stage 3, ~38 MB
+  of C). `RELEASE=1 ./scripts/bootstrap.sh` checks it on every release
+  build, then installs `release/fid.exe` and runs a program from an
+  installed layout.
+- **Self-hosted `run` and `ccompile` match `fidesc`:** `run` on all 302 test
+  programs and all 10 examples; `ccompile` on 242 of 243 test programs
+  (`test_sqlite` needs libsqlite3) and 9 of 10 examples (`minimal_game` needs
+  SDL2); all 59 expected-fail tests are rejected.
+- **Rust compiler suite:** interpreter 280/280, C 278/278, native Windows (PE)
+  282/282, expected-fail 59/59 (`fidesc test`, `fidesc test --fail`).
+- **Self-hosted native backend not working:** `build --native` (PIR →
+  x86-64 → `compiler/pe.fd`) crashes in the optimizer and register
+  allocator, so the self-hosted `build`/`ccompile` go through C and need a C
+  compiler. `fidesc emit` makes native Windows executables with none.
+- **Nondeterministic self-hosted typecheck:** reported earlier (HashMap-order
+  instability); not reproduced in the Oct 25–27 bootstraps.
+- **`verify.sh --golden` and `scripts/bisect.sh` do not exist** —
+  `verify.sh --golden` will fail; bisect manually with `dump-*` commands.
 
-### What this means
+### Recent sessions
 
-- **Everyday work uses `release/fides-c3.exe`** — writing programs, adding
-  stdlib modules, adding tests, building tools (ark, scribe, veil).
-- **The Rust compiler (`src/*.rs`) is the bootstrap reference only** — used
-  when `compiler/*.fd` changes and the bootstrap chain must be regenerated.
-- **New features go into `compiler/*.fd` first** when they don't require
-  new language constructs. When they do, add to Rust first, then port.
+| Session | What happened |
+|---------|---------------|
+| 34 | Self-hosted compiler: @conserve check completed, second `impl` blocks in imported modules kept, `extern "C" link` libraries linked. Tests that printed timings or random values, or had no `main`, made deterministic; `examples/riscv_blink` fixed. Self-hosted now matches on 302/302 (`run`) and 242/243 (`ccompile`). |
+| 33 | Self-hosted interpreter and front end ported to parity with the Rust compiler (79 → 241 `run`, 164 → 239 `ccompile`); stdlib found from an installed location; release bootstrap with fixpoint check; installer ships the self-hosted compiler. |
+| 32 | Native Windows executables run every test: a Fides runtime for the PE backend. |
+| 31 | Fast, reproducible and incremental builds; short-circuit, HMAC and PE miscompile fixes. |
+| 30 | Post-codegen constant-time verifier on x86-64 ELF (asm-level `jcc`/`cmov`/indexed-mem/call checks). `cast_arg` `Ptr(inner)→Generic` deref in both C codegens (heals `&mut Vec`→`Vec` forwards — the `record_def`/`ra_vec_find_i64` crash). `cmd /C` quote-strip fix so `cl.exe` links on Windows. |
+| 29 | Reference escape check (`src/escape.rs`, `compiler/escape.fd`): references are second-class. `Vec<f64>` reads + `f64` returns fixed. Fixpoint re-verified. |
+| 28 | Branch consolidation — `release-infra` merged into `main`; 15 `Vec` params made by-value; 92 `&mut` call sites removed; `str_equal` → `==`. |
+| 27 | Soundness pass — typechecker rejects previously-accepted wrong programs. |
+| 26 | Bootstrap fixpoint VERIFIED byte-for-byte (c4==c5); 7 Rust→Fides gap fixes; self-compilation SIGSEGV fixed. |
 
-### When you DO need the Rust compiler
-
-| Task | Use Rust compiler? |
-|------|-------------------|
-| Writing Fides programs | No — use `fides-c3.exe` |
-| Adding stdlib modules | No — use `fides-c3.exe` |
-| Adding tests | No — use `fides-c3.exe` |
-| Building tools (ark, etc.) | No — use `fides-c3.exe` |
-| Changing `compiler/*.fd` | Yes — regenerate C1, verify fixpoint |
-| Adding new language features | Yes — add to Rust first, then port to Fides |
-
-## Current Baseline (v1.0.0)
+## Current Baseline
 
 ```
-SELF-HOSTED COMPILER (primary):
-  compiler/*.fd:  50 modules, 93,605 LOC
-  Fixpoint:       NOT VERIFIABLE (fides-c2.c missing)
-  Self-compilation: FAILS (SIGSEGV in Lowerer_lower_stmt)
-  Bootstrap:      3 generations verified (Rust → c1 → c2 → c3)
-  Use:            release/fides-c3.exe for everyday work
-
-RUST BOOTSTRAP (reference only):
-  src/*.rs:       55 files, ~93,269 LOC
-  Used when:      compiler/*.fd changes (regenerate C1, verify fixpoint)
-
-WINDOWS INSTALLER (v1.0.0):
-  installer/:     NSIS script + build helper
-  CI:             .github/workflows/build-installer.yml
-  Output:         Fides-Setup-1.0.0.exe (2.5 MB, tested on Windows)
-
-TESTS:
-  Self-host:      38/38 pass on interp + C + PE (tests/selfhost/)
-  Bootstrap:      Interpreter 236/237, C Codegen 226/237, PE 237/237
-  Total .fd tests: 303 (261 bootstrap + 42 selfhost)
-
-STDLIB:
-  stdlib/*.fd:    99 modules, 28,370 LOC
-
-RECENT SESSIONS:
-  Session 23:     @zeroize, @secret, @interrupt, @firmware, parallel{}, @simd
-  Session 21:     26 game/media stdlib modules (9,140 LOC)
-  Session 20:     12 Rust modules ported + 7 cross-comp backends (14,577 LOC)
+compiler/*.fd:  54 modules, ~105K LOC — THE COMPILER (primary source)
+src/*.rs:       55 files, ~101K LOC — bootstrap reference + test harness
+stdlib/*.fd:    104 modules, 30,446 LOC (kernel/uefi moved to fides-os)
+tests:          302 bootstrap + 46 selfhost .fd files
+Binaries:       release/fid.exe (self-hosted, shipped as fid.exe)
+                target/release/fidesc.exe (Rust, shipped as fidesc.exe)
 ```
-
-## Critical blocker: Self-compilation SIGSEGV
-
-The compiler cannot currently compile itself. The crash occurs in
-`Lowerer_lower_stmt` (also referred to as `Lowerer_mangle_method` in
-AGENTS.md) during lowering of the full 75K LOC compiler source.
-
-**To fix:**
-1. Debug the SIGSEGV in the lowerer when processing the full compiler
-2. Regenerate `fides-c2.c` and verify the fixpoint
-3. Run the full test suite through the self-hosted compiler
 
 ## What's NOT yet done
 
-1. **Self-compilation fix** — the SIGSEGV must be resolved
-2. **Fixpoint re-verification** — regenerate fides-c2.c, verify c2==c3
-3. **DWARF debug info** — no DWARF generation exists (Phase 5 remaining item)
-4. **CFI (Control Flow Integrity)** — not started (Phase 12)
-5. **Green threads** — not started (Phase 13)
-6. **Package registry** — ark works for path/git deps, no registry yet
-7. **@shader annotation** — stdlib/shader.fd exists but compiler has no @shader parsing
-8. **State machine transform** — parser has parse_state_machine(), lowerer doesn't use it
+1. **Self-hosted native backend** — `build --native` crashes (optimizer
+   `pass_dse`, then register allocation). Plan: port the working Rust PE
+   backend (`src/pe.rs`, `src/pe_runtime/`) to `compiler/pe.fd`, checked
+   byte-for-byte against `fidesc emit`; then a bootstrap with no C compiler.
+2. **Self-hosted typecheck nondeterminism** — reported earlier; not seen in
+   the Oct 25–27 bootstraps. Retry before assuming a regression.
+3. **Post-codegen CT verification is x86-64 ELF only** — PE (`pe.rs` emits
+   bytes directly, no asm text), ARM64, and RISC-V paths are not covered.
+4. **`&mut Vec` and `Vec` param promotion is inconsistent** — mutated params
+   may promote to `Ptr(Vec)` while callers were lowered against the
+   `Generic` signature; `cast_arg` now papers over the common case, but the
+   promotion itself is not yet stable.
+5. ~~**`fidesc test` C-codegen on Windows**~~ — confirmed: 278/278 (Oct 27).
+6. ~~**Docs consolidation leftovers**~~ — FIXED (session 30 docs audit):
+   INDEX.md, selfhost.md, and all cross-links now point at the merged
+   `docs/roadmap/roadmap.md` + `docs/selfhost/selfhost.md`.
+7. **stdlib docs lag** — 30 of the 104 stdlib modules have no
+   `docs/stdlib/<name>.md` page (mostly the game/media batch from
+   session 21).
+8. ~~**`release/fid-dev.c` instrumentation**~~ — regenerated by
+   `./scripts/build-selfhost.sh` (clean `dump-c`, no debug prints).
 
-## What IS done (Sessions 17-24)
+## What IS done (Sessions 17–30)
 
-- Session 20: 12 Rust modules ported + 7 cross-comp backends (14,577 LOC)
-- Session 21: 26 game/media stdlib modules (9,140 LOC, 99 total)
-- Session 22: Self-host audit (fixpoint found NOT verifiable)
-- Session 23: 6 language features (@zeroize, @secret, @interrupt, @firmware, parallel{}, @simd)
-- Session 24: 16 roadmap bugs fixed, test baseline confirmed
-- v1.0.0 release: Windows installer, GitHub Actions CI
-- Industry stdlib: medical.fd, clinical.fd, can.fd, ecu.fd, arinc.fd, scada.fd, ota.fd
-- @send/@sync: typechecker has is_send_type()/is_sync_type() with #[send]/#[sync] attributes
-- Bare runtime stubs: p_hlt, p_cli, p_sti, p_inb, p_outb, p_serial_* all implemented in pe.rs
+- Sessions 17–24: v1.0.0 release, installer, industry stdlib, language
+  features (@zeroize, @secret, @interrupt, @firmware, `parallel {}`, @simd).
+- Sessions 26–29: fixpoint verified (c4==c5), soundness pass, escape check,
+  Vec<f64>/f64-return fixes, branch consolidation.
+- Session 30: post-codegen constant-time verifier (x86-64 ELF), `cast_arg`
+  ABI repair, `cl.exe` quoting fix, alloca-hoist fix for the `--native` path.
+- Sessions 31–34: reproducible/incremental builds, a Fides runtime for the
+  PE backend (all tests run natively), self-hosted `run`/`ccompile` parity,
+  release bootstrap, installer ships the self-hosted compiler.
 
 ## Self-Host Module Status
 
-All 50 modules compile and type-check. 38/38 self-host tests pass.
-
-| Module | Status |
-|--------|--------|
-| token.fd, diag.fd, json.fd, fmt.fd | DONE |
-| ast.fd, lexer.fd, parser.fd | DONE |
-| ir.fd, typechecker.fd, lower.fd | DONE |
-| mono.fd, borrowck.fd, pir.fd | DONE |
-| opt.fd, codegen_c.fd | DONE |
-| codegen_x64.fd, pe.fd, peephole.fd, regalloc.fd | DONE |
-| compiler.fd, comptime_eval.fd, flat_ast.fd | DONE |
-| lsp.fd, inc.fd, main.fd, ark.fd | DONE |
-| + 26 more modules | DONE |
-| **Total** | **50/50 — type-checks, 38/38 tests pass** |
+All **54** `compiler/*.fd` modules type-check. The full list and per-file
+findings are tracked in `file-analysis/PROGRESS.md` — that file is the
+authoritative per-module ledger (newest: `runtime.fd`, `escape.fd`).
 
 ---
 
 ## Build Commands
 
 ```bash
-# Build bootstrap compiler (Rust)
+# Build bootstrap compiler (Rust) — builds stage 1, runs the test harness
 cargo build --release
 
-# Build self-hosted compiler (Fides → C → .exe)
-.\target\release\fidesc.exe ccompile compiler\main.fd -o release\fides-c
-# (tcc link is now automatic via the ccompile command)
+# Release build of the self-hosted compiler: 3 stages, fixpoint checked,
+# installed as release/fid.exe (what the installer ships as fid.exe)
+RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh
 
-# Everyday work — use the self-hosted compiler directly:
-.\release\fides-c3.exe ccompile tests/bootstrap/hello.fd -o hello.exe
-.\release\fides-c3.exe run tests/bootstrap/hello.fd
-.\release\fides-c3.exe lsp
+# Single stage for development (same output name, no fixpoint check)
+# → release/fid-dev.c + release/fid-dev(.exe)
+./scripts/build-selfhost.sh
+
+# The self-hosted compiler
+.\release\fid.exe run      tests/bootstrap/hello.fd
+.\release\fid.exe ccompile tests/bootstrap/hello.fd -o hello.exe   # needs a C compiler
+
+# The Rust compiler (same output; emit needs no C compiler)
+.\target\release\fidesc.exe run      tests/bootstrap/hello.fd
+.\target\release\fidesc.exe ccompile tests/bootstrap/hello.fd -o hello.exe
+.\target\release\fidesc.exe build    tests/bootstrap/hello.fd -o hello --target x86-64
+
+# Regenerate the self-hosted C (needed after compiler/*.fd changes)
+.\target\release\fidesc.exe ccompile compiler\main.fd -o ...  # then link with cl/zig
 
 # Full verification
-./verify.sh          # Bootstrap tests (tests/bootstrap/)
-./verify-selfhost.sh # Self-host tests (tests/selfhost/)
+./verify.sh            # tests/bootstrap/ (Rust compiler)
+./verify-selfhost.sh   # tests/selfhost/ (Fides components, 3 backends)
 ```

@@ -1,12 +1,13 @@
 // Fides Filesystem standard library
 //
-// File and directory operations: read, write, list, check existence.
-// Wraps the runtime file functions.
+// File and directory operations: read, write, list, walk, glob, temp files.
+// Implemented over the p_file_*/p_dir_* runtime builtins, so every function
+// works identically on the interpreter, C codegen and the PE backend.
 //
 // Usage:
 //   use fs;
 //   fs_write_text("hello.txt", "Hello, World!");
-//   value content = fs_read_text("hello.txt");
+//   val content = fs_read_text("hello.txt");
 //   println(content);  // "Hello, World!"
 
 module fs;
@@ -14,98 +15,28 @@ module fs;
 use vec;
 use string;
 
-// ─── FFI declarations ───────────────────────────────────────────────────
-
-extern "C" include "<stdio.h>" {
-    fn fopen as pledge_fopen(path: str, mode: str) -> i64;
-    fn fclose as pledge_fclose(stream: i64) -> i64;
-    fn fread as pledge_fread(buf: i64, size: i64, count: i64, stream: i64) -> i64;
-    fn fwrite as pledge_fwrite(buf: i64, size: i64, count: i64, stream: i64) -> i64;
-    fn fseek as pledge_fseek(stream: i64, offset: i64, origin: i64) -> i64;
-    fn ftell as pledge_ftell(stream: i64) -> i64;
-    fn remove as pledge_remove(path: str) -> i64;
-    fn rename as pledge_rename(old: str, new: str) -> i64;
-}
-
-extern "C" include "<sys/stat.h>" {
-    fn stat as pledge_stat(path: str, buf: i64) -> i64;
-}
-
-extern "C" include "<dirent.h>" {
-    fn opendir as pledge_opendir(path: str) -> i64;
-    fn readdir as pledge_readdir(dir: i64) -> str;
-    fn closedir as pledge_closedir(dir: i64) -> i64;
-}
-
 // ─── File existence / info ──────────────────────────────────────────────
 
 /// Check if a file exists.
 pub fn fs_exists(path: str) -> bool {
-    var f = pledge_fopen(path, "rb");
-    if f == 0 { return false; }
-    pledge_fclose(f);
-    return true;
+    return p_file_exists(path) != 0;
 }
 
 /// Get file size in bytes. Returns -1 if file doesn't exist.
 pub fn fs_file_size(path: str) -> i64 {
-    var f = pledge_fopen(path, "rb");
-    if f == 0 { return -1; }
-    pledge_fseek(f, 0, 2);  // SEEK_END = 2
-    var size = pledge_ftell(f);
-    pledge_fclose(f);
-    return size;
+    return p_file_size(path);
 }
 
 // ─── Read ───────────────────────────────────────────────────────────────
 
 /// Read a file as text. Returns "" if file doesn't exist.
 pub fn fs_read_text(path: str) -> str {
-    var f = pledge_fopen(path, "rb");
-    if f == 0 { return ""; }
-    pledge_fseek(f, 0, 2);  // SEEK_END
-    var size = pledge_ftell(f);
-    pledge_fseek(f, 0, 0);  // SEEK_SET = 0
-    if size <= 0 {
-        pledge_fclose(f);
-        return "";
-    }
-    // Read byte by byte (simplified — real impl would use fread)
-    var bytes = Vec::new();
-    var i = 0;
-    while i < size {
-        var buf = Vec::new();
-        buf.push(0);
-        pledge_fread(buf, 1, 1, f);  // This won't work — need proper buffer
-        bytes.push(buf.get(0));
-        i = i + 1;
-    }
-    pledge_fclose(f);
-    return str_from_bytes(bytes);
+    return p_file_read(path);
 }
 
 /// Read a file as a Vec of bytes. Returns empty Vec if file doesn't exist.
 pub fn fs_read_bytes(path: str) -> Vec {
-    var f = pledge_fopen(path, "rb");
-    if f == 0 { return Vec::new(); }
-    pledge_fseek(f, 0, 2);
-    var size = pledge_ftell(f);
-    pledge_fseek(f, 0, 0);
-    if size <= 0 {
-        pledge_fclose(f);
-        return Vec::new();
-    }
-    var bytes = Vec::new();
-    var i = 0;
-    while i < size {
-        var buf = Vec::new();
-        buf.push(0);
-        pledge_fread(buf, 1, 1, f);
-        bytes.push(buf.get(0));
-        i = i + 1;
-    }
-    pledge_fclose(f);
-    return bytes;
+    return p_file_read_bytes(path);
 }
 
 /// Read a file as lines. Returns empty Vec if file doesn't exist.
@@ -119,89 +50,44 @@ pub fn fs_read_lines(path: str) -> Vec {
 
 /// Write text to a file. Overwrites if exists. Returns true on success.
 pub fn fs_write_text(path: str, content: str) -> bool {
-    var f = pledge_fopen(path, "wb");
-    if f == 0 { return false; }
-    var bytes = str_bytes(content);
-    var i = 0;
-    while i < bytes.len() {
-        var buf = Vec::new();
-        buf.push(bytes.get(i));
-        pledge_fwrite(buf, 1, 1, f);
-        i = i + 1;
-    }
-    pledge_fclose(f);
-    return true;
+    return p_file_write(path, content) == 0;
 }
 
 /// Write bytes to a file. Overwrites if exists. Returns true on success.
 pub fn fs_write_bytes(path: str, bytes: Vec) -> bool {
-    var f = pledge_fopen(path, "wb");
-    if f == 0 { return false; }
-    var i = 0;
-    while i < bytes.len() {
-        var buf = Vec::new();
-        buf.push(bytes.get(i));
-        pledge_fwrite(buf, 1, 1, f);
-        i = i + 1;
-    }
-    pledge_fclose(f);
-    return true;
+    return p_file_write_vec(path, bytes) == 0;
 }
 
 /// Append text to a file. Creates if doesn't exist. Returns true on success.
 pub fn fs_append_text(path: str, content: str) -> bool {
-    var f = pledge_fopen(path, "ab");
-    if f == 0 { return false; }
-    var bytes = str_bytes(content);
-    var i = 0;
-    while i < bytes.len() {
-        var buf = Vec::new();
-        buf.push(bytes.get(i));
-        pledge_fwrite(buf, 1, 1, f);
-        i = i + 1;
-    }
-    pledge_fclose(f);
-    return true;
+    return p_file_append(path, content) == 0;
 }
 
 // ─── Delete / Rename ────────────────────────────────────────────────────
 
 /// Delete a file. Returns true on success.
 pub fn fs_delete(path: str) -> bool {
-    return pledge_remove(path) == 0;
+    return p_file_delete(path) == 0;
 }
 
 /// Rename/move a file. Returns true on success.
 pub fn fs_rename(old_path: str, new_path: str) -> bool {
-    return pledge_rename(old_path, new_path) == 0;
+    return p_rename(old_path, new_path) == 0;
 }
 
 // ─── Directory listing ──────────────────────────────────────────────────
 
-/// List files in a directory. Returns a Vec of file names.
+/// List entries in a directory (names only, no "." or "..").
 /// Returns empty Vec if directory doesn't exist or can't be opened.
 pub fn fs_list_dir(path: str) -> Vec {
-    var result = Vec::new();
-    var dir = pledge_opendir(path);
-    if dir == 0 { return result; }
-    var entry = pledge_readdir(dir);
-    while str_len(entry) > 0 {
-        // Skip "." and ".."
-        if !str_equal(entry, ".") && !str_equal(entry, "..") {
-            result.push(entry);
-        }
-        entry = pledge_readdir(dir);
-    }
-    pledge_closedir(dir);
-    return result;
+    var listing: str = p_dir_list(path);
+    if str_len(listing) == 0 { return Vec::new(); }
+    return str_split(listing, "\n");
 }
 
-/// Check if a path is a directory (by trying to open it).
+/// Check if a path is a directory.
 pub fn fs_is_dir(path: str) -> bool {
-    var dir = pledge_opendir(path);
-    if dir == 0 { return false; }
-    pledge_closedir(dir);
-    return true;
+    return p_is_dir(path) != 0;
 }
 
 /// Check if a path is a file (not a directory).
@@ -209,14 +95,230 @@ pub fn fs_is_file(path: str) -> bool {
     return fs_exists(path) && !fs_is_dir(path);
 }
 
-// ─── Path helpers (delegating to path.fd) ───────────────────────────────
+// ─── Directory creation / removal ───────────────────────────────────────
 
-/// Join two path components.
+/// Create a single directory. Returns true on success (false if it already
+/// exists or the parent is missing — use fs_mkdir_all for the recursive
+/// form).
+pub fn fs_mkdir(path: str) -> bool {
+    return p_mkdir(path) == 0;
+}
+
+/// Create a directory and all missing parents ("mkdir -p").
+/// Returns true if the directory exists afterwards.
+pub fn fs_mkdir_all(path: str) -> bool {
+    if str_len(path) == 0 { return false; }
+    if fs_is_dir(path) { return true; }
+    // Create each leading component in turn.
+    var parts: Vec = str_split(path, "/");
+    var cur: str = "";
+    var i: i64 = 0;
+    var start: i64 = 0;
+    // Absolute path: keep a leading "/".
+    if str_byte_at(path, 0) == 47 {
+        cur = "/";
+    }
+    while i < parts.len() {
+        var seg: str = parts.get(i);
+        if str_len(seg) > 0 {
+            if str_len(cur) > 0 && str_byte_at(cur, str_len(cur) - 1) != 47 {
+                cur = cur + "/";
+            }
+            cur = cur + seg;
+            if !fs_is_dir(cur) {
+                if p_mkdir(cur) != 0 && !fs_is_dir(cur) {
+                    return false;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return fs_is_dir(path);
+}
+
+/// Remove an empty directory. Returns true on success.
+pub fn fs_rmdir(path: str) -> bool {
+    return p_rmdir(path) == 0;
+}
+
+/// Remove a directory and everything inside it ("rm -rf").
+/// Returns true when the path no longer exists afterwards.
+pub fn fs_rmdir_all(path: str) -> bool {
+    if !fs_is_dir(path) {
+        // A plain file: just delete it.
+        if fs_exists(path) { return fs_delete(path); }
+        return true;
+    }
+    var entries: Vec = fs_list_dir(path);
+    var i: i64 = 0;
+    while i < entries.len() {
+        var name: str = entries.get(i);
+        var child: str = fs_join(path, name);
+        if fs_is_dir(child) {
+            fs_rmdir_all(child);
+        } else {
+            fs_delete(child);
+        }
+        i = i + 1;
+    }
+    p_rmdir(path);
+    return !fs_is_dir(path);
+}
+
+// ─── Recursive walk ─────────────────────────────────────────────────────
+
+/// Append every file/dir path under `dir` (recursively) to `out`.
+/// Entries are reported as `dir/name`; `dir` itself is not included.
+fn fs_walk_into(dir: str, out: Vec) -> void {
+    var entries: Vec = fs_list_dir(dir);
+    var i: i64 = 0;
+    while i < entries.len() {
+        var name: str = entries.get(i);
+        var child: str = fs_join(dir, name);
+        out.push(child);
+        if fs_is_dir(child) {
+            fs_walk_into(child, out);
+        }
+        i = i + 1;
+    }
+}
+
+/// Recursively list every file and directory under `dir` (depth-first,
+/// full paths relative to `dir` as given). Empty Vec when `dir` is not a
+/// readable directory.
+pub fn fs_walk(dir: str) -> Vec {
+    var out: Vec = Vec::new();
+    if !fs_is_dir(dir) { return out; }
+    fs_walk_into(dir, out);
+    return out;
+}
+
+/// Like fs_walk but reports only files, not directories.
+pub fn fs_walk_files(dir: str) -> Vec {
+    var all: Vec = fs_walk(dir);
+    var out: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < all.len() {
+        var p: str = all.get(i);
+        if fs_is_file(p) { out.push(p); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Glob matching ──────────────────────────────────────────────────────
+// `*` and `?` match within a path segment; `**` as a whole segment matches
+// any number of segments (including zero).
+
+/// Does `name` match a single-segment glob pattern (`*`, `?`)?
+/// This is the same wildcard matcher as regex_match.
+pub fn fs_glob_match(name: str, pattern: str) -> bool {
+    return p_regex_match(name, pattern) != 0;
+}
+
+fn fs_glob_recurse(dir: str, pat: Vec, pi: i64, prefix: str, out: Vec) -> void {
+    if pi >= pat.len() {
+        // Pattern consumed: `prefix` itself is a match when it exists.
+        if fs_exists(prefix) || fs_is_dir(prefix) {
+            out.push(prefix);
+        }
+        return;
+    }
+    var seg: str = pat.get(pi);
+    if str_equal(seg, "**") {
+        // Zero segments: match rest at this level.
+        fs_glob_recurse(dir, pat, pi + 1, prefix, out);
+        // Or descend into every subdirectory (keeping "**" for depth).
+        var entries: Vec = fs_list_dir(dir);
+        var i: i64 = 0;
+        while i < entries.len() {
+            var name: str = entries.get(i);
+            var child: str = fs_join(dir, name);
+            if fs_is_dir(child) {
+                fs_glob_recurse(child, pat, pi, child, out);
+            }
+            i = i + 1;
+        }
+        return;
+    }
+    var entries: Vec = fs_list_dir(dir);
+    var i: i64 = 0;
+    while i < entries.len() {
+        var name: str = entries.get(i);
+        if fs_glob_match(name, seg) {
+            var child: str = fs_join(dir, name);
+            fs_glob_recurse(child, pat, pi + 1, child, out);
+        }
+        i = i + 1;
+    }
+}
+
+/// Match `pattern` against the directory tree under `dir`.
+/// Returns matching paths as `dir`-relative full paths.
+///   fs_glob("src", "*.fd")        — direct children ending in .fd
+///   fs_glob("src", "**/*.fd")     — .fd files at any depth
+///   fs_glob("src", "a/?/b.txt")   — single-char middle component
+pub fn fs_glob(dir: str, pattern: str) -> Vec {
+    var out: Vec = Vec::new();
+    if !fs_is_dir(dir) { return out; }
+    var pat: Vec = str_split(pattern, "/");
+    fs_glob_recurse(dir, pat, 0, "", out);
+    return out;
+}
+
+// ─── Temporary files ────────────────────────────────────────────────────
+
+/// A collision-resistant temp name: prefix + pid + tick + nanos.
+fn fs_temp_name(prefix: str, ext: str) -> str {
+    return prefix + int_to_str(p_getpid()) + "_" + int_to_str(p_clock_now_us()) + ext;
+}
+
+/// Return a fresh temp-file path in `dir` (created on first write).
+/// The path does not exist yet — nothing is created.
+pub fn fs_temp_path(dir: str, prefix: str) -> str {
+    return fs_join(dir, fs_temp_name(prefix + "_", ".tmp"));
+}
+
+/// Create an empty temp file in `dir` and return its path, or "" on
+/// failure. `prefix` becomes the first characters of the file name.
+pub fn fs_temp_file(dir: str, prefix: str) -> str {
+    var tries: i64 = 0;
+    while tries < 64 {
+        var path: str = fs_temp_path(dir, prefix);
+        if !fs_exists(path) {
+            if fs_write_text(path, "") { return path; }
+            return "";
+        }
+        tries = tries + 1;
+    }
+    return "";
+}
+
+/// Create a temp directory in `dir` and return its path, or "" on failure.
+pub fn fs_temp_dir(dir: str, prefix: str) -> str {
+    var tries: i64 = 0;
+    while tries < 64 {
+        var path: str = fs_temp_path(dir, prefix);
+        if !fs_exists(path) && !fs_is_dir(path) {
+            if p_mkdir(path) == 0 { return path; }
+            return "";
+        }
+        tries = tries + 1;
+    }
+    return "";
+}
+
+// ─── Path helpers ───────────────────────────────────────────────────────
+
+/// Join two path components (handles "/", also treats "\" as separator on
+/// the right-hand side for Windows callers).
 pub fn fs_join(a: str, b: str) -> str {
     if str_len(a) == 0 { return b; }
     if str_len(b) == 0 { return a; }
-    var a_ends = str_byte_at(a, str_len(a) - 1) == 47;
-    var b_starts = str_byte_at(b, 0) == 47;
+    var last: i64 = str_byte_at(a, str_len(a) - 1);
+    var first: i64 = str_byte_at(b, 0);
+    var a_ends = last == 47 || last == 92;
+    var b_starts = first == 47 || first == 92;
     if a_ends && b_starts {
         return a + str_slice(b, 1, str_len(b));
     }
@@ -224,6 +326,48 @@ pub fn fs_join(a: str, b: str) -> str {
         return (a + "/") + b;
     }
     return a + b;
+}
+
+/// The last path component (after '/' or '\'); "" for a trailing sep.
+pub fn fs_basename(path: str) -> str {
+    var n: i64 = str_len(path);
+    var i: i64 = n - 1;
+    while i >= 0 {
+        var c: i64 = str_byte_at(path, i);
+        if c == 47 || c == 92 { return str_slice(path, i + 1, n); }
+        i = i - 1;
+    }
+    return path;
+}
+
+/// Everything before the last '/' or '\'; "" when there is none.
+pub fn fs_dirname(path: str) -> str {
+    var i: i64 = str_len(path) - 1;
+    while i >= 0 {
+        var c: i64 = str_byte_at(path, i);
+        if c == 47 || c == 92 { return str_slice(path, 0, i); }
+        i = i - 1;
+    }
+    return "";
+}
+
+/// The extension including the dot ("a.tar.gz" -> ".gz"); "" when none.
+pub fn fs_ext(path: str) -> str {
+    var base: str = fs_basename(path);
+    var i: i64 = str_len(base) - 1;
+    while i >= 0 {
+        var c: i64 = str_byte_at(base, i);
+        if c == 46 { return str_slice(base, i, str_len(base)); }
+        if c == 47 || c == 92 { return ""; }
+        i = i - 1;
+    }
+    return "";
+}
+
+/// Path without its final extension.
+pub fn fs_stem(path: str) -> str {
+    var e: str = fs_ext(path);
+    return str_slice(path, 0, str_len(path) - str_len(e));
 }
 
 /// Get the full path of a file in a directory.

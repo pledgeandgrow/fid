@@ -1,0 +1,290 @@
+// Fides Logging standard library
+//
+// A small structured logger:
+//   - levels: TRACE DEBUG INFO WARN ERROR (compile-time-free, runtime gate)
+//   - text format (logfmt):  ts=... level=info msg="hello" key=value
+//   - JSON lines:            {"ts":"...","level":"info","msg":"hello","key":"value"}
+//   - sinks: stdout, stderr, or a file (append)
+//
+// Timestamps come from the wall clock (clock_now_ms) and are therefore NOT
+// deterministic; disable them in tests with log_set_timestamps(false).
+//
+// Usage:
+//   use log;
+//   log_info("server started");
+//   log_set_level(LOG_DEBUG);
+//   var f = Vec::new(); f.push("port"); f.push("8080");
+//   log_infof("listening", f);          // level=info msg="listening" port=8080
+//   log_set_json(true);
+//   log_warnf("slow request", f);       // {"level":"warn","msg":"slow request",...}
+
+module log;
+
+use vec;
+use time;
+use file;
+
+// ─── Levels ─────────────────────────────────────────────────────────────
+
+pub const LOG_TRACE: i64 = 10;
+pub const LOG_DEBUG: i64 = 20;
+pub const LOG_INFO: i64 = 30;
+pub const LOG_WARN: i64 = 40;
+pub const LOG_ERROR: i64 = 50;
+pub const LOG_OFF: i64 = 100;
+
+// ─── Logger state (module globals) ──────────────────────────────────────
+
+var log_min_level: i64 = 30;         // INFO
+var log_show_ts: i64 = 0;            // timestamps off by default (test-friendly)
+var log_json: i64 = 0;               // 0 = logfmt text, 1 = JSON lines
+var log_sink: i64 = 0;               // 0 = stdout, 1 = stderr, 2 = file
+var log_sink_path: str = "";
+
+// ─── Configuration ─────────────────────────────────────────────────────
+
+/// Only emit messages at or above this level.
+pub fn log_set_level(level: i64) -> void {
+    log_min_level = level;
+}
+
+pub fn log_get_level() -> i64 {
+    return log_min_level;
+}
+
+/// Parse a level name ("trace".."error", case-insensitive).
+/// Returns -1 for unknown names.
+pub fn log_level_from_str(name: str) -> i64 {
+    var n = str_to_lower(name);
+    if n == "trace" { return LOG_TRACE; }
+    if n == "debug" { return LOG_DEBUG; }
+    if n == "info" { return LOG_INFO; }
+    if n == "warn" || n == "warning" { return LOG_WARN; }
+    if n == "error" { return LOG_ERROR; }
+    if n == "off" { return LOG_OFF; }
+    return -1;
+}
+
+/// Turn timestamps on/off. Off by default so tests are deterministic.
+pub fn log_set_timestamps(on: bool) -> void {
+    if on { log_show_ts = 1; } else { log_show_ts = 0; }
+}
+
+/// Switch between logfmt text (false) and JSON lines (true).
+pub fn log_set_json(on: bool) -> void {
+    if on { log_json = 1; } else { log_json = 0; }
+}
+
+/// Send output to stdout (the default).
+pub fn log_to_stdout() -> void {
+    log_sink = 0;
+    log_sink_path = "";
+}
+
+/// Send output to stderr.
+pub fn log_to_stderr() -> void {
+    log_sink = 1;
+    log_sink_path = "";
+}
+
+/// Append output to a file. "" returns to stdout.
+pub fn log_to_file(path: str) -> void {
+    if str_len(path) == 0 {
+        log_to_stdout();
+        return;
+    }
+    log_sink = 2;
+    log_sink_path = path;
+}
+
+// ─── Internals ──────────────────────────────────────────────────────────
+
+fn log_level_name(level: i64) -> str {
+    if level == LOG_TRACE { return "trace"; }
+    if level == LOG_DEBUG { return "debug"; }
+    if level == LOG_INFO { return "info"; }
+    if level == LOG_WARN { return "warn"; }
+    if level == LOG_ERROR { return "error"; }
+    return "log";
+}
+
+/// The current UTC timestamp as ISO 8601 text, or "" when disabled.
+fn log_timestamp() -> str {
+    if log_show_ts == 0 { return ""; }
+    var ms = p_clock_now_ms();
+    var t = time_from_timestamp(ms / 1000);
+    return time_to_iso(t);
+}
+
+/// Is a byte a JSON/logfmt-safe printable character?
+fn log_safe_byte(b: i64) -> bool {
+    return b >= 32 && b < 127 && b != 34 && b != 92;   // not " or backslash
+}
+
+/// Escape a string for JSON output (quotes, backslashes, controls).
+pub fn log_json_escape(s: str) -> str {
+    var out = "";
+    var i = 0;
+    var n = str_len(s);
+    while i < n {
+        var b = str_byte_at(s, i);
+        if b == 34 { out = out + "\\\""; }
+        else if b == 92 { out = out + "\\\\"; }
+        else if b == 10 { out = out + "\\n"; }
+        else if b == 13 { out = out + "\\r"; }
+        else if b == 9 { out = out + "\\t"; }
+        else if b < 32 {
+            var hi = b / 16;
+            var lo = b % 16;
+            out = out + "\\u00";
+            out = out + char_to_str(str_byte_at("0123456789abcdef", hi));
+            out = out + char_to_str(str_byte_at("0123456789abcdef", lo));
+        } else {
+            out = out + char_to_str(b);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Does a value need quoting in logfmt? (spaces, '=', '"', or empty)
+fn log_needs_quote(s: str) -> bool {
+    var n = str_len(s);
+    if n == 0 { return true; }
+    var i = 0;
+    while i < n {
+        var b = str_byte_at(s, i);
+        if b == 32 || b == 61 || b == 34 || b < 32 || b == 92 {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// A logfmt field value: bare when safe, "..." otherwise.
+fn log_kv_value(s: str) -> str {
+    if log_needs_quote(s) {
+        return "\"" + log_json_escape(s) + "\"";
+    }
+    return s;
+}
+
+/// Is a field value a JSON scalar we can emit unquoted? (int, float,
+/// true, false, null)
+fn log_json_raw_ok(s: str) -> bool {
+    if str_len(s) == 0 { return false; }
+    if s == "true" || s == "false" || s == "null" { return true; }
+    var i = 0;
+    var n = str_len(s);
+    var seen_digit = false;
+    var seen_dot = false;
+    while i < n {
+        var b = str_byte_at(s, i);
+        if b == 45 || b == 43 {                       // sign only first
+            if i != 0 { return false; }
+        } else if b == 46 {
+            if seen_dot { return false; }
+            seen_dot = true;
+        } else if b >= 48 && b <= 57 {
+            seen_digit = true;
+        } else {
+            return false;
+        }
+        i = i + 1;
+    }
+    return seen_digit;
+}
+
+/// Build the logfmt text line.
+fn log_render_text(level: i64, msg: str, fields: Vec) -> str {
+    var line = "";
+    var ts = log_timestamp();
+    if str_len(ts) > 0 {
+        line = line + "ts=" + ts + " ";
+    }
+    line = line + "level=" + log_level_name(level);
+    line = line + " msg=" + log_kv_value(msg);
+    var i = 0;
+    while i + 1 < fields.len() {
+        var k: str = fields.get(i);
+        var v: str = fields.get(i + 1);
+        line = line + " " + k + "=" + log_kv_value(v);
+        i = i + 2;
+    }
+    return line;
+}
+
+/// Build the JSON line.
+fn log_render_json(level: i64, msg: str, fields: Vec) -> str {
+    var line = "{";
+    var first = true;
+    var ts = log_timestamp();
+    if str_len(ts) > 0 {
+        line = line + "\"ts\":\"" + ts + "\"";
+        first = false;
+    }
+    if !first { line = line + ","; }
+    line = line + "\"level\":\"" + log_level_name(level) + "\"";
+    line = line + ",\"msg\":\"" + log_json_escape(msg) + "\"";
+    var i = 0;
+    while i + 1 < fields.len() {
+        var k: str = fields.get(i);
+        var v: str = fields.get(i + 1);
+        line = line + ",\"" + log_json_escape(k) + "\":";
+        if log_json_raw_ok(v) {
+            line = line + v;
+        } else {
+            line = line + "\"" + log_json_escape(v) + "\"";
+        }
+        i = i + 2;
+    }
+    return line + "}";
+}
+
+/// Emit one line to the configured sink.
+fn log_emit(line: str) -> void {
+    if log_sink == 1 {
+        p_eprint_str(line);
+        p_eprint_str("\n");
+        return;
+    }
+    if log_sink == 2 {
+        file_append(log_sink_path, line + "\n");
+        return;
+    }
+    print(line);
+    print("\n");
+}
+
+/// Core: log at an explicit level with a field list (flat k,v pairs).
+pub fn log_logf(level: i64, msg: str, fields: Vec) -> void {
+    if level < log_min_level { return; }
+    var line = "";
+    if log_json == 1 {
+        line = log_render_json(level, msg, fields);
+    } else {
+        line = log_render_text(level, msg, fields);
+    }
+    log_emit(line);
+}
+
+/// Log at an explicit level without fields.
+pub fn log_log(level: i64, msg: str) -> void {
+    var f = Vec::new();
+    log_logf(level, msg, f);
+}
+
+// ─── Level shortcuts ────────────────────────────────────────────────────
+
+pub fn log_trace(msg: str) -> void { log_log(LOG_TRACE, msg); }
+pub fn log_debug(msg: str) -> void { log_log(LOG_DEBUG, msg); }
+pub fn log_info(msg: str) -> void { log_log(LOG_INFO, msg); }
+pub fn log_warn(msg: str) -> void { log_log(LOG_WARN, msg); }
+pub fn log_error(msg: str) -> void { log_log(LOG_ERROR, msg); }
+
+pub fn log_tracef(msg: str, fields: Vec) -> void { log_logf(LOG_TRACE, msg, fields); }
+pub fn log_debugf(msg: str, fields: Vec) -> void { log_logf(LOG_DEBUG, msg, fields); }
+pub fn log_infof(msg: str, fields: Vec) -> void { log_logf(LOG_INFO, msg, fields); }
+pub fn log_warnf(msg: str, fields: Vec) -> void { log_logf(LOG_WARN, msg, fields); }
+pub fn log_errorf(msg: str, fields: Vec) -> void { log_logf(LOG_ERROR, msg, fields); }

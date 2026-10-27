@@ -33,7 +33,7 @@ to compile Fides programs:
 ```
 
 To build the self-hosted compiler (c3), see
-[build-pipeline.md](../selfhost/build-pipeline.md).
+[selfhost.md](../selfhost/selfhost.md) § Build Pipeline.
 
 ## Your First Program
 
