@@ -1,0 +1,70 @@
+use core;
+use vec;
+use string;
+use fs;
+use compiler::ir;
+use compiler::compiler;
+use compiler::pe_ir_enc;
+use compiler::pe_ir_stubs;
+use compiler::pe_ir;
+fn main() -> i64 {
+    var src: str = p_file_read("tests\\bootstrap\\struct.fd");
+    var r: ResultIrModule = lower_to_ir_module_with_path(src, "tests\\bootstrap\\struct.fd", "warn");
+    match r {
+        ResultIrModule::Err(errs) => { println("lower fail"); return 1; }
+        ResultIrModule::Ok(m) => {
+            var fi: i64 = 0;
+            var shown: i64 = 0;
+            while fi < m.functions.len() {
+                var fe: IrFunctionEntry = m.functions.get(fi);
+                var f: IrFunction = fe.func;
+                var bad: bool = false;
+                // invariant: value_metas.len() should equal next_value (dense ids)
+                if f.value_metas.len() != f.next_value { bad = true; }
+                if bad && shown < 15 {
+                    println("BAD " + fe.name + " metas=" + int_to_str(f.value_metas.len()) + " next=" + int_to_str(f.next_value) + " insts=" + int_to_str(f.insts.len()) + " params=" + int_to_str(f.params.len()));
+                    var mi: i64 = 0;
+                    while mi < f.value_metas.len() && mi < 10 {
+                        var vm: ValueIdMeta = f.value_metas.get(mi);
+                        println("  meta[" + int_to_str(mi) + "] id=" + int_to_str(vm.id));
+                        mi = mi + 1;
+                    }
+                    shown = shown + 1;
+                }
+                fi = fi + 1;
+            }
+            println("scanned " + int_to_str(m.functions.len()) + " fns, bad=" + int_to_str(shown));
+            // Also: for a big runtime fn, simulate the frame and dump offset map
+            fi = 0;
+            while fi < m.functions.len() {
+                var fe2: IrFunctionEntry = m.functions.get(fi);
+                var f2: IrFunction = fe2.func;
+                if f2.value_metas.len() > 100 {
+                    var frame: PeStackFrame = PeStackFrame_new();
+                    var vi: i64 = 0;
+                    while vi < f2.value_metas.len() {
+                        var vm2: ValueIdMeta = f2.value_metas.get(vi);
+                        var sz: i64 = IrModule_type_size(&m, vm2.meta.ty);
+                        if sz < 8 { sz = 8; }
+                        PeStackFrame_alloc(&mut frame, vm2.id, sz);
+                        vi = vi + 1;
+                    }
+                    println("bigfn " + fe2.name + " size=" + int_to_str(frame.size) + " offsets.len=" + int_to_str(frame.offsets.len()));
+                    println("  off[0]=" + int_to_str(PeStackFrame_offset(&frame, 0)) + " off[1]=" + int_to_str(PeStackFrame_offset(&frame, 1)) + " off[50]=" + int_to_str(PeStackFrame_offset(&frame, 50)));
+                    // check for collapsed: count ids resolving to same offset
+                    var c0: i64 = 0;
+                    var i2: i64 = 0;
+                    while i2 < frame.offsets.len() {
+                        if PeStackFrame_offset(&frame, i2) == frame.offsets.get(0) { c0 = c0 + 1; }
+                        i2 = i2 + 1;
+                    }
+                    println("  ids sharing offset[0]: " + int_to_str(c0));
+                    return 0;
+                }
+                fi = fi + 1;
+            }
+            return 0;
+        }
+    }
+    return 1;
+}

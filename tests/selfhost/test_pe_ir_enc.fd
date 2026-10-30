@@ -1,0 +1,206 @@
+// test_pe_ir_enc.fd — differential test for compiler/pe_ir_enc.fd.
+//
+// Emits the same canonical byte sequence as the `dump_pe_ir_enc_reference`
+// test in src/pe.rs and prints three hex lines (.text, .rdata, whole PE).
+// `cargo test --release dump_pe_ir_enc_reference` writes pe_enc_ref.txt;
+// this program's stdout must match it byte for byte, plus a final report
+// line with sizes and import-slot checks.
+
+use core;
+use vec;
+use string;
+use compiler::pe_ir_enc;
+
+fn main() -> i64 {
+    var e: X86Encoder = X86Encoder_new();
+
+    // ─── GP instructions ───
+    X86Encoder_push(e, REG_RBP); X86Encoder_push(e, REG_R12);
+    X86Encoder_pop(e, REG_RBP); X86Encoder_pop(e, REG_R13);
+    X86Encoder_ret(e); X86Encoder_nop(e); X86Encoder_ud2(e);
+    X86Encoder_mov_imm64(e, REG_RAX, 0x1122334455667788);
+    X86Encoder_mov_imm64(e, REG_R15, 42);
+    X86Encoder_mov_imm32(e, REG_RCX, -7);
+    X86Encoder_mov_imm32(e, REG_R9, 4096);
+    X86Encoder_mov_rr(e, REG_RAX, REG_RCX); X86Encoder_mov_rr(e, REG_R8, REG_R15);
+    X86Encoder_mov_reg_mem_rbp(e, REG_RAX, -8); X86Encoder_mov_reg_mem_rbp(e, REG_R12, -300);
+    X86Encoder_mov_mem_rbp_reg(e, -16, REG_RDX); X86Encoder_mov_mem_rbp_reg(e, 0, REG_R9);
+    X86Encoder_lea_rbp(e, REG_RAX, -24); X86Encoder_lea_rbp(e, REG_R10, 0);
+    X86Encoder_add_rr(e, REG_RAX, REG_RCX); X86Encoder_add_rr(e, REG_R9, REG_R10);
+    X86Encoder_sub_rr(e, REG_RDX, REG_RSI); X86Encoder_imul_rr(e, REG_RAX, REG_R11);
+    X86Encoder_idiv_r(e, REG_RCX); X86Encoder_div_rr(e, REG_R15);
+    X86Encoder_and_rr(e, REG_RAX, REG_RDX); X86Encoder_or_rr(e, REG_RBX, REG_R8);
+    X86Encoder_xor_rr(e, REG_RCX, REG_RCX); X86Encoder_xor_self(e, REG_R12);
+    X86Encoder_not_r(e, REG_RAX); X86Encoder_neg_r(e, REG_R14);
+    X86Encoder_cmp_rr(e, REG_RAX, REG_RDX); X86Encoder_cmp_rr(e, REG_R8, REG_R9);
+    X86Encoder_cmp_r8_i8(e, REG_RAX, 0); X86Encoder_cmp_r8_i8(e, REG_RSI, 13);
+    X86Encoder_cmp_r8_i8(e, REG_R9, 127);
+    X86Encoder_test_rr(e, REG_RAX, REG_RAX); X86Encoder_test_rr(e, REG_R8, REG_R10);
+    X86Encoder_shl_cl(e, REG_RAX); X86Encoder_shl_r_i8(e, REG_RCX, 4);
+    X86Encoder_shl_r_i8(e, REG_R15, 63);
+    X86Encoder_sar_cl(e, REG_RDX); X86Encoder_cqo(e);
+    X86Encoder_movzx_r32_r8(e, REG_RAX, REG_RCX); X86Encoder_movzx_r32_r8(e, REG_RAX, REG_RSP);
+    X86Encoder_movzx_r32_r8(e, REG_R8, REG_R12);
+    X86Encoder_movzx_r32_r16(e, REG_RDX, REG_RBX); X86Encoder_movzx_r32_r16(e, REG_R9, REG_R14);
+    X86Encoder_movsxd_rr(e, REG_RAX, REG_RCX); X86Encoder_movsxd_rr(e, REG_R10, REG_R11);
+    X86Encoder_movsx_r64_r8(e, REG_RAX, REG_RDX); X86Encoder_movsx_r64_r8(e, REG_R12, REG_R15);
+    X86Encoder_movsx_r64_r16(e, REG_RCX, REG_RSI); X86Encoder_movsx_r64_r16(e, REG_R13, REG_R8);
+    var cc: i64 = 0;
+    while cc < 16 {
+        X86Encoder_setcc_r(e, cc, REG_RAX);
+        cc = cc + 1;
+    }
+    X86Encoder_setcc_r(e, 4, REG_R12);
+    X86Encoder_sub_rsp_i8(e, 32); X86Encoder_sub_rsp_i32(e, 1000);
+    X86Encoder_sub_rsp_i32(e, -8);
+    X86Encoder_add_rsp_i8(e, 16); X86Encoder_add_rsp_i32(e, 2000);
+    X86Encoder_add_r_i32(e, REG_RAX, 5); X86Encoder_add_r_i32(e, REG_R15, -300);
+    X86Encoder_add_r_i8(e, REG_RCX, 7); X86Encoder_add_r_i8(e, REG_R9, -1);
+    X86Encoder_mov_r8_imm(e, REG_RAX, 0x41); X86Encoder_mov_r8_imm(e, REG_R11, 0xFF);
+
+    // Byte/word/dword/qword loads and stores through every base register,
+    // including RSP/R12 (SIB) and RBP/R13 (disp8=0) and all disp widths.
+    var bases: Vec<i64> = Vec::new();
+    bases.push(REG_RAX); bases.push(REG_RCX); bases.push(REG_RDX);
+    bases.push(REG_RBX); bases.push(REG_RSP); bases.push(REG_RBP);
+    bases.push(REG_RSI); bases.push(REG_RDI); bases.push(REG_R8);
+    bases.push(REG_R12); bases.push(REG_R13); bases.push(REG_R15);
+    var bi: i64 = 0;
+    while bi < bases.len() {
+        var b: i64 = bases.get(bi);
+        X86Encoder_mov_reg8_mem(e, REG_RAX, b);
+        X86Encoder_mov_mem_reg8_ptr(e, b, REG_RCX);
+        X86Encoder_mov_mem_reg8(e, b, REG_RDX);
+        X86Encoder_mov_reg8_ptr(e, REG_RDX, b);
+        X86Encoder_mov_reg32_ptr(e, REG_RSI, b);
+        X86Encoder_mov_reg16_ptr(e, REG_RDI, b);
+        X86Encoder_mov_ptr_reg(e, b, REG_RAX);
+        X86Encoder_mov_ptr_reg32(e, b, REG_RAX);
+        X86Encoder_mov_ptr_reg16(e, b, REG_RAX);
+        X86Encoder_mov_reg_ptr(e, REG_RAX, b);
+        X86Encoder_mov_reg_mem_disp(e, REG_RBX, b, 0);
+        X86Encoder_mov_reg_mem_disp(e, REG_RBX, b, 127);
+        X86Encoder_mov_reg_mem_disp(e, REG_RBX, b, 128);
+        X86Encoder_mov_reg_mem_disp(e, REG_RBX, b, -128);
+        X86Encoder_mov_mem_disp_reg(e, b, 5, REG_RCX);
+        X86Encoder_mov_mem_disp_reg(e, b, 300, REG_RCX);
+        X86Encoder_mov_mem_disp_reg32(e, b, -1, REG_RDX);
+        X86Encoder_mov_mem_disp_reg8(e, b, 9, REG_RAX);
+        bi = bi + 1;
+    }
+
+    // Indexed forms, including RBP/R13 bases (SIB + disp8=0).
+    var ib: Vec<i64> = Vec::new();
+    ib.push(REG_RAX); ib.push(REG_RBP); ib.push(REG_R13); ib.push(REG_R12);
+    var ii: Vec<i64> = Vec::new();
+    ii.push(REG_RCX); ii.push(REG_RDX); ii.push(REG_R9); ii.push(REG_R10);
+    var pi: i64 = 0;
+    while pi < ib.len() {
+        var pb: i64 = ib.get(pi);
+        var px: i64 = ii.get(pi);
+        X86Encoder_mov_mem_idx_reg8(e, pb, px, REG_RAX);
+        X86Encoder_mov_reg8_mem_idx(e, REG_RAX, pb, px);
+        X86Encoder_cmp_mem_idx_imm8(e, pb, px, 0x2A);
+        X86Encoder_mov_reg_mem_idx(e, REG_RAX, pb, px);
+        X86Encoder_mov_mem_idx_reg(e, pb, px, REG_RAX);
+        pi = pi + 1;
+    }
+
+    X86Encoder_inc_r(e, REG_RAX); X86Encoder_inc_r(e, REG_R15);
+    X86Encoder_dec_r(e, REG_RCX); X86Encoder_dec_r(e, REG_R8);
+    X86Encoder_imul_r_r_imm32(e, REG_RAX, REG_RCX, 100);
+    X86Encoder_imul_r_r_imm32(e, REG_R9, REG_R10, -7);
+    X86Encoder_call_reg(e, REG_RAX); X86Encoder_call_reg(e, REG_R11);
+
+    // Labels: forward jump/jcc/call/lea, then backward jump.
+    var l1: i64 = X86Encoder_alloc_label(e);
+    var l2: i64 = X86Encoder_alloc_label(e);
+    X86Encoder_jmp_label(e, l1); X86Encoder_jcc_label(e, 0x4, l1);
+    X86Encoder_call_label(e, l1);
+    X86Encoder_lea_label(e, REG_RAX, l2); X86Encoder_lea_label(e, REG_R14, l1);
+    X86Encoder_place_label(e, l2); X86Encoder_jmp_label(e, l2);
+    X86Encoder_place_label(e, l1); X86Encoder_jmp_label(e, l1);
+    X86Encoder_resolve_labels(e);
+
+    // RIP-relative refs into .rdata (patched below).
+    X86Encoder_lea_rip(e, REG_RAX, 16); X86Encoder_lea_rip(e, REG_R15, 0);
+    X86Encoder_call_rip(e, 64); X86Encoder_call_rip(e, 128);
+
+    // SSE2 packed and AVX.
+    X86Encoder_addpd_rr(e, XMM0, XMM1); X86Encoder_addpd_rr(e, XMM8, XMM9);
+    X86Encoder_subpd_rr(e, XMM2, XMM3); X86Encoder_mulpd_rr(e, XMM4, XMM5);
+    X86Encoder_divpd_rr(e, XMM6, XMM7); X86Encoder_movapd_rr(e, XMM0, XMM15);
+    X86Encoder_movsd_rr(e, XMM1, XMM2); X86Encoder_movsd_rr(e, XMM10, XMM11);
+    X86Encoder_addpd_mem_rbp(e, XMM0, -16); X86Encoder_addpd_mem_rbp(e, XMM9, -200);
+    X86Encoder_movapd_mem_rbp(e, -24, XMM1); X86Encoder_movapd_mem_rbp(e, 300, XMM8);
+    X86Encoder_movapd_rbp_reg(e, XMM2, -32); X86Encoder_movapd_rbp_reg(e, XMM11, 1000);
+    X86Encoder_vaddpd_rr(e, XMM0, XMM1, XMM2);
+    X86Encoder_vaddpd_rr(e, XMM9, XMM3, XMM4);
+    X86Encoder_vmulpd_rr(e, XMM5, XMM6, XMM7);
+
+    // Scalar float.
+    X86Encoder_movsd_xmm_mem_rbp(e, 0, -8); X86Encoder_movsd_xmm_mem_rbp(e, 3, 200);
+    X86Encoder_movsd_mem_rbp_xmm(e, -16, 1); X86Encoder_movsd_mem_rbp_xmm(e, -300, 7);
+    X86Encoder_movss_xmm_mem_rbp(e, 2, -24); X86Encoder_movss_mem_rbp_xmm(e, 8, 4);
+    X86Encoder_addsd(e, 0, 1); X86Encoder_subsd(e, 2, 3);
+    X86Encoder_mulsd(e, 4, 5); X86Encoder_divsd(e, 6, 7);
+    X86Encoder_xorpd_xmm_mem_rbp(e, 0, -8); X86Encoder_xorpd_xmm_mem_rbp(e, 5, 400);
+    X86Encoder_xorpd_xmm_xmm(e, 0, 1);
+    X86Encoder_movq_xmm_r64(e, 0, REG_RAX); X86Encoder_movq_xmm_r64(e, 2, REG_R13);
+    X86Encoder_ucomisd(e, 0, 1); X86Encoder_ucomiss(e, 2, 3);
+    X86Encoder_cvtsi2sd_r64(e, 0, REG_RAX); X86Encoder_cvtsi2sd_r64(e, 1, REG_R12);
+    X86Encoder_cvttsd2si_r64(e, REG_RAX, 0); X86Encoder_cvttsd2si_r64(e, REG_R14, 3);
+    X86Encoder_addss(e, 0, 1); X86Encoder_subss(e, 1, 2);
+    X86Encoder_mulss(e, 2, 3); X86Encoder_divss(e, 3, 4);
+    X86Encoder_movq_xmm_mem_rbp(e, 6, -40); X86Encoder_movq_mem_rbp_xmm(e, -48, 7);
+    X86Encoder_align_to(e, 16);
+
+    // Raw emission.
+    X86Encoder_emit_u8(e, 0xAB); X86Encoder_emit_u16(e, 0x1234);
+    X86Encoder_emit_u32(e, 0xDEADBEEF);
+    X86Encoder_emit_i32(e, -1); X86Encoder_emit_u64(e, 0x0102030405060708);
+    var raw: Vec<i64> = Vec::new();
+    raw.push(0x01); raw.push(0x02); raw.push(0x03);
+    X86Encoder_emit(e, raw);
+
+    // ─── .rdata (mirrors generate()'s layout math) ───
+    var rd: RdataBuilder = RdataBuilder_new();
+    var sc: Vec<str> = Vec::new();
+    sc.push("hello");
+    sc.push("world!");
+    sc.push("a\nb\tc\"d");
+    sc.push("kernel32.dll"); // dedup: same offset as the DLL name
+    RdataBuilder_build(rd, sc);
+    var rdata_rva: i64 = PE_TEXT_RVA + pe_align_up(e.code.len(), PE_SECTION_ALIGN);
+    X86Encoder_resolve_rip_refs(e, PE_TEXT_RVA, rdata_rva);
+    RdataBuilder_patch_rvas(rd, rdata_rva);
+
+    // ─── Whole PE file ───
+    var import_dir_rva: i64 = rdata_rva + rd.import_dir_offset;
+    var iat_rva: i64 = rdata_rva + rd.iat_offset;
+    var pe: Vec<i64> = pe_build_file(e.code, rd.data, 0, import_dir_rva, iat_rva, rd.iat_size, rdata_rva);
+
+    // Three hex lines identical to the Rust reference dump.
+    print(pe_bytes_hex(e.code) + "\n");
+    print(pe_bytes_hex(rd.data) + "\n");
+    print(pe_bytes_hex(pe) + "\n");
+
+    // Report line: sizes and import-table checks.
+    var k32: Vec<str> = pe_kernel32_imports();
+    var msv: Vec<str> = pe_msvcrt_imports();
+    var ok: bool = true;
+    if k32.len() != 40 { ok = false; }
+    if msv.len() != 74 { ok = false; }
+    if pe_import_slot("WriteFile") != 1 { ok = false; }
+    if pe_import_slot("GetProcAddress") != 38 { ok = false; }
+    if pe_import_slot("sqrt") != 40 { ok = false; }
+    if pe_import_slot("system") != 113 { ok = false; }
+    if pe_import_slot("nope") != -1 { ok = false; }
+    if rd.iat_offsets.len() != 114 { ok = false; }
+    if ok {
+        print("checks ok: text=" + int_to_str(e.code.len()) + " rdata=" + int_to_str(rd.data.len()) + " pe=" + int_to_str(pe.len()) + " rdata_rva=" + int_to_str(rdata_rva) + "\n");
+        return 0;
+    }
+    print("CHECKS FAILED\n");
+    return 1;
+}

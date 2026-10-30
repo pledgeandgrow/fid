@@ -1,0 +1,38 @@
+use core;
+use vec;
+use string;
+use fs;
+use compiler::ir;
+use compiler::pe_ir_enc;
+use compiler::pe_ir_stubs;
+use compiler::pe_ir;
+fn main() -> i64 {
+    var m: IrModule = IrModule_new();
+    var f: IrFunction = IrFunction_new("main", IrType::I64);
+    var b: i64 = IrFunction_new_block(&mut f);
+    f.entry = b;
+    // x = 42 via alloca/store/load; y = x + 8; print(y); return y
+    var k42: i64 = IrFunction_emit(&mut f, Inst::ConstInt(42, IrType::I64));
+    var slot: i64 = IrFunction_emit(&mut f, Inst::Alloca(IrType::I64, Region::Stack));
+    IrFunction_emit(&mut f, Inst::Store(slot, k42, OptIrType::None));
+    var x: i64 = IrFunction_emit(&mut f, Inst::Load(slot, IrType::I64));
+    var k8: i64 = IrFunction_emit(&mut f, Inst::ConstInt(8, IrType::I64));
+    var y: i64 = IrFunction_emit(&mut f, Inst::BinOp(BinOp::Add, x, k8, IrType::I64));
+    IrFunction_emit(&mut f, Inst::Print(y, IrType::I64));
+    IrFunction_emit(&mut f, Inst::Return(OptValueId::Some(y)));
+    m.functions.push(IrFunctionEntry_new("main", f));
+    var r: ResultBytes = pe_ir_generate_pe(m);
+    match r {
+        ResultBytes::Err(errs) => {
+            var i: i64 = 0;
+            while i < errs.len() { println("err: " + errs.get(i)); i = i + 1; }
+            return 1;
+        }
+        ResultBytes::Ok(bytes) => {
+            if !fs_write_bytes("t_pe_ir\\probe2.exe", bytes) { println("write fail"); return 1; }
+            println("wrote " + int_to_str(bytes.len()));
+            return 0;
+        }
+    }
+    return 0;
+}

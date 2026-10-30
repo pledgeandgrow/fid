@@ -1007,6 +1007,14 @@ impl Lowerer {
         self.module.add_extern("p_http_build_response", vec![IrType::I64, IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))], IrType::Ptr(Box::new(IrType::U8)));
 
         // ─── File I/O builtins ───
+        // stdin / stdout
+        self.module.add_extern("p_flush_stdout", vec![], IrType::Void);
+        self.module.add_extern("p_stdin_eof", vec![], IrType::I64);
+        // p_read_line() -> *u8 — one line without the trailing newline; NULL at EOF
+        self.module.add_extern("p_read_line", vec![], IrType::Ptr(Box::new(IrType::U8)));
+        // p_read_stdin(n: i64) -> *u8 — up to n raw bytes from stdin
+        self.module.add_extern("p_read_stdin", vec![IrType::I64], IrType::Ptr(Box::new(IrType::U8)));
+
         // p_file_read(path: *u8) -> *u8  — read entire file, return content as string
         // p_file_write(path: *u8, content: *u8) -> i64  — write content to file, return 0 on success, -1 on error
         // p_file_exists(path: *u8) -> bool  — check if file exists
@@ -1418,6 +1426,7 @@ impl Lowerer {
         ir_func.bind_local("__env", env_val);
 
         // Create parameter values
+        let mut param_bindings: Vec<(String, ValueId, IrType)> = Vec::new();
         for param in &func.params {
             let raw_ty = self.lower_type(&param.ty);
             // I-6B: Check linearity before raw_ty is moved
@@ -1440,6 +1449,7 @@ impl Lowerer {
             let val = ir_func.new_value(meta);
             ir_func.params.push((val, ir_ty.clone()));
             ir_func.bind_local(&param.name, val);
+            param_bindings.push((param.name.clone(), val, ir_ty));
         }
 
         // Set as current function
@@ -1447,6 +1457,23 @@ impl Lowerer {
         self.current_block = BlockId(0);
         self.allocas.clear();
         self.alloca_types.clear();
+
+        // Parameters assigned in the body need an alloca: a bare SSA binding
+        // cannot be updated across block boundaries (a `while` loop would
+        // re-read the entry value forever). Spill them in the entry block.
+        let mut assigned_params = std::collections::HashSet::new();
+        Self::collect_assign_targets(&func.body, &mut assigned_params);
+        for (name, val, ir_ty) in &param_bindings {
+            if assigned_params.contains(name) {
+                let slot = self.emit_inst(Inst::Alloca {
+                    ty: ir_ty.clone(),
+                    region: self.current_region(),
+                });
+                self.emit_inst(Inst::Store { ptr: slot, value: *val, store_ty: None });
+                self.allocas.insert(name.clone(), slot);
+                self.alloca_types.insert(slot, ir_ty.clone());
+            }
+        }
         self.var_ast_types.clear();
         self.defer_stack.clear();
         // Save AST parameter types for function-typed param return type lookup
@@ -6776,6 +6803,56 @@ impl Lowerer {
                     self.collect_free_vars(body, free_vars, local_names);
                 }
                 Stmt::CancelScope { .. } => {}
+            }
+        }
+    }
+
+    /// Names rebound by `x = ...` anywhere in a statement list (all nested
+    /// bodies). IndexAssign/DerefAssign/FieldAssign write through a value —
+    /// they mutate contents, not the binding — so they do not count.
+    fn collect_assign_targets(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Assign { target, .. } => { out.insert(target.clone()); }
+                Stmt::If { then_block, else_block, .. } => {
+                    Self::collect_assign_targets(then_block, out);
+                    if let Some(eb) = else_block {
+                        Self::collect_assign_targets(eb, out);
+                    }
+                }
+                Stmt::While { body, .. } | Stmt::Loop { body, .. } | Stmt::Defer(body, _)
+                | Stmt::RegionBlock { body, .. } | Stmt::Sandbox { body, .. }
+                | Stmt::Unsafe { body, .. } | Stmt::Txn { body, .. }
+                | Stmt::GradBlock { body, .. } | Stmt::Query { body, .. }
+                | Stmt::SpawnScope { body, .. } | Stmt::ComptimeGen { block: body, .. } => {
+                    Self::collect_assign_targets(body, out);
+                }
+                Stmt::For { body, .. } => Self::collect_assign_targets(body, out),
+                Stmt::Match { arms, .. } => {
+                    for arm in arms {
+                        Self::collect_assign_targets(&arm.body, out);
+                    }
+                }
+                Stmt::Handle { body, handlers, .. } => {
+                    Self::collect_assign_targets(body, out);
+                    for h in handlers {
+                        Self::collect_assign_targets(&h.body, out);
+                    }
+                }
+                Stmt::Select { cases, default, .. } => {
+                    for c in cases {
+                        Self::collect_assign_targets(&c.body, out);
+                    }
+                    if let Some(d) = default {
+                        Self::collect_assign_targets(d, out);
+                    }
+                }
+                Stmt::Parallel { branches, .. } => {
+                    for b in branches {
+                        Self::collect_assign_targets(b, out);
+                    }
+                }
+                _ => {}
             }
         }
     }

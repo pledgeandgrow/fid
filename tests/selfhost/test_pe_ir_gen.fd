@@ -1,0 +1,103 @@
+// test_pe_ir_gen.fd — differential harness for the native PE backend
+// (compiler/pe_ir.fd): lowers bootstrap test programs with the Fides
+// pipeline and writes native .exe files to t_pe_ir/, one per test.
+// Compare each produced exe's output with `fidesc emit` (Rust backend)
+// and `fidesc run` — items 13-30 of docs/roadmap/pe-roadmap.md.
+
+use core;
+use vec;
+use string;
+use fs;
+use compiler::ir;
+use compiler::compiler;
+use compiler::pe_ir;
+
+fn emit_file(src_path: str, out_path: str) -> i64 {
+    var src: str = p_file_read(src_path);
+    if src == 0 {
+        println("FAIL read " + src_path);
+        return 1;
+    }
+    var r: ResultIrModule = lower_to_ir_module_with_path(src, src_path, "warn");
+    match r {
+        ResultIrModule::Err(errs) => {
+            println("FAIL lower " + src_path);
+            var i: i64 = 0;
+            while i < errs.len() {
+                println("  " + errs.get(i));
+                i = i + 1;
+            }
+            return 1;
+        }
+        ResultIrModule::Ok(imod) => {
+            var res: ResultBytes = pe_ir_generate_pe(imod);
+            match res {
+                ResultBytes::Err(errs2) => {
+                    println("FAIL gen " + src_path);
+                    var j: i64 = 0;
+                    while j < errs2.len() {
+                        println("  " + errs2.get(j));
+                        j = j + 1;
+                    }
+                    return 1;
+                }
+                ResultBytes::Ok(bytes) => {
+                    if !fs_write_bytes(out_path, bytes) {
+                        println("FAIL write " + out_path);
+                        return 1;
+                    }
+                    println("wrote " + out_path + " (" + int_to_str(bytes.len()) + " bytes)");
+                    return 0;
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+fn main() -> i64 {
+    // fidesc emit merges src/pe_runtime into core; the harness does the same.
+    set_pe_runtime_merge(true);
+    var files: Vec = Vec::new();
+    // items 13-16: frames, ABI, constants
+    files.push("tests/bootstrap/hello.fd");
+    files.push("tests/bootstrap/arithmetic.fd");
+    files.push("tests/bootstrap/struct.fd");
+    files.push("tests/bootstrap/test_globals.fd");
+    // items 17-19: overflow checks, div/mod, shifts/bitwise
+    files.push("tests/bootstrap/test_checked_arith.fd");
+    // item 20: branches/match
+    files.push("tests/bootstrap/test_match.fd");
+    // item 21: floats
+    files.push("tests/bootstrap/test_float.fd");
+    // items 23-24: structs/enums/match
+    files.push("tests/bootstrap/test_enum_simple.fd");
+    // item 25: closures/indirect calls
+    files.push("tests/bootstrap/test_closure.fd");
+    // item 27-28: print/panic are covered by the above; vec/map need stubs
+    files.push("tests/bootstrap/test_vec_one.fd");
+    files.push("tests/bootstrap/test_hashmap.fd");
+    files.push("tests/bootstrap/strings.fd");
+
+    // t_pe_ir/ is created by the driver script (p_is_dir is not a fid builtin)
+    var fails: i64 = 0;
+    var i: i64 = 0;
+    while i < files.len() {
+        var f: str = files.get(i);
+        var base: str = f;
+        // basename without extension
+        var slash: i64 = str_rfind(f, "/");
+        if slash >= 0 { base = str_slice(f, slash + 1, str_len(f)); }
+        var dot: i64 = str_find(base, ".fd");
+        if dot >= 0 { base = str_slice(base, 0, dot); }
+        var outp: str = "t_pe_ir/fides_" + base + ".exe";
+        if emit_file(f, outp) != 0 { fails = fails + 1; }
+        i = i + 1;
+    }
+    if fails > 0 {
+        println("=== " + int_to_str(fails) + " FAILED ===");
+        return 1;
+    }
+    println("=== ALL EMITTED ===");
+    return 0;
+}

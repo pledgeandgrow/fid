@@ -1,0 +1,57 @@
+// Test: stdlib/args — pure parser layer over a synthetic argv Vec.
+// (Real argv differs across backends; args_len/args_get shape is checked.)
+use args;
+use vec;
+
+fn bs(b: bool) -> str {
+    if b { return "t"; }
+    return "f";
+}
+
+fn main() -> i64 {
+    var av: Vec = Vec::new();
+    av.push("prog");
+    av.push("-v");
+    av.push("--output");
+    av.push("out.txt");
+    av.push("--jobs=8");
+    av.push("file1");
+    av.push("file2");
+    av.push("--");
+    av.push("--literal");
+
+    println("f1 " + bs(args_flag_in(av, "-v", "--verbose")));
+    println("f2 " + bs(!args_flag_in(av, "-q", "--quiet")));
+    println("o1 " + args_option_in(av, "-o", "--output", "def"));
+    println("o2 " + args_option_in(av, "-j", "--jobs", "1"));
+    println("o3 " + args_option_in(av, "-x", "--xxx", "none"));
+    println("i1 " + int_to_str(args_int_in(av, "-j", "--jobs", 0)));
+    println("h1 " + bs(args_has_option_in(av, "-o", "--output")));
+
+    // naive positionals: option values are not distinguishable (documented)
+    var ps: Vec = args_positionals_in(av);
+    println("p1 " + int_to_str(ps.len()));
+
+    // spec-driven parse: exact classification
+    var fl: Vec = args_flags_present_in(av, "-v,--verbose,-q,--quiet");
+    var op: Vec = args_opts_present_in(av, "-o,--output,-j,--jobs");
+    var ep: Vec = args_positionals_exact_in(av, "-v,--verbose,-q,--quiet", "-o,--output,-j,--jobs");
+    println("s1 " + int_to_str(fl.len()));
+    println("s2 " + int_to_str(op.len()));
+    println("s3 " + int_to_str(ep.len()));
+    var epj: str = "";
+    var k: i64 = 0;
+    while k < ep.len() {
+        var e: str = ep.get(k);
+        epj = epj + e + ",";
+        k = k + 1;
+    }
+    println("s4 " + epj);
+
+    // real argv: shape only (values differ interp vs compiled)
+    println("r1 " + bs(args_len() >= 1));
+    println("r2 " + bs(str_len(args_get(0)) >= 0));
+    println("r3 " + bs(str_len(args_program_name()) >= 0));
+
+    return 0;
+}

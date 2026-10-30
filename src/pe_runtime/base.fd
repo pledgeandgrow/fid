@@ -43,6 +43,9 @@ extern "C" {
     fn FindFirstFileA as pe_k_find_first(pat: str, data: i64) -> i64;
     fn FindNextFileA as pe_k_find_next(h: i64, data: i64) -> i32;
     fn FindClose as pe_k_find_close(h: i64) -> i32;
+    fn GetStdHandle as pe_k_std_handle(n: i64) -> i64;
+    fn ReadFile as pe_k_read_file(h: i64, buf: i64, n: i64, read_out: i64, ovl: i64) -> i32;
+    fn fflush as pe_c_fflush(f: i64) -> i32;
     // Machine-code primitives (pe.rs): a float travels as its bits
     fn pe_f64_to_bits(x: f64) -> i64;
     fn pe_bits_to_f64(bits: i64) -> f64;
@@ -375,9 +378,10 @@ pub fn pert_is_dir(path: str) -> bool {
     if pe_str_is_null(path) {
         return false;
     }
-    // GetFileAttributesA: -1 on failure, bit 4 (FILE_ATTRIBUTE_DIRECTORY) set for dirs
-    var a: i64 = pe_k_attrs(path);
-    return a != -1 && (a & 16) != 0;
+    // GetFileAttributesA: DWORD, zero-extended — failure is 0xFFFFFFFF, not -1.
+    // Bit 4 (FILE_ATTRIBUTE_DIRECTORY) is set for dirs.
+    var a: i64 = pe_k_attrs(path) & 4294967295;
+    return a != 4294967295 && (a & 16) != 0;
 }
 
 pub fn pert_rename(a: str, b: str) -> i64 {
@@ -502,7 +506,7 @@ pub fn pert_process_run(cmd: str) -> i64 {
     // The record address is unique per live call — a safe temp-name tag.
     var of: str = ".fprc_" + int_to_str(rec) + ".out";
     var ef: str = ".fprc_" + int_to_str(rec) + ".err";
-    var code: i64 = pe_c_system(cmd + " > \"" + of + "\" 2> \"" + ef + "\"");
+    var code: i64 = pe_c_system("( " + cmd + " ) > \"" + of + "\" 2> \"" + ef + "\"");
     var outp: *mut i64 = rec;
     var errp: *mut i64 = rec + 8;
     var codep: *mut i64 = rec + 16;
@@ -885,4 +889,87 @@ pub fn pert_ecs_remove(name: str, entity: i64) -> i64 {
         i = i + 2;
     }
     return 0;
+}
+
+// ─── stdin / stdout ─────────────────────────────────────────────────────
+
+/// feof() semantics: true only after a read hit the end of stdin.
+var pert_stdin_eof_flag: i64 = 0;
+
+/// Little-endian dword read (ReadFile's out count is a 32-bit DWORD).
+fn pe_dword_at(buf: i64, i: i64) -> i64 {
+    return pe_byte_at(buf, i)
+        | (pe_byte_at(buf, i + 1) << 8)
+        | (pe_byte_at(buf, i + 2) << 16)
+        | (pe_byte_at(buf, i + 3) << 24);
+}
+
+/// Our prints go straight to WriteFile — unbuffered — so there is nothing
+/// pending; flushing all C streams mirrors `fflush(stdout)` anyway.
+pub fn pert_flush_stdout() {
+    pe_c_fflush(0);
+}
+
+pub fn pert_stdin_eof() -> i64 {
+    return pert_stdin_eof_flag;
+}
+
+/// p_read_stdin(n): up to n raw bytes from stdin as a NUL-terminated str.
+/// Sets the eof flag when the stream ends before n bytes.
+pub fn pert_read_stdin(n: i64) -> str {
+    if n < 0 {
+        n = 0;
+    }
+    var buf: i64 = p_malloc(n + 1);
+    if buf == 0 {
+        return "";
+    }
+    var rd_ptr: i64 = p_malloc(8);
+    var h: i64 = pe_k_std_handle(-10); // STD_INPUT_HANDLE
+    var got: i64 = 0;
+    while got < n {
+        pe_set_byte(rd_ptr, 0, 0);
+        pe_set_byte(rd_ptr, 1, 0);
+        pe_set_byte(rd_ptr, 2, 0);
+        pe_set_byte(rd_ptr, 3, 0);
+        var ok: i64 = pe_k_read_file(h, buf + got, n - got, rd_ptr, 0);
+        var rd: i64 = pe_dword_at(rd_ptr, 0);
+        if ok == 0 || rd == 0 {
+            pert_stdin_eof_flag = 1;
+            break;
+        }
+        got = got + rd;
+    }
+    pe_set_byte(buf, got, 0);
+    return pe_buf_str(buf);
+}
+
+/// p_read_line(): one line without the trailing '\n'; "" on EOF or error
+/// (eof flag set on end of stream — callers test it like feof()).
+/// Byte reads are enough: this serves the REPL/debugger, not bulk input.
+pub fn pert_read_line() -> str {
+    var buf: i64 = p_malloc(65537);
+    if buf == 0 {
+        return "";
+    }
+    var rd_ptr: i64 = p_malloc(8);
+    var h: i64 = pe_k_std_handle(-10);
+    var got: i64 = 0;
+    while got < 65536 {
+        pe_set_byte(rd_ptr, 0, 0);
+        pe_set_byte(rd_ptr, 1, 0);
+        pe_set_byte(rd_ptr, 2, 0);
+        pe_set_byte(rd_ptr, 3, 0);
+        var ok: i64 = pe_k_read_file(h, buf + got, 1, rd_ptr, 0);
+        if ok == 0 || pe_dword_at(rd_ptr, 0) == 0 {
+            pert_stdin_eof_flag = 1;
+            break;
+        }
+        if pe_byte_at(buf, got) == 10 {
+            break;
+        }
+        got = got + 1;
+    }
+    pe_set_byte(buf, got, 0);
+    return pe_buf_str(buf);
 }

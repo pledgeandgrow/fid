@@ -906,6 +906,78 @@ pub fn Lowerer_insert_vec_alloca(self: &mut Lowerer, id: i64) {
     self.vec_allocas.push(id);
 }
 
+// Names rebound by `x = ...` anywhere in a statement list (all nested
+// bodies). IndexAssign/DerefAssign/FieldAssign write through a value —
+// they mutate contents, not the binding — so they do not count.
+fn collect_assign_targets(stmts: Vec<Stmt>, out: Vec<str>) {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        var stmt: Stmt = stmts.get(i);
+        match stmt {
+            Stmt::Assign(target, _op, _expr, _line) => {
+                if !lw_c_str_vec_contains(out, target) { out.push(target); }
+            }
+            Stmt::If(_c, then_block, else_block, _line) => {
+                collect_assign_targets(then_block, out);
+                match else_block {
+                    OptStmts::Some(eb) => { collect_assign_targets(eb, out); }
+                    OptStmts::None => {}
+                }
+            }
+            Stmt::While(_c, body, _line) => { collect_assign_targets(body, out); }
+            Stmt::For(_v, _it, body, _line) => { collect_assign_targets(body, out); }
+            Stmt::Loop(body, _line) => { collect_assign_targets(body, out); }
+            Stmt::Defer(body, _line) => { collect_assign_targets(body, out); }
+            Stmt::Unsafe(body, _line) => { collect_assign_targets(body, out); }
+            Stmt::Sandbox(body, _line) => { collect_assign_targets(body, out); }
+            Stmt::Txn(body, _line) => { collect_assign_targets(body, out); }
+            Stmt::RegionBlock(_n, _b, _g, _kv, _w, body, _line) => { collect_assign_targets(body, out); }
+            Stmt::GradBlock(_v, body, _line) => { collect_assign_targets(body, out); }
+            Stmt::Query(_n, body, _line) => { collect_assign_targets(body, out); }
+            Stmt::ComptimeGen(body, _line) => { collect_assign_targets(body, out); }
+            Stmt::SpawnScope(body, _line) => { collect_assign_targets(body, out); }
+            Stmt::Match(_e, arms, _line) => {
+                var ai: i64 = 0;
+                while ai < arms.len() {
+                    var arm: MatchArm = arms.get(ai);
+                    collect_assign_targets(arm.body, out);
+                    ai = ai + 1;
+                }
+            }
+            Stmt::Handle(body, handlers, _line) => {
+                collect_assign_targets(body, out);
+                var hi: i64 = 0;
+                while hi < handlers.len() {
+                    var h: EffectHandler = handlers.get(hi);
+                    collect_assign_targets(h.body, out);
+                    hi = hi + 1;
+                }
+            }
+            Stmt::Select(cases, default, _line) => {
+                var ci: i64 = 0;
+                while ci < cases.len() {
+                    var c: SelectCase = cases.get(ci);
+                    collect_assign_targets(c.body, out);
+                    ci = ci + 1;
+                }
+                match default {
+                    OptStmts::Some(db) => { collect_assign_targets(db, out); }
+                    OptStmts::None => {}
+                }
+            }
+            Stmt::Parallel(branches, _line) => {
+                var bi: i64 = 0;
+                while bi < branches.len() {
+                    collect_assign_targets(branches.get(bi), out);
+                    bi = bi + 1;
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+}
+
 // --- Emit helpers ---------------------------------------------------------
 
 /// Check if a function name is a user-defined function (not a runtime builtin).
@@ -1656,6 +1728,12 @@ pub fn Lowerer_register_runtime(self: &mut Lowerer) {
     Lowerer_add_extern_1(self, "p_http_parse_request", lw_ptr_u8(), opaque_ty("HttpRequest"));
     Lowerer_add_extern_3(self, "p_http_build_response", IrType::I64, lw_ptr_u8(), lw_ptr_u8(), lw_ptr_u8());
 
+    // stdin / stdout
+    Lowerer_add_extern_0(self, "p_flush_stdout", IrType::Void);
+    Lowerer_add_extern_0(self, "p_stdin_eof", IrType::I64);
+    Lowerer_add_extern_0(self, "p_read_line", lw_ptr_u8());
+    Lowerer_add_extern_1(self, "p_read_stdin", IrType::I64, lw_ptr_u8());
+
     // File I/O
     Lowerer_add_extern_1(self, "p_file_read", lw_ptr_u8(), lw_ptr_u8());
     Lowerer_add_extern_2(self, "p_file_write", lw_ptr_u8(), lw_ptr_u8(), IrType::I64);
@@ -2338,6 +2416,9 @@ pub fn Lowerer_lower_func(self: &mut Lowerer, func: Func) {
     IrFunction_bind_local(&mut ir_func, "__env", env_val);
 
     // User parameters
+    var pb_names: Vec<str> = Vec::new();
+    var pb_vals: Vec<i64> = Vec::new();
+    var pb_tys: Vec<IrType> = Vec::new();
     var i: i64 = 0;
     while i < func.params.len() {
         var param: Param = func.params.get(i);
@@ -2355,6 +2436,9 @@ pub fn Lowerer_lower_func(self: &mut Lowerer, func: Func) {
         var val: i64 = IrFunction_new_value(&mut ir_func, meta);
         ir_func.params.push(ValueIdType_new(val, ir_ty));
         IrFunction_bind_local(&mut ir_func, param.name, val);
+        pb_names.push(param.name);
+        pb_vals.push(val);
+        pb_tys.push(ir_ty);
         i = i + 1;
     }
 
@@ -2397,6 +2481,22 @@ pub fn Lowerer_lower_func(self: &mut Lowerer, func: Func) {
         var p: Param = func.params.get(i);
         Lowerer_insert_param_type(self, p.name, p.ty);
         i = i + 1;
+    }
+
+    // Parameters assigned in the body need an alloca: a bare SSA binding
+    // cannot be updated across block boundaries (a `while` loop would
+    // re-read the entry value forever). Spill them in the entry block.
+    var assigned_params: Vec<str> = Vec::new();
+    collect_assign_targets(func.body, assigned_params);
+    var pbi: i64 = 0;
+    while pbi < pb_names.len() {
+        if lw_c_str_vec_contains(assigned_params, pb_names.get(pbi)) {
+            var slot: i64 = Lowerer_emit_inst(self, Inst::Alloca(pb_tys.get(pbi), Lowerer_current_region(self)));
+            var _st: i64 = Lowerer_emit_inst(self, Inst::Store(slot, pb_vals.get(pbi), OptIrType::None));
+            Lowerer_insert_alloca(self, pb_names.get(pbi), slot);
+            Lowerer_insert_alloca_type(self, slot, pb_tys.get(pbi));
+        }
+        pbi = pbi + 1;
     }
 
     // @audit annotation: emit log calls at function entry/exit

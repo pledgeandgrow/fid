@@ -1,0 +1,84 @@
+// probe_pe_ir_stubs.fd — typecheck + smoke test for compiler::pe_ir_stubs
+use core;
+use vec;
+use string;
+use compiler::ir;
+use compiler::pe_ir_enc;
+use compiler::pe_ir_stubs;
+
+fn alloc_fn(g: &mut PeCodeGen, name: str) -> void {
+    if !HashMap_contains(g.func_labels, name) {
+        var l: i64 = X86Encoder_alloc_label(&mut g.enc);
+        HashMap_insert(g.func_labels, name, l);
+    }
+}
+
+fn main() -> i64 {
+    var g: PeCodeGen = PeCodeGen_new();
+    // Pre-allocate labels for every stub name gen_runtime_stubs touches,
+    // plus the cross-referenced helpers.
+    var names: Vec<str> = Vec::new();
+    names.push("p_arena_save"); names.push("p_arena_restore"); names.push("p_region_free");
+    names.push("p_print_int"); names.push("p_print_str"); names.push("p_print_bool");
+    names.push("p_print_float"); names.push("p_panic"); names.push("p_malloc");
+    names.push("p_free"); names.push("p_memset"); names.push("p_str_concat");
+    names.push("p_to_str"); names.push("p_to_str_vec"); names.push("p_to_str_float");
+    names.push("p_to_str_str"); names.push("p_to_str_bool");
+    names.push("p_float_to_str"); names.push("p_bool_to_str"); names.push("p_char_to_str");
+    names.push("p_eprint_str"); names.push("p_print_newline");
+    names.push("p_sb_new"); names.push("p_sb_append"); names.push("p_sb_to_str");
+    names.push("p_file_read"); names.push("p_file_write"); names.push("p_str_join_n");
+    names.push("p_vec_new"); names.push("p_vec_push"); names.push("p_vec_len");
+    names.push("p_vec_get"); names.push("p_vec_pop"); names.push("p_print_vec");
+    names.push("p_map_new"); names.push("p_map_insert"); names.push("p_map_get");
+    names.push("p_map_contains"); names.push("p_map_remove"); names.push("p_map_len");
+    names.push("p_map_is_empty"); names.push("p_print_map");
+    names.push("p_vec_set"); names.push("p_vec_is_empty"); names.push("p_vec_clear");
+    names.push("p_vec_capacity"); names.push("p_vec_first"); names.push("p_vec_last");
+    names.push("p_vec_contains"); names.push("p_vec_truncate"); names.push("p_vec_clone");
+    names.push("p_map_clear"); names.push("p_map_get_or");
+    names.push("p_string_len"); names.push("p_string_is_empty");
+    names.push("p_string_starts_with"); names.push("p_string_parse_int");
+    names.push("p_string_bytes"); names.push("p_string_clone");
+    names.push("p_cli"); names.push("p_sti"); names.push("p_hlt"); names.push("p_lidt");
+    names.push("p_idt_set_entry"); names.push("p_inb"); names.push("p_inw");
+    names.push("p_outb"); names.push("p_outw"); names.push("p_outl"); names.push("p_inl");
+    names.push("p_cr3_read"); names.push("p_cr3_write"); names.push("p_cr0_read");
+    names.push("p_cr0_write"); names.push("p_cr2_read"); names.push("p_cr4_read");
+    names.push("p_cr4_write"); names.push("p_invlpg");
+    names.push("p_wrmsr_gs_base"); names.push("p_rdmsr_gs_base");
+    names.push("p_wrmsr_kernel_gs_base"); names.push("p_swapgs");
+    names.push("p_page_map"); names.push("p_page_unmap");
+    names.push("p_phys_read64"); names.push("p_phys_write64");
+    names.push("p_mem_read8"); names.push("p_mem_write8"); names.push("p_mem_read16");
+    names.push("p_mem_write16"); names.push("p_mem_read32"); names.push("p_mem_write32");
+    names.push("p_mem_read64"); names.push("p_mem_write64");
+    names.push("p_get_rbp"); names.push("p_get_rsp"); names.push("p_atomic_xchg32");
+    names.push("p_lgdt"); names.push("p_gdt_set_entry"); names.push("p_enter_user_mode");
+    names.push("p_serial_init"); names.push("p_serial_write"); names.push("p_serial_read");
+    names.push("p_serial_ready");
+    names.push("p_argc"); names.push("p_argv"); names.push("p_system");
+    names.push("pe_atomic_load"); names.push("pe_atomic_store"); names.push("pe_atomic_add");
+    names.push("pe_atomic_cas"); names.push("pe_f64_to_bits"); names.push("pe_bits_to_f64");
+    names.push("pe_f64_to_f32_bits"); names.push("pe_f32_bits_to_f64");
+    names.push("pe_fn_lookup"); names.push("pe_call_fn");
+    names.push("pe_thread_entry_addr"); names.push("p_thread_spawn"); names.push("p_executor_spawn");
+    names.push("pert_thread_spawn_v"); names.push("pert_executor_spawn_v"); names.push("pert_thread_main");
+    names.push("main");
+    var i: i64 = 0;
+    while i < names.len() { alloc_fn(&mut g, names.get(i)); i = i + 1; }
+    // give iat offsets
+    i = 0;
+    while i < 256 { g.iat_rdata_offsets.push(4096 + i * 8); i = i + 1; }
+    PeCodeGen_gen_runtime_stubs(&mut g);
+    PeCodeGen_gen_pe_primitives(&mut g);
+    PeCodeGen_gen_entry_point(&mut g);
+    var m: IrModule = IrModule_new();
+    var r: Vec<str> = pe_ir_needed_functions(&m);
+    print("ok ");
+    print(int_to_str(r.len()));
+    print(" ");
+    print(int_to_str(g.enc.code.len()));
+    print("\n");
+    return 0;
+}

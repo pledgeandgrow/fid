@@ -4722,7 +4722,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         var dpath: str = "";
         if args.len() >= 1 { dpath = Interpreter_value_to_string(self, args.get(0)); }
         if name == "p_dir_list" { return ExecOutcome::Value(Value::Str(p_dir_list(dpath))); }
-        if name == "p_is_dir" { return ExecOutcome::Value(Value::Bool(p_is_dir(dpath))); }
+        if name == "p_is_dir" { return ExecOutcome::Value(Value::Bool(p_is_dir(dpath) != 0)); }
         if name == "p_mkdir" { return ExecOutcome::Value(Value::Int(p_mkdir(dpath))); }
         if name == "p_rmdir" { return ExecOutcome::Value(Value::Int(p_rmdir(dpath))); }
         if name == "p_rename" {
@@ -4760,6 +4760,22 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
     // Matches src/interp.rs:6165 — ExecOutcome::Panic("Unknown runtime
     // function: {name}"). is_runtime_func claims far more names than this
     // dispatch implements; returning Int(0) fabricated results silently.
+    // A declared extern "C" function that reached here has no interpreter
+    // stub: report it as an FFI call that requires a native build.
+    var ei: i64 = 0;
+    while ei < self.module.extern_functions.len() {
+        if self.module.extern_functions.get(ei).name == name {
+            var c_name: str = name;
+            var di: i64 = 0;
+            while di < self.module.extern_decls.len() {
+                var d: ExternDecl = self.module.extern_decls.get(di);
+                if d.pledge_name == name { c_name = d.c_name; }
+                di = di + 1;
+            }
+            return ExecOutcome::Panic("FFI function '" + name + "' (extern \"C\" " + c_name + ") is not available in the interpreter — this program requires native FFI; build it with `fid ccompile` instead of `fid run`");
+        }
+        ei = ei + 1;
+    }
     return ExecOutcome::Panic("Unknown runtime function: " + name);
 }
 

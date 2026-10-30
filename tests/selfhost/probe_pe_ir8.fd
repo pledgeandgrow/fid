@@ -1,0 +1,73 @@
+use core;
+use vec;
+use string;
+use fs;
+use compiler::ir;
+use compiler::pe_ir_enc;
+use compiler::pe_ir_stubs;
+use compiler::pe_ir;
+fn main() -> i64 {
+    var m: IrModule = IrModule_new();
+    // fn1: env param only, returns 7
+    var f1: IrFunction = IrFunction_new("f1", IrType::I64);
+    var b1: i64 = IrFunction_new_block(&mut f1);
+    f1.entry = b1;
+    var e1: i64 = IrFunction_new_value(&mut f1, ValueMeta_new(IrType::Ptr(IrType::U8)));
+    f1.params.push(ValueIdType_new(e1, IrType::Ptr(IrType::U8)));
+    var k7: i64 = IrFunction_emit(&mut f1, Inst::ConstInt(7, IrType::I64));
+    IrFunction_emit(&mut f1, Inst::Return(OptValueId::Some(k7)));
+    m.functions.push(IrFunctionEntry_new("f1", f1));
+    // fn2 (like a runtime fn): env + 3 params, ~40 values, 2 allocas
+    var f2: IrFunction = IrFunction_new("f2", IrType::I64);
+    var b2: i64 = IrFunction_new_block(&mut f2);
+    f2.entry = b2;
+    var e2: i64 = IrFunction_new_value(&mut f2, ValueMeta_new(IrType::Ptr(IrType::U8)));
+    f2.params.push(ValueIdType_new(e2, IrType::Ptr(IrType::U8)));
+    var p1: i64 = IrFunction_new_value(&mut f2, ValueMeta_new(IrType::I64));
+    f2.params.push(ValueIdType_new(p1, IrType::I64));
+    var p2: i64 = IrFunction_new_value(&mut f2, ValueMeta_new(IrType::I64));
+    f2.params.push(ValueIdType_new(p2, IrType::I64));
+    var p3: i64 = IrFunction_new_value(&mut f2, ValueMeta_new(IrType::I64));
+    f2.params.push(ValueIdType_new(p3, IrType::I64));
+    var s: i64 = IrFunction_emit(&mut f2, Inst::BinOp(BinOp::Add, p1, p2, IrType::I64));
+    var i: i64 = 0;
+    while i < 40 {
+        s = IrFunction_emit(&mut f2, Inst::BinOp(BinOp::Add, s, p3, IrType::I64));
+        i = i + 1;
+    }
+    var a: i64 = IrFunction_emit(&mut f2, Inst::Alloca(IrType::I64, Region::Stack));
+    IrFunction_emit(&mut f2, Inst::Store(a, s, OptIrType::None));
+    var v: i64 = IrFunction_emit(&mut f2, Inst::Load(a, IrType::I64));
+    IrFunction_emit(&mut f2, Inst::Return(OptValueId::Some(v)));
+    m.functions.push(IrFunctionEntry_new("f2", f2));
+    // main calls f2(1,2,3) → expect 1+2+40*3 = 123
+    var fm: IrFunction = IrFunction_new("main", IrType::I64);
+    var bm: i64 = IrFunction_new_block(&mut fm);
+    fm.entry = bm;
+    var em: i64 = IrFunction_new_value(&mut fm, ValueMeta_new(IrType::Ptr(IrType::U8)));
+    fm.params.push(ValueIdType_new(em, IrType::Ptr(IrType::U8)));
+    var args: Vec<i64> = Vec::new();
+    var c1: i64 = IrFunction_emit(&mut fm, Inst::ConstInt(1, IrType::I64));
+    var c2: i64 = IrFunction_emit(&mut fm, Inst::ConstInt(2, IrType::I64));
+    var c3: i64 = IrFunction_emit(&mut fm, Inst::ConstInt(3, IrType::I64));
+    var c0: i64 = IrFunction_emit(&mut fm, Inst::ConstInt(0, IrType::I64));
+    args.push(c0); args.push(c1); args.push(c2); args.push(c3);
+    var r: i64 = IrFunction_emit(&mut fm, Inst::Call("f2", args, IrType::I64, EffectSet_none()));
+    IrFunction_emit(&mut fm, Inst::Print(r, IrType::I64));
+    IrFunction_emit(&mut fm, Inst::Return(OptValueId::Some(r)));
+    m.functions.push(IrFunctionEntry_new("main", fm));
+    var res: ResultBytes = pe_ir_generate_pe(m);
+    match res {
+        ResultBytes::Err(errs) => {
+            var j: i64 = 0;
+            while j < errs.len() { println("err: " + errs.get(j)); j = j + 1; }
+            return 1;
+        }
+        ResultBytes::Ok(bytes) => {
+            if !fs_write_bytes("t_pe_ir\\probe8.exe", bytes) { println("write fail"); return 1; }
+            println("wrote " + int_to_str(bytes.len()));
+            return 0;
+        }
+    }
+    return 1;
+}

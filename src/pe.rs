@@ -552,6 +552,30 @@ impl X86Encoder {
         self.emit_i32(0); // placeholder
     }
 
+    /// mov r64, [rip + rdata_offset] — load from .rdata, patched later
+    fn mov_reg_rip(&mut self, dst: Reg, rdata_offset: usize) {
+        self.rex(true, dst.is_extended(), false, false);
+        self.emit_u8(0x8B);
+        self.modrm(0b00, dst.code(), 5);
+        self.pending_rip_refs.push(PendingRipRef {
+            code_offset: self.code.len(),
+            rdata_offset,
+        });
+        self.emit_i32(0); // placeholder, patched later
+    }
+
+    /// mov [rip + rdata_offset], r64 — store to .rdata, patched later
+    fn mov_rip_reg(&mut self, rdata_offset: usize, src: Reg) {
+        self.rex(true, src.is_extended(), false, false);
+        self.emit_u8(0x89);
+        self.modrm(0b00, src.code(), 5);
+        self.pending_rip_refs.push(PendingRipRef {
+            code_offset: self.code.len(),
+            rdata_offset,
+        });
+        self.emit_i32(0); // placeholder, patched later
+    }
+
     /// call rel32 — direct call to a local label
     fn call_label(&mut self, label: u32) {
         self.emit_u8(0xE8);
@@ -1934,6 +1958,10 @@ struct PeCodeGen {
     c_thunks: Vec<CThunk>,
     /// `extern "C"` functions of a missing local header: stubs returning 0
     stub_externs: Vec<String>,
+    /// .rdata offset of the bump-allocator state block (32 bytes:
+    /// +0 chunk cursor, +8 chunk end, +16 cached process-heap handle,
+    /// +24 grow spinlock)
+    alloc_rdata_off: usize,
     /// `extern "C"` functions the Fides runtime replaces (see c_override)
     c_overrides: std::collections::BTreeMap<String, String>,
     /// Functions a program refers to by name (thread and task entry points):
@@ -1996,6 +2024,7 @@ impl PeCodeGen {
             unresolved: std::collections::BTreeMap::new(),
             module_fns: std::collections::BTreeSet::new(),
             c_thunks: Vec::new(),
+            alloc_rdata_off: 0,
             stub_externs: Vec::new(),
             c_overrides: std::collections::BTreeMap::new(),
             named_fns: Vec::new(),
@@ -2098,6 +2127,12 @@ impl PeCodeGen {
             rdata.data.extend_from_slice(&bytes);
             self.global_rdata_offsets.insert(name.clone(), off);
         }
+
+        // Bump-allocator state for p_malloc: 32 zero bytes in writable
+        // .rdata — +0 chunk cursor, +8 chunk end, +16 cached process-heap
+        // handle, +24 grow spinlock.
+        self.alloc_rdata_off = rdata.data.len();
+        rdata.data.extend_from_slice(&[0u8; 32]);
 
         // 3. Pre-allocate labels for all functions (sorted for deterministic layout)
         let mut func_names: Vec<String> = module.functions.keys().cloned().collect();
@@ -5821,34 +5856,160 @@ impl PeCodeGen {
             self.enc.pop(Reg::R12);
             self.enc.ret();
         } else {
-            // Windows HeapAlloc
+            // Thread-safe bump allocator over 4 MB chunks (as in the C
+            // runtime arena). State: 32 bytes in writable .rdata at
+            // alloc_rdata_off — +0 cur, +8 end, +16 cached heap, +24 spinlock.
+            // Fast path: `lock xadd [cur]`; overflow only wastes tail bytes of
+            // a dead chunk and the retry lands on the live one.
+            // Slow path: under the spinlock, HeapAlloc(max(size, 4 MB)).
+            let abase = self.alloc_rdata_off;
+            let fast = self.enc.alloc_label();
+            let grow = self.enc.alloc_label();
+            let retry_lock = self.enc.alloc_label();
+            let acquired = self.enc.alloc_label();
+            let need_chunk = self.enc.alloc_label();
+            let have_sz = self.enc.alloc_label();
+            let have_heap = self.enc.alloc_label();
+            let oom = self.enc.alloc_label();
+
             self.enc.push(Reg::Rbp);
             self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
             self.enc.push(Reg::R12);
             self.enc.push(Reg::R13);
-            self.enc.sub_rsp_i32(48);
 
-            // Save size in r12
+            // r12 = (size + 15) & ~15
             self.enc.mov_rr(Reg::R12, Reg::Rcx);
+            self.enc.emit(&[0x49, 0x83, 0xC4, 0x0F]); // add r12, 15
+            self.enc.emit(&[0x49, 0x83, 0xE4, 0xF0]); // and r12, -16
 
-            // GetProcessHeap()
+            // --- Fast path: r8 = lock xadd [cur], r12 — atomic bump ---
+            self.enc.place_label(fast);
+            self.enc.mov_rr(Reg::R8, Reg::R12);
+            // lock xadd [rip + abase], r8  (F0 REX.W 0F C1 /r)
+            self.enc.emit_u8(0xF0);
+            self.enc.rex(true, Reg::R8.is_extended(), false, false);
+            self.enc.emit_u8(0x0F);
+            self.enc.emit_u8(0xC1);
+            self.enc.modrm(0b00, Reg::R8.code(), 5);
+            self.enc.pending_rip_refs.push(PendingRipRef {
+                code_offset: self.enc.code.len(),
+                rdata_offset: abase,
+            });
+            self.enc.emit_i32(0);
+            // r9 = r8 + r12 (end of our span); grow if r8 == 0 or span > end
+            self.enc.mov_rr(Reg::R9, Reg::R8);
+            self.enc.add_rr(Reg::R9, Reg::R12);
+            self.enc.test_rr(Reg::R8, Reg::R8);
+            self.enc.jcc_label(0x4, grow); // jz: uninitialised
+            self.enc.mov_reg_rip(Reg::R10, abase + 8);
+            self.enc.cmp_rr(Reg::R9, Reg::R10);
+            self.enc.jcc_label(0x7, grow); // ja: chunk full
+            self.enc.mov_rr(Reg::Rax, Reg::R8);
+            self.enc.pop(Reg::R13);
+            self.enc.pop(Reg::R12);
+            self.enc.pop(Reg::Rbp);
+            self.enc.ret();
+
+            // --- Slow path: grow under spinlock ---
+            self.enc.place_label(grow);
+            self.enc.place_label(retry_lock);
+            // lock bts qword [rip + abase+24], 0 → jnc = acquired
+            self.enc.emit_u8(0xF0);
+            self.enc.emit_u8(0x48);
+            self.enc.emit_u8(0x0F);
+            self.enc.emit_u8(0xBA);
+            self.enc.emit_u8(0x2D); // mod=00 reg=101 rm=101 → [rip]+/5
+            self.enc.pending_rip_refs.push(PendingRipRef {
+                code_offset: self.enc.code.len(),
+                rdata_offset: abase + 24,
+            });
+            self.enc.emit_i32(0);
+            self.enc.emit_u8(0x00); // imm8 = bit 0
+            self.enc.jcc_label(0x3, acquired); // jnc
+            self.enc.emit_u8(0xF3); // pause
+            self.enc.emit_u8(0x90);
+            self.enc.jmp_label(retry_lock);
+            self.enc.place_label(acquired);
+
+            // cur < end → another thread already grew → release and retry
+            self.enc.mov_reg_rip(Reg::Rax, abase);
+            self.enc.test_rr(Reg::Rax, Reg::Rax);
+            self.enc.jcc_label(0x4, need_chunk); // jz: first alloc
+            self.enc.mov_reg_rip(Reg::R9, abase + 8);
+            self.enc.cmp_rr(Reg::Rax, Reg::R9);
+            self.enc.jcc_label(0x3, need_chunk); // jae: dead chunk
+            // release lock: mov byte [rip + abase+24], 0
+            self.enc.emit_u8(0xC6);
+            self.enc.emit_u8(0x05);
+            self.enc.pending_rip_refs.push(PendingRipRef {
+                code_offset: self.enc.code.len(),
+                rdata_offset: abase + 24,
+            });
+            self.enc.emit_i32(0);
+            self.enc.emit_u8(0x00);
+            self.enc.jmp_label(fast);
+
+            // need_chunk: r13 = chunk size = max(r12, 4 MB)
+            self.enc.place_label(need_chunk);
+            self.enc.mov_rr(Reg::R13, Reg::R12);
+            self.enc.mov_imm64(Reg::Rax, 4194304);
+            self.enc.cmp_rr(Reg::R13, Reg::Rax);
+            self.enc.jcc_label(0x3, have_sz); // jae
+            self.enc.mov_rr(Reg::R13, Reg::Rax);
+            self.enc.place_label(have_sz);
+
+            // rax = cached heap handle; lazy-init via GetProcessHeap
+            self.enc.mov_reg_rip(Reg::Rax, abase + 16);
+            self.enc.test_rr(Reg::Rax, Reg::Rax);
+            self.enc.jcc_label(0x5, have_heap); // jnz
             self.enc.sub_rsp_i32(32);
             self.enc.call_rip(self.iat_off(IAT_GET_PROCESS_HEAP));
             self.enc.add_rsp_i32(32);
-            self.enc.mov_rr(Reg::R13, Reg::Rax);
+            self.enc.mov_rip_reg(abase + 16, Reg::Rax);
+            self.enc.place_label(have_heap);
 
-            // HeapAlloc(heap, 0, size)
-            self.enc.mov_rr(Reg::Rcx, Reg::R13);
+            // rax = HeapAlloc(heap, 0, r13)
+            self.enc.mov_rr(Reg::Rcx, Reg::Rax);
             self.enc.xor_self(Reg::Rdx);
-            self.enc.mov_rr(Reg::R8, Reg::R12);
+            self.enc.mov_rr(Reg::R8, Reg::R13);
             self.enc.sub_rsp_i32(32);
             self.enc.call_rip(self.iat_off(IAT_HEAP_ALLOC));
             self.enc.add_rsp_i32(32);
-
-            self.enc.add_rsp_i32(48);
+            self.enc.test_rr(Reg::Rax, Reg::Rax);
+            self.enc.jcc_label(0x4, oom); // jz: NULL
+            // end = base + r13; cur = base + r12; rax = base is the result
+            self.enc.mov_rr(Reg::R8, Reg::Rax);
+            self.enc.add_rr(Reg::R8, Reg::R13);
+            self.enc.mov_rip_reg(abase + 8, Reg::R8);
+            self.enc.mov_rr(Reg::R8, Reg::Rax);
+            self.enc.add_rr(Reg::R8, Reg::R12);
+            self.enc.mov_rip_reg(abase, Reg::R8);
+            // release lock
+            self.enc.emit_u8(0xC6);
+            self.enc.emit_u8(0x05);
+            self.enc.pending_rip_refs.push(PendingRipRef {
+                code_offset: self.enc.code.len(),
+                rdata_offset: abase + 24,
+            });
+            self.enc.emit_i32(0);
+            self.enc.emit_u8(0x00);
             self.enc.pop(Reg::R13);
             self.enc.pop(Reg::R12);
-            self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
+            self.enc.pop(Reg::Rbp);
+            self.enc.ret();
+
+            // oom: release lock, return NULL
+            self.enc.place_label(oom);
+            self.enc.emit_u8(0xC6);
+            self.enc.emit_u8(0x05);
+            self.enc.pending_rip_refs.push(PendingRipRef {
+                code_offset: self.enc.code.len(),
+                rdata_offset: abase + 24,
+            });
+            self.enc.emit_i32(0);
+            self.enc.emit_u8(0x00);
+            self.enc.pop(Reg::R13);
+            self.enc.pop(Reg::R12);
             self.enc.pop(Reg::Rbp);
             self.enc.ret();
         }
@@ -6118,34 +6279,8 @@ impl PeCodeGen {
             // Bare-metal: no-op (bump allocator doesn't support freeing)
             self.enc.ret();
         } else {
-            // Windows HeapFree
-            self.enc.push(Reg::Rbp);
-            self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
-            self.enc.push(Reg::R12);
-            self.enc.push(Reg::R13);
-            self.enc.sub_rsp_i32(48);
-
-            self.enc.mov_rr(Reg::R12, Reg::Rcx);
-
-            // GetProcessHeap()
-            self.enc.sub_rsp_i32(32);
-            self.enc.call_rip(self.iat_off(IAT_GET_PROCESS_HEAP));
-            self.enc.add_rsp_i32(32);
-            self.enc.mov_rr(Reg::R13, Reg::Rax);
-
-            // HeapFree(heap, 0, ptr)
-            self.enc.mov_rr(Reg::Rcx, Reg::R13);
-            self.enc.xor_self(Reg::Rdx);
-            self.enc.mov_rr(Reg::R8, Reg::R12);
-            self.enc.sub_rsp_i32(32);
-            self.enc.call_rip(self.iat_off(IAT_HEAP_FREE));
-            self.enc.add_rsp_i32(32);
-
-            self.enc.add_rsp_i32(48);
-            self.enc.pop(Reg::R13);
-            self.enc.pop(Reg::R12);
-            self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
-            self.enc.pop(Reg::Rbp);
+            // no-op: the bump allocator reclaims nothing (frees release at
+            // process exit, as in the C runtime arena)
             self.enc.ret();
         }
     }
@@ -9428,5 +9563,156 @@ mod tests {
         enc.addpd_rr(XmmReg::Xmm8, XmmReg::Xmm9);
         // 66 = mandatory prefix, 45 = REX (R+B for high regs), 0F 58 = addpd, C1 = ModR/M
         assert_eq!(enc.code, vec![0x66, 0x45, 0x0F, 0x58, 0xC1]);
+    }
+
+    /// Reference dump for the Fides port in compiler/pe_ir_enc.fd: emits a
+    /// canonical sequence covering every encoder helper (including the
+    /// R12/R13 SIB and disp8=0 cases), resolves labels and RIP-relative
+    /// references, then builds .rdata and a full PE file. Writes three hex
+    /// lines (text, rdata, pe) to pe_enc_ref.txt for `fidesc run
+    /// tests/selfhost/test_pe_ir_enc.fd` output to be diffed against.
+    #[test]
+    fn dump_pe_ir_enc_reference() {
+        fn hex(v: &[u8]) -> String {
+            v.iter().map(|b| format!("{:02x}", b)).collect()
+        }
+        let mut e = X86Encoder::new();
+        // ─── GP instructions ───
+        e.push(Reg::Rbp); e.push(Reg::R12);
+        e.pop(Reg::Rbp); e.pop(Reg::R13);
+        e.ret(); e.nop(); e.ud2();
+        e.mov_imm64(Reg::Rax, 0x1122334455667788);
+        e.mov_imm64(Reg::R15, 42);
+        e.mov_imm32(Reg::Rcx, -7);
+        e.mov_imm32(Reg::R9, 4096);
+        e.mov_rr(Reg::Rax, Reg::Rcx); e.mov_rr(Reg::R8, Reg::R15);
+        e.mov_reg_mem_rbp(Reg::Rax, -8); e.mov_reg_mem_rbp(Reg::R12, -300);
+        e.mov_mem_rbp_reg(-16, Reg::Rdx); e.mov_mem_rbp_reg(0, Reg::R9);
+        e.lea_rbp(Reg::Rax, -24); e.lea_rbp(Reg::R10, 0);
+        e.add_rr(Reg::Rax, Reg::Rcx); e.add_rr(Reg::R9, Reg::R10);
+        e.sub_rr(Reg::Rdx, Reg::Rsi); e.imul_rr(Reg::Rax, Reg::R11);
+        e.idiv_r(Reg::Rcx); e.div_rr(Reg::R15);
+        e.and_rr(Reg::Rax, Reg::Rdx); e.or_rr(Reg::Rbx, Reg::R8);
+        e.xor_rr(Reg::Rcx, Reg::Rcx); e.xor_self(Reg::R12);
+        e.not_r(Reg::Rax); e.neg_r(Reg::R14);
+        e.cmp_rr(Reg::Rax, Reg::Rdx); e.cmp_rr(Reg::R8, Reg::R9);
+        e.cmp_r8_i8(Reg::Rax, 0); e.cmp_r8_i8(Reg::Rsi, 13); e.cmp_r8_i8(Reg::R9, 127);
+        e.test_rr(Reg::Rax, Reg::Rax); e.test_rr(Reg::R8, Reg::R10);
+        e.shl_cl(Reg::Rax); e.shl_r_i8(Reg::Rcx, 4); e.shl_r_i8(Reg::R15, 63);
+        e.sar_cl(Reg::Rdx); e.cqo();
+        e.movzx_r32_r8(Reg::Rax, Reg::Rcx); e.movzx_r32_r8(Reg::Rax, Reg::Rsp);
+        e.movzx_r32_r8(Reg::R8, Reg::R12);
+        e.movzx_r32_r16(Reg::Rdx, Reg::Rbx); e.movzx_r32_r16(Reg::R9, Reg::R14);
+        e.movsxd_rr(Reg::Rax, Reg::Rcx); e.movsxd_rr(Reg::R10, Reg::R11);
+        e.movsx_r64_r8(Reg::Rax, Reg::Rdx); e.movsx_r64_r8(Reg::R12, Reg::R15);
+        e.movsx_r64_r16(Reg::Rcx, Reg::Rsi); e.movsx_r64_r16(Reg::R13, Reg::R8);
+        for cc in 0..16u8 { e.setcc_r(cc, Reg::Rax); }
+        e.setcc_r(4, Reg::R12);
+        e.sub_rsp_i8(32); e.sub_rsp_i32(1000); e.sub_rsp_i32(-8);
+        e.add_rsp_i8(16); e.add_rsp_i32(2000);
+        e.add_r_i32(Reg::Rax, 5); e.add_r_i32(Reg::R15, -300);
+        e.add_r_i8(Reg::Rcx, 7); e.add_r_i8(Reg::R9, -1);
+        e.mov_r8_imm(Reg::Rax, 0x41); e.mov_r8_imm(Reg::R11, 0xFF);
+        // Byte/word/dword/qword loads and stores through every base register,
+        // including RSP/R12 (SIB) and RBP/R13 (disp8=0) and all disp widths.
+        let bases = [Reg::Rax, Reg::Rcx, Reg::Rdx, Reg::Rbx, Reg::Rsp, Reg::Rbp,
+                     Reg::Rsi, Reg::Rdi, Reg::R8, Reg::R12, Reg::R13, Reg::R15];
+        for &b in &bases {
+            e.mov_reg8_mem(Reg::Rax, b);
+            e.mov_mem_reg8_ptr(b, Reg::Rcx);
+            e.mov_mem_reg8(b, Reg::Rdx);
+            e.mov_reg8_ptr(Reg::Rdx, b);
+            e.mov_reg32_ptr(Reg::Rsi, b);
+            e.mov_reg16_ptr(Reg::Rdi, b);
+            e.mov_ptr_reg(b, Reg::Rax);
+            e.mov_ptr_reg32(b, Reg::Rax);
+            e.mov_ptr_reg16(b, Reg::Rax);
+            e.mov_reg_ptr(Reg::Rax, b);
+            e.mov_reg_mem_disp(Reg::Rbx, b, 0);
+            e.mov_reg_mem_disp(Reg::Rbx, b, 127);
+            e.mov_reg_mem_disp(Reg::Rbx, b, 128);
+            e.mov_reg_mem_disp(Reg::Rbx, b, -128);
+            e.mov_mem_disp_reg(b, 5, Reg::Rcx);
+            e.mov_mem_disp_reg(b, 300, Reg::Rcx);
+            e.mov_mem_disp_reg32(b, -1, Reg::Rdx);
+            e.mov_mem_disp_reg8(b, 9, Reg::Rax);
+        }
+        // Indexed forms, including RBP/R13 bases (SIB + disp8=0).
+        let idx_pairs = [(Reg::Rax, Reg::Rcx), (Reg::Rbp, Reg::Rdx),
+                         (Reg::R13, Reg::R9), (Reg::R12, Reg::R10)];
+        for &(b, i) in &idx_pairs {
+            e.mov_mem_idx_reg8(b, i, Reg::Rax);
+            e.mov_reg8_mem_idx(Reg::Rax, b, i);
+            e.cmp_mem_idx_imm8(b, i, 0x2A);
+            e.mov_reg_mem_idx(Reg::Rax, b, i);
+            e.mov_mem_idx_reg(b, i, Reg::Rax);
+        }
+        e.inc_r(Reg::Rax); e.inc_r(Reg::R15); e.dec_r(Reg::Rcx); e.dec_r(Reg::R8);
+        e.imul_r_r_imm32(Reg::Rax, Reg::Rcx, 100);
+        e.imul_r_r_imm32(Reg::R9, Reg::R10, -7);
+        e.call_reg(Reg::Rax); e.call_reg(Reg::R11);
+        // Labels: forward jump/jcc/call/lea, then backward jump.
+        let l1 = e.alloc_label(); let l2 = e.alloc_label();
+        e.jmp_label(l1); e.jcc_label(0x4, l1); e.call_label(l1);
+        e.lea_label(Reg::Rax, l2); e.lea_label(Reg::R14, l1);
+        e.place_label(l2); e.jmp_label(l2);
+        e.place_label(l1); e.jmp_label(l1);
+        e.resolve_labels();
+        // RIP-relative refs into .rdata (patched below).
+        e.lea_rip(Reg::Rax, 16); e.lea_rip(Reg::R15, 0);
+        e.call_rip(64); e.call_rip(128);
+        // SSE2 packed and AVX.
+        e.addpd_rr(XmmReg::Xmm0, XmmReg::Xmm1); e.addpd_rr(XmmReg::Xmm8, XmmReg::Xmm9);
+        e.subpd_rr(XmmReg::Xmm2, XmmReg::Xmm3); e.mulpd_rr(XmmReg::Xmm4, XmmReg::Xmm5);
+        e.divpd_rr(XmmReg::Xmm6, XmmReg::Xmm7); e.movapd_rr(XmmReg::Xmm0, XmmReg::Xmm15);
+        e.movsd_rr(XmmReg::Xmm1, XmmReg::Xmm2); e.movsd_rr(XmmReg::Xmm10, XmmReg::Xmm11);
+        e.addpd_mem_rbp(XmmReg::Xmm0, -16); e.addpd_mem_rbp(XmmReg::Xmm9, -200);
+        e.movapd_mem_rbp(-24, XmmReg::Xmm1); e.movapd_mem_rbp(300, XmmReg::Xmm8);
+        e.movapd_rbp_reg(XmmReg::Xmm2, -32); e.movapd_rbp_reg(XmmReg::Xmm11, 1000);
+        e.vaddpd_rr(XmmReg::Xmm0, XmmReg::Xmm1, XmmReg::Xmm2);
+        e.vaddpd_rr(XmmReg::Xmm9, XmmReg::Xmm3, XmmReg::Xmm4);
+        e.vmulpd_rr(XmmReg::Xmm5, XmmReg::Xmm6, XmmReg::Xmm7);
+        // Scalar float.
+        e.movsd_xmm_mem_rbp(0, -8); e.movsd_xmm_mem_rbp(3, 200);
+        e.movsd_mem_rbp_xmm(-16, 1); e.movsd_mem_rbp_xmm(-300, 7);
+        e.movss_xmm_mem_rbp(2, -24); e.movss_mem_rbp_xmm(8, 4);
+        e.addsd(0, 1); e.subsd(2, 3); e.mulsd(4, 5); e.divsd(6, 7);
+        e.xorpd_xmm_mem_rbp(0, -8); e.xorpd_xmm_mem_rbp(5, 400);
+        e.xorpd_xmm_xmm(0, 1);
+        e.movq_xmm_r64(0, Reg::Rax); e.movq_xmm_r64(2, Reg::R13);
+        e.ucomisd(0, 1); e.ucomiss(2, 3);
+        e.cvtsi2sd_r64(0, Reg::Rax); e.cvtsi2sd_r64(1, Reg::R12);
+        e.cvttsd2si_r64(Reg::Rax, 0); e.cvttsd2si_r64(Reg::R14, 3);
+        e.addss(0, 1); e.subss(1, 2); e.mulss(2, 3); e.divss(3, 4);
+        e.movq_xmm_mem_rbp(6, -40); e.movq_mem_rbp_xmm(-48, 7);
+        e.align_to(16);
+        // Raw emission.
+        e.emit_u8(0xAB); e.emit_u16(0x1234); e.emit_u32(0xDEADBEEF);
+        e.emit_i32(-1); e.emit_u64(0x0102030405060708);
+        e.emit(&[0x01, 0x02, 0x03]);
+
+        // ─── .rdata (mirrors generate()'s layout math) ───
+        let mut rd = RdataBuilder::new();
+        let mut sc: HashMap<String, String> = HashMap::new();
+        sc.insert("hello".to_string(), "s".to_string());
+        sc.insert("world!".to_string(), "s".to_string());
+        sc.insert("a\nb\tc\"d".to_string(), "s".to_string());
+        sc.insert("kernel32.dll".to_string(), "s".to_string());
+        rd.build(&sc);
+        let rdata_rva = TEXT_RVA + align_up(e.code.len() as u32, SECTION_ALIGN);
+        e.resolve_rip_refs(TEXT_RVA, rdata_rva);
+        rd.patch_rvas(rdata_rva);
+
+        // ─── Whole PE file ───
+        let import_dir_rva = rdata_rva + rd.import_dir_offset as u32;
+        let iat_rva = rdata_rva + rd.iat_offset as u32;
+        let iat_size = rd.iat_size as u32;
+        let pe = build_pe_file(&e.code, &rd.data, 0, import_dir_rva, iat_rva, iat_size, rdata_rva);
+
+        std::fs::write(
+            "pe_enc_ref.txt",
+            format!("{}\n{}\n{}\n", hex(&e.code), hex(&rd.data), hex(&pe)),
+        )
+        .unwrap();
     }
 }

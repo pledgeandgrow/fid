@@ -1,19 +1,23 @@
 // Fides Command-Line Arguments standard library
 //
-// Provides access to command-line arguments (argc/argv).
-// In the interpreter, these use Rust's std::env::args.
-// In C codegen, these use globals saved by the main wrapper.
-// In native builds, p_argc/p_argv are stubs.
+// Provides access to command-line arguments (argc/argv) plus a small
+// parser: flags, --key=value and --key value options, positional args,
+// and "--" end-of-options handling.
+//
+// The parsing layer (`*_in` functions) operates on an explicit argument
+// Vec — pure, testable, identical on every backend. The argv wrappers
+// feed it p_argc/p_argv (Rust std::env::args in the interpreter, globals
+// saved by the main wrapper in C codegen, rt_sys_argv in native builds).
 //
 // Usage:
 //   use args;
-//   value n = args_len();
-//   if n > 1 {
-//       value first = args_get(1);
-//       print(first);
-//   }
+//   if args_flag("-v", "--verbose") { ... }
+//   value out = args_option("-o", "--output", "a.txt");
+//   value files = args_positionals();
 
 module args;
+
+use vec;
 
 /// Number of command-line arguments (including program name).
 pub fn args_len() -> i64 {
@@ -34,6 +38,290 @@ pub fn args_get(index: i64) -> str {
 /// Get the program name (argument 0).
 pub fn args_program_name() -> str {
     return args_get(0);
+}
+
+/// All argv entries as a Vec of strings (index 0 = program name).
+pub fn args_all() -> Vec {
+    var out: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < args_len() {
+        out.push(args_get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Parsing over an explicit argv Vec ──────────────────────────────────
+// Conventions:
+//   -f / --flag            boolean flag
+//   -o v / --opt v         option with separate value
+//   --opt=v                option with inline value
+//   --                     everything after is positional
+//   anything else          positional argument
+// av[0] is the program name and is skipped by all matchers.
+
+/// Index of the "--" terminator, or av.len() when absent.
+fn args_ddash_in(av: Vec) -> i64 {
+    var i: i64 = 1;
+    while i < av.len() {
+        var a: str = av.get(i);
+        if str_equal(a, "--") { return i; }
+        i = i + 1;
+    }
+    return av.len();
+}
+
+/// True when `a` equals `short` or `long` ("" entries are ignored).
+fn args_is_name(a: str, short: str, long: str) -> bool {
+    if str_len(short) > 0 && str_equal(a, short) { return true; }
+    if str_len(long) > 0 && str_equal(a, long) { return true; }
+    return false;
+}
+
+/// True when the flag `short`/`long` is present in `av` before "--".
+pub fn args_flag_in(av: Vec, short: str, long: str) -> bool {
+    var stop: i64 = args_ddash_in(av);
+    var i: i64 = 1;
+    while i < stop {
+        var a: str = av.get(i);
+        if args_is_name(a, short, long) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Value of an option in `av`: "--opt=v" inline form, or the argument
+/// after "short"/"long". Returns `def` when absent or valueless.
+pub fn args_option_in(av: Vec, short: str, long: str, def: str) -> str {
+    var stop: i64 = args_ddash_in(av);
+    var i: i64 = 1;
+    while i < stop {
+        var a: str = av.get(i);
+        if str_len(long) > 0 && str_starts_with(a, long + "=") {
+            return str_slice(a, str_len(long) + 1, str_len(a));
+        }
+        if args_is_name(a, short, long) {
+            if i + 1 < stop {
+                var v: str = av.get(i + 1);
+                return v;
+            }
+            return def;
+        }
+        i = i + 1;
+    }
+    return def;
+}
+
+/// True when the option is present with any value.
+pub fn args_has_option_in(av: Vec, short: str, long: str) -> bool {
+    var stop: i64 = args_ddash_in(av);
+    var i: i64 = 1;
+    while i < stop {
+        var a: str = av.get(i);
+        if str_len(long) > 0 && str_starts_with(a, long + "=") { return true; }
+        if args_is_name(a, short, long) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Option value parsed as an integer; `def` when absent or not a number.
+pub fn args_int_in(av: Vec, short: str, long: str, def: i64) -> i64 {
+    var v: str = args_option_in(av, short, long, "");
+    if str_len(v) == 0 { return def; }
+    var start: i64 = 0;
+    if str_byte_at(v, 0) == 45 {
+        if str_len(v) == 1 { return def; }
+        start = 1;
+    }
+    var k: i64 = start;
+    while k < str_len(v) {
+        var c: i64 = str_byte_at(v, k);
+        if c < 48 || c > 57 { return def; }
+        k = k + 1;
+    }
+    return str_parse_int(v);
+}
+
+/// Positional args of `av`: entries not starting with '-' (or bare "-"),
+/// plus everything after "--". NOTE: a value given to an option in the
+/// separate form ("-o file") is not distinguishable here — use
+/// args_positionals_exact_in when you have an option spec.
+pub fn args_positionals_in(av: Vec) -> Vec {
+    var out: Vec = Vec::new();
+    var stop: i64 = args_ddash_in(av);
+    var i: i64 = 1;
+    while i < av.len() {
+        var a: str = av.get(i);
+        if i > stop {
+            out.push(a);
+        } else if i < stop {
+            if !(str_starts_with(a, "-") && str_len(a) > 1) {
+                out.push(a);
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Spec-driven parse ──────────────────────────────────────────────────
+// Give comma-separated name lists ("-v,--verbose,-h,--help") and the
+// parser classifies every argument exactly: names in `flags` take no
+// value, names in `opts` consume the next arg as their value.
+
+fn args_in_spec(spec: Vec, name: str) -> bool {
+    var i: i64 = 0;
+    while i < spec.len() {
+        var s: str = spec.get(i);
+        if str_equal(s, name) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn args_opt_inline(spec: Vec, a: str) -> bool {
+    // "name=value" where name ∈ opts
+    var eq: i64 = str_find(a, "=");
+    if eq <= 0 { return false; }
+    var nm: str = str_slice(a, 0, eq);
+    return args_in_spec(spec, nm);
+}
+
+/// Every present flag from `flags_spec` (comma-separated names) in `av`.
+pub fn args_flags_present_in(av: Vec, flags_spec: str) -> Vec {
+    var out: Vec = Vec::new();
+    var spec: Vec = str_split(flags_spec, ",");
+    var stop: i64 = args_ddash_in(av);
+    var i: i64 = 1;
+    while i < stop {
+        var a: str = av.get(i);
+        if args_in_spec(spec, a) { out.push(a); }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Every option occurrence from `opts_spec` in `av` as "name=value"
+/// strings (name is the actual spelling used on the command line).
+pub fn args_opts_present_in(av: Vec, opts_spec: str) -> Vec {
+    var out: Vec = Vec::new();
+    var spec: Vec = str_split(opts_spec, ",");
+    var stop: i64 = args_ddash_in(av);
+    var i: i64 = 1;
+    while i < stop {
+        var a: str = av.get(i);
+        if args_opt_inline(spec, a) {
+            out.push(a);
+        } else if args_in_spec(spec, a) && i + 1 < stop {
+            var v: str = av.get(i + 1);
+            out.push(a + "=" + v);
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Exact positional args given specs: option values are consumed with
+/// their flag, unknown "-" args are skipped (treated as flags), and
+/// everything after "--" is positional.
+pub fn args_positionals_exact_in(av: Vec, flags_spec: str, opts_spec: str) -> Vec {
+    var out: Vec = Vec::new();
+    var fs: Vec = str_split(flags_spec, ",");
+    var os: Vec = str_split(opts_spec, ",");
+    var stop: i64 = args_ddash_in(av);
+    var i: i64 = 1;
+    while i < av.len() {
+        var a: str = av.get(i);
+        if i > stop {
+            out.push(a);
+        } else if args_in_spec(fs, a) {
+            // flag: skip
+        } else if args_opt_inline(os, a) {
+            // --opt=value: skip
+        } else if args_in_spec(os, a) {
+            i = i + 1;  // consume the separate value too
+        } else if str_starts_with(a, "-") && str_len(a) > 1 {
+            // unknown option-ish arg: skip
+        } else {
+            out.push(a);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Real-argv wrappers ─────────────────────────────────────────────────
+
+/// True when the flag `short`/`long` is present before "--".
+pub fn args_flag(short: str, long: str) -> bool {
+    return args_flag_in(args_all(), short, long);
+}
+
+/// Option value from argv; `def` when absent or valueless.
+pub fn args_option(short: str, long: str, def: str) -> str {
+    return args_option_in(args_all(), short, long, def);
+}
+
+/// True when the option is present with any value.
+pub fn args_has_option(short: str, long: str) -> bool {
+    return args_has_option_in(args_all(), short, long);
+}
+
+/// Option value as integer; `def` when absent or not a number.
+pub fn args_int(short: str, long: str, def: i64) -> i64 {
+    return args_int_in(args_all(), short, long, def);
+}
+
+/// Positional arguments (see args_positionals_in for the caveat).
+pub fn args_positionals() -> Vec {
+    return args_positionals_in(args_all());
+}
+
+/// The nth positional argument (0-based), or "" when absent.
+pub fn args_positional(n: i64) -> str {
+    var ps: Vec = args_positionals();
+    if n < 0 || n >= ps.len() { return ""; }
+    var v: str = ps.get(n);
+    return v;
+}
+
+/// Number of positional arguments.
+pub fn args_positionals_len() -> i64 {
+    return args_positionals().len();
+}
+
+/// Present flags from spec against real argv.
+pub fn args_flags_present(flags_spec: str) -> Vec {
+    return args_flags_present_in(args_all(), flags_spec);
+}
+
+/// Present options from spec against real argv, as "name=value" strings.
+pub fn args_opts_present(opts_spec: str) -> Vec {
+    return args_opts_present_in(args_all(), opts_spec);
+}
+
+/// Exact positional args against real argv (specs consume option values).
+pub fn args_positionals_exact(flags_spec: str, opts_spec: str) -> Vec {
+    return args_positionals_exact_in(args_all(), flags_spec, opts_spec);
+}
+
+// ─── Usage / validation ─────────────────────────────────────────────────
+
+/// Print usage: program name + spec text.
+pub fn args_usage(spec: str) -> void {
+    println("usage: " + args_program_name() + " " + spec);
+}
+
+/// When `cond` is false, print usage + message to stderr and exit with
+/// `code`. For early argument validation.
+pub fn args_require(cond: bool, spec: str, msg: str, code: i64) -> void {
+    if !cond {
+        args_usage(spec);
+        p_eprint_str(msg + "\n");
+        p_exit(code);
+    }
 }
 
 // ─── Compatibility aliases for os.fd ────────────────────────────────────

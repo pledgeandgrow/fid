@@ -1,0 +1,1826 @@
+// pe_ir.fd -- IR -> PE32+ executable backend: instruction-lowering half.
+// Ported from src/pe.rs: PeStackFrame, PeirGen::generate, gen_function,
+// gen_inst, gen_int_binop, gen_float_binop and the public pe_ir_generate_pe
+// entry point.  The PeirGen state, the machine-code runtime stub
+// generators and the reachability analysis live in
+// compiler::pe_ir_stubs; the x86-64 encoder, the .rdata builder and the
+// PE file writer live in compiler::pe_ir_enc.
+//
+// Adaptations from Rust:
+// 1. HashMap<u32, i64> / HashMap<(String,u32), u32> -> i64 handles
+//    (HashMap_get returns 0 when absent; the Rust code's unwrap_or(&0)
+//    makes that the correct default for both stack offsets and labels)
+// 2. BTreeMap/BTreeSet -> sorted Vec<str> + linear contains
+// 3. Option<ValueId> -> OptValueId, Option<IrType> -> OptIrType
+// 4. or-patterns -> separate match arms (Fides doesn't support `|`)
+// 5. ConstFloat stores the f64 value (not bits) -> p_f64_to_bits /
+//    p_f32_to_bits, as in codegen_c
+// 6. Rust `emit(&[b0, b1, ...])` -> one PeirEnc_emit_u8 per byte,
+//    grouped through peir_emit2/peir_emit8
+
+module compiler::pe_ir;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::pe_ir_enc;
+use compiler::pe_ir_stubs;
+
+// ===========================================================================
+// Stack frame (src/pe.rs PeStackFrame — mirrors x86.rs StackFrame)
+// ===========================================================================
+
+/// Key-value pair for the frame maps (Fides HashMap is string-keyed, so
+/// integer-keyed maps use a linear-search entry list, as x86.fd does).
+pub struct PeOffEnt {
+    pub id: i64,
+    pub offset: i64,
+}
+
+pub fn PeOffEnt_new(id: i64, offset: i64) -> PeOffEnt {
+    return PeOffEnt { id: id, offset: offset };
+}
+
+/// Per-function stack layout: every IR value gets a slot at a negative
+/// rbp offset, alloca data slots follow the value slots.
+pub struct PeStackFrame {
+    /// ValueId -> stack offset from rbp (entry list; 0 = absent).
+    pub offsets: Vec<PeOffEnt>,
+    /// Current frame size in bytes
+    pub size: i64,
+    /// Alloca ValueId -> data slot offset from rbp (entry list)
+    pub alloca_slots: Vec<PeOffEnt>,
+}
+
+pub fn PeStackFrame_new() -> PeStackFrame {
+    return PeStackFrame {
+        offsets: Vec::new(),
+        size: 0,
+        alloca_slots: Vec::new(),
+    };
+}
+
+/// `map[id] = value` (insert or overwrite, matching Rust's HashMap::insert).
+fn pe_idmap_put(map: &mut Vec<PeOffEnt>, id: i64, value: i64) -> void {
+    var i: i64 = 0;
+    while i < map.len() {
+        if map.get(i).id == id {
+            var e: PeOffEnt = map.get(i);
+            e.offset = value;
+            map.set(i, e);
+            return;
+        }
+        i = i + 1;
+    }
+    map.push(PeOffEnt_new(id, value));
+}
+
+/// `map[id]`, or 0 when absent (as Rust's unwrap_or(&0)).
+fn pe_idmap_get(map: &Vec<PeOffEnt>, id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < map.len() {
+        if map.get(i).id == id { return map.get(i).offset; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// Allocate space for a value and return its (negative) rbp offset.
+pub fn PeStackFrame_alloc(self: &mut PeStackFrame, id: i64, size: i64) -> i64 {
+    var align: i64 = 8;
+    if size <= 1 { align = 1; }
+    else if size <= 2 { align = 2; }
+    else if size <= 4 { align = 4; }
+    else { align = 8; }
+    self.size = (self.size + align - 1) & ~(align - 1);
+    self.size = self.size + size;
+    var offset: i64 = -self.size;
+    pe_idmap_put(&mut self.offsets, id, offset);
+    return offset;
+}
+
+/// Allocate raw space (not tied to a ValueId) and return its offset.
+pub fn PeStackFrame_alloc_raw(self: &mut PeStackFrame, size: i64) -> i64 {
+    var align: i64 = 8;
+    if size <= 1 { align = 1; }
+    else if size <= 2 { align = 2; }
+    else if size <= 4 { align = 4; }
+    else { align = 8; }
+    self.size = (self.size + align - 1) & ~(align - 1);
+    self.size = self.size + size;
+    return -self.size;
+}
+
+/// The stack offset of a value (0 when absent, as unwrap_or(&0)).
+pub fn PeStackFrame_offset(self: &PeStackFrame, id: i64) -> i64 {
+    return pe_idmap_get(&self.offsets, id);
+}
+
+// ===========================================================================
+// Small helpers (BTreeSet<BTreeMap> stand-ins, block label keys, byte emit)
+// ===========================================================================
+
+/// Linear-scan membership for Vec<str>.
+fn pe_ir_strs_contains(v: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == s { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Insert `s` into sorted Vec<str> `v` (BTreeSet<String>::insert).
+fn pe_ir_strs_insert_sorted(v: Vec<str>, s: str) -> Vec<str> {
+    var i: i64 = 0;
+    while i < v.len() {
+        var c: i64 = str_compare(v.get(i), s);
+        if c == 0 { return v; }
+        if c > 0 {
+            v.push(v.get(v.len() - 1));
+            var j: i64 = v.len() - 1;
+            while j > i {
+                v.set(j, v.get(j - 1));
+                j = j - 1;
+            }
+            v.set(i, s);
+            return v;
+        }
+        i = i + 1;
+    }
+    v.push(s);
+    return v;
+}
+
+/// Insertion-sort a Vec<str> with str_compare (deterministic BTree order).
+fn pe_ir_sort_strs(v: Vec<str>) -> Vec<str> {
+    var i: i64 = 1;
+    while i < v.len() {
+        var key: str = v.get(i);
+        var j: i64 = i - 1;
+        while j >= 0 && str_compare(v.get(j), key) > 0 {
+            v.set(j + 1, v.get(j));
+            j = j - 1;
+        }
+        v.set(j + 1, key);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Insertion-sort a Vec<ValueIdInst> by instruction id (Rust sorts the
+/// HashMap iteration into id order; ids are already dense but this keeps
+/// the port faithful).
+fn pe_sort_value_id_insts(v: Vec<ValueIdInst>) -> Vec<ValueIdInst> {
+    var i: i64 = 1;
+    while i < v.len() {
+        var key: ValueIdInst = v.get(i);
+        var j: i64 = i - 1;
+        while j >= 0 && v.get(j).id > key.id {
+            v.set(j + 1, v.get(j));
+            j = j - 1;
+        }
+        v.set(j + 1, key);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Insertion-sort a Vec<ValueIdMeta> by value id.
+fn pe_sort_value_id_metas(v: Vec<ValueIdMeta>) -> Vec<ValueIdMeta> {
+    var i: i64 = 1;
+    while i < v.len() {
+        var key: ValueIdMeta = v.get(i);
+        var j: i64 = i - 1;
+        while j >= 0 && v.get(j).id > key.id {
+            v.set(j + 1, v.get(j));
+            j = j - 1;
+        }
+        v.set(j + 1, key);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// The block_labels map key: Rust (String, u32) tuple -> "func:block".
+fn pe_block_key(func_name: str, block_id: i64) -> str {
+    return func_name + ":" + int_to_str(block_id);
+}
+
+/// Index of `pledge_name` in module.extern_functions, or -1
+/// (Rust: module.extern_functions.get(&pledge_name) -> Option).
+fn pe_extern_sig_index(module: &IrModule, pledge_name: str) -> i64 {
+    var i: i64 = 0;
+    while i < module.extern_functions.len() {
+        if module.extern_functions.get(i).name == pledge_name { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// IrType::Ptr(_) predicate (Rust `matches!(t, IrType::Ptr(_))`).
+fn pe_is_ptr(t: IrType) -> bool {
+    match t {
+        IrType::Ptr(_) => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+/// Arithmetic operators (the float-binop first arm).
+fn pe_binop_is_arith(op: BinOp) -> bool {
+    match op {
+        BinOp::Add => { return true; }
+        BinOp::Sub => { return true; }
+        BinOp::Mul => { return true; }
+        BinOp::Div => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+/// Comparison operators (the float-binop second arm).
+fn pe_binop_is_cmp(op: BinOp) -> bool {
+    match op {
+        BinOp::Eq => { return true; }
+        BinOp::Neq => { return true; }
+        BinOp::Lt => { return true; }
+        BinOp::Gt => { return true; }
+        BinOp::LtEq => { return true; }
+        BinOp::GtEq => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+/// Does this interrupt vector push an error code?
+/// (#DF=0x08, #TS=0x0A, #NP=0x0B, #SS=0x0C, #GP=0x0D, #PF=0x0E, #AC=0x11,
+///  #CP=0x1E; interrupt_vector is -1 when the function has none)
+fn pe_interrupt_has_err(v: i64) -> bool {
+    return v == 0x08 || v == 0x0A || v == 0x0B || v == 0x0C
+        || v == 0x0D || v == 0x0E || v == 0x11 || v == 0x1E;
+}
+
+/// Trim `chars` bytes from both ends of `s` (Rust trim_matches).
+fn pe_str_contains_char(chars: str, ch: i64) -> bool {
+    var i: i64 = 0;
+    while i < str_len(chars) {
+        if str_byte_at(chars, i) == ch { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn pe_str_trim_chars(s: str, chars: str) -> str {
+    var start: i64 = 0;
+    var end: i64 = str_len(s);
+    while start < end {
+        if pe_str_contains_char(chars, str_byte_at(s, start)) {
+            start = start + 1;
+        } else {
+            break;
+        }
+    }
+    while end > start {
+        if pe_str_contains_char(chars, str_byte_at(s, end - 1)) {
+            end = end - 1;
+        } else {
+            break;
+        }
+    }
+    return str_slice(s, start, end);
+}
+
+/// Raw byte emission (Rust `enc.emit(&[a, b])`).
+fn peir_emit2(e: &mut PeirEnc, a: i64, b: i64) -> void {
+    PeirEnc_emit_u8(e, a);
+    PeirEnc_emit_u8(e, b);
+}
+
+fn peir_emit8(e: &mut PeirEnc, a: i64, b: i64, c: i64, d: i64,
+              f: i64, g: i64, h: i64, i: i64) -> void {
+    PeirEnc_emit_u8(e, a);
+    PeirEnc_emit_u8(e, b);
+    PeirEnc_emit_u8(e, c);
+    PeirEnc_emit_u8(e, d);
+    PeirEnc_emit_u8(e, f);
+    PeirEnc_emit_u8(e, g);
+    PeirEnc_emit_u8(e, h);
+    PeirEnc_emit_u8(e, i);
+}
+
+/// The module's function names, sorted (Rust: keys of a sorted map).
+fn pe_module_fn_names(module: &IrModule) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        v.push(module.functions.get(i).name);
+        i = i + 1;
+    }
+    return pe_ir_sort_strs(v);
+}
+
+/// (type id, function label) for one dyn-call candidate
+/// (Rust Vec<(i64, u32)>).
+pub struct PeDynCandidate {
+    pub tid: i64,
+    pub label: i64,
+}
+
+/// The runtime stub names pre-allocated function labels, in the order of
+/// the literal list in PeirGen::generate (src/pe.rs).
+fn pe_runtime_stub_names() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push("p_print_int"); v.push("p_print_str"); v.push("p_print_bool"); v.push("p_print_float");
+    v.push("p_panic"); v.push("p_malloc"); v.push("p_free"); v.push("p_memset");
+    v.push("p_str_concat"); v.push("p_to_str");
+    v.push("p_to_str_vec"); v.push("p_to_str_float"); v.push("p_to_str_str"); v.push("p_to_str_bool");
+    v.push("p_float_to_str"); v.push("p_bool_to_str"); v.push("p_char_to_str");
+    v.push("p_eprint_str"); v.push("p_print_newline");
+    v.push("p_sb_new"); v.push("p_sb_append"); v.push("p_sb_to_str");
+    v.push("p_file_read"); v.push("p_file_write");
+    v.push("p_str_join_n");
+    v.push("p_vec_new"); v.push("p_vec_push"); v.push("p_vec_len"); v.push("p_vec_get"); v.push("p_vec_pop"); v.push("p_print_vec");
+    v.push("p_vec_set"); v.push("p_vec_is_empty"); v.push("p_vec_clear"); v.push("p_vec_capacity");
+    v.push("p_vec_contains");
+    v.push("p_vec_first"); v.push("p_vec_last"); v.push("p_vec_truncate");
+    v.push("p_vec_clone");
+    v.push("p_map_new"); v.push("p_map_insert"); v.push("p_map_get"); v.push("p_map_contains");
+    v.push("p_map_remove"); v.push("p_map_len"); v.push("p_map_is_empty"); v.push("p_print_map");
+    v.push("p_map_clear"); v.push("p_map_get_or");
+    v.push("p_string_len"); v.push("p_string_is_empty");
+    v.push("p_string_starts_with");
+    v.push("p_string_parse_int");
+    v.push("p_string_bytes"); v.push("p_string_clone");
+    // Phase 5A.3: Interrupt handler stubs
+    v.push("p_cli"); v.push("p_sti"); v.push("p_lidt"); v.push("p_idt_set_entry");
+    v.push("p_hlt"); v.push("p_inb"); v.push("p_outb"); v.push("p_outw"); v.push("p_inw"); v.push("p_outl"); v.push("p_inl");
+    // Phase 5A.4: MMU/page table stubs
+    v.push("p_cr3_read"); v.push("p_cr3_write"); v.push("p_cr0_read"); v.push("p_cr0_write");
+    v.push("p_cr2_read"); v.push("p_cr4_read"); v.push("p_cr4_write"); v.push("p_invlpg");
+    v.push("p_wrmsr_gs_base"); v.push("p_rdmsr_gs_base"); v.push("p_wrmsr_kernel_gs_base"); v.push("p_swapgs");
+    v.push("p_page_map"); v.push("p_page_unmap");
+    v.push("p_phys_read64"); v.push("p_phys_write64");
+    v.push("p_mem_read8"); v.push("p_mem_write8");
+    v.push("p_mem_read16"); v.push("p_mem_write16");
+    v.push("p_mem_read32"); v.push("p_mem_write32");
+    v.push("p_mem_read64"); v.push("p_mem_write64");
+    v.push("p_get_rbp"); v.push("p_get_rsp"); v.push("p_atomic_xchg32");
+    // Phase 5A.5: GDT stubs
+    v.push("p_lgdt"); v.push("p_gdt_set_entry");
+    v.push("p_enter_user_mode");
+    v.push("syscall_handler");
+    v.push("syscall_dispatch");
+    // Phase 5A.6: Serial port stubs
+    v.push("p_serial_init"); v.push("p_serial_write"); v.push("p_serial_read"); v.push("p_serial_ready");
+    // Native runtime stubs: argv, process exec
+    v.push("p_argc"); v.push("p_argv"); v.push("p_system");
+    // Arena marks / region frees (memory is never reused here)
+    v.push("p_arena_save"); v.push("p_arena_restore"); v.push("p_region_free");
+    return v;
+}
+
+// ===========================================================================
+// PeirGen::generate (src/pe.rs)
+// ===========================================================================
+
+/// Generate the complete PE file from an IR module.
+pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
+    // 1. Collect all string constants from IR (sorted for determinism)
+    var all_strings: Vec<str> = Vec::new();
+    var func_names: Vec<str> = pe_module_fn_names(module);
+    var fi: i64 = 0;
+    while fi < func_names.len() {
+        match IrModule_get_function(module, func_names.get(fi)) {
+            OptIrFunction::Some(func) => {
+                var insts: Vec<ValueIdInst> = pe_sort_value_id_insts(func.insts);
+                var ii: i64 = 0;
+                while ii < insts.len() {
+                    var inst: Inst = insts.get(ii).inst;
+                    match inst {
+                        Inst::ConstStr(value) => {
+                            if !pe_ir_strs_contains(all_strings, value) {
+                                all_strings.push(value);
+                            }
+                        }
+                        Inst::ConstFnRef(name) => {
+                            if !pe_ir_strs_contains(all_strings, name) {
+                                all_strings.push(name);
+                            }
+                        }
+                        Inst::Panic(message) => {
+                            if !pe_ir_strs_contains(all_strings, message) {
+                                all_strings.push(message);
+                            }
+                        }
+                        _ => {}
+                    }
+                    ii = ii + 1;
+                }
+            }
+            OptIrFunction::None => {}
+        }
+        fi = fi + 1;
+    }
+    // Add boolean strings
+    all_strings.push("true");
+    all_strings.push("false");
+
+    // 2. Build .rdata section
+    var rdata: PeirRdata = PeirRdata_new();
+    PeirRdata_build(&mut rdata, all_strings);
+
+    // Record string rdata offsets for later codegen
+    var si: i64 = 0;
+    while si < all_strings.len() {
+        var s: str = all_strings.get(si);
+        var soff: i64 = PeirRdata_string_offset(&rdata, s);
+        if soff != -1 {
+            HashMap_insert(self.string_rdata_offsets, s, soff);
+        }
+        si = si + 1;
+    }
+    // Record IAT offsets
+    self.iat_rdata_offsets = rdata.iat_offsets;
+
+    // 2b. Append module-level mutable globals to .rdata (section is writable)
+    // Each global gets 8 bytes of storage, initialized with the constant value.
+    var global_names: Vec<str> = Vec::new();
+    var gi: i64 = 0;
+    while gi < module.globals.len() {
+        global_names.push(module.globals.get(gi).name);
+        gi = gi + 1;
+    }
+    global_names = pe_ir_sort_strs(global_names);
+    gi = 0;
+    while gi < global_names.len() {
+        var gname: str = global_names.get(gi);
+        match IrModule_get_global(module, gname) {
+            OptGlobalLookup::Some(gty, init_expr) => {
+                var goff: i64 = rdata.data.len();
+                // Compute the 8-byte initial value
+                var bits: i64 = 0;
+                var f32_init: bool = false;
+                match init_expr {
+                    Expr::IntLit(v) => { bits = v; }
+                    Expr::BoolLit(b) => { if b { bits = 1; } else { bits = 0; } }
+                    Expr::FloatLit(f) => {
+                        if ir_type_eq(gty, IrType::F32) {
+                            bits = p_f32_to_bits(f);
+                            f32_init = true;
+                        } else {
+                            bits = p_f64_to_bits(f);
+                        }
+                    }
+                    _ => { bits = 0; } // zero-initialize
+                }
+                if f32_init {
+                    var b1: i64 = 0;
+                    while b1 < 4 {
+                        rdata.data.push((bits >> (8 * b1)) & 0xFF);
+                        b1 = b1 + 1;
+                    }
+                    var bz: i64 = 0;
+                    while bz < 4 {
+                        rdata.data.push(0);
+                        bz = bz + 1;
+                    }
+                } else {
+                    var b2: i64 = 0;
+                    while b2 < 8 {
+                        rdata.data.push((bits >> (8 * b2)) & 0xFF);
+                        b2 = b2 + 1;
+                    }
+                }
+                HashMap_insert(self.global_rdata_offsets, gname, goff);
+            }
+            OptGlobalLookup::None => {}
+        }
+        gi = gi + 1;
+    }
+
+    // Bump-allocator state for p_malloc: 32 zero bytes in writable .rdata —
+    // +0 chunk cursor, +8 chunk end, +16 cached process-heap handle, +24 lock.
+    self.alloc_rdata_off = rdata.data.len();
+    var az: i64 = 0;
+    while az < 32 {
+        rdata.data.push(0);
+        az = az + 1;
+    }
+
+    // 3. Pre-allocate labels for all functions (sorted for deterministic layout)
+    fi = 0;
+    while fi < func_names.len() {
+        var flabel: i64 = PeirEnc_alloc_label(&mut self.enc);
+        HashMap_insert(self.func_labels, func_names.get(fi), flabel);
+        fi = fi + 1;
+    }
+    // Pre-allocate labels for runtime stubs
+    var stub_names: Vec<str> = pe_runtime_stub_names();
+    var ri: i64 = 0;
+    while ri < stub_names.len() {
+        var slabel: i64 = PeirEnc_alloc_label(&mut self.enc);
+        HashMap_insert(self.func_labels, stub_names.get(ri), slabel);
+        ri = ri + 1;
+    }
+
+    // 3b. The Fides runtime (src/pe_runtime/): its machine-code
+    //     primitives, the stubs that hand over to it, and every
+    //     `extern "C"` function of msvcrt.dll / kernel32.dll (a thunk each)
+    self.module_fns = func_names;
+    var prims: Vec<str> = pe_primitive_names();
+    var pi: i64 = 0;
+    while pi < prims.len() {
+        var plabel: i64 = PeirEnc_alloc_label(&mut self.enc);
+        HashMap_insert(self.func_labels, prims.get(pi), plabel);
+        pi = pi + 1;
+    }
+    // (only those the program reaches: the runtime function they hand
+    // over to is left out otherwise)
+    var needed: Vec<str> = pe_ir_needed_functions(module);
+    var deps: Vec<PeirStrPair> = pe_stub_deps();
+    var di: i64 = 0;
+    while di < deps.len() {
+        var dep: PeirStrPair = deps.get(di);
+        if pe_ir_strs_contains(self.module_fns, dep.b) && pe_ir_strs_contains(needed, dep.a) {
+            var dlabel: i64 = PeirEnc_alloc_label(&mut self.enc);
+            HashMap_insert(self.func_labels, dep.a, dlabel);
+        }
+        di = di + 1;
+    }
+    var edi: i64 = 0;
+    while edi < module.extern_decls.len() {
+        var ext: ExternDecl = module.extern_decls.get(edi);
+        if !HashMap_contains(self.func_labels, ext.pledge_name) {
+            var over: str = pe_ir_c_override(module, ext.pledge_name);
+            if over != "" {
+                self.c_overrides.push(COverride_new(ext.pledge_name, over));
+            } else {
+                // `fn pe_f64_to_bits as pe_f32_raw(x: f32) -> i64`: another name
+                // (and Fides type) for a primitive
+                var done_ext: bool = false;
+                if pe_ir_strs_contains(pe_primitive_names(), ext.c_name) {
+                    var prim_label: i64 = HashMap_get(self.func_labels, ext.c_name);
+                    HashMap_insert(self.func_labels, ext.pledge_name, prim_label);
+                    done_ext = true;
+                }
+                if !done_ext {
+                    var slot: i64 = pe_import_slot(ext.c_name);
+                    var sig_idx: i64 = pe_extern_sig_index(module, ext.pledge_name);
+                    if slot >= 0 && sig_idx >= 0 {
+                        var sig: StringVecIrType = module.extern_functions.get(sig_idx);
+                        var tlabel: i64 = PeirEnc_alloc_label(&mut self.enc);
+                        HashMap_insert(self.func_labels, ext.pledge_name, tlabel);
+                        self.c_thunks.push(CThunk_new(ext.pledge_name, slot, sig.params, sig.ret));
+                        done_ext = true;
+                    }
+                }
+                if !done_ext {
+                    // As in the C backend: the functions of a local header that does
+                    // not exist (`include "pledge_audio.h"`) are stubs returning 0
+                    var missing_local_header: bool = false;
+                    match ext.include {
+                        OptStr::Some(inc) => {
+                            if !str_starts_with(inc, "<")
+                                && !c_file_exists(pe_str_trim_chars(inc, "\"<>")) {
+                                missing_local_header = true;
+                            }
+                        }
+                        OptStr::None => {}
+                    }
+                    if missing_local_header {
+                        var mlabel: i64 = PeirEnc_alloc_label(&mut self.enc);
+                        HashMap_insert(self.func_labels, ext.pledge_name, mlabel);
+                        self.stub_externs.push(ext.pledge_name);
+                    }
+                }
+            }
+        }
+        edi = edi + 1;
+    }
+    // Functions named by a string constant can be looked up by name
+    var nf: Vec<str> = Vec::new();
+    self.named_fns = nf;
+    var ni: i64 = 0;
+    while ni < all_strings.len() {
+        var ns: str = all_strings.get(ni);
+        if pe_ir_strs_contains(self.module_fns, ns) && !is_pe_runtime_fn(ns) {
+            self.named_fns.push(ns);
+        }
+        ni = ni + 1;
+    }
+
+    // 4. Generate code for each function (sorted for deterministic layout);
+    //    of the Fides runtime only what the program uses
+    fi = 0;
+    while fi < func_names.len() {
+        var fname: str = func_names.get(fi);
+        if is_pe_runtime_fn(fname) && !pe_ir_strs_contains(needed, fname) {
+            fi = fi + 1;
+            continue;
+        }
+        match IrModule_get_function(module, fname) {
+            OptIrFunction::Some(func) => {
+                PeirGen_gen_function(self, fname, &func, module);
+            }
+            OptIrFunction::None => {}
+        }
+        fi = fi + 1;
+    }
+
+    // 5. Generate runtime stubs
+    PeirGen_gen_runtime_stubs(self);
+    PeirGen_gen_pe_primitives(self);
+    var thunks: Vec<CThunk> = self.c_thunks;
+    var ti: i64 = 0;
+    while ti < thunks.len() {
+        var t: CThunk = thunks.get(ti);
+        PeirGen_gen_c_thunk(self, &t);
+        ti = ti + 1;
+    }
+    var stub_externs: Vec<str> = self.stub_externs;
+    var si2: i64 = 0;
+    while si2 < stub_externs.len() {
+        PeirGen_place_fn(self, stub_externs.get(si2));
+        PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        PeirEnc_ret(&mut self.enc);
+        si2 = si2 + 1;
+    }
+
+    // 6. Generate entry point (_main)
+    PeirGen_gen_entry_point(self);
+
+    // 7. Resolve local labels (jumps/calls within .text)
+    PeirEnc_resolve_labels(&mut self.enc);
+
+    // 8. Compute .rdata RVA dynamically from actual .text size
+    var rdata_rva: i64 = PE_TEXT_RVA + pe_align_up(self.enc.code.len(), PE_SECTION_ALIGN);
+
+    // 9. Patch RIP-relative references (strings + IAT calls)
+    PeirEnc_resolve_rip_refs(&mut self.enc, PE_TEXT_RVA, rdata_rva);
+
+    // 10. Patch import table RVAs in .rdata
+    PeirRdata_patch_rvas(&mut rdata, rdata_rva);
+
+    // 11. Calculate PE metadata
+    var import_dir_rva: i64 = rdata_rva + rdata.import_dir_offset;
+    var iat_rva: i64 = rdata_rva + rdata.iat_offset;
+    var iat_size: i64 = rdata.iat_size; // every DLL's entries + null terminators
+    var entry_rva: i64 = PE_TEXT_RVA + self.entry_offset;
+
+    // 12. Build PE file
+    return pe_build_file(self.enc.code, rdata.data, entry_rva, import_dir_rva, iat_rva, iat_size, rdata_rva);
+}
+
+// ===========================================================================
+// PeirGen::gen_function (src/pe.rs)
+// ===========================================================================
+
+/// Generate code for a single function.
+pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, module: &IrModule) -> void {
+    self.cur_func = name;
+    var label: i64 = HashMap_get(self.func_labels, name);
+    PeirEnc_align_to(&mut self.enc, 16);
+    PeirEnc_place_label(&mut self.enc, label);
+    if str_len(p_getenv("PE_DUMP_FN")) > 0 {
+        p_eprint_str("FN " + name + " @" + int_to_str(self.enc.code.len()) + "\n");
+    }
+
+    if func.is_interrupt {
+        // Interrupt handler prologue: save all GP registers
+        // The CPU already pushed SS:RSP, RFLAGS, CS:RIP on interrupt
+        // For exceptions with error codes (#PF=0x0E, #GP=0x0D, etc.),
+        // the CPU also pushed an error code before jumping here.
+        // We save it to 0x510 and remove it from the stack so the
+        // epilogue's iretq works correctly.
+
+        // Check if this vector pushes an error code
+        if pe_interrupt_has_err(func.interrupt_vector) {
+            // Pop error code into RAX, save to 0x510, then push RAX back
+            PeirEnc_pop(&mut self.enc, PEIR_RAX);
+            // mov [0x510], rax
+            peir_emit8(&mut self.enc, 0x48, 0x89, 0x04, 0x25, 0x10, 0x05, 0x00, 0x00);
+        }
+
+        // We save all general-purpose registers
+        PeirEnc_push(&mut self.enc, PEIR_RAX);
+        PeirEnc_push(&mut self.enc, PEIR_RBX);
+        PeirEnc_push(&mut self.enc, PEIR_RCX);
+        PeirEnc_push(&mut self.enc, PEIR_RDX);
+        PeirEnc_push(&mut self.enc, PEIR_RSI);
+        PeirEnc_push(&mut self.enc, PEIR_RDI);
+        PeirEnc_push(&mut self.enc, PEIR_R8);
+        PeirEnc_push(&mut self.enc, PEIR_R9);
+        PeirEnc_push(&mut self.enc, PEIR_R10);
+        PeirEnc_push(&mut self.enc, PEIR_R11);
+        PeirEnc_push(&mut self.enc, PEIR_R12);
+        PeirEnc_push(&mut self.enc, PEIR_R13);
+        PeirEnc_push(&mut self.enc, PEIR_R14);
+        PeirEnc_push(&mut self.enc, PEIR_R15);
+        // Set up frame
+        PeirEnc_push(&mut self.enc, PEIR_RBP);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
+    } else {
+        // Prologue
+        PeirEnc_push(&mut self.enc, PEIR_RBP);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
+    }
+
+    // Allocate stack frame (value_metas is insertion-ordered by id already,
+    // as x86.fd iterates it directly)
+    var frame: PeStackFrame = PeStackFrame_new();
+    var vi: i64 = 0;
+    while vi < func.value_metas.len() {
+        var vm: ValueIdMeta = func.value_metas.get(vi);
+        var size: i64 = IrModule_type_size(module, vm.meta.ty);
+        if size < 8 { size = 8; }
+        PeStackFrame_alloc(&mut frame, vm.id, size);
+        vi = vi + 1;
+    }
+    // Pre-allocate alloca data slots (insts is insertion-ordered by id)
+    var ii: i64 = 0;
+    while ii < func.insts.len() {
+        var ve: ValueIdInst = func.insts.get(ii);
+        match ve.inst {
+            Inst::Alloca(ty, _) => {
+                var data_size: i64 = IrModule_type_size(module, ty);
+                if data_size < 8 { data_size = 8; }
+                var aoff: i64 = PeStackFrame_alloc_raw(&mut frame, data_size);
+                pe_idmap_put(&mut frame.alloca_slots, ve.id, aoff);
+            }
+            _ => {}
+        }
+        ii = ii + 1;
+    }
+
+    // Align stack to 16 bytes + 32 shadow space
+    var stack_size: i64 = (frame.size + 32 + 15) & ~15;
+    if stack_size < 64 { stack_size = 64; }
+    PeirEnc_sub_rsp_i32(&mut self.enc, stack_size);
+
+    // Store params from registers
+    var arg_regs: Vec<i64> = Vec::new();
+    arg_regs.push(PEIR_RCX);
+    arg_regs.push(PEIR_RDX);
+    arg_regs.push(PEIR_R8);
+    arg_regs.push(PEIR_R9);
+    var pi: i64 = 0;
+    while pi < func.params.len() {
+        var param: ValueIdType = func.params.get(pi);
+        if pi < 4 {
+            var poff: i64 = PeStackFrame_offset(&frame, param.id);
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, poff, arg_regs.get(pi));
+        } else {
+            var stack_offset: i64 = 48 + (pi - 4) * 8;
+            var poff2: i64 = PeStackFrame_offset(&frame, param.id);
+            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, stack_offset);
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, poff2, PEIR_RAX);
+        }
+        pi = pi + 1;
+    }
+
+    // Pre-allocate block labels
+    var bi: i64 = 0;
+    while bi < func.blocks.len() {
+        var block: BasicBlock = func.blocks.get(bi);
+        var blabel: i64 = PeirEnc_alloc_label(&mut self.enc);
+        HashMap_insert(self.block_labels, pe_block_key(name, block.id), blabel);
+        bi = bi + 1;
+    }
+
+    // Generate code for each basic block
+    bi = 0;
+    while bi < func.blocks.len() {
+        var block2: BasicBlock = func.blocks.get(bi);
+        var blabel2: i64 = HashMap_get(self.block_labels, pe_block_key(name, block2.id));
+        PeirEnc_place_label(&mut self.enc, blabel2);
+
+        var ii2: i64 = 0;
+        while ii2 < block2.instructions.len() {
+            var inst_id: i64 = block2.instructions.get(ii2);
+            match IrFunction_get_inst(func, inst_id) {
+                OptInst::Some(inst) => {
+                    PeirGen_gen_inst(self, inst_id, inst, &frame, func, module, name);
+                }
+                OptInst::None => {}
+            }
+            ii2 = ii2 + 1;
+        }
+        bi = bi + 1;
+    }
+
+    // Epilogue (fallthrough safety)
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RSP, PEIR_RBP);
+    PeirEnc_pop(&mut self.enc, PEIR_RBP);
+    PeirEnc_ret(&mut self.enc);
+}
+
+// ===========================================================================
+// PeirGen::gen_inst (src/pe.rs) — code for a single instruction
+// ===========================================================================
+
+/// Emit the autograd call shared by GradBegin / GradEnd / Backward.
+fn PeirGen_gen_autograd(self: &mut PeirGen, inst: Inst, nargs: i64) -> void {
+    // Autograd, as in the C backend: start/stop recording the
+    // tape, run the backward pass (loss argument: NULL)
+    var builtin: str = pe_ir_autograd_builtin(inst);
+    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+    PeirEnc_xor_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
+    PeirGen_call_builtin(self, builtin, nargs);
+    PeirEnc_add_rsp_i32(&mut self.enc, 32);
+}
+
+/// Generate code for a single instruction.
+pub fn PeirGen_gen_inst(
+    self: &mut PeirGen,
+    id: i64,
+    inst: Inst,
+    frame: &PeStackFrame,
+    func: &IrFunction,
+    module: &IrModule,
+    func_name: str,
+) -> void {
+    var dst: i64 = PeStackFrame_offset(frame, id);
+
+    match inst {
+        // --- Constants ---
+        Inst::ConstInt(value, _) => {
+            PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, value);
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        Inst::ConstBool(value) => {
+            var v8: i64 = 0;
+            if value { v8 = 1; }
+            PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, v8);
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        Inst::ConstStr(value) => {
+            // Always a string, even one spelling a function's name (the
+            // string "main" was emitted as the address of fn main):
+            // function values are ConstFnRef.
+            var off: i64 = PeirGen_str_off(self, value);
+            PeirEnc_lea_rip(&mut self.enc, PEIR_RAX, off);
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        Inst::ConstFnRef(name) => {
+            // Function reference — resolve to function label address
+            if HashMap_contains(self.func_labels, name) {
+                var flabel: i64 = HashMap_get(self.func_labels, name);
+                PeirEnc_lea_label(&mut self.enc, PEIR_RAX, flabel);
+            } else {
+                PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, 0);
+            }
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        Inst::ConstFloat(value, ty) => {
+            // ConstFloat stores the f64 value; Rust emits `bits as u32` for
+            // F32 (the low 32 bits of the f64 bit pattern) and the full
+            // bits for F64.
+            if ir_type_eq(ty, IrType::F32) {
+                var bits32: i64 = p_f64_to_bits(value) & 0xFFFFFFFF;
+                PeirEnc_mov_imm32(&mut self.enc, PEIR_RAX, bits32);
+                PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+            } else {
+                PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, p_f64_to_bits(value));
+                PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+            }
+        }
+
+        Inst::ConstNull(_) => {
+            PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        Inst::GlobalAddr(name, _) => {
+            // lea rax, [rip + global_offset]
+            var goff: i64 = HashMap_get(self.global_rdata_offsets, name);
+            PeirEnc_lea_rip(&mut self.enc, PEIR_RAX, goff);
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        // --- Arithmetic ---
+        Inst::BinOp(op, left, right, ty) => {
+            var loff: i64 = PeStackFrame_offset(frame, left);
+            var roff: i64 = PeStackFrame_offset(frame, right);
+            // A comparison's type is Bool: its operands' type decides
+            var operand_ty: IrType = IrType::I64;
+            match IrFunction_get_meta(func, left) {
+                OptValueMeta::Some(m) => { operand_ty = m.ty; }
+                OptValueMeta::None => {}
+            }
+            if ir_type_is_float(ty) {
+                PeirGen_gen_float_binop(self, op, loff, roff, dst, ty);
+            } else if ir_type_is_float(operand_ty) {
+                PeirGen_gen_float_binop(self, op, loff, roff, dst, operand_ty);
+            } else {
+                PeirGen_gen_int_binop(self, op, loff, roff, dst);
+            }
+        }
+
+        Inst::UnaryOp(op, operand, ty) => {
+            var off: i64 = PeStackFrame_offset(frame, operand);
+            match op {
+                UnaryOp::Neg => {
+                    if ir_type_is_float(ty) {
+                        // Float negation: XOR sign bit via register
+                        PeirEnc_movsd_xmm_mem_rbp(&mut self.enc, 0, off);
+                        var sign_bit: i64 = 1 << 63;
+                        PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, sign_bit);
+                        PeirEnc_movq_xmm_r64(&mut self.enc, 1, PEIR_RAX);
+                        PeirEnc_xorpd_xmm_xmm(&mut self.enc, 0, 1);
+                        if ir_type_eq(ty, IrType::F32) {
+                            PeirEnc_movss_mem_rbp_xmm(&mut self.enc, dst, 0);
+                        } else {
+                            PeirEnc_movsd_mem_rbp_xmm(&mut self.enc, dst, 0);
+                        }
+                    } else {
+                        PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, off);
+                        PeirEnc_neg_r(&mut self.enc, PEIR_RAX);
+                        PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+                    }
+                }
+                UnaryOp::Not => {
+                    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, off);
+                    PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, 1);
+                    PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+                    PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+                }
+                UnaryOp::BitNot => {
+                    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, off);
+                    PeirEnc_not_r(&mut self.enc, PEIR_RAX);
+                    PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+                }
+            }
+        }
+
+        // --- Memory ---
+        Inst::Alloca(_, _) => {
+            var data_offset: i64 = pe_idmap_get(&frame.alloca_slots, id);
+            PeirEnc_lea_rbp(&mut self.enc, PEIR_RAX, data_offset);
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        Inst::Load(ptr, ty) => {
+            var poff: i64 = PeStackFrame_offset(frame, ptr);
+            var size: i64 = IrModule_type_size(module, ty);
+            if size < 1 { size = 1; }
+            // Unsigned values zero-extend (a u8 255 stays 255), as in C
+            var unsigned: bool = false;
+            match ty {
+                IrType::U8 => { unsigned = true; }
+                IrType::U16 => { unsigned = true; }
+                IrType::U32 => { unsigned = true; }
+                IrType::Bool => { unsigned = true; }
+                _ => {}
+            }
+            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, poff);
+            if size == 1 {
+                // mov al, [rax] (the rest of rax still holds the
+                // address), then extend al over all of rax
+                PeirEnc_mov_reg8_ptr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                if unsigned {
+                    PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                } else {
+                    PeirEnc_movsx_r64_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                }
+            } else if size == 2 {
+                PeirEnc_mov_reg16_ptr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                if unsigned {
+                    PeirEnc_movzx_r32_r16(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                } else {
+                    PeirEnc_movsx_r64_r16(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                }
+            } else if size == 4 {
+                // mov eax, [rax] zero-extends into rax
+                PeirEnc_mov_reg32_ptr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                if !unsigned {
+                    PeirEnc_movsxd_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                }
+            } else {
+                PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+            }
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        Inst::Store(ptr, value, explicit_ty) => {
+            var poff: i64 = PeStackFrame_offset(frame, ptr);
+            var voff: i64 = PeStackFrame_offset(frame, value);
+            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, poff);
+            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, voff);
+            // As in the C backend: the explicit store type, else the
+            // pointee type, else the value's type.
+            var pointee: OptIrType = OptIrType::None;
+            match IrFunction_get_meta(func, ptr) {
+                OptValueMeta::Some(pm) => {
+                    match pm.ty {
+                        IrType::Ptr(inner) => {
+                            pointee = OptIrType::Some(box_ir_type_unbox(inner));
+                        }
+                        _ => {}
+                    }
+                }
+                OptValueMeta::None => {}
+            }
+            var store_ty: IrType = IrType::I64;
+            var have_ty: bool = false;
+            match explicit_ty {
+                OptIrType::Some(t0) => { store_ty = t0; have_ty = true; }
+                OptIrType::None => {}
+            }
+            if !have_ty {
+                match pointee {
+                    OptIrType::Some(t1) => { store_ty = t1; have_ty = true; }
+                    OptIrType::None => {}
+                }
+            }
+            if !have_ty {
+                match IrFunction_get_meta(func, value) {
+                    OptValueMeta::Some(vm) => { store_ty = vm.ty; }
+                    OptValueMeta::None => {}
+                }
+            }
+            match store_ty {
+                // Structs are passed by pointer: copy the struct itself.
+                IrType::Struct(_) => {
+                    var ssize: i64 = IrModule_type_size(module, store_ty);
+                    PeirGen_emit_copy_rcx_to_rax(self, ssize);
+                }
+                IrType::Array(_, _) => {
+                    PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_RCX);
+                }
+                IrType::Ptr(_) => {
+                    PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_RCX);
+                }
+                IrType::Opaque(_) => {
+                    PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_RCX);
+                }
+                IrType::Generic(_, _) => {
+                    PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_RCX);
+                }
+                _ => {
+                    var sz: i64 = IrModule_type_size(module, store_ty);
+                    if sz == 1 {
+                        PeirEnc_mov_mem_reg8(&mut self.enc, PEIR_RAX, PEIR_RCX);
+                    } else if sz == 2 {
+                        PeirEnc_mov_ptr_reg16(&mut self.enc, PEIR_RAX, PEIR_RCX);
+                    } else if sz == 4 {
+                        PeirEnc_mov_ptr_reg32(&mut self.enc, PEIR_RAX, PEIR_RCX);
+                    } else {
+                        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_RCX);
+                    }
+                }
+            }
+        }
+
+        Inst::StructCopy(dst_v, src_v, ty) => {
+            // Copy struct data from src to dst (memcpy of struct size bytes)
+            var dst_off: i64 = PeStackFrame_offset(frame, dst_v);
+            var src_off: i64 = PeStackFrame_offset(frame, src_v);
+            var size: i64 = IrModule_type_size(module, ty);
+            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, dst_off); // dst ptr
+            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, src_off); // src ptr
+            PeirGen_emit_copy_rcx_to_rax(self, size);
+        }
+
+        Inst::GetFieldPtr(struct_ptr, field_index, _) => {
+            var poff: i64 = PeStackFrame_offset(frame, struct_ptr);
+            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, poff);
+            var offset: i64 = field_index * 8;
+            match IrFunction_get_meta(func, struct_ptr) {
+                OptValueMeta::Some(ptr_meta) => {
+                    var struct_name: str = "";
+                    match ptr_meta.ty {
+                        IrType::Ptr(inner) => {
+                            match box_ir_type_unbox(inner) {
+                                IrType::Struct(n) => { struct_name = n; }
+                                _ => {}
+                            }
+                        }
+                        IrType::Struct(n2) => { struct_name = n2; }
+                        _ => {}
+                    }
+                    if struct_name != "" {
+                        match IrModule_get_struct(module, struct_name) {
+                            OptStructLayout::Some(layout) => {
+                                if field_index >= 0 && field_index < layout.fields.len() {
+                                    offset = layout.fields.get(field_index).offset;
+                                }
+                            }
+                            OptStructLayout::None => {}
+                        }
+                    }
+                }
+                OptValueMeta::None => {}
+            }
+            if offset > 0 {
+                PeirEnc_add_r_i32(&mut self.enc, PEIR_RAX, offset);
+            }
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        Inst::GetElemPtr(array_ptr, index, elem_ty) => {
+            var poff: i64 = PeStackFrame_offset(frame, array_ptr);
+            var ioff: i64 = PeStackFrame_offset(frame, index);
+            var elem_size: i64 = IrModule_type_size(module, elem_ty);
+            if elem_size < 1 { elem_size = 1; }
+            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, poff);
+            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, ioff);
+            PeirEnc_imul_r_r_imm32(&mut self.enc, PEIR_RCX, PEIR_RCX, elem_size);
+            PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        // --- Control Flow ---
+        Inst::Jump(target) => {
+            var blabel: i64 = HashMap_get(self.block_labels, pe_block_key(func_name, target));
+            PeirEnc_jmp_label(&mut self.enc, blabel);
+        }
+
+        Inst::Branch(cond, then, else_) => {
+            var coff: i64 = PeStackFrame_offset(frame, cond);
+            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, coff);
+            PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+            var then_label: i64 = HashMap_get(self.block_labels, pe_block_key(func_name, then));
+            var else_label: i64 = HashMap_get(self.block_labels, pe_block_key(func_name, else_));
+            PeirEnc_jcc_label(&mut self.enc, 0x5, then_label); // jne
+            PeirEnc_jmp_label(&mut self.enc, else_label);
+        }
+
+        Inst::Return(ret) => {
+            match ret {
+                OptValueId::Some(v) => {
+                    var voff: i64 = PeStackFrame_offset(frame, v);
+                    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, voff);
+                }
+                OptValueId::None => {
+                    PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
+                }
+            }
+            PeirEnc_mov_rr(&mut self.enc, PEIR_RSP, PEIR_RBP);
+            PeirEnc_pop(&mut self.enc, PEIR_RBP);
+            if func.is_interrupt {
+                // Interrupt handler epilogue: restore all GP registers
+                PeirEnc_pop(&mut self.enc, PEIR_R15);
+                PeirEnc_pop(&mut self.enc, PEIR_R14);
+                PeirEnc_pop(&mut self.enc, PEIR_R13);
+                PeirEnc_pop(&mut self.enc, PEIR_R12);
+                PeirEnc_pop(&mut self.enc, PEIR_R11);
+                PeirEnc_pop(&mut self.enc, PEIR_R10);
+                PeirEnc_pop(&mut self.enc, PEIR_R9);
+                PeirEnc_pop(&mut self.enc, PEIR_R8);
+                PeirEnc_pop(&mut self.enc, PEIR_RDI);
+                PeirEnc_pop(&mut self.enc, PEIR_RSI);
+                PeirEnc_pop(&mut self.enc, PEIR_RDX);
+                PeirEnc_pop(&mut self.enc, PEIR_RCX);
+                PeirEnc_pop(&mut self.enc, PEIR_RBX);
+                PeirEnc_pop(&mut self.enc, PEIR_RAX);
+                // For exceptions with error codes, push dummy error code
+                // so iretq sees the correct stack layout
+                if pe_interrupt_has_err(func.interrupt_vector) {
+                    // push 0 (dummy error code)
+                    peir_emit2(&mut self.enc, 0x6A, 0x00);
+                }
+                // iretq restores SS:RSP, RFLAGS, CS:RIP (64-bit)
+                peir_emit2(&mut self.enc, 0x48, 0xCF); // iretq
+            } else {
+                PeirEnc_ret(&mut self.enc);
+            }
+        }
+
+        Inst::Unreachable => {
+            PeirEnc_ud2(&mut self.enc);
+        }
+
+        // --- Function Calls ---
+        Inst::Call(call_name, args, _, _) => {
+            // print(tensor): the runtime formats it, then the string prints
+            if call_name == "print" && args.len() > 0 {
+                var arg0: i64 = args.get(0);
+                var tensor_arg: bool = false;
+                match IrFunction_get_meta(func, arg0) {
+                    OptValueMeta::Some(m0) => {
+                        tensor_arg = ir_type_is_opaque_named(m0.ty, "Tensor");
+                    }
+                    OptValueMeta::None => {}
+                }
+                if tensor_arg {
+                    var aoff0: i64 = PeStackFrame_offset(frame, arg0);
+                    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+                    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, aoff0);
+                    PeirGen_call_builtin(self, "p_tensor_to_str", 1);
+                    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+                    PeirGen_call_runtime(self, "p_print_str");
+                    PeirEnc_add_rsp_i32(&mut self.enc, 32);
+                    PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+                    return;
+                }
+            }
+
+            var target_func: str = call_name;
+            if call_name == "print" {
+                target_func = "p_print_int";
+                if args.len() > 0 {
+                    match IrFunction_get_meta(func, args.get(0)) {
+                        OptValueMeta::Some(am) => {
+                            var aty: IrType = am.ty;
+                            if pe_is_ptr(aty) { target_func = "p_print_str"; }
+                            else if ir_type_is_float(aty) { target_func = "p_print_float"; }
+                            else if ir_type_eq(aty, IrType::Bool) { target_func = "p_print_bool"; }
+                            else if ir_type_is_opaque_named(aty, "Vec") { target_func = "p_print_vec"; }
+                            else if ir_type_is_opaque_named(aty, "HashMap") { target_func = "p_print_map"; }
+                            else { target_func = "p_print_int"; }
+                        }
+                        OptValueMeta::None => {}
+                    }
+                }
+            } else if call_name == "p_to_str" {
+                target_func = "p_to_str";
+                if args.len() > 0 {
+                    match IrFunction_get_meta(func, args.get(0)) {
+                        OptValueMeta::Some(am2) => {
+                            var aty2: IrType = am2.ty;
+                            if ir_type_is_opaque_named(aty2, "Vec") { target_func = "p_to_str_vec"; }
+                            else if ir_type_is_float(aty2) { target_func = "p_to_str_float"; }
+                            else if pe_is_ptr(aty2) { target_func = "p_to_str_str"; }
+                            else if ir_type_eq(aty2, IrType::Bool) { target_func = "p_to_str_bool"; }
+                            else { target_func = "p_to_str"; }
+                        }
+                        OptValueMeta::None => {}
+                    }
+                }
+            }
+            target_func = PeirGen_resolve_call(self, target_func);
+
+            // A Fides function standing in for a runtime builtin (called
+            // without one) takes a null `__env` first
+            var call_args: Vec<OptValueId> = Vec::new();
+            if pe_ir_strs_contains(self.module_fns, target_func)
+                && !pe_ir_strs_contains(self.module_fns, call_name) {
+                call_args.push(OptValueId::None);
+            }
+            var ai: i64 = 0;
+            while ai < args.len() {
+                call_args.push(OptValueId::Some(args.get(ai)));
+                ai = ai + 1;
+            }
+
+            var arg_regs: Vec<i64> = Vec::new();
+            arg_regs.push(PEIR_RCX);
+            arg_regs.push(PEIR_RDX);
+            arg_regs.push(PEIR_R8);
+            arg_regs.push(PEIR_R9);
+            var stack_args: i64 = 0;
+            if call_args.len() > 4 { stack_args = call_args.len() - 4; }
+            var call_space: i64 = (32 + stack_args * 8 + 15) & ~15;
+
+            // Load args into registers
+            var ri: i64 = 0;
+            while ri < call_args.len() && ri < 4 {
+                match call_args.get(ri) {
+                    OptValueId::Some(a) => {
+                        PeirEnc_mov_reg_mem_rbp(&mut self.enc, arg_regs.get(ri), PeStackFrame_offset(frame, a));
+                    }
+                    OptValueId::None => {
+                        PeirEnc_xor_rr(&mut self.enc, arg_regs.get(ri), arg_regs.get(ri));
+                    }
+                }
+                ri = ri + 1;
+            }
+
+            PeirEnc_sub_rsp_i32(&mut self.enc, call_space);
+            // Place stack args
+            var sa: i64 = 4;
+            while sa < call_args.len() {
+                var stack_pos: i64 = 32 + (sa - 4) * 8;
+                match call_args.get(sa) {
+                    OptValueId::Some(a2) => {
+                        PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, PeStackFrame_offset(frame, a2));
+                    }
+                    OptValueId::None => {
+                        PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                    }
+                }
+                PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, stack_pos, PEIR_RAX);
+                sa = sa + 1;
+            }
+
+            // Call the function. A function nobody defines would leave a
+            // garbage result: trap, and (outside bare mode, where kernels
+            // may rely on the trap) refuse the program in pe_ir_generate_pe.
+            PeirGen_call_runtime(self, target_func);
+
+            PeirEnc_add_rsp_i32(&mut self.enc, call_space);
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        Inst::CallPtr(fn_ptr, args, _, _, _) => {
+            var fpoff: i64 = PeStackFrame_offset(frame, fn_ptr);
+            // Load env struct pointer
+            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, fpoff);
+            // Load fn addr from field 0
+            PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+
+            var total_args: i64 = args.len() + 1;
+            var arg_regs: Vec<i64> = Vec::new();
+            arg_regs.push(PEIR_RCX);
+            arg_regs.push(PEIR_RDX);
+            arg_regs.push(PEIR_R8);
+            arg_regs.push(PEIR_R9);
+            var stack_args: i64 = 0;
+            if total_args > 4 { stack_args = total_args - 4; }
+            var call_space: i64 = (32 + stack_args * 8 + 15) & ~15;
+
+            PeirEnc_sub_rsp_i32(&mut self.enc, call_space);
+            // First arg (rcx) = env_ptr
+            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, fpoff);
+
+            var i: i64 = 0;
+            while i < args.len() {
+                var aoff: i64 = PeStackFrame_offset(frame, args.get(i));
+                var arg_idx: i64 = i + 1;
+                if arg_idx < 4 {
+                    PeirEnc_mov_reg_mem_rbp(&mut self.enc, arg_regs.get(arg_idx), aoff);
+                } else {
+                    var stack_pos: i64 = 32 + (arg_idx - 4) * 8;
+                    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_R10, aoff);
+                    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, stack_pos, PEIR_R10);
+                }
+                i = i + 1;
+            }
+
+            // Save fn addr, call indirectly
+            PeirEnc_mov_rr(&mut self.enc, PEIR_R10, PEIR_RAX);
+            PeirEnc_call_reg(&mut self.enc, PEIR_R10);
+            PeirEnc_add_rsp_i32(&mut self.enc, call_space);
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        // --- Conversions ---
+        Inst::IntExtend(value, from, _) => {
+            var voff: i64 = PeStackFrame_offset(frame, value);
+            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, voff);
+            match from {
+                IrType::I8 => { PeirEnc_movsx_r64_r8(&mut self.enc, PEIR_RAX, PEIR_RAX); }
+                IrType::I16 => { PeirEnc_movsx_r64_r16(&mut self.enc, PEIR_RAX, PEIR_RAX); }
+                IrType::I32 => { PeirEnc_movsxd_rr(&mut self.enc, PEIR_RAX, PEIR_RAX); }
+                _ => {}
+            }
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        Inst::IntTrunc(value, _, to) => {
+            var voff: i64 = PeStackFrame_offset(frame, value);
+            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, voff);
+            match to {
+                IrType::I8 => { PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX); }
+                IrType::U8 => { PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX); }
+                IrType::I16 => { PeirEnc_movzx_r32_r16(&mut self.enc, PEIR_RAX, PEIR_RAX); }
+                IrType::U16 => { PeirEnc_movzx_r32_r16(&mut self.enc, PEIR_RAX, PEIR_RAX); }
+                IrType::I32 => {
+                    // mov eax, eax (zero-extends upper 32 bits)
+                    PeirEnc_rex(&mut self.enc, false, false, false, false);
+                    PeirEnc_emit_u8(&mut self.enc, 0x89);
+                    PeirEnc_modrm_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                }
+                IrType::U32 => {
+                    // mov eax, eax (zero-extends upper 32 bits)
+                    PeirEnc_rex(&mut self.enc, false, false, false, false);
+                    PeirEnc_emit_u8(&mut self.enc, 0x89);
+                    PeirEnc_modrm_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                }
+                _ => {}
+            }
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        Inst::IntToFloat(value, _, to) => {
+            var voff: i64 = PeStackFrame_offset(frame, value);
+            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, voff);
+            PeirEnc_cvtsi2sd_r64(&mut self.enc, 0, PEIR_RAX);
+            if ir_type_eq(to, IrType::F32) {
+                PeirEnc_movss_mem_rbp_xmm(&mut self.enc, dst, 0);
+            } else {
+                PeirEnc_movsd_mem_rbp_xmm(&mut self.enc, dst, 0);
+            }
+        }
+
+        Inst::FloatToInt(value, from, _) => {
+            var voff: i64 = PeStackFrame_offset(frame, value);
+            if ir_type_eq(from, IrType::F32) {
+                PeirEnc_movss_xmm_mem_rbp(&mut self.enc, 0, voff);
+            } else {
+                PeirEnc_movsd_xmm_mem_rbp(&mut self.enc, 0, voff);
+            }
+            PeirEnc_cvttsd2si_r64(&mut self.enc, PEIR_RAX, 0);
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        Inst::MakeDyn(value, type_name, _) => {
+            // A dyn value: 16 bytes {type id, receiver}.
+            var tid: i64 = PeirGen_dyn_type_id(self, type_name);
+            var voff: i64 = PeStackFrame_offset(frame, value);
+            PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, 16);
+            PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+            PeirGen_call_runtime(self, "p_malloc");
+            PeirEnc_add_rsp_i32(&mut self.enc, 32);
+            PeirEnc_mov_imm64(&mut self.enc, PEIR_R10, tid);
+            PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RAX, 0, PEIR_R10);
+            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_R10, voff);
+            PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RAX, 8, PEIR_R10);
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        Inst::DynCall(_, method, args, _, _) => {
+            // Candidates: every type made into a dyn value or named by a
+            // trait impl that has `Type_method`.
+            var types: Vec<str> = Vec::new();
+            var ti: i64 = 0;
+            while ti < module.trait_impls.len() {
+                var items: Vec<str> = module.trait_impls.get(ti).items;
+                var ii: i64 = 0;
+                while ii < items.len() {
+                    types = pe_ir_strs_insert_sorted(types, items.get(ii));
+                    ii = ii + 1;
+                }
+                ti = ti + 1;
+            }
+            var fi2: i64 = 0;
+            while fi2 < module.functions.len() {
+                var f2: IrFunction = module.functions.get(fi2).func;
+                var ii2: i64 = 0;
+                while ii2 < f2.insts.len() {
+                    match f2.insts.get(ii2).inst {
+                        Inst::MakeDyn(_, type_name, _) => {
+                            types = pe_ir_strs_insert_sorted(types, type_name);
+                        }
+                        _ => {}
+                    }
+                    ii2 = ii2 + 1;
+                }
+                fi2 = fi2 + 1;
+            }
+            var candidates: Vec<PeDynCandidate> = Vec::new();
+            var tj: i64 = 0;
+            while tj < types.len() {
+                var tname: str = types.get(tj);
+                var mname: str = tname + "_" + method;
+                if HashMap_contains(self.func_labels, mname) {
+                    var flabel: i64 = HashMap_get(self.func_labels, mname);
+                    var tid: i64 = PeirGen_dyn_type_id(self, tname);
+                    candidates.push(PeDynCandidate { tid: tid, label: flabel });
+                }
+                tj = tj + 1;
+            }
+            // Arguments: env (0), receiver, then args[1..].
+            var total_args: i64 = args.len() + 1;
+            var stack_args: i64 = 0;
+            if total_args > 4 { stack_args = total_args - 4; }
+            var call_space: i64 = (32 + stack_args * 8 + 15) & ~15;
+            var arg_regs: Vec<i64> = Vec::new();
+            arg_regs.push(PEIR_RCX);
+            arg_regs.push(PEIR_RDX);
+            arg_regs.push(PEIR_R8);
+            arg_regs.push(PEIR_R9);
+            PeirEnc_sub_rsp_i32(&mut self.enc, call_space);
+            var i: i64 = 1;
+            while i < args.len() {
+                var arg_idx: i64 = i + 1;
+                if arg_idx >= 4 {
+                    var aoff: i64 = PeStackFrame_offset(frame, args.get(i));
+                    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, aoff);
+                    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 32 + (arg_idx - 4) * 8, PEIR_RAX);
+                }
+                i = i + 1;
+            }
+            i = 1;
+            while i < args.len() {
+                var arg_idx2: i64 = i + 1;
+                if arg_idx2 < 4 {
+                    var aoff2: i64 = PeStackFrame_offset(frame, args.get(i));
+                    PeirEnc_mov_reg_mem_rbp(&mut self.enc, arg_regs.get(arg_idx2), aoff2);
+                }
+                i = i + 1;
+            }
+            if args.len() > 0 {
+                var ooff: i64 = PeStackFrame_offset(frame, args.get(0));
+                PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_R10, ooff);
+                PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R11, PEIR_R10, 0); // type id
+                PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RDX, PEIR_R10, 8); // receiver
+            }
+            PeirEnc_xor_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
+            var done: i64 = PeirEnc_alloc_label(&mut self.enc);
+            var ci: i64 = 0;
+            while ci < candidates.len() {
+                var cand: PeDynCandidate = candidates.get(ci);
+                var next: i64 = PeirEnc_alloc_label(&mut self.enc);
+                PeirEnc_mov_imm64(&mut self.enc, PEIR_R10, cand.tid);
+                PeirEnc_cmp_rr(&mut self.enc, PEIR_R11, PEIR_R10);
+                PeirEnc_jcc_label(&mut self.enc, 0x5, next); // jne
+                PeirEnc_call_label(&mut self.enc, cand.label);
+                PeirEnc_jmp_label(&mut self.enc, done);
+                PeirEnc_place_label(&mut self.enc, next);
+                ci = ci + 1;
+            }
+            PeirEnc_ud2(&mut self.enc); // no implementation for this type
+            PeirEnc_place_label(&mut self.enc, done);
+            PeirEnc_add_rsp_i32(&mut self.enc, call_space);
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        Inst::BitCast(value, _, _) => {
+            var voff: i64 = PeStackFrame_offset(frame, value);
+            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, voff);
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        // --- Fides-Specific ---
+        Inst::Print(value, ty) => {
+            var voff: i64 = PeStackFrame_offset(frame, value);
+            PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+            var formatter: str = pe_ir_print_formatter(ty);
+            if formatter != "" {
+                // Collections print through their Fides formatter (as in
+                // the C backend): formatter(env = 0, value) -> str.
+                PeirEnc_xor_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
+                PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RDX, voff);
+                PeirGen_call_runtime(self, formatter);
+                PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+                PeirGen_call_runtime(self, "p_print_str");
+            } else {
+                PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, voff);
+                // Route to the correct print function based on type
+                var print_fn: str = "p_print_int";
+                match ty {
+                    IrType::Ptr(_) => { print_fn = "p_print_str"; }
+                    IrType::Opaque(n) => {
+                        if n == "String" { print_fn = "p_print_str"; }
+                    }
+                    IrType::F64 => { print_fn = "p_print_float"; }
+                    IrType::F32 => { print_fn = "p_print_float"; }
+                    IrType::Bool => { print_fn = "p_print_bool"; }
+                    _ => { print_fn = "p_print_int"; }
+                }
+                PeirGen_call_builtin(self, print_fn, 1);
+            }
+            PeirEnc_add_rsp_i32(&mut self.enc, 32);
+        }
+
+        Inst::PersistLoad(_, default, _) => {
+            // Persistent load — just copy default value to destination
+            var doff: i64 = PeStackFrame_offset(frame, default);
+            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, doff);
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        Inst::PersistSave(_, _) => {
+            // No-op in PE emitter
+        }
+
+        Inst::TxnBegin => {
+            // No-op in PE emitter (rollback/unsafe not supported)
+        }
+        Inst::TxnEnd => {
+            // No-op in PE emitter (rollback/unsafe not supported)
+        }
+        Inst::UnsafeBegin => {
+            // No-op in PE emitter (rollback/unsafe not supported)
+        }
+        Inst::UnsafeEnd => {
+            // No-op in PE emitter (rollback/unsafe not supported)
+        }
+
+        Inst::GradBegin(_) => {
+            PeirGen_gen_autograd(self, inst, 0);
+        }
+        Inst::GradEnd => {
+            PeirGen_gen_autograd(self, inst, 0);
+        }
+        Inst::Backward(_) => {
+            PeirGen_gen_autograd(self, inst, 1);
+        }
+
+        Inst::Panic(message) => {
+            var off: i64 = PeirGen_str_off(self, message);
+            PeirEnc_lea_rip(&mut self.enc, PEIR_RCX, off);
+            PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+            if HashMap_contains(self.func_labels, "p_panic") {
+                var plabel: i64 = HashMap_get(self.func_labels, "p_panic");
+                PeirEnc_call_label(&mut self.enc, plabel);
+            }
+            PeirEnc_add_rsp_i32(&mut self.enc, 32);
+        }
+
+        Inst::TryUnwrap(_, _, _, _) => {
+            // Not fully implemented
+            PeirEnc_nop(&mut self.enc);
+        }
+
+        Inst::Asm(_, _, _, _) => {
+            // Inline assembly not yet supported in PE backend
+            PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        }
+
+        Inst::RegionBegin(_, _, _, _) => {
+            // Region begin — no-op in PE backend (stack-based allocation)
+            PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
+        }
+
+        Inst::RegionEnd(_, _, _) => {
+            // Region end — no-op in PE backend
+        }
+    }
+}
+
+// ===========================================================================
+// PeirGen::gen_int_binop / gen_float_binop (src/pe.rs)
+// ===========================================================================
+
+/// Generate integer binary operation.
+pub fn PeirGen_gen_int_binop(self: &mut PeirGen, op: BinOp, loff: i64, roff: i64, dst: i64) -> void {
+    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, loff);
+    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, roff);
+
+    match op {
+        BinOp::Add => { PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_RCX); }
+        BinOp::Sub => { PeirEnc_sub_rr(&mut self.enc, PEIR_RAX, PEIR_RCX); }
+        BinOp::Mul => { PeirEnc_imul_rr(&mut self.enc, PEIR_RAX, PEIR_RCX); }
+        BinOp::Div => {
+            PeirEnc_cqo(&mut self.enc);
+            PeirEnc_idiv_r(&mut self.enc, PEIR_RCX);
+        }
+        BinOp::Mod => {
+            PeirEnc_cqo(&mut self.enc);
+            PeirEnc_idiv_r(&mut self.enc, PEIR_RCX);
+            PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
+        }
+        BinOp::BitAnd => { PeirEnc_and_rr(&mut self.enc, PEIR_RAX, PEIR_RCX); }
+        BinOp::BitOr => { PeirEnc_or_rr(&mut self.enc, PEIR_RAX, PEIR_RCX); }
+        BinOp::BitXor => { PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RCX); }
+        BinOp::Shl => { PeirEnc_shl_cl(&mut self.enc, PEIR_RAX); }
+        BinOp::Shr => { PeirEnc_sar_cl(&mut self.enc, PEIR_RAX); }
+        BinOp::Eq => {
+            PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+            PeirEnc_setcc_r(&mut self.enc, 0x4, PEIR_RAX); // sete
+            PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        }
+        BinOp::Neq => {
+            PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+            PeirEnc_setcc_r(&mut self.enc, 0x5, PEIR_RAX); // setne
+            PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        }
+        BinOp::Lt => {
+            PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+            PeirEnc_setcc_r(&mut self.enc, 0xC, PEIR_RAX); // setl
+            PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        }
+        BinOp::Gt => {
+            PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+            PeirEnc_setcc_r(&mut self.enc, 0xF, PEIR_RAX); // setg
+            PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        }
+        BinOp::LtEq => {
+            PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+            PeirEnc_setcc_r(&mut self.enc, 0xE, PEIR_RAX); // setle
+            PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        }
+        BinOp::GtEq => {
+            PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+            PeirEnc_setcc_r(&mut self.enc, 0xD, PEIR_RAX); // setge
+            PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        }
+        BinOp::And => {
+            PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+            PeirEnc_setcc_r(&mut self.enc, 0x5, PEIR_RAX); // setne
+            PeirEnc_test_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
+            PeirEnc_setcc_r(&mut self.enc, 0x5, PEIR_RCX); // setne
+            PeirEnc_and_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+            PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        }
+        BinOp::Or => {
+            PeirEnc_or_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+            PeirEnc_setcc_r(&mut self.enc, 0x5, PEIR_RAX); // setne
+            PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        }
+    }
+
+    PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+}
+
+/// Generate float binary operation.
+pub fn PeirGen_gen_float_binop(self: &mut PeirGen, op: BinOp, loff: i64, roff: i64, dst: i64, ty: IrType) -> void {
+    var is_f32: bool = ir_type_eq(ty, IrType::F32);
+    if is_f32 {
+        PeirEnc_movss_xmm_mem_rbp(&mut self.enc, 0, loff);
+        PeirEnc_movss_xmm_mem_rbp(&mut self.enc, 1, roff);
+    } else {
+        PeirEnc_movsd_xmm_mem_rbp(&mut self.enc, 0, loff);
+        PeirEnc_movsd_xmm_mem_rbp(&mut self.enc, 1, roff);
+    }
+    if pe_binop_is_arith(op) {
+        match op {
+            BinOp::Add => {
+                if is_f32 { PeirEnc_addss(&mut self.enc, 0, 1); }
+                else { PeirEnc_addsd(&mut self.enc, 0, 1); }
+            }
+            BinOp::Sub => {
+                if is_f32 { PeirEnc_subss(&mut self.enc, 0, 1); }
+                else { PeirEnc_subsd(&mut self.enc, 0, 1); }
+            }
+            BinOp::Mul => {
+                if is_f32 { PeirEnc_mulss(&mut self.enc, 0, 1); }
+                else { PeirEnc_mulsd(&mut self.enc, 0, 1); }
+            }
+            _ => {
+                if is_f32 { PeirEnc_divss(&mut self.enc, 0, 1); }
+                else { PeirEnc_divsd(&mut self.enc, 0, 1); }
+            }
+        }
+        if is_f32 {
+            PeirEnc_movss_mem_rbp_xmm(&mut self.enc, dst, 0);
+        } else {
+            PeirEnc_movsd_mem_rbp_xmm(&mut self.enc, dst, 0);
+        }
+    } else if pe_binop_is_cmp(op) {
+        // IEEE: every comparison with NaN is false, except !=. An
+        // unordered ucomis sets ZF, PF and CF, so: a < b is b > a
+        // (seta: CF = ZF = 0), a <= b is b >= a (setae: CF = 0), and
+        // == / != also look at PF.
+        var a: i64 = 0;
+        var b: i64 = 1;
+        match op {
+            BinOp::Lt => { a = 1; b = 0; }
+            BinOp::LtEq => { a = 1; b = 0; }
+            _ => { a = 0; b = 1; }
+        }
+        if is_f32 {
+            PeirEnc_ucomiss(&mut self.enc, a, b);
+        } else {
+            PeirEnc_ucomisd(&mut self.enc, a, b);
+        }
+        match op {
+            BinOp::Eq => {
+                PeirEnc_setcc_r(&mut self.enc, 0x4, PEIR_RAX); // sete al
+                PeirEnc_setcc_r(&mut self.enc, 0xB, PEIR_RCX); // setnp cl
+                peir_emit2(&mut self.enc, 0x20, 0xC8);           // and al, cl
+            }
+            BinOp::Neq => {
+                PeirEnc_setcc_r(&mut self.enc, 0x5, PEIR_RAX); // setne al
+                PeirEnc_setcc_r(&mut self.enc, 0xA, PEIR_RCX); // setp cl
+                peir_emit2(&mut self.enc, 0x08, 0xC8);           // or al, cl
+            }
+            BinOp::Lt => {
+                PeirEnc_setcc_r(&mut self.enc, 0x7, PEIR_RAX); // seta
+            }
+            BinOp::Gt => {
+                PeirEnc_setcc_r(&mut self.enc, 0x7, PEIR_RAX); // seta
+            }
+            _ => {
+                PeirEnc_setcc_r(&mut self.enc, 0x3, PEIR_RAX); // setae
+            }
+        }
+        PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+    }
+}
+
+// ===========================================================================
+// pe_ir_generate_pe (src/pe.rs) — public entry point
+// ===========================================================================
+
+/// Public entry point: generate a PE file from an IR module. Fails when the
+/// program calls runtime functions this native backend does not provide.
+pub fn pe_ir_generate_pe(module: IrModule) -> ResultBytes {
+    // The entry point calls main (it used to panic when there was none).
+    if !pe_module_has_fn(&module, "main") {
+        return ResultBytes::Err(c_vec1("PE backend: the program has no `main` function"));
+    }
+    var gen: PeirGen = PeirGen_new();
+    var bytes: Vec = PeirGen_generate(&mut gen, &module);
+    var reachable: Vec<str> = pe_ir_reachable_functions(&module);
+    var names: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < gen.unresolved.len() {
+        var u: UnresolvedCall = gen.unresolved.get(i);
+        var j: i64 = 0;
+        var hit: bool = false;
+        while j < u.callers.len() {
+            if pe_ir_strs_contains(reachable, u.callers.get(j)) { hit = true; }
+            j = j + 1;
+        }
+        if hit { names.push(u.name); }
+        i = i + 1;
+    }
+    if names.len() > 0 {
+        var msg: str = "PE backend: not available in native Windows executables: "
+            + str_join(names, ", ") + " (build with `fidesc ccompile` instead)";
+        return ResultBytes::Err(c_vec1(msg));
+    }
+    return ResultBytes::Ok(bytes);
+}

@@ -6379,7 +6379,19 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Int(0))
             }
 
-            _ => ExecOutcome::Panic(format!("Unknown runtime function: {}", name)),
+            _ => {
+                if self.module.extern_functions.contains_key(name) {
+                    let c_name = self.module.extern_decls.iter()
+                        .find(|d| d.pledge_name == name)
+                        .map(|d| d.c_name.as_str())
+                        .unwrap_or(name);
+                    ExecOutcome::Panic(format!(
+                        "FFI function '{}' (extern \"C\" {}) is not available in the interpreter — this program requires native FFI; build it with `fid ccompile` instead of `fid run`",
+                        name, c_name))
+                } else {
+                    ExecOutcome::Panic(format!("Unknown runtime function: {}", name))
+                }
+            }
         }
     }
 }

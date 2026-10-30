@@ -1282,6 +1282,11 @@ fn real_main() {
                         println!("C translation unchanged; {} is up to date", output);
                         return;
                     }
+                    let changed = build_cache.changed_inputs();
+                    if !changed.is_empty() {
+                        println!("Changed: {}", changed.join(", "));
+                    }
+                    let canon = fidesc::inc::canon_hash(&c_code);
 
                     // C optimization level: --cc-opt, else FIDES_CC_OPT, else -O2.
                     // gcc and clang need tens of minutes for a very large
@@ -1341,6 +1346,27 @@ fn real_main() {
                     };
 
                     let is_cl = cc.ends_with("cl.exe") || cc == "cl";
+                    // Phase A artifact store: a byte-identical canonical build
+                    // (same program modulo renames/dead code/formatting, same
+                    // toolchain+flags) reuses the cached binary — no C compile.
+                    let store = fidesc::inc::ArtifactStore::open(&output,
+                        args.iter().any(|a| a == "--no-cache"));
+                    let art_key = store.as_ref().map(|_| fidesc::inc::ArtifactStore::key(
+                        canon, &cc, &format!("{} {:?}", cc_opt, target)));
+                    if let (Some(s), Some(k)) = (&store, &art_key) {
+                        if let Some(bytes) = s.get(k) {
+                            if fs::write(&output, &bytes).is_ok() {
+                                build_cache.commit_canon(Some(c_hash), Some(canon));
+                                println!("Reused cached artifact: {}", output);
+                                return;
+                            }
+                        }
+                    }
+                    // CC may carry arguments (e.g. CC="zig cc"): first word is
+                    // the program, the rest lead every invocation.
+                    let mut cc_parts = cc.split_whitespace();
+                    let cc_prog = cc_parts.next().unwrap_or(&cc);
+                    let cc_args: Vec<&str> = cc_parts.collect();
                     let status = if is_cl {
                         // cl.exe needs MSVC environment (INCLUDE, LIB, etc.)
                         // Use vcvarsall.bat to set it up, then run cl.exe
@@ -1355,7 +1381,8 @@ fn real_main() {
                                 .output()
                         } else {
                             // No vcvarsall — try direct
-                            process::Command::new(&cc)
+                            process::Command::new(cc_prog)
+                                .args(&cc_args)
                                 .args([cl_opt, "/nologo", &format!("/Fe:{}", output), &c_path])
                                 .output()
                         }
@@ -1408,7 +1435,8 @@ fn real_main() {
                             || process::Command::new(&cc).arg("-v").output()
                                 .map(|o| String::from_utf8_lossy(&o.stderr).contains("tcc"))
                                 .unwrap_or(false);
-                        let mut cmd = process::Command::new(&cc);
+                        let mut cmd = process::Command::new(cc_prog);
+                        cmd.args(&cc_args);
                         if is_tcc {
                             // TCC: minimal flags — it doesn't support -fstack-protector,
                             // -fPIE, -pie, -Wl,-z,relro, etc.
@@ -1459,7 +1487,12 @@ fn real_main() {
                                 eprintln!("{}", String::from_utf8_lossy(&out.stderr));
                                 process::exit(1);
                             }
-                            build_cache.commit(Some(c_hash));
+                            if let (Some(s), Some(k)) = (&store, &art_key) {
+                                if let Ok(bytes) = fs::read(&output) {
+                                    s.store(k, &bytes);
+                                }
+                            }
+                            build_cache.commit_canon(Some(c_hash), Some(canon));
                             println!("Built native executable: {}", output);
                         }
                         Err(e) => {
@@ -1684,6 +1717,9 @@ fn real_main() {
                 "test_escape_scope_fail",
                 "test_escape_store_fail",
                 "test_escape_closure_fail",
+                // @constant_time: data-dependent branch on secret — rejected
+                // by the source-level checker (not just the asm verifier)
+                "test_ct_asm_fail",
                 // @secret information flow
                 "test_secret_output_fail",
                 "test_secret_helper_fail",

@@ -21,6 +21,7 @@ use compiler::opt;
 use compiler::compiler;
 use compiler::inc;
 use compiler::pe;
+use compiler::pe_ir;
 use compiler::fmt;
 use compiler::lower;
 use compiler::scribe;
@@ -743,6 +744,9 @@ fn cmd_test(n: i64, start: i64) -> i64 {
     expected_fail.push("test_dp_fail");
     expected_fail.push("test_shard_fail");
     expected_fail.push("test_vec_shape_fail");
+    // @constant_time: data-dependent branch on secret — rejected by the
+    // source-level checker (not just the asm verifier)
+    expected_fail.push("test_ct_asm_fail");
 
     // Skip list -- tests that fail on C codegen due to missing builtins
     // or legitimate design differences. These pass on interpreter + PE.
@@ -2172,6 +2176,13 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         }
     }
 
+    // Windows default: emit a PE .exe directly via the pe_ir backend
+    // (native, no C compiler). The pe_runtime sources must be merged into
+    // the program, so the flag is set before build_program below.
+    var windows_pe: bool = !is_linux() && !bare_mode && !boot_mode && !use_native
+        && target != "arm64" && target != "aarch64" && target != "riscv64";
+    if windows_pe { set_pe_runtime_merge(true); }
+
     var result: ResultProgram = build_program_with_path_borrowck(source, OptStr::Some(input), g_borrowck);
     match result {
         ResultProgram::Err(errs) => {
@@ -2187,6 +2198,31 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         ResultProgram::Ok(program) => {
             p_eprint_str("[build] Lowering to IR...\n");
             var ir_mod: IrModule = lower(program);
+
+            // Windows default: direct IR -> PE machine code (pe_ir backend)
+            if windows_pe {
+                p_eprint_str("[build] Emitting PE via pe_ir backend...\n");
+                var pe_res: ResultBytes = pe_ir_generate_pe(ir_mod);
+                match pe_res {
+                    ResultBytes::Err(perrs) => {
+                        print("PE generation errors:\n");
+                        var pei: i64 = 0;
+                        while pei < perrs.len() {
+                            print(perrs.get(pei));
+                            print("\n");
+                            pei = pei + 1;
+                        }
+                        return 1;
+                    }
+                    ResultBytes::Ok(pe_bytes) => {
+                        p_file_write_vec(output, pe_bytes);
+                        print("Built native executable: ");
+                        print(output);
+                        print("\n");
+                        return 0;
+                    }
+                }
+            }
 
             // Try native backend if --native flag is set
             if use_native {
@@ -2245,23 +2281,11 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 return 0;
             }
 
-            // Windows: C codegen + TCC
-            p_eprint_str("[build] Using C codegen (TCC)...\n");
-            var cgen: CCodeGen = CCodeGen_new();
-            var c_source: str = CCodeGen_generate(&mut cgen, ir_mod);
-            var c_file: str = output + ".c";
-            p_file_write(c_file, c_source);
-            var tcc_cmd: str = "C:\tcc\tcc.exe -o " + output + " " + c_file;
-            var tcc_ret: i64 = p_system(tcc_cmd);
-            if tcc_ret != 0 {
-                print("Error: TCC compilation failed\n");
-                return 1;
-            }
-            p_eprint_str("[build] Native executable built via C codegen.\n");
-            print("Built native executable: ");
-            print(output);
-            print("\n");
-            return 0;
+            // Windows reaches here only when --native failed above (the
+            // Windows default already emitted a PE via pe_ir and returned).
+            // No C-compiler fallback on this platform.
+            print("Error: native Windows build failed; no C-compiler fallback is configured\n");
+            return 1;
         }
     }
     return 1;
