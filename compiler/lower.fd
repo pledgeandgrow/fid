@@ -4489,6 +4489,62 @@ fn Lowerer_lower_field_access_expr(self: &mut Lowerer, obj: Box<Expr>, field: st
     return Lowerer_emit_inst(self, Inst::Load(field_ptr, field_ty));
 }
 
+// &obj.field — the field's address (GetFieldPtr), used by Expr::Ref so a
+// reference aliases the original storage instead of a copy in a dead stack
+// slot. Returns None when the struct/field can't be resolved (caller falls
+// back to the alloca path).
+fn Lowerer_try_field_addr(self: &mut Lowerer, obj: Box<Expr>, field: str) -> OptValueId {
+    var obj_expr: Expr = lw_box_expr_unbox(obj);
+    var obj_val: i64 = Lowerer_lower_expr(self, obj_expr);
+    var obj_ty: IrType = Lowerer_get_value_type(self, obj_val);
+
+    var struct_name: str = "";
+    match obj_ty {
+        IrType::Struct(n) => { struct_name = n; }
+        IrType::Ptr(inner) => {
+            match box_ir_type_unbox(inner) {
+                IrType::Struct(n2) => { struct_name = n2; }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    if str_len(struct_name) == 0 {
+        var inferred_ty: IrType = Lowerer_infer_expr_type(self, obj_expr);
+        match inferred_ty {
+            IrType::Struct(n) => { struct_name = n; }
+            IrType::Ptr(inner) => {
+                match box_ir_type_unbox(inner) {
+                    IrType::Struct(n2) => { struct_name = n2; }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    if str_len(struct_name) == 0 { return OptValueId::None; }
+
+    var field_idx: i64 = -1;
+    var field_ty: IrType = IrType::I64;
+    match IrModule_get_struct(&self.module, struct_name) {
+        OptStructLayout::Some(layout) => {
+            var fi: i64 = 0;
+            while fi < layout.fields.len() {
+                if layout.fields.get(fi).name == field {
+                    field_idx = fi;
+                    field_ty = layout.fields.get(fi).ty;
+                }
+                fi = fi + 1;
+            }
+        }
+        OptStructLayout::None => {}
+    }
+    if field_idx < 0 { return OptValueId::None; }
+
+    var field_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(obj_val, field_idx, field_ty));
+    return OptValueId::Some(field_ptr);
+}
+
 // The enum named by an IR type (`Struct(E)` or `Ptr(Struct(E))`), or "".
 fn enum_name_of_ir_type(self: &Lowerer, t: IrType) -> str {
     var name: str = "";
@@ -5582,6 +5638,17 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                         }
                         OptValueId::None => {}
                     }
+                }
+                Expr::FieldAccess(obj, field) => {
+                    // &obj.field — the field's real address, not a copy.
+                    match Lowerer_try_field_addr(self, obj, field) {
+                        OptValueId::Some(fp) => { return fp; }
+                        OptValueId::None => {}
+                    }
+                }
+                Expr::Deref(inner) => {
+                    // &*p — the pointer itself.
+                    return Lowerer_lower_expr(self, lw_box_expr_unbox(inner));
                 }
                 _ => {}
             }

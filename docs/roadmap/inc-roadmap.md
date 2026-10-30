@@ -82,6 +82,29 @@ original plan are noted inline.
 Today L2 is whole-program because lowering + monomorphization + opt merge
 everything. Splitting is the real work; hashing just exploits it.
 
+**Status (in progress):** the *C-codegen-level* split is implemented and
+opt-in via `fidesc ccompile --inc` — front-end stays whole-program, then
+`generate_c_units` emits one TU per module (shared prelude/`core` + per-fn
+chunks by `func_modules` provenance), each compiled to a content-keyed `.o`
+in `.fidcache/` and linked. Verified: single-function edits rebuild one
+unit; imported-module edits rebuild only that module; 20/20 bootstrap tests
+match single-TU output. `FIDES_INC_FLAT=1` forces a single unit for
+bisecting. Open items: per-*module-IR* split (below) is still needed for
+front-end incrementality; `--inc` is experimental until the full suite
+passes.
+
+Bugs found by `--inc` so far (both fixed):
+- Unit compiles lacked `-fno-strict-aliasing`/`-fno-strict-overflow` — the
+  generated C type-puns via pointer casts; strict aliasing at -O miscompiled
+  `HashMap_find_slot`. Unit flags now match the single-TU path and are part
+  of the artifact key.
+- `Expr::Ref` on an lvalue (`&p.x`) lowered to *copying the referent into a
+  fresh alloca* — returning the pointer escaped dead stack memory (latent UB
+  that single-TU survived by frame-layout luck) and broke write-back
+  semantics. Now emits `GetFieldPtr` for `FieldAccess` and the pointer
+  itself for `Deref` (src/lower.rs + compiler/lower.fd parity). Same
+  alloca-escape hazard remains for `&rvalue` (`&(x+1)`) returns.
+
 - [ ] B1. Per-module IR boundary: `lower()` emits one `IrModule` per source
         module plus a link table (exports, extern decls, struct layouts).
 - [ ] B2. Cross-module type info: struct layouts and enum tags must be

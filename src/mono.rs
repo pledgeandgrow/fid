@@ -830,6 +830,7 @@ pub fn monomorphize(program: &Program) -> Program {
         systems: program.systems.clone(),
         state_machines: program.state_machines.clone(),
         event_handlers: program.event_handlers.clone(),
+        func_modules: program.func_modules.clone(),
     }
 }
 

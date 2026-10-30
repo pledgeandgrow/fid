@@ -1261,6 +1261,152 @@ fn real_main() {
                 return;
             }
 
+            // --inc: per-module translation units, each compiled to a
+            // cached object, then linked (Phase B).
+            if args.iter().any(|a| a == "--inc") {
+                match compiler::ccompile_source_units(&source, input, trace) {
+                    Ok(units) => {
+                        let stem = output.strip_suffix(".exe").unwrap_or(&output);
+                        let tu_dir = format!("{}.fides-tu", stem);
+                        if let Err(e) = fs::create_dir_all(&tu_dir) {
+                            eprintln!("Error creating '{}': {}", tu_dir, e);
+                            process::exit(1);
+                        }
+                        let cc_opt = args.iter().position(|a| a == "--cc-opt")
+                            .and_then(|i| args.get(i + 1))
+                            .cloned()
+                            .unwrap_or_else(|| "2".to_string());
+                        let cc = std::env::var("CC").unwrap_or_else(|_| {
+                            for c in &["gcc", "clang", "cc", "tcc"] {
+                                if process::Command::new(c).arg("--version").output().is_ok() {
+                                    return c.to_string();
+                                }
+                            }
+                            "gcc".to_string()
+                        });
+                        let mut cc_parts = cc.split_whitespace();
+                        let cc_prog = cc_parts.next().unwrap_or(&cc);
+                        let cc_args: Vec<&str> = cc_parts.collect();
+                        if cc_prog.ends_with("cl.exe") || cc_prog == "cl" {
+                            eprintln!("--inc is not supported with cl.exe yet; use gcc/clang/zig cc");
+                            process::exit(1);
+                        }
+                        // Same flag set as the single-TU path — the generated C
+                        // type-puns via pointer casts, so -fno-strict-aliasing
+                        // and -fno-strict-overflow are correctness, not hardening.
+                        let is_tcc = cc == "tcc" || cc.ends_with("tcc.exe")
+                            || process::Command::new(&cc).arg("-v").output()
+                                .map(|o| String::from_utf8_lossy(&o.stderr).contains("tcc"))
+                                .unwrap_or(false);
+                        let unit_flags: &[&str] = if is_tcc {
+                            &["-Wno-int-conversion"]
+                        } else {
+                            &["-Wno-int-conversion",
+                              "-Wno-incompatible-pointer-types",
+                              "-fstack-protector-strong",
+                              "-fPIE",
+                              "-fno-strict-overflow",
+                              "-fno-strict-aliasing"]
+                        };
+                        let store = fidesc::inc::ArtifactStore::open(&output,
+                            args.iter().any(|a| a == "--no-cache"));
+                        let mut objs: Vec<String> = Vec::new();
+                        let mut whole = String::new();
+                        let mut link_libs: Vec<String> = vec!["-lm".to_string()];
+                        let mut stale: Vec<String> = Vec::new();
+                        for (unit_name, code) in &units {
+                            whole.push_str(code);
+                            // PLINK extraction (same scan as the single-TU path)
+                            for line in code.lines() {
+                                if line.starts_with("// PLINK:") {
+                                    let lib = line.trim_start_matches("// PLINK:").trim();
+                                    if !lib.is_empty() {
+                                        link_libs.push(format!("-l{}", lib));
+                                    }
+                                }
+                            }
+                            let safe = unit_name.replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_");
+                            let c_path = format!("{}/{}.c", tu_dir, safe);
+                            let o_path = format!("{}/{}.o", tu_dir, safe);
+                            if let Err(e) = fs::write(&c_path, code) {
+                                eprintln!("Error writing '{}': {}", c_path, e);
+                                process::exit(1);
+                            }
+                            let canon = fidesc::inc::canon_hash(code);
+                            let key = store.as_ref().map(|_| fidesc::inc::ArtifactStore::key(
+                                canon, &cc, &format!("o {} {:?} {:?}", cc_opt, target, unit_flags)));
+                            let mut have_obj = false;
+                            if let (Some(s), Some(k)) = (&store, &key) {
+                                if let Some(bytes) = s.get(k) {
+                                    if fs::write(&o_path, &bytes).is_ok() { have_obj = true; }
+                                }
+                            }
+                            if !have_obj {
+                                stale.push(unit_name.clone());
+                                let st = process::Command::new(cc_prog)
+                                    .args(&cc_args)
+                                    .arg(format!("-O{}", cc_opt))
+                                    .args(unit_flags)
+                                    .arg("-c").arg("-o").arg(&o_path).arg(&c_path)
+                                    .output();
+                                match st {
+                                    Ok(o) if o.status.success() => {
+                                        if let (Some(s), Some(k)) = (&store, &key) {
+                                            if let Ok(b) = fs::read(&o_path) { s.store(k, &b); }
+                                        }
+                                    }
+                                    Ok(o) => {
+                                        eprintln!("{} -c {} failed:", cc, c_path);
+                                        eprintln!("{}", String::from_utf8_lossy(&o.stderr));
+                                        process::exit(1);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to run {}: {}", cc, e);
+                                        process::exit(1);
+                                    }
+                                }
+                            }
+                            objs.push(o_path);
+                        }
+                        if stale.is_empty() {
+                            println!("All {} units up to date; linking", units.len());
+                        } else {
+                            println!("Compiling {} of {} units: {}", stale.len(), units.len(), stale.join(", "));
+                        }
+                        let mut cmd = process::Command::new(cc_prog);
+                        cmd.args(&cc_args).arg(format!("-O{}", cc_opt)).args(unit_flags).arg("-o").arg(&output);
+                        if !is_tcc {
+                            cmd.arg("-pie")
+                                .arg("-Wl,-z,relro")
+                                .arg("-Wl,-z,now")
+                                .arg("-Wl,-z,noexecstack");
+                        }
+                        for o in &objs { cmd.arg(o); }
+                        for lib in &link_libs { cmd.arg(lib); }
+                        match cmd.output() {
+                            Ok(o) if o.status.success() => {
+                                build_cache.commit_canon(Some(fidesc::inc::hash_source(&whole)), None);
+                                println!("Built native executable: {}", output);
+                            }
+                            Ok(o) => {
+                                eprintln!("link failed:");
+                                eprintln!("{}", String::from_utf8_lossy(&o.stderr));
+                                process::exit(1);
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to run {}: {}", cc, e);
+                                process::exit(1);
+                            }
+                        }
+                        return;
+                    }
+                    Err(errors) => {
+                        print_errors(&errors);
+                        process::exit(1);
+                    }
+                }
+            }
+
             match compiler::ccompile_source_traced(&source, input, trace) {
                 Ok(c_code) => {
                     let c_hash = fidesc::inc::hash_source(&c_code);

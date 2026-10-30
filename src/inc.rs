@@ -390,7 +390,7 @@ enum CTok {
     Lit(String),
 }
 
-fn lex_c(src: &str) -> Vec<CTok> {
+fn lex_c(src: &str) -> Vec<(CTok, usize, usize)> {
     let b = src.as_bytes();
     let mut toks = Vec::new();
     let mut i = 0;
@@ -421,14 +421,14 @@ fn lex_c(src: &str) -> Vec<CTok> {
                 while i < b.len() && b[i] != b'\n' { i += 1; }
             }
             let line = std::str::from_utf8(&b[start..i]).unwrap_or("").trim().to_string();
-            toks.push(CTok::Lit(line));
+            toks.push((CTok::Lit(line), start, i));
             continue;
         }
         at_line_start = false;
         if c.is_ascii_alphabetic() || c == b'_' {
             let start = i;
             while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') { i += 1; }
-            toks.push(CTok::Ident(String::from_utf8_lossy(&b[start..i]).to_string()));
+            toks.push((CTok::Ident(String::from_utf8_lossy(&b[start..i]).to_string()), start, i));
             continue;
         }
         if c == b'"' || c == b'\'' {
@@ -440,35 +440,31 @@ fn lex_c(src: &str) -> Vec<CTok> {
                 i += 1;
             }
             i = (i + 1).min(b.len());
-            toks.push(CTok::Lit(String::from_utf8_lossy(&b[start..i]).to_string()));
+            toks.push((CTok::Lit(String::from_utf8_lossy(&b[start..i]).to_string()), start, i));
             continue;
         }
         if c.is_ascii_digit() {
             let start = i;
             while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'.' || b[i] == b'_') { i += 1; }
-            toks.push(CTok::Lit(String::from_utf8_lossy(&b[start..i]).to_string()));
+            toks.push((CTok::Lit(String::from_utf8_lossy(&b[start..i]).to_string()), start, i));
             continue;
         }
-        toks.push(CTok::Lit((c as char).to_string()));
+        toks.push((CTok::Lit((c as char).to_string()), i, i + 1));
         i += 1;
     }
     toks
 }
 
-/// Canonicalize generated C: strip comments/whitespace, alpha-rename all
-/// non-keyword identifiers positionally, drop unreferenced top-level
-/// function definitions. Deterministic across renames and dead-code edits.
-pub fn canonicalize_c(src: &str) -> String {
-    let toks = lex_c(src);
-
-    // Find top-level function definitions: Ident followed by (…){…} at
-    // brace depth 0. Token indices of each def's name and [start,end) span.
-    let mut defs: Vec<(String, usize, usize, usize)> = Vec::new(); // (name, name_idx, start, end)
+/// Top-level function definitions in tokenized C: (name, name_tok_idx,
+/// def_start_tok_idx, one_past_end_tok_idx). A def is `… name ( … ) { … }`
+/// at brace depth 0.
+fn find_c_defs(toks: &[(CTok, usize, usize)]) -> Vec<(String, usize, usize, usize)> {
+    let mut defs = Vec::new();
     let mut depth: i64 = 0;
     let mut stmt_start = 0usize;
     let mut j = 0usize;
     while j < toks.len() {
-        if let CTok::Lit(l) = &toks[j] {
+        if let CTok::Lit(l) = &toks[j].0 {
             if l == "{" { depth += 1; }
             else if l == "}" {
                 depth -= 1;
@@ -476,25 +472,23 @@ pub fn canonicalize_c(src: &str) -> String {
             } else if l == ";" && depth == 0 { stmt_start = j + 1; }
         }
         if depth == 0 {
-            if let CTok::Ident(name) = &toks[j] {
-                // is next token '(' with its match followed by '{'?
-                if let Some(CTok::Lit(l)) = toks.get(j + 1) {
+            if let CTok::Ident(name) = &toks[j].0 {
+                if let Some((CTok::Lit(l), _, _)) = toks.get(j + 1) {
                     if l == "(" {
                         let mut d = 0i64;
                         let mut k = j + 1;
                         while k < toks.len() {
-                            if let CTok::Lit(l2) = &toks[k] {
+                            if let CTok::Lit(l2) = &toks[k].0 {
                                 if l2 == "(" { d += 1; } else if l2 == ")" { d -= 1; }
                                 if d == 0 { break; }
                             }
                             k += 1;
                         }
-                        if matches!(toks.get(k + 1), Some(CTok::Lit(l3)) if l3 == "{") {
-                            // find matching close brace
+                        if matches!(toks.get(k + 1), Some((CTok::Lit(l3), _, _)) if l3 == "{") {
                             let mut d2 = 0i64;
                             let mut m = k + 1;
                             while m < toks.len() {
-                                if let CTok::Lit(l4) = &toks[m] {
+                                if let CTok::Lit(l4) = &toks[m].0 {
                                     if l4 == "{" { d2 += 1; } else if l4 == "}" { d2 -= 1; }
                                     if d2 == 0 { break; }
                                 }
@@ -511,6 +505,38 @@ pub fn canonicalize_c(src: &str) -> String {
         }
         j += 1;
     }
+    defs
+}
+
+/// Byte spans of top-level function definitions in a C translation unit:
+/// (name, def_start_byte, open_brace_byte, one_past_end_byte). Used by
+/// per-module TU splitting to move shared-prelude definitions into the
+/// owner unit.
+pub fn c_fn_defs(src: &str) -> Vec<(String, usize, usize, usize)> {
+    let toks = lex_c(src);
+    find_c_defs(&toks).into_iter().map(|(name, name_idx, s, e)| {
+        let start_b = toks[s].1;
+        // the `{` is the token right after the name's param list; find it
+        // by scanning from name_idx for the first "{" literal
+        let mut brace_b = toks[e - 1].1;
+        for t in toks.iter().take(e).skip(name_idx) {
+            if let CTok::Lit(l) = &t.0 {
+                if l == "{" { brace_b = t.1; break; }
+            }
+        }
+        let end_b = toks[e - 1].2;
+        (name, start_b, brace_b, end_b)
+    }).collect()
+}
+
+/// Canonicalize generated C: strip comments/whitespace, alpha-rename all
+/// non-keyword identifiers positionally, drop unreferenced top-level
+/// function definitions. Deterministic across renames and dead-code edits.
+pub fn canonicalize_c(src: &str) -> String {
+    let toks = lex_c(src);
+
+    // Top-level function definitions: (name, name_idx, start, end) token idxs
+    let defs = find_c_defs(&toks);
 
     // Liveness fixpoint: roots are `main` plus every identifier used
     // outside any def body (globals, declarations, initializers).
@@ -525,7 +551,7 @@ pub fn canonicalize_c(src: &str) -> String {
     // unnecessary — header only contains the def name and param names.
     for (t, tok) in toks.iter().enumerate() {
         if !in_body[t] {
-            if let CTok::Ident(n) = tok { live.insert(n.clone()); }
+            if let CTok::Ident(n) = &tok.0 { live.insert(n.clone()); }
         }
     }
     let def_names: std::collections::HashSet<String> = defs.iter().map(|d| d.0.clone()).collect();
@@ -535,7 +561,7 @@ pub fn canonicalize_c(src: &str) -> String {
             if !live.contains(name) { continue; }
             // refs inside this live def's tokens pull in more names
             for tok in toks.iter().take(*end).skip(*name_idx + 1) {
-                if let CTok::Ident(n) = tok {
+                if let CTok::Ident(n) = &tok.0 {
                     if def_names.contains(n) { live.insert(n.clone()); }
                 }
             }
@@ -553,7 +579,7 @@ pub fn canonicalize_c(src: &str) -> String {
     let mut next = 0u64;
     for (t, tok) in toks.iter().enumerate() {
         if dead_spans.contains(&t) { continue; }
-        match tok {
+        match &tok.0 {
             CTok::Ident(n) => {
                 if C_KEYWORDS.contains(&n.as_str()) {
                     out.push_str(n);

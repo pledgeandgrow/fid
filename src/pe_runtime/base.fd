@@ -46,6 +46,8 @@ extern "C" {
     fn GetStdHandle as pe_k_std_handle(n: i64) -> i64;
     fn ReadFile as pe_k_read_file(h: i64, buf: i64, n: i64, read_out: i64, ovl: i64) -> i32;
     fn fflush as pe_c_fflush(f: i64) -> i32;
+    fn strlen as pe_c_strlen(s: i64) -> i64;
+    fn memcmp as pe_c_memcmp(a: i64, b: i64, n: i64) -> i32;
     // Machine-code primitives (pe.rs): a float travels as its bits
     fn pe_f64_to_bits(x: f64) -> i64;
     fn pe_bits_to_f64(bits: i64) -> f64;
@@ -98,6 +100,70 @@ pub fn pert_str_to_int(s: str) -> i64 {
         return 0;
     }
     return pe_c_strtoi64(s, 0, 10);
+}
+
+/// p_str_equal for this backend: compare the lengths first, then the
+/// memory in one msvcrt memcmp — not byte by byte (pe-roadmap item 74).
+pub fn pert_str_equal(a: i64, b: i64) -> bool {
+    if a == b { return true; }
+    if a == 0 { return false; }
+    if b == 0 { return false; }
+    var la: i64 = pe_c_strlen(a);
+    var lb: i64 = pe_c_strlen(b);
+    if la != lb { return false; }
+    return pe_c_memcmp(a, b, la) == 0;
+}
+
+/// Native-only replacement for `p_str_hash` (pe-roadmap item 77). The
+/// interpreter reads `*mut i64` derefs as tagged values, so the byte loop
+/// must stay in stdlib/core.fd; here real memory reads are valid and we mix
+/// 8 bytes per iteration. Word reads only happen when the whole word stays
+/// inside the same page (page offset <= 4088), which can't fault since the
+/// string's first byte is already readable.
+@wrapping pub fn pert_str_hash(s: i64) -> i64 {
+    var hash: i64 = -3750763034362895579;
+    var addr: i64 = s;
+    unsafe {
+        while (addr & 4095) <= 4088 {
+            var word_ptr: *mut i64 = addr;
+            var w: i64 = *word_ptr;
+            // Zero-byte test per 32-bit half (no i64 overflow):
+            // (x - 0x01010101) & ~x & 0x80808080 detects a zero byte.
+            var lo: i64 = w & 4294967295;
+            var hi: i64 = (w >> 32) & 4294967295;
+            if ((lo - 16843009) & (~lo) & 2155905152) != 0
+                || ((hi - 16843009) & (~hi) & 2155905152) != 0 {
+                var bp2: *mut u8 = addr;
+                var a2: i64 = addr;
+                var i: i64 = 0;
+                while i < 8 {
+                    var b2: i64 = *bp2;
+                    if b2 == 0 { break; }
+                    hash = hash ^ b2;
+                    hash = hash * 1099511628211;
+                    i = i + 1;
+                    a2 = a2 + 1;
+                    bp2 = a2;
+                }
+                if hash < 0 { return -hash; }
+                return hash;
+            }
+            hash = hash ^ w;
+            hash = hash * 1099511628211;
+            addr = addr + 8;
+        }
+        var byte_ptr: *mut u8 = addr;
+        var b: i64 = *byte_ptr;
+        while b != 0 {
+            hash = hash ^ b;
+            hash = hash * 1099511628211;
+            addr = addr + 1;
+            byte_ptr = addr;
+            b = *byte_ptr;
+        }
+    }
+    if hash < 0 { return -hash; }
+    return hash;
 }
 
 /// (A str argument passes as its address.)

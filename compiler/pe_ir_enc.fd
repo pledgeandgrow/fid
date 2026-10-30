@@ -128,6 +128,14 @@ pub struct PeirEnc {
     pub pending_rip_refs: Vec<PeirRipRef>,
     /// Next label ID
     pub next_label: i64,
+    /// Peephole: (disp, src reg, code position after the instruction) of
+    /// the last emitted `mov [rbp+disp], src`. last_store_end = -1 = none.
+    /// mov_reg_mem_rbp forwards the register instead of reloading when no
+    /// byte was emitted in between (code is append-only). place_label
+    /// clears it — a load at a branch target is never wrongly forwarded.
+    pub last_store_disp: i64,
+    pub last_store_reg: i64,
+    pub last_store_end: i64,
 }
 
 pub fn PeirEnc_new() -> PeirEnc {
@@ -137,6 +145,9 @@ pub fn PeirEnc_new() -> PeirEnc {
         pending_labels: Vec::new(),
         pending_rip_refs: Vec::new(),
         next_label: 0,
+        last_store_disp: 0,
+        last_store_reg: 0,
+        last_store_end: -1,
     };
 }
 
@@ -150,6 +161,7 @@ pub fn PeirEnc_alloc_label(self: &mut PeirEnc) -> i64 {
 
 /// Mark a label at the current code position
 pub fn PeirEnc_place_label(self: &mut PeirEnc, label: i64) -> void {
+    self.last_store_end = -1;
     self.labels.set(label, self.code.len());
 }
 
@@ -499,6 +511,16 @@ pub fn PeirEnc_mov_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 
 /// mov r64, [rbp + disp]
 pub fn PeirEnc_mov_reg_mem_rbp(self: &mut PeirEnc, dst: i64, disp: i64) -> void {
+    if self.last_store_end == self.code.len() && disp == self.last_store_disp {
+        // The slot was just written from a register and nothing was emitted
+        // since — forward the register, skip the reload.
+        self.last_store_end = -1;
+        if dst != self.last_store_reg {
+            PeirEnc_mov_rr(self, dst, self.last_store_reg);
+        }
+        return;
+    }
+    self.last_store_end = -1;
     PeirEnc_rex(self, true, reg_ext(dst), false, false);
     self.code.push(0x8B);
     PeirEnc_emit_mem_rbp(self, peir_reg_code(dst), disp);
@@ -509,6 +531,9 @@ pub fn PeirEnc_mov_mem_rbp_reg(self: &mut PeirEnc, disp: i64, src: i64) -> void 
     PeirEnc_rex(self, true, reg_ext(src), false, false);
     self.code.push(0x89);
     PeirEnc_emit_mem_rbp(self, peir_reg_code(src), disp);
+    self.last_store_disp = disp;
+    self.last_store_reg = src;
+    self.last_store_end = self.code.len();
 }
 
 /// Emit RBP-relative memory operand (ModR/M + optional SIB + displacement)
@@ -2018,7 +2043,7 @@ pub fn pe_build_file(text: Vec<i64>, rdata: Vec<i64>, entry_point_rva: i64, impo
     pe = pe_push_u32(pe, 0); // CheckSum
     pe = pe_push_u16(pe, 3); // Subsystem = CONSOLE
     pe = pe_push_u16(pe, 0x0000); // DllCharacteristics: none (testing)
-    pe = pe_push_u64(pe, 0x10000000); // SizeOfStackReserve = 256MB
+    pe = pe_push_u64(pe, 0x100000000); // SizeOfStackReserve = 4GB (native frames are large: one slot per IR value, no reuse — deep recursion in checker/parser needs it)
     pe = pe_push_u64(pe, 0x100000); // SizeOfStackCommit = 1MB
     pe = pe_push_u64(pe, 0x100000); // SizeOfHeapReserve
     pe = pe_push_u64(pe, 0x1000); // SizeOfHeapCommit

@@ -52,6 +52,9 @@ pub struct PeStackFrame {
     pub size: i64,
     /// Alloca ValueId -> data slot offset from rbp (entry list)
     pub alloca_slots: Vec<PeOffEnt>,
+    /// ValueId -> known integer constant: use sites move the immediate
+    /// straight into a register instead of loading the slot (item 81).
+    pub const_vals: Vec<PeOffEnt>,
 }
 
 pub fn PeStackFrame_new() -> PeStackFrame {
@@ -59,6 +62,7 @@ pub fn PeStackFrame_new() -> PeStackFrame {
         offsets: Vec::new(),
         size: 0,
         alloca_slots: Vec::new(),
+        const_vals: Vec::new(),
     };
 }
 
@@ -85,6 +89,16 @@ fn pe_idmap_get(map: &Vec<PeOffEnt>, id: i64) -> i64 {
         i = i + 1;
     }
     return 0;
+}
+
+/// Whether `map` has an entry for `id`.
+fn pe_idmap_has(map: &Vec<PeOffEnt>, id: i64) -> bool {
+    var i: i64 = 0;
+    while i < map.len() {
+        if map.get(i).id == id { return true; }
+        i = i + 1;
+    }
+    return false;
 }
 
 /// Allocate space for a value and return its (negative) rbp offset.
@@ -446,7 +460,8 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
     self.iat_rdata_offsets = rdata.iat_offsets;
 
     // 2b. Append module-level mutable globals to .rdata (section is writable)
-    // Each global gets 8 bytes of storage, initialized with the constant value.
+    // Each global gets storage for its type — a struct/enum global needs
+    // the full size (a Store does a struct copy), not just 8 bytes.
     var global_names: Vec<str> = Vec::new();
     var gi: i64 = 0;
     while gi < module.globals.len() {
@@ -454,15 +469,20 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
         gi = gi + 1;
     }
     global_names = pe_ir_sort_strs(global_names);
+    // Slots holding a str literal's address get patched once .rdata's RVA
+    // is known: pairs of (slot rdata offset, string rdata offset).
+    var global_str_patches: Vec<i64> = Vec::new();
     gi = 0;
     while gi < global_names.len() {
         var gname: str = global_names.get(gi);
         match IrModule_get_global(module, gname) {
             OptGlobalLookup::Some(gty, init_expr) => {
-                var goff: i64 = rdata.data.len();
+                var gsize: i64 = IrModule_type_size(module, gty);
+                if gsize < 8 { gsize = 8; }
                 // Compute the 8-byte initial value
                 var bits: i64 = 0;
                 var f32_init: bool = false;
+                var str_off: i64 = -1;
                 match init_expr {
                     Expr::IntLit(v) => { bits = v; }
                     Expr::BoolLit(b) => { if b { bits = 1; } else { bits = 0; } }
@@ -474,7 +494,15 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
                             bits = p_f64_to_bits(f);
                         }
                     }
+                    Expr::StringLit(s) => {
+                        str_off = PeirRdata_add_string(&mut rdata, s);
+                    }
                     _ => { bits = 0; } // zero-initialize
+                }
+                var goff: i64 = rdata.data.len();
+                if str_off != -1 {
+                    global_str_patches.push(goff);
+                    global_str_patches.push(str_off);
                 }
                 if f32_init {
                     var b1: i64 = 0;
@@ -482,8 +510,8 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
                         rdata.data.push((bits >> (8 * b1)) & 0xFF);
                         b1 = b1 + 1;
                     }
-                    var bz: i64 = 0;
-                    while bz < 4 {
+                    var bz: i64 = 4;
+                    while bz < gsize {
                         rdata.data.push(0);
                         bz = bz + 1;
                     }
@@ -492,6 +520,11 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
                     while b2 < 8 {
                         rdata.data.push((bits >> (8 * b2)) & 0xFF);
                         b2 = b2 + 1;
+                    }
+                    var b3: i64 = 8;
+                    while b3 < gsize {
+                        rdata.data.push(0);
+                        b3 = b3 + 1;
                     }
                 }
                 HashMap_insert(self.global_rdata_offsets, gname, goff);
@@ -664,6 +697,21 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
     // 10. Patch import table RVAs in .rdata
     PeirRdata_patch_rvas(&mut rdata, rdata_rva);
 
+    // 10b. Patch str-literal global initializers: each slot holds the
+    // absolute VA of its string (image loads at preferred base — no relocs).
+    var pi: i64 = 0;
+    while pi < global_str_patches.len() {
+        var slot_off: i64 = global_str_patches.get(pi);
+        var str_off: i64 = global_str_patches.get(pi + 1);
+        var va: i64 = PE_IMAGE_BASE + rdata_rva + str_off;
+        var pb: i64 = 0;
+        while pb < 8 {
+            rdata.data.set(slot_off + pb, (va >> (8 * pb)) & 0xFF);
+            pb = pb + 1;
+        }
+        pi = pi + 2;
+    }
+
     // 11. Calculate PE metadata
     var import_dir_rva: i64 = rdata_rva + rdata.import_dir_offset;
     var iat_rva: i64 = rdata_rva + rdata.iat_offset;
@@ -731,13 +779,154 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
     // Allocate stack frame (value_metas is insertion-ordered by id already,
     // as x86.fd iterates it directly)
     var frame: PeStackFrame = PeStackFrame_new();
+
+    // ── Slot reuse (pe-roadmap items 84-85) ──
+    // Block-local temporaries (def + all uses in one block) share a slot
+    // pool instead of owning one slot each, so frames stay small. Pools are
+    // dense Vec<i64> indexed by value id; -1 = absent.
+    var nvals: i64 = func.value_metas.len() + func.insts.len() + 16;
+    var def_block: Vec<i64> = Vec::new();
+    var n_use_blocks: Vec<i64> = Vec::new();
+    var a_use_block: Vec<i64> = Vec::new();
+    var last_use: Vec<i64> = Vec::new();
+    var zi: i64 = 0;
+    while zi < nvals {
+        def_block.push(-1);
+        n_use_blocks.push(0);
+        a_use_block.push(-1);
+        last_use.push(-1);
+        zi = zi + 1;
+    }
+    var ops: Vec<i64> = Vec::new();
+    var pos: i64 = 0;
+    var abi: i64 = 0;
+    while abi < func.blocks.len() {
+        var ablock: BasicBlock = func.blocks.get(abi);
+        var aii: i64 = 0;
+        while aii < ablock.instructions.len() {
+            var aiid: i64 = ablock.instructions.get(aii);
+            match IrFunction_get_inst(func, aiid) {
+                OptInst::Some(ainst) => {
+                    if aiid >= 0 && aiid < nvals { def_block.set(aiid, abi); }
+                    match ainst {
+                        Inst::TryUnwrap(_, okd, _, _) => {
+                            if okd >= 0 && okd < nvals { def_block.set(okd, abi); }
+                        }
+                        _ => {}
+                    }
+                    peir_inst_operands(ainst, &mut ops);
+                    var oi: i64 = 0;
+                    while oi < ops.len() {
+                        var op: i64 = ops.get(oi);
+                        if op >= 0 && op < nvals {
+                            if a_use_block.get(op) != abi {
+                                n_use_blocks.set(op, n_use_blocks.get(op) + 1);
+                                a_use_block.set(op, abi);
+                            }
+                            last_use.set(op, pos);
+                        }
+                        oi = oi + 1;
+                    }
+                    ops.clear();
+                }
+                OptInst::None => {}
+            }
+            pos = pos + 1;
+            aii = aii + 1;
+        }
+        abi = abi + 1;
+    }
+
     var vi: i64 = 0;
     while vi < func.value_metas.len() {
         var vm: ValueIdMeta = func.value_metas.get(vi);
-        var size: i64 = IrModule_type_size(module, vm.meta.ty);
-        if size < 8 { size = 8; }
-        PeStackFrame_alloc(&mut frame, vm.id, size);
+        if !peir_recyclable(vm.id, def_block, n_use_blocks, a_use_block, nvals) {
+            var size: i64 = IrModule_type_size(module, vm.meta.ty);
+            if size < 8 { size = 8; }
+            PeStackFrame_alloc(&mut frame, vm.id, size);
+        }
         vi = vi + 1;
+    }
+    // Assign recyclable values pool slots in scan order — the same order the
+    // emit loop runs, so frees/assignments line up. A value's slot frees
+    // once the instruction holding its last use passes. `assigned` tracks
+    // offsets densely (O(1)) — the Vec<PeOffEnt> map is O(n) per lookup.
+    var assigned: Vec<i64> = Vec::new();
+    zi = 0;
+    while zi < nvals { assigned.push(-2); zi = zi + 1; }
+    var free_slots: Vec<i64> = Vec::new();
+    pos = 0;
+    var sbi: i64 = 0;
+    while sbi < func.blocks.len() {
+        var sblock: BasicBlock = func.blocks.get(sbi);
+        var sii: i64 = 0;
+        while sii < sblock.instructions.len() {
+            var siid: i64 = sblock.instructions.get(sii);
+            match IrFunction_get_inst(func, siid) {
+                OptInst::Some(sinst) => {
+                    // Free operands whose last use is this instruction.
+                    peir_inst_operands(sinst, &mut ops);
+                    var oi2: i64 = 0;
+                    while oi2 < ops.len() {
+                        var op2: i64 = ops.get(oi2);
+                        if op2 >= 0 && op2 < nvals && last_use.get(op2) == pos
+                            && peir_recyclable(op2, def_block, n_use_blocks, a_use_block, nvals)
+                            && assigned.get(op2) != -2 {
+                            free_slots.push(assigned.get(op2));
+                            last_use.set(op2, -1); // freed once
+                            assigned.set(op2, -2);
+                        }
+                        oi2 = oi2 + 1;
+                    }
+                    ops.clear();
+                    // Assign this inst's result (and TryUnwrap's ok_dst) a
+                    // slot: pop a freed slot, or grow the frame. Recyclable
+                    // values wider than 8 bytes get a permanent slot — pool
+                    // slots are all 8-byte.
+                    if siid >= 0 && siid < nvals && assigned.get(siid) == -2
+                        && peir_recyclable(siid, def_block, n_use_blocks, a_use_block, nvals) {
+                        var vsz: i64 = 8;
+                        match IrFunction_get_meta(func, siid) {
+                            OptValueMeta::Some(svm) => {
+                                vsz = IrModule_type_size(module, svm.ty);
+                                if vsz < 8 { vsz = 8; }
+                            }
+                            OptValueMeta::None => {}
+                        }
+                        var off: i64 = 0;
+                        if vsz <= 8 && free_slots.len() > 0 {
+                            off = free_slots.get(free_slots.len() - 1);
+                            free_slots.remove(free_slots.len() - 1);
+                        } else {
+                            off = PeStackFrame_alloc_raw(&mut frame, vsz);
+                        }
+                        frame.offsets.push(PeOffEnt { id: siid, offset: off });
+                        assigned.set(siid, off);
+                    }
+                    match sinst {
+                        Inst::TryUnwrap(_, okd2, _, _) => {
+                            if okd2 >= 0 && okd2 < nvals && assigned.get(okd2) == -2
+                                && peir_recyclable(okd2, def_block, n_use_blocks, a_use_block, nvals) {
+                                var off2: i64 = 0;
+                                if free_slots.len() > 0 {
+                                    off2 = free_slots.get(free_slots.len() - 1);
+                                    free_slots.remove(free_slots.len() - 1);
+                                } else {
+                                    off2 = PeStackFrame_alloc_raw(&mut frame, 8);
+                                }
+                                frame.offsets.push(PeOffEnt { id: okd2, offset: off2 });
+                                assigned.set(okd2, off2);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                OptInst::None => {}
+            }
+            pos = pos + 1;
+            sii = sii + 1;
+        }
+        sbi = sbi + 1;
     }
     // Pre-allocate alloca data slots (insts is insertion-ordered by id)
     var ii: i64 = 0;
@@ -759,6 +948,24 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
     var stack_size: i64 = (frame.size + 32 + 15) & ~15;
     if stack_size < 64 { stack_size = 64; }
     PeirEnc_sub_rsp_i32(&mut self.enc, stack_size);
+
+    // Stack probes: touch every page of the new frame top-down so Windows
+    // commits it. Frames here are huge (one slot per IR value, no reuse),
+    // so a single sub lands far below the guard page; without probing, the
+    // next deep write or outgoing-arg push faults instead of growing the
+    // stack. (Same job as __chkstk.)
+    if stack_size > 4096 {
+        var probe_loop: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var probe_done: i64 = PeirEnc_alloc_label(&mut self.enc);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RBP);
+        PeirEnc_place_label(&mut self.enc, probe_loop);
+        PeirEnc_add_r_i32(&mut self.enc, PEIR_RAX, -4096);
+        PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RSP);
+        PeirEnc_jcc_label(&mut self.enc, 0x6, probe_done); // jbe: rax <= rsp
+        PeirEnc_mov_reg8_ptr(&mut self.enc, PEIR_R11, PEIR_RAX); // touch page
+        PeirEnc_jmp_label(&mut self.enc, probe_loop);
+        PeirEnc_place_label(&mut self.enc, probe_done);
+    }
 
     // Store params from registers
     var arg_regs: Vec<i64> = Vec::new();
@@ -797,12 +1004,25 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
         var blabel2: i64 = HashMap_get(self.block_labels, pe_block_key(name, block2.id));
         PeirEnc_place_label(&mut self.enc, blabel2);
 
+        self.pending_cmp_cc = -1;
         var ii2: i64 = 0;
         while ii2 < block2.instructions.len() {
             var inst_id: i64 = block2.instructions.get(ii2);
+            var next_cond: i64 = -1;
+            if ii2 + 1 < block2.instructions.len() {
+                match IrFunction_get_inst(func, block2.instructions.get(ii2 + 1)) {
+                    OptInst::Some(ninst) => {
+                        match ninst {
+                            Inst::Branch(c2, _, _) => { next_cond = c2; }
+                            _ => {}
+                        }
+                    }
+                    OptInst::None => {}
+                }
+            }
             match IrFunction_get_inst(func, inst_id) {
                 OptInst::Some(inst) => {
-                    PeirGen_gen_inst(self, inst_id, inst, &frame, func, module, name);
+                    PeirGen_gen_inst(self, inst_id, inst, next_cond, &mut frame, func, module, name);
                 }
                 OptInst::None => {}
             }
@@ -837,7 +1057,8 @@ pub fn PeirGen_gen_inst(
     self: &mut PeirGen,
     id: i64,
     inst: Inst,
-    frame: &PeStackFrame,
+    next_cond: i64,
+    frame: &mut PeStackFrame,
     func: &IrFunction,
     module: &IrModule,
     func_name: str,
@@ -849,6 +1070,7 @@ pub fn PeirGen_gen_inst(
         Inst::ConstInt(value, _) => {
             PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, value);
             PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+            pe_idmap_put(&mut frame.const_vals, id, value);
         }
 
         Inst::ConstBool(value) => {
@@ -919,7 +1141,23 @@ pub fn PeirGen_gen_inst(
             } else if ir_type_is_float(operand_ty) {
                 PeirGen_gen_float_binop(self, op, loff, roff, dst, operand_ty);
             } else {
-                PeirGen_gen_int_binop(self, op, loff, roff, dst);
+                var lconst: OptU64 = OptU64::None;
+                var rconst: OptU64 = OptU64::None;
+                if pe_idmap_has(&frame.const_vals, left) {
+                    lconst = OptU64::Some(pe_idmap_get(&frame.const_vals, left));
+                }
+                if pe_idmap_has(&frame.const_vals, right) {
+                    rconst = OptU64::Some(pe_idmap_get(&frame.const_vals, right));
+                }
+                PeirGen_gen_int_binop(self, op, loff, roff, dst, lconst, rconst);
+                // cmp+branch fusion (item 82): a comparison feeding the next
+                // instruction's Branch keeps its flags live through
+                // setcc/movzx/mov — the branch jcc's on them directly.
+                var cc: i64 = peir_int_cmp_cc(op);
+                if cc >= 0 && next_cond == id {
+                    self.pending_cmp_cc = cc;
+                    self.pending_cmp_vid = id;
+                }
             }
         }
 
@@ -1143,13 +1381,25 @@ pub fn PeirGen_gen_inst(
         }
 
         Inst::Branch(cond, then, else_) => {
-            var coff: i64 = PeStackFrame_offset(frame, cond);
-            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, coff);
-            PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
             var then_label: i64 = HashMap_get(self.block_labels, pe_block_key(func_name, then));
             var else_label: i64 = HashMap_get(self.block_labels, pe_block_key(func_name, else_));
-            PeirEnc_jcc_label(&mut self.enc, 0x5, then_label); // jne
-            PeirEnc_jmp_label(&mut self.enc, else_label);
+            var fused: bool = false;
+            if self.pending_cmp_vid == cond && self.pending_cmp_cc >= 0 {
+                // The compare just emitted left its flags live: jump on the
+                // condition directly.
+                PeirEnc_jcc_label(&mut self.enc, self.pending_cmp_cc, then_label);
+                PeirEnc_jmp_label(&mut self.enc, else_label);
+                fused = true;
+            }
+            self.pending_cmp_cc = -1;
+            self.pending_cmp_vid = -1;
+            if !fused {
+                var coff: i64 = PeStackFrame_offset(frame, cond);
+                PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, coff);
+                PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                PeirEnc_jcc_label(&mut self.enc, 0x5, then_label); // jne
+                PeirEnc_jmp_label(&mut self.enc, else_label);
+            }
         }
 
         Inst::Return(ret) => {
@@ -1257,6 +1507,34 @@ pub fn PeirGen_gen_inst(
             }
             target_func = PeirGen_resolve_call(self, target_func);
 
+            // Inline tiny runtime calls (pe-roadmap item 86): when the
+            // resolved callee is a machine stub and no Fides override
+            // stands in for it, emit its body at the call site.
+            if args.len() == 1 && !pe_ir_strs_contains(self.module_fns, target_func) {
+                var iaoff: i64 = PeStackFrame_offset(frame, args.get(0));
+                if target_func == "p_vec_len" || target_func == "p_map_len" {
+                    // rax = [[slot] + 8]
+                    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, iaoff);
+                    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_RAX, 8);
+                    PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+                    return;
+                }
+                if target_func == "p_map_is_empty" || target_func == "p_string_is_empty" {
+                    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, iaoff);
+                    if target_func == "p_map_is_empty" {
+                        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_RAX, 8);
+                    } else {
+                        PeirEnc_mov_reg8_ptr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                        PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                    }
+                    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                    PeirEnc_setcc_r(&mut self.enc, 0x4, PEIR_RAX); // sete
+                    PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                    PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+                    return;
+                }
+            }
+
             // A Fides function standing in for a runtime builtin (called
             // without one) takes a null `__env` first
             var call_args: Vec<OptValueId> = Vec::new();
@@ -1279,12 +1557,17 @@ pub fn PeirGen_gen_inst(
             if call_args.len() > 4 { stack_args = call_args.len() - 4; }
             var call_space: i64 = (32 + stack_args * 8 + 15) & ~15;
 
-            // Load args into registers
+            // Load args into registers (item 83): a known-constant arg moves
+            // in as an immediate instead of a slot load.
             var ri: i64 = 0;
             while ri < call_args.len() && ri < 4 {
                 match call_args.get(ri) {
                     OptValueId::Some(a) => {
-                        PeirEnc_mov_reg_mem_rbp(&mut self.enc, arg_regs.get(ri), PeStackFrame_offset(frame, a));
+                        if pe_idmap_has(&frame.const_vals, a) {
+                            PeirEnc_mov_imm64(&mut self.enc, arg_regs.get(ri), pe_idmap_get(&frame.const_vals, a));
+                        } else {
+                            PeirEnc_mov_reg_mem_rbp(&mut self.enc, arg_regs.get(ri), PeStackFrame_offset(frame, a));
+                        }
                     }
                     OptValueId::None => {
                         PeirEnc_xor_rr(&mut self.enc, arg_regs.get(ri), arg_regs.get(ri));
@@ -1300,7 +1583,11 @@ pub fn PeirGen_gen_inst(
                 var stack_pos: i64 = 32 + (sa - 4) * 8;
                 match call_args.get(sa) {
                     OptValueId::Some(a2) => {
-                        PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, PeStackFrame_offset(frame, a2));
+                        if pe_idmap_has(&frame.const_vals, a2) {
+                            PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, pe_idmap_get(&frame.const_vals, a2));
+                        } else {
+                            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, PeStackFrame_offset(frame, a2));
+                        }
                     }
                     OptValueId::None => {
                         PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
@@ -1643,9 +1930,94 @@ pub fn PeirGen_gen_inst(
 // ===========================================================================
 
 /// Generate integer binary operation.
-pub fn PeirGen_gen_int_binop(self: &mut PeirGen, op: BinOp, loff: i64, roff: i64, dst: i64) -> void {
-    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, loff);
-    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, roff);
+/// Append every ValueId `inst` reads to `out` (used by the slot-reuse
+/// analysis in gen_function — pe-roadmap items 84-85).
+pub fn peir_inst_operands(inst: Inst, out: &mut Vec<i64>) -> void {
+    match inst {
+        Inst::BinOp(_, l, r, _) => { out.push(l); out.push(r); }
+        Inst::UnaryOp(_, v, _) => { out.push(v); }
+        Inst::Load(p, _) => { out.push(p); }
+        Inst::Store(p, v, _) => { out.push(p); out.push(v); }
+        Inst::StructCopy(d, s, _) => { out.push(d); out.push(s); }
+        Inst::GetFieldPtr(p, _, _) => { out.push(p); }
+        Inst::GetElemPtr(p, i, _) => { out.push(p); out.push(i); }
+        Inst::Branch(c, _, _) => { out.push(c); }
+        Inst::Return(rv) => {
+            match rv {
+                OptValueId::Some(v) => { out.push(v); }
+                OptValueId::None => {}
+            }
+        }
+        Inst::Call(_, args, _, _) => {
+            var i: i64 = 0;
+            while i < args.len() { out.push(args.get(i)); i = i + 1; }
+        }
+        Inst::CallPtr(fp, args, _, _, _) => {
+            out.push(fp);
+            var j: i64 = 0;
+            while j < args.len() { out.push(args.get(j)); j = j + 1; }
+        }
+        Inst::DynCall(_, _, args, _, _) => {
+            var k: i64 = 0;
+            while k < args.len() { out.push(args.get(k)); k = k + 1; }
+        }
+        Inst::MakeDyn(v, _, _) => { out.push(v); }
+        Inst::BitCast(v, _, _) => { out.push(v); }
+        Inst::IntExtend(v, _, _) => { out.push(v); }
+        Inst::IntTrunc(v, _, _) => { out.push(v); }
+        Inst::IntToFloat(v, _, _) => { out.push(v); }
+        Inst::FloatToInt(v, _, _) => { out.push(v); }
+        Inst::TryUnwrap(v, _, _, _) => { out.push(v); }
+        Inst::Print(v, _) => { out.push(v); }
+        Inst::Asm(_, inputs, _, _) => {
+            var m: i64 = 0;
+            while m < inputs.len() { out.push(inputs.get(m).id); m = m + 1; }
+        }
+        Inst::PersistLoad(_, d, _) => { out.push(d); }
+        Inst::PersistSave(_, v) => { out.push(v); }
+        Inst::Backward(l) => { out.push(l); }
+        _ => {}
+    }
+}
+
+/// Slot-reuse rule: a value is a recyclable temporary iff it is defined by
+/// an instruction inside one block and every use sits in that same block.
+/// Params and cross-block/loop-carried values keep permanent slots.
+pub fn peir_recyclable(v: i64, def_block: Vec<i64>, n_use_blocks: Vec<i64>, a_use_block: Vec<i64>, nvals: i64) -> bool {
+    if v < 0 || v >= nvals { return false; }
+    var db: i64 = def_block.get(v);
+    if db < 0 { return false; }
+    var nub: i64 = n_use_blocks.get(v);
+    if nub == 0 { return true; }
+    if nub == 1 { return a_use_block.get(v) == db; }
+    return false;
+}
+
+/// The jcc code jumping when an integer comparison `a OP b` holds (the
+/// setcc-style numbering gen_int_binop uses: 4=E, 5=NE, C=L, D=GE, E=LE,
+/// F=G), or -1 for a non-comparison.
+pub fn peir_int_cmp_cc(op: BinOp) -> i64 {
+    match op {
+        BinOp::Eq => { return 0x4; }
+        BinOp::Neq => { return 0x5; }
+        BinOp::Lt => { return 0xC; }
+        BinOp::GtEq => { return 0xD; }
+        BinOp::LtEq => { return 0xE; }
+        BinOp::Gt => { return 0xF; }
+        _ => { return -1; }
+    }
+}
+
+pub fn PeirGen_gen_int_binop(self: &mut PeirGen, op: BinOp, loff: i64, roff: i64, dst: i64, lconst: OptU64, rconst: OptU64) -> void {
+    // A constant operand moves in as an immediate, not a slot load (item 81).
+    match lconst {
+        OptU64::Some(v) => { PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, v); }
+        OptU64::None => { PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, loff); }
+    }
+    match rconst {
+        OptU64::Some(v) => { PeirEnc_mov_imm64(&mut self.enc, PEIR_RCX, v); }
+        OptU64::None => { PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, roff); }
+    }
 
     match op {
         BinOp::Add => { PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_RCX); }

@@ -144,6 +144,12 @@ pub struct CCodeGen {
     /// Set of user-defined extern function names (FFI). These should NOT be
     /// sanitized (they keep their original C names).
     extern_func_names: std::collections::HashSet<String>,
+    /// Byte ranges in `out` for each emitted function body
+    /// (name, start, end) — for per-module TU splitting (Phase B).
+    fn_marks: Vec<(String, usize, usize)>,
+    /// Byte offset in `out` where the tail (main wrapper + runtime impl)
+    /// begins.
+    tail_mark: usize,
 }
 
 impl CCodeGen {
@@ -162,6 +168,8 @@ impl CCodeGen {
             user_fn_param_types: HashMap::new(),
             fn_ret_types: HashMap::new(),
             extern_func_names: std::collections::HashSet::new(),
+            fn_marks: Vec::new(),
+            tail_mark: 0,
         }
     }
 
@@ -477,9 +485,12 @@ impl CCodeGen {
 
         // Emit each function
         for (name, func) in &module.functions {
+            let start = self.out.len();
             self.gen_function(name, func);
+            self.fn_marks.push((name.clone(), start, self.out.len()));
         }
 
+        self.tail_mark = self.out.len();
         // Emit main wrapper
         self.emit_main_wrapper(module);
 
@@ -5396,4 +5407,178 @@ impl CCodeGen {
 pub fn generate_c(module: &IrModule) -> String {
     let mut gen = CCodeGen::new();
     gen.generate(module)
+}
+
+/// Per-module translation units (Phase B). Emits the full program once,
+/// then splits on recorded boundaries: every unit gets the shared prelude
+/// (includes, types, struct defs, prototypes, string constants) plus the
+/// bodies of its own functions; the `main` unit also gets the tail (main
+/// wrapper + runtime impl) and owns the global definitions. Other units
+/// see globals as `extern` declarations — duplicated `static` globals
+/// would silently fork state across TUs.
+///
+/// `func_modules` maps lowered function names to their origin module;
+/// unknown names (comptime/derive/mono products) fall back to the base
+/// name before a `__` mangled suffix, then to "main".
+/// Returns units as (module_name, c_source), sorted by name.
+pub fn generate_c_units(
+    module: &IrModule,
+    func_modules: &std::collections::HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut gen = CCodeGen::new();
+    let full = gen.generate(module);
+
+    let first_fn_start = gen.fn_marks.iter().map(|(_, s, _)| *s).min().unwrap_or(gen.tail_mark);
+    let prelude = &full[..first_fn_start];
+    let mut tail = full[gen.tail_mark..].to_string();
+
+    // The prelude carries a few small runtime *definitions* (call-stack
+    // helpers, p_set_max_recursion, ...). They must live in exactly one TU
+    // or the linker sees duplicate symbols — move them to the tail (main
+    // unit) and leave a prototype behind.
+    let mut prelude_stripped = String::with_capacity(prelude.len());
+    let mut protos = String::new();
+    let mut moved_defs = String::new();
+    {
+        let defs = crate::inc::c_fn_defs(prelude);
+        let mut cursor = 0usize;
+        for (_, s, brace, e) in defs {
+            prelude_stripped.push_str(&prelude[cursor..s]);
+            let header = prelude[s..brace].trim();
+            protos.push_str(header);
+            protos.push_str(";\n");
+            moved_defs.push_str(&prelude[s..e]);
+            moved_defs.push('\n');
+            cursor = e;
+        }
+        prelude_stripped.push_str(&prelude[cursor..]);
+        prelude_stripped.push_str(&protos);
+        tail = format!("{}\n{}", moved_defs, tail);
+    }
+    let prelude = &prelude_stripped[..];
+
+    let flat = std::env::var_os("FIDES_INC_FLAT").is_some();
+    // The unit that owns the entry point, globals definitions, and the
+    // runtime tail. This is the module `main` lives in — NOT always a unit
+    // literally named "main" (a file `test_caps.fd` produces a `test_caps`
+    // unit and no "main" unit at all).
+    let owner = if flat {
+        "main".to_string()
+    } else {
+        func_modules.get("main").cloned().unwrap_or_else(|| "main".to_string())
+    };
+    let unit_of = |name: &str| -> String {
+        if flat { return "main".to_string(); }
+        if let Some(m) = func_modules.get(name) {
+            return m.clone();
+        }
+        if let Some(base) = name.split("__").next() {
+            if let Some(m) = func_modules.get(base) {
+                return m.clone();
+            }
+        }
+        owner.clone()
+    };
+
+    // Group function bodies by unit.
+    let mut bodies: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (name, s, e) in &gen.fn_marks {
+        let unit = unit_of(name);
+        bodies.entry(unit).or_default().push_str(&full[*s..*e]);
+    }
+
+    // Which _strN constants each function references — replicates
+    // emit_string_consts' ordering so names match. String consts are
+    // `static`: emitting them per-unit (rather than once in the shared
+    // prelude) keeps a string edit from invalidating every unit.
+    let mut str_value_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut fn_str_names: std::collections::HashMap<String, std::collections::BTreeSet<String>> =
+        std::collections::HashMap::new();
+    {
+        let mut idx = 0;
+        for (fname, func) in &module.functions {
+            for block in &func.blocks {
+                for &inst_id in &block.instructions {
+                    let key = match func.instructions.get(&inst_id) {
+                        Some(crate::ir::Inst::ConstStr { value }) => Some(value.clone()),
+                        Some(crate::ir::Inst::ConstFnRef { name }) => Some(name.clone()),
+                        _ => None,
+                    };
+                    if let Some(k) = key {
+                        let entry = str_value_names.entry(k).or_insert_with(|| {
+                            let n = format!("_str{}", idx);
+                            idx += 1;
+                            n
+                        });
+                        fn_str_names.entry(fname.clone()).or_default().insert(entry.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Split prelude into normal lines, global definitions, and string
+    // constants. Globals → extern in non-owner units (a duplicated static
+    // would fork state); string consts are re-emitted per-unit below.
+    let mut pre_common = String::new();
+    let mut global_defs: Vec<String> = Vec::new();
+    let mut global_externs: Vec<String> = Vec::new();
+    let mut str_decls: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for line in prelude.lines() {
+        let t = line.trim_start();
+        if t.starts_with("static ") && t.contains(" _g_") {
+            let decl = t["static ".len()..].split_once(" = ").map(|(d, _)| d).unwrap_or(&t["static ".len()..]);
+            let decl = decl.trim_end_matches(';');
+            global_defs.push(format!("{};", decl));
+            global_externs.push(format!("extern {};", decl));
+        } else if t.starts_with("static const char _str") {
+            if let Some(rest) = t.strip_prefix("static const char ") {
+                let name = rest.split('[').next().unwrap_or("").trim().to_string();
+                str_decls.insert(name, line.to_string());
+            }
+        } else {
+            pre_common.push_str(line);
+            pre_common.push('\n');
+        }
+    }
+
+    // String consts referenced by each unit's functions.
+    let mut unit_strs: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for (name, _, _) in &gen.fn_marks {
+        let unit = unit_of(name);
+        if let Some(used) = fn_str_names.get(name) {
+            unit_strs.entry(unit).or_default().extend(used.iter().cloned());
+        }
+    }
+
+    let mut units: Vec<(String, String)> = Vec::new();
+    for (name, body) in &bodies {
+        let mut code = pre_common.clone();
+        if let Some(used) = unit_strs.get(name) {
+            for sname in used {
+                if let Some(decl) = str_decls.get(sname) {
+                    code.push_str(decl);
+                    code.push('\n');
+                }
+            }
+        }
+        if *name == owner {
+            for d in &global_defs {
+                code.push_str(d);
+                code.push('\n');
+            }
+        } else {
+            for e in &global_externs {
+                code.push_str(e);
+                code.push('\n');
+            }
+        }
+        code.push_str(body);
+        if *name == owner {
+            code.push_str(&tail);
+        }
+        units.push((name.clone(), code));
+    }
+    units
 }

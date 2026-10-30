@@ -5852,6 +5852,76 @@ impl Lowerer {
                         return *alloca;
                     }
                 }
+                // &obj.field — return the field's address (GetFieldPtr), not a
+                // copy of its value. A reference must alias the original
+                // storage; materializing the value in a fresh alloca both
+                // breaks write-back and returns a pointer to a dead stack
+                // slot once this frame returns.
+                if let Expr::FieldAccess { expr: base, field } = expr.as_ref() {
+                    let struct_ptr = self.lower_expr(base);
+                    let struct_ty = self.get_value_type(struct_ptr);
+                    let mut struct_name = match &struct_ty {
+                        IrType::Ptr(inner) => match inner.as_ref() {
+                            IrType::Struct(name) => Some(name.clone()),
+                            IrType::Opaque(name) => {
+                                if self.module.get_struct(name).is_some() { Some(name.clone()) } else { None }
+                            }
+                            _ => None,
+                        },
+                        IrType::Struct(name) => Some(name.clone()),
+                        IrType::Opaque(name) => {
+                            if self.module.get_struct(name).is_some() { Some(name.clone()) } else { None }
+                        }
+                        _ => None,
+                    };
+                    if struct_name.is_none() {
+                        let inferred_ty = self.infer_expr_type(base);
+                        struct_name = match &inferred_ty {
+                            IrType::Ptr(inner) => match inner.as_ref() {
+                                IrType::Struct(name) => Some(name.clone()),
+                                IrType::Opaque(name) => {
+                                    if self.module.get_struct(name).is_some() { Some(name.clone()) } else { None }
+                                }
+                                _ => None,
+                            },
+                            IrType::Struct(name) => Some(name.clone()),
+                            IrType::Opaque(name) => {
+                                if self.module.get_struct(name).is_some() { Some(name.clone()) } else { None }
+                            }
+                            _ => None,
+                        };
+                    }
+                    if let Some(name) = struct_name {
+                        if let Some(layout) = self.module.get_struct(&name).cloned() {
+                            if let Some((idx, (_, field_ty, _))) = layout.fields.iter()
+                                .enumerate()
+                                .find(|(_, (n, _, _))| n == field)
+                            {
+                                let field_ptr = self.emit_inst(Inst::GetFieldPtr {
+                                    struct_ptr,
+                                    field_index: idx as u32,
+                                    field_ty: field_ty.clone(),
+                                });
+                                if let Some(f) = self.current_func.as_mut() {
+                                    if let Some(meta) = f.values.get_mut(&field_ptr) {
+                                        meta.borrow_kind = borrow;
+                                    }
+                                }
+                                return field_ptr;
+                            }
+                        }
+                    }
+                }
+                // &*ptr — the reference is the pointer itself.
+                if let Expr::Deref { expr: inner } = expr.as_ref() {
+                    let p = self.lower_expr(inner);
+                    if let Some(f) = self.current_func.as_mut() {
+                        if let Some(meta) = f.values.get_mut(&p) {
+                            meta.borrow_kind = borrow;
+                        }
+                    }
+                    return p;
+                }
                 // Otherwise: alloca, store, return pointer
                 let val = self.lower_expr(expr);
                 let val_ty = self.get_value_type(val);

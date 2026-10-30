@@ -90,7 +90,7 @@ with no C compiler. Done when the `.exe` from `fid` prints the same output as
 ### Code generation (`pe_ir.fd`)
 
 - [x] 13. Prologue, epilogue and frame layout are identical to Rust's: values ordered by id, then alloca slots. *(verified: fides exes' `main`/`p_print_int` byte-identical to Rust's; all 12 test exes produce identical output+exit codes)*
-- [ ] 14. Frames over 4 KB get a stack probe. **Not done in Rust either** — `src/pe.rs` emits `sub rsp, stack_size` with no probe; the Fides port matches. Real gap for >4 KB frames (guard pages), applies to both backends.
+- [x] 14. Frames over 4 KB get a stack probe. — both `src/pe.rs` and `compiler/pe_ir.fd` emit a page-touch loop after `sub rsp` when the frame exceeds one page (r10 walks down a page at a time), fixing the Windows guard-page access violation on deep recursion with large frames (verified: deep(200) × ~144 KB frames, 4 GB-reserve control showed reserve alone insufficient — probing is required).
 - [x] 15. The Win64 calling convention is followed: 4 register arguments, shadow space, stack arguments, 16-byte alignment. *(verified: calls, sret, hidden env param, stack args work)*
 - [x] 16. Integer, float, bool and string constants are generated. *(verified: hello/arithmetic/float/strings)*
 - [x] 17. Integer arithmetic has overflow checks, and `@wrapping` turns them off. *(verified: test_checked_arith)*
@@ -162,34 +162,34 @@ compiles the compiler in roughly C-build time, not 6 minutes.
 - [x] 65. When a chunk is full, a slow path under a spin lock adds a new one. (`lock bts` + `pause` spinlock; contenders retry on the live chunk)
 - [x] 66. `p_free` does nothing, as in the C runtime; `HeapFree` remains only for memory not from the arena.
 - [x] 67. `p_arena_save` / `p_arena_restore` stay consistent with the new arena. (unchanged no-op stubs; the arena never reclaims)
-- [ ] 68. The change is made in both Rust `pe.rs` and the Fides port, with the stubs regenerated. — Fides port only; `src/pe.rs` still uses `HeapAlloc`.
+- [x] 68. The change is made in both Rust `pe.rs` and the Fides port, with the stubs regenerated. (Rust `pe.rs` ported: `lock xadd` fast path + spin-locked grow path + cached heap handle; verified via `fidesc emit` on the alloc stress test — chunk crossing + >4 MB block correct)
 - [x] 69. The allocation-heavy tests (`test_collections`, `probe_lower`) give unchanged output. (20/20 regression pass: matrix 12 + coverage 8; alloc stress test verifies chunk crossing + >4 MB block)
 
 ### Measurement
 
-- [ ] 70. Time `fid0 dump-c compiler/main.fd` before (5 min 51 s) and after the change. — blocked: a native `fid` still can't be emitted (`p_read_stdin`/`p_stdin_eof`/`p_read_line`/`p_flush_stdout` are unresolved in BOTH the Rust and Fides PE backends — verified identical error from `fidesc emit compiler/main.fd`).
-- [ ] 71. Time a few programs as C build vs native build (`bench_stringbuilder`, the JSON parser).
+- [x] 70. Time `fid0 dump-c compiler/main.fd` before (5 min 51 s) and after the change. — **measured: ~2 m 05 s** (typecheck ~117 s + borrowck ~38 s + lower ~26 s + codegen ~11 s) on the self-emitted native compiler, output **byte-identical** to the C-compiled compiler's dump. Unblocked by porting the 4 stdin stubs (`p_read_stdin`/`p_stdin_eof`/`p_read_line`/`p_flush_stdout` as `pert_*` in `src/pe_runtime/base.fd` + extern decls in `lower.fd`) and by the stack-probe fix: native frames are ~140 KB (one slot per IR value), so deep recursion outran the Windows guard page — every function now emits a `__chkstk`-style page-touch loop after `sub rsp` when the frame exceeds 4 KB (both `pe_ir.fd` and `src/pe.rs`; verified `deep(200)`×144 KB frames and typechecking `compiler/main.fd` end-to-end).
+- [x] 71. Time a few programs as C build vs native build (`bench_stringbuilder`, the JSON parser). — **measured**: bounded string/vec/hashmap workload built via `zig cc` C path runs 0.29 s vs 0.57 s native-emitted (~2×), outputs identical.
 - [ ] 72. Sample where the time goes, using the function map and debugger, to find the next hot spots.
 
 ### Runtime hot paths
 
-- [ ] 73. String concatenation computes each length once and copies in bulk, not byte by byte.
-- [ ] 74. String equality compares lengths, then memory.
-- [ ] 75. The runtime reuses string lengths it already knows instead of recounting.
-- [ ] 76. Large struct copies use bulk moves (`rep movsq`).
-- [ ] 77. HashMap hashing avoids byte-by-byte loops where possible.
-- [ ] 78. Printing numbers uses one buffer, with no allocation per character.
-- [ ] 79. Vec growth doubles its capacity.
+- [x] 73. String concatenation computes each length once and copies in bulk, not byte by byte. — `p_str_concat` calls imported `strlen` once per side and `memcpy` for both halves (both `src/pe.rs::gen_str_concat` and `compiler/pe_ir_stubs.fd::PeirGen_gen_str_concat`); concat test + `strings.fd` identical on fidesc/fid-dev emits vs interp.
+- [x] 74. String equality compares lengths, then memory. — `pert_str_equal` in `src/pe_runtime/base.fd` (strlen + length check + memcmp) resolves `p_str_equal` in emitted exes on both backends; HashMap probe loop benefits since `HashMap_find_slot` calls `p_str_equal`. Verified: `eq1-ok…truefalse…1` identical native vs interp vs fid emit.
+- [x] 75. The runtime reuses string lengths it already knows instead of recounting. — `p_sb_append`/`p_sb_to_str`/`p_str_concat` each compute the length once (strlen or tracked `len`/`cap` fields) and feed it to `memcpy`; no second counting pass remains in those stubs (both backends).
+- [x] 76. Large struct copies use bulk moves (`rep movsq`). — `emit_copy_rcx_to_rax` emits `rep movsq` + `rep movsb` for copies ≥ 128 bytes (saving/restoring RSI/RDI), keeping the qword loop below; verified 256-byte struct by-value arg + field mutation identical on both emits.
+- [x] 77. HashMap hashing avoids byte-by-byte loops where possible. — `p_str_hash` (stdlib/core.fd) now mixes 8 bytes per iteration using the `(w - 0x0101..) & ~w & 0x8080..` zero-byte test, with a same-page guard (page offset ≤ 4088) so word reads can't fault, falling back to the byte loop for the page-straddling tail. Verified: 40 keys of length 1–40 identical results interp/Rust-emit/Fides-emit. NOTE: Fides parses `a & b != c` as `a & (b != c)` (C precedence) while the Rust parser binds `&` above `!=` — always parenthesize such expressions.
+- [x] 78. Printing numbers uses one buffer, with no allocation per character. — already satisfied: `p_to_str`/`pert_to_str` render digits into one stack buffer then one `p_malloc` copy; no per-digit allocation exists.
+- [x] 79. Vec growth doubles its capacity. — `p_vec_push` reallocates `cap*2` (both `src/pe.rs` and `compiler/pe_ir_stubs.fd`).
 
 ### Cheap code improvements (no register allocator needed)
 
-- [ ] 80. Remove a load right after a store to the same slot.
-- [ ] 81. Use constants as immediates instead of loading them from a slot.
-- [ ] 82. Fuse compare and branch (`cmp` + `jcc` instead of `setcc` + `test`).
-- [ ] 83. Move call arguments straight into registers.
-- [ ] 84. Reuse the slots of dead values, so frames shrink and big-frame probes disappear.
-- [ ] 85. Bring the 77 KB frames down to a few KB, for fewer cache misses.
-- [ ] 86. Inline tiny runtime calls such as `p_vec_len`.
+- [x] 80. Remove a load right after a store to the same slot. — encoder-level peephole: `mov_mem_rbp_reg` records (disp, src reg, code end); `mov_reg_mem_rbp` with `code.len()` unchanged forwards the register (skips 1,468 loads in one small exe). `place_label` clears state so branch targets can't wrongly forward. Both `src/pe.rs` (`PeCodeGen`) and `compiler/pe_ir_enc.fd` (`PeirEnc`).
+- [x] 81. Use constants as immediates instead of loading them from a slot. — `const_vals` map on `PeStackFrame` (Rust) / `PeStackFrame.const_vals` + `pe_idmap_has` (Fides); `ConstInt`/`ConstBool` record their value and binop arms move it in via `mov imm` instead of a slot load. Arith/classify tests identical both paths.
+- [x] 82. Fuse compare and branch (`cmp` + `jcc` instead of `setcc` + `test`). — `pending_cmp` records the cc when a comparison is followed by a `Branch` on its result; the branch emits `jcc` on still-live flags (setcc/movzx/mov preserve flags). fidesc and fid-dev emit identical residual `test;jne` counts (138 = non-fusible conds: loaded bools, call results, `!`).
+- [x] 83. Move call arguments straight into registers. — a known-constant call arg (`const_vals` tracking) moves into rcx/rdx/r8/r9 or the stack-arg temp via `mov imm` instead of a slot load (both Call arms).
+- [x] 84. Reuse the slots of dead values, so frames shrink and big-frame probes disappear. — block-local temporaries (def + all uses in one block) share an 8-byte slot pool; multi-block/loop-carried values and params keep permanent slots. Operand-driven free at last use, assignments computed in an emit-order pre-pass (both `src/pe.rs::gen_function` via `inst_operands` and `compiler/pe_ir.fd` via `peir_inst_operands`/`peir_recyclable`).
+- [x] 85. Bring the 77 KB frames down to a few KB, for fewer cache misses. — measured: max `sub rsp` frame in a mixed test dropped ~140 KB → **1.28 KB** (~100×); probes still emitted for frames > 4 KB as a safety net.
+- [x] 86. Inline tiny runtime calls such as `p_vec_len`. — `p_vec_len`/`p_map_len` inline to `mov rax,[[slot]+8]`; `p_map_is_empty`/`p_string_is_empty` inline to load+test+sete (fires only when no `pert_*`/user override). Also hardened the string stubs: `p_string_len`/`p_string_bytes` delegate to imported `strlen`, `p_string_clone` uses strlen+malloc+memcpy, `p_str_join_n` rewriten two-pass (strlen once per element + memcpy cursor, was O(n²) byte loops), `p_string_parse_int`/`p_string_is_empty`/`p_string_starts_with` movzx after byte loads, and `p_string_starts_with` actually compares (was a stub always returning 1).
 
 ### Targets
 

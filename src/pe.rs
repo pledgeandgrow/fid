@@ -105,6 +105,12 @@ struct X86Encoder {
     pending_rip_refs: Vec<PendingRipRef>,
     /// Next label ID
     next_label: u32,
+    /// Peephole: (disp, src, code position after the instruction) of the
+    /// last emitted `mov [rbp+disp], src`, or None. `mov_reg_mem_rbp`
+    /// forwards the register instead of reloading when no byte was emitted
+    /// in between (code is append-only). Cleared by place_label — a load at
+    /// a branch target is never wrongly forwarded.
+    last_store: Option<(i32, Reg, usize)>,
 }
 
 impl X86Encoder {
@@ -115,6 +121,7 @@ impl X86Encoder {
             pending_labels: Vec::new(),
             pending_rip_refs: Vec::new(),
             next_label: 0,
+            last_store: None,
         }
     }
 
@@ -127,6 +134,7 @@ impl X86Encoder {
 
     /// Mark a label at the current code position
     fn place_label(&mut self, label: u32) {
+        self.last_store = None;
         self.labels.insert(label, self.code.len());
     }
 
@@ -445,6 +453,18 @@ impl X86Encoder {
 
     /// mov r64, [rbp + disp]
     fn mov_reg_mem_rbp(&mut self, dst: Reg, disp: i32) {
+        if let Some((d, src, end)) = self.last_store {
+            if d == disp && end == self.code.len() {
+                // The slot was just written from src and nothing was emitted
+                // since — forward the register, skip the reload.
+                self.last_store = None;
+                if dst != src {
+                    self.mov_rr(dst, src);
+                }
+                return;
+            }
+        }
+        self.last_store = None;
         self.rex(true, dst.is_extended(), false, false);
         self.emit_u8(0x8B);
         self.emit_mem_rbp(dst.code(), disp);
@@ -455,6 +475,7 @@ impl X86Encoder {
         self.rex(true, src.is_extended(), false, false);
         self.emit_u8(0x89);
         self.emit_mem_rbp(src.code(), disp);
+        self.last_store = Some((disp, src, self.code.len()));
     }
 
     /// Emit RBP-relative memory operand (ModR/M + optional SIB + displacement)
@@ -1782,7 +1803,7 @@ fn build_pe_file(text: &[u8], rdata: &[u8], entry_point_rva: u32, import_dir_rva
     pe.extend_from_slice(&0u32.to_le_bytes()); // CheckSum
     pe.extend_from_slice(&3u16.to_le_bytes()); // Subsystem = CONSOLE
     pe.extend_from_slice(&0x0000u16.to_le_bytes()); // DllCharacteristics: none (testing)
-    pe.extend_from_slice(&0x10000000u64.to_le_bytes()); // SizeOfStackReserve = 256MB
+    pe.extend_from_slice(&0x100000000u64.to_le_bytes()); // SizeOfStackReserve = 4GB (native frames are large: one slot per IR value, no reuse — deep recursion in checker/parser needs it)
     pe.extend_from_slice(&0x100000u64.to_le_bytes()); // SizeOfStackCommit = 1MB
     pe.extend_from_slice(&0x100000u64.to_le_bytes()); // SizeOfHeapReserve
     pe.extend_from_slice(&0x1000u64.to_le_bytes()); // SizeOfHeapCommit
@@ -1880,6 +1901,10 @@ struct PeStackFrame {
     offsets: HashMap<u32, i64>,
     size: i64,
     alloca_slots: HashMap<u32, i64>,
+    /// Value ids known to hold an integer constant — use sites can move the
+    /// immediate straight into a register instead of loading the slot
+    /// (pe-roadmap item 81).
+    const_vals: HashMap<u32, i64>,
 }
 
 impl PeStackFrame {
@@ -1888,6 +1913,7 @@ impl PeStackFrame {
             offsets: HashMap::new(),
             size: 0,
             alloca_slots: HashMap::new(),
+            const_vals: HashMap::new(),
         }
     }
 
@@ -1967,6 +1993,10 @@ struct PeCodeGen {
     /// Functions a program refers to by name (thread and task entry points):
     /// what `pe_fn_lookup` can find
     named_fns: Vec<String>,
+    /// cmp+branch fusion: (jcc code, cond value id) set when a comparison
+    /// is followed by a Branch on its result — the Branch then jumps on the
+    /// compare's still-live flags.
+    pending_cmp: Option<(u8, u32)>,
 }
 
 /// An `extern "C"` function of msvcrt.dll or kernel32.dll: called through a
@@ -2008,6 +2038,22 @@ fn pert_name(name: &str) -> Option<String> {
     name.strip_prefix("p_").or_else(|| name.strip_prefix("__")).map(|rest| format!("pert_{}", rest))
 }
 
+
+/// The jcc code jumping when an integer comparison `a OP b` holds (the
+/// setcc-style numbering gen_int_binop uses: 4=E, 5=NE, C=L, D=GE, E=LE,
+/// F=G), or None for a non-comparison.
+fn int_cmp_cc(op: &BinOp) -> Option<u8> {
+    match op {
+        BinOp::Eq => Some(0x4),
+        BinOp::Neq => Some(0x5),
+        BinOp::Lt => Some(0xC),
+        BinOp::GtEq => Some(0xD),
+        BinOp::LtEq => Some(0xE),
+        BinOp::Gt => Some(0xF),
+        _ => None,
+    }
+}
+
 impl PeCodeGen {
     fn new() -> Self {
         PeCodeGen {
@@ -2028,6 +2074,7 @@ impl PeCodeGen {
             stub_externs: Vec::new(),
             c_overrides: std::collections::BTreeMap::new(),
             named_fns: Vec::new(),
+            pending_cmp: None,
         }
     }
 
@@ -2108,13 +2155,17 @@ impl PeCodeGen {
         self.iat_rdata_offsets = rdata.iat_offsets.clone();
 
         // 2b. Append module-level mutable globals to .rdata (section is writable)
-        // Each global gets 8 bytes of storage, initialized with the constant value.
+        // Each global gets storage for its type — a struct/enum global needs
+        // the full size (a Store does a struct copy), not just 8 bytes.
         let mut global_names_pe: Vec<String> = module.globals.keys().cloned().collect();
         global_names_pe.sort();
+        let mut global_str_patches: Vec<(usize, usize)> = Vec::new();
         for name in &global_names_pe {
             let (ty, init_expr) = &module.globals[name];
-            let off = rdata.data.len();
-            // Compute the 8-byte initial value
+            let gsize = module.type_size(ty).max(8) as usize;
+            // Compute the 8-byte initial value; a string literal records
+            // its .rdata offset for an absolute-VA patch after layout.
+            let mut str_off: Option<usize> = None;
             let bytes: [u8; 8] = match init_expr {
                 crate::ast::Expr::IntLit(v) => (*v as i64).to_le_bytes(),
                 crate::ast::Expr::BoolLit(b) => (if *b { 1i64 } else { 0 }).to_le_bytes(),
@@ -2122,9 +2173,18 @@ impl PeCodeGen {
                     if *ty == IrType::F32 { (*f as f32).to_le_bytes().iter().chain([0u8;4].iter()).cloned().collect::<Vec<u8>>().try_into().unwrap() }
                     else { (*f as f64).to_le_bytes() }
                 }
+                crate::ast::Expr::StringLit(s) => {
+                    str_off = Some(rdata.add_string(s));
+                    0i64.to_le_bytes()
+                }
                 _ => 0i64.to_le_bytes(), // zero-initialize
             };
+            let off = rdata.data.len();
+            if let Some(soff) = str_off {
+                global_str_patches.push((off, soff));
+            }
             rdata.data.extend_from_slice(&bytes);
+            rdata.data.resize(off + gsize, 0);
             self.global_rdata_offsets.insert(name.clone(), off);
         }
 
@@ -2284,6 +2344,13 @@ impl PeCodeGen {
         // 10. Patch import table RVAs in .rdata
         rdata.patch_rvas(rdata_rva);
 
+        // 10b. Patch str-literal global initializers: each slot holds the
+        // absolute VA of its string (image loads at preferred base — no relocs).
+        for (slot_off, str_off) in &global_str_patches {
+            let va = IMAGE_BASE + rdata_rva as u64 + *str_off as u64;
+            rdata.data[*slot_off..*slot_off + 8].copy_from_slice(&va.to_le_bytes());
+        }
+
         // 11. Calculate PE metadata
         let import_dir_rva = rdata_rva + rdata.import_dir_offset as u32;
         let iat_rva = rdata_rva + rdata.iat_offset as u32;
@@ -2345,13 +2412,15 @@ impl PeCodeGen {
         self.iat_rdata_offsets.clear();
 
         // 2b. Append module-level mutable globals to .rdata (writable section)
-        // Each global gets 8 bytes of storage, initialized with the constant value.
+        // Each global gets storage for its type — a struct/enum global needs
+        // the full size (a Store does a struct copy), not just 8 bytes.
         // This is critical for bare-metal mode: GDT, IDT, page tables need fixed storage.
         let mut global_names_elf: Vec<String> = module.globals.keys().cloned().collect();
         global_names_elf.sort();
         for name in &global_names_elf {
             let (ty, init_expr) = &module.globals[name];
             let off = rdata.data.len();
+            let gsize = module.type_size(ty).max(8) as usize;
             let bytes: [u8; 8] = match init_expr {
                 crate::ast::Expr::IntLit(v) => (*v as i64).to_le_bytes(),
                 crate::ast::Expr::BoolLit(b) => (if *b { 1i64 } else { 0 }).to_le_bytes(),
@@ -2362,6 +2431,7 @@ impl PeCodeGen {
                 _ => 0i64.to_le_bytes(), // zero-initialize
             };
             rdata.data.extend_from_slice(&bytes);
+            rdata.data.resize(off + gsize, 0);
             self.global_rdata_offsets.insert(name.clone(), off);
         }
 
@@ -2500,12 +2570,15 @@ impl PeCodeGen {
         self.iat_rdata_offsets.clear();
 
         // 2b. Append module-level mutable globals to .rdata (writable section)
+        // Each global gets storage for its type — a struct/enum global needs
+        // the full size (a Store does a struct copy), not just 8 bytes.
         // Critical for bare-metal: GDT, IDT, page tables need fixed storage.
         let mut global_names: Vec<String> = module.globals.keys().cloned().collect();
         global_names.sort();
         for name in &global_names {
             let (ty, init_expr) = &module.globals[name];
             let off = rdata.data.len();
+            let gsize = module.type_size(ty).max(8) as usize;
             let bytes: [u8; 8] = match init_expr {
                 crate::ast::Expr::IntLit(v) => (*v as i64).to_le_bytes(),
                 crate::ast::Expr::BoolLit(b) => (if *b { 1i64 } else { 0 }).to_le_bytes(),
@@ -2516,6 +2589,7 @@ impl PeCodeGen {
                 _ => 0i64.to_le_bytes(), // zero-initialize
             };
             rdata.data.extend_from_slice(&bytes);
+            rdata.data.resize(off + gsize, 0);
             self.global_rdata_offsets.insert(name.clone(), off);
         }
 
@@ -3309,11 +3383,97 @@ impl PeCodeGen {
 
         // Allocate stack frame (sorted for deterministic layout)
         let mut frame = PeStackFrame::new();
+
+        // ── Slot reuse (pe-roadmap items 84-85) ──
+        // A value defined and used entirely inside one basic block is a
+        // temporary: give it a slot from a shared pool rather than a private
+        // slot. The pool frees a slot once the temp's last use passes in scan
+        // order — safe for any CFG because the temp's def dominates its uses
+        // and every block re-execution re-defines it first. Params and
+        // cross-block/loop-carried values keep permanent slots.
+        let mut def_block: HashMap<u32, u32> = HashMap::new();
+        let mut n_use_blocks: HashMap<u32, u32> = HashMap::new();
+        let mut a_use_block: HashMap<u32, u32> = HashMap::new();
+        let mut last_use: HashMap<u32, u32> = HashMap::new();
+        let mut ops: Vec<ValueId> = Vec::new();
+        let mut pos: u32 = 0;
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for &iid in &block.instructions {
+                if let Some(inst) = func.instructions.get(&iid) {
+                    def_block.insert(iid.0, bi as u32);
+                    if let Inst::TryUnwrap { ok_dst, .. } = inst {
+                        def_block.insert(ok_dst.0, bi as u32);
+                    }
+                    inst_operands(inst, &mut ops);
+                    for op in &ops {
+                        if a_use_block.get(&op.0) != Some(&(bi as u32)) {
+                            *n_use_blocks.entry(op.0).or_insert(0) += 1;
+                            a_use_block.insert(op.0, bi as u32);
+                        }
+                        last_use.insert(op.0, pos);
+                    }
+                    ops.clear();
+                }
+                pos += 1;
+            }
+        }
+        let recyclable = |v: u32| -> bool {
+            let Some(&db) = def_block.get(&v) else { return false; };
+            match n_use_blocks.get(&v) {
+                None => true,
+                Some(&1) => a_use_block[&v] == db,
+                _ => false,
+            }
+        };
         let mut sorted_values: Vec<(&ValueId, &ValueMeta)> = func.values.iter().collect();
         sorted_values.sort_by(|a, b| a.0.0.cmp(&b.0.0));
         for (vid, meta) in &sorted_values {
+            if recyclable(vid.0) { continue; }
             let size = module.type_size(&meta.ty).max(8);
             frame.alloc(**vid, size);
+        }
+        // Assign recyclable values pool slots in scan order — the same order
+        // the emit loop runs in, so frees/assignments line up exactly.
+        let mut dead_at: HashMap<u32, Vec<u32>> = HashMap::new();
+        // last_use is a HashMap — iterate sorted by value id so free_slots
+        // push order (and therefore slot assignment) is deterministic.
+        let mut dead: Vec<(u32, u32)> = last_use.iter().map(|(&v, &lu)| (v, lu)).collect();
+        dead.sort();
+        for (v, lu) in dead {
+            if recyclable(v) {
+                dead_at.entry(lu).or_default().push(v);
+            }
+        }
+        let mut free_slots: Vec<i64> = Vec::new();
+        let mut pos: u32 = 0;
+        for block in &func.blocks {
+            for &iid in &block.instructions {
+                if let Some(vids) = dead_at.get(&pos) {
+                    for &v in vids {
+                        if let Some(&off) = frame.offsets.get(&v) {
+                            free_slots.push(off);
+                        }
+                    }
+                }
+                // Assign offsets to this inst's result value(s) if recyclable.
+                let mut assign = |vid: u32, frame: &mut PeStackFrame, free_slots: &mut Vec<i64>| {
+                    if frame.offsets.contains_key(&vid) || !recyclable(vid) { return; }
+                    let size = func.values.get(&ValueId(vid))
+                        .map(|m| module.type_size(&m.ty).max(8))
+                        .unwrap_or(8);
+                    let off = if size <= 8 {
+                        free_slots.pop().unwrap_or_else(|| frame.alloc_raw(8))
+                    } else {
+                        frame.alloc_raw(size as i64)
+                    };
+                    frame.offsets.insert(vid, off);
+                };
+                assign(iid.0, &mut frame, &mut free_slots);
+                if let Some(Inst::TryUnwrap { ok_dst, .. }) = func.instructions.get(&iid) {
+                    assign(ok_dst.0, &mut frame, &mut free_slots);
+                }
+                pos += 1;
+            }
         }
         // Pre-allocate alloca data slots (sorted for deterministic layout)
         let mut sorted_insts: Vec<(&ValueId, &Inst)> = func.instructions.iter().collect();
@@ -3330,6 +3490,24 @@ impl PeCodeGen {
         let stack_size = ((frame.size + 32 + 15) & !15) as i64;
         let stack_size = stack_size.max(64);
         self.enc.sub_rsp_i32(stack_size as i32);
+
+        // Stack probes: touch every page of the new frame top-down so Windows
+        // commits it. Frames here are huge (one slot per IR value, no reuse),
+        // so a single sub lands far below the guard page; without probing, the
+        // next deep write or outgoing-arg push faults instead of growing the
+        // stack. (Same job as __chkstk.)
+        if stack_size > 4096 {
+            let probe_loop = self.enc.alloc_label();
+            let probe_done = self.enc.alloc_label();
+            self.enc.mov_rr(Reg::Rax, Reg::Rbp);
+            self.enc.place_label(probe_loop);
+            self.enc.add_r_i32(Reg::Rax, -4096);
+            self.enc.cmp_rr(Reg::Rax, Reg::Rsp);
+            self.enc.jcc_label(0x6, probe_done); // jbe: rax <= rsp
+            self.enc.mov_reg8_ptr(Reg::R11, Reg::Rax); // touch page
+            self.enc.jmp_label(probe_loop);
+            self.enc.place_label(probe_done);
+        }
 
         // Store params from registers
         let arg_regs = [Reg::Rcx, Reg::Rdx, Reg::R8, Reg::R9];
@@ -3355,10 +3533,12 @@ impl PeCodeGen {
         for block in &func.blocks {
             let blabel = *self.block_labels.get(&(name.to_string(), block.id.0)).unwrap();
             self.enc.place_label(blabel);
+            self.pending_cmp = None;
 
-            for &inst_id in &block.instructions {
+            for (i, &inst_id) in block.instructions.iter().enumerate() {
                 if let Some(inst) = func.get_inst(inst_id) {
-                    self.gen_inst(inst_id, inst, &mut frame, func, module, name);
+                    let next = block.instructions.get(i + 1).and_then(|nid| func.get_inst(*nid));
+                    self.gen_inst(inst_id, inst, next, &mut frame, func, module, name);
                 }
             }
         }
@@ -3374,6 +3554,7 @@ impl PeCodeGen {
         &mut self,
         id: ValueId,
         inst: &Inst,
+        next: Option<&Inst>,
         frame: &mut PeStackFrame,
         func: &IrFunction,
         module: &IrModule,
@@ -3386,6 +3567,7 @@ impl PeCodeGen {
             Inst::ConstInt { value, .. } => {
                 self.enc.mov_imm64(Reg::Rax, *value as u64);
                 self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
+                frame.const_vals.insert(id.0, *value);
             }
 
             Inst::ConstBool { value } => {
@@ -3440,6 +3622,8 @@ impl PeCodeGen {
             Inst::BinOp { op, left, right, ty } => {
                 let loff = frame.offset(*left) as i32;
                 let roff = frame.offset(*right) as i32;
+                let lconst = frame.const_vals.get(&left.0).copied();
+                let rconst = frame.const_vals.get(&right.0).copied();
                 // A comparison's type is Bool: its operands' type decides
                 let operand_ty = func.values.get(left).map(|m| m.ty.clone()).unwrap_or(IrType::I64);
                 if ty.is_float() {
@@ -3447,7 +3631,18 @@ impl PeCodeGen {
                 } else if operand_ty.is_float() {
                     self.gen_float_binop(op, loff, roff, dst, &operand_ty);
                 } else {
-                    self.gen_int_binop(op, loff, roff, dst);
+                    self.gen_int_binop(op, loff, roff, dst, lconst, rconst);
+                    // cmp+branch fusion (pe-roadmap item 82): a comparison
+                    // feeding the next instruction's Branch keeps its flags
+                    // live through setcc/movzx/mov — the branch jcc's on them
+                    // directly instead of reloading the slot and testing.
+                    if let Some(cc) = int_cmp_cc(op) {
+                        if let Some(Inst::Branch { cond, .. }) = next {
+                            if *cond == id {
+                                self.pending_cmp = Some((cc, id.0));
+                            }
+                        }
+                    }
                 }
             }
 
@@ -3627,11 +3822,20 @@ impl PeCodeGen {
             }
 
             Inst::Branch { cond, then, else_ } => {
+                let then_label = *self.block_labels.get(&(func_name.to_string(), then.0)).unwrap();
+                let else_label = *self.block_labels.get(&(func_name.to_string(), else_.0)).unwrap();
+                if let Some((cc, vid)) = self.pending_cmp.take() {
+                    if vid == cond.0 {
+                        // The compare just emitted left its flags live:
+                        // jump on the condition directly.
+                        self.enc.jcc_label(cc, then_label);
+                        self.enc.jmp_label(else_label);
+                        return;
+                    }
+                }
                 let coff = frame.offset(*cond) as i32;
                 self.enc.mov_reg_mem_rbp(Reg::Rax, coff);
                 self.enc.test_rr(Reg::Rax, Reg::Rax);
-                let then_label = *self.block_labels.get(&(func_name.to_string(), then.0)).unwrap();
-                let else_label = *self.block_labels.get(&(func_name.to_string(), else_.0)).unwrap();
                 self.enc.jcc_label(0x5, then_label); // jne
                 self.enc.jmp_label(else_label);
             }
@@ -3734,6 +3938,41 @@ impl PeCodeGen {
                 let target_func = self.resolve_call(&target_func);
                 let target_func = target_func.as_str();
 
+                // Inline tiny runtime calls (pe-roadmap item 86): when the
+                // resolved callee is a machine stub and no Fides override
+                // stands in for it, emit its body at the call site — no arg
+                // marshaling, shadow space, or call/ret overhead.
+                if args.len() == 1 && !self.module_fns.contains(target_func) {
+                    let aoff = frame.offset(args[0]) as i32;
+                    match target_func {
+                        "p_vec_len" | "p_map_len" => {
+                            // rax = [[slot] + 8]
+                            self.enc.mov_reg_mem_rbp(Reg::Rax, aoff);
+                            self.enc.mov_reg_mem_disp(Reg::Rax, Reg::Rax, 8);
+                            self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
+                            return;
+                        }
+                        "p_map_is_empty" | "p_string_is_empty" => {
+                            self.enc.mov_reg_mem_rbp(Reg::Rax, aoff);
+                            if target_func == "p_map_is_empty" {
+                                // rax = [ptr + 8] (len)
+                                self.enc.mov_reg_mem_disp(Reg::Rax, Reg::Rax, 8);
+                            } else {
+                                // rax = first byte of the C string
+                                // (mov r8,[m] leaves upper bits dirty: movzx)
+                                self.enc.mov_reg8_ptr(Reg::Rax, Reg::Rax);
+                                self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
+                            }
+                            self.enc.test_rr(Reg::Rax, Reg::Rax);
+                            self.enc.setcc_r(0x4, Reg::Rax); // sete
+                            self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
+                            self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
                 // A Fides function standing in for a runtime builtin (called
                 // without one) takes a null `__env` first
                 let mut call_args: Vec<Option<ValueId>> = args.iter().map(|a| Some(*a)).collect();
@@ -3745,11 +3984,17 @@ impl PeCodeGen {
                 let stack_args = if call_args.len() > 4 { call_args.len() - 4 } else { 0 };
                 let call_space = ((32 + stack_args * 8 + 15) & !15) as i32;
 
-                // Load args into registers
+                // Load args into registers (item 83): a known-constant arg
+                // moves in as an immediate instead of a slot load.
                 for (i, arg) in call_args.iter().enumerate() {
                     if i < 4 {
                         match arg {
-                            Some(a) => self.enc.mov_reg_mem_rbp(arg_regs[i], frame.offset(*a) as i32),
+                            Some(a) => {
+                                match frame.const_vals.get(&a.0).copied() {
+                                    Some(v) => self.enc.mov_imm64(arg_regs[i], v as u64),
+                                    None => self.enc.mov_reg_mem_rbp(arg_regs[i], frame.offset(*a) as i32),
+                                }
+                            }
                             None => self.enc.xor_rr(arg_regs[i], arg_regs[i]),
                         }
                     }
@@ -3760,7 +4005,12 @@ impl PeCodeGen {
                 for (i, arg) in call_args.iter().enumerate().skip(4) {
                     let stack_pos = 32 + ((i - 4) as i32) * 8;
                     match arg {
-                        Some(a) => self.enc.mov_reg_mem_rbp(Reg::Rax, frame.offset(*a) as i32),
+                        Some(a) => {
+                            match frame.const_vals.get(&a.0).copied() {
+                                Some(v) => self.enc.mov_imm64(Reg::Rax, v as u64),
+                                None => self.enc.mov_reg_mem_rbp(Reg::Rax, frame.offset(*a) as i32),
+                            }
+                        }
                         None => self.enc.xor_rr(Reg::Rax, Reg::Rax),
                     }
                     self.enc.mov_mem_disp_reg(Reg::Rsp, stack_pos, Reg::Rax);
@@ -4032,9 +4282,17 @@ impl PeCodeGen {
     }
 
     /// Generate integer binary operation
-    fn gen_int_binop(&mut self, op: &BinOp, loff: i32, roff: i32, dst: i32) {
-        self.enc.mov_reg_mem_rbp(Reg::Rax, loff);
-        self.enc.mov_reg_mem_rbp(Reg::Rcx, roff);
+    fn gen_int_binop(&mut self, op: &BinOp, loff: i32, roff: i32, dst: i32, lconst: Option<i64>, rconst: Option<i64>) {
+        // A constant operand moves in as an immediate, not a slot load
+        // (pe-roadmap item 81).
+        match lconst {
+            Some(v) => self.enc.mov_imm64(Reg::Rax, v as u64),
+            None => self.enc.mov_reg_mem_rbp(Reg::Rax, loff),
+        }
+        match rconst {
+            Some(v) => self.enc.mov_imm64(Reg::Rcx, v as u64),
+            None => self.enc.mov_reg_mem_rbp(Reg::Rcx, roff),
+        }
 
         match op {
             BinOp::Add => self.enc.add_rr(Reg::Rax, Reg::Rcx),
@@ -6237,6 +6495,25 @@ impl PeCodeGen {
     /// Copy `size` bytes from [rcx] to [rax] (clobbers rax, rcx, rdx):
     /// 8 bytes at a time, then single bytes, never past `size`.
     fn emit_copy_rcx_to_rax(&mut self, size: i32) {
+        if size >= 128 {
+            // Large copies: rep movsq + rep movsb tail. 16x smaller code than
+            // the unrolled loop below; rsi/rdi are callee-saved, so they are
+            // preserved (some emitted frames keep live values in them).
+            self.enc.push(Reg::Rsi);
+            self.enc.push(Reg::Rdi);
+            self.enc.mov_rr(Reg::Rsi, Reg::Rcx); // src
+            self.enc.mov_rr(Reg::Rdi, Reg::Rax); // dst
+            self.enc.mov_imm32(Reg::Rcx, size / 8);
+            self.enc.emit(&[0xF3, 0x48, 0xA5]); // rep movsq
+            let tail = size % 8;
+            if tail > 0 {
+                self.enc.mov_imm32(Reg::Rcx, tail);
+                self.enc.emit(&[0xF3, 0xA4]); // rep movsb
+            }
+            self.enc.pop(Reg::Rdi);
+            self.enc.pop(Reg::Rsi);
+            return;
+        }
         let mut offset: i32 = 0;
         while offset + 8 <= size {
             self.enc.mov_reg_mem_disp(Reg::Rdx, Reg::Rcx, offset);
@@ -6314,6 +6591,8 @@ impl PeCodeGen {
     // ─── String Runtime Stubs ───
 
     /// p_str_concat(rcx=left *u8, rdx=right *u8) -> rax=*u8
+    /// Each length is counted once by msvcrt strlen and both halves copy in
+    /// bulk via memcpy - not byte-by-byte loops.
     fn gen_str_concat(&mut self) {
         let label = *self.func_labels.get("p_str_concat").unwrap();
         self.enc.place_label(label);
@@ -6323,82 +6602,51 @@ impl PeCodeGen {
         self.enc.push(Reg::R12);
         self.enc.push(Reg::R13);
         self.enc.push(Reg::R14);
-        self.enc.sub_rsp_i32(40); // 32 shadow + 8 alignment
+        self.enc.push(Reg::R15);
+        self.enc.sub_rsp_i32(48); // 32 shadow + 16 locals
 
         // r12 = left, r13 = right
         self.enc.mov_rr(Reg::R12, Reg::Rcx);
         self.enc.mov_rr(Reg::R13, Reg::Rdx);
 
-        // r14 = strlen(left) + strlen(right)
-        self.enc.xor_self(Reg::R14);
-        self.enc.mov_rr(Reg::Rax, Reg::R12);
-        let sc1b = self.enc.alloc_label();
-        self.enc.place_label(sc1b);
-        self.enc.xor_self(Reg::Rcx); // zero rcx so test_rr checks only the byte
-        self.enc.mov_reg8_mem(Reg::Rcx, Reg::Rax);
-        self.enc.test_rr(Reg::Rcx, Reg::Rcx);
-        let sc1done = self.enc.alloc_label();
-        self.enc.jcc_label(0x4, sc1done); // je — null found
-        self.enc.inc_r(Reg::R14);
-        self.enc.inc_r(Reg::Rax);
-        self.enc.jmp_label(sc1b);
-        self.enc.place_label(sc1done);
+        let strlen_off = self.iat_off(import_slot("strlen").unwrap());
+        let memcpy_off = self.iat_off(import_slot("memcpy").unwrap());
 
-        // r14 = len(left). Now add strlen(right) to get total
-        self.enc.mov_rr(Reg::Rax, Reg::R13);
-        let sc2 = self.enc.alloc_label();
-        self.enc.place_label(sc2);
-        self.enc.xor_self(Reg::Rcx);
-        self.enc.mov_reg8_mem(Reg::Rcx, Reg::Rax);
-        self.enc.test_rr(Reg::Rcx, Reg::Rcx);
-        let sc2done = self.enc.alloc_label();
-        self.enc.jcc_label(0x4, sc2done);
-        self.enc.inc_r(Reg::R14);
-        self.enc.inc_r(Reg::Rax);
-        self.enc.jmp_label(sc2);
-        self.enc.place_label(sc2done);
+        // r14 = strlen(left); [rbp-48] = strlen(right)
+        self.enc.mov_rr(Reg::Rcx, Reg::R12);
+        self.enc.call_rip(strlen_off);
+        self.enc.mov_rr(Reg::R14, Reg::Rax);
+        self.enc.mov_rr(Reg::Rcx, Reg::R13);
+        self.enc.call_rip(strlen_off);
+        self.enc.mov_mem_rbp_reg(-48, Reg::Rax);
 
-        // r14 = total length. malloc(r14+1) for null terminator
+        // r15 = buf = p_malloc(len_l + len_r + 1) - +1 for the terminator
         self.enc.mov_rr(Reg::Rcx, Reg::R14);
-        self.enc.inc_r(Reg::Rcx); // +1 for null
+        self.enc.add_rr(Reg::Rcx, Reg::Rax);
+        self.enc.inc_r(Reg::Rcx);
         self.enc.call_label(*self.func_labels.get("p_malloc").unwrap());
-        self.enc.mov_rr(Reg::R9, Reg::Rax); // r9 = result buffer
+        self.enc.mov_rr(Reg::R15, Reg::Rax);
 
-        // Copy left string
-        self.enc.mov_rr(Reg::R8, Reg::R12); // r8 = left ptr
-        self.enc.mov_rr(Reg::R10, Reg::R9); // r10 = dest
-        let cc1 = self.enc.alloc_label();
-        self.enc.place_label(cc1);
-        self.enc.xor_self(Reg::Rax); // zero rax so test_rr checks only the byte
-        self.enc.mov_reg8_mem(Reg::Rax, Reg::R8);
-        self.enc.mov_mem_reg8_ptr(Reg::R10, Reg::Rax);
-        self.enc.test_rr(Reg::Rax, Reg::Rax);
-        let cc1done = self.enc.alloc_label();
-        self.enc.jcc_label(0x4, cc1done);
+        // memcpy(buf, left, len_l)
+        self.enc.mov_rr(Reg::Rcx, Reg::R15);
+        self.enc.mov_rr(Reg::Rdx, Reg::R12);
+        self.enc.mov_rr(Reg::R8, Reg::R14);
+        self.enc.call_rip(memcpy_off);
+
+        // memcpy(buf + len_l, right, len_r + 1) - +1 copies right's NUL,
+        // so the result is exactly "left" + "right" + NUL.
+        self.enc.mov_rr(Reg::Rcx, Reg::R15);
+        self.enc.add_rr(Reg::Rcx, Reg::R14);
+        self.enc.mov_rr(Reg::Rdx, Reg::R13);
+        self.enc.mov_reg_mem_rbp(Reg::R8, -48);
         self.enc.inc_r(Reg::R8);
-        self.enc.inc_r(Reg::R10);
-        self.enc.jmp_label(cc1);
-        self.enc.place_label(cc1done);
+        self.enc.call_rip(memcpy_off);
 
-        // Copy right string (r10 is already at end of left)
-        self.enc.mov_rr(Reg::R8, Reg::R13); // r8 = right ptr
-        let cc2 = self.enc.alloc_label();
-        self.enc.place_label(cc2);
-        self.enc.xor_self(Reg::Rax);
-        self.enc.mov_reg8_mem(Reg::Rax, Reg::R8);
-        self.enc.mov_mem_reg8_ptr(Reg::R10, Reg::Rax);
-        self.enc.test_rr(Reg::Rax, Reg::Rax);
-        let cc2done = self.enc.alloc_label();
-        self.enc.jcc_label(0x4, cc2done);
-        self.enc.inc_r(Reg::R8);
-        self.enc.inc_r(Reg::R10);
-        self.enc.jmp_label(cc2);
-        self.enc.place_label(cc2done);
+        // Return buf
+        self.enc.mov_rr(Reg::Rax, Reg::R15);
 
-        // Return result
-        self.enc.mov_rr(Reg::Rax, Reg::R9);
-
-        self.enc.add_rsp_i32(40);
+        self.enc.add_rsp_i32(48);
+        self.enc.pop(Reg::R15);
         self.enc.pop(Reg::R14);
         self.enc.pop(Reg::R13);
         self.enc.pop(Reg::R12);
@@ -7205,6 +7453,16 @@ impl PeCodeGen {
         let label = *self.func_labels.get("p_vec_get").unwrap();
         self.enc.place_label(label);
 
+        // len = [rcx + 8]
+        self.enc.mov_reg_mem_disp(Reg::Rax, Reg::Rcx, 8);
+        // idx >= len -> panic
+        self.enc.cmp_rr(Reg::Rdx, Reg::Rax);
+        let vg_panic = self.enc.alloc_label();
+        self.enc.jcc_label(0xD, vg_panic); // jge
+        // idx < 0 -> panic
+        self.enc.test_rr(Reg::Rdx, Reg::Rdx);
+        self.enc.jcc_label(0x8, vg_panic); // js
+
         // rax = ptr = [rcx]
         self.enc.mov_reg_ptr(Reg::Rax, Reg::Rcx);
         // rax += rdx * 8
@@ -7213,6 +7471,12 @@ impl PeCodeGen {
         // rax = [rax]
         self.enc.mov_reg_ptr(Reg::Rax, Reg::Rax);
         self.enc.ret();
+
+        self.enc.place_label(vg_panic);
+        self.enc.push(Reg::Rbp);
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_label(*self.func_labels.get("p_panic").unwrap());
+        self.enc.ud2();
     }
 
     /// p_vec_pop(rcx=*Vec) -> rax = i64 (last element, or 0 if empty)
@@ -8020,7 +8284,16 @@ impl PeCodeGen {
         self.enc.place_label(label);
         self.enc.push(Reg::Rbp);
         self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
-        // rax = data ptr, check idx < len
+
+        // len = [rcx + 8]
+        self.enc.mov_reg_mem_disp(Reg::Rax, Reg::Rcx, 8);
+        let vs_panic = self.enc.alloc_label();
+        self.enc.cmp_rr(Reg::Rdx, Reg::Rax);          // idx vs len
+        self.enc.jcc_label(0xD, vs_panic);            // jge -> panic
+        self.enc.test_rr(Reg::Rdx, Reg::Rdx);
+        self.enc.jcc_label(0x8, vs_panic);            // js -> panic
+
+        // rax = data ptr
         self.enc.mov_reg_ptr(Reg::Rax, Reg::Rcx);      // rax = data ptr
         self.enc.mov_rr(Reg::R9, Reg::Rdx);             // r9 = idx
         self.enc.shl_r_i8(Reg::R9, 3);                  // r9 = idx*8
@@ -8029,6 +8302,11 @@ impl PeCodeGen {
         self.enc.xor_self(Reg::Rax);                    // return void (0)
         self.enc.pop(Reg::Rbp);
         self.enc.ret();
+
+        self.enc.place_label(vs_panic);
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_label(*self.func_labels.get("p_panic").unwrap());
+        self.enc.ud2();
     }
 
     /// p_vec_is_empty(rcx=*Vec) -> rax = bool
@@ -8245,23 +8523,14 @@ impl PeCodeGen {
     fn gen_string_len(&mut self) {
         let label = *self.func_labels.get("p_string_len").unwrap();
         self.enc.place_label(label);
+        // Delegate to imported strlen — a real SIMD scan, not a byte loop.
+        // push rbp + sub 32 keeps rsp 16-aligned at the call.
         self.enc.push(Reg::Rbp);
         self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
-        self.enc.push(Reg::R12);
-        // r12 = ptr, rax = counter
-        self.enc.mov_rr(Reg::R12, Reg::Rcx);
-        self.enc.xor_self(Reg::Rax);
-        let loop_label = self.enc.alloc_label();
-        self.enc.place_label(loop_label);
-        self.enc.mov_reg8_mem_idx(Reg::R9, Reg::R12, Reg::Rax); // r9 = ptr[rax] (byte)
-        // Check if byte is 0
-        self.enc.test_rr(Reg::R9, Reg::R9);
-        let done = self.enc.alloc_label();
-        self.enc.jcc_label(0x4, done); // jz
-        self.enc.inc_r(Reg::Rax);
-        self.enc.jmp_label(loop_label);
-        self.enc.place_label(done);
-        self.enc.pop(Reg::R12);
+        self.enc.sub_rsp_i32(32);
+        let strlen_off = self.iat_off(import_slot("strlen").unwrap());
+        self.enc.call_rip(strlen_off);
+        self.enc.add_rsp_i32(32);
         self.enc.pop(Reg::Rbp);
         self.enc.ret();
     }
@@ -8271,6 +8540,8 @@ impl PeCodeGen {
         let label = *self.func_labels.get("p_string_is_empty").unwrap();
         self.enc.place_label(label);
         self.enc.mov_reg8_ptr(Reg::Rax, Reg::Rcx); // load first byte
+        // mov r8,[m] leaves rax's upper bits dirty — clean before the test
+        self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
         self.enc.test_rr(Reg::Rax, Reg::Rax);
         self.enc.setcc_r(0x4, Reg::Rax);
         self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
@@ -8292,26 +8563,28 @@ impl PeCodeGen {
         let loop_label = self.enc.alloc_label();
         let true_label = self.enc.alloc_label();
         let false_label = self.enc.alloc_label();
+        let done_label = self.enc.alloc_label();
         self.enc.place_label(loop_label);
-        // Load prefix byte
+        // Load prefix byte (movzx — upper bits dirty after mov r8,[m])
         self.enc.mov_reg8_ptr(Reg::Rax, Reg::R13);
+        self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
         self.enc.test_rr(Reg::Rax, Reg::Rax);
         self.enc.jcc_label(0x4, true_label); // if prefix byte == 0, match
         // Load str byte
         self.enc.mov_reg8_ptr(Reg::R9, Reg::R12);
+        self.enc.movzx_r32_r8(Reg::R9, Reg::R9);
         self.enc.cmp_rr(Reg::R9, Reg::Rax);
         self.enc.jcc_label(0x5, false_label); // jne
         // Advance both pointers
         self.enc.inc_r(Reg::R12);
         self.enc.inc_r(Reg::R13);
         self.enc.jmp_label(loop_label);
+        self.enc.place_label(false_label);
+        self.enc.xor_self(Reg::Rax);
+        self.enc.jmp_label(done_label);
         self.enc.place_label(true_label);
         self.enc.mov_imm32(Reg::Rax, 1);
-        self.enc.jmp_label(false_label);
-        // false_label is used as exit
-        self.enc.place_label(false_label);
-        // Simplified stub: always return 1
-        self.enc.mov_imm32(Reg::Rax, 1);
+        self.enc.place_label(done_label);
         self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
         self.enc.pop(Reg::R13);
         self.enc.pop(Reg::R12);
@@ -8332,8 +8605,10 @@ impl PeCodeGen {
         let loop_label = self.enc.alloc_label();
         let done = self.enc.alloc_label();
         self.enc.place_label(loop_label);
-        // Load byte
+        // Load byte (movzx — r9's upper bits are dirty after mov r8,[m] and
+        // r9 is added into the result below)
         self.enc.mov_reg8_ptr(Reg::R9, Reg::R12);
+        self.enc.movzx_r32_r8(Reg::R9, Reg::R9);
         // Check if byte < '0' or > '9'
         self.enc.cmp_r8_i8(Reg::R9, b'0' as i8);
         self.enc.jcc_label(0x2, done); // jb
@@ -8355,22 +8630,13 @@ impl PeCodeGen {
     fn gen_string_bytes(&mut self) {
         let label = *self.func_labels.get("p_string_bytes").unwrap();
         self.enc.place_label(label);
-        // Same as strlen
+        // Same as p_string_len: delegate to imported strlen.
         self.enc.push(Reg::Rbp);
         self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
-        self.enc.push(Reg::R12);
-        self.enc.mov_rr(Reg::R12, Reg::Rcx);
-        self.enc.xor_self(Reg::Rax);
-        let loop_label = self.enc.alloc_label();
-        let done = self.enc.alloc_label();
-        self.enc.place_label(loop_label);
-        self.enc.mov_reg8_mem_idx(Reg::R9, Reg::R12, Reg::Rax);
-        self.enc.test_rr(Reg::R9, Reg::R9);
-        self.enc.jcc_label(0x4, done);
-        self.enc.inc_r(Reg::Rax);
-        self.enc.jmp_label(loop_label);
-        self.enc.place_label(done);
-        self.enc.pop(Reg::R12);
+        self.enc.sub_rsp_i32(32);
+        let strlen_off = self.iat_off(import_slot("strlen").unwrap());
+        self.enc.call_rip(strlen_off);
+        self.enc.add_rsp_i32(32);
         self.enc.pop(Reg::Rbp);
         self.enc.ret();
     }
@@ -8384,40 +8650,26 @@ impl PeCodeGen {
         self.enc.push(Reg::R12);
         self.enc.push(Reg::R13);
         self.enc.sub_rsp_i32(32);
-        // First, get strlen
+        let strlen_off = self.iat_off(import_slot("strlen").unwrap());
+        let memcpy_off = self.iat_off(import_slot("memcpy").unwrap());
+        // r12 = src
         self.enc.mov_rr(Reg::R12, Reg::Rcx);
-        self.enc.xor_self(Reg::R13); // r13 = len
-        let len_loop = self.enc.alloc_label();
-        let len_done = self.enc.alloc_label();
-        self.enc.place_label(len_loop);
-        self.enc.mov_reg8_mem_idx(Reg::R9, Reg::R12, Reg::R13);
-        self.enc.test_rr(Reg::R9, Reg::R9);
-        self.enc.jcc_label(0x4, len_done);
-        self.enc.inc_r(Reg::R13);
-        self.enc.jmp_label(len_loop);
-        self.enc.place_label(len_done);
-        // malloc(len+1)
-        self.enc.mov_rr(Reg::Rcx, Reg::R13);
-        self.enc.inc_r(Reg::Rcx); // len+1
+        // r13 = strlen(src)
+        self.enc.call_rip(strlen_off);
+        self.enc.mov_rr(Reg::R13, Reg::Rax);
+        // malloc(len + 1)
+        self.enc.mov_rr(Reg::Rcx, Reg::Rax);
+        self.enc.inc_r(Reg::Rcx);
         self.enc.call_label(*self.func_labels.get("p_malloc").unwrap());
-        // Copy bytes
-        self.enc.mov_rr(Reg::R9, Reg::Rax); // r9 = dest
-        self.enc.xor_self(Reg::R10); // r10 = 0
-        let copy_loop = self.enc.alloc_label();
-        let copy_done = self.enc.alloc_label();
-        self.enc.place_label(copy_loop);
-        self.enc.cmp_rr(Reg::R10, Reg::R13);
-        self.enc.jcc_label(0x3, copy_done); // jae
-        self.enc.mov_reg8_mem_idx(Reg::R8, Reg::R12, Reg::R10);
-        self.enc.mov_mem_idx_reg8(Reg::R9, Reg::R10, Reg::R8);
-        self.enc.inc_r(Reg::R10);
-        self.enc.jmp_label(copy_loop);
-        self.enc.place_label(copy_done);
-        // Null terminate
-        self.enc.xor_self(Reg::R8);
-        self.enc.mov_mem_idx_reg8(Reg::R9, Reg::R10, Reg::R8);
+        // r12 = dest (src is done after rdx is set); memcpy(dest, src, len+1)
+        self.enc.mov_rr(Reg::Rdx, Reg::R12);
+        self.enc.mov_rr(Reg::R8, Reg::R13);
+        self.enc.inc_r(Reg::R8);
+        self.enc.mov_rr(Reg::R12, Reg::Rax);
+        self.enc.mov_rr(Reg::Rcx, Reg::Rax);
+        self.enc.call_rip(memcpy_off);
         // Return dest
-        self.enc.mov_rr(Reg::Rax, Reg::R9);
+        self.enc.mov_rr(Reg::Rax, Reg::R12);
         self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
         self.enc.pop(Reg::R13);
         self.enc.pop(Reg::R12);
@@ -8607,97 +8859,77 @@ impl PeCodeGen {
         self.enc.push(Reg::R12); // sb
         self.enc.push(Reg::R13); // s
         self.enc.push(Reg::R14); // slen
-        self.enc.sub_rsp_i32(40); // 32 + 8 for alignment (3 pushes = 8 mod 16)
+        self.enc.push(Reg::R15); // new_cap / new buf
+        self.enc.sub_rsp_i32(48); // 32 shadow + 16 locals
         // r12 = sb, r13 = s
         self.enc.mov_rr(Reg::R12, Reg::Rcx);
         self.enc.mov_rr(Reg::R13, Reg::Rdx);
-        // Calculate strlen(s) into r14
-        self.enc.xor_self(Reg::R14);
-        let sa_len = self.enc.alloc_label();
-        let sa_len_done = self.enc.alloc_label();
-        self.enc.place_label(sa_len);
-        self.enc.cmp_mem_idx_imm8(Reg::R13, Reg::R14, 0);
-        self.enc.jcc_label(0x4, sa_len_done); // je
-        self.enc.inc_r(Reg::R14);
-        self.enc.jmp_label(sa_len);
-        self.enc.place_label(sa_len_done);
-        // Check if sb->len + slen + 1 > sb->cap
-        // rax = sb->len, rax += slen, rax += 1, cmp rax, sb->cap
+
+        let strlen_off = self.iat_off(import_slot("strlen").unwrap());
+        let memcpy_off = self.iat_off(import_slot("memcpy").unwrap());
+
+        // r14 = slen = strlen(s)
+        self.enc.mov_rr(Reg::Rcx, Reg::R13);
+        self.enc.call_rip(strlen_off);
+        self.enc.mov_rr(Reg::R14, Reg::Rax);
+
+        // needed = sb->len + slen + 1; grow while cap < needed
         self.enc.mov_reg_mem_disp(Reg::Rax, Reg::R12, 8); // rax = sb->len
-        self.enc.add_rr(Reg::Rax, Reg::R14); // rax = len + slen
-        self.enc.inc_r(Reg::Rax); // rax = len + slen + 1
+        self.enc.add_rr(Reg::Rax, Reg::R14);
+        self.enc.inc_r(Reg::Rax); // rax = needed
         self.enc.mov_reg_mem_disp(Reg::Rdx, Reg::R12, 16); // rdx = sb->cap
         self.enc.cmp_rr(Reg::Rax, Reg::Rdx);
         let sa_no_grow = self.enc.alloc_label();
-        self.enc.jcc_label(0x6, sa_no_grow); // jbe — no need to grow
-        // Grow: double cap until it fits
-        // rax = needed size, rdx = current cap
+        self.enc.jcc_label(0x6, sa_no_grow); // jbe - fits
+
+        // r15 = new_cap = cap doubled until it fits
         let sa_grow_loop = self.enc.alloc_label();
         self.enc.place_label(sa_grow_loop);
-        self.enc.add_rr(Reg::Rdx, Reg::Rdx); // cap *= 2
+        self.enc.add_rr(Reg::Rdx, Reg::Rdx);
         self.enc.cmp_rr(Reg::Rax, Reg::Rdx);
-        self.enc.jcc_label(0x7, sa_grow_loop); // ja — still doesn't fit
-        // Now rdx = new cap. Store it.
-        self.enc.mov_mem_disp_reg(Reg::R12, 16, Reg::Rdx);
-        // Realloc buffer: we need to malloc new buffer, copy old, free old
-        // For simplicity, just malloc new size and copy
-        self.enc.mov_rr(Reg::Rcx, Reg::Rdx); // new cap
-        self.enc.sub_rsp_i32(32);
+        self.enc.jcc_label(0x7, sa_grow_loop); // ja - still doesn't fit
+        self.enc.mov_rr(Reg::R15, Reg::Rdx);
+
+        // [rbp-48] = old buf; sb->cap = new_cap
+        self.enc.mov_reg_mem_disp(Reg::Rax, Reg::R12, 0);
+        self.enc.mov_mem_rbp_reg(-48, Reg::Rax);
+        self.enc.mov_mem_disp_reg(Reg::R12, 16, Reg::R15);
+
+        // rax = new buf = p_malloc(new_cap)
+        self.enc.mov_rr(Reg::Rcx, Reg::R15);
         self.enc.call_label(*self.func_labels.get("p_malloc").unwrap());
-        self.enc.add_rsp_i32(32);
-        // rax = new buffer. Copy old buffer contents.
-        // r8 = old buf, r9 = new buf, r10 = 0
-        self.enc.mov_reg_mem_disp(Reg::R8, Reg::R12, 0); // old buf
-        self.enc.mov_rr(Reg::R9, Reg::Rax); // new buf
-        self.enc.xor_self(Reg::R10);
-        // Copy sb->len bytes
-        self.enc.mov_reg_mem_disp(Reg::R11, Reg::R12, 8); // r11 = sb->len
-        let sa_copy = self.enc.alloc_label();
-        let sa_copy_done = self.enc.alloc_label();
-        self.enc.place_label(sa_copy);
-        self.enc.cmp_rr(Reg::R10, Reg::R11);
-        self.enc.jcc_label(0x3, sa_copy_done); // jae
-        self.enc.mov_reg8_mem_idx(Reg::Rax, Reg::R8, Reg::R10);
-        self.enc.mov_mem_idx_reg8(Reg::R9, Reg::R10, Reg::Rax);
-        self.enc.inc_r(Reg::R10);
-        self.enc.jmp_label(sa_copy);
-        self.enc.place_label(sa_copy_done);
-        // Store new buffer first: r9 does not survive the call to p_free
-        self.enc.mov_mem_disp_reg(Reg::R12, 0, Reg::R9);
-        // Free old buffer
-        self.enc.mov_rr(Reg::Rcx, Reg::R8);
-        self.enc.sub_rsp_i32(32);
+
+        // r15 = new buf; memcpy(new buf, old buf, sb->len)
+        self.enc.mov_rr(Reg::R15, Reg::Rax);
+        self.enc.mov_rr(Reg::Rcx, Reg::Rax);
+        self.enc.mov_reg_mem_rbp(Reg::Rdx, -48);
+        self.enc.mov_reg_mem_disp(Reg::R8, Reg::R12, 8);
+        self.enc.call_rip(memcpy_off);
+
+        // sb->buf = new buf; free(old buf)
+        self.enc.mov_mem_disp_reg(Reg::R12, 0, Reg::R15);
+        self.enc.mov_reg_mem_rbp(Reg::Rcx, -48);
         self.enc.call_label(*self.func_labels.get("p_free").unwrap());
-        self.enc.add_rsp_i32(32);
+
         self.enc.place_label(sa_no_grow);
-        // memcpy(sb->buf + sb->len, s, slen)
-        // r8 = sb->buf, r9 = sb->len, r10 = 0
-        self.enc.mov_reg_mem_disp(Reg::R8, Reg::R12, 0); // buf
-        self.enc.mov_reg_mem_disp(Reg::R9, Reg::R12, 8); // len
-        self.enc.add_rr(Reg::R8, Reg::R9); // r8 = buf + len (dest)
-        self.enc.xor_self(Reg::R10);
-        let sa_memcpy = self.enc.alloc_label();
-        let sa_memcpy_done = self.enc.alloc_label();
-        self.enc.place_label(sa_memcpy);
-        self.enc.cmp_rr(Reg::R10, Reg::R14);
-        self.enc.jcc_label(0x3, sa_memcpy_done); // jae
-        self.enc.mov_reg8_mem_idx(Reg::Rax, Reg::R13, Reg::R10);
-        self.enc.mov_mem_idx_reg8(Reg::R8, Reg::R10, Reg::Rax);
-        self.enc.inc_r(Reg::R10);
-        self.enc.jmp_label(sa_memcpy);
-        self.enc.place_label(sa_memcpy_done);
+        // memcpy(sb->buf + sb->len, s, slen + 1) - +1 copies s's NUL
+        self.enc.mov_reg_mem_disp(Reg::Rcx, Reg::R12, 0); // buf
+        self.enc.mov_reg_mem_disp(Reg::Rax, Reg::R12, 8); // len
+        self.enc.add_rr(Reg::Rcx, Reg::Rax); // dest = buf + len
+        self.enc.mov_rr(Reg::Rdx, Reg::R13);
+        self.enc.mov_rr(Reg::R8, Reg::R14);
+        self.enc.inc_r(Reg::R8);
+        self.enc.call_rip(memcpy_off);
+
         // sb->len += slen
         self.enc.mov_reg_mem_disp(Reg::Rax, Reg::R12, 8);
         self.enc.add_rr(Reg::Rax, Reg::R14);
         self.enc.mov_mem_disp_reg(Reg::R12, 8, Reg::Rax);
-        // sb->buf[sb->len] = 0
-        self.enc.mov_reg_mem_disp(Reg::R8, Reg::R12, 0); // buf
-        self.enc.add_rr(Reg::R8, Reg::Rax); // buf + len
-        self.enc.xor_self(Reg::Rdx);
-        self.enc.mov_mem_reg8_ptr(Reg::R8, Reg::Rdx);
-        // Return
+
+        // Return 0
         self.enc.xor_self(Reg::Rax);
-        self.enc.add_rsp_i32(40);
+        self.enc.add_rsp_i32(48);
+        self.enc.pop(Reg::R15);
         self.enc.pop(Reg::R14);
         self.enc.pop(Reg::R13);
         self.enc.pop(Reg::R12);
@@ -8724,36 +8956,21 @@ impl PeCodeGen {
         // malloc(len + 1)
         self.enc.mov_rr(Reg::Rcx, Reg::R14);
         self.enc.inc_r(Reg::Rcx);
-        self.enc.sub_rsp_i32(32);
         self.enc.call_label(*self.func_labels.get("p_malloc").unwrap());
-        self.enc.add_rsp_i32(32);
         self.enc.mov_rr(Reg::R13, Reg::Rax); // r13 = result
-        // memcpy(result, sb->buf, len)
-        self.enc.mov_reg_mem_disp(Reg::R8, Reg::R12, 0); // r8 = sb->buf
-        self.enc.xor_self(Reg::R10);
-        let sts_copy = self.enc.alloc_label();
-        let sts_copy_done = self.enc.alloc_label();
-        self.enc.place_label(sts_copy);
-        self.enc.cmp_rr(Reg::R10, Reg::R14);
-        self.enc.jcc_label(0x3, sts_copy_done); // jae
-        self.enc.mov_reg8_mem_idx(Reg::Rax, Reg::R8, Reg::R10);
-        self.enc.mov_mem_idx_reg8(Reg::R13, Reg::R10, Reg::Rax);
-        self.enc.inc_r(Reg::R10);
-        self.enc.jmp_label(sts_copy);
-        self.enc.place_label(sts_copy_done);
-        // result[len] = 0
-        self.enc.xor_self(Reg::Rax);
-        self.enc.mov_mem_idx_reg8(Reg::R13, Reg::R10, Reg::Rax);
+        // memcpy(result, sb->buf, len + 1) — +1 copies the NUL
+        self.enc.mov_rr(Reg::Rcx, Reg::R13);
+        self.enc.mov_reg_mem_disp(Reg::Rdx, Reg::R12, 0); // rdx = sb->buf
+        self.enc.mov_rr(Reg::R8, Reg::R14);
+        self.enc.inc_r(Reg::R8);
+        let memcpy_off = self.iat_off(import_slot("memcpy").unwrap());
+        self.enc.call_rip(memcpy_off);
         // Free sb->buf
         self.enc.mov_reg_mem_disp(Reg::Rcx, Reg::R12, 0);
-        self.enc.sub_rsp_i32(32);
         self.enc.call_label(*self.func_labels.get("p_free").unwrap());
-        self.enc.add_rsp_i32(32);
         // Free sb struct
         self.enc.mov_rr(Reg::Rcx, Reg::R12);
-        self.enc.sub_rsp_i32(32);
         self.enc.call_label(*self.func_labels.get("p_free").unwrap());
-        self.enc.add_rsp_i32(32);
         // Return result
         self.enc.mov_rr(Reg::Rax, Reg::R13);
         self.enc.add_rsp_i32(40);
@@ -8968,6 +9185,7 @@ impl PeCodeGen {
         self.enc.jcc_label(0x4, done); // jz — NULL command line
         // Skip leading whitespace
         self.enc.place_label(loop_start);
+        self.enc.xor_self(Reg::Rdx); // zero upper bits before byte load
         self.enc.mov_reg8_ptr(Reg::Rdx, Reg::Rcx); // load byte
         self.enc.test_rr(Reg::Rdx, Reg::Rdx);
         self.enc.jcc_label(0x4, done); // jz — end of string
@@ -8983,11 +9201,12 @@ impl PeCodeGen {
         // Skip token until whitespace or end
         let skip_tok = self.enc.alloc_label();
         self.enc.place_label(skip_tok);
+        self.enc.xor_self(Reg::Rdx); // zero upper bits before byte load
         self.enc.mov_reg8_ptr(Reg::Rdx, Reg::Rcx);
         self.enc.test_rr(Reg::Rdx, Reg::Rdx);
         self.enc.jcc_label(0x4, done); // jz — end of string
         self.enc.cmp_r8_i8(Reg::Rdx, ' ' as i8);
-        self.enc.jcc_label(0x4, done); // je — space found, done with token
+        self.enc.jcc_label(0x4, loop_start); // je — space: more tokens may follow
         self.enc.inc_r(Reg::Rcx);
         self.enc.jmp_label(skip_tok);
         self.enc.place_label(done);
@@ -9029,6 +9248,7 @@ impl PeCodeGen {
         self.enc.place_label(scan_start);
         // Skip whitespace
         self.enc.place_label(skip_ws);
+        self.enc.xor_self(Reg::Rdx); // zero upper bits before byte load
         self.enc.mov_reg8_ptr(Reg::Rdx, Reg::R13);
         self.enc.test_rr(Reg::Rdx, Reg::Rdx);
         self.enc.jcc_label(0x4, tok_done); // jz — end
@@ -9046,15 +9266,18 @@ impl PeCodeGen {
         self.enc.jmp_label(tok_done);
         self.enc.place_label(not_this);
         // Skip this token
+        let tok_end = self.enc.alloc_label();
         self.enc.place_label(skip_tok);
+        self.enc.xor_self(Reg::Rdx); // zero upper bits before byte load
         self.enc.mov_reg8_ptr(Reg::Rdx, Reg::R13);
         self.enc.test_rr(Reg::Rdx, Reg::Rdx);
         self.enc.jcc_label(0x4, tok_done); // jz — end
         self.enc.cmp_r8_i8(Reg::Rdx, ' ' as i8);
-        self.enc.jcc_label(0x4, tok_done); // je — space, token done
+        self.enc.jcc_label(0x4, tok_end); // je — space: token done
         self.enc.inc_r(Reg::R13);
         self.enc.jmp_label(skip_tok);
         // After skipping token, increment index and loop
+        self.enc.place_label(tok_end);
         self.enc.inc_r(Reg::Rax);
         self.enc.jmp_label(scan_start);
         self.enc.place_label(tok_done);
@@ -9072,6 +9295,7 @@ impl PeCodeGen {
         let copy_start = self.enc.alloc_label();
         let copy_done = self.enc.alloc_label();
         self.enc.place_label(copy_start);
+        self.enc.xor_self(Reg::Rdx); // zero upper bits before byte load
         self.enc.mov_reg8_ptr(Reg::Rdx, Reg::R14); // load src byte
         self.enc.test_rr(Reg::Rdx, Reg::Rdx);
         self.enc.jcc_label(0x4, copy_done); // jz — null
@@ -9175,17 +9399,19 @@ impl PeCodeGen {
         self.enc.push(Reg::Rbp);
         self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
         self.enc.push(Reg::R12); // vec
-        self.enc.push(Reg::R13); // result
+        self.enc.push(Reg::R13); // element / total
         self.enc.push(Reg::R14); // index
         self.enc.push(Reg::R15); // vec len
-        self.enc.sub_rsp_i32(32);
-        // r12 = vec
+        self.enc.sub_rsp_i32(64);
+        // Locals: [rbp-40] = result, [rbp-48] = write cursor, [rbp-56] = len.
+        // Two passes, each element's length counted once by msvcrt strlen;
+        // copies via memcpy to a running cursor (no result re-scan).
+        let strlen_off = self.iat_off(import_slot("strlen").unwrap());
+        let memcpy_off = self.iat_off(import_slot("memcpy").unwrap());
+        // r12 = vec, r15 = vec->len
         self.enc.mov_rr(Reg::R12, Reg::Rcx);
-        // r15 = vec->len (offset 8)
         self.enc.mov_reg_mem_disp(Reg::R15, Reg::R12, 8);
-        // total = 1 (for null terminator)
-        // Calculate total length: sum of strlen of each part
-        // r14 = 0 (index), r13 = 1 (total)
+        // Pass 1: total = 1 + sum(strlen(elem))
         self.enc.xor_self(Reg::R14);
         self.enc.mov_imm32(Reg::R13, 1);
         let sjn_len_loop = self.enc.alloc_label();
@@ -9193,88 +9419,58 @@ impl PeCodeGen {
         self.enc.place_label(sjn_len_loop);
         self.enc.cmp_rr(Reg::R14, Reg::R15);
         self.enc.jcc_label(0x3, sjn_len_done); // jae
-        // Get element: data[r14] = *(r12->data + r14*8)
         self.enc.mov_reg_mem_disp(Reg::Rax, Reg::R12, 0); // data ptr
         self.enc.mov_rr(Reg::Rdx, Reg::R14);
-        self.enc.shl_r_i8(Reg::Rdx, 3); // *8
+        self.enc.shl_r_i8(Reg::Rdx, 3);
         self.enc.add_rr(Reg::Rax, Reg::Rdx);
-        self.enc.mov_reg_mem_disp(Reg::Rax, Reg::Rax, 0); // load string pointer
-        // strlen(rax) into rdx
-        self.enc.mov_rr(Reg::Rdx, Reg::Rax);
-        self.enc.xor_self(Reg::Rcx);
-        let sjn_strlen = self.enc.alloc_label();
-        let sjn_strlen_done = self.enc.alloc_label();
-        self.enc.place_label(sjn_strlen);
-        self.enc.cmp_mem_idx_imm8(Reg::Rdx, Reg::Rcx, 0);
-        self.enc.jcc_label(0x4, sjn_strlen_done); // je
-        self.enc.inc_r(Reg::Rcx);
-        self.enc.jmp_label(sjn_strlen);
-        self.enc.place_label(sjn_strlen_done);
-        // total += strlen
-        self.enc.add_rr(Reg::R13, Reg::Rcx);
+        self.enc.mov_reg_mem_disp(Reg::Rcx, Reg::Rax, 0); // elem ptr
+        self.enc.call_rip(strlen_off);
+        self.enc.add_rr(Reg::R13, Reg::Rax);
         self.enc.inc_r(Reg::R14);
         self.enc.jmp_label(sjn_len_loop);
         self.enc.place_label(sjn_len_done);
-        // malloc(total)
+        // result = cursor = malloc(total)
         self.enc.mov_rr(Reg::Rcx, Reg::R13);
-        self.enc.sub_rsp_i32(32);
         self.enc.call_label(*self.func_labels.get("p_malloc").unwrap());
-        self.enc.add_rsp_i32(32);
-        // r13 = result, result[0] = 0
-        self.enc.mov_rr(Reg::R13, Reg::Rax);
-        self.enc.xor_self(Reg::Rdx);
-        self.enc.mov_mem_reg8_ptr(Reg::R13, Reg::Rdx);
-        // Concatenate each string: for each element, strcat(result, element)
-        self.enc.xor_self(Reg::R14); // index = 0
+        self.enc.mov_mem_rbp_reg(-40, Reg::Rax);
+        self.enc.mov_mem_rbp_reg(-48, Reg::Rax);
+        // Pass 2: memcpy each element to the cursor
+        self.enc.xor_self(Reg::R14);
         let sjn_cat_loop = self.enc.alloc_label();
         let sjn_cat_done = self.enc.alloc_label();
         self.enc.place_label(sjn_cat_loop);
         self.enc.cmp_rr(Reg::R14, Reg::R15);
         self.enc.jcc_label(0x3, sjn_cat_done); // jae
-        // Get element pointer
         self.enc.mov_reg_mem_disp(Reg::Rax, Reg::R12, 0); // data ptr
         self.enc.mov_rr(Reg::Rdx, Reg::R14);
         self.enc.shl_r_i8(Reg::Rdx, 3);
         self.enc.add_rr(Reg::Rax, Reg::Rdx);
-        self.enc.mov_reg_mem_disp(Reg::Rax, Reg::Rax, 0); // string pointer
-        // Find end of result (strlen result)
+        self.enc.mov_reg_mem_disp(Reg::R13, Reg::Rax, 0); // r13 = elem ptr
         self.enc.mov_rr(Reg::Rcx, Reg::R13);
-        let sjn_find_end = self.enc.alloc_label();
-        let sjn_found_end = self.enc.alloc_label();
-        self.enc.place_label(sjn_find_end);
-        self.enc.mov_reg8_mem(Reg::Rdx, Reg::Rcx);
-        self.enc.test_rr(Reg::Rdx, Reg::Rdx);
-        self.enc.jcc_label(0x4, sjn_found_end); // je
-        self.enc.inc_r(Reg::Rcx);
-        self.enc.jmp_label(sjn_find_end);
-        self.enc.place_label(sjn_found_end);
-        // rcx = end of result. Copy element to end.
-        self.enc.mov_rr(Reg::R8, Reg::Rax); // r8 = src
-        let sjn_copy = self.enc.alloc_label();
-        let sjn_copy_done = self.enc.alloc_label();
-        self.enc.place_label(sjn_copy);
-        self.enc.mov_reg8_mem(Reg::Rdx, Reg::R8);
-        self.enc.test_rr(Reg::Rdx, Reg::Rdx);
-        self.enc.jcc_label(0x4, sjn_copy_done); // je
-        self.enc.mov_mem_reg8_ptr(Reg::Rcx, Reg::Rdx);
+        self.enc.call_rip(strlen_off);
+        self.enc.mov_mem_rbp_reg(-56, Reg::Rax); // elem len
+        // memcpy(cursor, elem, len + 1) — +1 copies the NUL; overwritten by
+        // the next element and re-written at the end
+        self.enc.mov_reg_mem_rbp(Reg::Rcx, -40 - 8); // [rbp-48] cursor
+        self.enc.mov_rr(Reg::Rdx, Reg::R13);
+        self.enc.mov_rr(Reg::R8, Reg::Rax);
         self.enc.inc_r(Reg::R8);
-        self.enc.inc_r(Reg::Rcx);
-        self.enc.jmp_label(sjn_copy);
-        self.enc.place_label(sjn_copy_done);
-        // Null terminate
-        self.enc.xor_self(Reg::Rdx);
-        self.enc.mov_mem_reg8_ptr(Reg::Rcx, Reg::Rdx);
+        self.enc.call_rip(memcpy_off);
+        // cursor += len
+        self.enc.mov_reg_mem_rbp(Reg::Rcx, -48);
+        self.enc.mov_reg_mem_rbp(Reg::Rax, -56);
+        self.enc.add_rr(Reg::Rcx, Reg::Rax);
+        self.enc.mov_mem_rbp_reg(-48, Reg::Rcx);
         self.enc.inc_r(Reg::R14);
         self.enc.jmp_label(sjn_cat_loop);
         self.enc.place_label(sjn_cat_done);
         // Return result
-        self.enc.mov_rr(Reg::Rax, Reg::R13);
-        self.enc.add_rsp_i32(32);
+        self.enc.mov_reg_mem_rbp(Reg::Rax, -40);
+        self.enc.add_rsp_i32(64);
         self.enc.pop(Reg::R15);
         self.enc.pop(Reg::R14);
         self.enc.pop(Reg::R13);
         self.enc.pop(Reg::R12);
-        self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
         self.enc.pop(Reg::Rbp);
         self.enc.ret();
     }
@@ -9320,6 +9516,35 @@ fn autograd_builtin(inst: &Inst) -> &'static str {
 
 /// `PeCodeGen::resolve_call` for the call graph: an alias, or the Fides
 /// runtime's `pert_X` for builtin `p_X` when the program has it.
+/// Append every ValueId `inst` reads to `out` (used by the slot-reuse
+/// analysis in gen_function — pe-roadmap items 84-85).
+fn inst_operands(inst: &Inst, out: &mut Vec<ValueId>) {
+    match inst {
+        Inst::BinOp { left, right, .. } => { out.push(*left); out.push(*right); }
+        Inst::UnaryOp { operand, .. } => out.push(*operand),
+        Inst::Load { ptr, .. } => out.push(*ptr),
+        Inst::Store { ptr, value, .. } => { out.push(*ptr); out.push(*value); }
+        Inst::StructCopy { dst, src, .. } => { out.push(*dst); out.push(*src); }
+        Inst::GetFieldPtr { struct_ptr, .. } => out.push(*struct_ptr),
+        Inst::GetElemPtr { array_ptr, index, .. } => { out.push(*array_ptr); out.push(*index); }
+        Inst::Branch { cond, .. } => out.push(*cond),
+        Inst::Return { value } => { if let Some(v) = value { out.push(*v); } }
+        Inst::Call { args, .. } | Inst::DynCall { args, .. } => out.extend(args.iter().copied()),
+        Inst::CallPtr { fn_ptr, args, .. } => { out.push(*fn_ptr); out.extend(args.iter().copied()); }
+        Inst::MakeDyn { value, .. } => out.push(*value),
+        Inst::BitCast { value, .. } | Inst::IntExtend { value, .. }
+        | Inst::IntTrunc { value, .. } | Inst::IntToFloat { value, .. }
+        | Inst::FloatToInt { value, .. } => out.push(*value),
+        Inst::TryUnwrap { value, .. } => out.push(*value),
+        Inst::Print { value, .. } => out.push(*value),
+        Inst::Asm { inputs, .. } => { for (_, v) in inputs { out.push(*v); } }
+        Inst::PersistLoad { default, .. } => out.push(*default),
+        Inst::PersistSave { value, .. } => out.push(*value),
+        Inst::Backward { loss } => out.push(*loss),
+        _ => {}
+    }
+}
+
 fn resolve_callee(module: &IrModule, name: &str) -> String {
     if let Some(over) = c_override(module, name) {
         return over;

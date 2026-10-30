@@ -892,6 +892,11 @@ pub struct Program {
     pub state_machines: Vec<StateMachineDef>,
     /// Phase 8B: Event handler declarations (F20)
     pub event_handlers: Vec<EventHandlerDef>,
+    /// Function-name → origin-module map, populated during program merge
+    /// (Phase B incremental compilation). Empty for unmerged programs;
+    /// functions absent from the map were generated post-merge (comptime,
+    /// derive, monomorphization) and belong to the user's module.
+    pub func_modules: std::collections::HashMap<String, String>,
 }
 
 /// A neural network layer definition.

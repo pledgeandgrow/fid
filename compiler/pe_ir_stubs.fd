@@ -131,6 +131,11 @@ pub struct PeirGen {
     /// Functions a program refers to by name (thread and task entry points):
     /// what `pe_fn_lookup` can find
     pub named_fns: Vec<str>,
+    /// cmp+branch fusion: jcc code (-1 = none) and the cond value id, set
+    /// when a comparison is followed by a Branch on its result — the Branch
+    /// jumps on the compare's still-live flags (pe-roadmap item 82).
+    pub pending_cmp_cc: i64,
+    pub pending_cmp_vid: i64,
 }
 
 pub fn PeirGen_new() -> PeirGen {
@@ -152,6 +157,8 @@ pub fn PeirGen_new() -> PeirGen {
         stub_externs: Vec::new(),
         c_overrides: Vec::new(),
         named_fns: Vec::new(),
+        pending_cmp_cc: -1,
+        pending_cmp_vid: -1,
     };
 }
 
@@ -1901,6 +1908,8 @@ pub fn PeirGen_gen_memset(self: &mut PeirGen) -> void {
 }
 
 /// p_str_concat(rcx=left *u8, rdx=right *u8) -> rax=*u8
+/// Each length is counted once by msvcrt strlen and both halves copy in bulk
+/// via memcpy - not byte-by-byte loops (pe-roadmap item 73).
 pub fn PeirGen_gen_str_concat(self: &mut PeirGen) -> void {
     var label: i64 = HashMap_get(self.func_labels, "p_str_concat");
     PeirEnc_place_label(&mut self.enc, label);
@@ -1910,82 +1919,51 @@ pub fn PeirGen_gen_str_concat(self: &mut PeirGen) -> void {
     PeirEnc_push(&mut self.enc, PEIR_R12);
     PeirEnc_push(&mut self.enc, PEIR_R13);
     PeirEnc_push(&mut self.enc, PEIR_R14);
-    PeirEnc_sub_rsp_i32(&mut self.enc, 40); // 32 shadow + 8 alignment
+    PeirEnc_push(&mut self.enc, PEIR_R15);
+    PeirEnc_sub_rsp_i32(&mut self.enc, 48); // 32 shadow + 16 locals
 
     // r12 = left, r13 = right
     PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RCX);
     PeirEnc_mov_rr(&mut self.enc, PEIR_R13, PEIR_RDX);
 
-    // r14 = strlen(left) + strlen(right)
-    PeirEnc_xor_self(&mut self.enc, PEIR_R14);
-    PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R12);
-    var sc1b: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_place_label(&mut self.enc, sc1b);
-    PeirEnc_xor_self(&mut self.enc, PEIR_RCX); // zero rcx for the byte test
-    PeirEnc_mov_reg8_mem(&mut self.enc, PEIR_RCX, PEIR_RAX);
-    PeirEnc_test_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
-    var sc1done: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_jcc_label(&mut self.enc, 0x4, sc1done); // je — null found
-    PeirEnc_inc_r(&mut self.enc, PEIR_R14);
-    PeirEnc_inc_r(&mut self.enc, PEIR_RAX);
-    PeirEnc_jmp_label(&mut self.enc, sc1b);
-    PeirEnc_place_label(&mut self.enc, sc1done);
+    var strlen_off: i64 = PeirGen_iat_off(self, pe_import_slot("strlen"));
+    var memcpy_off: i64 = PeirGen_iat_off(self, pe_import_slot("memcpy"));
 
-    // r14 = len(left). Now add strlen(right) to get total
-    PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R13);
-    var sc2: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_place_label(&mut self.enc, sc2);
-    PeirEnc_xor_self(&mut self.enc, PEIR_RCX);
-    PeirEnc_mov_reg8_mem(&mut self.enc, PEIR_RCX, PEIR_RAX);
-    PeirEnc_test_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
-    var sc2done: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_jcc_label(&mut self.enc, 0x4, sc2done);
-    PeirEnc_inc_r(&mut self.enc, PEIR_R14);
-    PeirEnc_inc_r(&mut self.enc, PEIR_RAX);
-    PeirEnc_jmp_label(&mut self.enc, sc2);
-    PeirEnc_place_label(&mut self.enc, sc2done);
+    // r14 = strlen(left); [rbp-48] = strlen(right)
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R12);
+    PeirEnc_call_rip(&mut self.enc, strlen_off);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R14, PEIR_RAX);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R13);
+    PeirEnc_call_rip(&mut self.enc, strlen_off);
+    PeirEnc_mov_mem_rbp_reg(&mut self.enc, -48, PEIR_RAX);
 
-    // r14 = total length. malloc(r14+1) for null terminator
+    // r15 = buf = p_malloc(len_l + len_r + 1) - +1 for the terminator
     PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R14);
-    PeirEnc_inc_r(&mut self.enc, PEIR_RCX); // +1 for null
+    PeirEnc_add_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+    PeirEnc_inc_r(&mut self.enc, PEIR_RCX);
     PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "p_malloc"));
-    PeirEnc_mov_rr(&mut self.enc, PEIR_R9, PEIR_RAX); // r9 = result buffer
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R15, PEIR_RAX);
 
-    // Copy left string
-    PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_R12); // r8 = left ptr
-    PeirEnc_mov_rr(&mut self.enc, PEIR_R10, PEIR_R9); // r10 = dest
-    var cc1: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_place_label(&mut self.enc, cc1);
-    PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
-    PeirEnc_mov_reg8_mem(&mut self.enc, PEIR_RAX, PEIR_R8);
-    PeirEnc_mov_mem_reg8_ptr(&mut self.enc, PEIR_R10, PEIR_RAX);
-    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
-    var cc1done: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_jcc_label(&mut self.enc, 0x4, cc1done);
+    // memcpy(buf, left, len_l)
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R15);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R12);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_R14);
+    PeirEnc_call_rip(&mut self.enc, memcpy_off);
+
+    // memcpy(buf + len_l, right, len_r + 1) - +1 copies right's NUL,
+    // so the result is exactly "left" + "right" + NUL.
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R15);
+    PeirEnc_add_rr(&mut self.enc, PEIR_RCX, PEIR_R14);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R13);
+    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_R8, -48);
     PeirEnc_inc_r(&mut self.enc, PEIR_R8);
-    PeirEnc_inc_r(&mut self.enc, PEIR_R10);
-    PeirEnc_jmp_label(&mut self.enc, cc1);
-    PeirEnc_place_label(&mut self.enc, cc1done);
+    PeirEnc_call_rip(&mut self.enc, memcpy_off);
 
-    // Copy right string (r10 is already at end of left)
-    PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_R13); // r8 = right ptr
-    var cc2: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_place_label(&mut self.enc, cc2);
-    PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
-    PeirEnc_mov_reg8_mem(&mut self.enc, PEIR_RAX, PEIR_R8);
-    PeirEnc_mov_mem_reg8_ptr(&mut self.enc, PEIR_R10, PEIR_RAX);
-    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
-    var cc2done: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_jcc_label(&mut self.enc, 0x4, cc2done);
-    PeirEnc_inc_r(&mut self.enc, PEIR_R8);
-    PeirEnc_inc_r(&mut self.enc, PEIR_R10);
-    PeirEnc_jmp_label(&mut self.enc, cc2);
-    PeirEnc_place_label(&mut self.enc, cc2done);
+    // Return buf
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R15);
 
-    // Return result
-    PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R9);
-
-    PeirEnc_add_rsp_i32(&mut self.enc, 40);
+    PeirEnc_add_rsp_i32(&mut self.enc, 48);
+    PeirEnc_pop(&mut self.enc, PEIR_R15);
     PeirEnc_pop(&mut self.enc, PEIR_R14);
     PeirEnc_pop(&mut self.enc, PEIR_R13);
     PeirEnc_pop(&mut self.enc, PEIR_R12);
@@ -3818,23 +3796,13 @@ pub fn PeirGen_gen_map_get_or(self: &mut PeirGen) -> void {
 pub fn PeirGen_gen_string_len(self: &mut PeirGen) -> void {
     var label: i64 = HashMap_get(self.func_labels, "p_string_len");
     PeirEnc_place_label(&mut self.enc, label);
+    // Delegate to imported strlen — a real SIMD scan, not a byte loop.
+    // push rbp + sub 32 keeps rsp 16-aligned at the call.
     PeirEnc_push(&mut self.enc, PEIR_RBP);
     PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
-    PeirEnc_push(&mut self.enc, PEIR_R12);
-    // r12 = ptr, rax = counter
-    PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RCX);
-    PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
-    var loop_label: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_place_label(&mut self.enc, loop_label);
-    PeirEnc_mov_reg8_mem_idx(&mut self.enc, PEIR_R9, PEIR_R12, PEIR_RAX); // byte
-    // Check if byte is 0
-    PeirEnc_test_rr(&mut self.enc, PEIR_R9, PEIR_R9);
-    var done: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_jcc_label(&mut self.enc, 0x4, done); // jz
-    PeirEnc_inc_r(&mut self.enc, PEIR_RAX);
-    PeirEnc_jmp_label(&mut self.enc, loop_label);
-    PeirEnc_place_label(&mut self.enc, done);
-    PeirEnc_pop(&mut self.enc, PEIR_R12);
+    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+    PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, pe_import_slot("strlen")));
+    PeirEnc_add_rsp_i32(&mut self.enc, 32);
     PeirEnc_pop(&mut self.enc, PEIR_RBP);
     PeirEnc_ret(&mut self.enc);
 }
@@ -3844,6 +3812,8 @@ pub fn PeirGen_gen_string_is_empty(self: &mut PeirGen) -> void {
     var label: i64 = HashMap_get(self.func_labels, "p_string_is_empty");
     PeirEnc_place_label(&mut self.enc, label);
     PeirEnc_mov_reg8_ptr(&mut self.enc, PEIR_RAX, PEIR_RCX); // load first byte
+    // mov r8,[m] leaves rax's upper bits dirty — clean before the test
+    PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
     PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
     PeirEnc_setcc_r(&mut self.enc, 0x4, PEIR_RAX);
     PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
@@ -3865,26 +3835,28 @@ pub fn PeirGen_gen_string_starts_with(self: &mut PeirGen) -> void {
     var loop_label: i64 = PeirEnc_alloc_label(&mut self.enc);
     var true_label: i64 = PeirEnc_alloc_label(&mut self.enc);
     var false_label: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var done_label: i64 = PeirEnc_alloc_label(&mut self.enc);
     PeirEnc_place_label(&mut self.enc, loop_label);
-    // Load prefix byte
+    // Load prefix byte (movzx — upper bits dirty after mov r8,[m])
     PeirEnc_mov_reg8_ptr(&mut self.enc, PEIR_RAX, PEIR_R13);
+    PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
     PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
     PeirEnc_jcc_label(&mut self.enc, 0x4, true_label); // prefix end = match
     // Load str byte
     PeirEnc_mov_reg8_ptr(&mut self.enc, PEIR_R9, PEIR_R12);
+    PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_R9, PEIR_R9);
     PeirEnc_cmp_rr(&mut self.enc, PEIR_R9, PEIR_RAX);
     PeirEnc_jcc_label(&mut self.enc, 0x5, false_label); // jne
     // Advance both pointers
     PeirEnc_inc_r(&mut self.enc, PEIR_R12);
     PeirEnc_inc_r(&mut self.enc, PEIR_R13);
     PeirEnc_jmp_label(&mut self.enc, loop_label);
+    PeirEnc_place_label(&mut self.enc, false_label);
+    PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
+    PeirEnc_jmp_label(&mut self.enc, done_label);
     PeirEnc_place_label(&mut self.enc, true_label);
     PeirEnc_mov_imm32(&mut self.enc, PEIR_RAX, 1);
-    PeirEnc_jmp_label(&mut self.enc, false_label);
-    // false_label is used as exit
-    PeirEnc_place_label(&mut self.enc, false_label);
-    // Simplified stub: always return 1 (as in Rust)
-    PeirEnc_mov_imm32(&mut self.enc, PEIR_RAX, 1);
+    PeirEnc_place_label(&mut self.enc, done_label);
     PeirEnc_mov_rr(&mut self.enc, PEIR_RSP, PEIR_RBP);
     PeirEnc_pop(&mut self.enc, PEIR_R13);
     PeirEnc_pop(&mut self.enc, PEIR_R12);
@@ -3905,8 +3877,10 @@ pub fn PeirGen_gen_string_parse_int(self: &mut PeirGen) -> void {
     var loop_label: i64 = PeirEnc_alloc_label(&mut self.enc);
     var done: i64 = PeirEnc_alloc_label(&mut self.enc);
     PeirEnc_place_label(&mut self.enc, loop_label);
-    // Load byte
+    // Load byte (movzx — r9's upper bits are dirty after mov r8,[m] and r9
+    // is added into the result below)
     PeirEnc_mov_reg8_ptr(&mut self.enc, PEIR_R9, PEIR_R12);
+    PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_R9, PEIR_R9);
     // Check if byte < '0' or > '9'
     PeirEnc_cmp_r8_i8(&mut self.enc, PEIR_R9, 48); // '0'
     PeirEnc_jcc_label(&mut self.enc, 0x2, done); // jb
@@ -3928,22 +3902,12 @@ pub fn PeirGen_gen_string_parse_int(self: &mut PeirGen) -> void {
 pub fn PeirGen_gen_string_bytes(self: &mut PeirGen) -> void {
     var label: i64 = HashMap_get(self.func_labels, "p_string_bytes");
     PeirEnc_place_label(&mut self.enc, label);
-    // Same as strlen
+    // Same as p_string_len: delegate to imported strlen.
     PeirEnc_push(&mut self.enc, PEIR_RBP);
     PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
-    PeirEnc_push(&mut self.enc, PEIR_R12);
-    PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RCX);
-    PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
-    var loop_label: i64 = PeirEnc_alloc_label(&mut self.enc);
-    var done: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_place_label(&mut self.enc, loop_label);
-    PeirEnc_mov_reg8_mem_idx(&mut self.enc, PEIR_R9, PEIR_R12, PEIR_RAX);
-    PeirEnc_test_rr(&mut self.enc, PEIR_R9, PEIR_R9);
-    PeirEnc_jcc_label(&mut self.enc, 0x4, done);
-    PeirEnc_inc_r(&mut self.enc, PEIR_RAX);
-    PeirEnc_jmp_label(&mut self.enc, loop_label);
-    PeirEnc_place_label(&mut self.enc, done);
-    PeirEnc_pop(&mut self.enc, PEIR_R12);
+    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+    PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, pe_import_slot("strlen")));
+    PeirEnc_add_rsp_i32(&mut self.enc, 32);
     PeirEnc_pop(&mut self.enc, PEIR_RBP);
     PeirEnc_ret(&mut self.enc);
 }
@@ -3957,40 +3921,25 @@ pub fn PeirGen_gen_string_clone(self: &mut PeirGen) -> void {
     PeirEnc_push(&mut self.enc, PEIR_R12);
     PeirEnc_push(&mut self.enc, PEIR_R13);
     PeirEnc_sub_rsp_i32(&mut self.enc, 32);
-    // First, get strlen
+    var strlen_off: i64 = PeirGen_iat_off(self, pe_import_slot("strlen"));
+    var memcpy_off: i64 = PeirGen_iat_off(self, pe_import_slot("memcpy"));
+    // r12 = src; r13 = strlen(src)
     PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RCX);
-    PeirEnc_xor_self(&mut self.enc, PEIR_R13); // r13 = len
-    var len_loop: i64 = PeirEnc_alloc_label(&mut self.enc);
-    var len_done: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_place_label(&mut self.enc, len_loop);
-    PeirEnc_mov_reg8_mem_idx(&mut self.enc, PEIR_R9, PEIR_R12, PEIR_R13);
-    PeirEnc_test_rr(&mut self.enc, PEIR_R9, PEIR_R9);
-    PeirEnc_jcc_label(&mut self.enc, 0x4, len_done);
-    PeirEnc_inc_r(&mut self.enc, PEIR_R13);
-    PeirEnc_jmp_label(&mut self.enc, len_loop);
-    PeirEnc_place_label(&mut self.enc, len_done);
-    // malloc(len+1)
-    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R13);
-    PeirEnc_inc_r(&mut self.enc, PEIR_RCX); // len+1
+    PeirEnc_call_rip(&mut self.enc, strlen_off);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R13, PEIR_RAX);
+    // malloc(len + 1)
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+    PeirEnc_inc_r(&mut self.enc, PEIR_RCX);
     PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "p_malloc"));
-    // Copy bytes
-    PeirEnc_mov_rr(&mut self.enc, PEIR_R9, PEIR_RAX); // r9 = dest
-    PeirEnc_xor_self(&mut self.enc, PEIR_R10); // r10 = 0
-    var copy_loop: i64 = PeirEnc_alloc_label(&mut self.enc);
-    var copy_done: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_place_label(&mut self.enc, copy_loop);
-    PeirEnc_cmp_rr(&mut self.enc, PEIR_R10, PEIR_R13);
-    PeirEnc_jcc_label(&mut self.enc, 0x3, copy_done); // jae
-    PeirEnc_mov_reg8_mem_idx(&mut self.enc, PEIR_R8, PEIR_R12, PEIR_R10);
-    PeirEnc_mov_mem_idx_reg8(&mut self.enc, PEIR_R9, PEIR_R10, PEIR_R8);
-    PeirEnc_inc_r(&mut self.enc, PEIR_R10);
-    PeirEnc_jmp_label(&mut self.enc, copy_loop);
-    PeirEnc_place_label(&mut self.enc, copy_done);
-    // Null terminate
-    PeirEnc_xor_self(&mut self.enc, PEIR_R8);
-    PeirEnc_mov_mem_idx_reg8(&mut self.enc, PEIR_R9, PEIR_R10, PEIR_R8);
+    // r12 = dest (src is done once rdx holds it); memcpy(dest, src, len+1)
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R12);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_R13);
+    PeirEnc_inc_r(&mut self.enc, PEIR_R8);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RAX);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+    PeirEnc_call_rip(&mut self.enc, memcpy_off);
     // Return dest
-    PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R9);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R12);
     PeirEnc_mov_rr(&mut self.enc, PEIR_RSP, PEIR_RBP);
     PeirEnc_pop(&mut self.enc, PEIR_R13);
     PeirEnc_pop(&mut self.enc, PEIR_R12);
@@ -4173,6 +4122,8 @@ pub fn PeirGen_gen_sb_new(self: &mut PeirGen) -> void {
 }
 
 /// p_sb_append(rcx = sb, rdx = s)
+/// strlen once, memcpy for both the grow-copy and the append — no byte
+/// loops (pe-roadmap items 73/75).
 pub fn PeirGen_gen_sb_append(self: &mut PeirGen) -> void {
     var label: i64 = HashMap_get(self.func_labels, "p_sb_append");
     PeirEnc_place_label(&mut self.enc, label);
@@ -4181,94 +4132,76 @@ pub fn PeirGen_gen_sb_append(self: &mut PeirGen) -> void {
     PeirEnc_push(&mut self.enc, PEIR_R12); // sb
     PeirEnc_push(&mut self.enc, PEIR_R13); // s
     PeirEnc_push(&mut self.enc, PEIR_R14); // slen
-    PeirEnc_sub_rsp_i32(&mut self.enc, 40); // 32 + 8 for alignment
+    PeirEnc_push(&mut self.enc, PEIR_R15); // new_cap / new buf
+    PeirEnc_sub_rsp_i32(&mut self.enc, 48); // 32 shadow + 16 locals
     // r12 = sb, r13 = s
     PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RCX);
     PeirEnc_mov_rr(&mut self.enc, PEIR_R13, PEIR_RDX);
-    // Calculate strlen(s) into r14
-    PeirEnc_xor_self(&mut self.enc, PEIR_R14);
-    var sa_len: i64 = PeirEnc_alloc_label(&mut self.enc);
-    var sa_len_done: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_place_label(&mut self.enc, sa_len);
-    PeirEnc_cmp_mem_idx_imm8(&mut self.enc, PEIR_R13, PEIR_R14, 0);
-    PeirEnc_jcc_label(&mut self.enc, 0x4, sa_len_done); // je
-    PeirEnc_inc_r(&mut self.enc, PEIR_R14);
-    PeirEnc_jmp_label(&mut self.enc, sa_len);
-    PeirEnc_place_label(&mut self.enc, sa_len_done);
-    // Check if sb->len + slen + 1 > sb->cap
+
+    var strlen_off: i64 = PeirGen_iat_off(self, pe_import_slot("strlen"));
+    var memcpy_off: i64 = PeirGen_iat_off(self, pe_import_slot("memcpy"));
+
+    // r14 = slen = strlen(s)
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R13);
+    PeirEnc_call_rip(&mut self.enc, strlen_off);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R14, PEIR_RAX);
+
+    // needed = sb->len + slen + 1; grow while cap < needed
     PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_R12, 8); // sb->len
-    PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_R14); // rax = len + slen
-    PeirEnc_inc_r(&mut self.enc, PEIR_RAX); // rax = len + slen + 1
+    PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_R14);
+    PeirEnc_inc_r(&mut self.enc, PEIR_RAX); // rax = needed
     PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RDX, PEIR_R12, 16); // sb->cap
     PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
     var sa_no_grow: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_jcc_label(&mut self.enc, 0x6, sa_no_grow); // jbe — no grow
-    // Grow: double cap until it fits
-    // rax = needed size, rdx = current cap
+    PeirEnc_jcc_label(&mut self.enc, 0x6, sa_no_grow); // jbe — fits
+    // r15 = new_cap = cap doubled until it fits
     var sa_grow_loop: i64 = PeirEnc_alloc_label(&mut self.enc);
     PeirEnc_place_label(&mut self.enc, sa_grow_loop);
     PeirEnc_add_rr(&mut self.enc, PEIR_RDX, PEIR_RDX); // cap *= 2
     PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
     PeirEnc_jcc_label(&mut self.enc, 0x7, sa_grow_loop); // ja — still no fit
-    // Now rdx = new cap. Store it.
-    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_R12, 16, PEIR_RDX);
-    // Realloc buffer: malloc new size and copy
-    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RDX); // new cap
-    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R15, PEIR_RDX);
+
+    // [rbp-48] = old buf; sb->cap = new_cap
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_R12, 0);
+    PeirEnc_mov_mem_rbp_reg(&mut self.enc, -48, PEIR_RAX);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_R12, 16, PEIR_R15);
+
+    // rax = new buf = p_malloc(new_cap)
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R15);
     PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "p_malloc"));
-    PeirEnc_add_rsp_i32(&mut self.enc, 32);
-    // rax = new buffer. Copy old buffer contents.
-    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R8, PEIR_R12, 0); // old buf
-    PeirEnc_mov_rr(&mut self.enc, PEIR_R9, PEIR_RAX); // new buf
-    PeirEnc_xor_self(&mut self.enc, PEIR_R10);
-    // Copy sb->len bytes
-    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R11, PEIR_R12, 8); // sb->len
-    var sa_copy: i64 = PeirEnc_alloc_label(&mut self.enc);
-    var sa_copy_done: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_place_label(&mut self.enc, sa_copy);
-    PeirEnc_cmp_rr(&mut self.enc, PEIR_R10, PEIR_R11);
-    PeirEnc_jcc_label(&mut self.enc, 0x3, sa_copy_done); // jae
-    PeirEnc_mov_reg8_mem_idx(&mut self.enc, PEIR_RAX, PEIR_R8, PEIR_R10);
-    PeirEnc_mov_mem_idx_reg8(&mut self.enc, PEIR_R9, PEIR_R10, PEIR_RAX);
-    PeirEnc_inc_r(&mut self.enc, PEIR_R10);
-    PeirEnc_jmp_label(&mut self.enc, sa_copy);
-    PeirEnc_place_label(&mut self.enc, sa_copy_done);
-    // Store new buffer first: r9 does not survive the call to p_free
-    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_R12, 0, PEIR_R9);
-    // Free old buffer
-    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R8);
-    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+
+    // r15 = new buf; memcpy(new buf, old buf, sb->len)
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R15, PEIR_RAX);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RDX, -48);
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R8, PEIR_R12, 8);
+    PeirEnc_call_rip(&mut self.enc, memcpy_off);
+
+    // sb->buf = new buf; free(old buf)
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_R12, 0, PEIR_R15);
+    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, -48);
     PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "p_free"));
-    PeirEnc_add_rsp_i32(&mut self.enc, 32);
+
     PeirEnc_place_label(&mut self.enc, sa_no_grow);
-    // memcpy(sb->buf + sb->len, s, slen)
-    // r8 = sb->buf, r9 = sb->len, r10 = 0
-    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R8, PEIR_R12, 0); // buf
-    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R9, PEIR_R12, 8); // len
-    PeirEnc_add_rr(&mut self.enc, PEIR_R8, PEIR_R9); // r8 = buf + len (dest)
-    PeirEnc_xor_self(&mut self.enc, PEIR_R10);
-    var sa_memcpy: i64 = PeirEnc_alloc_label(&mut self.enc);
-    var sa_memcpy_done: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_place_label(&mut self.enc, sa_memcpy);
-    PeirEnc_cmp_rr(&mut self.enc, PEIR_R10, PEIR_R14);
-    PeirEnc_jcc_label(&mut self.enc, 0x3, sa_memcpy_done); // jae
-    PeirEnc_mov_reg8_mem_idx(&mut self.enc, PEIR_RAX, PEIR_R13, PEIR_R10);
-    PeirEnc_mov_mem_idx_reg8(&mut self.enc, PEIR_R8, PEIR_R10, PEIR_RAX);
-    PeirEnc_inc_r(&mut self.enc, PEIR_R10);
-    PeirEnc_jmp_label(&mut self.enc, sa_memcpy);
-    PeirEnc_place_label(&mut self.enc, sa_memcpy_done);
+    // memcpy(sb->buf + sb->len, s, slen + 1) — +1 copies s's NUL
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RCX, PEIR_R12, 0); // buf
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_R12, 8); // len
+    PeirEnc_add_rr(&mut self.enc, PEIR_RCX, PEIR_RAX); // dest = buf + len
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R13);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_R14);
+    PeirEnc_inc_r(&mut self.enc, PEIR_R8);
+    PeirEnc_call_rip(&mut self.enc, memcpy_off);
+
     // sb->len += slen
     PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_R12, 8);
     PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_R14);
     PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_R12, 8, PEIR_RAX);
-    // sb->buf[sb->len] = 0
-    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R8, PEIR_R12, 0); // buf
-    PeirEnc_add_rr(&mut self.enc, PEIR_R8, PEIR_RAX); // buf + len
-    PeirEnc_xor_self(&mut self.enc, PEIR_RDX);
-    PeirEnc_mov_mem_reg8_ptr(&mut self.enc, PEIR_R8, PEIR_RDX);
-    // Return
+
+    // Return 0
     PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
-    PeirEnc_add_rsp_i32(&mut self.enc, 40);
+    PeirEnc_add_rsp_i32(&mut self.enc, 48);
+    PeirEnc_pop(&mut self.enc, PEIR_R15);
     PeirEnc_pop(&mut self.enc, PEIR_R14);
     PeirEnc_pop(&mut self.enc, PEIR_R13);
     PeirEnc_pop(&mut self.enc, PEIR_R12);
@@ -4294,36 +4227,20 @@ pub fn PeirGen_gen_sb_to_str(self: &mut PeirGen) -> void {
     // malloc(len + 1)
     PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R14);
     PeirEnc_inc_r(&mut self.enc, PEIR_RCX);
-    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
     PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "p_malloc"));
-    PeirEnc_add_rsp_i32(&mut self.enc, 32);
     PeirEnc_mov_rr(&mut self.enc, PEIR_R13, PEIR_RAX); // r13 = result
-    // memcpy(result, sb->buf, len)
-    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R8, PEIR_R12, 0); // sb->buf
-    PeirEnc_xor_self(&mut self.enc, PEIR_R10);
-    var sts_copy: i64 = PeirEnc_alloc_label(&mut self.enc);
-    var sts_copy_done: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_place_label(&mut self.enc, sts_copy);
-    PeirEnc_cmp_rr(&mut self.enc, PEIR_R10, PEIR_R14);
-    PeirEnc_jcc_label(&mut self.enc, 0x3, sts_copy_done); // jae
-    PeirEnc_mov_reg8_mem_idx(&mut self.enc, PEIR_RAX, PEIR_R8, PEIR_R10);
-    PeirEnc_mov_mem_idx_reg8(&mut self.enc, PEIR_R13, PEIR_R10, PEIR_RAX);
-    PeirEnc_inc_r(&mut self.enc, PEIR_R10);
-    PeirEnc_jmp_label(&mut self.enc, sts_copy);
-    PeirEnc_place_label(&mut self.enc, sts_copy_done);
-    // result[len] = 0
-    PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
-    PeirEnc_mov_mem_idx_reg8(&mut self.enc, PEIR_R13, PEIR_R10, PEIR_RAX);
+    // memcpy(result, sb->buf, len + 1) — +1 copies the NUL
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R13);
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RDX, PEIR_R12, 0); // sb->buf
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_R14);
+    PeirEnc_inc_r(&mut self.enc, PEIR_R8);
+    PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, pe_import_slot("memcpy")));
     // Free sb->buf
     PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RCX, PEIR_R12, 0);
-    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
     PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "p_free"));
-    PeirEnc_add_rsp_i32(&mut self.enc, 32);
     // Free sb struct
     PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R12);
-    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
     PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "p_free"));
-    PeirEnc_add_rsp_i32(&mut self.enc, 32);
     // Return result
     PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R13);
     PeirEnc_add_rsp_i32(&mut self.enc, 40);
@@ -4758,16 +4675,19 @@ pub fn PeirGen_gen_str_join_n(self: &mut PeirGen) -> void {
     PeirEnc_push(&mut self.enc, PEIR_RBP);
     PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
     PeirEnc_push(&mut self.enc, PEIR_R12); // vec
-    PeirEnc_push(&mut self.enc, PEIR_R13); // result
+    PeirEnc_push(&mut self.enc, PEIR_R13); // element / total
     PeirEnc_push(&mut self.enc, PEIR_R14); // index
     PeirEnc_push(&mut self.enc, PEIR_R15); // vec len
-    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
-    // r12 = vec
+    PeirEnc_sub_rsp_i32(&mut self.enc, 64);
+    // Locals: [rbp-40] = result, [rbp-48] = write cursor, [rbp-56] = len.
+    // Two passes, each element's length counted once by msvcrt strlen;
+    // copies via memcpy to a running cursor (no result re-scan).
+    var strlen_off: i64 = PeirGen_iat_off(self, pe_import_slot("strlen"));
+    var memcpy_off: i64 = PeirGen_iat_off(self, pe_import_slot("memcpy"));
+    // r12 = vec, r15 = vec->len
     PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RCX);
-    // r15 = vec->len (offset 8)
     PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R15, PEIR_R12, 8);
-    // total = 1 (for null terminator); calculate sum of strlen of each part.
-    // r14 = 0 (index), r13 = 1 (total)
+    // Pass 1: total = 1 + sum(strlen(elem))
     PeirEnc_xor_self(&mut self.enc, PEIR_R14);
     PeirEnc_mov_imm32(&mut self.enc, PEIR_R13, 1);
     var sjn_len_loop: i64 = PeirEnc_alloc_label(&mut self.enc);
@@ -4775,88 +4695,58 @@ pub fn PeirGen_gen_str_join_n(self: &mut PeirGen) -> void {
     PeirEnc_place_label(&mut self.enc, sjn_len_loop);
     PeirEnc_cmp_rr(&mut self.enc, PEIR_R14, PEIR_R15);
     PeirEnc_jcc_label(&mut self.enc, 0x3, sjn_len_done); // jae
-    // Get element: data[r14] = *(r12->data + r14*8)
     PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_R12, 0); // data ptr
     PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R14);
-    PeirEnc_shl_r_i8(&mut self.enc, PEIR_RDX, 3); // *8
+    PeirEnc_shl_r_i8(&mut self.enc, PEIR_RDX, 3);
     PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
-    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_RAX, 0); // string ptr
-    // strlen(rax) into rdx
-    PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
-    PeirEnc_xor_self(&mut self.enc, PEIR_RCX);
-    var sjn_strlen: i64 = PeirEnc_alloc_label(&mut self.enc);
-    var sjn_strlen_done: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_place_label(&mut self.enc, sjn_strlen);
-    PeirEnc_cmp_mem_idx_imm8(&mut self.enc, PEIR_RDX, PEIR_RCX, 0);
-    PeirEnc_jcc_label(&mut self.enc, 0x4, sjn_strlen_done); // je
-    PeirEnc_inc_r(&mut self.enc, PEIR_RCX);
-    PeirEnc_jmp_label(&mut self.enc, sjn_strlen);
-    PeirEnc_place_label(&mut self.enc, sjn_strlen_done);
-    // total += strlen
-    PeirEnc_add_rr(&mut self.enc, PEIR_R13, PEIR_RCX);
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RCX, PEIR_RAX, 0); // elem ptr
+    PeirEnc_call_rip(&mut self.enc, strlen_off);
+    PeirEnc_add_rr(&mut self.enc, PEIR_R13, PEIR_RAX);
     PeirEnc_inc_r(&mut self.enc, PEIR_R14);
     PeirEnc_jmp_label(&mut self.enc, sjn_len_loop);
     PeirEnc_place_label(&mut self.enc, sjn_len_done);
-    // malloc(total)
+    // result = cursor = malloc(total)
     PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R13);
-    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
     PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "p_malloc"));
-    PeirEnc_add_rsp_i32(&mut self.enc, 32);
-    // r13 = result, result[0] = 0
-    PeirEnc_mov_rr(&mut self.enc, PEIR_R13, PEIR_RAX);
-    PeirEnc_xor_self(&mut self.enc, PEIR_RDX);
-    PeirEnc_mov_mem_reg8_ptr(&mut self.enc, PEIR_R13, PEIR_RDX);
-    // Concatenate each string: strcat(result, element)
-    PeirEnc_xor_self(&mut self.enc, PEIR_R14); // index = 0
+    PeirEnc_mov_mem_rbp_reg(&mut self.enc, -40, PEIR_RAX);
+    PeirEnc_mov_mem_rbp_reg(&mut self.enc, -48, PEIR_RAX);
+    // Pass 2: memcpy each element to the cursor
+    PeirEnc_xor_self(&mut self.enc, PEIR_R14);
     var sjn_cat_loop: i64 = PeirEnc_alloc_label(&mut self.enc);
     var sjn_cat_done: i64 = PeirEnc_alloc_label(&mut self.enc);
     PeirEnc_place_label(&mut self.enc, sjn_cat_loop);
     PeirEnc_cmp_rr(&mut self.enc, PEIR_R14, PEIR_R15);
     PeirEnc_jcc_label(&mut self.enc, 0x3, sjn_cat_done); // jae
-    // Get element pointer
     PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_R12, 0); // data ptr
     PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R14);
     PeirEnc_shl_r_i8(&mut self.enc, PEIR_RDX, 3);
     PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
-    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_RAX, 0); // string ptr
-    // Find end of result (strlen result)
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R13, PEIR_RAX, 0); // r13 = elem
     PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R13);
-    var sjn_find_end: i64 = PeirEnc_alloc_label(&mut self.enc);
-    var sjn_found_end: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_place_label(&mut self.enc, sjn_find_end);
-    PeirEnc_mov_reg8_mem(&mut self.enc, PEIR_RDX, PEIR_RCX);
-    PeirEnc_test_rr(&mut self.enc, PEIR_RDX, PEIR_RDX);
-    PeirEnc_jcc_label(&mut self.enc, 0x4, sjn_found_end); // je
-    PeirEnc_inc_r(&mut self.enc, PEIR_RCX);
-    PeirEnc_jmp_label(&mut self.enc, sjn_find_end);
-    PeirEnc_place_label(&mut self.enc, sjn_found_end);
-    // rcx = end of result. Copy element to end.
-    PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_RAX); // r8 = src
-    var sjn_copy: i64 = PeirEnc_alloc_label(&mut self.enc);
-    var sjn_copy_done: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_place_label(&mut self.enc, sjn_copy);
-    PeirEnc_mov_reg8_mem(&mut self.enc, PEIR_RDX, PEIR_R8);
-    PeirEnc_test_rr(&mut self.enc, PEIR_RDX, PEIR_RDX);
-    PeirEnc_jcc_label(&mut self.enc, 0x4, sjn_copy_done); // je
-    PeirEnc_mov_mem_reg8_ptr(&mut self.enc, PEIR_RCX, PEIR_RDX);
+    PeirEnc_call_rip(&mut self.enc, strlen_off);
+    PeirEnc_mov_mem_rbp_reg(&mut self.enc, -56, PEIR_RAX); // elem len
+    // memcpy(cursor, elem, len + 1) — +1 copies the NUL; overwritten by
+    // the next element and re-written at the end
+    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, -48); // cursor
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R13);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_RAX);
     PeirEnc_inc_r(&mut self.enc, PEIR_R8);
-    PeirEnc_inc_r(&mut self.enc, PEIR_RCX);
-    PeirEnc_jmp_label(&mut self.enc, sjn_copy);
-    PeirEnc_place_label(&mut self.enc, sjn_copy_done);
-    // Null terminate
-    PeirEnc_xor_self(&mut self.enc, PEIR_RDX);
-    PeirEnc_mov_mem_reg8_ptr(&mut self.enc, PEIR_RCX, PEIR_RDX);
+    PeirEnc_call_rip(&mut self.enc, memcpy_off);
+    // cursor += len
+    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, -48);
+    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, -56);
+    PeirEnc_add_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+    PeirEnc_mov_mem_rbp_reg(&mut self.enc, -48, PEIR_RCX);
     PeirEnc_inc_r(&mut self.enc, PEIR_R14);
     PeirEnc_jmp_label(&mut self.enc, sjn_cat_loop);
     PeirEnc_place_label(&mut self.enc, sjn_cat_done);
     // Return result
-    PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R13);
-    PeirEnc_add_rsp_i32(&mut self.enc, 32);
+    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, -40);
+    PeirEnc_add_rsp_i32(&mut self.enc, 64);
     PeirEnc_pop(&mut self.enc, PEIR_R15);
     PeirEnc_pop(&mut self.enc, PEIR_R14);
     PeirEnc_pop(&mut self.enc, PEIR_R13);
     PeirEnc_pop(&mut self.enc, PEIR_R12);
-    PeirEnc_mov_rr(&mut self.enc, PEIR_RSP, PEIR_RBP);
     PeirEnc_pop(&mut self.enc, PEIR_RBP);
     PeirEnc_ret(&mut self.enc);
 }
@@ -5160,6 +5050,32 @@ pub fn PeirGen_gen_pe_primitives(self: &mut PeirGen) -> void {
 /// Copy `size` bytes from [rcx] to [rax] (clobbers rax, rcx, rdx):
 /// 8 bytes at a time, then single bytes, never past `size`.
 pub fn PeirGen_emit_copy_rcx_to_rax(self: &mut PeirGen, size: i64) -> void {
+    if size >= 128 {
+        // Large copies: rep movsq + rep movsb tail. 16x smaller code than
+        // the unrolled loop below; rsi/rdi are callee-saved, so they are
+        // preserved (some emitted frames keep live values in them).
+        PeirEnc_push(&mut self.enc, PEIR_RSI);
+        PeirEnc_push(&mut self.enc, PEIR_RDI);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RSI, PEIR_RCX); // src
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RDI, PEIR_RAX); // dst
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, size / 8);
+        var movsq: Vec<i64> = Vec::new();
+        movsq.push(0xF3);
+        movsq.push(0x48);
+        movsq.push(0xA5);
+        PeirEnc_emit(&mut self.enc, movsq); // rep movsq
+        var tail: i64 = size % 8;
+        if tail > 0 {
+            PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, tail);
+            var movsb: Vec<i64> = Vec::new();
+            movsb.push(0xF3);
+            movsb.push(0xA4);
+            PeirEnc_emit(&mut self.enc, movsb); // rep movsb
+        }
+        PeirEnc_pop(&mut self.enc, PEIR_RDI);
+        PeirEnc_pop(&mut self.enc, PEIR_RSI);
+        return;
+    }
     var offset: i64 = 0;
     while offset + 8 <= size {
         PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RDX, PEIR_RCX, offset);

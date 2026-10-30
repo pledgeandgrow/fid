@@ -585,6 +585,33 @@ pub fn build_program_with_runtime(source: &str, source_path: Option<&str>, runti
     // Merge: start with stdlib, then add imported modules, then user (user wins)
     let mut program = stdlib.clone();
 
+    // Phase B: record each function's origin module for per-module codegen
+    // units. Method names here are the lowered mangled forms. Built on the
+    // side because merge_programs keeps the later program's fields.
+    let stdlib_mod_name = stdlib.module.clone().unwrap_or_else(|| "core".to_string());
+    let user_mod_name = user.module.clone().unwrap_or_else(|| "main".to_string());
+    let mut func_modules: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut record_origins = |prog: &Program, mod_name: &str| {
+        for f in &prog.funcs {
+            func_modules.insert(f.name.clone(), mod_name.to_string());
+        }
+        for imp in &prog.impls {
+            for m in &imp.methods {
+                func_modules.insert(format!("{}_{}", imp.struct_name, m.name), mod_name.to_string());
+            }
+        }
+        for ti in &prog.trait_impls {
+            for m in &ti.methods {
+                func_modules.insert(format!("{}_{}", ti.type_name, m.name), mod_name.to_string());
+            }
+        }
+    };
+    record_origins(&stdlib, &stdlib_mod_name);
+    for (mod_name, mod_prog) in &imported_modules {
+        record_origins(mod_prog, mod_name);
+    }
+    record_origins(&user, &user_mod_name);
+
     // Merge imported modules
     for (_, mod_prog) in &imported_modules {
         program = merge_programs(program, mod_prog.clone());
@@ -592,6 +619,7 @@ pub fn build_program_with_runtime(source: &str, source_path: Option<&str>, runti
 
     // Merge user code (highest priority)
     program = merge_programs(program, user.clone());
+    program.func_modules = func_modules;
     timer.mark("merge");
 
     // Phase 7.7: Conditional compilation — filter out items with @cfg annotations
@@ -1885,6 +1913,24 @@ pub fn ccompile_source_traced(source: &str, source_path: &str, trace: bool) -> R
     Ok(c_code)
 }
 
+/// Like `ccompile_source_traced` but emits per-module C translation units
+/// (Phase B): (module_name, c_source) pairs, sorted by module name. The
+/// `main` unit carries the entry point and runtime implementation.
+pub fn ccompile_source_units(source: &str, source_path: &str, trace: bool) -> Result<Vec<(String, String)>, Vec<String>> {
+    use std::time::Instant;
+    let t0 = Instant::now();
+    let program = build_program_with_path(source, Some(source_path))?;
+    let t1 = Instant::now();
+    if trace { eprintln!("[trace] Frontend: {:.2}ms", t1.duration_since(t0).as_secs_f64() * 1000.0); }
+    let module = lower::lower(&program);
+    let units = codegen_c::generate_c_units(&module, &program.func_modules);
+    if trace {
+        let total: usize = units.iter().map(|(_, c)| c.len()).sum();
+        eprintln!("[trace] C Codegen: {} units, {} bytes total", units.len(), total);
+    }
+    Ok(units)
+}
+
 pub fn build_source_with_path(source: &str, source_path: &str) -> Result<String, Vec<String>> {
     let program = build_program_with_path(source, Some(source_path))?;
 
@@ -2324,6 +2370,7 @@ pub fn emit_boot(source: &str, source_path: &str) -> Result<Vec<u8>, Vec<String>
         systems: Vec::new(),
         state_machines: Vec::new(),
         event_handlers: Vec::new(),
+        func_modules: std::collections::HashMap::new(),
     };
     for (_, mod_prog) in &imported_modules {
         merged_program.funcs.extend(mod_prog.funcs.iter().cloned());
