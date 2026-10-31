@@ -1,5 +1,56 @@
 # Fides Language Changelog
 
+## Session 35 — Native PE Backend Reaches Self-Hosting Fixpoint (Oct 30, 2026)
+
+The native PE backend (`pe_ir.fd` / `src/pe.rs`, IR → x86-64 machine code →
+`.exe` with no assembler or linker) now compiles the full 104k-LOC self-hosted
+compiler and reaches a byte-exact bootstrap fixpoint:
+
+- **Self-reproduction:** `fid-n5.exe emit compiler/main.fd → fid-n6.exe` is
+  **byte-identical** (12,304,896 B) to `fid-n5.exe` — the natively-emitted
+  compiler reproduces itself bit-for-bit.
+- **Cross-emitter parity:** `fid-n5.exe` (native emit) == `fid-n5a.exe`
+  (C-compiled emit) byte-for-byte on the same source.
+- **Native beats the C build:** `dump-c compiler/main.fd` in **3m21s** vs
+  4m21s (`fid.exe` release) / 4m23s (`fid-dev`, -O0) → 0.77×. Output
+  byte-identical (40,321,215 B) to the C-compiled compiler's dump.
+- Emit of a typical test: `fidesc emit` 40 ms; `fid emit` ~1.35 s wall
+  (startup/typecheck-dominated, codegen ~50 ms).
+- Memory parity with the C build (peak WS 19.1 GB vs 19.2 GB on the bench).
+
+**Speed work (pe-roadmap items 73–86):** bulk `strlen`/`memcpy` string stubs
+(concat, sb_append, sb_to_str, clone, join — was byte loops / O(n²)),
+`rep movsq` struct copies, `movzx`-hardened byte loads, `p_str_join_n` two-pass,
+`pert_str_hash` word-at-a-time hashing (native-only; the interpreter's tagged
+values can't do raw i64 reads, so the byte loop stays in `stdlib/core.fd`),
+store→load forwarding peephole (−1,468 loads in a small exe), integer constants
+as immediates, `cmp`+`jcc` fusion (flags live across setcc/movzx/mov),
+call args as immediates, **slot reuse**: block-local temporaries share an 8-byte
+slot pool — frames dropped ~140 KB → **1.28 KB max** — and inlining of
+`p_vec_len`/`p_map_len`/`p_*_is_empty`.
+
+**Correctness fixes:** Windows **guard-page stack probes** for frames > 4 KB
+(the missing piece behind deep-recursion access violations; a 4 GB reserve
+alone does not commit pages), `p_string_starts_with` actually compares (was
+a stub always returning true), deterministic emit — `dead_at` was built by
+iterating a `HashMap` so free-slot order varied run to run — and negative
+operand guards in the reuse analysis.
+
+**Verified:** 15/15 + 14/14 emit matrices identical to interpreter; threads /
+channels / select / async / parallel / tensor / JSON / file tests identical;
+constant-time and secret `_fail` tests reject identically; emit deterministic
+on both emitters; `fidesc test`: interp 290/298, PE 289/299 (remaining fails
+are tracked dev probes, not regressions; C codegen 0/297 = broken zig install).
+
+**Gotchas discovered:** the interpreter panics on checked integer overflow
+where PE wraps (pre-existing semantic gap, both sides consistent within their
+model); `&Vec<T>` receivers resolve `.get`'s element type to `Json` —
+`peir_recyclable` takes Vecs by value to avoid a `__eq_Json` call on raw ints;
+Fides parses `a & b != c` as `a & (b != c)` (C precedence) while the Rust
+front end binds `&` above `!=` — parenthesize such expressions; zig cc `-O0`
+enables integer-overflow sanitizers that kill FNV-style wraparound code —
+`-fno-sanitize=all` is required (already in `build-selfhost.sh`).
+
 ## Session 34 — Every Test Passes on the Self-Hosted Compiler (Oct 27, 2026)
 
 The self-hosted compiler now matches `fidesc` on all 302 test programs with

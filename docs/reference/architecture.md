@@ -199,12 +199,16 @@ Phase 6:
 ### Binary Output — Current State
 
 #### PE Emission (Windows) — ✅
-- Direct byte emission of PE32+ format in `src/pe.rs`
+- Direct byte emission of PE32+ format in `src/pe.rs` (bootstrap) and `compiler/pe_ir.fd` + `compiler/pe_ir_enc.fd` (self-hosted, full parity)
 - No assembler, no linker, no `ml64.exe`, no `link.exe`
 - Custom section layout (`.text`, `.data`, `.rdata`)
-- Custom import table (only `kernel32.dll`: ExitProcess, GetStdHandle, WriteFile, HeapAlloc, HeapFree, GetProcessHeap)
+- Custom import table (only `kernel32.dll` + `msvcrt.dll` for strlen/memcpy/memcmp/etc.)
 - RIP-relative addressing, Rel32 relocations, Win64 ABI (RCX/RDX/R8/R9 + shadow space)
-- `fidesc emit <file> -o <exe>` produces a working `.exe` in one step
+- `fidesc emit <file> -o <exe>` and `fid emit <file> -o <exe>` produce working `.exe`s in one step
+- **Self-hosted fixpoint verified** (Oct 30): `fid-n5 emit compiler/main.fd` produces a byte-identical compiler to `fid-n5` itself (12,304,896 B); the same source emitted by the C-compiled compiler is also byte-identical
+- **Faster than the C build on real work:** `dump-c compiler/main.fd` 3m21s native vs 4m21s C release (0.77×), byte-identical 40 MB output
+- Cheap-codegen wins: block-local slot reuse (~140 KB → ~1.3 KB frames), store→load forwarding, immediates, `cmp`+`jcc` fusion, call-arg immediates, inlined `p_vec_len`/`p_map_len`/`p_*_is_empty`, `rep movsq` struct copies, `strlen`/`memcpy`-based string stubs, `pert_str_hash` word hashing
+- Correctness: Windows guard-page **stack probes** on frames > 4 KB; deterministic output (no HashMap-order leaks in slot assignment)
 
 #### ELF64 Emission (Linux) — ✅
 - Direct byte emission in `src/elf64.rs`
