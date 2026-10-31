@@ -232,7 +232,18 @@ pub struct BuildCache {
     stamp_path: String,
     output: String,
     main_input: String,
-    old: Option<(String, Deps, Option<u64>)>,
+    old: Option<Stamp>,
+}
+
+/// What `<output>.fides-stamp` records about the build that wrote the output.
+struct Stamp {
+    key: String,
+    deps: Deps,
+    /// Hash of the generated C
+    c: Option<u64>,
+    /// Hash of the output itself: anything else writing that path (another
+    /// compiler, another command) must not be reported up to date.
+    out: Option<u64>,
 }
 
 impl BuildCache {
@@ -261,27 +272,33 @@ impl BuildCache {
         }
     }
 
-    fn same_key(&self) -> Option<&(String, Deps, Option<u64>)> {
-        self.old.as_ref().filter(|(k, _, _)| *k == self.key)
+    fn same_key(&self) -> Option<&Stamp> {
+        self.old.as_ref().filter(|st| st.key == self.key)
+    }
+
+    /// The output still holds the bytes the recorded build wrote.
+    fn output_intact(&self, st: &Stamp) -> bool {
+        st.out.is_some() && std::fs::read(&self.output).map_or(false, |b| Some(hash_bytes(&b)) == st.out)
     }
 
     /// Nothing changed since the build that wrote the output.
     pub fn up_to_date(&self) -> bool {
-        std::path::Path::new(&self.output).exists()
-            && self.same_key().map_or(false, |(_, deps, _)| !deps.files.is_empty() && deps.unchanged())
+        self.same_key().map_or(false, |st| {
+            !st.deps.files.is_empty() && self.output_intact(st) && st.deps.unchanged()
+        })
     }
 
     /// The previous build produced the output from exactly this C code.
     pub fn c_unchanged(&self, c_hash: u64) -> bool {
-        std::path::Path::new(&self.output).exists()
-            && self.same_key().map_or(false, |(_, _, c)| *c == Some(c_hash))
+        self.same_key().map_or(false, |st| st.c == Some(c_hash) && self.output_intact(st))
     }
 
     /// Inputs whose content hash differs between the previous build's
     /// stamp and the deps recorded since `open` — i.e. which files changed
     /// to force this rebuild. Call before `commit`.
     pub fn changed_inputs(&self) -> Vec<String> {
-        let Some((_, old_deps, _)) = &self.old else { return Vec::new(); };
+        let Some(old) = &self.old else { return Vec::new(); };
+        let old_deps = &old.deps;
         let new_deps = deps_snapshot();
         let mut changed = Vec::new();
         for (p, h) in &new_deps.files {
@@ -303,8 +320,8 @@ impl BuildCache {
     /// Record a successful build. Nothing is written unless the build
     /// recorded its inputs (a pipeline that does not record them must
     /// never be reported up to date). `canon_hash` (Phase A) records the
-    /// canonical C hash for diagnostics; older v1 stamps without it still
-    /// parse (canon = the c hash, close enough for reporting).
+    /// canonical C hash for diagnostics. Older stamps have no output hash
+    /// and are not read: the next build rewrites them.
     pub fn commit(&self, c_hash: Option<u64>) {
         self.commit_canon(c_hash, None);
     }
@@ -315,7 +332,10 @@ impl BuildCache {
             let _ = std::fs::remove_file(&self.stamp_path);
             return;
         }
-        let mut s = format!("fides-stamp 2\nkey {}\n", self.key);
+        let mut s = format!("fides-stamp 3\nkey {}\n", self.key);
+        if let Ok(bytes) = std::fs::read(&self.output) {
+            s.push_str(&format!("out {:016x}\n", hash_bytes(&bytes)));
+        }
         if let Some(c) = c_hash {
             s.push_str(&format!("c {:016x}\n", c));
         }
@@ -332,21 +352,22 @@ impl BuildCache {
     }
 }
 
-fn read_stamp(path: &str) -> Option<(String, Deps, Option<u64>)> {
+fn read_stamp(path: &str) -> Option<Stamp> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
-    match lines.next()? {
-        "fides-stamp 1" | "fides-stamp 2" => {}
-        _ => return None,
+    if lines.next()? != "fides-stamp 3" {
+        return None;
     }
     let mut key = None;
     let mut c = None;
+    let mut out = None;
     let mut deps = Deps::default();
     for line in lines {
         let (tag, rest) = line.split_once(' ')?;
         match tag {
             "key" => key = Some(rest.to_string()),
             "c" => c = Some(u64::from_str_radix(rest, 16).ok()?),
+            "out" => out = Some(u64::from_str_radix(rest, 16).ok()?),
             "canon" => {}
             "file" => {
                 let (h, p) = rest.split_once(' ')?;
@@ -356,30 +377,21 @@ fn read_stamp(path: &str) -> Option<(String, Deps, Option<u64>)> {
             _ => {}
         }
     }
-    Some((key?, deps, c))
+    Some(Stamp { key: key?, deps, c, out })
 }
 
 // ─── Canonical C hashing and the on-disk artifact store ────────────────────
 //
 // `BuildCache` keys a build on its *inputs*. The artifact store keys a built
 // binary on what the program *compiles to*: a canonical form of the
-// generated C where comments and whitespace are gone, every identifier is
-// alpha-renamed positionally (i0, i1, …), and unreferenced top-level
-// function definitions are dropped. Two builds whose generated C differs
-// only by renames, dead code, or formatting get the same canonical hash and
-// reuse the same artifact — a rename or a comment edit never reruns the C
-// compiler. C keywords, string/char literals, and preprocessor lines are
-// kept verbatim so the hash stays semantics-exact.
-
-const C_KEYWORDS: &[&str] = &[
-    "auto", "break", "case", "char", "const", "continue", "default", "do",
-    "double", "else", "enum", "extern", "float", "for", "goto", "if",
-    "inline", "int", "long", "register", "restrict", "return", "short",
-    "signed", "sizeof", "static", "struct", "switch", "typedef", "union",
-    "unsigned", "void", "volatile", "while", "_Bool", "_Alignas",
-    "_Alignof", "_Atomic", "_Generic", "_Noreturn", "_Static_assert",
-    "_Thread_local",
-];
+// generated C where comments and whitespace are gone, the functions the unit
+// defines are alpha-renamed positionally (except `main`), and unreferenced
+// top-level function definitions are dropped. Two builds whose generated C
+// differs only by those get the same canonical hash and reuse one artifact.
+//
+// Every other identifier stays verbatim: an external C function, a type or
+// a global names what the program does, so `ispunct` and `isxdigit` must not
+// canonicalize alike. `// PLINK:` lines stay too: they choose what is linked.
 
 #[derive(Debug, Clone, PartialEq)]
 enum CTok {
@@ -403,7 +415,12 @@ fn lex_c(src: &str) -> Vec<(CTok, usize, usize)> {
             continue;
         }
         if c == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+            let start = i;
             while i < b.len() && b[i] != b'\n' { i += 1; }
+            let line = std::str::from_utf8(&b[start..i]).unwrap_or("").trim();
+            if line.starts_with("// PLINK:") {
+                toks.push((CTok::Lit(line.to_string()), start, i));
+            }
             continue;
         }
         if c == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
@@ -529,9 +546,9 @@ pub fn c_fn_defs(src: &str) -> Vec<(String, usize, usize, usize)> {
     }).collect()
 }
 
-/// Canonicalize generated C: strip comments/whitespace, alpha-rename all
-/// non-keyword identifiers positionally, drop unreferenced top-level
-/// function definitions. Deterministic across renames and dead-code edits.
+/// Canonicalize generated C: strip comments/whitespace, alpha-rename the
+/// functions defined here positionally, drop unreferenced top-level function
+/// definitions. Deterministic across renames and dead-code edits.
 pub fn canonicalize_c(src: &str) -> String {
     let toks = lex_c(src);
 
@@ -573,21 +590,20 @@ pub fn canonicalize_c(src: &str) -> String {
         .flat_map(|(_, _, s, e)| *s..*e)
         .collect();
 
-    // Alpha-rename non-keyword identifiers positionally; emit kept tokens.
+    // Alpha-rename defined functions positionally; emit kept tokens. `@` is
+    // not a C identifier character, so a renamed function can never read the
+    // same as a verbatim identifier of another program.
     let mut out = String::with_capacity(src.len() / 4);
     let mut names: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let mut next = 0u64;
     for (t, tok) in toks.iter().enumerate() {
         if dead_spans.contains(&t) { continue; }
         match &tok.0 {
-            CTok::Ident(n) => {
-                if C_KEYWORDS.contains(&n.as_str()) {
-                    out.push_str(n);
-                } else {
-                    let id = *names.entry(n.clone()).or_insert_with(|| { let v = next; next += 1; v });
-                    out.push_str(&format!("i{}", id));
-                }
+            CTok::Ident(n) if n != "main" && def_names.contains(n) => {
+                let id = *names.entry(n.clone()).or_insert_with(|| { let v = next; next += 1; v });
+                out.push_str(&format!("@{}", id));
             }
+            CTok::Ident(n) => out.push_str(n),
             CTok::Lit(l) => out.push_str(l),
         }
         out.push(' ');
@@ -733,6 +749,13 @@ mod tests {
         assert!(!BuildCache::open("t", &args, &args[0], &out_s, &[]).up_to_date());
         let _ = std::fs::remove_file(&missing);
 
+        // Another writer of the output is not this build.
+        assert!(BuildCache::open("t", &args, &args[0], &out_s, &[]).up_to_date());
+        std::fs::write(&out, "other").unwrap();
+        assert!(!BuildCache::open("t", &args, &args[0], &out_s, &[]).up_to_date());
+        assert!(!BuildCache::open("t", &args, &args[0], &out_s, &[]).c_unchanged(7));
+        std::fs::write(&out, "binary").unwrap();
+
         // So does a changed input, or a different command line.
         assert!(BuildCache::open("t", &args, &args[0], &out_s, &[]).up_to_date());
         assert!(!BuildCache::open("u", &args, &args[0], &out_s, &[]).up_to_date());
@@ -767,8 +790,25 @@ mod tests {
     #[test]
     fn test_canon_rename_invariant() {
         let a = "int64_t helper(int64_t x) { return x + 1; }\nint main(void) { return helper(2); }\n";
-        let b = "int64_t compute(int64_t v) { return v + 1; }\nint main(void) { return compute(2); }\n";
+        let b = "int64_t compute(int64_t x) { return x + 1; }\nint main(void) { return compute(2); }\n";
         assert_eq!(canonicalize_c(a), canonicalize_c(b));
+    }
+
+    #[test]
+    fn test_canon_external_names_kept() {
+        // Which external function is called is what the program does.
+        let a = "int ispunct(int c);\nint main(void) { return ispunct(65); }\n";
+        let b = "int isxdigit(int c);\nint main(void) { return isxdigit(65); }\n";
+        assert_ne!(canonicalize_c(a), canonicalize_c(b));
+    }
+
+    #[test]
+    fn test_canon_link_lines_kept() {
+        let a = "// PLINK: foo\nint main(void) { return 0; }\n";
+        let b = "// PLINK: bar\nint main(void) { return 0; }\n";
+        let c = "// other comment\nint main(void) { return 0; }\n";
+        assert_ne!(canonicalize_c(a), canonicalize_c(b));
+        assert_ne!(canonicalize_c(a), canonicalize_c(c));
     }
 
     #[test]

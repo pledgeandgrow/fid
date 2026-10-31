@@ -4275,6 +4275,18 @@ impl Lowerer {
             }
 
             Expr::Unary { op, expr } => {
+                // Integer negation is a checked 0 - x (-i64::MIN overflows).
+                if matches!(op, UnaryOp::Neg) {
+                    if let Expr::IntLit(v) = expr.as_ref() {
+                        return self.emit_inst(Inst::ConstInt { value: v.wrapping_neg(), ty: IrType::I64 });
+                    }
+                    let ty = self.infer_unary_type(op, expr);
+                    if ty.is_int() {
+                        let operand = self.lower_expr(expr);
+                        let zero = self.emit_inst(Inst::ConstInt { value: 0, ty: ty.clone() });
+                        return self.emit_inst(Inst::BinOp { op: BinOp::Sub, left: zero, right: operand, ty });
+                    }
+                }
                 let operand = self.lower_expr(expr);
                 let result_ty = self.infer_unary_type(op, expr);
                 self.emit_inst(Inst::UnaryOp {
@@ -4336,10 +4348,8 @@ impl Lowerer {
                 // so the codegen can route to p_print_int/p_print_str/etc.
                 if callee == "print" && !arg_vals.is_empty() {
                     let arg_ty = self.get_value_type(arg_vals[0]);
-                    return self.emit_inst(Inst::Print {
-                        value: arg_vals[0],
-                        ty: arg_ty,
-                    });
+                    let (value, ty) = self.printable(arg_vals[0], arg_ty);
+                    return self.emit_inst(Inst::Print { value, ty });
                 }
 
                 // Special case: println() builtin — emit as Print + Print("\n")
@@ -7420,15 +7430,71 @@ impl Lowerer {
                         IrType::F64
                     }
                 } else {
-                    IrType::I64
+                    Self::int_op_type(op, left, right, lt, rt)
                 }
             }
         }
     }
 
+    /// The integer type an operation runs in, and so the width it overflows
+    /// at. A bare literal takes the other operand's type when it fits; else
+    /// the wider type wins, and the unsigned one at equal width. A shift has
+    /// its left operand's type. What is not a plain integer (a pointer, a
+    /// handle) stays i64.
+    fn int_op_type(op: &BinOp, left: &Expr, right: &Expr, lt: IrType, rt: IrType) -> IrType {
+        let plain = |t: &IrType| t.is_int() && *t != IrType::Bool;
+        if !plain(&lt) || !plain(&rt) {
+            return IrType::I64;
+        }
+        if matches!(op, BinOp::Shl | BinOp::Shr) {
+            return lt;
+        }
+        let fits = |v: i64, t: &IrType| match t {
+            IrType::I8 => v >= i8::MIN as i64 && v <= i8::MAX as i64,
+            IrType::I16 => v >= i16::MIN as i64 && v <= i16::MAX as i64,
+            IrType::I32 => v >= i32::MIN as i64 && v <= i32::MAX as i64,
+            IrType::U8 => v >= 0 && v <= u8::MAX as i64,
+            IrType::U16 => v >= 0 && v <= u16::MAX as i64,
+            IrType::U32 => v >= 0 && v <= u32::MAX as i64,
+            IrType::U64 => v >= 0,
+            _ => true,
+        };
+        if let Expr::IntLit(v) = right {
+            if fits(*v, &lt) { return lt; }
+        }
+        if let Expr::IntLit(v) = left {
+            if fits(*v, &rt) { return rt; }
+        }
+        let size = |t: &IrType| match t {
+            IrType::I8 | IrType::U8 => 1,
+            IrType::I16 | IrType::U16 => 2,
+            IrType::I32 | IrType::U32 => 4,
+            _ => 8,
+        };
+        let unsigned = |t: &IrType| matches!(t, IrType::U8 | IrType::U16 | IrType::U32 | IrType::U64);
+        if size(&lt) > size(&rt) || (size(&lt) == size(&rt) && unsigned(&lt)) { lt } else { rt }
+    }
+
     fn infer_unary_type(&self, _op: &UnaryOp, expr: &Expr) -> IrType {
         let t = self.infer_expr_type(expr);
-        if t.is_float() { t } else { IrType::I64 }
+        if t.is_float() || (t.is_int() && t != IrType::Bool) { t } else { IrType::I64 }
+    }
+
+    /// `print` shows a u64 as unsigned, on every backend: through the Fides
+    /// formatter (no runtime has an unsigned printer).
+    fn printable(&mut self, value: ValueId, ty: IrType) -> (ValueId, IrType) {
+        if ty != IrType::U64 || !self.func_ret_types.contains_key("u64_to_str") {
+            return (value, ty);
+        }
+        let env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+        let str_ty = IrType::Ptr(Box::new(IrType::U8));
+        let s = self.emit_inst(Inst::Call {
+            func: "u64_to_str".to_string(),
+            args: vec![env, value],
+            ret_ty: str_ty.clone(),
+            effects: EffectSet::new(),
+        });
+        (s, str_ty)
     }
 
     fn lookup_func_ret_ty(&self, name: &str) -> IrType {

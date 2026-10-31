@@ -194,6 +194,9 @@ pub struct TypeChecker {
     /// Current source line being type-checked (for error messages).
     /// Updated from statement line numbers as check_stmt is called.
     current_line: usize,
+    /// Method calls resolved to a user impl while bodies are checked:
+    /// (calling function, type, method). See verify_method_calls.
+    method_calls: Vec<(String, String, String)>,
     /// Issue 46: Per-scope sets of variables declared with `val` (is_mut == false).
     /// Reassigning a `val` variable emits a warning. Tracked per scope so that
     /// a `val` in an inner scope doesn't leak to outer scopes.
@@ -254,6 +257,7 @@ impl TypeChecker {
             unsafe_depth: 0,
             uninit_vars: HashSet::new(),
             current_line: 0,
+            method_calls: Vec::new(),
             val_vars_per_scope: vec![HashSet::new()],
         }
     }
@@ -1073,12 +1077,70 @@ impl TypeChecker {
             self.current_type_params = prev_type_params;
             self.current_self_type = prev_self;
         }
+
+        self.verify_method_calls(program);
     }
 
     /// Verify that declared effect annotations match the inferred effects.
     /// If a function declares `!IO` but actually has `!Net` too, that's an error
     /// (under-declared). If it declares `!{}` (pure) but has `!IO`, that's also
     /// an error. Over-declaring (declaring more than needed) is allowed.
+    /// What the name-based scans cannot see: a method call's target depends
+    /// on its receiver's type, known only once bodies are checked. A call to
+    /// a user method is held to the same rules as a call to a function.
+    fn verify_method_calls(&mut self, program: &Program) {
+        let mut funcs: HashMap<String, &Func> = HashMap::new();
+        for func in &program.funcs {
+            funcs.insert(func.name.clone(), func);
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                funcs.insert(format!("{}.{}", imp.struct_name, method.name), method);
+            }
+        }
+        let has = |f: &Func, name: &str| f.annotations.iter().any(|a| a.name == name);
+        for (caller, owner, method) in std::mem::take(&mut self.method_calls) {
+            let target = format!("{}.{}", owner, method);
+            let (Some(from), Some(to)) = (funcs.get(&caller), funcs.get(&target)) else { continue; };
+            let prims = expand_annotations(&from.annotations);
+            if !prims.is_empty() {
+                let to_prims = expand_annotations(&to.annotations);
+                let mut wanted: Vec<&&str> = prims.iter().collect();
+                wanted.sort();
+                if let Some(missing) = wanted.iter().find(|p| !to_prims.contains(**p)) {
+                    self.errors.push(format!(
+                        "Safety error: function '{}' is safety-annotated but calls method '{}',\n\
+                         \x20\x20\x20\x20which lacks the '{}' primitive.\n\
+                         \x20\x20\x20\x20Fix: add the missing safety annotation to '{}', or remove the call.",
+                        caller, target, missing, target
+                    ));
+                }
+            }
+            for ann in ["deterministic", "constant_time"] {
+                if has(from, ann) && !has(to, ann) {
+                    self.errors.push(format!(
+                        "Safety error: @{} function '{}' calls method '{}', which is not @{}.",
+                        ann, caller, target, ann
+                    ));
+                }
+            }
+            if from.has_effect_annotation {
+                let effects = self.func_effects.get(&target).or_else(|| self.func_effects.get(&method)).cloned().unwrap_or_default();
+                let mut declared: Vec<String> = to_declared(to).into_iter().chain(effects).collect();
+                declared.sort();
+                declared.dedup();
+                for eff in declared {
+                    if !from.declared_effects.contains(&eff) {
+                        self.errors.push(format!(
+                            "Effect error: function '{}' calls method '{}', which has effect {}, not declared by '{}'.",
+                            caller, target, eff, caller
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     fn verify_declared_effects(&mut self, program: &Program) {
         for func in &program.funcs {
             if !func.has_effect_annotation {
@@ -2118,54 +2180,8 @@ impl TypeChecker {
     /// Users can also compose custom safety profiles:
     ///   @no-alloc @no-recursion pf foo() { ... }
     fn verify_safety_annotations(&mut self, program: &Program) {
-        // Domain preset → list of primitives (static for lifetime safety)
-        // @dal-a was merged into @medical (identical expansion).
-        // @no-panic is internal-only — users write @crashfree.
-        static DOMAIN_PRESETS: &[(&str, &[&str])] = &[
-            ("crashfree", &["no-panic", "no-unbounded"]),
-            ("medical", &["no-alloc", "no-recursion", "no-unbounded", "no-panic", "requires-audit"]),
-            ("safety-critical", &["no-alloc", "no-recursion", "no-unbounded", "no-panic", "no-indirect"]),
-            ("autosar", &["no-alloc", "no-recursion", "no-unbounded", "no-panic"]),
-        ];
-
-        // Collect all functions and their expanded primitive set
-        // Map: func_name → set of active primitives
         let mut func_primitives: HashMap<String, HashSet<&'static str>> = HashMap::new();
 
-        let expand_annotations = |annotations: &[Annotation]| -> HashSet<&'static str> {
-            let mut primitives: HashSet<&'static str> = HashSet::new();
-            for ann in annotations {
-                // Direct primitives — use static string literals
-                // Note: @no-panic is NOT user-facing — users write @crashfree
-                // (which expands to no-panic + no-unbounded). The "no-panic"
-                // primitive only appears via preset expansion.
-                match ann.name.as_str() {
-                    "no-alloc" => { primitives.insert("no-alloc"); }
-                    "no-recursion" => { primitives.insert("no-recursion"); }
-                    "no-unbounded" => { primitives.insert("no-unbounded"); }
-                    "no-indirect" => { primitives.insert("no-indirect"); }
-                    "requires-audit" => { primitives.insert("requires-audit"); }
-                    "bounded-stack" => { primitives.insert("bounded-stack"); }
-                    "bounded" => { primitives.insert("bounded"); }
-                    "firmware" => { primitives.insert("firmware"); }
-                    "simd" => { /* F23: @simd — recognized but no safety primitives */ }
-                    "zeroize" => { /* F88: @zeroize — recognized but no safety primitives */ }
-                    "secret" => { /* F74: @secret — recognized but no safety primitives */ }
-                    "declassify" => { /* audited release of @secret values (secrecy.rs) */ }
-                    "interrupt" => { /* F29: @interrupt — recognized but no safety primitives */ }
-                    _ => {}
-                }
-                // Domain presets — expand to their primitives
-                for (preset_name, preset_prims) in DOMAIN_PRESETS {
-                    if &ann.name == preset_name {
-                        for p in *preset_prims {
-                            primitives.insert(p);
-                        }
-                    }
-                }
-            }
-            primitives
-        };
 
         for func in &program.funcs {
             let prims = expand_annotations(&func.annotations);
@@ -4366,15 +4382,15 @@ impl TypeChecker {
                 } else {
                     expr_ty
                 };
-                // Issue 46: Track `val` (immutable) bindings — reassignment emits warning.
-                if !*is_mut {
-                    if let Some(scope) = self.val_vars_per_scope.last_mut() {
-                        scope.insert(name.clone());
-                    }
-                } else {
-                    // `var` redeclaration of a previously-`val` name: remove from current scope
-                    if let Some(scope) = self.val_vars_per_scope.last_mut() {
+                // Issue 46: Track `val` (immutable) bindings. A `var` of the same
+                // name is recorded as `!name`: it shadows an outer `val`.
+                if let Some(scope) = self.val_vars_per_scope.last_mut() {
+                    if *is_mut {
                         scope.remove(name);
+                        scope.insert(format!("!{}", name));
+                    } else {
+                        scope.remove(&format!("!{}", name));
+                        scope.insert(name.clone());
                     }
                 }
                 // Track region: if inside a region block, record the allocation region
@@ -4521,15 +4537,23 @@ impl TypeChecker {
                 self.consume_linear_in_expr(expr, *line);
                 // Mark as initialized (F63: init guarantee)
                 self.uninit_vars.remove(target);
-                // Issue 46: Warn about reassignment of `val` (immutable) bindings.
-                // Currently a warning to avoid breaking existing stdlib code that
-                // uses `val` for mutable variables. Will be promoted to an error
-                // after the stdlib is fully migrated to `var` for mutables.
-                let is_val = self.val_vars_per_scope.iter().any(|s| s.contains(target));
+                // Issue 46: `val` bindings are immutable; the innermost
+                // declaration of the name decides.
+                let shadow = format!("!{}", target);
+                let is_val = self.val_vars_per_scope.iter().rev()
+                    .find(|s| s.contains(target) || s.contains(&shadow))
+                    .map_or(false, |s| s.contains(target));
                 if is_val {
-                    self.warnings.push(format!(
-                        "Warning (line {}): reassigning '{}' which was declared with `val` (immutable).\n\
-                         \x20\x20\x20\x20Fix: declare it with `var` instead of `val` if you need to mutate it.",
+                    self.errors.push(format!(
+                        "Type error (line {}): cannot assign to '{}': it is declared with `val`.\n\
+                         \x20\x20\x20\x20Fix: declare it with `var` if you need to mutate it.",
+                        line, target
+                    ));
+                }
+                // A constant has no storage to assign to
+                if self.lookup(target).is_none() && self.consts.contains_key(target) {
+                    self.errors.push(format!(
+                        "Type error (line {}): cannot assign to constant '{}'",
                         line, target
                     ));
                 }
@@ -4648,7 +4672,8 @@ impl TypeChecker {
                         // Allow integer literals to coerce to the field type
                         let compatible = expr_ty == fty
                             || expr_ty == Type::Never
-                            || (self.is_integer(&expr_ty) && self.is_integer(&fty));
+                            || (self.is_integer(&expr_ty) && self.is_integer(&fty))
+                            || self.types_compatible(&fty, &expr_ty);
                         match op {
                             AssignOp::Assign => {
                                 if !compatible {
@@ -4753,7 +4778,7 @@ impl TypeChecker {
                 }
                 self.pop_scope();
             }
-            Stmt::Match { expr, arms, line: _ } => {
+            Stmt::Match { expr, arms, line } => {
                 let match_ty = Self::unbox_ty(&self.check_expr(expr));
                 for arm in arms {
                     self.push_scope();
@@ -4799,9 +4824,9 @@ impl TypeChecker {
                                 .filter(|v| !covered.contains(v))
                                 .collect();
                             if !missing.is_empty() {
-                                self.warnings.push(format!(
-                                    "Warning: non-exhaustive match — missing variant(s): {}",
-                                    missing.iter().map(|v| format!("{}::{}", enum_name, v)).collect::<Vec<_>>().join(", ")
+                                self.errors.push(format!(
+                                    "Type error: non-exhaustive match at line {} in {}, '{}' — missing variant(s): {}",
+                                    line, self.current_module, self.current_func_name.clone().unwrap_or_default(), missing.iter().map(|v| format!("{}::{}", enum_name, v)).collect::<Vec<_>>().join(", ")
                                 ));
                             }
                         }
@@ -4816,9 +4841,9 @@ impl TypeChecker {
                                 (false, true) => vec!["false"],
                                 _ => vec![],
                             };
-                            self.warnings.push(format!(
-                                "Warning: non-exhaustive match on bool — missing: {}",
-                                missing.join(", ")
+                            self.errors.push(format!(
+                                "Type error: non-exhaustive match on bool at line {} in {}, '{}' — missing: {}",
+                                line, self.current_module, self.current_func_name.clone().unwrap_or_default(), missing.join(", ")
                             ));
                         }
                     }
@@ -5181,6 +5206,14 @@ impl TypeChecker {
                 let rt = self.check_expr_with_hint(right, hint);
                 let lt = self.resolve_type(&lt);
                 let rt = self.resolve_type(&rt);
+                // An element of a bare Vec has no declared type: it takes the
+                // other operand's.
+                let (lt, rt) = match (lt == Type::Infer, rt == Type::Infer) {
+                    (true, true) => (Type::I64, Type::I64),
+                    (true, false) => (rt.clone(), rt),
+                    (false, true) => (lt.clone(), lt),
+                    _ => (lt, rt),
+                };
                 match op {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                         // Operator overloading for vec types (Phase 8A)
@@ -5936,7 +5969,8 @@ impl TypeChecker {
                                 return Type::Generic { name: "Vec".to_string(), args: args.clone() };
                             }
                         }
-                        return Type::Generic { name: "Vec".to_string(), args: vec![Type::I64] };
+                        // No declared element type: a bare Vec
+                        return Type::Named("Vec".to_string());
                     }
                 }
                 // Check if this is HashMap::new() — built-in
@@ -6004,6 +6038,19 @@ impl TypeChecker {
                 if let Type::Generic { name, args } = &recv_ty {
                     if name == "Vec" {
                         let elem_ty = args.first().cloned().unwrap_or(Type::I64);
+                        let stored = match method.as_str() {
+                            "push" => arg_types.first(),
+                            "set" => arg_types.get(1),
+                            _ => None,
+                        };
+                        if let Some(arg_ty) = stored {
+                            if !args.is_empty() && !self.types_compatible(&elem_ty, arg_ty) {
+                                self.errors.push(format!(
+                                    "Type error: cannot store {:?} in a Vec<{:?}> ({}) in '{}'",
+                                    arg_ty, elem_ty, method, self.current_func_name.clone().unwrap_or_default()
+                                ));
+                            }
+                        }
                         return match method.as_str() {
                             "push" => Type::Void,
                             "pop" => elem_ty.clone(),
@@ -6093,7 +6140,8 @@ impl TypeChecker {
                 }
                 if let Type::Named(n) = &recv_ty {
                     if n == "Vec" {
-                        let elem_ty = Type::I64;
+                        // A bare `Vec` says nothing about its elements
+                        let elem_ty = Type::Infer;
                         return match method.as_str() {
                             "push" => Type::Void,
                             "pop" => elem_ty.clone(),
@@ -6190,6 +6238,13 @@ impl TypeChecker {
                     other => other.clone(),
                 };
                 if let Type::Named(struct_name) = &effective_recv_ty {
+                    if self.methods.get(struct_name).map_or(false, |m| m.contains_key(method)) {
+                        if let Some(caller) = &self.current_func_name {
+                            let owner = self.current_self_type.as_ref()
+                                .map_or(caller.clone(), |t| format!("{}.{}", t, caller));
+                            self.method_calls.push((owner, struct_name.clone(), method.clone()));
+                        }
+                    }
                     if let Some(method_map) = self.methods.get(struct_name) {
                         if let Some((params, ret, has_self, is_pub)) = method_map.get(method) {
                                 // Visibility check
@@ -6387,9 +6442,9 @@ impl TypeChecker {
                                 .filter(|v| !covered.contains(v))
                                 .collect();
                             if !missing.is_empty() {
-                                self.warnings.push(format!(
-                                    "Warning: non-exhaustive match — missing variant(s): {}",
-                                    missing.iter().map(|v| format!("{}::{}", enum_name, v)).collect::<Vec<_>>().join(", ")
+                                self.errors.push(format!(
+                                    "Type error: non-exhaustive match in '{}' — missing variant(s): {}",
+                                    self.current_func_name.clone().unwrap_or_default(), missing.iter().map(|v| format!("{}::{}", enum_name, v)).collect::<Vec<_>>().join(", ")
                                 ));
                             }
                         }
@@ -6405,9 +6460,9 @@ impl TypeChecker {
                                 (false, true) => vec!["false"],
                                 _ => vec![],
                             };
-                            self.warnings.push(format!(
-                                "Warning: non-exhaustive match on bool — missing: {}",
-                                missing.join(", ")
+                            self.errors.push(format!(
+                                "Type error: non-exhaustive match on bool in '{}' — missing: {}",
+                                self.current_func_name.clone().unwrap_or_default(), missing.join(", ")
                             ));
                         }
                     }
@@ -6878,7 +6933,7 @@ impl TypeChecker {
     fn is_numeric(&self, ty: &Type) -> bool {
         matches!(
             ty,
-            Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128
+            Type::Infer | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128
                 | Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128
                 | Type::F32 | Type::F64
         )
@@ -6902,7 +6957,7 @@ impl TypeChecker {
     fn is_integer(&self, ty: &Type) -> bool {
         matches!(
             ty,
-            Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128
+            Type::Infer | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128
                 | Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128
         )
     }
@@ -7044,9 +7099,11 @@ impl TypeChecker {
         if matches!(declared, Type::ArrayConst { .. }) || matches!(actual, Type::ArrayConst { .. }) {
             return true;
         }
-        // str is represented as a pointer (i64) internally — allow str→i64 and i64→str
-        if (matches!(declared, Type::I64) && matches!(actual, Type::Str))
-            || (matches!(declared, Type::Str) && matches!(actual, Type::I64))
+        // str is a pointer, but in the program itself it is not an integer.
+        // Imported modules keep the old rule until their bare Vec is typed.
+        if self.current_module != "main"
+            && ((matches!(declared, Type::I64) && matches!(actual, Type::Str))
+                || (matches!(declared, Type::Str) && matches!(actual, Type::I64)))
         {
             return true;
         }
@@ -9469,4 +9526,55 @@ fn stmt_line(stmt: &Stmt) -> usize {
         Stmt::SpawnScope { line, .. } => *line,
         Stmt::CancelScope { line, .. } => *line,
     }
+}
+
+// Domain preset → list of primitives (static for lifetime safety)
+// @dal-a was merged into @medical (identical expansion).
+// @no-panic is internal-only — users write @crashfree.
+static DOMAIN_PRESETS: &[(&str, &[&str])] = &[
+    ("crashfree", &["no-panic", "no-unbounded"]),
+    ("medical", &["no-alloc", "no-recursion", "no-unbounded", "no-panic", "requires-audit"]),
+    ("safety-critical", &["no-alloc", "no-recursion", "no-unbounded", "no-panic", "no-indirect"]),
+    ("autosar", &["no-alloc", "no-recursion", "no-unbounded", "no-panic"]),
+];
+
+/// A function's safety primitives: its annotations with presets expanded.
+fn expand_annotations(annotations: &[Annotation]) -> HashSet<&'static str> {
+        let mut primitives: HashSet<&'static str> = HashSet::new();
+        for ann in annotations {
+            // Direct primitives — use static string literals
+            // Note: @no-panic is NOT user-facing — users write @crashfree
+            // (which expands to no-panic + no-unbounded). The "no-panic"
+            // primitive only appears via preset expansion.
+            match ann.name.as_str() {
+                "no-alloc" => { primitives.insert("no-alloc"); }
+                "no-recursion" => { primitives.insert("no-recursion"); }
+                "no-unbounded" => { primitives.insert("no-unbounded"); }
+                "no-indirect" => { primitives.insert("no-indirect"); }
+                "requires-audit" => { primitives.insert("requires-audit"); }
+                "bounded-stack" => { primitives.insert("bounded-stack"); }
+                "bounded" => { primitives.insert("bounded"); }
+                "firmware" => { primitives.insert("firmware"); }
+                "simd" => { /* F23: @simd — recognized but no safety primitives */ }
+                "zeroize" => { /* F88: @zeroize — recognized but no safety primitives */ }
+                "secret" => { /* F74: @secret — recognized but no safety primitives */ }
+                "declassify" => { /* audited release of @secret values (secrecy.rs) */ }
+                "interrupt" => { /* F29: @interrupt — recognized but no safety primitives */ }
+                _ => {}
+            }
+            // Domain presets — expand to their primitives
+            for (preset_name, preset_prims) in DOMAIN_PRESETS {
+                if &ann.name == preset_name {
+                    for p in *preset_prims {
+                        primitives.insert(p);
+                    }
+                }
+            }
+        }
+        primitives
+}
+
+/// The effects a function declares.
+fn to_declared(f: &Func) -> Vec<String> {
+    f.declared_effects.clone()
 }

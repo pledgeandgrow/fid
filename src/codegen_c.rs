@@ -1235,6 +1235,7 @@ impl CCodeGen {
         wln!(self, "char* p_read_line(void);");
         wln!(self, "char* p_read_stdin(int64_t n);");
         wln!(self, "void p_panic(const char* msg);");
+        self.gen_arith_helpers();
         wln!(self, "// Call stack for panic traces + recursion limit");
         wln!(self, "// Per-thread runtime state (arena, call stack): no locks needed.");
         wln!(self, "#if defined(_MSC_VER)");
@@ -1643,6 +1644,52 @@ impl CCodeGen {
         }
     }
 
+    /// Checked integer arithmetic, one helper per type: the same meaning as
+    /// the interpreter and the PE backend. A @wrapping function does not use
+    /// add/sub/mul; dividing by zero panics everywhere.
+    fn gen_arith_helpers(&mut self) {
+        wln!(self, "#define P_OVF_ADD \"Integer overflow on addition\"");
+        wln!(self, "#define P_OVF_SUB \"Integer overflow on subtraction\"");
+        wln!(self, "#define P_OVF_MUL \"Integer overflow on multiplication\"");
+        wln!(self, "#if (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)");
+        wln!(self, "#define P_ARITH(T, N) \\");
+        wln!(self, "static inline T p_add_##N(T a, T b) {{ T r; if (__builtin_add_overflow(a, b, &r)) p_panic(P_OVF_ADD); return r; }} \\");
+        wln!(self, "static inline T p_sub_##N(T a, T b) {{ T r; if (__builtin_sub_overflow(a, b, &r)) p_panic(P_OVF_SUB); return r; }} \\");
+        wln!(self, "static inline T p_mul_##N(T a, T b) {{ T r; if (__builtin_mul_overflow(a, b, &r)) p_panic(P_OVF_MUL); return r; }}");
+        wln!(self, "P_ARITH(int8_t, i8) P_ARITH(int16_t, i16) P_ARITH(int32_t, i32) P_ARITH(int64_t, i64)");
+        wln!(self, "P_ARITH(uint8_t, u8) P_ARITH(uint16_t, u16) P_ARITH(uint32_t, u32) P_ARITH(uint64_t, u64)");
+        wln!(self, "#else");
+        wln!(self, "#define P_NARROW(T, N, LO, HI) \\");
+        wln!(self, "static inline T p_add_##N(T a, T b) {{ int64_t r = (int64_t)a + b; if (r < (LO) || r > (HI)) p_panic(P_OVF_ADD); return (T)r; }} \\");
+        wln!(self, "static inline T p_sub_##N(T a, T b) {{ int64_t r = (int64_t)a - b; if (r < (LO) || r > (HI)) p_panic(P_OVF_SUB); return (T)r; }}");
+        wln!(self, "#define P_NARROW_MUL(T, N, LO, HI) \\");
+        wln!(self, "static inline T p_mul_##N(T a, T b) {{ int64_t r = (int64_t)a * b; if (r < (LO) || r > (HI)) p_panic(P_OVF_MUL); return (T)r; }}");
+        wln!(self, "P_NARROW(int8_t, i8, -128, 127) P_NARROW_MUL(int8_t, i8, -128, 127)");
+        wln!(self, "P_NARROW(int16_t, i16, -32768, 32767) P_NARROW_MUL(int16_t, i16, -32768, 32767)");
+        wln!(self, "P_NARROW(int32_t, i32, -2147483648LL, 2147483647LL) P_NARROW_MUL(int32_t, i32, -2147483648LL, 2147483647LL)");
+        wln!(self, "P_NARROW(uint8_t, u8, 0, 255) P_NARROW_MUL(uint8_t, u8, 0, 255)");
+        wln!(self, "P_NARROW(uint16_t, u16, 0, 65535) P_NARROW_MUL(uint16_t, u16, 0, 65535)");
+        wln!(self, "P_NARROW(uint32_t, u32, 0, 4294967295LL)");
+        wln!(self, "static inline uint32_t p_mul_u32(uint32_t a, uint32_t b) {{ uint64_t r = (uint64_t)a * b; if (r > 4294967295ULL) p_panic(P_OVF_MUL); return (uint32_t)r; }}");
+        wln!(self, "static inline int64_t p_add_i64(int64_t a, int64_t b) {{ int64_t r = (int64_t)((uint64_t)a + (uint64_t)b); if (((a ^ r) & (b ^ r)) < 0) p_panic(P_OVF_ADD); return r; }}");
+        wln!(self, "static inline int64_t p_sub_i64(int64_t a, int64_t b) {{ int64_t r = (int64_t)((uint64_t)a - (uint64_t)b); if (((a ^ b) & (a ^ r)) < 0) p_panic(P_OVF_SUB); return r; }}");
+        wln!(self, "static inline int64_t p_mul_i64(int64_t a, int64_t b) {{ int64_t r = (int64_t)((uint64_t)a * (uint64_t)b); if (a != 0 && ((a == -1 && b == INT64_MIN) || r / a != b)) p_panic(P_OVF_MUL); return r; }}");
+        wln!(self, "static inline uint64_t p_add_u64(uint64_t a, uint64_t b) {{ uint64_t r = a + b; if (r < a) p_panic(P_OVF_ADD); return r; }}");
+        wln!(self, "static inline uint64_t p_sub_u64(uint64_t a, uint64_t b) {{ if (b > a) p_panic(P_OVF_SUB); return a - b; }}");
+        wln!(self, "static inline uint64_t p_mul_u64(uint64_t a, uint64_t b) {{ uint64_t r = a * b; if (a != 0 && r / a != b) p_panic(P_OVF_MUL); return r; }}");
+        wln!(self, "#endif");
+        wln!(self, "#define P_DIVS(T, N) \\");
+        wln!(self, "static inline T p_div_##N(T a, T b) {{ if (b == 0) p_panic(\"Division by zero\"); if (b == -1) {{ if (a == (T)((uint64_t)1 << (sizeof(T) * 8 - 1))) p_panic(\"Integer overflow on division\"); return (T)(0 - (uint64_t)a); }} return (T)(a / b); }} \\");
+        wln!(self, "static inline T p_wdiv_##N(T a, T b) {{ if (b == 0) p_panic(\"Division by zero\"); if (b == -1) return (T)(0 - (uint64_t)a); return (T)(a / b); }} \\");
+        wln!(self, "static inline T p_mod_##N(T a, T b) {{ if (b == 0) p_panic(\"Modulo by zero\"); if (b == -1) return 0; return (T)(a % b); }}");
+        wln!(self, "#define P_DIVU(T, N) \\");
+        wln!(self, "static inline T p_div_##N(T a, T b) {{ if (b == 0) p_panic(\"Division by zero\"); return (T)(a / b); }} \\");
+        wln!(self, "static inline T p_wdiv_##N(T a, T b) {{ return p_div_##N(a, b); }} \\");
+        wln!(self, "static inline T p_mod_##N(T a, T b) {{ if (b == 0) p_panic(\"Modulo by zero\"); return (T)(a % b); }}");
+        wln!(self, "P_DIVS(int8_t, i8) P_DIVS(int16_t, i16) P_DIVS(int32_t, i32) P_DIVS(int64_t, i64)");
+        wln!(self, "P_DIVU(uint8_t, u8) P_DIVU(uint16_t, u16) P_DIVU(uint32_t, u32) P_DIVU(uint64_t, u64)");
+    }
+
     fn gen_function(&mut self, name: &str, func: &IrFunction) {
         self.value_names.clear();
         self.temp_counter = 0;
@@ -1834,7 +1881,30 @@ impl CCodeGen {
                 let result_is_ptr = is_ptr(Some(ty));
                 // Float modulo: C doesn't support % on doubles, use fmod()
                 let is_float_mod = matches!(op, BinOp::Mod) && matches!(ty, IrType::F64);
-                if is_float_mod {
+                // Integer arithmetic has one meaning (see gen_arith_helpers).
+                let plain_operands = !is_ptr(l_ty) && !is_ptr(r_ty);
+                let int_ty = if plain_operands { c_int_helper(ty) } else { None };
+                let unsigned_cmp = matches!(op, BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq)
+                    && (l_ty == Some(&IrType::U64) || r_ty == Some(&IrType::U64));
+                if let (Some((n, t)), BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Shl | BinOp::Shr) = (int_ty, op) {
+                    let wrapping = func.is_wrapping;
+                    match op {
+                        BinOp::Add | BinOp::Sub | BinOp::Mul if wrapping => {
+                            wln!(self, "    {} = ({})((uint64_t){} {} (uint64_t){});", dst, t, l, cop, r);
+                        }
+                        BinOp::Add => wln!(self, "    {} = p_add_{}({}, {});", dst, n, l, r),
+                        BinOp::Sub => wln!(self, "    {} = p_sub_{}({}, {});", dst, n, l, r),
+                        BinOp::Mul => wln!(self, "    {} = p_mul_{}({}, {});", dst, n, l, r),
+                        BinOp::Div if wrapping => wln!(self, "    {} = p_wdiv_{}({}, {});", dst, n, l, r),
+                        BinOp::Div => wln!(self, "    {} = p_div_{}({}, {});", dst, n, l, r),
+                        BinOp::Mod => wln!(self, "    {} = p_mod_{}({}, {});", dst, n, l, r),
+                        BinOp::Shl => wln!(self, "    {} = ({})((uint64_t){} << ({} & 63));", dst, t, l, r),
+                        _ if n.starts_with('u') => wln!(self, "    {} = ({})((uint64_t){} >> ({} & 63));", dst, t, l, r),
+                        _ => wln!(self, "    {} = ({})((int64_t){} >> ({} & 63));", dst, t, l, r),
+                    }
+                } else if unsigned_cmp {
+                    wln!(self, "    {} = (uint64_t){} {} (uint64_t){};", dst, l, cop, r);
+                } else if is_float_mod {
                     wln!(self, "    {} = fmod({}, {});", dst, l, r);
                 } else if result_is_ptr {
                     wln!(self, "    {} = (void*)(intptr_t)({} {} {});", dst, l, cop, r);
@@ -2857,7 +2927,8 @@ impl CCodeGen {
         wln!(self, "                fprintf(stderr, \"    ↳ called from %s\\n\", p_call_stack[i]);");
         wln!(self, "        }}");
         wln!(self, "    }}");
-        wln!(self, "    abort();");
+        wln!(self, "    fflush(stdout);");
+        wln!(self, "    exit(1);");
         wln!(self, "}}");
         // Chunk-based arena: linked list of fixed-size blocks.
         // New chunks are added to the chain when the current chunk is full.
@@ -5581,4 +5652,19 @@ pub fn generate_c_units(
         units.push((name.clone(), code));
     }
     units
+}
+
+/// The suffix and C type of the checked-arithmetic helpers for `ty`.
+fn c_int_helper(ty: &IrType) -> Option<(&'static str, &'static str)> {
+    match ty {
+        IrType::I8 => Some(("i8", "int8_t")),
+        IrType::I16 => Some(("i16", "int16_t")),
+        IrType::I32 => Some(("i32", "int32_t")),
+        IrType::I64 => Some(("i64", "int64_t")),
+        IrType::U8 => Some(("u8", "uint8_t")),
+        IrType::U16 => Some(("u16", "uint16_t")),
+        IrType::U32 => Some(("u32", "uint32_t")),
+        IrType::U64 => Some(("u64", "uint64_t")),
+        _ => None,
+    }
 }

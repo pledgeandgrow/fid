@@ -265,8 +265,15 @@ impl Lexer {
                 let val: f64 = s.parse().unwrap();
                 return Token::new(TokenKind::FloatLit(val), line, col);
             }
-            let val: i64 = s.parse().unwrap();
-            Token::new(TokenKind::IntLit(val), line, col)
+            // A literal above i64::MAX is a u64: keep its bits.
+            let val = s.parse::<i64>().or_else(|_| s.parse::<u64>().map(|v| v as i64));
+            match val {
+                Ok(v) => Token::new(TokenKind::IntLit(v), line, col),
+                Err(_) => {
+                    self.errors.push(format!("Lexer error at {}:{}: integer literal '{}' does not fit in 64 bits", line, col, s));
+                    Token::new(TokenKind::IntLit(0), line, col)
+                }
+            }
         }
     }
 

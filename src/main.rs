@@ -239,7 +239,7 @@ fn real_main() {
                     process::exit(1);
                 }
             };
-            let build_cache = fidesc::inc::BuildCache::open("build", &args[2..], input, &output, &[]);
+            let build_cache = fidesc::inc::BuildCache::open("build", &args[2..], input, &output, &["FID_HOME"]);
             if build_cache.up_to_date() {
                 println!("{} is up to date", output);
                 return;
@@ -397,7 +397,7 @@ fn real_main() {
                     }
                 }
             } else {
-                let build_cache = fidesc::inc::BuildCache::open("emit", &args[2..], input, &output, &[]);
+                let build_cache = fidesc::inc::BuildCache::open("emit", &args[2..], input, &output, &["FID_HOME"]);
                 if build_cache.up_to_date() {
                     println!("{} is up to date", output);
                     return;
@@ -1255,7 +1255,7 @@ fn real_main() {
                 }
             };
             // Incremental build: skip all work when no input changed.
-            let build_cache = fidesc::inc::BuildCache::open("ccompile", &args[2..], input, &output, &["CC", "FIDES_CC_OPT"]);
+            let build_cache = fidesc::inc::BuildCache::open("ccompile", &args[2..], input, &output, &["CC", "FIDES_CC_OPT", "FID_HOME", "FIDES_INC_FLAT"]);
             if build_cache.up_to_date() {
                 println!("{} is up to date", output);
                 return;
@@ -1275,6 +1275,7 @@ fn real_main() {
                         let cc_opt = args.iter().position(|a| a == "--cc-opt")
                             .and_then(|i| args.get(i + 1))
                             .cloned()
+                            .or_else(|| std::env::var("FIDES_CC_OPT").ok())
                             .unwrap_or_else(|| "2".to_string());
                         let cc = std::env::var("CC").unwrap_or_else(|_| {
                             for c in &["gcc", "clang", "cc", "tcc"] {
@@ -1838,6 +1839,12 @@ fn real_main() {
                 "test_shape_verify_fail",
                 // ML9: KV cache without budget
                 "test_kv_cache_fail",
+                "test_val_assign_fail",
+                "test_const_assign_fail",
+                "test_match_nonexhaustive_fail",
+                "test_vec_elem_fail",
+                "test_str_int_fail",
+                "test_crashfree_method_fail",
                 // ML10: @quantized with dequantize
                 "test_quantization_fail",
                 // ML11: @checkpoint without @deterministic

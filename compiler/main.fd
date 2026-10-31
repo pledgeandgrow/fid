@@ -739,6 +739,12 @@ fn cmd_test(n: i64, start: i64) -> i64 {
     expected_fail.push("test_realtime_fail2");
     expected_fail.push("test_autodiff_fail");
     expected_fail.push("test_kv_cache_fail");
+    expected_fail.push("test_val_assign_fail");
+    expected_fail.push("test_const_assign_fail");
+    expected_fail.push("test_match_nonexhaustive_fail");
+    expected_fail.push("test_vec_elem_fail");
+    expected_fail.push("test_str_int_fail");
+    expected_fail.push("test_crashfree_method_fail");
     expected_fail.push("test_quantization_fail");
     expected_fail.push("test_checkpoint_fail");
     expected_fail.push("test_dp_fail");
@@ -1384,8 +1390,6 @@ fn cmd_wasm(n: i64, start: i64) -> i64 {
 // self-hosted compiler's deep recursion (parser, lexer, typechecker).
 // This makes the output of `ccompile` work without manual patching.
 fn patch_pe_stack(exe_path: str) {
-    // Read the PE file as hex (p_file_read returns a C string, but PE files
-    // contain null bytes, so we use a PowerShell script to do the patching).
     // PE header layout:
     //   DOS header at offset 0, e_lfanew at offset 0x3C (4 bytes, little-endian)
     //   PE signature at e_lfanew (4 bytes "PE\0\0")
@@ -1393,22 +1397,28 @@ fn patch_pe_stack(exe_path: str) {
     //   Optional header at e_lfanew + 24
     //     SizeOfStackReserve at Optional header offset 0x48 (8 bytes, LE)
     //     SizeOfStackCommit   at Optional header offset 0x50 (8 bytes, LE)
-    var ps_script: str = "$bytes = [System.IO.File]::ReadAllBytes('" + exe_path + "'); ";
-    ps_script = ps_script + "$peOff = [BitConverter]::ToInt32($bytes, 0x3C); ";
-    ps_script = ps_script + "$stackOff = $peOff + 0x18 + 0x48; ";
-    ps_script = ps_script + "$newReserve = [BitConverter]::GetBytes([int64]268435456); ";  // 256MB
-    ps_script = ps_script + "[Array]::Copy($newReserve, 0, $bytes, $stackOff, 8); ";
-    ps_script = ps_script + "$newCommit = [BitConverter]::GetBytes([int64]16777216); ";    // 16MB
-    ps_script = ps_script + "[Array]::Copy($newCommit, 0, $bytes, $stackOff + 8, 8); ";
-    ps_script = ps_script + "[System.IO.File]::WriteAllBytes('" + exe_path + "', $bytes)";
-    var ps_cmd: str = "powershell -NoProfile -Command \"" + ps_script + "\"";
-    var ret: i64 = p_system(ps_cmd);
-    if ret != 0 {
-        p_eprint_str("[main] WARNING: PE stack patching failed (exit code ");
-        p_eprint_str(int_to_str(ret));
-        p_eprint_str("). Output may crash on deep recursion.\n");
-    } else {
-        p_eprint_str("[main] PE stack patched to 256MB.\n");
+    var bytes: Vec<i64> = p_file_read_bytes(exe_path);
+    if bytes.len() < 0x40 {
+        p_eprint_str("[main] WARNING: PE stack patching failed: cannot read output.\n");
+        return;
+    }
+    var pe_off: i64 = bytes.get(0x3C) + (bytes.get(0x3D) << 8) + (bytes.get(0x3E) << 16) + (bytes.get(0x3F) << 24);
+    var stack_off: i64 = pe_off + 0x18 + 0x48;
+    if stack_off + 16 > bytes.len() {
+        p_eprint_str("[main] WARNING: PE stack patching failed: not a PE file.\n");
+        return;
+    }
+    pe_put_u64(bytes, stack_off, 268435456);     // 256MB reserve
+    pe_put_u64(bytes, stack_off + 8, 16777216);  // 16MB commit
+    p_file_write_vec(exe_path, bytes);
+    p_eprint_str("[main] PE stack patched to 256MB.\n");
+}
+
+fn pe_put_u64(bytes: Vec<i64>, off: i64, value: i64) {
+    var i: i64 = 0;
+    while i < 8 {
+        bytes.set(off + i, (value >> (i * 8)) & 0xFF);
+        i = i + 1;
     }
 }
 
@@ -1514,7 +1524,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             // Same C as the build that produced the output: no need to run
             // the C compiler again.
             if inc_c_unchanged(stamp, build_key, output, c_hash) {
-                inc_stamp_commit(stamp_path, build_key, c_hash, input);
+                inc_stamp_commit(stamp_path, build_key, c_hash, input, output);
                 print("C translation unchanged; " + output + " is up to date\n");
                 return 0;
             }
@@ -1704,7 +1714,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             if !is_linux() {
                 patch_pe_stack(output);
             }
-            inc_stamp_commit(stamp_path, build_key, c_hash, input);
+            inc_stamp_commit(stamp_path, build_key, c_hash, input, output);
 
             print("Built native executable: ");
             print(output);
@@ -2183,6 +2193,20 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         && target != "arm64" && target != "aarch64" && target != "riscv64";
     if windows_pe { set_pe_runtime_merge(true); }
 
+    // Incremental build: skip all work when no input changed.
+    var stamp_path: str = output + ".fides-stamp";
+    var build_key: i64 = 0;
+    if windows_pe {
+        build_key = inc_build_key("emit", n, start);
+        var stamp: IncStamp = inc_stamp_read(stamp_path);
+        if !has_flag(n, start, "--no-cache") && str_len(env_or_empty("FIDES_NO_CACHE")) == 0
+            && inc_up_to_date(stamp, build_key, output) {
+            print(output + " is up to date\n");
+            return 0;
+        }
+        inc_deps_reset();
+    }
+
     var result: ResultProgram = build_program_with_path_borrowck(source, OptStr::Some(input), g_borrowck);
     match result {
         ResultProgram::Err(errs) => {
@@ -2216,6 +2240,7 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                     }
                     ResultBytes::Ok(pe_bytes) => {
                         p_file_write_vec(output, pe_bytes);
+                        inc_stamp_commit(stamp_path, build_key, 0, input, output);
                         print("Built native executable: ");
                         print(output);
                         print("\n");

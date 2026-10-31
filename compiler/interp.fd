@@ -1531,7 +1531,7 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
         }
 
         // ─── Arithmetic ───
-        Inst::BinOp(op, left, right, _) => {
+        Inst::BinOp(op, left, right, ty) => {
             var l: Value = get_value(values, left);
             var r: Value = get_value(values, right);
             // String comparison: when both operands are Ptr(U8) (str type),
@@ -1583,14 +1583,17 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                     _ => {}
                 }
             }
-            var result: Value = Interpreter_eval_binop(self, op, l, r);
+            var result: Value = Interpreter_eval_typed(self, op, l, r, ty, meta_is_u64(left_meta_opt) || meta_is_u64(right_meta_opt));
             if value_is_void(result) {
                 var msg: str = "Arithmetic error";
                 match op {
                     BinOp::Add => { msg = "Integer overflow on addition: " + int_or_q(l) + " + " + int_or_q(r); }
                     BinOp::Sub => { msg = "Integer overflow on subtraction: " + int_or_q(l) + " - " + int_or_q(r); }
                     BinOp::Mul => { msg = "Integer overflow on multiplication: " + int_or_q(l) + " * " + int_or_q(r); }
-                    BinOp::Div => { msg = "Division by zero"; }
+                    BinOp::Div => {
+                        msg = "Division by zero";
+                        if int_or_q(r) != "0" { msg = "Integer overflow on division"; }
+                    }
                     BinOp::Mod => { msg = "Modulo by zero"; }
                     _ => { msg = "Arithmetic error"; }
                 }
@@ -1638,6 +1641,9 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                 }
                 _ => { addr = 0; }
             }
+            if addr == 0 {
+                return ExecOutcome::Panic("Invalid memory access (null or dangling pointer)");
+            }
             // Load from byte memory based on type. Only a word-sized load can
             // read a value the side table holds (a Vec, map or string stored
             // there): a byte load at a string's address reads its first byte.
@@ -1668,7 +1674,7 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                     return ExecOutcome::Value(Value::Int(Memory_load_i32(&self.memory, addr)));
                 }
                 IrType::U32 => {
-                    return ExecOutcome::Value(Value::Int(Memory_load_i32(&self.memory, addr)));
+                    return ExecOutcome::Value(Value::Int(Memory_load_i32(&self.memory, addr) & 0xFFFFFFFF));
                 }
                 IrType::I64 => {
                     match Interpreter_load_side_word(self, addr) {
@@ -2431,6 +2437,131 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
 // ===========================================================================
 // eval_binop -- evaluate a binary operation
 // ===========================================================================
+
+fn meta_is_u64(m: OptValueMeta) -> bool {
+    match m {
+        OptValueMeta::Some(v) => { return ir_type_eq(v.ty, IrType::U64); }
+        OptValueMeta::None => { return false; }
+    }
+}
+
+fn interp_plain_int(t: IrType) -> bool {
+    match t {
+        IrType::I8 => { return true; }
+        IrType::I16 => { return true; }
+        IrType::I32 => { return true; }
+        IrType::I64 => { return true; }
+        IrType::U8 => { return true; }
+        IrType::U16 => { return true; }
+        IrType::U32 => { return true; }
+        IrType::U64 => { return true; }
+        _ => { return false; }
+    }
+}
+
+/// `v` as a value of integer type `t` (as a cast would give it).
+fn interp_int_norm(v: i64, t: IrType) -> i64 {
+    match t {
+        IrType::I8 => { return (v << 56) >> 56; }
+        IrType::I16 => { return (v << 48) >> 48; }
+        IrType::I32 => { return (v << 32) >> 32; }
+        IrType::U8 => { return v & 0xFF; }
+        IrType::U16 => { return v & 0xFFFF; }
+        IrType::U32 => { return v & 0xFFFFFFFF; }
+        _ => { return v; }
+    }
+}
+
+/// Integer operands go through the operation's type, the one meaning every
+/// backend implements; everything else through eval_binop.
+fn Interpreter_eval_typed(self: &Interpreter, op: BinOp, l: Value, r: Value, ty: IrType, u64_operand: bool) -> Value {
+    match l {
+        Value::Int(a) => {
+            match r {
+                Value::Int(b) => {
+                    if interp_plain_int(ty) {
+                        return Interpreter_eval_int_binop(self, op, a, b, ty);
+                    }
+                    if u64_operand {
+                        var ua: u64 = a as u64;
+                        var ub: u64 = b as u64;
+                        match op {
+                            BinOp::Lt => { return Value::Bool(ua < ub); }
+                            BinOp::Gt => { return Value::Bool(ua > ub); }
+                            BinOp::LtEq => { return Value::Bool(ua <= ub); }
+                            BinOp::GtEq => { return Value::Bool(ua >= ub); }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    return Interpreter_eval_binop(self, op, l, r);
+}
+
+/// Integer arithmetic in type `ty` (as src/interp.rs eval_int_binop).
+/// Overflow is Value::Void (the caller panics) or, in a @wrapping program,
+/// wraps at that width; dividing by zero is always Void. This function
+/// itself wraps: it tests each result.
+@wrapping
+fn Interpreter_eval_int_binop(self: &Interpreter, op: BinOp, a: i64, b: i64, ty: IrType) -> Value {
+    var is_u64: bool = ir_type_eq(ty, IrType::U64);
+    var is_i64: bool = ir_type_eq(ty, IrType::I64);
+    var ua: u64 = a as u64;
+    var ub: u64 = b as u64;
+    var r: i64 = 0;
+    var ovf: bool = false;
+    match op {
+        BinOp::Add => {
+            r = a + b;
+            if is_u64 { ovf = (r as u64) < ua; }
+            else if is_i64 { ovf = ((a ^ r) & (b ^ r)) < 0; }
+        }
+        BinOp::Sub => {
+            r = a - b;
+            if is_u64 { ovf = ua < ub; }
+            else if is_i64 { ovf = ((a ^ b) & (a ^ r)) < 0; }
+        }
+        BinOp::Mul => {
+            r = a * b;
+            if is_u64 {
+                if a != 0 { ovf = (r as u64) / ua != ub; }
+            } else if is_i64 {
+                var i64_min: i64 = (1 << 63);
+                if a != 0 { ovf = (a == -1 && b == i64_min) || r / a != b; }
+            }
+        }
+        BinOp::Div => {
+            if b == 0 { return Value::Void; }
+            if is_u64 { return Value::Int((ua / ub) as i64); }
+            if b == -1 {
+                r = 0 - a;
+                if is_i64 { ovf = a == (1 << 63); }
+            } else {
+                r = a / b;
+            }
+        }
+        BinOp::Mod => {
+            if b == 0 { return Value::Void; }
+            if is_u64 { return Value::Int((ua % ub) as i64); }
+            if b == -1 { return Value::Int(0); }
+            return Value::Int(a % b);
+        }
+        BinOp::Shl => { return Value::Int(interp_int_norm(a << (b & 63), ty)); }
+        BinOp::Shr => {
+            if is_u64 { return Value::Int((ua >> (ub & 63)) as i64); }
+            return Value::Int(a >> (b & 63));
+        }
+        _ => { return Interpreter_eval_binop(self, op, Value::Int(a), Value::Int(b)); }
+    }
+    var fit: i64 = interp_int_norm(r, ty);
+    if !ovf && !is_u64 && !is_i64 { ovf = fit != r; }
+    if ovf && !Interpreter_is_wrapping_func(self) { return Value::Void; }
+    return Value::Int(fit);
+}
 
 pub fn Interpreter_eval_binop(self: &Interpreter, op: BinOp, l: Value, r: Value) -> Value {
     // A bool compared with an integer is 0 or 1, as in C (runtime predicates
@@ -3647,20 +3778,6 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
                 return ExecOutcome::Panic("tensor_filled: expected Vec, f64");
             }
             _ => { return ExecOutcome::Panic("tensor_filled: expected Vec, f64"); }
-        }
-    }
-    if name == "p_tensor_from_vec" {
-        // stdlib calls from_vec(data, shape) — args are (data, shape)
-        var data_opt: OptVecF64 = Interpreter_args_to_f64_vec(self, args, 0);
-        var shape_opt: OptVecI64 = Interpreter_arg_to_vec_i64(self, args.get(1));
-        match data_opt {
-            OptVecF64::Some(d) => {
-                match shape_opt {
-                    OptVecI64::Some(sh) => { return ExecOutcome::Value(Interpreter_alloc_tensor(self, Tensor_from_vec(sh, d))); }
-                    _ => { return ExecOutcome::Panic("tensor_from_vec: expected Vec, Vec"); }
-                }
-            }
-            _ => { return ExecOutcome::Panic("tensor_from_vec: expected Vec, Vec"); }
         }
     }
     if name == "p_tensor_get" {
@@ -6975,7 +7092,7 @@ pub fn interp_quantize_q8(t: &TensorData, scale: f64, zp: i64) -> TensorData {
         var x: f64 = t.data.get(i) / scale;
         var r: f64 = 0.0;
         if x < 0.0 { r = 0.0 - math_floor(0.5 - x); } else { r = math_floor(x + 0.5); }
-        var q: i64 = (r as i64) + zp;
+        var q: i64 = wrap_add(r as i64, zp);
         if q < -128 { q = -128; }
         if q > 127 { q = 127; }
         d.push(q as f64);

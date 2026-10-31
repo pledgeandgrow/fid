@@ -233,7 +233,7 @@ backends and compares each compiled program's output with the interpreter's:
   compiler cache); results are reported in test order as before.
 - `fidesc test --fail` runs the expected-fail tests (they must be rejected).
 - A program the PE backend refuses because nothing provides a function it
-  calls (no machine code, no `pert_` function in src/pe_runtime/, no
+  calls (no machine code, no `pert_` function in stdlib/pe_runtime/, no
   msvcrt/kernel32 export for an `extern "C"` declaration) is reported as
   `[UNSUPPORTED]` with the missing functions, not as a pass. Every test
   program builds today.

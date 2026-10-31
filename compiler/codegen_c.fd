@@ -1630,6 +1630,7 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "void p_eprint_str(const char* s);");
     wln(self, "void p_flush_stdout(void);");
     wln(self, "void p_panic(const char* msg);");
+    gen_arith_helpers(self);
     wln(self, "// Call stack for panic traces + recursion limit");
     wln(self, "// Per-thread runtime state (arena, call stack): no locks needed.");
     wln(self, "#if defined(_MSC_VER)");
@@ -2720,7 +2721,15 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                 }
                 _ => {}
             }
-            if is_float_mod {
+            // Integer arithmetic has one meaning (see gen_arith_helpers).
+            var int_n: str = "";
+            if !is_ptr_type(l_ty) && !is_ptr_type(r_ty) { int_n = c_int_helper(ty); }
+            var unsigned_cmp: bool = ir_type_eq(l_ty, IrType::U64) || ir_type_eq(r_ty, IrType::U64);
+            if str_len(int_n) > 0 && gen_int_arith(self, func.is_wrapping, dst, op, int_n, c_type(ty), l, r) {
+                // done
+            } else if unsigned_cmp && c_is_ordered_cmp(op) {
+                wln(self, "    " + dst + " = (uint64_t)" + l + " " + cop + " (uint64_t)" + r + ";");
+            } else if is_float_mod {
                 wln(self, "    " + dst + " = fmod(" + l + ", " + r + ");");
             } else if is_ptr_type(ty) {
                 wln(self, "    " + dst + " = (void*)(intptr_t)(" + l + " " + cop + " " + r + ");");
@@ -3783,7 +3792,8 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "                fprintf(stderr, \"    -| called from %s\\n\", p_call_stack[i]);");
     wln(self, "        }");
     wln(self, "    }");
-    wln(self, "    abort();");
+    wln(self, "    fflush(stdout);");
+    wln(self, "    exit(1);");
     wln(self, "}");
     // Chunk-based arena: linked list of fixed-size blocks.
     // New chunks are added to the chain when the current chunk is full.
@@ -6352,4 +6362,108 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    }");
     wln(self, "    return 0;");
     wln(self, "}");
+}
+
+/// Checked integer arithmetic, one helper per type: the same meaning as the
+/// interpreter and the PE backend. A @wrapping function does not use
+/// add/sub/mul; dividing by zero panics everywhere.
+fn gen_arith_helpers(self: &mut CCodeGen) -> void {
+    wln(self, "#define P_OVF_ADD \"Integer overflow on addition\"");
+    wln(self, "#define P_OVF_SUB \"Integer overflow on subtraction\"");
+    wln(self, "#define P_OVF_MUL \"Integer overflow on multiplication\"");
+    wln(self, "#if (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)");
+    wln(self, "#define P_ARITH(T, N) \\");
+    wln(self, "static inline T p_add_##N(T a, T b) { T r; if (__builtin_add_overflow(a, b, &r)) p_panic(P_OVF_ADD); return r; } \\");
+    wln(self, "static inline T p_sub_##N(T a, T b) { T r; if (__builtin_sub_overflow(a, b, &r)) p_panic(P_OVF_SUB); return r; } \\");
+    wln(self, "static inline T p_mul_##N(T a, T b) { T r; if (__builtin_mul_overflow(a, b, &r)) p_panic(P_OVF_MUL); return r; }");
+    wln(self, "P_ARITH(int8_t, i8) P_ARITH(int16_t, i16) P_ARITH(int32_t, i32) P_ARITH(int64_t, i64)");
+    wln(self, "P_ARITH(uint8_t, u8) P_ARITH(uint16_t, u16) P_ARITH(uint32_t, u32) P_ARITH(uint64_t, u64)");
+    wln(self, "#else");
+    wln(self, "#define P_NARROW(T, N, LO, HI) \\");
+    wln(self, "static inline T p_add_##N(T a, T b) { int64_t r = (int64_t)a + b; if (r < (LO) || r > (HI)) p_panic(P_OVF_ADD); return (T)r; } \\");
+    wln(self, "static inline T p_sub_##N(T a, T b) { int64_t r = (int64_t)a - b; if (r < (LO) || r > (HI)) p_panic(P_OVF_SUB); return (T)r; }");
+    wln(self, "#define P_NARROW_MUL(T, N, LO, HI) \\");
+    wln(self, "static inline T p_mul_##N(T a, T b) { int64_t r = (int64_t)a * b; if (r < (LO) || r > (HI)) p_panic(P_OVF_MUL); return (T)r; }");
+    wln(self, "P_NARROW(int8_t, i8, -128, 127) P_NARROW_MUL(int8_t, i8, -128, 127)");
+    wln(self, "P_NARROW(int16_t, i16, -32768, 32767) P_NARROW_MUL(int16_t, i16, -32768, 32767)");
+    wln(self, "P_NARROW(int32_t, i32, -2147483648LL, 2147483647LL) P_NARROW_MUL(int32_t, i32, -2147483648LL, 2147483647LL)");
+    wln(self, "P_NARROW(uint8_t, u8, 0, 255) P_NARROW_MUL(uint8_t, u8, 0, 255)");
+    wln(self, "P_NARROW(uint16_t, u16, 0, 65535) P_NARROW_MUL(uint16_t, u16, 0, 65535)");
+    wln(self, "P_NARROW(uint32_t, u32, 0, 4294967295LL)");
+    wln(self, "static inline uint32_t p_mul_u32(uint32_t a, uint32_t b) { uint64_t r = (uint64_t)a * b; if (r > 4294967295ULL) p_panic(P_OVF_MUL); return (uint32_t)r; }");
+    wln(self, "static inline int64_t p_add_i64(int64_t a, int64_t b) { int64_t r = (int64_t)((uint64_t)a + (uint64_t)b); if (((a ^ r) & (b ^ r)) < 0) p_panic(P_OVF_ADD); return r; }");
+    wln(self, "static inline int64_t p_sub_i64(int64_t a, int64_t b) { int64_t r = (int64_t)((uint64_t)a - (uint64_t)b); if (((a ^ b) & (a ^ r)) < 0) p_panic(P_OVF_SUB); return r; }");
+    wln(self, "static inline int64_t p_mul_i64(int64_t a, int64_t b) { int64_t r = (int64_t)((uint64_t)a * (uint64_t)b); if (a != 0 && ((a == -1 && b == INT64_MIN) || r / a != b)) p_panic(P_OVF_MUL); return r; }");
+    wln(self, "static inline uint64_t p_add_u64(uint64_t a, uint64_t b) { uint64_t r = a + b; if (r < a) p_panic(P_OVF_ADD); return r; }");
+    wln(self, "static inline uint64_t p_sub_u64(uint64_t a, uint64_t b) { if (b > a) p_panic(P_OVF_SUB); return a - b; }");
+    wln(self, "static inline uint64_t p_mul_u64(uint64_t a, uint64_t b) { uint64_t r = a * b; if (a != 0 && r / a != b) p_panic(P_OVF_MUL); return r; }");
+    wln(self, "#endif");
+    wln(self, "#define P_DIVS(T, N) \\");
+    wln(self, "static inline T p_div_##N(T a, T b) { if (b == 0) p_panic(\"Division by zero\"); if (b == -1) { if (a == (T)((uint64_t)1 << (sizeof(T) * 8 - 1))) p_panic(\"Integer overflow on division\"); return (T)(0 - (uint64_t)a); } return (T)(a / b); } \\");
+    wln(self, "static inline T p_wdiv_##N(T a, T b) { if (b == 0) p_panic(\"Division by zero\"); if (b == -1) return (T)(0 - (uint64_t)a); return (T)(a / b); } \\");
+    wln(self, "static inline T p_mod_##N(T a, T b) { if (b == 0) p_panic(\"Modulo by zero\"); if (b == -1) return 0; return (T)(a % b); }");
+    wln(self, "#define P_DIVU(T, N) \\");
+    wln(self, "static inline T p_div_##N(T a, T b) { if (b == 0) p_panic(\"Division by zero\"); return (T)(a / b); } \\");
+    wln(self, "static inline T p_wdiv_##N(T a, T b) { return p_div_##N(a, b); } \\");
+    wln(self, "static inline T p_mod_##N(T a, T b) { if (b == 0) p_panic(\"Modulo by zero\"); return (T)(a % b); }");
+    wln(self, "P_DIVS(int8_t, i8) P_DIVS(int16_t, i16) P_DIVS(int32_t, i32) P_DIVS(int64_t, i64)");
+    wln(self, "P_DIVU(uint8_t, u8) P_DIVU(uint16_t, u16) P_DIVU(uint32_t, u32) P_DIVU(uint64_t, u64)");
+}
+
+/// The suffix of the checked-arithmetic helpers for `ty`; "" for none.
+fn c_int_helper(ty: IrType) -> str {
+    match ty {
+        IrType::I8 => { return "i8"; }
+        IrType::I16 => { return "i16"; }
+        IrType::I32 => { return "i32"; }
+        IrType::I64 => { return "i64"; }
+        IrType::U8 => { return "u8"; }
+        IrType::U16 => { return "u16"; }
+        IrType::U32 => { return "u32"; }
+        IrType::U64 => { return "u64"; }
+        _ => { return ""; }
+    }
+}
+
+fn c_is_ordered_cmp(op: BinOp) -> bool {
+    match op {
+        BinOp::Lt => { return true; }
+        BinOp::LtEq => { return true; }
+        BinOp::Gt => { return true; }
+        BinOp::GtEq => { return true; }
+        _ => { return false; }
+    }
+}
+
+/// `dst = l op r` in integer type `t` (helper suffix `n`). False when `op`
+/// is not arithmetic.
+fn gen_int_arith(self: &mut CCodeGen, wrapping: bool, dst: str, op: BinOp, n: str, t: str, l: str, r: str) -> bool {
+    var u64l: str = "(uint64_t)" + l;
+    var u64r: str = "(uint64_t)" + r;
+    match op {
+        BinOp::Add => {
+            if wrapping { wln(self, "    " + dst + " = (" + t + ")(" + u64l + " + " + u64r + ");"); }
+            else { wln(self, "    " + dst + " = p_add_" + n + "(" + l + ", " + r + ");"); }
+        }
+        BinOp::Sub => {
+            if wrapping { wln(self, "    " + dst + " = (" + t + ")(" + u64l + " - " + u64r + ");"); }
+            else { wln(self, "    " + dst + " = p_sub_" + n + "(" + l + ", " + r + ");"); }
+        }
+        BinOp::Mul => {
+            if wrapping { wln(self, "    " + dst + " = (" + t + ")(" + u64l + " * " + u64r + ");"); }
+            else { wln(self, "    " + dst + " = p_mul_" + n + "(" + l + ", " + r + ");"); }
+        }
+        BinOp::Div => {
+            if wrapping { wln(self, "    " + dst + " = p_wdiv_" + n + "(" + l + ", " + r + ");"); }
+            else { wln(self, "    " + dst + " = p_div_" + n + "(" + l + ", " + r + ");"); }
+        }
+        BinOp::Mod => { wln(self, "    " + dst + " = p_mod_" + n + "(" + l + ", " + r + ");"); }
+        BinOp::Shl => { wln(self, "    " + dst + " = (" + t + ")(" + u64l + " << (" + r + " & 63));"); }
+        BinOp::Shr => {
+            if str_starts_with(n, "u") { wln(self, "    " + dst + " = (" + t + ")(" + u64l + " >> (" + r + " & 63));"); }
+            else { wln(self, "    " + dst + " = (" + t + ")((int64_t)" + l + " >> (" + r + " & 63));"); }
+        }
+        _ => { return false; }
+    }
+    return true;
 }

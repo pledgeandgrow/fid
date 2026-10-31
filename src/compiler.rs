@@ -297,10 +297,10 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
 /// builtin `p_X` runs `pert_X` (see `pe::PeCodeGen::resolve_call`); the
 /// functions a program does not use are left out of the executable.
 pub const PE_RUNTIME: &[&str] = &[
-    include_str!("pe_runtime/base.fd"),
-    include_str!("pe_runtime/conc.fd"),
-    include_str!("pe_runtime/tensor.fd"),
-    include_str!("pe_runtime/data.fd"),
+    include_str!("../stdlib/pe_runtime/base.fd"),
+    include_str!("../stdlib/pe_runtime/conc.fd"),
+    include_str!("../stdlib/pe_runtime/tensor.fd"),
+    include_str!("../stdlib/pe_runtime/data.fd"),
 ];
 
 /// `build_program_with_path`, with `runtime` sources merged into

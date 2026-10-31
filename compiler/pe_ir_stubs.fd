@@ -112,6 +112,12 @@ pub struct PeirGen {
     pub bare_mode: bool,
     /// Function being generated
     pub cur_func: str,
+    /// The function being generated wraps on overflow
+    pub cur_wrapping: bool,
+    /// Labels of the arithmetic panic stubs (see gen_arith_panics)
+    pub arith_panics: Vec<i64>,
+    /// Label of the vectored exception handler
+    pub crash_filter: i64,
     /// Type ids of dyn values (sorted Vec<DynTypeId>, ids from 1)
     pub dyn_type_ids: Vec<DynTypeId>,
     /// Called functions that neither the program nor this runtime defines,
@@ -149,6 +155,9 @@ pub fn PeirGen_new() -> PeirGen {
         entry_offset: 0,
         bare_mode: false,
         cur_func: "",
+        cur_wrapping: false,
+        arith_panics: Vec::new(),
+        crash_filter: 0,
         dyn_type_ids: Vec::new(),
         unresolved: Vec::new(),
         module_fns: Vec::new(),
@@ -1691,24 +1700,46 @@ pub fn PeirGen_gen_panic(self: &mut PeirGen) -> void {
 
     PeirEnc_push(&mut self.enc, PEIR_RBP);
     PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
-    PeirEnc_sub_rsp_i32(&mut self.enc, 64);
+    PeirEnc_push(&mut self.enc, PEIR_R12); // message
+    PeirEnc_push(&mut self.enc, PEIR_R13); // stderr
+    PeirEnc_sub_rsp_i32(&mut self.enc, 80);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RCX);
 
-    // GetStdHandle(-11)
-    PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, -11);
-    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+    PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, -12); // STD_ERROR_HANDLE
     PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, PIAT_GET_STD_HANDLE));
-    PeirEnc_add_rsp_i32(&mut self.enc, 32);
-    PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RAX);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R13, PEIR_RAX);
 
-    // (The Rust stub's write path is dead code — it only does ExitProcess(1);
-    // the dead GetStdHandle sequence above is emitted verbatim for parity.)
+    // The prefix ("Panic: ") and the newline live in a stack slot (rbp-48)
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, 0x00203A63696E6150);
+    PeirEnc_mov_mem_rbp_reg(&mut self.enc, -48, PEIR_RAX);
+    PeirEnc_lea_rbp(&mut self.enc, PEIR_RDX, -48);
+    PeirEnc_mov_imm32(&mut self.enc, PEIR_R8, 7);
+    PeirGen_gen_panic_write(self);
 
-    // ExitProcess(1)
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R12);
+    PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, pe_import_slot("strlen")));
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_RAX);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R12);
+    PeirGen_gen_panic_write(self);
+
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, 0x0A);
+    PeirEnc_mov_mem_rbp_reg(&mut self.enc, -48, PEIR_RAX);
+    PeirEnc_lea_rbp(&mut self.enc, PEIR_RDX, -48);
+    PeirEnc_mov_imm32(&mut self.enc, PEIR_R8, 1);
+    PeirGen_gen_panic_write(self);
+
     PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, 1);
-    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
     PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, PIAT_EXIT_PROCESS));
-    PeirEnc_add_rsp_i32(&mut self.enc, 32);
     PeirEnc_ud2(&mut self.enc);
+}
+
+/// WriteFile(r13, rdx, r8, &written, NULL), inside gen_panic's frame
+fn PeirGen_gen_panic_write(self: &mut PeirGen) -> void {
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R13);
+    PeirEnc_lea_rbp(&mut self.enc, PEIR_R9, -40);
+    PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 32, PEIR_RAX);
+    PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, PIAT_WRITE_FILE));
 }
 
 /// p_malloc(rcx = size) -> rax = ptr — thread-safe bump allocator over 4 MB
@@ -2791,6 +2822,7 @@ pub fn PeirGen_gen_vec_get(self: &mut PeirGen) -> void {
     PeirEnc_ret(&mut self.enc);
 
     PeirEnc_place_label(&mut self.enc, vg_panic);
+    PeirEnc_lea_rip(&mut self.enc, PEIR_RCX, PeirGen_str_off(self, "Vec index out of bounds"));
     PeirEnc_push(&mut self.enc, PEIR_RBP);
     PeirEnc_sub_rsp_i32(&mut self.enc, 32);
     PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "p_panic"));
@@ -3586,6 +3618,8 @@ pub fn PeirGen_gen_vec_set(self: &mut PeirGen) -> void {
     PeirEnc_ret(&mut self.enc);
 
     PeirEnc_place_label(&mut self.enc, vs_panic);
+    PeirEnc_lea_rip(&mut self.enc, PEIR_RCX, PeirGen_str_off(self, "Vec index out of bounds"));
+    PeirEnc_push(&mut self.enc, PEIR_RBP);
     PeirEnc_sub_rsp_i32(&mut self.enc, 32);
     PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "p_panic"));
     PeirEnc_ud2(&mut self.enc);
@@ -4597,68 +4631,17 @@ pub fn PeirGen_gen_argv(self: &mut PeirGen) -> void {
 }
 
 /// p_system(rcx = cmd) -> rax = i64 (exit code)
-/// Runs a command via CreateProcessA + WaitForSingleObject.
+/// msvcrt system(), as the C backend: runs through the shell and returns the
+/// exit status.
 pub fn PeirGen_gen_system(self: &mut PeirGen) -> void {
     var label: i64 = HashMap_get(self.func_labels, "p_system");
     PeirEnc_place_label(&mut self.enc, label);
     PeirEnc_push(&mut self.enc, PEIR_RBP);
     PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
-    PeirEnc_push(&mut self.enc, PEIR_R12); // cmd
-    PeirEnc_sub_rsp_i32(&mut self.enc, 104); // 32 shadow + 72 SI+PI
-    // r12 = cmd
-    PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RCX);
-    // Zero out STARTUPINFO (68 bytes) at rsp+32
-    // Zero out PROCESS_INFORMATION (24 bytes) at rsp+32+68 = rsp+100
-    PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
-    var off: i64 = 0;
-    while off < 104 {
-        PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 32 + off, PEIR_RAX);
-        off = off + 8;
-    }
-    // Set STARTUPINFO.cb = 68 (at rsp+32)
-    PeirEnc_mov_imm32(&mut self.enc, PEIR_RAX, 68);
-    PeirEnc_mov_mem_disp_reg32(&mut self.enc, PEIR_RSP, 32, PEIR_RAX);
-    // CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)
-    PeirEnc_xor_self(&mut self.enc, PEIR_RCX); // lpApplicationName = NULL
-    PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R12); // lpCommandLine = cmd
-    PeirEnc_xor_self(&mut self.enc, PEIR_R8); // lpProcessAttributes = NULL
-    PeirEnc_xor_self(&mut self.enc, PEIR_R9); // lpThreadAttributes = NULL
-    // Stack args: bInheritHandles, dwCreationFlags, lpEnvironment,
-    //             lpCurrentDirectory, lpStartupInfo=&si, lpProcessInformation=&pi
-    PeirEnc_sub_rsp_i32(&mut self.enc, 48); // 32 shadow + 6 stack args
-    PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
-    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 32, PEIR_RAX); // bInherit
-    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 40, PEIR_RAX); // dwFlags
-    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 48, PEIR_RAX); // lpEnv
-    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 56, PEIR_RAX); // lpCurDir
-    PeirEnc_lea_rbp(&mut self.enc, PEIR_RAX, -80); // &si (at rbp-80)
-    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 64, PEIR_RAX); // lpSI
-    PeirEnc_lea_rbp(&mut self.enc, PEIR_RAX, -12); // &pi (at rbp-80+68)
-    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 72, PEIR_RAX); // lpPI
-    PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, PIAT_CREATE_PROCESS_A));
-    PeirEnc_add_rsp_i32(&mut self.enc, 48);
-    // Check if CreateProcess succeeded (rax != 0)
-    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
-    var fail: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_jcc_label(&mut self.enc, 0x4, fail); // jz — failed
-    // WaitForSingleObject(pi.hProcess, INFINITE)
-    // hProcess is at rsp+32+68+0 = rsp+100
-    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RCX, PEIR_RSP, 100); // hProcess
-    PeirEnc_mov_imm32(&mut self.enc, PEIR_RDX, -1); // INFINITE
     PeirEnc_sub_rsp_i32(&mut self.enc, 32);
-    PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, PIAT_WAIT_FOR_SINGLE_OBJECT));
+    PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, pe_import_slot("system")));
+    PeirEnc_movsxd_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
     PeirEnc_add_rsp_i32(&mut self.enc, 32);
-    // Return 0 (success)
-    PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
-    var done: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_jmp_label(&mut self.enc, done);
-    PeirEnc_place_label(&mut self.enc, fail);
-    // Return -1 (failure)
-    PeirEnc_mov_imm32(&mut self.enc, PEIR_RAX, -1);
-    PeirEnc_place_label(&mut self.enc, done);
-    PeirEnc_add_rsp_i32(&mut self.enc, 104);
-    PeirEnc_pop(&mut self.enc, PEIR_R12);
-    PeirEnc_mov_rr(&mut self.enc, PEIR_RSP, PEIR_RBP);
     PeirEnc_pop(&mut self.enc, PEIR_RBP);
     PeirEnc_ret(&mut self.enc);
 }
@@ -4777,6 +4760,11 @@ pub fn PeirGen_gen_entry_point(self: &mut PeirGen) -> void {
     } else {
         // sub rsp, 40 (32 shadow space + 8 for alignment)
         PeirEnc_sub_rsp_i32(&mut self.enc, 40);
+
+        // CPU faults become panics with a message
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, 1);
+        PeirEnc_lea_label(&mut self.enc, PEIR_RDX, self.crash_filter);
+        PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, pe_import_slot("AddVectoredExceptionHandler")));
 
         // Call main()
         var main_label2: i64 = HashMap_get(self.func_labels, "main");

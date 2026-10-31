@@ -26,10 +26,11 @@
   messages. The stack-frame bug that collapsed every slot to one offset is
   fixed — root cause was sorting borrowed `func.value_metas`/`func.insts`
   in place; the port now iterates them directly like `x86.fd` does.
-  Remaining: panic/threads/tensor/JSON/argv coverage (items 28, 30,
-  38–41, 52–56), install-layout `pe_runtime` lookup, and the release
-  `fid.exe` rebuild. Do not reuse `compiler/pe.fd` (PIR-based, a
-  different design).
+  Remaining: the release `fid.exe` rebuild (`NATIVE=1` bootstrap) and
+  the perf stretch goals (items 88–89). Items 28–56 all verified
+  (Oct 30–31); install-layout `pe_runtime` lookup fixed by moving the
+  runtime to `stdlib/pe_runtime/` (Oct 31). Do not reuse
+  `compiler/pe.fd` (PIR-based, a different design).
 - **Rust PE fixes found on the way (also not merged):** struct/enum globals
   were sized 8 bytes; string-initialized globals had no address; frames over
   4 KB needed stack probes (one type-checker function has a 77 KB frame);
@@ -120,7 +121,7 @@ with no C compiler. Done when the `.exe` from `fid` prints the same output as
 - [x] 38. Threads, mutexes, atomics and channels (`conc.fd`) work. — `test_threads`, `real_threads`, `test_channel`, `test_channels_select`, `test_async_threads`, `test_parallel_concurrent` all pass natively with output identical to the interpreter.
 - [x] 39. The tensor runtime (`tensor.fd`) works. — `test_tensor` passes natively, output identical to the interpreter.
 - [x] 40. JSON and file functions (`data.fd`) work. — `test_json`, `test_json2`, `test_file` pass natively, outputs identical to the interpreter.
-- [x] 41. Command-line arguments are split correctly, and the stdin functions work. *(argv verified: `p_argc`=3, `p_argv(0..2)` print exe path + args — two stub bugs fixed: token loops never advanced past token 0, and `mov dl,[rcx]` left garbage in rdx's upper bits making `test rdx,rdx` never see NUL. stdin untested)*
+- [x] 41. Command-line arguments are split correctly, and the stdin functions work. *(argv verified: `p_argc`=3, `p_argv(0..2)` print exe path + args — two stub bugs fixed: token loops never advanced past token 0, and `mov dl,[rcx]` left garbage in rdx's upper bits making `test rdx,rdx` never see NUL. stdin verified Oct 31: `p_read_line`×2 + `p_read_stdin(5)` + `p_stdin_eof` produce identical output on `fidesc emit` and `fid-dev emit`)*
 
 ### Wiring into `fid`
 
@@ -128,7 +129,7 @@ with no C compiler. Done when the `.exe` from `fid` prints the same output as
 - [x] 43. `fid build` on Windows uses it too, and the hard-coded `C:\tcc` is removed. *(verified end-to-end: `fid-dev.exe build struct.fd` → exe prints `1020`; tcc block deleted from `cmd_build`)*
 - [x] 44. `--bare`, `--boot` and `--native` behave as before. *(--bare/--boot paths untouched; `--native` → `build_executable` → `pe_ir` on Windows — verified in source; a `--native` failure now exits 1 with a clear error instead of tcc)*
 - [x] 45. Failures print a clear error and exit nonzero. *(verified end-to-end: emit of a no-main file prints "PE backend: the program has no `main` function" and exits 1)*
-- [x] 46. An installed `fid` finds `stdlib/pe_runtime` (through `FID_HOME` or the exe's folder). *(`pe_runtime_path()` implemented; merge verified in-tree — installed-layout lookup untested)*
+- [x] 46. An installed `fid` finds `stdlib/pe_runtime` (through `FID_HOME` or the exe's folder). *(`pe_runtime_path()` verified in installed layout Oct 31 — but only after moving `src/pe_runtime/` → `stdlib/pe_runtime/`; the previous `src/pe_runtime` fallback cannot exist outside the repo, so an installed `fid emit` failed with "PE runtime source not found". Rust side embeds the runtime via `include_str!("../stdlib/pe_runtime/…")`; installer ships it via `File /r "..\stdlib\*.fd"`)*
 
 ### Correctness
 

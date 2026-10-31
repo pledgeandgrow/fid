@@ -745,6 +745,27 @@ impl X86Encoder {
         self.modrm(0b11, 6, src.code());
     }
 
+    /// mul r/m64 (unsigned RDX:RAX = RAX * operand; OF and CF set when RDX != 0)
+    fn mul_r(&mut self, src: Reg) {
+        self.rex(true, false, false, src.is_extended());
+        self.emit_u8(0xF7);
+        self.modrm(0b11, 4, src.code());
+    }
+
+    /// shr r64, cl
+    fn shr_cl(&mut self, r: Reg) {
+        self.rex(true, false, false, r.is_extended());
+        self.emit_u8(0xD3);
+        self.modrm(0b11, 5, r.code());
+    }
+
+    /// mov r32, r32 (zero-extends into the 64-bit register)
+    fn mov_r32_r32(&mut self, dst: Reg, src: Reg) {
+        self.rex(false, src.is_extended(), false, dst.is_extended());
+        self.emit_u8(0x89);
+        self.modrm(0b11, src.code(), dst.code());
+    }
+
     /// sar r64, cl
     fn sar_cl(&mut self, r: Reg) {
         self.rex(true, false, false, r.is_extended());
@@ -1508,6 +1529,7 @@ const IMPORTS: &[&str] = &[
     "LoadLibraryA",
     "GetProcAddress",
     "FreeLibrary",
+    "AddVectoredExceptionHandler",
 ];
 
 /// msvcrt.dll functions: the C library behind `extern "C"` declarations
@@ -1973,6 +1995,12 @@ struct PeCodeGen {
     bare_mode: bool,
     /// Function being generated
     cur_func: String,
+    /// The function being generated wraps on overflow
+    cur_wrapping: bool,
+    /// Labels of the stubs behind ARITH_PANICS
+    arith_panics: [u32; 7],
+    /// Label of the top-level exception filter
+    crash_filter: u32,
     /// Type ids of dyn values (type name -> id, from 1)
     dyn_type_ids: std::collections::BTreeMap<String, i64>,
     /// Called functions that neither the program nor this runtime defines,
@@ -2042,17 +2070,42 @@ fn pert_name(name: &str) -> Option<String> {
 /// The jcc code jumping when an integer comparison `a OP b` holds (the
 /// setcc-style numbering gen_int_binop uses: 4=E, 5=NE, C=L, D=GE, E=LE,
 /// F=G), or None for a non-comparison.
-fn int_cmp_cc(op: &BinOp) -> Option<u8> {
+fn int_cmp_cc(op: &BinOp, unsigned: bool) -> Option<u8> {
     match op {
         BinOp::Eq => Some(0x4),
         BinOp::Neq => Some(0x5),
-        BinOp::Lt => Some(0xC),
-        BinOp::GtEq => Some(0xD),
-        BinOp::LtEq => Some(0xE),
-        BinOp::Gt => Some(0xF),
+        BinOp::Lt => Some(if unsigned { 0x2 } else { 0xC }),
+        BinOp::GtEq => Some(if unsigned { 0x3 } else { 0xD }),
+        BinOp::LtEq => Some(if unsigned { 0x6 } else { 0xE }),
+        BinOp::Gt => Some(if unsigned { 0x7 } else { 0xF }),
         _ => None,
     }
 }
+
+/// The messages of the arithmetic panics, one shared stub each.
+const ARITH_PANICS: [&str; 7] = [
+    "Integer overflow on addition",
+    "Integer overflow on subtraction",
+    "Integer overflow on multiplication",
+    "Integer overflow on division",
+    "Division by zero",
+    "Modulo by zero",
+    "Vec index out of bounds",
+];
+/// The other messages runtime stubs panic with.
+const RUNTIME_PANICS: [&str; 3] = [
+    "Stack overflow",
+    "Invalid memory access (null or dangling pointer)",
+    "Illegal instruction",
+];
+const PANIC_ADD: usize = 0;
+const PANIC_SUB: usize = 1;
+const PANIC_MUL: usize = 2;
+const PANIC_DIV_OVF: usize = 3;
+const PANIC_DIV_ZERO: usize = 4;
+const PANIC_MOD_ZERO: usize = 5;
+const PANIC_VEC_INDEX: usize = 6;
+
 
 impl PeCodeGen {
     fn new() -> Self {
@@ -2064,6 +2117,9 @@ impl PeCodeGen {
             iat_rdata_offsets: Vec::new(),
             block_labels: HashMap::new(),
             entry_offset: 0,
+            cur_wrapping: false,
+            arith_panics: [0; 7],
+            crash_filter: 0,
             bare_mode: false,
             cur_func: String::new(),
             dyn_type_ids: std::collections::BTreeMap::new(),
@@ -2137,6 +2193,12 @@ impl PeCodeGen {
         // Add boolean strings
         all_strings.push("true".to_string());
         all_strings.push("false".to_string());
+        // Panic messages of the runtime stubs
+        for s in RUNTIME_PANICS.iter().chain(ARITH_PANICS.iter()) {
+            if !all_strings.iter().any(|a| a == s) {
+                all_strings.push(s.to_string());
+            }
+        }
 
         // 2. Build .rdata section
         let mut rdata = RdataBuilder::new();
@@ -2304,6 +2366,11 @@ impl PeCodeGen {
             .cloned()
             .collect();
 
+        for i in 0..ARITH_PANICS.len() {
+            self.arith_panics[i] = self.enc.alloc_label();
+        }
+        self.crash_filter = self.enc.alloc_label();
+
         // 4. Generate code for each function (sorted for deterministic layout);
         //    of the Fides runtime only what the program uses
         let mut func_names: Vec<String> = module.functions.keys().cloned().collect();
@@ -2318,7 +2385,19 @@ impl PeCodeGen {
 
         // 5. Generate runtime stubs
         self.gen_runtime_stubs();
+        self.gen_arith_panics();
         self.gen_pe_primitives();
+        // FIDES_PE_MAP=<path>: write each function's address (for profilers)
+        if let Ok(path) = std::env::var("FIDES_PE_MAP") {
+            let mut map = String::new();
+            for (name, label) in &self.func_labels {
+                if let Some(off) = self.enc.labels.get(label) {
+                    map.push_str(&format!("{:x} {}
+", IMAGE_BASE + TEXT_RVA as u64 + *off as u64, name));
+                }
+            }
+            let _ = std::fs::write(path, map);
+        }
         let thunks = std::mem::take(&mut self.c_thunks);
         for t in &thunks {
             self.gen_c_thunk(t);
@@ -3332,6 +3411,9 @@ impl PeCodeGen {
     /// Generate code for a single function
     fn gen_function(&mut self, name: &str, func: &IrFunction, module: &IrModule) {
         self.cur_func = name.to_string();
+        // The Fides runtime is machine-level code the interpreter never runs:
+        // its arithmetic wraps, as a @wrapping function's does.
+        self.cur_wrapping = func.is_wrapping || is_pe_runtime_fn(name);
         let label = *self.func_labels.get(name).unwrap();
         self.enc.align_to(16);
         self.enc.place_label(label);
@@ -3626,17 +3708,19 @@ impl PeCodeGen {
                 let rconst = frame.const_vals.get(&right.0).copied();
                 // A comparison's type is Bool: its operands' type decides
                 let operand_ty = func.values.get(left).map(|m| m.ty.clone()).unwrap_or(IrType::I64);
+                let right_ty = func.values.get(right).map(|m| m.ty.clone()).unwrap_or(IrType::I64);
+                let unsigned_cmp = operand_ty == IrType::U64 || right_ty == IrType::U64;
                 if ty.is_float() {
                     self.gen_float_binop(op, loff, roff, dst, ty);
                 } else if operand_ty.is_float() {
                     self.gen_float_binop(op, loff, roff, dst, &operand_ty);
                 } else {
-                    self.gen_int_binop(op, loff, roff, dst, lconst, rconst);
+                    self.gen_int_binop(op, loff, roff, dst, lconst, rconst, ty, unsigned_cmp);
                     // cmp+branch fusion (pe-roadmap item 82): a comparison
                     // feeding the next instruction's Branch keeps its flags
                     // live through setcc/movzx/mov — the branch jcc's on them
                     // directly instead of reloading the slot and testing.
-                    if let Some(cc) = int_cmp_cc(op) {
+                    if let Some(cc) = int_cmp_cc(op, unsigned_cmp) {
                         if let Some(Inst::Branch { cond, .. }) = next {
                             if *cond == id {
                                 self.pending_cmp = Some((cc, id.0));
@@ -3937,6 +4021,32 @@ impl PeCodeGen {
                 };
                 let target_func = self.resolve_call(&target_func);
                 let target_func = target_func.as_str();
+
+                // Vec_len and Vec_get (core.fd) are the hottest calls of most
+                // programs: their bodies at the call site, bounds check
+                // included (unsigned, so a negative index fails it too). The
+                // `__env` argument, when present, is first.
+                if !self.bare_mode {
+                    if call_name == "Vec_len" && !args.is_empty() {
+                        self.gen_load_operand(Reg::Rax, args[args.len() - 1], frame);
+                        self.enc.mov_reg_mem_disp(Reg::Rax, Reg::Rax, 8);
+                        self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
+                        return;
+                    }
+                    if call_name == "Vec_get" && args.len() >= 2 {
+                        self.gen_load_operand(Reg::Rax, args[args.len() - 2], frame);
+                        self.gen_load_operand(Reg::Rcx, args[args.len() - 1], frame);
+                        self.enc.mov_reg_mem_disp(Reg::Rdx, Reg::Rax, 8);
+                        self.enc.cmp_rr(Reg::Rcx, Reg::Rdx);
+                        self.enc.jcc_label(0x3, self.arith_panics[PANIC_VEC_INDEX]); // jae
+                        self.enc.mov_reg_ptr(Reg::Rax, Reg::Rax);
+                        self.enc.shl_r_i8(Reg::Rcx, 3);
+                        self.enc.add_rr(Reg::Rax, Reg::Rcx);
+                        self.enc.mov_reg_ptr(Reg::Rax, Reg::Rax);
+                        self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
+                        return;
+                    }
+                }
 
                 // Inline tiny runtime calls (pe-roadmap item 86): when the
                 // resolved callee is a machine stub and no Fides override
@@ -4282,7 +4392,11 @@ impl PeCodeGen {
     }
 
     /// Generate integer binary operation
-    fn gen_int_binop(&mut self, op: &BinOp, loff: i32, roff: i32, dst: i32, lconst: Option<i64>, rconst: Option<i64>) {
+    /// Integer arithmetic in type `ty`: the one meaning the interpreter and
+    /// the C backend implement. A checked operation costs one jcc to a shared
+    /// panic stub. Bare-metal code has no panic path and stays plain.
+    #[allow(clippy::too_many_arguments)]
+    fn gen_int_binop(&mut self, op: &BinOp, loff: i32, roff: i32, dst: i32, lconst: Option<i64>, rconst: Option<i64>, ty: &IrType, unsigned_cmp: bool) {
         // A constant operand moves in as an immediate, not a slot load
         // (pe-roadmap item 81).
         match lconst {
@@ -4294,52 +4408,53 @@ impl PeCodeGen {
             None => self.enc.mov_reg_mem_rbp(Reg::Rcx, roff),
         }
 
+        let checked = !self.bare_mode && !self.cur_wrapping;
+        // jo for i64, jc for u64; narrow types are checked after the operation
+        let ovf_cc = match ty {
+            IrType::I64 => Some(0x0),
+            IrType::U64 => Some(0x2),
+            _ => None,
+        };
         match op {
-            BinOp::Add => self.enc.add_rr(Reg::Rax, Reg::Rcx),
-            BinOp::Sub => self.enc.sub_rr(Reg::Rax, Reg::Rcx),
-            BinOp::Mul => self.enc.imul_rr(Reg::Rax, Reg::Rcx),
-            BinOp::Div => {
-                self.enc.cqo();
-                self.enc.idiv_r(Reg::Rcx);
+            BinOp::Add => {
+                self.enc.add_rr(Reg::Rax, Reg::Rcx);
+                if let (true, Some(cc)) = (checked, ovf_cc) {
+                    self.enc.jcc_label(cc, self.arith_panics[PANIC_ADD]);
+                }
             }
-            BinOp::Mod => {
-                self.enc.cqo();
-                self.enc.idiv_r(Reg::Rcx);
-                self.enc.mov_rr(Reg::Rax, Reg::Rdx);
+            BinOp::Sub => {
+                self.enc.sub_rr(Reg::Rax, Reg::Rcx);
+                if let (true, Some(cc)) = (checked, ovf_cc) {
+                    self.enc.jcc_label(cc, self.arith_panics[PANIC_SUB]);
+                }
             }
+            BinOp::Mul => {
+                if checked && *ty == IrType::U64 {
+                    self.enc.mul_r(Reg::Rcx);
+                    self.enc.jcc_label(0x0, self.arith_panics[PANIC_MUL]);
+                } else {
+                    self.enc.imul_rr(Reg::Rax, Reg::Rcx);
+                    if checked && *ty == IrType::I64 {
+                        self.enc.jcc_label(0x0, self.arith_panics[PANIC_MUL]);
+                    }
+                }
+            }
+            BinOp::Div | BinOp::Mod => self.gen_int_div(op, rconst, ty, checked),
             BinOp::BitAnd => self.enc.and_rr(Reg::Rax, Reg::Rcx),
             BinOp::BitOr => self.enc.or_rr(Reg::Rax, Reg::Rcx),
             BinOp::BitXor => self.enc.xor_rr(Reg::Rax, Reg::Rcx),
             BinOp::Shl => self.enc.shl_cl(Reg::Rax),
-            BinOp::Shr => self.enc.sar_cl(Reg::Rax),
-            BinOp::Eq => {
-                self.enc.cmp_rr(Reg::Rax, Reg::Rcx);
-                self.enc.setcc_r(0x4, Reg::Rax); // sete
-                self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
+            BinOp::Shr => {
+                if *ty == IrType::U64 {
+                    self.enc.shr_cl(Reg::Rax);
+                } else {
+                    self.enc.sar_cl(Reg::Rax);
+                }
             }
-            BinOp::Neq => {
+            BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
+                let cc = int_cmp_cc(op, unsigned_cmp).unwrap();
                 self.enc.cmp_rr(Reg::Rax, Reg::Rcx);
-                self.enc.setcc_r(0x5, Reg::Rax); // setne
-                self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
-            }
-            BinOp::Lt => {
-                self.enc.cmp_rr(Reg::Rax, Reg::Rcx);
-                self.enc.setcc_r(0xC, Reg::Rax); // setl
-                self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
-            }
-            BinOp::Gt => {
-                self.enc.cmp_rr(Reg::Rax, Reg::Rcx);
-                self.enc.setcc_r(0xF, Reg::Rax); // setg
-                self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
-            }
-            BinOp::LtEq => {
-                self.enc.cmp_rr(Reg::Rax, Reg::Rcx);
-                self.enc.setcc_r(0xE, Reg::Rax); // setle
-                self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
-            }
-            BinOp::GtEq => {
-                self.enc.cmp_rr(Reg::Rax, Reg::Rcx);
-                self.enc.setcc_r(0xD, Reg::Rax); // setge
+                self.enc.setcc_r(cc, Reg::Rax);
                 self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
             }
             BinOp::And => {
@@ -4357,9 +4472,137 @@ impl PeCodeGen {
             }
         }
 
+        // A narrow result is normalized (its slot always holds the value in
+        // 64 bits); in checked code a value that changes did not fit.
+        if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Shl) {
+            let panic = match op {
+                BinOp::Add => Some(PANIC_ADD),
+                BinOp::Sub => Some(PANIC_SUB),
+                BinOp::Mul => Some(PANIC_MUL),
+                BinOp::Div => Some(PANIC_DIV_OVF),
+                _ => None,
+            };
+            self.gen_narrow(ty, if checked { panic } else { None });
+        }
+
         self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
     }
 
+    /// `reg` = a value: its constant, or its stack slot.
+    fn gen_load_operand(&mut self, reg: Reg, value: ValueId, frame: &PeStackFrame) {
+        match frame.const_vals.get(&value.0) {
+            Some(v) => self.enc.mov_imm64(reg, *v as u64),
+            None => self.enc.mov_reg_mem_rbp(reg, frame.offset(value) as i32),
+        }
+    }
+
+    /// rax = the value of `rax` in narrow type `ty`; panics instead if it
+    /// changes. Not a narrow type: nothing.
+    fn gen_narrow(&mut self, ty: &IrType, panic: Option<usize>) {
+        match ty {
+            IrType::I8 => self.enc.movsx_r64_r8(Reg::Rdx, Reg::Rax),
+            IrType::I16 => self.enc.movsx_r64_r16(Reg::Rdx, Reg::Rax),
+            IrType::I32 => self.enc.movsxd_rr(Reg::Rdx, Reg::Rax),
+            IrType::U8 => self.enc.movzx_r32_r8(Reg::Rdx, Reg::Rax),
+            IrType::U16 => self.enc.movzx_r32_r16(Reg::Rdx, Reg::Rax),
+            IrType::U32 => self.enc.mov_r32_r32(Reg::Rdx, Reg::Rax),
+            _ => return,
+        }
+        if let Some(p) = panic {
+            self.enc.cmp_rr(Reg::Rdx, Reg::Rax);
+            self.enc.jcc_label(0x5, self.arith_panics[p]);
+        }
+        self.enc.mov_rr(Reg::Rax, Reg::Rdx);
+    }
+
+    /// rax / rcx or rax % rcx. Dividing by zero panics, even in @wrapping
+    /// code; idiv also traps on MIN / -1, so -1 never reaches it. A constant
+    /// divisor needs neither check.
+    fn gen_int_div(&mut self, op: &BinOp, rconst: Option<i64>, ty: &IrType, checked: bool) {
+        let is_mod = matches!(op, BinOp::Mod);
+        if !self.bare_mode && rconst.map_or(true, |v| v == 0) {
+            self.enc.test_rr(Reg::Rcx, Reg::Rcx);
+            self.enc.jcc_label(0x4, self.arith_panics[if is_mod { PANIC_MOD_ZERO } else { PANIC_DIV_ZERO }]);
+        }
+        if matches!(ty, IrType::U8 | IrType::U16 | IrType::U32 | IrType::U64) {
+            self.enc.xor_self(Reg::Rdx);
+            self.enc.div_rr(Reg::Rcx);
+        } else if !self.bare_mode && rconst.map_or(true, |v| v == -1) {
+            let normal = self.enc.alloc_label();
+            let done = self.enc.alloc_label();
+            self.enc.mov_imm64(Reg::Rdx, u64::MAX);
+            self.enc.cmp_rr(Reg::Rcx, Reg::Rdx);
+            self.enc.jcc_label(0x5, normal);
+            if is_mod {
+                self.enc.xor_self(Reg::Rdx);
+            } else {
+                self.enc.neg_r(Reg::Rax);
+                if checked && *ty == IrType::I64 {
+                    self.enc.jcc_label(0x0, self.arith_panics[PANIC_DIV_OVF]);
+                }
+            }
+            self.enc.jmp_label(done);
+            self.enc.place_label(normal);
+            self.enc.cqo();
+            self.enc.idiv_r(Reg::Rcx);
+            self.enc.place_label(done);
+        } else {
+            self.enc.cqo();
+            self.enc.idiv_r(Reg::Rcx);
+        }
+        if is_mod {
+            self.enc.mov_rr(Reg::Rax, Reg::Rdx);
+        }
+    }
+
+    /// The shared stubs behind ARITH_PANICS, and the handler turning a CPU
+    /// fault into a panic with a message.
+    fn gen_arith_panics(&mut self) {
+        let panic = *self.func_labels.get("p_panic").unwrap();
+        for (i, msg) in ARITH_PANICS.iter().enumerate() {
+            self.enc.place_label(self.arith_panics[i]);
+            let off = self.str_off(msg);
+            self.enc.lea_rip(Reg::Rcx, off);
+            self.enc.sub_rsp_i32(32);
+            self.enc.call_label(panic);
+            self.enc.ud2();
+        }
+
+        // LONG handler(EXCEPTION_POINTERS* rcx): [[rcx]] is the exception code.
+        // A vectored handler: these executables have no unwind tables, so the
+        // system's frame walk gives up before any unhandled-exception filter
+        // would run. It sees first-chance exceptions too, so anything but
+        // these fatal codes goes on searching.
+        self.enc.place_label(self.crash_filter);
+        self.enc.mov_reg_ptr(Reg::Rax, Reg::Rcx);
+        self.enc.mov_reg_ptr(Reg::Rax, Reg::Rax);
+        self.enc.mov_r32_r32(Reg::Rax, Reg::Rax);
+        let faults: [(u64, &str); 4] = [
+            (0xC00000FD, "Stack overflow"),
+            (0xC0000005, "Invalid memory access (null or dangling pointer)"),
+            (0xC0000094, "Division by zero"),
+            (0xC000001D, "Illegal instruction"),
+        ];
+        let report = self.enc.alloc_label();
+        for (code, msg) in faults.iter() {
+            let off = self.str_off(msg);
+            let next = self.enc.alloc_label();
+            self.enc.mov_imm64(Reg::Rdx, *code);
+            self.enc.cmp_rr(Reg::Rax, Reg::Rdx);
+            self.enc.jcc_label(0x5, next);
+            self.enc.lea_rip(Reg::Rcx, off);
+            self.enc.jmp_label(report);
+            self.enc.place_label(next);
+        }
+        self.enc.xor_self(Reg::Rax); // EXCEPTION_CONTINUE_SEARCH
+        self.enc.ret();
+        self.enc.place_label(report);
+        self.enc.sub_rsp_i32(40);
+        self.enc.call_label(panic);
+        self.enc.ud2();
+    }
+
+    /// Generate float binary operation
     /// Generate float binary operation
     fn gen_float_binop(&mut self, op: &BinOp, loff: i32, roff: i32, dst: i32, ty: &IrType) {
         let f32 = *ty == IrType::F32;
@@ -6018,46 +6261,53 @@ impl PeCodeGen {
         self.enc.ret();
     }
 
-    /// p_panic(rcx = message pointer)
+    /// p_panic(rcx = message pointer): "Panic: <message>" on stderr, exit 1.
     fn gen_panic(&mut self) {
         let label = *self.func_labels.get("p_panic").unwrap();
         self.enc.place_label(label);
 
         self.enc.push(Reg::Rbp);
         self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
-        self.enc.sub_rsp_i32(64);
+        self.enc.push(Reg::R12); // message
+        self.enc.push(Reg::R13); // stderr
+        self.enc.sub_rsp_i32(80);
+        self.enc.mov_rr(Reg::R12, Reg::Rcx);
 
-        // GetStdHandle(-11)
-        self.enc.mov_imm32(Reg::Rcx, -11);
-        self.enc.sub_rsp_i32(32);
+        self.enc.mov_imm32(Reg::Rcx, -12); // STD_ERROR_HANDLE
         self.enc.call_rip(self.iat_off(IAT_GET_STD_HANDLE));
-        self.enc.add_rsp_i32(32);
-        self.enc.mov_rr(Reg::R12, Reg::Rax);
+        self.enc.mov_rr(Reg::R13, Reg::Rax);
 
-        // Calculate length
-        self.enc.mov_rr(Reg::Rdx, Reg::Rcx); // but rcx was overwritten... need to save original
-        // Actually rcx was the message pointer, but we overwrote it with -11 for GetStdHandle
-        // We need to save it first. Let me use r12 for handle and r13 for message.
-        // Redo:
-        // At entry: rcx = message. Save in r13.
-        // But we already called GetStdHandle... Let me restructure.
+        // The prefix and the newline live in a stack slot (rbp-48)
+        self.enc.mov_imm64(Reg::Rax, u64::from_le_bytes(*b"Panic: \0"));
+        self.enc.mov_mem_rbp_reg(-48, Reg::Rax);
+        self.enc.lea_rbp(Reg::Rdx, -48);
+        self.enc.mov_imm32(Reg::R8, 7);
+        self.gen_panic_write();
 
-        // Actually, let me just restructure the whole panic stub:
-        // 1. Save message in r12
-        // 2. GetStdHandle
-        // 3. strlen
-        // 4. WriteFile
-        // 5. ExitProcess(1)
+        self.enc.mov_rr(Reg::Rcx, Reg::R12);
+        self.enc.call_rip(self.iat_off(import_slot("strlen").unwrap()));
+        self.enc.mov_rr(Reg::R8, Reg::Rax);
+        self.enc.mov_rr(Reg::Rdx, Reg::R12);
+        self.gen_panic_write();
 
-        // For now, this stub is broken for hello.p but hello.p doesn't use panic.
-        // Let me just do ExitProcess(1) as a minimal stub.
+        self.enc.mov_imm64(Reg::Rax, 0x0A);
+        self.enc.mov_mem_rbp_reg(-48, Reg::Rax);
+        self.enc.lea_rbp(Reg::Rdx, -48);
+        self.enc.mov_imm32(Reg::R8, 1);
+        self.gen_panic_write();
 
-        // ExitProcess(1)
         self.enc.mov_imm32(Reg::Rcx, 1);
-        self.enc.sub_rsp_i32(32);
         self.enc.call_rip(self.iat_off(IAT_EXIT_PROCESS));
-        self.enc.add_rsp_i32(32);
         self.enc.ud2();
+    }
+
+    /// WriteFile(r13, rdx, r8, &written, NULL), inside gen_panic's frame
+    fn gen_panic_write(&mut self) {
+        self.enc.mov_rr(Reg::Rcx, Reg::R13);
+        self.enc.lea_rbp(Reg::R9, -40);
+        self.enc.xor_self(Reg::Rax);
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::Rax);
+        self.enc.call_rip(self.iat_off(IAT_WRITE_FILE));
     }
 
     /// p_malloc(rcx = size) -> rax = ptr
@@ -7473,6 +7723,8 @@ impl PeCodeGen {
         self.enc.ret();
 
         self.enc.place_label(vg_panic);
+        let off = self.str_off("Vec index out of bounds");
+        self.enc.lea_rip(Reg::Rcx, off);
         self.enc.push(Reg::Rbp);
         self.enc.sub_rsp_i32(32);
         self.enc.call_label(*self.func_labels.get("p_panic").unwrap());
@@ -8264,6 +8516,11 @@ impl PeCodeGen {
             // with RSP = 16n+8 due to return address, so we need 40 to realign to 16n)
             self.enc.sub_rsp_i32(40);
 
+            // CPU faults become panics with a message
+            self.enc.mov_imm32(Reg::Rcx, 1);
+            self.enc.lea_label(Reg::Rdx, self.crash_filter);
+            self.enc.call_rip(self.iat_off(import_slot("AddVectoredExceptionHandler").unwrap()));
+
             // Call main()
             let main_label = *self.func_labels.get("main").expect("no main function");
             self.enc.call_label(main_label);
@@ -8304,6 +8561,9 @@ impl PeCodeGen {
         self.enc.ret();
 
         self.enc.place_label(vs_panic);
+        let off = self.str_off("Vec index out of bounds");
+        self.enc.lea_rip(Reg::Rcx, off);
+        self.enc.push(Reg::Rbp);
         self.enc.sub_rsp_i32(32);
         self.enc.call_label(*self.func_labels.get("p_panic").unwrap());
         self.enc.ud2();
@@ -9324,67 +9584,18 @@ impl PeCodeGen {
     }
 
     // ─── p_system(rcx = cmd) -> rax = i64 (exit code) ───
-    // Runs a command via CreateProcessA + WaitForSingleObject.
+    // msvcrt system(), as the C backend: runs through the shell and returns
+    // the exit status.
 
     fn gen_system(&mut self) {
         let label = *self.func_labels.get("p_system").unwrap();
         self.enc.place_label(label);
         self.enc.push(Reg::Rbp);
         self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
-        self.enc.push(Reg::R12); // cmd
-        self.enc.sub_rsp_i32(104); // 32 shadow + 72 for STARTUPINFO+PROCESS_INFORMATION
-        // r12 = cmd
-        self.enc.mov_rr(Reg::R12, Reg::Rcx);
-        // Zero out STARTUPINFO (68 bytes) at rsp+32
-        // Zero out PROCESS_INFORMATION (24 bytes) at rsp+32+68 = rsp+100
-        self.enc.xor_self(Reg::Rax);
-        for off in (0..104).step_by(8) {
-            self.enc.mov_mem_disp_reg(Reg::Rsp, 32 + off, Reg::Rax);
-        }
-        // Set STARTUPINFO.cb = 68 (at rsp+32)
-        self.enc.mov_imm32(Reg::Rax, 68);
-        self.enc.mov_mem_disp_reg32(Reg::Rsp, 32, Reg::Rax);
-        // CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)
-        self.enc.xor_self(Reg::Rcx); // lpApplicationName = NULL
-        self.enc.mov_rr(Reg::Rdx, Reg::R12); // lpCommandLine = cmd
-        self.enc.xor_self(Reg::R8); // lpProcessAttributes = NULL
-        self.enc.xor_self(Reg::R9); // lpThreadAttributes = NULL
-        // Stack args: bInheritHandles=FALSE, dwCreationFlags=0, lpEnvironment=NULL,
-        //            lpCurrentDirectory=NULL, lpStartupInfo=&si, lpProcessInformation=&pi
-        self.enc.sub_rsp_i32(48); // 32 shadow + 6 stack args
-        self.enc.xor_self(Reg::Rax);
-        self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::Rax); // bInheritHandles = FALSE
-        self.enc.mov_mem_disp_reg(Reg::Rsp, 40, Reg::Rax); // dwCreationFlags = 0
-        self.enc.mov_mem_disp_reg(Reg::Rsp, 48, Reg::Rax); // lpEnvironment = NULL
-        self.enc.mov_mem_disp_reg(Reg::Rsp, 56, Reg::Rax); // lpCurrentDirectory = NULL
-        self.enc.lea_rbp(Reg::Rax, -80); // &si (at rbp-80)
-        self.enc.mov_mem_disp_reg(Reg::Rsp, 64, Reg::Rax); // lpStartupInfo
-        self.enc.lea_rbp(Reg::Rax, -12); // &pi (at rbp-80+68 = rbp-12)
-        self.enc.mov_mem_disp_reg(Reg::Rsp, 72, Reg::Rax); // lpProcessInformation
-        self.enc.call_rip(self.iat_off(IAT_CREATE_PROCESS_A));
-        self.enc.add_rsp_i32(48);
-        // Check if CreateProcess succeeded (rax != 0)
-        self.enc.test_rr(Reg::Rax, Reg::Rax);
-        let fail = self.enc.alloc_label();
-        self.enc.jcc_label(0x4, fail); // jz — failed
-        // WaitForSingleObject(pi.hProcess, INFINITE)
-        // hProcess is at rsp+32+68+0 = rsp+100 (first field of PROCESS_INFORMATION)
-        self.enc.mov_reg_mem_disp(Reg::Rcx, Reg::Rsp, 32 + 68); // hProcess
-        self.enc.mov_imm32(Reg::Rdx, -1); // INFINITE = 0xFFFFFFFF
         self.enc.sub_rsp_i32(32);
-        self.enc.call_rip(self.iat_off(IAT_WAIT_FOR_SINGLE_OBJECT));
+        self.enc.call_rip(self.iat_off(import_slot("system").unwrap()));
+        self.enc.movsxd_rr(Reg::Rax, Reg::Rax);
         self.enc.add_rsp_i32(32);
-        // Return 0 (success)
-        self.enc.xor_self(Reg::Rax);
-        let done = self.enc.alloc_label();
-        self.enc.jmp_label(done);
-        self.enc.place_label(fail);
-        // Return -1 (failure)
-        self.enc.mov_imm32(Reg::Rax, -1);
-        self.enc.place_label(done);
-        self.enc.add_rsp_i32(104);
-        self.enc.pop(Reg::R12);
-        self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
         self.enc.pop(Reg::Rbp);
         self.enc.ret();
     }

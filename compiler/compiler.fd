@@ -935,8 +935,8 @@ var g_stdlib_dir: str = "stdlib";
 pub var g_pe_runtime_merge: bool = false;
 pub fn set_pe_runtime_merge(v: bool) { g_pe_runtime_merge = v; }
 
-/// Locate a PE runtime source file: beside stdlib/ when installed, in the
-/// repo's src/pe_runtime/ otherwise.
+/// Locate a PE runtime source file: under stdlib/pe_runtime/ (repo and
+/// installed layouts alike), with a legacy src/pe_runtime/ fallback.
 pub fn pe_runtime_path(name: str) -> str {
     var p1: str = c_path_join(stdlib_dir(), c_path_join("pe_runtime", name));
     if c_file_exists(p1) { return p1; }
@@ -1045,6 +1045,8 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
         OptStr::Some(main_path) => { inc_record_file(main_path); }
         OptStr::None => {}
     }
+    // core is read from disk here (Rust embeds it): an input like any other
+    inc_record_file(c_path_join(stdlib_dir(), "core.fd"));
     // Parse stdlib first (use cache if available)
     var stdlib_opt: OptProgram = get_cached_stdlib();
     match stdlib_opt {
@@ -1082,6 +1084,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                 var rti: i64 = 0;
                 while rti < rt_files.len() {
                     var rt_path: str = pe_runtime_path(rt_files.get(rti));
+                    inc_record_file(rt_path);
                     var rt_raw: str = p_file_read(rt_path);
                     if rt_raw == 0 {
                         return ResultProgram::Err(c_vec1("PE runtime source not found: " + rt_path));
@@ -2723,6 +2726,7 @@ pub fn default_expr_for_type(ty: Type) -> Expr {
             var inits: Vec<FieldInit> = Vec::new();
             return Expr::StructLit(name, inits, OptBoxExpr::None);
         }
+        _ => {}
     }
     return Expr::IntLit(0);
 }
@@ -3207,6 +3211,7 @@ pub fn strip_ungranted_caps(module: &mut IrModule, granted_caps: Vec<str>) {
                         }
                     }
                 }
+                _ => {}
             }
             j = j + 1;
         }
@@ -3240,6 +3245,7 @@ pub fn strip_ungranted_caps(module: &mut IrModule, granted_caps: Vec<str>) {
                         callees.push(name);
                     }
                 }
+                _ => {}
             }
             j2 = j2 + 1;
         }

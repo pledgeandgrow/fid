@@ -27,7 +27,7 @@ use compiler::ir;
 // --- FNV-1a 64-bit hash --------------------------------------------------
 
 /// Compute a hash of the source content (FNV-1a 64-bit).
-/// Returns an i64 (Fides doesn't have u64).
+@wrapping
 pub fn hash_source(source: str) -> i64 {
     var hash: i64 = 8834263827529598795; // 0xcbf29ce484222325 as signed
     var i: i64 = 0;
@@ -52,9 +52,10 @@ pub fn hash_str(s: str) -> i64 {
 // A build records every file it reads (the program and each imported
 // module) and every import candidate it found missing (creating that file
 // would change what the import resolves to). `<output>.fides-stamp` keeps
-// them with a key (compiler identity, command line, CC): a later build whose
-// inputs are all unchanged and whose output exists is up to date; a build
-// that produces the same C as the last one skips the C compiler. The
+// them with a key (compiler identity, command line, CC, FID_HOME) and a hash
+// of the output: a later build whose inputs are all unchanged and whose
+// output still holds those bytes is up to date; a build that produces the
+// same C as the last one skips the C compiler. The
 // in-memory cache above checks the same inputs before reusing a module.
 
 var g_dep_files: Vec<str> = Vec::new();
@@ -126,6 +127,8 @@ pub struct IncStamp {
     pub key: i64,
     pub has_c: bool,
     pub c_hash: i64,
+    pub has_out: bool,
+    pub out_hash: i64,
     pub files: Vec<str>,
     pub hashes: Vec<i64>,
     pub absent: Vec<str>,
@@ -135,7 +138,7 @@ fn IncStamp_none() -> IncStamp {
     var files: Vec<str> = Vec::new();
     var hashes: Vec<i64> = Vec::new();
     var absent: Vec<str> = Vec::new();
-    return IncStamp { ok: false, key: 0, has_c: false, c_hash: 0, files: files, hashes: hashes, absent: absent };
+    return IncStamp { ok: false, key: 0, has_c: false, c_hash: 0, has_out: false, out_hash: 0, files: files, hashes: hashes, absent: absent };
 }
 
 /// An environment variable's value, "" when it is not set (p_getenv
@@ -148,13 +151,32 @@ pub fn env_or_empty(name: str) -> str {
     return value;
 }
 
-/// The key of a build: compiler identity, command, arguments, CC and
-/// FIDES_CC_OPT.
-pub fn inc_build_key(command: str, n: i64, start: i64) -> i64 {
+/// Hash of this compiler's executable: at argv[0], or (started by name) in
+/// the PATH entry that holds it. A rebuilt compiler must invalidate stamps.
+fn inc_self_hash() -> i64 {
     var exe: str = p_argv(0);
-    var ident: i64 = p_file_hash(exe);
-    if ident == 0 { ident = p_file_hash(exe + ".exe"); }
-    var k: str = int_to_str(ident) + " " + command;
+    var h: i64 = p_file_hash(exe);
+    if h == 0 { h = p_file_hash(exe + ".exe"); }
+    if h != 0 { return h; }
+    var path: str = env_or_empty("PATH");
+    var sep: str = ":";
+    if str_contains(path, ";") { sep = ";"; }
+    var dirs: Vec<str> = str_split(path, sep);
+    var i: i64 = 0;
+    while i < dirs.len() {
+        var d: str = dirs.get(i) + "/" + exe;
+        h = p_file_hash(d);
+        if h == 0 { h = p_file_hash(d + ".exe"); }
+        if h != 0 { return h; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// The key of a build: compiler identity, command, arguments, CC,
+/// FIDES_CC_OPT and FID_HOME (which stdlib imports resolve to).
+pub fn inc_build_key(command: str, n: i64, start: i64) -> i64 {
+    var k: str = int_to_str(inc_self_hash()) + " " + command;
     var i: i64 = start + 1;
     while i < n {
         var a: str = p_argv(i);
@@ -162,6 +184,7 @@ pub fn inc_build_key(command: str, n: i64, start: i64) -> i64 {
         i = i + 1;
     }
     k = k + " CC=" + env_or_empty("CC") + " FIDES_CC_OPT=" + env_or_empty("FIDES_CC_OPT");
+    k = k + " FID_HOME=" + env_or_empty("FID_HOME");
     return hash_source(k);
 }
 
@@ -172,7 +195,7 @@ pub fn inc_stamp_read(path: str) -> IncStamp {
     var text: str = p_file_read(path);
     var lines: Vec<str> = str_split(text, "\n");
     if lines.len() == 0 { return st; }
-    if lines.get(0) != "fides-stamp-fd 1" { return st; }
+    if lines.get(0) != "fides-stamp-fd 2" { return st; }
     var has_key: bool = false;
     var i: i64 = 1;
     while i < lines.len() {
@@ -183,6 +206,9 @@ pub fn inc_stamp_read(path: str) -> IncStamp {
         } else if str_starts_with(line, "c ") {
             st.c_hash = str_parse_int(str_slice(line, 2, str_len(line)));
             st.has_c = true;
+        } else if str_starts_with(line, "out ") {
+            st.out_hash = str_parse_int(str_slice(line, 4, str_len(line)));
+            st.has_out = true;
         } else if str_starts_with(line, "file ") {
             var rest: str = str_slice(line, 5, str_len(line));
             var sp: i64 = str_find(rest, " ");
@@ -200,29 +226,36 @@ pub fn inc_stamp_read(path: str) -> IncStamp {
     return st;
 }
 
+/// `output` still holds the bytes the recorded build wrote: anything else
+/// writing that path (another compiler, another command) is not this build.
+fn inc_output_intact(st: IncStamp, output: str) -> bool {
+    return st.has_out && p_file_exists(output) != 0 && p_file_hash(output) == st.out_hash;
+}
+
 /// Nothing changed since the build that wrote `output`.
 pub fn inc_up_to_date(st: IncStamp, key: i64, output: str) -> bool {
     if !st.ok || st.key != key || st.files.len() == 0 { return false; }
-    if p_file_exists(output) == 0 { return false; }
+    if !inc_output_intact(st, output) { return false; }
     return inc_deps_unchanged(st.files, st.hashes, st.absent);
 }
 
 /// The previous build produced `output` from exactly this C code.
 pub fn inc_c_unchanged(st: IncStamp, key: i64, output: str, c_hash: i64) -> bool {
     if !st.ok || st.key != key || !st.has_c { return false; }
-    return st.c_hash == c_hash && p_file_exists(output) != 0;
+    return st.c_hash == c_hash && inc_output_intact(st, output);
 }
 
 /// Record a successful build. Nothing is written unless the build recorded
 /// `main_input`: a pipeline that does not record its inputs must never be
 /// reported up to date.
-pub fn inc_stamp_commit(path: str, key: i64, c_hash: i64, main_input: str) {
+pub fn inc_stamp_commit(path: str, key: i64, c_hash: i64, main_input: str, output: str) {
     inc_deps_ensure();
     if !inc_str_vec_has(g_dep_files, main_input) {
         p_file_delete(path);
         return;
     }
-    var s: str = "fides-stamp-fd 1\nkey " + int_to_str(key) + "\nc " + int_to_str(c_hash) + "\n";
+    var s: str = "fides-stamp-fd 2\nkey " + int_to_str(key) + "\nc " + int_to_str(c_hash) + "\n";
+    s = s + "out " + int_to_str(p_file_hash(output)) + "\n";
     var i: i64 = 0;
     while i < g_dep_files.len() {
         s = s + "file " + int_to_str(g_dep_hashes.get(i)) + " " + g_dep_files.get(i) + "\n";

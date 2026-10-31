@@ -263,7 +263,7 @@ touching them.
 | `src/peephole.rs` | **CRITICAL** | 9 passes, always on in `build`. A wrong transform silently corrupts all output. |
 | `src/elf64.rs` | **HIGH** | ELF64 header bytes, section layout, relocations (R_X86_64_PC32/PLT32/64). Off-by-one = corrupt binary. Self-hosted port in `compiler/elf64.fd` (2,423 LOC, 85% parity) includes full x86-64 instruction encoder, assembly parser, and ELF builder. |
 | `src/pe.rs` | **HIGH** | PE header bytes, import table (kernel32.dll + msvcrt.dll: every name in `IMPORTS`/`MSVCRT_IMPORTS` must be a real export, or no program starts), section layout. Off-by-one = corrupt .exe. Machine-code stubs must not keep a value in a volatile register (rcx, rdx, r8–r11) across a call (HeapFree clobbers them). |
-| `src/pe_runtime/*.fd` | **MEDIUM** | The Fides runtime of native Windows executables: builtin `p_X` runs `pert_X` (base, conc, tensor, data). Merged into every `emit`: a type error here breaks every PE build. C functions via `extern "C"` thunks; helpers prefixed `pe_`/`pet_`/`ped_` (unused ones are left out of the .exe). |
+| `stdlib/pe_runtime/*.fd` | **MEDIUM** | The Fides runtime of native Windows executables: builtin `p_X` runs `pert_X` (base, conc, tensor, data). Merged into every `emit`: a type error here breaks every PE build. C functions via `extern "C"` thunks; helpers prefixed `pe_`/`pet_`/`ped_` (unused ones are left out of the .exe). |
 | `src/coff.rs` | **HIGH** | COFF object file format. Same byte-level risk as PE/ELF. |
 | `src/macho.rs` | **HIGH** | Mach-O object file format. Same byte-level risk. |
 | `src/codegen_x64.rs` | **HIGH** | PIR L3 → x86-64 instruction encoding. ModRM/SIB bytes, REX prefixes, ABI rules. |
@@ -554,7 +554,7 @@ or `git diff <path>` — these are read-only and safe.
 | `src/mono.rs` | Generic monomorphization |
 | `src/comptime.rs` | Compile-time eval + reflection |
 | `src/pe.rs` | PE emitter (Windows) |
-| `src/pe_runtime/*.fd` | Fides runtime of the PE backend |
+| `stdlib/pe_runtime/*.fd` | Fides runtime of the PE backend |
 | `src/elf64.rs` | ELF64 emitter (Linux) |
 | `src/macho.rs` | Mach-O emitter (macOS) |
 | `src/coff.rs` | COFF emitter (Windows) |

@@ -4325,7 +4325,7 @@ fn Lowerer_lower_call_expr(self: &mut Lowerer, callee: str, args: Vec<Expr>) -> 
 
     if callee == "print" && arg_vals.len() > 0 {
         var arg_ty: IrType = Lowerer_get_value_type(self, arg_vals.get(0));
-        return Lowerer_emit_inst(self, Inst::Print(arg_vals.get(0), arg_ty));
+        return Lowerer_emit_print(self, arg_vals.get(0), arg_ty);
     }
 
     if callee == "println" && arg_vals.len() > 0 {
@@ -5435,6 +5435,23 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             return Lowerer_emit_inst(self, Inst::BinOp(op, left_val, right_val, result_ty));
         }
         Expr::Unary(op, e) => {
+            // Integer negation is a checked 0 - x (-i64::MIN overflows).
+            match op {
+                UnaryOp::Neg => {
+                    var inner: Expr = lw_box_expr_unbox(e);
+                    match inner {
+                        Expr::IntLit(v) => { return Lowerer_emit_inst(self, Inst::ConstInt(lw_neg_lit(v), IrType::I64)); }
+                        _ => {}
+                    }
+                    var neg_ty: IrType = Lowerer_infer_unary_type(self, op, inner);
+                    if lw_plain_int(neg_ty) {
+                        var neg_operand: i64 = Lowerer_lower_expr(self, inner);
+                        var zero: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, neg_ty));
+                        return Lowerer_emit_inst(self, Inst::BinOp(BinOp::Sub, zero, neg_operand, neg_ty));
+                    }
+                }
+                _ => {}
+            }
             var operand: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(e));
             var result_ty: IrType = Lowerer_infer_unary_type(self, op, lw_box_expr_unbox(e));
             return Lowerer_emit_inst(self, Inst::UnaryOp(op, operand, result_ty));
@@ -7171,19 +7188,110 @@ pub fn Lowerer_infer_binop_type(self: &Lowerer, op: BinOp, left: Expr, right: Ex
     }
     // Arithmetic operators: infer from left operand
     var left_ty: IrType = Lowerer_infer_expr_type(self, left);
+    var right_ty: IrType = Lowerer_infer_expr_type(self, right);
+    if lw_plain_int(left_ty) && lw_plain_int(right_ty) {
+        return lw_int_op_type(op, left, right, left_ty, right_ty);
+    }
     if ir_type_eq(left_ty, IrType::Void) || ir_type_eq(left_ty, IrType::I64) {
-        var right_ty: IrType = Lowerer_infer_expr_type(self, right);
         if ir_type_eq(right_ty, IrType::F64) { return IrType::F64; }
         return IrType::I64;
     }
     return left_ty;
 }
 
+fn lw_plain_int(t: IrType) -> bool {
+    match t {
+        IrType::I8 => { return true; }
+        IrType::I16 => { return true; }
+        IrType::I32 => { return true; }
+        IrType::I64 => { return true; }
+        IrType::U8 => { return true; }
+        IrType::U16 => { return true; }
+        IrType::U32 => { return true; }
+        IrType::U64 => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn lw_int_size(t: IrType) -> i64 {
+    match t {
+        IrType::I8 => { return 1; }
+        IrType::U8 => { return 1; }
+        IrType::I16 => { return 2; }
+        IrType::U16 => { return 2; }
+        IrType::I32 => { return 4; }
+        IrType::U32 => { return 4; }
+        _ => { return 8; }
+    }
+}
+
+fn lw_int_unsigned(t: IrType) -> bool {
+    match t {
+        IrType::U8 => { return true; }
+        IrType::U16 => { return true; }
+        IrType::U32 => { return true; }
+        IrType::U64 => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn lw_lit_fits(v: i64, t: IrType) -> bool {
+    match t {
+        IrType::I8 => { return v >= -128 && v <= 127; }
+        IrType::I16 => { return v >= -32768 && v <= 32767; }
+        IrType::I32 => { return v >= -2147483648 && v <= 2147483647; }
+        IrType::U8 => { return v >= 0 && v <= 255; }
+        IrType::U16 => { return v >= 0 && v <= 65535; }
+        IrType::U32 => { return v >= 0 && v <= 4294967295; }
+        IrType::U64 => { return v >= 0; }
+        _ => { return true; }
+    }
+}
+
+/// The integer type an operation runs in, and so the width it overflows at
+/// (as src/lower.rs int_op_type): a bare literal takes the other operand's
+/// type when it fits; else the wider type wins, and the unsigned one at
+/// equal width. A shift has its left operand's type.
+fn lw_int_op_type(op: BinOp, left: Expr, right: Expr, lt: IrType, rt: IrType) -> IrType {
+    if binop_eq(op, BinOp::Shl) || binop_eq(op, BinOp::Shr) { return lt; }
+    match right {
+        Expr::IntLit(v) => { if lw_lit_fits(v, lt) { return lt; } }
+        _ => {}
+    }
+    match left {
+        Expr::IntLit(v) => { if lw_lit_fits(v, rt) { return rt; } }
+        _ => {}
+    }
+    var ls: i64 = lw_int_size(lt);
+    var rs: i64 = lw_int_size(rt);
+    if ls > rs || (ls == rs && lw_int_unsigned(lt)) { return lt; }
+    return rt;
+}
+
+/// `print` shows a u64 as unsigned, on every backend: through the Fides
+/// formatter (no runtime has an unsigned printer).
+fn Lowerer_emit_print(self: &mut Lowerer, value: i64, ty: IrType) -> i64 {
+    if ir_type_eq(ty, IrType::U64) {
+        match Lowerer_lookup_func_ret_type(self, "u64_to_str") {
+            OptType::Some(_) => {
+                var env: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+                var args: Vec<i64> = Vec::new();
+                args.push(env);
+                args.push(value);
+                var s: i64 = Lowerer_emit_inst(self, Inst::Call("u64_to_str", args, lw_ptr_u8(), EffectSet_new()));
+                return Lowerer_emit_inst(self, Inst::Print(s, lw_ptr_u8()));
+            }
+            OptType::None => {}
+        }
+    }
+    return Lowerer_emit_inst(self, Inst::Print(value, ty));
+}
+
 pub fn Lowerer_infer_unary_type(self: &Lowerer, op: UnaryOp, expr: Expr) -> IrType {
     // As src/lower.rs: a float operand keeps its type, anything else
     // (including `!bool`) is i64.
     var t: IrType = Lowerer_infer_expr_type(self, expr);
-    if ir_type_is_float(t) { return t; }
+    if ir_type_is_float(t) || lw_plain_int(t) { return t; }
     return IrType::I64;
 }
 
@@ -7901,3 +8009,7 @@ pub fn Lowerer_lower_vec_sret_call(self: &mut Lowerer, func_name: str, ret_ty: I
     var _call: i64 = Lowerer_emit_inst(self, Inst::Call(func_name, sret_args, IrType::Void, effects));
     return sret_ptr;
 }
+
+/// -v of a literal (the literal i64::MIN is its own negation).
+@wrapping
+fn lw_neg_lit(v: i64) -> i64 { return 0 - v; }

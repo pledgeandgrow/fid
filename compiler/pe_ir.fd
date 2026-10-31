@@ -441,6 +441,15 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
     // Add boolean strings
     all_strings.push("true");
     all_strings.push("false");
+    // Panic messages of the runtime stubs
+    var panic_strs: Vec<str> = peir_panic_strings();
+    var psi: i64 = 0;
+    while psi < panic_strs.len() {
+        if !pe_ir_strs_contains(all_strings, panic_strs.get(psi)) {
+            all_strings.push(panic_strs.get(psi));
+        }
+        psi = psi + 1;
+    }
 
     // 2. Build .rdata section
     var rdata: PeirRdata = PeirRdata_new();
@@ -645,6 +654,13 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
         ni = ni + 1;
     }
 
+    var api: i64 = 0;
+    while api < 7 {
+        self.arith_panics.push(PeirEnc_alloc_label(&mut self.enc));
+        api = api + 1;
+    }
+    self.crash_filter = PeirEnc_alloc_label(&mut self.enc);
+
     // 4. Generate code for each function (sorted for deterministic layout);
     //    of the Fides runtime only what the program uses
     fi = 0;
@@ -665,6 +681,7 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
 
     // 5. Generate runtime stubs
     PeirGen_gen_runtime_stubs(self);
+    PeirGen_gen_arith_panics(self);
     PeirGen_gen_pe_primitives(self);
     var thunks: Vec<CThunk> = self.c_thunks;
     var ti: i64 = 0;
@@ -729,6 +746,9 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
 /// Generate code for a single function.
 pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, module: &IrModule) -> void {
     self.cur_func = name;
+    // The Fides runtime is machine-level code the interpreter never runs:
+    // its arithmetic wraps, as a @wrapping function's does.
+    self.cur_wrapping = func.is_wrapping || is_pe_runtime_fn(name);
     var label: i64 = HashMap_get(self.func_labels, name);
     PeirEnc_align_to(&mut self.enc, 16);
     PeirEnc_place_label(&mut self.enc, label);
@@ -1132,10 +1152,16 @@ pub fn PeirGen_gen_inst(
             var roff: i64 = PeStackFrame_offset(frame, right);
             // A comparison's type is Bool: its operands' type decides
             var operand_ty: IrType = IrType::I64;
+            var right_ty: IrType = IrType::I64;
             match IrFunction_get_meta(func, left) {
                 OptValueMeta::Some(m) => { operand_ty = m.ty; }
                 OptValueMeta::None => {}
             }
+            match IrFunction_get_meta(func, right) {
+                OptValueMeta::Some(m) => { right_ty = m.ty; }
+                OptValueMeta::None => {}
+            }
+            var unsigned_cmp: bool = ir_type_eq(operand_ty, IrType::U64) || ir_type_eq(right_ty, IrType::U64);
             if ir_type_is_float(ty) {
                 PeirGen_gen_float_binop(self, op, loff, roff, dst, ty);
             } else if ir_type_is_float(operand_ty) {
@@ -1149,11 +1175,11 @@ pub fn PeirGen_gen_inst(
                 if pe_idmap_has(&frame.const_vals, right) {
                     rconst = OptU64::Some(pe_idmap_get(&frame.const_vals, right));
                 }
-                PeirGen_gen_int_binop(self, op, loff, roff, dst, lconst, rconst);
+                PeirGen_gen_int_binop(self, op, loff, roff, dst, lconst, rconst, ty, unsigned_cmp);
                 // cmp+branch fusion (item 82): a comparison feeding the next
                 // instruction's Branch keeps its flags live through
                 // setcc/movzx/mov — the branch jcc's on them directly.
-                var cc: i64 = peir_int_cmp_cc(op);
+                var cc: i64 = peir_int_cmp_cc(op, unsigned_cmp);
                 if cc >= 0 && next_cond == id {
                     self.pending_cmp_cc = cc;
                     self.pending_cmp_vid = id;
@@ -1449,6 +1475,7 @@ pub fn PeirGen_gen_inst(
 
         // --- Function Calls ---
         Inst::Call(call_name, args, _, _) => {
+            if PeirGen_inline_vec_call(self, call_name, args, dst, frame) { return; }
             // print(tensor): the runtime formats it, then the string prints
             if call_name == "print" && args.len() > 0 {
                 var arg0: i64 = args.get(0);
@@ -1995,20 +2022,63 @@ pub fn peir_recyclable(v: i64, def_block: Vec<i64>, n_use_blocks: Vec<i64>, a_us
 
 /// The jcc code jumping when an integer comparison `a OP b` holds (the
 /// setcc-style numbering gen_int_binop uses: 4=E, 5=NE, C=L, D=GE, E=LE,
-/// F=G), or -1 for a non-comparison.
-pub fn peir_int_cmp_cc(op: BinOp) -> i64 {
+/// F=G; unsigned 2=B, 3=AE, 6=BE, 7=A), or -1 for a non-comparison.
+pub fn peir_int_cmp_cc(op: BinOp, unsigned: bool) -> i64 {
     match op {
         BinOp::Eq => { return 0x4; }
         BinOp::Neq => { return 0x5; }
-        BinOp::Lt => { return 0xC; }
-        BinOp::GtEq => { return 0xD; }
-        BinOp::LtEq => { return 0xE; }
-        BinOp::Gt => { return 0xF; }
+        BinOp::Lt => { if unsigned { return 0x2; } return 0xC; }
+        BinOp::GtEq => { if unsigned { return 0x3; } return 0xD; }
+        BinOp::LtEq => { if unsigned { return 0x6; } return 0xE; }
+        BinOp::Gt => { if unsigned { return 0x7; } return 0xF; }
         _ => { return -1; }
     }
 }
 
-pub fn PeirGen_gen_int_binop(self: &mut PeirGen, op: BinOp, loff: i64, roff: i64, dst: i64, lconst: OptU64, rconst: OptU64) -> void {
+// The arithmetic panics, one shared stub each (indices into arith_panics)
+const PEIR_PANIC_ADD: i64 = 0;
+const PEIR_PANIC_SUB: i64 = 1;
+const PEIR_PANIC_MUL: i64 = 2;
+const PEIR_PANIC_DIV_OVF: i64 = 3;
+const PEIR_PANIC_DIV_ZERO: i64 = 4;
+const PEIR_PANIC_MOD_ZERO: i64 = 5;
+const PEIR_PANIC_VEC_INDEX: i64 = 6;
+
+fn peir_arith_panic_strings() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push("Integer overflow on addition");
+    v.push("Integer overflow on subtraction");
+    v.push("Integer overflow on multiplication");
+    v.push("Integer overflow on division");
+    v.push("Division by zero");
+    v.push("Modulo by zero");
+    v.push("Vec index out of bounds");
+    return v;
+}
+
+/// Every message a runtime stub panics with.
+fn peir_panic_strings() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push("Stack overflow");
+    v.push("Invalid memory access (null or dangling pointer)");
+    v.push("Illegal instruction");
+    var a: Vec<str> = peir_arith_panic_strings();
+    var i: i64 = 0;
+    while i < a.len() {
+        v.push(a.get(i));
+        i = i + 1;
+    }
+    return v;
+}
+
+fn PeirGen_jump_panic(self: &mut PeirGen, cc: i64, which: i64) -> void {
+    PeirEnc_jcc_label(&mut self.enc, cc, self.arith_panics.get(which));
+}
+
+/// Integer arithmetic in type `ty`: the one meaning the interpreter and the
+/// C backend implement. A checked operation costs one jcc to a shared panic
+/// stub. Bare-metal code has no panic path and stays plain.
+pub fn PeirGen_gen_int_binop(self: &mut PeirGen, op: BinOp, loff: i64, roff: i64, dst: i64, lconst: OptU64, rconst: OptU64, ty: IrType, unsigned_cmp: bool) -> void {
     // A constant operand moves in as an immediate, not a slot load (item 81).
     match lconst {
         OptU64::Some(v) => { PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, v); }
@@ -2019,53 +2089,51 @@ pub fn PeirGen_gen_int_binop(self: &mut PeirGen, op: BinOp, loff: i64, roff: i64
         OptU64::None => { PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, roff); }
     }
 
+    var checked: bool = !self.bare_mode && !self.cur_wrapping;
+    var is_i64: bool = ir_type_eq(ty, IrType::I64);
+    var is_u64: bool = ir_type_eq(ty, IrType::U64);
+    // jo for i64, jc for u64; narrow types are checked after the operation
+    var ovf_cc: i64 = -1;
+    if checked && is_i64 { ovf_cc = 0x0; }
+    if checked && is_u64 { ovf_cc = 0x2; }
+    var narrow_panic: i64 = -1;
+
     match op {
-        BinOp::Add => { PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_RCX); }
-        BinOp::Sub => { PeirEnc_sub_rr(&mut self.enc, PEIR_RAX, PEIR_RCX); }
-        BinOp::Mul => { PeirEnc_imul_rr(&mut self.enc, PEIR_RAX, PEIR_RCX); }
+        BinOp::Add => {
+            PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+            if ovf_cc >= 0 { PeirGen_jump_panic(self, ovf_cc, PEIR_PANIC_ADD); }
+            narrow_panic = PEIR_PANIC_ADD;
+        }
+        BinOp::Sub => {
+            PeirEnc_sub_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+            if ovf_cc >= 0 { PeirGen_jump_panic(self, ovf_cc, PEIR_PANIC_SUB); }
+            narrow_panic = PEIR_PANIC_SUB;
+        }
+        BinOp::Mul => {
+            if checked && is_u64 {
+                PeirEnc_mul_r(&mut self.enc, PEIR_RCX);
+                PeirGen_jump_panic(self, 0x0, PEIR_PANIC_MUL);
+            } else {
+                PeirEnc_imul_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+                if checked && is_i64 { PeirGen_jump_panic(self, 0x0, PEIR_PANIC_MUL); }
+            }
+            narrow_panic = PEIR_PANIC_MUL;
+        }
         BinOp::Div => {
-            PeirEnc_cqo(&mut self.enc);
-            PeirEnc_idiv_r(&mut self.enc, PEIR_RCX);
+            PeirGen_gen_int_div(self, false, rconst, ty, checked);
+            narrow_panic = PEIR_PANIC_DIV_OVF;
         }
-        BinOp::Mod => {
-            PeirEnc_cqo(&mut self.enc);
-            PeirEnc_idiv_r(&mut self.enc, PEIR_RCX);
-            PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
-        }
+        BinOp::Mod => { PeirGen_gen_int_div(self, true, rconst, ty, checked); }
         BinOp::BitAnd => { PeirEnc_and_rr(&mut self.enc, PEIR_RAX, PEIR_RCX); }
         BinOp::BitOr => { PeirEnc_or_rr(&mut self.enc, PEIR_RAX, PEIR_RCX); }
         BinOp::BitXor => { PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RCX); }
-        BinOp::Shl => { PeirEnc_shl_cl(&mut self.enc, PEIR_RAX); }
-        BinOp::Shr => { PeirEnc_sar_cl(&mut self.enc, PEIR_RAX); }
-        BinOp::Eq => {
-            PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
-            PeirEnc_setcc_r(&mut self.enc, 0x4, PEIR_RAX); // sete
-            PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        BinOp::Shl => {
+            PeirEnc_shl_cl(&mut self.enc, PEIR_RAX);
+            PeirGen_gen_narrow(self, ty, -1);
         }
-        BinOp::Neq => {
-            PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
-            PeirEnc_setcc_r(&mut self.enc, 0x5, PEIR_RAX); // setne
-            PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
-        }
-        BinOp::Lt => {
-            PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
-            PeirEnc_setcc_r(&mut self.enc, 0xC, PEIR_RAX); // setl
-            PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
-        }
-        BinOp::Gt => {
-            PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
-            PeirEnc_setcc_r(&mut self.enc, 0xF, PEIR_RAX); // setg
-            PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
-        }
-        BinOp::LtEq => {
-            PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
-            PeirEnc_setcc_r(&mut self.enc, 0xE, PEIR_RAX); // setle
-            PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
-        }
-        BinOp::GtEq => {
-            PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
-            PeirEnc_setcc_r(&mut self.enc, 0xD, PEIR_RAX); // setge
-            PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        BinOp::Shr => {
+            if is_u64 { PeirEnc_shr_cl(&mut self.enc, PEIR_RAX); }
+            else { PeirEnc_sar_cl(&mut self.enc, PEIR_RAX); }
         }
         BinOp::And => {
             PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
@@ -2080,9 +2148,177 @@ pub fn PeirGen_gen_int_binop(self: &mut PeirGen, op: BinOp, loff: i64, roff: i64
             PeirEnc_setcc_r(&mut self.enc, 0x5, PEIR_RAX); // setne
             PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
         }
+        _ => {
+            // Eq, Neq, Lt, Gt, LtEq, GtEq
+            PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+            PeirEnc_setcc_r(&mut self.enc, peir_int_cmp_cc(op, unsigned_cmp), PEIR_RAX);
+            PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        }
+    }
+
+    // A narrow result is normalized (its slot always holds the value in 64
+    // bits); in checked code a value that changes did not fit.
+    if narrow_panic >= 0 {
+        if checked { PeirGen_gen_narrow(self, ty, narrow_panic); }
+        else { PeirGen_gen_narrow(self, ty, -1); }
     }
 
     PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+}
+
+/// `reg` = a value: its constant, or its stack slot.
+fn PeirGen_load_operand(self: &mut PeirGen, reg: i64, value: i64, frame: &PeStackFrame) -> void {
+    if pe_idmap_has(&frame.const_vals, value) {
+        PeirEnc_mov_imm64(&mut self.enc, reg, pe_idmap_get(&frame.const_vals, value));
+    } else {
+        PeirEnc_mov_reg_mem_rbp(&mut self.enc, reg, PeStackFrame_offset(frame, value));
+    }
+}
+
+/// Vec_len and Vec_get (core.fd) are the hottest calls of most programs:
+/// their bodies at the call site, bounds check included (unsigned, so a
+/// negative index fails it too). The `__env` argument, when present, is
+/// first. True when the call was generated.
+fn PeirGen_inline_vec_call(self: &mut PeirGen, name: str, args: Vec<i64>, dst: i64, frame: &PeStackFrame) -> bool {
+    if self.bare_mode { return false; }
+    if name == "Vec_len" && args.len() >= 1 {
+        PeirGen_load_operand(self, PEIR_RAX, args.get(args.len() - 1), frame);
+        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_RAX, 8);
+        PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        return true;
+    }
+    if name == "Vec_get" && args.len() >= 2 {
+        PeirGen_load_operand(self, PEIR_RAX, args.get(args.len() - 2), frame);
+        PeirGen_load_operand(self, PEIR_RCX, args.get(args.len() - 1), frame);
+        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RDX, PEIR_RAX, 8);
+        PeirEnc_cmp_rr(&mut self.enc, PEIR_RCX, PEIR_RDX);
+        PeirGen_jump_panic(self, 0x3, PEIR_PANIC_VEC_INDEX); // jae
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        PeirEnc_shl_r_i8(&mut self.enc, PEIR_RCX, 3);
+        PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        return true;
+    }
+    return false;
+}
+
+/// rax = the value of `rax` in narrow type `ty`; panics (stub `panic` >= 0)
+/// instead if it changes. Not a narrow type: nothing.
+fn PeirGen_gen_narrow(self: &mut PeirGen, ty: IrType, panic: i64) -> void {
+    match ty {
+        IrType::I8 => { PeirEnc_movsx_r64_r8(&mut self.enc, PEIR_RDX, PEIR_RAX); }
+        IrType::I16 => { PeirEnc_movsx_r64_r16(&mut self.enc, PEIR_RDX, PEIR_RAX); }
+        IrType::I32 => { PeirEnc_movsxd_rr(&mut self.enc, PEIR_RDX, PEIR_RAX); }
+        IrType::U8 => { PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RDX, PEIR_RAX); }
+        IrType::U16 => { PeirEnc_movzx_r32_r16(&mut self.enc, PEIR_RDX, PEIR_RAX); }
+        IrType::U32 => { PeirEnc_mov_r32_r32(&mut self.enc, PEIR_RDX, PEIR_RAX); }
+        _ => { return; }
+    }
+    if panic >= 0 {
+        PeirEnc_cmp_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
+        PeirGen_jump_panic(self, 0x5, panic);
+    }
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
+}
+
+/// rax / rcx or rax % rcx. Dividing by zero panics, even in @wrapping code;
+/// idiv also traps on MIN / -1, so -1 never reaches it. A constant divisor
+/// needs neither check.
+fn PeirGen_gen_int_div(self: &mut PeirGen, is_mod: bool, rconst: OptU64, ty: IrType, checked: bool) -> void {
+    var may_be_zero: bool = true;
+    var may_be_m1: bool = true;
+    match rconst {
+        OptU64::Some(v) => {
+            may_be_zero = v == 0;
+            may_be_m1 = v == -1;
+        }
+        OptU64::None => {}
+    }
+    if !self.bare_mode && may_be_zero {
+        PeirEnc_test_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
+        if is_mod { PeirGen_jump_panic(self, 0x4, PEIR_PANIC_MOD_ZERO); }
+        else { PeirGen_jump_panic(self, 0x4, PEIR_PANIC_DIV_ZERO); }
+    }
+    var unsigned: bool = ir_type_eq(ty, IrType::U8) || ir_type_eq(ty, IrType::U16)
+        || ir_type_eq(ty, IrType::U32) || ir_type_eq(ty, IrType::U64);
+    if unsigned {
+        PeirEnc_xor_self(&mut self.enc, PEIR_RDX);
+        PeirEnc_div_rr(&mut self.enc, PEIR_RCX);
+    } else if !self.bare_mode && may_be_m1 {
+        var normal: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var done: i64 = PeirEnc_alloc_label(&mut self.enc);
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, -1);
+        PeirEnc_cmp_rr(&mut self.enc, PEIR_RCX, PEIR_RDX);
+        PeirEnc_jcc_label(&mut self.enc, 0x5, normal);
+        if is_mod {
+            PeirEnc_xor_self(&mut self.enc, PEIR_RDX);
+        } else {
+            PeirEnc_neg_r(&mut self.enc, PEIR_RAX);
+            if checked && ir_type_eq(ty, IrType::I64) {
+                PeirGen_jump_panic(self, 0x0, PEIR_PANIC_DIV_OVF);
+            }
+        }
+        PeirEnc_jmp_label(&mut self.enc, done);
+        PeirEnc_place_label(&mut self.enc, normal);
+        PeirEnc_cqo(&mut self.enc);
+        PeirEnc_idiv_r(&mut self.enc, PEIR_RCX);
+        PeirEnc_place_label(&mut self.enc, done);
+    } else {
+        PeirEnc_cqo(&mut self.enc);
+        PeirEnc_idiv_r(&mut self.enc, PEIR_RCX);
+    }
+    if is_mod {
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
+    }
+}
+
+/// Exception code `code`: panic with `msg`, else fall through.
+fn PeirGen_crash_case(self: &mut PeirGen, code: i64, msg: str, report: i64) -> void {
+    var next: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, code);
+    PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
+    PeirEnc_jcc_label(&mut self.enc, 0x5, next);
+    PeirEnc_lea_rip(&mut self.enc, PEIR_RCX, PeirGen_str_off(self, msg));
+    PeirEnc_jmp_label(&mut self.enc, report);
+    PeirEnc_place_label(&mut self.enc, next);
+}
+
+/// The shared stubs behind the arithmetic panics, and the handler turning a
+/// CPU fault into a panic with a message.
+pub fn PeirGen_gen_arith_panics(self: &mut PeirGen) -> void {
+    var panic: i64 = HashMap_get(self.func_labels, "p_panic");
+    var msgs: Vec<str> = peir_arith_panic_strings();
+    var i: i64 = 0;
+    while i < msgs.len() {
+        PeirEnc_place_label(&mut self.enc, self.arith_panics.get(i));
+        PeirEnc_lea_rip(&mut self.enc, PEIR_RCX, PeirGen_str_off(self, msgs.get(i)));
+        PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+        PeirEnc_call_label(&mut self.enc, panic);
+        PeirEnc_ud2(&mut self.enc);
+        i = i + 1;
+    }
+
+    // LONG handler(EXCEPTION_POINTERS* rcx): [[rcx]] is the exception code.
+    // A vectored handler: these executables have no unwind tables, so the
+    // system's frame walk gives up before any unhandled-exception filter
+    // would run. It sees first-chance exceptions too, so anything but these
+    // fatal codes goes on searching.
+    PeirEnc_place_label(&mut self.enc, self.crash_filter);
+    PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+    PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_mov_r32_r32(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    var report: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirGen_crash_case(self, 0xC00000FD, "Stack overflow", report);
+    PeirGen_crash_case(self, 0xC0000005, "Invalid memory access (null or dangling pointer)", report);
+    PeirGen_crash_case(self, 0xC0000094, "Division by zero", report);
+    PeirGen_crash_case(self, 0xC000001D, "Illegal instruction", report);
+    PeirEnc_xor_self(&mut self.enc, PEIR_RAX); // EXCEPTION_CONTINUE_SEARCH
+    PeirEnc_ret(&mut self.enc);
+    PeirEnc_place_label(&mut self.enc, report);
+    PeirEnc_sub_rsp_i32(&mut self.enc, 40);
+    PeirEnc_call_label(&mut self.enc, panic);
+    PeirEnc_ud2(&mut self.enc);
 }
 
 /// Generate float binary operation.

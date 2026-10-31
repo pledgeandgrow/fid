@@ -1357,7 +1357,7 @@ impl Interpreter {
             }
 
             // ─── Arithmetic ───
-            Inst::BinOp { op, left, right, .. } => {
+            Inst::BinOp { op, left, right, ty } => {
                 let l = values.get(left).cloned().unwrap_or(Value::Void);
                 let r = values.get(right).cloned().unwrap_or(Value::Void);
                 // String comparison: when both operands are Ptr(U8) (str type),
@@ -1377,7 +1377,17 @@ impl Interpreter {
                     };
                     return ExecOutcome::Value(result);
                 }
-                let result = self.eval_binop(op, &l, &r);
+                let operand_unsigned = [left, right].iter()
+                    .any(|v| func.values.get(*v).map_or(false, |m| m.ty == IrType::U64));
+                let result = match (&l, &r) {
+                    (Value::Int(a), Value::Int(b)) if *ty != IrType::Bool && ty.is_int() => {
+                        self.eval_int_binop(op, *a, *b, ty)
+                    }
+                    (Value::Int(a), Value::Int(b)) if operand_unsigned => {
+                        self.eval_unsigned_cmp(op, *a as u64, *b as u64)
+                    }
+                    _ => self.eval_binop(op, &l, &r),
+                };
                 // F64: checked arithmetic lock — overflow/div-by-zero ALWAYS panics
                 // (not just in debug mode). @wrapping functions never hit this
                 // because they use wrapping arithmetic in eval_binop.
@@ -1392,6 +1402,7 @@ impl Interpreter {
                         BinOp::Mul => format!("Integer overflow on multiplication: {} * {}",
                             if let Value::Int(a) = l { a.to_string() } else { "?".to_string() },
                             if let Value::Int(b) = r { b.to_string() } else { "?".to_string() }),
+                        BinOp::Div if !matches!(r, Value::Int(0)) => "Integer overflow on division".to_string(),
                         BinOp::Div => "Division by zero".to_string(),
                         BinOp::Mod => "Modulo by zero".to_string(),
                         _ => format!("Arithmetic error: {:?} on {:?} and {:?}", op, l, r),
@@ -1453,6 +1464,9 @@ impl Interpreter {
                 if self.debug_mode && self.freed_addresses.contains(&addr) {
                     panic!("Use-after-free: loading from address 0x{:x} that was freed (region ended)", addr);
                 }
+                if addr == 0 {
+                    return ExecOutcome::Panic("Invalid memory access (null or dangling pointer)".to_string());
+                }
                 let v = match ty {
                     IrType::I8 | IrType::U8 => {
                         let bytes = self.memory.load(addr, 1);
@@ -1462,9 +1476,8 @@ impl Interpreter {
                         let bytes = self.memory.load(addr, 2);
                         Value::Int(if *ty == IrType::I16 { i16::from_le_bytes(bytes[..2].try_into().unwrap_or([0u8; 2])) as i64 } else { u16::from_le_bytes(bytes[..2].try_into().unwrap_or([0u8; 2])) as i64 })
                     }
-                    IrType::I32 | IrType::U32 => {
-                        Value::Int(self.memory.load_i32(addr) as i64)
-                    }
+                    IrType::I32 => Value::Int(self.memory.load_i32(addr) as i64),
+                    IrType::U32 => Value::Int(self.memory.load_i32(addr) as u32 as i64),
                     IrType::I64 | IrType::U64 => {
                         // Check side-table first — the value might be a stored pointer
                         // or an opaque value (Vec, Map, etc.) that was stored from a
@@ -2435,6 +2448,68 @@ impl Interpreter {
     }
 
     /// Evaluate a binary operation
+    /// Integer arithmetic in the operation's type: the one meaning every
+    /// backend implements. Overflow is Value::Void (the caller panics) or,
+    /// in a @wrapping function, wraps at that width. Dividing by zero is
+    /// always Void. A u64 is the bits of its i64 value.
+    fn eval_int_binop(&self, op: &BinOp, a: i64, b: i64, ty: &IrType) -> Value {
+        let unsigned = *ty == IrType::U64;
+        let wide = |v: i64| if unsigned { v as u64 as i128 } else { v as i128 };
+        let (x, y) = (wide(a), wide(b));
+        let (min, max): (i128, i128) = match ty {
+            IrType::I8 => (i8::MIN as i128, i8::MAX as i128),
+            IrType::I16 => (i16::MIN as i128, i16::MAX as i128),
+            IrType::I32 => (i32::MIN as i128, i32::MAX as i128),
+            IrType::U8 => (0, u8::MAX as i128),
+            IrType::U16 => (0, u16::MAX as i128),
+            IrType::U32 => (0, u32::MAX as i128),
+            IrType::U64 => (0, u64::MAX as i128),
+            _ => (i64::MIN as i128, i64::MAX as i128),
+        };
+        let truncate = |v: i128| -> i64 {
+            match ty {
+                IrType::I8 => v as i8 as i64,
+                IrType::I16 => v as i16 as i64,
+                IrType::I32 => v as i32 as i64,
+                IrType::U8 => v as u8 as i64,
+                IrType::U16 => v as u16 as i64,
+                IrType::U32 => v as u32 as i64,
+                _ => v as i64,
+            }
+        };
+        let checked = |v: i128| -> Value {
+            if v >= min && v <= max {
+                Value::Int(v as i64)
+            } else if self.is_wrapping_func() {
+                Value::Int(truncate(v))
+            } else {
+                Value::Void
+            }
+        };
+        match op {
+            BinOp::Add => checked(x + y),
+            BinOp::Sub => checked(x - y),
+            BinOp::Mul => checked(x * y),
+            BinOp::Div => if y == 0 { Value::Void } else { checked(x / y) },
+            BinOp::Mod => if y == 0 { Value::Void } else { checked(x % y) },
+            BinOp::Shl => Value::Int(truncate(((a as u64) << (b & 63)) as i64 as i128)),
+            BinOp::Shr if unsigned => Value::Int(((a as u64) >> (b & 63)) as i64),
+            BinOp::Shr => Value::Int(a >> (b & 63)),
+            _ => self.eval_binop(op, &Value::Int(a), &Value::Int(b)),
+        }
+    }
+
+    /// A comparison with a u64 operand compares the bits unsigned.
+    fn eval_unsigned_cmp(&self, op: &BinOp, a: u64, b: u64) -> Value {
+        match op {
+            BinOp::Lt => Value::Bool(a < b),
+            BinOp::Gt => Value::Bool(a > b),
+            BinOp::LtEq => Value::Bool(a <= b),
+            BinOp::GtEq => Value::Bool(a >= b),
+            _ => self.eval_binop(op, &Value::Int(a as i64), &Value::Int(b as i64)),
+        }
+    }
+
     fn eval_binop(&self, op: &BinOp, l: &Value, r: &Value) -> Value {
         // F64/F65: checked arithmetic is the default. @wrapping functions
         // use wrap-around arithmetic. Division by zero always panics.
