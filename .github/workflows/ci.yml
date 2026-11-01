@@ -1,0 +1,72 @@
+# CI: every push and pull request to main.
+#
+# Windows runs the whole suite on all three backends (interpreter, C, native
+# PE) and proves the self-hosted compiler reproduces itself byte for byte.
+# Linux checks that the Rust compiler builds and that a program compiles
+# through C and runs (`fid` has no native Linux path yet).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CC: gcc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Unit tests
+        run: cargo test --release --lib
+
+      - name: Test suite (interpreter, C, native)
+        shell: bash
+        run: ./target/release/fidesc.exe test --jobs 4
+
+      - name: Programs that must be rejected
+        shell: bash
+        run: ./target/release/fidesc.exe test --fail
+
+      - name: Native fixpoint
+        shell: bash
+        run: |
+          ./target/release/fidesc.exe emit compiler/main.fd -o n1.exe --no-cache
+          ./n1.exe emit compiler/main.fd -o n2.exe --no-cache
+          ./n2.exe emit compiler/main.fd -o n3.exe --no-cache
+          cmp n2.exe n3.exe
+
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CC: gcc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Unit tests
+        run: cargo test --release --lib
+
+      - name: Compile and run a program through C
+        run: |
+          ./target/release/fidesc ccompile tests/bootstrap/hello.fd -o hello
+          ./hello

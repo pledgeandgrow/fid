@@ -1908,12 +1908,17 @@ fn real_main() {
                     }
                 }
             }
-            // Also scan tests/selfhost/ — self-hosted compiler module tests (SH-6)
+            // Also scan tests/selfhost/ — self-hosted compiler module tests (SH-6).
+            // probe_* and test_pe_ir_* are development diagnostics that need
+            // the compiler's own modules: not part of the suite.
             if let Ok(entries) = fs::read_dir("tests/selfhost") {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.extension().map_or(false, |e| e == "fd") {
                         let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+                        if stem.starts_with("probe") || stem.starts_with("test_pe_ir") {
+                            continue;
+                        }
                         let is_fail = expected_fail.contains(&stem.as_str());
                         let is_bench = stem.starts_with("bench_");
 
@@ -2325,7 +2330,6 @@ fn real_main() {
                 println!("C Codegen:    {} fail, {} bonus pass (of {} known-fail)", c_known_fail, c_known_pass, known_total);
                 println!("PE Emitter:   {} fail, {} bonus pass (of {} known-fail)", pe_known_fail, pe_known_pass, known_total);
             }
-
             if interp_fail > 0 || c_fail > 0 || pe_fail > 0 {
                 process::exit(1);
             }

@@ -194,7 +194,7 @@ impl Lexer {
                     while self.pos < self.source.len() && self.peek().is_ascii_hexdigit() {
                         s.push(self.advance());
                     }
-                    let val = i64::from_str_radix(&s[2..], 16).unwrap_or(0);
+                    let val = self.radix_literal(&s, 16, line, col);
                     return Token::new(TokenKind::IntLit(val), line, col);
                 }
                 Some('b') | Some('B') => {
@@ -203,7 +203,7 @@ impl Lexer {
                     while self.pos < self.source.len() && (self.peek() == '0' || self.peek() == '1') {
                         s.push(self.advance());
                     }
-                    let val = i64::from_str_radix(&s[2..], 2).unwrap_or(0);
+                    let val = self.radix_literal(&s, 2, line, col);
                     return Token::new(TokenKind::IntLit(val), line, col);
                 }
                 Some('o') | Some('O') => {
@@ -212,7 +212,7 @@ impl Lexer {
                     while self.pos < self.source.len() && (self.peek() >= '0' && self.peek() <= '7') {
                         s.push(self.advance());
                     }
-                    let val = i64::from_str_radix(&s[2..], 8).unwrap_or(0);
+                    let val = self.radix_literal(&s, 8, line, col);
                     return Token::new(TokenKind::IntLit(val), line, col);
                 }
                 _ => {}
@@ -273,6 +273,18 @@ impl Lexer {
                     self.errors.push(format!("Lexer error at {}:{}: integer literal '{}' does not fit in 64 bits", line, col, s));
                     Token::new(TokenKind::IntLit(0), line, col)
                 }
+            }
+        }
+    }
+
+    /// The value of a 0x/0b/0o literal: 64 bits, kept as they are (it may be
+    /// a u64 above i64::MAX). More than 64 bits is an error.
+    fn radix_literal(&mut self, s: &str, radix: u32, line: usize, col: usize) -> i64 {
+        match u64::from_str_radix(&s[2..], radix) {
+            Ok(v) => v as i64,
+            Err(_) => {
+                self.errors.push(format!("Lexer error at {}:{}: integer literal '{}' does not fit in 64 bits", line, col, s));
+                0
             }
         }
     }

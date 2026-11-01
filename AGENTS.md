@@ -165,7 +165,7 @@ SELF-HOSTED COMPILER (primary source):
 RUST BOOTSTRAP (reference + test harness):
   src/*.rs:       55 files, 100,935 LOC — bootstrap reference
   Used when:      compiler/*.fd changes (builds stage 1); runs `fidesc test`
-  Suite (Oct 27): interp 280/280, C 278/278, PE 282/282, expected-fail 59/59
+  Suite (Nov 1):  interp 286/286, C 285/285, PE 287/287, expected-fail 66/66
 
 WINDOWS INSTALLER (v1.0.0):
   installer/:     NSIS script + build helper
@@ -313,9 +313,9 @@ touching them.
    tests are rejected. The rest:
    - `test_sqlite` needs libsqlite3 and `examples/minimal_game` needs SDL2
      (the Rust compiler fails the same way without them).
-   - Its native backend (`build --native`, compiler/pe.fd via PIR) crashes
-     (optimizer `pass_dse`, register allocation): `build`/`ccompile` go
-     through C and need a C compiler.
+   - `build --native` (compiler/pe.fd via PIR) still crashes (optimizer
+     `pass_dse`, register allocation); `fid emit` (compiler/pe_ir*.fd) is the
+     working native path.
    Fixed Oct 25–27 (docs/reference/known-bugs.md §2e): block jumps ended
    functions, byte loads read side-table strings, builtins shadowed core
    functions, the comptime loop unroller, String/HashMap result types,

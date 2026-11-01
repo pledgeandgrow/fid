@@ -197,7 +197,7 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | Region inference | ✅ | Auto-detect regions via region_stack tracking in typechecker |
 | UAF detection (interpreter) | ✅ | RegionEnd marks addresses freed; Load/Store panic in debug mode if accessing freed memory |
 | `val` immutability | ✅ | Type error on reassignment + field mutation (Issues 46-47). 247 stdlib vars migrated to `var`. |
-| Non-exhaustive match | ⚠️ | Emits warning for missing enum variants or bool arms (Issue 49). Intentional warning (not error) to allow partial matches. |
+| Non-exhaustive match | ✅ | An error for missing enum variants or bool arms, unless a catch-all arm exists. |
 
 ### Modules & Imports
 

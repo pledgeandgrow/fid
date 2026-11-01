@@ -1,5 +1,30 @@
 # Fides Language Changelog
 
+## Session 36 — One Integer Meaning, Sound Builds, a Real Allocator (Nov 1, 2026)
+
+- **Integers:** add/sub/mul/neg are checked at the declared width on the
+  interpreter, C and native paths; @wrapping wraps at it; division by zero
+  always panics; u64 is really unsigned. Lowering carried i64 for every integer
+  operation before, which was the root cause of the differences.
+- **Native panics print:** p_panic had no write path. A vectored exception
+  handler reports stack overflow and invalid memory access.
+- **Incremental builds:** the artifact store could reuse a binary for a different
+  program; stale builds after a FID_HOME switch or an overwritten output; fid
+  emit had no cache. All fixed. fid has the artifact store and --inc.
+- **Types:** val and const reassignment, non-exhaustive match, wrong Vec element
+  types and str/i64 mixing in a program are errors. Safety, determinism and
+  effect rules follow method calls.
+- **Memory:** size-class allocator with working p_free; an IR pass frees local
+  Vecs that provably never escape (544 MB -> 6 MB on the dropped-Vec benchmark).
+- **Speed:** self-hosted type check of the compiler about 205 s -> 15 s;
+  Vec_get/Vec_len inlined natively.
+- **Bugs that were invisible:** p_system crashed every native program on return
+  and always returned 0; pert_str_hash depended on the string's address near a
+  page end, so a HashMap could lose keys; an unaligned allocator lock cost 900 ns
+  per allocation in unlucky layouts; hex literals above i64::MAX were 0 on fidesc;
+  a method's str result + str added two pointers on fidesc; process_close freed
+  strings it had handed out.
+
 ## Session 35 — Native PE Backend Reaches Self-Hosting Fixpoint (Oct 30, 2026)
 
 The native PE backend (`pe_ir.fd` / `src/pe.rs`, IR → x86-64 machine code →

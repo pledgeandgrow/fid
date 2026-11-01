@@ -333,14 +333,43 @@ a call to it fits wherever a value of any type is expected.
 
 ## 4. Memory & Ownership
 
-### 4.1 Ownership Model
+### Integer Arithmetic
 
-Fides uses Rust-like ownership with these rules:
-1. Each value has exactly one **owner**
-2. When the owner goes out of scope, the value is dropped (RAII)
-3. You can borrow immutably (`&`) with unlimited readers
-4. You can borrow mutably (`&mut`) with exactly one writer
-5. Borrows must not outlive the owner (enforced by region inference)
+The same on the interpreter, the C backend and native Windows executables:
+
+- `+`, `-`, `*` and negation are checked at the declared width: overflow panics.
+- In a `@wrapping` function they wrap at that width.
+- `/` and `%` by zero always panic, even in `@wrapping` code. `MIN / -1` panics,
+  unless `@wrapping`.
+- A bare literal takes the other operand's type when it fits; otherwise the
+  wider type wins, and the unsigned one at equal width.
+- `u64` is unsigned for division, modulo, comparison, `>>` and `print`.
+- A panic prints `Panic: <message>` on stderr and exits with status 1. On native
+  Windows executables a stack overflow or an invalid memory access does too.
+
+The direct ARM64, RISC-V and WASM backends do not implement this yet; a
+cross-build through `ccompile` does.
+
+### 4.1 Memory Model
+
+Fides has no garbage collector. What happens today:
+
+1. `p_malloc` hands out power-of-two blocks from per-class free lists; `p_free`
+   returns one (a double free is ignored).
+2. A `Vec` that provably never leaves its local variable is freed by the
+   compiler: the previous one when the variable is written again, the last one
+   at each return. Its elements are not freed.
+3. `Vec` growth and `HashMap` rehashing give their old buffers back.
+4. A type with a `drop` method has it called at scope exit, for annotated locals.
+5. Everything else stays allocated until the process exits. **Strings and
+   escaping values are not reclaimed yet**, so a long-running program that
+   builds many strings grows. There is no general ownership or RAII.
+
+Structs are copied by default; only `@linear` types move. `Vec` and `HashMap`
+values are handles: assigning one aliases it, and nothing tracks that.
+
+You can borrow immutably (`&`) with unlimited readers and mutably (`&mut`) with
+one writer, and references cannot outlive what they point to.
 
 ### 4.2 Move vs Copy
 
@@ -372,7 +401,7 @@ fn process(data: &str) -> &str {
 ```
 
 - Allocations inside a region get `Region::Named(name)`
-- All region allocations are bulk-freed at region exit (`p_region_free`)
+- Regions are checked at compile time (scope, budget). They do not free memory yet: `p_region_free` is a no-op
 - Region budgets can limit memory usage
 - GPU regions (`region gpu { ... }`) for GPU-scoped allocation
 - KV-cache regions with sliding window eviction

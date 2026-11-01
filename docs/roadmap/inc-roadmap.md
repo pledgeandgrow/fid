@@ -4,7 +4,7 @@
 > modules never recompile; semantic (effect-scoped) dependencies skip work
 > that a call graph alone would demand.
 >
-> Created: Oct 30, 2026. Status: design — nothing implemented yet.
+> Created: Oct 30, 2026. Status: Phase A done on both compilers; Phase B at the C level (`--inc`) on both; Phase C not started.
 
 ## Where it stands
 
@@ -50,8 +50,10 @@ original plan are noted inline.
 - [x] A5. Stamp v2 (`fides-stamp 2`) records a `canon` line; v1 stamps
       still parse. `changed_inputs()` reports which source files forced
       the rebuild — `ccompile` prints `Changed: <files>`.
-- [ ] A6. Self-host parity: canonicalizer + store format in
-      `compiler/inc.fd` so `fid` and `fidesc` agree (fixpoint guard).
+- [x] A6. Self-host parity: canonical hash and artifact store in
+      `compiler/inc.fd`; `--inc` in `compiler/compiler.fd` (split_c_units) and
+      `compiler/main.fd`. Hashes differ between the two compilers (each has
+      its own `.fidcache` keys), the behaviour does not.
 - [x] (bonus) `CC` env var is now split on whitespace — `CC="zig cc"`
       works in `fidesc ccompile`, matching the documented bootstrap usage.
 
@@ -76,6 +78,14 @@ original plan are noted inline.
 - [ ] A11. Remote-cache server for `.fidcache` (Bazel-style HTTP CAS) —
       the on-disk format is already content-addressed; a fetch/store
       backend is a small add when needed.
+
+### Corrections (Nov 1)
+
+Renaming every identifier was unsound: two programs differing only in which
+external C function they call got one artifact, so a build could reuse the
+wrong binary. Only functions the unit defines are renamed now, and `// PLINK:`
+lines stay. Stamps record the output's hash, the key includes `FID_HOME`, and
+`fid emit` has stamps too.
 
 ## Phase B — Per-module compilation units (prerequisite for fine-grained)
 

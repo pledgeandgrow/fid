@@ -27,10 +27,9 @@ builds stage 1 of the self-hosted compiler and holds the test harness
   SDL2); all 59 expected-fail tests are rejected.
 - **Rust compiler suite:** interpreter 280/280, C 278/278, native Windows (PE)
   282/282, expected-fail 59/59 (`fidesc test`, `fidesc test --fail`).
-- **Self-hosted native backend not working:** `build --native` (PIR →
-  x86-64 → `compiler/pe.fd`) crashes in the optimizer and register
-  allocator, so the self-hosted `build`/`ccompile` go through C and need a C
-  compiler. `fidesc emit` makes native Windows executables with none.
+- **Self-hosted native backend works:** `fid emit` makes Windows executables
+  with no C compiler and reaches a byte-identical fixpoint. The older
+  `build --native` path (PIR, compiler/pe.fd) still crashes and is unused.
 - **Nondeterministic self-hosted typecheck:** reported earlier (HashMap-order
   instability); not reproduced in the Oct 25–27 bootstraps.
 - **`verify.sh --golden` and `scripts/bisect.sh` do not exist** —
@@ -63,10 +62,8 @@ Binaries:       release/fid.exe (self-hosted, shipped as fid.exe)
 
 ## What's NOT yet done
 
-1. **Self-hosted native backend** — `build --native` crashes (optimizer
-   `pass_dse`, then register allocation). Plan: port the working Rust PE
-   backend (`src/pe.rs`, `src/pe_runtime/`) to `compiler/pe.fd`, checked
-   byte-for-byte against `fidesc emit`; then a bootstrap with no C compiler.
+1. **Strings are not reclaimed** — only `Vec` locals and container buffers are.
+   Extend the local-escape pass (lower.rs `auto_drop_vecs`) to string temporaries.
 2. **Self-hosted typecheck nondeterminism** — reported earlier; not seen in
    the Oct 25–27 bootstraps. Retry before assuming a regression.
 3. **Post-codegen CT verification is x86-64 ELF only** — PE (`pe.rs` emits
