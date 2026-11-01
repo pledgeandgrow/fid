@@ -3556,22 +3556,121 @@ fn cc_qualify_shadowed_imports(imported: Vec<Program>, names: Vec<str>, user: Pr
         }
         ui = ui + 1;
     }
+    // Names several imported modules define: every copy is renamed, per module
+    var own: Vec<Vec<RenameEntry>> = Vec::new();
+    mi = 0;
+    while mi < imported.len() {
+        var mine: Vec<RenameEntry> = rename_new();
+        var fs: Vec<Func> = imported.get(mi).funcs;
+        var fi: i64 = 0;
+        while fi < fs.len() {
+            var f: Func = fs.get(fi);
+            if !cc_is_cfg(f) && HashMap_get(definer, f.name) == 0 - 1 {
+                rename_set(mine, f.name, str_replace(names.get(mi), "::", "__") + "__" + f.name);
+                any = true;
+            }
+            fi = fi + 1;
+        }
+        own.push(mine);
+        mi = mi + 1;
+    }
+    // `module::name`, by the name the module is imported under
+    var qualified: Vec<RenameEntry> = rename_new();
+    var calls: Vec<str> = take_qualified_calls();
+    var ci: i64 = 0;
+    while ci < calls.len() {
+        var call: str = calls.get(ci);
+        var at: i64 = str_find(call, "::");
+        var seg: str = str_slice(call, 0, at);
+        var fname: str = str_slice(call, at + 2, str_len(call));
+        var path: str = seg;
+        var ai: i64 = 0;
+        while ai < user.imports.len() {
+            var imp: ImportDef = user.imports.get(ai);
+            match imp.alias {
+                OptStr::Some(al) => { if al == seg { path = imp.path; } }
+                OptStr::None => {}
+            }
+            ai = ai + 1;
+        }
+        if seg == "core" { rename_set(qualified, call, fname); }
+        mi = 0;
+        while mi < imported.len() {
+            if names.get(mi) == path || path_last(names.get(mi)) == path {
+                var target: str = fname;
+                var hit: bool = false;
+                var fs: Vec<Func> = imported.get(mi).funcs;
+                var fi: i64 = 0;
+                while fi < fs.len() {
+                    if fs.get(fi).name == fname { hit = true; }
+                    fi = fi + 1;
+                }
+                match rename_get(own.get(mi), fname) {
+                    OptStr::Some(q) => { target = q; }
+                    OptStr::None => {
+                        match rename_get(renames, fname) {
+                            OptStr::Some(q2) => { target = q2; }
+                            OptStr::None => {}
+                        }
+                    }
+                }
+                if hit { rename_set(qualified, call, target); any = true; }
+            }
+            mi = mi + 1;
+        }
+        ci = ci + 1;
+    }
     if !any { return; }
     mi = 0;
     while mi < imported.len() {
         var prog: Program = imported.get(mi);
-        cc_rename_funcs(prog.funcs, renames, true);
+        var map: Vec<RenameEntry> = rename_new();
+        cc_rename_extend(map, renames);
+        cc_rename_extend(map, qualified);
+        // A name it does not define: the copy of a module it imports
+        var ip: i64 = 0;
+        while ip < prog.imports.len() {
+            var ik: i64 = 0;
+            while ik < imported.len() {
+                if names.get(ik) == prog.imports.get(ip).path { cc_rename_extend(map, own.get(ik)); }
+                ik = ik + 1;
+            }
+            ip = ip + 1;
+        }
+        cc_rename_extend(map, own.get(mi));
+        cc_rename_funcs(prog.funcs, map, true);
         var ii: i64 = 0;
         while ii < prog.impls.len() {
-            cc_rename_funcs(prog.impls.get(ii).methods, renames, false);
+            cc_rename_funcs(prog.impls.get(ii).methods, map, false);
             ii = ii + 1;
         }
         ii = 0;
         while ii < prog.trait_impls.len() {
-            cc_rename_funcs(prog.trait_impls.get(ii).methods, renames, false);
+            cc_rename_funcs(prog.trait_impls.get(ii).methods, map, false);
             ii = ii + 1;
         }
         mi = mi + 1;
+    }
+    if qualified.len() > 0 {
+        cc_rename_funcs(user.funcs, qualified, false);
+        var ui2: i64 = 0;
+        while ui2 < user.impls.len() {
+            cc_rename_funcs(user.impls.get(ui2).methods, qualified, false);
+            ui2 = ui2 + 1;
+        }
+        ui2 = 0;
+        while ui2 < user.trait_impls.len() {
+            cc_rename_funcs(user.trait_impls.get(ui2).methods, qualified, false);
+            ui2 = ui2 + 1;
+        }
+    }
+}
+
+fn cc_rename_extend(map: Vec<RenameEntry>, more: Vec<RenameEntry>) {
+    var i: i64 = 0;
+    while i < more.len() {
+        map.push(more.get(i));
+        i = i + 1;
     }
 }
 

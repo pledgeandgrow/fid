@@ -387,6 +387,22 @@ val s2 = s1;     // String is Move — s1 is moved
 // println(s1);  // ERROR: s1 was moved
 ```
 
+### Module Names
+
+Two imported modules may define the same function. Name the one you mean:
+
+```fides
+use file;
+use fs;
+use json as j;
+
+println(file::file_exists("a.txt"));
+println(fs::file_exists("b.txt"));
+println(j::json_string("x"));
+```
+
+A name only one module defines needs no prefix.
+
 ### Unsafe Code
 
 A program works with raw memory only inside `unsafe { }`, or in a function

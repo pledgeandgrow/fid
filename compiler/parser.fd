@@ -204,6 +204,39 @@ Paren,
 
 // --- Parser --------------------------------------------------------------
 
+// The names modules are imported under, for `module::name()`, and each
+// `module::name` called so far
+var g_import_names: Vec<str> = Vec::new();
+var g_qualified_calls: Vec<str> = Vec::new();
+
+pub fn str_vec_has(v: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == s { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The last `::` segment of a path.
+pub fn path_last(path: str) -> str {
+    var at: i64 = str_len(path) - 1;
+    while at > 0 {
+        if str_byte_at(path, at) == 58 && str_byte_at(path, at - 1) == 58 {
+            return str_slice(path, at + 1, str_len(path));
+        }
+        at = at - 1;
+    }
+    return path;
+}
+
+/// The `module::name` calls parsed since the last time this was called.
+pub fn take_qualified_calls() -> Vec<str> {
+    var calls: Vec<str> = g_qualified_calls;
+    g_qualified_calls = Vec::new();
+    return calls;
+}
+
 pub struct Parser {
 pub tokens: Vec<Token>,
 pub pos: i64,
@@ -4786,11 +4819,17 @@ if token_kind_eq(k, TokenKind::Ident("")) {
             ParseResultStr::Err(e) => { return ParseResultExpr::Err(e); }
         }
         var args: Vec<Expr> = Vec::new();
-        if self.match_tok(TokenKind::LParen) {
+        var called: bool = self.match_tok(TokenKind::LParen);
+        if called {
             match self.parse_expr_list() {
                 ParseResultExprs::Ok(a) => { args = a; }
                 ParseResultExprs::Err(e) => { return ParseResultExpr::Err(e); }
             }
+        }
+        if called && !self.is_enum_name(name) && !str_vec_has(self.struct_names, name) && str_vec_has(g_import_names, name) {
+            var qcall: str = name + "::" + variant_or_method;
+            g_qualified_calls.push(qcall);
+            return ParseResultExpr::Ok(Expr::Call(qcall, args));
         }
         if self.is_enum_name(name) {
             return ParseResultExpr::Ok(Expr::EnumLit(name, variant_or_method, args));
@@ -5237,6 +5276,10 @@ if self.match_tok(TokenKind::Eq) {
 }
 self.match_tok(TokenKind::Semicolon);
 var import_result: ImportDef = ImportDef_new_full(path, items, capabilities, version, alias, false, is_glob);
+match alias {
+    OptStr::Some(al) => { g_import_names.push(al); }
+    OptStr::None => { g_import_names.push(path_last(path)); }
+}
 return ParseResultImportDef::Ok(import_result);
 }
 

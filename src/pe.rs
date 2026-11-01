@@ -1575,11 +1575,36 @@ const MSVCRT_IMPORTS: &[&str] = &[
 /// The DLLs of the import table, in IAT order.
 const DLL_IMPORTS: [(&str, &[&str]); 2] = [("kernel32.dll", IMPORTS), ("msvcrt.dll", MSVCRT_IMPORTS)];
 
+thread_local! {
+    /// What this program imports beyond DLL_IMPORTS: `extern "C" link "x"`
+    static EXTRA_IMPORTS: std::cell::RefCell<Vec<(String, Vec<String>)>> = std::cell::RefCell::new(Vec::new());
+}
+
+/// Every DLL of the import table with its names, in IAT order.
+fn dll_imports() -> Vec<(String, Vec<String>)> {
+    let mut all: Vec<(String, Vec<String>)> = DLL_IMPORTS.iter()
+        .map(|(dll, names)| (dll.to_string(), names.iter().map(|n| n.to_string()).collect()))
+        .collect();
+    EXTRA_IMPORTS.with(|e| all.extend(e.borrow().iter().cloned()));
+    all
+}
+
+/// The DLL of a `link` library. Unix libraries the C runtime covers have none.
+fn link_dll(lib: &str) -> Option<String> {
+    match lib {
+        "" | "m" | "c" | "pthread" | "dl" | "rt" | "msvcrt" | "kernel32" => None,
+        "GL" => Some("opengl32.dll".to_string()),
+        "GLU" => Some("glu32.dll".to_string()),
+        _ if lib.ends_with(".dll") => Some(lib.to_string()),
+        _ => Some(format!("{}.dll", lib)),
+    }
+}
+
 /// The IAT slot of an imported function (an index into `iat_rdata_offsets`).
 fn import_slot(name: &str) -> Option<usize> {
     let mut base = 0;
-    for (_, names) in DLL_IMPORTS.iter() {
-        if let Some(i) = names.iter().position(|n| *n == name) {
+    for (_, names) in dll_imports().iter() {
+        if let Some(i) = names.iter().position(|n| n == name) {
             return Some(base + i);
         }
         base += names.len();
@@ -1641,6 +1666,7 @@ impl RdataBuilder {
     /// Build the complete .rdata section
     /// string_constants: all string literals from the IR
     fn build(&mut self, string_constants: &HashMap<String, String>) {
+        let dlls = dll_imports();
         // 1. String constants from user code (sorted: HashMap order would
         //    make the .rdata layout, and so the binary, differ per build)
         let mut keys: Vec<&String> = string_constants.keys().collect();
@@ -1654,12 +1680,12 @@ impl RdataBuilder {
         let _false_off = self.add_string("false");
 
         // 3. DLL names
-        self.dll_name_offs = DLL_IMPORTS.iter().map(|(dll, _)| self.add_string(dll)).collect();
+        self.dll_name_offs = dlls.iter().map(|(dll, _)| self.add_string(dll)).collect();
 
         // 4. IMAGE_IMPORT_BY_NAME for each import, in IAT order
         // Each: 2-byte hint (0) + null-terminated name
         let mut import_by_name_offsets: Vec<usize> = Vec::new();
-        for (_, names) in DLL_IMPORTS.iter() {
+        for (_, names) in dlls.iter() {
             for name in names.iter() {
                 if self.data.len() % 2 != 0 {
                     self.data.push(0); // entries are 2-byte aligned
@@ -1681,7 +1707,7 @@ impl RdataBuilder {
         // 5. Import Lookup Tables (ILT), one per DLL — 8-byte entries,
         //    null-terminated (RVAs filled in by patch_rvas)
         self.ilt_offsets.clear();
-        for (_, names) in DLL_IMPORTS.iter() {
+        for (_, names) in dlls.iter() {
             self.ilt_offsets.push(self.data.len());
             for _ in names.iter() {
                 self.data.extend_from_slice(&0u64.to_le_bytes());
@@ -1695,7 +1721,7 @@ impl RdataBuilder {
         self.iat_offsets.clear();
         self.dll_iat_offsets.clear();
         let mut k = 0;
-        for (_, names) in DLL_IMPORTS.iter() {
+        for (_, names) in dlls.iter() {
             self.dll_iat_offsets.push(self.data.len());
             for _ in names.iter() {
                 self.iat_offsets.push(self.data.len());
@@ -1719,7 +1745,7 @@ impl RdataBuilder {
             self.data.push(0);
         }
         self.import_dir_offset = self.data.len();
-        for _ in DLL_IMPORTS.iter() {
+        for _ in dlls.iter() {
             self.data.extend_from_slice(&[0u8; 20]);
         }
         self.data.extend_from_slice(&[0u8; 20]); // null terminator descriptor
@@ -1729,11 +1755,12 @@ impl RdataBuilder {
 
     /// Patch RVAs in the import table now that we know the .rdata RVA
     fn patch_rvas(&mut self, rdata_rva: u32) {
+        let dlls = dll_imports();
         fn put_u32(data: &mut [u8], at: usize, v: u32) {
             data[at..at + 4].copy_from_slice(&v.to_le_bytes());
         }
         let mut k = 0;
-        for (d, (_, names)) in DLL_IMPORTS.iter().enumerate() {
+        for (d, (_, names)) in dlls.iter().enumerate() {
             // ILT and IAT entries: RVAs to IMAGE_IMPORT_BY_NAME
             for j in 0..names.len() {
                 let rva = rdata_rva + self.import_by_name_offsets[k] as u32;
@@ -2244,6 +2271,30 @@ impl PeCodeGen {
                 all_strings.push(s.to_string());
             }
         }
+
+        // The C functions the program reaches, from the DLLs it links
+        let reached = needed_functions(module);
+        let mut extra: Vec<(String, Vec<String>)> = Vec::new();
+        EXTRA_IMPORTS.with(|e| e.borrow_mut().clear());
+        for ext in &module.extern_decls {
+            let Some(dll) = ext.link_lib.as_deref().and_then(link_dll) else { continue; };
+            if self.bare_mode || !reached.contains(&ext.pledge_name)
+                || module.functions.contains_key(&ext.pledge_name)
+                || import_slot(&ext.c_name).is_some()
+                || PE_PRIMITIVES.contains(&ext.c_name.as_str())
+                || c_override(module, &ext.pledge_name).is_some() {
+                continue;
+            }
+            match extra.iter_mut().find(|(d, _)| *d == dll) {
+                Some((_, names)) => {
+                    if !names.contains(&ext.c_name) {
+                        names.push(ext.c_name.clone());
+                    }
+                }
+                None => extra.push((dll, vec![ext.c_name.clone()])),
+            }
+        }
+        EXTRA_IMPORTS.with(|e| *e.borrow_mut() = extra);
 
         // 2. Build .rdata section
         let mut rdata = RdataBuilder::new();

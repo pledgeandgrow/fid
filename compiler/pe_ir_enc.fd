@@ -1642,11 +1642,54 @@ pub struct PeDllImport {
     pub names: Vec<str>,
 }
 
+// What this program imports beyond kernel32 and msvcrt: `extern "C" link "x"`
+var g_pe_extra_imports: Vec<PeDllImport> = Vec::new();
+
+pub fn pe_clear_extra_imports() {
+    g_pe_extra_imports = Vec::new();
+}
+
+/// Import `name` from `dll` as well.
+pub fn pe_add_extra_import(dll: str, name: str) {
+    var i: i64 = 0;
+    while i < g_pe_extra_imports.len() {
+        var e: PeDllImport = g_pe_extra_imports.get(i);
+        if e.dll == dll {
+            var k: i64 = 0;
+            while k < e.names.len() {
+                if e.names.get(k) == name { return; }
+                k = k + 1;
+            }
+            e.names.push(name);
+            return;
+        }
+        i = i + 1;
+    }
+    var names: Vec<str> = Vec::new();
+    names.push(name);
+    g_pe_extra_imports.push(PeDllImport { dll: dll, names: names });
+}
+
+/// The DLL of a `link` library, "" for the Unix libraries the C runtime covers.
+pub fn pe_link_dll(lib: str) -> str {
+    if lib == "" || lib == "m" || lib == "c" || lib == "pthread" || lib == "dl" || lib == "rt"
+        || lib == "msvcrt" || lib == "kernel32" { return ""; }
+    if lib == "GL" { return "opengl32.dll"; }
+    if lib == "GLU" { return "glu32.dll"; }
+    if str_ends_with(lib, ".dll") { return lib; }
+    return lib + ".dll";
+}
+
 /// The DLLs of the import table, in IAT order.
 pub fn pe_dll_imports() -> Vec<PeDllImport> {
     var v: Vec<PeDllImport> = Vec::new();
     v.push(PeDllImport { dll: "kernel32.dll", names: pe_kernel32_imports() });
     v.push(PeDllImport { dll: "msvcrt.dll", names: pe_msvcrt_imports() });
+    var i: i64 = 0;
+    while i < g_pe_extra_imports.len() {
+        v.push(g_pe_extra_imports.get(i));
+        i = i + 1;
+    }
     return v;
 }
 

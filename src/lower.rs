@@ -228,6 +228,8 @@ pub struct Lowerer {
     current_self_type: Option<String>,
     /// Stack of effect handlers (for handle/do statements)
     effect_handler_stack: Vec<Vec<crate::ast::EffectHandler>>,
+    /// Globals assigned when `main` starts: their initializers are not constants
+    global_inits: Vec<(String, Expr)>,
     /// Where a `handle` ending this function leaves its value: (function, slot)
     handle_slot: Option<(String, ValueId)>,
     /// L3B: Stack of scope executors for structured concurrency.
@@ -341,6 +343,7 @@ impl Lowerer {
             type_aliases: HashMap::new(),
             current_self_type: None,
             effect_handler_stack: Vec::new(),
+            global_inits: Vec::new(),
             handle_slot: None,
             scope_executor_stack: Vec::new(),
             continuation_counter: 0,
@@ -382,6 +385,9 @@ impl Lowerer {
         for g in &program.globals {
             let ir_ty = self.lower_type(&g.ty);
             self.module.globals.insert(g.name.clone(), (ir_ty, g.init.clone()));
+            if !is_const_init(&g.init) {
+                self.global_inits.push((g.name.clone(), g.init.clone()));
+            }
         }
 
         // Register type aliases
@@ -1542,6 +1548,12 @@ impl Lowerer {
                 0,
             );
             self.defer_stack.push(vec![exit_stmt]);
+        }
+
+        if func.name == "main" {
+            for (target, expr) in self.global_inits.clone() {
+                self.lower_stmt(&Stmt::Assign { target, op: AssignOp::Assign, expr, line: 0 });
+            }
         }
 
         // Lower the function body
@@ -8021,6 +8033,15 @@ impl Lowerer {
                 }
             }
         }
+    }
+}
+
+/// Whether a global's initializer is written into the program's data.
+fn is_const_init(expr: &Expr) -> bool {
+    match expr {
+        Expr::IntLit(_) | Expr::FloatLit(_) | Expr::StringLit(_) | Expr::BoolLit(_) => true,
+        Expr::Unary { expr, .. } => is_const_init(expr),
+        _ => false,
     }
 }
 

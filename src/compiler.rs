@@ -558,7 +558,7 @@ pub fn build_program_with_runtime(source: &str, source_path: Option<&str>, runti
 
     // A user function named like a function of one imported module: each
     // side keeps its own (the module's copy is renamed module__name).
-    qualify_shadowed_imports(&mut imported_modules, &user);
+    qualify_shadowed_imports(&mut imported_modules, &mut user);
 
     // `cap Sub: Super`: Sub carries Super's methods (impl checks, vtables).
     let super_errors = inherit_supertrait_methods(&stdlib, &mut imported_modules, &mut user);
@@ -1235,7 +1235,11 @@ fn fill_default_trait_methods(program: &mut Program) {
 /// the imported modules follow it: they cannot see the user's definitions,
 /// so every caller keeps the function it was written against. A name defined
 /// by two imported modules stays a conflict (find_module_conflicts).
-fn qualify_shadowed_imports(imported: &mut [(String, Program)], user: &Program) {
+///
+/// A name two imported modules define is renamed in each, and `module::name`
+/// in the program picks one; calls inside a module keep its own copy, or the
+/// copy of the module it imports.
+fn qualify_shadowed_imports(imported: &mut [(String, Program)], user: &mut Program) {
     let is_cfg = |f: &crate::ast::Func| f.annotations.iter().any(|a| a.name == "cfg");
     let user_funcs: HashSet<&str> = user.funcs.iter()
         .filter(|f| !is_cfg(f))
@@ -1256,16 +1260,66 @@ fn qualify_shadowed_imports(imported: &mut [(String, Program)], user: &Program) 
             renames.insert(name.clone(), format!("{}__{}", module, name));
         }
     }
-    if renames.is_empty() {
+    let qualified_name = |module: &str, name: &str| format!("{}__{}", module.replace("::", "__"), name);
+    // Names several imported modules define: every copy is renamed
+    let mut count: HashMap<String, usize> = HashMap::new();
+    for (_, prog) in imported.iter() {
+        for f in prog.funcs.iter().filter(|f| !is_cfg(f)) {
+            *count.entry(f.name.clone()).or_insert(0) += 1;
+        }
+    }
+    let own: Vec<(String, Vec<String>, Vec<String>)> = imported.iter().map(|(module, prog)| {
+        let names: Vec<String> = prog.funcs.iter().filter(|f| !is_cfg(f)).map(|f| f.name.clone()).collect();
+        let imports: Vec<String> = prog.imports.iter().map(|i| i.path.clone()).collect();
+        (module.clone(), names, imports)
+    }).collect();
+    let is_clash = |name: &str| count.get(name).copied().unwrap_or(0) > 1;
+    // `module::name`, by the name the module is imported under
+    let aliases: Vec<(String, String)> = user.imports.iter()
+        .filter_map(|i| i.alias.clone().map(|a| (a, i.path.clone())))
+        .collect();
+    let mut qualified: HashMap<String, String> = HashMap::new();
+    for call in crate::parser::take_qualified_calls() {
+        let Some((seg, name)) = call.rsplit_once("::") else { continue; };
+        let path = aliases.iter().find(|(a, _)| a == seg).map_or(seg, |(_, p)| p.as_str());
+        let module = own.iter().find(|(m, _, _)| m == path || m.rsplit("::").next() == Some(path));
+        match module {
+            Some((m, names, _)) if names.iter().any(|n| n == name) => {
+                let target = if is_clash(name) {
+                    qualified_name(m, name)
+                } else {
+                    renames.get(name).cloned().unwrap_or_else(|| name.to_string())
+                };
+                qualified.insert(call.clone(), target);
+            }
+            None if seg == "core" => { qualified.insert(call.clone(), name.to_string()); }
+            _ => {}
+        }
+    }
+    if renames.is_empty() && qualified.is_empty() && !count.values().any(|c| *c > 1) {
         return;
     }
-    for (_, prog) in imported.iter_mut() {
+    for i in 0..imported.len() {
+        let mut map = renames.clone();
+        map.extend(qualified.iter().map(|(a, b)| (a.clone(), b.clone())));
+        // A name it does not define: the copy of a module it imports
+        for path in &own[i].2 {
+            if let Some((m, names, _)) = own.iter().find(|(m, _, _)| m == path) {
+                for n in names.iter().filter(|n| is_clash(n)) {
+                    map.insert(n.clone(), qualified_name(m, n));
+                }
+            }
+        }
+        for n in own[i].1.iter().filter(|n| is_clash(n)) {
+            map.insert(n.clone(), qualified_name(&own[i].0, n));
+        }
+        let prog = &mut imported[i].1;
         let rename_func = |f: &mut crate::ast::Func| {
-            f.body = crate::mono::rename_calls(&f.body, &renames);
+            f.body = crate::mono::rename_calls(&f.body, &map);
         };
         for f in prog.funcs.iter_mut() {
             if !is_cfg(f) {
-                if let Some(q) = renames.get(&f.name) {
+                if let Some(q) = map.get(&f.name) {
                     f.name = q.clone();
                 }
             }
@@ -1275,6 +1329,18 @@ fn qualify_shadowed_imports(imported: &mut [(String, Program)], user: &Program) 
             imp.methods.iter_mut().for_each(rename_func);
         }
         for ti in prog.trait_impls.iter_mut() {
+            ti.methods.iter_mut().for_each(rename_func);
+        }
+    }
+    if !qualified.is_empty() {
+        let rename_func = |f: &mut crate::ast::Func| {
+            f.body = crate::mono::rename_calls(&f.body, &qualified);
+        };
+        user.funcs.iter_mut().for_each(rename_func);
+        for imp in user.impls.iter_mut() {
+            imp.methods.iter_mut().for_each(rename_func);
+        }
+        for ti in user.trait_impls.iter_mut() {
             ti.methods.iter_mut().for_each(rename_func);
         }
     }

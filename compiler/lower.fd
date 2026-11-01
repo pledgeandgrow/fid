@@ -468,6 +468,8 @@ pub struct Lowerer {
     pub current_captures: Vec<ClosureCapture>,
     pub try_stack: Vec<TryContext>,
     pub effect_handler_stack: Vec<Vec<EffectHandler>>,
+    // Globals assigned when `main` starts: their initializers are not constants
+    pub global_inits: Vec<GlobalVar>,
     // Where a `handle` ending this function leaves its value
     pub handle_slot_fn: str,
     pub handle_slot: i64,
@@ -525,6 +527,7 @@ pub fn Lowerer_new() -> Lowerer {
         current_captures: Vec::new(),
         try_stack: Vec::new(),
         effect_handler_stack: Vec::new(),
+        global_inits: Vec::new(),
         handle_slot_fn: "",
         handle_slot: -1,
         scope_executor_stack: Vec::new(),
@@ -1968,6 +1971,7 @@ pub fn Lowerer_lower_program(self: &mut Lowerer, program: Program) -> IrModule {
         var g: GlobalVar = program.globals.get(i);
         var ir_ty: IrType = Lowerer_lower_type(self, g.ty);
         self.module.globals.push(GlobalEntry_new(g.name, ir_ty, g.init));
+        if !lw_is_const_init(g.init) { self.global_inits.push(g); }
         i = i + 1;
     }
 
@@ -2500,6 +2504,19 @@ fn lw_is_local_use(inst: Inst, op: i64) -> bool {
 }
 
 /// `Vec_drop(*shadow)`, appended to `out`.
+/// Whether a global's initializer is written into the program's data.
+fn lw_is_const_init(expr: Expr) -> bool {
+    match expr {
+        Expr::IntLit(_) => { return true; }
+        Expr::FloatLit(_) => { return true; }
+        Expr::StringLit(_) => { return true; }
+        Expr::BoolLit(_) => { return true; }
+        Expr::Unary(_, e) => { return lw_is_const_init(box_expr_unbox(e)); }
+        _ => { return false; }
+    }
+    return false;
+}
+
 /// src/lower.rs auto_drop_strs: free the strings that provably die where
 /// they are used. The worst case is a leak, never a dangling string.
 fn lw_auto_drop_strs(module: &mut IrModule) {
@@ -3085,6 +3102,15 @@ pub fn Lowerer_lower_func(self: &mut Lowerer, func: Func) {
         exit_args.push(Expr::StringLit("[AUDIT] exit " + func.name + "\n"));
         exit_stmts.push(Stmt::Expr(Expr::Call("print", exit_args), 0));
         self.defer_stack.push(exit_stmts);
+    }
+
+    if func.name == "main" {
+        var gi: i64 = 0;
+        while gi < self.global_inits.len() {
+            var ginit: GlobalVar = self.global_inits.get(gi);
+            Lowerer_lower_stmt(self, Stmt::Assign(ginit.name, AssignOp::Assign, ginit.init, 0));
+            gi = gi + 1;
+        }
     }
 
     // Lower the function body

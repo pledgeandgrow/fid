@@ -12,6 +12,18 @@ struct IfExpr {
     else_block: Option<Vec<Stmt>>,
 }
 
+thread_local! {
+    /// The names modules are imported under, for `module::name()`
+    static IMPORT_NAMES: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+    /// Each `module::name` called so far
+    static QUALIFIED_CALLS: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+}
+
+/// The `module::name` calls parsed since the last time this was called.
+pub fn take_qualified_calls() -> Vec<String> {
+    QUALIFIED_CALLS.with(|q| std::mem::take(&mut *q.borrow_mut()))
+}
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -2988,7 +3000,8 @@ impl Parser {
                     self.advance(); // consume ::
                     let variant_or_method = self.expect_ident()?;
                     let mut args = Vec::new();
-                    if self.match_tok(TokenKind::LParen) {
+                    let called = self.match_tok(TokenKind::LParen);
+                    if called {
                         if !self.check(&TokenKind::RParen) {
                             loop {
                                 args.push(self.parse_expr()?);
@@ -2999,7 +3012,13 @@ impl Parser {
                         }
                         self.expect(TokenKind::RParen, ")")?;
                     }
-                    if self.is_enum_name(name) {
+                    let is_module = called && !self.is_enum_name(name) && !self.struct_names.contains(name)
+                        && IMPORT_NAMES.with(|m| m.borrow().contains(name));
+                    if is_module {
+                        let callee = format!("{}::{}", name, variant_or_method);
+                        QUALIFIED_CALLS.with(|q| q.borrow_mut().push(callee.clone()));
+                        Ok(Expr::Call { callee, args })
+                    } else if self.is_enum_name(name) {
                         Ok(Expr::EnumLit {
                             enum_name: name.clone(),
                             variant: variant_or_method,
@@ -3266,6 +3285,8 @@ impl Parser {
             None
         };
         self.match_tok(TokenKind::Semicolon);
+        let import_name = alias.clone().unwrap_or_else(|| path.rsplit("::").next().unwrap_or("").to_string());
+        IMPORT_NAMES.with(|m| m.borrow_mut().push(import_name));
         Ok(ImportDef { path, items, capabilities, version, alias, is_pub: false, is_glob })
     }
 

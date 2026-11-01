@@ -2016,6 +2016,7 @@ fn real_main() {
             // C-codegen-only skip list — tests that pass on interpreter + PE
             // but can't compile via C codegen (e.g. bare-metal externs).
             let c_skip_tests: &[&str] = &[
+                "test_pe_dll_import",
                 "test_kernel_serial",
                 "test_os_gaps",
                 // They print their own argv, which differs per backend.
@@ -2028,6 +2029,7 @@ fn real_main() {
             // compiled; the C binary's output is the reference for PE.
             let interp_skip_tests: &[&str] = &[
                 "probe_lower",
+                "test_pe_dll_import",
                 "test_spawn_gt",
             ];
 

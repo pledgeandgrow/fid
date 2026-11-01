@@ -2,6 +2,11 @@
 
 ## Session 36 — One Integer Meaning, Sound Builds, a Real Allocator (Nov 1, 2026)
 
+- **Native builds import from any DLL:** `extern "C" link "x"` adds x.dll to the
+  import table, with no C compiler.
+- **`module::name()`:** two imported modules may define the same function.
+- **Globals:** an initializer that is not a constant, such as `Vec::new()`, runs
+  when `main` starts. It never ran, on any backend, so the first use crashed.
 - **Memory:** the compiler frees temporary strings and local strings that never
   escape: 30M strings peak at 4 MB, down from 2.3 GB.
 - **Native speed:** the hottest locals and short-lived temporaries live in

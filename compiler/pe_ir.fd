@@ -457,6 +457,28 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
         psi = psi + 1;
     }
 
+    // The C functions the program reaches, from the DLLs it links
+    pe_clear_extra_imports();
+    var reached: Vec<str> = pe_ir_needed_functions(module);
+    var xi: i64 = 0;
+    while xi < module.extern_decls.len() {
+        var xd: ExternDecl = module.extern_decls.get(xi);
+        match xd.link_lib {
+            OptStr::Some(lib) => {
+                var dll: str = pe_link_dll(lib);
+                if dll != "" && !self.bare_mode && pe_ir_strs_contains(reached, xd.pledge_name)
+                    && !pe_ir_strs_contains(self.module_fns, xd.pledge_name)
+                    && pe_import_slot(xd.c_name) < 0
+                    && !pe_ir_strs_contains(pe_primitive_names(), xd.c_name)
+                    && pe_ir_c_override(module, xd.pledge_name) == "" {
+                    pe_add_extra_import(dll, xd.c_name);
+                }
+            }
+            OptStr::None => {}
+        }
+        xi = xi + 1;
+    }
+
     // 2. Build .rdata section
     var rdata: PeirRdata = PeirRdata_new();
     PeirRdata_build(&mut rdata, all_strings);

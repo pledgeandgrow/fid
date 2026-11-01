@@ -141,10 +141,8 @@ Most modules still have no test, so expect more of this (B12).
       data; `ota_verify_manifest` only checks a prefix; `sqlite` has no
       parameter binding, so it is open to injection (M).
 
-- [ ] B16. Modules share one namespace, so 44 function names clash and those
-      pairs cannot be imported together: `file`+`fs` (11), `simd`+`tensor` (8),
-      `args`+`os`, `encoding`+`url`, `env`+`os`, `arena`+`http`, `csv`+`data`.
-      Add qualified names (`json::get`) or rename (M).
+- [x] B16. Two imported modules may define the same function: `module::name()`
+      picks one, and `use json as j` gives `j::name()`.
 - [ ] B17. A private function in one module must not shadow a core function for
       other modules: `sqlite`'s local `int_to_str` broke `json` and `string` (S).
 - [x] B18. A struct defined in two modules must be an error, as a function is:
@@ -202,7 +200,7 @@ the fastest build-to-native among compiled languages, and native code within
 
 ## Track E — C interop
 
-- [ ] E1. `extern "C"` from any DLL in native builds: `link "x"` adds to the PE
+- [x] E1. `extern "C"` from any DLL in native builds: `link "x"` adds to the PE
       import table (M). `ccompile` is needed today beyond msvcrt and kernel32.
 - [ ] E2. `use sqlite` and `use sdl` work through `emit` (depends on E1, B4) (S).
 - [ ] E3. Struct-by-value and callback arguments in the native thunks (M).
