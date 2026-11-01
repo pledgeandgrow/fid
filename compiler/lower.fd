@@ -31,6 +31,7 @@ use vec;
 use string;
 use compiler::ast;
 use compiler::ir;
+use compiler::pe_ir;
 
 // --- Box unbox helpers ---------------------------------------------------
 
@@ -2241,7 +2242,281 @@ pub fn Lowerer_lower_program(self: &mut Lowerer, program: Program) -> IrModule {
 
 pub fn lower(program: Program) -> IrModule {
     var l: Lowerer = Lowerer_new();
-    return Lowerer_lower_program(&mut l, program);
+    var module: IrModule = Lowerer_lower_program(&mut l, program);
+    lw_auto_drop_vecs(&mut module);
+    return module;
+}
+
+/// core.fd functions that use a Vec through its handle and keep no reference
+/// to it.
+fn lw_vec_local_call(name: str) -> bool {
+    if !str_starts_with(name, "Vec_") { return false; }
+    return name == "Vec_push" || name == "Vec_pop" || name == "Vec_len" || name == "Vec_is_empty"
+        || name == "Vec_get" || name == "Vec_set" || name == "Vec_clear" || name == "Vec_capacity"
+        || name == "Vec_contains" || name == "Vec_first" || name == "Vec_last"
+        || name == "Vec_truncate" || name == "Vec_reverse" || name == "Vec_sort";
+}
+
+/// Free the Vecs that provably never leave their local variable (as
+/// src/lower.rs auto_drop_vecs): a slot that only ever receives a fresh
+/// `Vec_new`, read only as the receiver of those calls (or to print it). The
+/// previous Vec is freed when the slot is written again and the last one at
+/// each return. The worst case is a leak, never a dangling Vec.
+fn lw_auto_drop_vecs(module: &mut IrModule) {
+    var has_drop: bool = false;
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        if module.functions.get(i).name == "Vec_drop" { has_drop = true; }
+        i = i + 1;
+    }
+    if !has_drop { return; }
+    i = 0;
+    while i < module.functions.len() {
+        var entry: IrFunctionEntry = module.functions.get(i);
+        var func: IrFunction = entry.func;
+        if lw_drop_function_vecs(&mut func) {
+            entry.func = func;
+            module.functions.set(i, entry);
+        }
+        i = i + 1;
+    }
+}
+
+fn lw_zeros(n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(0);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn lw_block_order(f: &IrFunction) -> Vec<i64> {
+    var order: Vec<i64> = Vec::new();
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var ids: Vec<i64> = f.blocks.get(b).instructions;
+        var k: i64 = 0;
+        while k < ids.len() {
+            order.push(ids.get(k));
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    return order;
+}
+
+fn lw_is_vec_new(f: &IrFunction, id: i64) -> bool {
+    match IrFunction_get_inst(f, id) {
+        OptInst::Some(inst) => {
+            match inst {
+                Inst::Call(name, _, _, _) => { return name == "Vec_new"; }
+                _ => { return false; }
+            }
+        }
+        OptInst::None => { return false; }
+    }
+}
+
+fn lw_drop_function_vecs(f: &mut IrFunction) -> bool {
+    var order: Vec<i64> = lw_block_order(f);
+    var i: i64 = 0;
+    var any: bool = false;
+    while i < order.len() && !any {
+        any = lw_is_vec_new(f, order.get(i));
+        i = i + 1;
+    }
+    if !any { return false; }
+    var n: i64 = f.next_value;
+    // Per value: slot (1 = a slot), loaded (slot + 1), stored_in (slot + 1),
+    // bad and written (per slot)
+    var is_slot: Vec<i64> = lw_zeros(n);
+    var loaded: Vec<i64> = lw_zeros(n);
+    var stored_in: Vec<i64> = lw_zeros(n);
+    var bad: Vec<i64> = lw_zeros(n);
+    var written: Vec<i64> = lw_zeros(n);
+    var slots: Vec<i64> = Vec::new();
+    i = 0;
+    while i < order.len() {
+        var id: i64 = order.get(i);
+        match IrFunction_get_inst(f, id) {
+            OptInst::Some(inst) => {
+                match inst {
+                    Inst::Alloca(_, _) => { is_slot.set(id, 1); slots.push(id); }
+                    _ => {}
+                }
+            }
+            OptInst::None => {}
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < order.len() {
+        var id: i64 = order.get(i);
+        match IrFunction_get_inst(f, id) {
+            OptInst::Some(inst) => {
+                match inst {
+                    Inst::Load(ptr, _) => {
+                        if is_slot.get(ptr) != 0 { loaded.set(id, ptr + 1); }
+                    }
+                    Inst::Store(ptr, value, _) => {
+                        if is_slot.get(ptr) != 0 {
+                            if lw_is_vec_new(f, value) {
+                                written.set(ptr, 1);
+                                stored_in.set(value, ptr + 1);
+                            } else {
+                                bad.set(ptr, 1);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            OptInst::None => {}
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < order.len() {
+        match IrFunction_get_inst(f, order.get(i)) {
+            OptInst::Some(inst) => { lw_check_slot_uses(inst, is_slot, loaded, stored_in, bad); }
+            OptInst::None => {}
+        }
+        i = i + 1;
+    }
+    var kept: Vec<i64> = Vec::new();
+    i = 0;
+    while i < slots.len() {
+        var s: i64 = slots.get(i);
+        if written.get(s) != 0 && bad.get(s) == 0 { kept.push(s); }
+        i = i + 1;
+    }
+    if kept.len() == 0 { return false; }
+    // The Vec a slot last held, kept apart from the slot: an Alloca in a
+    // loop body zeroes the slot at each iteration.
+    var shadows: Vec<i64> = lw_zeros(n);
+    var prologue: Vec<i64> = Vec::new();
+    i = 0;
+    while i < kept.len() {
+        var zero: i64 = lw_detached(f, Inst::ConstInt(0, IrType::I64));
+        var shadow: i64 = lw_detached(f, Inst::Alloca(IrType::I64, Region::Stack));
+        var init: i64 = lw_detached(f, Inst::Store(shadow, zero, OptIrType::None));
+        prologue.push(zero);
+        prologue.push(shadow);
+        prologue.push(init);
+        shadows.set(kept.get(i), shadow + 1);
+        i = i + 1;
+    }
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var blk: BasicBlock = f.blocks.get(b);
+        var old: Vec<i64> = blk.instructions;
+        var fresh: Vec<i64> = Vec::new();
+        if b == 0 { fresh = prologue; }
+        var k: i64 = 0;
+        while k < old.len() {
+            var id: i64 = old.get(k);
+            var done: bool = false;
+            match IrFunction_get_inst(f, id) {
+                OptInst::Some(inst) => {
+                    match inst {
+                        Inst::Store(ptr, value, _) => {
+                            if is_slot.get(ptr) != 0 && shadows.get(ptr) != 0 {
+                                var shadow: i64 = shadows.get(ptr) - 1;
+                                lw_drop_shadow(f, shadow, fresh);
+                                fresh.push(id);
+                                fresh.push(lw_detached(f, Inst::Store(shadow, value, OptIrType::None)));
+                                done = true;
+                            }
+                        }
+                        Inst::Return(_) => {
+                            var ki: i64 = 0;
+                            while ki < kept.len() {
+                                lw_drop_shadow(f, shadows.get(kept.get(ki)) - 1, fresh);
+                                ki = ki + 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                OptInst::None => {}
+            }
+            if !done { fresh.push(id); }
+            k = k + 1;
+        }
+        blk.instructions = fresh;
+        f.blocks.set(b, blk);
+        b = b + 1;
+    }
+    return true;
+}
+
+fn lw_check_slot_uses(inst: Inst, is_slot: Vec<i64>, loaded: Vec<i64>, stored_in: Vec<i64>, bad: Vec<i64>) {
+    var ops: Vec<i64> = Vec::new();
+    peir_inst_operands(inst, &mut ops);
+    var target: i64 = -1;
+    var own_store: bool = false;
+    match inst {
+        Inst::Load(ptr, _) => { if is_slot.get(ptr) != 0 { target = ptr; } }
+        Inst::Store(ptr, _, _) => {
+            if is_slot.get(ptr) != 0 {
+                target = ptr;
+                own_store = true;
+            }
+        }
+        _ => {}
+    }
+    var i: i64 = 0;
+    while i < ops.len() {
+        var op: i64 = ops.get(i);
+        if is_slot.get(op) != 0 && op != target { bad.set(op, 1); }
+        if loaded.get(op) != 0 && !lw_is_local_use(inst, op) { bad.set(loaded.get(op) - 1, 1); }
+        if stored_in.get(op) != 0 && !own_store { bad.set(stored_in.get(op) - 1, 1); }
+        i = i + 1;
+    }
+}
+
+fn lw_is_local_use(inst: Inst, op: i64) -> bool {
+    match inst {
+        Inst::Print(_, _) => { return true; }
+        Inst::Call(name, args, _, _) => {
+            if !lw_vec_local_call(name) || args.len() < 2 || args.get(1) != op { return false; }
+            var i: i64 = 2;
+            while i < args.len() {
+                if args.get(i) == op { return false; }
+                i = i + 1;
+            }
+            return true;
+        }
+        _ => { return false; }
+    }
+}
+
+/// `Vec_drop(*shadow)`, appended to `out`.
+fn lw_drop_shadow(f: &mut IrFunction, shadow: i64, out: Vec<i64>) {
+    var old: i64 = lw_detached(f, Inst::Load(shadow, IrType::I64));
+    var env: i64 = lw_detached(f, Inst::ConstInt(0, IrType::I64));
+    var effects: EffectSet = EffectSet_new();
+    EffectSet_add(&mut effects, Effect::Write);
+    EffectSet_add(&mut effects, Effect::Alloc);
+    var args: Vec<i64> = Vec::new();
+    args.push(env);
+    args.push(old);
+    var call: i64 = lw_detached(f, Inst::Call("Vec_drop", args, IrType::Void, effects));
+    out.push(old);
+    out.push(env);
+    out.push(call);
+}
+
+/// A new instruction not yet placed in a block.
+fn lw_detached(f: &mut IrFunction, inst: Inst) -> i64 {
+    var id: i64 = IrFunction_emit(f, inst);
+    var last: i64 = f.current_block_idx;
+    var blk: BasicBlock = f.blocks.get(last);
+    blk.instructions.pop();
+    f.blocks.set(last, blk);
+    return id;
 }
 
 // --- Lower function (stub - implemented in Part 3) ------------------------

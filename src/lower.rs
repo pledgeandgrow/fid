@@ -14,7 +14,7 @@
 
 use crate::ast::*;
 use crate::ir::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Determine effects for runtime builtin functions (p_* functions).
 /// Functions that mutate data have Write effect; functions that allocate
@@ -7985,7 +7985,156 @@ impl Lowerer {
 /// Lower a program to IR — convenience function
 pub fn lower(program: &Program) -> IrModule {
     let mut lowerer = Lowerer::new();
-    lowerer.lower_program(program)
+    let mut module = lowerer.lower_program(program);
+    auto_drop_vecs(&mut module);
+    module
+}
+
+/// core.fd functions that use a Vec through its handle and keep no reference
+/// to it.
+const VEC_LOCAL_CALLS: &[&str] = &[
+    "Vec_push", "Vec_pop", "Vec_len", "Vec_is_empty", "Vec_get", "Vec_set", "Vec_clear",
+    "Vec_capacity", "Vec_contains", "Vec_first", "Vec_last", "Vec_truncate", "Vec_reverse", "Vec_sort",
+];
+
+/// Free the Vecs that provably never leave their local variable: a slot that
+/// only ever receives a fresh `Vec_new`, read only as the receiver of
+/// VEC_LOCAL_CALLS (or to print it). The previous Vec is freed when the slot
+/// is written again (a loop's next iteration) and the last one at each
+/// return. Anything else, an element stored elsewhere included, stays
+/// allocated: the worst case is a leak, never a dangling Vec.
+fn auto_drop_vecs(module: &mut IrModule) {
+    if !module.functions.contains_key("Vec_drop") {
+        return;
+    }
+    for func in module.functions.values_mut() {
+        drop_function_vecs(func);
+    }
+}
+
+fn drop_function_vecs(f: &mut IrFunction) {
+    let order: Vec<ValueId> = f.blocks.iter().flat_map(|b| b.instructions.iter().copied()).collect();
+    let is_new = |f: &IrFunction, id: &ValueId| matches!(f.instructions.get(id), Some(Inst::Call { func, .. }) if func == "Vec_new");
+    if !order.iter().any(|id| is_new(f, id)) {
+        return;
+    }
+    let mut slots: Vec<ValueId> = Vec::new();
+    let mut loaded: HashMap<ValueId, ValueId> = HashMap::new();
+    let mut stored_in: HashMap<ValueId, ValueId> = HashMap::new();
+    for id in &order {
+        if matches!(f.instructions.get(id), Some(Inst::Alloca { .. })) {
+            slots.push(*id);
+        }
+    }
+    let is_slot = |v: &ValueId| slots.contains(v);
+    let mut bad: HashSet<ValueId> = HashSet::new();
+    let mut written: HashSet<ValueId> = HashSet::new();
+    for id in &order {
+        match f.instructions.get(id) {
+            Some(Inst::Load { ptr, .. }) if is_slot(ptr) => { loaded.insert(*id, *ptr); }
+            Some(Inst::Store { ptr, value, .. }) if is_slot(ptr) => {
+                if is_new(f, value) {
+                    written.insert(*ptr);
+                    stored_in.insert(*value, *ptr);
+                } else {
+                    bad.insert(*ptr);
+                }
+            }
+            _ => {}
+        }
+    }
+    for id in &order {
+        let Some(inst) = f.instructions.get(id) else { continue; };
+        let mut ops = Vec::new();
+        crate::pe::inst_operands(inst, &mut ops);
+        let own_load = matches!(inst, Inst::Load { ptr, .. } if is_slot(ptr));
+        let own_store = matches!(inst, Inst::Store { ptr, .. } if is_slot(ptr));
+        for op in ops {
+            let is_target = (own_load || own_store) && matches!(inst,
+                Inst::Load { ptr, .. } | Inst::Store { ptr, .. } if *ptr == op);
+            if is_slot(&op) && !is_target {
+                bad.insert(op);
+            }
+            if let Some(slot) = loaded.get(&op) {
+                let local = match inst {
+                    Inst::Call { func, args, .. } => VEC_LOCAL_CALLS.contains(&func.as_str())
+                        && args.len() >= 2 && args[1] == op && !args[2..].contains(&op),
+                    Inst::Print { .. } => true,
+                    _ => false,
+                };
+                if !local {
+                    bad.insert(*slot);
+                }
+            }
+            if let Some(slot) = stored_in.get(&op) {
+                if !own_store {
+                    bad.insert(*slot);
+                }
+            }
+        }
+    }
+    let kept: Vec<ValueId> = slots.iter().copied().filter(|s| written.contains(s) && !bad.contains(s)).collect();
+    if kept.is_empty() {
+        return;
+    }
+    // The Vec a slot last held, kept apart from the slot: an Alloca in a
+    // loop body zeroes the slot at each iteration.
+    let mut shadows: HashMap<ValueId, ValueId> = HashMap::new();
+    let mut prologue: Vec<ValueId> = Vec::new();
+    for s in &kept {
+        let zero = detached_inst(f, Inst::ConstInt { value: 0, ty: IrType::I64 });
+        let shadow = detached_inst(f, Inst::Alloca { ty: IrType::I64, region: Region::Stack });
+        let init = detached_inst(f, Inst::Store { ptr: shadow, value: zero, store_ty: None });
+        prologue.extend([zero, shadow, init]);
+        shadows.insert(*s, shadow);
+    }
+    for b in 0..f.blocks.len() {
+        let old = std::mem::take(&mut f.blocks[b].instructions);
+        let mut new = if b == 0 { std::mem::take(&mut prologue) } else { Vec::new() };
+        for id in old {
+            let inst = f.instructions.get(&id).cloned();
+            match inst {
+                Some(Inst::Store { ptr, value, .. }) if shadows.contains_key(&ptr) => {
+                    let shadow = shadows[&ptr];
+                    drop_shadow(f, shadow, &mut new);
+                    new.push(id);
+                    new.push(detached_inst(f, Inst::Store { ptr: shadow, value, store_ty: None }));
+                }
+                Some(Inst::Return { .. }) => {
+                    for s in &kept {
+                        drop_shadow(f, shadows[s], &mut new);
+                    }
+                    new.push(id);
+                }
+                _ => new.push(id),
+            }
+        }
+        f.blocks[b].instructions = new;
+    }
+}
+
+/// `Vec_drop(*shadow)`, appended to `out`.
+fn drop_shadow(f: &mut IrFunction, shadow: ValueId, out: &mut Vec<ValueId>) {
+    let old = detached_inst(f, Inst::Load { ptr: shadow, ty: IrType::I64 });
+    let env = detached_inst(f, Inst::ConstInt { value: 0, ty: IrType::I64 });
+    let mut effects = EffectSet::new();
+    effects.add(Effect::Write);
+    effects.add(Effect::Alloc);
+    let call = detached_inst(f, Inst::Call {
+        func: "Vec_drop".to_string(),
+        args: vec![env, old],
+        ret_ty: IrType::Void,
+        effects,
+    });
+    out.extend([old, env, call]);
+}
+
+/// A new instruction not yet placed in a block.
+fn detached_inst(f: &mut IrFunction, inst: Inst) -> ValueId {
+    let id = f.emit(inst);
+    let last = (f.next_block - 1) as usize;
+    f.blocks[last].instructions.pop();
+    id
 }
 
 /// Convert an IrType back to an AST Type (for capture type lookup)

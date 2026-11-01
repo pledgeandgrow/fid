@@ -1742,17 +1742,74 @@ fn PeirGen_gen_panic_write(self: &mut PeirGen) -> void {
     PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, PIAT_WRITE_FILE));
 }
 
-/// p_malloc(rcx = size) -> rax = ptr — thread-safe bump allocator over 4 MB
-/// chunks, as in the C runtime arena.
-/// State: 32 bytes in writable .rdata at alloc_rdata_off:
-///   +0 cur (next free byte), +8 end (chunk end), +16 cached process heap,
-///   +24 grow spinlock (byte 0 of a qword).
-/// Fast path: align size to 16, `lock xadd [cur]`, bounds-check — no OS call.
+// Allocator state in writable .rdata: +0 cur, +8 end, +16 cached heap,
+// +24 spinlock, +32 the free list of each size class.
+pub const PEIR_ALLOC_STATE_SIZE: i64 = 200;
+const PEIR_ALLOC_LISTS: i64 = 32;
+// A block's header: this magic | its size class. p_free ignores a pointer
+// without it (a block freed twice).
+const PEIR_BLOCK_MAGIC: i64 = 0xF1DE5A0000000000;
+const PEIR_CLASS_LARGE: i64 = 63;
+
+/// Acquire the allocator's spinlock.
+fn PeirGen_gen_alloc_lock(self: &mut PeirGen, abase: i64) -> void {
+    var retry: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var acquired: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirEnc_place_label(&mut self.enc, retry);
+    // lock bts qword [rip + abase+24], 0 → jnc = acquired
+    PeirEnc_emit_u8(&mut self.enc, 0xF0);
+    PeirEnc_emit_u8(&mut self.enc, 0x48);
+    PeirEnc_emit_u8(&mut self.enc, 0x0F);
+    PeirEnc_emit_u8(&mut self.enc, 0xBA);
+    PeirEnc_emit_u8(&mut self.enc, 0x2D); // mod=00 reg=101 rm=101 → [rip]+/5
+    self.enc.pending_rip_refs.push(PeirRipRef_new(self.enc.code.len(), abase + 24));
+    PeirEnc_emit_i32(&mut self.enc, 0);
+    PeirEnc_emit_u8(&mut self.enc, 0x00); // imm8 = bit 0
+    PeirEnc_jcc_label(&mut self.enc, 0x3, acquired); // jnc
+    PeirEnc_emit_u8(&mut self.enc, 0xF3); // pause
+    PeirEnc_emit_u8(&mut self.enc, 0x90);
+    PeirEnc_jmp_label(&mut self.enc, retry);
+    PeirEnc_place_label(&mut self.enc, acquired);
+}
+
+/// Release the allocator's spinlock.
+fn PeirGen_gen_alloc_unlock(self: &mut PeirGen, abase: i64) -> void {
+    PeirEnc_emit_u8(&mut self.enc, 0xC6);
+    PeirEnc_emit_u8(&mut self.enc, 0x05);
+    self.enc.pending_rip_refs.push(PeirRipRef_new(self.enc.code.len(), abase + 24));
+    PeirEnc_emit_i32(&mut self.enc, 0);
+    PeirEnc_emit_u8(&mut self.enc, 0x00);
+}
+
+/// r9 = address of the free list of class r13 (clobbers rax).
+fn PeirGen_gen_free_list_addr(self: &mut PeirGen, abase: i64) -> void {
+    PeirEnc_lea_rip(&mut self.enc, PEIR_R9, abase + PEIR_ALLOC_LISTS);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R13);
+    PeirEnc_shl_r_i8(&mut self.enc, PEIR_RAX, 3);
+    PeirEnc_add_rr(&mut self.enc, PEIR_R9, PEIR_RAX);
+}
+
+/// rax = the process heap, cached at abase+16.
+fn PeirGen_gen_process_heap(self: &mut PeirGen, abase: i64) -> void {
+    var have_heap: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirEnc_mov_reg_rip(&mut self.enc, PEIR_RAX, abase + 16);
+    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x5, have_heap); // jnz
+    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+    PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, PIAT_GET_PROCESS_HEAP));
+    PeirEnc_add_rsp_i32(&mut self.enc, 32);
+    PeirEnc_mov_rip_reg(&mut self.enc, abase + 16, PEIR_RAX);
+    PeirEnc_place_label(&mut self.enc, have_heap);
+}
+
+/// p_malloc(rcx = size) -> rax = ptr. Power-of-two blocks up to 1 MB, as in
+/// the C runtime: an 8-byte header, reused through free lists, refilled by a
+/// thread-safe bump allocator over 4 MB chunks. Larger blocks are HeapAlloc's.
+/// Bump fast path: `lock xadd [cur]`, bounds-check — no OS call.
 ///   An overflowing xadd only wastes tail bytes of a dead chunk; the retry
 ///   lands on the live chunk.
 /// Slow path: under the spinlock, HeapAlloc(max(size, 4 MB)) becomes the new
 ///   chunk; contenders that arrive after the swap see cur < end and retry.
-/// p_free is a no-op: chunks are never released (as in the C runtime).
 pub fn PeirGen_gen_malloc(self: &mut PeirGen) -> void {
     var label: i64 = HashMap_get(self.func_labels, "p_malloc");
     PeirEnc_place_label(&mut self.enc, label);
@@ -1767,19 +1824,94 @@ pub fn PeirGen_gen_malloc(self: &mut PeirGen) -> void {
         var acquired: i64 = PeirEnc_alloc_label(&mut self.enc);
         var need_chunk: i64 = PeirEnc_alloc_label(&mut self.enc);
         var have_sz: i64 = PeirEnc_alloc_label(&mut self.enc);
-        var have_heap: i64 = PeirEnc_alloc_label(&mut self.enc);
         var oom: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var large: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var class_ok: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var empty: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var bumped: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var no_memory: i64 = PeirEnc_alloc_label(&mut self.enc);
 
         PeirEnc_push(&mut self.enc, PEIR_RBP);
         PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
         PeirEnc_push(&mut self.enc, PEIR_R12);
         PeirEnc_push(&mut self.enc, PEIR_R13);
 
-        // r12 = (size + 15) & ~15
+        // r12 = size + header; over 1 MB is a large block
         PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RCX);
-        PeirEnc_add_r_i8(&mut self.enc, PEIR_R12, 15);
-        PeirEnc_mov_imm64(&mut self.enc, PEIR_R13, -16);
-        PeirEnc_and_rr(&mut self.enc, PEIR_R12, PEIR_R13);
+        pe_emit4(&mut self.enc, 0x49, 0x83, 0xC4, 0x08); // add r12, 8
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, 1 << 20);
+        PeirEnc_cmp_rr(&mut self.enc, PEIR_R12, PEIR_RAX);
+        PeirEnc_jcc_label(&mut self.enc, 0x7, large); // ja
+
+        // r13 = size class = max(4, bits(r12 - 1)); r12 = block size
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R12);
+        pe_emit3(&mut self.enc, 0x48, 0xFF, 0xC8); // dec rax
+        pe_emit4(&mut self.enc, 0x48, 0x0F, 0xBD, 0xC0); // bsr rax, rax
+        pe_emit3(&mut self.enc, 0x48, 0xFF, 0xC0); // inc rax
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, 4);
+        PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
+        PeirEnc_jcc_label(&mut self.enc, 0x3, class_ok); // jae
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
+        PeirEnc_place_label(&mut self.enc, class_ok);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_R13, PEIR_RAX);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_R12, 1);
+        PeirEnc_shl_cl(&mut self.enc, PEIR_R12);
+
+        // Pop this class's free list, under the spinlock. An unlocked look
+        // first: an allocate-only program never takes the lock, and a block
+        // freed just now by another thread is only found by the next call.
+        PeirGen_gen_free_list_addr(self, abase);
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RAX, PEIR_R9);
+        PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        PeirEnc_jcc_label(&mut self.enc, 0x4, fast); // jz
+        PeirGen_gen_alloc_lock(self, abase);
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RAX, PEIR_R9);
+        PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        PeirEnc_jcc_label(&mut self.enc, 0x4, empty); // jz
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RDX, PEIR_RAX);
+        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_R9, PEIR_RDX);
+        PeirGen_gen_alloc_unlock(self, abase);
+        // Restore the header, zero the payload (as fresh memory is)
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, PEIR_BLOCK_MAGIC);
+        PeirEnc_or_rr(&mut self.enc, PEIR_R8, PEIR_R13);
+        PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RAX, -8, PEIR_R8);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_R13, PEIR_RAX);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+        PeirEnc_xor_self(&mut self.enc, PEIR_RDX);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_R12);
+        pe_emit4(&mut self.enc, 0x49, 0x83, 0xE8, 0x08); // sub r8, 8
+        PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+        PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, pe_import_slot("memset")));
+        PeirEnc_add_rsp_i32(&mut self.enc, 32);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R13);
+        PeirEnc_pop(&mut self.enc, PEIR_R13);
+        PeirEnc_pop(&mut self.enc, PEIR_R12);
+        PeirEnc_pop(&mut self.enc, PEIR_RBP);
+        PeirEnc_ret(&mut self.enc);
+
+        // A large block: zeroed by the system heap
+        PeirEnc_place_label(&mut self.enc, large);
+        PeirGen_gen_process_heap(self, abase);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, 8); // HEAP_ZERO_MEMORY
+        PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_R12);
+        PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+        PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, PIAT_HEAP_ALLOC));
+        PeirEnc_add_rsp_i32(&mut self.enc, 32);
+        PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        PeirEnc_jcc_label(&mut self.enc, 0x4, no_memory); // jz
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, PEIR_BLOCK_MAGIC | PEIR_CLASS_LARGE);
+        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_R8);
+        pe_emit4(&mut self.enc, 0x48, 0x83, 0xC0, 0x08); // add rax, 8
+        PeirEnc_place_label(&mut self.enc, no_memory);
+        PeirEnc_pop(&mut self.enc, PEIR_R13);
+        PeirEnc_pop(&mut self.enc, PEIR_R12);
+        PeirEnc_pop(&mut self.enc, PEIR_RBP);
+        PeirEnc_ret(&mut self.enc);
+
+        PeirEnc_place_label(&mut self.enc, empty);
+        PeirGen_gen_alloc_unlock(self, abase);
 
         // --- Fast path: r8 = lock xadd [cur], r12 — atomic bump ---
         PeirEnc_place_label(&mut self.enc, fast);
@@ -1801,6 +1933,14 @@ pub fn PeirGen_gen_malloc(self: &mut PeirGen) -> void {
         PeirEnc_cmp_rr(&mut self.enc, PEIR_R9, PEIR_R10);
         PeirEnc_jcc_label(&mut self.enc, 0x7, grow); // ja: chunk full
         PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R8);
+
+        // A new block at rax: write its header. r12 is a power of two.
+        PeirEnc_place_label(&mut self.enc, bumped);
+        pe_emit4(&mut self.enc, 0x49, 0x0F, 0xBD, 0xD4); // bsr rdx, r12
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, PEIR_BLOCK_MAGIC);
+        PeirEnc_or_rr(&mut self.enc, PEIR_R8, PEIR_RDX);
+        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_R8);
+        pe_emit4(&mut self.enc, 0x48, 0x83, 0xC0, 0x08); // add rax, 8
         PeirEnc_pop(&mut self.enc, PEIR_R13);
         PeirEnc_pop(&mut self.enc, PEIR_R12);
         PeirEnc_pop(&mut self.enc, PEIR_RBP);
@@ -1849,15 +1989,7 @@ pub fn PeirGen_gen_malloc(self: &mut PeirGen) -> void {
         PeirEnc_mov_rr(&mut self.enc, PEIR_R13, PEIR_RAX);
         PeirEnc_place_label(&mut self.enc, have_sz);
 
-        // rax = cached heap handle; lazy-init via GetProcessHeap
-        PeirEnc_mov_reg_rip(&mut self.enc, PEIR_RAX, abase + 16);
-        PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
-        PeirEnc_jcc_label(&mut self.enc, 0x5, have_heap); // jnz
-        PeirEnc_sub_rsp_i32(&mut self.enc, 32);
-        PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, PIAT_GET_PROCESS_HEAP));
-        PeirEnc_add_rsp_i32(&mut self.enc, 32);
-        PeirEnc_mov_rip_reg(&mut self.enc, abase + 16, PEIR_RAX);
-        PeirEnc_place_label(&mut self.enc, have_heap);
+        PeirGen_gen_process_heap(self, abase);
 
         // rax = HeapAlloc(heap, 0, r13)
         PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
@@ -1881,10 +2013,7 @@ pub fn PeirGen_gen_malloc(self: &mut PeirGen) -> void {
         self.enc.pending_rip_refs.push(PeirRipRef_new(self.enc.code.len(), abase + 24));
         PeirEnc_emit_i32(&mut self.enc, 0);
         PeirEnc_emit_u8(&mut self.enc, 0x00);
-        PeirEnc_pop(&mut self.enc, PEIR_R13);
-        PeirEnc_pop(&mut self.enc, PEIR_R12);
-        PeirEnc_pop(&mut self.enc, PEIR_RBP);
-        PeirEnc_ret(&mut self.enc);
+        PeirEnc_jmp_label(&mut self.enc, bumped);
 
         // oom: release lock, return NULL (caller crashes on use, as before)
         PeirEnc_place_label(&mut self.enc, oom);
@@ -1900,8 +2029,8 @@ pub fn PeirGen_gen_malloc(self: &mut PeirGen) -> void {
     }
 }
 
-/// p_free(rcx = ptr) — no-op: the bump allocator reclaims nothing
-/// (frees release at process exit, as in the C runtime arena).
+/// p_free(rcx = ptr): back on its class's free list, or to the system heap
+/// when large. A pointer without the magic is ignored.
 pub fn PeirGen_gen_free(self: &mut PeirGen) -> void {
     var label: i64 = HashMap_get(self.func_labels, "p_free");
     PeirEnc_place_label(&mut self.enc, label);
@@ -1909,6 +2038,45 @@ pub fn PeirGen_gen_free(self: &mut PeirGen) -> void {
     if self.bare_mode {
         panic("pe_ir: bare mode not ported");
     } else {
+        var abase: i64 = self.alloc_rdata_off;
+        var out: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var large: i64 = PeirEnc_alloc_label(&mut self.enc);
+        PeirEnc_test_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
+        PeirEnc_jcc_label(&mut self.enc, 0x4, out); // jz
+        // rax = header; no magic: not a block, or already freed
+        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_RCX, -8);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
+        pe_emit2(&mut self.enc, 0x30, 0xD2); // xor dl, dl
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, PEIR_BLOCK_MAGIC);
+        PeirEnc_cmp_rr(&mut self.enc, PEIR_RDX, PEIR_R8);
+        PeirEnc_jcc_label(&mut self.enc, 0x5, out); // jne
+        PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        PeirEnc_xor_self(&mut self.enc, PEIR_RDX);
+        PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RCX, -8, PEIR_RDX);
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, PEIR_CLASS_LARGE);
+        PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
+        PeirEnc_jcc_label(&mut self.enc, 0x4, large); // je
+        // Push on the class's free list, under the spinlock
+        PeirGen_gen_alloc_lock(self, abase);
+        PeirEnc_lea_rip(&mut self.enc, PEIR_R9, abase + PEIR_ALLOC_LISTS);
+        PeirEnc_shl_r_i8(&mut self.enc, PEIR_RAX, 3);
+        PeirEnc_add_rr(&mut self.enc, PEIR_R9, PEIR_RAX);
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RDX, PEIR_R9);
+        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RCX, PEIR_RDX);
+        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_R9, PEIR_RCX);
+        PeirGen_gen_alloc_unlock(self, abase);
+        PeirEnc_place_label(&mut self.enc, out);
+        PeirEnc_ret(&mut self.enc);
+
+        // A large block goes back to the system heap
+        PeirEnc_place_label(&mut self.enc, large);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_RCX);
+        pe_emit4(&mut self.enc, 0x49, 0x83, 0xE8, 0x08); // sub r8, 8
+        PeirEnc_mov_reg_rip(&mut self.enc, PEIR_RCX, abase + 16);
+        PeirEnc_xor_self(&mut self.enc, PEIR_RDX);
+        PeirEnc_sub_rsp_i32(&mut self.enc, 40);
+        PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, PIAT_HEAP_FREE));
+        PeirEnc_add_rsp_i32(&mut self.enc, 40);
         PeirEnc_ret(&mut self.enc);
     }
 }

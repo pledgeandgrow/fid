@@ -2082,6 +2082,15 @@ fn int_cmp_cc(op: &BinOp, unsigned: bool) -> Option<u8> {
     }
 }
 
+/// Allocator state in writable .rdata: +0 cur, +8 end, +16 cached heap,
+/// +24 spinlock, +32 the free list of each size class.
+const ALLOC_STATE_SIZE: usize = 32 + 8 * 21;
+const ALLOC_LISTS: usize = 32;
+/// A block's header: this magic | its size class. p_free ignores a pointer
+/// without it (a block freed twice).
+const BLOCK_MAGIC: u64 = 0xF1DE5A0000000000;
+const CLASS_LARGE: u64 = 63;
+
 /// The messages of the arithmetic panics, one shared stub each.
 const ARITH_PANICS: [&str; 7] = [
     "Integer overflow on addition",
@@ -2254,7 +2263,7 @@ impl PeCodeGen {
         // .rdata — +0 chunk cursor, +8 chunk end, +16 cached process-heap
         // handle, +24 grow spinlock.
         self.alloc_rdata_off = rdata.data.len();
-        rdata.data.extend_from_slice(&[0u8; 32]);
+        rdata.data.extend_from_slice(&[0u8; ALLOC_STATE_SIZE]);
 
         // 3. Pre-allocate labels for all functions (sorted for deterministic layout)
         let mut func_names: Vec<String> = module.functions.keys().cloned().collect();
@@ -6364,12 +6373,13 @@ impl PeCodeGen {
             self.enc.pop(Reg::R12);
             self.enc.ret();
         } else {
-            // Thread-safe bump allocator over 4 MB chunks (as in the C
-            // runtime arena). State: 32 bytes in writable .rdata at
-            // alloc_rdata_off — +0 cur, +8 end, +16 cached heap, +24 spinlock.
-            // Fast path: `lock xadd [cur]`; overflow only wastes tail bytes of
-            // a dead chunk and the retry lands on the live one.
-            // Slow path: under the spinlock, HeapAlloc(max(size, 4 MB)).
+            // Power-of-two blocks up to 1 MB, as in the C runtime: an 8-byte
+            // header (BLOCK_MAGIC | class), reused through free lists, refilled
+            // by a thread-safe bump allocator over 4 MB chunks. Larger blocks
+            // are HeapAlloc's. State at alloc_rdata_off: see ALLOC_STATE_SIZE.
+            // Bump fast path: `lock xadd [cur]`; overflow only wastes tail
+            // bytes of a dead chunk and the retry lands on the live one.
+            // Bump slow path: under the spinlock, HeapAlloc(max(size, 4 MB)).
             let abase = self.alloc_rdata_off;
             let fast = self.enc.alloc_label();
             let grow = self.enc.alloc_label();
@@ -6377,7 +6387,6 @@ impl PeCodeGen {
             let acquired = self.enc.alloc_label();
             let need_chunk = self.enc.alloc_label();
             let have_sz = self.enc.alloc_label();
-            let have_heap = self.enc.alloc_label();
             let oom = self.enc.alloc_label();
 
             self.enc.push(Reg::Rbp);
@@ -6385,10 +6394,87 @@ impl PeCodeGen {
             self.enc.push(Reg::R12);
             self.enc.push(Reg::R13);
 
-            // r12 = (size + 15) & ~15
+            // r12 = size + header; over 1 MB is a large block
+            let large = self.enc.alloc_label();
+            let class_ok = self.enc.alloc_label();
+            let empty = self.enc.alloc_label();
+            let bumped = self.enc.alloc_label();
             self.enc.mov_rr(Reg::R12, Reg::Rcx);
-            self.enc.emit(&[0x49, 0x83, 0xC4, 0x0F]); // add r12, 15
-            self.enc.emit(&[0x49, 0x83, 0xE4, 0xF0]); // and r12, -16
+            self.enc.emit(&[0x49, 0x83, 0xC4, 0x08]); // add r12, 8
+            self.enc.mov_imm64(Reg::Rax, 1 << 20);
+            self.enc.cmp_rr(Reg::R12, Reg::Rax);
+            self.enc.jcc_label(0x7, large); // ja
+
+            // r13 = size class = max(4, bits(r12 - 1)); r12 = block size
+            self.enc.mov_rr(Reg::Rax, Reg::R12);
+            self.enc.emit(&[0x48, 0xFF, 0xC8]); // dec rax
+            self.enc.emit(&[0x48, 0x0F, 0xBD, 0xC0]); // bsr rax, rax
+            self.enc.emit(&[0x48, 0xFF, 0xC0]); // inc rax
+            self.enc.mov_imm64(Reg::Rdx, 4);
+            self.enc.cmp_rr(Reg::Rax, Reg::Rdx);
+            self.enc.jcc_label(0x3, class_ok); // jae
+            self.enc.mov_rr(Reg::Rax, Reg::Rdx);
+            self.enc.place_label(class_ok);
+            self.enc.mov_rr(Reg::R13, Reg::Rax);
+            self.enc.mov_rr(Reg::Rcx, Reg::Rax);
+            self.enc.mov_imm64(Reg::R12, 1);
+            self.enc.shl_cl(Reg::R12);
+
+            // Pop this class's free list, under the spinlock. An unlocked look
+            // first: an allocate-only program never takes the lock, and a block
+            // freed just now by another thread is only found by the next call.
+            self.gen_free_list_addr(abase);
+            self.enc.mov_reg_ptr(Reg::Rax, Reg::R9);
+            self.enc.test_rr(Reg::Rax, Reg::Rax);
+            self.enc.jcc_label(0x4, fast); // jz
+            self.gen_alloc_lock(abase);
+            self.enc.mov_reg_ptr(Reg::Rax, Reg::R9);
+            self.enc.test_rr(Reg::Rax, Reg::Rax);
+            self.enc.jcc_label(0x4, empty); // jz
+            self.enc.mov_reg_ptr(Reg::Rdx, Reg::Rax);
+            self.enc.mov_ptr_reg(Reg::R9, Reg::Rdx);
+            self.gen_alloc_unlock(abase);
+            // Restore the header, zero the payload (as fresh memory is)
+            self.enc.mov_imm64(Reg::R8, BLOCK_MAGIC);
+            self.enc.or_rr(Reg::R8, Reg::R13);
+            self.enc.mov_mem_disp_reg(Reg::Rax, -8, Reg::R8);
+            self.enc.mov_rr(Reg::R13, Reg::Rax);
+            self.enc.mov_rr(Reg::Rcx, Reg::Rax);
+            self.enc.xor_self(Reg::Rdx);
+            self.enc.mov_rr(Reg::R8, Reg::R12);
+            self.enc.emit(&[0x49, 0x83, 0xE8, 0x08]); // sub r8, 8
+            self.enc.sub_rsp_i32(32);
+            self.enc.call_rip(self.iat_off(import_slot("memset").unwrap()));
+            self.enc.add_rsp_i32(32);
+            self.enc.mov_rr(Reg::Rax, Reg::R13);
+            self.enc.pop(Reg::R13);
+            self.enc.pop(Reg::R12);
+            self.enc.pop(Reg::Rbp);
+            self.enc.ret();
+
+            // A large block: zeroed by the system heap
+            self.enc.place_label(large);
+            self.gen_process_heap(abase);
+            self.enc.mov_rr(Reg::Rcx, Reg::Rax);
+            self.enc.mov_imm64(Reg::Rdx, 8); // HEAP_ZERO_MEMORY
+            self.enc.mov_rr(Reg::R8, Reg::R12);
+            self.enc.sub_rsp_i32(32);
+            self.enc.call_rip(self.iat_off(IAT_HEAP_ALLOC));
+            self.enc.add_rsp_i32(32);
+            let no_memory = self.enc.alloc_label();
+            self.enc.test_rr(Reg::Rax, Reg::Rax);
+            self.enc.jcc_label(0x4, no_memory); // jz
+            self.enc.mov_imm64(Reg::R8, BLOCK_MAGIC | CLASS_LARGE);
+            self.enc.mov_ptr_reg(Reg::Rax, Reg::R8);
+            self.enc.emit(&[0x48, 0x83, 0xC0, 0x08]); // add rax, 8
+            self.enc.place_label(no_memory);
+            self.enc.pop(Reg::R13);
+            self.enc.pop(Reg::R12);
+            self.enc.pop(Reg::Rbp);
+            self.enc.ret();
+
+            self.enc.place_label(empty);
+            self.gen_alloc_unlock(abase);
 
             // --- Fast path: r8 = lock xadd [cur], r12 — atomic bump ---
             self.enc.place_label(fast);
@@ -6413,6 +6499,14 @@ impl PeCodeGen {
             self.enc.cmp_rr(Reg::R9, Reg::R10);
             self.enc.jcc_label(0x7, grow); // ja: chunk full
             self.enc.mov_rr(Reg::Rax, Reg::R8);
+
+            // A new block at rax: write its header. r12 is a power of two.
+            self.enc.place_label(bumped);
+            self.enc.emit(&[0x49, 0x0F, 0xBD, 0xD4]); // bsr rdx, r12
+            self.enc.mov_imm64(Reg::R8, BLOCK_MAGIC);
+            self.enc.or_rr(Reg::R8, Reg::Rdx);
+            self.enc.mov_ptr_reg(Reg::Rax, Reg::R8);
+            self.enc.emit(&[0x48, 0x83, 0xC0, 0x08]); // add rax, 8
             self.enc.pop(Reg::R13);
             self.enc.pop(Reg::R12);
             self.enc.pop(Reg::Rbp);
@@ -6466,15 +6560,7 @@ impl PeCodeGen {
             self.enc.mov_rr(Reg::R13, Reg::Rax);
             self.enc.place_label(have_sz);
 
-            // rax = cached heap handle; lazy-init via GetProcessHeap
-            self.enc.mov_reg_rip(Reg::Rax, abase + 16);
-            self.enc.test_rr(Reg::Rax, Reg::Rax);
-            self.enc.jcc_label(0x5, have_heap); // jnz
-            self.enc.sub_rsp_i32(32);
-            self.enc.call_rip(self.iat_off(IAT_GET_PROCESS_HEAP));
-            self.enc.add_rsp_i32(32);
-            self.enc.mov_rip_reg(abase + 16, Reg::Rax);
-            self.enc.place_label(have_heap);
+            self.gen_process_heap(abase);
 
             // rax = HeapAlloc(heap, 0, r13)
             self.enc.mov_rr(Reg::Rcx, Reg::Rax);
@@ -6501,10 +6587,7 @@ impl PeCodeGen {
             });
             self.enc.emit_i32(0);
             self.enc.emit_u8(0x00);
-            self.enc.pop(Reg::R13);
-            self.enc.pop(Reg::R12);
-            self.enc.pop(Reg::Rbp);
-            self.enc.ret();
+            self.enc.jmp_label(bumped);
 
             // oom: release lock, return NULL
             self.enc.place_label(oom);
@@ -6798,6 +6881,63 @@ impl PeCodeGen {
         }
     }
 
+    /// Acquire the allocator's spinlock.
+    fn gen_alloc_lock(&mut self, abase: usize) {
+        let retry = self.enc.alloc_label();
+        let acquired = self.enc.alloc_label();
+        self.enc.place_label(retry);
+        // lock bts qword [rip + abase+24], 0 → jnc = acquired
+        self.enc.emit_u8(0xF0);
+        self.enc.emit_u8(0x48);
+        self.enc.emit_u8(0x0F);
+        self.enc.emit_u8(0xBA);
+        self.enc.emit_u8(0x2D); // mod=00 reg=101 rm=101 → [rip]+/5
+        self.enc.pending_rip_refs.push(PendingRipRef {
+            code_offset: self.enc.code.len(),
+            rdata_offset: abase + 24,
+        });
+        self.enc.emit_i32(0);
+        self.enc.emit_u8(0x00); // imm8 = bit 0
+        self.enc.jcc_label(0x3, acquired); // jnc
+        self.enc.emit_u8(0xF3); // pause
+        self.enc.emit_u8(0x90);
+        self.enc.jmp_label(retry);
+        self.enc.place_label(acquired);
+    }
+
+    /// Release the allocator's spinlock.
+    fn gen_alloc_unlock(&mut self, abase: usize) {
+        self.enc.emit_u8(0xC6);
+        self.enc.emit_u8(0x05);
+        self.enc.pending_rip_refs.push(PendingRipRef {
+            code_offset: self.enc.code.len(),
+            rdata_offset: abase + 24,
+        });
+        self.enc.emit_i32(0);
+        self.enc.emit_u8(0x00);
+    }
+
+    /// r9 = address of the free list of class r13 (clobbers rax).
+    fn gen_free_list_addr(&mut self, abase: usize) {
+        self.enc.lea_rip(Reg::R9, abase + ALLOC_LISTS);
+        self.enc.mov_rr(Reg::Rax, Reg::R13);
+        self.enc.shl_r_i8(Reg::Rax, 3);
+        self.enc.add_rr(Reg::R9, Reg::Rax);
+    }
+
+    /// rax = the process heap, cached at abase+16.
+    fn gen_process_heap(&mut self, abase: usize) {
+        let have_heap = self.enc.alloc_label();
+        self.enc.mov_reg_rip(Reg::Rax, abase + 16);
+        self.enc.test_rr(Reg::Rax, Reg::Rax);
+        self.enc.jcc_label(0x5, have_heap); // jnz
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_rip(self.iat_off(IAT_GET_PROCESS_HEAP));
+        self.enc.add_rsp_i32(32);
+        self.enc.mov_rip_reg(abase + 16, Reg::Rax);
+        self.enc.place_label(have_heap);
+    }
+
     fn gen_free(&mut self) {
         let label = *self.func_labels.get("p_free").unwrap();
         self.enc.place_label(label);
@@ -6806,8 +6946,45 @@ impl PeCodeGen {
             // Bare-metal: no-op (bump allocator doesn't support freeing)
             self.enc.ret();
         } else {
-            // no-op: the bump allocator reclaims nothing (frees release at
-            // process exit, as in the C runtime arena)
+            let abase = self.alloc_rdata_off;
+            let out = self.enc.alloc_label();
+            let large = self.enc.alloc_label();
+            self.enc.test_rr(Reg::Rcx, Reg::Rcx);
+            self.enc.jcc_label(0x4, out); // jz
+            // rax = header; no magic: not a block, or already freed
+            self.enc.mov_reg_mem_disp(Reg::Rax, Reg::Rcx, -8);
+            self.enc.mov_rr(Reg::Rdx, Reg::Rax);
+            self.enc.emit(&[0x30, 0xD2]); // xor dl, dl
+            self.enc.mov_imm64(Reg::R8, BLOCK_MAGIC);
+            self.enc.cmp_rr(Reg::Rdx, Reg::R8);
+            self.enc.jcc_label(0x5, out); // jne
+            self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
+            self.enc.xor_self(Reg::Rdx);
+            self.enc.mov_mem_disp_reg(Reg::Rcx, -8, Reg::Rdx);
+            self.enc.mov_imm64(Reg::Rdx, CLASS_LARGE);
+            self.enc.cmp_rr(Reg::Rax, Reg::Rdx);
+            self.enc.jcc_label(0x4, large); // je
+            // Push on the class's free list, under the spinlock
+            self.gen_alloc_lock(abase);
+            self.enc.lea_rip(Reg::R9, abase + ALLOC_LISTS);
+            self.enc.shl_r_i8(Reg::Rax, 3);
+            self.enc.add_rr(Reg::R9, Reg::Rax);
+            self.enc.mov_reg_ptr(Reg::Rdx, Reg::R9);
+            self.enc.mov_ptr_reg(Reg::Rcx, Reg::Rdx);
+            self.enc.mov_ptr_reg(Reg::R9, Reg::Rcx);
+            self.gen_alloc_unlock(abase);
+            self.enc.place_label(out);
+            self.enc.ret();
+
+            // A large block goes back to the system heap
+            self.enc.place_label(large);
+            self.enc.mov_rr(Reg::R8, Reg::Rcx);
+            self.enc.emit(&[0x49, 0x83, 0xE8, 0x08]); // sub r8, 8
+            self.enc.mov_reg_rip(Reg::Rcx, abase + 16);
+            self.enc.xor_self(Reg::Rdx);
+            self.enc.sub_rsp_i32(40);
+            self.enc.call_rip(self.iat_off(IAT_HEAP_FREE));
+            self.enc.add_rsp_i32(40);
             self.enc.ret();
         }
     }
@@ -9729,7 +9906,7 @@ fn autograd_builtin(inst: &Inst) -> &'static str {
 /// runtime's `pert_X` for builtin `p_X` when the program has it.
 /// Append every ValueId `inst` reads to `out` (used by the slot-reuse
 /// analysis in gen_function — pe-roadmap items 84-85).
-fn inst_operands(inst: &Inst, out: &mut Vec<ValueId>) {
+pub fn inst_operands(inst: &Inst, out: &mut Vec<ValueId>) {
     match inst {
         Inst::BinOp { left, right, .. } => { out.push(*left); out.push(*right); }
         Inst::UnaryOp { operand, .. } => out.push(*operand),

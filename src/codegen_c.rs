@@ -2948,21 +2948,32 @@ impl CCodeGen {
         wln!(self, "    c->next = NULL;");
         wln!(self, "    return c;");
         wln!(self, "}");
+        // Blocks: an 8-byte header (P_BLOCK_MAGIC | size class) and the payload.
+        // Classes are powers of two up to 1 MB, refilled from the arena and
+        // reused through per-thread free lists; larger blocks go to malloc.
+        // A pointer without the magic (a block freed twice) is
+        // ignored by p_free. A reused block is zeroed, as fresh memory is.
+        wln!(self, "#define P_BLOCK_MAGIC 0xF1DE5A0000000000ULL");
+        wln!(self, "#define P_CLASS_LARGE 63");
+        wln!(self, "static P_THREAD_LOCAL uint64_t* __p_free_lists[21];");
         wln!(self, "void* p_malloc(int64_t size) {");
         wln!(self, "    if (size < 0) { fprintf(stderr, \"p_malloc: negative size %lld\\n\", (long long)size); abort(); }");
-        wln!(self, "    size_t sz = (size_t)size;");
-        wln!(self, "    sz = (sz + 7) & ~((size_t)7);");
-        wln!(self, "    if (sz > __P_ARENA_CHUNK_SIZE) {");
-        wln!(self, "        __p_arena_chunk* c = (__p_arena_chunk*)malloc(sizeof(__p_arena_chunk));");
-        wln!(self, "        if (!c) { fprintf(stderr, \"p_malloc: OOM allocating chunk metadata (%zu bytes)\\n\", sz); abort(); }");
-        wln!(self, "        c->base = (char*)malloc(sz);");
-        wln!(self, "        if (!c->base) { free(c); fprintf(stderr, \"p_malloc: OOM allocating %zu bytes\\n\", sz); abort(); }");
-        wln!(self, "        c->ptr = c->base + sz;");
-        wln!(self, "        c->end = c->base + sz;");
-        wln!(self, "        c->next = NULL;");
-        wln!(self, "        if (__p_arena_cur) __p_arena_cur->next = c; else __p_arena_head = c;");
-        wln!(self, "        __p_arena_cur = c;");
-        wln!(self, "        return c->base;");
+        wln!(self, "    size_t total = (size_t)size + 8;");
+        wln!(self, "    if (total > ((size_t)1 << 20)) {");
+        wln!(self, "        uint64_t* big = (uint64_t*)calloc(1, total);");
+        wln!(self, "        if (!big) { fprintf(stderr, \"p_malloc: OOM allocating %zu bytes\\n\", total); abort(); }");
+        wln!(self, "        big[0] = P_BLOCK_MAGIC | P_CLASS_LARGE;");
+        wln!(self, "        return big + 1;");
+        wln!(self, "    }");
+        wln!(self, "    int k = 4;");
+        wln!(self, "    while (((size_t)1 << k) < total) k++;");
+        wln!(self, "    size_t sz = (size_t)1 << k;");
+        wln!(self, "    uint64_t* reused = __p_free_lists[k];");
+        wln!(self, "    if (reused) {");
+        wln!(self, "        __p_free_lists[k] = (uint64_t*)reused[0];");
+        wln!(self, "        memset(reused, 0, sz - 8);");
+        wln!(self, "        reused[-1] = P_BLOCK_MAGIC | (uint64_t)k;");
+        wln!(self, "        return reused;");
         wln!(self, "    }");
         wln!(self, "    if (!__p_arena_cur) { __p_arena_cur = __p_arena_new_chunk(); __p_arena_head = __p_arena_cur; }");
         wln!(self, "    if (!__p_arena_cur) { fprintf(stderr, \"p_malloc: OOM — failed to create first arena chunk\\n\"); abort(); }");
@@ -2972,16 +2983,27 @@ impl CCodeGen {
         wln!(self, "        __p_arena_cur->next = nc;");
         wln!(self, "        __p_arena_cur = nc;");
         wln!(self, "    }");
-        wln!(self, "    void* result = __p_arena_cur->ptr;");
+        wln!(self, "    uint64_t* block = (uint64_t*)__p_arena_cur->ptr;");
         wln!(self, "    __p_arena_cur->ptr += sz;");
-        wln!(self, "    return result;");
+        wln!(self, "    block[0] = P_BLOCK_MAGIC | (uint64_t)k;");
+        wln!(self, "    return block + 1;");
         wln!(self, "}");
         wln!(self, "void* p_malloc_persistent(int64_t size) { if (size < 0) return NULL; return malloc((size_t)size); }");
         wln!(self, "void* p_alloc(int64_t size) { return p_malloc(size); }");
         // Note: p_alloc is also forward-declared as int64_t p_alloc(int64_t) from
         // the fn_param_types table. TCC treats void* and int64_t as compatible
         // pointer-sized types, but to be safe we match the forward declaration.
-        wln!(self, "void p_free(void* ptr) { /* arena memory — no individual frees */ }");
+        wln!(self, "void p_free(void* ptr) {");
+        wln!(self, "    if (!ptr) return;");
+        wln!(self, "    uint64_t* b = (uint64_t*)ptr;");
+        wln!(self, "    uint64_t h = b[-1];");
+        wln!(self, "    if ((h & ~(uint64_t)0xFF) != P_BLOCK_MAGIC) return;");
+        wln!(self, "    b[-1] = 0;");
+        wln!(self, "    int k = (int)(h & 0xFF);");
+        wln!(self, "    if (k == P_CLASS_LARGE) { free(b - 1); return; }");
+        wln!(self, "    b[0] = (uint64_t)__p_free_lists[k];");
+        wln!(self, "    __p_free_lists[k] = b;");
+        wln!(self, "}");
         // stdlib regions allocate from the arena, so it releases them too.
         wln!(self, "void p_region_free(void* region) { (void)region; }");
         wln!(self, "void p_memset(void* ptr, int val, int64_t size) { if (ptr && size > 0) memset(ptr, val, (size_t)size); }");
@@ -3016,6 +3038,8 @@ impl CCodeGen {
         wln!(self, "    return 0;");
         wln!(self, "}");
         wln!(self, "void p_arena_restore(int64_t mark) {");
+        // Blocks past the mark may sit in the free lists: drop those lists.
+        wln!(self, "    memset(__p_free_lists, 0, sizeof(__p_free_lists));");
         wln!(self, "    int64_t idx = mark >> 32, off = mark & 0xffffffffLL, i = 0;");
         wln!(self, "    __p_arena_chunk* keep = __p_arena_head;");
         wln!(self, "    if (!keep) return;");
