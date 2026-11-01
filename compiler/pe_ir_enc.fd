@@ -509,8 +509,29 @@ pub fn PeirEnc_mov_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
     PeirEnc_modrm_rr(self, src, dst);
 }
 
+// A frame offset at or above this names register peir_value_reg(offset -
+// PEIR_REG_SLOT). Values are read and written through mov_reg_mem_rbp and
+// mov_mem_rbp_reg, so every instruction works on a register value unchanged;
+// anything else that takes an offset must not get one (emit_mem_rbp panics).
+pub const PEIR_REG_SLOT: i64 = 0x7F000000;
+pub const PEIR_VALUE_REGS: i64 = 7;
+
+/// The callee-saved registers that hold values instead of stack slots.
+pub fn peir_value_reg(i: i64) -> i64 {
+    if i == 0 { return PEIR_RBX; }
+    if i == 1 { return PEIR_RSI; }
+    if i == 2 { return PEIR_RDI; }
+    return PEIR_R12 + i - 3;
+}
+
 /// mov r64, [rbp + disp]
 pub fn PeirEnc_mov_reg_mem_rbp(self: &mut PeirEnc, dst: i64, disp: i64) -> void {
+    if disp >= PEIR_REG_SLOT {
+        self.last_store_end = -1;
+        var src: i64 = peir_value_reg(disp - PEIR_REG_SLOT);
+        if dst != src { PeirEnc_mov_rr(self, dst, src); }
+        return;
+    }
     if self.last_store_end == self.code.len() && disp == self.last_store_disp {
         // The slot was just written from a register and nothing was emitted
         // since — forward the register, skip the reload.
@@ -528,6 +549,10 @@ pub fn PeirEnc_mov_reg_mem_rbp(self: &mut PeirEnc, dst: i64, disp: i64) -> void 
 
 /// mov [rbp + disp], r64
 pub fn PeirEnc_mov_mem_rbp_reg(self: &mut PeirEnc, disp: i64, src: i64) -> void {
+    if disp >= PEIR_REG_SLOT {
+        PeirEnc_mov_rr(self, peir_value_reg(disp - PEIR_REG_SLOT), src);
+        return;
+    }
     PeirEnc_rex(self, true, reg_ext(src), false, false);
     self.code.push(0x89);
     PeirEnc_emit_mem_rbp(self, peir_reg_code(src), disp);
@@ -540,6 +565,7 @@ pub fn PeirEnc_mov_mem_rbp_reg(self: &mut PeirEnc, disp: i64, src: i64) -> void 
 /// For RBP base: mod=01 for disp8, mod=10 for disp32
 /// RBP with mod=00 means RIP-relative, so we always need a displacement.
 pub fn PeirEnc_emit_mem_rbp(self: &mut PeirEnc, regc: i64, disp: i64) -> void {
+    if disp >= PEIR_REG_SLOT { panic("pe_ir: a register value used as memory"); }
     if disp == 0 {
         // RBP with mod=00 is RIP-relative, so we must use disp8=0
         PeirEnc_modrm(self, 1, regc, 5); // RBP = 5

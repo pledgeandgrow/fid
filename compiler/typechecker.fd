@@ -729,6 +729,13 @@ pub struct TypeChecker {
     scope_linear_vars: Vec<LinearVarStack>,
     loop_depth: i64,
     unsafe_depth: i64,
+    // The function being checked, the functions started on another thread,
+    // and each write to a global in the program (three parallel lists)
+    checking_fn: str,
+    thread_entries: Vec<str>,
+    write_funcs: Vec<str>,
+    write_globals: Vec<str>,
+    write_lines: Vec<i64>,
     uninit_vars: Vec<str>,
     current_line: i64,
     val_vars_per_scope: Vec<StrStack>,
@@ -870,6 +877,11 @@ impl TypeChecker {
             scope_linear_vars: Vec::new(),
             loop_depth: 0,
             unsafe_depth: 0,
+            checking_fn: "",
+            thread_entries: Vec::new(),
+            write_funcs: Vec::new(),
+            write_globals: Vec::new(),
+            write_lines: Vec::new(),
             uninit_vars: Vec::new(),
             current_line: 0,
             val_vars_per_scope: Vec::new(),
@@ -1560,6 +1572,66 @@ pub fn TypeChecker_check_bodies(self: &mut TypeChecker, program: Program) {
         tii = tii + 1;
     }
     TypeChecker_verify_method_calls(self, program);
+    TypeChecker_verify_no_races(self, program);
+}
+
+fn tc_find_func(program: Program, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < program.funcs.len() {
+        if program.funcs.get(i).name == name { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// src/typechecker.rs verify_no_races: a function that runs on another thread
+/// may not write a global of the program unless it takes a lock.
+fn TypeChecker_verify_no_races(self: &mut TypeChecker, program: Program) {
+    if self.thread_entries.len() == 0 || self.write_funcs.len() == 0 { return; }
+    var reached: Vec<str> = Vec::new();
+    var work: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < self.thread_entries.len() {
+        work.push(self.thread_entries.get(i));
+        i = i + 1;
+    }
+    while work.len() > 0 {
+        var name: str = work.pop();
+        if !str_vec_contains(reached, name) {
+            reached.push(name);
+            var at: i64 = tc_find_func(program, name);
+            if at >= 0 {
+                var called: Vec<str> = Vec::new();
+                TypeChecker_collect_called_funcs(self, program.funcs.get(at).body, called);
+                var c: i64 = 0;
+                while c < called.len() {
+                    work.push(called.get(c));
+                    c = c + 1;
+                }
+            }
+        }
+    }
+    i = 0;
+    while i < self.write_funcs.len() {
+        var func: str = self.write_funcs.get(i);
+        if str_vec_contains(reached, func) {
+            var called: Vec<str> = Vec::new();
+            var at: i64 = tc_find_func(program, func);
+            if at >= 0 { TypeChecker_collect_called_funcs(self, program.funcs.get(at).body, called); }
+            var locked: bool = false;
+            var c: i64 = 0;
+            while c < called.len() {
+                if str_ends_with(called.get(c), "mutex_lock") || str_ends_with(called.get(c), "write_lock") { locked = true; }
+                c = c + 1;
+            }
+            if !locked {
+                self.errors.push("Race error (line " + int_to_str(self.write_lines.get(i)) + "): '" + func
+                    + "' runs on another thread and writes the global '" + self.write_globals.get(i)
+                    + "' with no lock.\n    Fix: hold a mutex around the write, or use p_shared_alloc and the p_atomic_ functions.");
+            }
+        }
+        i = i + 1;
+    }
 }
 
 // `name` is declared with `val` in the innermost scope that declares it.
@@ -5138,7 +5210,21 @@ pub fn TypeChecker_verify_allocator_params(self: &mut TypeChecker, program: Prog
 
 // --- check_func ----------------------------------------------------------
 
+/// `@unsafe fn` is one `unsafe` block around the whole body.
 pub fn TypeChecker_check_func(self: &mut TypeChecker, func: Func) {
+    var whole: bool = false;
+    var ai: i64 = 0;
+    while ai < func.annotations.len() {
+        if func.annotations.get(ai).name == "unsafe" { whole = true; }
+        ai = ai + 1;
+    }
+    self.checking_fn = func.name;
+    if whole { self.unsafe_depth = self.unsafe_depth + 1; }
+    TypeChecker_check_func_body(self, func);
+    if whole { self.unsafe_depth = self.unsafe_depth - 1; }
+}
+
+fn TypeChecker_check_func_body(self: &mut TypeChecker, func: Func) {
     self.current_func_name = OptString::Some(func.name);
     var empty_ret: Vec<Type> = Vec::new();
     self.current_return_types = empty_ret;
@@ -5869,6 +5955,114 @@ pub fn type_eq(a: Type, b: Type) -> bool {
 
 // --- types_compatible ----------------------------------------------------
 
+/// Raw memory is `unsafe` in the program itself. Imported modules are not
+/// checked yet: their `unsafe` blocks are not complete (roadmap M10).
+fn TypeChecker_require_unsafe(self: &mut TypeChecker, what: str) {
+    if self.current_module == "main" && self.unsafe_depth == 0 {
+        self.errors.push("Safety error (line " + int_to_str(self.current_line) + "): " + what + " needs an `unsafe` block.");
+    }
+}
+
+/// The bits of an integer type, 0 for anything else.
+fn tc_int_bits(ty: Type) -> i64 {
+    match ty {
+        Type::I8 => { return 8; }
+        Type::I16 => { return 16; }
+        Type::I32 => { return 32; }
+        Type::I64 => { return 64; }
+        Type::I128 => { return 128; }
+        Type::U8 => { return 8; }
+        Type::U16 => { return 16; }
+        Type::U32 => { return 32; }
+        Type::U64 => { return 64; }
+        Type::U128 => { return 128; }
+        _ => { return 0; }
+    }
+    return 0;
+}
+
+fn tc_int_signed(ty: Type) -> bool {
+    match ty {
+        Type::I8 => { return true; }
+        Type::I16 => { return true; }
+        Type::I32 => { return true; }
+        Type::I64 => { return true; }
+        Type::I128 => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+fn tc_is_constant_expr(expr: Expr) -> bool {
+    match expr {
+        Expr::IntLit(_) => { return true; }
+        Expr::Unary(_, e) => { return tc_is_constant_expr(box_expr_unbox(e)); }
+        Expr::Binary(_, l, r) => { return tc_is_constant_expr(box_expr_unbox(l)) && tc_is_constant_expr(box_expr_unbox(r)); }
+        _ => { return false; }
+    }
+    return false;
+}
+
+fn tc_literal_fits(v: i64, negative: bool, bits: i64, signed: bool) -> bool {
+    if negative {
+        return signed && (bits >= 64 || v <= (1 << (bits - 1)));
+    }
+    if bits >= 64 { return true; }
+    if signed { return v >= 0 && v < (1 << (bits - 1)); }
+    return v >= 0 && v < (1 << bits);
+}
+
+/// src/typechecker.rs check_value_fits: a value given to an integer type
+/// must fit it.
+fn TypeChecker_check_value_fits(self: &mut TypeChecker, declared0: Type, actual0: Type, expr: Expr, line: i64) {
+    var declared: Type = TypeChecker_resolve_type(self, declared0);
+    var bits: i64 = tc_int_bits(declared);
+    if bits == 0 { return; }
+    var signed: bool = tc_int_signed(declared);
+    var checked: bool = false;
+    var fits: bool = true;
+    match expr {
+        Expr::IntLit(v) => {
+            checked = true;
+            fits = tc_literal_fits(v, false, bits, signed);
+        }
+        Expr::Unary(op, e) => {
+            match op {
+                UnaryOp::Neg => {
+                    match box_expr_unbox(e) {
+                        Expr::IntLit(v) => {
+                            checked = true;
+                            fits = tc_literal_fits(v, true, bits, signed);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    if checked {
+        if !fits {
+            self.errors.push("Type error (line " + int_to_str(line) + "): the literal does not fit in " + type_to_str(declared) + ".");
+        }
+        return;
+    }
+    if self.current_module != "main" || tc_is_constant_expr(expr) { return; }
+    // `x & 0xFF`: the literal takes the other operand's type
+    match expr {
+        Expr::Binary(_, l, r) => {
+            if tc_is_constant_expr(box_expr_unbox(l)) || tc_is_constant_expr(box_expr_unbox(r)) { return; }
+        }
+        _ => {}
+    }
+    var actual: Type = TypeChecker_resolve_type(self, actual0);
+    if tc_int_bits(actual) > bits || TypeChecker_is_float(self, actual) {
+        self.errors.push("Type error (line " + int_to_str(line) + "): a " + type_to_str(actual) + " may not fit in "
+            + type_to_str(declared) + ".\n    Fix: convert it with `as " + type_to_str(declared) + "`.");
+    }
+}
+
 pub fn TypeChecker_types_compatible(self: &TypeChecker, declared: Type, actual: Type) -> bool {
     var decl: Type = TypeChecker_resolve_type(self, declared);
     var act: Type = TypeChecker_resolve_type(self, actual);
@@ -6518,12 +6712,20 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             var final_ty: Type = expr_ty;
             match ty {
                 OptType::Some(declared) => {
+                    TypeChecker_check_value_fits(self, declared, expr_ty, expr, line);
                     if !TypeChecker_types_compatible(self, declared, expr_ty) && !(is_runtime_layer(self.current_module) && is_handle_int_pair(declared, expr_ty)) {
                         self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign " + type_to_str(expr_ty) + " to variable '" + name + "' of type " + type_to_str(declared));
                     }
                     final_ty = declared;
                 }
-                OptType::None => { final_ty = expr_ty; }
+                OptType::None => {
+                    final_ty = expr_ty;
+                    // `var i = 0` is an i64: the literal's size says nothing
+                    // about what the variable will hold
+                    if tc_is_constant_expr(expr) && tc_int_bits(expr_ty) > 0 && tc_int_bits(expr_ty) < 64 {
+                        final_ty = Type::I64;
+                    }
+                }
             }
             // Track val (immutable) bindings. A `var` of the same name is
             // recorded as `!name`: it shadows an outer `val`.
@@ -6671,7 +6873,22 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             self.uninit_vars = merged_uninit;
         }
         Stmt::Assign(target, _, expr, line) => {
-            TypeChecker_check_expr(self, expr);
+            var assigned_ty: Type = TypeChecker_check_expr(self, expr);
+            match TypeChecker_lookup(self, target) {
+                OptType::Some(target_ty) => { TypeChecker_check_value_fits(self, target_ty, assigned_ty, expr, line); }
+                OptType::None => {
+                    if self.current_module == "main" {
+                        match TypeChecker_lookup_global_cache(self, target) {
+                            OptType::Some(_) => {
+                                self.write_funcs.push(self.checking_fn);
+                                self.write_globals.push(target);
+                                self.write_lines.push(line);
+                            }
+                            OptType::None => {}
+                        }
+                    }
+                }
+            }
             TypeChecker_consume_linear_in_expr(self, expr, line);
             // Inline str_vec_remove to avoid &mut self.field issues
             var ri: i64 = 0;
@@ -6726,7 +6943,10 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             }
         }
         Stmt::DerefAssign(ptr_expr, _, expr, _) => {
-            TypeChecker_check_expr(self, ptr_expr);
+            match TypeChecker_check_expr(self, ptr_expr) {
+                Type::RawPtr(_, _) => { TypeChecker_require_unsafe(self, "writing through a raw pointer"); }
+                _ => {}
+            }
             TypeChecker_check_expr(self, expr);
         }
         Stmt::FieldAssign(object, field, op, expr, line) => {
@@ -7428,6 +7648,18 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             return ty;
         }
         Expr::Call(callee, args) => {
+            if callee == "p_thread_spawn" && args.len() > 0 {
+                match args.get(0) {
+                    Expr::StringLit(entry) => { self.thread_entries.push(entry); }
+                    _ => {}
+                }
+            }
+            if callee == "p_malloc" || callee == "p_alloc" || callee == "p_free" || callee == "p_realloc"
+                || callee == "p_memcpy" || callee == "p_memset" {
+                TypeChecker_require_unsafe(self, callee + "()");
+            } else if str_vec_contains(self.extern_fns, callee) && !str_starts_with(callee, "p_") {
+                TypeChecker_require_unsafe(self, "calling the C function " + callee + "()");
+            }
             // Check capabilities for built-in functions
             if callee == "print" || callee == "println" || callee == "print_int" || callee == "print_float" || callee == "print_str" {
                 TypeChecker_check_capability(self, "IO", callee + "()");
@@ -7867,7 +8099,11 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             var ty: Type = TypeChecker_check_expr(self, box_expr_unbox(e));
             match ty {
                 Type::Ref(inner, _) => { var t: Type = box_type_unbox(inner); return t; }
-                Type::RawPtr(inner, _) => { var t: Type = box_type_unbox(inner); return t; }
+                Type::RawPtr(inner, _) => {
+                    TypeChecker_require_unsafe(self, "reading through a raw pointer");
+                    var t: Type = box_type_unbox(inner);
+                    return t;
+                }
                 Type::Generic(gname, gargs) => {
                     if gname == "Box" && gargs.len() == 1 { return gargs.get(0); }
                     self.errors.push("Type error: cannot dereference non-reference type " + type_to_str(ty));
@@ -8092,6 +8328,10 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
         }
         Expr::Spawn(inner) => {
             var inner_ty: Type = TypeChecker_check_expr(self, box_expr_unbox(inner));
+            match box_expr_unbox(inner) {
+                Expr::Call(spawned, _) => { self.thread_entries.push(spawned); }
+                _ => {}
+            }
             // @send check: any variables captured in the spawn expression
             // must be @send (safe to send across threads).
             var cap_names: Vec<str> = Vec::new();

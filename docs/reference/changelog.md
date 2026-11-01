@@ -2,6 +2,24 @@
 
 ## Session 36 — One Integer Meaning, Sound Builds, a Real Allocator (Nov 1, 2026)
 
+- **Memory:** the compiler frees temporary strings and local strings that never
+  escape: 30M strings peak at 4 MB, down from 2.3 GB.
+- **Native speed:** the hottest locals and short-lived temporaries live in
+  callee-saved registers; division by a constant is a multiplication; Vec_set
+  and Vec_push are inlined; small constants are immediates.
+- **Safety rules:** raw pointers, raw allocation and C calls need `unsafe` or
+  `@unsafe fn` in the program itself; a literal must fit its type; a wider value
+  or a float needs `as`; a thread may not write a global without a lock.
+  `var i = 0` is an i64.
+- **Threads on the Windows C path are real.** They exposed atomics that were
+  neither atomic nor the right width: storing one task's done flag cleared the
+  next one's.
+- **`handle` gives a value** when it ends a function; it was dropped before.
+- **Tensor mean under `fid run`** divided by a float's bit pattern.
+- **Every expected-fail test names its error** (`// expect-error:`). Three were
+  failing for the wrong reason, and one did not exist.
+- **Linux:** `p_system` returned the raw wait status, `process_capture` read freed
+  text, `io_eprint` passed the number 2 as a `FILE*`.
 - **Bad frees stop the program:** p_free panics on a double free and on a pointer
   that is not a live block, on the interpreter and the C and native paths
   (release roadmap M3). It used to ignore both. This exposed a leak: shared slots

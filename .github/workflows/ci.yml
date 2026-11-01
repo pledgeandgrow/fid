@@ -2,8 +2,9 @@
 #
 # Windows runs the whole suite on all three backends (interpreter, C, native
 # PE) and proves the self-hosted compiler reproduces itself byte for byte.
-# Linux checks that the Rust compiler builds and that a program compiles
-# through C and runs (`fid` has no native Linux path yet).
+# Linux runs the suite through the interpreter and C, bootstraps `fid`, and
+# installs a release archive on a clean machine (`fid` has no native Linux
+# path yet, so `emit` output is checked but not run).
 
 name: CI
 
@@ -68,9 +69,20 @@ jobs:
           ./n2.exe emit compiler/main.fd -o n3.exe --no-cache
           cmp n2.exe n3.exe
 
+      - name: fid works from an installed location
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/fides/bin"
+          cp n3.exe "$RUNNER_TEMP/fides/bin/fid.exe"
+          cp -r stdlib "$RUNNER_TEMP/fides/"
+          cp tests/bootstrap/hello.fd "$RUNNER_TEMP/hello.fd"
+          cd "$RUNNER_TEMP"
+          ./fides/bin/fid.exe emit hello.fd -o hello.exe --no-cache
+          ./hello.exe
+
   linux:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 150
     env:
       CC: gcc
     steps:
@@ -89,7 +101,32 @@ jobs:
       - name: Unit tests
         run: cargo test --release --lib
 
-      - name: Compile and run a program through C
+      - name: Test suite (interpreter, C)
+        run: ./target/release/fidesc test --jobs 4
+
+      - name: Programs that must be rejected
+        run: ./target/release/fidesc test --fail
+
+      - name: Bootstrap fid on Linux
+        run: RELEASE=1 ./scripts/bootstrap.sh
+
+      - name: Package a release archive
         run: |
-          ./target/release/fidesc ccompile tests/bootstrap/hello.fd -o hello
-          ./hello
+          mkdir -p dist/fides/bin
+          cp release/fid dist/fides/bin/
+          cp -r stdlib dist/fides/
+          tar -czf dist/fides-linux-x64.tar.gz -C dist fides
+
+      - name: Install on a clean machine
+        run: |
+          cp tests/bootstrap/hello.fd dist/hello.fd
+          docker run --rm -v "$PWD/dist:/work" -w /work ubuntu:24.04 bash -c '
+            set -e
+            apt-get update -qq
+            apt-get install -y -qq gcc > /dev/null
+            mkdir /opt/fides
+            tar -xzf fides-linux-x64.tar.gz -C /opt
+            /opt/fides/bin/fid run hello.fd
+            CC=gcc /opt/fides/bin/fid ccompile hello.fd -o /tmp/hello
+            /tmp/hello
+          '

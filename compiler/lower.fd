@@ -468,6 +468,9 @@ pub struct Lowerer {
     pub current_captures: Vec<ClosureCapture>,
     pub try_stack: Vec<TryContext>,
     pub effect_handler_stack: Vec<Vec<EffectHandler>>,
+    // Where a `handle` ending this function leaves its value
+    pub handle_slot_fn: str,
+    pub handle_slot: i64,
     pub scope_executor_stack: Vec<i64>,
     pub current_line: OptU64,
     pub type_aliases: Vec<StringTypeEntry>,
@@ -522,6 +525,8 @@ pub fn Lowerer_new() -> Lowerer {
         current_captures: Vec::new(),
         try_stack: Vec::new(),
         effect_handler_stack: Vec::new(),
+        handle_slot_fn: "",
+        handle_slot: -1,
         scope_executor_stack: Vec::new(),
         current_line: OptU64::None,
         type_aliases: Vec::new(),
@@ -2244,6 +2249,7 @@ pub fn lower(program: Program) -> IrModule {
     var l: Lowerer = Lowerer_new();
     var module: IrModule = Lowerer_lower_program(&mut l, program);
     lw_auto_drop_vecs(&mut module);
+    lw_auto_drop_strs(&mut module);
     return module;
 }
 
@@ -2424,7 +2430,7 @@ fn lw_drop_function_vecs(f: &mut IrFunction) -> bool {
                         Inst::Store(ptr, value, _) => {
                             if is_slot.get(ptr) != 0 && shadows.get(ptr) != 0 {
                                 var shadow: i64 = shadows.get(ptr) - 1;
-                                lw_drop_shadow(f, shadow, fresh);
+                                lw_drop_shadow(f, "Vec_drop", shadow, fresh);
                                 fresh.push(id);
                                 fresh.push(lw_detached(f, Inst::Store(shadow, value, OptIrType::None)));
                                 done = true;
@@ -2433,7 +2439,7 @@ fn lw_drop_function_vecs(f: &mut IrFunction) -> bool {
                         Inst::Return(_) => {
                             var ki: i64 = 0;
                             while ki < kept.len() {
-                                lw_drop_shadow(f, shadows.get(kept.get(ki)) - 1, fresh);
+                                lw_drop_shadow(f, "Vec_drop", shadows.get(kept.get(ki)) - 1, fresh);
                                 ki = ki + 1;
                             }
                         }
@@ -2494,17 +2500,285 @@ fn lw_is_local_use(inst: Inst, op: i64) -> bool {
 }
 
 /// `Vec_drop(*shadow)`, appended to `out`.
-fn lw_drop_shadow(f: &mut IrFunction, shadow: i64, out: Vec<i64>) {
+/// src/lower.rs auto_drop_strs: free the strings that provably die where
+/// they are used. The worst case is a leak, never a dangling string.
+fn lw_auto_drop_strs(module: &mut IrModule) {
+    var has_drop: bool = false;
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        if module.functions.get(i).name == "Str_drop" { has_drop = true; }
+        i = i + 1;
+    }
+    if !has_drop { return; }
+    i = 0;
+    while i < module.functions.len() {
+        var entry: IrFunctionEntry = module.functions.get(i);
+        var func: IrFunction = entry.func;
+        if lw_drop_function_strs(&mut func) {
+            entry.func = func;
+            module.functions.set(i, entry);
+        }
+        i = i + 1;
+    }
+}
+
+fn lw_is_fresh_str(f: &IrFunction, id: i64) -> bool {
+    match IrFunction_get_inst(f, id) {
+        OptInst::Some(inst) => {
+            match inst {
+                Inst::Call(name, _, _, _) => { return name == "p_str_concat" || name == "int_to_str"; }
+                _ => { return false; }
+            }
+        }
+        OptInst::None => { return false; }
+    }
+}
+
+fn lw_is_const_str(f: &IrFunction, id: i64) -> bool {
+    match IrFunction_get_inst(f, id) {
+        OptInst::Some(inst) => {
+            match inst {
+                Inst::ConstStr(_) => { return true; }
+                _ => { return false; }
+            }
+        }
+        OptInst::None => { return false; }
+    }
+}
+
+fn lw_reads_str(inst: Inst) -> bool {
+    match inst {
+        Inst::Call(name, _, _, _) => {
+            return name == "p_str_concat" || name == "str_len" || name == "str_byte_at"
+                || name == "str_equal" || name == "str_starts_with" || name == "str_ends_with"
+                || name == "str_contains" || name == "str_find" || name == "str_parse_int";
+        }
+        Inst::Print(_, _) => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn lw_drop_function_strs(f: &mut IrFunction) -> bool {
+    var order: Vec<i64> = lw_block_order(f);
+    var i: i64 = 0;
+    var any: bool = false;
+    while i < order.len() && !any {
+        any = lw_is_fresh_str(f, order.get(i));
+        i = i + 1;
+    }
+    if !any { return false; }
+    var n: i64 = f.next_value;
+    // Per value: position + 1, block, use count, last user + 1, slot,
+    // loaded (slot + 1), and per slot: bad, written, last store position + 1
+    var pos: Vec<i64> = lw_zeros(n);
+    var block_of: Vec<i64> = lw_zeros(n);
+    var uses: Vec<i64> = lw_zeros(n);
+    var user: Vec<i64> = lw_zeros(n);
+    var is_slot: Vec<i64> = lw_zeros(n);
+    var loaded: Vec<i64> = lw_zeros(n);
+    var bad: Vec<i64> = lw_zeros(n);
+    var written: Vec<i64> = lw_zeros(n);
+    var last_store: Vec<i64> = lw_zeros(n);
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var ids: Vec<i64> = f.blocks.get(b).instructions;
+        var k: i64 = 0;
+        while k < ids.len() {
+            block_of.set(ids.get(k), b);
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    i = 0;
+    while i < order.len() {
+        var id: i64 = order.get(i);
+        pos.set(id, i + 1);
+        match IrFunction_get_inst(f, id) {
+            OptInst::Some(inst) => {
+                match inst {
+                    Inst::Alloca(_, _) => { is_slot.set(id, 1); }
+                    _ => {}
+                }
+                var ops: Vec<i64> = Vec::new();
+                peir_inst_operands(inst, &mut ops);
+                var o: i64 = 0;
+                while o < ops.len() {
+                    var op: i64 = ops.get(o);
+                    uses.set(op, uses.get(op) + 1);
+                    user.set(op, id + 1);
+                    o = o + 1;
+                }
+            }
+            OptInst::None => {}
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < order.len() {
+        var id: i64 = order.get(i);
+        match IrFunction_get_inst(f, id) {
+            OptInst::Some(inst) => {
+                var target: i64 = -1;
+                match inst {
+                    Inst::Load(ptr, _) => {
+                        if is_slot.get(ptr) != 0 {
+                            loaded.set(id, ptr + 1);
+                            target = ptr;
+                        }
+                    }
+                    Inst::Store(ptr, value, _) => {
+                        if is_slot.get(ptr) != 0 {
+                            target = ptr;
+                            if lw_is_fresh_str(f, value) && uses.get(value) == 1 {
+                                written.set(ptr, 1);
+                            } else if !lw_is_const_str(f, value) {
+                                bad.set(ptr, 1);
+                            }
+                            last_store.set(ptr, pos.get(id));
+                        }
+                    }
+                    _ => {}
+                }
+                var ops: Vec<i64> = Vec::new();
+                peir_inst_operands(inst, &mut ops);
+                var o: i64 = 0;
+                while o < ops.len() {
+                    var op: i64 = ops.get(o);
+                    if is_slot.get(op) != 0 && op != target { bad.set(op, 1); }
+                    if loaded.get(op) != 0 {
+                        var slot: i64 = loaded.get(op) - 1;
+                        // Read in the same block, before the slot is written again
+                        if !lw_reads_str(inst) || block_of.get(id) != block_of.get(op)
+                            || last_store.get(slot) > pos.get(op) {
+                            bad.set(slot, 1);
+                        }
+                    }
+                    o = o + 1;
+                }
+            }
+            OptInst::None => {}
+        }
+        i = i + 1;
+    }
+    var kept: Vec<i64> = Vec::new();
+    i = 0;
+    while i < order.len() {
+        var s: i64 = order.get(i);
+        if written.get(s) != 0 && bad.get(s) == 0 { kept.push(s); }
+        i = i + 1;
+    }
+    // Per user: the temporaries it is the last to read (value + 1)
+    var temp1: Vec<i64> = lw_zeros(n);
+    var temp2: Vec<i64> = lw_zeros(n);
+    var any_temp: bool = false;
+    i = 0;
+    while i < order.len() {
+        var id: i64 = order.get(i);
+        if lw_is_fresh_str(f, id) && uses.get(id) == 1 {
+            var u: i64 = user.get(id) - 1;
+            if block_of.get(u) == block_of.get(id) {
+                match IrFunction_get_inst(f, u) {
+                    OptInst::Some(inst) => {
+                        if lw_reads_str(inst) {
+                            if temp1.get(u) == 0 {
+                                temp1.set(u, id + 1);
+                                any_temp = true;
+                            } else if temp2.get(u) == 0 {
+                                temp2.set(u, id + 1);
+                            }
+                        }
+                    }
+                    OptInst::None => {}
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if kept.len() == 0 && !any_temp { return false; }
+    // The string a slot last held, kept apart from the slot, as for Vecs
+    var shadows: Vec<i64> = lw_zeros(n);
+    var prologue: Vec<i64> = Vec::new();
+    i = 0;
+    while i < kept.len() {
+        var zero: i64 = lw_detached(f, Inst::ConstInt(0, IrType::I64));
+        var shadow: i64 = lw_detached(f, Inst::Alloca(IrType::I64, Region::Stack));
+        var init: i64 = lw_detached(f, Inst::Store(shadow, zero, OptIrType::None));
+        prologue.push(zero);
+        prologue.push(shadow);
+        prologue.push(init);
+        shadows.set(kept.get(i), shadow + 1);
+        i = i + 1;
+    }
+    b = 0;
+    while b < f.blocks.len() {
+        var blk: BasicBlock = f.blocks.get(b);
+        var old: Vec<i64> = blk.instructions;
+        var fresh: Vec<i64> = Vec::new();
+        if b == 0 { fresh = prologue; }
+        var k: i64 = 0;
+        while k < old.len() {
+            var id: i64 = old.get(k);
+            var done: bool = false;
+            match IrFunction_get_inst(f, id) {
+                OptInst::Some(inst) => {
+                    match inst {
+                        Inst::Store(ptr, value, _) => {
+                            if shadows.get(ptr) != 0 {
+                                var shadow: i64 = shadows.get(ptr) - 1;
+                                lw_drop_shadow(f, "Str_drop", shadow, fresh);
+                                fresh.push(id);
+                                var held: i64 = value;
+                                if !lw_is_fresh_str(f, value) {
+                                    held = lw_detached(f, Inst::ConstInt(0, IrType::I64));
+                                    fresh.push(held);
+                                }
+                                fresh.push(lw_detached(f, Inst::Store(shadow, held, OptIrType::None)));
+                                done = true;
+                            }
+                        }
+                        Inst::Return(_) => {
+                            var ki: i64 = 0;
+                            while ki < kept.len() {
+                                lw_drop_shadow(f, "Str_drop", shadows.get(kept.get(ki)) - 1, fresh);
+                                ki = ki + 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                OptInst::None => {}
+            }
+            if !done {
+                fresh.push(id);
+                if id < n {
+                    if temp1.get(id) != 0 { lw_drop_value(f, "Str_drop", temp1.get(id) - 1, fresh); }
+                    if temp2.get(id) != 0 { lw_drop_value(f, "Str_drop", temp2.get(id) - 1, fresh); }
+                }
+            }
+            k = k + 1;
+        }
+        blk.instructions = fresh;
+        f.blocks.set(b, blk);
+        b = b + 1;
+    }
+    return true;
+}
+
+fn lw_drop_shadow(f: &mut IrFunction, drop_fn: str, shadow: i64, out: Vec<i64>) {
     var old: i64 = lw_detached(f, Inst::Load(shadow, IrType::I64));
+    out.push(old);
+    lw_drop_value(f, drop_fn, old, out);
+}
+
+fn lw_drop_value(f: &mut IrFunction, drop_fn: str, value: i64, out: Vec<i64>) {
     var env: i64 = lw_detached(f, Inst::ConstInt(0, IrType::I64));
     var effects: EffectSet = EffectSet_new();
     EffectSet_add(&mut effects, Effect::Write);
     EffectSet_add(&mut effects, Effect::Alloc);
     var args: Vec<i64> = Vec::new();
     args.push(env);
-    args.push(old);
-    var call: i64 = lw_detached(f, Inst::Call("Vec_drop", args, IrType::Void, effects));
-    out.push(old);
+    args.push(value);
+    var call: i64 = lw_detached(f, Inst::Call(drop_fn, args, IrType::Void, effects));
     out.push(env);
     out.push(call);
 }
@@ -2839,6 +3113,14 @@ pub fn Lowerer_lower_func(self: &mut Lowerer, func: Func) {
                 var val: i64 = Lowerer_lower_expr(self, expr);
                 last_expr_val = OptValueId::Some(val);
             }
+            Stmt::Handle(_, _, _) => {
+                last_expr_val = OptValueId::None;
+                if i + 1 == func.body.len() {
+                    last_expr_val = Lowerer_lower_tail_handle(self, stmt);
+                } else {
+                    Lowerer_lower_stmt(self, stmt);
+                }
+            }
             _ => {
                 last_expr_val = OptValueId::None;
                 Lowerer_lower_stmt(self, stmt);
@@ -2918,6 +3200,42 @@ pub fn Lowerer_lower_func(self: &mut Lowerer, func: Func) {
 }
 
 // --- Lower statements -----------------------------------------------------
+
+/// The slot a `handle` in this function leaves its value in, or -1.
+fn Lowerer_handle_target(self: &Lowerer) -> i64 {
+    if self.handle_slot >= 0 && self.handle_slot_fn == self.current_func.name { return self.handle_slot; }
+    return -1;
+}
+
+/// src/lower.rs lower_tail_handle: a `handle` ending a function gives the
+/// function its value.
+fn Lowerer_lower_tail_handle(self: &mut Lowerer, stmt: Stmt) -> OptValueId {
+    var is_void: bool = false;
+    match self.current_func.ret_ty {
+        IrType::Void => { is_void = true; }
+        _ => {}
+    }
+    var has_sret: bool = false;
+    match self.current_sret {
+        OptValueId::Some(_) => { has_sret = true; }
+        OptValueId::None => {}
+    }
+    if is_void || has_sret {
+        Lowerer_lower_stmt(self, stmt);
+        return OptValueId::None;
+    }
+    var zero: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+    var slot: i64 = Lowerer_emit_inst(self, Inst::Alloca(IrType::I64, Lowerer_current_region(self)));
+    Lowerer_emit_inst(self, Inst::Store(slot, zero, OptIrType::None));
+    var outer_fn: str = self.handle_slot_fn;
+    var outer: i64 = self.handle_slot;
+    self.handle_slot_fn = self.current_func.name;
+    self.handle_slot = slot;
+    Lowerer_lower_stmt(self, stmt);
+    self.handle_slot_fn = outer_fn;
+    self.handle_slot = outer;
+    return OptValueId::Some(Lowerer_emit_inst(self, Inst::Load(slot, IrType::I64)));
+}
 
 pub fn Lowerer_lower_stmts(self: &mut Lowerer, stmts: Vec<Stmt>) {
     // L3A: at a `do` statement the remaining statements become the
@@ -3911,7 +4229,35 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
             // encountered inside, the matching handler is called.
             // Store handlers in a stack so Do statements can find them.
             self.effect_handler_stack.push(handlers);
-            Lowerer_lower_stmts(self, body);
+            var hslot: i64 = Lowerer_handle_target(self);
+            var has_do_in: bool = false;
+            var hi: i64 = 0;
+            while hi < body.len() {
+                match body.get(hi) {
+                    Stmt::Do(_, _, _, _) => { has_do_in = true; }
+                    _ => {}
+                }
+                hi = hi + 1;
+            }
+            var stored: bool = false;
+            if hslot >= 0 && !has_do_in && body.len() > 0 {
+                match body.get(body.len() - 1) {
+                    Stmt::Expr(last, _) => {
+                        var rest: Vec<Stmt> = Vec::new();
+                        hi = 0;
+                        while hi + 1 < body.len() {
+                            rest.push(body.get(hi));
+                            hi = hi + 1;
+                        }
+                        Lowerer_lower_stmts(self, rest);
+                        var hval: i64 = Lowerer_lower_expr(self, last);
+                        Lowerer_emit_inst(self, Inst::Store(hslot, hval, OptIrType::None));
+                        stored = true;
+                    }
+                    _ => {}
+                }
+            }
+            if !stored { Lowerer_lower_stmts(self, body); }
             self.effect_handler_stack.pop();
         }
         Stmt::Do(effect, op, args, _line) => {
@@ -3970,7 +4316,9 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
             // env pointer as first arg automatically (has_env = true).
             var cont_val: i64 = Lowerer_lower_expr(self, cont);
             var value_val: i64 = Lowerer_lower_expr(self, value);
+            var rslot: i64 = Lowerer_handle_target(self);
             var _r: i64 = Lowerer_emit_inst(self, Inst::CallPtr(cont_val, lw_c_vec1_i64(value_val), IrType::I64, EffectSet_new(), true));
+            if rslot >= 0 { Lowerer_emit_inst(self, Inst::Store(rslot, _r, OptIrType::None)); }
         }
         Stmt::SpawnScope(body, _line) => {
             // L3B: spawn scope { body } — create an executor, lower the body

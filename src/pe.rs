@@ -28,6 +28,14 @@ pub enum Reg {
     R12 = 12, R13 = 13, R14 = 14, R15 = 15,
 }
 
+/// Callee-saved registers that hold values instead of stack slots.
+const VALUE_REGS: [Reg; 7] = [Reg::Rbx, Reg::Rsi, Reg::Rdi, Reg::R12, Reg::R13, Reg::R14, Reg::R15];
+/// A frame offset at or above this names VALUE_REGS[offset - REG_SLOT]. Values
+/// are read and written through mov_reg_mem_rbp and mov_mem_rbp_reg, so every
+/// instruction works on a register value unchanged; anything else that takes
+/// an offset must not get one of these (emit_mem_rbp panics).
+const REG_SLOT: i32 = 0x7F000000;
+
 /// XMM (SSE/AVX) registers — 128-bit for SSE, 256-bit for AVX.
 /// Encoded with the same low-3-bit scheme as GP regs, plus optional VEX prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -453,6 +461,14 @@ impl X86Encoder {
 
     /// mov r64, [rbp + disp]
     fn mov_reg_mem_rbp(&mut self, dst: Reg, disp: i32) {
+        if disp >= REG_SLOT {
+            self.last_store = None;
+            let src = VALUE_REGS[(disp - REG_SLOT) as usize];
+            if dst != src {
+                self.mov_rr(dst, src);
+            }
+            return;
+        }
         if let Some((d, src, end)) = self.last_store {
             if d == disp && end == self.code.len() {
                 // The slot was just written from src and nothing was emitted
@@ -472,6 +488,10 @@ impl X86Encoder {
 
     /// mov [rbp + disp], r64
     fn mov_mem_rbp_reg(&mut self, disp: i32, src: Reg) {
+        if disp >= REG_SLOT {
+            self.mov_rr(VALUE_REGS[(disp - REG_SLOT) as usize], src);
+            return;
+        }
         self.rex(true, src.is_extended(), false, false);
         self.emit_u8(0x89);
         self.emit_mem_rbp(src.code(), disp);
@@ -482,6 +502,7 @@ impl X86Encoder {
     /// For RBP base: mod=01 for disp8, mod=10 for disp32
     /// RBP with mod=00 means RIP-relative, so we always need a displacement.
     fn emit_mem_rbp(&mut self, reg_code: u8, disp: i32) {
+        assert!(disp < REG_SLOT, "a register value used as memory");
         if disp == 0 {
             // RBP with mod=00 is RIP-relative, so we must use disp8=0
             self.modrm(0b01, reg_code, 5); // RBP = 5
@@ -1927,6 +1948,10 @@ struct PeStackFrame {
     /// immediate straight into a register instead of loading the slot
     /// (pe-roadmap item 81).
     const_vals: HashMap<u32, i64>,
+    /// Locals kept in a register: alloca id -> REG_SLOT offset
+    reg_vars: HashMap<u32, i64>,
+    /// Constants every use of which takes the immediate: they need no slot
+    imm_only: std::collections::HashSet<u32>,
 }
 
 impl PeStackFrame {
@@ -1936,6 +1961,8 @@ impl PeStackFrame {
             size: 0,
             alloca_slots: HashMap::new(),
             const_vals: HashMap::new(),
+            reg_vars: HashMap::new(),
+            imm_only: std::collections::HashSet::new(),
         }
     }
 
@@ -2001,6 +2028,8 @@ struct PeCodeGen {
     arith_panics: [u32; 9],
     /// Label of the top-level exception filter
     crash_filter: u32,
+    /// Registers this function uses for values, and where it saved them
+    saved_regs: Vec<(Reg, i32)>,
     /// Type ids of dyn values (type name -> id, from 1)
     dyn_type_ids: std::collections::BTreeMap<String, i64>,
     /// Called functions that neither the program nor this runtime defines,
@@ -2135,6 +2164,7 @@ impl PeCodeGen {
             cur_wrapping: false,
             arith_panics: [0; 9],
             crash_filter: 0,
+            saved_regs: Vec::new(),
             bare_mode: false,
             cur_func: String::new(),
             dyn_type_ids: std::collections::BTreeMap::new(),
@@ -3527,6 +3557,22 @@ impl PeCodeGen {
                 _ => false,
             }
         };
+        // Registers: the hottest locals keep one for the whole function, the
+        // others serve temporaries, freed and reused as pool slots are.
+        let use_regs = !self.bare_mode && !func.is_interrupt;
+        let mut no_reg: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut used_regs: Vec<usize> = Vec::new();
+        if use_regs {
+            used_regs = pick_reg_vars(func, module, &mut frame, &mut no_reg);
+        }
+        let mut free_regs: Vec<usize> = Vec::new();
+        if use_regs {
+            free_regs = (0..VALUE_REGS.len()).rev().filter(|r| !used_regs.contains(r)).collect();
+        }
+        let reg_value = |v: u32| -> bool {
+            !no_reg.contains(&v) && last_use.contains_key(&v)
+                && func.values.get(&ValueId(v)).map_or(false, |m| reg_type(&m.ty, module))
+        };
         let mut sorted_values: Vec<(&ValueId, &ValueMeta)> = func.values.iter().collect();
         sorted_values.sort_by(|a, b| a.0.0.cmp(&b.0.0));
         for (vid, meta) in &sorted_values {
@@ -3553,26 +3599,37 @@ impl PeCodeGen {
                 if let Some(vids) = dead_at.get(&pos) {
                     for &v in vids {
                         if let Some(&off) = frame.offsets.get(&v) {
-                            free_slots.push(off);
+                            if off >= REG_SLOT as i64 {
+                                free_regs.push(off as usize - REG_SLOT as usize);
+                            } else {
+                                free_slots.push(off);
+                            }
                         }
                     }
                 }
                 // Assign offsets to this inst's result value(s) if recyclable.
-                let mut assign = |vid: u32, frame: &mut PeStackFrame, free_slots: &mut Vec<i64>| {
+                let mut assign = |vid: u32, frame: &mut PeStackFrame, free_slots: &mut Vec<i64>,
+                                  free_regs: &mut Vec<usize>, used_regs: &mut Vec<usize>| {
                     if frame.offsets.contains_key(&vid) || !recyclable(vid) { return; }
                     let size = func.values.get(&ValueId(vid))
                         .map(|m| module.type_size(&m.ty).max(8))
                         .unwrap_or(8);
-                    let off = if size <= 8 {
+                    let off = if reg_value(vid) && !free_regs.is_empty() {
+                        let r = free_regs.pop().unwrap();
+                        if !used_regs.contains(&r) {
+                            used_regs.push(r);
+                        }
+                        (REG_SLOT as usize + r) as i64
+                    } else if size <= 8 {
                         free_slots.pop().unwrap_or_else(|| frame.alloc_raw(8))
                     } else {
                         frame.alloc_raw(size as i64)
                     };
                     frame.offsets.insert(vid, off);
                 };
-                assign(iid.0, &mut frame, &mut free_slots);
+                assign(iid.0, &mut frame, &mut free_slots, &mut free_regs, &mut used_regs);
                 if let Some(Inst::TryUnwrap { ok_dst, .. }) = func.instructions.get(&iid) {
-                    assign(ok_dst.0, &mut frame, &mut free_slots);
+                    assign(ok_dst.0, &mut frame, &mut free_slots, &mut free_regs, &mut used_regs);
                 }
                 pos += 1;
             }
@@ -3582,11 +3639,14 @@ impl PeCodeGen {
         sorted_insts.sort_by(|a, b| a.0.0.cmp(&b.0.0));
         for (vid, inst) in &sorted_insts {
             if let Inst::Alloca { ty, .. } = inst {
+                if frame.reg_vars.contains_key(&vid.0) { continue; }
                 let data_size = module.type_size(ty).max(8) as i64;
                 let offset = frame.alloc_raw(data_size);
                 frame.alloca_slots.insert(vid.0, offset);
             }
         }
+        used_regs.sort();
+        self.saved_regs = used_regs.iter().map(|r| (VALUE_REGS[*r], frame.alloc_raw(8) as i32)).collect();
 
         // Align stack to 16 bytes + 32 shadow space
         let stack_size = ((frame.size + 32 + 15) & !15) as i64;
@@ -3609,6 +3669,10 @@ impl PeCodeGen {
             self.enc.mov_reg8_ptr(Reg::R11, Reg::Rax); // touch page
             self.enc.jmp_label(probe_loop);
             self.enc.place_label(probe_done);
+        }
+
+        for (r, off) in self.saved_regs.clone() {
+            self.enc.mov_mem_rbp_reg(off, r);
         }
 
         // Store params from registers
@@ -3646,6 +3710,9 @@ impl PeCodeGen {
         }
 
         // Epilogue (fallthrough safety)
+        for (r, off) in self.saved_regs.clone() {
+            self.enc.mov_reg_mem_rbp(r, off);
+        }
         self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
         self.enc.pop(Reg::Rbp);
         self.enc.ret();
@@ -3667,6 +3734,10 @@ impl PeCodeGen {
         match inst {
             // ─── Constants ───
             Inst::ConstInt { value, .. } => {
+                if frame.imm_only.contains(&id.0) {
+                    frame.const_vals.insert(id.0, *value);
+                    return;
+                }
                 self.enc.mov_imm64(Reg::Rax, *value as u64);
                 self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
                 frame.const_vals.insert(id.0, *value);
@@ -3787,12 +3858,20 @@ impl PeCodeGen {
 
             // ─── Memory ───
             Inst::Alloca { .. } => {
+                if frame.reg_vars.contains_key(&id.0) {
+                    return;
+                }
                 let data_offset = *frame.alloca_slots.get(&id.0).unwrap_or(&0) as i32;
                 self.enc.lea_rbp(Reg::Rax, data_offset);
                 self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
             }
 
             Inst::Load { ptr, ty } => {
+                if let Some(&r) = frame.reg_vars.get(&ptr.0) {
+                    self.enc.mov_reg_mem_rbp(Reg::Rax, r as i32);
+                    self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
+                    return;
+                }
                 let poff = frame.offset(*ptr) as i32;
                 let size = module.type_size(ty).max(1);
                 // Unsigned values zero-extend (a u8 255 stays 255), as in C
@@ -3832,6 +3911,11 @@ impl PeCodeGen {
             }
 
             Inst::Store { ptr, value, store_ty: explicit_ty } => {
+                if let Some(&r) = frame.reg_vars.get(&ptr.0) {
+                    self.gen_load_operand(Reg::Rax, *value, frame);
+                    self.enc.mov_mem_rbp_reg(r as i32, Reg::Rax);
+                    return;
+                }
                 let poff = frame.offset(*ptr) as i32;
                 let voff = frame.offset(*value) as i32;
                 self.enc.mov_reg_mem_rbp(Reg::Rax, poff);
@@ -3951,6 +4035,9 @@ impl PeCodeGen {
                 } else {
                     self.enc.xor_self(Reg::Rax);
                 }
+                for (r, off) in self.saved_regs.clone() {
+                    self.enc.mov_reg_mem_rbp(r, off);
+                }
                 self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
                 self.enc.pop(Reg::Rbp);
                 if func.is_interrupt {
@@ -4065,6 +4152,49 @@ impl PeCodeGen {
                         self.enc.mov_reg_ptr(Reg::Rax, Reg::Rax);
                         self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
                         return;
+                    }
+                    if call_name == "Vec_set" && args.len() >= 3 {
+                        self.gen_load_operand(Reg::Rax, args[args.len() - 3], frame);
+                        self.gen_load_operand(Reg::Rcx, args[args.len() - 2], frame);
+                        self.gen_load_operand(Reg::Rdx, args[args.len() - 1], frame);
+                        self.enc.mov_reg_mem_disp(Reg::R8, Reg::Rax, 8);
+                        self.enc.cmp_rr(Reg::Rcx, Reg::R8);
+                        self.enc.jcc_label(0x3, self.arith_panics[PANIC_VEC_INDEX]); // jae
+                        self.enc.mov_reg_ptr(Reg::Rax, Reg::Rax);
+                        self.enc.shl_r_i8(Reg::Rcx, 3);
+                        self.enc.add_rr(Reg::Rax, Reg::Rcx);
+                        self.enc.mov_ptr_reg(Reg::Rax, Reg::Rdx);
+                        return;
+                    }
+                    // Vec_push with room in the buffer; growing stays a call
+                    if call_name == "Vec_push" && args.len() == 3 {
+                        if let Some(&push) = self.func_labels.get("Vec_push") {
+                            let grow = self.enc.alloc_label();
+                            let done = self.enc.alloc_label();
+                            self.gen_load_operand(Reg::Rax, args[1], frame);
+                            self.gen_load_operand(Reg::Rcx, args[2], frame);
+                            self.enc.mov_reg_mem_disp(Reg::Rdx, Reg::Rax, 8);
+                            self.enc.mov_reg_mem_disp(Reg::R8, Reg::Rax, 16);
+                            self.enc.cmp_rr(Reg::Rdx, Reg::R8);
+                            self.enc.jcc_label(0x3, grow); // jae
+                            self.enc.mov_reg_ptr(Reg::R8, Reg::Rax);
+                            self.enc.mov_rr(Reg::R9, Reg::Rdx);
+                            self.enc.shl_r_i8(Reg::R9, 3);
+                            self.enc.add_rr(Reg::R8, Reg::R9);
+                            self.enc.mov_ptr_reg(Reg::R8, Reg::Rcx);
+                            self.enc.inc_r(Reg::Rdx);
+                            self.enc.mov_mem_disp_reg(Reg::Rax, 8, Reg::Rdx);
+                            self.enc.jmp_label(done);
+                            self.enc.place_label(grow);
+                            self.enc.mov_rr(Reg::Rdx, Reg::Rax);
+                            self.enc.mov_rr(Reg::R8, Reg::Rcx);
+                            self.enc.xor_self(Reg::Rcx);
+                            self.enc.sub_rsp_i32(32);
+                            self.enc.call_label(push);
+                            self.enc.add_rsp_i32(32);
+                            self.enc.place_label(done);
+                            return;
+                        }
                     }
                 }
 
@@ -4423,7 +4553,17 @@ impl PeCodeGen {
             Some(v) => self.enc.mov_imm64(Reg::Rax, v as u64),
             None => self.enc.mov_reg_mem_rbp(Reg::Rax, loff),
         }
+        let unsigned_ty = matches!(ty, IrType::U8 | IrType::U16 | IrType::U32 | IrType::U64);
+        let by_const = matches!(op, BinOp::Div | BinOp::Mod) && !unsigned_ty && rconst.map_or(false, |v| v >= 2);
+        // A small constant is an immediate; `sub` is an `add` of its negation
+        let small = rconst.filter(|v| *v > i32::MIN as i64 && *v <= i32::MAX as i64);
+        let imm = match op {
+            BinOp::Add | BinOp::Sub if *ty != IrType::U64 => small,
+            BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => small,
+            _ => None,
+        };
         match rconst {
+            Some(_) if imm.is_some() || by_const => {}
             Some(v) => self.enc.mov_imm64(Reg::Rcx, v as u64),
             None => self.enc.mov_reg_mem_rbp(Reg::Rcx, roff),
         }
@@ -4437,13 +4577,19 @@ impl PeCodeGen {
         };
         match op {
             BinOp::Add => {
-                self.enc.add_rr(Reg::Rax, Reg::Rcx);
+                match imm {
+                    Some(v) => self.enc.add_r_i32(Reg::Rax, v as i32),
+                    None => self.enc.add_rr(Reg::Rax, Reg::Rcx),
+                }
                 if let (true, Some(cc)) = (checked, ovf_cc) {
                     self.enc.jcc_label(cc, self.arith_panics[PANIC_ADD]);
                 }
             }
             BinOp::Sub => {
-                self.enc.sub_rr(Reg::Rax, Reg::Rcx);
+                match imm {
+                    Some(v) => self.enc.add_r_i32(Reg::Rax, -(v as i32)),
+                    None => self.enc.sub_rr(Reg::Rax, Reg::Rcx),
+                }
                 if let (true, Some(cc)) = (checked, ovf_cc) {
                     self.enc.jcc_label(cc, self.arith_panics[PANIC_SUB]);
                 }
@@ -4473,7 +4619,13 @@ impl PeCodeGen {
             }
             BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
                 let cc = int_cmp_cc(op, unsigned_cmp).unwrap();
-                self.enc.cmp_rr(Reg::Rax, Reg::Rcx);
+                match imm {
+                    Some(v) => {
+                        self.enc.emit(&[0x48, 0x3D]); // cmp rax, imm32
+                        self.enc.emit_i32(v as i32);
+                    }
+                    None => self.enc.cmp_rr(Reg::Rax, Reg::Rcx),
+                }
                 self.enc.setcc_r(cc, Reg::Rax);
                 self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
             }
@@ -4540,6 +4692,12 @@ impl PeCodeGen {
     /// divisor needs neither check.
     fn gen_int_div(&mut self, op: &BinOp, rconst: Option<i64>, ty: &IrType, checked: bool) {
         let is_mod = matches!(op, BinOp::Mod);
+        if let Some(d) = rconst {
+            if d >= 2 && !matches!(ty, IrType::U8 | IrType::U16 | IrType::U32 | IrType::U64) {
+                self.gen_div_const(is_mod, d);
+                return;
+            }
+        }
         if !self.bare_mode && rconst.map_or(true, |v| v == 0) {
             self.enc.test_rr(Reg::Rcx, Reg::Rcx);
             self.enc.jcc_label(0x4, self.arith_panics[if is_mod { PANIC_MOD_ZERO } else { PANIC_DIV_ZERO }]);
@@ -4572,6 +4730,39 @@ impl PeCodeGen {
         }
         if is_mod {
             self.enc.mov_rr(Reg::Rax, Reg::Rdx);
+        }
+    }
+
+    /// rax / d or rax % d, signed, for a constant d >= 2: no idiv. The
+    /// quotient truncates toward zero, as idiv's does.
+    fn gen_div_const(&mut self, is_mod: bool, d: i64) {
+        self.enc.mov_rr(Reg::Rcx, Reg::Rax); // rcx = n
+        if d & (d - 1) == 0 {
+            let k = d.trailing_zeros() as u8;
+            self.enc.mov_rr(Reg::Rdx, Reg::Rax);
+            self.enc.emit(&[0x48, 0xC1, 0xFA, 63]); // sar rdx, 63
+            self.enc.emit(&[0x48, 0xC1, 0xEA, 64 - k]); // shr rdx, 64 - k
+            self.enc.add_rr(Reg::Rax, Reg::Rdx);
+            self.enc.emit(&[0x48, 0xC1, 0xF8, k]); // sar rax, k
+        } else {
+            let (m, s) = div_magic(d as u64);
+            self.enc.mov_imm64(Reg::Rax, m);
+            self.enc.emit(&[0x48, 0xF7, 0xE9]); // imul rcx: rdx = high half
+            if (m as i64) < 0 {
+                self.enc.add_rr(Reg::Rdx, Reg::Rcx);
+            }
+            if s > 0 {
+                self.enc.emit(&[0x48, 0xC1, 0xFA, s as u8]); // sar rdx, s
+            }
+            self.enc.mov_rr(Reg::Rax, Reg::Rdx);
+            self.enc.emit(&[0x48, 0xC1, 0xE8, 63]); // shr rax, 63
+            self.enc.add_rr(Reg::Rax, Reg::Rdx);
+        }
+        if is_mod {
+            self.enc.mov_imm64(Reg::Rdx, d as u64);
+            self.enc.imul_rr(Reg::Rax, Reg::Rdx);
+            self.enc.sub_rr(Reg::Rcx, Reg::Rax);
+            self.enc.mov_rr(Reg::Rax, Reg::Rcx);
         }
     }
 
@@ -6119,8 +6310,8 @@ impl PeCodeGen {
         self.enc.jcc_label(0x3, pf_rev_done); // jae (r13 >= r14, done)
         // Swap bytes at r13 and r14: load [r13] into al, [r14] into bl, store
         self.enc.mov_reg8_mem(Reg::Rax, Reg::R13);
-        self.enc.mov_reg8_mem(Reg::Rbx, Reg::R14);
-        self.enc.mov_mem_reg8_ptr(Reg::R13, Reg::Rbx);
+        self.enc.mov_reg8_mem(Reg::R10, Reg::R14);
+        self.enc.mov_mem_reg8_ptr(Reg::R13, Reg::R10);
         self.enc.mov_mem_reg8_ptr(Reg::R14, Reg::Rax);
         // inc r13, dec r14
         self.enc.inc_r(Reg::R13);
@@ -7485,8 +7676,8 @@ impl PeCodeGen {
         self.enc.cmp_rr(Reg::R13, Reg::R14);
         self.enc.jcc_label(0x3, tsf_rev_done);
         self.enc.mov_reg8_mem(Reg::Rax, Reg::R13);
-        self.enc.mov_reg8_mem(Reg::Rbx, Reg::R14);
-        self.enc.mov_mem_reg8_ptr(Reg::R13, Reg::Rbx);
+        self.enc.mov_reg8_mem(Reg::R10, Reg::R14);
+        self.enc.mov_mem_reg8_ptr(Reg::R13, Reg::R10);
         self.enc.mov_mem_reg8_ptr(Reg::R14, Reg::Rax);
         self.enc.inc_r(Reg::R13);
         self.enc.dec_r(Reg::R14);
@@ -9930,6 +10121,180 @@ fn autograd_builtin(inst: &Inst) -> &'static str {
 /// runtime's `pert_X` for builtin `p_X` when the program has it.
 /// Append every ValueId `inst` reads to `out` (used by the slot-reuse
 /// analysis in gen_function — pe-roadmap items 84-85).
+/// Whether a value of this type fits a register: everything is moved 64 bits
+/// at a time, so a narrow integer does too.
+fn reg_type(ty: &IrType, module: &IrModule) -> bool {
+    !ty.is_float()
+        && !matches!(ty, IrType::Struct(_) | IrType::Array(..) | IrType::Void | IrType::Never)
+        && module.type_size(ty) <= 8
+}
+
+fn reg_word(ty: &IrType, module: &IrModule) -> bool {
+    reg_type(ty, module) && module.type_size(ty) == 8
+}
+
+/// The locals worth a register: 8-byte allocas used only by whole-word loads
+/// and stores, most used first, a use in a loop counting ten times more per
+/// level. Two registers stay for temporaries. Records them in `frame`, marks
+/// in `no_reg` what must stay in memory, and returns the registers taken.
+fn pick_reg_vars(func: &IrFunction, module: &IrModule, frame: &mut PeStackFrame, no_reg: &mut std::collections::HashSet<u32>) -> Vec<usize> {
+    let index: HashMap<u32, usize> = func.blocks.iter().enumerate().map(|(i, b)| (b.id.0, i)).collect();
+    let mut depth = vec![0u32; func.blocks.len()];
+    for (i, block) in func.blocks.iter().enumerate() {
+        let mut targets = Vec::new();
+        match block.instructions.last().and_then(|id| func.get_inst(*id)) {
+            Some(Inst::Jump { target }) => targets.push(target.0),
+            Some(Inst::Branch { then, else_, .. }) => { targets.push(then.0); targets.push(else_.0); }
+            _ => {}
+        }
+        for t in targets {
+            if let Some(&head) = index.get(&t) {
+                if head <= i {
+                    for d in head..=i { depth[d] += 1; }
+                }
+            }
+        }
+    }
+    let mut weight: HashMap<u32, u64> = HashMap::new();
+    for block in &func.blocks {
+        for id in &block.instructions {
+            if let Some(Inst::Alloca { ty, .. }) = func.get_inst(*id) {
+                if reg_word(ty, module) {
+                    weight.insert(id.0, 0);
+                }
+            }
+        }
+    }
+    let mut bad: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let float = |v: &ValueId| func.values.get(v).map_or(false, |m| m.ty.is_float());
+    let mut ops: Vec<ValueId> = Vec::new();
+    for (i, block) in func.blocks.iter().enumerate() {
+        let cost = 10u64.pow(depth[i].min(4));
+        for id in &block.instructions {
+            let Some(inst) = func.get_inst(*id) else { continue; };
+            // Float instructions read and write their slots directly
+            match inst {
+                Inst::BinOp { left, right, ty, .. } if ty.is_float() || float(left) => {
+                    no_reg.extend([left.0, right.0, id.0]);
+                }
+                Inst::UnaryOp { operand, ty, .. } if ty.is_float() => {
+                    no_reg.extend([operand.0, id.0]);
+                }
+                Inst::FloatToInt { value, .. } => { no_reg.insert(value.0); }
+                Inst::IntToFloat { .. } => { no_reg.insert(id.0); }
+                Inst::TryUnwrap { ok_dst, .. } => { no_reg.insert(ok_dst.0); }
+                _ => {}
+            }
+            ops.clear();
+            inst_operands(inst, &mut ops);
+            for op in &ops {
+                if !weight.contains_key(&op.0) { continue; }
+                let whole = match inst {
+                    Inst::Load { ptr, ty } => ptr == op && reg_word(ty, module),
+                    Inst::Store { ptr, value, store_ty } => {
+                        ptr == op && value != op
+                            && store_ty.as_ref().map_or(true, |t| reg_word(t, module))
+                            && func.values.get(value).map_or(false, |m| reg_word(&m.ty, module))
+                    }
+                    _ => false,
+                };
+                if whole {
+                    *weight.get_mut(&op.0).unwrap() += cost;
+                } else {
+                    bad.insert(op.0);
+                }
+            }
+        }
+    }
+    let mut ranked: Vec<(u64, u32)> = weight.iter()
+        .filter(|(id, w)| **w >= 3 && !bad.contains(*id))
+        .map(|(id, w)| (*w, *id))
+        .collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    ranked.truncate(VALUE_REGS.len() - 2);
+    let mut taken = Vec::new();
+    for (r, (_, id)) in ranked.iter().enumerate() {
+        frame.reg_vars.insert(*id, (REG_SLOT as usize + r) as i64);
+        no_reg.insert(*id);
+        taken.push(r);
+    }
+    // Constants read only as immediates, in their own block, need no slot
+    let mut const_block: HashMap<u32, usize> = HashMap::new();
+    for (i, block) in func.blocks.iter().enumerate() {
+        for id in &block.instructions {
+            if let Some(Inst::ConstInt { .. }) = func.get_inst(*id) {
+                const_block.insert(id.0, i);
+            }
+        }
+    }
+    for (i, block) in func.blocks.iter().enumerate() {
+        for id in &block.instructions {
+            let Some(inst) = func.get_inst(*id) else { continue; };
+            ops.clear();
+            inst_operands(inst, &mut ops);
+            for op in &ops {
+                let imm = match inst {
+                    Inst::BinOp { left, ty, .. } => !ty.is_float() && !float(left),
+                    Inst::Store { ptr, value, .. } => value == op && frame.reg_vars.contains_key(&ptr.0),
+                    _ => false,
+                };
+                if !imm || const_block.get(&op.0) != Some(&i) {
+                    const_block.remove(&op.0);
+                }
+            }
+        }
+    }
+    let mut used: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for block in &func.blocks {
+        for id in &block.instructions {
+            if let Some(inst) = func.get_inst(*id) {
+                ops.clear();
+                inst_operands(inst, &mut ops);
+                used.extend(ops.iter().map(|o| o.0));
+            }
+        }
+    }
+    for id in const_block.keys() {
+        if used.contains(id) {
+            frame.imm_only.insert(*id);
+            no_reg.insert(*id);
+        }
+    }
+    taken
+}
+
+/// Signed 64-bit division by the constant `d >= 2` as a multiplication: the
+/// multiplier and the shift (Hacker's Delight, 10-1).
+fn div_magic(d: u64) -> (u64, u32) {
+    let two63: u64 = 1 << 63;
+    let anc = two63 - 1 - two63 % d;
+    let mut p = 63u32;
+    let mut q1 = two63 / anc;
+    let mut r1 = two63 - q1 * anc;
+    let mut q2 = two63 / d;
+    let mut r2 = two63 - q2 * d;
+    loop {
+        p += 1;
+        q1 = q1.wrapping_mul(2);
+        r1 = r1.wrapping_mul(2);
+        if r1 >= anc {
+            q1 = q1.wrapping_add(1);
+            r1 -= anc;
+        }
+        q2 = q2.wrapping_mul(2);
+        r2 = r2.wrapping_mul(2);
+        if r2 >= d {
+            q2 = q2.wrapping_add(1);
+            r2 -= d;
+        }
+        let delta = d - r2;
+        if !(q1 < delta || (q1 == delta && r1 == 0)) {
+            break;
+        }
+    }
+    (q2.wrapping_add(1), p - 64)
+}
+
 pub fn inst_operands(inst: &Inst, out: &mut Vec<ValueId>) {
     match inst {
         Inst::BinOp { left, right, .. } => { out.push(*left); out.push(*right); }

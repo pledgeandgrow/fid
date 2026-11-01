@@ -1466,6 +1466,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         OptStr::None => {}
                     }
                     cc_find_duplicate_funcs(user, dup_user_module, dup_errors);
+                    cc_find_module_conflicts(stdlib, imported_modules, imported_module_names, user, dup_user_module, dup_errors);
                     if dup_errors.len() > 0 {
                         return ResultProgram::Err(dup_errors);
                     }
@@ -2221,6 +2222,84 @@ pub fn get_diagnostics(source: str, source_path: OptStr) -> Vec<StrTriple> {
 /// Merge two programs: user definitions take priority over stdlib.
 /// Report functions defined twice within one module (platform
 /// alternatives selected by @cfg are filtered later and are skipped).
+/// Items defined by two modules used to collapse silently into one (src/compiler.rs
+/// find_module_conflicts): functions and consts conflict on name alone, structs
+/// when their fields differ. Enums and core's own names follow the Rust check.
+fn cc_find_module_conflicts(stdlib: Program, imported: Vec<Program>, names: Vec<str>, user: Program, user_name: str, errors: Vec<str>) {
+    var func_names: Vec<str> = Vec::new();
+    var func_mods: Vec<str> = Vec::new();
+    var struct_names: Vec<str> = Vec::new();
+    var struct_mods: Vec<str> = Vec::new();
+    var struct_shapes: Vec<str> = Vec::new();
+    var mi: i64 = 0;
+    while mi <= imported.len() {
+        var prog: Program = user;
+        var module: str = user_name;
+        if mi < imported.len() {
+            prog = imported.get(mi);
+            module = names.get(mi);
+        }
+        var fi: i64 = 0;
+        while fi < prog.funcs.len() {
+            var f: Func = prog.funcs.get(fi);
+            var is_cfg: bool = false;
+            var ai: i64 = 0;
+            while ai < f.annotations.len() {
+                if f.annotations.get(ai).name == "cfg" { is_cfg = true; }
+                ai = ai + 1;
+            }
+            if !is_cfg {
+                var k: i64 = 0;
+                while k < func_names.len() {
+                    if func_names.get(k) == f.name && func_mods.get(k) != module {
+                        errors.push("Duplicate definition: function '" + f.name + "' is defined in both module '"
+                            + func_mods.get(k) + "' and module '" + module + "'");
+                    }
+                    k = k + 1;
+                }
+                // The user's program may shadow an imported function
+                if mi < imported.len() {
+                    func_names.push(f.name);
+                    func_mods.push(module);
+                }
+            }
+            fi = fi + 1;
+        }
+        var si: i64 = 0;
+        while si < prog.structs.len() {
+            var s: StructDef = prog.structs.get(si);
+            var shape: str = "";
+            var fj: i64 = 0;
+            while fj < s.fields.len() {
+                shape = shape + s.fields.get(fj).name + ",";
+                fj = fj + 1;
+            }
+            var c: i64 = 0;
+            if mi < imported.len() {
+                while c < stdlib.structs.len() {
+                    if stdlib.structs.get(c).name == s.name {
+                        errors.push("Duplicate definition: type '" + s.name + "' is defined in both module 'core' and module '" + module + "'");
+                    }
+                    c = c + 1;
+                }
+            }
+            var k: i64 = 0;
+            while k < struct_names.len() {
+                if struct_names.get(k) == s.name && struct_mods.get(k) != module && struct_shapes.get(k) != shape {
+                    errors.push("Duplicate definition: type '" + s.name + "' is defined differently in module '"
+                        + struct_mods.get(k) + "' and module '" + module + "'");
+                }
+                k = k + 1;
+            }
+            struct_names.push(s.name);
+            struct_mods.push(module);
+            struct_shapes.push(shape);
+            si = si + 1;
+        }
+        mi = mi + 1;
+    }
+}
+
 fn cc_find_duplicate_funcs(prog: Program, module: str, errors: Vec<str>) {
     var seen: Vec<str> = Vec::new();
     var fi: i64 = 0;

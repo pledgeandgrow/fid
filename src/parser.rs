@@ -81,7 +81,7 @@ impl Parser {
                     self.advance(); // consume module
                     let mut name = String::new();
                     loop {
-                        let part = self.expect_ident()?;
+                        let part = self.expect_ident_or_keyword()?;
                         name.push_str(&part);
                         if self.match_tok(TokenKind::DoubleColon) {
                             name.push_str("::");
@@ -3200,7 +3200,7 @@ impl Parser {
                 is_glob = true;
                 break;
             }
-            let name = self.expect_ident()?;
+            let name = self.expect_ident_or_keyword()?;
             path.push_str(&name);
             if self.match_tok(TokenKind::DoubleColon) {
                 path.push_str("::");
@@ -3277,7 +3277,7 @@ impl Parser {
             if self.check(&TokenKind::LBrace) {
                 break;
             }
-            let name = self.expect_ident()?;
+            let name = self.expect_ident_or_keyword()?;
             path.push_str(&name);
             if self.match_tok(TokenKind::DoubleColon) {
                 path.push_str("::");
@@ -3555,6 +3555,7 @@ impl Parser {
             TokenKind::Layer => { self.advance(); "layer".to_string() }
             TokenKind::Model => { self.advance(); "model".to_string() }
             TokenKind::Interrupt => { self.advance(); "interrupt".to_string() }
+            TokenKind::Unsafe => { self.advance(); "unsafe".to_string() }
             _ => return Err(format!(
                 "Parse error at {}:{}: expected annotation name after '@' but got '{:?}'",
                 self.peek_token().line, self.peek_token().col, self.peek()

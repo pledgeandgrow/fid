@@ -92,13 +92,13 @@ Everything else relies on these.
       one C program so far (F1).
 - [ ] A4. The suite runs on the self-hosted compiler too, not only `fidesc` (M).
       `tests/` parity is a local script today.
-- [ ] A5. `_fail` tests name the error they expect. Today any failure passes,
+- [x] A5. `_fail` tests name the error they expect. Today any failure passes,
       so a test can reject a program for the wrong reason (M).
 - [ ] A6. The effect, capability, region and safety tests in subdirectories run
       in `fidesc test`, not only `cargo test` (S).
 - [ ] A7. Refresh `tests/bootstrap/baseline/test_results.txt`; it is stale (S).
-- [ ] A8. Fix `fid run` tensor `mean` (wrong value; `test_tensor`) (S).
-- [ ] A9. Fix `handle` expression values: `test_no_coloring` reads an unset
+- [x] A8. Fix `fid run` tensor `mean` (wrong value; `test_tensor`) (S).
+- [x] A9. Fix `handle` expression values: `test_no_coloring` reads an unset
       value on every backend (M).
 - [ ] A10. `release/fid.exe` from the release bootstrap replaces stale builds;
       the installer ships it and `fid emit` is tested from an installed layout
@@ -107,7 +107,7 @@ Everything else relies on these.
 - [ ] A12. Find why `test_spawn_gt` failed natively once on CI: it passed on the
       next run and 320 of 320 here under load. The harness now prints the
       reason if it comes back (S).
-- [ ] A13. `run_with_timeout` reads a child's output only after it exits, so a
+- [x] A13. `run_with_timeout` reads a child's output only after it exits, so a
       test printing more than the pipe holds would hang until the limit (S).
 
 **Acceptance:** a red test blocks a merge, on both compilers.
@@ -147,7 +147,7 @@ Most modules still have no test, so expect more of this (B12).
       Add qualified names (`json::get`) or rename (M).
 - [ ] B17. A private function in one module must not shadow a core function for
       other modules: `sqlite`'s local `int_to_str` broke `json` and `string` (S).
-- [ ] B18. A struct defined in two modules must be an error, as a function is:
+- [x] B18. A struct defined in two modules must be an error, as a function is:
       `core` and `buffer` both had a public `ByteBuffer`, and each compiler
       silently picked a different one (S).
 
@@ -157,9 +157,9 @@ Most modules still have no test, so expect more of this (B12).
 
 - [x] C0. Real allocator on both native paths; `Vec` growth and `HashMap`
       rehashing reuse memory; local `Vec`s freed by the compiler.
-- [ ] C1. Free string temporaries: the intermediate results of `a + b + c`, and
+- [x] C1. Free string temporaries: the intermediate results of `a + b + c`, and
       a fresh call result used once as a concat operand (M).
-- [ ] C2. Free local strings that never escape, by extending the
+- [x] C2. Free local strings that never escape, by extending the
       `auto_drop_vecs` pass (M).
 - [ ] C3. Free `Vec`s passed only to functions that do not keep them: per-function
       escape summaries, as `compiler/escape.fd` has for references (L).
@@ -183,11 +183,13 @@ the fastest build-to-native among compiled languages, and native code within
 
 - [x] D0. `Vec_get`/`Vec_len` inlined; allocator state cache-aligned;
       type checking about 14× faster.
-- [ ] D1. Inline `Vec_set` and `Vec_push`'s fast path (S).
-- [ ] D2. Division by a constant as a multiplication (`i % 7` costs an `idiv`) (S).
+- [x] D1. Inline `Vec_set` and `Vec_push`'s fast path (S).
+- [x] D2. Division by a constant as a multiplication (`i % 7` costs an `idiv`) (S).
 - [ ] D3. Bounds-check and overflow-check elimination on simple counted loops (M).
-- [ ] D4. Register allocation for the PE backend: values live in stack slots
-      today, the main cause of the 3–7× gap to C (L, see decision 1).
+- [~] D4. Registers for the PE backend. Done: the five hottest locals of a
+      function and short-lived temporaries live in callee-saved registers,
+      weighted by loop depth. Left: values that cross blocks, caller-saved
+      registers, floats (L).
 - [ ] D5. Inlining of small functions at IR level (M).
 - [ ] D6. Run the IR optimizer on the native path (M).
 - [ ] D7. Benchmarks in CI, failing on a slowdown over 10% (M).
@@ -212,13 +214,17 @@ compiler.
 
 ## Track F — Platforms
 
-- [ ] F1. Run the whole suite on Linux x64 through C, in CI (M). Not run so far.
-      `fidesc` did not even build on Linux until Nov 1: a missing import.
-- [ ] F10. The C path works with MinGW `gcc`: linking fails because `-Wl,-z,...`
+- [~] F1. Run the whole suite on Linux x64 through C, in CI (M). CI runs it; a first
+      green run is left. Locally, the generated C of every test ran under gcc on
+      WSL, which found and fixed `p_system`'s status and a use after free in
+      `process_capture`.
+- [x] F10. The C path works with MinGW `gcc`: linking fails because `-Wl,-z,...`
       is ELF-only (`src/main.rs`, `compiler/main.fd`). `zig cc` accepts it. CI's
       diagnostic step proves the fix (S).
-- [ ] F2. `fid` builds and bootstraps itself on Linux (M).
-- [ ] F3. Install archives tested on a clean Linux machine (S).
+- [~] F2. `fid` builds and bootstraps itself on Linux, in CI (M). A first green run
+      is left.
+- [~] F3. Install archives tested on a clean Linux machine: a clean Ubuntu
+      container in CI (S). A first green run is left.
 - [ ] F4. Native ELF path for `fid`: an IR→ELF backend sharing the x86-64
       encoder with `pe_ir` (L).
 - [ ] F5. macOS x64 and ARM64 through C, in CI (M).
@@ -245,12 +251,12 @@ listed as experimental in the docs, with what does not work.
 
 ## Track H — Concurrency
 
-- [ ] H1. `spawn` really runs concurrently on the Windows C path: it runs
+- [x] H1. `spawn` really runs concurrently on the Windows C path: it runs
       synchronously there today, and differs from native (M).
-- [ ] H2. Mutexes on the Windows C path are real (S).
-- [ ] H3. Data races rejected: a global or a captured `var` used from a spawned
-      function needs a lock or an atomic (L). Today one compiles silently and
-      10,000,000 increments give about 5.7M.
+- [x] H2. Mutexes on the Windows C path are real (S).
+- [~] H3. Data races rejected. Done: code reached from `spawn` or
+      `p_thread_spawn` may not write a global of the program without a lock. Left:
+      shared data reached through pointers and captures (L).
 - [ ] H4. Enforce `@send`/`@sync` for every spawn argument (M).
 - [ ] H5. Real `async`: tasks suspend and resume (L, see decision 4). Today
       `async` runs eagerly and `yield` does nothing.
@@ -302,10 +308,10 @@ Nothing here is ready to protect real data yet. Do not write new primitives.
 - [x] K0. `val`/`const` reassignment, non-exhaustive `match`, wrong `Vec` element
       types and `str`/`i64` mixing in a program are rejected; safety rules follow
       method calls.
-- [ ] K1. Raw pointer dereference outside `unsafe` is an error: a null `*p`
+- [x] K1. Raw pointer dereference outside `unsafe` is an error: a null `*p`
       compiles and only panics at runtime (M).
-- [ ] K2. Literal range checks: `var x: u8 = 300` is rejected (S).
-- [ ] K3. Silent narrowing rejected: an `i64` assigned to an `i32` truncates (M).
+- [x] K2. Literal range checks: `var x: u8 = 300` is rejected (S).
+- [x] K3. Silent narrowing rejected: an `i64` assigned to an `i32` truncates (M).
 - [ ] K4. Iterator invalidation: `for x in v { v.push(1); }` is rejected (M).
 - [ ] K5. Borrow-checker gaps: `s.x = 1`, `&v[i]`, trait impl bodies (M).
 - [ ] K6. `&(rvalue)` no longer points at a dead temporary (M).
@@ -351,8 +357,8 @@ Tested on Nov 1, native build:
 | Error | What happens today | Fixed by |
 |---|---|---|
 | `Vec` index out of bounds | Panics | Done |
-| Wild or null pointer read | Compiles outside `unsafe`; panics only if unmapped | K1, M2 |
-| Double free | Panics, on the interpreter, C and native paths; still needs no `unsafe`, and is missed once the block has been reused | M2, M5, M7 |
+| Wild or null pointer read | Rejected outside `unsafe`; inside, panics only if unmapped | K1, M2 |
+| Double free | Rejected outside `unsafe`; inside, panics, unless the block has been reused | M2, M5, M7 |
 | Free of a pointer that is not a block | Panics, on the interpreter, C and native paths | Done (M3) |
 | Use after free | Needs `unsafe` to read, but nothing detects it: it read 0 | M7, M8 |
 | Two names for one `Vec` | `var b = a` shares it, with no move check | M4, M5 |
@@ -360,8 +366,9 @@ Tested on Nov 1, native build:
 
 - [ ] M1. Write down the guarantee in the language guide: what safe code
       promises, and exactly what `unsafe` gives up (S).
-- [ ] M2. `p_malloc`, `p_free`, integer-to-pointer casts and `extern "C"` calls
-      need `unsafe` (M).
+- [~] M2. `p_malloc`, `p_free`, integer-to-pointer casts and `extern "C"` calls
+      need `unsafe`, or `@unsafe` on the function. Done in the program itself;
+      imported modules wait for M10 (M).
 - [x] M3. The allocator marks freed blocks in their header and panics on a double
       free or a pointer it never handed out. A second free after the block was
       reused cannot be told from a valid one, and frees the new owner's block:
@@ -445,6 +452,10 @@ and go to definition in VS Code, then format, test and build it.
 
 ## Notes
 
+- Library policy (decided Nov 1): the standard library is pure Fides wherever it
+  can be. System libraries serve what only the OS provides (sockets, secure
+  random numbers, Schannel). TLS and cryptography bind reviewed libraries. SQLite
+  and SDL2 stay optional bindings.
 - Keep `src/` and `compiler/` in step: a change to one is not done until the
   other matches and both pass.
 - Do not claim a feature in `README.md` or `positioning.md` until its track says

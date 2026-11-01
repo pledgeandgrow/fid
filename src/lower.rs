@@ -228,6 +228,8 @@ pub struct Lowerer {
     current_self_type: Option<String>,
     /// Stack of effect handlers (for handle/do statements)
     effect_handler_stack: Vec<Vec<crate::ast::EffectHandler>>,
+    /// Where a `handle` ending this function leaves its value: (function, slot)
+    handle_slot: Option<(String, ValueId)>,
     /// L3B: Stack of scope executors for structured concurrency.
     /// `spawn` expressions inside a `spawn scope` block use the top executor.
     scope_executor_stack: Vec<ValueId>,
@@ -339,6 +341,7 @@ impl Lowerer {
             type_aliases: HashMap::new(),
             current_self_type: None,
             effect_handler_stack: Vec::new(),
+            handle_slot: None,
             scope_executor_stack: Vec::new(),
             continuation_counter: 0,
             region_stack: Vec::new(),
@@ -1554,10 +1557,12 @@ impl Lowerer {
             // The continuation function handles its own implicit return.
             self.lower_stmts(&func.body);
         } else {
-            for stmt in &func.body {
+            for (i, stmt) in func.body.iter().enumerate() {
                 if let Stmt::Expr(expr, _) = stmt {
                     // Lower the expression and remember its value
                     last_expr_val = Some(self.lower_expr(expr));
+                } else if i + 1 == func.body.len() && matches!(stmt, Stmt::Handle { .. }) {
+                    last_expr_val = self.lower_tail_handle(stmt);
                 } else {
                     last_expr_val = None;
                     self.lower_stmt(stmt);
@@ -2577,7 +2582,15 @@ impl Lowerer {
                 // encountered inside, the matching handler is called.
                 // We store the handlers in a stack so that Do statements can find them.
                 self.effect_handler_stack.push(handlers.clone());
-                self.lower_stmts(body);
+                let has_do = body.iter().any(|s| matches!(s, Stmt::Do { .. }));
+                match (self.handle_target(), body.split_last()) {
+                    (Some(slot), Some((Stmt::Expr(last, _), rest))) if !has_do => {
+                        self.lower_stmts(rest);
+                        let value = self.lower_expr(last);
+                        self.emit_inst(Inst::Store { ptr: slot, value, store_ty: None });
+                    }
+                    _ => self.lower_stmts(body),
+                }
                 self.effect_handler_stack.pop();
             }
 
@@ -2598,13 +2611,16 @@ impl Lowerer {
                 // Call the continuation: cont(value)
                 // The continuation closure has signature (env: *u8, value: i64) -> i64
                 // We use CallPtr which passes env_ptr as first arg automatically.
-                self.emit_inst(Inst::CallPtr {
+                let result = self.emit_inst(Inst::CallPtr {
                     fn_ptr: cont_val,
                     args: vec![value_val],
                     ret_ty: IrType::I64,
                     effects: EffectSet::new(),
                     has_env: true,
                 });
+                if let Some(slot) = self.handle_target() {
+                    self.emit_inst(Inst::Store { ptr: slot, value: result, store_ty: None });
+                }
             }
             Stmt::RegionBlock { name, budget: _, is_gpu, is_kv_cache, window_size, body, .. } => {
                 // Emit RegionBegin — marks the start of a named region.
@@ -3864,6 +3880,29 @@ impl Lowerer {
                 self.lower_stmt(s);
             }
         }
+    }
+
+    /// The slot a `handle` in this function leaves its value in, if any.
+    fn handle_target(&self) -> Option<ValueId> {
+        let name = &self.current_func.as_ref()?.name;
+        self.handle_slot.as_ref().filter(|(f, _)| f == name).map(|(_, slot)| *slot)
+    }
+
+    /// A `handle` ending a function gives the function its value: the last
+    /// expression of its body, or what `resume` returned.
+    fn lower_tail_handle(&mut self, stmt: &Stmt) -> Option<ValueId> {
+        let (name, ret_ty) = self.current_func.as_ref().map(|f| (f.name.clone(), f.ret_ty.clone()))?;
+        if ret_ty == IrType::Void || self.current_sret.is_some() {
+            self.lower_stmt(stmt);
+            return None;
+        }
+        let zero = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+        let slot = self.emit_inst(Inst::Alloca { ty: IrType::I64, region: self.current_region() });
+        self.emit_inst(Inst::Store { ptr: slot, value: zero, store_ty: None });
+        let outer = self.handle_slot.replace((name, slot));
+        self.lower_stmt(stmt);
+        self.handle_slot = outer;
+        Some(self.emit_inst(Inst::Load { ptr: slot, ty: IrType::I64 }))
     }
 
     /// L3A: Inlined `do` (fallback for nested do inside if/for/etc.)
@@ -7990,6 +8029,7 @@ pub fn lower(program: &Program) -> IrModule {
     let mut lowerer = Lowerer::new();
     let mut module = lowerer.lower_program(program);
     auto_drop_vecs(&mut module);
+    auto_drop_strs(&mut module);
     module
 }
 
@@ -8099,13 +8139,13 @@ fn drop_function_vecs(f: &mut IrFunction) {
             match inst {
                 Some(Inst::Store { ptr, value, .. }) if shadows.contains_key(&ptr) => {
                     let shadow = shadows[&ptr];
-                    drop_shadow(f, shadow, &mut new);
+                    drop_shadow(f, "Vec_drop", shadow, &mut new);
                     new.push(id);
                     new.push(detached_inst(f, Inst::Store { ptr: shadow, value, store_ty: None }));
                 }
                 Some(Inst::Return { .. }) => {
                     for s in &kept {
-                        drop_shadow(f, shadows[s], &mut new);
+                        drop_shadow(f, "Vec_drop", shadows[s], &mut new);
                     }
                     new.push(id);
                 }
@@ -8116,20 +8156,187 @@ fn drop_function_vecs(f: &mut IrFunction) {
     }
 }
 
-/// `Vec_drop(*shadow)`, appended to `out`.
-fn drop_shadow(f: &mut IrFunction, shadow: ValueId, out: &mut Vec<ValueId>) {
+/// Calls that return a new string, held only by their caller.
+const STR_FRESH_CALLS: &[&str] = &["p_str_concat", "int_to_str"];
+/// Calls that read a string, keeping no pointer to it and returning none.
+const STR_READ_CALLS: &[&str] = &[
+    "p_str_concat", "str_len", "str_byte_at", "str_equal", "str_starts_with", "str_ends_with",
+    "str_contains", "str_find", "str_parse_int",
+];
+
+/// Free the strings that provably die where they are used, as auto_drop_vecs
+/// does for Vecs: a fresh string whose only use is a read in the same block
+/// (a temporary of `a + b + c`), and a slot that only receives fresh strings
+/// or literals and is read only by STR_READ_CALLS (or to print it). Anything
+/// else stays allocated: the worst case is a leak, never a dangling string.
+fn auto_drop_strs(module: &mut IrModule) {
+    if !module.functions.contains_key("Str_drop") {
+        return;
+    }
+    for func in module.functions.values_mut() {
+        drop_function_strs(func);
+    }
+}
+
+fn is_fresh_str(f: &IrFunction, id: &ValueId) -> bool {
+    matches!(f.instructions.get(id), Some(Inst::Call { func, .. }) if STR_FRESH_CALLS.contains(&func.as_str()))
+}
+
+fn reads_str(inst: &Inst) -> bool {
+    match inst {
+        Inst::Call { func, .. } => STR_READ_CALLS.contains(&func.as_str()),
+        Inst::Print { .. } => true,
+        _ => false,
+    }
+}
+
+fn drop_function_strs(f: &mut IrFunction) {
+    let order: Vec<ValueId> = f.blocks.iter().flat_map(|b| b.instructions.iter().copied()).collect();
+    if !order.iter().any(|id| is_fresh_str(f, id)) {
+        return;
+    }
+    let mut block_of: HashMap<ValueId, usize> = HashMap::new();
+    for (b, block) in f.blocks.iter().enumerate() {
+        for id in &block.instructions {
+            block_of.insert(*id, b);
+        }
+    }
+    let pos: HashMap<ValueId, usize> = order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+    let mut slots: HashSet<ValueId> = HashSet::new();
+    let mut loaded: HashMap<ValueId, ValueId> = HashMap::new();
+    let mut uses: HashMap<ValueId, usize> = HashMap::new();
+    let mut user: HashMap<ValueId, ValueId> = HashMap::new();
+    for id in &order {
+        let Some(inst) = f.instructions.get(id) else { continue; };
+        if matches!(inst, Inst::Alloca { .. }) {
+            slots.insert(*id);
+        }
+        let mut ops = Vec::new();
+        crate::pe::inst_operands(inst, &mut ops);
+        for op in ops {
+            *uses.entry(op).or_insert(0) += 1;
+            user.insert(op, *id);
+        }
+    }
+    let mut bad: HashSet<ValueId> = HashSet::new();
+    let mut written: HashSet<ValueId> = HashSet::new();
+    let mut last_store: HashMap<ValueId, usize> = HashMap::new();
+    for id in &order {
+        let Some(inst) = f.instructions.get(id) else { continue; };
+        let mut ops = Vec::new();
+        crate::pe::inst_operands(inst, &mut ops);
+        let mut target = None;
+        match inst {
+            Inst::Load { ptr, .. } if slots.contains(ptr) => {
+                loaded.insert(*id, *ptr);
+                target = Some(*ptr);
+            }
+            Inst::Store { ptr, value, .. } if slots.contains(ptr) => {
+                target = Some(*ptr);
+                if is_fresh_str(f, value) && uses.get(value) == Some(&1) {
+                    written.insert(*ptr);
+                } else if !matches!(f.instructions.get(value), Some(Inst::ConstStr { .. })) {
+                    bad.insert(*ptr);
+                }
+                last_store.insert(*ptr, pos[id]);
+            }
+            _ => {}
+        }
+        for op in ops {
+            if slots.contains(&op) && target != Some(op) {
+                bad.insert(op);
+            }
+            if let Some(slot) = loaded.get(&op) {
+                // Read in the same block, before the slot is written again
+                let clean = last_store.get(slot).map_or(true, |p| *p < pos[&op]);
+                if !reads_str(inst) || block_of[id] != block_of[&op] || !clean {
+                    bad.insert(*slot);
+                }
+            }
+        }
+    }
+    let kept: Vec<ValueId> = order.iter().copied().filter(|s| written.contains(s) && !bad.contains(s)).collect();
+    let mut temps: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    for id in &order {
+        if is_fresh_str(f, id) && uses.get(id) == Some(&1) {
+            let u = user[id];
+            if block_of[&u] == block_of[id] && f.instructions.get(&u).map_or(false, reads_str) {
+                temps.entry(u).or_default().push(*id);
+            }
+        }
+    }
+    if kept.is_empty() && temps.is_empty() {
+        return;
+    }
+    // The string a slot last held, kept apart from the slot, as for Vecs
+    let mut shadows: HashMap<ValueId, ValueId> = HashMap::new();
+    let mut prologue: Vec<ValueId> = Vec::new();
+    for s in &kept {
+        let zero = detached_inst(f, Inst::ConstInt { value: 0, ty: IrType::I64 });
+        let shadow = detached_inst(f, Inst::Alloca { ty: IrType::I64, region: Region::Stack });
+        let init = detached_inst(f, Inst::Store { ptr: shadow, value: zero, store_ty: None });
+        prologue.extend([zero, shadow, init]);
+        shadows.insert(*s, shadow);
+    }
+    for b in 0..f.blocks.len() {
+        let old = std::mem::take(&mut f.blocks[b].instructions);
+        let mut new = if b == 0 { std::mem::take(&mut prologue) } else { Vec::new() };
+        for id in old {
+            let inst = f.instructions.get(&id).cloned();
+            match inst {
+                Some(Inst::Store { ptr, value, .. }) if shadows.contains_key(&ptr) => {
+                    let shadow = shadows[&ptr];
+                    drop_shadow(f, "Str_drop", shadow, &mut new);
+                    new.push(id);
+                    let held = if is_fresh_str(f, &value) {
+                        value
+                    } else {
+                        let zero = detached_inst(f, Inst::ConstInt { value: 0, ty: IrType::I64 });
+                        new.push(zero);
+                        zero
+                    };
+                    new.push(detached_inst(f, Inst::Store { ptr: shadow, value: held, store_ty: None }));
+                }
+                Some(Inst::Return { .. }) => {
+                    for s in &kept {
+                        drop_shadow(f, "Str_drop", shadows[s], &mut new);
+                    }
+                    new.push(id);
+                }
+                _ => {
+                    new.push(id);
+                    if let Some(done) = temps.get(&id) {
+                        for t in done {
+                            drop_value(f, "Str_drop", *t, &mut new);
+                        }
+                    }
+                }
+            }
+        }
+        f.blocks[b].instructions = new;
+    }
+}
+
+/// `drop_fn(*shadow)`, appended to `out`.
+fn drop_shadow(f: &mut IrFunction, drop_fn: &str, shadow: ValueId, out: &mut Vec<ValueId>) {
     let old = detached_inst(f, Inst::Load { ptr: shadow, ty: IrType::I64 });
+    out.push(old);
+    drop_value(f, drop_fn, old, out);
+}
+
+/// `drop_fn(value)`, appended to `out`.
+fn drop_value(f: &mut IrFunction, drop_fn: &str, value: ValueId, out: &mut Vec<ValueId>) {
     let env = detached_inst(f, Inst::ConstInt { value: 0, ty: IrType::I64 });
     let mut effects = EffectSet::new();
     effects.add(Effect::Write);
     effects.add(Effect::Alloc);
     let call = detached_inst(f, Inst::Call {
-        func: "Vec_drop".to_string(),
-        args: vec![env, old],
+        func: drop_fn.to_string(),
+        args: vec![env, value],
         ret_ty: IrType::Void,
         effects,
     });
-    out.extend([old, env, call]);
+    out.extend([env, call]);
 }
 
 /// A new instruction not yet placed in a block.

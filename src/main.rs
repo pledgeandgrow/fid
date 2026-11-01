@@ -62,10 +62,28 @@ fn run_with_timeout(path: &str, limit: std::time::Duration) -> Option<process::O
         .stderr(process::Stdio::piped())
         .spawn()
         .ok()?;
+    // Read the output as it comes: a child filling a pipe would block forever
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = std::io::Read::read_to_end(&mut p, &mut bytes);
+            }
+            bytes
+        })
+    };
+    let out = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
+    let err = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(Some(status)) => {
+                return Some(process::Output {
+                    status,
+                    stdout: out.join().unwrap_or_default(),
+                    stderr: err.join().unwrap_or_default(),
+                });
+            }
             Ok(None) if start.elapsed() < limit => std::thread::sleep(std::time::Duration::from_millis(20)),
             _ => {
                 let _ = child.kill();
@@ -1377,10 +1395,10 @@ fn real_main() {
                         let mut cmd = process::Command::new(cc_prog);
                         cmd.args(&cc_args).arg(format!("-O{}", cc_opt)).args(unit_flags).arg("-o").arg(&output);
                         if !is_tcc {
-                            cmd.arg("-pie")
-                                .arg("-Wl,-z,relro")
-                                .arg("-Wl,-z,now")
-                                .arg("-Wl,-z,noexecstack");
+                            cmd.arg("-pie");
+                            if cfg!(not(windows)) {
+                                cmd.arg("-Wl,-z,relro").arg("-Wl,-z,now").arg("-Wl,-z,noexecstack");
+                            }
                         }
                         for o in &objs { cmd.arg(o); }
                         for lib in &link_libs { cmd.arg(lib); }
@@ -1615,10 +1633,12 @@ fn real_main() {
                                 .arg("-fno-strict-aliasing")      // generated code type-puns via pointer casts
                                 .arg("-o").arg(&output).arg(&c_path);
                             // Linker security flags
-                            cmd.arg("-pie")                     // position-independent executable
-                                .arg("-Wl,-z,relro")             // read-only relocations
-                                .arg("-Wl,-z,now")               // bind now (full RELRO)
-                                .arg("-Wl,-z,noexecstack");      // non-executable stack
+                            cmd.arg("-pie");                    // position-independent executable
+                            if cfg!(not(windows)) {              // the -z options are ELF-only
+                                cmd.arg("-Wl,-z,relro")          // read-only relocations
+                                    .arg("-Wl,-z,now")           // bind now (full RELRO)
+                                    .arg("-Wl,-z,noexecstack");  // non-executable stack
+                            }
                             for lib in &link_libs {
                                 cmd.arg(lib);
                             }
@@ -1805,7 +1825,6 @@ fn real_main() {
                 "test_crashfree_fail",
                 "test_crashfree_index_fail",
                 "test_crashfree_overflow_fail",
-                "test_txn_rollback_fail",
                 "test_typed_strings_fail",
                 "test_init_guarantee_fail",
                 "test_init_guarantee_cond_fail",
@@ -1836,7 +1855,6 @@ fn real_main() {
                 // ML3: @differentiable with IO effect
                 "test_autodiff_fail",
                 // ML2: Shape mismatch is a compile error
-                "test_shape_verify_fail",
                 // ML9: KV cache without budget
                 "test_kv_cache_fail",
                 "test_val_assign_fail",
@@ -1847,6 +1865,12 @@ fn real_main() {
                 "test_crashfree_method_fail",
                 "test_double_free_fail",
                 "test_bad_free_fail",
+                "test_deref_safe_fail",
+                "test_malloc_safe_fail",
+                "test_int_to_ptr_safe_fail",
+                "test_literal_range_fail",
+                "test_narrowing_fail",
+                "test_race_global_fail",
                 // ML10: @quantized with dequantize
                 "test_quantization_fail",
                 // ML11: @checkpoint without @deterministic
@@ -2086,6 +2110,27 @@ fn real_main() {
                         !stderr.contains("panic:") && !stderr.contains("error")
                     })
                     .unwrap_or(false);
+                // An expected failure must fail for its own reason, named by
+                // `// expect-error: text` in the test.
+                if fail_only && !run.interp_skipped {
+                    let want = fs::read_to_string(test_file).ok().and_then(|src| {
+                        src.lines().find_map(|l| l.strip_prefix("// expect-error: ").map(|t| t.trim().to_string()))
+                    });
+                    let got = interp_out.as_ref()
+                        .map(|o| format!("{}{}", String::from_utf8_lossy(&o.stderr), String::from_utf8_lossy(&o.stdout)))
+                        .unwrap_or_default();
+                    match want {
+                        Some(w) if got.contains(&w) => {}
+                        Some(w) => {
+                            eprintln!("  [WRONG REASON] {}: expected '{}'", name, w);
+                            run.interp_ok = true;
+                        }
+                        None => {
+                            eprintln!("  [NO EXPECT-ERROR] {}", name);
+                            run.interp_ok = true;
+                        }
+                    }
+                }
                 let mut interp_stdout = interp_out
                     .as_ref()
                     .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
@@ -2128,7 +2173,7 @@ fn real_main() {
                 };
                 run.c_ok = if let Some(Ok(compile_out)) = c_compile.as_ref() {
                     if compile_out.status.success() {
-                        if let Ok(c_out) = process::Command::new(&c_exe).output() {
+                        if let Some(c_out) = run_with_timeout(&c_exe, std::time::Duration::from_secs(30)) {
                             let c_stdout = String::from_utf8_lossy(&c_out.stdout).to_string();
                             if run.interp_skipped {
                                 // The compiled run is the reference: it must succeed.
@@ -2190,7 +2235,8 @@ fn real_main() {
                         .map(|o| String::from_utf8_lossy(&o.stderr).lines().find(|l| l.contains("rror")).unwrap_or("no binary").to_string())
                         .unwrap_or_else(|e| e.to_string());
                     false
-                } else if run.c_skipped {
+                } else if run.c_skipped || !cfg!(windows) {
+                    // A valid binary is the check where it cannot run
                     true
                 } else {
                     match run_with_timeout(&pe_exe, std::time::Duration::from_secs(30)) {

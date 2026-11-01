@@ -188,6 +188,11 @@ pub struct TypeChecker {
     /// Current unsafe block nesting depth — when > 0, raw pointer operations
     /// (dereference, arithmetic) are permitted.
     unsafe_depth: usize,
+    /// The function being checked, the functions started on another thread,
+    /// and (function, global, line) of each write to a global in the program
+    checking_fn: String,
+    thread_entries: Vec<String>,
+    global_writes: Vec<(String, String, usize)>,
     /// Set of variables declared with `pm` that have not yet been assigned.
     /// Reading a variable in this set is a compile error (F63: init guarantee).
     uninit_vars: HashSet<String>,
@@ -255,6 +260,9 @@ impl TypeChecker {
             scope_linear_vars: vec![Vec::new()],
             loop_depth: 0,
             unsafe_depth: 0,
+            checking_fn: String::new(),
+            thread_entries: Vec::new(),
+            global_writes: Vec::new(),
             uninit_vars: HashSet::new(),
             current_line: 0,
             method_calls: Vec::new(),
@@ -1079,6 +1087,42 @@ impl TypeChecker {
         }
 
         self.verify_method_calls(program);
+        self.verify_no_races(program);
+    }
+
+    /// A function that runs on another thread may not write a global of the
+    /// program unless it takes a lock: nothing orders the writes, and an
+    /// increment loses updates. Atomics are calls, not writes, so they pass.
+    fn verify_no_races(&mut self, program: &Program) {
+        let bodies: HashMap<&str, &Func> = program.funcs.iter().map(|f| (f.name.as_str(), f)).collect();
+        let mut reached: HashSet<String> = HashSet::new();
+        let mut work = self.thread_entries.clone();
+        while let Some(name) = work.pop() {
+            if !reached.insert(name.clone()) {
+                continue;
+            }
+            if let Some(f) = bodies.get(name.as_str()) {
+                let mut called = HashSet::new();
+                self.collect_called_funcs(&f.body, &mut called);
+                work.extend(called);
+            }
+        }
+        for (func, global, line) in self.global_writes.clone() {
+            if !reached.contains(&func) {
+                continue;
+            }
+            let mut called = HashSet::new();
+            if let Some(f) = bodies.get(func.as_str()) {
+                self.collect_called_funcs(&f.body, &mut called);
+            }
+            if !called.iter().any(|c| c.ends_with("mutex_lock") || c.ends_with("write_lock")) {
+                self.errors.push(format!(
+                    "Race error (line {}): '{}' runs on another thread and writes the global '{}' with no lock.\n    \
+                     Fix: hold a mutex around the write, or use p_shared_alloc and the p_atomic_ functions.",
+                    line, func, global
+                ));
+            }
+        }
     }
 
     /// Verify that declared effect annotations match the inferred effects.
@@ -4260,7 +4304,20 @@ impl TypeChecker {
         }
     }
 
+    /// `@unsafe fn` is one `unsafe` block around the whole body.
     fn check_func(&mut self, func: &Func) {
+        let whole = func.annotations.iter().any(|a| a.name == "unsafe");
+        self.checking_fn = func.name.clone();
+        if whole {
+            self.unsafe_depth += 1;
+        }
+        self.check_func_body(func);
+        if whole {
+            self.unsafe_depth -= 1;
+        }
+    }
+
+    fn check_func_body(&mut self, func: &Func) {
         self.current_func_name = Some(func.name.clone());
         self.current_return_types.clear();
         let saved_ret_ty = self.current_ret_ty.take();
@@ -4367,6 +4424,7 @@ impl TypeChecker {
                 // Consume linear values in the initializer expression
                 self.consume_linear_in_expr(expr, *line);
                 let final_ty = if let Some(declared) = ty {
+                    self.check_value_fits(declared, &expr_ty, expr, *line);
                     if !self.types_compatible(declared, &expr_ty)
                         && !(Self::is_runtime_layer(&self.current_module) && Self::is_handle_int_pair(declared, &expr_ty)) {
                         self.errors.push(format!(
@@ -4379,6 +4437,11 @@ impl TypeChecker {
                         ));
                     }
                     declared.clone()
+                } else if Self::is_constant_expr(expr)
+                    && Self::int_shape(&expr_ty).map_or(false, |(b, _)| b < 64) {
+                    // `var i = 0` is an i64: the literal's size says nothing
+                    // about what the variable will hold
+                    Type::I64
                 } else {
                     expr_ty
                 };
@@ -4532,7 +4595,12 @@ impl TypeChecker {
                 self.uninit_vars = uninit_after_then.union(&self.uninit_vars).cloned().collect();
             }
             Stmt::Assign { target, op: _, expr, line } => {
-                let _expr_ty = self.check_expr(expr);
+                let expr_ty = self.check_expr(expr);
+                if let Some(declared) = self.lookup(target).cloned() {
+                    self.check_value_fits(&declared, &expr_ty, expr, *line);
+                } else if self.current_module == "main" && self.globals.contains_key(target) {
+                    self.global_writes.push((self.checking_fn.clone(), target.clone(), *line));
+                }
                 // Consume linear values in the RHS
                 self.consume_linear_in_expr(expr, *line);
                 // Mark as initialized (F63: init guarantee)
@@ -4635,7 +4703,10 @@ impl TypeChecker {
                 }
             }
             Stmt::DerefAssign { ptr_expr, op: _, expr, line: _ } => {
-                self.check_expr(ptr_expr);
+                let ptr_ty = self.check_expr(ptr_expr);
+                if matches!(ptr_ty, Type::RawPtr { .. }) {
+                    self.require_unsafe("writing through a raw pointer");
+                }
                 self.check_expr(expr);
             }
             Stmt::FieldAssign { object, field, op, expr, line } => {
@@ -5377,6 +5448,16 @@ impl TypeChecker {
                 }
             }
             Expr::Call { callee, args } => {
+                if callee == "p_thread_spawn" {
+                    if let Some(Expr::StringLit(name)) = args.first() {
+                        self.thread_entries.push(name.clone());
+                    }
+                }
+                if matches!(callee.as_str(), "p_malloc" | "p_alloc" | "p_free" | "p_realloc" | "p_memcpy" | "p_memset") {
+                    self.require_unsafe(&format!("{}()", callee));
+                } else if self.extern_fns.contains(callee.as_str()) && !callee.starts_with("p_") {
+                    self.require_unsafe(&format!("calling the C function {}()", callee));
+                }
                 // Check capabilities for built-in functions that produce effects
                 match callee.as_str() {
                     "print" | "println" | "print_int" | "print_float" | "print_str" => {
@@ -6482,7 +6563,10 @@ impl TypeChecker {
                 let ty = self.check_expr(expr);
                 match ty {
                     Type::Ref { inner, .. } => *inner,
-                    Type::RawPtr { inner, .. } => *inner,
+                    Type::RawPtr { inner, .. } => {
+                        self.require_unsafe("reading through a raw pointer");
+                        *inner
+                    }
                     Type::Generic { ref name, ref args } if name == "Box" && args.len() == 1 => args[0].clone(),
                     _ => {
                         self.errors.push(format!(
@@ -6650,8 +6734,12 @@ impl TypeChecker {
                 }
             }
             Expr::Cast { expr, target_ty } => {
-                self.check_expr(expr);
-                self.resolve_type(target_ty)
+                let from = self.check_expr(expr);
+                let to = self.resolve_type(target_ty);
+                if matches!(to, Type::RawPtr { .. }) && self.is_integer(&from) {
+                    self.require_unsafe("turning an integer into a pointer");
+                }
+                to
             }
             Expr::Asm { template: _, operands } => {
                 // Type-check each operand expression
@@ -6776,6 +6864,9 @@ impl TypeChecker {
                 // an async function). spawn schedules it for concurrent execution
                 // and returns the same Future<T>.
                 let inner_ty = self.check_expr(inner);
+                if let Expr::Call { callee, .. } = &**inner {
+                    self.thread_entries.push(callee.clone());
+                }
 
                 // @send check: any variables captured in the spawn expression
                 // must be @send (safe to send across threads).
@@ -7039,6 +7130,93 @@ impl TypeChecker {
         false
     }
 
+    /// Raw memory is `unsafe` in the program itself. Imported modules are
+    /// not checked yet: their `unsafe` blocks are not complete (roadmap M10).
+    fn require_unsafe(&mut self, what: &str) {
+        if self.current_module == "main" && self.unsafe_depth == 0 {
+            self.errors.push(format!(
+                "Safety error (line {}): {} needs an `unsafe` block.",
+                self.current_line, what
+            ));
+        }
+    }
+
+    /// (bits, signed) of an integer type.
+    fn int_shape(ty: &Type) -> Option<(u32, bool)> {
+        match ty {
+            Type::I8 => Some((8, true)),
+            Type::I16 => Some((16, true)),
+            Type::I32 => Some((32, true)),
+            Type::I64 => Some((64, true)),
+            Type::I128 => Some((128, true)),
+            Type::U8 => Some((8, false)),
+            Type::U16 => Some((16, false)),
+            Type::U32 => Some((32, false)),
+            Type::U64 => Some((64, false)),
+            Type::U128 => Some((128, false)),
+            _ => None,
+        }
+    }
+
+    /// A value given to an integer type must fit it: a literal is checked
+    /// against the type, and in the program itself a wider value or a float
+    /// needs an explicit `as`.
+    fn check_value_fits(&mut self, declared: &Type, actual: &Type, expr: &Expr, line: usize) {
+        let declared = self.resolve_type(declared);
+        let Some((bits, signed)) = Self::int_shape(&declared) else { return; };
+        let literal = match expr {
+            Expr::IntLit(v) => Some((*v, false)),
+            Expr::Unary { op: crate::ast::UnaryOp::Neg, expr } => match &**expr {
+                Expr::IntLit(v) => Some((*v, true)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((v, negative)) = literal {
+            let fits = if negative {
+                signed && (bits >= 64 || v <= 1i64 << (bits - 1))
+            } else if bits >= 64 {
+                true
+            } else if signed {
+                v >= 0 && v < 1i64 << (bits - 1)
+            } else {
+                v >= 0 && v < 1i64 << bits
+            };
+            if !fits {
+                self.errors.push(format!(
+                    "Type error (line {}): the literal does not fit in {}.", line, declared
+                ));
+            }
+            return;
+        }
+        if self.current_module != "main" || Self::is_constant_expr(expr) {
+            return;
+        }
+        // `x & 0xFF`: the literal takes the other operand's type
+        if let Expr::Binary { left, right, .. } = expr {
+            if Self::is_constant_expr(left) || Self::is_constant_expr(right) {
+                return;
+            }
+        }
+        let actual = self.resolve_type(actual);
+        let wider = Self::int_shape(&actual).map_or(false, |(b, _)| b > bits);
+        if wider || self.is_float(&actual) {
+            self.errors.push(format!(
+                "Type error (line {}): a {} may not fit in {}.\n    Fix: convert it with `as {}`.",
+                line, actual, declared, declared
+            ));
+        }
+    }
+
+    fn is_constant_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::IntLit(_) => true,
+            Expr::Unary { expr, .. } => Self::is_constant_expr(expr),
+            Expr::Binary { left, right, .. } => Self::is_constant_expr(left) && Self::is_constant_expr(right),
+            _ => false,
+        }
+    }
+
     fn types_compatible(&self, declared: &Type, actual: &Type) -> bool {
         let declared = self.resolve_type(declared);
         let actual = self.resolve_type(actual);
@@ -7125,9 +7303,10 @@ impl TypeChecker {
                 Type::RawPtr { inner: a_inner, is_mut: a_mut }) = (&declared, &actual) {
             return d_mut == a_mut && self.types_compatible(d_inner, a_inner);
         }
-        // Allow i64 ↔ *mut T / *const T (pointers are i64 internally)
+        // Allow i64 ↔ *mut T / *const T (pointers are i64 internally). Making
+        // a pointer from an integer is for `unsafe` code in the program itself.
         if matches!(declared, Type::RawPtr { .. }) && self.is_numeric(&actual) {
-            return true;
+            return self.current_module != "main" || self.unsafe_depth > 0;
         }
         if matches!(actual, Type::RawPtr { .. }) && self.is_numeric(&declared) {
             return true;

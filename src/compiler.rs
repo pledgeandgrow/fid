@@ -574,7 +574,18 @@ pub fn build_program_with_runtime(source: &str, source_path: Option<&str>, runti
         let mut all_modules: Vec<(&String, &Program)> =
             imported_modules.iter().map(|(n, p)| (n, p)).collect();
         all_modules.push((&user_module, &user));
-        let conflicts = find_module_conflicts(&all_modules);
+        let mut conflicts = find_module_conflicts(&all_modules);
+        // A type of core redefined by a module would be silently replaced
+        for (module, prog) in imported_modules.iter() {
+            for s in &prog.structs {
+                if stdlib.structs.iter().any(|c| c.name == s.name) {
+                    conflicts.push(format!(
+                        "Duplicate definition: type '{}' is defined in both module 'core' and module '{}'",
+                        s.name, module
+                    ));
+                }
+            }
+        }
         if !conflicts.is_empty() {
             return Err(conflicts);
         }

@@ -387,6 +387,66 @@ val s2 = s1;     // String is Move — s1 is moved
 // println(s1);  // ERROR: s1 was moved
 ```
 
+### Unsafe Code
+
+A program works with raw memory only inside `unsafe { }`, or in a function
+marked `@unsafe`:
+
+```fides
+@unsafe
+fn first_word(addr: i64) -> i64 {
+    var p: *mut i64 = addr;
+    return *p;
+}
+```
+
+Outside them, each of these is a compile error:
+
+- reading or writing through a raw pointer (`*p`, `*p = v`)
+- `p_malloc`, `p_alloc`, `p_free`, `p_realloc`, `p_memcpy`, `p_memset`
+- making a pointer from an integer
+- calling an `extern "C"` function
+
+Inside them the compiler no longer protects you, though a bad free still stops
+the program: freeing a block twice panics with `Double free`, and freeing
+anything that is not a live block panics with `Invalid free`. A second free
+after the block has been reused cannot be detected.
+
+These rules apply to the program itself. Imported modules are not held to them
+yet, and Fides does not yet promise full memory safety: see
+`docs/roadmap/release-roadmap.md`, track M.
+
+**Strings and Vecs are freed for you.** A temporary string, and a local string
+or `Vec` that never leaves its variable, is freed by the compiler. Anything it
+cannot prove stays allocated: the worst case is a leak.
+
+### Values That Must Fit
+
+A value given to an integer type must fit it:
+
+```fides
+var a: u8 = 300;           // error: the literal does not fit in u8
+var big: i64 = 5000000000;
+var b: i32 = big;          // error: a i64 may not fit in i32
+var c: i32 = big as i32;   // the conversion is explicit
+var i = 0;                 // an i64, whatever the size of the literal
+```
+
+A float going into an integer needs `as` too.
+
+### Threads and Globals
+
+A function that runs on another thread, or anything it calls, may not write a
+global of the program without taking a lock:
+
+```fides
+var counter: i64 = 0;
+fn bump() { counter = counter + 1; }   // error when `spawn bump()` exists
+```
+
+Hold a mutex around the write, or use `p_shared_alloc` and the `p_atomic_*`
+functions. Shared data reached through pointers is not checked yet.
+
 ### 4.3 Region-Based Memory
 
 Fides supports region-based memory management via `region` blocks:
