@@ -33,24 +33,27 @@ Self-compile: about 3 minutes natively, 22 s with `fidesc`.
 
 | Gap | Track |
 |---|---|
-| C libraries need `ccompile`; `use sqlite` fails | B, E |
+| C libraries need `ccompile` | E |
 | Strings are not reclaimed in long-running programs | C |
 | Native builds are several times slower on tight loops | D |
 | Bare-metal tests only run hosted, where they fault | G |
-| Linux has not been run | F |
-| No TLS; `http`, `net` and `sqlite` do not compile | B, I |
+| Linux only builds and runs unit tests and one program | F |
+| No TLS; `http` and `net` are thin and blocking | I |
 | Only SHA-256 and HMAC, unreviewed | J |
 | `async` runs eagerly and does not suspend | H |
 | macOS, ARM64, RISC-V and WASM are partial | F |
 | Safety annotations are not certified or fully enforced | K, L |
+| Safe code can still corrupt memory | M, K |
+| No package registry; the editor extension only highlights syntax | N |
 
 ## Release gates
 
 **Public beta** needs: all of tracks A and B; C1–C4; D1–D3; E1–E3; F1–F3;
-H1–H2; K1–K3. A beta may have gaps, but every gap must be documented.
+H1–H2; K1–K3; M1–M3, M6; N1–N5. A beta may have gaps, but every gap must be
+documented.
 
-**Stable 1.0** needs: all of tracks A–E, F1–F6, H, I, J1–J6 and K, plus every
-guide and feature table matching what the compiler does.
+**Stable 1.0** needs: all of tracks A–E, F1–F6, H, I, J1–J6, K, M and N, plus
+every guide and feature table matching what the compiler does.
 
 **After 1.0:** track L (safety-critical), native macOS, ARM64, RISC-V and WASM
 (F7–F9), J7–J9 and track G beyond what `fides-os` needs. None of them block
@@ -74,6 +77,8 @@ Each changes the work below. Recommendations first; none is taken yet.
    colouring, matches the existing `test_no_coloring`), or compiled state
    machines.
 5. **Platform order:** Linux first (recommended), then macOS, then ARM64.
+6. **Package registry:** an index in a Git repository (recommended: cheap to run
+   and easy to mirror), or a hosted service.
 
 ## Track A — Release foundations
 
@@ -332,13 +337,102 @@ until this track is complete.
 
 **Acceptance:** an external assessor's report, not our own claim.
 
+## Track M — Memory safety
+
+The goal: **a program with no `unsafe` block cannot corrupt memory.** A memory
+bug is rejected at compile time or stops with a panic. It never reads freed
+memory or silently damages other data.
+
+Track C makes this more urgent: every compiler-inserted free is a new way to
+free too early. M3 and M6 must land before C1 and C2.
+
+Tested on Nov 1, native build:
+
+| Error | What happens today | Fixed by |
+|---|---|---|
+| `Vec` index out of bounds | Panics | Done |
+| Wild or null pointer read | Compiles outside `unsafe`; panics only if unmapped | K1, M2 |
+| Double free | `p_free` needs no `unsafe`; the second free is accepted silently | M2, M3 |
+| Use after free | Needs `unsafe` to read, but nothing detects it: it read 0 | M7, M8 |
+| Two names for one `Vec` | `var b = a` shares it, with no move check | M4, M5 |
+| `push` during `for` over the same `Vec` | Compiles and runs | K4 |
+
+- [ ] M1. Write down the guarantee in the language guide: what safe code
+      promises, and exactly what `unsafe` gives up (S).
+- [ ] M2. `p_malloc`, `p_free`, integer-to-pointer casts and `extern "C"` calls
+      need `unsafe` (M).
+- [ ] M3. The allocator marks freed blocks in their header and panics on a double
+      free or a pointer it never handed out (S).
+- [ ] M4. Decide what `var b = a` means for `Vec`, `str` and `HashMap`: a move, or
+      a shared counted handle (S, see decision 3).
+- [ ] M5. Enforce it: use after move is rejected, or shared handles are counted
+      (L).
+- [ ] M6. Every compiler-inserted free has tests for each way a value can escape:
+      assignment, field, return, closure, task, container, `unsafe` (M).
+- [ ] M7. A checked allocator mode that keeps and poisons freed blocks, so use
+      after free panics instead of reading stale data (M).
+- [ ] M8. The suite runs under AddressSanitizer through the C path, in CI (M).
+- [ ] M9. Fuzzing: random programs must agree on the interpreter, C and native
+      paths and stay clean under M7 and M8, run nightly (L).
+- [ ] M10. Audit every `unsafe` block in the stdlib: each states why it is sound,
+      and no safe stdlib function can be misused into a memory error (L).
+
+K1, K4, K5, K6, C5, C6 and H3 count towards this goal.
+
+**Acceptance:** every row of the table is rejected or panics, with a test;
+sanitizer runs and a week of fuzzing find no memory error in programs without
+`unsafe`. Until then the docs must not call Fides memory-safe.
+
+## Track N — Tooling and packages
+
+Some tools exist, but a new user cannot yet get from install to a working
+project with packages and editor help. Checked Nov 1:
+
+| Tool | Works today | Missing |
+|---|---|---|
+| `ark` | `init`, `add`, `install`, `list`, `lock` for path and git packages | No registry: `search` and `publish` only print "not yet implemented" |
+| LSP | Completion, go to definition, hover, rename, diagnostics | References, formatting, signature help; not tested in CI |
+| VS Code extension | Syntax highlighting | Does not use the LSP; not on the Marketplace |
+| `fmt`, `lint`, `test`, `bench`, `profile` | On both compilers | Not run in CI |
+| `ark`, `scribe`, `veil` | Rust binaries | No self-hosted version |
+| Debugging | `debug` and `replay`; `autopsy` on Linux | Source-level debugging of native Windows builds |
+
+- [ ] N1. CI runs `ark init`, `add`, `install` and a build from a clean machine,
+      on Windows and Linux (S).
+- [ ] N2. A getting-started guide, followed step by step in CI (M).
+- [ ] N3. The VS Code extension starts the LSP, and is on the Marketplace (M).
+- [ ] N4. `fmt --check` passes on the stdlib and the compiler in CI; formatting
+      keeps every comment and never changes behaviour (M).
+- [ ] N5. `lint` runs in CI and is clean on the stdlib (S).
+- [ ] N6. Package registry: names, versions, checksums and yanking, with
+      `ark search` and `ark publish` working (L, see decision 6).
+- [ ] N7. The LSP gains references, formatting and signature help, with tests (M).
+- [ ] N8. `ark`, `scribe` and `veil` are ported to Fides or shipped by the same
+      release process as `fid` (L).
+- [ ] N9. Source-level debugging of native Windows builds: line tables a standard
+      debugger can read (L).
+- [ ] N10. `docs/stdlib/` is generated by `scribe` and published with each release
+      (M).
+- [ ] N11. Five example projects built in CI: command-line tool, library, service,
+      game, C binding (M).
+- [ ] N12. Install and update on a clean machine, tested in CI; `fid --version`
+      names the exact build (M).
+- [ ] N13. Contributor basics: contribution guide, issue templates, release notes,
+      a security contact (S).
+
+**Acceptance:** on a clean Windows or Linux machine, a new user follows only the
+guide to install Fides, create a project, add a registry package, get completion
+and go to definition in VS Code, then format, test and build it.
+
 ## Order of work
 
 1. **A, B:** quick, and every other track relies on them.
-2. **C1–C4, D1–D3, E1–E3:** the cheap wins with the most visible effect.
-3. **F1–F3, H1–H2, K1–K3:** the rest of the beta gate. **→ Public beta**
-4. **D4, H3, H5, C3, I, J:** the large projects, after decisions 1–4.
-5. **K, remaining F, docs.** **→ Stable 1.0**
+2. **M1–M3, M6, then C1–C4, D1–D3, E1–E3:** the cheap wins with the most visible
+   effect, with the safety checks first so new frees cannot go unnoticed.
+3. **F1–F3, H1–H2, K1–K3, N1–N5:** the rest of the beta gate. **→ Public beta**
+4. **D4, H3, H5, C3, I, J, M4–M5, N6:** the large projects, after decisions 1–4
+   and 6.
+5. **K, remaining F, M and N, docs.** **→ Stable 1.0**
 6. **G, F7–F9, L:** after 1.0.
 
 ## Notes
