@@ -402,3 +402,328 @@ pub fn global_cache_clear() {
     ensure_cache_init();
     IncrementalCache_clear(&mut g_cache);
 }
+
+// --- Canonical C and the artifact store (as src/inc.rs) ------------------
+// The stamp keys a build on its inputs. The artifact store keys a built
+// binary on what the program compiles to: a hash of the generated C with
+// comments and whitespace gone, the functions it defines alpha-renamed
+// positionally (except `main`) and unreferenced ones dropped. Every other
+// identifier stays: an external C function names what the program does.
+// `// PLINK:` lines stay too: they choose what is linked.
+
+/// Tokens of a C source: spans, and whether each is an identifier.
+pub struct CTokens {
+    pub is_ident: Vec<i64>,
+    pub starts: Vec<i64>,
+    pub ends: Vec<i64>,
+}
+
+fn c_is_ident_start(c: i64) -> bool {
+    return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95;
+}
+
+fn c_is_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+fn c_push_tok(t: &mut CTokens, ident: i64, start: i64, end: i64) {
+    t.is_ident.push(ident);
+    t.starts.push(start);
+    t.ends.push(end);
+}
+
+pub fn inc_lex_c(src: str) -> CTokens {
+    var t: CTokens = CTokens { is_ident: Vec::new(), starts: Vec::new(), ends: Vec::new() };
+    var n: i64 = str_len(src);
+    var i: i64 = 0;
+    var at_line_start: bool = true;
+    while i < n {
+        var c: i64 = str_byte_at(src, i);
+        if c == 10 || c == 13 || c == 32 || c == 9 || c == 11 || c == 12 {
+            at_line_start = c == 10;
+            i = i + 1;
+        } else if c == 47 && i + 1 < n && str_byte_at(src, i + 1) == 47 {
+            var cs: i64 = i;
+            while i < n && str_byte_at(src, i) != 10 { i = i + 1; }
+            if i - cs >= 9 && str_starts_with(str_slice_len(src, n, cs, cs + 9), "// PLINK:") {
+                c_push_tok(&mut t, 0, cs, i);
+            }
+        } else if c == 47 && i + 1 < n && str_byte_at(src, i + 1) == 42 {
+            i = i + 2;
+            while i + 1 < n && !(str_byte_at(src, i) == 42 && str_byte_at(src, i + 1) == 47) { i = i + 1; }
+            i = i + 2;
+            if i > n { i = n; }
+        } else if c == 35 && at_line_start {
+            var ps: i64 = i;
+            while i < n && str_byte_at(src, i) != 10 { i = i + 1; }
+            // A line ending in '\' continues the directive.
+            while i < n && str_byte_at(src, i - 1) == 92 {
+                i = i + 1;
+                while i < n && str_byte_at(src, i) != 10 { i = i + 1; }
+            }
+            c_push_tok(&mut t, 0, ps, i);
+        } else if c_is_ident_start(c) {
+            at_line_start = false;
+            var ids: i64 = i;
+            while i < n && (c_is_ident_start(str_byte_at(src, i)) || c_is_digit(str_byte_at(src, i))) { i = i + 1; }
+            c_push_tok(&mut t, 1, ids, i);
+        } else if c == 34 || c == 39 {
+            at_line_start = false;
+            var qs: i64 = i;
+            i = i + 1;
+            while i < n && str_byte_at(src, i) != c {
+                if str_byte_at(src, i) == 92 { i = i + 1; }
+                i = i + 1;
+            }
+            i = i + 1;
+            if i > n { i = n; }
+            c_push_tok(&mut t, 0, qs, i);
+        } else if c_is_digit(c) {
+            at_line_start = false;
+            var ds: i64 = i;
+            while i < n {
+                var d: i64 = str_byte_at(src, i);
+                if !(c_is_ident_start(d) || c_is_digit(d) || d == 46) { break; }
+                i = i + 1;
+            }
+            c_push_tok(&mut t, 0, ds, i);
+        } else {
+            at_line_start = false;
+            c_push_tok(&mut t, 0, i, i + 1);
+            i = i + 1;
+        }
+    }
+    return t;
+}
+
+/// The one-character token `c`?
+fn c_tok_is(src: str, t: &CTokens, i: i64, c: i64) -> bool {
+    return t.is_ident.get(i) == 0 && t.ends.get(i) - t.starts.get(i) == 1 && str_byte_at(src, t.starts.get(i)) == c;
+}
+
+/// Top-level function definitions: `... name ( ... ) { ... }` at depth 0.
+pub struct CDefs {
+    pub names: Vec<str>,
+    pub name_toks: Vec<i64>,
+    pub start_toks: Vec<i64>,
+    pub end_toks: Vec<i64>,
+}
+
+pub fn inc_find_c_defs(src: str, t: &CTokens) -> CDefs {
+    var defs: CDefs = CDefs { names: Vec::new(), name_toks: Vec::new(), start_toks: Vec::new(), end_toks: Vec::new() };
+    var n: i64 = t.starts.len();
+    var slen: i64 = str_len(src);
+    var depth: i64 = 0;
+    var stmt_start: i64 = 0;
+    var j: i64 = 0;
+    while j < n {
+        var is_def: bool = false;
+        if c_tok_is(src, t, j, 123) {
+            depth = depth + 1;
+        } else if c_tok_is(src, t, j, 125) {
+            depth = depth - 1;
+            if depth == 0 { stmt_start = j + 1; }
+        } else if c_tok_is(src, t, j, 59) && depth == 0 {
+            stmt_start = j + 1;
+        }
+        if depth == 0 && t.is_ident.get(j) == 1 && j + 1 < n && c_tok_is(src, t, j + 1, 40) {
+            var d: i64 = 0;
+            var k: i64 = j + 1;
+            while k < n {
+                if c_tok_is(src, t, k, 40) { d = d + 1; }
+                if c_tok_is(src, t, k, 41) { d = d - 1; }
+                if d == 0 { break; }
+                k = k + 1;
+            }
+            if k + 1 < n && c_tok_is(src, t, k + 1, 123) {
+                var d2: i64 = 0;
+                var m: i64 = k + 1;
+                while m < n {
+                    if c_tok_is(src, t, m, 123) { d2 = d2 + 1; }
+                    if c_tok_is(src, t, m, 125) { d2 = d2 - 1; }
+                    if d2 == 0 { break; }
+                    m = m + 1;
+                }
+                var e: i64 = m + 1;
+                if e > n { e = n; }
+                defs.names.push(str_slice_len(src, slen, t.starts.get(j), t.ends.get(j)));
+                defs.name_toks.push(j);
+                defs.start_toks.push(stmt_start);
+                defs.end_toks.push(e);
+                j = m + 1;
+                stmt_start = j;
+                is_def = true;
+            }
+        }
+        if !is_def { j = j + 1; }
+    }
+    return defs;
+}
+
+@wrapping
+fn inc_mix(h: i64, src: str, start: i64, end: i64) -> i64 {
+    var i: i64 = start;
+    var r: i64 = h;
+    while i < end {
+        r = (r ^ (str_byte_at(src, i) & 0xFF)) * 1099511628211;
+        i = i + 1;
+    }
+    return r;
+}
+
+/// Hash of the canonical form of generated C.
+pub fn inc_canon_hash(src: str) -> i64 {
+    var t: CTokens = inc_lex_c(src);
+    var defs: CDefs = inc_find_c_defs(src, &t);
+    var n: i64 = t.starts.len();
+    var slen: i64 = str_len(src);
+    var in_body: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        in_body.push(-1);
+        i = i + 1;
+    }
+    var def_index: i64 = HashMap_new();
+    var di: i64 = 0;
+    while di < defs.names.len() {
+        HashMap_insert(def_index, defs.names.get(di), di + 1);
+        var k: i64 = defs.start_toks.get(di);
+        while k < defs.end_toks.get(di) {
+            in_body.set(k, di);
+            k = k + 1;
+        }
+        di = di + 1;
+    }
+    // Liveness: roots are `main` and every identifier outside a definition
+    var live: Vec<i64> = Vec::new();
+    di = 0;
+    while di < defs.names.len() {
+        live.push(0);
+        di = di + 1;
+    }
+    var work: Vec<i64> = Vec::new();
+    var main_slot: i64 = HashMap_get(def_index, "main");
+    if main_slot != 0 {
+        live.set(main_slot - 1, 1);
+        work.push(main_slot - 1);
+    }
+    i = 0;
+    while i < n {
+        if t.is_ident.get(i) == 1 && in_body.get(i) < 0 {
+            var slot: i64 = HashMap_get(def_index, str_slice_len(src, slen, t.starts.get(i), t.ends.get(i)));
+            if slot != 0 && live.get(slot - 1) == 0 {
+                live.set(slot - 1, 1);
+                work.push(slot - 1);
+            }
+        }
+        i = i + 1;
+    }
+    while work.len() > 0 {
+        var d: i64 = work.pop();
+        var k: i64 = defs.name_toks.get(d) + 1;
+        while k < defs.end_toks.get(d) {
+            if t.is_ident.get(k) == 1 {
+                var s2: i64 = HashMap_get(def_index, str_slice_len(src, slen, t.starts.get(k), t.ends.get(k)));
+                if s2 != 0 && live.get(s2 - 1) == 0 {
+                    live.set(s2 - 1, 1);
+                    work.push(s2 - 1);
+                }
+            }
+            k = k + 1;
+        }
+    }
+    // Alpha-rename defined functions positionally; hash the kept tokens.
+    var numbers: i64 = HashMap_new();
+    var next: i64 = 1;
+    var h: i64 = 8834263827529598795;
+    i = 0;
+    while i < n {
+        var owner: i64 = in_body.get(i);
+        if owner < 0 || live.get(owner) != 0 {
+            var s: i64 = t.starts.get(i);
+            var e: i64 = t.ends.get(i);
+            var renamed: i64 = 0;
+            if t.is_ident.get(i) == 1 {
+                var name: str = str_slice_len(src, slen, s, e);
+                if name != "main" && HashMap_get(def_index, name) != 0 {
+                    renamed = HashMap_get(numbers, name);
+                    if renamed == 0 {
+                        renamed = next;
+                        next = next + 1;
+                        HashMap_insert(numbers, name, renamed);
+                    }
+                }
+            }
+            if renamed != 0 {
+                var tag: str = "@" + int_to_str(renamed);
+                h = inc_mix(h, tag, 0, str_len(tag));
+            } else {
+                h = inc_mix(h, src, s, e);
+            }
+            h = inc_mix(h, " ", 0, 1);
+        }
+        i = i + 1;
+    }
+    return h;
+}
+
+/// Byte spans of top-level function definitions: names, start, the `{`, end.
+pub struct CDefSpans {
+    pub names: Vec<str>,
+    pub starts: Vec<i64>,
+    pub braces: Vec<i64>,
+    pub ends: Vec<i64>,
+}
+
+pub fn inc_c_fn_defs(src: str) -> CDefSpans {
+    var t: CTokens = inc_lex_c(src);
+    var defs: CDefs = inc_find_c_defs(src, &t);
+    var out: CDefSpans = CDefSpans { names: Vec::new(), starts: Vec::new(), braces: Vec::new(), ends: Vec::new() };
+    var i: i64 = 0;
+    while i < defs.names.len() {
+        var e: i64 = defs.end_toks.get(i);
+        var k: i64 = defs.name_toks.get(i);
+        while k < e && !c_tok_is(src, &t, k, 123) { k = k + 1; }
+        out.names.push(defs.names.get(i));
+        out.starts.push(t.starts.get(defs.start_toks.get(i)));
+        out.braces.push(t.starts.get(k));
+        out.ends.push(t.ends.get(e - 1));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The directory holding `output`.
+fn inc_dir_of(output: str) -> str {
+    var i: i64 = str_len(output) - 1;
+    while i >= 0 {
+        var c: i64 = str_byte_at(output, i);
+        if c == 47 || c == 92 { return str_slice(output, 0, i); }
+        i = i - 1;
+    }
+    return ".";
+}
+
+/// Store path `<dir>/.fidcache/<key>.exe` of an artifact: keyed on content,
+/// toolchain and flags, so any build (this output or another) reuses it.
+pub fn inc_artifact_path(output: str, canon: i64, tool: str, flags: str) -> str {
+    var key: i64 = hash_source("a1 " + int_to_str(canon) + " " + tool + " " + flags);
+    var name: str = int_to_str(key);
+    if str_starts_with(name, "-") { name = "n" + str_slice(name, 1, str_len(name)); }
+    return inc_dir_of(output) + "/.fidcache/" + name + ".exe";
+}
+
+/// Copy `path` to `dest` if the artifact exists.
+pub fn inc_artifact_get(path: str, dest: str) -> bool {
+    if p_file_exists(path) == 0 { return false; }
+    return p_file_write_vec(dest, p_file_read_bytes(path)) >= 0;
+}
+
+/// Store `source` under `path`. Best-effort: a cache failure never breaks a
+/// build.
+pub fn inc_artifact_put(path: str, source: str) {
+    p_mkdir(inc_dir_of(path));
+    var tmp: str = path + ".tmp";
+    p_file_write_vec(tmp, p_file_read_bytes(source));
+    p_rename(tmp, path);
+}

@@ -1384,6 +1384,60 @@ fn cmd_wasm(n: i64, start: i64) -> i64 {
     return 1;
 }
 
+// --- Per-module build (`ccompile --inc`) ---------------------------------
+// Each unit compiles to a content-keyed object, reused while its canonical C
+// does not change; then all link.
+fn build_c_units(c_code: str, cc: str, gcc_opt: str, is_tcc: bool, output: str, libs: str, no_cache: bool) -> i64 {
+    var units: Vec<CUnit> = split_c_units(c_code);
+    var stem: str = output;
+    if str_ends_with(output, ".exe") { stem = str_slice(output, 0, str_len(output) - 4); }
+    var tu_dir: str = stem + ".fides-tu";
+    p_mkdir(tu_dir);
+    var flags: str = " -Wno-int-conversion";
+    if !is_tcc {
+        flags = flags + " -Wno-incompatible-pointer-types -fstack-protector-strong -fPIE -fno-strict-overflow -fno-strict-aliasing";
+    }
+    var objs: str = "";
+    var stale: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < units.len() {
+        var unit: CUnit = units.get(i);
+        var c_path: str = tu_dir + "/" + unit.name + ".c";
+        var o_path: str = tu_dir + "/" + unit.name + ".o";
+        p_file_write(c_path, unit.code);
+        var art: str = "";
+        var have: bool = false;
+        if !no_cache {
+            art = inc_artifact_path(output, inc_canon_hash(unit.code), cc, "o " + gcc_opt + flags);
+            have = inc_artifact_get(art, o_path);
+        }
+        if !have {
+            stale.push(unit.name);
+            if p_system(cc + " " + gcc_opt + flags + " -c -o " + o_path + " " + c_path) != 0 {
+                print("C compilation failed: " + c_path + "\n");
+                return 1;
+            }
+            if str_len(art) > 0 { inc_artifact_put(art, o_path); }
+        }
+        objs = objs + " " + o_path;
+        i = i + 1;
+    }
+    if stale.len() == 0 {
+        print("All " + int_to_str(units.len()) + " units up to date; linking\n");
+    } else {
+        print("Compiling " + int_to_str(stale.len()) + " of " + int_to_str(units.len()) + " units\n");
+    }
+    var link: str = cc + " " + gcc_opt + flags + " -o " + output;
+    if !is_tcc { link = link + " -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack"; }
+    var system_libs: str = " -lm";
+    if !is_linux() { system_libs = system_libs + " -lws2_32"; }
+    if p_system(link + objs + system_libs + libs) != 0 {
+        print("link failed\n");
+        return 1;
+    }
+    return 0;
+}
+
 // --- PE stack patching ---------------------------------------------------
 // Patches SizeOfStackReserve to 256MB and SizeOfStackCommit to 16MB in a
 // PE executable. tcc defaults to 1MB stack which is too small for the
@@ -1507,6 +1561,8 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     }
     inc_deps_reset();
 
+    var unit_build: bool = has_flag(n, start, "--inc");
+    if unit_build { set_c_unit_marks(true); }
     var result: ResultStr = ccompile_source_with_path(source, input, g_borrowck);
     match result {
         ResultStr::Ok(c_code) => {
@@ -1673,6 +1729,33 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             if cc_opt == "0" { cl_opt = "/Od"; }
             if cc_opt == "1" || cc_opt == "s" { cl_opt = "/O1"; }
 
+            // --inc: one translation unit per module, each compiled to a
+            // cached object, then linked.
+            if unit_build {
+                if is_cl {
+                    print("--inc is not supported with cl.exe yet; use gcc/clang/zig cc\n");
+                    return 1;
+                }
+                var rc: i64 = build_c_units(c_code, cc, gcc_opt, is_tcc, output, extra_libs, no_cache);
+                if rc != 0 { return rc; }
+                if !is_linux() { patch_pe_stack(output); }
+                inc_stamp_commit(stamp_path, build_key, c_hash, input, output);
+                print("Built native executable: " + output + "\n");
+                return 0;
+            }
+
+            // A build of the same canonical program with the same toolchain
+            // and flags reuses its binary: no C compile.
+            var art_path: str = "";
+            if !no_cache {
+                art_path = inc_artifact_path(output, inc_canon_hash(c_code), cc, cc_opt + " " + target + extra_libs);
+                if inc_artifact_get(art_path, output) {
+                    inc_stamp_commit(stamp_path, build_key, c_hash, input, output);
+                    print("Reused cached artifact: " + output + "\n");
+                    return 0;
+                }
+            }
+
             var cc_cmd: str = "";
             if is_cl {
                 // cl.exe: /O2 /Fe:output file.c
@@ -1714,6 +1797,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             if !is_linux() {
                 patch_pe_stack(output);
             }
+            if str_len(art_path) > 0 { inc_artifact_put(art_path, output); }
             inc_stamp_commit(stamp_path, build_key, c_hash, input, output);
 
             print("Built native executable: ");

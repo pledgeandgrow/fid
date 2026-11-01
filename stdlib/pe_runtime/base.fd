@@ -117,53 +117,56 @@ pub fn pert_str_equal(a: i64, b: i64) -> bool {
 /// Native-only replacement for `p_str_hash` (pe-roadmap item 77). The
 /// interpreter reads `*mut i64` derefs as tagged values, so the byte loop
 /// must stay in stdlib/core.fd; here real memory reads are valid and we mix
-/// 8 bytes per iteration. Word reads only happen when the whole word stays
-/// inside the same page (page offset <= 4088), which can't fault since the
-/// string's first byte is already readable.
+/// 8 bytes per iteration. The hash depends only on the string's content:
+/// near the end of a page, where a word read could fault, the same word is
+/// assembled byte by byte (a whole-word read could not fault only because
+/// the word stays inside the page of the string's first byte).
 @wrapping pub fn pert_str_hash(s: i64) -> i64 {
-    var hash: i64 = -3750763034362895579;
+    var hash: i64 = -3750763034362895579; // FNV-1a offset basis
+    if s == 0 { return 0; }
     var addr: i64 = s;
     unsafe {
-        while (addr & 4095) <= 4088 {
-            var word_ptr: *mut i64 = addr;
-            var w: i64 = *word_ptr;
-            // Zero-byte test per 32-bit half (no i64 overflow):
-            // (x - 0x01010101) & ~x & 0x80808080 detects a zero byte.
-            var lo: i64 = w & 4294967295;
-            var hi: i64 = (w >> 32) & 4294967295;
-            if ((lo - 16843009) & (~lo) & 2155905152) != 0
-                || ((hi - 16843009) & (~hi) & 2155905152) != 0 {
-                var bp2: *mut u8 = addr;
-                var a2: i64 = addr;
-                var i: i64 = 0;
-                while i < 8 {
-                    var b2: i64 = *bp2;
-                    if b2 == 0 { break; }
-                    hash = hash ^ b2;
-                    hash = hash * 1099511628211;
-                    i = i + 1;
-                    a2 = a2 + 1;
-                    bp2 = a2;
+        while true {
+            var w: i64 = 0;
+            var whole: bool = true;
+            if (addr & 4095) <= 4088 {
+                var word_ptr: *mut i64 = addr;
+                w = *word_ptr;
+                // Zero-byte test per 32-bit half (no i64 overflow):
+                // (x - 0x01010101) & ~x & 0x80808080 detects a zero byte.
+                var lo: i64 = w & 4294967295;
+                var hi: i64 = (w >> 32) & 4294967295;
+                if ((lo - 16843009) & (~lo) & 2155905152) != 0
+                    || ((hi - 16843009) & (~hi) & 2155905152) != 0 {
+                    whole = false;
                 }
-                if hash < 0 { return -hash; }
-                return hash;
+            } else {
+                var k: i64 = 0;
+                while k < 8 && whole {
+                    var bp: *mut u8 = addr + k;
+                    var b: i64 = *bp;
+                    if b == 0 { whole = false; }
+                    w = w | (b << (k * 8));
+                    k = k + 1;
+                }
             }
+            if !whole { break; }
             hash = hash ^ w;
             hash = hash * 1099511628211;
             addr = addr + 8;
         }
+        // The last bytes, fewer than 8
         var byte_ptr: *mut u8 = addr;
-        var b: i64 = *byte_ptr;
-        while b != 0 {
-            hash = hash ^ b;
+        var last: i64 = *byte_ptr;
+        while last != 0 {
+            hash = hash ^ last;
             hash = hash * 1099511628211;
             addr = addr + 1;
             byte_ptr = addr;
-            b = *byte_ptr;
+            last = *byte_ptr;
         }
     }
-    if hash < 0 { return -hash; }
-    return hash;
+    return hash & 9223372036854775807;
 }
 
 /// (A str argument passes as its address.)

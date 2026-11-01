@@ -1471,16 +1471,24 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     }
 
                     // Merge: start with stdlib, then imported modules, then user
+                    record_func_modules(stdlib, "core");
                     var program: Program = stdlib;
 
                     // Merge imported modules
                     var mi: i64 = 0;
                     while mi < imported_modules.len() {
+                        var imported_name: str = "module" + int_to_str(mi);
+                        match imported_modules.get(mi).module {
+                            OptStr::Some(im) => { imported_name = im; }
+                            OptStr::None => {}
+                        }
+                        record_func_modules(imported_modules.get(mi), imported_name);
                         program = merge_programs(program, imported_modules.get(mi));
                         mi = mi + 1;
                     }
 
                     // Merge user (highest priority)
+                    record_func_modules(user, dup_user_module);
                     program = merge_programs(program, user);
 
                     // Phase 7.7: Conditional compilation filter
@@ -3668,4 +3676,256 @@ pub fn c_path_join(a: str, b: str) -> str {
 /// Get the current working directory.
 pub fn c_os_cwd() -> str {
     return ".";
+}
+
+// --- Per-module C units (`ccompile --inc`, as src/codegen_c.rs) ----------
+
+var g_func_module_index: i64 = 0;
+var g_func_module_names: Vec<str> = Vec::new();
+
+fn set_func_module(name: str, module: str) {
+    if g_func_module_index == 0 {
+        g_func_module_index = HashMap_new();
+        var names: Vec<str> = Vec::new();
+        g_func_module_names = names;
+    }
+    g_func_module_names.push(module);
+    HashMap_insert(g_func_module_index, name, g_func_module_names.len());
+}
+
+/// Record which module defines each function of `prog`.
+fn record_func_modules(prog: Program, module: str) {
+    var i: i64 = 0;
+    while i < prog.funcs.len() {
+        set_func_module(prog.funcs.get(i).name, module);
+        i = i + 1;
+    }
+    i = 0;
+    while i < prog.impls.len() {
+        var imp: ImplDef = prog.impls.get(i);
+        var m: i64 = 0;
+        while m < imp.methods.len() {
+            set_func_module(imp.struct_name + "_" + imp.methods.get(m).name, module);
+            m = m + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < prog.trait_impls.len() {
+        var ti: TraitImpl = prog.trait_impls.get(i);
+        var m: i64 = 0;
+        while m < ti.methods.len() {
+            set_func_module(ti.type_name + "_" + ti.methods.get(m).name, module);
+            m = m + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn func_module_of(name: str, fallback: str) -> str {
+    if g_func_module_index == 0 { return fallback; }
+    var slot: i64 = HashMap_get(g_func_module_index, name);
+    if slot != 0 { return g_func_module_names.get(slot - 1); }
+    var at: i64 = str_find(name, "__");
+    if at > 0 {
+        slot = HashMap_get(g_func_module_index, str_slice(name, 0, at));
+        if slot != 0 { return g_func_module_names.get(slot - 1); }
+    }
+    return fallback;
+}
+
+pub struct CUnit {
+    pub name: str,
+    pub code: str,
+}
+
+fn c_unit_slot(names: Vec<str>, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < names.len() {
+        if names.get(i) == name { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// The `_strN` names `body` uses, appended to `used` (a HashMap as a set).
+fn c_collect_str_names(body: str, used: i64) {
+    var n: i64 = str_len(body);
+    var i: i64 = 0;
+    while i + 4 < n {
+        if str_byte_at(body, i) == 95 && str_byte_at(body, i + 1) == 115 && str_byte_at(body, i + 2) == 116
+            && str_byte_at(body, i + 3) == 114 {
+            var e: i64 = i + 4;
+            while e < n && str_byte_at(body, e) >= 48 && str_byte_at(body, e) <= 57 { e = e + 1; }
+            if e > i + 4 { HashMap_insert(used, str_slice(body, i, e), 1); }
+            i = e;
+        } else {
+            i = i + 1;
+        }
+    }
+}
+
+/// Offset of the next "//@FN " line after `from`, else limit + 1.
+fn c_next_fn_mark(full: str, from: i64, limit: i64) -> i64 {
+    var i: i64 = from;
+    while i < limit {
+        if str_byte_at(full, i) == 10 && str_byte_at(full, i + 1) == 47 && str_byte_at(full, i + 2) == 47
+            && str_byte_at(full, i + 3) == 64 && str_byte_at(full, i + 4) == 70 {
+            return i + 1;
+        }
+        i = i + 1;
+    }
+    return limit + 1;
+}
+
+/// Split generated C with //@FN marks into one unit per source module. The
+/// prelude's small runtime definitions move to the unit owning `main` (a
+/// prototype stays); a global is defined there and `extern` elsewhere.
+pub fn split_c_units(full: str) -> Vec<CUnit> {
+    var full_len: i64 = str_len(full);
+    var first: i64 = str_find(full, "\n//@FN ");
+    var tail_at: i64 = str_find(full, "\n//@TAIL\n");
+    var units: Vec<CUnit> = Vec::new();
+    if first < 0 || tail_at < 0 {
+        units.push(CUnit { name: "main", code: full });
+        return units;
+    }
+    var prelude: str = str_slice(full, 0, first + 1);
+    var tail: str = str_slice(full, tail_at + 9, str_len(full));
+    var owner: str = func_module_of("main", "main");
+    var flat: bool = str_len(env_or_empty("FIDES_INC_FLAT")) > 0;
+    if flat { owner = "main"; }
+
+    // Move the prelude's definitions to the tail
+    var spans: CDefSpans = inc_c_fn_defs(prelude);
+    var stripped: StringBuilder = StringBuilder::new();
+    var protos: StringBuilder = StringBuilder::new();
+    var moved: StringBuilder = StringBuilder::new();
+    var cursor: i64 = 0;
+    var si: i64 = 0;
+    while si < spans.names.len() {
+        var s: i64 = spans.starts.get(si);
+        stripped.append_str(str_slice(prelude, cursor, s));
+        protos.append_str(str_trim(str_slice(prelude, s, spans.braces.get(si))));
+        protos.append_str(";\n");
+        moved.append_str(str_slice(prelude, s, spans.ends.get(si)));
+        moved.append_str("\n");
+        cursor = spans.ends.get(si);
+        si = si + 1;
+    }
+    stripped.append_str(str_slice(prelude, cursor, str_len(prelude)));
+    stripped.append_str(protos.to_str());
+    tail = moved.to_str() + "\n" + tail;
+
+    // Function bodies by unit
+    var unit_names: Vec<str> = Vec::new();
+    var fn_units: Vec<i64> = Vec::new();
+    var fn_starts: Vec<i64> = Vec::new();
+    var fn_ends: Vec<i64> = Vec::new();
+    var at: i64 = first + 1;
+    while at < tail_at {
+        var line_end: i64 = at;
+        while str_byte_at(full, line_end) != 10 { line_end = line_end + 1; }
+        var fname: str = str_slice_len(full, full_len, at + 6, line_end);
+        var body_end: i64 = c_next_fn_mark(full, line_end, tail_at);
+        var unit: str = "main";
+        if !flat { unit = func_module_of(fname, owner); }
+        var slot: i64 = c_unit_slot(unit_names, unit);
+        if slot < 0 {
+            unit_names.push(unit);
+            slot = unit_names.len() - 1;
+        }
+        fn_units.push(slot);
+        fn_starts.push(line_end + 1);
+        fn_ends.push(body_end);
+        at = body_end;
+    }
+
+    // Prelude lines: shared, global definitions, string constants
+    var pre_common: StringBuilder = StringBuilder::new();
+    var global_defs: Vec<str> = Vec::new();
+    var global_externs: Vec<str> = Vec::new();
+    var str_decl_names: i64 = HashMap_new();
+    var str_decls: Vec<str> = Vec::new();
+    var lines: Vec<str> = str_split(stripped.to_str(), "\n");
+    var li: i64 = 0;
+    while li < lines.len() {
+        var line: str = lines.get(li);
+        var t: str = str_trim(line);
+        if str_starts_with(t, "static ") && str_contains(t, " _g_") {
+            var decl: str = str_slice(t, 7, str_len(t));
+            var eq: i64 = str_find(decl, " = ");
+            if eq >= 0 { decl = str_slice(decl, 0, eq); }
+            if str_ends_with(decl, ";") { decl = str_slice(decl, 0, str_len(decl) - 1); }
+            global_defs.push(decl + ";");
+            global_externs.push("extern " + decl + ";");
+        } else if str_starts_with(t, "static const char _str") {
+            var rest2: str = str_slice(t, 18, str_len(t));
+            var br: i64 = str_find(rest2, "[");
+            if br >= 0 { rest2 = str_slice(rest2, 0, br); }
+            str_decls.push(line);
+            HashMap_insert(str_decl_names, str_trim(rest2), str_decls.len());
+        } else {
+            pre_common.append_str(line);
+            pre_common.append_str("\n");
+        }
+        li = li + 1;
+    }
+    var common: str = pre_common.to_str();
+
+    // Units, sorted by name
+    var order: Vec<i64> = Vec::new();
+    var oi: i64 = 0;
+    while oi < unit_names.len() {
+        order.push(oi);
+        var k: i64 = order.len() - 1;
+        while k > 0 && str_compare(unit_names.get(order.get(k)), unit_names.get(order.get(k - 1))) < 0 {
+            var tmp: i64 = order.get(k);
+            order.set(k, order.get(k - 1));
+            order.set(k - 1, tmp);
+            k = k - 1;
+        }
+        oi = oi + 1;
+    }
+    oi = 0;
+    while oi < order.len() {
+        var idx: i64 = order.get(oi);
+        var body_sb: StringBuilder = StringBuilder::new();
+        var fi: i64 = 0;
+        while fi < fn_units.len() {
+            if fn_units.get(fi) == idx {
+                body_sb.append_str(str_slice_len(full, full_len, fn_starts.get(fi), fn_ends.get(fi)));
+            }
+            fi = fi + 1;
+        }
+        var body: str = body_sb.to_str();
+        var used: i64 = HashMap_new();
+        c_collect_str_names(body, used);
+        if unit_names.get(idx) == owner { c_collect_str_names(tail, used); }
+        var code: StringBuilder = StringBuilder::new();
+        code.append_str(common);
+        var d: i64 = 0;
+        while d < str_decls.len() {
+            var dl: str = str_decls.get(d);
+            var nb: i64 = str_find(dl, "_str");
+            var ne: i64 = str_find(dl, "[");
+            if nb >= 0 && ne > nb && HashMap_get(used, str_slice(dl, nb, ne)) != 0 {
+                code.append_str(dl);
+                code.append_str("\n");
+            }
+            d = d + 1;
+        }
+        var g: i64 = 0;
+        while g < global_defs.len() {
+            if unit_names.get(idx) == owner { code.append_str(global_defs.get(g)); }
+            else { code.append_str(global_externs.get(g)); }
+            code.append_str("\n");
+            g = g + 1;
+        }
+        code.append_str(body);
+        if unit_names.get(idx) == owner { code.append_str(tail); }
+        units.push(CUnit { name: unit_names.get(idx), code: code.to_str() });
+        oi = oi + 1;
+    }
+    return units;
 }

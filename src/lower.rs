@@ -4186,8 +4186,11 @@ impl Lowerer {
                 // emit a call to p_str_concat instead of integer addition.
                 // Only when BOTH are strings — str + i64 is pointer arithmetic.
                 let str_ty = IrType::Ptr(Box::new(IrType::U8));
+                // A lowered value knows its type; inference by name does not
+                // when a method is lowered later (`sb.to_str() + "!"`).
                 if matches!(op, BinOp::Add)
-                    && left_ir_ty == str_ty && right_ir_ty == str_ty
+                    && (left_ir_ty == str_ty || self.get_value_type(left_val) == str_ty)
+                    && (right_ir_ty == str_ty || self.get_value_type(right_val) == str_ty)
                 {
                     return self.emit_inst(Inst::Call {
                         func: "p_str_concat".to_string(),
