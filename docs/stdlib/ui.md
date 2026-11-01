@@ -1,0 +1,306 @@
+# ui — Fides Documentation
+
+## Contents
+
+- [UiContext](#uicontext) (struct)
+- [ui_create](#ui_create) (function)
+- [ui_begin](#ui_begin) (function)
+- [ui_end](#ui_end) (function)
+- [ui_button](#ui_button) (function)
+- [ui_slider](#ui_slider) (function)
+- [ui_checkbox](#ui_checkbox) (function)
+- [ui_label](#ui_label) (function)
+- [ui_panel](#ui_panel) (function)
+- [ui_progress_bar](#ui_progress_bar) (function)
+- [ui_text_input](#ui_text_input) (function)
+- [ui_separator](#ui_separator) (function)
+- [ui_next_row](#ui_next_row) (function)
+
+## UiContext
+
+```fides
+pub struct UiContext {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `ren` | `i64,               // SDL renderer` |
+| `mouse_x` | `i64` |
+| `mouse_y` | `i64` |
+| `mouse_down` | `bool` |
+| `mouse_pressed` | `bool,    // pressed this frame` |
+| `hot` | `i64,                // widget ID under mouse` |
+| `active` | `i64,             // widget ID being interacted with` |
+| `next_id` | `i64,            // auto-incrementing widget ID` |
+| `text_color_r` | `i64` |
+| `text_color_g` | `i64` |
+| `text_color_b` | `i64` |
+| `bg_color_r` | `i64` |
+| `bg_color_g` | `i64` |
+| `bg_color_b` | `i64` |
+| `hover_color_r` | `i64` |
+| `hover_color_g` | `i64` |
+| `hover_color_b` | `i64` |
+| `active_color_r` | `i64` |
+| `active_color_g` | `i64` |
+| `active_color_b` | `i64` |
+
+*Defined at line 28*
+
+---
+
+## ui_create
+
+Create a UI context.
+
+```fides
+pub fn ui_create() -> UiContext {
+```
+
+**Returns:** `UiContext`
+
+*Defined at line 52*
+
+---
+
+## ui_begin
+
+Begin a UI frame. Pass the SDL renderer and input state.
+
+```fides
+pub fn ui_begin(ctx: &mut UiContext, ren: i64, input: &SdlInputState) -> void {
+```
+
+**Parameters:**
+
+- `ctx`: `&mut UiContext`
+- `ren`: `i64`
+- `input`: `&SdlInputState`
+
+**Returns:** `void`
+
+*Defined at line 78*
+
+---
+
+## ui_end
+
+End a UI frame.
+
+```fides
+pub fn ui_end(ctx: &mut UiContext) -> void {
+```
+
+**Parameters:**
+
+- `ctx`: `&mut UiContext`
+
+**Returns:** `void`
+
+*Defined at line 89*
+
+---
+
+## ui_button
+
+Draw a button. Returns true if the button was clicked this frame.
+
+```fides
+pub fn ui_button(ctx: &mut UiContext, label: str, x: i64, y: i64, w: i64, h: i64) -> bool {
+```
+
+**Parameters:**
+
+- `ctx`: `&mut UiContext`
+- `label`: `str`
+- `x`: `i64`
+- `y`: `i64`
+- `w`: `i64`
+- `h`: `i64`
+
+**Returns:** `bool`
+
+*Defined at line 146*
+
+---
+
+## ui_slider
+
+Draw a slider. Returns the new value (or the same value if unchanged).
+
+```fides
+pub fn ui_slider(ctx: &mut UiContext, x: i64, y: i64, w: i64, h: i64, min: f64, max: f64, value: f64) -> f64 {
+```
+
+**Parameters:**
+
+- `ctx`: `&mut UiContext`
+- `x`: `i64`
+- `y`: `i64`
+- `w`: `i64`
+- `h`: `i64`
+- `min`: `f64`
+- `max`: `f64`
+- `value`: `f64`
+
+**Returns:** `f64`
+
+*Defined at line 193*
+
+---
+
+## ui_checkbox
+
+Draw a checkbox. Returns the new checked state.
+
+```fides
+pub fn ui_checkbox(ctx: &mut UiContext, label: str, x: i64, y: i64, checked: bool) -> bool {
+```
+
+**Parameters:**
+
+- `ctx`: `&mut UiContext`
+- `label`: `str`
+- `x`: `i64`
+- `y`: `i64`
+- `checked`: `bool`
+
+**Returns:** `bool`
+
+*Defined at line 239*
+
+---
+
+## ui_label
+
+Draw a label (non-interactive text).
+
+```fides
+pub fn ui_label(ctx: &UiContext, text: str, x: i64, y: i64) -> void {
+```
+
+**Parameters:**
+
+- `ctx`: `&UiContext`
+- `text`: `str`
+- `x`: `i64`
+- `y`: `i64`
+
+**Returns:** `void`
+
+*Defined at line 282*
+
+---
+
+## ui_panel
+
+Draw a panel background.
+
+```fides
+pub fn ui_panel(ctx: &UiContext, x: i64, y: i64, w: i64, h: i64) -> void {
+```
+
+**Parameters:**
+
+- `ctx`: `&UiContext`
+- `x`: `i64`
+- `y`: `i64`
+- `w`: `i64`
+- `h`: `i64`
+
+**Returns:** `void`
+
+*Defined at line 287*
+
+---
+
+## ui_progress_bar
+
+Draw a progress bar.
+
+```fides
+pub fn ui_progress_bar(ctx: &UiContext, x: i64, y: i64, w: i64, h: i64, progress: f64) -> void {
+```
+
+**Parameters:**
+
+- `ctx`: `&UiContext`
+- `x`: `i64`
+- `y`: `i64`
+- `w`: `i64`
+- `h`: `i64`
+- `progress`: `f64`
+
+**Returns:** `void`
+
+*Defined at line 293*
+
+---
+
+## ui_text_input
+
+Draw a text input field (simplified — no actual text editing).
+
+```fides
+pub fn ui_text_input(ctx: &mut UiContext, x: i64, y: i64, w: i64, h: i64, text: str) -> str {
+```
+
+**Parameters:**
+
+- `ctx`: `&mut UiContext`
+- `x`: `i64`
+- `y`: `i64`
+- `w`: `i64`
+- `h`: `i64`
+- `text`: `str`
+
+**Returns:** `str`
+
+*Defined at line 307*
+
+---
+
+## ui_separator
+
+Draw a separator line.
+
+```fides
+pub fn ui_separator(ctx: &UiContext, x: i64, y: i64, w: i64) -> void {
+```
+
+**Parameters:**
+
+- `ctx`: `&UiContext`
+- `x`: `i64`
+- `y`: `i64`
+- `w`: `i64`
+
+**Returns:** `void`
+
+*Defined at line 337*
+
+---
+
+## ui_next_row
+
+Draw a column layout helper (returns next y position).
+
+```fides
+pub fn ui_next_row(y: i64, h: i64, spacing: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `y`: `i64`
+- `h`: `i64`
+- `spacing`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 343*
+
+---
+
+*Generated by [scribe](https://fides.dev) — Fides documentation generator*

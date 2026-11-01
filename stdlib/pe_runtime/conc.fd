@@ -22,6 +22,10 @@ extern "C" {
     fn SleepConditionVariableSRW as pe_k_cond_wait(cond: i64, lock: i64, ms: i64, flags: i64) -> i32;
     fn WakeConditionVariable as pe_k_cond_signal(cond: i64);
     fn WakeAllConditionVariable as pe_k_cond_broadcast(cond: i64);
+    fn ConvertThreadToFiber as pe_k_thread_to_fiber(arg: i64) -> i64;
+    fn CreateFiberEx as pe_k_create_fiber(commit: i64, reserve: i64, flags: i64, start: i64, arg: i64) -> i64;
+    fn SwitchToFiber as pe_k_switch_fiber(fiber: i64);
+    fn DeleteFiber as pe_k_delete_fiber(fiber: i64);
     fn TlsAlloc as pe_k_tls_alloc() -> u32;
     fn TlsGetValue as pe_k_tls_get(key: i64) -> i64;
     fn TlsSetValue as pe_k_tls_set(key: i64, value: i64) -> i32;
@@ -100,7 +104,7 @@ pub fn pert_thread_spawn_v(name: str, nargs: i64, argv: i64) -> i64 {
         return -1;
     }
     pert_thread_count = idx + 1;
-    var block: i64 = pe_zeroed(12);
+    var block: i64 = pe_zeroed(14);
     pe_store(block, fn_addr);
     pe_store(block + 8, nargs);
     var i: i64 = 0;
@@ -123,7 +127,103 @@ pub fn pert_thread_main(block: i64) -> i64 {
     var result: i64 = pe_call_fn(pe_load(block), pe_load(block + 8), block + 16);
     pe_store(block + 88, result);
     pe_atomic_store(block + 80, 1);
+    // A task runs on its fiber: it ends by giving control back for good
+    if pe_load(block + 96) != 0 {
+        pe_k_switch_fiber(pert_co_sched);
+    }
     return result;
+}
+
+// ─── Tasks: green threads ─────────────────
+// A task's block is a thread's, with [12] = 1 and [13] its fiber. They run on
+// the thread that calls p_co_run, one at a time, until each yields.
+
+var pert_co_sched: i64 = 0;
+var pert_co_cur: i64 = 0;
+var pert_co_blocks: i64 = 0;
+var pert_co_count: i64 = 0;
+var pert_co_cap: i64 = 0;
+
+pub fn pert_co_go(name: str, arg: i64) -> i64 {
+    var fn_addr: i64 = pe_fn_lookup(name);
+    if fn_addr == 0 {
+        p_panic("task: no such function");
+    }
+    if pert_co_count == pert_co_cap {
+        var cap: i64 = pert_co_cap * 2;
+        if cap == 0 {
+            cap = 64;
+        }
+        var blocks: i64 = pe_zeroed(cap);
+        var i: i64 = 0;
+        while i < pert_co_count {
+            pe_store(blocks + i * 8, pe_load(pert_co_blocks + i * 8));
+            i = i + 1;
+        }
+        pert_co_blocks = blocks;
+        pert_co_cap = cap;
+    }
+    var block: i64 = pe_zeroed(14);
+    pe_store(block, fn_addr);
+    pe_store(block + 8, 1);
+    pe_store(block + 16, arg);
+    pe_store(block + 96, 1);
+    var fiber: i64 = pe_k_create_fiber(16384, 1048576, 0, pe_thread_entry_addr(), block);
+    if fiber == 0 {
+        p_panic("task: out of memory");
+    }
+    pe_store(block + 104, fiber);
+    pe_store(pert_co_blocks + pert_co_count * 8, block);
+    pert_co_count = pert_co_count + 1;
+    return pert_co_count;
+}
+
+pub fn pert_co_yield() {
+    if pert_co_cur != 0 {
+        pe_k_switch_fiber(pert_co_sched);
+    }
+}
+
+pub fn pert_co_run() -> i64 {
+    if pert_co_sched == 0 {
+        pert_co_sched = pe_k_thread_to_fiber(0);
+    }
+    while true {
+        var live: i64 = 0;
+        var i: i64 = 0;
+        while i < pert_co_count {
+            var block: i64 = pe_load(pert_co_blocks + i * 8);
+            if pe_load(block + 80) == 0 {
+                pert_co_cur = block;
+                pe_k_switch_fiber(pe_load(block + 104));
+                pert_co_cur = 0;
+                if pe_load(block + 80) == 0 {
+                    live = live + 1;
+                } else {
+                    pe_k_delete_fiber(pe_load(block + 104));
+                }
+            }
+            i = i + 1;
+        }
+        if live == 0 {
+            return pert_co_count;
+        }
+    }
+    return pert_co_count;
+}
+
+pub fn pert_co_done(t: i64) -> i64 {
+    if t < 1 || t > pert_co_count {
+        return 1;
+    }
+    return pe_load(pe_load(pert_co_blocks + (t - 1) * 8) + 80);
+}
+
+pub fn pert_co_result(t: i64) -> i64 {
+    if t < 1 || t > pert_co_count {
+        return 0;
+    }
+    return pe_load(pe_load(pert_co_blocks + (t - 1) * 8) + 88);
 }
 
 /// The table index of future f, or -1 (a ready value or an unknown handle).

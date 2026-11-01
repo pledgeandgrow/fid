@@ -1186,6 +1186,11 @@ impl Lowerer {
         // ─── Phase A1: Executor + non-blocking task poll ───
         // p_executor_new() -> i64 — create an executor, return handle
         self.module.add_extern("p_executor_new", vec![], IrType::I64);
+        self.module.add_extern("p_co_go", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::I64], IrType::I64);
+        self.module.add_extern("p_co_yield", vec![], IrType::Void);
+        self.module.add_extern("p_co_run", vec![], IrType::I64);
+        self.module.add_extern("p_co_done", vec![IrType::I64], IrType::I64);
+        self.module.add_extern("p_co_result", vec![IrType::I64], IrType::I64);
         // p_executor_spawn(exec, func_name, num_args, args...) -> i64 (future handle)
         self.module.add_extern("p_executor_spawn",
             vec![IrType::I64, IrType::Ptr(Box::new(IrType::U8)), IrType::I64],

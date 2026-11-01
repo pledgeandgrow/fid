@@ -5430,6 +5430,22 @@ impl Interpreter {
             }
 
             // ─── Phase A1: Executor + non-blocking task poll ───
+            // The interpreter has one call stack: a task runs to its end when
+            // started, and yielding does nothing.
+            "p_co_go" => {
+                let spawn = vec![Value::Int(0), args[0].clone(), Value::Int(1), args[1].clone()];
+                match self.call_runtime("p_executor_spawn", &spawn) {
+                    ExecOutcome::Value(Value::Future(f)) => ExecOutcome::Value(Value::Int(f as i64 + 1)),
+                    other => other,
+                }
+            }
+            "p_co_yield" => ExecOutcome::Value(Value::Void),
+            "p_co_run" => ExecOutcome::Value(Value::Int(self.futures.len() as i64)),
+            "p_co_done" => ExecOutcome::Value(Value::Int(1)),
+            "p_co_result" => {
+                let t = if let Some(Value::Int(t)) = args.first() { *t } else { 0 };
+                self.call_runtime("p_future_poll", &[Value::Int(t - 1)])
+            }
             "p_executor_new" => {
                 // p_executor_new() -> i64 — create an executor, return handle.
                 let idx = self.executors.len();

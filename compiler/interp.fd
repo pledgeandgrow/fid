@@ -5791,6 +5791,32 @@ pub fn Interpreter_call_runtime2(self: &mut Interpreter, name: str, args: Vec<Va
     if name == "p_thread_join" {
         return ExecOutcome::Value(Value::Void);
     }
+    // The interpreter has one call stack: a task runs to its end when started,
+    // and yielding does nothing.
+    if name == "p_co_go" {
+        var co_args: Vec<Value> = Vec::new();
+        co_args.push(Value::Int(0));
+        co_args.push(arg_value(args, 0));
+        co_args.push(Value::Int(1));
+        co_args.push(arg_value(args, 1));
+        match Interpreter_call_runtime(self, "p_executor_spawn", co_args) {
+            ExecOutcome::Value(cv) => {
+                match cv {
+                    Value::Int(cf) => { return ExecOutcome::Value(Value::Int(cf + 1)); }
+                    _ => { return ExecOutcome::Value(cv); }
+                }
+            }
+            other => { return other; }
+        }
+    }
+    if name == "p_co_yield" { return ExecOutcome::Value(Value::Void); }
+    if name == "p_co_run" { return ExecOutcome::Value(Value::Int(self.future_values.len())); }
+    if name == "p_co_done" { return ExecOutcome::Value(Value::Int(1)); }
+    if name == "p_co_result" {
+        var co_get: Vec<Value> = Vec::new();
+        co_get.push(Value::Int(arg_int(args, 0, 1) - 1));
+        return Interpreter_call_runtime(self, "p_future_poll", co_get);
+    }
     if name == "p_executor_new" {
         var eidx: i64 = self.executor_count;
         self.executor_count = self.executor_count + 1;

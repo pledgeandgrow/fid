@@ -1551,6 +1551,10 @@ const IMPORTS: &[&str] = &[
     "GetProcAddress",
     "FreeLibrary",
     "AddVectoredExceptionHandler",
+    "ConvertThreadToFiber",
+    "CreateFiberEx",
+    "SwitchToFiber",
+    "DeleteFiber",
 ];
 
 /// msvcrt.dll functions: the C library behind `extern "C"` declarations

@@ -132,8 +132,8 @@ Most modules still have no test, so expect more of this (B12).
 - [x] B10. `template`: `str_char_at` undefined (S).
 - [x] B11. A CI step imports every stdlib module on its own, so this cannot
       regress (S).
-- [ ] B12. Every module has a test and a `docs/stdlib/` page; 36 of 108 have no
-      page (L).
+- [~] B12. Every module has a test and a `docs/stdlib/` page. Pages are done
+      except `sqlite`; left: a test for each module (L).
 - [ ] B13. Replace bare `Vec` with `Vec<T>` across the stdlib, then make the
       `str`/`i64` rule strict in imported modules too (L).
 - [ ] B14. `StringBuilder` is quadratic (`buf + s`): back it with `p_sb_*` (S).
@@ -256,9 +256,11 @@ listed as experimental in the docs, with what does not work.
       `p_thread_spawn` may not write a global of the program without a lock. Left:
       shared data reached through pointers and captures (L).
 - [ ] H4. Enforce `@send`/`@sync` for every spawn argument (M).
-- [ ] H5. Real `async`: tasks suspend and resume (L, see decision 4). Today
-      `async` runs eagerly and `yield` does nothing.
-- [ ] H6. Green threads outside the interpreter (L).
+- [~] H5. Real `async`: tasks suspend and resume (L, see decision 4). Done:
+      `stdlib/task.fd`, real stack switching. Left: `async fn` and `await` on top
+      of tasks, and tasks that wait on sockets.
+- [x] H6. Green threads outside the interpreter: fibers on Windows, `ucontext` on
+      Linux, 10,000 tasks on one thread. The interpreter runs a task to its end.
 - [ ] H7. `parallel { }` runs multi-statement branches concurrently (M).
 - [ ] H8. Allocator: per-thread caches instead of one global lock (M).
 

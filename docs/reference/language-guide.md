@@ -450,6 +450,30 @@ var i = 0;                 // an i64, whatever the size of the literal
 
 A float going into an integer needs `as` too.
 
+### Tasks
+
+Tasks are green threads: many of them share one OS thread, each with its own
+stack, and one runs until it calls `task_yield`.
+
+```fides
+use task;
+
+fn worker(n: i64) -> i64 {
+    task_yield();
+    return n * 2;
+}
+
+fn main() -> i64 {
+    val t = task_go("worker", 21);
+    task_run();
+    println(task_result(t));     // 42
+    return 0;
+}
+```
+
+The interpreter has one call stack, so there a task runs to its end when it
+starts; `task_yield` does nothing.
+
 ### Threads and Globals
 
 A function that runs on another thread, or anything it calls, may not write a

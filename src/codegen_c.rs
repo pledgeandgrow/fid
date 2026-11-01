@@ -714,6 +714,9 @@ impl CCodeGen {
             // call-site fallback logic (needed for void*→int64_t via va_arg).
             ("p_thread_spawn", &[p(), I64]),
             ("p_executor_spawn", &[I64, p(), I64]),
+            ("p_co_go", &[p(), I64]),
+            ("p_co_done", &[I64]),
+            ("p_co_result", &[I64]),
             // Channel functions
             ("p_chan_create", &[I64]),
             ("p_chan_send", &[I64, I64]),
@@ -1319,6 +1322,11 @@ impl CCodeGen {
         wln!(self, "int64_t p_thread_spawn(const char* func_name, int64_t num_args, ...);");
         // Phase A1: Executor + non-blocking task poll
         wln!(self, "int64_t p_executor_new(void);");
+        wln!(self, "int64_t p_co_go(const char* name, int64_t arg);");
+        wln!(self, "void p_co_yield(void);");
+        wln!(self, "int64_t p_co_run(void);");
+        wln!(self, "int64_t p_co_done(int64_t t);");
+        wln!(self, "int64_t p_co_result(int64_t t);");
         wln!(self, "int64_t p_executor_spawn(int64_t exec, const char* func_name, int64_t num_args, ...);");
         wln!(self, "int64_t p_executor_block_on(int64_t exec, int64_t future);");
         wln!(self, "int64_t p_task_poll(int64_t future);");
@@ -3396,6 +3404,97 @@ impl CCodeGen {
         wln!(self, "    }");
         wln!(self, "}");
         wln!(self, "typedef struct { int64_t (*fn)(); int64_t nargs; int64_t args[8]; atomic_int* done; } p_thread_arg_t;");
+        wln!(self, "#ifndef _WIN32");
+        wln!(self, "#include <ucontext.h>");
+        wln!(self, "#endif");
+        wln!(self, "typedef struct {{ int64_t (*fn)(); int64_t arg; int64_t result; int done;");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    void* fiber;");
+        wln!(self, "#else");
+        wln!(self, "    ucontext_t ctx; char* stack;");
+        wln!(self, "#endif");
+        wln!(self, "}} __p_co;");
+        wln!(self, "static __p_co** __p_cos = NULL;");
+        wln!(self, "static int64_t __p_co_count = 0;");
+        wln!(self, "static int64_t __p_co_cap = 0;");
+        wln!(self, "static __p_co* __p_co_cur = NULL;");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "static void* __p_co_sched = NULL;");
+        wln!(self, "#define __P_CO_TO_SCHED() SwitchToFiber(__p_co_sched)");
+        wln!(self, "#else");
+        wln!(self, "static ucontext_t __p_co_sched;");
+        wln!(self, "#define __P_CO_TO_SCHED() swapcontext(&__p_co_cur->ctx, &__p_co_sched)");
+        wln!(self, "#endif");
+        wln!(self, "static void __p_co_body(__p_co* c) {{");
+        wln!(self, "    typedef int64_t (*f1)(void*, int64_t);");
+        wln!(self, "    c->result = ((f1)c->fn)(NULL, c->arg);");
+        wln!(self, "    c->done = 1;");
+        wln!(self, "    __P_CO_TO_SCHED();");
+        wln!(self, "}}");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "static void WINAPI __p_co_start(void* p) {{ __p_co_body((__p_co*)p); }}");
+        wln!(self, "#else");
+        wln!(self, "static void __p_co_start(unsigned lo, unsigned hi) {{ __p_co_body((__p_co*)(((uintptr_t)hi << 32) | lo)); }}");
+        wln!(self, "#endif");
+        wln!(self, "int64_t p_co_go(const char* name, int64_t arg) {{");
+        wln!(self, "    int64_t (*fn)() = NULL;");
+        wln!(self, "    for (int i = 0; i < p_thread_entry_count; i++) {{");
+        wln!(self, "        if (strcmp(p_thread_entries[i].name, name) == 0) {{ fn = p_thread_entries[i].fn; break; }}");
+        wln!(self, "    }}");
+        wln!(self, "    if (!fn) p_panic(\"task: no such function\");");
+        wln!(self, "    if (__p_co_count == __p_co_cap) {{");
+        wln!(self, "        __p_co_cap = __p_co_cap ? __p_co_cap * 2 : 64;");
+        wln!(self, "        __p_cos = (__p_co**)realloc(__p_cos, (size_t)__p_co_cap * sizeof(__p_co*));");
+        wln!(self, "    }}");
+        wln!(self, "    __p_co* c = (__p_co*)calloc(1, sizeof(__p_co));");
+        wln!(self, "    c->fn = fn; c->arg = arg;");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    c->fiber = CreateFiberEx(16384, 1024 * 1024, 0, __p_co_start, c);");
+        wln!(self, "    if (!c->fiber) p_panic(\"task: out of memory\");");
+        wln!(self, "#else");
+        wln!(self, "    c->stack = (char*)malloc(256 * 1024);");
+        wln!(self, "    if (!c->stack) p_panic(\"task: out of memory\");");
+        wln!(self, "    getcontext(&c->ctx);");
+        wln!(self, "    c->ctx.uc_stack.ss_sp = c->stack;");
+        wln!(self, "    c->ctx.uc_stack.ss_size = 256 * 1024;");
+        wln!(self, "    c->ctx.uc_link = NULL;");
+        wln!(self, "    makecontext(&c->ctx, (void (*)(void))__p_co_start, 2, (unsigned)(uintptr_t)c, (unsigned)((uintptr_t)c >> 32));");
+        wln!(self, "#endif");
+        wln!(self, "    __p_cos[__p_co_count] = c;");
+        wln!(self, "    return ++__p_co_count;");
+        wln!(self, "}}");
+        wln!(self, "void p_co_yield(void) {{ if (__p_co_cur) {{ __P_CO_TO_SCHED(); }} }}");
+        wln!(self, "int64_t p_co_run(void) {{");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    if (!__p_co_sched) __p_co_sched = ConvertThreadToFiber(NULL);");
+        wln!(self, "#endif");
+        wln!(self, "    for (;;) {{");
+        wln!(self, "        int64_t live = 0;");
+        wln!(self, "        for (int64_t i = 0; i < __p_co_count; i++) {{");
+        wln!(self, "            __p_co* c = __p_cos[i];");
+        wln!(self, "            if (c->done) continue;");
+        wln!(self, "            __p_co_cur = c;");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "            SwitchToFiber(c->fiber);");
+        wln!(self, "#else");
+        wln!(self, "            swapcontext(&__p_co_sched, &c->ctx);");
+        wln!(self, "#endif");
+        wln!(self, "            __p_co_cur = NULL;");
+        wln!(self, "            if (c->done) {{");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "                DeleteFiber(c->fiber);");
+        wln!(self, "#else");
+        wln!(self, "                free(c->stack);");
+        wln!(self, "#endif");
+        wln!(self, "            }} else {{");
+        wln!(self, "                live++;");
+        wln!(self, "            }}");
+        wln!(self, "        }}");
+        wln!(self, "        if (live == 0) return __p_co_count;");
+        wln!(self, "    }}");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_co_done(int64_t t) {{ return (t >= 1 && t <= __p_co_count) ? (int64_t)__p_cos[t - 1]->done : 1; }}");
+        wln!(self, "int64_t p_co_result(int64_t t) {{ return (t >= 1 && t <= __p_co_count) ? __p_cos[t - 1]->result : 0; }}");
         wln!(self, "static void* p_thread_wrapper(void* arg) {");
         wln!(self, "    p_thread_arg_t* ta = (p_thread_arg_t*)arg;");
         wln!(self, "    int64_t result = 0;");

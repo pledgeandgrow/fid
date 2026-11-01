@@ -2,6 +2,8 @@
 
 ## Session 36 — One Integer Meaning, Sound Builds, a Real Allocator (Nov 1, 2026)
 
+- **Tasks:** `stdlib/task.fd` gives green threads with real stack switching,
+  through fibers on Windows and ucontext on Linux.
 - **Native builds import from any DLL:** `extern "C" link "x"` adds x.dll to the
   import table, with no C compiler.
 - **`module::name()`:** two imported modules may define the same function.

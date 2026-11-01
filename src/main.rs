@@ -2030,6 +2030,7 @@ fn real_main() {
             let interp_skip_tests: &[&str] = &[
                 "probe_lower",
                 "test_pe_dll_import",
+                "test_pe_task_order",
                 "test_spawn_gt",
             ];
 
