@@ -2512,15 +2512,19 @@ mod tests {
     }
 
     #[test]
-    fn ct_asm_fail_fixture_is_rejected() {
-        let src = fixture("test_ct_asm_fail.fd");
+    fn ct_asm_checked_add_is_rejected() {
+        // The source check already rejects an `if` on data
+        // (test_ct_asm_fail.fd), so this uses what only the asm verifier
+        // can see: the overflow branch of a checked add.
+        let src = "@constant_time\nfn leaky_add(a: i64, b: i64) -> i64 {\n    return a + b;\n}\n\
+                   fn main() {\n    print(leaky_add(5, 6));\n}\n";
         for level in [crate::opt::OptLevel::O0, crate::opt::OptLevel::O2] {
-            let (asm, ct) = build_asm_like_build(&src, level);
-            assert_eq!(ct, vec!["leaky_eq".to_string()]);
+            let (asm, ct) = build_asm_like_build(src, level);
+            assert_eq!(ct, vec!["leaky_add".to_string()]);
             let v = verify_constant_time_asm(&asm, &ct);
             assert!(
-                v.iter().any(|x| x.kind == CtViolationKind::ConditionalJump && x.function == "leaky_eq"),
-                "level {:?}: expected a conditional-jump violation in leaky_eq, got {:#?}",
+                v.iter().any(|x| x.kind == CtViolationKind::ConditionalJump && x.function == "leaky_add"),
+                "level {:?}: expected a conditional-jump violation in leaky_add, got {:#?}",
                 level,
                 v
             );

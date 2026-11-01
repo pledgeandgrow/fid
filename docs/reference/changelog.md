@@ -2,6 +2,12 @@
 
 ## Session 36 — One Integer Meaning, Sound Builds, a Real Allocator (Nov 1, 2026)
 
+- **Stdlib:** all modules compile on their own, on both compilers
+  (scripts/check-stdlib.sh, run in CI); 13 did not. template no longer prints
+  JSON quotes, csv_get returns plain text, replay reads back what it saved
+  (binary-safe, negative values kept), skel stores a track, not its keyframes.
+  serialize's writer functions json_string/json_bool/json_null are now
+  json_write_string/json_write_bool/json_write_null: they clashed with json.
 - **Integers:** add/sub/mul/neg are checked at the declared width on the
   interpreter, C and native paths; @wrapping wraps at it; division by zero
   always panics; u64 is really unsigned. Lowering carried i64 for every integer

@@ -2,18 +2,18 @@
 
 ## Contents
 
-- [ByteBuffer](#bytebuffer) (struct)
-- [ByteBuffer](#bytebuffer) (impl)
+- [ByteCursor](#bytebuffer) (struct)
+- [ByteCursor](#bytebuffer) (impl)
 - [buffer_new](#buffer_new) (function)
 - [buffer_from_bytes](#buffer_from_bytes) (function)
 - [buffer_from_string](#buffer_from_string) (function)
 
-## ByteBuffer
+## ByteCursor
 
 A byte buffer with separate read and write cursors.
 
 ```fides
-pub struct ByteBuffer {
+pub struct ByteCursor {
 ```
 
 **Fields:**
@@ -27,10 +27,10 @@ pub struct ByteBuffer {
 
 ---
 
-## ByteBuffer
+## ByteCursor
 
 ```fides
-impl ByteBuffer {
+impl ByteCursor {
 ```
 
 *Defined at line 24*
@@ -42,10 +42,10 @@ impl ByteBuffer {
 Create a new empty buffer (free function wrapper).
 
 ```fides
-pub fn buffer_new() -> ByteBuffer {
+pub fn buffer_new() -> ByteCursor {
 ```
 
-**Returns:** `ByteBuffer`
+**Returns:** `ByteCursor`
 
 *Defined at line 297*
 
@@ -56,14 +56,14 @@ pub fn buffer_new() -> ByteBuffer {
 Create a buffer from an existing Vec of bytes.
 
 ```fides
-pub fn buffer_from_bytes(bytes: Vec) -> ByteBuffer {
+pub fn buffer_from_bytes(bytes: Vec) -> ByteCursor {
 ```
 
 **Parameters:**
 
 - `bytes`: `Vec`
 
-**Returns:** `ByteBuffer`
+**Returns:** `ByteCursor`
 
 *Defined at line 302*
 
@@ -74,14 +74,14 @@ pub fn buffer_from_bytes(bytes: Vec) -> ByteBuffer {
 Create a buffer from a string.
 
 ```fides
-pub fn buffer_from_string(s: str) -> ByteBuffer {
+pub fn buffer_from_string(s: str) -> ByteCursor {
 ```
 
 **Parameters:**
 
 - `s`: `str`
 
-**Returns:** `ByteBuffer`
+**Returns:** `ByteCursor`
 
 *Defined at line 307*
 

@@ -1,0 +1,80 @@
+// The stdlib modules that had stopped compiling: each one still does its job.
+use json;
+use data;
+use template;
+use skel;
+use mesh;
+use terrain;
+use serialize;
+use replay;
+use buffer;
+
+fn main() -> i64 {
+    // data
+    val cells = parse_csv_row("a,\"b,c\",d");
+    print(cells.len()); print("\n");
+    var c1: str = cells.get(1);
+    print(c1); print("\n");
+    val csv = parse_csv("name,age\nAda,36\nGrace,45\n");
+    print(csv); print("\n");
+    print(csv_headers(csv)); print("\n");
+    print(csv_row_count(csv)); print("\n");
+    print(csv_get(csv_row(csv, 1), "name")); print("\n");
+    print(infer_json_schema("{\"name\":\"x\",\"age\":3,\"ok\":true}")); print("\n");
+
+    // template
+    print(render("{{name}}, {{name|upper}}: {{age}}", "{\"name\":\"Ada\",\"age\":36}")); print("\n");
+
+    // skel: a keyframe lands in the bone's track
+    var anim = skel_create_animation("walk", 2);
+    skel_set_keyframe(&mut anim, 1, 0.5, vec3(1.0, 2.0, 3.0), quat(1.0, 0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0));
+    skel_set_keyframe(&mut anim, 1, 1.0, vec3(3.0, 2.0, 1.0), quat(1.0, 0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0));
+    print(anim.tracks.get(1).keyframes.len()); print("\n");
+    print(anim.tracks.get(0).keyframes.len()); print("\n");
+
+    // mesh and terrain
+    val cube = mesh_create_cube(1.0);
+    print(mesh_triangle_count(&cube)); print("\n");
+    p_file_write("test_stdlib_repaired.obj", "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n");
+    val tri = mesh_load_obj("test_stdlib_repaired.obj");
+    p_file_delete("test_stdlib_repaired.obj");
+    print(mesh_triangle_count(&tri)); print("\n");
+    var t = terrain_create(4, 4, 1.0);
+    terrain_generate_flat(&mut t);
+    print(terrain_get_height_grid(&t, 1, 1) == 0.0); print("\n");
+
+    // serialize: a saved document reads back
+    var w = json_writer_create();
+    json_object_begin(&mut w);
+    json_key(&mut w, "n");
+    json_int(&mut w, 7);
+    json_object_end(&mut w);
+    print(json_save(&w, "test_stdlib_repaired.json")); print("\n");
+    print(p_file_read("test_stdlib_repaired.json")); print("\n");
+    p_file_delete("test_stdlib_repaired.json");
+
+    // replay: frames survive a save and a load
+    var rp = replay_create();
+    replay_start_recording(&mut rp, 42, "game", "1.0");
+    var keys: Vec<i64> = Vec::new();
+    keys.push(65);
+    replay_record_frame(&mut rp, keys, -10, 20, 1, 16, 42);
+    replay_stop_recording(&mut rp);
+    print(replay_save(&rp, "test_stdlib_repaired.rpl")); print("\n");
+    var back = replay_create();
+    print(replay_load(&mut back, "test_stdlib_repaired.rpl")); print("\n");
+    p_file_delete("test_stdlib_repaired.rpl");
+    print(replay_frame_count(&back)); print("\n");
+    print(back.mouse_xs.get(0)); print("\n");
+    print(back.key0s.get(0)); print("\n");
+
+    // buffer: its cursor is its own type, not core's ByteBuffer
+    var cur = ByteCursor::new();
+    cur.write_u32_le(305419896);
+    cur.write_u8(7);
+    cur.rewind();
+    print(cur.read_u32_le()); print("\n");
+    print(cur.read_u8()); print("\n");
+    print(cur.remaining()); print("\n");
+    return 0;
+}

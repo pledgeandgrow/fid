@@ -7391,7 +7391,7 @@ mod tests {
     fn dce_removes_unused_pure_insts() {
         // `pv unused = 1 + 2; ret 0;` — the BinOp is pure and its result is
         // never used, so DCE should remove it.
-        let src = "fn main() -> i64 { val unused = 1 + 2; return 0; }\n";
+        let src = "fn main() -> i64 { var unused = 1 + 2; return 0; }\n";
         let mut l2 = compile_to_l2(src);
         // Fold first so the BinOp becomes a ConstInt (still pure, still dead).
         pass_const_fold(&mut l2);
@@ -7689,7 +7689,7 @@ mod tests {
         // reading in between. In Fides, this happens with mutable local vars.
         let src = "
             fn main() -> i64 {
-                val x = 1;
+                var x = 1;
                 x = 2;
                 return x;
             }
@@ -7973,8 +7973,8 @@ mod tests {
         // A while loop with a large trip count should be rotated.
         let src = "
             fn main() -> i64 {
-                val sum = 0;
-                val i = 0;
+                var sum = 0;
+                var i = 0;
                 while i < 100 {
                     sum = sum + i;
                     i = i + 1;
@@ -8004,8 +8004,8 @@ mod tests {
         // We verify by checking the PIR has a self-looping block (the rotated body).
         let src = "
             fn main() -> i64 {
-                val sum = 0;
-                val i = 0;
+                var sum = 0;
+                var i = 0;
                 while i < 50 {
                     sum = sum + i;
                     i = i + 1;
@@ -8040,7 +8040,7 @@ mod tests {
             fn main() -> i64 {
                 val a = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
                 val c = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-                val i = 0;
+                var i = 0;
                 while i < 12 {
                     c[i] = a[i] + 1;
                     i = i + 1;
@@ -8062,7 +8062,7 @@ mod tests {
             fn main() -> i64 {
                 val a = [1, 2, 3, 4];
                 val c = [0, 0, 0, 0];
-                val i = 0;
+                var i = 0;
                 while i < 4 {
                     c[i] = a[i] + 1;
                     i = i + 1;
@@ -8085,7 +8085,7 @@ mod tests {
             fn main() -> i64 {
                 val a = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
                 val c = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-                val i = 0;
+                var i = 0;
                 while i < 13 {
                     c[i] = a[i] + 1;
                     i = i + 1;
@@ -8229,8 +8229,8 @@ mod tests {
                 return k;
             }
             fn main() -> i64 {
-                val sum = 0;
-                val i = 0;
+                var sum = 0;
+                var i = 0;
                 while i < 10 {
                     val r = compute(3, 4);
                     sum = sum + r;
@@ -8298,7 +8298,7 @@ mod tests {
         // I-1A: A call that receives a pointer to region R invalidates loads
         // from region R, but NOT loads from other regions.
         let src = "fn helper(a: &mut [i64; 4], n: i64) -> i64 !IO {
-            if n > 0 { val _ = helper(a, n - 1); }
+            if n > 0 { var _ = helper(a, n - 1); }
             a[0] = 99;
             return 0;
         }
@@ -8306,7 +8306,7 @@ mod tests {
             region r1 {
                 var a = [1, 2, 3, 4];
                 val x = a[0];
-                val _ = helper(&mut a, 3);
+                var _ = helper(&mut a, 3);
                 val y = a[0];
                 return x + y;
             }
@@ -8418,7 +8418,7 @@ mod tests {
     fn i3c_sandbox_values_populated() {
         // I-3C: Instructions inside sandbox blocks should be marked in_sandbox.
         let src = "fn helper(x: i64) -> i64 { return x * 2; }
-        fn main() -> i64 !IO { val r: i64 = 0; sandbox { r = helper(5); } print(r); return 0; }\n";
+        fn main() -> i64 !IO { var r: i64 = 0; sandbox { r = helper(5); } print(r); return 0; }\n";
         let l2 = compile_to_l2(src);
         let f = l2.functions.iter().find(|f| f.name == "main").unwrap();
         // At least some values should be marked as sandbox
@@ -8432,7 +8432,7 @@ mod tests {
         // even if they're slightly above the normal inline threshold.
         // The sandbox inline limit is 6 blocks / 40 insts vs normal 3/20.
         let src = "fn helper(x: i64) -> i64 { val a = x + 1; val b = a + 2; val c = b + 3; return c; }
-        fn main() -> i64 !IO { val r: i64 = 0; sandbox { r = helper(5); } print(r); return 0; }\n";
+        fn main() -> i64 !IO { var r: i64 = 0; sandbox { r = helper(5); } print(r); return 0; }\n";
         let mut l2 = compile_to_l2(src);
         // helper has 1 block but several instructions — should be inlined
         // in both normal and sandbox context (it's small enough).
@@ -8475,7 +8475,7 @@ mod tests {
         // I-4B: @crashfree calls with loop-invariant args should be hoisted
         // out of loops (in addition to pure calls).
         let src = "@crashfree @wrapping fn safe_compute(x: i64) -> i64 { return x * 2; }
-        fn main() -> i64 !IO { val sum: i64 = 0; for i in 0..5 { sum = sum + safe_compute(10); } print(sum); return 0; }\n";
+        fn main() -> i64 !IO { var sum: i64 = 0; for i in 0..5 { sum = sum + safe_compute(10); } print(sum); return 0; }\n";
         let mut l2 = compile_to_l2(src);
         let n = pass_effect_optimize(&mut l2);
         // safe_compute(10) has loop-invariant args and is @crashfree + effectively pure
@@ -8528,7 +8528,7 @@ mod tests {
         // I-4C: @gas functions should allow unrolling loops with trip count > 8
         // Use trip count 20 (> 16, so comptime loop unrolling won't handle it,
         // only the IR unroller with @gas will).
-        let src = "@gas(1000) fn compute() -> i64 { val sum: i64 = 0; for i in 0..20 { sum = sum + i; } return sum; }\n";
+        let src = "@gas(1000) fn compute() -> i64 { var sum: i64 = 0; for i in 0..20 { sum = sum + i; } return sum; }\n";
         let mut l2 = compile_to_l2(src);
         let n = pass_unroll(&mut l2);
         // Normal limit is 8, but @gas allows up to 64. Trip count 20 should unroll.
@@ -8538,7 +8538,7 @@ mod tests {
     #[test]
     fn i4c_no_gas_still_limits_unrolling() {
         // Without @gas, trip count > 8 should NOT unroll
-        let src = "fn compute() -> i64 { val sum: i64 = 0; for i in 0..12 { sum = sum + i; } return sum; }\n";
+        let src = "fn compute() -> i64 { var sum: i64 = 0; for i in 0..12 { sum = sum + i; } return sum; }\n";
         let mut l2 = compile_to_l2(src);
         let n = pass_unroll(&mut l2);
         assert_eq!(n, 0, "should not unroll trip count 12 without @gas, got {}", n);

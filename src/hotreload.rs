@@ -455,12 +455,12 @@ mod tests {
 
     #[test]
     fn test_persistent_state() {
-        let state_path = "/tmp/pledge_test_state_unique_12345.json";
-        let _ = std::fs::remove_file(state_path);
+        let state_path = std::env::temp_dir().join("pledge_test_state_unique_12345.json");
+        let _ = std::fs::remove_file(&state_path);
 
         {
             let mut state = PersistentState {
-                state_file: PathBuf::from(state_path),
+                state_file: state_path.clone(),
                 data: HashMap::new(),
             };
             state.set("counter", "42");
@@ -470,7 +470,7 @@ mod tests {
 
         // Load in a new instance
         let state = PersistentState {
-            state_file: PathBuf::from(state_path),
+            state_file: state_path.clone(),
             data: HashMap::new(),
         };
         let mut state = state;

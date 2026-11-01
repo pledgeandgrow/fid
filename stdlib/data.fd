@@ -58,9 +58,7 @@ pub fn parse_csv(content: str) -> str {
         var j = 0;
         while j < headers.len() && j < cells.len() {
             if j > 0 { result = result + ","; }
-            var header = json_escape_string(headers.get(j));
-            var value = json_escape_string(cells.get(j));
-            result = result + "\"" + header + "\":\"" + value + "\"";
+            result = result + json_string(headers.get(j)) + ":" + json_string(cells.get(j));
             j = j + 1;
         }
         result = result + "}";
@@ -79,12 +77,12 @@ pub fn parse_csv_row(line: str) -> Vec {
     var i = 0;
     var len = str_len(line);
     while i < len {
-        var c = str_char_at(line, i);
+        var c = str_byte_at(line, i);
         if in_quotes {
             if c == 34 {  // "
                 in_quotes = false;
             } else {
-                current = current + str_from_char(c);
+                current = current + char_to_str(c);
             }
         } else {
             if c == 34 {  // "
@@ -93,7 +91,7 @@ pub fn parse_csv_row(line: str) -> Vec {
                 cells.push(current);
                 current = "";
             } else {
-                current = current + str_from_char(c);
+                current = current + char_to_str(c);
             }
         }
         i = i + 1;
@@ -106,8 +104,15 @@ pub fn parse_csv_row(line: str) -> Vec {
 /// Returns a JSON array of header strings.
 pub fn csv_headers(csv_json: str) -> str {
     if json_len(csv_json) == 0 { return "[]"; }
-    var first_row = json_at(csv_json, 0);
-    return json_keys(first_row);
+    var keys = json_keys(json_at(csv_json, 0));
+    var result = "[";
+    var i = 0;
+    while i < keys.len() {
+        if i > 0 { result = result + ","; }
+        result = result + json_string(keys.get(i));
+        i = i + 1;
+    }
+    return result + "]";
 }
 
 /// Get a specific row from a parsed CSV.
@@ -118,7 +123,7 @@ pub fn csv_row(csv_json: str, row_idx: i64) -> str {
 
 /// Get a cell value from a CSV row by column name.
 pub fn csv_get(row_json: str, col_name: str) -> str {
-    return json_get(row_json, col_name);
+    return json_get_str(row_json, col_name);
 }
 
 /// Get the number of rows in a parsed CSV.
@@ -148,16 +153,16 @@ pub fn infer_json_schema(json_str: str) -> str {
     var keys = json_keys(json_str);
     var result = "{";
     var i = 0;
-    while i < json_len(keys) {
+    while i < keys.len() {
         if i > 0 { result = result + ","; }
-        var key = json_at(keys, i);
+        var key: str = keys.get(i);
         var value = json_get(json_str, key);
         var type_name = "string";
         if str_starts_with(value, "{") { type_name = "object"; }
         else if str_starts_with(value, "[") { type_name = "array"; }
         else if str_equal(value, "true") || str_equal(value, "false") { type_name = "boolean"; }
         else if str_len(value) > 0 {
-            var c = str_char_at(value, 0);
+            var c = str_byte_at(value, 0);
             if c >= 48 && c <= 57 { type_name = "number"; }
             if c == 45 { type_name = "number"; }  // negative number
         }
@@ -226,7 +231,7 @@ pub fn infer_op_shape(op: str, input_shape: str) -> str {
         var total = 1;
         var i = 0;
         while i < json_len(input_shape) {
-            var dim = c_str_parse_i64(json_at(input_shape, i));
+            var dim = str_parse_int(json_at(input_shape, i));
             total = total * dim;
             i = i + 1;
         }

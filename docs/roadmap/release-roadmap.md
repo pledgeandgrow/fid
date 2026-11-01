@@ -81,8 +81,9 @@ Everything else relies on these.
 
 - [x] A1. `fidesc test` exits non-zero on a failure (S).
 - [x] A2. Dev probes (`probe_*`, `test_pe_ir_*`) are left out of the suite (S).
-- [~] A3. CI runs the suite, expected-fail tests and the native fixpoint on
-      every push (`.github/workflows/ci.yml`). Left: a first green run (M).
+- [~] A3. CI runs the unit tests, suite, expected-fail tests, the stdlib check
+      and the native fixpoint on every push (`.github/workflows/ci.yml`). Left:
+      a first green run (M).
 - [ ] A4. The suite runs on the self-hosted compiler too, not only `fidesc` (M).
       `tests/` parity is a local script today.
 - [ ] A5. `_fail` tests name the error they expect. Today any failure passes,
@@ -102,20 +103,23 @@ Everything else relies on these.
 
 ## Track B — Standard library
 
-13 of 108 modules do not compile when imported on their own. Several share a
-cause, usually a missing `use`.
+On Nov 1, 13 of 108 modules did not compile when imported on their own. All do
+now, and `test_stdlib_repaired` runs them. Running them found what compiling
+could not: `template` printed JSON quotes, `csv_get` returned them, `replay`
+could not read its own files, and `skel` stored the wrong type in a track.
+Most modules still have no test, so expect more of this (B12).
 
-- [ ] B1. `data`: `json_escape_string` undefined (S).
-- [ ] B2. `http`: `json_get` undefined (S).
-- [ ] B3. `ecs`, `serialize`: JSON names and return types (S).
-- [ ] B4. `sqlite`: visibility error on `int_to_str` (S).
-- [ ] B5. `game`: `float_from_i64` undefined (S).
-- [ ] B6. `mesh`, `terrain`: `str_split` called with a char, not a str (S).
-- [ ] B7. `net`, `replay`: `&mut Vec` passed where `Vec` is declared (S).
-- [ ] B8. `shape`: tensor methods called as free functions (S).
-- [ ] B9. `skel`: a `Vec<Keyframe>` stored in a bare `Vec` field (S).
-- [ ] B10. `template`: `str_char_at` undefined (S).
-- [ ] B11. A CI step imports every stdlib module on its own, so this cannot
+- [x] B1. `data`: `json_escape_string` undefined (S).
+- [x] B2. `http`: `json_get` undefined (S).
+- [x] B3. `ecs`, `serialize`: JSON names and return types (S).
+- [x] B4. `sqlite`: visibility error on `int_to_str` (S).
+- [x] B5. `game`: `float_from_i64` undefined (S).
+- [x] B6. `mesh`, `terrain`: `str_split` called with a char, not a str (S).
+- [x] B7. `net`, `replay`: `&mut Vec` passed where `Vec` is declared (S).
+- [x] B8. `shape`: tensor methods called as free functions (S).
+- [x] B9. `skel`: a `Vec<Keyframe>` stored in a bare `Vec` field (S).
+- [x] B10. `template`: `str_char_at` undefined (S).
+- [x] B11. A CI step imports every stdlib module on its own, so this cannot
       regress (S).
 - [ ] B12. Every module has a test and a `docs/stdlib/` page; 36 of 108 have no
       page (L).
@@ -125,6 +129,16 @@ cause, usually a missing `use`.
 - [ ] B15. Remove the false claims in stubs: `@derive(Serialize)` emits constant
       data; `ota_verify_manifest` only checks a prefix; `sqlite` has no
       parameter binding, so it is open to injection (M).
+
+- [ ] B16. Modules share one namespace, so 44 function names clash and those
+      pairs cannot be imported together: `file`+`fs` (11), `simd`+`tensor` (8),
+      `args`+`os`, `encoding`+`url`, `env`+`os`, `arena`+`http`, `csv`+`data`.
+      Add qualified names (`json::get`) or rename (M).
+- [ ] B17. A private function in one module must not shadow a core function for
+      other modules: `sqlite`'s local `int_to_str` broke `json` and `string` (S).
+- [ ] B18. A struct defined in two modules must be an error, as a function is:
+      `core` and `buffer` both had a public `ByteBuffer`, and each compiler
+      silently picked a different one (S).
 
 **Acceptance:** every stdlib module compiles and has a passing test.
 
