@@ -81,9 +81,10 @@ Everything else relies on these.
 
 - [x] A1. `fidesc test` exits non-zero on a failure (S).
 - [x] A2. Dev probes (`probe_*`, `test_pe_ir_*`) are left out of the suite (S).
-- [~] A3. CI runs the unit tests, suite, expected-fail tests, the stdlib check
-      and the native fixpoint on every push (`.github/workflows/ci.yml`). Left:
-      a first green run (M).
+- [x] A3. CI runs the unit tests, suite, expected-fail tests, the stdlib check
+      and the native fixpoint on every push (`.github/workflows/ci.yml`); first
+      green run Nov 1, Windows and Linux. Linux only builds, runs unit tests and
+      one C program so far (F1).
 - [ ] A4. The suite runs on the self-hosted compiler too, not only `fidesc` (M).
       `tests/` parity is a local script today.
 - [ ] A5. `_fail` tests name the error they expect. Today any failure passes,
@@ -98,8 +99,9 @@ Everything else relies on these.
       the installer ships it and `fid emit` is tested from an installed layout
       in CI (S).
 - [ ] A11. `verify-selfhost.sh` baseline restored (S).
-- [ ] A12. Find why `test_spawn_gt` failed natively once on CI: it passes 320 of
-      320 runs here under load. The harness now prints the reason (S).
+- [ ] A12. Find why `test_spawn_gt` failed natively once on CI: it passed on the
+      next run and 320 of 320 here under load. The harness now prints the
+      reason if it comes back (S).
 - [ ] A13. `run_with_timeout` reads a child's output only after it exits, so a
       test printing more than the pipe holds would hang until the limit (S).
 
@@ -207,8 +209,9 @@ compiler.
 
 - [ ] F1. Run the whole suite on Linux x64 through C, in CI (M). Not run so far.
       `fidesc` did not even build on Linux until Nov 1: a missing import.
-- [ ] F10. The C path works with MinGW `gcc`: every C test failed with it on CI,
-      while `zig cc` passes. CI has a diagnostic step for this (S).
+- [ ] F10. The C path works with MinGW `gcc`: linking fails because `-Wl,-z,...`
+      is ELF-only (`src/main.rs`, `compiler/main.fd`). `zig cc` accepts it. CI's
+      diagnostic step proves the fix (S).
 - [ ] F2. `fid` builds and bootstraps itself on Linux (M).
 - [ ] F3. Install archives tested on a clean Linux machine (S).
 - [ ] F4. Native ELF path for `fid`: an IR→ELF backend sharing the x86-64
