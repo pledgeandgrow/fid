@@ -2262,6 +2262,11 @@ impl PeCodeGen {
         // Bump-allocator state for p_malloc: 32 zero bytes in writable
         // .rdata — +0 chunk cursor, +8 chunk end, +16 cached process-heap
         // handle, +24 grow spinlock.
+        // Cache-line aligned: a locked operation on a value that crosses a
+        // line stalls the whole memory bus (about 900 ns per allocation).
+        while rdata.data.len() % 64 != 0 {
+            rdata.data.push(0);
+        }
         self.alloc_rdata_off = rdata.data.len();
         rdata.data.extend_from_slice(&[0u8; ALLOC_STATE_SIZE]);
 
