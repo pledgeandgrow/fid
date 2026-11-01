@@ -352,7 +352,8 @@ Tested on Nov 1, native build:
 |---|---|---|
 | `Vec` index out of bounds | Panics | Done |
 | Wild or null pointer read | Compiles outside `unsafe`; panics only if unmapped | K1, M2 |
-| Double free | `p_free` needs no `unsafe`; the second free is accepted silently | M2, M3 |
+| Double free | Panics, on the interpreter, C and native paths; still needs no `unsafe`, and is missed once the block has been reused | M2, M5, M7 |
+| Free of a pointer that is not a block | Panics, on the interpreter, C and native paths | Done (M3) |
 | Use after free | Needs `unsafe` to read, but nothing detects it: it read 0 | M7, M8 |
 | Two names for one `Vec` | `var b = a` shares it, with no move check | M4, M5 |
 | `push` during `for` over the same `Vec` | Compiles and runs | K4 |
@@ -361,8 +362,11 @@ Tested on Nov 1, native build:
       promises, and exactly what `unsafe` gives up (S).
 - [ ] M2. `p_malloc`, `p_free`, integer-to-pointer casts and `extern "C"` calls
       need `unsafe` (M).
-- [ ] M3. The allocator marks freed blocks in their header and panics on a double
-      free or a pointer it never handed out (S).
+- [x] M3. The allocator marks freed blocks in their header and panics on a double
+      free or a pointer it never handed out. A second free after the block was
+      reused cannot be told from a valid one, and frees the new owner's block:
+      M5 and M7 close that. Covers the interpreter, C and native Windows paths;
+      the native ELF, ARM64 and RISC-V runtimes have their own p_free, unchanged.
 - [ ] M4. Decide what `var b = a` means for `Vec`, `str` and `HashMap`: a move, or
       a shared counted handle (S, see decision 3).
 - [ ] M5. Enforce it: use after move is rejected, or shared handles are counted
@@ -378,6 +382,10 @@ Tested on Nov 1, native build:
       and no safe stdlib function can be misused into a memory error (L).
 
 K1, K4, K5, K6, C5, C6 and H3 count towards this goal.
+
+M3 found a real leak on its first run: shared slots on the C path came from plain
+`malloc`, so `p_free` had ignored every one of them. Any other pointer the
+runtime hands out from `malloc` will now panic if freed, rather than leak.
 
 **Acceptance:** every row of the table is rejected or panics, with a test;
 sanitizer runs and a week of fuzzing find no memory error in programs without

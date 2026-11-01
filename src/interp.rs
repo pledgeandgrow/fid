@@ -133,6 +133,8 @@ pub struct Memory {
     data: Vec<u8>,
     /// Next allocation address
     next_alloc: u64,
+    /// Every block's start address, and whether it is still live
+    blocks: HashMap<u64, bool>,
 }
 
 impl Memory {
@@ -140,16 +142,33 @@ impl Memory {
         Memory {
             data: vec![0u8; 1024 * 1024],  // 1MB simulated memory
             next_alloc: 0x1000,             // Start allocations at 0x1000
+            blocks: HashMap::new(),
         }
+    }
+
+    /// A live block at `addr`: shared slots are allocated elsewhere, and
+    /// freed like any other block.
+    pub fn add_block(&mut self, addr: u64) {
+        self.blocks.insert(addr, true);
     }
 
     pub fn alloc(&mut self, size: u64) -> u64 {
         let addr = self.next_alloc;
+        if size > 0 { self.add_block(addr); }
         self.next_alloc += size;
         if self.next_alloc as usize > self.data.len() {
             self.data.resize(self.next_alloc as usize + 1024, 0);
         }
         addr
+    }
+
+    /// Memory is never reused, but a bad free fails as it does natively.
+    pub fn free(&mut self, addr: u64) -> Result<(), &'static str> {
+        match self.blocks.get_mut(&addr) {
+            Some(live) if *live => { *live = false; Ok(()) }
+            Some(_) => Err("Double free"),
+            None => Err("Invalid free: not an allocated block"),
+        }
     }
 
     /// Total bytes allocated so far (for memory limit checks).
@@ -2891,16 +2910,25 @@ impl Interpreter {
             }
             "p_malloc" => {
                 let size = if let Some(Value::Int(s)) = args.first() {
-                    if *s < 0 { 0 } else { *s as u64 }
+                    if *s < 1 { 1 } else { *s as u64 }
                 } else {
-                    0
+                    1
                 };
                 let addr = self.memory.alloc(size);
                 ExecOutcome::Value(Value::Ptr(addr))
             }
             "p_free" => {
-                // Interpreter doesn't actually free — memory is arena-based
-                ExecOutcome::Value(Value::Void)
+                // Strings and Vecs are managed values here, not blocks
+                let addr = match args.first() {
+                    Some(Value::Ptr(a)) => *a,
+                    Some(Value::Int(a)) => *a as u64,
+                    _ => 0,
+                };
+                if addr == 0 { return ExecOutcome::Value(Value::Void); }
+                match self.memory.free(addr) {
+                    Ok(()) => ExecOutcome::Value(Value::Void),
+                    Err(msg) => ExecOutcome::Panic(msg.to_string()),
+                }
             }
             // Interpreter memory is never reused, so a mark has nothing to
             // restore (use after restore is the program's error).
@@ -5812,6 +5840,7 @@ impl Interpreter {
                 self.next_shared_addr += 8;
                 // Initialize to 0
                 self.shared_memory.lock().unwrap().insert(addr, 0);
+                self.memory.add_block(addr as u64);
                 ExecOutcome::Value(Value::Int(addr))
             }
             "p_atomic_load" => {

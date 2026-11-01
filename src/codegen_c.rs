@@ -2953,9 +2953,10 @@ impl CCodeGen {
         // Blocks: an 8-byte header (P_BLOCK_MAGIC | size class) and the payload.
         // Classes are powers of two up to 1 MB, refilled from the arena and
         // reused through per-thread free lists; larger blocks go to malloc.
-        // A pointer without the magic (a block freed twice) is
-        // ignored by p_free. A reused block is zeroed, as fresh memory is.
+        // p_free turns the header into P_BLOCK_FREED | class and panics on
+        // anything else. A reused block is zeroed, as fresh memory is.
         wln!(self, "#define P_BLOCK_MAGIC 0xF1DE5A0000000000ULL");
+        wln!(self, "#define P_BLOCK_FREED 0xF1DE5B0000000000ULL");
         wln!(self, "#define P_CLASS_LARGE 63");
         wln!(self, "static P_THREAD_LOCAL uint64_t* __p_free_lists[21];");
         wln!(self, "void* p_malloc(int64_t size) {");
@@ -2999,9 +3000,10 @@ impl CCodeGen {
         wln!(self, "    if (!ptr) return;");
         wln!(self, "    uint64_t* b = (uint64_t*)ptr;");
         wln!(self, "    uint64_t h = b[-1];");
-        wln!(self, "    if ((h & ~(uint64_t)0xFF) != P_BLOCK_MAGIC) return;");
-        wln!(self, "    b[-1] = 0;");
+        wln!(self, "    if ((h & ~(uint64_t)0xFF) == P_BLOCK_FREED) p_panic(\"Double free\");");
+        wln!(self, "    if ((h & ~(uint64_t)0xFF) != P_BLOCK_MAGIC) p_panic(\"Invalid free: not an allocated block\");");
         wln!(self, "    int k = (int)(h & 0xFF);");
+        wln!(self, "    b[-1] = P_BLOCK_FREED | (uint64_t)k;");
         wln!(self, "    if (k == P_CLASS_LARGE) { free(b - 1); return; }");
         wln!(self, "    b[0] = (uint64_t)__p_free_lists[k];");
         wln!(self, "    __p_free_lists[k] = b;");
@@ -3599,7 +3601,7 @@ impl CCodeGen {
         wln!(self, "    return -(int64_t)(idx + 1);");
         wln!(self, "}");
         // Shared memory — simple malloc-based, atomics use C11 stdatomic
-        wln!(self, "int64_t p_shared_alloc(int64_t size) { if (size < 0) return 0; return (int64_t)(intptr_t)malloc((size_t)size); }");
+        wln!(self, "int64_t p_shared_alloc(int64_t size) { if (size < 0) return 0; uint64_t* b = (uint64_t*)calloc(1, (size_t)size + 8); if (!b) { p_panic(\"p_shared_alloc: out of memory\"); } b[0] = P_BLOCK_MAGIC | P_CLASS_LARGE; return (int64_t)(intptr_t)(b + 1); }");
         wln!(self, "int64_t p_atomic_load(int64_t addr) { return atomic_load((atomic_int_least64_t*)(intptr_t)addr); }");
         wln!(self, "void p_atomic_store(int64_t addr, int64_t val) { atomic_store((atomic_int_least64_t*)(intptr_t)addr, val); }");
         wln!(self, "bool p_atomic_cas(int64_t addr, int64_t expected, int64_t new_val) {");

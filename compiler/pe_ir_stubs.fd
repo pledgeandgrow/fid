@@ -1746,9 +1746,11 @@ fn PeirGen_gen_panic_write(self: &mut PeirGen) -> void {
 // +24 spinlock, +32 the free list of each size class.
 pub const PEIR_ALLOC_STATE_SIZE: i64 = 200;
 const PEIR_ALLOC_LISTS: i64 = 32;
-// A block's header: this magic | its size class. p_free ignores a pointer
-// without it (a block freed twice).
+// A block's header: this magic | its size class. p_free turns it into
+// PEIR_BLOCK_FREED | class, and panics on anything else: a block freed twice,
+// or a pointer that never was a block.
 const PEIR_BLOCK_MAGIC: i64 = 0xF1DE5A0000000000;
+const PEIR_BLOCK_FREED: i64 = 0xF1DE5B0000000000;
 const PEIR_CLASS_LARGE: i64 = 63;
 
 /// Acquire the allocator's spinlock.
@@ -2030,7 +2032,7 @@ pub fn PeirGen_gen_malloc(self: &mut PeirGen) -> void {
 }
 
 /// p_free(rcx = ptr): back on its class's free list, or to the system heap
-/// when large. A pointer without the magic is ignored.
+/// when large. Panics unless it is a live block.
 pub fn PeirGen_gen_free(self: &mut PeirGen) -> void {
     var label: i64 = HashMap_get(self.func_labels, "p_free");
     PeirEnc_place_label(&mut self.enc, label);
@@ -2041,17 +2043,30 @@ pub fn PeirGen_gen_free(self: &mut PeirGen) -> void {
         var abase: i64 = self.alloc_rdata_off;
         var out: i64 = PeirEnc_alloc_label(&mut self.enc);
         var large: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var live: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var twice: i64 = PeirEnc_alloc_label(&mut self.enc);
         PeirEnc_test_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
         PeirEnc_jcc_label(&mut self.enc, 0x4, out); // jz
-        // rax = header; no magic: not a block, or already freed
+        // rax = header, rdx = its magic
         PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_RCX, -8);
         PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
         pe_emit2(&mut self.enc, 0x30, 0xD2); // xor dl, dl
         PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, PEIR_BLOCK_MAGIC);
         PeirEnc_cmp_rr(&mut self.enc, PEIR_RDX, PEIR_R8);
-        PeirEnc_jcc_label(&mut self.enc, 0x5, out); // jne
+        PeirEnc_jcc_label(&mut self.enc, 0x4, live); // je
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, PEIR_BLOCK_FREED);
+        PeirEnc_cmp_rr(&mut self.enc, PEIR_RDX, PEIR_R8);
+        PeirEnc_jcc_label(&mut self.enc, 0x4, twice); // je
+        // The panic stubs expect a function body's aligned stack
+        PeirEnc_sub_rsp_i32(&mut self.enc, 8);
+        PeirEnc_jmp_label(&mut self.enc, self.arith_panics.get(PEIR_PANIC_BAD_FREE));
+        PeirEnc_place_label(&mut self.enc, twice);
+        PeirEnc_sub_rsp_i32(&mut self.enc, 8);
+        PeirEnc_jmp_label(&mut self.enc, self.arith_panics.get(PEIR_PANIC_DOUBLE_FREE));
+        PeirEnc_place_label(&mut self.enc, live);
         PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
-        PeirEnc_xor_self(&mut self.enc, PEIR_RDX);
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, PEIR_BLOCK_FREED);
+        PeirEnc_or_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
         PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RCX, -8, PEIR_RDX);
         PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, PEIR_CLASS_LARGE);
         PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);

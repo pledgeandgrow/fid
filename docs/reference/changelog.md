@@ -2,6 +2,10 @@
 
 ## Session 36 — One Integer Meaning, Sound Builds, a Real Allocator (Nov 1, 2026)
 
+- **Bad frees stop the program:** p_free panics on a double free and on a pointer
+  that is not a live block, on the interpreter and the C and native paths
+  (release roadmap M3). It used to ignore both. This exposed a leak: shared slots
+  on the C path came from plain malloc, so rc.fd never freed its counters.
 - **Stdlib:** all modules compile on their own, on both compilers
   (scripts/check-stdlib.sh, run in CI); 13 did not. template no longer prints
   JSON quotes, csv_get returns plain text, replay reads back what it saved

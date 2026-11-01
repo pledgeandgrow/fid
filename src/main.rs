@@ -1845,6 +1845,8 @@ fn real_main() {
                 "test_vec_elem_fail",
                 "test_str_int_fail",
                 "test_crashfree_method_fail",
+                "test_double_free_fail",
+                "test_bad_free_fail",
                 // ML10: @quantized with dequantize
                 "test_quantization_fail",
                 // ML11: @checkpoint without @deterministic

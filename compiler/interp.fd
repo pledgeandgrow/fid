@@ -153,6 +153,8 @@ pub fn value_is_void(v: Value) -> bool {
 pub struct Memory {
     pub data: Vec<i64>,
     pub next_alloc: i64,
+    // Every block's start address: Value::Int while live, Value::Void once freed
+    pub blocks: I64Table,
 }
 
 pub fn Memory_new() -> Memory {
@@ -163,12 +165,13 @@ pub fn Memory_new() -> Memory {
         data.push(0);
         i = i + 1;
     }
-    return Memory { data: data, next_alloc: 0x1000 };
+    return Memory { data: data, next_alloc: 0x1000, blocks: I64Table_new() };
 }
 
 pub fn Memory_alloc(self: &mut Memory, size: i64) -> i64 {
     if size <= 0 { return self.next_alloc; }
     var addr: i64 = self.next_alloc;
+    I64Table_set(&mut self.blocks, addr, Value::Int(1));
     self.next_alloc = self.next_alloc + size;
     // Grow if needed
     while self.next_alloc >= self.data.len() {
@@ -179,6 +182,19 @@ pub fn Memory_alloc(self: &mut Memory, size: i64) -> i64 {
         }
     }
     return addr;
+}
+
+/// Memory is never reused, but a bad free fails as it does natively.
+/// Returns the panic message, "" when the free is fine.
+pub fn Memory_free(self: &mut Memory, addr: i64) -> str {
+    var s: i64 = I64Table_find(&self.blocks, addr);
+    if s < 0 { return "Invalid free: not an allocated block"; }
+    match self.blocks.vals.get(s) {
+        Value::Void => { return "Double free"; }
+        _ => {}
+    }
+    I64Table_set(&mut self.blocks, addr, Value::Void);
+    return "";
 }
 
 pub fn Memory_allocated(self: &Memory) -> i64 {
@@ -648,7 +664,7 @@ pub fn StrTable_set(t: &mut StrTable, key: str, val: i64) {
 }
 
 fn Memory_clone(m: &Memory) -> Memory {
-    return Memory { data: m.data.clone(), next_alloc: m.next_alloc };
+    return Memory { data: m.data.clone(), next_alloc: m.next_alloc, blocks: I64Table_clone(&m.blocks) };
 }
 
 pub struct ArrayBoundEntry {
@@ -3047,7 +3063,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         if args.len() > 0 {
             match args.get(0) {
                 Value::Int(s) => {
-                    if s < 0 { size = 0; } else { size = s; }
+                    if s < 1 { size = 1; } else { size = s; }
                 }
                 _ => {}
             }
@@ -3055,10 +3071,23 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
         var addr: i64 = Memory_alloc(&mut self.memory, size);
         return ExecOutcome::Value(Value::Ptr(addr));
     }
-    if name == "p_free" || name == "p_region_free" {
-        // Interpreter doesn't actually free — memory is arena-based
+    if name == "p_free" {
+        // Strings and Vecs are managed values here, not blocks
+        var addr: i64 = 0;
+        if args.len() > 0 {
+            match args.get(0) {
+                Value::Ptr(a) => { addr = a; }
+                Value::Int(a) => { addr = a; }
+                _ => {}
+            }
+        }
+        if addr != 0 {
+            var msg: str = Memory_free(&mut self.memory, addr);
+            if str_len(msg) > 0 { return ExecOutcome::Panic(msg); }
+        }
         return ExecOutcome::Value(Value::Void);
     }
+    if name == "p_region_free" { return ExecOutcome::Value(Value::Void); }
     // Interpreter memory is never reused, so a mark has nothing to restore.
     if name == "p_arena_save" { return ExecOutcome::Value(Value::Int(0)); }
     if name == "p_arena_restore" { return ExecOutcome::Value(Value::Void); }
@@ -5830,6 +5859,7 @@ pub fn Interpreter_call_runtime2(self: &mut Interpreter, name: str, args: Vec<Va
         var saddr: i64 = self.next_shared_addr;
         self.next_shared_addr = self.next_shared_addr + 8;
         I64Table_set(&mut self.shared_mem, saddr, Value::Int(0));
+        I64Table_set(&mut self.memory.blocks, saddr, Value::Int(1));
         return ExecOutcome::Value(Value::Int(saddr));
     }
     if name == "p_atomic_load" {

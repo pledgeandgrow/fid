@@ -1998,7 +1998,7 @@ struct PeCodeGen {
     /// The function being generated wraps on overflow
     cur_wrapping: bool,
     /// Labels of the stubs behind ARITH_PANICS
-    arith_panics: [u32; 7],
+    arith_panics: [u32; 9],
     /// Label of the top-level exception filter
     crash_filter: u32,
     /// Type ids of dyn values (type name -> id, from 1)
@@ -2086,13 +2086,15 @@ fn int_cmp_cc(op: &BinOp, unsigned: bool) -> Option<u8> {
 /// +24 spinlock, +32 the free list of each size class.
 const ALLOC_STATE_SIZE: usize = 32 + 8 * 21;
 const ALLOC_LISTS: usize = 32;
-/// A block's header: this magic | its size class. p_free ignores a pointer
-/// without it (a block freed twice).
+/// A block's header: this magic | its size class. p_free turns it into
+/// BLOCK_FREED | class, and panics on anything else: a block freed twice, or
+/// a pointer that never was a block.
 const BLOCK_MAGIC: u64 = 0xF1DE5A0000000000;
+const BLOCK_FREED: u64 = 0xF1DE5B0000000000;
 const CLASS_LARGE: u64 = 63;
 
 /// The messages of the arithmetic panics, one shared stub each.
-const ARITH_PANICS: [&str; 7] = [
+const ARITH_PANICS: [&str; 9] = [
     "Integer overflow on addition",
     "Integer overflow on subtraction",
     "Integer overflow on multiplication",
@@ -2100,6 +2102,8 @@ const ARITH_PANICS: [&str; 7] = [
     "Division by zero",
     "Modulo by zero",
     "Vec index out of bounds",
+    "Double free",
+    "Invalid free: not an allocated block",
 ];
 /// The other messages runtime stubs panic with.
 const RUNTIME_PANICS: [&str; 3] = [
@@ -2114,6 +2118,8 @@ const PANIC_DIV_OVF: usize = 3;
 const PANIC_DIV_ZERO: usize = 4;
 const PANIC_MOD_ZERO: usize = 5;
 const PANIC_VEC_INDEX: usize = 6;
+const PANIC_DOUBLE_FREE: usize = 7;
+const PANIC_BAD_FREE: usize = 8;
 
 
 impl PeCodeGen {
@@ -2127,7 +2133,7 @@ impl PeCodeGen {
             block_labels: HashMap::new(),
             entry_offset: 0,
             cur_wrapping: false,
-            arith_panics: [0; 7],
+            arith_panics: [0; 9],
             crash_filter: 0,
             bare_mode: false,
             cur_func: String::new(),
@@ -6954,17 +6960,30 @@ impl PeCodeGen {
             let abase = self.alloc_rdata_off;
             let out = self.enc.alloc_label();
             let large = self.enc.alloc_label();
+            let live = self.enc.alloc_label();
+            let twice = self.enc.alloc_label();
             self.enc.test_rr(Reg::Rcx, Reg::Rcx);
             self.enc.jcc_label(0x4, out); // jz
-            // rax = header; no magic: not a block, or already freed
+            // rax = header, rdx = its magic
             self.enc.mov_reg_mem_disp(Reg::Rax, Reg::Rcx, -8);
             self.enc.mov_rr(Reg::Rdx, Reg::Rax);
             self.enc.emit(&[0x30, 0xD2]); // xor dl, dl
             self.enc.mov_imm64(Reg::R8, BLOCK_MAGIC);
             self.enc.cmp_rr(Reg::Rdx, Reg::R8);
-            self.enc.jcc_label(0x5, out); // jne
+            self.enc.jcc_label(0x4, live); // je
+            self.enc.mov_imm64(Reg::R8, BLOCK_FREED);
+            self.enc.cmp_rr(Reg::Rdx, Reg::R8);
+            self.enc.jcc_label(0x4, twice); // je
+            // The panic stubs expect a function body's aligned stack
+            self.enc.sub_rsp_i32(8);
+            self.enc.jmp_label(self.arith_panics[PANIC_BAD_FREE]);
+            self.enc.place_label(twice);
+            self.enc.sub_rsp_i32(8);
+            self.enc.jmp_label(self.arith_panics[PANIC_DOUBLE_FREE]);
+            self.enc.place_label(live);
             self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
-            self.enc.xor_self(Reg::Rdx);
+            self.enc.mov_imm64(Reg::Rdx, BLOCK_FREED);
+            self.enc.or_rr(Reg::Rdx, Reg::Rax);
             self.enc.mov_mem_disp_reg(Reg::Rcx, -8, Reg::Rdx);
             self.enc.mov_imm64(Reg::Rdx, CLASS_LARGE);
             self.enc.cmp_rr(Reg::Rax, Reg::Rdx);
