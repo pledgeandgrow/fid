@@ -14,7 +14,7 @@
 self-hosted compiler reproduces itself byte for byte; one integer meaning on
 the interpreter, C and native paths; sound incremental builds; a real
 allocator; local `Vec`s freed by the compiler; `@secret`; native threads.
-Suite: interpreter 286/286, C 285/285, native 287/287, expected-fail 66/66.
+Suite: interpreter 287/287, C 286/286, native 288/288, expected-fail 66/66.
 The self-hosted compiler reproduces itself from its second generation on.
 
 **Measured starting point** (Windows x64, seconds):
@@ -98,6 +98,10 @@ Everything else relies on these.
       the installer ships it and `fid emit` is tested from an installed layout
       in CI (S).
 - [ ] A11. `verify-selfhost.sh` baseline restored (S).
+- [ ] A12. Find why `test_spawn_gt` failed natively once on CI: it passes 320 of
+      320 runs here under load. The harness now prints the reason (S).
+- [ ] A13. `run_with_timeout` reads a child's output only after it exits, so a
+      test printing more than the pipe holds would hang until the limit (S).
 
 **Acceptance:** a red test blocks a merge, on both compilers.
 
@@ -202,6 +206,9 @@ compiler.
 ## Track F — Platforms
 
 - [ ] F1. Run the whole suite on Linux x64 through C, in CI (M). Not run so far.
+      `fidesc` did not even build on Linux until Nov 1: a missing import.
+- [ ] F10. The C path works with MinGW `gcc`: every C test failed with it on CI,
+      while `zig cc` passes. CI has a diagnostic step for this (S).
 - [ ] F2. `fid` builds and bootstraps itself on Linux (M).
 - [ ] F3. Install archives tested on a clean Linux machine (S).
 - [ ] F4. Native ELF path for `fid`: an IR→ELF backend sharing the x86-64

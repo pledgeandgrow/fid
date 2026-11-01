@@ -2026,6 +2026,7 @@ fn real_main() {
                 /// The PE backend refused the program: the missing functions
                 pe_refused: Option<String>,
                 pe_ok: bool,
+                pe_why: String,
             }
             let jobs: usize = args.iter()
                 .position(|a| a == "--jobs" || a == "-j")
@@ -2048,6 +2049,7 @@ fn real_main() {
                     c_ok: false,
                     pe_refused: None,
                     pe_ok: false,
+                    pe_why: String::new(),
                 };
 
                 // Skip tests for C codegen limitations (pass on interp + PE)
@@ -2182,6 +2184,9 @@ fn real_main() {
                 // as for C. (Bare-metal tests the C backend skips cannot run
                 // under an OS; for them a valid binary is the check.)
                 run.pe_ok = if !pe_emitted {
+                    run.pe_why = pe_out.as_ref()
+                        .map(|o| String::from_utf8_lossy(&o.stderr).lines().find(|l| l.contains("rror")).unwrap_or("no binary").to_string())
+                        .unwrap_or_else(|e| e.to_string());
                     false
                 } else if run.c_skipped {
                     true
@@ -2189,10 +2194,18 @@ fn real_main() {
                     match run_with_timeout(&pe_exe, std::time::Duration::from_secs(30)) {
                         Some(out) => {
                             let pe_norm = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
-                            pe_norm == interp_stdout.replace("\r\n", "\n")
-                                && (!fail_only || out.status.success())
+                            let want = interp_stdout.replace("\r\n", "\n");
+                            run.pe_why = format!(
+                                "{}, first difference: {:?}", out.status,
+                                pe_norm.lines().zip(want.lines()).find(|(a, b)| a != b)
+                                    .or_else(|| pe_norm.lines().zip(want.lines()).last()),
+                            );
+                            pe_norm == want && (!fail_only || out.status.success())
                         }
-                        None => false,
+                        None => {
+                            run.pe_why = "timed out after 30 s".to_string();
+                            false
+                        }
                     }
                 };
                 let _ = fs::remove_file(&pe_exe);
@@ -2305,7 +2318,7 @@ fn real_main() {
                         pe_pass += 1;
                     } else {
                         pe_fail += 1;
-                        eprintln!("  [FAIL] pe emit: {}", name);
+                        eprintln!("  [FAIL] pe emit: {} ({})", name, run.pe_why);
                     }
                 }
             }

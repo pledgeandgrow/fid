@@ -16,6 +16,8 @@
 //!   backtrace              — show call stack (from debug info)
 //!   quit                   — exit debugger
 
+#[cfg(target_os = "linux")]
+use std::io::{self, BufRead, Write};
 use std::process::Command;
 
 /// Native debugger state
