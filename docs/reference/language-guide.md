@@ -403,6 +403,43 @@ println(j::json_string("x"));
 
 A name only one module defines needs no prefix.
 
+### What Safe Code Promises
+
+The goal: **a program with no `unsafe` block cannot corrupt memory.** A memory bug
+is rejected at compile time or stops with a panic. Here is exactly how far that
+holds today. Safe code means no `unsafe` block and no `@unsafe` function in your
+program; the modules it imports are trusted, as is the compiler.
+
+**Holds today:**
+
+- A `Vec` or array index out of bounds panics.
+- Integer overflow and division by zero panic, unless the function is `@wrapping`.
+- Reading through a raw pointer needs `unsafe`, as do `p_malloc`, `p_free`, making
+  a pointer from an integer, and calling `extern "C"` functions.
+- A reference cannot be stored, returned from a local, sent to a task, or captured
+  by an escaping closure.
+- What the compiler frees for you never dangles: when it cannot prove a value is
+  finished with, it leaves it allocated. The worst case is a leak.
+- A thread cannot write a global of your program without holding a lock.
+
+**Does not hold yet:**
+
+- `var b = a` on a `Vec`, `str` or `HashMap` gives two names for one value, with no
+  move check. One name can change what the other sees.
+- `push` during a `for` over the same `Vec` compiles. It is bounds-checked, so it
+  cannot read outside the `Vec`, but it can skip or repeat elements.
+- Race checks cover globals only: a `Vec` shared between threads is not checked.
+- The rules above about `unsafe` apply to your program, not yet to imported modules.
+  The standard library has not been audited.
+
+**What `unsafe` gives up:** the compiler stops checking raw pointers. Memory freed
+and then read gives stale data, with nothing to detect it. A double free panics
+unless the block has been reused, in which case it frees the new owner's memory. A
+C library can do anything at all. Inside `unsafe`, those are yours to prevent.
+
+`http_serve_scoped` is an `@unsafe` function for this reason: it frees a request's
+strings after the handler returns, on your promise that the handler kept none.
+
 ### Unsafe Code
 
 A program works with raw memory only inside `unsafe { }`, or in a function

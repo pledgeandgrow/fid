@@ -1935,6 +1935,24 @@ fn real_main() {
                     }
                 }
             }
+            // The capability, effect, region and safety tests. A name the main
+            // directory also has is skipped: output files go by name.
+            let top_stems: Vec<String> = test_files.iter()
+                .filter_map(|f| std::path::Path::new(f).file_stem().map(|n| n.to_string_lossy().to_string()))
+                .collect();
+            for dir in ["capability", "effects", "regions", "safety"] {
+                let Ok(entries) = fs::read_dir(format!("{}/{}", test_dir, dir)) else { continue; };
+                for path in entries.flatten().map(|e| e.path()) {
+                    if path.extension().map_or(true, |e| e != "fd") {
+                        continue;
+                    }
+                    let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+                    let is_fail = fs::read_to_string(&path).map_or(false, |t| t.starts_with("// expect-error:"));
+                    if is_fail == fail_only && !top_stems.contains(&stem) {
+                        test_files.push(path.to_string_lossy().to_string());
+                    }
+                }
+            }
             // Also scan tests/selfhost/ — self-hosted compiler module tests (SH-6).
             // probe_* and test_pe_ir_* are development diagnostics that need
             // the compiler's own modules: not part of the suite.
@@ -2179,10 +2197,10 @@ fn real_main() {
                         cmd.output()
                     };
                     let mut out = compile();
-                    // Under parallel load the C compiler fails now and then on
-                    // its own files (zig: "file_open Unexpected"): one retry
-                    // of the compile, never of the comparison.
-                    if jobs > 1 && matches!(&out, Ok(o) if !o.status.success()) {
+                    // The C compiler fails now and then on its own files (zig:
+                    // "file_open Unexpected"): one retry of the compile, never
+                    // of the comparison.
+                    if matches!(&out, Ok(o) if !o.status.success()) {
                         out = compile();
                     }
                     Some(out)

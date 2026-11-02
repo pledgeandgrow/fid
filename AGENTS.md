@@ -165,7 +165,7 @@ SELF-HOSTED COMPILER (primary source):
 RUST BOOTSTRAP (reference + test harness):
   src/*.rs:       55 files, 100,935 LOC — bootstrap reference
   Used when:      compiler/*.fd changes (builds stage 1); runs `fidesc test`
-  Suite (Nov 1):  interp 286/286, C 285/285, PE 287/287, expected-fail 66/66
+  Suite (Nov 2):  interp 334/334, C 338/338, PE 341/341, expected-fail 89/89
 
 WINDOWS INSTALLER (v1.0.0):
   installer/:     NSIS script + build helper
@@ -176,7 +176,7 @@ WINDOWS INSTALLER (v1.0.0):
 
 TESTS:
   tests/bootstrap/: 302 .fd files (fidesc test)
-  tests/selfhost/:  46 .fd files (verify-selfhost.sh; baseline saved 38/38×3)
+  tests/selfhost/:  47 .fd files (verify-selfhost.sh; baseline saved 36/47×3)
   Baseline:         tests/bootstrap/baseline/test_results.txt
 
 STDLIB:

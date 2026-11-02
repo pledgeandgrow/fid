@@ -567,7 +567,7 @@ pub fn build_program_with_runtime(source: &str, source_path: Option<&str>, runti
 
     // A user function named like a function of one imported module: each
     // side keeps its own (the module's copy is renamed module__name).
-    qualify_shadowed_imports(&mut imported_modules, &mut user);
+    qualify_shadowed_imports(&mut imported_modules, &mut user, &stdlib);
 
     // `cap Sub: Super`: Sub carries Super's methods (impl checks, vtables).
     let super_errors = inherit_supertrait_methods(&stdlib, &mut imported_modules, &mut user);
@@ -1248,7 +1248,7 @@ fn fill_default_trait_methods(program: &mut Program) {
 /// A name two imported modules define is renamed in each, and `module::name`
 /// in the program picks one; calls inside a module keep its own copy, or the
 /// copy of the module it imports.
-fn qualify_shadowed_imports(imported: &mut [(String, Program)], user: &mut Program) {
+fn qualify_shadowed_imports(imported: &mut [(String, Program)], user: &mut Program, core: &Program) {
     let is_cfg = |f: &crate::ast::Func| f.annotations.iter().any(|a| a.name == "cfg");
     let user_funcs: HashSet<&str> = user.funcs.iter()
         .filter(|f| !is_cfg(f))
@@ -1275,6 +1275,10 @@ fn qualify_shadowed_imports(imported: &mut [(String, Program)], user: &mut Progr
     for (_, prog) in imported.iter() {
         for f in prog.funcs.iter().filter(|f| !is_cfg(f)) {
             *count.entry(f.name.clone()).or_insert(0) += 1;
+            // A private helper named like a core function stays the module's own
+            if !f.is_pub && core.funcs.iter().any(|c| c.name == f.name) {
+                *count.entry(f.name.clone()).or_insert(0) += 1;
+            }
         }
     }
     let own: Vec<(String, Vec<String>, Vec<String>)> = imported.iter().map(|(module, prog)| {
@@ -2665,11 +2669,39 @@ fn process_derive(program: &mut Program) {
                         // Returns a JSON string representation of the struct.
                         let func_name = format!("{}_to_json", s.name);
                         let self_type = Type::Named(s.name.clone());
-                        let fields_json = s.fields.iter()
-                            .map(|f| format!("\"{}\":0", f.name))
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        let json_str = format!("{{{}}}", fields_json);
+                        // "{\"a\":" + <a> + ",\"b\":" + <b> + "}"
+                        let mut body_expr = Expr::StringLit("{".to_string());
+                        for (i, f) in s.fields.iter().enumerate() {
+                            let sep = if i > 0 { "," } else { "" };
+                            let key = Expr::StringLit(format!("{}\"{}\":", sep, f.name));
+                            let field = Expr::FieldAccess {
+                                expr: Box::new(Expr::Ident("self".to_string())),
+                                field: f.name.clone(),
+                            };
+                            let call = |callee: &str, arg: Expr| Expr::Call { callee: callee.to_string(), args: vec![arg] };
+                            let value = match &f.ty {
+                                Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::U8 | Type::U16 | Type::U32
+                                | Type::U64 => call("int_to_str", Expr::Cast { expr: Box::new(field), target_ty: Type::I64 }),
+                                Type::F32 | Type::F64 => call("p_float_to_str", Expr::Cast { expr: Box::new(field), target_ty: Type::F64 }),
+                                Type::Bool => call("p_bool_to_str", field),
+                                Type::Str => call("p_json_string", field),
+                                Type::Named(n) if n == "str" => call("p_json_string", field),
+                                Type::Named(n) => call(&format!("{}_to_json", n), field),
+                                _ => Expr::StringLit("null".to_string()),
+                            };
+                            for part in [key, value] {
+                                body_expr = Expr::Binary {
+                                    op: crate::ast::BinOp::Add,
+                                    left: Box::new(body_expr),
+                                    right: Box::new(part),
+                                };
+                            }
+                        }
+                        body_expr = Expr::Binary {
+                            op: crate::ast::BinOp::Add,
+                            left: Box::new(body_expr),
+                            right: Box::new(Expr::StringLit("}".to_string())),
+                        };
                         let func = Func {
                             name: func_name,
                             type_params: Vec::new(),
@@ -2677,7 +2709,7 @@ fn process_derive(program: &mut Program) {
                             const_params: Vec::new(),
                             params: vec![Param { name: "self".to_string(), ty: self_type, is_pub: false, annotations: Vec::new() }],
                             ret_ty: Type::Str,
-                            body: vec![Stmt::Return(Some(Expr::StringLit(json_str)), 0)],
+                            body: vec![Stmt::Return(Some(body_expr), 0)],
                             is_pub: true,
                             is_comptime: false,
                             declared_effects: Vec::new(),

@@ -21,7 +21,7 @@ really suspends; sockets on the native path; HTTP/1.1 and HTTPS, client and
 server, 28,000 requests/s on one thread; TLS through Schannel and OpenSSL; C
 callbacks and small structs by value; a stdlib with typed `Vec`s and a test for
 every module; language support running inside VS Code.
-Suite: interpreter 324/324, C 328/328, native 331/331, expected-fail 75/75.
+Suite: interpreter 334/334, C 338/338, native 341/341, expected-fail 89/89.
 The self-hosted compiler reproduces itself from its second generation on.
 
 **Measured starting point** (Windows x64, seconds):
@@ -101,16 +101,18 @@ Everything else relies on these.
       `tests/` parity is a local script today.
 - [x] A5. `_fail` tests name the error they expect. Today any failure passes,
       so a test can reject a program for the wrong reason (M).
-- [ ] A6. The effect, capability, region and safety tests in subdirectories run
+- [x] A6. The effect, capability, region and safety tests in subdirectories run
       in `fidesc test`, not only `cargo test` (S).
-- [ ] A7. Refresh `tests/bootstrap/baseline/test_results.txt`; it is stale (S).
+- [x] A7. Refresh `tests/bootstrap/baseline/test_results.txt`; it is stale (S).
 - [x] A8. Fix `fid run` tensor `mean` (wrong value; `test_tensor`) (S).
 - [x] A9. Fix `handle` expression values: `test_no_coloring` reads an unset
       value on every backend (M).
 - [ ] A10. `release/fid.exe` from the release bootstrap replaces stale builds;
       the installer ships it and `fid emit` is tested from an installed layout
       in CI (S).
-- [ ] A11. `verify-selfhost.sh` baseline restored (S).
+- [~] A11. `verify-selfhost.sh` baseline restored (S). Saved at 36/47 on all three
+      backends. Left: the 11 others are old debugging probes (`probe_*`, removed names,
+      the old `str` rule) or run the compiler inside the interpreter, which is slow.
 - [ ] A12. Find why `test_spawn_gt` failed natively once on CI: it passed on the
       next run and 320 of 320 here under load. The harness now prints the
       reason if it comes back (S).
@@ -146,14 +148,15 @@ Most modules still have no test, so expect more of this (B12).
       `str`/`i64` rule strict in imported modules too (L). Only `core`, `vec` and
       the self-hosted compiler keep the old rule. `Deque`, `Queue` and `Stack`
       still hold `Vec<i64>` inside.
-- [ ] B14. `StringBuilder` is quadratic (`buf + s`): back it with `p_sb_*` (S).
-- [ ] B15. Remove the false claims in stubs: `@derive(Serialize)` emits constant
-      data; `ota_verify_manifest` only checks a prefix; `sqlite` has no
-      parameter binding, so it is open to injection (M).
+- [x] B14. `StringBuilder` is quadratic (`buf + s`): back it with `p_sb_*` (S).
+- [~] B15. Remove the false claims in stubs (M). Done: `@derive(Serialize)` writes
+      the real values, and `ota_verify_payload` checks size and SHA-256. Left:
+      `sqlite`'s `query_params` binds values, but has not been run: SQLite is not
+      installed here.
 
 - [x] B16. Two imported modules may define the same function: `module::name()`
       picks one, and `use json as j` gives `j::name()`.
-- [ ] B17. A private function in one module must not shadow a core function for
+- [x] B17. A private function in one module must not shadow a core function for
       other modules: `sqlite`'s local `int_to_str` broke `json` and `string` (S).
 - [x] B18. A struct defined in two modules must be an error, as a function is:
       `core` and `buffer` both had a public `ByteBuffer`, and each compiler
@@ -164,7 +167,8 @@ Most modules still have no test, so expect more of this (B12).
       function named `yn` or `j0` clashes with libm in C; the interpreter prints a
       `bool` from a `Vec<bool>` as 0 or 1; `__ecs_*` in the interpreter miss a
       `str` passed through a wrapper; `LN_CSWI2` has no name in `grid`;
-      `font_render_text` starts from opaque black.
+      `font_render_text` starts from opaque black; a closure that captures a `Vec` is
+      refused by the borrow checker ("cannot mutate v").
 
 **Acceptance:** every stdlib module compiles and has a passing test.
 
@@ -396,7 +400,7 @@ Tested on Nov 1, native build:
 | Two names for one `Vec` | `var b = a` shares it, with no move check | M4, M5 |
 | `push` during `for` over the same `Vec` | Compiles and runs | K4 |
 
-- [ ] M1. Write down the guarantee in the language guide: what safe code
+- [x] M1. Write down the guarantee in the language guide: what safe code
       promises, and exactly what `unsafe` gives up (S).
 - [~] M2. `p_malloc`, `p_free`, integer-to-pointer casts and `extern "C"` calls
       need `unsafe`, or `@unsafe` on the function. Done in the program itself;
@@ -410,7 +414,7 @@ Tested on Nov 1, native build:
       a shared counted handle (S, see decision 3).
 - [ ] M5. Enforce it: use after move is rejected, or shared handles are counted
       (L).
-- [ ] M6. Every compiler-inserted free has tests for each way a value can escape:
+- [x] M6. Every compiler-inserted free has tests for each way a value can escape:
       assignment, field, return, closure, task, container, `unsafe` (M).
 - [ ] M7. A checked allocator mode that keeps and poisons freed blocks, so use
       after free panics instead of reading stale data (M).

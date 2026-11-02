@@ -309,13 +309,15 @@ fn pe_co_round(ran: i64) -> i64 {
 }
 
 /// Sleep until a waiting task can run, at most limit ms (-1: no limit). With
-/// `ran` set, only look. Panics if no task ever will.
+/// `ran` set, only look. Panics if no task ever will. Wakes the earliest deadline
+/// only: the next pass takes the next, so timers fire in order.
 fn pe_co_wait(ran: i64, limit: i64) {
     var timeout: i64 = limit;
     if ran != 0 {
         timeout = 0;
     }
     var now: i64 = pe_k_ticks();
+    var first: i64 = 0;
     if pert_co_count > pert_co_fds_cap {
         if pert_co_fds != 0 {
             p_free(pert_co_fds);
@@ -339,6 +341,9 @@ fn pe_co_wait(ran: i64, limit: i64) {
         }
         var wake: i64 = pe_load(c + 152);
         if wake != 0 {
+            if first == 0 || wake < first {
+                first = wake;
+            }
             var left: i64 = wake - now;
             if left < 0 {
                 left = 0;
@@ -371,7 +376,7 @@ fn pe_co_wait(ran: i64, limit: i64) {
             pe_store(c + 144, 1);
             pe_store(c + 128, -1);
             pe_store(c + 152, 0);
-        } else if pe_load(c + 152) != 0 && pe_load(c + 152) <= now {
+        } else if first != 0 && pe_load(c + 152) == first && first <= now {
             pe_store(c + 144, 0);
             pe_store(c + 128, -1);
             pe_store(c + 152, 0);

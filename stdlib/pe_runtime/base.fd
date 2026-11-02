@@ -18,6 +18,7 @@
 extern "C" {
     // msvcrt.dll
     fn fopen as pe_c_fopen(path: str, mode: str) -> i64;
+    fn memcpy as pe_c_memcpy(dst: i64, src: i64, n: i64) -> i64;
     fn fclose as pe_c_fclose(f: i64) -> i32;
     fn fread as pe_c_fread(buf: i64, size: i64, count: i64, f: i64) -> i64;
     fn fwrite as pe_c_fwrite(buf: i64, size: i64, count: i64, f: i64) -> i64;
@@ -657,6 +658,54 @@ pub fn pert_regex_match(s: str, pattern: str) -> bool {
 }
 
 // ─── Memory ─────────────────────────────────────────────────────────────
+
+// A string builder: buffer, bytes in it, its size.
+
+fn pe_sb_get(sb: i64, i: i64) -> i64 {
+    var p: *mut i64 = sb + i * 8;
+    var v: i64 = 0;
+    unsafe { v = *p; }
+    return v;
+}
+
+fn pe_sb_set(sb: i64, i: i64, v: i64) {
+    var p: *mut i64 = sb + i * 8;
+    unsafe { *p = v; }
+}
+
+pub fn pert_sb_new() -> i64 {
+    var sb: i64 = p_malloc(24);
+    pe_sb_set(sb, 0, p_malloc(64));
+    pe_sb_set(sb, 1, 0);
+    pe_sb_set(sb, 2, 64);
+    return sb;
+}
+
+pub fn pert_sb_append(sb: i64, s: str) {
+    var n: i64 = str_len(s);
+    var len: i64 = pe_sb_get(sb, 1);
+    var cap: i64 = pe_sb_get(sb, 2);
+    if len + n + 1 > cap {
+        while len + n + 1 > cap {
+            cap = cap * 2;
+        }
+        var grown: i64 = p_malloc(cap);
+        pe_c_memcpy(grown, pe_sb_get(sb, 0), len);
+        p_free(pe_sb_get(sb, 0));
+        pe_sb_set(sb, 0, grown);
+        pe_sb_set(sb, 2, cap);
+    }
+    pe_c_memcpy(pe_sb_get(sb, 0) + len, s as i64, n);
+    pe_sb_set(sb, 1, len + n);
+}
+
+pub fn pert_sb_to_str(sb: i64) -> str {
+    var len: i64 = pe_sb_get(sb, 1);
+    var out: i64 = p_malloc(len + 1);
+    pe_c_memcpy(out, pe_sb_get(sb, 0), len);
+    pe_set_byte(out, len, 0);
+    return out as str;
+}
 
 pub fn pert_alloc(size: i64) -> i64 {
     return p_malloc(size);

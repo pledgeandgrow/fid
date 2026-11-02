@@ -1,0 +1,156 @@
+// What the compiler frees must never be something still in use: a Vec or string
+// leaves its function each way a value can, then memory of the same sizes is
+// reused and overwritten, so a block freed too early shows as a wrong value.
+use task;
+
+struct Holder {
+    v: Vec<i64>,
+    s: str,
+}
+
+var kept: Vec<i64> = Vec::new();
+var kept_str: str = "";
+
+/// Allocate and overwrite blocks of the sizes the tests use.
+fn churn() {
+    var round: i64 = 0;
+    while round < 200 {
+        var v: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        while i < 20 {
+            v.push(999);
+            i = i + 1;
+        }
+        var s: str = "xxxxxxxxxxxxxxxx" + int_to_str(round);
+        print(str_len(s) * 0);
+        round = round + 1;
+    }
+    println("");
+}
+
+fn by_return() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(1);
+    return v;
+}
+
+fn by_return_str() -> str {
+    val s: str = "ret" + int_to_str(1);
+    return s;
+}
+
+fn by_assignment() -> i64 {
+    var a: Vec<i64> = Vec::new();
+    a.push(2);
+    var b: Vec<i64> = a;
+    churn();
+    return b.get(0);
+}
+
+fn by_field(h: &mut Holder) {
+    var v: Vec<i64> = Vec::new();
+    v.push(3);
+    h.v = v;
+    val s: str = "field" + int_to_str(3);
+    h.s = s;
+}
+
+fn by_container(out: &mut Vec<Vec<i64>>) {
+    var v: Vec<i64> = Vec::new();
+    v.push(4);
+    out.push(v);
+}
+
+fn by_string_container(out: &mut Vec<str>) {
+    val s: str = "item" + int_to_str(4);
+    out.push(s);
+}
+
+fn by_global() {
+    var v: Vec<i64> = Vec::new();
+    v.push(5);
+    kept = v;
+    kept_str = "global" + int_to_str(5);
+}
+
+fn through_function(v: Vec<i64>) -> Vec<i64> {
+    return v;
+}
+
+fn by_passing() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(6);
+    return through_function(v);
+}
+
+fn store_in(h: &mut Holder, v: Vec<i64>) {
+    h.v = v;
+}
+
+fn by_callee_keeping(h: &mut Holder) {
+    var v: Vec<i64> = Vec::new();
+    v.push(7);
+    store_in(h, v);
+}
+
+fn by_closure() -> fn(i64) -> i64 {
+    val s: str = "1234567" + int_to_str(8);
+    return fn(x: i64) { str_len(s) + x - 1 };
+}
+
+async fn later(v: Vec<i64>) -> Future<i64> {
+    task_yield();
+    return v.get(0);
+}
+
+fn by_task() -> Future<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(9);
+    return later(v);
+}
+
+@unsafe
+fn by_pointer() -> i64 {
+    var v: Vec<i64> = Vec::new();
+    v.push(10);
+    val p: i64 = v as i64;
+    churn();
+    val again: Vec<i64> = p as Vec<i64>;
+    return again.get(0);
+}
+
+fn main() -> i64 {
+    val a: Vec<i64> = by_return();
+    val b: str = by_return_str();
+    churn();
+    println(a.get(0));
+    println(b);
+    println(by_assignment());
+    var h: Holder = Holder { v: Vec::new(), s: "" };
+    by_field(&mut h);
+    churn();
+    println(h.v.get(0));
+    println(h.s);
+    var vs: Vec<Vec<i64>> = Vec::new();
+    by_container(&mut vs);
+    var ss: Vec<str> = Vec::new();
+    by_string_container(&mut ss);
+    by_global();
+    val c: Vec<i64> = by_passing();
+    by_callee_keeping(&mut h);
+    val add = by_closure();
+    val f = by_task();
+    churn();
+    println(vs.get(0).get(0));
+    println(ss.get(0));
+    println(kept.get(0));
+    println(kept_str);
+    println(c.get(0));
+    println(h.v.get(0));
+    println(add(1));
+    println(await f);
+    unsafe {
+        println(by_pointer());
+    }
+    return 0;
+}

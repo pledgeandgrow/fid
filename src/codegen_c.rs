@@ -3005,8 +3005,6 @@ impl CCodeGen {
         wln!(self, "    char* result = (char*)p_malloc((int64_t)(len + 1));");
         wln!(self, "    memcpy(result, sb->buf, len);");
         wln!(self, "    result[len] = 0;");
-        wln!(self, "    free(sb->buf);");
-        wln!(self, "    free(sb);");
         wln!(self, "    return result;");
         wln!(self, "}}");
         wln!(self, "");
@@ -3655,10 +3653,12 @@ impl CCodeGen {
         wln!(self, "    return kept;");
         wln!(self, "}}");
         wln!(self, "/* Sleep until a waiting task can run, at most limit ms (-1: no limit). With");
-        wln!(self, "   ran set, only look. Panics if no task ever will. */");
+        wln!(self, "   ran set, only look. Panics if no task ever will. Wakes the earliest");
+        wln!(self, "   deadline only: the next pass takes the next, so timers fire in order. */");
         wln!(self, "static void __p_co_wait(int64_t ran, int64_t limit) {{");
         wln!(self, "    int64_t n = 0;");
         wln!(self, "    int64_t timeout = ran ? 0 : limit;");
+        wln!(self, "    int64_t first = 0;");
         wln!(self, "    int64_t now = __p_co_now();");
         wln!(self, "#ifdef _WIN32");
         wln!(self, "    static P_THREAD_LOCAL WSAPOLLFD* fds = NULL;");
@@ -3679,6 +3679,7 @@ impl CCodeGen {
         wln!(self, "            n++;");
         wln!(self, "        }}");
         wln!(self, "        if (c->wake_ms) {{");
+        wln!(self, "            if (!first || c->wake_ms < first) first = c->wake_ms;");
         wln!(self, "            int64_t left = c->wake_ms > now ? c->wake_ms - now : 0;");
         wln!(self, "            if (timeout < 0 || left < timeout) timeout = left;");
         wln!(self, "        }}");
@@ -3704,7 +3705,7 @@ impl CCodeGen {
         wln!(self, "        int hit = 0;");
         wln!(self, "        if (c->fd >= 0) {{ hit = fds[k].revents != 0; k++; }}");
         wln!(self, "        if (hit) {{ c->ready = 1; c->fd = -1; c->wake_ms = 0; }}");
-        wln!(self, "        else if (c->wake_ms && c->wake_ms <= now) {{ c->ready = 0; c->fd = -1; c->wake_ms = 0; }}");
+        wln!(self, "        else if (c->wake_ms == first && first && first <= now) {{ c->ready = 0; c->fd = -1; c->wake_ms = 0; }}");
         wln!(self, "    }}");
         wln!(self, "}}");
         wln!(self, "int64_t p_co_go(const char* name, int64_t arg) {{ return (int64_t)__p_co_new(name, 1, &arg); }}");

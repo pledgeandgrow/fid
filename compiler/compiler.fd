@@ -1454,7 +1454,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
 
                     // A user function named like a function of one imported
                     // module: each side keeps its own (module__name).
-                    cc_qualify_shadowed_imports(imported_modules, imported_module_names, user);
+                    cc_qualify_shadowed_imports(imported_modules, imported_module_names, user, stdlib);
 
                     // `cap Sub: Super`: Sub carries Super's methods.
                     var trait_defs: Vec<TraitDef> = Vec::new();
@@ -2683,20 +2683,21 @@ pub fn process_derive(program: &mut Program) {
 
                     if arg == "Serialize" {
                         var func_name3: str = str_concat(s.name, "_to_json");
-                        var fields_json: str = "";
+                        // "{\"a\":" + <a> + ",\"b\":" + <b> + "}"
+                        var body_expr: Expr = Expr::StringLit("{");
                         var f2: i64 = 0;
                         while f2 < s.fields.len() {
-                            if f2 > 0 { fields_json = str_concat(fields_json, ","); }
-                            fields_json = str_concat(fields_json, "\"");
-                            fields_json = str_concat(fields_json, s.fields.get(f2).name);
-                            fields_json = str_concat(fields_json, "\":0");
+                            var key: str = "\"" + s.fields.get(f2).name + "\":";
+                            if f2 > 0 { key = "," + key; }
+                            body_expr = cc_add(body_expr, Expr::StringLit(key));
+                            body_expr = cc_add(body_expr, cc_serialize_field(s.fields.get(f2).name, s.fields.get(f2).ty));
                             f2 = f2 + 1;
                         }
-                        var json_str: str = str_concat("{", str_concat(fields_json, "}"));
+                        body_expr = cc_add(body_expr, Expr::StringLit("}"));
                         var params3: Vec<Param> = Vec::new();
                         params3.push(Param_new("self", Type::Named(s.name), false));
                         var body3: Vec<Stmt> = Vec::new();
-                        body3.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::StringLit(json_str))), 0));
+                        body3.push(Stmt::Return(OptBoxExpr::Some(Box::new(body_expr)), 0));
                         generated.push(Func_new_full(func_name3, params3, Type::Str, body3, true));
                     }
 
@@ -3547,9 +3548,41 @@ fn cc_rename_funcs(funcs: Vec<Func>, renames: Vec<RenameEntry>, rename_defs: boo
 /// the imported modules follow it: they cannot see the user's definitions,
 /// so every caller keeps the function it was written against. A name that
 /// two imported modules define is left alone.
-fn cc_qualify_shadowed_imports(imported: Vec<Program>, names: Vec<str>, user: Program) {
+fn cc_add(a: Expr, b: Expr) -> Expr {
+    return Expr::Binary(BinOp::Add, Box::new(a), Box::new(b));
+}
+
+/// @derive(Serialize): the JSON text of field `name`.
+fn cc_serialize_field(name: str, ty: Type) -> Expr {
+    var field: Expr = Expr::FieldAccess(Box::new(Expr::Ident("self")), name);
+    var args: Vec<Expr> = Vec::new();
+    match ty {
+        Type::F32 => { args.push(Expr::Cast(Box::new(field), Type::F64)); return Expr::Call("p_float_to_str", args); }
+        Type::F64 => { args.push(Expr::Cast(Box::new(field), Type::F64)); return Expr::Call("p_float_to_str", args); }
+        Type::Bool => { args.push(field); return Expr::Call("p_bool_to_str", args); }
+        Type::Str => { args.push(field); return Expr::Call("p_json_string", args); }
+        Type::Named(n) => {
+            args.push(field);
+            if n == "str" { return Expr::Call("p_json_string", args); }
+            return Expr::Call(n + "_to_json", args);
+        }
+        Type::I8 => {} Type::I16 => {} Type::I32 => {} Type::I64 => {}
+        Type::U8 => {} Type::U16 => {} Type::U32 => {} Type::U64 => {}
+        _ => { return Expr::StringLit("null"); }
+    }
+    args.push(Expr::Cast(Box::new(field), Type::I64));
+    return Expr::Call("int_to_str", args);
+}
+
+fn cc_qualify_shadowed_imports(imported: Vec<Program>, names: Vec<str>, user: Program, core: Program) {
     // name -> 1 + index of the one module defining it, or -1 for several
     var definer: i64 = HashMap_new();
+    var core_fns: i64 = HashMap_new();
+    var ci0: i64 = 0;
+    while ci0 < core.funcs.len() {
+        HashMap_insert(core_fns, core.funcs.get(ci0).name, 1);
+        ci0 = ci0 + 1;
+    }
     var mi: i64 = 0;
     while mi < imported.len() {
         var fs: Vec<Func> = imported.get(mi).funcs;
@@ -3561,6 +3594,10 @@ fn cc_qualify_shadowed_imports(imported: Vec<Program>, names: Vec<str>, user: Pr
                 if prev == 0 {
                     HashMap_insert(definer, f.name, mi + 1);
                 } else if prev != mi + 1 {
+                    HashMap_insert(definer, f.name, 0 - 1);
+                }
+                // A private helper named like a core function stays the module's own
+                if !f.is_pub && HashMap_get(core_fns, f.name) != 0 {
                     HashMap_insert(definer, f.name, 0 - 1);
                 }
             }

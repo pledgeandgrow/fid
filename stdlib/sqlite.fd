@@ -61,6 +61,7 @@ extern "C" link "sqlite3" {
         tail: *str
     ) -> i64;
     fn sqlite3_step as p_sqlite3_step(stmt: i64) -> i64;
+    fn sqlite3_bind_text as p_sqlite3_bind_text(stmt: i64, index: i64, text: str, size: i64, destructor: i64) -> i64;
     fn sqlite3_finalize as p_sqlite3_finalize(stmt: i64) -> i64;
 
     // Column metadata
@@ -150,12 +151,27 @@ impl SQLite {
     /// Each row is a JSON object with column names as keys.
     /// Example: [{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]
     pub fn query(self: SQLite, sql: str) -> str {
+        var none: Vec<str> = Vec::new();
+        return self.query_params(sql, none);
+    }
+
+    /// As query, with values bound to the statement's `?` in order. A value is
+    /// data, never SQL: this is the safe way to use anything from outside.
+    pub fn query_params(self: SQLite, sql: str, params: Vec<str>) -> str {
         var stmt: i64 = 0;
         var tail: str = "";
         var rc = p_sqlite3_prepare_v2(self.handle, sql, -1, &stmt, &tail);
         if rc != SQLITE_OK {
             var msg = p_sqlite3_errmsg(self.handle);
             p_panic(msg);
+        }
+        var bound: i64 = 0;
+        while bound < params.len() {
+            // -1: SQLITE_TRANSIENT, SQLite takes its own copy
+            if p_sqlite3_bind_text(stmt, bound + 1, params.get(bound), -1, -1) != SQLITE_OK {
+                p_panic(p_sqlite3_errmsg(self.handle));
+            }
+            bound = bound + 1;
         }
 
         var ncol = p_sqlite3_column_count(stmt);

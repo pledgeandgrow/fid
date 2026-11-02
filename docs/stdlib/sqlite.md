@@ -153,9 +153,9 @@ including `<sqlite3.h>`.
 
 **Does not**
 
-- Bind parameters. A statement is a plain string, so values that come from
-  outside must be escaped by the caller (single quotes doubled); building SQL by
-  concatenation is open to SQL injection.
+- Bind parameters in `query` or `exec`: a statement is a plain string, and building
+  it by concatenation is open to SQL injection. Use `query_params`, which binds
+  each value as text. It has not been run here: SQLite is not installed.
 - Return an error value. Every failure of `open`, `query` and `exec` is a
   `p_panic` with the SQLite message. `error_message` only reports the last
   message of the connection.
