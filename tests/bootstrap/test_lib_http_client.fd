@@ -1,0 +1,61 @@
+// stdlib/http_client: the parts that need no network. https:// URLs are
+// refused before any lookup (status 0), header lookup is
+// case-insensitive, and http_body_type falls back to the path's MIME type.
+// Response parsing (hc_parse, de-chunking) is private and only reached
+// through a live server, so it is not covered here (the interpreter's
+// sockets are simulated, so even a loopback connection differs there).
+use http_client;
+
+fn check_s(name: str, got: str, want: str) {
+    println(name + " = " + got);
+    if !str_equal(got, want) {
+        p_panic(name + ": got [" + got + "], want [" + want + "]");
+    }
+}
+
+fn check_i(name: str, got: i64, want: i64) {
+    println(name + " = " + int_to_str(got));
+    if got != want {
+        p_panic(name + ": got " + int_to_str(got) + ", want " + int_to_str(want));
+    }
+}
+
+fn main() -> i64 {
+    // No TLS: https is refused without touching the network
+    var r: HttpResponse = http_get_url("https://example.com/index.html");
+    check_i("https get status", r.status, 0);
+    check_i("https get body", str_len(r.body), 0);
+    check_i("https get reason", str_len(r.reason), 0);
+    check_i("https get headers", r.header_names.len(), 0);
+    val p: HttpResponse = http_post_url("https://example.com/api", "application/json", "{}");
+    check_i("https post status", p.status, 0);
+    // A URL without a host is refused before any lookup
+    check_i("no host get", http_get_url("example.com/x").status, 0);
+    check_i("no host post", http_post_url("/just/a/path", "", "x").status, 0);
+
+    // Header lookup on a filled-in response
+    check_i("no header", str_len(http_resp_header(r, "content-type")), 0);
+    check_s("body type from path", http_body_type(r, "/static/app.json"), "application/json");
+    check_s("body type from html path", http_body_type(r, "/a/b/index.html"), "text/html");
+    check_s("body type unknown path", http_body_type(r, "/download"), "application/octet-stream");
+    var names: Vec<str> = Vec::new();
+    var vals: Vec<str> = Vec::new();
+    names.push("Content-Type");
+    vals.push("text/plain; charset=utf-8");
+    names.push("X-Request-ID");
+    vals.push("abc123");
+    names.push("x-request-id");
+    vals.push("second");
+    r.header_names = names;
+    r.header_vals = vals;
+    r.status = 200;
+    check_s("header exact case", http_resp_header(r, "Content-Type"), "text/plain; charset=utf-8");
+    check_s("header lower case", http_resp_header(r, "content-type"), "text/plain; charset=utf-8");
+    check_s("header upper case", http_resp_header(r, "CONTENT-TYPE"), "text/plain; charset=utf-8");
+    check_s("header first match wins", http_resp_header(r, "x-request-id"), "abc123");
+    check_i("header missing", str_len(http_resp_header(r, "Server")), 0);
+    check_s("body type from header", http_body_type(r, "/static/app.json"), "text/plain; charset=utf-8");
+
+    println("http_client ok");
+    return 0;
+}

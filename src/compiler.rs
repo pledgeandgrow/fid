@@ -651,6 +651,8 @@ pub fn build_program_with_runtime(source: &str, source_path: Option<&str>, runti
 
     // R1.2: structural `==` for enums (the lowerer calls `__eq_<Enum>`).
     synthesize_enum_eq(&mut program);
+    // R1.2b: structural `==` for structs (`__eq_<Struct>`).
+    synthesize_struct_eq(&mut program);
 
     // Desugar layer/model declarations into structs + impls + functions
     desugar_layers_models(&mut program);
@@ -672,6 +674,16 @@ pub fn build_program_with_runtime(source: &str, source_path: Option<&str>, runti
     // Type check — register each module with its own name for visibility enforcement
     let mut tc = TypeChecker::new();
     let stdlib_module = stdlib.module.clone().unwrap_or_else(|| "core".to_string());
+    // CS2: the baked-in stdlib (core.fd + the backend's runtime sources,
+    // include_str!'d into this binary) was checked when the toolchain shipped
+    // — don't re-check its bodies or report its diagnostics on every user
+    // build. Disk-loaded modules always stay fully checked. FIDES_CHECK_STDLIB
+    // restores full checking for stdlib development.
+    let mut trusted_modules: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if std::env::var_os("FIDES_CHECK_STDLIB").is_none() {
+        trusted_modules.insert(stdlib_module.clone());
+    }
+    tc.trusted_modules = trusted_modules.clone();
     tc.register_program(&stdlib, &stdlib_module);
 
     for (mod_name, mod_prog) in &imported_modules {
@@ -699,6 +711,7 @@ pub fn build_program_with_runtime(source: &str, source_path: Option<&str>, runti
     // Check bodies of the merged program from the user's module context
     timer.mark("typecheck: register");
     tc.current_module = user_module.clone();
+    tc.check_annotation_validity(&program);
     tc.check_bodies(&program);
     if !tc.errors.is_empty() {
         let file = source_path.unwrap_or("<stdin>");
@@ -707,13 +720,13 @@ pub fn build_program_with_runtime(source: &str, source_path: Option<&str>, runti
     timer.mark("typecheck: bodies");
 
     // References are second-class: none may outlive what it points to.
-    let escape_errors = crate::escape::check(&program);
+    let escape_errors = crate::escape::check_filtered(&program, &trusted_modules);
     timer.mark("escape check");
     if !escape_errors.is_empty() {
         let file = source_path.unwrap_or("<stdin>");
         return Err(enrich_errors(&escape_errors, source, file));
     }
-    let secret_errors = crate::secrecy::check(&program);
+    let secret_errors = crate::secrecy::check_filtered(&program, &trusted_modules);
     timer.mark("secrecy check");
     if !secret_errors.is_empty() {
         let file = source_path.unwrap_or("<stdin>");
@@ -1884,6 +1897,7 @@ fn build_program_with_lints(source: &str, source_path: Option<&str>) -> Result<(
     // Type check
     tc.current_module = user_module.clone();
     tc.collect_capabilities(&user);
+    tc.check_annotation_validity(&program);
     tc.check_bodies(&program);
     if !tc.errors.is_empty() {
         let file = source_path.unwrap_or("<stdin>");
@@ -2337,6 +2351,7 @@ pub fn emit_bare(source: &str, _source_path: &str) -> Result<Vec<u8>, Vec<String
     let user_module = user.module.clone().unwrap_or_else(|| "bare".to_string());
     tc.register_program(&user, &user_module);
     tc.collect_capabilities(&user);
+    tc.check_annotation_validity(&user);
     tc.check_bodies(&user);
     if !tc.errors.is_empty() {
         return Err(tc.errors);
@@ -2438,6 +2453,7 @@ pub fn emit_boot(source: &str, source_path: &str) -> Result<Vec<u8>, Vec<String>
     let user_module = user.module.clone().unwrap_or_else(|| "boot".to_string());
     tc.register_program(&user, &user_module);
     tc.collect_capabilities(&user);
+    tc.check_annotation_validity(&user);
     tc.check_bodies(&user);
     if !tc.errors.is_empty() {
         return Err(tc.errors);
@@ -2446,6 +2462,7 @@ pub fn emit_boot(source: &str, source_path: &str) -> Result<Vec<u8>, Vec<String>
     // Also check imported module bodies
     for (mod_name, mod_prog) in &imported_modules {
         tc.collect_capabilities(mod_prog);
+        tc.check_annotation_validity(mod_prog);
         tc.check_bodies(mod_prog);
     }
     if !tc.errors.is_empty() {
@@ -2603,6 +2620,96 @@ pub fn synthesize_enum_eq(program: &mut Program) {
                 Stmt::Match { expr: Expr::Ident("__eq_a".to_string()), arms, line: 0 },
                 ret(Expr::BoolLit(false)),
             ],
+            is_pub: true,
+            is_comptime: false,
+            declared_effects: Vec::new(),
+            has_effect_annotation: false,
+            is_interrupt: false,
+            annotations: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            is_async: false,
+            line: 0,
+        });
+    }
+    program.funcs.extend(generated);
+}
+
+/// R1.2b: structural `==` for structs — the struct companion of
+/// `synthesize_enum_eq`. For every non-generic struct, synthesize
+///
+///     fn __eq_S(__eq_a: S, __eq_b: S) -> bool {
+///         return __eq_a.f0 == __eq_b.f0 && __eq_a.f1 == __eq_b.f1 && ...;
+///     }
+///
+/// The field comparisons go back through `==`, so nested structs/enums get
+/// their own synthesized __eq, strings compare by content, and opaque handles
+/// (Vec, HashMap, ...) keep pointer identity — the same semantics a manual
+/// field-wise compare has today. Structs containing generic-aggregate fields
+/// (e.g. Option<T>) are skipped: generics are R1.3 territory, and synthesizing
+/// `==` on them would itself fail to typecheck.
+pub fn synthesize_struct_eq(program: &mut Program) {
+    use crate::ast::{Func, Param, Type, Expr, Stmt, BinOp};
+
+    // A generic aggregate field (Generic<T> whose def has type params) would
+    // make the synthesized `==` fail typechecking — such structs are skipped.
+    let mut generic_defs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for s in &program.structs {
+        if !s.type_params.is_empty() { generic_defs.insert(s.name.clone()); }
+    }
+    for e in &program.enums {
+        if !e.type_params.is_empty() { generic_defs.insert(e.name.clone()); }
+    }
+    let has_generic_aggregate_field = |s: &crate::ast::StructDef| -> bool {
+        s.fields.iter().any(|f| match &f.ty {
+            Type::Generic { name, .. } => generic_defs.contains(name),
+            _ => false,
+        })
+    };
+
+    let mut generated: Vec<Func> = Vec::new();
+    for s in &program.structs {
+        if !s.type_params.is_empty() || has_generic_aggregate_field(s) {
+            continue;
+        }
+        let fname = format!("__eq_{}", s.name);
+        if program.funcs.iter().any(|f| f.name == fname) {
+            continue;
+        }
+        let field_cmp = |f: &Param| Expr::Binary {
+            op: BinOp::Eq,
+            left: Box::new(Expr::FieldAccess {
+                expr: Box::new(Expr::Ident("__eq_a".to_string())),
+                field: f.name.clone(),
+            }),
+            right: Box::new(Expr::FieldAccess {
+                expr: Box::new(Expr::Ident("__eq_b".to_string())),
+                field: f.name.clone(),
+            }),
+        };
+        let mut same = Expr::BoolLit(true);
+        for (i, f) in s.fields.iter().enumerate() {
+            let cmp = field_cmp(f);
+            same = if i == 0 {
+                cmp
+            } else {
+                Expr::Binary { op: BinOp::And, left: Box::new(same), right: Box::new(cmp) }
+            };
+        }
+        let param = |name: &str| Param {
+            name: name.to_string(),
+            ty: Type::Named(s.name.clone()),
+            is_pub: false,
+            annotations: Vec::new(),
+        };
+        generated.push(Func {
+            name: fname,
+            type_params: Vec::new(),
+            type_param_bounds: Vec::new(),
+            const_params: Vec::new(),
+            params: vec![param("__eq_a"), param("__eq_b")],
+            ret_ty: Type::Bool,
+            body: vec![Stmt::Return(Some(same), 0)],
             is_pub: true,
             is_comptime: false,
             declared_effects: Vec::new(),

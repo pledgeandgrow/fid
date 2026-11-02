@@ -1108,3 +1108,27 @@ pub fn pert_read_line() -> str {
     pe_set_byte(buf, got, 0);
     return pe_buf_str(buf);
 }
+
+// ─── @zeroize heap wiping ────────────────────────────────────────────────
+// p_str_zeroize / p_vec_zeroize (called by the lowerer for @zeroize on str
+// and Vec locals): wipe the bytes the value owns. Semantics per the C
+// backend (src/codegen_c.rs): a string is wiped to NUL, a Vec's whole
+// element buffer (capacity * 8) is cleared.
+
+pub fn pert_str_zeroize(s: i64) {
+    if s == 0 { return; }
+    p_memset(s, 0, pe_c_strlen(s));
+}
+
+// A Fides Vec is a 24-byte block: [0] data  [8] len  [16] capacity.
+pub fn pert_vec_zeroize(v: i64) {
+    if v == 0 { return; }
+    var data_p: *mut i64 = v;
+    var cap_p: *mut i64 = v + 16;
+    var data: i64 = 0;
+    var cap: i64 = 0;
+    unsafe { data = *data_p; cap = *cap_p; }
+    if data != 0 && cap > 0 {
+        p_memset(data, 0, cap * 8);
+    }
+}

@@ -3,6 +3,7 @@
 ## Contents
 
 - [file_read](#file_read) (function)
+- [file_read_result](#file_read_result) (function)
 - [file_write](#file_write) (function)
 - [file_append](#file_append) (function)
 - [file_exists](#file_exists) (function)
@@ -28,6 +29,30 @@ pub fn file_read(path: str) -> str {
 **Returns:** `str`
 
 *Defined at line 13*
+
+---
+
+## file_read_result
+
+Read the entire contents of a file: `Err("cannot read <path>")` when it does
+not exist or cannot be read.
+
+```fides
+pub fn file_read_result(path: str) -> Result<str, str> {
+```
+
+**Parameters:**
+
+- `path`: `str`
+
+**Returns:** `Result<str, str>`
+
+```fides
+fn load(path: str) -> Result<str, str> {
+    val text: str = file_read_result(path).context("loading the config")?;
+    return Result::Ok(text);
+}
+```
 
 ---
 

@@ -84,6 +84,8 @@ pub struct TypeChecker {
     enum_variants: HashMap<String, Vec<(String, Vec<Type>)>>,
     /// Enum name → declared type parameters (e.g. ["T"] for Option<T>).
     enum_type_params: HashMap<String, Vec<String>>,
+    /// Struct name → declared type parameters (e.g. ["T"] for Box<T>).
+    struct_type_params: HashMap<String, Vec<String>>,
     consts: HashMap<String, Type>,
     /// Module-level mutable global variables: name → type
     globals: HashMap<String, Type>,
@@ -176,6 +178,15 @@ pub struct TypeChecker {
     send_structs: HashSet<String>,
     /// Set of struct names that are @sync (values can be safely shared across threads).
     sync_structs: HashSet<String>,
+    /// Set of function names annotated @sanitizer — their results cleanse taint.
+    sanitizer_fns: HashSet<String>,
+    /// Set of function names annotated @sink — tainted data must not reach them.
+    sink_fns: HashSet<String>,
+    /// Modules whose function bodies are trusted: the toolchain's baked-in
+    /// stdlib was checked when it shipped, so check_bodies runs every
+    /// whole-program analysis over them but skips the per-function body
+    /// check. Empty = check everything (FIDES_CHECK_STDLIB restores that).
+    pub trusted_modules: HashSet<String>,
     /// Set of variable names that have been consumed (moved) in the current scope.
     /// A linear variable can only be used once — after it's moved, it's in this set.
     consumed_vars: HashSet<String>,
@@ -217,6 +228,7 @@ impl TypeChecker {
             enums: HashSet::new(),
             enum_variants: HashMap::new(),
             enum_type_params: HashMap::new(),
+            struct_type_params: HashMap::new(),
             consts: HashMap::new(),
             globals: HashMap::new(),
             type_aliases: HashMap::new(),
@@ -256,6 +268,9 @@ impl TypeChecker {
             linear_structs: HashSet::new(),
             send_structs: HashSet::new(),
             sync_structs: HashSet::new(),
+            sanitizer_fns: HashSet::new(),
+            sink_fns: HashSet::new(),
+            trusted_modules: HashSet::new(),
             consumed_vars: HashSet::new(),
             scope_linear_vars: vec![Vec::new()],
             loop_depth: 0,
@@ -274,6 +289,7 @@ impl TypeChecker {
         // Single-program mode: all items belong to the same module
         let module = program.module.clone().unwrap_or_else(|| "main".to_string());
         self.register_program(program, &module);
+        self.check_annotation_validity(program);
         self.check_bodies(program);
         // Run lint checks (only generate warnings, never errors)
         self.run_lints(program);
@@ -289,6 +305,78 @@ impl TypeChecker {
     pub fn run_lints(&mut self, program: &Program) {
         self.lint_unused_functions(program);
         self.lint_unused_imports(program);
+    }
+
+    /// Reject unknown or misplaced annotations. `parse_at_annotation`
+    /// accepts any identifier after '@', and no consumer warns about names
+    /// it doesn't recognize — so `@zeorize` or `@secrett` would compile as
+    /// silent no-ops. This pass makes every annotation either meaningful or
+    /// an error. It also collects @sanitizer/@sink registrations for the
+    /// taint pass.
+    pub fn check_annotation_validity(&mut self, program: &Program) {
+        let check_fn = |tc: &mut TypeChecker, func: &Func| {
+            for a in &func.annotations {
+                tc.check_one_annotation(a, "fn", &func.name, func.line);
+                if a.name == "sanitizer" {
+                    tc.sanitizer_fns.insert(func.name.clone());
+                } else if a.name == "sink" {
+                    tc.sink_fns.insert(func.name.clone());
+                }
+            }
+            for p in &func.params {
+                for a in &p.annotations {
+                    tc.check_one_annotation(a, "param", &func.name, func.line);
+                }
+            }
+            let mut locals: Vec<(&[Annotation], usize)> = Vec::new();
+            collect_local_annotations(&func.body, &mut locals);
+            for (anns, line) in locals {
+                for a in anns {
+                    tc.check_one_annotation(a, "local", &func.name, line);
+                }
+            }
+        };
+        for func in &program.funcs {
+            check_fn(self, func);
+        }
+        for imp in &program.impls {
+            for m in &imp.methods {
+                check_fn(self, m);
+            }
+        }
+        for ti in &program.trait_impls {
+            for m in &ti.methods {
+                check_fn(self, m);
+            }
+        }
+        for s in &program.structs {
+            for a in &s.annotations {
+                self.check_one_annotation(a, "struct", &s.name, s.line);
+            }
+            for f in &s.fields {
+                for a in &f.annotations {
+                    self.check_one_annotation(a, "param", &s.name, s.line);
+                }
+            }
+        }
+        for g in &program.globals {
+            for a in &g.annotations {
+                self.check_one_annotation(a, "global", &g.name, 0);
+            }
+        }
+    }
+
+    fn check_one_annotation(&mut self, a: &Annotation, target: &str, what: &str, line: usize) {
+        match annotation_targets(&a.name) {
+            None => self.errors.push(format!(
+                "Unknown annotation '@{}' on '{}' (line {}): no compiler pass consumes this name\n\
+                 \x20\x20\x20\x20and it will be silently ignored. Check the spelling.",
+                a.name, what, line)),
+            Some(targets) if !targets.contains(&target) => self.errors.push(format!(
+                "Misplaced annotation '@{}' on '{}' (line {}): valid on {}, not {}.",
+                a.name, what, line, targets.join("/"), target)),
+            _ => {}
+        }
     }
 
     /// Detect functions that are defined but never called.
@@ -711,6 +799,7 @@ impl TypeChecker {
         for s in &program.structs {
             let fields: Vec<(String, Type)> = s.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect();
             self.structs.insert(s.name.clone(), fields);
+            self.struct_type_params.insert(s.name.clone(), s.type_params.clone());
             self.item_modules.insert(s.name.clone(), module.to_string());
             self.item_visibility.insert(s.name.clone(), s.is_pub);
             self.struct_modules.insert(s.name.clone(), module.to_string());
@@ -1054,7 +1143,9 @@ impl TypeChecker {
         }
 
         for func in &program.funcs {
-            self.check_func(func);
+            if !self.is_trusted_fn(func) {
+                self.check_func(func);
+            }
         }
 
         for imp in &program.impls {
@@ -1065,7 +1156,9 @@ impl TypeChecker {
             }
             self.current_self_type = Some(imp.struct_name.clone());
             for method in &imp.methods {
-                self.check_func(method);
+                if !self.is_trusted_fn(method) {
+                    self.check_func(method);
+                }
             }
             self.current_type_params = prev_type_params;
             self.current_self_type = prev_self;
@@ -1080,7 +1173,9 @@ impl TypeChecker {
             }
             self.current_self_type = Some(ti.type_name.clone());
             for method in &ti.methods {
-                self.check_func(method);
+                if !self.is_trusted_fn(method) {
+                    self.check_func(method);
+                }
             }
             self.current_type_params = prev_type_params;
             self.current_self_type = prev_self;
@@ -2225,13 +2320,24 @@ impl TypeChecker {
     ///   @no-alloc @no-recursion pf foo() { ... }
     fn verify_safety_annotations(&mut self, program: &Program) {
         let mut func_primitives: HashMap<String, HashSet<&'static str>> = HashMap::new();
-
+        // @bounded-stack(N) frame limits, keyed the same way as func_primitives.
+        let mut stack_bounds: HashMap<String, u64> = HashMap::new();
+        let record_bound = |name: &str, anns: &[Annotation], bounds: &mut HashMap<String, u64>| {
+            if let Some(n) = anns.iter()
+                .find(|a| a.name == "bounded-stack")
+                .and_then(|a| a.args.first())
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                bounds.insert(name.to_string(), n);
+            }
+        };
 
         for func in &program.funcs {
             let prims = expand_annotations(&func.annotations);
             if !prims.is_empty() {
                 func_primitives.insert(func.name.clone(), prims);
             }
+            record_bound(&func.name, &func.annotations, &mut stack_bounds);
         }
         for imp in &program.impls {
             for method in &imp.methods {
@@ -2239,6 +2345,7 @@ impl TypeChecker {
                 if !prims.is_empty() {
                     func_primitives.insert(format!("{}_{}", imp.struct_name, method.name), prims);
                 }
+                record_bound(&format!("{}_{}", imp.struct_name, method.name), &method.annotations, &mut stack_bounds);
             }
         }
         for ti in &program.trait_impls {
@@ -2247,6 +2354,7 @@ impl TypeChecker {
                 if !prims.is_empty() {
                     func_primitives.insert(format!("{}_{}", ti.type_name, method.name), prims);
                 }
+                record_bound(&format!("{}_{}", ti.type_name, method.name), &method.annotations, &mut stack_bounds);
             }
         }
 
@@ -2614,6 +2722,37 @@ impl TypeChecker {
                          \x20\x20\x20\x20Fix: break the cycle by making one function in the loop iterative,\n\
                          \x20\x20\x20\x20or remove the @no-recursion annotation.",
                         func_name
+                    ));
+                }
+            }
+        }
+
+        // @bounded-stack: no recursion and no call to an unknown target in
+        // anything the function can reach, so its stack depth has a bound.
+        let leaves: HashSet<String> = program.extern_decls.iter().map(|e| e.pledge_name.clone()).collect();
+        let mut bounded: Vec<&String> = func_primitives.iter()
+            .filter(|(_, prims)| prims.contains("bounded-stack"))
+            .map(|(name, _)| name)
+            .collect();
+        bounded.sort();
+        for func_name in bounded {
+            if let Some(why) = bounded_stack_violation(func_name, &safety_call_graph, &leaves) {
+                self.errors.push(format!(
+                    "Safety error (bounded-stack): function '{}' is @bounded-stack but {}.\n\
+                     \x20\x20\x20\x20Its stack depth has no bound: every function it can reach must be\n\
+                     \x20\x20\x20\x20non-recursive and called directly.",
+                    func_name, why
+                ));
+            } else if let Some(&limit) = stack_bounds.get(func_name) {
+                // The graph is a known-target DAG — the longest call chain
+                // is the frame-depth bound. @bounded-stack(N) requires N frames.
+                let depth = safety_call_depth(func_name, &safety_call_graph, &leaves);
+                if depth > limit {
+                    self.errors.push(format!(
+                        "Safety error (bounded-stack): function '{}' is @bounded-stack({}) but its\n\
+                         \x20\x20\x20\x20deepest static call chain is {} frames — it exceeds the declared\n\
+                         \x20\x20\x20\x20frame budget. Reduce call depth or raise the bound.",
+                        func_name, limit, depth
                     ));
                 }
             }
@@ -3046,24 +3185,30 @@ impl TypeChecker {
         //   - Returning Tainted from a non-@tainted function is an error
         //   - Returning Secret from a non-@secret function is an error
 
-        // Known sink functions (must not receive Tainted input)
+        // Known sink functions (must not receive Tainted input). The builtin
+        // name list is extended by functions the program marks @sink.
         let sql_sinks: &[&str] = &["sql_query", "sql_literal", "db_query", "db_exec"];
         let shell_sinks: &[&str] = &["process_system", "shell_cmd", "shell_escape"];
         let html_sinks: &[&str] = &["html_literal", "html_escape"];
         let path_sinks: &[&str] = &["file_read", "file_write", "file_append"];
-        let all_sinks: Vec<&str> = sql_sinks.iter()
+        let sink_names: Vec<String> = self.sink_fns.iter().cloned().collect();
+        let san_names: Vec<String> = self.sanitizer_fns.iter().cloned().collect();
+        let mut all_sinks: Vec<&str> = sql_sinks.iter()
             .chain(shell_sinks.iter())
             .chain(html_sinks.iter())
             .chain(path_sinks.iter())
             .copied()
             .collect();
+        all_sinks.extend(sink_names.iter().map(|s| s.as_str()));
 
-        // Known sanitizer functions (cleanse taint → result is Sanitized)
-        let sanitizers: &[&str] = &[
+        // Known sanitizer functions (cleanse taint → result is Sanitized).
+        // The builtin name list is extended by functions marked @sanitizer.
+        let mut sanitizers: Vec<&str> = vec![
             "sql_escape", "shell_escape", "html_escape", "path_normalize",
             "sanitize", "sanitize_input", "escape_html", "escape_sql",
             "escape_shell", "normalize_path",
         ];
+        sanitizers.extend(san_names.iter().map(|s| s.as_str()));
 
         for func in &program.funcs {
             let has_tainted = func.params.iter().any(|p| {
@@ -3086,7 +3231,7 @@ impl TypeChecker {
             }
 
             // Walk statements in order, propagating taint
-            self.propagate_taint_stmts(&func.body, &mut taint_map, &all_sinks, sanitizers, &func.name, program);
+            self.propagate_taint_stmts(&func.body, &mut taint_map, &all_sinks, &sanitizers, &func.name, program);
         }
     }
 
@@ -3476,6 +3621,36 @@ impl TypeChecker {
                     self.errors.push(err);
                 }
             }
+        }
+
+        // @allocator: custom allocator marker — requires at least one arg
+        // (the allocator name or type), matching the self-hosted checker.
+        let check_alloc_ann = |func: &Func, errs: &mut Vec<String>| {
+            for ann in &func.annotations {
+                if ann.name == "allocator" && ann.args.is_empty() {
+                    errs.push(format!(
+                        "Allocator error: function '{}' has @allocator but no allocator parameter specified",
+                        func.name
+                    ));
+                }
+            }
+        };
+        let mut alloc_errs = Vec::new();
+        for func in &program.funcs {
+            check_alloc_ann(func, &mut alloc_errs);
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                check_alloc_ann(method, &mut alloc_errs);
+            }
+        }
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                check_alloc_ann(method, &mut alloc_errs);
+            }
+        }
+        for err in alloc_errs {
+            self.errors.push(err);
         }
     }
 
@@ -4305,6 +4480,21 @@ impl TypeChecker {
     }
 
     /// `@unsafe fn` is one `unsafe` block around the whole body.
+    /// Whether `func` comes from a trusted module — the baked-in stdlib,
+    /// checked when the toolchain shipped. Looks up the defining module the
+    /// same way check_func_body does (mangled `Struct_method`, then plain
+    /// name), so a user redefinition of a stdlib name is still checked.
+    fn is_trusted_fn(&self, func: &Func) -> bool {
+        if self.trusted_modules.is_empty() {
+            return false;
+        }
+        let module = self.current_self_type.as_ref()
+            .map(|s| format!("{}_{}", s, func.name))
+            .and_then(|mangled| self.item_modules.get(&mangled))
+            .or_else(|| self.item_modules.get(&func.name));
+        module.map_or(false, |m| self.trusted_modules.contains(m))
+    }
+
     fn check_func(&mut self, func: &Func) {
         let whole = func.annotations.iter().any(|a| a.name == "unsafe");
         self.checking_fn = func.name.clone();
@@ -4343,6 +4533,13 @@ impl TypeChecker {
             }
         } else if let Some(mod_name) = self.item_modules.get(&func.name) {
             self.current_module = mod_name.clone();
+        } else if let Some(struct_name) = func.name.strip_prefix("__eq_") {
+            // Synthesized __eq fns aren't registered in item_modules; they
+            // belong to the struct's defining module (like a Rust derive
+            // expanding in-place) so private-field access checks pass.
+            if let Some(mod_name) = self.item_modules.get(struct_name) {
+                self.current_module = mod_name.clone();
+            }
         }
         // Reset linear tracking for this function
         let saved_consumed = std::mem::take(&mut self.consumed_vars);
@@ -5414,29 +5611,51 @@ impl TypeChecker {
                         }
                     }
                     BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
-                        // Comparing two user structs/enums requires an `eq` (for ==/!=)
-                        // or `cmp` (for ordering) method — comparing two aggregates'
-                        // addresses is silently meaningless. Implementations are
-                        // opt-in like Rust's PartialEq/PartialOrd.
+                        // Aggregate comparison rules:
+                        //   ==/!= on non-generic structs/enums → synthesized
+                        //       `__eq_<T>` (structural tag+payload / field-wise),
+                        //       or a user `eq` method when one exists.
+                        //   ==/!= on GENERIC aggregates (Option<T>, etc.) → no
+                        //       synthesis exists yet (R1.3); without a user `eq`
+                        //       the lowered code would silently compare
+                        //       addresses — reject instead.
+                        //   Ordering ops always need a user `cmp` method —
+                        //       address ordering is never meaningful.
                         let type_name = |t: &Type| -> Option<String> {
                             match t {
                                 Type::Named(n) | Type::Generic { name: n, .. } => Some(n.clone()),
                                 _ => None,
                             }
                         };
+                        // Generic ENUMS are value types — a bare pointer compare
+                        // is silently wrong, so ==/!= without `eq` is an error.
+                        // Generic structs (Vec<T>, Box<T>, handles) are
+                        // reference-like: `==` legitimately means identity.
+                        let is_generic_enum = |t: &Type| -> bool {
+                            let n = match t {
+                                Type::Generic { name, args } if !args.is_empty() => name,
+                                Type::Named(n) => n,
+                                _ => return false,
+                            };
+                            self.enum_type_params.get(n).map_or(false, |p| !p.is_empty())
+                        };
                         if let (Some(lname), Some(rname)) = (type_name(&lt), type_name(&rt)) {
                             if lname == rname && (self.structs.contains_key(&lname) || self.enums.contains(&lname)) {
-                                let (needed, want_ret, sig) = if matches!(op, BinOp::Eq | BinOp::Neq) {
-                                    ("eq", Type::Bool, "fn eq(self: T, other: T) -> bool")
-                                } else {
-                                    ("cmp", Type::I64, "fn cmp(self: T, other: T) -> i64")
-                                };
-                                let ok = self.methods.get(&lname)
-                                    .and_then(|m| m.get(needed))
+                                let has_method = |m: &str, want_ret: &Type| self.methods.get(&lname)
+                                    .and_then(|mm| mm.get(m))
                                     .map_or(false, |(params, ret, has_self, _is_pub)| {
-                                        *has_self && params.len() == 2 && ret == &want_ret
+                                        *has_self && params.len() == 2 && ret == want_ret
                                     });
-                                if !ok {
+                                let err = if matches!(op, BinOp::Eq | BinOp::Neq) {
+                                    // ==/!=: fine when a synthesized __eq will
+                                    // exist (non-generic) or the user gave `eq`.
+                                    if is_generic_enum(&lt) && !has_method("eq", &Type::Bool) {
+                                        Some("fn eq(self: T, other: T) -> bool")
+                                    } else { None }
+                                } else if !has_method("cmp", &Type::I64) {
+                                    Some("fn cmp(self: T, other: T) -> i64")
+                                } else { None };
+                                if let Some(sig) = err {
                                     self.errors.push(format!(
                                         "Type error: cannot compare '{}' with '{}' — comparing two aggregates compares \
                                          addresses, not contents.\n\
@@ -8077,6 +8296,134 @@ fn compute_total_gas(
 /// Detect if `target` is reachable from itself via a non-trivial path in the
 /// call graph (i.e., participates in a cycle). This catches indirect recursion
 /// (A → B → A) that the direct self-call check misses.
+/// Why the stack depth of `root` has no bound (@bounded-stack), if it has
+/// none: a cycle among the functions it can reach, or a call whose target is
+/// not known (a closure or function value). A method call, recorded by its
+/// bare name, is taken to reach every method of that name.
+/// Resolve one callee name from the safety call graph to concrete function
+/// nodes, the same way `bounded_stack_violation` does: a direct node, a
+/// hard failure for indirect calls, a no-op for runtime builtins/externs,
+/// or every method whose mangled name ends in `_name`.
+fn resolve_safety_callee(
+    name: &str,
+    graph: &HashMap<String, HashSet<String>>,
+    leaves: &HashSet<String>,
+) -> Result<Vec<String>, String> {
+    const INDIRECT: [&str; 3] = ["p_make_dyn", "p_call_ptr", "p_dyn_call"];
+    if graph.contains_key(name) {
+        return Ok(vec![name.to_string()]);
+    }
+    if INDIRECT.contains(&name) {
+        return Err(format!("makes an indirect call ('{}')", name));
+    }
+    if name.starts_with("p_") || leaves.contains(name)
+        || matches!(name, "print" | "println" | "print_str" | "print_nl" | "print_int")
+    {
+        return Ok(Vec::new());
+    }
+    let suffix = format!("_{}", name);
+    let mut methods: Vec<String> = graph.keys().filter(|k| k.ends_with(&suffix)).cloned().collect();
+    if methods.is_empty() {
+        return Err(format!("calls '{}', whose target is not a known function", name));
+    }
+    methods.sort();
+    Ok(methods)
+}
+
+fn safety_graph_edges(
+    f: &str,
+    graph: &HashMap<String, HashSet<String>>,
+    leaves: &HashSet<String>,
+) -> Result<Vec<String>, String> {
+    let mut callees: Vec<&String> = graph.get(f).map(|c| c.iter().collect()).unwrap_or_default();
+    callees.sort();
+    let mut out = Vec::new();
+    for c in callees {
+        out.extend(resolve_safety_callee(c, graph, leaves)?);
+    }
+    Ok(out)
+}
+
+/// Longest call chain (in frames, counting `root` itself) reachable from
+/// `root` over the safety call graph. Only meaningful after
+/// `bounded_stack_violation` has passed — on a cyclic graph this would not
+/// terminate, so cycles are treated as already-rejected and cut.
+fn safety_call_depth(
+    root: &str,
+    graph: &HashMap<String, HashSet<String>>,
+    leaves: &HashSet<String>,
+) -> u64 {
+    fn go(
+        f: &str,
+        graph: &HashMap<String, HashSet<String>>,
+        leaves: &HashSet<String>,
+        on_path: &mut HashSet<String>,
+        cache: &mut HashMap<String, u64>,
+    ) -> u64 {
+        if let Some(&d) = cache.get(f) {
+            return d;
+        }
+        if !on_path.insert(f.to_string()) {
+            return 0; // cycle — already rejected by bounded_stack_violation
+        }
+        let mut best = 0;
+        if let Ok(edges) = safety_graph_edges(f, graph, leaves) {
+            for e in edges {
+                best = best.max(go(&e, graph, leaves, on_path, cache));
+            }
+        }
+        on_path.remove(f);
+        let d = best + 1;
+        cache.insert(f.to_string(), d);
+        d
+    }
+    let mut on_path = HashSet::new();
+    let mut cache = HashMap::new();
+    go(root, graph, leaves, &mut on_path, &mut cache)
+}
+
+fn bounded_stack_violation(
+    root: &str,
+    graph: &HashMap<String, HashSet<String>>,
+    leaves: &HashSet<String>,
+) -> Option<String> {
+    let edges = |f: &str| -> Result<Vec<String>, String> {
+        safety_graph_edges(f, graph, leaves)
+    };
+    // Depth first over the resolved edges: a function on the current path,
+    // reached again, is a cycle
+    let mut on_path: HashMap<String, bool> = HashMap::new();
+    let mut stack: Vec<(String, Vec<String>, usize)> = Vec::new();
+    match edges(root) {
+        Ok(e) => {
+            on_path.insert(root.to_string(), true);
+            stack.push((root.to_string(), e, 0));
+        }
+        Err(why) => return Some(format!("{} (in '{}')", why, root)),
+    }
+    while let Some(top) = stack.last_mut() {
+        if top.2 < top.1.len() {
+            let next = top.1[top.2].clone();
+            top.2 += 1;
+            match on_path.get(&next) {
+                Some(true) => return Some(format!("can recurse through '{}'", next)),
+                Some(false) => {}
+                None => match edges(&next) {
+                    Ok(e) => {
+                        on_path.insert(next.clone(), true);
+                        stack.push((next, e, 0));
+                    }
+                    Err(why) => return Some(format!("{} (in '{}')", why, next)),
+                },
+            }
+        } else {
+            let (f, _, _) = stack.pop().unwrap();
+            on_path.insert(f, false);
+        }
+    }
+    None
+}
+
 fn is_in_call_cycle(
     target: &str,
     call_graph: &HashMap<String, HashSet<String>>,
@@ -9173,8 +9520,7 @@ fn stmt_decreases_var(stmt: &Stmt, var: &str) -> bool {
 ///   verify_adapter              → adapter
 ///   verify_taint_propagation    → tainted, secret
 ///
-/// Deliberately NOT listed: `bounded-stack` (collected as a primitive but
-/// never checked), and annotations enforced outside a `verify_*` pass
+/// Deliberately NOT listed: annotations enforced outside a `verify_*` pass
 /// (`linear`/`send`/`sync` via struct registration + borrowck, `wrapping`,
 /// `repr(C)`, `kernel`, `audit` via lowering/codegen flags).
 pub fn enforced_annotations() -> &'static [&'static str] {
@@ -9188,11 +9534,14 @@ pub fn enforced_annotations() -> &'static [&'static str] {
         "no-indirect",
         "requires-audit",
         "bounded",
+        "bounded-stack",
         "firmware",
+        "no-panic",
         "crashfree",
         "medical",
         "safety-critical",
         "autosar",
+        "dal-a",
         "constant_time",
         "realtime",
         "differentiable",
@@ -9203,7 +9552,79 @@ pub fn enforced_annotations() -> &'static [&'static str] {
         "adapter",
         "tainted",
         "secret",
+        "allocator",
     ]
+}
+
+/// Every annotation the compiler recognizes, mapped to the syntactic
+/// targets it may attach to. Consumed by `check_annotation_validity` — the
+/// parser accepts any `@name`, so this table is the boundary between a real
+/// annotation and a silent no-op. Keep in sync when adding annotations.
+fn annotation_targets(name: &str) -> Option<&'static [&'static str]> {
+    Some(match name {
+        // Function annotations: verify_* passes, lowering flags, codegen.
+        "deterministic" | "conserve" | "gas" | "no-alloc" | "no-recursion"
+        | "no-unbounded" | "no-indirect" | "requires-audit" | "bounded"
+        | "bounded-stack" | "firmware" | "no-panic" | "crashfree" | "medical"
+        | "safety-critical" | "autosar" | "dal-a" | "constant_time" | "realtime"
+        | "differentiable" | "quantized" | "checkpoint" | "dp" | "shard"
+        | "adapter" | "audit" | "simd" | "interrupt" | "kernel" | "shader"
+        | "unsafe" | "test" | "allocator" | "sanitizer" | "sink" | "declassify"
+        | "wrapping" | "panic_handler" => &["fn"],
+        // Struct annotations.
+        "linear" | "send" | "sync" | "repr" | "packed" | "derive" => &["struct"],
+        // Conditional compilation applies to fns and structs.
+        "cfg" => &["fn", "struct"],
+        // Parameter annotations.
+        "tainted" | "public" => &["param"],
+        // @secret marks data: params, locals, or a fn whose result is secret.
+        "secret" => &["fn", "param", "local"],
+        // Local val/var annotations.
+        "zeroize" => &["local"],
+        // Module-level global annotations.
+        "cpu_local" => &["global"],
+        _ => return None,
+    })
+}
+
+/// Collect (annotations, line) for every `val`/`var`/`pm` statement in a
+/// function body, recursing into all block-carrying statements — mirrors
+/// `scan_stmt_for_calls`' coverage.
+fn collect_local_annotations<'a>(stmts: &'a [Stmt], out: &mut Vec<(&'a [Annotation], usize)>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Let { annotations, line, .. } | Stmt::LetUninit { annotations, line, .. } => {
+                out.push((annotations.as_slice(), *line));
+            }
+            Stmt::If { then_block, else_block, .. } => {
+                collect_local_annotations(then_block, out);
+                if let Some(eb) = else_block {
+                    collect_local_annotations(eb, out);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::Loop { body, .. } | Stmt::For { body, .. } => {
+                collect_local_annotations(body, out);
+            }
+            Stmt::Defer(body, _) => collect_local_annotations(body, out),
+            Stmt::Match { arms, .. } => {
+                for arm in arms {
+                    collect_local_annotations(&arm.body, out);
+                }
+            }
+            Stmt::Handle { body, handlers, .. } => {
+                collect_local_annotations(body, out);
+                for h in handlers {
+                    collect_local_annotations(&h.body, out);
+                }
+            }
+            Stmt::RegionBlock { body, .. } | Stmt::Sandbox { body, .. }
+            | Stmt::Unsafe { body, .. } | Stmt::Txn { body, .. }
+            | Stmt::GradBlock { body, .. } => {
+                collect_local_annotations(body, out);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Scan for early returns (ret before the last statement in a block).
@@ -9881,6 +10302,8 @@ fn stmt_line(stmt: &Stmt) -> usize {
 static DOMAIN_PRESETS: &[(&str, &[&str])] = &[
     ("crashfree", &["no-panic", "no-unbounded"]),
     ("medical", &["no-alloc", "no-recursion", "no-unbounded", "no-panic", "requires-audit"]),
+    // @dal-a was merged into @medical — identical expansion, kept as an alias.
+    ("dal-a", &["no-alloc", "no-recursion", "no-unbounded", "no-panic", "requires-audit"]),
     ("safety-critical", &["no-alloc", "no-recursion", "no-unbounded", "no-panic", "no-indirect"]),
     ("autosar", &["no-alloc", "no-recursion", "no-unbounded", "no-panic"]),
 ];
@@ -9890,10 +10313,10 @@ fn expand_annotations(annotations: &[Annotation]) -> HashSet<&'static str> {
         let mut primitives: HashSet<&'static str> = HashSet::new();
         for ann in annotations {
             // Direct primitives — use static string literals
-            // Note: @no-panic is NOT user-facing — users write @crashfree
-            // (which expands to no-panic + no-unbounded). The "no-panic"
-            // primitive only appears via preset expansion.
+            // @no-panic is user-facing like the other primitives; @crashfree
+            // additionally bundles it with no-unbounded.
             match ann.name.as_str() {
+                "no-panic" => { primitives.insert("no-panic"); }
                 "no-alloc" => { primitives.insert("no-alloc"); }
                 "no-recursion" => { primitives.insert("no-recursion"); }
                 "no-unbounded" => { primitives.insert("no-unbounded"); }

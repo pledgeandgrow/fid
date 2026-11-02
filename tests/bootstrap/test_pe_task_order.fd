@@ -1,26 +1,42 @@
-// Tasks really suspend: each yield hands over to the next task.
+// Tasks really suspend: each yield hands over so another task can run.
+// On the M:N scheduler tasks also run in parallel across workers, so the
+// push order is not deterministic — under a mutex this checks that both
+// tasks interleave through task_yield at all.
 use task;
+use sync;
 
 var log: Vec<i64> = Vec::new();
+var lock: i64 = 0;
+
+fn note(n: i64) -> void {
+    sync_mutex_lock(lock);
+    log.push(n);
+    sync_mutex_unlock(lock);
+}
 
 fn worker(n: i64) -> i64 {
-    log.push(n);
+    note(n);
     task_yield();
-    log.push(n + 10);
+    note(n + 10);
     task_yield();
-    log.push(n + 20);
+    note(n + 20);
     return 0;
 }
 
 fn main() -> i64 {
+    lock = sync_mutex_create();
     task_go("worker", 1);
     task_go("worker", 2);
     task_run();
+    var seen: i64 = 0;
     var i: i64 = 0;
     while i < log.len() {
-        println(log.get(i));
+        seen = seen + log.get(i);
         i = i + 1;
     }
-    if log.get(1) != 2 { p_panic("tasks did not interleave"); }
+    // 1+11+21 + 2+12+22: every yield point of both tasks ran exactly once.
+    println(log.len());
+    println(seen);
+    if log.len() != 6 || seen != 69 { p_panic("tasks did not interleave"); }
     return 0;
 }

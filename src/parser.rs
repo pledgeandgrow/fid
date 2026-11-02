@@ -172,12 +172,17 @@ impl Parser {
                     } else {
                         is_pub
                     };
-                    // Check if the annotated item is a struct or function
+                    // Check if the annotated item is a struct, global, or function
                     if self.check(&TokenKind::Struct) {
                         let mut sd = self.parse_struct()?;
                         sd.is_pub = item_is_pub;
                         sd.annotations = annotations;
                         program.structs.push(sd);
+                    } else if self.check(&TokenKind::Var) || self.check(&TokenKind::Static) {
+                        let mut g = self.parse_global_var()?;
+                        g.is_pub = item_is_pub;
+                        g.annotations = annotations;
+                        program.globals.push(g);
                     } else {
                         let mut func = self.parse_func()?;
                         func.is_pub = item_is_pub;
@@ -840,7 +845,7 @@ impl Parser {
             }
         };
         self.match_tok(TokenKind::Semicolon);
-        Ok(GlobalVar { name, ty, init, is_pub: false })
+        Ok(GlobalVar { name, ty, init, is_pub: false, annotations: Vec::new() })
     }
 
     fn parse_type_alias(&mut self) -> Result<TypeAlias, String> {

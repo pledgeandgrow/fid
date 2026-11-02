@@ -388,6 +388,9 @@ impl Lowerer {
         for g in &program.globals {
             let ir_ty = self.lower_type(&g.ty);
             self.module.globals.insert(g.name.clone(), (ir_ty, g.init.clone()));
+            if g.annotations.iter().any(|a| a.name == "cpu_local") {
+                self.module.cpu_locals.insert(g.name.clone());
+            }
             if !is_const_init(&g.init) {
                 self.global_inits.push((g.name.clone(), g.init.clone()));
             }
@@ -1208,6 +1211,19 @@ impl Lowerer {
         self.module.add_extern("p_co_sleep", vec![IrType::I64], IrType::I64);
         self.module.add_extern("p_co_wait_fd", vec![IrType::I64, IrType::I64, IrType::I64], IrType::I64);
         self.module.add_extern("p_co_detach", vec![IrType::I64], IrType::Void);
+        // p_co_spawn(func_name, num_args, args...) -> i64 (future handle)
+        // `spawn f(args)` lowers here: a green task on the M:N scheduler.
+        self.module.add_extern("p_co_spawn",
+            vec![IrType::Ptr(Box::new(IrType::U8)), IrType::I64],
+            IrType::I64);
+        // p_co_tick() — loop-backedge safepoint: yields the task only when
+        // other tasks are queued behind it (cheap flag check otherwise).
+        self.module.add_extern("p_co_tick", vec![], IrType::Void);
+        // p_co_pool_call(name, nargs, argv) -> i64 — run a blocking call on
+        // the scheduler's OS-thread pool while the task parks.
+        self.module.add_extern("p_co_pool_call",
+            vec![IrType::Ptr(Box::new(IrType::U8)), IrType::I64, IrType::I64],
+            IrType::I64);
         self.module.add_extern("p_co_accept", vec![IrType::I64], IrType::I64);
         self.module.add_extern("p_co_connect", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::I64], IrType::I64);
         self.module.add_extern("p_co_recv", vec![IrType::I64, IrType::I64, IrType::I64, IrType::I64], IrType::I64);
@@ -1394,13 +1410,16 @@ impl Lowerer {
         // + @crashfree + @requires-audit. The optimizer can assume
         // no heap allocation, no recursion, bounded iteration, no panics.
         ir_func.is_medical = func.annotations.iter().any(|a| a.name == "medical");
-        // ML8: @kernel annotation — GPU entry point for SPIR-V/PTX codegen
-        ir_func.is_kernel = func.annotations.iter().any(|a| a.name == "kernel");
+        // ML8: @kernel annotation — GPU entry point for SPIR-V/PTX codegen.
+        // @shader is an alias consumed the same way (self-hosted parity).
+        ir_func.is_kernel = func.annotations.iter().any(|a| a.name == "kernel" || a.name == "shader");
         // F23: @simd annotation — enables aggressive loop vectorization
         ir_func.is_simd = func.annotations.iter().any(|a| a.name == "simd");
+        // @panic_handler — receives panic messages instead of p_panic (kernels)
+        ir_func.is_panic_handler = func.annotations.iter().any(|a| a.name == "panic_handler");
         // Parse workgroup size from @kernel(x, y, z) or @kernel([x, y, z])
         if ir_func.is_kernel {
-            if let Some(kann) = func.annotations.iter().find(|a| a.name == "kernel") {
+            if let Some(kann) = func.annotations.iter().find(|a| a.name == "kernel" || a.name == "shader") {
                 if !kann.args.is_empty() {
                     // Try parsing as [x,y,z] or x,y,z
                     let args_str: String = kann.args.join(",");
@@ -3020,6 +3039,18 @@ impl Lowerer {
     }
 
     /// Lower a while loop
+    /// M5 safepoint: `p_co_tick()` at a loop header. On a green task it yields
+    /// only when other tasks are queued, so CPU-bound loops can't starve the
+    /// scheduler; off-task and in interp it's a no-op.
+    fn emit_co_tick(&mut self) {
+        self.emit_inst(Inst::Call {
+            func: "p_co_tick".to_string(),
+            args: vec![],
+            ret_ty: IrType::Void,
+            effects: EffectSet::new(),
+        });
+    }
+
     fn lower_while(&mut self, cond: &Expr, body: &[Stmt]) {
         let cond_block = self.new_block();
         let body_block = self.new_block();
@@ -3028,8 +3059,9 @@ impl Lowerer {
         // Jump to condition block
         self.emit_terminator(Inst::Jump { target: cond_block });
 
-        // Condition block
+        // Condition block — loop-header safepoint for task preemption
         self.set_current_block(cond_block);
+        self.emit_co_tick();
         let cond_val = self.lower_expr(cond);
         self.emit_terminator(Inst::Branch {
             cond: cond_val,
@@ -3082,6 +3114,7 @@ impl Lowerer {
 
                 // Condition: var < end (or var <= end for inclusive)
                 self.set_current_block(cond_block);
+                self.emit_co_tick();
                 let var_val = self.emit_inst(Inst::Load {
                     ptr: alloca,
                     ty: IrType::I64,
@@ -3322,6 +3355,7 @@ impl Lowerer {
 
         // Condition: i < vec.len()
         self.set_current_block(cond_block);
+        self.emit_co_tick();
         let idx_val = self.emit_inst(Inst::Load { ptr: idx_alloca, ty: IrType::I64 });
         let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
         let len_val = self.emit_inst(Inst::Call {
@@ -3420,6 +3454,7 @@ impl Lowerer {
 
         // Condition: i < len
         self.set_current_block(cond_block);
+        self.emit_co_tick();
         let idx_val = self.emit_inst(Inst::Load { ptr: idx_alloca, ty: IrType::I64 });
         let cond_val = self.emit_inst(Inst::BinOp {
             op: BinOp::Lt,
@@ -3473,6 +3508,7 @@ impl Lowerer {
         self.emit_terminator(Inst::Jump { target: loop_block });
 
         self.set_current_block(loop_block);
+        self.emit_co_tick();
         self.loop_stack.push((loop_block, exit_block, None));
         self.lower_stmts(body);
         self.loop_stack.pop();
@@ -4433,7 +4469,7 @@ impl Lowerer {
                     };
                     let eq_func = enum_of(&left_ir_ty)
                         .or_else(|| enum_of(&right_ir_ty))
-                        .filter(|n| self.enums.contains_key(n))
+                        .filter(|n| self.enums.contains_key(n) || self.structs.contains_key(n))
                         .map(|n| format!("__eq_{}", n))
                         .filter(|f| self.module.functions.contains_key(f));
                     if let Some(func) = eq_func {
@@ -6904,9 +6940,11 @@ impl Lowerer {
                 }
             }
             Expr::Spawn { expr: inner } => {
-                // spawn <expr> — create a concurrent task.
-                // L3B: If inside a `spawn scope` block, use the scope executor.
-                // Otherwise, use p_thread_spawn (creates an OS thread).
+                // spawn <expr> — a green task on the M:N scheduler (M3). Inside
+                // `spawn scope` or bare, `spawn f(args)` always becomes
+                // p_co_spawn; the scope-exit p_executor_run_all joins every
+                // live task. True OS threads remain via sync.fd's p_thread_spawn
+                // wrapper, which code needing real parallelism uses directly.
                 match &**inner {
                     Expr::Call { callee, args, .. } => {
                         let func_name_val = self.emit_inst(Inst::ConstStr { value: callee.clone() });
@@ -6914,32 +6952,16 @@ impl Lowerer {
                             value: args.len() as i64,
                             ty: IrType::I64,
                         });
-                        // L3B: Use scope executor if available, else p_thread_spawn
-                        if let Some(exec) = self.scope_executor_stack.last().copied() {
-                            // spawn func(args) → p_executor_spawn(exec, func_name, num_args, args...)
-                            let mut all_args = vec![exec, func_name_val, num_args_val];
-                            for arg in args {
-                                all_args.push(self.lower_expr(arg));
-                            }
-                            self.emit_inst(Inst::Call {
-                                func: "p_executor_spawn".to_string(),
-                                args: all_args,
-                                ret_ty: IrType::I64,
-                                effects: EffectSet::new(),
-                            })
-                        } else {
-                            // spawn func(args) → p_thread_spawn(func_name, num_args, args...)
-                            let mut all_args = vec![func_name_val, num_args_val];
-                            for arg in args {
-                                all_args.push(self.lower_expr(arg));
-                            }
-                            self.emit_inst(Inst::Call {
-                                func: "p_thread_spawn".to_string(),
-                                args: all_args,
-                                ret_ty: IrType::I64,
-                                effects: EffectSet::new(),
-                            })
+                        let mut all_args = vec![func_name_val, num_args_val];
+                        for arg in args {
+                            all_args.push(self.lower_expr(arg));
                         }
+                        self.emit_inst(Inst::Call {
+                            func: "p_co_spawn".to_string(),
+                            args: all_args,
+                            ret_ty: IrType::I64,
+                            effects: EffectSet::new(),
+                        })
                     }
                     _ => {
                         // Non-call spawn — fall back to eager evaluation

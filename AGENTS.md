@@ -104,8 +104,13 @@ cargo build
 # Run the LSP server (for editor integration)
 ./target/release/fidesc lsp
 
-# Run lint checks (unused functions, unused imports)
+# Run lint checks (unused functions, unused imports; fid also unwrap() outside tests)
 ./target/release/fidesc lint <file.fd>
+
+# Self-hosted only: unsafe code a program reaches, leaks, use after free
+.\release\fid.exe audit <file.fd> [--stdlib] [--strict]
+.\release\fid.exe run <file.fd> --leaks
+.\release\fid.exe run <file.fd> --checked-alloc
 
 # Benchmark a file (interpreter or C native)
 ./target/release/fidesc bench <file.fd> [-n <count>] [--ccompile]
@@ -468,6 +473,20 @@ touching them.
 17. **The counted-loop analysis lives in `compiler/checks.fd`**, not in
    `pe_ir.fd`: `codegen_c.fd` importing `pe_ir` doubled the C of any program
    that uses the C generator (`test_codegen_c` 5 MB -> 11 MB).
+
+18. **Testing a runtime `str` for null**: write `(s as i64) == 0`. `s == 0`
+   on a `str` is a text comparison in `fid`, so it never detects the null
+   that `p_file_read`, `p_getenv` and `p_argv` return on failure.
+
+19. **fidesc bakes `stdlib/core.fd` in** (`include_str!` in
+   `src/compiler.rs`): after editing core, rebuild `fidesc` before testing
+   with it, or it runs the old core. `fid` reads core at run time.
+
+20. **The debug allocator** (`P_LEAKS`, `P_CHECKED_ALLOC` in
+   `compiler/codegen_c.fd`) renames the block allocator to
+   `__p_block_malloc`/`__p_block_free` with `#define` and puts recording
+   `p_malloc`/`p_free` after it. Keep code that must call the real block
+   allocator between those defines, and nothing else.
 
 ## NEVER DO THESE (Hard Rules)
 

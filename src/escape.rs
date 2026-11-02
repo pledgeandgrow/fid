@@ -928,6 +928,13 @@ impl<'a> EscapeChecker<'a> {
 
 /// Run the escape check over every function of `program`.
 pub fn check(program: &Program) -> Vec<String> {
+    check_filtered(program, &HashSet::new())
+}
+
+/// `check`, but functions whose origin module is in `trusted` are analyzed
+/// without reporting errors — their summaries still feed callers' checks;
+/// the toolchain's baked-in stdlib was verified when it shipped.
+pub fn check_filtered(program: &Program, trusted: &HashSet<String>) -> Vec<String> {
     let mut c = EscapeChecker::new(program);
     c.check_decls(program);
     let all = c.all.clone();
@@ -943,6 +950,9 @@ pub fn check(program: &Program) -> Vec<String> {
     }
     c.report = true;
     for (key, f) in &all {
+        if program.func_modules.get(key).map_or(false, |m| trusted.contains(m)) {
+            continue;
+        }
         c.analyze_func(key, f);
     }
     c.errors

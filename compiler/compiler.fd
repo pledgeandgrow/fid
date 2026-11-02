@@ -774,7 +774,7 @@ pub fn build_program_no_std_borrowck(source: str, source_path: OptStr, borrowck_
                         p_eprint_str(found_path);
                         p_eprint_str("\n");
                         var module_source: str = p_file_read(found_path);
-                        if module_source == 0 {
+                        if (module_source as i64) == 0 {
                             p_eprint_str("[build] Warning: could not read: ");
                             p_eprint_str(found_path);
                             p_eprint_str("\n");
@@ -960,7 +960,7 @@ pub fn pe_runtime_path(name: str) -> str {
 /// of an installed toolchain: $FID_HOME/stdlib, <exe dir>/stdlib,
 /// <exe dir>/../stdlib (as the Rust compiler looks).
 /// `use tls` is a different module on each system.
-fn c_platform_module(path: str) -> str {
+pub fn c_platform_module(path: str) -> str {
     if path == "tls" {
         if c_file_exists("/proc/self/exe") {
             return "tls_unix";
@@ -1043,7 +1043,7 @@ pub fn get_cached_stdlib() -> OptProgram {
     }
     // Parse stdlib/core.fd
     var stdlib_raw: str = p_file_read(c_path_join(stdlib_dir(), "core.fd"));
-    if stdlib_raw == 0 {
+    if (stdlib_raw as i64) == 0 {
         return OptProgram::None;
     }
     var stdlib_result: ParseResultProgram = parse_source(stdlib_raw);
@@ -1110,7 +1110,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     var rt_path: str = pe_runtime_path(rt_files.get(rti));
                     inc_record_file(rt_path);
                     var rt_raw: str = p_file_read(rt_path);
-                    if rt_raw == 0 {
+                    if (rt_raw as i64) == 0 {
                         return ResultProgram::Err(c_vec1("PE runtime source not found: " + rt_path));
                     }
                     var rt_lex: Lexer = Lexer::new(rt_raw);
@@ -1808,12 +1808,71 @@ pub fn lint_source(source: str, source_path: str) -> ResultVecStr {
 
                     // Run lints
                     tc.run_lints(program);
+                    lint_unwraps(&mut tc, user, source, source_path);
                     return ResultVecStr::Ok(tc.warnings);
                 }
             }
         }
     }
     return ResultVecStr::Err(c_vec1("unreachable"));
+}
+
+/// CE2: unwrap() and expect() panic on None or Err. Outside tests (a file
+/// named *_test.fd, or a fn test_* or bench_* as `fid test` runs), warn at
+/// each function that calls one.
+fn lint_unwraps(tc: &mut TypeChecker, user: Program, source: str, source_path: str) {
+    if str_ends_with(source_path, "_test.fd") { return; }
+    var names: Vec<str> = Vec::new();
+    var bodies: Vec<Vec<Stmt>> = Vec::new();
+    var fi: i64 = 0;
+    while fi < user.funcs.len() {
+        names.push(user.funcs.get(fi).name);
+        bodies.push(user.funcs.get(fi).body);
+        fi = fi + 1;
+    }
+    var ii: i64 = 0;
+    while ii < user.impls.len() {
+        var imp: ImplDef = user.impls.get(ii);
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            names.push(imp.methods.get(mi).name);
+            bodies.push(imp.methods.get(mi).body);
+            mi = mi + 1;
+        }
+        ii = ii + 1;
+    }
+    var i: i64 = 0;
+    while i < names.len() {
+        val name: str = names.get(i);
+        if !str_starts_with(name, "test_") && !str_starts_with(name, "bench_") {
+            var called: Vec<str> = Vec::new();
+            TypeChecker_collect_called_funcs(tc, bodies.get(i), called);
+            if str_vec_contains(called, "#unwrap") {
+                tc.warnings.push(lint_unwrap_where(source, name) + "'" + name
+                    + "' calls unwrap() or expect(), which panic on None or Err.\n"
+                    + "    Fix: match on it, use unwrap_or(default), or return the error with ?.");
+            }
+        }
+        i = i + 1;
+    }
+}
+
+/// "line N: " for the first unwrap( or expect( after `fn <name>`, or "".
+fn lint_unwrap_where(source: str, name: str) -> str {
+    val at: i64 = str_find(source, "fn " + name + "(");
+    if at < 0 { return ""; }
+    val rest: str = str_slice(source, at, str_len(source));
+    var u: i64 = str_find(rest, ".unwrap(");
+    val e: i64 = str_find(rest, ".expect(");
+    if u < 0 || (e >= 0 && e < u) { u = e; }
+    if u < 0 { return ""; }
+    var line: i64 = 1;
+    var k: i64 = 0;
+    while k < at + u {
+        if str_byte_at(source, k) == 10 { line = line + 1; }
+        k = k + 1;
+    }
+    return "line " + int_to_str(line) + ": ";
 }
 
 /// Lower source to an IR module.
@@ -3888,7 +3947,7 @@ pub fn c_vec2_str(a: str, b: str) -> Vec<str> {
 /// Read a file as a string. Returns empty string on failure.
 pub fn c_file_read(path: str) -> str {
     var content = p_file_read(path);
-    if content == 0 { return ""; }
+    if (content as i64) == 0 { return ""; }
     return content;
 }
 

@@ -169,7 +169,8 @@ pub fn main() -> i64 {
     if command == "repl" { return cmd_repl(); }
     if command == "codegen" { return cmd_codegen(n, start); }
     if command == "gpu" { return cmd_gpu(n, start); }
-    if command == "verify" || command == "audit" { return cmd_verify(n, start); }
+    if command == "verify" { return cmd_verify(n, start); }
+    if command == "audit" { return cmd_audit(n, start); }
     if command == "sourcemap" { return cmd_sourcemap(n, start); }
     if command == "parse-header" { return cmd_parse_header(n, start); }
     if command == "notebook" { return cmd_notebook(n, start); }
@@ -607,6 +608,27 @@ fn cmd_run(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         return 1;
     }
     var input: str = p_argv(start + 1);
+
+    // --leaks / --checked-alloc: the interpreter has no allocator to watch, so
+    // build through C with the debug allocator and run that
+    var mem_flags: str = "";
+    if has_flag(n, start, "--leaks") { mem_flags = " --leaks"; }
+    if has_flag(n, start, "--checked-alloc") { mem_flags = mem_flags + " --checked-alloc"; }
+    if str_len(mem_flags) > 0 {
+        var mexe: str = "_fides_memcheck_tmp.exe";
+        var mrun: str = ".\\_fides_memcheck_tmp.exe";
+        if is_linux() {
+            mexe = "_fides_memcheck_tmp";
+            mrun = "./_fides_memcheck_tmp";
+        }
+        if p_system("\"" + p_argv(0) + "\" ccompile " + input + " -o " + mexe + " --debug" + mem_flags) != 0 {
+            p_eprint_str("run: the build failed\n");
+            return 1;
+        }
+        val mcode: i64 = p_system(mrun);
+        p_file_delete(mexe);
+        return mcode;
+    }
 
     // Parse run-specific flags
     var verbose: bool = has_flag(n, start, "-v") || has_flag(n, start, "--verbose");
@@ -1230,8 +1252,7 @@ fn cmd_profile(n: i64, start: i64) -> i64 {
         }
         li = li + 1;
     }
-    print("
-Profile of " + input + ": " + int_to_str(total) + " samples, 1 ms apart\n");
+    print("\nProfile of " + input + ": " + int_to_str(total) + " samples, 1 ms apart\n");
     print("  self %   samples  function\n");
     var shown: i64 = 0;
     while shown < 20 && shown < names.len() {
@@ -1698,6 +1719,8 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     var unit_build: bool = has_flag(n, start, "--inc");
     if unit_build { set_c_unit_marks(true); }
     if has_flag(n, start, "--profile") { set_c_profile(true); }
+    if has_flag(n, start, "--leaks") { set_c_leaks(true); }
+    if has_flag(n, start, "--checked-alloc") { set_c_checked_alloc(true); }
     var result: ResultStr = ccompile_source_with_path(source, input, g_borrowck);
     match result {
         ResultStr::Ok(c_code) => {
@@ -2174,6 +2197,137 @@ fn cmd_gpu(n: i64, start: i64) -> i64 {
 
 // --- cmd_verify ----------------------------------------------------------
 // Verify IR correctness for a Fides source file.
+// --- cmd_audit -------------------------------------------------------------
+// CM10: every `unsafe` block, @unsafe function and extern "C" declaration in
+// the program and the modules it uses (transitively), each with the
+// `// SAFETY:` comment that justifies it. The stdlib is summed up per module
+// unless --stdlib; --strict exits 1 when a site outside the stdlib has no
+// SAFETY: comment.
+
+/// The file a `use` line names, or "" (a module not found is skipped).
+fn audit_module_file(spec: str, from_file: str) -> str {
+    var m: str = spec;
+    val brace: i64 = str_find(m, "::{");
+    if brace >= 0 { m = str_slice(m, 0, brace); }
+    val rel: str = str_replace(m, "::", "/") + ".fd";
+    val local: str = c_path_join(c_path_dirname(from_file), rel);
+    if c_file_exists(local) { return local; }
+    if c_file_exists(rel) { return rel; }
+    val in_std: str = c_path_join(stdlib_dir(), c_platform_module(str_replace(m, "::", "/")) + ".fd");
+    if c_file_exists(in_std) { return in_std; }
+    return "";
+}
+
+/// The text after "SAFETY:" on the line or in the comment lines right above.
+fn audit_justification(lines: Vec<str>, at: i64) -> str {
+    val here: str = lines.get(at);
+    val h: i64 = str_find(here, "SAFETY:");
+    if h >= 0 { return str_trim(str_slice(here, h + 7, str_len(here))); }
+    var k: i64 = at - 1;
+    while k >= 0 && str_starts_with(str_trim(lines.get(k)), "//") {
+        val c: str = lines.get(k);
+        val s: i64 = str_find(c, "SAFETY:");
+        if s >= 0 { return str_trim(str_slice(c, s + 7, str_len(c))); }
+        k = k - 1;
+    }
+    return "";
+}
+
+fn cmd_audit(n: i64, start: i64) -> i64 {
+    if start + 2 > n {
+        p_eprint_str("Usage: fid audit <file.fd> [--stdlib] [--strict]\n");
+        return 1;
+    }
+    val input: str = p_argv(start + 1);
+    var show_std: bool = false;
+    var strict: bool = false;
+    var ai: i64 = start + 2;
+    while ai < n {
+        if p_argv(ai) == "--stdlib" { show_std = true; }
+        if p_argv(ai) == "--strict" { strict = true; }
+        ai = ai + 1;
+    }
+    if str_len(c_file_read(input)) == 0 {
+        p_eprint_str("Error: could not read file: " + input + "\n");
+        return 1;
+    }
+    val std_dir: str = stdlib_dir();
+    var files: Vec<str> = Vec::new();
+    files.push(input);
+    val core_file: str = c_path_join(std_dir, "core.fd");
+    if c_file_exists(core_file) { files.push(core_file); }
+    var mine: i64 = 0;
+    var mine_bare: i64 = 0;
+    var std_summary: Vec<str> = Vec::new();
+    var fi: i64 = 0;
+    while fi < files.len() {
+        val file: str = files.get(fi);
+        val is_std: bool = str_starts_with(file, std_dir);
+        val lines: Vec<str> = str_split(c_file_read(file), "\n");
+        var func: str = "";
+        var count: i64 = 0;
+        var bare: i64 = 0;
+        var li: i64 = 0;
+        while li < lines.len() {
+            var code: str = lines.get(li);
+            val cm: i64 = str_find(code, "//");
+            if cm >= 0 { code = str_slice(code, 0, cm); }
+            val t: str = str_trim(code);
+            if str_starts_with(t, "use ") {
+                val spec: str = str_trim(str_replace(str_slice(t, 4, str_len(t)), ";", ""));
+                val dep: str = audit_module_file(spec, file);
+                if str_len(dep) > 0 && !str_vec_contains(files, dep) { files.push(dep); }
+            }
+            val fnat: i64 = str_find(t, "fn ");
+            if fnat >= 0 && (fnat == 0 || str_starts_with(t, "pub ") || str_starts_with(t, "@")) {
+                var rest: str = str_slice(t, fnat + 3, str_len(t));
+                val paren: i64 = str_find(rest, "(");
+                if paren > 0 { func = str_trim(str_slice(rest, 0, paren)); }
+            }
+            var kind: str = "";
+            if str_contains(t, "unsafe {") || t == "unsafe" { kind = "unsafe block"; }
+            if str_starts_with(t, "@unsafe") { kind = "@unsafe function"; }
+            if str_contains(t, "extern \"C\"") { kind = "extern \"C\""; }
+            if str_len(kind) > 0 {
+                val why: str = audit_justification(lines, li);
+                count = count + 1;
+                if str_len(why) == 0 { bare = bare + 1; }
+                if !is_std || show_std {
+                    var where_fn: str = "";
+                    if str_len(func) > 0 { where_fn = " in " + func; }
+                    var say: str = "no SAFETY: comment";
+                    if str_len(why) > 0 { say = "SAFETY: " + why; }
+                    print(file + ":" + int_to_str(li + 1) + ": " + kind + where_fn + " - " + say + "\n");
+                }
+            }
+            li = li + 1;
+        }
+        if is_std {
+            if count > 0 && !show_std {
+                std_summary.push(str_slice(file, str_len(std_dir) + 1, str_len(file)) + " " + int_to_str(count)
+                    + " (" + int_to_str(bare) + " without SAFETY:)");
+            }
+        } else {
+            mine = mine + count;
+            mine_bare = mine_bare + bare;
+        }
+        fi = fi + 1;
+    }
+    if std_summary.len() > 0 {
+        print("stdlib (--stdlib lists them): ");
+        var si: i64 = 0;
+        while si < std_summary.len() {
+            if si > 0 { print(", "); }
+            print(std_summary.get(si));
+            si = si + 1;
+        }
+        print("\n");
+    }
+    print(int_to_str(mine) + " unsafe site(s) outside the stdlib, " + int_to_str(mine_bare) + " without a SAFETY: comment\n");
+    if strict && mine_bare > 0 { return 1; }
+    return 0;
+}
+
 fn cmd_verify(n: i64, start: i64) -> i64 {
     if start + 2 > n {
         p_eprint_str("Usage: fid verify <file.fd>\n");
@@ -2566,6 +2720,8 @@ fn print_usage() {
     p_eprint_str("  fid check    <file.fd>               Type, borrow and effect checks only\n");
     p_eprint_str("  fid doc      <file.fd|dir> ...        Generate documentation (as scribe)\n");
     p_eprint_str("  fid ccompile <file.fd> --debug|--release  C at -O0, or -O2 (the default)\n");
+    p_eprint_str("  fid run      <file.fd> --leaks        Report the blocks never freed, by where allocated\n");
+    p_eprint_str("  fid run      <file.fd> --checked-alloc  Fault on use after free or past a block's end\n");
     p_eprint_str("  fid wasm     <file.fd> [-o <out>] [--wat]  Compile to WASM/WAT\n");
     p_eprint_str("  fid version                          Show version\n");
     p_eprint_str("  fid scribe   <file.fd|dir> [--format html|markdown] [--output <dir>]\n");
@@ -2578,6 +2734,7 @@ fn print_usage() {
     p_eprint_str("  fid gpu      <file.fd> --target spirv|ptx [-o <out>] [--text]\n");
     p_eprint_str("                                           Generate GPU code\n");
     p_eprint_str("  fid verify   <file.fd>              Verify IR correctness\n");
+    p_eprint_str("  fid audit    <file.fd> [--stdlib] [--strict]  List the unsafe code it can reach\n");
     p_eprint_str("  fid sourcemap <file.fd>             Show IR-to-source mapping\n");
     p_eprint_str("  fid parse-header <file.h> [-o <fd>] Generate FFI bindings from C header\n");
 }

@@ -1,9 +1,11 @@
 // Fides Tasks standard library
 //
-// Green threads: many tasks on one OS thread, each with its own stack. A task
-// runs until it calls task_yield, then the next one runs. On the native and C
-// paths this is real stack switching, so 10,000 tasks are cheap. The interpreter
-// has one call stack: there a task runs to its end when started.
+// Green threads: many tasks scheduled M:N over a worker per CPU, each with its
+// own stack. Tasks yield at task_yield/task_sleep/fd waits, at blocking calls
+// the runtime can poll or pool, and at compiler-emitted loop safepoints — so a
+// busy loop cannot starve the others. A dedicated poller thread owns socket
+// readiness; a small OS-thread pool runs syscalls that cannot be polled.
+// The interpreter has one call stack: there a task runs to its end when started.
 //
 // Usage:
 //   use task;
@@ -14,8 +16,8 @@
 
 module task;
 
-/// Start the function `name`, which takes one i64, as a task. It first runs
-/// when task_run does. Returns the task.
+/// Start the function `name`, which takes one i64, as a task. It starts on a
+/// worker as soon as one is free. Returns the task.
 pub fn task_go(name: str, arg: i64) -> i64 {
     return p_co_go(name, arg);
 }
@@ -25,7 +27,7 @@ pub fn task_yield() -> void {
     p_co_yield();
 }
 
-/// Run every task until all have finished, tasks they start included.
+/// Wait until every task has finished, tasks they start included.
 /// Returns how many tasks there have been.
 pub fn task_run() -> i64 {
     return p_co_run();
@@ -60,4 +62,13 @@ pub fn task_done(t: i64) -> bool {
 /// What the task returned.
 pub fn task_result(t: i64) -> i64 {
     return p_co_result(t);
+}
+
+/// Run the program function `name` (same signature rules as spawn targets)
+/// on the scheduler's blocking-call pool while this task parks. For wrapping
+/// syscalls that can neither be polled nor made nonblocking. Off a task it
+/// just calls the function. `args` is an i64 array of arguments; returns what
+/// the function returned.
+pub fn task_pool_call(name: str, nargs: i64, args: i64) -> i64 {
+    return p_co_pool_call(name, nargs, args);
 }

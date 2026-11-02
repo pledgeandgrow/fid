@@ -1496,7 +1496,7 @@ impl X86Encoder {
     // ─── Label resolution ───
 
     /// Resolve all pending label relocations (local jumps/calls)
-    fn resolve_labels(&mut self) {
+    fn resolve_labels(&mut self, func_labels: &std::collections::HashMap<String, u32>) {
         for reloc in &self.pending_labels {
             if let Some(&target_offset) = self.labels.get(&reloc.target_label) {
                 let disp = target_offset as i64 - (reloc.code_offset as i64 + 4);
@@ -1505,7 +1505,21 @@ impl X86Encoder {
                     self.code[reloc.code_offset + i] = b;
                 }
             } else {
-                eprintln!("[PE] WARNING: unresolved label {} at code offset 0x{:x}", reloc.target_label, reloc.code_offset);
+                let mut owner = "?";
+                let mut best = 0usize;
+                let mut target_name = "?";
+                for (name, lbl) in func_labels {
+                    if *lbl == reloc.target_label {
+                        target_name = name.as_str();
+                    }
+                    if let Some(&off) = self.labels.get(lbl) {
+                        if off <= reloc.code_offset && off >= best {
+                            best = off;
+                            owner = name.as_str();
+                        }
+                    }
+                }
+                eprintln!("[PE] WARNING: unresolved label {} (-> fn {}) at code offset 0x{:x} (in {})", reloc.target_label, target_name, reloc.code_offset, owner);
             }
         }
     }
@@ -1577,6 +1591,9 @@ const IMPORTS: &[&str] = &[
     "CreateFiberEx",
     "SwitchToFiber",
     "DeleteFiber",
+    "CreateMutexA",
+    "ReleaseMutex",
+    "GetSystemInfo",
 ];
 
 /// msvcrt.dll functions: the C library behind `extern "C"` declarations
@@ -2144,6 +2161,12 @@ struct PeCodeGen {
     string_rdata_offsets: HashMap<String, usize>,
     /// Map global var name to rdata offset (writable section)
     global_rdata_offsets: HashMap<String, usize>,
+    /// @cpu_local globals: name -> GS-relative offset (per-CPU storage).
+    /// Offset 0 = start of the per-CPU block; the kernel sets GS.base to it.
+    cpu_local_offsets: HashMap<String, usize>,
+    /// Name of the @panic_handler function, if the program declares one.
+    /// Panics route to it instead of the p_panic stub.
+    panic_handler: Option<String>,
     /// IAT entry offsets within .rdata (for each import)
     iat_rdata_offsets: Vec<usize>,
     /// Block labels: (function_name, block_id) -> label_id
@@ -2273,6 +2296,7 @@ const PE_STUB_DEPS: &[(&str, &str)] = &[
     ("p_thread_spawn", "pert_thread_spawn_v"),
     ("p_executor_spawn", "pert_executor_spawn_v"),
     ("p_co_async", "pert_co_async_v"),
+    ("p_co_spawn", "pert_co_spawn_v"),
     // The C-convention thread start routine runs pert_thread_main(arg)
     ("pe_thread_entry_addr", "pert_thread_main"),
 ];
@@ -2351,6 +2375,8 @@ impl PeCodeGen {
             func_labels: HashMap::new(),
             string_rdata_offsets: HashMap::new(),
             global_rdata_offsets: HashMap::new(),
+            cpu_local_offsets: HashMap::new(),
+            panic_handler: None,
             iat_rdata_offsets: Vec::new(),
             block_labels: HashMap::new(),
             entry_offset: 0,
@@ -2496,9 +2522,14 @@ impl PeCodeGen {
         let mut global_names_pe: Vec<String> = module.globals.keys().cloned().collect();
         global_names_pe.sort();
         let mut global_str_patches: Vec<(usize, usize)> = Vec::new();
+        let mut next_gs_off = 0usize;
         for name in &global_names_pe {
             let (ty, init_expr) = &module.globals[name];
             let gsize = module.type_size(ty).max(8) as usize;
+            if module.cpu_locals.contains(name) {
+                self.cpu_local_offsets.insert(name.clone(), next_gs_off);
+                next_gs_off += (gsize + 7) & !7;
+            }
             // Compute the 8-byte initial value; a string literal records
             // its .rdata offset for an absolute-VA patch after layout.
             let mut str_off: Option<usize> = None;
@@ -2541,6 +2572,9 @@ impl PeCodeGen {
         for name in &func_names {
             let label = self.enc.alloc_label();
             self.func_labels.insert(name.clone(), label);
+            if module.functions[name].is_panic_handler {
+                self.panic_handler = Some(name.clone());
+            }
         }
         // Pre-allocate labels for runtime stubs
         for stub in &["p_print_int", "p_print_str", "p_print_bool", "p_print_float",
@@ -2648,9 +2682,13 @@ impl PeCodeGen {
                 self.c_adapters.push(CAdapter { name, target: target.clone(), params, ret: func.ret_ty.clone() });
             }
         }
-        // Functions named by a string constant can be looked up by name
+        // Functions named by a string constant can be looked up by name —
+        // pe_runtime fns too: the M:N scheduler starts its worker, poller and
+        // pool threads through pe_fn_lookup("pert_*_main"). Only fns actually
+        // emitted: a pruned runtime helper's label resolves nowhere.
         self.named_fns = all_strings.iter()
-            .filter(|s| self.module_fns.contains(*s) && !is_pe_runtime_fn(s))
+            .filter(|s| self.module_fns.contains(*s)
+                && (!is_pe_runtime_fn(s) || needed.contains(*s)))
             .cloned()
             .collect();
 
@@ -2703,7 +2741,7 @@ impl PeCodeGen {
         self.gen_entry_point();
 
         // 7. Resolve local labels (jumps/calls within .text)
-        self.enc.resolve_labels();
+        self.enc.resolve_labels(&self.func_labels);
 
         // 8. Compute .rdata RVA dynamically from actual .text size
         let rdata_rva = TEXT_RVA + align_up(self.enc.code.len() as u32, SECTION_ALIGN);
@@ -2811,10 +2849,15 @@ impl PeCodeGen {
         // This is critical for bare-metal mode: GDT, IDT, page tables need fixed storage.
         let mut global_names_elf: Vec<String> = module.globals.keys().cloned().collect();
         global_names_elf.sort();
+        let mut next_gs_off = 0usize;
         for name in &global_names_elf {
             let (ty, init_expr) = &module.globals[name];
             let off = rdata.data.len();
             let gsize = module.type_size(ty).max(8) as usize;
+            if module.cpu_locals.contains(name) {
+                self.cpu_local_offsets.insert(name.clone(), next_gs_off);
+                next_gs_off += (gsize + 7) & !7;
+            }
             let bytes: [u8; 8] = match init_expr {
                 crate::ast::Expr::IntLit(v) => (*v as i64).to_le_bytes(),
                 crate::ast::Expr::BoolLit(b) => (if *b { 1i64 } else { 0 }).to_le_bytes(),
@@ -2835,6 +2878,9 @@ impl PeCodeGen {
         for name in &func_names {
             let label = self.enc.alloc_label();
             self.func_labels.insert(name.clone(), label);
+            if module.functions[name].is_panic_handler {
+                self.panic_handler = Some(name.clone());
+            }
         }
         // Pre-allocate labels for runtime stubs (only the ones we can generate without imports)
         for stub in &["p_print_int", "p_print_str", "p_print_bool", "p_print_float",
@@ -2897,7 +2943,7 @@ impl PeCodeGen {
         self.gen_entry_point();
 
         // 7. Resolve labels
-        self.enc.resolve_labels();
+        self.enc.resolve_labels(&self.func_labels);
 
         // 8. Compute rdata RVA
         let rdata_rva = BARE_LOAD_RVA + align_up(self.enc.code.len() as u32, SECTION_ALIGN);
@@ -2969,10 +3015,15 @@ impl PeCodeGen {
         // Critical for bare-metal: GDT, IDT, page tables need fixed storage.
         let mut global_names: Vec<String> = module.globals.keys().cloned().collect();
         global_names.sort();
+        let mut next_gs_off = 0usize;
         for name in &global_names {
             let (ty, init_expr) = &module.globals[name];
             let off = rdata.data.len();
             let gsize = module.type_size(ty).max(8) as usize;
+            if module.cpu_locals.contains(name) {
+                self.cpu_local_offsets.insert(name.clone(), next_gs_off);
+                next_gs_off += (gsize + 7) & !7;
+            }
             let bytes: [u8; 8] = match init_expr {
                 crate::ast::Expr::IntLit(v) => (*v as i64).to_le_bytes(),
                 crate::ast::Expr::BoolLit(b) => (if *b { 1i64 } else { 0 }).to_le_bytes(),
@@ -2993,6 +3044,9 @@ impl PeCodeGen {
         for name in &func_names {
             let label = self.enc.alloc_label();
             self.func_labels.insert(name.clone(), label);
+            if module.functions[name].is_panic_handler {
+                self.panic_handler = Some(name.clone());
+            }
         }
         for stub in &["p_print_int", "p_print_str", "p_print_bool", "p_print_float",
                        "p_panic", "p_malloc", "p_free", "p_memset",
@@ -3052,7 +3106,7 @@ impl PeCodeGen {
         self.gen_runtime_stubs();
 
         // 7. Resolve labels
-        self.enc.resolve_labels();
+        self.enc.resolve_labels(&self.func_labels);
 
         // 8. Compute rdata RVA
         let rdata_rva = BARE_LOAD_RVA + align_up(self.enc.code.len() as u32, SECTION_ALIGN);
@@ -4116,9 +4170,22 @@ impl PeCodeGen {
             }
 
             Inst::GlobalAddr { name, .. } => {
-                // lea rax, [rip + global_offset]
-                let off = *self.global_rdata_offsets.get(name).unwrap_or(&0);
-                self.enc.lea_rip(Reg::Rax, off);
+                let gs_off = if self.bare_mode {
+                    self.cpu_local_offsets.get(name).copied()
+                } else {
+                    None
+                };
+                if let Some(off) = gs_off {
+                    // @cpu_local: per-CPU storage - lea rax, gs:[disp32]
+                    // (0x65 = GS prefix; the kernel sets GS.base to the
+                    // compiler-defined per-CPU block on each CPU).
+                    self.enc.emit(&[0x65, 0x48, 0x8D, 0x04, 0x25]);
+                    self.enc.emit_i32(off as i32);
+                } else {
+                    // lea rax, [rip + global_offset]
+                    let off = *self.global_rdata_offsets.get(name).unwrap_or(&0);
+                    self.enc.lea_rip(Reg::Rax, off);
+                }
                 self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
             }
 
@@ -4864,7 +4931,10 @@ impl PeCodeGen {
                 let off = self.str_off(message);
                 self.enc.lea_rip(Reg::Rcx, off);
                 self.enc.sub_rsp_i32(32);
-                if let Some(&flabel) = self.func_labels.get("p_panic") {
+                // A @panic_handler fn receives the message instead of the
+                // runtime stub — the bare-metal kernel owns the panic path.
+                let target = self.panic_handler.as_deref().unwrap_or("p_panic");
+                if let Some(&flabel) = self.func_labels.get(target) {
                     self.enc.call_label(flabel);
                 }
                 self.enc.add_rsp_i32(32);
@@ -7509,6 +7579,19 @@ impl PeCodeGen {
             self.enc.xor_rr(Reg::Rcx, Reg::Rcx);
             self.enc.emit(&[0x4C, 0x8D, 0x4C, 0x24, 0x18]); // lea r9, [rsp+24]
             let target = self.func_labels["pert_co_async_v"];
+            self.enc.jmp_label(target);
+        }
+        // p_co_spawn(name, nargs, args...): same shape as p_co_async —
+        // `spawn f(args)` becomes a green task (M3).
+        if self.func_labels.contains_key("p_co_spawn") {
+            self.place_fn("p_co_spawn");
+            self.enc.mov_mem_disp_reg(Reg::Rsp, 24, Reg::R8);
+            self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::R9);
+            self.enc.mov_rr(Reg::R8, Reg::Rdx);
+            self.enc.mov_rr(Reg::Rdx, Reg::Rcx);
+            self.enc.xor_rr(Reg::Rcx, Reg::Rcx);
+            self.enc.emit(&[0x4C, 0x8D, 0x4C, 0x24, 0x18]); // lea r9, [rsp+24]
+            let target = self.func_labels["pert_co_spawn_v"];
             self.enc.jmp_label(target);
         }
         // p_executor_spawn(exec, name, nargs, args...): likewise, from the
@@ -10606,6 +10689,18 @@ pub fn generate_pe_opts(module: &IrModule, debug_file: Option<&str>) -> Result<V
         return Err(vec![format!(
             "PE backend: not available in native Windows executables: {} (build with `fidesc ccompile` instead)",
             names.join(", ")
+        )]);
+    }
+    if !gen.cpu_local_offsets.is_empty() {
+        // GS-segment addressing only exists when the kernel owns GS.base
+        // (bare-metal builds). On a hosted Windows .exe GS points at the
+        // TEB - there is no per-CPU region to use. Reject instead of
+        // silently treating @cpu_local as a plain global.
+        let mut locals: Vec<String> = gen.cpu_local_offsets.keys().cloned().collect();
+        locals.sort();
+        return Err(vec![format!(
+            "PE backend: @cpu_local on {} is only supported in bare-metal/kernel builds              (hosted Windows has no per-CPU GS region; `fidesc ccompile` maps it to _Thread_local)",
+            locals.join(", ")
         )]);
     }
     Ok(bytes)

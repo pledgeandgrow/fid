@@ -5485,6 +5485,15 @@ impl Interpreter {
                 }
             }
             "p_co_async" => self.call_runtime("p_thread_spawn", args),
+            // p_co_spawn(name, nargs, args...) — `spawn f()` (M3). Same
+            // signature as p_thread_spawn; interp runs it eagerly either way.
+            "p_co_spawn" => self.call_runtime("p_thread_spawn", args),
+            // p_co_tick() — loop-backedge safepoint (M5). One call stack here:
+            // nothing to yield to, so it is a no-op.
+            "p_co_tick" => ExecOutcome::Value(Value::Void),
+            // p_co_pool_call(name, nargs, argv) — blocking-pool routing only
+            // exists in the native runtime; interp has no pool.
+            "p_co_pool_call" => ExecOutcome::Value(Value::Int(0)),
             "p_co_sleep" => {
                 if let Some(Value::Int(ms)) = args.first() {
                     std::thread::sleep(std::time::Duration::from_millis((*ms).max(0) as u64));

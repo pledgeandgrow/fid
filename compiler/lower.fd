@@ -5878,7 +5878,18 @@ fn Lowerer_lower_try_expr(self: &mut Lowerer, e: Box<Expr>) -> i64 {
         Lowerer_emit_drops(self);
         Lowerer_emit_defers(self);
         match self.current_sret {
-            OptValueId::Some(_) => {
+            OptValueId::Some(sret) => {
+                // Struct return: the caller reads the result from its
+                // out-param, so copy tag and payload there (as src/lower.rs);
+                // a bare return left the caller's buffer as it was
+                var e_tag_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(val, 0, IrType::I64));
+                var e_tag: i64 = Lowerer_emit_inst(self, Inst::Load(e_tag_ptr, IrType::I64));
+                var r_tag_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(sret, 0, IrType::I64));
+                Lowerer_emit_inst(self, Inst::Store(r_tag_ptr, e_tag, OptIrType::None));
+                var e_val_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(val, 1, IrType::I64));
+                var e_val: i64 = Lowerer_emit_inst(self, Inst::Load(e_val_ptr, IrType::I64));
+                var r_val_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(sret, 1, IrType::I64));
+                Lowerer_emit_inst(self, Inst::Store(r_val_ptr, e_val, OptIrType::None));
                 Lowerer_emit_terminator(self, Inst::Return(OptValueId::None));
             }
             OptValueId::None => {

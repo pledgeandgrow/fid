@@ -792,6 +792,8 @@ pub struct GlobalVar {
     pub ty: Type,
     pub init: Expr,
     pub is_pub: bool,
+    /// Annotations attached to this global (e.g. @cpu_local).
+    pub annotations: Vec<Annotation>,
 }
 
 #[derive(Debug, Clone)]

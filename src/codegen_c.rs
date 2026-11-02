@@ -755,6 +755,9 @@ impl CCodeGen {
             ("p_co_done", &[I64]),
             ("p_co_result", &[I64]),
             ("p_co_async", &[p(), I64]),
+            ("p_co_spawn", &[p(), I64]),
+            ("p_co_tick", &[]),
+            ("p_co_pool_call", &[p(), I64, I64]),
             ("p_co_sleep", &[I64]),
             ("p_co_wait_fd", &[I64, I64, I64]),
             ("p_co_detach", &[I64]),
@@ -884,15 +887,26 @@ impl CCodeGen {
         wln!(self, "#include <string.h>");
         wln!(self, "#ifndef _WIN32");
         wln!(self, "#include <alloca.h>");
+        wln!(self, "#else");
+        wln!(self, "#include <malloc.h>");
+        wln!(self, "#define alloca _alloca");
         wln!(self, "#endif");
         wln!(self, "#include <stdint.h>");
         wln!(self, "#include <stdbool.h>");
         wln!(self, "#include <ctype.h>");
+        wln!(self, "#ifdef _MSC_VER");
+        wln!(self, "#define _USE_MATH_DEFINES");
+        wln!(self, "#include <BaseTsd.h>");
+        wln!(self, "typedef SSIZE_T ssize_t;");
+        wln!(self, "#endif");
         wln!(self, "#include <math.h>");
         // Socket support for native HTTP server (Phase 5D)
         wln!(self, "#ifdef _WIN32");
         wln!(self, "#include <winsock2.h>");
         wln!(self, "#include <ws2tcpip.h>");
+        wln!(self, "#ifdef _MSC_VER");
+        wln!(self, "#pragma comment(lib, \"ws2_32.lib\")");
+        wln!(self, "#endif");
         wln!(self, "#include <io.h>");
         wln!(self, "#include <fcntl.h>");
         wln!(self, "// PLINK: ws2_32");
@@ -1408,6 +1422,9 @@ impl CCodeGen {
         wln!(self, "int64_t p_co_done(int64_t t);");
         wln!(self, "int64_t p_co_result(int64_t t);");
         wln!(self, "int64_t p_co_async(const char* name, int64_t nargs, ...);");
+        wln!(self, "int64_t p_co_spawn(const char* name, int64_t nargs, ...);");
+        wln!(self, "void p_co_tick(void);");
+        wln!(self, "int64_t p_co_pool_call(const char* name, int64_t nargs, const int64_t* argv);");
         wln!(self, "int64_t p_co_sleep(int64_t ms);");
         wln!(self, "int64_t p_co_wait_fd(int64_t fd, int64_t write, int64_t timeout_ms);");
         wln!(self, "void p_co_detach(int64_t t);");
@@ -1542,7 +1559,10 @@ impl CCodeGen {
                 IrType::Array(_, _) => "{0}".to_string(),
                 _ => self.gen_global_init_expr(init, ty),
             };
-            wln!(self, "static {} {} = {};", c_ty, c_name, init_str);
+            // @cpu_local maps to thread-local storage — the closest hosted
+            // semantic to per-CPU GS-relative addressing.
+            let tls = if module.cpu_locals.contains(name) { "_Thread_local " } else { "" };
+            wln!(self, "static {}{} {} = {};", tls, c_ty, c_name, init_str);
         }
         wln!(self, "");
     }
@@ -3939,6 +3959,38 @@ impl CCodeGen {
         wln!(self, "    __p_co_enter(c);");
         wln!(self, "    return (int64_t)((uint64_t)__P_CO_TAG << 48 | (uint64_t)(uintptr_t)c);");
         wln!(self, "}}");
+        // p_co_spawn(name, nargs, args...): `spawn f()` — a green task (M3).
+        // Runs to its first yield immediately, like p_co_async.
+        wln!(self, "int64_t p_co_spawn(const char* name, int64_t nargs, ...) {{");
+        wln!(self, "    va_list ap; va_start(ap, nargs);");
+        wln!(self, "    int64_t args[8];");
+        wln!(self, "    for (int64_t i = 0; i < nargs && i < 8; i++) args[i] = va_arg(ap, int64_t);");
+        wln!(self, "    va_end(ap);");
+        wln!(self, "    __p_co* c = __p_co_new(name, nargs, args);");
+        wln!(self, "    c->back = __p_co_cur;");
+        wln!(self, "    __p_co_enter(c);");
+        wln!(self, "    return (int64_t)((uint64_t)__P_CO_TAG << 48 | (uint64_t)(uintptr_t)c);");
+        wln!(self, "}}");
+        // p_co_tick(): loop-backedge safepoint (M5) — yield when a sibling
+        // task waits for this thread's single scheduler.
+        wln!(self, "void p_co_tick(void) {{ if (__p_co_cur && __p_co_count > 1) __p_co_leave(); }}");
+        // p_co_pool_call(name, nargs, argv): the blocking pool exists only in
+        // the native Windows runtime — run the call inline here.
+        wln!(self, "int64_t p_co_pool_call(const char* name, int64_t nargs, const int64_t* argv) {{");
+        wln!(self, "    int64_t (*fn)() = NULL;");
+        wln!(self, "    for (int i = 0; i < p_thread_entry_count; i++) {{");
+        wln!(self, "        if (strcmp(p_thread_entries[i].name, name) == 0) {{ fn = p_thread_entries[i].fn; break; }}");
+        wln!(self, "    }}");
+        wln!(self, "    if (!fn) {{ p_panic(\"pool call: no such function\"); return 0; }}");
+        wln!(self, "    const int64_t* a = argv;");
+        wln!(self, "    switch (nargs) {{");
+        wln!(self, "        case 0: return ((int64_t (*)(void*))fn)(NULL);");
+        wln!(self, "        case 1: return ((int64_t (*)(void*, int64_t))fn)(NULL, a[0]);");
+        wln!(self, "        case 2: return ((int64_t (*)(void*, int64_t, int64_t))fn)(NULL, a[0], a[1]);");
+        wln!(self, "        case 3: return ((int64_t (*)(void*, int64_t, int64_t, int64_t))fn)(NULL, a[0], a[1], a[2]);");
+        wln!(self, "        default: return ((int64_t (*)(void*, int64_t, int64_t, int64_t, int64_t))fn)(NULL, a[0], a[1], a[2], a[3]);");
+        wln!(self, "    }}");
+        wln!(self, "}}");
         wln!(self, "void p_co_yield(void) {{ if (__p_co_cur) __p_co_leave(); }}");
         wln!(self, "int64_t p_co_run(void) {{");
         wln!(self, "    for (;;) {{");
@@ -4160,6 +4212,9 @@ impl CCodeGen {
         wln!(self, "        p_task_results[i] = (int64_t)(intptr_t)ret;");
         wln!(self, "        p_thread_handles[i] = 0; count++;");
         wln!(self, "    }");
+        // spawn f() is a green task (M3): run every live task out before the
+        // scope exits, then count the joined ones.
+        wln!(self, "    count += p_co_run();");
         wln!(self, "    return count;");
         wln!(self, "}");
         // A2: Non-blocking poll — returns PENDING_SENTINEL if task not done

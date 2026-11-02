@@ -252,6 +252,16 @@ pub enum Result<T, E> {
 impl Result {
 ```
 
+Besides `is_ok`, `unwrap`, `map` and the rest:
+
+- `context(msg: str) -> Result`: for an error that is a `str`, `Err(e)` becomes
+  `Err("msg: e")`; `Ok` goes through as it is (nothing is built).
+- `with_context(f: fn() -> str) -> Result`: the same, with the message made by
+  `f`, called only on `Err`.
+
+`Option` has `context(msg: str) -> Result`: `Some(v)` is `Ok(v)`, `None` is
+`Err(msg)`, so `?` can pass a missing value up as an error.
+
 *Defined at line 131*
 
 ---

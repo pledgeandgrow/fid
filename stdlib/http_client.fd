@@ -90,17 +90,15 @@ fn hc_dechunk(raw: str) -> str {
         var size: i64 = 0;
         if str_len(sizestr) > 0 { size = str_parse_hex("0x" + sizestr); }
         if size <= 0 { break; }
-        // skip CRLF
-        while eol < n && (str_byte_at(raw, eol) == 13 || str_byte_at(raw, eol) == 10) {
-            eol = eol + 1;
-        }
+        // skip the size line's CRLF (only that: the data may start with one)
+        if eol < n && str_byte_at(raw, eol) == 13 { eol = eol + 1; }
+        if eol < n && str_byte_at(raw, eol) == 10 { eol = eol + 1; }
         if eol + size > n { size = n - eol; }
         out = out + str_slice(raw, eol, eol + size);
         i = eol + size;
-        // skip trailing CRLF after chunk
-        while i < n && (str_byte_at(raw, i) == 13 || str_byte_at(raw, i) == 10) {
-            i = i + 1;
-        }
+        // skip the CRLF that ends the chunk
+        if i < n && str_byte_at(raw, i) == 13 { i = i + 1; }
+        if i < n && str_byte_at(raw, i) == 10 { i = i + 1; }
     }
     return out;
 }
@@ -174,8 +172,10 @@ pub fn http_request(method: str, host: str, port: i64, path: str,
 
     var p: str = path;
     if str_len(p) == 0 { p = "/"; }
+    var host_hdr: str = host;
+    if port != 80 { host_hdr = host + ":" + int_to_str(port); }
     var req: str = method + " " + p + " HTTP/1.1\r\n" +
-                   "Host: " + host + "\r\n" +
+                   "Host: " + host_hdr + "\r\n" +
                    "User-Agent: fides-http/1.0\r\n" +
                    "Accept: */*\r\n" +
                    "Connection: close\r\n";
@@ -219,10 +219,11 @@ pub fn http_head(host: str, port: i64, path: str) -> HttpResponse {
 pub fn http_get_url(u: str) -> HttpResponse {
     var pu: Url = url_parse(u);
     if str_equal(pu.scheme, "https") { return hc_response(0); }
+    if str_len(pu.host) == 0 { return hc_response(0); }
     var host: str = pu.host;
     var port: i64 = pu.port;
     if port < 0 { port = 80; }
-    var path: str = pu.path;
+    var path: str = url_encode_path(pu.path);
     if str_len(pu.query) > 0 { path = path + "?" + pu.query; }
     return http_get(host, port, path);
 }
@@ -231,9 +232,10 @@ pub fn http_get_url(u: str) -> HttpResponse {
 pub fn http_post_url(u: str, content_type: str, body: str) -> HttpResponse {
     var pu: Url = url_parse(u);
     if str_equal(pu.scheme, "https") { return hc_response(0); }
+    if str_len(pu.host) == 0 { return hc_response(0); }
     var port: i64 = pu.port;
     if port < 0 { port = 80; }
-    var path: str = pu.path;
+    var path: str = url_encode_path(pu.path);
     if str_len(pu.query) > 0 { path = path + "?" + pu.query; }
     return http_post(pu.host, port, path, content_type, body);
 }

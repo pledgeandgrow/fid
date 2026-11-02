@@ -59,15 +59,16 @@ pub fn MutBorrowEntry_new(key: str, borrower: OptStr) -> MutBorrowEntry {
     return MutBorrowEntry { key: key, borrower: borrower };
 }
 
-// borrow_of: borrower -> (borrowed_var, is_mut)
+// borrow_of: borrower -> (borrowed_var, is_mut, line the borrow was made on)
 pub struct BorrowOfEntry {
     pub borrower: str,
     pub borrowed: str,
     pub is_mut: bool,
+    pub line: i64,
 }
 
-pub fn BorrowOfEntry_new(borrower: str, borrowed: str, is_mut: bool) -> BorrowOfEntry {
-    return BorrowOfEntry { borrower: borrower, borrowed: borrowed, is_mut: is_mut };
+pub fn BorrowOfEntry_new(borrower: str, borrowed: str, is_mut: bool, line: i64) -> BorrowOfEntry {
+    return BorrowOfEntry { borrower: borrower, borrowed: borrowed, is_mut: is_mut, line: line };
 }
 
 // reserved_mut_borrows: Vec<(path, borrower, line)>
@@ -212,6 +213,9 @@ pub struct BorrowChecker {
     // Counter for synthetic temporary borrower names (e.g. __tmp_ref_0).
     pub temp_counter: i64,
 
+    // Line of the statement being checked (expressions carry none).
+    pub stmt_line: i64,
+
     // Stack of checkpoints -- each records temp_counter at the start of a
     // Call/MethodCall. After the call, all temps >= checkpoint are released.
     pub temp_checkpoints: Vec<i64>,
@@ -251,6 +255,7 @@ pub fn BorrowChecker_new(mode: BorrowckMode) -> BorrowChecker {
         unsafe_depth: 0,
         current_func: OptStr::None,
         temp_counter: 0,
+        stmt_line: 0,
         temp_checkpoints: Vec::new(),
         reserved_mut_borrows: Vec::new(),
         in_reservation_phase: false,
@@ -1131,7 +1136,7 @@ fn mut_borrow_set(self: &mut BorrowChecker, key: str, borrower: OptStr) -> void 
     self.mut_borrow.push(MutBorrowEntry_new(key, borrower));
 }
 
-fn borrow_of_add(self: &mut BorrowChecker, borrower: str, borrowed: str, is_mut: bool) -> void {
+fn borrow_of_add(self: &mut BorrowChecker, borrower: str, borrowed: str, is_mut: bool, line: i64) -> void {
     // Remove existing entry for this borrower if any (reassignment).
     var i: i64 = 0;
     while i < self.borrow_of.len() {
@@ -1141,7 +1146,44 @@ fn borrow_of_add(self: &mut BorrowChecker, borrower: str, borrowed: str, is_mut:
         }
         i = i + 1;
     }
-    self.borrow_of.push(BorrowOfEntry_new(borrower, borrowed, is_mut));
+    self.borrow_of.push(BorrowOfEntry_new(borrower, borrowed, is_mut, line));
+}
+
+// CM2: which borrow holds `path` (or a field of it, or what it is a field
+// of), and the change that frees it. want: 1 a mutable borrow, 0 a shared
+// one. The latest such borrow is named (as src/borrowck.rs holder_note).
+fn holder_note(self: &BorrowChecker, path: str, want: i64) -> str {
+    var best: i64 = -1;
+    var i: i64 = 0;
+    while i < self.borrow_of.len() {
+        var e: BorrowOfEntry = self.borrow_of.get(i);
+        var related: bool = e.borrowed == path || str_starts_with(e.borrowed, path + ".") || str_starts_with(path, e.borrowed + ".");
+        var kind_ok: bool = (want == 1) == e.is_mut;
+        if related && kind_ok {
+            if best < 0 {
+                best = i;
+            } else {
+                var b: BorrowOfEntry = self.borrow_of.get(best);
+                if e.line > b.line || (e.line == b.line && str_compare(e.borrower, b.borrower) > 0) { best = i; }
+            }
+        }
+        i = i + 1;
+    }
+    if best < 0 { return ""; }
+    var h: BorrowOfEntry = self.borrow_of.get(best);
+    var kind: str = "&";
+    if h.is_mut { kind = "&mut "; }
+    var who: str = "'" + h.borrower + "'";
+    var fix: str = "use '" + h.borrower + "' for the last time before this line, or declare it in an inner block { ... } that ends first";
+    if str_starts_with(h.borrower, "__tmp_ref_") {
+        who = "a reference made earlier in this statement";
+        fix = "take that reference in a statement of its own, or copy the value into a local first";
+    } else if str_starts_with(h.borrower, "__closure_capture_") {
+        var cap: str = str_slice(h.borrower, 18, str_len(h.borrower));
+        who = "a closure that captures '" + cap + "'";
+        fix = "call the closure for the last time before this line, or pass the value to it as an argument";
+    }
+    return "\n    Held by: " + who + " (" + kind + h.borrowed + ", line " + int_to_str(h.line) + ").\n    Fix: " + fix + ".";
 }
 
 // --- The three rules ------------------------------------------------------
@@ -1157,13 +1199,13 @@ fn create_borrow(self: &mut BorrowChecker, borrowed_path: str, borrower: str, is
             if has_shared_borrow_inclusive(self, borrowed_path)
                 || has_shared_borrow_on_prefix(self, borrowed_path)
             {
-                violation(self, line, "cannot create &mut " + borrowed_path + ": shared borrow(s) already active on it or a related path");
+                violation(self, line, "cannot create &mut " + borrowed_path + ": shared borrow(s) already active on it or a related path" + holder_note(self, borrowed_path, 0));
                 return;
             }
             if has_mut_borrow_inclusive(self, borrowed_path)
                 || has_mut_borrow_on_prefix(self, borrowed_path)
             {
-                violation(self, line, "cannot create &mut " + borrowed_path + ": a mutable borrow is already active on it or a related path");
+                violation(self, line, "cannot create &mut " + borrowed_path + ": a mutable borrow is already active on it or a related path" + holder_note(self, borrowed_path, 1));
                 return;
             }
             // Check for conflicts with other reserved &mut on the same path.
@@ -1174,14 +1216,14 @@ fn create_borrow(self: &mut BorrowChecker, borrowed_path: str, borrower: str, is
                     || str_starts_with(existing_path, borrowed_path + ".")
                     || str_starts_with(borrowed_path, existing_path + ".")
                 {
-                    violation(self, line, "cannot create &mut " + borrowed_path + ": a mutable borrow is already reserved on it or a related path");
+                    violation(self, line, "cannot create &mut " + borrowed_path + ": a mutable borrow is already reserved on it or a related path" + holder_note(self, borrowed_path, 1));
                     return;
                 }
                 i = i + 1;
             }
             // Reserve the borrow -- don't activate it yet.
             self.reserved_mut_borrows.push(ReservedMutBorrow_new(borrowed_path, borrower, line));
-            borrow_of_add(self, borrower, borrowed_path, is_mut);
+            borrow_of_add(self, borrower, borrowed_path, is_mut, line);
             return;
         }
 
@@ -1189,13 +1231,13 @@ fn create_borrow(self: &mut BorrowChecker, borrowed_path: str, borrower: str, is
         if has_shared_borrow_inclusive(self, borrowed_path)
             || has_shared_borrow_on_prefix(self, borrowed_path)
         {
-            violation(self, line, "cannot create &mut " + borrowed_path + ": shared borrow(s) already active on it or a related path");
+            violation(self, line, "cannot create &mut " + borrowed_path + ": shared borrow(s) already active on it or a related path" + holder_note(self, borrowed_path, 0));
             return;
         }
         if has_mut_borrow_inclusive(self, borrowed_path)
             || has_mut_borrow_on_prefix(self, borrowed_path)
         {
-            violation(self, line, "cannot create &mut " + borrowed_path + ": a mutable borrow is already active on it or a related path");
+            violation(self, line, "cannot create &mut " + borrowed_path + ": a mutable borrow is already active on it or a related path" + holder_note(self, borrowed_path, 1));
             return;
         }
         mut_borrow_set(self, borrowed_path, OptStr::Some(borrower));
@@ -1205,12 +1247,12 @@ fn create_borrow(self: &mut BorrowChecker, borrowed_path: str, borrower: str, is
         if has_mut_borrow(self, borrowed_path)
             || has_mut_borrow_on_prefix(self, borrowed_path)
         {
-            violation(self, line, "cannot create &" + borrowed_path + ": a mutable borrow is already active on it or a parent path");
+            violation(self, line, "cannot create &" + borrowed_path + ": a mutable borrow is already active on it or a parent path" + holder_note(self, borrowed_path, 1));
             return;
         }
         shared_borrows_add_borrower(self, borrowed_path, borrower);
     }
-    borrow_of_add(self, borrower, borrowed_path, is_mut);
+    borrow_of_add(self, borrower, borrowed_path, is_mut, line);
 }
 
 // Phase 4: Activate all reserved &mut borrows. Called after all call
@@ -1225,7 +1267,7 @@ fn activate_reserved_borrows(self: &mut BorrowChecker) -> void {
         if has_shared_borrow_inclusive(self, r.path)
             || has_shared_borrow_on_prefix(self, r.path)
         {
-            violation(self, r.line, "cannot activate &mut " + r.path + ": shared borrow(s) are still active on it or a related path");
+            violation(self, r.line, "cannot activate &mut " + r.path + ": shared borrow(s) are still active on it or a related path" + holder_note(self, r.path, 0));
             i = i + 1;
             continue;
         }
@@ -1238,10 +1280,10 @@ fn activate_reserved_borrows(self: &mut BorrowChecker) -> void {
 // any field path under it.
 fn check_mutation(self: &mut BorrowChecker, var: str, line: i64) -> void {
     if has_shared_borrow_inclusive(self, var) {
-        violation(self, line, "cannot mutate " + var + ": shared borrow(s) are active on it or its fields");
+        violation(self, line, "cannot mutate " + var + ": shared borrow(s) are active on it or its fields" + holder_note(self, var, 0));
     }
     if has_mut_borrow_inclusive(self, var) {
-        violation(self, line, "cannot mutate " + var + ": a mutable borrow is active on it or its fields");
+        violation(self, line, "cannot mutate " + var + ": a mutable borrow is active on it or its fields" + holder_note(self, var, 1));
     }
 }
 
@@ -1267,6 +1309,7 @@ fn violation(self: &mut BorrowChecker, line: i64, msg: str) -> void {
 // --- Statement walker -----------------------------------------------------
 
 fn check_stmt(self: &mut BorrowChecker, stmt: Stmt) -> void {
+    self.stmt_line = stmt_line(stmt);
     match stmt {
         Stmt::Let(name, _, expr, _, _, _, line) => {
             // Check the initializer first (it may borrow from other vars).
@@ -1687,7 +1730,7 @@ fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
             release_temps_since(self, checkpoint);
             // Now check the receiver mutation (after args are consumed).
             match receiver_path {
-                OptStr::Some(name) => { check_mutation(self, name, 0); }
+                OptStr::Some(name) => { check_mutation(self, name, self.stmt_line); }
                 OptStr::None => {}
             }
         }

@@ -11,6 +11,8 @@ This starts where [release-roadmap.md](release-roadmap.md) stops. That roadmap
 makes every promise of 1.0.0 true. This one asks a harder question: why would
 someone choose Fides over a language with fifteen years of production use?
 Goals already in the release roadmap are named here, not repeated.
+[complaint-roadmap.md](complaint-roadmap.md) starts from the other side: what
+developers complain about in the languages they use today.
 
 ## What maturity is
 
@@ -188,7 +190,12 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
 - [ ] RT10. Tasks across all cores: M:N scheduling with work stealing (XL).
 - [ ] RT11. IOCP on Windows, epoll on Linux, kqueue on macOS, replacing the O(n) poll
       loop (L).
-- [ ] RT12. A timer heap, so 100,000 sleeping tasks cost nothing (M).
+- [~] RT12. A timer heap, so 100,000 sleeping tasks cost nothing (M).
+      Done on the PE path: `pe_runtime/conc.fd` arms deadlines in a min-heap
+      (indexed removal, so finishing tasks can't dangle) and keeps fd/join/
+      pool waiters in a separate registry — the poller no longer scans live
+      task blocks to find expirations. Left: interp/C-path schedulers still
+      use their own waits; no 100k-sleeper benchmark yet.
 - [~] RT13. Growable task stacks, or checked stack limits with a clear panic (L).
       Done on the C path: the OS guard page with a handler that reports the
       overflow, a guard page under every POSIX task stack. Left: native.
@@ -202,8 +209,15 @@ one machine; 100,000 requests/s on one core.
 
 This is the race we can win outright, since no rival's speed comes for free.
 
-- [ ] CS1. `emit` of hello world under 0.5 s (release D9), then under 0.1 s (L).
-- [ ] CS2. Cache the checked stdlib in a binary form, not re-parsed each build (L).
+- [~] CS1. `emit` of hello world under 0.5 s (release D9), then under 0.1 s (L).
+      Done: ~360 ms (Nov 2, fidesc). Left: the 0.1 s stretch — needs CS2's full
+      cache (comptime alone is ~90 ms) plus backend work.
+- [~] CS2. Cache the checked stdlib in a binary form, not re-parsed each build (L).
+      Done: trusted-module fast path — the baked-in core.fd and backend runtime
+      skip per-function body checks and error reporting (~26 ms off hello's
+      frontend; FIDES_CHECK_STDLIB restores full checking). Left: a real binary
+      artifact skipping parse and the whole-program analyses, and caching
+      stdlib comptime output (~90 ms — the biggest single pass).
 - [ ] CS3. Borrow checking linear in program size (release D8) (M).
 - [~] CS4. Self-compile under 60 s (release), then under 10 s (L). 112–137 s on
       Nov 2, from 601 s (release D10, D11). Next: string compares in method lookup and the
@@ -291,14 +305,17 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
 - [ ] LG8. Sum types and pattern matching with guards, nesting and exhaustiveness in
       every position (M).
 - [ ] LG9. Hygienic macros, or a comptime that covers what they do (L).
-- [ ] LG10. Error handling with context and no allocation on the happy path (M).
+- [x] LG10. Error handling with context and no allocation on the happy path (M).
+      `Result.context(msg)`, `with_context(f)`, `Option.context(msg)` (complaint
+      CE1).
 - [ ] LG11. Structured concurrency with cancellation and timeouts (L).
 - [ ] LG12. A defined memory model for atomics (L).
 - [ ] LG13. Inline assembly on every native target (M).
 - [ ] LG14. `async` for every argument type, and async traits (release H9) (L).
 - [ ] LG15. C interop without bindings: `@import("header.h")`, as Zig does (L).
 - [ ] LG16. C++ interop for the common cases (XL).
-- [ ] LG17. Every annotation works or is removed (release K8) (M).
+- [~] LG17. Every annotation works or is removed (release K8) (M).
+      Done: `@bounded-stack`. Left: `@tainted`.
 
 **Acceptance:** each feature in the comparison table has a conformance test.
 
@@ -342,7 +359,12 @@ Go and Rust won developers with tools as much as with languages.
 - [ ] TL3. `fid fix`: applies suggested fixes, and upgrades code between versions (L).
 - [ ] TL4. LSP complete: references, rename, formatting, signature help, inlay
       hints, code actions (release N7 is the start) (L).
-- [ ] TL5. Debugger support with line tables on every platform (release N9) (L).
+- [~] TL5. Debugger support with line tables on every platform (release N9) (L).
+     Done: `-g`/`--debug` on `fidesc emit`/`build`/`ccompile` — PE gets
+     `.debug_abbrev/.debug_info/.debug_line/.debug_str` (DWARF v4, per-instruction
+     line tables); the C backend emits `#line` back to `.fd` source and passes
+     `-g` to the C compiler. Left: port DWARF emission to `compiler/*.fd`
+     (self-hosted `fid` doesn't emit it), variable/location DIEs, ELF/Mach-O.
 - [ ] TL6. Cross-compilation out of the box: `fid build --target linux-arm64` from
       any host, with no extra download (L).
 - [x] TL7. Profiler output readable by standard tools (M).

@@ -1075,6 +1075,9 @@ pub struct IrFunction {
     /// F23: Whether this function is @simd — enables aggressive loop vectorization.
     /// @simd functions get larger unroll limits and prefer SSE2/AVX/NEON instructions.
     pub is_simd: bool,
+    /// Whether this function is @panic_handler — it receives panic messages
+    /// instead of the runtime p_panic stub (bare-metal kernels).
+    pub is_panic_handler: bool,
 }
 
 impl IrFunction {
@@ -1105,6 +1108,7 @@ impl IrFunction {
             is_kernel: false,
             workgroup_size: [1, 1, 1],
             is_simd: false,
+            is_panic_handler: false,
         };
         // Create entry block
         func.new_block();
@@ -1301,6 +1305,9 @@ pub struct IrModule {
     /// I-6B: Set of @linear struct names. Propagated from the lowerer
     /// for use by alias analysis and other optimizations.
     pub linear_structs: std::collections::BTreeSet<String>,
+    /// Names of globals declared @cpu_local — accessed through the GS
+    /// segment (per-CPU storage) on native backends instead of .rdata.
+    pub cpu_locals: std::collections::BTreeSet<String>,
 }
 
 impl IrModule {
@@ -1317,6 +1324,7 @@ impl IrModule {
             trait_methods: std::collections::BTreeMap::new(),
             trait_impls: std::collections::BTreeMap::new(),
             linear_structs: std::collections::BTreeSet::new(),
+            cpu_locals: std::collections::BTreeSet::new(),
         }
     }
 

@@ -1,5 +1,35 @@
 # Fides Language Changelog
 
+## Session 40 — Memory and Error Tracks (Nov 2, 2026)
+
+- **Error context:** `Result.context(msg)`, `Result.with_context(f)`,
+  `Option.context(msg)`; nothing is built when there is no error.
+  `file_read_result(path) -> Result<str, str>`.
+- **`fid lint`** warns at each function that calls `unwrap()` or `expect()`
+  outside tests.
+- **`fid audit <file.fd>`** lists every `unsafe` block, `@unsafe` function and
+  `extern "C"` the program and its modules contain, with its `// SAFETY:`
+  comment (`--stdlib`, `--strict`). `audit` was an alias of `verify`.
+- **`fid run --leaks`** reports the blocks never freed, grouped by the
+  functions that allocated them; **`fid run --checked-alloc`** gives each block
+  its own pages, so a use after free or a write past the end faults at that
+  access (both build through C; also on `ccompile`).
+- **Borrow errors** name the borrow that holds the value (holder, kind, path,
+  line) and end with a `Fix:` line (both compilers). An error from a method
+  call (`v.push(2)` while `v` is borrowed) gives the statement's line; it said
+  line 0.
+- **Fewer cascades in `fid`:** an undefined name is reported once per function,
+  and arithmetic on an operand whose error is already reported adds none.
+- **`@bounded-stack`** is checked: no recursion and no call through a function
+  value in anything the function reaches.
+- **Fixed:** in `fid`, `?` in a function that returns its `Result` by struct
+  return returned without copying the error (the caller saw `Ok(0)`).
+- **Fixed:** null checks on runtime strings (`p_file_read`, `p_getenv`,
+  `p_argv`) in the stdlib and `fid` were `s == 0`, which `fid` compiles as a
+  text comparison; they are `(s as i64) == 0`. `os_argv`, `load_csv`,
+  `load_json`, `render_file`, `mesh_load_obj` and the asset loader no longer pass
+  a null `str` on.
+
 ## Session 39 — Tools, Process, Platforms (Nov 2, 2026)
 
 - **`fid check`** (and `fidesc check`): type, borrow and effect checks, no code

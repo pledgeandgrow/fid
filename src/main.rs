@@ -1571,9 +1571,10 @@ fn real_main() {
                                 "\"\"{}\" x64 >nul 2>&1 && \"{}\" {} {} /nologo /Fe:{} {}\"",
                                 vcvars, cc, cl_opt, z7, output, c_path
                             );
-                            process::Command::new("cmd")
-                                .args(["/C", &cmd_str])
-                                .output()
+                            // Pass the line verbatim: Command::args escapes each inner
+                            // '"' as '\"' which cmd's /C parser reads as a UNC path
+                            // ("the network path was not found").
+                            run_cmd_line(&cmd_str)
                         } else {
                             // No vcvarsall — try direct
                             let mut direct = process::Command::new(cc_prog);
@@ -4047,6 +4048,19 @@ fn find_cl() -> Option<String> {
         }
     }
     None
+}
+
+/// Run a composite `cmd /C` line. `Command::args` would escape each inner
+/// quote as `\"`, which cmd.exe parses as a UNC path (ERROR_BAD_NETPATH).
+#[cfg(windows)]
+fn run_cmd_line(line: &str) -> std::io::Result<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+    process::Command::new("cmd").arg("/C").raw_arg(line).output()
+}
+
+#[cfg(not(windows))]
+fn run_cmd_line(line: &str) -> std::io::Result<std::process::Output> {
+    process::Command::new("cmd").args(["/C", line]).output()
 }
 
 /// Find vcvarsall.bat by searching Visual Studio install paths

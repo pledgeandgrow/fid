@@ -702,6 +702,9 @@ pub struct TypeChecker {
     freed_regions: Vec<str>,
     cap_verified: Vec<str>,
     current_func_name: OptString,
+    // CE6: "fn:name" for each undefined name already reported, so that later
+    // uses of it in the same function add no error
+    reported_undefined: Vec<str>,
     // HashMaps: name -> slot + 1 in the table of the same name
     func_effects_index: i64,
     ho_param_effects_index: i64,
@@ -853,6 +856,7 @@ impl TypeChecker {
             freed_regions: Vec::new(),
             cap_verified: Vec::new(),
             current_func_name: OptString::None,
+            reported_undefined: Vec::new(),
             func_effects_index: HashMap_new(),
             ho_param_effects_index: HashMap_new(),
             item_modules_index: HashMap_new(),
@@ -1484,7 +1488,194 @@ pub fn TypeChecker_build_caches(self: &mut TypeChecker) -> void {
     self.caches_built = true;
 }
 
+// ─── Annotation whitelist + placement ────────────────────────────────────
+// Mirrors src/typechecker.rs::check_annotation_validity. The parser accepts
+// any `@name`; without this pass a typo is a silent no-op.
+// Target bits: fn=1, struct=2, param=4, local=8, global=16.
+
+fn annotation_target_mask(name: str) -> i64 {
+    if name == "deterministic" || name == "conserve" || name == "gas"
+        || name == "no-alloc" || name == "no-recursion" || name == "no-unbounded"
+        || name == "no-indirect" || name == "requires-audit" || name == "bounded"
+        || name == "bounded-stack" || name == "firmware" || name == "no-panic"
+        || name == "crashfree" || name == "medical" || name == "safety-critical"
+        || name == "autosar" || name == "dal-a" || name == "constant_time"
+        || name == "realtime" || name == "differentiable" || name == "quantized"
+        || name == "checkpoint" || name == "dp" || name == "shard" || name == "adapter"
+        || name == "audit" || name == "simd" || name == "interrupt" || name == "kernel"
+        || name == "shader" || name == "unsafe" || name == "test" || name == "allocator"
+        || name == "sanitizer" || name == "sink" || name == "declassify"
+        || name == "wrapping" || name == "panic_handler" {
+        return 1;
+    }
+    if name == "linear" || name == "send" || name == "sync" || name == "repr"
+        || name == "packed" || name == "derive" {
+        return 2;
+    }
+    if name == "cfg" { return 3; }                 // fn + struct
+    if name == "tainted" || name == "public" { return 4; }
+    if name == "secret" { return 13; }             // fn + param + local
+    if name == "zeroize" { return 8; }
+    if name == "cpu_local" { return 16; }
+    return 0;
+}
+
+fn annotation_targets_str(mask: i64) -> str {
+    var s: str = "";
+    if mask % 2 == 1 { s = s + "fn/"; }
+    if (mask / 2) % 2 == 1 { s = s + "struct/"; }
+    if (mask / 4) % 2 == 1 { s = s + "param/"; }
+    if (mask / 8) % 2 == 1 { s = s + "local/"; }
+    if (mask / 16) % 2 == 1 { s = s + "global/"; }
+    if str_len(s) > 0 { s = str_slice(s, 0, str_len(s) - 1); }
+    return s;
+}
+
+fn check_one_annotation_fd(self: &mut TypeChecker, a: Annotation, target: str, what: str) {
+    var mask: i64 = annotation_target_mask(a.name);
+    if mask == 0 {
+        self.errors.push("Unknown annotation '@" + a.name + "' on '" + what
+            + "': no compiler pass consumes this name\n    and it will be silently ignored. Check the spelling.");
+        return;
+    }
+    var bit: i64 = 0;
+    if target == "fn" { bit = 1; }
+    if target == "struct" { bit = 2; }
+    if target == "param" { bit = 4; }
+    if target == "local" { bit = 8; }
+    if target == "global" { bit = 16; }
+    if bit > 0 && (mask / bit) % 2 == 0 {
+        self.errors.push("Misplaced annotation '@" + a.name + "' on '" + what
+            + "': valid on " + annotation_targets_str(mask) + ", not " + target + ".");
+    }
+}
+
+fn check_ann_list_fd(self: &mut TypeChecker, anns: Vec<Annotation>, target: str, fname: str) {
+    var i: i64 = 0;
+    while i < anns.len() {
+        check_one_annotation_fd(self, anns.get(i), target, fname);
+        i = i + 1;
+    }
+}
+
+fn check_local_annotations_fd(self: &mut TypeChecker, stmts: Vec<Stmt>, fname: str) {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        var s: Stmt = stmts.get(i);
+        match s {
+            Stmt::Let(_, _, _, _, _, anns, _) => { check_ann_list_fd(self, anns, "local", fname); }
+            Stmt::LetUninit(_, _, anns, _) => { check_ann_list_fd(self, anns, "local", fname); }
+            Stmt::If(_, then_b, else_b, _) => {
+                check_local_annotations_fd(self, then_b, fname);
+                match else_b {
+                    OptStmts::Some(eb) => { check_local_annotations_fd(self, eb, fname); }
+                    OptStmts::None => {}
+                }
+            }
+            Stmt::While(_, body, _) => { check_local_annotations_fd(self, body, fname); }
+            Stmt::For(_, _, body, _) => { check_local_annotations_fd(self, body, fname); }
+            Stmt::Loop(body, _) => { check_local_annotations_fd(self, body, fname); }
+            Stmt::Defer(body, _) => { check_local_annotations_fd(self, body, fname); }
+            Stmt::Match(_, arms, _) => {
+                var ai: i64 = 0;
+                while ai < arms.len() {
+                    check_local_annotations_fd(self, arms.get(ai).body, fname);
+                    ai = ai + 1;
+                }
+            }
+            Stmt::Handle(body, handlers, _) => {
+                check_local_annotations_fd(self, body, fname);
+                var hi: i64 = 0;
+                while hi < handlers.len() {
+                    check_local_annotations_fd(self, handlers.get(hi).body, fname);
+                    hi = hi + 1;
+                }
+            }
+            Stmt::RegionBlock(_, _, _, _, _, body, _) => { check_local_annotations_fd(self, body, fname); }
+            Stmt::Sandbox(body, _) => { check_local_annotations_fd(self, body, fname); }
+            Stmt::Unsafe(body, _) => { check_local_annotations_fd(self, body, fname); }
+            Stmt::Txn(body, _) => { check_local_annotations_fd(self, body, fname); }
+            Stmt::ComptimeGen(body, _) => { check_local_annotations_fd(self, body, fname); }
+            Stmt::GradBlock(_, body, _) => { check_local_annotations_fd(self, body, fname); }
+            Stmt::Query(_, body, _) => { check_local_annotations_fd(self, body, fname); }
+            Stmt::Select(cases, def, _) => {
+                var ci: i64 = 0;
+                while ci < cases.len() {
+                    check_local_annotations_fd(self, cases.get(ci).body, fname);
+                    ci = ci + 1;
+                }
+                match def {
+                    OptStmts::Some(db) => { check_local_annotations_fd(self, db, fname); }
+                    OptStmts::None => {}
+                }
+            }
+            Stmt::Parallel(branches, _) => {
+                var bi: i64 = 0;
+                while bi < branches.len() {
+                    check_local_annotations_fd(self, branches.get(bi), fname);
+                    bi = bi + 1;
+                }
+            }
+            Stmt::SpawnScope(body, _) => { check_local_annotations_fd(self, body, fname); }
+            _ => {}
+        }
+        i = i + 1;
+    }
+}
+
+fn check_fn_annotations_fd(self: &mut TypeChecker, func: Func) {
+    check_ann_list_fd(self, func.annotations, "fn", func.name);
+    var pi: i64 = 0;
+    while pi < func.params.len() {
+        check_ann_list_fd(self, func.params.get(pi).annotations, "param", func.name);
+        pi = pi + 1;
+    }
+    check_local_annotations_fd(self, func.body, func.name);
+}
+
+pub fn TypeChecker_check_annotation_validity(self: &mut TypeChecker, program: Program) {
+    var i: i64 = 0;
+    while i < program.funcs.len() {
+        check_fn_annotations_fd(self, program.funcs.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < program.impls.len() {
+        var impl_: ImplDef = program.impls.get(i);
+        var mi: i64 = 0;
+        while mi < impl_.methods.len() {
+            check_fn_annotations_fd(self, impl_.methods.get(mi));
+            mi = mi + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < program.trait_impls.len() {
+        var ti: TraitImpl = program.trait_impls.get(i);
+        var tmi: i64 = 0;
+        while tmi < ti.methods.len() {
+            check_fn_annotations_fd(self, ti.methods.get(tmi));
+            tmi = tmi + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < program.structs.len() {
+        var sd: StructDef = program.structs.get(i);
+        check_ann_list_fd(self, sd.annotations, "struct", sd.name);
+        var fi: i64 = 0;
+        while fi < sd.fields.len() {
+            check_ann_list_fd(self, sd.fields.get(fi).annotations, "param", sd.name);
+            fi = fi + 1;
+        }
+        i = i + 1;
+    }
+}
+
 pub fn TypeChecker_check_bodies(self: &mut TypeChecker, program: Program) {
+    // Reject unknown / misplaced annotations before any pass consumes them —
+    // otherwise a typo is a silent no-op.
+    TypeChecker_check_annotation_validity(self, program);
     // Build O(1) lookup caches before checking (memoize type lookups)
     TypeChecker_build_caches(self);
     // Pre-pass: compute direct effects of each function
@@ -2659,6 +2850,173 @@ pub fn TypeChecker_verify_safety_annotations(self: &mut TypeChecker, program: Pr
         }
         nri = nri + 1;
     }
+    // @bounded-stack: no recursion and no call to an unknown target in
+    // anything the function can reach, so its stack depth has a bound.
+    var leaves: Vec<str> = Vec::new();
+    var lei: i64 = 0;
+    while lei < program.extern_decls.len() {
+        leaves.push(program.extern_decls.get(lei).pledge_name);
+        lei = lei + 1;
+    }
+    var bsi: i64 = 0;
+    while bsi < func_names.len() {
+        if tc_vec_contains_str(func_prim_lists.get(bsi), "bounded-stack") {
+            var why: str = bounded_stack_violation_fd(func_names.get(bsi), cg_names, cg_calls, cg_offsets, leaves);
+            if str_len(why) > 0 {
+                self.errors.push("Safety error (bounded-stack): function '" + func_names.get(bsi)
+                    + "' is @bounded-stack but " + why + ".\n    Its stack depth has no bound: every function it can reach must be\n    non-recursive and called directly.");
+            } else {
+                // @bounded-stack(N): the acyclicity check above proved the
+                // reachable call graph is a DAG — now measure the longest
+                // call chain (in stack frames) against the declared budget.
+                var bound: i64 = -1;
+                var fas: Vec<Annotation> = func_anns.get(bsi);
+                var fai: i64 = 0;
+                while fai < fas.len() {
+                    var fa: Annotation = fas.get(fai);
+                    if fa.name == "bounded-stack" && fa.args.len() > 0 {
+                        bound = str_parse_int(fa.args.get(0));
+                    }
+                    fai = fai + 1;
+                }
+                if bound >= 0 {
+                    var index2: i64 = HashMap_new();
+                    var ii2: i64 = 0;
+                    while ii2 < cg_names.len() {
+                        HashMap_insert(index2, cg_names.get(ii2), ii2 + 1);
+                        ii2 = ii2 + 1;
+                    }
+                    var root_i: i64 = HashMap_get(index2, func_names.get(bsi)) - 1;
+                    var memo_names: Vec<str> = Vec::new();
+                    var memo_vals: Vec<i64> = Vec::new();
+                    var depth: i64 = bs_depth(root_i, cg_names, cg_calls, cg_offsets, index2, leaves, memo_names, memo_vals);
+                    if depth > bound {
+                        self.errors.push("Safety error (bounded-stack): function '" + func_names.get(bsi)
+                            + "' is @bounded-stack(" + int_to_str(bound) + ") but its deepest static call chain is "
+                            + int_to_str(depth) + " frames — it exceeds the declared\n    frame budget. Reduce call depth or raise the bound.");
+                    }
+                }
+            }
+        }
+        bsi = bsi + 1;
+    }
+}
+
+/// Longest static call-chain depth from `node`, in stack frames (the node
+/// itself counts as 1). Only called on graphs that passed
+/// bounded_stack_violation_fd — i.e. proven acyclic — so a memoized DFS is
+/// safe. Mirrors src/typechecker.rs::safety_call_depth.
+fn bs_depth(node: i64, cg_names: Vec<str>, cg_calls: Vec<str>, cg_offsets: Vec<i64>,
+            index: i64, leaves: Vec<str>, memo_names: Vec<str>, memo_vals: Vec<i64>) -> i64 {
+    var name: str = cg_names.get(node);
+    var mi: i64 = 0;
+    while mi < memo_names.len() {
+        if memo_names.get(mi) == name { return memo_vals.get(mi); }
+        mi = mi + 1;
+    }
+    var err: Vec<str> = Vec::new();
+    var edges: Vec<i64> = bs_edges(node, cg_names, cg_calls, cg_offsets, index, leaves, err);
+    var best: i64 = 0;
+    var i: i64 = 0;
+    while i < edges.len() {
+        var d: i64 = bs_depth(edges.get(i), cg_names, cg_calls, cg_offsets, index, leaves, memo_names, memo_vals);
+        if d > best { best = d; }
+        i = i + 1;
+    }
+    memo_names.push(name);
+    memo_vals.push(best + 1);
+    return best + 1;
+}
+
+/// The functions a call to `name` from `node` can reach (a method call,
+/// recorded by its bare name, reaches every method of that name), as indexes.
+/// An indirect call or an unknown target goes into `err`.
+fn bs_edges(node: i64, cg_names: Vec<str>, cg_calls: Vec<str>, cg_offsets: Vec<i64>, index: i64,
+            leaves: Vec<str>, err: Vec<str>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var end: i64 = cg_calls.len();
+    if node + 1 < cg_offsets.len() { end = cg_offsets.get(node + 1); }
+    var ci: i64 = cg_offsets.get(node);
+    while ci < end {
+        var c: str = cg_calls.get(ci);
+        var j: i64 = HashMap_get(index, c);
+        if j != 0 {
+            out.push(j - 1);
+        } else if c == "p_make_dyn" || c == "p_call_ptr" || c == "p_dyn_call" {
+            err.push("makes an indirect call ('" + c + "')");
+            return out;
+        } else if !(str_starts_with(c, "p_") || tc_vec_contains_str(leaves, c) || c == "print" || c == "println"
+                    || c == "print_str" || c == "print_nl" || c == "print_int") {
+            var suffix: str = "_" + c;
+            var found: bool = false;
+            var k: i64 = 0;
+            while k < cg_names.len() {
+                if str_ends_with(cg_names.get(k), suffix) {
+                    out.push(k);
+                    found = true;
+                }
+                k = k + 1;
+            }
+            if !found {
+                err.push("calls '" + c + "', whose target is not a known function");
+                return out;
+            }
+        }
+        ci = ci + 1;
+    }
+    return out;
+}
+
+/// As src/typechecker.rs bounded_stack_violation: why the stack depth of
+/// `root` has no bound (a cycle it can reach, or a call with no known
+/// target), or "" when it has one.
+fn bounded_stack_violation_fd(root: str, cg_names: Vec<str>, cg_calls: Vec<str>, cg_offsets: Vec<i64>,
+                              leaves: Vec<str>) -> str {
+    var index: i64 = HashMap_new();
+    var state: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < cg_names.len() {
+        HashMap_insert(index, cg_names.get(i), i + 1);
+        state.push(0);
+        i = i + 1;
+    }
+    var root_i: i64 = HashMap_get(index, root) - 1;
+    if root_i < 0 { return ""; }
+    var err: Vec<str> = Vec::new();
+    var path_node: Vec<i64> = Vec::new();
+    var path_edges: Vec<Vec<i64>> = Vec::new();
+    var path_pos: Vec<i64> = Vec::new();
+    var first: Vec<i64> = bs_edges(root_i, cg_names, cg_calls, cg_offsets, index, leaves, err);
+    if err.len() > 0 { return err.get(0) + " (in '" + root + "')"; }
+    // Depth first: a function on the current path, reached again, is a cycle
+    state.set(root_i, 1);
+    path_node.push(root_i);
+    path_edges.push(first);
+    path_pos.push(0);
+    while path_node.len() > 0 {
+        var top: i64 = path_node.len() - 1;
+        var es: Vec<i64> = path_edges.get(top);
+        var pos: i64 = path_pos.get(top);
+        if pos < es.len() {
+            path_pos.set(top, pos + 1);
+            var nx: i64 = es.get(pos);
+            if state.get(nx) == 1 { return "can recurse through '" + cg_names.get(nx) + "'"; }
+            if state.get(nx) == 0 {
+                var next_edges: Vec<i64> = bs_edges(nx, cg_names, cg_calls, cg_offsets, index, leaves, err);
+                if err.len() > 0 { return err.get(0) + " (in '" + cg_names.get(nx) + "')"; }
+                state.set(nx, 1);
+                path_node.push(nx);
+                path_edges.push(next_edges);
+                path_pos.push(0);
+            }
+        } else {
+            state.set(path_node.get(top), 2);
+            path_node.pop();
+            path_edges.pop();
+            path_pos.pop();
+        }
+    }
+    return "";
 }
 
 // Detect if `target` is reachable from itself via a non-trivial path in the
@@ -2748,6 +3106,8 @@ pub fn expand_safety_primitives(annotations: Vec<Annotation>) -> Vec<str> {
         if name == "no-indirect" { prims.push("no-indirect"); }
         if name == "requires-audit" { prims.push("requires-audit"); }
         if name == "bounded-stack" { prims.push("bounded-stack"); }
+        // @no-panic is a real primitive — usable directly, not only via presets.
+        if name == "no-panic" { prims.push("no-panic"); }
         // F30: @firmware — bare-metal firmware (no OS-dependent calls)
         if name == "firmware" { prims.push("firmware"); }
         // F23: @simd — recognized but no safety primitives
@@ -2761,7 +3121,9 @@ pub fn expand_safety_primitives(annotations: Vec<Annotation>) -> Vec<str> {
             prims.push("no-panic");
             prims.push("no-unbounded");
         }
-        if name == "medical" {
+        if name == "medical" || name == "dal-a" {
+            // @dal-a is the old spelling of @medical (DO-178C DAL-A); kept as
+            // an alias instead of silently doing nothing.
             prims.push("no-alloc");
             prims.push("no-recursion");
             prims.push("no-unbounded");
@@ -5211,6 +5573,14 @@ pub fn TypeChecker_verify_allocator_params(self: &mut TypeChecker, program: Prog
 // --- check_func ----------------------------------------------------------
 
 /// `@unsafe fn` is one `unsafe` block around the whole body.
+/// CE6: true the first time an undefined `name` is met in this function.
+fn TypeChecker_first_report(self: &mut TypeChecker, name: str) -> bool {
+    val key: str = self.checking_fn + ":" + name;
+    if str_vec_contains(self.reported_undefined, key) { return false; }
+    self.reported_undefined.push(key);
+    return true;
+}
+
 pub fn TypeChecker_check_func(self: &mut TypeChecker, func: Func) {
     var whole: bool = false;
     var ai: i64 = 0;
@@ -7511,7 +7881,9 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 }
                 OptFuncSig::None => {}
             }
-            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): undefined variable '" + name + "'");
+            if TypeChecker_first_report(self, name) {
+                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): undefined variable '" + name + "'");
+            }
             return Type::Never;
         }
         Expr::Binary(op, left, right) => {
@@ -7620,7 +7992,10 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 }
                 return Type::F32;
             }
-            self.errors.push("Type error: arithmetic requires numeric types. Left: " + type_to_str(lt_r) + ", Right: " + type_to_str(rt_r));
+            // never: an operand whose error is already reported (CE6)
+            if !type_eq(lt_r, Type::Never) && !type_eq(rt_r, Type::Never) {
+                self.errors.push("Type error: arithmetic requires numeric types. Left: " + type_to_str(lt_r) + ", Right: " + type_to_str(rt_r));
+            }
             return Type::Never;
         }
         Expr::Unary(op, e) => {
@@ -7820,7 +8195,9 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 }
                 OptType::None => {}
             }
-            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): undefined function '" + callee + "'");
+            if TypeChecker_first_report(self, callee + "()") {
+                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): undefined function '" + callee + "'");
+            }
             return Type::Never;
         }
         Expr::FieldAccess(obj_expr, field) => {
@@ -9969,7 +10346,12 @@ pub fn TypeChecker_collect_called_funcs_expr(self: &TypeChecker, expr: Expr, cal
                 i = i + 1;
             }
         }
-        Expr::MethodCall(receiver, _, args) => {
+        Expr::MethodCall(receiver, method, args) => {
+            // "#unwrap" (no function has that name) marks a call that panics on
+            // None or Err, for the lint in lint_unwraps
+            if (method == "unwrap" || method == "expect") && !str_vec_contains_ref(called, "#unwrap") {
+                called.push("#unwrap");
+            }
             TypeChecker_collect_called_funcs_expr(self, box_expr_unbox(receiver), called);
             var i: i64 = 0;
             while i < args.len() {
