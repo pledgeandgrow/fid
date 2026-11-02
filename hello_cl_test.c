@@ -10,6 +10,9 @@
 #include <string.h>
 #ifndef _WIN32
 #include <alloca.h>
+#else
+#include <malloc.h>
+#define alloca _alloca
 #endif
 #include <stdint.h>
 #include <stdbool.h>
@@ -23,6 +26,9 @@ typedef SSIZE_T ssize_t;
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "ws2_32.lib")
+#endif
 #include <io.h>
 #include <fcntl.h>
 // PLINK: ws2_32

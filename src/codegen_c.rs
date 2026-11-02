@@ -898,6 +898,7 @@ impl CCodeGen {
         wln!(self, "#define _USE_MATH_DEFINES");
         wln!(self, "#include <BaseTsd.h>");
         wln!(self, "typedef SSIZE_T ssize_t;");
+        wln!(self, "#define _Thread_local __declspec(thread)");
         wln!(self, "#endif");
         wln!(self, "#include <math.h>");
         // Socket support for native HTTP server (Phase 5D)
