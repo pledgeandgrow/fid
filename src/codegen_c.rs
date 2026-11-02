@@ -147,6 +147,12 @@ pub struct CCodeGen {
     /// Byte offset in `out` where the tail (main wrapper + runtime impl)
     /// begins.
     tail_mark: usize,
+    /// --debug: the .fd file `#line` directives attribute generated code to
+    /// (forward slashes — accepted by every C compiler, escapes nothing).
+    /// None = no directives.
+    line_file: Option<String>,
+    /// Last source line a `#line` directive pointed at (dedupe).
+    c_line_last: usize,
 }
 
 impl CCodeGen {
@@ -169,6 +175,8 @@ impl CCodeGen {
             extern_func_names: std::collections::HashSet::new(),
             fn_marks: Vec::new(),
             tail_mark: 0,
+            line_file: None,
+            c_line_last: 0,
         }
     }
 
@@ -1383,6 +1391,7 @@ impl CCodeGen {
         wln!(self, "int64_t p_clock_now(void);");
         wln!(self, "int64_t p_clock_now_us(void);");
         wln!(self, "int64_t p_clock_now_ms(void);");
+        wln!(self, "int64_t p_os_random_u64(void);");
         // Regex builtin
         wln!(self, "bool p_regex_match(const char* s, const char* pattern);");
         wln!(self, "const char* p_intern_str(const char* s);");
@@ -1888,12 +1897,23 @@ impl CCodeGen {
         }
 
         // Generate blocks
+        self.c_line_last = 0;
         for (i, block) in func.blocks.iter().enumerate() {
             if i > 0 {
                 wln!(self, "  bb{}:", block.id.0);
             }
             for &inst_id in &block.instructions {
                 if let Some(inst) = func.instructions.get(&inst_id) {
+                    // --debug: the C for this instruction stands for the .fd
+                    // line in its IR metadata; one directive per change.
+                    if let Some(f) = self.line_file.clone() {
+                        if let Some(line) = func.values.get(&inst_id).and_then(|m| m.source_line) {
+                            if line != self.c_line_last {
+                                wln!(self, "#line {} \"{}\"", line, f);
+                                self.c_line_last = line;
+                            }
+                        }
+                    }
                     self.gen_inst(inst, inst_id, func);
                 }
             }
@@ -1906,6 +1926,12 @@ impl CCodeGen {
             wln!(self, "    return 0;");
         }
         wln!(self, "}");
+        if self.line_file.is_some() {
+            // Whatever follows is generated code again, not .fd source —
+            // point the directives back at the generator's own name so
+            // runtime helpers don't show up as user lines.
+            wln!(self, "#line 1 \"fidesc-cgen\"");
+        }
         wln!(self, "");
     }
 
@@ -3534,11 +3560,45 @@ impl CCodeGen {
         wln!(self, "int64_t p_clock_now(void) {{ struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec; }}");
         wln!(self, "int64_t p_clock_now_us(void) {{ struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (int64_t)ts.tv_sec * 1000000LL + (int64_t)ts.tv_nsec / 1000; }}");
         wln!(self, "int64_t p_clock_now_ms(void) {{ struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (int64_t)ts.tv_sec * 1000LL + (int64_t)ts.tv_nsec / 1000000; }}");
+        wln!(self, "#elif defined(_WIN32)");
+        wln!(self, "#include <windows.h>");
+        wln!(self, "/* 100 ns units since 1970: the precise clock (time() has 1 s resolution) */");
+        wln!(self, "static int64_t __p_now_100ns(void) {{");
+        wln!(self, "    FILETIME ft;");
+        wln!(self, "#if defined(__TINYC__)");
+        wln!(self, "    GetSystemTimeAsFileTime(&ft);");
+        wln!(self, "#else");
+        wln!(self, "    GetSystemTimePreciseAsFileTime(&ft);");
+        wln!(self, "#endif");
+        wln!(self, "    return (int64_t)((((uint64_t)ft.dwHighDateTime) << 32) | ft.dwLowDateTime) - 116444736000000000LL;");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_clock_now(void) {{ return __p_now_100ns() * 100; }}");
+        wln!(self, "int64_t p_clock_now_us(void) {{ return __p_now_100ns() / 10; }}");
+        wln!(self, "int64_t p_clock_now_ms(void) {{ return __p_now_100ns() / 10000; }}");
         wln!(self, "#else");
         wln!(self, "#include <time.h>");
         wln!(self, "int64_t p_clock_now(void) {{ return (int64_t)time(NULL) * 1000000000LL; }}");
         wln!(self, "int64_t p_clock_now_us(void) {{ return (int64_t)time(NULL) * 1000000LL; }}");
         wln!(self, "int64_t p_clock_now_ms(void) {{ return (int64_t)time(NULL) * 1000LL; }}");
+        wln!(self, "#endif");
+        wln!(self, "/* 64 random bits from the operating system's secure generator */");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "int rand_s(unsigned int* v);");
+        wln!(self, "int64_t p_os_random_u64(void) {{");
+        wln!(self, "    unsigned int a = 0, b = 0;");
+        wln!(self, "    if (rand_s(&a) != 0 || rand_s(&b) != 0) p_panic(\"no random source in the operating system\");");
+        wln!(self, "    return (int64_t)(((uint64_t)a << 32) | b);");
+        wln!(self, "}}");
+        wln!(self, "#else");
+        wln!(self, "#include <fcntl.h>");
+        wln!(self, "#include <unistd.h>");
+        wln!(self, "int64_t p_os_random_u64(void) {{");
+        wln!(self, "    uint64_t v = 0;");
+        wln!(self, "    int fd = open(\"/dev/urandom\", O_RDONLY);");
+        wln!(self, "    if (fd < 0 || read(fd, &v, sizeof v) != (ssize_t)sizeof v) p_panic(\"no random source in the operating system\");");
+        wln!(self, "    close(fd);");
+        wln!(self, "    return (int64_t)v;");
+        wln!(self, "}}");
         wln!(self, "#endif");
         // Regex builtin — simple wildcard match (? and *)
         wln!(self, "bool p_regex_match(const char* s, const char* pattern) {{");
@@ -5501,8 +5561,8 @@ impl CCodeGen {
         wln!(self, "void* p_gaussian_noise(void* shape_vec, double sigma) {{");
         wln!(self, "    // shape_vec is a Fides Vec (i64 pointer to 24-byte block)");
         wln!(self, "    int64_t* sv = (int64_t*)shape_vec;");
-        wln!(self, "    int64_t ndim = sv ? sv[0] : 0;");
-        wln!(self, "    int64_t* data_ptr = sv ? (int64_t*)sv[1] : NULL;");
+        wln!(self, "    int64_t ndim = sv ? sv[1] : 0;");
+        wln!(self, "    int64_t* data_ptr = sv ? (int64_t*)sv[0] : NULL;");
         wln!(self, "    int64_t shape[8]; int64_t len = 1;");
         wln!(self, "    for (int64_t i = 0; i < ndim && i < 8; i++) {{ shape[i] = data_ptr ? data_ptr[i] : 1; len *= shape[i]; }}");
         wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
@@ -5551,8 +5611,8 @@ impl CCodeGen {
         wln!(self, "void p_send_tensor(void* t) {{ (void)t; /* no-op in single-rank */ }}");
         wln!(self, "void* p_recv_tensor(void* shape_vec) {{");
         wln!(self, "    int64_t* sv = (int64_t*)shape_vec;");
-        wln!(self, "    int64_t ndim = sv ? sv[0] : 0;");
-        wln!(self, "    int64_t* data_ptr = sv ? (int64_t*)sv[1] : NULL;");
+        wln!(self, "    int64_t ndim = sv ? sv[1] : 0;");
+        wln!(self, "    int64_t* data_ptr = sv ? (int64_t*)sv[0] : NULL;");
         wln!(self, "    int64_t shape[8]; int64_t len = 1;");
         wln!(self, "    for (int64_t i = 0; i < ndim && i < 8; i++) {{ shape[i] = data_ptr ? data_ptr[i] : 1; len *= shape[i]; }}");
         wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
@@ -6272,7 +6332,15 @@ impl CCodeGen {
 }
 
 pub fn generate_c(module: &IrModule) -> String {
+    generate_c_opts(module, None)
+}
+
+/// `generate_c`, plus source mapping: with `line_file` set, `#line`
+/// directives inside each function map the generated C back to .fd lines,
+/// so `cc -g` produces debug info a debugger can follow.
+pub fn generate_c_opts(module: &IrModule, line_file: Option<&str>) -> String {
     let mut gen = CCodeGen::new();
+    gen.line_file = line_file.map(|f| f.replace('\\', "/"));
     gen.generate(module)
 }
 

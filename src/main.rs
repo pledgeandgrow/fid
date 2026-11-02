@@ -94,9 +94,13 @@ fn run_with_timeout(path: &str, limit: std::time::Duration) -> Option<process::O
     }
 }
 
+// Deeply nested programs recurse deeply in the parser, the checkers and
+// lowering; the default main-thread stack (1 MB on Windows) overflows, so the
+// real entry point runs on a dedicated 256 MB-stack thread. WASI cannot spawn
+// threads, so the wasm build calls real_main directly (its stack size is set
+// at link time via `-zstack-size`).
+#[cfg(not(target_family = "wasm"))]
 fn main() {
-    // Deeply nested programs recurse deeply in the parser, the checkers and
-    // lowering; the default main-thread stack (1 MB on Windows) overflows.
     let compiler = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(real_main)
@@ -104,6 +108,11 @@ fn main() {
     if compiler.join().is_err() {
         process::exit(101);
     }
+}
+
+#[cfg(target_family = "wasm")]
+fn main() {
+    real_main();
 }
 
 fn real_main() {
@@ -217,6 +226,7 @@ fn real_main() {
                 eprintln!("       --no-opt     Disable PIR optimizer (equivalent to --opt-level 0)");
                 eprintln!("       --lto        Enable cross-module LTO (equivalent to --opt-level 3)");
                 eprintln!("       --caps       Grant only these capabilities (e.g. \"IO,FS\"). Strips code requiring ungranted caps.");
+                eprintln!("       -g/--debug   Emit DWARF line tables in the PE (windows targets).");
                 process::exit(1);
             }
             let input = &args[2];
@@ -262,7 +272,8 @@ fn real_main() {
                 println!("{} is up to date", output);
                 return;
             }
-            match compiler::build_executable_with_level(&source, input, target, opt_level, do_lto, granted_caps.as_deref()) {
+            let debug = args.iter().any(|a| a == "-g" || a == "--debug");
+            match compiler::build_executable_with_level(&source, input, target, opt_level, do_lto, granted_caps.as_deref(), debug) {
                 Ok(exe_bytes) => {
                     fs::write(&output, &exe_bytes).unwrap_or_else(|e| {
                         eprintln!("Error writing '{}': {}", output, e);
@@ -326,7 +337,7 @@ fn real_main() {
 
         "emit" => {
             if args.len() < 3 {
-                eprintln!("Usage: fidesc emit <file.fd> [-o output.exe] [--bare] [--boot] [--opt-level 0|1|2|3] [--load-addr <hex>] [--linker-script <file>]");
+                eprintln!("Usage: fidesc emit <file.fd> [-o output.exe] [-g] [--bare] [--boot] [--opt-level 0|1|2|3] [--load-addr <hex>] [--linker-script <file>]");
                 process::exit(1);
             }
             let bare_mode = args.iter().any(|a| a == "--bare");
@@ -420,7 +431,10 @@ fn real_main() {
                     println!("{} is up to date", output);
                     return;
                 }
-                match compiler::emit_source_with_level(&source, input, opt_level) {
+                // -g / --debug: DWARF v4 line tables in the PE so a standard
+                // debugger maps machine code back to .fd source lines.
+                let debug = args.iter().any(|a| a == "-g" || a == "--debug");
+                match compiler::emit_source_debug(&source, input, opt_level, debug) {
                     Ok(pe_bytes) => {
                         fs::write(&output, &pe_bytes).unwrap_or_else(|e| {
                             eprintln!("Error writing '{}': {}", output, e);
@@ -1249,9 +1263,12 @@ fn real_main() {
 
         "ccompile" => {
             if args.len() < 3 {
-                eprintln!("Usage: fidesc ccompile <file.fd> [-o output.exe] [--target <triple>] [--cc-opt 0|1|2|3|s] [--trace]");
+                eprintln!("Usage: fidesc ccompile <file.fd> [-o output.exe] [--target <triple>] [--cc-opt 0|1|2|3|s] [--trace] [--debug|-g]");
                 process::exit(1);
             }
+            // --debug / -g: -O0 generated C with #line directives, and the C
+            // compiler emits debug info pointing back at the .fd source.
+            let debug = args.iter().any(|a| a == "--debug" || a == "-g");
             let input = &args[2];
             let output = args.iter().position(|a| a == "-o")
                 .and_then(|i| args.get(i + 1))
@@ -1293,6 +1310,9 @@ fn real_main() {
                         let cc_opt = args.iter().position(|a| a == "--cc-opt")
                             .and_then(|i| args.get(i + 1))
                             .cloned()
+                        // --debug: no C optimization (fast to build, easy to debug); --release: -O2
+                        .or_else(|| if args.iter().any(|a| a == "--debug") { Some("0".to_string()) }
+                            else if args.iter().any(|a| a == "--release") { Some("2".to_string()) } else { None })
                             .or_else(|| std::env::var("FIDES_CC_OPT").ok())
                             .unwrap_or_else(|| "2".to_string());
                         let cc = std::env::var("CC").unwrap_or_else(|_| {
@@ -1366,12 +1386,13 @@ fn real_main() {
                             }
                             if !have_obj {
                                 stale.push(unit_name.clone());
-                                let st = process::Command::new(cc_prog)
-                                    .args(&cc_args)
+                                let mut unit_cmd = process::Command::new(cc_prog);
+                                unit_cmd.args(&cc_args)
                                     .arg(format!("-O{}", cc_opt))
                                     .args(unit_flags)
-                                    .arg("-c").arg("-o").arg(&o_path).arg(&c_path)
-                                    .output();
+                                    .arg("-c").arg("-o").arg(&o_path).arg(&c_path);
+                                if debug { unit_cmd.arg("-g"); }
+                                let st = unit_cmd.output();
                                 match st {
                                     Ok(o) if o.status.success() => {
                                         if let (Some(s), Some(k)) = (&store, &key) {
@@ -1430,7 +1451,7 @@ fn real_main() {
                 }
             }
 
-            match compiler::ccompile_source_traced(&source, input, trace) {
+            match compiler::ccompile_source_debugged(&source, input, trace, debug) {
                 Ok(c_code) => {
                     let c_hash = fidesc::inc::hash_source(&c_code);
                     // Write C source
@@ -1465,6 +1486,9 @@ fn real_main() {
                     let cc_opt = args.iter().position(|a| a == "--cc-opt")
                         .and_then(|i| args.get(i + 1))
                         .cloned()
+                        // --debug: no C optimization (fast to build, easy to debug); --release: -O2
+                        .or_else(|| if args.iter().any(|a| a == "--debug") { Some("0".to_string()) }
+                            else if args.iter().any(|a| a == "--release") { Some("2".to_string()) } else { None })
                         .or_else(|| std::env::var("FIDES_CC_OPT").ok())
                         .unwrap_or_else(|| {
                             if c_code.len() > LARGE_C_BYTES {
@@ -1541,19 +1565,22 @@ fn real_main() {
                         // Use vcvarsall.bat to set it up, then run cl.exe
                         let vcvars = find_vcvarsall();
                         if let Some(vcvars) = vcvars {
+                            // /Z7 embeds debug info in the objects — no PDB
+                            let z7 = if debug { "/Z7" } else { "" };
                             let cmd_str = format!(
-                                "\"\"{}\" x64 >nul 2>&1 && \"{}\" {} /nologo /Fe:{} {}\"",
-                                vcvars, cc, cl_opt, output, c_path
+                                "\"\"{}\" x64 >nul 2>&1 && \"{}\" {} {} /nologo /Fe:{} {}\"",
+                                vcvars, cc, cl_opt, z7, output, c_path
                             );
                             process::Command::new("cmd")
                                 .args(["/C", &cmd_str])
                                 .output()
                         } else {
                             // No vcvarsall — try direct
-                            process::Command::new(cc_prog)
-                                .args(&cc_args)
-                                .args([cl_opt, "/nologo", &format!("/Fe:{}", output), &c_path])
-                                .output()
+                            let mut direct = process::Command::new(cc_prog);
+                            direct.args(&cc_args)
+                                .args([cl_opt, "/nologo", &format!("/Fe:{}", output), &c_path]);
+                            if debug { direct.arg("/Z7"); }
+                            direct.output()
                         }
                     } else {
                         // gcc/clang/tcc: -O2 + security hardening flags -o output c_path
@@ -1610,6 +1637,7 @@ fn real_main() {
                                 .unwrap_or(false);
                         let mut cmd = process::Command::new(cc_prog);
                         cmd.args(&cc_args);
+                        if debug { cmd.arg("-g"); }
                         if is_tcc {
                             // TCC: minimal flags — it doesn't support -fstack-protector,
                             // -fPIE, -pie, -Wl,-z,relro, etc.
@@ -1801,6 +1829,74 @@ fn real_main() {
         }
 
         "test" => {
+            // `fidesc test <file.fd>` — unit tests: run each @test-annotated
+            // function in the file through the interpreter. A return means
+            // pass; a panic means fail. Bare `fidesc test` falls through to
+            // the corpus runner below.
+            if let Some(input) = args.iter().skip(2).find(|a| a.ends_with(".fd")).cloned() {
+                let source = match fs::read_to_string(&input) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Error reading '{}': {}", input, e);
+                        process::exit(1);
+                    }
+                };
+
+                // Discover @test fns via a fast parse of just this file
+                // (the full build below merges stdlib/imports — their funcs
+                // must not be mistaken for the file's tests).
+                let mut lex = fidesc::lexer::Lexer::new(&source);
+                let toks = lex.tokenize();
+                let test_names: Vec<String> = match fidesc::parser::Parser::new(toks).parse() {
+                    Ok(user) => user.funcs.iter()
+                        .filter(|f| f.annotations.iter().any(|a| a.name == "test"))
+                        .map(|f| f.name.clone())
+                        .collect(),
+                    Err(e) => {
+                        eprintln!("Parse error: {}", e);
+                        process::exit(1);
+                    }
+                };
+
+                if test_names.is_empty() {
+                    println!("{}: no @test functions found", input);
+                    process::exit(0);
+                }
+
+                let program = match compiler::build_program_with_path(&source, Some(&input)) {
+                    Ok(p) => p,
+                    Err(errors) => {
+                        print_errors(&errors);
+                        process::exit(1);
+                    }
+                };
+                let module = lower::lower(&program);
+
+                let mut passed = 0usize;
+                let mut failed = 0usize;
+                for name in &test_names {
+                    // A fresh interpreter per test keeps globals and memory
+                    // isolated between tests.
+                    let mut it = interp::Interpreter::new(module.clone());
+                    match it.run_named(name) {
+                        RunResult::Return(_) => {
+                            println!("  \u{2713} {}", name);
+                            passed += 1;
+                        }
+                        RunResult::Panic(msg) => {
+                            println!("  \u{2717} {} — {}", name, msg);
+                            failed += 1;
+                        }
+                        RunResult::Paused => {
+                            println!("  - {} (paused by debugger)", name);
+                            failed += 1;
+                        }
+                    }
+                }
+                println!("{}: {} passed, {} failed, {} total", input, passed, failed, test_names.len());
+                process::exit(if failed == 0 { 0 } else { 1 });
+            }
+
             // Run .fd tests in the tests/bootstrap/ directory against all backends.
             //
             // By default, runs NORMAL tests (expected to pass).
@@ -1808,8 +1904,13 @@ fn real_main() {
             // (where failing = correct, passing = regression).
             let fail_only = args.iter().any(|a| a == "--fail");
 
-            let current_exe = std::env::current_exe()
-                .unwrap_or_else(|_| std::path::PathBuf::from("fidesc"));
+            // --compiler <exe>: run, ccompile and emit go through that compiler
+            // (the shipped `fid`) instead of this one
+            let current_exe = args.iter().position(|a| a == "--compiler")
+                .and_then(|i| args.get(i + 1))
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::current_exe()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("fidesc")));
             let test_dir = "tests/bootstrap";
 
             // Expected-fail tests: these test compiler error detection.
@@ -3133,6 +3234,34 @@ fn real_main() {
             }
         }
 
+        "check" => {
+            // Type, borrow and effect checks with no code generation
+            if args.len() < 3 {
+                eprintln!("Usage: fidesc check <file.fd>");
+                process::exit(1);
+            }
+            let input = &args[2];
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+            let start = std::time::Instant::now();
+            match compiler::build_program_with_path(&source, Some(input)) {
+                Ok(_) => {
+                    eprintln!("{}: no errors ({} ms)", input, start.elapsed().as_millis());
+                    process::exit(0);
+                }
+                Err(errs) => {
+                    for e in &errs {
+                        eprintln!("{}", e);
+                    }
+                    process::exit(1);
+                }
+            }
+        }
         "lint" => {
             if args.len() < 3 {
                 eprintln!("Usage: fidesc lint <file.fd>");

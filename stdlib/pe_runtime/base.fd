@@ -18,6 +18,7 @@
 extern "C" {
     // msvcrt.dll
     fn fopen as pe_c_fopen(path: str, mode: str) -> i64;
+    fn rand_s as pe_c_rand_s(v: i64) -> i32;
     fn memcpy as pe_c_memcpy(dst: i64, src: i64, n: i64) -> i64;
     fn fclose as pe_c_fclose(f: i64) -> i32;
     fn fread as pe_c_fread(buf: i64, size: i64, count: i64, f: i64) -> i64;
@@ -417,6 +418,23 @@ fn pe_time_100ns() -> i64 {
     var t: i64 = 0;
     unsafe { t = *p; }
     return t - 116444736000000000;
+}
+
+/// 64 bits from the operating system's secure generator (msvcrt's rand_s,
+/// over RtlGenRandom).
+pub fn pert_os_random_u64() -> i64 {
+    var cell: i64 = p_malloc(8);
+    var lo: *mut i32 = cell;
+    var hi: *mut i32 = cell + 4;
+    unsafe { *lo = 0; *hi = 0; }
+    if pe_c_rand_s(cell) != 0 || pe_c_rand_s(cell + 4) != 0 {
+        p_panic("no random source in the operating system");
+    }
+    var p: *mut i64 = cell;
+    var v: i64 = 0;
+    unsafe { v = *p; }
+    p_free(cell);
+    return v;
 }
 
 pub fn pert_clock_now() -> i64 {

@@ -1,0 +1,124 @@
+// stdlib/compress: CRC-32 / Adler-32 against known values, the stored-
+// block writers (byte-exact zlib/gzip output), and inflate of real zlib
+// and gzip streams made by zlib 1.x: fixed-Huffman, dynamic-Huffman,
+// stored blocks and a gzip member with FNAME. Bad input gives empty.
+use compress;
+
+fn check_i(label: str, got: i64, want: i64) {
+    println(label + " = " + int_to_str(got));
+    if got != want {
+        p_panic("compress: " + label + " wrong");
+    }
+}
+
+fn check_s(label: str, got: str, want: str) {
+    println(label + " = " + got);
+    if !str_equal(got, want) {
+        p_panic("compress: " + label + " gave '" + got + "', want '" + want + "'");
+    }
+}
+
+fn hex_val(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    return c - 87;
+}
+
+fn from_hex(h: str) -> Vec {
+    var out: Vec = Vec::new();
+    var i: i64 = 0;
+    while i + 1 < str_len(h) {
+        out.push(hex_val(str_byte_at(h, i)) * 16 + hex_val(str_byte_at(h, i + 1)));
+        i = i + 2;
+    }
+    return out;
+}
+
+fn to_hex(v: Vec) -> str {
+    var digits = "0123456789abcdef";
+    var out = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        var b: i64 = v.get(i);
+        out = out + str_slice(digits, b >> 4, (b >> 4) + 1) + str_slice(digits, b & 15, (b & 15) + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn from_hex_slice(v: Vec, a: i64, b: i64) -> Vec {
+    var out: Vec = Vec::new();
+    var i: i64 = a;
+    while i < b {
+        out.push(v.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main() -> i64 {
+    // checksums
+    check_i("crc32.fox", crc32("The quick brown fox jumps over the lazy dog"), 1095738169);
+    check_i("crc32.hello", crc32("hello world"), 222957957);
+    check_i("crc32.empty", crc32(""), 0);
+    check_i("adler32.wiki", adler32("Wikipedia"), 300286872);
+    check_i("adler32.empty", adler32(""), 1);
+    check_i("crc32.bytes", crc32_bytes(from_hex("616263")), crc32("abc"));
+    check_i("adler32.bytes", adler32_bytes(from_hex("616263")), adler32("abc"));
+
+    // stored-block writers, byte for byte
+    check_s("zlib.abc", to_hex(zlib_compress("abc")), "7801010300fcff616263024d0127");
+    check_s("gzip.hello", to_hex(gzip_compress("hello world")),
+        "1f8b08000000000000ff010b00f4ff68656c6c6f20776f726c6485114a0d0b000000");
+    check_s("deflate.empty", to_hex(deflate_stored(Vec::new())), "010000ffff");
+    check_s("zlib.rt", zlib_decompress_str(zlib_compress("round trip, zlib")), "round trip, zlib");
+    check_s("gzip.rt", gzip_decompress_str(gzip_compress("round trip, gzip")), "round trip, gzip");
+    check_i("zlib.rt.empty", zlib_decompress(zlib_compress("")).len(), 0);
+    check_s("inflate.stored", str_from_bytes(inflate(deflate_stored(from_hex("78797a")))), "xyz");
+
+    // 65537 bytes: two stored blocks (65535 + 2), kept just over the
+    // block limit because the interpreter is slow on big loops
+    var big: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < 65537 {
+        big.push((i * 7 + 3) % 251);
+        i = i + 1;
+    }
+    var db = deflate_stored(big);
+    check_i("big.dlen", db.len(), 65537 + 10);
+    check_s("big.hdr1", to_hex(from_hex_slice(db, 0, 5)), "00ffff0000");
+    check_s("big.hdr2", to_hex(from_hex_slice(db, 65540, 65547)), "010200fdffabb2");
+    var back = inflate(db);
+    check_i("big.len", back.len(), 65537);
+    check_i("big.first", back.get(0), 3);
+    check_i("big.mid", back.get(40000), (40000 * 7 + 3) % 251);
+    check_i("big.last", back.get(65536), (65536 * 7 + 3) % 251);
+    // multi-block inflate: non-final stored "ab" + final stored "c"
+    check_s("inflate.2blocks", str_from_bytes(inflate(from_hex("000200fdff6162010100feff63"))), "abc");
+
+    // zlib 1.x streams: fixed Huffman (level 9, back-references)
+    check_s("zlib.fixed",
+        zlib_decompress_str(from_hex("78dacb48cdc9c957c8c020cbf38b725200a38a0af9")),
+        "hello hello hello hello world");
+    // zlib stored (level 0)
+    check_s("zlib.level0", zlib_decompress_str(from_hex("7801010300fcff616263024d0127")), "abc");
+    // dynamic Huffman (BTYPE=2)
+    var dyn = zlib_decompress(from_hex(
+        "789c75cdc10980301044d156b600b10a2f824d243a318b312bd99560f79293087a7e7f98d1a83a258b200f359240c63bb4237ea44af923b7a241655d64ff922092586386be8738648e2df0488cf06d9ce782e54c6cd72b503895dc8a89d7683f36b8b2b5dffe06effe5054"));
+    check_i("dyn.len", dyn.len(), 229);
+    check_i("dyn.crc", crc32_bytes(dyn), 2071561309);
+    check_s("dyn.text", str_from_bytes(dyn),
+        "It was the best of times, it was the worst of times, it was the age of wisdom, it was the age of foolishness, it was the epoch of belief, it was the epoch of incredulity, it was the season of Light, it was the season of Darkness.");
+    // gzip member with FNAME "a.txt"
+    check_s("gzip.fname",
+        gzip_decompress_str(from_hex("1f8b0808000000000003612e74787400cb48cdc9c957c8c020cbf38b725200336534341d000000")),
+        "hello hello hello hello world");
+
+    // invalid input → empty result
+    check_i("zlib.short", zlib_decompress(from_hex("7801")).len(), 0);
+    check_i("zlib.badcm", zlib_decompress(from_hex("7701010300fcff616263024d0127")).len(), 0);
+    check_i("zlib.badfcheck", zlib_decompress(from_hex("7802010300fcff616263024d0127")).len(), 0);
+    check_i("gzip.badmagic", gzip_decompress(from_hex("1f8c0800000000000000ff010b00f4ff68656c6c6f")).len(), 0);
+    check_i("inflate.badtype", inflate(from_hex("07")).len(), 0);
+    println("compress ok");
+    return 0;
+}

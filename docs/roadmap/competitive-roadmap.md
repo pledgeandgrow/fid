@@ -33,18 +33,24 @@ Only real users find some bugs. Nothing here makes that untrue.
 
 ## The scoreboard
 
-Measured so far (Windows x64, seconds, lower is better). These predate the
-counted-loop and allocator work of Nov 1–2 and are re-measured by BM1.
+Measured on Nov 2 (Windows x64, seconds, lower is better, best of 3, every
+column in the same run). BM1 makes this a published, repeatable harness.
 
 | Benchmark | Fides native | Fides via C | Rust | Zig | Go | C++ |
 |---|---|---|---|---|---|---|
-| fib(40) | 1.26 | 2.95 | 0.46 | not measured | not measured | not measured |
-| Arithmetic loop, 2 billion | 7.73 | 3.51 | 3.89 | not measured | not measured | not measured |
-| Sieve, 20M | 0.91 | 0.42 | 0.31 | not measured | not measured | not measured |
-| HashMap, 1M strings | 1.0–1.5 | 0.78 | 1.09 | not measured | not measured | not measured |
+| fib(40) | 1.34 | 0.81 | 0.53 | not measured | not measured | not measured |
+| Arithmetic loop, 2 billion | 7.59 | 3.53 | 5.36 | not measured | not measured | not measured |
+| Sieve, 20M | 0.82 | 0.48 | 0.40 | not measured | not measured | not measured |
+| HashMap, 1M strings | 1.04 | 0.80 | 1.12 | not measured | not measured | not measured |
+
+What changed on Nov 2: through C, fib went from 3.0 s to 0.81 s (no
+call-stack bookkeeping per call) and the sieve from 0.64 s to 0.48 s (`push`
+inlines to a store); natively, from 1.63 s to 1.34 s on fib and 1.47 s to 1.04 s
+on the map. The remaining fib gap is the overflow check: Rust's release mode
+drops it, which lets LLVM turn one of the two recursive calls into a loop.
 
 Compile speed: `fid` compiles itself (104,000 lines of Fides, 44 MB of C out) in
-136 s, about 770 lines a second; `fidesc` (Rust) does it in 21 s. Go and Zig
+112–137 s, about 800 lines a second; `fidesc` (Rust) does it in 21 s. Go and Zig
 compile on the order of 100,000 lines a second or more, so this is the widest gap
 on the board: CS1–CS7.
 
@@ -118,15 +124,18 @@ level and leaves floats in memory. This track is where most of the speed is.
       (L).
 - [ ] OP13. Tail calls, tail recursion into loops (M).
 - [ ] OP14. Devirtualization of trait calls and closures (M).
-- [ ] OP15. Block layout for hot paths, using likely branches (M).
+- [~] OP15. Block layout for hot paths, using likely branches (M). Native: no jump to
+      the block laid out next; a branch inverts its condition to fall through.
 
 **Back end**
 
 - [ ] OP16. A full register allocator over all registers, caller-saved included,
-      live ranges split at calls (release D4 goes further) (L).
+      live ranges split at calls (release D4 goes further) (L). Native now keeps
+      parameters read more than once in registers (release D13).
 - [ ] OP17. Floats in xmm registers, not stack slots (L).
-- [ ] OP18. Instruction selection: `lea`, addressing modes, `cmov`, `test`, fused
-      compare and branch (L).
+- [~] OP18. Instruction selection: `lea`, addressing modes, `cmov`, `test`, fused
+      compare and branch (L). Done: compare and branch without a stored bool,
+      `imul` by an immediate, short immediate loads, shadow space set once.
 - [ ] OP19. A peephole pass on the native path (M).
 - [ ] OP20. Modern targets: BMI, AVX2, a `--cpu` switch, safe defaults (M).
 
@@ -140,7 +149,8 @@ level and leaves floats in memory. This track is where most of the speed is.
 **Where Fides can beat them: what the language proves**
 
 - [~] OP24. Bounds and overflow checks dropped on counted loops. Done for
-      `while i < v.len()` and `for i in 0..v.len()`. Left: range analysis for every
+      `while i < v.len()`, `for i in 0..v.len()` and a length kept in a local, on
+      the native and the C backends (release D12). Left: range analysis for every
       loop and branch (L).
 - [ ] OP25. Effects drive optimization: `pure` calls merged, moved out of loops and
       removed; no-write calls keep memory facts alive (L).
@@ -161,8 +171,9 @@ overhead of safety checks under 2% where Rust's is measured higher.
 
 Some of the largest costs are in how data is laid out, not in the optimizer.
 
-- [ ] RT1. `Vec<T>` stores `T` inline: a `Vec<u8>` takes one byte per element, and a
-      `Vec<Struct>` no pointer per element (L).
+- [~] RT1. `Vec<T>` stores `T` inline: a `Vec<u8>` takes one byte per element, and a
+      `Vec<Struct>` no pointer per element (L). Stage A done: one `Vec`
+      implementation on every backend (release D14).
 - [ ] RT2. `str` carries its length: `str_len` is O(1), zero bytes are allowed, and
       HTTP bodies can be binary (release I8) (XL, touches every backend).
 - [ ] RT3. Small-string storage with no allocation (M).
@@ -178,7 +189,9 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
 - [ ] RT11. IOCP on Windows, epoll on Linux, kqueue on macOS, replacing the O(n) poll
       loop (L).
 - [ ] RT12. A timer heap, so 100,000 sleeping tasks cost nothing (M).
-- [ ] RT13. Growable task stacks, or checked stack limits with a clear panic (L).
+- [~] RT13. Growable task stacks, or checked stack limits with a clear panic (L).
+      Done on the C path: the OS guard page with a handler that reports the
+      overflow, a guard page under every POSIX task stack. Left: native.
 - [ ] RT14. Zero-copy file and socket I/O where the system allows it (M).
 - [ ] RT15. Panics unwind cleanly, or abort by a documented rule (L).
 
@@ -192,17 +205,20 @@ This is the race we can win outright, since no rival's speed comes for free.
 - [ ] CS1. `emit` of hello world under 0.5 s (release D9), then under 0.1 s (L).
 - [ ] CS2. Cache the checked stdlib in a binary form, not re-parsed each build (L).
 - [ ] CS3. Borrow checking linear in program size (release D8) (M).
-- [~] CS4. Self-compile under 60 s (release), then under 10 s (L). 136 s on Nov 2,
-      from 601 s (release D10). Next: string compares in method lookup and the
+- [~] CS4. Self-compile under 60 s (release), then under 10 s (L). 112–137 s on
+      Nov 2, from 601 s (release D10, D11). Next: string compares in method lookup and the
       parser, then building the compiler with optimization.
 - [ ] CS5. Parallel front end and code generation on all cores (L).
 - [ ] CS6. Incremental native builds per function, under 100 ms for a one-line
       change (L).
-- [ ] CS7. A fast debug mode with no optimizer, and a release mode (S).
-- [ ] CS8. No linear scans in the self-hosted compiler: tables, not `Vec` searches
+- [x] CS7. A fast debug mode with no optimizer, and a release mode (S).
+      Done: `--debug` (C at -O0) and `--release` (-O2) on `ccompile` in both compilers.
+- [~] CS8. No linear scans in the self-hosted compiler: tables, not `Vec` searches
+      (M). Done: instructions, functions, strings, defaults and comptime functions
+      by table. Left: method lookup in the type checker, the parser's token checks.
+- [~] CS9. `fid check`: type errors with no code generation, under 50 ms on an edit
       (M).
-- [ ] CS9. `fid check`: type errors with no code generation, under 50 ms on an edit
-      (M).
+      Done: `fid check` and `fidesc check`; 46 ms on a small file. Left: under 50 ms on an edit in a large program (needs CS2).
 
 **Acceptance:** 1M lines per second on the front end, ahead of Go on clean builds
 and far ahead of Rust and C++.
@@ -303,8 +319,10 @@ owning what we ship.
 - [ ] SL10. Compression: gzip, zstd, brotli decode (L).
 - [ ] SL11. Encoding: base64, hex, CSV, XML, YAML, TOML, protobuf (L).
 - [ ] SL12. Database drivers: PostgreSQL, MySQL, SQLite, with parameter binding (L).
-- [ ] SL13. Built-in testing: table tests, benchmarks, fuzzing, as in Go (M).
-- [ ] SL14. Structured logging and metrics (M).
+- [~] SL13. Built-in testing: table tests, benchmarks, fuzzing, as in Go (M).
+      Done: `fid test <file.fd>` runs each `fn test_*()` in its own process and times each `fn bench_*()`. Left: fuzzing.
+- [~] SL14. Structured logging and metrics (M).
+      Done: `metrics` (counters, gauges, histograms, Prometheus text format). Left: structured fields in `log`.
 - [ ] SL15. A sampling profiler reachable from a running service (L).
 - [ ] SL16. Big integers and decimals (M).
 - [ ] SL17. Files, paths and processes complete on every platform (M).
@@ -317,7 +335,8 @@ owning what we ship.
 
 Go and Rust won developers with tools as much as with languages.
 
-- [ ] TL1. One binary, `fid`: build, run, test, fmt, doc, lint, bench, fuzz (L).
+- [~] TL1. One binary, `fid`: build, run, test, fmt, doc, lint, bench, fuzz (L).
+      Done: `fid` has build, run, test, fmt, doc, lint, bench, check, profile. Left: fuzz (VF).
 - [ ] TL2. Error messages as good as Rust's, each with a suggested fix, and a test
       per error (L).
 - [ ] TL3. `fid fix`: applies suggested fixes, and upgrades code between versions (L).
@@ -326,11 +345,13 @@ Go and Rust won developers with tools as much as with languages.
 - [ ] TL5. Debugger support with line tables on every platform (release N9) (L).
 - [ ] TL6. Cross-compilation out of the box: `fid build --target linux-arm64` from
       any host, with no extra download (L).
-- [ ] TL7. Profiler output readable by standard tools (M).
+- [x] TL7. Profiler output readable by standard tools (M).
+      Done: `fid profile` samples the native call stack every millisecond and writes collapsed stacks (flamegraph.pl, inferno, speedscope).
 - [ ] TL8. A web playground (M).
 - [ ] TL9. Clear dependency handling: Git and path, a lock file, audits of what a
       build pulls in (M).
-- [ ] TL10. Editor support beyond VS Code: Neovim, JetBrains, Zed (M).
+- [~] TL10. Editor support beyond VS Code: Neovim, JetBrains, Zed (M).
+      Done: configs for Neovim, Helix, Emacs, Sublime and JetBrains (LSP4IJ) in `editors/`, untested. Left: testing them, Zed (needs a grammar).
 - [ ] TL11. `fid doc` sites as good as docs.rs and pkg.go.dev (M).
 
 **Acceptance:** a new user is productive within an hour, on any supported system.
@@ -339,8 +360,9 @@ Go and Rust won developers with tools as much as with languages.
 
 Every platform gets a tier, and a tier means CI, not a hope.
 
-- [ ] PL1. Publish tiers: Tier 1 is tested on each commit, Tier 2 builds, Tier 3 is
+- [x] PL1. Publish tiers: Tier 1 is tested on each commit, Tier 2 builds, Tier 3 is
       best effort (S).
+      Done: `docs/reference/platforms.md`.
 - [ ] PL2. Tier 1: Windows x64, Linux x64, macOS ARM64, Linux ARM64 (release F4–F8)
       (XL).
 - [ ] PL3. Tier 2: Windows ARM64, macOS x64, FreeBSD, RISC-V (L).
@@ -356,19 +378,29 @@ Every platform gets a tier, and a tier means CI, not a hope.
 
 Trust is built by what we do not break.
 
-- [ ] ST1. Freeze the Rust compiler as a bootstrap only: new features land in
+- [x] ST1. Freeze the Rust compiler as a bootstrap only: new features land in
       `compiler/*.fd` alone. Writing everything twice is the largest drag on pace (M).
-- [ ] ST2. A written stability promise: code that compiles on 1.0 compiles on every
+      Done: `docs/reference/stability.md`; `fidesc test --compiler release/fid.exe` runs the suite on `fid`.
+- [x] ST2. A written stability promise: code that compiles on 1.0 compiles on every
       1.x (release K12) (S).
-- [ ] ST3. Editions, so the language can change without breaking old code (L).
-- [ ] ST4. A release every six weeks, on a date, whatever is ready (M).
-- [ ] ST5. Long-term support releases with security fixes (M).
-- [ ] ST6. Before each release, build every known public Fides project, as Rust's
+      Done: `docs/reference/stability.md`.
+- [~] ST3. Editions, so the language can change without breaking old code (L).
+      Done: the plan. Left: editions in the compiler.
+- [~] ST4. A release every six weeks, on a date, whatever is ready (M).
+      Done: the policy. Left: the first dated release.
+- [~] ST5. Long-term support releases with security fixes (M).
+      Done: the policy. Left: the first LTS release.
+- [~] ST6. Before each release, build every known public Fides project, as Rust's
       crater does (L).
-- [ ] ST7. A public process for language changes (S).
-- [ ] ST8. A security policy, a contact, and published advisories (S).
-- [ ] ST9. Release notes that name every breaking change (S).
-- [ ] ST10. Signed checksums for every download (S).
+      Done: the rule. Left: a list of public projects and the job that builds them.
+- [x] ST7. A public process for language changes (S).
+      Done: proposals in `docs/proposals/`, the process in `docs/reference/stability.md`.
+- [x] ST8. A security policy, a contact, and published advisories (S).
+      Done: `SECURITY.md` (private reporting, response times, advisories).
+- [x] ST9. Release notes that name every breaking change (S).
+      Done: the rule in `docs/reference/stability.md` and `CONTRIBUTING.md`.
+- [~] ST10. Signed checksums for every download (S).
+      Done: `SHA256SUMS` and a Sigstore build provenance attestation per archive in `release.yml`. Left: proven on a real release.
 
 **Acceptance:** two years of releases with no unannounced break.
 

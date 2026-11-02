@@ -1,0 +1,109 @@
+// stdlib/dns: the parts that need no network. Query packet construction
+// (RFC 1035 wire format), parsing a hand-built response with a CNAME, an
+// A and an AAAA answer behind compression pointers, and dns_lookup's
+// short-circuits for "localhost" and IPv4 literals.
+use dns;
+
+fn check_s(label: str, got: str, want: str) {
+    println(label + " = " + got);
+    if !str_equal(got, want) { p_panic("dns: wrong value for " + label); }
+}
+
+fn check_i(label: str, got: i64, want: i64) {
+    println(label + " = " + int_to_str(got));
+    if got != want { p_panic("dns: wrong value for " + label); }
+}
+
+fn hex_of(v: Vec) -> str {
+    var digits: str = "0123456789abcdef";
+    var out: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        var b: i64 = v.get(i);
+        out = out + str_slice(digits, (b >> 4) & 15, ((b >> 4) & 15) + 1) +
+              str_slice(digits, b & 15, (b & 15) + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+// Append the bytes of a hex string ("c00c0001") to v.
+fn push_hex(v: Vec, h: str) -> void {
+    var i: i64 = 0;
+    while i + 1 < str_len(h) {
+        v.push(hexval(str_byte_at(h, i)) * 16 + hexval(str_byte_at(h, i + 1)));
+        i = i + 2;
+    }
+}
+
+fn hexval(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    return c - 97 + 10;
+}
+
+// Copy a byte Vec into malloc'd memory, as dns_parse_response expects.
+fn to_buf(v: Vec) -> i64 {
+    var buf: i64 = 0;
+    unsafe {
+        buf = p_malloc(v.len() + 1);
+        var i: i64 = 0;
+        while i < v.len() {
+            p_volatile_store8(buf + i, v.get(i));
+            i = i + 1;
+        }
+    }
+    return buf;
+}
+
+fn main() -> i64 {
+    // Query packets
+    check_s("query A", hex_of(dns_build_query("example.com", 1)),
+            "60f101000001000000000000076578616d706c6503636f6d0000010001");
+    check_s("query AAAA", hex_of(dns_build_query("a.b.c", 28)),
+            "60f10100000100000000000001610162016300001c0001");
+    var q: Vec = dns_build_query("www.example.org", 15);
+    check_i("query MX len", q.len(), 12 + 17 + 4);
+    check_i("query MX qtype", q.get(q.len() - 3), 15);
+    // A 70-character label is cut to 63
+    var long: str = "";
+    var k: i64 = 0;
+    while k < 70 { long = long + "x"; k = k + 1; }
+    var ql: Vec = dns_build_query(long + ".io", 1);
+    check_i("long label len byte", ql.get(12), 63);
+    check_i("long label packet", ql.len(), 12 + 1 + 63 + 1 + 2 + 1 + 4);
+
+    // Response: example.com -> CNAME www.example.com, A 93.184.216.34,
+    // AAAA 2606:2800:220:1:248:1893:25c8:1946
+    var r: Vec = Vec::new();
+    push_hex(r, "5ff181800001000300000000");
+    push_hex(r, "076578616d706c6503636f6d0000010001");
+    push_hex(r, "c00c0005000100000e10000603777777c00c");
+    push_hex(r, "c00c0001000100000e1000045db8d822");
+    push_hex(r, "c00c001c000100000e100010260628000220000102481893" + "25c81946");
+    val buf: i64 = to_buf(r);
+    var ips: Vec<str> = dns_parse_response(buf, r.len());
+    check_i("answers", ips.len(), 2);
+    check_s("A", ips.get(0), "93.184.216.34");
+    check_s("AAAA", ips.get(1), "2606:2800:220:1:248:1893:25c8:1946");
+    // Answer count beyond the data: parsing stops at the end
+    check_i("truncated", dns_parse_response(buf, r.len() - 28).len(), 1);
+    check_i("short packet", dns_parse_response(buf, 11).len(), 0);
+    unsafe { p_free(buf); }
+
+    // Response with no answers
+    var e: Vec = Vec::new();
+    push_hex(e, "5ff181830001000000000000");
+    push_hex(e, "076578616d706c6503636f6d0000010001");
+    val ebuf: i64 = to_buf(e);
+    check_i("nxdomain", dns_parse_response(ebuf, e.len()).len(), 0);
+    unsafe { p_free(ebuf); }
+
+    // Lookups that never touch the network
+    check_s("lookup localhost", dns_lookup("localhost"), "127.0.0.1");
+    check_s("lookup LocalHost", dns_lookup("LocalHost"), "127.0.0.1");
+    check_s("lookup ip", dns_lookup("192.168.1.10"), "192.168.1.10");
+    check_s("lookup ip 0", dns_lookup("0.0.0.0"), "0.0.0.0");
+
+    println("dns ok");
+    return 0;
+}

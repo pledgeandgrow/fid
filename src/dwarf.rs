@@ -49,7 +49,8 @@ const DW_LNS_NEGATE_STMT: u8 = 6;
 const DW_LNS_SET_BASIC_BLOCK: u8 = 7;
 const DW_LNS_CONST_ADD_PC: u8 = 8;
 const DW_LNS_FIXED_ADVANCE_PC: u8 = 9;
-const DW_LNE_END_SEQUENCE: u8 = 0;
+const DW_LNE_END_SEQUENCE: u8 = 1;
+const DW_LNE_SET_ADDRESS: u8 = 2;
 
 // Special opcode base: opcode 0 is extended, 1-12 are standard, 13+ are special
 const SPECIAL_OPCODE_BASE: u8 = 13;
@@ -314,36 +315,37 @@ impl DwarfBuilder {
         // Line number program state machine
         let mut current_address: u64 = 0;
         let mut current_line: i32 = 1;
-        let mut current_file: u32 = 1;
+        let mut first = true;
 
         for entry in &self.line_entries {
-            // Set file
-            if current_file != 1 {
-                buf.push(DW_LNS_SET_FILE);
-                encode_uleb128(&mut buf, 1);
-                current_file = 1;
-            }
-
-            // Advance PC
+            // Advance PC. The program starts at address 0, so the first entry
+            // (a full virtual address) and any jump beyond u16 needs
+            // DW_LNE_SET_ADDRESS; DW_LNS_FIXED_ADVANCE_PC would truncate.
             let addr_diff = entry.address.saturating_sub(current_address);
-            if addr_diff > 0 {
-                // Try special opcode first (encodes both address and line advance)
+            if first || addr_diff > u16::MAX as u64 {
+                buf.push(0); // extended opcode marker
+                encode_uleb128(&mut buf, 9); // 1-byte op + 8-byte address
+                buf.push(DW_LNE_SET_ADDRESS);
+                buf.extend_from_slice(&entry.address.to_le_bytes());
+                current_address = entry.address;
+                first = false;
+            } else if addr_diff > 0 {
+                // Try a special opcode first (one byte encodes both advances).
+                // The encoded value must fit in a u8 — check before truncating.
                 let line_diff = entry.line as i32 - current_line;
                 let adjusted_line = line_diff - LINE_BASE;
-                if adjusted_line >= 0 && (adjusted_line as u32) < LINE_RANGE {
-                    let opcode = SPECIAL_OPCODE_BASE
-                        + (addr_diff as u32 * LINE_RANGE + adjusted_line as u32) as u8;
-                    if (opcode as u32) < 256 && addr_diff < 256 {
-                        buf.push(opcode);
-                        current_address = entry.address;
-                        current_line = entry.line as i32;
-                        continue;
-                    }
+                let special = SPECIAL_OPCODE_BASE as u32
+                    + addr_diff as u32 * LINE_RANGE
+                    + adjusted_line as u32;
+                if adjusted_line >= 0 && (adjusted_line as u32) < LINE_RANGE && special < 256 {
+                    buf.push(special as u8);
+                    current_address = entry.address;
+                    current_line = entry.line as i32;
+                    continue;
                 }
-                // Fall back to DW_LNS_ADVANCE_PC
                 if addr_diff < 256 {
                     buf.push(DW_LNS_ADVANCE_PC);
-                    encode_uleb128(&mut buf, addr_diff as u64);
+                    encode_uleb128(&mut buf, addr_diff);
                 } else {
                     buf.push(DW_LNS_FIXED_ADVANCE_PC);
                     buf.extend_from_slice(&(addr_diff as u16).to_le_bytes());

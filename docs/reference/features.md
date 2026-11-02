@@ -322,9 +322,9 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | `select` statement | ✅ | CSP-style channel select (`select { case ch => x => { } default => { } }`) |
 | Option/Result combinators | ✅ | `map`, `and_then`, `or_else`, `unwrap_or_else`, `expect` in `stdlib/core.fd` |
 | Vec iterator adapters | ✅ | `take`, `skip`, `zip`, `enumerate`, `flat_map`, `chunk`, `window`, `dedup`, `sort_by` |
-| Stack traces on panic | ✅ | Call stack trace printed on panic (interpreter + C codegen) |
+| Stack traces on panic | ✅ | Printed on panic. Compiled code walks the machine stack (unwind tables): nothing is recorded per call, and at -O2 inlined frames fold into their caller. The interpreter keeps its own call stack. |
 | Assertion builtins | ✅ | `assert(cond)`, `assert_eq(a, b)`, `assert_msg(cond, msg)`, `assert_eq_msg(a, b, msg)` in stdlib/core.fd. `assert_msg`/`assert_eq_msg` take f-string formatted messages. |
-| Recursion depth limit | ✅ | `--max-recursion N` flag (default 1000, 0 = unlimited). Interpreter panics with clear message when exceeded. |
+| Recursion depth limit | ✅ | Interpreter: `--max-recursion N` (default 1000, 0 = unlimited), with a clear panic. Compiled code has no fixed depth: running out of stack hits the OS guard page and prints "Stack overflow: the recursion is too deep" with a trace. |
 | Iterative parser fallback | ✅ | Shunting-yard parser activates for deeply nested expressions (>256 levels) to prevent stack overflow. |
 | `@constant_time` | ✅ | Security annotation: no early returns, no data-dependent branches, no IO/Net |
 | `@tainted` | ✅ | Taint tracking for untrusted input |
@@ -699,7 +699,7 @@ val out = quant::dequantize_q8(q_out); // dequantize result
 | Binary hardening (Phase 12) | Stack canaries, PIE, RELRO, NX stack | ✅ DONE (all C codegen output hardened by default, no opt-in) |
 | @constant_time (Phase 12) | Side-channel defense | ✅ DONE (no early returns, no data-dependent branches, no IO/Net/Spawn) |
 | @tainted (Phase 12) | Injection defense | ✅ DONE (prevents tainted values in SQL/shell/HTML/path sinks) |
-| Stack traces (Phase 12) | Panic call stack | ✅ DONE (interpreter + C codegen, p_call_stack_push/pop instrumentation) |
+| Stack traces (Phase 12) | Panic call stack | ✅ DONE (interpreter; C codegen from the machine stack since Nov 2, 2026, replacing per-call p_call_stack_push/pop) |
 
 ---
 

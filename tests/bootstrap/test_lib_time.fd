@@ -1,0 +1,127 @@
+// stdlib/time: LogicalTime construction, field extraction (including
+// timestamps before 1970), weekday, arithmetic, comparison, ISO
+// formatting, leap years, day of year, and the wall clock (checked only
+// for plausibility, never printed). Expected values come from Python's
+// calendar.timegm / datetime.
+use time;
+
+fn check_i(name: str, got: i64, want: i64) {
+    println(name + " = " + int_to_str(got));
+    if got != want {
+        p_panic(name + ": got " + int_to_str(got) + ", want " + int_to_str(want));
+    }
+}
+
+fn check_s(name: str, got: str, want: str) {
+    println(name + " = " + got);
+    if !str_equal(got, want) {
+        p_panic(name + ": got " + got + ", want " + want);
+    }
+}
+
+fn bstr(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn check_b(name: str, got: bool, want: bool) {
+    println(name + " = " + bstr(got));
+    if got != want {
+        p_panic(name + ": wrong");
+    }
+}
+
+fn fields(t: LogicalTime) -> str {
+    return int_to_str(time_get_year(t)) + "/" + int_to_str(time_get_month(t)) + "/" +
+        int_to_str(time_get_day(t)) + " " + int_to_str(time_get_hour(t)) + ":" +
+        int_to_str(time_get_minute(t)) + ":" + int_to_str(time_get_second(t)) +
+        " wd" + int_to_str(time_get_weekday(t)) + " yd" + int_to_str(time_get_day_of_year(t));
+}
+
+fn main() -> i64 {
+    // Construction → Unix seconds
+    check_i("2000-01-01", time_from_date(2000, 1, 1).seconds, 946684800);
+    check_i("2024-02-29 12:34:56", time_new(2024, 2, 29, 12, 34, 56).seconds, 1709210096);
+    check_i("1900-01-01", time_from_date(1900, 1, 1).seconds, 0 - 2208988800);
+    check_i("1969-12-31 23:59:59", time_new(1969, 12, 31, 23, 59, 59).seconds, 0 - 1);
+    check_i("2038-01-19 03:14:08", time_new(2038, 1, 19, 3, 14, 8).seconds, 2147483648);
+    check_i("1600-03-01", time_from_date(1600, 3, 1).seconds, 0 - 11670912000);
+    check_i("9999-12-31 23:59:59", time_new(9999, 12, 31, 23, 59, 59).seconds, 253402300799);
+    check_i("epoch", time_from_date(1970, 1, 1).seconds, 0);
+    check_i("from_timestamp", time_from_timestamp(123).seconds, 123);
+
+    // Field extraction, weekday (0 = Sunday), day of year
+    check_s("fields 0", fields(time_from_timestamp(0)), "1970/1/1 0:0:0 wd4 yd1");
+    check_s("fields 2024", fields(time_from_timestamp(1709210096)), "2024/2/29 12:34:56 wd4 yd60");
+    check_s("fields 2000-02-29", fields(time_from_timestamp(951782400)), "2000/2/29 0:0:0 wd2 yd60");
+    check_s("fields 9999", fields(time_from_timestamp(253402300799)), "9999/12/31 23:59:59 wd5 yd365");
+    // Before 1970: the day must round down, not toward zero
+    check_s("fields -1", fields(time_from_timestamp(0 - 1)), "1969/12/31 23:59:59 wd3 yd365");
+    check_s("fields -86400", fields(time_from_timestamp(0 - 86400)), "1969/12/31 0:0:0 wd3 yd365");
+    check_s("fields -86401", fields(time_from_timestamp(0 - 86401)), "1969/12/30 23:59:59 wd2 yd364");
+    check_s("fields 1900", fields(time_from_timestamp(0 - 2208988800)), "1900/1/1 0:0:0 wd1 yd1");
+
+    // ISO / date formatting
+    check_s("iso 2024", time_to_iso(time_new(2024, 2, 29, 12, 34, 56)), "2024-02-29T12:34:56Z");
+    check_s("iso epoch", time_to_iso(time_from_timestamp(0)), "1970-01-01T00:00:00Z");
+    check_s("iso -1", time_to_iso(time_from_timestamp(0 - 1)), "1969-12-31T23:59:59Z");
+    check_s("iso year 5", time_to_iso(time_new(5, 6, 7, 8, 9, 10)), "0005-06-07T08:09:10Z");
+    check_s("date 1999-12-31", time_to_date_string(time_new(1999, 12, 31, 23, 0, 0)), "1999-12-31");
+    check_s("date roundtrip", time_to_date_string(time_from_date(2023, 11, 5)), "2023-11-05");
+
+    // Arithmetic
+    var t = time_from_date(2024, 2, 28);
+    check_s("add 1 day", time_to_date_string(time_add_days(t, 1)), "2024-02-29");
+    check_s("add 2 days", time_to_date_string(time_add_days(t, 2)), "2024-03-01");
+    check_s("add hours", time_to_iso(time_add_hours(t, 25)), "2024-02-29T01:00:00Z");
+    check_s("add minutes", time_to_iso(time_add_minutes(t, 90)), "2024-02-28T01:30:00Z");
+    check_s("add seconds", time_to_iso(time_add_seconds(t, 59)), "2024-02-28T00:00:59Z");
+    check_s("sub seconds", time_to_iso(time_sub_seconds(t, 1)), "2024-02-27T23:59:59Z");
+    check_s("year rollover", time_to_iso(time_add_seconds(time_new(2023, 12, 31, 23, 59, 59), 1)), "2024-01-01T00:00:00Z");
+    var a = time_from_date(2024, 3, 1);
+    var b = time_from_date(2023, 3, 1);
+    check_i("diff days leap year", time_diff_days(a, b), 366);
+    check_i("diff seconds", time_diff_seconds(time_add_seconds(a, 5), a), 5);
+    check_i("diff seconds neg", time_diff_seconds(b, a), 0 - 31622400);
+
+    // Comparison
+    check_b("before", time_before(b, a), true);
+    check_b("before rev", time_before(a, b), false);
+    check_b("after", time_after(a, b), true);
+    check_b("eq", time_eq(a, time_from_timestamp(a.seconds)), true);
+    check_b("eq diff", time_eq(a, b), false);
+    check_b("before_eq same", time_before_eq(a, a), true);
+    check_b("before_eq later", time_before_eq(a, b), false);
+
+    // Leap years and month lengths
+    check_b("leap 2000", is_leap_year(2000), true);
+    check_b("leap 1900", is_leap_year(1900), false);
+    check_b("leap 2024", is_leap_year(2024), true);
+    check_b("leap 2023", is_leap_year(2023), false);
+    check_i("feb 2024", days_in_month(2024, 2), 29);
+    check_i("feb 1900", days_in_month(1900, 2), 28);
+    check_i("feb 2000", days_in_month(2000, 2), 29);
+    var total: i64 = 0;
+    var m: i64 = 1;
+    while m <= 12 {
+        total = total + days_in_month(2023, m);
+        m = m + 1;
+    }
+    check_i("days in 2023", total, 365);
+    check_i("apr", days_in_month(2023, 4), 30);
+    check_i("dec", days_in_month(2023, 12), 31);
+    check_i("doy dec 31 leap", time_get_day_of_year(time_from_date(2024, 12, 31)), 366);
+
+    // Wall clock: only plausibility (after 2020-09-13, elapsed >= 0)
+    val ns: i64 = clock_now_ns();
+    val us: i64 = clock_now_us();
+    val ms: i64 = clock_now_ms();
+    check_b("clock ns plausible", ns > 1600000000000000000, true);
+    check_b("clock us plausible", us > 1600000000000000, true);
+    check_b("clock ms plausible", ms > 1600000000000, true);
+    check_b("elapsed ns >= 0", clock_elapsed_ns(ns) >= 0, true);
+    check_b("elapsed us >= 0", clock_elapsed_us(us) >= 0, true);
+    check_b("elapsed ms >= 0", clock_elapsed_ms(ms) >= 0, true);
+    println("time ok");
+    return 0;
+}

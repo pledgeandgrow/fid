@@ -253,3 +253,32 @@ pub fn sync_channel_close(ch: i64) -> void {
 pub fn sync_channel_is_closed(ch: i64) -> bool {
     return p_chan_is_closed(ch) != 0;
 }
+
+// ─── Scoped locking ─────────────────────────────────────────────────────
+
+/// Lock `m`, run `f`, and release the lock when `f` returns — including the
+/// `?`-propagation and panic paths, because the release rides `defer`.
+///
+///   val m = sync_mutex_create();
+///   val total = with_lock(m, tally);
+///
+/// Prefer this over manual lock/unlock pairs: it cannot forget to unlock.
+pub fn with_lock(m: i64, f: fn() -> i64) -> i64 {
+    sync_mutex_lock(m);
+    defer { sync_mutex_unlock(m); }
+    return f();
+}
+
+/// Same, for read-write locks: holds the write lock for `f`'s duration.
+pub fn with_write_lock(rwlock: i64, f: fn() -> i64) -> i64 {
+    sync_rwlock_write_lock(rwlock);
+    defer { sync_rwlock_write_unlock(rwlock); }
+    return f();
+}
+
+/// Same, for read-write locks: holds the read lock for `f`'s duration.
+pub fn with_read_lock(rwlock: i64, f: fn() -> i64) -> i64 {
+    sync_rwlock_read_lock(rwlock);
+    defer { sync_rwlock_read_unlock(rwlock); }
+    return f();
+}

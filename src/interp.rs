@@ -841,6 +841,17 @@ impl Interpreter {
         }
     }
 
+    /// Run a single named function as the entry point (used by `fidesc test
+    /// <file.fd>` for `@test` functions). Each call should use a fresh
+    /// Interpreter so runs are isolated from one another.
+    pub fn run_named(&mut self, name: &str) -> RunResult {
+        if let Some(f) = self.module.functions.get(name).cloned() {
+            self.run_function(&f, &[])
+        } else {
+            RunResult::Panic(format!("No function named '{}' found", name))
+        }
+    }
+
     /// Phase 10B: Convert a Fides Vec (i64 pointer) to a Value::Vec
     /// by reading elements via Vec_get.
     /// Look up a Vec value from either Value::Int (address) or Value::Vec.
@@ -2828,6 +2839,20 @@ impl Interpreter {
 
     /// Call a runtime function
     fn call_runtime(&mut self, name: &str, args: &[Value]) -> ExecOutcome {
+        // One Vec implementation: core's. A p_vec_* builtin on a core Vec (a
+        // handle) runs core's function, as on the other backends.
+        if let Some(core) = core_vec_fn(name) {
+            let on_core = name == "p_vec_new" || matches!(args.first(), Some(Value::Int(_)));
+            if let (true, Some(f)) = (on_core, self.module.functions.get(core).cloned()) {
+                let mut call_args = vec![Value::Int(0)];
+                call_args.extend(args.iter().cloned());
+                return match self.run_function(&f, &call_args) {
+                    RunResult::Return(v) => ExecOutcome::Value(v),
+                    RunResult::Panic(msg) => ExecOutcome::Panic(msg),
+                    _ => ExecOutcome::Value(Value::Void),
+                };
+            }
+        }
         match name {
             "p_print_int" => {
                 if let Some(Value::Int(i)) = args.first() {
@@ -3725,6 +3750,12 @@ impl Interpreter {
             "p_vec_clone" => {
                 if let Some(Value::Vec(arr)) = args.first() {
                     return ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(arr.borrow().clone()))));
+                }
+                // A core Vec is a handle: core's Vec_clone copies its elements
+                if let (Some(Value::Int(h)), Some(f)) = (args.first(), self.module.functions.get("Vec_clone").cloned()) {
+                    if let RunResult::Return(v) = self.run_function(&f, &[Value::Int(0), Value::Int(*h)]) {
+                        return ExecOutcome::Value(v);
+                    }
                 }
                 ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(SmallVec::new()))))
             }
@@ -5324,6 +5355,11 @@ impl Interpreter {
                     .unwrap_or_default();
                 ExecOutcome::Value(Value::Int(now.as_nanos() as i64))
             }
+            // 64 bits from the operating system's secure generator
+            "p_os_random_u64" => match os_random_u64() {
+                Some(v) => ExecOutcome::Value(Value::Int(v as i64)),
+                None => ExecOutcome::Panic("no random source in the operating system".to_string()),
+            },
             // Returns current time in microseconds since Unix epoch.
             "p_clock_now_us" => {
                 use std::time::{SystemTime, UNIX_EPOCH};
@@ -6668,6 +6704,54 @@ fn simd_binary(args: &[Value], f: impl Fn(f64, f64) -> f64) -> ExecOutcome {
 }
 
 /// Outcome of executing a single instruction
+/// The core function a `p_vec_*` builtin stands for.
+fn core_vec_fn(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "p_vec_new" => "Vec_new",
+        "p_vec_push" => "Vec_push",
+        "p_vec_len" => "Vec_len",
+        "p_vec_get" => "Vec_get",
+        "p_vec_set" => "Vec_set",
+        "p_vec_pop" => "Vec_pop",
+        "p_vec_is_empty" => "Vec_is_empty",
+        "p_vec_clear" => "Vec_clear",
+        "p_vec_capacity" => "Vec_capacity",
+        "p_vec_first" => "Vec_first",
+        "p_vec_last" => "Vec_last",
+        "p_vec_contains" => "Vec_contains",
+        "p_vec_truncate" => "Vec_truncate",
+        "p_vec_clone" => "Vec_clone",
+        "p_vec_insert" => "vec_raw_insert",
+        "p_vec_remove" => "vec_raw_remove",
+        "p_vec_reverse" => "vec_raw_reverse",
+        "p_vec_extend" => "vec_raw_extend",
+        "p_vec_sort" => "vec_raw_sort",
+        _ => return None,
+    })
+}
+
+/// 64 random bits from the operating system's secure generator.
+fn os_random_u64() -> Option<u64> {
+    let mut b = [0u8; 8];
+    #[cfg(windows)]
+    {
+        #[link(name = "bcrypt")]
+        extern "system" {
+            fn BCryptGenRandom(alg: *mut std::ffi::c_void, buf: *mut u8, len: u32, flags: u32) -> i32;
+        }
+        // 2: BCRYPT_USE_SYSTEM_PREFERRED_RNG
+        if unsafe { BCryptGenRandom(std::ptr::null_mut(), b.as_mut_ptr(), 8, 2) } != 0 {
+            return None;
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).ok()?;
+    }
+    Some(u64::from_le_bytes(b))
+}
+
 enum ExecOutcome {
     /// Continue to next instruction (no value produced)
     Continue,

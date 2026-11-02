@@ -1,0 +1,90 @@
+// stdlib/mime: extension and path lookups, reverse lookup, Content-Type
+// parsing (base type and parameters) and classification.
+use mime;
+
+fn check_s(label: str, got_in: str, want: str) -> void {
+    // copy into a typed local first: the interpreter prints an empty
+    // malloc'd string (str_trim("") etc.) passed straight in as a number
+    var got: str = got_in;
+    println(label + " = " + got);
+    if !str_equal(got, want) { p_panic("mime: wrong " + label); }
+}
+
+fn check_b(label: str, got: bool, want: bool) -> void {
+    println(label + " = " + bool_to_str(got));
+    if got != want { p_panic("mime: wrong " + label); }
+}
+
+fn bool_to_str(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn main() -> i64 {
+    // extension lookups (with/without dot, case, whitespace)
+    check_s("ext html", mime_from_ext("html"), "text/html");
+    check_s("ext .PNG", mime_from_ext(".PNG"), "image/png");
+    check_s("ext ' jpg '", mime_from_ext(" jpg "), "image/jpeg");
+    check_s("ext json", mime_from_ext("json"), "application/json");
+    check_s("ext svg", mime_from_ext("svg"), "image/svg+xml");
+    check_s("ext mp3", mime_from_ext("mp3"), "audio/mpeg");
+    check_s("ext woff2", mime_from_ext("woff2"), "font/woff2");
+    check_s("ext pdf", mime_from_ext("pdf"), "application/pdf");
+    check_s("ext docx", mime_from_ext("docx"),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    check_s("ext sqlite", mime_from_ext("sqlite"), "application/vnd.sqlite3");
+    check_s("ext msi", mime_from_ext("msi"), "application/octet-stream");
+    // the last table rows (the type list once ran one entry short here)
+    check_s("ext dmg", mime_from_ext("dmg"), "application/x-apple-diskimage");
+    check_s("ext iso", mime_from_ext("iso"), "application/x-iso9660-image");
+    check_s("ext apk", mime_from_ext("apk"), "application/vnd.android.package-archive");
+    check_s("ext deb", mime_from_ext("deb"), "application/x-deb");
+    check_s("ext rpm", mime_from_ext("rpm"), "application/x-rpm");
+    check_s("ext unknown", mime_from_ext("zzz"), "application/octet-stream");
+    check_s("ext empty", mime_from_ext(""), "application/octet-stream");
+
+    // paths
+    check_s("path index.html", mime_from_path("site/index.html"), "text/html");
+    check_s("path a.tar.gz", mime_from_path("dist/a.tar.gz"), "application/gzip");
+    check_s("path Makefile", mime_from_path("Makefile"), "application/octet-stream");
+    check_s("path main.fd", mime_from_path("src/main.fd"), "text/plain");
+
+    // known
+    check_b("known png", mime_known("png"), true);
+    check_b("known bin", mime_known("bin"), true);
+    check_b("known xyz", mime_known("xyz"), false);
+
+    // reverse lookup
+    check_s("ext_for image/jpeg", mime_ext_for("image/jpeg"), "jpg");
+    check_s("ext_for text/html;charset", mime_ext_for("Text/HTML; charset=utf-8"), "html");
+    check_s("ext_for x-apple-diskimage", mime_ext_for("application/x-apple-diskimage"), "dmg");
+    check_s("ext_for rpm", mime_ext_for("application/x-rpm"), "rpm");
+    check_s("ext_for unknown", mime_ext_for("foo/bar"), "");
+
+    // Content-Type parsing
+    check_s("base", mime_base("text/html; charset=utf-8"), "text/html");
+    check_s("base upper", mime_base("  Application/JSON  "), "application/json");
+    check_s("param charset", mime_param("text/html; charset=utf-8", "charset"), "utf-8");
+    check_s("param quoted", mime_param("multipart/form-data; boundary=\"abc 123\"", "BOUNDARY"), "abc 123");
+    check_s("param second", mime_param("text/plain; format=flowed; charset=us-ascii", "charset"), "us-ascii");
+    check_s("param missing", mime_param("text/plain; format=flowed", "charset"), "");
+    check_s("param none", mime_param("text/plain", "charset"), "");
+
+    // classification
+    check_b("is_text text/css", mime_is_text("text/css"), true);
+    check_b("is_text json", mime_is_text("application/json; charset=utf-8"), true);
+    check_b("is_text ld+json", mime_is_text("application/ld+json"), true);
+    check_b("is_text png", mime_is_text("image/png"), false);
+    check_b("is_image", mime_is_image("image/webp"), true);
+    check_b("is_image text", mime_is_image("text/plain"), false);
+    check_b("is_audio", mime_is_audio("audio/ogg"), true);
+    check_b("is_video", mime_is_video("video/mp4"), true);
+    check_b("is_video audio", mime_is_video("audio/mp4"), false);
+    check_b("compressible svg", mime_is_compressible("image/svg+xml"), true);
+    check_b("compressible wasm", mime_is_compressible("application/wasm"), true);
+    check_b("compressible html", mime_is_compressible("text/html"), true);
+    check_b("compressible zip", mime_is_compressible("application/zip"), false);
+    check_b("compressible jpeg", mime_is_compressible("image/jpeg"), false);
+    println("mime ok");
+    return 0;
+}

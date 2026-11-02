@@ -4,8 +4,8 @@
 > Fides compiler safely. Read this before making changes.
 >
 > **Fides is self-hosted and independent.** The primary compiler is in
-> `compiler/*.fd` (54 modules, 104,439 LOC). The Rust source in `src/*.rs`
-> (55 files, 100,935 LOC) is the bootstrap reference, used when
+> `compiler/*.fd` (59 modules, 127,707 LOC). The Rust source in `src/*.rs`
+> (56 files, 109,561 LOC) is the bootstrap reference, used when
 > `compiler/*.fd` changes.
 >
 > **The self-hosted compiler is the release compiler:** `RELEASE=1
@@ -150,24 +150,24 @@ cargo build
 # Manual trigger: gh workflow run build-installer.yml -f version=1.0.0
 ```
 
-## Current Baseline (post-session-34, Oct 27 2026)
+## Current Baseline (post-session-38, Nov 2 2026)
 
 ```
 SELF-HOSTED COMPILER (primary source):
-  compiler/*.fd:  54 modules, 104,439 LOC — THE COMPILER
+  compiler/*.fd:  59 modules, 127,707 LOC — THE COMPILER
   Fixpoint:       VERIFIED byte-for-byte (fides-c4.c == fides-c5.c, ~29.7 MB;
                   re-verified stage2==stage3 in session 29)
   Bootstrap:      5 generations verified (Rust → c1 → c2 → c3 → c4 → c5)
   Binary:         release/fid.exe (RELEASE=1 scripts/bootstrap.sh):
                   fixpoint; run 302/302 and ccompile 242/243 test programs
                   match fidesc (Known Bugs #1). Shipped as fid.exe.
-  Self-compile:   stage 2 `dump-c compiler/main.fd` 136 s (Nov 2; was ~600 s),
+  Self-compile:   stage 2 `dump-c compiler/main.fd` 112–137 s (Nov 2; was ~600 s),
                   fidesc 21 s. The compiler is built at -O0 (bootstrap.sh).
 
 RUST BOOTSTRAP (reference + test harness):
-  src/*.rs:       55 files, 100,935 LOC — bootstrap reference
+  src/*.rs:       56 files, 109,561 LOC — bootstrap reference
   Used when:      compiler/*.fd changes (builds stage 1); runs `fidesc test`
-  Suite (Nov 2):  interp 334/334, C 338/338, PE 341/341, expected-fail 89/89
+  Suite (Nov 2):  interp 339/339, C 343/343, PE 345/345, expected-fail 89/89
 
 WINDOWS INSTALLER (v1.0.0):
   installer/:     NSIS script + build helper
@@ -177,14 +177,25 @@ WINDOWS INSTALLER (v1.0.0):
                  Rust compiler, stdlib/ and examples/ beside them
 
 TESTS:
-  tests/bootstrap/: 302 .fd files (fidesc test)
-  tests/selfhost/:  47 .fd files (verify-selfhost.sh; baseline saved 36/47×3)
+  tests/bootstrap/: 393 .fd files (fidesc test; plus capability/, effects/,
+                    regions/, safety/)
+  tests/selfhost/:  51 .fd files (verify-selfhost.sh; baseline saved 36/47×3)
   Baseline:         tests/bootstrap/baseline/test_results.txt
 
 STDLIB:
-  stdlib/*.fd:    104 modules, 30,446 LOC (kernel/uefi moved to fides-os project)
+  stdlib/*.fd:    133 modules, 42,018 LOC (kernel/uefi moved to fides-os project)
 
 RECENT IMPROVEMENTS:
+  Session 38:     C path: no per-call call-stack push/pop; panic traces from
+                  the machine stack (__p_frames / __p_fn_name over the
+                  __p_fns table), stack overflow from the OS guard page
+                  (SetThreadStackGuarantee, sigaltstack); fib through C 3.0 s
+                  -> 0.81 s. Counted-loop check removal shared with C
+                  (compiler/checks.fd, pe::unchecked_ops). Vec_push inlines.
+                  Native: shadow space once, flags-only compares, fall-through
+                  blocks, params in registers, short immediates. One Vec
+                  implementation: every backend's p_vec_* runs core's Vec_*.
+                  Crypto vectors (NIST, RFC 4231), p_os_random_u64.
   Session 37:     Self-compile 4.4x faster (601 s -> 136 s, fixpoint kept),
                   found with a stack sampler on the stage-3 C. C runtime prints
                   with one fwrite per print (printf on unbuffered stdout wrote a
@@ -252,6 +263,9 @@ Binaries:     4 (fidesc, ark, scribe, veil) + the self-hosted fid
 
 **Build directories:**
 - `target/` — Rust bootstrap compiler output (`fidesc.exe`) — gitignored
+- Never commit a build directory. `target3/` (an agent's build folder) went
+  into commits f9c55d8/087609a by mistake; it is now in `.gitignore`. Agents
+  build in their scratch folder (`CARGO_TARGET_DIR`), not in the repository.
 - `release/` — Self-hosted compiler output: `fid.exe` (from the release
   bootstrap, or a single stage with `fid.c` from build-selfhost.sh) — gitignored
 - `compiler/` — Self-hosted compiler source (54 `.fd` modules) — THE PRIMARY COMPILER
@@ -437,6 +451,23 @@ touching them.
    `str_index`. A function's parameters take value ids without instructions,
    so `id == index` does not hold. Any code that replaces `module.functions`
    wholesale must `HashMap_clear(module.fn_index)`.
+
+15. **Per-call bookkeeping in generated C** (both C generators): do not
+   bring back `p_call_stack_push`/`pop` or a recursion counter. Traces come
+   from the machine stack (`__p_print_trace_ctx`); overflow from the guard
+   page. `zig cc` off Windows needs `-lunwind` for `_Unwind_Backtrace`
+   (main.rs, main.fd, bootstrap.sh, build-selfhost.sh add it).
+
+16. **One `Vec` implementation** (`pe_runtime_alias`, `pe_ir_stubs.fd`,
+   `interp.rs core_vec_fn`): every `p_vec_*` builtin runs core's `Vec_*`
+   function. Do not add a backend stub with its own semantics; the old ones
+   disagreed (`clone` shared data, `first` returned garbage). The C runtime's
+   `PVec` functions share core's layout and must keep doing so.
+   `test_vec_builtins.fd` checks every backend agrees.
+
+17. **The counted-loop analysis lives in `compiler/checks.fd`**, not in
+   `pe_ir.fd`: `codegen_c.fd` importing `pe_ir` doubled the C of any program
+   that uses the C generator (`test_codegen_c` 5 MB -> 11 MB).
 
 ## NEVER DO THESE (Hard Rules)
 

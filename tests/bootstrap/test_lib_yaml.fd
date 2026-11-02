@@ -1,0 +1,166 @@
+// stdlib/yaml: nested maps, block lists (indented and at the key's own
+// indent), list items holding maps, scalar typing (int/float/bool/null
+// versus plain strings such as versions), quoting and escapes, comments,
+// document markers, CRLF input and the typed accessors.
+use yaml;
+
+fn check_s(name: str, got: str, want: str) {
+    println(name + " = " + got);
+    if !str_equal(got, want) {
+        p_panic(name + ": got [" + got + "], want [" + want + "]");
+    }
+}
+
+fn check_i(name: str, got: i64, want: i64) {
+    println(name + " = " + int_to_str(got));
+    if got != want {
+        p_panic(name + ": got " + int_to_str(got) + ", want " + int_to_str(want));
+    }
+}
+
+fn check_b(name: str, got: bool, want: bool) {
+    var g: str = "false";
+    if got { g = "true"; }
+    println(name + " = " + g);
+    if got != want {
+        p_panic(name + ": wrong");
+    }
+}
+
+// "kind:value" of the entry at `path`
+fn kv(doc: Vec<YamlEntry>, path: str) -> str {
+    val v: YamlValue = yaml_get(doc, path);
+    return v.kind + ":" + v.sval;
+}
+
+// Kind of a one-line document "v: <text>"
+fn kind_of(text: str) -> str {
+    val d: Vec<YamlEntry> = yaml_parse("v: " + text);
+    return yaml_kind(d, "v");
+}
+
+fn main() -> i64 {
+    var text: str = "# leading comment\n---\napiVersion: v1\nkind: Pod\nmetadata:\n";
+    text = text + "  name: web   # trailing comment\n  labels:\n    app: \"my app\"\n";
+    text = text + "    tier: 'it''s'\n\nspec:\n  replicas: 3\n  ratio: 0.75\n  big: 1.5e3\n";
+    text = text + "  neg: -12\n  enabled: true\n  off: False\n  nothing: ~\n  version: 1.2.3\n";
+    text = text + "  hash: abc#def\n  url: http://x.org:80/p\n  containers:\n";
+    text = text + "    - name: nginx\n      image: nginx:1.25\n      ports:\n";
+    text = text + "        - containerPort: 80\n        - containerPort: 443\n";
+    text = text + "    - name: sidecar\n  args:\n  - --verbose\n  - \"-x\"\n  tags: [a, b]\n...\n";
+    val doc: Vec<YamlEntry> = yaml_parse(text);
+
+    check_s("apiVersion", kv(doc, "apiVersion"), "str:v1");
+    check_s("kind", kv(doc, "kind"), "str:Pod");
+    check_s("metadata", kv(doc, "metadata"), "map:");
+    check_s("name (comment stripped)", kv(doc, "metadata.name"), "str:web");
+    check_s("labels", yaml_kind(doc, "metadata.labels"), "map");
+    check_s("double quoted", kv(doc, "metadata.labels.app"), "str:my app");
+    check_s("single quoted", kv(doc, "metadata.labels.tier"), "str:it's");
+    check_s("replicas", kv(doc, "spec.replicas"), "int:3");
+    check_s("ratio", kv(doc, "spec.ratio"), "float:0.75");
+    check_s("big", kv(doc, "spec.big"), "float:1.5e3");
+    check_s("neg", kv(doc, "spec.neg"), "int:-12");
+    check_s("enabled", kv(doc, "spec.enabled"), "bool:true");
+    check_s("off", kv(doc, "spec.off"), "bool:false");
+    check_s("nothing", kv(doc, "spec.nothing"), "null:");
+    check_s("version string", kv(doc, "spec.version"), "str:1.2.3");
+    check_s("hash not comment", kv(doc, "spec.hash"), "str:abc#def");
+    check_s("url colons", kv(doc, "spec.url"), "str:http://x.org:80/p");
+    check_s("containers", yaml_kind(doc, "spec.containers"), "list");
+    check_s("container 0", yaml_kind(doc, "spec.containers.0"), "map");
+    check_s("container 0 name", yaml_get_str(doc, "spec.containers.0.name"), "nginx");
+    check_s("container 0 image", yaml_get_str(doc, "spec.containers.0.image"), "nginx:1.25");
+    check_s("ports", yaml_kind(doc, "spec.containers.0.ports"), "list");
+    check_i("port 0", yaml_get_int(doc, "spec.containers.0.ports.0.containerPort", 0), 80);
+    check_i("port 1", yaml_get_int(doc, "spec.containers.0.ports.1.containerPort", 0), 443);
+    check_s("container 1 name", yaml_get_str(doc, "spec.containers.1.name"), "sidecar");
+    check_s("args (same indent as key)", yaml_kind(doc, "spec.args"), "list");
+    check_s("arg 0", kv(doc, "spec.args.0"), "str:--verbose");
+    check_s("arg 1", kv(doc, "spec.args.1"), "str:-x");
+    check_s("flow list kept as text", kv(doc, "spec.tags"), "str:[a, b]");
+    check_i("list_len containers", yaml_list_len(doc, "spec.containers"), 2);
+    check_i("list_len ports", yaml_list_len(doc, "spec.containers.0.ports"), 2);
+    check_i("list_len args", yaml_list_len(doc, "spec.args"), 2);
+    check_i("list_len map", yaml_list_len(doc, "metadata"), 0);
+    check_i("list_len missing", yaml_list_len(doc, "nope"), 0);
+    check_b("has", yaml_has(doc, "spec.containers.1.name"), true);
+    check_b("has missing", yaml_has(doc, "spec.containers.2"), false);
+    check_s("missing kind", yaml_kind(doc, "spec.zzz"), "missing");
+    check_i("missing str", str_len(yaml_get_str(doc, "spec.zzz")), 0);
+
+    // Typed accessors and their defaults
+    check_i("get_int", yaml_get_int(doc, "spec.replicas", 7), 3);
+    check_i("get_int neg", yaml_get_int(doc, "spec.neg", 7), 0 - 12);
+    check_i("get_int on str", yaml_get_int(doc, "kind", 7), 7);
+    check_i("get_int on float", yaml_get_int(doc, "spec.ratio", 7), 7);
+    check_i("get_float", (yaml_get_float(doc, "spec.big", 0.0) * 10.0) as i64, 15000);
+    check_i("get_float ratio", (yaml_get_float(doc, "spec.ratio", 0.0) * 100.0) as i64, 75);
+    check_i("get_float int", (yaml_get_float(doc, "spec.replicas", 0.0) * 10.0) as i64, 30);
+    check_i("get_float default", (yaml_get_float(doc, "kind", 2.5) * 10.0) as i64, 25);
+    check_b("get_bool", yaml_get_bool(doc, "spec.enabled", false), true);
+    check_b("get_bool false", yaml_get_bool(doc, "spec.off", true), false);
+    check_b("get_bool default", yaml_get_bool(doc, "spec.replicas", true), true);
+
+    // Scalar typing
+    check_s("int 0", kind_of("0"), "int");
+    check_s("int +5", kind_of("+5"), "int");
+    check_s("float -.5", kind_of("-.5"), "float");
+    check_s("float 1.", kind_of("1."), "float");
+    check_s("float 1e5", kind_of("1e5"), "float");
+    check_s("float 2.5E-3", kind_of("2.5E-3"), "float");
+    check_s("str 1e", kind_of("1e"), "str");
+    check_s("str e5", kind_of("e5"), "str");
+    check_s("str e", kind_of("e"), "str");
+    check_s("str dot", kind_of("."), "str");
+    check_s("str dash", kind_of("-"), "str");
+    check_s("str --1", kind_of("--1"), "str");
+    check_s("str 1-2", kind_of("1-2"), "str");
+    check_s("str 1_000", kind_of("1_000"), "str");
+    check_s("str 10.0.0.1", kind_of("10.0.0.1"), "str");
+    check_s("bool True", kind_of("True"), "bool");
+    check_s("bool TRUE", kind_of("TRUE"), "bool");
+    check_s("bool FALSE", kind_of("FALSE"), "bool");
+    check_s("null NULL", kind_of("NULL"), "null");
+    check_s("null null", kind_of("null"), "null");
+    check_s("str yes", kind_of("yes"), "str");
+    check_s("quoted number is str", kind_of("\"42\""), "str");
+
+    // Escapes, quoted keys, '#' inside quotes, empty value
+    var t2: str = "s: \"tab\\there \\\"q\\\" back\\\\slash\"\nk2: 'single # not comment' # real\n";
+    t2 = t2 + "\"quoted key\": 5\n'other key': x\nempty: \"\"\n";
+    val d2: Vec<YamlEntry> = yaml_parse(t2);
+    check_s("escapes", yaml_get_str(d2, "s"), "tab\there \"q\" back\\slash");
+    check_s("hash in quotes", yaml_get_str(d2, "k2"), "single # not comment");
+    check_i("quoted key", yaml_get_int(d2, "quoted key", 0), 5);
+    check_s("single quoted key", yaml_get_str(d2, "other key"), "x");
+    check_s("empty quoted", kv(d2, "empty"), "str:");
+
+    // Root list, bare "-" items, list item maps with a nested list
+    var t3: str = "- one\n- 2\n-\n  x: 1\n  y: 2\n- name: n\n  sub:\n  - p\n  - q\n- last\n";
+    val d3: Vec<YamlEntry> = yaml_parse(t3);
+    check_s("root 0", kv(d3, "0"), "str:one");
+    check_s("root 1", kv(d3, "1"), "int:2");
+    check_s("bare item", yaml_kind(d3, "2"), "map");
+    check_i("bare item x", yaml_get_int(d3, "2.x", 0), 1);
+    check_i("bare item y", yaml_get_int(d3, "2.y", 0), 2);
+    check_s("item map name", yaml_get_str(d3, "3.name"), "n");
+    check_s("item nested list", yaml_kind(d3, "3.sub"), "list");
+    check_s("item nested 0", yaml_get_str(d3, "3.sub.0"), "p");
+    check_s("item nested 1", yaml_get_str(d3, "3.sub.1"), "q");
+    check_s("root last", kv(d3, "4"), "str:last");
+    check_i("root list_len", yaml_list_len(d3, ""), 0);
+
+    // CRLF lines, two documents, a repeated key (the last one wins)
+    val d4: Vec<YamlEntry> = yaml_parse("a: 1\r\nb:\r\n  c: x\r\n---\r\na: 2\r\n");
+    check_i("crlf a (last wins)", yaml_get_int(d4, "a", 0), 2);
+    check_s("crlf nested", kv(d4, "b.c"), "str:x");
+
+    // Empty input
+    val d5: Vec<YamlEntry> = yaml_parse("");
+    check_i("empty doc", d5.len(), 0);
+    val d6: Vec<YamlEntry> = yaml_parse("# only a comment\n\n   \n");
+    check_i("comment-only doc", d6.len(), 0);
+    println("yaml ok");
+    return 0;
+}

@@ -1,0 +1,131 @@
+// stdlib/toml: tables, dotted keys, comments, basic/literal strings with
+// escapes, ints (dec/hex/oct/bin, underscores), floats, bools, arrays,
+// typed getters with defaults, key listing.
+use toml;
+
+fn check_s(label: str, got: str, want: str) {
+    println(label + " = [" + got + "]");
+    if !str_equal(got, want) {
+        p_panic("toml: " + label + " gave '" + got + "', want '" + want + "'");
+    }
+}
+
+fn check_i(label: str, got: i64, want: i64) {
+    println(label + " = " + int_to_str(got));
+    if got != want {
+        p_panic("toml: " + label + " wrong");
+    }
+}
+
+fn check_b(label: str, got: bool, want: bool) {
+    println(label + " = " + bool_to_str(got));
+    if got != want {
+        p_panic("toml: " + label + " wrong");
+    }
+}
+
+fn main() -> i64 {
+    var text = "# manifest\n" +
+        "title = \"Fides # not a comment\"  # trailing comment\n" +
+        "[package]\n" +
+        "name = \"demo\"\n" +
+        "version = 3\n" +
+        "big = 1_000_000\n" +
+        "neg = -42\n" +
+        "hexv = 0xff\n" +
+        "octv = 0o17\n" +
+        "binv = 0b1011\n" +
+        "pi = 3.25\n" +
+        "exp = 1e3\n" +
+        "ok = true\n" +
+        "off = false\n" +
+        "lit = 'C:\\path\\x'\n" +
+        "esc = \"tab\\tq\\\"x\\\" \\u0041\"\n" +
+        "tags = [\"a\", \"b, c\", 'd']\n" +
+        "nums = [1, 2, 3]\n" +
+        "empty = []\n" +
+        "\r\n" +
+        "[server.http]\n" +
+        "port = 8080\n" +
+        "tls.enabled = true\n" +
+        "\"quoted key\" = \"qv\"\n" +
+        "bad key = 1\n" +
+        "weird = @@\n";
+    // (the \u escape stays ASCII: the interpreter's str_from_bytes turns
+    // bytes >= 128 into two-byte UTF-8 sequences)
+    var doc = toml_parse(text);
+
+    check_s("title", toml_get_str(doc, "title"), "Fides # not a comment");
+    check_s("name", toml_get_str(doc, "package.name"), "demo");
+    check_s("kind.name", toml_kind(doc, "package.name"), "str");
+    check_i("version", toml_get_int(doc, "package.version", 0), 3);
+    check_s("kind.version", toml_kind(doc, "package.version"), "int");
+    check_i("big", toml_get_int(doc, "package.big", 0), 1000000);
+    check_i("neg", toml_get_int(doc, "package.neg", 0), -42);
+    check_i("hexv", toml_get_int(doc, "package.hexv", 0), 255);
+    check_i("octv", toml_get_int(doc, "package.octv", 0), 15);
+    check_i("binv", toml_get_int(doc, "package.binv", 0), 11);
+    check_s("kind.pi", toml_kind(doc, "package.pi"), "float");
+    var pi = toml_get_float(doc, "package.pi", 0.0);
+    println(pi);
+    if pi != 3.25 { p_panic("toml: pi"); }
+    var e3 = toml_get_float(doc, "package.exp", 0.0);
+    println(e3);
+    if e3 != 1000.0 { p_panic("toml: exp"); }
+    check_i("int.of.float", toml_get_int(doc, "package.pi", 0), 3);
+    var fv = toml_get_float(doc, "package.version", 0.0);
+    if fv != 3.0 { p_panic("toml: float of int"); }
+    check_b("ok", toml_get_bool(doc, "package.ok", false), true);
+    check_b("off", toml_get_bool(doc, "package.off", true), false);
+    check_s("kind.ok", toml_kind(doc, "package.ok"), "bool");
+    check_s("lit", toml_get_str(doc, "package.lit"), "C:\\path\\x");
+    check_s("esc", toml_get_str(doc, "package.esc"), "tab\tq\"x\" A");
+
+    var tags = toml_get(doc, "package.tags");
+    check_s("kind.tags", tags.kind, "array");
+    check_i("tags.len", tags.items.len(), 3);
+    check_s("tags0", tags.items.get(0), "a");
+    check_s("tags1", tags.items.get(1), "b, c");
+    check_s("tags2", tags.items.get(2), "d");
+    var nums = toml_get(doc, "package.nums");
+    check_i("nums.len", nums.items.len(), 3);
+    check_s("nums2", nums.items.get(2), "3");
+    check_i("empty.len", toml_get(doc, "package.empty").items.len(), 0);
+
+    check_i("port", toml_get_int(doc, "server.http.port", 0), 8080);
+    check_b("tls", toml_get_bool(doc, "server.http.tls.enabled", false), true);
+    check_s("quoted", toml_get_str(doc, "server.http.quoted key"), "qv");
+    check_b("has.bad", toml_has(doc, "server.http.bad key"), false);
+    check_s("kind.weird", toml_kind(doc, "server.http.weird"), "invalid");
+
+    // defaults on absent / wrong type
+    check_b("has.missing", toml_has(doc, "nope"), false);
+    check_s("kind.missing", toml_kind(doc, "nope"), "invalid");
+    check_i("int.default", toml_get_int(doc, "nope", 7), 7);
+    check_i("int.wrongtype", toml_get_int(doc, "package.name", 9), 9);
+    check_b("bool.default", toml_get_bool(doc, "package.version", true), true);
+    var fd = toml_get_float(doc, "nope", 2.5);
+    if fd != 2.5 { p_panic("toml: float default"); }
+    check_i("str.missing.len", str_len(toml_get_str(doc, "nope")), 0);
+
+    var keys = toml_keys(doc);
+    check_i("keys.len", keys.len(), 21);
+    check_s("keys0", keys.get(0), "title");
+    check_s("keys1", keys.get(1), "package.name");
+    var root = toml_table_keys(doc, "");
+    check_i("root.len", root.len(), 3);
+    check_s("root1", root.get(1), "package");
+    check_s("root2", root.get(2), "server");
+    var srv = toml_table_keys(doc, "server.http");
+    check_i("srv.len", srv.len(), 4);
+    check_s("srv1", srv.get(1), "tls");
+
+    // duplicate key: last one wins
+    var dup = toml_parse("a = 1\na = 2\n");
+    check_i("dup", toml_get_int(dup, "a", 0), 2);
+    // [[array-of-tables]] headers are skipped, keys stay under the old table
+    var aot = toml_parse("[t]\nx = 1\n[[items]]\ny = 2\n");
+    check_i("aot.y", toml_get_int(aot, "t.y", 0), 2);
+    println("toml ok");
+    return 0;
+}

@@ -1,0 +1,156 @@
+// stdlib/regex: wildcard matching, the backtracking regex engine (literals,
+// '.', classes, escapes, quantifiers, anchors, alternation, groups), and
+// the find/replace/split helpers built on it.
+use regex;
+
+fn check_s(label: str, got_in: str, want: str) -> void {
+    // copy into a typed local first (see test_lib_process.fd)
+    var got: str = got_in;
+    println(label + " = " + got);
+    if !str_equal(got, want) { p_panic("regex: wrong " + label); }
+}
+
+fn check_i(label: str, got: i64, want: i64) -> void {
+    println(label + " = " + int_to_str(got));
+    if got != want { p_panic("regex: wrong " + label); }
+}
+
+fn check_b(label: str, got: bool, want: bool) -> void {
+    if got { println(label + " = true"); } else { println(label + " = false"); }
+    if got != want { p_panic("regex: wrong " + label); }
+}
+
+fn m(s: str, re: str, want: bool) -> void {
+    check_b("match '" + s + "' ~ " + re, regex_match(s, re), want);
+}
+
+fn join(v: Vec<str>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { out = out + "|"; }
+        var piece: str = v.get(i);
+        out = out + "<" + piece + ">";
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main() -> i64 {
+    // ── wildcard (legacy) ──
+    check_b("wild *.fd", regex_matches("main.fd", "*.fd"), true);
+    check_b("wild ?", regex_matches("cat", "c?t"), true);
+    check_b("wild no", regex_matches("cart", "c?t"), false);
+    check_b("wild star mid", regex_matches("abcxyz", "a*z"), true);
+
+    // ── full match: literals, dot, classes ──
+    m("hello123", "h[ae]l+o[0-9]+", true);
+    m("hallo", "h[ae]l+o", true);
+    m("hollo", "h[ae]l+o", false);
+    m("abc", "a.c", true);
+    m("a\nc", "a.c", false);
+    m("abc", "ab", false);
+    m("", "", true);
+    m("x", "", false);
+    m("Z", "[^a-z]", true);
+    m("q", "[^a-z]", false);
+    m("-", "[a-]", true);
+    m("]", "[]a]", true);
+    m("b", "[]a]", false);
+
+    // ── escapes ──
+    m("2026", "\\d\\d\\d\\d", true);
+    m("20a6", "\\d{4}", false);
+    m("foo_bar9", "\\w+", true);
+    m("foo bar", "\\w+", false);
+    m("a \tb", "a\\s+b", true);
+    m("x.y", "x\\.y", true);
+    m("xzy", "x\\.y", false);
+    m("a\\b", "a\\\\b", true);
+    m("tab\there", "tab\\there", true);
+    m("abc", "\\D+", true);
+    m("a1", "\\D+", false);
+    m("--", "\\W+", true);
+    m("ab", "\\S\\S", true);
+    m("4", "[\\d]", true);
+
+    // ── quantifiers ──
+    m("", "a*", true);
+    m("aaaa", "a*", true);
+    m("", "a+", false);
+    m("color", "colou?r", true);
+    m("colour", "colou?r", true);
+    m("aaa", "a{3}", true);
+    m("aa", "a{3}", false);
+    m("aaaaa", "a{2,}", true);
+    m("a", "a{2,}", false);
+    m("aaa", "a{1,3}", true);
+    m("aaaa", "a{1,3}", false);
+    m("a{x", "a{x", true);       // not a valid brace: literal '{'
+    m("aab", "a*ab", true);      // backtracking within a run
+
+    // ── anchors ──
+    m("abc", "^abc$", true);
+    check_b("search ^b", regex_search("abc", "^b"), false);
+    check_b("search c$", regex_search("abc", "c$"), true);
+    check_b("search b$", regex_search("abc", "b$"), false);
+
+    // ── alternation (top level) ──
+    m("cat", "cat|dog", true);
+    m("dog", "cat|dog", true);
+    m("cow", "cat|dog", false);
+    m("ab", "a|ab", true);       // the second alternative must be tried
+    m("x", "a|b|x", true);
+
+    // ── groups ──
+    m("ababab", "(ab)+", true);
+    m("ababa", "(ab)+", false);
+    m("abab", "(ab){2}", true);
+    m("ab", "(ab)?ab", true);
+    m("aab", "(a*)ab", true);    // the group gives back an 'a'
+    m("", "(a*)", true);         // group matching the empty string at the end
+    m("ab", "a?(ab)?", true);
+    m("abcabc", "((abc))*", true);
+    m("12-34-56", "(\\d\\d-)*\\d\\d", true);
+    check_b("group alternation rejected", regex_match("a", "(a|b)"), false);
+    check_b("unbalanced rejected", regex_match("a)", "a)"), false);
+    check_b("bad class rejected", regex_match("a", "[a"), false);
+
+    // ── find / span ──
+    check_i("find_re", regex_find_re("abc123def", "[0-9]+"), 3);
+    check_i("find_re none", regex_find_re("abc", "\\d"), -1);
+    check_i("find_re empty pat", regex_find_re("abc", ""), 0);
+    var sp: Vec<i64> = regex_find_span("abc123def", "[0-9]+");
+    check_i("span start", sp.get(0), 3);
+    check_i("span end", sp.get(1), 6);
+    var sp2: Vec<i64> = regex_find_span("x aab y", "(a*)ab");
+    check_i("span2 start", sp2.get(0), 2);
+    check_i("span2 end", sp2.get(1), 5);
+    var sp3: Vec<i64> = regex_find_span("abc", "z");
+    check_i("span none", sp3.get(0), -1);
+    check_b("search", regex_search("say hello", "h.l+o"), true);
+
+    // ── replace ──
+    check_s("replace digits", regex_replace("a1b2", "[0-9]", "#"), "a#b#");
+    check_s("replace runs", regex_replace("a  b   c", " +", " "), "a b c");
+    check_s("replace none", regex_replace("abc", "\\d", "#"), "abc");
+    check_s("replace alt", regex_replace("cat and dog", "cat|dog", "pet"), "pet and pet");
+    check_s("replace empty matches", regex_replace("abc", "x*", "-"), "-a-b-c-");
+    check_s("replace bad pattern", regex_replace("abc", "[", "-"), "abc");
+
+    // ── split ──
+    check_s("split comma", join(regex_split("a, b,c ,d", "\\s*,\\s*")), "<a>|<b>|<c>|<d>");
+    check_s("split ws", join(regex_split("one  two\tthree", "\\s+")), "<one>|<two>|<three>");
+    check_s("split edges", join(regex_split(",a,", ",")), "<>|<a>|<>");
+    check_s("split none", join(regex_split("abc", ",")), "<abc>");
+
+    // ── literal helpers ──
+    check_i("find literal", regex_find("hello", "ll"), 2);
+    check_b("contains", regex_contains("hello", "ell"), true);
+    check_b("starts_with", regex_starts_with("hello", "he"), true);
+    check_b("ends_with", regex_ends_with("hello", "lo"), true);
+    check_i("len", regex_len("hello"), 5);
+
+    println("regex ok");
+    return 0;
+}

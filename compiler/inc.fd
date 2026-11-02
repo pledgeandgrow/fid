@@ -572,6 +572,18 @@ fn inc_mix(h: i64, src: str, start: i64, end: i64) -> i64 {
 }
 
 /// Hash of the canonical form of generated C.
+/// Mark definition `d` live, with every other definition of its name.
+fn inc_mark_def(d: i64, live: Vec<i64>, work: Vec<i64>, same_prev: Vec<i64>) {
+    var k: i64 = d;
+    while k >= 0 {
+        if live.get(k) == 0 {
+            live.set(k, 1);
+            work.push(k);
+        }
+        k = same_prev.get(k);
+    }
+}
+
 pub fn inc_canon_hash(src: str) -> i64 {
     var t: CTokens = inc_lex_c(src);
     var defs: CDefs = inc_find_c_defs(src, &t);
@@ -584,8 +596,12 @@ pub fn inc_canon_hash(src: str) -> i64 {
         i = i + 1;
     }
     var def_index: i64 = HashMap_new();
+    // A name defined more than once (one definition per #if branch): each
+    // definition points at the previous one, and all are live together
+    var same_prev: Vec<i64> = Vec::new();
     var di: i64 = 0;
     while di < defs.names.len() {
+        same_prev.push(HashMap_get(def_index, defs.names.get(di)) - 1);
         HashMap_insert(def_index, defs.names.get(di), di + 1);
         var k: i64 = defs.start_toks.get(di);
         while k < defs.end_toks.get(di) {
@@ -604,16 +620,14 @@ pub fn inc_canon_hash(src: str) -> i64 {
     var work: Vec<i64> = Vec::new();
     var main_slot: i64 = HashMap_get(def_index, "main");
     if main_slot != 0 {
-        live.set(main_slot - 1, 1);
-        work.push(main_slot - 1);
+        inc_mark_def(main_slot - 1, live, work, same_prev);
     }
     i = 0;
     while i < n {
         if t.is_ident.get(i) == 1 && in_body.get(i) < 0 {
             var slot: i64 = HashMap_get(def_index, str_slice_len(src, slen, t.starts.get(i), t.ends.get(i)));
-            if slot != 0 && live.get(slot - 1) == 0 {
-                live.set(slot - 1, 1);
-                work.push(slot - 1);
+            if slot != 0 {
+                inc_mark_def(slot - 1, live, work, same_prev);
             }
         }
         i = i + 1;
@@ -624,9 +638,8 @@ pub fn inc_canon_hash(src: str) -> i64 {
         while k < defs.end_toks.get(d) {
             if t.is_ident.get(k) == 1 {
                 var s2: i64 = HashMap_get(def_index, str_slice_len(src, slen, t.starts.get(k), t.ends.get(k)));
-                if s2 != 0 && live.get(s2 - 1) == 0 {
-                    live.set(s2 - 1, 1);
-                    work.push(s2 - 1);
+                if s2 != 0 {
+                    inc_mark_def(s2 - 1, live, work, same_prev);
                 }
             }
             k = k + 1;

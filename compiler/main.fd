@@ -158,6 +158,8 @@ pub fn main() -> i64 {
     if command == "bench" { return cmd_bench(n, start); }
     if command == "profile" { return cmd_profile(n, start); }
     if command == "lint" { return cmd_lint(n, start); }
+    if command == "check" { return cmd_check(n, start); }
+    if command == "doc" { return cmd_scribe(n, start); }
     if command == "wasm" { return cmd_wasm(n, start); }
     if command == "watch" { return cmd_bench(n, start); }
     if command == "lsp" { return lsp_run(); }
@@ -670,7 +672,129 @@ fn cmd_run(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
 // Scans tests/bootstrap/ directory for .fd files, compiles and runs each.
 // Flags: --fail (expect test to fail)
 // Backends: C codegen (tcc), PE emitter. TODO: interpreter backend.
+/// The functions of `source` whose name starts with `prefix` and that take no
+/// arguments: `fn test_x()` or `pub fn test_x()`.
+fn test_fns(source: str, prefix: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var lines: Vec<str> = str_split(source, "\n");
+    var i: i64 = 0;
+    while i < lines.len() {
+        var t: str = str_trim(lines.get(i));
+        if str_starts_with(t, "pub ") { t = str_slice(t, 4, str_len(t)); }
+        if str_starts_with(t, "fn " + prefix) {
+            var open: i64 = str_find(t, "(");
+            if open > 3 && str_find(t, "()") == open {
+                out.push(str_slice(t, 3, open));
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// fid test <file.fd>: each `fn test_*()` runs in its own process (a panic
+/// fails that test only), then each `fn bench_*()` runs until it has taken
+/// 200 ms and reports its time per call, as `go test -bench` does.
+fn cmd_test_file(n: i64, start: i64) -> i64 {
+    var input: str = p_argv(start + 1);
+    var source: str = c_file_read(input);
+    if str_len(source) == 0 {
+        p_eprint_str("Error: could not read file: " + input + "\n");
+        return 1;
+    }
+    var tests: Vec<str> = test_fns(source, "test_");
+    var benches: Vec<str> = test_fns(source, "bench_");
+    if str_find(source, "fn main(") >= 0 {
+        p_eprint_str("fid test: " + input + " has a main; a test file holds only fn test_*() and fn bench_*()\n");
+        return 1;
+    }
+    if tests.len() + benches.len() == 0 {
+        p_eprint_str("fid test: no fn test_*() or fn bench_*() in " + input + "\n");
+        return 1;
+    }
+    // The harness: the file and a main that runs the function its argument
+    // names, as many times as the second argument says
+    var harness: str = source + "\n\nfn main() -> i64 {\n    val which: str = p_argv(1);\n"
+        + "    val reps: i64 = str_parse_int(p_argv(2));\n";
+    var i: i64 = 0;
+    while i < tests.len() {
+        harness = harness + "    if which == \"" + tests.get(i) + "\" { " + tests.get(i) + "(); }\n";
+        i = i + 1;
+    }
+    i = 0;
+    while i < benches.len() {
+        val b: str = benches.get(i);
+        harness = harness + "    if which == \"" + b + "\" {\n        val t0: i64 = p_clock_now_us();\n"
+            + "        var r: i64 = 0;\n        while r < reps { " + b + "(); r = r + 1; }\n"
+            + "        println(p_clock_now_us() - t0);\n    }\n";
+        i = i + 1;
+    }
+    harness = harness + "    return 0;\n}\n";
+    // Next to the file, so its own imports resolve the same way
+    var dir: str = "";
+    var slash: i64 = str_rfind(str_replace(input, "\\", "/"), "/");
+    if slash >= 0 { dir = str_slice(input, 0, slash + 1); }
+    var main_fd: str = dir + "_fides_test_main.fd";
+    p_file_write(main_fd, harness);
+    var exe: str = "_fides_test_run.exe";
+    var run: str = ".\\_fides_test_run.exe";
+    if is_linux() {
+        exe = "_fides_test_run";
+        run = "./_fides_test_run";
+    }
+    if p_system("\"" + p_argv(0) + "\" ccompile " + main_fd + " -o " + exe) != 0 {
+        p_file_delete(main_fd);
+        p_eprint_str("fid test: the build failed\n");
+        return 1;
+    }
+    var failed: i64 = 0;
+    i = 0;
+    while i < tests.len() {
+        if p_system(run + " " + tests.get(i) + " 1") == 0 {
+            print("ok    " + tests.get(i) + "\n");
+        } else {
+            print("FAIL  " + tests.get(i) + "\n");
+            failed = failed + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < benches.len() {
+        var reps: i64 = 1;
+        var us: i64 = 0;
+        var ok: bool = true;
+        while ok {
+            if p_system(run + " " + benches.get(i) + " " + int_to_str(reps) + " > _fides_bench_out.txt") != 0 {
+                print("FAIL  " + benches.get(i) + "\n");
+                failed = failed + 1;
+                ok = false;
+            } else {
+                us = str_parse_int(str_trim(c_file_read("_fides_bench_out.txt")));
+                if us >= 200000 || reps >= 1073741824 {
+                    print(benches.get(i) + "  " + int_to_str(reps) + " runs  "
+                        + int_to_str(us * 1000 / reps) + " ns/op\n");
+                    ok = false;
+                } else if us < 1000 {
+                    reps = reps * 100;
+                } else {
+                    reps = reps * 2;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    p_file_delete(main_fd);
+    p_file_delete("_fides_bench_out.txt");
+    print(int_to_str(tests.len() - failed) + " passed, " + int_to_str(failed) + " failed\n");
+    if failed > 0 { return 1; }
+    return 0;
+}
+
 fn cmd_test(n: i64, start: i64) -> i64 {
+    // fid test <file.fd>: that file's test_* and bench_* functions
+    if start + 2 <= n && str_ends_with(p_argv(start + 1), ".fd") {
+        return cmd_test_file(n, start);
+    }
     // --fail: run only expected-fail tests (failing = correct)
     var fail_only: bool = has_flag(n, start, "--fail");
 
@@ -1059,109 +1183,76 @@ fn cmd_bench(n: i64, start: i64) -> i64 {
 // --- profile -------------------------------------------------------------
 fn cmd_profile(n: i64, start: i64) -> i64 {
     if start + 2 > n {
-        p_eprint_str("Usage: fid profile <file.fd> [-n <count>]\n");
-        p_eprint_str("  Profile: run file and report per-function timing.\n");
+        p_eprint_str("Usage: fid profile <file.fd> [-o <stacks.folded>]\n");
+        p_eprint_str("  Build through C with a sampling profiler, run, and report where the\n");
+        p_eprint_str("  time goes. Writes collapsed stacks (flamegraph.pl, inferno, speedscope).\n");
         return 1;
     }
     var input: str = p_argv(start + 1);
-    var count: i64 = 1;
-
-    var ai: i64 = start + 2;
-    while ai < n {
-        if p_argv(ai) == "-n" {
-            if ai + 1 < n {
-                count = c_str_parse_i64(p_argv(ai + 1));
-            }
-        }
-        ai = ai + 1;
+    var out: str = get_flag_value(n, start, "-o", "fides-profile.folded");
+    var exe: str = "_fides_profile_tmp.exe";
+    var run_exe: str = ".\\_fides_profile_tmp.exe";
+    if is_linux() {
+        exe = "_fides_profile_tmp";
+        run_exe = "./_fides_profile_tmp";
     }
-    if count <= 0 { count = 1; }
-
-    var source: str = c_file_read(input);
-    if str_len(source) == 0 {
-        p_eprint_str("Error: could not read file: ");
-        p_eprint_str(input);
-        p_eprint_str("\n");
+    var build: str = "\"" + p_argv(0) + "\" ccompile " + input + " -o " + exe + " --profile";
+    if p_system(build) != 0 {
+        p_eprint_str("profile: the build failed\n");
         return 1;
     }
-
-    // Compile to C, run N times, report timing
-    var result: ResultStr = ccompile_source_with_path(source, input, "on");
-    match result {
-        ResultStr::Ok(c_code) => {
-            var c_file: str = "_fides_profile_tmp.c";
-            p_file_write(c_file, c_code);
-            var exe_name: str = "_fides_profile_tmp.exe";
-            if is_linux() { exe_name = "_fides_profile_tmp"; }
-            var build_cmd: str = "";
-            if is_linux() {
-                build_cmd = "gcc -O2 -w -o " + exe_name + " " + c_file + " -lm";
-            } else {
-                build_cmd = "tcc -O2 -w -o " + exe_name + " " + c_file + " -lws2_32";
-            }
-            var ret: i64 = p_system(build_cmd);
-            if ret != 0 {
-                p_eprint_str("C compilation failed\n");
-                return 1;
-            }
-
-            p_eprint_str("Profile: ");
-            p_eprint_str(input);
-            p_eprint_str(" (");
-            p_eprint_str(int_to_str(count));
-            p_eprint_str(" iteration");
-            if count != 1 { p_eprint_str("s"); }
-            p_eprint_str(")\n");
-
-            var bi: i64 = 0;
-            var total_ms: i64 = 0;
-            while bi < count {
-                var t0: i64 = p_clock_now();
-                var exit_code: i64 = p_system(exe_name);
-                var t1: i64 = p_clock_now();
-                var elapsed_ms: i64 = (t1 - t0) / 1000000;
-                total_ms = total_ms + elapsed_ms;
-                p_eprint_str("  Run ");
-                p_eprint_str(int_to_str(bi + 1));
-                p_eprint_str("/");
-                p_eprint_str(int_to_str(count));
-                p_eprint_str(": ");
-                p_eprint_str(int_to_str(elapsed_ms));
-                p_eprint_str("ms (exit=");
-                p_eprint_str(int_to_str(exit_code));
-                p_eprint_str(")\n");
-                bi = bi + 1;
-            }
-
-            p_eprint_str("  Total: ");
-            p_eprint_str(int_to_str(total_ms));
-            p_eprint_str("ms  Avg: ");
-            if count > 0 {
-                p_eprint_str(int_to_str(total_ms / count));
-            } else {
-                p_eprint_str("0");
-            }
-            p_eprint_str("ms\n");
-
-            // Clean up
-            if is_linux() {
-                p_system("rm -f _fides_profile_tmp.c _fides_profile_tmp");
-            } else {
-                p_system("del _fides_profile_tmp.c");
-                p_system("del _fides_profile_tmp.exe");
-            }
-
-            return 0;
-        }
-        ResultStr::Err(errs) => {
-            print_errors(errs);
-            return 1;
-        }
+    p_system(run_exe);
+    if out != "fides-profile.folded" {
+        p_rename("fides-profile.folded", out);
     }
-    return 1;
+    var text: str = c_file_read(out);
+    if str_len(text) == 0 {
+        p_eprint_str("profile: no samples (the program ran under a millisecond?)\n");
+        return 1;
+    }
+    // Self samples: the innermost function of each stack
+    var counts: i64 = HashMap_new();
+    var names: Vec<str> = Vec::new();
+    var total: i64 = 0;
+    var lines: Vec<str> = str_split(text, "\n");
+    var li: i64 = 0;
+    while li < lines.len() {
+        var line: str = lines.get(li);
+        var sp: i64 = str_rfind(line, " ");
+        if sp > 0 {
+            var stack: str = str_slice(line, 0, sp);
+            var semi: i64 = str_rfind(stack, ";");
+            var leaf: str = stack;
+            if semi >= 0 { leaf = str_slice(stack, semi + 1, str_len(stack)); }
+            if HashMap_get(counts, leaf) == 0 { names.push(leaf); }
+            HashMap_insert(counts, leaf, HashMap_get(counts, leaf) + 1);
+            total = total + 1;
+        }
+        li = li + 1;
+    }
+    print("
+Profile of " + input + ": " + int_to_str(total) + " samples, 1 ms apart\n");
+    print("  self %   samples  function\n");
+    var shown: i64 = 0;
+    while shown < 20 && shown < names.len() {
+        var best: i64 = -1;
+        var bi: i64 = 0;
+        while bi < names.len() {
+            if HashMap_get(counts, names.get(bi)) > 0 {
+                if best < 0 || HashMap_get(counts, names.get(bi)) > HashMap_get(counts, names.get(best)) { best = bi; }
+            }
+            bi = bi + 1;
+        }
+        if best < 0 { break; }
+        var c: i64 = HashMap_get(counts, names.get(best));
+        print("  " + int_to_str(c * 100 / total) + "%  " + int_to_str(c) + "  " + names.get(best) + "\n");
+        HashMap_insert(counts, names.get(best), 0 - 1);
+        shown = shown + 1;
+    }
+    print("Collapsed stacks: " + out + " (flamegraph.pl, inferno-flamegraph, speedscope)\n");
+    return 0;
 }
 
-// --- repl ----------------------------------------------------------------
 fn cmd_repl() -> i64 {
     p_eprint_str("fid REPL — type expressions to evaluate, :quit to exit\n\n");
     var line_num: i64 = 1;
@@ -1283,6 +1374,32 @@ fn cmd_notebook(n: i64, start: i64) -> i64 {
 }
 
 // --- lint ----------------------------------------------------------------
+/// fid check: type, borrow and effect checks with no code generation.
+fn cmd_check(n: i64, start: i64) -> i64 {
+    if start + 2 > n {
+        p_eprint_str("Usage: fid check <file.fd>\n");
+        return 1;
+    }
+    var input: str = p_argv(start + 1);
+    var source: str = c_file_read(input);
+    if str_len(source) == 0 {
+        p_eprint_str("Error: could not read file: " + input + "\n");
+        return 1;
+    }
+    var t0: i64 = p_clock_now_ms();
+    match build_program_with_path_borrowck(source, OptStr::Some(input), "on") {
+        ResultProgram::Ok(_) => {
+            p_eprint_str(input + ": no errors (" + int_to_str(p_clock_now_ms() - t0) + " ms)\n");
+            return 0;
+        }
+        ResultProgram::Err(errs) => {
+            print_errors(errs);
+            return 1;
+        }
+    }
+    return 1;
+}
+
 fn cmd_lint(n: i64, start: i64) -> i64 {
     if start + 2 > n {
         p_eprint_str("Usage: fid lint <file.fd>\n");
@@ -1580,6 +1697,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
 
     var unit_build: bool = has_flag(n, start, "--inc");
     if unit_build { set_c_unit_marks(true); }
+    if has_flag(n, start, "--profile") { set_c_profile(true); }
     var result: ResultStr = ccompile_source_with_path(source, input, g_borrowck);
     match result {
         ResultStr::Ok(c_code) => {
@@ -1728,6 +1846,9 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             // translation unit at -O1/-O2 (the compiler itself is ~35 MB of
             // C: 26 min at -O2, 40 s at -O0), so one gets -O0.
             var cc_opt: str = get_flag_value(n, start, "--cc-opt", "");
+            // --debug: no C optimization (fast to build, easy to debug); --release: -O2
+            if str_len(cc_opt) == 0 && has_flag(n, start, "--debug") { cc_opt = "0"; }
+            if str_len(cc_opt) == 0 && has_flag(n, start, "--release") { cc_opt = "2"; }
             if str_len(cc_opt) == 0 { cc_opt = env_or_empty("FIDES_CC_OPT"); }
             if str_len(cc_opt) == 0 {
                 if str_len(c_code) > 16777216 {
@@ -2439,8 +2560,12 @@ fn print_usage() {
     p_eprint_str("  fid opt      <file.fd>                Optimize PIR L2 and show result\n");
     p_eprint_str("  fid fmt      <file.fd> [--check]      Format source code\n");
     p_eprint_str("  fid test                             Run all tests in tests/bootstrap/\n");
+    p_eprint_str("  fid test     <file.fd>               Run its fn test_*() (one process each), time fn bench_*()\n");
     p_eprint_str("  fid bench    <file.fd> [-n <count>]   Benchmark: run N times\n");
     p_eprint_str("  fid lint     <file.fd>               Run lint checks\n");
+    p_eprint_str("  fid check    <file.fd>               Type, borrow and effect checks only\n");
+    p_eprint_str("  fid doc      <file.fd|dir> ...        Generate documentation (as scribe)\n");
+    p_eprint_str("  fid ccompile <file.fd> --debug|--release  C at -O0, or -O2 (the default)\n");
     p_eprint_str("  fid wasm     <file.fd> [-o <out>] [--wat]  Compile to WASM/WAT\n");
     p_eprint_str("  fid version                          Show version\n");
     p_eprint_str("  fid scribe   <file.fd|dir> [--format html|markdown] [--output <dir>]\n");

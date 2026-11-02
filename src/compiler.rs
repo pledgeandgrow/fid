@@ -1987,6 +1987,13 @@ pub fn ccompile_source_with_path(source: &str, source_path: &str) -> Result<Stri
 
 /// C compile with --trace flag (SH-1.2). Prints per-stage timing to stderr.
 pub fn ccompile_source_traced(source: &str, source_path: &str, trace: bool) -> Result<String, Vec<String>> {
+    ccompile_source_debugged(source, source_path, trace, false)
+}
+
+/// `ccompile_source_traced`, plus `--debug` (`debug = true`): the generated
+/// C carries `#line` directives back to the .fd source, so compiling it
+/// with `-g` gives debuggers source lines.
+pub fn ccompile_source_debugged(source: &str, source_path: &str, trace: bool, debug: bool) -> Result<String, Vec<String>> {
     use std::time::Instant;
 
     let t0 = Instant::now();
@@ -2000,7 +2007,7 @@ pub fn ccompile_source_traced(source: &str, source_path: &str, trace: bool) -> R
     if trace { eprintln!("[trace] Lower (AST → IR): {:.2}ms, {} functions", t3.duration_since(t2).as_secs_f64() * 1000.0, module.functions.len()); }
 
     let t4 = Instant::now();
-    let c_code = codegen_c::generate_c(&module);
+    let c_code = codegen_c::generate_c_opts(&module, if debug { Some(source_path) } else { None });
     let t5 = Instant::now();
     if trace { eprintln!("[trace] C Codegen: {:.2}ms, {} lines", t5.duration_since(t4).as_secs_f64() * 1000.0, c_code.lines().count()); }
 
@@ -2072,6 +2079,13 @@ pub fn emit_source_with_path(source: &str, source_path: &str) -> Result<Vec<u8>,
 /// on L2 before generating PE. This closes the stale roadmap gap where
 /// `emit` was documented as "bypasses the optimizer."
 pub fn emit_source_with_level(source: &str, source_path: &str, level: crate::opt::OptLevel) -> Result<Vec<u8>, Vec<String>> {
+    emit_source_debug(source, source_path, level, false)
+}
+
+/// `emit_source_with_level`, plus `-g` (`debug = true`): the PE carries
+/// DWARF v4 line tables and per-function DIEs so a standard debugger can
+/// map machine code back to .fd source lines.
+pub fn emit_source_debug(source: &str, source_path: &str, level: crate::opt::OptLevel, debug: bool) -> Result<Vec<u8>, Vec<String>> {
     let program = build_program_with_runtime(source, Some(source_path), PE_RUNTIME)?;
     let module = lower::lower(&program);
 
@@ -2083,7 +2097,7 @@ pub fn emit_source_with_level(source: &str, source_path: &str, level: crate::opt
     let _ = level;
 
     // Generate PE file directly from IR module.
-    pe::generate_pe(&module)
+    pe::generate_pe_opts(&module, if debug { Some(source_path) } else { None })
 }
 
 /// Compile to WASM binary (Phase 5D.1).
@@ -2103,7 +2117,7 @@ pub fn compile_to_wasm(source: &str, source_path: &str, wat_mode: bool) -> Resul
 /// Supports x86-64 (full ELF linking), arm64 and riscv (assembly text output).
 pub fn build_executable(source: &str, source_path: &str, target: &str, do_opt: bool, granted_caps: Option<&[String]>) -> Result<Vec<u8>, Vec<String>> {
     let level = if do_opt { crate::opt::OptLevel::O2 } else { crate::opt::OptLevel::O0 };
-    build_executable_with_level(source, source_path, target, level, false, granted_caps)
+    build_executable_with_level(source, source_path, target, level, false, granted_caps, false)
 }
 
 /// Targets on which `build_executable_with_level` runs the post-codegen
@@ -2149,7 +2163,7 @@ pub fn build_executable_with_lto(source: &str, source_path: &str, target: &str, 
     } else {
         crate::opt::OptLevel::O2
     };
-    build_executable_with_level(source, source_path, target, level, do_lto, granted_caps)
+    build_executable_with_level(source, source_path, target, level, do_lto, granted_caps, false)
 }
 
 /// Build a native executable at a specific `OptLevel`.
@@ -2157,7 +2171,8 @@ pub fn build_executable_with_lto(source: &str, source_path: &str, target: &str, 
 /// This is the main entry point used by both `build` and `build --opt-level=N`.
 /// `O0` skips optimization entirely. `O1` runs only cheap passes. `O2` is the
 /// default full pipeline. `O3` enables LTO-style inline thresholds.
-pub fn build_executable_with_level(source: &str, source_path: &str, target: &str, level: crate::opt::OptLevel, do_lto: bool, granted_caps: Option<&[String]>) -> Result<Vec<u8>, Vec<String>> {
+/// `debug` (`-g`) asks the PE target for DWARF line tables.
+pub fn build_executable_with_level(source: &str, source_path: &str, target: &str, level: crate::opt::OptLevel, do_lto: bool, granted_caps: Option<&[String]>, debug: bool) -> Result<Vec<u8>, Vec<String>> {
     // S-1B: Incremental compilation — reuse a cached optimized L2 module when
     // no input changed. The key covers every file the build read (imported
     // modules too: keying on the main file alone reused stale code after an
@@ -2301,7 +2316,7 @@ pub fn build_executable_with_level(source: &str, source_path: &str, target: &str
         "x86-64-windows" | "x64-windows" | "windows" => {
             // Windows PE cross-compilation — use the direct PE emitter
             // which generates x86-64 Windows .exe files with kernel32.dll imports
-            crate::pe::generate_pe(&module)
+            crate::pe::generate_pe_opts(&module, if debug { Some(source_path) } else { None })
         }
         _ => Err(vec![format!("Unknown target: {}", target)])
     }

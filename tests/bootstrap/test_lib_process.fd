@@ -1,0 +1,69 @@
+// stdlib/process: run shell commands with captured stdout/stderr and exit
+// code, process_system, process_capture, bad handles, and the pid.
+// Only commands that behave the same under `sh -c` and `cmd /C` are used;
+// output is trimmed so \r\n vs \n does not matter.
+use process;
+
+fn check_s(label: str, got_in: str, want: str) -> void {
+    // copy into a typed local first: the interpreter prints an empty
+    // malloc'd string (str_trim("") etc.) passed straight in as a number
+    var got: str = got_in;
+    println(label + " = " + got);
+    if !str_equal(got, want) { p_panic("process: wrong " + label); }
+}
+
+fn check_i(label: str, got: i64, want: i64) -> void {
+    println(label + " = " + int_to_str(got));
+    if got != want { p_panic("process: wrong " + label); }
+}
+
+fn check_b(label: str, got: bool, want: bool) -> void {
+    if got { println(label + " = true"); } else { println(label + " = false"); }
+    if got != want { p_panic("process: wrong " + label); }
+}
+
+fn main() -> i64 {
+    // stdout + exit code 0
+    var h: i64 = process_run("echo hello");
+    check_b("run ok", process_ok(h), true);
+    check_s("stdout", str_trim(process_stdout(h)), "hello");
+    check_s("stderr empty", str_trim(process_stderr(h)), "");
+    check_i("code", process_code(h), 0);
+    process_close(h);
+
+    // stderr and a non-zero exit code
+    var h2: i64 = process_run("echo oops 1>&2 && exit 3");
+    check_b("run2 ok", process_ok(h2), true);
+    check_s("stdout2 empty", str_trim(process_stdout(h2)), "");
+    check_s("stderr2", str_trim(process_stderr(h2)), "oops");
+    check_i("code2", process_code(h2), 3);
+    process_close(h2);
+
+    // two lines of output
+    var h3: i64 = process_run("echo one&& echo two");
+    var lines: Vec<str> = str_split(str_replace(str_trim(process_stdout(h3)), "\r", ""), "\n");
+    check_i("lines", lines.len(), 2);
+    check_s("line0", str_trim(lines.get(0)), "one");
+    check_s("line1", str_trim(lines.get(1)), "two");
+    process_close(h3);
+
+    // capture convenience
+    var cap: Vec<str> = process_capture("echo captured");
+    check_i("capture len", cap.len(), 2);
+    check_s("capture out", str_trim(cap.get(0)), "captured");
+    check_s("capture code", cap.get(1), "0");
+    var cap2: Vec<str> = process_capture("exit 7");
+    check_s("capture code 7", cap2.get(1), "7");
+
+    // process_system: exit status
+    check_i("system 0", process_system("exit 0"), 0);
+    check_i("system 4", process_system("exit 4"), 4);
+
+    // bad handle
+    check_b("ok(0)", process_ok(0), false);
+
+    // pid is positive (value itself is not printed: it changes every run)
+    check_b("pid > 0", process_pid() > 0, true);
+    println("process ok");
+    return 0;
+}

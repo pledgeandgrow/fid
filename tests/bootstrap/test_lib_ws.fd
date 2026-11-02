@@ -1,0 +1,132 @@
+// stdlib/ws: the parts that need no network. SHA-1 (RFC 3174 vectors),
+// the RFC 6455 accept key, frame encoding (7/16/64-bit lengths, server
+// unmasked and client masked), and the failure paths of accept/recv/close.
+// The client mask key is random, so masked frames are checked by
+// unmasking, never printed.
+use ws;
+
+fn check_s(label: str, got: str, want: str) {
+    println(label + " = " + got);
+    if !str_equal(got, want) { p_panic("ws: wrong value for " + label); }
+}
+
+fn check_i(label: str, got: i64, want: i64) {
+    println(label + " = " + int_to_str(got));
+    if got != want { p_panic("ws: wrong value for " + label); }
+}
+
+fn check_b(label: str, got: bool, want: bool) {
+    println(label + " = " + bool_to_str(got));
+    if got != want { p_panic("ws: wrong value for " + label); }
+}
+
+fn hex_of(v: Vec) -> str {
+    var digits: str = "0123456789abcdef";
+    var out: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        var b: i64 = v.get(i);
+        out = out + str_slice(digits, (b >> 4) & 15, ((b >> 4) & 15) + 1) +
+              str_slice(digits, b & 15, (b & 15) + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn bytes_of(s: str) -> Vec {
+    var out: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(s) { out.push(str_byte_at(s, i)); i = i + 1; }
+    return out;
+}
+
+fn filled(n: i64, b: i64) -> Vec {
+    var out: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < n { out.push(b); i = i + 1; }
+    return out;
+}
+
+fn take(v: Vec, n: i64) -> Vec {
+    var out: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < n { out.push(v.get(i)); i = i + 1; }
+    return out;
+}
+
+fn main() -> i64 {
+    // SHA-1
+    check_s("sha1 empty", hex_of(ws_sha1(bytes_of(""))),
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+    check_s("sha1 abc", hex_of(ws_sha1(bytes_of("abc"))),
+            "a9993e364706816aba3e25717850c26c9cd0d89d");
+    check_s("sha1 448-bit", hex_of(ws_sha1(bytes_of(
+            "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"))),
+            "84983e441c3bd26ebaae4aa1f95129e5e54670f1");
+    check_s("sha1 fox", hex_of(ws_sha1(bytes_of(
+            "The quick brown fox jumps over the lazy dog"))),
+            "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12");
+    check_s("sha1 1000 a", hex_of(ws_sha1(filled(1000, 97))),
+            "291e9a6c66994949b57ba5e650361e98fc36b1ba");
+
+    // RFC 6455 section 1.3 example
+    check_s("accept key", ws_accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+
+    // Server frames (unmasked)
+    check_s("text frame", hex_of(ws_frame_encode(1, bytes_of("Hello"), false)),
+            "810548656c6c6f");
+    check_s("empty close", hex_of(ws_frame_encode(8, Vec::new(), false)), "8800");
+    check_s("ping", hex_of(ws_frame_encode(9, bytes_of("hi"), false)), "89026869");
+    var f125: Vec = ws_frame_encode(2, filled(125, 7), false);
+    check_i("len125 size", f125.len(), 127);
+    check_i("len125 b1", f125.get(1), 125);
+    var f126: Vec = ws_frame_encode(2, filled(126, 7), false);
+    check_i("len126 size", f126.len(), 130);
+    check_s("len126 header", hex_of(take(ws_frame_encode(2, filled(126, 0), false), 4)),
+            "827e007e");
+    var f300: Vec = ws_frame_encode(2, filled(300, 1), false);
+    check_i("len300 b2", f300.get(2), 1);
+    check_i("len300 b3", f300.get(3), 44);
+    var f64k: Vec = ws_frame_encode(2, filled(65536, 9), false);
+    check_i("len65536 size", f64k.len(), 65536 + 10);
+    check_s("len65536 header", hex_of(take(f64k, 10)), "827f0000000000010000");
+    check_i("len65536 last", f64k.get(f64k.len() - 1), 9);
+
+    // Client frame (masked): header bits fixed, payload ^ mask == original
+    val msg: Vec = bytes_of("Hello, WebSocket");
+    var cf: Vec = ws_frame_encode(1, msg, true);
+    check_i("masked size", cf.len(), 2 + 4 + 16);
+    check_i("masked b0", cf.get(0), 129);
+    check_i("masked b1", cf.get(1), 128 + 16);
+    var un: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < 16 {
+        un.push(cf.get(6 + i) ^ cf.get(2 + (i % 4)));
+        i = i + 1;
+    }
+    check_s("unmasked", str_from_bytes(un), "Hello, WebSocket");
+
+    // Failure paths that touch no socket. (A struct literal of an imported
+    // struct does not parse, so the dead connection comes from ws_accept.)
+    val a1: WsConn = ws_accept(-1, "GET / HTTP/1.1
+Host: x
+
+");
+    check_i("accept no upgrade", a1.fd, -1);
+    check_b("ws_ok dead", ws_ok(a1), false);
+    val a2: WsConn = ws_accept(-1, "GET / HTTP/1.1
+Upgrade: websocket
+
+");
+    check_i("accept no key", a2.fd, -1);
+    check_b("accept no key open", a2.open, false);
+    val r: WsFrame = ws_recv(a1);
+    check_i("recv dead opcode", r.opcode, -1);
+    check_i("recv dead bytes", r.bytes.len(), 0);
+    check_b("recv dead fin", r.fin, true);
+    ws_close(a1);
+
+    println("ws ok");
+    return 0;
+}

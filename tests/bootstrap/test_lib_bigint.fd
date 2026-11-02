@@ -1,0 +1,117 @@
+// stdlib/bigint: parsing/formatting, comparison, add/sub/mul, Knuth
+// division (single- and multi-limb divisors), pow, mod and modpow, hex.
+// Expected values computed with Python's arbitrary-precision ints.
+use bigint;
+
+fn check(label: str, got: BigInt, want: str) {
+    var s = bigint_to_str(got);
+    println(label + " = " + s);
+    if !str_equal(s, want) {
+        p_panic("bigint: " + label + " gave " + s + ", want " + want);
+    }
+}
+
+fn check_s(label: str, got: str, want: str) {
+    println(label + " = " + got);
+    if !str_equal(got, want) {
+        p_panic("bigint: " + label + " gave " + got + ", want " + want);
+    }
+}
+
+fn check_i(label: str, got: i64, want: i64) {
+    println(label + " = " + int_to_str(got));
+    if got != want {
+        p_panic("bigint: " + label + " wrong");
+    }
+}
+
+fn check_b(label: str, got: bool, want: bool) {
+    println(label + " = " + bool_to_str(got));
+    if got != want {
+        p_panic("bigint: " + label + " wrong");
+    }
+}
+
+// n! by recursion (a `fact = bigint_mul_i64(fact, i)` loop miscompiles
+// on the C backend: the struct-return buffer is cleared while `fact`
+// still points at it)
+fn factorial(n: i64) -> BigInt {
+    if n <= 1 { return bigint_one(); }
+    return bigint_mul_i64(factorial(n - 1), n);
+}
+
+fn main() -> i64 {
+    var a = bigint_from_str("123456789012345678901234567890");
+    var b = bigint_from_str("987654321098765432109876543210");
+    check("a", a, "123456789012345678901234567890");
+    check("zero", bigint_zero(), "0");
+    check("one", bigint_one(), "1");
+    check("from_i64", bigint_from_i64(-1234567890123), "-1234567890123");
+    check("from_i64.0", bigint_from_i64(0), "0");
+    check("parse.plus", bigint_from_str("  +42 "), "42");
+    check("parse.neg0", bigint_from_str("-0"), "0");
+    check("parse.pad", bigint_from_str("000001000000000"), "1000000000");
+    check_i("to_i64", bigint_to_i64(bigint_from_str("-9000000000000000001")), -9000000000000000001);
+    check_b("is_zero", bigint_is_zero(bigint_from_str("-0")), true);
+
+    check("add", bigint_add(a, b), "1111111110111111111011111111100");
+    check("sub", bigint_sub(b, a), "864197532086419753208641975320");
+    check("sub.neg", bigint_sub(a, b), "-864197532086419753208641975320");
+    check("sub.self", bigint_sub(a, a), "0");
+    check("add.mixed", bigint_add(bigint_neg(a), b), "864197532086419753208641975320");
+    check("carry", bigint_add(bigint_from_str("999999999999999999"), bigint_one()), "1000000000000000000");
+    check("borrow", bigint_sub(bigint_from_str("1000000000000000000"), bigint_one()), "999999999999999999");
+    check("mul", bigint_mul(a, b), "121932631137021795226185032733622923332237463801111263526900");
+    check("mul.sign", bigint_mul(bigint_neg(a), bigint_from_i64(-2)), "246913578024691357802469135780");
+    check("mul.zero", bigint_mul(a, bigint_zero()), "0");
+    check("mul_i64", bigint_mul_i64(a, -3), "-370370367037037036703703703670");
+    check("add_i64", bigint_add_i64(bigint_from_i64(5), -8), "-3");
+    check("neg", bigint_neg(a), "-123456789012345678901234567890");
+    check("abs", bigint_abs(bigint_neg(a)), "123456789012345678901234567890");
+
+    check_i("cmp.lt", bigint_cmp(a, b), -1);
+    check_i("cmp.gt", bigint_cmp(b, a), 1);
+    check_i("cmp.eq", bigint_cmp(a, bigint_from_str("123456789012345678901234567890")), 0);
+    check_i("cmp.neg", bigint_cmp(bigint_neg(b), bigint_neg(a)), -1);
+    check_i("cmp.sign", bigint_cmp(bigint_neg(a), bigint_one()), -1);
+    check_b("eq", bigint_eq(a, a), true);
+    check_b("lt", bigint_lt(bigint_from_i64(-5), bigint_from_i64(3)), true);
+    check_b("gt", bigint_gt(bigint_from_i64(-5), bigint_from_i64(3)), false);
+
+    check("div", bigint_div(b, a), "8");
+    check("mod", bigint_mod(b, a), "9000000000900000000090");
+    var x = bigint_add(bigint_pow(bigint_from_i64(2), 200), bigint_from_i64(12345));
+    var y = bigint_from_str("1000000000000000000000000000007");
+    check("pow2_200+", x, "1606938044258990275541962092341162602522202993782792835313721");
+    var dm = bigint_divmod(x, y);
+    check("dm.q", dm.q, "1606938044258990275541962092329");
+    check("dm.r", dm.r, "914036212390061853999100667418");
+    check("dm.check", bigint_add(bigint_mul(dm.q, y), dm.r), "1606938044258990275541962092341162602522202993782792835313721");
+    check("div.small", bigint_div(bigint_from_str("1000000000000000000"), bigint_from_i64(1000000001)), "999999999");
+    check("mod.small", bigint_mod(bigint_from_str("1000000000000000000"), bigint_from_i64(1000000001)), "1");
+    check("div.9s", bigint_div(bigint_from_str("999999999999999999999999999"), bigint_from_str("999999999999999999")), "1000000000");
+    check("mod.9s", bigint_mod(bigint_from_str("999999999999999999999999999"), bigint_from_str("999999999999999999")), "999999999");
+    var n = bigint_neg(bigint_from_str("10000000000000000000000003"));
+    var d = bigint_from_str("1000000000001");
+    check("div.neg", bigint_div(n, d), "-9999999999990");
+    check("mod.neg", bigint_mod(n, d), "-13");
+    check("div.lt", bigint_div(a, b), "0");
+    check("mod.lt", bigint_mod(a, b), "123456789012345678901234567890");
+    check("div.byzero", bigint_div(a, bigint_zero()), "0");
+
+    check("pow3_100", bigint_pow(bigint_from_i64(3), 100), "515377520732011331036461129765621272702107522001");
+    check("pow.0", bigint_pow(a, 0), "1");
+    check("fact30", factorial(30), "265252859812191058636308480000000");
+
+    check("modpow.small", bigint_modpow(bigint_from_i64(4), bigint_from_i64(13), bigint_from_i64(497)), "445");
+    var mers = bigint_sub(bigint_pow(bigint_from_i64(2), 127), bigint_one());
+    var m = bigint_add_i64(bigint_pow(bigint_from_i64(10), 40), 9);
+    check("modpow.big", bigint_modpow(mers, bigint_from_i64(65537), m), "6323423133708753786020642288204538570854");
+    check("modpow.m0", bigint_modpow(a, b, bigint_zero()), "0");
+
+    check_s("hex", bigint_to_hex(bigint_pow(bigint_from_i64(2), 100)), "0x10000000000000000000000000");
+    check_s("hex.ff", bigint_to_hex(bigint_from_i64(-255)), "-0xff");
+    check_s("hex.0", bigint_to_hex(bigint_zero()), "0x0");
+    println("bigint ok");
+    return 0;
+}

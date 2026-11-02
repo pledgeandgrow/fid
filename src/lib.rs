@@ -34,6 +34,7 @@ pub mod parser;
 pub mod token;
 pub mod typechecker;
 pub mod pe;
+pub mod dwarf;
 pub mod pir;
 pub mod opt;
 pub mod regalloc;

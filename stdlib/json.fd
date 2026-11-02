@@ -54,7 +54,26 @@ fn j_scan_str(s: str, i: i64) -> i64 {
     while j < str_len(s) {
         var c: i64 = str_byte_at(s, j);
         if c == 92 {
-            j = j + 2;  // skip escaped char ('uXXXX' hex is scanned as normal chars)
+            // only \" \\ \/ \b \f \n \r \t \uXXXX are valid escapes
+            if j + 1 >= str_len(s) { return -1; }
+            var e: i64 = str_byte_at(s, j + 1);
+            if e == 117 {
+                var k: i64 = 2;
+                while k < 6 {
+                    if j + k >= str_len(s) { return -1; }
+                    var h: i64 = str_byte_at(s, j + k);
+                    if !((h >= 48 && h <= 57) || (h >= 97 && h <= 102) || (h >= 65 && h <= 70)) {
+                        return -1;
+                    }
+                    k = k + 1;
+                }
+                j = j + 6;
+                continue;
+            }
+            if e != 34 && e != 92 && e != 47 && e != 98 && e != 102 && e != 110 && e != 114 && e != 116 {
+                return -1;
+            }
+            j = j + 2;
             continue;
         }
         if c == 34 { return j + 1; }
@@ -67,19 +86,24 @@ fn j_scan_str(s: str, i: i64) -> i64 {
 fn j_scan_num(s: str, i: i64) -> i64 {
     var j: i64 = i;
     if j < str_len(s) && str_byte_at(s, j) == 45 { j = j + 1; }
+    // RFC 8259: int = "0" / digit1-9 *DIGIT; frac = "." 1*DIGIT
     var digits: i64 = 0;
+    var first: i64 = j;
     while j < str_len(s) && str_byte_at(s, j) >= 48 && str_byte_at(s, j) <= 57 {
         j = j + 1;
         digits = digits + 1;
     }
+    if digits == 0 { return -1; }
+    if digits > 1 && str_byte_at(s, first) == 48 { return -1; }
     if j < str_len(s) && str_byte_at(s, j) == 46 {
         j = j + 1;
+        var fd: i64 = 0;
         while j < str_len(s) && str_byte_at(s, j) >= 48 && str_byte_at(s, j) <= 57 {
             j = j + 1;
-            digits = digits + 1;
+            fd = fd + 1;
         }
+        if fd == 0 { return -1; }
     }
-    if digits == 0 { return -1; }
     if j < str_len(s) && (str_byte_at(s, j) == 101 || str_byte_at(s, j) == 69) {
         j = j + 1;
         if j < str_len(s) && (str_byte_at(s, j) == 43 || str_byte_at(s, j) == 45) { j = j + 1; }
@@ -373,8 +397,30 @@ pub fn json_unescape(lit: str) -> str {
                 k = k + 1;
             }
             if !ok { return lit; }
-            out = out + utf8_encode(cp);
             i = i + 4;
+            // UTF-16 surrogate pair \uD8xx\uDCxx → one codepoint
+            if cp >= 55296 && cp <= 56319 && i + 6 < n - 1 &&
+               str_byte_at(lit, i + 1) == 92 && str_byte_at(lit, i + 2) == 117 {
+                var lo: i64 = 0;
+                var k2: i64 = 3;
+                while k2 <= 6 {
+                    var h2: i64 = str_byte_at(lit, i + k2);
+                    var d2: i64 = -1;
+                    if h2 >= 48 && h2 <= 57 { d2 = h2 - 48; }
+                    if h2 >= 97 && h2 <= 102 { d2 = h2 - 87; }
+                    if h2 >= 65 && h2 <= 70 { d2 = h2 - 55; }
+                    if d2 < 0 { lo = -1; break; }
+                    lo = lo * 16 + d2;
+                    k2 = k2 + 1;
+                }
+                if lo >= 56320 && lo <= 57343 {
+                    cp = 65536 + (cp - 55296) * 1024 + (lo - 56320);
+                    i = i + 6;
+                }
+            }
+            // byte-exact on every backend (utf8_encode goes through
+            // char_to_str for cp < 256, which is one raw byte on C/PE)
+            out = out + enc_bytes_to_str(utf8_encode_bytes(cp));
         }
         else { out = out + str_slice(lit, i, i + 1); }
         i = i + 1;
@@ -463,8 +509,22 @@ pub fn json_pretty(s: str) -> str {
     var i: i64 = 0;
     while i < str_len(src) {
         var c: i64 = str_byte_at(src, i);
-        if c == 34 && (i == 0 || str_byte_at(src, i - 1) != 92) { in_str = !in_str; }
+        if in_str && c == 92 {
+            // copy an escape pair whole, so "\\" before a quote is not
+            // mistaken for an escaped quote
+            out = out + str_slice(src, i, i + 2);
+            i = i + 2;
+            continue;
+        }
+        if c == 34 { in_str = !in_str; }
         if !in_str {
+            if (c == 123 || c == 91) && i + 1 < str_len(src) &&
+               (str_byte_at(src, i + 1) == 125 || str_byte_at(src, i + 1) == 93) {
+                // empty {} / []
+                out = out + str_slice(src, i, i + 2);
+                i = i + 2;
+                continue;
+            }
             if c == 123 || c == 91 {
                 ind = ind + 1;
                 out = out + str_slice(src, i, i + 1) + "\n" + j_ind(ind);

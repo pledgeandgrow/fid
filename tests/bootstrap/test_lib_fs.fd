@@ -1,0 +1,199 @@
+// stdlib/fs: write/read/append text and bytes, sizes, lines, rename,
+// delete, mkdir/mkdir_all/rmdir/rmdir_all, listing, walk, glob, temp
+// files and the pure path helpers. Everything is written under a fresh
+// directory in the system temp dir and removed at the end; no path or
+// generated name is printed.
+use fs;
+use env;
+
+fn check_b(label: str, got: bool, want: bool) {
+    println(label + " = " + bool_to_str(got));
+    if got != want { p_panic("fs: wrong value for " + label); }
+}
+
+fn check_i(label: str, got: i64, want: i64) {
+    println(label + " = " + int_to_str(got));
+    if got != want { p_panic("fs: wrong value for " + label); }
+}
+
+fn check_s(label: str, got: str, want: str) {
+    println(label + " = " + got);
+    if !str_equal(got, want) { p_panic("fs: wrong value for " + label); }
+}
+
+// True when `v` holds a string ending in `suffix`.
+fn has_suffix(v: Vec<str>, suffix: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        var s: str = v.get(i);
+        if str_ends_with(s, suffix) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn has_name(v: Vec<str>, name: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        var s: str = v.get(i);
+        if str_equal(s, name) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn temp_base() -> str {
+    var t: str = env_get("TEMP");
+    if str_len(t) > 0 && fs_is_dir(t) { return t; }
+    t = env_get("TMPDIR");
+    if str_len(t) > 0 && fs_is_dir(t) { return t; }
+    if fs_is_dir("/tmp") { return "/tmp"; }
+    return ".";
+}
+
+fn main() -> i64 {
+    // ── Pure path helpers ──
+    check_s("join", fs_join("a", "b"), "a/b");
+    check_s("join slash", fs_join("a/", "/b"), "a/b");
+    check_s("join one slash", fs_join("a/", "b"), "a/b");
+    check_s("join empty a", fs_join("", "b"), "b");
+    check_s("join empty b", fs_join("a", ""), "a");
+    check_s("basename", fs_basename("dir/sub/file.tar.gz"), "file.tar.gz");
+    check_s("basename win", fs_basename("C:\\x\\y.txt"), "y.txt");
+    check_s("basename trailing", fs_basename("dir/"), "");
+    check_s("basename bare", fs_basename("file"), "file");
+    check_s("dirname", fs_dirname("dir/sub/file.txt"), "dir/sub");
+    check_s("dirname none", fs_dirname("file.txt"), "");
+    check_s("ext", fs_ext("a/b.tar.gz"), ".gz");
+    check_s("ext none", fs_ext("a.d/file"), "");
+    check_s("stem", fs_stem("a/b.tar.gz"), "a/b.tar");
+    check_s("path_in", fs_path_in("d", "f.txt"), "d/f.txt");
+    check_b("glob *.fd", fs_glob_match("main.fd", "*.fd"), true);
+    check_b("glob *.fd no", fs_glob_match("main.rs", "*.fd"), false);
+    check_b("glob ?", fs_glob_match("a1", "a?"), true);
+    check_b("glob ? no", fs_glob_match("a12", "a?"), false);
+
+    // ── Workspace ──
+    var root: str = fs_temp_dir(temp_base(), "tmp_fs_test");
+    check_b("temp dir made", str_len(root) > 0, true);
+    check_b("temp dir is dir", fs_is_dir(root), true);
+    check_b("temp dir name", str_starts_with(fs_basename(root), "tmp_fs_test_"), true);
+
+    // ── Text files ──
+    val f: str = fs_join(root, "hello.txt");
+    check_b("missing exists", fs_exists(f), false);
+    check_i("missing size", fs_file_size(f), -1);
+    check_b("write", fs_write_text(f, "Hello, World!"), true);
+    check_b("exists", fs_exists(f), true);
+    check_b("is_file", fs_is_file(f), true);
+    check_b("file not dir", fs_is_dir(f), false);
+    check_s("read", fs_read_text(f), "Hello, World!");
+    check_i("size", fs_file_size(f), 13);
+    check_b("append", fs_append_text(f, "\nline2\nline3"), true);
+    check_i("size after append", fs_file_size(f), 25);
+    var lines: Vec<str> = fs_read_lines(f);
+    check_i("lines", lines.len(), 3);
+    check_s("line 2", lines.get(1), "line2");
+    check_b("overwrite", fs_write_text(f, "short"), true);
+    check_s("read overwritten", fs_read_text(f), "short");
+    check_i("lines of missing", fs_read_lines(fs_join(root, "nope")).len(), 0);
+    check_s("read missing", fs_read_text(fs_join(root, "nope")), "");
+
+    // ── Bytes ──
+    val bf: str = fs_join(root, "data.bin");
+    var bytes: Vec<i64> = Vec::new();
+    bytes.push(0);
+    bytes.push(1);
+    bytes.push(127);
+    bytes.push(65);
+    bytes.push(10);
+    check_b("write bytes", fs_write_bytes(bf, bytes), true);
+    check_i("bytes size", fs_file_size(bf), 5);
+    var rb: Vec<i64> = fs_read_bytes(bf);
+    check_i("read bytes len", rb.len(), 5);
+    check_i("byte 0", rb.get(0), 0);
+    check_i("byte 2", rb.get(2), 127);
+    check_i("byte 3", rb.get(3), 65);
+    check_i("byte 4", rb.get(4), 10);
+
+    // ── Rename / delete ──
+    val g: str = fs_join(root, "renamed.txt");
+    check_b("rename", fs_rename(f, g), true);
+    check_b("old gone", fs_exists(f), false);
+    check_s("new content", fs_read_text(g), "short");
+    check_b("delete", fs_delete(g), true);
+    check_b("deleted", fs_exists(g), false);
+    check_b("delete missing", fs_delete(g), false);
+
+    // ── Directories ──
+    val d1: str = fs_join(root, "d1");
+    check_b("mkdir", fs_mkdir(d1), true);
+    check_b("mkdir again", fs_mkdir(d1), false);
+    check_b("rmdir", fs_rmdir(d1), true);
+    check_b("rmdir gone", fs_is_dir(d1), false);
+    check_b("mkdir_all", fs_mkdir_all(fs_join(root, "a/b/c")), true);
+    check_b("mkdir_all exists", fs_mkdir_all(fs_join(root, "a/b/c")), true);
+    check_b("mkdir_all empty", fs_mkdir_all(""), false);
+    fs_write_text(fs_join(root, "a/top.fd"), "1");
+    fs_write_text(fs_join(root, "a/b/mid.fd"), "22");
+    fs_write_text(fs_join(root, "a/b/c/deep.fd"), "333");
+    fs_write_text(fs_join(root, "a/b/c/deep.txt"), "x");
+    fs_write_text(fs_join(root, "a/notes.txt"), "n");
+
+    var la: Vec<str> = fs_list_dir(fs_join(root, "a"));
+    check_i("list a", la.len(), 3);
+    check_b("list has b", has_name(la, "b"), true);
+    check_b("list has top.fd", has_name(la, "top.fd"), true);
+    check_b("list has notes.txt", has_name(la, "notes.txt"), true);
+    check_i("list missing", fs_list_dir(fs_join(root, "zz")).len(), 0);
+
+    var w: Vec<str> = fs_walk(fs_join(root, "a"));
+    check_i("walk", w.len(), 7);
+    check_b("walk deep", has_suffix(w, "a/b/c/deep.fd"), true);
+    check_b("walk dir c", has_suffix(w, "a/b/c"), true);
+    var wf: Vec<str> = fs_walk_files(fs_join(root, "a"));
+    check_i("walk files", wf.len(), 5);
+    check_b("walk files no dir", has_suffix(wf, "a/b"), false);
+    check_i("walk missing", fs_walk(fs_join(root, "zz")).len(), 0);
+
+    var g1: Vec<str> = fs_glob(fs_join(root, "a"), "*.fd");
+    check_i("glob *.fd", g1.len(), 1);
+    check_b("glob *.fd top", has_suffix(g1, "a/top.fd"), true);
+    var g2: Vec<str> = fs_glob(fs_join(root, "a"), "**/*.fd");
+    check_i("glob **/*.fd", g2.len(), 3);
+    check_b("glob ** deep", has_suffix(g2, "a/b/c/deep.fd"), true);
+    var g3: Vec<str> = fs_glob(fs_join(root, "a"), "b/?/deep.*");
+    check_i("glob b/?/deep.*", g3.len(), 2);
+    var g4: Vec<str> = fs_glob(fs_join(root, "a"), "*.rs");
+    check_i("glob none", g4.len(), 0);
+
+    // ── Temp files ──
+    var t1: str = fs_temp_file(root, "tf");
+    check_b("temp file made", str_len(t1) > 0, true);
+    check_b("temp file exists", fs_exists(t1), true);
+    check_i("temp file empty", fs_file_size(t1), 0);
+    check_b("temp file ext", str_ends_with(t1, ".tmp"), true);
+    var t2: str = fs_temp_file(root, "tf");
+    check_b("temp files differ", !str_equal(t1, t2), true);
+    var tp: str = fs_temp_path(root, "tp");
+    check_b("temp path not created", fs_exists(tp), false);
+
+    // ── file.fd aliases ──
+    val al: str = fs_join(root, "alias.txt");
+    check_i("file_write", file_write(al, "ab"), 0);
+    check_i("file_append", file_append(al, "cd"), 0);
+    check_s("file_read", file_read(al), "abcd");
+    check_b("file_exists", file_exists(al), true);
+    check_i("file_size", file_size(al), 4);
+    check_i("file_delete", file_delete(al), 0);
+    check_i("file_delete again", file_delete(al), -1);
+
+    // ── Cleanup ──
+    check_b("rmdir non-empty fails", fs_rmdir(root), false);
+    check_b("rmdir_all", fs_rmdir_all(root), true);
+    check_b("root gone", fs_is_dir(root), false);
+    check_b("rmdir_all missing", fs_rmdir_all(root), true);
+
+    println("fs ok");
+    return 0;
+}

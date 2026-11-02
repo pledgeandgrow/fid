@@ -75,6 +75,7 @@
 - [H6_INIT:](#h6_init:) (const)
 - [H7_INIT:](#h7_init:) (const)
 - [crypto_sha256](#crypto_sha256) (function)
+- [crypto_sha256_bytes](#crypto_sha256_bytes) (function)
 - [crypto_sha256_hex](#crypto_sha256_hex) (function)
 - [crypto_sha256_hex_str](#crypto_sha256_hex_str) (function)
 - [NonceTracker](#noncetracker) (struct)
@@ -87,6 +88,8 @@
 - [crypto_constant_time_eq](#crypto_constant_time_eq) (function)
 - [CRYPTO_APPROVED_ALGORITHMS:](#crypto_approved_algorithms:) (const)
 - [CRYPTO_REJECTED_ALGORITHMS:](#crypto_rejected_algorithms:) (const)
+- [crypto_random_u64](#crypto_random_u64) (function)
+- [crypto_random_bytes](#crypto_random_bytes) (function)
 
 ## K0:
 
@@ -94,7 +97,7 @@
 pub const K0: i64  = 0x428a2f98;
 ```
 
-*Defined at line 29*
+*Defined at line 31*
 
 ---
 
@@ -104,7 +107,7 @@ pub const K0: i64  = 0x428a2f98;
 pub const K1: i64  = 0x71374491;
 ```
 
-*Defined at line 30*
+*Defined at line 32*
 
 ---
 
@@ -114,7 +117,7 @@ pub const K1: i64  = 0x71374491;
 pub const K2: i64  = 0xb5c0fbcf;
 ```
 
-*Defined at line 31*
+*Defined at line 33*
 
 ---
 
@@ -124,7 +127,7 @@ pub const K2: i64  = 0xb5c0fbcf;
 pub const K3: i64  = 0xe9b5dba5;
 ```
 
-*Defined at line 32*
+*Defined at line 34*
 
 ---
 
@@ -134,7 +137,7 @@ pub const K3: i64  = 0xe9b5dba5;
 pub const K4: i64  = 0x3956c25b;
 ```
 
-*Defined at line 33*
+*Defined at line 35*
 
 ---
 
@@ -144,7 +147,7 @@ pub const K4: i64  = 0x3956c25b;
 pub const K5: i64  = 0x59f111f1;
 ```
 
-*Defined at line 34*
+*Defined at line 36*
 
 ---
 
@@ -154,7 +157,7 @@ pub const K5: i64  = 0x59f111f1;
 pub const K6: i64  = 0x923f82a4;
 ```
 
-*Defined at line 35*
+*Defined at line 37*
 
 ---
 
@@ -164,7 +167,7 @@ pub const K6: i64  = 0x923f82a4;
 pub const K7: i64  = 0xab1c5ed5;
 ```
 
-*Defined at line 36*
+*Defined at line 38*
 
 ---
 
@@ -174,7 +177,7 @@ pub const K7: i64  = 0xab1c5ed5;
 pub const K8: i64  = 0xd807aa98;
 ```
 
-*Defined at line 37*
+*Defined at line 39*
 
 ---
 
@@ -184,7 +187,7 @@ pub const K8: i64  = 0xd807aa98;
 pub const K9: i64  = 0x12835b01;
 ```
 
-*Defined at line 38*
+*Defined at line 40*
 
 ---
 
@@ -194,7 +197,7 @@ pub const K9: i64  = 0x12835b01;
 pub const K10: i64 = 0x243185be;
 ```
 
-*Defined at line 39*
+*Defined at line 41*
 
 ---
 
@@ -204,7 +207,7 @@ pub const K10: i64 = 0x243185be;
 pub const K11: i64 = 0x550c7dc3;
 ```
 
-*Defined at line 40*
+*Defined at line 42*
 
 ---
 
@@ -214,7 +217,7 @@ pub const K11: i64 = 0x550c7dc3;
 pub const K12: i64 = 0x72be5d74;
 ```
 
-*Defined at line 41*
+*Defined at line 43*
 
 ---
 
@@ -224,7 +227,7 @@ pub const K12: i64 = 0x72be5d74;
 pub const K13: i64 = 0x80deb1fe;
 ```
 
-*Defined at line 42*
+*Defined at line 44*
 
 ---
 
@@ -234,7 +237,7 @@ pub const K13: i64 = 0x80deb1fe;
 pub const K14: i64 = 0x9bdc06a7;
 ```
 
-*Defined at line 43*
+*Defined at line 45*
 
 ---
 
@@ -244,7 +247,7 @@ pub const K14: i64 = 0x9bdc06a7;
 pub const K15: i64 = 0xc19bf174;
 ```
 
-*Defined at line 44*
+*Defined at line 46*
 
 ---
 
@@ -254,7 +257,7 @@ pub const K15: i64 = 0xc19bf174;
 pub const K16: i64 = 0xe49b69c1;
 ```
 
-*Defined at line 45*
+*Defined at line 47*
 
 ---
 
@@ -264,7 +267,7 @@ pub const K16: i64 = 0xe49b69c1;
 pub const K17: i64 = 0xefbe4786;
 ```
 
-*Defined at line 46*
+*Defined at line 48*
 
 ---
 
@@ -274,7 +277,7 @@ pub const K17: i64 = 0xefbe4786;
 pub const K18: i64 = 0x0fc19dc6;
 ```
 
-*Defined at line 47*
+*Defined at line 49*
 
 ---
 
@@ -284,7 +287,7 @@ pub const K18: i64 = 0x0fc19dc6;
 pub const K19: i64 = 0x240ca1cc;
 ```
 
-*Defined at line 48*
+*Defined at line 50*
 
 ---
 
@@ -294,7 +297,7 @@ pub const K19: i64 = 0x240ca1cc;
 pub const K20: i64 = 0x2de92c6f;
 ```
 
-*Defined at line 49*
+*Defined at line 51*
 
 ---
 
@@ -304,7 +307,7 @@ pub const K20: i64 = 0x2de92c6f;
 pub const K21: i64 = 0x4a7484aa;
 ```
 
-*Defined at line 50*
+*Defined at line 52*
 
 ---
 
@@ -314,7 +317,7 @@ pub const K21: i64 = 0x4a7484aa;
 pub const K22: i64 = 0x5cb0a9dc;
 ```
 
-*Defined at line 51*
+*Defined at line 53*
 
 ---
 
@@ -324,7 +327,7 @@ pub const K22: i64 = 0x5cb0a9dc;
 pub const K23: i64 = 0x76f988da;
 ```
 
-*Defined at line 52*
+*Defined at line 54*
 
 ---
 
@@ -334,7 +337,7 @@ pub const K23: i64 = 0x76f988da;
 pub const K24: i64 = 0x983e5152;
 ```
 
-*Defined at line 53*
+*Defined at line 55*
 
 ---
 
@@ -344,7 +347,7 @@ pub const K24: i64 = 0x983e5152;
 pub const K25: i64 = 0xa831c66d;
 ```
 
-*Defined at line 54*
+*Defined at line 56*
 
 ---
 
@@ -354,7 +357,7 @@ pub const K25: i64 = 0xa831c66d;
 pub const K26: i64 = 0xb00327c8;
 ```
 
-*Defined at line 55*
+*Defined at line 57*
 
 ---
 
@@ -364,7 +367,7 @@ pub const K26: i64 = 0xb00327c8;
 pub const K27: i64 = 0xbf597fc7;
 ```
 
-*Defined at line 56*
+*Defined at line 58*
 
 ---
 
@@ -374,7 +377,7 @@ pub const K27: i64 = 0xbf597fc7;
 pub const K28: i64 = 0xc6e00bf3;
 ```
 
-*Defined at line 57*
+*Defined at line 59*
 
 ---
 
@@ -384,7 +387,7 @@ pub const K28: i64 = 0xc6e00bf3;
 pub const K29: i64 = 0xd5a79147;
 ```
 
-*Defined at line 58*
+*Defined at line 60*
 
 ---
 
@@ -394,7 +397,7 @@ pub const K29: i64 = 0xd5a79147;
 pub const K30: i64 = 0x06ca6351;
 ```
 
-*Defined at line 59*
+*Defined at line 61*
 
 ---
 
@@ -404,7 +407,7 @@ pub const K30: i64 = 0x06ca6351;
 pub const K31: i64 = 0x14292967;
 ```
 
-*Defined at line 60*
+*Defined at line 62*
 
 ---
 
@@ -414,7 +417,7 @@ pub const K31: i64 = 0x14292967;
 pub const K32: i64 = 0x27b70a85;
 ```
 
-*Defined at line 61*
+*Defined at line 63*
 
 ---
 
@@ -424,7 +427,7 @@ pub const K32: i64 = 0x27b70a85;
 pub const K33: i64 = 0x2e1b2138;
 ```
 
-*Defined at line 62*
+*Defined at line 64*
 
 ---
 
@@ -434,7 +437,7 @@ pub const K33: i64 = 0x2e1b2138;
 pub const K34: i64 = 0x4d2c6dfc;
 ```
 
-*Defined at line 63*
+*Defined at line 65*
 
 ---
 
@@ -444,7 +447,7 @@ pub const K34: i64 = 0x4d2c6dfc;
 pub const K35: i64 = 0x53380d13;
 ```
 
-*Defined at line 64*
+*Defined at line 66*
 
 ---
 
@@ -454,7 +457,7 @@ pub const K35: i64 = 0x53380d13;
 pub const K36: i64 = 0x650a7354;
 ```
 
-*Defined at line 65*
+*Defined at line 67*
 
 ---
 
@@ -464,7 +467,7 @@ pub const K36: i64 = 0x650a7354;
 pub const K37: i64 = 0x766a0abb;
 ```
 
-*Defined at line 66*
+*Defined at line 68*
 
 ---
 
@@ -474,7 +477,7 @@ pub const K37: i64 = 0x766a0abb;
 pub const K38: i64 = 0x81c2c92e;
 ```
 
-*Defined at line 67*
+*Defined at line 69*
 
 ---
 
@@ -484,7 +487,7 @@ pub const K38: i64 = 0x81c2c92e;
 pub const K39: i64 = 0x92722c85;
 ```
 
-*Defined at line 68*
+*Defined at line 70*
 
 ---
 
@@ -494,7 +497,7 @@ pub const K39: i64 = 0x92722c85;
 pub const K40: i64 = 0xa2bfe8a1;
 ```
 
-*Defined at line 69*
+*Defined at line 71*
 
 ---
 
@@ -504,7 +507,7 @@ pub const K40: i64 = 0xa2bfe8a1;
 pub const K41: i64 = 0xa81a664b;
 ```
 
-*Defined at line 70*
+*Defined at line 72*
 
 ---
 
@@ -514,7 +517,7 @@ pub const K41: i64 = 0xa81a664b;
 pub const K42: i64 = 0xc24b8b70;
 ```
 
-*Defined at line 71*
+*Defined at line 73*
 
 ---
 
@@ -524,7 +527,7 @@ pub const K42: i64 = 0xc24b8b70;
 pub const K43: i64 = 0xc76c51a3;
 ```
 
-*Defined at line 72*
+*Defined at line 74*
 
 ---
 
@@ -534,7 +537,7 @@ pub const K43: i64 = 0xc76c51a3;
 pub const K44: i64 = 0xd192e819;
 ```
 
-*Defined at line 73*
+*Defined at line 75*
 
 ---
 
@@ -544,7 +547,7 @@ pub const K44: i64 = 0xd192e819;
 pub const K45: i64 = 0xd6990624;
 ```
 
-*Defined at line 74*
+*Defined at line 76*
 
 ---
 
@@ -554,7 +557,7 @@ pub const K45: i64 = 0xd6990624;
 pub const K46: i64 = 0xf40e3585;
 ```
 
-*Defined at line 75*
+*Defined at line 77*
 
 ---
 
@@ -564,7 +567,7 @@ pub const K46: i64 = 0xf40e3585;
 pub const K47: i64 = 0x106aa070;
 ```
 
-*Defined at line 76*
+*Defined at line 78*
 
 ---
 
@@ -574,7 +577,7 @@ pub const K47: i64 = 0x106aa070;
 pub const K48: i64 = 0x19a4c116;
 ```
 
-*Defined at line 77*
+*Defined at line 79*
 
 ---
 
@@ -584,7 +587,7 @@ pub const K48: i64 = 0x19a4c116;
 pub const K49: i64 = 0x1e376c08;
 ```
 
-*Defined at line 78*
+*Defined at line 80*
 
 ---
 
@@ -594,7 +597,7 @@ pub const K49: i64 = 0x1e376c08;
 pub const K50: i64 = 0x2748774c;
 ```
 
-*Defined at line 79*
+*Defined at line 81*
 
 ---
 
@@ -604,7 +607,7 @@ pub const K50: i64 = 0x2748774c;
 pub const K51: i64 = 0x34b0bcb5;
 ```
 
-*Defined at line 80*
+*Defined at line 82*
 
 ---
 
@@ -614,7 +617,7 @@ pub const K51: i64 = 0x34b0bcb5;
 pub const K52: i64 = 0x391c0cb3;
 ```
 
-*Defined at line 81*
+*Defined at line 83*
 
 ---
 
@@ -624,7 +627,7 @@ pub const K52: i64 = 0x391c0cb3;
 pub const K53: i64 = 0x4ed8aa4a;
 ```
 
-*Defined at line 82*
+*Defined at line 84*
 
 ---
 
@@ -634,7 +637,7 @@ pub const K53: i64 = 0x4ed8aa4a;
 pub const K54: i64 = 0x5b9cca4f;
 ```
 
-*Defined at line 83*
+*Defined at line 85*
 
 ---
 
@@ -644,7 +647,7 @@ pub const K54: i64 = 0x5b9cca4f;
 pub const K55: i64 = 0x682e6ff3;
 ```
 
-*Defined at line 84*
+*Defined at line 86*
 
 ---
 
@@ -654,7 +657,7 @@ pub const K55: i64 = 0x682e6ff3;
 pub const K56: i64 = 0x748f82ee;
 ```
 
-*Defined at line 85*
+*Defined at line 87*
 
 ---
 
@@ -664,7 +667,7 @@ pub const K56: i64 = 0x748f82ee;
 pub const K57: i64 = 0x78a5636f;
 ```
 
-*Defined at line 86*
+*Defined at line 88*
 
 ---
 
@@ -674,7 +677,7 @@ pub const K57: i64 = 0x78a5636f;
 pub const K58: i64 = 0x84c87814;
 ```
 
-*Defined at line 87*
+*Defined at line 89*
 
 ---
 
@@ -684,7 +687,7 @@ pub const K58: i64 = 0x84c87814;
 pub const K59: i64 = 0x8cc70208;
 ```
 
-*Defined at line 88*
+*Defined at line 90*
 
 ---
 
@@ -694,7 +697,7 @@ pub const K59: i64 = 0x8cc70208;
 pub const K60: i64 = 0x90befffa;
 ```
 
-*Defined at line 89*
+*Defined at line 91*
 
 ---
 
@@ -704,7 +707,7 @@ pub const K60: i64 = 0x90befffa;
 pub const K61: i64 = 0xa4506ceb;
 ```
 
-*Defined at line 90*
+*Defined at line 92*
 
 ---
 
@@ -714,7 +717,7 @@ pub const K61: i64 = 0xa4506ceb;
 pub const K62: i64 = 0xbef9a3f7;
 ```
 
-*Defined at line 91*
+*Defined at line 93*
 
 ---
 
@@ -724,7 +727,7 @@ pub const K62: i64 = 0xbef9a3f7;
 pub const K63: i64 = 0xc67178f2;
 ```
 
-*Defined at line 92*
+*Defined at line 94*
 
 ---
 
@@ -734,7 +737,7 @@ pub const K63: i64 = 0xc67178f2;
 pub const H0_INIT: i64 = 0x6a09e667;
 ```
 
-*Defined at line 95*
+*Defined at line 97*
 
 ---
 
@@ -744,7 +747,7 @@ pub const H0_INIT: i64 = 0x6a09e667;
 pub const H1_INIT: i64 = 0xbb67ae85;
 ```
 
-*Defined at line 96*
+*Defined at line 98*
 
 ---
 
@@ -754,7 +757,7 @@ pub const H1_INIT: i64 = 0xbb67ae85;
 pub const H2_INIT: i64 = 0x3c6ef372;
 ```
 
-*Defined at line 97*
+*Defined at line 99*
 
 ---
 
@@ -764,7 +767,7 @@ pub const H2_INIT: i64 = 0x3c6ef372;
 pub const H3_INIT: i64 = 0xa54ff53a;
 ```
 
-*Defined at line 98*
+*Defined at line 100*
 
 ---
 
@@ -774,7 +777,7 @@ pub const H3_INIT: i64 = 0xa54ff53a;
 pub const H4_INIT: i64 = 0x510e527f;
 ```
 
-*Defined at line 99*
+*Defined at line 101*
 
 ---
 
@@ -784,7 +787,7 @@ pub const H4_INIT: i64 = 0x510e527f;
 pub const H5_INIT: i64 = 0x9b05688c;
 ```
 
-*Defined at line 100*
+*Defined at line 102*
 
 ---
 
@@ -794,7 +797,7 @@ pub const H5_INIT: i64 = 0x9b05688c;
 pub const H6_INIT: i64 = 0x1f83d9ab;
 ```
 
-*Defined at line 101*
+*Defined at line 103*
 
 ---
 
@@ -804,7 +807,7 @@ pub const H6_INIT: i64 = 0x1f83d9ab;
 pub const H7_INIT: i64 = 0x5be0cd19;
 ```
 
-*Defined at line 102*
+*Defined at line 104*
 
 ---
 
@@ -814,16 +817,35 @@ Compute SHA-256 hash of a string.
 Returns a 32-byte Vec of hash values (each byte 0-255).
 
 ```fides
-pub fn crypto_sha256(input: str) -> Vec {
+pub fn crypto_sha256(input: str) -> Vec<i64> {
 ```
 
 **Parameters:**
 
 - `input`: `str`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 155*
+*Defined at line 158*
+
+---
+
+## crypto_sha256_bytes
+
+Compute SHA-256 of a byte vector (each element 0-255): binary-safe.
+Returns a 32-byte Vec.
+
+```fides
+pub fn crypto_sha256_bytes(msg: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `msg`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 164*
 
 ---
 
@@ -832,16 +854,16 @@ pub fn crypto_sha256(input: str) -> Vec {
 Convert SHA-256 hash bytes to hex string.
 
 ```fides
-pub fn crypto_sha256_hex(hash: Vec) -> str {
+pub fn crypto_sha256_hex(hash: Vec<i64>) -> str {
 ```
 
 **Parameters:**
 
-- `hash`: `Vec`
+- `hash`: `Vec<i64>`
 
 **Returns:** `str`
 
-*Defined at line 325*
+*Defined at line 332*
 
 ---
 
@@ -859,7 +881,7 @@ pub fn crypto_sha256_hex_str(input: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 339*
+*Defined at line 346*
 
 ---
 
@@ -875,10 +897,10 @@ pub struct NonceTracker {
 
 | Name | Type |
 |------|------|
-| `used` | `Vec` |
+| `used` | `Vec<i64>` |
 | `next` | `i64` |
 
-*Defined at line 353*
+*Defined at line 360*
 
 ---
 
@@ -892,7 +914,7 @@ pub fn crypto_nonce_tracker_new() -> NonceTracker {
 
 **Returns:** `NonceTracker`
 
-*Defined at line 359*
+*Defined at line 366*
 
 ---
 
@@ -910,7 +932,7 @@ pub fn crypto_nonce_next(tracker: NonceTracker) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 367*
+*Defined at line 374*
 
 ---
 
@@ -929,7 +951,7 @@ pub fn crypto_nonce_is_used(tracker: NonceTracker, nonce: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 375*
+*Defined at line 382*
 
 ---
 
@@ -948,7 +970,7 @@ pub fn crypto_nonce_register(tracker: NonceTracker, nonce: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 385*
+*Defined at line 392*
 
 ---
 
@@ -966,7 +988,7 @@ pub fn crypto_nonce_reset(tracker: NonceTracker) -> void {
 
 **Returns:** `void`
 
-*Defined at line 397*
+*Defined at line 404*
 
 ---
 
@@ -976,7 +998,7 @@ Compute HMAC-SHA256.
 Returns a 32-byte Vec.
 
 ```fides
-pub fn crypto_hmac_sha256(key: str, message: str) -> Vec {
+pub fn crypto_hmac_sha256(key: str, message: str) -> Vec<i64> {
 ```
 
 **Parameters:**
@@ -984,9 +1006,9 @@ pub fn crypto_hmac_sha256(key: str, message: str) -> Vec {
 - `key`: `str`
 - `message`: `str`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 412*
+*Defined at line 419*
 
 ---
 
@@ -996,17 +1018,17 @@ Compare two byte arrays in constant time (prevents timing attacks).
 Returns true if equal, false otherwise. Always processes all bytes.
 
 ```fides
-pub fn crypto_constant_time_eq(a: Vec, b: Vec) -> bool {
+pub fn crypto_constant_time_eq(a: Vec<i64>, b: Vec<i64>) -> bool {
 ```
 
 **Parameters:**
 
-- `a`: `Vec`
-- `b`: `Vec`
+- `a`: `Vec<i64>`
+- `b`: `Vec<i64>`
 
 **Returns:** `bool`
 
-*Defined at line 458*
+*Defined at line 473*
 
 ---
 
@@ -1016,7 +1038,7 @@ pub fn crypto_constant_time_eq(a: Vec, b: Vec) -> bool {
 pub const CRYPTO_APPROVED_ALGORITHMS: str = "SHA-256, HMAC-SHA256";
 ```
 
-*Defined at line 484*
+*Defined at line 499*
 
 ---
 
@@ -1026,7 +1048,39 @@ pub const CRYPTO_APPROVED_ALGORITHMS: str = "SHA-256, HMAC-SHA256";
 pub const CRYPTO_REJECTED_ALGORITHMS: str = "MD5, SHA-1, custom";
 ```
 
-*Defined at line 485*
+*Defined at line 500*
+
+---
+
+## crypto_random_u64
+
+64 random bits.
+
+```fides
+pub fn crypto_random_u64() -> i64 {
+```
+
+**Returns:** `i64`
+
+*Defined at line 508*
+
+---
+
+## crypto_random_bytes
+
+`n` random bytes, each 0..255.
+
+```fides
+pub fn crypto_random_bytes(n: i64) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `n`: `i64`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 513*
 
 ---
 

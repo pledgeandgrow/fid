@@ -505,6 +505,8 @@ unmangled (`len` instead of `Vec_len`).
 **Fixes applied:**
 - NULL check after `p_file_read` in `compiler.fd`.
 - Recursion limit (`p_max_recursion = 10000`) + abort in `compiler/codegen_c.fd`.
+  (Removed Nov 2, 2026: compiled code now relies on the OS guard page, with a
+  handler on reserved stack that reports the overflow.)
 - OOM abort on all `p_malloc` failures in `compiler/codegen_c.fd`.
 - Vectored exception handler (Windows) / signal handler (Linux) in both `compiler/codegen_c.fd` and `src/codegen_c.rs`.
 - Windows 16 MB stack thread wrapper in `src/codegen_c.rs`.

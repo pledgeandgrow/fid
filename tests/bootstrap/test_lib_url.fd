@@ -1,0 +1,168 @@
+// stdlib/url: percent encoding (plain and form), decoding, parsing of
+// every component, serialization, query strings, path normalization and
+// the RFC 3986 section 5.4 reference-resolution examples.
+// (Decoded non-ASCII text is not checked here: building strings from
+// bytes >= 128 differs on the interpreter, see str_from_bytes.)
+use url;
+
+fn check_s(name: str, got: str, want: str) {
+    println(name + " = " + got);
+    if !str_equal(got, want) {
+        p_panic(name + ": got [" + got + "], want [" + want + "]");
+    }
+}
+
+fn check_i(name: str, got: i64, want: i64) {
+    println(name + " = " + int_to_str(got));
+    if got != want {
+        p_panic(name + ": got " + int_to_str(got) + ", want " + int_to_str(want));
+    }
+}
+
+fn check_b(name: str, got: bool, want: bool) {
+    var g: str = "false";
+    if got { g = "true"; }
+    println(name + " = " + g);
+    if got != want {
+        p_panic(name + ": wrong");
+    }
+}
+
+fn parts(u: Url) -> str {
+    return u.scheme + "|" + u.userinfo + "|" + u.host + "|" + int_to_str(u.port) + "|" +
+        u.path + "|" + u.query + "|" + u.fragment;
+}
+
+fn main() -> i64 {
+    // ── Encoding ──
+    check_s("encode unreserved", url_encode("AZaz09-._~"), "AZaz09-._~");
+    check_s("encode reserved", url_encode("a b&c=d/e?f#g"), "a%20b%26c%3Dd%2Fe%3Ff%23g");
+    check_s("encode utf8", url_encode("é€"), "%C3%A9%E2%82%AC");
+    check_s("encode percent", url_encode("100%"), "100%25");
+    check_s("encode empty", url_encode(""), "");
+    check_s("encode_form space", url_encode_form("a b+c"), "a+b%2Bc");
+    check_s("encode_form utf8", url_encode_form("x é"), "x+%C3%A9");
+
+    // ── Decoding ──
+    check_s("decode basic", url_decode("a%20b%26c"), "a b&c");
+    check_s("decode lower hex", url_decode("%2f%3a"), "/:");
+    check_s("decode plus stays", url_decode("a+b"), "a+b");
+    check_s("decode bad escape", url_decode("100%zz%"), "100%zz%");
+    check_s("decode truncated", url_decode("ab%4"), "ab%4");
+    check_s("decode at end", url_decode("ab%41"), "abA");
+    check_s("decode adjacent", url_decode("%41%42C%44"), "ABCD");
+    check_s("decode_form", url_decode_form("a+b%2Bc"), "a b+c");
+    check_s("roundtrip", url_decode(url_encode("k=v & w/x?")), "k=v & w/x?");
+
+    // ── Parsing ──
+    check_s("parse full", parts(url_parse("https://user:p%40ss@Example.COM:8443/a%20b/c?x=1&y=2#frag%21")),
+        "https|user:p@ss|Example.COM|8443|/a b/c|x=1&y=2|frag!");
+    check_s("parse scheme lower", parts(url_parse("HTTP://h/")), "http||h|-1|/||");
+    check_s("parse no path", parts(url_parse("http://host.com")), "http||host.com|-1|/||");
+    check_s("parse empty port", parts(url_parse("http://h:/x")), "http||h|-1|/x||");
+    check_s("parse ipv6", parts(url_parse("http://[::1]:8080/p")), "http||::1|8080|/p||");
+    check_s("parse ipv6 no port", parts(url_parse("http://[fe80::2]/")), "http||fe80::2|-1|/||");
+    check_s("parse mailto", parts(url_parse("mailto:joe@x.org")), "mailto|||-1|joe@x.org||");
+    check_s("parse relative", parts(url_parse("../rel/p?q#f")), "|||-1|../rel/p|q|f");
+    check_s("parse query only", parts(url_parse("?a=1")), "|||-1||a=1|");
+    check_s("parse file", parts(url_parse("file:///tmp/x.txt")), "file|||-1|/tmp/x.txt||");
+    check_s("parse at in path", parts(url_parse("http://h/a@b")), "http||h|-1|/a@b||");
+    check_s("parse non-numeric port", parts(url_parse("http://h:abc/")), "http||h:abc|-1|/||");
+
+    // ── Serialization ──
+    check_s("to_str full", url_to_str(url_parse("https://user:pw@h.com:8443/a%20b/c?x=1#f/g")),
+        "https://user:pw@h.com:8443/a%20b/c?x=1#f/g");
+    check_s("to_str ipv6", url_to_str(url_parse("http://[::1]:80/")), "http://[::1]:80/");
+    check_s("to_str userinfo at", url_to_str(url_parse("ftp://a%40b@h/")), "ftp://a%40b@h/");
+    check_s("to_str path specials", url_to_str(url_parse("http://h/a;b=c/d:e@f%25")), "http://h/a;b=c/d:e@f%25");
+    check_s("to_str relative", url_to_str(url_parse("p/q?x#y")), "p/q?x#y");
+    var u: Url = url_parse("http://h/");
+    u.path = "/new path";
+    u.query = "k=v";
+    u.port = 8080;
+    check_s("to_str edited", url_to_str(u), "http://h:8080/new%20path?k=v");
+
+    // ── Query strings ──
+    val q: str = "a=1&b=two+words&c=%26%3D&flag&a=dup&e=";
+    check_s("query a (first wins)", url_query_get(q, "a"), "1");
+    check_s("query b", url_query_get(q, "b"), "two words");
+    check_s("query c", url_query_get(q, "c"), "&=");
+    check_i("query flag empty", str_len(url_query_get(q, "flag")), 0);
+    check_i("query missing", str_len(url_query_get(q, "zz")), 0);
+    check_b("has flag", url_query_has(q, "flag"), true);
+    check_b("has e", url_query_has(q, "e"), true);
+    check_b("has zz", url_query_has(q, "zz"), false);
+    check_b("has empty query", url_query_has("", "a"), false);
+    check_s("query encoded key", url_query_get("my+key=1&x%20y=2", "x y"), "2");
+    val keys: Vec<str> = url_query_keys("a=1&&b=2&c");
+    check_i("keys len", keys.len(), 3);
+    check_s("keys", keys.get(0) + "," + keys.get(1) + "," + keys.get(2), "a,b,c");
+    var ks: Vec<str> = Vec::new();
+    var vs: Vec<str> = Vec::new();
+    ks.push("q");
+    vs.push("hello world");
+    ks.push("x&y");
+    vs.push("1=2");
+    ks.push("only");
+    check_s("query build", url_query_build(ks, vs), "q=hello+world&x%26y=1%3D2&only");
+    check_s("query build roundtrip", url_query_get(url_query_build(ks, vs), "x&y"), "1=2");
+
+    // ── Path normalization ──
+    check_s("norm dots", url_normalize_path("/a/./b/../c"), "/a/c");
+    check_s("norm above root", url_normalize_path("/../../x"), "/x");
+    check_s("norm trailing", url_normalize_path("/a/b/.."), "/a/");
+    check_s("norm double slash", url_normalize_path("/a//b/"), "/a/b/");
+    check_s("norm relative", url_normalize_path("a/./b"), "a/b");
+    check_s("norm root", url_normalize_path("/"), "/");
+    check_s("norm all up", url_normalize_path("/a/.."), "/");
+
+    // ── Resolution: RFC 3986 section 5.4.1 / 5.4.2 ──
+    val base: Url = url_parse("http://a/b/c/d;p?q");
+    var rels: Vec<str> = Vec::new();
+    var want: Vec<str> = Vec::new();
+    rels.push("g:h");        want.push("g:h");
+    rels.push("g");          want.push("http://a/b/c/g");
+    rels.push("./g");        want.push("http://a/b/c/g");
+    rels.push("g/");         want.push("http://a/b/c/g/");
+    rels.push("/g");         want.push("http://a/g");
+    rels.push("//g/x");      want.push("http://g/x");
+    rels.push("?y");         want.push("http://a/b/c/d;p?y");
+    rels.push("g?y");        want.push("http://a/b/c/g?y");
+    rels.push("#s");         want.push("http://a/b/c/d;p?q#s");
+    rels.push("g#s");        want.push("http://a/b/c/g#s");
+    rels.push("g?y#s");      want.push("http://a/b/c/g?y#s");
+    rels.push(";x");         want.push("http://a/b/c/;x");
+    rels.push("g;x");        want.push("http://a/b/c/g;x");
+    rels.push("");           want.push("http://a/b/c/d;p?q");
+    rels.push(".");          want.push("http://a/b/c/");
+    rels.push("./");         want.push("http://a/b/c/");
+    rels.push("..");         want.push("http://a/b/");
+    rels.push("../");        want.push("http://a/b/");
+    rels.push("../g");       want.push("http://a/b/g");
+    rels.push("../..");      want.push("http://a/");
+    rels.push("../../");     want.push("http://a/");
+    rels.push("../../g");    want.push("http://a/g");
+    rels.push("../../../g"); want.push("http://a/g");
+    rels.push("/./g");       want.push("http://a/g");
+    rels.push("/../g");      want.push("http://a/g");
+    rels.push("g.");         want.push("http://a/b/c/g.");
+    rels.push(".g");         want.push("http://a/b/c/.g");
+    rels.push("g..");        want.push("http://a/b/c/g..");
+    rels.push("..g");        want.push("http://a/b/c/..g");
+    rels.push("./../g");     want.push("http://a/b/g");
+    rels.push("./g/.");      want.push("http://a/b/c/g/");
+    rels.push("g/./h");      want.push("http://a/b/c/g/h");
+    rels.push("g/../h");     want.push("http://a/b/c/h");
+    rels.push("g;x=1/./y");  want.push("http://a/b/c/g;x=1/y");
+    rels.push("g;x=1/../y"); want.push("http://a/b/c/y");
+    var i: i64 = 0;
+    while i < rels.len() {
+        check_s("resolve '" + rels.get(i) + "'", url_resolve(base, rels.get(i)), want.get(i));
+        i = i + 1;
+    }
+    check_s("resolve port kept", url_resolve(url_parse("http://h:81/a/b"), "c"), "http://h:81/a/c");
+    check_s("resolve space", url_resolve(url_parse("http://h/a/b"), "my%20file"), "http://h/a/my%20file");
+    check_s("resolve no base path", url_resolve(url_parse("http://h"), "x"), "http://h/x");
+    println("url ok");
+    return 0;
+}

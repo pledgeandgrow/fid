@@ -444,6 +444,20 @@ impl X86Encoder {
         self.emit_u64(val);
     }
 
+    /// mov r64, imm in its shortest form: mov r32 (zero-extends), imm32
+    /// sign-extended, or movabs. Flags are left alone.
+    fn mov_imm(&mut self, r: Reg, val: i64) {
+        if (0..=u32::MAX as i64).contains(&val) {
+            if r.is_extended() { self.emit_u8(0x41); }
+            self.emit_u8(0xB8 + r.code());
+            self.emit_u32(val as u32);
+        } else if (i32::MIN as i64..=i32::MAX as i64).contains(&val) {
+            self.mov_imm32(r, val as i32);
+        } else {
+            self.mov_imm64(r, val as u64);
+        }
+    }
+
     /// mov r64, imm32 (sign-extended, 7 bytes)
     fn mov_imm32(&mut self, r: Reg, val: i32) {
         self.rex(true, false, false, r.is_extended());
@@ -670,6 +684,14 @@ impl X86Encoder {
     }
 
     /// imul r64, r64
+    /// imul r, r, imm32: OF is set as by imul r, r/m
+    fn imul_r_i32(&mut self, r: Reg, imm: i32) {
+        self.rex(true, r.is_extended(), false, r.is_extended());
+        self.emit_u8(0x69);
+        self.modrm_rr(r, r);
+        self.emit_i32(imm);
+    }
+
     fn imul_rr(&mut self, dst: Reg, src: Reg) {
         self.rex(true, dst.is_extended(), false, src.is_extended());
         self.emit_u8(0x0F);
@@ -1572,7 +1594,7 @@ const MSVCRT_IMPORTS: &[&str] = &[
     "malloc", "calloc", "realloc", "free", "getenv", "exit", "qsort", "bsearch", "ldiv",
     "_snprintf", "putchar", "puts", "getchar",
     "fopen", "fclose", "fread", "fwrite", "fflush", "fgets", "fputs",
-    "fseek", "ftell", "_fseeki64", "remove", "rename", "_access",
+    "fseek", "ftell", "_fseeki64", "remove", "rename", "_access", "rand_s",
     "system",
 ];
 
@@ -1793,29 +1815,71 @@ const SECTION_ALIGN: u32 = 0x1000;
 const FILE_ALIGN: u32 = 0x200;
 const TEXT_RVA: u32 = 0x1000;
 
-/// Build a complete PE32+ executable from .text and .rdata section data
-fn build_pe_file(text: &[u8], rdata: &[u8], entry_point_rva: u32, import_dir_rva: u32, iat_rva: u32, iat_size: u32, rdata_rva: u32) -> Vec<u8> {
+/// Build a complete PE32+ executable from .text and .rdata section data,
+/// plus optional DWARF debug sections (`-g`). Debug sections continue the
+/// RVA sequence after .rdata but are flagged discardable, so the loader
+/// skips them; debuggers read them from the file. Their names are longer
+/// than the 8-byte field allows, so a COFF string table goes at the end of
+/// the file and PointerToSymbolTable names it (the GCC/MinGW layout).
+fn build_pe_file(text: &[u8], rdata: &[u8], entry_point_rva: u32, import_dir_rva: u32, iat_rva: u32, iat_size: u32, rdata_rva: u32, dbg_secs: &[(&str, &[u8])]) -> Vec<u8> {
     let mut pe = Vec::new();
 
-    // Header size: DOS(64) + PE sig(4) + COFF(20) + Optional(240) + 2 sections(80) = 408 bytes
-    // Wait — let's count precisely: 64+4+20+240+80 = 408. But we need room and alignment.
-    // Actually: DOS(64) + PE sig(4) + COFF(20) + Optional(240) + 2×section(80) = 408 bytes.
-    // Align to FILE_ALIGN (512) is enough. But let's be safe and compute properly.
+    let nsec = 2 + dbg_secs.len() as u32;
+
+    // Header size: DOS(64) + PE sig(4) + COFF(20) + Optional(240) + nsec×40,
+    // aligned up to FILE_ALIGN.
     let header_size = align_up(
-        64 + 4 + 20 + 240 + 2 * 40, // = 408
+        64 + 4 + 20 + 240 + nsec * 40,
         FILE_ALIGN,
-    ) as usize; // = 512
+    ) as usize;
 
     // Section sizes (aligned to FILE_ALIGN for raw data)
     let text_raw_size = align_up(text.len() as u32, FILE_ALIGN) as usize;
     let rdata_raw_size = align_up(rdata.len() as u32, FILE_ALIGN) as usize;
+    let dbg_raw_sizes: Vec<usize> = dbg_secs.iter()
+        .map(|(_, b)| align_up(b.len() as u32, FILE_ALIGN) as usize)
+        .collect();
 
     // Virtual sizes (aligned to SECTION_ALIGN)
     let text_virt_size = align_up(text.len() as u32, SECTION_ALIGN);
     let rdata_virt_size = align_up(rdata.len() as u32, SECTION_ALIGN);
 
-    // SizeOfImage: headers + .text + .rdata (aligned)
-    let size_of_image = align_up(header_size as u32, SECTION_ALIGN) + text_virt_size + rdata_virt_size;
+    // Debug sections continue the RVA sequence after .rdata
+    let mut dbg_rvas: Vec<u32> = Vec::with_capacity(dbg_secs.len());
+    {
+        let mut rva = rdata_rva + rdata_virt_size;
+        for (_, bytes) in dbg_secs {
+            dbg_rvas.push(rva);
+            rva += align_up(bytes.len() as u32, SECTION_ALIGN);
+        }
+    }
+
+    // SizeOfImage: headers + every section's aligned virtual size
+    let mut size_of_image = align_up(header_size as u32, SECTION_ALIGN) + text_virt_size + rdata_virt_size;
+    for (_, bytes) in dbg_secs {
+        size_of_image += align_up(bytes.len() as u32, SECTION_ALIGN);
+    }
+
+    // Section names longer than 8 bytes go in the COFF string table: the
+    // name field holds "/<offset>" and the table (4-byte size + strings)
+    // sits at the end of the file, pointed at by PointerToSymbolTable.
+    let mut strtab: Vec<u8> = Vec::new();
+    let mut dbg_names: Vec<[u8; 8]> = Vec::with_capacity(dbg_secs.len());
+    for (name, _) in dbg_secs {
+        if name.len() <= 8 {
+            let mut n = [0u8; 8];
+            n[..name.len()].copy_from_slice(name.as_bytes());
+            dbg_names.push(n);
+        } else {
+            let off = 4 + strtab.len() as u32; // first 4 bytes hold the size
+            let refname = format!("/{}", off);
+            let mut n = [0u8; 8];
+            n[..refname.len()].copy_from_slice(refname.as_bytes());
+            dbg_names.push(n);
+            strtab.extend_from_slice(name.as_bytes());
+            strtab.push(0);
+        }
+    }
 
     // ─── DOS Header (64 bytes) ───
     pe.extend_from_slice(&0x5A4Du16.to_le_bytes()); // e_magic = "MZ"
@@ -1843,9 +1907,12 @@ fn build_pe_file(text: &[u8], rdata: &[u8], entry_point_rva: u32, import_dir_rva
 
     // ─── COFF Header (20 bytes) ───
     pe.extend_from_slice(&0x8664u16.to_le_bytes()); // Machine = AMD64
-    pe.extend_from_slice(&2u16.to_le_bytes()); // NumberOfSections = 2 (.text, .rdata)
+    pe.extend_from_slice(&(nsec as u16).to_le_bytes()); // NumberOfSections
     pe.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
-    pe.extend_from_slice(&0u32.to_le_bytes()); // PointerToSymbolTable
+    // PointerToSymbolTable is patched to the COFF string table at the end
+    // when a debug section name needs it (none without -g).
+    let ptr_to_symtab = pe.len();
+    pe.extend_from_slice(&0u32.to_le_bytes());
     pe.extend_from_slice(&0u32.to_le_bytes()); // NumberOfSymbols
     pe.extend_from_slice(&240u16.to_le_bytes()); // SizeOfOptionalHeader (PE32+)
     pe.extend_from_slice(&0x0022u16.to_le_bytes()); // Characteristics: EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
@@ -1926,7 +1993,7 @@ fn build_pe_file(text: &[u8], rdata: &[u8], entry_point_rva: u32, import_dir_rva
     pe.extend_from_slice(&text_virt_size.to_le_bytes()); // VirtualSize
     pe.extend_from_slice(&TEXT_RVA.to_le_bytes()); // VirtualAddress
     pe.extend_from_slice(&(text_raw_size as u32).to_le_bytes()); // SizeOfRawData
-    pe.extend_from_slice(&FILE_ALIGN.to_le_bytes()); // PointerToRawData
+    pe.extend_from_slice(&(header_size as u32).to_le_bytes()); // PointerToRawData
     pe.extend_from_slice(&0u32.to_le_bytes()); // PointerToRelocations
     pe.extend_from_slice(&0u32.to_le_bytes()); // PointerToLinenumbers
     pe.extend_from_slice(&0u16.to_le_bytes()); // NumberOfRelocations
@@ -1938,12 +2005,30 @@ fn build_pe_file(text: &[u8], rdata: &[u8], entry_point_rva: u32, import_dir_rva
     pe.extend_from_slice(&rdata_virt_size.to_le_bytes()); // VirtualSize
     pe.extend_from_slice(&rdata_rva.to_le_bytes()); // VirtualAddress
     pe.extend_from_slice(&(rdata_raw_size as u32).to_le_bytes()); // SizeOfRawData
-    pe.extend_from_slice(&(FILE_ALIGN + text_raw_size as u32).to_le_bytes()); // PointerToRawData
+    pe.extend_from_slice(&(header_size as u32 + text_raw_size as u32).to_le_bytes()); // PointerToRawData
     pe.extend_from_slice(&0u32.to_le_bytes()); // PointerToRelocations
     pe.extend_from_slice(&0u32.to_le_bytes()); // PointerToLinenumbers
     pe.extend_from_slice(&0u16.to_le_bytes()); // NumberOfRelocations
     pe.extend_from_slice(&0u16.to_le_bytes()); // NumberOfLinenumbers
     pe.extend_from_slice(&0xC0000040u32.to_le_bytes()); // Characteristics: INITIALIZED_DATA|READ|WRITE (IAT needs write)
+
+    // ─── Debug section headers (-g) ───
+    // INITIALIZED_DATA | MEM_DISCARDABLE | MEM_READ: readable from the file,
+    // skipped by the loader (the GCC/MinGW convention for .debug_* in PE).
+    let mut dbg_raw_ptr = header_size + text_raw_size + rdata_raw_size;
+    for (i, (_, bytes)) in dbg_secs.iter().enumerate() {
+        pe.extend_from_slice(&dbg_names[i]); // Name (8 bytes, "/N" for long)
+        pe.extend_from_slice(&align_up(bytes.len() as u32, SECTION_ALIGN).to_le_bytes()); // VirtualSize
+        pe.extend_from_slice(&dbg_rvas[i].to_le_bytes()); // VirtualAddress
+        pe.extend_from_slice(&(dbg_raw_sizes[i] as u32).to_le_bytes()); // SizeOfRawData
+        pe.extend_from_slice(&(dbg_raw_ptr as u32).to_le_bytes()); // PointerToRawData
+        pe.extend_from_slice(&0u32.to_le_bytes()); // PointerToRelocations
+        pe.extend_from_slice(&0u32.to_le_bytes()); // PointerToLinenumbers
+        pe.extend_from_slice(&0u16.to_le_bytes()); // NumberOfRelocations
+        pe.extend_from_slice(&0u16.to_le_bytes()); // NumberOfLinenumbers
+        pe.extend_from_slice(&0x42100040u32.to_le_bytes()); // INITIALIZED_DATA|DISCARDABLE|READ
+        dbg_raw_ptr += dbg_raw_sizes[i];
+    }
 
     // Pad headers to FILE_ALIGN
     while pe.len() < header_size {
@@ -1960,6 +2045,22 @@ fn build_pe_file(text: &[u8], rdata: &[u8], entry_point_rva: u32, import_dir_rva
     pe.extend_from_slice(rdata);
     while pe.len() < header_size + text_raw_size + rdata_raw_size {
         pe.push(0);
+    }
+
+    // ─── Debug section data ───
+    for (_, bytes) in dbg_secs {
+        pe.extend_from_slice(bytes);
+        while pe.len() % FILE_ALIGN as usize != 0 {
+            pe.push(0);
+        }
+    }
+
+    // ─── COFF string table (long section names) ───
+    if !strtab.is_empty() {
+        let strtab_ptr = pe.len() as u32;
+        pe.extend_from_slice(&(4 + strtab.len() as u32).to_le_bytes());
+        pe.extend_from_slice(&strtab);
+        pe[ptr_to_symtab..ptr_to_symtab + 4].copy_from_slice(&strtab_ptr.to_le_bytes());
     }
 
     pe
@@ -2090,6 +2191,28 @@ struct PeCodeGen {
     /// is followed by a Branch on its result — the Branch then jumps on the
     /// compare's still-live flags.
     pending_cmp: Option<(u8, u32)>,
+    /// The comparison being emitted only sets flags: its sole use is the
+    /// Branch right after it
+    flags_only: bool,
+    /// How many times each value of the current function is used
+    use_count: HashMap<u32, u32>,
+    /// The label of the block laid out after the current one
+    next_block: Option<u32>,
+    /// The prologue reserved the outgoing argument area: a call does not
+    /// move rsp
+    calls_reserved: bool,
+    /// -g: source file and directory for the DWARF compilation unit;
+    /// empty = no debug info
+    dbg_file: String,
+    dbg_dir: String,
+    /// (text offset, source line) recorded before each instruction whose IR
+    /// metadata carries a source line — feeds .debug_line
+    dbg_lines: Vec<(u32, u32)>,
+    /// (name, start offset, end offset) per generated function — feeds
+    /// .debug_info subprogram DIEs
+    dbg_funcs: Vec<(String, u32, u32)>,
+    /// Last source line recorded, to skip duplicate rows
+    dbg_last_line: u32,
 }
 
 /// An `extern "C"` function of msvcrt.dll or kernel32.dll: called through a
@@ -2249,6 +2372,15 @@ impl PeCodeGen {
             c_overrides: std::collections::BTreeMap::new(),
             named_fns: Vec::new(),
             pending_cmp: None,
+            flags_only: false,
+            use_count: HashMap::new(),
+            next_block: None,
+            calls_reserved: false,
+            dbg_file: String::new(),
+            dbg_dir: String::new(),
+            dbg_lines: Vec::new(),
+            dbg_funcs: Vec::new(),
+            dbg_last_line: 0,
         }
     }
 
@@ -2595,8 +2727,32 @@ impl PeCodeGen {
         let iat_size = rdata.iat_size as u32; // every DLL's entries + null terminators
         let entry_rva = TEXT_RVA + self.entry_offset as u32;
 
-        // 12. Build PE file
-        build_pe_file(&self.enc.code, &rdata.data, entry_rva, import_dir_rva, iat_rva, iat_size, rdata_rva)
+        // 12. -g: DWARF debug sections (.debug_* appended after .rdata)
+        let dwarf = if self.dbg_file.is_empty() {
+            None
+        } else {
+            Some(self.build_dwarf())
+        };
+        let dbg_secs: Vec<(&'static str, &[u8])> = dwarf.as_ref()
+            .map(|d| d.sections())
+            .unwrap_or_default();
+
+        // 13. Build PE file
+        build_pe_file(&self.enc.code, &rdata.data, entry_rva, import_dir_rva, iat_rva, iat_size, rdata_rva, &dbg_secs)
+    }
+
+    /// -g: assemble .debug_abbrev/.debug_info/.debug_line/.debug_str for the
+    /// code just emitted, as one DWARF v4 compilation unit.
+    fn build_dwarf(&self) -> crate::dwarf::DwarfSections {
+        let mut b = crate::dwarf::DwarfBuilder::new(&self.dbg_file, &self.dbg_dir);
+        let base = IMAGE_BASE + TEXT_RVA as u64;
+        for (name, start, end) in &self.dbg_funcs {
+            b.add_function(name, base + *start as u64, base + *end as u64, true);
+        }
+        for (off, line) in &self.dbg_lines {
+            b.add_line_entry(base + *off as u64, *line, 0);
+        }
+        b.build()
     }
 
     /// Generate a flat binary (no PE headers, no imports).
@@ -3577,6 +3733,8 @@ impl PeCodeGen {
         let label = *self.func_labels.get(name).unwrap();
         self.enc.align_to(16);
         self.enc.place_label(label);
+        let dbg_fn_start = self.enc.code.len() as u32;
+        self.dbg_last_line = 0;
 
         if func.is_interrupt {
             // Interrupt handler prologue: save all GP registers
@@ -3690,6 +3848,32 @@ impl PeCodeGen {
             let size = module.type_size(&meta.ty).max(8);
             frame.alloc(**vid, size);
         }
+        // A parameter read more than once keeps a free register for the
+        // whole function, while two stay free for temporaries
+        if use_regs {
+            let mut uses: HashMap<u32, u32> = HashMap::new();
+            for i in func.instructions.values() {
+                ops.clear();
+                inst_operands(i, &mut ops);
+                for o in &ops {
+                    *uses.entry(o.0).or_insert(0) += 1;
+                }
+            }
+            let mut params: Vec<(u32, u32)> = func.params.iter()
+                .filter(|(id, ty)| reg_word(ty, module) && !no_reg.contains(&id.0)
+                    && uses.get(&id.0).copied().unwrap_or(0) >= 2)
+                .map(|(id, _)| (uses[&id.0], id.0))
+                .collect();
+            params.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            for (_, p) in params {
+                if free_regs.len() <= 2 {
+                    break;
+                }
+                let r = free_regs.pop().unwrap();
+                used_regs.push(r);
+                frame.offsets.insert(p, (REG_SLOT as usize + r) as i64);
+            }
+        }
         // Assign recyclable values pool slots in scan order — the same order
         // the emit loop runs in, so frees/assignments line up exactly.
         let mut dead_at: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -3758,8 +3942,28 @@ impl PeCodeGen {
         used_regs.sort();
         self.saved_regs = used_regs.iter().map(|r| (VALUE_REGS[*r], frame.alloc_raw(8) as i32)).collect();
 
+        // The outgoing argument area of every call, reserved once: shadow
+        // space and the widest call's stack arguments
+        self.use_count.clear();
+        let mut most_args = 0usize;
+        let mut ops: Vec<ValueId> = Vec::new();
+        for i in func.instructions.values() {
+            ops.clear();
+            inst_operands(i, &mut ops);
+            for op in &ops {
+                *self.use_count.entry(op.0).or_insert(0) += 1;
+            }
+            match i {
+                Inst::Call { args, .. } | Inst::CallPtr { args, .. } | Inst::DynCall { args, .. } => {
+                    most_args = most_args.max(args.len() + 1);
+                }
+                _ => {}
+            }
+        }
+        let out_args = most_args.saturating_sub(4) as i64 * 8;
+        self.calls_reserved = !func.is_interrupt;
         // Align stack to 16 bytes + 32 shadow space
-        let stack_size = ((frame.size + 32 + 15) & !15) as i64;
+        let stack_size = ((frame.size + 32 + out_args + 15) & !15) as i64;
         let stack_size = stack_size.max(64);
         self.enc.sub_rsp_i32(stack_size as i32);
 
@@ -3806,13 +4010,25 @@ impl PeCodeGen {
         }
 
         // Generate code for each basic block
-        for block in &func.blocks {
+        for (bi, block) in func.blocks.iter().enumerate() {
             let blabel = *self.block_labels.get(&(name.to_string(), block.id.0)).unwrap();
             self.enc.place_label(blabel);
             self.pending_cmp = None;
+            self.next_block = func.blocks.get(bi + 1)
+                .map(|b| *self.block_labels.get(&(name.to_string(), b.id.0)).unwrap());
 
             for (i, &inst_id) in block.instructions.iter().enumerate() {
                 if let Some(inst) = func.get_inst(inst_id) {
+                    // -g: the machine code for this instruction starts here;
+                    // one line-table row per distinct source line.
+                    if !self.dbg_file.is_empty() {
+                        if let Some(line) = func.values.get(&inst_id).and_then(|m| m.source_line) {
+                            if line as u32 != self.dbg_last_line {
+                                self.dbg_lines.push((self.enc.code.len() as u32, line as u32));
+                                self.dbg_last_line = line as u32;
+                            }
+                        }
+                    }
                     let next = block.instructions.get(i + 1).and_then(|nid| func.get_inst(*nid));
                     self.gen_inst(inst_id, inst, next, &mut frame, func, module, name);
                 }
@@ -3826,6 +4042,10 @@ impl PeCodeGen {
         self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
         self.enc.pop(Reg::Rbp);
         self.enc.ret();
+
+        if !self.dbg_file.is_empty() {
+            self.dbg_funcs.push((name.to_string(), dbg_fn_start, self.enc.code.len() as u32));
+        }
     }
 
     /// Generate code for a single instruction
@@ -3849,7 +4069,7 @@ impl PeCodeGen {
                     frame.const_vals.insert(id.0, *value);
                     return;
                 }
-                self.enc.mov_imm64(Reg::Rax, *value as u64);
+                self.enc.mov_imm(Reg::Rax, *value);
                 self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
                 frame.const_vals.insert(id.0, *value);
             }
@@ -3917,17 +4137,20 @@ impl PeCodeGen {
                 } else if operand_ty.is_float() {
                     self.gen_float_binop(op, loff, roff, dst, &operand_ty);
                 } else {
-                    self.gen_int_binop(op, loff, roff, dst, lconst, rconst, ty, unsigned_cmp);
                     // cmp+branch fusion (pe-roadmap item 82): a comparison
                     // feeding the next instruction's Branch keeps its flags
                     // live through setcc/movzx/mov — the branch jcc's on them
                     // directly instead of reloading the slot and testing.
-                    if let Some(cc) = int_cmp_cc(op, unsigned_cmp) {
-                        if let Some(Inst::Branch { cond, .. }) = next {
-                            if *cond == id {
-                                self.pending_cmp = Some((cc, id.0));
-                            }
-                        }
+                    // When that Branch is its only use, it is not stored at all.
+                    let fused = match (int_cmp_cc(op, unsigned_cmp), next) {
+                        (Some(cc), Some(Inst::Branch { cond, .. })) if *cond == id => Some(cc),
+                        _ => None,
+                    };
+                    self.flags_only = fused.is_some() && self.use_count.get(&id.0) == Some(&1);
+                    self.gen_int_binop(op, loff, roff, dst, lconst, rconst, ty, unsigned_cmp);
+                    self.flags_only = false;
+                    if let Some(cc) = fused {
+                        self.pending_cmp = Some((cc, id.0));
                     }
                 }
             }
@@ -4117,26 +4340,35 @@ impl PeCodeGen {
             // ─── Control Flow ───
             Inst::Jump { target } => {
                 let blabel = *self.block_labels.get(&(func_name.to_string(), target.0)).unwrap();
-                self.enc.jmp_label(blabel);
+                if self.next_block != Some(blabel) {
+                    self.enc.jmp_label(blabel);
+                }
             }
 
             Inst::Branch { cond, then, else_ } => {
                 let then_label = *self.block_labels.get(&(func_name.to_string(), then.0)).unwrap();
                 let else_label = *self.block_labels.get(&(func_name.to_string(), else_.0)).unwrap();
-                if let Some((cc, vid)) = self.pending_cmp.take() {
-                    if vid == cond.0 {
-                        // The compare just emitted left its flags live:
-                        // jump on the condition directly.
-                        self.enc.jcc_label(cc, then_label);
-                        self.enc.jmp_label(else_label);
-                        return;
+                let mut cc = 0x5; // jne: the bool is not zero
+                match self.pending_cmp.take() {
+                    // The compare just emitted left its flags live: jump on
+                    // the condition directly.
+                    Some((fcc, vid)) if vid == cond.0 => cc = fcc,
+                    _ => {
+                        let coff = frame.offset(*cond) as i32;
+                        self.enc.mov_reg_mem_rbp(Reg::Rax, coff);
+                        self.enc.test_rr(Reg::Rax, Reg::Rax);
                     }
                 }
-                let coff = frame.offset(*cond) as i32;
-                self.enc.mov_reg_mem_rbp(Reg::Rax, coff);
-                self.enc.test_rr(Reg::Rax, Reg::Rax);
-                self.enc.jcc_label(0x5, then_label); // jne
-                self.enc.jmp_label(else_label);
+                // The block laid out next needs no jump; x86 condition codes
+                // come in pairs that differ in the low bit
+                if self.next_block == Some(then_label) {
+                    self.enc.jcc_label(cc ^ 1, else_label);
+                } else {
+                    self.enc.jcc_label(cc, then_label);
+                    if self.next_block != Some(else_label) {
+                        self.enc.jmp_label(else_label);
+                    }
+                }
             }
 
             Inst::Return { value } => {
@@ -4366,7 +4598,7 @@ impl PeCodeGen {
                         match arg {
                             Some(a) => {
                                 match frame.const_vals.get(&a.0).copied() {
-                                    Some(v) => self.enc.mov_imm64(arg_regs[i], v as u64),
+                                    Some(v) => self.enc.mov_imm(arg_regs[i], v),
                                     None => self.enc.mov_reg_mem_rbp(arg_regs[i], frame.offset(*a) as i32),
                                 }
                             }
@@ -4375,14 +4607,16 @@ impl PeCodeGen {
                     }
                 }
 
-                self.enc.sub_rsp_i32(call_space);
+                if !self.calls_reserved {
+                    self.enc.sub_rsp_i32(call_space);
+                }
                 // Place stack args
                 for (i, arg) in call_args.iter().enumerate().skip(4) {
                     let stack_pos = 32 + ((i - 4) as i32) * 8;
                     match arg {
                         Some(a) => {
                             match frame.const_vals.get(&a.0).copied() {
-                                Some(v) => self.enc.mov_imm64(Reg::Rax, v as u64),
+                                Some(v) => self.enc.mov_imm(Reg::Rax, v),
                                 None => self.enc.mov_reg_mem_rbp(Reg::Rax, frame.offset(*a) as i32),
                             }
                         }
@@ -4403,7 +4637,9 @@ impl PeCodeGen {
                     self.enc.ud2();
                 }
 
-                self.enc.add_rsp_i32(call_space);
+                if !self.calls_reserved {
+                    self.enc.add_rsp_i32(call_space);
+                }
                 self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
             }
 
@@ -4665,7 +4901,7 @@ impl PeCodeGen {
         // A constant operand moves in as an immediate, not a slot load
         // (pe-roadmap item 81).
         match lconst {
-            Some(v) => self.enc.mov_imm64(Reg::Rax, v as u64),
+            Some(v) => self.enc.mov_imm(Reg::Rax, v),
             None => self.enc.mov_reg_mem_rbp(Reg::Rax, loff),
         }
         let unsigned_ty = matches!(ty, IrType::U8 | IrType::U16 | IrType::U32 | IrType::U64);
@@ -4673,13 +4909,13 @@ impl PeCodeGen {
         // A small constant is an immediate; `sub` is an `add` of its negation
         let small = rconst.filter(|v| *v > i32::MIN as i64 && *v <= i32::MAX as i64);
         let imm = match op {
-            BinOp::Add | BinOp::Sub if *ty != IrType::U64 => small,
+            BinOp::Add | BinOp::Sub | BinOp::Mul if *ty != IrType::U64 => small,
             BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => small,
             _ => None,
         };
         match rconst {
             Some(_) if imm.is_some() || by_const => {}
-            Some(v) => self.enc.mov_imm64(Reg::Rcx, v as u64),
+            Some(v) => self.enc.mov_imm(Reg::Rcx, v),
             None => self.enc.mov_reg_mem_rbp(Reg::Rcx, roff),
         }
 
@@ -4714,7 +4950,10 @@ impl PeCodeGen {
                     self.enc.mul_r(Reg::Rcx);
                     self.enc.jcc_label(0x0, self.arith_panics[PANIC_MUL]);
                 } else {
-                    self.enc.imul_rr(Reg::Rax, Reg::Rcx);
+                    match imm {
+                        Some(v) => self.enc.imul_r_i32(Reg::Rax, v as i32),
+                        None => self.enc.imul_rr(Reg::Rax, Reg::Rcx),
+                    }
                     if checked && *ty == IrType::I64 {
                         self.enc.jcc_label(0x0, self.arith_panics[PANIC_MUL]);
                     }
@@ -4740,6 +4979,9 @@ impl PeCodeGen {
                         self.enc.emit_i32(v as i32);
                     }
                     None => self.enc.cmp_rr(Reg::Rax, Reg::Rcx),
+                }
+                if self.flags_only {
+                    return;
                 }
                 self.enc.setcc_r(cc, Reg::Rax);
                 self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
@@ -4778,7 +5020,7 @@ impl PeCodeGen {
     /// `reg` = a value: its constant, or its stack slot.
     fn gen_load_operand(&mut self, reg: Reg, value: ValueId, frame: &PeStackFrame) {
         match frame.const_vals.get(&value.0) {
-            Some(v) => self.enc.mov_imm64(reg, *v as u64),
+            Some(v) => self.enc.mov_imm(reg, *v),
             None => self.enc.mov_reg_mem_rbp(reg, frame.offset(value) as i32),
         }
     }
@@ -10336,11 +10578,24 @@ impl PeCodeGen {
 /// Public entry point: generate a PE file from an IR module. Fails when the
 /// program calls runtime functions this native backend does not provide.
 pub fn generate_pe(module: &IrModule) -> Result<Vec<u8>, Vec<String>> {
+    generate_pe_opts(module, None)
+}
+
+/// `generate_pe`, plus `-g`: `debug_file` is the .fd source the DWARF line
+/// table and compilation unit point at, as given on the command line; the
+/// compilation directory is the current directory.
+pub fn generate_pe_opts(module: &IrModule, debug_file: Option<&str>) -> Result<Vec<u8>, Vec<String>> {
     // The entry point calls main (it used to panic when there was none).
     if !module.functions.contains_key("main") {
         return Err(vec!["PE backend: the program has no `main` function".to_string()]);
     }
     let mut gen = PeCodeGen::new();
+    if let Some(f) = debug_file {
+        gen.dbg_file = f.to_string();
+        gen.dbg_dir = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+    }
     let bytes = gen.generate(module);
     let reachable = reachable_functions(module);
     let names: Vec<String> = gen.unresolved.into_iter()
@@ -10697,6 +10952,12 @@ fn pick_reg_vars(func: &IrFunction, module: &IrModule, frame: &mut PeStackFrame,
                 let imm = match inst {
                     Inst::BinOp { left, ty, .. } => !ty.is_float() && !float(left),
                     Inst::Store { ptr, value, .. } => value == op && frame.reg_vars.contains_key(&ptr.0),
+                    // A call's null environment: the generic call path loads
+                    // constant arguments as immediates
+                    Inst::Call { func: callee, args, .. } => args.first() == Some(op)
+                        && module.functions.contains_key(callee)
+                        && !callee.starts_with("Vec_") && callee != "print" && callee != "println"
+                        && args.iter().filter(|a| *a == op).count() == 1,
                     _ => false,
                 };
                 if !imm || const_block.get(&op.0) != Some(&i) {
@@ -10812,6 +11073,22 @@ fn pe_runtime_alias(name: &str) -> &str {
         "p_vec_reverse" => "vec_raw_reverse",
         "p_vec_extend" => "vec_raw_extend",
         "p_vec_sort" => "vec_raw_sort",
+        // One Vec implementation: core's. (The machine stubs disagreed with it:
+        // clone shared the data, first returned garbage.)
+        "p_vec_clone" => "Vec_clone",
+        "p_vec_new" => "Vec_new",
+        "p_vec_push" => "Vec_push",
+        "p_vec_len" => "Vec_len",
+        "p_vec_get" => "Vec_get",
+        "p_vec_set" => "Vec_set",
+        "p_vec_pop" => "Vec_pop",
+        "p_vec_is_empty" => "Vec_is_empty",
+        "p_vec_clear" => "Vec_clear",
+        "p_vec_capacity" => "Vec_capacity",
+        "p_vec_first" => "Vec_first",
+        "p_vec_last" => "Vec_last",
+        "p_vec_contains" => "Vec_contains",
+        "p_vec_truncate" => "Vec_truncate",
         _ => name,
     }
 }
@@ -11170,7 +11447,7 @@ mod tests {
         let import_dir_rva = rdata_rva + rd.import_dir_offset as u32;
         let iat_rva = rdata_rva + rd.iat_offset as u32;
         let iat_size = rd.iat_size as u32;
-        let pe = build_pe_file(&e.code, &rd.data, 0, import_dir_rva, iat_rva, iat_size, rdata_rva);
+        let pe = build_pe_file(&e.code, &rd.data, 0, import_dir_rva, iat_rva, iat_size, rdata_rva, &[]);
 
         std::fs::write(
             "pe_enc_ref.txt",

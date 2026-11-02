@@ -1,0 +1,132 @@
+// stdlib/log: level gate, level names, logfmt and JSON-lines rendering,
+// quoting/escaping of values, raw JSON scalars, and the file sink.
+// Timestamps stay off (the default), so the output is deterministic.
+use log;
+use env;
+
+fn check_i(label: str, got: i64, want: i64) -> void {
+    println(label + " = " + int_to_str(got));
+    if got != want { p_panic("log: wrong " + label); }
+}
+
+fn check_s(label: str, got_in: str, want: str) -> void {
+    // copy into a typed local first: the interpreter prints an empty
+    // malloc'd string (str_trim("") etc.) passed straight in as a number
+    var got: str = got_in;
+    println(label + " = " + got);
+    if !str_equal(got, want) { p_panic("log: wrong " + label); }
+}
+
+fn temp_root() -> str {
+    var t: str = env_get("TEMP");
+    if str_len(t) == 0 { t = env_get("TMP"); }
+    if str_len(t) == 0 { t = env_get("TMPDIR"); }
+    if str_len(t) == 0 { t = "."; }
+    return t;
+}
+
+fn main() -> i64 {
+    // ── levels ──
+    check_i("default level", log_get_level(), LOG_INFO);
+    check_i("from_str TRACE", log_level_from_str("TRACE"), 10);
+    check_i("from_str debug", log_level_from_str("debug"), 20);
+    check_i("from_str Info", log_level_from_str("Info"), 30);
+    check_i("from_str warning", log_level_from_str("warning"), 40);
+    check_i("from_str error", log_level_from_str("error"), 50);
+    check_i("from_str off", log_level_from_str("off"), 100);
+    check_i("from_str bogus", log_level_from_str("loud"), -1);
+
+    // ── escaping ──
+    check_s("escape quote", log_json_escape("say \"hi\""), "say \\\"hi\\\"");
+    check_s("escape backslash", log_json_escape("a\\b"), "a\\\\b");
+    check_s("escape nl tab", log_json_escape("x\ny\tz"), "x\\ny\\tz");
+    check_s("escape ctrl", log_json_escape("a" + char_to_str(1) + "b" + char_to_str(31)), "a\\u0001b\\u001f");
+
+    // ── logfmt (stdout) ──
+    println("-- text --");
+    log_info("server started");
+    log_debug("hidden: below INFO");
+    log_trace("hidden too");
+    var f: Vec<str> = Vec::new();
+    f.push("port");
+    f.push("8080");
+    f.push("path");
+    f.push("/a b");
+    f.push("empty");
+    f.push("");
+    f.push("q");
+    f.push("x=\"1\"");
+    log_infof("listening now", f);
+    log_warn("plain");
+    log_error("bad\nthing");
+    log_set_level(LOG_DEBUG);
+    check_i("level after set", log_get_level(), 20);
+    log_debug("now visible");
+    log_trace("still hidden");
+    log_set_level(LOG_TRACE);
+    log_trace("trace visible");
+    log_set_level(LOG_OFF);
+    log_error("off hides errors");
+    log_set_level(LOG_INFO);
+    // odd field count: the trailing key is ignored
+    var odd: Vec<str> = Vec::new();
+    odd.push("k");
+    odd.push("v");
+    odd.push("dangling");
+    log_infof("odd", odd);
+
+    // ── JSON lines ──
+    println("-- json --");
+    log_set_json(true);
+    log_info("hello");
+    var j: Vec<str> = Vec::new();
+    j.push("n");
+    j.push("42");
+    j.push("neg");
+    j.push("-1.5");
+    j.push("ok");
+    j.push("true");
+    j.push("nothing");
+    j.push("null");
+    j.push("plus");
+    j.push("+5");
+    j.push("dot");
+    j.push("1.");
+    j.push("lead");
+    j.push(".5");
+    j.push("ver");
+    j.push("1.2.3");
+    j.push("dash");
+    j.push("-");
+    j.push("s");
+    j.push("a \"b\"");
+    log_warnf("slow request", j);
+    log_set_json(false);
+
+    // ── file sink ──
+    var path: str = temp_root() + "/fides_test_lib_log_" + int_to_str(p_getpid()) + ".log";
+    file_delete(path);
+    log_to_file(path);
+    log_info("to file 1");
+    log_infof("listening now", f);
+    log_debug("not written");
+    log_set_json(true);
+    log_error("to file 2");
+    log_warnf("slow request", j);
+    log_set_json(false);
+    log_to_stdout();
+    var body: str = file_read(path);
+    check_s("file body", body,
+            "level=info msg=\"to file 1\"\n"
+            + "level=info msg=\"listening now\" port=8080 path=\"/a b\" empty=\"\" q=\"x=\\\"1\\\"\"\n"
+            + "{\"level\":\"error\",\"msg\":\"to file 2\"}\n"
+            + "{\"level\":\"warn\",\"msg\":\"slow request\",\"n\":42,\"neg\":-1.5,\"ok\":true,"
+            + "\"nothing\":null,\"plus\":\"+5\",\"dot\":\"1.\",\"lead\":\".5\",\"ver\":\"1.2.3\","
+            + "\"dash\":\"-\",\"s\":\"a \\\"b\\\"\"}\n");
+    file_delete(path);
+    if file_exists(path) { p_panic("log: temp file not removed"); }
+    log_to_file("");
+    log_info("back on stdout");
+    println("log ok");
+    return 0;
+}

@@ -1,0 +1,103 @@
+// stdlib/csv: RFC 4180 parsing (quotes, "" escapes, embedded delimiters
+// and newlines, CRLF/CR/LF), records by header, quoting, serialization,
+// dialects and accessors.
+use csv;
+
+fn check_s(label: str, got: str, want: str) {
+    println(label + " = [" + got + "]");
+    if !str_equal(got, want) {
+        p_panic("csv: " + label + " gave '" + got + "', want '" + want + "'");
+    }
+}
+
+fn check_i(label: str, got: i64, want: i64) {
+    println(label + " = " + int_to_str(got));
+    if got != want {
+        p_panic("csv: " + label + " wrong");
+    }
+}
+
+fn main() -> i64 {
+    var rows = csv_parse("a,b\n1,2\n");
+    check_i("rows", csv_row_count(rows), 2);
+    check_s("r0c1", rows.get(0).fields.get(1), "b");
+    check_s("r1c0", csv_field(rows, 1, 0), "1");
+    check_s("oob", csv_field(rows, 5, 0), "");
+    check_s("oobc", csv_field(rows, 0, 9), "");
+    check_i("cols0", csv_col_count(rows, 0), 2);
+    check_i("cols9", csv_col_count(rows, 9), 0);
+
+    // no trailing newline, CRLF and bare CR line endings
+    var r2 = csv_parse("x,y\r\n3,4\r5,6");
+    check_i("r2.rows", csv_row_count(r2), 3);
+    check_s("r2.1.1", csv_field(r2, 1, 1), "4");
+    check_s("r2.2.0", csv_field(r2, 2, 0), "5");
+    check_s("r2.2.1", csv_field(r2, 2, 1), "6");
+
+    // quoted fields: embedded comma, newline and doubled quote
+    var q = csv_parse("name,note\n\"Smith, J\",\"say \"\"hi\"\"\"\n\"multi\nline\",end\n");
+    check_i("q.rows", csv_row_count(q), 3);
+    check_s("q.1.0", csv_field(q, 1, 0), "Smith, J");
+    check_s("q.1.1", csv_field(q, 1, 1), "say \"hi\"");
+    check_s("q.2.0", csv_field(q, 2, 0), "multi\nline");
+    check_s("q.2.1", csv_field(q, 2, 1), "end");
+
+    // empty fields and the empty second row
+    var e = csv_parse("a,,c\n\n");
+    check_i("e.rows", csv_row_count(e), 2);
+    check_i("e.cols0", csv_col_count(e, 0), 3);
+    check_i("e.mid.len", str_len(csv_field(e, 0, 1)), 0);
+    check_s("e.c", csv_field(e, 0, 2), "c");
+    check_i("e.cols1", csv_col_count(e, 1), 1);
+    check_i("trailing.delim", csv_col_count(csv_parse("a,b,\n"), 0), 3);
+    check_i("empty.text", csv_row_count(csv_parse("")), 0);
+
+    // column extraction
+    var col = csv_column(rows, 1);
+    check_i("col.len", col.len(), 2);
+    check_s("col0", col.get(0), "b");
+    check_s("col1", col.get(1), "2");
+
+    // records by header; short rows fill with ""
+    var recs = csv_parse_records("id,name,age\n1,Ann,30\n2,Bob\n");
+    check_i("recs", recs.len(), 2);
+    check_s("rec0.name", csv_record_get(recs.get(0), "name"), "Ann");
+    check_s("rec0.age", csv_record_get(recs.get(0), "age"), "30");
+    check_s("rec1.id", csv_record_get(recs.get(1), "id"), "2");
+    check_i("rec1.age.len", str_len(csv_record_get(recs.get(1), "age")), 0);
+    check_i("rec.missing.len", str_len(csv_record_get(recs.get(0), "zzz")), 0);
+    check_i("recs.empty", csv_parse_records("").len(), 0);
+
+    // quoting
+    check_s("quote.plain", csv_quote_field("abc"), "abc");
+    check_s("quote.comma", csv_quote_field("a,b"), "\"a,b\"");
+    check_s("quote.q", csv_quote_field("say \"x\""), "\"say \"\"x\"\"\"");
+    check_s("quote.nl", csv_quote_field("l1\nl2"), "\"l1\nl2\"");
+    check_s("quote.semi", csv_quote_field_dialect("a;b", 59, 34), "\"a;b\"");
+    check_s("quote.semi.comma", csv_quote_field_dialect("a,b", 59, 34), "a,b");
+
+    // serialization and round trip
+    var out = csv_serialize(q);
+    check_s("ser", out, "name,note\n\"Smith, J\",\"say \"\"hi\"\"\"\n\"multi\nline\",end\n");
+    var back = csv_parse(out);
+    check_i("rt.rows", csv_row_count(back), 3);
+    check_s("rt.1.1", csv_field(back, 1, 1), "say \"hi\"");
+
+    var f: Vec<str> = Vec::new();
+    f.push("p");
+    f.push("q;r");
+    var built: Vec<CsvRow> = Vec::new();
+    built.push(csv_row(f));
+    check_s("ser.semi", csv_serialize_dialect(built, 59), "p;\"q;r\"\n");
+    check_s("ser.tab", csv_serialize_dialect(built, 9), "p\tq;r\n");
+
+    // custom dialects: semicolon delimiter, single-quote quoting, tab
+    var sc = csv_parse_dialect("a;'b;c'\n1;'it''s'\n", 59, 39);
+    check_i("sc.cols", csv_col_count(sc, 0), 2);
+    check_s("sc.0.1", csv_field(sc, 0, 1), "b;c");
+    check_s("sc.1.1", csv_field(sc, 1, 1), "it's");
+    var tb = csv_parse_dialect("k\tv\nx\ty\n", 9, 34);
+    check_s("tab.1.1", csv_field(tb, 1, 1), "y");
+    println("csv ok");
+    return 0;
+}

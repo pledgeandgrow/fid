@@ -23,6 +23,7 @@ use vec;
 use string;
 use compiler::ast;
 use compiler::ir;
+use compiler::checks;
 
 // --- Vec-based map entry structs ------------------------------------------
 // Replace HashMap with Vec<Entry> + linear search.
@@ -72,6 +73,9 @@ pub fn FnRetTypeEntry_new(key: str, ty: IrType) -> FnRetTypeEntry {
 // --- CCodeGen struct ------------------------------------------------------
 
 pub struct CCodeGen {
+    // Per value of the current function: 1 when a counted loop makes its check
+    // needless (peir_unchecked_ops)
+    pub unchecked: Vec<i64>,
     // Externs that take or return a struct by value: called through a wrapper
     pub c_wrapped: Vec<str>,
     // Accumulated C output - uses p_sb (mutable string builder) to avoid
@@ -111,6 +115,7 @@ pub struct CCodeGen {
 
 pub fn CCodeGen_new() -> CCodeGen {
     var cg: CCodeGen = CCodeGen {
+        unchecked: Vec::new(),
         c_wrapped: Vec::new(),
         sb: p_sb_new(),
         out: "",
@@ -917,6 +922,7 @@ fn CCodeGen_insert_runtime_sigs(self: &mut CCodeGen) -> void {
     fn_param_types_set(self, "p_stdin_eof", t0());
     fn_param_types_set(self, "p_clock_now", t0());
     fn_param_types_set(self, "p_clock_now_us", t0());
+    fn_param_types_set(self, "p_os_random_u64", t0());
     fn_param_types_set(self, "p_clock_now_ms", t0());
     fn_param_types_set(self, "p_intern_str", t1(ptr_u8()));
 
@@ -1745,6 +1751,13 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "    h[0] = (int64_t)(intptr_t)nd;");
     wln(self, "    h[2] = nc;");
     wln(self, "}");
+    wln(self, "/* Element access a counted loop proved in bounds (pe.rs unchecked_ops). */");
+    wln(self, "#define P_VEC_UNCHECKED \\");
+    wln(self, "static inline int64_t __p_vec_get_u(void* e, int64_t v, int64_t i) { (void)e; return ((int64_t*)(intptr_t)((int64_t*)(intptr_t)v)[0])[i]; } \\");
+    wln(self, "static inline void __p_vec_set_u(void* e, int64_t v, int64_t i, int64_t x) { (void)e; ((int64_t*)(intptr_t)((int64_t*)(intptr_t)v)[0])[i] = x; } \\");
+    wln(self, "static inline void* __p_pvec_get_u(PVec* v, int64_t i) { return v->data[i]; } \\");
+    wln(self, "static inline void __p_pvec_set_u(PVec* v, int64_t i, void* x) { v->data[i] = x; }");
+    wln(self, "P_VEC_UNCHECKED");
     wln(self, "char* p_file_read(const char* path);");
     wln(self, "int64_t p_file_write(const char* path, const char* content);");
     wln(self, "int64_t p_file_write_vec(const char* path, PVec* v);");
@@ -1778,6 +1791,7 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_clock_now(void);");
     wln(self, "int64_t p_clock_now_us(void);");
     wln(self, "int64_t p_clock_now_ms(void);");
+    wln(self, "int64_t p_os_random_u64(void);");
     wln(self, "bool p_regex_match(const char* s, const char* pattern);");
     wln(self, "const char* p_intern_str(const char* s);");
     wln(self, "int64_t p_future_ready(int64_t value);");
@@ -2389,8 +2403,14 @@ fn emit_main_wrapper(self: &mut CCodeGen, module: IrModule) -> void {
         wln(self, "#include <windows.h>");
         wln(self, "#endif");
         wln(self, "void __p_install_crash_handlers(void);");
+        wln(self, "#ifdef P_PROFILE");
+        wln(self, "void __p_profile_start(void);");
+        wln(self, "#endif");
         wln(self, "int main(int argc, char** argv) {");
         wln(self, "    __p_install_crash_handlers();");
+        wln(self, "#ifdef P_PROFILE");
+        wln(self, "    __p_profile_start();");
+        wln(self, "#endif");
         wln(self, "    setvbuf(stdout, NULL, _IONBF, 0);");
         wln(self, "    setvbuf(stderr, NULL, _IONBF, 0);");
         // Windows: binary stdout/stderr, so a newline is not written as CR LF
@@ -2692,6 +2712,7 @@ fn gen_function(self: &mut CCodeGen, name: str, func: IrFunction) -> void {
     wln(self, ret_ty + " " + c_name + "(" + params_str + ") {");
     // Core's hottest Vec functions: a few C statements instead of the
     // lowered Fides body (much faster in the -O0 self-hosted build).
+    self.unchecked = peir_unchecked_ops(&func, func.value_metas.len() + func.insts.len() + 16);
     var fast: Vec<str> = fast_core_vec_body(name, func, ret_ty);
     if fast.len() > 0 {
         var fi: i64 = 0;
@@ -2775,6 +2796,10 @@ fn gen_function(self: &mut CCodeGen, name: str, func: IrFunction) -> void {
     }
     wln(self, "}");
     wln(self, "");
+}
+
+fn cg_unchecked(self: &CCodeGen, id: i64) -> bool {
+    return id >= 0 && id < self.unchecked.len() && self.unchecked.get(id) != 0;
 }
 
 fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void {
@@ -2862,7 +2887,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
             var int_n: str = "";
             if !is_ptr_type(l_ty) && !is_ptr_type(r_ty) { int_n = c_int_helper(ty); }
             var unsigned_cmp: bool = ir_type_eq(l_ty, IrType::U64) || ir_type_eq(r_ty, IrType::U64);
-            if str_len(int_n) > 0 && gen_int_arith(self, func.is_wrapping, dst, op, int_n, c_type(ty), l, r) {
+            if str_len(int_n) > 0 && gen_int_arith(self, func.is_wrapping || cg_unchecked(self, id), dst, op, int_n, c_type(ty), l, r) {
                 // done
             } else if unsigned_cmp && c_is_ordered_cmp(op) {
                 wln(self, "    " + dst + " = (uint64_t)" + l + " " + cop + " (uint64_t)" + r + ";");
@@ -3046,6 +3071,13 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
         }
         Inst::Call(fname, args, ret_ty, _) => {
             var c_fname: str = sanitize_c_name(self, fname);
+            // In bounds: a counted loop proved it
+            if cg_unchecked(self, id) {
+                if fname == "Vec_get" { c_fname = "__p_vec_get_u"; }
+                if fname == "Vec_set" { c_fname = "__p_vec_set_u"; }
+                if fname == "p_vec_get" { c_fname = "__p_pvec_get_u"; }
+                if fname == "p_vec_set" { c_fname = "__p_pvec_set_u"; }
+            }
 
             // Special-case: print is polymorphic - dispatch based on arg type
             if fname == "print" && args.len() > 0 {
@@ -3634,6 +3666,9 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
 // compiler.fd can split it.
 var g_c_unit_marks: bool = false;
 pub fn set_c_unit_marks(v: bool) { g_c_unit_marks = v; }
+// fid ccompile --profile: the program samples its own call stack
+var g_c_profile: bool = false;
+pub fn set_c_profile(v: bool) { g_c_profile = v; }
 
 pub fn CCodeGen_generate(self: &mut CCodeGen, module: IrModule) -> str {
     CCodeGen_insert_runtime_sigs(self);
@@ -3658,6 +3693,7 @@ pub fn CCodeGen_generate(self: &mut CCodeGen, module: IrModule) -> str {
         f = f + 1;
     }
 
+    if g_c_profile { wln(self, "#define P_PROFILE 1"); }
     emit_runtime_header(self);
     emit_extern_decls(self, module);
     emit_runtime_types(self);
@@ -4101,6 +4137,100 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    __p_thread_guard_init();");
     wln(self, "}");
     wln(self, "#endif");
+    wln(self, "#ifdef P_PROFILE");
+    wln(self, "/* Sampling profiler (fid profile): the call stack every millisecond, written");
+    wln(self, "   at exit as collapsed stacks (\"main;f;g 1\"), which flamegraph tools read. */");
+    wln(self, "#define P_PROF_DEPTH 64");
+    wln(self, "#define P_PROF_MAX 100000");
+    wln(self, "static uintptr_t* __p_prof_buf;");
+    wln(self, "static volatile long __p_prof_n;");
+    wln(self, "static volatile int __p_prof_on;");
+    wln(self, "static void __p_prof_record(uintptr_t* f, int n) {");
+    wln(self, "    long i = __p_prof_n;");
+    wln(self, "    if (i >= P_PROF_MAX) return;");
+    wln(self, "    uintptr_t* row = __p_prof_buf + i * P_PROF_DEPTH;");
+    wln(self, "    for (int k = 0; k < P_PROF_DEPTH; k++) row[k] = k < n ? f[k] : 0;");
+    wln(self, "    __p_prof_n = i + 1;");
+    wln(self, "}");
+    wln(self, "static void __p_prof_dump(void) {");
+    wln(self, "    __p_prof_on = 0;");
+    wln(self, "    const char* path = getenv(\"FIDES_PROFILE_OUT\");");
+    wln(self, "    if (!path || !*path) path = \"fides-profile.folded\";");
+    wln(self, "    FILE* out = fopen(path, \"w\");");
+    wln(self, "    if (!out) return;");
+    wln(self, "    for (long i = 0; i < __p_prof_n; i++) {");
+    wln(self, "        uintptr_t* row = __p_prof_buf + i * P_PROF_DEPTH;");
+    wln(self, "        const char* names[P_PROF_DEPTH];");
+    wln(self, "        int m = 0;");
+    wln(self, "        for (int k = 0; k < P_PROF_DEPTH && row[k]; k++) {");
+    wln(self, "            const char* nm = __p_fn_name(row[k]);");
+    wln(self, "            if (nm) names[m++] = nm;");
+    wln(self, "        }");
+    wln(self, "        if (m == 0) continue;");
+    wln(self, "        for (int k = m - 1; k >= 0; k--) fprintf(out, k == m - 1 ? \"%s\" : \";%s\", names[k]);");
+    wln(self, "        fprintf(out, \" 1\\n\");");
+    wln(self, "    }");
+    wln(self, "    fclose(out);");
+    wln(self, "}");
+    wln(self, "#if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__)) && !defined(__TINYC__)");
+    wln(self, "static HANDLE __p_prof_target;");
+    wln(self, "static DWORD WINAPI __p_prof_loop(LPVOID a) {");
+    wln(self, "    (void)a;");
+    wln(self, "    /* Sleep(1) sleeps a whole 15.6 ms tick: wait on the performance counter */");
+    wln(self, "    LARGE_INTEGER fr, t0, t1;");
+    wln(self, "    QueryPerformanceFrequency(&fr);");
+    wln(self, "    while (__p_prof_on) {");
+    wln(self, "        QueryPerformanceCounter(&t0);");
+    wln(self, "        do { Sleep(0); QueryPerformanceCounter(&t1); } while ((t1.QuadPart - t0.QuadPart) * 1000 < fr.QuadPart);");
+    wln(self, "        if (SuspendThread(__p_prof_target) == (DWORD)-1) break;");
+    wln(self, "        CONTEXT c;");
+    wln(self, "        memset(&c, 0, sizeof c);");
+    wln(self, "        c.ContextFlags = CONTEXT_FULL;");
+    wln(self, "        if (GetThreadContext(__p_prof_target, &c)) {");
+    wln(self, "            uintptr_t f[P_PROF_DEPTH];");
+    wln(self, "            __p_prof_record(f, __p_frames(&c, 1, f, P_PROF_DEPTH));");
+    wln(self, "        }");
+    wln(self, "        ResumeThread(__p_prof_target);");
+    wln(self, "    }");
+    wln(self, "    return 0;");
+    wln(self, "}");
+    wln(self, "void __p_profile_start(void) {");
+    wln(self, "    __p_prof_buf = (uintptr_t*)malloc(sizeof(uintptr_t) * P_PROF_DEPTH * P_PROF_MAX);");
+    wln(self, "    if (!__p_prof_buf) return;");
+    wln(self, "    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &__p_prof_target, 0, FALSE, DUPLICATE_SAME_ACCESS);");
+    wln(self, "    __p_prof_on = 1;");
+    wln(self, "    atexit(__p_prof_dump);");
+    wln(self, "    CreateThread(NULL, 0, __p_prof_loop, NULL, 0, NULL);");
+    wln(self, "}");
+    wln(self, "#elif !defined(_WIN32) && (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)");
+    wln(self, "#include <sys/time.h>");
+    wln(self, "static void __p_prof_tick(int sig) {");
+    wln(self, "    (void)sig;");
+    wln(self, "    if (!__p_prof_on) return;");
+    wln(self, "    uintptr_t f[P_PROF_DEPTH];");
+    wln(self, "    __p_prof_record(f, __p_frames(NULL, 0, f, P_PROF_DEPTH));");
+    wln(self, "}");
+    wln(self, "void __p_profile_start(void) {");
+    wln(self, "    __p_prof_buf = (uintptr_t*)malloc(sizeof(uintptr_t) * P_PROF_DEPTH * P_PROF_MAX);");
+    wln(self, "    if (!__p_prof_buf) return;");
+    wln(self, "    __p_prof_on = 1;");
+    wln(self, "    atexit(__p_prof_dump);");
+    wln(self, "    struct sigaction sa;");
+    wln(self, "    memset(&sa, 0, sizeof sa);");
+    wln(self, "    sa.sa_handler = __p_prof_tick;");
+    wln(self, "    sa.sa_flags = SA_RESTART;");
+    wln(self, "    sigemptyset(&sa.sa_mask);");
+    wln(self, "    sigaction(SIGPROF, &sa, NULL);");
+    wln(self, "    struct itimerval t;");
+    wln(self, "    t.it_interval.tv_sec = 0;");
+    wln(self, "    t.it_interval.tv_usec = 1000;");
+    wln(self, "    t.it_value = t.it_interval;");
+    wln(self, "    setitimer(ITIMER_PROF, &t, NULL);");
+    wln(self, "}");
+    wln(self, "#else");
+    wln(self, "void __p_profile_start(void) {}");
+    wln(self, "#endif");
+    wln(self, "#endif");
     wln(self, "void p_panic(const char* msg) {");
     wln(self, "    fprintf(stderr, \"Panic: %s\\n\", msg);");
     wln(self, "    __p_print_trace_ctx(NULL, 0);");
@@ -4424,11 +4554,45 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_clock_now(void) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec; }");
     wln(self, "int64_t p_clock_now_us(void) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (int64_t)ts.tv_sec * 1000000LL + (int64_t)ts.tv_nsec / 1000; }");
     wln(self, "int64_t p_clock_now_ms(void) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (int64_t)ts.tv_sec * 1000LL + (int64_t)ts.tv_nsec / 1000000; }");
+    wln(self, "#elif defined(_WIN32)");
+    wln(self, "#include <windows.h>");
+    wln(self, "/* 100 ns units since 1970: the precise clock (time() has 1 s resolution) */");
+    wln(self, "static int64_t __p_now_100ns(void) {");
+    wln(self, "    FILETIME ft;");
+    wln(self, "#if defined(__TINYC__)");
+    wln(self, "    GetSystemTimeAsFileTime(&ft);");
+    wln(self, "#else");
+    wln(self, "    GetSystemTimePreciseAsFileTime(&ft);");
+    wln(self, "#endif");
+    wln(self, "    return (int64_t)((((uint64_t)ft.dwHighDateTime) << 32) | ft.dwLowDateTime) - 116444736000000000LL;");
+    wln(self, "}");
+    wln(self, "int64_t p_clock_now(void) { return __p_now_100ns() * 100; }");
+    wln(self, "int64_t p_clock_now_us(void) { return __p_now_100ns() / 10; }");
+    wln(self, "int64_t p_clock_now_ms(void) { return __p_now_100ns() / 10000; }");
     wln(self, "#else");
     wln(self, "#include <time.h>");
     wln(self, "int64_t p_clock_now(void) { return (int64_t)time(NULL) * 1000000000LL; }");
     wln(self, "int64_t p_clock_now_us(void) { return (int64_t)time(NULL) * 1000000LL; }");
     wln(self, "int64_t p_clock_now_ms(void) { return (int64_t)time(NULL) * 1000LL; }");
+    wln(self, "#endif");
+    wln(self, "/* 64 random bits from the operating system's secure generator */");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "int rand_s(unsigned int* v);");
+    wln(self, "int64_t p_os_random_u64(void) {");
+    wln(self, "    unsigned int a = 0, b = 0;");
+    wln(self, "    if (rand_s(&a) != 0 || rand_s(&b) != 0) p_panic(\"no random source in the operating system\");");
+    wln(self, "    return (int64_t)(((uint64_t)a << 32) | b);");
+    wln(self, "}");
+    wln(self, "#else");
+    wln(self, "#include <fcntl.h>");
+    wln(self, "#include <unistd.h>");
+    wln(self, "int64_t p_os_random_u64(void) {");
+    wln(self, "    uint64_t v = 0;");
+    wln(self, "    int fd = open(\"/dev/urandom\", O_RDONLY);");
+    wln(self, "    if (fd < 0 || read(fd, &v, sizeof v) != (ssize_t)sizeof v) p_panic(\"no random source in the operating system\");");
+    wln(self, "    close(fd);");
+    wln(self, "    return (int64_t)v;");
+    wln(self, "}");
     wln(self, "#endif");
     // Regex builtin - simple wildcard match (? and *)
     wln(self, "bool p_regex_match(const char* s, const char* pattern) {");
@@ -6464,8 +6628,8 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "void* p_gaussian_noise(void* shape_vec, double sigma) {");
     wln(self, "    // shape_vec is a Fides Vec (i64 pointer to 24-byte block)");
     wln(self, "    int64_t* sv = (int64_t*)shape_vec;");
-    wln(self, "    int64_t ndim = sv ? sv[0] : 0;");
-    wln(self, "    int64_t* data_ptr = sv ? (int64_t*)sv[1] : NULL;");
+    wln(self, "    int64_t ndim = sv ? sv[1] : 0;");
+    wln(self, "    int64_t* data_ptr = sv ? (int64_t*)sv[0] : NULL;");
     wln(self, "    int64_t shape[8]; int64_t len = 1;");
     wln(self, "    for (int64_t i = 0; i < ndim && i < 8; i++) { shape[i] = data_ptr ? data_ptr[i] : 1; len *= shape[i]; }");
     wln(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
@@ -6514,8 +6678,8 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "void p_send_tensor(void* t) { (void)t; /* no-op in single-rank */ }");
     wln(self, "void* p_recv_tensor(void* shape_vec) {");
     wln(self, "    int64_t* sv = (int64_t*)shape_vec;");
-    wln(self, "    int64_t ndim = sv ? sv[0] : 0;");
-    wln(self, "    int64_t* data_ptr = sv ? (int64_t*)sv[1] : NULL;");
+    wln(self, "    int64_t ndim = sv ? sv[1] : 0;");
+    wln(self, "    int64_t* data_ptr = sv ? (int64_t*)sv[0] : NULL;");
     wln(self, "    int64_t shape[8]; int64_t len = 1;");
     wln(self, "    for (int64_t i = 0; i < ndim && i < 8; i++) { shape[i] = data_ptr ? data_ptr[i] : 1; len *= shape[i]; }");
     wln(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");

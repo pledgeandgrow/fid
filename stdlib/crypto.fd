@@ -1,7 +1,9 @@
 // Fides Cryptography standard library
 //
-// Provides hashing (SHA-256, SHA-512), HMAC, nonce tracking, and
-// cryptographically secure random number generation wrappers.
+// Provides SHA-256, HMAC-SHA-256, nonce tracking, a constant-time
+// comparison, and random bytes from the operating system's secure generator.
+// SHA-256 and HMAC-SHA-256 are checked against the NIST and RFC 4231 test
+// vectors (tests/bootstrap/test_crypto_vectors.fd).
 //
 // Only vetted algorithms are included (no MD5, no SHA1, no custom crypto).
 // This satisfies the @crypto-approved requirement by construction —
@@ -11,7 +13,7 @@
 //   use crypto;
 //   fn main() {
 //       val hash = crypto_sha256("hello");
-//       val nonce = crypto_nonce_next();
+//       val key = crypto_random_bytes(32);
 //   }
 
 module crypto;
@@ -496,3 +498,26 @@ pub fn crypto_constant_time_eq(a: Vec<i64>, b: Vec<i64>) -> bool {
 
 pub const CRYPTO_APPROVED_ALGORITHMS: str = "SHA-256, HMAC-SHA256";
 pub const CRYPTO_REJECTED_ALGORITHMS: str = "MD5, SHA-1, custom";
+
+// ─── Random bytes ──────────────────────────────────────────────────────
+//
+// From the operating system: BCryptGenRandom or RtlGenRandom on Windows,
+// /dev/urandom elsewhere. Panics when the system has none.
+
+/// 64 random bits.
+pub fn crypto_random_u64() -> i64 {
+    return p_os_random_u64();
+}
+
+/// `n` random bytes, each 0..255.
+pub fn crypto_random_bytes(n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var bits: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        if i % 8 == 0 { bits = p_os_random_u64(); }
+        out.push((bits >> ((i % 8) * 8)) & 255);
+        i = i + 1;
+    }
+    return out;
+}

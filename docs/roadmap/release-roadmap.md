@@ -21,7 +21,7 @@ really suspends; sockets on the native path; HTTP/1.1 and HTTPS, client and
 server, 28,000 requests/s on one thread; TLS through Schannel and OpenSSL; C
 callbacks and small structs by value; a stdlib with typed `Vec`s and a test for
 every module; language support running inside VS Code.
-Suite: interpreter 334/334, C 338/338, native 341/341, expected-fail 89/89.
+Suite: interpreter 339/339, C 343/343, native 345/345, expected-fail 89/89.
 The self-hosted compiler reproduces itself from its second generation on.
 
 **Measured starting point** (Windows x64, seconds):
@@ -34,8 +34,22 @@ The self-hosted compiler reproduces itself from its second generation on.
 | HashMap, 1M strings | 1.65 | 0.78 | 1.09 | ≤ 1.0 |
 | Peak memory, 30M temporary strings | 2.3 GB | 3.4 GB | 5 MB on 3M | ≤ 50 MB |
 
+**Now** (Nov 2, same machine, best of 3, Rust re-measured in the same run):
+
+| Benchmark | fid native | fid via C -O2 | Rust -O | Target for 1.0 |
+|---|---|---|---|---|
+| fib(40) | 1.34 | 0.81 | 0.53 | ≤ 1.0 |
+| Arithmetic loop, 2 billion | 7.59 | 3.53 | 5.36 | ≤ 5.0 |
+| Sieve, 20M | 0.82 | 0.48 | 0.40 | ≤ 0.6 |
+| HashMap, 1M strings | 1.04 | 0.80 | 1.12 | ≤ 1.0 |
+| Peak memory, 30M temporary strings | not re-measured | not re-measured | 5 MB on 3M | ≤ 50 MB |
+
+Through C, three of four targets are met and two benchmarks beat Rust; fib is
+left, where Rust's release mode drops the overflow check Fides keeps. Native
+meets the sieve target and is behind on the others: release D6, D13.
+
 Self-compile (`fid dump-c compiler/main.fd`, the compiler built through C):
-136 s on Nov 2, down from 601 s; 21 s with `fidesc`. See D10.
+112–137 s on Nov 2, down from 601 s; 21 s with `fidesc`. See D10, D11.
 
 **Which gap is handled where:**
 
@@ -98,7 +112,8 @@ Everything else relies on these.
       and the native fixpoint on every push (`.github/workflows/ci.yml`); first
       green run Nov 1, Windows and Linux. Linux only builds, runs unit tests and
       one C program so far (F1).
-- [ ] A4. The suite runs on the self-hosted compiler too, not only `fidesc` (M).
+- [~] A4. The suite runs on the self-hosted compiler too, not only `fidesc` (M).
+      Done: `fidesc test --compiler release/fid.exe`. Left: in CI.
       `tests/` parity is a local script today.
 - [x] A5. `_fail` tests name the error they expect. Today any failure passes,
       so a test can reject a program for the wrong reason (M).
@@ -162,8 +177,8 @@ Most modules still have no test, so expect more of this (B12).
 - [x] B18. A struct defined in two modules must be an error, as a function is:
       `core` and `buffer` both had a public `ByteBuffer`, and each compiler
       silently picked a different one (S).
-- [ ] B19. Bugs the module tests found and left open (M): direct `p_vec_*` calls do
-      nothing in the interpreter; an untyped `Vec::new()` of floats is misread as
+- [~] B19. Bugs the module tests found and left open (M). Fixed: direct `p_vec_*`
+      calls did nothing in the interpreter (D14). Left: an untyped `Vec::new()` of floats is misread as
       `i64` in C; `T { a: 1 }` of an imported struct does not parse; a user
       function named `yn` or `j0` clashes with libm in C; the interpreter prints a
       `bool` from a `Vec<bool>` as 0 or 1; `__ecs_*` in the interpreter miss a
@@ -209,8 +224,8 @@ the fastest build-to-native among compiled languages, and native code within
       on the native path (M).
 - [~] D4. Registers for the PE backend. Done: the five hottest locals of a
       function and short-lived temporaries live in callee-saved registers,
-      weighted by loop depth. Left: values that cross blocks, caller-saved
-      registers, floats (L).
+      weighted by loop depth; parameters read more than once keep a register.
+      Left: other values that cross blocks, caller-saved registers, floats (L).
 - [ ] D5. Inlining of small functions at IR level (M).
 - [ ] D6. Run the IR optimizer on the native path (M).
 - [ ] D7. Benchmarks in CI, failing on a slowdown over 10% (M).
@@ -218,6 +233,34 @@ the fastest build-to-native among compiled languages, and native code within
       compiler itself): profile and fix it, as for the type checker (M).
 - [ ] D9. `emit` of hello world under 0.5 s: stop re-checking the stdlib on each
       build, by caching its checked form (L).
+- [x] D11. Per-call cost on the C path (M). Functions no longer push and pop a
+      call-stack array: panic traces walk the machine stack (unwind tables on
+      Windows, `_Unwind_Backtrace` elsewhere; `zig cc` off Windows links
+      `-lunwind`), and a stack overflow hits the OS guard page, with a handler on
+      reserved stack (`SetThreadStackGuarantee`, `sigaltstack`). The fixed limit of
+      10,000 nested calls is gone. Task stacks on POSIX have a guard page.
+      fib(40) through C: 3.0 s to 0.9 s.
+- [x] D12. The counted-loop check removal (pe.rs `unchecked_ops`) is shared with
+      the C backend, and proves more: a length kept in a local, `p_vec_*` calls,
+      print calls inside the loop; no `Vec` shortened between the length and
+      the loop. `Vec_push` inlines to a store (growth out of line).
+- [~] D13. The native emitters (`pe.rs`, `pe_ir.fd`) waste less per call and
+      branch (M): shadow space reserved once in the prologue, a comparison used
+      only by its branch sets flags without a stored bool, no jump to the block
+      laid out next, parameters in registers, short immediates, `imul` by an
+      immediate, no register for a call's null environment. Left: the optimizer
+      on this path (D6) and a full register allocator (competitive OP16).
+- [~] D14. `Vec` elements at their real size (L). Stage A done: one `Vec`
+      implementation, core's. Every backend's `p_vec_*` builtins run core's
+      `Vec_*` functions; on native and the interpreter they disagreed with it
+      (`clone` shared the data, `first` returned garbage, builtins did nothing
+      on a core `Vec`): `test_vec_builtins.fd` now agrees everywhere. Left: an
+      element size in the header, typed access in lowering, structs inline.
+      About 400 places know today's layout.
+- [ ] D15. References into containers: `&v[i]` and large structs passed by
+      pointer, not copied (needs D14) (L).
+- [ ] D16. Strings carry their length: O(1) length, zero bytes allowed,
+      slices without copying (competitive RT2) (L).
 - [~] D10. Self-compile under 60 s (M). Profiled with a stack sampler: 601 s to
       136 s, 4.4 times faster, fixpoint kept. Fixed: on Windows `printf` wrote
       stdout a byte at a time (31% of the time, and every printing program on the C
@@ -262,7 +305,12 @@ compiler.
       semantics match the other backends (M).
 - [ ] F7. Native macOS: Mach-O executables, not only objects (L).
 - [ ] F8. ARM64 and RISC-V: replace the runtime stubs (19 and 18 zero stubs, 46
-      capability stubs), and test under QEMU (XL).
+      capability stubs), and test under QEMU (XL). Their `p_vec_new` (and the
+      x86-64 ELF one) keeps the data inside the header block with a fixed
+      capacity of 509, while core's `Vec` frees the old data when it grows:
+      harmless today, since `p_free` there is an `munmap` that refuses the
+      interior pointer. Make them call core's `Vec` functions, as the other
+      backends now do (D14).
 - [ ] F9. WASM: globals, struct copies, collections (L).
 
 **Acceptance:** Windows, Linux and macOS are fully supported at 1.0.0, on x64 and
@@ -333,12 +381,16 @@ Depends on B, C, H5 and J.
 
 Nothing here is ready to protect real data yet. Do not write new primitives.
 
-- [ ] J1. `crypto` tests fail on a mismatch: `real_crypto.fd` prints `MISMATCH`
-      and still passes (S).
-- [ ] J2. SHA-256 and HMAC checked against the NIST test vectors (S).
-- [ ] J3. `crypto.fd`'s header claims SHA-512 and a CSPRNG that do not exist:
-      remove the claims or add them (S).
-- [ ] J4. A CSPRNG from the OS (`BCryptGenRandom`, `getrandom`) (S).
+- [x] J1. `crypto` tests fail on a mismatch: `real_crypto.fd` prints `MISMATCH`
+      and still passes (S). It panics now.
+- [x] J2. SHA-256 and HMAC checked against the NIST test vectors (S):
+      `test_crypto_vectors.fd`, FIPS 180-4 and RFC 4231; a mismatch panics.
+- [x] J3. `crypto.fd`'s header claims SHA-512 and a CSPRNG that do not exist:
+      remove the claims or add them (S). The header now lists what exists.
+- [x] J4. A CSPRNG from the OS (`BCryptGenRandom`, `getrandom`) (S):
+      `crypto_random_bytes`, `crypto_random_u64` over the builtin
+      `p_os_random_u64` (rand_s / BCryptGenRandom on Windows, /dev/urandom
+      elsewhere), on every backend.
 - [ ] J5. AEAD, signatures and a KDF through bindings (L, see decision 2).
 - [ ] J6. Apply `@constant_time`, `@secret` and `@zeroize` in `stdlib/crypto.fd`
       itself: it uses none of them today (M).
@@ -369,7 +421,7 @@ Nothing here is ready to protect real data yet. Do not write new primitives.
 - [ ] K10. `@cfg` and `@simd` work on `fid` as on `fidesc` (M).
 - [ ] K11. A language reference that matches both compilers, with the differences
       closed (M).
-- [ ] K12. Semver and a stability promise for 1.0 (S).
+- [x] K12. Semver and a stability promise for 1.0 (S): `docs/reference/stability.md`.
 
 **Acceptance:** every line in `docs/reference/features.md` has a test proving it,
 and a test proving what it rejects.

@@ -1,0 +1,120 @@
+// stdlib/xml: entity escape/unescape, parsing (attributes, nesting,
+// comments, CDATA, PI, DOCTYPE, self-closing), accessors, find_all,
+// fragments, building nodes and serializing them.
+use xml;
+
+fn check_s(label: str, got: str, want: str) {
+    println(label + " = " + got);
+    if !str_equal(got, want) { p_panic("xml: wrong value for " + label); }
+}
+
+fn check_i(label: str, got: i64, want: i64) {
+    println(label + " = " + int_to_str(got));
+    if got != want { p_panic("xml: wrong value for " + label); }
+}
+
+fn check_b(label: str, got: bool, want: bool) {
+    println(label + " = " + bool_to_str(got));
+    if got != want { p_panic("xml: wrong value for " + label); }
+}
+
+fn main() -> i64 {
+    // Entities
+    check_s("unescape", xml_unescape("a &lt;b&gt; &amp; &quot;c&quot; &apos;d&apos;"),
+            "a <b> & \"c\" 'd'");
+    check_s("unescape dec", xml_unescape("&#65;&#66;"), "AB");
+    check_s("unescape hex", xml_unescape("&#x41;&#X42;"), "AB");
+    // Non-ASCII &#NN; (UTF-8 output) is not checked here: the interpreter's
+    // p_char_to_str turns a byte >= 128 into two bytes (C/native give one),
+    // so str_from_bytes differs between backends.
+    check_s("unescape unknown", xml_unescape("&nbsp; & x"), "&nbsp; & x");
+    check_s("escape", xml_escape("<a href=\"x\">&</a>"),
+            "&lt;a href=&quot;x&quot;&gt;&amp;&lt;/a&gt;");
+
+    // Basic parse
+    val root = xml_parse("<a x=\"1\"><b>hi</b></a>");
+    check_s("root tag", root.tag, "a");
+    check_s("attr x", xml_attr(root, "x"), "1");
+    check_s("attr missing", xml_attr(root, "y"), "");
+    check_s("child b text", xml_child(root, "b").text, "hi");
+    check_b("has b", xml_has(root, "b"), true);
+    check_b("has c", xml_has(root, "c"), false);
+    check_s("missing child tag", xml_child(root, "c").tag, "");
+
+    // A fuller document
+    var doc: str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+        "<!DOCTYPE library>\n" +
+        "<!-- a comment -->\n" +
+        "<library name='City &amp; County' open=\"yes\">\n" +
+        "  <book id=\"1\" lang=en><title>Dune</title><year>1965</year></book>\n" +
+        "  <book id=\"2\"><title>Emma &lt;1815&gt;</title><year>1815</year></book>\n" +
+        "  <shelf><book id=\"3\"><title>Ulysses</title></book></shelf>\n" +
+        "  <note><![CDATA[x < y && <tag>]]></note>\n" +
+        "  <empty/>\n" +
+        "  <spaced   a = \"1\"   b='2' />\n" +
+        "</library>";
+    val lib = xml_parse(doc);
+    check_s("lib tag", lib.tag, "library");
+    check_s("lib name", xml_attr(lib, "name"), "City & County");
+    check_s("lib open", xml_attr(lib, "open"), "yes");
+    check_i("lib attrs", lib.attr_names.len(), 2);
+    check_i("lib children", lib.children.len(), 6);
+    var books: Vec<XmlNode> = xml_children(lib, "book");
+    check_i("direct books", books.len(), 2);
+    val b1: XmlNode = books.get(0);
+    check_s("book1 id", xml_attr(b1, "id"), "1");
+    check_s("book1 lang (unquoted)", xml_attr(b1, "lang"), "en");
+    check_s("book1 title", xml_child(b1, "title").text, "Dune");
+    check_s("book1 year", xml_child(b1, "year").text, "1965");
+    val b2: XmlNode = books.get(1);
+    check_s("book2 title", xml_child(b2, "title").text, "Emma <1815>");
+    var all: Vec<XmlNode> = xml_find_all(lib, "book");
+    check_i("all books", all.len(), 3);
+    val b3: XmlNode = all.get(2);
+    check_s("book3 id", xml_attr(b3, "id"), "3");
+    check_s("book3 text", xml_text(b3), "Ulysses");
+    check_s("cdata", xml_child(lib, "note").text, "x < y && <tag>");
+    val emp: XmlNode = xml_child(lib, "empty");
+    check_s("empty tag", emp.tag, "empty");
+    check_i("empty children", emp.children.len(), 0);
+    val sp: XmlNode = xml_child(lib, "spaced");
+    check_s("spaced a", xml_attr(sp, "a"), "1");
+    check_s("spaced b", xml_attr(sp, "b"), "2");
+    check_s("text of book1", xml_text(b1), "Dune1965");
+
+    // Mixed text
+    val m = xml_parse("<p>Hello <b>big</b> world</p>");
+    check_s("mixed own text", m.text, "Hello  world");
+    check_s("mixed xml_text", xml_text(m), "Hello  worldbig");
+
+    // Fragments and failures
+    var frag: Vec<XmlNode> = xml_parse_fragment("<a/><b>2</b><c k=\"v\"/>");
+    check_i("fragment len", frag.len(), 3);
+    val f2: XmlNode = frag.get(1);
+    check_s("fragment[1]", f2.tag, "b");
+    val f3: XmlNode = frag.get(2);
+    check_s("fragment[2] k", xml_attr(f3, "k"), "v");
+    check_s("no element", xml_parse("just text").tag, "");
+    check_s("empty doc", xml_parse("").tag, "");
+
+    // Building and serializing
+    var item = xml_elem("item", "a & b");
+    item = xml_with_attr(item, "id", "7");
+    item = xml_with_attr(item, "q", "say \"hi\"");
+    var list = xml_elem("list", "");
+    list = xml_with_child(list, item);
+    list = xml_with_child(list, xml_elem("end", ""));
+    val out: str = xml_to_str(list);
+    check_s("to_str", out,
+            "<list><item id=\"7\" q=\"say &quot;hi&quot;\">a &amp; b</item><end /></list>");
+    // Round trip
+    val back = xml_parse(out);
+    check_s("roundtrip tag", back.tag, "list");
+    val bi: XmlNode = xml_child(back, "item");
+    check_s("roundtrip text", bi.text, "a & b");
+    check_s("roundtrip q", xml_attr(bi, "q"), "say \"hi\"");
+    check_s("roundtrip again", xml_to_str(back), out);
+
+    println("xml ok");
+    return 0;
+}

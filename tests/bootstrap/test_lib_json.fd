@@ -1,0 +1,177 @@
+// stdlib/json: validation (RFC 8259 grammar), canonical form, accessors,
+// safe accessors, typed getters, escaping/unescaping (incl. \u escapes and
+// surrogate pairs), pretty printing, path access, and builders.
+use json;
+
+fn check_s(label: str, got_in: str, want: str) -> void {
+    // copy into a typed local first (see test_lib_process.fd)
+    var got: str = got_in;
+    println(label + " = " + got);
+    if !str_equal(got, want) { p_panic("json: wrong " + label); }
+}
+
+fn check_i(label: str, got: i64, want: i64) -> void {
+    println(label + " = " + int_to_str(got));
+    if got != want { p_panic("json: wrong " + label); }
+}
+
+fn check_b(label: str, got: bool, want: bool) -> void {
+    if got { println(label + " = true"); } else { println(label + " = false"); }
+    if got != want { p_panic("json: wrong " + label); }
+}
+
+// bytes of `s` as lowercase hex, for checking UTF-8 output
+fn hex(s: str) -> str {
+    var d: str = "0123456789abcdef";
+    var out: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var b: i64 = str_byte_at(s, i) & 255;
+        out = out + str_slice(d, b / 16, b / 16 + 1) + str_slice(d, b % 16, b % 16 + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main() -> i64 {
+    // ── validation ──
+    check_b("valid obj", json_is_valid(" {\"a\": [1, 2.5, -3e2, true, false, null, \"x\"]} "), true);
+    check_b("valid num", json_is_valid("0"), true);
+    check_b("valid neg frac exp", json_is_valid("-0.25E+3"), true);
+    check_b("valid escapes", json_is_valid("\"q\\\" b\\\\ s\\/ \\b\\f\\n\\r\\t \\u00e9\""), true);
+    check_b("invalid trailing comma", json_is_valid("[1,2,]"), false);
+    check_b("invalid junk", json_is_valid("{} x"), false);
+    check_b("invalid bare word", json_is_valid("nul"), false);
+    check_b("invalid unquoted key", json_is_valid("{a:1}"), false);
+    check_b("invalid leading zero", json_is_valid("012"), false);
+    check_b("invalid .5", json_is_valid(".5"), false);
+    check_b("invalid 1.", json_is_valid("1."), false);
+    check_b("invalid -", json_is_valid("-"), false);
+    check_b("invalid 1e", json_is_valid("1e"), false);
+    check_b("invalid escape \\x", json_is_valid("\"a\\xb\""), false);
+    check_b("invalid short \\u", json_is_valid("\"\\u12\""), false);
+    check_b("invalid ctrl in str", json_is_valid("\"a" + char_to_str(10) + "b\""), false);
+    check_b("invalid empty", json_is_valid(""), false);
+    check_b("invalid unclosed", json_is_valid("[1, [2]"), false);
+
+    // ── canonical form (minified, keys sorted recursively) ──
+    var doc: str = "{ \"name\": \"fides\", \"tags\": [ \"a\", {\"z\":1, \"b\":2} ], \"ver\": 3, \"ok\": true, \"none\": null }";
+    check_s("parse", json_parse(doc),
+            "{\"name\":\"fides\",\"none\":null,\"ok\":true,\"tags\":[\"a\",{\"b\":2,\"z\":1}],\"ver\":3}");
+    check_s("dump", json_dump("[ 1 , 2 ]"), "[1,2]");
+    check_s("parse_safe bad", json_parse_safe("{"), "");
+    check_s("parse scalar", json_parse("  \"hi\"  "), "\"hi\"");
+
+    // ── type / len ──
+    check_s("type obj", json_type(doc), "object");
+    check_s("type arr", json_type("[]"), "array");
+    check_s("type str", json_type("\"s\""), "string");
+    check_s("type num", json_type("-1.5"), "number");
+    check_s("type bool", json_type("false"), "boolean");
+    check_s("type null", json_type("null"), "null");
+    check_s("type_safe bad", json_type_safe("[1,"), "error");
+    check_i("len obj", json_len(doc), 5);
+    check_i("len arr", json_len("[1,[2,3],{}]"), 3);
+    check_i("len empty", json_len("{}"), 0);
+    check_i("len_safe scalar", json_len_safe("5"), -1);
+    check_i("len_safe bad", json_len_safe("[1"), -1);
+
+    // ── get / at (raw values) ──
+    check_s("get name", json_get(doc, "name"), "\"fides\"");
+    check_s("get tags", json_get(doc, "tags"), "[ \"a\", {\"z\":1, \"b\":2} ]");
+    check_s("get missing", json_get(doc, "nope"), "null");
+    check_s("get_safe not obj", json_get_safe("[1]", "a"), "");
+    check_s("at 1", json_at("[10, \"x\", [3]]", 1), "\"x\"");
+    check_s("at 2", json_at("[10, \"x\", [3]]", 2), "[3]");
+    check_s("at_safe oob", json_at_safe("[1]", 5), "");
+    check_s("at_safe neg", json_at_safe("[1]", -1), "");
+    check_s("at_safe not arr", json_at_safe("{}", 0), "");
+    // escaped key lookup
+    check_s("get escaped key", json_get("{\"a\\\"b\": 7}", "a\"b"), "7");
+
+    // ── typed getters ──
+    var cfg: str = "{\"port\": 8080, \"ratio\": 0.75, \"debug\": true, \"host\": \"local\\nhost\", \"neg\": -42}";
+    check_s("get_str", json_get_str(cfg, "host"), "local\nhost");
+    check_s("get_str not str", json_get_str(cfg, "port"), "");
+    check_i("get_int", json_get_int(cfg, "port", -1), 8080);
+    check_i("get_int neg", json_get_int(cfg, "neg", 0), -42);
+    check_i("get_int default", json_get_int(cfg, "missing", 99), 99);
+    check_i("get_int not num", json_get_int(cfg, "host", 5), 5);
+    var r: f64 = json_get_num(cfg, "ratio", 0.0);
+    println(r);
+    if r != 0.75 { p_panic("json: wrong get_num"); }
+    var d: f64 = json_get_num(cfg, "nope", 1.5);
+    if d != 1.5 { p_panic("json: wrong get_num default"); }
+    check_b("get_bool", json_get_bool(cfg, "debug", false), true);
+    check_b("get_bool default", json_get_bool(cfg, "port", false), false);
+    check_b("has port", json_has(cfg, "port"), true);
+    check_b("has null field", json_has("{\"x\": null}", "x"), true);
+    check_b("has missing", json_has(cfg, "zzz"), false);
+    check_s("at_str", json_at_str("[1, \"two\"]", 1), "two");
+    check_s("at_str not str", json_at_str("[1, \"two\"]", 0), "");
+    check_i("at_int", json_at_int("[1, \"two\", -7]", 2, 0), -7);
+    check_i("at_int default", json_at_int("[1, \"two\"]", 1, 13), 13);
+
+    // ── keys / items ──
+    var ks: Vec<str> = json_keys("{\"b\":1, \"a\":2, \"c\":{\"d\":3}}");
+    check_i("keys len", ks.len(), 3);
+    check_s("key0 (document order)", ks.get(0), "b");
+    check_s("key2", ks.get(2), "c");
+    check_i("keys of array", json_keys("[1]").len(), 0);
+    var it: Vec<str> = json_items("[1, \"a\", [2, 3], {\"k\": null}]");
+    check_i("items len", it.len(), 4);
+    check_s("item2", it.get(2), "[2, 3]");
+    check_s("item3", it.get(3), "{\"k\": null}");
+
+    // ── path ──
+    var nest: str = "{\"a\": {\"b\": [ {\"c\": \"deep\"}, 5 ]}}";
+    check_s("path a.b.0.c", json_path(nest, "a.b.0.c"), "\"deep\"");
+    check_s("path a.b.1", json_path(nest, "a.b.1"), "5");
+    check_s("path missing key", json_path(nest, "a.x"), "null");
+    check_s("path oob", json_path(nest, "a.b.9"), "");
+    check_s("path through scalar", json_path(nest, "a.b.1.z"), "");
+
+    // ── escaping ──
+    check_s("string plain", json_string("hi"), "\"hi\"");
+    check_s("string escapes", json_string("a\"b\\c\nd\te\r"), "\"a\\\"b\\\\c\\nd\\te\\r\"");
+    check_s("string ctrl", json_string(char_to_str(1)), "\"\\u0001\"");
+    check_s("unescape basic", json_unescape("\"a\\\"b\\\\c\\/d\\ne\""), "a\"b\\c/d\ne");
+    check_s("unescape bf", hex(json_unescape("\"\\b\\f\"")), "080c");
+    check_s("unescape u0041", json_unescape("\"\\u0041\\u0062\""), "Ab");
+    check_s("unescape u20ac (euro)", hex(json_unescape("\"\\u20ac\"")), "e282ac");
+    check_s("unescape u00e9 (e-acute)", hex(json_unescape("\"\\u00e9\"")), "c3a9");
+    check_s("unescape u007f", hex(json_unescape("\"\\u007f\"")), "7f");
+    check_s("unescape u0080", hex(json_unescape("\"\\u0080\"")), "c280");
+    check_s("unescape u03b1 (alpha)", hex(json_unescape("\"\\u03B1\"")), "ceb1");
+    check_s("unescape surrogate pair", hex(json_unescape("\"\\ud83d\\ude00\"")), "f09f9880");
+    check_s("unescape not literal", json_unescape("abc"), "abc");
+    check_s("roundtrip", json_unescape(json_string("q\"\\\n\t")), "q\"\\\n\t");
+
+    // ── pretty ──
+    check_s("pretty", json_pretty("{\"b\":[1,2],\"a\":{}}"),
+            "{\n  \"a\": {},\n  \"b\": [\n    1,\n    2\n  ]\n}");
+    check_s("pretty empty arr", json_pretty("[]"), "[]");
+    // a string ending in an escaped backslash must not swallow the rest
+    check_s("pretty backslash", json_pretty("{\"a\":\"x\\\\\",\"b\":\"{,:}\"}"),
+            "{\n  \"a\": \"x\\\\\",\n  \"b\": \"{,:}\"\n}");
+    check_s("pretty_safe bad", json_pretty_safe("{"), "");
+
+    // ── builders ──
+    check_s("pair", json_pair("k", "1"), "{\"k\":1}");
+    var o: str = "{}";
+    o = json_obj_set(o, "a", json_num(1));
+    o = json_obj_set(o, "b", json_string("x"));
+    o = json_obj_set(o, "a", json_bool(false));
+    o = json_obj_set(o, "c", json_null());
+    check_s("obj_set", o, "{\"a\":false,\"b\":\"x\",\"c\":null}");
+    check_s("obj_set not obj", json_obj_set("[1]", "a", "1"), "[1]");
+    var a: str = "[]";
+    a = json_arr_push(a, json_num(-3));
+    a = json_arr_push(a, json_bool(true));
+    a = json_arr_push(a, o);
+    check_s("arr_push", a, "[-3,true,{\"a\":false,\"b\":\"x\",\"c\":null}]");
+    check_b("built is valid", json_is_valid(a), true);
+    check_s("built get", json_get_str(json_at(a, 2), "b"), "x");
+    println("json ok");
+    return 0;
+}

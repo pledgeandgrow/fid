@@ -1,0 +1,185 @@
+// stdlib/unicode: UTF-8 decoding (including invalid input), codepoint
+// counts, simple case mapping per codepoint, case-folded comparison,
+// character classes and grapheme-cluster counts.
+// Functions that build non-ASCII strings (uni_encode_cp, uni_upper on
+// accented text, uni_normalize_lite) are only checked on ASCII here:
+// str_from_bytes gives different bytes for values >= 128 on the
+// interpreter (a runtime bug, not a module bug).
+use unicode;
+use encoding;
+
+fn check_i(name: str, got: i64, want: i64) {
+    println(name + " = " + int_to_str(got));
+    if got != want {
+        p_panic(name + ": got " + int_to_str(got) + ", want " + int_to_str(want));
+    }
+}
+
+fn check_s(name: str, got: str, want: str) {
+    println(name + " = " + got);
+    if !str_equal(got, want) {
+        p_panic(name + ": got [" + got + "], want [" + want + "]");
+    }
+}
+
+fn check_b(name: str, got: bool, want: bool) {
+    var g: str = "false";
+    if got { g = "true"; }
+    println(name + " = " + g);
+    if got != want {
+        p_panic(name + ": wrong");
+    }
+}
+
+fn cps_str(v: Vec) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { out = out + ","; }
+        out = out + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn raw(a: i64, b: i64, c: i64, d: i64, n: i64) -> str {
+    var v: Vec<i64> = Vec::new();
+    v.push(a);
+    if n > 1 { v.push(b); }
+    if n > 2 { v.push(c); }
+    if n > 3 { v.push(d); }
+    return enc_bytes_to_str(v);
+}
+
+fn main() -> i64 {
+    // ── Decoding ──
+    check_s("cps hello", cps_str(uni_to_codepoints("h\u{e9}llo")), "104,233,108,108,111");
+    check_s("cps 1-4 bytes", cps_str(uni_to_codepoints("A\u{e9}\u{20ac}\u{1d11e}")), "65,233,8364,119070");
+    check_s("cps cjk", cps_str(uni_to_codepoints("\u{65e5}\u{672c}")), "26085,26412");
+    check_i("cps empty", uni_to_codepoints("").len(), 0);
+    check_s("bad continuation", cps_str(uni_to_codepoints(raw(195, 97, 0, 0, 2))), "65533,97");
+    check_s("truncated 3-byte", cps_str(uni_to_codepoints(raw(226, 130, 0, 0, 2))), "65533,65533");
+    check_s("lone 0xFF", cps_str(uni_to_codepoints(raw(255, 0, 0, 0, 1))), "65533");
+    check_s("lone continuation", cps_str(uni_to_codepoints(raw(128, 65, 0, 0, 2))), "65533,65");
+    check_s("raw 4-byte", cps_str(uni_to_codepoints(raw(240, 159, 152, 128, 4))), "128512");
+    check_s("bad 4th byte", cps_str(uni_to_codepoints(raw(240, 159, 152, 65, 4))), "65533,65533,65533,65");
+
+    // ── Lengths ──
+    check_i("uni_len", uni_len("h\u{e9}llo\u{20ac}\u{1d11e}"), 7);
+    check_i("byte len", str_len("h\u{e9}llo\u{20ac}\u{1d11e}"), 13);
+    check_i("uni_len empty", uni_len(""), 0);
+    check_i("uni_len ascii", uni_len("plain"), 5);
+
+    // ── ASCII encoding / case on strings ──
+    check_s("encode_cp A", uni_encode_cp(65), "A");
+    var hi: Vec = Vec::new();
+    hi.push(72);
+    hi.push(105);
+    check_s("from_codepoints", uni_from_codepoints(hi), "Hi");
+    check_s("lower ascii", uni_lower("HeLLo WORLD 123!"), "hello world 123!");
+    check_s("upper ascii", uni_upper("HeLLo world 123!"), "HELLO WORLD 123!");
+    check_s("normalize ascii", uni_normalize_lite("plain text"), "plain text");
+
+    // ── Case mapping per codepoint ──
+    check_i("lower A", uni_lower_cp(65), 97);
+    check_i("lower A-grave", uni_lower_cp(192), 224);
+    check_i("lower multiply sign", uni_lower_cp(215), 215);
+    check_i("lower A-macron", uni_lower_cp(256), 257);
+    check_i("lower L-acute", uni_lower_cp(313), 314);
+    check_i("lower OE", uni_lower_cp(338), 339);
+    check_i("lower Y-diaeresis", uni_lower_cp(376), 255);
+    check_i("lower Z-acute", uni_lower_cp(377), 378);
+    check_i("lower Z-caron", uni_lower_cp(381), 382);
+    check_i("lower kra unchanged", uni_lower_cp(312), 312);
+    check_i("lower Alpha", uni_lower_cp(913), 945);
+    check_i("lower Sigma", uni_lower_cp(931), 963);
+    check_i("lower Upsilon-dialytika", uni_lower_cp(939), 971);
+    check_i("lower 930 unassigned", uni_lower_cp(930), 930);
+    check_i("lower Cyrillic Ie-grave", uni_lower_cp(1024), 1104);
+    check_i("lower Cyrillic A", uni_lower_cp(1040), 1072);
+    check_i("lower Cyrillic Ya", uni_lower_cp(1071), 1103);
+    check_i("lower Omega (Cyr)", uni_lower_cp(1120), 1121);
+    check_i("lower digit", uni_lower_cp(48), 48);
+    check_i("upper z", uni_upper_cp(122), 90);
+    check_i("upper n-tilde", uni_upper_cp(241), 209);
+    check_i("upper division sign", uni_upper_cp(247), 247);
+    check_i("upper y-diaeresis", uni_upper_cp(255), 376);
+    check_i("upper sharp s", uni_upper_cp(223), 7838);
+    check_i("upper oe", uni_upper_cp(339), 338);
+    check_i("upper z-caron", uni_upper_cp(382), 381);
+    check_i("upper z-dot", uni_upper_cp(380), 379);
+    check_i("upper final sigma", uni_upper_cp(962), 931);
+    check_i("upper omega", uni_upper_cp(969), 937);
+    check_i("upper Cyrillic ya", uni_upper_cp(1103), 1071);
+    check_i("upper Cyrillic yo", uni_upper_cp(1105), 1025);
+    // lower(upper(c)) == c over the covered lowercase ranges
+    var bad: i64 = 0;
+    var c: i64 = 97;
+    while c <= 1153 {
+        val u: i64 = uni_upper_cp(c);
+        if u != c && c != 223 && c != 962 && uni_lower_cp(u) != c { bad = bad + 1; }
+        c = c + 1;
+    }
+    check_i("case round trip failures", bad, 0);
+
+    // ── Case-folded comparison ──
+    check_b("fold latin", uni_equal_fold("\u{c9}COLE \u{17d}", "\u{e9}cole \u{17e}"), true);
+    check_b("fold greek", uni_equal_fold("\u{3a3}\u{39f}\u{3a6}\u{399}\u{391}", "\u{3c3}\u{3bf}\u{3c6}\u{3b9}\u{3b1}"), true);
+    check_b("fold cyrillic", uni_equal_fold("\u{41f}\u{420}\u{418}\u{412}\u{415}\u{422}", "\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}"), true);
+    check_b("fold ascii", uni_equal_fold("Hello", "hELLO"), true);
+    check_b("fold differs", uni_equal_fold("abc", "abd"), false);
+    check_b("fold length", uni_equal_fold("ab", "abc"), false);
+
+    // ── Character classes ──
+    check_b("alpha a", uni_is_alpha(97), true);
+    check_b("alpha e-acute", uni_is_alpha(233), true);
+    check_b("alpha zhe", uni_is_alpha(1078), true);
+    check_b("alpha alpha", uni_is_alpha(945), true);
+    check_b("alpha CJK", uni_is_alpha(26085), true);
+    check_b("alpha Hangul", uni_is_alpha(44032), true);
+    check_b("alpha Hiragana", uni_is_alpha(12354), true);
+    check_b("alpha Devanagari ka", uni_is_alpha(2325), true);
+    check_b("alpha Hebrew alef", uni_is_alpha(1488), true);
+    check_b("alpha digit 1", uni_is_alpha(49), false);
+    check_b("alpha space", uni_is_alpha(32), false);
+    check_b("alpha multiply sign", uni_is_alpha(215), false);
+    check_b("alpha division sign", uni_is_alpha(247), false);
+    check_b("alpha Arabic-Indic 3", uni_is_alpha(1635), false);
+    check_b("alpha Tamil digit 0", uni_is_alpha(3046), false);
+    check_b("digit 7", uni_is_digit(55), true);
+    check_b("digit Arabic-Indic 3", uni_is_digit(1635), true);
+    check_b("digit Devanagari 0", uni_is_digit(2406), true);
+    check_b("digit fullwidth 1", uni_is_digit(65297), true);
+    check_b("digit a", uni_is_digit(97), false);
+    check_b("space 32", uni_is_space(32), true);
+    check_b("space tab", uni_is_space(9), true);
+    check_b("space LF", uni_is_space(10), true);
+    check_b("space NBSP", uni_is_space(160), true);
+    check_b("space ideographic", uni_is_space(12288), true);
+    check_b("space line sep", uni_is_space(8232), true);
+    check_b("space ZWSP", uni_is_space(8203), false);
+    check_b("space a", uni_is_space(97), false);
+    check_b("combining acute", uni_is_combining(769), true);
+    check_b("combining A", uni_is_combining(65), false);
+    check_b("combining Hebrew point", uni_is_combining(1456), true);
+
+    // ── Grapheme clusters ──
+    check_i("graphemes ascii", uni_grapheme_len("abc"), 3);
+    check_i("graphemes empty", uni_grapheme_len(""), 0);
+    check_i("graphemes e+acute", uni_grapheme_len("e\u{301}"), 1);
+    check_i("graphemes two marks", uni_grapheme_len("a\u{301}b\u{308}\u{301}"), 2);
+    check_i("graphemes flags", uni_grapheme_len("\u{1f1eb}\u{1f1f7}\u{1f1e9}\u{1f1ea}"), 2);
+    check_i("graphemes odd RI", uni_grapheme_len("\u{1f1eb}\u{1f1f7}\u{1f1e9}"), 2);
+    check_i("graphemes family ZWJ", uni_grapheme_len("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}"), 1);
+    check_i("graphemes skin tone", uni_grapheme_len("\u{1f44d}\u{1f3fd}"), 1);
+    check_i("graphemes skin tone ZWJ", uni_grapheme_len("\u{1f469}\u{1f3fd}\u{200d}\u{1f4bb}x"), 2);
+    check_i("graphemes VS16", uni_grapheme_len("\u{2764}\u{fe0f}!"), 2);
+    check_i("graphemes CJK", uni_grapheme_len("\u{65e5}\u{672c}\u{8a9e}"), 3);
+    val g: Vec = uni_graphemes("xyz");
+    val g0: str = g.get(0);
+    val g1: str = g.get(1);
+    val g2: str = g.get(2);
+    check_s("grapheme strings", g0 + "|" + g1 + "|" + g2, "x|y|z");
+    println("unicode ok");
+    return 0;
+}

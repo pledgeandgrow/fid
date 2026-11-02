@@ -113,28 +113,42 @@ fn y_scalar(s: str) -> YamlValue {
     if c0 == 34 || c0 == 39 {
         return YamlValue { kind: "str", sval: y_decode_quoted(v) };
     }
-    if str_equal(v, "true") || str_equal(v, "True") {
+    if str_equal(v, "true") || str_equal(v, "True") || str_equal(v, "TRUE") {
         return YamlValue { kind: "bool", sval: "true" };
     }
-    if str_equal(v, "false") || str_equal(v, "False") {
+    if str_equal(v, "false") || str_equal(v, "False") || str_equal(v, "FALSE") {
         return YamlValue { kind: "bool", sval: "false" };
     }
-    if str_equal(v, "null") || str_equal(v, "~") || str_equal(v, "Null") {
+    if str_equal(v, "null") || str_equal(v, "~") || str_equal(v, "Null") || str_equal(v, "NULL") {
         return YamlValue { kind: "null", sval: "" };
     }
     // flow sequence [a, b] — store as list entries? Keep joined scalar.
-    // number?
+    // number? [-+]? (digits [. digits?] | . digits) ([eE] [-+]? digits)?
     var i: i64 = 0;
-    var is_num: bool = n > 0;
+    var is_num: bool = true;
     var is_float: bool = false;
+    var mant_digits: i64 = 0;
+    var dots: i64 = 0;
+    var exps: i64 = 0;
+    var exp_digits: i64 = 0;
     while i < n {
         var c: i64 = str_byte_at(v, i);
-        if y_is_digit(c) { }
-        else if c == 45 || c == 43 { if i != 0 { is_num = false; } }
-        else if c == 46 || c == 101 || c == 69 { is_float = true; }
+        if y_is_digit(c) {
+            if exps > 0 { exp_digits = exp_digits + 1; }
+            else { mant_digits = mant_digits + 1; }
+        }
+        else if c == 45 || c == 43 {
+            var prev: i64 = 0;
+            if i > 0 { prev = str_byte_at(v, i - 1); }
+            if i != 0 && prev != 101 && prev != 69 { is_num = false; }
+        }
+        else if c == 46 { dots = dots + 1; is_float = true; if exps > 0 { is_num = false; } }
+        else if c == 101 || c == 69 { exps = exps + 1; is_float = true; }
         else { is_num = false; }
         i = i + 1;
     }
+    if mant_digits == 0 || dots > 1 || exps > 1 { is_num = false; }
+    if exps == 1 && exp_digits == 0 { is_num = false; }
     if is_num {
         if is_float { return YamlValue { kind: "float", sval: v }; }
         return YamlValue { kind: "int", sval: v };
@@ -179,6 +193,8 @@ pub fn yaml_parse(text: str) -> Vec<YamlEntry> {
         while stack.len() > 1 {
             var top: YFrame = stack.get(stack.len() - 1);
             if is_item && top.is_list && indent == top.indent { break; }
+            // "- x" lines at the same indent as their "key:" belong to the key
+            if is_item && !top.is_list && indent == top.indent && top.counter == -1 { break; }
             if indent <= top.indent { stack.pop(); }
             else { break; }
         }
@@ -188,6 +204,11 @@ pub fn yaml_parse(text: str) -> Vec<YamlEntry> {
         if is_item {
             // Ensure parent frame is a list at this indent.
             if !parent.is_list {
+                var owner: i64 = y_find(entries, base);
+                if owner >= 0 {
+                    entries.set(owner, YamlEntry { path: base,
+                        value: YamlValue { kind: "list", sval: "" } });
+                }
                 stack.push(YFrame {
                     indent: indent, path: base, is_list: true, counter: 0 });
                 parent = stack.get(stack.len() - 1);
@@ -208,7 +229,7 @@ pub fn yaml_parse(text: str) -> Vec<YamlEntry> {
             // "- key: value" — inline map start inside the item
             var kc: i64 = y_key_colon(rest);
             if kc > 0 {
-                var key: str = str_trim(str_slice(rest, 0, kc));
+                var key: str = y_decode_quoted(str_trim(str_slice(rest, 0, kc)));
                 var val: str = str_trim(str_slice(rest, kc + 1, str_len(rest)));
                 var kvpath: str = y_join(ipath, key);
                 entries.push(YamlEntry { path: ipath,
@@ -219,7 +240,7 @@ pub fn yaml_parse(text: str) -> Vec<YamlEntry> {
                     stack.push(YFrame { indent: indent + 1, path: ipath,
                         is_list: false, counter: 0 });
                     stack.push(YFrame { indent: indent + 2, path: kvpath,
-                        is_list: false, counter: 0 });
+                        is_list: false, counter: -1 });
                 } else {
                     entries.push(YamlEntry { path: kvpath, value: y_scalar(val) });
                     stack.push(YFrame { indent: indent + 1, path: ipath,
@@ -234,15 +255,16 @@ pub fn yaml_parse(text: str) -> Vec<YamlEntry> {
         // key: or key: value
         var cpos: i64 = y_key_colon(trimmed);
         if cpos <= 0 { continue; }    // junk / unsupported line
-        var key2: str = str_trim(str_slice(trimmed, 0, cpos));
+        var key2: str = y_decode_quoted(str_trim(str_slice(trimmed, 0, cpos)));
         var val2: str = str_trim(str_slice(trimmed, cpos + 1, str_len(trimmed)));
         var kpath: str = y_join(base, key2);
         if str_len(val2) == 0 {
             // opens a nested container (kind fixed by first child; map default)
             entries.push(YamlEntry { path: kpath,
                 value: YamlValue { kind: "map", sval: "" } });
+            // counter -1 marks a frame opened by "key:" (see the pop loop)
             stack.push(YFrame { indent: indent, path: kpath,
-                is_list: false, counter: 0 });
+                is_list: false, counter: -1 });
         } else {
             entries.push(YamlEntry { path: kpath, value: y_scalar(val2) });
         }

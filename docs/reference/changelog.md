@@ -1,5 +1,61 @@
 # Fides Language Changelog
 
+## Session 39 — Tools, Process, Platforms (Nov 2, 2026)
+
+- **`fid check`** (and `fidesc check`): type, borrow and effect checks, no code
+  generation. **`fid doc`**: documentation, as `scribe`.
+- **`fid test <file.fd>`**: each `fn test_*()` runs in its own process, so a
+  panic fails that test only; each `fn bench_*()` runs until it has taken
+  200 ms and reports ns per call.
+- **`fid profile <file.fd>`**: builds with a sampling profiler (the call stack
+  every millisecond), runs, prints the functions with the most samples, and
+  writes collapsed stacks for flamegraph.pl, inferno or speedscope.
+- **`--debug` / `--release`** on `ccompile`: C at -O0, or -O2.
+- **`fidesc test --compiler <exe>`** runs the suite through another compiler,
+  such as the shipped `fid`.
+- **`metrics`**: counters, gauges and histograms in the Prometheus text format.
+- **Fixed:** on Windows, the C runtime's clock (`p_clock_now*`, so `time.fd`)
+  had one-second resolution: it used `time()`. It reads the precise system time.
+- **Fixed:** `fid`'s build cache ignored a change made only in one `#if` branch
+  of the C runtime (its canonical hash kept one definition of a name defined in
+  several branches), and reused a stale executable.
+- **Process:** a stability promise, semantic versioning, editions (planned), a
+  release cadence and LTS policy, proposals for language changes
+  (`docs/proposals/`), platform tiers (`docs/reference/platforms.md`), and a
+  signed build provenance for every release archive.
+- **Editors:** configs for Neovim, Helix, Emacs, Sublime and JetBrains, beside
+  the VS Code extension.
+
+## Session 38 — Cheaper Calls, One Vec, Real Randomness (Nov 2, 2026)
+
+- **Calls cost less on the C path:** a function no longer pushes and pops a
+  call-stack array. Panic traces walk the machine stack and name each frame
+  that starts at a Fides function (unwind tables on Windows,
+  `_Unwind_Backtrace` elsewhere); repeated frames print once with a count. A
+  stack overflow hits the OS guard page and prints "Stack overflow: the
+  recursion is too deep", from a handler on reserved stack. The fixed limit of
+  10,000 nested calls is gone; POSIX task stacks have a guard page. fib(40)
+  through C: 3.0 s to 0.81 s.
+- **Counted loops lose their checks on C too:** the analysis that drops bounds
+  and overflow checks moved to `compiler/checks.fd` (and `pe::unchecked_ops`)
+  and serves both backends; it now also sees a length kept in a local,
+  `p_vec_*` calls and printing in the loop. `Vec_push` inlines to a store.
+- **Native code is tighter:** shadow space reserved once, compare and branch
+  without a stored bool, no jump to the next block, parameters in registers,
+  short immediates, `imul` by an immediate. fib 1.63 s to 1.34 s, the map
+  1.47 s to 1.04 s.
+- **One `Vec` implementation:** every backend's `p_vec_*` builtins run core's
+  `Vec_*` functions. Natively, `p_vec_clone` shared its data and `p_vec_first`
+  returned garbage; in the interpreter the builtins did nothing on a core
+  `Vec`. `test_vec_builtins.fd` now agrees on every backend.
+- **Tensors:** `p_gaussian_noise` and `p_recv_tensor` on C read a shape's length
+  and data from the right fields.
+- **Crypto:** SHA-256 and HMAC-SHA-256 checked against NIST FIPS 180-4 and
+  RFC 4231 (`test_crypto_vectors.fd`, a mismatch panics); `crypto_random_bytes`
+  and `crypto_random_u64` take randomness from the OS on every backend
+  (builtin `p_os_random_u64`); the module's header no longer claims SHA-512.
+- **Self-compile:** 112–137 s.
+
 ## Session 37 — A Faster Compiler, Linux in CI (Nov 2, 2026)
 
 - **Self-compile 4.4 times faster:** `fid` compiles itself in 136 s, down from

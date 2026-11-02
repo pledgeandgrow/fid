@@ -1,0 +1,169 @@
+// metrics.fd - counters, gauges and histograms, exported in the Prometheus
+// text format (read by Prometheus, Grafana Agent, OpenTelemetry collectors).
+//
+// Usage:
+//   use metrics;
+//   val m: Metrics = metrics_new();
+//   val requests: i64 = metrics_counter(m, "http_requests_total", "Requests served");
+//   val latency: i64 = metrics_histogram(m, "http_latency_ms", "Latency", [1, 10, 100]);
+//   metrics_inc(m, requests, 1);
+//   metrics_observe(m, latency, 7);
+//   print(metrics_text(m));    // serve this at /metrics
+
+module metrics;
+
+use core;
+use vec;
+use string;
+
+pub const METRIC_COUNTER: i64 = 0;
+pub const METRIC_GAUGE: i64 = 1;
+pub const METRIC_HISTOGRAM: i64 = 2;
+
+/// A set of metrics. Ids are indexes; a histogram's buckets live in `bounds`
+/// and `buckets`, from `first[id]`, `nbounds[id]` of them.
+pub struct Metrics {
+    pub names: Vec<str>,
+    pub helps: Vec<str>,
+    pub kinds: Vec<i64>,
+    // A counter's or gauge's value; a histogram's sum
+    pub values: Vec<i64>,
+    // A histogram's number of observations
+    pub counts: Vec<i64>,
+    pub first: Vec<i64>,
+    pub nbounds: Vec<i64>,
+    pub bounds: Vec<i64>,
+    pub buckets: Vec<i64>,
+}
+
+pub fn metrics_new() -> Metrics {
+    return Metrics {
+        names: Vec::new(), helps: Vec::new(), kinds: Vec::new(), values: Vec::new(),
+        counts: Vec::new(), first: Vec::new(), nbounds: Vec::new(), bounds: Vec::new(),
+        buckets: Vec::new(),
+    };
+}
+
+/// Is `name` a valid metric name: [a-zA-Z_:][a-zA-Z0-9_:]*?
+pub fn metrics_valid_name(name: str) -> bool {
+    if str_len(name) == 0 { return false; }
+    var i: i64 = 0;
+    while i < str_len(name) {
+        val c: i64 = str_byte_at(name, i);
+        val letter: bool = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || c == 58;
+        val digit: bool = c >= 48 && c <= 57;
+        if !letter && !(digit && i > 0) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn metrics_add(m: Metrics, name: str, help: str, kind: i64) -> i64 {
+    if !metrics_valid_name(name) { p_panic("metrics: invalid name: " + name); }
+    var i: i64 = 0;
+    while i < m.names.len() {
+        if m.names.get(i) == name { p_panic("metrics: registered twice: " + name); }
+        i = i + 1;
+    }
+    m.names.push(name);
+    m.helps.push(help);
+    m.kinds.push(kind);
+    m.values.push(0);
+    m.counts.push(0);
+    m.first.push(m.bounds.len());
+    m.nbounds.push(0);
+    return m.names.len() - 1;
+}
+
+/// A counter: only goes up.
+pub fn metrics_counter(m: Metrics, name: str, help: str) -> i64 {
+    return metrics_add(m, name, help, METRIC_COUNTER);
+}
+
+/// A gauge: set to any value.
+pub fn metrics_gauge(m: Metrics, name: str, help: str) -> i64 {
+    return metrics_add(m, name, help, METRIC_GAUGE);
+}
+
+/// A histogram with the given upper bounds, in increasing order.
+pub fn metrics_histogram(m: Metrics, name: str, help: str, upper: Vec<i64>) -> i64 {
+    val id: i64 = metrics_add(m, name, help, METRIC_HISTOGRAM);
+    m.nbounds.set(id, upper.len());
+    var i: i64 = 0;
+    while i < upper.len() {
+        if i > 0 && upper.get(i) <= upper.get(i - 1) { p_panic("metrics: bounds must increase: " + name); }
+        m.bounds.push(upper.get(i));
+        m.buckets.push(0);
+        i = i + 1;
+    }
+    return id;
+}
+
+/// Add `by` (>= 0) to a counter, or to a gauge.
+pub fn metrics_inc(m: Metrics, id: i64, by: i64) {
+    if m.kinds.get(id) == METRIC_COUNTER && by < 0 { p_panic("metrics: a counter cannot go down"); }
+    m.values.set(id, m.values.get(id) + by);
+}
+
+/// Set a gauge.
+pub fn metrics_set(m: Metrics, id: i64, value: i64) {
+    if m.kinds.get(id) != METRIC_GAUGE { p_panic("metrics: only a gauge is set"); }
+    m.values.set(id, value);
+}
+
+/// Record one value in a histogram.
+pub fn metrics_observe(m: Metrics, id: i64, value: i64) {
+    if m.kinds.get(id) != METRIC_HISTOGRAM { p_panic("metrics: only a histogram observes"); }
+    m.values.set(id, m.values.get(id) + value);
+    m.counts.set(id, m.counts.get(id) + 1);
+    var i: i64 = 0;
+    while i < m.nbounds.get(id) {
+        val at: i64 = m.first.get(id) + i;
+        if value <= m.bounds.get(at) {
+            m.buckets.set(at, m.buckets.get(at) + 1);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+/// A counter's or gauge's value; a histogram's sum.
+pub fn metrics_get(m: Metrics, id: i64) -> i64 {
+    return m.values.get(id);
+}
+
+/// A histogram's number of observations.
+pub fn metrics_count(m: Metrics, id: i64) -> i64 {
+    return m.counts.get(id);
+}
+
+/// Every metric in the Prometheus text format, version 0.0.4.
+pub fn metrics_text(m: Metrics) -> str {
+    var sb: StringBuilder = StringBuilder::new();
+    var id: i64 = 0;
+    while id < m.names.len() {
+        val name: str = m.names.get(id);
+        val kind: i64 = m.kinds.get(id);
+        sb.append_str("# HELP " + name + " " + m.helps.get(id) + "\n");
+        if kind == METRIC_COUNTER {
+            sb.append_str("# TYPE " + name + " counter\n" + name + " " + int_to_str(m.values.get(id)) + "\n");
+        } else if kind == METRIC_GAUGE {
+            sb.append_str("# TYPE " + name + " gauge\n" + name + " " + int_to_str(m.values.get(id)) + "\n");
+        } else {
+            sb.append_str("# TYPE " + name + " histogram\n");
+            var below: i64 = 0;
+            var i: i64 = 0;
+            while i < m.nbounds.get(id) {
+                val at: i64 = m.first.get(id) + i;
+                below = below + m.buckets.get(at);
+                sb.append_str(name + "_bucket{le=\"" + int_to_str(m.bounds.get(at)) + "\"} " + int_to_str(below) + "\n");
+                i = i + 1;
+            }
+            sb.append_str(name + "_bucket{le=\"+Inf\"} " + int_to_str(m.counts.get(id)) + "\n");
+            sb.append_str(name + "_sum " + int_to_str(m.values.get(id)) + "\n");
+            sb.append_str(name + "_count " + int_to_str(m.counts.get(id)) + "\n");
+        }
+        id = id + 1;
+    }
+    return sb.to_str();
+}

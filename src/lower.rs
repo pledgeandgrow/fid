@@ -1161,6 +1161,8 @@ impl Lowerer {
         self.module.add_extern("p_clock_now", vec![], IrType::I64);
         // p_clock_now_us() -> i64  — wall-clock time in microseconds since Unix epoch
         self.module.add_extern("p_clock_now_us", vec![], IrType::I64);
+        // p_os_random_u64() -> i64 — 64 bits from the OS's secure generator
+        self.module.add_extern("p_os_random_u64", vec![], IrType::I64);
         // p_clock_now_ms() -> i64  — wall-clock time in milliseconds since Unix epoch
         self.module.add_extern("p_clock_now_ms", vec![], IrType::I64);
 
@@ -2398,6 +2400,56 @@ impl Lowerer {
                         self.emit_inst(Inst::Call {
                             func: "Vec_set".to_string(),
                             args: vec![dummy_env3, arr_val, idx_val, new_val],
+                            ret_ty: IrType::Void,
+                            effects: EffectSet::new(),
+                        });
+                    }
+                    return;
+                }
+
+                // Map indexing — m[k] = v desugars to HashMap_insert(m, k, v);
+                // compound ops (m[k] += v) do get + binop + insert.
+                if arr_ty.is_opaque_named("HashMap") {
+                    let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                    if *op == AssignOp::Assign {
+                        let val = self.lower_expr(expr);
+                        self.emit_inst(Inst::Call {
+                            func: "HashMap_insert".to_string(),
+                            args: vec![dummy_env, arr_val, idx_val, val],
+                            ret_ty: IrType::Void,
+                            effects: EffectSet::new(),
+                        });
+                    } else {
+                        let current = self.emit_inst(Inst::Call {
+                            func: "HashMap_get".to_string(),
+                            args: vec![dummy_env, arr_val, idx_val],
+                            ret_ty: IrType::I64,
+                            effects: EffectSet::new(),
+                        });
+                        let rhs = self.lower_expr(expr);
+                        let bin_op = match op {
+                            AssignOp::AddAssign => BinOp::Add,
+                            AssignOp::SubAssign => BinOp::Sub,
+                            AssignOp::MulAssign => BinOp::Mul,
+                            AssignOp::DivAssign => BinOp::Div,
+                            AssignOp::ModAssign => BinOp::Mod,
+                            AssignOp::BitAndAssign => BinOp::BitAnd,
+                            AssignOp::BitOrAssign => BinOp::BitOr,
+                            AssignOp::BitXorAssign => BinOp::BitXor,
+                            AssignOp::ShlAssign => BinOp::Shl,
+                            AssignOp::ShrAssign => BinOp::Shr,
+                            AssignOp::Assign => unreachable!(),
+                        };
+                        let new_val = self.emit_inst(Inst::BinOp {
+                            op: bin_op,
+                            left: current,
+                            right: rhs,
+                            ty: IrType::I64,
+                        });
+                        let dummy_env2 = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                        self.emit_inst(Inst::Call {
+                            func: "HashMap_insert".to_string(),
+                            args: vec![dummy_env2, arr_val, idx_val, new_val],
                             ret_ty: IrType::Void,
                             effects: EffectSet::new(),
                         });
@@ -4239,6 +4291,53 @@ impl Lowerer {
                     }
                 }
 
+                // User-type operator overloading: `a == b` on a struct or enum
+                // desugars to `T_eq(a, b)`; ordering ops to `T_cmp(a, b) < 0`.
+                // Required because comparing two aggregate addresses would
+                // silently compare addresses, not contents (see typechecker).
+                {
+                    let aggregate_name = |t: &IrType| -> Option<String> {
+                        match t {
+                            IrType::Struct(n) if !is_vec_type_name(n) => Some(n.clone()),
+                            IrType::Ptr(inner) => match inner.as_ref() {
+                                IrType::Struct(n) if !is_vec_type_name(n) => Some(n.clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        }
+                    };
+                    let method = match op {
+                        BinOp::Eq | BinOp::Neq => Some("eq"),
+                        BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => Some("cmp"),
+                        _ => None,
+                    };
+                    if let Some(method) = method {
+                        if let Some(tn) = aggregate_name(&left_ir_ty) {
+                            if aggregate_name(&right_ir_ty).as_deref() == Some(tn.as_str())
+                                && self.impl_methods.contains_key(&(tn.clone(), method.to_string()))
+                            {
+                                let l = self.lower_expr(left);
+                                let r = self.lower_expr(right);
+                                let cmp_ret = if method == "eq" { IrType::Bool } else { IrType::I64 };
+                                let call = self.emit_inst(Inst::Call {
+                                    func: format!("{}_{}", tn, method),
+                                    args: vec![l, r],
+                                    ret_ty: cmp_ret,
+                                    effects: EffectSet::new(),
+                                });
+                                return match op {
+                                    BinOp::Eq => call,
+                                    _ => {
+                                        let zero = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                                        let bin = if *op == BinOp::Neq { BinOp::Eq } else { *op };
+                                        self.emit_inst(Inst::BinOp { op: bin, left: call, right: zero, ty: IrType::Bool })
+                                    }
+                                };
+                            }
+                        }
+                    }
+                }
+
                 let mut left_val = self.lower_expr(left);
                 let mut right_val = self.lower_expr(right);
                 let mut result_ty = self.infer_binop_type(op, left, right);
@@ -5579,6 +5678,17 @@ impl Lowerer {
 
                 let idx_val = self.lower_expr(index);
 
+                // Map indexing — m[k] desugars to HashMap_get(m, k)
+                if arr_ty.is_opaque_named("HashMap") {
+                    let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                    return self.emit_inst(Inst::Call {
+                        func: "HashMap_get".to_string(),
+                        args: vec![dummy_env, arr_val, idx_val],
+                        ret_ty: IrType::I64,
+                        effects: EffectSet::new(),
+                    });
+                }
+
                 // Vec indexing — call Fides Vec_get with correct element type (Phase 10B)
                 if arr_ty.is_opaque_named("Vec") {
                     let elem_ty = arr_ty.generic_elem().cloned().unwrap_or(IrType::I64);
@@ -6189,15 +6299,44 @@ impl Lowerer {
                     });
                     self.emit_inst(Inst::Store { ptr: dst_val_ptr, value: src_val, store_ty: None });
                     self.emit_terminator(Inst::Jump { target: try_err_block });
+                } else if let Some(sret) = self.current_sret {
+                    // Struct return (sret ABI): `val` is a *struct pointer, but the
+                    // caller expects the result written into the out-param — a
+                    // bare `Return void` would leave the caller's buffer
+                    // uninitialized. Copy tag + payload fields like the
+                    // try-block path does.
+                    let src_tag_ptr = self.emit_inst(Inst::GetFieldPtr {
+                        struct_ptr: val,
+                        field_index: 0,
+                        field_ty: IrType::I64,
+                    });
+                    let src_tag = self.emit_inst(Inst::Load { ptr: src_tag_ptr, ty: IrType::I64 });
+                    let dst_tag_ptr = self.emit_inst(Inst::GetFieldPtr {
+                        struct_ptr: sret,
+                        field_index: 0,
+                        field_ty: IrType::I64,
+                    });
+                    self.emit_inst(Inst::Store { ptr: dst_tag_ptr, value: src_tag, store_ty: None });
+                    let src_val_ptr = self.emit_inst(Inst::GetFieldPtr {
+                        struct_ptr: val,
+                        field_index: 1,
+                        field_ty: IrType::I64,
+                    });
+                    let src_val = self.emit_inst(Inst::Load { ptr: src_val_ptr, ty: IrType::I64 });
+                    let dst_val_ptr = self.emit_inst(Inst::GetFieldPtr {
+                        struct_ptr: sret,
+                        field_index: 1,
+                        field_ty: IrType::I64,
+                    });
+                    self.emit_inst(Inst::Store { ptr: dst_val_ptr, value: src_val, store_ty: None });
+                    self.emit_drops();
+                    self.emit_defers();
+                    self.emit_terminator(Inst::Return { value: None });
                 } else {
                     // Not inside a try block: return the error from the current function
                     self.emit_drops();
                     self.emit_defers();
-                    if self.current_sret.is_some() {
-                        self.emit_terminator(Inst::Return { value: None });
-                    } else {
-                        self.emit_terminator(Inst::Return { value: Some(val) });
-                    }
+                    self.emit_terminator(Inst::Return { value: Some(val) });
                 }
 
                 // Merge: load the unwrapped value

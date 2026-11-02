@@ -1,0 +1,125 @@
+// stdlib/semver: parsing, validation, canonical text, SemVer 2.0.0
+// precedence, range matching (^ ~ comparators, hyphen, ||), and max queries.
+use semver;
+
+fn check_b(label: str, got: bool, want: bool) {
+    println(label + " = " + bool_to_str(got));
+    if got != want { p_panic("semver: wrong value for " + label); }
+}
+
+fn check_i(label: str, got: i64, want: i64) {
+    println(label + " = " + int_to_str(got));
+    if got != want { p_panic("semver: wrong value for " + label); }
+}
+
+fn check_s(label: str, got: str, want: str) {
+    println(label + " = " + got);
+    if !str_equal(got, want) { p_panic("semver: wrong value for " + label); }
+}
+
+fn sign(x: i64) -> i64 {
+    if x < 0 { return -1; }
+    if x > 0 { return 1; }
+    return 0;
+}
+
+fn cmp(a: str, b: str) -> i64 {
+    return sign(semver_compare_str(a, b));
+}
+
+fn sat(v: str, r: str) -> bool {
+    return semver_satisfies_str(v, r);
+}
+
+fn main() -> i64 {
+    // Parsing
+    val v = semver_parse("1.4.2-rc.1+build.7");
+    check_i("major", v.major, 1);
+    check_i("minor", v.minor, 4);
+    check_i("patch", v.patch, 2);
+    check_s("pre", v.pre, "rc.1");
+    check_s("build", v.build, "build.7");
+    check_s("to_str", semver_to_str(v), "1.4.2-rc.1+build.7");
+    check_s("to_str plain", semver_to_str(semver_parse("  10.20.30  ")), "10.20.30");
+    check_s("to_str hyphen pre", semver_to_str(semver_parse("1.0.0-alpha-1")), "1.0.0-alpha-1");
+    check_s("to_str invalid", semver_to_str(semver_parse("1.2")), "invalid");
+
+    // Validation
+    check_b("valid 0.0.0", semver_is_valid_str("0.0.0"), true);
+    check_b("valid 1.0.0-0.3.7", semver_is_valid_str("1.0.0-0.3.7"), true);
+    check_b("valid 1.0.0+001", semver_is_valid_str("1.0.0+001"), true);
+    check_b("invalid 1.2", semver_is_valid_str("1.2"), false);
+    check_b("invalid 1.2.3.4", semver_is_valid_str("1.2.3.4"), false);
+    check_b("invalid 01.2.3", semver_is_valid_str("01.2.3"), false);
+    check_b("invalid 1.2.3-01", semver_is_valid_str("1.2.3-01"), false);
+    check_b("invalid 1.2.3-", semver_is_valid_str("1.2.3-"), false);
+    check_b("invalid 1.2.3+", semver_is_valid_str("1.2.3+"), false);
+    check_b("invalid 1.2.3-a..b", semver_is_valid_str("1.2.3-a..b"), false);
+    check_b("invalid a.b.c", semver_is_valid_str("a.b.c"), false);
+    check_b("invalid empty", semver_is_valid_str(""), false);
+
+    // Precedence: the SemVer 2.0.0 spec example chain
+    check_i("alpha < alpha.1", cmp("1.0.0-alpha", "1.0.0-alpha.1"), -1);
+    check_i("alpha.1 < alpha.beta", cmp("1.0.0-alpha.1", "1.0.0-alpha.beta"), -1);
+    check_i("alpha.beta < beta", cmp("1.0.0-alpha.beta", "1.0.0-beta"), -1);
+    check_i("beta < beta.2", cmp("1.0.0-beta", "1.0.0-beta.2"), -1);
+    check_i("beta.2 < beta.11", cmp("1.0.0-beta.2", "1.0.0-beta.11"), -1);
+    check_i("beta.11 < rc.1", cmp("1.0.0-beta.11", "1.0.0-rc.1"), -1);
+    check_i("rc.1 < 1.0.0", cmp("1.0.0-rc.1", "1.0.0"), -1);
+    check_i("1.0.0 > rc.1", cmp("1.0.0", "1.0.0-rc.1"), 1);
+    check_i("1.9.0 < 1.10.0", cmp("1.9.0", "1.10.0"), -1);
+    check_i("2.0.0 > 1.99.99", cmp("2.0.0", "1.99.99"), 1);
+    check_i("build ignored", cmp("1.0.0+a", "1.0.0+b"), 0);
+    check_i("invalid < valid", cmp("bogus", "0.0.1"), -1);
+    check_b("eq", semver_eq(semver_parse("3.2.1"), semver_parse("3.2.1+x")), true);
+    check_b("lt", semver_lt(semver_parse("3.2.1"), semver_parse("3.2.2")), true);
+    check_b("gt", semver_gt(semver_parse("3.2.1"), semver_parse("3.2.2")), false);
+
+    // Ranges
+    check_b("* any", sat("5.6.7", "*"), true);
+    check_b("empty any", sat("5.6.7", ""), true);
+    check_b("exact", sat("1.2.3", "1.2.3"), true);
+    check_b("exact no", sat("1.2.4", "=1.2.3"), false);
+    check_b("^1.2.3 1.9.9", sat("1.9.9", "^1.2.3"), true);
+    check_b("^1.2.3 2.0.0", sat("2.0.0", "^1.2.3"), false);
+    check_b("^1.2.3 1.2.2", sat("1.2.2", "^1.2.3"), false);
+    check_b("^0.2.3 0.2.9", sat("0.2.9", "^0.2.3"), true);
+    check_b("^0.2.3 0.3.0", sat("0.3.0", "^0.2.3"), false);
+    check_b("^0.0.3 0.0.3", sat("0.0.3", "^0.0.3"), true);
+    check_b("^0.0.3 0.0.4", sat("0.0.4", "^0.0.3"), false);
+    check_b("^1.2 1.5.0", sat("1.5.0", "^1.2"), true);
+    check_b("~1.4.0 1.4.9", sat("1.4.9", "~1.4.0"), true);
+    check_b("~1.4.0 1.5.0", sat("1.5.0", "~1.4.0"), false);
+    check_b(">=1.0 <2.0 1.5.0", sat("1.5.0", ">=1.0 <2.0"), true);
+    check_b(">=1.0 <2.0 2.0.0", sat("2.0.0", ">=1.0 <2.0"), false);
+    check_b(">1.0.0 1.0.0", sat("1.0.0", ">1.0.0"), false);
+    check_b("<=1.0.0 1.0.0", sat("1.0.0", "<=1.0.0"), true);
+    check_b("hyphen in", sat("1.5.0", "1.2.3 - 2.0.0"), true);
+    check_b("hyphen top", sat("2.0.0", "1.2.3 - 2.0.0"), true);
+    check_b("hyphen out", sat("2.0.1", "1.2.3 - 2.0.0"), false);
+    check_b("or first", sat("1.2.0", "^1.0.0 || ^3.0.0"), true);
+    check_b("or second", sat("3.1.0", "^1.0.0 || ^3.0.0"), true);
+    check_b("or none", sat("2.1.0", "^1.0.0 || ^3.0.0"), false);
+    check_b("pre excluded", sat("1.5.0-beta", "^1.0.0"), false);
+    check_b("pre allowed", sat("1.2.3-beta.2", ">=1.2.3-beta.1"), true);
+    check_b("invalid version", sat("nope", "*"), false);
+
+    // Max queries
+    var vs: Vec = Vec::new();
+    vs.push("1.2.3");
+    vs.push("2.0.0-rc.1");
+    vs.push("1.10.0");
+    vs.push("junk");
+    vs.push("1.9.9");
+    vs.push("0.5.0");
+    check_s("max", semver_max(vs), "2.0.0-rc.1");
+    check_s("max ^1", semver_max_satisfying(vs, "^1.0.0"), "1.10.0");
+    check_s("max ~1.9", semver_max_satisfying(vs, "~1.9.0"), "1.9.9");
+    check_s("max <1", semver_max_satisfying(vs, "<1.0.0"), "0.5.0");
+    check_s("max none", semver_max_satisfying(vs, "^3.0.0"), "");
+    var empty: Vec = Vec::new();
+    check_s("max empty", semver_max(empty), "");
+
+    println("semver ok");
+    return 0;
+}

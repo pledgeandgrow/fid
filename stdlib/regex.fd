@@ -370,7 +370,7 @@ pub fn regex_compile(re: str) -> Regex {
     return r;
 }
 
-// One atom match at `pos` → end position or -1. Variable width for groups.
+// One single-character atom (literal, '.', class) at `pos` → pos+1 or -1.
 fn rx_atom(r: Regex, s: str, ti: i64, pos: i64) -> i64 {
     var n: i64 = str_len(s);
     if pos >= n { return -1; }
@@ -389,17 +389,32 @@ fn rx_atom(r: Regex, s: str, ti: i64, pos: i64) -> i64 {
         if rx_cls_get(r.cls, arg, ch & 255) { return pos + 1; }
         return -1;
     }
-    if kind == RX_GROUP {
-        // body is tokens ti+1 .. arg
-        return rx_range(r, s, ti + 1, arg, pos);
-    }
     return -1;
 }
 
-// Match token range [ti, tend) against s at si → end position or -1.
-// Greedy per-atom repetition with backtracking over recorded positions.
-fn rx_range(r: Regex, s: str, ti: i64, tend: i64, si: i64) -> i64 {
-    if ti >= tend { return si; }
+fn rx_has(v: Vec<i64>, x: i64) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == x { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn rx_add(v: Vec<i64>, x: i64) -> void {
+    if !rx_has(v, x) { v.push(x); }
+}
+
+// Every end position reachable by matching token range [ti, tend) against
+// s at si (distinct values, any order). Working with the whole set of ends
+// lets a group's body give back characters to what follows it, e.g.
+// "(a*)ab" on "aab", and lets regex_match look for an end at str_len(s).
+fn rx_all(r: Regex, s: str, ti: i64, tend: i64, si: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if ti >= tend {
+        out.push(si);
+        return out;
+    }
     var kind: i64 = rx_tok(r.toks, ti);
     var arg: i64 = rx_arg(r.toks, ti);
     var mn: i64 = rx_min(r.toks, ti);
@@ -408,63 +423,105 @@ fn rx_range(r: Regex, s: str, ti: i64, tend: i64, si: i64) -> i64 {
 
     // zero-width anchors
     if kind == RX_BOL {
-        if si == 0 { return rx_range(r, s, ti + 1, tend, si); }
-        return -1;
+        if si == 0 { return rx_all(r, s, ti + 1, tend, si); }
+        return out;
     }
     if kind == RX_EOL {
-        if si == n { return rx_range(r, s, ti + 1, tend, si); }
-        return -1;
+        if si == n { return rx_all(r, s, ti + 1, tend, si); }
+        return out;
     }
 
     // the outer sequence continues after the group's body for GROUP
     var next_ti: i64 = ti + 1;
     if kind == RX_GROUP { next_ti = arg; }
-
-    // greedy repetition, recording the position after each rep
-    var positions: Vec<i64> = Vec::new();
-    positions.push(si);
-    var reps: i64 = 0;
-    var cur: i64 = si;
     var limit: i64 = mx;
     if limit < 0 { limit = n + 1; }
-    while reps < limit {
-        var e: i64 = rx_atom(r, s, ti, cur);
-        if e < 0 { break; }
-        positions.push(e);
+
+    // level = positions after `reps` repetitions; `starts` = positions
+    // after an allowed number of repetitions (mn..mx)
+    var starts: Vec<i64> = Vec::new();
+    var level: Vec<i64> = Vec::new();
+    level.push(si);
+    var reps: i64 = 0;
+    while true {
+        if reps >= mn {
+            var a: i64 = 0;
+            while a < level.len() {
+                rx_add(starts, level.get(a));
+                a = a + 1;
+            }
+        }
+        if reps >= limit || level.len() == 0 { break; }
+        var nxt: Vec<i64> = Vec::new();
+        var b: i64 = 0;
+        while b < level.len() {
+            var p: i64 = level.get(b);
+            if kind == RX_GROUP {
+                var ends: Vec<i64> = rx_all(r, s, ti + 1, arg, p);
+                var c: i64 = 0;
+                while c < ends.len() {
+                    var e: i64 = ends.get(c);
+                    // past the minimum, a repetition must make progress
+                    // and need not revisit a position already reached
+                    if reps < mn || (e != p && !rx_has(starts, e)) {
+                        rx_add(nxt, e);
+                    }
+                    c = c + 1;
+                }
+            } else {
+                var e1: i64 = rx_atom(r, s, ti, p);
+                if e1 >= 0 { rx_add(nxt, e1); }
+            }
+            b = b + 1;
+        }
+        level = nxt;
         reps = reps + 1;
-        if e == cur { break; }  // zero-width rep can't make progress
-        cur = e;
     }
-    // backtrack from greedy down to the required minimum
-    while reps >= mn {
-        var p: i64 = positions.get(reps);
-        var try_end: i64 = rx_range(r, s, next_ti, tend, p);
-        if try_end >= 0 { return try_end; }
-        reps = reps - 1;
+
+    var k: i64 = 0;
+    while k < starts.len() {
+        var rest: Vec<i64> = rx_all(r, s, next_ti, tend, starts.get(k));
+        var m: i64 = 0;
+        while m < rest.len() {
+            rx_add(out, rest.get(m));
+            m = m + 1;
+        }
+        k = k + 1;
     }
-    return -1;
+    return out;
 }
 
 /// Match compiled regex `r` starting at position `si` → end position or -1.
-/// Tries each top-level alternative (pattern split on '|') left to right.
+/// Tries each top-level alternative (pattern split on '|') left to right;
+/// the first alternative that matches gives its longest match.
 fn rx_match_at(r: Regex, s: str, si: i64) -> i64 {
     var p: i64 = 0;
     while p < r.progs.len() {
-        var s0: i64 = r.progs.get(p);
-        var e0: i64 = r.progs.get(p + 1);
-        var e: i64 = rx_range(r, s, s0, e0, si);
-        if e >= 0 { return e; }
+        var ends: Vec<i64> = rx_all(r, s, r.progs.get(p), r.progs.get(p + 1), si);
+        var best: i64 = -1;
+        var i: i64 = 0;
+        while i < ends.len() {
+            if ends.get(i) > best { best = ends.get(i); }
+            i = i + 1;
+        }
+        if best >= 0 { return best; }
         p = p + 2;
     }
     return -1;
 }
 
-/// True when `s` fully matches `re` (anchors implied at both ends).
+/// True when `s` fully matches `re` (anchors implied at both ends):
+/// some alternative must be able to end exactly at the end of `s`.
 pub fn regex_match(s: str, re: str) -> bool {
     var r: Regex = regex_compile(re);
     if !r.ok { return false; }
-    var e: i64 = rx_match_at(r, s, 0);
-    return e == str_len(s);
+    var p: i64 = 0;
+    while p < r.progs.len() {
+        var ends: Vec<i64> = rx_all(r, s, r.progs.get(p), r.progs.get(p + 1), 0);
+        if rx_has(ends, str_len(s)) { return true; }
+        p = p + 2;
+    }
+    return false;
 }
 
 /// True when `re` matches anywhere inside `s`.

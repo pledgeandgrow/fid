@@ -4668,13 +4668,44 @@ impl TypeChecker {
                 }
             }
             Stmt::IndexAssign { array, index, op: _, expr, line: _ } => {
-                self.check_expr(index);
-                self.check_expr(expr);
-                if self.lookup(array).is_none() {
-                    self.errors.push(format!(
-                        "Type error: cannot index undefined variable '{}'",
-                        array
-                    ));
+                let idx_ty = self.check_expr(index);
+                let val_ty = self.check_expr(expr);
+                match self.lookup(array) {
+                    None => {
+                        self.errors.push(format!(
+                            "Type error: cannot index undefined variable '{}'",
+                            array
+                        ));
+                    }
+                    Some(ty @ (Type::Generic { .. } | Type::Named(_))) => {
+                        // m[k] = v on HashMap<K, V> desugars to HashMap_insert(m, k, v).
+                        let map_name = match &ty {
+                            Type::Generic { name, .. } | Type::Named(name) => name.as_str(),
+                            _ => "",
+                        };
+                        if map_name == "HashMap" {
+                            let (key_ty, val_expected) = match &ty {
+                                Type::Generic { args, .. } => (
+                                    args.first().cloned().unwrap_or(Type::Str),
+                                    args.get(1).cloned().unwrap_or(Type::I64),
+                                ),
+                                _ => (Type::Str, Type::I64),
+                            };
+                            if !self.types_compatible(&key_ty, &idx_ty) {
+                                self.errors.push(format!(
+                                    "Type error: map key type mismatch — expected {}, got {}",
+                                    key_ty, idx_ty
+                                ));
+                            }
+                            if !self.types_compatible(&val_expected, &val_ty) {
+                                self.errors.push(format!(
+                                    "Type error: map value type mismatch — expected {}, got {}",
+                                    val_expected, val_ty
+                                ));
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 // Compile-time bounds checking for constant indices
                 let const_idx = match &index {
@@ -5383,6 +5414,49 @@ impl TypeChecker {
                         }
                     }
                     BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
+                        // Comparing two user structs/enums requires an `eq` (for ==/!=)
+                        // or `cmp` (for ordering) method — comparing two aggregates'
+                        // addresses is silently meaningless. Implementations are
+                        // opt-in like Rust's PartialEq/PartialOrd.
+                        let type_name = |t: &Type| -> Option<String> {
+                            match t {
+                                Type::Named(n) | Type::Generic { name: n, .. } => Some(n.clone()),
+                                _ => None,
+                            }
+                        };
+                        if let (Some(lname), Some(rname)) = (type_name(&lt), type_name(&rt)) {
+                            if lname == rname && (self.structs.contains_key(&lname) || self.enums.contains(&lname)) {
+                                let (needed, want_ret, sig) = if matches!(op, BinOp::Eq | BinOp::Neq) {
+                                    ("eq", Type::Bool, "fn eq(self: T, other: T) -> bool")
+                                } else {
+                                    ("cmp", Type::I64, "fn cmp(self: T, other: T) -> i64")
+                                };
+                                let ok = self.methods.get(&lname)
+                                    .and_then(|m| m.get(needed))
+                                    .map_or(false, |(params, ret, has_self, _is_pub)| {
+                                        *has_self && params.len() == 2 && ret == &want_ret
+                                    });
+                                if !ok {
+                                    self.errors.push(format!(
+                                        "Type error: cannot compare '{}' with '{}' — comparing two aggregates compares \
+                                         addresses, not contents.\n\
+                                         \x20\x20\x20\x20Fix: implement `{}` in `impl {}`, or compare fields/variants \
+                                         explicitly with match/field access.",
+                                        lname,
+                                        match op {
+                                            BinOp::Eq => "==",
+                                            BinOp::Neq => "!=",
+                                            BinOp::Lt => "<",
+                                            BinOp::Gt => ">",
+                                            BinOp::LtEq => "<=",
+                                            _ => ">=",
+                                        },
+                                        sig,
+                                        lname
+                                    ));
+                                }
+                            }
+                        }
                         Type::Bool
                     }
                     BinOp::And | BinOp::Or => {
@@ -6442,6 +6516,25 @@ impl TypeChecker {
                     }
                 }
                 let idx_ty = self.check_expr(index);
+                // m[k] on HashMap<K, V> desugars to HashMap_get(m, k) -> V.
+                if let Type::Generic { name, .. } | Type::Named(name) = &arr_ty {
+                    if name == "HashMap" {
+                        let key_ty = match &arr_ty {
+                            Type::Generic { args, .. } => args.first().cloned().unwrap_or(Type::Str),
+                            _ => Type::Str,
+                        };
+                        if !self.types_compatible(&key_ty, &idx_ty) {
+                            self.errors.push(format!(
+                                "Type error: map key type mismatch — expected {}, got {}",
+                                key_ty, idx_ty
+                            ));
+                        }
+                        return match &arr_ty {
+                            Type::Generic { args, .. } => args.get(1).cloned().unwrap_or(Type::I64),
+                            _ => Type::I64,
+                        };
+                    }
+                }
                 if !self.is_numeric(&idx_ty) {
                     self.errors.push(format!(
                         "Type error: array index must be numeric, got {}",
@@ -6624,26 +6717,49 @@ impl TypeChecker {
                 Type::Str
             }
             Expr::Try { expr } => {
-                // ? operator: unwrap Result<T, E> -> T, or Option<T> -> T
-                let ty = self.check_expr(expr);
-                match &ty {
-                    Type::Generic { name, args } if name == "Result" && args.len() == 2 => {
-                        args[0].clone()
+                // ? operator: unwrap any "Try-shaped" enum — an enum whose FIRST
+                // variant carries a payload unwraps to that payload type; any
+                // other variant propagates the whole enum to the caller (or the
+                // enclosing try block). Option<T> -> T and Result<T, E> -> T
+                // are special cases of this rule: the lowerer treats tag 0 as
+                // the success variant for every enum.
+                let ty = Self::unbox_ty(&self.check_expr(expr));
+                let enum_name = match &ty {
+                    Type::Generic { name, .. } | Type::Named(name) => name.clone(),
+                    _ => {
+                        self.errors.push(format!(
+                            "Type error: ? operator requires a Try-shaped enum (Option, Result, or any enum whose \
+                             first variant carries a payload).\n\
+                             \x20\x20\x20\x20Found: {}\n\
+                             \x20\x20\x20\x20The ? operator unwraps the first variant and propagates the rest to the caller.\n\
+                             \x20\x20\x20\x20Fix: return a Try-shaped enum, or remove the ? operator.",
+                            ty
+                        ));
+                        return Type::Never;
                     }
-                    Type::Generic { name, args } if name == "Option" && args.len() == 1 => {
-                        args[0].clone()
-                    }
-                    Type::Named(name) if name == "Result" || name == "Option" => {
-                        Type::I64
+                };
+                let variants = self.enum_variants.get(&enum_name).cloned().unwrap_or_default();
+                match variants.first() {
+                    Some((_, payload_tys)) if !payload_tys.is_empty() => {
+                        let params = self.enum_type_params.get(&enum_name).cloned().unwrap_or_default();
+                        let args = match &ty {
+                            Type::Generic { args, .. } => args.clone(),
+                            _ => Vec::new(),
+                        };
+                        let subst: HashMap<&str, &Type> = params.iter()
+                            .map(|p| p.as_str())
+                            .zip(args.iter())
+                            .collect();
+                        let t = Self::subst_type_params(&payload_tys[0], &subst);
+                        if self.is_type_param_name_ty(&t) { Type::I64 } else { t }
                     }
                     _ => {
                         self.errors.push(format!(
-                            "Type error: ? operator requires Option<T> or Result<T, E>.\n\
-                             \x20\x20\x20\x20Found: {}\n\
-                             \x20\x20\x20\x20The ? operator unwraps Option or Result — it propagates the error/None \
-                             to the caller.\n\
-                             \x20\x20\x20\x20Fix: wrap the value in Option or Result, or remove the ? operator.",
-                            ty
+                            "Type error: ? operator requires a Try-shaped enum — '{}' is not an enum whose first \
+                             variant carries a payload (like Some(T) or Ok(T)).\n\
+                             \x20\x20\x20\x20Fix: make the type an enum with a payload-carrying first variant, \
+                             or remove the ? operator.",
+                            enum_name
                         ));
                         Type::Never
                     }

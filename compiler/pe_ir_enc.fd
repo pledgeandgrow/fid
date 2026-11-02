@@ -494,6 +494,20 @@ pub fn PeirEnc_mov_imm64(self: &mut PeirEnc, r: i64, val: i64) -> void {
     PeirEnc_emit_u64(self, val);
 }
 
+/// mov r64, imm in its shortest form: mov r32 (zero-extends), imm32
+/// sign-extended, or movabs. Flags are left alone.
+pub fn PeirEnc_mov_imm(self: &mut PeirEnc, r: i64, val: i64) -> void {
+    if val >= 0 && val <= 0xFFFFFFFF {
+        if reg_ext(r) { self.code.push(0x41); }
+        self.code.push(0xB8 + peir_reg_code(r));
+        PeirEnc_emit_u32(self, val);
+    } else if val >= 0 - 2147483648 && val <= 2147483647 {
+        PeirEnc_mov_imm32(self, r, val);
+    } else {
+        PeirEnc_mov_imm64(self, r, val);
+    }
+}
+
 /// mov r64, imm32 (sign-extended, 7 bytes)
 pub fn PeirEnc_mov_imm32(self: &mut PeirEnc, r: i64, val: i64) -> void {
     PeirEnc_rex(self, true, false, false, reg_ext(r));
@@ -702,6 +716,14 @@ pub fn PeirEnc_sub_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(src), false, reg_ext(dst));
     self.code.push(0x29);
     PeirEnc_modrm_rr(self, src, dst);
+}
+
+/// imul r, r, imm32: OF is set as by imul r, r/m
+pub fn PeirEnc_imul_r_i32(self: &mut PeirEnc, r: i64, imm: i64) -> void {
+    PeirEnc_rex(self, true, reg_ext(r), false, reg_ext(r));
+    self.code.push(0x69);
+    PeirEnc_modrm_rr(self, r, r);
+    PeirEnc_emit_i32(self, imm);
 }
 
 /// imul r64, r64
@@ -1634,7 +1656,7 @@ pub fn pe_msvcrt_imports() -> Vec<str> {
     v.push("_snprintf"); v.push("putchar"); v.push("puts"); v.push("getchar");
     v.push("fopen"); v.push("fclose"); v.push("fread"); v.push("fwrite");
     v.push("fflush"); v.push("fgets"); v.push("fputs");
-    v.push("fseek"); v.push("ftell"); v.push("_fseeki64"); v.push("remove");
+    v.push("fseek"); v.push("ftell"); v.push("_fseeki64"); v.push("remove"); v.push("rand_s");
     v.push("rename"); v.push("_access");
     v.push("system");
     return v;

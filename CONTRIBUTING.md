@@ -16,7 +16,7 @@ the test harness. Both give the same output on the test programs.
 | ------------------------------------------------- | ------------------------------------------------------- |
 | Write Fides programs, add tests, add stdlib modules | either compiler; check with `fidesc test`             |
 | Build tools (`ark`, `scribe`, `veil`)             | `cargo build --release`                                 |
-| Change the language or compiler internals         | the Rust compiler first, then port to `compiler/*.fd`   |
+| Change the language or compiler internals         | `compiler/*.fd`; the Rust compiler only when the bootstrap needs it (`docs/reference/stability.md`) |
 | Check a `compiler/*.fd` change                    | `RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh` (fixpoint) |
 
 ## Setting up
@@ -69,6 +69,15 @@ lists them with the risk level of each. For those:
 Never run `git stash`, `git checkout -- <file>`, `git reset --hard`, or
 `git clean` in a shared checkout, never rewrite history, and never delete
 files you did not create. These rules apply to people and to agents alike.
+
+## Language changes and releases
+
+A change to the language, to what a program means, or to a public stdlib API
+starts as a proposal: copy `docs/proposals/0000-template.md`. The process, the
+stability promise, editions, the release cadence and the rule for release notes
+(every change that can affect a working program is listed under **Breaking**)
+are in `docs/reference/stability.md`. Supported platforms and their tiers are in
+`docs/reference/platforms.md`.
 
 ## Pull requests
 
