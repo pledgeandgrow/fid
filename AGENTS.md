@@ -161,6 +161,8 @@ SELF-HOSTED COMPILER (primary source):
   Binary:         release/fid.exe (RELEASE=1 scripts/bootstrap.sh):
                   fixpoint; run 302/302 and ccompile 242/243 test programs
                   match fidesc (Known Bugs #1). Shipped as fid.exe.
+  Self-compile:   stage 2 `dump-c compiler/main.fd` 136 s (Nov 2; was ~600 s),
+                  fidesc 21 s. The compiler is built at -O0 (bootstrap.sh).
 
 RUST BOOTSTRAP (reference + test harness):
   src/*.rs:       55 files, 100,935 LOC — bootstrap reference
@@ -183,6 +185,15 @@ STDLIB:
   stdlib/*.fd:    104 modules, 30,446 LOC (kernel/uefi moved to fides-os project)
 
 RECENT IMPROVEMENTS:
+  Session 37:     Self-compile 4.4x faster (601 s -> 136 s, fixpoint kept),
+                  found with a stack sampler on the stage-3 C. C runtime prints
+                  with one fwrite per print (printf on unbuffered stdout wrote a
+                  byte at a time on Windows: every printing program was slow);
+                  IrFunction.inst_at (id -> instruction, was a linear scan for
+                  any function with parameters); IrModule.fn_index/str_index,
+                  Lowerer.func_info_at and the comptime pass's name set replace
+                  scans by name. Linux CI green: suite, bootstrap, clean install.
+                  Tasks wake by deadline; StringBuilder usable after to_str on C.
   Session 30:     Post-codegen constant-time verifier on the x86-64 ELF path:
                   after peephole, `verify_constant_time_asm` scans final asm for
                   conditional/indirect jumps, memory cmov, indexed memory ops,
@@ -418,6 +429,14 @@ touching them.
    **Fixed:** Frame size starts at 16 bytes (8 canary + 8 float scratch) in
    `compiler/pir.fd`. Float scratch moved to `-16(%rbp)` in
    `compiler/codegen_x64.fd`.
+
+14. **Slow paths that look harmless** (`compiler/ir.fd`, both C runtimes):
+   do not print through `printf` in the C runtime (stdout is unbuffered: one
+   write per byte on Windows; use `fwrite`), and do not look up instructions,
+   functions or strings by scanning a list: use `inst_at`, `fn_index`,
+   `str_index`. A function's parameters take value ids without instructions,
+   so `id == index` does not hold. Any code that replaces `module.functions`
+   wholesale must `HashMap_clear(module.fn_index)`.
 
 ## NEVER DO THESE (Hard Rules)
 

@@ -34,7 +34,8 @@ The self-hosted compiler reproduces itself from its second generation on.
 | HashMap, 1M strings | 1.65 | 0.78 | 1.09 | ≤ 1.0 |
 | Peak memory, 30M temporary strings | 2.3 GB | 3.4 GB | 5 MB on 3M | ≤ 50 MB |
 
-Self-compile: about 3 minutes natively, 22 s with `fidesc`.
+Self-compile (`fid dump-c compiler/main.fd`, the compiler built through C):
+136 s on Nov 2, down from 601 s; 21 s with `fidesc`. See D10.
 
 **Which gap is handled where:**
 
@@ -217,6 +218,14 @@ the fastest build-to-native among compiled languages, and native code within
       compiler itself): profile and fix it, as for the type checker (M).
 - [ ] D9. `emit` of hello world under 0.5 s: stop re-checking the stdlib on each
       build, by caching its checked form (L).
+- [~] D10. Self-compile under 60 s (M). Profiled with a stack sampler: 601 s to
+      136 s, 4.4 times faster, fixpoint kept. Fixed: on Windows `printf` wrote
+      stdout a byte at a time (31% of the time, and every printing program on the C
+      path); instruction lookup by id scanned the whole function whenever it had
+      parameters (20%); comptime, function, string and default-argument lookups
+      scanned lists by name. Left: string compares in method lookup and in the
+      parser's token checks; and the compiler is built at -O0, since optimizing
+      one 44 MB C file needs more than 16 GB.
 
 **Acceptance:** the Target column above; self-compile under 60 s.
 
@@ -236,17 +245,16 @@ compiler.
 
 ## Track F — Platforms
 
-- [~] F1. Run the whole suite on Linux x64 through C, in CI (M). CI runs it; a first
-      green run is left. Locally, the generated C of every test ran under gcc on
+- [x] F1. Run the whole suite on Linux x64 through C, in CI (M). Green on Nov 2
+      (6f94314). Locally, the generated C of every test ran under gcc on
       WSL, which found and fixed `p_system`'s status and a use after free in
       `process_capture`.
 - [x] F10. The C path works with MinGW `gcc`: linking fails because `-Wl,-z,...`
       is ELF-only (`src/main.rs`, `compiler/main.fd`). `zig cc` accepts it. CI's
       diagnostic step proves the fix (S).
-- [~] F2. `fid` builds and bootstraps itself on Linux, in CI (M). A first green run
-      is left.
-- [~] F3. Install archives tested on a clean Linux machine: a clean Ubuntu
-      container in CI (S). A first green run is left.
+- [x] F2. `fid` builds and bootstraps itself on Linux, in CI (M). Green on Nov 2.
+- [x] F3. Install archives tested on a clean Linux machine: a clean Ubuntu
+      container in CI (S). Green on Nov 2.
 - [ ] F4. Native ELF path for `fid`: an IR→ELF backend sharing the x86-64
       encoder with `pe_ir` (L).
 - [ ] F5. macOS x64 and ARM64 through C, in CI (M).

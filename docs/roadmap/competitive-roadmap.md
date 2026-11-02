@@ -43,6 +43,11 @@ counted-loop and allocator work of Nov 1–2 and are re-measured by BM1.
 | Sieve, 20M | 0.91 | 0.42 | 0.31 | not measured | not measured | not measured |
 | HashMap, 1M strings | 1.0–1.5 | 0.78 | 1.09 | not measured | not measured | not measured |
 
+Compile speed: `fid` compiles itself (104,000 lines of Fides, 44 MB of C out) in
+136 s, about 770 lines a second; `fidesc` (Rust) does it in 21 s. Go and Zig
+compile on the order of 100,000 lines a second or more, so this is the widest gap
+on the board: CS1–CS7.
+
 Also measured: an HTTP server of 285 KB with no runtime dependency, 28,000
 requests/s on one thread with the client on the same machine, 5.2 MB after 160,000
 requests in scoped mode. No rival has been measured on these yet.
@@ -187,7 +192,9 @@ This is the race we can win outright, since no rival's speed comes for free.
 - [ ] CS1. `emit` of hello world under 0.5 s (release D9), then under 0.1 s (L).
 - [ ] CS2. Cache the checked stdlib in a binary form, not re-parsed each build (L).
 - [ ] CS3. Borrow checking linear in program size (release D8) (M).
-- [ ] CS4. Self-compile under 60 s (release), then under 10 s (L).
+- [~] CS4. Self-compile under 60 s (release), then under 10 s (L). 136 s on Nov 2,
+      from 601 s (release D10). Next: string compares in method lookup and the
+      parser, then building the compiler with optimization.
 - [ ] CS5. Parallel front end and code generation on all cores (L).
 - [ ] CS6. Incremental native builds per function, under 100 ms for a one-line
       change (L).

@@ -1,0 +1,416 @@
+// Fides TLS cryptography primitives
+//
+// The building blocks a TLS 1.3 client needs, in pure Fides:
+//   - ChaCha20 (RFC 8439 stream cipher, IETF 96-bit nonce)
+//   - Poly1305 one-time authenticator (RFC 8439)
+//   - ChaCha20-Poly1305 AEAD (RFC 8439 §2.8)
+//   - HKDF-SHA256 extract/expand (RFC 5869) on crypto.fd HMAC
+//   - X25519 ECDH (RFC 7748 Montgomery ladder, bigint field math)
+// SHA-256/HMAC live in crypto.fd.
+//
+// What remains for full TLS 1.3: the record layer + handshake state
+// machine (ClientHello → derive secrets → Finished) and x.509 chain
+// validation (ASN.1 DER parser). These primitives are the parts that
+// are verifiable against RFC test vectors.
+//
+// Usage:
+//   use tls_crypto;
+//   val ct = chacha20_encrypt(key, nonce, counter, plaintext);
+
+module tls_crypto;
+
+use vec;
+use string;
+use crypto;
+use bigint;
+
+// ─── ChaCha20 ───────────────────────────────────────────────────────────
+
+fn c20_rot(v: i64, n: i64) -> i64 {
+    var x: i64 = v & 0xFFFFFFFF;
+    return ((x << n) & 0xFFFFFFFF) | (x >> (32 - n));
+}
+
+fn c20_qr(st: Vec, a: i64, b: i64, c: i64, d: i64) -> void {
+    var xa: i64 = st.get(a); var xb: i64 = st.get(b);
+    var xc: i64 = st.get(c); var xd: i64 = st.get(d);
+    xa = (xa + xb) & 0xFFFFFFFF; xd = c20_rot(xd ^ xa, 16);
+    xc = (xc + xd) & 0xFFFFFFFF; xb = c20_rot(xb ^ xc, 12);
+    xa = (xa + xb) & 0xFFFFFFFF; xd = c20_rot(xd ^ xa, 8);
+    xc = (xc + xd) & 0xFFFFFFFF; xb = c20_rot(xb ^ xc, 7);
+    st.set(a, xa); st.set(b, xb); st.set(c, xc); st.set(d, xd);
+}
+
+fn c20_u32(b: Vec, i: i64) -> i64 {
+    return b.get(i) | (b.get(i + 1) << 8) | (b.get(i + 2) << 16) | (b.get(i + 3) << 24);
+}
+
+/// One 64-byte ChaCha20 block: key(32B) nonce(12B) counter → Vec(64).
+pub fn chacha20_block(key: Vec, nonce: Vec, counter: i64) -> Vec {
+    var st: Vec = Vec::new();
+    st.push(0x61707865); st.push(0x3320646E); st.push(0x79622D32); st.push(0x6B206574);
+    var i: i64 = 0;
+    while i < 8 { st.push(c20_u32(key, i * 4)); i = i + 1; }
+    st.push(counter & 0xFFFFFFFF);
+    i = 0;
+    while i < 3 { st.push(c20_u32(nonce, i * 4)); i = i + 1; }
+    var orig: Vec = Vec::new();
+    i = 0;
+    while i < 16 { orig.push(st.get(i)); i = i + 1; }
+    var r: i64 = 0;
+    while r < 10 {
+        c20_qr(st, 0, 4, 8, 12); c20_qr(st, 1, 5, 9, 13);
+        c20_qr(st, 2, 6, 10, 14); c20_qr(st, 3, 7, 11, 15);
+        c20_qr(st, 0, 5, 10, 15); c20_qr(st, 1, 6, 11, 12);
+        c20_qr(st, 2, 7, 8, 13); c20_qr(st, 3, 4, 9, 14);
+        r = r + 1;
+    }
+    var out: Vec = Vec::new();
+    i = 0;
+    while i < 16 {
+        var w: i64 = (st.get(i) + orig.get(i)) & 0xFFFFFFFF;
+        out.push(w & 255); out.push((w >> 8) & 255);
+        out.push((w >> 16) & 255); out.push((w >> 24) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// ChaCha20 encrypt/decrypt (same op): XOR stream with `data`.
+pub fn chacha20_encrypt(key: Vec, nonce: Vec, counter: i64, data: Vec) -> Vec {
+    var out: Vec = Vec::new();
+    var pos: i64 = 0;
+    var ctr: i64 = counter;
+    while pos < data.len() {
+        var ks: Vec = chacha20_block(key, nonce, ctr);
+        var i: i64 = 0;
+        while i < 64 && pos + i < data.len() {
+            out.push((data.get(pos + i) ^ ks.get(i)) & 255);
+            i = i + 1;
+        }
+        pos = pos + 64;
+        ctr = ctr + 1;
+    }
+    return out;
+}
+
+// ─── Poly1305 ───────────────────────────────────────────────────────────
+// r is clamped; accumulate 16-byte chunks with hibit. Final = (a+r... )
+// Standard: acc = (acc + n) * r mod p each block, tag = acc + s mod 2^128.
+
+fn poly_p() -> BigInt {
+    // 2^130 - 5
+    return bigint_sub(bigint_pow(bigint_from_i64(2), 130), bigint_from_i64(5));
+}
+
+fn poly_bignum(bytes: Vec, off: i64, n: i64, hibit: bool) -> BigInt {
+    var v: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < n { v.push(bytes.get(off + i) & 255); i = i + 1; }
+    if hibit { v.push(1); }
+    // little-endian → bigint: value = sum b[i] * 256^i — build via hex-ish
+    var num: BigInt = bigint_zero();
+    var mul: BigInt = bigint_one();
+    var b256: BigInt = bigint_from_i64(256);
+    i = 0;
+    while i < v.len() {
+        num = bigint_add(num, bigint_mul(mul, bigint_from_i64(v.get(i))));
+        mul = bigint_mul(mul, b256);
+        i = i + 1;
+    }
+    return num;
+}
+
+/// Poly1305 tag of `msg` under 32-byte one-time key (r||s).
+pub fn poly1305_tag(msg: Vec, key: Vec) -> Vec {
+    var p: BigInt = poly_p();
+    // clamp r bytes per RFC 8439: r[3],r[7],r[11],r[15] &= 15;
+    // r[4],r[8],r[12] &= 252
+    var rk: Vec = Vec::new();
+    var ci: i64 = 0;
+    while ci < 16 {
+        var b: i64 = key.get(ci) & 255;
+        if ci == 3 || ci == 7 || ci == 11 || ci == 15 { b = b & 15; }
+        if ci == 4 || ci == 8 || ci == 12 { b = b & 252; }
+        rk.push(b);
+        ci = ci + 1;
+    }
+    var rnum: BigInt = poly_bignum(rk, 0, 16, false);
+    var sacc: BigInt = bigint_zero();
+    var i: i64 = 0;
+    while i < msg.len() {
+        var n: i64 = msg.len() - i;
+        if n > 16 { n = 16; }
+        var block: BigInt = poly_bignum(msg, i, n, true);
+        sacc = bigint_mod(bigint_mul(bigint_add(sacc, block), rnum), p);
+        i = i + n;
+    }
+    // tag = (acc + s) mod 2^128 — add s little-endian
+    var s: BigInt = poly_bignum(key, 16, 16, false);
+    var m128: BigInt = bigint_pow(bigint_from_i64(2), 128);
+    var tag: BigInt = bigint_mod(bigint_add(sacc, s), m128);
+    // serialize little-endian 16 bytes
+    var out: Vec = Vec::new();
+    var b256v: BigInt = bigint_from_i64(256);
+    i = 0;
+    while i < 16 {
+        var dm: BigDiv = bigint_divmod(tag, b256v);
+        out.push(dm.r.limbs.get(0));
+        tag = dm.q;
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── ChaCha20-Poly1305 AEAD (RFC 8439 §2.8) ─────────────────────────────
+
+fn aead_pad16(v: Vec) -> Vec {
+    var out: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() { out.push(v.get(i)); i = i + 1; }
+    while (out.len() % 16) != 0 { out.push(0); }
+    return out;
+}
+
+fn aead_le64(v: i64) -> Vec {
+    var out: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < 8 { out.push((v >> (i * 8)) & 255); i = i + 1; }
+    return out;
+}
+
+fn aead_mac(aad: Vec, ct: Vec, otk: Vec) -> Vec {
+    var mac: Vec = Vec::new();
+    var pa: Vec = aead_pad16(aad);
+    var pc: Vec = aead_pad16(ct);
+    var i: i64 = 0;
+    while i < pa.len() { mac.push(pa.get(i)); i = i + 1; }
+    i = 0;
+    while i < pc.len() { mac.push(pc.get(i)); i = i + 1; }
+    var l1: Vec = aead_le64(aad.len());
+    var l2: Vec = aead_le64(ct.len());
+    i = 0;
+    while i < 8 { mac.push(l1.get(i)); mac.push(l2.get(i)); i = i + 1; }
+    return poly1305_tag(mac, otk);
+}
+
+/// AEAD encrypt: returns Vec { ciphertext || 16-byte tag }.
+pub fn chacha20poly_encrypt(key: Vec, nonce: Vec, aad: Vec, pt: Vec) -> Vec {
+    var ks0: Vec = chacha20_block(key, nonce, 0);
+    var otk: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < 32 { otk.push(ks0.get(i)); i = i + 1; }
+    var ct: Vec = chacha20_encrypt(key, nonce, 1, pt);
+    var tag: Vec = aead_mac(aad, ct, otk);
+    i = 0;
+    while i < tag.len() { ct.push(tag.get(i)); i = i + 1; }
+    return ct;
+}
+
+/// AEAD decrypt: returns plaintext Vec, or empty on tag mismatch.
+pub fn chacha20poly_decrypt(key: Vec, nonce: Vec, aad: Vec, cttag: Vec) -> Vec {
+    var out: Vec = Vec::new();
+    if cttag.len() < 16 { return out; }
+    var ct: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < cttag.len() - 16 { ct.push(cttag.get(i)); i = i + 1; }
+    var tag: Vec = Vec::new();
+    i = cttag.len() - 16;
+    while i < cttag.len() { tag.push(cttag.get(i)); i = i + 1; }
+    var ks0: Vec = chacha20_block(key, nonce, 0);
+    var otk: Vec = Vec::new();
+    i = 0;
+    while i < 32 { otk.push(ks0.get(i)); i = i + 1; }
+    var expect: Vec = aead_mac(aad, ct, otk);
+    var diff: i64 = 0;
+    i = 0;
+    while i < 16 { diff = diff | (expect.get(i) ^ tag.get(i)); i = i + 1; }
+    if diff != 0 { return out; }
+    return chacha20_encrypt(key, nonce, 1, ct);
+}
+
+// ─── HKDF-SHA256 (RFC 5869) ─────────────────────────────────────────────
+
+fn vec_str_bytes(s: str) -> Vec {
+    var b: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(s) { b.push(str_byte_at(s, i)); i = i + 1; }
+    return b;
+}
+
+// HMAC-SHA256 over raw byte Vecs (crypto_hmac_sha256 takes str).
+fn hmac_bytes(key: Vec, msg: Vec) -> Vec {
+    var kb: Vec = Vec::new();
+    if key.len() > 64 {
+        var kh: Vec = crypto_sha256_bytes(key);
+        var i: i64 = 0;
+        while i < 32 { kb.push(kh.get(i)); i = i + 1; }
+    } else {
+        var i2: i64 = 0;
+        while i2 < key.len() { kb.push(key.get(i2)); i2 = i2 + 1; }
+    }
+    while kb.len() < 64 { kb.push(0); }
+    var inner: Vec = Vec::new();
+    var j: i64 = 0;
+    while j < 64 { inner.push(kb.get(j) ^ 0x36); j = j + 1; }
+    j = 0;
+    while j < msg.len() { inner.push(msg.get(j)); j = j + 1; }
+    var ih: Vec = crypto_sha256_bytes(inner);
+    var outer: Vec = Vec::new();
+    j = 0;
+    while j < 64 { outer.push(kb.get(j) ^ 0x5C); j = j + 1; }
+    j = 0;
+    while j < ih.len() { outer.push(ih.get(j)); j = j + 1; }
+    return crypto_sha256_bytes(outer);
+}
+
+/// HKDF-Extract(salt, ikm) → 32-byte PRK.
+pub fn hkdf_extract(salt: Vec, ikm: Vec) -> Vec {
+    var s: Vec = salt;
+    if s.len() == 0 {
+        s = Vec::new();
+        var i: i64 = 0;
+        while i < 32 { s.push(0); i = i + 1; }
+    }
+    return hmac_bytes(s, ikm);
+}
+
+/// HKDF-Expand(prk, info, L) → L bytes of keying material.
+pub fn hkdf_expand(prk: Vec, info: Vec, len: i64) -> Vec {
+    var out: Vec = Vec::new();
+    var t: Vec = Vec::new();
+    var c: i64 = 1;
+    while out.len() < len {
+        var msg: Vec = Vec::new();
+        var i: i64 = 0;
+        while i < t.len() { msg.push(t.get(i)); i = i + 1; }
+        i = 0;
+        while i < info.len() { msg.push(info.get(i)); i = i + 1; }
+        msg.push(c);
+        t = hmac_bytes(prk, msg);
+        i = 0;
+        while i < t.len() && out.len() < len {
+            out.push(t.get(i));
+            i = i + 1;
+        }
+        c = c + 1;
+    }
+    return out;
+}
+
+/// TLS 1.3 HKDF-Expand-Label(secret, label, context, len).
+pub fn hkdf_expand_label(secret: Vec, label: str, context: Vec, len: i64) -> Vec {
+    var info: Vec = Vec::new();
+    info.push((len >> 8) & 255); info.push(len & 255);
+    var full: str = "tls13 " + label;
+    info.push(str_len(full));
+    var i: i64 = 0;
+    while i < str_len(full) { info.push(str_byte_at(full, i)); i = i + 1; }
+    info.push(context.len());
+    i = 0;
+    while i < context.len() { info.push(context.get(i)); i = i + 1; }
+    return hkdf_expand(secret, info, len);
+}
+
+// ─── X25519 (RFC 7748 Montgomery ladder over GF(2^255-19)) ──────────────
+
+fn x_p() -> BigInt {
+    return bigint_sub(bigint_pow(bigint_from_i64(2), 255), bigint_from_i64(19));
+}
+
+fn x_a24() -> BigInt { return bigint_from_i64(121665); }
+
+fn x_sub(a: BigInt, b: BigInt) -> BigInt {
+    var d: BigInt = bigint_sub(a, b);
+    var p: BigInt = x_p();
+    var m: BigDiv = bigint_divmod(d, p);
+    if m.r.neg { return bigint_add(m.r, p); }
+    return m.r;
+}
+
+fn x_mul(a: BigInt, b: BigInt) -> BigInt {
+    return bigint_mod(bigint_mul(a, b), x_p());
+}
+
+fn x_add(a: BigInt, b: BigInt) -> BigInt {
+    return bigint_mod(bigint_add(a, b), x_p());
+}
+
+fn x_inv(a: BigInt) -> BigInt {
+    // a^(p-2) mod p
+    var e: BigInt = bigint_sub(x_p(), bigint_from_i64(2));
+    return bigint_modpow(a, e, x_p());
+}
+
+/// X25519: scalar(32B, clamped internally) × point(32B) → 32B shared.
+/// `scalar` and `point` are little-endian Vec<i64> of 32 bytes.
+pub fn x25519(scalar: Vec, point: Vec) -> Vec {
+    var p: BigInt = x_p();
+    // clamp scalar per RFC 7748
+    var k: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < 32 { k.push(scalar.get(i) & 255); i = i + 1; }
+    k.set(0, k.get(0) & 248);
+    k.set(31, (k.get(31) & 127) | 64);
+    // u-coordinate
+    var u: BigInt = bigint_zero();
+    var mul: BigInt = bigint_one();
+    var b256: BigInt = bigint_from_i64(256);
+    i = 0;
+    while i < 32 {
+        u = bigint_add(u, bigint_mul(mul, bigint_from_i64(point.get(i) & 255)));
+        mul = bigint_mul(mul, b256);
+        i = i + 1;
+    }
+    u = bigint_mod(u, p);
+    // scalar bits (little-endian)
+    var x1: BigInt = u;
+    var x2: BigInt = bigint_one();
+    var z2: BigInt = bigint_zero();
+    var x3: BigInt = u;
+    var z3: BigInt = bigint_one();
+    var swap: i64 = 0;
+    var t: i64 = 254;
+    while t >= 0 {
+        var kbyte: i64 = k.get(t / 8);
+        var kt: i64 = (kbyte >> (t % 8)) & 1;
+        swap = swap ^ kt;
+        if swap == 1 {
+            var tx2: BigInt = x2; x2 = x3; x3 = tx2;
+            var tz2: BigInt = z2; z2 = z3; z3 = tz2;
+        }
+        swap = kt;
+        var a: BigInt = x_add(x2, z2);
+        var aa: BigInt = x_mul(a, a);
+        var b: BigInt = x_sub(x2, z2);
+        var bb: BigInt = x_mul(b, b);
+        var e2: BigInt = x_sub(aa, bb);
+        var c: BigInt = x_add(x3, z3);
+        var d: BigInt = x_sub(x3, z3);
+        var da: BigInt = x_mul(d, a);
+        var cb: BigInt = x_mul(c, b);
+        var dac: BigInt = x_add(da, cb);
+        var dsc: BigInt = x_sub(da, cb);
+        x3 = x_mul(dac, dac);
+        z3 = x_mul(x1, x_mul(dsc, dsc));
+        x2 = x_mul(aa, bb);
+        z2 = x_mul(e2, x_add(aa, x_mul(x_a24(), e2)));
+        t = t - 1;
+    }
+    if swap == 1 {
+        var tx2b: BigInt = x2; x2 = x3; x3 = tx2b;
+        var tz2b: BigInt = z2; z2 = z3; z3 = tz2b;
+    }
+    var result: BigInt = x_mul(x2, x_inv(z2));
+    // serialize little-endian 32 bytes
+    var out: Vec = Vec::new();
+    var b256v: BigInt = bigint_from_i64(256);
+    i = 0;
+    while i < 32 {
+        var dm: BigDiv = bigint_divmod(result, b256v);
+        out.push(dm.r.limbs.get(0));
+        result = dm.q;
+        i = i + 1;
+    }
+    return out;
+}

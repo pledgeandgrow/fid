@@ -1,0 +1,148 @@
+// Fides Memory Map standard library
+//
+// Memory-mapped files and anonymous mappings via the p_mmap_* runtime
+// builtins (MapViewOfFile/VirtualAlloc on Windows, mmap on POSIX).
+// Byte access goes through the p_volatile_load8/store8 builtins.
+//
+// Usage:
+//   use mmap;
+//   val m = mmap_file("data.bin");
+//   if mmap_ok(m) {
+//       println(mmap_get(m, 0));            // first byte
+//       println(mmap_slice(m, 0, 8));
+//       mmap_set(m, 0, 65);                 // write 'A'
+//       mmap_flush(m);
+//   }
+//   mmap_close(&mut m);
+
+module mmap;
+
+use vec;
+use string;
+use fs;
+
+// ─── Mapping handle ─────────────────────────────────────────────────────
+
+/// A memory mapping. `addr` 0 = invalid/failed.
+pub struct Mmap {
+    pub addr: i64,
+    pub len: i64,
+}
+
+/// Map `path` read/write (falls back to read-only if write access is
+/// denied). Returns Mmap with addr 0 on failure.
+pub fn mmap_file(path: str) -> Mmap {
+    var a: i64 = p_mmap_file(path);
+    return Mmap { addr: a, len: p_mmap_len(a) };
+}
+
+/// Map `path` read/write, creating it with `size` bytes when missing
+/// or empty (grows the file first so the mapping succeeds).
+pub fn mmap_file_create(path: str, size: i64) -> Mmap {
+    var a: i64 = p_mmap_file(path);
+    if a == 0 {
+        // create + size the file, then map
+        var zeroes: Vec = Vec::new();
+        var i: i64 = 0;
+        while i < size { zeroes.push(0); i = i + 1; }
+        fs_write_bytes(path, zeroes);
+        a = p_mmap_file(path);
+    }
+    return Mmap { addr: a, len: p_mmap_len(a) };
+}
+
+/// Anonymous private mapping of `len` bytes (zero-initialized).
+pub fn mmap_anon(len: i64) -> Mmap {
+    var a: i64 = p_mmap_anon(len);
+    return Mmap { addr: a, len: p_mmap_len(a) };
+}
+
+/// True when the mapping is valid.
+pub fn mmap_ok(m: Mmap) -> bool { return m.addr != 0; }
+
+/// Unmap. The handle is left invalid (addr = 0).
+pub fn mmap_close(m: &mut Mmap) -> void {
+    if m.addr != 0 { p_munmap(m.addr); m.addr = 0; m.len = 0; }
+}
+
+/// Flush modified pages to the file (msync/FlushViewOfFile).
+pub fn mmap_flush(m: Mmap) -> i64 {
+    return p_msync(m.addr);
+}
+
+// ─── Access ─────────────────────────────────────────────────────────────
+
+/// Read byte at `off` (0 when out of range).
+pub fn mmap_get(m: Mmap, off: i64) -> i64 {
+    if off < 0 || off >= m.len { return 0; }
+    return p_volatile_load8(m.addr + off);
+}
+
+/// Write byte at `off` (no-op when out of range).
+pub fn mmap_set(m: Mmap, off: i64, val: i64) -> void {
+    if off < 0 || off >= m.len { return; }
+    p_volatile_store8(m.addr + off, val & 255);
+}
+
+/// Read `len` bytes at `off` as a Vec.
+pub fn mmap_read(m: Mmap, off: i64, len: i64) -> Vec {
+    var out: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < len && off + i < m.len {
+        out.push(p_volatile_load8(m.addr + off + i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Write a Vec of bytes at `off`; returns bytes written.
+pub fn mmap_write(m: Mmap, off: i64, data: Vec) -> i64 {
+    var i: i64 = 0;
+    while i < data.len() && off + i < m.len {
+        p_volatile_store8(m.addr + off + i, data.get(i) & 255);
+        i = i + 1;
+    }
+    return i;
+}
+
+/// Read bytes at `off` as a string.
+pub fn mmap_slice(m: Mmap, off: i64, len: i64) -> str {
+    return str_from_bytes(mmap_read(m, off, len));
+}
+
+/// Write a string's bytes at `off`; returns bytes written.
+pub fn mmap_write_str(m: Mmap, off: i64, s: str) -> i64 {
+    var b: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(s) { b.push(str_byte_at(s, i)); i = i + 1; }
+    return mmap_write(m, off, b);
+}
+
+// Little-endian scalar helpers.
+pub fn mmap_get_u32(m: Mmap, off: i64) -> i64 {
+    return mmap_get(m, off) | (mmap_get(m, off + 1) << 8) |
+           (mmap_get(m, off + 2) << 16) | (mmap_get(m, off + 3) << 24);
+}
+
+pub fn mmap_set_u32(m: Mmap, off: i64, v: i64) -> void {
+    mmap_set(m, off, v); mmap_set(m, off + 1, v >> 8);
+    mmap_set(m, off + 2, v >> 16); mmap_set(m, off + 3, v >> 24);
+}
+
+pub fn mmap_get_u64(m: Mmap, off: i64) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 7;
+    while i >= 0 {
+        v = (v << 8) | mmap_get(m, off + i);
+        i = i - 1;
+    }
+    return v;
+}
+
+pub fn mmap_set_u64(m: Mmap, off: i64, v: i64) -> void {
+    var i: i64 = 0;
+    while i < 8 {
+        mmap_set(m, off + i, v >> (i * 8));
+        i = i + 1;
+    }
+}

@@ -38,7 +38,7 @@ case "${CC_CMD[*]}" in
 esac
 LIBS=()
 EXE=""
-case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) LIBS=(-lws2_32); EXE=".exe" ;; *) LIBS=(-lm -lpthread) ;; esac
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) LIBS=(-lws2_32); EXE=".exe" ;; *) LIBS=(-lm -lpthread); case "${CC_CMD[*]}${CC:-}" in *zig*) LIBS+=(-lunwind) ;; esac ;; esac
 
 # Rename main and run it on a thread with a 256MB stack.
 wrap() {

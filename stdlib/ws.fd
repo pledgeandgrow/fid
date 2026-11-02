@@ -1,0 +1,403 @@
+// Fides WebSocket standard library
+//
+// RFC 6455 WebSocket client/server over the runtime socket builtins
+// (p_net_connect, p_socket_listen/accept/read/write). Includes the
+// HTTP Upgrade handshake (SHA-1 + base64 accept key, both implemented
+// here), frame encode/decode with client masking, ping/pong, and close.
+//
+// LIMITATIONS: no wss:// (needs TLS), no fragmentation reassembly
+// beyond simple continuation accumulation, no permessage-deflate.
+//
+// Usage (client):
+//   use ws;
+//   val c = ws_connect("echo.server", 80, "/");
+//   if ws_ok(c) {
+//       ws_send_text(c, "hello");
+//       println(ws_recv(c).text);
+//       ws_close(c);
+//   }
+
+module ws;
+
+use vec;
+use string;
+use encoding;
+use random;
+use dns;
+
+// ─── SHA-1 (RFC 3174) — needed only for the handshake ───────────────────
+
+fn sha1_rol(x: i64, n: i64) -> i64 {
+    var v: i64 = x & 0xFFFFFFFF;
+    var l: i64 = (v << n) & 0xFFFFFFFF;
+    return l | (v >> (32 - n));
+}
+
+/// SHA-1 of a byte Vec → 20-byte Vec.
+pub fn ws_sha1(bytes: Vec) -> Vec {
+    var h0: i64 = 0x67452301;
+    var h1: i64 = 0xEFCDAB89;
+    var h2: i64 = 0x98BADCFE;
+    var h3: i64 = 0x10325476;
+    var h4: i64 = 0xC3D2E1F0;
+
+    // Pad message.
+    var msg: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < bytes.len() { msg.push(bytes.get(i) & 255); i = i + 1; }
+    var bitlen: i64 = bytes.len() * 8;
+    msg.push(128);
+    while (msg.len() % 64) != 56 { msg.push(0); }
+    var k: i64 = 7;
+    while k >= 0 {
+        msg.push((bitlen >> (k * 8)) & 255);
+        k = k - 1;
+    }
+
+    var w: Vec = Vec::new();
+    var wi: i64 = 0;
+    while wi < 80 { w.push(0); wi = wi + 1; }
+
+    var chunk: i64 = 0;
+    while chunk < msg.len() {
+        var t: i64 = 0;
+        while t < 16 {
+            w.set(t, (msg.get(chunk + t * 4) << 24) |
+                     (msg.get(chunk + t * 4 + 1) << 16) |
+                     (msg.get(chunk + t * 4 + 2) << 8) |
+                     msg.get(chunk + t * 4 + 3));
+            t = t + 1;
+        }
+        t = 16;
+        while t < 80 {
+            w.set(t, sha1_rol(w.get(t - 3) ^ w.get(t - 8) ^
+                              w.get(t - 14) ^ w.get(t - 16), 1));
+            t = t + 1;
+        }
+        var a: i64 = h0; var b: i64 = h1; var c: i64 = h2;
+        var d: i64 = h3; var e: i64 = h4;
+        t = 0;
+        while t < 80 {
+            var f: i64 = 0;
+            var kk: i64 = 0;
+            if t < 20 {
+                f = (b & c) | ((~b & 0xFFFFFFFF) & d);
+                kk = 0x5A827999;
+            } else if t < 40 {
+                f = b ^ c ^ d;
+                kk = 0x6ED9EBA1;
+            } else if t < 60 {
+                f = (b & c) | (b & d) | (c & d);
+                kk = 0x8F1BBCDC;
+            } else {
+                f = b ^ c ^ d;
+                kk = 0xCA62C1D6;
+            }
+            var tmp: i64 = (sha1_rol(a, 5) + f + e + kk + w.get(t)) & 0xFFFFFFFF;
+            e = d; d = c; c = sha1_rol(b, 30); b = a; a = tmp;
+            t = t + 1;
+        }
+        h0 = (h0 + a) & 0xFFFFFFFF;
+        h1 = (h1 + b) & 0xFFFFFFFF;
+        h2 = (h2 + c) & 0xFFFFFFFF;
+        h3 = (h3 + d) & 0xFFFFFFFF;
+        h4 = (h4 + e) & 0xFFFFFFFF;
+        chunk = chunk + 64;
+    }
+
+    var out: Vec = Vec::new();
+    var hs: Vec = Vec::new();
+    hs.push(h0); hs.push(h1); hs.push(h2); hs.push(h3); hs.push(h4);
+    var j: i64 = 0;
+    while j < 5 {
+        var v: i64 = hs.get(j);
+        out.push((v >> 24) & 255); out.push((v >> 16) & 255);
+        out.push((v >> 8) & 255); out.push(v & 255);
+        j = j + 1;
+    }
+    return out;
+}
+
+// ─── Connection model ───────────────────────────────────────────────────
+
+/// A WebSocket connection. `fd` < 0 means handshake/connect failed.
+pub struct WsConn {
+    pub fd: i64,
+    pub is_client: bool,
+    pub open: bool,
+}
+
+/// A received frame/message.
+pub struct WsFrame {
+    pub opcode: i64,        // 1 text, 2 binary, 8 close, 9 ping, 10 pong
+    pub text: str,          // text payload (utf8, possibly lossy)
+    pub bytes: Vec,         // raw payload bytes
+    pub fin: bool,
+}
+
+pub fn ws_ok(c: WsConn) -> bool { return c.fd >= 0 && c.open; }
+
+// ─── Handshake ──────────────────────────────────────────────────────────
+
+/// The RFC 6455 accept key for a given Sec-WebSocket-Key.
+pub fn ws_accept_key(key: str) -> str {
+    var magic: str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    var bytes: Vec = Vec::new();
+    var s: str = key + magic;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        bytes.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+    return b64_encode_bytes(ws_sha1(bytes));
+}
+
+fn ws_gen_key() -> str {
+    var b: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < 16 { b.push(random_int_range(0, 255)); i = i + 1; }
+    return b64_encode_bytes(b);
+}
+
+// Read until \r\n\r\n (headers end) or socket EOF; returns raw text.
+fn ws_read_headers(fd: i64) -> str {
+    var out: str = "";
+    var buf: i64 = p_malloc(4096);
+    var grd: i64 = 0;
+    while grd < 200 {
+        var n: i64 = p_socket_read(fd, buf, 4096);
+        if n <= 0 { break; }
+        var bytes: Vec = Vec::new();
+        var i: i64 = 0;
+        while i < n { bytes.push(p_volatile_load8(buf + i)); i = i + 1; }
+        out = out + str_from_bytes(bytes);
+        if str_contains(out, "\r\n\r\n") { break; }
+        grd = grd + 1;
+    }
+    p_free(buf);
+    return out;
+}
+
+/// Client-side connect: TCP + Upgrade handshake.
+/// `host` may be a hostname or IP. Returns WsConn with fd<0 on failure.
+pub fn ws_connect(host: str, port: i64, path: str) -> WsConn {
+    var fail: WsConn = WsConn { fd: -1, is_client: true, open: false };
+    var ip: str = dns_lookup(host);
+    if str_len(ip) == 0 { return fail; }
+    var fd: i64 = p_net_connect(ip, port);
+    if fd < 0 { return fail; }
+    var key: str = ws_gen_key();
+    var req: str = "GET " + path + " HTTP/1.1\r\n" +
+                   "Host: " + host + "\r\n" +
+                   "Upgrade: websocket\r\n" +
+                   "Connection: Upgrade\r\n" +
+                   "Sec-WebSocket-Key: " + key + "\r\n" +
+                   "Sec-WebSocket-Version: 13\r\n\r\n";
+    p_socket_write_str(fd, req);
+    var resp: str = ws_read_headers(fd);
+    if !str_contains(resp, "101") ||
+       !str_contains(str_to_lower(resp), "sec-websocket-accept") {
+        p_socket_close(fd);
+        return fail;
+    }
+    return WsConn { fd: fd, is_client: true, open: true };
+}
+
+/// Server-side accept: given an accepted socket fd and the client's
+/// HTTP request text (read by the caller), validate the Upgrade and
+/// send the 101 response. Returns WsConn with fd<0 on failure.
+pub fn ws_accept(fd: i64, request: str) -> WsConn {
+    var fail: WsConn = WsConn { fd: -1, is_client: false, open: false };
+    var low: str = str_to_lower(request);
+    if !str_contains(low, "upgrade: websocket") { return fail; }
+    // find Sec-WebSocket-Key header
+    var lines: Vec<str> = str_lines(request);
+    var key: str = "";
+    var i: i64 = 0;
+    while i < lines.len() {
+        var l: str = str_trim(lines.get(i));
+        if str_starts_with(str_to_lower(l), "sec-websocket-key:") {
+            key = str_trim(str_slice(l, 18, str_len(l)));
+        }
+        i = i + 1;
+    }
+    if str_len(key) == 0 { return fail; }
+    var resp: str = "HTTP/1.1 101 Switching Protocols\r\n" +
+                    "Upgrade: websocket\r\n" +
+                    "Connection: Upgrade\r\n" +
+                    "Sec-WebSocket-Accept: " + ws_accept_key(key) + "\r\n\r\n";
+    p_socket_write_str(fd, resp);
+    return WsConn { fd: fd, is_client: false, open: true };
+}
+
+// ─── Framing ────────────────────────────────────────────────────────────
+
+fn ws_push_u16(v: Vec, x: i64) -> void {
+    v.push((x >> 8) & 255); v.push(x & 255);
+}
+
+fn ws_push_u64(v: Vec, x: i64) -> void {
+    var s: i64 = 7;
+    while s >= 0 { v.push((x >> (s * 8)) & 255); s = s - 1; }
+}
+
+/// Encode a frame. Clients must mask (RFC 6455 §5.3); servers must not.
+pub fn ws_frame_encode(opcode: i64, payload: Vec, mask: bool) -> Vec {
+    var f: Vec = Vec::new();
+    f.push(128 | opcode);                            // FIN=1
+    var len: i64 = payload.len();
+    var mbit: i64 = 0;
+    if mask { mbit = 128; }
+    if len < 126 {
+        f.push(mbit | len);
+    } else if len <= 65535 {
+        f.push(mbit | 126);
+        ws_push_u16(f, len);
+    } else {
+        f.push(mbit | 127);
+        ws_push_u64(f, len);
+    }
+    var maskkey: Vec = Vec::new();
+    if mask {
+        var i: i64 = 0;
+        while i < 4 { maskkey.push(random_int_range(0, 255)); i = i + 1; }
+        i = 0;
+        while i < 4 { f.push(maskkey.get(i)); i = i + 1; }
+    }
+    var j: i64 = 0;
+    while j < len {
+        var b: i64 = payload.get(j) & 255;
+        if mask { b = b ^ maskkey.get(j % 4); }
+        f.push(b);
+        j = j + 1;
+    }
+    return f;
+}
+
+fn ws_write_bytes(fd: i64, data: Vec) -> i64 {
+    var buf: i64 = p_malloc(data.len() + 4);
+    var i: i64 = 0;
+    while i < data.len() {
+        p_volatile_store8(buf + i, data.get(i));
+        i = i + 1;
+    }
+    var n: i64 = p_socket_write(fd, buf, data.len());
+    p_free(buf);
+    return n;
+}
+
+// Read exactly n bytes (may block); returns Vec (possibly short on EOF).
+fn ws_read_n(fd: i64, n: i64) -> Vec {
+    var out: Vec = Vec::new();
+    var buf: i64 = p_malloc(n + 4);
+    var got: i64 = 0;
+    var grd: i64 = 0;
+    while got < n && grd < 1000 {
+        var r: i64 = p_socket_read(fd, buf + got, n - got);
+        if r <= 0 { break; }
+        got = got + r;
+        grd = grd + 1;
+    }
+    var i: i64 = 0;
+    while i < got { out.push(p_volatile_load8(buf + i)); i = i + 1; }
+    p_free(buf);
+    return out;
+}
+
+/// Receive one frame; opcode -1 on connection failure/close.
+/// Continuation frames are accumulated so a fragmented message
+/// arrives as one WsFrame.
+pub fn ws_recv(c: WsConn) -> WsFrame {
+    var dead: WsFrame = WsFrame { opcode: -1, text: "", bytes: Vec::new(), fin: true };
+    if c.fd < 0 { return dead; }
+    var acc: Vec = Vec::new();
+    var first_op: i64 = -1;
+    var fin: bool = false;
+    var grd: i64 = 0;
+    while !fin && grd < 100 {
+        var hdr: Vec = ws_read_n(c.fd, 2);
+        if hdr.len() < 2 { return dead; }
+        var b0: i64 = hdr.get(0);
+        var b1: i64 = hdr.get(1);
+        fin = (b0 & 128) != 0;
+        var op: i64 = b0 & 15;
+        var masked: bool = (b1 & 128) != 0;
+        var len: i64 = b1 & 127;
+        if len == 126 {
+            var e2: Vec = ws_read_n(c.fd, 2);
+            if e2.len() < 2 { return dead; }
+            len = (e2.get(0) << 8) | e2.get(1);
+        } else if len == 127 {
+            var e8: Vec = ws_read_n(c.fd, 8);
+            if e8.len() < 8 { return dead; }
+            len = 0;
+            var q: i64 = 0;
+            while q < 8 { len = (len << 8) | e8.get(q); q = q + 1; }
+        }
+        var maskkey: Vec = Vec::new();
+        if masked { maskkey = ws_read_n(c.fd, 4); }
+        var payload: Vec = ws_read_n(c.fd, len);
+        if payload.len() < len { return dead; }
+        if masked {
+            var m: i64 = 0;
+            while m < payload.len() {
+                payload.set(m, payload.get(m) ^ maskkey.get(m % 4));
+                m = m + 1;
+            }
+        }
+        if op == 0 {
+            // continuation
+            var ci: i64 = 0;
+            while ci < payload.len() { acc.push(payload.get(ci)); ci = ci + 1; }
+        } else {
+            first_op = op;
+            var pj: i64 = 0;
+            while pj < payload.len() { acc.push(payload.get(pj)); pj = pj + 1; }
+            // control frames can't be fragmented; return immediately
+            if op >= 8 {
+                return WsFrame { opcode: op, text: str_from_bytes(acc),
+                                 bytes: acc, fin: true };
+            }
+        }
+        grd = grd + 1;
+    }
+    return WsFrame { opcode: first_op, text: str_from_bytes(acc),
+                     bytes: acc, fin: fin };
+}
+
+// ─── Send / close ───────────────────────────────────────────────────────
+
+fn ws_str_bytes(s: str) -> Vec {
+    var out: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(s) { out.push(str_byte_at(s, i)); i = i + 1; }
+    return out;
+}
+
+/// Send a text message.
+pub fn ws_send_text(c: WsConn, text: str) -> i64 {
+    return ws_write_bytes(c.fd, ws_frame_encode(1, ws_str_bytes(text), c.is_client));
+}
+
+/// Send a binary message.
+pub fn ws_send_binary(c: WsConn, data: Vec) -> i64 {
+    return ws_write_bytes(c.fd, ws_frame_encode(2, data, c.is_client));
+}
+
+/// Send a ping.
+pub fn ws_send_ping(c: WsConn, text: str) -> i64 {
+    return ws_write_bytes(c.fd, ws_frame_encode(9, ws_str_bytes(text), c.is_client));
+}
+
+/// Reply to a ping (callers handle it automatically in ws_recv_loop).
+pub fn ws_send_pong(c: WsConn, payload: Vec) -> i64 {
+    return ws_write_bytes(c.fd, ws_frame_encode(10, payload, c.is_client));
+}
+
+/// Close handshake + socket close.
+pub fn ws_close(c: WsConn) -> void {
+    if c.fd >= 0 {
+        ws_write_bytes(c.fd, ws_frame_encode(8, Vec::new(), c.is_client));
+        p_socket_close(c.fd);
+    }
+}

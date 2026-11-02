@@ -1,0 +1,255 @@
+// Fides INI standard library
+//
+// INI file parsing and serialization in pure Fides.
+// Supports [sections], key = value pairs, ; and # comments,
+// quoted values, and keys in a global (section-less) scope.
+//
+// Usage:
+//   use ini;
+//   val doc = ini_parse("[server]\nport = 8080\nhost = \"x\"");
+//   println(ini_get(doc, "server", "port"));        // "8080"
+//   println(ini_get_int(doc, "server", "port", 0)); // 8080
+
+module ini;
+
+use vec;
+use string;
+
+// ─── Document model ─────────────────────────────────────────────────────
+// A document is a flat Vec<IniEntry> preserving file order. The section ""
+// holds global (pre-section) keys.
+
+/// One key = value line inside a section.
+pub struct IniEntry {
+    pub section: str,
+    pub key: str,
+    pub value: str,
+}
+
+// ─── Parsing ────────────────────────────────────────────────────────────
+
+fn ini_is_space(c: i64) -> bool { return c == 32 || c == 9; }
+
+fn ini_strip_quotes(s: str) -> str {
+    var n: i64 = str_len(s);
+    if n >= 2 {
+        var a: i64 = str_byte_at(s, 0);
+        var b: i64 = str_byte_at(s, n - 1);
+        if (a == 34 && b == 34) || (a == 39 && b == 39) {
+            return str_slice(s, 1, n - 1);
+        }
+    }
+    return s;
+}
+
+// Strip trailing comment: ';' or '#' at line start or after whitespace
+// ends the value, unless inside quotes.
+fn ini_strip_comment(s: str) -> str {
+    var in_q: bool = false;
+    var qc: i64 = 0;
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if in_q {
+            if c == qc { in_q = false; }
+        } else {
+            if c == 34 || c == 39 { in_q = true; qc = c; }
+            else if c == 59 || c == 35 {
+                if i == 0 || ini_is_space(str_byte_at(s, i - 1)) {
+                    return str_slice(s, 0, i);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+/// Parse INI text into a Vec<IniEntry> preserving document order.
+pub fn ini_parse(text: str) -> Vec<IniEntry> {
+    var entries: Vec<IniEntry> = Vec::new();
+    var section: str = "";
+    var lines: Vec<str> = str_lines(text);
+    var i: i64 = 0;
+    while i < lines.len() {
+        var line: str = str_trim(lines.get(i));
+        i = i + 1;
+        if str_len(line) == 0 { continue; }
+        var c0: i64 = str_byte_at(line, 0);
+        if c0 == 59 || c0 == 35 { continue; }              // comment line
+        if c0 == 91 {                                      // '[' — section
+            var close: i64 = str_find(line, "]");
+            if close > 1 {
+                section = str_trim(str_slice(line, 1, close));
+            }
+            continue;
+        }
+        // key = value   (accept '=' or ':' separators)
+        var eq: i64 = str_find(line, "=");
+        var colon: i64 = str_find(line, ":");
+        var sep: i64 = eq;
+        if sep < 0 || (colon >= 0 && colon < sep) { sep = colon; }
+        if sep <= 0 { continue; }                          // junk line
+        var key: str = str_trim(str_slice(line, 0, sep));
+        var val: str = str_trim(ini_strip_comment(str_slice(line, sep + 1, str_len(line))));
+        entries.push(IniEntry {
+            section: section,
+            key: key,
+            value: ini_strip_quotes(val),
+        });
+    }
+    return entries;
+}
+
+// ─── Accessors ──────────────────────────────────────────────────────────
+
+fn ini_eq_key(a: str, b: str) -> bool { return str_equal(a, b); }
+
+fn ini_strs_has(v: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if str_equal(v.get(i), s) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Value for `key` in `section` ("" for global), or "" if absent.
+pub fn ini_get(doc: Vec<IniEntry>, section: str, key: str) -> str {
+    var i: i64 = 0;
+    while i < doc.len() {
+        var e: IniEntry = doc.get(i);
+        if ini_eq_key(e.section, section) && ini_eq_key(e.key, key) {
+            return e.value;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// True if (section, key) exists.
+pub fn ini_has(doc: Vec<IniEntry>, section: str, key: str) -> bool {
+    var i: i64 = 0;
+    while i < doc.len() {
+        var e: IniEntry = doc.get(i);
+        if ini_eq_key(e.section, section) && ini_eq_key(e.key, key) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Value parsed as int; `default` when absent or non-numeric.
+pub fn ini_get_int(doc: Vec<IniEntry>, section: str, key: str, default: i64) -> i64 {
+    var v: str = ini_get(doc, section, key);
+    if str_len(v) == 0 || !str_is_numeric(v) { return default; }
+    return str_parse_int(v);
+}
+
+/// Value parsed as float; `default` when absent or non-numeric.
+pub fn ini_get_float(doc: Vec<IniEntry>, section: str, key: str, default: f64) -> f64 {
+    var v: str = ini_get(doc, section, key);
+    if str_len(v) == 0 { return default; }
+    return str_parse_float(v);
+}
+
+/// Value parsed as bool: true/yes/on/1 (case-insensitive) are true;
+/// false/no/off/0 are false; `default` otherwise or when absent.
+pub fn ini_get_bool(doc: Vec<IniEntry>, section: str, key: str, default: bool) -> bool {
+    var v: str = str_to_lower(str_trim(ini_get(doc, section, key)));
+    if str_equal(v, "true") || str_equal(v, "yes") || str_equal(v, "on") || str_equal(v, "1") {
+        return true;
+    }
+    if str_equal(v, "false") || str_equal(v, "no") || str_equal(v, "off") || str_equal(v, "0") {
+        return false;
+    }
+    return default;
+}
+
+/// List of section names in document order (excluding the global "").
+pub fn ini_sections(doc: Vec<IniEntry>) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < doc.len() {
+        var e: IniEntry = doc.get(i);
+        if str_len(e.section) > 0 && !ini_strs_has(out, e.section) {
+            out.push(e.section);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// All keys inside `section` in document order.
+pub fn ini_keys(doc: Vec<IniEntry>, section: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < doc.len() {
+        var e: IniEntry = doc.get(i);
+        if ini_eq_key(e.section, section) && !ini_strs_has(out, e.key) {
+            out.push(e.key);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Mutation + serialization ───────────────────────────────────────────
+
+/// Set `key` in `section` to `value`; replaces the first existing entry
+/// in-place, appends at the end otherwise.
+pub fn ini_set(doc: &mut Vec<IniEntry>, section: str, key: str, value: str) -> void {
+    var i: i64 = 0;
+    while i < doc.len() {
+        var e: IniEntry = doc.get(i);
+        if ini_eq_key(e.section, section) && ini_eq_key(e.key, key) {
+            doc.set(i, IniEntry { section: section, key: key, value: value });
+            return;
+        }
+        i = i + 1;
+    }
+    doc.push(IniEntry { section: section, key: key, value: value });
+}
+
+fn ini_needs_quotes(v: str) -> bool {
+    if str_len(v) == 0 { return false; }
+    if str_byte_at(v, 0) == 32 || str_byte_at(v, str_len(v) - 1) == 32 { return true; }
+    return str_contains(v, ";") || str_contains(v, "#") ||
+           str_contains(v, "\n") || str_contains(v, "=");
+}
+
+/// Serialize back to INI text. Global keys come first; entries keep the
+/// order they appear in `doc`, grouped under section headers as they occur.
+pub fn ini_serialize(doc: Vec<IniEntry>) -> str {
+    var out: str = "";
+    // Global section first.
+    var i: i64 = 0;
+    while i < doc.len() {
+        var e: IniEntry = doc.get(i);
+        if str_len(e.section) == 0 {
+            var v: str = e.value;
+            if ini_needs_quotes(v) { v = "\"" + v + "\""; }
+            out = out + e.key + " = " + v + "\n";
+        }
+        i = i + 1;
+    }
+    var secs: Vec<str> = ini_sections(doc);
+    var s: i64 = 0;
+    while s < secs.len() {
+        out = out + "\n[" + secs.get(s) + "]\n";
+        var j: i64 = 0;
+        while j < doc.len() {
+            var e2: IniEntry = doc.get(j);
+            if ini_eq_key(e2.section, secs.get(s)) {
+                var v2: str = e2.value;
+                if ini_needs_quotes(v2) { v2 = "\"" + v2 + "\""; }
+                out = out + e2.key + " = " + v2 + "\n";
+            }
+            j = j + 1;
+        }
+        s = s + 1;
+    }
+    return out;
+}

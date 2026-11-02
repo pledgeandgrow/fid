@@ -1,5 +1,26 @@
 # Fides Language Changelog
 
+## Session 37 — A Faster Compiler, Linux in CI (Nov 2, 2026)
+
+- **Self-compile 4.4 times faster:** `fid` compiles itself in 136 s, down from
+  601 s, with the fixpoint kept. A stack sampler on the stage-3 C showed where:
+  - C programs printed a byte at a time on Windows (`printf` on unbuffered
+    stdout): 31% of the self-compile, and every program that prints a lot. Each
+    print is now one write.
+  - Looking up an instruction by id scanned the function whenever it had
+    parameters (20%): `IrFunction.inst_at` maps ids to instructions.
+  - Functions, strings, default arguments and comptime functions were found by
+    scanning lists by name: now by hash map.
+- **CI green on Windows and Linux:** the suite, the expected failures, `fid`
+  bootstrapping itself on Linux, and the release archive on a clean Ubuntu.
+- **Tasks wake by deadline:** of two expired sleepers, the earlier deadline runs
+  first, on all three runtimes.
+- **StringBuilder** grows in place on every backend and stays usable after
+  `to_str`; `@derive(Serialize)` writes real values; `ota_verify_payload` checks
+  size and SHA-256; `sqlite` gained `query_params`.
+- **Tests:** `fidesc test` runs the capability, effect, region and safety tests too
+  (89 expected failures); baselines refreshed.
+
 ## Session 36 — One Integer Meaning, Sound Builds, a Real Allocator (Nov 1, 2026)
 
 - **Tasks:** `stdlib/task.fd` gives green threads with real stack switching,

@@ -7,9 +7,13 @@
 //   ark remove <name>     Remove a dependency
 //   ark list              List all dependencies
 //   ark lock              Generate ark.lock with resolved versions
-//   ark search <query>    Search for packages (future: registry)
-//   ark publish           Publish to registry (future)
+//   ark search <query>    Search the package index
+//   ark publish           Add this package's tagged version to the index
 //   ark update <name>     Update a dependency (future)
+//
+// The index is a Git repository (ARK_INDEX, or DEFAULT_INDEX) with one file per
+// package, one line per version: `version git-url tag commit`. Versions are
+// never changed once published, and installing checks the commit.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -21,6 +25,7 @@ use std::path::Path;
 const MANIFEST_FILE: &str = "ark.toml";
 const LOCK_FILE: &str = "ark.lock";
 const MODULES_DIR: &str = "ark_modules";
+const DEFAULT_INDEX: &str = "https://github.com/pledgeandgrow/ark-index.git";
 
 #[derive(Debug, Clone)]
 pub struct Manifest {
@@ -504,8 +509,23 @@ pub fn cmd_install(_args: &[String]) -> Result<(), String> {
                 installed += 1;
             }
             Dependency::Registry(version) => {
-                println!("SKIP (registry not yet implemented -- version {})", version);
-                // Future: download from ark.dev registry
+                let index = update_index()?;
+                let entry = index_lookup(&index, name, version)?;
+                clone_git(&entry.git, &dest, Some(format!("--branch {}", entry.tag)))?;
+                let commit = get_git_commit(&dest).unwrap_or_else(|_| "unknown".to_string());
+                if commit != entry.commit {
+                    return Err(format!(
+                        "{} {}: the tag {} is at {}, but the index says {}: refusing to install",
+                        name, entry.version, entry.tag, commit, entry.commit
+                    ));
+                }
+                lock.packages.insert(name.clone(), LockEntry {
+                    source: format!("{}#{}", entry.git, entry.tag),
+                    resolved: commit,
+                    kind: "registry".to_string(),
+                });
+                println!("OK (registry {})", entry.version);
+                installed += 1;
             }
         }
     }
@@ -587,17 +607,124 @@ pub fn cmd_search(args: &[String]) -> Result<(), String> {
     if args.is_empty() {
         return Err("Usage: ark search <query>".to_string());
     }
-    let query = &args[0];
-    println!("Searching for '{}'...", query);
-    println!("Registry search not yet implemented.");
-    println!("Future: search ark.dev registry for packages matching '{}'", query);
+    let query = args[0].to_lowercase();
+    let index = update_index()?;
+    let mut names: Vec<String> = fs::read_dir(&index)
+        .map_err(|e| format!("Cannot read the index: {}", e))?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| !n.starts_with('.') && n.to_lowercase().contains(&query))
+        .collect();
+    names.sort();
+    for name in &names {
+        if let Ok(entry) = index_lookup(&index, name, "") {
+            println!("{} {}  {}", name, entry.version, entry.git);
+        }
+    }
+    if names.is_empty() {
+        println!("No package matches '{}'.", args[0]);
+    }
     Ok(())
 }
 
-pub fn cmd_publish(_args: &[String]) -> Result<(), String> {
-    println!("Publish not yet implemented.");
-    println!("Future: publish current package to ark.dev registry");
+pub fn cmd_publish(args: &[String]) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("Cannot get cwd: {}", e))?;
+    let manifest = Manifest::load(&cwd)?;
+    let name = &manifest.package.name;
+    let version = &manifest.package.version;
+    let tag = format!("v{}", version);
+    let commit = git_output(&cwd, &["rev-parse", &format!("{}^{{commit}}", tag)])
+        .map_err(|_| format!("No tag {}: tag this version before publishing", tag))?;
+    let git = match args.iter().position(|a| a == "--git") {
+        Some(i) => args.get(i + 1).cloned().ok_or("--git needs a URL")?,
+        None => git_output(&cwd, &["remote", "get-url", "origin"])
+            .map_err(|_| "No git remote: pass --git <url>".to_string())?,
+    };
+    let index = update_index()?;
+    let file = index.join(name);
+    let mut lines = fs::read_to_string(&file).unwrap_or_default();
+    if lines.lines().any(|l| l.split(' ').next() == Some(version.as_str())) {
+        return Err(format!("{} {} is already published; versions never change", name, version));
+    }
+    lines.push_str(&format!("{} {} {} {}\n", version, git, tag, commit));
+    fs::write(&file, lines).map_err(|e| format!("Cannot write the index: {}", e))?;
+    git_output(&index, &["add", name])?;
+    git_output(&index, &["commit", "-m", &format!("{} {}", name, version)])?;
+    match git_output(&index, &["push"]) {
+        Ok(_) => println!("Published {} {}.", name, version),
+        Err(e) => println!(
+            "Committed {} {} to the local index at {}, but the push failed: {}\n\
+             Open a pull request against the index with that commit.",
+            name, version, index.display(), e
+        ),
+    }
     Ok(())
+}
+
+struct IndexEntry {
+    version: String,
+    git: String,
+    tag: String,
+    commit: String,
+}
+
+fn git_output(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .map_err(|e| format!("Failed to run git: {}", e))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The local copy of the index, up to date.
+fn update_index() -> Result<std::path::PathBuf, String> {
+    let home = std::env::var("ARK_HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .or_else(|_| std::env::var("HOME"))
+        .map_err(|_| "Set ARK_HOME".to_string())?;
+    let url = std::env::var("ARK_INDEX").unwrap_or_else(|_| DEFAULT_INDEX.to_string());
+    let dir = Path::new(&home).join(".ark").join("index");
+    if dir.join(".git").exists() {
+        // Offline: the copy from the last update still answers
+        if let Err(e) = git_output(&dir, &["pull", "--ff-only", "-q"]) {
+            eprintln!("warning: could not update the index: {}", e);
+        }
+        return Ok(dir);
+    }
+    if let Some(parent) = dir.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Cannot create {}: {}", parent.display(), e))?;
+    }
+    let target = dir.to_string_lossy().to_string();
+    git_output(Path::new(&home), &["clone", "-q", &url, &target])
+        .map_err(|e| format!("Cannot fetch the index from {}: {}", url, e))?;
+    Ok(dir)
+}
+
+/// The newest version of `name` matching `spec`: empty or `*` for any, else an
+/// exact version or a `1.2` prefix.
+fn index_lookup(index: &Path, name: &str, spec: &str) -> Result<IndexEntry, String> {
+    let lines = fs::read_to_string(index.join(name))
+        .map_err(|_| format!("No package '{}' in the index", name))?;
+    let wanted = spec.trim_start_matches(['^', '=', 'v']);
+    let matches = |v: &str| wanted.is_empty() || wanted == "*" || v == wanted
+        || v.starts_with(&format!("{}.", wanted));
+    let parse = |v: &str| v.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect::<Vec<u64>>();
+    lines.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(' ').collect();
+            (f.len() == 4 && matches(f[0])).then(|| IndexEntry {
+                version: f[0].to_string(),
+                git: f[1].to_string(),
+                tag: f[2].to_string(),
+                commit: f[3].to_string(),
+            })
+        })
+        .max_by_key(|e| parse(&e.version))
+        .ok_or_else(|| format!("No version of '{}' matches '{}'", name, spec))
 }
 
 pub fn cmd_update(args: &[String]) -> Result<(), String> {
@@ -636,16 +763,14 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 fn clone_git(url: &str, dest: &Path, extra_args: Option<String>) -> Result<(), String> {
-    let mut cmd = format!("git clone --depth 1");
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["clone", "--depth", "1"]);
     if let Some(extra) = extra_args {
-        cmd.push(' ');
-        cmd.push_str(&extra);
+        cmd.args(extra.split_whitespace());
     }
-    cmd.push_str(&format!(" {} {}", url, dest.display()));
-
-    let result = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&cmd)
+    let result = cmd
+        .arg(url)
+        .arg(dest)
         .output()
         .map_err(|e| format!("Failed to run git: {}", e))?;
 
@@ -690,8 +815,8 @@ pub fn print_help() {
     println!("    list                     List all dependencies");
     println!("    lock                     Generate ark.lock with resolved versions");
     println!("    update [name]            Update dependencies");
-    println!("    search <query>           Search for packages (future)");
-    println!("    publish                  Publish to registry (future)");
+    println!("    search <query>           Search the package index");
+    println!("    publish [--git <url>]    Add the tagged version to the index");
     println!();
     println!("MANIFEST: ark.toml");
     println!("LOCKFILE: ark.lock");

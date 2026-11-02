@@ -1,0 +1,375 @@
+// Fides URL standard library
+//
+// RFC 3986 URL parsing, percent-encoding/decoding, query-string
+// handling, and URL resolution-free joining.
+//
+// Usage:
+//   use url;
+//   val u = url_parse("https://user@host.com:8443/a/b?x=1#frag");
+//   println(u.scheme + "|" + u.host + "|" + u.path);
+//   println(url_query_get(u.query, "x"));
+
+module url;
+
+use vec;
+use string;
+
+// ─── URL struct ─────────────────────────────────────────────────────────
+
+/// A parsed absolute or relative URL. Missing parts are "" (port is -1
+/// when not present; userinfo holds "user" or "user:pass").
+pub struct Url {
+    pub scheme: str,
+    pub userinfo: str,
+    pub host: str,
+    pub port: i64,
+    pub path: str,
+    pub query: str,
+    pub fragment: str,
+}
+
+// ─── Percent encoding ───────────────────────────────────────────────────
+
+fn url_hexdig(n: i64) -> str {
+    var hexd: str = "0123456789ABCDEF";
+    return str_slice(hexd, n, n + 1);
+}
+
+fn url_unhex(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    return -1;
+}
+
+// RFC 3986 unreserved characters pass through; everything else → %XX.
+fn url_is_unreserved(c: i64) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+           (c >= 48 && c <= 57) || c == 45 || c == 46 || c == 95 || c == 126;
+}
+
+/// Percent-encode `s` — only unreserved bytes pass through.
+pub fn url_encode(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if url_is_unreserved(c) {
+            out = out + str_slice(s, i, i + 1);
+        } else {
+            out = out + "%" + url_hexdig((c >> 4) & 15) + url_hexdig(c & 15);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Encode for query/form values — like url_encode but space → '+'.
+pub fn url_encode_form(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if url_is_unreserved(c) {
+            out = out + str_slice(s, i, i + 1);
+        } else if c == 32 {
+            out = out + "+";
+        } else {
+            out = out + "%" + url_hexdig((c >> 4) & 15) + url_hexdig(c & 15);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Percent-decode `s`; '+' stays literal (use url_decode_form for query).
+/// Invalid % sequences are passed through unchanged.
+pub fn url_decode(s: str) -> str {
+    var out: str = "";
+    var bytes: Vec = Vec::new();
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    var pending: bool = false;
+    var plain_start: i64 = 0;
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if c == 37 && i + 2 < n {
+            var h1: i64 = url_unhex(str_byte_at(s, i + 1));
+            var h2: i64 = url_unhex(str_byte_at(s, i + 2));
+            if h1 >= 0 && h2 >= 0 {
+                // flush plain run
+                if pending { out = out + str_from_bytes(bytes); bytes = Vec::new(); pending = false; }
+                if plain_start < i { out = out + str_slice(s, plain_start, i); }
+                bytes.push(h1 * 16 + h2);
+                pending = true;
+                i = i + 3;
+                plain_start = i;
+                continue;
+            }
+        }
+        i = i + 1;
+    }
+    if pending { out = out + str_from_bytes(bytes); }
+    if plain_start < n { out = out + str_slice(s, plain_start, n); }
+    return out;
+}
+
+/// Percent-decode with '+' → ' ' (application/x-www-form-urlencoded).
+pub fn url_decode_form(s: str) -> str {
+    return url_decode(str_replace(s, "+", " "));
+}
+
+// ─── Parsing ────────────────────────────────────────────────────────────
+
+/// Parse a URL string into a Url struct. Lenient: missing components
+/// are left empty; port is -1 when absent or unparseable.
+pub fn url_parse(s: str) -> Url {
+    var u: Url = Url {
+        scheme: "", userinfo: "", host: "", port: -1,
+        path: "", query: "", fragment: "" };
+    var rest: str = s;
+
+    // Fragment
+    var frag: i64 = str_find(rest, "#");
+    if frag >= 0 {
+        u.fragment = url_decode(str_slice(rest, frag + 1, str_len(rest)));
+        rest = str_slice(rest, 0, frag);
+    }
+    // Query
+    var q: i64 = str_find(rest, "?");
+    if q >= 0 {
+        u.query = str_slice(rest, q + 1, str_len(rest));
+        rest = str_slice(rest, 0, q);
+    }
+    // Scheme: letters/digits/+-. ending in ':'
+    var colon: i64 = str_find(rest, ":");
+    if colon > 0 {
+        var cand: str = str_slice(rest, 0, colon);
+        if url_valid_scheme(cand) {
+            u.scheme = str_to_lower(cand);
+            rest = str_slice(rest, colon + 1, str_len(rest));
+        }
+    }
+    // Authority: //...
+    if str_starts_with(rest, "//") {
+        var after_slashes: str = str_slice(rest, 2, str_len(rest));
+        var auth_end: i64 = str_find(after_slashes, "/");
+        var auth: str = "";
+        if auth_end < 0 {
+            auth = after_slashes;
+            rest = "";
+        } else {
+            auth = str_slice(after_slashes, 0, auth_end);
+            rest = str_slice(after_slashes, auth_end, str_len(after_slashes));
+        }
+        // userinfo@host:port
+        var at: i64 = str_rfind(auth, "@");
+        if at >= 0 {
+            u.userinfo = url_decode(str_slice(auth, 0, at));
+            auth = str_slice(auth, at + 1, str_len(auth));
+        }
+        // [ipv6] or host:port
+        if str_starts_with(auth, "[") {
+            var rb: i64 = str_find(auth, "]");
+            if rb >= 0 {
+                u.host = str_slice(auth, 1, rb);
+                var after: str = str_slice(auth, rb + 1, str_len(auth));
+                if str_starts_with(after, ":") {
+                    u.port = str_parse_int(str_slice(after, 1, str_len(after)));
+                }
+            }
+        } else {
+            var pc: i64 = str_rfind(auth, ":");
+            if pc >= 0 {
+                var pstr: str = str_slice(auth, pc + 1, str_len(auth));
+                if str_is_numeric(pstr) || str_len(pstr) == 0 {
+                    u.port = str_parse_int(pstr);
+                    u.host = str_slice(auth, 0, pc);
+                } else {
+                    u.host = auth;
+                }
+            } else {
+                u.host = auth;
+            }
+        }
+    }
+    u.path = url_decode(rest);
+    if str_len(u.path) == 0 && str_len(u.host) > 0 { u.path = "/"; }
+    return u;
+}
+
+fn url_valid_scheme(s: str) -> bool {
+    if str_len(s) == 0 { return false; }
+    var c0: i64 = str_byte_at(s, 0);
+    if !((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122)) { return false; }
+    var i: i64 = 1;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        var ok: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+                       (c >= 48 && c <= 57) || c == 43 || c == 45 || c == 46;
+        if !ok { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Serialize a Url struct back to a string (components re-encoded).
+pub fn url_to_str(u: Url) -> str {
+    var out: str = "";
+    if str_len(u.scheme) > 0 { out = out + u.scheme + ":"; }
+    if str_len(u.host) > 0 {
+        out = out + "//";
+        if str_len(u.userinfo) > 0 { out = out + url_encode(u.userinfo) + "@"; }
+        if str_contains(u.host, ":") {
+            out = out + "[" + u.host + "]";
+        } else {
+            out = out + u.host;
+        }
+        if u.port >= 0 { out = out + ":" + int_to_str(u.port); }
+    }
+    out = out + u.path;
+    if str_len(u.query) > 0 { out = out + "?" + u.query; }
+    if str_len(u.fragment) > 0 { out = out + "#" + url_encode(u.fragment); }
+    return out;
+}
+
+// ─── Query string ───────────────────────────────────────────────────────
+
+/// Value of `key` in a query string ("a=1&b=2"); "" when absent.
+pub fn url_query_get(query: str, key: str) -> str {
+    var pairs: Vec = str_split(query, "&");
+    var i: i64 = 0;
+    while i < pairs.len() {
+        var p: str = pairs.get(i);
+        var eqi: i64 = str_find(p, "=");
+        var k: str = p;
+        var v: str = "";
+        if eqi >= 0 {
+            k = str_slice(p, 0, eqi);
+            v = str_slice(p, eqi + 1, str_len(p));
+        }
+        if str_equal(url_decode_form(k), key) { return url_decode_form(v); }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// True if `key` appears in the query string.
+pub fn url_query_has(query: str, key: str) -> bool {
+    var pairs: Vec = str_split(query, "&");
+    var i: i64 = 0;
+    while i < pairs.len() {
+        var p: str = pairs.get(i);
+        var eqi: i64 = str_find(p, "=");
+        var k: str = p;
+        if eqi >= 0 { k = str_slice(p, 0, eqi); }
+        if str_equal(url_decode_form(k), key) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// All keys of the query string in order (decoded).
+pub fn url_query_keys(query: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var pairs: Vec = str_split(query, "&");
+    var i: i64 = 0;
+    while i < pairs.len() {
+        var p: str = pairs.get(i);
+        if str_len(p) == 0 { i = i + 1; continue; }
+        var eqi: i64 = str_find(p, "=");
+        var k: str = p;
+        if eqi >= 0 { k = str_slice(p, 0, eqi); }
+        out.push(url_decode_form(k));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Build a query string from parallel key/value vecs (form-encoded).
+pub fn url_query_build(keys: Vec<str>, values: Vec<str>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < keys.len() {
+        if i > 0 { out = out + "&"; }
+        out = out + url_encode_form(keys.get(i));
+        if i < values.len() { out = out + "=" + url_encode_form(values.get(i)); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Path helpers ───────────────────────────────────────────────────────
+
+/// Resolve `rel` against `base` (RFC 3986 §5.2, no scheme changes).
+/// Handles absolute paths, relative paths, and dot segments.
+pub fn url_resolve(base: Url, rel: str) -> str {
+    var r: Url = url_parse(rel);
+    if str_len(r.scheme) > 0 { return rel; }        // absolute URL wins
+    var out: str = "";
+    if str_len(base.scheme) > 0 { out = base.scheme + ":"; }
+    if str_len(r.host) > 0 {
+        // protocol-relative //host/path
+        if str_len(r.userinfo) > 0 { out = out + "//" + r.userinfo + "@"; }
+        else { out = out + "//"; }
+        out = out + r.host;
+        if r.port >= 0 { out = out + ":" + int_to_str(r.port); }
+        out = out + url_normalize_path(r.path);
+    } else {
+        if str_len(base.host) > 0 {
+            out = out + "//" + base.host;
+            if base.port >= 0 { out = out + ":" + int_to_str(base.port); }
+        }
+        if str_starts_with(r.path, "/") {
+            out = out + url_normalize_path(r.path);
+        } else if str_len(r.path) > 0 {
+            // merge: base dir + rel
+            var dir: str = base.path;
+            var slash: i64 = str_rfind(dir, "/");
+            if slash >= 0 { dir = str_slice(dir, 0, slash + 1); }
+            else { dir = ""; }
+            out = out + url_normalize_path(dir + r.path);
+        } else {
+            out = out + base.path;
+            if str_len(r.query) == 0 && str_len(base.query) > 0 {
+                out = out + "?" + base.query;
+            }
+        }
+    }
+    if str_len(r.query) > 0 { out = out + "?" + r.query; }
+    if str_len(r.fragment) > 0 { out = out + "#" + url_encode(r.fragment); }
+    return out;
+}
+
+/// Collapse "." and ".." segments in a path.
+pub fn url_normalize_path(p: str) -> str {
+    var segs: Vec = str_split(p, "/");
+    var stack: Vec<str> = Vec::new();
+    var leading: bool = str_starts_with(p, "/");
+    var trailing: bool = str_ends_with(p, "/") || str_ends_with(p, "/.") || str_ends_with(p, "/..");
+    var i: i64 = 0;
+    while i < segs.len() {
+        var s: str = segs.get(i);
+        if str_len(s) == 0 || str_equal(s, ".") {
+            // skip
+        } else if str_equal(s, "..") {
+            if stack.len() > 0 { stack.pop(); }
+        } else {
+            stack.push(s);
+        }
+        i = i + 1;
+    }
+    var out: str = "";
+    if leading { out = "/"; }
+    var j: i64 = 0;
+    while j < stack.len() {
+        if j > 0 { out = out + "/"; }
+        out = out + stack.get(j);
+        j = j + 1;
+    }
+    if trailing && stack.len() > 0 { out = out + "/"; }
+    if str_len(out) == 0 && leading { return "/"; }
+    return out;
+}

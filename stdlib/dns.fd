@@ -1,0 +1,286 @@
+// Fides DNS standard library
+//
+// DNS client built on the wire format (RFC 1035) over UDP — no libc
+// resolver needed. Builds real query packets, sends them to a
+// recursive resolver, and parses A/AAAA/CNAME answers.
+//
+// Works anywhere net.fd UDP works. The caller supplies the resolver
+// IP (defaults to well-known public resolvers) because the runtime
+// has no /etc/resolv.conf parser yet.
+//
+// Usage:
+//   use dns;
+//   println(dns_resolve("example.com"));              // via 1.1.1.1
+//   println(dns_resolve_via("example.com", "8.8.8.8"));
+//   val ips = dns_resolve_all("example.com");
+
+module dns;
+
+use vec;
+use string;
+use net;
+
+// ─── Packet construction ────────────────────────────────────────────────
+
+// Query id — monotonic-ish per process (random is fine for matching).
+fn dns_qid() -> i64 { return 24817; }
+
+/// Build a DNS query packet for `hostname` (A record by default).
+/// qtype: 1=A, 28=AAAA, 5=CNAME, 15=MX, 16=TXT.
+/// Returns a Vec<i64> of bytes.
+pub fn dns_build_query(hostname: str, qtype: i64) -> Vec {
+    var q: Vec = Vec::new();
+    var id: i64 = dns_qid();
+    q.push((id >> 8) & 255); q.push(id & 255);           // ID
+    q.push(1); q.push(0);                                 // flags: RD
+    q.push(0); q.push(1);                                 // QDCOUNT=1
+    q.push(0); q.push(0);                                 // ANCOUNT
+    q.push(0); q.push(0);                                 // NSCOUNT
+    q.push(0); q.push(0);                                 // ARCOUNT
+    // QNAME: labels
+    var labels: Vec = str_split(hostname, ".");
+    var i: i64 = 0;
+    while i < labels.len() {
+        var lab: str = labels.get(i);
+        if str_len(lab) > 63 { lab = str_slice(lab, 0, 63); }
+        q.push(str_len(lab));
+        var k: i64 = 0;
+        while k < str_len(lab) {
+            q.push(str_byte_at(lab, k));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    q.push(0);                                            // root label
+    q.push((qtype >> 8) & 255); q.push(qtype & 255);      // QTYPE
+    q.push(0); q.push(1);                                 // QCLASS=IN
+    return q;
+}
+
+// ─── Response parsing ───────────────────────────────────────────────────
+
+fn rd_u16(buf: i64, off: i64) -> i64 {
+    return (p_volatile_load8(buf + off) << 8) | p_volatile_load8(buf + off + 1);
+}
+
+fn rd_u32(buf: i64, off: i64) -> i64 {
+    return (rd_u16(buf, off) << 16) | rd_u16(buf, off + 2);
+}
+
+// Skip a DNS name (handles 0xC0 compression pointers). Returns offset
+// after the name.
+fn dns_skip_name(buf: i64, off: i64) -> i64 {
+    var i: i64 = off;
+    while true {
+        var len: i64 = p_volatile_load8(buf + i);
+        if len == 0 { return i + 1; }
+        if (len & 192) == 192 { return i + 2; }            // pointer
+        i = i + len + 1;
+    }
+    return i;
+}
+
+fn dns_parse_u32_addr(buf: i64, off: i64) -> str {
+    return int_to_str(p_volatile_load8(buf + off)) + "." +
+           int_to_str(p_volatile_load8(buf + off + 1)) + "." +
+           int_to_str(p_volatile_load8(buf + off + 2)) + "." +
+           int_to_str(p_volatile_load8(buf + off + 3));
+}
+
+fn dns_parse_v6_addr(buf: i64, off: i64) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < 16 {
+        var w: i64 = rd_u16(buf, off + i);
+        if i > 0 { out = out + ":"; }
+        out = out + int_to_hex(w);
+        i = i + 2;
+    }
+    return out;
+}
+
+/// Parse a raw DNS response (malloc'd bytes, `len` long) and return the
+/// resolved IPs as Vec<str>. qtype 1 → dotted-quad, 28 → hex groups.
+pub fn dns_parse_response(buf: i64, len: i64) -> Vec<str> {
+    var ips: Vec<str> = Vec::new();
+    if len < 12 { return ips; }
+    var qd: i64 = rd_u16(buf, 4);
+    var an: i64 = rd_u16(buf, 6);
+    var off: i64 = 12;
+    var i: i64 = 0;
+    while i < qd {
+        off = dns_skip_name(buf, off) + 4;                 // name + QTYPE+QCLASS
+        i = i + 1;
+    }
+    i = 0;
+    while i < an && off < len {
+        off = dns_skip_name(buf, off);
+        if off + 10 > len { break; }
+        var rtype: i64 = rd_u16(buf, off);
+        var rdlen: i64 = rd_u16(buf, off + 8);
+        var rdata: i64 = off + 10;
+        if rtype == 1 && rdlen == 4 {
+            ips.push(dns_parse_u32_addr(buf, rdata));
+        } else if rtype == 28 && rdlen == 16 {
+            ips.push(dns_parse_v6_addr(buf, rdata));
+        }
+        off = rdata + rdlen;
+        i = i + 1;
+    }
+    return ips;
+}
+
+// ─── Resolver ───────────────────────────────────────────────────────────
+
+/// Query `server` (dotted-quad) for `hostname` qtype; returns Vec<str> of
+/// answer addresses (empty on failure/timeout). Timeout ~2s.
+pub fn dns_query(hostname: str, qtype: i64, server: str, port: i64, timeout_ms: i64) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var sock: i64 = net_socket_create();
+    if sock < 0 { return out; }
+    net_set_recv_timeout(sock, timeout_ms);
+    var addr: NetAddr = net_addr_create(server, port);
+    var pkt: Vec = dns_build_query(hostname, qtype);
+    var n: i64 = pkt.len();
+    var buf: i64 = p_malloc(n);
+    var i: i64 = 0;
+    while i < n {
+        p_volatile_store8(buf + i, pkt.get(i));
+        i = i + 1;
+    }
+    var sent: i64 = net_send_to(sock, buf, n, &addr);
+    if sent < 0 { net_close(sock); p_free(buf); return out; }
+    var rbuf: i64 = p_malloc(4096);
+    var got: i64 = net_recv_from(sock, rbuf, 4096, &mut addr);
+    if got > 0 { out = dns_parse_response(rbuf, got); }
+    p_free(rbuf);
+    p_free(buf);
+    net_close(sock);
+    return out;
+}
+
+/// Resolve `hostname` to all A records via the default resolver.
+pub fn dns_resolve_all(hostname: str) -> Vec<str> {
+    return dns_resolve_all_via(hostname, "1.1.1.1");
+}
+
+/// Resolve via a specific resolver IP.
+pub fn dns_resolve_all_via(hostname: str, server: str) -> Vec<str> {
+    return dns_query(hostname, 1, server, 53, 2000);
+}
+
+/// First A record for `hostname`, or "" on failure.
+pub fn dns_resolve(hostname: str) -> str {
+    var ips: Vec<str> = dns_resolve_all(hostname);
+    if ips.len() == 0 { return ""; }
+    return ips.get(0);
+}
+
+pub fn dns_resolve_via(hostname: str, server: str) -> str {
+    var ips: Vec<str> = dns_resolve_all_via(hostname, server);
+    if ips.len() == 0 { return ""; }
+    return ips.get(0);
+}
+
+/// All AAAA records for `hostname`.
+pub fn dns_resolve_v6(hostname: str) -> Vec<str> {
+    return dns_query(hostname, 28, "1.1.1.1", 53, 2000);
+}
+
+// ─── System-resolver fallback ───────────────────────────────────────────
+// When pledge_net UDP isn't linked into the build (the common case —
+// ccompile only links named libraries), resolve through the OS resolver
+// by shelling out to nslookup (Windows/Unix) or getent (glibc). Output
+// is parsed for the first IPv4 answer.
+
+use os;
+use fs;
+use io;
+
+// Parse dotted quads out of an nslookup/getent text block. Works across
+// locales: collects every IPv4-looking token except the resolver's own
+// address (the "Server:"/"Serveur :" header and its "Address:" line).
+fn dns_extract_ipv4(text: str, hostname: str) -> Vec<str> {
+    var ips: Vec<str> = Vec::new();
+    var lines: Vec<str> = str_lines(text);
+    var skip_next_addr: bool = false;
+    var i: i64 = 0;
+    while i < lines.len() {
+        var line: str = str_trim(lines.get(i));
+        var lower: str = str_to_lower(line);
+        if str_starts_with(lower, "serveur") || str_starts_with(lower, "server") {
+            skip_next_addr = true;
+            i = i + 1;
+            continue;
+        }
+        // Candidate: text after ':' on a "ddress"-line, or the whole line.
+        var cand: str = "";
+        var cpos: i64 = str_find(lower, "ddress");
+        if cpos >= 0 {
+            var colon: i64 = str_find(line, ":");
+            if colon >= 0 {
+                cand = str_trim(str_slice(line, colon + 1, str_len(line)));
+            }
+            if skip_next_addr { cand = ""; skip_next_addr = false; }
+        } else {
+            skip_next_addr = false;
+            // whole line or first token (getent: "93.184.216.34 STREAM host")
+            var sp: i64 = str_find(line, " ");
+            var tab: i64 = str_find(line, "\t");
+            var cut: i64 = str_len(line);
+            if sp >= 0 && sp < cut { cut = sp; }
+            if tab >= 0 && tab < cut { cut = tab; }
+            cand = str_slice(line, 0, cut);
+        }
+        if dns_looks_ipv4(cand) { ips.push(cand); }
+        i = i + 1;
+    }
+    return ips;
+}
+
+fn dns_looks_ipv4(s: str) -> bool {
+    var parts: Vec = str_split(s, ".");
+    if parts.len() != 4 { return false; }
+    var i: i64 = 0;
+    while i < 4 {
+        var p: str = parts.get(i);
+        if !str_is_numeric(p) { return false; }
+        var v: i64 = str_parse_int(p);
+        if v < 0 || v > 255 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Resolve via the OS resolver: nslookup on Windows, getent on Unix.
+/// Returns first IPv4 address or "" on failure. Slower than a wire query
+/// (process spawn) but needs no socket FFI.
+pub fn dns_resolve_system(hostname: str) -> str {
+    var tmp: str = "fides_dns_tmp.txt";
+    var cmd: str = "";
+    if str_equal(os_name(), "windows") {
+        cmd = "nslookup " + hostname + " > " + tmp + " 2>&1";
+    } else {
+        cmd = "getent ahostsv4 " + hostname + " > " + tmp + " 2>&1 || nslookup " + hostname + " > " + tmp + " 2>&1";
+    }
+    os_system(cmd);
+    var out: str = "";
+    if file_exists(tmp) {
+        out = file_read(tmp);
+        file_delete(tmp);
+    }
+    if str_len(out) == 0 { return ""; }
+    var ips: Vec<str> = dns_extract_ipv4(out, hostname);
+    if ips.len() == 0 { return ""; }
+    return ips.get(0);
+}
+
+/// Recommended entry point: resolves through the OS resolver, which
+/// works on every backend (the wire-format path needs pledge_net
+/// linked and panics under `fid run` if it isn't).
+/// Use dns_resolve()/dns_resolve_via() explicitly for the UDP path.
+pub fn dns_lookup(hostname: str) -> str {
+    if str_equal(str_to_lower(hostname), "localhost") { return "127.0.0.1"; }
+    if dns_looks_ipv4(hostname) { return hostname; }
+    return dns_resolve_system(hostname);
+}

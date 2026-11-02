@@ -1,0 +1,122 @@
+// Fides Async standard library
+//
+// Cooperative concurrency over the runtime's executor and socket
+// builtins:
+//   - CPU tasks: p_executor_spawn / p_task_poll / p_executor_run_all
+//     (OS threads, already in the runtime)
+//   - I/O readiness: p_socket_nonblock + p_socket_poll — this module
+//     wraps them into a small event loop primitive.
+//
+// This is *level-triggered readiness*, not async/await. Coroutines
+// are a language feature, not a library — see docs for status.
+//
+// Usage:
+//   use async;
+//   var e = async_executor();
+//   var t = async_spawn(e, "worker_fn", 1, 42);
+//   println(async_await(e, t));          // blocks until ready
+//   async_run_all(e);
+
+module async;
+
+use vec;
+
+// ─── Executor (OS-thread tasks) ─────────────────────────────────────────
+
+/// Create a task executor.
+pub fn async_executor() -> i64 { return p_executor_new(); }
+
+/// Spawn a named function with `nargs` i64 args (max 8).
+/// Returns a future handle.
+pub fn async_spawn(exec: i64, fname: str, nargs: i64, a1: i64) -> i64 {
+    return p_executor_spawn(exec, fname, nargs, a1);
+}
+
+/// Poll a task: returns its value if ready, or PENDING.
+pub fn async_poll(exec: i64, fut: i64) -> i64 {
+    return p_task_poll(fut);
+}
+
+/// True when the task has finished.
+pub fn async_ready(fut: i64) -> bool {
+    return p_task_is_ready(fut);
+}
+
+/// Block until the task completes; returns its value.
+pub fn async_await(exec: i64, fut: i64) -> i64 {
+    return p_executor_block_on(exec, fut);
+}
+
+/// Run all spawned tasks to completion.
+pub fn async_run_all(exec: i64) -> void {
+    p_executor_run_all(exec);
+}
+
+// ─── I/O readiness event loop ───────────────────────────────────────────
+
+/// Put a socket fd into nonblocking mode (1) or back to blocking (0).
+pub fn io_nonblock(fd: i64, on: i64) -> i64 {
+    return p_socket_nonblock(fd, on);
+}
+
+/// Wait until `fd` is readable (or timeout_ms elapses).
+/// Returns 1 if ready, 0 on timeout, <0 on error.
+/// timeout_ms < 0 waits forever.
+pub fn io_wait_readable(fd: i64, timeout_ms: i64) -> i64 {
+    return p_socket_poll(fd, timeout_ms, 0);
+}
+
+/// Wait until `fd` is writable (or timeout_ms elapses).
+pub fn io_wait_writable(fd: i64, timeout_ms: i64) -> i64 {
+    return p_socket_poll(fd, timeout_ms, 1);
+}
+
+/// Wait for either readable or writable; returns bitmask
+/// (1=readable, 2=writable, 0=timeout). Polls twice — cheap
+/// approximation since select() checks both sets in one call anyway.
+pub fn io_wait(fd: i64, timeout_ms: i64) -> i64 {
+    var r: i64 = p_socket_poll(fd, 0, 0);
+    var w: i64 = p_socket_poll(fd, timeout_ms, 1);
+    var mask: i64 = 0;
+    if r > 0 { mask = mask | 1; }
+    if w > 0 { mask = mask | 2; }
+    return mask;
+}
+
+/// A registered fd in the poll set.
+pub struct PollFd {
+    pub fd: i64,
+    pub events: i64,    // 1=readable, 2=writable, 3=both
+}
+
+/// Poll a set of fds; returns index of the first ready fd, or -1 on
+/// timeout/error. Round-robins p_socket_poll per fd — adequate for
+/// small server fanouts (select per fd).
+pub fn io_poll(fds: Vec<PollFd>, timeout_ms: i64) -> i64 {
+    var deadline: i64 = timeout_ms;
+    if deadline < 0 { deadline = 1000; }
+    var i: i64 = 0;
+    while i < fds.len() {
+        var e: PollFd = fds.get(i);
+        var mask: i64 = 0;
+        if (e.events & 1) != 0 {
+            if p_socket_poll(e.fd, 0, 0) > 0 { mask = mask | 1; }
+        }
+        if (e.events & 2) != 0 {
+            if p_socket_poll(e.fd, 0, 1) > 0 { mask = mask | 2; }
+        }
+        if mask != 0 { return i; }
+        i = i + 1;
+    }
+    // nothing ready — block on the first fd for the timeout
+    if fds.len() > 0 {
+        p_socket_poll(fds.get(0).fd, deadline, 0);
+        var j: i64 = 0;
+        while j < fds.len() {
+            var e2: PollFd = fds.get(j);
+            if p_socket_poll(e2.fd, 0, 0) > 0 { return j; }
+            j = j + 1;
+        }
+    }
+    return -1;
+}

@@ -259,6 +259,12 @@ fn is_linux() -> bool {
     return c_file_exists("/proc/self/exe");
 }
 
+/// Panic traces unwind the stack: zig cc links no unwinder for C on Linux.
+fn zig_unwind(cc: str) -> str {
+    if is_linux() && str_contains(cc, "zig") { return " -lunwind"; }
+    return "";
+}
+
 // --- Helper: read source file or error -----------------------------------
 fn read_source_or_error(path: str) -> str {
     var source: str = c_file_read(path);
@@ -1440,7 +1446,7 @@ fn build_c_units(c_code: str, cc: str, gcc_opt: str, is_tcc: bool, output: str, 
         // The -z options are ELF-only
         if p_getenv("OS") != "Windows_NT" { link = link + " -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack"; }
     }
-    var system_libs: str = " -lm";
+    var system_libs: str = " -lm" + zig_unwind(cc);
     if !is_linux() { system_libs = system_libs + " -lws2_32"; }
     if p_system(link + objs + system_libs + libs) != 0 {
         print("link failed\n");
@@ -1788,7 +1794,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                     // The -z options are ELF-only
                     if p_getenv("OS") != "Windows_NT" { cc_flags = cc_flags + " -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack"; }
                     if is_linux() {
-                        cc_cmd = cc + cc_flags + " -lm -lpthread" + extra_libs;
+                        cc_cmd = cc + cc_flags + " -lm -lpthread" + zig_unwind(cc) + extra_libs;
                     } else {
                         cc_cmd = cc + cc_flags + " -lws2_32" + extra_libs;
                     }

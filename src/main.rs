@@ -1332,6 +1332,10 @@ fn real_main() {
                         let mut objs: Vec<String> = Vec::new();
                         let mut whole = String::new();
                         let mut link_libs: Vec<String> = vec!["-lm".to_string()];
+                        // Panic traces unwind the stack: zig cc links no unwinder for C
+                        if !cfg!(windows) && cc.contains("zig") {
+                            link_libs.push("-lunwind".to_string());
+                        }
                         let mut stale: Vec<String> = Vec::new();
                         for (unit_name, code) in &units {
                             whole.push_str(code);
@@ -1555,6 +1559,10 @@ fn real_main() {
                         // gcc/clang/tcc: -O2 + security hardening flags -o output c_path
                         // Extract link libraries from the C source (extern "C" link "m")
                         let mut link_libs: Vec<String> = vec!["-lm".to_string()];
+                        // Panic traces unwind the stack: zig cc links no unwinder for C
+                        if !cfg!(windows) && cc.contains("zig") {
+                            link_libs.push("-lunwind".to_string());
+                        }
                         // Track preprocessor state to only pick up PLINK comments
                         // that are active on the current platform.
                         let is_windows = cfg!(target_os = "windows");

@@ -1,0 +1,70 @@
+// Fides Signal standard library
+//
+// POSIX-style signal handling via the p_signal_* runtime builtins.
+// Handlers are flag-based for safety: sig_register installs a
+// trampoline that only sets a flag; your code polls sig_check()
+// and runs real work at a safe point. This is the standard
+// signal-safety pattern (no allocations in handler context).
+//
+// Usage:
+//   use signal;
+//   sig_register(SIGINT);
+//   while !sig_check(SIGINT) { /* work; returns 1 once, then clears */ }
+//   println("interrupted");
+
+module signal;
+
+// Common signal numbers (POSIX + Windows-compatible subset).
+pub const SIGHUP: i64 = 1;
+pub const SIGINT: i64 = 2;
+pub const SIGQUIT: i64 = 3;
+pub const SIGILL: i64 = 4;
+pub const SIGTRAP: i64 = 5;
+pub const SIGABRT: i64 = 6;
+pub const SIGBUS: i64 = 7;
+pub const SIGFPE: i64 = 8;
+pub const SIGKILL: i64 = 9;
+pub const SIGUSR1: i64 = 10;
+pub const SIGSEGV: i64 = 11;
+pub const SIGUSR2: i64 = 12;
+pub const SIGPIPE: i64 = 13;
+pub const SIGALRM: i64 = 14;
+pub const SIGTERM: i64 = 15;
+
+// ─── Registration ───────────────────────────────────────────────────────
+
+/// Install the flag-trampoline handler for `sig`.
+/// Returns 0 on success, -1 on failure.
+/// Note: SIGKILL/SIGSEGV etc. cannot be caught — signal() returns error.
+pub fn sig_register(sig: i64) -> i64 {
+    return p_signal_register(sig);
+}
+
+/// Check and clear the flag for `sig`: returns 1 if the signal was
+/// received since the last check, 0 otherwise.
+pub fn sig_check(sig: i64) -> i64 {
+    return p_signal_check(sig);
+}
+
+/// Raise `sig` in the current process (for testing handlers).
+pub fn sig_raise(sig: i64) -> i64 {
+    return p_signal_raise(sig);
+}
+
+// ─── Convenience ────────────────────────────────────────────────────────
+
+/// Register SIGINT + SIGTERM (graceful-shutdown pair).
+/// Returns 0 if both registered.
+pub fn sig_register_shutdown() -> i64 {
+    var a: i64 = sig_register(SIGINT);
+    var b: i64 = sig_register(SIGTERM);
+    if a < 0 { return a; }
+    return b;
+}
+
+/// True once if SIGINT or SIGTERM arrived since last check.
+pub fn sig_shutdown_requested() -> bool {
+    if p_signal_check(SIGINT) == 1 { return true; }
+    if p_signal_check(SIGTERM) == 1 { return true; }
+    return false;
+}

@@ -61,16 +61,8 @@ fn fast_core_vec_body(name: &str, func: &IrFunction, c_ret: &str) -> Option<Vec<
         }
         ("Vec_push", 3, "void") => vec![
             hdr(&p[1]),
-            "    int64_t __len = __h[1], __cap = __h[2];".into(),
-            "    if (__len >= __cap) {".into(),
-            "        int64_t __nc = __cap > 0 ? __cap * 2 : 8;".into(),
-            "        int64_t* __nd = (int64_t*)p_malloc(__nc * 8);".into(),
-            "        int64_t* __od = (int64_t*)(intptr_t)__h[0];".into(),
-            "        for (int64_t __i = 0; __i < __len; __i++) __nd[__i] = __od[__i];".into(),
-            "        if (__od) p_free(__od);".into(),
-            "        __h[0] = (int64_t)(intptr_t)__nd;".into(),
-            "        __h[2] = __nc;".into(),
-            "    }".into(),
+            "    int64_t __len = __h[1];".into(),
+            "    if (P_UNLIKELY(__len >= __h[2])) __p_vec_grow(__h);".into(),
             format!("    ((int64_t*)(intptr_t)__h[0])[__len] = {};", p[2]),
             "    __h[1] = __len + 1;".into(),
         ],
@@ -508,6 +500,18 @@ impl CCodeGen {
         // Emit runtime implementation
         self.emit_runtime_impl();
 
+        // Panic traces name each frame through this table
+        wln!(self, "const __p_fn_entry __p_fns[] = {{");
+        for (name, _) in &module.functions {
+            let c_name = self.sanitize_c_name(name);
+            wln!(self, "    {{(const void*){}, \"{}\"}},", c_name, name);
+        }
+        if module.functions.is_empty() {
+            wln!(self, "    {{0, 0}},");
+        }
+        wln!(self, "}};");
+        wln!(self, "const int __p_fn_count = {};", module.functions.len());
+
         self.out.clone()
     }
 
@@ -685,6 +689,16 @@ impl CCodeGen {
             ("p_json_len", &[p()]),
             ("p_json_object_get", &[p(), p()]),
             ("p_http_listen", &[I64]),
+            ("p_socket_nonblock", &[I64, I64]),
+            ("p_socket_poll", &[I64, I64, I64]),
+            ("p_signal_register", &[I64]),
+            ("p_signal_check", &[I64]),
+            ("p_signal_raise", &[I64]),
+            ("p_mmap_anon", &[I64]),
+            ("p_mmap_file", &[p()]),
+            ("p_mmap_len", &[I64]),
+            ("p_munmap", &[I64]),
+            ("p_msync", &[I64]),
             ("p_http_recv_request", &[I64]),
             ("p_http_send_response", &[I64, I64, p()]),
             ("p_http_build_response", &[I64, p(), p()]),
@@ -1284,8 +1298,7 @@ impl CCodeGen {
         wln!(self, "char* p_read_stdin(int64_t n);");
         wln!(self, "void p_panic(const char* msg);");
         self.gen_arith_helpers();
-        wln!(self, "// Call stack for panic traces + recursion limit");
-        wln!(self, "// Per-thread runtime state (arena, call stack): no locks needed.");
+        wln!(self, "// Per-thread runtime state (arena, tasks): no locks needed.");
         wln!(self, "#if defined(_MSC_VER)");
         wln!(self, "#define P_THREAD_LOCAL __declspec(thread)");
         wln!(self, "#elif defined(__TINYC__)");
@@ -1293,25 +1306,29 @@ impl CCodeGen {
         wln!(self, "#else");
         wln!(self, "#define P_THREAD_LOCAL __thread");
         wln!(self, "#endif");
-        wln!(self, "static P_THREAD_LOCAL const char* p_call_stack[2048];");
-        wln!(self, "static P_THREAD_LOCAL int p_call_stack_depth = 0;");
-        wln!(self, "static int p_max_recursion = 10000; // default limit");
-        wln!(self, "void p_call_stack_push(const char* name) {{");
-        wln!(self, "    if (p_call_stack_depth >= p_max_recursion) {{");
-        wln!(self, "        fprintf(stderr, \"\\nRecursion limit exceeded (%d) in function '%s'\\n\", p_max_recursion, name);");
-        wln!(self, "        fprintf(stderr, \"Call stack (last 20):\\n\");");
-        wln!(self, "        int start = p_call_stack_depth > 20 ? p_call_stack_depth - 20 : 0;");
-        wln!(self, "        for (int i = start; i < p_call_stack_depth; i++)");
-        wln!(self, "            fprintf(stderr, \"  [%d] %s\\n\", i, p_call_stack[i]);");
-        wln!(self, "        abort();");
-        wln!(self, "    }}");
-        wln!(self, "    if (p_call_stack_depth < 2048) p_call_stack[p_call_stack_depth++] = name;");
-        wln!(self, "}}");
-        wln!(self, "void p_call_stack_pop(void) {{ if (p_call_stack_depth > 0) p_call_stack_depth--; }}");
-        wln!(self, "void p_set_max_recursion(int limit) {{ p_max_recursion = limit; }}");
+        wln!(self, "void p_set_max_recursion(int limit) {{ (void)limit; }}");
         wln!(self, "void* p_malloc(int64_t size);");
         wln!(self, "void* p_alloc(int64_t size);");
         wln!(self, "void p_free(void* ptr);");
+        wln!(self, "#if (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)");
+        wln!(self, "#define P_NOINLINE __attribute__((noinline))");
+        wln!(self, "#define P_UNLIKELY(x) __builtin_expect(!!(x), 0)");
+        wln!(self, "#elif defined(_MSC_VER)");
+        wln!(self, "#define P_NOINLINE __declspec(noinline)");
+        wln!(self, "#define P_UNLIKELY(x) (x)");
+        wln!(self, "#else");
+        wln!(self, "#define P_NOINLINE");
+        wln!(self, "#define P_UNLIKELY(x) (x)");
+        wln!(self, "#endif");
+        wln!(self, "/* A full Vec grows out of line, so push inlines to a store. */");
+        wln!(self, "P_NOINLINE void __p_vec_grow(int64_t* h) {{");
+        wln!(self, "    int64_t cap = h[2], nc = cap > 0 ? cap * 2 : 8;");
+        wln!(self, "    int64_t* nd = (int64_t*)p_malloc(nc * 8);");
+        wln!(self, "    int64_t* od = (int64_t*)(intptr_t)h[0];");
+        wln!(self, "    if (od) {{ memcpy(nd, od, (size_t)h[1] * 8); p_free(od); }}");
+        wln!(self, "    h[0] = (int64_t)(intptr_t)nd;");
+        wln!(self, "    h[2] = nc;");
+        wln!(self, "}}");
         wln!(self, "int64_t p_arena_save(void);");
         wln!(self, "void p_arena_restore(int64_t mark);");
         wln!(self, "void p_region_free(void* region);");
@@ -1433,6 +1450,16 @@ impl CCodeGen {
         wln!(self, "int64_t p_socket_write_str(int64_t fd, const char* buf);");
         wln!(self, "void p_socket_close(int64_t fd);");
         wln!(self, "char* p_socket_recv_str(int64_t fd);");
+        wln!(self, "int64_t p_socket_nonblock(int64_t fd, int64_t on);");
+        wln!(self, "int64_t p_socket_poll(int64_t fd, int64_t timeout_ms, int64_t write_mode);");
+        wln!(self, "int64_t p_signal_register(int64_t sig);");
+        wln!(self, "int64_t p_signal_check(int64_t sig);");
+        wln!(self, "int64_t p_signal_raise(int64_t sig);");
+        wln!(self, "int64_t p_mmap_anon(int64_t len);");
+        wln!(self, "int64_t p_mmap_file(const char* path);");
+        wln!(self, "int64_t p_mmap_len(int64_t addr);");
+        wln!(self, "int64_t p_munmap(int64_t addr);");
+        wln!(self, "int64_t p_msync(int64_t addr);");
         wln!(self, "int64_t print(int64_t val);");
         wln!(self, "int64_t print_str(const char* s);");
         wln!(self, "void p_vec_clear(PVec* v);");
@@ -1652,51 +1679,15 @@ impl CCodeGen {
     fn emit_main_wrapper(&mut self, module: &IrModule) {
         if module.functions.contains_key("main") {
             wln!(self, "// ─── C entry point ───");
-            // Windows: vectored exception handler to print call stack on crash
+            // Crash and stack overflow handlers: __p_install_crash_handlers
             wln!(self, "#ifdef _WIN32");
             wln!(self, "#include <windows.h>");
-            wln!(self, "LONG WINAPI __p_crash_handler(PEXCEPTION_POINTERS ep) {{");
-            wln!(self, "    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||");
-            wln!(self, "        ep->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {{");
-            wln!(self, "        fprintf(stderr, \"\\n=== CRASH: 0x%lX ===\\n\", (unsigned long)ep->ExceptionRecord->ExceptionCode);");
-            wln!(self, "        if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {{");
-            wln!(self, "            fprintf(stderr, \"Access violation at address 0x%llX\\n\",");
-            wln!(self, "                    (unsigned long long)ep->ExceptionRecord->ExceptionInformation[1]);");
-            wln!(self, "        }}");
-            wln!(self, "        fprintf(stderr, \"Call stack depth: %d\\n\", p_call_stack_depth);");
-            wln!(self, "        int start = p_call_stack_depth > 30 ? p_call_stack_depth - 30 : 0;");
-            wln!(self, "        for (int i = start; i < p_call_stack_depth; i++)");
-            wln!(self, "            fprintf(stderr, \"  [%d] %s\\n\", i, p_call_stack[i]);");
-            wln!(self, "        fflush(stderr);");
-            wln!(self, "    }}");
-            wln!(self, "    return EXCEPTION_CONTINUE_SEARCH;");
-            wln!(self, "}}");
             wln!(self, "#endif");
-            // Linux: signal handler to print call stack on crash
-            wln!(self, "#ifndef _WIN32");
-            wln!(self, "#include <signal.h>");
-            wln!(self, "static void __p_sig_handler(int sig) {{");
-            wln!(self, "    const char* name = sig == SIGSEGV ? \"SIGSEGV\" : sig == SIGBUS ? \"SIGBUS\" : sig == SIGABRT ? \"SIGABRT\" : sig == SIGFPE ? \"SIGFPE\" : \"UNKNOWN\";");
-            wln!(self, "    fprintf(stderr, \"\\n=== CRASH: signal %d (%s) ===\\n\", sig, name);");
-            wln!(self, "    fprintf(stderr, \"Call stack depth: %d\\n\", p_call_stack_depth);");
-            wln!(self, "    int start = p_call_stack_depth > 30 ? p_call_stack_depth - 30 : 0;");
-            wln!(self, "    for (int i = start; i < p_call_stack_depth; i++)");
-            wln!(self, "        fprintf(stderr, \"  [%d] %s\\n\", i, p_call_stack[i]);");
-            wln!(self, "    fflush(stderr);");
-            wln!(self, "    _exit(128 + sig);");
-            wln!(self, "}}");
-            wln!(self, "#endif");
+            wln!(self, "void __p_install_crash_handlers(void);");
             // Windows: wrap main in a thread with 16MB stack to prevent stack overflow
             // when processing large files (the self-hosted compiler needs >1MB stack)
             wln!(self, "int real_main(int argc, char** argv) {{");
-            wln!(self, "#ifdef _WIN32");
-            wln!(self, "    SetUnhandledExceptionFilter(__p_crash_handler);");
-            wln!(self, "#else");
-            wln!(self, "    signal(SIGSEGV, __p_sig_handler);");
-            wln!(self, "    signal(SIGBUS, __p_sig_handler);");
-            wln!(self, "    signal(SIGABRT, __p_sig_handler);");
-            wln!(self, "    signal(SIGFPE, __p_sig_handler);");
-            wln!(self, "#endif");
+            wln!(self, "    __p_install_crash_handlers();");
             wln!(self, "    setvbuf(stdout, NULL, _IONBF, 0);");
             wln!(self, "    setvbuf(stderr, NULL, _IONBF, 0);");
             // On Windows, set stdout/stderr to binary mode so that printf
@@ -1845,9 +1836,6 @@ impl CCodeGen {
             wln!(self, "");
             return;
         }
-
-        // Push function name onto call stack for panic traces
-        wln!(self, "    p_call_stack_push(\"{}\");", name);
 
         // Declare all SSA values as local variables (skip void/never and params),
         // in id order so the output does not depend on HashMap order.
@@ -2170,8 +2158,6 @@ impl CCodeGen {
                 wln!(self, "    else goto bb{};", else_.0);
             }
             Inst::Return { value } => {
-                // Pop call stack before returning (for panic traces)
-                wln!(self, "    p_call_stack_pop();");
                 match value {
                     Some(v) => {
                         // If the C function returns void, discard the value
@@ -3008,9 +2994,11 @@ impl CCodeGen {
         wln!(self, "    return result;");
         wln!(self, "}}");
         wln!(self, "");
-        wln!(self, "void p_print(int64_t val) { printf(\"%lld\", (long long)val); }");
-        wln!(self, "void p_print_str(const char* s) { printf(\"%s\", s); }");
-        wln!(self, "void p_eprint_str(const char* s) { fprintf(stderr, \"%s\", s); fflush(stderr); }");
+        // One write per print: stdout is unbuffered, and printf then writes each
+        // byte on its own on Windows (a 2 MB string took 8 seconds).
+        wln!(self, "void p_print(int64_t val) { char b[32]; int n = snprintf(b, sizeof b, \"%lld\", (long long)val); fwrite(b, 1, (size_t)n, stdout); }");
+        wln!(self, "void p_print_str(const char* s) { fwrite(s, 1, strlen(s), stdout); }");
+        wln!(self, "void p_eprint_str(const char* s) { fwrite(s, 1, strlen(s), stderr); fflush(stderr); }");
         wln!(self, "void p_flush_stdout(void) { fflush(stdout); }");
         wln!(self, "int64_t p_stdin_eof(void) { return (int64_t)feof(stdin); }");
         wln!(self, "char* p_read_line(void) {");
@@ -3033,21 +3021,166 @@ impl CCodeGen {
         wln!(self, "    buf[read] = '\\0';");
         wln!(self, "    return buf;");
         wln!(self, "}");
-        wln!(self, "void p_print_int(int64_t val) { printf(\"%lld\", (long long)val); }");
-        wln!(self, "void p_print_bool(bool val) { printf(\"%s\", val ? \"true\" : \"false\"); }");
-        wln!(self, "void p_print_float(double val) {{ char* _s = p_to_str_float(val); printf(\"%s\", _s); free(_s); }}");
-        wln!(self, "void p_print_newline(void) { printf(\"\\n\"); }");
+        wln!(self, "void p_print_int(int64_t val) { char b[32]; int n = snprintf(b, sizeof b, \"%lld\", (long long)val); fwrite(b, 1, (size_t)n, stdout); }");
+        wln!(self, "void p_print_bool(bool val) { if (val) fwrite(\"true\", 1, 4, stdout); else fwrite(\"false\", 1, 5, stdout); }");
+        wln!(self, "void p_print_float(double val) {{ char* _s = p_to_str_float(val); fwrite(_s, 1, strlen(_s), stdout); free(_s); }}");
+        wln!(self, "void p_print_newline(void) { fwrite(\"\\n\", 1, 1, stdout); }");
+        wln!(self, "/* Crashes, stack overflow and panic traces. Nothing is recorded per call:");
+        wln!(self, "   a trace walks the machine stack and names each frame that starts at a");
+        wln!(self, "   Fides function; a stack overflow hits the OS guard page, and its handler");
+        wln!(self, "   runs on reserved stack. */");
+        wln!(self, "typedef struct {{ const void* addr; const char* name; }} __p_fn_entry;");
+        wln!(self, "extern const __p_fn_entry __p_fns[];");
+        wln!(self, "extern const int __p_fn_count;");
+        wln!(self, "static __p_fn_entry* __p_fns_sorted = NULL;");
+        wln!(self, "static int __p_fn_cmp(const void* a, const void* b) {{");
+        wln!(self, "    uintptr_t x = (uintptr_t)((const __p_fn_entry*)a)->addr, y = (uintptr_t)((const __p_fn_entry*)b)->addr;");
+        wln!(self, "    return x < y ? -1 : x > y;");
+        wln!(self, "}}");
+        wln!(self, "static const char* __p_fn_name(uintptr_t start) {{");
+        wln!(self, "    if (!__p_fns_sorted) {{");
+        wln!(self, "        __p_fns_sorted = (__p_fn_entry*)malloc(sizeof(__p_fn_entry) * (size_t)(__p_fn_count + 1));");
+        wln!(self, "        if (!__p_fns_sorted) return NULL;");
+        wln!(self, "        memcpy(__p_fns_sorted, __p_fns, sizeof(__p_fn_entry) * (size_t)__p_fn_count);");
+        wln!(self, "        qsort(__p_fns_sorted, (size_t)__p_fn_count, sizeof(__p_fn_entry), __p_fn_cmp);");
+        wln!(self, "    }}");
+        wln!(self, "    int lo = 0, hi = __p_fn_count - 1;");
+        wln!(self, "    while (lo <= hi) {{");
+        wln!(self, "        int mid = (lo + hi) / 2;");
+        wln!(self, "        uintptr_t a = (uintptr_t)__p_fns_sorted[mid].addr;");
+        wln!(self, "        if (a == start) return __p_fns_sorted[mid].name;");
+        wln!(self, "        if (a < start) lo = mid + 1; else hi = mid - 1;");
+        wln!(self, "    }}");
+        wln!(self, "    return NULL;");
+        wln!(self, "}}");
+        wln!(self, "#if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__)) && !defined(__TINYC__)");
+        wln!(self, "#include <windows.h>");
+        wln!(self, "/* Where the function of each frame starts, from the unwind tables. ctx: a");
+        wln!(self, "   CONTEXT to start from (exact: its pc is the faulting one), or NULL. */");
+        wln!(self, "static int __p_frames(void* ctx, int exact, uintptr_t* out, int max) {{");
+        wln!(self, "    CONTEXT c;");
+        wln!(self, "    if (ctx) c = *(CONTEXT*)ctx; else {{ RtlCaptureContext(&c); exact = 0; }}");
+        wln!(self, "    int k = 0;");
+        wln!(self, "    for (int i = 0; i < 256 && k < max && c.Rip; i++) {{");
+        wln!(self, "        DWORD64 pc = (i == 0 && exact) ? c.Rip : c.Rip - 1;");
+        wln!(self, "        DWORD64 base = 0; PVOID hd = NULL; DWORD64 est = 0;");
+        wln!(self, "        PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(pc, &base, NULL);");
+        wln!(self, "        if (!rf) {{ c.Rip = *(DWORD64*)c.Rsp; c.Rsp += 8; continue; }}");
+        wln!(self, "        out[k++] = (uintptr_t)(base + rf->BeginAddress);");
+        wln!(self, "        RtlVirtualUnwind(0, base, pc, rf, &c, &hd, &est, NULL);");
+        wln!(self, "    }}");
+        wln!(self, "    return k;");
+        wln!(self, "}}");
+        wln!(self, "#elif (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__) && !defined(_WIN32)");
+        wln!(self, "#include <unwind.h>");
+        wln!(self, "typedef struct {{ uintptr_t* out; int n; int max; }} __p_unw;");
+        wln!(self, "static _Unwind_Reason_Code __p_unw_step(struct _Unwind_Context* uc, void* arg) {{");
+        wln!(self, "    __p_unw* u = (__p_unw*)arg;");
+        wln!(self, "    if (u->n >= u->max) return _URC_END_OF_STACK;");
+        wln!(self, "    uintptr_t s = (uintptr_t)_Unwind_GetRegionStart(uc);");
+        wln!(self, "    if (s) u->out[u->n++] = s;");
+        wln!(self, "    return _URC_NO_REASON;");
+        wln!(self, "}}");
+        wln!(self, "static int __p_frames(void* ctx, int exact, uintptr_t* out, int max) {{");
+        wln!(self, "    (void)ctx; (void)exact;");
+        wln!(self, "    __p_unw u = {{ out, 0, max }};");
+        wln!(self, "    _Unwind_Backtrace(__p_unw_step, &u);");
+        wln!(self, "    return u.n;");
+        wln!(self, "}}");
+        wln!(self, "#else");
+        wln!(self, "static int __p_frames(void* ctx, int exact, uintptr_t* out, int max) {{ (void)ctx; (void)exact; (void)out; (void)max; return 0; }}");
+        wln!(self, "#endif");
+        wln!(self, "void __p_print_trace_ctx(void* ctx, int exact) {{");
+        wln!(self, "    uintptr_t f[64];");
+        wln!(self, "    const char* names[64];");
+        wln!(self, "    int n = __p_frames(ctx, exact, f, 64), m = 0;");
+        wln!(self, "    for (int i = 0; i < n; i++) {{");
+        wln!(self, "        const char* name = __p_fn_name(f[i]);");
+        wln!(self, "        if (name) names[m++] = name;");
+        wln!(self, "    }}");
+        wln!(self, "    if (m == 0) return;");
+        wln!(self, "    fprintf(stderr, \"stack trace:\\n    → %s\\n\", names[0]);");
+        wln!(self, "    for (int i = 1; i < m; ) {{");
+        wln!(self, "        int j = i + 1;");
+        wln!(self, "        while (j < m && strcmp(names[j], names[i]) == 0) j++;");
+        wln!(self, "        if (j - i > 1) fprintf(stderr, \"    ↳ called from %s (%d times)\\n\", names[i], j - i);");
+        wln!(self, "        else fprintf(stderr, \"    ↳ called from %s\\n\", names[i]);");
+        wln!(self, "        i = j;");
+        wln!(self, "    }}");
+        wln!(self, "}}");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "void __p_thread_guard_init(void) {{");
+        wln!(self, "#if !defined(__TINYC__)");
+        wln!(self, "    ULONG g = 64 * 1024;");
+        wln!(self, "    SetThreadStackGuarantee(&g);");
+        wln!(self, "#endif");
+        wln!(self, "}}");
+        wln!(self, "void __p_thread_guard_done(void) {{}}");
+        wln!(self, "LONG WINAPI __p_crash_handler(PEXCEPTION_POINTERS ep) {{");
+        wln!(self, "    DWORD code = ep->ExceptionRecord->ExceptionCode;");
+        wln!(self, "    if (code == EXCEPTION_STACK_OVERFLOW) {{");
+        wln!(self, "        fprintf(stderr, \"\\nStack overflow: the recursion is too deep\\n\");");
+        wln!(self, "    }} else if (code == EXCEPTION_ACCESS_VIOLATION) {{");
+        wln!(self, "        fprintf(stderr, \"\\n=== CRASH: 0x%lX ===\\n\", (unsigned long)code);");
+        wln!(self, "        fprintf(stderr, \"Access violation at address 0x%llX\\n\", (unsigned long long)ep->ExceptionRecord->ExceptionInformation[1]);");
+        wln!(self, "    }} else {{");
+        wln!(self, "        return EXCEPTION_CONTINUE_SEARCH;");
+        wln!(self, "    }}");
+        wln!(self, "    __p_print_trace_ctx(ep->ContextRecord, 1);");
+        wln!(self, "    fflush(stderr);");
+        wln!(self, "    return EXCEPTION_CONTINUE_SEARCH;");
+        wln!(self, "}}");
+        wln!(self, "void __p_install_crash_handlers(void) {{");
+        wln!(self, "    SetUnhandledExceptionFilter(__p_crash_handler);");
+        wln!(self, "    __p_thread_guard_init();");
+        wln!(self, "}}");
+        wln!(self, "#else");
+        wln!(self, "#include <signal.h>");
+        wln!(self, "static P_THREAD_LOCAL char* __p_stack_top;");
+        wln!(self, "static void __p_sig_handler(int sig, siginfo_t* si, void* uc) {{");
+        wln!(self, "    (void)uc;");
+        wln!(self, "    const char* name = sig == SIGSEGV ? \"SIGSEGV\" : sig == SIGBUS ? \"SIGBUS\" : sig == SIGABRT ? \"SIGABRT\" : sig == SIGFPE ? \"SIGFPE\" : \"UNKNOWN\";");
+        wln!(self, "    char* a = (char*)si->si_addr;");
+        wln!(self, "    if ((sig == SIGSEGV || sig == SIGBUS) && __p_stack_top && a < __p_stack_top && a >= __p_stack_top - (64 << 20))");
+        wln!(self, "        fprintf(stderr, \"\\nStack overflow: the recursion is too deep\\n\");");
+        wln!(self, "    else");
+        wln!(self, "        fprintf(stderr, \"\\n=== CRASH: signal %d (%s) ===\\n\", sig, name);");
+        wln!(self, "    __p_print_trace_ctx(NULL, 0);");
+        wln!(self, "    fflush(stderr);");
+        wln!(self, "    _exit(128 + sig);");
+        wln!(self, "}}");
+        wln!(self, "/* Each thread: a reserved stack for the handler, so it runs on overflow. */");
+        wln!(self, "void __p_thread_guard_init(void) {{");
+        wln!(self, "    char here;");
+        wln!(self, "    __p_stack_top = &here;");
+        wln!(self, "    stack_t ss;");
+        wln!(self, "    memset(&ss, 0, sizeof ss);");
+        wln!(self, "    ss.ss_sp = malloc(64 * 1024);");
+        wln!(self, "    ss.ss_size = 64 * 1024;");
+        wln!(self, "    if (ss.ss_sp) sigaltstack(&ss, NULL);");
+        wln!(self, "}}");
+        wln!(self, "void __p_thread_guard_done(void) {{");
+        wln!(self, "    stack_t ss, old;");
+        wln!(self, "    memset(&ss, 0, sizeof ss);");
+        wln!(self, "    ss.ss_flags = SS_DISABLE;");
+        wln!(self, "    if (sigaltstack(&ss, &old) == 0 && old.ss_sp) free(old.ss_sp);");
+        wln!(self, "}}");
+        wln!(self, "void __p_install_crash_handlers(void) {{");
+        wln!(self, "    struct sigaction sa;");
+        wln!(self, "    memset(&sa, 0, sizeof sa);");
+        wln!(self, "    sa.sa_sigaction = __p_sig_handler;");
+        wln!(self, "    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;");
+        wln!(self, "    sigemptyset(&sa.sa_mask);");
+        wln!(self, "    sigaction(SIGSEGV, &sa, NULL);");
+        wln!(self, "    sigaction(SIGBUS, &sa, NULL);");
+        wln!(self, "    sigaction(SIGABRT, &sa, NULL);");
+        wln!(self, "    sigaction(SIGFPE, &sa, NULL);");
+        wln!(self, "    __p_thread_guard_init();");
+        wln!(self, "}}");
+        wln!(self, "#endif");
         wln!(self, "void p_panic(const char* msg) {{");
         wln!(self, "    fprintf(stderr, \"Panic: %s\\n\", msg);");
-        wln!(self, "    if (p_call_stack_depth > 0) {{");
-        wln!(self, "        fprintf(stderr, \"stack trace:\\n\");");
-        wln!(self, "        for (int i = p_call_stack_depth - 1; i >= 0; i--) {{");
-        wln!(self, "            if (i == p_call_stack_depth - 1)");
-        wln!(self, "                fprintf(stderr, \"    → %s\\n\", p_call_stack[i]);");
-        wln!(self, "            else");
-        wln!(self, "                fprintf(stderr, \"    ↳ called from %s\\n\", p_call_stack[i]);");
-        wln!(self, "        }}");
-        wln!(self, "    }}");
+        wln!(self, "    __p_print_trace_ctx(NULL, 0);");
         wln!(self, "    fflush(stdout);");
         wln!(self, "    exit(1);");
         wln!(self, "}}");
@@ -3551,6 +3684,11 @@ impl CCodeGen {
         wln!(self, "    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;");
         wln!(self, "#endif");
         wln!(self, "}}");
+        wln!(self, "#ifndef _WIN32");
+        wln!(self, "#include <sys/mman.h>");
+        wln!(self, "#endif");
+        wln!(self, "/* A task stack on POSIX, with a guard page at its low end. */");
+        wln!(self, "#define P_CO_STACK (256 * 1024 + 4096)");
         wln!(self, "static void __p_co_leave(void) {{");
         wln!(self, "    __p_co* c = __p_co_cur;");
         wln!(self, "    __p_co* back = c->back;");
@@ -3575,7 +3713,7 @@ impl CCodeGen {
         wln!(self, "#ifdef _WIN32");
         wln!(self, "        DeleteFiber(c->fiber);");
         wln!(self, "#else");
-        wln!(self, "        free(c->stack);");
+        wln!(self, "        munmap(c->stack, P_CO_STACK);");
         wln!(self, "#endif");
         wln!(self, "    }}");
         wln!(self, "}}");
@@ -3621,11 +3759,12 @@ impl CCodeGen {
         wln!(self, "    c->fiber = CreateFiberEx(16384, 1024 * 1024, 0, __p_co_start, c);");
         wln!(self, "    if (!c->fiber) p_panic(\"task: out of memory\");");
         wln!(self, "#else");
-        wln!(self, "    c->stack = (char*)malloc(256 * 1024);");
-        wln!(self, "    if (!c->stack) p_panic(\"task: out of memory\");");
+        wln!(self, "    c->stack = (char*)mmap(NULL, P_CO_STACK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);");
+        wln!(self, "    if (c->stack == MAP_FAILED) p_panic(\"task: out of memory\");");
+        wln!(self, "    mprotect(c->stack, 4096, PROT_NONE);");
         wln!(self, "    getcontext(&c->ctx);");
         wln!(self, "    c->ctx.uc_stack.ss_sp = c->stack;");
-        wln!(self, "    c->ctx.uc_stack.ss_size = 256 * 1024;");
+        wln!(self, "    c->ctx.uc_stack.ss_size = P_CO_STACK;");
         wln!(self, "    c->ctx.uc_link = NULL;");
         wln!(self, "    makecontext(&c->ctx, (void (*)(void))__p_co_start, 2, (unsigned)(uintptr_t)c, (unsigned)((uintptr_t)c >> 32));");
         wln!(self, "#endif");
@@ -3853,6 +3992,7 @@ impl CCodeGen {
         wln!(self, "}}");
         wln!(self, "static void* p_thread_wrapper(void* arg) {");
         wln!(self, "    p_thread_arg_t* ta = (p_thread_arg_t*)arg;");
+        wln!(self, "    __p_thread_guard_init();");
         wln!(self, "    int64_t result = 0;");
         wln!(self, "    // Fides functions have an implicit __env param (void*) as first arg.");
         wln!(self, "    // Pass NULL for __env, then the user-provided args.");
@@ -3864,6 +4004,7 @@ impl CCodeGen {
         wln!(self, "        default: { typedef int64_t (*f4)(void*,int64_t,int64_t,int64_t,int64_t); f4 f = (f4)ta->fn; result = f(NULL, ta->args[0], ta->args[1], ta->args[2], ta->args[3]); break; }");
         wln!(self, "    }");
         wln!(self, "    if (ta->done) atomic_store(ta->done, 1);");
+        wln!(self, "    __p_thread_guard_done();");
         wln!(self, "    return (void*)(intptr_t)result;");
         wln!(self, "}");
         // Phase A1: Executor + non-blocking task poll
@@ -4022,14 +4163,34 @@ impl CCodeGen {
         wln!(self, "    return -(int64_t)(idx + 1);");
         wln!(self, "}");
         wln!(self, "int64_t p_net_connect(const char* host, int64_t port) {");
-        wln!(self, "    int sock = socket(AF_INET, SOCK_STREAM, 0);");
-        wln!(self, "    if (sock < 0) return -1;");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    { WSADATA d; static int ws = 0; if (!ws) { WSAStartup(MAKEWORD(2,2), &d); ws = 1; } }");
+        wln!(self, "#endif");
         wln!(self, "    struct sockaddr_in addr = {0};");
         wln!(self, "    addr.sin_family = AF_INET;");
         wln!(self, "    addr.sin_port = htons((uint16_t)port);");
-        wln!(self, "    inet_pton(AF_INET, host, &addr.sin_addr);");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    if (InetPtonA(AF_INET, host, &addr.sin_addr) != 1) {");
+        wln!(self, "#else");
+        wln!(self, "    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {");
+        wln!(self, "#endif");
+        wln!(self, "        // Not a dotted IP — resolve via getaddrinfo.");
+        wln!(self, "        struct addrinfo hints = {0}, *res = NULL;");
+        wln!(self, "        hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;");
+        wln!(self, "        char portbuf[16]; snprintf(portbuf, sizeof(portbuf), \"%lld\", (long long)port);");
+        wln!(self, "        if (getaddrinfo(host, portbuf, &hints, &res) != 0 || !res) return -1;");
+        wln!(self, "        addr = *(struct sockaddr_in*)res->ai_addr;");
+        wln!(self, "        freeaddrinfo(res);");
+        wln!(self, "    }");
+        wln!(self, "    int sock = socket(AF_INET, SOCK_STREAM, 0);");
+        wln!(self, "    if (sock < 0) return -1;");
         wln!(self, "    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {");
-        wln!(self, "        close(sock); return -1;");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "        closesocket(sock);");
+        wln!(self, "#else");
+        wln!(self, "        close(sock);");
+        wln!(self, "#endif");
+        wln!(self, "        return -1;");
         wln!(self, "    }");
         wln!(self, "    // Return the socket FD as an eager future (positive = ready)");
         wln!(self, "    return (int64_t)sock;");
@@ -4041,7 +4202,11 @@ impl CCodeGen {
         wln!(self, "    return p_io_spawn(2, sock, (char*)buf, len);");
         wln!(self, "}");
         wln!(self, "void p_net_close(int64_t sock) {");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    closesocket((SOCKET)sock);");
+        wln!(self, "#else");
         wln!(self, "    close((int)sock);");
+        wln!(self, "#endif");
         wln!(self, "}");
         wln!(self, "int64_t p_fs_read_async(const char* path, char* buf, int64_t len) {");
         wln!(self, "    // Use sock field to pass the path pointer (op=3 reads it as path)");
@@ -4225,8 +4390,8 @@ impl CCodeGen {
         wln!(self, "int64_t p_allocator_alloc(void* alloc, int64_t size) { (void)alloc; if (size < 0) return 0; return (int64_t)(intptr_t)malloc((size_t)size); }");
         wln!(self, "void p_allocator_free(void* alloc, int64_t ptr) { (void)alloc; free((void*)(intptr_t)ptr); }");
         wln!(self, "int64_t p_allocator_stats(void* alloc) { (void)alloc; return 0; }");
-        wln!(self, "int64_t print(int64_t val) { printf(\"%lld\", (long long)val); return 0; }");
-        wln!(self, "int64_t print_str(const char* s) { printf(\"%s\", s); return 0; }");
+        wln!(self, "int64_t print(int64_t val) { char b[32]; int n = snprintf(b, sizeof b, \"%lld\", (long long)val); fwrite(b, 1, (size_t)n, stdout); return 0; }");
+        wln!(self, "int64_t print_str(const char* s) { fwrite(s, 1, strlen(s), stdout); return 0; }");
         wln!(self, "");
         // String functions
         wln!(self, "bool p_string_contains(const char* s, const char* sub) {{ return s && sub && strstr(s, sub) != NULL; }}");
@@ -4551,6 +4716,117 @@ impl CCodeGen {
         wln!(self, "    if (n >= (int64_t)sizeof(buf)) n = sizeof(buf) - 1;");
         wln!(self, "    buf[n] = 0;");
         wln!(self, "    return strdup(buf);");
+        wln!(self, "}");
+        wln!(self, "");
+        wln!(self, "// ─── Nonblocking sockets + readiness poll (async event loop) ───");
+        wln!(self, "int64_t p_socket_nonblock(int64_t fd, int64_t on) {");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    u_long m = on ? 1u : 0u;");
+        wln!(self, "    return ioctlsocket((SOCKET)fd, FIONBIO, &m);");
+        wln!(self, "#else");
+        wln!(self, "    int fl = fcntl((int)fd, F_GETFL, 0);");
+        wln!(self, "    if (fl < 0) return -1;");
+        wln!(self, "    return fcntl((int)fd, F_SETFL, on ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK));");
+        wln!(self, "#endif");
+        wln!(self, "}");
+        wln!(self, "int64_t p_socket_poll(int64_t fd, int64_t timeout_ms, int64_t write_mode) {");
+        wln!(self, "    fd_set rset, wset; struct timeval tv;");
+        wln!(self, "    FD_ZERO(&rset); FD_ZERO(&wset);");
+        wln!(self, "    if (write_mode) FD_SET((SOCKET)fd, &wset); else FD_SET((SOCKET)fd, &rset);");
+        wln!(self, "    tv.tv_sec = (long)(timeout_ms / 1000);");
+        wln!(self, "    tv.tv_usec = (long)((timeout_ms % 1000) * 1000);");
+        wln!(self, "    int n = select((int)(fd + 1), &rset, &wset, NULL, timeout_ms < 0 ? NULL : &tv);");
+        wln!(self, "    return (int64_t)n;");
+        wln!(self, "}");
+        wln!(self, "");
+        wln!(self, "// ─── Signals ───");
+        wln!(self, "#include <signal.h>");
+        wln!(self, "static volatile sig_atomic_t p_signal_flags[64] = {0};");
+        wln!(self, "static void p_signal_trampoline(int s) { if (s >= 0 && s < 64) p_signal_flags[s] = 1; }");
+        wln!(self, "int64_t p_signal_register(int64_t sig) {");
+        wln!(self, "    if (sig < 0 || sig >= 64) return -1;");
+        wln!(self, "    if (signal((int)sig, p_signal_trampoline) == SIG_ERR) return -1;");
+        wln!(self, "    return 0;");
+        wln!(self, "}");
+        wln!(self, "int64_t p_signal_check(int64_t sig) {");
+        wln!(self, "    if (sig < 0 || sig >= 64) return 0;");
+        wln!(self, "    int64_t f = p_signal_flags[sig]; p_signal_flags[sig] = 0;");
+        wln!(self, "    return f;");
+        wln!(self, "}");
+        wln!(self, "int64_t p_signal_raise(int64_t sig) { return raise((int)sig); }");
+        wln!(self, "");
+        wln!(self, "// ─── Memory-mapped files / anonymous mappings ───");
+        wln!(self, "#ifndef _WIN32");
+        wln!(self, "#include <sys/mman.h>");
+        wln!(self, "#include <sys/stat.h>");
+        wln!(self, "#include <fcntl.h>");
+        wln!(self, "#endif");
+        wln!(self, "typedef struct { void* addr; int64_t len; int64_t h1; int64_t h2; int is_file; } p_mmap_entry_t;");
+        wln!(self, "static p_mmap_entry_t p_mmap_table[256];");
+        wln!(self, "static int p_mmap_find(void* addr) { for (int i = 0; i < 256; i++) if (p_mmap_table[i].addr == addr) return i; return -1; }");
+        wln!(self, "static int p_mmap_slot(void) { for (int i = 0; i < 256; i++) if (!p_mmap_table[i].addr) return i; return -1; }");
+        wln!(self, "int64_t p_mmap_anon(int64_t len) {");
+        wln!(self, "    if (len <= 0) return 0;");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    void* p = VirtualAlloc(NULL, (SIZE_T)len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);");
+        wln!(self, "#else");
+        wln!(self, "    void* p = mmap(NULL, (size_t)len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);");
+        wln!(self, "    if (p == MAP_FAILED) p = NULL;");
+        wln!(self, "#endif");
+        wln!(self, "    if (!p) return 0;");
+        wln!(self, "    int s = p_mmap_slot(); if (s < 0) return 0;");
+        wln!(self, "    p_mmap_table[s].addr = p; p_mmap_table[s].len = len; p_mmap_table[s].is_file = 0;");
+        wln!(self, "    return (int64_t)(intptr_t)p;");
+        wln!(self, "}");
+        wln!(self, "int64_t p_mmap_file(const char* path) {");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    HANDLE f = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);");
+        wln!(self, "    if (f == INVALID_HANDLE_VALUE) f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);");
+        wln!(self, "    if (f == INVALID_HANDLE_VALUE) return 0;");
+        wln!(self, "    LARGE_INTEGER sz; if (!GetFileSizeEx(f, &sz) || sz.QuadPart == 0) { CloseHandle(f); return 0; }");
+        wln!(self, "    HANDLE m = CreateFileMappingA(f, NULL, PAGE_READWRITE, 0, 0, NULL);");
+        wln!(self, "    if (!m) m = CreateFileMappingA(f, NULL, PAGE_READONLY, 0, 0, NULL);");
+        wln!(self, "    if (!m) { CloseHandle(f); return 0; }");
+        wln!(self, "    void* p = MapViewOfFile(m, FILE_MAP_ALL_ACCESS, 0, 0, 0);");
+        wln!(self, "    if (!p) p = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);");
+        wln!(self, "    if (!p) { CloseHandle(m); CloseHandle(f); return 0; }");
+        wln!(self, "    int s = p_mmap_slot(); if (s < 0) return 0;");
+        wln!(self, "    p_mmap_table[s].addr = p; p_mmap_table[s].len = (int64_t)sz.QuadPart;");
+        wln!(self, "    p_mmap_table[s].h1 = (int64_t)(intptr_t)m; p_mmap_table[s].h2 = (int64_t)(intptr_t)f;");
+        wln!(self, "    p_mmap_table[s].is_file = 1;");
+        wln!(self, "    return (int64_t)(intptr_t)p;");
+        wln!(self, "#else");
+        wln!(self, "    int fd = open(path, O_RDWR); if (fd < 0) fd = open(path, O_RDONLY);");
+        wln!(self, "    if (fd < 0) return 0;");
+        wln!(self, "    struct stat st; if (fstat(fd, &st) < 0 || st.st_size == 0) { close(fd); return 0; }");
+        wln!(self, "    void* p = mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);");
+        wln!(self, "    if (p == MAP_FAILED) p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);");
+        wln!(self, "    if (p == MAP_FAILED) { close(fd); return 0; }");
+        wln!(self, "    int s = p_mmap_slot(); if (s < 0) return 0;");
+        wln!(self, "    p_mmap_table[s].addr = p; p_mmap_table[s].len = (int64_t)st.st_size;");
+        wln!(self, "    p_mmap_table[s].h1 = fd; p_mmap_table[s].is_file = 1;");
+        wln!(self, "    return (int64_t)(intptr_t)p;");
+        wln!(self, "#endif");
+        wln!(self, "}");
+        wln!(self, "int64_t p_mmap_len(int64_t addr) { int s = p_mmap_find((void*)(intptr_t)addr); return s < 0 ? 0 : p_mmap_table[s].len; }");
+        wln!(self, "int64_t p_munmap(int64_t addr) {");
+        wln!(self, "    int s = p_mmap_find((void*)(intptr_t)addr); if (s < 0) return -1;");
+        wln!(self, "    p_mmap_entry_t e = p_mmap_table[s]; p_mmap_table[s].addr = NULL;");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    if (e.is_file) { UnmapViewOfFile(e.addr); CloseHandle((HANDLE)(intptr_t)e.h1); CloseHandle((HANDLE)(intptr_t)e.h2); }");
+        wln!(self, "    else VirtualFree(e.addr, 0, MEM_RELEASE);");
+        wln!(self, "#else");
+        wln!(self, "    munmap(e.addr, (size_t)e.len); if (e.is_file) close((int)e.h1);");
+        wln!(self, "#endif");
+        wln!(self, "    return 0;");
+        wln!(self, "}");
+        wln!(self, "int64_t p_msync(int64_t addr) {");
+        wln!(self, "    int s = p_mmap_find((void*)(intptr_t)addr); if (s < 0) return -1;");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    return FlushViewOfFile(p_mmap_table[s].addr, 0) ? 0 : -1;");
+        wln!(self, "#else");
+        wln!(self, "    return msync(p_mmap_table[s].addr, (size_t)p_mmap_table[s].len, MS_SYNC);");
+        wln!(self, "#endif");
         wln!(self, "}");
 
         // ─── Bare metal builtins (Phase 5A) — stubs for C codegen ───

@@ -1,0 +1,200 @@
+// Fides MIME standard library
+//
+// File extension ↔ MIME type mapping, Content-Type header parsing,
+// and type classification helpers.
+//
+// Usage:
+//   use mime;
+//   println(mime_from_path("index.html"));        // text/html
+//   println(mime_from_ext("png"));                // image/png
+//   println(mime_base("text/html; charset=utf-8")); // text/html
+
+module mime;
+
+use vec;
+use string;
+use fs;
+
+// ─── Extension table ────────────────────────────────────────────────────
+// Parallel lists keep lookup simple and backend-independent.
+
+fn mime_exts() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    // text
+    v.push("txt"); v.push("text"); v.push("md"); v.push("markdown");
+    v.push("html"); v.push("htm"); v.push("css"); v.push("csv");
+    v.push("xml"); v.push("json"); v.push("yaml"); v.push("yml");
+    v.push("toml"); v.push("ini"); v.push("js"); v.push("mjs");
+    v.push("ts"); v.push("fd"); v.push("c"); v.push("h"); v.push("rs");
+    v.push("py"); v.push("java"); v.push("go"); v.push("sh"); v.push("bat");
+    v.push("ps1"); v.push("wasm"); v.push("map"); v.push("svg");
+    // images
+    v.push("png"); v.push("jpg"); v.push("jpeg"); v.push("gif");
+    v.push("webp"); v.push("bmp"); v.push("ico"); v.push("tif"); v.push("tiff");
+    // audio/video
+    v.push("mp3"); v.push("wav"); v.push("ogg"); v.push("flac");
+    v.push("mp4"); v.push("webm"); v.push("avi"); v.push("mov"); v.push("mkv");
+    // fonts
+    v.push("woff"); v.push("woff2"); v.push("ttf"); v.push("otf"); v.push("eot");
+    // documents
+    v.push("pdf"); v.push("doc"); v.push("docx"); v.push("xls"); v.push("xlsx");
+    v.push("ppt"); v.push("pptx"); v.push("rtf");
+    // data / archives
+    v.push("zip"); v.push("gz"); v.push("tar"); v.push("bz2"); v.push("xz");
+    v.push("7z"); v.push("rar"); v.push("bin"); v.push("dat"); v.push("sqlite");
+    v.push("db"); v.push("exe"); v.push("dll"); v.push("msi"); v.push("dmg");
+    v.push("iso"); v.push("apk"); v.push("deb"); v.push("rpm");
+    return v;
+}
+
+fn mime_types() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    // text
+    v.push("text/plain"); v.push("text/plain"); v.push("text/markdown");
+    v.push("text/markdown"); v.push("text/html"); v.push("text/html");
+    v.push("text/css"); v.push("text/csv"); v.push("application/xml");
+    v.push("application/json"); v.push("application/yaml");
+    v.push("application/yaml"); v.push("application/toml");
+    v.push("text/plain"); v.push("text/javascript"); v.push("text/javascript");
+    v.push("text/plain"); v.push("text/plain"); v.push("text/plain");
+    v.push("text/plain"); v.push("text/plain"); v.push("text/x-python");
+    v.push("text/x-java-source"); v.push("text/x-go"); v.push("text/x-sh");
+    v.push("text/plain"); v.push("text/plain"); v.push("application/wasm");
+    v.push("application/json"); v.push("image/svg+xml");
+    // images
+    v.push("image/png"); v.push("image/jpeg"); v.push("image/jpeg");
+    v.push("image/gif"); v.push("image/webp"); v.push("image/bmp");
+    v.push("image/x-icon"); v.push("image/tiff"); v.push("image/tiff");
+    // audio/video
+    v.push("audio/mpeg"); v.push("audio/wav"); v.push("audio/ogg");
+    v.push("audio/flac"); v.push("video/mp4"); v.push("video/webm");
+    v.push("video/x-msvideo"); v.push("video/quicktime"); v.push("video/x-matroska");
+    // fonts
+    v.push("font/woff"); v.push("font/woff2"); v.push("font/ttf");
+    v.push("font/otf"); v.push("application/vnd.ms-fontobject");
+    // documents
+    v.push("application/pdf"); v.push("application/msword");
+    v.push("application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    v.push("application/vnd.ms-excel");
+    v.push("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    v.push("application/vnd.ms-powerpoint");
+    v.push("application/vnd.openxmlformats-officedocument.presentationml.presentation");
+    v.push("application/rtf");
+    // data / archives
+    v.push("application/zip"); v.push("application/gzip");
+    v.push("application/x-tar"); v.push("application/x-bzip2");
+    v.push("application/x-xz"); v.push("application/x-7z-compressed");
+    v.push("application/vnd.rar"); v.push("application/octet-stream");
+    v.push("application/octet-stream"); v.push("application/vnd.sqlite3");
+    v.push("application/octet-stream"); v.push("application/octet-stream");
+    v.push("application/octet-stream"); v.push("application/octet-stream");
+    v.push("application/x-iso9660-image"); v.push("application/vnd.android.package-archive");
+    v.push("application/x-deb"); v.push("application/x-rpm");
+    return v;
+}
+
+/// Default type when nothing matches.
+pub fn mime_default() -> str { return "application/octet-stream"; }
+
+// ─── Lookups ────────────────────────────────────────────────────────────
+
+/// MIME type for a file extension (with or without leading dot).
+/// Returns "application/octet-stream" when unknown.
+pub fn mime_from_ext(ext: str) -> str {
+    var e: str = str_to_lower(str_trim(ext));
+    if str_starts_with(e, ".") { e = str_slice(e, 1, str_len(e)); }
+    var exts: Vec<str> = mime_exts();
+    var i: i64 = 0;
+    while i < exts.len() {
+        if str_equal(exts.get(i), e) { return mime_types().get(i); }
+        i = i + 1;
+    }
+    return mime_default();
+}
+
+/// MIME type for a path (uses its extension).
+pub fn mime_from_path(path: str) -> str {
+    return mime_from_ext(fs_ext(path));
+}
+
+/// True if `ext` maps to a known type.
+pub fn mime_known(ext: str) -> bool {
+    return !str_equal(mime_from_ext(ext), mime_default()) ||
+           str_equal(str_to_lower(str_trim(ext)), "bin");
+}
+
+/// First extension registered for a MIME type, or "" when none.
+pub fn mime_ext_for(mime: str) -> str {
+    var m: str = mime_base(mime);
+    var types: Vec<str> = mime_types();
+    var i: i64 = 0;
+    while i < types.len() {
+        if str_equal(types.get(i), m) { return mime_exts().get(i); }
+        i = i + 1;
+    }
+    return "";
+}
+
+// ─── Content-Type helpers ───────────────────────────────────────────────
+
+/// Strip parameters: "text/html; charset=utf-8" → "text/html".
+pub fn mime_base(content_type: str) -> str {
+    var semi: i64 = str_find(content_type, ";");
+    var b: str = content_type;
+    if semi >= 0 { b = str_slice(content_type, 0, semi); }
+    return str_to_lower(str_trim(b));
+}
+
+/// A parameter value from a Content-Type header, e.g.
+/// mime_param("text/c; charset=utf-8", "charset") → "utf-8".
+pub fn mime_param(content_type: str, name: str) -> str {
+    var semi: i64 = str_find(content_type, ";");
+    if semi < 0 { return ""; }
+    var params: str = str_slice(content_type, semi + 1, str_len(content_type));
+    var parts: Vec = str_split(params, ";");
+    var i: i64 = 0;
+    while i < parts.len() {
+        var p: str = str_trim(parts.get(i));
+        var eqi: i64 = str_find(p, "=");
+        if eqi > 0 {
+            var k: str = str_to_lower(str_trim(str_slice(p, 0, eqi)));
+            if str_equal(k, str_to_lower(name)) {
+                var v: str = str_trim(str_slice(p, eqi + 1, str_len(p)));
+                if str_len(v) >= 2 && str_byte_at(v, 0) == 34 &&
+                   str_byte_at(v, str_len(v) - 1) == 34 {
+                    v = str_slice(v, 1, str_len(v) - 1);
+                }
+                return v;
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// ─── Classification ─────────────────────────────────────────────────────
+
+fn mime_prefix(ct: str, top: str) -> bool {
+    return str_starts_with(mime_base(ct), top + "/");
+}
+
+pub fn mime_is_text(ct: str) -> bool {
+    var b: str = mime_base(ct);
+    if mime_prefix(b, "text") { return true; }
+    return str_equal(b, "application/json") || str_equal(b, "application/xml") ||
+           str_equal(b, "application/javascript") || str_equal(b, "text/javascript") ||
+           str_equal(b, "application/yaml") || str_equal(b, "application/toml") ||
+           str_ends_with(b, "+json") || str_ends_with(b, "+xml");
+}
+
+pub fn mime_is_image(ct: str) -> bool { return mime_prefix(ct, "image"); }
+pub fn mime_is_audio(ct: str) -> bool { return mime_prefix(ct, "audio"); }
+pub fn mime_is_video(ct: str) -> bool { return mime_prefix(ct, "video"); }
+
+/// True for types that compress well (text + structured data).
+pub fn mime_is_compressible(ct: str) -> bool {
+    var b: str = mime_base(ct);
+    if mime_is_text(b) { return true; }
+    return str_equal(b, "application/wasm") || str_equal(b, "image/svg+xml") ||
+           str_equal(b, "font/ttf") || str_equal(b, "font/otf");
+}

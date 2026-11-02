@@ -37,7 +37,19 @@ static struct sockaddr_in make_addr(long long ip, long long port) {
 
 // ─── API ─────────────────────────────────────────────────────────────────
 
+#ifdef _WIN32
+static int pledge_net_wsa_ready = 0;
+static void pledge_net_wsa_init(void) {
+    if (pledge_net_wsa_ready) return;
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) pledge_net_wsa_ready = 1;
+}
+#else
+static void pledge_net_wsa_init(void) {}
+#endif
+
 long long pledge_net_socket(long long domain, long long type, long long protocol) {
+    pledge_net_wsa_init();
     return (long long)socket((int)domain, (int)type, (int)protocol);
 }
 

@@ -276,6 +276,14 @@ pub fn substitute(program: Program) -> Program {
 
     // Phase 3: Aggressive comptime evuation -- auto-evaluate calls to
     // comptime fn functions when ALL arguments are literals
+    ct_comptime_fns = HashMap_new();
+    var cf: i64 = 0;
+    while cf < prog.funcs.len() {
+        if prog.funcs.get(cf).is_comptime {
+            HashMap_insert(ct_comptime_fns, prog.funcs.get(cf).name, 1);
+        }
+        cf = cf + 1;
+    }
     var iter2: i64 = 0;
     while iter2 < 4 {
         var fi3: i64 = 0;
@@ -575,6 +583,9 @@ fn substitute_expr_comptime_reflect(expr: &mut Expr, op: ReflectOp, ty: Type, or
 // Auto-evaluate calls to `comptime fn` functions when ALL arguments are
 // literals, without requiring an explicit `comptime` wrapper.
 
+// The names of this program's comptime fns
+var ct_comptime_fns: i64 = 0;
+
 fn aggressive_comptime_func(funcs: Vec<Func>, idx: i64, original: &Program) {
     var func: Func = funcs.get(idx);
     var si: i64 = 0;
@@ -759,14 +770,7 @@ fn aggressive_comptime_expr(expr: &mut Expr, original: &Program) {
     // I-5A: If this is a call to a comptime fn with all-literal args, evaluate it
     match expr {
         Expr::Call(callee, args) => {
-            var is_comptime_fn: bool = false;
-            var fi: i64 = 0;
-            while fi < original.funcs.len() {
-                var f: Func = original.funcs.get(fi);
-                if f.name == callee && f.is_comptime { is_comptime_fn = true; }
-                fi = fi + 1;
-            }
-            if is_comptime_fn {
+            if HashMap_get(ct_comptime_fns, callee) != 0 {
                 var all_lit: bool = true;
                 var ai: i64 = 0;
                 while ai < args.len() {

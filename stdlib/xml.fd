@@ -1,0 +1,428 @@
+// Fides XML standard library
+//
+// XML parsing and serialization — the well-formed-document subset:
+//   elements, attributes, text content, comments <!-- -->,
+//   CDATA <![CDATA[...]]>, processing instructions <?...?>,
+//   XML declarations, entity refs (&amp; &lt; &gt; &quot; &apos; &#NN;),
+//   and self-closing tags. Not supported: DTDs, namespaces-aware
+//   validation, mixed-content whitespace semantics.
+//
+// Attributes are parallel vecs (names/values) on each XmlNode.
+//
+// Usage:
+//   use xml;
+//   val root = xml_parse("<a x=\"1\"><b>hi</b></a>");
+//   println(xml_attr(root, "x"));
+//   println(xml_child(root, "b").text);
+
+module xml;
+
+use vec;
+use string;
+
+// ─── Node model ─────────────────────────────────────────────────────────
+
+/// An XML element. `text` accumulates character data found directly
+/// inside the element (concatenated, entity-decoded). Empty `tag`
+/// marks a parse failure / not-found sentinel.
+pub struct XmlNode {
+    pub tag: str,
+    pub attr_names: Vec<str>,
+    pub attr_vals: Vec<str>,
+    pub text: str,
+    pub children: Vec<XmlNode>,
+}
+
+fn x_node(tag: str) -> XmlNode {
+    return XmlNode {
+        tag: tag, attr_names: Vec::new(), attr_vals: Vec::new(),
+        text: "", children: Vec::new() };
+}
+
+fn x_none() -> XmlNode { return x_node(""); }
+
+// ─── Entities ───────────────────────────────────────────────────────────
+
+/// Decode &amp; &lt; &gt; &quot; &apos; &#NN; &#xHH; entities.
+pub fn xml_unescape(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if c == 38 {                                       // '&'
+            var semi: i64 = i + 1;
+            var ent: str = "";
+            while semi < n && semi - i < 10 && str_byte_at(s, semi) != 59 {
+                semi = semi + 1;
+            }
+            if semi < n && str_byte_at(s, semi) == 59 {
+                ent = str_slice(s, i + 1, semi);
+                var rep: str = "";
+                if str_equal(ent, "amp") { rep = "&"; }
+                else if str_equal(ent, "lt") { rep = "<"; }
+                else if str_equal(ent, "gt") { rep = ">"; }
+                else if str_equal(ent, "quot") { rep = "\""; }
+                else if str_equal(ent, "apos") { rep = "'"; }
+                else if str_starts_with(ent, "#x") || str_starts_with(ent, "#X") {
+                    rep = x_utf8(str_parse_hex("0x" + str_slice(ent, 2, str_len(ent))));
+                }
+                else if str_starts_with(ent, "#") {
+                    rep = x_utf8(str_parse_int(str_slice(ent, 1, str_len(ent))));
+                }
+                if str_len(rep) > 0 {
+                    out = out + rep;
+                    i = semi + 1;
+                    continue;
+                }
+            }
+        }
+        out = out + str_slice(s, i, i + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn x_utf8(cp: i64) -> str {
+    if cp <= 0 { return ""; }
+    var bytes: Vec = Vec::new();
+    if cp < 128 { bytes.push(cp); }
+    else if cp < 2048 {
+        bytes.push(192 | (cp >> 6)); bytes.push(128 | (cp & 63));
+    } else if cp < 65536 {
+        bytes.push(224 | (cp >> 12));
+        bytes.push(128 | ((cp >> 6) & 63)); bytes.push(128 | (cp & 63));
+    } else {
+        bytes.push(240 | (cp >> 18));
+        bytes.push(128 | ((cp >> 12) & 63));
+        bytes.push(128 | ((cp >> 6) & 63)); bytes.push(128 | (cp & 63));
+    }
+    return str_from_bytes(bytes);
+}
+
+/// Escape & < > " in text content.
+pub fn xml_escape(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < n2(str_len(s)) {
+        var c: i64 = str_byte_at(s, i);
+        if c == 38 { out = out + "&amp;"; }
+        else if c == 60 { out = out + "&lt;"; }
+        else if c == 62 { out = out + "&gt;"; }
+        else if c == 34 { out = out + "&quot;"; }
+        else { out = out + str_slice(s, i, i + 1); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn n2(n: i64) -> i64 { return n; }
+
+// ─── Parser ─────────────────────────────────────────────────────────────
+
+fn x_is_name_start(c: i64) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+           c == 95 || c == 58 || c >= 128;
+}
+
+fn x_is_name_char(c: i64) -> bool {
+    return x_is_name_start(c) || (c >= 48 && c <= 57) || c == 45 || c == 46;
+}
+
+fn x_ws(s: str, i: i64) -> i64 {
+    var j: i64 = i;
+    var n: i64 = str_len(s);
+    while j < n {
+        var c: i64 = str_byte_at(s, j);
+        if c == 32 || c == 9 || c == 10 || c == 13 { j = j + 1; }
+        else { return j; }
+    }
+    return j;
+}
+
+// Scan a name; returns end index (0 if none at i).
+fn x_name(s: str, i: i64) -> i64 {
+    var n: i64 = str_len(s);
+    if i >= n || !x_is_name_start(str_byte_at(s, i)) { return 0; }
+    var j: i64 = i + 1;
+    while j < n && x_is_name_char(str_byte_at(s, j)) { j = j + 1; }
+    return j;
+}
+
+// Parse attributes starting at i (inside a tag); fills node, returns
+// index just after attributes (at '/', '>', or end).
+fn x_attrs(s: str, i: i64, node: &mut XmlNode) -> i64 {
+    var j: i64 = i;
+    var n: i64 = str_len(s);
+    while true {
+        j = x_ws(s, j);
+        if j >= n { return j; }
+        var c: i64 = str_byte_at(s, j);
+        if c == 62 || c == 47 { return j; }                 // '>' or '/'
+        var e: i64 = x_name(s, j);
+        if e == 0 { return j + 1; }
+        var name: str = str_slice(s, j, e);
+        j = x_ws(s, e);
+        var aval: str = "";
+        if j < n && str_byte_at(s, j) == 61 {               // '='
+            j = x_ws(s, j + 1);
+            if j < n {
+                var q: i64 = str_byte_at(s, j);
+                if q == 34 || q == 39 {
+                    var close: i64 = j + 1;
+                    while close < n && str_byte_at(s, close) != q { close = close + 1; }
+                    aval = xml_unescape(str_slice(s, j + 1, close));
+                    j = close + 1;
+                } else {
+                    // unquoted value (lenient)
+                    var k: i64 = j;
+                    while k < n {
+                        var cc: i64 = str_byte_at(s, k);
+                        if cc == 32 || cc == 62 || cc == 47 { break; }
+                        k = k + 1;
+                    }
+                    aval = str_slice(s, j, k);
+                    j = k;
+                }
+            }
+        }
+        node.attr_names.push(name);
+        node.attr_vals.push(aval);
+    }
+    return j;
+}
+
+// Find "-->" or "]]>" end; returns index after terminator or n.
+fn x_skip_until(s: str, i: i64, term: str) -> i64 {
+    var n: i64 = str_len(s);
+    var tn: i64 = str_len(term);
+    var j: i64 = i;
+    while j + tn <= n {
+        if str_equal(str_slice(s, j, j + tn), term) { return j + tn; }
+        j = j + 1;
+    }
+    return n;
+}
+
+// Recursive descent: parse content into `parent` until `close_tag`
+// or EOF. Text chunks accumulate into parent.text; elements into
+// parent.children. Returns position where parsing stopped.
+fn x_children(s: str, i: i64, parent: &mut XmlNode, close_tag: str) -> i64 {
+    var j: i64 = i;
+    var n: i64 = str_len(s);
+    var text_acc: str = "";
+    while j < n {
+        var c: i64 = str_byte_at(s, j);
+        if c == 60 {                                        // '<'
+            if j + 1 < n {
+                var c1: i64 = str_byte_at(s, j + 1);
+                if c1 == 47 {                               // '</' close
+                    var ce: i64 = str_find(str_slice(s, j, n), ">");
+                    if ce < 0 {
+                        parent.text = parent.text + xml_unescape(text_acc);
+                        return n;
+                    }
+                    var name_end: i64 = x_name(s, j + 2);
+                    var name: str = "";
+                    if name_end > 0 { name = str_slice(s, j + 2, name_end); }
+                    if str_len(close_tag) == 0 || str_equal(name, close_tag) {
+                        parent.text = parent.text + xml_unescape(text_acc);
+                        return j + ce + 1;
+                    }
+                    // mismatched close — skip it
+                    j = j + ce + 1;
+                    continue;
+                }
+                if c1 == 33 {                               // '!' comment/CDATA/DOCTYPE
+                    if str_starts_with(str_slice(s, j, n), "<!--") {
+                        j = x_skip_until(s, j + 4, "-->");
+                        continue;
+                    }
+                    if str_starts_with(str_slice(s, j, n), "<![CDATA[") {
+                        var cend: i64 = x_skip_until(s, j + 9, "]]>");
+                        var cd: str = str_slice(s, j + 9, cend - 3);
+                        if cend >= n { cd = str_slice(s, j + 9, n); }
+                        text_acc = text_acc + cd;
+                        j = cend;
+                        continue;
+                    }
+                    // DOCTYPE or other <! ... >: skip to '>'
+                    var d_end: i64 = str_find(str_slice(s, j, n), ">");
+                    if d_end < 0 { return n; }
+                    j = j + d_end + 1;
+                    continue;
+                }
+                if c1 == 63 {                               // '?' PI/xml decl
+                    var p_end: i64 = str_find(str_slice(s, j, n), "?>");
+                    if p_end < 0 { return n; }
+                    j = j + p_end + 2;
+                    continue;
+                }
+                // Element open
+                var ne: i64 = x_name(s, j + 1);
+                if ne == 0 {                                 // stray '<'
+                    text_acc = text_acc + "<";
+                    j = j + 1;
+                    continue;
+                }
+                var tag: str = str_slice(s, j + 1, ne);
+                var node: XmlNode = x_node(tag);
+                var k: i64 = x_attrs(s, ne, &mut node);
+                var self_close: bool = false;
+                if k < n && str_byte_at(s, k) == 47 {
+                    self_close = true;
+                    k = k + 1;
+                }
+                if k < n && str_byte_at(s, k) == 62 { k = k + 1; }
+                else { k = n; }
+                // pending text belongs to the parent element
+                if str_len(text_acc) > 0 {
+                    parent.text = parent.text + xml_unescape(text_acc);
+                    text_acc = "";
+                }
+                if !self_close {
+                    k = x_children(s, k, &mut node, tag);
+                }
+                parent.children.push(node);
+                j = k;
+                continue;
+            }
+        }
+        // text run
+        var t_end: i64 = j;
+        while t_end < n && str_byte_at(s, t_end) != 60 { t_end = t_end + 1; }
+        text_acc = text_acc + str_slice(s, j, t_end);
+        j = t_end;
+    }
+    if str_len(text_acc) > 0 {
+        parent.text = parent.text + xml_unescape(text_acc);
+    }
+    return j;
+}
+
+/// Parse an XML document. Returns the root element; a node with
+/// tag "" when no element is found.
+pub fn xml_parse(text: str) -> XmlNode {
+    var doc: XmlNode = x_node("#document");
+    x_children(text, 0, &mut doc, "");
+    if doc.children.len() == 0 { return x_none(); }
+    return doc.children.get(0);
+}
+
+/// Parse a fragment allowing multiple top-level elements.
+pub fn xml_parse_fragment(text: str) -> Vec<XmlNode> {
+    var doc: XmlNode = x_node("#document");
+    x_children(text, 0, &mut doc, "");
+    return doc.children;
+}
+
+// ─── Accessors ──────────────────────────────────────────────────────────
+
+/// Attribute value or "" when absent.
+pub fn xml_attr(node: XmlNode, name: str) -> str {
+    var i: i64 = 0;
+    while i < node.attr_names.len() {
+        if str_equal(node.attr_names.get(i), name) { return node.attr_vals.get(i); }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// First direct child with `tag`; tag "" sentinel when absent.
+pub fn xml_child(node: XmlNode, tag: str) -> XmlNode {
+    var i: i64 = 0;
+    while i < node.children.len() {
+        if str_equal(node.children.get(i).tag, tag) { return node.children.get(i); }
+        i = i + 1;
+    }
+    return x_none();
+}
+
+/// True when node has a direct child with `tag`.
+pub fn xml_has(node: XmlNode, tag: str) -> bool {
+    return str_len(xml_child(node, tag).tag) > 0;
+}
+
+/// All direct children with `tag`.
+pub fn xml_children(node: XmlNode, tag: str) -> Vec<XmlNode> {
+    var out: Vec<XmlNode> = Vec::new();
+    var i: i64 = 0;
+    while i < node.children.len() {
+        if str_equal(node.children.get(i).tag, tag) { out.push(node.children.get(i)); }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// All descendant elements with `tag` (document order).
+pub fn xml_find_all(node: XmlNode, tag: str) -> Vec<XmlNode> {
+    var out: Vec<XmlNode> = Vec::new();
+    x_collect(node, tag, &mut out);
+    return out;
+}
+
+fn x_collect(node: XmlNode, tag: str, out: &mut Vec<XmlNode>) -> void {
+    if str_equal(node.tag, tag) { out.push(node); }
+    var i: i64 = 0;
+    while i < node.children.len() {
+        x_collect(node.children.get(i), tag, out);
+        i = i + 1;
+    }
+}
+
+/// All descendant-or-self text concatenated (entity-decoded).
+pub fn xml_text(node: XmlNode) -> str {
+    var out: str = node.text;
+    var i: i64 = 0;
+    while i < node.children.len() {
+        var sep: str = "";
+        if str_len(out) > 0 { sep = ""; }
+        out = out + sep + xml_text(node.children.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Serialization ──────────────────────────────────────────────────────
+
+/// Serialize a node tree back to XML text (no pretty indentation).
+pub fn xml_to_str(node: XmlNode) -> str {
+    var out: str = "<" + node.tag;
+    var i: i64 = 0;
+    while i < node.attr_names.len() {
+        out = out + " " + node.attr_names.get(i) + "=\"" +
+              xml_escape(node.attr_vals.get(i)) + "\"";
+        i = i + 1;
+    }
+    if node.children.len() == 0 && str_len(node.text) == 0 {
+        return out + " />";
+    }
+    out = out + ">";
+    out = out + xml_escape(node.text);
+    var c: i64 = 0;
+    while c < node.children.len() {
+        out = out + xml_to_str(node.children.get(c));
+        c = c + 1;
+    }
+    return out + "</" + node.tag + ">";
+}
+
+/// Build an element node.
+pub fn xml_elem(tag: str, text: str) -> XmlNode {
+    var n: XmlNode = x_node(tag);
+    n.text = text;
+    return n;
+}
+
+/// Add an attribute to a node (returns the node for chaining).
+pub fn xml_with_attr(node: XmlNode, name: str, value: str) -> XmlNode {
+    node.attr_names.push(name);
+    node.attr_vals.push(value);
+    return node;
+}
+
+/// Append a child (returns the parent for chaining).
+pub fn xml_with_child(node: XmlNode, child: XmlNode) -> XmlNode {
+    node.children.push(child);
+    return node;
+}

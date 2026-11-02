@@ -492,6 +492,8 @@ pub struct Lowerer {
     pub let_hint: OptType,
     pub func_param_names: Vec<StringVecStrEntry>,
     pub func_defaults: Vec<StringVecExprEntry>,
+    // Name -> position in func_param_names and func_defaults + 1
+    pub func_info_at: i64,
     /// L3A: numbers the continuation closures (__cont_N).
     pub continuation_counter: i64,
 }
@@ -551,6 +553,7 @@ pub fn Lowerer_new() -> Lowerer {
         let_hint: OptType::None,
         func_param_names: Vec::new(),
         func_defaults: Vec::new(),
+        func_info_at: HashMap_new(),
         continuation_counter: 0,
     };
 }
@@ -2240,6 +2243,9 @@ pub fn Lowerer_lower_program(self: &mut Lowerer, program: Program) -> IrModule {
                 defaults.push(Expr::IntLit(0));
             }
             pi = pi + 1;
+        }
+        if HashMap_get(self.func_info_at, func.name) == 0 {
+            HashMap_insert(self.func_info_at, func.name, self.func_defaults.len() + 1);
         }
         self.func_param_names.push(StringVecStrEntry_new(func.name, param_names));
         self.func_defaults.push(StringVecExprEntry_new(func.name, defaults));
@@ -5185,29 +5191,21 @@ fn Lowerer_resolve_call_args(self: &mut Lowerer, callee: str, args: Vec<Expr>) -
 }
 
 fn Lowerer_lookup_defaults(self: &mut Lowerer, callee: str) -> Vec<Expr> {
-    var result: Vec<Expr> = Vec::new();
-    var fi: i64 = 0;
-    while fi < self.func_defaults.len() {
-        var entry: StringVecExprEntry = self.func_defaults.get(fi);
-        if entry.key == callee {
-            return entry.val;
-        }
-        fi = fi + 1;
+    var at: i64 = HashMap_get(self.func_info_at, callee);
+    if at != 0 {
+        return self.func_defaults.get(at - 1).val;
     }
+    var result: Vec<Expr> = Vec::new();
     return result;
 }
 
 fn Lowerer_lookup_param_names(self: &mut Lowerer, callee: str) -> Vec<str> {
     // Look up function param names from the func_param_names table
-    var result: Vec<str> = Vec::new();
-    var fi: i64 = 0;
-    while fi < self.func_param_names.len() {
-        var entry: StringVecStrEntry = self.func_param_names.get(fi);
-        if entry.key == callee {
-            return entry.val;
-        }
-        fi = fi + 1;
+    var at: i64 = HashMap_get(self.func_info_at, callee);
+    if at != 0 {
+        return self.func_param_names.get(at - 1).val;
     }
+    var result: Vec<str> = Vec::new();
     return result;
 }
 

@@ -4655,6 +4655,16 @@ impl Interpreter {
                 }
             }
             "p_socket_close" => ExecOutcome::Continue,
+            "p_socket_nonblock" | "p_signal_raise" => {
+                ExecOutcome::Value(Value::Int(0))
+            }
+            "p_socket_poll" | "p_signal_register" => {
+                ExecOutcome::Value(Value::Int(0))
+            }
+            "p_signal_check" => ExecOutcome::Value(Value::Int(0)),
+            "p_mmap_len" | "p_mmap_anon" | "p_mmap_file" | "p_munmap" | "p_msync" => {
+                ExecOutcome::Value(Value::Int(0))
+            }
             "p_socket_recv_str" => {
                 // Simulated — return empty string
                 ExecOutcome::Value(Value::Str(CompactString::from("")))

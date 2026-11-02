@@ -1,0 +1,193 @@
+// Fides Diff standard library
+//
+// Line-based text diffing: LCS edit script plus unified-diff rendering.
+// Works on lines (str_lines split), so it handles source, config, and
+// golden-file comparisons.
+//
+// Usage:
+//   use diff;
+//   val ops = diff_lines("a\nb\nc", "a\nx\nc");
+//   println(diff_format(ops));          // context/- /+ rendering
+//   print(diff_unified(old, new, "old", "new", 3));
+
+module diff;
+
+use vec;
+use string;
+
+// ─── Op model ───────────────────────────────────────────────────────────
+// tag: " " context, "-" deleted from old, "+" added in new.
+
+/// One edit-script line.
+pub struct DiffOp {
+    pub tag: str,
+    pub text: str,
+}
+
+// ─── LCS core ───────────────────────────────────────────────────────────
+// Classic O(n·m) LCS over line-equality. Table is stored flat in a
+// Vec<i64>: dp[i*(m+1)+j] = LCS length of a[i..], b[j..].
+
+fn d_at(dp: Vec, w: i64, i: i64, j: i64) -> i64 {
+    return dp.get(i * w + j);
+}
+
+fn d_set(dp: &mut Vec, w: i64, i: i64, j: i64, v: i64) -> void {
+    dp.set(i * w + j, v);
+}
+
+/// Compute the edit script between `old_text` and `new_text` as
+/// Vec<DiffOp>. Context lines are tagged " ", deletions "-", inserts "+".
+pub fn diff_lines(old_text: str, new_text: str) -> Vec<DiffOp> {
+    var a: Vec<str> = str_lines(old_text);
+    var b: Vec<str> = str_lines(new_text);
+    return diff_vec(a, b);
+}
+
+/// Edit script between two already-split line vecs.
+pub fn diff_vec(a: Vec<str>, b: Vec<str>) -> Vec<DiffOp> {
+    var n: i64 = a.len();
+    var m: i64 = b.len();
+    var w: i64 = m + 1;
+    var dp: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < (n + 1) * w { dp.push(0); i = i + 1; }
+
+    // Fill from the bottom-right.
+    i = n - 1;
+    while i >= 0 {
+        var j: i64 = m - 1;
+        while j >= 0 {
+            if str_equal(a.get(i), b.get(j)) {
+                d_set(&mut dp, w, i, j, d_at(dp, w, i + 1, j + 1) + 1);
+            } else {
+                var del: i64 = d_at(dp, w, i + 1, j);
+                var ins: i64 = d_at(dp, w, i, j + 1);
+                if del >= ins { d_set(&mut dp, w, i, j, del); }
+                else { d_set(&mut dp, w, i, j, ins); }
+            }
+            j = j - 1;
+        }
+        i = i - 1;
+    }
+
+    // Walk the table.
+    var ops: Vec<DiffOp> = Vec::new();
+    var x: i64 = 0;
+    var y: i64 = 0;
+    while x < n && y < m {
+        if str_equal(a.get(x), b.get(y)) {
+            ops.push(DiffOp { tag: " ", text: a.get(x) });
+            x = x + 1; y = y + 1;
+        } else if d_at(dp, w, x + 1, y) >= d_at(dp, w, x, y + 1) {
+            ops.push(DiffOp { tag: "-", text: a.get(x) });
+            x = x + 1;
+        } else {
+            ops.push(DiffOp { tag: "+", text: b.get(y) });
+            y = y + 1;
+        }
+    }
+    while x < n { ops.push(DiffOp { tag: "-", text: a.get(x) }); x = x + 1; }
+    while y < m { ops.push(DiffOp { tag: "+", text: b.get(y) }); y = y + 1; }
+    return ops;
+}
+
+// ─── Stats & formatting ─────────────────────────────────────────────────
+
+/// True when the texts are identical (no +/- ops).
+pub fn diff_is_empty(ops: Vec<DiffOp>) -> bool {
+    var i: i64 = 0;
+    while i < ops.len() {
+        if !str_equal(ops.get(i).tag, " ") { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Count of changed lines (additions + deletions).
+pub fn diff_change_count(ops: Vec<DiffOp>) -> i64 {
+    var c: i64 = 0;
+    var i: i64 = 0;
+    while i < ops.len() {
+        if !str_equal(ops.get(i).tag, " ") { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+/// Render ops as " text" / "-text" / "+text" lines.
+pub fn diff_format(ops: Vec<DiffOp>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < ops.len() {
+        var op: DiffOp = ops.get(i);
+        out = out + op.tag + op.text + "\n";
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Unified-diff rendering with `context` lines around each hunk and
+/// "--- old_label" / "+++ new_label" headers.
+pub fn diff_unified(old_text: str, new_text: str,
+                    old_label: str, new_label: str, context: i64) -> str {
+    var ops: Vec<DiffOp> = diff_lines(old_text, new_text);
+    if diff_is_empty(ops) { return ""; }
+    var out: str = "--- " + old_label + "\n+++ " + new_label + "\n";
+
+    // Mark ops included in hunks (within `context` of a change).
+    var keep: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < ops.len() { keep.push(0); i = i + 1; }
+    i = 0;
+    while i < ops.len() {
+        if !str_equal(ops.get(i).tag, " ") {
+            var lo: i64 = i - context;
+            if lo < 0 { lo = 0; }
+            var hi: i64 = i + context;
+            if hi >= ops.len() { hi = ops.len() - 1; }
+            var k: i64 = lo;
+            while k <= hi { keep.set(k, 1); k = k + 1; }
+        }
+        i = i + 1;
+    }
+
+    // Emit hunks; track old/new line numbers.
+    var old_ln: i64 = 1;
+    var new_ln: i64 = 1;
+    i = 0;
+    while i < ops.len() {
+        if keep.get(i) == 0 {
+            if str_equal(ops.get(i).tag, "-") { old_ln = old_ln + 1; }
+            else if str_equal(ops.get(i).tag, "+") { new_ln = new_ln + 1; }
+            else { old_ln = old_ln + 1; new_ln = new_ln + 1; }
+            i = i + 1;
+            continue;
+        }
+        // hunk spans consecutive kept ops
+        var start: i64 = i;
+        while i < ops.len() && keep.get(i) == 1 { i = i + 1; }
+        var hunk: Vec<DiffOp> = Vec::new();
+        var j: i64 = start;
+        while j < i { hunk.push(ops.get(j)); j = j + 1; }
+        var old_count: i64 = 0;
+        var new_count: i64 = 0;
+        j = 0;
+        while j < hunk.len() {
+            if !str_equal(hunk.get(j).tag, "+") { old_count = old_count + 1; }
+            if !str_equal(hunk.get(j).tag, "-") { new_count = new_count + 1; }
+            j = j + 1;
+        }
+        out = out + "@@ -" + int_to_str(old_ln) + "," + int_to_str(old_count) +
+              " +" + int_to_str(new_ln) + "," + int_to_str(new_count) + " @@\n";
+        j = 0;
+        while j < hunk.len() {
+            var op2: DiffOp = hunk.get(j);
+            out = out + op2.tag + op2.text + "\n";
+            if !str_equal(op2.tag, "+") { old_ln = old_ln + 1; }
+            if !str_equal(op2.tag, "-") { new_ln = new_ln + 1; }
+            j = j + 1;
+        }
+    }
+    return out;
+}

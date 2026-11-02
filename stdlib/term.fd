@@ -1,0 +1,183 @@
+// Fides Terminal standard library
+//
+// ANSI escape codes for terminal UIs: colors, styles, cursor control,
+// screen clearing, and basic widgets (progress bar, prompt line).
+// Works on Windows 10+ consoles, macOS, and Linux terminals that
+// support ANSI; call term_supports_ansi() to gate usage.
+//
+// Usage:
+//   use term;
+//   term_clear();
+//   println(term_red("error") + " something failed");
+//   term_progress(3, 10);
+
+module term;
+
+use vec;
+use string;
+use os;
+
+// ─── Escape sequences ───────────────────────────────────────────────────
+
+pub const TERM_ESC: str = "\x1b";
+
+fn esc(code: str) -> str { return "\x1b[" + code; }
+
+// ─── Text styles ────────────────────────────────────────────────────────
+
+pub fn term_reset() -> str { return esc("0m"); }
+pub fn term_bold(s: str) -> str { return esc("1m") + s + esc("0m"); }
+pub fn term_dim(s: str) -> str { return esc("2m") + s + esc("0m"); }
+pub fn term_italic(s: str) -> str { return esc("3m") + s + esc("0m"); }
+pub fn term_underline(s: str) -> str { return esc("4m") + s + esc("0m"); }
+pub fn term_blink(s: str) -> str { return esc("5m") + s + esc("0m"); }
+pub fn term_inverse(s: str) -> str { return esc("7m") + s + esc("0m"); }
+pub fn term_strikethrough(s: str) -> str { return esc("9m") + s + esc("0m"); }
+
+// Foreground colors (SGR 30-37, bright 90-97).
+pub fn term_black(s: str) -> str { return esc("30m") + s + esc("0m"); }
+pub fn term_red(s: str) -> str { return esc("31m") + s + esc("0m"); }
+pub fn term_green(s: str) -> str { return esc("32m") + s + esc("0m"); }
+pub fn term_yellow(s: str) -> str { return esc("33m") + s + esc("0m"); }
+pub fn term_blue(s: str) -> str { return esc("34m") + s + esc("0m"); }
+pub fn term_magenta(s: str) -> str { return esc("35m") + s + esc("0m"); }
+pub fn term_cyan(s: str) -> str { return esc("36m") + s + esc("0m"); }
+pub fn term_white(s: str) -> str { return esc("37m") + s + esc("0m"); }
+pub fn term_gray(s: str) -> str { return esc("90m") + s + esc("0m"); }
+pub fn term_bright_red(s: str) -> str { return esc("91m") + s + esc("0m"); }
+pub fn term_bright_green(s: str) -> str { return esc("92m") + s + esc("0m"); }
+pub fn term_bright_yellow(s: str) -> str { return esc("93m") + s + esc("0m"); }
+pub fn term_bright_blue(s: str) -> str { return esc("94m") + s + esc("0m"); }
+pub fn term_bright_magenta(s: str) -> str { return esc("95m") + s + esc("0m"); }
+pub fn term_bright_cyan(s: str) -> str { return esc("96m") + s + esc("0m"); }
+pub fn term_bright_white(s: str) -> str { return esc("97m") + s + esc("0m"); }
+
+// Background colors.
+pub fn term_bg_red(s: str) -> str { return esc("41m") + s + esc("0m"); }
+pub fn term_bg_green(s: str) -> str { return esc("42m") + s + esc("0m"); }
+pub fn term_bg_yellow(s: str) -> str { return esc("43m") + s + esc("0m"); }
+pub fn term_bg_blue(s: str) -> str { return esc("44m") + s + esc("0m"); }
+pub fn term_bg_magenta(s: str) -> str { return esc("45m") + s + esc("0m"); }
+pub fn term_bg_cyan(s: str) -> str { return esc("46m") + s + esc("0m"); }
+pub fn term_bg_white(s: str) -> str { return esc("47m") + s + esc("0m"); }
+
+/// 256-color foreground (0-255).
+pub fn term_fg256(s: str, n: i64) -> str {
+    return esc("38;5;" + int_to_str(n) + "m") + s + esc("0m");
+}
+
+/// 256-color background (0-255).
+pub fn term_bg256(s: str, n: i64) -> str {
+    return esc("48;5;" + int_to_str(n) + "m") + s + esc("0m");
+}
+
+/// True-color foreground.
+pub fn term_rgb(s: str, r: i64, g: i64, b: i64) -> str {
+    return esc("38;2;" + int_to_str(r) + ";" + int_to_str(g) + ";" +
+               int_to_str(b) + "m") + s + esc("0m");
+}
+
+/// True-color background.
+pub fn term_bg_rgb(s: str, r: i64, g: i64, b: i64) -> str {
+    return esc("48;2;" + int_to_str(r) + ";" + int_to_str(g) + ";" +
+               int_to_str(b) + "m") + s + esc("0m");
+}
+
+// ─── Cursor control ─────────────────────────────────────────────────────
+
+pub fn term_up(n: i64) -> str { return esc(int_to_str(n) + "A"); }
+pub fn term_down(n: i64) -> str { return esc(int_to_str(n) + "B"); }
+pub fn term_forward(n: i64) -> str { return esc(int_to_str(n) + "C"); }
+pub fn term_back(n: i64) -> str { return esc(int_to_str(n) + "D"); }
+pub fn term_col(n: i64) -> str { return esc(int_to_str(n) + "G"); }
+pub fn term_goto(row: i64, col: i64) -> str {
+    return esc(int_to_str(row) + ";" + int_to_str(col) + "H");
+}
+pub fn term_home() -> str { return esc("H"); }
+pub fn term_save_cursor() -> str { return esc("s"); }
+pub fn term_restore_cursor() -> str { return esc("u"); }
+pub fn term_hide_cursor() -> str { return esc("?25l"); }
+pub fn term_show_cursor() -> str { return esc("?25h"); }
+
+// ─── Screen control ─────────────────────────────────────────────────────
+
+pub fn term_clear_code() -> str { return esc("2J") + esc("H"); }
+pub fn term_clear_line_code() -> str { return esc("2K"); }
+pub fn term_clear_to_end_code() -> str { return esc("0J"); }
+pub fn term_clear_line_to_end_code() -> str { return esc("0K"); }
+
+pub fn term_clear() -> void { print(term_clear_code()); }
+pub fn term_clear_line() -> void { print(term_clear_line_code()); }
+
+// ─── Widgets ────────────────────────────────────────────────────────────
+
+/// Render a progress bar string of `width` cells: [████░░░░] 40%.
+pub fn term_progress_bar(done: i64, total: i64, width: i64) -> str {
+    var w: i64 = width;
+    if w < 4 { w = 4; }
+    var t: i64 = total;
+    if t <= 0 { t = 1; }
+    var filled: i64 = (done * w) / t;
+    if filled > w { filled = w; }
+    if filled < 0 { filled = 0; }
+    var pct: i64 = (done * 100) / t;
+    if pct > 100 { pct = 100; }
+    var bar: str = "[";
+    var i: i64 = 0;
+    while i < w {
+        if i < filled { bar = bar + "#"; }
+        else { bar = bar + "-"; }
+        i = i + 1;
+    }
+    return bar + "] " + int_to_str(pct) + "%";
+}
+
+/// Print a carriage-returned progress bar (overwrites the current line).
+pub fn term_progress(done: i64, total: i64) -> void {
+    print("\r" + term_clear_line_code() + term_progress_bar(done, total, 30));
+}
+
+/// End a progress line (newline).
+pub fn term_progress_done() -> void { print("\n"); }
+
+/// Strip ANSI escape sequences from `s` (for width calculations/logs).
+pub fn term_strip(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if c == 27 {
+            i = i + 1;
+            if i < n && str_byte_at(s, i) == 91 {
+                // CSI: ESC [ params... final byte in 0x40-0x7E
+                i = i + 1;
+                while i < n {
+                    var f: i64 = str_byte_at(s, i);
+                    i = i + 1;
+                    if f >= 64 && f <= 126 { break; }
+                }
+            } else if i < n {
+                i = i + 1;   // two-byte escape (ESC X)
+            }
+            continue;
+        }
+        out = out + str_slice(s, i, i + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Visible width of a possibly-colored string.
+pub fn term_width(s: str) -> i64 { return str_len(term_strip(s)); }
+
+/// True when stdout is likely a terminal with ANSI support:
+/// TERM is set (and not "dumb"), or we're on modern Windows
+/// (WT_SESSION / ANSICON / NO_COLOR absent heuristics).
+pub fn term_supports_ansi() -> bool {
+    if os_hasenv("NO_COLOR") { return false; }
+    var t: str = os_term();
+    if str_len(t) > 0 && !str_equal(t, "dumb") { return true; }
+    if os_hasenv("WT_SESSION") || os_hasenv("ANSICON") { return true; }
+    return false;
+}

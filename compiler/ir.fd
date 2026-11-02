@@ -1361,6 +1361,8 @@ pub struct IrFunction {
     pub blocks: Vec<BasicBlock>,
     pub value_metas: Vec<ValueIdMeta>,
     pub insts: Vec<ValueIdInst>,
+    // Value id -> position in insts + 1; parameters have ids but no instruction
+    pub inst_at: Vec<i64>,
     pub effects: EffectSet,
     pub next_value: i64,
     pub next_block: i64,
@@ -1409,6 +1411,7 @@ pub fn IrFunction_new(name: str, ret_ty: IrType) -> IrFunction {
         blocks: Vec::new(),
         value_metas: Vec::new(),
         insts: Vec::new(),
+        inst_at: Vec::new(),
         effects: EffectSet_new(),
         next_value: 0,
         next_block: 0,
@@ -1473,6 +1476,10 @@ pub fn IrFunction_emit(self: &mut IrFunction, inst: Inst) -> i64 {
     var blk: BasicBlock = self.blocks.get(block_idx);
     blk.instructions.push(id);
     self.blocks.set(block_idx, blk);
+    while self.inst_at.len() <= id {
+        self.inst_at.push(0);
+    }
+    self.inst_at.set(id, self.insts.len() + 1);
     self.insts.push(ValueIdInst_new(id, inst));
     return id;
 }
@@ -1512,18 +1519,9 @@ pub fn IrFunction_lookup_local(self: &IrFunction, name: str) -> OptValueId {
 }
 
 pub fn IrFunction_get_inst(self: &IrFunction, id: i64) -> OptInst {
-    // Fast path: ids are dense counters starting at 0, so id == index in the
-    // common case. Verified by the id check — falls back to scan otherwise.
-    if id >= 0 && id < self.insts.len() {
-        var e: ValueIdInst = self.insts.get(id);
-        if e.id == id { return OptInst::Some(e.inst); }
-    }
-    var i: i64 = 0;
-    while i < self.insts.len() {
-        if self.insts.get(i).id == id {
-            return OptInst::Some(self.insts.get(i).inst);
-        }
-        i = i + 1;
+    if id >= 0 && id < self.inst_at.len() {
+        var at: i64 = self.inst_at.get(id);
+        if at != 0 { return OptInst::Some(self.insts.get(at - 1).inst); }
     }
     return OptInst::None;
 }
@@ -1623,8 +1621,12 @@ pub fn SourceMap_to_str(self: &SourceMap) -> str {
 
 pub struct IrModule {
     pub functions: Vec<IrFunctionEntry>,
+    // Name -> position in functions + 1; filled by IrModule_get_function
+    pub fn_index: i64,
     pub struct_layouts: Vec<StructLayoutEntry>,
     pub string_constants: Vec<StringStringEntry>,
+    // String -> position in string_constants + 1
+    pub str_index: i64,
     pub extern_functions: Vec<StringVecIrType>,
     pub function_effects: Vec<StringEffectSetEntry>,
     pub extern_decls: Vec<ExternDecl>,
@@ -1705,8 +1707,10 @@ pub enum OptGlobalLookup {
 pub fn IrModule_new() -> IrModule {
     return IrModule {
         functions: Vec::new(),
+        fn_index: HashMap_new(),
         struct_layouts: Vec::new(),
         string_constants: Vec::new(),
+        str_index: HashMap_new(),
         extern_functions: Vec::new(),
         function_effects: Vec::new(),
         extern_decls: Vec::new(),
@@ -1757,15 +1761,13 @@ pub fn IrModule_get_struct(self: &IrModule, name: str) -> OptStructLayout {
 }
 
 pub fn IrModule_intern_string(self: &mut IrModule, s: str) -> str {
-    var i: i64 = 0;
-    while i < self.string_constants.len() {
-        if self.string_constants.get(i).key == s {
-            return self.string_constants.get(i).val;
-        }
-        i = i + 1;
+    var at: i64 = HashMap_get(self.str_index, s);
+    if at != 0 {
+        return self.string_constants.get(at - 1).val;
     }
     var label: str = ".str_" + int_to_str(self.string_constants.len());
     self.string_constants.push(StringStringEntry_new(s, label));
+    HashMap_insert(self.str_index, s, self.string_constants.len());
     return label;
 }
 
@@ -1845,14 +1847,18 @@ pub fn IrModule_replace_function_named(self: &mut IrModule, func: IrFunction, na
 }
 
 pub fn IrModule_get_function(self: &IrModule, name: str) -> OptIrFunction {
-    var i: i64 = 0;
+    // Index what was added since the last lookup
+    var i: i64 = HashMap_len(self.fn_index);
     while i < self.functions.len() {
-        if self.functions.get(i).name == name {
-            return OptIrFunction::Some(self.functions.get(i).func);
+        var key: str = self.functions.get(i).name;
+        if HashMap_get(self.fn_index, key) == 0 {
+            HashMap_insert(self.fn_index, key, i + 1);
         }
         i = i + 1;
     }
-    return OptIrFunction::None;
+    var at: i64 = HashMap_get(self.fn_index, name);
+    if at == 0 { return OptIrFunction::None; }
+    return OptIrFunction::Some(self.functions.get(at - 1).func);
 }
 
 // --- Type Lowering (AST -> IR) --------------------------------------------
@@ -2158,6 +2164,7 @@ pub fn IrModule_dead_function_elimination(self: &mut IrModule) -> i64 {
 
     if removed > 0 {
         self.functions = new_functions;
+        HashMap_clear(self.fn_index);
     }
 
     return removed;
@@ -2225,16 +2232,13 @@ fn IrFunction_constant_fold(self: &mut IrFunction) -> i64 {
 }
 
 pub fn IrFunction_set_inst(self: &mut IrFunction, id: i64, inst: Inst) {
-    var i: i64 = 0;
-    while i < self.insts.len() {
-        if self.insts.get(i).id == id {
-            var entry: ValueIdInst = self.insts.get(i);
-            entry.inst = inst;
-            self.insts.set(i, entry);
-            return;
-        }
-        i = i + 1;
+    if id < 0 || id >= self.inst_at.len() || self.inst_at.get(id) == 0 {
+        return;
     }
+    var at: i64 = self.inst_at.get(id) - 1;
+    var entry: ValueIdInst = self.insts.get(at);
+    entry.inst = inst;
+    self.insts.set(at, entry);
 }
 
 pub fn IrFunction_set_meta(self: &mut IrFunction, id: i64, meta: ValueMeta) {

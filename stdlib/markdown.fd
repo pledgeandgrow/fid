@@ -1,0 +1,330 @@
+// Fides Markdown standard library
+//
+// Markdown → HTML rendering for the common subset:
+//   # .. ###### headings, **bold**, *italic*, `code`, [text](url),
+//   ![alt](src), -/*/1. lists, > blockquotes, ``` code fences,
+//   --- horizontal rules, paragraphs, and raw-line passthrough.
+// Not supported: tables, footnotes, nested emphasis edge cases,
+// reference-style links, HTML blocks.
+//
+// Usage:
+//   use markdown;
+//   println(md_to_html("# Hello\n\nSome **bold** text."));
+
+module markdown;
+
+use vec;
+use string;
+
+// ─── HTML escaping ──────────────────────────────────────────────────────
+
+/// Escape & < > " for HTML text contexts.
+pub fn md_escape(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if c == 38 { out = out + "&amp;"; }
+        else if c == 60 { out = out + "&lt;"; }
+        else if c == 62 { out = out + "&gt;"; }
+        else if c == 34 { out = out + "&quot;"; }
+        else { out = out + str_slice(s, i, i + 1); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Inline rendering ───────────────────────────────────────────────────
+
+// Find matching '*' or '**' run starting at `from`; returns index after
+// the closing delimiter or -1.
+fn md_find_star(s: str, from: i64, len: i64) -> i64 {
+    var i: i64 = from;
+    var n: i64 = str_len(s);
+    while i + len <= n {
+        var okm: bool = true;
+        var k: i64 = 0;
+        while k < len {
+            if str_byte_at(s, i + k) != 42 { okm = false; }
+            k = k + 1;
+        }
+        if okm {
+            // closing delimiter must not be immediately followed by '*'
+            if i + len < n && str_byte_at(s, i + len) == 42 {
+                i = i + 1; continue;
+            }
+            return i + len;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Render inline markup inside already-trimmed text.
+/// Handles `code`, **bold**, *italic*, [text](url), ![alt](src).
+pub fn md_inline(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if c == 96 {                                        // `code`
+            var close: i64 = i + 1;
+            var found: i64 = -1;
+            while close < n {
+                if str_byte_at(s, close) == 96 { found = close; break; }
+                close = close + 1;
+            }
+            if found >= 0 {
+                out = out + "<code>" + md_escape(str_slice(s, i + 1, found)) + "</code>";
+                i = found + 1;
+            } else {
+                out = out + md_escape(str_slice(s, i, i + 1));
+                i = i + 1;
+            }
+        } else if c == 42 {                                 // * or **
+            if i + 1 < n && str_byte_at(s, i + 1) == 42 {
+                var e2: i64 = md_find_star(s, i + 2, 2);
+                if e2 > 0 {
+                    out = out + "<strong>" + md_inline(str_slice(s, i + 2, e2 - 2)) + "</strong>";
+                    i = e2;
+                } else {
+                    out = out + md_escape(str_slice(s, i, i + 2));
+                    i = i + 2;
+                }
+            } else {
+                var e1: i64 = md_find_star(s, i + 1, 1);
+                if e1 > 0 {
+                    out = out + "<em>" + md_inline(str_slice(s, i + 1, e1 - 1)) + "</em>";
+                    i = e1;
+                } else {
+                    out = out + md_escape(str_slice(s, i, i + 1));
+                    i = i + 1;
+                }
+            }
+        } else if c == 95 {                                 // _ or __
+            if i + 1 < n && str_byte_at(s, i + 1) == 95 {
+                var end: i64 = str_find(str_slice(s, i + 2, n), "__");
+                if end >= 0 {
+                    out = out + "<strong>" + md_inline(str_slice(s, i + 2, i + 2 + end)) + "</strong>";
+                    i = i + 2 + end + 2;
+                } else {
+                    out = out + md_escape(str_slice(s, i, i + 1));
+                    i = i + 1;
+                }
+            } else {
+                var end1: i64 = str_find(str_slice(s, i + 1, n), "_");
+                if end1 >= 0 {
+                    out = out + "<em>" + md_inline(str_slice(s, i + 1, i + 1 + end1)) + "</em>";
+                    i = i + 1 + end1 + 1;
+                } else {
+                    out = out + md_escape(str_slice(s, i, i + 1));
+                    i = i + 1;
+                }
+            }
+        } else if c == 33 && i + 1 < n && str_byte_at(s, i + 1) == 91 {
+            // ![alt](src)
+            var rb: i64 = str_find(str_slice(s, i, n), "]");
+            var img: str = md_link_body(s, i + 2, rb + i);
+            if str_len(img) > 0 {
+                var parts: Vec = str_split_char(img, 7);
+                out = out + "<img src=\"" + md_escape(parts.get(1)) +
+                      "\" alt=\"" + md_escape(parts.get(0)) + "\" />";
+                i = rb + i + str_parse_int(parts.get(2));
+            } else {
+                out = out + md_escape(str_slice(s, i, i + 1));
+                i = i + 1;
+            }
+        } else if c == 91 {                                 // [text](url)
+            var rb2: i64 = str_find(str_slice(s, i, n), "]");
+            var lnk: str = md_link_body(s, i + 1, rb2 + i);
+            if str_len(lnk) > 0 {
+                var parts2: Vec = str_split_char(lnk, 7);
+                out = out + "<a href=\"" + md_escape(parts2.get(1)) + "\">" +
+                      md_inline(parts2.get(0)) + "</a>";
+                i = rb2 + i + str_parse_int(parts2.get(2));
+            } else {
+                out = out + md_escape(str_slice(s, i, i + 1));
+                i = i + 1;
+            }
+        } else {
+            out = out + md_escape(str_slice(s, i, i + 1));
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+// For "[body](url)": s[start..bracket] is the text; returns
+// text + \x07 + url + \x07 + rest_len, or "" if no (url) follows.
+fn md_link_body(s: str, start: i64, abs_bracket: i64) -> str {
+    var n: i64 = str_len(s);
+    if abs_bracket < 0 || abs_bracket + 1 >= n { return ""; }
+    if str_byte_at(s, abs_bracket + 1) != 40 { return ""; }
+    var depth: i64 = 0;
+    var j: i64 = abs_bracket + 1;
+    var close: i64 = -1;
+    while j < n {
+        var c: i64 = str_byte_at(s, j);
+        if c == 40 { depth = depth + 1; }
+        if c == 41 {
+            depth = depth - 1;
+            if depth == 0 { close = j; break; }
+        }
+        j = j + 1;
+    }
+    if close < 0 { return ""; }
+    var text: str = str_slice(s, start, abs_bracket);
+    var url: str = str_slice(s, abs_bracket + 2, close);
+    // Return packed: text \x07 url \x07 (chars consumed after ']' = close - abs_bracket)
+    var bell: str = str_slice("\x07x", 0, 1);
+    return text + bell + url + bell + int_to_str_padded(close - abs_bracket + 1, 4);
+}
+
+// ─── Block rendering ────────────────────────────────────────────────────
+
+fn md_is_hr(t: str) -> bool {
+    if str_len(t) < 3 { return false; }
+    var c: i64 = str_byte_at(t, 0);
+    if c != 45 && c != 42 && c != 95 { return false; }
+    var i: i64 = 0;
+    var cnt: i64 = 0;
+    while i < str_len(t) {
+        var x: i64 = str_byte_at(t, i);
+        if x == c { cnt = cnt + 1; }
+        else if x != 32 { return false; }
+        i = i + 1;
+    }
+    return cnt >= 3;
+}
+
+fn md_heading_level(t: str) -> i64 {
+    var i: i64 = 0;
+    while i < str_len(t) && str_byte_at(t, i) == 35 { i = i + 1; }
+    if i > 0 && i <= 6 && i < str_len(t) && str_byte_at(t, i) == 32 { return i; }
+    return 0;
+}
+
+fn md_ul_item(t: str) -> bool {
+    if str_len(t) < 2 { return false; }
+    var c: i64 = str_byte_at(t, 0);
+    return (c == 45 || c == 42 || c == 43) && str_byte_at(t, 1) == 32;
+}
+
+// "1. item" / "12. item" → content start index, -1 if not OL.
+fn md_ol_item(t: str) -> i64 {
+    var i: i64 = 0;
+    var n: i64 = str_len(t);
+    while i < n && str_byte_at(t, i) >= 48 && str_byte_at(t, i) <= 57 { i = i + 1; }
+    if i == 0 || i + 1 >= n { return -1; }
+    if str_byte_at(t, i) == 46 && str_byte_at(t, i + 1) == 32 { return i + 2; }
+    return -1;
+}
+
+/// Convert Markdown text to an HTML fragment.
+pub fn md_to_html(text: str) -> str {
+    var lines: Vec<str> = str_lines(text);
+    var out: str = "";
+    var i: i64 = 0;
+    var n: i64 = lines.len();
+
+    while i < n {
+        var line: str = lines.get(i);
+        var t: str = str_trim_end(line);
+
+        // Code fence ```
+        if str_starts_with(t, "```") {
+            var code: str = "";
+            i = i + 1;
+            while i < n && !str_starts_with(str_trim_end(lines.get(i)), "```") {
+                code = code + md_escape(lines.get(i)) + "\n";
+                i = i + 1;
+            }
+            if i < n { i = i + 1; }   // closing fence
+            out = out + "<pre><code>" + code + "</code></pre>\n";
+            continue;
+        }
+        var tr: str = str_trim(t);
+        if str_len(tr) == 0 { i = i + 1; continue; }
+
+        // Heading
+        var h: i64 = md_heading_level(tr);
+        if h > 0 {
+            var content: str = str_trim(str_slice(tr, h, str_len(tr)));
+            out = out + "<h" + int_to_str(h) + ">" + md_inline(content) +
+                  "</h" + int_to_str(h) + ">\n";
+            i = i + 1;
+            continue;
+        }
+        // Horizontal rule
+        if md_is_hr(tr) {
+            out = out + "<hr />\n";
+            i = i + 1;
+            continue;
+        }
+        // Blockquote (consecutive '>' lines)
+        if str_byte_at(tr, 0) == 62 {
+            var inner: str = "";
+            while i < n {
+                var l2: str = str_trim(lines.get(i));
+                if str_len(l2) > 0 && str_byte_at(l2, 0) == 62 {
+                    var body: str = str_trim(str_slice(l2, 1, str_len(l2)));
+                    inner = inner + body + "\n";
+                    i = i + 1;
+                } else { break; }
+            }
+            out = out + "<blockquote>" + md_to_html(inner) + "</blockquote>\n";
+            continue;
+        }
+        // Unordered list
+        if md_ul_item(tr) {
+            out = out + "<ul>\n";
+            while i < n {
+                var l3: str = str_trim(lines.get(i));
+                if str_len(l3) > 0 && md_ul_item(l3) {
+                    out = out + "<li>" + md_inline(str_slice(l3, 2, str_len(l3))) + "</li>\n";
+                    i = i + 1;
+                } else { break; }
+            }
+            out = out + "</ul>\n";
+            continue;
+        }
+        // Ordered list
+        if md_ol_item(tr) > 0 {
+            out = out + "<ol>\n";
+            while i < n {
+                var l4: str = str_trim(lines.get(i));
+                var cs: i64 = -1;
+                if str_len(l4) > 0 { cs = md_ol_item(l4); }
+                if cs > 0 {
+                    out = out + "<li>" + md_inline(str_slice(l4, cs, str_len(l4))) + "</li>\n";
+                    i = i + 1;
+                } else { break; }
+            }
+            out = out + "</ol>\n";
+            continue;
+        }
+        // Paragraph: merge following non-blank, non-structural lines
+        var para: str = tr;
+        i = i + 1;
+        while i < n {
+            var l5: str = str_trim(lines.get(i));
+            if str_len(l5) == 0 { break; }
+            if md_heading_level(l5) > 0 || md_is_hr(l5) || md_ul_item(l5) ||
+               md_ol_item(l5) > 0 || str_starts_with(l5, "```") ||
+               str_byte_at(l5, 0) == 62 { break; }
+            para = para + "\n" + l5;
+            i = i + 1;
+        }
+        out = out + "<p>" + md_inline(para) + "</p>\n";
+    }
+    return out;
+}
+
+/// Render to a full HTML document with optional <title>.
+pub fn md_to_page(text: str, title: str) -> str {
+    return "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>" +
+           md_escape(title) + "</title>\n</head>\n<body>\n" +
+           md_to_html(text) + "</body>\n</html>\n";
+}

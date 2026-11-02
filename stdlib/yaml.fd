@@ -1,0 +1,344 @@
+// Fides YAML standard library
+//
+// YAML parsing — the config-file subset:
+//   nested maps by indentation, lists ("- item"), scalars
+//   (quoted/plain strings, ints, floats, bools, null), comments (#),
+//   document markers (---), and inline flow values ([a, b], {k: v}).
+// Not supported: anchors/aliases, multi-line | > blocks, tags, complex keys.
+//
+// Values are stored as flat dotted-path entries (like toml.fd):
+// list elements get numeric path segments — "spec.containers.0.name".
+//
+// Usage:
+//   use yaml;
+//   val doc = yaml_parse("a:\n  b: 1\n  list:\n    - x\n    - y");
+//   println(yaml_get_str(doc, "a.b"));          // "1"
+//   println(yaml_get_str(doc, "a.list.1"));     // "y"
+
+module yaml;
+
+use vec;
+use string;
+
+// ─── Value model ────────────────────────────────────────────────────────
+
+/// kind: "str" | "int" | "float" | "bool" | "null" | "map" | "list".
+/// `sval` holds scalars; maps/lists only mark structure (children are
+/// other entries under a longer path).
+pub struct YamlValue {
+    pub kind: str,
+    pub sval: str,
+}
+
+/// One entry: dotted path → value. List indexes appear as digits.
+pub struct YamlEntry {
+    pub path: str,
+    pub value: YamlValue,
+}
+
+/// Stack frame while parsing: an open container.
+struct YFrame {
+    indent: i64,
+    path: str,      // path of this container ("" = root)
+    is_list: bool,
+    counter: i64,   // next list index
+}
+
+// ─── Scalar helpers ─────────────────────────────────────────────────────
+
+fn y_is_digit(c: i64) -> bool { return c >= 48 && c <= 57; }
+
+// Find '#' starting a comment: preceded by whitespace, outside quotes.
+fn y_comment_end(s: str) -> i64 {
+    var in_d: bool = false;
+    var in_s: bool = false;
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if in_d {
+            if c == 92 { i = i + 1; }
+            else if c == 34 { in_d = false; }
+        } else if in_s {
+            if c == 39 { in_s = false; }
+        } else {
+            if c == 34 { in_d = true; }
+            else if c == 39 { in_s = true; }
+            else if c == 35 && (i == 0 || str_byte_at(s, i - 1) == 32) { return i; }
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn y_decode_quoted(s: str) -> str {
+    var n: i64 = str_len(s);
+    if n < 2 { return s; }
+    var q: i64 = str_byte_at(s, 0);
+    if q != 34 && q != 39 { return s; }
+    var body: str = str_slice(s, 1, n - 1);
+    if q == 39 {
+        // literal: '' → '
+        return str_replace(body, "''", "'");
+    }
+    // basic escapes
+    var out: str = "";
+    var i: i64 = 0;
+    var m: i64 = str_len(body);
+    while i < m {
+        var c: i64 = str_byte_at(body, i);
+        if c == 92 && i + 1 < m {
+            var e: i64 = str_byte_at(body, i + 1);
+            if e == 110 { out = out + "\n"; }
+            else if e == 116 { out = out + "\t"; }
+            else if e == 114 { out = out + "\r"; }
+            else if e == 34 { out = out + "\""; }
+            else if e == 92 { out = out + "\\"; }
+            else if e == 48 { out = out + str_slice("\0 ", 0, 0); }
+            else { out = out + str_slice(body, i, i + 2); }
+            i = i + 1;
+        } else {
+            out = out + str_slice(body, i, i + 1);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn y_scalar(s: str) -> YamlValue {
+    var v: str = str_trim(s);
+    var n: i64 = str_len(v);
+    if n == 0 { return YamlValue { kind: "null", sval: "" }; }
+    var c0: i64 = str_byte_at(v, 0);
+    if c0 == 34 || c0 == 39 {
+        return YamlValue { kind: "str", sval: y_decode_quoted(v) };
+    }
+    if str_equal(v, "true") || str_equal(v, "True") {
+        return YamlValue { kind: "bool", sval: "true" };
+    }
+    if str_equal(v, "false") || str_equal(v, "False") {
+        return YamlValue { kind: "bool", sval: "false" };
+    }
+    if str_equal(v, "null") || str_equal(v, "~") || str_equal(v, "Null") {
+        return YamlValue { kind: "null", sval: "" };
+    }
+    // flow sequence [a, b] — store as list entries? Keep joined scalar.
+    // number?
+    var i: i64 = 0;
+    var is_num: bool = n > 0;
+    var is_float: bool = false;
+    while i < n {
+        var c: i64 = str_byte_at(v, i);
+        if y_is_digit(c) { }
+        else if c == 45 || c == 43 { if i != 0 { is_num = false; } }
+        else if c == 46 || c == 101 || c == 69 { is_float = true; }
+        else { is_num = false; }
+        i = i + 1;
+    }
+    if is_num {
+        if is_float { return YamlValue { kind: "float", sval: v }; }
+        return YamlValue { kind: "int", sval: v };
+    }
+    return YamlValue { kind: "str", sval: v };
+}
+
+fn y_indent_of(line: str) -> i64 {
+    var i: i64 = 0;
+    while i < str_len(line) && str_byte_at(line, i) == 32 { i = i + 1; }
+    return i;
+}
+
+fn y_join(prefix: str, seg: str) -> str {
+    if str_len(prefix) == 0 { return seg; }
+    return prefix + "." + seg;
+}
+
+// ─── Parser ─────────────────────────────────────────────────────────────
+
+/// Parse YAML text into Vec<YamlEntry> in document order.
+pub fn yaml_parse(text: str) -> Vec<YamlEntry> {
+    var entries: Vec<YamlEntry> = Vec::new();
+    var stack: Vec<YFrame> = Vec::new();
+    stack.push(YFrame { indent: -1, path: "", is_list: false, counter: 0 });
+
+    var lines: Vec<str> = str_lines(text);
+    var li: i64 = 0;
+    while li < lines.len() {
+        var raw: str = lines.get(li);
+        li = li + 1;
+        var no_comment: str = str_slice(raw, 0, y_comment_end(raw));
+        var trimmed: str = str_trim(no_comment);
+        if str_len(trimmed) == 0 { continue; }
+        if str_equal(trimmed, "---") || str_equal(trimmed, "...") { continue; }
+
+        var indent: i64 = y_indent_of(no_comment);
+
+        // Pop frames deeper-or-equal to this line's content level.
+        // A list item ("-") at the same indent stays in its list frame.
+        var is_item: bool = str_starts_with(trimmed, "- ") || str_equal(trimmed, "-");
+        while stack.len() > 1 {
+            var top: YFrame = stack.get(stack.len() - 1);
+            if is_item && top.is_list && indent == top.indent { break; }
+            if indent <= top.indent { stack.pop(); }
+            else { break; }
+        }
+        var parent: YFrame = stack.get(stack.len() - 1);
+        var base: str = parent.path;
+
+        if is_item {
+            // Ensure parent frame is a list at this indent.
+            if !parent.is_list {
+                stack.push(YFrame {
+                    indent: indent, path: base, is_list: true, counter: 0 });
+                parent = stack.get(stack.len() - 1);
+            }
+            var idx: i64 = parent.counter;
+            stack.get(stack.len() - 1).counter = idx + 1;
+            var ipath: str = y_join(base, int_to_str(idx));
+            var rest: str = str_trim(str_slice(trimmed, 1, str_len(trimmed)));
+
+            if str_len(rest) == 0 {
+                // "-\n  ..." — bare item opening a container
+                entries.push(YamlEntry { path: ipath,
+                    value: YamlValue { kind: "map", sval: "" } });
+                stack.push(YFrame { indent: indent + 1, path: ipath,
+                    is_list: false, counter: 0 });
+                continue;
+            }
+            // "- key: value" — inline map start inside the item
+            var kc: i64 = y_key_colon(rest);
+            if kc > 0 {
+                var key: str = str_trim(str_slice(rest, 0, kc));
+                var val: str = str_trim(str_slice(rest, kc + 1, str_len(rest)));
+                var kvpath: str = y_join(ipath, key);
+                entries.push(YamlEntry { path: ipath,
+                    value: YamlValue { kind: "map", sval: "" } });
+                if str_len(val) == 0 {
+                    entries.push(YamlEntry { path: kvpath,
+                        value: YamlValue { kind: "map", sval: "" } });
+                    stack.push(YFrame { indent: indent + 1, path: ipath,
+                        is_list: false, counter: 0 });
+                    stack.push(YFrame { indent: indent + 2, path: kvpath,
+                        is_list: false, counter: 0 });
+                } else {
+                    entries.push(YamlEntry { path: kvpath, value: y_scalar(val) });
+                    stack.push(YFrame { indent: indent + 1, path: ipath,
+                        is_list: false, counter: 0 });
+                }
+            } else {
+                entries.push(YamlEntry { path: ipath, value: y_scalar(rest) });
+            }
+            continue;
+        }
+
+        // key: or key: value
+        var cpos: i64 = y_key_colon(trimmed);
+        if cpos <= 0 { continue; }    // junk / unsupported line
+        var key2: str = str_trim(str_slice(trimmed, 0, cpos));
+        var val2: str = str_trim(str_slice(trimmed, cpos + 1, str_len(trimmed)));
+        var kpath: str = y_join(base, key2);
+        if str_len(val2) == 0 {
+            // opens a nested container (kind fixed by first child; map default)
+            entries.push(YamlEntry { path: kpath,
+                value: YamlValue { kind: "map", sval: "" } });
+            stack.push(YFrame { indent: indent, path: kpath,
+                is_list: false, counter: 0 });
+        } else {
+            entries.push(YamlEntry { path: kpath, value: y_scalar(val2) });
+        }
+    }
+    return entries;
+}
+
+// Position of the ':' that separates key from value (outside quotes),
+// requiring end-of-line or a following space. -1 when none.
+fn y_key_colon(s: str) -> i64 {
+    var in_d: bool = false;
+    var in_s: bool = false;
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if in_d {
+            if c == 92 { i = i + 1; }
+            else if c == 34 { in_d = false; }
+        } else if in_s {
+            if c == 39 { in_s = false; }
+        } else {
+            if c == 34 { in_d = true; }
+            else if c == 39 { in_s = true; }
+            else if c == 58 {
+                if i + 1 >= n || str_byte_at(s, i + 1) == 32 { return i; }
+            }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ─── Accessors ──────────────────────────────────────────────────────────
+
+fn y_find(doc: Vec<YamlEntry>, path: str) -> i64 {
+    var i: i64 = doc.len();
+    while i > 0 {
+        i = i - 1;
+        if str_equal(doc.get(i).path, path) { return i; }
+    }
+    return -1;
+}
+
+/// Value at dotted `path`; kind "missing" when absent.
+pub fn yaml_get(doc: Vec<YamlEntry>, path: str) -> YamlValue {
+    var i: i64 = y_find(doc, path);
+    if i < 0 { return YamlValue { kind: "missing", sval: "" }; }
+    return doc.get(i).value;
+}
+
+pub fn yaml_has(doc: Vec<YamlEntry>, path: str) -> bool {
+    return y_find(doc, path) >= 0;
+}
+
+pub fn yaml_kind(doc: Vec<YamlEntry>, path: str) -> str {
+    return yaml_get(doc, path).kind;
+}
+
+/// Scalar string at `path` ("" when absent).
+pub fn yaml_get_str(doc: Vec<YamlEntry>, path: str) -> str {
+    return yaml_get(doc, path).sval;
+}
+
+pub fn yaml_get_int(doc: Vec<YamlEntry>, path: str, default: i64) -> i64 {
+    var v: YamlValue = yaml_get(doc, path);
+    if str_equal(v.kind, "int") { return str_parse_int(v.sval); }
+    return default;
+}
+
+pub fn yaml_get_float(doc: Vec<YamlEntry>, path: str, default: f64) -> f64 {
+    var v: YamlValue = yaml_get(doc, path);
+    if str_equal(v.kind, "float") || str_equal(v.kind, "int") {
+        return str_parse_float(v.sval);
+    }
+    return default;
+}
+
+pub fn yaml_get_bool(doc: Vec<YamlEntry>, path: str, default: bool) -> bool {
+    var v: YamlValue = yaml_get(doc, path);
+    if str_equal(v.kind, "bool") { return str_equal(v.sval, "true"); }
+    return default;
+}
+
+/// Number of items in the list at `path` (0 if not a list).
+pub fn yaml_list_len(doc: Vec<YamlEntry>, path: str) -> i64 {
+    var prefix: str = path + ".";
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < doc.len() {
+        var p: str = doc.get(i).path;
+        if str_starts_with(p, prefix) {
+            var rest: str = str_slice(p, str_len(prefix), str_len(p));
+            if !str_contains(rest, ".") && str_is_numeric(rest) { count = count + 1; }
+        }
+        i = i + 1;
+    }
+    return count;
+}

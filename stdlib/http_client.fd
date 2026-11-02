@@ -1,0 +1,248 @@
+// Fides HTTP Client standard library
+//
+// HTTP/1.1 client built on the runtime socket builtins
+// (p_net_connect / p_socket_write / p_socket_read). No external FFI
+// required — works on every native backend.
+//
+// LIMITATIONS (honest): HTTP only — no TLS, so no https:// URLs.
+// Connection: close semantics only (one request per connection).
+// Bodies read to EOF; chunked transfer-encoding is de-chunked.
+// For https you need tls.fd (not yet available) or a local proxy.
+//
+// Usage:
+//   use http_client;
+//   val r = http_get("example.com", 80, "/");
+//   println(int_to_str(r.status));
+//   println(r.body);
+
+module http_client;
+
+use vec;
+use string;
+use url;
+use dns;
+use mime;
+
+// ─── Response model ─────────────────────────────────────────────────────
+
+/// A parsed HTTP response. `status` 0 = transport failure.
+/// `header_names`/`header_vals` are parallel vecs (original case).
+pub struct HttpResponse {
+    pub status: i64,
+    pub reason: str,
+    pub header_names: Vec<str>,
+    pub header_vals: Vec<str>,
+    pub body: str,
+}
+
+fn hc_response(status: i64) -> HttpResponse {
+    return HttpResponse {
+        status: status, reason: "",
+        header_names: Vec::new(), header_vals: Vec::new(), body: "" };
+}
+
+/// Header value (case-insensitive name); "" when absent.
+pub fn http_resp_header(r: HttpResponse, name: str) -> str {
+    var want: str = str_to_lower(name);
+    var i: i64 = 0;
+    while i < r.header_names.len() {
+        if str_equal(str_to_lower(r.header_names.get(i)), want) {
+            return r.header_vals.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// ─── Wire helpers ───────────────────────────────────────────────────────
+
+fn hc_read_all(fd: i64) -> str {
+    var out: str = "";
+    var buf: i64 = p_malloc(8192);
+    var bytes: Vec = Vec::new();
+    while true {
+        var n: i64 = p_socket_read(fd, buf, 8192);
+        if n <= 0 { break; }
+        var i: i64 = 0;
+        while i < n {
+            bytes.push(p_volatile_load8(buf + i));
+            i = i + 1;
+        }
+    }
+    p_free(buf);
+    return str_from_bytes(bytes);
+}
+
+// Remove chunked transfer-encoding framing.
+fn hc_dechunk(raw: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    var n: i64 = str_len(raw);
+    while i < n {
+        // read hex size line
+        var eol: i64 = i;
+        while eol < n && str_byte_at(raw, eol) != 13 && str_byte_at(raw, eol) != 10 {
+            eol = eol + 1;
+        }
+        var sizestr: str = str_trim(str_slice(raw, i, eol));
+        var semi: i64 = str_find(sizestr, ";");
+        if semi >= 0 { sizestr = str_slice(sizestr, 0, semi); }
+        var size: i64 = 0;
+        if str_len(sizestr) > 0 { size = str_parse_hex("0x" + sizestr); }
+        if size <= 0 { break; }
+        // skip CRLF
+        while eol < n && (str_byte_at(raw, eol) == 13 || str_byte_at(raw, eol) == 10) {
+            eol = eol + 1;
+        }
+        if eol + size > n { size = n - eol; }
+        out = out + str_slice(raw, eol, eol + size);
+        i = eol + size;
+        // skip trailing CRLF after chunk
+        while i < n && (str_byte_at(raw, i) == 13 || str_byte_at(raw, i) == 10) {
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn hc_parse(raw: str) -> HttpResponse {
+    // header/body split on \r\n\r\n (or \n\n)
+    var h_end: i64 = str_find(raw, "\r\n\r\n");
+    var sep: i64 = 4;
+    if h_end < 0 { h_end = str_find(raw, "\n\n"); sep = 2; }
+    var head: str = raw;
+    var body: str = "";
+    if h_end >= 0 {
+        head = str_slice(raw, 0, h_end);
+        body = str_slice(raw, h_end + sep, str_len(raw));
+    }
+    var lines: Vec<str> = str_lines(head);
+    var status: i64 = 0;
+    var reason: str = "";
+    var names: Vec<str> = Vec::new();
+    var vals: Vec<str> = Vec::new();
+    if lines.len() > 0 {
+        // status line: HTTP/1.1 200 OK
+        var status_line: str = str_trim_end(lines.get(0));
+        if str_starts_with(status_line, "HTTP/") {
+            var sp1: i64 = str_find(status_line, " ");
+            if sp1 >= 0 {
+                var rest: str = str_slice(status_line, sp1 + 1, str_len(status_line));
+                var sp2: i64 = str_find(rest, " ");
+                if sp2 >= 0 {
+                    status = str_parse_int(str_slice(rest, 0, sp2));
+                    reason = str_slice(rest, sp2 + 1, str_len(rest));
+                } else {
+                    status = str_parse_int(rest);
+                }
+            }
+        }
+        var i: i64 = 1;
+        while i < lines.len() {
+            var line: str = lines.get(i);
+            var colon: i64 = str_find(line, ":");
+            if colon > 0 {
+                names.push(str_trim(str_slice(line, 0, colon)));
+                vals.push(str_trim(str_slice(line, colon + 1, str_len(line))));
+            }
+            i = i + 1;
+        }
+    }
+    var r: HttpResponse = HttpResponse {
+        status: status, reason: reason,
+        header_names: names, header_vals: vals, body: body };
+    if str_equal(str_to_lower(http_resp_header(r, "transfer-encoding")), "chunked") {
+        return HttpResponse {
+            status: status, reason: reason,
+            header_names: names, header_vals: vals, body: hc_dechunk(body) };
+    }
+    return r;
+}
+
+// ─── Request ────────────────────────────────────────────────────────────
+
+/// Issue an HTTP request. `host` may be a hostname (resolved via
+/// dns_lookup) or dotted IP. `extra_headers` may be "" or complete
+/// "K: v\r\nK2: v2\r\n" strings. `body` may be "".
+/// Returns HttpResponse with status 0 on transport failure.
+pub fn http_request(method: str, host: str, port: i64, path: str,
+                    extra_headers: str, body: str) -> HttpResponse {
+    var ip: str = dns_lookup(host);
+    if str_len(ip) == 0 { return hc_response(0); }
+    var fd: i64 = p_net_connect(ip, port);
+    if fd < 0 { return hc_response(0); }
+
+    var p: str = path;
+    if str_len(p) == 0 { p = "/"; }
+    var req: str = method + " " + p + " HTTP/1.1\r\n" +
+                   "Host: " + host + "\r\n" +
+                   "User-Agent: fides-http/1.0\r\n" +
+                   "Accept: */*\r\n" +
+                   "Connection: close\r\n";
+    if str_len(extra_headers) > 0 { req = req + extra_headers; }
+    if str_len(body) > 0 {
+        req = req + "Content-Length: " + int_to_str(str_len(body)) + "\r\n";
+    }
+    req = req + "\r\n";
+    if str_len(body) > 0 { req = req + body; }
+
+    p_socket_write_str(fd, req);
+    var raw: str = hc_read_all(fd);
+    p_socket_close(fd);
+    if str_len(raw) == 0 { return hc_response(0); }
+    return hc_parse(raw);
+}
+
+/// GET request; returns HttpResponse.
+pub fn http_get(host: str, port: i64, path: str) -> HttpResponse {
+    return http_request("GET", host, port, path, "", "");
+}
+
+/// POST with body; content_type may be "" to omit the header.
+pub fn http_post(host: str, port: i64, path: str,
+                 content_type: str, body: str) -> HttpResponse {
+    var h: str = "";
+    if str_len(content_type) > 0 {
+        h = "Content-Type: " + content_type + "\r\n";
+    }
+    return http_request("POST", host, port, path, h, body);
+}
+
+/// HEAD request (headers only).
+pub fn http_head(host: str, port: i64, path: str) -> HttpResponse {
+    return http_request("HEAD", host, port, path, "", "");
+}
+
+// ─── URL-based entry points ─────────────────────────────────────────────
+
+/// GET a full http:// URL (https:// returns status 0 — no TLS).
+pub fn http_get_url(u: str) -> HttpResponse {
+    var pu: Url = url_parse(u);
+    if str_equal(pu.scheme, "https") { return hc_response(0); }
+    var host: str = pu.host;
+    var port: i64 = pu.port;
+    if port < 0 { port = 80; }
+    var path: str = pu.path;
+    if str_len(pu.query) > 0 { path = path + "?" + pu.query; }
+    return http_get(host, port, path);
+}
+
+/// POST a full http:// URL.
+pub fn http_post_url(u: str, content_type: str, body: str) -> HttpResponse {
+    var pu: Url = url_parse(u);
+    if str_equal(pu.scheme, "https") { return hc_response(0); }
+    var port: i64 = pu.port;
+    if port < 0 { port = 80; }
+    var path: str = pu.path;
+    if str_len(pu.query) > 0 { path = path + "?" + pu.query; }
+    return http_post(pu.host, port, path, content_type, body);
+}
+
+// ─── Convenience ────────────────────────────────────────────────────────
+
+/// Guess the body's type from Content-Type or the path extension.
+pub fn http_body_type(r: HttpResponse, path: str) -> str {
+    var ct: str = http_resp_header(r, "content-type");
+    if str_len(ct) > 0 { return ct; }
+    return mime_from_path(path);
+}

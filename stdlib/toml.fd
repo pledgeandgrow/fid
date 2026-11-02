@@ -1,0 +1,476 @@
+// Fides TOML standard library
+//
+// TOML v1.0 parsing — the subset a manifest/config file needs:
+//   [section] / [a.b.c] tables, key = value pairs, comments (#),
+//   basic & literal strings, integers, floats, booleans, and
+//   single-line arrays of scalars. Dotted keys (`a.b = 1`) are
+//   stored under their full dotted path.
+//
+// Values keep their TOML type tag so toml_get_* can check it.
+//
+// Usage:
+//   use toml;
+//   val doc = toml_parse("[pkg]\nname = \"x\"\nver = 3\ntags = [\"a\", \"b\"]");
+//   println(toml_get_str(doc, "pkg.name"));
+//   println(int_to_str(toml_get_int(doc, "pkg.ver", 0)));
+//   println(toml_get(doc, "pkg.tags").items.get(1));
+
+module toml;
+
+use vec;
+use string;
+
+// ─── Value model ────────────────────────────────────────────────────────
+
+/// A typed TOML scalar/array. `kind` is one of:
+/// "str" | "int" | "float" | "bool" | "array" | "invalid".
+/// `sval` holds the decoded scalar (ints/floats keep source text);
+/// `items` holds decoded element strings for arrays.
+pub struct TomlValue {
+    pub kind: str,
+    pub sval: str,
+    pub items: Vec<str>,
+}
+
+/// One entry: dotted full path → value.
+pub struct TomlEntry {
+    pub path: str,
+    pub value: TomlValue,
+}
+
+fn toml_invalid() -> TomlValue {
+    return TomlValue { kind: "invalid", sval: "", items: Vec::new() };
+}
+
+fn toml_scalar(kind: str, sval: str) -> TomlValue {
+    return TomlValue { kind: kind, sval: sval, items: Vec::new() };
+}
+
+// ─── Scalar parsing ─────────────────────────────────────────────────────
+
+fn toml_is_digit(c: i64) -> bool { return c >= 48 && c <= 57; }
+fn toml_is_hex(c: i64) -> bool {
+    return toml_is_digit(c) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102);
+}
+
+// Find '#' that ends the value — not inside a string.
+fn toml_comment_end(s: str, start: i64) -> i64 {
+    var in_b: bool = false;   // inside basic "..." string
+    var in_l: bool = false;   // inside literal '...' string
+    var i: i64 = start;
+    var n: i64 = str_len(s);
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if in_b {
+            if c == 92 { i = i + 1; }
+            else if c == 34 { in_b = false; }
+        } else if in_l {
+            if c == 39 { in_l = false; }
+        } else {
+            if c == 34 { in_b = true; }
+            else if c == 39 { in_l = true; }
+            else if c == 35 { return i; }
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// Decode a basic "..." string body (escapes \n \t \r \" \\ \uXXXX \UXXXXXXXX).
+fn toml_decode_basic(body: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    var n: i64 = str_len(body);
+    while i < n {
+        var c: i64 = str_byte_at(body, i);
+        if c == 92 && i + 1 < n {
+            var e: i64 = str_byte_at(body, i + 1);
+            if e == 110 { out = out + "\n"; }
+            else if e == 116 { out = out + "\t"; }
+            else if e == 114 { out = out + "\r"; }
+            else if e == 34 { out = out + "\""; }
+            else if e == 39 { out = out + "'"; }
+            else if e == 92 { out = out + "\\"; }
+            else if e == 98 { out = out + "\b"; }
+            else if e == 102 { out = out + "\f"; }
+            else if e == 117 || e == 85 {
+                // \uXXXX / \UXXXXXXXX → UTF-8 encode
+                var digits: i64 = 4;
+                if e == 85 { digits = 8; }
+                var hex: str = "";
+                var k: i64 = 0;
+                while k < digits && i + 2 + k < n {
+                    hex = hex + str_slice(body, i + 2 + k, i + 3 + k);
+                    k = k + 1;
+                }
+                var cp: i64 = str_parse_hex(hex);
+                out = out + toml_encode_utf8(cp);
+                i = i + digits;
+            }
+            else { out = out + str_slice(body, i, i + 2); }
+            i = i + 1;
+        } else {
+            out = out + str_slice(body, i, i + 1);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Minimal UTF-8 encoder for a codepoint (up to 4 bytes).
+fn toml_encode_utf8(cp: i64) -> str {
+    if cp < 0 { return ""; }
+    var bytes: Vec = Vec::new();
+    if cp < 128 {
+        bytes.push(cp);
+    } else if cp < 2048 {
+        bytes.push(192 | (cp >> 6));
+        bytes.push(128 | (cp & 63));
+    } else if cp < 65536 {
+        bytes.push(224 | (cp >> 12));
+        bytes.push(128 | ((cp >> 6) & 63));
+        bytes.push(128 | (cp & 63));
+    } else {
+        bytes.push(240 | (cp >> 18));
+        bytes.push(128 | ((cp >> 12) & 63));
+        bytes.push(128 | ((cp >> 6) & 63));
+        bytes.push(128 | (cp & 63));
+    }
+    return str_from_bytes(bytes);
+}
+
+// Parse one scalar or single-line array literal → TomlValue.
+fn toml_parse_value(raw: str) -> TomlValue {
+    var v: str = str_trim(raw);
+    var n: i64 = str_len(v);
+    if n == 0 { return toml_invalid(); }
+    var c0: i64 = str_byte_at(v, 0);
+
+    // Basic string "..."
+    if c0 == 34 {
+        if n >= 2 && str_byte_at(v, n - 1) == 34 {
+            return toml_scalar("str", toml_decode_basic(str_slice(v, 1, n - 1)));
+        }
+        return toml_invalid();
+    }
+    // Literal string '...'
+    if c0 == 39 {
+        if n >= 2 && str_byte_at(v, n - 1) == 39 {
+            return toml_scalar("str", str_slice(v, 1, n - 1));
+        }
+        return toml_invalid();
+    }
+    // Array [...] (single-line)
+    if c0 == 91 {
+        if n >= 2 && str_byte_at(v, n - 1) == 93 {
+            var body: str = str_trim(str_slice(v, 1, n - 1));
+            var items: Vec<str> = Vec::new();
+            if str_len(body) > 0 {
+                var parts: Vec = toml_split_top(body);
+                var i: i64 = 0;
+                while i < parts.len() {
+                    var p: str = str_trim(parts.get(i));
+                    if str_len(p) > 0 {
+                        var pv: TomlValue = toml_parse_value(p);
+                        items.push(pv.sval);
+                    }
+                    i = i + 1;
+                }
+            }
+            return TomlValue { kind: "array", sval: "", items: items };
+        }
+        return toml_invalid();
+    }
+    // Booleans
+    if str_equal(v, "true") { return toml_scalar("bool", "true"); }
+    if str_equal(v, "false") { return toml_scalar("bool", "false"); }
+    // Integer / float / date-ish fallback to str? Keep strict:
+    var num: TomlValue = toml_parse_number(v);
+    return num;
+}
+
+fn toml_parse_number(v: str) -> TomlValue {
+    var s: str = v;
+    // strip underscores
+    s = str_replace(s, "_", "");
+    var is_float: bool = str_contains(s, ".") || str_contains(s, "e") || str_contains(s, "E");
+    // hex/oct/bin
+    if str_starts_with(s, "0x") || str_starts_with(s, "-0x") || str_starts_with(s, "+0x") {
+        return toml_scalar("int", int_to_str(str_parse_hex(s)));
+    }
+    if str_starts_with(s, "0o") || str_starts_with(s, "0b") {
+        var neg: bool = false;
+        var body: str = s;
+        if str_byte_at(s, 0) == 45 { neg = true; body = str_slice(s, 1, str_len(s)); }
+        var base: i64 = 8;
+        if str_byte_at(body, 1) == 98 { base = 2; }
+        var digits: str = str_slice(body, 2, str_len(body));
+        var num: i64 = 0;
+        var i: i64 = 0;
+        var ok: bool = str_len(digits) > 0;
+        while i < str_len(digits) {
+            var d: i64 = str_byte_at(digits, i) - 48;
+            if d < 0 || d >= base { ok = false; break; }
+            num = num * base + d;
+            i = i + 1;
+        }
+        if !ok { return toml_invalid(); }
+        if neg { num = 0 - num; }
+        return toml_scalar("int", int_to_str(num));
+    }
+    // validate plain number loosely
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    var saw_digit: bool = false;
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if toml_is_digit(c) { saw_digit = true; }
+        else if c == 45 || c == 43 || c == 46 || c == 101 || c == 69 { /* ok */ }
+        else { return toml_invalid(); }
+        i = i + 1;
+    }
+    if !saw_digit { return toml_invalid(); }
+    if is_float { return toml_scalar("float", s); }
+    return toml_scalar("int", s);
+}
+
+// Split "a, b, c" on top-level commas (not inside quotes/brackets).
+fn toml_split_top(body: str) -> Vec {
+    var out: Vec = Vec::new();
+    var depth: i64 = 0;
+    var in_b: bool = false;
+    var in_l: bool = false;
+    var start: i64 = 0;
+    var i: i64 = 0;
+    var n: i64 = str_len(body);
+    while i < n {
+        var c: i64 = str_byte_at(body, i);
+        if in_b {
+            if c == 92 { i = i + 1; }
+            else if c == 34 { in_b = false; }
+        } else if in_l {
+            if c == 39 { in_l = false; }
+        } else {
+            if c == 34 { in_b = true; }
+            else if c == 39 { in_l = true; }
+            else if c == 91 { depth = depth + 1; }
+            else if c == 93 { depth = depth - 1; }
+            else if c == 44 && depth == 0 {
+                out.push(str_slice(body, start, i));
+                start = i + 1;
+            }
+        }
+        i = i + 1;
+    }
+    out.push(str_slice(body, start, n));
+    return out;
+}
+
+// ─── Document parsing ───────────────────────────────────────────────────
+
+fn toml_valid_key(k: str) -> bool {
+    if str_len(k) == 0 { return false; }
+    if (str_byte_at(k, 0) == 34 || str_byte_at(k, 0) == 39) &&
+       str_byte_at(k, str_len(k) - 1) == str_byte_at(k, 0) { return true; }
+    var i: i64 = 0;
+    while i < str_len(k) {
+        var c: i64 = str_byte_at(k, i);
+        var ok: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+                       toml_is_digit(c) || c == 95 || c == 45;
+        if !ok { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn toml_unquote_key(k: str) -> str {
+    var t: str = str_trim(k);
+    if str_len(t) >= 2 && str_byte_at(t, 0) == 34 {
+        return toml_decode_basic(str_slice(t, 1, str_len(t) - 1));
+    }
+    if str_len(t) >= 2 && str_byte_at(t, 0) == 39 {
+        return str_slice(t, 1, str_len(t) - 1);
+    }
+    return t;
+}
+
+// Join table path segments with dots; quoted segments already decoded.
+fn toml_join_path(prefix: str, rel: str) -> str {
+    if str_len(prefix) == 0 { return rel; }
+    return prefix + "." + rel;
+}
+
+/// Parse TOML text into Vec<TomlEntry> (document order).
+/// Malformed lines are skipped rather than fatal — inspect with toml_kind.
+pub fn toml_parse(text: str) -> Vec<TomlEntry> {
+    var entries: Vec<TomlEntry> = Vec::new();
+    var table: str = "";
+    var lines: Vec<str> = str_lines(text);
+    var i: i64 = 0;
+    while i < lines.len() {
+        var raw: str = lines.get(i);
+        i = i + 1;
+        // Cut comments outside strings.
+        var end: i64 = toml_comment_end(raw, 0);
+        var line: str = str_trim(str_slice(raw, 0, end));
+        if str_len(line) == 0 { continue; }
+
+        var c0: i64 = str_byte_at(line, 0);
+        if c0 == 91 {                                     // [table]
+            if str_len(line) >= 2 && str_byte_at(line, 1) == 91 { continue; } // [[x]] arrays unsupported
+            var close: i64 = str_find(line, "]");
+            if close > 1 {
+                var segs: Vec = str_split(str_slice(line, 1, close), ".");
+                table = "";
+                var k: i64 = 0;
+                while k < segs.len() {
+                    var seg: str = toml_unquote_key(segs.get(k));
+                    table = toml_join_path(table, seg);
+                    k = k + 1;
+                }
+            }
+            continue;
+        }
+        // key = value — '=' not inside a string
+        var eqi: i64 = toml_find_eq(line);
+        if eqi <= 0 { continue; }
+        var keyraw: str = str_slice(line, 0, eqi);
+        var valraw: str = str_slice(line, eqi + 1, str_len(line));
+        // dotted key path
+        var ksegs: Vec = str_split(keyraw, ".");
+        var rel: str = "";
+        var kk: i64 = 0;
+        while kk < ksegs.len() {
+            var seg2: str = toml_unquote_key(ksegs.get(kk));
+            if !toml_valid_key_raw(ksegs.get(kk)) { rel = ""; break; }
+            rel = toml_join_path(rel, seg2);
+            kk = kk + 1;
+        }
+        if str_len(rel) == 0 { continue; }
+        var tv: TomlValue = toml_parse_value(valraw);
+        entries.push(TomlEntry {
+            path: toml_join_path(table, rel),
+            value: tv,
+        });
+    }
+    return entries;
+}
+
+fn toml_valid_key_raw(k: str) -> bool {
+    var t: str = str_trim(k);
+    return toml_valid_key(t);
+}
+
+// First '=' outside strings.
+fn toml_find_eq(s: str) -> i64 {
+    var in_b: bool = false;
+    var in_l: bool = false;
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if in_b {
+            if c == 92 { i = i + 1; }
+            else if c == 34 { in_b = false; }
+        } else if in_l {
+            if c == 39 { in_l = false; }
+        } else {
+            if c == 34 { in_b = true; }
+            else if c == 39 { in_l = true; }
+            else if c == 61 { return i; }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ─── Accessors ──────────────────────────────────────────────────────────
+
+/// The TomlValue at dotted `path`; kind "invalid" when absent.
+pub fn toml_get(doc: Vec<TomlEntry>, path: str) -> TomlValue {
+    var i: i64 = doc.len();
+    // last write wins (TOML: duplicate keys are an error; we take the last)
+    while i > 0 {
+        i = i - 1;
+        var e: TomlEntry = doc.get(i);
+        if str_equal(e.path, path) { return e.value; }
+    }
+    return toml_invalid();
+}
+
+/// True if `path` exists.
+pub fn toml_has(doc: Vec<TomlEntry>, path: str) -> bool {
+    return !str_equal(toml_get(doc, path).kind, "invalid");
+}
+
+/// Kind string for `path` ("invalid" if missing).
+pub fn toml_kind(doc: Vec<TomlEntry>, path: str) -> str {
+    return toml_get(doc, path).kind;
+}
+
+/// String value at `path` ("" when absent).
+pub fn toml_get_str(doc: Vec<TomlEntry>, path: str) -> str {
+    return toml_get(doc, path).sval;
+}
+
+/// Int value at `path`, `default` when absent or not numeric.
+pub fn toml_get_int(doc: Vec<TomlEntry>, path: str, default: i64) -> i64 {
+    var v: TomlValue = toml_get(doc, path);
+    if str_equal(v.kind, "int") { return str_parse_int(v.sval); }
+    if str_equal(v.kind, "float") { return str_parse_float(v.sval); }
+    return default;
+}
+
+/// Float value at `path`, `default` when absent or not numeric.
+pub fn toml_get_float(doc: Vec<TomlEntry>, path: str, default: f64) -> f64 {
+    var v: TomlValue = toml_get(doc, path);
+    if str_equal(v.kind, "float") || str_equal(v.kind, "int") {
+        return str_parse_float(v.sval);
+    }
+    return default;
+}
+
+/// Bool value at `path`, `default` when absent or not a bool.
+pub fn toml_get_bool(doc: Vec<TomlEntry>, path: str, default: bool) -> bool {
+    var v: TomlValue = toml_get(doc, path);
+    if str_equal(v.kind, "bool") { return str_equal(v.sval, "true"); }
+    return default;
+}
+
+/// All dotted key paths in document order.
+pub fn toml_keys(doc: Vec<TomlEntry>) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < doc.len() {
+        out.push(doc.get(i).path);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Immediate child keys of table `path` ("" for the root table).
+/// e.g. with entries a.b and a.c.d, toml_table_keys(doc,"a") → ["b","c"].
+pub fn toml_table_keys(doc: Vec<TomlEntry>, path: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var prefix: str = path;
+    if str_len(prefix) > 0 { prefix = prefix + "."; }
+    var i: i64 = 0;
+    while i < doc.len() {
+        var p: str = doc.get(i).path;
+        if str_starts_with(p, prefix) {
+            var rest: str = str_slice(p, str_len(prefix), str_len(p));
+            var dot: i64 = str_find(rest, ".");
+            var first: str = rest;
+            if dot >= 0 { first = str_slice(rest, 0, dot); }
+            var seen: bool = false;
+            var j: i64 = 0;
+            while j < out.len() {
+                if str_equal(out.get(j), first) { seen = true; }
+                j = j + 1;
+            }
+            if !seen { out.push(first); }
+        }
+        i = i + 1;
+    }
+    return out;
+}

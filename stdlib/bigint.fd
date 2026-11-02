@@ -1,0 +1,491 @@
+// Fides BigInt standard library
+//
+// Arbitrary-precision signed integers in pure Fides.
+// Limbs are base 10^9 stored little-endian in a Vec<i64>;
+// `neg` is the sign flag. Zero is always neg=false, len 1 limb = 0.
+//
+// Operations: from/to str & i64, compare, add, sub, mul, divmod,
+// pow, mod, and modpow (for crypto use cases).
+//
+// Usage:
+//   use bigint;
+//   val a = bigint_from_str("123456789012345678901234567890");
+//   println(bigint_to_str(bigint_mul(a, a)));
+
+module bigint;
+
+use vec;
+use string;
+
+// ─── Representation ─────────────────────────────────────────────────────
+
+/// A big integer: little-endian base-1e9 limbs + sign.
+/// Invariant: no trailing zero limbs (except the value 0 → limbs [0]).
+pub struct BigInt {
+    pub limbs: Vec,   // Vec<i64>, little-endian
+    pub neg: bool,
+}
+
+/// Result of bigint_divmod: quotient and remainder.
+pub struct BigDiv {
+    pub q: BigInt,
+    pub r: BigInt,
+}
+
+// Internal: quotient limbs + small remainder from divmod-small.
+struct LimbDiv {
+    q: Vec,
+    r: i64,
+}
+
+fn bi_base() -> i64 { return 1000000000; }
+
+pub fn bigint_zero() -> BigInt {
+    var l: Vec = Vec::new();
+    l.push(0);
+    return BigInt { limbs: l, neg: false };
+}
+
+pub fn bigint_one() -> BigInt {
+    var l: Vec = Vec::new();
+    l.push(1);
+    return BigInt { limbs: l, neg: false };
+}
+
+pub fn bigint_from_i64(x: i64) -> BigInt {
+    var l: Vec = Vec::new();
+    var neg: bool = false;
+    var v: i64 = x;
+    if v < 0 { neg = true; v = 0 - v; }
+    var b: i64 = bi_base();
+    if v == 0 { l.push(0); }
+    while v > 0 {
+        l.push(v % b);
+        v = v / b;
+    }
+    return BigInt { limbs: l, neg: neg };
+}
+
+// Strip leading zero limbs.
+fn bi_norm(l: &mut Vec) -> void {
+    while l.len() > 1 && l.get(l.len() - 1) == 0 { l.pop(); }
+}
+
+pub fn bigint_is_zero(a: BigInt) -> bool {
+    return a.limbs.len() == 1 && a.limbs.get(0) == 0;
+}
+
+// ─── Parsing / formatting ───────────────────────────────────────────────
+
+/// Parse a decimal string (optional leading '-'). Invalid input → 0.
+pub fn bigint_from_str(s: str) -> BigInt {
+    var t: str = str_trim(s);
+    var neg: bool = false;
+    if str_len(t) > 0 && str_byte_at(t, 0) == 45 {
+        neg = true;
+        t = str_slice(t, 1, str_len(t));
+    } else if str_len(t) > 0 && str_byte_at(t, 0) == 43 {
+        t = str_slice(t, 1, str_len(t));
+    }
+    var r: BigInt = bigint_zero();
+    var i: i64 = 0;
+    var n: i64 = str_len(t);
+    while i < n {
+        var c: i64 = str_byte_at(t, i);
+        if c >= 48 && c <= 57 {
+            r = bigint_add_i64(bigint_mul_i64(r, 10), c - 48);
+        }
+        i = i + 1;
+    }
+    if !bigint_is_zero(r) { r.neg = neg; }
+    return r;
+}
+
+/// Decimal string form.
+pub fn bigint_to_str(a: BigInt) -> str {
+    if bigint_is_zero(a) { return "0"; }
+    var b: i64 = bi_base();
+    var out: str = int_to_str(a.limbs.get(a.limbs.len() - 1));
+    var i: i64 = a.limbs.len() - 2;
+    while i >= 0 {
+        out = out + int_to_str_padded(a.limbs.get(i), 9);
+        i = i - 1;
+    }
+    if a.neg { out = "-" + out; }
+    return out;
+}
+
+/// Hex string form ("0x..." or "-0x...").
+pub fn bigint_to_hex(a: BigInt) -> str {
+    if bigint_is_zero(a) { return "0x0"; }
+    var digits: str = "0123456789abcdef";
+    // repeated divmod by 16
+    var rem: BigInt = a;
+    rem.neg = false;
+    var out: str = "";
+    var sixteen: BigInt = bigint_from_i64(16);
+    while !bigint_is_zero(rem) {
+        var dm: BigDiv = bigint_divmod(rem, sixteen);
+        out = str_slice(digits, dm.r.limbs.get(0), dm.r.limbs.get(0) + 1) + out;
+        rem = dm.q;
+    }
+    if a.neg { out = "-" + out; }
+    return "0x" + out;
+}
+
+/// Lossy small-int conversion (clamps into i64 range naturally via mod).
+pub fn bigint_to_i64(a: BigInt) -> i64 {
+    var v: i64 = 0;
+    var b: i64 = bi_base();
+    var i: i64 = a.limbs.len() - 1;
+    while i >= 0 {
+        v = v * b + a.limbs.get(i);
+        i = i - 1;
+    }
+    if a.neg { v = 0 - v; }
+    return v;
+}
+
+// ─── Comparison ─────────────────────────────────────────────────────────
+
+// |a| vs |b|: -1, 0, 1
+fn bi_cmp_abs(a: BigInt, b: BigInt) -> i64 {
+    if a.limbs.len() < b.limbs.len() { return -1; }
+    if a.limbs.len() > b.limbs.len() { return 1; }
+    var i: i64 = a.limbs.len() - 1;
+    while i >= 0 {
+        var x: i64 = a.limbs.get(i);
+        var y: i64 = b.limbs.get(i);
+        if x < y { return -1; }
+        if x > y { return 1; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+/// Compare a and b: -1, 0, 1.
+pub fn bigint_cmp(a: BigInt, b: BigInt) -> i64 {
+    if a.neg && !b.neg { if bigint_is_zero(a) && bigint_is_zero(b) { return 0; } return -1; }
+    if !a.neg && b.neg { if bigint_is_zero(a) && bigint_is_zero(b) { return 0; } return 1; }
+    var c: i64 = bi_cmp_abs(a, b);
+    if a.neg { return 0 - c; }
+    return c;
+}
+
+pub fn bigint_eq(a: BigInt, b: BigInt) -> bool { return bigint_cmp(a, b) == 0; }
+pub fn bigint_lt(a: BigInt, b: BigInt) -> bool { return bigint_cmp(a, b) < 0; }
+pub fn bigint_gt(a: BigInt, b: BigInt) -> bool { return bigint_cmp(a, b) > 0; }
+
+// ─── Unsigned limb arithmetic ───────────────────────────────────────────
+
+fn bi_add_abs(a: Vec, b: Vec) -> Vec {
+    var out: Vec = Vec::new();
+    var carry: i64 = 0;
+    var bse: i64 = bi_base();
+    var n: i64 = a.len();
+    if b.len() > n { n = b.len(); }
+    var i: i64 = 0;
+    while i < n {
+        var x: i64 = 0;
+        var y: i64 = 0;
+        if i < a.len() { x = a.get(i); }
+        if i < b.len() { y = b.get(i); }
+        var s: i64 = x + y + carry;
+        if s >= bse { s = s - bse; carry = 1; }
+        else { carry = 0; }
+        out.push(s);
+        i = i + 1;
+    }
+    if carry > 0 { out.push(carry); }
+    return out;
+}
+
+// |a| - |b|, requires |a| >= |b|.
+fn bi_sub_abs(a: Vec, b: Vec) -> Vec {
+    var out: Vec = Vec::new();
+    var borrow: i64 = 0;
+    var bse: i64 = bi_base();
+    var i: i64 = 0;
+    while i < a.len() {
+        var x: i64 = a.get(i) - borrow;
+        var y: i64 = 0;
+        if i < b.len() { y = b.get(i); }
+        var d: i64 = x - y;
+        if d < 0 { d = d + bse; borrow = 1; }
+        else { borrow = 0; }
+        out.push(d);
+        i = i + 1;
+    }
+    bi_norm(&mut out);
+    return out;
+}
+
+// ─── Public arithmetic ──────────────────────────────────────────────────
+
+/// a + b
+pub fn bigint_add(a: BigInt, b: BigInt) -> BigInt {
+    if a.neg == b.neg {
+        return BigInt { limbs: bi_add_abs(a.limbs, b.limbs), neg: a.neg };
+    }
+    var c: i64 = bi_cmp_abs(a, b);
+    if c == 0 { return bigint_zero(); }
+    if c > 0 { return BigInt { limbs: bi_sub_abs(a.limbs, b.limbs), neg: a.neg }; }
+    return BigInt { limbs: bi_sub_abs(b.limbs, a.limbs), neg: b.neg };
+}
+
+/// a - b
+pub fn bigint_sub(a: BigInt, b: BigInt) -> BigInt {
+    var nb: BigInt = BigInt { limbs: b.limbs, neg: !b.neg };
+    if bigint_is_zero(b) { nb.neg = false; }
+    return bigint_add(a, nb);
+}
+
+/// -a
+pub fn bigint_neg(a: BigInt) -> BigInt {
+    if bigint_is_zero(a) { return a; }
+    return BigInt { limbs: a.limbs, neg: !a.neg };
+}
+
+/// |a|
+pub fn bigint_abs(a: BigInt) -> BigInt {
+    return BigInt { limbs: a.limbs, neg: false };
+}
+
+/// a * b (schoolbook — products stay < 10^18, safely in i64).
+pub fn bigint_mul(a: BigInt, b: BigInt) -> BigInt {
+    if bigint_is_zero(a) || bigint_is_zero(b) { return bigint_zero(); }
+    var bse: i64 = bi_base();
+    var n: i64 = a.limbs.len();
+    var m: i64 = b.limbs.len();
+    var out: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < n + m { out.push(0); i = i + 1; }
+    i = 0;
+    while i < n {
+        var carry: i64 = 0;
+        var x: i64 = a.limbs.get(i);
+        var j: i64 = 0;
+        while j < m {
+            var cur: i64 = out.get(i + j) + x * b.limbs.get(j) + carry;
+            out.set(i + j, cur % bse);
+            carry = cur / bse;
+            j = j + 1;
+        }
+        var k: i64 = i + m;
+        while carry > 0 {
+            var cur2: i64 = out.get(k) + carry;
+            out.set(k, cur2 % bse);
+            carry = cur2 / bse;
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    bi_norm(&mut out);
+    return BigInt { limbs: out, neg: a.neg != b.neg };
+}
+
+/// a * small (|small| < 2^62 or so; products < 10^18 for |small| < 10^9
+/// guaranteed, larger smalls work but multiply limb-wise).
+pub fn bigint_mul_i64(a: BigInt, small: i64) -> BigInt {
+    if small == 0 || bigint_is_zero(a) { return bigint_zero(); }
+    var s: i64 = small;
+    var neg: bool = a.neg;
+    if s < 0 { neg = !neg; s = 0 - s; }
+    var bse: i64 = bi_base();
+    var out: Vec = Vec::new();
+    var carry: i64 = 0;
+    var i: i64 = 0;
+    while i < a.limbs.len() {
+        var cur: i64 = a.limbs.get(i) * s + carry;
+        out.push(cur % bse);
+        carry = cur / bse;
+        i = i + 1;
+    }
+    while carry > 0 {
+        out.push(carry % bse);
+        carry = carry / bse;
+    }
+    return BigInt { limbs: out, neg: neg };
+}
+
+/// a + small
+pub fn bigint_add_i64(a: BigInt, small: i64) -> BigInt {
+    return bigint_add(a, bigint_from_i64(small));
+}
+
+// ─── Division (Knuth algorithm D, base 10^9) ────────────────────────────
+
+// |u| / d where 0 < d < base; returns {q_limbs, remainder_i64}
+fn bi_divmod_small(u: Vec, d: i64) -> LimbDiv {
+    var q: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < u.len() { q.push(0); i = i + 1; }
+    var rem: i64 = 0;
+    var bse: i64 = bi_base();
+    i = u.len() - 1;
+    while i >= 0 {
+        var cur: i64 = rem * bse + u.get(i);
+        q.set(i, cur / d);
+        rem = cur % d;
+        i = i - 1;
+    }
+    bi_norm(&mut q);
+    return LimbDiv { q: q, r: rem };
+}
+
+/// divmod: a = q*b + r, 0 <= |r| < |b| (r takes a's sign).
+/// Division by zero → {0, 0}.
+pub fn bigint_divmod(a: BigInt, b: BigInt) -> BigDiv {
+    if bigint_is_zero(b) {
+        return BigDiv { q: bigint_zero(), r: bigint_zero() };
+    }
+    if bi_cmp_abs(a, b) < 0 {
+        return BigDiv { q: bigint_zero(), r: a };
+    }
+    var bse: i64 = bi_base();
+    var bn: i64 = b.limbs.len();
+
+    var q: Vec = Vec::new();
+    var r: Vec = Vec::new();
+
+    if bn == 1 {
+        var dm: LimbDiv = bi_divmod_small(a.limbs, b.limbs.get(0));
+        q = dm.q;
+        var rv: Vec = Vec::new();
+        rv.push(dm.r);
+        r = rv;
+    } else {
+        // Normalize so top limb of divisor >= base/2.
+        var d: i64 = bse / (b.limbs.get(bn - 1) + 1);
+        var ub: BigInt = bigint_mul_i64(BigInt { limbs: a.limbs, neg: false }, d);
+        var vb: BigInt = bigint_mul_i64(BigInt { limbs: b.limbs, neg: false }, d);
+        var un: Vec = ub.limbs;
+        var vn: Vec = vb.limbs;
+        var m: i64 = un.len() - vn.len();
+        // u needs one extra limb slot
+        un.push(0);
+        var j: i64 = m;
+        while j >= 0 {
+            var top: i64 = un.get(j + bn);
+            var next: i64 = un.get(j + bn - 1);
+            var vhi: i64 = vn.get(bn - 1);
+            var qhat: i64 = (top * bse + next) / vhi;
+            var rhat: i64 = (top * bse + next) % vhi;
+            var done: bool = false;
+            while !done {
+                if qhat >= bse { qhat = qhat - 1; rhat = rhat + vhi; }
+                else {
+                    var v2: i64 = 0;
+                    if bn >= 2 { v2 = vn.get(bn - 2); }
+                    var u2: i64 = 0;
+                    if j + bn - 2 >= 0 && j + bn - 2 < un.len() {
+                        u2 = un.get(j + bn - 2);
+                    }
+                    if qhat * v2 > rhat * bse + u2 {
+                        qhat = qhat - 1; rhat = rhat + vhi;
+                        if rhat < bse { continue; }
+                    }
+                    done = true;
+                }
+                if rhat >= bse { done = true; }
+            }
+            // Multiply and subtract.
+            var borrow: i64 = 0;
+            var carry2: i64 = 0;
+            var i: i64 = 0;
+            while i < bn {
+                var p: i64 = qhat * vn.get(i) + carry2;
+                carry2 = p / bse;
+                var sub: i64 = un.get(j + i) - borrow - (p % bse);
+                if sub < 0 { sub = sub + bse; borrow = 1; }
+                else { borrow = 0; }
+                un.set(j + i, sub);
+                i = i + 1;
+            }
+            var sub2: i64 = un.get(j + bn) - borrow - carry2;
+            if sub2 < 0 {
+                // qhat was one too large: add back
+                sub2 = sub2 + bse;
+                un.set(j + bn, sub2);
+                qhat = qhat - 1;
+                var c3: i64 = 0;
+                var ii: i64 = 0;
+                while ii < bn {
+                    var s3: i64 = un.get(j + ii) + vn.get(ii) + c3;
+                    if s3 >= bse { s3 = s3 - bse; c3 = 1; }
+                    else { c3 = 0; }
+                    un.set(j + ii, s3);
+                    ii = ii + 1;
+                }
+                un.set(j + bn, (un.get(j + bn) + c3) % bse);
+            } else {
+                un.set(j + bn, sub2);
+            }
+            q.push(qhat);
+            j = j - 1;
+        }
+        // q built high→low: reverse
+        var qr: Vec = Vec::new();
+        var qi: i64 = q.len() - 1;
+        while qi >= 0 { qr.push(q.get(qi)); qi = qi - 1; }
+        q = qr;
+        bi_norm(&mut q);
+        // Remainder = un[0..bn] / d
+        var rem_un: Vec = Vec::new();
+        var ri: i64 = 0;
+        while ri < bn && ri < un.len() { rem_un.push(un.get(ri)); ri = ri + 1; }
+        bi_norm(&mut rem_un);
+        var dm2: LimbDiv = bi_divmod_small(rem_un, d);
+        r = dm2.q;
+    }
+    var qb: BigInt = BigInt { limbs: q, neg: a.neg != b.neg };
+    if bigint_is_zero(qb) { qb.neg = false; }
+    var rb: BigInt = BigInt { limbs: r, neg: a.neg };
+    if bigint_is_zero(rb) { rb.neg = false; }
+    return BigDiv { q: qb, r: rb };
+}
+
+/// a / b (truncated toward zero).
+pub fn bigint_div(a: BigInt, b: BigInt) -> BigInt {
+    return bigint_divmod(a, b).q;
+}
+
+/// a mod b — result takes a's sign (truncated division).
+pub fn bigint_mod(a: BigInt, b: BigInt) -> BigInt {
+    return bigint_divmod(a, b).r;
+}
+
+// ─── Powers ─────────────────────────────────────────────────────────────
+
+/// a^e for e >= 0 (binary exponentiation).
+pub fn bigint_pow(a: BigInt, e: i64) -> BigInt {
+    var base: BigInt = a;
+    var exp: i64 = e;
+    var result: BigInt = bigint_one();
+    while exp > 0 {
+        if exp % 2 == 1 { result = bigint_mul(result, base); }
+        base = bigint_mul(base, base);
+        exp = exp / 2;
+    }
+    return result;
+}
+
+/// (a^e) mod m — the workhorse for RSA-style crypto.
+pub fn bigint_modpow(base_in: BigInt, e_in: BigInt, m: BigInt) -> BigInt {
+    if bigint_is_zero(m) { return bigint_zero(); }
+    var base: BigInt = bigint_mod(base_in, m);
+    var result: BigInt = bigint_one();
+    var e: BigInt = e_in;
+    var two: BigInt = bigint_from_i64(2);
+    while !bigint_is_zero(e) {
+        var dm: BigDiv = bigint_divmod(e, two);
+        var half: BigInt = dm.q;
+        var bit: BigInt = dm.r;
+        if !bigint_is_zero(bit) {
+            result = bigint_mod(bigint_mul(result, base), m);
+        }
+        base = bigint_mod(bigint_mul(base, base), m);
+        e = half;
+    }
+    return result;
+}

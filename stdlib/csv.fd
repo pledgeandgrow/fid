@@ -1,0 +1,224 @@
+// Fides CSV standard library
+//
+// RFC 4180 CSV parsing and serialization in pure Fides.
+// Handles quoted fields, embedded commas, embedded newlines, and
+// "" escape sequences. Line endings CRLF / LF / CR all accepted.
+//
+// Usage:
+//   use csv;
+//   val rows = csv_parse("a,b\n1,2\n");
+//   println(rows.get(0).fields.get(1));       // "b"
+//   println(csv_field(rows, 1, 0));           // "1"
+//   println(csv_serialize(rows));
+
+module csv;
+
+use vec;
+use string;
+
+// ─── Row type ───────────────────────────────────────────────────────────
+
+/// One CSV record: a list of string fields.
+pub struct CsvRow {
+    pub fields: Vec<str>,
+}
+
+/// A header→value record as produced by csv_parse_records:
+/// `keys` and `values` are parallel; index-aligned.
+pub struct CsvRecord {
+    pub keys: Vec<str>,
+    pub values: Vec<str>,
+}
+
+// ─── Low-level scanner ──────────────────────────────────────────────────
+// Single-pass scanner; on each delimiter/record boundary we emit the
+// accumulated field.
+
+/// Parse CSV text into a Vec of CsvRow. A trailing newline does not add
+/// a phantom row; "a,b\n\n" keeps the empty second row.
+pub fn csv_parse(text: str) -> Vec<CsvRow> {
+    return csv_parse_dialect(text, 44, 34);
+}
+
+/// Full-dialect parse with a custom `delim` and `quote` character.
+pub fn csv_parse_dialect(text: str, delim: i64, quote: i64) -> Vec<CsvRow> {
+    var rows: Vec<CsvRow> = Vec::new();
+    var row: Vec<str> = Vec::new();
+    var field: str = "";
+    var in_quotes: bool = false;
+    var field_started: bool = false;
+    var pending: bool = false;   // row has ≥1 emitted field or open field
+
+    var n: i64 = str_len(text);
+    var i: i64 = 0;
+    while i < n {
+        var c: i64 = str_byte_at(text, i);
+        if in_quotes {
+            if c == quote {
+                if i + 1 < n && str_byte_at(text, i + 1) == quote {
+                    field = field + str_slice(text, i, i + 1);
+                    i = i + 1;
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                field = field + str_slice(text, i, i + 1);
+            }
+        } else {
+            if c == quote && !field_started {
+                in_quotes = true;
+                field_started = true;
+            } else if c == delim {
+                row.push(field);
+                field = "";
+                field_started = false;
+                pending = true;
+            } else if c == 10 || c == 13 {
+                if c == 13 && i + 1 < n && str_byte_at(text, i + 1) == 10 {
+                    i = i + 1;
+                }
+                row.push(field);
+                rows.push(CsvRow { fields: row });
+                row = Vec::new();
+                field = "";
+                field_started = false;
+                pending = false;
+            } else {
+                field = field + str_slice(text, i, i + 1);
+                field_started = true;
+                pending = true;
+            }
+        }
+        i = i + 1;
+    }
+    if pending || field_started || row.len() > 0 {
+        row.push(field);
+        rows.push(CsvRow { fields: row });
+    }
+    return rows;
+}
+
+/// Parse with the first line as headers; returns one CsvRecord per data row.
+pub fn csv_parse_records(text: str) -> Vec<CsvRecord> {
+    var rows: Vec<CsvRow> = csv_parse(text);
+    var out: Vec<CsvRecord> = Vec::new();
+    if rows.len() == 0 { return out; }
+    var headers: Vec<str> = rows.get(0).fields;
+    var r: i64 = 1;
+    while r < rows.len() {
+        var row: Vec<str> = rows.get(r).fields;
+        var vals: Vec<str> = Vec::new();
+        var c: i64 = 0;
+        while c < headers.len() {
+            if c < row.len() { vals.push(row.get(c)); }
+            else { vals.push(""); }
+            c = c + 1;
+        }
+        out.push(CsvRecord { keys: headers, values: vals });
+        r = r + 1;
+    }
+    return out;
+}
+
+/// Look up `key` in a CsvRecord; "" when absent.
+pub fn csv_record_get(rec: CsvRecord, key: str) -> str {
+    var i: i64 = 0;
+    while i < rec.keys.len() {
+        if str_equal(rec.keys.get(i), key) { return rec.values.get(i); }
+        i = i + 1;
+    }
+    return "";
+}
+
+// ─── Serialization ──────────────────────────────────────────────────────
+
+fn csv_delim_str(delim: i64) -> str {
+    if delim == 59 { return ";"; }
+    if delim == 9 { return "\t"; }
+    if delim == 124 { return "|"; }
+    return ",";
+}
+
+/// Quote a field if it contains the delimiter, quotes, or newlines.
+pub fn csv_quote_field(field: str) -> str {
+    return csv_quote_field_dialect(field, 44, 34);
+}
+
+pub fn csv_quote_field_dialect(field: str, delim: i64, quote: i64) -> str {
+    var need: bool = false;
+    var i: i64 = 0;
+    var n: i64 = str_len(field);
+    while i < n {
+        var c: i64 = str_byte_at(field, i);
+        if c == delim || c == quote || c == 10 || c == 13 { need = true; }
+        i = i + 1;
+    }
+    if !need { return field; }
+    var out: str = "\"";
+    i = 0;
+    while i < n {
+        var ch: str = str_slice(field, i, i + 1);
+        if str_byte_at(field, i) == quote { out = out + ch; }  // double it
+        out = out + ch;
+        i = i + 1;
+    }
+    return out + "\"";
+}
+
+/// Serialize rows back to CSV text with LF line endings.
+pub fn csv_serialize(rows: Vec<CsvRow>) -> str {
+    return csv_serialize_dialect(rows, 44);
+}
+
+pub fn csv_serialize_dialect(rows: Vec<CsvRow>, delim: i64) -> str {
+    var ds: str = csv_delim_str(delim);
+    var out: str = "";
+    var r: i64 = 0;
+    while r < rows.len() {
+        var row: Vec<str> = rows.get(r).fields;
+        var c: i64 = 0;
+        while c < row.len() {
+            if c > 0 { out = out + ds; }
+            out = out + csv_quote_field_dialect(row.get(c), delim, 34);
+            c = c + 1;
+        }
+        out = out + "\n";
+        r = r + 1;
+    }
+    return out;
+}
+
+/// Build a CsvRow from a Vec of str.
+pub fn csv_row(fields: Vec<str>) -> CsvRow {
+    return CsvRow { fields: fields };
+}
+
+// ─── Convenience accessors ──────────────────────────────────────────────
+
+/// Field at (row, col) or "" when out of range.
+pub fn csv_field(rows: Vec<CsvRow>, r: i64, c: i64) -> str {
+    if r < 0 || r >= rows.len() { return ""; }
+    var row: Vec<str> = rows.get(r).fields;
+    if c < 0 || c >= row.len() { return ""; }
+    return row.get(c);
+}
+
+/// Number of parsed rows.
+pub fn csv_row_count(rows: Vec<CsvRow>) -> i64 { return rows.len(); }
+
+/// Column count of row `r` (0 if out of range).
+pub fn csv_col_count(rows: Vec<CsvRow>, r: i64) -> i64 {
+    if r < 0 || r >= rows.len() { return 0; }
+    return rows.get(r).fields.len();
+}
+
+/// Extract column `c` across all rows (missing cells become "").
+pub fn csv_column(rows: Vec<CsvRow>, c: i64) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var r: i64 = 0;
+    while r < rows.len() {
+        out.push(csv_field(rows, r, c));
+        r = r + 1;
+    }
+    return out;
+}
