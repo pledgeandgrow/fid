@@ -1,0 +1,84 @@
+# 0001: Values, copy-on-write collections, equality by content
+
+- **Status:** accepted
+- **Decision:** accepted on 2026-11-02 (release M4, M5). `Vec`, `str` and
+  `HashMap` are copy-on-write values; structs are values; `==` on a struct
+  compares its fields.
+
+## Problem
+
+What `b = a` means depends on the type and on whether it is an assignment or a
+call, and the three backends agree only because they share the same mistakes:
+
+```fides
+struct P { x: i64, xs: Vec<i64> }
+fn bump(p: P) { p.x = 9; p.xs.push(7); }
+fn grow(v: Vec<i64>) { v.push(5); }
+
+var a: P = P { x: 1, xs: Vec::new() };
+var b: P = a;  b.x = 2;      // a.x is still 1: assignment copies
+bump(a);                     // a.x is now 9: a call shares
+var v: Vec<i64> = Vec::new();
+var w: Vec<i64> = v;  w.push(1);   // v.len() is 1: a Vec is shared
+grow(v);                           // v.len() is 2
+```
+
+And `==` compares a struct's address and a `Vec`'s identity, so two equal
+points are unequal. Without one rule the compiler cannot know when a value is
+dead, which is why it cannot free everything (release C5, C6).
+
+## Change
+
+1. **Every type is a value.** Assigning, passing, returning and storing a value
+   gives the receiver its own value: changing it never changes the original.
+   Structs are copied (a struct of words is cheap to copy).
+2. **`Vec`, `str`, `HashMap` are copy-on-write.** A copy shares the buffer and
+   adds one to its reference count; the first change to a shared buffer copies
+   it (Swift's model). Copies are O(1) until one side writes.
+3. **A function changes the caller's value only through `&mut`.**
+   `fn grow(v: &mut Vec<i64>)`, called as `grow(&mut v)`. Changing a by-value
+   parameter changes the function's own copy; the compiler warns when such a
+   change is never read (the call does nothing visible).
+4. **Freeing:** the buffer is freed when its reference count reaches zero: at
+   the end of the last owner's scope, on reassignment, or when the struct or
+   collection holding it is freed. No collector, no leak for any `Vec`, `str`,
+   `HashMap` or struct value, including `Vec<str>` elements.
+5. **`==` and `!=`** compare by content: numbers and `str` by value, structs
+   field by field, enums by variant and payload, `Vec` and `HashMap` element by
+   element. A struct that holds a function value or a raw pointer has no `==`
+   unless it implements `eq`. `same(a, b)` asks whether two values share a
+   buffer.
+
+## What it breaks
+
+Code that changes a collection it received by value and expects the caller to
+see it: 152 functions in `compiler/*.fd` and 35 in the stdlib (436 changes).
+Each becomes a `&mut` parameter. Code that compares structs or `Vec`s with `==`
+and meant identity (rare; found by the tests). This is a breaking change before
+1.0, so it ships without an edition, with a migration warning first.
+
+## Alternatives
+
+- **Move semantics** (Rust): no counts, exact freeing, but every use after a
+  move is an error and `.clone()` is everywhere; most borrow-checker friction.
+- **Shared handles** (today, Go and Java): no migration, but aliasing bugs stay
+  and freeing needs a collector or counts on every handle anyway.
+
+## Implementation
+
+1. **Warning first** (both compilers): "changes the by-value parameter 'v'; the
+   caller will not see it: take `&mut`" — the list to migrate. Migrate the
+   stdlib and `compiler/*.fd` to `&mut` while semantics are still shared, so
+   the compiler keeps building itself at every step.
+2. **Runtime:** a count word in the `Vec`, `str` and `HashMap` headers
+   (core's `Vec_*` is the only implementation on every backend); `retain` on
+   copy, `release` at scope end and on overwrite (the lowering already has drop
+   points for `@drop` types and freed strings); `make_unique` before a write.
+3. **Structs:** copied on pass as on assignment (the call ABI passes a copy;
+   `&`/`&mut` pass the address).
+4. **Equality:** synthesized `__eq_T` per type that is compared (the Rust work
+   in progress: only in the module defining the type, only when compared, none
+   for `Vec`/`HashMap` handles, which get element-wise `Vec_eq`).
+5. Tests: one per row of the example above on all three backends, a leak test
+   (`fid run --leaks` reports nothing) for each value kind, and the bootstrap
+   fixpoint.

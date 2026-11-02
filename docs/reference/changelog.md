@@ -22,6 +22,13 @@
   and arithmetic on an operand whose error is already reported adds none.
 - **`@bounded-stack`** is checked: no recursion and no call through a function
   value in anything the function reaches.
+- **`fid` and `fidesc` reject the same programs for the same reason:** `fid`
+  now rejects making a pointer from an integer outside `unsafe` (it accepted
+  it), and its messages for budgets, determinism, linear values, `await`,
+  initialization, KV cache regions, typed strings, `@send` and assignments
+  read as `fidesc`'s (with their Hint and Fix lines). `fid run` errors start
+  with `error:`, and `fid check` no longer prints `error: error:`. The 91
+  expected-fail tests pass through both compilers.
 - **Fixed:** in `fid`, `?` in a function that returns its `Result` by struct
   return returned without copying the error (the caller saw `Ok(0)`).
 - **Fixed:** null checks on runtime strings (`p_file_read`, `p_getenv`,

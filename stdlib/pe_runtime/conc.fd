@@ -163,7 +163,15 @@ pub fn pert_thread_main(block: i64) -> i64 {
 // socket it waits for (-1: none), [17] 1 to wait for writing, [18] the result
 // of the wait, [19] when the wait ends in ms (0: never), [20] freed once done,
 // [21] the scheduler fiber it yields back to, [22] queue links, [23] a pending
-// blocking-pool job.
+// blocking-pool job, [24] the wait state: 0 runnable-or-running, 1 blocked on a
+// wait in the registry (fd/join/pool), 2 already requeued by a wake, 3 blocked
+// on a deadline in the timer heap only.
+// [24] exists because two threads can requeue a task: its worker when it
+// yields runnable, the poller/pool when its wait ends. A yielded task leaves
+// with [24] = 0 and only its worker requeues it; a blocked task leaves with
+// [24] = 1 or 3 and only the poller/pool does, marking it 2 so nobody else
+// can. All transitions hold the registry lock, so a task is never on the run
+// queue twice.
 // A future of a task is its block with the tag 0x7FA5 in the top 16 bits.
 //
 // M:N: `pert_nworkers` OS worker threads each run a scheduler fiber that pops
@@ -199,15 +207,16 @@ var pert_nworkers: i64 = 0;
 var pert_started: i64 = 0;     // *i64 — CAS-guarded one-time init
 var pert_co_deadlocked: i64 = 0;
 
-// Wait registries (RT12). A task blocked on fd / join / pool sits in
-// pert_wait (swap-remove, O(1)); one blocked on a deadline sits in
-// pert_timers (binary min-heap). Pure sleepers are in neither wait nor
-// work queues, so the poller's scans never walk them — a million sleeping
-// tasks cost nothing. Both live under pert_reg; each block stores its own
-// indices ([24] = wait slot, [25] = heap slot, -1 = not registered).
-var pert_wait: i64 = 0;      // wait registry: i64 array of blocks
+// Wait registries (RT12). A task blocked on fd / join / pool sits in a
+// FIFO intrusive list (head→tail = registration order, matching the old
+// blocks-array scan order); one blocked on a deadline sits in pert_timers
+// (binary min-heap). Pure sleepers are in neither wait nor work queues, so
+// the poller's scans never walk them — a million sleeping tasks cost
+// nothing. Both live under pert_reg; each block stores its links and heap
+// index ([24] = in-list flag, [25] = heap slot, [26]/[27] = wait links).
+var pert_wait_head: i64 = 0;
+var pert_wait_tail: i64 = 0;
 var pert_wait_n: i64 = 0;
-var pert_wait_cap: i64 = 0;
 var pert_timers: i64 = 0;    // min-heap entries of 16 bytes: [deadline][block]
 var pert_timer_n: i64 = 0;
 var pert_timer_cap: i64 = 0;
@@ -246,6 +255,7 @@ fn pe_wq_pop() -> i64 {
     if pert_wq_head == 0 {
         pert_wq_tail = 0;
     }
+    pe_store(t + 192, 0);
     pe_k_unlock(pert_wq);
     return t;
 }
@@ -265,7 +275,7 @@ fn pe_co_new_block(name: str, nargs: i64, argv: i64) -> i64 {
         p_panic("task: no such function");
     }
     pe_co_ensure();
-    var block: i64 = pe_zeroed(26);
+    var block: i64 = pe_zeroed(28);
     pe_store(block, fn_addr);
     pe_store(block + 8, nargs);
     var a: i64 = 0;
@@ -275,7 +285,7 @@ fn pe_co_new_block(name: str, nargs: i64, argv: i64) -> i64 {
     }
     pe_store(block + 96, 1);
     pe_store(block + 128, -1);
-    pe_store(block + 192, 0 - 1);   // wait-registry slot
+    // +192 in-wait-list flag and +208/+216 links stay 0 until registered
     pe_store(block + 200, 0 - 1);   // timer-heap slot
     var fiber: i64 = pe_k_create_fiber(16384, 1048576, 0, pe_thread_entry_addr(), block);
     if fiber == 0 {
@@ -430,39 +440,40 @@ fn pe_co_enter(block: i64) {
 
 /// Add `block` to the wait registry (idempotent).
 fn pe_wait_add(block: i64) {
-    if pe_load(block + 192) < 0 {
-        if pert_wait_n == pert_wait_cap {
-            var cap: i64 = pert_wait_cap * 2;
-            if cap == 0 {
-                cap = 64;
-            }
-            var arr: i64 = pe_zeroed(cap);
-            var i: i64 = 0;
-            while i < pert_wait_n {
-                pe_store(arr + i * 8, pe_load(pert_wait + i * 8));
-                i = i + 1;
-            }
-            if pert_wait != 0 {
-                p_free(pert_wait);
-            }
-            pert_wait = arr;
-            pert_wait_cap = cap;
+    if pe_load(block + 192) == 0 {
+        pe_store(block + 192, 1);
+        pe_store(block + 208, 0);
+        pe_store(block + 216, pert_wait_tail);
+        if pert_wait_tail != 0 {
+            pe_store(pert_wait_tail + 208, block);
+        } else {
+            pert_wait_head = block;
         }
-        pe_store(pert_wait + pert_wait_n * 8, block);
-        pe_store(block + 192, pert_wait_n);
+        pert_wait_tail = block;
         pert_wait_n = pert_wait_n + 1;
     }
 }
 
-/// Remove `block` from the wait registry: swap in the last entry.
+/// Unlink `block` from the wait list if registered. Only state 1 is linked —
+/// timer-blocked tasks (3) and wake-queued ones (2) are not on this list.
 fn pe_wait_remove(block: i64) {
-    var idx: i64 = pe_load(block + 192);
-    if idx >= 0 {
-        var last: i64 = pe_load(pert_wait + (pert_wait_n - 1) * 8);
-        pe_store(pert_wait + idx * 8, last);
-        pe_store(last + 192, idx);
+    if pe_load(block + 192) == 1 {
+        var nx: i64 = pe_load(block + 208);
+        var pv: i64 = pe_load(block + 216);
+        if pv != 0 {
+            pe_store(pv + 208, nx);
+        } else {
+            pert_wait_head = nx;
+        }
+        if nx != 0 {
+            pe_store(nx + 216, pv);
+        } else {
+            pert_wait_tail = pv;
+        }
+        pe_store(block + 192, 0);
+        pe_store(block + 208, 0);
+        pe_store(block + 216, 0);
         pert_wait_n = pert_wait_n - 1;
-        pe_store(block + 192, 0 - 1);
     }
 }
 
@@ -643,12 +654,15 @@ pub fn pert_worker_main(id: i64) -> i64 {
         pe_k_tls_set(pert_tls_cur, 0);
         if pe_load(t + 80) != 0 {
             pe_co_finish_task(t);
-        } else if pe_load(t + 128) >= 0 || pe_load(t + 152) != 0
-               || pe_load(t + 112) != 0 || pe_load(t + 184) != 0 {
-            // Blocked on fd / timer / join / pool: the poller or the pool
-            // thread requeues it when it can run again.
         } else {
-            pe_wq_push(t);
+            // Requeue only a runnable task ([24] == 0). A blocked one is the
+            // poller/pool's to wake — checking under the registry lock makes
+            // the handoff atomic against their wake-and-push.
+            pe_k_lock(pert_reg);
+            if pe_load(t + 192) == 0 {
+                pe_wq_push(t);
+            }
+            pe_k_unlock(pert_reg);
         }
     }
     return 0;
@@ -678,18 +692,18 @@ pub fn pert_poller_main(id: i64) -> i64 {
             fds = pe_zeroed(cap * 2);
             map = pe_zeroed(cap);
         }
-        var i: i64 = 0;
         // Scan only tasks blocked on fd / join / pool — timer-only tasks
         // live in the heap and are never walked.
-        while i < pert_wait_n {
-            var c: i64 = pe_load(pert_wait + i * 8);
+        var c: i64 = pert_wait_head;
+        while c != 0 {
+            var nx: i64 = pe_load(c + 208);
             // join wakeup: awaited task finished → runnable again
             var awaits: i64 = pe_load(c + 112);
             if awaits != 0 && pe_load(awaits + 80) != 0 {
                 pe_store(c + 112, 0);
                 pe_wait_remove(c);
+                pe_store(c + 192, 2);
                 pe_wq_push(c);
-                // slot i refilled from the end: re-examine it
             } else {
                 if awaits != 0 {
                     waiters = waiters + 1;
@@ -708,8 +722,8 @@ pub fn pert_poller_main(id: i64) -> i64 {
                 if pe_load(c + 184) != 0 {
                     waiters = waiters + 1;
                 }
-                i = i + 1;
             }
+            c = nx;
         }
         // Soonest deadline is the heap top; armed timers count as waiters.
         first = pe_timer_peek();
@@ -752,9 +766,10 @@ pub fn pert_poller_main(id: i64) -> i64 {
         // lock so a task can't be pushed twice for the same wait. Only the
         // wait registry is walked — sleepers stay in the heap.
         pe_k_lock(pert_reg);
-        i = 0;
-        while i < pert_wait_n {
-            var c: i64 = pe_load(pert_wait + i * 8);
+        var c2: i64 = pert_wait_head;
+        while c2 != 0 {
+            var nx2: i64 = pe_load(c2 + 208);
+            var c: i64 = c2;
             var wake_now: bool = false;
             var wres: i64 = 0;
             var fd: i64 = pe_load(c + 128);
@@ -789,11 +804,10 @@ pub fn pert_poller_main(id: i64) -> i64 {
                 pe_store(c + 152, 0);
                 pe_timer_disarm(c);
                 pe_wait_remove(c);
+                pe_store(c + 192, 2);
                 pe_wq_push(c);
-                // slot i refilled from the end: re-examine it
-            } else {
-                i = i + 1;
             }
+            c2 = nx2;
         }
         // Expired deadlines fire straight off the heap top.
         var more: bool = pert_timer_n > 0 && pe_timer_peek() <= now;
@@ -804,6 +818,7 @@ pub fn pert_poller_main(id: i64) -> i64 {
                 pe_store(tb + 128, -1);
                 pe_store(tb + 152, 0);
                 pe_wait_remove(tb);
+                pe_store(tb + 192, 2);
                 pe_wq_push(tb);
             }
             more = pert_timer_n > 0 && pe_timer_peek() <= now;
@@ -884,7 +899,15 @@ pub fn pert_pool_main(id: i64) -> i64 {
         var r: i64 = pe_call_fn(pe_load(job), pe_load(job + 8), job + 16);
         pe_store(job + 88, r);
         pe_atomic_store(job + 80, 1);
-        pe_wq_push(pe_load(job + 96));
+        // Wake the waiting task under the registry lock: unlink it if its
+        // wait_add already ran, then mark it queued so workers never push it
+        // a second time.
+        pe_k_lock(pert_reg);
+        var tb2: i64 = pe_load(job + 96);
+        pe_wait_remove(tb2);
+        pe_store(tb2 + 192, 2);
+        pe_wq_push(tb2);
+        pe_k_unlock(pert_reg);
     }
     return 0;
 }
@@ -908,10 +931,15 @@ pub fn pert_co_async_v(name: str, nargs: i64, argv: i64) -> i64 {
     pe_co_enter(block);
     if pe_load(block + 80) != 0 {
         pe_co_finish_task(block);
-    } else if pe_load(block + 128) < 0 && pe_load(block + 152) == 0
-           && pe_load(block + 112) == 0 && pe_load(block + 184) == 0 {
-        // Yielded mid-run with nothing to wait on: hand it to the workers.
-        pe_wq_push(block);
+    } else {
+        // Requeue only if truly runnable ([24] == 0). Blocked tasks are the
+        // poller/pool's to wake ([24] == 1); one already pushed by a wake is
+        // marked [24] == 2 — pushing either again would double-queue it.
+        pe_k_lock(pert_reg);
+        if pe_load(block + 192) == 0 {
+            pe_wq_push(block);
+        }
+        pe_k_unlock(pert_reg);
     }
     return block | (0x7FA5 << 48);
 }
@@ -977,6 +1005,9 @@ pub fn pert_co_sleep(ms: i64) -> i64 {
         pe_k_lock(pert_reg);
         pe_store(cur + 152, pe_k_ticks() + d + 1);
         pe_timer_push(pe_load(cur + 152), cur);
+        // Timer-blocked: not on the wait list, not runnable. Without this the
+        // worker's post-switch check sees [24] == 0 and requeues a sleeper.
+        pe_store(cur + 192, 3);
         pe_k_unlock(pert_reg);
         pe_poller_poke();
         pe_co_leave();

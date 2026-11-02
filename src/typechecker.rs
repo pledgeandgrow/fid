@@ -135,6 +135,15 @@ pub struct TypeChecker {
     /// that function-typed parameter may produce. This allows higher-order
     /// functions to propagate effects from their function arguments.
     ho_param_effects: HashMap<(String, String), HashSet<String>>,
+    /// Call-site effect instantiation: func/method name → (param count,
+    /// indices of function-typed params). Functions with such params are
+    /// implicitly effect-polymorphic: the effects of whatever function is
+    /// passed are substituted at each call site.
+    fn_param_positions: HashMap<String, (usize, Vec<usize>)>,
+    /// Function-typed parameter names of the function whose body is being
+    /// scanned for effects. Calls through these are deferred: they contribute
+    /// nothing to the function's own summary because callers instantiate them.
+    cur_fn_params: std::cell::RefCell<HashSet<String>>,
     /// Stack of active region scopes (region name → depth)
     /// When a `region r { ... }` block is entered, `r` is pushed.
     /// When exited, `r` is popped and any references to it become invalid.
@@ -252,6 +261,8 @@ impl TypeChecker {
             strict_caps: false,
             func_effects: HashMap::new(),
             ho_param_effects: HashMap::new(),
+            fn_param_positions: HashMap::new(),
+            cur_fn_params: std::cell::RefCell::new(HashSet::new()),
             region_stack: Vec::new(),
             var_regions: HashMap::new(),
             freed_regions: HashSet::new(),
@@ -1055,6 +1066,12 @@ impl TypeChecker {
                 }
             }
         }
+    }
+
+    /// Inferred effect names per function, populated by `check`/`check_bodies`.
+    /// Exposed for tooling (sequence diagrams, IDE hovers, docs).
+    pub fn func_effects(&self) -> &HashMap<String, HashSet<String>> {
+        &self.func_effects
     }
 
     /// Check function and method bodies after all items are registered.
@@ -3665,67 +3682,55 @@ impl TypeChecker {
         // parameter may produce effects that depend on what function is passed.
         // We track this as "polymorphic effects" keyed by (func_name, param_name).
         for func in &program.funcs {
-            for param in &func.params {
+            let mut positions = Vec::new();
+            for (i, param) in func.params.iter().enumerate() {
                 if let Type::Func { .. } = &param.ty {
-                    // Mark this as a function-typed parameter. The actual effects
-                    // will be determined at call sites based on what function is passed.
-                    // For now, we conservatively assume it can produce any effect.
+                    positions.push(i);
                     self.ho_param_effects.insert(
                         (func.name.clone(), param.name.clone()),
-                        // Conservative: all known effects possible
-                        ["IO", "Net", "Spawn", "Diverge", "Alloc", "Read", "Write",
-                         "Diff", "Noise", "Comm"]
-                            .iter().map(|s| s.to_string()).collect(),
+                        Self::all_effects(),
                     );
                 }
+            }
+            if !positions.is_empty() {
+                self.fn_param_positions
+                    .insert(func.name.clone(), (func.params.len(), positions));
             }
         }
         for imp in &program.impls {
             for method in &imp.methods {
-                for param in &method.params {
+                let mut positions = Vec::new();
+                for (i, param) in method.params.iter().enumerate() {
                     if let Type::Func { .. } = &param.ty {
+                        positions.push(i);
                         self.ho_param_effects.insert(
                             (method.name.clone(), param.name.clone()),
-                            ["IO", "Net", "Spawn", "Diverge", "Alloc", "Read", "Write",
-                             "Diff", "Noise", "Comm"]
-                                .iter().map(|s| s.to_string()).collect(),
+                            Self::all_effects(),
                         );
                     }
+                }
+                if !positions.is_empty() {
+                    self.fn_param_positions
+                        .insert(method.name.clone(), (method.params.len(), positions));
                 }
             }
         }
 
         for func in &program.funcs {
+            *self.cur_fn_params.borrow_mut() = Self::fn_param_names(&func.params);
             let mut effects = HashSet::new();
             self.scan_stmts_for_effects(&func.body, &mut effects);
-            // Add effects from function-typed parameters (conservative: all effects).
-            for param in &func.params {
-                if let Type::Func { .. } = &param.ty {
-                    if let Some(ho_effs) = self.ho_param_effects.get(&(func.name.clone(), param.name.clone())) {
-                        for e in ho_effs {
-                            effects.insert(e.clone());
-                        }
-                    }
-                }
-            }
             results.push((func.name.clone(), effects));
         }
         for imp in &program.impls {
             for method in &imp.methods {
+                *self.cur_fn_params.borrow_mut() = Self::fn_param_names(&method.params);
                 let mut effects = HashSet::new();
                 self.scan_stmts_for_effects(&method.body, &mut effects);
-                for param in &method.params {
-                    if let Type::Func { .. } = &param.ty {
-                        if let Some(ho_effs) = self.ho_param_effects.get(&(method.name.clone(), param.name.clone())) {
-                            for e in ho_effs {
-                                effects.insert(e.clone());
-                            }
-                        }
-                    }
-                }
                 results.push((method.name.clone(), effects));
             }
         }
+        self.cur_fn_params.borrow_mut().clear();
 
         // Insert into the map
         for (name, effects) in &results {
@@ -3734,20 +3739,27 @@ impl TypeChecker {
 
         // Fixpoint iteration: propagate transitive effects through call graph
         // (if A calls B and B has IO, then A has IO too)
+        // Iterate to a fixed point. Replacement (not union) is required:
+        // during the first pass a higher-order argument may resolve to the
+        // conservative all-effects fallback, which later iterations must be
+        // able to shrink back to the actual callee's effects.
+        let max_iters = results.len() * 4 + 64;
         let mut changed = true;
-        while changed {
+        let mut iters = 0usize;
+        while changed && iters < max_iters {
+            iters += 1;
             changed = false;
             // Re-scan with the now-populated func_effects map
             for (name, _) in &results {
                 let func = program.funcs.iter().find(|f| &f.name == name);
-                let body = if let Some(f) = func {
-                    &f.body
+                let (body, params) = if let Some(f) = func {
+                    (&f.body, &f.params)
                 } else {
                     // Find in impls
                     let mut found = None;
                     for imp in &program.impls {
                         if let Some(m) = imp.methods.iter().find(|m| &m.name == name) {
-                            found = Some(&m.body);
+                            found = Some((&m.body, &m.params));
                             break;
                         }
                     }
@@ -3756,16 +3768,33 @@ impl TypeChecker {
                         None => continue,
                     }
                 };
+                *self.cur_fn_params.borrow_mut() = Self::fn_param_names(params);
                 let mut new_effects = HashSet::new();
                 self.scan_stmts_for_effects(body, &mut new_effects);
-                if let Some(existing) = self.func_effects.get(name) {
-                    if !new_effects.is_subset(existing) {
-                        self.func_effects.insert(name.clone(), new_effects);
-                        changed = true;
-                    }
+                if self.func_effects.get(name) != Some(&new_effects) {
+                    self.func_effects.insert(name.clone(), new_effects);
+                    changed = true;
                 }
             }
         }
+        self.cur_fn_params.borrow_mut().clear();
+    }
+
+    /// All concrete effect names — the fallback when a function value of
+    /// unknown provenance is passed to a higher-order function.
+    fn all_effects() -> HashSet<String> {
+        ["IO", "Net", "Spawn", "Diverge", "Alloc", "Read", "Write",
+         "Diff", "Noise", "Comm"]
+            .iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Names of parameters whose type is `fn(...) -> ...`.
+    fn fn_param_names(params: &[Param]) -> HashSet<String> {
+        params
+            .iter()
+            .filter(|p| matches!(p.ty, Type::Func { .. }))
+            .map(|p| p.name.clone())
+            .collect()
     }
 
     fn scan_stmts_for_effects(&self, stmts: &[Stmt], effects: &mut HashSet<String>) {
@@ -3906,22 +3935,23 @@ impl TypeChecker {
                         effects.insert(e.clone());
                     }
                 }
-                // Effect polymorphism: if the callee is a function-typed parameter,
-                // add the polymorphic effects associated with that parameter.
-                // We check all registered HO param effects for any function.
-                for ((_, param_name), ho_effs) in &self.ho_param_effects {
-                    if param_name == callee {
-                        for e in ho_effs {
-                            effects.insert(e.clone());
-                        }
-                    }
+                // Effect-row polymorphism: a call through a function-typed
+                // parameter of the enclosing function is deferred — the
+                // caller instantiates it with the actual argument's effects.
+                // A higher-order call is resolved here, per argument: a known
+                // function name contributes that function's effects, a closure
+                // contributes its body's effects, a forwarded parameter stays
+                // polymorphic, and anything else is conservatively all effects.
+                if !self.cur_fn_params.borrow().contains(callee) {
+                    self.instantiate_fn_arg_effects(callee, args.len(), effects, &|idx| args.get(idx).map(|e| e as &Expr));
                 }
                 for arg in args {
                     self.scan_expr_for_effects(arg, effects);
                 }
             }
-            Expr::MethodCall { receiver, args, .. } => {
+            Expr::MethodCall { receiver, method, args } => {
                 self.scan_expr_for_effects(receiver, effects);
+                self.instantiate_fn_arg_effects(method, args.len(), effects, &|idx| args.get(idx).map(|e| e as &Expr));
                 for arg in args {
                     self.scan_expr_for_effects(arg, effects);
                 }
@@ -3937,7 +3967,98 @@ impl TypeChecker {
                 self.scan_expr_for_effects(array, effects);
                 self.scan_expr_for_effects(index, effects);
             }
+            // A closure passed anywhere (higher-order arg, `val f = ...`)
+            // contributes the effects of its body — including calls through
+            // the enclosing function's params, which stay deferred.
+            Expr::Closure { body, .. } => self.scan_stmts_for_effects(body, effects),
+            Expr::If { cond, then_block, else_block } => {
+                self.scan_expr_for_effects(cond, effects);
+                self.scan_stmts_for_effects(then_block, effects);
+                if let Some(eb) = else_block {
+                    self.scan_stmts_for_effects(eb, effects);
+                }
+            }
+            Expr::Block(stmts) => self.scan_stmts_for_effects(stmts, effects),
+            Expr::Match { expr, arms } => {
+                self.scan_expr_for_effects(expr, effects);
+                for arm in arms {
+                    self.scan_stmts_for_effects(&arm.body, effects);
+                }
+            }
+            Expr::StructLit { fields, spread, .. } => {
+                for (_, e) in fields {
+                    self.scan_expr_for_effects(e, effects);
+                }
+                if let Some(s) = spread {
+                    self.scan_expr_for_effects(s, effects);
+                }
+            }
+            Expr::ArrayLit { elements, .. } | Expr::TupleLit(elements) => {
+                for e in elements {
+                    self.scan_expr_for_effects(e, effects);
+                }
+            }
+            Expr::PipeForward { left, right } => {
+                self.scan_expr_for_effects(left, effects);
+                self.scan_expr_for_effects(right, effects);
+            }
+            Expr::Ref { expr, .. } | Expr::Deref { expr } | Expr::Try { expr }
+            | Expr::Cast { expr, .. } | Expr::Comptime(expr) => {
+                self.scan_expr_for_effects(expr, effects);
+            }
+            Expr::TryBlock { body } => self.scan_stmts_for_effects(body, effects),
+            Expr::Coalesce { expr, default } | Expr::Range { start: expr, end: default, .. } => {
+                self.scan_expr_for_effects(expr, effects);
+                self.scan_expr_for_effects(default, effects);
+            }
+            Expr::ComptimeBlock(stmts) => self.scan_stmts_for_effects(stmts, effects),
             _ => {}
+        }
+    }
+
+    /// Call-site instantiation for a higher-order call: for each
+    /// function-typed parameter position of `callee`, fold the argument's
+    /// effects into `effects`. Deferred when the argument is itself a
+    /// function-typed parameter of the enclosing function.
+    fn instantiate_fn_arg_effects<'a>(
+        &'a self,
+        callee: &str,
+        argc: usize,
+        effects: &mut HashSet<String>,
+        arg_at: &'a (dyn Fn(usize) -> Option<&'a Expr> + 'a),
+    ) {
+        let Some((param_count, positions)) = self.fn_param_positions.get(callee).cloned() else {
+            return;
+        };
+        // Methods may list `self` as a parameter; align positions to args.
+        let offset = param_count.saturating_sub(argc);
+        for pos in positions {
+            if pos < offset {
+                continue;
+            }
+            match arg_at(pos - offset) {
+                Some(Expr::Ident(name)) => {
+                    if let Some(fe) = self.func_effects.get(name) {
+                        for e in fe.clone() {
+                            effects.insert(e);
+                        }
+                    } else if self.cur_fn_params.borrow().contains(name) {
+                        // Forwarded parameter — stays polymorphic.
+                    } else {
+                        // Function value of unknown provenance.
+                        for e in Self::all_effects() {
+                            effects.insert(e);
+                        }
+                    }
+                }
+                Some(Expr::Closure { body, .. }) => self.scan_stmts_for_effects(body, effects),
+                Some(_) => {
+                    for e in Self::all_effects() {
+                        effects.insert(e);
+                    }
+                }
+                None => {}
+            }
         }
     }
 

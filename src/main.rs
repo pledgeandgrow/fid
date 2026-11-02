@@ -32,6 +32,8 @@ use fidesc::native_debugger;
 use fidesc::opt;
 use fidesc::peephole;
 use fidesc::pir;
+use fidesc::seqdiag;
+use fidesc::typechecker::TypeChecker;
 
 /// Print a list of error strings to stderr with colored "error:" prefix.
 ///
@@ -2644,6 +2646,58 @@ fn real_main() {
                         print!("{}", pir::generate_pir(&module, pir::PirLevel::All));
                     }
                 }
+            }
+        }
+
+        "diagram" | "seq" => {
+            if args.len() < 3 {
+                eprintln!("Usage: fidesc diagram <file.fd> [-o out.mmd]");
+                eprintln!("       Emits a Mermaid sequenceDiagram of the file's calls,");
+                eprintln!("       annotated with inferred effects.");
+                process::exit(1);
+            }
+            let input = &args[2];
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+
+            // Parse just this file: the diagram shows the file's own functions.
+            let mut lex = fidesc::lexer::Lexer::new(&source);
+            let toks = lex.tokenize();
+            let program = match fidesc::parser::Parser::new(toks).parse() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Parse error: {}", e);
+                    process::exit(1);
+                }
+            };
+
+            // Infer effects; unresolved imports may produce errors, which are
+            // irrelevant to the diagram, so the check result is ignored.
+            let mut tc = TypeChecker::new();
+            let _ = tc.check(&program);
+            let text = seqdiag::mermaid(&program, tc.func_effects());
+
+            if let Some(pos) = args.iter().position(|a| a == "-o") {
+                match args.get(pos + 1) {
+                    Some(out) => {
+                        if let Err(e) = fs::write(out, &text) {
+                            eprintln!("Error writing '{}': {}", out, e);
+                            process::exit(1);
+                        }
+                        eprintln!("wrote {}", out);
+                    }
+                    None => {
+                        eprintln!("Error: -o requires an output path");
+                        process::exit(1);
+                    }
+                }
+            } else {
+                print!("{}", text);
             }
         }
 

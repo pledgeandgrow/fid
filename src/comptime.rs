@@ -62,14 +62,23 @@ pub fn substitute(program: &Program) -> Result<Program, Vec<String>> {
     let mut errs: Vec<String> = Vec::new();
     let mut prog = program.clone();
 
+    // Phase 1 and I-5A only act on `comptime pf` functions. When the merged
+    // program defines none (the common case — stdlib has no comptime), both
+    // bounded loops only re-clone the program: skip them.
+    let has_comptime_fns = prog.funcs.iter().any(|f| f.is_comptime)
+        || prog.impls.iter().any(|i| i.methods.iter().any(|m| m.is_comptime))
+        || prog.trait_impls.iter().any(|t| t.methods.iter().any(|m| m.is_comptime));
+
     // Phase 1: Pre-substitute comptime expressions inside comptime function
     // bodies so that comptime function calls from comptime context see
     // already-substituted bodies. Iterate a bounded number of times.
-    for _ in 0..8 {
-        let snapshot = prog.clone();
-        for func in prog.funcs.iter_mut() {
-            if func.is_comptime {
-                substitute_func(func, &snapshot, &mut errs);
+    if has_comptime_fns {
+        for _ in 0..8 {
+            let snapshot = prog.clone();
+            for func in prog.funcs.iter_mut() {
+                if func.is_comptime {
+                    substitute_func(func, &snapshot, &mut errs);
+                }
             }
         }
     }
@@ -94,7 +103,8 @@ pub fn substitute(program: &Program) -> Result<Program, Vec<String>> {
     // `comptime pf` functions when ALL arguments are literals, without requiring
     // an explicit `comptime` wrapper. This moves more work to compile time.
     // Iterate to fixed point (bounded) to handle chains of comptime calls.
-    for _ in 0..4 {
+    if has_comptime_fns {
+        for _ in 0..4 {
         let snapshot3 = prog.clone();
         let mut errs3: Vec<String> = Vec::new();
         for func in prog.funcs.iter_mut() {
@@ -111,6 +121,7 @@ pub fn substitute(program: &Program) -> Result<Program, Vec<String>> {
             }
         }
         // Don't add aggressive errors — if it fails, just leave the call as-is
+        }
     }
 
     if errs.is_empty() {

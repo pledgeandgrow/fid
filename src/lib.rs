@@ -66,3 +66,4 @@ pub mod native_debugger;
 pub mod ark;
 pub mod scribe;
 pub mod veil;
+pub mod seqdiag;

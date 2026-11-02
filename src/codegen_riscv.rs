@@ -224,8 +224,8 @@ impl RiscVCodeGen {
                     Operand::Slot(s) => {
                         self.emit(&format!("    sd {}, -{}(fp)", v, s.0));
                     }
-                    Operand::VReg(v) => {
-                        let p = vreg_to_reg(v);
+                    Operand::VReg(pv) => {
+                        let p = vreg_to_reg(pv);
                         self.emit(&format!("    sd {}, 0({})", v, p));
                     }
                     _ => {
@@ -267,7 +267,7 @@ impl RiscVCodeGen {
                 self.emit("    ld ra, 8(sp)");
                 self.emit("    ld s0, 0(sp)");
                 self.emit("    addi sp, sp, 16");
-                self.emit("    return");
+                self.emit("    ret");
             }
 
             L3Inst::Unreachable => self.emit("    ebreak"),

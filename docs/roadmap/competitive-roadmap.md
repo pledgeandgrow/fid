@@ -223,8 +223,15 @@ This is the race we can win outright, since no rival's speed comes for free.
       Nov 2, from 601 s (release D10, D11). Next: string compares in method lookup and the
       parser, then building the compiler with optimization.
 - [ ] CS5. Parallel front end and code generation on all cores (L).
-- [ ] CS6. Incremental native builds per function, under 100 ms for a one-line
+- [~] CS6. Incremental native builds per function, under 100 ms for a one-line
       change (L).
+      Done: whole-output incremental caching on `emit`, `ccompile`, and `build`
+      — `.fides-stamp` records compiler identity, output hash, and every dep
+      file hash; unchanged inputs print "is up to date" and do no work, and a
+      touched dep correctly invalidates. An in-memory L2 IR cache keys modules
+      by source hash within a process. Left: per-function native code reuse —
+      a one-line change still recompiles the whole binary (~0.5 s on hello vs
+      the 100 ms target).
 - [x] CS7. A fast debug mode with no optimizer, and a release mode (S).
       Done: `--debug` (C at -O0) and `--release` (-O2) on `ccompile` in both compilers.
 - [~] CS8. No linear scans in the self-hosted compiler: tables, not `Vec` searches

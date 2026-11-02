@@ -127,7 +127,7 @@ impl Arm64CodeGen {
         match inst {
             L3Inst::AddrOfSlot { dst, slot } => {
                 let d = vreg_to_reg(dst);
-                self.emit(&format!("    add {}, fp, #-{}", d, slot.0));
+                self.emit(&format!("    add {}, x29, #-{}", d, slot.0));
             }
             L3Inst::GlobalAddr { dst, name, .. } => {
                 let d = vreg_to_reg(dst);
@@ -211,7 +211,7 @@ impl Arm64CodeGen {
                 let d = vreg_to_reg(dst);
                 match ptr {
                     Operand::Slot(s) => {
-                        self.emit(&format!("    ldr {}, [fp, #-{}]", d, s.0));
+                        self.emit(&format!("    ldr {}, [x29, #-{}]", d, s.0));
                     }
                     Operand::VReg(v) => {
                         let p = vreg_to_reg(v);
@@ -227,10 +227,10 @@ impl Arm64CodeGen {
                 let v = operand_to_reg(val);
                 match ptr {
                     Operand::Slot(s) => {
-                        self.emit(&format!("    str {}, [fp, #-{}]", v, s.0));
+                        self.emit(&format!("    str {}, [x29, #-{}]", v, s.0));
                     }
-                    Operand::VReg(v) => {
-                        let p = vreg_to_reg(v);
+                    Operand::VReg(pv) => {
+                        let p = vreg_to_reg(pv);
                         self.emit(&format!("    str {}, [{}]", v, p));
                     }
                     _ => {
@@ -271,7 +271,7 @@ impl Arm64CodeGen {
                 }
                 self.emit("    mov sp, x29");
                 self.emit("    ldp x29, x30, [sp], #16");
-                self.emit("    return");
+                self.emit("    ret");
             }
 
             L3Inst::Unreachable => self.emit("    brk #0"),

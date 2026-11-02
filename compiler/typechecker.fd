@@ -2292,14 +2292,20 @@ pub fn TypeChecker_verify_deterministic(self: &mut TypeChecker, program: Program
             while ei < inferred.len() {
                 var eff: str = inferred.get(ei);
                 if eff == "IO" || eff == "Net" || eff == "Spawn" || eff == "Diverge" {
-                    self.errors.push("Deterministic error: function '" + func.name + "' is @deterministic but has !" + eff + " effect");
+                    self.errors.push("Determinism error: function '" + func.name + "' is @deterministic but has effect '!" + eff + "'."
+                        + "\n    @deterministic functions must be reproducible — same inputs → same outputs."
+                        + "\n    Effect '!" + eff + "' introduces nondeterminism (IO/Net depend on external state,"
+                        + "\n    Spawn introduces concurrency, Diverge introduces control flow uncertainty)."
+                        + "\n    Fix: remove the @deterministic annotation, or remove the operation that\n    produces the '!" + eff + "' effect.");
                 }
                 ei = ei + 1;
             }
             // Check for floating-point operations
             var floats: Vec<str> = scan_for_floats(func.body);
             if floats.len() > 0 {
-                self.errors.push("Deterministic error: function '" + func.name + "' is @deterministic but contains floating-point operations");
+                self.errors.push("Determinism error: function '" + func.name + "' is @deterministic but uses floating-point."
+                    + "\n    Floating-point results vary across CPUs (different rounding, FMA contraction, etc.)."
+                    + "\n    Fix: use integer arithmetic (e.g., fixed-point with i64) instead of f32/f64,\n    or remove the @deterministic annotation.");
             }
         }
         fi = fi + 1;
@@ -6558,10 +6564,11 @@ pub fn TypeChecker_types_compatible(self: &TypeChecker, declared: Type, actual: 
         }
         _ => {}
     }
-    // i64 <-> *mut T / *const T
+    // i64 <-> *mut T / *const T (pointers are i64 inside). Making a pointer
+    // from an integer is for `unsafe` code in the program itself.
     match decl {
         Type::RawPtr(_, _) => {
-            if TypeChecker_is_numeric(self, act) { return true; }
+            if TypeChecker_is_numeric(self, act) { return self.current_module != "main" || self.unsafe_depth > 0; }
         }
         _ => {}
     }
@@ -6910,10 +6917,14 @@ pub fn TypeChecker_is_sync_type(self: &TypeChecker, ty: Type) -> bool {
 
 pub fn TypeChecker_consume_var(self: &mut TypeChecker, name: str, line: i64) {
     if self.loop_depth > 0 {
-        self.errors.push("Linear type error (line " + int_to_str(line) + "): variable '" + name + "' cannot be consumed inside a loop");
+        self.errors.push("Linear type error (line " + int_to_str(line) + "): variable '" + name + "' cannot be consumed inside a loop."
+            + "\n    Linear values can only be used once — consuming them inside a loop\n    would fail on the second iteration. Move the consumption outside"
+            + "\n    the loop, or use a non-linear type.");
     }
     if tc_str_vec_contains(self.consumed_vars, name) {
-        self.errors.push("Linear type error (line " + int_to_str(line) + "): variable '" + name + "' was already consumed (moved)");
+        self.errors.push("Linear type error (line " + int_to_str(line) + "): variable '" + name + "' was already consumed (moved)."
+            + "\n    Linear values can only be used once. After being passed to a function,\n    returned, or moved, they cannot be used again."
+            + "\n    Fix: use a different variable, or restructure the code so '" + name + "' is only used once.");
     } else {
         self.consumed_vars.push(name);
     }
@@ -7084,7 +7095,9 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                 OptType::Some(declared) => {
                     TypeChecker_check_value_fits(self, declared, expr_ty, expr, line);
                     if !TypeChecker_types_compatible(self, declared, expr_ty) && !(is_runtime_layer(self.current_module) && is_handle_int_pair(declared, expr_ty)) {
-                        self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign " + type_to_str(expr_ty) + " to variable '" + name + "' of type " + type_to_str(declared));
+                        self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign " + type_to_str(expr_ty) + " to variable '" + name + "' of type " + type_to_str(declared) + "."
+                            + "\n    Expected: " + type_to_str(declared) + "\n    Found:    " + type_to_str(expr_ty)
+                            + "\n    Fix: change the type annotation or the expression.");
                     }
                     final_ty = declared;
                 }
@@ -7526,7 +7539,9 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             if is_kv_cache {
                 match budget {
                     OptI64::None => {
-                        self.errors.push("KV cache region error (line " + int_to_str(line) + "): 'region kv_cache " + name + "' must have a budget");
+                        self.errors.push("KV cache region error (line " + int_to_str(line) + "): 'region kv_cache " + name + "' must have a budget."
+                            + "\n    KV cache regions exist to prevent OOM in LLM serving.\n    Without a budget, the cache can grow unboundedly and crash."
+                            + "\n    Fix: add a budget: `region kv_cache " + name + " with budget(N) { ... }`.");
                     }
                     OptI64::Some(_) => {}
                 }
@@ -7567,7 +7582,13 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                 match rb.budget {
                     OptI64::Some(b) => {
                         if rb.usage > b {
-                            self.errors.push("Budget error: region '" + name + "' used " + int_to_str(rb.usage) + " bytes but budget is " + int_to_str(b) + " bytes");
+                            var rkind: str = "";
+                            var rkw: str = "";
+                            if is_gpu { rkind = "GPU "; rkw = " gpu"; } else if is_kv_cache { rkind = "KV cache "; rkw = " kv_cache"; }
+                            self.errors.push("Budget error (line " + int_to_str(line) + "): " + rkind + "region '" + name + "' used " + int_to_str(rb.usage)
+                                + " bytes but budget is " + int_to_str(b) + " bytes (" + int_to_str(rb.usage - b) + " bytes over)."
+                                + "\n    Hint: reduce allocations inside the " + rkind + "region block, or increase the budget in `region"
+                                + rkw + " " + name + " with budget(" + int_to_str(b) + ") { ... }`.");
                         }
                     }
                     OptI64::None => {}
@@ -7851,7 +7872,9 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
         Expr::Ident(name) => {
             // F63: init guarantee -- check if variable is read before assignment
             if tc_str_vec_contains(self.uninit_vars, name) {
-                self.errors.push("Init error: variable '" + name + "' is used before being assigned a value");
+                self.errors.push("Init error: variable '" + name + "' is used before being assigned a value."
+                    + "\n    It was declared with `var` (uninitialized mutable)."
+                    + "\n    Fix: assign a value to '" + name + "' before reading it, or use `val " + name + " = ...` to initialize at declaration.");
             }
             match TypeChecker_lookup(self, name) {
                 OptType::Some(ty) => { return ty; }
@@ -7974,7 +7997,12 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 }
                 // F68: reject typed string concatenation
                 if TypeChecker_is_typed_string(self, lt_r) || TypeChecker_is_typed_string(self, rt_r) {
-                    self.errors.push("Injection error (F68): cannot use + to concatenate typed string");
+                    var typed: Type = rt_r;
+                    if TypeChecker_is_typed_string(self, lt_r) { typed = lt_r; }
+                    self.errors.push("Injection error (F68): cannot use + to concatenate typed string '" + type_to_str(typed) + "'."
+                        + "\n    Typed strings prevent injection — use bind/escape methods instead."
+                        + "\n    For SQLString: use sql_query() + sql_bind() instead of string +."
+                        + "\n    For ShellString: use shell_cmd() + shell_escape() instead of string +.");
                     return Type::Never;
                 }
             }
@@ -8074,7 +8102,14 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             if callee == "p_thread_spawn" || callee == "p_chan_send" {
                 if arg_types.len() >= 2 {
                     if !TypeChecker_is_send_type(self, arg_types.get(1)) {
-                        self.errors.push("Thread safety error: " + callee + " argument is not @send");
+                        var what: str = " argument of type ";
+                        var where_to: str = "across threads";
+                        var send_only: str = "pass only";
+                        if callee == "p_chan_send" { what = " value of type "; where_to = "through channels"; send_only = "send only"; }
+                        self.errors.push("Thread safety error: " + callee + what + type_to_str(arg_types.get(1))
+                            + "\n             is not @send.\n             Only @send types can be safely sent " + where_to + "."
+                            + "\n             Fix: add @send to the struct definition, or " + send_only
+                            + "\n             @send types (primitives, @send structs, Vec, HashMap).");
                     }
                 }
             }
@@ -8706,7 +8741,8 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 }
                 _ => {}
             }
-            self.errors.push("Type error: await requires a Future<T> operand, got " + type_to_str(inner_ty));
+            self.errors.push("Type error: await requires a Future<T> operand, got " + type_to_str(inner_ty) + "."
+                + "\n    Hint: async fn functions return Future<T>.\n         spawn <expr> also returns Future<T>.");
             return Type::I64;
         }
         Expr::Spawn(inner) => {
@@ -8892,7 +8928,7 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                 if method == "set" { stored = 1; }
                 if stored >= 0 && gargs.len() > 0 && stored < arg_types.len() {
                     if !TypeChecker_types_compatible(self, elem_ty, arg_types.get(stored)) {
-                        self.errors.push("Type error: cannot store " + type_to_str(arg_types.get(stored)) + " in a Vec<" + type_to_str(elem_ty) + "> (" + method + ")");
+                        self.errors.push("Type error: cannot store " + type_to_str(arg_types.get(stored)) + " in a Vec<" + type_to_str(elem_ty) + "> (" + method + ") in '" + self.checking_fn + "'");
                     }
                 }
                 if method == "push" { return Type::Void; }

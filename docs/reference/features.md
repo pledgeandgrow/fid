@@ -244,6 +244,8 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | Effect handlers `handle { do } with` | ⚠️ | Syntax parses and runs; full continuation semantics pending |
 | Effect annotations `!IO`, `!{}` | ✅ | Compile-time effect inference and checking |
 | Effect propagation | ✅ | Fixpoint iteration over call graph |
+| Effect-row polymorphism | ✅ | Higher-order functions (`fn` params) are instantiated per call site: `apply(pure_fn)` is pure, `apply(io_fn)` gets `IO`. Unknown function values fall back to all effects |
+| `fidesc diagram <file>` | ✅ | Mermaid sequence diagram of calls annotated with inferred effects (`src/seqdiag.rs`) |
 
 ### Safety (Phase 2)
 

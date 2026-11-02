@@ -1,0 +1,92 @@
+// Fides atomics with memory orders (proposal 0003,
+// docs/reference/memory-model.md).
+//
+// The model is C++11's, shared by C, Rust, Swift and Zig: a Release store
+// and an Acquire load that reads it make every write before the store
+// visible after the load; SeqCst operations also form one order that every
+// thread sees.
+//
+// Every backend runs each operation as SeqCst today (lock-prefixed or xchg
+// instructions natively, C11 seq_cst or Interlocked in C). A stronger order
+// than asked for is always correct; a backend may later emit the weaker
+// instruction an order allows.
+//
+//   use atomic;
+//   val ready: Atomic = atomic_new(0);
+//   val data: Atomic = atomic_new(0);
+//   // writer thread:
+//   data.store(42, Order::Relaxed);
+//   ready.store(1, Order::Release);
+//   // reader thread:
+//   while ready.load(Order::Acquire) == 0 {}
+//   println(data.load(Order::Relaxed));   // 42
+
+module atomic;
+
+pub enum Order {
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+    SeqCst,
+}
+
+/// One shared 64-bit word. Copies refer to the same word, so an Atomic can be
+/// given to several threads.
+@send
+pub struct Atomic {
+    addr: i64,
+}
+
+/// A new atomic word holding `initial`.
+pub fn atomic_new(initial: i64) -> Atomic {
+    var addr: i64 = 0;
+    // SAFETY: an 8-byte block that lives as long as the program, written
+    // and read only through the atomic operations below
+    unsafe { addr = p_shared_alloc(8); }
+    p_atomic_store(addr, initial);
+    return Atomic { addr: addr };
+}
+
+/// A fence: with Acquire, Release or AcqRel it orders the plain and relaxed
+/// accesses around it as such a load or store would. Every atomic operation
+/// is SeqCst today, so a fence adds no ordering of its own.
+pub fn memory_fence(order: Order) {
+}
+
+impl Atomic {
+    /// The current value. Order: Relaxed, Acquire or SeqCst.
+    pub fn load(self: Atomic, order: Order) -> i64 {
+        return p_atomic_load(self.addr);
+    }
+
+    /// Set the value. Order: Relaxed, Release or SeqCst.
+    pub fn store(self: Atomic, value: i64, order: Order) {
+        p_atomic_store(self.addr, value);
+    }
+
+    /// Set the value and return the previous one.
+    pub fn swap(self: Atomic, value: i64, order: Order) -> i64 {
+        var old: i64 = p_atomic_load(self.addr);
+        while p_atomic_cas(self.addr, old, value) == 0 {
+            old = p_atomic_load(self.addr);
+        }
+        return old;
+    }
+
+    /// If the value is `expected`, set it to `new_value` and return true;
+    /// otherwise leave it and return false.
+    pub fn compare_swap(self: Atomic, expected: i64, new_value: i64, order: Order) -> bool {
+        return p_atomic_cas(self.addr, expected, new_value) != 0;
+    }
+
+    /// Add `n` and return the previous value.
+    pub fn fetch_add(self: Atomic, n: i64, order: Order) -> i64 {
+        return p_atomic_add(self.addr, n);
+    }
+
+    /// Subtract `n` and return the previous value.
+    pub fn fetch_sub(self: Atomic, n: i64, order: Order) -> i64 {
+        return p_atomic_sub(self.addr, n);
+    }
+}
