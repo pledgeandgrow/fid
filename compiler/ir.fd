@@ -1628,6 +1628,8 @@ pub struct IrModule {
     pub extern_functions: Vec<StringVecIrType>,
     pub function_effects: Vec<StringEffectSetEntry>,
     pub extern_decls: Vec<ExternDecl>,
+    // Functions passed to C: each gets an adapter C can call
+    pub c_callbacks: Vec<str>,
     pub trait_methods: Vec<StringVecStr>,
     pub trait_impls: Vec<StringVecStr>,
     pub linear_structs: Vec<str>,
@@ -1708,11 +1710,26 @@ pub fn IrModule_new() -> IrModule {
         extern_functions: Vec::new(),
         function_effects: Vec::new(),
         extern_decls: Vec::new(),
+        c_callbacks: Vec::new(),
         trait_methods: Vec::new(),
         trait_impls: Vec::new(),
         linear_structs: Vec::new(),
         globals: Vec::new(),
     };
+}
+
+/// A `ConstFnRef` of this prefix and a function name is the address of the
+/// function's adapter, which C can call: it supplies the `__env` Fides takes.
+pub fn c_fn_name(name: str) -> str {
+    return "__c_fn_" + name;
+}
+
+/// The function a `ConstFnRef` name refers to.
+pub fn c_fn_target(name: str) -> str {
+    if str_starts_with(name, "__c_fn_") {
+        return str_slice(name, 7, str_len(name));
+    }
+    return name;
 }
 
 pub fn IrModule_add_struct(self: &mut IrModule, layout: StructLayout) {
@@ -2033,8 +2050,9 @@ pub fn IrModule_dead_function_elimination(self: &mut IrModule) -> i64 {
                     OptInst::Some(inst0) => {
                         match inst0 {
                             Inst::ConstFnRef(fn_name) => {
-                                if !ir_c_str_vec_contains(addr_taken, fn_name) {
-                                    addr_taken.push(fn_name);
+                                var taken: str = c_fn_target(fn_name);
+                                if !ir_c_str_vec_contains(addr_taken, taken) {
+                                    addr_taken.push(taken);
                                 }
                             }
                             _ => {}

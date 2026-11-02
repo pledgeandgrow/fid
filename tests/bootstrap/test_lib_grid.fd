@@ -1,0 +1,108 @@
+// stdlib/grid: IEC 61850 names, circuit breaker state, three-phase
+// measurement, GOOSE messages and their wire format, object references and
+// overcurrent protection.
+use grid;
+
+fn main() -> i64 {
+    // names
+    println(iec61850_ln_name(LN_XCBR));
+    println(iec61850_ln_name(LN_PTOC));
+    println(iec61850_ln_name(LN_CILO));
+    println(iec61850_ln_name(LN_CSWI2));
+    println(iec61850_ln_name(-1));
+    println(iec61850_cdc_name(CDC_SPS));
+    println(iec61850_cdc_name(CDC_INC));
+    println(iec61850_cdc_name(99));
+
+    // breaker: starts open; closing and opening count operations
+    var cb = iec61850_xcbr_new("CB1", 630);
+    println(cb.name);
+    println(cb.rated_current);
+    println(iec61850_xcbr_pos_name(cb));
+    println(iec61850_xcbr_is_open(cb));
+    println(iec61850_xcbr_is_closed(cb));
+    iec61850_xcbr_set_pos(cb, 1);
+    println(iec61850_xcbr_pos_name(cb));
+    println(iec61850_xcbr_is_closed(cb));
+    iec61850_xcbr_set_pos(cb, 0);
+    println(cb.op_cnt);
+    // a position outside 0..1 is invalid and is not counted
+    iec61850_xcbr_set_pos(cb, 5);
+    println(iec61850_xcbr_pos_name(cb));
+    println(iec61850_xcbr_is_open(cb));
+    println(iec61850_xcbr_is_closed(cb));
+    println(cb.op_cnt);
+    // health: a warning keeps it operable, an alarm does not
+    println(iec61850_xcbr_health_name(cb));
+    iec61850_xcbr_set_health(cb, 1);
+    println(iec61850_xcbr_health_name(cb));
+    println(cb.capable_of_op);
+    iec61850_xcbr_set_health(cb, 2);
+    println(iec61850_xcbr_health_name(cb));
+    println(cb.capable_of_op);
+
+    // measurement: 3-4-5 triangle for apparent power
+    var m = iec61850_mmxu_new("M1");
+    println(m.frequency);
+    println(iec61850_mmxu_total_power(m));
+    iec61850_mmxu_set_voltage(m, 230.0, 231.0, 232.0);
+    iec61850_mmxu_set_current(m, 1.0, 2.0, 3.0);
+    iec61850_mmxu_set_power(m, 3000.0, 4000.0, 0.6);
+    println(iec61850_mmxu_apparent_power(m));
+    println(iec61850_mmxu_total_power(m));
+    println(m.power_factor);
+
+    // GOOSE
+    var g = iec61850_goose_new(258, "LD0/LLN0$GO$gcb1");
+    println(g.goose_ref);
+    println(iec61850_goose_data_count(g));
+    println(iec61850_goose_get_data(g, 0));
+    iec61850_goose_add_data(g, 1);
+    iec61850_goose_add_data(g, 256);
+    iec61850_goose_add_data(g, 305419896);
+    println(iec61850_goose_data_count(g));
+    println(g.st_num);
+    println(g.seq_num);
+    iec61850_goose_update_data(g, 1, 7);
+    iec61850_goose_update_data(g, 9, 7);
+    iec61850_goose_update_data(g, -1, 7);
+    println(g.seq_num);
+    println(iec61850_goose_get_data(g, 1));
+    println(iec61850_goose_get_data(g, 3));
+    println(iec61850_goose_get_data(g, -1));
+    // wire format: app id (2), st_num (4), seq_num (4), count (1), values (4 each)
+    var b = iec61850_goose_serialize(g);
+    println(b.len());
+    var i: i64 = 0;
+    while i < b.len() {
+        print(b.get(i));
+        print(" ");
+        i = i + 1;
+    }
+    println("");
+    var empty = iec61850_goose_new(1, "x");
+    println(iec61850_goose_serialize(empty).len());
+
+    // references
+    println(iec61850_ref("LD0", "XCBR1", "Pos.stVal"));
+    println(iec61850_dataset_ref("LD0", "ds1"));
+    println(iec61850_control_ref("LD0", "CSWI1", "Pos"));
+
+    // overcurrent: definite time returns the delay; the check latches
+    var p = iec61850_ptoc_new("P1", 100.0, 0.5);
+    println(iec61850_ptoc_check(p, 99.0));
+    println(p.tripped);
+    println(iec61850_ptoc_check(p, 100.0));
+    println(p.tripped);
+    println(iec61850_ptoc_trip_time(p, 500.0));
+    // inverse: below pickup never trips, at pickup the curve is undefined
+    iec61850_ptoc_set_inverse(p, 0.5);
+    println(p.inverse_curve);
+    println(p.tds);
+    println(iec61850_ptoc_trip_time(p, 50.0));
+    println(iec61850_ptoc_trip_time(p, 100.0));
+    // twice pickup: 0.5 * 0.14 / (2^0.02 - 1) = 5.01 s
+    var t = iec61850_ptoc_trip_time(p, 200.0);
+    println((t * 10.0) as i64);
+    return 0;
+}

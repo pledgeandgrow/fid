@@ -337,7 +337,17 @@ pub fn extract_line_col(err: str) -> I64Pair {
 
 /// Parse an error string to extract (line, column, message).
 /// Used by LSP for diagnostics.
-pub fn parse_error_position(error: str) -> StrTriple {
+pub fn parse_error_position(full: str) -> StrTriple {
+    // An enriched error: "error[E040]: <message>", then the source around it
+    var error: str = full;
+    var newline: i64 = str_find(error, "\n");
+    if newline > 0 {
+        error = c_str_substr(error, 0, newline);
+    }
+    var mark: i64 = str_find(error, "]: ");
+    if str_starts_with(error, "error[") && mark >= 0 {
+        error = c_str_substr(error, mark + 3, str_len(error));
+    }
     // Format 1: "Error:line:col: message"
     if str_starts_with(error, "Error:") {
         var rest: str = c_str_substr(error, 6, str_len(error));
@@ -354,8 +364,11 @@ pub fn parse_error_position(error: str) -> StrTriple {
         var start: i64 = str_find(error, "(line ");
         if start >= 0 {
             var rest2: str = c_str_substr(error, start + 6, str_len(error));
-            var end: i64 = str_find(rest2, ")");
-            if end >= 0 {
+            var end: i64 = 0;
+            while end < str_len(rest2) && char_is_digit(str_byte_at(rest2, end)) {
+                end = end + 1;
+            }
+            if end > 0 {
                 var line2: i64 = c_str_parse_i64(c_str_substr(rest2, 0, end));
                 return StrTriple_new(line2, 1, error);
             }
@@ -737,7 +750,7 @@ pub fn build_program_no_std_borrowck(source: str, source_path: OptStr, borrowck_
                     if already_loaded { continue; }
 
                     // Try candidate paths (base_dir + project_root, no stdlib)
-                    var path_str: str = str_replace(import_path, "::", "/");
+                    var path_str: str = c_platform_module(str_replace(import_path, "::", "/"));
                     var candidates: Vec<str> = Vec::new();
                     candidates.push(c_path_join(base_dir, str_concat(path_str, ".fd")));
                     candidates.push(c_path_join(base_dir, c_path_join(path_str, "mod.fd")));
@@ -946,6 +959,17 @@ pub fn pe_runtime_path(name: str) -> str {
 /// The standard library's directory: ./stdlib (the repository), else that
 /// of an installed toolchain: $FID_HOME/stdlib, <exe dir>/stdlib,
 /// <exe dir>/../stdlib (as the Rust compiler looks).
+/// `use tls` is a different module on each system.
+fn c_platform_module(path: str) -> str {
+    if path == "tls" {
+        if c_file_exists("/proc/self/exe") {
+            return "tls_unix";
+        }
+        return "tls_windows";
+    }
+    return path;
+}
+
 pub fn stdlib_dir() -> str {
     if g_stdlib_dir_found {
         return g_stdlib_dir;
@@ -1231,7 +1255,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                             if HashMap_get(loaded_module_set, import_path) != 0 { continue; }
 
                             // Try candidate paths
-                            var path_str: str = str_replace(import_path, "::", "/");
+                            var path_str: str = c_platform_module(str_replace(import_path, "::", "/"));
                             var candidates: Vec<str> = Vec::new();
                             candidates.push(c_path_join(base_dir, str_concat(path_str, ".fd")));
                             candidates.push(c_path_join(base_dir, c_path_join(path_str, "mod.fd")));
@@ -3328,8 +3352,9 @@ pub fn strip_ungranted_caps(module: &mut IrModule, granted_caps: Vec<str>) {
                     }
                 }
                 Inst::ConstFnRef(name) => {
-                    if cc_c_str_vec_contains(all_func_names, name) {
-                        callees.push(name);
+                    var target: str = c_fn_target(name);
+                    if cc_c_str_vec_contains(all_func_names, target) {
+                        callees.push(target);
                     }
                 }
                 _ => {}

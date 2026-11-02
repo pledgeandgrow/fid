@@ -474,6 +474,29 @@ fn main() -> i64 {
 The interpreter has one call stack, so there a task runs to its end when it
 starts; `task_yield` does nothing.
 
+`task_sleep(ms)` and `task_wait_read(fd, timeout_ms)` wait while the other tasks
+run. An `async fn` is a task that starts at once and runs until it first waits,
+then its caller goes on; `await` gives its result, and meanwhile other tasks run:
+
+```fides
+use task;
+
+async fn slow(id: i64) -> Future<i64> {
+    task_sleep(10);
+    return id * 2;
+}
+
+fn main() -> i64 {
+    val a = slow(1);
+    val b = slow(2);
+    println((await a) + (await b));     // 6, after 10 ms
+    return 0;
+}
+```
+
+An `async fn` whose arguments or result are floats, structs or references runs to
+its end at the call: a task cannot hold those across a suspension yet.
+
 ### Threads and Globals
 
 A function that runs on another thread, or anything it calls, may not write a

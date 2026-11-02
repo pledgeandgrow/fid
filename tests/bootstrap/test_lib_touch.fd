@@ -1,0 +1,182 @@
+// stdlib/touch: touch slots, begin/move/end/cancel, taps, pan, swipe
+// direction and delta, pinch scale, pixel conversion, thresholds, clear and
+// init. Coordinates are binary fractions so the distances are exact.
+// Taps and swipe deltas read touches that are in the ENDED phase, and
+// touch_update removes those, so they are checked before touch_update.
+use touch;
+
+fn say_yes(b: bool) {
+    if b { println("yes"); } else { println("no"); }
+}
+
+fn main() -> i64 {
+    var ts = touch_create();
+    println(touch_count(&ts));
+    println(ts.touches.len());
+    println(ts.screen_width);
+    println(ts.tap_max_distance);
+    println(ts.swipe_min_distance);
+    say_yes(touch_pinch_active(&ts));
+    println(touch_pinch_scale(&ts));
+    say_yes(touch_is_tap(&ts));
+    var none = touch_get(&ts, 0);
+    println(none.id);
+    say_yes(none.active);
+
+    // a tap: down and up in the same place
+    touch_begin(&mut ts, 5, 0.5, 0.5, 1.0, 100.0);
+    println(touch_count(&ts));
+    var t = touch_get(&ts, 0);
+    println(t.id);
+    println(t.phase == TOUCH_BEGAN);
+    println(t.start_x);
+    println(t.pressure);
+    println(t.timestamp);
+    say_yes(touch_is_tap(&ts));
+    touch_end(&mut ts, 5);
+    println(touch_get(&ts, 0).phase == TOUCH_ENDED);
+    say_yes(touch_is_tap(&ts));
+    var tp = touch_tap_position(&ts);
+    println(tp.x);
+    println(tp.y);
+    touch_update(&mut ts);
+    // update cleaned the ended touch up
+    println(touch_count(&ts));
+    say_yes(touch_is_tap(&ts));
+    say_yes(touch_pan_active(&ts));
+    say_yes(touch_swipe_active(&ts));
+
+    // moving more than the tap distance is not a tap
+    touch_begin(&mut ts, 6, 0.25, 0.25, 0.5, 200.0);
+    touch_move(&mut ts, 6, 0.5, 0.5, 0.75);
+    var m = touch_get(&ts, 0);
+    println(m.x);
+    println(m.prev_x);
+    println(m.start_x);
+    println(m.pressure);
+    println(m.phase == TOUCH_MOVED);
+    var pd = touch_pan_delta(&ts);
+    println(pd.x);
+    println(pd.y);
+    touch_end(&mut ts, 6);
+    say_yes(touch_is_tap(&ts));
+    var sd = touch_swipe_delta(&ts);
+    println(sd.x);
+    println(sd.y);
+    // update: a single finger lifted after moving 0.35 is a swipe to the
+    // lower right; the larger of |dx| and |dy| decides, ties go vertical
+    touch_update(&mut ts);
+    say_yes(touch_swipe_active(&ts));
+    println(touch_swipe_direction(&ts));
+    say_yes(touch_pan_active(&ts));
+    println(touch_count(&ts));
+
+    // swipe directions: 0 right, 1 left, 2 down, 3 up
+    var dirs_x: Vec<f64> = Vec::new();
+    dirs_x.push(0.75);
+    dirs_x.push(0.25);
+    dirs_x.push(0.5);
+    dirs_x.push(0.5);
+    var dirs_y: Vec<f64> = Vec::new();
+    dirs_y.push(0.5);
+    dirs_y.push(0.5);
+    dirs_y.push(0.75);
+    dirs_y.push(0.25);
+    var d: i64 = 0;
+    while d < 4 {
+        touch_begin(&mut ts, 20 + d, 0.5, 0.5, 1.0, 0.0);
+        touch_move(&mut ts, 20 + d, dirs_x.get(d), dirs_y.get(d), 1.0);
+        touch_end(&mut ts, 20 + d);
+        touch_update(&mut ts);
+        print(touch_swipe_direction(&ts));
+        print(" ");
+        print(touch_swipe_active(&ts));
+        print(" ");
+        println(touch_pan_active(&ts));
+        d = d + 1;
+    }
+    // a move shorter than the swipe distance (0.1) is no swipe
+    touch_begin(&mut ts, 30, 0.5, 0.5, 1.0, 0.0);
+    touch_move(&mut ts, 30, 0.5625, 0.5, 1.0);
+    touch_end(&mut ts, 30);
+    touch_update(&mut ts);
+    say_yes(touch_swipe_active(&ts));
+    // a cancelled touch is cleaned up without a swipe
+    touch_begin(&mut ts, 31, 0.5, 0.5, 1.0, 0.0);
+    touch_move(&mut ts, 31, 0.9, 0.5, 1.0);
+    touch_cancel(&mut ts, 31);
+    touch_update(&mut ts);
+    say_yes(touch_swipe_active(&ts));
+    println(touch_count(&ts));
+
+    // pinch: two fingers 0.5 apart, then 1.0 apart is a scale of 2
+    touch_begin(&mut ts, 1, 0.25, 0.5, 1.0, 0.0);
+    touch_begin(&mut ts, 2, 0.75, 0.5, 1.0, 0.0);
+    println(touch_count(&ts));
+    touch_update(&mut ts);
+    say_yes(touch_pinch_active(&ts));
+    println(ts.pinch_initial_distance);
+    println(touch_pinch_scale(&ts));
+    touch_move(&mut ts, 2, 1.25, 0.5, 1.0);
+    touch_update(&mut ts);
+    println(touch_pinch_scale(&ts));
+    touch_move(&mut ts, 2, 0.5, 0.5, 1.0);
+    touch_update(&mut ts);
+    println(touch_pinch_scale(&ts));
+    say_yes(touch_pan_active(&ts));
+    // lifting one finger ends the pinch
+    touch_end(&mut ts, 2);
+    touch_update(&mut ts);
+    say_yes(touch_pinch_active(&ts));
+    println(touch_pinch_scale(&ts));
+    println(touch_count(&ts));
+
+    // events for unknown ids are ignored
+    touch_move(&mut ts, 99, 0.0, 0.0, 1.0);
+    touch_end(&mut ts, 99);
+    touch_cancel(&mut ts, 99);
+    println(touch_count(&ts));
+
+    // the slots are limited to 10
+    touch_clear(&mut ts);
+    println(touch_count(&ts));
+    var k: i64 = 0;
+    while k < 12 {
+        touch_begin(&mut ts, 100 + k, 0.1, 0.1, 1.0, 0.0);
+        k = k + 1;
+    }
+    println(touch_count(&ts));
+    println(touch_get(&ts, 9).id);
+    println(touch_get(&ts, 10).id);
+    touch_init(&mut ts);
+    println(touch_count(&ts));
+
+    // pixels
+    touch_set_screen_size(&mut ts, 1000.0, 500.0);
+    touch_begin(&mut ts, 1, 0.25, 0.5, 1.0, 0.0);
+    var px = touch_to_pixels(&ts, &touch_get(&ts, 0));
+    println(px.x);
+    println(px.y);
+
+    // thresholds
+    touch_clear(&mut ts);
+    touch_set_tap_threshold(&mut ts, 0.5, 100.0);
+    println(ts.tap_max_distance);
+    println(ts.tap_max_duration);
+    touch_begin(&mut ts, 1, 0.25, 0.25, 1.0, 0.0);
+    touch_move(&mut ts, 1, 0.5, 0.25, 1.0);
+    touch_end(&mut ts, 1);
+    say_yes(touch_is_tap(&ts));
+    touch_clear(&mut ts);
+    touch_set_swipe_threshold(&mut ts, 0.5);
+    println(ts.swipe_min_distance);
+    touch_begin(&mut ts, 1, 0.25, 0.25, 1.0, 0.0);
+    touch_move(&mut ts, 1, 0.5, 0.25, 1.0);
+    touch_end(&mut ts, 1);
+    touch_update(&mut ts);
+    say_yes(touch_swipe_active(&ts));
+    println(TOUCH_NONE);
+    println(TOUCH_CANCELLED);
+    println(MAX_TOUCHES);
+    return 0;
+}

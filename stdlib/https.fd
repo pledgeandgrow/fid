@@ -1,0 +1,179 @@
+// Fides HTTPS standard library
+//
+// Making HTTP and HTTPS requests, and serving HTTPS: module `http` over `tls`.
+//
+// Usage:
+//   use https;
+//
+//   val r: FetchResult = fetch("https://example.com/");
+//   if r.status == 200 {
+//       println(r.body);
+//   }
+//
+//   https_serve(8443, "server.pfx", "password", route);   // on Windows
+//   https_serve(8443, "cert.pem", "key.pem", route);      // on other systems
+
+module https;
+
+use http;
+use tls;
+
+/// What a request gave. `status` is 0 when it never got an answer, and `error`
+/// says why.
+pub struct FetchResult {
+    pub status: i64,
+    pub message: HttpRequest,
+    pub body: str,
+    pub error: str,
+}
+
+fn fetch_failed(why: str) -> FetchResult {
+    return FetchResult { status: 0, message: http_parse_head(""), body: "", error: why };
+}
+
+/// The parts of a URL: scheme, host, port as text, path with its query.
+fn url_part(url: str, part: i64) -> str {
+    var rest: str = url;
+    var scheme: str = "http";
+    val mark: i64 = str_find(url, "://");
+    if mark >= 0 {
+        scheme = str_to_lower(str_slice(url, 0, mark));
+        rest = str_slice(url, mark + 3, str_len(url));
+    }
+    var path: str = "/";
+    val slash: i64 = str_find(rest, "/");
+    if slash >= 0 {
+        path = str_slice(rest, slash, str_len(rest));
+        rest = str_slice(rest, 0, slash);
+    }
+    var port: str = "80";
+    if scheme == "https" {
+        port = "443";
+    }
+    val colon: i64 = str_find(rest, ":");
+    if colon >= 0 {
+        port = str_slice(rest, colon + 1, str_len(rest));
+        rest = str_slice(rest, 0, colon);
+    }
+    if part == 0 { return scheme; }
+    if part == 1 { return rest; }
+    if part == 2 { return port; }
+    return path;
+}
+
+fn tls_conn_recv(s: i64, buf: i64, n: i64, timeout_ms: i64) -> i64 {
+    return tls_session_recv(s, buf, n, timeout_ms);
+}
+
+fn tls_conn_send(s: i64, buf: i64, n: i64) -> i64 {
+    return tls_session_send(s, buf, n);
+}
+
+fn tls_conn_close(s: i64) -> i64 {
+    return tls_session_close(s);
+}
+
+var https_server_creds: i64 = 0;
+
+fn tls_conn_accept(fd: i64) -> i64 {
+    return tls_accept(https_server_creds, fd);
+}
+
+fn https_hooks() {
+    http_set_tls(tls_conn_recv, tls_conn_send, tls_conn_close, tls_conn_accept);
+}
+
+/// One request and its answer.
+fn fetch_once(method: str, url: str, headers: str, body: str) -> FetchResult {
+    val scheme: str = url_part(url, 0);
+    val host: str = url_part(url, 1);
+    val port: i64 = str_parse_int(url_part(url, 2));
+    if scheme != "http" && scheme != "https" {
+        return fetch_failed("unknown scheme: " + scheme);
+    }
+    val fd: i64 = p_co_connect(host, port);
+    if fd < 0 {
+        return fetch_failed("cannot connect to " + host);
+    }
+    var session: i64 = 0;
+    if scheme == "https" {
+        https_hooks();
+        session = tls_client(fd, host);
+        if session == 0 {
+            p_socket_close(fd);
+            return fetch_failed("TLS handshake failed with " + host);
+        }
+    }
+    val c: i64 = http_conn_new(fd, session);
+    var request: str = method + " " + url_part(url, 3) + " HTTP/1.1\r\nHost: " + host
+        + "\r\nUser-Agent: fides\r\nAccept: */*\r\nConnection: close\r\n" + headers;
+    if body != "" || method == "POST" || method == "PUT" {
+        request = request + "Content-Length: " + int_to_str(str_len(body)) + "\r\n";
+    }
+    if !http_conn_write(c, request + "\r\n" + body) {
+        http_conn_close(c);
+        return fetch_failed("cannot send to " + host);
+    }
+    val msg: HttpRequest = http_read_message(c, 30000, true);
+    http_conn_close(c);
+    if msg.method == "" {
+        return fetch_failed("no answer from " + host);
+    }
+    return FetchResult { status: str_parse_int(msg.target), message: msg, body: msg.body, error: "" };
+}
+
+/// A request, following redirects. `headers` are extra headers, each
+/// "Name: value\r\n".
+pub fn fetch_with(method: str, url: str, headers: str, body: str) -> FetchResult {
+    var target: str = url;
+    var hops: i64 = 0;
+    while true {
+        val r: FetchResult = fetch_once(method, target, headers, body);
+        val moved: bool = r.status == 301 || r.status == 302 || r.status == 303 || r.status == 307 || r.status == 308;
+        val next: str = http_header(r.message, "location");
+        if !moved || next == "" || hops >= 5 {
+            return r;
+        }
+        if str_contains(next, "://") {
+            target = next;
+        } else {
+            target = url_part(target, 0) + "://" + url_part(target, 1) + ":" + url_part(target, 2) + next;
+        }
+        hops = hops + 1;
+    }
+    return fetch_failed("too many redirects");
+}
+
+/// GET a URL.
+pub fn fetch(url: str) -> FetchResult {
+    return fetch_with("GET", url, "", "");
+}
+
+/// POST a body to a URL.
+pub fn fetch_post(url: str, content_type: str, body: str) -> FetchResult {
+    return fetch_with("POST", url, "Content-Type: " + content_type + "\r\n", body);
+}
+
+/// As https_serve, with memory that stays flat; the promise is http_serve_scoped's.
+@unsafe
+pub fn https_serve_scoped(port: i64, cert: str, key: str, handler: fn(HttpRequest) -> str) -> bool {
+    http_set_scoped();
+    return https_serve(port, cert, key, handler);
+}
+
+/// Serve HTTPS on `port` until the process ends: `cert` and `key` are as for
+/// tls_server. Returns false if the port or the certificate cannot be opened.
+pub fn https_serve(port: i64, cert: str, key: str, handler: fn(HttpRequest) -> str) -> bool {
+    val creds: i64 = tls_server(cert, key);
+    if creds == 0 {
+        return false;
+    }
+    val fd: i64 = p_socket_listen(port);
+    if fd < 0 {
+        return false;
+    }
+    https_server_creds = creds;
+    https_hooks();
+    http_serve_on(fd, true, handler);
+    return true;
+}

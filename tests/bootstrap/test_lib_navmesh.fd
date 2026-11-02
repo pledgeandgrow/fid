@@ -1,0 +1,113 @@
+// stdlib/navmesh: grid A* (straight, diagonal, forced detour, blocked and
+// out-of-range cells, no path), coordinate packing, and polygon-graph A*.
+// Every grid below has one cheapest path, so the waypoints are exact.
+// Waypoints print as packed values x * 10000 + y.
+use navmesh;
+
+fn show(v: Vec<i64>) {
+    print(v.len());
+    print(": ");
+    var i: i64 = 0;
+    while i < v.len() {
+        print(v.get(i));
+        print(" ");
+        i = i + 1;
+    }
+    println("");
+}
+
+// Printing a bool read back from a Vec<bool> shows 0/1 in the interpreter
+// and false/true elsewhere, so the cell checks go through show_blocked().
+fn show_blocked(b: bool) {
+    if b { println("blocked"); } else { println("free"); }
+}
+
+fn main() -> i64 {
+    // packing
+    println(nav_grid_index(3, 7));
+    println(nav_grid_index(0, 0));
+    var u = nav_grid_unpack(30007);
+    println(u.x);
+    println(u.y);
+
+    // cell access: outside the grid counts as blocked, setting outside is ignored
+    var g = nav_grid_create(5, 5);
+    println(g.cells.len());
+    show_blocked(nav_grid_is_blocked(&g, 2, 2));
+    nav_grid_set_blocked(&mut g, 2, 2, true);
+    show_blocked(nav_grid_is_blocked(&g, 2, 2));
+    nav_grid_set_blocked(&mut g, 2, 2, false);
+    show_blocked(nav_grid_is_blocked(&g, 2, 2));
+    nav_grid_set_blocked(&mut g, 9, 9, true);
+    nav_grid_set_blocked(&mut g, -1, 0, true);
+    show_blocked(nav_grid_is_blocked(&g, -1, 0));
+    show_blocked(nav_grid_is_blocked(&g, 5, 0));
+    show_blocked(nav_grid_is_blocked(&g, 0, 5));
+    show_blocked(nav_grid_is_blocked(&g, 4, 4));
+
+    // straight line, diagonal, and start == goal
+    show(nav_grid_find_path(&g, 0, 0, 4, 0));
+    show(nav_grid_find_path(&g, 0, 0, 4, 4));
+    show(nav_grid_find_path(&g, 3, 2, 3, 2));
+    // a goal that is blocked or outside the grid has no path
+    nav_grid_set_blocked(&mut g, 4, 4, true);
+    show(nav_grid_find_path(&g, 0, 0, 4, 4));
+    show(nav_grid_find_path(&g, 0, 0, 7, 7));
+
+    // a wall with one gap at the bottom forces the path through it. Diagonal
+    // moves may not cut the wall's corner.
+    var w = nav_grid_create(3, 3);
+    nav_grid_set_blocked(&mut w, 1, 0, true);
+    nav_grid_set_blocked(&mut w, 1, 1, true);
+    var p = nav_grid_find_path(&w, 0, 0, 2, 0);
+    show(p);
+    println(nav_grid_path_length(p));
+    var wp = nav_grid_path_waypoint(p, 3);
+    println(wp.x);
+    println(wp.y);
+    var bad = nav_grid_path_waypoint(p, 7);
+    println(bad.x);
+    println(bad.y);
+    var neg = nav_grid_path_waypoint(p, -1);
+    println(neg.x);
+    // close the gap: no path
+    nav_grid_set_blocked(&mut w, 1, 2, true);
+    show(nav_grid_find_path(&w, 0, 0, 2, 0));
+
+    // polygon graph: a short chain 0-1-2 and a long way round through 3
+    var m = navmesh_create();
+    println(navmesh_poly_count(&m));
+    var a = navmesh_add_polygon(&mut m, 0.0, 0.0);
+    var b = navmesh_add_polygon(&mut m, 3.0, 4.0);
+    var c = navmesh_add_polygon(&mut m, 6.0, 8.0);
+    var d = navmesh_add_polygon(&mut m, 0.0, 20.0);
+    var e = navmesh_add_polygon(&mut m, 100.0, 100.0);
+    println(a);
+    println(b);
+    println(c);
+    println(d);
+    println(e);
+    println(navmesh_poly_count(&m));
+    navmesh_connect(&mut m, a, b);
+    navmesh_connect(&mut m, b, c);
+    navmesh_connect(&mut m, a, d);
+    navmesh_connect(&mut m, d, c);
+    // bad ids are ignored
+    navmesh_connect(&mut m, a, 17);
+    navmesh_connect(&mut m, -2, b);
+    println(m.polygons.get(a).neighbors.len());
+    println(m.polygons.get(b).neighbors.len());
+    show(navmesh_find_path(&m, a, c));
+    show(navmesh_find_path(&m, c, a));
+    show(navmesh_find_path(&m, a, a));
+    show(navmesh_find_path(&m, a, d));
+    // polygon 4 is not connected to anything
+    show(navmesh_find_path(&m, a, e));
+    var pc = navmesh_poly_center(&m, c);
+    println(pc.x);
+    println(pc.y);
+    var none = navmesh_poly_center(&m, 99);
+    println(none.x);
+    println(none.y);
+    return 0;
+}

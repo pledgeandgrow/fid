@@ -1266,6 +1266,15 @@ impl SourceMap {
 /// Its tables are ordered maps so every backend emits the same output for
 /// the same input (reproducible builds; HashMap order differs per run).
 /// Contains functions, global data, struct layouts, and metadata.
+/// A `ConstFnRef` of this prefix and a function name is the address of the
+/// function's adapter, which C can call: it supplies the `__env` Fides takes.
+pub const C_FN_PREFIX: &str = "__c_fn_";
+
+/// The function a `ConstFnRef` name refers to.
+pub fn c_fn_target(name: &str) -> &str {
+    name.strip_prefix(C_FN_PREFIX).unwrap_or(name)
+}
+
 #[derive(Debug, Clone)]
 pub struct IrModule {
     pub functions: std::collections::BTreeMap<String, IrFunction>,
@@ -1280,6 +1289,8 @@ pub struct IrModule {
     pub function_effects: std::collections::BTreeMap<String, EffectSet>,
     /// User-defined extern declarations for FFI (C codegen uses these)
     pub extern_decls: Vec<crate::ast::ExternDecl>,
+    /// Functions passed to C: each gets an adapter C can call
+    pub c_callbacks: std::collections::BTreeSet<String>,
     /// Trait method names in order, for vtable dispatch.
     /// Maps trait name → list of method names.
     pub trait_methods: std::collections::BTreeMap<String, Vec<String>>,
@@ -1302,6 +1313,7 @@ impl IrModule {
             extern_functions: std::collections::BTreeMap::new(),
             function_effects: std::collections::BTreeMap::new(),
             extern_decls: Vec::new(),
+            c_callbacks: std::collections::BTreeSet::new(),
             trait_methods: std::collections::BTreeMap::new(),
             trait_impls: std::collections::BTreeMap::new(),
             linear_structs: std::collections::BTreeSet::new(),

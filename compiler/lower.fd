@@ -482,6 +482,10 @@ pub struct Lowerer {
     pub sandbox_depth: i64,
     pub func_ret_types: Vec<StringTypeEntry>,
     pub async_funcs: Vec<str>,
+    // Those whose calls start a task: their arguments and result are words
+    pub async_tasks: Vec<str>,
+    // Externs with a function parameter
+    pub fn_externs: Vec<str>,
     pub current_func_param_types: Vec<StringTypeEntry>,
     pub vec_allocas: Vec<i64>,
     pub linear_structs: Vec<str>,
@@ -539,6 +543,8 @@ pub fn Lowerer_new() -> Lowerer {
         sandbox_depth: 0,
         func_ret_types: Vec::new(),
         async_funcs: Vec::new(),
+        async_tasks: Vec::new(),
+        fn_externs: Vec::new(),
         current_func_param_types: Vec::new(),
         vec_allocas: Vec::new(),
         linear_structs: Vec::new(),
@@ -905,6 +911,47 @@ pub fn Lowerer_insert_param_type(self: &mut Lowerer, name: str, ty: Type) {
 
 pub fn Lowerer_insert_async_func(self: &mut Lowerer, name: str) {
     self.async_funcs.push(name);
+}
+
+/// A value a task can hold across a suspension and hand back: one word that
+/// does not point into its caller's stack.
+fn lw_task_word(ty: Type) -> bool {
+    match ty {
+        Type::I8 => { return true; }
+        Type::I16 => { return true; }
+        Type::I32 => { return true; }
+        Type::I64 => { return true; }
+        Type::U8 => { return true; }
+        Type::U16 => { return true; }
+        Type::U32 => { return true; }
+        Type::U64 => { return true; }
+        Type::Bool => { return true; }
+        Type::Str => { return true; }
+        Type::Void => { return true; }
+        Type::Named(n) => { return n == "str"; }
+        Type::Generic(n, _) => { return n == "Vec" || n == "HashMap"; }
+        _ => { return false; }
+    }
+}
+
+fn lw_is_async_task(func: Func) -> bool {
+    var ret: Type = func.ret_ty;
+    match func.ret_ty {
+        Type::Generic(n, args) => {
+            if n == "Future" {
+                ret = Type::Void;
+                if args.len() > 0 { ret = args.get(0); }
+            }
+        }
+        _ => {}
+    }
+    if !lw_task_word(ret) { return false; }
+    var i: i64 = 0;
+    while i < func.params.len() {
+        if !lw_task_word(func.params.get(i).ty) { return false; }
+        i = i + 1;
+    }
+    return true;
 }
 
 pub fn Lowerer_insert_linear_struct(self: &mut Lowerer, name: str) {
@@ -1873,6 +1920,14 @@ pub fn Lowerer_register_runtime(self: &mut Lowerer) {
     Lowerer_add_extern_0(self, "p_co_run", IrType::I64);
     Lowerer_add_extern_1(self, "p_co_done", IrType::I64, IrType::I64);
     Lowerer_add_extern_1(self, "p_co_result", IrType::I64, IrType::I64);
+    Lowerer_add_extern_2(self, "p_co_async", lw_ptr_u8(), IrType::I64, IrType::I64);
+    Lowerer_add_extern_1(self, "p_co_sleep", IrType::I64, IrType::I64);
+    Lowerer_add_extern_3(self, "p_co_wait_fd", IrType::I64, IrType::I64, IrType::I64, IrType::I64);
+    Lowerer_add_extern_1(self, "p_co_detach", IrType::I64, IrType::Void);
+    Lowerer_add_extern_1(self, "p_co_accept", IrType::I64, IrType::I64);
+    Lowerer_add_extern_2(self, "p_co_connect", lw_ptr_u8(), IrType::I64, IrType::I64);
+    Lowerer_add_extern_4(self, "p_co_recv", IrType::I64, IrType::I64, IrType::I64, IrType::I64, IrType::I64);
+    Lowerer_add_extern_3(self, "p_co_send", IrType::I64, IrType::I64, IrType::I64, IrType::I64);
     Lowerer_add_extern_3(self, "p_executor_spawn", IrType::I64, lw_ptr_u8(), IrType::I64, IrType::I64);
     Lowerer_add_extern_2(self, "p_executor_block_on", IrType::I64, IrType::I64, IrType::I64);
     Lowerer_add_extern_1(self, "p_task_poll", IrType::I64, IrType::I64);
@@ -2024,6 +2079,14 @@ pub fn Lowerer_lower_program(self: &mut Lowerer, program: Program) -> IrModule {
         }
         var ret_type: IrType = Lowerer_lower_type(self, ext.ret_ty);
         IrModule_add_extern(&mut self.module, ext.pledge_name, param_types, ret_type);
+        var fp: i64 = 0;
+        while fp < ext.params.len() {
+            match ext.params.get(fp).ty {
+                Type::Func(_, _) => { self.fn_externs.push(ext.pledge_name); }
+                _ => {}
+            }
+            fp = fp + 1;
+        }
         self.module.extern_decls.push(ext);
         i = i + 1;
     }
@@ -2163,6 +2226,7 @@ pub fn Lowerer_lower_program(self: &mut Lowerer, program: Program) -> IrModule {
         Lowerer_insert_func_ret_type(self, func.name, func.ret_ty);
         if func.is_async {
             Lowerer_insert_async_func(self, func.name);
+            if lw_is_async_task(func) { self.async_tasks.push(func.name); }
         }
         // Store parameter names for named argument resolution
         var param_names: Vec<str> = Vec::new();
@@ -2272,11 +2336,178 @@ fn lw_vec_local_call(name: str) -> bool {
         || name == "Vec_truncate" || name == "Vec_reverse" || name == "Vec_sort";
 }
 
+/// Per function, per argument: 1 for a Vec it only uses, keeping no reference
+/// to it and leaving it to the caller to free.
+pub struct LwBorrows {
+    pub index: i64,          // function name -> row
+    pub rows: Vec<Vec<i64>>,
+    pub funcs: Vec<i64>,     // row -> function
+}
+
+fn lw_is_vec_type(t: IrType) -> bool {
+    match t {
+        IrType::Generic(n, _) => { return n == "Vec"; }
+        IrType::Opaque(n) => { return n == "Vec"; }
+        _ => { return false; }
+    }
+}
+
+fn lw_vec_borrows(module: &IrModule) -> LwBorrows {
+    var b: LwBorrows = LwBorrows { index: HashMap_new(), rows: Vec::new(), funcs: Vec::new() };
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var entry: IrFunctionEntry = module.functions.get(i);
+        var row: Vec<i64> = Vec::new();
+        var any: bool = false;
+        var p: i64 = 0;
+        while p < entry.func.params.len() {
+            var flag: bool = false;
+            var ty: IrType = entry.func.params.get(p).ty;
+            match ty {
+                IrType::Ptr(inner) => { flag = lw_is_vec_type(inner); }
+                _ => { flag = lw_is_vec_type(ty); }
+            }
+            if flag { row.push(1); any = true; } else { row.push(0); }
+            p = p + 1;
+        }
+        if any {
+            HashMap_insert(b.index, entry.name, b.rows.len());
+            b.rows.push(row);
+            b.funcs.push(i);
+        }
+        i = i + 1;
+    }
+    // Every candidate holds until a use disproves it: functions may call each
+    // other. One scan of each function gives what it hands on to whom (an edge per
+    // argument), and the rest needs no more scans.
+    var edge_from: Vec<i64> = Vec::new();
+    var edge_to: Vec<i64> = Vec::new();
+    var r: i64 = 0;
+    while r < b.rows.len() {
+        var f: IrFunction = module.functions.get(b.funcs.get(r)).func;
+        lw_scan_borrows(&f, r, b, edge_from, edge_to);
+        r = r + 1;
+    }
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        var e: i64 = 0;
+        while e < edge_from.len() {
+            var from: i64 = edge_from.get(e);
+            var to: i64 = edge_to.get(e);
+            if b.rows.get(to >> 12).get(to & 4095) == 0 && b.rows.get(from >> 12).get(from & 4095) != 0 {
+                b.rows.get(from >> 12).set(from & 4095, 0);
+                changed = true;
+            }
+            e = e + 1;
+        }
+    }
+    return b;
+}
+
+// What function `r`'s uses of its Vec parameters decide: a parameter it keeps is
+// cleared, and one it hands to another function adds an edge.
+fn lw_scan_borrows(f: &IrFunction, r: i64, b: LwBorrows, edge_from: Vec<i64>, edge_to: Vec<i64>) {
+    var row: Vec<i64> = b.rows.get(r);
+    // Per value: 1 + the parameter it is, or for `&Vec` the handle read through it
+    var owner: Vec<i64> = lw_zeros(f.next_value);
+    var is_param: Vec<i64> = lw_zeros(f.next_value);
+    var p: i64 = 0;
+    while p < row.len() {
+        if row.get(p) != 0 {
+            owner.set(f.params.get(p).id, p + 1);
+            is_param.set(f.params.get(p).id, 1);
+        }
+        p = p + 1;
+    }
+    var order: Vec<i64> = lw_block_order(f);
+    var i: i64 = 0;
+    while i < order.len() {
+        var id: i64 = order.get(i);
+        match IrFunction_get_inst(f, id) {
+            OptInst::Some(inst) => {
+                match inst {
+                    Inst::Load(ptr, _) => {
+                        if is_param.get(ptr) != 0 { owner.set(id, owner.get(ptr)); }
+                    }
+                    _ => {}
+                }
+            }
+            OptInst::None => {}
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < order.len() {
+        match IrFunction_get_inst(f, order.get(i)) {
+            OptInst::Some(inst) => {
+                var is_load: bool = false;
+                match inst {
+                    Inst::Load(_, _) => { is_load = true; }
+                    _ => {}
+                }
+                if !is_load {
+                    var ops: Vec<i64> = Vec::new();
+                    peir_inst_operands(inst, &mut ops);
+                    var k: i64 = 0;
+                    while k < ops.len() {
+                        var op: i64 = ops.get(k);
+                        if owner.get(op) != 0 {
+                            lw_borrow_use(inst, op, b, row, r, owner.get(op) - 1, edge_from, edge_to);
+                        }
+                        k = k + 1;
+                    }
+                }
+            }
+            OptInst::None => {}
+        }
+        i = i + 1;
+    }
+}
+
+fn lw_borrow_use(inst: Inst, op: i64, b: LwBorrows, row: Vec<i64>, r: i64, param: i64, edge_from: Vec<i64>, edge_to: Vec<i64>) {
+    match inst {
+        Inst::Print(_, _) => { return; }
+        Inst::Call(name, args, _, _) => {
+            if lw_vec_local_call(name) && args.len() >= 2 && args.get(1) == op {
+                var once: bool = true;
+                var k: i64 = 2;
+                while k < args.len() {
+                    if args.get(k) == op { once = false; }
+                    k = k + 1;
+                }
+                if once { return; }
+            }
+            if HashMap_contains(b.index, name) {
+                var to: i64 = HashMap_get(b.index, name);
+                var to_row: Vec<i64> = b.rows.get(to);
+                var i: i64 = 0;
+                var fits: bool = true;
+                while i < args.len() {
+                    if args.get(i) == op {
+                        if i >= to_row.len() || to_row.get(i) == 0 {
+                            fits = false;
+                        } else {
+                            edge_from.push(r * 4096 + param);
+                            edge_to.push(to * 4096 + i);
+                        }
+                    }
+                    i = i + 1;
+                }
+                if fits { return; }
+            }
+        }
+        _ => {}
+    }
+    row.set(param, 0);
+}
+
 /// Free the Vecs that provably never leave their local variable (as
 /// src/lower.rs auto_drop_vecs): a slot that only ever receives a fresh
-/// `Vec_new`, read only as the receiver of those calls (or to print it). The
-/// previous Vec is freed when the slot is written again and the last one at
-/// each return. The worst case is a leak, never a dangling Vec.
+/// `Vec_new`, read only as the receiver of those calls, by a function that
+/// only borrows it, or to print it. The previous Vec is freed when the slot
+/// is written again and the last one at each return. The worst case is a
+/// leak, never a dangling Vec.
 fn lw_auto_drop_vecs(module: &mut IrModule) {
     var has_drop: bool = false;
     var i: i64 = 0;
@@ -2285,11 +2516,12 @@ fn lw_auto_drop_vecs(module: &mut IrModule) {
         i = i + 1;
     }
     if !has_drop { return; }
+    var borrows: LwBorrows = lw_vec_borrows(module);
     i = 0;
     while i < module.functions.len() {
         var entry: IrFunctionEntry = module.functions.get(i);
         var func: IrFunction = entry.func;
-        if lw_drop_function_vecs(&mut func) {
+        if lw_drop_function_vecs(&mut func, borrows) {
             entry.func = func;
             module.functions.set(i, entry);
         }
@@ -2334,7 +2566,7 @@ fn lw_is_vec_new(f: &IrFunction, id: i64) -> bool {
     }
 }
 
-fn lw_drop_function_vecs(f: &mut IrFunction) -> bool {
+fn lw_drop_function_vecs(f: &mut IrFunction, borrows: LwBorrows) -> bool {
     var order: Vec<i64> = lw_block_order(f);
     var i: i64 = 0;
     var any: bool = false;
@@ -2395,7 +2627,7 @@ fn lw_drop_function_vecs(f: &mut IrFunction) -> bool {
     i = 0;
     while i < order.len() {
         match IrFunction_get_inst(f, order.get(i)) {
-            OptInst::Some(inst) => { lw_check_slot_uses(inst, is_slot, loaded, stored_in, bad); }
+            OptInst::Some(inst) => { lw_check_slot_uses(inst, is_slot, loaded, stored_in, bad, borrows); }
             OptInst::None => {}
         }
         i = i + 1;
@@ -2467,7 +2699,7 @@ fn lw_drop_function_vecs(f: &mut IrFunction) -> bool {
     return true;
 }
 
-fn lw_check_slot_uses(inst: Inst, is_slot: Vec<i64>, loaded: Vec<i64>, stored_in: Vec<i64>, bad: Vec<i64>) {
+fn lw_check_slot_uses(inst: Inst, is_slot: Vec<i64>, loaded: Vec<i64>, stored_in: Vec<i64>, bad: Vec<i64>, borrows: LwBorrows) {
     var ops: Vec<i64> = Vec::new();
     peir_inst_operands(inst, &mut ops);
     var target: i64 = -1;
@@ -2485,21 +2717,33 @@ fn lw_check_slot_uses(inst: Inst, is_slot: Vec<i64>, loaded: Vec<i64>, stored_in
     var i: i64 = 0;
     while i < ops.len() {
         var op: i64 = ops.get(i);
-        if is_slot.get(op) != 0 && op != target { bad.set(op, 1); }
-        if loaded.get(op) != 0 && !lw_is_local_use(inst, op) { bad.set(loaded.get(op) - 1, 1); }
+        if is_slot.get(op) != 0 && op != target && !lw_is_local_use(inst, op, borrows) { bad.set(op, 1); }
+        if loaded.get(op) != 0 && !lw_is_local_use(inst, op, borrows) { bad.set(loaded.get(op) - 1, 1); }
         if stored_in.get(op) != 0 && !own_store { bad.set(stored_in.get(op) - 1, 1); }
         i = i + 1;
     }
 }
 
-fn lw_is_local_use(inst: Inst, op: i64) -> bool {
+fn lw_is_local_use(inst: Inst, op: i64, borrows: LwBorrows) -> bool {
     match inst {
         Inst::Print(_, _) => { return true; }
         Inst::Call(name, args, _, _) => {
-            if !lw_vec_local_call(name) || args.len() < 2 || args.get(1) != op { return false; }
-            var i: i64 = 2;
+            if lw_vec_local_call(name) && args.len() >= 2 && args.get(1) == op {
+                var once: bool = true;
+                var k: i64 = 2;
+                while k < args.len() {
+                    if args.get(k) == op { once = false; }
+                    k = k + 1;
+                }
+                if once { return true; }
+            }
+            if !HashMap_contains(borrows.index, name) { return false; }
+            var row: Vec<i64> = borrows.rows.get(HashMap_get(borrows.index, name));
+            var i: i64 = 0;
             while i < args.len() {
-                if args.get(i) == op { return false; }
+                if args.get(i) == op {
+                    if i >= row.len() || row.get(i) == 0 { return false; }
+                }
                 i = i + 1;
             }
             return true;
@@ -4967,14 +5211,71 @@ fn Lowerer_lookup_param_names(self: &mut Lowerer, callee: str) -> Vec<str> {
     return result;
 }
 
+fn Lowerer_extern_index(self: &Lowerer, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < self.module.extern_functions.len() {
+        if self.module.extern_functions.get(i).name == name { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// The Fides function argument `i` of an extern hands to C, or ""
+fn Lowerer_c_callback(self: &Lowerer, ext_idx: i64, i: i64, arg: Expr) -> str {
+    var params: Vec<IrType> = self.module.extern_functions.get(ext_idx).params;
+    if i >= params.len() { return ""; }
+    match params.get(i) {
+        IrType::Opaque(o) => {
+            if o != "func" { return ""; }
+        }
+        _ => { return ""; }
+    }
+    match arg {
+        Expr::Ident(name) => {
+            if Lowerer_is_user_func(self, name) { return name; }
+        }
+        _ => {}
+    }
+    return "";
+}
+
 fn Lowerer_lower_call_expr(self: &mut Lowerer, callee: str, args: Vec<Expr>) -> i64 {
     // Resolve named arguments to positional order and fill in defaults
     var resolved_args: Vec<Expr> = Lowerer_resolve_call_args(self, callee, args);
     var arg_vals: Vec<i64> = Vec::new();
+    var ext_idx: i64 = -1;
+    if lw_c_str_vec_contains(self.fn_externs, callee) {
+        ext_idx = Lowerer_extern_index(self, callee);
+    }
     var ai: i64 = 0;
     while ai < resolved_args.len() {
-        arg_vals.push(Lowerer_lower_expr(self, resolved_args.get(ai)));
+        var c_fn: str = "";
+        if ext_idx >= 0 {
+            c_fn = Lowerer_c_callback(self, ext_idx, ai, resolved_args.get(ai));
+        }
+        if c_fn != "" {
+            // C calls a Fides function through its adapter
+            if !lw_c_str_vec_contains(self.module.c_callbacks, c_fn) {
+                self.module.c_callbacks.push(c_fn);
+            }
+            arg_vals.push(Lowerer_emit_inst(self, Inst::ConstFnRef(c_fn_name(c_fn))));
+        } else {
+            arg_vals.push(Lowerer_lower_expr(self, resolved_args.get(ai)));
+        }
         ai = ai + 1;
+    }
+
+    // An async function runs on its own stack, until it first waits
+    if lw_c_str_vec_contains(self.async_tasks, callee) {
+        var co_args: Vec<i64> = Vec::new();
+        co_args.push(Lowerer_emit_inst(self, Inst::ConstStr(callee)));
+        co_args.push(Lowerer_emit_inst(self, Inst::ConstInt(resolved_args.len(), IrType::I64)));
+        var cai: i64 = 0;
+        while cai < arg_vals.len() {
+            co_args.push(arg_vals.get(cai));
+            cai = cai + 1;
+        }
+        return Lowerer_emit_inst(self, Inst::Call("p_co_async", co_args, IrType::I64, EffectSet_new()));
     }
 
     if callee == "print" && arg_vals.len() > 0 {
@@ -6025,6 +6326,8 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                 left_val = Lowerer_emit_inst(self, Inst::IntToFloat(left_val, left_ir_ty, right_ir_ty));
                 left_ir_ty = right_ir_ty;
                 if !result_is_bool { result_ty = right_ir_ty; }
+            } else if numeric && ir_type_is_float(left_ir_ty) && ir_type_is_float(right_ir_ty) && !result_is_bool {
+                result_ty = left_ir_ty;
             }
             if binop_eq(op, BinOp::Add) && ir_type_eq(left_ir_ty, lw_ptr_u8()) && ir_type_eq(right_ir_ty, lw_ptr_u8()) {
                 var args: Vec<i64> = Vec::new();
@@ -6097,12 +6400,16 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                         Expr::IntLit(v) => { return Lowerer_emit_inst(self, Inst::ConstInt(lw_neg_lit(v), IrType::I64)); }
                         _ => {}
                     }
-                    var neg_ty: IrType = Lowerer_infer_unary_type(self, op, inner);
+                    var neg_operand: i64 = Lowerer_lower_expr(self, inner);
+                    var neg_ty: IrType = Lowerer_get_value_type(self, neg_operand);
+                    if !ir_type_is_float(neg_ty) {
+                        neg_ty = Lowerer_infer_unary_type(self, op, inner);
+                    }
                     if lw_plain_int(neg_ty) {
-                        var neg_operand: i64 = Lowerer_lower_expr(self, inner);
                         var zero: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, neg_ty));
                         return Lowerer_emit_inst(self, Inst::BinOp(BinOp::Sub, zero, neg_operand, neg_ty));
                     }
+                    return Lowerer_emit_inst(self, Inst::UnaryOp(op, neg_operand, neg_ty));
                 }
                 _ => {}
             }
@@ -6778,7 +7085,31 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             var fut_val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(e));
             var args: Vec<i64> = Vec::new();
             args.push(fut_val);
-            return Lowerer_emit_inst(self, Inst::Call("p_future_poll", args, IrType::I64, EffectSet_new()));
+            var polled: i64 = Lowerer_emit_inst(self, Inst::Call("p_future_poll", args, IrType::I64, EffectSet_new()));
+            // A future holds a word: give a pointer its type back
+            match lw_box_expr_unbox(e) {
+                Expr::Call(fut_callee, _) => {
+                    match Lowerer_lookup_func_ret_type(self, fut_callee) {
+                        OptType::Some(fut_ret) => {
+                            match fut_ret {
+                                Type::Generic(fname, fargs) => {
+                                    if fname == "Future" && fargs.len() > 0 {
+                                        var fut_ty: IrType = Lowerer_lower_type(self, fargs.get(0));
+                                        match fut_ty {
+                                            IrType::Ptr(_) => { return Lowerer_lower_cast(self, polled, IrType::I64, fut_ty); }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        OptType::None => {}
+                    }
+                }
+                _ => {}
+            }
+            return polled;
         }
         Expr::Spawn(e) => {
             // spawn <expr> - create a concurrent task that runs in a real OS thread.

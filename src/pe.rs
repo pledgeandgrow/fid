@@ -1569,7 +1569,7 @@ const MSVCRT_IMPORTS: &[&str] = &[
     "memcpy", "memmove", "memset", "memcmp",
     "toupper", "tolower", "isalpha", "isdigit", "isspace", "isalnum",
     "abs", "labs", "_abs64", "rand", "srand", "time", "clock",
-    "malloc", "calloc", "realloc", "free", "getenv", "exit", "qsort",
+    "malloc", "calloc", "realloc", "free", "getenv", "exit", "qsort", "bsearch", "ldiv",
     "_snprintf", "putchar", "puts", "getchar",
     "fopen", "fclose", "fread", "fwrite", "fflush", "fgets", "fputs",
     "fseek", "ftell", "_fseeki64", "remove", "rename", "_access",
@@ -2055,6 +2055,10 @@ struct PeCodeGen {
     cur_func: String,
     /// The function being generated wraps on overflow
     cur_wrapping: bool,
+    /// This function's instructions a counted loop proves safe (unchecked_ops)
+    unchecked: std::collections::HashSet<u32>,
+    /// The instruction being generated is one of them
+    cur_unchecked: bool,
     /// Labels of the stubs behind ARITH_PANICS
     arith_panics: [u32; 9],
     /// Label of the top-level exception filter
@@ -2070,6 +2074,7 @@ struct PeCodeGen {
     module_fns: std::collections::BTreeSet<String>,
     /// `extern "C"` functions called through the import table
     c_thunks: Vec<CThunk>,
+    c_adapters: Vec<CAdapter>,
     /// `extern "C"` functions of a missing local header: stubs returning 0
     stub_externs: Vec<String>,
     /// .rdata offset of the bump-allocator state block (32 bytes:
@@ -2095,6 +2100,39 @@ struct CThunk {
     slot: usize,
     params: Vec<IrType>,
     ret: IrType,
+    /// For each parameter: the size of a struct C takes by value, else 0
+    by_value: Vec<i64>,
+    /// The size of a struct C returns in rax, else 0
+    ret_size: i64,
+}
+
+/// What C calls for a Fides function: the C convention on one side, a null
+/// `__env` and raw bits on the other.
+struct CAdapter {
+    name: String,
+    target: String,
+    params: Vec<IrType>,
+    ret: IrType,
+}
+
+/// The size of a struct Windows passes by value (in a register), else 0.
+fn c_by_value(module: &IrModule, ty: &IrType) -> i64 {
+    let size = match ty {
+        IrType::Struct(name) => module.get_struct(name).map_or(0, |l| l.size as i64),
+        _ => 0,
+    };
+    if matches!(size, 1 | 2 | 4 | 8) { size } else { 0 }
+}
+
+fn c_thunk(module: &IrModule, name: &str, slot: usize, params: &[IrType], ret: &IrType) -> CThunk {
+    let mut params = params.to_vec();
+    let ret_size = c_by_value(module, ret);
+    // Any bigger struct: C takes the result pointer Fides passes, first
+    if matches!(ret, IrType::Struct(_)) && ret_size == 0 {
+        params.insert(0, IrType::I64);
+    }
+    let by_value = params.iter().map(|t| c_by_value(module, t)).collect();
+    CThunk { name: name.to_string(), slot, params, ret: ret.clone(), by_value, ret_size }
 }
 
 /// Machine-code primitives of the Fides PE runtime (src/pe_runtime/), which
@@ -2111,6 +2149,7 @@ const PE_STUB_DEPS: &[(&str, &str)] = &[
     // p_thread_spawn(name, nargs, ...): varargs, captured into an array
     ("p_thread_spawn", "pert_thread_spawn_v"),
     ("p_executor_spawn", "pert_executor_spawn_v"),
+    ("p_co_async", "pert_co_async_v"),
     // The C-convention thread start routine runs pert_thread_main(arg)
     ("pe_thread_entry_addr", "pert_thread_main"),
 ];
@@ -2144,7 +2183,7 @@ fn int_cmp_cc(op: &BinOp, unsigned: bool) -> Option<u8> {
 
 /// Allocator state in writable .rdata: +0 cur, +8 end, +16 cached heap,
 /// +24 spinlock, +32 the free list of each size class.
-const ALLOC_STATE_SIZE: usize = 32 + 8 * 21;
+const ALLOC_STATE_SIZE: usize = 32 + 8 * 41;
 const ALLOC_LISTS: usize = 32;
 /// A block's header: this magic | its size class. p_free turns it into
 /// BLOCK_FREED | class, and panics on anything else: a block freed twice, or
@@ -2193,6 +2232,8 @@ impl PeCodeGen {
             block_labels: HashMap::new(),
             entry_offset: 0,
             cur_wrapping: false,
+            unchecked: Default::default(),
+            cur_unchecked: false,
             arith_panics: [0; 9],
             crash_filter: 0,
             saved_regs: Vec::new(),
@@ -2202,6 +2243,7 @@ impl PeCodeGen {
             unresolved: std::collections::BTreeMap::new(),
             module_fns: std::collections::BTreeSet::new(),
             c_thunks: Vec::new(),
+            c_adapters: Vec::new(),
             alloc_rdata_off: 0,
             stub_externs: Vec::new(),
             c_overrides: std::collections::BTreeMap::new(),
@@ -2451,7 +2493,7 @@ impl PeCodeGen {
             if let (Some(slot), Some((params, ret))) = (import_slot(&ext.c_name), module.extern_functions.get(&ext.pledge_name)) {
                 let label = self.enc.alloc_label();
                 self.func_labels.insert(ext.pledge_name.clone(), label);
-                self.c_thunks.push(CThunk { name: ext.pledge_name.clone(), slot, params: params.clone(), ret: ret.clone() });
+                self.c_thunks.push(c_thunk(module, &ext.pledge_name, slot, params, ret));
                 continue;
             }
             // As in the C backend: the functions of a local header that does
@@ -2463,6 +2505,15 @@ impl PeCodeGen {
                 let label = self.enc.alloc_label();
                 self.func_labels.insert(ext.pledge_name.clone(), label);
                 self.stub_externs.push(ext.pledge_name.clone());
+            }
+        }
+        for target in &module.c_callbacks {
+            if let Some(func) = module.functions.get(target).filter(|_| needed.contains(target)) {
+                let name = format!("{}{}", crate::ir::C_FN_PREFIX, target);
+                let label = self.enc.alloc_label();
+                self.func_labels.insert(name.clone(), label);
+                let params = func.params.iter().skip(1).map(|(_, t)| t.clone()).collect();
+                self.c_adapters.push(CAdapter { name, target: target.clone(), params, ret: func.ret_ty.clone() });
             }
         }
         // Functions named by a string constant can be looked up by name
@@ -2506,6 +2557,9 @@ impl PeCodeGen {
         let thunks = std::mem::take(&mut self.c_thunks);
         for t in &thunks {
             self.gen_c_thunk(t);
+        }
+        for a in std::mem::take(&mut self.c_adapters) {
+            self.gen_c_adapter(&a);
         }
         for name in std::mem::take(&mut self.stub_externs) {
             self.place_fn(&name);
@@ -3519,6 +3573,7 @@ impl PeCodeGen {
         // The Fides runtime is machine-level code the interpreter never runs:
         // its arithmetic wraps, as a @wrapping function's does.
         self.cur_wrapping = func.is_wrapping || is_pe_runtime_fn(name);
+        self.unchecked = unchecked_ops(func);
         let label = *self.func_labels.get(name).unwrap();
         self.enc.align_to(16);
         self.enc.place_label(label);
@@ -3785,6 +3840,7 @@ impl PeCodeGen {
         func_name: &str,
     ) {
         let dst = frame.offset(id) as i32;
+        self.cur_unchecked = self.unchecked.contains(&id.0);
 
         match inst {
             // ─── Constants ───
@@ -4198,9 +4254,11 @@ impl PeCodeGen {
                     if call_name == "Vec_get" && args.len() >= 2 {
                         self.gen_load_operand(Reg::Rax, args[args.len() - 2], frame);
                         self.gen_load_operand(Reg::Rcx, args[args.len() - 1], frame);
-                        self.enc.mov_reg_mem_disp(Reg::Rdx, Reg::Rax, 8);
-                        self.enc.cmp_rr(Reg::Rcx, Reg::Rdx);
-                        self.enc.jcc_label(0x3, self.arith_panics[PANIC_VEC_INDEX]); // jae
+                        if !self.cur_unchecked {
+                            self.enc.mov_reg_mem_disp(Reg::Rdx, Reg::Rax, 8);
+                            self.enc.cmp_rr(Reg::Rcx, Reg::Rdx);
+                            self.enc.jcc_label(0x3, self.arith_panics[PANIC_VEC_INDEX]); // jae
+                        }
                         self.enc.mov_reg_ptr(Reg::Rax, Reg::Rax);
                         self.enc.shl_r_i8(Reg::Rcx, 3);
                         self.enc.add_rr(Reg::Rax, Reg::Rcx);
@@ -4212,9 +4270,11 @@ impl PeCodeGen {
                         self.gen_load_operand(Reg::Rax, args[args.len() - 3], frame);
                         self.gen_load_operand(Reg::Rcx, args[args.len() - 2], frame);
                         self.gen_load_operand(Reg::Rdx, args[args.len() - 1], frame);
-                        self.enc.mov_reg_mem_disp(Reg::R8, Reg::Rax, 8);
-                        self.enc.cmp_rr(Reg::Rcx, Reg::R8);
-                        self.enc.jcc_label(0x3, self.arith_panics[PANIC_VEC_INDEX]); // jae
+                        if !self.cur_unchecked {
+                            self.enc.mov_reg_mem_disp(Reg::R8, Reg::Rax, 8);
+                            self.enc.cmp_rr(Reg::Rcx, Reg::R8);
+                            self.enc.jcc_label(0x3, self.arith_panics[PANIC_VEC_INDEX]); // jae
+                        }
                         self.enc.mov_reg_ptr(Reg::Rax, Reg::Rax);
                         self.enc.shl_r_i8(Reg::Rcx, 3);
                         self.enc.add_rr(Reg::Rax, Reg::Rcx);
@@ -4623,7 +4683,7 @@ impl PeCodeGen {
             None => self.enc.mov_reg_mem_rbp(Reg::Rcx, roff),
         }
 
-        let checked = !self.bare_mode && !self.cur_wrapping;
+        let checked = !self.bare_mode && !self.cur_wrapping && !self.cur_unchecked;
         // jo for i64, jc for u64; narrow types are checked after the operation
         let ovf_cc = match ty {
             IrType::I64 => Some(0x0),
@@ -6630,7 +6690,8 @@ impl PeCodeGen {
             self.enc.pop(Reg::R12);
             self.enc.ret();
         } else {
-            // Power-of-two blocks up to 1 MB, as in the C runtime: an 8-byte
+            // Powers of two up to 1 MB and three quarters of them (class 2k
+            // and 2k - 1 for 2^k bytes), as in the C runtime: an 8-byte
             // header (BLOCK_MAGIC | class), reused through free lists, refilled
             // by a thread-safe bump allocator over 4 MB chunks. Larger blocks
             // are HeapAlloc's. State at alloc_rdata_off: see ALLOC_STATE_SIZE.
@@ -6674,8 +6735,23 @@ impl PeCodeGen {
             self.enc.place_label(class_ok);
             self.enc.mov_rr(Reg::R13, Reg::Rax);
             self.enc.mov_rr(Reg::Rcx, Reg::Rax);
+            self.enc.mov_rr(Reg::R8, Reg::R12);
             self.enc.mov_imm64(Reg::R12, 1);
             self.enc.shl_cl(Reg::R12);
+            self.enc.add_rr(Reg::R13, Reg::R13);
+            // Three quarters of the block, if that holds it
+            let whole = self.enc.alloc_label();
+            self.enc.mov_rr(Reg::Rax, Reg::R12);
+            self.enc.shl_r_i8(Reg::Rax, 1);
+            self.enc.add_rr(Reg::Rax, Reg::R12);
+            self.enc.emit(&[0x48, 0xC1, 0xE8, 0x02]); // shr rax, 2
+            self.enc.cmp_rr(Reg::R8, Reg::Rax);
+            self.enc.jcc_label(0x7, whole); // ja
+            self.enc.emit(&[0x49, 0x83, 0xFD, 0x08]); // cmp r13, 8
+            self.enc.jcc_label(0x4, whole); // je
+            self.enc.mov_rr(Reg::R12, Reg::Rax);
+            self.enc.emit(&[0x49, 0xFF, 0xCD]); // dec r13
+            self.enc.place_label(whole);
 
             // Pop this class's free list, under the spinlock. An unlocked look
             // first: an allocate-only program never takes the lock, and a block
@@ -6757,11 +6833,10 @@ impl PeCodeGen {
             self.enc.jcc_label(0x7, grow); // ja: chunk full
             self.enc.mov_rr(Reg::Rax, Reg::R8);
 
-            // A new block at rax: write its header. r12 is a power of two.
+            // A new block at rax: write its header
             self.enc.place_label(bumped);
-            self.enc.emit(&[0x49, 0x0F, 0xBD, 0xD4]); // bsr rdx, r12
             self.enc.mov_imm64(Reg::R8, BLOCK_MAGIC);
-            self.enc.or_rr(Reg::R8, Reg::Rdx);
+            self.enc.or_rr(Reg::R8, Reg::R13);
             self.enc.mov_ptr_reg(Reg::Rax, Reg::R8);
             self.enc.emit(&[0x48, 0x83, 0xC0, 0x08]); // add rax, 8
             self.enc.pop(Reg::R13);
@@ -6844,6 +6919,16 @@ impl PeCodeGen {
             });
             self.enc.emit_i32(0);
             self.enc.emit_u8(0x00);
+            // r13 held the chunk size: the class again, from the block size
+            let whole = self.enc.alloc_label();
+            self.enc.emit(&[0x4D, 0x0F, 0xBD, 0xEC]); // bsr r13, r12
+            self.enc.add_rr(Reg::R13, Reg::R13);
+            self.enc.mov_rr(Reg::Rdx, Reg::R12);
+            self.enc.emit(&[0x48, 0xFF, 0xCA]); // dec rdx
+            self.enc.test_rr(Reg::Rdx, Reg::R12);
+            self.enc.jcc_label(0x4, whole); // jz: a power of two
+            self.enc.emit(&[0x49, 0xFF, 0xC5]); // inc r13
+            self.enc.place_label(whole);
             self.enc.jmp_label(bumped);
 
             // oom: release lock, return NULL
@@ -6894,23 +6979,116 @@ impl PeCodeGen {
     /// then the stack, floats as raw bits in integer registers, the result
     /// in rax) to a C function of the import table (float arguments in
     /// xmm0-3, a float result in xmm0, an `int` result in eax).
-    fn gen_c_thunk(&mut self, t: &CThunk) {
-        self.place_fn(&t.name);
-        let stack_args = t.params.len().saturating_sub(4) as i32;
+    /// Replace the pointer in register `n` (rax, rcx, rdx, r8 or r9) by the
+    /// struct of `size` bytes it points at; 0 leaves it.
+    fn load_by_value(&mut self, n: u8, size: i64) {
+        let ext = (n >= 8) as u8;
+        let rex = 0x40 | ext << 2 | ext;
+        let modrm = (n & 7) << 3 | (n & 7);
+        match size {
+            8 => self.enc.emit(&[rex | 8, 0x8B, modrm]),
+            4 => self.enc.emit(&[rex, 0x8B, modrm]),
+            2 => self.enc.emit(&[rex, 0x0F, 0xB7, modrm]),
+            1 => self.enc.emit(&[rex, 0x0F, 0xB6, modrm]),
+            _ => {}
+        }
+    }
+
+    /// Widen the C argument in register `n`, whose upper bits are undefined.
+    fn widen_c_arg(&mut self, n: u8, ty: &IrType) {
+        let ext = (n >= 8) as u8;
+        let rex = 0x40 | ext << 2 | ext;
+        let modrm = 0xC0 | (n & 7) << 3 | (n & 7);
+        match ty {
+            IrType::I32 => self.enc.emit(&[rex | 8, 0x63, modrm]),
+            IrType::U32 => self.enc.emit(&[rex, 0x8B, modrm]),
+            IrType::I16 => self.enc.emit(&[rex | 8, 0x0F, 0xBF, modrm]),
+            IrType::U16 => self.enc.emit(&[rex, 0x0F, 0xB7, modrm]),
+            IrType::I8 => self.enc.emit(&[rex | 8, 0x0F, 0xBE, modrm]),
+            IrType::U8 | IrType::Bool => self.enc.emit(&[rex, 0x0F, 0xB6, modrm]),
+            _ => {}
+        }
+    }
+
+    fn gen_c_adapter(&mut self, a: &CAdapter) {
+        self.place_fn(&a.name);
+        let n = a.params.len();
+        // The fourth C argument moves to the stack: `__env` takes rcx
+        let stack_args = (n + 1).saturating_sub(4) as i32;
         // On entry rsp = 8 (mod 16): the frame realigns it for the call
         let mut frame = 32 + 8 * stack_args;
         if frame % 16 == 0 {
             frame += 8;
         }
         self.enc.sub_rsp_i32(frame);
+        const REGS: [u8; 4] = [1, 2, 8, 9]; // rcx, rdx, r8, r9
+        for (i, ty) in a.params.iter().enumerate().take(4) {
+            let r = REGS[i];
+            let rex = 0x48 | (r >= 8) as u8;
+            let modrm = 0xC0 | (i as u8) << 3 | (r & 7);
+            match ty {
+                IrType::F64 => self.enc.emit(&[0x66, rex, 0x0F, 0x7E, modrm]), // movq r, xmm_i
+                IrType::F32 => self.enc.emit(&[0x66, rex & 0x41, 0x0F, 0x7E, modrm]), // movd r32, xmm_i
+                _ => self.widen_c_arg(r, ty),
+            }
+        }
+        for i in 4..n {
+            self.enc.mov_reg_mem_disp(Reg::Rax, Reg::Rsp, frame + 8 + 32 + 8 * (i as i32 - 4));
+            self.widen_c_arg(0, &a.params[i]);
+            self.enc.mov_mem_disp_reg(Reg::Rsp, 32 + 8 * (i as i32 - 3), Reg::Rax);
+        }
+        if n >= 4 {
+            self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::R9);
+        }
+        self.enc.emit(&[0x4D, 0x89, 0xC1]); // mov r9, r8
+        self.enc.emit(&[0x49, 0x89, 0xD0]); // mov r8, rdx
+        self.enc.emit(&[0x48, 0x89, 0xCA]); // mov rdx, rcx
+        self.enc.emit(&[0x31, 0xC9]);       // xor ecx, ecx
+        self.enc.call_label(self.func_labels[&a.target]);
+        match &a.ret {
+            IrType::F64 => self.enc.emit(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]), // movq xmm0, rax
+            IrType::F32 => self.enc.emit(&[0x66, 0x0F, 0x6E, 0xC0]),       // movd xmm0, eax
+            _ => {}
+        }
+        self.enc.add_rsp_i32(frame);
+        self.enc.ret();
+    }
+
+    fn gen_c_thunk(&mut self, t: &CThunk) {
+        self.place_fn(&t.name);
+        let n = t.params.len();
+        let stack_args = n.saturating_sub(4) as i32;
+        // A struct C returns in rax: the result pointer Fides passes first
+        // waits in the frame, and the arguments move down one place
+        let shift = (t.ret_size > 0) as i32;
+        let ret_slot = 32 + 8 * stack_args;
+        // On entry rsp = 8 (mod 16): the frame realigns it for the call
+        let mut frame = ret_slot + 8 * shift;
+        if frame % 16 == 0 {
+            frame += 8;
+        }
+        self.enc.sub_rsp_i32(frame);
+        if shift > 0 {
+            self.enc.mov_mem_disp_reg(Reg::Rsp, ret_slot, Reg::Rcx);
+        }
         for i in 0..stack_args {
             // The caller's fifth and later arguments: above our frame and
             // the return address, past the caller's 32-byte shadow space
-            self.enc.mov_reg_mem_disp(Reg::Rax, Reg::Rsp, frame + 8 + 32 + 8 * i);
+            self.enc.mov_reg_mem_disp(Reg::Rax, Reg::Rsp, frame + 8 + 32 + 8 * (i + shift));
+            self.load_by_value(0, t.by_value[4 + i as usize]);
             self.enc.mov_mem_disp_reg(Reg::Rsp, 32 + 8 * i, Reg::Rax);
+        }
+        if shift > 0 {
+            self.enc.emit(&[0x48, 0x89, 0xD1]); // mov rcx, rdx
+            self.enc.emit(&[0x4C, 0x89, 0xC2]); // mov rdx, r8
+            self.enc.emit(&[0x4D, 0x89, 0xC8]); // mov r8, r9
+            if n >= 4 {
+                self.enc.mov_reg_mem_disp(Reg::R9, Reg::Rsp, frame + 8 + 32);
+            }
         }
         let regs = [Reg::Rcx, Reg::Rdx, Reg::R8, Reg::R9];
         for (i, ty) in t.params.iter().enumerate().take(4) {
+            self.load_by_value(regs[i] as u8, t.by_value[i]);
             match ty {
                 // The integer register keeps its copy: a variadic function
                 // (_snprintf) reads a double from there
@@ -6940,6 +7118,15 @@ impl PeCodeGen {
             // A C truth value is any non-zero int
             IrType::Bool => self.enc.emit(&[0x85, 0xC0, 0x0F, 0x95, 0xC0, 0x0F, 0xB6, 0xC0]),
             _ => {}
+        }
+        if shift > 0 {
+            self.enc.mov_reg_mem_disp(Reg::Rcx, Reg::Rsp, ret_slot);
+            match t.ret_size {
+                8 => self.enc.emit(&[0x48, 0x89, 0x01]), // mov [rcx], rax
+                4 => self.enc.emit(&[0x89, 0x01]),       // mov [rcx], eax
+                2 => self.enc.emit(&[0x66, 0x89, 0x01]), // mov [rcx], ax
+                _ => self.enc.emit(&[0x88, 0x01]),       // mov [rcx], al
+            }
         }
         self.enc.add_rsp_i32(frame);
         self.enc.ret();
@@ -7068,6 +7255,18 @@ impl PeCodeGen {
             self.enc.xor_rr(Reg::Rcx, Reg::Rcx);
             self.enc.emit(&[0x4C, 0x8D, 0x4C, 0x24, 0x18]); // lea r9, [rsp+24]
             let target = self.func_labels["pert_thread_spawn_v"];
+            self.enc.jmp_label(target);
+        }
+        // p_co_async(name, nargs, args...): likewise
+        if self.func_labels.contains_key("p_co_async") {
+            self.place_fn("p_co_async");
+            self.enc.mov_mem_disp_reg(Reg::Rsp, 24, Reg::R8);
+            self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::R9);
+            self.enc.mov_rr(Reg::R8, Reg::Rdx);
+            self.enc.mov_rr(Reg::Rdx, Reg::Rcx);
+            self.enc.xor_rr(Reg::Rcx, Reg::Rcx);
+            self.enc.emit(&[0x4C, 0x8D, 0x4C, 0x24, 0x18]); // lea r9, [rsp+24]
+            let target = self.func_labels["pert_co_async_v"];
             self.enc.jmp_label(target);
         }
         // p_executor_spawn(exec, name, nargs, args...): likewise, from the
@@ -10188,6 +10387,177 @@ fn reg_word(ty: &IrType, module: &IrModule) -> bool {
     reg_type(ty, module) && module.type_size(ty) == 8
 }
 
+/// Checks a counted loop makes needless. In `while i < n`, with `i` an unshared
+/// local that only the increment `i = i + 1` changes in the loop, that increment
+/// cannot overflow. If also `n` is `v.len()`, `i` starts at a constant >= 0 and
+/// nothing in the loop can shorten `v`, then `v.get(i)` and `v.set(i, x)` are in
+/// bounds, when `i` is read before the increment. Returns those instructions.
+fn unchecked_ops(func: &IrFunction) -> std::collections::HashSet<u32> {
+    use std::collections::HashSet;
+    let mut out = HashSet::new();
+    let n = func.blocks.len();
+    let pos: HashMap<u32, usize> = func.blocks.iter().enumerate().map(|(i, b)| (b.id.0, i)).collect();
+    let inst = |v: ValueId| func.get_inst(v);
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, block) in func.blocks.iter().enumerate() {
+        let targets = match block.instructions.last().and_then(|id| inst(*id)) {
+            Some(Inst::Jump { target }) => vec![target.0],
+            Some(Inst::Branch { then, else_, .. }) => vec![then.0, else_.0],
+            _ => Vec::new(),
+        };
+        for t in targets.iter().filter_map(|t| pos.get(t)) {
+            succs[i].push(*t);
+            preds[*t].push(i);
+        }
+    }
+    // Back edges: to a block on the depth-first path
+    let mut latches: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut state = vec![0u8; n];
+    let mut stack = vec![(0usize, 0usize)];
+    state[0] = 1;
+    while let Some(top) = stack.last_mut() {
+        let (b, next) = *top;
+        if next < succs[b].len() {
+            top.1 += 1;
+            let s = succs[b][next];
+            match state[s] {
+                0 => { state[s] = 1; stack.push((s, 0)); }
+                1 => latches[s].push(b),
+                _ => {}
+            }
+        } else {
+            state[b] = 2;
+            stack.pop();
+        }
+    }
+    if latches.iter().all(|l| l.is_empty()) {
+        return out;
+    }
+    // Where each instruction is, the stores to each pointer, and the slots
+    // only loads and stores use
+    let mut place: HashMap<u32, (usize, usize)> = HashMap::new();
+    let mut stores: HashMap<u32, Vec<(usize, usize, ValueId)>> = HashMap::new();
+    let mut plain: HashSet<u32> = HashSet::new();
+    let mut ops: Vec<ValueId> = Vec::new();
+    for (b, block) in func.blocks.iter().enumerate() {
+        for (k, id) in block.instructions.iter().enumerate() {
+            place.insert(id.0, (b, k));
+            if let Some(Inst::Alloca { .. }) = inst(*id) {
+                plain.insert(id.0);
+            }
+        }
+    }
+    for (b, block) in func.blocks.iter().enumerate() {
+        for (k, id) in block.instructions.iter().enumerate() {
+            let Some(i) = inst(*id) else { continue; };
+            ops.clear();
+            inst_operands(i, &mut ops);
+            for op in &ops {
+                let target = match i {
+                    Inst::Load { ptr, .. } => ptr == op,
+                    Inst::Store { ptr, value, .. } => ptr == op && value != op,
+                    _ => false,
+                };
+                if !target {
+                    plain.remove(&op.0);
+                }
+            }
+            if let Inst::Store { ptr, value, .. } = i {
+                stores.entry(ptr.0).or_default().push((b, k, *value));
+            }
+        }
+    }
+    let may_shorten = |id: &ValueId| match inst(*id) {
+        Some(Inst::Call { func, .. }) => !matches!(func.as_str(),
+            "Vec_get" | "Vec_set" | "Vec_len" | "Vec_push" | "Vec_is_empty" | "Vec_capacity"),
+        Some(Inst::CallPtr { .. } | Inst::DynCall { .. } | Inst::Asm { .. } | Inst::Backward { .. }) => true,
+        _ => false,
+    };
+    for head in 0..n {
+        if latches[head].is_empty() {
+            continue;
+        }
+        let mut body = vec![false; n];
+        body[head] = true;
+        let mut work = latches[head].clone();
+        while let Some(b) = work.pop() {
+            if !body[b] {
+                body[b] = true;
+                work.extend(preds[b].iter().copied());
+            }
+        }
+        let in_body = |b: &u32| pos.get(b).map_or(false, |p| body[*p]);
+        // The guard: `i < right`, entering the loop only when it holds
+        let Some(Inst::Branch { cond, then, else_ }) =
+            func.blocks[head].instructions.last().and_then(|id| inst(*id)) else { continue; };
+        let Some(Inst::BinOp { op: BinOp::Lt, left, right, .. }) = inst(*cond) else { continue; };
+        let Some(Inst::Load { ptr: slot, ty: IrType::I64 }) = inst(*left) else { continue; };
+        if !plain.contains(&slot.0) || !in_body(&then.0) || in_body(&else_.0) || body[place[&slot.0].0] {
+            continue;
+        }
+        // The only store in the loop: `i = i + 1`
+        let Some(all) = stores.get(&slot.0) else { continue; };
+        let inside: Vec<_> = all.iter().filter(|s| body[s.0]).collect();
+        let [&(store_block, store_at, value)] = inside[..] else { continue; };
+        let Some(Inst::BinOp { op: BinOp::Add, left: x, right: one, ty: IrType::I64 }) = inst(value) else { continue; };
+        if store_block == head
+            || !matches!(inst(*x), Some(Inst::Load { ptr, .. }) if ptr == slot)
+            || !matches!(inst(*one), Some(Inst::ConstInt { value: 1, .. }))
+        {
+            continue;
+        }
+        out.insert(value.0);
+        // Bounds: `right` is v.len()
+        let Some(Inst::Call { func: len, args, .. }) = inst(*right) else { continue; };
+        let (Some(&vec), true) = (args.last(), len == "Vec_len") else { continue; };
+        let starts_ok = all.iter().all(|s| body[s.0]
+            || matches!(inst(s.2), Some(Inst::ConstInt { value, .. }) if *value >= 0));
+        let (len_block, len_at) = place[&right.0];
+        let len_stands = body[len_block]
+            || !func.blocks[len_block].instructions[len_at + 1..].iter().any(may_shorten);
+        let shortens = (0..n).any(|b| body[b] && func.blocks[b].instructions.iter().any(may_shorten));
+        if !starts_ok || !len_stands || shortens {
+            continue;
+        }
+        let params: HashSet<u32> = func.params.iter().map(|(id, _)| id.0).collect();
+        let same_vec = |v: ValueId| v == vec || match (inst(v), inst(vec)) {
+            (Some(Inst::Load { ptr: a, .. }), Some(Inst::Load { ptr: b, .. })) => a == b
+                && (plain.contains(&a.0) || params.contains(&a.0))
+                && !stores.get(&a.0).map_or(false, |s| s.iter().any(|s| body[s.0])),
+            _ => false,
+        };
+        // The blocks that can run after the increment, in the same iteration
+        let mut after = vec![false; n];
+        let mut work = succs[store_block].clone();
+        while let Some(b) = work.pop() {
+            if b != head && !after[b] {
+                after[b] = true;
+                work.extend(succs[b].iter().copied());
+            }
+        }
+        for b in (0..n).filter(|b| body[*b] && *b != head) {
+            for id in &func.blocks[b].instructions {
+                let Some(Inst::Call { func: name, args, .. }) = inst(*id) else { continue; };
+                let at = match name.as_str() {
+                    "Vec_get" if args.len() >= 2 => args.len() - 2,
+                    "Vec_set" if args.len() >= 3 => args.len() - 3,
+                    _ => continue,
+                };
+                let index = args[at + 1];
+                if !same_vec(args[at]) || !matches!(inst(index), Some(Inst::Load { ptr, .. }) if ptr == slot) {
+                    continue;
+                }
+                let (lb, lk) = place[&index.0];
+                if !after[lb] && !(lb == store_block && lk > store_at) {
+                    out.insert(id.0);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The locals worth a register: 8-byte allocas used only by whole-word loads
 /// and stores, most used first, a use in a loop counting ten times more per
 /// level. Two registers stay for temporaries. Records them in `frame`, marks
@@ -10476,7 +10846,7 @@ fn reachable_from(module: &IrModule, roots: Vec<String>) -> std::collections::BT
                     }
                     // A function named in a string: a thread or task entry point
                     Inst::ConstStr { value } if module.functions.contains_key(value) => work.push(value.clone()),
-                    Inst::ConstFnRef { name } => work.push(name.clone()),
+                    Inst::ConstFnRef { name } => work.push(crate::ir::c_fn_target(name).to_string()),
                     Inst::Print { ty, .. } => {
                         work.extend(print_formatter(ty).map(String::from));
                         work.extend(PRINT_BUILTINS.iter().map(|b| resolve_callee(module, b)));

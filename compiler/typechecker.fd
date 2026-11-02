@@ -6146,9 +6146,9 @@ pub fn TypeChecker_types_compatible(self: &TypeChecker, declared: Type, actual: 
         _ => {}
     }
     // str <-> i64 (str is a pointer internally)
-    // str is a pointer, but in the program itself it is not an integer.
-    // Imported modules keep the old rule until their bare Vec is typed.
-    if self.current_module != "main"
+    // str is a pointer, but only the runtime layer and the self-hosted compiler
+    // treat it as an integer
+    if (is_runtime_layer(self.current_module) || str_starts_with(self.current_module, "compiler"))
         && ((type_eq(decl, Type::I64) && type_eq(act, Type::Str)) || (type_eq(decl, Type::Str) && type_eq(act, Type::I64))) {
         return true;
     }
@@ -7748,6 +7748,9 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                         }
                         pi = pi + 1;
                     }
+                    if str_vec_contains(self.extern_fns, callee) {
+                        TypeChecker_check_c_callbacks(self, callee, sig, args);
+                    }
                     // For generic functions, return Never (compatible with any type)
                     if TypeChecker_type_contains_param(self, sig.ret_ty) {
                         return Type::Never;
@@ -7772,6 +7775,9 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             }
             // Check for runtime builtin functions (p_*)
             if str_starts_with(callee, "p_") {
+                if callee == "p_json_dump" || callee == "p_json_type" || callee == "p_json_pretty" || callee == "p_json_string" || callee == "p_tensor_to_str" || callee == "p_tensor_to_json" || callee == "p_simd_to_str" || callee == "p_socket_recv_str" || callee == "p_http_build_response" || callee == "p_read_line" || callee == "p_read_stdin" || callee == "p_file_read" || callee == "p_db_mem_query" || callee == "p_getenv" || callee == "p_env_get" || callee == "p_argv" || callee == "p_process_stdout" || callee == "p_process_stderr" || callee == "p_dir_list" || callee == "p_intern_str" || callee == "p_str_join_n" {
+                    return Type::Str;
+                }
                 if callee == "p_str_concat" || callee == "p_to_str" || callee == "p_float_to_str" || callee == "p_string_replace" || callee == "p_string_trim" || callee == "p_string_to_uppercase" || callee == "p_string_to_lowercase" || callee == "p_string_char_at" || callee == "p_string_repeat" || callee == "p_char_to_str" || callee == "p_bool_to_str" || callee == "p_sb_to_str" {
                     return Type::Str;
                 }
@@ -9229,6 +9235,51 @@ pub fn unbox_ty(t: Type) -> Type {
 
 // At the C FFI boundary a reference, str, raw pointer or runtime handle is
 // passed as a pointer-sized integer or raw pointer.
+/// A function handed to C must be a named one: C calls it through an adapter
+/// made at compile time, with no captures and no struct result.
+fn TypeChecker_check_c_callbacks(self: &mut TypeChecker, callee: str, sig: FuncSig, args: Vec<Expr>) -> void {
+    var i: i64 = 0;
+    while i < sig.param_types.len() && i < args.len() {
+        var ok: bool = true;
+        match TypeChecker_resolve_type(self, sig.param_types.get(i)) {
+            Type::Func(_, _) => { ok = TypeChecker_is_c_callable(self, args.get(i)); }
+            _ => {}
+        }
+        if !ok {
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): C function '" + callee + "' parameter " + int_to_str(i + 1) + " needs a named function that returns no struct");
+        }
+        i = i + 1;
+    }
+}
+
+fn TypeChecker_is_c_callable(self: &mut TypeChecker, arg: Expr) -> bool {
+    match arg {
+        Expr::Ident(name) => {
+            match TypeChecker_lookup(self, name) {
+                OptType::Some(_) => { return false; }
+                OptType::None => {}
+            }
+            match TypeChecker_lookup_func_cache(self, name) {
+                OptFuncSig::Some(sig) => {
+                    match sig.ret_ty {
+                        Type::Named(n) => {
+                            match TypeChecker_lookup_struct_cache(self, n) {
+                                OptVecStructField::Some(_) => { return false; }
+                                OptVecStructField::None => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                    return true;
+                }
+                OptFuncSig::None => {}
+            }
+        }
+        _ => {}
+    }
+    return false;
+}
+
 pub fn is_ffi_pointer_pair(param: Type, arg: Type) -> bool {
     var param_is_ptr: bool = false;
     match param {

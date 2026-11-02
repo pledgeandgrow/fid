@@ -1,0 +1,155 @@
+// stdlib/storage: the Merkle tree (empty tree, single leaf with a known
+// FNV-1a pair, node numbering for 2 and 3 leaves, order and content
+// sensitivity, data lookup) and the key-value store (set, update, get,
+// has, delete with shifting, state hash).
+// The two 64-bit halves of a leaf are FNV-1a of the bytes with the usual
+// basis (cbf29ce484222325) and with a second basis (84222325cbf29ce4) and
+// each byte plus one; the expected values were computed separately.
+use storage;
+
+fn say_yes(b: bool) {
+    if b { println("yes"); } else { println("no"); }
+}
+
+fn main() -> i64 {
+    // empty tree
+    var t0 = merkle_tree_new();
+    println(t0.root_index);
+    println(merkle_tree_leaf_count(t0));
+    println(merkle_tree_build(t0));
+    println(merkle_tree_root(t0).len());
+    println(merkle_tree_root_hex(t0) == "");
+    say_yes(merkle_tree_verify_data(t0, "a"));
+
+    // one leaf is its own root
+    var t1 = merkle_tree_new();
+    println(merkle_tree_add(t1, "a"));
+    println(merkle_tree_build(t1));
+    println(merkle_tree_root_hex(t1));
+    println(merkle_tree_root(t1).len());
+    var te = merkle_tree_new();
+    merkle_tree_add(te, "");
+    merkle_tree_build(te);
+    println(merkle_tree_root_hex(te));
+    var th = merkle_tree_new();
+    merkle_tree_add(th, "hello");
+    merkle_tree_build(th);
+    println(merkle_tree_root_hex(th));
+
+    // two leaves: nodes 0, 1 and the parent 2
+    var t2 = merkle_tree_new();
+    println(merkle_tree_add(t2, "a"));
+    println(merkle_tree_add(t2, "b"));
+    println(merkle_tree_build(t2));
+    println(t2.node_count);
+    println(t2.left_children.get(2));
+    println(t2.right_children.get(2));
+    println(t2.is_leaf_flags.get(0));
+    println(t2.is_leaf_flags.get(2));
+    println(str_len(merkle_tree_root_hex(t2)));
+    println(merkle_tree_root_hex(t2) == merkle_tree_root_hex(t1));
+
+    // three leaves: the odd one is paired with itself; (0,1) -> 3,
+    // (2,2) -> 4, (3,4) -> 5
+    var t3 = merkle_tree_new();
+    merkle_tree_add(t3, "a");
+    merkle_tree_add(t3, "b");
+    merkle_tree_add(t3, "c");
+    println(merkle_tree_build(t3));
+    println(t3.node_count);
+    println(merkle_tree_leaf_count(t3));
+    println(t3.left_children.get(4));
+    println(t3.right_children.get(4));
+    println(t3.left_children.get(5));
+    println(t3.right_children.get(5));
+
+    // same data, same root; other order or other content, other root
+    var u2 = merkle_tree_new();
+    merkle_tree_add(u2, "a");
+    merkle_tree_add(u2, "b");
+    merkle_tree_build(u2);
+    println(merkle_tree_root_hex(u2) == merkle_tree_root_hex(t2));
+    var swapped = merkle_tree_new();
+    merkle_tree_add(swapped, "b");
+    merkle_tree_add(swapped, "a");
+    merkle_tree_build(swapped);
+    println(merkle_tree_root_hex(swapped) == merkle_tree_root_hex(t2));
+    var changed = merkle_tree_new();
+    merkle_tree_add(changed, "a");
+    merkle_tree_add(changed, "c");
+    merkle_tree_build(changed);
+    println(merkle_tree_root_hex(changed) == merkle_tree_root_hex(t2));
+    // a duplicated pair is not the same as the single leaf
+    var dup = merkle_tree_new();
+    merkle_tree_add(dup, "a");
+    merkle_tree_add(dup, "a");
+    merkle_tree_build(dup);
+    println(merkle_tree_root_hex(dup) == merkle_tree_root_hex(t1));
+
+    // data lookup works on the leaves
+    say_yes(merkle_tree_verify_data(t3, "a"));
+    say_yes(merkle_tree_verify_data(t3, "c"));
+    say_yes(merkle_tree_verify_data(t3, "d"));
+    say_yes(merkle_tree_verify_data(t3, ""));
+
+    // key-value store
+    var kv = kv_store_new();
+    println(kv_store_count(kv));
+    println(kv_store_get(kv, "x"));
+    say_yes(kv_store_has(kv, "x"));
+    kv_store_set(kv, "x", 10);
+    kv_store_set(kv, "y", 20);
+    kv_store_set(kv, "z", 30);
+    println(kv_store_count(kv));
+    println(kv_store_get(kv, "y"));
+    say_yes(kv_store_has(kv, "z"));
+    say_yes(kv_store_has(kv, "w"));
+    // setting an existing key updates it
+    kv_store_set(kv, "y", 21);
+    println(kv_store_count(kv));
+    println(kv_store_get(kv, "y"));
+    // delete shifts the later entries down
+    say_yes(kv_store_delete(kv, "x"));
+    println(kv_store_count(kv));
+    say_yes(kv_store_has(kv, "x"));
+    println(kv_store_get(kv, "y"));
+    println(kv_store_get(kv, "z"));
+    println(kv.keys.get(0));
+    say_yes(kv_store_delete(kv, "x"));
+    say_yes(kv_store_delete(kv, "z"));
+    println(kv_store_count(kv));
+    println(kv_store_get(kv, "z"));
+    say_yes(kv_store_delete(kv, "y"));
+    println(kv_store_count(kv));
+    // reuse after emptying
+    kv_store_set(kv, "k", 7);
+    println(kv_store_get(kv, "k"));
+
+    // the state hash: empty store has none; it covers the keys and values
+    var e1 = kv_store_new();
+    println(kv_store_state_hash(e1).len());
+    var s1 = kv_store_new();
+    kv_store_set(s1, "a", 1);
+    kv_store_set(s1, "b", 2);
+    var s2 = kv_store_new();
+    kv_store_set(s2, "a", 1);
+    kv_store_set(s2, "b", 2);
+    var s3 = kv_store_new();
+    kv_store_set(s3, "a", 1);
+    kv_store_set(s3, "b", 3);
+    println(kv_store_state_hash(s1).len());
+    var h1 = kv_store_state_hash(s1);
+    var h2 = kv_store_state_hash(s2);
+    var h3 = kv_store_state_hash(s3);
+    var same12 = true;
+    var same13 = true;
+    var i: i64 = 0;
+    while i < 16 {
+        if h1.get(i) != h2.get(i) { same12 = false; }
+        if h1.get(i) != h3.get(i) { same13 = false; }
+        i = i + 1;
+    }
+    println(same12);
+    println(same13);
+    return 0;
+}

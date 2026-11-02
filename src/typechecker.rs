@@ -5786,6 +5786,9 @@ impl TypeChecker {
                             ));
                         }
                     }
+                    if self.extern_fns.contains(callee) {
+                        self.check_c_callbacks(callee, &params, args);
+                    }
                     // For generic functions, the return type contains type params
                     // that will be resolved by monomorphization. Return Never as
                     // a sentinel that's compatible with any type.
@@ -5833,7 +5836,29 @@ impl TypeChecker {
                         | "p_string_replace" | "p_string_trim"
                         | "p_string_to_uppercase" | "p_string_to_lowercase"
                         | "p_string_char_at" | "p_string_repeat"
-                        | "p_char_to_str" | "p_sb_to_str" => {
+                        | "p_char_to_str" | "p_sb_to_str"
+                        | "p_json_dump"
+                        | "p_json_type"
+                        | "p_json_pretty"
+                        | "p_json_string"
+                        | "p_tensor_to_str"
+                        | "p_tensor_to_json"
+                        | "p_simd_to_str"
+                        | "p_socket_recv_str"
+                        | "p_http_build_response"
+                        | "p_read_line"
+                        | "p_read_stdin"
+                        | "p_file_read"
+                        | "p_db_mem_query"
+                        | "p_getenv"
+                        | "p_env_get"
+                        | "p_argv"
+                        | "p_process_stdout"
+                        | "p_process_stderr"
+                        | "p_dir_list"
+                        | "p_intern_str"
+                        | "p_str_join_n"
+                        => {
                             return Type::Str;
                         }
                         "p_bool_to_str" => {
@@ -7277,9 +7302,9 @@ impl TypeChecker {
         if matches!(declared, Type::ArrayConst { .. }) || matches!(actual, Type::ArrayConst { .. }) {
             return true;
         }
-        // str is a pointer, but in the program itself it is not an integer.
-        // Imported modules keep the old rule until their bare Vec is typed.
-        if self.current_module != "main"
+        // str is a pointer, but only the runtime layer and the self-hosted compiler
+        // treat it as an integer
+        if (Self::is_runtime_layer(&self.current_module) || self.current_module.starts_with("compiler"))
             && ((matches!(declared, Type::I64) && matches!(actual, Type::Str))
                 || (matches!(declared, Type::Str) && matches!(actual, Type::I64)))
         {
@@ -7565,6 +7590,33 @@ impl TypeChecker {
             _ => false,
         };
         (is_handle(a) && matches!(b, Type::I64)) || (is_handle(b) && matches!(a, Type::I64))
+    }
+
+    /// A function handed to C must be a named one: C calls it through an
+    /// adapter made at compile time, with no captures and no struct result.
+    fn check_c_callbacks(&mut self, callee: &str, params: &[Type], args: &[Expr]) {
+        for (i, (param, arg)) in params.iter().zip(args).enumerate() {
+            if !matches!(param, Type::Func { .. }) {
+                continue;
+            }
+            let ret = match arg {
+                Expr::Ident(name) if self.lookup(name).is_none() => {
+                    self.funcs.get(name).map(|(_, ret)| ret.clone())
+                }
+                _ => None,
+            };
+            let ok = match ret {
+                Some(Type::Named(n)) => !self.structs.contains_key(&n),
+                Some(_) => true,
+                None => false,
+            };
+            if !ok {
+                self.errors.push(format!(
+                    "Type error (line {}): C function '{}' parameter {} needs a named function that returns no struct",
+                    self.current_line, callee, i + 1
+                ));
+            }
+        }
     }
 
     /// At the C FFI boundary a reference, str, raw pointer or runtime handle

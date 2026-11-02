@@ -1,0 +1,106 @@
+// stdlib/gameloop: the fixed timestep loop (timestep, update count,
+// accumulator, interpolation factor, frame cap, FPS counter) and the
+// variable timestep loop. The loops read the clock; the tests either make
+// the step time irrelevant (max_frame_time = 0, or a start time long ago
+// that the cap clamps) or only check ranges.
+use gameloop;
+
+fn say_yes(b: bool) {
+    if b { println("yes"); } else { println("no"); }
+}
+
+fn main() -> i64 {
+    var gl = gameloop_create(4);
+    println(gl.target_fps);
+    println(gameloop_dt(&gl));
+    println(gl.running);
+    println(gl.max_frame_time);
+    println(gameloop_total_frames(&gl));
+    println(gameloop_fps(&gl));
+    println(gameloop_alpha(&gl));
+    println(gameloop_dt(&gameloop_create(1)));
+    println(gameloop_dt(&gameloop_create(0)));
+    println(gameloop_dt(&gameloop_create(-5)));
+
+    // 1 update per second at target 1: a quick frame makes no update
+    var slow = gameloop_create(1);
+    println(gameloop_step(&mut slow));
+    println(gameloop_total_frames(&slow));
+    say_yes(gameloop_alpha(&slow) >= 0.0);
+    say_yes(gameloop_alpha(&slow) < 1.0);
+
+    // a frame time of zero (cap 0) leaves the accumulator alone: 0.625 s
+    // at 4 updates per second is 2 updates and 0.125 s left, alpha 0.5
+    var fixed = gameloop_create(4);
+    fixed.max_frame_time = 0.0;
+    fixed.accumulator = 0.625;
+    println(gameloop_step(&mut fixed));
+    println(fixed.accumulator);
+    println(gameloop_alpha(&fixed));
+    println(gameloop_step(&mut fixed));
+    println(gameloop_total_frames(&fixed));
+
+    // a long pause is clamped to max_frame_time (0.25 s): one update at
+    // 4 per second, nothing left over
+    var lag = gameloop_create(4);
+    lag.current_time = lag.current_time - 100000;
+    println(gameloop_step(&mut lag));
+    println(lag.accumulator);
+    println(lag.fps_timer);
+    // at 8 updates per second the same 0.25 s makes two
+    var lag8 = gameloop_create(8);
+    lag8.current_time = lag8.current_time - 100000;
+    println(gameloop_step(&mut lag8));
+    // and a spiral of death is avoided: no matter the pause, at most
+    // max_frame_time / dt updates
+    var lag64 = gameloop_create(64);
+    lag64.current_time = lag64.current_time - 100000;
+    println(gameloop_step(&mut lag64));
+
+    // the FPS counter reports once a second of frame time has passed
+    var fps = gameloop_create(1);
+    fps.max_frame_time = 0.0;
+    fps.frame_count = 29;
+    fps.fps_timer = 1000;
+    gameloop_step(&mut fps);
+    println(gameloop_fps(&fps));
+    println(fps.frame_count);
+    println(fps.fps_timer);
+    fps.fps_timer = 999;
+    fps.frame_count = 5;
+    gameloop_step(&mut fps);
+    println(gameloop_fps(&fps));
+    println(fps.frame_count);
+
+    // stop
+    gameloop_stop(&mut gl);
+    println(gl.running);
+
+    // the simple loop
+    var sl = simpleloop_create();
+    println(sl.running);
+    println(sl.dt);
+    println(sl.frame_count);
+    // after a long pause dt is capped at a quarter second
+    sl.current_time = sl.current_time - 100000;
+    println(simpleloop_step(&mut sl));
+    println(sl.dt);
+    println(sl.frame_count);
+    println(sl.fps_timer);
+    // a quick frame: small but not negative
+    var dt = simpleloop_step(&mut sl);
+    say_yes(dt >= 0.0);
+    say_yes(dt < 0.25);
+    println(sl.frame_count);
+    // the FPS counter
+    sl.fps_timer = 800;
+    sl.frame_count = 41;
+    sl.current_time = sl.current_time - 100000;
+    simpleloop_step(&mut sl);
+    println(sl.fps);
+    println(sl.frame_count);
+    println(sl.fps_timer);
+    simpleloop_stop(&mut sl);
+    println(sl.running);
+    return 0;
+}

@@ -1,0 +1,192 @@
+// stdlib/editor: entities, selection, move/rotate/scale with grid snapping
+// (rounded to the nearest step), locks, visibility, duplicate, delete and
+// the state flags and setters.
+use editor;
+
+fn say_yes(b: bool) {
+    if b { println("yes"); } else { println("no"); }
+}
+
+// round to thousandths, half away from zero
+fn r3(x: f64) -> i64 {
+    if x < 0.0 {
+        return 0 - (((0.0 - x) * 1000.0 + 0.5) as i64);
+    }
+    return (x * 1000.0 + 0.5) as i64;
+}
+
+fn pos(e: EditorEntity) {
+    print(r3(e.x));
+    print(" ");
+    print(r3(e.y));
+    print(" ");
+    println(r3(e.z));
+}
+
+fn main() -> i64 {
+    var ed = editor_create();
+    println(editor_entity_count(&ed));
+    println(editor_selected_id(&ed));
+    println(editor_gizmo_mode(&ed));
+    say_yes(editor_snap_enabled(&ed));
+    say_yes(editor_grid_visible(&ed));
+    println(ed.snap_translate);
+    println(ed.snap_rotate);
+    println(ed.snap_scale);
+    println(ed.max_undo);
+
+    // nothing selected: the selection is an empty placeholder and edits do nothing
+    var none = editor_get_selected(&ed);
+    println(none.id);
+    println(none.visible);
+    editor_move_selected(&mut ed, 1.0, 1.0, 1.0);
+    editor_delete_selected(&mut ed);
+    editor_duplicate_selected(&mut ed);
+    println(editor_entity_count(&ed));
+
+    editor_add_entity(&mut ed, 7, "Player", 1.0, 2.0, 3.0);
+    editor_add_entity(&mut ed, 9, "Crate", -1.0, 0.0, 0.0);
+    println(editor_entity_count(&ed));
+    var p = editor_get_entity(&ed, 0);
+    println(p.name);
+    println(p.id);
+    pos(p);
+    println(p.sx);
+    println(p.visible);
+    println(p.locked);
+    println(p.selected);
+
+    // selecting marks one entity and clears the rest
+    editor_select(&mut ed, 7);
+    println(editor_selected_id(&ed));
+    println(editor_get_entity(&ed, 0).selected);
+    println(editor_get_entity(&ed, 1).selected);
+    println(editor_get_selected(&ed).name);
+    editor_select(&mut ed, 9);
+    println(editor_get_entity(&ed, 0).selected);
+    println(editor_get_entity(&ed, 1).selected);
+    println(editor_get_selected(&ed).name);
+    // an id that does not exist selects nothing
+    editor_select(&mut ed, 123);
+    println(editor_get_selected(&ed).id);
+    editor_deselect_all(&mut ed);
+    println(editor_selected_id(&ed));
+    println(editor_get_entity(&ed, 1).selected);
+
+    // moving snaps to the nearest 0.25
+    editor_select(&mut ed, 7);
+    editor_move_selected(&mut ed, 0.3, 0.0, 0.0);
+    pos(editor_get_selected(&ed));
+    editor_move_selected(&mut ed, 0.125, 0.0, 0.0);
+    pos(editor_get_selected(&ed));
+    editor_move_selected(&mut ed, 0.0, -0.3, 0.4);
+    pos(editor_get_selected(&ed));
+    // with snapping off the move is exact
+    editor_toggle_snap(&mut ed);
+    say_yes(editor_snap_enabled(&ed));
+    editor_move_selected(&mut ed, 0.1, 0.0, 0.0);
+    pos(editor_get_selected(&ed));
+    editor_toggle_snap(&mut ed);
+    // a step of 0 turns snapping off
+    editor_set_snap_translate(&mut ed, 0.0);
+    editor_move_selected(&mut ed, 0.1, 0.0, 0.0);
+    pos(editor_get_selected(&ed));
+    editor_set_snap_translate(&mut ed, 1.0);
+    editor_move_selected(&mut ed, 0.4, 0.6, -2.0);
+    pos(editor_get_selected(&ed));
+
+    // rotation snaps to 15 degrees
+    editor_rotate_selected(&mut ed, 20.0, 8.0, 7.0);
+    var r = editor_get_selected(&ed);
+    println(r3(r.rx));
+    println(r3(r.ry));
+    println(r3(r.rz));
+    editor_rotate_selected(&mut ed, 7.5, 0.0, 0.0);
+    println(r3(editor_get_selected(&ed).rx));
+    editor_set_snap_rotate(&mut ed, 90.0);
+    editor_rotate_selected(&mut ed, 50.0, 0.0, 0.0);
+    println(r3(editor_get_selected(&ed).rx));
+
+    // scaling snaps to 0.1 and never goes below 0.01
+    editor_scale_selected(&mut ed, 0.26, 0.0, 0.0);
+    var s = editor_get_selected(&ed);
+    println(r3(s.sx));
+    println(r3(s.sy));
+    editor_scale_selected(&mut ed, -5.0, -5.0, -5.0);
+    s = editor_get_selected(&ed);
+    println(s.sx);
+    println(s.sy);
+    println(s.sz);
+    editor_set_snap_scale(&mut ed, 0.5);
+    editor_scale_selected(&mut ed, 1.7, 0.0, 0.0);
+    println(r3(editor_get_selected(&ed).sx));
+
+    // locked entities ignore transforms
+    editor_toggle_lock(&mut ed, 7);
+    say_yes(editor_get_selected(&ed).locked);
+    var before = editor_get_selected(&ed);
+    editor_move_selected(&mut ed, 5.0, 5.0, 5.0);
+    editor_rotate_selected(&mut ed, 90.0, 90.0, 90.0);
+    editor_scale_selected(&mut ed, 1.0, 1.0, 1.0);
+    var after = editor_get_selected(&ed);
+    println(r3(before.x) == r3(after.x));
+    println(r3(before.rx) == r3(after.rx));
+    println(r3(before.sx) == r3(after.sx));
+    editor_toggle_lock(&mut ed, 7);
+    say_yes(editor_get_selected(&ed).locked);
+    // an unknown id changes nothing
+    editor_toggle_lock(&mut ed, 55);
+    editor_toggle_visibility(&mut ed, 55);
+
+    // visibility
+    say_yes(editor_get_entity(&ed, 1).visible);
+    editor_toggle_visibility(&mut ed, 9);
+    say_yes(editor_get_entity(&ed, 1).visible);
+    editor_toggle_visibility(&mut ed, 9);
+    say_yes(editor_get_entity(&ed, 1).visible);
+
+    // duplicate: the copy is 1 along x and has id + 10000
+    editor_select(&mut ed, 9);
+    editor_duplicate_selected(&mut ed);
+    println(editor_entity_count(&ed));
+    var d = editor_get_entity(&ed, 2);
+    println(d.id);
+    println(d.name);
+    pos(d);
+    println(d.selected);
+    // delete the selected one: the selection is cleared
+    editor_delete_selected(&mut ed);
+    println(editor_entity_count(&ed));
+    println(editor_selected_id(&ed));
+    println(editor_get_entity(&ed, 0).id);
+    println(editor_get_entity(&ed, 1).id);
+
+    // settings
+    editor_set_gizmo_mode(&mut ed, GIZMO_ROTATE);
+    println(editor_gizmo_mode(&ed));
+    editor_set_gizmo_mode(&mut ed, GIZMO_SCALE);
+    println(editor_gizmo_mode(&ed));
+    editor_toggle_grid(&mut ed);
+    say_yes(editor_grid_visible(&ed));
+    editor_set_grid_size(&mut ed, 2.0);
+    println(ed.grid_size);
+    editor_set_camera(&mut ed, 1.0, 2.0, 3.0);
+    println(ed.camera_z);
+    editor_show_inspector(&mut ed, false);
+    editor_show_hierarchy(&mut ed, false);
+    say_yes(ed.show_inspector);
+    say_yes(ed.show_hierarchy);
+    say_yes(ed.show_gizmo);
+    editor_set_max_undo(&mut ed, 10);
+    println(ed.max_undo);
+
+    // clear and init empty the scene
+    editor_select(&mut ed, 7);
+    editor_clear(&mut ed);
+    println(editor_entity_count(&ed));
+    println(editor_selected_id(&ed));
+    editor_add_entity(&mut ed, 1, "A", 0.0, 0.0, 0.0);
+    editor_init(&mut ed);
+    println(editor_entity_count(&ed));
+    return 0;
+}

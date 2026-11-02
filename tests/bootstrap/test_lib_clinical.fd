@@ -1,0 +1,151 @@
+// stdlib/clinical: BMI and its categories, eGFR and CKD stage, CHA2DS2-VASc,
+// dose rules, creatinine clearance, temperature conversion, heart
+// rate zones, anion gap and NEWS2. clinical_meld is not covered: it calls
+// the C library log, which the interpreter cannot (no FFI). Inputs are
+// picked so the expected value
+// is easy to work out; irrational results print in thousandths (r3).
+use clinical;
+
+// round to thousandths, half away from zero
+fn r3(x: f64) -> i64 {
+    if x < 0.0 {
+        return 0 - (((0.0 - x) * 1000.0 + 0.5) as i64);
+    }
+    return (x * 1000.0 + 0.5) as i64;
+}
+
+fn show(v: Vec<i64>) {
+    print(v.len());
+    print(":");
+    var i: i64 = 0;
+    while i < v.len() {
+        print(" ");
+        print(v.get(i));
+        i = i + 1;
+    }
+    println("");
+}
+
+fn main() -> i64 {
+    // BMI = kg / m^2; 81 / 2.25 = 36 exactly; 70 / 1.75^2 = 22.857
+    println(clinical_bmi(81.0, 1.5));
+    println(r3(clinical_bmi(70.0, 1.75)));
+    println(clinical_bmi(70.0, 0.0));
+    println(clinical_bmi(70.0, -1.8));
+    println(clinical_bmi_category(18.4));
+    println(clinical_bmi_category(18.5));
+    println(clinical_bmi_category(24.9));
+    println(clinical_bmi_category(25.0));
+    println(clinical_bmi_category(29.9));
+    println(clinical_bmi_category(30.0));
+    println(r3(clinical_bmi_imperial(150.0, 60.0)));
+    println(clinical_bmi_imperial(150.0, 0.0));
+
+    // eGFR (CKD-EPI 2021): at age 0 with Scr = kappa the result is 142
+    // (x 1.012 for women); age adds a factor 0.9938 per year
+    println(r3(clinical_gfr_egfr(0.9, 0, 0)));
+    println(r3(clinical_gfr_egfr(0.7, 0, 1)));
+    println(r3(clinical_gfr_egfr(0.9, 1, 0)));
+    println(r3(clinical_gfr_egfr(0.7, 1, 1)));
+    // Scr 1.8 in a man: 142 * 2^-1.2
+    println(r3(clinical_gfr_egfr(1.8, 0, 0)));
+    // CKD stages at the boundaries
+    println(clinical_ckd_stage(120.0));
+    println(clinical_ckd_stage(90.0));
+    println(clinical_ckd_stage(89.9));
+    println(clinical_ckd_stage(60.0));
+    println(clinical_ckd_stage(59.9));
+    println(clinical_ckd_stage(45.0));
+    println(clinical_ckd_stage(44.9));
+    println(clinical_ckd_stage(30.0));
+    println(clinical_ckd_stage(29.9));
+    println(clinical_ckd_stage(15.0));
+    println(clinical_ckd_stage(14.9));
+
+    // CHA2DS2-VASc: chf htn age diabetes stroke vascular female
+    println(clinical_chads2vasc(0, 0, 50, 0, 0, 0, 0));
+    println(clinical_chads2vasc(1, 1, 80, 1, 1, 1, 1));
+    println(clinical_chads2vasc(0, 1, 70, 0, 0, 0, 0));
+    println(clinical_chads2vasc(0, 0, 64, 0, 0, 0, 0));
+    println(clinical_chads2vasc(0, 0, 65, 0, 0, 0, 0));
+    println(clinical_chads2vasc(0, 0, 74, 0, 0, 0, 0));
+    println(clinical_chads2vasc(0, 0, 75, 0, 0, 0, 0));
+    println(clinical_chads2vasc(0, 0, 50, 0, 1, 0, 0));
+    println(clinical_chads2vasc(0, 0, 50, 0, 0, 0, 1));
+    println(clinical_chads2vasc_risk(0));
+    println(clinical_chads2vasc_risk(1));
+    println(clinical_chads2vasc_risk(2));
+    println(clinical_chads2vasc_risk(9));
+
+    // doses
+    println(clinical_dose_by_weight(5.0, 70.0));
+    println(clinical_dose_young(100.0, 4));
+    println(clinical_dose_young(100.0, 0));
+    println(clinical_dose_clark(100.0, 75.0));
+    println(r3(clinical_creatinine_clearance(40, 80.0, 1.0, 0)));
+    println(r3(clinical_creatinine_clearance(40, 80.0, 1.0, 1)));
+    println(clinical_creatinine_clearance(40, 80.0, 0.0, 0));
+    println(clinical_creatinine_clearance(40, 80.0, -1.0, 0));
+
+    // temperature
+    println(clinical_c_to_f(100.0));
+    println(clinical_c_to_f(0.0));
+    println(r3(clinical_c_to_f(37.0)));
+    println(clinical_f_to_c(212.0));
+    println(clinical_f_to_c(32.0));
+    println(r3(clinical_f_to_c(98.6)));
+
+    // heart rate
+    println(clinical_max_hr(40));
+    show(clinical_target_hr_zone(40));
+    show(clinical_target_hr_zone(20));
+
+    // anion gap: Na - (Cl + HCO3), normal 8..16
+    println(clinical_anion_gap(140, 100, 24));
+    println(clinical_anion_gap_normal(16));
+    println(clinical_anion_gap_normal(17));
+    println(clinical_anion_gap_normal(8));
+    println(clinical_anion_gap_normal(7));
+
+    // NEWS2: rr, spo2, air(0)/oxygen(1), systolic, pulse, temperature
+    println(clinical_news2(16, 98, 0, 120, 70, 36.6));
+    println(clinical_news2(30, 85, 0, 80, 140, 40.0));
+    // one abnormal parameter at a time, the rest normal
+    println(clinical_news2(8, 98, 0, 120, 70, 36.6));
+    println(clinical_news2(25, 98, 0, 120, 70, 36.6));
+    println(clinical_news2(21, 98, 0, 120, 70, 36.6));
+    println(clinical_news2(11, 98, 0, 120, 70, 36.6));
+    println(clinical_news2(12, 98, 0, 120, 70, 36.6));
+    println(clinical_news2(16, 91, 0, 120, 70, 36.6));
+    println(clinical_news2(16, 93, 0, 120, 70, 36.6));
+    println(clinical_news2(16, 95, 0, 120, 70, 36.6));
+    println(clinical_news2(16, 96, 0, 120, 70, 36.6));
+    println(clinical_news2(16, 84, 1, 120, 70, 36.6));
+    println(clinical_news2(16, 88, 1, 120, 70, 36.6));
+    println(clinical_news2(16, 94, 1, 120, 70, 36.6));
+    println(clinical_news2(16, 98, 0, 90, 70, 36.6));
+    println(clinical_news2(16, 98, 0, 100, 70, 36.6));
+    println(clinical_news2(16, 98, 0, 110, 70, 36.6));
+    println(clinical_news2(16, 98, 0, 111, 70, 36.6));
+    println(clinical_news2(16, 98, 0, 200, 70, 36.6));
+    println(clinical_news2(16, 98, 0, 201, 70, 36.6));
+    println(clinical_news2(16, 98, 0, 220, 70, 36.6));
+    println(clinical_news2(16, 98, 0, 120, 40, 36.6));
+    println(clinical_news2(16, 98, 0, 120, 50, 36.6));
+    println(clinical_news2(16, 98, 0, 120, 51, 36.6));
+    println(clinical_news2(16, 98, 0, 120, 91, 36.6));
+    println(clinical_news2(16, 98, 0, 120, 111, 36.6));
+    println(clinical_news2(16, 98, 0, 120, 131, 36.6));
+    println(clinical_news2(16, 98, 0, 120, 70, 34.9));
+    println(clinical_news2(16, 98, 0, 120, 70, 35.5));
+    println(clinical_news2(16, 98, 0, 120, 70, 37.6));
+    println(clinical_news2(16, 98, 0, 120, 70, 38.1));
+    println(clinical_news2(16, 98, 0, 120, 70, 39.1));
+    println(clinical_news2_category(0));
+    println(clinical_news2_category(1));
+    println(clinical_news2_category(4));
+    println(clinical_news2_category(5));
+    println(clinical_news2_category(6));
+    println(clinical_news2_category(7));
+    return 0;
+}

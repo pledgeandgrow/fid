@@ -243,6 +243,15 @@ fn installed_stdlib_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// `use tls` is a different module on each system.
+fn platform_module(path: String) -> String {
+    match path.as_str() {
+        "tls" if cfg!(windows) => "tls_windows".to_string(),
+        "tls" => "tls_unix".to_string(),
+        _ => path,
+    }
+}
+
 /// `<dir>/<path>.fd` and `<dir>/<path>/mod.fd` for every installed stdlib dir.
 fn installed_stdlib_candidates(path_str: &str) -> Vec<PathBuf> {
     installed_stdlib_dirs()
@@ -380,7 +389,7 @@ pub fn build_program_with_runtime(source: &str, source_path: Option<&str>, runti
             }
 
             // Try: <base_dir>/<path>.fd  and  <base_dir>/<path>/mod.fd
-            let path_str = import_path.replace("::", "/");
+            let path_str = platform_module(import_path.replace("::", "/"));
             // Walk up from base_dir to find project root (the dir containing stdlib/ or compiler/).
             // This handles tests in tests/selfhost/ whose base_dir is a subdirectory.
             let project_root = find_project_root(base_dir);
@@ -1695,6 +1704,12 @@ pub fn build_program_for_lsp(source: &str) -> (Program, TypeChecker) {
 
 /// Parse an error string to extract (line, column, message).
 fn parse_error_position(error: &str) -> (usize, usize, String) {
+    // An enriched error: "error[E040]: <message>", then the source around it
+    let error = error.lines().find(|l| !l.trim().is_empty()).unwrap_or(error);
+    let error = match error.find("]: ") {
+        Some(i) if error.starts_with("error[") => &error[i + 3..],
+        _ => error,
+    };
     // Format 1: "Error:line:col: message"
     if let Some(rest) = error.strip_prefix("Error:") {
         let parts: Vec<&str> = rest.splitn(3, ':').collect();
@@ -1708,8 +1723,8 @@ fn parse_error_position(error: &str) -> (usize, usize, String) {
     if error.starts_with("Type error") {
         if let Some(start) = error.find("(line ") {
             let rest = &error[start + 6..];
-            if let Some(end) = rest.find(')') {
-                let line = rest[..end].parse::<usize>().unwrap_or(1);
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(line) = digits.parse::<usize>() {
                 return (line, 1, error.to_string());
             }
         }
@@ -2353,7 +2368,7 @@ pub fn emit_boot(source: &str, source_path: &str) -> Result<Vec<u8>, Vec<String>
         if import_path == "core" { continue; }
         if loaded_module_names.contains(&import_path) { continue; }
 
-        let path_str = import_path.replace("::", "/");
+        let path_str = platform_module(import_path.replace("::", "/"));
         let candidates = [
             base_dir.join(format!("{}.fd", path_str)),
             base_dir.join(format!("{}/mod.fd", path_str)),
@@ -3027,9 +3042,10 @@ fn strip_ungranted_caps(module: &mut IrModule, granted_caps: &[String]) {
                 }
                 Inst::ConstFnRef { name } => {
                     // Function reference — address taken
+                    let name = crate::ir::c_fn_target(name);
                     if known_functions.contains(name) {
-                        address_taken.insert(name.clone());
-                        callees.push(name.clone());
+                        address_taken.insert(name.to_string());
+                        callees.push(name.to_string());
                     }
                 }
                 Inst::CallPtr { .. } | Inst::DynCall { .. } => {

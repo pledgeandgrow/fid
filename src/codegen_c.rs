@@ -107,6 +107,8 @@ fn is_internal_function(name: &str) -> bool {
 }
 
 pub struct CCodeGen {
+    /// Externs that take or return a struct by value: called through a wrapper
+    c_wrapped: std::collections::BTreeSet<String>,
     out: String,
     /// Map from ValueId to C variable name
     value_names: HashMap<u32, String>,
@@ -155,6 +157,7 @@ pub struct CCodeGen {
 impl CCodeGen {
     fn new() -> Self {
         CCodeGen {
+            c_wrapped: Default::default(),
             out: String::new(),
             value_names: HashMap::new(),
             string_consts: HashMap::new(),
@@ -228,6 +231,11 @@ impl CCodeGen {
 
     /// Format a C parameter declaration with the variable name in the right position.
     /// For array types, C requires `type name[size]` not `type[size] name`.
+    /// A C type that holds a 64-bit integer or a pointer.
+    fn is_word_c(c: &str) -> bool {
+        c == "int64_t" || c == "uint64_t" || c.ends_with('*')
+    }
+
     fn c_param_decl(ty: &IrType, name: &str) -> String {
         match ty {
             IrType::Array(elem, size) => format!("{} {}[{}]", Self::c_type(elem), name, size),
@@ -309,6 +317,9 @@ impl CCodeGen {
     /// Sanitize a Fides function name for use as a C identifier.
     /// Renames functions that collide with C keywords or C runtime names.
     fn sanitize_c_name(&self, name: &str) -> String {
+        if self.c_wrapped.contains(name) {
+            return format!("__c_wrap_{}", name);
+        }
         // Don't sanitize user-defined extern function names (FFI)
         if self.extern_func_names.contains(name) {
             return name.to_string();
@@ -717,6 +728,14 @@ impl CCodeGen {
             ("p_co_go", &[p(), I64]),
             ("p_co_done", &[I64]),
             ("p_co_result", &[I64]),
+            ("p_co_async", &[p(), I64]),
+            ("p_co_sleep", &[I64]),
+            ("p_co_wait_fd", &[I64, I64, I64]),
+            ("p_co_detach", &[I64]),
+            ("p_co_accept", &[I64]),
+            ("p_co_connect", &[p(), I64]),
+            ("p_co_recv", &[I64, I64, I64, I64]),
+            ("p_co_send", &[I64, I64, I64]),
             // Channel functions
             ("p_chan_create", &[I64]),
             ("p_chan_send", &[I64, I64]),
@@ -936,6 +955,30 @@ impl CCodeGen {
                 }
             }
         }
+
+        // A Fides struct a declaration names, with no header to define it
+        let mut named = std::collections::BTreeSet::new();
+        for ext in module.extern_decls.iter().filter(|e| e.include.is_none()) {
+            for ty in ext.params.iter().map(|p| &p.ty).chain(std::iter::once(&ext.ret_ty)) {
+                let mut ty = ty;
+                while let ast::Type::Ref { inner, .. } = ty {
+                    ty = inner;
+                }
+                if let ast::Type::Named(n) = ty {
+                    if module.struct_layouts.contains_key(n) {
+                        named.insert(n.clone());
+                    }
+                }
+            }
+        }
+        for n in &named {
+            wln!(self, "typedef struct {}_s {};", n, n);
+        }
+        let is_struct = |t: &ast::Type| matches!(t, ast::Type::Named(n) if module.struct_layouts.contains_key(n));
+        self.c_wrapped = module.extern_decls.iter()
+            .filter(|e| is_struct(&e.ret_ty) || e.params.iter().any(|p| is_struct(&p.ty)))
+            .map(|e| e.pledge_name.clone())
+            .collect();
 
         // Emit extern function declarations
         wln!(self, "// ─── User-defined extern declarations (FFI) ───");
@@ -1327,6 +1370,14 @@ impl CCodeGen {
         wln!(self, "int64_t p_co_run(void);");
         wln!(self, "int64_t p_co_done(int64_t t);");
         wln!(self, "int64_t p_co_result(int64_t t);");
+        wln!(self, "int64_t p_co_async(const char* name, int64_t nargs, ...);");
+        wln!(self, "int64_t p_co_sleep(int64_t ms);");
+        wln!(self, "int64_t p_co_wait_fd(int64_t fd, int64_t write, int64_t timeout_ms);");
+        wln!(self, "void p_co_detach(int64_t t);");
+        wln!(self, "int64_t p_co_accept(int64_t fd);");
+        wln!(self, "int64_t p_co_connect(const char* host, int64_t port);");
+        wln!(self, "int64_t p_co_recv(int64_t fd, int64_t buf, int64_t len, int64_t timeout_ms);");
+        wln!(self, "int64_t p_co_send(int64_t fd, int64_t buf, int64_t len);");
         wln!(self, "int64_t p_executor_spawn(int64_t exec, const char* func_name, int64_t num_args, ...);");
         wln!(self, "int64_t p_executor_block_on(int64_t exec, int64_t future);");
         wln!(self, "int64_t p_task_poll(int64_t future);");
@@ -1549,6 +1600,51 @@ impl CCodeGen {
                 .map(|(id, ty)| Self::c_param_decl(ty, &format!("v{}", id.0)))
                 .collect();
             wln!(self, "{} {}({});", ret_ty, proto_name, params.join(", "));
+        }
+        // C takes a struct by value and Fides has a pointer to it
+        for ext in module.extern_decls.iter().filter(|e| self.c_wrapped.contains(&e.pledge_name)) {
+            let is_struct = |t: &ast::Type| matches!(t, ast::Type::Named(n) if module.struct_layouts.contains_key(n));
+            let mut params = Vec::new();
+            let mut args = Vec::new();
+            if is_struct(&ext.ret_ty) {
+                params.push("void* ret".to_string());
+            }
+            for (i, p) in ext.params.iter().enumerate() {
+                let c_ty = self.c_type_from_ast(&p.ty);
+                if is_struct(&p.ty) {
+                    params.push(format!("void* a{}", i));
+                    args.push(format!("*({}*)a{}", c_ty, i));
+                } else {
+                    params.push(format!("{} a{}", c_ty, i));
+                    args.push(format!("a{}", i));
+                }
+            }
+            let call = format!("{}({})", ext.pledge_name, args.join(", "));
+            let c_ret = self.c_type_from_ast(&ext.ret_ty);
+            let (ret, body) = if is_struct(&ext.ret_ty) {
+                ("void".to_string(), format!("*({}*)ret = {};", c_ret, call))
+            } else if matches!(ext.ret_ty, ast::Type::Void) {
+                (c_ret, format!("{};", call))
+            } else {
+                (c_ret, format!("return {};", call))
+            };
+            let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
+            wln!(self, "{} __c_wrap_{}({}) {{ {} }}", ret, ext.pledge_name, params, body);
+        }
+        // C calls these: they supply the `__env` Fides functions take
+        for target in &module.c_callbacks {
+            let Some(func) = module.functions.get(target) else { continue };
+            let c_ret = Self::c_ret_type(&func.ret_ty);
+            let c_name = self.sanitize_c_name(target);
+            let mut params = Vec::new();
+            let mut args = vec!["NULL".to_string()];
+            for (i, (_, ty)) in func.params.iter().skip(1).enumerate() {
+                params.push(Self::c_param_decl(ty, &format!("a{}", i)));
+                args.push(format!("a{}", i));
+            }
+            let call = format!("{}({});", c_name, args.join(", "));
+            let body = if c_ret == "void" { call } else { format!("return {}", call) };
+            wln!(self, "{} {}{}({}) {{ {} }}", c_ret, crate::ir::C_FN_PREFIX, c_name, params.join(", "), body);
         }
         wln!(self, "");
     }
@@ -1838,6 +1934,10 @@ impl CCodeGen {
                     format!("\"{}\"", escaped)
                 });
                 wln!(self, "    {} = {};", dst, const_name);
+            }
+            Inst::ConstFnRef { name } if name.starts_with(crate::ir::C_FN_PREFIX) => {
+                let target = self.sanitize_c_name(crate::ir::c_fn_target(name));
+                wln!(self, "    {} = (int64_t){}{};", dst, crate::ir::C_FN_PREFIX, target);
             }
             Inst::ConstFnRef { name } => {
                 // Function reference — emit the function name as a string for name-based lookup
@@ -2281,7 +2381,7 @@ impl CCodeGen {
                                 // are misread by va_arg on some platforms.
                                 // For other functions (e.g. FFI externs), pass as-is
                                 // to avoid breaking pointer-parameter calls.
-                                let is_varargs = fname == "p_thread_spawn" || fname == "p_executor_spawn";
+                                let is_varargs = fname == "p_thread_spawn" || fname == "p_executor_spawn" || fname == "p_co_async";
                                 let is_rc_func = fname == "p_rc_incr" || fname == "p_rc_decr";
                                 if (is_varargs || is_rc_func) && matches!(arg_ty, IrType::Ptr(_) | IrType::Opaque(_) | IrType::Generic(_, _)) {
                                     format!("(int64_t){}", base)
@@ -2376,7 +2476,7 @@ impl CCodeGen {
                                 // Match by C return type category (void vs non-void)
                                 let c_rt = Self::c_ret_type(rt);
                                 let c_expected = Self::c_ret_type(ret_ty);
-                                c_rt == c_expected
+                                c_rt == c_expected || (Self::is_word_c(&c_rt) && Self::is_word_c(&c_expected))
                             })
                     })
                     .map(|(name, _)| name)
@@ -2418,7 +2518,17 @@ impl CCodeGen {
                             .and_then(|pts| pts.get(param_idx))
                             .map(|pt| Self::c_type(pt))
                             .unwrap_or_else(|| "int64_t".to_string());
-                        if cast == "void*" || cast.starts_with("struct ") {
+                        let arg_float = func.values.get(&args[i]).map_or(false, |m| m.ty.is_float());
+                        if arg_float {
+                            // A float stays one; this candidate may not take it
+                            if cast == "double" || cast == "float" {
+                                call_args.push(format!("({}){}", cast, arg));
+                            } else if cast == "void*" || cast.starts_with("struct ") || cast.contains('[') {
+                                call_args.push(format!("(void*)(intptr_t){}", arg));
+                            } else {
+                                call_args.push(format!("({}){}", cast, arg));
+                            }
+                        } else if cast == "void*" || cast.starts_with("struct ") {
                             call_args.push(format!("(void*){}", arg));
                         } else if cast == "double" {
                             call_args.push(format!("(double)(intptr_t){}", arg));
@@ -2457,7 +2567,8 @@ impl CCodeGen {
                             dispatch.push_str(&format!("            {};\n", call_expr));
                         }
                         _ => {
-                            dispatch.push_str(&format!("            {} = {};\n", dst, call_expr));
+                            // A word of another type (a function value may only know i64)
+                            dispatch.push_str(&format!("            {} = ({}){};\n", dst, Self::c_type(ret_ty), call_expr));
                         }
                     }
                 }
@@ -2961,14 +3072,15 @@ impl CCodeGen {
         wln!(self, "    return c;");
         wln!(self, "}");
         // Blocks: an 8-byte header (P_BLOCK_MAGIC | size class) and the payload.
-        // Classes are powers of two up to 1 MB, refilled from the arena and
+        // Classes are powers of two up to 1 MB and three quarters of them
+        // (class 2k and 2k - 1 for 2^k bytes), refilled from the arena and
         // reused through per-thread free lists; larger blocks go to malloc.
         // p_free turns the header into P_BLOCK_FREED | class and panics on
         // anything else. A reused block is zeroed, as fresh memory is.
         wln!(self, "#define P_BLOCK_MAGIC 0xF1DE5A0000000000ULL");
         wln!(self, "#define P_BLOCK_FREED 0xF1DE5B0000000000ULL");
         wln!(self, "#define P_CLASS_LARGE 63");
-        wln!(self, "static P_THREAD_LOCAL uint64_t* __p_free_lists[21];");
+        wln!(self, "static P_THREAD_LOCAL uint64_t* __p_free_lists[41];");
         wln!(self, "void* p_malloc(int64_t size) {");
         wln!(self, "    if (size < 0) { fprintf(stderr, \"p_malloc: negative size %lld\\n\", (long long)size); abort(); }");
         wln!(self, "    size_t total = (size_t)size + 8;");
@@ -2981,6 +3093,8 @@ impl CCodeGen {
         wln!(self, "    int k = 4;");
         wln!(self, "    while (((size_t)1 << k) < total) k++;");
         wln!(self, "    size_t sz = (size_t)1 << k;");
+        wln!(self, "    k *= 2;");
+        wln!(self, "    if (k > 8 && total <= sz - sz / 4) { sz -= sz / 4; k--; }");
         wln!(self, "    uint64_t* reused = __p_free_lists[k];");
         wln!(self, "    if (reused) {");
         wln!(self, "        __p_free_lists[k] = (uint64_t*)reused[0];");
@@ -3359,7 +3473,9 @@ impl CCodeGen {
         wln!(self, "static pthread_t p_thread_handles[256];");
         wln!(self, "static int p_thread_handle_count = 0;");
         wln!(self, "static int64_t p_task_results[256];");
+        wln!(self, "static int64_t __p_co_await(int64_t future);");
         wln!(self, "int64_t p_future_poll(int64_t future) {");
+        wln!(self, "    if (((uint64_t)future >> 48) == 0x7FA5) return __p_co_await(future);");
         wln!(self, "    if (future >= 0) return future; // eager future");
         wln!(self, "    // Thread-based future: join and get result");
         wln!(self, "    int idx = -(future + 1);");
@@ -3406,48 +3522,103 @@ impl CCodeGen {
         wln!(self, "typedef struct { int64_t (*fn)(); int64_t nargs; int64_t args[8]; atomic_int* done; } p_thread_arg_t;");
         wln!(self, "#ifndef _WIN32");
         wln!(self, "#include <ucontext.h>");
+        wln!(self, "#include <poll.h>");
+        wln!(self, "#include <time.h>");
         wln!(self, "#endif");
-        wln!(self, "typedef struct {{ int64_t (*fn)(); int64_t arg; int64_t result; int done;");
+        wln!(self, "typedef struct __p_co {{ int64_t (*fn)(); int64_t nargs; int64_t args[8]; int64_t result; int done; int detached;");
+        wln!(self, "    struct __p_co* awaits; struct __p_co* back;");
+        wln!(self, "    int64_t fd; int64_t fd_write; int64_t ready; int64_t wake_ms;");
         wln!(self, "#ifdef _WIN32");
         wln!(self, "    void* fiber;");
         wln!(self, "#else");
         wln!(self, "    ucontext_t ctx; char* stack;");
         wln!(self, "#endif");
         wln!(self, "}} __p_co;");
-        wln!(self, "static __p_co** __p_cos = NULL;");
-        wln!(self, "static int64_t __p_co_count = 0;");
-        wln!(self, "static int64_t __p_co_cap = 0;");
-        wln!(self, "static __p_co* __p_co_cur = NULL;");
+        wln!(self, "static P_THREAD_LOCAL __p_co** __p_cos = NULL;");
+        wln!(self, "static P_THREAD_LOCAL int64_t __p_co_count = 0;");
+        wln!(self, "static P_THREAD_LOCAL int64_t __p_co_cap = 0;");
+        wln!(self, "static P_THREAD_LOCAL int64_t __p_co_total = 0;");
+        wln!(self, "static P_THREAD_LOCAL __p_co* __p_co_cur = NULL;");
         wln!(self, "#ifdef _WIN32");
-        wln!(self, "static void* __p_co_sched = NULL;");
-        wln!(self, "#define __P_CO_TO_SCHED() SwitchToFiber(__p_co_sched)");
+        wln!(self, "static P_THREAD_LOCAL void* __p_co_sched = NULL;");
         wln!(self, "#else");
-        wln!(self, "static ucontext_t __p_co_sched;");
-        wln!(self, "#define __P_CO_TO_SCHED() swapcontext(&__p_co_cur->ctx, &__p_co_sched)");
+        wln!(self, "static P_THREAD_LOCAL ucontext_t __p_co_sched;");
         wln!(self, "#endif");
+        wln!(self, "#define __P_CO_TAG 0x7FA5");
+        wln!(self, "static int64_t __p_co_now(void) {{");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    return (int64_t)GetTickCount64();");
+        wln!(self, "#else");
+        wln!(self, "    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);");
+        wln!(self, "    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;");
+        wln!(self, "#endif");
+        wln!(self, "}}");
+        wln!(self, "static void __p_co_leave(void) {{");
+        wln!(self, "    __p_co* c = __p_co_cur;");
+        wln!(self, "    __p_co* back = c->back;");
+        wln!(self, "    c->back = NULL;");
+        wln!(self, "    __p_co_cur = back;");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    SwitchToFiber(back ? back->fiber : __p_co_sched);");
+        wln!(self, "#else");
+        wln!(self, "    swapcontext(&c->ctx, back ? &back->ctx : &__p_co_sched);");
+        wln!(self, "#endif");
+        wln!(self, "}}");
+        wln!(self, "static void __p_co_enter(__p_co* c) {{");
+        wln!(self, "    __p_co* from = __p_co_cur;");
+        wln!(self, "    __p_co_cur = c;");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    (void)from;");
+        wln!(self, "    SwitchToFiber(c->fiber);");
+        wln!(self, "#else");
+        wln!(self, "    swapcontext(from ? &from->ctx : &__p_co_sched, &c->ctx);");
+        wln!(self, "#endif");
+        wln!(self, "    if (c->done) {{");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "        DeleteFiber(c->fiber);");
+        wln!(self, "#else");
+        wln!(self, "        free(c->stack);");
+        wln!(self, "#endif");
+        wln!(self, "    }}");
+        wln!(self, "}}");
         wln!(self, "static void __p_co_body(__p_co* c) {{");
-        wln!(self, "    typedef int64_t (*f1)(void*, int64_t);");
-        wln!(self, "    c->result = ((f1)c->fn)(NULL, c->arg);");
+        wln!(self, "    int64_t (*f)() = c->fn;");
+        wln!(self, "    int64_t* a = c->args;");
+        wln!(self, "    switch (c->nargs) {{");
+        wln!(self, "        case 0: c->result = ((int64_t (*)(void*))f)(NULL); break;");
+        wln!(self, "        case 1: c->result = ((int64_t (*)(void*, int64_t))f)(NULL, a[0]); break;");
+        wln!(self, "        case 2: c->result = ((int64_t (*)(void*, int64_t, int64_t))f)(NULL, a[0], a[1]); break;");
+        wln!(self, "        case 3: c->result = ((int64_t (*)(void*, int64_t, int64_t, int64_t))f)(NULL, a[0], a[1], a[2]); break;");
+        wln!(self, "        case 4: c->result = ((int64_t (*)(void*, int64_t, int64_t, int64_t, int64_t))f)(NULL, a[0], a[1], a[2], a[3]); break;");
+        wln!(self, "        case 5: c->result = ((int64_t (*)(void*, int64_t, int64_t, int64_t, int64_t, int64_t))f)(NULL, a[0], a[1], a[2], a[3], a[4]); break;");
+        wln!(self, "        case 6: c->result = ((int64_t (*)(void*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t))f)(NULL, a[0], a[1], a[2], a[3], a[4], a[5]); break;");
+        wln!(self, "        case 7: c->result = ((int64_t (*)(void*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t))f)(NULL, a[0], a[1], a[2], a[3], a[4], a[5], a[6]); break;");
+        wln!(self, "        default: c->result = ((int64_t (*)(void*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t))f)(NULL, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]); break;");
+        wln!(self, "    }}");
         wln!(self, "    c->done = 1;");
-        wln!(self, "    __P_CO_TO_SCHED();");
+        wln!(self, "    __p_co_leave();");
         wln!(self, "}}");
         wln!(self, "#ifdef _WIN32");
         wln!(self, "static void WINAPI __p_co_start(void* p) {{ __p_co_body((__p_co*)p); }}");
         wln!(self, "#else");
         wln!(self, "static void __p_co_start(unsigned lo, unsigned hi) {{ __p_co_body((__p_co*)(((uintptr_t)hi << 32) | lo)); }}");
         wln!(self, "#endif");
-        wln!(self, "int64_t p_co_go(const char* name, int64_t arg) {{");
+        wln!(self, "static __p_co* __p_co_new(const char* name, int64_t nargs, const int64_t* args) {{");
         wln!(self, "    int64_t (*fn)() = NULL;");
         wln!(self, "    for (int i = 0; i < p_thread_entry_count; i++) {{");
         wln!(self, "        if (strcmp(p_thread_entries[i].name, name) == 0) {{ fn = p_thread_entries[i].fn; break; }}");
         wln!(self, "    }}");
         wln!(self, "    if (!fn) p_panic(\"task: no such function\");");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    if (!__p_co_sched) __p_co_sched = ConvertThreadToFiber(NULL);");
+        wln!(self, "#endif");
         wln!(self, "    if (__p_co_count == __p_co_cap) {{");
         wln!(self, "        __p_co_cap = __p_co_cap ? __p_co_cap * 2 : 64;");
         wln!(self, "        __p_cos = (__p_co**)realloc(__p_cos, (size_t)__p_co_cap * sizeof(__p_co*));");
         wln!(self, "    }}");
         wln!(self, "    __p_co* c = (__p_co*)calloc(1, sizeof(__p_co));");
-        wln!(self, "    c->fn = fn; c->arg = arg;");
+        wln!(self, "    c->fn = fn; c->nargs = nargs; c->fd = -1;");
+        wln!(self, "    for (int64_t i = 0; i < nargs && i < 8; i++) c->args[i] = args[i];");
         wln!(self, "#ifdef _WIN32");
         wln!(self, "    c->fiber = CreateFiberEx(16384, 1024 * 1024, 0, __p_co_start, c);");
         wln!(self, "    if (!c->fiber) p_panic(\"task: out of memory\");");
@@ -3460,41 +3631,225 @@ impl CCodeGen {
         wln!(self, "    c->ctx.uc_link = NULL;");
         wln!(self, "    makecontext(&c->ctx, (void (*)(void))__p_co_start, 2, (unsigned)(uintptr_t)c, (unsigned)((uintptr_t)c >> 32));");
         wln!(self, "#endif");
-        wln!(self, "    __p_cos[__p_co_count] = c;");
-        wln!(self, "    return ++__p_co_count;");
+        wln!(self, "    __p_cos[__p_co_count++] = c;");
+        wln!(self, "    __p_co_total++;");
+        wln!(self, "    return c;");
         wln!(self, "}}");
-        wln!(self, "void p_co_yield(void) {{ if (__p_co_cur) {{ __P_CO_TO_SCHED(); }} }}");
-        wln!(self, "int64_t p_co_run(void) {{");
-        wln!(self, "#ifdef _WIN32");
-        wln!(self, "    if (!__p_co_sched) __p_co_sched = ConvertThreadToFiber(NULL);");
-        wln!(self, "#endif");
-        wln!(self, "    for (;;) {{");
-        wln!(self, "        int64_t live = 0;");
-        wln!(self, "        for (int64_t i = 0; i < __p_co_count; i++) {{");
-        wln!(self, "            __p_co* c = __p_cos[i];");
-        wln!(self, "            if (c->done) continue;");
-        wln!(self, "            __p_co_cur = c;");
-        wln!(self, "#ifdef _WIN32");
-        wln!(self, "            SwitchToFiber(c->fiber);");
-        wln!(self, "#else");
-        wln!(self, "            swapcontext(&__p_co_sched, &c->ctx);");
-        wln!(self, "#endif");
-        wln!(self, "            __p_co_cur = NULL;");
-        wln!(self, "            if (c->done) {{");
-        wln!(self, "#ifdef _WIN32");
-        wln!(self, "                DeleteFiber(c->fiber);");
-        wln!(self, "#else");
-        wln!(self, "                free(c->stack);");
-        wln!(self, "#endif");
-        wln!(self, "            }} else {{");
-        wln!(self, "                live++;");
-        wln!(self, "            }}");
+        wln!(self, "/* One turn of every task that can run. Returns how many are unfinished;");
+        wln!(self, "   ran says how many took their turn. */");
+        wln!(self, "static int64_t __p_co_round(int64_t* ran) {{");
+        wln!(self, "    int64_t kept = 0;");
+        wln!(self, "    *ran = 0;");
+        wln!(self, "    for (int64_t i = 0; i < __p_co_count; i++) {{");
+        wln!(self, "        __p_co* c = __p_cos[i];");
+        wln!(self, "        if (c->done) {{ if (c->detached) free(c); continue; }}");
+        wln!(self, "        if (c->awaits && c->awaits->done) c->awaits = NULL;");
+        wln!(self, "        if (!c->awaits && c->fd < 0 && !c->wake_ms) {{");
+        wln!(self, "            (*ran)++;");
+        wln!(self, "            __p_co_enter(c);");
+        wln!(self, "            if (c->done) {{ if (c->detached) free(c); continue; }}");
         wln!(self, "        }}");
-        wln!(self, "        if (live == 0) return __p_co_count;");
+        wln!(self, "        __p_cos[kept++] = c;");
+        wln!(self, "    }}");
+        wln!(self, "    __p_co_count = kept;");
+        wln!(self, "    return kept;");
+        wln!(self, "}}");
+        wln!(self, "/* Sleep until a waiting task can run, at most limit ms (-1: no limit). With");
+        wln!(self, "   ran set, only look. Panics if no task ever will. */");
+        wln!(self, "static void __p_co_wait(int64_t ran, int64_t limit) {{");
+        wln!(self, "    int64_t n = 0;");
+        wln!(self, "    int64_t timeout = ran ? 0 : limit;");
+        wln!(self, "    int64_t now = __p_co_now();");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    static P_THREAD_LOCAL WSAPOLLFD* fds = NULL;");
+        wln!(self, "#else");
+        wln!(self, "    static P_THREAD_LOCAL struct pollfd* fds = NULL;");
+        wln!(self, "#endif");
+        wln!(self, "    static P_THREAD_LOCAL int64_t cap = 0;");
+        wln!(self, "    if (__p_co_count > cap) {{");
+        wln!(self, "        cap = __p_co_count * 2;");
+        wln!(self, "        fds = realloc(fds, (size_t)cap * sizeof(*fds));");
+        wln!(self, "    }}");
+        wln!(self, "    for (int64_t i = 0; i < __p_co_count; i++) {{");
+        wln!(self, "        __p_co* c = __p_cos[i];");
+        wln!(self, "        if (c->fd >= 0) {{");
+        wln!(self, "            fds[n].fd = (c->fd);");
+        wln!(self, "            fds[n].events = c->fd_write ? POLLOUT : POLLIN;");
+        wln!(self, "            fds[n].revents = 0;");
+        wln!(self, "            n++;");
+        wln!(self, "        }}");
+        wln!(self, "        if (c->wake_ms) {{");
+        wln!(self, "            int64_t left = c->wake_ms > now ? c->wake_ms - now : 0;");
+        wln!(self, "            if (timeout < 0 || left < timeout) timeout = left;");
+        wln!(self, "        }}");
+        wln!(self, "    }}");
+        wln!(self, "    if (n == 0 && timeout < 0) p_panic(\"Tasks are deadlocked: each one awaits another\");");
+        wln!(self, "    if (n > 0) {{");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "        WSAPoll(fds, (ULONG)n, (INT)timeout);");
+        wln!(self, "#else");
+        wln!(self, "        poll(fds, (nfds_t)n, (int)timeout);");
+        wln!(self, "#endif");
+        wln!(self, "    }} else if (timeout > 0) {{");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "        Sleep((DWORD)timeout);");
+        wln!(self, "#else");
+        wln!(self, "        poll(NULL, 0, (int)timeout);");
+        wln!(self, "#endif");
+        wln!(self, "    }}");
+        wln!(self, "    now = __p_co_now();");
+        wln!(self, "    int64_t k = 0;");
+        wln!(self, "    for (int64_t i = 0; i < __p_co_count; i++) {{");
+        wln!(self, "        __p_co* c = __p_cos[i];");
+        wln!(self, "        int hit = 0;");
+        wln!(self, "        if (c->fd >= 0) {{ hit = fds[k].revents != 0; k++; }}");
+        wln!(self, "        if (hit) {{ c->ready = 1; c->fd = -1; c->wake_ms = 0; }}");
+        wln!(self, "        else if (c->wake_ms && c->wake_ms <= now) {{ c->ready = 0; c->fd = -1; c->wake_ms = 0; }}");
         wln!(self, "    }}");
         wln!(self, "}}");
-        wln!(self, "int64_t p_co_done(int64_t t) {{ return (t >= 1 && t <= __p_co_count) ? (int64_t)__p_cos[t - 1]->done : 1; }}");
-        wln!(self, "int64_t p_co_result(int64_t t) {{ return (t >= 1 && t <= __p_co_count) ? __p_cos[t - 1]->result : 0; }}");
+        wln!(self, "int64_t p_co_go(const char* name, int64_t arg) {{ return (int64_t)__p_co_new(name, 1, &arg); }}");
+        wln!(self, "int64_t p_co_async(const char* name, int64_t nargs, ...) {{");
+        wln!(self, "    int64_t args[8] = {{0}};");
+        wln!(self, "    va_list ap;");
+        wln!(self, "    va_start(ap, nargs);");
+        wln!(self, "    for (int64_t i = 0; i < nargs && i < 8; i++) args[i] = va_arg(ap, int64_t);");
+        wln!(self, "    va_end(ap);");
+        wln!(self, "    __p_co* c = __p_co_new(name, nargs, args);");
+        wln!(self, "    c->back = __p_co_cur;");
+        wln!(self, "    __p_co_enter(c);");
+        wln!(self, "    return (int64_t)((uint64_t)__P_CO_TAG << 48 | (uint64_t)(uintptr_t)c);");
+        wln!(self, "}}");
+        wln!(self, "void p_co_yield(void) {{ if (__p_co_cur) __p_co_leave(); }}");
+        wln!(self, "int64_t p_co_run(void) {{");
+        wln!(self, "    for (;;) {{");
+        wln!(self, "        int64_t ran;");
+        wln!(self, "        if (__p_co_round(&ran) == 0) return __p_co_total;");
+        wln!(self, "        __p_co_wait(ran, -1);");
+        wln!(self, "    }}");
+        wln!(self, "}}");
+        wln!(self, "static int64_t __p_co_await(int64_t future) {{");
+        wln!(self, "    __p_co* c = (__p_co*)(uintptr_t)((uint64_t)future & 0xFFFFFFFFFFFFULL);");
+        wln!(self, "    while (!c->done) {{");
+        wln!(self, "        if (__p_co_cur) {{");
+        wln!(self, "            __p_co_cur->awaits = c;");
+        wln!(self, "            __p_co_leave();");
+        wln!(self, "        }} else {{");
+        wln!(self, "            int64_t ran;");
+        wln!(self, "            __p_co_round(&ran);");
+        wln!(self, "            if (!c->done) __p_co_wait(ran, -1);");
+        wln!(self, "        }}");
+        wln!(self, "    }}");
+        wln!(self, "    return c->result;");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_co_sleep(int64_t ms) {{");
+        wln!(self, "    if (__p_co_cur) {{");
+        wln!(self, "        __p_co_cur->wake_ms = __p_co_now() + (ms > 0 ? ms : 0) + 1;");
+        wln!(self, "        __p_co_leave();");
+        wln!(self, "        return 0;");
+        wln!(self, "    }}");
+        wln!(self, "    int64_t end = __p_co_now() + ms;");
+        wln!(self, "    for (;;) {{");
+        wln!(self, "        int64_t ran;");
+        wln!(self, "        int64_t live = __p_co_round(&ran);");
+        wln!(self, "        int64_t left = end - __p_co_now();");
+        wln!(self, "        if (left <= 0) return 0;");
+        wln!(self, "        if (live) __p_co_wait(ran, left);");
+        wln!(self, "        else {{");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "            Sleep((DWORD)left);");
+        wln!(self, "#else");
+        wln!(self, "            poll(NULL, 0, (int)left);");
+        wln!(self, "#endif");
+        wln!(self, "        }}");
+        wln!(self, "    }}");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_co_wait_fd(int64_t fd, int64_t write, int64_t timeout_ms) {{");
+        wln!(self, "    if (__p_co_cur) {{");
+        wln!(self, "        __p_co_cur->fd = fd;");
+        wln!(self, "        __p_co_cur->fd_write = write;");
+        wln!(self, "        __p_co_cur->wake_ms = timeout_ms >= 0 ? __p_co_now() + timeout_ms + 1 : 0;");
+        wln!(self, "        __p_co_leave();");
+        wln!(self, "        return __p_co_cur->ready;");
+        wln!(self, "    }}");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    WSAPOLLFD one;");
+        wln!(self, "    one.fd = (SOCKET)fd; one.events = write ? POLLOUT : POLLIN; one.revents = 0;");
+        wln!(self, "    return WSAPoll(&one, 1, (INT)timeout_ms) > 0;");
+        wln!(self, "#else");
+        wln!(self, "    struct pollfd one;");
+        wln!(self, "    one.fd = (int)fd; one.events = write ? POLLOUT : POLLIN; one.revents = 0;");
+        wln!(self, "    return poll(&one, 1, (int)timeout_ms) > 0;");
+        wln!(self, "#endif");
+        wln!(self, "}}");
+        wln!(self, "void p_co_detach(int64_t t) {{");
+        wln!(self, "    __p_co* c = (__p_co*)(uintptr_t)t;");
+        wln!(self, "    if (c->done) free(c);");
+        wln!(self, "    else c->detached = 1;");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_co_done(int64_t t) {{ return (int64_t)((__p_co*)(uintptr_t)t)->done; }}");
+        wln!(self, "int64_t p_co_result(int64_t t) {{ return ((__p_co*)(uintptr_t)t)->result; }}");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "#define __P_CO_BLOCKED() (WSAGetLastError() == WSAEWOULDBLOCK)");
+        wln!(self, "#else");
+        wln!(self, "#include <errno.h>");
+        wln!(self, "#include <fcntl.h>");
+        wln!(self, "#define __P_CO_BLOCKED() (errno == EAGAIN || errno == EWOULDBLOCK)");
+        wln!(self, "#endif");
+        wln!(self, "static void __p_co_nonblock(int64_t fd) {{");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    u_long on = 1;");
+        wln!(self, "    ioctlsocket((SOCKET)fd, FIONBIO, &on);");
+        wln!(self, "#else");
+        wln!(self, "    fcntl((int)fd, F_SETFL, fcntl((int)fd, F_GETFL, 0) | O_NONBLOCK);");
+        wln!(self, "#endif");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_co_accept(int64_t fd) {{");
+        wln!(self, "    p_co_wait_fd(fd, 0, -1);");
+        wln!(self, "    int64_t c = p_socket_accept(fd);");
+        wln!(self, "    if (c >= 0) __p_co_nonblock(c);");
+        wln!(self, "    return c;");
+        wln!(self, "}}");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "static void init_winsock(void);");
+        wln!(self, "#endif");
+        wln!(self, "int64_t p_co_connect(const char* host, int64_t port) {{");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    init_winsock();");
+        wln!(self, "#endif");
+        wln!(self, "    char service[16];");
+        wln!(self, "    struct addrinfo hints, *res = NULL;");
+        wln!(self, "    memset(&hints, 0, sizeof(hints));");
+        wln!(self, "    hints.ai_family = AF_INET;");
+        wln!(self, "    hints.ai_socktype = SOCK_STREAM;");
+        wln!(self, "    snprintf(service, sizeof(service), \"%lld\", (long long)port);");
+        wln!(self, "    if (getaddrinfo(host, service, &hints, &res) != 0 || !res) return -1;");
+        wln!(self, "    int64_t s = (int64_t)socket(res->ai_family, res->ai_socktype, 0);");
+        wln!(self, "    if (s >= 0 && connect((SOCKET)s, res->ai_addr, (int)res->ai_addrlen) != 0) {{");
+        wln!(self, "        p_socket_close(s);");
+        wln!(self, "        s = -1;");
+        wln!(self, "    }}");
+        wln!(self, "    freeaddrinfo(res);");
+        wln!(self, "    if (s >= 0) __p_co_nonblock(s);");
+        wln!(self, "    return s;");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_co_recv(int64_t fd, int64_t buf, int64_t len, int64_t timeout_ms) {{");
+        wln!(self, "    for (;;) {{");
+        wln!(self, "        int64_t n = p_socket_read(fd, (char*)(uintptr_t)buf, len);");
+        wln!(self, "        if (n >= 0) return n;");
+        wln!(self, "        if (!__P_CO_BLOCKED()) return -1;");
+        wln!(self, "        if (!p_co_wait_fd(fd, 0, timeout_ms)) return -2;");
+        wln!(self, "    }}");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_co_send(int64_t fd, int64_t buf, int64_t len) {{");
+        wln!(self, "    int64_t done = 0;");
+        wln!(self, "    while (done < len) {{");
+        wln!(self, "        int64_t n = p_socket_write(fd, (const char*)(uintptr_t)buf + done, len - done);");
+        wln!(self, "        if (n > 0) done += n;");
+        wln!(self, "        else if (n < 0 && !__P_CO_BLOCKED()) return -1;");
+        wln!(self, "        else if (!p_co_wait_fd(fd, 1, 30000)) return -1;");
+        wln!(self, "    }}");
+        wln!(self, "    return done;");
+        wln!(self, "}}");
         wln!(self, "static void* p_thread_wrapper(void* arg) {");
         wln!(self, "    p_thread_arg_t* ta = (p_thread_arg_t*)arg;");
         wln!(self, "    int64_t result = 0;");
@@ -3536,6 +3891,7 @@ impl CCodeGen {
         wln!(self, "    return -(int64_t)(idx + 1);");
         wln!(self, "}");
         wln!(self, "int64_t p_task_poll(int64_t future) {");
+        wln!(self, "    if (((uint64_t)future >> 48) == 0x7FA5) return p_future_poll(future);");
         wln!(self, "    if (future >= 0) return future; // eager future");
         wln!(self, "    int idx = -(future + 1);");
         wln!(self, "    if (idx < 0 || idx >= p_thread_handle_count) return 0;");
@@ -3547,6 +3903,7 @@ impl CCodeGen {
         wln!(self, "    return p_task_results[idx];");
         wln!(self, "}");
         wln!(self, "bool p_task_is_ready(int64_t future) {");
+        wln!(self, "    if (((uint64_t)future >> 48) == 0x7FA5) return p_co_done(future & 0xFFFFFFFFFFFFLL) != 0;");
         wln!(self, "    if (future >= 0) return true;");
         wln!(self, "    int idx = -(future + 1);");
         wln!(self, "    if (idx < 0 || idx >= p_thread_handle_count) return false;");
@@ -3585,6 +3942,7 @@ impl CCodeGen {
         wln!(self, "}");
         // A2: Non-blocking poll — returns PENDING_SENTINEL if task not done
         wln!(self, "int64_t p_task_poll_nonblocking(int64_t future) {");
+        wln!(self, "    if (((uint64_t)future >> 48) == 0x7FA5) return p_co_done(future & 0xFFFFFFFFFFFFLL) ? p_future_poll(future) : (int64_t)0x8000000000000001LL;");
         wln!(self, "    if (future >= 0) return future; // eager future");
         wln!(self, "    int idx = -(future + 1);");
         wln!(self, "    if (idx < 0 || idx >= p_thread_handle_count) return 0;");

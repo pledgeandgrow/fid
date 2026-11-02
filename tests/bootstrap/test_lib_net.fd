@@ -1,0 +1,93 @@
+// stdlib/net: the byte buffer (big-endian writes and reads, bounds, reset,
+// remaining), the constants, and the state of a reliable connection that
+// has not sent anything. Sockets, sending and receiving go through the
+// pledge_net functions (real sockets) and are not run here.
+use net;
+
+fn main() -> i64 {
+    println(AF_INET);
+    println(SOCK_DGRAM);
+    println(SOCK_STREAM);
+    println(MSG_TYPE_DATA);
+    println(MSG_TYPE_ACK);
+    println(MSG_TYPE_PING);
+    println(MSG_TYPE_PONG);
+
+    // a buffer of 16 bytes, all zero
+    var b = net_buffer_create(16);
+    println(b.size);
+    println(b.pos);
+    println(b.data.len());
+    println(net_buffer_remaining(&b));
+
+    // writes are big-endian and move the position
+    net_buffer_write_u8(&mut b, 0xAB);
+    net_buffer_write_u16(&mut b, 0x1234);
+    net_buffer_write_u32(&mut b, 0xDEADBEEF);
+    println(b.pos);
+    println(net_buffer_remaining(&b));
+    println(b.data.get(0));
+    println(b.data.get(1));
+    println(b.data.get(2));
+    println(b.data.get(3));
+    println(b.data.get(4));
+    println(b.data.get(5));
+    println(b.data.get(6));
+    println(b.data.get(7));
+    // values are cut to the byte / half-word / word they are written as
+    net_buffer_write_u8(&mut b, 0x1FF);
+    println(b.data.get(7));
+    net_buffer_write_u16(&mut b, 0x12345);
+    println(b.data.get(8));
+    println(b.data.get(9));
+    net_buffer_write_u8(&mut b, -1);
+    println(b.data.get(10));
+
+    // reading back from the start
+    net_buffer_reset(&mut b);
+    println(b.pos);
+    println(net_buffer_read_u8(&mut b));
+    println(net_buffer_read_u16(&mut b));
+    println(net_buffer_read_u32(&mut b));
+    println(b.pos);
+    println(net_buffer_read_u8(&mut b));
+    println(net_buffer_read_u16(&mut b));
+    println(net_buffer_read_u8(&mut b));
+    println(b.pos);
+
+    // a full buffer ignores writes, and an exhausted one reads zeros
+    var s = net_buffer_create(3);
+    net_buffer_write_u8(&mut s, 1);
+    net_buffer_write_u8(&mut s, 2);
+    net_buffer_write_u8(&mut s, 3);
+    net_buffer_write_u8(&mut s, 4);
+    println(s.pos);
+    println(net_buffer_remaining(&s));
+    println(s.data.len());
+    net_buffer_write_u32(&mut s, 0x01020304);
+    println(s.pos);
+    println(s.data.get(0));
+    net_buffer_reset(&mut s);
+    println(net_buffer_read_u32(&mut s));
+    println(s.pos);
+    println(net_buffer_read_u8(&mut s));
+    // u16 and u32 writes that only half fit keep the bytes that fit
+    var h = net_buffer_create(3);
+    net_buffer_write_u8(&mut h, 9);
+    net_buffer_write_u32(&mut h, 0x0A0B0C0D);
+    println(h.data.get(1));
+    println(h.data.get(2));
+    println(h.pos);
+    // an empty buffer
+    var z = net_buffer_create(0);
+    net_buffer_write_u8(&mut z, 1);
+    println(z.pos);
+    println(net_buffer_read_u8(&mut z));
+    println(net_buffer_remaining(&z));
+    // an unsigned 32-bit read is never negative
+    var n = net_buffer_create(4);
+    net_buffer_write_u32(&mut n, 0xFFFFFFFF);
+    net_buffer_reset(&mut n);
+    println(net_buffer_read_u32(&mut n));
+    return 0;
+}

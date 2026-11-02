@@ -1,0 +1,61 @@
+// stdlib/sys: system information. The numbers differ between machines, so
+// the test checks what must always hold: counts are at least 1, the page
+// size is a power of two, the memory conversions agree with each other,
+// the 32/64-bit and little/big-endian answers are opposites, and the info
+// struct matches the individual calls. The libc calls (sysconf, getpid,
+// ...) are FFI, so this runs only on the native backends.
+use sys;
+
+fn say_yes(b: bool) {
+    if b { println("yes"); } else { println("no"); }
+}
+
+fn main() -> i64 {
+    say_yes(sys_cpu_count() >= 1);
+    say_yes(sys_cpu_count_conf() >= 1);
+    var ps = sys_page_size();
+    say_yes(ps > 0);
+    say_yes((ps & (ps - 1)) == 0);
+    say_yes(sys_pid() > 0);
+    say_yes(sys_ppid() >= 0);
+    say_yes(sys_uid() >= 0);
+    say_yes(sys_gid() >= 0);
+    say_yes(sys_clk_tck() > 0);
+    say_yes(str_len(sys_arch()) > 0);
+
+    // the memory figures are consistent with each other
+    var total = sys_total_memory();
+    say_yes(total >= 0);
+    say_yes(sys_total_memory_kb() == total / 1024);
+    say_yes(sys_total_memory_mb() == total / 1048576);
+    say_yes(sys_total_memory_gb() == total / 1073741824);
+    say_yes(sys_available_memory() >= 0);
+
+    // opposites
+    say_yes(sys_is_64bit() != sys_is_32bit());
+    say_yes(sys_is_little_endian() != sys_is_big_endian());
+    // at most one platform name matches
+    var n: i64 = 0;
+    if sys_is_linux() { n = n + 1; }
+    if sys_is_macos() { n = n + 1; }
+    if sys_is_windows() { n = n + 1; }
+    say_yes(n <= 1);
+
+    // the info struct and its text form
+    var info = sys_info();
+    say_yes(info.cpu_count >= 1);
+    say_yes(info.page_size == ps);
+    say_yes(info.pid > 0);
+    say_yes(info.arch == sys_arch());
+    var text = sys_info_string(info);
+    say_yes(str_contains(text, "OS: "));
+    say_yes(str_contains(text, "\nArch: "));
+    say_yes(str_contains(text, "\nCPUs: "));
+    say_yes(str_contains(text, "\nPage size: "));
+    say_yes(str_contains(text, "\nUID: "));
+
+    // constants
+    println(_SC_PAGESIZE);
+    println(_SC_NPROCESSORS_ONLN);
+    return 0;
+}

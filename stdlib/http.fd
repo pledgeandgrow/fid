@@ -1,85 +1,636 @@
-// Pledge HTTP server standard library — Phase 5D.3
+// Fides HTTP standard library
 //
-// HTTP server for the "Web & Cloud" platform milestone.
+// HTTP/1.1 in Fides over sockets: requests with Content-Length and chunked
+// bodies, keep-alive, pipelining. Each connection is a task, so one thread
+// serves many clients and a slow one holds up nobody.
 //
-// Design: Socket primitives are implemented as native builtins (p_socket_*).
-// HTTP request parsing and response writing are implemented in Pledge.
-// This is a blocking, single-threaded server — effect handlers (Phase 2B)
-// will replace the blocking calls with non-blocking I/O later.
+// Usage:
+//   use http;
 //
-// Builtins (implemented in interp.rs):
-//   p_socket_listen(port: i64) -> i64       — create listening socket, return fd
-//   p_socket_accept(fd: i64) -> i64         — accept connection, return client fd
-//   p_socket_read(fd: i64, buf: str, n: i64) -> str  — read up to n bytes
-//   p_socket_write(fd: i64, data: str) -> i64       — write data, return bytes written
-//   p_socket_close(fd: i64) -> void         — close socket
-//   p_socket_recv_str(fd: i64) -> str       — read until \r\n\r\n (HTTP headers)
+//   fn route(req: HttpRequest) -> str {
+//       if req.path == "/" {
+//           return build_response(200, "text/plain", "Hello!\n");
+//       }
+//       return build_response(404, "text/plain", "Not Found\n");
+//   }
+//
+//   fn main() -> i64 {
+//       http_serve(8080, route);
+//       return 0;
+//   }
+//
+// A body is text: it cannot hold a zero byte. Module `https` adds TLS and
+// making requests.
 
 module http;
 
 use json;
+use task;
 
-/// HTTP request structure (parsed from raw HTTP request text).
-/// Fields are accessed via builtin functions since Pledge doesn't yet
-/// support string fields in structs (strings are opaque handles).
-//
-// We represent the request as a JSON string for easy field access:
-// {"method":"GET","path":"/","headers":{...},"body":"..."}
-
-/// Parse an HTTP request from raw text. Returns a JSON string with
-/// method, path, headers, and body fields.
-pub fn parse_request(raw: str) -> str {
-    p_http_parse_request(raw)
+extern "C" include "<string.h>" {
+    fn memmove as hc_memmove(dst: *u8, src: *u8, n: i64) -> *u8;
 }
 
-/// Build an HTTP response string from status, content-type, and body.
-pub fn build_response(status: i64, content_type: str, body: str) -> str {
-    p_http_build_response(status, content_type, body)
+/// Largest request head and body a server accepts.
+const HTTP_MAX_HEAD: i64 = 65536;
+const HTTP_MAX_BODY: i64 = 16777216;
+/// A connection that sends nothing for this long is closed (ms).
+const HTTP_IDLE_MS: i64 = 30000;
+
+/// A message as it arrived. For a response, `method` is the protocol word and
+/// `target` the status code.
+pub struct HttpRequest {
+    pub method: str,
+    pub target: str,
+    pub path: str,
+    pub query: str,
+    pub version: str,
+    pub names: Vec<str>,
+    pub vals: Vec<str>,
+    pub body: str,
 }
 
-/// Start an HTTP server on the given port. The handler function is called
-/// for each connection with the raw request text. The handler returns
-/// the response text to send back.
-/// This is a blocking call — it runs forever until the process is killed.
-pub fn serve(port: i64) -> void {
-    var fd = p_socket_listen(port);
-    if fd < 0 {
-        print("Failed to listen on port\n");
-        return;
+/// Are two header names or tokens the same, ignoring case?
+fn hs_same(a: str, b: str) -> bool {
+    val n: i64 = str_len(a);
+    if n != str_len(b) {
+        return false;
     }
-    print("Server listening on port ");
-    print(port);
-    print("\n");
-    while true {
-        var client = p_socket_accept(fd);
-        if client < 0 {
-            return;
+    var i: i64 = 0;
+    while i < n {
+        if char_to_lower(str_byte_at(a, i)) != char_to_lower(str_byte_at(b, i)) {
+            return false;
         }
-        var raw = p_socket_recv_str(client);
-        var response = handle_request(raw);
-        p_socket_write(client, response);
-        p_socket_close(client);
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The value of header `name`, any case, or "".
+pub fn http_header(req: HttpRequest, name: str) -> str {
+    var i: i64 = 0;
+    while i < req.names.len() {
+        if hs_same(req.names.get(i), name) {
+            return req.vals.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// Should the connection stay open after this request?
+pub fn http_keep_alive(req: HttpRequest) -> bool {
+    val conn: str = http_header(req, "connection");
+    if hs_same(conn, "close") {
+        return false;
+    }
+    if req.version == "1.0" {
+        return hs_same(conn, "keep-alive");
+    }
+    return true;
+}
+
+/// The offset of byte `b` in s[from..to), or `to`.
+fn hs_find(s: str, b: i64, from: i64, to: i64) -> i64 {
+    var i: i64 = from;
+    while i < to {
+        if str_byte_at(s, i) == b {
+            return i;
+        }
+        i = i + 1;
+    }
+    return to;
+}
+
+/// The offset of the "\r\n" at or after `from`, or `n`.
+fn hs_line_end(s: str, from: i64, n: i64) -> i64 {
+    var i: i64 = from;
+    while i + 1 < n {
+        if str_byte_at(s, i) == 13 && str_byte_at(s, i + 1) == 10 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Parse a head: the first line and the headers.
+pub fn http_parse_head(head: str) -> HttpRequest {
+    var req: HttpRequest = HttpRequest {
+        method: "", target: "", path: "", query: "", version: "",
+        names: Vec::new(), vals: Vec::new(), body: "",
+    };
+    val n: i64 = str_len(head);
+    val line_end: i64 = hs_line_end(head, 0, n);
+    val sp1: i64 = hs_find(head, 32, 0, line_end);
+    if sp1 >= line_end {
+        return req;
+    }
+    req.method = str_slice(head, 0, sp1);
+    val sp2: i64 = hs_find(head, 32, sp1 + 1, line_end);
+    req.target = str_slice(head, sp1 + 1, sp2);
+    if sp2 < line_end {
+        var v: i64 = sp2 + 1;
+        if str_byte_at(head, v) == 72 && line_end - v > 5 {
+            v = v + 5;      // HTTP/
+        }
+        req.version = str_slice(head, v, line_end);
+    }
+    val q: i64 = hs_find(head, 63, sp1 + 1, sp2);
+    req.path = str_slice(head, sp1 + 1, q);
+    if q < sp2 {
+        req.query = str_slice(head, q + 1, sp2);
+    }
+    var at: i64 = line_end + 2;
+    while at < n {
+        val end: i64 = hs_line_end(head, at, n);
+        if end == at {
+            return req;
+        }
+        val colon: i64 = hs_find(head, 58, at, end);
+        if colon > at && colon < end {
+            var v: i64 = colon + 1;
+            while v < end && (str_byte_at(head, v) == 32 || str_byte_at(head, v) == 9) {
+                v = v + 1;
+            }
+            var e: i64 = end;
+            while e > v && (str_byte_at(head, e - 1) == 32 || str_byte_at(head, e - 1) == 9) {
+                e = e - 1;
+            }
+            req.names.push(str_slice(head, at, colon));
+            req.vals.push(str_slice(head, v, e));
+        }
+        at = end + 2;
+    }
+    return req;
+}
+
+fn hs_free(s: str) {
+    if str_len(s) > 0 {
+        p_free(s as i64);
     }
 }
 
-/// Default request handler — echoes the request path.
-/// Override this in your program by defining your own `handle_request`.
-pub fn handle_request(raw: str) -> str {
-    var req = parse_request(raw);
-    var path = json_get(req, "path");
-    var body = "Hello from Pledge! Path: " + path + "\n";
-    build_response(200, "text/plain", body)
+/// Free a request's strings, for a handler that keeps none of them.
+fn http_request_free(req: HttpRequest) {
+    hs_free(req.method);
+    hs_free(req.target);
+    hs_free(req.path);
+    hs_free(req.query);
+    hs_free(req.version);
+    hs_free(req.body);
+    var i: i64 = 0;
+    while i < req.names.len() {
+        hs_free(req.names.get(i));
+        hs_free(req.vals.get(i));
+        i = i + 1;
+    }
+    Vec_drop(req.names as i64);
+    Vec_drop(req.vals as i64);
+}
+
+/// Parse raw request text into a JSON string with method, path, version,
+/// headers, and body fields.
+pub fn parse_request(raw: str) -> str {
+    val end: i64 = str_find(raw, "\r\n\r\n");
+    var req: HttpRequest = http_parse_head(raw);
+    var body: str = "";
+    if end >= 0 {
+        body = str_slice(raw, end + 4, str_len(raw));
+    }
+    var out: str = "{\"method\":" + json_string(req.method) + ",\"path\":" + json_string(req.target)
+        + ",\"version\":" + json_string(req.version) + ",\"headers\":{";
+    var i: i64 = 0;
+    while i < req.names.len() {
+        if i > 0 {
+            out = out + ",";
+        }
+        out = out + json_string(req.names.get(i)) + ":" + json_string(req.vals.get(i));
+        i = i + 1;
+    }
+    return out + "},\"body\":" + json_string(body) + "}";
+}
+
+/// Build an HTTP response from status, content-type, and body.
+pub fn build_response(status: i64, content_type: str, body: str) -> str {
+    return build_response_headers(status, content_type, "", body);
+}
+
+/// A response with extra headers, each "Name: value\r\n".
+pub fn build_response_headers(status: i64, content_type: str, headers: str, body: str) -> str {
+    return "HTTP/1.1 " + int_to_str(status) + " " + status_text(status)
+        + "\r\nContent-Type: " + content_type + "\r\n" + headers
+        + "Content-Length: " + int_to_str(str_len(body)) + "\r\n\r\n" + body;
 }
 
 /// HTTP status codes as strings.
 pub fn status_text(code: i64) -> str {
     if code == 200 { return "OK"; }
     if code == 201 { return "Created"; }
+    if code == 202 { return "Accepted"; }
     if code == 204 { return "No Content"; }
+    if code == 301 { return "Moved Permanently"; }
+    if code == 302 { return "Found"; }
+    if code == 304 { return "Not Modified"; }
     if code == 400 { return "Bad Request"; }
+    if code == 401 { return "Unauthorized"; }
+    if code == 403 { return "Forbidden"; }
     if code == 404 { return "Not Found"; }
+    if code == 405 { return "Method Not Allowed"; }
+    if code == 408 { return "Request Timeout"; }
+    if code == 409 { return "Conflict"; }
+    if code == 413 { return "Payload Too Large"; }
+    if code == 429 { return "Too Many Requests"; }
+    if code == 431 { return "Request Header Fields Too Large"; }
     if code == 500 { return "Internal Server Error"; }
-    return "Unknown"
+    if code == 501 { return "Not Implemented"; }
+    if code == 502 { return "Bad Gateway"; }
+    if code == 503 { return "Service Unavailable"; }
+    if code == 504 { return "Gateway Timeout"; }
+    return "Unknown";
+}
+
+// ─── Connections ──────────────────────────────────────────────────────────
+// A connection is a block of words: socket, TLS session (0: none), read buffer,
+// its size, the bytes in it, the first byte not yet consumed.
+
+fn hc_get(c: i64, i: i64) -> i64 {
+    var p: *mut i64 = c + i * 8;
+    var v: i64 = 0;
+    unsafe { v = *p; }
+    return v;
+}
+
+fn hc_set(c: i64, i: i64, v: i64) {
+    var p: *mut i64 = c + i * 8;
+    unsafe { *p = v; }
+}
+
+fn hc_byte(addr: i64) -> i64 {
+    var p: *mut u8 = addr;
+    var v: i64 = 0;
+    unsafe { v = (*p) as i64; }
+    return v;
+}
+
+fn hc_set_byte(addr: i64, v: i64) {
+    var p: *mut u8 = addr;
+    unsafe { *p = v as u8; }
+}
+
+fn hc_copy(dst: i64, src: i64, n: i64) {
+    hc_memmove(dst as *u8, src as *u8, n);
+}
+
+fn hc_no_tls_recv(tls: i64, buf: i64, n: i64, timeout_ms: i64) -> i64 { return -1; }
+fn hc_no_tls_send(tls: i64, buf: i64, n: i64) -> i64 { return -1; }
+fn hc_no_tls_close(tls: i64) -> i64 { return 0; }
+fn hc_no_tls_accept(fd: i64) -> i64 { return 0; }
+
+// Module `https` sets these
+var http_tls_recv: fn(i64, i64, i64, i64) -> i64 = hc_no_tls_recv;
+var http_tls_send: fn(i64, i64, i64) -> i64 = hc_no_tls_send;
+var http_tls_close: fn(i64) -> i64 = hc_no_tls_close;
+var http_tls_accept: fn(i64) -> i64 = hc_no_tls_accept;
+
+/// For module `https`: how to read, write, close and accept a TLS session.
+pub fn http_set_tls(recv: fn(i64, i64, i64, i64) -> i64, send: fn(i64, i64, i64) -> i64, close: fn(i64) -> i64,
+                    accept: fn(i64) -> i64) {
+    http_tls_recv = recv;
+    http_tls_send = send;
+    http_tls_close = close;
+    http_tls_accept = accept;
+}
+
+/// A connection on a connected socket, with a TLS session or 0.
+pub fn http_conn_new(fd: i64, tls: i64) -> i64 {
+    val c: i64 = p_malloc(48);
+    hc_set(c, 0, fd);
+    hc_set(c, 1, tls);
+    hc_set(c, 2, p_malloc(8192));
+    hc_set(c, 3, 8192);
+    hc_set(c, 4, 0);
+    hc_set(c, 5, 0);
+    return c;
+}
+
+pub fn http_conn_close(c: i64) {
+    if hc_get(c, 1) != 0 {
+        val close: fn(i64) -> i64 = http_tls_close;
+        close(hc_get(c, 1));
+    }
+    p_socket_close(hc_get(c, 0));
+    p_free(hc_get(c, 2));
+    p_free(c);
+}
+
+/// More bytes into the buffer. Returns how many; 0 at end of input, below 0 on
+/// an error or a timeout.
+fn hc_fill(c: i64, timeout_ms: i64) -> i64 {
+    var buf: i64 = hc_get(c, 2);
+    var cap: i64 = hc_get(c, 3);
+    var len: i64 = hc_get(c, 4);
+    val pos: i64 = hc_get(c, 5);
+    if pos > 0 {
+        hc_copy(buf, buf + pos, len - pos);
+        len = len - pos;
+        hc_set(c, 4, len);
+        hc_set(c, 5, 0);
+    }
+    if len + 1 >= cap {
+        val bigger: i64 = p_malloc(cap * 2);
+        hc_copy(bigger, buf, len);
+        p_free(buf);
+        buf = bigger;
+        cap = cap * 2;
+        hc_set(c, 2, buf);
+        hc_set(c, 3, cap);
+    }
+    var n: i64 = 0;
+    if hc_get(c, 1) != 0 {
+        val recv: fn(i64, i64, i64, i64) -> i64 = http_tls_recv;
+        n = recv(hc_get(c, 1), buf + len, cap - len - 1, timeout_ms);
+    } else {
+        n = p_co_recv(hc_get(c, 0), buf + len, cap - len - 1, timeout_ms);
+    }
+    if n > 0 {
+        hc_set(c, 4, len + n);
+    }
+    return n;
+}
+
+/// The bytes at addr as a string.
+fn hc_text(addr: i64, n: i64) -> str {
+    val copy: i64 = p_malloc(n + 1);
+    hc_copy(copy, addr, n);
+    hc_set_byte(copy + n, 0);
+    return copy as str;
+}
+
+/// The offset of the next "\r\n" from `from`, past the first unread byte, or -1.
+fn hc_find_line(c: i64, from: i64) -> i64 {
+    val buf: i64 = hc_get(c, 2) + hc_get(c, 5);
+    val n: i64 = hc_get(c, 4) - hc_get(c, 5);
+    var i: i64 = from;
+    while i + 1 < n {
+        if hc_byte(buf + i) == 13 && hc_byte(buf + i + 1) == 10 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// The offset of the "\r\n\r\n" that ends a head, or -1.
+fn hc_find_head(c: i64) -> i64 {
+    var from: i64 = 0;
+    while true {
+        val at: i64 = hc_find_line(c, from);
+        if at < 0 {
+            return -1;
+        }
+        val buf: i64 = hc_get(c, 2) + hc_get(c, 5);
+        if at + 3 < hc_get(c, 4) - hc_get(c, 5) && hc_byte(buf + at + 2) == 13 && hc_byte(buf + at + 3) == 10 {
+            return at;
+        }
+        from = at + 2;
+    }
+    return -1;
+}
+
+/// Take `n` bytes off the buffer, reading more as needed; "" if the input ends.
+fn hc_take(c: i64, n: i64, timeout_ms: i64) -> str {
+    while hc_get(c, 4) - hc_get(c, 5) < n {
+        if hc_fill(c, timeout_ms) <= 0 {
+            return "";
+        }
+    }
+    val out: str = hc_text(hc_get(c, 2) + hc_get(c, 5), n);
+    hc_set(c, 5, hc_get(c, 5) + n);
+    return out;
+}
+
+/// One line, without its "\r\n".
+fn hc_line(c: i64, timeout_ms: i64) -> str {
+    var at: i64 = hc_find_line(c, 0);
+    while at < 0 {
+        if hc_get(c, 4) - hc_get(c, 5) > HTTP_MAX_HEAD || hc_fill(c, timeout_ms) <= 0 {
+            return "";
+        }
+        at = hc_find_line(c, 0);
+    }
+    val out: str = hc_text(hc_get(c, 2) + hc_get(c, 5), at);
+    hc_set(c, 5, hc_get(c, 5) + at + 2);
+    return out;
+}
+
+/// Was this string allocated, as opposed to a constant in the program?
+fn hs_allocated(s: str) -> bool {
+    return ((hc_get(s as i64, -1) >> 48) & 65535) == 61918 && ((hc_get(s as i64, -1) >> 40) & 255) == 90;
+}
+
+fn hc_hex(s: str) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val b: i64 = str_byte_at(s, i);
+        if b >= 48 && b <= 57 {
+            n = n * 16 + b - 48;
+        } else if b >= 97 && b <= 102 {
+            n = n * 16 + b - 87;
+        } else if b >= 65 && b <= 70 {
+            n = n * 16 + b - 55;
+        } else {
+            return n;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// A chunked body, or "" when it breaks off or passes the limit.
+fn hc_chunked(c: i64, timeout_ms: i64) -> str {
+    var body: str = "";
+    while true {
+        val size: i64 = hc_hex(hc_line(c, timeout_ms));
+        if size == 0 {
+            break;
+        }
+        if str_len(body) + size > HTTP_MAX_BODY {
+            return "";
+        }
+        body = body + hc_take(c, size, timeout_ms);
+        hc_line(c, timeout_ms);
+    }
+    // Trailers, then the empty line
+    while hc_line(c, timeout_ms) != "" {
+    }
+    return body;
+}
+
+/// A response body that runs until the connection closes.
+fn hc_to_end(c: i64, timeout_ms: i64) -> str {
+    while hc_get(c, 4) - hc_get(c, 5) <= HTTP_MAX_BODY && hc_fill(c, timeout_ms) > 0 {
+    }
+    val n: i64 = hc_get(c, 4) - hc_get(c, 5);
+    return hc_take(c, n, timeout_ms);
+}
+
+/// Read a head and its body off the connection. `method` is "" at the end of the
+/// input, on a timeout, or when the message is too large. A response with no
+/// length reads to the end when `to_end` is set.
+pub fn http_read_message(c: i64, timeout_ms: i64, to_end: bool) -> HttpRequest {
+    var at: i64 = hc_find_head(c);
+    while at < 0 {
+        if hc_get(c, 4) - hc_get(c, 5) > HTTP_MAX_HEAD || hc_fill(c, timeout_ms) <= 0 {
+            return http_parse_head("");
+        }
+        at = hc_find_head(c);
+    }
+    val head: str = hc_text(hc_get(c, 2) + hc_get(c, 5), at);
+    hc_set(c, 5, hc_get(c, 5) + at + 4);
+    var msg: HttpRequest = http_parse_head(head);
+    hs_free(head);
+    val len: str = http_header(msg, "content-length");
+    if hs_same(http_header(msg, "transfer-encoding"), "chunked") {
+        msg.body = hc_chunked(c, timeout_ms);
+    } else if len != "" {
+        val n: i64 = str_parse_int(len);
+        if n > HTTP_MAX_BODY {
+            msg.method = "";
+            return msg;
+        }
+        if n > 0 {
+            msg.body = hc_take(c, n, timeout_ms);
+        }
+    } else if to_end {
+        msg.body = hc_to_end(c, timeout_ms);
+    }
+    return msg;
+}
+
+/// Write the whole string. Returns false if the connection failed.
+pub fn http_conn_write(c: i64, data: str) -> bool {
+    val n: i64 = str_len(data);
+    if hc_get(c, 1) != 0 {
+        val send: fn(i64, i64, i64) -> i64 = http_tls_send;
+        return send(hc_get(c, 1), data as i64, n) == n;
+    }
+    return p_co_send(hc_get(c, 0), data as i64, n) == n;
+}
+
+// ─── Serving ──────────────────────────────────────────────────────────────
+
+fn http_not_found(req: HttpRequest) -> str {
+    return build_response(404, "text/plain", "Not Found\n");
+}
+
+var http_handler: fn(HttpRequest) -> str = http_not_found;
+var http_secure: bool = false;
+var http_scoped: bool = false;
+
+/// Serve one connection until it closes. The TLS handshake is here, so a client
+/// that stalls holds up only its own task.
+pub fn http_conn_task(c: i64) -> i64 {
+    if http_secure {
+        val accept: fn(i64) -> i64 = http_tls_accept;
+        val session: i64 = accept(hc_get(c, 0));
+        if session == 0 {
+            http_conn_close(c);
+            return 0;
+        }
+        hc_set(c, 1, session);
+    }
+    while true {
+        val req: HttpRequest = http_read_message(c, HTTP_IDLE_MS, false);
+        if req.method == "" {
+            break;
+        }
+        val handler: fn(HttpRequest) -> str = http_handler;
+        val keep: bool = http_keep_alive(req);
+        val response: str = handler(req);
+        val sent: bool = http_conn_write(c, response);
+        if http_scoped {
+            http_request_free(req);
+            if hs_allocated(response) {
+                p_free(response as i64);
+            }
+        }
+        if !sent || !keep {
+            break;
+        }
+    }
+    http_conn_close(c);
+    return 0;
+}
+
+/// Take connections off the listening socket, each its own task.
+pub fn http_accept_task(fd: i64) -> i64 {
+    while true {
+        val client: i64 = p_co_accept(fd);
+        if client >= 0 {
+            task_detach(task_go("http_conn_task", http_conn_new(client, 0)));
+        }
+    }
+    return 0;
+}
+
+/// Serve HTTP on `port` until the process ends. Returns false if the port
+/// cannot be opened.
+///
+/// Nothing can dangle here: what a request and its response hold stays allocated,
+/// since `handler` may have kept it. A long-running server wants
+/// http_serve_scoped.
+pub fn http_serve(port: i64, handler: fn(HttpRequest) -> str) -> bool {
+    val fd: i64 = p_socket_listen(port);
+    if fd < 0 {
+        return false;
+    }
+    http_serve_on(fd, false, handler);
+    return true;
+}
+
+/// As http_serve, with memory that stays flat: after each response, the request's
+/// strings and the response are freed. The caller promises that `handler` keeps
+/// none of them past its return, nor returns one it holds elsewhere; a handler
+/// that wants to keep a string copies it (`s + ""`).
+@unsafe
+pub fn http_serve_scoped(port: i64, handler: fn(HttpRequest) -> str) -> bool {
+    http_scoped = true;
+    return http_serve(port, handler);
+}
+
+/// For module `https`.
+pub fn http_set_scoped() {
+    http_scoped = true;
+}
+
+/// Serve a listening socket from tasks and return: the caller goes on, and they
+/// run whenever it waits.
+pub fn http_listen_tasks(fd: i64, handler: fn(HttpRequest) -> str) {
+    http_handler = handler;
+    task_go("http_accept_task", fd);
+}
+
+/// Serve a listening socket until the process ends, over TLS if `secure` (module
+/// `https` has set it up).
+pub fn http_serve_on(fd: i64, secure: bool, handler: fn(HttpRequest) -> str) {
+    http_handler = handler;
+    http_secure = secure;
+    task_go("http_accept_task", fd);
+    task_run();
+}
+
+/// Default handler: echoes the request path.
+pub fn handle_request(req: HttpRequest) -> str {
+    return build_response(200, "text/plain", "Hello from Fides! Path: " + req.path + "\n");
+}
+
+/// Serve `handle_request` on `port`.
+pub fn serve(port: i64) -> void {
+    if !http_serve(port, handle_request) {
+        print("Failed to listen on port\n");
+    }
 }
 
 // ─── HTTP request arena (Phase 15.1) ─────────────────────────────────────
@@ -141,45 +692,6 @@ pub fn http_parse_request_arena(arena: http_request_arena, raw: str) -> str {
 /// and any intermediate allocations go into the arena.
 pub fn http_build_response_arena(arena: http_request_arena, status: i64, content_type: str, body: str) -> str {
     return build_response(status, content_type, body);
-}
-
-/// Serve HTTP with arena-based request handling. Each request gets its
-/// own arena. The handler function receives the raw request and the
-/// arena handle. All allocations in the handler should use the arena.
-/// The arena is freed after the response is sent.
-pub fn serve_arena(port: i64) -> void {
-    var fd = p_socket_listen(port);
-    if fd < 0 {
-        print("Failed to listen on port\n");
-        return;
-    }
-    print("Server listening on port ");
-    print(port);
-    print("\n");
-    while true {
-        var client = p_socket_accept(fd);
-        if client < 0 {
-            return;
-        }
-        var raw = p_socket_recv_str(client);
-        // Create a request arena for this request
-        var arena = http_request_arena_new();
-        var response = handle_request_arena(raw, arena);
-        p_socket_write(client, response);
-        p_socket_close(client);
-        // Free the request arena — all allocations freed at once
-        http_request_arena_free(arena);
-    }
-}
-
-/// Default arena-based request handler — echoes the request path.
-/// Override this in your program by defining your own `handle_request_arena`.
-/// The arena handle can be passed to http_request_alloc for allocations.
-pub fn handle_request_arena(raw: str, arena: http_request_arena) -> str {
-    var req = parse_request(raw);
-    var path = json_get(req, "path");
-    var body = "Hello from Fides! Path: " + path + "\n";
-    return build_response(200, "text/plain", body);
 }
 
 // ─── Router (Phase 15.2) ──────────────────────────────────────────────────

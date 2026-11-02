@@ -1,0 +1,128 @@
+// stdlib/chunk: world to chunk coordinate maths (including negative
+// coordinates), a single chunk (blocks, bounds, fill, height, clear), the
+// chunk world (lazy loading, the chunk limit, dirty flags, loading and
+// unloading around the player) and visible face counting.
+// A chunk holds 65536 blocks and the interpreter needs about 7 million
+// steps to build one (the test harness stops a run at 50 million), so the
+// test makes only two chunks and scans a chunk only once.
+use chunk;
+
+fn say_yes(b: bool) {
+    if b { println("yes"); } else { println("no"); }
+}
+
+fn main() -> i64 {
+    // world -> chunk and local coordinates, 16 blocks per chunk
+    println(chunk_world_to_chunk_x(0));
+    println(chunk_world_to_chunk_x(15));
+    println(chunk_world_to_chunk_x(16));
+    println(chunk_world_to_chunk_x(-1));
+    println(chunk_world_to_chunk_x(-16));
+    println(chunk_world_to_chunk_x(-17));
+    println(chunk_world_to_chunk_z(-17));
+    println(chunk_world_to_chunk_z(33));
+    println(chunk_world_to_local_x(17));
+    println(chunk_world_to_local_x(-1));
+    println(chunk_world_to_local_x(-16));
+    println(chunk_world_to_local_x(-17));
+    println(chunk_world_to_local_z(-1));
+    println(chunk_world_to_local_z(31));
+
+    // the world: two chunks at most
+    var w = chunk_world_create(2);
+    println(chunk_world_chunk_count(&w));
+    println(w.render_distance);
+    println(chunk_world_get(&w, 0, 5, 0));
+    // x = -1 is chunk -1, local 15
+    chunk_world_set(&mut w, -1, 5, 0, 4);
+    println(chunk_world_chunk_count(&w));
+    println(chunk_world_get(&w, -1, 5, 0));
+    println(chunk_world_get(&w, -1, 6, 0));
+    println(chunk_world_get(&w, -2, 5, 0));
+    println(chunk_world_get(&w, 0, 5, 0));
+    println(chunk_world_find(&w, -1, 0));
+    println(chunk_world_find(&w, 3, 3));
+    say_yes(chunk_world_is_loaded(&w, -1, 0));
+    say_yes(chunk_world_is_loaded(&w, 1, 0));
+    // x = 0 is chunk 0: the second chunk loads, a third is refused
+    chunk_world_set(&mut w, 0, 1, 0, 2);
+    chunk_world_set(&mut w, 400, 1, 0, 2);
+    println(chunk_world_chunk_count(&w));
+    println(chunk_world_get(&w, 0, 1, 0));
+    println(chunk_world_get(&w, 400, 1, 0));
+
+    // the chunks themselves
+    var c = w.chunks.get(0);
+    println(chunk_get_cx(&c));
+    println(chunk_get_cz(&c));
+    println(chunk_total_blocks(&c));
+    println(chunk_world_origin_x(&c));
+    println(chunk_world_origin_z(&c));
+    println(c.loaded);
+    println(c.vertex_count);
+    println(chunk_get_block(&c, 15, 5, 0));
+    println(chunk_get_block(&c, 15, 6, 0));
+    // the highest block in a column, and 0 for an empty one
+    chunk_set_block(&mut c, 15, 9, 0, 7);
+    println(chunk_height_at(&c, 15, 0));
+    println(chunk_height_at(&c, 0, 0));
+    println(chunk_height_at(&c, 99, 0));
+    // out of range reads give 0 and writes are ignored
+    chunk_set_block(&mut c, 16, 0, 0, 5);
+    chunk_set_block(&mut c, 0, 256, 0, 5);
+    chunk_set_block(&mut c, 0, 0, -1, 5);
+    println(chunk_get_block(&c, 16, 0, 0));
+    println(chunk_get_block(&c, 0, 256, 0));
+    // writing marks the chunk dirty
+    c.dirty = false;
+    chunk_set_block(&mut c, 4, 4, 4, 1);
+    say_yes(c.dirty);
+    chunk_clear(&mut c);
+    println(chunk_get_block(&c, 15, 5, 0));
+    println(chunk_get_block(&c, 4, 4, 4));
+    // flat terrain: 4 layers of 16 x 16
+    chunk_fill_flat(&mut c, 4, 3);
+    println(chunk_get_block(&c, 8, 3, 8));
+    println(chunk_get_block(&c, 8, 4, 8));
+    println(chunk_height_at(&c, 8, 8));
+    chunk_clear(&mut c);
+    chunk_world_set(&mut w, -1, 5, 0, 4);
+
+    // dirty flags: new chunks start dirty
+    say_yes(chunk_world_is_dirty(&w, -1, 0));
+    // a chunk that is not loaded is not dirty; clearing it does nothing
+    say_yes(chunk_world_is_dirty(&w, 9, 9));
+    chunk_world_clear_dirty(&mut w, 9, 9);
+    // clear_dirty must look the chunk up by both coordinates: chunk (-1,0)
+    // is not chunk (-1,-1)
+    chunk_world_clear_dirty(&mut w, -1, 0);
+    say_yes(chunk_world_is_dirty(&w, -1, 0));
+    say_yes(chunk_world_is_dirty(&w, 0, 0));
+    chunk_world_clear_dirty(&mut w, 0, 0);
+    say_yes(chunk_world_is_dirty(&w, 0, 0));
+    chunk_world_mark_dirty(&mut w, 0, 0);
+    say_yes(chunk_world_is_dirty(&w, 0, 0));
+
+    // visible faces in chunk (0,0): the block at (0,1,0) shows all 6 faces; a
+    // second one at (0,5,0) sits right across the border from the block at
+    // x = -1, y = 5 in chunk (-1,0), which hides one face of each: 6 + 5
+    chunk_world_set(&mut w, 0, 5, 0, 1);
+    println(chunk_visible_face_count(&w, w.chunks.get(chunk_world_find(&w, 0, 0))));
+
+    // streaming with radius 0 on the same world, at most two chunks
+    chunk_world_set_render_distance(&mut w, 0);
+    chunk_world_update(&mut w, -5, 0);
+    println(w.player_cx);
+    println(w.player_cz);
+    println(chunk_world_chunk_count(&w));
+    // chunk 1 does not fit under the limit of two: it is not loaded, and
+    // (-1,0), two away, is dropped (a later update would load chunk 1: it is
+    // left out because building a third chunk is too slow)
+    chunk_world_update(&mut w, 16, 0);
+    println(w.player_cx);
+    println(chunk_world_chunk_count(&w));
+    say_yes(chunk_world_is_loaded(&w, 1, 0));
+    say_yes(chunk_world_is_loaded(&w, 0, 0));
+    say_yes(chunk_world_is_loaded(&w, -1, 0));
+    return 0;
+}

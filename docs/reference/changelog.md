@@ -4,6 +4,18 @@
 
 - **Tasks:** `stdlib/task.fd` gives green threads with real stack switching,
   through fibers on Windows and ucontext on Linux.
+- **async:** an `async fn` is a task that runs until it first waits. `await`,
+  `task_sleep`, `task_wait_read` and `task_wait_write` suspend it.
+- **Networking:** sockets on the native path; non-blocking I/O through tasks;
+  `http` is HTTP/1.1 in Fides (keep-alive, chunked bodies, pipelining); `tls`
+  over Schannel and OpenSSL; `https` makes requests and serves.
+- **C calls:** a named Fides function as a callback, small structs by value and
+  as results, on both backends.
+- **Memory:** a Vec passed to functions that keep nothing is freed by its caller;
+  half-step size classes (24, 48, 96 bytes...).
+- **Speed:** a counted loop over a Vec drops its bounds and overflow checks.
+- **Editor:** `editors/vscode` starts the language server; run inside VS Code.
+  Diagnostics now carry their real line.
 - **Native builds import from any DLL:** `extern "C" link "x"` adds x.dll to the
   import table, with no C compiler.
 - **`module::name()`:** two imported modules may define the same function.

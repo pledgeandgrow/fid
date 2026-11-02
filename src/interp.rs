@@ -5406,9 +5406,6 @@ impl Interpreter {
                 let mut thread_values: Vec<Value> = vec![Value::Int(0)];
                 thread_values.extend(thread_args);
 
-                // Allocate a Future slot
-                let future_idx = self.futures.len();
-
                 // Run eagerly in the current interpreter (preserves Vec side-table access)
                 let result = if let Some(func) = self.module.functions.get(&func_name).cloned() {
                     match self.run_function(&func, &thread_values) {
@@ -5424,7 +5421,9 @@ impl Interpreter {
                     Value::Int(0)
                 };
 
-                // Store result as Ready (eager execution — no JoinHandle needed)
+                // Store result as Ready (eager execution — no JoinHandle needed).
+                // Its slot comes last: the function may have made futures of its own.
+                let future_idx = self.futures.len();
                 self.futures.push(FutureState::Ready(result));
                 ExecOutcome::Value(Value::Future(future_idx))
             }
@@ -5439,6 +5438,15 @@ impl Interpreter {
                     other => other,
                 }
             }
+            "p_co_async" => self.call_runtime("p_thread_spawn", args),
+            "p_co_sleep" => {
+                if let Some(Value::Int(ms)) = args.first() {
+                    std::thread::sleep(std::time::Duration::from_millis((*ms).max(0) as u64));
+                }
+                ExecOutcome::Value(Value::Int(0))
+            }
+            "p_co_wait_fd" => ExecOutcome::Value(Value::Int(1)),
+            "p_co_detach" => ExecOutcome::Value(Value::Void),
             "p_co_yield" => ExecOutcome::Value(Value::Void),
             "p_co_run" => ExecOutcome::Value(Value::Int(self.futures.len() as i64)),
             "p_co_done" => ExecOutcome::Value(Value::Int(1)),

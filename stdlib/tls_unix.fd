@@ -1,0 +1,216 @@
+// Fides TLS on Linux and macOS, through OpenSSL (it needs libssl and its
+// development files). `use tls` picks this module there and tls_windows on
+// Windows; they have the same functions.
+//
+// Certificates are checked against the system's store, and the name against
+// `host`. Reading and writing wait as tasks do: other tasks run meanwhile.
+//
+// A server key comes from PEM files: tls_server(cert_path, key_path).
+
+module tls;
+
+extern "C" link "ssl" {
+    fn TLS_client_method as ssl_client_method() -> i64;
+    fn TLS_server_method as ssl_server_method() -> i64;
+    fn SSL_CTX_new as ssl_ctx_new(method: i64) -> i64;
+    fn SSL_CTX_set_default_verify_paths as ssl_ctx_default_paths(ctx: i64) -> i32;
+    fn SSL_CTX_set_verify as ssl_ctx_set_verify(ctx: i64, mode: i64, callback: i64);
+    fn SSL_CTX_use_certificate_chain_file as ssl_ctx_cert(ctx: i64, path: str) -> i32;
+    fn SSL_CTX_use_PrivateKey_file as ssl_ctx_key(ctx: i64, path: str, kind: i64) -> i32;
+    fn SSL_new as ssl_new(ctx: i64) -> i64;
+    fn SSL_free as ssl_free(ssl: i64);
+    fn SSL_set_fd as ssl_set_fd(ssl: i64, fd: i64) -> i32;
+    fn SSL_ctrl as ssl_ctrl(ssl: i64, cmd: i64, larg: i64, parg: str) -> i64;
+    fn SSL_set1_host as ssl_set_host(ssl: i64, host: str) -> i32;
+    fn SSL_connect as ssl_connect(ssl: i64) -> i32;
+    fn SSL_accept as ssl_accept(ssl: i64) -> i32;
+    fn SSL_read as ssl_read(ssl: i64, buf: i64, n: i64) -> i32;
+    fn SSL_write as ssl_write(ssl: i64, buf: i64, n: i64) -> i32;
+    fn SSL_shutdown as ssl_shutdown(ssl: i64) -> i32;
+    fn SSL_get_error as ssl_get_error(ssl: i64, rc: i64) -> i32;
+}
+
+const TS_WANT_READ: i64 = 2;
+const TS_WANT_WRITE: i64 = 3;
+const TS_ZERO_RETURN: i64 = 6;
+const TS_TIMEOUT: i64 = 30000;
+
+// A session is a block of words: the SSL object, its socket
+const TS_SSL: i64 = 0;
+const TS_FD: i64 = 1;
+
+fn ts_get(p: i64) -> i64 {
+    var a: *mut i64 = p;
+    var v: i64 = 0;
+    unsafe { v = *a; }
+    return v;
+}
+
+fn ts_set(p: i64, v: i64) {
+    var a: *mut i64 = p;
+    unsafe { *a = v; }
+}
+
+fn ts_session(ssl: i64, fd: i64) -> i64 {
+    val s: i64 = p_malloc(16);
+    ts_set(s, ssl);
+    ts_set(s + 8, fd);
+    return s;
+}
+
+/// After a call returned `rc`: wait if it only needs the socket to be ready.
+/// False if it failed.
+fn ts_wait(s: i64, rc: i64, timeout_ms: i64) -> bool {
+    val fd: i64 = ts_get(s + 8);
+    val e: i64 = ssl_get_error(ts_get(s), rc);
+    if e == TS_WANT_READ {
+        return p_co_wait_fd(fd, 0, timeout_ms) != 0;
+    }
+    if e == TS_WANT_WRITE {
+        return p_co_wait_fd(fd, 1, timeout_ms) != 0;
+    }
+    return false;
+}
+
+var ts_client_ctx: i64 = 0;
+
+fn ts_client_context(verify: i64) -> i64 {
+    val ctx: i64 = ssl_ctx_new(ssl_client_method());
+    if ctx != 0 {
+        ssl_ctx_default_paths(ctx);
+        ssl_ctx_set_verify(ctx, verify, 0);
+    }
+    return ctx;
+}
+
+fn ts_handshake(ctx: i64, fd: i64, host: str, server: bool) -> i64 {
+    val ssl: i64 = ssl_new(ctx);
+    if ssl == 0 {
+        return 0;
+    }
+    ssl_set_fd(ssl, fd);
+    if !server {
+        // SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name
+        ssl_ctrl(ssl, 55, 0, host);
+        ssl_set_host(ssl, host);
+    }
+    val s: i64 = ts_session(ssl, fd);
+    while true {
+        var rc: i64 = 0;
+        if server {
+            rc = ssl_accept(ssl);
+        } else {
+            rc = ssl_connect(ssl);
+        }
+        if rc == 1 {
+            return s;
+        }
+        if !ts_wait(s, rc, TS_TIMEOUT) {
+            ssl_free(ssl);
+            p_free(s);
+            return 0;
+        }
+    }
+    return 0;
+}
+
+/// A TLS session over the connected socket `fd`, checking `host`'s certificate.
+/// Returns 0 on failure.
+pub fn tls_client(fd: i64, host: str) -> i64 {
+    if ts_client_ctx == 0 {
+        // SSL_VERIFY_PEER
+        ts_client_ctx = ts_client_context(1);
+    }
+    if ts_client_ctx == 0 {
+        return 0;
+    }
+    return ts_handshake(ts_client_ctx, fd, host, false);
+}
+
+/// Connect to host:port. Returns 0 on failure.
+pub fn tls_connect(host: str, port: i64) -> i64 {
+    val fd: i64 = p_co_connect(host, port);
+    if fd < 0 {
+        return 0;
+    }
+    val s: i64 = tls_client(fd, host);
+    if s == 0 {
+        p_socket_close(fd);
+    }
+    return s;
+}
+
+/// As tls_connect, but accept any certificate. For tests of a local server only:
+/// it does not know whom it is talking to.
+pub fn tls_connect_unchecked(host: str, port: i64) -> i64 {
+    val fd: i64 = p_co_connect(host, port);
+    if fd < 0 {
+        return 0;
+    }
+    val s: i64 = ts_handshake(ts_client_context(0), fd, host, false);
+    if s == 0 {
+        p_socket_close(fd);
+    }
+    return s;
+}
+
+/// Server credentials from PEM files. Returns 0 on failure.
+pub fn tls_server(cert_path: str, key_path: str) -> i64 {
+    val ctx: i64 = ssl_ctx_new(ssl_server_method());
+    if ctx == 0 || ssl_ctx_cert(ctx, cert_path) != 1 || ssl_ctx_key(ctx, key_path, 1) != 1 {
+        return 0;
+    }
+    return ctx;
+}
+
+/// The server's side of a TLS session over the accepted socket `fd`. Returns 0 on
+/// failure.
+pub fn tls_accept(server: i64, fd: i64) -> i64 {
+    return ts_handshake(server, fd, "", true);
+}
+
+/// The session's socket.
+pub fn tls_session_fd(s: i64) -> i64 {
+    return ts_get(s + 8);
+}
+
+/// Send `n` bytes at `addr`. Returns `n`, or -1.
+pub fn tls_session_send(s: i64, addr: i64, n: i64) -> i64 {
+    var sent: i64 = 0;
+    while sent < n {
+        val rc: i64 = ssl_write(ts_get(s), addr + sent, n - sent);
+        if rc > 0 {
+            sent = sent + rc;
+        } else if !ts_wait(s, rc, TS_TIMEOUT) {
+            return -1;
+        }
+    }
+    return sent;
+}
+
+/// Read up to `n` bytes into `addr`. Returns how many; 0 when the other side has
+/// closed; below 0 on an error or a timeout.
+pub fn tls_session_recv(s: i64, addr: i64, n: i64, timeout_ms: i64) -> i64 {
+    while true {
+        val rc: i64 = ssl_read(ts_get(s), addr, n);
+        if rc > 0 {
+            return rc;
+        }
+        if ssl_get_error(ts_get(s), rc) == TS_ZERO_RETURN {
+            return 0;
+        }
+        if !ts_wait(s, rc, timeout_ms) {
+            return -1;
+        }
+    }
+    return -1;
+}
+
+/// End the session and free it. The socket stays open: closing it is the
+/// caller's.
+pub fn tls_session_close(s: i64) -> i64 {
+    ssl_shutdown(ts_get(s));
+    ssl_free(ts_get(s));
+    p_free(s);
+    return 0;
+}

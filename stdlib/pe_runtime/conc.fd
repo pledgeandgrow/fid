@@ -26,6 +26,8 @@ extern "C" {
     fn CreateFiberEx as pe_k_create_fiber(commit: i64, reserve: i64, flags: i64, start: i64, arg: i64) -> i64;
     fn SwitchToFiber as pe_k_switch_fiber(fiber: i64);
     fn DeleteFiber as pe_k_delete_fiber(fiber: i64);
+    fn GetTickCount64 as pe_k_ticks() -> i64;
+    fn Sleep as pe_k_sleep(ms: i64);
     fn TlsAlloc as pe_k_tls_alloc() -> u32;
     fn TlsGetValue as pe_k_tls_get(key: i64) -> i64;
     fn TlsSetValue as pe_k_tls_set(key: i64, value: i64) -> i32;
@@ -37,6 +39,24 @@ extern "C" {
     fn pe_fn_lookup(name: str) -> i64;
     fn pe_call_fn(addr: i64, nargs: i64, argv: i64) -> i64;
     fn pe_thread_entry_addr() -> i64;
+}
+
+extern "C" link "ws2_32" {
+    fn WSAPoll as pe_k_wsa_poll(fds: i64, n: i64, timeout: i32) -> i32;
+    fn WSAStartup as pe_w_startup(version: i64, data: i64) -> i32;
+    fn WSAGetLastError as pe_w_last_error() -> i32;
+    fn socket as pe_w_socket(family: i64, kind: i64, protocol: i64) -> i64;
+    fn bind as pe_w_bind(s: i64, addr: i64, len: i64) -> i32;
+    fn listen as pe_w_listen(s: i64, backlog: i64) -> i32;
+    fn accept as pe_w_accept(s: i64, addr: i64, len: i64) -> i64;
+    fn connect as pe_w_connect(s: i64, addr: i64, len: i64) -> i32;
+    fn recv as pe_w_recv(s: i64, buf: i64, len: i64, flags: i64) -> i32;
+    fn send as pe_w_send(s: i64, buf: i64, len: i64, flags: i64) -> i32;
+    fn closesocket as pe_w_close(s: i64) -> i32;
+    fn setsockopt as pe_w_setsockopt(s: i64, level: i64, opt: i64, value: i64, len: i64) -> i32;
+    fn ioctlsocket as pe_w_ioctl(s: i64, cmd: i64, arg: i64) -> i32;
+    fn getaddrinfo as pe_w_getaddrinfo(host: str, service: i64, hints: i64, res: i64) -> i32;
+    fn freeaddrinfo as pe_w_freeaddrinfo(res: i64);
 }
 
 /// WaitForSingleObject / SleepConditionVariableSRW: no timeout.
@@ -129,25 +149,35 @@ pub fn pert_thread_main(block: i64) -> i64 {
     pe_atomic_store(block + 80, 1);
     // A task runs on its fiber: it ends by giving control back for good
     if pe_load(block + 96) != 0 {
-        pe_k_switch_fiber(pert_co_sched);
+        pe_co_leave();
     }
     return result;
 }
 
 // ─── Tasks: green threads ─────────────────
-// A task's block is a thread's, with [12] = 1 and [13] its fiber. They run on
-// the thread that calls p_co_run, one at a time, until each yields.
+// A task's block is a thread's, with [12] = 1 and [13] its fiber, then [14] the
+// task it awaits, [15] the task it returns to when it first suspends, [16] the
+// socket it waits for (-1: none), [17] 1 to wait for writing, [18] the result
+// of the wait, [19] when the wait ends in ms (0: never), [20] freed once done.
+// They run on the thread that calls p_co_run, one at a time, until each yields.
+// A future of a task is its block with the tag 0x7FA5 in the top 16 bits.
 
 var pert_co_sched: i64 = 0;
 var pert_co_cur: i64 = 0;
 var pert_co_blocks: i64 = 0;
 var pert_co_count: i64 = 0;
 var pert_co_cap: i64 = 0;
+var pert_co_total: i64 = 0;
+var pert_co_fds: i64 = 0;
+var pert_co_fds_cap: i64 = 0;
 
-pub fn pert_co_go(name: str, arg: i64) -> i64 {
+fn pe_co_new(name: str, nargs: i64, argv: i64) -> i64 {
     var fn_addr: i64 = pe_fn_lookup(name);
     if fn_addr == 0 {
         p_panic("task: no such function");
+    }
+    if pert_co_sched == 0 {
+        pert_co_sched = pe_k_thread_to_fiber(0);
     }
     if pert_co_count == pert_co_cap {
         var cap: i64 = pert_co_cap * 2;
@@ -160,14 +190,22 @@ pub fn pert_co_go(name: str, arg: i64) -> i64 {
             pe_store(blocks + i * 8, pe_load(pert_co_blocks + i * 8));
             i = i + 1;
         }
+        if pert_co_blocks != 0 {
+            p_free(pert_co_blocks);
+        }
         pert_co_blocks = blocks;
         pert_co_cap = cap;
     }
-    var block: i64 = pe_zeroed(14);
+    var block: i64 = pe_zeroed(21);
     pe_store(block, fn_addr);
-    pe_store(block + 8, 1);
-    pe_store(block + 16, arg);
+    pe_store(block + 8, nargs);
+    var a: i64 = 0;
+    while a < nargs && a < 8 {
+        pe_store(block + 16 + a * 8, pe_load(argv + a * 8));
+        a = a + 1;
+    }
     pe_store(block + 96, 1);
+    pe_store(block + 128, -1);
     var fiber: i64 = pe_k_create_fiber(16384, 1048576, 0, pe_thread_entry_addr(), block);
     if fiber == 0 {
         p_panic("task: out of memory");
@@ -175,55 +213,439 @@ pub fn pert_co_go(name: str, arg: i64) -> i64 {
     pe_store(block + 104, fiber);
     pe_store(pert_co_blocks + pert_co_count * 8, block);
     pert_co_count = pert_co_count + 1;
-    return pert_co_count;
+    pert_co_total = pert_co_total + 1;
+    return block;
 }
 
-pub fn pert_co_yield() {
-    if pert_co_cur != 0 {
+/// The running task gives up control: to the task that started it the first
+/// time, then to the scheduler.
+fn pe_co_leave() {
+    var c: i64 = pert_co_cur;
+    var back: i64 = pe_load(c + 120);
+    pe_store(c + 120, 0);
+    pert_co_cur = back;
+    if back != 0 {
+        pe_k_switch_fiber(pe_load(back + 104));
+    } else {
         pe_k_switch_fiber(pert_co_sched);
     }
 }
 
-pub fn pert_co_run() -> i64 {
-    if pert_co_sched == 0 {
-        pert_co_sched = pe_k_thread_to_fiber(0);
+fn pe_co_enter(block: i64) {
+    pert_co_cur = block;
+    pe_k_switch_fiber(pe_load(block + 104));
+    if pe_load(block + 80) != 0 {
+        pe_k_delete_fiber(pe_load(block + 104));
     }
-    while true {
-        var live: i64 = 0;
-        var i: i64 = 0;
-        while i < pert_co_count {
-            var block: i64 = pe_load(pert_co_blocks + i * 8);
-            if pe_load(block + 80) == 0 {
-                pert_co_cur = block;
-                pe_k_switch_fiber(pe_load(block + 104));
-                pert_co_cur = 0;
-                if pe_load(block + 80) == 0 {
-                    live = live + 1;
-                } else {
-                    pe_k_delete_fiber(pe_load(block + 104));
+}
+
+/// A finished task leaves the list: free it if nobody will read its result.
+fn pe_co_finish(block: i64) {
+    if pe_load(block + 160) != 0 {
+        p_free(block);
+    }
+}
+
+pub fn pert_co_go(name: str, arg: i64) -> i64 {
+    var slot: i64 = pe_zeroed(1);
+    pe_store(slot, arg);
+    var block: i64 = pe_co_new(name, 1, slot);
+    p_free(slot);
+    return block;
+}
+
+pub fn pert_co_async_v(name: str, nargs: i64, argv: i64) -> i64 {
+    var block: i64 = pe_co_new(name, nargs, argv);
+    pe_store(block + 120, pert_co_cur);
+    pe_co_enter(block);
+    return block | (0x7FA5 << 48);
+}
+
+pub fn pert_co_yield() {
+    if pert_co_cur != 0 {
+        pe_co_leave();
+    }
+}
+
+/// One turn of every task that can run. Returns how many are unfinished; slot
+/// `ran` gets how many took their turn.
+fn pe_co_round(ran: i64) -> i64 {
+    var kept: i64 = 0;
+    var turns: i64 = 0;
+    var i: i64 = 0;
+    while i < pert_co_count {
+        var c: i64 = pe_load(pert_co_blocks + i * 8);
+        var keep: bool = true;
+        if pe_load(c + 80) != 0 {
+            pe_co_finish(c);
+            keep = false;
+        } else {
+            var awaits: i64 = pe_load(c + 112);
+            if awaits != 0 {
+                if pe_load(awaits + 80) != 0 {
+                    pe_store(c + 112, 0);
+                    awaits = 0;
                 }
             }
-            i = i + 1;
+            if awaits == 0 && pe_load(c + 128) < 0 && pe_load(c + 152) == 0 {
+                turns = turns + 1;
+                pe_co_enter(c);
+                // (a detached task frees itself in pe_co_finish, on the next turn)
+                if pe_load(c + 80) != 0 {
+                    pe_co_finish(c);
+                    keep = false;
+                }
+            }
         }
-        if live == 0 {
-            return pert_co_count;
+        if keep {
+            pe_store(pert_co_blocks + kept * 8, c);
+            kept = kept + 1;
+        }
+        i = i + 1;
+    }
+    pert_co_count = kept;
+    pe_store(ran, turns);
+    return kept;
+}
+
+/// Sleep until a waiting task can run, at most limit ms (-1: no limit). With
+/// `ran` set, only look. Panics if no task ever will.
+fn pe_co_wait(ran: i64, limit: i64) {
+    var timeout: i64 = limit;
+    if ran != 0 {
+        timeout = 0;
+    }
+    var now: i64 = pe_k_ticks();
+    if pert_co_count > pert_co_fds_cap {
+        if pert_co_fds != 0 {
+            p_free(pert_co_fds);
+        }
+        pert_co_fds_cap = pert_co_count * 2;
+        pert_co_fds = pe_zeroed(pert_co_fds_cap * 2);
+    }
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < pert_co_count {
+        var c: i64 = pe_load(pert_co_blocks + i * 8);
+        if pe_load(c + 128) >= 0 {
+            // WSAPOLLFD: socket, then events and revents (16 bits each)
+            pe_store(pert_co_fds + n * 16, pe_load(c + 128));
+            if pe_load(c + 136) != 0 {
+                pe_store(pert_co_fds + n * 16 + 8, 16);
+            } else {
+                pe_store(pert_co_fds + n * 16 + 8, 256);
+            }
+            n = n + 1;
+        }
+        var wake: i64 = pe_load(c + 152);
+        if wake != 0 {
+            var left: i64 = wake - now;
+            if left < 0 {
+                left = 0;
+            }
+            if timeout < 0 || left < timeout {
+                timeout = left;
+            }
+        }
+        i = i + 1;
+    }
+    if n == 0 && timeout < 0 {
+        p_panic("Tasks are deadlocked: each one awaits another");
+    }
+    if n > 0 {
+        pe_k_wsa_poll(pert_co_fds, n, timeout);
+    } else if timeout > 0 {
+        pe_k_sleep(timeout);
+    }
+    now = pe_k_ticks();
+    var k: i64 = 0;
+    i = 0;
+    while i < pert_co_count {
+        var c: i64 = pe_load(pert_co_blocks + i * 8);
+        var hit: bool = false;
+        if pe_load(c + 128) >= 0 {
+            hit = (pe_load(pert_co_fds + k * 16 + 8) >> 16) != 0;
+            k = k + 1;
+        }
+        if hit {
+            pe_store(c + 144, 1);
+            pe_store(c + 128, -1);
+            pe_store(c + 152, 0);
+        } else if pe_load(c + 152) != 0 && pe_load(c + 152) <= now {
+            pe_store(c + 144, 0);
+            pe_store(c + 128, -1);
+            pe_store(c + 152, 0);
+        }
+        i = i + 1;
+    }
+}
+
+pub fn pert_co_run() -> i64 {
+    var ran: i64 = pe_zeroed(1);
+    while pe_co_round(ran) != 0 {
+        pe_co_wait(pe_load(ran), -1);
+    }
+    p_free(ran);
+    return pert_co_total;
+}
+
+fn pe_co_await(f: i64) -> i64 {
+    var c: i64 = f & 0xFFFFFFFFFFFF;
+    var ran: i64 = pe_zeroed(1);
+    while pe_load(c + 80) == 0 {
+        if pert_co_cur != 0 {
+            pe_store(pert_co_cur + 112, c);
+            pe_co_leave();
+        } else {
+            pe_co_round(ran);
+            if pe_load(c + 80) == 0 {
+                pe_co_wait(pe_load(ran), -1);
+            }
         }
     }
-    return pert_co_count;
+    p_free(ran);
+    return pe_load(c + 88);
+}
+
+fn pe_is_co_future(f: i64) -> bool {
+    return ((f >> 48) & 0xFFFF) == 0x7FA5;
+}
+
+pub fn pert_co_sleep(ms: i64) -> i64 {
+    if pert_co_cur != 0 {
+        var d: i64 = ms;
+        if d < 0 {
+            d = 0;
+        }
+        pe_store(pert_co_cur + 152, pe_k_ticks() + d + 1);
+        pe_co_leave();
+        return 0;
+    }
+    var end: i64 = pe_k_ticks() + ms;
+    var ran: i64 = pe_zeroed(1);
+    while true {
+        var live: i64 = pe_co_round(ran);
+        var left: i64 = end - pe_k_ticks();
+        if left <= 0 {
+            p_free(ran);
+            return 0;
+        }
+        if live != 0 {
+            pe_co_wait(pe_load(ran), left);
+        } else {
+            pe_k_sleep(left);
+        }
+    }
+    return 0;
+}
+
+pub fn pert_co_wait_fd(fd: i64, write: i64, timeout_ms: i64) -> i64 {
+    if pert_co_cur != 0 {
+        var c: i64 = pert_co_cur;
+        pe_store(c + 128, fd);
+        pe_store(c + 136, write);
+        if timeout_ms >= 0 {
+            pe_store(c + 152, pe_k_ticks() + timeout_ms + 1);
+        } else {
+            pe_store(c + 152, 0);
+        }
+        pe_co_leave();
+        return pe_load(c + 144);
+    }
+    var one: i64 = pe_zeroed(2);
+    pe_store(one, fd);
+    if write != 0 {
+        pe_store(one + 8, 16);
+    } else {
+        pe_store(one + 8, 256);
+    }
+    var r: i64 = pe_k_wsa_poll(one, 1, timeout_ms);
+    p_free(one);
+    if r > 0 {
+        return 1;
+    }
+    return 0;
+}
+
+// ─── Sockets ─────────────────────────────────
+
+var pert_wsa_ready: i64 = 0;
+
+fn pe_wsa() {
+    if pert_wsa_ready == 0 {
+        pert_wsa_ready = 1;
+        var data: i64 = pe_zeroed(64);
+        pe_w_startup(514, data);
+        p_free(data);
+    }
+}
+
+/// The first 8 bytes of a sockaddr_in for `port`, above `rest` (the address).
+fn pe_port_word(port: i64, rest: i64) -> i64 {
+    return (rest & ~4294901760) | ((port & 255) << 24) | (((port >> 8) & 255) << 16);
+}
+
+/// A TCP socket on all addresses, listening, or -1.
+pub fn pert_socket_listen(port: i64) -> i64 {
+    pe_wsa();
+    var s: i64 = pe_w_socket(2, 1, 0);
+    if s == -1 {
+        return -1;
+    }
+    var on: i64 = pe_zeroed(1);
+    pe_store(on, 1);
+    pe_w_setsockopt(s, 65535, 4, on, 4);
+    p_free(on);
+    var addr: i64 = pe_zeroed(2);
+    pe_store(addr, pe_port_word(port, 2));
+    var bound: i64 = pe_w_bind(s, addr, 16);
+    p_free(addr);
+    if bound != 0 || pe_w_listen(s, 128) != 0 {
+        pe_w_close(s);
+        return -1;
+    }
+    return s;
+}
+
+pub fn pert_socket_accept(fd: i64) -> i64 {
+    return pe_w_accept(fd, 0, 0);
+}
+
+pub fn pert_socket_read(fd: i64, buf: i64, n: i64) -> i64 {
+    return pe_w_recv(fd, buf, n, 0);
+}
+
+pub fn pert_socket_write(fd: i64, data: str) -> i64 {
+    return pe_w_send(fd, data as i64, str_len(data), 0);
+}
+
+pub fn pert_socket_write_str(fd: i64, data: str) -> i64 {
+    return pe_w_send(fd, data as i64, str_len(data), 0);
+}
+
+pub fn pert_socket_close(fd: i64) {
+    pe_w_close(fd);
+}
+
+pub fn pert_net_close(fd: i64) {
+    pe_w_close(fd);
+}
+
+pub fn pert_socket_recv_str(fd: i64) -> str {
+    var buf: i64 = pe_zeroed(512);
+    var n: i64 = pe_w_recv(fd, buf, 4095, 0);
+    if n <= 0 {
+        return "";
+    }
+    return buf as str;
+}
+
+pub fn pert_net_connect(host: str, port: i64) -> i64 {
+    pe_wsa();
+    var hints: i64 = pe_zeroed(6);
+    pe_store(hints, 2 << 32);
+    pe_store(hints + 8, 1);
+    var res: i64 = pe_zeroed(1);
+    var failed: i64 = pe_w_getaddrinfo(host, 0, hints, res);
+    p_free(hints);
+    var info: i64 = pe_load(res);
+    p_free(res);
+    if failed != 0 || info == 0 {
+        return -1;
+    }
+    var addr: i64 = pe_zeroed(2);
+    var from: i64 = pe_load(info + 32);
+    pe_store(addr, pe_port_word(port, pe_load(from)));
+    pe_store(addr + 8, pe_load(from + 8));
+    pe_w_freeaddrinfo(info);
+    var s: i64 = pe_w_socket(2, 1, 0);
+    if s == -1 {
+        p_free(addr);
+        return -1;
+    }
+    var joined: i64 = pe_w_connect(s, addr, 16);
+    p_free(addr);
+    if joined != 0 {
+        pe_w_close(s);
+        return -1;
+    }
+    return s;
+}
+
+fn pe_co_nonblock(fd: i64) {
+    var on: i64 = pe_zeroed(1);
+    pe_store(on, 1);
+    pe_w_ioctl(fd, 2147772030, on);
+    p_free(on);
+}
+
+/// The last socket call failed only because it would have blocked.
+fn pe_co_blocked() -> bool {
+    return pe_w_last_error() == 10035;
+}
+
+pub fn pert_co_accept(fd: i64) -> i64 {
+    pert_co_wait_fd(fd, 0, -1);
+    var c: i64 = pe_w_accept(fd, 0, 0);
+    if c != -1 {
+        pe_co_nonblock(c);
+    }
+    return c;
+}
+
+pub fn pert_co_connect(host: str, port: i64) -> i64 {
+    var c: i64 = pert_net_connect(host, port);
+    if c != -1 {
+        pe_co_nonblock(c);
+    }
+    return c;
+}
+
+pub fn pert_co_recv(fd: i64, buf: i64, n: i64, timeout_ms: i64) -> i64 {
+    while true {
+        var got: i64 = pe_w_recv(fd, buf, n, 0);
+        if got >= 0 {
+            return got;
+        }
+        if !pe_co_blocked() {
+            return -1;
+        }
+        if pert_co_wait_fd(fd, 0, timeout_ms) == 0 {
+            return -2;
+        }
+    }
+    return -1;
+}
+
+pub fn pert_co_send(fd: i64, buf: i64, n: i64) -> i64 {
+    var done: i64 = 0;
+    while done < n {
+        var sent: i64 = pe_w_send(fd, buf + done, n - done, 0);
+        if sent > 0 {
+            done = done + sent;
+        } else if sent < 0 && !pe_co_blocked() {
+            return -1;
+        } else if pert_co_wait_fd(fd, 1, 30000) == 0 {
+            return -1;
+        }
+    }
+    return done;
+}
+
+pub fn pert_co_detach(t: i64) {
+    if pe_load(t + 80) != 0 {
+        p_free(t);
+    } else {
+        pe_store(t + 160, 1);
+    }
 }
 
 pub fn pert_co_done(t: i64) -> i64 {
-    if t < 1 || t > pert_co_count {
-        return 1;
-    }
-    return pe_load(pe_load(pert_co_blocks + (t - 1) * 8) + 80);
+    return pe_load(t + 80);
 }
 
 pub fn pert_co_result(t: i64) -> i64 {
-    if t < 1 || t > pert_co_count {
-        return 0;
-    }
-    return pe_load(pe_load(pert_co_blocks + (t - 1) * 8) + 88);
+    return pe_load(t + 88);
 }
 
 /// The table index of future f, or -1 (a ready value or an unknown handle).
@@ -259,6 +681,9 @@ pub fn pert_future_ready(value: i64) -> i64 {
 }
 
 pub fn pert_future_poll(f: i64) -> i64 {
+    if pe_is_co_future(f) {
+        return pe_co_await(f);
+    }
     if f >= 0 {
         return f;
     }
@@ -274,6 +699,9 @@ pub fn pert_task_poll(f: i64) -> i64 {
 }
 
 pub fn pert_task_is_ready(f: i64) -> bool {
+    if pe_is_co_future(f) {
+        return pe_load((f & 0xFFFFFFFFFFFF) + 80) != 0;
+    }
     if f >= 0 {
         return true;
     }
@@ -285,6 +713,12 @@ pub fn pert_task_is_ready(f: i64) -> bool {
 }
 
 pub fn pert_task_poll_nonblocking(f: i64) -> i64 {
+    if pe_is_co_future(f) {
+        if pe_load((f & 0xFFFFFFFFFFFF) + 80) == 0 {
+            return pe_pending();
+        }
+        return pe_co_await(f);
+    }
     if f >= 0 {
         return f;
     }

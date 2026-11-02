@@ -161,8 +161,8 @@ pub fn json_is_valid(s: str) -> bool {
 //             (key bounds include the surrounding quotes)
 //   array  → flat Vec [val_start, val_end] × n
 // Returns an empty Vec for {} / [] / malformed input.
-fn j_members(s: str, i: i64) -> Vec {
-    var out: Vec = Vec::new();
+fn j_members(s: str, i: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
     if str_byte_at(s, i) == 91 {
         var j: i64 = j_ws(s, i + 1);
         if j < str_len(s) && str_byte_at(s, j) == 93 { return out; }
@@ -238,10 +238,10 @@ fn j_canon(s: str, i: i64) -> str {
 }
 
 fn j_canon_obj(s: str, i: i64) -> str {
-    var mem: Vec = j_members(s, i);
+    var mem: Vec<i64> = j_members(s, i);
     var n: i64 = mem.len() / 4;
-    var keys: Vec = Vec::new();
-    var vals: Vec = Vec::new();
+    var keys: Vec<str> = Vec::new();
+    var vals: Vec<str> = Vec::new();
     var m: i64 = 0;
     while m < n {
         var kend: i64 = mem.get(m * 4 + 1);
@@ -280,7 +280,7 @@ fn j_canon_obj(s: str, i: i64) -> str {
 }
 
 fn j_canon_arr(s: str, i: i64) -> str {
-    var mem: Vec = j_members(s, i);
+    var mem: Vec<i64> = j_members(s, i);
     var n: i64 = mem.len() / 2;
     var out: str = "[";
     var m: i64 = 0;
@@ -404,7 +404,7 @@ pub fn json_get(s: str, key: str) -> str {
     if !json_is_valid(s) || !str_equal(j_type_at(s, j_ws(s, 0)), "object") {
         panic("json_get: not an object");
     }
-    var mem: Vec = j_members(s, j_ws(s, 0));
+    var mem: Vec<i64> = j_members(s, j_ws(s, 0));
     var n: i64 = mem.len() / 4;
     var m: i64 = 0;
     while m < n {
@@ -423,7 +423,7 @@ pub fn json_at(s: str, idx: i64) -> str {
     if !json_is_valid(s) || !str_equal(j_type_at(s, j_ws(s, 0)), "array") {
         panic("json_at: not an array");
     }
-    var mem: Vec = j_members(s, j_ws(s, 0));
+    var mem: Vec<i64> = j_members(s, j_ws(s, 0));
     var n: i64 = mem.len() / 2;
     if idx < 0 || idx >= n { panic("json_at: index out of bounds"); }
     return str_slice(s, mem.get(idx * 2), mem.get(idx * 2 + 1));
@@ -517,7 +517,7 @@ pub fn json_type_safe(s: str) -> str {
 /// when the key is absent (matching historical json_get semantics).
 pub fn json_get_safe(s: str, key: str) -> str {
     if !str_equal(json_type_safe(s), "object") { return ""; }
-    var mem: Vec = j_members(s, j_ws(s, 0));
+    var mem: Vec<i64> = j_members(s, j_ws(s, 0));
     var n: i64 = mem.len() / 4;
     var m: i64 = 0;
     while m < n {
@@ -533,7 +533,7 @@ pub fn json_get_safe(s: str, key: str) -> str {
 /// Element of a JSON array as raw JSON text; "" on any failure.
 pub fn json_at_safe(s: str, idx: i64) -> str {
     if !str_equal(json_type_safe(s), "array") { return ""; }
-    var mem: Vec = j_members(s, j_ws(s, 0));
+    var mem: Vec<i64> = j_members(s, j_ws(s, 0));
     var n: i64 = mem.len() / 2;
     if idx < 0 || idx >= n { return ""; }
     return str_slice(s, mem.get(idx * 2), mem.get(idx * 2 + 1));
@@ -587,7 +587,7 @@ pub fn json_get_bool(s: str, key: str, def: bool) -> bool {
 
 /// True when `key` exists on object `s` (even if its value is null).
 pub fn json_has(s: str, key: str) -> bool {
-    var keys: Vec = json_keys(s);
+    var keys: Vec<str> = json_keys(s);
     var i: i64 = 0;
     while i < keys.len() {
         var k: str = keys.get(i);
@@ -615,10 +615,10 @@ pub fn json_at_int(s: str, idx: i64, def: i64) -> i64 {
 
 /// Top-level keys of a JSON object as a Vec of plain strings, in document
 /// order. Empty Vec when `s` is not an object.
-pub fn json_keys(s: str) -> Vec {
-    var out: Vec = Vec::new();
+pub fn json_keys(s: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
     if !str_equal(json_type_safe(s), "object") { return out; }
-    var mem: Vec = j_members(s, j_ws(s, 0));
+    var mem: Vec<i64> = j_members(s, j_ws(s, 0));
     var n: i64 = mem.len() / 4;
     var m: i64 = 0;
     while m < n {
@@ -630,10 +630,10 @@ pub fn json_keys(s: str) -> Vec {
 
 /// Top-level elements of a JSON array as a Vec of raw JSON strings.
 /// Empty Vec when `s` is not an array.
-pub fn json_items(s: str) -> Vec {
-    var out: Vec = Vec::new();
+pub fn json_items(s: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
     if !str_equal(json_type_safe(s), "array") { return out; }
-    var mem: Vec = j_members(s, j_ws(s, 0));
+    var mem: Vec<i64> = j_members(s, j_ws(s, 0));
     var n: i64 = mem.len() / 2;
     var m: i64 = 0;
     while m < n {
@@ -650,7 +650,7 @@ pub fn json_items(s: str) -> Vec {
 /// ("null" when the final lookup lands on a missing key).
 pub fn json_path(s: str, path: str) -> str {
     var cur: str = s;
-    var segs: Vec = str_split(path, ".");
+    var segs: Vec<str> = str_split(path, ".");
     var i: i64 = 0;
     while i < segs.len() {
         var seg: str = segs.get(i);
@@ -675,7 +675,7 @@ pub fn json_path(s: str, path: str) -> str {
 /// Works on any valid object text; returns obj unchanged if invalid.
 pub fn json_obj_set(obj: str, key: str, value: str) -> str {
     if !str_equal(json_type_safe(obj), "object") { return obj; }
-    var mem: Vec = j_members(obj, j_ws(obj, 0));
+    var mem: Vec<i64> = j_members(obj, j_ws(obj, 0));
     var n: i64 = mem.len() / 4;
     var m: i64 = 0;
     while m < n {

@@ -1,0 +1,94 @@
+// stdlib/audio_mixer: the volume model that does not need SDL_mixer: group
+// and master volumes with clamping, the 3D distance attenuation curve and
+// its parameters, and the checks that refuse to load or play before init
+// or with a bad sound index. Loading and playing real sounds goes through
+// the SDL_mixer functions and is not run here.
+use audio_mixer;
+
+fn say_yes(b: bool) {
+    if b { println("yes"); } else { println("no"); }
+}
+
+fn main() -> i64 {
+    println(GROUP_MASTER);
+    println(GROUP_SFX);
+    println(GROUP_MUSIC);
+    println(GROUP_VOICE);
+    println(GROUP_AMBIENT);
+    println(GROUP_COUNT);
+
+    // before init: nothing loads, nothing plays
+    println(audio_mixer_load("a.wav"));
+    println(audio_mixer_load_group("a.wav", GROUP_MUSIC));
+    println(audio_mixer_sound_count());
+    println(audio_mixer_play(0));
+    println(audio_mixer_play(-1));
+    println(audio_mixer_play_volume(0, 0.5));
+    println(audio_mixer_play_3d(0, 1.0, 2.0, 3.0));
+    println(audio_mixer_play_2d(0, 1.0, 2.0));
+    say_yes(audio_mixer_is_loaded(0));
+    say_yes(audio_mixer_is_loaded(-1));
+
+    audio_mixer_init();
+    println(audio_mixer_master_volume());
+    println(audio_mixer_group_volume(GROUP_SFX));
+    println(audio_mixer_group_volume(GROUP_AMBIENT));
+    // a group that does not exist reads as silent
+    println(audio_mixer_group_volume(7));
+    println(audio_mixer_group_volume(-1));
+    // there is still nothing in the cache, so index 0 cannot play
+    println(audio_mixer_play(0));
+    println(audio_mixer_sound_count());
+
+    // volumes are clamped to 0..1
+    audio_mixer_set_master_volume(0.5);
+    println(audio_mixer_master_volume());
+    audio_mixer_set_master_volume(3.0);
+    println(audio_mixer_master_volume());
+    audio_mixer_set_master_volume(-1.0);
+    println(audio_mixer_master_volume());
+    audio_mixer_set_master_volume(1.0);
+    audio_mixer_set_group_volume(GROUP_MUSIC, 0.25);
+    println(audio_mixer_group_volume(GROUP_MUSIC));
+    println(audio_mixer_group_volume(GROUP_SFX));
+    audio_mixer_set_group_volume(GROUP_MUSIC, 2.0);
+    println(audio_mixer_group_volume(GROUP_MUSIC));
+    audio_mixer_set_group_volume(GROUP_MUSIC, -2.0);
+    println(audio_mixer_group_volume(GROUP_MUSIC));
+    // a bad group is ignored
+    audio_mixer_set_group_volume(9, 0.5);
+    audio_mixer_set_group_volume(-1, 0.5);
+    println(audio_mixer_group_volume(9));
+    // init puts every group back to full volume
+    audio_mixer_init();
+    println(audio_mixer_group_volume(GROUP_MUSIC));
+
+    // attenuation: full inside the reference distance (50), silent from the
+    // maximum (500), linear in between
+    println(audio_mixer_distance_attenuation(0.0));
+    println(audio_mixer_distance_attenuation(50.0));
+    println(audio_mixer_distance_attenuation(275.0));
+    println(audio_mixer_distance_attenuation(500.0));
+    println(audio_mixer_distance_attenuation(900.0));
+    println(audio_mixer_distance_attenuation(162.5));
+    // custom range 10..30 and a steeper rolloff of 2: halfway gives 0
+    audio_mixer_set_3d_params(10.0, 30.0, 2.0);
+    println(audio_mixer_distance_attenuation(10.0));
+    println(audio_mixer_distance_attenuation(15.0));
+    println(audio_mixer_distance_attenuation(20.0));
+    println(audio_mixer_distance_attenuation(30.0));
+    audio_mixer_set_3d_params(10.0, 30.0, 0.5);
+    println(audio_mixer_distance_attenuation(20.0));
+    audio_mixer_set_listener(1.0, 2.0, 3.0);
+
+    // nothing can be loaded or played without a native library: bad indexes
+    println(audio_mixer_play(5));
+    println(audio_mixer_play_volume(-3, 0.5));
+    println(audio_mixer_play_3d(5, 0.0, 0.0, 0.0));
+    say_yes(audio_mixer_is_loaded(0));
+    audio_mixer_unload(4);
+    audio_mixer_unload(-4);
+    audio_mixer_unload_all();
+    println(audio_mixer_sound_count());
+    return 0;
+}

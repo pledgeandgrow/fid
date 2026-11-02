@@ -1,0 +1,184 @@
+// stdlib/scada: Modbus names, the CRC-16, request builders, RTU frame
+// serialisation and parsing, response decoding, exception frames and the
+// Modbus TCP frame. CRC values are the published ones for the well known
+// frames (01 03 00 00 00 0A C5 CD, 01 04 02 FF FF B8 80, 01 06 00 01 00 03
+// 98 0B), the others were worked out with a separate CRC loop.
+use scada;
+
+fn show(v: Vec<i64>) {
+    print(v.len());
+    print(":");
+    var i: i64 = 0;
+    while i < v.len() {
+        print(" ");
+        print(v.get(i));
+        i = i + 1;
+    }
+    println("");
+}
+
+fn vec_of(a: i64, b: i64, c: i64, d: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(a);
+    v.push(b);
+    v.push(c);
+    v.push(d);
+    return v;
+}
+
+// Struct literals of an imported type do not parse in a user file, so the
+// response frames are made from a request frame and then adjusted.
+fn mk(fc: i64, data: Vec<i64>, is_exc: bool) -> ModbusFrame {
+    var f = modbus_read_holding_registers(1, 0, 1);
+    f.function_code = fc;
+    f.data = data;
+    f.is_exception = is_exc;
+    return f;
+}
+
+fn main() -> i64 {
+    // names
+    println(modbus_fc_name(MODBUS_FC_READ_COILS));
+    println(modbus_fc_name(MODBUS_FC_READ_HOLDING_REGS));
+    println(modbus_fc_name(MODBUS_FC_WRITE_SINGLE_REG));
+    println(modbus_fc_name(MODBUS_FC_WRITE_MULTIPLE_REGS));
+    println(modbus_fc_name(MODBUS_FC_DIAGNOSTICS));
+    println(modbus_fc_name(0));
+    println(modbus_exc_name(MODBUS_EXC_ILLEGAL_FUNCTION));
+    println(modbus_exc_name(MODBUS_EXC_ILLEGAL_DATA_ADDRESS));
+    println(modbus_exc_name(MODBUS_EXC_SLAVE_BUSY));
+    println(modbus_exc_name(MODBUS_EXC_GATEWAY_TARGET_NO_RESPONSE));
+    println(modbus_exc_name(0x09));
+
+    // CRC-16: the empty message gives the start value
+    var none: Vec<i64> = Vec::new();
+    println(modbus_crc16(none));
+    println(modbus_crc16(vec_of(1, 3, 0, 0)));
+    var req: Vec<i64> = vec_of(1, 3, 0, 0);
+    req.push(0);
+    req.push(10);
+    println(modbus_crc16(req));
+    var resp: Vec<i64> = Vec::new();
+    resp.push(1);
+    resp.push(4);
+    resp.push(2);
+    resp.push(255);
+    resp.push(255);
+    println(modbus_crc16(resp));
+    // verify a frame with its CRC appended (low byte first)
+    resp.push(184);
+    resp.push(128);
+    println(modbus_crc_verify(resp));
+    resp.set(3, 254);
+    println(modbus_crc_verify(resp));
+    resp.set(3, 255);
+    resp.set(5, 185);
+    println(modbus_crc_verify(resp));
+    println(modbus_crc_verify(none));
+    var one: Vec<i64> = Vec::new();
+    one.push(7);
+    println(modbus_crc_verify(one));
+    // two bytes: an empty payload, whose CRC is 0xFFFF
+    var ff: Vec<i64> = Vec::new();
+    ff.push(255);
+    ff.push(255);
+    println(modbus_crc_verify(ff));
+
+    // requests, serialised with the CRC
+    var f1 = modbus_read_holding_registers(1, 0, 10);
+    println(f1.function_code);
+    println(f1.is_exception);
+    show(f1.data);
+    show(modbus_frame_serialize(f1));
+    show(modbus_frame_serialize(modbus_read_coils(1, 19, 37)));
+    show(modbus_frame_serialize(modbus_write_single_register(1, 1, 3)));
+    show(modbus_frame_serialize(modbus_write_single_coil(17, 172, true)));
+    show(modbus_frame_serialize(modbus_write_single_coil(17, 172, false)));
+    var vals: Vec<i64> = Vec::new();
+    vals.push(10);
+    vals.push(258);
+    show(modbus_frame_serialize(modbus_write_multiple_registers(1, 1, vals)));
+    // addresses above 255 use both bytes
+    show(modbus_read_holding_registers(2, 0x1234, 0x0056).data);
+
+    // parsing a serialised frame
+    var bytes = modbus_frame_serialize(f1);
+    var g = modbus_frame_deserialize(bytes);
+    println(g.slave_address);
+    println(g.function_code);
+    println(g.is_exception);
+    show(g.data);
+    println(g.crc);
+    // too short to be a frame
+    var short: Vec<i64> = Vec::new();
+    short.push(1);
+    short.push(3);
+    short.push(0);
+    var s = modbus_frame_deserialize(short);
+    println(s.is_exception);
+    println(s.slave_address);
+    println(s.data.len());
+
+    // exception responses set bit 7 of the function code
+    var exc = mk(MODBUS_FC_READ_HOLDING_REGS, vec_of(2, 0, 0, 0), true);
+    exc.data.pop();
+    exc.data.pop();
+    exc.data.pop();
+    var eb = modbus_frame_serialize(exc);
+    println(eb.get(1));
+    println(eb.len());
+    var ex = modbus_frame_deserialize(eb);
+    println(ex.is_exception);
+    println(ex.function_code);
+    println(modbus_exception_code(ex));
+    println(modbus_exception_code(g));
+    var noexcdata = mk(3, Vec::new(), true);
+    println(modbus_exception_code(noexcdata));
+    show(modbus_decode_registers(ex));
+
+    // register responses: byte count, then 16-bit values
+    var rr = mk(3, vec_of(4, 0, 10, 1), false);
+    rr.data.push(2);
+    show(modbus_decode_registers(rr));
+    // a trailing odd byte is dropped; a wrong function or no data gives nothing
+    var odd = mk(3, vec_of(3, 0, 10, 1), false);
+    show(modbus_decode_registers(odd));
+    var wrong = mk(4, vec_of(2, 0, 10, 0), false);
+    show(modbus_decode_registers(wrong));
+    var empty = mk(3, Vec::new(), false);
+    show(modbus_decode_registers(empty));
+    show(modbus_decode_coils(empty));
+
+    // coil responses: bits are taken lowest first, eight per byte
+    var cr = mk(1, vec_of(2, 13, 1, 0), false);
+    cr.data.pop();
+    show(modbus_decode_coils(cr));
+    var cw = mk(3, vec_of(1, 1, 0, 0), false);
+    show(modbus_decode_coils(cw));
+    show(modbus_decode_coils(ex));
+
+    // Modbus TCP: transaction id, protocol 0, length, unit, function, data
+    var t = modbus_tcp_frame(258, 1, 3, vec_of(0, 0, 0, 10));
+    var tb = modbus_tcp_serialize(t);
+    show(tb);
+    var t2 = modbus_tcp_deserialize(tb);
+    println(t2.transaction_id);
+    println(t2.unit_id);
+    println(t2.function_code);
+    show(t2.data);
+    // fewer than 8 bytes is not a frame; exactly 8 has no data
+    var t3 = modbus_tcp_deserialize(short);
+    println(t3.transaction_id);
+    println(t3.data.len());
+    var eight: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 8 {
+        eight.push(k);
+        k = k + 1;
+    }
+    var t4 = modbus_tcp_deserialize(eight);
+    println(t4.unit_id);
+    println(t4.function_code);
+    println(t4.data.len());
+    return 0;
+}

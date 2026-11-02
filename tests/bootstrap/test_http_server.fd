@@ -1,0 +1,58 @@
+// A server and a client in one process, over a real socket: the accept loop and
+// each connection are tasks, and so is the client.
+use http;
+use task;
+
+fn route(req: HttpRequest) -> str {
+    if req.path == "/echo" {
+        return build_response(200, "text/plain", req.method + ":" + req.query + ":" + req.body);
+    }
+    if req.path == "/header" {
+        return build_response(200, "text/plain", http_header(req, "X-THING"));
+    }
+    return build_response(404, "text/plain", "none");
+}
+
+fn show(c: i64) {
+    val m: HttpRequest = http_read_message(c, 5000, false);
+    println(m.target + " " + http_header(m, "content-type") + " [" + m.body + "]");
+}
+
+async fn client(port: i64) -> Future<i64> {
+    val fd: i64 = p_co_connect("127.0.0.1", port);
+    val c: i64 = http_conn_new(fd, 0);
+    // Keep-alive: three requests on one connection
+    http_conn_write(c, "GET /echo?a=1 HTTP/1.1\r\nHost: x\r\n\r\n");
+    show(c);
+    http_conn_write(c, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
+    show(c);
+    http_conn_write(c, "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
+    show(c);
+    // Two at once, then a split request, any case of header name
+    http_conn_write(c, "GET /nope HTTP/1.1\r\nHost: x\r\n\r\nGET /header HTTP/1.1\r\nHost: x\r\n");
+    show(c);
+    task_sleep(10);
+    http_conn_write(c, "x-thing: split\r\n\r\n");
+    show(c);
+    http_conn_close(c);
+    // HTTP/1.0 closes after one answer
+    val c2: i64 = http_conn_new(p_co_connect("127.0.0.1", port), 0);
+    http_conn_write(c2, "GET /echo HTTP/1.0\r\n\r\n");
+    show(c2);
+    val more: HttpRequest = http_read_message(c2, 5000, false);
+    println(more.method == "");
+    http_conn_close(c2);
+    return 0;
+}
+
+fn main() -> i64 {
+    var port: i64 = 18470;
+    var fd: i64 = p_socket_listen(port);
+    while fd < 0 && port < 18490 {
+        port = port + 1;
+        fd = p_socket_listen(port);
+    }
+    http_listen_tasks(fd, route);
+    await client(port);
+    return 0;
+}

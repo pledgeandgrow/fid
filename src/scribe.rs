@@ -435,7 +435,8 @@ fn extract_params_and_return(line: &str) -> (Vec<(String, String)>, String) {
             else if bytes[end] == b')' { depth -= 1; }
             end += 1;
         }
-        let params_str = &line[start+1..end-1];
+        // A parameter list that runs on to the next line has no closing paren here
+        let params_str = if depth == 0 { &line[start+1..end-1] } else { &line[start+1..] };
         for param in params_str.split(',') {
             let param = param.trim();
             if param.is_empty() { continue; }

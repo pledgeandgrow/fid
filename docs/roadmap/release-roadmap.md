@@ -1,20 +1,27 @@
 # Release Roadmap
 
-> Goal: a public beta people can build real programs on, then a stable 1.0
-> whose promises are all true and all tested.
+> Goal: a public beta people can build real programs on, then a stable 1.0.0
+> whose promises are all true and all tested. Every track below is part of 1.0.0,
+> and all of it is work we can do ourselves. What needs a certifier or money is
+> set aside, at the end.
 >
 > Created: Nov 1, 2026. Update it in the same commit as the work.
 > `[x]` done and verified, `[~]` partly done (the note says what is left),
 > `[ ]` not started. Sizes are effort, not dates: S = hours, M = days,
 > L = weeks, XL = months.
 
-## Where it stands (Nov 1, 2026)
+## Where it stands (Nov 2, 2026)
 
 **Works today (tested):** native Windows `.exe` files with no C compiler; the
 self-hosted compiler reproduces itself byte for byte; one integer meaning on
 the interpreter, C and native paths; sound incremental builds; a real
-allocator; local `Vec`s freed by the compiler; `@secret`; native threads.
-Suite: interpreter 287/287, C 286/286, native 288/288, expected-fail 66/66.
+allocator; local `Vec`s and strings freed by the compiler, a `Vec` passed to
+functions that keep nothing included; `@secret`; native threads; `async` that
+really suspends; sockets on the native path; HTTP/1.1 and HTTPS, client and
+server, 28,000 requests/s on one thread; TLS through Schannel and OpenSSL; C
+callbacks and small structs by value; a stdlib with typed `Vec`s and a test for
+every module; language support running inside VS Code.
+Suite: interpreter 324/324, C 328/328, native 331/331, expected-fail 75/75.
 The self-hosted compiler reproduces itself from its second generation on.
 
 **Measured starting point** (Windows x64, seconds):
@@ -33,18 +40,17 @@ Self-compile: about 3 minutes natively, 22 s with `fidesc`.
 
 | Gap | Track |
 |---|---|
-| C libraries need `ccompile` | E |
-| Strings are not reclaimed in long-running programs | C |
-| Native builds are several times slower on tight loops | D |
+| `use sqlite` and `use sdl` are untested through `emit` | E |
+| A server's request strings stay allocated unless its handler promises to keep none | M, C |
+| Native builds are about twice as slow as C on tight loops | D |
 | Bare-metal tests only run hosted, where they fault | G |
-| Linux only builds and runs unit tests and one program | F |
-| No TLS; `http` and `net` are thin and blocking | I |
+| Linux has not had a green CI run yet; the last failure was in the test harness | F |
+| The 24-hour load test has not been run | I |
 | Only SHA-256 and HMAC, unreviewed | J |
-| `async` runs eagerly and does not suspend | H |
 | macOS, ARM64, RISC-V and WASM are partial | F |
 | Safety annotations are not certified or fully enforced | K, L |
 | Safe code can still corrupt memory | M, K |
-| No package registry; the editor extension only highlights syntax | N |
+| The package index is not public; the extension is not on the Marketplace | N |
 
 ## Release gates
 
@@ -52,13 +58,14 @@ Self-compile: about 3 minutes natively, 22 s with `fidesc`.
 H1–H2; K1–K3; M1–M3, M6; N1–N5. A beta may have gaps, but every gap must be
 documented.
 
-**Stable 1.0** needs: all of tracks A–E, F1–F6, H, I, J1–J6, K, M and N, plus
-every guide and feature table matching what the compiler does.
+**Stable 1.0.0** needs: every item of every track, A to N, plus every guide and
+feature table matching what the compiler does. That includes bare metal (G),
+native macOS, ARM64, RISC-V and WASM (F7–F9), crypto verification (J7–J8) and the
+safety-critical evidence (L1–L4).
 
-**After 1.0:** track L (safety-critical), native macOS, ARM64, RISC-V and WASM
-(F7–F9), J7–J9 and track G beyond what `fides-os` needs. None of them block
-1.0, as long as the docs say they are not supported yet. Crypto stays marked
-"not for production" until J9 is done.
+What needs an outside party or money is set aside (see the end) and does not
+block 1.0.0. Until those items are done, crypto stays marked "not for production"
+and Fides is not described as suitable for medical, automotive or avionics use.
 
 ## Decisions needed
 
@@ -67,8 +74,8 @@ Each changes the work below. Recommendations first; none is taken yet.
 1. **Native speed:** write a register allocator for the PE backend (recommended
    for 1.0: no dependencies, keeps "no C, no LLVM"), or lean on the C path or
    `llvm-roadmap.md` for release builds.
-2. **TLS and crypto:** bind reviewed libraries (recommended: Schannel on
-   Windows, a vendored mbedTLS or BearSSL elsewhere). Writing our own TLS is
+2. **TLS and crypto:** bind reviewed libraries (done: Schannel on Windows, the
+   system's OpenSSL elsewhere). Writing our own TLS is
    not an option for a first release.
 3. **Memory model:** compiler-inserted frees with escape analysis (recommended:
    matches "no GC"), or real ownership with moves checked everywhere. A garbage
@@ -132,10 +139,13 @@ Most modules still have no test, so expect more of this (B12).
 - [x] B10. `template`: `str_char_at` undefined (S).
 - [x] B11. A CI step imports every stdlib module on its own, so this cannot
       regress (S).
-- [~] B12. Every module has a test and a `docs/stdlib/` page. Pages are done
-      except `sqlite`; left: a test for each module (L).
-- [ ] B13. Replace bare `Vec` with `Vec<T>` across the stdlib, then make the
-      `str`/`i64` rule strict in imported modules too (L).
+- [x] B12. Every module has a test and a `docs/stdlib/` page (L). `tests/bootstrap/
+      test_lib_*.fd`; those of `sdl`, `ui`, `audio_mixer`, `image`, `font`, `gl`,
+      `shader` and `sys` need their library and run with `FIDES_TEST_EXTERNAL=1`.
+- [x] B13. Replace bare `Vec` with `Vec<T>` across the stdlib, then make the
+      `str`/`i64` rule strict in imported modules too (L). Only `core`, `vec` and
+      the self-hosted compiler keep the old rule. `Deque`, `Queue` and `Stack`
+      still hold `Vec<i64>` inside.
 - [ ] B14. `StringBuilder` is quadratic (`buf + s`): back it with `p_sb_*` (S).
 - [ ] B15. Remove the false claims in stubs: `@derive(Serialize)` emits constant
       data; `ota_verify_manifest` only checks a prefix; `sqlite` has no
@@ -148,6 +158,13 @@ Most modules still have no test, so expect more of this (B12).
 - [x] B18. A struct defined in two modules must be an error, as a function is:
       `core` and `buffer` both had a public `ByteBuffer`, and each compiler
       silently picked a different one (S).
+- [ ] B19. Bugs the module tests found and left open (M): direct `p_vec_*` calls do
+      nothing in the interpreter; an untyped `Vec::new()` of floats is misread as
+      `i64` in C; `T { a: 1 }` of an imported struct does not parse; a user
+      function named `yn` or `j0` clashes with libm in C; the interpreter prints a
+      `bool` from a `Vec<bool>` as 0 or 1; `__ecs_*` in the interpreter miss a
+      `str` passed through a wrapper; `LN_CSWI2` has no name in `grid`;
+      `font_render_text` starts from opaque black.
 
 **Acceptance:** every stdlib module compiles and has a passing test.
 
@@ -159,9 +176,9 @@ Most modules still have no test, so expect more of this (B12).
       a fresh call result used once as a concat operand (M).
 - [x] C2. Free local strings that never escape, by extending the
       `auto_drop_vecs` pass (M).
-- [ ] C3. Free `Vec`s passed only to functions that do not keep them: per-function
-      escape summaries, as `compiler/escape.fd` has for references (L).
-- [ ] C4. Half-step size classes, so a 33-byte string does not take 64 bytes (S).
+- [x] C3. Free `Vec`s passed only to functions that do not keep them: per-function
+      summaries of which arguments are only borrowed (L).
+- [x] C4. Half-step size classes, so a 33-byte string does not take 64 bytes (S).
 - [ ] C5. Free elements of a dropped `Vec<str>` and `Vec<Vec<T>>` when they are
       owned (L).
 - [ ] C6. Regions really free: `region { }` releases its allocations, with a
@@ -183,7 +200,8 @@ the fastest build-to-native among compiled languages, and native code within
       type checking about 14× faster.
 - [x] D1. Inline `Vec_set` and `Vec_push`'s fast path (S).
 - [x] D2. Division by a constant as a multiplication (`i % 7` costs an `idiv`) (S).
-- [ ] D3. Bounds-check and overflow-check elimination on simple counted loops (M).
+- [x] D3. Bounds-check and overflow-check elimination on simple counted loops,
+      on the native path (M).
 - [~] D4. Registers for the PE backend. Done: the five hottest locals of a
       function and short-lived temporaries live in callee-saved registers,
       weighted by loop depth. Left: values that cross blocks, caller-saved
@@ -203,7 +221,9 @@ the fastest build-to-native among compiled languages, and native code within
 - [x] E1. `extern "C"` from any DLL in native builds: `link "x"` adds to the PE
       import table (M). `ccompile` is needed today beyond msvcrt and kernel32.
 - [ ] E2. `use sqlite` and `use sdl` work through `emit` (depends on E1, B4) (S).
-- [ ] E3. Struct-by-value and callback arguments in the native thunks (M).
+- [x] E3. Struct-by-value and callback arguments in C calls: a struct of 1, 2, 4
+      or 8 bytes by value and as a result, a named Fides function as a callback,
+      native and C (M).
 - [ ] E4. `fid` finds and reports a missing library clearly (S).
 - [ ] E5. `parse-header` output compiles for a real header set (SDL2, SQLite) (M).
 
@@ -233,8 +253,8 @@ compiler.
       capability stubs), and test under QEMU (XL).
 - [ ] F9. WASM: globals, struct copies, collections (L).
 
-**Acceptance:** Windows and Linux are fully supported at 1.0; everything else is
-listed as experimental in the docs, with what does not work.
+**Acceptance:** Windows, Linux and macOS are fully supported at 1.0.0, on x64 and
+ARM64 where the system runs there; RISC-V and WASM pass the suite.
 
 ## Track G — Bare metal
 
@@ -256,13 +276,18 @@ listed as experimental in the docs, with what does not work.
       `p_thread_spawn` may not write a global of the program without a lock. Left:
       shared data reached through pointers and captures (L).
 - [ ] H4. Enforce `@send`/`@sync` for every spawn argument (M).
-- [~] H5. Real `async`: tasks suspend and resume (L, see decision 4). Done:
-      `stdlib/task.fd`, real stack switching. Left: `async fn` and `await` on top
-      of tasks, and tasks that wait on sockets.
+- [x] H5. Real `async`: an `async fn` is a task that runs until it first waits;
+      `await`, `task_sleep` and socket waits suspend it (L, see decision 4). An
+      `async fn` with float, struct or reference arguments or results still runs
+      to its end at the call.
 - [x] H6. Green threads outside the interpreter: fibers on Windows, `ucontext` on
       Linux, 10,000 tasks on one thread. The interpreter runs a task to its end.
 - [ ] H7. `parallel { }` runs multi-statement branches concurrently (M).
 - [ ] H8. Allocator: per-thread caches instead of one global lock (M).
+- [ ] H9. An `async fn` with float, struct or reference arguments or results is a
+      task too: today it runs to its end at the call (M).
+- [ ] H10. Tasks on several threads natively: the C runtime keeps them per thread,
+      the native one has a single set (M).
 
 **Acceptance:** a race test is rejected; 10,000 concurrent tasks run on a few
 threads.
@@ -271,14 +296,24 @@ threads.
 
 Depends on B, C, H5 and J.
 
-- [ ] I1. TCP in the native runtime: `net` goes through a C header
-      (`pledge_net.h`) and has no `listen` or `accept` (M).
-- [ ] I2. Non-blocking I/O tied to the `async` runtime (L).
-- [ ] I3. TLS client and server through a reviewed library (L, see decision 2).
-- [ ] I4. HTTP/1.1 client and server that handle real traffic, with tests
-      against a real client (L). `http` is a thin blocking wrapper today.
-- [ ] I5. `examples/http_server` runs on a native build (S).
-- [ ] I6. A sample service survives a 24-hour load test (M).
+- [x] I1. TCP in the native runtime: `p_socket_*` over Winsock (M).
+- [x] I2. Non-blocking I/O tied to tasks: `p_co_recv`, `p_co_send`, `p_co_accept`
+      (L).
+- [x] I3. TLS client and server: `use tls`, Schannel on Windows, OpenSSL on Linux
+      (L, see decision 2). TLS 1.3 needs the newer Schannel credentials: today
+      Windows negotiates 1.2.
+- [x] I4. HTTP/1.1 client and server: `http` and `https`, tested with curl, keep-
+      alive, chunked bodies, pipelining, 28,000 requests/s on one thread (L).
+      Bodies are text: a zero byte ends them. `http_serve_scoped` keeps memory
+      flat, on the promise that a handler keeps no request string.
+- [x] I5. `examples/http_server` runs on a native build (S).
+- [ ] I6. A sample service survives a 24-hour load test (M). A short run:
+      160,000 requests stay at 5.2 MB with `http_serve_scoped`.
+- [ ] I7. TLS 1.3 on Windows: Schannel needs its newer credentials structure; 1.2
+      is negotiated today (S).
+- [ ] I8. Binary HTTP bodies: a body is a `str`, so a zero byte ends it (M).
+- [ ] I9. `net`: `net_reliable_recv` never recognises an ACK, and the ACK it builds
+      is never sent (S).
 
 **Acceptance:** an HTTPS service runs for 24 hours under load, with flat memory.
 
@@ -298,10 +333,8 @@ Nothing here is ready to protect real data yet. Do not write new primitives.
 - [ ] J7. `@constant_time` verified on the PE path: its asm verifier covers x86-64
       ELF only (L).
 - [ ] J8. `@zeroize` reaches old `Vec` buffers and cannot be optimised away (M).
-- [ ] J9. Independent security review before anything is called production
-      ready (external).
 
-**Acceptance:** vectors pass in CI; a third party signs off.
+**Acceptance:** vectors pass in CI; the documented claims match the tests.
 
 ## Track K — Language soundness
 
@@ -329,19 +362,18 @@ Nothing here is ready to protect real data yet. Do not write new primitives.
 **Acceptance:** every line in `docs/reference/features.md` has a test proving it,
 and a test proving what it rejects.
 
-## Track L — Safety-critical (after 1.0)
+## Track L — Safety-critical
 
 Fides must not be described as suitable for medical, automotive or avionics use
-until this track is complete.
+until this track and L5 (set aside) are complete.
 
 - [ ] L1. Every safety annotation enforced, with a negative test per rule (L).
 - [ ] L2. Remaining stubs in the safety-annotation checks closed (M).
 - [ ] L3. `qualify` reports complete evidence (L).
 - [ ] L4. Requirements traceability from each rule to its tests (L).
-- [ ] L5. A qualified toolchain process per IEC 62304, ISO 26262 or DO-178C,
-      through a certification body (XL, external).
 
-**Acceptance:** an external assessor's report, not our own claim.
+**Acceptance:** every rule has its negative test and traces to its requirement.
+This is our evidence, not a certificate: see "Set aside".
 
 ## Track M — Memory safety
 
@@ -387,6 +419,9 @@ Tested on Nov 1, native build:
       paths and stay clean under M7 and M8, run nightly (L).
 - [ ] M10. Audit every `unsafe` block in the stdlib: each states why it is sound,
       and no safe stdlib function can be misused into a memory error (L).
+- [ ] M11. An owned and a borrowed string type, so a server frees its request
+      strings without a promise: `http_serve_scoped` is `@unsafe` until then (L,
+      after M4).
 
 K1, K4, K5, K6, C5, C6 and H3 count towards this goal.
 
@@ -415,12 +450,16 @@ project with packages and editor help. Checked Nov 1:
 - [ ] N1. CI runs `ark init`, `add`, `install` and a build from a clean machine,
       on Windows and Linux (S).
 - [ ] N2. A getting-started guide, followed step by step in CI (M).
-- [ ] N3. The VS Code extension starts the LSP, and is on the Marketplace (M).
+- [~] N3. The VS Code extension starts the LSP, and is on the Marketplace (M).
+      Done: it runs inside VS Code, with diagnostics on their real line, hover, go
+      to definition, completion and rename. Left: the Marketplace.
 - [ ] N4. `fmt --check` passes on the stdlib and the compiler in CI; formatting
       keeps every comment and never changes behaviour (M).
 - [ ] N5. `lint` runs in CI and is clean on the stdlib (S).
-- [ ] N6. Package registry: names, versions, checksums and yanking, with
-      `ark search` and `ark publish` working (L, see decision 6).
+- [~] N6. Package registry: names, versions, checksums and yanking, with
+      `ark search` and `ark publish` working (L, see decision 6). Done: a Git index,
+      `search`, `publish` and `install`, which checks the commit, tested end to end
+      on a local index. Left: the public index, yanking, committing it.
 - [ ] N7. The LSP gains references, formatting and signature help, with tests (M).
 - [ ] N8. `ark`, `scribe` and `veil` are ported to Fides or shipped by the same
       release process as `fid` (L).
@@ -445,10 +484,19 @@ and go to definition in VS Code, then format, test and build it.
 2. **M1–M3, M6, then C1–C4, D1–D3, E1–E3:** the cheap wins with the most visible
    effect, with the safety checks first so new frees cannot go unnoticed.
 3. **F1–F3, H1–H2, K1–K3, N1–N5:** the rest of the beta gate. **→ Public beta**
-4. **D4, H3, H5, C3, I, J, M4–M5, N6:** the large projects, after decisions 1–4
-   and 6.
-5. **K, remaining F, M and N, docs.** **→ Stable 1.0**
-6. **G, F7–F9, L:** after 1.0.
+4. **D4, H3, J, M4–M5, N6:** the large projects, after decisions 1–4 and 6.
+5. **K, remaining F4–F6, M and N, docs.**
+6. **G, F7–F9, J7–J8, L1–L4:** bare metal, the other platforms, and the safety
+   evidence. **→ Stable 1.0.0**
+
+## Set aside
+
+These need an outside party or money, so they wait, and they do not block 1.0.0.
+
+- [ ] J9. Independent security review before anything is called production
+      ready (external).
+- [ ] L5. A qualified toolchain process per IEC 62304, ISO 26262 or DO-178C,
+      through a certification body (XL, external).
 
 ## Notes
 

@@ -54,6 +54,35 @@ pub struct CThunk {
     pub slot: i64,
     pub params: Vec<IrType>,
     pub ret: IrType,
+    // For each parameter: the size of a struct C takes by value, else 0
+    pub by_value: Vec<i64>,
+    // The size of a struct C returns in rax, else 0
+    pub ret_size: i64,
+}
+
+/// What C calls for a Fides function: the C convention on one side, a null
+/// `__env` and raw bits on the other.
+pub struct CAdapter {
+    pub name: str,
+    pub target: str,
+    pub params: Vec<IrType>,
+    pub ret: IrType,
+}
+
+pub fn CAdapter_new(name: str, target: str, params: Vec<IrType>, ret: IrType) -> CAdapter {
+    return CAdapter { name: name, target: target, params: params, ret: ret };
+}
+
+/// The size of a struct Windows passes by value (in a register), else 0.
+pub fn pe_c_by_value(module: &IrModule, ty: IrType) -> i64 {
+    match ty {
+        IrType::Struct(_) => {
+            var size: i64 = IrModule_type_size(module, ty);
+            if size == 1 || size == 2 || size == 4 || size == 8 { return size; }
+        }
+        _ => {}
+    }
+    return 0;
 }
 
 /// Type id of dyn values (type name -> id, from 1).  Sorted Vec stand-in for
@@ -81,8 +110,28 @@ pub struct COverride {
 // Cross-module construction needs `Name_new` helpers: Fides has no struct
 // literals for types declared in another module (compiler/pe_ir.fd).
 
-pub fn CThunk_new(name: str, slot: i64, params: Vec<IrType>, ret: IrType) -> CThunk {
-    return CThunk { name: name, slot: slot, params: params, ret: ret };
+pub fn CThunk_new(module: &IrModule, name: str, slot: i64, params: Vec<IrType>, ret: IrType) -> CThunk {
+    var ret_size: i64 = pe_c_by_value(module, ret);
+    var all: Vec<IrType> = Vec::new();
+    // Any bigger struct: C takes the result pointer Fides passes, first
+    match ret {
+        IrType::Struct(_) => {
+            if ret_size == 0 { all.push(IrType::I64); }
+        }
+        _ => {}
+    }
+    var i: i64 = 0;
+    while i < params.len() {
+        all.push(params.get(i));
+        i = i + 1;
+    }
+    var by_value: Vec<i64> = Vec::new();
+    i = 0;
+    while i < all.len() {
+        by_value.push(pe_c_by_value(module, all.get(i)));
+        i = i + 1;
+    }
+    return CThunk { name: name, slot: slot, params: all, ret: ret, by_value: by_value, ret_size: ret_size };
 }
 
 pub fn COverride_new(name: str, over: str) -> COverride {
@@ -114,6 +163,10 @@ pub struct PeirGen {
     pub cur_func: str,
     /// The function being generated wraps on overflow
     pub cur_wrapping: bool,
+    // Per value: an instruction a counted loop proves safe (peir_unchecked_ops)
+    pub unchecked: Vec<i64>,
+    // The instruction being generated is one of them
+    pub cur_unchecked: bool,
     /// Labels of the arithmetic panic stubs (see gen_arith_panics)
     pub arith_panics: Vec<i64>,
     /// Label of the vectored exception handler
@@ -130,6 +183,7 @@ pub struct PeirGen {
     pub module_fns: Vec<str>,
     /// `extern "C"` functions called through the import table
     pub c_thunks: Vec<CThunk>,
+    pub c_adapters: Vec<CAdapter>,
     /// `extern "C"` functions of a missing local header: stubs returning 0
     pub stub_externs: Vec<str>,
     /// .rdata offset of the bump-allocator state block (24 bytes:
@@ -159,6 +213,8 @@ pub fn PeirGen_new() -> PeirGen {
         bare_mode: false,
         cur_func: "",
         cur_wrapping: false,
+        unchecked: Vec::new(),
+        cur_unchecked: false,
         arith_panics: Vec::new(),
         crash_filter: 0,
         saved_regs: Vec::new(),
@@ -166,6 +222,7 @@ pub fn PeirGen_new() -> PeirGen {
         unresolved: Vec::new(),
         module_fns: Vec::new(),
         c_thunks: Vec::new(),
+        c_adapters: Vec::new(),
         alloc_rdata_off: 0,
         stub_externs: Vec::new(),
         c_overrides: Vec::new(),
@@ -294,6 +351,7 @@ pub fn pe_stub_deps() -> Vec<PeirStrPair> {
     // p_thread_spawn(name, nargs, ...): varargs, captured into an array
     v.push(PeirStrPair { a: "p_thread_spawn", b: "pert_thread_spawn_v" });
     v.push(PeirStrPair { a: "p_executor_spawn", b: "pert_executor_spawn_v" });
+    v.push(PeirStrPair { a: "p_co_async", b: "pert_co_async_v" });
     // The C-convention thread start routine runs pert_thread_main(arg)
     v.push(PeirStrPair { a: "pe_thread_entry_addr", b: "pert_thread_main" });
     return v;
@@ -490,7 +548,7 @@ pub fn pe_ir_reachable_from(module: &IrModule, roots: Vec<str>) -> Vec<str> {
                             Inst::ConstStr(value) => {
                                 if pe_module_has_fn(module, value) { work.push(value); }
                             }
-                            Inst::ConstFnRef(n) => { work.push(n); }
+                            Inst::ConstFnRef(n) => { work.push(c_fn_target(n)); }
                             Inst::Print(_, ty) => {
                                 var pf: str = pe_ir_print_formatter(ty);
                                 if pf != "" { work.push(pf); }
@@ -1748,7 +1806,7 @@ fn PeirGen_gen_panic_write(self: &mut PeirGen) -> void {
 
 // Allocator state in writable .rdata: +0 cur, +8 end, +16 cached heap,
 // +24 spinlock, +32 the free list of each size class.
-pub const PEIR_ALLOC_STATE_SIZE: i64 = 200;
+pub const PEIR_ALLOC_STATE_SIZE: i64 = 360;
 const PEIR_ALLOC_LISTS: i64 = 32;
 // A block's header: this magic | its size class. p_free turns it into
 // PEIR_BLOCK_FREED | class, and panics on anything else: a block freed twice,
@@ -1861,8 +1919,23 @@ pub fn PeirGen_gen_malloc(self: &mut PeirGen) -> void {
         PeirEnc_place_label(&mut self.enc, class_ok);
         PeirEnc_mov_rr(&mut self.enc, PEIR_R13, PEIR_RAX);
         PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_R12);
         PeirEnc_mov_imm64(&mut self.enc, PEIR_R12, 1);
         PeirEnc_shl_cl(&mut self.enc, PEIR_R12);
+        PeirEnc_add_rr(&mut self.enc, PEIR_R13, PEIR_R13);
+        // Three quarters of the block, if that holds it
+        var whole: i64 = PeirEnc_alloc_label(&mut self.enc);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R12);
+        PeirEnc_shl_r_i8(&mut self.enc, PEIR_RAX, 1);
+        PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_R12);
+        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE8, 0x02); // shr rax, 2
+        PeirEnc_cmp_rr(&mut self.enc, PEIR_R8, PEIR_RAX);
+        PeirEnc_jcc_label(&mut self.enc, 0x7, whole); // ja
+        pe_emit4(&mut self.enc, 0x49, 0x83, 0xFD, 0x08); // cmp r13, 8
+        PeirEnc_jcc_label(&mut self.enc, 0x4, whole); // je
+        PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RAX);
+        pe_emit3(&mut self.enc, 0x49, 0xFF, 0xCD); // dec r13
+        PeirEnc_place_label(&mut self.enc, whole);
 
         // Pop this class's free list, under the spinlock. An unlocked look
         // first: an allocate-only program never takes the lock, and a block
@@ -1940,11 +2013,10 @@ pub fn PeirGen_gen_malloc(self: &mut PeirGen) -> void {
         PeirEnc_jcc_label(&mut self.enc, 0x7, grow); // ja: chunk full
         PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R8);
 
-        // A new block at rax: write its header. r12 is a power of two.
+        // A new block at rax: write its header
         PeirEnc_place_label(&mut self.enc, bumped);
-        pe_emit4(&mut self.enc, 0x49, 0x0F, 0xBD, 0xD4); // bsr rdx, r12
         PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, PEIR_BLOCK_MAGIC);
-        PeirEnc_or_rr(&mut self.enc, PEIR_R8, PEIR_RDX);
+        PeirEnc_or_rr(&mut self.enc, PEIR_R8, PEIR_R13);
         PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_R8);
         pe_emit4(&mut self.enc, 0x48, 0x83, 0xC0, 0x08); // add rax, 8
         PeirEnc_pop(&mut self.enc, PEIR_R13);
@@ -2019,6 +2091,16 @@ pub fn PeirGen_gen_malloc(self: &mut PeirGen) -> void {
         self.enc.pending_rip_refs.push(PeirRipRef_new(self.enc.code.len(), abase + 24));
         PeirEnc_emit_i32(&mut self.enc, 0);
         PeirEnc_emit_u8(&mut self.enc, 0x00);
+        // r13 held the chunk size: the class again, from the block size
+        var whole2: i64 = PeirEnc_alloc_label(&mut self.enc);
+        pe_emit4(&mut self.enc, 0x4D, 0x0F, 0xBD, 0xEC); // bsr r13, r12
+        PeirEnc_add_rr(&mut self.enc, PEIR_R13, PEIR_R13);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R12);
+        pe_emit3(&mut self.enc, 0x48, 0xFF, 0xCA); // dec rdx
+        PeirEnc_test_rr(&mut self.enc, PEIR_RDX, PEIR_R12);
+        PeirEnc_jcc_label(&mut self.enc, 0x4, whole2); // jz: a power of two
+        pe_emit3(&mut self.enc, 0x49, 0xFF, 0xC5); // inc r13
+        PeirEnc_place_label(&mut self.enc, whole2);
         PeirEnc_jmp_label(&mut self.enc, bumped);
 
         // oom: release lock, return NULL (caller crashes on use, as before)
@@ -4969,9 +5051,45 @@ pub fn PeirGen_gen_entry_point(self: &mut PeirGen) -> void {
 /// then the stack, floats as raw bits in integer registers, the result
 /// in rax) to a C function of the import table (float arguments in
 /// xmm0-3, a float result in xmm0, an `int` result in eax).
-pub fn PeirGen_gen_c_thunk(self: &mut PeirGen, t: &CThunk) -> void {
-    PeirGen_place_fn(self, t.name);
-    var stack_args: i64 = t.params.len() - 4;
+// Replace the pointer in register `n` (rax, rcx, rdx, r8 or r9) by the struct
+// of `size` bytes it points at; 0 leaves it.
+fn PeirGen_load_by_value(self: &mut PeirGen, n: i64, size: i64) -> void {
+    var rex: i64 = 0x40;
+    if n >= 8 { rex = 0x45; }
+    var modrm: i64 = ((n & 7) << 3) | (n & 7);
+    if size == 8 {
+        pe_emit3(&mut self.enc, rex | 8, 0x8B, modrm);
+    } else if size == 4 {
+        pe_emit3(&mut self.enc, rex, 0x8B, modrm);
+    } else if size == 2 {
+        pe_emit4(&mut self.enc, rex, 0x0F, 0xB7, modrm);
+    } else if size == 1 {
+        pe_emit4(&mut self.enc, rex, 0x0F, 0xB6, modrm);
+    }
+}
+
+// Widen the C argument in register `n`, whose upper bits are undefined.
+fn PeirGen_widen_c_arg(self: &mut PeirGen, n: i64, ty: IrType) -> void {
+    var rex: i64 = 0x40;
+    if n >= 8 { rex = 0x45; }
+    var modrm: i64 = 0xC0 | ((n & 7) << 3) | (n & 7);
+    match ty {
+        IrType::I32 => { pe_emit3(&mut self.enc, rex | 8, 0x63, modrm); }
+        IrType::U32 => { pe_emit3(&mut self.enc, rex, 0x8B, modrm); }
+        IrType::I16 => { pe_emit4(&mut self.enc, rex | 8, 0x0F, 0xBF, modrm); }
+        IrType::U16 => { pe_emit4(&mut self.enc, rex, 0x0F, 0xB7, modrm); }
+        IrType::I8 => { pe_emit4(&mut self.enc, rex | 8, 0x0F, 0xBE, modrm); }
+        IrType::U8 => { pe_emit4(&mut self.enc, rex, 0x0F, 0xB6, modrm); }
+        IrType::Bool => { pe_emit4(&mut self.enc, rex, 0x0F, 0xB6, modrm); }
+        _ => {}
+    }
+}
+
+pub fn PeirGen_gen_c_adapter(self: &mut PeirGen, a: &CAdapter) -> void {
+    PeirGen_place_fn(self, a.name);
+    var n: i64 = a.params.len();
+    // The fourth C argument moves to the stack: `__env` takes rcx
+    var stack_args: i64 = n + 1 - 4;
     if stack_args < 0 { stack_args = 0; }
     // On entry rsp = 8 (mod 16): the frame realigns it for the call
     var frame: i64 = 32 + 8 * stack_args;
@@ -4979,13 +5097,83 @@ pub fn PeirGen_gen_c_thunk(self: &mut PeirGen, t: &CThunk) -> void {
         frame = frame + 8;
     }
     PeirEnc_sub_rsp_i32(&mut self.enc, frame);
+    var regs: Vec<i64> = Vec::new();
+    regs.push(PEIR_RCX); regs.push(PEIR_RDX); regs.push(PEIR_R8); regs.push(PEIR_R9);
+    var i: i64 = 0;
+    while i < n && i < 4 {
+        var r: i64 = regs.get(i);
+        var rex: i64 = 0x48;
+        if r >= 8 { rex = 0x49; }
+        var modrm: i64 = 0xC0 | (i << 3) | (r & 7);
+        var ty: IrType = a.params.get(i);
+        match ty {
+            // movq r, xmm_i
+            IrType::F64 => { pe_emit5(&mut self.enc, 0x66, rex, 0x0F, 0x7E, modrm); }
+            // movd r32, xmm_i
+            IrType::F32 => { pe_emit5(&mut self.enc, 0x66, rex & 0x41, 0x0F, 0x7E, modrm); }
+            _ => { PeirGen_widen_c_arg(self, r, ty); }
+        }
+        i = i + 1;
+    }
+    i = 4;
+    while i < n {
+        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_RSP, frame + 8 + 32 + 8 * (i - 4));
+        PeirGen_widen_c_arg(self, 0, a.params.get(i));
+        PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 32 + 8 * (i - 3), PEIR_RAX);
+        i = i + 1;
+    }
+    if n >= 4 {
+        PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 32, PEIR_R9);
+    }
+    pe_emit3(&mut self.enc, 0x4D, 0x89, 0xC1); // mov r9, r8
+    pe_emit3(&mut self.enc, 0x49, 0x89, 0xD0); // mov r8, rdx
+    pe_emit3(&mut self.enc, 0x48, 0x89, 0xCA); // mov rdx, rcx
+    pe_emit2(&mut self.enc, 0x31, 0xC9);       // xor ecx, ecx
+    PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, a.target));
+    match a.ret {
+        IrType::F64 => { pe_emit5(&mut self.enc, 0x66, 0x48, 0x0F, 0x6E, 0xC0); } // movq xmm0, rax
+        IrType::F32 => { pe_emit4(&mut self.enc, 0x66, 0x0F, 0x6E, 0xC0); }       // movd xmm0, eax
+        _ => {}
+    }
+    PeirEnc_add_rsp_i32(&mut self.enc, frame);
+    PeirEnc_ret(&mut self.enc);
+}
+
+pub fn PeirGen_gen_c_thunk(self: &mut PeirGen, t: &CThunk) -> void {
+    PeirGen_place_fn(self, t.name);
+    var n: i64 = t.params.len();
+    var stack_args: i64 = n - 4;
+    if stack_args < 0 { stack_args = 0; }
+    // A struct C returns in rax: the result pointer Fides passes first
+    // waits in the frame, and the arguments move down one place
+    var shift: i64 = 0;
+    if t.ret_size > 0 { shift = 1; }
+    var ret_slot: i64 = 32 + 8 * stack_args;
+    // On entry rsp = 8 (mod 16): the frame realigns it for the call
+    var frame: i64 = ret_slot + 8 * shift;
+    if frame % 16 == 0 {
+        frame = frame + 8;
+    }
+    PeirEnc_sub_rsp_i32(&mut self.enc, frame);
+    if shift > 0 {
+        PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, ret_slot, PEIR_RCX);
+    }
     var i: i64 = 0;
     while i < stack_args {
         // The caller's fifth and later arguments: above our frame and
         // the return address, past the caller's 32-byte shadow space
-        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_RSP, frame + 8 + 32 + 8 * i);
+        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_RSP, frame + 8 + 32 + 8 * (i + shift));
+        PeirGen_load_by_value(self, 0, t.by_value.get(4 + i));
         PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 32 + 8 * i, PEIR_RAX);
         i = i + 1;
+    }
+    if shift > 0 {
+        pe_emit3(&mut self.enc, 0x48, 0x89, 0xD1); // mov rcx, rdx
+        pe_emit3(&mut self.enc, 0x4C, 0x89, 0xC2); // mov rdx, r8
+        pe_emit3(&mut self.enc, 0x4D, 0x89, 0xC8); // mov r8, r9
+        if n >= 4 {
+            PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R9, PEIR_RSP, frame + 8 + 32);
+        }
     }
     var regs: Vec<i64> = Vec::new();
     regs.push(PEIR_RCX); regs.push(PEIR_RDX); regs.push(PEIR_R8); regs.push(PEIR_R9);
@@ -4993,6 +5181,7 @@ pub fn PeirGen_gen_c_thunk(self: &mut PeirGen, t: &CThunk) -> void {
     if np > 4 { np = 4; }
     i = 0;
     while i < np {
+        PeirGen_load_by_value(self, regs.get(i), t.by_value.get(i));
         var ty: IrType = t.params.get(i);
         match ty {
             // The integer register keeps its copy: a variadic function
@@ -5051,6 +5240,18 @@ pub fn PeirGen_gen_c_thunk(self: &mut PeirGen, t: &CThunk) -> void {
             pe_emit8(&mut self.enc, 0x85, 0xC0, 0x0F, 0x95, 0xC0, 0x0F, 0xB6, 0xC0);
         }
         _ => {}
+    }
+    if shift > 0 {
+        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RCX, PEIR_RSP, ret_slot);
+        if t.ret_size == 8 {
+            pe_emit3(&mut self.enc, 0x48, 0x89, 0x01); // mov [rcx], rax
+        } else if t.ret_size == 4 {
+            pe_emit2(&mut self.enc, 0x89, 0x01);       // mov [rcx], eax
+        } else if t.ret_size == 2 {
+            pe_emit3(&mut self.enc, 0x66, 0x89, 0x01); // mov [rcx], ax
+        } else {
+            pe_emit2(&mut self.enc, 0x88, 0x01);       // mov [rcx], al
+        }
     }
     PeirEnc_add_rsp_i32(&mut self.enc, frame);
     PeirEnc_ret(&mut self.enc);
@@ -5208,6 +5409,17 @@ pub fn PeirGen_gen_pe_primitives(self: &mut PeirGen) -> void {
         pe_emit5(&mut self.enc, 0x4C, 0x8D, 0x4C, 0x24, 0x18);
         var target: i64 = HashMap_get(self.func_labels, "pert_thread_spawn_v");
         PeirEnc_jmp_label(&mut self.enc, target);
+    }
+    // p_co_async(name, nargs, args...): likewise
+    if HashMap_contains(self.func_labels, "p_co_async") {
+        PeirGen_place_fn(self, "p_co_async");
+        PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 24, PEIR_R8);
+        PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 32, PEIR_R9);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_RDX);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_RCX);
+        PeirEnc_xor_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
+        pe_emit5(&mut self.enc, 0x4C, 0x8D, 0x4C, 0x24, 0x18); // lea r9, [rsp+24]
+        PeirEnc_jmp_label(&mut self.enc, HashMap_get(self.func_labels, "pert_co_async_v"));
     }
     // p_executor_spawn(exec, name, nargs, args...): likewise, from the
     // fourth argument; pert_executor_spawn_v(name, nargs, argv)

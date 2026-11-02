@@ -254,6 +254,8 @@ pub struct Lowerer {
     /// Async function names — functions declared with `async pf`
     /// Calls to these functions are wrapped in p_future_ready
     async_funcs: std::collections::HashSet<String>,
+    /// Those whose calls start a task: their arguments and result are words
+    async_tasks: std::collections::HashSet<String>,
     /// Current function's AST parameter types — maps param name to AST type
     /// Used to determine return types of function-typed parameters (closures)
     current_func_param_types: HashMap<String, Type>,
@@ -353,6 +355,7 @@ impl Lowerer {
             func_ret_types: HashMap::new(),
             trait_method_rets: HashMap::new(),
             async_funcs: std::collections::HashSet::new(),
+            async_tasks: std::collections::HashSet::new(),
             current_func_param_types: HashMap::new(),
             vec_allocas: std::collections::HashSet::new(),
             linear_structs: std::collections::HashSet::new(),
@@ -527,6 +530,13 @@ impl Lowerer {
             // Track async functions — calls to these are wrapped in p_future_ready
             if func.is_async {
                 self.async_funcs.insert(func.name.clone());
+                let ret = match &func.ret_ty {
+                    Type::Generic { name, args } if name == "Future" => args.first().unwrap_or(&Type::Void),
+                    other => other,
+                };
+                if task_word(ret) && func.params.iter().all(|p| task_word(&p.ty)) {
+                    self.async_tasks.insert(func.name.clone());
+                }
             }
         }
 
@@ -1191,6 +1201,15 @@ impl Lowerer {
         self.module.add_extern("p_co_run", vec![], IrType::I64);
         self.module.add_extern("p_co_done", vec![IrType::I64], IrType::I64);
         self.module.add_extern("p_co_result", vec![IrType::I64], IrType::I64);
+        // p_co_async(func_name, num_args, args...) -> i64 (Future handle)
+        self.module.add_extern("p_co_async", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::I64], IrType::I64);
+        self.module.add_extern("p_co_sleep", vec![IrType::I64], IrType::I64);
+        self.module.add_extern("p_co_wait_fd", vec![IrType::I64, IrType::I64, IrType::I64], IrType::I64);
+        self.module.add_extern("p_co_detach", vec![IrType::I64], IrType::Void);
+        self.module.add_extern("p_co_accept", vec![IrType::I64], IrType::I64);
+        self.module.add_extern("p_co_connect", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::I64], IrType::I64);
+        self.module.add_extern("p_co_recv", vec![IrType::I64, IrType::I64, IrType::I64, IrType::I64], IrType::I64);
+        self.module.add_extern("p_co_send", vec![IrType::I64, IrType::I64, IrType::I64], IrType::I64);
         // p_executor_spawn(exec, func_name, num_args, args...) -> i64 (future handle)
         self.module.add_extern("p_executor_spawn",
             vec![IrType::I64, IrType::Ptr(Box::new(IrType::U8)), IrType::I64],
@@ -4223,6 +4242,16 @@ impl Lowerer {
                 let mut left_val = self.lower_expr(left);
                 let mut right_val = self.lower_expr(right);
                 let mut result_ty = self.infer_binop_type(op, left, right);
+                // What an operand is beats what inference guessed: a method's
+                // float result is not an integer to convert
+                let left_ir_ty = match self.get_value_type(left_val) {
+                    actual if actual.is_float() => actual,
+                    _ => left_ir_ty,
+                };
+                let right_ir_ty = match self.get_value_type(right_val) {
+                    actual if actual.is_float() => actual,
+                    _ => right_ir_ty,
+                };
 
                 // An integer operand next to a float one is converted to that
                 // float type (C's usual arithmetic conversion): `f < 0`, `2 * f`.
@@ -4236,6 +4265,8 @@ impl Lowerer {
                 } else if numeric && plain_int(&left_ir_ty) && right_ir_ty.is_float() {
                     left_val = self.emit_inst(Inst::IntToFloat { value: left_val, from: left_ir_ty.clone(), to: right_ir_ty.clone() });
                     if !matches!(result_ty, IrType::Bool) { result_ty = right_ir_ty.clone(); }
+                } else if numeric && left_ir_ty.is_float() && right_ir_ty.is_float() && !matches!(result_ty, IrType::Bool) {
+                    result_ty = left_ir_ty.clone();
                 }
 
                 // String concatenation: when + is used with two str operands,
@@ -4339,12 +4370,14 @@ impl Lowerer {
                     if let Expr::IntLit(v) = expr.as_ref() {
                         return self.emit_inst(Inst::ConstInt { value: v.wrapping_neg(), ty: IrType::I64 });
                     }
-                    let ty = self.infer_unary_type(op, expr);
+                    let operand = self.lower_expr(expr);
+                    let actual = self.get_value_type(operand);
+                    let ty = if actual.is_float() { actual } else { self.infer_unary_type(op, expr) };
                     if ty.is_int() {
-                        let operand = self.lower_expr(expr);
                         let zero = self.emit_inst(Inst::ConstInt { value: 0, ty: ty.clone() });
                         return self.emit_inst(Inst::BinOp { op: BinOp::Sub, left: zero, right: operand, ty });
                     }
+                    return self.emit_inst(Inst::UnaryOp { op: op.clone(), operand, ty });
                 }
                 let operand = self.lower_expr(expr);
                 let result_ty = self.infer_unary_type(op, expr);
@@ -4356,9 +4389,34 @@ impl Lowerer {
             }
 
             Expr::Call { callee, args } => {
-                let arg_vals: Vec<ValueId> = args.iter()
-                    .map(|a| self.lower_expr(a))
+                let extern_params = self.module.extern_functions.get(callee).map(|(p, _)| p.clone());
+                let arg_vals: Vec<ValueId> = args.iter().enumerate()
+                    .map(|(i, a)| match (a, extern_params.as_ref().and_then(|p| p.get(i))) {
+                        // C calls a Fides function through its adapter
+                        (Expr::Ident(name), Some(IrType::Opaque(o)))
+                            if o == "func" && self.module.functions.contains_key(name) =>
+                        {
+                            self.module.c_callbacks.insert(name.clone());
+                            let adapter = format!("{}{}", crate::ir::C_FN_PREFIX, name);
+                            self.emit_inst(Inst::ConstFnRef { name: adapter })
+                        }
+                        _ => self.lower_expr(a),
+                    })
                     .collect();
+
+                // An async function runs on its own stack, until it first waits
+                if self.async_tasks.contains(callee) {
+                    let name = self.emit_inst(Inst::ConstStr { value: callee.clone() });
+                    let count = self.emit_inst(Inst::ConstInt { value: args.len() as i64, ty: IrType::I64 });
+                    let mut call_args = vec![name, count];
+                    call_args.extend(arg_vals);
+                    return self.emit_inst(Inst::Call {
+                        func: "p_co_async".to_string(),
+                        args: call_args,
+                        ret_ty: IrType::I64,
+                        effects: EffectSet::new(),
+                    });
+                }
 
                 // Check if callee is a local variable (function-typed param)
                 let is_local = self.current_func.as_ref().and_then(|f| f.lookup_local(callee)).is_some()
@@ -6685,12 +6743,26 @@ impl Lowerer {
                 // The inner expression evaluates to a Future<T> (an opaque handle).
                 // p_future_poll extracts the value from the Future.
                 let future_val = self.lower_expr(inner);
-                self.emit_inst(Inst::Call {
+                let value = self.emit_inst(Inst::Call {
                     func: "p_future_poll".to_string(),
                     args: vec![future_val],
                     ret_ty: IrType::I64,
                     effects: EffectSet::new(),
-                })
+                });
+                // A future holds a word: give a pointer its type back
+                let future_ty = match &**inner {
+                    Expr::Call { callee, .. } => self.func_ret_types.get(callee).cloned(),
+                    _ => None,
+                };
+                match future_ty {
+                    Some(Type::Generic { name, args }) if name == "Future" && !args.is_empty() => {
+                        match self.lower_type(&args[0]) {
+                            ty @ IrType::Ptr(_) => self.lower_cast(value, IrType::I64, ty),
+                            _ => value,
+                        }
+                    }
+                    _ => value,
+                }
             }
             Expr::Spawn { expr: inner } => {
                 // spawn <expr> — create a concurrent task.
@@ -8050,6 +8122,18 @@ fn is_const_init(expr: &Expr) -> bool {
     }
 }
 
+/// A value a task can hold across a suspension and hand back: one word that
+/// does not point into its caller's stack.
+fn task_word(ty: &Type) -> bool {
+    match ty {
+        Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::U8 | Type::U16 | Type::U32 | Type::U64
+        | Type::Bool | Type::Str | Type::Void => true,
+        Type::Named(n) => n == "str",
+        Type::Generic { name, .. } => name == "Vec" || name == "HashMap",
+        _ => false,
+    }
+}
+
 /// Lower a program to IR — convenience function
 pub fn lower(program: &Program) -> IrModule {
     let mut lowerer = Lowerer::new();
@@ -8066,9 +8150,92 @@ const VEC_LOCAL_CALLS: &[&str] = &[
     "Vec_capacity", "Vec_contains", "Vec_first", "Vec_last", "Vec_truncate", "Vec_reverse", "Vec_sort",
 ];
 
+/// Per function, per argument: 1 for a Vec it only uses, keeping no reference
+/// to it and leaving it to the caller to free.
+type VecBorrows = HashMap<String, Vec<bool>>;
+
+fn vec_borrows(module: &IrModule) -> VecBorrows {
+    let is_vec = |t: &IrType| match t {
+        IrType::Generic(n, _) | IrType::Opaque(n) => n == "Vec",
+        _ => false,
+    };
+    let mut borrows: VecBorrows = module.functions.iter()
+        .map(|(name, f)| {
+            let flags = f.params.iter().map(|(_, t)| match t {
+                IrType::Ptr(inner) => is_vec(inner),
+                _ => is_vec(t),
+            });
+            (name.clone(), flags.collect::<Vec<bool>>())
+        })
+        .filter(|(_, flags)| flags.contains(&true))
+        .collect();
+    // Every candidate holds until a use disproves it: functions may call
+    // each other
+    let names: Vec<String> = borrows.keys().cloned().collect();
+    loop {
+        let mut changed = false;
+        for name in &names {
+            let f = &module.functions[name];
+            for (i, (param, _)) in f.params.iter().enumerate() {
+                if borrows[name][i] && !only_borrows(f, *param, &borrows) {
+                    borrows.get_mut(name).unwrap()[i] = false;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return borrows;
+        }
+    }
+}
+
+fn only_borrows(f: &IrFunction, param: ValueId, borrows: &VecBorrows) -> bool {
+    // The parameter, or for `&Vec` the handle read through it
+    let order: Vec<ValueId> = f.blocks.iter().flat_map(|b| b.instructions.iter().copied()).collect();
+    let mut handles: HashSet<ValueId> = HashSet::new();
+    handles.insert(param);
+    for id in &order {
+        if matches!(f.instructions.get(id), Some(Inst::Load { ptr, .. }) if *ptr == param) {
+            handles.insert(*id);
+        }
+    }
+    for id in &order {
+        let Some(inst) = f.instructions.get(id) else { continue; };
+        let mut ops = Vec::new();
+        crate::pe::inst_operands(inst, &mut ops);
+        for op in ops {
+            if handles.contains(&op) && !matches!(inst, Inst::Load { .. }) && !keeps_no_vec(inst, op, borrows) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// `inst` uses the Vec `op` without keeping a reference to it.
+fn keeps_no_vec(inst: &Inst, op: ValueId, borrows: &VecBorrows) -> bool {
+    match inst {
+        Inst::Print { .. } => true,
+        Inst::Call { func, args, .. } => {
+            if VEC_LOCAL_CALLS.contains(&func.as_str()) && args.len() >= 2 && args[1] == op
+                && !args[2..].contains(&op)
+            {
+                return true;
+            }
+            match borrows.get(func) {
+                Some(flags) => args.iter().enumerate()
+                    .all(|(i, a)| *a != op || flags.get(i).copied().unwrap_or(false)),
+                None => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Free the Vecs that provably never leave their local variable: a slot that
 /// only ever receives a fresh `Vec_new`, read only as the receiver of
-/// VEC_LOCAL_CALLS (or to print it). The previous Vec is freed when the slot
+/// VEC_LOCAL_CALLS, by a function that only borrows it, or to print it. The
+/// previous Vec is freed when the slot
 /// is written again (a loop's next iteration) and the last one at each
 /// return. Anything else, an element stored elsewhere included, stays
 /// allocated: the worst case is a leak, never a dangling Vec.
@@ -8076,12 +8243,13 @@ fn auto_drop_vecs(module: &mut IrModule) {
     if !module.functions.contains_key("Vec_drop") {
         return;
     }
+    let borrows = vec_borrows(module);
     for func in module.functions.values_mut() {
-        drop_function_vecs(func);
+        drop_function_vecs(func, &borrows);
     }
 }
 
-fn drop_function_vecs(f: &mut IrFunction) {
+fn drop_function_vecs(f: &mut IrFunction, borrows: &VecBorrows) {
     let order: Vec<ValueId> = f.blocks.iter().flat_map(|b| b.instructions.iter().copied()).collect();
     let is_new = |f: &IrFunction, id: &ValueId| matches!(f.instructions.get(id), Some(Inst::Call { func, .. }) if func == "Vec_new");
     if !order.iter().any(|id| is_new(f, id)) {
@@ -8121,17 +8289,11 @@ fn drop_function_vecs(f: &mut IrFunction) {
         for op in ops {
             let is_target = (own_load || own_store) && matches!(inst,
                 Inst::Load { ptr, .. } | Inst::Store { ptr, .. } if *ptr == op);
-            if is_slot(&op) && !is_target {
+            if is_slot(&op) && !is_target && !keeps_no_vec(inst, op, borrows) {
                 bad.insert(op);
             }
             if let Some(slot) = loaded.get(&op) {
-                let local = match inst {
-                    Inst::Call { func, args, .. } => VEC_LOCAL_CALLS.contains(&func.as_str())
-                        && args.len() >= 2 && args[1] == op && !args[2..].contains(&op),
-                    Inst::Print { .. } => true,
-                    _ => false,
-                };
-                if !local {
+                if !keeps_no_vec(inst, op, borrows) {
                     bad.insert(*slot);
                 }
             }

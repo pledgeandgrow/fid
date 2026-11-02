@@ -1894,6 +1894,7 @@ fn real_main() {
                 // Reference escape check: references outliving what they point to
                 "test_escape_return_fail",
                 "test_escape_scope_fail",
+                "test_c_callback_closure_fail",
                 "test_escape_store_fail",
                 "test_escape_closure_fail",
                 // @constant_time: data-dependent branch on secret — rejected
@@ -2029,6 +2030,10 @@ fn real_main() {
             // compiled; the C binary's output is the reference for PE.
             let interp_skip_tests: &[&str] = &[
                 "probe_lower",
+                "test_async_suspend",
+                "test_c_callback",
+                "test_lib_os",
+                "test_http_server",
                 "test_pe_dll_import",
                 "test_pe_task_order",
                 "test_spawn_gt",
@@ -2038,6 +2043,14 @@ fn real_main() {
             // only with FIDES_TEST_EXTERNAL=1 (the library must be installed).
             let external_lib_tests: &[(&str, &str)] = &[
                 ("test_sqlite", "libsqlite3"),
+                ("test_lib_sdl", "SDL2"),
+                ("test_lib_ui", "SDL2"),
+                ("test_lib_audio_mixer", "SDL2"),
+                ("test_lib_image", "SDL2_image"),
+                ("test_lib_font", "SDL2"),
+                ("test_lib_gl", "OpenGL"),
+                ("test_lib_shader", "OpenGL"),
+                ("test_lib_sys", "POSIX unistd.h"),
             ];
             let run_external = std::env::var("FIDES_TEST_EXTERNAL").map_or(false, |v| v == "1");
 
@@ -2351,7 +2364,9 @@ fn real_main() {
                     pe_unsupported += 1;
                     eprintln!("  [UNSUPPORTED] pe emit: {} (needs {})", name, missing);
                 } else if fail_only {
-                    if pe_ok {
+                    // A .exe runs only on Windows: elsewhere a program that fails
+                    // when it runs compiles and shows nothing
+                    if pe_ok && cfg!(windows) {
                         pe_fail += 1;  // unexpected pass!
                         eprintln!("  [UNEXPECTED PASS] pe emit: {} (should have failed)", name);
                     } else {

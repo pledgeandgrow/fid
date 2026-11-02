@@ -1,0 +1,157 @@
+// stdlib/profiler: nested scopes (depth and parent), per-frame counters,
+// frame history and its limit, enable/disable, reset, init and shutdown.
+// The profiler reads the clock, so times are only checked for sign and
+// order, never printed; the history string is built from values set by hand.
+use profiler;
+
+fn say_yes(b: bool) {
+    if b { println("yes"); } else { println("no"); }
+}
+
+fn one_frame(p: &mut Profiler, draws: i64) {
+    profiler_begin_frame(p);
+    var i: i64 = 0;
+    while i < draws {
+        profiler_count_draw_call(p);
+        i = i + 1;
+    }
+    profiler_end_frame(p);
+}
+
+fn main() -> i64 {
+    var p = profiler_create();
+    println(p.enabled);
+    println(p.max_frames);
+    println(profiler_frame_count(&p));
+    println(profiler_sample_count(&p));
+    println(profiler_min_frame(&p));
+    println(profiler_max_frame(&p));
+    println(profiler_fps(&p));
+    println(profiler_frame_time(&p));
+    println(profiler_draw_calls(&p));
+    println(profiler_triangles(&p));
+
+    // nested scopes: update > (physics > collide), render
+    profiler_begin_frame(&mut p);
+    profiler_begin(&mut p, "update");
+    profiler_begin(&mut p, "physics");
+    profiler_begin(&mut p, "collide");
+    println(p.current_depth);
+    profiler_end(&mut p, "collide");
+    profiler_end(&mut p, "physics");
+    profiler_begin(&mut p, "render");
+    profiler_end(&mut p, "render");
+    profiler_end(&mut p, "update");
+    // an end with nothing open is ignored
+    profiler_end(&mut p, "update");
+    println(p.current_depth);
+    println(profiler_sample_count(&p));
+    var s = profiler_get_sample(&p, "collide");
+    println(s.name);
+    println(s.depth);
+    println(s.parent);
+    say_yes(s.elapsed_ms >= 0.0);
+    var u = profiler_get_sample(&p, "update");
+    println(u.depth);
+    println(u.parent);
+    var r = profiler_get_sample(&p, "render");
+    println(r.depth);
+    println(r.parent);
+    var ph = profiler_get_sample_idx(&p, 1);
+    println(ph.name);
+    println(ph.parent);
+    // a missing name and a bad index give the empty sample
+    var none = profiler_get_sample(&p, "nope");
+    println(none.name);
+    println(none.parent);
+    var bad = profiler_get_sample_idx(&p, 9);
+    println(bad.name);
+    println(bad.parent);
+    var neg = profiler_get_sample_idx(&p, -1);
+    println(neg.depth);
+
+    // counters
+    profiler_count_draw_call(&mut p);
+    profiler_count_draw_call(&mut p);
+    profiler_count_draw_call(&mut p);
+    profiler_count_triangles(&mut p, 100);
+    profiler_count_triangles(&mut p, 50);
+    profiler_count_texture_bind(&mut p);
+    profiler_count_texture_bind(&mut p);
+    profiler_count_shader_switch(&mut p);
+    profiler_end_frame(&mut p);
+    println(profiler_draw_calls(&p));
+    println(profiler_triangles(&p));
+    println(profiler_frame_count(&p));
+    println(p.total_draw_calls);
+    var lf = profiler_last_frame(&p);
+    println(lf.frame_number);
+    println(lf.draw_calls);
+    println(lf.triangles);
+    println(lf.texture_binds);
+    println(lf.shader_switches);
+    say_yes(lf.frame_time_ms >= 0.0);
+    say_yes(profiler_min_frame(&p) >= 0.0);
+    say_yes(profiler_min_frame(&p) <= profiler_max_frame(&p));
+    say_yes(profiler_frame_time(&p) >= 0.0);
+
+    // a new frame clears the samples and counters; totals keep growing
+    one_frame(&mut p, 5);
+    println(profiler_draw_calls(&p));
+    println(p.total_draw_calls);
+    println(profiler_frame_count(&p));
+    println(profiler_sample_count(&p));
+    println(p.frame_count);
+
+    // history keeps only max_frames entries, frame_count counts them all
+    profiler_set_max_frames(&mut p, 2);
+    println(profiler_frame_count(&p));
+    one_frame(&mut p, 1);
+    one_frame(&mut p, 2);
+    one_frame(&mut p, 3);
+    println(profiler_frame_count(&p));
+    println(p.frame_count);
+    println(profiler_draw_calls(&p));
+    profiler_set_max_frames(&mut p, 1);
+    println(profiler_frame_count(&p));
+    println(profiler_draw_calls(&p));
+
+    // the average FPS needs a history; with times set by hand it is exact
+    p.hist_frame_times.clear();
+    p.hist_frame_times.push(0.5);
+    p.hist_frame_times.push(2.0);
+    println(profiler_frame_time_history(&p));
+    println(profiler_frame_time(&p));
+
+    // disabled: scopes and frames are ignored
+    profiler_set_enabled(&mut p, false);
+    var before = p.frame_count;
+    profiler_begin_frame(&mut p);
+    profiler_begin(&mut p, "ignored");
+    println(profiler_sample_count(&p));
+    profiler_end_frame(&mut p);
+    println(p.frame_count == before);
+    profiler_set_enabled(&mut p, true);
+    one_frame(&mut p, 1);
+    println(p.frame_count == before + 1);
+
+    // reset keeps the samples and the limit but clears the statistics
+    profiler_reset(&mut p);
+    println(profiler_frame_count(&p));
+    println(p.frame_count);
+    println(p.total_draw_calls);
+    println(profiler_min_frame(&p));
+    println(profiler_max_frame(&p));
+    println(profiler_fps(&p));
+    println(p.max_frames);
+
+    // init clears everything and enables; shutdown disables
+    one_frame(&mut p, 2);
+    profiler_init(&mut p);
+    println(p.enabled);
+    println(profiler_frame_count(&p));
+    profiler_shutdown(&mut p);
+    println(p.enabled);
+    println(profiler_sample_count(&p));
+    return 0;
+}

@@ -1,0 +1,81 @@
+// stdlib/asset: the part of the asset manager that needs no native library:
+// text assets (loaded through p_file_read), the lookup by path, reference
+// counting while references remain, the accessors with bad indexes, size
+// and memory accounting, and init. Textures, sounds, fonts and meshes are
+// loaded through extern "C" functions (pledge_asset_*) and releasing the
+// last reference of any asset unloads through one too, so those paths are
+// not run here (the interpreter has no FFI).
+use asset;
+use file;
+
+fn main() -> i64 {
+    var path = "_test_lib_asset.tmp";
+    file_write(path, "hello\n");
+
+    asset_init();
+    asset_set_root("assets/");
+    asset_set_auto_reload(false);
+    println(asset_count());
+    println(asset_memory_usage());
+    println(asset_find(path));
+
+    // a missing or empty file does not load
+    println(asset_load_text("_test_lib_asset_missing.tmp"));
+    println(asset_count());
+
+    var a = asset_load_text(path);
+    println(a);
+    println(asset_count());
+    println(asset_memory_usage());
+    println(asset_find(path));
+    println(asset_path(a));
+    println(asset_type(a) == ASSET_TEXT);
+    println(asset_handle(a));
+
+    // loading the same path again shares the entry
+    var b = asset_load_text(path);
+    println(b);
+    println(asset_count());
+    println(asset_memory_usage());
+    // releasing one of two references keeps it loaded
+    asset_release(a);
+    println(asset_count());
+    println(asset_type(a));
+
+    // bad indexes
+    println(asset_handle(-1));
+    println(asset_handle(99));
+    println(asset_type(-1));
+    println(asset_type(99));
+    println(asset_path(99) == "");
+    asset_release(-1);
+    asset_release(99);
+    asset_unload(99);
+    println(asset_reload(99));
+    println(asset_reload(-1));
+
+    // init forgets everything
+    asset_init();
+    println(asset_count());
+    println(asset_find(path));
+    println(asset_memory_usage());
+    // nothing loaded: nothing to reload or unload
+    println(asset_hot_reload());
+    asset_unload_all();
+    println(asset_count());
+
+    // the entry numbers start again from 0
+    println(asset_load_text(path));
+    asset_init();
+
+    // the type constants
+    println(ASSET_TEXTURE);
+    println(ASSET_SOUND);
+    println(ASSET_FONT);
+    println(ASSET_MESH);
+    println(ASSET_TEXT);
+    println(ASSET_DATA);
+
+    file_delete(path);
+    return 0;
+}

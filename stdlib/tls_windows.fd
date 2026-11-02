@@ -1,0 +1,515 @@
+// Fides TLS on Windows, through Schannel (the system's TLS). `use tls` picks this
+// module on Windows and tls_unix on other systems; they have the same functions.
+//
+// Certificates are checked against the system's store, and the name against
+// `host`. Reading and writing wait as tasks do: other tasks run meanwhile.
+//
+// Usage:
+//   use tls;
+//   val s: i64 = tls_connect("example.com", 443);
+//   tls_session_send(s, data as i64, str_len(data));
+//   val n: i64 = tls_session_recv(s, buffer, size, 30000);
+//   tls_session_close(s);
+//
+// A server key comes from a PKCS#12 (.pfx) file: tls_server(path, password).
+
+module tls;
+
+extern "C" link "secur32" {
+    fn AcquireCredentialsHandleA as sc_acquire(principal: i64, package: str, usage: i64, logon: i64, auth: i64, get_key: i64, get_arg: i64, cred: i64, expiry: i64) -> i32;
+    fn FreeCredentialsHandle as sc_free_cred(cred: i64) -> i32;
+    fn InitializeSecurityContextA as sc_init(cred: i64, ctx: i64, target: str, flags: i64, reserved: i64, rep: i64, input: i64, reserved2: i64, new_ctx: i64, output: i64, attrs: i64, expiry: i64) -> i32;
+    fn AcceptSecurityContext as sc_accept(cred: i64, ctx: i64, input: i64, flags: i64, rep: i64, new_ctx: i64, output: i64, attrs: i64, expiry: i64) -> i32;
+    fn DeleteSecurityContext as sc_delete(ctx: i64) -> i32;
+    fn FreeContextBuffer as sc_free_buffer(buffer: i64) -> i32;
+    fn QueryContextAttributesA as sc_query(ctx: i64, attr: i64, out: i64) -> i32;
+    fn EncryptMessage as sc_encrypt(ctx: i64, qop: i64, desc: i64, seq: i64) -> i32;
+    fn DecryptMessage as sc_decrypt(ctx: i64, desc: i64, seq: i64, qop: i64) -> i32;
+}
+
+extern "C" include "<wincrypt.h>" link "crypt32" {
+    fn PFXImportCertStore as sc_pfx_import(blob: *u8, password: *u8, flags: i64) -> *u8;
+    fn CertFindCertificateInStore as sc_find_cert(store: *u8, encoding: i64, flags: i64, kind: i64, para: *u8, prev: *u8) -> *u8;
+}
+
+extern "C" include "<stdio.h>" {
+    fn fopen as ts_fopen(path: str, mode: str) -> *u8;
+    fn fread as ts_fread(buf: *u8, size: i64, n: i64, file: *u8) -> i64;
+    fn fclose as ts_fclose(file: *u8) -> i32;
+}
+
+extern "C" include "<string.h>" {
+    fn memmove as ts_memmove(dst: *u8, src: *u8, n: i64) -> *u8;
+}
+
+const TS_PACKAGE: str = "Microsoft Unified Security Protocol Provider";
+const TS_OK: i64 = 0;
+const TS_CONTINUE: i64 = 590610;            // SEC_I_CONTINUE_NEEDED
+const TS_CLOSED: i64 = 590615;              // SEC_I_CONTEXT_EXPIRED
+const TS_INCOMPLETE: i64 = -2146893032;     // SEC_E_INCOMPLETE_MESSAGE
+const TS_TIMEOUT: i64 = 30000;
+
+const TB_EMPTY: i64 = 0;
+const TB_DATA: i64 = 1;
+const TB_TOKEN: i64 = 2;
+const TB_EXTRA: i64 = 5;
+const TB_TRAILER: i64 = 6;
+const TB_HEADER: i64 = 7;
+
+// A session is a block of words: socket, context handle (2), credentials handle
+// (2), header, trailer and message sizes, input buffer, its size, the encrypted
+// bytes in it, plain buffer, unread plain offset, unread plain bytes.
+const TS_FD: i64 = 0;
+const TS_CTX: i64 = 1;
+const TS_CRED: i64 = 3;
+const TS_HEADER: i64 = 5;
+const TS_TRAILER: i64 = 6;
+const TS_MAX: i64 = 7;
+const TS_BUF: i64 = 8;
+const TS_CAP: i64 = 9;
+const TS_HAVE: i64 = 10;
+const TS_PLAIN: i64 = 11;
+const TS_PLAIN_AT: i64 = 12;
+const TS_PLAIN_LEN: i64 = 13;
+const TS_OWNS_CRED: i64 = 14;
+const TS_WORDS: i64 = 15;
+
+fn ts_get(p: i64) -> i64 {
+    var a: *mut i64 = p;
+    var v: i64 = 0;
+    unsafe { v = *a; }
+    return v;
+}
+
+fn ts_set(p: i64, v: i64) {
+    var a: *mut i64 = p;
+    unsafe { *a = v; }
+}
+
+fn ts_get32(p: i64) -> i64 {
+    return ts_get(p) & 4294967295;
+}
+
+fn ts_set32(p: i64, v: i64) {
+    ts_set(p, (ts_get(p) & (0 - 4294967296)) | (v & 4294967295));
+}
+
+fn ts_copy(dst: i64, src: i64, n: i64) {
+    ts_memmove(dst as *u8, src as *u8, n);
+}
+
+/// `n` zeroed words.
+fn ts_zeroed(n: i64) -> i64 {
+    val block: i64 = p_malloc(n * 8);
+    var i: i64 = 0;
+    while i < n {
+        ts_set(block + i * 8, 0);
+        i = i + 1;
+    }
+    return block;
+}
+
+fn ts_field(s: i64, i: i64) -> i64 {
+    return ts_get(s + i * 8);
+}
+
+fn ts_put(s: i64, i: i64, v: i64) {
+    ts_set(s + i * 8, v);
+}
+
+// A SecBuffer: size, type, pointer. A SecBufferDesc: version, count, pointer.
+fn ts_buffer(buffers: i64, i: i64, kind: i64, addr: i64, size: i64) {
+    val b: i64 = buffers + i * 16;
+    ts_set32(b, size);
+    ts_set32(b + 4, kind);
+    ts_set(b + 8, addr);
+}
+
+fn ts_buffer_size(buffers: i64, i: i64) -> i64 {
+    return ts_get32(buffers + i * 16);
+}
+
+fn ts_buffer_kind(buffers: i64, i: i64) -> i64 {
+    return ts_get32(buffers + i * 16 + 4);
+}
+
+fn ts_buffer_addr(buffers: i64, i: i64) -> i64 {
+    return ts_get(buffers + i * 16 + 8);
+}
+
+fn ts_desc(buffers: i64, count: i64) -> i64 {
+    val desc: i64 = ts_zeroed(2);
+    ts_set32(desc + 4, count);
+    ts_set(desc + 8, buffers);
+    return desc;
+}
+
+fn ts_session(fd: i64) -> i64 {
+    val s: i64 = ts_zeroed(TS_WORDS);
+    ts_put(s, TS_FD, fd);
+    ts_put(s, TS_CAP, 65536);
+    ts_put(s, TS_BUF, p_malloc(65536));
+    ts_put(s, TS_PLAIN, p_malloc(65536));
+    return s;
+}
+
+fn ts_free_session(s: i64) {
+    p_free(ts_field(s, TS_BUF));
+    p_free(ts_field(s, TS_PLAIN));
+    p_free(s);
+}
+
+/// The sizes EncryptMessage needs, once the handshake is done.
+fn ts_stream_sizes(s: i64) {
+    val sizes: i64 = ts_zeroed(3);
+    sc_query(s + TS_CTX * 8, 4, sizes);
+    ts_put(s, TS_HEADER, ts_get32(sizes));
+    ts_put(s, TS_TRAILER, ts_get32(sizes + 4));
+    ts_put(s, TS_MAX, ts_get32(sizes + 8));
+    p_free(sizes);
+}
+
+/// The handshake, either side. Returns true once it is done.
+fn ts_handshake(s: i64, host: str, server: bool) -> bool {
+    val fd: i64 = ts_field(s, TS_FD);
+    val buf: i64 = ts_field(s, TS_BUF);
+    val cap: i64 = ts_field(s, TS_CAP);
+    val cred: i64 = s + TS_CRED * 8;
+    val ctx: i64 = s + TS_CTX * 8;
+    val attrs: i64 = ts_zeroed(1);
+    val expiry: i64 = ts_zeroed(1);
+    val input: i64 = ts_zeroed(4);
+    val output: i64 = ts_zeroed(2);
+    val in_desc: i64 = ts_desc(input, 2);
+    val out_desc: i64 = ts_desc(output, 1);
+    var have: i64 = 0;
+    var started: bool = false;
+    var done: bool = false;
+    var failed: bool = false;
+    var need_data: bool = server;
+    while !done && !failed {
+        if need_data {
+            val n: i64 = p_co_recv(fd, buf + have, cap - have, TS_TIMEOUT);
+            if n <= 0 {
+                failed = true;
+                break;
+            }
+            have = have + n;
+        }
+        ts_buffer(input, 0, TB_TOKEN, buf, have);
+        ts_buffer(input, 1, TB_EMPTY, 0, 0);
+        ts_buffer(output, 0, TB_TOKEN, 0, 0);
+        var rc: i64 = 0;
+        if server {
+            var old: i64 = 0;
+            if started { old = ctx; }
+            // ASC_REQ: sequence and replay detection, confidentiality,
+            // allocate memory, stream
+            rc = sc_accept(cred, old, in_desc, 65820, 0, ctx, out_desc, attrs, expiry);
+        } else if started {
+            rc = sc_init(cred, ctx, host, 33052, 0, 0, in_desc, 0, ctx, out_desc, attrs, expiry);
+        } else {
+            rc = sc_init(cred, 0, host, 33052, 0, 0, 0, 0, ctx, out_desc, attrs, expiry);
+        }
+        if rc != TS_INCOMPLETE {
+            started = true;
+        }
+        val out_size: i64 = ts_buffer_size(output, 0);
+        val out_addr: i64 = ts_buffer_addr(output, 0);
+        if out_addr != 0 {
+            if out_size > 0 && p_co_send(fd, out_addr, out_size) != out_size {
+                failed = true;
+            }
+            sc_free_buffer(out_addr);
+        }
+        if rc == TS_OK || rc == TS_CONTINUE {
+            // What the call did not use stays in the buffer
+            var extra: i64 = 0;
+            if ts_buffer_kind(input, 1) == TB_EXTRA {
+                extra = ts_buffer_size(input, 1);
+            }
+            if extra > 0 {
+                ts_copy(buf, buf + have - extra, extra);
+            }
+            have = extra;
+            need_data = extra == 0;
+            done = rc == TS_OK;
+        } else if rc == TS_INCOMPLETE {
+            need_data = true;
+        } else {
+            failed = true;
+        }
+    }
+    ts_put(s, TS_HAVE, have);
+    p_free(attrs);
+    p_free(expiry);
+    p_free(input);
+    p_free(output);
+    p_free(in_desc);
+    p_free(out_desc);
+    if done {
+        ts_stream_sizes(s);
+    }
+    return done;
+}
+
+// SCHANNEL_CRED: 80 bytes; version at 0, credentials at 4 and 8, flags at 72.
+fn ts_acquire(s: i64, usage: i64, flags: i64, cert_slot: i64) -> bool {
+    val cred: i64 = ts_zeroed(10);
+    ts_set32(cred, 4);
+    if cert_slot != 0 {
+        ts_set32(cred + 4, 1);
+        ts_set(cred + 8, cert_slot);
+    }
+    ts_set32(cred + 72, flags);
+    val expiry: i64 = ts_zeroed(1);
+    val rc: i64 = sc_acquire(0, TS_PACKAGE, usage, 0, cred, 0, 0, s + TS_CRED * 8, expiry);
+    p_free(cred);
+    p_free(expiry);
+    return rc == TS_OK;
+}
+
+fn ts_client(fd: i64, host: str, flags: i64) -> i64 {
+    val s: i64 = ts_session(fd);
+    if !ts_acquire(s, 2, flags, 0) {
+        ts_free_session(s);
+        return 0;
+    }
+    ts_put(s, TS_OWNS_CRED, 1);
+    if !ts_handshake(s, host, false) {
+        sc_free_cred(s + TS_CRED * 8);
+        ts_free_session(s);
+        return 0;
+    }
+    return s;
+}
+
+/// A TLS session over the connected socket `fd`, checking `host`'s certificate.
+/// Returns 0 on failure.
+pub fn tls_client(fd: i64, host: str) -> i64 {
+    // SCH_CRED_NO_DEFAULT_CREDS, AUTO_CRED_VALIDATION, SCH_USE_STRONG_CRYPTO
+    return ts_client(fd, host, 4194352);
+}
+
+/// Connect to host:port. The session owns the socket. Returns 0 on failure.
+pub fn tls_connect(host: str, port: i64) -> i64 {
+    val fd: i64 = p_co_connect(host, port);
+    if fd < 0 {
+        return 0;
+    }
+    val s: i64 = tls_client(fd, host);
+    if s == 0 {
+        p_socket_close(fd);
+    }
+    return s;
+}
+
+/// As tls_connect, but accept any certificate. For tests of a local server only:
+/// it does not know whom it is talking to.
+pub fn tls_connect_unchecked(host: str, port: i64) -> i64 {
+    val fd: i64 = p_co_connect(host, port);
+    if fd < 0 {
+        return 0;
+    }
+    // SCH_CRED_MANUAL_CRED_VALIDATION, NO_DEFAULT_CREDS, USE_STRONG_CRYPTO
+    val s: i64 = ts_client(fd, host, 4194328);
+    if s == 0 {
+        p_socket_close(fd);
+    }
+    return s;
+}
+
+/// Server credentials from a PKCS#12 file. Returns 0 on failure.
+pub fn tls_server(pfx_path: str, password: str) -> i64 {
+    val file: *u8 = ts_fopen(pfx_path, "rb");
+    if file as i64 == 0 {
+        return 0;
+    }
+    val cap: i64 = 1048576;
+    val data: i64 = p_malloc(cap);
+    val size: i64 = ts_fread(data as *u8, 1, cap, file);
+    ts_fclose(file);
+    // The password as UTF-16
+    val n: i64 = str_len(password);
+    val wide: i64 = ts_zeroed(n + 1);
+    var i: i64 = 0;
+    while i < n {
+        var p: *mut u16 = wide + i * 2;
+        unsafe { *p = str_byte_at(password, i) as u16; }
+        i = i + 1;
+    }
+    val blob: i64 = ts_zeroed(2);
+    ts_set32(blob, size);
+    ts_set(blob + 8, data);
+    // The key goes to the user's key store: Schannel cannot use one held only
+    // in memory (PKCS12_NO_PERSIST_KEY gives SEC_E_NO_CREDENTIALS)
+    val store: *u8 = sc_pfx_import(blob as *u8, wide as *u8, 0);
+    p_free(blob);
+    p_free(wide);
+    p_free(data);
+    if store as i64 == 0 {
+        return 0;
+    }
+    // X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, CERT_FIND_ANY
+    val cert: i64 = sc_find_cert(store, 65537, 0, 0, 0 as *u8, 0 as *u8) as i64;
+    if cert == 0 {
+        return 0;
+    }
+    val slot: i64 = ts_zeroed(1);
+    ts_set(slot, cert);
+    val creds: i64 = ts_zeroed(2);
+    if !ts_acquire(creds - TS_CRED * 8, 1, 0, slot) {
+        p_free(slot);
+        p_free(creds);
+        return 0;
+    }
+    return creds;
+}
+
+/// The server's side of a TLS session over the accepted socket `fd`. Returns 0 on
+/// failure.
+pub fn tls_accept(server: i64, fd: i64) -> i64 {
+    val s: i64 = ts_session(fd);
+    ts_put(s, TS_CRED, ts_get(server));
+    ts_put(s, TS_CRED + 1, ts_get(server + 8));
+    if !ts_handshake(s, "", true) {
+        ts_free_session(s);
+        return 0;
+    }
+    return s;
+}
+
+/// The session's socket.
+pub fn tls_session_fd(s: i64) -> i64 {
+    return ts_field(s, TS_FD);
+}
+
+/// Send `n` bytes at `addr`. Returns `n`, or -1.
+pub fn tls_session_send(s: i64, addr: i64, n: i64) -> i64 {
+    val header: i64 = ts_field(s, TS_HEADER);
+    val trailer: i64 = ts_field(s, TS_TRAILER);
+    val most: i64 = ts_field(s, TS_MAX);
+    val buffers: i64 = ts_zeroed(8);
+    val desc: i64 = ts_desc(buffers, 4);
+    val msg: i64 = p_malloc(header + most + trailer);
+    var sent: i64 = 0;
+    while sent < n {
+        var part: i64 = n - sent;
+        if part > most {
+            part = most;
+        }
+        ts_copy(msg + header, addr + sent, part);
+        ts_buffer(buffers, 0, TB_HEADER, msg, header);
+        ts_buffer(buffers, 1, TB_DATA, msg + header, part);
+        ts_buffer(buffers, 2, TB_TRAILER, msg + header + part, trailer);
+        ts_buffer(buffers, 3, TB_EMPTY, 0, 0);
+        if sc_encrypt(s + TS_CTX * 8, 0, desc, 0) != TS_OK {
+            sent = -1;
+            break;
+        }
+        val total: i64 = ts_buffer_size(buffers, 0) + ts_buffer_size(buffers, 1) + ts_buffer_size(buffers, 2);
+        if p_co_send(ts_field(s, TS_FD), msg, total) != total {
+            sent = -1;
+            break;
+        }
+        sent = sent + part;
+    }
+    p_free(msg);
+    p_free(desc);
+    p_free(buffers);
+    return sent;
+}
+
+/// Read up to `n` bytes into `addr`. Returns how many; 0 when the other side has
+/// closed; below 0 on an error or a timeout.
+pub fn tls_session_recv(s: i64, addr: i64, n: i64, timeout_ms: i64) -> i64 {
+    val buf: i64 = ts_field(s, TS_BUF);
+    val plain: i64 = ts_field(s, TS_PLAIN);
+    while ts_field(s, TS_PLAIN_LEN) == 0 {
+        var result: i64 = 1;
+        var have: i64 = ts_field(s, TS_HAVE);
+        if have > 0 {
+            result = ts_decrypt(s, buf, plain, have);
+            if result <= 0 {
+                return result;
+            }
+        }
+        if ts_field(s, TS_PLAIN_LEN) == 0 {
+            have = ts_field(s, TS_HAVE);
+            if have >= ts_field(s, TS_CAP) {
+                return -1;
+            }
+            val got: i64 = p_co_recv(ts_field(s, TS_FD), buf + have, ts_field(s, TS_CAP) - have, timeout_ms);
+            if got <= 0 {
+                return got;
+            }
+            ts_put(s, TS_HAVE, have + got);
+        }
+    }
+    var part: i64 = ts_field(s, TS_PLAIN_LEN);
+    if part > n {
+        part = n;
+    }
+    ts_copy(addr, plain + ts_field(s, TS_PLAIN_AT), part);
+    ts_put(s, TS_PLAIN_AT, ts_field(s, TS_PLAIN_AT) + part);
+    ts_put(s, TS_PLAIN_LEN, ts_field(s, TS_PLAIN_LEN) - part);
+    return part;
+}
+
+/// Decrypt what is in the buffer. 1 to go on (more input may be needed), 0 when
+/// the other side closed, -1 on an error.
+fn ts_decrypt(s: i64, buf: i64, plain: i64, have: i64) -> i64 {
+    val buffers: i64 = ts_zeroed(8);
+    val desc: i64 = ts_desc(buffers, 4);
+    ts_buffer(buffers, 0, TB_DATA, buf, have);
+    ts_buffer(buffers, 1, TB_EMPTY, 0, 0);
+    ts_buffer(buffers, 2, TB_EMPTY, 0, 0);
+    ts_buffer(buffers, 3, TB_EMPTY, 0, 0);
+    val rc: i64 = sc_decrypt(s + TS_CTX * 8, desc, 0, 0);
+    var result: i64 = -1;
+    if rc == TS_INCOMPLETE {
+        result = 1;
+    } else if rc == TS_CLOSED {
+        result = 0;
+    } else if rc == TS_OK {
+        var data_at: i64 = 0;
+        var data_size: i64 = 0;
+        var extra: i64 = 0;
+        var i: i64 = 0;
+        while i < 4 {
+            val kind: i64 = ts_buffer_kind(buffers, i);
+            if kind == TB_DATA {
+                data_at = ts_buffer_addr(buffers, i);
+                data_size = ts_buffer_size(buffers, i);
+            }
+            if kind == TB_EXTRA {
+                extra = ts_buffer_size(buffers, i);
+            }
+            i = i + 1;
+        }
+        if data_size > 0 {
+            ts_copy(plain, data_at, data_size);
+        }
+        ts_put(s, TS_PLAIN_AT, 0);
+        ts_put(s, TS_PLAIN_LEN, data_size);
+        if extra > 0 {
+            ts_copy(buf, buf + have - extra, extra);
+        }
+        ts_put(s, TS_HAVE, extra);
+        result = 1;
+    }
+    p_free(desc);
+    p_free(buffers);
+    return result;
+}
+
+/// End the session and free it. The socket stays open: closing it is the
+/// caller's.
+pub fn tls_session_close(s: i64) -> i64 {
+    sc_delete(s + TS_CTX * 8);
+    if ts_field(s, TS_OWNS_CRED) != 0 {
+        sc_free_cred(s + TS_CRED * 8);
+    }
+    ts_free_session(s);
+    return 0;
+}

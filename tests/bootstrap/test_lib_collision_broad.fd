@@ -1,0 +1,80 @@
+// stdlib/collision_broad: the spatial hash grid (cell lookup, candidate
+// pairs, a deliberate bucket collision, clear) and sweep-and-prune
+// (overlap pairs, update, clear). Pairs come back flat: a0 b0 a1 b1 ...
+use collision_broad;
+
+fn show(v: Vec<i64>) {
+    var i: i64 = 0;
+    while i < v.len() {
+        print(v.get(i));
+        print(" ");
+        i = i + 1;
+    }
+    println("|");
+}
+
+fn main() -> i64 {
+    var g = spatial_hash_create(64.0);
+    println(spatial_hash_count(&g));
+    show(spatial_hash_query_pairs(&g));
+    show(spatial_hash_query(&g, 0.0, 0.0, 10.0, 10.0));
+
+    spatial_hash_insert(&mut g, 0, 0.0, 0.0, 32.0, 32.0);
+    spatial_hash_insert(&mut g, 1, 10.0, 10.0, 42.0, 42.0);
+    spatial_hash_insert(&mut g, 2, 200.0, 200.0, 232.0, 232.0);
+    // 3 spans cells x = 0 and x = 1
+    spatial_hash_insert(&mut g, 3, 60.0, 0.0, 70.0, 10.0);
+    println(spatial_hash_count(&g));
+
+    // 0, 1 and 3 share cell (0,0); 2 is alone in cell (3,3)
+    show(spatial_hash_query(&g, 0.0, 0.0, 5.0, 5.0));
+    show(spatial_hash_query(&g, 200.0, 200.0, 210.0, 210.0));
+    show(spatial_hash_query(&g, 66.0, 0.0, 68.0, 5.0));
+    // an empty cell
+    show(spatial_hash_query(&g, 100.0, 100.0, 110.0, 110.0));
+    show(spatial_hash_query_pairs(&g));
+
+    // cells (3,3) and (5,5) hash to the same bucket, so 4 is reported
+    // against 2 although they are 100 units apart: a false positive the
+    // narrow phase must discard
+    spatial_hash_insert(&mut g, 4, 320.0, 320.0, 330.0, 330.0);
+    show(spatial_hash_query_pairs(&g));
+
+    spatial_hash_clear(&mut g);
+    println(spatial_hash_count(&g));
+    show(spatial_hash_query_pairs(&g));
+    show(spatial_hash_query(&g, 0.0, 0.0, 5.0, 5.0));
+    spatial_hash_insert(&mut g, 7, 0.0, 0.0, 1.0, 1.0);
+    spatial_hash_insert(&mut g, 8, 0.0, 0.0, 1.0, 1.0);
+    show(spatial_hash_query_pairs(&g));
+
+    // sweep and prune along x
+    var s = sap_create();
+    println(sap_count(&s));
+    show(sap_query_pairs(&mut s));
+    sap_insert(&mut s, 0, 0.0, 32.0);
+    sap_insert(&mut s, 1, 10.0, 42.0);
+    sap_insert(&mut s, 2, 100.0, 120.0);
+    sap_insert(&mut s, 3, 30.0, 105.0);
+    println(sap_count(&s));
+    // sorted: min0 0, min1 10, min3 30, max0 32, max1 42, min2 100, max3 105, max2 120
+    show(sap_query_pairs(&mut s));
+    // asking twice gives the same answer
+    show(sap_query_pairs(&mut s));
+
+    // moving 3 far away leaves only the 0-1 overlap (sap_count is still 4:
+    // sap_update changes the endpoints, not the stored boxes)
+    sap_update(&mut s, 3, 200.0, 210.0);
+    show(sap_query_pairs(&mut s));
+    println(sap_count(&s));
+
+    sap_clear(&mut s);
+    println(sap_count(&s));
+    show(sap_query_pairs(&mut s));
+
+    // separate boxes never pair
+    sap_insert(&mut s, 5, 0.0, 1.0);
+    sap_insert(&mut s, 6, 2.0, 3.0);
+    show(sap_query_pairs(&mut s));
+    return 0;
+}

@@ -1,0 +1,192 @@
+// stdlib/physics3d: body construction, forces and impulses, integration,
+// the four collision tests (sphere-sphere, box-box, sphere-plane,
+// sphere-box), dispatch by collider type, impulse resolution and
+// resolve_all. Values are chosen to be exact where possible; the rest are
+// printed in thousandths (r3).
+use physics3d;
+
+// round to thousandths, half away from zero, so only exact digits print
+fn r3(x: f64) -> i64 {
+    if x < 0.0 {
+        return 0 - (((0.0 - x) * 1000.0 + 0.5) as i64);
+    }
+    return (x * 1000.0 + 0.5) as i64;
+}
+
+fn pv(v: vec3) {
+    print(r3(v.x));
+    print(" ");
+    print(r3(v.y));
+    print(" ");
+    println(r3(v.z));
+}
+
+fn pc(c: Contact3) {
+    print(c.has_contact);
+    print(" depth ");
+    print(r3(c.depth));
+    print(" normal ");
+    print(r3(c.normal.x));
+    print(" ");
+    print(r3(c.normal.y));
+    print(" ");
+    print(r3(c.normal.z));
+    print(" point ");
+    print(r3(c.point.x));
+    print(" ");
+    print(r3(c.point.y));
+    print(" ");
+    println(r3(c.point.z));
+}
+
+fn main() -> i64 {
+    // construction
+    var box = phys3d_create_body(vec3(0.0, 10.0, 0.0), vec3(1.0, 1.0, 1.0), 2.0);
+    println(box.inv_mass);
+    println(box.is_static);
+    println(box.collider_type == COLLIDER_BOX);
+    pv(box.box.min);
+    pv(box.box.max);
+    println(box.restitution);
+    println(box.friction);
+    var ball = phys3d_create_sphere(vec3(0.0, 0.0, 0.0), 2.0, 0.0);
+    println(ball.is_static);
+    println(ball.inv_mass);
+    println(ball.collider_type == COLLIDER_SPHERE);
+    println(ball.radius);
+    var ground = phys3d_create_static_plane(vec3(0.0, 1.0, 0.0), 5.0);
+    println(ground.is_static);
+    println(ground.collider_type == COLLIDER_PLANE);
+    pv(ground.position);
+
+    // gravity is global
+    phys3d_set_gravity(vec3(0.0, -10.0, 0.0));
+    pv(phys3d_get_gravity());
+
+    // impulses scale by 1/mass; a static body ignores them
+    phys3d_apply_impulse(&mut box, vec3(4.0, 0.0, 2.0));
+    pv(box.velocity);
+    phys3d_apply_impulse(&mut ball, vec3(4.0, 0.0, 2.0));
+    pv(ball.velocity);
+    // forces add up until the next step
+    phys3d_apply_force(&mut box, vec3(1.0, 0.0, 0.0));
+    phys3d_apply_force(&mut box, vec3(3.0, 0.0, 0.0));
+    pv(box.force);
+    box.velocity = vec3(0.0, 0.0, 0.0);
+
+    // one step of half a second: gravity makes v = (0,-5,0), the force (4,0,0)
+    // on mass 2 adds (1,0,0), and the position moves by v * dt
+    phys3d_step(&mut box, 0.5);
+    pv(box.velocity);
+    pv(box.position);
+    pv(box.force);
+    pv(box.box.min);
+    pv(box.box.max);
+    // static bodies do not move
+    phys3d_step(&mut ball, 0.5);
+    pv(ball.position);
+    phys3d_apply_gravity(&mut ball, 0.5);
+    pv(ball.velocity);
+    // a sphere body moves its collider with it
+    var s1 = phys3d_create_sphere(vec3(0.0, 4.0, 0.0), 1.0, 1.0);
+    phys3d_step(&mut s1, 0.5);
+    pv(s1.sphere.center);
+
+    // sphere vs sphere
+    var a = phys3d_create_sphere(vec3(0.0, 0.0, 0.0), 2.0, 1.0);
+    var b = phys3d_create_sphere(vec3(2.0, 0.0, 0.0), 2.0, 1.0);
+    pc(phys3d_sphere_vs_sphere(&a, &b));
+    b.position = vec3(4.0, 0.0, 0.0);
+    pc(phys3d_sphere_vs_sphere(&a, &b));
+    b.position = vec3(0.0, 0.0, 0.0);
+    pc(phys3d_sphere_vs_sphere(&a, &b));
+
+    // box vs box, along each axis
+    var p = phys3d_create_body(vec3(0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0), 1.0);
+    var q = phys3d_create_body(vec3(1.5, 0.0, 0.0), vec3(1.0, 1.0, 1.0), 1.0);
+    pc(phys3d_aabb_vs_aabb(&p, &q));
+    q.position = vec3(-1.5, 0.0, 0.0);
+    pc(phys3d_aabb_vs_aabb(&p, &q));
+    q.position = vec3(0.0, 1.5, 0.0);
+    pc(phys3d_aabb_vs_aabb(&p, &q));
+    q.position = vec3(0.0, -1.5, 0.0);
+    pc(phys3d_aabb_vs_aabb(&p, &q));
+    q.position = vec3(0.0, 0.0, 1.5);
+    pc(phys3d_aabb_vs_aabb(&p, &q));
+    q.position = vec3(0.0, 0.0, -1.5);
+    pc(phys3d_aabb_vs_aabb(&p, &q));
+    // touching faces count, a gap does not
+    q.position = vec3(2.0, 0.0, 0.0);
+    pc(phys3d_aabb_vs_aabb(&p, &q));
+    q.position = vec3(5.0, 0.0, 0.0);
+    pc(phys3d_aabb_vs_aabb(&p, &q));
+
+    // sphere vs plane (the ground is y = 5)
+    var ps = phys3d_create_sphere(vec3(0.0, 5.5, 0.0), 1.0, 1.0);
+    pc(phys3d_sphere_vs_plane(&ps, &ground));
+    ps.position = vec3(0.0, 7.0, 0.0);
+    pc(phys3d_sphere_vs_plane(&ps, &ground));
+
+    // sphere vs box (1 x 1 x 1 half extents at the origin)
+    var bx = phys3d_create_body(vec3(0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0), 1.0);
+    var sp = phys3d_create_sphere(vec3(3.0, 0.0, 0.0), 1.0, 1.0);
+    pc(phys3d_sphere_vs_aabb(&sp, &bx));
+    sp.position = vec3(1.5, 0.0, 0.0);
+    pc(phys3d_sphere_vs_aabb(&sp, &bx));
+    // centre inside the box: pushed out along the line from the box centre
+    sp.position = vec3(0.5, 0.0, 0.0);
+    pc(phys3d_sphere_vs_aabb(&sp, &bx));
+
+    // dispatch by collider type; box vs sphere flips the normal
+    sp.position = vec3(1.5, 0.0, 0.0);
+    pc(phys3d_check_collision(&sp, &bx));
+    pc(phys3d_check_collision(&bx, &sp));
+    pc(phys3d_check_collision(&bx, &bx));
+    pc(phys3d_check_collision(&a, &a));
+    ps.position = vec3(0.0, 5.5, 0.0);
+    pc(phys3d_check_collision(&ps, &ground));
+    pc(phys3d_check_collision(&ground, &ps));
+    // a plane against a box has no test
+    pc(phys3d_check_collision(&ground, &bx));
+
+    // impulse resolution: two unit spheres one apart, closing at 2 units/s
+    var ra = phys3d_create_sphere(vec3(0.0, 0.0, 0.0), 1.0, 1.0);
+    var rb = phys3d_create_sphere(vec3(1.0, 0.0, 0.0), 1.0, 1.0);
+    ra.velocity = vec3(1.0, 0.0, 0.0);
+    rb.velocity = vec3(-1.0, 0.0, 0.0);
+    var contact = phys3d_check_collision(&ra, &rb);
+    phys3d_resolve_contact(&mut ra, &mut rb, &contact);
+    // pushed apart by (1 - 0.01) * 0.8 / 2 each, and bounced at e = 0.5
+    pv(ra.position);
+    pv(rb.position);
+    pv(ra.velocity);
+    pv(rb.velocity);
+    // separating bodies get their positions fixed but keep their velocity
+    var sa = phys3d_create_sphere(vec3(0.0, 0.0, 0.0), 1.0, 1.0);
+    var sb = phys3d_create_sphere(vec3(1.0, 0.0, 0.0), 1.0, 1.0);
+    sa.velocity = vec3(-1.0, 0.0, 0.0);
+    sb.velocity = vec3(1.0, 0.0, 0.0);
+    var c2 = phys3d_check_collision(&sa, &sb);
+    phys3d_resolve_contact(&mut sa, &mut sb, &c2);
+    pv(sa.velocity);
+    pv(sb.velocity);
+    // no contact: nothing changes
+    var far = phys3d_create_sphere(vec3(10.0, 0.0, 0.0), 1.0, 1.0);
+    var c3 = phys3d_check_collision(&sa, &far);
+    var before = far.position;
+    phys3d_resolve_contact(&mut sa, &mut far, &c3);
+    pv(far.position);
+    pv(before);
+
+    // resolve_all: a unit sphere falls onto the plane y = 1 and bounces
+    var fall = phys3d_create_sphere(vec3(0.0, 2.05, 0.0), 1.0, 1.0);
+    var floor = phys3d_create_static_plane(vec3(0.0, 1.0, 0.0), 1.0);
+    var bodies: Vec<RigidBody3> = Vec::new();
+    bodies.push(fall);
+    bodies.push(floor);
+    phys3d_resolve_all(bodies, 0.1);
+    pv(bodies.get(0).velocity);
+    pv(bodies.get(0).position);
+    pv(bodies.get(1).position);
+    return 0;
+}

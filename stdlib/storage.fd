@@ -24,8 +24,9 @@ use vec;
 // For production use, replace with crypto_sha256 from crypto.fd.
 
 /// FNV-1a hash of a string, returns 8 bytes as a Vec.
-fn storage_hash(data: str) -> Vec {
-    var bytes: Vec = str_bytes(data);
+@wrapping
+fn storage_hash(data: str) -> Vec<i64> {
+    var bytes: Vec<i64> = str_bytes(data);
     var h1 = 0xcbf29ce484222325;
     var h2 = 0x84222325cbf29ce4;
     for i in 0..bytes.len() {
@@ -55,7 +56,7 @@ fn storage_hash(data: str) -> Vec {
 }
 
 /// Convert a hash Vec to hex string.
-fn storage_hash_hex(hash: Vec) -> str {
+fn storage_hash_hex(hash: Vec<i64>) -> str {
     var hex_chars = "0123456789abcdef";
     var result = "";
     for i in 0..hash.len() {
@@ -84,12 +85,12 @@ fn storage_hash_hex(hash: Vec) -> str {
 
 /// A Merkle tree — uses parallel arrays for node data.
 pub struct MerkleTree {
-    pub hashes: Vec,      // flat array: 16 bytes per node
-    pub left_children: Vec,   // left child index per node (-1 if leaf)
-    pub right_children: Vec,  // right child index per node (-1 if leaf)
-    pub is_leaf_flags: Vec,   // 1 if leaf, 0 if internal
-    pub leaf_data: Vec,       // data hash index for each leaf
-    pub leaves: Vec,          // indices of leaf nodes
+    pub hashes: Vec<i64>,      // flat array: 16 bytes per node
+    pub left_children: Vec<i64>,   // left child index per node (-1 if leaf)
+    pub right_children: Vec<i64>,  // right child index per node (-1 if leaf)
+    pub is_leaf_flags: Vec<i64>,   // 1 if leaf, 0 if internal
+    pub leaf_data: Vec<i64>,       // data hash index for each leaf
+    pub leaves: Vec<i64>,          // indices of leaf nodes
     pub root_index: i64,      // index of root node (-1 if empty)
     pub node_count: i64,
 }
@@ -109,7 +110,7 @@ pub fn merkle_tree_new() -> MerkleTree {
 }
 
 /// Get the hash of a node (returns 16-byte Vec).
-fn merkle_node_hash(tree: MerkleTree, idx: i64) -> Vec {
+fn merkle_node_hash(tree: MerkleTree, idx: i64) -> Vec<i64> {
     var hash = Vec::new();
     var offset = idx * 16;
     for i in 0..16 {
@@ -121,7 +122,7 @@ fn merkle_node_hash(tree: MerkleTree, idx: i64) -> Vec {
 /// Add a data leaf to the tree. Must call merkle_tree_build() after
 /// adding all leaves to compute the root.
 pub fn merkle_tree_add(tree: MerkleTree, data: str) -> i64 {
-    var hash: Vec = storage_hash(data);
+    var hash: Vec<i64> = storage_hash(data);
     var idx = tree.node_count;
     // Store hash bytes in flat array
     for i in 0..16 {
@@ -137,7 +138,7 @@ pub fn merkle_tree_add(tree: MerkleTree, data: str) -> i64 {
 }
 
 /// Hash two child hashes together: SHA-256(left || right).
-fn merkle_hash_pair(left: Vec, right: Vec) -> Vec {
+fn merkle_hash_pair(left: Vec<i64>, right: Vec<i64>) -> Vec<i64> {
     var combined = Vec::new();
     for i in 0..left.len() {
         combined.push(left.get(i));
@@ -170,9 +171,9 @@ pub fn merkle_tree_build(tree: MerkleTree) -> i64 {
             if i + 1 < level.len() {
                 right_idx = level.get(i + 1);
             }
-            var left_hash: Vec = merkle_node_hash(tree, left_idx);
-            var right_hash: Vec = merkle_node_hash(tree, right_idx);
-            var combined_hash: Vec = merkle_hash_pair(left_hash, right_hash);
+            var left_hash: Vec<i64> = merkle_node_hash(tree, left_idx);
+            var right_hash: Vec<i64> = merkle_node_hash(tree, right_idx);
+            var combined_hash: Vec<i64> = merkle_hash_pair(left_hash, right_hash);
             var parent_idx = tree.node_count;
             // Store hash
             for j in 0..16 {
@@ -193,7 +194,7 @@ pub fn merkle_tree_build(tree: MerkleTree) -> i64 {
 }
 
 /// Get the root hash of the tree. Returns empty Vec if tree is empty.
-pub fn merkle_tree_root(tree: MerkleTree) -> Vec {
+pub fn merkle_tree_root(tree: MerkleTree) -> Vec<i64> {
     if tree.root_index < 0 {
         return Vec::new();
     }
@@ -202,7 +203,7 @@ pub fn merkle_tree_root(tree: MerkleTree) -> Vec {
 
 /// Get the root hash as a hex string.
 pub fn merkle_tree_root_hex(tree: MerkleTree) -> str {
-    var root: Vec = merkle_tree_root(tree);
+    var root: Vec<i64> = merkle_tree_root(tree);
     if root.len() == 0 {
         return "";
     }
@@ -217,10 +218,10 @@ pub fn merkle_tree_leaf_count(tree: MerkleTree) -> i64 {
 /// Verify that a piece of data is in the tree by recomputing its hash
 /// and checking against leaf hashes.
 pub fn merkle_tree_verify_data(tree: MerkleTree, data: str) -> bool {
-    var data_hash: Vec = storage_hash(data);
+    var data_hash: Vec<i64> = storage_hash(data);
     for i in 0..tree.leaves.len() {
         var leaf_idx = tree.leaves.get(i);
-        var leaf_hash: Vec = merkle_node_hash(tree, leaf_idx);
+        var leaf_hash: Vec<i64> = merkle_node_hash(tree, leaf_idx);
         var is_match = 1;
         for j in 0..16 {
             if leaf_hash.get(j) != data_hash.get(j) {
@@ -247,8 +248,8 @@ pub struct KVEntry {
 
 /// A simple key-value store.
 pub struct KVStore {
-    pub keys: Vec,
-    pub values: Vec,
+    pub keys: Vec<str>,
+    pub values: Vec<i64>,
     pub count: i64,
 }
 
@@ -320,11 +321,12 @@ pub fn kv_store_count(store: KVStore) -> i64 {
 }
 
 /// Compute a hash of all key-value pairs (for state root verification).
-pub fn kv_store_state_hash(store: KVStore) -> Vec {
+pub fn kv_store_state_hash(store: KVStore) -> Vec<i64> {
     var tree = merkle_tree_new();
     for i in 0..store.count {
-        // Use the value as the leaf data (converted to string)
-        merkle_tree_add(tree, "kv_entry");
+        // The leaf covers the key and the value ("key=value"); it used to be
+        // the constant "kv_entry", so the hash ignored the contents.
+        merkle_tree_add(tree, store.keys.get(i) + "=" + int_to_str(store.values.get(i)));
     }
     merkle_tree_build(tree);
     return merkle_tree_root(tree);

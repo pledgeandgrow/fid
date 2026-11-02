@@ -1,0 +1,106 @@
+// stdlib/swift: SWIFT MT names, BIC and IBAN checks and parts, the MT103
+// payment message and its text form, amount formatting, and field parsing
+// and extraction.
+use swift;
+
+fn say_yes(b: bool) {
+    if b { println("yes"); } else { println("no"); }
+}
+
+fn main() -> i64 {
+    // message types
+    println(swift_mt_name(SWIFT_MT103));
+    println(swift_mt_name(SWIFT_MT202));
+    println(swift_mt_name(SWIFT_MT940));
+    println(swift_mt_name(SWIFT_MT760));
+    println(swift_mt_name(1));
+
+    // BIC: 8 or 11 characters, six letters first
+    say_yes(swift_bic_validate("DEUTDEFF"));
+    say_yes(swift_bic_validate("DEUTDEFF500"));
+    say_yes(swift_bic_validate("deutdeff"));
+    say_yes(swift_bic_validate("DEUTDEF"));
+    say_yes(swift_bic_validate("DEUTDEFF5"));
+    say_yes(swift_bic_validate("DEUTDEFF5000"));
+    say_yes(swift_bic_validate("DEU1DEFF"));
+    say_yes(swift_bic_validate("12345678"));
+    say_yes(swift_bic_validate(""));
+    println(swift_bic_bank_code("DEUTDEFF500"));
+    println(swift_bic_country("DEUTDEFF500"));
+    println(swift_bic_location("DEUTDEFF500"));
+    println(swift_bic_branch("DEUTDEFF500"));
+    println(swift_bic_branch("DEUTDEFF"));
+
+    // IBAN: the length must match the country; other countries 15..34
+    say_yes(swift_iban_validate_length("DE89370400440532013000"));
+    say_yes(swift_iban_validate_length("DE8937040044053201300"));
+    say_yes(swift_iban_validate_length("GB29NWBK60161331926819"));
+    say_yes(swift_iban_validate_length("NL91ABNA0417164300"));
+    say_yes(swift_iban_validate_length("NL91ABNA04171643000"));
+    say_yes(swift_iban_validate_length("NO9386011117947"));
+    say_yes(swift_iban_validate_length("FR1420041010050500013M02606"));
+    say_yes(swift_iban_validate_length("FR1420041010050500013M0260"));
+    say_yes(swift_iban_validate_length("XX12345678901234"));
+    say_yes(swift_iban_validate_length("XX1234567890123"));
+    say_yes(swift_iban_validate_length("XX123456789012"));
+    say_yes(swift_iban_validate_length("XX12345678901234567890123456789012"));
+    say_yes(swift_iban_validate_length("XX123456789012345678901234567890123"));
+    println(swift_iban_country("DE89370400440532013000"));
+    println(swift_iban_check_digits("DE89370400440532013000"));
+    println(swift_iban_bban("DE89370400440532013000"));
+
+    // an MT103
+    var m = swift_mt103_new("BANKUS33", "DEUTDEFF", 123456, "USD");
+    println(m.amount);
+    println(m.currency);
+    println(m.message_id == "");
+    m.message_id = "REF001";
+    swift_mt103_set_ordering(m, "ACME CORP", "BANKUS33XXX");
+    swift_mt103_set_beneficiary(m, "JOHN DOE", "DEUTDEFFXXX");
+    swift_mt103_set_remittance(m, "INVOICE 42");
+    swift_mt103_set_value_date(m, "260826");
+    println(swift_mt103_serialize(m));
+    // a bare message leaves out the optional fields
+    var bare = swift_mt103_new("AAAAUS33", "BBBBGB2L", 5, "EUR");
+    println(swift_mt103_serialize(bare));
+
+    // amounts
+    println(swift_mt103_amount_major(m));
+    println(swift_mt103_amount_formatted(m));
+    println(swift_mt103_amount_formatted(bare));
+    println(swift_mt103_amount_formatted(swift_mt103_new("A", "B", 100000, "USD")));
+    println(swift_mt103_amount_formatted(swift_mt103_new("A", "B", 0, "USD")));
+    println(swift_mt103_amount_formatted(swift_mt103_new("A", "B", 1010, "JPY")));
+    println(swift_mt103_amount_major(swift_mt103_new("A", "B", 250, "USD")));
+
+    // parsing fields
+    var f = swift_parse_field(":20:REF12345");
+    println(f.get(0));
+    println(f.get(1));
+    var g = swift_parse_field(":32A:260826USD100,00");
+    println(g.get(0));
+    println(g.get(1));
+    // a value may contain colons: only the first closes the tag
+    var h = swift_parse_field(":72:/INS/A:B");
+    println(h.get(0));
+    println(h.get(1));
+    var empty_val = swift_parse_field(":20::");
+    println(str_len(empty_val.get(0)));
+    // malformed lines give two empty strings
+    println(str_len(swift_parse_field("20:REF").get(0)));
+    println(str_len(swift_parse_field(":2").get(0)));
+    println(str_len(swift_parse_field(":20REF").get(1)));
+    println(swift_parse_field("").len());
+
+    // extracting a field from a whole text block
+    var text = swift_mt103_serialize(m);
+    println(swift_extract_field(text, "20"));
+    println(swift_extract_field(text, "23B"));
+    println(swift_extract_field(text, "32A"));
+    println(swift_extract_field(text, "50K"));
+    println(swift_extract_field(text, "59"));
+    println(swift_extract_field(text, "71A"));
+    println(str_len(swift_extract_field(text, "99")));
+    println(str_len(swift_extract_field(swift_mt103_serialize(bare), "70")));
+    return 0;
+}

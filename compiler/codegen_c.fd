@@ -72,6 +72,8 @@ pub fn FnRetTypeEntry_new(key: str, ty: IrType) -> FnRetTypeEntry {
 // --- CCodeGen struct ------------------------------------------------------
 
 pub struct CCodeGen {
+    // Externs that take or return a struct by value: called through a wrapper
+    pub c_wrapped: Vec<str>,
     // Accumulated C output - uses p_sb (mutable string builder) to avoid
     // O(n^2) memory blowup from string concatenation.
     pub sb: i64,
@@ -109,6 +111,7 @@ pub struct CCodeGen {
 
 pub fn CCodeGen_new() -> CCodeGen {
     var cg: CCodeGen = CCodeGen {
+        c_wrapped: Vec::new(),
         sb: p_sb_new(),
         out: "",
         value_names: Vec::new(),
@@ -372,6 +375,9 @@ fn cast_arg(val: str, from: IrType, to: IrType) -> str {
 // Renames Fides functions that collide with C keywords or C runtime names.
 
 fn sanitize_c_name(self: &CCodeGen, name: str) -> str {
+    if vec_contains_str(self.c_wrapped, name) {
+        return "__c_wrap_" + name;
+    }
     // Don't sanitize user-defined extern function names (FFI)
     if vec_contains_str(self.extern_func_names, name) {
         return name;
@@ -911,6 +917,14 @@ fn CCodeGen_insert_runtime_sigs(self: &mut CCodeGen) -> void {
     fn_param_types_set(self, "p_co_go", t2(ptr_u8(), IrType::I64));
     fn_param_types_set(self, "p_co_done", t1(IrType::I64));
     fn_param_types_set(self, "p_co_result", t1(IrType::I64));
+    fn_param_types_set(self, "p_co_async", t2(ptr_u8(), IrType::I64));
+    fn_param_types_set(self, "p_co_sleep", t1(IrType::I64));
+    fn_param_types_set(self, "p_co_wait_fd", t3(IrType::I64, IrType::I64, IrType::I64));
+    fn_param_types_set(self, "p_co_detach", t1(IrType::I64));
+    fn_param_types_set(self, "p_co_accept", t1(IrType::I64));
+    fn_param_types_set(self, "p_co_connect", t2(ptr_u8(), IrType::I64));
+    fn_param_types_set(self, "p_co_recv", t4(IrType::I64, IrType::I64, IrType::I64, IrType::I64));
+    fn_param_types_set(self, "p_co_send", t3(IrType::I64, IrType::I64, IrType::I64));
 
     // Channels
     fn_param_types_set(self, "p_chan_create", t1(IrType::I64));
@@ -1159,6 +1173,29 @@ fn emit_runtime_header(self: &mut CCodeGen) -> void {
 
 // --- FFI / extern declarations --------------------------------------------
 
+fn c_is_struct(module: IrModule, ty: Type) -> bool {
+    match ty {
+        Type::Named(n) => {
+            match IrModule_get_struct(&module, n) {
+                OptStructLayout::Some(_) => { return true; }
+                OptStructLayout::None => {}
+            }
+        }
+        _ => {}
+    }
+    return false;
+}
+
+fn c_named_struct(module: IrModule, ty: Type, out: &mut Vec<str>) -> void {
+    match ty {
+        Type::Ref(inner, _) => { c_named_struct(module, box_type_unbox(inner), out); }
+        Type::Named(n) => {
+            if c_is_struct(module, ty) && !vec_contains_str(*out, n) { out.push(n); }
+        }
+        _ => {}
+    }
+}
+
 fn emit_extern_decls(self: &mut CCodeGen, module: IrModule) -> void {
     if module.extern_decls.len() == 0 {
         return;
@@ -1215,6 +1252,33 @@ fn emit_extern_decls(self: &mut CCodeGen, module: IrModule) -> void {
         ed = ed + 1;
     }
 
+    // A Fides struct a declaration names, with no header to define it
+    var named: Vec<str> = Vec::new();
+    var ni: i64 = 0;
+    while ni < module.extern_decls.len() {
+        var nd: ExternDecl = module.extern_decls.get(ni);
+        var wrapped: bool = c_is_struct(module, nd.ret_ty);
+        var has_include: bool = false;
+        match nd.include {
+            OptStr::Some(_) => { has_include = true; }
+            OptStr::None => {}
+        }
+        if !has_include { c_named_struct(module, nd.ret_ty, &mut named); }
+        var np: i64 = 0;
+        while np < nd.params.len() {
+            var nty: Type = nd.params.get(np).ty;
+            if !has_include { c_named_struct(module, nty, &mut named); }
+            if c_is_struct(module, nty) { wrapped = true; }
+            np = np + 1;
+        }
+        if wrapped { self.c_wrapped.push(nd.pledge_name); }
+        ni = ni + 1;
+    }
+    ni = 0;
+    while ni < named.len() {
+        wln(self, "typedef struct " + named.get(ni) + "_s " + named.get(ni) + ";");
+        ni = ni + 1;
+    }
     wln(self, "// --- User-defined extern declarations (FFI) ---");
     ed = 0;
     while ed < module.extern_decls.len() {
@@ -1713,6 +1777,14 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_co_run(void);");
     wln(self, "int64_t p_co_done(int64_t t);");
     wln(self, "int64_t p_co_result(int64_t t);");
+    wln(self, "int64_t p_co_async(const char* name, int64_t nargs, ...);");
+    wln(self, "int64_t p_co_sleep(int64_t ms);");
+    wln(self, "int64_t p_co_wait_fd(int64_t fd, int64_t write, int64_t timeout_ms);");
+    wln(self, "void p_co_detach(int64_t t);");
+    wln(self, "int64_t p_co_accept(int64_t fd);");
+    wln(self, "int64_t p_co_connect(const char* host, int64_t port);");
+    wln(self, "int64_t p_co_recv(int64_t fd, int64_t buf, int64_t len, int64_t timeout_ms);");
+    wln(self, "int64_t p_co_send(int64_t fd, int64_t buf, int64_t len);");
     wln(self, "int64_t p_executor_spawn(int64_t exec, const char* func_name, int64_t num_args, ...);");
     wln(self, "int64_t p_executor_block_on(int64_t exec, int64_t future);");
     wln(self, "int64_t p_task_poll(int64_t future);");
@@ -2190,6 +2262,11 @@ fn emit_global_init_function(self: &mut CCodeGen, module: IrModule) -> void {
     wln(self, "");
 }
 
+/// A C type that holds a 64-bit integer or a pointer.
+fn is_word_c(c: str) -> bool {
+    return c == "int64_t" || c == "uint64_t" || str_ends_with(c, "*");
+}
+
 fn emit_prototypes(self: &mut CCodeGen, module: IrModule) -> void {
     wln(self, "// --- Function prototypes ---");
     wln(self, "void p_thread_register(const char* name, int64_t (*fn)());");
@@ -2213,6 +2290,70 @@ fn emit_prototypes(self: &mut CCodeGen, module: IrModule) -> void {
         }
         wln(self, ret_ty + " " + proto_name + "(" + params + ");");
         f = f + 1;
+    }
+    // C takes a struct by value and Fides has a pointer to it
+    var wi: i64 = 0;
+    while wi < module.extern_decls.len() {
+        var ext: ExternDecl = module.extern_decls.get(wi);
+        if vec_contains_str(self.c_wrapped, ext.pledge_name) {
+            var w_params: str = "";
+            var w_args: str = "";
+            var struct_ret: bool = c_is_struct(module, ext.ret_ty);
+            if struct_ret { w_params = "void* ret"; }
+            var wp: i64 = 0;
+            while wp < ext.params.len() {
+                var pty: Type = ext.params.get(wp).ty;
+                var c_ty: str = c_type_from_ast(pty);
+                var a_name: str = "a" + int_to_str(wp);
+                if w_params != "" { w_params = w_params + ", "; }
+                if wp > 0 { w_args = w_args + ", "; }
+                if c_is_struct(module, pty) {
+                    w_params = w_params + "void* " + a_name;
+                    w_args = w_args + "*(" + c_ty + "*)" + a_name;
+                } else {
+                    w_params = w_params + c_ty + " " + a_name;
+                    w_args = w_args + a_name;
+                }
+                wp = wp + 1;
+            }
+            if w_params == "" { w_params = "void"; }
+            var w_call: str = ext.pledge_name + "(" + w_args + ")";
+            var w_ret: str = c_type_from_ast(ext.ret_ty);
+            if struct_ret {
+                w_call = "*(" + w_ret + "*)ret = " + w_call;
+                w_ret = "void";
+            } else if w_ret != "void" {
+                w_call = "return " + w_call;
+            }
+            wln(self, w_ret + " __c_wrap_" + ext.pledge_name + "(" + w_params + ") { " + w_call + "; }");
+        }
+        wi = wi + 1;
+    }
+    // C calls these: they supply the `__env` Fides functions take
+    var cb: i64 = 0;
+    while cb < module.c_callbacks.len() {
+        var target: str = module.c_callbacks.get(cb);
+        match IrModule_get_function(&module, target) {
+            OptIrFunction::Some(func) => {
+                var c_ret: str = c_ret_type(func.ret_ty);
+                var c_name: str = sanitize_c_name(self, target);
+                var c_params: str = "";
+                var c_args: str = "NULL";
+                var p2: i64 = 1;
+                while p2 < func.params.len() {
+                    var arg_name: str = "a" + int_to_str(p2 - 1);
+                    if p2 > 1 { c_params = c_params + ", "; }
+                    c_params = c_params + c_param_decl(func.params.get(p2).ty, arg_name);
+                    c_args = c_args + ", " + arg_name;
+                    p2 = p2 + 1;
+                }
+                var call: str = c_name + "(" + c_args + ");";
+                if c_ret != "void" { call = "return " + call; }
+                wln(self, c_ret + " " + c_fn_name(c_name) + "(" + c_params + ") { " + call + " }");
+            }
+            OptIrFunction::None => {}
+        }
+        cb = cb + 1;
     }
     wln(self, "");
 }
@@ -2692,6 +2833,10 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
             }
         }
         Inst::ConstFnRef(name) => {
+            if str_starts_with(name, "__c_fn_") {
+                wln(self, "    " + dst + " = (int64_t)" + c_fn_name(sanitize_c_name(self, c_fn_target(name))) + ";");
+                return;
+            }
             match string_consts_get(self, name) {
                 OptStr::Some(cname) => {
                     wln(self, "    " + dst + " = (int64_t)" + cname + ";");
@@ -3082,7 +3227,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                         if i < pts.len() {
                             cast = cast_arg(base, arg_ty, pts.get(i));
                         } else {
-                            var is_varargs: bool = fname == "p_thread_spawn" || fname == "p_executor_spawn";
+                            var is_varargs: bool = fname == "p_thread_spawn" || fname == "p_executor_spawn" || fname == "p_co_async";
                             if is_varargs && is_ptr_type(arg_ty) {
                                 cast = "(int64_t)" + base;
                             }
@@ -3188,7 +3333,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                                     OptIrType::Some(rt) => {
                                         var c_rt: str = c_ret_type(rt);
                                         var c_expected: str = c_ret_type(ret_ty);
-                                        if c_rt == c_expected {
+                                        if c_rt == c_expected || (is_word_c(c_rt) && is_word_c(c_expected)) {
                                             candidates.push(name);
                                         }
                                     }
@@ -3241,7 +3386,17 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                         OptVecIrType::None => {}
                     }
                     var arg: str = arg_strs.get(arg_i);
-                    if cast == "void*" || str_starts_with(cast, "struct ") {
+                    var arg_ty_c: IrType = value_ty_for_id(func, args.get(arg_i));
+                    if ir_type_eq(arg_ty_c, IrType::F64) || ir_type_eq(arg_ty_c, IrType::F32) {
+                        // A float stays one; this candidate may not take it
+                        if cast == "double" || cast == "float" {
+                            call_args.push("(" + cast + ")" + arg);
+                        } else if cast == "void*" || str_starts_with(cast, "struct ") || str_contains(cast, "[") {
+                            call_args.push("(void*)(intptr_t)" + arg);
+                        } else {
+                            call_args.push("(" + cast + ")" + arg);
+                        }
+                    } else if cast == "void*" || str_starts_with(cast, "struct ") {
                         call_args.push("(void*)" + arg);
                     } else if cast == "double" {
                         call_args.push("(double)(intptr_t)" + arg);
@@ -3279,7 +3434,8 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                 } else if is_aggregate_ret(fn_ret) {
                     wln(self, "            " + call_expr + ";");
                 } else {
-                    wln(self, "            " + dst + " = " + call_expr + ";");
+                    // A word of another type (a function value may only know i64)
+                    wln(self, "            " + dst + " = (" + c_type(ret_ty) + ")" + call_expr + ";");
                 }
                 cand_i = cand_i + 1;
             }
@@ -3837,7 +3993,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "#define P_BLOCK_MAGIC 0xF1DE5A0000000000ULL");
     wln(self, "#define P_BLOCK_FREED 0xF1DE5B0000000000ULL");
     wln(self, "#define P_CLASS_LARGE 63");
-    wln(self, "static P_THREAD_LOCAL uint64_t* __p_free_lists[21];");
+    wln(self, "static P_THREAD_LOCAL uint64_t* __p_free_lists[41];");
     wln(self, "void* p_malloc(int64_t size) {");
     wln(self, "    if (size < 0) { fprintf(stderr, \"p_malloc: negative size %lld\\n\", (long long)size); abort(); }");
     wln(self, "    size_t total = (size_t)size + 8;");
@@ -3850,6 +4006,8 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    int k = 4;");
     wln(self, "    while (((size_t)1 << k) < total) k++;");
     wln(self, "    size_t sz = (size_t)1 << k;");
+    wln(self, "    k *= 2;");
+    wln(self, "    if (k > 8 && total <= sz - sz / 4) { sz -= sz / 4; k--; }");
     wln(self, "    uint64_t* reused = __p_free_lists[k];");
     wln(self, "    if (reused) {");
     wln(self, "        __p_free_lists[k] = (uint64_t*)reused[0];");
@@ -4220,7 +4378,9 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "static pthread_t p_thread_handles[256];");
     wln(self, "static int p_thread_handle_count = 0;");
     wln(self, "static int64_t p_task_results[256];");
+    wln(self, "static int64_t __p_co_await(int64_t future);");
     wln(self, "int64_t p_future_poll(int64_t future) {");
+    wln(self, "    if (((uint64_t)future >> 48) == 0x7FA5) return __p_co_await(future);");
     wln(self, "    if (future >= 0) return future; // eager future");
     wln(self, "    // Thread-based future: join and get result");
     wln(self, "    int idx = -(future + 1);");
@@ -4267,48 +4427,103 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "typedef struct { int64_t (*fn)(); int64_t nargs; int64_t args[8]; atomic_int* done; } p_thread_arg_t;");
     wln(self, "#ifndef _WIN32");
     wln(self, "#include <ucontext.h>");
+    wln(self, "#include <poll.h>");
+    wln(self, "#include <time.h>");
     wln(self, "#endif");
-    wln(self, "typedef struct { int64_t (*fn)(); int64_t arg; int64_t result; int done;");
+    wln(self, "typedef struct __p_co { int64_t (*fn)(); int64_t nargs; int64_t args[8]; int64_t result; int done; int detached;");
+    wln(self, "    struct __p_co* awaits; struct __p_co* back;");
+    wln(self, "    int64_t fd; int64_t fd_write; int64_t ready; int64_t wake_ms;");
     wln(self, "#ifdef _WIN32");
     wln(self, "    void* fiber;");
     wln(self, "#else");
     wln(self, "    ucontext_t ctx; char* stack;");
     wln(self, "#endif");
     wln(self, "} __p_co;");
-    wln(self, "static __p_co** __p_cos = NULL;");
-    wln(self, "static int64_t __p_co_count = 0;");
-    wln(self, "static int64_t __p_co_cap = 0;");
-    wln(self, "static __p_co* __p_co_cur = NULL;");
+    wln(self, "static P_THREAD_LOCAL __p_co** __p_cos = NULL;");
+    wln(self, "static P_THREAD_LOCAL int64_t __p_co_count = 0;");
+    wln(self, "static P_THREAD_LOCAL int64_t __p_co_cap = 0;");
+    wln(self, "static P_THREAD_LOCAL int64_t __p_co_total = 0;");
+    wln(self, "static P_THREAD_LOCAL __p_co* __p_co_cur = NULL;");
     wln(self, "#ifdef _WIN32");
-    wln(self, "static void* __p_co_sched = NULL;");
-    wln(self, "#define __P_CO_TO_SCHED() SwitchToFiber(__p_co_sched)");
+    wln(self, "static P_THREAD_LOCAL void* __p_co_sched = NULL;");
     wln(self, "#else");
-    wln(self, "static ucontext_t __p_co_sched;");
-    wln(self, "#define __P_CO_TO_SCHED() swapcontext(&__p_co_cur->ctx, &__p_co_sched)");
+    wln(self, "static P_THREAD_LOCAL ucontext_t __p_co_sched;");
     wln(self, "#endif");
+    wln(self, "#define __P_CO_TAG 0x7FA5");
+    wln(self, "static int64_t __p_co_now(void) {");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "    return (int64_t)GetTickCount64();");
+    wln(self, "#else");
+    wln(self, "    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);");
+    wln(self, "    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;");
+    wln(self, "#endif");
+    wln(self, "}");
+    wln(self, "static void __p_co_leave(void) {");
+    wln(self, "    __p_co* c = __p_co_cur;");
+    wln(self, "    __p_co* back = c->back;");
+    wln(self, "    c->back = NULL;");
+    wln(self, "    __p_co_cur = back;");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "    SwitchToFiber(back ? back->fiber : __p_co_sched);");
+    wln(self, "#else");
+    wln(self, "    swapcontext(&c->ctx, back ? &back->ctx : &__p_co_sched);");
+    wln(self, "#endif");
+    wln(self, "}");
+    wln(self, "static void __p_co_enter(__p_co* c) {");
+    wln(self, "    __p_co* from = __p_co_cur;");
+    wln(self, "    __p_co_cur = c;");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "    (void)from;");
+    wln(self, "    SwitchToFiber(c->fiber);");
+    wln(self, "#else");
+    wln(self, "    swapcontext(from ? &from->ctx : &__p_co_sched, &c->ctx);");
+    wln(self, "#endif");
+    wln(self, "    if (c->done) {");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "        DeleteFiber(c->fiber);");
+    wln(self, "#else");
+    wln(self, "        free(c->stack);");
+    wln(self, "#endif");
+    wln(self, "    }");
+    wln(self, "}");
     wln(self, "static void __p_co_body(__p_co* c) {");
-    wln(self, "    typedef int64_t (*f1)(void*, int64_t);");
-    wln(self, "    c->result = ((f1)c->fn)(NULL, c->arg);");
+    wln(self, "    int64_t (*f)() = c->fn;");
+    wln(self, "    int64_t* a = c->args;");
+    wln(self, "    switch (c->nargs) {");
+    wln(self, "        case 0: c->result = ((int64_t (*)(void*))f)(NULL); break;");
+    wln(self, "        case 1: c->result = ((int64_t (*)(void*, int64_t))f)(NULL, a[0]); break;");
+    wln(self, "        case 2: c->result = ((int64_t (*)(void*, int64_t, int64_t))f)(NULL, a[0], a[1]); break;");
+    wln(self, "        case 3: c->result = ((int64_t (*)(void*, int64_t, int64_t, int64_t))f)(NULL, a[0], a[1], a[2]); break;");
+    wln(self, "        case 4: c->result = ((int64_t (*)(void*, int64_t, int64_t, int64_t, int64_t))f)(NULL, a[0], a[1], a[2], a[3]); break;");
+    wln(self, "        case 5: c->result = ((int64_t (*)(void*, int64_t, int64_t, int64_t, int64_t, int64_t))f)(NULL, a[0], a[1], a[2], a[3], a[4]); break;");
+    wln(self, "        case 6: c->result = ((int64_t (*)(void*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t))f)(NULL, a[0], a[1], a[2], a[3], a[4], a[5]); break;");
+    wln(self, "        case 7: c->result = ((int64_t (*)(void*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t))f)(NULL, a[0], a[1], a[2], a[3], a[4], a[5], a[6]); break;");
+    wln(self, "        default: c->result = ((int64_t (*)(void*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t))f)(NULL, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]); break;");
+    wln(self, "    }");
     wln(self, "    c->done = 1;");
-    wln(self, "    __P_CO_TO_SCHED();");
+    wln(self, "    __p_co_leave();");
     wln(self, "}");
     wln(self, "#ifdef _WIN32");
     wln(self, "static void WINAPI __p_co_start(void* p) { __p_co_body((__p_co*)p); }");
     wln(self, "#else");
     wln(self, "static void __p_co_start(unsigned lo, unsigned hi) { __p_co_body((__p_co*)(((uintptr_t)hi << 32) | lo)); }");
     wln(self, "#endif");
-    wln(self, "int64_t p_co_go(const char* name, int64_t arg) {");
+    wln(self, "static __p_co* __p_co_new(const char* name, int64_t nargs, const int64_t* args) {");
     wln(self, "    int64_t (*fn)() = NULL;");
     wln(self, "    for (int i = 0; i < p_thread_entry_count; i++) {");
     wln(self, "        if (strcmp(p_thread_entries[i].name, name) == 0) { fn = p_thread_entries[i].fn; break; }");
     wln(self, "    }");
     wln(self, "    if (!fn) p_panic(\"task: no such function\");");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "    if (!__p_co_sched) __p_co_sched = ConvertThreadToFiber(NULL);");
+    wln(self, "#endif");
     wln(self, "    if (__p_co_count == __p_co_cap) {");
     wln(self, "        __p_co_cap = __p_co_cap ? __p_co_cap * 2 : 64;");
     wln(self, "        __p_cos = (__p_co**)realloc(__p_cos, (size_t)__p_co_cap * sizeof(__p_co*));");
     wln(self, "    }");
     wln(self, "    __p_co* c = (__p_co*)calloc(1, sizeof(__p_co));");
-    wln(self, "    c->fn = fn; c->arg = arg;");
+    wln(self, "    c->fn = fn; c->nargs = nargs; c->fd = -1;");
+    wln(self, "    for (int64_t i = 0; i < nargs && i < 8; i++) c->args[i] = args[i];");
     wln(self, "#ifdef _WIN32");
     wln(self, "    c->fiber = CreateFiberEx(16384, 1024 * 1024, 0, __p_co_start, c);");
     wln(self, "    if (!c->fiber) p_panic(\"task: out of memory\");");
@@ -4321,41 +4536,225 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    c->ctx.uc_link = NULL;");
     wln(self, "    makecontext(&c->ctx, (void (*)(void))__p_co_start, 2, (unsigned)(uintptr_t)c, (unsigned)((uintptr_t)c >> 32));");
     wln(self, "#endif");
-    wln(self, "    __p_cos[__p_co_count] = c;");
-    wln(self, "    return ++__p_co_count;");
+    wln(self, "    __p_cos[__p_co_count++] = c;");
+    wln(self, "    __p_co_total++;");
+    wln(self, "    return c;");
     wln(self, "}");
-    wln(self, "void p_co_yield(void) { if (__p_co_cur) { __P_CO_TO_SCHED(); } }");
-    wln(self, "int64_t p_co_run(void) {");
-    wln(self, "#ifdef _WIN32");
-    wln(self, "    if (!__p_co_sched) __p_co_sched = ConvertThreadToFiber(NULL);");
-    wln(self, "#endif");
-    wln(self, "    for (;;) {");
-    wln(self, "        int64_t live = 0;");
-    wln(self, "        for (int64_t i = 0; i < __p_co_count; i++) {");
-    wln(self, "            __p_co* c = __p_cos[i];");
-    wln(self, "            if (c->done) continue;");
-    wln(self, "            __p_co_cur = c;");
-    wln(self, "#ifdef _WIN32");
-    wln(self, "            SwitchToFiber(c->fiber);");
-    wln(self, "#else");
-    wln(self, "            swapcontext(&__p_co_sched, &c->ctx);");
-    wln(self, "#endif");
-    wln(self, "            __p_co_cur = NULL;");
-    wln(self, "            if (c->done) {");
-    wln(self, "#ifdef _WIN32");
-    wln(self, "                DeleteFiber(c->fiber);");
-    wln(self, "#else");
-    wln(self, "                free(c->stack);");
-    wln(self, "#endif");
-    wln(self, "            } else {");
-    wln(self, "                live++;");
-    wln(self, "            }");
+    wln(self, "/* One turn of every task that can run. Returns how many are unfinished;");
+    wln(self, "   ran says how many took their turn. */");
+    wln(self, "static int64_t __p_co_round(int64_t* ran) {");
+    wln(self, "    int64_t kept = 0;");
+    wln(self, "    *ran = 0;");
+    wln(self, "    for (int64_t i = 0; i < __p_co_count; i++) {");
+    wln(self, "        __p_co* c = __p_cos[i];");
+    wln(self, "        if (c->done) { if (c->detached) free(c); continue; }");
+    wln(self, "        if (c->awaits && c->awaits->done) c->awaits = NULL;");
+    wln(self, "        if (!c->awaits && c->fd < 0 && !c->wake_ms) {");
+    wln(self, "            (*ran)++;");
+    wln(self, "            __p_co_enter(c);");
+    wln(self, "            if (c->done) { if (c->detached) free(c); continue; }");
     wln(self, "        }");
-    wln(self, "        if (live == 0) return __p_co_count;");
+    wln(self, "        __p_cos[kept++] = c;");
+    wln(self, "    }");
+    wln(self, "    __p_co_count = kept;");
+    wln(self, "    return kept;");
+    wln(self, "}");
+    wln(self, "/* Sleep until a waiting task can run, at most limit ms (-1: no limit). With");
+    wln(self, "   ran set, only look. Panics if no task ever will. */");
+    wln(self, "static void __p_co_wait(int64_t ran, int64_t limit) {");
+    wln(self, "    int64_t n = 0;");
+    wln(self, "    int64_t timeout = ran ? 0 : limit;");
+    wln(self, "    int64_t now = __p_co_now();");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "    static P_THREAD_LOCAL WSAPOLLFD* fds = NULL;");
+    wln(self, "#else");
+    wln(self, "    static P_THREAD_LOCAL struct pollfd* fds = NULL;");
+    wln(self, "#endif");
+    wln(self, "    static P_THREAD_LOCAL int64_t cap = 0;");
+    wln(self, "    if (__p_co_count > cap) {");
+    wln(self, "        cap = __p_co_count * 2;");
+    wln(self, "        fds = realloc(fds, (size_t)cap * sizeof(*fds));");
+    wln(self, "    }");
+    wln(self, "    for (int64_t i = 0; i < __p_co_count; i++) {");
+    wln(self, "        __p_co* c = __p_cos[i];");
+    wln(self, "        if (c->fd >= 0) {");
+    wln(self, "            fds[n].fd = (c->fd);");
+    wln(self, "            fds[n].events = c->fd_write ? POLLOUT : POLLIN;");
+    wln(self, "            fds[n].revents = 0;");
+    wln(self, "            n++;");
+    wln(self, "        }");
+    wln(self, "        if (c->wake_ms) {");
+    wln(self, "            int64_t left = c->wake_ms > now ? c->wake_ms - now : 0;");
+    wln(self, "            if (timeout < 0 || left < timeout) timeout = left;");
+    wln(self, "        }");
+    wln(self, "    }");
+    wln(self, "    if (n == 0 && timeout < 0) p_panic(\"Tasks are deadlocked: each one awaits another\");");
+    wln(self, "    if (n > 0) {");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "        WSAPoll(fds, (ULONG)n, (INT)timeout);");
+    wln(self, "#else");
+    wln(self, "        poll(fds, (nfds_t)n, (int)timeout);");
+    wln(self, "#endif");
+    wln(self, "    } else if (timeout > 0) {");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "        Sleep((DWORD)timeout);");
+    wln(self, "#else");
+    wln(self, "        poll(NULL, 0, (int)timeout);");
+    wln(self, "#endif");
+    wln(self, "    }");
+    wln(self, "    now = __p_co_now();");
+    wln(self, "    int64_t k = 0;");
+    wln(self, "    for (int64_t i = 0; i < __p_co_count; i++) {");
+    wln(self, "        __p_co* c = __p_cos[i];");
+    wln(self, "        int hit = 0;");
+    wln(self, "        if (c->fd >= 0) { hit = fds[k].revents != 0; k++; }");
+    wln(self, "        if (hit) { c->ready = 1; c->fd = -1; c->wake_ms = 0; }");
+    wln(self, "        else if (c->wake_ms && c->wake_ms <= now) { c->ready = 0; c->fd = -1; c->wake_ms = 0; }");
     wln(self, "    }");
     wln(self, "}");
-    wln(self, "int64_t p_co_done(int64_t t) { return (t >= 1 && t <= __p_co_count) ? (int64_t)__p_cos[t - 1]->done : 1; }");
-    wln(self, "int64_t p_co_result(int64_t t) { return (t >= 1 && t <= __p_co_count) ? __p_cos[t - 1]->result : 0; }");
+    wln(self, "int64_t p_co_go(const char* name, int64_t arg) { return (int64_t)__p_co_new(name, 1, &arg); }");
+    wln(self, "int64_t p_co_async(const char* name, int64_t nargs, ...) {");
+    wln(self, "    int64_t args[8] = {0};");
+    wln(self, "    va_list ap;");
+    wln(self, "    va_start(ap, nargs);");
+    wln(self, "    for (int64_t i = 0; i < nargs && i < 8; i++) args[i] = va_arg(ap, int64_t);");
+    wln(self, "    va_end(ap);");
+    wln(self, "    __p_co* c = __p_co_new(name, nargs, args);");
+    wln(self, "    c->back = __p_co_cur;");
+    wln(self, "    __p_co_enter(c);");
+    wln(self, "    return (int64_t)((uint64_t)__P_CO_TAG << 48 | (uint64_t)(uintptr_t)c);");
+    wln(self, "}");
+    wln(self, "void p_co_yield(void) { if (__p_co_cur) __p_co_leave(); }");
+    wln(self, "int64_t p_co_run(void) {");
+    wln(self, "    for (;;) {");
+    wln(self, "        int64_t ran;");
+    wln(self, "        if (__p_co_round(&ran) == 0) return __p_co_total;");
+    wln(self, "        __p_co_wait(ran, -1);");
+    wln(self, "    }");
+    wln(self, "}");
+    wln(self, "static int64_t __p_co_await(int64_t future) {");
+    wln(self, "    __p_co* c = (__p_co*)(uintptr_t)((uint64_t)future & 0xFFFFFFFFFFFFULL);");
+    wln(self, "    while (!c->done) {");
+    wln(self, "        if (__p_co_cur) {");
+    wln(self, "            __p_co_cur->awaits = c;");
+    wln(self, "            __p_co_leave();");
+    wln(self, "        } else {");
+    wln(self, "            int64_t ran;");
+    wln(self, "            __p_co_round(&ran);");
+    wln(self, "            if (!c->done) __p_co_wait(ran, -1);");
+    wln(self, "        }");
+    wln(self, "    }");
+    wln(self, "    return c->result;");
+    wln(self, "}");
+    wln(self, "int64_t p_co_sleep(int64_t ms) {");
+    wln(self, "    if (__p_co_cur) {");
+    wln(self, "        __p_co_cur->wake_ms = __p_co_now() + (ms > 0 ? ms : 0) + 1;");
+    wln(self, "        __p_co_leave();");
+    wln(self, "        return 0;");
+    wln(self, "    }");
+    wln(self, "    int64_t end = __p_co_now() + ms;");
+    wln(self, "    for (;;) {");
+    wln(self, "        int64_t ran;");
+    wln(self, "        int64_t live = __p_co_round(&ran);");
+    wln(self, "        int64_t left = end - __p_co_now();");
+    wln(self, "        if (left <= 0) return 0;");
+    wln(self, "        if (live) __p_co_wait(ran, left);");
+    wln(self, "        else {");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "            Sleep((DWORD)left);");
+    wln(self, "#else");
+    wln(self, "            poll(NULL, 0, (int)left);");
+    wln(self, "#endif");
+    wln(self, "        }");
+    wln(self, "    }");
+    wln(self, "}");
+    wln(self, "int64_t p_co_wait_fd(int64_t fd, int64_t write, int64_t timeout_ms) {");
+    wln(self, "    if (__p_co_cur) {");
+    wln(self, "        __p_co_cur->fd = fd;");
+    wln(self, "        __p_co_cur->fd_write = write;");
+    wln(self, "        __p_co_cur->wake_ms = timeout_ms >= 0 ? __p_co_now() + timeout_ms + 1 : 0;");
+    wln(self, "        __p_co_leave();");
+    wln(self, "        return __p_co_cur->ready;");
+    wln(self, "    }");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "    WSAPOLLFD one;");
+    wln(self, "    one.fd = (SOCKET)fd; one.events = write ? POLLOUT : POLLIN; one.revents = 0;");
+    wln(self, "    return WSAPoll(&one, 1, (INT)timeout_ms) > 0;");
+    wln(self, "#else");
+    wln(self, "    struct pollfd one;");
+    wln(self, "    one.fd = (int)fd; one.events = write ? POLLOUT : POLLIN; one.revents = 0;");
+    wln(self, "    return poll(&one, 1, (int)timeout_ms) > 0;");
+    wln(self, "#endif");
+    wln(self, "}");
+    wln(self, "void p_co_detach(int64_t t) {");
+    wln(self, "    __p_co* c = (__p_co*)(uintptr_t)t;");
+    wln(self, "    if (c->done) free(c);");
+    wln(self, "    else c->detached = 1;");
+    wln(self, "}");
+    wln(self, "int64_t p_co_done(int64_t t) { return (int64_t)((__p_co*)(uintptr_t)t)->done; }");
+    wln(self, "int64_t p_co_result(int64_t t) { return ((__p_co*)(uintptr_t)t)->result; }");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "#define __P_CO_BLOCKED() (WSAGetLastError() == WSAEWOULDBLOCK)");
+    wln(self, "#else");
+    wln(self, "#include <errno.h>");
+    wln(self, "#include <fcntl.h>");
+    wln(self, "#define __P_CO_BLOCKED() (errno == EAGAIN || errno == EWOULDBLOCK)");
+    wln(self, "#endif");
+    wln(self, "static void __p_co_nonblock(int64_t fd) {");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "    u_long on = 1;");
+    wln(self, "    ioctlsocket((SOCKET)fd, FIONBIO, &on);");
+    wln(self, "#else");
+    wln(self, "    fcntl((int)fd, F_SETFL, fcntl((int)fd, F_GETFL, 0) | O_NONBLOCK);");
+    wln(self, "#endif");
+    wln(self, "}");
+    wln(self, "int64_t p_co_accept(int64_t fd) {");
+    wln(self, "    p_co_wait_fd(fd, 0, -1);");
+    wln(self, "    int64_t c = p_socket_accept(fd);");
+    wln(self, "    if (c >= 0) __p_co_nonblock(c);");
+    wln(self, "    return c;");
+    wln(self, "}");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "static void init_winsock(void);");
+    wln(self, "#endif");
+    wln(self, "int64_t p_co_connect(const char* host, int64_t port) {");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "    init_winsock();");
+    wln(self, "#endif");
+    wln(self, "    char service[16];");
+    wln(self, "    struct addrinfo hints, *res = NULL;");
+    wln(self, "    memset(&hints, 0, sizeof(hints));");
+    wln(self, "    hints.ai_family = AF_INET;");
+    wln(self, "    hints.ai_socktype = SOCK_STREAM;");
+    wln(self, "    snprintf(service, sizeof(service), \"%lld\", (long long)port);");
+    wln(self, "    if (getaddrinfo(host, service, &hints, &res) != 0 || !res) return -1;");
+    wln(self, "    int64_t s = (int64_t)socket(res->ai_family, res->ai_socktype, 0);");
+    wln(self, "    if (s >= 0 && connect((SOCKET)s, res->ai_addr, (int)res->ai_addrlen) != 0) {");
+    wln(self, "        p_socket_close(s);");
+    wln(self, "        s = -1;");
+    wln(self, "    }");
+    wln(self, "    freeaddrinfo(res);");
+    wln(self, "    if (s >= 0) __p_co_nonblock(s);");
+    wln(self, "    return s;");
+    wln(self, "}");
+    wln(self, "int64_t p_co_recv(int64_t fd, int64_t buf, int64_t len, int64_t timeout_ms) {");
+    wln(self, "    for (;;) {");
+    wln(self, "        int64_t n = p_socket_read(fd, (char*)(uintptr_t)buf, len);");
+    wln(self, "        if (n >= 0) return n;");
+    wln(self, "        if (!__P_CO_BLOCKED()) return -1;");
+    wln(self, "        if (!p_co_wait_fd(fd, 0, timeout_ms)) return -2;");
+    wln(self, "    }");
+    wln(self, "}");
+    wln(self, "int64_t p_co_send(int64_t fd, int64_t buf, int64_t len) {");
+    wln(self, "    int64_t done = 0;");
+    wln(self, "    while (done < len) {");
+    wln(self, "        int64_t n = p_socket_write(fd, (const char*)(uintptr_t)buf + done, len - done);");
+    wln(self, "        if (n > 0) done += n;");
+    wln(self, "        else if (n < 0 && !__P_CO_BLOCKED()) return -1;");
+    wln(self, "        else if (!p_co_wait_fd(fd, 1, 30000)) return -1;");
+    wln(self, "    }");
+    wln(self, "    return done;");
+    wln(self, "}");
     wln(self, "static void* p_thread_wrapper(void* arg) {");
     wln(self, "    p_thread_arg_t* ta = (p_thread_arg_t*)arg;");
     wln(self, "    int64_t result = 0;");
@@ -4397,6 +4796,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return -(int64_t)(idx + 1);");
     wln(self, "}");
     wln(self, "int64_t p_task_poll(int64_t future) {");
+    wln(self, "    if (((uint64_t)future >> 48) == 0x7FA5) return p_future_poll(future);");
     wln(self, "    if (future >= 0) return future; // eager future");
     wln(self, "    int idx = -(future + 1);");
     wln(self, "    if (idx < 0 || idx >= p_thread_handle_count) return 0;");
@@ -4408,6 +4808,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return p_task_results[idx];");
     wln(self, "}");
     wln(self, "bool p_task_is_ready(int64_t future) {");
+    wln(self, "    if (((uint64_t)future >> 48) == 0x7FA5) return p_co_done(future & 0xFFFFFFFFFFFFLL) != 0;");
     wln(self, "    if (future >= 0) return true;");
     wln(self, "    int idx = -(future + 1);");
     wln(self, "    if (idx < 0 || idx >= p_thread_handle_count) return false;");
@@ -4446,6 +4847,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "}");
     // A2: Non-blocking poll - returns PENDING_SENTINEL if task not done
     wln(self, "int64_t p_task_poll_nonblocking(int64_t future) {");
+    wln(self, "    if (((uint64_t)future >> 48) == 0x7FA5) return p_co_done(future & 0xFFFFFFFFFFFFLL) ? p_future_poll(future) : (int64_t)0x8000000000000001LL;");
     wln(self, "    if (future >= 0) return future; // eager future");
     wln(self, "    int idx = -(future + 1);");
     wln(self, "    if (idx < 0 || idx >= p_thread_handle_count) return 0;");

@@ -1,0 +1,110 @@
+// stdlib/medical: HL7 v2 message types, segment builders, ADT messages,
+// serialisation and parsing, field access, FHIR names, ICD-10 format
+// checks and the LOINC code constants.
+use medical;
+
+fn say_yes(b: bool) {
+    if b { println("yes"); } else { println("no"); }
+}
+
+fn main() -> i64 {
+    // message types
+    println(hl7_msg_type_code(HL7_ADT_A01));
+    println(hl7_msg_type_code(HL7_ORU_R01));
+    println(hl7_msg_type_code(HL7_MDM_T02));
+    println(hl7_msg_type_code(99));
+    println(hl7_msg_type_name(HL7_ADT_A03));
+    println(hl7_msg_type_name(HL7_OUL_R22));
+    println(hl7_msg_type_name(0));
+
+    // building a message by hand
+    var m = hl7_new(HL7_ORU_R01, "M42", "LAB", "NORTH", "20260101010101");
+    println(hl7_segment_count(m));
+    println(m.receiving_app == "");
+    hl7_set_receiver(m, "EHR", "CENTRAL");
+    println(m.receiving_app);
+    println(m.receiving_facility);
+    println(hl7_msh_segment(m));
+    hl7_add_segment(m, "PID|1");
+    hl7_add_segment(m, hl7_obx_segment(1, "NM", "2339-0", "5.5", "mmol/L"));
+    println(hl7_segment_count(m));
+    println(hl7_serialize(m));
+
+    // segments
+    println(hl7_pid_segment("P1", "Doe^John", "19800515", "M"));
+    println(hl7_pv1_segment("I", "WARD^1", "DR9"));
+    println(hl7_obx_segment(7, "ST", "X", "abc", "u"));
+
+    // an admission and a discharge
+    var adm = hl7_adt_a01("HMS", "12345", "Doe^John", "19800515", "M");
+    println(hl7_segment_count(adm));
+    println(adm.msg_id);
+    println(adm.receiving_app);
+    println(hl7_segment_type(adm.segments.get(0)));
+    println(hl7_segment_type(adm.segments.get(1)));
+    println(hl7_segment_type(adm.segments.get(2)));
+    println(hl7_segment_type(adm.segments.get(3)));
+    println(adm.segments.get(1));
+    println(adm.segments.get(2));
+    var dis = hl7_adt_a03("HMS", "12345");
+    println(hl7_segment_count(dis));
+    println(dis.segments.get(1));
+    println(hl7_get_field(dis.segments.get(2), 5));
+
+    // fields: 0 is the segment name; outside gives ""
+    var seg = "OBX|1|NM|2339-0||5.5|mmol/L";
+    println(hl7_get_field(seg, 0));
+    println(hl7_get_field(seg, 2));
+    println(hl7_get_field(seg, 4));
+    println(hl7_get_field(seg, 5));
+    println(hl7_get_field(seg, 6));
+    println(hl7_get_field(seg, 7));
+    println(hl7_get_field(seg, -1));
+    println(hl7_segment_type("PV1||I"));
+
+    // parsing a message that was written out with LF between segments
+    var text = "MSH|^~\\&|APP|FAC|RAPP|RFAC|20260101||ADT^A01|MSG7|P|2.5\nPID|1\nPV1|2";
+    var p = hl7_parse(text);
+    println(hl7_segment_count(p));
+    println(p.sending_app);
+    println(p.sending_facility);
+    println(p.msg_id);
+    println(p.segments.get(1));
+    println(p.timestamp);
+    // text with no MSH fields
+    var q = hl7_parse("PID|1");
+    println(hl7_segment_count(q));
+    println(q.msg_id == "");
+    println(q.sending_app == "");
+
+    // a serialised message parses back into the same segments
+    var round = hl7_parse(hl7_serialize(adm));
+    println(hl7_segment_count(round));
+    println(round.sending_facility);
+
+    // FHIR names
+    println(fhir_resource_name(FHIR_PATIENT));
+    println(fhir_resource_name(FHIR_OBSERVATION));
+    println(fhir_resource_name(FHIR_PRACTITIONER));
+    println(fhir_resource_name(42));
+
+    // ICD-10: 3 to 7 characters, a letter then two digits
+    say_yes(icd10_validate("E11.9"));
+    say_yes(icd10_validate("I10"));
+    say_yes(icd10_validate("J45.909"));
+    say_yes(icd10_validate("j45"));
+    say_yes(icd10_validate("I1"));
+    say_yes(icd10_validate("J45.9099"));
+    say_yes(icd10_validate("110"));
+    say_yes(icd10_validate("EA1"));
+    say_yes(icd10_validate("E1A"));
+    say_yes(icd10_validate(""));
+    say_yes(icd10_validate("_10"));
+
+    // LOINC codes
+    println(LOINC_GLUCOSE);
+    println(LOINC_HEMOGLOBIN_A1C);
+    println(LOINC_SPO2);
+    println(LOINC_BP_SYSTOLIC);
+    return 0;
+}

@@ -1,0 +1,93 @@
+// stdlib/particles: emitter pool limits, burst, continuous emission,
+// gravity, drag, lifetime expiry and the size and colour fades. Spread is
+// 0 and speed_min == speed_max so the launch velocity does not depend on
+// the clock.
+use particles;
+
+fn fixed_emitter(n: i64) -> ParticleEmitter {
+    var em = particle_emitter_create(n);
+    em.spread = 0.0;
+    em.angle = 0.0;
+    em.speed_min = 100.0;
+    em.speed_max = 100.0;
+    em.lifetime = 1.0;
+    em.size_start = 8.0;
+    em.size_end = 0.0;
+    return em;
+}
+
+fn main() -> i64 {
+    var em = fixed_emitter(4);
+    println(particle_emitter_count(&em));
+    println(em.max_particles);
+    println(em.active);
+
+    particle_emitter_set_pos(&mut em, 10.0, 20.0);
+    particle_emitter_burst(&mut em, 2);
+    println(particle_emitter_count(&em));
+    println(em.particles.get(0).x);
+    println(em.particles.get(0).y);
+    println(em.particles.get(0).vx);
+    println(em.particles.get(0).vy);
+    println(em.particles.get(2).active);
+
+    // the pool holds 4: a burst of 10 only fills the rest
+    particle_emitter_burst(&mut em, 10);
+    println(particle_emitter_count(&em));
+    particle_emitter_burst(&mut em, 1);
+    println(particle_emitter_count(&em));
+
+    // half a second: moved 50, size 8 -> 4, alpha 255 -> 128
+    particle_emitter_update(&mut em, 0.5);
+    println(particle_emitter_count(&em));
+    println(em.particles.get(0).x);
+    println(em.particles.get(0).y);
+    println(em.particles.get(0).size);
+    println(em.particles.get(0).r);
+    println(em.particles.get(0).a);
+    // the lifetime runs out on the second half second
+    particle_emitter_update(&mut em, 0.5);
+    println(particle_emitter_count(&em));
+
+    // gravity pulls down, drag damps both axes (gravity is applied first)
+    var g = fixed_emitter(1);
+    g.gravity = 10.0;
+    g.drag = 1.0;
+    particle_emitter_burst(&mut g, 1);
+    particle_emitter_update(&mut g, 0.5);
+    println(g.particles.get(0).vx);
+    println(g.particles.get(0).vy);
+    println(g.particles.get(0).x);
+    println(g.particles.get(0).y);
+
+    // continuous emission: rate 4 for half a second makes 2 particles
+    var r = fixed_emitter(10);
+    r.rate = 4.0;
+    particle_emitter_update(&mut r, 0.5);
+    println(particle_emitter_count(&r));
+    println(r.emit_accum);
+    // rate 3 for half a second: 1 particle and 0.5 left over
+    var r3 = fixed_emitter(10);
+    r3.rate = 3.0;
+    particle_emitter_update(&mut r3, 0.5);
+    println(particle_emitter_count(&r3));
+    println(r3.emit_accum);
+    // stop halts emission, start resumes it
+    particle_emitter_stop(&mut r3);
+    println(r3.active);
+    particle_emitter_update(&mut r3, 0.1);
+    println(particle_emitter_count(&r3));
+    particle_emitter_start(&mut r3);
+    println(r3.active);
+    particle_emitter_update(&mut r3, 1.0);
+    println(particle_emitter_count(&r3));
+
+    particle_emitter_clear(&mut r3);
+    println(particle_emitter_count(&r3));
+
+    // an emitter with no room emits nothing
+    var z = fixed_emitter(0);
+    particle_emitter_burst(&mut z, 3);
+    println(particle_emitter_count(&z));
+    return 0;
+}

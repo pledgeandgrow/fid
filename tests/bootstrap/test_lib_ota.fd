@@ -1,0 +1,186 @@
+// stdlib/ota: state names, manifest checks, version compatibility, the
+// update session (download progress, verification against an FNV-1a
+// checksum, apply, commit, rollback, fail and retry) and the binary diff.
+// The checksum of the bytes of "hello" is a430d84680aabd0b (FNV-1a, 64 bit,
+// the published value); the empty message hashes to the offset basis,
+// cbf29ce484222325.
+use ota;
+
+fn say_yes(b: bool) {
+    if b { println("yes"); } else { println("no"); }
+}
+
+fn hello() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(104);
+    v.push(101);
+    v.push(108);
+    v.push(108);
+    v.push(111);
+    return v;
+}
+
+fn show(v: Vec<i64>) {
+    print(v.len());
+    print(":");
+    var i: i64 = 0;
+    while i < v.len() {
+        print(" ");
+        print(v.get(i));
+        i = i + 1;
+    }
+    println("");
+}
+
+fn main() -> i64 {
+    println(ota_state_name(OTA_STATE_IDLE));
+    println(ota_state_name(OTA_STATE_DOWNLOADING));
+    println(ota_state_name(OTA_STATE_VERIFYING));
+    println(ota_state_name(OTA_STATE_APPLYING));
+    println(ota_state_name(OTA_STATE_COMMITTED));
+    println(ota_state_name(OTA_STATE_ROLLBACK));
+    println(ota_state_name(OTA_STATE_FAILED));
+    println(ota_state_name(42));
+
+    // manifest
+    var m = ota_manifest_new("fw_v2.bin", 5, "sha256:a430d84680aabd0b");
+    println(m.filename);
+    println(m.size);
+    println(m.version == "");
+    say_yes(ota_verify_manifest(m));
+    ota_manifest_set_version(m, "2.0.0", "1.0.0", "2.0.0");
+    ota_manifest_set_signature(m, "beef");
+    ota_manifest_set_description(m, "second firmware");
+    println(m.version);
+    println(m.min_version);
+    println(m.max_version);
+    println(m.signature);
+    println(m.description);
+    // each field that is checked
+    say_yes(ota_verify_manifest(ota_manifest_new("", 5, "sha256:aa")));
+    say_yes(ota_verify_manifest(ota_manifest_new("f", 0, "sha256:aa")));
+    say_yes(ota_verify_manifest(ota_manifest_new("f", -4, "sha256:aa")));
+    say_yes(ota_verify_manifest(ota_manifest_new("f", 5, "")));
+    say_yes(ota_verify_manifest(ota_manifest_new("f", 5, "sha256:")));
+    say_yes(ota_verify_manifest(ota_manifest_new("f", 5, "sha256:a")));
+    say_yes(ota_verify_manifest(ota_manifest_new("f", 5, "md5:abcdefgh")));
+    say_yes(ota_verify_manifest(ota_manifest_new("f", 5, "SHA256:aa")));
+
+    // compatibility window 1.0.0 .. 2.0.0 (compared as text)
+    say_yes(ota_check_compatibility(m, "1.5.0"));
+    say_yes(ota_check_compatibility(m, "1.0.0"));
+    say_yes(ota_check_compatibility(m, "2.0.0"));
+    say_yes(ota_check_compatibility(m, "0.9.0"));
+    say_yes(ota_check_compatibility(m, "2.0.1"));
+    say_yes(ota_check_compatibility(m, "3.0.0"));
+    // no limits set: anything goes
+    say_yes(ota_check_compatibility(ota_manifest_new("f", 5, "sha256:aa"), "0.0.1"));
+    var lo = ota_manifest_new("f", 5, "sha256:aa");
+    ota_manifest_set_version(lo, "2.0.0", "1.5.0", "");
+    say_yes(ota_check_compatibility(lo, "1.4.0"));
+    say_yes(ota_check_compatibility(lo, "9.0.0"));
+
+    // a session that downloads, verifies and commits
+    var s = ota_session_new(m);
+    println(ota_session_state_name(s));
+    println(s.max_retries);
+    println(ota_session_download_percent(s));
+    ota_session_start_download(s);
+    println(ota_session_state_name(s));
+    ota_session_download_progress(s, 2);
+    println(ota_session_state_name(s));
+    println(ota_session_download_percent(s));
+    ota_session_download_progress(s, 3);
+    println(ota_session_state_name(s));
+    println(ota_session_download_percent(s));
+    println(s.bytes_downloaded);
+    say_yes(ota_session_verify(s, hello()));
+    println(ota_session_state_name(s));
+    println(s.bytes_verified);
+    ota_session_apply(s);
+    println(ota_session_state_name(s));
+    ota_session_commit(s);
+    println(ota_session_state_name(s));
+
+    // wrong size and wrong content both fail with a message
+    var f1 = ota_session_new(m);
+    var short: Vec<i64> = Vec::new();
+    short.push(1);
+    say_yes(ota_session_verify(f1, short));
+    println(ota_session_state_name(f1));
+    println(f1.error_msg);
+    var f2 = ota_session_new(m);
+    var bad = hello();
+    bad.set(4, 112);
+    say_yes(ota_session_verify(f2, bad));
+    println(ota_session_state_name(f2));
+    println(f2.error_msg);
+    println(f2.bytes_verified);
+
+    // a manifest for the empty file would need size 0, which is refused;
+    // a one byte file checks against its own FNV-1a value
+    var one: Vec<i64> = Vec::new();
+    one.push(0);
+    var m1 = ota_manifest_new("one.bin", 1, "sha256:af63bd4c8601b7df");
+    var s1 = ota_session_new(m1);
+    say_yes(ota_session_verify(s1, one));
+    var three: Vec<i64> = Vec::new();
+    three.push(1);
+    three.push(2);
+    three.push(3);
+    var m3 = ota_manifest_new("three.bin", 3, "sha256:d0aa6218672cf5ab");
+    var s3 = ota_session_new(m3);
+    say_yes(ota_session_verify(s3, three));
+
+    // failure, retry (3 allowed) and rollback
+    var r = ota_session_new(m);
+    ota_session_fail(r, "disk full");
+    println(ota_session_state_name(r));
+    println(r.error_msg);
+    say_yes(ota_session_can_retry(r));
+    ota_session_retry(r);
+    println(ota_session_state_name(r));
+    println(r.error_msg == "");
+    println(r.retry_count);
+    ota_session_retry(r);
+    say_yes(ota_session_can_retry(r));
+    ota_session_retry(r);
+    println(r.retry_count);
+    say_yes(ota_session_can_retry(r));
+    ota_session_rollback(r);
+    println(ota_session_state_name(r));
+    // a zero-size manifest has no percentage
+    var z = ota_session_new(ota_manifest_new("z", 0, "sha256:aa"));
+    println(ota_session_download_percent(z));
+
+    // binary diff: regions are (offset, length) pairs
+    var old: Vec<i64> = Vec::new();
+    old.push(1);
+    old.push(2);
+    old.push(3);
+    old.push(4);
+    old.push(5);
+    var new_data: Vec<i64> = Vec::new();
+    new_data.push(1);
+    new_data.push(9);
+    new_data.push(9);
+    new_data.push(4);
+    new_data.push(5);
+    new_data.push(6);
+    var d = ota_binary_diff(old, new_data);
+    show(d);
+    println(ota_diff_size(d));
+    println(ota_diff_region_count(d));
+    // identical data has no regions; a first byte and a last byte differ
+    show(ota_binary_diff(old, old));
+    var e = ota_binary_diff(old, hello());
+    show(e);
+    println(ota_diff_size(e));
+    var none: Vec<i64> = Vec::new();
+    show(ota_binary_diff(none, none));
+    println(ota_diff_size(none));
+    println(ota_diff_region_count(none));
+    // growing from nothing is one region
+    show(ota_binary_diff(none, old));
+    return 0;
+}
