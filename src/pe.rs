@@ -10389,10 +10389,12 @@ fn reg_word(ty: &IrType, module: &IrModule) -> bool {
 
 /// Checks a counted loop makes needless. In `while i < n`, with `i` an unshared
 /// local that only the increment `i = i + 1` changes in the loop, that increment
-/// cannot overflow. If also `n` is `v.len()`, `i` starts at a constant >= 0 and
-/// nothing in the loop can shorten `v`, then `v.get(i)` and `v.set(i, x)` are in
+/// cannot overflow. If also `n` is `v.len()` (or a local set once to it before
+/// the loop), `i` starts at a constant >= 0 and nothing between that `len` and
+/// the loop's end can shorten `v`, then `v.get(i)` and `v.set(i, x)` are in
 /// bounds, when `i` is read before the increment. Returns those instructions.
-fn unchecked_ops(func: &IrFunction) -> std::collections::HashSet<u32> {
+/// The C backend uses it too (codegen_c.rs).
+pub(crate) fn unchecked_ops(func: &IrFunction) -> std::collections::HashSet<u32> {
     use std::collections::HashSet;
     let mut out = HashSet::new();
     let n = func.blocks.len();
@@ -10470,7 +10472,10 @@ fn unchecked_ops(func: &IrFunction) -> std::collections::HashSet<u32> {
     }
     let may_shorten = |id: &ValueId| match inst(*id) {
         Some(Inst::Call { func, .. }) => !matches!(func.as_str(),
-            "Vec_get" | "Vec_set" | "Vec_len" | "Vec_push" | "Vec_is_empty" | "Vec_capacity"),
+            "Vec_get" | "Vec_set" | "Vec_len" | "Vec_push" | "Vec_is_empty" | "Vec_capacity"
+            | "p_vec_get" | "p_vec_set" | "p_vec_len" | "p_vec_push" | "p_vec_is_empty"
+            | "print" | "println" | "int_to_str" | "p_print_int" | "p_print_str" | "p_print_float"
+            | "p_print_bool" | "p_print_newline"),
         Some(Inst::CallPtr { .. } | Inst::DynCall { .. } | Inst::Asm { .. } | Inst::Backward { .. }) => true,
         _ => false,
     };
@@ -10508,14 +10513,45 @@ fn unchecked_ops(func: &IrFunction) -> std::collections::HashSet<u32> {
             continue;
         }
         out.insert(value.0);
-        // Bounds: `right` is v.len()
-        let Some(Inst::Call { func: len, args, .. }) = inst(*right) else { continue; };
-        let (Some(&vec), true) = (args.last(), len == "Vec_len") else { continue; };
+        // Bounds: `right` is v.len(), or a local set once, before the loop, to it
+        let is_len = |v: ValueId| matches!(inst(v),
+            Some(Inst::Call { func, .. }) if func == "Vec_len" || func == "p_vec_len");
+        let len_call = match inst(*right) {
+            _ if is_len(*right) => *right,
+            Some(Inst::Load { ptr, .. }) if plain.contains(&ptr.0) => match stores.get(&ptr.0).map(|s| &s[..]) {
+                Some([(sb, _, v)]) if !body[*sb] && is_len(*v) => *v,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let Some(Inst::Call { args, .. }) = inst(len_call) else { continue; };
+        let Some(&vec) = args.last() else { continue; };
         let starts_ok = all.iter().all(|s| body[s.0]
             || matches!(inst(s.2), Some(Inst::ConstInt { value, .. }) if *value >= 0));
-        let (len_block, len_at) = place[&right.0];
-        let len_stands = body[len_block]
-            || !func.blocks[len_block].instructions[len_at + 1..].iter().any(may_shorten);
+        let (len_block, len_at) = place[&len_call.0];
+        // Nothing shortens v after the len and before the loop: not later in its
+        // block, nor in a block on a path from it to the loop
+        let len_stands = body[len_block] || {
+            let mut fwd = vec![false; n];
+            let mut work = succs[len_block].clone();
+            while let Some(b) = work.pop() {
+                if !fwd[b] && !body[b] {
+                    fwd[b] = true;
+                    work.extend(succs[b].iter().copied());
+                }
+            }
+            let mut bwd = vec![false; n];
+            let mut work: Vec<usize> = preds[head].iter().copied().filter(|p| !body[*p]).collect();
+            while let Some(b) = work.pop() {
+                if !bwd[b] && !body[b] {
+                    bwd[b] = true;
+                    work.extend(preds[b].iter().copied());
+                }
+            }
+            !func.blocks[len_block].instructions[len_at + 1..].iter().any(may_shorten)
+                && !(0..n).any(|b| fwd[b] && bwd[b] && b != len_block
+                    && func.blocks[b].instructions.iter().any(may_shorten))
+        };
         let shortens = (0..n).any(|b| body[b] && func.blocks[b].instructions.iter().any(may_shorten));
         if !starts_ok || !len_stands || shortens {
             continue;
@@ -10540,8 +10576,8 @@ fn unchecked_ops(func: &IrFunction) -> std::collections::HashSet<u32> {
             for id in &func.blocks[b].instructions {
                 let Some(Inst::Call { func: name, args, .. }) = inst(*id) else { continue; };
                 let at = match name.as_str() {
-                    "Vec_get" if args.len() >= 2 => args.len() - 2,
-                    "Vec_set" if args.len() >= 3 => args.len() - 3,
+                    "Vec_get" | "p_vec_get" if args.len() >= 2 => args.len() - 2,
+                    "Vec_set" | "p_vec_set" if args.len() >= 3 => args.len() - 3,
                     _ => continue,
                 };
                 let index = args[at + 1];

@@ -99,6 +99,9 @@ fn is_internal_function(name: &str) -> bool {
 }
 
 pub struct CCodeGen {
+    /// Instructions of the current function whose checks a counted loop makes
+    /// needless (pe::unchecked_ops)
+    unchecked: std::collections::HashSet<u32>,
     /// Externs that take or return a struct by value: called through a wrapper
     c_wrapped: std::collections::BTreeSet<String>,
     out: String,
@@ -149,6 +152,7 @@ pub struct CCodeGen {
 impl CCodeGen {
     fn new() -> Self {
         CCodeGen {
+            unchecked: Default::default(),
             c_wrapped: Default::default(),
             out: String::new(),
             value_names: HashMap::new(),
@@ -1329,6 +1333,13 @@ impl CCodeGen {
         wln!(self, "    h[0] = (int64_t)(intptr_t)nd;");
         wln!(self, "    h[2] = nc;");
         wln!(self, "}}");
+        wln!(self, "/* Element access a counted loop proved in bounds (pe.rs unchecked_ops). */");
+        wln!(self, "#define P_VEC_UNCHECKED \\");
+        wln!(self, "static inline int64_t __p_vec_get_u(void* e, int64_t v, int64_t i) {{ (void)e; return ((int64_t*)(intptr_t)((int64_t*)(intptr_t)v)[0])[i]; }} \\");
+        wln!(self, "static inline void __p_vec_set_u(void* e, int64_t v, int64_t i, int64_t x) {{ (void)e; ((int64_t*)(intptr_t)((int64_t*)(intptr_t)v)[0])[i] = x; }} \\");
+        wln!(self, "static inline void* __p_pvec_get_u(PVec* v, int64_t i) {{ return v->data[i]; }} \\");
+        wln!(self, "static inline void __p_pvec_set_u(PVec* v, int64_t i, void* x) {{ v->data[i] = x; }}");
+        wln!(self, "P_VEC_UNCHECKED");
         wln!(self, "int64_t p_arena_save(void);");
         wln!(self, "void p_arena_restore(int64_t mark);");
         wln!(self, "void p_region_free(void* region);");
@@ -1790,6 +1801,7 @@ impl CCodeGen {
     }
 
     fn gen_function(&mut self, name: &str, func: &IrFunction) {
+        self.unchecked = crate::pe::unchecked_ops(func);
         self.value_names.clear();
         self.temp_counter = 0;
         self.label_counter = 0;
@@ -1987,7 +1999,8 @@ impl CCodeGen {
                 let unsigned_cmp = matches!(op, BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq)
                     && (l_ty == Some(&IrType::U64) || r_ty == Some(&IrType::U64));
                 if let (Some((n, t)), BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Shl | BinOp::Shr) = (int_ty, op) {
-                    let wrapping = func.is_wrapping;
+                    // A counted loop's increment cannot overflow (pe::unchecked_ops)
+                    let wrapping = func.is_wrapping || self.unchecked.contains(&id.0);
                     match op {
                         BinOp::Add | BinOp::Sub | BinOp::Mul if wrapping => {
                             wln!(self, "    {} = ({})((uint64_t){} {} (uint64_t){});", dst, t, l, cop, r);
@@ -2340,7 +2353,14 @@ impl CCodeGen {
                     wln!(self, "    {} = p_socket_write_str({}, {});", dst, arg0, arg1);
                     return;
                 }
-                let c_fname = self.sanitize_c_name(fname);
+                let c_fname = match fname.as_str() {
+                    // In bounds: a counted loop proved it
+                    "Vec_get" if self.unchecked.contains(&id.0) => "__p_vec_get_u".to_string(),
+                    "Vec_set" if self.unchecked.contains(&id.0) => "__p_vec_set_u".to_string(),
+                    "p_vec_get" if self.unchecked.contains(&id.0) => "__p_pvec_get_u".to_string(),
+                    "p_vec_set" if self.unchecked.contains(&id.0) => "__p_pvec_set_u".to_string(),
+                    _ => self.sanitize_c_name(fname),
+                };
                 // Look up the called function's parameter types so we can
                 // cast arguments to the correct C type (e.g. the hidden
                 // context pointer is passed as I64 0 but the parameter is
