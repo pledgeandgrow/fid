@@ -286,6 +286,38 @@ pub fn EscapeChecker_new(program: Program) -> EscapeChecker {
     };
 }
 
+/// A `&mut`/`&` parameter holding a Vec, HashMap or str, given to a value
+/// parameter: the lowering reads the value through it, so the callee gets a
+/// value, not the reference (as src/escape.rs read_through).
+fn esc_read_through(self: &EscapeChecker, arg: Expr) -> bool {
+    var n: str = "";
+    match arg {
+        Expr::Ident(name) => { n = name; }
+        _ => { return false; }
+    }
+    var slot: i64 = HashMap_get(self.func_index, self.func_name);
+    if slot == 0 { return false; }
+    var f: Func = self.all.get(slot - 1).func;
+    var i: i64 = 0;
+    while i < f.params.len() {
+        if f.params.get(i).name == n {
+            match f.params.get(i).ty {
+                Type::Ref(inner, _) => {
+                    match box_type_unbox(inner) {
+                        Type::Generic(gn, _) => { return gn == "Vec" || gn == "HashMap"; }
+                        Type::Named(nn) => { return nn == "Vec" || nn == "HashMap"; }
+                        Type::Str => { return true; }
+                        _ => { return false; }
+                    }
+                }
+                _ => { return false; }
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
 fn esc_error(self: &mut EscapeChecker, msg: str) {
     if self.report && self.unsafe_depth == 0 {
         var full: str = "Reference error (line " + int_to_str(self.line) + "): in '" + self.func_name + "', " + msg;
@@ -1181,7 +1213,7 @@ fn esc_call(self: &mut EscapeChecker, callee: str, args: Vec<Expr>) -> Vec<EscRo
     var f: Func = self.all.get(slot - 1).func;
     var i: i64 = 0;
     while i < rs.len() {
-        if rs.get(i).len() > 0 && !esc_read_only_call(callee) && i < f.params.len() {
+        if rs.get(i).len() > 0 && !esc_read_only_call(callee) && i < f.params.len() && !esc_read_through(self, args.get(i)) {
             var p: Param = f.params.get(i);
             if !esc_contains_ref(p.ty) {
                 var what: str = "a reference";
@@ -1251,7 +1283,7 @@ fn esc_method_call(self: &mut EscapeChecker, receiver: Expr, method: str, args: 
 fn esc_closure(self: &mut EscapeChecker, params: Vec<Param>, body: Vec<Stmt>) -> Vec<EscRoot> {
     // Captured references root the closure value (captures are by value).
     var used: Vec<str> = Vec::new();
-    esc_idents_stmts(body, used);
+    esc_idents_stmts(body, &mut used);
     var roots: Vec<EscRoot> = Vec::new();
     var ui: i64 = 0;
     while ui < used.len() {
@@ -1291,11 +1323,11 @@ fn esc_closure(self: &mut EscapeChecker, params: Vec<Param>, body: Vec<Stmt>) ->
 
 // --- Identifiers a closure body reads (a superset of its captures) ---------
 
-fn esc_note(out: Vec<str>, name: str) {
+fn esc_note(out: &mut Vec<str>, name: str) {
     if !str_vec_contains(out, name) { out.push(name); }
 }
 
-pub fn esc_idents_stmts(stmts: Vec<Stmt>, out: Vec<str>) {
+pub fn esc_idents_stmts(stmts: Vec<Stmt>, out: &mut Vec<str>) {
     var i: i64 = 0;
     while i < stmts.len() {
         esc_idents_stmt(stmts.get(i), out);
@@ -1303,14 +1335,14 @@ pub fn esc_idents_stmts(stmts: Vec<Stmt>, out: Vec<str>) {
     }
 }
 
-fn esc_idents_opt_stmts(stmts: OptStmts, out: Vec<str>) {
+fn esc_idents_opt_stmts(stmts: OptStmts, out: &mut Vec<str>) {
     match stmts {
         OptStmts::Some(b) => { esc_idents_stmts(b, out); }
         OptStmts::None => {}
     }
 }
 
-fn esc_idents_stmt(s: Stmt, out: Vec<str>) {
+fn esc_idents_stmt(s: Stmt, out: &mut Vec<str>) {
     match s {
         Stmt::Let(_, _, expr, _, _, _, _) => { esc_idents_expr(expr, out); }
         Stmt::LetTuple(_, expr, _) => { esc_idents_expr(expr, out); }
@@ -1375,7 +1407,7 @@ fn esc_idents_stmt(s: Stmt, out: Vec<str>) {
     }
 }
 
-fn esc_idents_exprs(es: Vec<Expr>, out: Vec<str>) {
+fn esc_idents_exprs(es: Vec<Expr>, out: &mut Vec<str>) {
     var i: i64 = 0;
     while i < es.len() {
         esc_idents_expr(es.get(i), out);
@@ -1383,7 +1415,7 @@ fn esc_idents_exprs(es: Vec<Expr>, out: Vec<str>) {
     }
 }
 
-fn esc_idents_expr(e: Expr, out: Vec<str>) {
+fn esc_idents_expr(e: Expr, out: &mut Vec<str>) {
     match e {
         Expr::Ident(n) => { esc_note(out, n); }
         Expr::Binary(_, l, r) => {

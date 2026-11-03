@@ -883,6 +883,23 @@ impl Parser {
         }
 
         let first_name = self.expect_ident()?;
+        // `impl<T> Slot<T>`: the type's arguments repeat the impl's parameters
+        if self.check(&TokenKind::Lt) {
+            let mut depth = 0i32;
+            loop {
+                if self.check(&TokenKind::Lt) {
+                    depth += 1;
+                } else if self.check(&TokenKind::Gt) {
+                    depth -= 1;
+                } else if self.check(&TokenKind::Shr) {
+                    depth -= 2;
+                }
+                self.advance();
+                if depth <= 0 || self.is_at_end() {
+                    break;
+                }
+            }
+        }
 
         // Check for `impl Trait for Type` syntax
         if self.match_tok(TokenKind::For) {

@@ -188,7 +188,7 @@ pub fn PathProgram_new(path: str, prog: Program) -> PathProgram {
 }
 
 /// Cached file read -- returns cached content if available, otherwise reads from disk.
-fn cached_file_read(cache: Vec<PathContent>, path: str) -> str {
+fn cached_file_read(cache: &mut Vec<PathContent>, path: str) -> str {
     var i: i64 = 0;
     while i < cache.len() {
         if cache.get(i).path == path {
@@ -202,7 +202,7 @@ fn cached_file_read(cache: Vec<PathContent>, path: str) -> str {
 }
 
 /// Cached lex -- returns cached tokens if available, otherwise lexes.
-fn cached_lex(token_cache: Vec<PathTokens>, content_cache: Vec<PathContent>, path: str) -> Vec<Token> {
+fn cached_lex(token_cache: &mut Vec<PathTokens>, content_cache: &mut Vec<PathContent>, path: str) -> Vec<Token> {
     var i: i64 = 0;
     while i < token_cache.len() {
         if token_cache.get(i).path == path {
@@ -221,7 +221,7 @@ fn cached_lex(token_cache: Vec<PathTokens>, content_cache: Vec<PathContent>, pat
 /// This avoids re-parsing modules that were pre-scanned then deferred due to
 /// unloaded transitive dependencies. The pre-scan parse is the most expensive
 /// step (~4s per module), and deferred modules get re-parsed on re-encounter.
-fn cached_parse(parse_cache: Vec<PathProgram>, token_cache: Vec<PathTokens>, content_cache: Vec<PathContent>, path: str, struct_names: Vec<str>, enum_names: Vec<str>) -> OptProgram {
+fn cached_parse(parse_cache: &mut Vec<PathProgram>, token_cache: &mut Vec<PathTokens>, content_cache: &mut Vec<PathContent>, path: str, struct_names: Vec<str>, enum_names: Vec<str>) -> OptProgram {
     var i: i64 = 0;
     while i < parse_cache.len() {
         if parse_cache.get(i).path == path {
@@ -1281,11 +1281,11 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                             if found {
                                 inc_record_file(found_path);
                                 // OPTIMIZATION: use cached file read + cached lex + cached parse
-                                var pre_toks: Vec<Token> = cached_lex(token_cache, content_cache, found_path);
+                                var pre_toks: Vec<Token> = cached_lex(&mut token_cache, &mut content_cache, found_path);
 
                                 // Pre-scan: parse to extract imports and type names.
                                 // OPTIMIZATION: use cached_parse to avoid re-parsing deferred modules.
-                                var pre_result_opt: OptProgram = cached_parse(parse_cache, token_cache, content_cache, found_path, struct_names, enum_names);
+                                var pre_result_opt: OptProgram = cached_parse(&mut parse_cache, &mut token_cache, &mut content_cache, found_path, struct_names, enum_names);
 
                                 match pre_result_opt {
                                     OptProgram::Some(pre_prog) => {
@@ -1458,20 +1458,20 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
 
                     // `cap Sub: Super`: Sub carries Super's methods.
                     var trait_defs: Vec<TraitDef> = Vec::new();
-                    cc_push_traits(trait_defs, stdlib);
+                    cc_push_traits(&mut trait_defs, stdlib);
                     var tmi: i64 = 0;
                     while tmi < imported_modules.len() {
-                        cc_push_traits(trait_defs, imported_modules.get(tmi));
+                        cc_push_traits(&mut trait_defs, imported_modules.get(tmi));
                         tmi = tmi + 1;
                     }
-                    cc_push_traits(trait_defs, user);
+                    cc_push_traits(&mut trait_defs, user);
                     var super_errors: Vec<str> = Vec::new();
                     tmi = 0;
                     while tmi < imported_modules.len() {
-                        cc_inherit_supertraits(imported_modules.get(tmi), trait_defs, super_errors);
+                        cc_inherit_supertraits(imported_modules.get(tmi), trait_defs, &mut super_errors);
                         tmi = tmi + 1;
                     }
-                    cc_inherit_supertraits(user, trait_defs, super_errors);
+                    cc_inherit_supertraits(&mut user, trait_defs, &mut super_errors);
                     if super_errors.len() > 0 {
                         return ResultProgram::Err(super_errors);
                     }
@@ -1481,7 +1481,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     var dup_errors: Vec<str> = Vec::new();
                     var dmi: i64 = 0;
                     while dmi < imported_modules.len() {
-                        cc_find_duplicate_funcs(imported_modules.get(dmi), imported_module_names.get(dmi), dup_errors);
+                        cc_find_duplicate_funcs(imported_modules.get(dmi), imported_module_names.get(dmi), &mut dup_errors);
                         dmi = dmi + 1;
                     }
                     var dup_user_module: str = "main";
@@ -1489,8 +1489,8 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         OptStr::Some(um) => { dup_user_module = um; }
                         OptStr::None => {}
                     }
-                    cc_find_duplicate_funcs(user, dup_user_module, dup_errors);
-                    cc_find_module_conflicts(stdlib, imported_modules, imported_module_names, user, dup_user_module, dup_errors);
+                    cc_find_duplicate_funcs(user, dup_user_module, &mut dup_errors);
+                    cc_find_module_conflicts(stdlib, imported_modules, imported_module_names, user, dup_user_module, &mut dup_errors);
                     if dup_errors.len() > 0 {
                         return ResultProgram::Err(dup_errors);
                     }
@@ -1524,6 +1524,8 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
 
                     // R1.2: structural `==` for enums (the lowerer calls `__eq_<Enum>`).
                     synthesize_enum_eq(&mut program);
+                    // R1.2b: structural `==` for structs (`__eq_<Struct>`).
+                    synthesize_struct_eq(&mut program);
 
                     // Desugar layer/model declarations
                     desugar_layers_models(&mut program);
@@ -1846,7 +1848,7 @@ fn lint_unwraps(tc: &mut TypeChecker, user: Program, source: str, source_path: s
         val name: str = names.get(i);
         if !str_starts_with(name, "test_") && !str_starts_with(name, "bench_") {
             var called: Vec<str> = Vec::new();
-            TypeChecker_collect_called_funcs(tc, bodies.get(i), called);
+            TypeChecker_collect_called_funcs(tc, bodies.get(i), &mut called);
             if str_vec_contains(called, "#unwrap") {
                 tc.warnings.push(lint_unwrap_where(source, name) + "'" + name
                     + "' calls unwrap() or expect(), which panic on None or Err.\n"
@@ -2311,7 +2313,7 @@ pub fn get_diagnostics(source: str, source_path: OptStr) -> Vec<StrTriple> {
 /// Items defined by two modules used to collapse silently into one (src/compiler.rs
 /// find_module_conflicts): functions and consts conflict on name alone, structs
 /// when their fields differ. Enums and core's own names follow the Rust check.
-fn cc_find_module_conflicts(stdlib: Program, imported: Vec<Program>, names: Vec<str>, user: Program, user_name: str, errors: Vec<str>) {
+fn cc_find_module_conflicts(stdlib: Program, imported: Vec<Program>, names: Vec<str>, user: Program, user_name: str, errors: &mut Vec<str>) {
     var func_names: Vec<str> = Vec::new();
     var func_mods: Vec<str> = Vec::new();
     var struct_names: Vec<str> = Vec::new();
@@ -2386,7 +2388,7 @@ fn cc_find_module_conflicts(stdlib: Program, imported: Vec<Program>, names: Vec<
     }
 }
 
-fn cc_find_duplicate_funcs(prog: Program, module: str, errors: Vec<str>) {
+fn cc_find_duplicate_funcs(prog: Program, module: str, errors: &mut Vec<str>) {
     var seen: Vec<str> = Vec::new();
     var fi: i64 = 0;
     while fi < prog.funcs.len() {
@@ -2699,6 +2701,76 @@ pub fn synthesize_enum_eq(program: &mut Program) {
     while gi < generated.len() {
         program.funcs.push(generated.get(gi));
         gi = gi + 1;
+    }
+}
+
+/// R1.2b: `==` on structs compares fields (proposal 0001). For every
+/// non-generic struct, as src/compiler.rs synthesize_struct_eq:
+///
+///     fn __eq_S(__eq_a: S, __eq_b: S) -> bool {
+///         return __eq_a.f0 == __eq_b.f0 && __eq_a.f1 == __eq_b.f1 && ...;
+///     }
+///
+/// Each field goes back through `==`: nested structs and enums use their own
+/// __eq, strings compare by content. A struct with a field of a generic
+/// struct or enum type is skipped (its `==` would not type-check yet).
+pub fn synthesize_struct_eq(program: &mut Program) {
+    var generic_defs: Vec<str> = Vec::new();
+    var gi: i64 = 0;
+    while gi < program.structs.len() {
+        if program.structs.get(gi).type_params.len() > 0 { generic_defs.push(program.structs.get(gi).name); }
+        gi = gi + 1;
+    }
+    gi = 0;
+    while gi < program.enums.len() {
+        if program.enums.get(gi).type_params.len() > 0 { generic_defs.push(program.enums.get(gi).name); }
+        gi = gi + 1;
+    }
+    var have: Vec<str> = Vec::new();
+    var fi: i64 = 0;
+    while fi < program.funcs.len() {
+        if str_starts_with(program.funcs.get(fi).name, "__eq_") { have.push(program.funcs.get(fi).name); }
+        fi = fi + 1;
+    }
+    var generated: Vec<Func> = Vec::new();
+    var si: i64 = 0;
+    while si < program.structs.len() {
+        var s: StructDef = program.structs.get(si);
+        si = si + 1;
+        if s.type_params.len() > 0 { continue; }
+        var fname: str = "__eq_" + s.name;
+        if str_vec_contains(have, fname) { continue; }
+        var skip: bool = false;
+        var same: Expr = Expr::BoolLit(true);
+        var i: i64 = 0;
+        while i < s.fields.len() {
+            var f: Param = s.fields.get(i);
+            match f.ty {
+                Type::Generic(gname, _) => { if str_vec_contains(generic_defs, gname) { skip = true; } }
+                _ => {}
+            }
+            var cmp: Expr = Expr::Binary(BinOp::Eq,
+                Box::new(Expr::FieldAccess(Box::new(Expr::Ident("__eq_a")), f.name)),
+                Box::new(Expr::FieldAccess(Box::new(Expr::Ident("__eq_b")), f.name)));
+            if i == 0 {
+                same = cmp;
+            } else {
+                same = Expr::Binary(BinOp::And, Box::new(same), Box::new(cmp));
+            }
+            i = i + 1;
+        }
+        if skip { continue; }
+        var params: Vec<Param> = Vec::new();
+        params.push(Param_new("__eq_a", Type::Named(s.name), false));
+        params.push(Param_new("__eq_b", Type::Named(s.name), false));
+        var body: Vec<Stmt> = Vec::new();
+        body.push(Stmt::Return(OptBoxExpr::Some(Box::new(same)), 0));
+        generated.push(Func_new_full(fname, params, Type::Bool, body, true));
+    }
+    var ni: i64 = 0;
+    while ni < generated.len() {
+        program.funcs.push(generated.get(ni));
+        ni = ni + 1;
     }
 }
 
@@ -3582,7 +3654,7 @@ fn cc_is_cfg(f: Func) -> bool {
 }
 
 /// `funcs` with names and calls rewritten through `renames`.
-fn cc_rename_funcs(funcs: Vec<Func>, renames: Vec<RenameEntry>, rename_defs: bool) {
+fn cc_rename_funcs(funcs: &mut Vec<Func>, renames: Vec<RenameEntry>, rename_defs: bool) {
     var empty_subst: Vec<SubstEntry> = subst_new();
     var no_methods: Vec<RenameEntry> = rename_new();
     var fi: i64 = 0;
@@ -3676,7 +3748,7 @@ fn cc_qualify_shadowed_imports(imported: Vec<Program>, names: Vec<str>, user: Pr
         var d: i64 = HashMap_get(definer, uf.name);
         if d > 0 && !cc_is_cfg(uf) {
             var module: str = str_replace(names.get(d - 1), "::", "__");
-            rename_set(renames, uf.name, module + "__" + uf.name);
+            rename_set(&mut renames, uf.name, module + "__" + uf.name);
             any = true;
         }
         ui = ui + 1;
@@ -3691,7 +3763,7 @@ fn cc_qualify_shadowed_imports(imported: Vec<Program>, names: Vec<str>, user: Pr
         while fi < fs.len() {
             var f: Func = fs.get(fi);
             if !cc_is_cfg(f) && HashMap_get(definer, f.name) == 0 - 1 {
-                rename_set(mine, f.name, str_replace(names.get(mi), "::", "__") + "__" + f.name);
+                rename_set(&mut mine, f.name, str_replace(names.get(mi), "::", "__") + "__" + f.name);
                 any = true;
             }
             fi = fi + 1;
@@ -3718,7 +3790,7 @@ fn cc_qualify_shadowed_imports(imported: Vec<Program>, names: Vec<str>, user: Pr
             }
             ai = ai + 1;
         }
-        if seg == "core" { rename_set(qualified, call, fname); }
+        if seg == "core" { rename_set(&mut qualified, call, fname); }
         mi = 0;
         while mi < imported.len() {
             if names.get(mi) == path || path_last(names.get(mi)) == path {
@@ -3739,7 +3811,7 @@ fn cc_qualify_shadowed_imports(imported: Vec<Program>, names: Vec<str>, user: Pr
                         }
                     }
                 }
-                if hit { rename_set(qualified, call, target); any = true; }
+                if hit { rename_set(&mut qualified, call, target); any = true; }
             }
             mi = mi + 1;
         }
@@ -3750,48 +3822,56 @@ fn cc_qualify_shadowed_imports(imported: Vec<Program>, names: Vec<str>, user: Pr
     while mi < imported.len() {
         var prog: Program = imported.get(mi);
         var map: Vec<RenameEntry> = rename_new();
-        cc_rename_extend(map, renames);
-        cc_rename_extend(map, qualified);
+        cc_rename_extend(&mut map, renames);
+        cc_rename_extend(&mut map, qualified);
         // A name it does not define: the copy of a module it imports
         var ip: i64 = 0;
         while ip < prog.imports.len() {
             var ik: i64 = 0;
             while ik < imported.len() {
-                if names.get(ik) == prog.imports.get(ip).path { cc_rename_extend(map, own.get(ik)); }
+                if names.get(ik) == prog.imports.get(ip).path { cc_rename_extend(&mut map, own.get(ik)); }
                 ik = ik + 1;
             }
             ip = ip + 1;
         }
-        cc_rename_extend(map, own.get(mi));
-        cc_rename_funcs(prog.funcs, map, true);
+        cc_rename_extend(&mut map, own.get(mi));
+        cc_rename_funcs(&mut prog.funcs, map, true);
         var ii: i64 = 0;
         while ii < prog.impls.len() {
-            cc_rename_funcs(prog.impls.get(ii).methods, map, false);
+            var rimp: ImplDef = prog.impls.get(ii);
+            cc_rename_funcs(&mut rimp.methods, map, false);
+            prog.impls.set(ii, rimp);
             ii = ii + 1;
         }
         ii = 0;
         while ii < prog.trait_impls.len() {
-            cc_rename_funcs(prog.trait_impls.get(ii).methods, map, false);
+            var rti: TraitImpl = prog.trait_impls.get(ii);
+            cc_rename_funcs(&mut rti.methods, map, false);
+            prog.trait_impls.set(ii, rti);
             ii = ii + 1;
         }
         mi = mi + 1;
     }
     if qualified.len() > 0 {
-        cc_rename_funcs(user.funcs, qualified, false);
+        cc_rename_funcs(&mut user.funcs, qualified, false);
         var ui2: i64 = 0;
         while ui2 < user.impls.len() {
-            cc_rename_funcs(user.impls.get(ui2).methods, qualified, false);
+            var uimp: ImplDef = user.impls.get(ui2);
+            cc_rename_funcs(&mut uimp.methods, qualified, false);
+            user.impls.set(ui2, uimp);
             ui2 = ui2 + 1;
         }
         ui2 = 0;
         while ui2 < user.trait_impls.len() {
-            cc_rename_funcs(user.trait_impls.get(ui2).methods, qualified, false);
+            var uti: TraitImpl = user.trait_impls.get(ui2);
+            cc_rename_funcs(&mut uti.methods, qualified, false);
+            user.trait_impls.set(ui2, uti);
             ui2 = ui2 + 1;
         }
     }
 }
 
-fn cc_rename_extend(map: Vec<RenameEntry>, more: Vec<RenameEntry>) {
+fn cc_rename_extend(map: &mut Vec<RenameEntry>, more: Vec<RenameEntry>) {
     var i: i64 = 0;
     while i < more.len() {
         map.push(more.get(i));
@@ -3799,7 +3879,7 @@ fn cc_rename_extend(map: Vec<RenameEntry>, more: Vec<RenameEntry>) {
     }
 }
 
-fn cc_push_traits(defs: Vec<TraitDef>, p: Program) {
+fn cc_push_traits(defs: &mut Vec<TraitDef>, p: Program) {
     var i: i64 = 0;
     while i < p.traits.len() {
         defs.push(p.traits.get(i));
@@ -3809,7 +3889,7 @@ fn cc_push_traits(defs: Vec<TraitDef>, p: Program) {
 
 /// Supertrait methods first (transitively), then the trait's own; a method
 /// the trait redeclares keeps its signature.
-fn cc_collect_trait_methods(name: str, defs: Vec<TraitDef>, seen: Vec<str>, out: Vec<TraitMethod>) {
+fn cc_collect_trait_methods(name: str, defs: Vec<TraitDef>, seen: &mut Vec<str>, out: &mut Vec<TraitMethod>) {
     if cc_c_str_vec_contains(seen, name) { return; }
     seen.push(name);
     var i: i64 = 0;
@@ -3845,7 +3925,7 @@ fn cc_collect_trait_methods(name: str, defs: Vec<TraitDef>, seen: Vec<str>, out:
 
 /// `cap Sub: Super { .. }`: a subtrait inherits its supertraits' methods, so
 /// an impl of Sub must provide them and a `dyn Sub` vtable carries them.
-fn cc_inherit_supertraits(p: Program, defs: Vec<TraitDef>, errors: Vec<str>) {
+fn cc_inherit_supertraits(p: &mut Program, defs: Vec<TraitDef>, errors: &mut Vec<str>) {
     var i: i64 = 0;
     while i < p.traits.len() {
         var t: TraitDef = p.traits.get(i);
@@ -3866,7 +3946,7 @@ fn cc_inherit_supertraits(p: Program, defs: Vec<TraitDef>, errors: Vec<str>) {
             }
             var out: Vec<TraitMethod> = Vec::new();
             var seen: Vec<str> = Vec::new();
-            cc_collect_trait_methods(t.name, defs, seen, out);
+            cc_collect_trait_methods(t.name, defs, &mut seen, &mut out);
             t.methods = out;
             p.traits.set(i, t);
         }

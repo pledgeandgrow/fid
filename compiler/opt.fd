@@ -882,7 +882,7 @@ pub fn collect_used_values(f: &L2Function) -> Vec<i64> {
     while bi < f.blocks.len() {
         var pi: i64 = 0;
         while pi < f.blocks.get(bi).params.len() {
-            used_push(used, f.blocks.get(bi).params.get(pi).id);
+            used_push(&mut used, f.blocks.get(bi).params.get(pi).id);
             pi = pi + 1;
         }
         bi = bi + 1;
@@ -890,7 +890,7 @@ pub fn collect_used_values(f: &L2Function) -> Vec<i64> {
     // Function params are live
     var pi: i64 = 0;
     while pi < f.params.len() {
-        used_push(used, f.params.get(pi).id);
+        used_push(&mut used, f.params.get(pi).id);
         pi = pi + 1;
     }
     // Every operand reference
@@ -899,7 +899,7 @@ pub fn collect_used_values(f: &L2Function) -> Vec<i64> {
         var refs: Vec<i64> = value_refs(f.values.get(vi).inst);
         var ri: i64 = 0;
         while ri < refs.len() {
-            used_push(used, refs.get(ri));
+            used_push(&mut used, refs.get(ri));
             ri = ri + 1;
         }
         vi = vi + 1;
@@ -908,7 +908,7 @@ pub fn collect_used_values(f: &L2Function) -> Vec<i64> {
 }
 
 /// Push to used vec if not already present (dedup).
-fn used_push(used: Vec<i64>, v: i64) {
+fn used_push(used: &mut Vec<i64>, v: i64) {
     var i: i64 = 0;
     while i < used.len() {
         if used.get(i) == v { return; }
@@ -1847,7 +1847,7 @@ fn copy_of_get(copy_of: Vec<CopyEntry>, pv: i64) -> i64 {
 }
 
 /// Set or update a copy_of entry
-fn copy_of_set(copy_of: Vec<CopyEntry>, vid: i64, canonical: i64) {
+fn copy_of_set(copy_of: &mut Vec<CopyEntry>, vid: i64, canonical: i64) {
     var i: i64 = 0;
     while i < copy_of.len() {
         if copy_of.get(i).vid == vid {
@@ -2005,7 +2005,7 @@ fn gvn_function(f: &mut L2Function) -> i64 {
             match inst {
                 L2Inst::Copy(value, _) => {
                     var resolved: i64 = resolve_copy(value, copy_of);
-                    copy_of_set(copy_of, vid, resolved);
+                    copy_of_set(&mut copy_of, vid, resolved);
                     ii = ii + 1;
                     continue;
                 }
@@ -2519,13 +2519,13 @@ fn dse_function(f: &mut L2Function) -> i64 {
                                 count = count + 1;
                             }
                         }
-                        dse_set_add(seen_store, ptr);
+                        dse_set_add(&mut seen_store, ptr);
                         dse_set_remove(&mut seen_load, ptr);
                     }
                 }
                 L2Inst::Load(ptr, ty) => {
                     if dse_is_local_ptr(ptr, local_allocas, gfp_base_ids) {
-                        dse_set_add(seen_load, ptr);
+                        dse_set_add(&mut seen_load, ptr);
                     }
                 }
                 L2Inst::Call(func, _, _) => {
@@ -2533,12 +2533,12 @@ fn dse_function(f: &mut L2Function) -> i64 {
                         // Conservative: treat as load from all local pointers
                         var k: i64 = 0;
                         while k < local_allocas.len() {
-                            dse_set_add(seen_load, local_allocas.get(k));
+                            dse_set_add(&mut seen_load, local_allocas.get(k));
                             k = k + 1;
                         }
                         k = 0;
                         while k < gfp_base_ids.len() {
-                            dse_set_add(seen_load, gfp_base_ids.get(k));
+                            dse_set_add(&mut seen_load, gfp_base_ids.get(k));
                             k = k + 1;
                         }
                     }
@@ -2546,14 +2546,14 @@ fn dse_function(f: &mut L2Function) -> i64 {
                 L2Inst::CallPtr(_, _, _, _) => {
                     var k: i64 = 0;
                     while k < local_allocas.len() {
-                        dse_set_add(seen_load, local_allocas.get(k));
+                        dse_set_add(&mut seen_load, local_allocas.get(k));
                         k = k + 1;
                     }
                 }
                 L2Inst::DynCall(_, _, _, _) => {
                     var k: i64 = 0;
                     while k < local_allocas.len() {
-                        dse_set_add(seen_load, local_allocas.get(k));
+                        dse_set_add(&mut seen_load, local_allocas.get(k));
                         k = k + 1;
                     }
                 }
@@ -2570,11 +2570,11 @@ fn dse_function(f: &mut L2Function) -> i64 {
     while i < f.values.len() {
         match f.values.get(i).inst {
             L2Inst::Load(ptr, _) => {
-                dse_set_add(loaded_ptrs, ptr);
+                dse_set_add(&mut loaded_ptrs, ptr);
                 // If loading through a GetFieldPtr, mark base alloca as loaded
                 var gfp_idx: i64 = dse_gfp_find(gfp_base_ids, ptr);
                 if gfp_idx >= 0 {
-                    dse_set_add(loaded_ptrs, gfp_base_alloca.get(gfp_idx));
+                    dse_set_add(&mut loaded_ptrs, gfp_base_alloca.get(gfp_idx));
                 }
             }
             _ => {}
@@ -2633,25 +2633,25 @@ fn dse_function(f: &mut L2Function) -> i64 {
                 match inst {
                     L2Inst::Store(ptr, _, _) => {
                         if dse_is_local_ptr(ptr, local_allocas, gfp_base_ids) {
-                            dse_set_add(stored, ptr);
+                            dse_set_add(&mut stored, ptr);
                             dse_set_remove(&mut loaded, ptr);
                         }
                     }
                     L2Inst::Load(ptr, _) => {
                         if dse_is_local_ptr(ptr, local_allocas, gfp_base_ids) {
-                            dse_set_add(loaded, ptr);
+                            dse_set_add(&mut loaded, ptr);
                         }
                     }
                     L2Inst::Call(func, _, _) => {
                         if !is_known_pure_func(func) {
                             var k: i64 = 0;
                             while k < local_allocas.len() {
-                                dse_set_add(loaded, local_allocas.get(k));
+                                dse_set_add(&mut loaded, local_allocas.get(k));
                                 k = k + 1;
                             }
                             k = 0;
                             while k < gfp_base_ids.len() {
-                                dse_set_add(loaded, gfp_base_ids.get(k));
+                                dse_set_add(&mut loaded, gfp_base_ids.get(k));
                                 k = k + 1;
                             }
                         }
@@ -2659,14 +2659,14 @@ fn dse_function(f: &mut L2Function) -> i64 {
                     L2Inst::CallPtr(_, _, _, _) => {
                         var k: i64 = 0;
                         while k < local_allocas.len() {
-                            dse_set_add(loaded, local_allocas.get(k));
+                            dse_set_add(&mut loaded, local_allocas.get(k));
                             k = k + 1;
                         }
                     }
                     L2Inst::DynCall(_, _, _, _) => {
                         var k: i64 = 0;
                         while k < local_allocas.len() {
-                            dse_set_add(loaded, local_allocas.get(k));
+                            dse_set_add(&mut loaded, local_allocas.get(k));
                             k = k + 1;
                         }
                     }
@@ -2884,7 +2884,7 @@ fn dse_is_local_ptr(ptr: i64, local_allocas: Vec<i64>, gfp_base_ids: Vec<i64>) -
     return false;
 }
 
-fn dse_set_add(set: Vec<i64>, v: i64) {
+fn dse_set_add(set: &mut Vec<i64>, v: i64) {
     if !i64_vec_contains(set, v) {
         set.push(v);
     }
@@ -5435,7 +5435,7 @@ fn I64VecI64_new(a: i64, b: Vec<i64>) -> I64VecI64 {
 pub fn compute_rpo(f: &L2Function, entry: i64) -> Vec<i64> {
     var visited: Vec<i64> = Vec::new();
     var postorder: Vec<i64> = Vec::new();
-    rpo_dfs(f, entry, visited, postorder);
+    rpo_dfs(f, entry, &mut visited, &mut postorder);
     // Reverse postorder = reverse of postorder
     var rpo: Vec<i64> = Vec::new();
     var i: i64 = postorder.len() - 1;
@@ -5447,7 +5447,7 @@ pub fn compute_rpo(f: &L2Function, entry: i64) -> Vec<i64> {
     return rpo;
 }
 
-fn rpo_dfs(f: &L2Function, block: i64, visited: Vec<i64>, postorder: Vec<i64>) {
+fn rpo_dfs(f: &L2Function, block: i64, visited: &mut Vec<i64>, postorder: &mut Vec<i64>) {
     // Iterative DFS with an explicit stack — deep CFGs (large stdlib
     // functions) would overflow the native call stack in compiled code.
     var stack: Vec<I64Pair> = Vec::new();
@@ -5456,7 +5456,7 @@ fn rpo_dfs(f: &L2Function, block: i64, visited: Vec<i64>, postorder: Vec<i64>) {
     stack.push(I64Pair_new(block, 0));
     while stack.len() > 0 {
         var top: I64Pair = stack.get(stack.len() - 1);
-        var succs: Vec<i64> = rpo_dfs_succs(f, top.first, succ_cache);
+        var succs: Vec<i64> = rpo_dfs_succs(f, top.first, &mut succ_cache);
         if top.second < succs.len() {
             var succ: i64 = succs.get(top.second);
             stack.pop();
@@ -5474,7 +5474,7 @@ fn rpo_dfs(f: &L2Function, block: i64, visited: Vec<i64>, postorder: Vec<i64>) {
 
 // Successors of `block`, cached in succ_cache (block id -> succs) so each
 // block's terminator is examined once.
-fn rpo_dfs_succs(f: &L2Function, block: i64, succ_cache: Vec<I64VecI64>) -> Vec<i64> {
+fn rpo_dfs_succs(f: &L2Function, block: i64, succ_cache: &mut Vec<I64VecI64>) -> Vec<i64> {
     var ci: i64 = 0;
     while ci < succ_cache.len() {
         if succ_cache.get(ci).a == block { return succ_cache.get(ci).b; }
@@ -5542,7 +5542,7 @@ pub fn compute_dominators(f: &L2Function) -> Vec<I64Pair> {
             }
             var current: i64 = dom_get(idom, b);
             if current != new_idom {
-                dom_set(idom, b, new_idom);
+                dom_set(&mut idom, b, new_idom);
                 changed = true;
             }
             ri = ri + 1;
@@ -5572,7 +5572,7 @@ fn dom_get(idom: Vec<I64Pair>, b: i64) -> i64 {
 }
 
 /// Set the idom of block b (update or insert)
-fn dom_set(idom: Vec<I64Pair>, b: i64, val: i64) {
+fn dom_set(idom: &mut Vec<I64Pair>, b: i64, val: i64) {
     var i: i64 = 0;
     while i < idom.len() {
         if idom.get(i).first == b {

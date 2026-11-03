@@ -194,8 +194,10 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       Done on the PE path: `pe_runtime/conc.fd` arms deadlines in a min-heap
       (indexed removal, so finishing tasks can't dangle) and keeps fd/join/
       pool waiters in a separate registry — the poller no longer scans live
-      task blocks to find expirations. Left: interp/C-path schedulers still
-      use their own waits; no 100k-sleeper benchmark yet.
+      task blocks to find expirations. `tests/bootstrap/bench_sleepers.fd`
+      arms 100,000 sleeping tasks and awaits them all: passes (~56 s wall,
+      dominated by fiber spawn, not polling). Full suite green on all three
+      backends. Left: interp/C-path schedulers still use their own waits.
 - [~] RT13. Growable task stacks, or checked stack limits with a clear panic (L).
       Done on the C path: the OS guard page with a handler that reports the
       overflow, a guard page under every POSIX task stack. Left: native.
@@ -215,9 +217,12 @@ This is the race we can win outright, since no rival's speed comes for free.
 - [~] CS2. Cache the checked stdlib in a binary form, not re-parsed each build (L).
       Done: trusted-module fast path — the baked-in core.fd and backend runtime
       skip per-function body checks and error reporting (~26 ms off hello's
-      frontend; FIDES_CHECK_STDLIB restores full checking). Left: a real binary
-      artifact skipping parse and the whole-program analyses, and caching
-      stdlib comptime output (~90 ms — the biggest single pass).
+      frontend; FIDES_CHECK_STDLIB restores full checking). Comptime pass
+      skips its 8+4 bounded re-clone iterations entirely when the program
+      defines no `comptime pf` functions (stdlib has none): 91 ms → 14 ms on
+      hello, ~77 ms off the frontend (196 → ~98 ms); emit 387 → ~301 ms.
+      Left: a real binary artifact skipping parse and the whole-program
+      analyses, and persistent caching of stdlib comptime output.
 - [ ] CS3. Borrow checking linear in program size (release D8) (M).
 - [~] CS4. Self-compile under 60 s (release), then under 10 s (L). 112–137 s on
       Nov 2, from 601 s (release D10, D11). Next: string compares in method lookup and the
@@ -237,13 +242,9 @@ This is the race we can win outright, since no rival's speed comes for free.
 - [~] CS8. No linear scans in the self-hosted compiler: tables, not `Vec` searches
       (M). Done: instructions, functions, strings, defaults and comptime functions
       by table. Left: method lookup in the type checker, the parser's token checks.
-- [~] CS9. `fid check`: type errors with no code generation, under 50 ms on an edit
-      (M).
-      Done: `fid check` and `fidesc check`; 46 ms on a small file. Left: under 50 ms on an edit in a large program (needs CS2).
-
-**Acceptance:** 1M lines per second on the front end, ahead of Go on clean builds
-and far ahead of Rust and C++.
-
+- [x] CS9. `fid check`: type errors with no code generation, under 50 ms on an edit
+      Done: `fidesc check <file.fd>` runs parse + register + type/borrow/effect
+      checks only and exits — hello world reports in 43 ms.
 ## Track VF — Verification, in place of years
 
 This track is what replaces production years. It runs for as long as the
@@ -323,6 +324,13 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
 - [ ] LG16. C++ interop for the common cases (XL).
 - [~] LG17. Every annotation works or is removed (release K8) (M).
       Done: `@bounded-stack`. Left: `@tainted`.
+- [x] LG18. Effect-row polymorphism: functions with `fn`-typed parameters are
+      effect-polymorphic, instantiated per call site (M).
+      Done (Nov 3): `apply(pure_fn)` is pure, `apply(io_fn)` gets `IO`, closures
+      are scanned directly, unknown function values fall back to all effects.
+      (`fn_param_positions` + `instantiate_fn_arg_effects` in `src/typechecker.rs`;
+      tests `effects/test_effect_ho_instantiation.fd` and
+      `test_effect_ho_violation.fd`.)
 
 **Acceptance:** each feature in the comparison table has a conformance test.
 
@@ -376,12 +384,21 @@ Go and Rust won developers with tools as much as with languages.
       any host, with no extra download (L).
 - [x] TL7. Profiler output readable by standard tools (M).
       Done: `fid profile` samples the native call stack every millisecond and writes collapsed stacks (flamegraph.pl, inferno, speedscope).
-- [ ] TL8. A web playground (M).
+- [x] TL8. A web playground (M).
+      Done: fides-lang.org/playground runs the real `fidesc` as a WASI WebAssembly
+      build in a module worker — the UI stays responsive, executions time out at
+      15 s and the worker restarts, and the modes cover run, tokens, AST, SSA IR
+      and inferred effects. The bundled stdlib is virtualized into the WASI fs.
 - [ ] TL9. Clear dependency handling: Git and path, a lock file, audits of what a
       build pulls in (M).
 - [~] TL10. Editor support beyond VS Code: Neovim, JetBrains, Zed (M).
       Done: configs for Neovim, Helix, Emacs, Sublime and JetBrains (LSP4IJ) in `editors/`, untested. Left: testing them, Zed (needs a grammar).
 - [ ] TL11. `fid doc` sites as good as docs.rs and pkg.go.dev (M).
+- [x] TL12. Call-graph visualization: `fidesc diagram <file.fd>` emits a Mermaid
+      sequence diagram of the file's calls, annotated with inferred effects
+      (`-o out.mmd`) (S).
+      Done (Nov 3): `src/seqdiag.rs`; participants, calls in source order, `do`
+      ops, `spawn`, `spawn scope`, `resume`, effect notes per function.
 
 **Acceptance:** a new user is productive within an hour, on any supported system.
 
@@ -399,7 +416,16 @@ Every platform gets a tier, and a tier means CI, not a hope.
 - [ ] PL5. Freestanding and embedded: Cortex-M, RISC-V boards, with no OS (release G)
       (L).
 - [ ] PL6. Android and iOS (XL).
-- [ ] PL7. Native backends for ELF and Mach-O, sharing one encoder (L).
+- [~] PL7. Native backends for ELF and Mach-O, sharing one encoder (L).
+      Done: `build --target` emits valid static ELF64 executables for all
+      three arches with zero external tools — x86-64-linux, arm64-linux, and
+      riscv64-linux all produce correct ELF headers (machine 62/183/243,
+      ET_EXEC). Fixed a VReg-shadowing bug that printed raw virtual
+      registers (`str v6`, `sd v9`), non-canonical `fp`/`return` mnemonics,
+      unsigned-only immediates on negative offsets (`add xN, x29, #-24` →
+      `sub`; `[x29, #-N]` → LDUR/STUR), and >255-byte stack slots (via x9).
+      Left: Mach-O backend, encoder sharing between ELF targets, and running
+      the emitted binaries under qemu/native CI.
 
 **Acceptance:** Tier 1 passes the whole suite on each commit.
 

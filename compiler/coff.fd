@@ -98,8 +98,8 @@ pub enum ResultVec { Ok(Vec<i64>), Err(str) }
 
 // --- Helper: emit little-endian ---
 
-fn co_emit_u16(t: Vec, v: i64) { t.push(v & 0xFF); t.push((v >> 8) & 0xFF); }
-fn co_emit_u32(t: Vec, v: i64) {
+fn co_emit_u16(t: &mut Vec, v: i64) { t.push(v & 0xFF); t.push((v >> 8) & 0xFF); }
+fn co_emit_u32(t: &mut Vec, v: i64) {
     t.push(v & 0xFF);
     t.push((v >> 8) & 0xFF);
     t.push((v >> 16) & 0xFF);
@@ -251,7 +251,7 @@ pub fn CoffEmitter_build_coff(self: &mut CoffEmitter) -> ResultVec {
 
     // Build string table (for names > 8 chars)
     var string_table_data: Vec<i64> = Vec::new();
-    co_emit_u32(string_table_data, 4); // initial size = 4
+    co_emit_u32(&mut string_table_data, 4); // initial size = 4
 
     var si: i64 = 0;
     while si < self.symbols.len() {
@@ -277,38 +277,38 @@ pub fn CoffEmitter_build_coff(self: &mut CoffEmitter) -> ResultVec {
     var buf: Vec<i64> = Vec::new();
 
     // -- COFF Header --
-    co_emit_u16(buf, IMAGE_FILE_MACHINE_AMD64);     // Machine
-    co_emit_u16(buf, num_sections);                   // NumberOfSections
-    co_emit_u32(buf, 0);                              // TimeDateStamp
-    co_emit_u32(buf, symbol_table_offset);            // PointerToSymbolTable
-    co_emit_u32(buf, self.symbols.len());              // NumberOfSymbols
-    co_emit_u16(buf, 0);                              // SizeOfOptionalHeader
-    co_emit_u16(buf, 0);                              // Characteristics
+    co_emit_u16(&mut buf, IMAGE_FILE_MACHINE_AMD64);     // Machine
+    co_emit_u16(&mut buf, num_sections);                   // NumberOfSections
+    co_emit_u32(&mut buf, 0);                              // TimeDateStamp
+    co_emit_u32(&mut buf, symbol_table_offset);            // PointerToSymbolTable
+    co_emit_u32(&mut buf, self.symbols.len());              // NumberOfSymbols
+    co_emit_u16(&mut buf, 0);                              // SizeOfOptionalHeader
+    co_emit_u16(&mut buf, 0);                              // Characteristics
 
     // -- Section Header: .text --
-    co_section_name(buf, ".text");
-    co_emit_u32(buf, text_data_size);                  // VirtualSize
-    co_emit_u32(buf, 0);                               // VirtualAddress
-    co_emit_u32(buf, text_data_size);                  // SizeOfRawData
-    co_emit_u32(buf, text_data_offset);                // PointerToRawData
-    co_emit_u32(buf, text_reloc_offset);               // PointerToRelocations
-    co_emit_u32(buf, 0);                               // PointerToLinenumbers
-    co_emit_u16(buf, text_reloc_count);                // NumberOfRelocations
-    co_emit_u16(buf, 0);                               // NumberOfLinenumbers
-    co_emit_u32(buf, IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ);
+    co_section_name(&mut buf, ".text");
+    co_emit_u32(&mut buf, text_data_size);                  // VirtualSize
+    co_emit_u32(&mut buf, 0);                               // VirtualAddress
+    co_emit_u32(&mut buf, text_data_size);                  // SizeOfRawData
+    co_emit_u32(&mut buf, text_data_offset);                // PointerToRawData
+    co_emit_u32(&mut buf, text_reloc_offset);               // PointerToRelocations
+    co_emit_u32(&mut buf, 0);                               // PointerToLinenumbers
+    co_emit_u16(&mut buf, text_reloc_count);                // NumberOfRelocations
+    co_emit_u16(&mut buf, 0);                               // NumberOfLinenumbers
+    co_emit_u32(&mut buf, IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ);
 
     // -- Section Header: .rdata --
     if has_rdata {
-        co_section_name(buf, ".rdata");
-        co_emit_u32(buf, rdata_data_size);
-        co_emit_u32(buf, 0);
-        co_emit_u32(buf, rdata_data_size);
-        co_emit_u32(buf, rdata_data_offset);
-        co_emit_u32(buf, rdata_reloc_offset);
-        co_emit_u32(buf, 0);
-        co_emit_u16(buf, rdata_reloc_count);
-        co_emit_u16(buf, 0);
-        co_emit_u32(buf, IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
+        co_section_name(&mut buf, ".rdata");
+        co_emit_u32(&mut buf, rdata_data_size);
+        co_emit_u32(&mut buf, 0);
+        co_emit_u32(&mut buf, rdata_data_size);
+        co_emit_u32(&mut buf, rdata_data_offset);
+        co_emit_u32(&mut buf, rdata_reloc_offset);
+        co_emit_u32(&mut buf, 0);
+        co_emit_u16(&mut buf, rdata_reloc_count);
+        co_emit_u16(&mut buf, 0);
+        co_emit_u32(&mut buf, IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
     }
 
     // -- .text section data --
@@ -323,9 +323,9 @@ pub fn CoffEmitter_build_coff(self: &mut CoffEmitter) -> ResultVec {
     while ri < self.relocations.len() {
         var reloc: RelocEntry = self.relocations.get(ri);
         if reloc.section == 1 {
-            co_emit_u32(buf, reloc.virtual_address);
-            co_emit_u32(buf, reloc.symbol_table_index);
-            co_emit_u16(buf, reloc.rtype);
+            co_emit_u32(&mut buf, reloc.virtual_address);
+            co_emit_u32(&mut buf, reloc.symbol_table_index);
+            co_emit_u16(&mut buf, reloc.rtype);
         }
         ri = ri + 1;
     }
@@ -341,9 +341,9 @@ pub fn CoffEmitter_build_coff(self: &mut CoffEmitter) -> ResultVec {
         while rri < self.relocations.len() {
             var rreloc: RelocEntry = self.relocations.get(rri);
             if rreloc.section == 2 {
-                co_emit_u32(buf, rreloc.virtual_address);
-                co_emit_u32(buf, rreloc.symbol_table_index);
-                co_emit_u16(buf, rreloc.rtype);
+                co_emit_u32(&mut buf, rreloc.virtual_address);
+                co_emit_u32(&mut buf, rreloc.symbol_table_index);
+                co_emit_u16(&mut buf, rreloc.rtype);
             }
             rri = rri + 1;
         }
@@ -366,12 +366,12 @@ pub fn CoffEmitter_build_coff(self: &mut CoffEmitter) -> ResultVec {
         } else {
             // Long name: 4 bytes of 0 + 4 bytes offset into string table
             var offset: i64 = symbol_name_map_lookup(self.symbol_name_map, s2.name);
-            co_emit_u32(buf, 0);
-            co_emit_u32(buf, offset);
+            co_emit_u32(&mut buf, 0);
+            co_emit_u32(&mut buf, offset);
         }
-        co_emit_u32(buf, s2.value);                    // Value
-        co_emit_u16(buf, s2.section_number);           // SectionNumber
-        co_emit_u16(buf, s2.sym_type);                 // Type
+        co_emit_u32(&mut buf, s2.value);                    // Value
+        co_emit_u16(&mut buf, s2.section_number);           // SectionNumber
+        co_emit_u16(&mut buf, s2.sym_type);                 // Type
         buf.push(s2.storage_class);                      // StorageClass
         buf.push(s2.number_of_aux_symbols);              // NumberOfAuxSymbols
         syi = syi + 1;
@@ -387,7 +387,7 @@ pub fn CoffEmitter_build_coff(self: &mut CoffEmitter) -> ResultVec {
     return ResultVec::Ok(buf);
 }
 
-fn co_section_name(buf: Vec, name: str) {
+fn co_section_name(buf: &mut Vec, name: str) {
     var i: i64 = 0;
     while i < str_len(name) {
         buf.push(str_byte_at(name, i));

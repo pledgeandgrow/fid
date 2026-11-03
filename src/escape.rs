@@ -828,6 +828,19 @@ impl<'a> EscapeChecker<'a> {
         }
     }
 
+    /// A `&mut`/`&` parameter holding a Vec, HashMap or str, given to a value
+    /// parameter: the lowering reads the value through it, so the callee
+    /// gets a value, not the reference.
+    fn read_through(&self, arg: &Expr) -> bool {
+        let Expr::Ident(n) = arg else { return false };
+        let Some(f) = self.funcs.get(&self.func_name) else { return false };
+        f.params.iter().any(|p| p.name == *n && matches!(&p.ty, Type::Ref { inner, .. } if match inner.as_ref() {
+            Type::Generic { name, .. } | Type::Named(name) => matches!(name.as_str(), "Vec" | "HashMap"),
+            Type::Str => true,
+            _ => false,
+        }))
+    }
+
     fn call(&mut self, callee: &str, args: &[Expr]) -> Roots {
         let rs: Vec<Roots> = args.iter().map(|a| self.expr(a)).collect();
         if matches!(callee, "Some" | "Ok" | "Err") {
@@ -842,7 +855,7 @@ impl<'a> EscapeChecker<'a> {
         }
         if let Some(f) = self.funcs.get(callee).copied() {
             for (i, r) in rs.iter().enumerate() {
-                if r.is_empty() || READ_ONLY_CALLS.contains(&callee) {
+                if r.is_empty() || READ_ONLY_CALLS.contains(&callee) || self.read_through(&args[i]) {
                     continue;
                 }
                 if let Some(p) = f.params.get(i) {

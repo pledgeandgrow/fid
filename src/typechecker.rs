@@ -77,6 +77,15 @@ fn swizzle_component_index(c: char) -> usize {
 pub struct TypeChecker {
     scopes: Vec<HashMap<String, Type>>,
     funcs: HashMap<String, (Vec<Type>, Type)>,
+    /// Generic functions: name -> (type parameters, bounds `T: Trait`).
+    func_generics: HashMap<String, (Vec<String>, Vec<(String, String)>)>,
+    /// (trait, type) for every `impl Trait for Type`.
+    impl_pairs: HashSet<(String, String)>,
+    /// Type parameters of each generic impl: `impl<T> Slot` -> Slot: [T].
+    impl_type_params: HashMap<String, Vec<String>>,
+    /// The current function's by-value parameters holding a Vec, HashMap or
+    /// struct, with their types: they are read-only (proposal 0001).
+    value_params: HashMap<String, Type>,
     structs: HashMap<String, Vec<(String, Type)>>,
     enums: HashSet<String>,
     /// Enum name → list of (variant name, payload field types).
@@ -233,6 +242,10 @@ impl TypeChecker {
         TypeChecker {
             scopes: vec![HashMap::new()],
             funcs: HashMap::new(),
+            func_generics: HashMap::new(),
+            impl_pairs: HashSet::new(),
+            impl_type_params: HashMap::new(),
+            value_params: HashMap::new(),
             structs: HashMap::new(),
             enums: HashSet::new(),
             enum_variants: HashMap::new(),
@@ -873,6 +886,11 @@ impl TypeChecker {
             self.module_functions.entry(module.to_string()).or_insert_with(HashSet::new).insert(func.name.clone());
             // Always overwrite — last module wins (user module overrides stdlib)
             self.funcs.insert(func.name.clone(), (param_types, self.resolve_type(&func.ret_ty)));
+            if func.type_params.is_empty() {
+                self.func_generics.remove(&func.name);
+            } else {
+                self.func_generics.insert(func.name.clone(), (func.type_params.clone(), func.type_param_bounds.clone()));
+            }
             self.item_modules.insert(func.name.clone(), module.to_string());
             self.item_visibility.insert(func.name.clone(), func.is_pub);
             self.item_lines.insert(func.name.clone(), func.line);
@@ -889,6 +907,9 @@ impl TypeChecker {
 
         for imp in &program.impls {
             let struct_name = imp.struct_name.clone();
+            if !imp.type_params.is_empty() {
+                self.impl_type_params.insert(struct_name.clone(), imp.type_params.clone());
+            }
             let mut method_map = HashMap::new();
             for method in &imp.methods {
                 let param_types: Vec<Type> = method.params.iter().map(|p| self.resolve_type(&p.ty)).collect();
@@ -942,6 +963,7 @@ impl TypeChecker {
     /// trait methods are visible to the typechecker.
     pub fn register_trait_impls(&mut self, program: &Program) {
         for ti in &program.trait_impls {
+            self.impl_pairs.insert((ti.trait_name.clone(), ti.type_name.clone()));
             let type_name = ti.type_name.clone();
             let mut new_methods: Vec<(String, Vec<Type>, Type, bool, bool)> = Vec::new();
             for method in &ti.methods {
@@ -1307,6 +1329,16 @@ impl TypeChecker {
                 Some(e) => e,
                 None => continue,
             };
+
+            // Effect-row variables (LG19): a declared name that is not a
+            // concrete effect (e.g. `!E` or `!{IO, E}`) marks the function
+            // effect-polymorphic — its callers instantiate the row. Any
+            // inferred effect is then allowed.
+            const CONCRETE: &[&str] = &["IO", "Net", "Spawn", "Diverge", "Alloc",
+                                       "Read", "Write", "Diff", "Noise", "Comm"];
+            if func.declared_effects.iter().any(|e| !CONCRETE.contains(&e.as_str())) {
+                continue;
+            }
 
             // Check that all inferred effects are declared (under-declaration is an error)
             for eff in inferred {
@@ -4667,8 +4699,23 @@ impl TypeChecker {
         self.push_scope();
 
         // Track type parameters for this function
+        // (an impl method also sees its impl's: `impl<T> Slot` puts T in scope)
+        let saved_value_params = std::mem::take(&mut self.value_params);
+        for p in &func.params {
+            let t = self.resolve_type(&p.ty);
+            let aggregate = match &t {
+                Type::Generic { name, .. } => name == "Vec" || name == "HashMap",
+                Type::Named(n) => n == "Vec" || n == "HashMap" || self.structs.contains_key(n),
+                _ => false,
+            };
+            if aggregate && p.name != "self" {
+                self.value_params.insert(p.name.clone(), p.ty.clone());
+            }
+        }
         let saved_tp = self.current_type_params.clone();
-        self.current_type_params = func.type_params.iter().cloned().collect();
+        let mut tps = saved_tp.clone();
+        tps.extend(func.type_params.iter().cloned());
+        self.current_type_params = tps;
 
         // Track trait bounds for type parameters
         let saved_bounds = self.current_type_param_bounds.clone();
@@ -4712,6 +4759,7 @@ impl TypeChecker {
 
         self.current_type_params = saved_tp;
         self.current_type_param_bounds = saved_bounds;
+        self.value_params = saved_value_params;
         self.pop_scope();
         // A function declared to return a value must not fall off the end
         // of its body (parse_match_expr in the self-hosted parser did, and its
@@ -4736,6 +4784,8 @@ impl TypeChecker {
         self.current_line = stmt_line(stmt);
         match stmt {
             Stmt::Let { name, ty, expr, is_mut, is_persist: _, annotations, line } => {
+                // `var v = v;` makes a local copy that may be changed
+                self.value_params.remove(name);
                 // Bidirectional type inference: pass declared type as hint
                 let hint = ty.as_ref().map(|t| t.clone()).unwrap_or(Type::Never);
                 let expr_ty = self.check_expr_with_hint(expr, &hint);
@@ -4854,7 +4904,9 @@ impl TypeChecker {
             }
             Stmt::Return(expr, line) => {
                 if let Some(e) = expr {
-                    let ret_ty = self.check_expr(e);
+                    // The declared return type is the expected type
+                    let hint = self.current_ret_ty.clone().map(|t| self.resolve_self_type(&t)).unwrap_or(Type::Never);
+                    let ret_ty = self.check_expr_with_hint(e, &hint);
                     self.consume_linear_in_expr(e, *line);
                     self.check_return_type(&ret_ty, *line);
                     // Collect for `-> _` inference
@@ -4986,6 +5038,7 @@ impl TypeChecker {
                 }
             }
             Stmt::IndexAssign { array, index, op: _, expr, line: _ } => {
+                self.check_param_change(array);
                 let idx_ty = self.check_expr(index);
                 let val_ty = self.check_expr(expr);
                 match self.lookup(array) {
@@ -5059,6 +5112,10 @@ impl TypeChecker {
                 self.check_expr(expr);
             }
             Stmt::FieldAssign { object, field, op, expr, line } => {
+                self.current_line = *line;
+                if let Some(root) = place_root(object) {
+                    self.check_param_change(&root);
+                }
                 let obj_ty = self.check_expr(object);
                 self.current_line = *line;
                 // Issue 47: Reject field assignment on `val` (immutable) bindings.
@@ -5732,6 +5789,20 @@ impl TypeChecker {
                         }
                     }
                     BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
+                        // A str is text: comparing it with a number has no
+                        // meaning outside the runtime layer and the compiler,
+                        // where a str is a word
+                        let num = |t: &Type| self.is_numeric(t) && *t != Type::Infer;
+                        if !Self::is_runtime_layer(&self.current_module)
+                            && !self.current_module.starts_with("compiler")
+                            && ((lt == Type::Str && num(&rt)) || (rt == Type::Str && num(&lt)))
+                        {
+                            self.errors.push(format!(
+                                "Type error (line {}): cannot compare a str with a number ({} with {}).\n    `==` on a str compares text. To test a runtime string for null, write `(s as i64) == 0`; to compare with a number, convert one side with `as` or int_to_str.",
+                                self.current_line, lt, rt
+                            ));
+                            return Type::Bool;
+                        }
                         // Aggregate comparison rules:
                         //   ==/!= on non-generic structs/enums → synthesized
                         //       `__eq_<T>` (structural tag+payload / field-wise),
@@ -6179,6 +6250,14 @@ impl TypeChecker {
                             arg_types.len()
                         ));
                     }
+                    if let Some((tps, bounds)) = self.func_generics.get(callee).cloned() {
+                        // An integer literal given for a type parameter is an i64, not
+                        // the smallest type that holds it
+                        let arg_types: Vec<Type> = args.iter().zip(arg_types.iter())
+                            .map(|(e, t)| if matches!(e, Expr::IntLit(_)) { Type::I64 } else { t.clone() })
+                            .collect();
+                        return self.check_generic_call(callee, &tps, &bounds, &params, &ret, &arg_types, hint);
+                    }
                     let runtime_call = self.item_modules.get(callee).map_or(false, |m| Self::is_runtime_layer(m))
                         || Self::is_runtime_layer(&self.current_module)
                         || self.extern_fns.contains(callee);
@@ -6189,8 +6268,10 @@ impl TypeChecker {
                     for (i, (param, arg)) in params.iter().zip(arg_types.iter()).enumerate() {
                         let is_generic_param = matches!(param, Type::Named(name) if name.len() == 1 && name.chars().next().unwrap().is_uppercase())
                             || self.type_contains_param(param);
+                        // (a reference to a handle is read through: Vec_len(v) with v: &mut Vec)
+                        let arg_read = match arg { Type::Ref { inner, .. } => inner.as_ref(), a => a };
                         if !is_generic_param && !polymorphic_builtin && !self.arg_compatible(param, arg)
-                            && !(runtime_call && Self::is_handle_int_pair(param, arg))
+                            && !(runtime_call && Self::is_handle_int_pair(param, arg_read))
                             && !(self.extern_fns.contains(callee) && Self::is_ffi_pointer_pair(param, arg)) {
                             self.errors.push(format!(
                                 "Type error (line {}{}): function '{}' parameter {} expects '{}', got '{}'",
@@ -6462,6 +6543,11 @@ impl TypeChecker {
                 last_ty
             }
             Expr::MethodCall { receiver, method, args } => {
+                if CHANGING_METHODS.contains(&method.as_str()) || self.method_takes_mut_self(receiver, method) {
+                    if let Some(root) = place_root(receiver) {
+                        self.check_param_change(&root);
+                    }
+                }
                 // Check if this is Box::new(x) — built-in
                 if let Expr::Ident(name) = receiver.as_ref() {
                     if name == "Box" && method == "new" {
@@ -6784,6 +6870,13 @@ impl TypeChecker {
                                     struct_name, method, expected_args, arg_types.len()
                                 ));
                             }
+                            // A generic impl's method on a value without type
+                            // arguments (a bare `Option`): the i64 instance,
+                            // as monomorphization picks
+                            if let Some(tps) = self.impl_type_params.get(struct_name) {
+                                let subst: HashMap<String, Type> = tps.iter().map(|t| (t.clone(), Type::I64)).collect();
+                                return subst_type_params(ret, &subst);
+                            }
                             return ret.clone();
                         }
                     }
@@ -6808,7 +6901,7 @@ impl TypeChecker {
                         "Type error: no method '{}' on struct '{}'",
                         method, struct_name
                     ));
-                } else if let Type::Generic { name: gen_name, .. } = &effective_recv_ty {
+                } else if let Type::Generic { name: gen_name, args: recv_args } = &effective_recv_ty {
                     // Generic type (e.g. Option<i64>): look up methods by the base name
                     if let Some(method_map) = self.methods.get(gen_name) {
                         if let Some((params, ret, has_self, is_pub)) = method_map.get(method) {
@@ -6818,6 +6911,23 @@ impl TypeChecker {
                                     "Type error: method '{}.{}' expects {} args, got {}",
                                     gen_name, method, expected_args, arg_types.len()
                                 ));
+                            }
+                            // `impl<T> Slot` on a Slot<f64>: the method's types with T=f64
+                            let tps = self.impl_type_params.get(gen_name).cloned().unwrap_or_default();
+                            if !tps.is_empty() {
+                                let subst: HashMap<String, Type> = tps.iter().cloned().zip(recv_args.iter().cloned()).collect();
+                                let skip = if *has_self { 1 } else { 0 };
+                                for (i, (p, a)) in params.iter().skip(skip).zip(arg_types.iter()).enumerate() {
+                                    let pt = subst_type_params(p, &subst);
+                                    if !self.type_contains_param(&pt) && !matches!(a, Type::Infer | Type::Never) && !self.arg_compatible(&pt, a) {
+                                        self.errors.push(format!(
+                                            "Type error (line {}): method '{}.{}' parameter {} expects '{}', got '{}'",
+                                            self.current_line, gen_name, method, i + 1, pt, a
+                                        ));
+                                    }
+                                }
+                                let r = subst_type_params(ret, &subst);
+                                return if self.type_contains_param(&r) { Type::Never } else { r };
                             }
                             return ret.clone();
                         }
@@ -7014,6 +7124,11 @@ impl TypeChecker {
                 Type::Named(enum_name.clone())
             }
             Expr::Ref { expr, is_mut } => {
+                if *is_mut {
+                    if let Some(root) = place_root(expr) {
+                        self.check_param_change(&root);
+                    }
+                }
                 let inner_ty = self.check_expr(expr);
                 Type::Ref { inner: Box::new(inner_ty), is_mut: *is_mut }
             }
@@ -7797,7 +7912,113 @@ impl TypeChecker {
                 Type::Ref { inner: a_inner, .. }) = (&declared, &actual) {
             return self.types_compatible(d_inner, a_inner);
         }
+        // Numbers: integers mix (narrowing a value is checked where it is
+        // assigned), an integer becomes a float, but a float never silently
+        // becomes an integer (proposal 0002: `as` says so)
+        if self.is_float(&actual) && !self.is_float(&declared) && declared != Type::Infer {
+            return false;
+        }
         self.is_numeric(&declared) && self.is_numeric(&actual)
+    }
+
+    /// Proposal 0002: a call to a generic function. Its type arguments are
+    /// inferred from the arguments (and from the expected type, for one that
+    /// only the result mentions); each argument is checked against its
+    /// instantiated parameter, each bound `T: Trait` against the impls; the
+    /// call has the instantiated return type.
+    #[allow(clippy::too_many_arguments)]
+    fn check_generic_call(
+        &mut self,
+        callee: &str,
+        tps: &[String],
+        bounds: &[(String, String)],
+        params: &[Type],
+        ret: &Type,
+        arg_types: &[Type],
+        hint: &Type,
+    ) -> Type {
+        let mut subst: HashMap<String, Type> = HashMap::new();
+        for (p, a) in params.iter().zip(arg_types.iter()) {
+            bind_type_params(p, a, tps, &mut subst);
+        }
+        if !matches!(hint, Type::Never | Type::Infer) {
+            bind_type_params(ret, hint, tps, &mut subst);
+        }
+        let in_fn = self.current_func_name.as_ref().map(|f| format!(", in '{}'", f)).unwrap_or_default();
+        // An argument of unknown type binds nothing: monomorphization infers
+        // from the values; only a parameter no argument mentions is an error
+        let unknown_arg = arg_types.iter().any(|a| matches!(a, Type::Infer | Type::Never));
+        let unbound: Vec<&String> = tps.iter().filter(|t| !subst.contains_key(*t)).collect();
+        if !unbound.is_empty() && !unknown_arg {
+            self.errors.push(format!(
+                "Type error (line {}{}): cannot infer the type parameter '{}' of '{}': no argument gives it.\n\
+                 \x20\x20\x20\x20Fix: give the result a type, as in `val x: i64 = {}(...)`.",
+                self.current_line, in_fn, unbound[0], callee, callee
+            ));
+            return Type::Never;
+        }
+        for (i, (p, a)) in params.iter().zip(arg_types.iter()).enumerate() {
+            let pt = subst_type_params(p, &subst);
+            if self.type_contains_param(&pt) || matches!(a, Type::Infer | Type::Never) {
+                continue;
+            }
+            if !self.arg_compatible(&pt, a) {
+                self.errors.push(format!(
+                    "Type error (line {}{}): function '{}' parameter {} expects '{}', got '{}'",
+                    self.current_line, in_fn, callee, i + 1, pt, a
+                ));
+            }
+        }
+        for (tp, tr) in bounds {
+            let Some(ty) = subst.get(tp) else { continue };
+            if !self.traits.contains_key(tr) || self.satisfies_bound(ty, tr) {
+                continue;
+            }
+            self.errors.push(format!(
+                "Type error (line {}{}): {} does not implement {} (required by {}: {} in '{}').\n\
+                 \x20\x20\x20\x20Fix: add `impl {} for {} {{ ... }}`, or pass a value whose type implements it.",
+                self.current_line, in_fn, ty, tr, tp, tr, callee, tr, ty
+            ));
+        }
+        let r = subst_type_params(ret, &subst);
+        if self.type_contains_param(&r) { Type::Never } else { r }
+    }
+
+    /// A by-value Vec/HashMap/struct parameter changed: an error, since the
+    /// caller would not see the change (proposal 0001).
+    fn check_param_change(&mut self, root: &str) {
+        let Some(ty) = self.value_params.get(root).cloned() else { return };
+        let in_fn = self.current_func_name.as_ref().map(|f| format!(" of '{}'", f)).unwrap_or_default();
+        self.errors.push(format!(
+            "Type error (line {}): '{}' is a by-value parameter{} and cannot be changed: the caller would not see the change.\n\
+             \x20\x20\x20\x20Fix: take `{}: &mut {}` and pass `&mut ...`, or change a copy: `var {} = {};`.",
+            self.current_line, root, in_fn, root, ty, root, root
+        ));
+        // one error per parameter
+        self.value_params.remove(root);
+    }
+
+    /// Whether `receiver.method(..)` calls a user method taking `self: &mut T`.
+    fn method_takes_mut_self(&self, receiver: &Expr, method: &str) -> bool {
+        let Some(root) = place_root(receiver) else { return false };
+        let Some(Type::Named(sn)) = self.value_params.get(&root).map(|t| self.resolve_type(t)) else { return false };
+        self.methods.get(&sn).and_then(|m| m.get(method))
+            .map_or(false, |(params, _, has_self, _)| *has_self && matches!(params.first(), Some(Type::Ref { is_mut: true, .. })))
+    }
+
+    /// Whether `ty` implements `tr`: an impl, or a type parameter of the
+    /// current function bound by it.
+    fn satisfies_bound(&self, ty: &Type, tr: &str) -> bool {
+        let name = match ty {
+            Type::Named(n) => n.clone(),
+            Type::Generic { name, .. } => name.clone(),
+            Type::Infer | Type::Never => return true,
+            other => other.to_string(),
+        };
+        if self.impl_pairs.contains(&(tr.to_string(), name.clone())) {
+            return true;
+        }
+        self.current_type_param_bounds.get(&name).map_or(false, |b| b == tr)
     }
 
     /// Check if a type contains any type parameter (Named type that's not a struct/enum)
@@ -7978,7 +8199,9 @@ impl TypeChecker {
             (Type::Ref { is_mut: true, .. }, Type::Ref { is_mut: false, .. }) => false,
             (Type::Ref { inner: p, is_mut: true }, Type::Ref { inner: a, is_mut: true }) => self.types_compatible(&strip(p), &strip(a)),
             (Type::Ref { inner: p, .. }, a) => shares_repr(&strip(p)) && self.types_compatible(&strip(p), &strip(a)),
-            (p, Type::Ref { inner: a, .. }) => shares_repr(&strip(p)) && self.types_compatible(&strip(p), &strip(a)),
+            // A reference where the value is wanted is read through (the
+            // lowering loads a Vec/HashMap/str handle from it)
+            (p, Type::Ref { inner: a, .. }) => self.types_compatible(&strip(p), &strip(a)),
             (p, a) => {
                 let (sp, sa) = (strip(p), strip(a));
                 (shares_repr(&sp) || (sp == *p && sa == *a)) && self.types_compatible(&sp, &sa)
@@ -8211,7 +8434,11 @@ impl TypeChecker {
             let declared = payload.get(i);
             // An unsubstituted type param carries no information — prefer the
             // annotation when one is present.
-            let declared_is_param = matches!(declared, Some(Type::Named(n)) if self.is_type_param_name(n));
+            // A type parameter in scope (inside `impl<T> Slot`) is the type,
+            // unless the binding names one (`Err(e: str)`)
+            let declared_is_param = matches!(declared, Some(Type::Named(n))
+                if self.is_type_param_name(n)
+                    && (!self.current_type_params.contains(n) || !annot.is_empty()));
             match declared {
                 Some(t) if !declared_is_param => t.clone(),
                 _ => self.type_from_name(annot).unwrap_or(Type::I64),
@@ -10468,4 +10695,78 @@ fn expand_annotations(annotations: &[Annotation]) -> HashSet<&'static str> {
 /// The effects a function declares.
 fn to_declared(f: &Func) -> Vec<String> {
     f.declared_effects.clone()
+}
+
+/// Bind the type parameters `tps` that `param` mentions from `arg` (the first
+/// binding of each wins), as mono.rs infer_from_pair.
+fn bind_type_params(param: &Type, arg: &Type, tps: &[String], subst: &mut HashMap<String, Type>) {
+    match (param, arg) {
+        (Type::Named(n), _) if tps.contains(n) => {
+            if !matches!(arg, Type::Infer | Type::Never) && !subst.contains_key(n) {
+                subst.insert(n.clone(), arg.clone());
+            }
+        }
+        (Type::Generic { name, args }, Type::Generic { name: an, args: aa }) if name == an => {
+            for (p, a) in args.iter().zip(aa.iter()) {
+                bind_type_params(p, a, tps, subst);
+            }
+        }
+        (Type::Ref { inner, .. }, Type::Ref { inner: ai, .. })
+        | (Type::RawPtr { inner, .. }, Type::RawPtr { inner: ai, .. }) => bind_type_params(inner, ai, tps, subst),
+        (Type::Array { elem, .. }, Type::Array { elem: ae, .. }) => bind_type_params(elem, ae, tps, subst),
+        // A const parameter `[T; N]` takes the array's length (as mono.rs)
+        (Type::ArrayConst { elem, size_param }, Type::Array { elem: ae, size }) => {
+            if tps.contains(size_param) && !subst.contains_key(size_param) {
+                subst.insert(size_param.clone(), Type::Named(format!("__const_{}", size)));
+            }
+            bind_type_params(elem, ae, tps, subst);
+        }
+        (Type::Tuple(ps), Type::Tuple(as_)) => {
+            for (p, a) in ps.iter().zip(as_.iter()) {
+                bind_type_params(p, a, tps, subst);
+            }
+        }
+        (Type::Func { params, ret }, Type::Func { params: ap, ret: ar }) => {
+            for (p, a) in params.iter().zip(ap.iter()) {
+                bind_type_params(p, a, tps, subst);
+            }
+            bind_type_params(ret, ar, tps, subst);
+        }
+        _ => {}
+    }
+}
+
+/// `ty` with its bound type parameters replaced.
+fn subst_type_params(ty: &Type, subst: &HashMap<String, Type>) -> Type {
+    match ty {
+        Type::Named(n) => subst.get(n).cloned().unwrap_or_else(|| ty.clone()),
+        Type::Generic { name, args } => Type::Generic {
+            name: name.clone(),
+            args: args.iter().map(|a| subst_type_params(a, subst)).collect(),
+        },
+        Type::Ref { inner, is_mut } => Type::Ref { inner: Box::new(subst_type_params(inner, subst)), is_mut: *is_mut },
+        Type::RawPtr { inner, is_mut } => Type::RawPtr { inner: Box::new(subst_type_params(inner, subst)), is_mut: *is_mut },
+        Type::Array { elem, size } => Type::Array { elem: Box::new(subst_type_params(elem, subst)), size: *size },
+        Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| subst_type_params(t, subst)).collect()),
+        Type::Func { params, ret } => Type::Func {
+            params: params.iter().map(|p| subst_type_params(p, subst)).collect(),
+            ret: Box::new(subst_type_params(ret, subst)),
+        },
+        _ => ty.clone(),
+    }
+}
+
+/// Methods that change their receiver (Vec, HashMap, String).
+const CHANGING_METHODS: &[&str] = &["push", "pop", "set", "insert", "remove", "clear", "extend", "truncate", "reverse", "sort", "resize", "swap", "push_str", "append", "retain", "dedup", "fill", "drain", "sort_by", "push_front", "pop_front"];
+
+/// The variable a place expression is part of: `p` for `p`, `p.items`,
+/// `p.items.get(i).name` or `p[i]`.
+fn place_root(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Ident(n) => Some(n.clone()),
+        Expr::FieldAccess { expr, .. } => place_root(expr),
+        Expr::Index { array, .. } => place_root(array),
+        Expr::MethodCall { receiver, method, .. } if method == "get" => place_root(receiver),
+        _ => None,
+    }
 }

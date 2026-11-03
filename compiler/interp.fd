@@ -2005,14 +2005,14 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
             if Interpreter_is_runtime_func(self, name) {
                 if name == "p_vec_get" || name == "p_vec_pop" {
                     // A raw Vec element is the stored 8-byte word
-                    var vout: ExecOutcome = Interpreter_call_runtime(self, name, arg_vals);
+                    var vout: ExecOutcome = Interpreter_call_runtime(self, name, &mut arg_vals);
                     match vout {
                         ExecOutcome::Value(rv) => { return ExecOutcome::Value(interp_reinterpret_word(rv, call_ret_ty)); }
                         _ => {}
                     }
                     return vout;
                 }
-                return Interpreter_call_runtime(self, name, arg_vals);
+                return Interpreter_call_runtime(self, name, &mut arg_vals);
             }
             // Check if it's a user function
             match Interpreter_get_function(self, name) {
@@ -2066,7 +2066,7 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                 }
             }
             if Interpreter_is_runtime_func(self, fn_name) {
-                return Interpreter_call_runtime(self, fn_name, arg_vals2);
+                return Interpreter_call_runtime(self, fn_name, &mut arg_vals2);
             }
             match Interpreter_get_function(self, fn_name) {
                 OptIrFunction::Some(callee2) => {
@@ -2968,7 +2968,7 @@ pub fn Interpreter_is_runtime_func_uncached(self: &Interpreter, name: str) -> bo
 // vectors, maps, and numeric conversions.
 // Advanced builtins (tensors, networking, threads, etc.) return defaults.
 
-pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Value>) -> ExecOutcome {
+pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Vec<Value>) -> ExecOutcome {
     // A raw Vec handle may arrive as a Ptr (loaded from a by-value struct
     // copy's Vec field): the p_vec_* builtins take its address.
     if str_starts_with(name, "p_vec_") && args.len() > 0 {
@@ -5741,7 +5741,7 @@ fn arg_str_raw(args: Vec<Value>, i: i64) -> str {
     return "";
 }
 
-pub fn Interpreter_call_runtime2(self: &mut Interpreter, name: str, args: Vec<Value>) -> ExecOutcome {
+pub fn Interpreter_call_runtime2(self: &mut Interpreter, name: str, args: &mut Vec<Value>) -> ExecOutcome {
     // ─── Futures / threads / executors (eager, as src/interp.rs) ───
     if name == "p_future_ready" {
         var fidx: i64 = self.future_values.len();
@@ -5804,7 +5804,7 @@ pub fn Interpreter_call_runtime2(self: &mut Interpreter, name: str, args: Vec<Va
         co_args.push(arg_value(args, 0));
         co_args.push(Value::Int(1));
         co_args.push(arg_value(args, 1));
-        match Interpreter_call_runtime(self, "p_executor_spawn", co_args) {
+        match Interpreter_call_runtime(self, "p_executor_spawn", &mut co_args) {
             ExecOutcome::Value(cv) => {
                 match cv {
                     Value::Int(cf) => { return ExecOutcome::Value(Value::Int(cf + 1)); }
@@ -5824,7 +5824,7 @@ pub fn Interpreter_call_runtime2(self: &mut Interpreter, name: str, args: Vec<Va
     if name == "p_co_result" {
         var co_get: Vec<Value> = Vec::new();
         co_get.push(Value::Int(arg_int(args, 0, 1) - 1));
-        return Interpreter_call_runtime(self, "p_future_poll", co_get);
+        return Interpreter_call_runtime(self, "p_future_poll", &mut co_get);
     }
     if name == "p_executor_new" {
         var eidx: i64 = self.executor_count;
@@ -6691,7 +6691,7 @@ fn tensor_map_data(t: &TensorData, data: Vec<f64>) -> TensorData {
 }
 
 /// accum_grad: add `g` into the gradient for `addr`.
-pub fn Interpreter_accum_grad(self: &mut Interpreter, keys: Vec<i64>, vals: Vec<TensorData>, addr: i64, g: TensorData) {
+pub fn Interpreter_accum_grad(self: &mut Interpreter, keys: &mut Vec<i64>, vals: &mut Vec<TensorData>, addr: i64, g: TensorData) {
     var i: i64 = 0;
     while i < keys.len() {
         if keys.get(i) == addr {
@@ -6761,22 +6761,22 @@ pub fn Interpreter_run_backward(self: &mut Interpreter) {
         var go: TensorData = vals.get(gi);
         var gout: TensorData = Tensor_new(go.shape.clone(), go.strides.clone(), go.data.clone());
         if node.op == agop_add() || node.op == agop_mul() {
-            Interpreter_accum_grad(self, keys, vals, node.a, gout);
-            Interpreter_accum_grad(self, keys, vals, node.b, gout);
+            Interpreter_accum_grad(self, &mut keys, &mut vals, node.a, gout);
+            Interpreter_accum_grad(self, &mut keys, &mut vals, node.b, gout);
         } else if node.op == agop_sub() {
-            Interpreter_accum_grad(self, keys, vals, node.a, gout);
+            Interpreter_accum_grad(self, &mut keys, &mut vals, node.a, gout);
             var neg: Vec<f64> = Vec::new();
             var i1: i64 = 0;
             while i1 < gout.data.len() { neg.push(0.0 - gout.data.get(i1)); i1 = i1 + 1; }
-            Interpreter_accum_grad(self, keys, vals, node.b, tensor_map_data(&gout, neg));
+            Interpreter_accum_grad(self, &mut keys, &mut vals, node.b, tensor_map_data(&gout, neg));
         } else if node.op == agop_matmul() {
-            Interpreter_accum_grad(self, keys, vals, node.a, Tensor_filled(node.a_shape.clone(), 1.0));
-            Interpreter_accum_grad(self, keys, vals, node.b, Tensor_filled(node.b_shape.clone(), 1.0));
+            Interpreter_accum_grad(self, &mut keys, &mut vals, node.a, Tensor_filled(node.a_shape.clone(), 1.0));
+            Interpreter_accum_grad(self, &mut keys, &mut vals, node.b, Tensor_filled(node.b_shape.clone(), 1.0));
         } else if node.op == agop_scale() {
             var sc: Vec<f64> = Vec::new();
             var i2: i64 = 0;
             while i2 < gout.data.len() { sc.push(gout.data.get(i2) * node.s); i2 = i2 + 1; }
-            Interpreter_accum_grad(self, keys, vals, node.a, tensor_map_data(&gout, sc));
+            Interpreter_accum_grad(self, &mut keys, &mut vals, node.a, tensor_map_data(&gout, sc));
         } else if node.op == agop_relu() {
             var eff: Vec<f64> = node.data;
             if node.has_input {
@@ -6794,7 +6794,7 @@ pub fn Interpreter_run_backward(self: &mut Interpreter) {
                 if eff.get(i4) > 0.0 { rg.push(gout.data.get(i4)); } else { rg.push(gout.data.get(i4) * 0.0); }
                 i4 = i4 + 1;
             }
-            Interpreter_accum_grad(self, keys, vals, node.a, tensor_map_data(&gout, rg));
+            Interpreter_accum_grad(self, &mut keys, &mut vals, node.a, tensor_map_data(&gout, rg));
         } else if node.op == agop_sigmoid() {
             var eff2: Vec<f64> = node.data;
             if node.has_input {
@@ -6812,11 +6812,11 @@ pub fn Interpreter_run_backward(self: &mut Interpreter) {
                 sg.push(gout.data.get(i6) * sv * (1.0 - sv));
                 i6 = i6 + 1;
             }
-            Interpreter_accum_grad(self, keys, vals, node.a, tensor_map_data(&gout, sg));
+            Interpreter_accum_grad(self, &mut keys, &mut vals, node.a, tensor_map_data(&gout, sg));
         } else if node.op == agop_sum() {
-            Interpreter_accum_grad(self, keys, vals, node.a, Tensor_filled(node.a_shape.clone(), loss_grad));
+            Interpreter_accum_grad(self, &mut keys, &mut vals, node.a, Tensor_filled(node.a_shape.clone(), loss_grad));
         } else if node.op == agop_mean() {
-            Interpreter_accum_grad(self, keys, vals, node.a, Tensor_filled(node.a_shape.clone(), loss_grad / (node.a_size as f64)));
+            Interpreter_accum_grad(self, &mut keys, &mut vals, node.a, Tensor_filled(node.a_shape.clone(), loss_grad / (node.a_size as f64)));
         }
     }
     self.ag_grad_keys = keys;

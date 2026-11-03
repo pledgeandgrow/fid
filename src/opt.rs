@@ -920,8 +920,13 @@ pub fn pass_cse(module: &mut L2Module) -> usize {
     // Calls to these functions are CSE-able — same args always produce
     // the same result, so duplicate calls can be replaced with a Copy
     // of the first result.
+    // OP25: effect-driven CSE — calls to @deterministic functions and to
+    // functions with an empty inferred effect set (`is_pure`, no IO/alloc/
+    // reads at all) always produce the same result for the same args, so
+    // duplicates fold to the first result. Effect precision now includes
+    // higher-order instantiation, so pure callbacks count too.
     let det_funcs: HashSet<String> = module.functions.iter()
-        .filter(|f| f.is_deterministic)
+        .filter(|f| f.is_deterministic || f.is_pure)
         .map(|f| f.name.clone())
         .collect();
     parallel_functions(&mut module.functions, |f| cse_function(f, &det_funcs))

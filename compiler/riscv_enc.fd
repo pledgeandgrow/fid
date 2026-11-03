@@ -112,13 +112,13 @@ pub enum ResultRiscVEncodedInst {
 
 pub fn RiscVEncodedInst_bytes(inst: i64) -> RiscVEncodedInst {
     var bytes: Vec<i64> = Vec::new();
-    rv_push_u32_le(bytes, inst);
+    rv_push_u32_le(&mut bytes, inst);
     return RiscVEncodedInst { bytes: bytes, relocations: Vec::new() };
 }
 
 pub fn RiscVEncodedInst_with_reloc(inst: i64, label: str, reloc_type: i64) -> RiscVEncodedInst {
     var bytes: Vec<i64> = Vec::new();
-    rv_push_u32_le(bytes, inst);
+    rv_push_u32_le(&mut bytes, inst);
     var relocs: Vec<RiscVInstReloc> = Vec::new();
     relocs.push(RiscVInstReloc_new(label, reloc_type));
     return RiscVEncodedInst { bytes: bytes, relocations: relocs };
@@ -133,7 +133,7 @@ pub fn RiscVEncodedInst_multi(bytes: Vec<i64>) -> RiscVEncodedInst {
 // ===========================================================================
 
 /// Push a 32-bit value in little-endian byte order.
-pub fn rv_push_u32_le(text: Vec<i64>, inst: i64) {
+pub fn rv_push_u32_le(text: &mut Vec<i64>, inst: i64) {
     text.push(inst & 0xFF);
     text.push((inst >> 8) & 0xFF);
     text.push((inst >> 16) & 0xFF);
@@ -146,7 +146,7 @@ pub fn rv_read_u32_le(text: Vec<i64>, idx: i64) -> i64 {
 }
 
 /// Patch a 32-bit little-endian value in a byte vector.
-pub fn rv_patch_u32_le(text: Vec<i64>, idx: i64, inst: i64) {
+pub fn rv_patch_u32_le(text: &mut Vec<i64>, idx: i64, inst: i64) {
     text.set(idx, inst & 0xFF);
     text.set(idx + 1, (inst >> 8) & 0xFF);
     text.set(idx + 2, (inst >> 16) & 0xFF);
@@ -273,7 +273,7 @@ pub fn rv_label_offset_lookup(map: Vec<LabelOffsetEntry>, label: str) -> i64 {
     return -1;
 }
 
-pub fn rv_label_offset_insert(map: Vec<LabelOffsetEntry>, label: str, offset: i64) {
+pub fn rv_label_offset_insert(map: &mut Vec<LabelOffsetEntry>, label: str, offset: i64) {
     map.push(rv_LabelOffsetEntry_new(label, offset));
 }
 
@@ -335,7 +335,7 @@ pub fn RiscvAssembler_define_label(self: &mut RiscvAssembler, label: str) {
     match self.current_section {
         RiscVSection::Text => {
             var offset: i64 = self.text.len();
-            rv_label_offset_insert(self.label_offsets, label, offset);
+            rv_label_offset_insert(&mut self.label_offsets, label, offset);
             self.symbols.push(RiscVSymbol_new(label, offset));
         }
         RiscVSection::Rodata => {
@@ -380,8 +380,8 @@ pub fn RiscvAssembler_handle_directive(self: &mut RiscvAssembler, line: str) -> 
     } else if directive == ".quad" {
         if parts.len() > 1 {
             var qv: i64 = str_parse_int(str_trim(parts.get(1)));
-            rv_push_u32_le(self.rodata, qv & 0xFFFFFFFF);
-            rv_push_u32_le(self.rodata, (qv >> 32) & 0xFFFFFFFF);
+            rv_push_u32_le(&mut self.rodata, qv & 0xFFFFFFFF);
+            rv_push_u32_le(&mut self.rodata, (qv >> 32) & 0xFFFFFFFF);
         }
     } else if directive == ".byte" {
         if parts.len() > 1 {
@@ -397,7 +397,7 @@ pub fn RiscvAssembler_handle_directive(self: &mut RiscvAssembler, line: str) -> 
             match self.current_section {
                 RiscVSection::Text => {
                     while self.text.len() % align != 0 {
-                        rv_push_u32_le(self.text, 0x13); // NOP
+                        rv_push_u32_le(&mut self.text, 0x13); // NOP
                     }
                 }
                 RiscVSection::Rodata => {
@@ -453,7 +453,7 @@ pub fn RiscvAssembler_resolve_branches(self: &mut RiscvAssembler) -> ResultUnit 
                     var imm11: i64 = (imm >> 11) & 1;
                     var imm19_12: i64 = (imm >> 12) & 0xFF;
                     var patched: i64 = (instr & 0x00000FFF) | (imm20 << 31) | (imm10_1 << 21) | (imm11 << 20) | (imm19_12 << 12);
-                    rv_patch_u32_le(self.text, idx, patched);
+                    rv_patch_u32_le(&mut self.text, idx, patched);
                 } else if pb.rtype == 21 {
                     // Branch: 13-bit immediate (bits [12:1])
                     var imm: i64 = delta;
@@ -462,7 +462,7 @@ pub fn RiscvAssembler_resolve_branches(self: &mut RiscvAssembler) -> ResultUnit 
                     var imm4_1: i64 = (imm >> 1) & 0xF;
                     var imm11: i64 = (imm >> 11) & 1;
                     var patched: i64 = (instr & 0x01FFF07F) | (imm12 << 31) | (imm10_5 << 25) | (imm4_1 << 8) | (imm11 << 7);
-                    rv_patch_u32_le(self.text, idx, patched);
+                    rv_patch_u32_le(&mut self.text, idx, patched);
                 }
             }
         } else {
@@ -860,8 +860,8 @@ pub fn RiscvAssembler_enc_li(self: &RiscvAssembler, ops: Vec<str>) -> ResultRisc
                     var lui: i64 = (hi << 12) | (rd << 7) | 0x37;
                     var addi: i64 = (lo << 20) | (rd << 15) | (rd << 7) | 0x13;
                     var bytes: Vec<i64> = Vec::new();
-                    rv_push_u32_le(bytes, lui);
-                    rv_push_u32_le(bytes, addi);
+                    rv_push_u32_le(&mut bytes, lui);
+                    rv_push_u32_le(&mut bytes, addi);
                     return ResultRiscVEncodedInst::Ok(RiscVEncodedInst_multi(bytes));
                 }
                 ResultI64Str::Err(e) => { return ResultRiscVEncodedInst::Err(e); }

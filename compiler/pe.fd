@@ -1711,14 +1711,14 @@ fn nameoff_has(v: Vec<NameOff>, name: str) -> bool {
 }
 
 // Patch a 32-bit little-endian field inside a byte vector
-fn pe_patch32(buf: Vec, off: i64, val: i64) {
+fn pe_patch32(buf: &mut Vec, off: i64, val: i64) {
     buf.set(off, val & 0xFF);
     buf.set(off + 1, (val >> 8) & 0xFF);
     buf.set(off + 2, (val >> 16) & 0xFF);
     buf.set(off + 3, (val >> 24) & 0xFF);
 }
 // Patch a 64-bit little-endian field inside a byte vector
-fn pe_patch64(buf: Vec, off: i64, val: i64) {
+fn pe_patch64(buf: &mut Vec, off: i64, val: i64) {
     var i: i64 = 0;
     while i < 8 {
         buf.set(off + i, (val >> (i * 8)) & 0xFF);
@@ -1794,7 +1794,7 @@ fn pe_rodata_off(em: &ElfEmitter, name: str) -> i64 {
 // Splits them into p_* runtime calls and true external imports.
 // (.rodata labels like .str_N arrive as undefined `symbols` entries — the
 // assembler only marks `.L*` locals — so they must be filtered out here.)
-fn pe_collect_externs(em: &ElfEmitter, stubs: Vec<str>, imports: Vec<str>) {
+fn pe_collect_externs(em: &ElfEmitter, stubs: &mut Vec<str>, imports: &mut Vec<str>) {
     var i: i64 = 0;
     while i < em.relocations.len() {
         var rel: Relocation = em.relocations.get(i);
@@ -1825,7 +1825,7 @@ fn nameoff_has_str(v: Vec<str>, name: str) -> bool {
 //   <wrapper>: <sysv->win64 shuffle>; jmp <p_x body label>
 // For builtins without a machine-code stub, emit `xor eax,eax; ret`.
 // Appends name -> wrapper-offset entries (offsets inside enc.code).
-fn pe_emit_stub_wrappers(gen: &mut PeCodeGen, stub_names: Vec<str>, out_map: Vec<NameOff>) {
+fn pe_emit_stub_wrappers(gen: &mut PeCodeGen, stub_names: Vec<str>, out_map: &mut Vec<NameOff>) {
     var i: i64 = 0;
     while i < stub_names.len() {
         var name: str = stub_names.get(i);
@@ -1844,7 +1844,7 @@ fn pe_emit_stub_wrappers(gen: &mut PeCodeGen, stub_names: Vec<str>, out_map: Vec
 }
 
 // Emit import trampolines; appends name -> trampoline-offset entries.
-fn pe_emit_import_tramps(gen: &mut PeCodeGen, import_names: Vec<str>, iat_idx: Vec<NameOff>, out_map: Vec<NameOff>) {
+fn pe_emit_import_tramps(gen: &mut PeCodeGen, import_names: Vec<str>, iat_idx: Vec<NameOff>, out_map: &mut Vec<NameOff>) {
     var i: i64 = 0;
     while i < import_names.len() {
         var name: str = import_names.get(i);
@@ -1862,7 +1862,7 @@ fn pe_emit_import_tramps(gen: &mut PeCodeGen, import_names: Vec<str>, iat_idx: V
 // rdata_va  = virtual address where .rdata starts (for .str_N references)
 // user_base = .text offset where assembled user code begins
 // enc_base  = .text offset where the enc stream (stubs) begins
-fn pe_apply_text_relocs(text: Vec, em: &ElfEmitter, target_map: Vec<NameOff>,
+fn pe_apply_text_relocs(text: &mut Vec, em: &ElfEmitter, target_map: Vec<NameOff>,
                         text_va: i64, rdata_va: i64, user_base: i64, enc_base: i64) {
     var i: i64 = 0;
     while i < em.relocations.len() {
@@ -1896,7 +1896,7 @@ fn pe_apply_text_relocs(text: Vec, em: &ElfEmitter, target_map: Vec<NameOff>,
 }
 
 // Apply .rodata absolute relocations (e.g. vtables holding function addrs).
-fn pe_apply_rodata_relocs(rdata: Vec, em: &ElfEmitter, target_map: Vec<NameOff>,
+fn pe_apply_rodata_relocs(rdata: &mut Vec, em: &ElfEmitter, target_map: Vec<NameOff>,
                           text_va: i64, rdata_va: i64, user_base: i64, enc_base: i64) {
     var i: i64 = 0;
     while i < em.rodata_relocations.len() {
@@ -1952,7 +1952,7 @@ fn pe_build(asm: str, module: &IrModule, mode: i64) -> Vec {
     // 2. Which externals does the user code actually call?
     var stub_names: Vec<str> = Vec::new();
     var import_names: Vec<str> = Vec::new();
-    pe_collect_externs(&em, stub_names, import_names);
+    pe_collect_externs(&em, &mut stub_names, &mut import_names);
     if !hosted { import_names = Vec::new(); }
 
     // 3. Build .rdata: assembler rodata + stub strings + import tables
@@ -1992,9 +1992,9 @@ fn pe_build(asm: str, module: &IrModule, mode: i64) -> Vec {
     }
 
     // Wrappers first (SysV entry for user calls), then raw Win64 bodies.
-    pe_emit_stub_wrappers(&mut gen, stub_names, target_map);
+    pe_emit_stub_wrappers(&mut gen, stub_names, &mut target_map);
     if hosted {
-        pe_emit_import_tramps(&mut gen, import_names, iat_idx, target_map);
+        pe_emit_import_tramps(&mut gen, import_names, iat_idx, &mut target_map);
     }
     PeCodeGen_gen_runtime_stubs(&mut gen);
 
@@ -2054,9 +2054,9 @@ fn pe_build(asm: str, module: &IrModule, mode: i64) -> Vec {
         if sym_off >= 0 {
             if pref.kind == PREF_REL32 {
                 var d32: i64 = (user_base + sym_off) - (enc_base + pref.code_off + 4);
-                pe_patch32(gen.enc.code, pref.code_off, d32);
+                pe_patch32(&mut gen.enc.code, pref.code_off, d32);
             } else {
-                pe_patch64(gen.enc.code, pref.code_off, text_va + user_base + sym_off);
+                pe_patch64(&mut gen.enc.code, pref.code_off, text_va + user_base + sym_off);
             }
         }
         pc = pc + 1;
@@ -2074,12 +2074,12 @@ fn pe_build(asm: str, module: &IrModule, mode: i64) -> Vec {
     }
 
     // 7. Apply assembler relocations over the final image
-    pe_apply_text_relocs(text, &em, target_map, text_va, rdata_rva, user_base, enc_base);
+    pe_apply_text_relocs(&mut text, &em, target_map, text_va, rdata_rva, user_base, enc_base);
 
     // 8. Finish .rdata and apply its relocations
     var base_va: i64 = IMAGE_BASE;
     if !hosted { base_va = 0; }
-    pe_apply_rodata_relocs(rdata.data, &em, target_map, text_va + base_va, rdata_rva + base_va, user_base, enc_base);
+    pe_apply_rodata_relocs(&mut rdata.data, &em, target_map, text_va + base_va, rdata_rva + base_va, user_base, enc_base);
     if hosted {
         RdataBuilder_patch_rvas(&mut rdata, rdata_rva);
     }

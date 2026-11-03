@@ -204,6 +204,9 @@ pub struct Lowerer {
     /// AST types of variables — maps variable name → AST Type
     /// Used by LetTuple to determine tuple element types for destructuring
     var_ast_types: HashMap<String, Type>,
+    /// The AST type of the value being matched, for the bindings of a generic
+    /// enum's variants (Option<f64>: Some(v) is an f64).
+    match_scrutinee_ty: Option<Type>,
     /// Constants (pc) — maps name to expression for inline substitution
     constants: HashMap<String, Expr>,
     /// SRET pointer for current function (if it returns a struct)
@@ -249,6 +252,9 @@ pub struct Lowerer {
     /// AST function return types — maps function name to AST return type
     /// Used by LetTuple to determine tuple element types
     func_ret_types: HashMap<String, Type>,
+    /// AST parameter types of each function, to read a reference argument
+    /// through when the callee takes the value.
+    func_param_asts: HashMap<String, Vec<Type>>,
     /// (trait, method) -> declared return type, for `dyn Trait` calls
     trait_method_rets: HashMap<(String, String), Type>,
     /// Async function names — functions declared with `async pf`
@@ -334,6 +340,7 @@ impl Lowerer {
             allocas: HashMap::new(),
             alloca_types: HashMap::new(),
             var_ast_types: HashMap::new(),
+            match_scrutinee_ty: None,
             constants: HashMap::new(),
             current_sret: None,
             enums: HashMap::new(),
@@ -353,6 +360,7 @@ impl Lowerer {
             gpu_region_stack: Vec::new(),
             sandbox_depth: 0,
             func_ret_types: HashMap::new(),
+            func_param_asts: HashMap::new(),
             trait_method_rets: HashMap::new(),
             async_funcs: std::collections::HashSet::new(),
             async_tasks: std::collections::HashSet::new(),
@@ -530,6 +538,7 @@ impl Lowerer {
             self.module.functions.insert(func.name.clone(), ir_func);
             // Store AST return type for tuple element type lookup
             self.func_ret_types.insert(func.name.clone(), func.ret_ty.clone());
+            self.func_param_asts.insert(func.name.clone(), func.params.iter().map(|p| p.ty.clone()).collect());
             // Track async functions — calls to these are wrapped in p_future_ready
             if func.is_async {
                 self.async_funcs.insert(func.name.clone());
@@ -1776,6 +1785,13 @@ impl Lowerer {
     /// Lower a Fides AST type to an IR type, resolving aliases first
     fn lower_type(&self, ty: &Type) -> IrType {
         let resolved = self.resolve_type(ty);
+        // A generic enum (Option<f64>) is laid out as the enum itself: its
+        // type arguments only say what its payloads hold
+        if let Type::Generic { name, .. } = &resolved {
+            if self.enums.contains_key(name) {
+                return crate::ir::lower_type(&Type::Named(name.clone()));
+            }
+        }
         crate::ir::lower_type(&resolved)
     }
 
@@ -1878,11 +1894,24 @@ impl Lowerer {
             .map(|params| params.iter().map(|p| p.ty.clone()).collect())
             .unwrap_or_default();
 
+        // A payload that is a type parameter of a generic enum: the
+        // scrutinee's type argument for it
+        let type_arg = |t: &Type| -> Option<Type> {
+            let Type::Named(tp) = t else { return None };
+            let def = self.lookup_pattern_enum(enum_name, variant)?;
+            let k = def.type_params.iter().position(|p| p == tp)?;
+            match self.match_scrutinee_ty.as_ref()? {
+                Type::Generic { name, args } if *name == def.name => args.get(k).cloned(),
+                _ => None,
+            }
+        };
         bindings.iter().enumerate().map(|(i, (_, annot))| {
             let declared = payload.get(i).filter(|t| !self.is_opaque_type_param(t));
             match declared {
                 Some(t) => t.clone(),
-                None => self.ast_type_from_name(annot).unwrap_or(Type::I64),
+                None => self.ast_type_from_name(annot)
+                    .or_else(|| payload.get(i).and_then(|t| type_arg(t)))
+                    .unwrap_or(Type::I64),
             }
         }).collect()
     }
@@ -3522,6 +3551,7 @@ impl Lowerer {
     /// Lower a match statement (lowered to if/else chains)
     fn lower_match(&mut self, expr: &Expr, arms: &[MatchArm]) {
         let match_val = self.lower_expr(expr);
+        let scrutinee_ty = self.infer_expr_ast_type(expr);
         // If the scrutinee is a Box<T> (pointer to pointer to struct),
         // dereference it once so enum/struct patterns see the inner value.
         let match_val = self.maybe_deref_box(match_val);
@@ -3646,6 +3676,7 @@ impl Lowerer {
                     let saved_alloca_types = self.alloca_types.clone();
                     let saved_var_ast_types = self.var_ast_types.clone();
                     let saved_locals = self.current_func.as_ref().map(|f| f.locals.clone());
+                    self.match_scrutinee_ty = Some(scrutinee_ty.clone());
                     let binding_tys = self.pattern_binding_ir_types(enum_name, variant, bindings);
                     let binding_ast_tys = self.pattern_binding_ast_types(enum_name, variant, bindings);
                     // Compute field indices: struct-typed fields occupy multiple
@@ -3745,6 +3776,7 @@ impl Lowerer {
     /// Lower a match expression — stores arm result into result_slot
     fn lower_match_expr(&mut self, expr: &Expr, arms: &[MatchArm], result_slot: ValueId) {
         let match_val = self.lower_expr(expr);
+        let scrutinee_ty = self.infer_expr_ast_type(expr);
         // If the scrutinee is a Box<T> (pointer to pointer to struct),
         // dereference it once so enum/struct patterns see the inner value.
         let match_val = self.maybe_deref_box(match_val);
@@ -3816,6 +3848,7 @@ impl Lowerer {
                     let saved_alloca_types = self.alloca_types.clone();
                     let saved_var_ast_types = self.var_ast_types.clone();
                     let saved_locals = self.current_func.as_ref().map(|f| f.locals.clone());
+                    self.match_scrutinee_ty = Some(scrutinee_ty.clone());
                     let binding_tys = self.pattern_binding_ir_types(enum_name, variant, bindings);
                     let binding_ast_tys = self.pattern_binding_ast_types(enum_name, variant, bindings);
                     let mut field_idx: u32 = 1;
@@ -4535,7 +4568,7 @@ impl Lowerer {
                             let adapter = format!("{}{}", crate::ir::C_FN_PREFIX, name);
                             self.emit_inst(Inst::ConstFnRef { name: adapter })
                         }
-                        _ => self.lower_expr(a),
+                        _ => self.lower_expr_for_param(a, callee, i),
                     })
                     .collect();
 
@@ -6375,16 +6408,24 @@ impl Lowerer {
                     self.emit_terminator(Inst::Return { value: Some(val) });
                 }
 
-                // Merge: load the unwrapped value
+                // Merge: load the unwrapped value, as the float it is for a
+                // Result<f64, E> (an i64 load would be converted, not reread)
                 self.set_current_block(merge_block);
+                let ok_ty = match self.infer_expr_ast_type(expr) {
+                    Type::Generic { name, args } if name == "Result" || name == "Option" => {
+                        args.first().map(|t| self.lower_type(t)).filter(|t| t.is_float())
+                    }
+                    _ => None,
+                }
+                .unwrap_or(IrType::I64);
                 let val_ptr = self.emit_inst(Inst::GetFieldPtr {
                     struct_ptr: val,
                     field_index: 1,
-                    field_ty: IrType::I64,
+                    field_ty: ok_ty.clone(),
                 });
                 self.emit_inst(Inst::Load {
                     ptr: val_ptr,
-                    ty: IrType::I64,
+                    ty: ok_ty,
                 })
             }
 
@@ -6990,6 +7031,30 @@ impl Lowerer {
     }
 
     /// Infer the type of an expression (best-effort, for closure return type inference)
+    /// An argument, read through when it is a `&mut`/`&` parameter of the
+    /// current function holding a Vec, HashMap or str and the callee's
+    /// parameter takes the value: the reference points at the caller's slot.
+    fn lower_expr_for_param(&mut self, arg: &Expr, callee: &str, i: usize) -> ValueId {
+        let val = self.lower_expr(arg);
+        let Expr::Ident(name) = arg else { return val };
+        let Some(Type::Ref { inner, .. }) = self.current_func_param_types.get(name).cloned() else { return val };
+        // (a runtime builtin p_* always takes the value)
+        let wants_value = match self.func_param_asts.get(callee) {
+            Some(ps) => ps.get(i).map_or(false, |p| !matches!(p, Type::Ref { .. } | Type::RawPtr { .. })),
+            None => callee.starts_with("p_"),
+        };
+        let handle = match inner.as_ref() {
+            Type::Generic { name, .. } | Type::Named(name) => matches!(name.as_str(), "Vec" | "HashMap"),
+            Type::Str => true,
+            _ => false,
+        };
+        if wants_value && handle {
+            let ty = self.lower_type(&inner);
+            return self.emit_inst(Inst::Load { ptr: val, ty });
+        }
+        val
+    }
+
     fn infer_expr_ast_type(&self, expr: &Expr) -> Type {
         match expr {
             Expr::Binary { op, .. } => {
@@ -7007,8 +7072,12 @@ impl Lowerer {
                 self.func_ret_types.get(callee).cloned().unwrap_or(Type::I64)
             }
             Expr::Ident(name) => {
-                // Look up variable's AST type (recorded during Stmt::Let)
-                self.var_ast_types.get(name).cloned().unwrap_or(Type::I64)
+                // Look up variable's AST type (recorded during Stmt::Let), or
+                // the parameter's
+                self.var_ast_types.get(name)
+                    .or_else(|| self.current_func_param_types.get(name))
+                    .cloned()
+                    .unwrap_or(Type::I64)
             }
             _ => Type::I64,
         }
@@ -7960,6 +8029,11 @@ impl Lowerer {
                     }
                 }
                 let recv_ty = self.infer_expr_type(receiver);
+                // Through a `&mut Vec` / `&Vec` reference, as the dispatch does
+                let recv_ty = match recv_ty {
+                    IrType::Ptr(inner) if matches!(inner.as_ref(), IrType::Generic(n, _) if n == "Vec" || n == "HashMap") => *inner,
+                    other => other,
+                };
                 // Builtin Vec methods — infer from generic element type
                 if let IrType::Generic(name, args) = &recv_ty {
                     if name == "Vec" {

@@ -1,5 +1,12 @@
 use crate::ast::*;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+
+thread_local! {
+    /// The declared return type of every non-generic function, for the type
+    /// of a call (`parse(s).context(..)` is a method on what `parse` returns).
+    static FN_RET_TYPES: RefCell<HashMap<String, Type>> = RefCell::new(HashMap::new());
+}
 
 /// A substitution mapping type parameters to concrete types
 type Subst = HashMap<String, Type>;
@@ -681,6 +688,16 @@ fn infer_from_pair(param: &Type, arg: &Type, tp_set: &HashSet<&String>, subst: &
                 infer_from_pair(ret, arg_ret, tp_set, subst);
             }
         }
+        // param=Vec<T>, arg=Vec<f64> -> T=f64 (as compiler/mono.fd)
+        Type::Generic { name, args } => {
+            if let Type::Generic { name: arg_name, args: arg_args } = arg {
+                if name == arg_name {
+                    for (p, a) in args.iter().zip(arg_args.iter()) {
+                        infer_from_pair(p, a, tp_set, subst);
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -707,6 +724,13 @@ const MAX_MONO_DEPTH: usize = 64;
 
 /// Main monomorphization entry point
 pub fn monomorphize(program: &Program) -> Program {
+    FN_RET_TYPES.with(|m| {
+        let mut m = m.borrow_mut();
+        m.clear();
+        for f in program.funcs.iter().filter(|f| f.type_params.is_empty()) {
+            m.insert(f.name.clone(), f.ret_ty.clone());
+        }
+    });
     // Separate generic and non-generic functions
     let mut generics: HashMap<String, (Func, Vec<String>)> = HashMap::new();
     let mut concrete_funcs: Vec<Func> = Vec::new();
@@ -773,8 +797,12 @@ pub fn monomorphize(program: &Program) -> Program {
     for imp in &program.impls {
         let mut new_methods = Vec::new();
         for method in &imp.methods {
-            // Skip generic methods — they'll be instantiated on demand
+            // A generic impl's methods are instantiated on demand; the i64
+            // instantiation also keeps the plain name (Option_unwrap), for a
+            // call whose receiver type is not known here
             if !imp.type_params.is_empty() {
+                let subst: Subst = imp.type_params.iter().map(|tp| (tp.clone(), Type::I64)).collect();
+                new_methods.push(instantiate(method, &subst, &method.name, &mut ctx));
                 continue;
             }
             let new_method = process_func(method, &mut ctx);
@@ -837,59 +865,140 @@ pub fn monomorphize(program: &Program) -> Program {
 /// Fix up call sites for generic functions that may have multiple instantiations.
 /// For each call to a generic, re-infer the substitution from argument types
 /// and use the correct mangled name.
-fn fixup_generic_calls(stmts: &[Stmt], generics: &HashMap<String, (Func, Vec<String>)>, current_func: &Func) -> Vec<Stmt> {
-    stmts.iter().map(|s| fixup_generic_calls_stmt(s, generics, current_func)).collect()
+fn fixup_generic_calls(stmts: &[Stmt], generics: &HashMap<String, (Func, Vec<String>)>, gm: &HashMap<(String, String), (Func, Vec<String>)>, current_func: &Func) -> Vec<Stmt> {
+    stmts.iter().map(|s| fixup_generic_calls_stmt(s, generics, gm, current_func)).collect()
 }
 
-fn fixup_generic_calls_stmt(stmt: &Stmt, generics: &HashMap<String, (Func, Vec<String>)>, current_func: &Func) -> Stmt {
+fn fixup_generic_calls_stmt(stmt: &Stmt, generics: &HashMap<String, (Func, Vec<String>)>, gm: &HashMap<(String, String), (Func, Vec<String>)>, current_func: &Func) -> Stmt {
     match stmt {
-        Stmt::Expr(e, line) => Stmt::Expr(fixup_generic_calls_expr(e, generics, current_func), *line),
+        Stmt::Expr(e, line) => Stmt::Expr(fixup_generic_calls_expr(e, generics, gm, current_func), *line),
         Stmt::Let { name, ty, expr, is_mut, is_persist, annotations, line } => Stmt::Let {
             name: name.clone(), ty: ty.clone(),
-            expr: fixup_generic_calls_expr(expr, generics, current_func),
+            expr: fixup_hinted_call(expr, ty.as_ref(), generics, gm, current_func)
+                .unwrap_or_else(|| fixup_generic_calls_expr(expr, generics, gm, current_func)),
             is_mut: *is_mut, is_persist: *is_persist, annotations: annotations.clone(), line: *line,
         },
         Stmt::LetTuple { names, expr, line } => Stmt::LetTuple {
             names: names.clone(),
-            expr: fixup_generic_calls_expr(expr, generics, current_func),
+            expr: fixup_generic_calls_expr(expr, generics, gm, current_func),
             line: *line,
         },
         Stmt::Return(opt, line) => Stmt::Return(
-            opt.as_ref().map(|e| fixup_generic_calls_expr(e, generics, current_func)),
+            opt.as_ref().map(|e| fixup_hinted_call(e, Some(&current_func.ret_ty), generics, gm, current_func)
+                .unwrap_or_else(|| fixup_generic_calls_expr(e, generics, gm, current_func))),
             *line,
         ),
         Stmt::If { cond, then_block, else_block, line } => Stmt::If {
-            cond: fixup_generic_calls_expr(cond, generics, current_func),
-            then_block: fixup_generic_calls(then_block, generics, current_func),
-            else_block: else_block.as_ref().map(|eb| fixup_generic_calls(eb, generics, current_func)),
+            cond: fixup_generic_calls_expr(cond, generics, gm, current_func),
+            then_block: fixup_generic_calls(then_block, generics, gm, current_func),
+            else_block: else_block.as_ref().map(|eb| fixup_generic_calls(eb, generics, gm, current_func)),
             line: *line,
         },
         Stmt::While { cond, body, line } => Stmt::While {
-            cond: fixup_generic_calls_expr(cond, generics, current_func),
-            body: fixup_generic_calls(body, generics, current_func),
+            cond: fixup_generic_calls_expr(cond, generics, gm, current_func),
+            body: fixup_generic_calls(body, generics, gm, current_func),
             line: *line,
         },
         Stmt::For { var, iterator, body, line } => Stmt::For {
             var: var.clone(),
-            iterator: fixup_generic_calls_expr(iterator, generics, current_func),
-            body: fixup_generic_calls(body, generics, current_func),
+            iterator: fixup_generic_calls_expr(iterator, generics, gm, current_func),
+            body: fixup_generic_calls(body, generics, gm, current_func),
             line: *line,
         },
         Stmt::Assign { target, op, expr, line } => Stmt::Assign {
             target: target.clone(), op: op.clone(),
-            expr: fixup_generic_calls_expr(expr, generics, current_func),
+            expr: fixup_generic_calls_expr(expr, generics, gm, current_func),
+            line: *line,
+        },
+        Stmt::FieldAssign { object, field, op, expr, line } => Stmt::FieldAssign {
+            object: fixup_generic_calls_expr(object, generics, gm, current_func),
+            field: field.clone(), op: op.clone(),
+            expr: fixup_generic_calls_expr(expr, generics, gm, current_func),
+            line: *line,
+        },
+        Stmt::IndexAssign { array, index, op, expr, line } => Stmt::IndexAssign {
+            array: array.clone(),
+            index: fixup_generic_calls_expr(index, generics, gm, current_func),
+            op: op.clone(),
+            expr: fixup_generic_calls_expr(expr, generics, gm, current_func),
+            line: *line,
+        },
+        Stmt::Loop { body, line } => Stmt::Loop { body: fixup_generic_calls(body, generics, gm, current_func), line: *line },
+        Stmt::Unsafe { body, line } => Stmt::Unsafe { body: fixup_generic_calls(body, generics, gm, current_func), line: *line },
+        Stmt::Defer(body, line) => Stmt::Defer(fixup_generic_calls(body, generics, gm, current_func), *line),
+        Stmt::Match { expr, arms, line } => Stmt::Match {
+            expr: fixup_generic_calls_expr(expr, generics, gm, current_func),
+            arms: arms.iter().map(|arm| MatchArm {
+                pattern: arm.pattern.clone(),
+                guard: arm.guard.as_ref().map(|g| fixup_generic_calls_expr(g, generics, gm, current_func)),
+                body: fixup_generic_calls(&arm.body, generics, gm, current_func),
+            }).collect(),
             line: *line,
         },
         other => other.clone(),
     }
 }
 
-fn fixup_generic_calls_expr(expr: &Expr, generics: &HashMap<String, (Func, Vec<String>)>, current_func: &Func) -> Expr {
+/// The substitution for a call of a generic impl method: from the arguments
+/// (after `self`), then from the receiver's type arguments (`impl<T> Option<T>`
+/// on an `Option<f64>` gives T=f64), then i64 for what is left.
+fn method_subst(gen_func: &Func, type_params: &[String], arg_types: &[Type], recv_ty: &Type) -> Subst {
+    let param_types: Vec<Type> = gen_func.params.iter().skip(1).map(|p| p.ty.clone()).collect();
+    let mut subst = infer_subst(&param_types, arg_types, type_params);
+    let recv = match recv_ty {
+        Type::Ref { inner, .. } => inner.as_ref(),
+        other => other,
+    };
+    if let Type::Generic { args, .. } = recv {
+        for (tp, a) in type_params.iter().zip(args.iter()) {
+            subst.entry(tp.clone()).or_insert_with(|| a.clone());
+        }
+    }
+    for tp in type_params {
+        subst.entry(tp.clone()).or_insert(Type::I64);
+    }
+    subst
+}
+
+/// The substitution for a call: from the arguments, then, for a type
+/// parameter they leave unbound, from the expected type (the element after
+/// the arguments in `arg_types`, when there is one) against the result type.
+fn subst_with_result(gen_func: &Func, arg_types: &[Type], type_params: &[String]) -> Subst {
+    let param_types: Vec<Type> = gen_func.params.iter().map(|p| p.ty.clone()).collect();
+    let n = param_types.len().min(arg_types.len());
+    let mut subst = infer_subst(&param_types, &arg_types[..n], type_params);
+    if arg_types.len() == param_types.len() + 1 {
+        let tp_set: HashSet<&String> = type_params.iter().collect();
+        let mut from_result: Subst = HashMap::new();
+        infer_from_pair(&gen_func.ret_ty, &arg_types[param_types.len()], &tp_set, &mut from_result);
+        for (k, v) in from_result {
+            subst.entry(k).or_insert(v);
+        }
+    }
+    subst
+}
+
+/// A direct call to a generic function whose result has a declared type:
+/// renamed with that type for what the arguments leave unbound.
+fn fixup_hinted_call(expr: &Expr, hint: Option<&Type>, generics: &HashMap<String, (Func, Vec<String>)>, gm: &HashMap<(String, String), (Func, Vec<String>)>, current_func: &Func) -> Option<Expr> {
+    let (Expr::Call { callee, args }, Some(h)) = (expr, hint) else { return None };
+    let (gen_func, type_params) = generics.get(callee)?;
+    let new_args: Vec<Expr> = args.iter().map(|a| fixup_generic_calls_expr(a, generics, gm, current_func)).collect();
+    let mut arg_types: Vec<Type> = new_args.iter().map(|a| infer_expr_type(a, current_func)).collect();
+    arg_types.push(h.clone());
+    let subst = subst_with_result(gen_func, &arg_types, type_params);
+    if !type_params.iter().all(|tp| subst.contains_key(tp)) {
+        return None;
+    }
+    Some(Expr::Call { callee: mangle(callee, &subst, type_params), args: new_args })
+}
+
+fn fixup_generic_calls_expr(expr: &Expr, generics: &HashMap<String, (Func, Vec<String>)>, gm: &HashMap<(String, String), (Func, Vec<String>)>, current_func: &Func) -> Expr {
     match expr {
         Expr::Call { callee, args } => {
             // First, recursively fix up args
             let new_args: Vec<Expr> = args.iter()
-                .map(|a| fixup_generic_calls_expr(a, generics, current_func))
+                .map(|a| fixup_generic_calls_expr(a, generics, gm, current_func))
                 .collect();
 
             // Check if this is a call to a generic function
@@ -907,32 +1016,79 @@ fn fixup_generic_calls_expr(expr: &Expr, generics: &HashMap<String, (Func, Vec<S
         }
         Expr::Binary { op, left, right } => Expr::Binary {
             op: op.clone(),
-            left: Box::new(fixup_generic_calls_expr(left, generics, current_func)),
-            right: Box::new(fixup_generic_calls_expr(right, generics, current_func)),
+            left: Box::new(fixup_generic_calls_expr(left, generics, gm, current_func)),
+            right: Box::new(fixup_generic_calls_expr(right, generics, gm, current_func)),
         },
         Expr::Unary { op, expr: inner } => Expr::Unary {
             op: op.clone(),
-            expr: Box::new(fixup_generic_calls_expr(inner, generics, current_func)),
+            expr: Box::new(fixup_generic_calls_expr(inner, generics, gm, current_func)),
         },
-        Expr::MethodCall { receiver, method, args } => Expr::MethodCall {
-            receiver: Box::new(fixup_generic_calls_expr(receiver, generics, current_func)),
-            method: method.clone(),
-            args: args.iter().map(|a| fixup_generic_calls_expr(a, generics, current_func)).collect(),
-        },
+        Expr::MethodCall { receiver, method, args } => {
+            let new_recv = fixup_generic_calls_expr(receiver, generics, gm, current_func);
+            let new_args: Vec<Expr> = args.iter().map(|a| fixup_generic_calls_expr(a, generics, gm, current_func)).collect();
+            // A generic impl method: a call to the instantiation for this
+            // receiver's type, with the receiver as first argument
+            if let Some(sn) = infer_receiver_struct_name(receiver, current_func) {
+                if let Some((gen_func, type_params)) = gm.get(&(sn.clone(), method.clone())) {
+                    let arg_types: Vec<Type> = new_args.iter().map(|a| infer_expr_type(a, current_func)).collect();
+                    let subst = method_subst(gen_func, type_params, &arg_types, &infer_expr_type(receiver, current_func));
+                    let mut all_args = vec![new_recv];
+                    all_args.extend(new_args);
+                    return Expr::Call { callee: mangle_method(&sn, method, &subst, type_params), args: all_args };
+                }
+            }
+            Expr::MethodCall { receiver: Box::new(new_recv), method: method.clone(), args: new_args }
+        }
         Expr::FieldAccess { expr: inner, field } => Expr::FieldAccess {
-            expr: Box::new(fixup_generic_calls_expr(inner, generics, current_func)),
+            expr: Box::new(fixup_generic_calls_expr(inner, generics, gm, current_func)),
             field: field.clone(),
         },
         Expr::Index { array, index } => Expr::Index {
-            array: Box::new(fixup_generic_calls_expr(array, generics, current_func)),
-            index: Box::new(fixup_generic_calls_expr(index, generics, current_func)),
+            array: Box::new(fixup_generic_calls_expr(array, generics, gm, current_func)),
+            index: Box::new(fixup_generic_calls_expr(index, generics, gm, current_func)),
         },
         Expr::If { cond, then_block, else_block } => Expr::If {
-            cond: Box::new(fixup_generic_calls_expr(cond, generics, current_func)),
-            then_block: fixup_generic_calls(then_block, generics, current_func),
-            else_block: else_block.as_ref().map(|eb| fixup_generic_calls(eb, generics, current_func)),
+            cond: Box::new(fixup_generic_calls_expr(cond, generics, gm, current_func)),
+            then_block: fixup_generic_calls(then_block, generics, gm, current_func),
+            else_block: else_block.as_ref().map(|eb| fixup_generic_calls(eb, generics, gm, current_func)),
         },
-        Expr::Block(stmts) => Expr::Block(fixup_generic_calls(stmts, generics, current_func)),
+        Expr::Block(stmts) => Expr::Block(fixup_generic_calls(stmts, generics, gm, current_func)),
+        // Calls inside these are renamed as anywhere else
+        Expr::Try { expr: inner } => Expr::Try { expr: Box::new(fixup_generic_calls_expr(inner, generics, gm, current_func)) },
+        Expr::Ref { expr: inner, is_mut } => Expr::Ref { expr: Box::new(fixup_generic_calls_expr(inner, generics, gm, current_func)), is_mut: *is_mut },
+        Expr::Deref { expr: inner } => Expr::Deref { expr: Box::new(fixup_generic_calls_expr(inner, generics, gm, current_func)) },
+        Expr::Cast { expr: inner, target_ty } => Expr::Cast { expr: Box::new(fixup_generic_calls_expr(inner, generics, gm, current_func)), target_ty: target_ty.clone() },
+        Expr::StrConcat { left, right } => Expr::StrConcat {
+            left: Box::new(fixup_generic_calls_expr(left, generics, gm, current_func)),
+            right: Box::new(fixup_generic_calls_expr(right, generics, gm, current_func)),
+        },
+        Expr::Coalesce { expr: inner, default } => Expr::Coalesce {
+            expr: Box::new(fixup_generic_calls_expr(inner, generics, gm, current_func)),
+            default: Box::new(fixup_generic_calls_expr(default, generics, gm, current_func)),
+        },
+        Expr::EnumLit { enum_name, variant, args } => Expr::EnumLit {
+            enum_name: enum_name.clone(), variant: variant.clone(),
+            args: args.iter().map(|a| fixup_generic_calls_expr(a, generics, gm, current_func)).collect(),
+        },
+        Expr::ArrayLit { elem_type, elements } => Expr::ArrayLit {
+            elem_type: elem_type.clone(),
+            elements: elements.iter().map(|a| fixup_generic_calls_expr(a, generics, gm, current_func)).collect(),
+        },
+        Expr::TupleLit(items) => Expr::TupleLit(items.iter().map(|a| fixup_generic_calls_expr(a, generics, gm, current_func)).collect()),
+        Expr::Match { expr: inner, arms } => Expr::Match {
+            expr: Box::new(fixup_generic_calls_expr(inner, generics, gm, current_func)),
+            arms: arms.iter().map(|arm| MatchArm {
+                pattern: arm.pattern.clone(),
+                guard: arm.guard.as_ref().map(|g| fixup_generic_calls_expr(g, generics, gm, current_func)),
+                body: fixup_generic_calls(&arm.body, generics, gm, current_func),
+            }).collect(),
+        },
+        Expr::TryBlock { body } => Expr::TryBlock { body: fixup_generic_calls(body, generics, gm, current_func) },
+        Expr::StructLit { name, fields, spread } => Expr::StructLit {
+            name: name.clone(),
+            fields: fields.iter().map(|(f, e)| (f.clone(), fixup_generic_calls_expr(e, generics, gm, current_func))).collect(),
+            spread: spread.as_ref().map(|e| Box::new(fixup_generic_calls_expr(e, generics, gm, current_func))),
+        },
         other => other.clone(),
     }
 }
@@ -943,7 +1099,7 @@ fn process_func(func: &Func, ctx: &mut MonoCtx) -> Func {
     // Collect all calls to generic functions in this function's body
     let mut calls_to_instantiate: Vec<(String, Vec<Type>)> = Vec::new();
     // Collect all calls to generic methods: (struct_name, method_name, arg_types)
-    let mut method_calls_to_instantiate: Vec<(String, String, Vec<Type>)> = Vec::new();
+    let mut method_calls_to_instantiate: Vec<(String, String, Vec<Type>, Type)> = Vec::new();
 
     for stmt in &func.body {
         collect_generic_calls_stmt(stmt, &ctx.generics, &ctx.generic_methods, &mut calls_to_instantiate, &mut method_calls_to_instantiate, func);
@@ -955,8 +1111,7 @@ fn process_func(func: &Func, ctx: &mut MonoCtx) -> Func {
         // Clone the generic function data to avoid borrowing ctx while we need &mut ctx later
         let generic_info = ctx.generics.get(callee).cloned();
         if let Some((gen_func, type_params)) = generic_info {
-            let param_types: Vec<Type> = gen_func.params.iter().map(|p| p.ty.clone()).collect();
-            let subst = infer_subst(&param_types, arg_types, &type_params);
+            let subst = subst_with_result(&gen_func, arg_types, &type_params);
 
             // Check that all type params are bound
             let all_bound = type_params.iter().all(|tp| subst.contains_key(tp));
@@ -978,24 +1133,11 @@ fn process_func(func: &Func, ctx: &mut MonoCtx) -> Func {
 
     // Instantiate each generic method call
     let mut method_renames: HashMap<String, String> = HashMap::new();
-    for (struct_name, method_name, arg_types) in &method_calls_to_instantiate {
+    for (struct_name, method_name, arg_types, recv_ty) in &method_calls_to_instantiate {
         let key = (struct_name.clone(), method_name.clone());
         let generic_info = ctx.generic_methods.get(&key).cloned();
         if let Some((gen_func, type_params)) = generic_info {
-            // For methods, the first param is `self` — skip it when inferring
-            let param_types: Vec<Type> = gen_func.params.iter()
-                .skip(1) // skip self
-                .map(|p| p.ty.clone())
-                .collect();
-            let subst = infer_subst(&param_types, arg_types, &type_params);
-
-            // Bind any unbound type params to a placeholder (they're not used in this method)
-            let mut subst = subst;
-            for tp in &type_params {
-                if !subst.contains_key(tp) {
-                    subst.insert(tp.clone(), Type::I32);
-                }
-            }
+            let subst = method_subst(&gen_func, &type_params, arg_types, recv_ty);
 
             // Mangle as StructName__methodName__T
             let mangled = mangle_method(struct_name, method_name, &subst, &type_params);
@@ -1013,10 +1155,12 @@ fn process_func(func: &Func, ctx: &mut MonoCtx) -> Func {
     // Fix up call sites for generics with multiple instantiations.
     // We need to run fixup on the ORIGINAL body (before subst_stmt renamed
     // callees), then apply substitution for types/exprs without the renames.
-    let fixed_body = fixup_generic_calls(&func.body, &ctx.generics, func);
-    // Now apply type substitution (but no call renames since fixup already did them)
+    let fixed_body = fixup_generic_calls(&func.body, &ctx.generics, &ctx.generic_methods, func);
+    // Now apply type substitution (no renames: fixup renamed each call site
+    // from its own argument and receiver types)
+    let _ = &method_renames;
     let new_body: Vec<Stmt> = fixed_body.iter()
-        .map(|s| subst_stmt(s, &HashMap::new(), &HashMap::new(), &method_renames))
+        .map(|s| subst_stmt(s, &HashMap::new(), &HashMap::new(), &HashMap::new()))
         .collect();
 
     Func {
@@ -1122,7 +1266,7 @@ fn collect_generic_calls_stmt(
     generics: &HashMap<String, (Func, Vec<String>)>,
     generic_methods: &HashMap<(String, String), (Func, Vec<String>)>,
     calls: &mut Vec<(String, Vec<Type>)>,
-    method_calls: &mut Vec<(String, String, Vec<Type>)>,
+    method_calls: &mut Vec<(String, String, Vec<Type>, Type)>,
     current_func: &Func,
 ) {
     collect_generic_calls_stmt_with_hint(stmt, generics, generic_methods, calls, method_calls, current_func, None)
@@ -1134,7 +1278,7 @@ fn collect_generic_calls_stmt_with_hint(
     generics: &HashMap<String, (Func, Vec<String>)>,
     generic_methods: &HashMap<(String, String), (Func, Vec<String>)>,
     calls: &mut Vec<(String, Vec<Type>)>,
-    method_calls: &mut Vec<(String, String, Vec<Type>)>,
+    method_calls: &mut Vec<(String, String, Vec<Type>, Type)>,
     current_func: &Func,
     expected_ty: Option<&Type>,
 ) {
@@ -1299,16 +1443,21 @@ fn collect_generic_calls_expr_with_hint(
     generics: &HashMap<String, (Func, Vec<String>)>,
     generic_methods: &HashMap<(String, String), (Func, Vec<String>)>,
     calls: &mut Vec<(String, Vec<Type>)>,
-    method_calls: &mut Vec<(String, String, Vec<Type>)>,
+    method_calls: &mut Vec<(String, String, Vec<Type>, Type)>,
     current_func: &Func,
     expected_ty: Option<&Type>,
 ) {
     match expr {
         Expr::Call { callee, args } => {
             if generics.contains_key(callee) {
-                let arg_types: Vec<Type> = args.iter()
+                let mut arg_types: Vec<Type> = args.iter()
                     .map(|a| infer_expr_type_with_hint(a, current_func, expected_ty))
                     .collect();
+                // The expected type follows the arguments: it binds what they
+                // leave unbound (see subst_with_result)
+                if let Some(h) = expected_ty {
+                    arg_types.push(h.clone());
+                }
                 calls.push((callee.clone(), arg_types));
             }
             for a in args {
@@ -1354,7 +1503,7 @@ fn collect_generic_calls_expr_with_hint(
                     let arg_types: Vec<Type> = args.iter()
                         .map(|a| infer_expr_type_with_hint(a, current_func, expected_ty))
                         .collect();
-                    method_calls.push((sn.clone(), method.clone(), arg_types));
+                    method_calls.push((sn.clone(), method.clone(), arg_types, infer_expr_type(receiver, current_func)));
                 }
             }
             // Always recurse into receiver and args for nested generic calls
@@ -1480,13 +1629,8 @@ fn infer_expr_type_with_hint(expr: &Expr, func: &Func, hint: Option<&Type>) -> T
 /// Simple type inference for expressions (to infer generic arg types at call sites)
 fn infer_expr_type(expr: &Expr, func: &Func) -> Type {
     match expr {
-        Expr::IntLit(n) => {
-            if *n > i32::MAX as i64 || *n < i32::MIN as i64 {
-                Type::I64
-            } else {
-                Type::I32
-            }
-        }
+        // An integer literal is an i64, as everywhere else in the language
+        Expr::IntLit(_) => Type::I64,
         Expr::FloatLit(_) => Type::F64,
         Expr::BoolLit(_) => Type::Bool,
         Expr::StringLit(_) => Type::Str,
@@ -1514,6 +1658,9 @@ fn infer_expr_type(expr: &Expr, func: &Func) -> Type {
             Type::Named(name.clone())
         }
         Expr::Cast { target_ty, .. } => target_ty.clone(),
+        Expr::Call { callee, .. } => FN_RET_TYPES
+            .with(|m| m.borrow().get(callee).cloned())
+            .unwrap_or(Type::I64),
         Expr::Asm { operands, .. } => {
             let has_out = operands.iter().any(|op| op.direction == crate::ast::AsmDir::Out);
             if has_out { Type::I64 } else { Type::Void }

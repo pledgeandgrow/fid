@@ -136,7 +136,7 @@ pub fn process_gen(program: Program) -> Program {
     var errs: Vec<str> = Vec::new();
     var fi: i64 = 0;
     while fi < prog.funcs.len() {
-        substitute_comptime_gen_blocks(prog.funcs, fi, &prog, errs);
+        substitute_comptime_gen_blocks(&mut prog.funcs, fi, &prog, &mut errs);
         fi = fi + 1;
     }
 
@@ -146,7 +146,7 @@ pub fn process_gen(program: Program) -> Program {
     var func_count: i64 = prog.funcs.len();
     var idx: i64 = 0;
     while idx < func_count {
-        process_comptime_gen_in_func(prog.funcs, idx, &prog, generated_funcs, generated_structs, errs);
+        process_comptime_gen_in_func(&mut prog.funcs, idx, &prog, &mut generated_funcs, &mut generated_structs, &mut errs);
         idx = idx + 1;
     }
 
@@ -165,14 +165,14 @@ pub fn process_gen(program: Program) -> Program {
     return prog;
 }
 
-fn substitute_comptime_gen_blocks(funcs: Vec<Func>, idx: i64, original: &Program, errs: Vec<str>) {
+fn substitute_comptime_gen_blocks(funcs: &mut Vec<Func>, idx: i64, original: &Program, errs: &mut Vec<str>) {
     var func: Func = funcs.get(idx);
     var si: i64 = 0;
     while si < func.body.len() {
         match func.body.get(si) {
             Stmt::ComptimeGen(block, _) => {
                 var block_copy: Vec<Stmt> = block;
-                substitute_stmts(block_copy, original, errs);
+                substitute_stmts(&mut block_copy, original, errs);
                 func.body.set(si, Stmt::ComptimeGen(block_copy, 0));
             }
             _ => {}
@@ -182,7 +182,7 @@ fn substitute_comptime_gen_blocks(funcs: Vec<Func>, idx: i64, original: &Program
     funcs.set(idx, func);
 }
 
-fn process_comptime_gen_in_func(funcs: Vec<Func>, idx: i64, original: &Program, generated_funcs: Vec<Func>, generated_structs: Vec<StructDef>, errs: Vec<str>) {
+fn process_comptime_gen_in_func(funcs: &mut Vec<Func>, idx: i64, original: &Program, generated_funcs: &mut Vec<Func>, generated_structs: &mut Vec<StructDef>, errs: &mut Vec<str>) {
     var func: Func = funcs.get(idx);
     var new_body: Vec<Stmt> = Vec::new();
     var si: i64 = 0;
@@ -261,7 +261,7 @@ pub fn substitute(program: Program) -> Program {
     while iter < 8 {
         var fi: i64 = 0;
         while fi < prog.funcs.len() {
-            substitute_func(prog.funcs, fi, &prog, errs);
+            substitute_func(&mut prog.funcs, fi, &prog, &mut errs);
             fi = fi + 1;
         }
         iter = iter + 1;
@@ -270,7 +270,7 @@ pub fn substitute(program: Program) -> Program {
     // Phase 2: Substitute comptime expressions everywhere
     var fi2: i64 = 0;
     while fi2 < prog.funcs.len() {
-        substitute_func(prog.funcs, fi2, &prog, errs);
+        substitute_func(&mut prog.funcs, fi2, &prog, &mut errs);
         fi2 = fi2 + 1;
     }
 
@@ -288,7 +288,7 @@ pub fn substitute(program: Program) -> Program {
     while iter2 < 4 {
         var fi3: i64 = 0;
         while fi3 < prog.funcs.len() {
-            aggressive_comptime_func(prog.funcs, fi3, &prog);
+            aggressive_comptime_func(&mut prog.funcs, fi3, &prog);
             fi3 = fi3 + 1;
         }
         iter2 = iter2 + 1;
@@ -297,7 +297,7 @@ pub fn substitute(program: Program) -> Program {
     return prog;
 }
 
-fn substitute_func(funcs: Vec<Func>, idx: i64, original: &Program, errs: Vec<str>) {
+fn substitute_func(funcs: &mut Vec<Func>, idx: i64, original: &Program, errs: &mut Vec<str>) {
     var func: Func = funcs.get(idx);
     var si: i64 = 0;
     while si < func.body.len() {
@@ -309,7 +309,7 @@ fn substitute_func(funcs: Vec<Func>, idx: i64, original: &Program, errs: Vec<str
     funcs.set(idx, func);
 }
 
-fn substitute_stmts(stmts: Vec<Stmt>, original: &Program, errs: Vec<str>) {
+fn substitute_stmts(stmts: &mut Vec<Stmt>, original: &Program, errs: &mut Vec<str>) {
     var si: i64 = 0;
     while si < stmts.len() {
         var stmt: Stmt = stmts.get(si);
@@ -319,7 +319,7 @@ fn substitute_stmts(stmts: Vec<Stmt>, original: &Program, errs: Vec<str>) {
     }
 }
 
-fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: Vec<str>) {
+fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<str>) {
     // A match binding is a copy of the payload: substitute into the copy,
     // then rebuild the statement so the result is kept.
     match stmt {
@@ -366,21 +366,21 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: Vec<str>) {
         }
         Stmt::If(cond, then_block, else_block, iline2) => {
             substitute_expr(&mut cond, original, errs);
-            substitute_stmts(then_block, original, errs);
+            substitute_stmts(&mut then_block, original, errs);
             match else_block {
-                OptStmts::Some(eb) => { substitute_stmts(eb, original, errs); }
+                OptStmts::Some(eb) => { substitute_stmts(&mut eb, original, errs); }
                 OptStmts::None => {}
             }
             *stmt = Stmt::If(cond, then_block, else_block, iline2);
         }
         Stmt::While(cond, body, wline) => {
             substitute_expr(&mut cond, original, errs);
-            substitute_stmts(body, original, errs);
+            substitute_stmts(&mut body, original, errs);
             *stmt = Stmt::While(cond, body, wline);
         }
         Stmt::For(fvar, iterator, body, forline) => {
             substitute_expr(&mut iterator, original, errs);
-            substitute_stmts(body, original, errs);
+            substitute_stmts(&mut body, original, errs);
             *stmt = Stmt::For(fvar, iterator, body, forline);
         }
         Stmt::Match(expr, arms, mline) => {
@@ -389,33 +389,33 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: Vec<str>) {
             var ai: i64 = 0;
             while ai < arms.len() {
                 var arm: MatchArm = arms.get(ai);
-                substitute_stmts(arm.body, original, errs);
+                substitute_stmts(&mut arm.body, original, errs);
                 arms.set(ai, arm);
                 ai = ai + 1;
             }
         }
-        Stmt::Defer(body, _) => { substitute_stmts(body, original, errs); }
-        Stmt::Txn(body, _) => { substitute_stmts(body, original, errs); }
-        Stmt::RegionBlock(_, _, _, _, _, body, _) => { substitute_stmts(body, original, errs); }
-        Stmt::Sandbox(body, _) => { substitute_stmts(body, original, errs); }
-        Stmt::Unsafe(body, _) => { substitute_stmts(body, original, errs); }
-        Stmt::ComptimeGen(block, _) => { substitute_stmts(block, original, errs); }
+        Stmt::Defer(body, _) => { substitute_stmts(&mut body, original, errs); }
+        Stmt::Txn(body, _) => { substitute_stmts(&mut body, original, errs); }
+        Stmt::RegionBlock(_, _, _, _, _, body, _) => { substitute_stmts(&mut body, original, errs); }
+        Stmt::Sandbox(body, _) => { substitute_stmts(&mut body, original, errs); }
+        Stmt::Unsafe(body, _) => { substitute_stmts(&mut body, original, errs); }
+        Stmt::ComptimeGen(block, _) => { substitute_stmts(&mut block, original, errs); }
         Stmt::Handle(body, handlers, _) => {
-            substitute_stmts(body, original, errs);
+            substitute_stmts(&mut body, original, errs);
             var hi: i64 = 0;
             while hi < handlers.len() {
                 var h: EffectHandler = handlers.get(hi);
-                substitute_stmts(h.body, original, errs);
+                substitute_stmts(&mut h.body, original, errs);
                 handlers.set(hi, h);
                 hi = hi + 1;
             }
         }
-        Stmt::Query(_, body, _) => { substitute_stmts(body, original, errs); }
+        Stmt::Query(_, body, _) => { substitute_stmts(&mut body, original, errs); }
         Stmt::Parallel(branches, _) => {
             var bi: i64 = 0;
             while bi < branches.len() {
                 var branch: Vec<Stmt> = branches.get(bi);
-                substitute_stmts(branch, original, errs);
+                substitute_stmts(&mut branch, original, errs);
                 branches.set(bi, branch);
                 bi = bi + 1;
             }
@@ -425,13 +425,13 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: Vec<str>) {
             substitute_expr(&mut cont, original, errs);
             substitute_expr(&mut value, original, errs);
         }
-        Stmt::SpawnScope(body, _) => { substitute_stmts(body, original, errs); }
+        Stmt::SpawnScope(body, _) => { substitute_stmts(&mut body, original, errs); }
         Stmt::CancelScope(_) => {}
         _ => {}
     }
 }
 
-fn substitute_expr(expr: &mut Expr, original: &Program, errs: Vec<str>) {
+fn substitute_expr(expr: &mut Expr, original: &Program, errs: &mut Vec<str>) {
     match expr {
         Expr::Binary(op, left, right) => {
             var l: Expr = ct_box_expr_unbox(left);
@@ -482,13 +482,13 @@ fn substitute_expr(expr: &mut Expr, original: &Program, errs: Vec<str>) {
         }
         Expr::If(cond, then_block, else_block) => {
             substitute_expr(&mut cond, original, errs);
-            substitute_stmts(then_block, original, errs);
+            substitute_stmts(&mut then_block, original, errs);
             match else_block {
-                OptStmts::Some(eb) => { substitute_stmts(eb, original, errs); }
+                OptStmts::Some(eb) => { substitute_stmts(&mut eb, original, errs); }
                 OptStmts::None => {}
             }
         }
-        Expr::Block(stmts) => { substitute_stmts(stmts, original, errs); }
+        Expr::Block(stmts) => { substitute_stmts(&mut stmts, original, errs); }
         Expr::Index(array, index) => {
             var a: Expr = ct_box_expr_unbox(array);
             var i: Expr = ct_box_expr_unbox(index);
@@ -510,7 +510,7 @@ fn substitute_expr(expr: &mut Expr, original: &Program, errs: Vec<str>) {
             var ai: i64 = 0;
             while ai < arms.len() {
                 var arm: MatchArm = arms.get(ai);
-                substitute_stmts(arm.body, original, errs);
+                substitute_stmts(&mut arm.body, original, errs);
                 arms.set(ai, arm);
                 ai = ai + 1;
             }
@@ -545,13 +545,13 @@ fn substitute_expr(expr: &mut Expr, original: &Program, errs: Vec<str>) {
             *expr = Expr::Cast(box_expr_new(e), ty);
         }
         Expr::Comptime(inner) => { substitute_expr_comptime(expr, inner, original, errs); }
-        Expr::ComptimeBlock(stmts) => { substitute_expr_comptime_block(expr, stmts, original, errs); }
+        Expr::ComptimeBlock(stmts) => { substitute_expr_comptime_block(expr, &mut stmts, original, errs); }
         Expr::ComptimeReflect(op, ty) => { substitute_expr_comptime_reflect(expr, op, ty, original, errs); }
         _ => {}
     }
 }
 
-fn substitute_expr_comptime(expr: &mut Expr, inner: Box<Expr>, original: &Program, errs: Vec<str>) {
+fn substitute_expr_comptime(expr: &mut Expr, inner: Box<Expr>, original: &Program, errs: &mut Vec<str>) {
     var e: Expr = ct_box_expr_unbox(inner);
     substitute_expr(&mut e, original, errs);
     // Now evaluate the comptime expression
@@ -562,7 +562,7 @@ fn substitute_expr_comptime(expr: &mut Expr, inner: Box<Expr>, original: &Progra
     }
 }
 
-fn substitute_expr_comptime_block(expr: &mut Expr, stmts: Vec<Stmt>, original: &Program, errs: Vec<str>) {
+fn substitute_expr_comptime_block(expr: &mut Expr, stmts: &mut Vec<Stmt>, original: &Program, errs: &mut Vec<str>) {
     substitute_stmts(stmts, original, errs);
     var result: ResultExpr = evaluate_block(stmts, original);
     match result {
@@ -571,7 +571,7 @@ fn substitute_expr_comptime_block(expr: &mut Expr, stmts: Vec<Stmt>, original: &
     }
 }
 
-fn substitute_expr_comptime_reflect(expr: &mut Expr, op: ReflectOp, ty: Type, original: &Program, errs: Vec<str>) {
+fn substitute_expr_comptime_reflect(expr: &mut Expr, op: ReflectOp, ty: Type, original: &Program, errs: &mut Vec<str>) {
     var result: ResultExpr = evaluate_reflect(op, ty, original);
     match result {
         ResultExpr::Ok(v) => { *expr = v; }
@@ -586,7 +586,7 @@ fn substitute_expr_comptime_reflect(expr: &mut Expr, op: ReflectOp, ty: Type, or
 // The names of this program's comptime fns
 var ct_comptime_fns: i64 = 0;
 
-fn aggressive_comptime_func(funcs: Vec<Func>, idx: i64, original: &Program) {
+fn aggressive_comptime_func(funcs: &mut Vec<Func>, idx: i64, original: &Program) {
     var func: Func = funcs.get(idx);
     var si: i64 = 0;
     while si < func.body.len() {
@@ -1133,13 +1133,13 @@ fn evaluate_block(stmts: Vec<Stmt>, original: &Program) -> ResultExpr {
 fn evaluate_block_with_env(stmts: Vec<Stmt>, original: &Program, env: &ComptimeEnv) -> ResultExpr {
     var returned: Vec<i64> = Vec::new();
     var block_env: ComptimeEnv = ComptimeEnv_clone(env);
-    return evaluate_block_rt(stmts, original, &block_env, returned);
+    return evaluate_block_rt(stmts, original, &block_env, &mut returned);
 }
 
 /// Runs `stmts` in `env` itself (its Vecs are shared): assignments to
 /// outer variables persist (a loop accumulating into `out`), names the
 /// block declares are dropped at its end.
-fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &ComptimeEnv, returned: Vec<i64>) -> ResultExpr {
+fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &ComptimeEnv, returned: &mut Vec<i64>) -> ResultExpr {
     var local_env: ComptimeEnv = ComptimeEnv { names: env.names, values: env.values };
     var n_outer: i64 = local_env.names.len();
     var result: Expr = Expr::IntLit(0);

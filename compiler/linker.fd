@@ -149,7 +149,7 @@ fn linker_find_rodata_sym(rodata_syms: Vec<LinkerRodataSym>, name: str) -> i64 {
     return -1;
 }
 
-fn linker_push_unique(v: Vec<str>, s: str) {
+fn linker_push_unique(v: &mut Vec<str>, s: str) {
     var i: i64 = 0;
     while i < v.len() {
         if v.get(i) == s { return; }
@@ -158,7 +158,7 @@ fn linker_push_unique(v: Vec<str>, s: str) {
     v.push(s);
 }
 
-fn linker_set_symbol(symbols: Vec<LinkerSymbol>, name: str, offset: i64, is_defined: bool) {
+fn linker_set_symbol(symbols: &mut Vec<LinkerSymbol>, name: str, offset: i64, is_defined: bool) {
     var idx: i64 = linker_find_symbol(symbols, name);
     if idx >= 0 {
         symbols.get(idx).offset = offset;
@@ -168,7 +168,7 @@ fn linker_set_symbol(symbols: Vec<LinkerSymbol>, name: str, offset: i64, is_defi
     symbols.push(LinkerSymbol { name: name, offset: offset, is_defined: is_defined });
 }
 
-fn linker_set_rodata_sym(rodata_syms: Vec<LinkerRodataSym>, name: str, offset: i64) {
+fn linker_set_rodata_sym(rodata_syms: &mut Vec<LinkerRodataSym>, name: str, offset: i64) {
     var i: i64 = 0;
     while i < rodata_syms.len() {
         if rodata_syms.get(i).name == name {
@@ -204,7 +204,7 @@ fn read_i64(buf: Vec, off: i64) -> i64 {
 
 // --- Helper: write little-endian integers to Vec ---
 
-fn write_u32(buf: Vec, off: i64, val: i64) {
+fn write_u32(buf: &mut Vec, off: i64, val: i64) {
     var i: i64 = 0;
     while i < 4 {
         var b: i64 = (val >> (i * 8)) & 0xFF;
@@ -214,7 +214,7 @@ fn write_u32(buf: Vec, off: i64, val: i64) {
     }
 }
 
-fn write_u64(buf: Vec, off: i64, val: i64) {
+fn write_u64(buf: &mut Vec, off: i64, val: i64) {
     var i: i64 = 0;
     while i < 8 {
         var b: i64 = (val >> (i * 8)) & 0xFF;
@@ -320,7 +320,7 @@ pub fn link_with_runtime_for_target(
     }
     var si: i64 = 0;
     while si < runtime_symbols.len() {
-        linker_set_symbol(linker.symbols, runtime_symbols.get(si).name, rt_base + runtime_symbols.get(si).offset, true);
+        linker_set_symbol(&mut linker.symbols, runtime_symbols.get(si).name, rt_base + runtime_symbols.get(si).offset, true);
         si = si + 1;
     }
     // Add rodata
@@ -332,7 +332,7 @@ pub fn link_with_runtime_for_target(
     }
     si = 0;
     while si < runtime_rodata_syms.len() {
-        linker_set_rodata_sym(linker.rodata_symbols, runtime_rodata_syms.get(si).name, rod_base + runtime_rodata_syms.get(si).offset);
+        linker_set_rodata_sym(&mut linker.rodata_symbols, runtime_rodata_syms.get(si).name, rod_base + runtime_rodata_syms.get(si).offset);
         si = si + 1;
     }
     // Add relocations (adjusted by rt_base)
@@ -372,7 +372,7 @@ pub fn link_raw_with_runtime_for_target(
     // Add user symbols
     i = 0;
     while i < user_symbols.len() {
-        linker_set_symbol(linker.symbols, user_symbols.get(i).name, user_symbols.get(i).offset, true);
+        linker_set_symbol(&mut linker.symbols, user_symbols.get(i).name, user_symbols.get(i).offset, true);
         i = i + 1;
     }
     // Add user rodata
@@ -381,7 +381,7 @@ pub fn link_raw_with_runtime_for_target(
     // Add user rodata symbols
     i = 0;
     while i < user_rodata_syms.len() {
-        linker_set_rodata_sym(linker.rodata_symbols, user_rodata_syms.get(i).name, user_rodata_syms.get(i).offset);
+        linker_set_rodata_sym(&mut linker.rodata_symbols, user_rodata_syms.get(i).name, user_rodata_syms.get(i).offset);
         i = i + 1;
     }
     // Add user relocations
@@ -397,7 +397,7 @@ pub fn link_raw_with_runtime_for_target(
     while i < runtime_text.len() { linker.text_bytes.push(runtime_text.get(i)); i = i + 1; }
     i = 0;
     while i < runtime_symbols.len() {
-        linker_set_symbol(linker.symbols, runtime_symbols.get(i).name, rt_base + runtime_symbols.get(i).offset, true);
+        linker_set_symbol(&mut linker.symbols, runtime_symbols.get(i).name, rt_base + runtime_symbols.get(i).offset, true);
         i = i + 1;
     }
     // Add runtime rodata
@@ -406,7 +406,7 @@ pub fn link_raw_with_runtime_for_target(
     while i < runtime_rodata.len() { linker.rodata.push(runtime_rodata.get(i)); i = i + 1; }
     i = 0;
     while i < runtime_rodata_syms.len() {
-        linker_set_rodata_sym(linker.rodata_symbols, runtime_rodata_syms.get(i).name, rod_base + runtime_rodata_syms.get(i).offset);
+        linker_set_rodata_sym(&mut linker.rodata_symbols, runtime_rodata_syms.get(i).name, rod_base + runtime_rodata_syms.get(i).offset);
         i = i + 1;
     }
     // Add runtime relocations (adjusted by rt_base)
@@ -659,13 +659,13 @@ pub fn Linker_add_object(self: &mut Linker, obj: Vec) -> LinkerResultUnit {
             // Check if this symbol is in the rodata section
             if is_defined && rodata_sec_idx == st_shndx {
                 // Rodata symbol
-                linker_set_rodata_sym(self.rodata_symbols, name, rodata_base + st_value);
+                linker_set_rodata_sym(&mut self.rodata_symbols, name, rodata_base + st_value);
             } else {
                 var offset2: i64 = 0;
                 if is_defined {
                     offset2 = text_base + st_value;
                 }
-                linker_set_symbol(self.symbols, name, offset2, is_defined);
+                linker_set_symbol(&mut self.symbols, name, offset2, is_defined);
             }
             j = j + 1;
         }
@@ -818,7 +818,7 @@ pub fn Linker_link(self: &mut Linker, entry: str) -> LinkerResult {
             } else {
                 // Unknown symbol -- record it; skipping would leave a 0 patch
                 // (e.g. `call next_rip` fallthrough) and silently corrupt output.
-                linker_push_unique(undefined_syms, sym_name);
+                linker_push_unique(&mut undefined_syms, sym_name);
                 ri3 = ri3 + 1; continue;
             }
         }
@@ -830,17 +830,17 @@ pub fn Linker_link(self: &mut Linker, entry: str) -> LinkerResult {
                     // LK_R_X86_64_PC32: PC-relative 32-bit
                     var next_rip: i64 = patch_offset + 4;
                     var delta: i64 = sym_offset - next_rip;
-                    write_u32(self.text_bytes, patch_offset, delta);
+                    write_u32(&mut self.text_bytes, patch_offset, delta);
                 } else if r_type == LK_R_X86_64_PLT32 {
                     // LK_R_X86_64_PLT32: same as PC32 for our purposes
                     var next_rip2: i64 = patch_offset + 4;
                     var delta2: i64 = sym_offset - next_rip2;
-                    write_u32(self.text_bytes, patch_offset, delta2);
+                    write_u32(&mut self.text_bytes, patch_offset, delta2);
                 } else if r_type == LK_R_X86_64_64 {
                     // LK_R_X86_64_64: absolute 64-bit
                     if patch_offset + 8 <= self.text_bytes.len() {
                         var abs_addr: i64 = sym_offset + 0x400078;
-                        write_u64(self.text_bytes, patch_offset, abs_addr);
+                        write_u64(&mut self.text_bytes, patch_offset, abs_addr);
                     }
                 } else if r_type == R_ARM64_BL || r_type == R_ARM64_B {
                     // BL/B: 26-bit offset /4 relative to the branch's own PC
@@ -848,14 +848,14 @@ pub fn Linker_link(self: &mut Linker, entry: str) -> LinkerResult {
                     var imm26: i64 = (delta3 / 4) & 0x03FFFFFF;
                     var instr: i64 = read_u32(self.text_bytes, patch_offset);
                     var patched: i64 = (instr & 0xFC000000) | imm26;
-                    write_u32(self.text_bytes, patch_offset, patched);
+                    write_u32(&mut self.text_bytes, patch_offset, patched);
                 } else if r_type == R_ARM64_BCOND {
                     // B.cond: 19-bit offset /4 relative to the branch's own PC
                     var delta4: i64 = sym_offset - patch_offset;
                     var imm19: i64 = (delta4 / 4) & 0x0007FFFF;
                     var instr2: i64 = read_u32(self.text_bytes, patch_offset);
                     var patched2: i64 = (instr2 & 0xFF00001F) | (imm19 << 5);
-                    write_u32(self.text_bytes, patch_offset, patched2);
+                    write_u32(&mut self.text_bytes, patch_offset, patched2);
                 } else if r_type == R_ARM64_ADRP {
                     // ADRP: compute page-aligned PC-relative address
                     var base_addr: i64 = 0x400000;
@@ -871,7 +871,7 @@ pub fn Linker_link(self: &mut Linker, entry: str) -> LinkerResult {
                     var immhi: i64 = (imm >> 2) & 0x7FFFF;
                     var instr3: i64 = read_u32(self.text_bytes, patch_offset);
                     var patched3: i64 = (instr3 & 0x9F00001F) | (immlo << 29) | (immhi << 5);
-                    write_u32(self.text_bytes, patch_offset, patched3);
+                    write_u32(&mut self.text_bytes, patch_offset, patched3);
                 } else if r_type == R_ARM64_ADD_LO12 {
                     // ADD Xd, Xn, :lo12:label -- add low 12 bits of symbol address
                     var base_addr2: i64 = 0x400000;
@@ -881,7 +881,7 @@ pub fn Linker_link(self: &mut Linker, entry: str) -> LinkerResult {
                     var lo12: i64 = sym_vaddr2 & 0xFFF;
                     var instr4: i64 = read_u32(self.text_bytes, patch_offset);
                     var patched4: i64 = (instr4 & 0xFFC00003) | (lo12 << 10);
-                    write_u32(self.text_bytes, patch_offset, patched4);
+                    write_u32(&mut self.text_bytes, patch_offset, patched4);
                 } else if r_type == R_RISCV_JAL {
                     // JAL: 20-bit PC-relative immediate (J-type)
                     var next_pc3: i64 = patch_offset;
@@ -896,7 +896,7 @@ pub fn Linker_link(self: &mut Linker, entry: str) -> LinkerResult {
                         | (imm10_1 << 21)
                         | (imm11 << 20)
                         | (imm19_12 << 12);
-                    write_u32(self.text_bytes, patch_offset, patched5);
+                    write_u32(&mut self.text_bytes, patch_offset, patched5);
                 } else if r_type == R_RISCV_BRANCH {
                     // Branch: 13-bit PC-relative immediate (B-type)
                     var next_pc4: i64 = patch_offset;
@@ -911,7 +911,7 @@ pub fn Linker_link(self: &mut Linker, entry: str) -> LinkerResult {
                         | (imm10_5 << 25)
                         | (imm4_1 << 8)
                         | (imm11_2 << 7);
-                    write_u32(self.text_bytes, patch_offset, patched6);
+                    write_u32(&mut self.text_bytes, patch_offset, patched6);
                 }
             }
         }
@@ -947,7 +947,7 @@ pub fn Linker_link(self: &mut Linker, entry: str) -> LinkerResult {
             if rod_off2 >= 0 {
                 sym_offset2 = text_size2 + rod_off2;
             } else {
-                linker_push_unique(undefined_syms, sym_name2);
+                linker_push_unique(&mut undefined_syms, sym_name2);
                 ri4 = ri4 + 1; continue;
             }
         }
@@ -958,7 +958,7 @@ pub fn Linker_link(self: &mut Linker, entry: str) -> LinkerResult {
                 // LK_R_X86_64_64: absolute 64-bit
                 if patch_offset2 + 8 <= self.rodata.len() {
                     var abs_addr2: i64 = text_vaddr3 + sym_offset2;
-                    write_u64(self.rodata, patch_offset2, abs_addr2);
+                    write_u64(&mut self.rodata, patch_offset2, abs_addr2);
                 }
             }
         }
@@ -1021,11 +1021,11 @@ pub fn Linker_build_executable(self: &Linker, entry_offset: i64) -> LinkerResult
     // e_version = 1
     buf.push(1); buf.push(0); buf.push(0); buf.push(0);
     // e_entry = virtual address of entry
-    write_u64(buf, buf.len(), text_vaddr + entry_offset);
+    write_u64(&mut buf, buf.len(), text_vaddr + entry_offset);
     // e_phoff
-    write_u64(buf, buf.len(), phdr_offset);
+    write_u64(&mut buf, buf.len(), phdr_offset);
     // e_shoff (no section headers)
-    write_u64(buf, buf.len(), 0);
+    write_u64(&mut buf, buf.len(), 0);
     // e_flags
     buf.push(0); buf.push(0); buf.push(0); buf.push(0);
     // e_ehsize = 64
@@ -1047,17 +1047,17 @@ pub fn Linker_build_executable(self: &Linker, entry_offset: i64) -> LinkerResult
     // p_flags = PF_R | PF_X (5)
     buf.push(5); buf.push(0); buf.push(0); buf.push(0);
     // p_offset
-    write_u64(buf, buf.len(), text_file_offset);
+    write_u64(&mut buf, buf.len(), text_file_offset);
     // p_vaddr
-    write_u64(buf, buf.len(), text_vaddr);
+    write_u64(&mut buf, buf.len(), text_vaddr);
     // p_paddr
-    write_u64(buf, buf.len(), text_vaddr);
+    write_u64(&mut buf, buf.len(), text_vaddr);
     // p_filesz
-    write_u64(buf, buf.len(), text_size + rodata_size);
+    write_u64(&mut buf, buf.len(), text_size + rodata_size);
     // p_memsz
-    write_u64(buf, buf.len(), text_size + rodata_size);
+    write_u64(&mut buf, buf.len(), text_size + rodata_size);
     // p_align = 0x1000
-    write_u64(buf, buf.len(), 0x1000);
+    write_u64(&mut buf, buf.len(), 0x1000);
 
     // --- .text section ---
     var ti: i64 = 0;

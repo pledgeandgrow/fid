@@ -304,7 +304,7 @@ pub fn str_vec_contains_ref(v: Vec<str>, s: str) -> bool {
     return false;
 }
 
-fn str_vec_remove(v: Vec<str>, s: str) {
+fn str_vec_remove(v: &mut Vec<str>, s: str) {
     var i: i64 = 0;
     while i < v.len() {
         if v.get(i) == s {
@@ -337,7 +337,7 @@ fn map_str_type_get(m: Vec<StringType>, key: str) -> OptType {
     return OptType::None;
 }
 
-fn map_str_type_set(m: Vec<StringType>, key: str, val: Type) {
+fn map_str_type_set(m: &mut Vec<StringType>, key: str, val: Type) {
     var i: i64 = 0;
     while i < m.len() {
         if m.get(i).key == key {
@@ -409,7 +409,7 @@ fn map_str_bool_get(m: Vec<StringBool>, key: str) -> bool {
     return false;
 }
 
-fn map_str_bool_set(m: Vec<StringBool>, key: str, val: bool) {
+fn map_str_bool_set(m: &mut Vec<StringBool>, key: str, val: bool) {
     var i: i64 = 0;
     while i < m.len() {
         if m.get(i).key == key {
@@ -436,7 +436,7 @@ fn map_str_str_get(m: Vec<StringString>, key: str) -> OptString {
     return OptString::None;
 }
 
-fn map_str_str_set(m: Vec<StringString>, key: str, val: str) {
+fn map_str_str_set(m: &mut Vec<StringString>, key: str, val: str) {
     var i: i64 = 0;
     while i < m.len() {
         if m.get(i).key == key {
@@ -600,7 +600,7 @@ pub enum OptMethodInfo {
     None,
 }
 
-fn method_map_set_entry(m: Vec<MethodMapEntry>, method_name: str, info: MethodInfo) {
+fn method_map_set_entry(m: &mut Vec<MethodMapEntry>, method_name: str, info: MethodInfo) {
     var i: i64 = 0;
     while i < m.len() {
         if m.get(i).key == method_name {
@@ -681,6 +681,19 @@ pub struct TypeChecker {
     methods: Vec<StringMethodMap>,                   // struct_name -> method map
     current_type_params: Vec<str>,                   // current function's type params
     current_type_param_bounds: Vec<StringString>,    // type_param -> trait_name
+    // Generic functions (proposal 0002): name, type parameters, bounds
+    func_generic_names: Vec<str>,
+    func_generic_tps: Vec<Vec<str>>,
+    func_generic_bounds: Vec<Vec<StrPair>>,
+    // "Trait:Type" for every `impl Trait for Type`
+    impl_pairs: Vec<str>,
+    // Type parameters of each generic impl: `impl<T> Slot` -> Slot, [T]
+    impl_tp_names: Vec<str>,
+    impl_tp_lists: Vec<Vec<str>>,
+    // The current function's by-value parameters holding a Vec, HashMap or
+    // struct, with their types: they are read-only (proposal 0001)
+    value_param_names: Vec<str>,
+    value_param_types: Vec<Type>,
     traits: Vec<StringTraitMethodMap>,               // trait_name -> methods
     trait_assoc_types: Vec<StringVecString>,         // trait_name -> assoc type names
     trait_impl_assoc_bindings: Vec<TraitImplAssocEntry>, // (trait,type) -> bindings
@@ -837,6 +850,14 @@ impl TypeChecker {
             methods: Vec::new(),
             current_type_params: Vec::new(),
             current_type_param_bounds: Vec::new(),
+            func_generic_names: Vec::new(),
+            func_generic_tps: Vec::new(),
+            func_generic_bounds: Vec::new(),
+            impl_pairs: Vec::new(),
+            impl_tp_names: Vec::new(),
+            impl_tp_lists: Vec::new(),
+            value_param_names: Vec::new(),
+            value_param_types: Vec::new(),
             traits: Vec::new(),
             trait_assoc_types: Vec::new(),
             trait_impl_assoc_bindings: Vec::new(),
@@ -1008,7 +1029,7 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
     var ci: i64 = 0;
     while ci < program.consts.len() {
         var c: ConstDef = program.consts.get(ci);
-        map_str_type_set(self.consts, c.name, c.ty);
+        map_str_type_set(&mut self.consts, c.name, c.ty);
         TypeChecker_set_item_module(self, c.name, module);
         TypeChecker_set_item_visibility(self, c.name, c.is_pub);
         ci = ci + 1;
@@ -1018,7 +1039,7 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
     var gi: i64 = 0;
     while gi < program.globals.len() {
         var g: GlobalVar = program.globals.get(gi);
-        map_str_type_set(self.globals, g.name, g.ty);
+        map_str_type_set(&mut self.globals, g.name, g.ty);
         TypeChecker_set_item_module(self, g.name, module);
         TypeChecker_set_item_visibility(self, g.name, g.is_pub);
         gi = gi + 1;
@@ -1028,7 +1049,7 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
     var tai: i64 = 0;
     while tai < program.type_aliases.len() {
         var ta: TypeAlias = program.type_aliases.get(tai);
-        map_str_type_set(self.type_aliases, ta.name, ta.alias_for);
+        map_str_type_set(&mut self.type_aliases, ta.name, ta.alias_for);
         TypeChecker_set_item_module(self, ta.name, module);
         TypeChecker_set_item_visibility(self, ta.name, ta.is_pub);
         tai = tai + 1;
@@ -1051,6 +1072,11 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
         }
         var ret_ty: Type = TypeChecker_resolve_type(self, func.ret_ty);
         self.funcs.push(StringFuncSig_new(func.name, FuncSig_new_with_min(param_types, ret_ty, min_args)));
+        if func.type_params.len() > 0 {
+            self.func_generic_names.push(func.name);
+            self.func_generic_tps.push(func.type_params);
+            self.func_generic_bounds.push(func.type_param_bounds);
+        }
         TypeChecker_set_item_module(self, func.name, module);
         TypeChecker_set_item_visibility(self, func.name, func.is_pub);
         fi3 = fi3 + 1;
@@ -1079,6 +1105,10 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
     while impi < program.impls.len() {
         var imp: ImplDef = program.impls.get(impi);
         var struct_name: str = imp.struct_name;
+        if imp.type_params.len() > 0 && !str_vec_contains(self.impl_tp_names, struct_name) {
+            self.impl_tp_names.push(struct_name);
+            self.impl_tp_lists.push(imp.type_params);
+        }
         var method_entries: Vec<MethodMapEntry> = Vec::new();
         var mi: i64 = 0;
         while mi < imp.methods.len() {
@@ -1162,7 +1192,7 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
                 var existing_val: Vec<MethodMapEntry> = self.methods.get(mi2).val;
                 var ni: i64 = 0;
                 while ni < new_methods.len() {
-                    method_map_set_entry(existing_val, new_methods.get(ni).key, new_methods.get(ni).val);
+                    method_map_set_entry(&mut existing_val, new_methods.get(ni).key, new_methods.get(ni).val);
                     ni = ni + 1;
                 }
                 var m_entry: StringMethodMap = self.methods.get(mi2);
@@ -1213,6 +1243,7 @@ pub fn TypeChecker_register_trait_impls(self: &mut TypeChecker, program: Program
     var tii: i64 = 0;
     while tii < program.trait_impls.len() {
         var ti: TraitImpl = program.trait_impls.get(tii);
+        self.impl_pairs.push(ti.trait_name + ":" + ti.type_name);
         var type_name: str = ti.type_name;
         var new_methods: Vec<MethodMapEntry> = Vec::new();
         var mi: i64 = 0;
@@ -1239,7 +1270,7 @@ pub fn TypeChecker_register_trait_impls(self: &mut TypeChecker, program: Program
                 var existing_val: Vec<MethodMapEntry> = self.methods.get(mi2).val;
                 var ni: i64 = 0;
                 while ni < new_methods.len() {
-                    method_map_set_entry(existing_val, new_methods.get(ni).key, new_methods.get(ni).val);
+                    method_map_set_entry(&mut existing_val, new_methods.get(ni).key, new_methods.get(ni).val);
                     ni = ni + 1;
                 }
                 var m_entry: StringMethodMap = self.methods.get(mi2);
@@ -1429,7 +1460,7 @@ pub fn TypeChecker_register_generated_decls(self: &mut TypeChecker, program: Pro
         } else if to_add.len() > 0 {
             var ai: i64 = 0;
             while ai < to_add.len() {
-                method_map_set_entry(existing_val, to_add.get(ai).key, to_add.get(ai).val);
+                method_map_set_entry(&mut existing_val, to_add.get(ai).key, to_add.get(ai).val);
                 ai = ai + 1;
             }
             var m_entry: StringMethodMap = self.methods.get(idx);
@@ -1793,7 +1824,7 @@ fn TypeChecker_verify_no_races(self: &mut TypeChecker, program: Program) {
             var at: i64 = tc_find_func(program, name);
             if at >= 0 {
                 var called: Vec<str> = Vec::new();
-                TypeChecker_collect_called_funcs(self, program.funcs.get(at).body, called);
+                TypeChecker_collect_called_funcs(self, program.funcs.get(at).body, &mut called);
                 var c: i64 = 0;
                 while c < called.len() {
                     work.push(called.get(c));
@@ -1808,7 +1839,7 @@ fn TypeChecker_verify_no_races(self: &mut TypeChecker, program: Program) {
         if str_vec_contains(reached, func) {
             var called: Vec<str> = Vec::new();
             var at: i64 = tc_find_func(program, func);
-            if at >= 0 { TypeChecker_collect_called_funcs(self, program.funcs.get(at).body, called); }
+            if at >= 0 { TypeChecker_collect_called_funcs(self, program.funcs.get(at).body, &mut called); }
             var locked: bool = false;
             var c: i64 = 0;
             while c < called.len() {
@@ -2105,7 +2136,7 @@ pub fn TypeChecker_compute_func_effects(self: &mut TypeChecker, program: Program
             pi = pi + 1;
         }
         var effects: Vec<str> = Vec::new();
-        TypeChecker_scan_stmts_for_effects(self, func.body, effects);
+        TypeChecker_scan_stmts_for_effects(self, func.body, &mut effects);
         // Add conservative effects from function-typed params.
         pi = 0;
         while pi < func.params.len() {
@@ -2148,7 +2179,7 @@ pub fn TypeChecker_compute_func_effects(self: &mut TypeChecker, program: Program
                 pi = pi + 1;
             }
             var effects: Vec<str> = Vec::new();
-            TypeChecker_scan_stmts_for_effects(self, method.body, effects);
+            TypeChecker_scan_stmts_for_effects(self, method.body, &mut effects);
             pi = 0;
             while pi < method.params.len() {
                 var param: Param = method.params.get(pi);
@@ -2187,7 +2218,7 @@ pub fn TypeChecker_compute_func_effects(self: &mut TypeChecker, program: Program
             match body_opt {
                 OptStmtList::Some(body) => {
                     var new_effects: Vec<str> = Vec::new();
-                    TypeChecker_scan_stmts_for_effects(self, body, new_effects);
+                    TypeChecker_scan_stmts_for_effects(self, body, &mut new_effects);
                     // Check if new_effects has any effect not already in func_effects for this name
                     var existing: Vec<str> = TypeChecker_get_func_effects(self, fname);
                     var has_new: bool = false;
@@ -2468,7 +2499,7 @@ fn TypeChecker_has_func(self: &TypeChecker, name: str) -> bool {
 // (p_*) and printing.
 fn tc_conserve_calls(f: Func) -> Vec<str> {
     var raw: Vec<str> = Vec::new();
-    scan_stmts_for_calls(f.body, raw);
+    scan_stmts_for_calls(f.body, &mut raw);
     var out: Vec<str> = Vec::new();
     var i: i64 = 0;
     while i < raw.len() {
@@ -2537,7 +2568,7 @@ pub fn TypeChecker_verify_gas(self: &mut TypeChecker, program: Program) {
     var fi: i64 = 0;
     while fi < program.funcs.len() {
         var func: Func = program.funcs.get(fi);
-        gas_collect(func, func.name, names, bodies, limit_names, limits);
+        gas_collect(func, func.name, &mut names, &mut bodies, &mut limit_names, &mut limits);
         fi = fi + 1;
     }
     var ii: i64 = 0;
@@ -2545,7 +2576,7 @@ pub fn TypeChecker_verify_gas(self: &mut TypeChecker, program: Program) {
         var imp: ImplDef = program.impls.get(ii);
         var mi: i64 = 0;
         while mi < imp.methods.len() {
-            gas_collect(imp.methods.get(mi), imp.struct_name + "_" + imp.methods.get(mi).name, names, bodies, limit_names, limits);
+            gas_collect(imp.methods.get(mi), imp.struct_name + "_" + imp.methods.get(mi).name, &mut names, &mut bodies, &mut limit_names, &mut limits);
             mi = mi + 1;
         }
         ii = ii + 1;
@@ -2555,7 +2586,7 @@ pub fn TypeChecker_verify_gas(self: &mut TypeChecker, program: Program) {
         var timp: TraitImpl = program.trait_impls.get(ti);
         var tmi: i64 = 0;
         while tmi < timp.methods.len() {
-            gas_collect(timp.methods.get(tmi), timp.type_name + "_" + timp.methods.get(tmi).name, names, bodies, limit_names, limits);
+            gas_collect(timp.methods.get(tmi), timp.type_name + "_" + timp.methods.get(tmi).name, &mut names, &mut bodies, &mut limit_names, &mut limits);
             tmi = tmi + 1;
         }
         ti = ti + 1;
@@ -2566,7 +2597,7 @@ pub fn TypeChecker_verify_gas(self: &mut TypeChecker, program: Program) {
     while li < limit_names.len() {
         var lname: str = limit_names.get(li);
         var visited: Vec<str> = Vec::new();
-        var total: i64 = gas_total(lname, names, bodies, visited, cache_names, cache_vals);
+        var total: i64 = gas_total(lname, names, bodies, &mut visited, &mut cache_names, &mut cache_vals);
         if total > limits.get(li) {
             var own: i64 = gas_own(lname, names, bodies);
             self.errors.push("Gas error: function '" + lname + "' has @gas(" + int_to_str(limits.get(li)) + ") but total gas cost is " + int_to_str(total) + " (own: " + int_to_str(own) + " + callees: " + int_to_str(total - own) + ").");
@@ -2575,7 +2606,7 @@ pub fn TypeChecker_verify_gas(self: &mut TypeChecker, program: Program) {
     }
 }
 
-fn gas_collect(func: Func, name: str, names: Vec<str>, bodies: Vec<StmtList>, limit_names: Vec<str>, limits: Vec<i64>) {
+fn gas_collect(func: Func, name: str, names: &mut Vec<str>, bodies: &mut Vec<StmtList>, limit_names: &mut Vec<str>, limits: &mut Vec<i64>) {
     names.push(name);
     bodies.push(func.body);
     var ai: i64 = 0;
@@ -2609,7 +2640,7 @@ fn gas_own(name: str, names: Vec<str>, bodies: Vec<StmtList>) -> i64 {
 
 /// Own cost plus the (memoized) totals of the distinct callees; a callee
 /// already on the current path counts only its own cost (cycles).
-fn gas_total(name: str, names: Vec<str>, bodies: Vec<StmtList>, visited: Vec<str>, cache_names: Vec<str>, cache_vals: Vec<i64>) -> i64 {
+fn gas_total(name: str, names: Vec<str>, bodies: Vec<StmtList>, visited: &mut Vec<str>, cache_names: &mut Vec<str>, cache_vals: &mut Vec<i64>) -> i64 {
     var ci: i64 = gas_index(name, cache_names);
     if ci >= 0 { return cache_vals.get(ci); }
     if gas_index(name, visited) >= 0 { return gas_own(name, names, bodies); }
@@ -2619,7 +2650,7 @@ fn gas_total(name: str, names: Vec<str>, bodies: Vec<StmtList>, visited: Vec<str
     var idx: i64 = gas_index(name, names);
     if idx >= 0 {
         var calls: Vec<str> = Vec::new();
-        scan_stmts_for_calls(bodies.get(idx), calls);
+        scan_stmts_for_calls(bodies.get(idx), &mut calls);
         var seen: Vec<str> = Vec::new();
         var k: i64 = 0;
         while k < calls.len() {
@@ -2834,7 +2865,7 @@ pub fn TypeChecker_verify_safety_annotations(self: &mut TypeChecker, program: Pr
     while cgi < func_names.len() {
         var body: Vec<Stmt> = func_bodies.get(cgi);
         var calls: Vec<str> = Vec::new();
-        scan_stmts_for_calls(body, calls);
+        scan_stmts_for_calls(body, &mut calls);
         cg_names.push(func_names.get(cgi));
         cg_offsets.push(cg_calls.len());
         var cli: i64 = 0;
@@ -2895,7 +2926,7 @@ pub fn TypeChecker_verify_safety_annotations(self: &mut TypeChecker, program: Pr
                     var root_i: i64 = HashMap_get(index2, func_names.get(bsi)) - 1;
                     var memo_names: Vec<str> = Vec::new();
                     var memo_vals: Vec<i64> = Vec::new();
-                    var depth: i64 = bs_depth(root_i, cg_names, cg_calls, cg_offsets, index2, leaves, memo_names, memo_vals);
+                    var depth: i64 = bs_depth(root_i, cg_names, cg_calls, cg_offsets, index2, leaves, &mut memo_names, &mut memo_vals);
                     if depth > bound {
                         self.errors.push("Safety error (bounded-stack): function '" + func_names.get(bsi)
                             + "' is @bounded-stack(" + int_to_str(bound) + ") but its deepest static call chain is "
@@ -2913,7 +2944,7 @@ pub fn TypeChecker_verify_safety_annotations(self: &mut TypeChecker, program: Pr
 /// bounded_stack_violation_fd — i.e. proven acyclic — so a memoized DFS is
 /// safe. Mirrors src/typechecker.rs::safety_call_depth.
 fn bs_depth(node: i64, cg_names: Vec<str>, cg_calls: Vec<str>, cg_offsets: Vec<i64>,
-            index: i64, leaves: Vec<str>, memo_names: Vec<str>, memo_vals: Vec<i64>) -> i64 {
+            index: i64, leaves: Vec<str>, memo_names: &mut Vec<str>, memo_vals: &mut Vec<i64>) -> i64 {
     var name: str = cg_names.get(node);
     var mi: i64 = 0;
     while mi < memo_names.len() {
@@ -2921,7 +2952,7 @@ fn bs_depth(node: i64, cg_names: Vec<str>, cg_calls: Vec<str>, cg_offsets: Vec<i
         mi = mi + 1;
     }
     var err: Vec<str> = Vec::new();
-    var edges: Vec<i64> = bs_edges(node, cg_names, cg_calls, cg_offsets, index, leaves, err);
+    var edges: Vec<i64> = bs_edges(node, cg_names, cg_calls, cg_offsets, index, leaves, &mut err);
     var best: i64 = 0;
     var i: i64 = 0;
     while i < edges.len() {
@@ -2938,7 +2969,7 @@ fn bs_depth(node: i64, cg_names: Vec<str>, cg_calls: Vec<str>, cg_offsets: Vec<i
 /// recorded by its bare name, reaches every method of that name), as indexes.
 /// An indirect call or an unknown target goes into `err`.
 fn bs_edges(node: i64, cg_names: Vec<str>, cg_calls: Vec<str>, cg_offsets: Vec<i64>, index: i64,
-            leaves: Vec<str>, err: Vec<str>) -> Vec<i64> {
+            leaves: Vec<str>, err: &mut Vec<str>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var end: i64 = cg_calls.len();
     if node + 1 < cg_offsets.len() { end = cg_offsets.get(node + 1); }
@@ -2992,7 +3023,7 @@ fn bounded_stack_violation_fd(root: str, cg_names: Vec<str>, cg_calls: Vec<str>,
     var path_node: Vec<i64> = Vec::new();
     var path_edges: Vec<Vec<i64>> = Vec::new();
     var path_pos: Vec<i64> = Vec::new();
-    var first: Vec<i64> = bs_edges(root_i, cg_names, cg_calls, cg_offsets, index, leaves, err);
+    var first: Vec<i64> = bs_edges(root_i, cg_names, cg_calls, cg_offsets, index, leaves, &mut err);
     if err.len() > 0 { return err.get(0) + " (in '" + root + "')"; }
     // Depth first: a function on the current path, reached again, is a cycle
     state.set(root_i, 1);
@@ -3008,7 +3039,7 @@ fn bounded_stack_violation_fd(root: str, cg_names: Vec<str>, cg_calls: Vec<str>,
             var nx: i64 = es.get(pos);
             if state.get(nx) == 1 { return "can recurse through '" + cg_names.get(nx) + "'"; }
             if state.get(nx) == 0 {
-                var next_edges: Vec<i64> = bs_edges(nx, cg_names, cg_calls, cg_offsets, index, leaves, err);
+                var next_edges: Vec<i64> = bs_edges(nx, cg_names, cg_calls, cg_offsets, index, leaves, &mut err);
                 if err.len() > 0 { return err.get(0) + " (in '" + cg_names.get(nx) + "')"; }
                 state.set(nx, 1);
                 path_node.push(nx);
@@ -3051,7 +3082,7 @@ fn is_in_call_cycle_fd(target: str, cg_names: Vec<str>, cg_calls: Vec<str>, cg_o
         if callee != target {
             // DFS from callee to target
             var visited: Vec<str> = Vec::new();
-            if dfs_reaches_fd(callee, target, cg_names, cg_calls, cg_offsets, visited) {
+            if dfs_reaches_fd(callee, target, cg_names, cg_calls, cg_offsets, &mut visited) {
                 return true;
             }
         }
@@ -3060,7 +3091,7 @@ fn is_in_call_cycle_fd(target: str, cg_names: Vec<str>, cg_calls: Vec<str>, cg_o
     return false;
 }
 
-fn dfs_reaches_fd(node: str, target: str, cg_names: Vec<str>, cg_calls: Vec<str>, cg_offsets: Vec<i64>, visited: Vec<str>) -> bool {
+fn dfs_reaches_fd(node: str, target: str, cg_names: Vec<str>, cg_calls: Vec<str>, cg_offsets: Vec<i64>, visited: &mut Vec<str>) -> bool {
     if node == target { return true; }
     // Check visited
     var vi: i64 = 0;
@@ -3268,7 +3299,7 @@ pub fn check_safety_body(
 
     // Collect all calls in the body
     var calls: Vec<str> = Vec::new();
-    scan_stmts_for_calls(body, calls);
+    scan_stmts_for_calls(body, &mut calls);
 
     // Alloc functions (forbidden by @no-alloc)
     var alloc_funcs: Vec<str> = Vec::new();
@@ -3393,7 +3424,7 @@ pub fn check_safety_body(
     // @no-panic: check for division/modulo (division by zero risk)
     if has_primitive(prims, "no-panic") {
         var div_sites: Vec<str> = Vec::new();
-        scan_for_division(body, div_sites);
+        scan_for_division(body, &mut div_sites);
         var di: i64 = 0;
         while di < div_sites.len() {
             errs.push("Safety error (" + label + "): function '" + func_name + "' uses '" + div_sites.get(di) + "'.\n    Division/modulo by zero aborts at runtime.\n    Crashfree functions cannot use '" + div_sites.get(di) + "' unless the divisor is proven non-zero.\n    Fix: use a checked-divide helper, or remove the safety annotation.");
@@ -3412,7 +3443,7 @@ pub fn check_safety_body(
         }
         var risk_lines: Vec<i64> = Vec::new();
         var risk_msgs: Vec<str> = Vec::new();
-        scan_for_panic_risks(body, wrapping, risk_lines, risk_msgs);
+        scan_for_panic_risks(body, wrapping, &mut risk_lines, &mut risk_msgs);
         var rk: i64 = 0;
         while rk < risk_lines.len() {
             errs.push("Safety error (" + label + ") (line " + int_to_str(risk_lines.get(rk)) + "): function '" + func_name + "' " + risk_msgs.get(rk) + ".\n    Crashfree functions must never panic.");
@@ -3423,7 +3454,7 @@ pub fn check_safety_body(
     // @no-unbounded: check for while loops
     if has_primitive(prims, "no-unbounded") {
         var while_sites: Vec<i64> = Vec::new();
-        scan_for_while_loops(body, while_sites);
+        scan_for_while_loops(body, &mut while_sites);
         var wi: i64 = 0;
         while wi < while_sites.len() {
             errs.push("Safety error (" + label + ") (line " + int_to_str(while_sites.get(wi)) + "): function '" + func_name + "' is @no-unbounded but uses a 'while' loop.\n    While loops are unbounded — use 'for' loops over finite ranges/arrays.\n    Fix: replace 'while cond { ... }' with 'for i in 0..N { ... }', or remove the safety annotation.");
@@ -3446,7 +3477,7 @@ pub fn tc_vec_contains_str(v: Vec<str>, s: str) -> bool {
 
 // --- Call scanning helpers ---
 
-pub fn scan_stmts_for_calls(stmts: Vec<Stmt>, calls: Vec<str>) {
+pub fn scan_stmts_for_calls(stmts: Vec<Stmt>, calls: &mut Vec<str>) {
     var i: i64 = 0;
     while i < stmts.len() {
         scan_stmt_for_calls(stmts.get(i), calls);
@@ -3454,7 +3485,7 @@ pub fn scan_stmts_for_calls(stmts: Vec<Stmt>, calls: Vec<str>) {
     }
 }
 
-pub fn scan_stmt_for_calls(stmt: Stmt, calls: Vec<str>) {
+pub fn scan_stmt_for_calls(stmt: Stmt, calls: &mut Vec<str>) {
     match stmt {
         Stmt::Let(_, _, expr, _, _, _, _) => { scan_expr_for_calls(expr, calls); }
         Stmt::LetTuple(_, expr, _) => { scan_expr_for_calls(expr, calls); }
@@ -3536,7 +3567,7 @@ pub fn scan_stmt_for_calls(stmt: Stmt, calls: Vec<str>) {
     }
 }
 
-pub fn scan_expr_for_calls(expr: Expr, calls: Vec<str>) {
+pub fn scan_expr_for_calls(expr: Expr, calls: &mut Vec<str>) {
     match expr {
         Expr::Call(callee, args) => {
             calls.push(callee);
@@ -3644,10 +3675,10 @@ pub fn scan_expr_for_calls(expr: Expr, calls: Vec<str>) {
 // arithmetic (overflow). One (line, what) per site. Inside
 // `for i in 0..v.len()`, `v[i]` / `v.get(i)` / `v.set(i, ..)` are in bounds
 // (unless the body reassigns `i` or resizes `v`).
-pub fn scan_for_panic_risks(stmts: Vec<Stmt>, wrapping: bool, lines: Vec<i64>, msgs: Vec<str>) {
+pub fn scan_for_panic_risks(stmts: Vec<Stmt>, wrapping: bool, lines: &mut Vec<i64>, msgs: &mut Vec<str>) {
     var safe_idx: Vec<str> = Vec::new();
     var safe_vec: Vec<str> = Vec::new();
-    pr_stmts(stmts, wrapping, safe_idx, safe_vec, lines, msgs);
+    pr_stmts(stmts, wrapping, &mut safe_idx, &mut safe_vec, lines, msgs);
 }
 
 // `a`, `a.b.c`: the textual path of a place ("" if it is not one).
@@ -3769,7 +3800,7 @@ fn pr_in_bounds(safe_idx: Vec<str>, safe_vec: Vec<str>, vec: Expr, index: Expr) 
     return false;
 }
 
-fn pr_push(lines: Vec<i64>, msgs: Vec<str>, line: i64, what: str) {
+fn pr_push(lines: &mut Vec<i64>, msgs: &mut Vec<str>, line: i64, what: str) {
     var k: i64 = 0;
     while k < lines.len() {
         if lines.get(k) == line && msgs.get(k) == what { return; }
@@ -3779,7 +3810,7 @@ fn pr_push(lines: Vec<i64>, msgs: Vec<str>, line: i64, what: str) {
     msgs.push(what);
 }
 
-fn pr_stmts(stmts: Vec<Stmt>, wrapping: bool, safe_idx: Vec<str>, safe_vec: Vec<str>, lines: Vec<i64>, msgs: Vec<str>) {
+fn pr_stmts(stmts: Vec<Stmt>, wrapping: bool, safe_idx: &mut Vec<str>, safe_vec: &mut Vec<str>, lines: &mut Vec<i64>, msgs: &mut Vec<str>) {
     var k: i64 = 0;
     while k < stmts.len() {
         var s: Stmt = stmts.get(k);
@@ -3882,7 +3913,7 @@ fn pr_is_int_lit(e: Expr) -> bool {
     return false;
 }
 
-fn pr_exprs(es: Vec<Expr>, wrapping: bool, safe_idx: Vec<str>, safe_vec: Vec<str>, line: i64, lines: Vec<i64>, msgs: Vec<str>) {
+fn pr_exprs(es: Vec<Expr>, wrapping: bool, safe_idx: &mut Vec<str>, safe_vec: &mut Vec<str>, line: i64, lines: &mut Vec<i64>, msgs: &mut Vec<str>) {
     var k: i64 = 0;
     while k < es.len() {
         pr_expr(es.get(k), wrapping, safe_idx, safe_vec, line, lines, msgs);
@@ -3890,7 +3921,7 @@ fn pr_exprs(es: Vec<Expr>, wrapping: bool, safe_idx: Vec<str>, safe_vec: Vec<str
     }
 }
 
-fn pr_expr(e: Expr, wrapping: bool, safe_idx: Vec<str>, safe_vec: Vec<str>, line: i64, lines: Vec<i64>, msgs: Vec<str>) {
+fn pr_expr(e: Expr, wrapping: bool, safe_idx: &mut Vec<str>, safe_vec: &mut Vec<str>, line: i64, lines: &mut Vec<i64>, msgs: &mut Vec<str>) {
     match e {
         Expr::Index(a, x) => {
             var arr: Expr = box_expr_deref(a);
@@ -3992,7 +4023,7 @@ fn pr_expr(e: Expr, wrapping: bool, safe_idx: Vec<str>, safe_vec: Vec<str>, line
     }
 }
 
-pub fn scan_for_division(stmts: Vec<Stmt>, sites: Vec<str>) {
+pub fn scan_for_division(stmts: Vec<Stmt>, sites: &mut Vec<str>) {
     var i: i64 = 0;
     while i < stmts.len() {
         scan_stmt_for_division(stmts.get(i), sites);
@@ -4000,7 +4031,7 @@ pub fn scan_for_division(stmts: Vec<Stmt>, sites: Vec<str>) {
     }
 }
 
-pub fn scan_stmt_for_division(stmt: Stmt, sites: Vec<str>) {
+pub fn scan_stmt_for_division(stmt: Stmt, sites: &mut Vec<str>) {
     match stmt {
         Stmt::Let(_, _, expr, _, _, _, _) => { scan_expr_for_division(expr, sites); }
         Stmt::LetTuple(_, expr, _) => { scan_expr_for_division(expr, sites); }
@@ -4069,7 +4100,7 @@ pub fn scan_stmt_for_division(stmt: Stmt, sites: Vec<str>) {
     }
 }
 
-pub fn scan_stmts_for_division(stmts: Vec<Stmt>, sites: Vec<str>) {
+pub fn scan_stmts_for_division(stmts: Vec<Stmt>, sites: &mut Vec<str>) {
     var i: i64 = 0;
     while i < stmts.len() {
         scan_stmt_for_division(stmts.get(i), sites);
@@ -4077,7 +4108,7 @@ pub fn scan_stmts_for_division(stmts: Vec<Stmt>, sites: Vec<str>) {
     }
 }
 
-pub fn scan_expr_for_division(expr: Expr, sites: Vec<str>) {
+pub fn scan_expr_for_division(expr: Expr, sites: &mut Vec<str>) {
     match expr {
         Expr::Binary(op, left, right) => {
             var is_div: bool = false;
@@ -4193,7 +4224,7 @@ pub fn scan_expr_for_division(expr: Expr, sites: Vec<str>) {
 
 // --- While loop scanning helpers ---
 
-pub fn scan_for_while_loops(stmts: Vec<Stmt>, sites: Vec<i64>) {
+pub fn scan_for_while_loops(stmts: Vec<Stmt>, sites: &mut Vec<i64>) {
     var i: i64 = 0;
     while i < stmts.len() {
         scan_stmt_for_while(stmts.get(i), sites);
@@ -4201,7 +4232,7 @@ pub fn scan_for_while_loops(stmts: Vec<Stmt>, sites: Vec<i64>) {
     }
 }
 
-pub fn scan_stmt_for_while(stmt: Stmt, sites: Vec<i64>) {
+pub fn scan_stmt_for_while(stmt: Stmt, sites: &mut Vec<i64>) {
     match stmt {
         Stmt::While(cond, body, line) => {
             sites.push(line);
@@ -4248,7 +4279,7 @@ pub fn scan_stmt_for_while(stmt: Stmt, sites: Vec<i64>) {
     }
 }
 
-pub fn scan_stmts_for_while(stmts: Vec<Stmt>, sites: Vec<i64>) {
+pub fn scan_stmts_for_while(stmts: Vec<Stmt>, sites: &mut Vec<i64>) {
     var i: i64 = 0;
     while i < stmts.len() {
         scan_stmt_for_while(stmts.get(i), sites);
@@ -4256,7 +4287,7 @@ pub fn scan_stmts_for_while(stmts: Vec<Stmt>, sites: Vec<i64>) {
     }
 }
 
-pub fn scan_expr_for_while(expr: Expr, sites: Vec<i64>) {
+pub fn scan_expr_for_while(expr: Expr, sites: &mut Vec<i64>) {
     match expr {
         Expr::Binary(_, left, right) => {
             scan_expr_for_while(box_expr_unbox(left), sites);
@@ -4345,7 +4376,7 @@ pub fn TypeChecker_verify_constant_time(self: &mut TypeChecker, program: Program
             }
             // Only other @constant_time functions (and runtime builtins) may be called.
             var calls: Vec<str> = Vec::new();
-            scan_stmts_for_calls(func.body, calls);
+            scan_stmts_for_calls(func.body, &mut calls);
             var ki: i64 = 0;
             while ki < calls.len() {
                 var called: str = calls.get(ki);
@@ -4360,7 +4391,7 @@ pub fn TypeChecker_verify_constant_time(self: &mut TypeChecker, program: Program
                 ki = ki + 1;
             }
             var ret_lines: Vec<i64> = Vec::new();
-            ct_scan_early_returns(func.body, ret_lines);
+            ct_scan_early_returns(func.body, &mut ret_lines);
             var ri: i64 = 0;
             while ri < ret_lines.len() {
                 self.errors.push("Security error (constant_time) (line " + int_to_str(ret_lines.get(ri)) + "): function '" + func.name + "' has an early return.");
@@ -4368,7 +4399,7 @@ pub fn TypeChecker_verify_constant_time(self: &mut TypeChecker, program: Program
             }
             var out_lines: Vec<i64> = Vec::new();
             var out_msgs: Vec<str> = Vec::new();
-            ct_secret_dependence(func, out_lines, out_msgs);
+            ct_secret_dependence(func, &mut out_lines, &mut out_msgs);
             var oi: i64 = 0;
             while oi < out_lines.len() {
                 self.errors.push("Security error (constant_time) (line " + int_to_str(out_lines.get(oi)) + "): function '" + func.name + "' " + out_msgs.get(oi) + ".");
@@ -4389,7 +4420,7 @@ fn ct_has_annotation(anns: Vec<Annotation>, name: str) -> bool {
 }
 
 // Any `return` inside a branch or loop, or before the last statement.
-fn ct_scan_early_returns(stmts: Vec<Stmt>, lines: Vec<i64>) {
+fn ct_scan_early_returns(stmts: Vec<Stmt>, lines: &mut Vec<i64>) {
     var i: i64 = 0;
     while i < stmts.len() {
         var s: Stmt = stmts.get(i);
@@ -4403,7 +4434,7 @@ fn ct_scan_early_returns(stmts: Vec<Stmt>, lines: Vec<i64>) {
     }
 }
 
-fn ct_scan_nested_returns(s: Stmt, lines: Vec<i64>) {
+fn ct_scan_nested_returns(s: Stmt, lines: &mut Vec<i64>) {
     match s {
         Stmt::Return(_, line) => { lines.push(line); }
         Stmt::If(_, then_block, else_block, _) => {
@@ -4431,7 +4462,7 @@ fn ct_scan_nested_returns(s: Stmt, lines: Vec<i64>) {
     }
 }
 
-fn ct_scan_nested_returns_all(stmts: Vec<Stmt>, lines: Vec<i64>) {
+fn ct_scan_nested_returns_all(stmts: Vec<Stmt>, lines: &mut Vec<i64>) {
     var i: i64 = 0;
     while i < stmts.len() {
         ct_scan_nested_returns(stmts.get(i), lines);
@@ -4442,7 +4473,7 @@ fn ct_scan_nested_returns_all(stmts: Vec<Stmt>, lines: Vec<i64>) {
 // Secret-dependent timing: one (line, what) per branch, loop, short-circuit,
 // memory index or division whose operand depends on a parameter not marked
 // @public. Lengths (`x.len()`) are public.
-fn ct_secret_dependence(func: Func, out_lines: Vec<i64>, out_msgs: Vec<str>) {
+fn ct_secret_dependence(func: Func, out_lines: &mut Vec<i64>, out_msgs: &mut Vec<str>) {
     var secret: Vec<str> = Vec::new();
     var pi: i64 = 0;
     while pi < func.params.len() {
@@ -4454,12 +4485,12 @@ fn ct_secret_dependence(func: Func, out_lines: Vec<i64>, out_msgs: Vec<str>) {
     var before: i64 = -1;
     while before != secret.len() {
         before = secret.len();
-        ct_propagate(func.body, secret);
+        ct_propagate(func.body, &mut secret);
     }
     ct_check_stmts(func.body, secret, out_lines, out_msgs);
 }
 
-fn ct_mark(secret: Vec<str>, name: str) {
+fn ct_mark(secret: &mut Vec<str>, name: str) {
     if !str_vec_contains(secret, name) { secret.push(name); }
 }
 
@@ -4575,7 +4606,7 @@ fn ct_base(e: Expr) -> str {
     return "";
 }
 
-fn ct_propagate(stmts: Vec<Stmt>, secret: Vec<str>) {
+fn ct_propagate(stmts: Vec<Stmt>, secret: &mut Vec<str>) {
     var i: i64 = 0;
     while i < stmts.len() {
         var s: Stmt = stmts.get(i);
@@ -4656,7 +4687,7 @@ fn ct_propagate(stmts: Vec<Stmt>, secret: Vec<str>) {
     }
 }
 
-fn ct_push(out_lines: Vec<i64>, out_msgs: Vec<str>, line: i64, what: str) {
+fn ct_push(out_lines: &mut Vec<i64>, out_msgs: &mut Vec<str>, line: i64, what: str) {
     var i: i64 = 0;
     while i < out_lines.len() {
         if out_lines.get(i) == line && out_msgs.get(i) == what { return; }
@@ -4666,7 +4697,7 @@ fn ct_push(out_lines: Vec<i64>, out_msgs: Vec<str>, line: i64, what: str) {
     out_msgs.push(what);
 }
 
-fn ct_check_stmts(stmts: Vec<Stmt>, secret: Vec<str>, out_lines: Vec<i64>, out_msgs: Vec<str>) {
+fn ct_check_stmts(stmts: Vec<Stmt>, secret: Vec<str>, out_lines: &mut Vec<i64>, out_msgs: &mut Vec<str>) {
     var i: i64 = 0;
     while i < stmts.len() {
         var s: Stmt = stmts.get(i);
@@ -4741,7 +4772,7 @@ fn ct_check_stmts(stmts: Vec<Stmt>, secret: Vec<str>, out_lines: Vec<i64>, out_m
     }
 }
 
-fn ct_check_exprs(es: Vec<Expr>, secret: Vec<str>, line: i64, out_lines: Vec<i64>, out_msgs: Vec<str>) {
+fn ct_check_exprs(es: Vec<Expr>, secret: Vec<str>, line: i64, out_lines: &mut Vec<i64>, out_msgs: &mut Vec<str>) {
     var i: i64 = 0;
     while i < es.len() {
         ct_check_expr(es.get(i), secret, line, out_lines, out_msgs);
@@ -4749,7 +4780,7 @@ fn ct_check_exprs(es: Vec<Expr>, secret: Vec<str>, line: i64, out_lines: Vec<i64
     }
 }
 
-fn ct_check_expr(e: Expr, secret: Vec<str>, line: i64, out_lines: Vec<i64>, out_msgs: Vec<str>) {
+fn ct_check_expr(e: Expr, secret: Vec<str>, line: i64, out_lines: &mut Vec<i64>, out_msgs: &mut Vec<str>) {
     match e {
         Expr::Binary(op, l, r) => {
             var left: Expr = box_expr_deref(l);
@@ -4878,9 +4909,9 @@ pub fn TypeChecker_verify_realtime(self: &mut TypeChecker, program: Program) {
             // Calls that allocate, block, spawn, dispatch dynamically or
             // recurse (src/typechecker.rs verify_realtime rules 1-5).
             var calls: Vec<str> = Vec::new();
-            scan_stmts_for_calls(func.body, calls);
+            scan_stmts_for_calls(func.body, &mut calls);
             var while_sites: Vec<i64> = Vec::new();
-            scan_for_while_loops(func.body, while_sites);
+            scan_for_while_loops(func.body, &mut while_sites);
             if while_sites.len() > 0 {
                 self.errors.push("Real-time error: function '" + func.name + "' contains a 'while' loop. While loops have unbounded iteration counts.");
             }
@@ -4931,7 +4962,7 @@ pub fn TypeChecker_verify_differentiable(self: &mut TypeChecker, program: Progra
 }
 
 /// The body of the function or (unmangled) method `name`, if any.
-fn tc_body_by_name(program: Program, name: str, out: Vec<StmtList>) -> bool {
+fn tc_body_by_name(program: Program, name: str, out: &mut Vec<StmtList>) -> bool {
     var fi: i64 = 0;
     while fi < program.funcs.len() {
         if program.funcs.get(fi).name == name { out.push(program.funcs.get(fi).body); return true; }
@@ -4970,9 +5001,9 @@ fn tc_transitively_calls_dequant(program: Program, start: str) -> bool {
         if !tc_str_vec_contains(visited, cur) {
             visited.push(cur);
             var body: Vec<StmtList> = Vec::new();
-            if tc_body_by_name(program, cur, body) {
+            if tc_body_by_name(program, cur, &mut body) {
                 var calls: Vec<str> = Vec::new();
-                scan_stmts_for_calls(body.get(0), calls);
+                scan_stmts_for_calls(body.get(0), &mut calls);
                 var ci: i64 = 0;
                 while ci < calls.len() {
                     var c: str = calls.get(ci);
@@ -5097,7 +5128,7 @@ pub fn TypeChecker_verify_dp(self: &mut TypeChecker, program: Program) {
         }
         // Build call graph entry for this function
         var calls: Vec<str> = Vec::new();
-        scan_stmts_for_calls(func.body, calls);
+        scan_stmts_for_calls(func.body, &mut calls);
         dp_call_names.push(func.name);
         dp_call_offsets.push(dp_call_flat.len());
         var ci: i64 = 0;
@@ -5133,7 +5164,7 @@ pub fn TypeChecker_verify_dp(self: &mut TypeChecker, program: Program) {
         var declared: f64 = dp_epsilons.get(nri);
         // DFS to sum epsilon of all @dp callees reachable from target
         var visited: Vec<str> = Vec::new();
-        var total: f64 = dp_compute_total_epsilon(target, dp_names, dp_epsilons, dp_call_names, dp_call_offsets, dp_call_flat, visited);
+        var total: f64 = dp_compute_total_epsilon(target, dp_names, dp_epsilons, dp_call_names, dp_call_offsets, dp_call_flat, &mut visited);
         if total > declared {
             self.errors.push("Differential privacy error: function '" + target + "' declares @dp(epsilon=" + float_to_str(declared) + ") but total epsilon across @dp callees is " + float_to_str(total));
         }
@@ -5179,7 +5210,7 @@ fn dp_parse_float(s: str) -> f64 {
 }
 
 // Compute total epsilon (own + transitive @dp callees) via DFS.
-fn dp_compute_total_epsilon(target: str, dp_names: Vec<str>, dp_epsilons: Vec<f64>, cg_names: Vec<str>, cg_offsets: Vec<i64>, cg_calls: Vec<str>, visited: Vec<str>) -> f64 {
+fn dp_compute_total_epsilon(target: str, dp_names: Vec<str>, dp_epsilons: Vec<f64>, cg_names: Vec<str>, cg_offsets: Vec<i64>, cg_calls: Vec<str>, visited: &mut Vec<str>) -> f64 {
     // Check if already visited (cycle)
     var vi: i64 = 0;
     while vi < visited.len() {
@@ -5365,7 +5396,7 @@ pub fn TypeChecker_verify_contracts(self: &mut TypeChecker, program: Program) {
     while k < bodies.len() {
         var callees: Vec<str> = Vec::new();
         var argss: Vec<Vec<Expr>> = Vec::new();
-        cs_stmts(bodies.get(k), callees, argss);
+        cs_stmts(bodies.get(k), &mut callees, &mut argss);
         var ci: i64 = 0;
         while ci < callees.len() {
             var pi: i64 = 0;
@@ -5378,7 +5409,7 @@ pub fn TypeChecker_verify_contracts(self: &mut TypeChecker, program: Program) {
                     var ai: i64 = 0;
                     while ai < pf.params.len() && ai < args.len() {
                         var cv: Vec<i64> = Vec::new();
-                        if ct_eval_int(args.get(ai), Vec::new(), Vec::new(), cv) {
+                        if ct_eval_int(args.get(ai), Vec::new(), Vec::new(), &mut cv) {
                             bnames.push(pf.params.get(ai).name);
                             bvals.push(cv.get(0));
                         }
@@ -5402,7 +5433,7 @@ pub fn TypeChecker_verify_contracts(self: &mut TypeChecker, program: Program) {
 }
 
 /// Collect the direct calls (callee, args) in statements, at any depth.
-fn cs_stmts(stmts: Vec<Stmt>, callees: Vec<str>, argss: Vec<Vec<Expr>>) {
+fn cs_stmts(stmts: Vec<Stmt>, callees: &mut Vec<str>, argss: &mut Vec<Vec<Expr>>) {
     var i: i64 = 0;
     while i < stmts.len() {
         match stmts.get(i) {
@@ -5445,7 +5476,7 @@ fn cs_stmts(stmts: Vec<Stmt>, callees: Vec<str>, argss: Vec<Vec<Expr>>) {
     }
 }
 
-fn cs_exprs(es: Vec<Expr>, callees: Vec<str>, argss: Vec<Vec<Expr>>) {
+fn cs_exprs(es: Vec<Expr>, callees: &mut Vec<str>, argss: &mut Vec<Vec<Expr>>) {
     var i: i64 = 0;
     while i < es.len() {
         cs_expr(es.get(i), callees, argss);
@@ -5453,7 +5484,7 @@ fn cs_exprs(es: Vec<Expr>, callees: Vec<str>, argss: Vec<Vec<Expr>>) {
     }
 }
 
-fn cs_expr(expr: Expr, callees: Vec<str>, argss: Vec<Vec<Expr>>) {
+fn cs_expr(expr: Expr, callees: &mut Vec<str>, argss: &mut Vec<Vec<Expr>>) {
     match expr {
         Expr::Call(callee, args) => {
             callees.push(callee);
@@ -5479,7 +5510,7 @@ fn cs_expr(expr: Expr, callees: Vec<str>, argss: Vec<Vec<Expr>>) {
 }
 
 /// Constant integer value of `expr` under the bindings (pushed to `out`).
-fn ct_eval_int(expr: Expr, bnames: Vec<str>, bvals: Vec<i64>, out: Vec<i64>) -> bool {
+fn ct_eval_int(expr: Expr, bnames: Vec<str>, bvals: Vec<i64>, out: &mut Vec<i64>) -> bool {
     match expr {
         Expr::IntLit(n) => { out.push(n); return true; }
         Expr::Ident(name) => {
@@ -5493,15 +5524,15 @@ fn ct_eval_int(expr: Expr, bnames: Vec<str>, bvals: Vec<i64>, out: Vec<i64>) -> 
         Expr::Unary(op, e) => {
             if unaryop_eq(op, UnaryOp::Neg) {
                 var v: Vec<i64> = Vec::new();
-                if ct_eval_int(box_expr_unbox(e), bnames, bvals, v) { out.push(0 - v.get(0)); return true; }
+                if ct_eval_int(box_expr_unbox(e), bnames, bvals, &mut v) { out.push(0 - v.get(0)); return true; }
             }
             return false;
         }
         Expr::Binary(op, l, r) => {
             var lv: Vec<i64> = Vec::new();
             var rv: Vec<i64> = Vec::new();
-            if !ct_eval_int(box_expr_unbox(l), bnames, bvals, lv) { return false; }
-            if !ct_eval_int(box_expr_unbox(r), bnames, bvals, rv) { return false; }
+            if !ct_eval_int(box_expr_unbox(l), bnames, bvals, &mut lv) { return false; }
+            if !ct_eval_int(box_expr_unbox(r), bnames, bvals, &mut rv) { return false; }
             var a: i64 = lv.get(0);
             var b: i64 = rv.get(0);
             if binop_eq(op, BinOp::Add) { out.push(a + b); return true; }
@@ -5535,8 +5566,8 @@ fn ct_eval_bool(expr: Expr, bnames: Vec<str>, bvals: Vec<i64>) -> i64 {
             }
             var lv: Vec<i64> = Vec::new();
             var rv: Vec<i64> = Vec::new();
-            if !ct_eval_int(box_expr_unbox(l), bnames, bvals, lv) { return -1; }
-            if !ct_eval_int(box_expr_unbox(r), bnames, bvals, rv) { return -1; }
+            if !ct_eval_int(box_expr_unbox(l), bnames, bvals, &mut lv) { return -1; }
+            if !ct_eval_int(box_expr_unbox(r), bnames, bvals, &mut rv) { return -1; }
             var a: i64 = lv.get(0);
             var b: i64 = rv.get(0);
             var res: bool = false;
@@ -5644,6 +5675,14 @@ fn TypeChecker_check_func_body(self: &mut TypeChecker, func: Func) {
             OptString::Some(mod_name) => { self.current_module = mod_name; }
             OptString::None => {}
         }
+        // A synthesized __eq_S belongs to S's module (as a derive expands in
+        // place), so it may read S's private fields
+        if str_starts_with(func.name, "__eq_") {
+            match TypeChecker_get_item_module(self, str_slice(func.name, 5, str_len(func.name))) {
+                OptString::Some(eq_mod) => { self.current_module = eq_mod; }
+                OptString::None => {}
+            }
+        }
     }
     // Reset linear tracking
     var saved_consumed: Vec<str> = self.consumed_vars;
@@ -5651,8 +5690,41 @@ fn TypeChecker_check_func_body(self: &mut TypeChecker, func: Func) {
     self.consumed_vars = empty_consumed;
     TypeChecker_push_scope(self);
     // Track type parameters
+    var saved_vp_names: Vec<str> = self.value_param_names;
+    var saved_vp_types: Vec<Type> = self.value_param_types;
+    var vp_names: Vec<str> = Vec::new();
+    var vp_types: Vec<Type> = Vec::new();
+    var vpi: i64 = 0;
+    while vpi < func.params.len() {
+        var vpt: Type = TypeChecker_resolve_type(self, func.params.get(vpi).ty);
+        var aggregate: bool = false;
+        match vpt {
+            Type::Generic(gn, _) => { aggregate = gn == "Vec" || gn == "HashMap"; }
+            Type::Named(nn) => { aggregate = nn == "Vec" || nn == "HashMap" || tc_is_struct(self, nn); }
+            _ => {}
+        }
+        if aggregate && func.params.get(vpi).name != "self" {
+            vp_names.push(func.params.get(vpi).name);
+            vp_types.push(func.params.get(vpi).ty);
+        }
+        vpi = vpi + 1;
+    }
+    self.value_param_names = vp_names;
+    self.value_param_types = vp_types;
+    // (an impl method also sees its impl's: `impl<T> Slot` puts T in scope)
     var saved_tp: Vec<str> = self.current_type_params;
-    self.current_type_params = func.type_params;
+    var tps: Vec<str> = Vec::new();
+    var tpi0: i64 = 0;
+    while tpi0 < saved_tp.len() {
+        tps.push(saved_tp.get(tpi0));
+        tpi0 = tpi0 + 1;
+    }
+    tpi0 = 0;
+    while tpi0 < func.type_params.len() {
+        tps.push(func.type_params.get(tpi0));
+        tpi0 = tpi0 + 1;
+    }
+    self.current_type_params = tps;
     // Track trait bounds
     var saved_bounds: Vec<StringString> = self.current_type_param_bounds;
     var empty_bounds: Vec<StringString> = Vec::new();
@@ -5720,6 +5792,8 @@ fn TypeChecker_check_func_body(self: &mut TypeChecker, func: Func) {
     }
     // Restore state
     self.current_type_params = saved_tp;
+    self.value_param_names = saved_vp_names;
+    self.value_param_types = saved_vp_types;
     self.current_type_param_bounds = saved_bounds;
     TypeChecker_pop_scope(self);
     // A function declared to return a value must not fall off the end of its
@@ -6590,9 +6664,357 @@ pub fn TypeChecker_types_compatible(self: &TypeChecker, declared: Type, actual: 
         }
         _ => {}
     }
-    // Numeric compatibility fallback
+    // Numbers: integers mix (narrowing a value is checked where it is
+    // assigned), an integer becomes a float, but a float never silently
+    // becomes an integer (proposal 0002: `as` says so)
+    if TypeChecker_is_float(self, act) && !TypeChecker_is_float(self, decl) && !type_eq(decl, Type::Infer) { return false; }
     if TypeChecker_is_numeric(self, decl) && TypeChecker_is_numeric(self, act) { return true; }
     return false;
+}
+
+// --- Generic calls (proposal 0002) ----------------------------------------
+
+/// A call to a generic function, as src/typechecker.rs check_generic_call:
+/// type arguments inferred from the arguments (and the expected type for one
+/// only the result mentions), arguments and bounds checked, the call typed
+/// with the instantiated return type.
+fn TypeChecker_check_generic_call(self: &mut TypeChecker, callee: str, tps: Vec<str>, bounds: Vec<StrPair>,
+                                  params: Vec<Type>, ret: Type, arg_types: Vec<Type>, hint: Type) -> Type {
+    var names: Vec<str> = Vec::new();
+    var types: Vec<Type> = Vec::new();
+    var i: i64 = 0;
+    while i < params.len() && i < arg_types.len() {
+        tc_bind_type_params(params.get(i), arg_types.get(i), tps, &mut names, &mut types);
+        i = i + 1;
+    }
+    if !type_eq(hint, Type::Never) && !type_eq(hint, Type::Infer) {
+        tc_bind_type_params(ret, hint, tps, &mut names, &mut types);
+    }
+    var in_fn: str = "";
+    match self.current_func_name {
+        OptString::Some(fname) => { in_fn = ", in '" + fname + "'"; }
+        OptString::None => {}
+    }
+    // An argument of unknown type binds nothing: monomorphization infers from
+    // the values; only a parameter no argument mentions is an error
+    var unknown_arg: bool = false;
+    i = 0;
+    while i < arg_types.len() {
+        if type_eq(arg_types.get(i), Type::Infer) || type_eq(arg_types.get(i), Type::Never) { unknown_arg = true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < tps.len() && !unknown_arg {
+        if !str_vec_contains(names, tps.get(i)) {
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + in_fn + "): cannot infer the type parameter '"
+                + tps.get(i) + "' of '" + callee + "': no argument gives it.\n    Fix: give the result a type, as in `val x: i64 = "
+                + callee + "(...)`.");
+            return Type::Never;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < params.len() && i < arg_types.len() {
+        var pt: Type = tc_subst_type_params(params.get(i), names, types);
+        var a: Type = arg_types.get(i);
+        if !TypeChecker_type_contains_param(self, pt) && !type_eq(a, Type::Infer) && !type_eq(a, Type::Never)
+            && !TypeChecker_arg_compatible(self, pt, a) {
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + in_fn + "): function '" + callee + "' parameter "
+                + int_to_str(i + 1) + " expects '" + type_to_str(pt) + "', got '" + type_to_str(a) + "'");
+        }
+        i = i + 1;
+    }
+    var bi: i64 = 0;
+    while bi < bounds.len() {
+        var tp: str = bounds.get(bi).a;
+        var tr: str = bounds.get(bi).b;
+        bi = bi + 1;
+        var k: i64 = 0;
+        var found: bool = false;
+        var bty: Type = Type::Infer;
+        while k < names.len() {
+            if names.get(k) == tp { bty = types.get(k); found = true; }
+            k = k + 1;
+        }
+        if !found || !TypeChecker_is_trait_name(self, tr) || TypeChecker_satisfies_bound(self, bty, tr) { continue; }
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + in_fn + "): " + type_to_str(bty) + " does not implement "
+            + tr + " (required by " + tp + ": " + tr + " in '" + callee + "').\n    Fix: add `impl " + tr + " for " + type_to_str(bty)
+            + " { ... }`, or pass a value whose type implements it.");
+    }
+    var r: Type = tc_subst_type_params(ret, names, types);
+    if TypeChecker_type_contains_param(self, r) { return Type::Never; }
+    return r;
+}
+
+/// A reference is read through where its value is wanted: the referenced type.
+fn tc_read_through(t: Type) -> Type {
+    match t {
+        Type::Ref(inner, _) => { return box_type_unbox(inner); }
+        _ => { return t; }
+    }
+    return t;
+}
+
+fn tc_is_struct(self: &TypeChecker, name: str) -> bool {
+    match TypeChecker_lookup_struct_cache(self, name) {
+        OptVecStructField::Some(_) => { return true; }
+        OptVecStructField::None => { return false; }
+    }
+    return false;
+}
+
+/// Methods that change their receiver (Vec, HashMap, String).
+fn tc_changing_method(m: str) -> bool {
+    return m == "push" || m == "pop" || m == "set" || m == "insert" || m == "remove" || m == "clear" || m == "extend" || m == "truncate" || m == "reverse" || m == "sort" || m == "resize" || m == "swap" || m == "push_str" || m == "append" || m == "retain" || m == "dedup" || m == "fill" || m == "drain" || m == "sort_by" || m == "push_front" || m == "pop_front";
+}
+
+/// The variable a place expression is part of: `p` for `p`, `p.items`,
+/// `p.items.get(i).name` or `p[i]` ("" for anything else).
+fn tc_place_root(e: Expr) -> str {
+    match e {
+        Expr::Ident(n) => { return n; }
+        Expr::FieldAccess(inner, _) => { return tc_place_root(box_expr_unbox(inner)); }
+        Expr::Index(arr, _) => { return tc_place_root(box_expr_unbox(arr)); }
+        Expr::MethodCall(recv, m, _) => {
+            if m == "get" { return tc_place_root(box_expr_unbox(recv)); }
+            return "";
+        }
+        _ => { return ""; }
+    }
+    return "";
+}
+
+fn TypeChecker_forget_value_param(self: &mut TypeChecker, name: str) {
+    var i: i64 = 0;
+    while i < self.value_param_names.len() {
+        if self.value_param_names.get(i) == name {
+            self.value_param_names.remove(i);
+            self.value_param_types.remove(i);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+/// A by-value Vec/HashMap/struct parameter changed: an error, since the
+/// caller would not see the change (as src/typechecker.rs).
+fn TypeChecker_check_param_change(self: &mut TypeChecker, root: str) {
+    var i: i64 = 0;
+    while i < self.value_param_names.len() {
+        if self.value_param_names.get(i) == root {
+            var ty: Type = self.value_param_types.get(i);
+            var in_fn: str = "";
+            match self.current_func_name {
+                OptString::Some(fname) => { in_fn = " of '" + fname + "'"; }
+                OptString::None => {}
+            }
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): '" + root + "' is a by-value parameter" + in_fn
+                + " and cannot be changed: the caller would not see the change.\n    Fix: take `" + root + ": &mut " + type_to_str(ty)
+                + "` and pass `&mut ...`, or change a copy: `var " + root + " = " + root + ";`.");
+            // one error per parameter
+            TypeChecker_forget_value_param(self, root);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+/// Whether `receiver.method(..)` calls a user method taking `self: &mut T`.
+fn TypeChecker_method_takes_mut_self(self: &TypeChecker, receiver: Expr, method: str) -> bool {
+    var root: str = tc_place_root(receiver);
+    if str_len(root) == 0 { return false; }
+    var i: i64 = 0;
+    while i < self.value_param_names.len() {
+        if self.value_param_names.get(i) == root {
+            match TypeChecker_resolve_type(self, self.value_param_types.get(i)) {
+                Type::Named(sn) => {
+                    var mi: i64 = 0;
+                    while mi < self.methods.len() {
+                        if self.methods.get(mi).key == sn {
+                            var mm: Vec<MethodMapEntry> = self.methods.get(mi).val;
+                            var k: i64 = 0;
+                            while k < mm.len() {
+                                if mm.get(k).key == method && mm.get(k).val.has_self && mm.get(k).val.param_types.len() > 0 {
+                                    match mm.get(k).val.param_types.get(0) {
+                                        Type::Ref(_, is_mut) => { return is_mut; }
+                                        _ => { return false; }
+                                    }
+                                }
+                                k = k + 1;
+                            }
+                        }
+                        mi = mi + 1;
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn TypeChecker_impl_type_params(self: &TypeChecker, name: str) -> Vec<str> {
+    var i: i64 = 0;
+    while i < self.impl_tp_names.len() {
+        if self.impl_tp_names.get(i) == name { return self.impl_tp_lists.get(i); }
+        i = i + 1;
+    }
+    return Vec::new();
+}
+
+fn TypeChecker_is_trait_name(self: &TypeChecker, name: str) -> bool {
+    var i: i64 = 0;
+    while i < self.traits.len() {
+        if self.traits.get(i).key == name { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Whether `ty` implements `tr`: an impl, or a type parameter of the current
+/// function bound by it.
+fn TypeChecker_satisfies_bound(self: &TypeChecker, ty: Type, tr: str) -> bool {
+    var name: str = type_to_str(ty);
+    match ty {
+        Type::Named(n) => { name = n; }
+        Type::Generic(gn, _) => { name = gn; }
+        Type::Infer => { return true; }
+        Type::Never => { return true; }
+        _ => {}
+    }
+    if str_vec_contains(self.impl_pairs, tr + ":" + name) { return true; }
+    var i: i64 = 0;
+    while i < self.current_type_param_bounds.len() {
+        if self.current_type_param_bounds.get(i).key == name && self.current_type_param_bounds.get(i).val == tr { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Bind the type parameters `tps` that `param` mentions from `arg` (the first
+/// binding of each wins), as mono.fd infer_from_pair.
+fn tc_bind_type_params(param: Type, arg: Type, tps: Vec<str>, names: &mut Vec<str>, types: &mut Vec<Type>) {
+    match param {
+        Type::Named(n) => {
+            if str_vec_contains(tps, n) && !str_vec_contains(names, n) && !type_eq(arg, Type::Infer) && !type_eq(arg, Type::Never) {
+                names.push(n);
+                types.push(arg);
+            }
+        }
+        Type::Generic(gn, gargs) => {
+            match arg {
+                Type::Generic(an, aargs) => {
+                    if gn == an {
+                        var i: i64 = 0;
+                        while i < gargs.len() && i < aargs.len() {
+                            tc_bind_type_params(gargs.get(i), aargs.get(i), tps, names, types);
+                            i = i + 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Type::Ref(inner, _) => {
+            match arg {
+                Type::Ref(ainner, _) => { tc_bind_type_params(box_type_unbox(inner), box_type_unbox(ainner), tps, names, types); }
+                _ => {}
+            }
+        }
+        Type::Array(elem, _) => {
+            match arg {
+                Type::Array(aelem, _) => { tc_bind_type_params(box_type_unbox(elem), box_type_unbox(aelem), tps, names, types); }
+                _ => {}
+            }
+        }
+        // A const parameter `[T; N]` takes the array's length (as mono.fd)
+        Type::ArrayConst(celem, size_param) => {
+            match arg {
+                Type::Array(aelem, size) => {
+                    if str_vec_contains(tps, size_param) && !str_vec_contains(names, size_param) {
+                        names.push(size_param);
+                        types.push(Type::Named("__const_" + int_to_str(size)));
+                    }
+                    tc_bind_type_params(box_type_unbox(celem), box_type_unbox(aelem), tps, names, types);
+                }
+                _ => {}
+            }
+        }
+        Type::Tuple(ps) => {
+            match arg {
+                Type::Tuple(aps) => {
+                    var i: i64 = 0;
+                    while i < ps.len() && i < aps.len() {
+                        tc_bind_type_params(ps.get(i), aps.get(i), tps, names, types);
+                        i = i + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Type::Func(fps, fret) => {
+            match arg {
+                Type::Func(aps, aret) => {
+                    var i: i64 = 0;
+                    while i < fps.len() && i < aps.len() {
+                        tc_bind_type_params(fps.get(i), aps.get(i), tps, names, types);
+                        i = i + 1;
+                    }
+                    tc_bind_type_params(box_type_unbox(fret), box_type_unbox(aret), tps, names, types);
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `ty` with its bound type parameters replaced.
+fn tc_subst_type_params(ty: Type, names: Vec<str>, types: Vec<Type>) -> Type {
+    match ty {
+        Type::Named(n) => {
+            var i: i64 = 0;
+            while i < names.len() {
+                if names.get(i) == n { return types.get(i); }
+                i = i + 1;
+            }
+            return ty;
+        }
+        Type::Generic(gn, gargs) => {
+            var out: Vec<Type> = Vec::new();
+            var i: i64 = 0;
+            while i < gargs.len() {
+                out.push(tc_subst_type_params(gargs.get(i), names, types));
+                i = i + 1;
+            }
+            return Type::Generic(gn, out);
+        }
+        Type::Ref(inner, m) => { return Type::Ref(Box::new(tc_subst_type_params(box_type_unbox(inner), names, types)), m); }
+        Type::RawPtr(inner, m) => { return Type::RawPtr(Box::new(tc_subst_type_params(box_type_unbox(inner), names, types)), m); }
+        Type::Array(elem, n) => { return Type::Array(Box::new(tc_subst_type_params(box_type_unbox(elem), names, types)), n); }
+        Type::Tuple(ts) => {
+            var out2: Vec<Type> = Vec::new();
+            var i: i64 = 0;
+            while i < ts.len() {
+                out2.push(tc_subst_type_params(ts.get(i), names, types));
+                i = i + 1;
+            }
+            return Type::Tuple(out2);
+        }
+        Type::Func(fps, fret) => {
+            var out3: Vec<Type> = Vec::new();
+            var i: i64 = 0;
+            while i < fps.len() {
+                out3.push(tc_subst_type_params(fps.get(i), names, types));
+                i = i + 1;
+            }
+            return Type::Func(out3, Box::new(tc_subst_type_params(box_type_unbox(fret), names, types)));
+        }
+        _ => { return ty; }
+    }
+    return ty;
 }
 
 // --- type_contains_param -------------------------------------------------
@@ -7011,7 +7433,7 @@ pub fn TypeChecker_consume_linear_in_expr(self: &mut TypeChecker, expr: Expr, li
             // A closure can be called any number of times, so it must not
             // capture a linear value (each call could use it again).
             var used: Vec<str> = Vec::new();
-            esc_idents_stmts(body, used);
+            esc_idents_stmts(body, &mut used);
             var captured: Vec<str> = Vec::new();
             var ui: i64 = 0;
             while ui < used.len() {
@@ -7082,6 +7504,8 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
     self.current_line = stmt_line(stmt);
     match stmt {
         Stmt::Let(name, ty, expr, is_mut, _, annotations, line) => {
+            // `var v = v;` makes a local copy that may be changed
+            TypeChecker_forget_value_param(self, name);
             // Bidirectional type inference: pass declared type as hint
             var hint: Type = Type::Never;
             match ty {
@@ -7115,10 +7539,10 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             if self.val_vars_per_scope.len() > 0 {
                 var scope: Vec<str> = self.val_vars_per_scope.pop();
                 if is_mut {
-                    str_vec_remove(scope, name);
+                    str_vec_remove(&mut scope, name);
                     scope.push("!" + name);
                 } else {
-                    str_vec_remove(scope, "!" + name);
+                    str_vec_remove(&mut scope, "!" + name);
                     scope.push(name);
                 }
                 self.val_vars_per_scope.push(scope);
@@ -7126,8 +7550,8 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             // Track region: if inside a region block, record the allocation region
             if self.region_stack.len() > 0 {
                 var region: str = self.region_stack.get(self.region_stack.len() - 1);
-                map_str_str_set(self.var_regions, name, region);
-                map_str_str_set(self.var_alloc_lines, name, int_to_str(line));
+                map_str_str_set(&mut self.var_regions, name, region);
+                map_str_str_set(&mut self.var_alloc_lines, name, int_to_str(line));
                 var size: i64 = TypeChecker_type_size(self, final_ty);
                 if self.region_budgets.len() > 0 {
                     var budget: RegionBudget = self.region_budgets.pop();
@@ -7191,7 +7615,13 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
         Stmt::Return(opt_expr, _) => {
             match opt_expr {
                 OptBoxExpr::Some(e) => {
-                    var ret_ty: Type = TypeChecker_check_expr(self, box_expr_unbox(e));
+                    // The declared return type is the expected type
+                    var ret_hint: Type = Type::Never;
+                    match self.current_ret_ty {
+                        OptType::Some(rt) => { ret_hint = TypeChecker_resolve_self_type(self, rt); }
+                        OptType::None => {}
+                    }
+                    var ret_ty: Type = TypeChecker_check_expr_with_hint(self, box_expr_unbox(e), ret_hint);
                     TypeChecker_consume_linear_in_expr(self, box_expr_unbox(e), self.current_line);
                     TypeChecker_check_return_type(self, ret_ty);
                     self.current_return_types.push(ret_ty);
@@ -7316,6 +7746,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             }
         }
         Stmt::IndexAssign(array, index, _, expr, _) => {
+            TypeChecker_check_param_change(self, array);
             TypeChecker_check_expr(self, index);
             TypeChecker_check_expr(self, expr);
             match TypeChecker_lookup(self, array) {
@@ -7333,6 +7764,8 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             TypeChecker_check_expr(self, expr);
         }
         Stmt::FieldAssign(object, field, op, expr, line) => {
+            self.current_line = line;
+            TypeChecker_check_param_change(self, tc_place_root(object));
             var obj_ty: Type = TypeChecker_check_expr(self, object);
             self.current_line = line;
             // Unwrap references
@@ -7534,7 +7967,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             self.region_stack.push(name);
             TypeChecker_push_scope(self);
             self.region_budgets.push(RegionBudget_new(name, budget, 0));
-            map_str_str_set(self.region_lines, name, int_to_str(line));
+            map_str_str_set(&mut self.region_lines, name, int_to_str(line));
             if is_gpu { self.gpu_region_depth = self.gpu_region_depth + 1; }
             if is_kv_cache {
                 match budget {
@@ -7926,6 +8359,17 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             }
             lt = lt_r;
             rt = rt_r;
+            // A str is text: comparing it with a number has no meaning outside
+            // the runtime layer and the compiler, where a str is a word
+            var is_cmp: bool = binop_eq(op, BinOp::Eq) || binop_eq(op, BinOp::Neq) || binop_eq(op, BinOp::Lt)
+                || binop_eq(op, BinOp::Gt) || binop_eq(op, BinOp::LtEq) || binop_eq(op, BinOp::GtEq);
+            if is_cmp && !is_runtime_layer(self.current_module) && !str_starts_with(self.current_module, "compiler")
+                && ((type_eq(lt_r, Type::Str) && TypeChecker_is_numeric(self, rt_r))
+                    || (type_eq(rt_r, Type::Str) && TypeChecker_is_numeric(self, lt_r))) {
+                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): cannot compare a str with a number (" + type_to_str(lt_r)
+                    + " with " + type_to_str(rt_r) + ").\n    `==` on a str compares text. To test a runtime string for null, write `(s as i64) == 0`; to compare with a number, convert one side with `as` or int_to_str.");
+                return Type::Bool;
+            }
             match op {
                 BinOp::Add => {}
                 BinOp::Sub => {}
@@ -8137,6 +8581,29 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                     if arg_types.len() < sig.min_args || arg_types.len() > sig.param_types.len() {
                         self.errors.push("Type error (line " + int_to_str(self.current_line) + "): function '" + callee + "' expects " + int_to_str(sig.min_args) + "-" + int_to_str(sig.param_types.len()) + " args, got " + int_to_str(arg_types.len()));
                     }
+                    var gi: i64 = 0;
+                    while gi < self.func_generic_names.len() {
+                        if self.func_generic_names.get(gi) == callee {
+                            // An integer literal given for a type parameter is an
+                            // i64, not the smallest type that holds it
+                            var gen_args: Vec<Type> = Vec::new();
+                            var gai: i64 = 0;
+                            while gai < arg_types.len() {
+                                var gat: Type = arg_types.get(gai);
+                                if gai < args.len() {
+                                    match args.get(gai) {
+                                        Expr::IntLit(_) => { gat = Type::I64; }
+                                        _ => {}
+                                    }
+                                }
+                                gen_args.push(gat);
+                                gai = gai + 1;
+                            }
+                            return TypeChecker_check_generic_call(self, callee, self.func_generic_tps.get(gi),
+                                self.func_generic_bounds.get(gi), sig.param_types, sig.ret_ty, gen_args, hint);
+                        }
+                        gi = gi + 1;
+                    }
                     // Check every argument (generic parameters are resolved by
                     // monomorphization).
                     var pi: i64 = 0;
@@ -8147,7 +8614,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                         if !TypeChecker_type_contains_param(self, raw_param) && !is_single_upper_name(raw_param)
                             && !(callee == "print" || callee == "println" || callee == "eprint" || callee == "eprintln")
                             && !TypeChecker_arg_compatible(self, param, arg)
-                            && !(is_handle_int_pair(param, arg) && TypeChecker_is_runtime_call(self, callee))
+                            && !(is_handle_int_pair(param, tc_read_through(arg)) && TypeChecker_is_runtime_call(self, callee))
                             && !(str_vec_contains(self.extern_fns, callee) && is_ffi_pointer_pair(param, arg)) {
                             var in_fn: str = "";
                             match self.current_func_name {
@@ -8402,6 +8869,9 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             return last_ty;
         }
         Expr::MethodCall(receiver, method, args) => {
+            if tc_changing_method(method) || TypeChecker_method_takes_mut_self(self, box_expr_unbox(receiver), method) {
+                TypeChecker_check_param_change(self, tc_place_root(box_expr_unbox(receiver)));
+            }
             return TypeChecker_check_method_call(self, box_expr_unbox(receiver), method, args, hint);
         }
         Expr::ArrayLit(elem_type, elements) => {
@@ -8510,6 +8980,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             return Type::Named(enum_name);
         }
         Expr::Ref(e, is_mut) => {
+            if is_mut { TypeChecker_check_param_change(self, tc_place_root(box_expr_unbox(e))); }
             var inner_ty: Type = TypeChecker_check_expr(self, box_expr_unbox(e));
             return Type::Ref(Box::new(inner_ty), is_mut);
         }
@@ -9204,6 +9675,21 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                     while mei < method_map.len() {
                         if method_map.get(mei).key == method {
                             TypeChecker_record_method_call(self, struct_name, method);
+                            // A generic impl's method on a value without type
+                            // arguments (a bare `Option`): the i64 instance, as
+                            // monomorphization picks
+                            var btps: Vec<str> = TypeChecker_impl_type_params(self, struct_name);
+                            if btps.len() > 0 && !tc_str_vec_contains(self.current_type_params, struct_name) {
+                                var bnames: Vec<str> = Vec::new();
+                                var btypes: Vec<Type> = Vec::new();
+                                var bk: i64 = 0;
+                                while bk < btps.len() {
+                                    bnames.push(btps.get(bk));
+                                    btypes.push(Type::I64);
+                                    bk = bk + 1;
+                                }
+                                return tc_subst_type_params(method_map.get(mei).val.ret_ty, bnames, btypes);
+                            }
                             return method_map.get(mei).val.ret_ty;
                         }
                         mei = mei + 1;
@@ -9240,7 +9726,7 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
             }
             self.errors.push("Type error: no method '" + method + "' on struct '" + struct_name + "'");
         }
-        Type::Generic(gen_name, _) => {
+        Type::Generic(gen_name, recv_args) => {
             // Generic type: look up methods by base name
             var mi: i64 = 0;
             while mi < self.methods.len() {
@@ -9249,6 +9735,21 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                     var mei: i64 = 0;
                     while mei < method_map.len() {
                         if method_map.get(mei).key == method {
+                            // `impl<T> Slot` on a Slot<f64>: the method's type with T=f64
+                            var gtps: Vec<str> = TypeChecker_impl_type_params(self, gen_name);
+                            if gtps.len() > 0 {
+                                var gnames: Vec<str> = Vec::new();
+                                var gtypes: Vec<Type> = Vec::new();
+                                var gk: i64 = 0;
+                                while gk < gtps.len() && gk < recv_args.len() {
+                                    gnames.push(gtps.get(gk));
+                                    gtypes.push(recv_args.get(gk));
+                                    gk = gk + 1;
+                                }
+                                var gret: Type = tc_subst_type_params(method_map.get(mei).val.ret_ty, gnames, gtypes);
+                                if TypeChecker_type_contains_param(self, gret) { return Type::Never; }
+                                return gret;
+                            }
                             return method_map.get(mei).val.ret_ty;
                         }
                         mei = mei + 1;
@@ -9480,7 +9981,10 @@ pub fn TypeChecker_arg_compatible(self: &TypeChecker, param: Type, arg: Type) ->
     // HashMap, str or number value is itself the handle or value, and `&v` is
     // a pointer to the variable holding it (mirrors src/typechecker.rs).
     var stripped_any: bool = (p_is_ref != a_is_ref) || is_box_type(p_inner) || is_box_type(a_inner);
-    if stripped_any && !TypeChecker_shares_repr(self, ps) { return false; }
+    // A reference where the value is wanted is read through (the lowering
+    // loads a Vec/HashMap/str handle from it); not the other way round
+    var read_through: bool = a_is_ref && !p_is_ref && !is_box_type(p_inner) && !is_box_type(a_inner);
+    if stripped_any && !read_through && !TypeChecker_shares_repr(self, ps) { return false; }
     return TypeChecker_types_compatible(self, ps, as2);
 }
 
@@ -9852,9 +10356,20 @@ pub fn TypeChecker_pattern_binding_types(self: &TypeChecker, match_ty: Type, enu
                             }
                             _ => {}
                         }
-                        if is_type_param && subst.len() > 0 {
+                        var binding_ann: str = bindings.get(pi).ty;
+                        var subst_ty: Type = TypeChecker_subst_type_params(payload_ty, subst);
+                        // A type parameter in scope (inside `impl<T> Slot`) is the
+                        // type, unless the binding names one (`Err(e: str)`)
+                        var in_scope_param: bool = false;
+                        match subst_ty {
+                            Type::Named(sn) => { in_scope_param = tc_str_vec_contains(self.current_type_params, sn); }
+                            _ => {}
+                        }
+                        if is_type_param && subst.len() > 0 && in_scope_param && !str_is_empty(binding_ann) {
+                            result.push(type_from_annotation(binding_ann));
+                        } else if is_type_param && subst.len() > 0 {
                             // Substitute the type param with the actual type
-                            result.push(TypeChecker_subst_type_params(payload_ty, subst));
+                            result.push(subst_ty);
                         } else if is_type_param {
                             // Unsubstituted type param: use binding annotation or i64 fallback
                             var binding_annot: str = bindings.get(pi).ty;
@@ -9889,7 +10404,7 @@ pub fn TypeChecker_pattern_binding_types(self: &TypeChecker, match_ty: Type, enu
 
 // --- scan_stmts_for_effects ----------------------------------------------
 
-pub fn TypeChecker_scan_stmts_for_effects(self: &TypeChecker, stmts: Vec<Stmt>, effects: Vec<str>) {
+pub fn TypeChecker_scan_stmts_for_effects(self: &TypeChecker, stmts: Vec<Stmt>, effects: &mut Vec<str>) {
     var i: i64 = 0;
     while i < stmts.len() {
         TypeChecker_scan_stmt_for_effects(self, stmts.get(i), effects);
@@ -9897,7 +10412,7 @@ pub fn TypeChecker_scan_stmts_for_effects(self: &TypeChecker, stmts: Vec<Stmt>, 
     }
 }
 
-pub fn TypeChecker_scan_stmt_for_effects(self: &TypeChecker, stmt: Stmt, effects: Vec<str>) {
+pub fn TypeChecker_scan_stmt_for_effects(self: &TypeChecker, stmt: Stmt, effects: &mut Vec<str>) {
     match stmt {
         Stmt::Let(_, _, expr, _, _, _, _) => { TypeChecker_scan_expr_for_effects(self, expr, effects); }
         Stmt::LetTuple(_, expr, _) => { TypeChecker_scan_expr_for_effects(self, expr, effects); }
@@ -9999,7 +10514,7 @@ pub fn TypeChecker_scan_stmt_for_effects(self: &TypeChecker, stmt: Stmt, effects
     }
 }
 
-pub fn TypeChecker_scan_expr_for_effects(self: &TypeChecker, expr: Expr, effects: Vec<str>) {
+pub fn TypeChecker_scan_expr_for_effects(self: &TypeChecker, expr: Expr, effects: &mut Vec<str>) {
     match expr {
         Expr::IntLit(_) => {}
         Expr::FloatLit(_) => {}
@@ -10218,7 +10733,7 @@ pub fn TypeChecker_lint_unused_functions(self: &mut TypeChecker, program: Progra
     // Collect all called functions
     var fi: i64 = 0;
     while fi < program.funcs.len() {
-        TypeChecker_collect_called_funcs(self, program.funcs.get(fi).body, called);
+        TypeChecker_collect_called_funcs(self, program.funcs.get(fi).body, &mut called);
         fi = fi + 1;
     }
     var impi: i64 = 0;
@@ -10226,7 +10741,7 @@ pub fn TypeChecker_lint_unused_functions(self: &mut TypeChecker, program: Progra
         var imp: ImplDef = program.impls.get(impi);
         var mi: i64 = 0;
         while mi < imp.methods.len() {
-            TypeChecker_collect_called_funcs(self, imp.methods.get(mi).body, called);
+            TypeChecker_collect_called_funcs(self, imp.methods.get(mi).body, &mut called);
             mi = mi + 1;
         }
         impi = impi + 1;
@@ -10236,7 +10751,7 @@ pub fn TypeChecker_lint_unused_functions(self: &mut TypeChecker, program: Progra
         var timp: TraitImpl = program.trait_impls.get(timpi);
         var tmi: i64 = 0;
         while tmi < timp.methods.len() {
-            TypeChecker_collect_called_funcs(self, timp.methods.get(tmi).body, called);
+            TypeChecker_collect_called_funcs(self, timp.methods.get(tmi).body, &mut called);
             tmi = tmi + 1;
         }
         timpi = timpi + 1;
@@ -10252,7 +10767,7 @@ pub fn TypeChecker_lint_unused_functions(self: &mut TypeChecker, program: Progra
     }
 }
 
-pub fn TypeChecker_collect_called_funcs(self: &TypeChecker, stmts: Vec<Stmt>, called: Vec<str>) {
+pub fn TypeChecker_collect_called_funcs(self: &TypeChecker, stmts: Vec<Stmt>, called: &mut Vec<str>) {
     var i: i64 = 0;
     while i < stmts.len() {
         TypeChecker_collect_called_funcs_stmt(self, stmts.get(i), called);
@@ -10260,7 +10775,7 @@ pub fn TypeChecker_collect_called_funcs(self: &TypeChecker, stmts: Vec<Stmt>, ca
     }
 }
 
-pub fn TypeChecker_collect_called_funcs_stmt(self: &TypeChecker, stmt: Stmt, called: Vec<str>) {
+pub fn TypeChecker_collect_called_funcs_stmt(self: &TypeChecker, stmt: Stmt, called: &mut Vec<str>) {
     match stmt {
         Stmt::Let(_, _, expr, _, _, _, _) => { TypeChecker_collect_called_funcs_expr(self, expr, called); }
         Stmt::LetTuple(_, expr, _) => { TypeChecker_collect_called_funcs_expr(self, expr, called); }
@@ -10362,7 +10877,7 @@ pub fn TypeChecker_collect_called_funcs_stmt(self: &TypeChecker, stmt: Stmt, cal
     }
 }
 
-pub fn TypeChecker_collect_called_funcs_expr(self: &TypeChecker, expr: Expr, called: Vec<str>) {
+pub fn TypeChecker_collect_called_funcs_expr(self: &TypeChecker, expr: Expr, called: &mut Vec<str>) {
     match expr {
         Expr::IntLit(_) => {}
         Expr::FloatLit(_) => {}
@@ -10508,7 +11023,7 @@ pub fn TypeChecker_lint_unused_imports(self: &mut TypeChecker, program: Program)
     var called: Vec<str> = Vec::new();
     var fi: i64 = 0;
     while fi < program.funcs.len() {
-        TypeChecker_collect_called_funcs(self, program.funcs.get(fi).body, called);
+        TypeChecker_collect_called_funcs(self, program.funcs.get(fi).body, &mut called);
         fi = fi + 1;
     }
     var impi: i64 = 0;
@@ -10516,7 +11031,7 @@ pub fn TypeChecker_lint_unused_imports(self: &mut TypeChecker, program: Program)
         var imp: ImplDef = program.impls.get(impi);
         var mi: i64 = 0;
         while mi < imp.methods.len() {
-            TypeChecker_collect_called_funcs(self, imp.methods.get(mi).body, called);
+            TypeChecker_collect_called_funcs(self, imp.methods.get(mi).body, &mut called);
             mi = mi + 1;
         }
         impi = impi + 1;
@@ -10526,7 +11041,7 @@ pub fn TypeChecker_lint_unused_imports(self: &mut TypeChecker, program: Program)
         var timp: TraitImpl = program.trait_impls.get(timpi);
         var tmi: i64 = 0;
         while tmi < timp.methods.len() {
-            TypeChecker_collect_called_funcs(self, timp.methods.get(tmi).body, called);
+            TypeChecker_collect_called_funcs(self, timp.methods.get(tmi).body, &mut called);
             tmi = tmi + 1;
         }
         timpi = timpi + 1;
@@ -10562,13 +11077,13 @@ pub fn scan_for_floats(stmts: Vec<Stmt>) -> Vec<str> {
     var found: Vec<str> = Vec::new();
     var i: i64 = 0;
     while i < stmts.len() {
-        scan_stmt_for_floats(stmts.get(i), found);
+        scan_stmt_for_floats(stmts.get(i), &mut found);
         i = i + 1;
     }
     return found;
 }
 
-pub fn scan_stmt_for_floats(stmt: Stmt, found: Vec<str>) {
+pub fn scan_stmt_for_floats(stmt: Stmt, found: &mut Vec<str>) {
     match stmt {
         Stmt::Let(_, _, expr, _, _, _, _) => { scan_expr_for_floats(expr, found); }
         Stmt::LetTuple(_, expr, _) => { scan_expr_for_floats(expr, found); }
@@ -10759,7 +11274,7 @@ pub fn scan_stmt_for_floats(stmt: Stmt, found: Vec<str>) {
     }
 }
 
-pub fn scan_expr_for_floats(expr: Expr, found: Vec<str>) {
+pub fn scan_expr_for_floats(expr: Expr, found: &mut Vec<str>) {
     match expr {
         Expr::FloatLit(_) => { found.push("float_literal"); }
         Expr::IntLit(_) => {}

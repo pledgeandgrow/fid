@@ -834,6 +834,14 @@ impl Arm64Assembler {
             let inst = if sf == 1 { 0xF940_0000u32 } else { 0xB940_0000u32 };
             let inst = inst | (rn << 5) | rt;
             Ok(EncodedInst::bytes(inst))
+        } else if imm < 0 {
+            // Negative offsets are unscaled: LDUR Xt, [Xn, #simm9]
+            if !(-256..0).contains(&imm) {
+                return Err(format!("LDR offset out of range: {}", imm));
+            }
+            let inst = if sf == 1 { 0xF840_0000u32 } else { 0xB840_0000u32 };
+            let inst = inst | (((imm as u32) & 0x1FF) << 12) | (rn << 5) | rt;
+            Ok(EncodedInst::bytes(inst))
         } else {
             // LDR Xt, [Xn, #imm]
             let imm12 = (imm / (if sf == 1 { 8 } else { 4 })) as u32;
@@ -854,6 +862,14 @@ impl Arm64Assembler {
         if imm == 0 {
             let inst = if sf == 1 { 0xF900_0000u32 } else { 0xB900_0000u32 };
             let inst = inst | (rn << 5) | rt;
+            Ok(EncodedInst::bytes(inst))
+        } else if imm < 0 {
+            // STUR Xt, [Xn, #simm9] — unscaled signed offset
+            if !(-256..0).contains(&imm) {
+                return Err(format!("STR offset out of range: {}", imm));
+            }
+            let inst = if sf == 1 { 0xF800_0000u32 } else { 0xB800_0000u32 };
+            let inst = inst | (((imm as u32) & 0x1FF) << 12) | (rn << 5) | rt;
             Ok(EncodedInst::bytes(inst))
         } else {
             let imm12 = (imm / (if sf == 1 { 8 } else { 4 })) as u32;

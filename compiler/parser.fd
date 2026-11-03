@@ -550,7 +550,7 @@ pub fn parse(self: &mut Parser) -> ParseResultProgram {
     return ParseResultProgram::Ok(program);
 }
 
-fn parse_top_level_item(self: &mut Parser, program: Program, is_pub: bool) -> ParseResultUnit {
+fn parse_top_level_item(self: &mut Parser, program: &mut Program, is_pub: bool) -> ParseResultUnit {
     var k: TokenKind = self.peek();
 
     if token_kind_eq(k, TokenKind::Module) {
@@ -850,7 +850,7 @@ fn parse_top_level_item(self: &mut Parser, program: Program, is_pub: bool) -> Pa
     }
 
 }
-fn parse_extern_block(self: &mut Parser, program: Program, _is_pub: bool) -> ParseResultUnit {
+fn parse_extern_block(self: &mut Parser, program: &mut Program, _is_pub: bool) -> ParseResultUnit {
     self.advance(); // consume extern
     var abi: str = "C";
     var tok: Token = self.peek_token();
@@ -1262,6 +1262,22 @@ var first_name: str = "";
 match self.expect_ident() {
     ParseResultStr::Ok(s) => { first_name = s; }
     ParseResultStr::Err(e) => { return ParseResultImplOrTrait::Err(e); }
+}
+// `impl<T> Slot<T>`: the type's arguments repeat the impl's parameters
+if self.check(TokenKind::Lt) {
+    var tdepth: i64 = 0;
+    var tscan: bool = true;
+    while tscan {
+        if self.check(TokenKind::Lt) {
+            tdepth = tdepth + 1;
+        } else if self.check(TokenKind::Gt) {
+            tdepth = tdepth - 1;
+        } else if self.check(TokenKind::Shr) {
+            tdepth = tdepth - 2;
+        }
+        self.advance();
+        if tdepth <= 0 || self.is_at_end() { tscan = false; }
+    }
 }
 
 // Check for `impl Trait for Type`
@@ -5088,7 +5104,7 @@ loop {
                     OpEntry::Paren => { break; }
                 }
                 if is_op && top_prec >= prec {
-                    if !reduce_one_op(vals, ops) { break; }
+                    if !reduce_one_op(&mut vals, &mut ops) { break; }
                 } else {
                     break;
                 }
@@ -5110,7 +5126,7 @@ loop {
                     found_paren = true;
                     break;
                 }
-                if !reduce_one_op(vals, ops) { break; }
+                if !reduce_one_op(&mut vals, &mut ops) { break; }
             }
             if found_paren {
                 self.advance();
@@ -5163,7 +5179,7 @@ while ops.len() > 0 {
     if is_paren {
         return ParseResultExpr::Err("unmatched '(' in expression");
     }
-    if !reduce_one_op(vals, ops) { break; }
+    if !reduce_one_op(&mut vals, &mut ops) { break; }
 }
 
 if vals.len() == 0 {
@@ -5602,7 +5618,7 @@ pub fn BinOpInfo_new(op: BinOp, prec: i64, found: bool) -> BinOpInfo {
 return BinOpInfo { op: op, prec: prec, found: found };
 }
 
-pub fn reduce_one_op(vals: Vec<Expr>, ops: Vec<OpEntry>) -> bool {
+pub fn reduce_one_op(vals: &mut Vec<Expr>, ops: &mut Vec<OpEntry>) -> bool {
 if ops.len() == 0 { return false; }
 if vals.len() < 2 { return false; }
 var op_entry: OpEntry = ops.pop();

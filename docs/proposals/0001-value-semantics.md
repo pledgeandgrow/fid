@@ -49,6 +49,26 @@ dead, which is why it cannot free everything (release C5, C6).
    unless it implements `eq`. `same(a, b)` asks whether two values share a
    buffer.
 
+## Status of the implementation (Nov 3, 2026)
+
+- Done: `==` by content for structs and enums in both compilers; every
+  parameter a function changes for its caller is `&mut` (403 parameters in
+  345 functions, 2,232 edits across `compiler/`, `stdlib/`, tests and
+  examples, by `scratchpad/cow/migrate.py` with the type checker finding the
+  rest); a `&mut` parameter read where a value is wanted is read through
+  (checker, escape check and both lowerings); the borrow checker treats
+  read-only methods (`len`, `get`, ...) as reads. Behaviour is unchanged:
+  every test prints what it printed before, and the compiler builds itself.
+- Found while migrating: 44 places mutate an element through `.get(i)`
+  (`self.symbols.get(idx).size = n`) and a few locals copied out of a
+  collection are changed and never written back. Under copy-on-write the
+  first must still mutate in place (as Swift's `arr[i].x = 1`), and a
+  `Vec<Struct>` clone must copy its structs: a Vec of structs holds pointers
+  to them today. So the copy-on-write switch needs structs to be values too
+  (copied on assignment, on passing and in a cloned collection; element
+  access a place), which is the next step and a change to the struct layout
+  and call convention of every backend.
+
 ## What it breaks
 
 Code that changes a collection it received by value and expects the caller to

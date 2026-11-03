@@ -23,6 +23,13 @@ use crate::typechecker::TypeChecker;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
 
+/// Methods that only read their receiver: calling one is not a mutation.
+const READ_METHODS: &[&str] = &[
+    "len", "get", "is_empty", "contains", "contains_key", "first", "last", "clone", "to_str", "keys",
+    "values", "starts_with", "ends_with", "find", "capacity", "is_some", "is_none", "is_ok", "is_err",
+    "unwrap", "unwrap_or", "get_or", "eq", "cmp", "show", "slice", "byte_at", "char_at",
+];
+
 /// The line a statement starts on (as typechecker.rs stmt_line).
 fn stmt_line(stmt: &Stmt) -> usize {
     match stmt {
@@ -1138,16 +1145,16 @@ impl<'tc> BorrowChecker<'tc> {
                 for s in body { self.check_stmt(s); }
                 self.pop_scope();
             }
-            Expr::MethodCall { receiver, args, .. } => {
+            Expr::MethodCall { receiver, method, args } => {
                 // A method call on `receiver` may mutate it (e.g. arr.push()).
-                // If receiver is a simple Ident, treat it as a mutation.
+                // If receiver is a simple Ident, treat it as a mutation, unless
+                // the method only reads (`f(&mut v, v.len())` is fine).
                 // Phase 4: The receiver mutation check is deferred to after
                 // argument evaluation (reservation phase), so that shared
                 // borrows in args don't conflict with the receiver mutation.
-                let receiver_path = if let Expr::Ident(name) = receiver.as_ref() {
-                    Some(name.clone())
-                } else {
-                    None
+                let receiver_path = match receiver.as_ref() {
+                    Expr::Ident(name) if !READ_METHODS.contains(&method.as_str()) => Some(name.clone()),
+                    _ => None,
                 };
                 // Phase 4: Evaluate receiver + args in reservation mode.
                 let checkpoint = self.temp_counter;

@@ -1308,6 +1308,16 @@ fn violation(self: &mut BorrowChecker, line: i64, msg: str) -> void {
 
 // --- Statement walker -----------------------------------------------------
 
+/// Methods that only read their receiver: calling one is not a mutation.
+fn bc_read_method(m: str) -> bool {
+    return m == "len" || m == "get" || m == "is_empty" || m == "contains" || m == "contains_key"
+        || m == "first" || m == "last" || m == "clone" || m == "to_str" || m == "keys" || m == "values"
+        || m == "starts_with" || m == "ends_with" || m == "find" || m == "capacity" || m == "is_some"
+        || m == "is_none" || m == "is_ok" || m == "is_err" || m == "unwrap" || m == "unwrap_or"
+        || m == "get_or" || m == "eq" || m == "cmp" || m == "show" || m == "slice" || m == "byte_at"
+        || m == "char_at";
+}
+
 fn check_stmt(self: &mut BorrowChecker, stmt: Stmt) -> void {
     self.stmt_line = stmt_line(stmt);
     match stmt {
@@ -1701,14 +1711,15 @@ fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
             }
             pop_scope(self);
         }
-        Expr::MethodCall(receiver, _, args) => {
+        Expr::MethodCall(receiver, method, args) => {
             // A method call on receiver may mutate it (e.g. arr.push()).
-            // If receiver is a simple Ident, treat it as a mutation.
+            // If receiver is a simple Ident, treat it as a mutation, unless the
+            // method only reads (`f(&mut v, v.len())` is fine; src/borrowck.rs).
             // Phase 4: The receiver mutation check is deferred to after
             // argument evaluation (reservation phase).
             var receiver_path: OptStr = OptStr::None;
             match receiver {
-                Expr::Ident(name) => { receiver_path = OptStr::Some(name); }
+                Expr::Ident(name) => { if !bc_read_method(method) { receiver_path = OptStr::Some(name); } }
                 _ => {}
             }
             // Phase 4: Evaluate receiver + args in reservation mode.
@@ -1845,14 +1856,14 @@ fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
             var captured: Vec<str> = Vec::new();
             var b: i64 = 0;
             while b < body.len() {
-                collect_captures_stmt_fd(body.get(b), captured);
+                collect_captures_stmt_fd(body.get(b), &mut captured);
                 b = b + 1;
             }
             // Collect identifiers that are assigned to (for mutable capture).
             var assigned: Vec<str> = Vec::new();
             b = 0;
             while b < body.len() {
-                collect_assigned_stmt_fd(body.get(b), assigned);
+                collect_assigned_stmt_fd(body.get(b), &mut assigned);
                 b = b + 1;
             }
             // Record a borrow for each captured variable that exists in an
@@ -1974,7 +1985,7 @@ pub fn str_to_lower(s: str) -> str {
 
 // Collect identifiers used in a statement that are NOT locals (params or
 // locally-declared variables). These are closure captures.
-fn collect_captures_stmt_fd(stmt: Stmt, captured: Vec<str>) -> void {
+fn collect_captures_stmt_fd(stmt: Stmt, captured: &mut Vec<str>) -> void {
     match stmt {
         Stmt::Let(_, _, expr, _, _, _, _) => {
             collect_captures_expr_fd(expr, captured);
@@ -2035,7 +2046,7 @@ fn collect_captures_stmt_fd(stmt: Stmt, captured: Vec<str>) -> void {
     }
 }
 
-fn collect_captures_expr_fd(expr: Expr, captured: Vec<str>) -> void {
+fn collect_captures_expr_fd(expr: Expr, captured: &mut Vec<str>) -> void {
     match expr {
         Expr::Ident(name) => {
             if !bc_vec_contains_str(captured, name) {
@@ -2083,7 +2094,7 @@ fn bc_vec_contains_str(v: Vec<str>, s: str) -> bool {
 }
 
 // Collect identifiers that are assigned to in a statement (for mutable capture).
-fn collect_assigned_stmt_fd(stmt: Stmt, assigned: Vec<str>) -> void {
+fn collect_assigned_stmt_fd(stmt: Stmt, assigned: &mut Vec<str>) -> void {
     match stmt {
         Stmt::Assign(target, _, _, _) => {
             if !bc_vec_contains_str(assigned, target) {

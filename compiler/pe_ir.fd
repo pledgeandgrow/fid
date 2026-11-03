@@ -926,7 +926,7 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
     var no_reg: Vec<i64> = peir_zeros(nvals);
     var used_regs: Vec<i64> = Vec::new();
     if use_regs {
-        used_regs = peir_pick_reg_vars(func, module, &mut frame, no_reg, nvals);
+        used_regs = peir_pick_reg_vars(func, module, &mut frame, &mut no_reg, nvals);
     }
     var free_regs: Vec<i64> = Vec::new();
     if use_regs {
@@ -1286,7 +1286,7 @@ fn peir_reg_word(module: &IrModule, ty: IrType) -> bool {
     return peir_reg_type(module, ty) && IrModule_type_size(module, ty) == 8;
 }
 
-fn peir_mark(v: Vec<i64>, id: i64, n: i64) {
+fn peir_mark(v: &mut Vec<i64>, id: i64, n: i64) {
     if id >= 0 && id < n { v.set(id, 1); }
 }
 
@@ -1304,7 +1304,7 @@ fn peir_value_word(func: &IrFunction, module: &IrModule, id: i64) -> bool {
     }
 }
 
-fn peir_loop_back(index: Vec<i64>, depth: Vec<i64>, target: i64, at: i64) {
+fn peir_loop_back(index: Vec<i64>, depth: &mut Vec<i64>, target: i64, at: i64) {
     if target < 0 || target >= index.len() { return; }
     var head: i64 = index.get(target);
     if head >= 0 && head <= at {
@@ -1317,7 +1317,7 @@ fn peir_loop_back(index: Vec<i64>, depth: Vec<i64>, target: i64, at: i64) {
 }
 
 /// src/pe.rs pick_reg_vars: the locals worth a register, most used first.
-fn peir_pick_reg_vars(func: &IrFunction, module: &IrModule, frame: &mut PeStackFrame, no_reg: Vec<i64>, nvals: i64) -> Vec<i64> {
+fn peir_pick_reg_vars(func: &IrFunction, module: &IrModule, frame: &mut PeStackFrame, no_reg: &mut Vec<i64>, nvals: i64) -> Vec<i64> {
     var nb: i64 = func.blocks.len();
     var max_id: i64 = 0;
     var b: i64 = 0;
@@ -1340,10 +1340,10 @@ fn peir_pick_reg_vars(func: &IrFunction, module: &IrModule, frame: &mut PeStackF
             match IrFunction_get_inst(func, ids.get(ids.len() - 1)) {
                 OptInst::Some(last) => {
                     match last {
-                        Inst::Jump(t) => { peir_loop_back(index, depth, t, b); }
+                        Inst::Jump(t) => { peir_loop_back(index, &mut depth, t, b); }
                         Inst::Branch(_, t, e) => {
-                            peir_loop_back(index, depth, t, b);
-                            peir_loop_back(index, depth, e, b);
+                            peir_loop_back(index, &mut depth, t, b);
+                            peir_loop_back(index, &mut depth, e, b);
                         }
                         _ => {}
                     }

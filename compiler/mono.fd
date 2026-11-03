@@ -57,7 +57,7 @@ pub fn subst_get(map: Vec<SubstEntry>, key: str) -> OptType {
     return result;
 }
 
-pub fn subst_set(map: Vec<SubstEntry>, key: str, val: Type) {
+pub fn subst_set(map: &mut Vec<SubstEntry>, key: str, val: Type) {
     // Fides Vec::get returns a copy, so we can't mutate in place.
     // Just push -- subst_get returns the last match.
     map.push(SubstEntry_new(key, val));
@@ -267,7 +267,7 @@ pub fn rename_get(map: Vec<RenameEntry>, key: str) -> OptStr {
     return result;
 }
 
-pub fn rename_set(map: Vec<RenameEntry>, from: str, to: str) {
+pub fn rename_set(map: &mut Vec<RenameEntry>, from: str, to: str) {
     // Fides Vec::get returns a copy, so we can't mutate in place.
     // Just push -- rename_get returns the last match.
     map.push(RenameEntry_new(from, to));
@@ -297,13 +297,15 @@ pub struct GenericMethodCallEntry {
     pub struct_name: str,
     pub method_name: str,
     pub arg_types: Vec<Type>,
+    pub recv_ty: Type,
 }
 
-pub fn GenericMethodCallEntry_new(struct_name: str, method_name: str, arg_types: Vec<Type>) -> GenericMethodCallEntry {
+pub fn GenericMethodCallEntry_new(struct_name: str, method_name: str, arg_types: Vec<Type>, recv_ty: Type) -> GenericMethodCallEntry {
     return GenericMethodCallEntry {
         struct_name: struct_name,
         method_name: method_name,
         arg_types: arg_types,
+        recv_ty: recv_ty,
     };
 }
 
@@ -1425,7 +1427,7 @@ pub fn infer_subst(
     if arg_types.len() < n { n = arg_types.len(); }
     var i: i64 = 0;
     while i < n {
-        infer_from_pair(param_types.get(i), arg_types.get(i), type_params, subst);
+        infer_from_pair(param_types.get(i), arg_types.get(i), type_params, &mut subst);
         i = i + 1;
     }
     return subst;
@@ -1433,7 +1435,7 @@ pub fn infer_subst(
 
 // --- Recursively infer type parameter bindings from a (param, arg) pair ---
 
-pub fn infer_from_pair(param: Type, arg: Type, type_params: Vec<str>, subst: Vec<SubstEntry>) {
+pub fn infer_from_pair(param: Type, arg: Type, type_params: Vec<str>, subst: &mut Vec<SubstEntry>) {
     match param {
         Type::Named(name) => {
             if str_vec_contains(type_params, name) {
@@ -1554,7 +1556,22 @@ pub fn MonoCtx_seen_insert(ctx: &mut MonoCtx, name: str) -> bool {
 
 // --- Main monomorphization entry point -----------------------------------
 
+// The declared return type of every non-generic function, for the type of a
+// call (`parse(s).context(..)` is a method on what `parse` returns).
+var g_mono_ret_index: i64 = 0;
+var g_mono_ret_types: Vec<Type> = Vec::new();
+
 pub fn monomorphize(program: Program) -> Program {
+    g_mono_ret_index = HashMap_new();
+    g_mono_ret_types = Vec::new();
+    var ri: i64 = 0;
+    while ri < program.funcs.len() {
+        if program.funcs.get(ri).type_params.len() == 0 {
+            g_mono_ret_types.push(program.funcs.get(ri).ret_ty);
+            HashMap_insert(g_mono_ret_index, program.funcs.get(ri).name, g_mono_ret_types.len());
+        }
+        ri = ri + 1;
+    }
     var ctx: MonoCtx = MonoCtx_new();
 
     // Separate generic and non-generic functions
@@ -1632,6 +1649,17 @@ pub fn monomorphize(program: Program) -> Program {
         while j < imp.methods.len() {
             if imp.type_params.len() == 0 {
                 new_methods.push(process_func(imp.methods.get(j), &mut ctx));
+            } else {
+                // A generic impl's methods are instantiated on demand; the i64
+                // instance also keeps the plain name (Option_unwrap), for a
+                // call whose receiver type is not known here (as mono.rs)
+                var isub: Vec<SubstEntry> = subst_new();
+                var tk: i64 = 0;
+                while tk < imp.type_params.len() {
+                    subst_set(&mut isub, imp.type_params.get(tk), Type::I64);
+                    tk = tk + 1;
+                }
+                new_methods.push(instantiate(imp.methods.get(j), isub, imp.methods.get(j).name, &mut ctx));
             }
             j = j + 1;
         }
@@ -1695,69 +1723,207 @@ pub fn monomorphize(program: Program) -> Program {
 // For each call to a generic, re-infer the substitution from argument types
 // and use the correct mangled name.
 
-pub fn fixup_generic_calls(stmts: Vec<Stmt>, generics: Vec<GenericFuncEntry>, current_func: Func) -> Vec<Stmt> {
+pub fn fixup_generic_calls(stmts: Vec<Stmt>, generics: Vec<GenericFuncEntry>, gm: Vec<GenericMethodEntry>, current_func: Func) -> Vec<Stmt> {
     var result: Vec<Stmt> = Vec::new();
     var i: i64 = 0;
     while i < stmts.len() {
-        result.push(fixup_generic_calls_stmt(stmts.get(i), generics, current_func));
+        result.push(fixup_generic_calls_stmt(stmts.get(i), generics, gm, current_func));
         i = i + 1;
     }
     return result;
 }
 
-pub fn fixup_generic_calls_stmt(stmt: Stmt, generics: Vec<GenericFuncEntry>, current_func: Func) -> Stmt {
+pub fn fixup_generic_calls_stmt(stmt: Stmt, generics: Vec<GenericFuncEntry>, gm: Vec<GenericMethodEntry>, current_func: Func) -> Stmt {
     match stmt {
         Stmt::Expr(e, line) => {
-            return Stmt::Expr(fixup_generic_calls_expr(e, generics, current_func), line);
+            return Stmt::Expr(fixup_generic_calls_expr(e, generics, gm, current_func), line);
         }
         Stmt::Let(name, ty, expr, is_mut, is_persist, annotations, line) => {
-            return Stmt::Let(name, ty, fixup_generic_calls_expr(expr, generics, current_func), is_mut, is_persist, annotations, line);
+            var hinted: Vec<Expr> = fixup_hinted_call(expr, ty, generics, gm, current_func);
+            if hinted.len() > 0 { return Stmt::Let(name, ty, hinted.get(0), is_mut, is_persist, annotations, line); }
+            return Stmt::Let(name, ty, fixup_generic_calls_expr(expr, generics, gm, current_func), is_mut, is_persist, annotations, line);
         }
         Stmt::LetTuple(names, expr, line) => {
-            return Stmt::LetTuple(names, fixup_generic_calls_expr(expr, generics, current_func), line);
+            return Stmt::LetTuple(names, fixup_generic_calls_expr(expr, generics, gm, current_func), line);
         }
         Stmt::Return(opt, line) => {
             match opt {
                 OptBoxExpr::Some(e) => {
-                    return Stmt::Return(OptBoxExpr::Some(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(e), generics, current_func))), line);
+                    var rhinted: Vec<Expr> = fixup_hinted_call(mn_box_expr_deref(e), OptType::Some(current_func.ret_ty), generics, gm, current_func);
+                    if rhinted.len() > 0 { return Stmt::Return(OptBoxExpr::Some(mn_box_expr_new(rhinted.get(0))), line); }
+                    return Stmt::Return(OptBoxExpr::Some(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(e), generics, gm, current_func))), line);
                 }
                 OptBoxExpr::None => { return Stmt::Return(OptBoxExpr::None, line); }
             }
             return Stmt::Return(OptBoxExpr::None, line);
         }
         Stmt::If(cond, then_block, else_block, line) => {
-            var new_then: Vec<Stmt> = fixup_generic_calls(then_block, generics, current_func);
+            var new_then: Vec<Stmt> = fixup_generic_calls(then_block, generics, gm, current_func);
             var new_else: OptStmts = OptStmts::None;
             match else_block {
                 OptStmts::Some(eb) => {
-                    new_else = OptStmts::Some(fixup_generic_calls(eb, generics, current_func));
+                    new_else = OptStmts::Some(fixup_generic_calls(eb, generics, gm, current_func));
                 }
                 OptStmts::None => {}
             }
-            return Stmt::If(fixup_generic_calls_expr(cond, generics, current_func), new_then, new_else, line);
+            return Stmt::If(fixup_generic_calls_expr(cond, generics, gm, current_func), new_then, new_else, line);
         }
         Stmt::While(cond, body, line) => {
-            return Stmt::While(fixup_generic_calls_expr(cond, generics, current_func), fixup_generic_calls(body, generics, current_func), line);
+            return Stmt::While(fixup_generic_calls_expr(cond, generics, gm, current_func), fixup_generic_calls(body, generics, gm, current_func), line);
         }
         Stmt::For(var_name, iterator, body, line) => {
-            return Stmt::For(var_name, fixup_generic_calls_expr(iterator, generics, current_func), fixup_generic_calls(body, generics, current_func), line);
+            return Stmt::For(var_name, fixup_generic_calls_expr(iterator, generics, gm, current_func), fixup_generic_calls(body, generics, gm, current_func), line);
         }
         Stmt::Assign(target, op, expr, line) => {
-            return Stmt::Assign(target, op, fixup_generic_calls_expr(expr, generics, current_func), line);
+            return Stmt::Assign(target, op, fixup_generic_calls_expr(expr, generics, gm, current_func), line);
+        }
+        Stmt::FieldAssign(obj, field, op, expr, line) => {
+            return Stmt::FieldAssign(fixup_generic_calls_expr(obj, generics, gm, current_func), field, op, fixup_generic_calls_expr(expr, generics, gm, current_func), line);
+        }
+        Stmt::IndexAssign(arr, index, op, expr, line) => {
+            return Stmt::IndexAssign(arr, fixup_generic_calls_expr(index, generics, gm, current_func), op, fixup_generic_calls_expr(expr, generics, gm, current_func), line);
+        }
+        Stmt::Loop(body, line) => { return Stmt::Loop(fixup_generic_calls(body, generics, gm, current_func), line); }
+        Stmt::Defer(body, line) => { return Stmt::Defer(fixup_generic_calls(body, generics, gm, current_func), line); }
+        Stmt::Unsafe(body, line) => { return Stmt::Unsafe(fixup_generic_calls(body, generics, gm, current_func), line); }
+        Stmt::Match(scrut, arms, line) => {
+            return Stmt::Match(fixup_generic_calls_expr(scrut, generics, gm, current_func), fixup_match_arms(arms, generics, gm, current_func), line);
         }
         other => { return other; }
     }
     return stmt;
 }
 
-pub fn fixup_generic_calls_expr(expr: Expr, generics: Vec<GenericFuncEntry>, current_func: Func) -> Expr {
+/// The substitution for a call of a generic impl method, as mono.rs: from the
+/// arguments (after `self`), then from the receiver's type arguments
+/// (`impl<T> Option` on an Option<f64> gives T=f64), then i64 for the rest.
+pub fn method_subst(gen_func: Func, type_params: Vec<str>, arg_types: Vec<Type>, recv_ty: Type) -> Vec<SubstEntry> {
+    var param_types: Vec<Type> = Vec::new();
+    var j: i64 = 1;
+    while j < gen_func.params.len() {
+        param_types.push(gen_func.params.get(j).ty);
+        j = j + 1;
+    }
+    var subst: Vec<SubstEntry> = infer_subst(param_types, arg_types, type_params);
+    var recv: Type = recv_ty;
+    match recv_ty {
+        Type::Ref(inner, _) => { recv = box_type_deref(inner); }
+        _ => {}
+    }
+    match recv {
+        Type::Generic(_, rargs) => {
+            var k: i64 = 0;
+            while k < type_params.len() && k < rargs.len() {
+                if !subst_contains(subst, type_params.get(k)) { subst_set(&mut subst, type_params.get(k), rargs.get(k)); }
+                k = k + 1;
+            }
+        }
+        _ => {}
+    }
+    var t: i64 = 0;
+    while t < type_params.len() {
+        if !subst_contains(subst, type_params.get(t)) { subst_set(&mut subst, type_params.get(t), Type::I64); }
+        t = t + 1;
+    }
+    return subst;
+}
+
+/// The substitution for a call: from the arguments, then, for a type
+/// parameter they leave unbound, from the expected type (the element after
+/// the arguments in `arg_types`, when there is one) against the result type.
+pub fn subst_with_result(gen_func: Func, arg_types: Vec<Type>, type_params: Vec<str>) -> Vec<SubstEntry> {
+    var param_types: Vec<Type> = Vec::new();
+    var args: Vec<Type> = Vec::new();
+    var j: i64 = 0;
+    while j < gen_func.params.len() {
+        param_types.push(gen_func.params.get(j).ty);
+        if j < arg_types.len() { args.push(arg_types.get(j)); }
+        j = j + 1;
+    }
+    var subst: Vec<SubstEntry> = infer_subst(param_types, args, type_params);
+    if arg_types.len() == param_types.len() + 1 {
+        var from_result: Vec<SubstEntry> = subst_new();
+        infer_from_pair(gen_func.ret_ty, arg_types.get(param_types.len()), type_params, &mut from_result);
+        var k: i64 = 0;
+        while k < type_params.len() {
+            var tp: str = type_params.get(k);
+            if !subst_contains(subst, tp) {
+                match subst_get(from_result, tp) {
+                    OptType::Some(t) => { subst_set(&mut subst, tp, t); }
+                    OptType::None => {}
+                }
+            }
+            k = k + 1;
+        }
+    }
+    return subst;
+}
+
+/// A direct call to a generic function whose result has a declared type:
+/// renamed with that type for what the arguments leave unbound. One
+/// expression, or none.
+pub fn fixup_hinted_call(expr: Expr, hint: OptType, generics: Vec<GenericFuncEntry>, gm: Vec<GenericMethodEntry>, current_func: Func) -> Vec<Expr> {
+    var out: Vec<Expr> = Vec::new();
+    var h: Type = Type::Infer;
+    match hint {
+        OptType::Some(t) => { h = t; }
+        OptType::None => { return out; }
+    }
+    match expr {
+        Expr::Call(callee, args) => {
+            match generic_funcs_get(generics, callee) {
+                OptGenericFunc::Some(entry) => {
+                    var new_args: Vec<Expr> = Vec::new();
+                    var arg_types: Vec<Type> = Vec::new();
+                    var i: i64 = 0;
+                    while i < args.len() {
+                        var na: Expr = fixup_generic_calls_expr(args.get(i), generics, gm, current_func);
+                        new_args.push(na);
+                        arg_types.push(infer_expr_type(na, current_func));
+                        i = i + 1;
+                    }
+                    arg_types.push(h);
+                    var subst: Vec<SubstEntry> = subst_with_result(entry.func, arg_types, entry.type_params);
+                    var k: i64 = 0;
+                    while k < entry.type_params.len() {
+                        if !subst_contains(subst, entry.type_params.get(k)) { return out; }
+                        k = k + 1;
+                    }
+                    out.push(Expr::Call(mangle(callee, subst, entry.type_params), new_args));
+                    return out;
+                }
+                OptGenericFunc::None => {}
+            }
+        }
+        _ => {}
+    }
+    return out;
+}
+
+fn fixup_match_arms(arms: Vec<MatchArm>, generics: Vec<GenericFuncEntry>, gm: Vec<GenericMethodEntry>, current_func: Func) -> Vec<MatchArm> {
+    var out: Vec<MatchArm> = Vec::new();
+    var i: i64 = 0;
+    while i < arms.len() {
+        var arm: MatchArm = arms.get(i);
+        var arm_guard: OptBoxExpr = OptBoxExpr::None;
+        match arm.guard {
+            OptBoxExpr::Some(g) => { arm_guard = OptBoxExpr::Some(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(g), generics, gm, current_func))); }
+            OptBoxExpr::None => {}
+        }
+        out.push(MatchArm_new(arm.pattern, arm_guard, fixup_generic_calls(arm.body, generics, gm, current_func)));
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn fixup_generic_calls_expr(expr: Expr, generics: Vec<GenericFuncEntry>, gm: Vec<GenericMethodEntry>, current_func: Func) -> Expr {
     match expr {
         Expr::Call(callee, args) => {
             // First, recursively fix up args
             var new_args: Vec<Expr> = Vec::new();
             var i: i64 = 0;
             while i < args.len() {
-                new_args.push(fixup_generic_calls_expr(args.get(i), generics, current_func));
+                new_args.push(fixup_generic_calls_expr(args.get(i), generics, gm, current_func));
                 i = i + 1;
             }
             // Check if this is a call to a generic function
@@ -1787,43 +1953,124 @@ pub fn fixup_generic_calls_expr(expr: Expr, generics: Vec<GenericFuncEntry>, cur
         }
         Expr::Binary(op, left, right) => {
             return Expr::Binary(op,
-                mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(left), generics, current_func)),
-                mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(right), generics, current_func)));
+                mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(left), generics, gm, current_func)),
+                mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(right), generics, gm, current_func)));
         }
         Expr::Unary(op, inner) => {
-            return Expr::Unary(op, mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(inner), generics, current_func)));
+            return Expr::Unary(op, mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(inner), generics, gm, current_func)));
         }
         Expr::MethodCall(receiver, method, args) => {
             var new_args: Vec<Expr> = Vec::new();
             var i: i64 = 0;
             while i < args.len() {
-                new_args.push(fixup_generic_calls_expr(args.get(i), generics, current_func));
+                new_args.push(fixup_generic_calls_expr(args.get(i), generics, gm, current_func));
                 i = i + 1;
             }
-            return Expr::MethodCall(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(receiver), generics, current_func)), method, new_args);
+            var recv_expr: Expr = mn_box_expr_deref(receiver);
+            var new_recv: Expr = fixup_generic_calls_expr(recv_expr, generics, gm, current_func);
+            // A generic impl method: a call to the instantiation for this
+            // receiver's type, with the receiver as first argument
+            match infer_receiver_struct_name(recv_expr, current_func) {
+                OptStr::Some(sn) => {
+                    match generic_methods_get(gm, sn, method) {
+                        OptGenericMethod::Some(gen) => {
+                            var arg_types: Vec<Type> = Vec::new();
+                            var j: i64 = 0;
+                            while j < new_args.len() {
+                                arg_types.push(infer_expr_type(new_args.get(j), current_func));
+                                j = j + 1;
+                            }
+                            var msubst: Vec<SubstEntry> = method_subst(gen.func, gen.type_params, arg_types, infer_expr_type(recv_expr, current_func));
+                            var all_args: Vec<Expr> = Vec::new();
+                            all_args.push(new_recv);
+                            j = 0;
+                            while j < new_args.len() {
+                                all_args.push(new_args.get(j));
+                                j = j + 1;
+                            }
+                            return Expr::Call(mangle_method(sn, method, msubst, gen.type_params), all_args);
+                        }
+                        OptGenericMethod::None => {}
+                    }
+                }
+                OptStr::None => {}
+            }
+            return Expr::MethodCall(mn_box_expr_new(new_recv), method, new_args);
         }
         Expr::FieldAccess(inner, field) => {
-            return Expr::FieldAccess(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(inner), generics, current_func)), field);
+            return Expr::FieldAccess(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(inner), generics, gm, current_func)), field);
         }
         Expr::Index(array, index) => {
             return Expr::Index(
-                mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(array), generics, current_func)),
-                mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(index), generics, current_func)));
+                mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(array), generics, gm, current_func)),
+                mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(index), generics, gm, current_func)));
         }
         Expr::If(cond, then_block, else_block) => {
-            var new_then: Vec<Stmt> = fixup_generic_calls(then_block, generics, current_func);
+            var new_then: Vec<Stmt> = fixup_generic_calls(then_block, generics, gm, current_func);
             var new_else: OptStmts = OptStmts::None;
             match else_block {
                 OptStmts::Some(eb) => {
-                    new_else = OptStmts::Some(fixup_generic_calls(eb, generics, current_func));
+                    new_else = OptStmts::Some(fixup_generic_calls(eb, generics, gm, current_func));
                 }
                 OptStmts::None => {}
             }
-            return Expr::If(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(cond), generics, current_func)), new_then, new_else);
+            return Expr::If(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(cond), generics, gm, current_func)), new_then, new_else);
         }
         Expr::Block(stmts) => {
-            return Expr::Block(fixup_generic_calls(stmts, generics, current_func));
+            return Expr::Block(fixup_generic_calls(stmts, generics, gm, current_func));
         }
+        // Calls inside these are renamed as anywhere else (as mono.rs)
+        Expr::Try(inner) => { return Expr::Try(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(inner), generics, gm, current_func))); }
+        Expr::Ref(inner, is_mut) => { return Expr::Ref(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(inner), generics, gm, current_func)), is_mut); }
+        Expr::Deref(inner) => { return Expr::Deref(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(inner), generics, gm, current_func))); }
+        Expr::Cast(inner, target_ty) => { return Expr::Cast(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(inner), generics, gm, current_func)), target_ty); }
+        Expr::StrConcat(left, right) => { return Expr::StrConcat(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(left), generics, gm, current_func)), mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(right), generics, gm, current_func))); }
+        Expr::Coalesce(inner, dflt) => { return Expr::Coalesce(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(inner), generics, gm, current_func)), mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(dflt), generics, gm, current_func))); }
+        Expr::EnumLit(ename, variant, eargs) => {
+            var nea: Vec<Expr> = Vec::new();
+            var i: i64 = 0;
+            while i < eargs.len() {
+                nea.push(fixup_generic_calls_expr(eargs.get(i), generics, gm, current_func));
+                i = i + 1;
+            }
+            return Expr::EnumLit(ename, variant, nea);
+        }
+        Expr::ArrayLit(elem_ty, elems) => {
+            var nel: Vec<Expr> = Vec::new();
+            var i: i64 = 0;
+            while i < elems.len() {
+                nel.push(fixup_generic_calls_expr(elems.get(i), generics, gm, current_func));
+                i = i + 1;
+            }
+            return Expr::ArrayLit(elem_ty, nel);
+        }
+        Expr::TupleLit(items) => {
+            var nti: Vec<Expr> = Vec::new();
+            var i: i64 = 0;
+            while i < items.len() {
+                nti.push(fixup_generic_calls_expr(items.get(i), generics, gm, current_func));
+                i = i + 1;
+            }
+            return Expr::TupleLit(nti);
+        }
+        Expr::StructLit(sname, fields, spread) => {
+            var nfi: Vec<FieldInit> = Vec::new();
+            var i: i64 = 0;
+            while i < fields.len() {
+                nfi.push(FieldInit_new(fields.get(i).name, fixup_generic_calls_expr(fields.get(i).value, generics, gm, current_func)));
+                i = i + 1;
+            }
+            var nsp: OptBoxExpr = OptBoxExpr::None;
+            match spread {
+                OptBoxExpr::Some(se) => { nsp = OptBoxExpr::Some(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(se), generics, gm, current_func))); }
+                OptBoxExpr::None => {}
+            }
+            return Expr::StructLit(sname, nfi, nsp);
+        }
+        Expr::Match(scrut, arms) => {
+            return Expr::Match(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(scrut), generics, gm, current_func)), fixup_match_arms(arms, generics, gm, current_func));
+        }
+        Expr::TryBlock(tbody) => { return Expr::TryBlock(fixup_generic_calls(tbody, generics, gm, current_func)); }
         other => { return other; }
     }
     return expr;
@@ -1842,8 +2089,8 @@ pub fn process_func(func: Func, ctx: &mut MonoCtx) -> Func {
             func.body.get(i),
             ctx.generics,
             ctx.generic_methods,
-            calls_to_instantiate,
-            method_calls_to_instantiate,
+            &mut calls_to_instantiate,
+            &mut method_calls_to_instantiate,
             func);
         i = i + 1;
     }
@@ -1858,13 +2105,7 @@ pub fn process_func(func: Func, ctx: &mut MonoCtx) -> Func {
 
         match generic_funcs_get(ctx.generics, callee) {
             OptGenericFunc::Some(gen) => {
-                var param_types: Vec<Type> = Vec::new();
-                var j: i64 = 0;
-                while j < gen.func.params.len() {
-                    param_types.push(gen.func.params.get(j).ty);
-                    j = j + 1;
-                }
-                var subst: Vec<SubstEntry> = infer_subst(param_types, arg_types, gen.type_params);
+                var subst: Vec<SubstEntry> = subst_with_result(gen.func, arg_types, gen.type_params);
 
                 // Check that all type params are bound
                 var all_bound: bool = true;
@@ -1887,7 +2128,7 @@ pub fn process_func(func: Func, ctx: &mut MonoCtx) -> Func {
                     ctx.instantiated.push(instantiated);
                 }
 
-                rename_set(local_renames, callee, mangled);
+                rename_set(&mut local_renames, callee, mangled);
             }
             OptGenericFunc::None => {}
         }
@@ -1905,22 +2146,7 @@ pub fn process_func(func: Func, ctx: &mut MonoCtx) -> Func {
 
         match generic_methods_get(ctx.generic_methods, struct_name, method_name) {
             OptGenericMethod::Some(gen) => {
-                var param_types: Vec<Type> = Vec::new();
-                var j: i64 = 0;
-                while j < gen.func.params.len() {
-                    param_types.push(gen.func.params.get(j).ty);
-                    j = j + 1;
-                }
-                var subst: Vec<SubstEntry> = infer_subst(param_types, arg_types, gen.type_params);
-
-                // Bind any unbound type params to a placeholder
-                var k: i64 = 0;
-                while k < gen.type_params.len() {
-                    if !subst_contains(subst, gen.type_params.get(k)) {
-                        subst_set(subst, gen.type_params.get(k), Type::I32);
-                    }
-                    k = k + 1;
-                }
+                var subst: Vec<SubstEntry> = method_subst(gen.func, gen.type_params, arg_types, entry.recv_ty);
 
                 var mangled: str = mangle_method(struct_name, method_name, subst, gen.type_params);
 
@@ -1929,7 +2155,7 @@ pub fn process_func(func: Func, ctx: &mut MonoCtx) -> Func {
                     ctx.instantiated.push(instantiated);
                 }
 
-                rename_set(method_renames, method_name, mangled);
+                rename_set(&mut method_renames, method_name, mangled);
             }
             OptGenericMethod::None => {}
         }
@@ -1937,12 +2163,13 @@ pub fn process_func(func: Func, ctx: &mut MonoCtx) -> Func {
     }
 
     // Fixup call sites for generics with multiple instantiations
-    var fixed_body: Vec<Stmt> = fixup_generic_calls(func.body, ctx.generics, func);
-    // Apply type substitution (no call renames since fixup already did them)
+    var fixed_body: Vec<Stmt> = fixup_generic_calls(func.body, ctx.generics, ctx.generic_methods, func);
+    // Apply type substitution (no renames: fixup renamed each call site from
+    // its own argument and receiver types)
     var new_body: Vec<Stmt> = Vec::new();
     i = 0;
     while i < fixed_body.len() {
-        new_body.push(subst_stmt(fixed_body.get(i), subst_new(), rename_new(), method_renames));
+        new_body.push(subst_stmt(fixed_body.get(i), subst_new(), rename_new(), rename_new()));
         i = i + 1;
     }
 
@@ -2011,8 +2238,8 @@ pub fn collect_generic_calls_stmt(
     stmt: Stmt,
     generics: Vec<GenericFuncEntry>,
     generic_methods: Vec<GenericMethodEntry>,
-    calls: Vec<GenericCallEntry>,
-    method_calls: Vec<GenericMethodCallEntry>,
+    calls: &mut Vec<GenericCallEntry>,
+    method_calls: &mut Vec<GenericMethodCallEntry>,
     current_func: Func,
 ) {
     collect_generic_calls_stmt_with_hint(stmt, generics, generic_methods, calls, method_calls, current_func, OptType::None);
@@ -2022,8 +2249,8 @@ pub fn collect_generic_calls_stmt_with_hint(
     stmt: Stmt,
     generics: Vec<GenericFuncEntry>,
     generic_methods: Vec<GenericMethodEntry>,
-    calls: Vec<GenericCallEntry>,
-    method_calls: Vec<GenericMethodCallEntry>,
+    calls: &mut Vec<GenericCallEntry>,
+    method_calls: &mut Vec<GenericMethodCallEntry>,
     current_func: Func,
     expected_ty: OptType,
 ) {
@@ -2255,8 +2482,8 @@ pub fn collect_generic_calls_expr_with_hint(
     expr: Expr,
     generics: Vec<GenericFuncEntry>,
     generic_methods: Vec<GenericMethodEntry>,
-    calls: Vec<GenericCallEntry>,
-    method_calls: Vec<GenericMethodCallEntry>,
+    calls: &mut Vec<GenericCallEntry>,
+    method_calls: &mut Vec<GenericMethodCallEntry>,
     current_func: Func,
     expected_ty: OptType,
 ) {
@@ -2268,6 +2495,12 @@ pub fn collect_generic_calls_expr_with_hint(
                 while i < args.len() {
                     arg_types.push(infer_expr_type_with_hint(args.get(i), current_func, expected_ty));
                     i = i + 1;
+                }
+                // The expected type follows the arguments: it binds what they
+                // leave unbound (see subst_with_result)
+                match expected_ty {
+                    OptType::Some(h) => { arg_types.push(h); }
+                    OptType::None => {}
                 }
                 calls.push(GenericCallEntry_new(callee, arg_types));
             }
@@ -2329,7 +2562,7 @@ pub fn collect_generic_calls_expr_with_hint(
                             arg_types.push(infer_expr_type_with_hint(args.get(i), current_func, expected_ty));
                             i = i + 1;
                         }
-                        method_calls.push(GenericMethodCallEntry_new(sn, method, arg_types));
+                        method_calls.push(GenericMethodCallEntry_new(sn, method, arg_types, infer_expr_type(recv_expr, current_func)));
                     }
                 }
                 OptStr::None => {}
@@ -2530,13 +2763,16 @@ pub fn infer_expr_type_with_hint(expr: Expr, func: Func, hint: OptType) -> Type 
 
 pub fn infer_expr_type(expr: Expr, func: Func) -> Type {
     match expr {
-        Expr::IntLit(n) => {
-            if n > 2147483647 || n < -2147483648 {
-                return Type::I64;
-            }
-            return Type::I32;
-        }
+        // An integer literal is an i64, as everywhere else in the language
+        Expr::IntLit(n) => { return Type::I64; }
         Expr::FloatLit(f) => { return Type::F64; }
+        Expr::Call(callee, _) => {
+            if g_mono_ret_index != 0 {
+                var at: i64 = HashMap_get(g_mono_ret_index, callee);
+                if at > 0 { return g_mono_ret_types.get(at - 1); }
+            }
+            return Type::I64;
+        }
         Expr::BoolLit(b) => { return Type::Bool; }
         Expr::StringLit(s) => { return Type::Str; }
         Expr::Ident(name) => {

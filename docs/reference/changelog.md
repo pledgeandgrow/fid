@@ -1,5 +1,30 @@
 # Fides Language Changelog
 
+## Session 41 — Scheduler, Compile Speed, ELF Targets (Nov 3, 2026)
+
+- **PE scheduler:** sleeping tasks live in an indexed deadline min-heap;
+  fd/join/pool waiters in a separate intrusive FIFO registry; a task state
+  field (runnable / registry-blocked / requeued / timer-only) makes double
+  enqueue impossible. The poller no longer scans live task blocks for
+  expirations. `bench_sleepers.fd` arms 100,000 sleepers and awaits them
+  all: passes.
+- **Frontend ~100 ms lighter:** `comptime` substitution skips its 12
+  bounded re-clone iterations when the program defines no `comptime pf`
+  function (91 → 14 ms on hello); trusted stdlib bodies skip per-function
+  checks and error reporting (`FIDES_CHECK_STDLIB` restores them). `emit`
+  on hello: ~387 → ~301 ms.
+- **All three ELF targets build:** `build --target x86-64-linux`,
+  `arm64-linux` and `riscv64-linux` emit valid static ELFs with no external
+  tools. Fixed: VReg names leaking into asm (`str v6`, `sd v9`), `fp` and
+  `return` mnemonics the assemblers never defined, unsigned-only immediates
+  on negative offsets (`add → sub`; `[x29, #-N]` → LDUR/STUR), and stack
+  slots deeper than the ±256-byte unscaled range (via x9).
+- **Suite:** 363/363 interp, 367/367 C, 370/370 PE; 92/92 expected-fail
+  correctly fail on all three backends (`CC="zig cc"`).
+- **Known harness caveat:** tests in `interp_skip_tests` take their
+  reference output from the C binary — with no working `CC`, their PE runs
+  compare against empty output and fail. Not a scheduler bug.
+
 ## Session 40 — Memory and Error Tracks (Nov 2, 2026)
 
 - **Error context:** `Result.context(msg)`, `Result.with_context(f)`,
