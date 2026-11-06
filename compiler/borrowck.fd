@@ -229,6 +229,15 @@ pub struct BorrowChecker {
 
     // Phase 6: NLL. Maps each variable name to the last statement index.
     pub last_use: Vec<StringI64Entry>,
+    // name -> index in last_use + 1 (release D8: the lists were searched by
+    // name on every statement, quadratic in the size of a function)
+    pub last_use_index: i64,
+    // Variables a `for` loop is iterating over, innermost last (release K4):
+    // changing one inside the loop body is an error
+    pub iterating: Vec<str>,
+    // Functions not to check: "fn:name", "impl:Type:method" (core, when an
+    // earlier build checked this same core clean; release D9). 0 = none.
+    pub skip_bodies: i64,
 
     // Phase 6: Current statement index within the function body.
     pub stmt_index: i64,
@@ -260,6 +269,9 @@ pub fn BorrowChecker_new(mode: BorrowckMode) -> BorrowChecker {
         reserved_mut_borrows: Vec::new(),
         in_reservation_phase: false,
         last_use: Vec::new(),
+        last_use_index: HashMap_new(),
+        iterating: Vec::new(),
+        skip_bodies: 0,
         stmt_index: 0,
         errors: Vec::new(),
         warnings: Vec::new(),
@@ -282,7 +294,7 @@ pub fn check(self: &mut BorrowChecker, program: Program) -> void {
     var i: i64 = 0;
     while i < program.funcs.len() {
         var f: Func = program.funcs.get(i);
-        check_func(self, f);
+        if !bc_skips(self, "fn:" + f.name) { check_func(self, f); }
         i = i + 1;
     }
     var j: i64 = 0;
@@ -291,10 +303,22 @@ pub fn check(self: &mut BorrowChecker, program: Program) -> void {
         var k: i64 = 0;
         while k < impl_.methods.len() {
             var m: Func = impl_.methods.get(k);
-            check_func(self, m);
+            if !bc_skips(self, "impl:" + impl_.struct_name + ":" + m.name) { check_func(self, m); }
             k = k + 1;
         }
         j = j + 1;
+    }
+    // Trait impl bodies too (release K5: they were never checked)
+    var t: i64 = 0;
+    while t < program.trait_impls.len() {
+        var ti: TraitImpl = program.trait_impls.get(t);
+        var tm: i64 = 0;
+        while tm < ti.methods.len() {
+            var m2: Func = ti.methods.get(tm);
+            if !bc_skips(self, "trait:" + ti.type_name + ":" + m2.name) { check_func(self, m2); }
+            tm = tm + 1;
+        }
+        t = t + 1;
     }
 }
 
@@ -315,6 +339,8 @@ pub fn check_func(self: &mut BorrowChecker, func: Func) -> void {
     self.reserved_mut_borrows.clear();
     self.in_reservation_phase = false;
     self.last_use.clear();
+    HashMap_clear(self.last_use_index);
+    self.iterating.clear();
     self.stmt_index = 0;
 
     // Phase 6: NLL pre-pass. Compute the last statement index that references
@@ -764,27 +790,24 @@ fn collect_var_uses_expr(self: &mut BorrowChecker, expr: Expr, idx: i64) -> void
 
 // Set the last-use index for a variable. If it already exists, update it.
 fn last_use_set(self: &mut BorrowChecker, name: str, idx: i64) -> void {
-    var i: i64 = 0;
-    while i < self.last_use.len() {
-        if self.last_use.get(i).key == name {
-            self.last_use.get(i).val = idx;
-            return;
-        }
-        i = i + 1;
+    if HashMap_contains(self.last_use_index, name) {
+        self.last_use.get(HashMap_get(self.last_use_index, name) - 1).val = idx;
+        return;
     }
     self.last_use.push(StringI64Entry_new(name, idx));
+    HashMap_insert(self.last_use_index, name, self.last_use.len());
 }
 
 // Get the last-use index for a variable, or -1 if not found.
 fn last_use_get(self: &BorrowChecker, name: str) -> i64 {
-    var i: i64 = 0;
-    while i < self.last_use.len() {
-        if self.last_use.get(i).key == name {
-            return self.last_use.get(i).val;
-        }
-        i = i + 1;
-    }
-    return -1;
+    if !HashMap_contains(self.last_use_index, name) { return -1; }
+    return self.last_use.get(HashMap_get(self.last_use_index, name) - 1).val;
+}
+
+/// Whether `key` ("fn:name", "impl:Type:method") is a body not to check.
+pub fn bc_skips(self: &BorrowChecker, key: str) -> bool {
+    if self.skip_bodies == 0 { return false; }
+    return HashMap_contains(self.skip_bodies, key);
 }
 
 // --- Phase 6: NLL -- release dead borrows ----------------------------------
@@ -850,7 +873,7 @@ fn scope_stack_remove_name(self: &mut BorrowChecker, name: str) -> void {
     var i: i64 = 0;
     while i < scope.len() {
         if scope.get(i) == name {
-            scope.remove(i);
+            self.scope_stack.get(top).items.remove(i);
             return;
         }
         i = i + 1;
@@ -948,6 +971,9 @@ fn extract_field_path(expr: Expr) -> OptStr {
                 OptStr::None => { return OptStr::None; }
             }
         }
+        // `&v[i]` borrows v itself (release K5): a push could move the
+        // elements while the reference is alive
+        Expr::Index(arr, _) => { return extract_field_path(bc_box_expr_unbox(arr)); }
         _ => { return OptStr::None; }
     }
 }
@@ -1072,7 +1098,7 @@ fn shared_borrows_remove_borrower(self: &mut BorrowChecker, borrowed: str, borro
             var j: i64 = 0;
             while j < borrowers.len() {
                 if borrowers.get(j) == borrower {
-                    borrowers.remove(j);
+                    self.shared_borrows.get(i).borrowers.remove(j);
                     return;
                 }
                 j = j + 1;
@@ -1191,6 +1217,10 @@ fn holder_note(self: &BorrowChecker, path: str, want: i64) -> str {
 // Rule 1 & 2: creating a borrow. is_mut true = &mut x, false = &x.
 // borrowed_path is a field path like "s" or "s.x" or "s.inner.z".
 fn create_borrow(self: &mut BorrowChecker, borrowed_path: str, borrower: str, is_mut: bool, line: i64) -> void {
+    if is_mut && bc_is_iterating(self, borrowed_path) {
+        violation(self, line, "cannot create &mut " + borrowed_path + " while a `for` loop iterates over it.\n    Fix: collect the changes and apply them after the loop.");
+        return;
+    }
     if is_mut {
         // Phase 4: Two-phase borrows. If in reservation phase, don't activate
         // the &mut yet -- just reserve it.
@@ -1279,6 +1309,11 @@ fn activate_reserved_borrows(self: &mut BorrowChecker) -> void {
 // Rule 3: mutating a variable. Fails if any borrow is active on it or on
 // any field path under it.
 fn check_mutation(self: &mut BorrowChecker, var: str, line: i64) -> void {
+    if bc_is_iterating(self, var) {
+        violation(self, line, "cannot change " + var + " while a `for` loop iterates over it: the loop would read past a resize or skip elements.
+    Fix: collect the changes in another Vec and apply them after the loop.");
+        return;
+    }
     if has_shared_borrow_inclusive(self, var) {
         violation(self, line, "cannot mutate " + var + ": shared borrow(s) are active on it or its fields" + holder_note(self, var, 0));
     }
@@ -1288,6 +1323,18 @@ fn check_mutation(self: &mut BorrowChecker, var: str, line: i64) -> void {
 }
 
 // --- Violation reporting --------------------------------------------------
+
+/// Whether a `for` loop around this point iterates over `var` (or the
+/// variable `var` is a field of).
+fn bc_is_iterating(self: &BorrowChecker, var: str) -> bool {
+    var i: i64 = 0;
+    while i < self.iterating.len() {
+        var it: str = self.iterating.get(i);
+        if it == var || str_starts_with(var, it + ".") { return true; }
+        i = i + 1;
+    }
+    return false;
+}
 
 fn violation(self: &mut BorrowChecker, line: i64, msg: str) -> void {
     var full: str = "";
@@ -1361,9 +1408,23 @@ fn check_stmt(self: &mut BorrowChecker, stmt: Stmt) -> void {
             check_expr(self, ptr_expr);
             check_expr(self, expr);
         }
-        Stmt::FieldAssign(object, _, _, expr, _) => {
+        Stmt::FieldAssign(object, field, _, expr, fline) => {
             check_expr(self, object);
             check_expr(self, expr);
+            // `s.x = 1` changes s.x: rejected while s, s.x or a field of
+            // s.x is borrowed (release K5)
+            match object {
+                Expr::Ident(oname) => {
+                    var fpath: str = oname + "." + field;
+                    check_mutation(self, fpath, fline);
+                    if has_shared_borrow_on_prefix(self, fpath) {
+                        violation(self, fline, "cannot assign to " + fpath + ": " + oname + " is borrowed" + holder_note(self, oname, 0));
+                    } else if has_mut_borrow_on_prefix(self, fpath) {
+                        violation(self, fline, "cannot assign to " + fpath + ": " + oname + " is mutably borrowed" + holder_note(self, oname, 1));
+                    }
+                }
+                _ => {}
+            }
         }
         Stmt::Expr(e, _) => { check_expr(self, e); }
         Stmt::Return(opt_e, _) => {
@@ -1409,11 +1470,27 @@ fn check_stmt(self: &mut BorrowChecker, stmt: Stmt) -> void {
             check_expr(self, iterator);
             push_scope(self);
             declare_var(self, loop_var);
+            // `for x in v` / `for x in v.iter()`: v is read by the loop
+            var iter_var: str = "";
+            match iterator {
+                Expr::Ident(iv) => { iter_var = iv; }
+                Expr::MethodCall(irecv, im, _) => {
+                    if im == "iter" || im == "keys" || im == "values" {
+                        match bc_box_expr_unbox(irecv) {
+                            Expr::Ident(iv2) => { iter_var = iv2; }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if iter_var != "" { self.iterating.push(iter_var); }
             var b: i64 = 0;
             while b < body.len() {
                 check_stmt(self, body.get(b));
                 b = b + 1;
             }
+            if iter_var != "" { self.iterating.pop(); }
             pop_scope(self);
         }
         Stmt::Loop(body, _) => {

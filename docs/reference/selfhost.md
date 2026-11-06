@@ -1,15 +1,39 @@
 # Self-Hosted Fides Compiler
 
-> **Status (Oct 27, 2026, session 34):** the self-hosted compiler is the
-> release compiler. `RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh` builds it
-> in three stages, checks that stages 2 and 3 emit identical C, installs
-> `release/fid.exe` and runs a program from an installed layout; the
-> installer ships it as `fid.exe`. Against `fidesc`: `run` matches on all
-> 302 test programs, `ccompile` on 242 of 243 (`test_sqlite` needs
-> libsqlite3), and all 59 expected-fail tests are rejected. Open: the
-> self-hosted native backend (`build --native`) crashes, so `build` and
-> `ccompile` go through C. Most of this file is the history of getting here;
-> commands below that mention `release.fid.exe` or `C:\tcc` are historical.
+> **Status (Nov 6, 2026):** the self-hosted compiler `fid` (`compiler/*.fd`,
+> 61 modules, 133,688 lines) is the release compiler and defines the
+> language ([reference.md](reference.md)); the Rust compiler `fidesc`
+> (`src/*.rs`, 57 files, 112,511 lines) is frozen and builds stage 1 and runs
+> the test harness. `RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh` builds
+> `fid` in three stages, checks that stages 2 and 3 emit identical C (49 MB,
+> Nov 6), installs `release/fid.exe` and runs a program from an installed
+> layout; the installer ships it as `fid.exe`. Stage 1 is built from a
+> pinned stage 0 (`release/stage0/fid.exe`, checked against
+> `scripts/stage0.sha256`) when one exists, otherwise cold from `fidesc`;
+> `PIN=1` pins the last stage after a fixpoint. No stage 0 is pinned yet.
+> `fid` compiles itself to C in ~133 s (type check
+> 59 s, borrow check 16 s, lowering 20 s, C generation 12 s), ~6x slower than
+> `fidesc` (~21 s).
+>
+> Against `fidesc` (Oct 27): `run` matched on all 302 test programs of that
+> date, `ccompile` on 242 of 243 (`test_sqlite` needs libsqlite3), and all 59
+> expected-fail tests were rejected. The last full suite run is Nov 2 (Rust
+> harness, `fidesc` as compiler: interp 339/339, C 343/343, PE 345/345,
+> expected-fail 89/89); it has not been rerun with the Nov 4–6 compiler,
+> whose additions (generics, `if`/`match` values, `@cfg`, memory freeing,
+> borrow checks K4/K5, `@send`, `parallel`, async with f64/struct, safety
+> annotations and `fid qualify`, borrowed strings and `@scoped`, HashMap
+> integer keys, higher-order effects) were checked with `fid run`,
+> `fid ccompile` and `fid emit` on their tests.
+>
+> Native Windows executables come from `fid emit` (compiler/pe_ir*.fd, with
+> the `compiler/iropt.fd` optimizer), with no C compiler; native async/tasks
+> crash there. The older `build --native` path (PIR, compiler/pe.fd) crashes,
+> so `build` and `ccompile` go through C. Open items:
+> [known-bugs.md §2f](known-bugs.md#2f-nov-46-2026--open-items-and-fixes).
+> Current counts are in [CURRENT.md → Numbers](../../CURRENT.md#numbers).
+> Most of this file is the history of getting here; commands below that
+> mention `release.fid.exe` or `C:\tcc` are historical.
 
 > Consolidated 2026-10-24 from selfhost/ README, agent-guide, COORDINATION, architecture, build-pipeline, language-constraints, path-to-fixpoint, capability-comparison, vision-analysis. Living ledgers now live alongside it in `docs/reference/`: `known-bugs.md` (includes the port-gap-analysis appendix), `calling-conventions.md`.
 
@@ -114,17 +138,19 @@ cargo build --release
 - **23/23 self-host tests pass** on interp + PE (tests/compiler/)
 - **Strict fixpoint (VERIFIED)** — `fides-c4.c` == `fides-c5.c` (byte-identical, ~29.7 MB) re-verified in session 29. The earlier `fides-c2.c` == `fides-c3.c` proof (session 15) was superseded, not lost.
 
-#### Codebase size (Session 30, Oct 2026)
-| Component | Files | LOC |
-|-----------|-------|-----|
-| Self-hosted compiler (`compiler/*.fd`) | 54 | 104,439 |
-| Rust compiler (`src/*.rs`) | 55 | 100,935 |
-| Stdlib (`stdlib/*.fd`) | 104 | 30,446 |
-| Tests (`tests/bootstrap/`) | 302 .fd | — |
-| Tests (`tests/selfhost/`) | 46 .fd | — |
-| Stdlib (`stdlib/*.fd`) | 99 | 28,370 |
-| Test files (`tests/*.fd` + `tests/selfhost/*.fd`) | 261 + 42 = 303 | — |
+#### Codebase size (Nov 6, 2026, `wc -l`)
+| Component | Files | Lines |
+|-----------|-------|-------|
+| Self-hosted compiler (`compiler/*.fd`) | 61 | 133,688 |
+| Rust compiler (`src/*.rs`) | 57 | 112,511 |
+| Stdlib (`stdlib/*.fd`) | 137 (+ 4 in `pe_runtime/`) | 43,576 |
+| Tests (`tests/bootstrap/`) | 493 .fd (452 top level, 91 expected-fail) | — |
+| Tests (`tests/selfhost/`) | 51 .fd | — |
+| Examples | 10 | — |
 | Installer (`installer/`) | 5 | — |
+
+Session 30 (Oct 2026) for comparison: compiler 54 files / 104,439 lines, Rust
+55 / 100,935, stdlib 104 / 30,446, 302 bootstrap tests.
 
 #### Test results (v1.0.0, Session 24)
 | Backend | Result |
@@ -1154,8 +1180,12 @@ Before touching any file:
 > sessions 12–14. Treat them as approximate guides, not exact references.
 > Re-verify with `grep` before editing based on these numbers.
 >
-> **Module count:** 25 `.fd` files in `compiler/` (57,021 LOC total).
-> The "18 modules" count in older session notes is obsolete.
+> **Module count:** 61 `.fd` files in `compiler/` (133,688 lines, Nov 6);
+> the breakdown below was written for the 25 modules of session 16 (57,021
+> lines) and does not cover the later ones (among them `interp.fd`,
+> `escape.fd`, `secrecy.fd`, `checks.fd`, `iropt.fd`, `pe_ir*.fd`,
+> `green_thread.fd`, `cowcheck.fd`). The "18 modules" count in older session
+> notes is obsolete.
 
 ### The Pipeline (Simplified)
 
@@ -1955,8 +1985,8 @@ Also a compiled artifact. The source is `compiler/lower.fd`.
 Download `Fides-Setup-1.0.0.exe` from
 [GitHub Releases](https://github.com/pledgeandgrow/p-lang/releases/tag/v1.0.0)
 and run it. This installs:
-- `fides.exe` (compiler) to `C:\Program Files\Fides\`
-- Standard library (99 modules) to `C:\Program Files\Fides\stdlib\`
+- the compilers to `C:\Program Files\Fides\` (`installer/fides.nsi` today ships `fid.exe`, the self-hosted compiler, plus `fidesc.exe`, `ark.exe`, `scribe.exe`, `veil.exe`)
+- Standard library to `C:\Program Files\Fides\stdlib\` (99 modules in v1.0.0; 137 in the tree on Nov 6)
 - C runtime files to `C:\Program Files\Fides\runtime\`
 - Documentation to `C:\Program Files\Fides\docs\`
 - PATH integration (system-wide)
@@ -2379,7 +2409,7 @@ Probe tests for self-hosting behavior:
 
 ```
 p-lang/
-├── compiler/             # Self-hosted Fides compiler modules (25 .fd files, 57,021 LOC)
+├── compiler/             # Self-hosted Fides compiler modules (61 .fd files, 133,688 lines, Nov 6; list below is from session 16)
 │   ├── main.fd           # CLI entry point (ccompile + build + lsp + test + fmt + ...)
 │   ├── compiler.fd       # Pipeline driver
 │   ├── token.fd          # Token kinds (133 variants)
@@ -2407,10 +2437,10 @@ p-lang/
 │   └── inc.fd            # Incremental compilation cache
 ├── docs/selfhost/        # This documentation
 ├── release/              # Self-hosted build artifacts (gitignored)
-├── src/                  # Rust reference compiler (52 .rs files, 84,447 LOC)
-├── stdlib/               # Fides standard library (99 .fd modules, 28,370 LOC)
-├── tests/                # Language tests (225+ .fd files)
-├── tests/selfhost/       # Self-host module tests (23 .fd files)
+├── src/                  # Rust reference compiler, frozen (57 .rs files, 112,511 lines)
+├── stdlib/               # Fides standard library (137 .fd modules, 43,576 lines)
+├── tests/bootstrap/      # Language tests (493 .fd files)
+├── tests/selfhost/       # Self-host module tests (51 .fd files)
 ├── tests/selfhost/       # Bootstrap probe tests
 ├── target/               # Rust build artifacts
 ├── verify.sh             # Full Rust compiler verification

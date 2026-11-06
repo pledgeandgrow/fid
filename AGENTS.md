@@ -4,15 +4,16 @@
 > Fides compiler safely. Read this before making changes.
 >
 > **Fides is self-hosted and independent.** The primary compiler is in
-> `compiler/*.fd` (59 modules, 127,707 LOC). The Rust source in `src/*.rs`
-> (56 files, 109,561 LOC) is the bootstrap reference, used when
-> `compiler/*.fd` changes.
+> `compiler/*.fd` (61 modules, ~134K lines). The Rust source in `src/*.rs`
+> (57 files, ~113K lines) is the bootstrap reference, frozen: it builds
+> stage 1 when `compiler/*.fd` changes and runs the test harness. The
+> language is what `fid` accepts: docs/reference/reference.md.
 >
 > **The self-hosted compiler is the release compiler:** `RELEASE=1
 > ./scripts/bootstrap.sh` builds it in 3 stages (fixpoint checked) into
-> `release/fid.exe`, which the installer ships as `fid.exe`. Its
-> `run` and `ccompile` match the Rust compiler on the test programs and
-> examples (see "Known Bugs" #1 for the few exceptions).
+> `release/fid.exe`, which the installer ships as `fid.exe`. It checks
+> more than the Rust compiler (generics, borrows, safety annotations,
+> borrowed strings): see docs/reference/language-guide.md § 10.
 
 ## Build & Test Commands
 
@@ -155,42 +156,56 @@ cargo build
 # Manual trigger: gh workflow run build-installer.yml -f version=1.0.0
 ```
 
-## Current Baseline (post-session-38, Nov 2 2026)
+## Current Baseline (Nov 6 2026; full suite last run Nov 2)
+
+> Project-wide numbers live in `CURRENT.md` → "Numbers"; keep the two in step.
 
 ```
 SELF-HOSTED COMPILER (primary source):
-  compiler/*.fd:  59 modules, 127,707 LOC — THE COMPILER
-  Fixpoint:       VERIFIED byte-for-byte (fides-c4.c == fides-c5.c, ~29.7 MB;
-                  re-verified stage2==stage3 in session 29)
+  compiler/*.fd:  61 modules, 133,688 lines — THE COMPILER
+  Fixpoint:       VERIFIED byte-for-byte (stage2 == stage3, 49 MB of C,
+                  Nov 6; checked by every RELEASE=1 bootstrap)
   Bootstrap:      5 generations verified (Rust → c1 → c2 → c3 → c4 → c5)
   Binary:         release/fid.exe (RELEASE=1 scripts/bootstrap.sh):
-                  fixpoint; run 302/302 and ccompile 242/243 test programs
-                  match fidesc (Known Bugs #1). Shipped as fid.exe.
-  Self-compile:   stage 2 `dump-c compiler/main.fd` 112–137 s (Nov 2; was ~600 s),
+                  fixpoint. Shipped as fid.exe. The Nov 4–6 compiler was
+                  checked on the new and key tests on all 3 backends; the
+                  full suite has not been rerun with it.
+  Self-compile:   `dump-c compiler/main.fd` ~133 s (Nov 6: type check 59 s),
                   fidesc 21 s. The compiler is built at -O0 (bootstrap.sh).
 
 RUST BOOTSTRAP (reference + test harness):
-  src/*.rs:       56 files, 109,561 LOC — bootstrap reference
+  src/*.rs:       57 files, 112,511 lines — bootstrap reference (frozen)
   Used when:      compiler/*.fd changes (builds stage 1); runs `fidesc test`
   Suite (Nov 2):  interp 339/339, C 343/343, PE 345/345, expected-fail 89/89
+                  (saved baseline: an earlier run, 334/338/341)
 
 WINDOWS INSTALLER (v1.0.0):
   installer/:     NSIS script + build helper
-  CI:            .github/workflows/build-installer.yml (builds on release tags)
+  CI:            .github/workflows/build-installer.yml is not in this
+                 checkout (no .github/ directory); the user runs CI
   Output:        Fides-Setup-1.0.0.exe (2.5 MB, tested on Windows)
   Ships:         fid.exe = self-hosted (release/fid.exe), fidesc.exe =
                  Rust compiler, stdlib/ and examples/ beside them
 
 TESTS:
-  tests/bootstrap/: 393 .fd files (fidesc test; plus capability/, effects/,
-                    regions/, safety/)
+  tests/bootstrap/: 452 .fd at top level (91 expected-fail), 493 with
+                    capability/, effects/, regions/, safety/, diagnostics/
   tests/selfhost/:  51 .fd files (verify-selfhost.sh; baseline saved 36/47×3)
   Baseline:         tests/bootstrap/baseline/test_results.txt
 
 STDLIB:
-  stdlib/*.fd:    133 modules, 42,018 LOC (kernel/uefi moved to fides-os project)
+  stdlib/*.fd:    137 modules, 43,576 lines (+ 4 in stdlib/pe_runtime/;
+                  kernel/uefi moved to the fides-os project)
 
 RECENT IMPROVEMENTS:
+  Nov 4–6:        fid: generics (0002), if/match values, @cfg, freeing of
+                  provably finished locals (C5–C8), K4/K5 borrow checks, K7
+                  effects, @send on spawn args (H4), parallel branches (H7),
+                  async f64/struct (H9), native per-thread free lists (H8),
+                  safety annotations enforced + `fid qualify` + safety-rules.md
+                  (L1–L4), owned/borrowed strings (M11), integer-key HashMap,
+                  per-call-site higher-order effects, iropt on the native path,
+                  core checked once (D9). Copy-on-write written, LOWER_COW off.
   Session 38:     C path: no per-call call-stack push/pop; panic traces from
                   the machine stack (__p_frames / __p_fn_name over the
                   __p_fns table), stack overflow from the OS guard page
@@ -297,7 +312,7 @@ touching them.
 | `src/coff.rs` | **HIGH** | COFF object file format. Same byte-level risk as PE/ELF. |
 | `src/macho.rs` | **HIGH** | Mach-O object file format. Same byte-level risk. |
 | `src/codegen_x64.rs` | **HIGH** | PIR L3 → x86-64 instruction encoding. ModRM/SIB bytes, REX prefixes, ABI rules. |
-| `src/codegen_c.rs` | **HIGH** | IR → C99. ABI casts, struct offsets, function renaming. 164/165 test parity (1 fail: test_compiler_sized, user-added). Phase 10B: Print instruction calls Fides Vec_to_str/HashMap_to_str for formatting. Channels: p_chan_* with pthread mutex+condvar. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic. Rc/Arc runtime via p_rc_incr/p_rc_decr. ML3: Autograd tape (ag_tape, ag_record, p_autograd_backward) with reverse-mode AD for add/sub/mul/matmul/scale/relu/sigmoid/sum/mean. ML11: Checkpoint mode stores input data for relu/sigmoid backward. ML12: DP noise/budget builtins. ML13: TP builtins (identity in single-rank). ML9: KV cache with sliding window eviction. ML10: Quantization (quantize/dequantize/qmatmul/find_quant_params). Tensor printing via p_tensor_to_str with %.4f for non-integers. Dlopen simulated to match interpreter (sequential handles). |
+| `src/codegen_c.rs` | **HIGH** | IR → C99. ABI casts, struct offsets, function renaming. 343/343 test parity (Nov 2). Phase 10B: Print instruction calls Fides Vec_to_str/HashMap_to_str for formatting. Channels: p_chan_* with pthread mutex+condvar. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic. Rc/Arc runtime via p_rc_incr/p_rc_decr. ML3: Autograd tape (ag_tape, ag_record, p_autograd_backward) with reverse-mode AD for add/sub/mul/matmul/scale/relu/sigmoid/sum/mean. ML11: Checkpoint mode stores input data for relu/sigmoid backward. ML12: DP noise/budget builtins. ML13: TP builtins (identity in single-rank). ML9: KV cache with sliding window eviction. ML10: Quantization (quantize/dequantize/qmatmul/find_quant_params). Tensor printing via p_tensor_to_str with %.4f for non-integers. Dlopen simulated to match interpreter (sequential handles). |
 | `src/pir.rs` | **HIGH** | PIR L1/L2/L3 transforms. A bad lowering propagates to all backends. |
 | `src/lower.rs` | **MEDIUM** | AST → SSA IR. Changes here affect interpreter + all backends. `runtime_effects()` helper sets Write/Alloc/IO effects on `p_*` builtin calls — without this, the optimizer DCE's side-effecting calls. `p_vec_*` extern declarations (23 functions) ensure correct calling convention. |
 | `src/typechecker.rs` | **MEDIUM** | Types + regions + effects + capabilities. Wrong rejection = broken code; wrong acceptance = silent miscompilation. |
@@ -306,7 +321,7 @@ touching them.
 | `src/comptime.rs` | **LOW** | Comptime evaluation engine. Evaluates `comptime <expr>`, `comptime { block }`, `comptime reflect_op(T)`, `comptime gen { block }` at compile time. I-5A: Aggressive comptime evaluation — auto-evaluates calls to `comptime fn` functions with all-literal args (no explicit `comptime` wrapper needed). I-5D: Comptime loop unrolling — unrolls `for` loops with literal bounds (≤16 iterations, ≤16 body stmts) at AST level. Also eliminates dead `if` branches with literal conditions. |
 | `src/runtime_linux.rs` | **HIGH** | Hand-encoded x86-64 machine code (raw bytes). No assembler — every byte is manual. |
 | `src/linker.rs` | **MEDIUM** | Relocation resolution. Wrong offset = crash or silent corruption. |
-| `src/interp.rs` | **MEDIUM** | The reference oracle (~6060 LOC). If this is wrong, all backends "match" but produce wrong results. `p_vec_new` uses `vec_side_table` to separate raw struct fields from `Value::Vec`. `run_function` auto-detects missing `__env` param and inserts dummy. Self-hosted port in `compiler/interp.fd` (2,839 LOC) covers core execution + 75 helper functions. |
+| `src/interp.rs` | **MEDIUM** | The reference oracle (~6060 LOC). If this is wrong, all backends "match" but produce wrong results. `p_vec_new` uses `vec_side_table` to separate raw struct fields from `Value::Vec`. `run_function` auto-detects missing `__env` param and inserts dummy. Self-hosted port in `compiler/interp.fd` (~7,200 lines) runs every test program `fidesc run` does. |
 
 ## LOWER-RISK FILES
 
@@ -322,16 +337,16 @@ touching them.
 | `src/compiler.rs` | LOW | Pipeline orchestration — changes are visible. Phase 12: `enrich_errors()` post-processes errors with source context + error codes. |
 | `src/diag.rs` | LOW | Diagnostic system — structured error/warning/note/help with error codes, source context, color. Zero external deps. |
 | `src/lsp.rs` | LOW | LSP server — JSON-RPC over stdio, no external deps. |
-| `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. 104 stdlib modules: alloc, animation2d, arena, args, arinc, asset, audio, audio_mixer, banking, bitfield, bits, buffer, camera, can, channel, chunk, clinical, collections, collision_broad, core, crypto, data, db, dp, ecs, ecu, editor, env, events, file, flowfield, fmt, font, fs, game, gameloop, gl, grid, hash, http, image, input, io, iter, json, kv_cache, math, medical, memo, mesh, money, navmesh, net, os, ota, parallel, particles, path, physics, physics3d, plot, privacy, process, profiler, quant, queue, random, raycast, rc, regex, replay, result, scada, scene, sdl, serialize, shader, shape, shard, simd, skel, sort, sprite, sqlite, stack, storage, streaming, string, swift, sync, sys, template, tensor, terrain, test, tilemap, time, touch, typed_strings, ui, units, uuid, vec, volatile. (kernel.fd + uefi.fd moved to the fides-os project.) |
+| `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. 137 stdlib modules, among them: alloc, animation2d, arena, args, arinc, asset, audio, audio_mixer, banking, bitfield, bits, buffer, camera, can, channel, chunk, clinical, collections, collision_broad, core, crypto, data, db, dp, ecs, ecu, editor, env, events, file, flowfield, fmt, font, fs, game, gameloop, gl, grid, hash, http, image, input, io, iter, json, kv_cache, math, medical, memo, mesh, money, navmesh, net, os, ota, parallel, particles, path, physics, physics3d, plot, privacy, process, profiler, quant, queue, random, raycast, rc, regex, replay, result, scada, scene, sdl, serialize, shader, shape, shard, simd, skel, sort, sprite, sqlite, stack, storage, streaming, string, swift, sync, sys, template, tensor, terrain, test, tilemap, time, touch, typed_strings, ui, units, uuid, vec, volatile. (kernel.fd + uefi.fd moved to the fides-os project.) |
 
 ## Known Bugs (Do Not Re-Introduce)
 
 > **Critical Blockers:** See `docs/roadmap/roadmap.md` § Issues & Debates → "Critical
 > Blockers" section for the highest-priority issues that must be fixed
 > before production use:
-> 1. CB1: Safety annotations — core primitives enforced (Session 19), 13 stubs remain
-> 2. CB2: Generic Option<T>/Result<T,E> — ✅ resolved (Session 19)
-> 3. CB3: Backend test parity — ✅ resolved (Oct 27: 280/280 interp, 278/278 C, 282/282 PE)
+> 1. CB1: Safety annotations — ✅ in `fid` (Nov 4): every rule enforced, each with a negative test (docs/reference/safety-rules.md)
+> 2. CB2: Generics — ✅ in `fid` (Nov 3–4, proposal 0002): inference or an error, bounds checked, turbofish; `fidesc` is frozen without it
+> 3. CB3: Backend test parity — ✅ resolved (Nov 2: 339/339 interp, 343/343 C, 345/345 PE)
 > 4. CB4: Parser debug prints — ✅ resolved (Session 19)
 > 5. CB5: Self-hosted compiler build fails — ✅ resolved (Session 20, all 50 modules type-check)
 > 6. CB6: PE emitter stubs — partially resolved (Session 20, 6/15 fixed, 9 p_string_* remain)
@@ -487,6 +502,48 @@ touching them.
    `__p_block_malloc`/`__p_block_free` with `#define` and puts recording
    `p_malloc`/`p_free` after it. Keep code that must call the real block
    allocator between those defines, and nothing else.
+
+21. **A plain string is not a headered one** (`stdlib/core.fd`
+   `p_str_free`, `p_str_length`): a length-headered string has
+   `P_STR_MAGIC` at `s - 16` and its length at `s - 8`. A plain `p_malloc`
+   string can sit right after a block whose last word happens to be the
+   magic (the compiler's own IR of core.fd holds it as a constant), so the
+   magic alone is not enough: `p_str_len_word` also requires the word at
+   `s - 8` to be a plausible length (a block header is negative). Without
+   it, natively built `fid` freed `s - 16` ("Invalid free").
+
+22. **The C runtime frees what it allocated with the same allocator**:
+   strings from `p_malloc` (`p_to_str_float`, `p_file_read`, `p_dir_list`,
+   `p_string_split`, `p_to_str_vec`, `p_to_str_map`) go back through
+   `p_free`, never `free()` (`p_print_float` did: a crash after the second
+   float printed).
+
+23. **Freeing a by-value `Vec` parameter needs copy-on-write**
+   (`compiler/lower.fd`, `lw_drop_function_vecs`): a function may free a
+   `Vec` parameter at its return only when callers pass copy-on-write
+   shares, i.e. when `LOWER_COW` is on. With it off the caller's own header
+   arrives, and freeing it is a double free in the caller (seen as
+   "Double free" in `cc_inherit_supertraits` when the compiler built itself).
+
+24. **Field addresses come from a pointer typed as the struct**
+   (`Lowerer_emit_struct_share`): a pointer typed as what holds the struct
+   (an enum's payload) resolves field indexes against the holder's layout.
+   Bit-cast to `Ptr(Struct)` first. Likewise word offsets of fields come
+   from the layout's `offset`, not from adding up field sizes: an enum
+   field is `(1 + payload)` words.
+
+25. **Copy-on-write** (`LOWER_COW`, off): shares must stay lazy
+   (`Vec_share_deep` records the element kind, `vec_own` copies at the first
+   write) and counted, a struct store must not share fresh values or last
+   uses (`Lowerer_fresh_struct`), and read-only copies are judged on the rest
+   of their block (`Lowerer_readonly_copy_in`). The first eager version ran
+   the self-compile out of memory. With it on the fixpoint holds (Nov 6,
+   4.7 GB peak); run the full suite before switching it on.
+
+26. **Another agent may be editing `core.fd`/`lower.fd`**: build from a
+   snapshot of `compiler/`, `stdlib/` and `scripts/` when files change
+   during a build, or the stage-3 C differs only because a file changed
+   between the stages.
 
 ## NEVER DO THESE (Hard Rules)
 

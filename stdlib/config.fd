@@ -1,0 +1,224 @@
+// Fides Config standard library
+//
+// One declaration feeds a config file (INI), environment variables and
+// command line flags (roadmap CO6). Precedence: --flag > env > file > default.
+// Every error names the key.
+//
+//   use config;
+//   var c = config_new();
+//   config_opt(&mut c, "port", CONFIG_INT, "8080");
+//   config_opt(&mut c, "host", CONFIG_STR, "127.0.0.1");
+//   config_req(&mut c, "api_key", CONFIG_STR);
+//   config_load(&mut c, "app.ini", "APP_");
+//   // --port=9090 > APP_PORT=9090 > port = 9090 in app.ini > "8080"
+//   println(config_int(c, "port"));
+//
+// A dotted name ("db.port") reads [db] port in the file and env DB_PORT
+// with the prefix, so nested config maps to flat sources.
+
+module config;
+
+use ini;
+use env;
+use args;
+use file;
+
+pub const CONFIG_STR: i64 = 0;
+pub const CONFIG_INT: i64 = 1;
+pub const CONFIG_BOOL: i64 = 2;
+pub const CONFIG_FLOAT: i64 = 3;
+
+// Where a value came from: 0 unresolved, 1 flag, 2 env, 3 file, 4 default.
+const SRC_FLAG: i64 = 1;
+const SRC_ENV: i64 = 2;
+const SRC_FILE: i64 = 3;
+const SRC_DEFAULT: i64 = 4;
+
+struct ConfigField {
+    name: str,
+    kind: i64,
+    def: str,
+    required: bool,
+    value: str,
+    source: i64,
+}
+
+pub struct Config {
+    fields: Vec<ConfigField>,
+}
+
+pub fn config_new() -> Config {
+    return Config { fields: Vec::new() };
+}
+
+/// Declare a key with a default value.
+pub fn config_opt(c: &mut Config, name: str, kind: i64, def: str) {
+    c.fields.push(ConfigField { name: name, kind: kind, def: def,
+        required: false, value: "", source: 0 });
+}
+
+/// Declare a key that file, env or flags must supply.
+pub fn config_req(c: &mut Config, name: str, kind: i64) {
+    c.fields.push(ConfigField { name: name, kind: kind, def: "",
+        required: true, value: "", source: 0 });
+}
+
+// ─── Validation ─────────────────────────────────────────────────────────
+
+fn config_is_int(v: str) -> bool {
+    var n: i64 = str_len(v);
+    if n == 0 { return false; }
+    var i: i64 = 0;
+    var b0: i64 = str_byte_at(v, 0);
+    if b0 == 45 || b0 == 43 { i = 1; }
+    if i >= n { return false; }
+    while i < n {
+        var b: i64 = str_byte_at(v, i);
+        if b < 48 || b > 57 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn config_is_bool(v: str) -> bool {
+    var l: str = str_to_lower(v);
+    return l == "true" || l == "false" || l == "1" || l == "0"
+        || l == "yes" || l == "no" || l == "on" || l == "off";
+}
+
+fn config_is_float(v: str) -> bool {
+    var n: i64 = str_len(v);
+    if n == 0 { return false; }
+    var i: i64 = 0;
+    var b0: i64 = str_byte_at(v, 0);
+    if b0 == 45 || b0 == 43 { i = 1; }
+    var dots: i64 = 0;
+    var digits: i64 = 0;
+    while i < n {
+        var b: i64 = str_byte_at(v, i);
+        if b == 46 { dots = dots + 1; }
+        else if b >= 48 && b <= 57 { digits = digits + 1; }
+        else { return false; }
+        i = i + 1;
+    }
+    return digits > 0 && dots <= 1;
+}
+
+fn config_validate(name: str, kind: i64, v: str) {
+    if kind == CONFIG_INT && !config_is_int(v) {
+        p_panic("config: key '" + name + "' is not an integer: '" + v + "'");
+    }
+    if kind == CONFIG_BOOL && !config_is_bool(v) {
+        p_panic("config: key '" + name + "' is not a boolean: '" + v + "'");
+    }
+    if kind == CONFIG_FLOAT && !config_is_float(v) {
+        p_panic("config: key '" + name + "' is not a float: '" + v + "'");
+    }
+}
+
+// ─── Loading ────────────────────────────────────────────────────────────
+
+/// The environment variable for `name` under `prefix`: PREFIX + NAME with
+/// '-' and '.' turned to '_'.
+fn config_env_name(prefix: str, name: str) -> str {
+    var u: str = str_replace(name, "-", "_");
+    u = str_replace(u, ".", "_");
+    return prefix + str_to_upper(u);
+}
+
+/// The file value for `name`: "sec.key" reads [sec] key; else the global
+/// key `name`. "" when absent.
+fn config_file_get(doc: Vec<IniEntry>, name: str) -> str {
+    var dot: i64 = str_find(name, ".");
+    if dot >= 0 {
+        var sec: str = str_slice(name, 0, dot);
+        var key: str = str_slice(name, dot + 1, str_len(name));
+        if ini_has(doc, sec, key) { return ini_get(doc, sec, key); }
+    }
+    if ini_has(doc, "", name) { return ini_get(doc, "", name); }
+    return "";
+}
+
+/// Load every declared key: --name flag, then PREFIXNAME env, then the
+/// file's key, then the declared default. A required key no source supplies
+/// panics naming it; a value of the wrong kind panics naming it too.
+pub fn config_load(c: &mut Config, file_path: str, env_prefix: str) {
+    var doc: Vec<IniEntry> = Vec::new();
+    if str_len(file_path) > 0 && file_exists(file_path) {
+        doc = ini_parse(file_read(file_path));
+    }
+    var av: Vec<str> = args_all();
+    var i: i64 = 0;
+    while i < c.fields.len() {
+        var f: ConfigField = c.fields.get(i);
+        var v: str = "";
+        var src: i64 = 0;
+        var flag: str = "--" + f.name;
+        if args_has_option_in(av, "", flag) {
+            v = args_option_in(av, "", flag, "");
+            src = SRC_FLAG;
+        }
+        if src == 0 {
+            var ename: str = config_env_name(env_prefix, f.name);
+            if env_exists(ename) {
+                v = env_get(ename);
+                src = SRC_ENV;
+            }
+        }
+        if src == 0 {
+            var fv: str = config_file_get(doc, f.name);
+            if str_len(fv) > 0 {
+                v = fv;
+                src = SRC_FILE;
+            }
+        }
+        if src == 0 && !f.required {
+            v = f.def;
+            src = SRC_DEFAULT;
+        }
+        if src == 0 {
+            p_panic("config: missing required key '" + f.name + "'");
+        }
+        config_validate(f.name, f.kind, v);
+        f.value = v;
+        f.source = src;
+        c.fields.set(i, f);
+        i = i + 1;
+    }
+}
+
+// ─── Reading ────────────────────────────────────────────────────────────
+
+fn config_find(c: Config, name: str) -> ConfigField {
+    var i: i64 = 0;
+    while i < c.fields.len() {
+        var f: ConfigField = c.fields.get(i);
+        if str_equal(f.name, name) { return f; }
+        i = i + 1;
+    }
+    p_panic("config: unknown key '" + name + "'");
+    return c.fields.get(0);
+}
+
+pub fn config_str(c: Config, name: str) -> str {
+    return config_find(c, name).value;
+}
+
+pub fn config_int(c: Config, name: str) -> i64 {
+    return str_parse_int(config_find(c, name).value);
+}
+
+pub fn config_bool(c: Config, name: str) -> bool {
+    var l: str = str_to_lower(config_find(c, name).value);
+    return l == "true" || l == "1" || l == "yes" || l == "on";
+}
+
+pub fn config_float(c: Config, name: str) -> f64 {
+    return str_parse_float(config_find(c, name).value);
+}
+
+/// Was `name` supplied by a flag, env or the file (not just its default)?
+pub fn config_given(c: Config, name: str) -> bool {
+    var f: ConfigField = config_find(c, name);
+    return f.source > 0 && f.source < SRC_DEFAULT;
+}

@@ -1554,6 +1554,158 @@ pub fn MonoCtx_seen_insert(ctx: &mut MonoCtx, name: str) -> bool {
     return true;
 }
 
+// --- Turbofish: explicit type arguments (proposal 0002) ------------------
+//
+// The parser reads `name::<T, U>(args)` as a call of `name::<#k>`, with the
+// types in its table at k. Before type checking, mono_resolve_turbofish
+// renames each such call to the instantiation (`name__T_U`) and adds that
+// instantiation to the program, so every later pass sees an ordinary call
+// of an ordinary function.
+
+var g_mono_tf_only: bool = false;
+var g_mono_tf_table: Vec<Type> = Vec::new();
+var g_mono_tf_names: Vec<str> = Vec::new();
+var g_mono_tf_funcs: Vec<Func> = Vec::new();
+var g_mono_tf_substs: Vec<Vec<SubstEntry>> = Vec::new();
+var g_mono_tf_errors: Vec<str> = Vec::new();
+
+/// The errors of the last mono_resolve_turbofish.
+pub fn mono_turbofish_errors() -> Vec<str> {
+    return g_mono_tf_errors;
+}
+
+/// The function a turbofish call `name::<#k>` calls: the instantiation of
+/// `name` with the k-th type arguments, queued to be created.
+fn mono_turbofish_callee(callee: str, generics: Vec<GenericFuncEntry>, in_func: str) -> str {
+    var at: i64 = str_find(callee, "::<#");
+    if at < 0 { return callee; }
+    var base: str = str_slice(callee, 0, at);
+    var k: i64 = str_parse_int(str_slice(callee, at + 4, str_len(callee) - 1));
+    var targs: Vec<Type> = Vec::new();
+    if k >= 0 && k < g_mono_tf_table.len() {
+        match g_mono_tf_table.get(k) {
+            Type::Generic(_, ta) => { targs = ta; }
+            _ => {}
+        }
+    }
+    match generic_funcs_get(generics, base) {
+        OptGenericFunc::Some(entry) => {
+            if targs.len() != entry.type_params.len() {
+                g_mono_tf_errors.push("Type error (in '" + in_func + "'): '" + base + "' takes "
+                    + int_to_str(entry.type_params.len()) + " type argument(s), the call gives "
+                    + int_to_str(targs.len()) + ".\n    Fix: write `" + base + "::<" + str_join(entry.type_params, ", ") + ">(...)` with a type for each.");
+                return base;
+            }
+            var subst: Vec<SubstEntry> = subst_new();
+            var i: i64 = 0;
+            while i < targs.len() {
+                subst_set(&mut subst, entry.type_params.get(i), targs.get(i));
+                i = i + 1;
+            }
+            var mangled: str = mangle(base, subst, entry.type_params);
+            if !str_vec_contains(g_mono_tf_names, mangled) {
+                g_mono_tf_names.push(mangled);
+                g_mono_tf_funcs.push(entry.func);
+                g_mono_tf_substs.push(subst);
+            }
+            return mangled;
+        }
+        OptGenericFunc::None => {
+            g_mono_tf_errors.push("Type error (in '" + in_func + "'): '" + base
+                + "' is not a generic function, so it takes no type arguments.\n    Fix: call it as `" + base + "(...)`.");
+            return base;
+        }
+    }
+    return base;
+}
+
+fn mono_tf_body(f: Func, generics: Vec<GenericFuncEntry>) -> Func {
+    var r: Func = f;
+    var no_methods: Vec<GenericMethodEntry> = Vec::new();
+    r.body = fixup_generic_calls(f.body, generics, no_methods, f);
+    return r;
+}
+
+/// Resolve the turbofish calls of `program` (table: the parser's
+/// turbofish_types). Errors are read with mono_turbofish_errors.
+pub fn mono_resolve_turbofish(program: Program, table: Vec<Type>) -> Program {
+    g_mono_tf_errors = Vec::new();
+    if table.len() == 0 { return program; }
+    g_mono_tf_table = table;
+    g_mono_tf_names = Vec::new();
+    g_mono_tf_funcs = Vec::new();
+    g_mono_tf_substs = Vec::new();
+    var generics: Vec<GenericFuncEntry> = Vec::new();
+    var i: i64 = 0;
+    while i < program.funcs.len() {
+        var f: Func = program.funcs.get(i);
+        if f.type_params.len() > 0 { generics.push(GenericFuncEntry_new(f.name, f, f.type_params)); }
+        i = i + 1;
+    }
+    // Only turbofish calls are renamed here: inference is mono's later job
+    g_mono_tf_only = true;
+    var result: Program = program;
+    var funcs: Vec<Func> = Vec::new();
+    i = 0;
+    while i < program.funcs.len() {
+        var f: Func = program.funcs.get(i);
+        if f.type_params.len() == 0 { funcs.push(mono_tf_body(f, generics)); } else { funcs.push(f); }
+        i = i + 1;
+    }
+    var impls: Vec<ImplDef> = Vec::new();
+    i = 0;
+    while i < program.impls.len() {
+        var imp: ImplDef = program.impls.get(i);
+        if imp.type_params.len() == 0 {
+            var ms: Vec<Func> = Vec::new();
+            var j: i64 = 0;
+            while j < imp.methods.len() {
+                ms.push(mono_tf_body(imp.methods.get(j), generics));
+                j = j + 1;
+            }
+            imp.methods = ms;
+        }
+        impls.push(imp);
+        i = i + 1;
+    }
+    var timpls: Vec<TraitImpl> = Vec::new();
+    i = 0;
+    while i < program.trait_impls.len() {
+        var ti: TraitImpl = program.trait_impls.get(i);
+        if ti.type_params.len() == 0 {
+            var ms: Vec<Func> = Vec::new();
+            var j: i64 = 0;
+            while j < ti.methods.len() {
+                ms.push(mono_tf_body(ti.methods.get(j), generics));
+                j = j + 1;
+            }
+            ti.methods = ms;
+        }
+        timpls.push(ti);
+        i = i + 1;
+    }
+    g_mono_tf_only = false;
+    // The instantiations, and the generic functions they call in turn
+    var ctx: MonoCtx = MonoCtx_new();
+    ctx.generics = generics;
+    i = 0;
+    while i < g_mono_tf_names.len() {
+        if MonoCtx_seen_insert(&mut ctx, g_mono_tf_names.get(i)) {
+            funcs.push(instantiate(g_mono_tf_funcs.get(i), g_mono_tf_substs.get(i), g_mono_tf_names.get(i), &mut ctx));
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < ctx.instantiated.len() {
+        funcs.push(ctx.instantiated.get(i));
+        i = i + 1;
+    }
+    result.funcs = funcs;
+    result.impls = impls;
+    result.trait_impls = timpls;
+    return result;
+}
+
 // --- Main monomorphization entry point -----------------------------------
 
 // The declared return type of every non-generic function, for the type of a
@@ -1574,12 +1726,14 @@ pub fn monomorphize(program: Program) -> Program {
     }
     var ctx: MonoCtx = MonoCtx_new();
 
-    // Separate generic and non-generic functions
+    // Separate generic and non-generic functions. An instantiation already
+    // in the program (made for a turbofish call) is not made again.
     var concrete_funcs: Vec<Func> = Vec::new();
     var i: i64 = 0;
     while i < program.funcs.len() {
         var func: Func = program.funcs.get(i);
         if func.type_params.len() == 0 {
+            if str_contains(func.name, "__") { ctx.seen.push(func.name); }
             concrete_funcs.push(func);
         } else {
             ctx.generics.push(GenericFuncEntry_new(func.name, func, func.type_params));
@@ -1864,6 +2018,7 @@ pub fn subst_with_result(gen_func: Func, arg_types: Vec<Type>, type_params: Vec<
 /// expression, or none.
 pub fn fixup_hinted_call(expr: Expr, hint: OptType, generics: Vec<GenericFuncEntry>, gm: Vec<GenericMethodEntry>, current_func: Func) -> Vec<Expr> {
     var out: Vec<Expr> = Vec::new();
+    if g_mono_tf_only { return out; }
     var h: Type = Type::Infer;
     match hint {
         OptType::Some(t) => { h = t; }
@@ -1926,6 +2081,10 @@ pub fn fixup_generic_calls_expr(expr: Expr, generics: Vec<GenericFuncEntry>, gm:
                 new_args.push(fixup_generic_calls_expr(args.get(i), generics, gm, current_func));
                 i = i + 1;
             }
+            if str_contains(callee, "::<#") {
+                return Expr::Call(mono_turbofish_callee(callee, generics, current_func.name), new_args);
+            }
+            if g_mono_tf_only { return Expr::Call(callee, new_args); }
             // Check if this is a call to a generic function
             match generic_funcs_get(generics, callee) {
                 OptGenericFunc::Some(entry) => {
@@ -2866,13 +3025,28 @@ pub fn infer_expr_type(expr: Expr, func: Func) -> Type {
         }
         Expr::MethodCall(receiver, method, args) => {
             // For associated function calls like Point::new(x, y),
-            // the receiver is Expr::Ident("Point")
-            match mn_box_expr_deref(receiver) {
-                Expr::Ident(name) => {
-                    return Type::Named(name);
+            // the receiver is Expr::Ident("Point"); a variable has its type
+            var rt: Type = infer_expr_type(mn_box_expr_deref(receiver), func);
+            match rt {
+                Type::Generic(gn, gargs) => {
+                    if gargs.len() > 0 {
+                        // What core's Option/Result/Vec methods return
+                        // (proposal 0002): the payload, or the same type
+                        if (gn == "Option" || gn == "Result") && (method == "unwrap" || method == "unwrap_or" || method == "expect") {
+                            return gargs.get(0);
+                        }
+                        if (gn == "Option" || gn == "Result") && (method == "map" || method == "map_err" || method == "and_then"
+                            || method == "or" || method == "or_else" || method == "filter") {
+                            return rt;
+                        }
+                        if gn == "Vec" && (method == "get" || method == "pop" || method == "first" || method == "last") {
+                            return gargs.get(0);
+                        }
+                    }
                 }
-                _ => { return infer_expr_type(mn_box_expr_deref(receiver), func); }
+                _ => {}
             }
+            return rt;
         }
         _ => { return Type::I64; }
     }

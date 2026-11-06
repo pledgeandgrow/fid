@@ -246,6 +246,34 @@ well-formed. (Also available as `fidesc verify`.)
 fidesc audit <file.fd>        # verify IR correctness
 ```
 
+In `fid` the name means something else: `fid audit <file.fd> [--stdlib]
+[--strict]` lists the unsafe code a program reaches.
+
+### qualify — Safety Evidence
+
+**Status: ✅ Implemented (`fid` only)** — `fid qualify <file.fd> [-o out.json]`
+writes JSON evidence: compiler and source hashes, the check result, the
+annotated functions, and each safety rule with its requirement and tests
+([safety-rules.md](safety-rules.md)). The verdict is always `NOT_QUALIFIED`:
+the file is evidence, not a certificate. Fides is not suitable for medical,
+automotive or avionics use.
+
+```
+fid qualify <file.fd> -o evidence.json
+```
+
+### Memory checks and other test tools
+
+| Command | Status |
+|---|---|
+| `fid run <file.fd> --leaks` | The C runtime's debug allocator reports blocks never freed |
+| `fid run <file.fd> --checked-alloc` | The debug allocator detects use after free |
+| `fid emit <file.fd> --checked-alloc` | Written, not run: every block on pages of its own, ending at a guard page; freed pages inaccessible, never reused |
+| `fid test <file.fd>` | Runs the file's functions whose names start with `test_` and `bench_` |
+| `bench/run.sh`, `bench/check.sh` | `check.sh` fails on a slowdown over `LIMIT_PCT` against `bench/baseline.txt`; not in CI |
+| `scripts/sanitize.sh` | Written, not run: the tests through C under ASan/UBSan (clang with ASan, Linux/macOS); `FIDES_CFLAGS` passes extra C flags |
+| `scripts/fuzz/nightly.sh` | Written, not run; no CI workflow schedules it |
+
 ---
 
 ## Incremental Builds
@@ -262,6 +290,11 @@ empty, the compiler's identity, the command line and `CC`:
 - Creating a file that would change what an import resolves to, rebuilding
   the compiler, or changing flags or `CC` invalidates the stamp.
 - `--no-cache` or `FIDES_NO_CACHE=1` builds from scratch.
+
+`fid` also keeps a build cache in `.fidcache/` that evicts the least recently
+used artifacts past 64 files or 1 GB, and type-checks `stdlib/core.fd` once
+per (compiler, core.fd) pair: a stamp in the temp directory skips core's
+bodies on later builds (`FIDES_CHECK_CORE=1` forces the check).
 
 `FIDES_TIME_PASSES=1` prints how long each frontend pass took.
 
@@ -289,10 +322,10 @@ optimization level: `-O2` by default, `-O0` for a program over 16 MB of C
    and a verb ("sentinel the codebase"). This makes documentation and
    conversation natural.
 
-5. **Distinct from the compiler.** The compiler is `fidesc`. The tools
-   are separate words — they're separate programs with separate concerns.
-   `fidesc` compiles; `ark` manages packages; `scribe` documents;
-   `veil` covers.
+5. **Distinct from the compiler.** The compiler is `fid` (the frozen Rust
+   compiler is `fidesc`). The tools are separate words — they're separate
+   programs with separate concerns. `fid` compiles; `ark` manages packages;
+   `scribe` documents; `veil` covers.
 
 ---
 
@@ -310,9 +343,14 @@ optimization level: `-O2` by default, `-O0` for a program over 16 MB of C
 | scribe   | ✅ Implemented | Doc generator — `///` comments to HTML/Markdown, files and directories |
 | veil     | ✅ Implemented | Coverage tool — function/line/instruction coverage, text and HTML reports |
 | trial    | ⚠️ Partial (as `fidesc test`) | `fidesc test` runs `.fd` test files across 3 backends. Standalone runner pending |
-| audit    | ✅ Implemented (as `fidesc audit`) | IR verifier — checks block terminators, type consistency |
+| audit    | ✅ Implemented (as `fidesc audit`) | IR verifier — checks block terminators, type consistency. `fid audit` lists reachable unsafe code |
+| qualify  | ✅ Implemented (as `fid qualify`) | Safety evidence as JSON; always `NOT_QUALIFIED` |
 
-> The compiler (`fidesc`) already has `run`, `build`, `emit`, `ccompile`,
+> `fid` has `run`, `ccompile`, `emit`, `build`, `test`, `fmt`, `lint`,
+> `check`, `bench`, `profile`, `lsp`, `doc`/`scribe`, `veil`, `ark`, `repl`,
+> `audit`, `qualify`, `parse-header` and the `dump-*` commands
+> (`compiler/main.fd`); its `watch` runs `bench`.
+> The Rust compiler (`fidesc`) has `run`, `build`, `emit`, `ccompile`,
 > `test`, `repl`, `ir`, `pir`, `ast`, `tokens`, `codegen`, `gpu`, `watch`,
 > `replay`, `sourcemap` commands. The standalone tools (`ark`, `scribe`,
 > `veil`) are separate binaries built from the same codebase. Others

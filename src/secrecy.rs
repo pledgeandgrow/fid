@@ -5,6 +5,11 @@
 //! - a local marked `@secret` (`@secret val key = load_key();`),
 //! - the result of a function marked `@secret` (its result stays secret).
 //!
+//! `@sensitive` is the same check one notch down (roadmap CO7): personal data
+//! that may reach an output only after a release — `privacy::release` runs a
+//! consent check at runtime; any `@declassify` is an audited release. Its
+//! sources and sinks are `@sensitive`'s, tracked as a second label.
+//!
 //! Sinks: output and logging calls, network and file writes, globals, writes
 //! through a reference parameter, `spawn`, and calls through function values
 //! (which could do any of these).
@@ -31,6 +36,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 enum Origin {
     /// A real secret.
     Secret,
+    /// Personal data: released only by a consent check (`privacy::release`)
+    /// or an explicit `@declassify`.
+    Sensitive,
     /// The function's `i`-th parameter.
     Param(usize),
 }
@@ -86,6 +94,7 @@ pub struct SecrecyChecker<'a> {
     pc: Vec<Label>,
     func_name: String,
     may_return_secret: bool,
+    may_return_sensitive: bool,
     declassify: bool,
     cur: Summary,
     changed: bool,
@@ -132,6 +141,7 @@ impl<'a> SecrecyChecker<'a> {
             pc: Vec::new(),
             func_name: String::new(),
             may_return_secret: false,
+            may_return_sensitive: false,
             declassify: false,
             cur: Summary::default(),
             changed: false,
@@ -141,9 +151,9 @@ impl<'a> SecrecyChecker<'a> {
         }
     }
 
-    fn error(&mut self, msg: String) {
+    fn error(&mut self, kind: &str, msg: String) {
         if self.report {
-            let full = format!("Security error (@secret) (line {}): in '{}', {}", self.line, self.func_name, msg);
+            let full = format!("Security error ({}) (line {}): in '{}', {}", kind, self.line, self.func_name, msg);
             if !self.errors.contains(&full) {
                 self.errors.push(full);
             }
@@ -186,9 +196,13 @@ impl<'a> SecrecyChecker<'a> {
     fn sink(&mut self, what: &str, data: &Label, pc: &Label) {
         self.note_output();
         if data.contains(&Origin::Secret) {
-            self.error(format!("a secret value reaches {}", what));
+            self.error("@secret", format!("a secret value reaches {}", what));
+        } else if data.contains(&Origin::Sensitive) {
+            self.error("@sensitive", format!("a sensitive value reaches {}; release it through privacy::release (a consent check) or mark the function @declassify", what));
         } else if pc.contains(&Origin::Secret) {
-            self.error(format!("{} runs inside a branch or loop that depends on a secret", what));
+            self.error("@secret", format!("{} runs inside a branch or loop that depends on a secret", what));
+        } else if pc.contains(&Origin::Sensitive) {
+            self.error("@sensitive", format!("{} runs inside a branch or loop that depends on sensitive data", what));
         }
         for o in data.iter().chain(pc.iter()) {
             if let Origin::Param(i) = o {
@@ -210,8 +224,16 @@ impl<'a> SecrecyChecker<'a> {
                 }
                 Origin::Secret => {
                     if !self.may_return_secret {
-                        self.error(
+                        self.error("@secret",
                             "returns a secret value; mark the function @secret (callers keep its result secret) or @declassify (an audited release)"
+                                .to_string(),
+                        );
+                    }
+                }
+                Origin::Sensitive => {
+                    if !self.may_return_sensitive {
+                        self.error("@sensitive",
+                            "returns a sensitive value; mark the function @sensitive (callers keep its result sensitive) or @declassify (an audited release)"
                                 .to_string(),
                         );
                     }
@@ -226,6 +248,7 @@ impl<'a> SecrecyChecker<'a> {
         self.func_name = f.name.clone();
         self.line = f.line;
         self.may_return_secret = has_annotation(f, "secret");
+        self.may_return_sensitive = has_annotation(f, "sensitive");
         self.declassify = has_annotation(f, "declassify");
         self.cur = self.summaries.get(key).cloned().unwrap_or_default();
         self.vars.clear();
@@ -233,6 +256,8 @@ impl<'a> SecrecyChecker<'a> {
         for (i, p) in f.params.iter().enumerate() {
             let l: Label = if p.annotations.iter().any(|a| a.name == "secret") {
                 [Origin::Secret].into_iter().collect()
+            } else if p.annotations.iter().any(|a| a.name == "sensitive") {
+                [Origin::Sensitive].into_iter().collect()
             } else {
                 [Origin::Param(i)].into_iter().collect()
             };
@@ -338,12 +363,19 @@ impl<'a> SecrecyChecker<'a> {
     fn store(&mut self, name: &str, l: &Label) {
         if self.vars.contains_key(name) || !self.globals.contains(name) {
             self.assign_var(name, l);
-            if self.ref_params.contains(name) && l.contains(&Origin::Secret) && !self.may_return_secret && !self.declassify {
-                // The caller sees what is written through a reference parameter.
-                self.error(format!(
-                    "writes a secret value through reference parameter '{}'; mark the function @secret or @declassify",
-                    name
-                ));
+            // The caller sees what is written through a reference parameter.
+            if self.ref_params.contains(name) && !self.declassify {
+                if l.contains(&Origin::Secret) && !self.may_return_secret {
+                    self.error("@secret", format!(
+                        "writes a secret value through reference parameter '{}'; mark the function @secret or @declassify",
+                        name
+                    ));
+                } else if l.contains(&Origin::Sensitive) && !self.may_return_sensitive {
+                    self.error("@sensitive", format!(
+                        "writes a sensitive value through reference parameter '{}'; mark the function @sensitive or @declassify",
+                        name
+                    ));
+                }
             }
         } else {
             let pc = Label::new();
@@ -360,6 +392,9 @@ impl<'a> SecrecyChecker<'a> {
                 if annotations.iter().any(|a| a.name == "secret") {
                     l.insert(Origin::Secret);
                 }
+                if annotations.iter().any(|a| a.name == "sensitive") {
+                    l.insert(Origin::Sensitive);
+                }
                 self.assign_var(name, &l);
             }
             Stmt::LetTuple { names, expr, .. } => {
@@ -372,6 +407,9 @@ impl<'a> SecrecyChecker<'a> {
                 let mut l = pc.clone();
                 if annotations.iter().any(|a| a.name == "secret") {
                     l.insert(Origin::Secret);
+                }
+                if annotations.iter().any(|a| a.name == "sensitive") {
+                    l.insert(Origin::Sensitive);
                 }
                 self.assign_var(name, &l);
             }
@@ -552,13 +590,16 @@ impl<'a> SecrecyChecker<'a> {
                 }
                 let saved_returns = self.cur.returns.clone();
                 let saved_secret = self.may_return_secret;
+                let saved_sensitive = self.may_return_sensitive;
                 let saved_declassify = self.declassify;
                 // A closure's `return` is its own, not the function's.
                 self.may_return_secret = true;
+                self.may_return_sensitive = true;
                 self.declassify = false;
                 self.stmts_value(body);
                 self.cur.returns = saved_returns;
                 self.may_return_secret = saved_secret;
+                self.may_return_sensitive = saved_sensitive;
                 self.declassify = saved_declassify;
                 captured
             }
@@ -607,7 +648,9 @@ impl<'a> SecrecyChecker<'a> {
             if let Some(l) = ls.get(i - offset) {
                 let pname = f.params.get(i).map(|p| p.name.clone()).unwrap_or_default();
                 if l.contains(&Origin::Secret) {
-                    self.error(format!("a secret value is passed to '{}', which outputs its parameter '{}'", name, pname));
+                    self.error("@secret", format!("a secret value is passed to '{}', which outputs its parameter '{}'", name, pname));
+                } else if l.contains(&Origin::Sensitive) {
+                    self.error("@sensitive", format!("a sensitive value is passed to '{}', which outputs its parameter '{}'", name, pname));
                 }
                 for o in l.clone() {
                     if let Origin::Param(j) = o {
@@ -619,7 +662,9 @@ impl<'a> SecrecyChecker<'a> {
         if summ.outputs {
             self.note_output();
             if pc.contains(&Origin::Secret) {
-                self.error(format!("'{}' produces output and is called inside a branch or loop that depends on a secret", name));
+                self.error("@secret", format!("'{}' produces output and is called inside a branch or loop that depends on a secret", name));
+            } else if pc.contains(&Origin::Sensitive) {
+                self.error("@sensitive", format!("'{}' produces output and is called inside a branch or loop that depends on sensitive data", name));
             }
             for o in pc.clone() {
                 if let Origin::Param(j) = o {
@@ -637,6 +682,9 @@ impl<'a> SecrecyChecker<'a> {
         }
         if has_annotation(f, "secret") {
             out.insert(Origin::Secret);
+        }
+        if has_annotation(f, "sensitive") {
+            out.insert(Origin::Sensitive);
         }
         if has_annotation(f, "declassify") {
             out.clear();

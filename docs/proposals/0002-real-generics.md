@@ -1,6 +1,7 @@
 # 0002: Real generics
 
-- **Status:** accepted
+- **Status:** accepted; implemented in `fid` (Nov 4–6) except the items
+  under "Left" below. Not in the frozen `fidesc`.
 - **Decision:** accepted on 2026-11-02, part of removing the technical
   weaknesses listed in the competitive roadmap.
 
@@ -41,6 +42,42 @@ So the type checker accepts what it cannot type: an `f64` returned from
    types, as Rust does).
 5. **No implicit conversions between unrelated types:** `str` and integers
    only through `as` in the runtime layer; `f64` to `i64` only through `as`.
+
+## Status of the implementation (Nov 3, 2026)
+
+In the self-hosted compiler (`compiler/*.fd`); the Rust compiler is frozen
+(stability.md, ST1) and does not get this.
+
+- Done: type arguments inferred per call, including from the expected
+  type; "cannot infer the type parameter" when nothing gives one; bounds
+  checked at the call, every bound of `T: A + B` kept and searched for
+  methods; turbofish `f::<T>(..)` (the call is instantiated before type
+  checking, so later passes see an ordinary call; a wrong count of type
+  arguments is an error); generic methods instantiated per receiver type
+  (`Option__unwrap__Pt`), with `map`/`and_then`/... keeping the receiver's
+  type; an `Option<f64>`/`Option<str>` payload keeps its type with or without
+  an annotation; a struct or enum payload of a type parameter is copied to
+  the heap, so `Option<Pt>` returned from a function stays valid, and copied
+  back out on a match. Tests: `test_generics_full.fd`, `test_generics_real.fd`,
+  `test_generic_infer_fail.fd`, `test_generic_bound_fail.fd`,
+  `test_turbofish_arity_fail.fd`.
+- Left: generic structs and enums laid out per instantiation (a payload is
+  still one word; wide values go through a heap copy, which is not freed);
+  method-level type parameters (`map<U>`, core's `map` is `fn(T) -> T`);
+  method arguments checked against the substituted parameter types; `?` and
+  `??` on a struct payload; turbofish on methods, inside the body of a
+  generic function, and in `--no-std` builds.
+
+Nov 6: in `fid`, every type parameter is inferred or an error ("cannot infer
+the type parameter 'T' of 'make'"), bounds `T: A + B` are checked at the call
+("i64 does not implement Show (required by T: Show in 'twice')"), and a
+turbofish `f::<T>()` must give as many types as `f` has parameters. Tests:
+`test_generics_full.fd`, `test_generics_real.fd`,
+`test_generic_infer_fail.fd`, `test_generic_bound_fail.fd`,
+`safety/test_generic_unbound_fail.fd`, `test_turbofish_arity_fail.fd`
+(checked with `fid run`, `fid ccompile` and `fid emit`; the full suite has
+not been rerun since Nov 2). The rules: [reference.md §7](../reference/reference.md#7-generics).
+The "Left" list above was written on Nov 3 and has not been rechecked.
 
 ## What it breaks
 

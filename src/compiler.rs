@@ -38,7 +38,14 @@ fn enrich_errors(errors: &[String], source: &str, file: &str) -> Vec<String> {
     for err in errors {
         let (line, col) = extract_line_col(err);
         if line == 0 || line > source_lines.len() {
-            result.push(err.clone());
+            // No usable position: still tag the message with its diagnostic
+            // code, just without a source span.
+            let code = classify_error(err);
+            if code != crate::diag::ErrCode::Custom {
+                result.push(format!("error[{}]: {}", code.code(), err));
+            } else {
+                result.push(err.clone());
+            }
             continue;
         }
 
@@ -125,7 +132,17 @@ fn classify_error(err: &str) -> ErrCode {
     else if e.contains("expects") && e.contains("args") { ErrCode::ArgCountMismatch }
     else if e.contains("missing return") { ErrCode::MissingReturn }
     else if e.starts_with("Init error") { ErrCode::InitBeforeAssign }
-    else if e.starts_with("Linear error") || e.contains("linear") { ErrCode::NotLinear }
+    else if e.starts_with("Linear type error") || e.contains("already consumed") { ErrCode::LinearConsumed }
+    else if e.contains("linear") { ErrCode::NotLinear }
+    else if e.starts_with("Region error: use-after-free") { ErrCode::RegionUseAfterFree }
+    else if e.starts_with("GPU region error") { ErrCode::GpuRegionViolation }
+    else if e.starts_with("KV cache region error") { ErrCode::KvRegionViolation }
+    else if e.starts_with("Region error") && e.contains("escapes region") { ErrCode::RegionEscape }
+    else if e.starts_with("Region error") { ErrCode::RegionEscape }
+    else if e.starts_with("Budget error") { ErrCode::RegionBudgetExceeded }
+    else if e.starts_with("Misplaced annotation") { ErrCode::MisplacedAnnotation }
+    else if e.starts_with("Escape error") || e.starts_with("Reference escape") { ErrCode::EscapeViolation }
+    else if e.starts_with("Secret error") || e.starts_with("Secrecy") || e.contains("secret value reaching") { ErrCode::SecrecyViolation }
     else if e.starts_with("Capability error") { ErrCode::CapabilityDenied }
     else if e.starts_with("Sandbox error") { ErrCode::SandboxViolation }
     else if e.starts_with("Conservation error") { ErrCode::ConservationViolation }
@@ -134,6 +151,7 @@ fn classify_error(err: &str) -> ErrCode {
     else if e.starts_with("Parse error") { ErrCode::ExpectedToken }
     else if e.starts_with("Error:") { ErrCode::UnexpectedChar }
     else if e.starts_with("borrow error") { ErrCode::BorrowConflict }
+    else if e.starts_with("Thread safety error") { ErrCode::ThreadSafetyViolation }
     else if e.starts_with("Panic:") { ErrCode::NoMain }
     else { ErrCode::Custom }
 }

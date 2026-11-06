@@ -7,9 +7,17 @@ moves up a tier only when the tests that tier names pass on it.
 
 CI runs the whole suite, and a failure blocks the change.
 
+Status (Nov 6, 2026): the repository has no CI workflow at the moment (the
+`.github/workflows/` files were removed in commit 9f2ba40), so no platform
+meets this definition today. The last full suite run is Nov 2 on Windows
+(Rust harness, `fidesc` as compiler: interp 339/339, C 343/343, PE 345/345,
+expected-fail 89/89); Linux CI last ran green in session 37. The Nov 4–6
+changes were checked with `fid run`, `fid ccompile` and `fid emit` on their
+tests. The table lists what Tier 1 covered when CI ran.
+
 | Platform | Backends | What CI runs |
 |---|---|---|
-| Windows x64 | interpreter, C, native (PE) | the suite on all three, expected failures, every stdlib module, the native fixpoint, an installed `fid` |
+| Windows x64 | interpreter, C, native (PE, `fid emit`) | the suite on all three, expected failures, every stdlib module, the native fixpoint, an installed `fid`. Native async/tasks crash (`test_async`, `test_async_float_struct`) |
 | Linux x64 | interpreter, C | the suite, expected failures, `fid` bootstrapping itself, the release archive on a clean Ubuntu |
 
 ## Tier 2: builds, partly tested
@@ -30,7 +38,7 @@ every commit.
 | ARM64, RISC-V native | assembly | runtime has stubs that do nothing (release F8) |
 | WebAssembly | WASM | no globals, struct copies or collections yet (release F9) |
 | macOS native | Mach-O objects | no executables yet (release F7) |
-| Bare metal | `emit --bare`, `--boot` | `fid emit --bare` is not ported (release G2) |
+| Bare metal | `emit --bare`, `--boot` | `fid emit --bare` panics (release G2) |
 | Android, iOS | none | not started (PL6) |
 
 ## What decides a platform's tier

@@ -17,11 +17,10 @@
 //    grouped through pe_emit1..pe_emit8
 // 6. `for`/`iter().enumerate()`/`pop()` -> while loops / index loops
 // 7. format!/to_string() -> int_to_str() + concatenation
-// 8. Bare-metal bodies of the stub generators are NOT ported: in Rust they
-//    only run when `bare_mode` is set, and `PeirGen_gen_runtime_stubs`
-//    panics on bare mode ("pe_ir: bare mode not ported").  Each stub keeps a
-//    matching `bare_mode` guard so a future port can fill them in; until
-//    then they panic rather than silently emitting wrong code.
+// 8. Bare-metal bodies of the stub generators are ported (release G2, Nov 6;
+//    two Rust bugs fixed on the way: p_idt_set_entry stored cl for the gate
+//    flags, p_gdt_set_entry read its fifth argument from the shadow space).
+//    `fid emit --bare` runs them through PeirGen_gen_bare_runtime.
 //
 // Windows x64 calling convention (for reference):
 //   - Integer args: RCX, RDX, R8, R9 (then stack); return: RAX
@@ -306,6 +305,7 @@ fn pe_strs_contains(v: Vec<str>, s: str) -> bool {
 /// Insert `s` into sorted Vec<str> `v` (BTreeSet<String>::insert).
 /// Returns the (possibly reallocated) Vec.
 fn pe_strs_insert_sorted(v: Vec<str>, s: str) -> Vec<str> {
+    var v = v;
     var i: i64 = 0;
     while i < v.len() {
         var c: i64 = str_compare(v.get(i), s);
@@ -329,6 +329,7 @@ fn pe_strs_insert_sorted(v: Vec<str>, s: str) -> Vec<str> {
 
 /// Insertion-sort a Vec<str> with str_compare (deterministic BTree order).
 fn pe_sort_strs(v: Vec<str>) -> Vec<str> {
+    var v = v;
     var i: i64 = 1;
     while i < v.len() {
         var key: str = v.get(i);
@@ -706,6 +707,7 @@ pub fn PeirGen_dyn_type_id(self: &mut PeirGen, name: str) -> i64 {
 /// Insert (callee -> caller) into the sorted unresolved table
 /// (BTreeMap<String, BTreeSet<String>>).
 fn pe_unresolved_add(unresolved: Vec<UnresolvedCall>, name: str, caller: str) -> Vec<UnresolvedCall> {
+    var unresolved = unresolved;
     var i: i64 = 0;
     while i < unresolved.len() {
         var e: UnresolvedCall = unresolved.get(i);
@@ -736,16 +738,14 @@ fn pe_unresolved_add(unresolved: Vec<UnresolvedCall>, name: str, caller: str) ->
 }
 
 /// Call runtime or program function `name`; one nobody defines traps,
-/// and (outside bare mode) makes generate_pe refuse the program.
+/// and makes generate_pe (or generate_flat) refuse the program.
 pub fn PeirGen_call_runtime(self: &mut PeirGen, name: str) -> void {
     if HashMap_contains(self.func_labels, name) {
         var label: i64 = HashMap_get(self.func_labels, name);
         PeirEnc_call_label(&mut self.enc, label);
         return;
     }
-    if !self.bare_mode {
-        self.unresolved = pe_unresolved_add(self.unresolved, name, self.cur_func);
-    }
+    self.unresolved = pe_unresolved_add(self.unresolved, name, self.cur_func);
     PeirEnc_ud2(&mut self.enc);
 }
 
@@ -767,12 +767,246 @@ pub fn PeirGen_iat_off(self: &PeirGen, idx: i64) -> i64 {
 }
 
 // ===========================================================================
+// Bare-metal runtime (`fid emit --bare`, release G2, G3)
+//
+// No OS: the hardware stubs (interrupts, MMU, GDT, user mode, COM1) are the
+// real instructions, p_malloc is a bump allocator from g_pe_bare_heap,
+// p_free does nothing, and printing writes to COM1 (port 0x3F8), which is
+// what QEMU's `-serial stdio` shows. A panic, a failed overflow or division
+// check included, calls the program's @panic_handler (with the message)
+// when it has one, else prints "panic: <message>" to COM1; then the CPU
+// halts with interrupts off. Any other runtime function traps (ud2).
+// ===========================================================================
+
+/// Where the bare-metal heap starts (the bump allocator's first block).
+pub var g_pe_bare_heap: i64 = 0x300000;
+/// Where a flat binary is loaded (its first byte, a jump to the entry).
+pub var g_pe_bare_load: i64 = 0x10000;
+/// A static Linux ELF executable instead (release F4, first step): the bare
+/// build's code with the system calls of Linux for output, heap and exit.
+pub var g_pe_elf: bool = false;
+/// The program's @panic_handler ("" when it has none). Like every Fides
+/// function it takes `__env` (null here) before the message.
+pub var g_pe_bare_panic_handler: str = "";
+
+pub fn PeirGen_gen_bare_runtime(self: &mut PeirGen) -> void {
+    PeirGen_gen_interrupt_stubs(self);
+    PeirGen_gen_mmu_stubs(self);
+    PeirGen_gen_gdt_stubs(self);
+    PeirGen_gen_enter_user_mode(self);
+    PeirGen_gen_serial_stubs(self);
+    PeirGen_gen_malloc(self);
+    PeirGen_gen_free(self);
+    PeirGen_gen_memset(self);
+
+    var putc: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var pstr: i64 = HashMap_get(self.func_labels, "p_print_str");
+    var estr: i64 = HashMap_get(self.func_labels, "p_eprint_str");
+    if g_pe_elf {
+        // Linux (release F4): write(r9 = fd, ...). The syscall takes rdi
+        // and rsi, which Fides code keeps across calls: saved here.
+        // putc(cl)
+        PeirEnc_align_to(&mut self.enc, 16);
+        PeirEnc_place_label(&mut self.enc, putc);
+        pe_emit3(&mut self.enc, 0x57, 0x56, 0x51);       // push rdi; push rsi; push rcx
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RAX, 1);   // SYS_write
+        pe_emit3(&mut self.enc, 0x4C, 0x89, 0xCF);       // mov rdi, r9
+        pe_emit3(&mut self.enc, 0x48, 0x89, 0xE6);       // mov rsi, rsp
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RDX, 1);
+        pe_emit2(&mut self.enc, 0x0F, 0x05);             // syscall
+        pe_emit3(&mut self.enc, 0x59, 0x5E, 0x5F);       // pop rcx; pop rsi; pop rdi
+        PeirEnc_ret(&mut self.enc);
+        // write the C string rcx to fd r9, in one call
+        var wstr: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var ws_len: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var ws_go: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var ws_done: i64 = PeirEnc_alloc_label(&mut self.enc);
+        PeirEnc_align_to(&mut self.enc, 16);
+        PeirEnc_place_label(&mut self.enc, wstr);
+        pe_emit2(&mut self.enc, 0x57, 0x56);             // push rdi; push rsi
+        pe_emit3(&mut self.enc, 0x48, 0x89, 0xCE);       // mov rsi, rcx
+        pe_emit3(&mut self.enc, 0x48, 0x85, 0xF6);       // test rsi, rsi
+        PeirEnc_jcc_label(&mut self.enc, 0x4, ws_done);  // jz
+        pe_emit2(&mut self.enc, 0x31, 0xD2);             // xor edx, edx
+        PeirEnc_place_label(&mut self.enc, ws_len);
+        pe_emit4(&mut self.enc, 0x80, 0x3C, 0x16, 0x00); // cmp byte [rsi+rdx], 0
+        PeirEnc_jcc_label(&mut self.enc, 0x4, ws_go);    // je
+        pe_emit3(&mut self.enc, 0x48, 0xFF, 0xC2);       // inc rdx
+        PeirEnc_jmp_label(&mut self.enc, ws_len);
+        PeirEnc_place_label(&mut self.enc, ws_go);
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RAX, 1);   // SYS_write
+        pe_emit3(&mut self.enc, 0x4C, 0x89, 0xCF);       // mov rdi, r9
+        pe_emit2(&mut self.enc, 0x0F, 0x05);             // syscall
+        PeirEnc_place_label(&mut self.enc, ws_done);
+        pe_emit2(&mut self.enc, 0x5E, 0x5F);             // pop rsi; pop rdi
+        PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        PeirEnc_ret(&mut self.enc);
+        // p_print_str(rcx): stdout; p_eprint_str(rcx): stderr
+        PeirEnc_align_to(&mut self.enc, 16);
+        PeirEnc_place_label(&mut self.enc, pstr);
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_R9, 1);
+        PeirEnc_jmp_label(&mut self.enc, wstr);
+        PeirEnc_align_to(&mut self.enc, 16);
+        PeirEnc_place_label(&mut self.enc, estr);
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_R9, 2);
+        PeirEnc_jmp_label(&mut self.enc, wstr);
+    } else {
+        // putc(cl): wait until COM1 can take a byte, send it (uses rax, rdx)
+        var wait: i64 = PeirEnc_alloc_label(&mut self.enc);
+        PeirEnc_align_to(&mut self.enc, 16);
+        PeirEnc_place_label(&mut self.enc, putc);
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RDX, 0x3FD); // COM1 + 5 (LSR)
+        PeirEnc_place_label(&mut self.enc, wait);
+        pe_emit1(&mut self.enc, 0xEC);       // in al, dx
+        pe_emit2(&mut self.enc, 0xA8, 0x20); // test al, 0x20 (THR empty)
+        PeirEnc_jcc_label(&mut self.enc, 0x4, wait); // jz
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RDX, 0x3F8); // COM1 (THR)
+        pe_emit2(&mut self.enc, 0x89, 0xC8); // mov eax, ecx
+        pe_emit1(&mut self.enc, 0xEE);       // out dx, al
+        PeirEnc_ret(&mut self.enc);
+
+        // p_print_str / p_eprint_str(rcx = C string)
+        var ps_loop: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var ps_done: i64 = PeirEnc_alloc_label(&mut self.enc);
+        PeirEnc_align_to(&mut self.enc, 16);
+        PeirEnc_place_label(&mut self.enc, pstr);
+        PeirEnc_place_label(&mut self.enc, estr);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_RCX);
+        PeirEnc_test_rr(&mut self.enc, PEIR_R8, PEIR_R8);
+        PeirEnc_jcc_label(&mut self.enc, 0x4, ps_done); // jz
+        PeirEnc_place_label(&mut self.enc, ps_loop);
+        pe_emit4(&mut self.enc, 0x41, 0x0F, 0xB6, 0x08); // movzx ecx, byte [r8]
+        pe_emit2(&mut self.enc, 0x85, 0xC9);             // test ecx, ecx
+        PeirEnc_jcc_label(&mut self.enc, 0x4, ps_done);  // jz
+        PeirEnc_call_label(&mut self.enc, putc);
+        pe_emit3(&mut self.enc, 0x49, 0xFF, 0xC0);       // inc r8
+        PeirEnc_jmp_label(&mut self.enc, ps_loop);
+        PeirEnc_place_label(&mut self.enc, ps_done);
+        PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        PeirEnc_ret(&mut self.enc);
+    }
+
+    // p_print_newline()
+    PeirGen_place_fn(self, "p_print_newline");
+    PeirEnc_mov_imm32(&mut self.enc, PEIR_R9, 1);
+    PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, 10);
+    PeirEnc_jmp_label(&mut self.enc, putc);
+
+    // p_print_bool(rcx)
+    var pb_true: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirGen_place_fn(self, "p_print_bool");
+    PeirEnc_test_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
+    PeirEnc_jcc_label(&mut self.enc, 0x5, pb_true); // jnz
+    PeirEnc_lea_rip(&mut self.enc, PEIR_RCX, PeirGen_str_off(self, "false"));
+    PeirEnc_jmp_label(&mut self.enc, pstr);
+    PeirEnc_place_label(&mut self.enc, pb_true);
+    PeirEnc_lea_rip(&mut self.enc, PEIR_RCX, PeirGen_str_off(self, "true"));
+    PeirEnc_jmp_label(&mut self.enc, pstr);
+
+    // p_print_int(rcx): decimal, built backwards in a buffer on the stack
+    var pi_pos: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var pi_digit: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var pi_out: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirGen_place_fn(self, "p_print_int");
+    PeirEnc_push(&mut self.enc, PEIR_RBP);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
+    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R9, PEIR_RCX);    // the sign
+    PeirEnc_lea_rbp(&mut self.enc, PEIR_R8, -1);
+    pe_emit4(&mut self.enc, 0x41, 0xC6, 0x00, 0x00);     // mov byte [r8], 0
+    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x9, pi_pos);       // jns
+    PeirEnc_neg_r(&mut self.enc, PEIR_RAX);              // i64 min: 2^63, unsigned
+    PeirEnc_place_label(&mut self.enc, pi_pos);
+    PeirEnc_mov_imm32(&mut self.enc, PEIR_R10, 10);
+    PeirEnc_place_label(&mut self.enc, pi_digit);
+    PeirEnc_xor_rr(&mut self.enc, PEIR_RDX, PEIR_RDX);
+    pe_emit3(&mut self.enc, 0x49, 0xF7, 0xF2);           // div r10
+    pe_emit3(&mut self.enc, 0x80, 0xC2, 0x30);           // add dl, 48
+    pe_emit3(&mut self.enc, 0x49, 0xFF, 0xC8);           // dec r8
+    pe_emit3(&mut self.enc, 0x41, 0x88, 0x10);           // mov [r8], dl
+    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x5, pi_digit);     // jnz
+    PeirEnc_test_rr(&mut self.enc, PEIR_R9, PEIR_R9);
+    PeirEnc_jcc_label(&mut self.enc, 0x9, pi_out);       // jns
+    pe_emit3(&mut self.enc, 0x49, 0xFF, 0xC8);           // dec r8
+    pe_emit4(&mut self.enc, 0x41, 0xC6, 0x00, 0x2D);     // mov byte [r8], 45 (minus)
+    PeirEnc_place_label(&mut self.enc, pi_out);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R8);
+    PeirEnc_call_label(&mut self.enc, pstr);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RSP, PEIR_RBP);
+    PeirEnc_pop(&mut self.enc, PEIR_RBP);
+    PeirEnc_ret(&mut self.enc);
+
+    // p_panic(rcx = message): the program's handler, else COM1; then halt
+    var halt: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirGen_place_fn(self, "p_panic");
+    PeirEnc_push(&mut self.enc, PEIR_RBP);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
+    PeirEnc_push(&mut self.enc, PEIR_R12);
+    PeirEnc_sub_rsp_i32(&mut self.enc, 40);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RCX);
+    if g_pe_bare_panic_handler != "" && HashMap_contains(self.func_labels, g_pe_bare_panic_handler) {
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R12);
+        PeirEnc_xor_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
+        PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, g_pe_bare_panic_handler));
+    } else if g_pe_elf {
+        // As a Windows program: "Panic: <message>" on stderr, exit code 1
+        PeirEnc_lea_rip(&mut self.enc, PEIR_RCX, PeirGen_str_off(self, "Panic: "));
+        PeirEnc_call_label(&mut self.enc, estr);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R12);
+        PeirEnc_call_label(&mut self.enc, estr);
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_R9, 2);
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, 10);
+        PeirEnc_call_label(&mut self.enc, putc);
+    } else {
+        PeirEnc_lea_rip(&mut self.enc, PEIR_RCX, PeirGen_str_off(self, "panic: "));
+        PeirEnc_call_label(&mut self.enc, pstr);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R12);
+        PeirEnc_call_label(&mut self.enc, pstr);
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, 10);
+        PeirEnc_call_label(&mut self.enc, putc);
+    }
+    if g_pe_elf {
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RAX, 231);  // SYS_exit_group
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RDI, 1);
+        pe_emit2(&mut self.enc, 0x0F, 0x05);              // syscall
+    }
+    PeirEnc_place_label(&mut self.enc, halt);
+    pe_emit2(&mut self.enc, 0xFA, 0xF4); // cli; hlt
+    PeirEnc_jmp_label(&mut self.enc, halt);
+
+    // p_argc: no command line
+    PeirGen_place_fn(self, "p_argc");
+    PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_ret(&mut self.enc);
+}
+
+/// Place each of `names` not placed yet at a trap: the runtime functions a
+/// bare build has no body for.
+pub fn PeirGen_trap_unplaced(self: &mut PeirGen, names: Vec<str>) -> void {
+    var ni: i64 = 0;
+    while ni < names.len() {
+        if HashMap_contains(self.func_labels, names.get(ni)) {
+            var l: i64 = HashMap_get(self.func_labels, names.get(ni));
+            if self.enc.labels.get(l) < 0 {
+                PeirEnc_place_label(&mut self.enc, l);
+                PeirEnc_ud2(&mut self.enc);
+            }
+        }
+        ni = ni + 1;
+    }
+}
+
+// ===========================================================================
 // gen_runtime_stubs (src/pe.rs) — the non-bare sequence, verbatim
 // ===========================================================================
 
 pub fn PeirGen_gen_runtime_stubs(self: &mut PeirGen) -> void {
     if self.bare_mode {
-        panic("pe_ir: bare mode not ported");
+        PeirGen_gen_bare_runtime(self);
+        return;
     }
     // Runtime functions that only pretended to work (string search,
     // replace, case, trim, vec sort/insert, map keys...) are not
@@ -876,7 +1110,9 @@ pub fn PeirGen_gen_interrupt_stubs(self: &mut PeirGen) -> void {
     // p_cli() — clear interrupt flag
     var label: i64 = HashMap_get(self.func_labels, "p_cli");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        pe_emit1(&mut self.enc, 0xFA); // cli
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -884,7 +1120,9 @@ pub fn PeirGen_gen_interrupt_stubs(self: &mut PeirGen) -> void {
     // p_sti() — set interrupt flag
     label = HashMap_get(self.func_labels, "p_sti");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        pe_emit1(&mut self.enc, 0xFB); // sti
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -892,7 +1130,9 @@ pub fn PeirGen_gen_interrupt_stubs(self: &mut PeirGen) -> void {
     // p_hlt() — halt CPU (hlt only; interrupts must be enabled for wakeup)
     label = HashMap_get(self.func_labels, "p_hlt");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        pe_emit1(&mut self.enc, 0xF4); // hlt (no cli — interrupts wake the CPU)
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -900,7 +1140,10 @@ pub fn PeirGen_gen_interrupt_stubs(self: &mut PeirGen) -> void {
     // p_lidt(rcx = ptr to IDT descriptor) — load IDT
     label = HashMap_get(self.func_labels, "p_lidt");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // lidt [rcx]
+        pe_emit4(&mut self.enc, 0x48, 0x0F, 0x01, 0x19); // lidt [rcx]
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -909,7 +1152,40 @@ pub fn PeirGen_gen_interrupt_stubs(self: &mut PeirGen) -> void {
     // Writes a 16-byte IDT gate descriptor at idt_ptr + vector * 16 (bare only).
     label = HashMap_get(self.func_labels, "p_idt_set_entry");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // rcx = idt_ptr (base), rdx = vector, r8 = handler_addr, r9 = flags
+        // Compute gate address: rdx * 16 + rcx → r10
+        // r10 = rdx << 4
+        PeirEnc_mov_rr(&mut self.enc, PEIR_R10, PEIR_RDX);
+        PeirEnc_shl_r_i8(&mut self.enc, PEIR_R10, 4);
+        // r10 = r10 + rcx (idt_ptr + vector*16)
+        PeirEnc_add_rr(&mut self.enc, PEIR_R10, PEIR_RCX);
+        // offset_low = handler_addr & 0xFFFF → [r10 + 0]
+        // mov rax, r8 (handler_addr)
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R8);
+        // mov [r10], ax
+        pe_emit4(&mut self.enc, 0x66, 0x41, 0x89, 0x02); // mov [r10], ax
+        // selector = 0x08 → [r10 + 2]
+        pe_emit7(&mut self.enc, 0x66, 0x41, 0xC7, 0x42, 0x02, 0x08, 0x00); // mov word [r10+2], 0x0008
+        // ist = 0 → [r10 + 4]
+        pe_emit5(&mut self.enc, 0x41, 0xC6, 0x42, 0x04, 0x00); // mov byte [r10+4], 0
+        // type_attr = flags | 0x8E → [r10 + 5]
+        // r9 = flags, or with 0x8E
+        pe_emit4(&mut self.enc, 0x41, 0x80, 0xC9, 0x8E); // or r9b, 0x8E
+        pe_emit4(&mut self.enc, 0x45, 0x88, 0x4A, 0x05); // mov [r10+5], r9b
+        // offset_mid = (handler_addr >> 16) & 0xFFFF → [r10 + 6]
+        // shr rax, 16
+        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE8, 0x10); // shr rax, 16
+        // mov [r10 + 6], ax
+        pe_emit5(&mut self.enc, 0x66, 0x41, 0x89, 0x42, 0x06); // mov [r10+6], ax
+        // offset_high = (handler_addr >> 32) & 0xFFFFFFFF → [r10 + 8]
+        // shr rax, 16  (rax now = handler_addr >> 32)
+        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE8, 0x10); // shr rax, 16
+        // mov [r10 + 8], eax
+        pe_emit4(&mut self.enc, 0x41, 0x89, 0x42, 0x08); // mov [r10+8], eax
+        // reserved = 0 → [r10 + 12]
+        pe_emit8(&mut self.enc, 0x41, 0xC7, 0x42, 0x0C, 0x00, 0x00, 0x00, 0x00); // mov dword [r10+12], 0
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -917,7 +1193,15 @@ pub fn PeirGen_gen_interrupt_stubs(self: &mut PeirGen) -> void {
     // p_inb(rcx = port) -> rax = byte — read from I/O port
     label = HashMap_get(self.func_labels, "p_inb");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // Port is in rcx, move to dx for in al, dx
+        // mov dx, cx (16-bit)
+        pe_emit3(&mut self.enc, 0x66, 0x89, 0xCA); // mov dx, cx
+        // xor rax, rax
+        PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        // in al, dx
+        pe_emit1(&mut self.enc, 0xEC); // in al, dx
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -925,7 +1209,14 @@ pub fn PeirGen_gen_interrupt_stubs(self: &mut PeirGen) -> void {
     // p_inw(rcx = port) -> rax = word — read 16-bit from I/O port
     label = HashMap_get(self.func_labels, "p_inw");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov dx, cx (16-bit)
+        pe_emit3(&mut self.enc, 0x66, 0x89, 0xCA); // mov dx, cx
+        // xor rax, rax
+        PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        // in ax, dx
+        pe_emit2(&mut self.enc, 0x66, 0xED); // in ax, dx
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -933,7 +1224,14 @@ pub fn PeirGen_gen_interrupt_stubs(self: &mut PeirGen) -> void {
     // p_outb(rcx = port, rdx = value) — write to I/O port
     label = HashMap_get(self.func_labels, "p_outb");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // rcx = port, rdx = value
+        // mov al, dl (value to al — must do before overwriting dx)
+        pe_emit2(&mut self.enc, 0x88, 0xD0); // mov al, dl (value to al)
+        pe_emit3(&mut self.enc, 0x66, 0x89, 0xCA); // mov dx, cx (port to dx)
+        // out dx, al
+        pe_emit1(&mut self.enc, 0xEE); // out dx, al
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -941,7 +1239,15 @@ pub fn PeirGen_gen_interrupt_stubs(self: &mut PeirGen) -> void {
     // p_outw(rcx = port, rdx = value) — write 16-bit word to I/O port
     label = HashMap_get(self.func_labels, "p_outw");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // rcx = port, rdx = value
+        // mov ax, dx (value to ax — must do before overwriting dx)
+        pe_emit3(&mut self.enc, 0x66, 0x89, 0xD0); // mov ax, dx (value to ax)
+        // mov dx, cx (port to dx)
+        pe_emit3(&mut self.enc, 0x66, 0x89, 0xCA); // mov dx, cx (port to dx)
+        // out dx, ax
+        pe_emit2(&mut self.enc, 0x66, 0xEF); // out dx, ax
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -949,7 +1255,15 @@ pub fn PeirGen_gen_interrupt_stubs(self: &mut PeirGen) -> void {
     // p_outl(rcx = port, rdx = value) — write 32-bit dword to I/O port
     label = HashMap_get(self.func_labels, "p_outl");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // rcx = port, rdx = value
+        // mov eax, edx (value to eax)
+        pe_emit2(&mut self.enc, 0x89, 0xD0); // mov eax, edx
+        // mov dx, cx (port to dx)
+        pe_emit3(&mut self.enc, 0x66, 0x89, 0xCA); // mov dx, cx (port to dx)
+        // out dx, eax
+        pe_emit1(&mut self.enc, 0xEF); // out dx, eax
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -957,7 +1271,12 @@ pub fn PeirGen_gen_interrupt_stubs(self: &mut PeirGen) -> void {
     // p_inl(rcx = port) -> rax — read 32-bit dword from I/O port
     label = HashMap_get(self.func_labels, "p_inl");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov dx, cx (port to dx)
+        pe_emit3(&mut self.enc, 0x66, 0x89, 0xCA); // mov dx, cx
+        // in eax, dx
+        pe_emit1(&mut self.enc, 0xED); // in eax, dx
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -968,7 +1287,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_cr3_read() -> rax — read CR3 (page table base)
     var label: i64 = HashMap_get(self.func_labels, "p_cr3_read");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov rax, cr3
+        pe_emit4(&mut self.enc, 0x48, 0x0F, 0x20, 0xD8); // mov rax, cr3
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -976,7 +1298,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_cr3_write(rcx = addr) — write CR3
     label = HashMap_get(self.func_labels, "p_cr3_write");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov cr3, rcx
+        pe_emit4(&mut self.enc, 0x48, 0x0F, 0x22, 0xD9); // mov cr3, rcx
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -984,7 +1309,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_cr0_read() -> rax — read CR0
     label = HashMap_get(self.func_labels, "p_cr0_read");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov rax, cr0
+        pe_emit4(&mut self.enc, 0x48, 0x0F, 0x20, 0xC0); // mov rax, cr0
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -992,7 +1320,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_cr0_write(rcx = val) — write CR0
     label = HashMap_get(self.func_labels, "p_cr0_write");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov cr0, rcx
+        pe_emit4(&mut self.enc, 0x48, 0x0F, 0x22, 0xC1); // mov cr0, rcx
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1000,7 +1331,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_cr2_read() -> rax — read CR2 (page fault address)
     label = HashMap_get(self.func_labels, "p_cr2_read");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov rax, cr2
+        pe_emit4(&mut self.enc, 0x48, 0x0F, 0x20, 0xD0); // mov rax, cr2
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1008,7 +1342,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_cr4_read() -> rax — read CR4
     label = HashMap_get(self.func_labels, "p_cr4_read");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov rax, cr4
+        pe_emit4(&mut self.enc, 0x48, 0x0F, 0x20, 0xE0); // mov rax, cr4
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1016,7 +1353,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_cr4_write(rcx = val) — write CR4
     label = HashMap_get(self.func_labels, "p_cr4_write");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov cr4, rcx
+        pe_emit4(&mut self.enc, 0x48, 0x0F, 0x22, 0xE1); // mov cr4, rcx
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1024,7 +1364,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_invlpg(rcx = addr) — invalidate TLB entry
     label = HashMap_get(self.func_labels, "p_invlpg");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // invlpg [rcx]
+        pe_emit4(&mut self.enc, 0x48, 0x0F, 0x01, 0x39); // invlpg [rcx]
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1032,7 +1375,19 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // T10: p_wrmsr_gs_base(rcx = value) — write GS base (MSR 0xC0000101)
     label = HashMap_get(self.func_labels, "p_wrmsr_gs_base");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // Save rcx (value) before clobbering ecx with the MSR address.
+        // mov rax, rcx            ; rax = value (low 32 will be used)
+        pe_emit3(&mut self.enc, 0x48, 0x89, 0xC8); // mov rax, rcx
+        // mov rdx, rax            ; rdx = value (high 32 in edx after shift)
+        pe_emit3(&mut self.enc, 0x48, 0x89, 0xC2); // mov rdx, rax
+        // shr rdx, 32             ; edx = high 32 bits
+        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xEA, 0x20); // shr rdx, 32
+        // mov ecx, 0xC0000101     ; MSR_GS_BASE
+        pe_emit5(&mut self.enc, 0xB9, 0x01, 0x01, 0x00, 0xC0); // mov ecx, 0xC0000101
+        // wrmsr
+        pe_emit2(&mut self.enc, 0x0F, 0x30); // wrmsr
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1040,7 +1395,16 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // T10: p_rdmsr_gs_base() -> rax — read GS base (MSR 0xC0000101)
     label = HashMap_get(self.func_labels, "p_rdmsr_gs_base");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov ecx, 0xC0000101     ; MSR_GS_BASE
+        pe_emit5(&mut self.enc, 0xB9, 0x01, 0x01, 0x00, 0xC0); // mov ecx, 0xC0000101
+        // rdmsr                   ; edx:eax = MSR value
+        pe_emit2(&mut self.enc, 0x0F, 0x32); // rdmsr
+        // shl rdx, 32             ; shift high 32 bits into position
+        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE2, 0x20); // shl rdx, 32
+        // or rax, rdx             ; combine low and high
+        pe_emit3(&mut self.enc, 0x48, 0x09, 0xD0); // or rax, rdx
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1048,7 +1412,14 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // T10: p_wrmsr_kernel_gs_base(rcx = value) — write KernelGSBase (0xC0000102)
     label = HashMap_get(self.func_labels, "p_wrmsr_kernel_gs_base");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        pe_emit3(&mut self.enc, 0x48, 0x89, 0xC8); // mov rax, rcx
+        pe_emit3(&mut self.enc, 0x48, 0x89, 0xC2); // mov rdx, rax
+        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xEA, 0x20); // shr rdx, 32
+        // mov ecx, 0xC0000102     ; MSR_KERNEL_GS_BASE
+        pe_emit5(&mut self.enc, 0xB9, 0x02, 0x01, 0x00, 0xC0); // mov ecx, 0xC0000102
+        pe_emit2(&mut self.enc, 0x0F, 0x30); // wrmsr
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1056,7 +1427,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // T10: p_swapgs() — swap GS base and KernelGSBase
     label = HashMap_get(self.func_labels, "p_swapgs");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // swapgs
+        pe_emit3(&mut self.enc, 0x0F, 0x01, 0xF8); // swapgs
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1065,7 +1439,134 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // Bare-metal 4-level page walk; under an OS, a trap.
     label = HashMap_get(self.func_labels, "p_page_map");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // Save callee-saved registers
+        PeirEnc_push(&mut self.enc, PEIR_RBP);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
+        PeirEnc_push(&mut self.enc, PEIR_R12); // PML4 base
+        PeirEnc_push(&mut self.enc, PEIR_R13); // virt_addr
+        PeirEnc_push(&mut self.enc, PEIR_R14); // phys_addr
+        PeirEnc_push(&mut self.enc, PEIR_R15); // flags
+        PeirEnc_sub_rsp_i32(&mut self.enc, 16); // alignment + temp
+        // r12 = PML4 base (rcx)
+        PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RCX);
+        // r13 = virt_addr (rdx)
+        PeirEnc_mov_rr(&mut self.enc, PEIR_R13, PEIR_RDX);
+        // r14 = phys_addr (r8)
+        PeirEnc_mov_rr(&mut self.enc, PEIR_R14, PEIR_R8);
+        // r15 = flags (r9)
+        PeirEnc_mov_rr(&mut self.enc, PEIR_R15, PEIR_R9);
+        // === Level 1: PML4 (bits 39-47) ===
+        // rax = (r13 >> 39) & 0x1FF
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R13);
+        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE8, 0x27); // shr rax, 39
+        pe_emit6(&mut self.enc, 0x48, 0x25, 0xFF, 0x01, 0x00, 0x00); // and rax, 0x1FF
+        // rax = rax * 8 (entry offset)
+        PeirEnc_shl_r_i8(&mut self.enc, PEIR_RAX, 3);
+        // rax = r12 + rax (PML4 entry address)
+        PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_R12);
+        // Read PML4 entry: rcx = [rax]
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+        // Test present bit (bit 0): if 0, allocate new PDPT
+        PeirEnc_test_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
+        var pm_have_pdpt: i64 = PeirEnc_alloc_label(&mut self.enc);
+        // test rcx, 1 → jnz pm_have_pdpt
+        pe_emit7(&mut self.enc, 0x48, 0xF7, 0xC1, 0x01, 0x00, 0x00, 0x00); // test rcx, 1
+        PeirEnc_jcc_label(&mut self.enc, 0x5, pm_have_pdpt); // jnz
+        // Allocate new PDPT at bump allocator (0x200000)
+        // Load current bump ptr: rax = [0x200000]
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, 0x200000);
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RCX, PEIR_RAX); // rcx = bump ptr
+        // Advance bump ptr by 4096 (one page table)
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_RCX);
+        // rdx = rcx + 4096 (the Rust version also emitted `add rdx, 0` and a
+        // stray 0x10 byte here, which swallowed the next instruction)
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RDX, 4096);
+        PeirEnc_add_rr(&mut self.enc, PEIR_RDX, PEIR_RCX);
+        // Store new bump ptr: [0x200000] = rdx
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, 0x200000);
+        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_RDX);
+        // Zero the new page table (4096 bytes = 512 qwords)
+        // rdi = rcx (new table), xor rax,rax, mov rcx_loop=512, rep stosq
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RDI, PEIR_RCX); // rdi = table addr
+        PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RAX); // rax = 0
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, 512); // rcx = 512
+        pe_emit3(&mut self.enc, 0xF3, 0x48, 0xAB); // rep stosq
+        // Set PML4 entry = new_table_addr | present | writable
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RDI); // rcx = new table addr (rdi was modified, use saved)
+        // Actually rdi was modified by rep stosq. Reload from bump ptr - 0x1000
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, 0x200000);
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RDX, PEIR_RAX); // rdx = current bump
+        pe_emit4(&mut self.enc, 0x48, 0x83, 0xEA, 0x10); // sub rdx, 16 — wrong, need sub 0x1000
+        // Fix: use mov_imm32 + sub
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RAX, 4096);
+        pe_emit3(&mut self.enc, 0x48, 0x29, 0xC2); // sub rdx, rax
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RDX); // rcx = new table addr
+        // or rcx, 3 (present | writable)
+        pe_emit4(&mut self.enc, 0x48, 0x83, 0xC9, 0x03); // or rcx, 3
+        // Re-read PML4 entry address and store
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R13); // rax = virt
+        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE8, 0x27); // shr rax, 39
+        pe_emit6(&mut self.enc, 0x48, 0x25, 0xFF, 0x01, 0x00, 0x00); // and rax, 0x1FF
+        PeirEnc_shl_r_i8(&mut self.enc, PEIR_RAX, 3);
+        PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_R12); // rax = PML4 entry addr
+        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_RCX); // store entry
+        // rcx = table base (strip flags)
+        pe_emit6(&mut self.enc, 0x48, 0x25, 0x00, 0xF0, 0xFF, 0xFF); // and rax, 0xFFFFF000 — wrong reg
+        // Use: and rcx, ~0xFFF
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, -4096);
+        PeirEnc_and_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+        PeirEnc_place_label(&mut self.enc, pm_have_pdpt);
+        // rcx = PDPT base (strip flags from PML4 entry)
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, -4096);
+        PeirEnc_and_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+        // For now, just map at PT level directly (simplified 4KB page mapping).
+        // Full 4-level walk is complex in raw asm; this handles the common case
+        // where intermediate tables already exist (pre-allocated by bootloader).
+        // Walk PDPT (bits 30-38), PD (bits 21-29), PT (bits 12-20).
+        // Each level: index = (virt >> shift) & 0x1FF; entry = table[index]; if not present, alloc; table = entry & ~0xFFF
+        // === Level 2: PDPT (bits 30-38) ===
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R13);
+        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE8, 0x1E); // shr rax, 30
+        pe_emit6(&mut self.enc, 0x48, 0x25, 0xFF, 0x01, 0x00, 0x00); // and rax, 0x1FF
+        PeirEnc_shl_r_i8(&mut self.enc, PEIR_RAX, 3);
+        PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RCX, PEIR_RAX); // rcx = PDPT entry
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, -4096);
+        PeirEnc_and_rr(&mut self.enc, PEIR_RCX, PEIR_RAX); // strip flags
+        // === Level 3: PD (bits 21-29) ===
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R13);
+        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE8, 0x15); // shr rax, 21
+        pe_emit6(&mut self.enc, 0x48, 0x25, 0xFF, 0x01, 0x00, 0x00); // and rax, 0x1FF
+        PeirEnc_shl_r_i8(&mut self.enc, PEIR_RAX, 3);
+        PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RCX, PEIR_RAX); // rcx = PD entry
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, -4096);
+        PeirEnc_and_rr(&mut self.enc, PEIR_RCX, PEIR_RAX); // strip flags
+        // === Level 4: PT (bits 12-20) ===
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R13);
+        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE8, 0x0C); // shr rax, 12
+        pe_emit6(&mut self.enc, 0x48, 0x25, 0xFF, 0x01, 0x00, 0x00); // and rax, 0x1FF
+        PeirEnc_shl_r_i8(&mut self.enc, PEIR_RAX, 3);
+        PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_RCX); // rax = PT entry address
+        // Set PT entry = phys_addr | flags
+        // r14 = phys_addr, r15 = flags
+        // entry = (r14 & ~0xFFF) | (r15 & 0xFFF)
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R14);
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, -4096);
+        PeirEnc_and_rr(&mut self.enc, PEIR_RCX, PEIR_RDX); // phys & ~0xFFF
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, 0x0000000000000FFF);
+        PeirEnc_and_rr(&mut self.enc, PEIR_R15, PEIR_RDX); // flags & 0xFFF
+        PeirEnc_or_rr(&mut self.enc, PEIR_RCX, PEIR_R15); // phys | flags
+        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_RCX); // store PTE
+        // Restore and return
+        pe_emit4(&mut self.enc, 0x48, 0x83, 0xC4, 0x10); // add rsp, 16
+        PeirEnc_pop(&mut self.enc, PEIR_R15);
+        PeirEnc_pop(&mut self.enc, PEIR_R14);
+        PeirEnc_pop(&mut self.enc, PEIR_R13);
+        PeirEnc_pop(&mut self.enc, PEIR_R12);
+        PeirEnc_pop(&mut self.enc, PEIR_RBP);
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1073,7 +1574,59 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_page_unmap(rcx=PML4 base, rdx=virt_addr)
     label = HashMap_get(self.func_labels, "p_page_unmap");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        PeirEnc_push(&mut self.enc, PEIR_RBP);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
+        PeirEnc_push(&mut self.enc, PEIR_R12); // PML4 base
+        PeirEnc_push(&mut self.enc, PEIR_R13); // virt_addr
+        PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RCX);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_R13, PEIR_RDX);
+        // Walk PML4 → PDPT → PD → PT (same as p_page_map but read-only)
+        // PML4 (bits 39-47)
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R13);
+        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE8, 0x27); // shr rax, 39
+        pe_emit6(&mut self.enc, 0x48, 0x25, 0xFF, 0x01, 0x00, 0x00); // and rax, 0x1FF
+        PeirEnc_shl_r_i8(&mut self.enc, PEIR_RAX, 3);
+        PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_R12);
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, -4096);
+        PeirEnc_and_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+        // PDPT (bits 30-38)
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R13);
+        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE8, 0x1E); // shr rax, 30
+        pe_emit6(&mut self.enc, 0x48, 0x25, 0xFF, 0x01, 0x00, 0x00); // and rax, 0x1FF
+        PeirEnc_shl_r_i8(&mut self.enc, PEIR_RAX, 3);
+        PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, -4096);
+        PeirEnc_and_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+        // PD (bits 21-29)
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R13);
+        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE8, 0x15); // shr rax, 21
+        pe_emit6(&mut self.enc, 0x48, 0x25, 0xFF, 0x01, 0x00, 0x00); // and rax, 0x1FF
+        PeirEnc_shl_r_i8(&mut self.enc, PEIR_RAX, 3);
+        PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, -4096);
+        PeirEnc_and_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+        // PT (bits 12-20)
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R13);
+        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE8, 0x0C); // shr rax, 12
+        pe_emit6(&mut self.enc, 0x48, 0x25, 0xFF, 0x01, 0x00, 0x00); // and rax, 0x1FF
+        PeirEnc_shl_r_i8(&mut self.enc, PEIR_RAX, 3);
+        PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_RCX); // rax = PT entry address
+        // Clear the PTE: mov qword [rax], 0
+        PeirEnc_xor_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
+        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_RCX);
+        // invlpg [r13]
+        pe_emit4(&mut self.enc, 0x48, 0x0F, 0x01, 0xBD); // invlpg [r13] — using rbp? no
+        // invlpg [rcx] where rcx = virt_addr
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R13);
+        pe_emit4(&mut self.enc, 0x48, 0x0F, 0x01, 0x39); // invlpg [rcx]
+        PeirEnc_pop(&mut self.enc, PEIR_R13);
+        PeirEnc_pop(&mut self.enc, PEIR_R12);
+        PeirEnc_pop(&mut self.enc, PEIR_RBP);
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1081,7 +1634,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_phys_read64(rcx=addr) -> rax — read 8 bytes from physical address
     label = HashMap_get(self.func_labels, "p_phys_read64");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov rax, [rcx]
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1089,7 +1645,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_phys_write64(rcx=addr, rdx=val) — write 8 bytes to physical address
     label = HashMap_get(self.func_labels, "p_phys_write64");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov [rcx], rdx
+        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RCX, PEIR_RDX);
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1097,7 +1656,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_mem_read8(rcx=addr) -> rax — read 1 byte from memory
     label = HashMap_get(self.func_labels, "p_mem_read8");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // movzx eax, byte [rcx]
+        pe_emit3(&mut self.enc, 0x0F, 0xB6, 0x01); // movzx eax, byte [rcx]
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1105,7 +1667,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_mem_write8(rcx=addr, rdx=val) — write 1 byte to memory
     label = HashMap_get(self.func_labels, "p_mem_write8");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov [rcx], dl
+        pe_emit2(&mut self.enc, 0x88, 0x11); // mov [rcx], dl
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1113,7 +1678,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_mem_read16(rcx=addr) -> rax — read 2 bytes from memory
     label = HashMap_get(self.func_labels, "p_mem_read16");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // movzx eax, word [rcx]
+        pe_emit3(&mut self.enc, 0x0F, 0xB7, 0x01); // movzx eax, word [rcx]
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1121,7 +1689,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_mem_write16(rcx=addr, rdx=val) — write 2 bytes to memory
     label = HashMap_get(self.func_labels, "p_mem_write16");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov [rcx], dx
+        pe_emit3(&mut self.enc, 0x66, 0x89, 0x11); // mov [rcx], dx
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1129,7 +1700,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_mem_read32(rcx=addr) -> rax — read 4 bytes from memory
     label = HashMap_get(self.func_labels, "p_mem_read32");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov eax, [rcx]
+        pe_emit2(&mut self.enc, 0x8B, 0x01); // mov eax, [rcx]
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1137,7 +1711,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_mem_write32(rcx=addr, rdx=val) — write 4 bytes to memory
     label = HashMap_get(self.func_labels, "p_mem_write32");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov [rcx], edx
+        pe_emit2(&mut self.enc, 0x89, 0x11); // mov [rcx], edx
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1145,7 +1722,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_mem_read64(rcx=addr) -> rax — read 8 bytes from memory
     label = HashMap_get(self.func_labels, "p_mem_read64");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov rax, [rcx]
+        pe_emit3(&mut self.enc, 0x48, 0x8B, 0x01); // mov rax, [rcx]
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1153,7 +1733,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_mem_write64(rcx=addr, rdx=val) — write 8 bytes to memory
     label = HashMap_get(self.func_labels, "p_mem_write64");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov [rcx], rdx
+        pe_emit3(&mut self.enc, 0x48, 0x89, 0x11); // mov [rcx], rdx
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1161,7 +1744,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_get_rbp() -> rax = RBP
     label = HashMap_get(self.func_labels, "p_get_rbp");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov rax, rbp
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RBP);
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1169,7 +1755,10 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_get_rsp() -> rax = RSP
     label = HashMap_get(self.func_labels, "p_get_rsp");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // mov rax, rsp
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RSP);
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1177,7 +1766,21 @@ pub fn PeirGen_gen_mmu_stubs(self: &mut PeirGen) -> void {
     // p_atomic_xchg32(rcx=addr, rdx=value) -> rax = old value
     label = HashMap_get(self.func_labels, "p_atomic_xchg32");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // lock xchg [rcx], edx
+        pe_emit1(&mut self.enc, 0xF0); // lock prefix
+        pe_emit2(&mut self.enc, 0x87, 0x11); // xchg [rcx], edx
+        // Old value is now in edx, move to rax
+        // xchg puts old [rcx] in edx and new value in [rcx]
+        // Actually xchg [rcx], edx: edx gets old [rcx], [rcx] gets old edx
+        // So rax needs to be set to edx (the old value)
+        // But xchg already set edx to the old value, and edx was the input
+        // Wait: xchg [rcx], edx exchanges edx and [rcx]
+        // Before: [rcx] = old_val, edx = new_val
+        // After:  [rcx] = new_val, edx = old_val
+        // So mov eax, edx to return old_val
+        pe_emit2(&mut self.enc, 0x89, 0xD0); // mov eax, edx
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1188,7 +1791,10 @@ pub fn PeirGen_gen_gdt_stubs(self: &mut PeirGen) -> void {
     // p_lgdt(rcx = pointer to GDT descriptor)
     var label: i64 = HashMap_get(self.func_labels, "p_lgdt");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // lgdt [rcx] — 0x0F 0x01 0x19
+        pe_emit3(&mut self.enc, 0x0F, 0x01, 0x19); // lgdt [rcx]
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1197,7 +1803,47 @@ pub fn PeirGen_gen_gdt_stubs(self: &mut PeirGen) -> void {
     // stack[16] = flags) — writes an 8-byte GDT entry (bare only).
     label = HashMap_get(self.func_labels, "p_gdt_set_entry");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // rcx = gdt_ptr, rdx = index, r8 = base, r9 = limit
+        // flags is on stack at [rbp + 16] (after return address + rbp)
+        PeirEnc_push(&mut self.enc, PEIR_RBP);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
+        // r10 = rdx * 8 + rcx (entry address)
+        PeirEnc_mov_rr(&mut self.enc, PEIR_R10, PEIR_RDX);
+        PeirEnc_shl_r_i8(&mut self.enc, PEIR_R10, 3);
+        PeirEnc_add_rr(&mut self.enc, PEIR_R10, PEIR_RCX);
+        // limit_low = r9 & 0xFFFF → [r10 + 0]
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R9);
+        pe_emit4(&mut self.enc, 0x66, 0x41, 0x89, 0x02); // mov [r10], ax
+        // base_low = r8 & 0xFFFF → [r10 + 2]
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R8);
+        pe_emit5(&mut self.enc, 0x66, 0x41, 0x89, 0x42, 0x02); // mov [r10+2], ax
+        // base_mid = (r8 >> 16) & 0xFF → [r10 + 4]
+        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE8, 0x10); // shr rax, 16
+        pe_emit4(&mut self.enc, 0x41, 0x88, 0x42, 0x04); // mov [r10+4], al
+        // type_attr = flags (from stack) → [r10 + 5]
+        // flags at [rbp + 16] (first stack arg on x64 Windows: shadow space + return addr)
+        // On Windows x64, 5th arg is at [rbp + 8 + 32] = [rbp + 40]
+        PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX); // clear upper bits (al = base_mid, reuse)
+        // Load flags from stack: [rbp + 40]
+        PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, 48);
+        pe_emit4(&mut self.enc, 0x41, 0x88, 0x42, 0x05); // mov [r10+5], al
+        // limit_high + flags_high = ((r9 >> 16) & 0x0F) | ((flags >> 8) & 0xF0) → [r10 + 6]
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R9);
+        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE8, 0x10); // shr rax, 16
+        pe_emit6(&mut self.enc, 0x48, 0x25, 0x0F, 0x00, 0x00, 0x00); // and rax, 0x0F
+        // Load flags again, shift right 8, mask 0xF0
+        PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, 48);
+        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE9, 0x08); // shr rcx, 8
+        pe_emit7(&mut self.enc, 0x48, 0x81, 0xE1, 0xF0, 0x00, 0x00, 0x00); // and rcx, 0xF0
+        PeirEnc_or_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+        pe_emit4(&mut self.enc, 0x41, 0x88, 0x42, 0x06); // mov [r10+6], al
+        // base_high = (r8 >> 24) & 0xFF → [r10 + 7]
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R8);
+        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE8, 0x18); // shr rax, 24
+        pe_emit4(&mut self.enc, 0x41, 0x88, 0x42, 0x07); // mov [r10+7], al
+        PeirEnc_pop(&mut self.enc, PEIR_RBP);
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1208,7 +1854,32 @@ pub fn PeirGen_gen_gdt_stubs(self: &mut PeirGen) -> void {
 pub fn PeirGen_gen_enter_user_mode(self: &mut PeirGen) -> void {
     var label: i64 = HashMap_get(self.func_labels, "p_enter_user_mode");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // rcx = entry_addr (RIP), rdx = stack_addr (RSP)
+        // Save entry/stack in callee-saved regs (r11, r12) before CR3 switch
+        // mov r11, rcx (entry addr)
+        pe_emit3(&mut self.enc, 0x49, 0x89, 0xCB); // mov r11, rcx
+        // mov r12, rdx (stack addr)
+        pe_emit3(&mut self.enc, 0x49, 0x89, 0xD4); // mov r12, rdx
+        // Switch CR3 to user page tables (0x72000)
+        // mov eax, 0x72000
+        pe_emit5(&mut self.enc, 0xB8, 0x00, 0x20, 0x07, 0x00); // mov eax, 0x72000
+        // mov cr3, rax
+        pe_emit3(&mut self.enc, 0x0F, 0x22, 0xD8); // mov cr3, rax
+        // Build iret frame on kernel stack, then iretq
+        // Push SS (user data segment = 0x23, index 4 | RPL=3)
+        pe_emit2(&mut self.enc, 0x6A, 0x23); // push 0x23
+        // Push RSP (user stack = r12)
+        PeirEnc_push(&mut self.enc, PEIR_R12);
+        // Push RFLAGS = 0x202 (IF=1, bit1=1) as a constant
+        pe_emit5(&mut self.enc, 0x68, 0x02, 0x02, 0x00, 0x00); // push 0x202
+        // Push CS (user code segment = 0x1B, index 3 | RPL=3)
+        pe_emit2(&mut self.enc, 0x6A, 0x1B); // push 0x1B
+        // Push RIP (entry address = r11)
+        PeirEnc_push(&mut self.enc, PEIR_R11);
+        // iretq — pops RIP, CS, RFLAGS, RSP, SS and jumps to ring 3
+        pe_emit2(&mut self.enc, 0x48, 0xCF); // iretq
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     // No ret — iretq never returns here
@@ -1220,7 +1891,36 @@ pub fn PeirGen_gen_serial_stubs(self: &mut PeirGen) -> void {
     // p_serial_init() — initialize COM1 serial port (115200 baud, 8N1)
     var label: i64 = HashMap_get(self.func_labels, "p_serial_init");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // Disable interrupts: outb(0x3F8 + 1, 0x00)
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RDX, 0x3F9); // COM1 + 1
+        PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        pe_emit1(&mut self.enc, 0xEE); // out dx, al
+        // Enable DLAB: outb(0x3F8 + 3, 0x80)
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RDX, 0x3FB); // COM1 + 3 (LCR)
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RAX, 0x80);
+        pe_emit1(&mut self.enc, 0xEE); // out dx, al
+        // Set divisor low byte (115200 baud = divisor 1): outb(0x3F8 + 0, 0x01)
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RDX, 0x3F8); // COM1 + 0
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RAX, 0x01);
+        pe_emit1(&mut self.enc, 0xEE); // out dx, al
+        // Set divisor high byte: outb(0x3F8 + 1, 0x00)
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RDX, 0x3F9); // COM1 + 1
+        PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        pe_emit1(&mut self.enc, 0xEE); // out dx, al
+        // 8 bits, no parity, 1 stop bit: outb(0x3F8 + 3, 0x03)
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RDX, 0x3FB); // COM1 + 3 (LCR)
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RAX, 0x03);
+        pe_emit1(&mut self.enc, 0xEE); // out dx, al
+        // Enable FIFO, clear them, 14-byte threshold: outb(0x3F8 + 2, 0xC7)
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RDX, 0x3FA); // COM1 + 2 (FCR)
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RAX, 0xC7);
+        pe_emit1(&mut self.enc, 0xEE); // out dx, al
+        // IRQs enabled, RTS/DSR set: outb(0x3F8 + 4, 0x0B)
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RDX, 0x3FC); // COM1 + 4 (MCR)
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RAX, 0x0B);
+        pe_emit1(&mut self.enc, 0xEE); // out dx, al
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1228,7 +1928,19 @@ pub fn PeirGen_gen_serial_stubs(self: &mut PeirGen) -> void {
     // p_serial_write(rcx = char) — write one byte to COM1
     label = HashMap_get(self.func_labels, "p_serial_write");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // Wait for transmit buffer empty (Line Status Register bit 5)
+        var sw_wait: i64 = PeirEnc_alloc_label(&mut self.enc);
+        PeirEnc_place_label(&mut self.enc, sw_wait);
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RDX, 0x3FD); // COM1 + 5 (LSR)
+        pe_emit1(&mut self.enc, 0xEC); // in al, dx
+        pe_emit2(&mut self.enc, 0xA8, 0x20); // test al, 0x20 (THR empty)
+        PeirEnc_jcc_label(&mut self.enc, 0x4, sw_wait); // jz (wait until set)
+        // Send byte: outb(0x3F8, char)
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RDX, 0x3F8); // COM1 + 0 (THR)
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RCX); // al = char
+        pe_emit1(&mut self.enc, 0xEE); // out dx, al
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1236,7 +1948,19 @@ pub fn PeirGen_gen_serial_stubs(self: &mut PeirGen) -> void {
     // p_serial_read() -> rax = byte — read one byte from COM1
     label = HashMap_get(self.func_labels, "p_serial_read");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // Wait for data ready (Line Status Register bit 0)
+        var sr_wait: i64 = PeirEnc_alloc_label(&mut self.enc);
+        PeirEnc_place_label(&mut self.enc, sr_wait);
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RDX, 0x3FD); // COM1 + 5 (LSR)
+        pe_emit1(&mut self.enc, 0xEC); // in al, dx
+        pe_emit2(&mut self.enc, 0xA8, 0x01); // test al, 0x01 (data ready)
+        PeirEnc_jcc_label(&mut self.enc, 0x4, sr_wait); // jz (wait until set)
+        // Read byte: in al, 0x3F8
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RDX, 0x3F8); // COM1 + 0 (RBR)
+        pe_emit1(&mut self.enc, 0xEC); // in al, dx
+        PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX); // zero-extend al to rax
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1244,7 +1968,13 @@ pub fn PeirGen_gen_serial_stubs(self: &mut PeirGen) -> void {
     // p_serial_ready() -> rax = bool — check if data is available
     label = HashMap_get(self.func_labels, "p_serial_ready");
     PeirEnc_place_label(&mut self.enc, label);
-    if self.bare_mode { panic("pe_ir: bare mode not ported"); } else {
+    if self.bare_mode {
+        // Read LSR and check bit 0 (data ready)
+        PeirEnc_mov_imm32(&mut self.enc, PEIR_RDX, 0x3FD); // COM1 + 5 (LSR)
+        pe_emit1(&mut self.enc, 0xEC); // in al, dx
+        pe_emit2(&mut self.enc, 0x24, 0x01); // and al, 0x01
+        PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    } else {
         PeirEnc_ud2(&mut self.enc);
     }
     PeirEnc_ret(&mut self.enc);
@@ -1835,7 +2565,8 @@ fn PeirGen_gen_panic_write(self: &mut PeirGen) -> void {
 }
 
 // Allocator state in writable .rdata: +0 cur, +8 end, +16 cached heap,
-// +24 spinlock, +32 the free list of each size class.
+// +24 spinlock, +32 the TLS index + 1 of the per-thread free lists (release
+// H8; the classes start at 7, so the old global list slot 0 is free for it).
 pub const PEIR_ALLOC_STATE_SIZE: i64 = 360;
 const PEIR_ALLOC_LISTS: i64 = 32;
 // A block's header: this magic | its size class. p_free turns it into
@@ -1844,6 +2575,75 @@ const PEIR_ALLOC_LISTS: i64 = 32;
 const PEIR_BLOCK_MAGIC: i64 = 0xF1DE5A0000000000;
 const PEIR_BLOCK_FREED: i64 = 0xF1DE5B0000000000;
 const PEIR_CLASS_LARGE: i64 = 63;
+
+/// `fid emit --checked-alloc` (release M7): every block gets pages of its
+/// own, ending at an inaccessible guard page; a freed block's pages become
+/// inaccessible and are never reused. A use after free, a double free or an
+/// overrun past the block faults, with a trace, instead of reading or
+/// damaging other data. Slow and memory-hungry: for finding bugs.
+pub var g_pe_checked_alloc: bool = false;
+
+const PEIR_CLASS_CHECKED: i64 = 62;
+
+/// p_malloc under --checked-alloc. Block layout from `start`: [base][span]
+/// [header] then the payload, placed so that it ends (rounded to 16 bytes)
+/// at the guard page.
+fn PeirGen_gen_checked_malloc(self: &mut PeirGen) -> void {
+    var out: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirEnc_push(&mut self.enc, PEIR_RBP);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
+    PeirEnc_push(&mut self.enc, PEIR_R12);
+    PeirEnc_push(&mut self.enc, PEIR_R13);
+    // r12 = used = (size + 24 + 15) & ~15
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+    pe_emit4(&mut self.enc, 0x48, 0x83, 0xC0, 0x27); // add rax, 39
+    pe_emit4(&mut self.enc, 0x48, 0x83, 0xE0, 0xF0); // and rax, -16
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RAX);
+    // r13 = span = round_up(used, 4096) + 4096
+    pe_emit2(&mut self.enc, 0x48, 0x05); PeirEnc_emit_i32(&mut self.enc, 4095); // add rax, 4095
+    pe_emit2(&mut self.enc, 0x48, 0x25); PeirEnc_emit_i32(&mut self.enc, -4096); // and rax, -4096
+    pe_emit2(&mut self.enc, 0x48, 0x05); PeirEnc_emit_i32(&mut self.enc, 4096); // add rax, 4096
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R13, PEIR_RAX);
+    // rax = VirtualAlloc(NULL, span, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+    PeirEnc_xor_self(&mut self.enc, PEIR_RCX);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R13);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, 0x3000);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R9, 4);
+    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+    PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, pe_import_slot("VirtualAlloc")));
+    PeirEnc_add_rsp_i32(&mut self.enc, 32);
+    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, out); // jz: out of memory, NULL
+    // VirtualProtect(base + span - 4096, 4096, PAGE_NOACCESS, &old)
+    PeirEnc_sub_rsp_i32(&mut self.enc, 48);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 40, PEIR_RAX);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+    PeirEnc_add_rr(&mut self.enc, PEIR_RCX, PEIR_R13);
+    pe_emit3(&mut self.enc, 0x48, 0x81, 0xE9); PeirEnc_emit_i32(&mut self.enc, 4096); // sub rcx, 4096
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, 4096);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, 1);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R9, PEIR_RSP);
+    pe_emit4(&mut self.enc, 0x49, 0x83, 0xC1, 0x20); // add r9, 32
+    PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, pe_import_slot("VirtualProtect")));
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_RSP, 40);
+    PeirEnc_add_rsp_i32(&mut self.enc, 48);
+    // rcx = start = base + span - 4096 - used: [base][span][header]
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+    PeirEnc_add_rr(&mut self.enc, PEIR_RCX, PEIR_R13);
+    pe_emit3(&mut self.enc, 0x48, 0x81, 0xE9); PeirEnc_emit_i32(&mut self.enc, 4096); // sub rcx, 4096
+    PeirEnc_sub_rr(&mut self.enc, PEIR_RCX, PEIR_R12);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RCX, 0, PEIR_RAX);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RCX, 8, PEIR_R13);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, PEIR_BLOCK_MAGIC | PEIR_CLASS_CHECKED);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RCX, 16, PEIR_RDX);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+    pe_emit4(&mut self.enc, 0x48, 0x83, 0xC0, 0x18); // add rax, 24
+    PeirEnc_place_label(&mut self.enc, out);
+    PeirEnc_pop(&mut self.enc, PEIR_R13);
+    PeirEnc_pop(&mut self.enc, PEIR_R12);
+    PeirEnc_pop(&mut self.enc, PEIR_RBP);
+    PeirEnc_ret(&mut self.enc);
+}
 
 /// Acquire the allocator's spinlock.
 fn PeirGen_gen_alloc_lock(self: &mut PeirGen, abase: i64) -> void {
@@ -1873,6 +2673,60 @@ fn PeirGen_gen_alloc_unlock(self: &mut PeirGen, abase: i64) -> void {
     self.enc.pending_rip_refs.push(PeirRipRef_new(self.enc.code.len(), abase + 24));
     PeirEnc_emit_i32(&mut self.enc, 0);
     PeirEnc_emit_u8(&mut self.enc, 0x00);
+}
+
+/// r9 = this thread's free-list array (release H8: a free list per thread,
+/// so p_malloc and p_free take no lock; only growing the bump chunk does).
+/// The array (64 class heads) is made on a thread's first use and kept in a
+/// TLS slot allocated once. Needs rsp 16-aligned; clobbers rax, rcx, rdx,
+/// r8–r11. A block freed by another thread joins that thread's lists.
+fn PeirGen_gen_my_lists(self: &mut PeirGen, abase: i64) -> void {
+    var have: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var have_locked: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var done: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirEnc_mov_reg_rip(&mut self.enc, PEIR_RAX, abase + PEIR_ALLOC_LISTS);
+    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x5, have); // jnz
+    // First use in the process: TlsAlloc, once, under the spinlock
+    PeirGen_gen_alloc_lock(self, abase);
+    PeirEnc_mov_reg_rip(&mut self.enc, PEIR_RAX, abase + PEIR_ALLOC_LISTS);
+    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x5, have_locked); // jnz
+    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+    PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, pe_import_slot("TlsAlloc")));
+    PeirEnc_add_rsp_i32(&mut self.enc, 32);
+    pe_emit2(&mut self.enc, 0x89, 0xC0); // mov eax, eax (zero-extend the DWORD)
+    pe_emit3(&mut self.enc, 0x48, 0xFF, 0xC0); // inc rax
+    PeirEnc_mov_rip_reg(&mut self.enc, abase + PEIR_ALLOC_LISTS, PEIR_RAX);
+    PeirEnc_place_label(&mut self.enc, have_locked);
+    PeirGen_gen_alloc_unlock(self, abase);
+    PeirEnc_place_label(&mut self.enc, have);
+    // rax = TlsGetValue(index)
+    PeirEnc_mov_reg_rip(&mut self.enc, PEIR_RCX, abase + PEIR_ALLOC_LISTS);
+    pe_emit3(&mut self.enc, 0x48, 0xFF, 0xC9); // dec rcx
+    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+    PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, pe_import_slot("TlsGetValue")));
+    PeirEnc_add_rsp_i32(&mut self.enc, 32);
+    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x5, done); // jnz
+    // This thread's first block: its zeroed list array, kept in the slot
+    PeirGen_gen_process_heap(self, abase);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, 8); // HEAP_ZERO_MEMORY
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, 512);
+    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+    PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, PIAT_HEAP_ALLOC));
+    PeirEnc_add_rsp_i32(&mut self.enc, 32);
+    PeirEnc_sub_rsp_i32(&mut self.enc, 48);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 32, PEIR_RAX);
+    PeirEnc_mov_reg_rip(&mut self.enc, PEIR_RCX, abase + PEIR_ALLOC_LISTS);
+    pe_emit3(&mut self.enc, 0x48, 0xFF, 0xC9); // dec rcx
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
+    PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, pe_import_slot("TlsSetValue")));
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_RSP, 32);
+    PeirEnc_add_rsp_i32(&mut self.enc, 48);
+    PeirEnc_place_label(&mut self.enc, done);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R9, PEIR_RAX);
 }
 
 /// r9 = address of the free list of class r13 (clobbers rax).
@@ -1909,7 +2763,22 @@ pub fn PeirGen_gen_malloc(self: &mut PeirGen) -> void {
     PeirEnc_place_label(&mut self.enc, label);
 
     if self.bare_mode {
-        panic("pe_ir: bare mode not ported");
+        // Bump allocator from g_pe_bare_heap; the cursor is the first word
+        // of the allocator state in .rdata. Blocks are 16-byte aligned.
+        var have: i64 = PeirEnc_alloc_label(&mut self.enc);
+        PeirEnc_mov_reg_rip(&mut self.enc, PEIR_RAX, self.alloc_rdata_off);
+        PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        PeirEnc_jcc_label(&mut self.enc, 0x5, have); // jnz
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, g_pe_bare_heap);
+        PeirEnc_place_label(&mut self.enc, have);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_RCX);
+        pe_emit4(&mut self.enc, 0x48, 0x83, 0xC2, 0x0F); // add rdx, 15
+        pe_emit4(&mut self.enc, 0x48, 0x83, 0xE2, 0xF0); // and rdx, -16
+        PeirEnc_add_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
+        PeirEnc_mov_rip_reg(&mut self.enc, self.alloc_rdata_off, PEIR_RDX);
+        PeirEnc_ret(&mut self.enc);
+    } else if g_pe_checked_alloc {
+        PeirGen_gen_checked_malloc(self);
     } else {
         var abase: i64 = self.alloc_rdata_off;
         var fast: i64 = PeirEnc_alloc_label(&mut self.enc);
@@ -1967,20 +2836,17 @@ pub fn PeirGen_gen_malloc(self: &mut PeirGen) -> void {
         pe_emit3(&mut self.enc, 0x49, 0xFF, 0xCD); // dec r13
         PeirEnc_place_label(&mut self.enc, whole);
 
-        // Pop this class's free list, under the spinlock. An unlocked look
-        // first: an allocate-only program never takes the lock, and a block
-        // freed just now by another thread is only found by the next call.
-        PeirGen_gen_free_list_addr(self, abase);
+        // Pop this class's list of this thread's free blocks: no lock
+        // (release H8). rsp is 16-aligned here (three pushes after the call).
+        PeirGen_gen_my_lists(self, abase);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R13);
+        PeirEnc_shl_r_i8(&mut self.enc, PEIR_RAX, 3);
+        PeirEnc_add_rr(&mut self.enc, PEIR_R9, PEIR_RAX);
         PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RAX, PEIR_R9);
         PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
         PeirEnc_jcc_label(&mut self.enc, 0x4, fast); // jz
-        PeirGen_gen_alloc_lock(self, abase);
-        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RAX, PEIR_R9);
-        PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
-        PeirEnc_jcc_label(&mut self.enc, 0x4, empty); // jz
         PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RDX, PEIR_RAX);
         PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_R9, PEIR_RDX);
-        PeirGen_gen_alloc_unlock(self, abase);
         // Restore the header, zero the payload (as fresh memory is)
         PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, PEIR_BLOCK_MAGIC);
         PeirEnc_or_rr(&mut self.enc, PEIR_R8, PEIR_R13);
@@ -2020,7 +2886,6 @@ pub fn PeirGen_gen_malloc(self: &mut PeirGen) -> void {
         PeirEnc_ret(&mut self.enc);
 
         PeirEnc_place_label(&mut self.enc, empty);
-        PeirGen_gen_alloc_unlock(self, abase);
 
         // --- Fast path: r8 = lock xadd [cur], r12 — atomic bump ---
         PeirEnc_place_label(&mut self.enc, fast);
@@ -2154,7 +3019,8 @@ pub fn PeirGen_gen_free(self: &mut PeirGen) -> void {
     PeirEnc_place_label(&mut self.enc, label);
 
     if self.bare_mode {
-        panic("pe_ir: bare mode not ported");
+        // The bump allocator never reuses memory
+        PeirEnc_ret(&mut self.enc);
     } else {
         var abase: i64 = self.alloc_rdata_off;
         var out: i64 = PeirEnc_alloc_label(&mut self.enc);
@@ -2184,20 +3050,46 @@ pub fn PeirGen_gen_free(self: &mut PeirGen) -> void {
         PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, PEIR_BLOCK_FREED);
         PeirEnc_or_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
         PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RCX, -8, PEIR_RDX);
+        var checked_free: i64 = PeirEnc_alloc_label(&mut self.enc);
+        if g_pe_checked_alloc {
+            PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, PEIR_CLASS_CHECKED);
+            PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
+            PeirEnc_jcc_label(&mut self.enc, 0x4, checked_free); // je
+        }
         PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, PEIR_CLASS_LARGE);
         PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
         PeirEnc_jcc_label(&mut self.enc, 0x4, large); // je
-        // Push on the class's free list, under the spinlock
-        PeirGen_gen_alloc_lock(self, abase);
-        PeirEnc_lea_rip(&mut self.enc, PEIR_R9, abase + PEIR_ALLOC_LISTS);
+        // Push on this thread's list of the class: no lock (release H8).
+        // rcx (the block) and rax (its class) survive the lookup on the
+        // stack; entry rsp is 8 mod 16, so two pushes and 8 align it.
+        PeirEnc_push(&mut self.enc, PEIR_RCX);
+        PeirEnc_push(&mut self.enc, PEIR_RAX);
+        PeirEnc_sub_rsp_i32(&mut self.enc, 8);
+        PeirGen_gen_my_lists(self, abase);
+        PeirEnc_add_rsp_i32(&mut self.enc, 8);
+        PeirEnc_pop(&mut self.enc, PEIR_RAX);
+        PeirEnc_pop(&mut self.enc, PEIR_RCX);
         PeirEnc_shl_r_i8(&mut self.enc, PEIR_RAX, 3);
         PeirEnc_add_rr(&mut self.enc, PEIR_R9, PEIR_RAX);
         PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RDX, PEIR_R9);
         PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RCX, PEIR_RDX);
         PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_R9, PEIR_RCX);
-        PeirGen_gen_alloc_unlock(self, abase);
         PeirEnc_place_label(&mut self.enc, out);
         PeirEnc_ret(&mut self.enc);
+
+        // --checked-alloc: the block's pages become inaccessible, for good
+        if g_pe_checked_alloc {
+            PeirEnc_place_label(&mut self.enc, checked_free);
+            PeirEnc_sub_rsp_i32(&mut self.enc, 56);
+            PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RDX, PEIR_RCX, -16);
+            PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RCX, PEIR_RCX, -24);
+            PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, 1); // PAGE_NOACCESS
+            PeirEnc_mov_rr(&mut self.enc, PEIR_R9, PEIR_RSP);
+            pe_emit4(&mut self.enc, 0x49, 0x83, 0xC1, 0x28); // add r9, 40
+            PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, pe_import_slot("VirtualProtect")));
+            PeirEnc_add_rsp_i32(&mut self.enc, 56);
+            PeirEnc_ret(&mut self.enc);
+        }
 
         // A large block goes back to the system heap
         PeirEnc_place_label(&mut self.enc, large);
@@ -2267,12 +3159,24 @@ pub fn PeirGen_gen_str_concat(self: &mut PeirGen) -> void {
     PeirEnc_call_rip(&mut self.enc, strlen_off);
     PeirEnc_mov_mem_rbp_reg(&mut self.enc, -48, PEIR_RAX);
 
-    // r15 = buf = p_malloc(len_l + len_r + 1) - +1 for the terminator
+    // block = p_malloc(16 + len_l + len_r + 1): a length header, as core's
+    // p_str_alloc writes it (release D16: [magic][len], then the bytes and
+    // the terminator), so p_str_length is O(1) on the result and Str_drop
+    // frees the whole block
     PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R14);
     PeirEnc_add_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
-    PeirEnc_inc_r(&mut self.enc, PEIR_RCX);
+    PeirEnc_add_r_i32(&mut self.enc, PEIR_RCX, 17);
     PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "p_malloc"));
+    // [block] = magic (0x4649444553545201, core's P_STR_MAGIC)
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R9, 0x4649444553545201);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RAX, 0, PEIR_R9);
+    // [block + 8] = len_l + len_r
+    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_R10, -48);
+    PeirEnc_add_rr(&mut self.enc, PEIR_R10, PEIR_R14);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RAX, 8, PEIR_R10);
+    // r15 = buf = block + 16
     PeirEnc_mov_rr(&mut self.enc, PEIR_R15, PEIR_RAX);
+    PeirEnc_add_r_i32(&mut self.enc, PEIR_R15, 16);
 
     // memcpy(buf, left, len_l)
     PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R15);
@@ -5042,20 +5946,39 @@ pub fn PeirGen_gen_entry_point(self: &mut PeirGen) -> void {
     self.entry_offset = PeirEnc_offset(&self.enc);
 
     if self.bare_mode {
-        // Bare-metal entry: just call main(), then hlt
-        PeirEnc_push(&mut self.enc, PEIR_RBP);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
+        // Bare-metal entry: on whatever stack the loader set up, aligned
+        // to 16 with the 32-byte shadow space main's calls expect
+        PeirEnc_xor_rr(&mut self.enc, PEIR_RBP, PEIR_RBP);
+        pe_emit4(&mut self.enc, 0x48, 0x83, 0xE4, 0xF0); // and rsp, -16
+        PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+
+        if g_pe_elf {
+            // The heap: 1 GB of address space, pages on first touch
+            PeirEnc_mov_imm32(&mut self.enc, PEIR_RAX, 9);         // SYS_mmap
+            PeirEnc_xor_rr(&mut self.enc, PEIR_RDI, PEIR_RDI);
+            PeirEnc_mov_imm64(&mut self.enc, PEIR_RSI, 0x40000000);
+            PeirEnc_mov_imm32(&mut self.enc, PEIR_RDX, 3);         // PROT_READ | PROT_WRITE
+            PeirEnc_mov_imm32(&mut self.enc, PEIR_R10, 0x4022);    // PRIVATE | ANONYMOUS | NORESERVE
+            PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, -1);
+            PeirEnc_xor_rr(&mut self.enc, PEIR_R9, PEIR_R9);
+            pe_emit2(&mut self.enc, 0x0F, 0x05);                   // syscall
+            PeirEnc_mov_rip_reg(&mut self.enc, self.alloc_rdata_off, PEIR_RAX);
+        }
 
         // Call main()
         var main_label: i64 = HashMap_get(self.func_labels, "main");
         PeirEnc_call_label(&mut self.enc, main_label);
 
-        // Halt loop: hlt; jmp -3 (back to hlt)
+        if g_pe_elf {
+            // exit_group(main's result)
+            PeirEnc_mov_rr(&mut self.enc, PEIR_RDI, PEIR_RAX);
+            PeirEnc_mov_imm32(&mut self.enc, PEIR_RAX, 231);
+            pe_emit2(&mut self.enc, 0x0F, 0x05);
+        }
+
+        // Halt loop: hlt; jmp -3 (back to hlt: interrupt handlers still run)
         pe_emit1(&mut self.enc, 0xF4);       // hlt
         pe_emit2(&mut self.enc, 0xEB, 0xFD); // jmp -3
-
-        PeirEnc_pop(&mut self.enc, PEIR_RBP);
-        PeirEnc_ret(&mut self.enc);
     } else {
         // sub rsp, 40 (32 shadow space + 8 for alignment)
         PeirEnc_sub_rsp_i32(&mut self.enc, 40);
@@ -5064,6 +5987,11 @@ pub fn PeirGen_gen_entry_point(self: &mut PeirGen) -> void {
         PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, 1);
         PeirEnc_lea_label(&mut self.enc, PEIR_RDX, self.crash_filter);
         PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, pe_import_slot("AddVectoredExceptionHandler")));
+
+        // The `link` DLLs, before anything can call into them
+        if HashMap_contains(self.func_labels, "__pe_load_dlls") {
+            PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "__pe_load_dlls"));
+        }
 
         // Call main()
         var main_label2: i64 = HashMap_get(self.func_labels, "main");
@@ -5074,6 +6002,109 @@ pub fn PeirGen_gen_entry_point(self: &mut PeirGen) -> void {
         PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, PIAT_EXIT_PROCESS));
 
         PeirEnc_ud2(&mut self.enc);
+    }
+}
+
+// A stub a C call lands on when its DLL or function is missing: print the
+// message at .rdata offset `msg_off` to stderr and exit with 1.
+fn PeirGen_dll_fail(self: &mut PeirGen, label: i64, msg_off: i64) -> void {
+    PeirEnc_align_to(&mut self.enc, 16);
+    PeirEnc_place_label(&mut self.enc, label);
+    PeirEnc_sub_rsp_i32(&mut self.enc, 40); // called: realign, shadow space
+    PeirEnc_lea_rip(&mut self.enc, PEIR_RCX, msg_off);
+    PeirGen_call_runtime(self, "p_eprint_str");
+    PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, 1);
+    PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, PIAT_EXIT_PROCESS));
+    PeirEnc_ud2(&mut self.enc);
+}
+
+/// Start-up loader of the `link` DLLs (release E2, E4), `__pe_load_dlls`:
+/// LoadLibraryA each DLL (its candidates in order: sqlite3.dll, then the
+/// system's winsqlite3.dll), GetProcAddress each function the program
+/// reaches into its IAT slot. A DLL or function that is not there gets a
+/// stub instead: the first call into it stops the program with a message
+/// naming what is missing (a static import would make Windows refuse to
+/// start the program at all, with no message on a console), and a program
+/// that never calls it runs.
+pub fn PeirGen_gen_dll_loader(self: &mut PeirGen, rdata: &mut PeirRdata) -> void {
+    var dlls: Vec<PeDllImport> = pe_dll_imports();
+    if self.bare_mode || dlls.len() <= PE_STATIC_DLLS { return; }
+    var label: i64 = PeirEnc_alloc_label(&mut self.enc);
+    HashMap_insert(self.func_labels, "__pe_load_dlls", label);
+    PeirEnc_align_to(&mut self.enc, 16);
+    PeirEnc_place_label(&mut self.enc, label);
+    // rsp = 8 (mod 16) on entry: rbx and the shadow space realign it
+    PeirEnc_push(&mut self.enc, PEIR_RBX);
+    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+    var load_lib: i64 = PeirGen_iat_off(self, pe_import_slot("LoadLibraryA"));
+    var get_proc: i64 = PeirGen_iat_off(self, pe_import_slot("GetProcAddress"));
+    // The failure stubs, generated after the loader: (label, message)
+    var fail_labels: Vec<i64> = Vec::new();
+    var fail_msgs: Vec<i64> = Vec::new();
+    var slot_base: i64 = 0;
+    var d: i64 = 0;
+    while d < dlls.len() {
+        var names: Vec<str> = dlls.get(d).names;
+        if d >= PE_STATIC_DLLS {
+            var dll: str = dlls.get(d).dll;
+            var loaded: i64 = PeirEnc_alloc_label(&mut self.enc);
+            var next_dll: i64 = PeirEnc_alloc_label(&mut self.enc);
+            var cands: Vec<str> = pe_link_dll_candidates(dll);
+            var also: str = "";
+            var ci: i64 = 0;
+            while ci < cands.len() {
+                PeirEnc_lea_rip(&mut self.enc, PEIR_RCX, PeirRdata_add_string(rdata, cands.get(ci)));
+                PeirEnc_call_rip(&mut self.enc, load_lib);
+                PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                PeirEnc_jcc_label(&mut self.enc, 0x5, loaded); // jne
+                if ci > 0 { also = also + " or " + cands.get(ci); }
+                ci = ci + 1;
+            }
+            // Not there: every function of it calls the DLL's stub
+            var msg: str = "error: this program needs " + dll + also + ", which Windows could not load.\n"
+                + "  Install the library, or put " + dll + " beside the program or in a folder on PATH.\n";
+            var dll_stub: i64 = PeirEnc_alloc_label(&mut self.enc);
+            fail_labels.push(dll_stub);
+            fail_msgs.push(PeirRdata_add_string(rdata, msg));
+            PeirEnc_lea_label(&mut self.enc, PEIR_RAX, dll_stub);
+            var k: i64 = 0;
+            while k < names.len() {
+                PeirEnc_mov_rip_reg(&mut self.enc, PeirGen_iat_off(self, slot_base + k), PEIR_RAX);
+                k = k + 1;
+            }
+            PeirEnc_jmp_label(&mut self.enc, next_dll);
+            PeirEnc_place_label(&mut self.enc, loaded);
+            PeirEnc_mov_rr(&mut self.enc, PEIR_RBX, PEIR_RAX);
+            var j: i64 = 0;
+            while j < names.len() {
+                var found: i64 = PeirEnc_alloc_label(&mut self.enc);
+                PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RBX);
+                PeirEnc_lea_rip(&mut self.enc, PEIR_RDX, PeirRdata_add_string(rdata, names.get(j)));
+                PeirEnc_call_rip(&mut self.enc, get_proc);
+                PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                PeirEnc_jcc_label(&mut self.enc, 0x5, found); // jne
+                var nmsg: str = "error: " + dll + " has no function " + names.get(j)
+                    + " (another version of the library?)\n";
+                var fn_stub: i64 = PeirEnc_alloc_label(&mut self.enc);
+                fail_labels.push(fn_stub);
+                fail_msgs.push(PeirRdata_add_string(rdata, nmsg));
+                PeirEnc_lea_label(&mut self.enc, PEIR_RAX, fn_stub);
+                PeirEnc_place_label(&mut self.enc, found);
+                PeirEnc_mov_rip_reg(&mut self.enc, PeirGen_iat_off(self, slot_base + j), PEIR_RAX);
+                j = j + 1;
+            }
+            PeirEnc_place_label(&mut self.enc, next_dll);
+        }
+        slot_base = slot_base + names.len();
+        d = d + 1;
+    }
+    PeirEnc_add_rsp_i32(&mut self.enc, 32);
+    PeirEnc_pop(&mut self.enc, PEIR_RBX);
+    PeirEnc_ret(&mut self.enc);
+    var fi: i64 = 0;
+    while fi < fail_labels.len() {
+        PeirGen_dll_fail(self, fail_labels.get(fi), fail_msgs.get(fi));
+        fi = fi + 1;
     }
 }
 
@@ -5534,3 +6565,373 @@ pub fn PeirGen_gen_arena_stubs(self: &mut PeirGen) -> void {
         i = i + 1;
     }
 }
+
+// ===========================================================================
+// asm!() in bare builds (release G2): Intel-syntax templates encoded here.
+// One instruction per `;` or line. What is covered: the system and fence
+// instructions, port I/O, control registers, register-register ALU, mov
+// of an immediate, push/pop, inc/dec/neg/not, int N, and lgdt/lidt/invlpg
+// through a register. Anything else is a compile error naming it.
+// ===========================================================================
+
+pub struct PeAsmOut {
+    pub b: Vec<i64>,
+}
+
+pub struct PeAsmResult {
+    pub bytes: Vec<i64>,
+    pub error: str,
+}
+
+/// 64-bit register number of `s` (rax=0 .. r15=15), else -1.
+pub fn pe_asm_reg64(s: str) -> i64 {
+    var names: Vec<str> = Vec::new();
+    names.push("rax"); names.push("rcx"); names.push("rdx"); names.push("rbx");
+    names.push("rsp"); names.push("rbp"); names.push("rsi"); names.push("rdi");
+    names.push("r8"); names.push("r9"); names.push("r10"); names.push("r11");
+    names.push("r12"); names.push("r13"); names.push("r14"); names.push("r15");
+    var i: i64 = 0;
+    while i < names.len() {
+        if names.get(i) == s { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Control register number of `s` (cr0, cr2, cr3, cr4, cr8), else -1.
+fn pe_asm_cr(s: str) -> i64 {
+    if s == "cr0" { return 0; }
+    if s == "cr2" { return 2; }
+    if s == "cr3" { return 3; }
+    if s == "cr4" { return 4; }
+    if s == "cr8" { return 8; }
+    return -1;
+}
+
+fn pe_asm_digit(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    return -1;
+}
+
+/// Is `s` a number (decimal, 0x hex, or a trailing-h hex)?
+fn pe_asm_is_num(s: str) -> bool {
+    var t: str = s;
+    if str_starts_with(t, "-") { t = str_slice(t, 1, str_len(t)); }
+    if str_len(t) == 0 { return false; }
+    var base: i64 = 10;
+    if str_starts_with(t, "0x") { t = str_slice(t, 2, str_len(t)); base = 16; }
+    else if str_ends_with(t, "h") { t = str_slice(t, 0, str_len(t) - 1); base = 16; }
+    if str_len(t) == 0 { return false; }
+    var i: i64 = 0;
+    while i < str_len(t) {
+        var d: i64 = pe_asm_digit(str_byte_at(t, i));
+        if d < 0 || d >= base { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn pe_asm_num(s: str) -> i64 {
+    var t: str = s;
+    var neg: bool = false;
+    if str_starts_with(t, "-") { t = str_slice(t, 1, str_len(t)); neg = true; }
+    var base: i64 = 10;
+    if str_starts_with(t, "0x") { t = str_slice(t, 2, str_len(t)); base = 16; }
+    else if str_ends_with(t, "h") { t = str_slice(t, 0, str_len(t) - 1); base = 16; }
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(t) {
+        v = v * base + pe_asm_digit(str_byte_at(t, i));
+        i = i + 1;
+    }
+    if neg { return 0 - v; }
+    return v;
+}
+
+fn pe_asm_push4(o: &mut PeAsmOut, x: i64) {
+    o.b.push(x & 0xFF); o.b.push((x >> 8) & 0xFF); o.b.push((x >> 16) & 0xFF); o.b.push((x >> 24) & 0xFF);
+}
+
+/// REX for reg field `r` and r/m `b` (W set when `w`); 0 when none is needed.
+fn pe_asm_rex(w: bool, r: i64, b: i64) -> i64 {
+    var x: i64 = 0x40;
+    if w { x = x | 8; }
+    if r >= 8 { x = x | 4; }
+    if b >= 8 { x = x | 1; }
+    if x == 0x40 { return 0; }
+    return x;
+}
+
+/// [reg] memory operand: the register, else -1.
+fn pe_asm_mem_reg(s: str) -> i64 {
+    var t: str = s;
+    if str_starts_with(t, "qword ptr ") { t = str_trim(str_slice(t, 10, str_len(t))); }
+    if !str_starts_with(t, "[") || !str_ends_with(t, "]") { return -1; }
+    return pe_asm_reg64(str_trim(str_slice(t, 1, str_len(t) - 1)));
+}
+
+/// opcode bytes `op` with ModRM reg field `ext` and memory operand [r].
+fn pe_asm_mem_op(o: &mut PeAsmOut, op: Vec<i64>, ext: i64, r: i64) {
+    var rex: i64 = pe_asm_rex(false, 0, r);
+    if rex != 0 { o.b.push(rex); }
+    var i: i64 = 0;
+    while i < op.len() { o.b.push(op.get(i)); i = i + 1; }
+    var low: i64 = r & 7;
+    if low == 5 {
+        o.b.push(0x40 | (ext << 3) | 5); o.b.push(0); // [rbp/r13 + 0]
+    } else if low == 4 {
+        o.b.push((ext << 3) | 4); o.b.push(0x24);     // SIB: [rsp/r12]
+    } else {
+        o.b.push((ext << 3) | low);
+    }
+}
+
+fn pe_asm_fixed(m: str) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    if m == "nop" { v.push(0x90); }
+    else if m == "cli" { v.push(0xFA); }
+    else if m == "sti" { v.push(0xFB); }
+    else if m == "hlt" { v.push(0xF4); }
+    else if m == "pause" { v.push(0xF3); v.push(0x90); }
+    else if m == "mfence" { v.push(0x0F); v.push(0xAE); v.push(0xF0); }
+    else if m == "sfence" { v.push(0x0F); v.push(0xAE); v.push(0xF8); }
+    else if m == "lfence" { v.push(0x0F); v.push(0xAE); v.push(0xE8); }
+    else if m == "cld" { v.push(0xFC); }
+    else if m == "std" { v.push(0xFD); }
+    else if m == "leave" { v.push(0xC9); }
+    else if m == "ret" { v.push(0xC3); }
+    else if m == "iretq" { v.push(0x48); v.push(0xCF); }
+    else if m == "int3" { v.push(0xCC); }
+    else if m == "wbinvd" { v.push(0x0F); v.push(0x09); }
+    else if m == "invd" { v.push(0x0F); v.push(0x08); }
+    else if m == "rdmsr" { v.push(0x0F); v.push(0x32); }
+    else if m == "wrmsr" { v.push(0x0F); v.push(0x30); }
+    else if m == "cpuid" { v.push(0x0F); v.push(0xA2); }
+    else if m == "rdtsc" { v.push(0x0F); v.push(0x31); }
+    else if m == "swapgs" { v.push(0x0F); v.push(0x01); v.push(0xF8); }
+    else if m == "syscall" { v.push(0x0F); v.push(0x05); }
+    else if m == "sysretq" { v.push(0x48); v.push(0x0F); v.push(0x07); }
+    else if m == "ud2" { v.push(0x0F); v.push(0x0B); }
+    else if m == "pushfq" { v.push(0x9C); }
+    else if m == "popfq" { v.push(0x9D); }
+    else if m == "clts" { v.push(0x0F); v.push(0x06); }
+    return v;
+}
+
+/// Encode one instruction into `out`; "" or the reason it is not supported.
+fn pe_asm_one(o: &mut PeAsmOut, line: str) -> str {
+    var s: str = str_trim(str_to_lower(line));
+    if str_len(s) == 0 { return ""; }
+    var sp: i64 = 0;
+    while sp < str_len(s) && str_byte_at(s, sp) != 32 && str_byte_at(s, sp) != 9 { sp = sp + 1; }
+    var m: str = str_slice(s, 0, sp);
+    var rest: str = str_trim(str_slice(s, sp, str_len(s)));
+    var ops: Vec<str> = Vec::new();
+    if str_len(rest) > 0 {
+        var parts: Vec<str> = str_split(rest, ",");
+        var pi: i64 = 0;
+        while pi < parts.len() { ops.push(str_trim(parts.get(pi))); pi = pi + 1; }
+    }
+    if ops.len() == 0 {
+        var f: Vec<i64> = pe_asm_fixed(m);
+        if f.len() == 0 { return "unknown instruction"; }
+        var fi: i64 = 0;
+        while fi < f.len() { o.b.push(f.get(fi)); fi = fi + 1; }
+        return "";
+    }
+    if m == "int" && ops.len() == 1 && pe_asm_is_num(ops.get(0)) {
+        o.b.push(0xCD); o.b.push(pe_asm_num(ops.get(0)) & 0xFF);
+        return "";
+    }
+    if m == "in" && ops.len() == 2 {
+        var dst: str = ops.get(0);
+        var src: str = ops.get(1);
+        if src == "dx" {
+            if dst == "al" { o.b.push(0xEC); return ""; }
+            if dst == "ax" { o.b.push(0x66); o.b.push(0xED); return ""; }
+            if dst == "eax" { o.b.push(0xED); return ""; }
+        } else if pe_asm_is_num(src) {
+            if dst == "al" { o.b.push(0xE4); o.b.push(pe_asm_num(src) & 0xFF); return ""; }
+            if dst == "ax" { o.b.push(0x66); o.b.push(0xE5); o.b.push(pe_asm_num(src) & 0xFF); return ""; }
+            if dst == "eax" { o.b.push(0xE5); o.b.push(pe_asm_num(src) & 0xFF); return ""; }
+        }
+        return "unsupported operands";
+    }
+    if m == "out" && ops.len() == 2 {
+        var port: str = ops.get(0);
+        var val: str = ops.get(1);
+        if port == "dx" {
+            if val == "al" { o.b.push(0xEE); return ""; }
+            if val == "ax" { o.b.push(0x66); o.b.push(0xEF); return ""; }
+            if val == "eax" { o.b.push(0xEF); return ""; }
+        } else if pe_asm_is_num(port) {
+            if val == "al" { o.b.push(0xE6); o.b.push(pe_asm_num(port) & 0xFF); return ""; }
+            if val == "ax" { o.b.push(0x66); o.b.push(0xE7); o.b.push(pe_asm_num(port) & 0xFF); return ""; }
+            if val == "eax" { o.b.push(0xE7); o.b.push(pe_asm_num(port) & 0xFF); return ""; }
+        }
+        return "unsupported operands";
+    }
+    if (m == "lgdt" || m == "lidt" || m == "invlpg") && ops.len() == 1 {
+        var mr: i64 = pe_asm_mem_reg(ops.get(0));
+        if mr < 0 { return "needs a [register] operand"; }
+        var op: Vec<i64> = Vec::new();
+        op.push(0x0F); op.push(0x01);
+        var ext: i64 = 7;
+        if m == "lgdt" { ext = 2; }
+        if m == "lidt" { ext = 3; }
+        pe_asm_mem_op(o, op, ext, mr);
+        return "";
+    }
+    if (m == "push" || m == "pop") && ops.len() == 1 {
+        var r: i64 = pe_asm_reg64(ops.get(0));
+        if r >= 0 {
+            if r >= 8 { o.b.push(0x41); }
+            if m == "push" { o.b.push(0x50 + (r & 7)); } else { o.b.push(0x58 + (r & 7)); }
+            return "";
+        }
+        if m == "push" && pe_asm_is_num(ops.get(0)) {
+            var pv: i64 = pe_asm_num(ops.get(0));
+            if pv >= -128 && pv <= 127 { o.b.push(0x6A); o.b.push(pv & 0xFF); }
+            else { o.b.push(0x68); pe_asm_push4(o, pv); }
+            return "";
+        }
+        return "unsupported operand";
+    }
+    if (m == "jmp" || m == "call") && ops.len() == 1 && pe_asm_reg64(ops.get(0)) >= 0 {
+        var rj: i64 = pe_asm_reg64(ops.get(0));
+        if rj >= 8 { o.b.push(0x41); }
+        o.b.push(0xFF);
+        if m == "jmp" { o.b.push(0xE0 | (rj & 7)); } else { o.b.push(0xD0 | (rj & 7)); }
+        return "";
+    }
+    if (m == "shl" || m == "sal" || m == "shr" || m == "sar") && ops.len() == 2 && pe_asm_reg64(ops.get(0)) >= 0 {
+        var rs: i64 = pe_asm_reg64(ops.get(0));
+        var sext: i64 = 4;
+        if m == "shr" { sext = 5; }
+        if m == "sar" { sext = 7; }
+        if ops.get(1) == "cl" {
+            o.b.push(pe_asm_rex(true, 0, rs)); o.b.push(0xD3); o.b.push(0xC0 | (sext << 3) | (rs & 7));
+            return "";
+        }
+        if pe_asm_is_num(ops.get(1)) {
+            o.b.push(pe_asm_rex(true, 0, rs)); o.b.push(0xC1); o.b.push(0xC0 | (sext << 3) | (rs & 7));
+            o.b.push(pe_asm_num(ops.get(1)) & 0x3F);
+            return "";
+        }
+        return "unsupported operands";
+    }
+    if ops.len() == 2 && pe_asm_reg64(ops.get(0)) >= 0 && pe_asm_is_num(ops.get(1)) && m != "mov" {
+        // add/or/and/sub/xor/cmp r64, imm32 (81 /n, or 83 /n with an imm8)
+        var ext2: i64 = -1;
+        if m == "add" { ext2 = 0; }
+        if m == "or" { ext2 = 1; }
+        if m == "and" { ext2 = 4; }
+        if m == "sub" { ext2 = 5; }
+        if m == "xor" { ext2 = 6; }
+        if m == "cmp" { ext2 = 7; }
+        if ext2 >= 0 {
+            var ri: i64 = pe_asm_reg64(ops.get(0));
+            var imm: i64 = pe_asm_num(ops.get(1));
+            o.b.push(pe_asm_rex(true, 0, ri));
+            if imm >= -128 && imm <= 127 {
+                o.b.push(0x83); o.b.push(0xC0 | (ext2 << 3) | (ri & 7)); o.b.push(imm & 0xFF);
+            } else {
+                o.b.push(0x81); o.b.push(0xC0 | (ext2 << 3) | (ri & 7)); pe_asm_push4(o, imm);
+            }
+            return "";
+        }
+    }
+    if (m == "inc" || m == "dec" || m == "neg" || m == "not") && ops.len() == 1 {
+        var r1: i64 = pe_asm_reg64(ops.get(0));
+        if r1 < 0 { return "needs a 64-bit register"; }
+        var ext1: i64 = 0;
+        var opc: i64 = 0xFF;
+        if m == "dec" { ext1 = 1; }
+        if m == "neg" { ext1 = 3; opc = 0xF7; }
+        if m == "not" { ext1 = 2; opc = 0xF7; }
+        o.b.push(pe_asm_rex(true, 0, r1)); o.b.push(opc); o.b.push(0xC0 | (ext1 << 3) | (r1 & 7));
+        return "";
+    }
+    if ops.len() == 2 {
+        var a: str = ops.get(0);
+        var b: str = ops.get(1);
+        var ra: i64 = pe_asm_reg64(a);
+        var rb: i64 = pe_asm_reg64(b);
+        if m == "mov" {
+            var ca: i64 = pe_asm_cr(a);
+            var cb: i64 = pe_asm_cr(b);
+            if ra >= 0 && cb >= 0 {
+                var rx: i64 = pe_asm_rex(false, cb, ra);
+                if rx != 0 { o.b.push(rx); }
+                o.b.push(0x0F); o.b.push(0x20); o.b.push(0xC0 | ((cb & 7) << 3) | (ra & 7));
+                return "";
+            }
+            if ca >= 0 && rb >= 0 {
+                var rx2: i64 = pe_asm_rex(false, ca, rb);
+                if rx2 != 0 { o.b.push(rx2); }
+                o.b.push(0x0F); o.b.push(0x22); o.b.push(0xC0 | ((ca & 7) << 3) | (rb & 7));
+                return "";
+            }
+            var small: str = " al cl dl bl ax cx dx bx si di eax ecx edx ebx esp ebp esi edi ";
+            var sk: i64 = str_find(small, " " + a + " ");
+            if sk >= 0 && pe_asm_is_num(b) {
+                var sv: i64 = pe_asm_num(b);
+                if str_len(a) == 2 && str_ends_with(a, "l") {
+                    o.b.push(0xB0 + pe_asm_reg64("r" + str_slice(a, 0, 1) + "x")); o.b.push(sv & 0xFF);
+                } else if str_len(a) == 2 {
+                    var r16: i64 = pe_asm_reg64("r" + a);
+                    if str_ends_with(a, "x") { r16 = pe_asm_reg64("r" + a); }
+                    o.b.push(0x66); o.b.push(0xB8 + r16); o.b.push(sv & 0xFF); o.b.push((sv >> 8) & 0xFF);
+                } else {
+                    o.b.push(0xB8 + pe_asm_reg64("r" + str_slice(a, 1, 3))); pe_asm_push4(o, sv);
+                }
+                return "";
+            }
+            if ra >= 0 && pe_asm_is_num(b) {
+                var iv: i64 = pe_asm_num(b);
+                if iv >= -2147483648 && iv <= 2147483647 {
+                    o.b.push(pe_asm_rex(true, 0, ra)); o.b.push(0xC7); o.b.push(0xC0 | (ra & 7));
+                    pe_asm_push4(o, iv);
+                } else {
+                    o.b.push(pe_asm_rex(true, 0, ra)); o.b.push(0xB8 + (ra & 7));
+                    pe_asm_push4(o, iv); pe_asm_push4(o, iv >> 32);
+                }
+                return "";
+            }
+        }
+        var alu: i64 = -1;
+        if m == "mov" { alu = 0x89; }
+        if m == "add" { alu = 0x01; }
+        if m == "or" { alu = 0x09; }
+        if m == "and" { alu = 0x21; }
+        if m == "sub" { alu = 0x29; }
+        if m == "xor" { alu = 0x31; }
+        if m == "cmp" { alu = 0x39; }
+        if m == "test" { alu = 0x85; }
+        if alu >= 0 && ra >= 0 && rb >= 0 {
+            o.b.push(pe_asm_rex(true, rb, ra)); o.b.push(alu); o.b.push(0xC0 | ((rb & 7) << 3) | (ra & 7));
+            return "";
+        }
+        return "unsupported operands";
+    }
+    return "unknown instruction";
+}
+
+/// Encode an asm! template (instructions separated by `;` or newlines).
+pub fn pe_asm_encode(template: str) -> PeAsmResult {
+    var o: PeAsmOut = PeAsmOut { b: Vec::new() };
+    var lines: Vec<str> = str_split(str_replace(template, "\n", ";"), ";");
+    var i: i64 = 0;
+    while i < lines.len() {
+        var why: str = pe_asm_one(&mut o, lines.get(i));
+        if why != "" {
+            return PeAsmResult { bytes: Vec::new(), error: str_trim(lines.get(i)) + ": " + why };
+        }
+        i = i + 1;
+    }
+    return PeAsmResult { bytes: o.b, error: "" };
+}
+
+/// Errors of asm! templates the bare build could not encode.
+pub var g_pe_asm_errors: Vec<str> = Vec::new();

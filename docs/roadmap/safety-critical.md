@@ -6,12 +6,16 @@
 
 ## Status Summary
 
+Updated Nov 6, 2026. `fid` (self-hosted) is the release compiler; `fidesc`
+(Rust) is frozen. Fides is not certified and not suitable for medical,
+automotive or avionics use.
+
 | # | Item | Status | Stub Location |
 |---|------|--------|---------------|
-| 17 | Certified toolchain | Stub (`qualify` command) | `src/main.rs` `generate_qualification_manifest` |
-| 18 | Information-flow control | **DONE** — full data-flow taint tracking | `src/typechecker.rs` |
-| 19 | SBOM export | Stub (`sbom` command) | `src/main.rs` `generate_sbom` |
-| 20 | Post-codegen constant-time verification | Stub (`verify_constant_time_asm`) | `src/codegen_x64.rs` |
+| 17 | Certified toolchain | Not certified. `fid qualify <file.fd> [-o out.json]` writes evidence: compiler and source hashes, the check result, annotated functions, each rule with its requirement and tests; always `NOT_QUALIFIED`. Rules and tests: `docs/reference/safety-rules.md` (17 rules, each with a negative test) | `compiler/main.fd` `cmd_qualify`; `src/main.rs` `generate_qualification_manifest` (frozen) |
+| 18 | Information-flow control | Data-flow taint tracking in `fidesc` only. In `fid`, `@tainted` is the coarse check: a tainted function or parameter reaches no IO or Net effect (SR-12) | `src/typechecker.rs`; `compiler/typechecker.fd` `TypeChecker_verify_tainted` |
+| 19 | SBOM export | Stub (`sbom` command), `fidesc` only | `src/main.rs` `generate_sbom` |
+| 20 | Post-codegen constant-time verification | Done in `fidesc` on the x86-64 ELF path only; not on the PE path, not in `fid` | `src/codegen_x64.rs` `verify_constant_time_asm` |
 
 ---
 
@@ -26,7 +30,13 @@ safety-critical code, defeating the purpose of the annotations.
 
 ### Current State
 
-- `fidesc qualify <file.fd>` emits a JSON manifest with:
+- `fid qualify <file.fd> [-o out.json]` (release L3, Nov 4–6): JSON evidence
+  with the compiler and source hashes, the check result, the program's
+  annotated functions, and each rule with its requirement and tests (release
+  L4 traceability: `docs/reference/safety-rules.md`). Status always
+  `NOT_QUALIFIED`: evidence, not a certificate. Phase 3's compliance matrix
+  is that table.
+- `fidesc qualify <file.fd>` (frozen) emits a JSON manifest with:
   - Compiler version and implementation (Rust bootstrap vs self-hosted)
   - Optimizer pass list (22 passes from `opt::Pass::all()`)
   - Annotations enforced in the Rust bootstrap vs stubbed in self-hosted
@@ -119,6 +129,10 @@ This means:
   - Call propagation: taint flows through function call arguments
 - `verify_tainted` (old coarse check) is now a no-op to avoid duplicate errors
   and false positives on sanitized code
+- The above is `fidesc` (frozen). `fid` keeps the coarse check: a function
+  with `@tainted` on itself or on a parameter may have no IO or Net effect
+  (`compiler/typechecker.fd` `TypeChecker_verify_tainted`, SR-12,
+  `test_tainted_param_fail`). No data flow, no sanitizers in `fid` yet.
 
 ### Full Implementation Plan
 
@@ -312,9 +326,13 @@ source-level check cannot catch:
 
 ### Current State
 
-- `verify_constant_time_asm` in `src/codegen_x64.rs` — STUB (returns empty)
-- `CtViolation` struct defined with function, line, instruction, reason
-- No integration into the build pipeline yet
+- `verify_constant_time_asm` in `src/codegen_x64.rs` runs on the x86-64 ELF
+  path after peephole (Session 30): conditional and indirect jumps, `cmov`
+  with a memory operand, indexed memory, variable-latency ops and calls to
+  non-`@constant_time` functions are build errors (`test_ct_asm.fd`,
+  `test_ct_asm_fail.fd`). `@wrapping` exempts generated overflow branches.
+- Not covered: the PE path (`fid emit`), ARM64, RISC-V, and the self-hosted
+  compiler, which checks `@constant_time` at the source level only (SR-14).
 
 ### Full Implementation Plan
 

@@ -256,7 +256,7 @@ pub fn p_str_length(s: i64) -> i64 {
 pub fn p_str_concat(a: i64, b: i64) -> i64 {
     var la: i64 = p_str_length(a);
     var lb: i64 = p_str_length(b);
-    var out: i64 = p_malloc(la + lb + 1);
+    var out: i64 = p_str_alloc(la + lb);
     if out == 0 { return 0; }
     p_memcpy(out, a, la);
     p_memcpy(out + la, b, lb);
@@ -311,7 +311,7 @@ pub fn p_str_compare(a: i64, b: i64) -> i64 {
 
 pub fn p_to_str(n: i64) -> i64 {
     if n == 0 {
-        var z: i64 = p_malloc(2);
+        var z: i64 = p_str_alloc(1);
         var zp: *mut i64 = z;
         unsafe { *zp = 48; }
         var zn: *mut i64 = z + 1;
@@ -332,7 +332,9 @@ pub fn p_to_str(n: i64) -> i64 {
         cnt = cnt + 1;
         m = m / 10;
     }
-    var out: i64 = p_malloc(cnt + 2);
+    var out_len: i64 = cnt;
+    if neg { out_len = cnt + 1; }
+    var out: i64 = p_str_alloc(out_len);
     var oi: i64 = 0;
     if neg {
         var mp: *mut i64 = out;
@@ -355,7 +357,7 @@ pub fn p_to_str(n: i64) -> i64 {
 }
 
 pub fn p_char_to_str(b: i64) -> i64 {
-    var out: i64 = p_malloc(2);
+    var out: i64 = p_str_alloc(1);
     var p: *mut i64 = out;
     unsafe { *p = b & 0xFF; }
     var z: *mut i64 = out + 1;
@@ -373,7 +375,7 @@ pub fn p_bool_to_str(b: bool) -> i64 {
 fn p_str_literal_dup(s: str) -> i64 {
     var sa: i64 = s;
     var n: i64 = p_str_length(sa);
-    var out: i64 = p_malloc(n + 1);
+    var out: i64 = p_str_alloc(n);
     p_memcpy(out, sa, n + 1);
     return out;
 }
@@ -491,10 +493,14 @@ pub fn p_file_read(path: i64) -> i64 {
         r = rt_sys_read(fd, buf + total, 4096);
         if r > 0 { total = total + r; }
     }
-    var z: *mut i64 = buf + total;
-    unsafe { *z = 0; }
     rt_sys_close(fd);
-    return buf;
+    // Wrap the raw buffer in a length header so str_len is O(1).
+    var out: i64 = p_str_alloc(total);
+    p_memcpy(out, buf, total);
+    var z: *mut i64 = out + total;
+    unsafe { *z = 0; }
+    p_free(buf);
+    return out;
 }
 
 // ==========================================================================
@@ -503,9 +509,18 @@ pub fn p_file_read(path: i64) -> i64 {
 
 pub fn p_argc() -> i64 { return rt_sys_argc(); }
 
-pub fn p_argv(i: i64) -> i64 { return rt_sys_argv(i); }
+// Copy a C string into a length-headered Fides string (str_len O(1)).
+pub fn p_str_wrap(s: i64) -> i64 {
+    if s == 0 { return 0; }
+    var n: i64 = p_str_length(s);
+    var out: i64 = p_str_alloc(n);
+    p_memcpy(out, s, n + 1);
+    return out;
+}
 
-pub fn p_getenv(name: i64) -> i64 { return rt_sys_getenv(name); }
+pub fn p_argv(i: i64) -> i64 { return p_str_wrap(rt_sys_argv(i)); }
+
+pub fn p_getenv(name: i64) -> i64 { return p_str_wrap(rt_sys_getenv(name)); }
 
 pub fn p_clock_now() -> i64 { return rt_sys_clock_ns(); }
 

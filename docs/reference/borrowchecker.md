@@ -1,8 +1,31 @@
 # Borrow Checker Design Document
 
-> Status: **Phases 1-6 complete — `on` by default, field-wise borrows, two-phase borrows, NLL**
+> Status: **Phases 1-6 complete — `on` by default, field-wise borrows, two-phase borrows, NLL.** Nov 4–6: K4/K5 in `fid` (below).
 > Created: Aug 2026
-> Related: `src/borrowck.rs`, `src/typechecker.rs`, `src/compiler.rs`
+> Related: `src/borrowck.rs`, `src/typechecker.rs`, `src/compiler.rs`; the self-hosted pass is `compiler/borrowck.fd` (`fid`, the release compiler), and the reference escape check is `compiler/escape.fd`
+>
+> This document was written as the design for the Rust compiler. The rules
+> as `fid` applies them are in [reference.md §8.4](reference.md#84-references).
+
+## Current State (Nov 6, 2026)
+
+`fid` checks, besides the three rules:
+
+- **K4, iterator invalidation:** changing a `Vec` while a `for` loop walks it
+  is an error (`test_iter_invalidation_fail.fd`).
+- **K5:** `s.x = 1` while `s` is borrowed is an error; `&v[i]` is a borrow of
+  `v`; trait impl bodies are borrow-checked.
+- **Escape check** (`compiler/escape.fd`): a reference cannot be stored,
+  returned from a local, outlive its block, or be sent to another task.
+- **Borrowed strings:** a `str` field of a `@scoped` struct reads as `&str`,
+  which cannot be returned as `str`, stored, or passed to a user function's
+  `str` parameter; a `@scoped` struct cannot be stored or sent
+  (`test_borrowed_str_return_fail.fd`, `test_borrowed_str_pass_fail.fd`,
+  `test_scoped_store_fail.fd`).
+
+The frozen `fidesc` does not have K4/K5 or the borrowed-string rules.
+There is no region use-after-free check: `freed_regions` (below) is written
+and never read.
 
 ## TL;DR
 
@@ -24,8 +47,8 @@ occasionally over-restrictive — upgradeable to NLL later.
 |---------|-------|-----------------|
 | `Type::Ref { inner, is_mut }` | `ast.rs:23` | Reference types exist |
 | `Expr::Ref { expr, is_mut }` | `ast.rs:215` | `&` / `&mut` expressions |
-| Regions (`region r { ... }`) | `typechecker.rs:41-50` | Use-after-free across region boundaries |
-| `freed_regions` set | `typechecker.rs:50` | Catches access to popped-region vars |
+| Regions (`region r { ... }`) | `typechecker.rs:41-50` | Scope and size budget; a variable declared in a region is not visible after it |
+| `freed_regions` set | `typechecker.rs:50` | Written and never read: no check uses it |
 | Linear types (`@linear`) | `typechecker.rs:70-77` | Double-free, leaks, double-consume |
 | `unsafe {}` blocks | `typechecker.rs:81-83` | Escape hatch for raw pointers |
 
@@ -220,8 +243,9 @@ print(*nr);       // nr used after mutation
 - **No lifetime parameters** in type syntax (`'a`, `&'a T`). Lifetimes are
   implicit (region-scoped).
 - **No variance / subtyping** rules for references.
-- **No trait-based `Send`/`Sync`.** Fides' `!Spawn` effect handles cross-task
-  safety.
+- **No trait-based `Send`/`Sync`.** `fid` instead requires every argument of a
+  spawned call to be `@send` (a struct of `@send` fields is `@send`;
+  references and raw pointers are not). `@sync` is recorded and not checked.
 - **No backend changes.** `codegen_c.rs`, `codegen_x64.rs`, `interp.rs` — all
   untouched. Borrow checking is purely front-end.
 

@@ -1,0 +1,42 @@
+// `fid parse-header` output for a real header set (release E5): the raw
+// SQLite API of stdlib/sqlite3_h.fd, generated from sqlite3.h 3.54.1 (356
+// functions, 530 constants), used directly. With `fid emit` it runs with no
+// C compiler: sqlite3.dll, else the winsqlite3.dll of Windows (release E2).
+// Elsewhere it needs libsqlite3 (an external-library test).
+//
+// Expected output:
+// version ok
+// open 0
+// exec 0
+// 1 one 1.5
+// 2 two 3
+// changes 1
+use sqlite3_h;
+
+@unsafe
+fn main() -> i64 {
+    if sqlite3_libversion_number() >= 3000000 { println("version ok"); }
+    var db: i64 = 0;
+    println("open " + int_to_str(sqlite3_open(":memory:", &db)));
+    var err: i64 = 0;
+    var rc = sqlite3_exec(db, "CREATE TABLE t (id INTEGER, name TEXT, x REAL); INSERT INTO t VALUES (1, 'one', 1.5); INSERT INTO t VALUES (2, 'two', 3.0);", 0, 0, &err);
+    println("exec " + int_to_str(rc));
+    var stmt: i64 = 0;
+    var tail: i64 = 0;
+    if sqlite3_prepare_v2(db, "SELECT id, name, x FROM t ORDER BY id", -1, &stmt, &tail) != SQLITE_OK {
+        println("prepare failed");
+        return 1;
+    }
+    while sqlite3_step(stmt) == SQLITE_ROW {
+        print(sqlite3_column_int64(stmt, 0));
+        print(" ");
+        print(sqlite3_column_text(stmt, 1));
+        print(" ");
+        println(float_to_str(sqlite3_column_double(stmt, 2)));
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_exec(db, "UPDATE t SET x = 0 WHERE id = 2", 0, 0, &err);
+    println("changes " + int_to_str(sqlite3_changes(db)));
+    sqlite3_close(db);
+    return 0;
+}

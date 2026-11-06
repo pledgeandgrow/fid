@@ -1249,13 +1249,13 @@ The sequence:
 Phase 1 (now): Language foundation
   ✅ Own compiler, own IR, own codegen, own linker, own runtime
   ✅ Safety features (bounds, overflow, linear types, borrow checker)
-  ✅ Financial features (money, banking, txn, conservation)
+  ✅ Financial features (money, banking, txn, conservation; txn rollback only in fid run)
   ✅ Capability system + sandbox
   ✅ Deterministic annotations + LogicalTime
-  ✅ Bare-metal + multiboot2 kernel mode (--bare, --boot)
+  ⚠️ Bare-metal + multiboot2 kernel mode (--bare, --boot): in fidesc; fid emit --bare panics
 
 Phase 2 (near): Language completion
-  ○ Self-hosting (Fides compiler written in Fides)
+  ✅ Self-hosting (Fides compiler written in Fides; fixpoint reached)
   ○ io_uring runtime (feature 1 above)
   ○ Capability-based process isolation (feature 2)
   ○ Transactional memory in native codegen (feature 3)

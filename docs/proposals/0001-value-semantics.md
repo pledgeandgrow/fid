@@ -1,6 +1,8 @@
 # 0001: Values, copy-on-write collections, equality by content
 
-- **Status:** accepted
+- **Status:** accepted; partly implemented. `==` by content is done.
+  Copy-on-write is written and not on in the verified compiler: today
+  `var b = a` on a `Vec` still aliases (Nov 6, see below).
 - **Decision:** accepted on 2026-11-02 (release M4, M5). `Vec`, `str` and
   `HashMap` are copy-on-write values; structs are values; `==` on a struct
   compares its fields.
@@ -68,6 +70,44 @@ dead, which is why it cannot free everything (release C5, C6).
   (copied on assignment, on passing and in a cloned collection; element
   access a place), which is the next step and a change to the struct layout
   and call convention of every backend.
+
+Nov 3, later:
+
+- Done: `==` on two `Vec`s, and on a struct's `Vec` field, compares element
+  by element (`Vec_eq_words` for numbers and bools, `Vec_eq_strs` for
+  strings); a `Vec` of structs still compares by identity.
+- Copy-on-write for `Vec` (share on assignment, copy before the first write:
+  `Vec_share`, `vec_own` in core, `Lowerer_lower_value`) is written and behind
+  `LOWER_COW` in `compiler/lower.fd`, off. On, it gives the right answers on
+  the test programs (the example above prints 1, 0, 0, 1), but the compiler
+  built with it crashes: its own source relies on shared handles in the ways
+  listed above. So the next step is unchanged: structs as values, element
+  access as a place, then turning `LOWER_COW` on. Shared data is never freed
+  yet (no count word); the count is part of that step.
+
+Nov 4–6:
+
+- Copy-on-write lowering is written for `Vec`, `HashMap` and the `Vec` fields
+  of copied structs, behind `LOWER_COW` (`compiler/lower.fd`), which is off
+  in the verified compiler. With it on, the test programs get value semantics
+  on all three backends (interpreter, C, native). The first version made
+  the compiler compiling itself run out of memory in the type checker
+  (`Vec_share_deep` copied every struct of a `Vec<Struct>` at each
+  assignment from a place). Since Nov 6 shares are lazy (the owner box
+  records the element kind and `vec_own` copies the elements at the first
+  write; the compiler calls `vec_own` before a write into an element),
+  counted (the box is freed with its last owner) and skipped for copies that
+  are never written, and a variable's last use is moved. With it on, the
+  compiler compiling itself reaches its fixpoint (Nov 6), at a peak of
+  4.7 GB against 1.8 GB off. Next: the full suite with it on, then on by
+  default; then free the shares held by struct copies at scope end.
+- Freeing without counts (item 4, in part): the compiler frees what it can
+  prove is finished: `Vec`/`HashMap` locals, a `Vec<str>`/`Vec<Vec>` that
+  owns its elements, collections declared in a `region` at its end, and
+  string temporaries (`test_mem_owned_drop.fd`). Everything else lives until
+  exit (a leak, never a dangling value). There is no GC.
+- Not done: the count word (item 2 of the implementation), structs copied on
+  pass, `same(a, b)`.
 
 ## What it breaks
 

@@ -4,11 +4,19 @@
 > itself with no C compiler and no Rust; native programs run about as fast
 > as C-built ones.
 >
-> Last updated: Oct 27, 2026.
+> Last updated: Nov 6, 2026.
 
 ## Where it stands
 
-- **In the repository (`main`, 1305b74):** the self-hosted compiler makes
+- **Now (Nov 6, 2026):** `fid emit` (`compiler/pe_ir*.fd`) is the native
+  Windows x64 path and needs no C compiler. It runs a small IR optimizer
+  (`compiler/iropt.fd`: inlining of small one-block functions, constant
+  folding, dead code removal) and keeps values in 7 callee-saved registers;
+  there is no full register allocator. Programs that use `async` or
+  `spawn` + `await` crash natively (`test_async`, `test_async_float_struct`).
+  `emit --bare` panics. `build --native` (the old PIR path, `compiler/pe.fd`)
+  still crashes. The paragraphs below are the Oct 27–31 record.
+- **In the repository (`main`, 1305b74, Oct 27):** the self-hosted compiler makes
   executables only through C (`fid ccompile`, `fid build`); its own native
   path (`build --native`: PIR → x86-64 → `compiler/pe.fd`) crashes on every
   program. The Rust compiler's PE backend (`src/pe.rs`, `fidesc emit`) works:
@@ -37,7 +45,8 @@
   command-line arguments were split wrongly; five runtime functions the
   compiler uses were missing. With them, `fidesc emit compiler/main.fd`
   gives a working native compiler.
-- **Known speed gap:** that native compiler takes 5 min 51 s for
+- **Known speed gap (Oct 27; closed by items 61–70, see item 87):** that
+  native compiler takes 5 min 51 s for
   `dump-c compiler/main.fd`, against 16 s for the C build. Main cause: PE
   `p_malloc` calls `GetProcessHeap` + `HeapAlloc` on every allocation (and
   `p_free` calls `HeapFree`), while the C runtime uses a bump allocator over
@@ -138,7 +147,7 @@ with no C compiler. Done when the `.exe` from `fid` prints the same output as
 - [x] 49. The enum, `match`, Option and Result tests pass. *(verified: test_enum_simple, test_match exit 44; Option/Result untested)*
 - [x] 50. The closure, trait and `dyn` tests pass. *(verified: test_closure; trait/dyn untested)*
 - [x] 51. The float and math tests pass. *(verified: test_float identical; math untested)*
-- [x] 52. The concurrency tests (threads, channels, async) pass. — `test_threads`, `real_threads`, `test_channel`, `test_channels_select`, `test_async_threads`, `test_parallel_concurrent` all pass natively, identical output+exit code to the interpreter.
+- [~] 52. The concurrency tests (threads, channels, async) pass. — `test_threads`, `real_threads`, `test_channel`, `test_channels_select`, `test_async_threads`, `test_parallel_concurrent` all pass natively, identical output+exit code to the interpreter (Oct 30–31). Nov 6: `fid emit` programs that use `async` or `spawn` + `await` crash (`test_async`, `test_async_float_struct`); the interpreter and C paths are fine.
 - [x] 53. The safety tests give the same panics. — `test_bounds_check`, `test_overflow_safe` pass identically. Div/mod-by-zero emits bare `cqo;idiv` on both backends → same hardware fault (a shared semantic gap vs the interpreter's checked panic, not a backend divergence). Checked-overflow parity gap documented separately (interp checks, PE wraps — pre-existing).
 - [x] 54. The ML and tensor tests pass. — `test_tensor` identical both paths.
 - [x] 55. Examples pass modulo platform exclusions. — `codegen`, `json_parser`, `lexer`, `mini_compiler`, `neural_network`, `parser` all emit + run identical to interp. Exclusions: `http_server` (no sockets), `minimal_game` (needs SDL — its own error says `build with ccompile`), `riscv_blink`/`rpi_led_blink` (bare-metal asm; both hang/behave identically both paths).
@@ -146,7 +155,7 @@ with no C compiler. Done when the `.exe` from `fid` prints the same output as
 - [x] 57. Output is byte-identical to `fidesc emit` wherever the two front ends produce the same IR. — strongest possible evidence: `fid-n5.exe` (native compiler emitting `compiler/main.fd`) is **byte-identical (12,304,896 B)** to `fid-n5a.exe` (C-compiled compiler emitting the same source).
 - [x] 58. The self-hosted IR moves closer to Rust's. — demonstrated by the byte-identical dump-c output (40,321,215 B) and byte-identical emitted executables across both front ends.
 - [x] 59. The natively built compiler runs and compiles programs. — `fid-n4.exe` (native emit of `compiler/main.fd`) runs `run`, `emit` and `dump-c` correctly; its dump-c output is byte-identical to the C-compiled compiler's; its emit output (`fid-n5`) is byte-identical to the C compiler's (`fid-n5a`).
-- [ ] 60. The Rust suite still passes after those fixes and the runtime move: 280 / 278 / 282, and 59/59 expected-fail.
+- [x] 60. The Rust suite still passes after those fixes and the runtime move: 280 / 278 / 282, and 59/59 expected-fail. — last full run Nov 2: interpreter 339/339, C 343/343, PE 345/345, expected-fail 89/89. Not rerun with the Nov 4–6 compiler.
 
 ## Step 2: Fast native code
 
@@ -213,4 +222,4 @@ compiles the compiler in roughly C-build time, not 6 minutes.
 - [x] 97. The compiler emitted by `c1` reproduces itself identically. — **native fixpoint verified**: `fid-n5.exe emit compiler/main.fd → fid-n6.exe` is **byte-identical** to `fid-n5.exe` (12,304,896 B). The natively-emitted compiler reproduces itself bit-for-bit.
 - [x] 98. The timings are recorded in this file and the changelog. — numbers in items 87–90/95–97 here and the "Session 35" entry in `docs/reference/changelog.md` (dump-c 3m21s vs 4m21s, emit timings, bench 2.7×, memory parity, frame-size reduction).
 - [x] 99. The docs describe the native backend's status and speed. — `docs/reference/architecture.md` "PE Emission (Windows)" updated with the self-hosted parity, fixpoint, speed numbers and codegen wins.
-- [ ] 100. Commit and push. — source changes committed at 17:28 (7441c08); roadmap/changelog/architecture updates pending in working copy.
+- [x] 100. Commit and push. — source changes committed at 17:28 (7441c08); roadmap, changelog and architecture updates in 4153bb4, on `origin/main`.

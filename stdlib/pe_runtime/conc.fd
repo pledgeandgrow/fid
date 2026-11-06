@@ -189,6 +189,10 @@ var pert_co_total: i64 = 0;
 
 var pert_tls_cur: i64 = 0;     // TLS slot: current task on this thread
 var pert_tls_sched: i64 = 0;   // TLS slot: this thread's scheduler fiber
+var pert_tls_wid: i64 = 0;     // TLS slot: worker id + 1 (0 = not a worker)
+var pert_lq: i64 = 0;          // per-worker queues: [wid*16]=head [wid*16+8]=tail
+var pert_lq_any: i64 = 0;      // *i64 — count of tasks on all local queues
+var pert_dl_streak: i64 = 0;   // consecutive dead-looking poller cycles
 
 var pert_wq: i64 = 0;          // [0] SRWLOCK [8] COND — guards head/tail
 var pert_wq_head: i64 = 0;
@@ -229,35 +233,90 @@ pub fn pe_co_cur() -> i64 {
     return pe_k_tls_get(pert_tls_cur);
 }
 
-// ─── Run queue ─────────────────────────────────────────────
+// ─── Run queues: one global + one local per worker ─────────
+// Work pushed on a worker stays on its own queue (spawn locality);
+// a worker whose queue is dry pops the global queue, then steals
+// from a sibling. All run queues share `pert_wq`'s lock — the
+// critical sections are pointer swaps only.
+
+// Append t to worker wid's local queue (wq lock held).
+fn pe_lq_push_locked(t: i64, wid: i64) {
+    var tail: i64 = pe_load(pert_lq + wid * 16 + 8);
+    pe_store(t + 176, 0);
+    if tail != 0 {
+        pe_store(tail + 176, t);
+    } else {
+        pe_store(pert_lq + wid * 16, t);
+    }
+    pe_store(pert_lq + wid * 16 + 8, t);
+    pe_atomic_add(pert_lq_any, 1);
+}
+
+// Pop the head of worker wid's local queue (wq lock held). 0 if empty.
+fn pe_lq_pop_locked(wid: i64) -> i64 {
+    var t: i64 = pe_load(pert_lq + wid * 16);
+    if t == 0 { return 0; }
+    var nx: i64 = pe_load(t + 176);
+    pe_store(pert_lq + wid * 16, nx);
+    if nx == 0 { pe_store(pert_lq + wid * 16 + 8, 0); }
+    pe_store(t + 176, 0);
+    pe_store(t + 192, 0);
+    pe_atomic_add(pert_lq_any, 0 - 1);
+    return t;
+}
+
+// Steal one task from another worker's queue (wq lock held). 0 if none.
+fn pe_lq_steal_locked(wid: i64) -> i64 {
+    var i: i64 = 0;
+    while i < pert_nworkers {
+        if i != wid {
+            var t: i64 = pe_lq_pop_locked(i);
+            if t != 0 { return t; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn pe_wq_push(t: i64) {
     pe_k_lock(pert_wq);
-    pe_store(t + 176, 0);
-    if pert_wq_tail != 0 {
-        pe_store(pert_wq_tail + 176, t);
+    var wid: i64 = 0;
+    if pert_tls_wid != 0 { wid = pe_k_tls_get(pert_tls_wid); }
+    if wid != 0 {
+        pe_lq_push_locked(t, wid - 1);
     } else {
-        pert_wq_head = t;
+        pe_store(t + 176, 0);
+        if pert_wq_tail != 0 {
+            pe_store(pert_wq_tail + 176, t);
+        } else {
+            pert_wq_head = t;
+        }
+        pert_wq_tail = t;
     }
-    pert_wq_tail = t;
     pe_k_cond_signal(pert_wq + 8);
     pe_k_unlock(pert_wq);
 }
 
-fn pe_wq_pop() -> i64 {
+fn pe_wq_pop(wid: i64) -> i64 {
     pe_k_lock(pert_wq);
-    while pert_wq_head == 0 {
+    while true {
+        var t: i64 = pe_lq_pop_locked(wid);
+        if t != 0 { pe_k_unlock(pert_wq); return t; }
+        if pert_wq_head != 0 {
+            t = pert_wq_head;
+            pert_wq_head = pe_load(t + 176);
+            if pert_wq_head == 0 { pert_wq_tail = 0; }
+            pe_store(t + 192, 0);
+            pe_k_unlock(pert_wq);
+            return t;
+        }
+        t = pe_lq_steal_locked(wid);
+        if t != 0 { pe_k_unlock(pert_wq); return t; }
         pe_atomic_add(pert_idle, 1);
         pe_k_cond_wait(pert_wq + 8, pert_wq, pe_infinite(), 0);
         pe_atomic_add(pert_idle, 0 - 1);
     }
-    var t: i64 = pert_wq_head;
-    pert_wq_head = pe_load(t + 176);
-    if pert_wq_head == 0 {
-        pert_wq_tail = 0;
-    }
-    pe_store(t + 192, 0);
-    pe_k_unlock(pert_wq);
-    return t;
+    return 0;
 }
 
 // ─── Task lifecycle ────────────────────────────────────────
@@ -339,6 +398,7 @@ fn pe_co_ensure() {
     }
     pert_tls_cur = pe_k_tls_alloc();
     pert_tls_sched = pe_k_tls_alloc();
+    pert_tls_wid = pe_k_tls_alloc();
     pert_wq = pe_zeroed(2);
     pe_k_lock_init(pert_wq);
     pe_k_cond_init(pert_wq + 8);
@@ -368,6 +428,8 @@ fn pe_co_ensure() {
         n = 16;
     }
     pert_nworkers = n;
+    pert_lq = pe_zeroed(n * 16);
+    pert_lq_any = pe_zeroed(1);
 
     var wid: i64 = 0;
     while wid < n {
@@ -646,8 +708,9 @@ fn pe_co_finish_task(block: i64) {
 pub fn pert_worker_main(id: i64) -> i64 {
     var sched: i64 = pe_k_thread_to_fiber(0);
     pe_k_tls_set(pert_tls_sched, sched);
+    pe_k_tls_set(pert_tls_wid, id + 1);
     while true {
-        var t: i64 = pe_wq_pop();
+        var t: i64 = pe_wq_pop(id);
         pe_store(t + 168, sched);
         pe_k_tls_set(pert_tls_cur, t);
         pe_k_switch_fiber(pe_load(t + 104));
@@ -730,12 +793,20 @@ pub fn pert_poller_main(id: i64) -> i64 {
         waiters = waiters + pert_timer_n;
         var live_n: i64 = pe_atomic_load(pert_live);
         var idle_n: i64 = pe_atomic_load(pert_idle);
-        var queue_empty: bool = pert_wq_head == 0;
+        var queue_empty: bool = pert_wq_head == 0 && pe_atomic_load(pert_lq_any) == 0;
         pe_k_unlock(pert_reg);
 
         // Deadlock: live tasks exist but nothing can ever run again —
         // queue empty, every worker parked, no fd/timer/join/pool waiters.
-        if live_n > 0 && queue_empty && idle_n >= pert_nworkers && waiters == 0 && pert_co_deadlocked == 0 {
+        // With per-worker queues a steal handoff can look empty for an
+        // instant, so the state must persist across two poll cycles.
+        var looks_dead: bool = live_n > 0 && queue_empty && idle_n >= pert_nworkers && waiters == 0;
+        if looks_dead {
+            pert_dl_streak = pert_dl_streak + 1;
+        } else {
+            pert_dl_streak = 0;
+        }
+        if pert_dl_streak >= 2 && pert_co_deadlocked == 0 {
             pert_co_deadlocked = 1;
             p_panic("Tasks are deadlocked: each one awaits another");
         }

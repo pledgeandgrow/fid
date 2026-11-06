@@ -57,6 +57,8 @@ use compiler::riscv_enc;
 use compiler::runtime_riscv;
 use compiler::x86;
 use compiler::wasm;
+use compiler::iropt;
+use compiler::cowcheck;
 // ===========================================================================
 // Result types (Fides has no generic Result<T,E>)
 // ===========================================================================
@@ -939,6 +941,9 @@ pub var g_stdlib_cache: OptProgram = OptProgram::None;
 var g_stdlib_struct_names: Vec<str> = Vec::new();
 var g_stdlib_enum_names: Vec<str> = Vec::new();
 var g_stdlib_cache_init: bool = false;
+// Hash of core.fd's text (release D9: a core checked clean once is not
+// checked again by the same compiler)
+var g_stdlib_hash: i64 = 0;
 var g_stdlib_dir_found: bool = false;
 var g_stdlib_dir: str = "stdlib";
 
@@ -1046,9 +1051,34 @@ pub fn get_cached_stdlib() -> OptProgram {
     if (stdlib_raw as i64) == 0 {
         return OptProgram::None;
     }
+    g_stdlib_hash = hash_source(stdlib_raw);
     var stdlib_result: ParseResultProgram = parse_source(stdlib_raw);
+    var rp: *mut i64 = (&stdlib_result as i64);
+    var rw0: i64 = 0;
+    var rw1: i64 = 0;
+    var rw2: i64 = 0;
+    var rw3: i64 = 0;
+    var rw4: i64 = 0;
+    var r0p: *mut i64 = (rp as i64) + 0;
+    var r1p: *mut i64 = (rp as i64) + 8;
+    var r2p: *mut i64 = (rp as i64) + 16;
+    var r3p: *mut i64 = (rp as i64) + 24;
+    var r4p: *mut i64 = (rp as i64) + 32;
+    unsafe { rw0 = *r0p; rw1 = *r1p; rw2 = *r2p; rw3 = *r3p; rw4 = *r4p; }
+    var rmsg: str = "RES +0=" + int_to_str(rw0) + " +8=" + int_to_str(rw1) + " +16=" + int_to_str(rw2) + " +24=" + int_to_str(rw3) + " +32=" + int_to_str(rw4);
+    p_eprint_str(rmsg);
+    p_eprint_str("\n");
     match stdlib_result {
         ParseResultProgram::Ok(stdlib) => {
+            var sp: *mut i64 = (&stdlib as i64);
+            var ps0: i64 = 0;
+            var ps1: i64 = 0;
+            var ps2: i64 = 0;
+            var q0p: *mut i64 = (sp as i64) + 0;
+            var q1p: *mut i64 = (sp as i64) + 8;
+            var q2p: *mut i64 = (sp as i64) + 16;
+            unsafe { ps0 = *q0p; ps1 = *q1p; ps2 = *q2p; }
+            p_eprint_str("BOUND +0=" + int_to_str(ps0) + " +8=" + int_to_str(ps1) + " +16=" + int_to_str(ps2) + "\n");
             g_stdlib_cache = OptProgram::Some(stdlib);
             g_stdlib_cache_init = true;
             return g_stdlib_cache;
@@ -1080,6 +1110,21 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
         }
         OptProgram::Some(stdlib_parsed) => {
             var stdlib: Program = stdlib_parsed;
+            var sbp: *mut i64 = (&stdlib as i64);
+            var sw0: i64 = 0;
+            var sw1: i64 = 0;
+            var sw2: i64 = 0;
+            var sw3: i64 = 0;
+            var sw4: i64 = 0;
+            var s0p: *mut i64 = (sbp as i64) + 0;
+            var s1p: *mut i64 = (sbp as i64) + 8;
+            var s2p: *mut i64 = (sbp as i64) + 16;
+            var s3p: *mut i64 = (sbp as i64) + 24;
+            var s4p: *mut i64 = (sbp as i64) + 32;
+            unsafe { sw0 = *s0p; sw1 = *s1p; sw2 = *s2p; sw3 = *s3p; sw4 = *s4p; }
+            var smsg: str = "STDLIB +0=" + int_to_str(sw0) + " +8=" + int_to_str(sw1) + " +16=" + int_to_str(sw2) + " +24=" + int_to_str(sw3) + " +32=" + int_to_str(sw4);
+            p_eprint_str(smsg);
+            p_eprint_str("\n");
             p_eprint_str("[build] Stdlib parsed ok (cached). Extracting names...\n");
             // Extract stdlib struct/enum names for parser
             var struct_names: Vec<str> = Vec::new();
@@ -1454,7 +1499,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
 
                     // A user function named like a function of one imported
                     // module: each side keeps its own (module__name).
-                    cc_qualify_shadowed_imports(imported_modules, imported_module_names, user, stdlib);
+                    cc_qualify_shadowed_imports(&mut imported_modules, imported_module_names, &mut user, stdlib);
 
                     // `cap Sub: Super`: Sub carries Super's methods.
                     var trait_defs: Vec<TraitDef> = Vec::new();
@@ -1537,6 +1582,19 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     // Phase 3B.1: Fill in default trait methods
                     fill_default_trait_methods(&mut program);
 
+                    // Turbofish calls `f::<T>(..)`: instantiated before type
+                    // checking, so every pass sees an ordinary call (0002)
+                    program = mono_resolve_turbofish(program, turbofish_all());
+                    var tf_errors: Vec<str> = mono_turbofish_errors();
+                    if tf_errors.len() > 0 {
+                        var file_tf: str = "<stdin>";
+                        match source_path {
+                            OptStr::Some(ptf) => { file_tf = ptf; }
+                            OptStr::None => { }
+                        }
+                        return ResultProgram::Err(enrich_errors(tf_errors, source, file_tf));
+                    }
+
                     p_eprint_str("[build] Type checking...\n");
                     var t_tc: i64 = p_clock_now_ms();
                     // Type check -- register each module with its own name
@@ -1566,6 +1624,28 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     TypeChecker_register_generated_decls(&mut tc, program);
                     TypeChecker_verify_trait_impls(&mut tc, program);
                     TypeChecker_collect_capabilities(&mut tc, user);
+                    // Core's bodies are checked once per core and compiler
+                    // (release D9): user code still sees every declaration
+                    // of core; only re-checking its bodies is skipped
+                    var core_checked: bool = false;
+                    var core_skip: i64 = 0;
+                    match g_stdlib_cache {
+                        OptProgram::Some(core_prog) => {
+                            core_checked = inc_core_checked(g_stdlib_hash);
+                            if core_checked {
+                                var others: Vec<Program> = Vec::new();
+                                others.push(user);
+                                var oi2: i64 = 0;
+                                while oi2 < imported_modules.len() {
+                                    others.push(imported_modules.get(oi2));
+                                    oi2 = oi2 + 1;
+                                }
+                                core_skip = tc_core_skip_set(core_prog, others);
+                                tc.skip_bodies = core_skip;
+                            }
+                        }
+                        OptProgram::None => {}
+                    }
                     TypeChecker_check_bodies(&mut tc, program);
 
                     if tc.errors.len() > 0 {
@@ -1590,7 +1670,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     }
                     var secret_errors: Vec<str> = secrecy_check(program);
                     if secret_errors.len() > 0 {
-                        p_eprint_str("[build] FAILED: @secret errors\n");
+                        p_eprint_str("[build] FAILED: @secret/@sensitive errors\n");
                         var file8: str = "<stdin>";
                         match source_path {
                             OptStr::Some(p8) => { file8 = p8; }
@@ -1622,6 +1702,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                             bc_mode = BorrowckMode::Warn;
                         }
                         var bc: BorrowChecker = BorrowChecker_new(bc_mode);
+                        bc.skip_bodies = core_skip;
                         check(&mut bc, program);
                         if bc.errors.len() > 0 {
                             var file4: str = "<stdin>";
@@ -1646,7 +1727,24 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         p_eprint_str("[build] Borrow checking skipped (mode=off).\n");
                     }
 
+                    // FIDES_COW_CHECK=1: the copy-on-write migration report
+                    // (proposal 0001, release M5): changes that only reach
+                    // their place while Vecs are shared handles
+                    if str_len(env_or_empty("FIDES_COW_CHECK")) > 0 {
+                        var cow_reports: Vec<str> = cow_check_program(program);
+                        var cri: i64 = 0;
+                        while cri < cow_reports.len() {
+                            p_eprint_str("cow: " + cow_reports.get(cri) + "
+");
+                            cri = cri + 1;
+                        }
+                        p_eprint_str("cow: " + int_to_str(cow_reports.len()) + " place(s)
+");
+                    }
+
                     // Comptime: substitute comptime expressions with their values
+                    // Everything in core passed: later builds skip its bodies
+                    if !core_checked && borrowck_mode == "on" { inc_core_mark_checked(g_stdlib_hash); }
                     program = substitute(program);
 
                     p_eprint_str("[build] Monomorphizing...\n");
@@ -2081,8 +2179,11 @@ pub fn build_executable(source: str, source_path: str, target: str, do_opt: bool
             }
             if target == "x86-64-windows" || target == "x64-windows" || target == "windows" {
                 // Windows PE — direct IR -> machine code backend (pe_ir),
-                // no assembler/linker in the loop
-                return pe_ir_generate_pe(module);
+                // no assembler/linker in the loop; inlined and folded first
+                // (release D5, D6)
+                var native_mod: IrModule = module;
+                iropt_native(&mut native_mod);
+                return pe_ir_generate_pe(native_mod);
             }
             if target == "arm64" || target == "aarch64" {
                 // ARM64: PIR L3 -> codegen_arm64 -> arm64_enc -> runtime_arm64 -> linker
@@ -2568,22 +2669,48 @@ pub fn merge_programs(stdlib: Program, user: Program) -> Program {
 }
 
 // ===========================================================================
-// apply_cfg_filter -- conditional compilation (simplified: always include)
+// apply_cfg_filter -- conditional compilation (@cfg)
 // ===========================================================================
 
-/// Apply conditional compilation filtering -- remove items with @cfg annotations
-/// that don't match the current platform/features.
-/// NO-OP: The self-hosted compiler includes all items. @cfg filtering is only
-/// needed for cross-compilation, which the self-hosted compiler doesn't do yet.
-/// This was previously a no-op-free rebuild of Vec<Func>/Vec<StructDef> which
-/// crashed due to the Vec-of-struct push problem (only 8 bytes copied per
-/// struct). Skipping it entirely avoids that crash and is correct for bootstrap.
+/// Conditional compilation (release K10, as src/compiler.rs apply_cfg_filter):
+/// a function or struct whose @cfg names another platform, architecture or
+/// build mode is left out. Lists are rebuilt with plain pushes (the old
+/// Vec-of-struct copy problem that made this a no-op is long fixed).
 pub fn apply_cfg_filter(program: &mut Program) {
-    // No-op -- include all items.
+    var is_windows: bool = p_getenv("OS") == "Windows_NT";
+    var is_linux: bool = !is_windows && c_file_exists("/proc/self/exe");
+    var is_macos: bool = !is_windows && !is_linux;
+    var any: bool = false;
+    var i: i64 = 0;
+    while i < program.funcs.len() && !any {
+        if !check_cfg(program.funcs.get(i).annotations, is_linux, is_windows, is_macos, false) { any = true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < program.structs.len() && !any {
+        if !check_cfg(program.structs.get(i).annotations, is_linux, is_windows, is_macos, false) { any = true; }
+        i = i + 1;
+    }
+    if !any { return; }
+    var funcs: Vec<Func> = Vec::new();
+    i = 0;
+    while i < program.funcs.len() {
+        if check_cfg(program.funcs.get(i).annotations, is_linux, is_windows, is_macos, false) { funcs.push(program.funcs.get(i)); }
+        i = i + 1;
+    }
+    program.funcs = funcs;
+    var structs: Vec<StructDef> = Vec::new();
+    i = 0;
+    while i < program.structs.len() {
+        if check_cfg(program.structs.get(i).annotations, is_linux, is_windows, is_macos, false) { structs.push(program.structs.get(i)); }
+        i = i + 1;
+    }
+    program.structs = structs;
 }
 
-/// Check if an item's @cfg annotations match the current platform.
-fn check_cfg(annotations: Vec<Annotation>, is_linux: bool, is_debug: bool) -> bool {
+/// Whether an item's @cfg annotations hold for this build. fid runs on
+/// x86-64 hosts only, so the architecture is x86-64.
+fn check_cfg(annotations: Vec<Annotation>, is_linux: bool, is_windows: bool, is_macos: bool, is_debug: bool) -> bool {
     var i: i64 = 0;
     while i < annotations.len() {
         if annotations.get(i).name == "cfg" {
@@ -2591,27 +2718,29 @@ fn check_cfg(annotations: Vec<Annotation>, is_linux: bool, is_debug: bool) -> bo
             var j: i64 = 0;
             while j < args.len() {
                 var arg: str = str_trim(args.get(j));
-                // Parse key=value pairs
                 var eq_pos: i64 = str_find(arg, "=");
+                var include: bool = true;
                 if eq_pos >= 0 {
                     var key: str = str_trim(c_str_substr(arg, 0, eq_pos));
                     var val: str = c_str_trim_quotes(str_trim(c_str_substr(arg, eq_pos + 1, str_len(arg))));
-                    var include: bool = true;
                     if key == "platform" || key == "os" {
                         if val == "linux" { include = is_linux; }
-                        else { include = false; }
+                        if val == "windows" { include = is_windows; }
+                        if val == "macos" { include = is_macos; }
                     }
-                    if key == "feature" { include = true; }
-                    if key == "backend" || key == "target" { include = true; }
-                    if !include { return false; }
+                    if key == "target_arch" || key == "arch" {
+                        if val == "x86_64" { include = true; }
+                        if val == "aarch64" || val == "riscv64" { include = false; }
+                    }
                 } else {
-                    // Bare flags
-                    var include2: bool = true;
-                    if arg == "debug" { include2 = is_debug; }
-                    if arg == "release" { include2 = !is_debug; }
-                    if arg == "linux" { include2 = is_linux; }
-                    if !include2 { return false; }
+                    if arg == "debug" { include = is_debug; }
+                    if arg == "release" { include = !is_debug; }
+                    if arg == "linux" { include = is_linux; }
+                    if arg == "windows" { include = is_windows; }
+                    if arg == "macos" { include = is_macos; }
+                    if arg == "aarch64" || arg == "arm64" || arg == "riscv64" || arg == "riscv" { include = false; }
                 }
+                if !include { return false; }
                 j = j + 1;
             }
         }
@@ -2749,9 +2878,17 @@ pub fn synthesize_struct_eq(program: &mut Program) {
                 Type::Generic(gname, _) => { if str_vec_contains(generic_defs, gname) { skip = true; } }
                 _ => {}
             }
-            var cmp: Expr = Expr::Binary(BinOp::Eq,
-                Box::new(Expr::FieldAccess(Box::new(Expr::Ident("__eq_a")), f.name)),
-                Box::new(Expr::FieldAccess(Box::new(Expr::Ident("__eq_b")), f.name)));
+            var fa: Expr = Expr::FieldAccess(Box::new(Expr::Ident("__eq_a")), f.name);
+            var fb: Expr = Expr::FieldAccess(Box::new(Expr::Ident("__eq_b")), f.name);
+            var cmp: Expr = Expr::Binary(BinOp::Eq, Box::new(fa), Box::new(fb));
+            // A Vec field compares element by element (proposal 0001)
+            var veq: str = vec_eq_fn_for(f.ty);
+            if veq != "" {
+                var vargs: Vec<Expr> = Vec::new();
+                vargs.push(fa);
+                vargs.push(fb);
+                cmp = Expr::Call(veq, vargs);
+            }
             if i == 0 {
                 same = cmp;
             } else {
@@ -2780,6 +2917,70 @@ pub fn process_derive(program: &mut Program) {
     var i: i64 = 0;
     while i < program.structs.len() {
         var s: StructDef = program.structs.get(i);
+        p_eprint_str(str_concat(str_concat(str_concat("DS i=", int_to_str(i)), " "), s.name)); p_eprint_str("\n");
+        if i < 3 {
+            var shp: *mut i64 = (program.structs as i64);
+            var shd: i64 = 0;
+            unsafe { shd = *shp; }
+            var e0p: *mut i64 = shd;
+            var e0: i64 = 0;
+            unsafe { e0 = *e0p; }
+            var f8p: *mut i64 = e0 + 8;
+            var f8: i64 = 0;
+            unsafe { f8 = *f8p; }
+            var a24p: *mut i64 = e0 + 24;
+            var a24: i64 = 0;
+            unsafe { a24 = *a24p; }
+            var t32p: *mut i64 = e0 + 32;
+            var t32: i64 = 0;
+            unsafe { t32 = *t32p; }
+            var fhd: i64 = 0;
+            var fhl: i64 = 0;
+            var ahd: i64 = 0;
+            var ahl: i64 = 0;
+            var fhdp: *mut i64 = f8;
+            var fhlp: *mut i64 = f8 + 8;
+            var ahdp: *mut i64 = a24;
+            var ahlp: *mut i64 = a24 + 8;
+            unsafe { fhd = *fhdp; }
+            unsafe { fhl = *fhlp; }
+            unsafe { ahd = *ahdp; }
+            unsafe { ahl = *ahlp; }
+            var fe0p: *mut i64 = fhd;
+            var fe0: i64 = 0;
+            var fe1p: *mut i64 = fhd + 8;
+            var fe1: i64 = 0;
+            var ae0p: *mut i64 = ahd;
+            var ae0: i64 = 0;
+            var ae1p: *mut i64 = ahd + 8;
+            var ae1: i64 = 0;
+            var acapp: *mut i64 = a24 + 16;
+            var acap: i64 = 0;
+            var fcapp: *mut i64 = f8 + 16;
+            var fcap: i64 = 0;
+            unsafe { fe0 = *fe0p; fe1 = *fe1p; ae0 = *ae0p; ae1 = *ae1p; acap = *acapp; fcap = *fcapp; }
+            var f0w0p: *mut i64 = fe0;
+            var f0w1p: *mut i64 = fe0 + 8;
+            var f0w0: i64 = 0;
+            var f0w1: i64 = 0;
+            var a0w0p: *mut i64 = ae0;
+            var a0w1p: *mut i64 = ae0 + 8;
+            var a0w0: i64 = 0;
+            var a0w1: i64 = 0;
+            var t32dp: *mut i64 = t32;
+            var t32d: i64 = 0;
+            var t32lp: *mut i64 = t32 + 8;
+            var t32l: i64 = 0;
+            unsafe { f0w0 = *f0w0p; f0w1 = *f0w1p; a0w0 = *a0w0p; a0w1 = *a0w1p; t32d = *t32dp; t32l = *t32lp; }
+            var mm: str = "RAW e0=" + int_to_str(e0) + " f8=" + int_to_str(f8) + " a24=" + int_to_str(a24) + " t32=" + int_to_str(t32);
+            mm = mm + " fdata=" + int_to_str(fhd) + " flen=" + int_to_str(fhl) + " adata=" + int_to_str(ahd) + " alen=" + int_to_str(ahl);
+            mm = mm + " fe0=" + int_to_str(fe0) + " ae0=" + int_to_str(ae0) + " fe1=" + int_to_str(fe1) + " ae1=" + int_to_str(ae1);
+            mm = mm + " fcap=" + int_to_str(fcap) + " acap=" + int_to_str(acap);
+            mm = mm + " f0w0=" + int_to_str(f0w0) + " f0w1=" + int_to_str(f0w1) + " a0w0=" + int_to_str(a0w0) + " a0w1=" + int_to_str(a0w1);
+            mm = mm + " t32d=" + int_to_str(t32d) + " t32l=" + int_to_str(t32l);
+            p_eprint_str(mm);
+            p_eprint_str("\n");
+        }
         var j: i64 = 0;
         while j < s.annotations.len() {
             if s.annotations.get(j).name == "derive" {
@@ -3709,7 +3910,7 @@ fn cc_serialize_field(name: str, ty: Type) -> Expr {
     return Expr::Call("int_to_str", args);
 }
 
-fn cc_qualify_shadowed_imports(imported: Vec<Program>, names: Vec<str>, user: Program, core: Program) {
+fn cc_qualify_shadowed_imports(imported: &mut Vec<Program>, names: Vec<str>, user: &mut Program, core: Program) {
     // name -> 1 + index of the one module defining it, or -1 for several
     var definer: i64 = HashMap_new();
     var core_fns: i64 = HashMap_new();
@@ -3850,6 +4051,7 @@ fn cc_qualify_shadowed_imports(imported: Vec<Program>, names: Vec<str>, user: Pr
             prog.trait_impls.set(ii, rti);
             ii = ii + 1;
         }
+        imported.set(mi, prog);
         mi = mi + 1;
     }
     if qualified.len() > 0 {

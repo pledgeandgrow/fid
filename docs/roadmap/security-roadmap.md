@@ -8,6 +8,12 @@
 > `roadmap.md` Phase 12. The "Not Yet Prevented" items (CFI, full taint
 > propagation, runtime sandbox, runtime resource limits) are tracked as
 > Phase 12 remaining work in `roadmap.md`.
+>
+> **Status (Nov 6, 2026):** several rows below describe the frozen Rust
+> compiler (`fidesc`), not the release compiler `fid`. Safe code is not yet
+> proven memory-safe: `var b = a` on a `Vec` shares it until copy-on-write is
+> on (release-roadmap.md, Track M), and the sanitizer and fuzzing runs (M8,
+> M9) are written but have not been run. Crypto is not for production use.
 
 ## Design Philosophy
 
@@ -83,7 +89,7 @@ All C codegen output is compiled with these flags (no opt-in required):
 | ROP chains | Partial | Fewer gadgets (no unused code with `--caps`), but no CFI |
 | Spectre/Meltdown | Partial | `@constant_time` helps, but hardware-level issue |
 | Heap spraying | Partial | No `eval()` or dynamic code exec, but no heap hardening |
-| Stack overflow (deep recursion) | **Prevented** (SH-12) | C codegen `p_max_recursion=10000` + abort with trace; interpreter `--max-recursion` |
+| Stack overflow (deep recursion) | **Prevented** (SH-12) | C path: the OS guard page, with a handler on reserved stack that prints the trace (`SetThreadStackGuarantee`, `sigaltstack`; the old 10,000-call counter is gone); interpreter `--max-recursion` |
 | Infinite loops | **Prevented** (SH-12) | Interpreter `--max-steps N` panics with trace; test runner uses 50M limit |
 | Out-of-memory | **Prevented** (SH-12) | C codegen `p_malloc` aborts with size on alloc failure (no silent NULL) |
 
@@ -92,8 +98,8 @@ All C codegen output is compiled with these flags (no opt-in required):
 | Exploit Class | Status | Planned |
 |--------------|--------|---------|
 | CFI (Control Flow Integrity) | Not implemented | Forward-edge CFI for indirect calls |
-| Data race prevention | Not implemented | `@sync` annotation (Send/Sync traits) |
-| Taint propagation | Basic (sink detection) | Full data-flow taint tracking |
+| Data race prevention | Partial: every argument of a spawned call must be `@send` (raw pointers and references are not); spawned code writes no global without a lock | Collections alias until copy-on-write is on (release M5) |
+| Taint propagation | `fid`: coarse (a `@tainted` function or parameter reaches no IO or Net effect); `fidesc`: data-flow with sanitizers | Data-flow taint tracking in `fid` |
 | Runtime sandbox | Compile-time only | Runtime capability revocation in interpreter |
 | Runtime resource limits | Compile-time only | Runtime memory/time limits |
 

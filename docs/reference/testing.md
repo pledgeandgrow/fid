@@ -1,20 +1,41 @@
 # TEST.md — Fides Test Results
 
-*Last updated: Oct 27, 2026 (session 34). The bootstrap fixpoint is VERIFIED byte-for-byte (stage 2 == stage 3, checked by `RELEASE=1 scripts/bootstrap.sh`). 348 total .fd test files: 302 in `tests/bootstrap/` + 46 in `tests/selfhost/`. Current results are in "Current Results" below; the Session-16-era tables after it are kept for history — see `tests/bootstrap/baseline/test_results.txt` (via `./verify.sh`) for the saved baseline.*
+*Last updated: Nov 6, 2026. The bootstrap fixpoint is VERIFIED byte-for-byte (stage 2 C == stage 3 C, 49 MB, Nov 6, checked by `RELEASE=1 scripts/bootstrap.sh`). 493 .fd test files under `tests/bootstrap/` (452 top level, 91 of them expected-fail `*_fail.fd`), 51 in `tests/selfhost/`, 10 examples. Current results are in "Current Results" below; the Session-16-era tables after it are kept for history — see `tests/bootstrap/baseline/test_results.txt` (via `./verify.sh`) for the saved baseline, and [CURRENT.md → Numbers](../../CURRENT.md#numbers) for the project's counts.*
 
-## Current Results (Oct 27, 2026)
+## Current Results
 
-**Rust compiler (`fidesc test`, `fidesc test --fail`, `cargo test`):**
+**Rust compiler (`fidesc test`, `fidesc test --fail`), Nov 2, 2026:**
 
 | Backend | Result |
 |---|---|
-| Interpreter | 280/280 |
-| C codegen | 278/278 match the interpreter |
-| PE emitter (native Windows) | 282/282 match, 0 unsupported |
-| Expected-fail | 59/59 rejected on all three |
-| `cargo test --lib` | 265 passed |
+| Interpreter | 339/339 |
+| C codegen | 343/343 match the interpreter |
+| PE emitter (native Windows) | 345/345 match, 0 unsupported |
+| Expected-fail | 89/89 rejected on all three |
+| `cargo test --lib` | 265 passed (Oct 27; not rerun since) |
 
-**Self-hosted compiler vs `fidesc`** (same program, outputs compared):
+The saved baseline is from an earlier run on Nov 2 (334/338/341, 89/89).
+Tests that need SDL2, OpenGL, libsqlite3 or POSIX headers are skipped unless
+`FIDES_TEST_EXTERNAL=1`.
+
+**The full suite has not been rerun with the Nov 4–6 compiler.** The tests
+added Nov 4–6 were checked with quick runs (`fid run`, `fid ccompile`,
+`fid emit`, outputs compared): among them `test_generics_full`,
+`test_generic_infer_fail`, `test_generic_bound_fail`,
+`test_turbofish_arity_fail`, `test_if_expr_value`, `test_cfg` (all 3
+backends), `test_mem_owned_drop`, `test_iter_invalidation_fail`,
+`test_race_ptr_fail`, `test_parallel_branches` (all 3 backends),
+`test_borrowed_str`, `test_borrowed_str_return_fail`,
+`test_borrowed_str_pass_fail`, `test_scoped_store_fail`,
+`test_hashmap_int_keys` (all 3 backends),
+`effects/test_effect_ho_instantiation`, and one negative test per safety rule
+([safety-rules.md](safety-rules.md)). `test_async` and
+`test_async_float_struct` crash under `fid emit` (native async is broken);
+the interpreter and C are fine.
+
+**Self-hosted compiler vs `fidesc`** (same program, outputs compared),
+Oct 27, 2026, on the 302 test programs of that date — not rerun since the
+suite grew:
 
 | | Result |
 |---|---|
@@ -22,8 +43,18 @@
 | `fid ccompile` | 242/243 test programs (`test_sqlite` needs libsqlite3), 9/10 examples (`minimal_game` needs SDL2) |
 | Expected-fail | 59/59 rejected |
 
-There is no harness command for the self-hosted comparison yet; it runs
-each test through both compilers and diffs stdout and the exit code.
+To rerun it: `fidesc test --compiler release/fid.exe` sends `run`,
+`ccompile` and `emit` through the shipped `fid` instead of `fidesc`.
+
+**Other test tools** (Nov 4–6):
+
+| Tool | State |
+|---|---|
+| `bench/run.sh`, `bench/check.sh` | Built and in use. `check.sh` fails on a slowdown over `LIMIT_PCT` against `bench/baseline.txt`; not in CI |
+| `scripts/sanitize.sh` | Written, not run: the tests through C under ASan/UBSan; needs clang with ASan (Linux/macOS); `FIDES_CFLAGS` passes extra C flags |
+| `scripts/fuzz/nightly.sh` + `checked` backend in `scripts/fuzz/gen_programs.py` | Written, not run. No CI workflow in the repo schedules it |
+| `fid emit --checked-alloc` | Written, not run: every block on pages of its own, ending at a guard page; freed pages inaccessible, never reused |
+| `fid run --leaks`, `fid run --checked-alloc` | The C runtime's debug allocator (leak report, use after free) |
 
 ## Legend
 
@@ -38,7 +69,7 @@ each test through both compilers and diffs stdout and the exit code.
 
 ---
 
-## Test Summary
+## Test Summary (session 16, historical)
 
 | Test Group | Count | Pass | Fail | Notes |
 |------------|-------|------|------|-------|

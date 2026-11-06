@@ -48,7 +48,7 @@ extern "C" link "sqlite3" {
         sql: str,
         callback: i64,
         arg: i64,
-        errmsg: *str
+        errmsg: *i64
     ) -> i64;
 
     // Prepared statements
@@ -58,7 +58,7 @@ extern "C" link "sqlite3" {
         sql: str,
         nByte: i64,
         ppStmt: *i64,
-        tail: *str
+        tail: *i64
     ) -> i64;
     fn sqlite3_step as p_sqlite3_step(stmt: i64) -> i64;
     fn sqlite3_bind_text as p_sqlite3_bind_text(stmt: i64, index: i64, text: str, size: i64, destructor: i64) -> i64;
@@ -159,7 +159,9 @@ impl SQLite {
     /// data, never SQL: this is the safe way to use anything from outside.
     pub fn query_params(self: SQLite, sql: str, params: Vec<str>) -> str {
         var stmt: i64 = 0;
-        var tail: str = "";
+        // Out-parameters are word slots: `&s` of a str is the (borrowed)
+        // string itself, so SQLite would write its pointer over the text
+        var tail: i64 = 0;
         var rc = p_sqlite3_prepare_v2(self.handle, sql, -1, &stmt, &tail);
         if rc != SQLITE_OK {
             var msg = p_sqlite3_errmsg(self.handle);
@@ -228,16 +230,17 @@ impl SQLite {
     /// Execute a non-query SQL statement (INSERT/UPDATE/DELETE/CREATE TABLE, etc.)
     /// Returns the number of rows affected.
     pub fn exec(self: SQLite, sql: str) -> i64 {
-        var errmsg: str = "";
+        var errmsg: i64 = 0;
         var rc = p_sqlite3_exec(self.handle, sql, 0, 0, &errmsg);
         if rc != SQLITE_OK {
-            var msg = errmsg;
-            if errmsg != "" {
-                // sqlite3_exec allocates the error message with sqlite3_malloc
-                // We should free it, but we don't have the raw pointer easily.
-                // In practice, the C runtime will clean it up.
+            var msg: str = "";
+            if errmsg != 0 {
+                // sqlite3_exec allocates the message with sqlite3_malloc:
+                // copied, then given back
+                msg = "" + (errmsg as str);
+                p_sqlite3_free(errmsg);
             }
-            // Fall back to sqlite3_errmsg if errmsg is empty
+            // Fall back to sqlite3_errmsg if there is none
             if msg == "" {
                 msg = p_sqlite3_errmsg(self.handle);
             }

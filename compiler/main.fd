@@ -22,6 +22,7 @@ use compiler::compiler;
 use compiler::inc;
 use compiler::pe;
 use compiler::pe_ir;
+use compiler::pe_ir_stubs;
 use compiler::fmt;
 use compiler::lower;
 use compiler::scribe;
@@ -39,6 +40,9 @@ use compiler::elf64;
 use compiler::coff;
 use compiler::macho;
 use compiler::cparser;
+use compiler::iropt;
+use compiler::typechecker;
+use compiler::json;
 
 // --- Global flag state ---------------------------------------------------
 // Parsed from --borrowck= and --timeout flags before command dispatch.
@@ -171,6 +175,7 @@ pub fn main() -> i64 {
     if command == "gpu" { return cmd_gpu(n, start); }
     if command == "verify" { return cmd_verify(n, start); }
     if command == "audit" { return cmd_audit(n, start); }
+    if command == "qualify" { return cmd_qualify(n, start); }
     if command == "sourcemap" { return cmd_sourcemap(n, start); }
     if command == "parse-header" { return cmd_parse_header(n, start); }
     if command == "notebook" { return cmd_notebook(n, start); }
@@ -913,11 +918,41 @@ fn cmd_test(n: i64, start: i64) -> i64 {
     // @constant_time: data-dependent branch on secret — rejected by the
     // source-level checker (not just the asm verifier)
     expected_fail.push("test_ct_asm_fail");
+    // @sensitive (CO7): consent-gated information flow
+    expected_fail.push("test_sensitive_fail");
+    // CO6: a required config key no source supplies panics
+    expected_fail.push("test_config_missing_fail");
+    // Proposal 0002; release L1, K4, K5, H4
+    expected_fail.push("test_generic_infer_fail");
+    expected_fail.push("test_generic_bound_fail");
+    expected_fail.push("test_turbofish_arity_fail");
+    expected_fail.push("test_safety_method_alloc_fail");
+    expected_fail.push("test_safety_indirect_fail");
+    expected_fail.push("test_gas_loop_fail");
+    expected_fail.push("test_tainted_param_fail");
+    expected_fail.push("test_iter_invalidation_fail");
+    expected_fail.push("test_field_borrow_fail");
+    expected_fail.push("test_spawn_send_fail");
+    expected_fail.push("test_safety_recursion_fail");
+    expected_fail.push("test_firmware_os_fail");
+    expected_fail.push("test_bounded_stack_fail");
+    expected_fail.push("test_borrowed_str_return_fail");
+    expected_fail.push("test_borrowed_str_pass_fail");
+    expected_fail.push("test_scoped_store_fail");
+    expected_fail.push("test_race_ptr_fail");
+    // Release E4: a missing DLL, a missing function in a DLL
+    expected_fail.push("test_pe_dll_missing_fail");
+    expected_fail.push("test_pe_dll_nofn_fail");
 
     // Skip list -- tests that fail on C codegen due to missing builtins
     // or legitimate design differences. These pass on interpreter + PE.
     // Reference: src/main.rs:1543-1545
     var skip_tests: Vec<str> = Vec::new();
+    // Bare-only (`fid emit --bare`): a hosted build panics
+    skip_tests.push("test_bare_panic_handler");
+    // Links SQLite (native builds use the system's winsqlite3.dll; the C
+    // path needs an import library)
+    skip_tests.push("test_pe_sqlite");
     // All previously skipped tests now pass on C codegen!
 
     // Filter test files based on --fail mode
@@ -1910,7 +1945,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             // and flags reuses its binary: no C compile.
             var art_path: str = "";
             if !no_cache {
-                art_path = inc_artifact_path(output, inc_canon_hash(c_code), cc, cc_opt + " " + target + extra_libs);
+                art_path = inc_artifact_path(output, inc_canon_hash(c_code), cc, cc_opt + " " + target + extra_libs + " " + env_or_empty("FIDES_CFLAGS"));
                 if inc_artifact_get(art_path, output) {
                     inc_stamp_commit(stamp_path, build_key, c_hash, input, output);
                     print("Reused cached artifact: " + output + "\n");
@@ -1936,6 +1971,10 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                     // through pointer casts; -fno-strict-overflow: wrapping
                     // arithmetic must not be assumed away.
                     var cc_flags: str = " " + gcc_opt + " -w -Wno-int-conversion -Wno-incompatible-pointer-types -fstack-protector-strong -fPIE -fno-strict-overflow -fno-strict-aliasing -o " + output + " " + c_file + " -pie";
+                    // FIDES_CFLAGS: extra C compiler flags, e.g. the
+                    // sanitizers of scripts/sanitize.sh (release M8)
+                    var user_cflags: str = env_or_empty("FIDES_CFLAGS");
+                    if str_len(user_cflags) > 0 { cc_flags = " " + user_cflags + cc_flags; }
                     // The -z options are ELF-only
                     if p_getenv("OS") != "Windows_NT" { cc_flags = cc_flags + " -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack"; }
                     if is_linux() {
@@ -2198,6 +2237,162 @@ fn cmd_gpu(n: i64, start: i64) -> i64 {
 
 // --- cmd_verify ----------------------------------------------------------
 // Verify IR correctness for a Fides source file.
+// --- cmd_qualify -----------------------------------------------------------
+//
+// Release L3/L4: the evidence for one program, as JSON. Each safety rule
+// with the requirement it implements and the tests that prove it (the same
+// table as docs/reference/safety-rules.md), whether the program passes every
+// check, and which of its functions carry which rules. It is evidence, not a
+// certificate: "qualification" stays "NOT_QUALIFIED".
+
+/// id | annotation | requirement | negative tests | positive tests
+fn qualify_rules() -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    r.push("SR-1|@no-alloc|No dynamic allocation: no allocating call, builtin method (push, insert, clone, ...) or string +|test_safety_method_alloc_fail,test_medical_fail|test_medical,test_safety_annotations");
+    r.push("SR-2|@no-recursion|No direct or indirect recursion|test_safety_recursion_fail|test_safety_annotations");
+    r.push("SR-3|@no-unbounded|No while or loop without a bound|test_safety_annotations_fail|test_safety_annotations");
+    r.push("SR-4|@no-panic (@crashfree)|No unwrap, no unchecked division, index or overflowing arithmetic|test_crashfree_fail,test_crashfree_index_fail,test_crashfree_overflow_fail,test_crashfree_method_fail|test_safety_annotations");
+    r.push("SR-5|@no-indirect|No call through a function value, closure or dyn|test_safety_indirect_fail|test_safety_annotations");
+    r.push("SR-6|@requires-audit|A @medical function carries @audit|test_safety_no_audit_fail|test_medical");
+    r.push("SR-7|transitive|An annotated function calls only functions with the same guarantees|test_medical_fail,test_crashfree_method_fail|test_safety_annotations");
+    r.push("SR-8|@firmware|No OS-dependent call (files, sockets, processes, environment)|test_firmware_os_fail|test_os_features");
+    r.push("SR-9|@gas(N)|Static cost, loops with literal bounds counted per trip, within N|test_gas_fail,test_gas_loop_fail|test_gas");
+    r.push("SR-10|@bounded-stack|Nothing reachable recurses or calls through a function value|test_bounded_stack_fail|test_bounded_stack");
+    r.push("SR-11|@deterministic|No IO, time or randomness effect|test_deterministic_fail|test_deterministic");
+    r.push("SR-12|@tainted|A tainted function or parameter reaches no IO or Net effect|test_tainted_param_fail|");
+    r.push("SR-13|@secret|A secret value reaches no output, global, branch or unmarked return|test_secret_output_fail,test_secret_global_fail,test_secret_branch_fail,test_secret_helper_fail,test_secret_return_fail|test_secret");
+    r.push("SR-14|@constant_time|No secret-dependent branch, early return or index|test_constant_time_fail,test_constant_time_branch_fail,test_constant_time_index_fail|test_constant_time");
+    r.push("SR-15|sandbox|Code in a sandbox block uses only granted capabilities|test_sandbox_fail,test_sandbox_alloc_fail|test_sandbox");
+    r.push("SR-16|@send|A spawned call's arguments and captures are @send|test_spawn_send_fail,test_send_fail|test_async");
+    r.push("SR-17|borrows|No change to a Vec a for loop walks; no field assignment while borrowed|test_iter_invalidation_fail,test_field_borrow_fail|test_borrowck");
+    return r;
+}
+
+fn qualify_json_list(csv: str, dir: str) -> str {
+    var out: str = "[";
+    if str_len(csv) == 0 { return "[]"; }
+    val items: Vec<str> = str_split(csv, ",");
+    var i: i64 = 0;
+    while i < items.len() {
+        val t: str = items.get(i);
+        if i > 0 { out = out + ", "; }
+        var present: str = "false";
+        if c_file_exists(c_path_join(dir, t + ".fd")) { present = "true"; }
+        out = out + "{\"test\": \"" + t + "\", \"present\": " + present + "}";
+        i = i + 1;
+    }
+    return out + "]";
+}
+
+fn cmd_qualify(n: i64, start: i64) -> i64 {
+    if start + 2 > n {
+        p_eprint_str("Usage: fid qualify <file.fd> [-o out.json]\n");
+        return 1;
+    }
+    val input: str = p_argv(start + 1);
+    var out_path: str = "";
+    var ai: i64 = start + 2;
+    while ai + 1 < n {
+        if p_argv(ai) == "-o" { out_path = p_argv(ai + 1); }
+        ai = ai + 1;
+    }
+    val source: str = c_file_read(input);
+    if str_len(source) == 0 {
+        p_eprint_str("Error: could not read file: " + input + "\n");
+        return 1;
+    }
+    // tests/bootstrap beside the stdlib (a checkout or an install)
+    val test_dir: str = c_path_join(c_path_join(c_path_join(stdlib_dir(), ".."), "tests"), "bootstrap");
+
+    var checks: str = "passed";
+    var errors: Vec<str> = Vec::new();
+    var annotated: str = "";
+    var annotated_count: i64 = 0;
+    match build_program_with_path_borrowck(source, OptStr::Some(input), "on") {
+        ResultProgram::Ok(program) => {
+            var fi: i64 = 0;
+            while fi < program.funcs.len() {
+                val f: Func = program.funcs.get(fi);
+                if program_func_is_user(f.name, source) {
+                    val prims: Vec<str> = expand_safety_primitives(f.annotations);
+                    var anns: str = "";
+                    var k: i64 = 0;
+                    while k < f.annotations.len() {
+                        if k > 0 { anns = anns + ", "; }
+                        anns = anns + "\"@" + f.annotations.get(k).name + "\"";
+                        k = k + 1;
+                    }
+                    if prims.len() > 0 || f.annotations.len() > 0 {
+                        var ps: str = "";
+                        k = 0;
+                        while k < prims.len() {
+                            if k > 0 { ps = ps + ", "; }
+                            ps = ps + "\"" + prims.get(k) + "\"";
+                            k = k + 1;
+                        }
+                        if annotated_count > 0 { annotated = annotated + ",\n"; }
+                        annotated = annotated + "    {\"function\": \"" + f.name + "\", \"annotations\": [" + anns + "], \"rules\": [" + ps + "]}";
+                        annotated_count = annotated_count + 1;
+                    }
+                }
+                fi = fi + 1;
+            }
+        }
+        ResultProgram::Err(errs) => {
+            checks = "failed";
+            errors = errs;
+        }
+    }
+
+    var j: str = "{\n";
+    j = j + "  \"tool\": \"fid\",\n";
+    j = j + "  \"compilerHash\": \"" + int_to_str(inc_compiler_hash()) + "\",\n";
+    j = j + "  \"source\": \"" + json_escape_string(input) + "\",\n";
+    j = j + "  \"sourceHash\": \"" + int_to_str(hash_source(source)) + "\",\n";
+    j = j + "  \"checks\": \"" + checks + "\",\n";
+    j = j + "  \"errors\": [";
+    var ei: i64 = 0;
+    while ei < errors.len() {
+        if ei > 0 { j = j + ", "; }
+        j = j + "\"" + json_escape_string(errors.get(ei)) + "\"";
+        ei = ei + 1;
+    }
+    j = j + "],\n";
+    j = j + "  \"annotatedFunctions\": [\n" + annotated + "\n  ],\n";
+    j = j + "  \"rules\": [\n";
+    val rules: Vec<str> = qualify_rules();
+    var missing: i64 = 0;
+    var ri: i64 = 0;
+    while ri < rules.len() {
+        val parts: Vec<str> = str_split(rules.get(ri), "|");
+        val neg: str = qualify_json_list(parts.get(3), test_dir);
+        val pos: str = qualify_json_list(parts.get(4), test_dir);
+        if str_contains(neg, "\"present\": false") || str_len(parts.get(3)) == 0 { missing = missing + 1; }
+        if ri > 0 { j = j + ",\n"; }
+        j = j + "    {\"id\": \"" + parts.get(0) + "\", \"rule\": \"" + parts.get(1) + "\", \"requirement\": \"" + json_escape_string(parts.get(2)) + "\", \"negativeTests\": " + neg + ", \"positiveTests\": " + pos + "}";
+        ri = ri + 1;
+    }
+    j = j + "\n  ],\n";
+    j = j + "  \"rulesWithoutNegativeTest\": " + int_to_str(missing) + ",\n";
+    j = j + "  \"qualification\": \"NOT_QUALIFIED\",\n";
+    j = j + "  \"note\": \"Evidence for review, not a certificate: no certification body has assessed this toolchain.\"\n";
+    j = j + "}\n";
+    if str_len(out_path) > 0 {
+        p_file_write(out_path, j);
+        p_eprint_str("Wrote " + out_path + "\n");
+    } else {
+        print(j);
+    }
+    if checks == "passed" { return 0; }
+    return 1;
+}
+
+/// Whether a function name is defined in the program's own source (not in
+/// the stdlib merged into it).
+fn program_func_is_user(name: str, source: str) -> bool {
+    return str_contains(source, "fn " + name + "(") || str_contains(source, "fn " + name + "<");
+}
+
 // --- cmd_audit -------------------------------------------------------------
 // CM10: every `unsafe` block, @unsafe function and extern "C" declaration in
 // the program and the modules it uses (transitively), each with the
@@ -2403,7 +2598,7 @@ fn cmd_sourcemap(n: i64, start: i64) -> i64 {
 // Parse a C header file and emit Fides FFI bindings.
 fn cmd_parse_header(n: i64, start: i64) -> i64 {
     if start + 2 > n {
-        p_eprint_str("Usage: fid parse-header <file.h> [-o output.fd]\n");
+        p_eprint_str("Usage: fid parse-header <file.h> [-o output.fd] [--link <lib>]\n");
         return 1;
     }
     var input: str = p_argv(start + 1);
@@ -2415,10 +2610,24 @@ fn cmd_parse_header(n: i64, start: i64) -> i64 {
     }
     var base: str = input;
     var slash: i64 = str_rfind_char(input, 47);
+    var bslash: i64 = str_rfind_char(input, 92);
+    if bslash > slash { slash = bslash; }
     if slash >= 0 { base = str_slice(input, slash + 1, str_len(input)); }
-    var include: str = "\"" + base + "\"";
-    var decls: Vec<CExternDecl> = parse_header(source, include);
-    var bindings: str = generate_pledge_bindings(decls, include);
+    var stem: str = base;
+    if str_ends_with(stem, ".h") { stem = str_slice(stem, 0, str_len(stem) - 2); }
+    // --link <lib>: the library of the extern block (default: the header's name)
+    var link: str = get_flag_value(n, start, "--link", stem);
+    // With -o x.fd the bindings are module x (usable with `use x;`)
+    var module_name: str = "";
+    if str_len(output) > 0 {
+        module_name = output;
+        var os: i64 = str_rfind_char(module_name, 47);
+        var ob: i64 = str_rfind_char(module_name, 92);
+        if ob > os { os = ob; }
+        if os >= 0 { module_name = str_slice(module_name, os + 1, str_len(module_name)); }
+        if str_ends_with(module_name, ".fd") { module_name = str_slice(module_name, 0, str_len(module_name) - 3); }
+    }
+    var bindings: str = cparse_header_file(input, link, module_name);
     if str_len(output) > 0 {
         p_file_write(output, bindings);
         p_eprint_str("Generated " + input + " bindings -> " + output + "\n");
@@ -2448,6 +2657,8 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     var use_native: bool = has_flag(n, start, "--native");
     // --bare: bare-metal mode (skip stdlib, flat binary)
     var bare_mode: bool = has_flag(n, start, "--bare");
+    // --checked-alloc: native blocks on pages of their own (release M7)
+    if has_flag(n, start, "--checked-alloc") { g_pe_checked_alloc = true; }
     // --boot: multiboot2 boot mode (skip stdlib, generate boot binary)
     var boot_mode: bool = has_flag(n, start, "--boot");
     // --caps <list>: capability restrictions
@@ -2531,6 +2742,46 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         }
     }
 
+    // --elf (or --target linux): a static Linux x86-64 executable from the
+    // native code generator (release F4, first step: no stdlib yet)
+    if has_flag(n, start, "--elf") || target == "linux" || target == "x86_64-linux" {
+        var elf_out: str = find_output_arg(n, start, "a.out");
+        p_eprint_str("[build] ELF mode: static Linux x86-64 executable (no stdlib yet)...\n");
+        var elf_result: ResultProgram = build_program_no_std(source, OptStr::Some(input));
+        match elf_result {
+            ResultProgram::Err(errs) => {
+                print("Compilation errors:\n");
+                var eei: i64 = 0;
+                while eei < errs.len() {
+                    print(errs.get(eei));
+                    print("\n");
+                    eei = eei + 1;
+                }
+                return 1;
+            }
+            ResultProgram::Ok(program) => {
+                var elf_ir: IrModule = lower(program);
+                match pe_ir_generate_elf(elf_ir) {
+                    ResultBytes::Ok(eb) => {
+                        p_file_write_vec(elf_out, eb);
+                        print("Emitted Linux executable: " + elf_out + " (" + int_to_str(eb.len()) + " bytes, static, no stdlib)\n");
+                        return 0;
+                    }
+                    ResultBytes::Err(errs2) => {
+                        print("Compilation errors:\n");
+                        var eej: i64 = 0;
+                        while eej < errs2.len() {
+                            print(errs2.get(eej));
+                            print("\n");
+                            eej = eej + 1;
+                        }
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+
     // --bare mode: flat binary (no stdlib)
     if bare_mode {
         p_eprint_str("[build] Bare mode: generating flat binary...\n");
@@ -2547,19 +2798,44 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 return 1;
             }
             ResultProgram::Ok(program) => {
+                // The @panic_handler a panic (and a failed check) calls
+                var handler: str = "";
+                var hfi: i64 = 0;
+                while hfi < program.funcs.len() {
+                    var hf: Func = program.funcs.get(hfi);
+                    var hai: i64 = 0;
+                    while hai < hf.annotations.len() {
+                        var an: str = hf.annotations.get(hai).name;
+                        if an == "panic_handler" || an == "@panic_handler" { handler = hf.name; }
+                        hai = hai + 1;
+                    }
+                    hfi = hfi + 1;
+                }
                 p_eprint_str("[build] Lowering to IR...\n");
                 var ir_mod: IrModule = lower(program);
-                var l1: L1Module = lower_ir_to_l1(&ir_mod);
-                var l2: L2Module = lower_l1_to_l2(&l1);
-                var l3: L3Module = lower_l2_to_l3(&l2, &ir_mod);
-                p_eprint_str("[build] Generating flat binary...\n");
-                var bin: Vec = generate_flat_binary(ir_mod, l3);
-                p_file_write_vec(output, bin);
+                p_eprint_str("[build] Generating flat binary (pe_ir)...\n");
+                var bin: Vec = Vec::new();
+                match pe_ir_generate_flat(ir_mod, handler) {
+                    ResultBytes::Ok(b) => { bin = b; }
+                    ResultBytes::Err(errs) => {
+                        print("Compilation errors:\n");
+                        var bei: i64 = 0;
+                        while bei < errs.len() {
+                            print(errs.get(bei));
+                            print("\n");
+                            bei = bei + 1;
+                        }
+                        return 1;
+                    }
+                }
+                // A flat binary is not an .exe: the -o name as given
+                var bare_out: str = find_output_arg(n, start, "a.bin");
+                p_file_write_vec(bare_out, bin);
                 print("Emitted bare-metal binary: ");
-                print(output);
+                print(bare_out);
                 print(" (");
                 print(int_to_str(bin.len()));
-                print(" bytes, no stdlib, no PE headers)\n");
+                print(" bytes, no stdlib, no PE headers, load at 0x10000)\n");
                 return 0;
             }
         }
@@ -2604,6 +2880,8 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
 
             // Windows default: direct IR -> PE machine code (pe_ir backend)
             if windows_pe {
+                // Inlining and folding before machine code (release D5, D6)
+                if do_opt { iropt_native(&mut ir_mod); }
                 p_eprint_str("[build] Emitting PE via pe_ir backend...\n");
                 var pe_res: ResultBytes = pe_ir_generate_pe(ir_mod);
                 match pe_res {
@@ -2706,6 +2984,7 @@ fn print_usage() {
     p_eprint_str("  fid build-x86 <file.fd> [-o <out>]    Linux ELF via x86 stack-machine backend\n");
     p_eprint_str("  fid emit     <file.fd> --boot -o <out>  Multiboot2 kernel binary\n");
     p_eprint_str("  fid emit     <file.fd> --bare -o <out>  Bare-metal flat binary\n");
+    p_eprint_str("  fid emit     <file.fd> --elf -o <out>   Static Linux x86-64 executable (no stdlib yet)\n");
     p_eprint_str("  fid run      <file.fd>                Compile + execute\n");
     p_eprint_str("  fid tokens   <file.fd>                Show tokens\n");
     p_eprint_str("  fid ast      <file.fd>                Show AST summary\n");
@@ -2736,8 +3015,9 @@ fn print_usage() {
     p_eprint_str("                                           Generate GPU code\n");
     p_eprint_str("  fid verify   <file.fd>              Verify IR correctness\n");
     p_eprint_str("  fid audit    <file.fd> [--stdlib] [--strict]  List the unsafe code it can reach\n");
+    p_eprint_str("  fid qualify  <file.fd> [-o out.json]  Safety evidence: rules, their tests, the program's annotations\n");
     p_eprint_str("  fid sourcemap <file.fd>             Show IR-to-source mapping\n");
-    p_eprint_str("  fid parse-header <file.h> [-o <fd>] Generate FFI bindings from C header\n");
+    p_eprint_str("  fid parse-header <file.h> [-o <fd>] [--link <lib>] FFI bindings from a C header\n");
 }
 
 

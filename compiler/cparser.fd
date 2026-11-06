@@ -1,11 +1,27 @@
-// cparser.fd -- C Header Parser for auto-generating Fides FFI bindings
-// Ported from src/cparser.rs.
+// cparser.fd -- C header parser: Fides FFI bindings from real headers
+// (release E5).
 //
-// Parses C function declarations from .h files and generates Fides
-// `extern "C"` declarations. Supports basic C types, pointers, and
-// function prototypes.
+// `fid parse-header <file.h> [-o out.fd] [--link lib]` reads a header and the
+// headers it includes with `#include "..."` (same folder), and writes:
+//   - `pub const` for every `#define` and enum value that is an integer
+//     constant expression (macros, casts, shifts and function-like macros
+//     included);
+//   - one `extern "C" link "lib" { ... }` block with every function
+//     prototype, its C types mapped to Fides ones;
+//   - a comment naming each function it could not express, and why.
 //
-// Usage: fidesc parse-header <file.h> [-o output.fd]
+// It is not a C compiler. Conditionals (`#if`, `#ifdef`) are not evaluated:
+// every branch is read, and the first definition that resolves wins.
+// Macros that expand to nothing or only to attributes (`SQLITE_API`,
+// `DECLSPEC`, `SDLCALL`, `__declspec(..)`, `__attribute__((..))`) are
+// dropped. Types:
+//   char*, const char*              str
+//   T* for an integer or float T    *T
+//   T** and any deeper pointer      *i64
+//   other pointers, function ptrs   i64 (an address)
+//   enums                           i32
+//   C `long`                        i32 (the Windows x64 ABI)
+//   a struct by value, va_list, `...`  not expressible yet: skipped
 
 module compiler::cparser;
 
@@ -13,480 +29,1135 @@ use core;
 use vec;
 use string;
 
-// --- Structs ------------------------------------------------------------
+// --- Token kinds ----------------------------------------------------------
 
-/// A C type mapped to Fides
-pub enum CType {
-    CI8,
-    CI16,
-    CI32,
-    CI64,
-    CU8,
-    CU16,
-    CU32,
-    CU64,
-    CF32,
-    CF64,
-    CBool,
-    CVoid,
-    CStr,
-    CNamed(str),
-    CRef(CType),
+const CTK_IDENT: i64 = 1;
+const CTK_NUM: i64 = 2;
+const CTK_PUNCT: i64 = 3;
+const CTK_STR: i64 = 4;
+const CTK_CHAR: i64 = 5;
+
+/// The state of one parse: macros, headers read, the code, the types seen.
+pub struct CHeaderState {
+    // Macros: name -> 1 + index
+    pub macro_index: i64,
+    pub macro_names: Vec<str>,
+    pub macro_bodies: Vec<str>,
+    // "" for an object-like macro, else its parameters joined by ","
+    // ("()" for none)
+    pub macro_params: Vec<str>,
+    // 1 noise (expands to nothing or attributes), 0 not, -1 not decided
+    pub macro_noise: Vec<i64>,
+    pub included: Vec<str>,
+    pub code: StringBuilder,
+    // Tokens of the code
+    pub toks: Vec<str>,
+    pub kinds: Vec<i64>,
+    // typedef name -> 1 + index; its base and pointer depth
+    pub td_index: i64,
+    pub td_names: Vec<str>,
+    pub td_base: Vec<str>,
+    pub td_ptr: Vec<i64>,
+    // Constants: name -> 1 + index
+    pub const_index: i64,
+    pub const_names: Vec<str>,
+    pub const_values: Vec<i64>,
+    // Functions written, and the ones skipped
+    pub fn_index: i64,
+    pub fn_lines: Vec<str>,
+    pub skipped: Vec<str>,
 }
 
-/// A function parameter
-pub struct CParam {
-    pub name: str,
-    pub ty: CType,
-}
-
-pub fn CParam_new(name: str, ty: CType) -> CParam {
-    return CParam { name: name, ty: ty };
-}
-
-/// An extern declaration
-pub struct CExternDecl {
-    pub abi: str,
-    pub c_name: str,
-    pub pledge_name: str,
-    pub params: Vec<CParam>,
-    pub ret_ty: CType,
-    pub include: str,
-    pub link_lib: str,
-}
-
-pub fn CExternDecl_new(abi: str, c_name: str, pledge_name: str, params: Vec<CParam>, ret_ty: CType, include: str, link_lib: str) -> CExternDecl {
-    return CExternDecl {
-        abi: abi,
-        c_name: c_name,
-        pledge_name: pledge_name,
-        params: params,
-        ret_ty: ret_ty,
-        include: include,
-        link_lib: link_lib,
+pub fn CHeaderState_new() -> CHeaderState {
+    return CHeaderState {
+        macro_index: HashMap_new(),
+        macro_names: Vec::new(),
+        macro_bodies: Vec::new(),
+        macro_params: Vec::new(),
+        macro_noise: Vec::new(),
+        included: Vec::new(),
+        code: StringBuilder::new(),
+        toks: Vec::new(),
+        kinds: Vec::new(),
+        td_index: HashMap_new(),
+        td_names: Vec::new(),
+        td_base: Vec::new(),
+        td_ptr: Vec::new(),
+        const_index: HashMap_new(),
+        const_names: Vec::new(),
+        const_values: Vec::new(),
+        fn_index: HashMap_new(),
+        fn_lines: Vec::new(),
+        skipped: Vec::new(),
     };
 }
 
-// --- Public API ---
+// --- Public API -----------------------------------------------------------
 
-/// Parse a C header file and extract function declarations.
-pub fn parse_header(source: str, include: str) -> Vec<CExternDecl> {
-    var decls: Vec<CExternDecl> = Vec::new();
-    var seen_names: Vec<str> = Vec::new();
+/// Bindings for the header at `path` (and the headers it includes), as
+/// Fides source. `link` is the library for the `extern` block; `module_name`
+/// becomes the `module` line ("" for none).
+pub fn cparse_header_file(path: str, link: str, module_name: str) -> str {
+    var st: CHeaderState = CHeaderState_new();
+    cp_load_file(&mut st, path);
+    var code: str = st.code.to_str();
+    cp_tokenize(&mut st, code);
+    cp_parse_decls(&mut st);
+    cp_collect_define_consts(&mut st);
+    return cp_render(&mut st, path, link, module_name);
+}
 
-    // Strip comments
-    var cleaned: str = strip_comments(source);
+// --- Small string helpers -------------------------------------------------
 
-    // Tokenize into lines and look for function declarations
-    var lines: Vec<str> = str_lines(cleaned);
+fn cp_is_ident_start(c: i64) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+}
+
+fn cp_is_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+fn cp_is_ident_char(c: i64) -> bool {
+    return cp_is_ident_start(c) || cp_is_digit(c);
+}
+
+fn cp_is_space(c: i64) -> bool {
+    return c == 32 || c == 9 || c == 13 || c == 10 || c == 12 || c == 11;
+}
+
+fn cp_dir_of(path: str) -> str {
+    var i: i64 = str_len(path) - 1;
+    while i >= 0 {
+        var c: i64 = str_byte_at(path, i);
+        if c == 47 || c == 92 { return str_slice(path, 0, i + 1); }
+        i = i - 1;
+    }
+    return "";
+}
+
+fn cp_base_name(path: str) -> str {
+    var d: str = cp_dir_of(path);
+    return str_slice(path, str_len(d), str_len(path));
+}
+
+fn cp_strs_has(v: Vec<str>, s: str) -> bool {
     var i: i64 = 0;
-    while i < lines.len() {
-        var line: str = str_trim(lines.get(i));
-
-        // Skip preprocessor directives, empty lines, typedefs, structs, etc.
-        if str_len(line) == 0 || str_starts_with(line, "#") || str_starts_with(line, "typedef")
-            || str_starts_with(line, "struct") || str_starts_with(line, "enum")
-            || str_starts_with(line, "union") || str_starts_with(line, "extern")
-            || str_starts_with(line, "static") || str_starts_with(line, "inline")
-        {
-            i = i + 1;
-            continue;
-        }
-
-        // Collect lines until we find a semicolon
-        var full_decl: str = line;
-        while !cp_str_contains(full_decl, ";") && i + 1 < lines.len() {
-            i = i + 1;
-            full_decl = full_decl + " " + str_trim(lines.get(i));
-        }
-
-        if cp_str_contains(full_decl, "(") && cp_str_contains(full_decl, ")") && cp_str_contains(full_decl, ";") {
-            var decl_result: OptionCExternDecl = parse_c_function(full_decl, include);
-            match decl_result {
-                OptionCExternDecl::Some(decl) => {
-                    if !seen_names_contains(seen_names, decl.c_name) {
-                        seen_names.push(decl.c_name);
-                        decls.push(decl);
-                    }
-                }
-                OptionCExternDecl::None => {}
-            }
-        }
-
-        i = i + 1;
-    }
-
-    return decls;
-}
-
-// --- Comment stripping ---
-
-fn strip_comments(source: str) -> str {
-    var result: str = "";
-    var i: i64 = 0;
-    var len: i64 = str_len(source);
-    while i < len {
-        var c: i64 = str_byte_at(source, i);
-        if c == 47 { // '/'
-            if i + 1 < len {
-                var next: i64 = str_byte_at(source, i + 1);
-                if next == 47 { // '//'
-                    // Line comment -- skip to end of line
-                    i = i + 2;
-                    while i < len && str_byte_at(source, i) != 10 {
-                        i = i + 1;
-                    }
-                    continue;
-                } else if next == 42 { // '*'
-                    // Block comment -- skip to */
-                    i = i + 2;
-                    while i + 1 < len {
-                        if str_byte_at(source, i) == 42 && str_byte_at(source, i + 1) == 47 {
-                            i = i + 2;
-                            break;
-                        }
-                        i = i + 1;
-                    }
-                    if i + 1 >= len { i = len; }
-                    continue;
-                }
-            }
-        }
-        result = result + str_from_byte(c);
-        i = i + 1;
-    }
-    return result;
-}
-
-// --- Option type for CExternDecl ---
-
-pub enum OptionCExternDecl { Some(CExternDecl), None }
-
-// --- Parse a single C function declaration ---
-
-fn parse_c_function(decl: str, include: str) -> OptionCExternDecl {
-    // Trim and remove trailing semicolon
-    var d: str = str_trim(decl);
-    d = str_trim_end_char(d, ";");
-    d = str_trim(d);
-
-    // Find the opening paren
-    var paren_pos: i64 = cp_str_find_char(d, "(");
-    if paren_pos < 0 { return OptionCExternDecl::None; }
-
-    var before_paren: str = str_slice(d, 0, paren_pos);
-    before_paren = str_trim(before_paren);
-    var params_str: str = str_slice(d, paren_pos + 1, str_len(d));
-    params_str = str_trim_end_char(params_str, ")");
-    params_str = str_trim(params_str);
-
-    // The function name is the last identifier before the paren
-    var name_start: i64 = str_rfind_space(before_paren);
-    if name_start < 0 { return OptionCExternDecl::None; }
-
-    var ret_type_str: str = str_trim(str_slice(before_paren, 0, name_start));
-    var name: str = str_trim(str_slice(before_paren, name_start, str_len(before_paren)));
-
-    // Skip if name is empty or starts with non-identifier
-    if str_len(name) == 0 { return OptionCExternDecl::None; }
-    var first: i64 = str_byte_at(name, 0);
-    if !is_alpha(first) && first != 95 { return OptionCExternDecl::None; }
-
-    // Skip common non-function patterns
-    if name == "if" || name == "while" || name == "for" || name == "switch" {
-        return OptionCExternDecl::None;
-    }
-
-    var ret_ty_result: OptionCType = parse_c_type(ret_type_str);
-    var ret_ty: CType;
-    match ret_ty_result {
-        OptionCType::Some(t) => { ret_ty = t; }
-        OptionCType::None => { return OptionCExternDecl::None; }
-    }
-
-    var params: Vec<CParam> = parse_c_params(params_str);
-
-    return OptionCExternDecl::Some(CExternDecl_new(
-        "C",
-        name,
-        name,
-        params,
-        ret_ty,
-        include,
-        ""
-    ));
-}
-
-// --- Option type for CType ---
-
-pub enum OptionCType { Some(CType), None }
-
-// --- Parse a C type string into a Fides type ---
-
-fn parse_c_type(c_type: str) -> OptionCType {
-    var t: str = str_trim(c_type);
-    // Remove qualifiers
-    t = str_replace(t, "const ", "");
-    t = str_replace(t, "volatile ", "");
-    t = str_replace(t, "register ", "");
-    t = str_trim(t);
-
-    // Handle pointer types
-    if str_ends_with(t, "*") {
-        var base: str = str_trim(str_slice(t, 0, str_len(t) - 1));
-        if base == "char" || base == "void" {
-            return OptionCType::Some(CType::CStr);
-        }
-        var inner_result: OptionCType = parse_c_type(base);
-        match inner_result {
-            OptionCType::Some(inner) => {
-                return OptionCType::Some(CType::CRef(inner));
-            }
-            OptionCType::None => { return OptionCType::None; }
-        }
-    }
-
-    // Map C types to Fides types
-    if t == "int" || t == "signed int" || t == "signed" {
-        return OptionCType::Some(CType::CI32);
-    }
-    if t == "long" || t == "signed long" || t == "long int" {
-        return OptionCType::Some(CType::CI64);
-    }
-    if t == "long long" || t == "long long int" || t == "signed long long" {
-        return OptionCType::Some(CType::CI64);
-    }
-    if t == "short" || t == "short int" || t == "signed short" {
-        return OptionCType::Some(CType::CI16);
-    }
-    if t == "char" || t == "signed char" {
-        return OptionCType::Some(CType::CI8);
-    }
-    if t == "unsigned" || t == "unsigned int" {
-        return OptionCType::Some(CType::CU32);
-    }
-    if t == "unsigned long" || t == "unsigned long int" {
-        return OptionCType::Some(CType::CU64);
-    }
-    if t == "unsigned long long" || t == "unsigned long long int" {
-        return OptionCType::Some(CType::CU64);
-    }
-    if t == "unsigned short" || t == "unsigned short int" {
-        return OptionCType::Some(CType::CU16);
-    }
-    if t == "unsigned char" {
-        return OptionCType::Some(CType::CU8);
-    }
-    if t == "float" { return OptionCType::Some(CType::CF32); }
-    if t == "double" { return OptionCType::Some(CType::CF64); }
-    if t == "long double" { return OptionCType::Some(CType::CF64); }
-    if t == "void" { return OptionCType::Some(CType::CVoid); }
-    if t == "size_t" { return OptionCType::Some(CType::CU64); }
-    if t == "ssize_t" { return OptionCType::Some(CType::CI64); }
-    if t == "int8_t" { return OptionCType::Some(CType::CI8); }
-    if t == "int16_t" { return OptionCType::Some(CType::CI16); }
-    if t == "int32_t" { return OptionCType::Some(CType::CI32); }
-    if t == "int64_t" { return OptionCType::Some(CType::CI64); }
-    if t == "uint8_t" { return OptionCType::Some(CType::CU8); }
-    if t == "uint16_t" { return OptionCType::Some(CType::CU16); }
-    if t == "uint32_t" { return OptionCType::Some(CType::CU32); }
-    if t == "uint64_t" { return OptionCType::Some(CType::CU64); }
-
-    // Unknown type -- map to opaque named type
-    return OptionCType::Some(CType::CNamed(t));
-}
-
-// --- Parse C function parameters ---
-
-fn parse_c_params(params_str: str) -> Vec<CParam> {
-    var params: Vec<CParam> = Vec::new();
-    var trimmed: str = str_trim(params_str);
-    if str_len(trimmed) == 0 || trimmed == "void" {
-        return params;
-    }
-
-    // Split by comma, handling nested parens
-    var depth: i64 = 0;
-    var current: str = "";
-    var i: i64 = 0;
-    while i < str_len(params_str) {
-        var c: i64 = str_byte_at(params_str, i);
-        if c == 40 { // '('
-            depth = depth + 1;
-            current = current + str_from_byte(c);
-        } else if c == 41 { // ')'
-            depth = depth - 1;
-            current = current + str_from_byte(c);
-        } else if c == 44 && depth == 0 { // ','
-            var p_result: OptionParam = parse_c_param(current);
-            match p_result {
-                OptionParam::Some(p) => { params.push(p); }
-                OptionParam::None => {}
-            }
-            current = "";
-        } else {
-            current = current + str_from_byte(c);
-        }
-        i = i + 1;
-    }
-
-    if str_len(str_trim(current)) > 0 {
-        var p_result: OptionParam = parse_c_param(current);
-        match p_result {
-            OptionParam::Some(p) => { params.push(p); }
-            OptionParam::None => {}
-        }
-    }
-
-    return params;
-}
-
-// --- Option type for CParam ---
-
-pub enum OptionParam { Some(CParam), None }
-
-// --- Parse a single C parameter ---
-
-fn parse_c_param(param: str) -> OptionParam {
-    var p: str = str_trim(param);
-    // Remove qualifiers
-    p = str_replace(p, "const ", "");
-    p = str_replace(p, "restrict", "");
-    p = str_trim(p);
-
-    // Handle pointer types -- name is after the last *
-    if cp_str_contains(p, "*") {
-        // Find the last *
-        var star_pos: i64 = cp_str_rfind_char(p, "*");
-        var base_type: str = str_trim(str_slice(p, 0, star_pos));
-        var name: str = str_trim(str_slice(p, star_pos + 1, str_len(p)));
-        var ty: CType;
-        if base_type == "char" {
-            ty = CType::CStr;
-        } else {
-            var inner_result: OptionCType = parse_c_type(base_type);
-            match inner_result {
-                OptionCType::Some(inner) => { ty = CType::CRef(inner); }
-                OptionCType::None => { return OptionParam::None; }
-            }
-        }
-        var pname: str = name;
-        if str_len(pname) == 0 { pname = "arg0"; }
-        return OptionParam::Some(CParam_new(pname, ty));
-    }
-
-    // Non-pointer: split type and name
-    var last_space: i64 = str_rfind_space(p);
-    if last_space < 0 { return OptionParam::None; }
-    var type_str: str = str_trim(str_slice(p, 0, last_space));
-    var name: str = str_trim(str_slice(p, last_space, str_len(p)));
-
-    var ty_result: OptionCType = parse_c_type(type_str);
-    match ty_result {
-        OptionCType::Some(ty) => {
-            var pname: str = name;
-            if str_len(pname) == 0 { pname = "arg"; }
-            return OptionParam::Some(CParam_new(pname, ty));
-        }
-        OptionCType::None => { return OptionParam::None; }
-    }
-}
-
-// --- Generate Fides source code from extern declarations ---
-
-pub fn generate_pledge_bindings(decls: Vec<CExternDecl>, include: str) -> str {
-    var out: str = "// Auto-generated Fides FFI bindings from C header\n";
-    out = out + "extern \"C\" include \"" + include + "\" {\n";
-
-    var i: i64 = 0;
-    while i < decls.len() {
-        var decl: CExternDecl = decls.get(i);
-        var ret: str = type_to_pledge(decl.ret_ty);
-        var params_str: str = "";
-        var j: i64 = 0;
-        while j < decl.params.len() {
-            var p: CParam = decl.params.get(j);
-            if j > 0 { params_str = params_str + ", "; }
-            params_str = params_str + p.name + ": " + type_to_pledge(p.ty);
-            j = j + 1;
-        }
-        out = out + "    fn " + decl.c_name + "(" + params_str + ") -> " + ret + ";\n";
-        i = i + 1;
-    }
-    out = out + "}\n";
-    return out;
-}
-
-fn type_to_pledge(ty: CType) -> str {
-    match ty {
-        CType::CI8 => { return "i8"; }
-        CType::CI16 => { return "i16"; }
-        CType::CI32 => { return "i32"; }
-        CType::CI64 => { return "i64"; }
-        CType::CU8 => { return "u8"; }
-        CType::CU16 => { return "u16"; }
-        CType::CU32 => { return "u32"; }
-        CType::CU64 => { return "u64"; }
-        CType::CF32 => { return "f32"; }
-        CType::CF64 => { return "f64"; }
-        CType::CBool => { return "bool"; }
-        CType::CVoid => { return "void"; }
-        CType::CStr => { return "str"; }
-        CType::CNamed(n) => { return n; }
-        CType::CRef(inner) => { return "&" + type_to_pledge(inner); }
-    }
-    return "*u8";
-}
-
-// --- Local helpers ---
-
-fn seen_names_contains(names: Vec<str>, name: str) -> bool {
-    var i: i64 = 0;
-    while i < names.len() {
-        if names.get(i) == name { return true; }
+    while i < v.len() {
+        if v.get(i) == s { return true; }
         i = i + 1;
     }
     return false;
 }
 
-fn is_alpha(c: i64) -> bool {
-    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
-}
+// --- Loading: comments, line splices, #include, #define --------------------
 
-pub fn str_from_byte(b: i64) -> str {
-    var buf: Vec<i64> = Vec::new();
-    buf.push(b);
-    return str_from_bytes(buf);
-}
-
-fn cp_str_contains(s: str, substr: str) -> bool {
-    return str_find(s, substr) >= 0;
-}
-
-fn cp_str_find_char(s: str, ch: i64) -> i64 {
+/// Text without comments, with backslash-newline splices joined.
+fn cp_strip(src: str) -> str {
+    var out: StringBuilder = StringBuilder::new();
+    var n: i64 = str_len(src);
     var i: i64 = 0;
-    while i < str_len(s) {
-        if str_byte_at(s, i) == ch { return i; }
+    var run: i64 = 0; // start of the text not yet copied
+    while i < n {
+        var c: i64 = str_byte_at(src, i);
+        if c == 47 && i + 1 < n && str_byte_at(src, i + 1) == 47 {
+            out.append_str(str_slice_len(src, n, run, i));
+            while i < n && str_byte_at(src, i) != 10 { i = i + 1; }
+            run = i;
+        } else if c == 47 && i + 1 < n && str_byte_at(src, i + 1) == 42 {
+            out.append_str(str_slice_len(src, n, run, i));
+            i = i + 2;
+            while i + 1 < n && !(str_byte_at(src, i) == 42 && str_byte_at(src, i + 1) == 47) {
+                // keep line breaks, so directives stay on their own lines
+                if str_byte_at(src, i) == 10 { out.append_str("\n"); }
+                i = i + 1;
+            }
+            i = i + 2;
+            out.append_str(" ");
+            run = i;
+        } else if c == 34 || c == 39 {
+            // a string or character literal: copied as it is
+            i = i + 1;
+            while i < n && str_byte_at(src, i) != c && str_byte_at(src, i) != 10 {
+                if str_byte_at(src, i) == 92 { i = i + 1; }
+                i = i + 1;
+            }
+            i = i + 1;
+        } else if c == 92 && i + 1 < n && (str_byte_at(src, i + 1) == 10
+            || (str_byte_at(src, i + 1) == 13 && i + 2 < n && str_byte_at(src, i + 2) == 10)) {
+            out.append_str(str_slice_len(src, n, run, i));
+            if str_byte_at(src, i + 1) == 13 { i = i + 3; } else { i = i + 2; }
+            run = i;
+        } else {
+            i = i + 1;
+        }
+    }
+    if run < n { out.append_str(str_slice_len(src, n, run, n)); }
+    return out.to_str();
+}
+
+fn cp_load_file(st: &mut CHeaderState, path: str) {
+    if cp_strs_has(st.included, path) { return; }
+    st.included.push(path);
+    var src: str = p_file_read(path);
+    if (src as i64) == 0 { return; }
+    var text: str = cp_strip(src);
+    var dir: str = cp_dir_of(path);
+    var lines: Vec<str> = str_lines(text);
+    var li: i64 = 0;
+    while li < lines.len() {
+        var line: str = str_trim(lines.get(li));
+        if str_starts_with(line, "#") {
+            var d: str = str_trim(str_slice(line, 1, str_len(line)));
+            if str_starts_with(d, "include") {
+                var rest: str = str_trim(str_slice(d, 7, str_len(d)));
+                if str_starts_with(rest, "\"") {
+                    var close: i64 = str_find(str_slice(rest, 1, str_len(rest)), "\"");
+                    if close > 0 {
+                        cp_load_file(st, dir + str_slice(rest, 1, close + 1));
+                    }
+                }
+            } else if str_starts_with(d, "define") {
+                cp_add_define(st, str_trim(str_slice(d, 6, str_len(d))));
+            }
+        } else {
+            st.code.append_str(line);
+            st.code.append_str("\n");
+        }
+        li = li + 1;
+    }
+}
+
+/// `#define NAME body` or `#define NAME(a, b) body`: the first definition wins.
+fn cp_add_define(st: &mut CHeaderState, d: str) {
+    var n: i64 = str_len(d);
+    var i: i64 = 0;
+    while i < n && cp_is_ident_char(str_byte_at(d, i)) { i = i + 1; }
+    if i == 0 { return; }
+    var name: str = str_slice_len(d, n, 0, i);
+    var params: str = "";
+    if i < n && str_byte_at(d, i) == 40 {
+        var close: i64 = i;
+        while close < n && str_byte_at(d, close) != 41 { close = close + 1; }
+        var plist: str = str_trim(str_slice_len(d, n, i + 1, close));
+        params = "()";
+        if str_len(plist) > 0 { params = str_replace(str_replace(plist, " ", ""), "\t", ""); }
+        i = close + 1;
+    }
+    var body: str = str_trim(str_slice_len(d, n, i, n));
+    if HashMap_contains(st.macro_index, name) { return; }
+    st.macro_names.push(name);
+    st.macro_bodies.push(body);
+    st.macro_params.push(params);
+    st.macro_noise.push(-1);
+    HashMap_insert(st.macro_index, name, st.macro_names.len());
+}
+
+// --- Tokenizer ------------------------------------------------------------
+
+fn cp_tokens_of(text: str, toks: &mut Vec<str>, kinds: &mut Vec<i64>) {
+    var n: i64 = str_len(text);
+    var i: i64 = 0;
+    while i < n {
+        var c: i64 = str_byte_at(text, i);
+        if cp_is_space(c) {
+            i = i + 1;
+        } else if cp_is_ident_start(c) {
+            var s: i64 = i;
+            while i < n && cp_is_ident_char(str_byte_at(text, i)) { i = i + 1; }
+            toks.push(str_slice_len(text, n, s, i));
+            kinds.push(CTK_IDENT);
+        } else if cp_is_digit(c) || (c == 46 && i + 1 < n && cp_is_digit(str_byte_at(text, i + 1))) {
+            var s2: i64 = i;
+            while i < n && (cp_is_ident_char(str_byte_at(text, i)) || str_byte_at(text, i) == 46) { i = i + 1; }
+            toks.push(str_slice_len(text, n, s2, i));
+            kinds.push(CTK_NUM);
+        } else if c == 34 || c == 39 {
+            var s3: i64 = i;
+            i = i + 1;
+            while i < n && str_byte_at(text, i) != c {
+                if str_byte_at(text, i) == 92 { i = i + 1; }
+                i = i + 1;
+            }
+            i = i + 1;
+            toks.push(str_slice_len(text, n, s3, i));
+            if c == 34 { kinds.push(CTK_STR); } else { kinds.push(CTK_CHAR); }
+        } else {
+            var two: str = str_slice_len(text, n, i, i + 2);
+            if str_slice_len(text, n, i, i + 3) == "..." {
+                toks.push("..."); i = i + 3;
+            } else if two == "<<" || two == ">>" || two == "==" || two == "!=" || two == "<="
+                || two == ">=" || two == "&&" || two == "||" || two == "->" || two == "##" {
+                toks.push(two); i = i + 2;
+            } else {
+                toks.push(str_slice_len(text, n, i, i + 1)); i = i + 1;
+            }
+            kinds.push(CTK_PUNCT);
+        }
+    }
+}
+
+/// Tokens of the code, with noise macros (and the groups after them)
+/// dropped, and `extern "C" {` wrappers removed.
+fn cp_tokenize(st: &mut CHeaderState, code: str) {
+    var raw: Vec<str> = Vec::new();
+    var rk: Vec<i64> = Vec::new();
+    cp_tokens_of(code, &mut raw, &mut rk);
+    var depth: i64 = 0;
+    var i: i64 = 0;
+    while i < raw.len() {
+        var t: str = raw.get(i);
+        var k: i64 = rk.get(i);
+        if k == CTK_IDENT && t == "extern" && i + 2 < raw.len() && rk.get(i + 1) == CTK_STR && raw.get(i + 2) == "{" {
+            i = i + 3;
+            continue;
+        }
+        if k == CTK_IDENT && (cp_is_noise_word(t) || cp_macro_is_noise(st, t)) {
+            // An attribute group after it goes too: __declspec(x), NAME(args)
+            i = i + 1;
+            if i < raw.len() && raw.get(i) == "(" && (t == "__declspec" || t == "__attribute__"
+                || t == "__attribute" || cp_macro_is_fn(st, t) || t == "_Pragma" || t == "__pragma"
+                || t == "__asm__" || t == "__asm" || t == "_Alignas" || t == "__declspec") {
+                var pd: i64 = 0;
+                while i < raw.len() {
+                    if raw.get(i) == "(" { pd = pd + 1; }
+                    if raw.get(i) == ")" { pd = pd - 1; if pd == 0 { i = i + 1; break; } }
+                    i = i + 1;
+                }
+            }
+            continue;
+        }
+        if t == "{" { depth = depth + 1; }
+        if t == "}" {
+            if depth == 0 { i = i + 1; continue; } // the end of `extern "C" {`
+            depth = depth - 1;
+        }
+        st.toks.push(t);
+        st.kinds.push(k);
+        i = i + 1;
+    }
+}
+
+/// Words that never matter to a binding.
+fn cp_is_noise_word(t: str) -> bool {
+    return t == "extern" || t == "__declspec" || t == "__attribute__" || t == "__attribute"
+        || t == "__cdecl" || t == "__stdcall" || t == "__fastcall" || t == "__vectorcall"
+        || t == "__inline" || t == "__inline__" || t == "inline" || t == "__forceinline"
+        || t == "__extension__" || t == "restrict" || t == "__restrict" || t == "__restrict__"
+        || t == "const" || t == "volatile" || t == "register" || t == "_Printf_format_string_"
+        || t == "__unaligned" || t == "__ptr64" || t == "__ptr32" || t == "_Noreturn"
+        || t == "__cdecl__" || t == "_Pragma" || t == "__pragma" || t == "__asm__" || t == "__asm"
+        || t == "_Alignas" || t == "WINAPI" || t == "APIENTRY" || t == "CALLBACK";
+}
+
+fn cp_macro_at(st: &CHeaderState, name: str) -> i64 {
+    return HashMap_get(st.macro_index, name) - 1;
+}
+
+fn cp_macro_is_fn(st: &CHeaderState, name: str) -> bool {
+    var m: i64 = cp_macro_at(st, name);
+    return m >= 0 && st.macro_params.get(m) != "";
+}
+
+/// A macro is noise when its body, macros expanded, holds only noise words,
+/// attribute groups and other noise macros (or nothing).
+fn cp_macro_is_noise(st: &mut CHeaderState, name: str) -> bool {
+    var m: i64 = cp_macro_at(st, name);
+    if m < 0 { return false; }
+    var known: i64 = st.macro_noise.get(m);
+    if known >= 0 { return known == 1; }
+    st.macro_noise.set(m, 0); // a cycle is not noise
+    var toks: Vec<str> = Vec::new();
+    var kinds: Vec<i64> = Vec::new();
+    cp_tokens_of(st.macro_bodies.get(m), &mut toks, &mut kinds);
+    var noise: bool = true;
+    var depth: i64 = 0;
+    var i: i64 = 0;
+    while i < toks.len() && noise {
+        var t: str = toks.get(i);
+        if depth > 0 {
+            if t == "(" { depth = depth + 1; }
+            if t == ")" { depth = depth - 1; }
+        } else if t == "(" && i > 0 {
+            depth = 1; // the argument group of an attribute
+        } else if kinds.get(i) == CTK_IDENT && (cp_is_noise_word(t) || cp_macro_is_noise(st, t)) {
+            // fine
+        } else {
+            noise = false;
+        }
+        i = i + 1;
+    }
+    if noise { st.macro_noise.set(m, 1); }
+    return noise;
+}
+
+// --- Declarations ---------------------------------------------------------
+
+/// Split the tokens into declarations at `;` (outside brackets); function
+/// bodies end a declaration and are skipped.
+fn cp_parse_decls(st: &mut CHeaderState) {
+    var start: i64 = 0;
+    var depth: i64 = 0;
+    var i: i64 = 0;
+    while i < st.toks.len() {
+        var t: str = st.toks.get(i);
+        if t == "(" || t == "[" { depth = depth + 1; }
+        if t == ")" || t == "]" { depth = depth - 1; }
+        if t == "{" && depth == 0 {
+            // a function definition: `) {` -- skip its body
+            if i > start && st.toks.get(i - 1) == ")" {
+                var bd: i64 = 0;
+                while i < st.toks.len() {
+                    if st.toks.get(i) == "{" { bd = bd + 1; }
+                    if st.toks.get(i) == "}" { bd = bd - 1; if bd == 0 { break; } }
+                    i = i + 1;
+                }
+                start = i + 1;
+                i = i + 1;
+                continue;
+            }
+            // a struct, union or enum body: up to its `}`
+            var bd2: i64 = 0;
+            while i < st.toks.len() {
+                if st.toks.get(i) == "{" { bd2 = bd2 + 1; }
+                if st.toks.get(i) == "}" { bd2 = bd2 - 1; if bd2 == 0 { break; } }
+                i = i + 1;
+            }
+            i = i + 1;
+            continue;
+        }
+        if t == ";" && depth == 0 {
+            if i > start { cp_decl(st, start, i); }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn cp_decl(st: &mut CHeaderState, a: i64, b: i64) {
+    var first: str = st.toks.get(a);
+    if first == "typedef" {
+        cp_typedef(st, a + 1, b);
+        return;
+    }
+    if first == "static" { return; }
+    if first == "struct" || first == "union" || first == "enum" {
+        var brace: i64 = cp_find(st, a, b, "{");
+        if brace >= 0 {
+            if first == "enum" { cp_enum_body(st, brace); }
+            return; // `struct X { .. };` -- a variable after it is not kept
+        }
+    }
+    cp_function(st, a, b);
+}
+
+/// Index of token `t` in [a, b), or -1.
+fn cp_find(st: &CHeaderState, a: i64, b: i64, t: str) -> i64 {
+    var i: i64 = a;
+    while i < b {
+        if st.toks.get(i) == t { return i; }
         i = i + 1;
     }
     return -1;
 }
 
-fn cp_str_rfind_char(s: str, ch: i64) -> i64 {
-    var i: i64 = str_len(s) - 1;
-    while i >= 0 {
-        if str_byte_at(s, i) == ch { return i; }
-        i = i - 1;
+/// The index of the bracket closing the one at `open`.
+fn cp_close_of(st: &CHeaderState, open: i64) -> i64 {
+    var o: str = st.toks.get(open);
+    var c: str = ")";
+    if o == "{" { c = "}"; }
+    if o == "[" { c = "]"; }
+    var depth: i64 = 0;
+    var i: i64 = open;
+    while i < st.toks.len() {
+        var t: str = st.toks.get(i);
+        if t == o { depth = depth + 1; }
+        if t == c { depth = depth - 1; if depth == 0 { return i; } }
+        i = i + 1;
     }
-    return -1;
+    return st.toks.len() - 1;
 }
 
-fn str_rfind_space(s: str) -> i64 {
-    var i: i64 = str_len(s) - 1;
-    while i >= 0 {
-        var b: i64 = str_byte_at(s, i);
-        if b == 32 || b == 9 { return i; }
+fn cp_enum_body(st: &mut CHeaderState, brace: i64) {
+    var close: i64 = cp_close_of(st, brace);
+    var next: i64 = 0;
+    var next_ok: bool = true;
+    var i: i64 = brace + 1;
+    while i < close {
+        // NAME [= expr] up to `,` at depth 0
+        var e: i64 = i;
+        var depth: i64 = 0;
+        while e < close && !(depth == 0 && st.toks.get(e) == ",") {
+            if st.toks.get(e) == "(" { depth = depth + 1; }
+            if st.toks.get(e) == ")" { depth = depth - 1; }
+            e = e + 1;
+        }
+        if e > i && st.kinds.get(i) == CTK_IDENT {
+            var name: str = st.toks.get(i);
+            if i + 1 < e && st.toks.get(i + 1) == "=" {
+                var vt: Vec<str> = Vec::new();
+                var vk: Vec<i64> = Vec::new();
+                var j: i64 = i + 2;
+                while j < e { vt.push(st.toks.get(j)); vk.push(st.kinds.get(j)); j = j + 1; }
+                var r: CpEval = cp_eval_tokens(st, vt, vk, 0);
+                next_ok = r.ok;
+                next = r.value;
+            }
+            if next_ok { cp_add_const(st, name, next); }
+            next = next + 1;
+        }
+        i = e + 1;
+    }
+}
+
+fn cp_add_const(st: &mut CHeaderState, name: str, value: i64) {
+    if HashMap_contains(st.const_index, name) { return; }
+    st.const_names.push(name);
+    st.const_values.push(value);
+    HashMap_insert(st.const_index, name, st.const_names.len());
+}
+
+fn cp_add_typedef(st: &mut CHeaderState, name: str, base: str, ptr: i64) {
+    var at: i64 = HashMap_get(st.td_index, name) - 1;
+    if at >= 0 {
+        // the first one that resolves wins
+        if cp_resolve(st, st.td_base.get(at), st.td_ptr.get(at), 0) != "?" { return; }
+        st.td_base.set(at, base);
+        st.td_ptr.set(at, ptr);
+        return;
+    }
+    st.td_names.push(name);
+    st.td_base.push(base);
+    st.td_ptr.push(ptr);
+    HashMap_insert(st.td_index, name, st.td_names.len());
+}
+
+/// `typedef ...` in [a, b).
+fn cp_typedef(st: &mut CHeaderState, a: i64, b: i64) {
+    if a >= b { return; }
+    var first: str = st.toks.get(a);
+    // typedef struct|union|enum TAG? { ... } NAMES  /  typedef struct TAG NAMES
+    if first == "struct" || first == "union" || first == "enum" {
+        var tag: str = "";
+        var p: i64 = a + 1;
+        if p < b && st.kinds.get(p) == CTK_IDENT { tag = st.toks.get(p); p = p + 1; }
+        if p < b && st.toks.get(p) == "{" {
+            if first == "enum" { cp_enum_body(st, p); }
+            p = cp_close_of(st, p) + 1;
+        }
+        var base: str = first + " " + tag;
+        if first == "enum" { base = "enum"; }
+        cp_typedef_declarators(st, p, b, base, 0);
+        return;
+    }
+    // A function pointer: typedef RET (*NAME)(..)
+    var lp: i64 = cp_find(st, a, b, "(");
+    if lp >= 0 && lp + 2 < b && st.toks.get(lp + 1) == "*" && st.kinds.get(lp + 2) == CTK_IDENT {
+        cp_add_typedef(st, st.toks.get(lp + 2), "fnptr", 0);
+        return;
+    }
+    if lp >= 0 && lp > a && st.kinds.get(lp - 1) == CTK_IDENT {
+        // typedef RET NAME(args): a function type
+        cp_add_typedef(st, st.toks.get(lp - 1), "fnptr", 0);
+        return;
+    }
+    // typedef BASE NAME [, *NAME2]: the base is everything up to the last
+    // identifier of the first declarator
+    var comma: i64 = cp_find(st, a, b, ",");
+    var end1: i64 = b;
+    if comma >= 0 { end1 = comma; }
+    var nm: i64 = end1 - 1;
+    while nm > a && st.toks.get(nm) == "]" {
+        nm = cp_open_of(st, nm, a) - 1;
+    }
+    if nm <= a || st.kinds.get(nm) != CTK_IDENT { return; }
+    var ptr: i64 = 0;
+    var be: i64 = nm;
+    while be > a && st.toks.get(be - 1) == "*" { ptr = ptr + 1; be = be - 1; }
+    var base2: str = cp_base_of(st, a, be);
+    if end1 < b && nm + 1 < end1 && st.toks.get(nm + 1) == "[" { ptr = ptr + 1; }
+    cp_add_typedef(st, st.toks.get(nm), base2, ptr);
+    if comma >= 0 { cp_typedef_declarators(st, comma + 1, b, base2, 0); }
+}
+
+/// The `[` opening the `]` at `close` (not before `limit`).
+fn cp_open_of(st: &CHeaderState, close: i64, limit: i64) -> i64 {
+    var depth: i64 = 0;
+    var i: i64 = close;
+    while i >= limit {
+        if st.toks.get(i) == "]" { depth = depth + 1; }
+        if st.toks.get(i) == "[" { depth = depth - 1; if depth == 0 { return i; } }
         i = i - 1;
     }
-    return -1;
+    return limit;
+}
+
+/// Declarators `*A, B, **C` in [a, b) for type `base`.
+fn cp_typedef_declarators(st: &mut CHeaderState, a: i64, b: i64, base: str, ptr0: i64) {
+    var i: i64 = a;
+    var ptr: i64 = ptr0;
+    while i < b {
+        var t: str = st.toks.get(i);
+        if t == "*" { ptr = ptr + 1; }
+        else if t == "," { ptr = ptr0; }
+        else if st.kinds.get(i) == CTK_IDENT { cp_add_typedef(st, t, base, ptr); }
+        i = i + 1;
+    }
+}
+
+/// The base type of the tokens [a, b) (no `*`): "int", "uint", "struct X",
+/// "td NAME", ...; "?" when it is not a type.
+fn cp_base_of(st: &CHeaderState, a: i64, b: i64) -> str {
+    var unsigned: bool = false;
+    var signed: bool = false;
+    var longs: i64 = 0;
+    var short: bool = false;
+    var word: str = "";
+    var i: i64 = a;
+    while i < b {
+        var t: str = st.toks.get(i);
+        if t == "unsigned" { unsigned = true; }
+        else if t == "signed" { signed = true; }
+        else if t == "long" { longs = longs + 1; }
+        else if t == "short" { short = true; }
+        else if t == "int" { if word == "" { word = "int"; } }
+        else if t == "struct" || t == "union" || t == "enum" {
+            if i + 1 < b { return t + " " + st.toks.get(i + 1); }
+            return "?";
+        }
+        else if st.kinds.get(i) == CTK_IDENT { word = t; }
+        else { return "?"; }
+        i = i + 1;
+    }
+    if longs >= 2 { if unsigned { return "ullong"; } return "llong"; }
+    if longs == 1 && word == "double" { return "double"; }
+    if longs == 1 { if unsigned { return "ulong"; } return "long"; }
+    if short { if unsigned { return "ushort"; } return "short"; }
+    if word == "char" {
+        if unsigned { return "uchar"; }
+        return "char";
+    }
+    if word == "" || word == "int" {
+        if unsigned { return "uint"; }
+        if signed || word == "int" { return "int"; }
+        return "?";
+    }
+    if word == "float" || word == "double" || word == "void" { return word; }
+    if word == "_Bool" || word == "bool" { return "bool"; }
+    // MSVC's sized integers: `unsigned __int8` and the like
+    if word == "__int8" || word == "__int16" || word == "__int32" || word == "__int64" {
+        var bits: str = str_slice(word, 5, str_len(word));
+        if unsigned { return "u" + bits; }
+        return "i" + bits;
+    }
+    if unsigned { return "uint"; } // `unsigned NAME`: not C
+    return "td " + word;
+}
+
+/// A known type name of the system headers, as a base ("" when unknown).
+fn cp_builtin(name: str) -> str {
+    if name == "int8_t" || name == "__int8" { return "i8"; }
+    if name == "int16_t" || name == "__int16" { return "i16"; }
+    if name == "int32_t" || name == "__int32" { return "i32"; }
+    if name == "int64_t" || name == "__int64" || name == "intptr_t" || name == "ptrdiff_t"
+        || name == "ssize_t" || name == "off_t" || name == "time_t" || name == "intmax_t" { return "i64"; }
+    if name == "uint8_t" { return "u8"; }
+    if name == "uint16_t" || name == "wchar_t" { return "u16"; }
+    if name == "uint32_t" { return "u32"; }
+    if name == "uint64_t" || name == "size_t" || name == "uintptr_t" || name == "uintmax_t" { return "u64"; }
+    if name == "FILE" { return "struct FILE"; }
+    if name == "va_list" || name == "__builtin_va_list" { return "valist"; }
+    return "";
+}
+
+/// The Fides type of base `base` with `ptr` stars: "i32", "*u8", "str",
+/// "i64" (an address), "struct:X" (by value), "valist", or "?" (unknown).
+fn cp_resolve(st: &CHeaderState, base: str, ptr: i64, depth: i64) -> str {
+    if depth > 32 { return "?"; }
+    var prim: str = "";
+    if base == "int" { prim = "i32"; }
+    if base == "uint" { prim = "u32"; }
+    if base == "char" { prim = "i8"; }
+    if base == "uchar" { prim = "u8"; }
+    if base == "short" { prim = "i16"; }
+    if base == "ushort" { prim = "u16"; }
+    if base == "long" { prim = "i32"; }
+    if base == "ulong" { prim = "u32"; }
+    if base == "llong" { prim = "i64"; }
+    if base == "ullong" { prim = "u64"; }
+    if base == "float" { prim = "f32"; }
+    if base == "double" { prim = "f64"; }
+    if base == "bool" { prim = "bool"; }
+    if base == "enum" || str_starts_with(base, "enum ") { prim = "i32"; }
+    if base == "i8" || base == "i16" || base == "i32" || base == "i64" || base == "u8"
+        || base == "u16" || base == "u32" || base == "u64" { prim = base; }
+    if prim != "" {
+        if ptr == 0 { return prim; }
+        if ptr == 1 && (base == "char" || base == "uchar") { return "str"; }
+        if ptr == 1 { return "*" + prim; }
+        return "*i64";
+    }
+    if base == "void" {
+        if ptr == 0 { return "void"; }
+        if ptr == 1 { return "i64"; }
+        return "*i64";
+    }
+    if base == "fnptr" {
+        if ptr == 0 { return "i64"; }
+        return "*i64";
+    }
+    if base == "valist" { return "valist"; }
+    if str_starts_with(base, "struct ") || str_starts_with(base, "union ") {
+        if ptr == 0 { return "struct:" + str_slice(base, 7, str_len(base)); }
+        if ptr == 1 { return "i64"; }
+        return "*i64";
+    }
+    if str_starts_with(base, "td ") {
+        var name: str = str_slice(base, 3, str_len(base));
+        var at: i64 = HashMap_get(st.td_index, name) - 1;
+        if at >= 0 {
+            return cp_resolve(st, st.td_base.get(at), st.td_ptr.get(at) + ptr, depth + 1);
+        }
+        var b: str = cp_builtin(name);
+        if b != "" { return cp_resolve(st, b, ptr, depth + 1); }
+        // An unknown name behind a pointer is still an address
+        if ptr == 1 { return "i64"; }
+        if ptr > 1 { return "*i64"; }
+        return "?";
+    }
+    return "?";
+}
+
+/// Fides keywords and type names cannot be parameter names.
+fn cp_safe_name(name: str) -> str {
+    var kw: str = " as async await backward bool break cap component comptime const continue defer do dyn else ensure enum extern false fn for given grad guard handle if impl in interrupt is kernel layer loop match model module move mut on persist pub query region resume return sandbox select spawn state static str struct system true try txn type unsafe use val var void where while with yield self Self i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 isize usize char ";
+    if str_find(kw, " " + name + " ") >= 0 { return name + "_"; }
+    return name;
+}
+
+/// A function prototype in [a, b), or nothing.
+fn cp_function(st: &mut CHeaderState, a: i64, b: i64) {
+    // NAME ( params ) with the return type before NAME
+    var lp: i64 = cp_find(st, a, b, "(");
+    if lp <= a || st.kinds.get(lp - 1) != CTK_IDENT { return; }
+    var rp: i64 = cp_close_of(st, lp);
+    if rp + 1 != b { return; } // anything after the parameters: not a plain prototype
+    var name: str = st.toks.get(lp - 1);
+    if HashMap_contains(st.fn_index, name) { return; }
+    var ptr: i64 = 0;
+    var be: i64 = lp - 1;
+    while be > a && st.toks.get(be - 1) == "*" { ptr = ptr + 1; be = be - 1; }
+    if be <= a { return; } // no return type: a macro call
+    var rbase: str = cp_base_of(st, a, be);
+    var ret: str = cp_resolve(st, rbase, ptr, 0);
+    var why: str = cp_unsupported(ret, "the result");
+    // Parameters, split at commas outside brackets
+    var params: Vec<str> = Vec::new();
+    if !(rp == lp + 2 && st.toks.get(lp + 1) == "void") && rp > lp + 1 {
+        var s: i64 = lp + 1;
+        var depth: i64 = 0;
+        var i: i64 = lp + 1;
+        while i <= rp {
+            var t: str = st.toks.get(i);
+            if (t == "," && depth == 0) || i == rp {
+                var one: str = cp_param(st, s, i, params.len());
+                if str_starts_with(one, "!") {
+                    if why == "" { why = str_slice(one, 1, str_len(one)); }
+                } else {
+                    params.push(one);
+                }
+                s = i + 1;
+            } else if t == "(" || t == "[" {
+                depth = depth + 1;
+            } else if t == ")" || t == "]" {
+                depth = depth - 1;
+            }
+            i = i + 1;
+        }
+    }
+    HashMap_insert(st.fn_index, name, 1);
+    if why != "" {
+        st.skipped.push(name + ": " + why);
+        return;
+    }
+    var line: str = "    fn " + name + "(" + str_join(params, ", ") + ")";
+    if ret != "void" { line = line + " -> " + ret; }
+    st.fn_lines.push(line + ";");
+}
+
+/// Why a type cannot be a parameter or result yet ("" when it can).
+fn cp_unsupported(ty: str, what: str) -> str {
+    if ty == "?" { return what + " has a type this parser does not know"; }
+    if ty == "valist" { return what + " is a va_list"; }
+    if str_starts_with(ty, "struct:") {
+        return what + " is a struct by value (" + str_slice(ty, 7, str_len(ty)) + ")";
+    }
+    return "";
+}
+
+/// One parameter in [a, b) as `name: type`, or "!reason".
+fn cp_param(st: &CHeaderState, a: i64, b: i64, index: i64) -> str {
+    if a >= b { return "!an empty parameter"; }
+    if st.toks.get(a) == "..." { return "!it takes a variable number of arguments"; }
+    // A function pointer: RET (*name)(args)
+    var lp: i64 = cp_find(st, a, b, "(");
+    if lp >= 0 {
+        var pname: str = "";
+        var j: i64 = lp;
+        while j < b {
+            if st.kinds.get(j) == CTK_IDENT { pname = st.toks.get(j); break; }
+            if st.toks.get(j) == ")" { break; }
+            j = j + 1;
+        }
+        if pname == "" { pname = "arg" + int_to_str(index); }
+        return cp_safe_name(pname) + ": i64";
+    }
+    var e: i64 = b;
+    var ptr: i64 = 0;
+    // arrays: name[n] is a pointer
+    while e > a && st.toks.get(e - 1) == "]" {
+        e = cp_open_of(st, e - 1, a);
+        ptr = ptr + 1;
+    }
+    var pname2: str = "";
+    if e - 1 > a && st.kinds.get(e - 1) == CTK_IDENT && cp_names_param(st, a, e - 1) {
+        pname2 = st.toks.get(e - 1);
+        e = e - 1;
+    }
+    while e > a && st.toks.get(e - 1) == "*" { ptr = ptr + 1; e = e - 1; }
+    var ty: str = cp_resolve(st, cp_base_of(st, a, e), ptr, 0);
+    if pname2 == "" { pname2 = "arg" + int_to_str(index); }
+    var why: str = cp_unsupported(ty, "parameter " + pname2);
+    if why != "" { return "!" + why; }
+    if ty == "void" { return "!parameter " + pname2 + " is void"; }
+    // An integer argument is passed as i64: C reads only its low bits, and
+    // the i64 constants above pass without a cast (results keep their type)
+    if ty == "i8" || ty == "i16" || ty == "i32" || ty == "u8" || ty == "u16" || ty == "u32" || ty == "u64" {
+        ty = "i64";
+    }
+    return cp_safe_name(pname2) + ": " + ty;
+}
+
+/// Is the identifier at the end of [a, last] a parameter name (not the end
+/// of its type, as in `unsigned int` or `struct X`)?
+fn cp_names_param(st: &CHeaderState, a: i64, last: i64) -> bool {
+    var t: str = st.toks.get(last);
+    if t == "int" || t == "char" || t == "short" || t == "long" || t == "unsigned"
+        || t == "signed" || t == "float" || t == "double" || t == "void" || t == "_Bool" { return false; }
+    var prev: str = st.toks.get(last - 1);
+    if prev == "struct" || prev == "union" || prev == "enum" { return false; }
+    return true;
+}
+
+// --- Constant expressions -------------------------------------------------
+
+pub struct CpEval {
+    pub ok: bool,
+    pub value: i64,
+}
+
+/// A parse position over a token list.
+pub struct CpExpr {
+    pub toks: Vec<str>,
+    pub kinds: Vec<i64>,
+    pub pos: i64,
+    pub ok: bool,
+    pub depth: i64,
+}
+
+fn cp_eval_tokens(st: &mut CHeaderState, toks: Vec<str>, kinds: Vec<i64>, depth: i64) -> CpEval {
+    if toks.len() == 0 || depth > 16 { return CpEval { ok: false, value: 0 }; }
+    var e: CpExpr = CpExpr { toks: toks, kinds: kinds, pos: 0, ok: true, depth: depth };
+    var v: i64 = cp_ex_or(st, &mut e);
+    if e.pos != e.toks.len() { e.ok = false; }
+    return CpEval { ok: e.ok, value: v };
+}
+
+fn cp_ex_peek(e: &CpExpr) -> str {
+    if e.pos < e.toks.len() { return e.toks.get(e.pos); }
+    return "";
+}
+
+fn cp_ex_or(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
+    var v: i64 = cp_ex_xor(st, e);
+    while e.ok && cp_ex_peek(e) == "|" { e.pos = e.pos + 1; v = v | cp_ex_xor(st, e); }
+    return v;
+}
+
+fn cp_ex_xor(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
+    var v: i64 = cp_ex_and(st, e);
+    while e.ok && cp_ex_peek(e) == "^" { e.pos = e.pos + 1; v = v ^ cp_ex_and(st, e); }
+    return v;
+}
+
+fn cp_ex_and(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
+    var v: i64 = cp_ex_shift(st, e);
+    while e.ok && cp_ex_peek(e) == "&" { e.pos = e.pos + 1; v = v & cp_ex_shift(st, e); }
+    return v;
+}
+
+fn cp_ex_shift(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
+    var v: i64 = cp_ex_add(st, e);
+    while e.ok && (cp_ex_peek(e) == "<<" || cp_ex_peek(e) == ">>") {
+        var op: str = cp_ex_peek(e);
+        e.pos = e.pos + 1;
+        var r: i64 = cp_ex_add(st, e);
+        if r < 0 || r > 63 { e.ok = false; return 0; }
+        if op == "<<" { v = v << r; } else { v = v >> r; }
+    }
+    return v;
+}
+
+@wrapping fn cp_ex_add(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
+    var v: i64 = cp_ex_mul(st, e);
+    while e.ok && (cp_ex_peek(e) == "+" || cp_ex_peek(e) == "-") {
+        var op: str = cp_ex_peek(e);
+        e.pos = e.pos + 1;
+        var r: i64 = cp_ex_mul(st, e);
+        if op == "+" { v = v + r; } else { v = v - r; }
+    }
+    return v;
+}
+
+@wrapping fn cp_ex_mul(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
+    var v: i64 = cp_ex_unary(st, e);
+    while e.ok && (cp_ex_peek(e) == "*" || cp_ex_peek(e) == "/" || cp_ex_peek(e) == "%") {
+        var op: str = cp_ex_peek(e);
+        e.pos = e.pos + 1;
+        var r: i64 = cp_ex_unary(st, e);
+        if op == "*" { v = v * r; }
+        else if r == 0 { e.ok = false; return 0; }
+        else if op == "/" { v = v / r; }
+        else { v = v % r; }
+    }
+    return v;
+}
+
+@wrapping fn cp_ex_unary(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
+    var t: str = cp_ex_peek(e);
+    if t == "-" { e.pos = e.pos + 1; return 0 - cp_ex_unary(st, e); }
+    if t == "+" { e.pos = e.pos + 1; return cp_ex_unary(st, e); }
+    if t == "~" { e.pos = e.pos + 1; return ~cp_ex_unary(st, e); }
+    if t == "!" { e.pos = e.pos + 1; if cp_ex_unary(st, e) == 0 { return 1; } return 0; }
+    return cp_ex_primary(st, e);
+}
+
+/// Is the token at `pos` the start of a cast `(type)`?
+fn cp_ex_is_cast(st: &CHeaderState, e: &CpExpr) -> bool {
+    var i: i64 = e.pos + 1;
+    var saw: bool = false;
+    while i < e.toks.len() {
+        var t: str = e.toks.get(i);
+        if t == ")" { return saw && i + 1 < e.toks.len(); }
+        if t == "*" { i = i + 1; continue; }
+        if e.kinds.get(i) != CTK_IDENT { return false; }
+        if !(t == "unsigned" || t == "signed" || t == "int" || t == "long" || t == "short"
+            || t == "char" || cp_builtin(t) != "" || HashMap_contains(st.td_index, t)) { return false; }
+        saw = true;
+        i = i + 1;
+    }
+    return false;
+}
+
+fn cp_ex_primary(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
+    if e.pos >= e.toks.len() { e.ok = false; return 0; }
+    var t: str = e.toks.get(e.pos);
+    var k: i64 = e.kinds.get(e.pos);
+    if t == "(" {
+        if cp_ex_is_cast(st, e) {
+            while cp_ex_peek(e) != ")" { e.pos = e.pos + 1; }
+            e.pos = e.pos + 1;
+            return cp_ex_unary(st, e);
+        }
+        e.pos = e.pos + 1;
+        var v: i64 = cp_ex_or(st, e);
+        if cp_ex_peek(e) != ")" { e.ok = false; return 0; }
+        e.pos = e.pos + 1;
+        return v;
+    }
+    if k == CTK_NUM {
+        e.pos = e.pos + 1;
+        return cp_number(t, e);
+    }
+    if k == CTK_CHAR {
+        e.pos = e.pos + 1;
+        if str_len(t) == 3 { return str_byte_at(t, 1); }
+        if str_len(t) >= 4 && str_byte_at(t, 1) == 92 {
+            var c: i64 = str_byte_at(t, 2);
+            if str_len(t) == 4 {
+                if c == 110 { return 10; }
+                if c == 116 { return 9; }
+                if c == 114 { return 13; }
+                if c == 48 { return 0; }
+                if c == 97 { return 7; }
+                if c == 98 { return 8; }
+                return c;
+            }
+            // '\033' (octal) and '\x1B' (hex)
+            var digits: str = str_slice(t, 2, str_len(t) - 1);
+            var v: i64 = 0;
+            var base: i64 = 8;
+            var di: i64 = 0;
+            if c == 120 { base = 16; di = 1; }
+            if di >= str_len(digits) { e.ok = false; return 0; }
+            while di < str_len(digits) {
+                var dc: i64 = str_byte_at(digits, di);
+                var d: i64 = -1;
+                if dc >= 48 && dc <= 57 { d = dc - 48; }
+                if dc >= 97 && dc <= 102 { d = dc - 87; }
+                if dc >= 65 && dc <= 70 { d = dc - 55; }
+                if d < 0 || d >= base { e.ok = false; return 0; }
+                v = v * base + d;
+                di = di + 1;
+            }
+            return v;
+        }
+        e.ok = false;
+        return 0;
+    }
+    if k == CTK_IDENT {
+        e.pos = e.pos + 1;
+        var ci: i64 = HashMap_get(st.const_index, t) - 1;
+        if ci >= 0 { return st.const_values.get(ci); }
+        var m: i64 = cp_macro_at(st, t);
+        if m < 0 { e.ok = false; return 0; }
+        var body: str = st.macro_bodies.get(m);
+        var params: str = st.macro_params.get(m);
+        if params != "" {
+            // NAME(args): the body with each parameter replaced
+            if cp_ex_peek(e) != "(" { e.ok = false; return 0; }
+            var args: Vec<str> = Vec::new();
+            var cur: str = "";
+            var depth: i64 = 0;
+            e.pos = e.pos + 1;
+            while e.pos < e.toks.len() {
+                var a: str = e.toks.get(e.pos);
+                if a == "(" { depth = depth + 1; }
+                if a == ")" {
+                    if depth == 0 { break; }
+                    depth = depth - 1;
+                }
+                if a == "," && depth == 0 { args.push(cur); cur = ""; }
+                else { cur = cur + " " + a; }
+                e.pos = e.pos + 1;
+            }
+            e.pos = e.pos + 1;
+            args.push(cur);
+            var names: Vec<str> = Vec::new();
+            if params != "()" { names = str_split(params, ","); }
+            var bt: Vec<str> = Vec::new();
+            var bk: Vec<i64> = Vec::new();
+            cp_tokens_of(body, &mut bt, &mut bk);
+            var xt: Vec<str> = Vec::new();
+            var xk: Vec<i64> = Vec::new();
+            var bi: i64 = 0;
+            while bi < bt.len() {
+                var pi: i64 = 0;
+                var hit: i64 = -1;
+                while pi < names.len() {
+                    if names.get(pi) == bt.get(bi) { hit = pi; }
+                    pi = pi + 1;
+                }
+                if hit >= 0 && hit < args.len() {
+                    cp_tokens_of(args.get(hit), &mut xt, &mut xk);
+                } else {
+                    xt.push(bt.get(bi));
+                    xk.push(bk.get(bi));
+                }
+                bi = bi + 1;
+            }
+            var r: CpEval = cp_eval_tokens(st, xt, xk, e.depth + 1);
+            if !r.ok { e.ok = false; }
+            return r.value;
+        }
+        var ot: Vec<str> = Vec::new();
+        var ok: Vec<i64> = Vec::new();
+        cp_tokens_of(body, &mut ot, &mut ok);
+        var r2: CpEval = cp_eval_tokens(st, ot, ok, e.depth + 1);
+        if !r2.ok { e.ok = false; }
+        return r2.value;
+    }
+    e.ok = false;
+    return 0;
+}
+
+/// A C integer literal (decimal, 0x hex, 0 octal, with u/l suffixes).
+@wrapping fn cp_number(t: str, e: &mut CpExpr) -> i64 {
+    var s: str = t;
+    while str_len(s) > 0 {
+        var last: i64 = str_byte_at(s, str_len(s) - 1);
+        if last == 117 || last == 85 || last == 108 || last == 76 { s = str_slice(s, 0, str_len(s) - 1); }
+        else { break; }
+    }
+    var base: i64 = 10;
+    var i: i64 = 0;
+    if str_starts_with(s, "0x") || str_starts_with(s, "0X") { base = 16; i = 2; }
+    else if str_len(s) > 1 && str_starts_with(s, "0") { base = 8; i = 1; }
+    if i >= str_len(s) && base == 16 { e.ok = false; return 0; }
+    var v: i64 = 0;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        var d: i64 = -1;
+        if c >= 48 && c <= 57 { d = c - 48; }
+        if c >= 97 && c <= 102 { d = c - 87; }
+        if c >= 65 && c <= 70 { d = c - 55; }
+        if d < 0 || d >= base { e.ok = false; return 0; }
+        v = v * base + d;
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Every object-like `#define` whose body is an integer constant.
+fn cp_collect_define_consts(st: &mut CHeaderState) {
+    var i: i64 = 0;
+    while i < st.macro_names.len() {
+        var name: str = st.macro_names.get(i);
+        if st.macro_params.get(i) == "" && str_len(st.macro_bodies.get(i)) > 0
+            && !str_starts_with(name, "_") && !HashMap_contains(st.fn_index, name) {
+            var t: Vec<str> = Vec::new();
+            var k: Vec<i64> = Vec::new();
+            cp_tokens_of(st.macro_bodies.get(i), &mut t, &mut k);
+            var r: CpEval = cp_eval_tokens(st, t, k, 0);
+            if r.ok { cp_add_const(st, name, r.value); }
+        }
+        i = i + 1;
+    }
+}
+
+// --- Output ---------------------------------------------------------------
+
+fn cp_render(st: &mut CHeaderState, path: str, link: str, module_name: str) -> str {
+    var out: StringBuilder = StringBuilder::new();
+    out.append_str("// Generated by `fid parse-header` from " + cp_base_name(path));
+    if st.included.len() > 1 {
+        out.append_str(" and the " + int_to_str(st.included.len() - 1) + " headers it includes");
+    }
+    out.append_str(".\n// Regenerate rather than edit. Pointers other than char* are addresses\n");
+    out.append_str("// (i64), char* is str, C `long` is 32 bits (Windows x64).\n");
+    if module_name != "" { out.append_str("\nmodule " + module_name + ";\n"); }
+    out.append_str("\n");
+    var i: i64 = 0;
+    while i < st.const_names.len() {
+        var cname: str = st.const_names.get(i);
+        if !HashMap_contains(st.fn_index, cname) && cp_safe_name(cname) == cname {
+            out.append_str("pub const " + cname + ": i64 = " + int_to_str(st.const_values.get(i)) + ";\n");
+        }
+        i = i + 1;
+    }
+    out.append_str("\nextern \"C\" link \"" + link + "\" {\n");
+    i = 0;
+    while i < st.fn_lines.len() {
+        out.append_str(st.fn_lines.get(i) + "\n");
+        i = i + 1;
+    }
+    out.append_str("}\n");
+    if st.skipped.len() > 0 {
+        out.append_str("\n// Not expressible yet (" + int_to_str(st.skipped.len()) + "):\n");
+        i = 0;
+        while i < st.skipped.len() {
+            out.append_str("//   " + st.skipped.get(i) + "\n");
+            i = i + 1;
+        }
+    }
+    return out.to_str();
 }

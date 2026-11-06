@@ -3,18 +3,27 @@
 What one thread may see of another's writes. Fides uses the C++11 model, as C,
 Rust, Swift and Zig do (proposal 0003).
 
-## Safe code has no data races
+## What the compiler checks against data races
 
 A data race is two threads touching the same location, at least one writing,
-with nothing ordering them. In safe Fides it cannot happen:
+with nothing ordering them. The goal is that safe Fides cannot have one. What
+is checked today (`fid`):
 
 - A global written by a function that runs on another thread must be written
   under a lock or through an atomic: the compiler rejects the program
   otherwise ("Race error ... writes the global ... with no lock").
 - A value sent to another thread (`spawn`, `p_thread_spawn`, a channel) must be
-  `@send`, and is that thread's own copy.
-- Shared memory between threads is only `p_shared_alloc` blocks used through
-  atomics, or data behind a mutex.
+  `@send`: numbers, `bool`, `str`, enums, `@send` structs, structs whose fields
+  are all `@send`, and `Vec`/`HashMap`/`Option`/`Result`/`Box`/`Future`/
+  `Mutex`/`Channel` of such types. References and raw pointers are not
+  (`test_spawn_send_fail.fd`, `test_race_ptr_fail.fd`).
+- Shared memory between threads is meant to be `p_shared_alloc` blocks used
+  through atomics, or data behind a mutex.
+
+Not checked: `Vec`, `HashMap` and `str` are handles, so a `Vec` passed to a
+spawned call is shared with the caller, and writes to it from both threads are
+not detected. Copy-on-write (proposal 0001) would make it the thread's own
+copy; it is written behind `LOWER_COW` and switched off.
 
 `unsafe` code that shares raw memory without these is responsible for its own
 ordering.

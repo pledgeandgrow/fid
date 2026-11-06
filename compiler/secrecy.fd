@@ -1,4 +1,5 @@
-// secrecy.fd -- @secret information-flow check, rewritten from src/secrecy.rs
+// secrecy.fd -- @secret/@sensitive information-flow check, rewritten from
+// src/secrecy.rs
 //
 // A secret never reaches an output. Sources: @secret parameters and locals,
 // and the results of @secret functions. Sinks: output and logging calls,
@@ -9,9 +10,12 @@
 // carries the secret. src/secrecy.rs explains the rules;
 // docs/reference/language-guide.md §5.4 explains the design.
 //
+// @sensitive is the same check one notch down (roadmap CO7): personal data
+// released only by privacy::release (a runtime consent check) or @declassify.
+//
 // Adaptations from Rust:
-// 1. Label (BTreeSet<Origin>) -> sorted Vec<i64>: -1 = Secret, i = Param(i)
-//    (the same order Rust derives: Secret before every Param)
+// 1. Label (BTreeSet<Origin>) -> sorted Vec<i64>: -2 = Sensitive,
+//    -1 = Secret, i >= 0 = Param(i)
 // 2. HashMap<String, _> -> core HashMap (str -> index + 1) over Vecs
 //
 // Dependencies: compiler::ast, compiler::escape (identifier walker)
@@ -51,6 +55,7 @@ pub struct SecrecyChecker {
     pub pc: Vec<Vec<i64>>,
     pub func_name: str,
     pub may_return_secret: bool,
+    pub may_return_sensitive: bool,
     pub declassify: bool,
     pub cur_leaks: Vec<i64>,
     pub cur_returns: Vec<i64>,
@@ -183,8 +188,7 @@ pub fn SecrecyChecker_new(program: Program) -> SecrecyChecker {
                     slot = method_keys.len();
                     HashMap_insert(method_index, suffix, slot);
                 }
-                var keys: Vec<str> = method_keys.get(slot - 1);
-                keys.push(key);
+                method_keys.get(slot - 1).push(key);
             }
             p = p + 1;
         }
@@ -215,6 +219,7 @@ pub fn SecrecyChecker_new(program: Program) -> SecrecyChecker {
         pc: Vec::new(),
         func_name: "",
         may_return_secret: false,
+        may_return_sensitive: false,
         declassify: false,
         cur_leaks: Vec::new(),
         cur_returns: Vec::new(),
@@ -226,9 +231,9 @@ pub fn SecrecyChecker_new(program: Program) -> SecrecyChecker {
     };
 }
 
-fn sec_error(self: &mut SecrecyChecker, msg: str) {
+fn sec_error(self: &mut SecrecyChecker, kind: str, msg: str) {
     if self.report {
-        var full: str = "Security error (@secret) (line " + int_to_str(self.line) + "): in '" + self.func_name + "', " + msg;
+        var full: str = "Security error (" + kind + ") (line " + int_to_str(self.line) + "): in '" + self.func_name + "', " + msg;
         if !str_vec_contains(self.errors, full) {
             self.errors.push(full);
         }
@@ -329,9 +334,13 @@ fn sec_note_output(self: &mut SecrecyChecker) {
 fn sec_sink(self: &mut SecrecyChecker, what: str, data: Vec<i64>, pc: Vec<i64>) {
     sec_note_output(self);
     if sec_has(data, -1) {
-        sec_error(self, "a secret value reaches " + what);
+        sec_error(self, "@secret", "a secret value reaches " + what);
+    } else if sec_has(data, -2) {
+        sec_error(self, "@sensitive", "a sensitive value reaches " + what + "; release it through privacy::release (a consent check) or mark the function @declassify");
     } else if sec_has(pc, -1) {
-        sec_error(self, what + " runs inside a branch or loop that depends on a secret");
+        sec_error(self, "@secret", what + " runs inside a branch or loop that depends on a secret");
+    } else if sec_has(pc, -2) {
+        sec_error(self, "@sensitive", what + " runs inside a branch or loop that depends on sensitive data");
     }
     var both: Vec<i64> = sec_union(data, pc);
     var i: i64 = 0;
@@ -351,8 +360,12 @@ fn sec_ret(self: &mut SecrecyChecker, l: Vec<i64>) {
                 self.cur_returns = sec_union(self.cur_returns, sec_one(o));
                 self.changed = true;
             }
-        } else if !self.may_return_secret {
-            sec_error(self, "returns a secret value; mark the function @secret (callers keep its result secret) or @declassify (an audited release)");
+        } else if o == -1 {
+            if !self.may_return_secret {
+                sec_error(self, "@secret", "returns a secret value; mark the function @secret (callers keep its result secret) or @declassify (an audited release)");
+            }
+        } else if !self.may_return_sensitive {
+            sec_error(self, "@sensitive", "returns a sensitive value; mark the function @sensitive (callers keep its result sensitive) or @declassify (an audited release)");
         }
         i = i + 1;
     }
@@ -364,6 +377,7 @@ fn sec_analyze_func(self: &mut SecrecyChecker, key: str, f: Func) {
     self.func_name = f.name;
     self.line = 0;
     self.may_return_secret = sec_has_annotation(f.annotations, "secret");
+    self.may_return_sensitive = sec_has_annotation(f.annotations, "sensitive");
     self.declassify = sec_has_annotation(f.annotations, "declassify");
     var prev: SecSummary = sec_summary(self, key);
     self.cur_leaks = prev.leaks;
@@ -379,6 +393,8 @@ fn sec_analyze_func(self: &mut SecrecyChecker, key: str, f: Func) {
         var p: Param = f.params.get(i);
         if sec_has_annotation(p.annotations, "secret") {
             sec_assign(self, p.name, sec_one(-1));
+        } else if sec_has_annotation(p.annotations, "sensitive") {
+            sec_assign(self, p.name, sec_one(-2));
         } else {
             sec_assign(self, p.name, sec_one(i));
         }
@@ -501,9 +517,13 @@ fn sec_base_var(e: Expr) -> OptStr {
 fn sec_store(self: &mut SecrecyChecker, name: str, l: Vec<i64>) {
     if sec_has_var(self, name) || HashMap_get(self.globals, name) == 0 {
         sec_assign(self, name, l);
-        if str_vec_contains(self.ref_params, name) && sec_has(l, -1) && !self.may_return_secret && !self.declassify {
-            // The caller sees what is written through a reference parameter.
-            sec_error(self, "writes a secret value through reference parameter '" + name + "'; mark the function @secret or @declassify");
+        // The caller sees what is written through a reference parameter.
+        if str_vec_contains(self.ref_params, name) && !self.declassify {
+            if sec_has(l, -1) && !self.may_return_secret {
+                sec_error(self, "@secret", "writes a secret value through reference parameter '" + name + "'; mark the function @secret or @declassify");
+            } else if sec_has(l, -2) && !self.may_return_sensitive {
+                sec_error(self, "@sensitive", "writes a sensitive value through reference parameter '" + name + "'; mark the function @sensitive or @declassify");
+            }
         }
     } else {
         sec_sink(self, "global '" + name + "'", l, sec_none());
@@ -528,6 +548,7 @@ fn sec_stmt(self: &mut SecrecyChecker, s: Stmt) {
         Stmt::Let(name, _, expr, _, _, annotations, _) => {
             var l: Vec<i64> = sec_union(sec_expr(self, expr), pc);
             if sec_has_secret_annotation(annotations) { l = sec_union(l, sec_one(-1)); }
+            if sec_has_annotation(annotations, "sensitive") { l = sec_union(l, sec_one(-2)); }
             sec_assign(self, name, l);
         }
         Stmt::LetTuple(names, expr, _) => {
@@ -541,6 +562,7 @@ fn sec_stmt(self: &mut SecrecyChecker, s: Stmt) {
         Stmt::LetUninit(name, _, annotations, _) => {
             var ul: Vec<i64> = pc;
             if sec_has_secret_annotation(annotations) { ul = sec_union(ul, sec_one(-1)); }
+            if sec_has_annotation(annotations, "sensitive") { ul = sec_union(ul, sec_one(-2)); }
             sec_assign(self, name, ul);
         }
         Stmt::Assign(target, _, expr, _) => {
@@ -781,13 +803,16 @@ fn sec_closure(self: &mut SecrecyChecker, params: Vec<Param>, body: Vec<Stmt>) -
     }
     var saved_returns: Vec<i64> = self.cur_returns;
     var saved_secret: bool = self.may_return_secret;
+    var saved_sensitive: bool = self.may_return_sensitive;
     var saved_declassify: bool = self.declassify;
     // A closure's `return` is its own, not the function's.
     self.may_return_secret = true;
+    self.may_return_sensitive = true;
     self.declassify = false;
     sec_stmts_value(self, body);
     self.cur_returns = saved_returns;
     self.may_return_secret = saved_secret;
+    self.may_return_sensitive = saved_sensitive;
     self.declassify = saved_declassify;
     return captured;
 }
@@ -825,7 +850,9 @@ fn sec_apply_summary(self: &mut SecrecyChecker, name: str, f: Func, summ: SecSum
             var pname: str = "";
             if i < f.params.len() { pname = f.params.get(i).name; }
             if sec_has(l, -1) {
-                sec_error(self, "a secret value is passed to '" + name + "', which outputs its parameter '" + pname + "'");
+                sec_error(self, "@secret", "a secret value is passed to '" + name + "', which outputs its parameter '" + pname + "'");
+            } else if sec_has(l, -2) {
+                sec_error(self, "@sensitive", "a sensitive value is passed to '" + name + "', which outputs its parameter '" + pname + "'");
             }
             var oi: i64 = 0;
             while oi < l.len() {
@@ -838,7 +865,9 @@ fn sec_apply_summary(self: &mut SecrecyChecker, name: str, f: Func, summ: SecSum
     if summ.outputs {
         sec_note_output(self);
         if sec_has(pc, -1) {
-            sec_error(self, "'" + name + "' produces output and is called inside a branch or loop that depends on a secret");
+            sec_error(self, "@secret", "'" + name + "' produces output and is called inside a branch or loop that depends on a secret");
+        } else if sec_has(pc, -2) {
+            sec_error(self, "@sensitive", "'" + name + "' produces output and is called inside a branch or loop that depends on sensitive data");
         }
         var pi: i64 = 0;
         while pi < pc.len() {
@@ -854,6 +883,7 @@ fn sec_apply_summary(self: &mut SecrecyChecker, name: str, f: Func, summ: SecSum
         ri = ri + 1;
     }
     if sec_has_annotation(f.annotations, "secret") { out = sec_union(out, sec_one(-1)); }
+    if sec_has_annotation(f.annotations, "sensitive") { out = sec_union(out, sec_one(-2)); }
     if sec_has_annotation(f.annotations, "declassify") { out = sec_none(); }
     return out;
 }

@@ -4,7 +4,7 @@
 > SRET convention, enum layout, struct copy, and value semantics must stay
 > in sync across `lower.fd`, `codegen_c.fd`, and the runtime.
 >
-> **Last updated:** Sep 6, 2026 (session 16 — Tier 3 OS features added: @cpu_local, inline asm clobbers, --no-std, UEFI bindings)
+> **Last updated:** Nov 6, 2026 (§7 handles, freeing and HashMap keys; §8 string headers). The rest was last revised in session 16 (Sep 6, 2026) and has not been rechecked against the Nov 4–6 compiler.
 >
 > **Important:** Sections 3 and 5 were updated in session 14 to reflect the
 > **pointer-based enum payload approach** (selfhost.md § Coordination, decision D1). The old
@@ -346,7 +346,24 @@ Lowerer_emit_inst(self, Inst::Store(heap_ptr, val, OptIrType::None));
 
 ### For loops
 
-`for v in vec` uses `p_vec_len` and `p_vec_get`.
+`for v in vec` uses `p_vec_len` and `p_vec_get`. Changing the `Vec` inside
+the loop is rejected by the borrow checker (`test_iter_invalidation_fail.fd`).
+
+### Handles and freeing
+
+A `Vec` or `HashMap` value is a handle: assigning it, or copying a struct that
+holds it, shares the data. Copy-on-write (`core.fd:Vec_share`, proposal 0001)
+is written behind `LOWER_COW` in `lower.fd` and is off. The compiler frees a
+`Vec`/`HashMap` local that provably never leaves its variable
+(`lower.fd:lw_auto_drop_vecs`); a `Vec<str>` or `Vec<Vec>` that owns its
+elements frees them too.
+
+### HashMap keys
+
+Integer keys are stored as `key ^ HM_INT_XOR` (`HM_INT_XOR =
+0x5DEECE66D1234567`, `stdlib/core.fd`) so that the empty (0) and removed (-1)
+slot markers stay free: 0 and -1 are ordinary keys, and the two keys that
+would map to the markers panic (`test_hashmap_int_keys.fd`).
 
 ---
 
@@ -361,8 +378,11 @@ Lowerer_emit_inst(self, Inst::Store(heap_ptr, val, OptIrType::None));
 
 ### `str` in IR
 
-`IrType::Str` is `IrType::Ptr(Box::new(IrType::U8))`. A `str` value is a
-pointer to a heap-allocated, refcounted, length-prefixed string.
+`IrType::Str` is `IrType::Ptr(Box::new(IrType::U8))`. A `str` value points at
+NUL-terminated bytes. A heap string may carry a header (a magic word and the
+length in the 16 bytes before the bytes) or be a plain C string;
+`core.fd:p_str_free` frees either. String temporaries that provably die where
+they are used are freed by the compiler (`lower.fd:lw_auto_drop_strs`).
 
 ### String operations
 

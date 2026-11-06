@@ -1,0 +1,603 @@
+// cowcheck.fd -- the copy-on-write migration check (proposal 0001, release M5).
+//
+// Today a Vec is a shared handle: `var b = a; b.push(1)` changes `a`, and a
+// struct copied out of a collection (`var blk = f.blocks.get(i)`) still
+// shares its Vec fields with the original. Under copy-on-write each of those
+// is a copy, so code that changes a Vec through a local copied from a place
+// and never writes the local back depends on sharing: its change is lost.
+//
+// This pass lists such places. It is a migration aid (FIDES_COW_CHECK=1),
+// not a type rule: a copy that is meant to be a copy is reported too. Each
+// report names the local, the place it was copied from and the change.
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+
+struct CowCopy {
+    name: str,
+    src: str,
+    line: i64,
+}
+
+/// Every function body, method and trait method of the program; returns the
+/// reports ("fn: message").
+pub fn cow_check_program(program: Program) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < program.funcs.len() {
+        cow_check_body(program.funcs.get(i).name, program.funcs.get(i).body, &mut out);
+        i = i + 1;
+    }
+    i = 0;
+    while i < program.impls.len() {
+        var imp: ImplDef = program.impls.get(i);
+        var k: i64 = 0;
+        while k < imp.methods.len() {
+            cow_check_body(imp.struct_name + "_" + imp.methods.get(k).name, imp.methods.get(k).body, &mut out);
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < program.trait_impls.len() {
+        var ti: TraitImpl = program.trait_impls.get(i);
+        var k2: i64 = 0;
+        while k2 < ti.methods.len() {
+            cow_check_body(ti.type_name + "_" + ti.methods.get(k2).name, ti.methods.get(k2).body, &mut out);
+            k2 = k2 + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn cow_check_body(fname: str, body: Vec<Stmt>, out: &mut Vec<str>) {
+    var copies: Vec<CowCopy> = Vec::new();
+    cow_collect_copies(body, &mut copies);
+    var ci: i64 = 0;
+    while ci < copies.len() {
+        var c: CowCopy = copies.get(ci);
+        var mut_line: i64 = cow_first_change(body, c.name, 0);
+        if mut_line > 0 && !cow_written_back(body, c.name) {
+            out.push(fname + " (line " + int_to_str(mut_line) + "): `" + c.name + "` is a copy of `" + c.src
+                + "` (line " + int_to_str(c.line) + "); this change to a Vec through it reaches `" + c.src
+                + "` only while Vecs are shared handles. Under copy-on-write it is lost: write it back (`"
+                + c.src + " = " + c.name + ";`) or change `" + c.src + "` in place.");
+        }
+        ci = ci + 1;
+    }
+}
+
+// --- Copies: `var x = <place>` -----------------------------------------------
+
+fn cow_is_value_type(ty: OptType) -> bool {
+    match ty {
+        OptType::Some(t) => {
+            match t {
+                Type::I8 => { return false; }
+                Type::I16 => { return false; }
+                Type::I32 => { return false; }
+                Type::I64 => { return false; }
+                Type::I128 => { return false; }
+                Type::U8 => { return false; }
+                Type::U16 => { return false; }
+                Type::U32 => { return false; }
+                Type::U64 => { return false; }
+                Type::U128 => { return false; }
+                Type::F32 => { return false; }
+                Type::F64 => { return false; }
+                Type::Bool => { return false; }
+                Type::Str => { return false; }
+                Type::Ref(_, _) => { return false; }
+                Type::RawPtr(_, _) => { return false; }
+                Type::Func(_, _) => { return false; }
+                Type::Named(n) => { return n != "str" && n != "i64" && n != "bool"; }
+                _ => { return true; }
+            }
+        }
+        OptType::None => { return true; }
+    }
+    return true;
+}
+
+/// The place an expression reads, as text, or "" when it makes a new value.
+fn cow_place(e: Expr) -> str {
+    match e {
+        Expr::Ident(n) => { return n; }
+        Expr::FieldAccess(obj, f) => {
+            var base: str = cow_place(box_expr_unbox(obj));
+            if base == "" { return ""; }
+            return base + "." + f;
+        }
+        Expr::Index(arr, _) => {
+            var base2: str = cow_place(box_expr_unbox(arr));
+            if base2 == "" { return ""; }
+            return base2 + "[..]";
+        }
+        Expr::MethodCall(recv, m, _) => {
+            if m == "get" || m == "first" || m == "last" {
+                var base3: str = cow_place(box_expr_unbox(recv));
+                if base3 == "" { return ""; }
+                return base3 + "." + m + "(..)";
+            }
+        }
+        _ => {}
+    }
+    return "";
+}
+
+fn cow_collect_copies(stmts: Vec<Stmt>, out: &mut Vec<CowCopy>) {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        match stmts.get(i) {
+            Stmt::Let(name, ty, e, _, _, _, line) => {
+                if cow_is_value_type(ty) {
+                    var src: str = cow_place(e);
+                    if src != "" && src != name { out.push(CowCopy { name: name, src: src, line: line }); }
+                }
+            }
+            Stmt::If(_, tb, eb, _) => {
+                cow_collect_copies(tb, out);
+                match eb {
+                    OptStmts::Some(b) => { cow_collect_copies(b, out); }
+                    OptStmts::None => {}
+                }
+            }
+            Stmt::While(_, b, _) => { cow_collect_copies(b, out); }
+            Stmt::For(_, _, b, _) => { cow_collect_copies(b, out); }
+            Stmt::Loop(b, _) => { cow_collect_copies(b, out); }
+            Stmt::Match(_, arms, _) => {
+                var a: i64 = 0;
+                while a < arms.len() {
+                    cow_collect_copies(arms.get(a).body, out);
+                    a = a + 1;
+                }
+            }
+            Stmt::RegionBlock(_, _, _, _, _, b, _) => { cow_collect_copies(b, out); }
+            Stmt::Unsafe(b, _) => { cow_collect_copies(b, out); }
+            Stmt::Sandbox(b, _) => { cow_collect_copies(b, out); }
+            _ => {}
+        }
+        i = i + 1;
+    }
+}
+
+// --- Changes to a Vec reached through the copy --------------------------------
+
+fn cow_vec_changing(m: str) -> bool {
+    return m == "push" || m == "pop" || m == "set" || m == "insert" || m == "remove"
+        || m == "clear" || m == "truncate" || m == "extend" || m == "sort" || m == "reverse"
+        || m == "resize" || m == "swap" || m == "append" || m == "retain" || m == "dedup"
+        || m == "push_str" || m == "drain" || m == "sort_by";
+}
+
+/// The variable a place expression starts from, or "".
+pub fn cow_root(e: Expr) -> str {
+    match e {
+        Expr::Ident(n) => { return n; }
+        Expr::FieldAccess(obj, _) => { return cow_root(box_expr_unbox(obj)); }
+        Expr::Index(arr, _) => { return cow_root(box_expr_unbox(arr)); }
+        Expr::MethodCall(recv, m, _) => {
+            if m == "get" || m == "first" || m == "last" { return cow_root(box_expr_unbox(recv)); }
+        }
+        _ => {}
+    }
+    return "";
+}
+
+/// Line of the first change to a Vec reached through `name`, or 0.
+pub fn cow_first_change(stmts: Vec<Stmt>, name: str, _depth: i64) -> i64 {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        var line: i64 = 0;
+        match stmts.get(i) {
+            Stmt::Let(_, _, e, _, _, _, l) => { if cow_expr_changes(e, name) { return l; } }
+            Stmt::Assign(_, _, e, l) => { if cow_expr_changes(e, name) { return l; } }
+            Stmt::IndexAssign(target, idx, _, e, l) => {
+                if target == name { return l; }
+                if cow_expr_changes(idx, name) || cow_expr_changes(e, name) { return l; }
+            }
+            Stmt::FieldAssign(obj, _, _, e, l) => {
+                // `x.f.v[i] = ..` / `x.get(i).v = ..`: a write into a Vec element
+                match obj {
+                    Expr::MethodCall(_, _, _) => { if cow_root(obj) == name { return l; } }
+                    Expr::Index(_, _) => { if cow_root(obj) == name { return l; } }
+                    _ => {}
+                }
+                if cow_expr_changes(obj, name) || cow_expr_changes(e, name) { return l; }
+            }
+            Stmt::DerefAssign(p, _, e, l) => { if cow_expr_changes(p, name) || cow_expr_changes(e, name) { return l; } }
+            Stmt::Expr(e, l) => { if cow_expr_changes(e, name) { return l; } }
+            Stmt::Return(oe, l) => {
+                match oe {
+                    OptBoxExpr::Some(re) => { if cow_expr_changes(box_expr_unbox(re), name) { return l; } }
+                    OptBoxExpr::None => {}
+                }
+            }
+            Stmt::If(c, tb, eb, l) => {
+                if cow_expr_changes(c, name) { return l; }
+                line = cow_first_change(tb, name, 0);
+                if line > 0 { return line; }
+                match eb {
+                    OptStmts::Some(b) => {
+                        line = cow_first_change(b, name, 0);
+                        if line > 0 { return line; }
+                    }
+                    OptStmts::None => {}
+                }
+            }
+            Stmt::While(c, b, l) => {
+                if cow_expr_changes(c, name) { return l; }
+                line = cow_first_change(b, name, 0);
+                if line > 0 { return line; }
+            }
+            Stmt::For(_, it, b, l) => {
+                if cow_expr_changes(it, name) { return l; }
+                line = cow_first_change(b, name, 0);
+                if line > 0 { return line; }
+            }
+            Stmt::Loop(b, _) => {
+                line = cow_first_change(b, name, 0);
+                if line > 0 { return line; }
+            }
+            Stmt::Match(e, arms, l) => {
+                if cow_expr_changes(e, name) { return l; }
+                var a: i64 = 0;
+                while a < arms.len() {
+                    line = cow_first_change(arms.get(a).body, name, 0);
+                    if line > 0 { return line; }
+                    a = a + 1;
+                }
+            }
+            Stmt::RegionBlock(_, _, _, _, _, b, _) => {
+                line = cow_first_change(b, name, 0);
+                if line > 0 { return line; }
+            }
+            Stmt::Unsafe(b, _) => {
+                line = cow_first_change(b, name, 0);
+                if line > 0 { return line; }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn cow_exprs_change(es: Vec<Expr>, name: str) -> bool {
+    var i: i64 = 0;
+    while i < es.len() {
+        if cow_expr_changes(es.get(i), name) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Whether an expression changes a Vec reached through `name`: a changing
+/// method on it or on a path from it, or `&mut` of such a path.
+fn cow_expr_changes(e: Expr, name: str) -> bool {
+    match e {
+        Expr::MethodCall(recv, m, args) => {
+            var r: Expr = box_expr_unbox(recv);
+            if cow_vec_changing(m) && cow_root(r) == name { return true; }
+            if cow_expr_changes(r, name) { return true; }
+            return cow_exprs_change(args, name);
+        }
+        Expr::Ref(inner, is_mut) => {
+            var ie: Expr = box_expr_unbox(inner);
+            if is_mut && cow_root(ie) == name { return true; }
+            return cow_expr_changes(ie, name);
+        }
+        Expr::Call(_, args) => { return cow_exprs_change(args, name); }
+        Expr::Binary(_, l, r2) => { return cow_expr_changes(box_expr_unbox(l), name) || cow_expr_changes(box_expr_unbox(r2), name); }
+        Expr::Unary(_, x) => { return cow_expr_changes(box_expr_unbox(x), name); }
+        Expr::FieldAccess(obj, _) => { return cow_expr_changes(box_expr_unbox(obj), name); }
+        Expr::Index(a, b) => { return cow_expr_changes(box_expr_unbox(a), name) || cow_expr_changes(box_expr_unbox(b), name); }
+        Expr::StrConcat(l2, r3) => { return cow_expr_changes(box_expr_unbox(l2), name) || cow_expr_changes(box_expr_unbox(r3), name); }
+        Expr::Cast(x2, _) => { return cow_expr_changes(box_expr_unbox(x2), name); }
+        Expr::If(c, tb, eb) => {
+            if cow_expr_changes(box_expr_unbox(c), name) { return true; }
+            if cow_first_change(tb, name, 0) > 0 { return true; }
+            match eb {
+                OptStmts::Some(b) => { return cow_first_change(b, name, 0) > 0; }
+                OptStmts::None => {}
+            }
+        }
+        Expr::Block(b2) => { return cow_first_change(b2, name, 0) > 0; }
+        _ => {}
+    }
+    return false;
+}
+
+// --- Write-backs: the copy used as a value -------------------------------------
+
+/// Whether `name` is used as a whole value anywhere: assigned or stored
+/// somewhere, returned, passed, put in a struct or collection. Then the
+/// change travels with it (or was meant for the copy).
+pub fn cow_written_back(stmts: Vec<Stmt>, name: str) -> bool {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        match stmts.get(i) {
+            Stmt::Let(_, _, e, _, _, _, _) => { if cow_value_use(e, name) { return true; } }
+            Stmt::Assign(_, _, e, _) => { if cow_value_use(e, name) { return true; } }
+            Stmt::IndexAssign(_, idx, _, e, _) => { if cow_value_use(e, name) || cow_inner_use(idx, name) { return true; } }
+            Stmt::FieldAssign(obj, _, _, e, _) => { if cow_value_use(e, name) || cow_inner_use(obj, name) { return true; } }
+            Stmt::DerefAssign(p, _, e, _) => { if cow_value_use(e, name) || cow_inner_use(p, name) { return true; } }
+            Stmt::Expr(e, _) => { if cow_inner_use(e, name) { return true; } }
+            Stmt::Return(oe, _) => {
+                match oe {
+                    OptBoxExpr::Some(re) => { if cow_value_use(box_expr_unbox(re), name) { return true; } }
+                    OptBoxExpr::None => {}
+                }
+            }
+            Stmt::If(c, tb, eb, _) => {
+                if cow_inner_use(c, name) || cow_written_back(tb, name) { return true; }
+                match eb {
+                    OptStmts::Some(b) => { if cow_written_back(b, name) { return true; } }
+                    OptStmts::None => {}
+                }
+            }
+            Stmt::While(c, b, _) => { if cow_inner_use(c, name) || cow_written_back(b, name) { return true; } }
+            Stmt::For(_, it, b, _) => { if cow_inner_use(it, name) || cow_written_back(b, name) { return true; } }
+            Stmt::Loop(b, _) => { if cow_written_back(b, name) { return true; } }
+            Stmt::Match(e, arms, _) => {
+                if cow_inner_use(e, name) { return true; }
+                var a: i64 = 0;
+                while a < arms.len() {
+                    if cow_written_back(arms.get(a).body, name) { return true; }
+                    a = a + 1;
+                }
+            }
+            Stmt::RegionBlock(_, _, _, _, _, b, _) => { if cow_written_back(b, name) { return true; } }
+            Stmt::Unsafe(b, _) => { if cow_written_back(b, name) { return true; } }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// `e` in a value position: `name` itself, or a value use inside it.
+fn cow_value_use(e: Expr, name: str) -> bool {
+    match e {
+        Expr::Ident(n) => { return n == name; }
+        _ => {}
+    }
+    return cow_inner_use(e, name);
+}
+
+fn cow_values_use(es: Vec<Expr>, name: str) -> bool {
+    var i: i64 = 0;
+    while i < es.len() {
+        if cow_value_use(es.get(i), name) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// A value use of `name` inside `e`: as an argument, a struct field, an
+/// element; a receiver or a field's object is not one.
+fn cow_inner_use(e: Expr, name: str) -> bool {
+    match e {
+        Expr::Call(_, args) => { return cow_values_use(args, name); }
+        Expr::MethodCall(recv, _, args) => { return cow_inner_use(box_expr_unbox(recv), name) || cow_values_use(args, name); }
+        Expr::StructLit(_, fields, _) => {
+            var fi: i64 = 0;
+            while fi < fields.len() {
+                if cow_value_use(fields.get(fi).value, name) { return true; }
+                fi = fi + 1;
+            }
+        }
+        Expr::ArrayLit(_, els) => { return cow_values_use(els, name); }
+        Expr::TupleLit(els2) => { return cow_values_use(els2, name); }
+        Expr::Ref(inner, _) => { return cow_inner_use(box_expr_unbox(inner), name); }
+        Expr::Binary(_, l, r) => { return cow_inner_use(box_expr_unbox(l), name) || cow_inner_use(box_expr_unbox(r), name); }
+        Expr::If(c, tb, eb) => {
+            if cow_inner_use(box_expr_unbox(c), name) || cow_written_back(tb, name) { return true; }
+            match eb {
+                OptStmts::Some(b) => { return cow_written_back(b, name); }
+                OptStmts::None => {}
+            }
+        }
+        Expr::Block(b2) => { return cow_written_back(b2, name); }
+        Expr::Closure(_, cbody, _) => { return cow_written_back(cbody, name) || cow_first_change(cbody, name, 0) > 0; }
+        Expr::Spawn(x) => { return cow_value_use(box_expr_unbox(x), name); }
+        Expr::Await(x2) => { return cow_value_use(box_expr_unbox(x2), name); }
+        Expr::NamedArg(_, x3) => { return cow_value_use(box_expr_unbox(x3), name); }
+        _ => {}
+    }
+    return false;
+}
+
+// --- Uses of a variable, for move on last use ------------------------------------
+
+/// A count of uses of `name` that is at least the true number, and
+/// COW_MANY when one use may run more than once (inside a loop), when the
+/// variable is assigned, borrowed with `&`, captured by a closure or
+/// shadowed, or when a construct is not looked into.
+pub const COW_MANY: i64 = 1000;
+
+fn cow_add(a: i64, b: i64) -> i64 {
+    if a >= COW_MANY || b >= COW_MANY { return COW_MANY; }
+    return a + b;
+}
+
+pub fn cow_uses_stmts(stmts: Vec<Stmt>, name: str) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < stmts.len() && n < COW_MANY {
+        n = cow_add(n, cow_uses_stmt(stmts.get(i), name));
+        i = i + 1;
+    }
+    return n;
+}
+
+fn cow_uses_opt_stmts(o: OptStmts, name: str) -> i64 {
+    match o {
+        OptStmts::Some(b) => { return cow_uses_stmts(b, name); }
+        OptStmts::None => {}
+    }
+    return 0;
+}
+
+fn cow_loop(n: i64) -> i64 {
+    if n > 0 { return COW_MANY; }
+    return 0;
+}
+
+pub fn cow_uses_stmt(s: Stmt, name: str) -> i64 {
+    match s {
+        Stmt::Let(n2, _, e, _, _, _, _) => {
+            if n2 == name { return COW_MANY; }
+            return cow_uses_expr(e, name);
+        }
+        Stmt::LetTuple(ns, e, _) => {
+            var k: i64 = 0;
+            while k < ns.len() {
+                if ns.get(k) == name { return COW_MANY; }
+                k = k + 1;
+            }
+            return cow_uses_expr(e, name);
+        }
+        Stmt::LetUninit(n3, _, _, _) => {
+            if n3 == name { return COW_MANY; }
+            return 0;
+        }
+        Stmt::Assign(t, _, e, _) => {
+            if t == name { return COW_MANY; }
+            return cow_uses_expr(e, name);
+        }
+        Stmt::IndexAssign(t2, idx, _, e2, _) => {
+            if t2 == name { return COW_MANY; }
+            return cow_add(cow_uses_expr(idx, name), cow_uses_expr(e2, name));
+        }
+        Stmt::DerefAssign(pe, _, e3, _) => { return cow_add(cow_uses_expr(pe, name), cow_uses_expr(e3, name)); }
+        Stmt::FieldAssign(obj, _, _, e4, _) => { return cow_add(cow_uses_expr(obj, name), cow_uses_expr(e4, name)); }
+        Stmt::Expr(e5, _) => { return cow_uses_expr(e5, name); }
+        Stmt::Return(oe, _) => {
+            match oe {
+                OptBoxExpr::Some(re) => { return cow_uses_expr(box_expr_unbox(re), name); }
+                OptBoxExpr::None => {}
+            }
+            return 0;
+        }
+        Stmt::Break(ob, _) => {
+            match ob {
+                OptBoxExpr::Some(be) => { return cow_uses_expr(box_expr_unbox(be), name); }
+                OptBoxExpr::None => {}
+            }
+            return 0;
+        }
+        Stmt::Continue(_) => { return 0; }
+        Stmt::Use(_, _, _) => { return 0; }
+        Stmt::CancelScope(_) => { return 0; }
+        Stmt::If(c, tb, eb, _) => {
+            return cow_add(cow_uses_expr(c, name), cow_add(cow_uses_stmts(tb, name), cow_uses_opt_stmts(eb, name)));
+        }
+        Stmt::While(c2, b, _) => { return cow_loop(cow_add(cow_uses_expr(c2, name), cow_uses_stmts(b, name))); }
+        Stmt::For(v, it, b2, _) => {
+            if v == name { return COW_MANY; }
+            return cow_add(cow_uses_expr(it, name), cow_loop(cow_uses_stmts(b2, name)));
+        }
+        Stmt::Loop(b3, _) => { return cow_loop(cow_uses_stmts(b3, name)); }
+        Stmt::Match(me, arms, _) => {
+            var n: i64 = cow_uses_expr(me, name);
+            var a: i64 = 0;
+            while a < arms.len() {
+                n = cow_add(n, cow_uses_stmts(arms.get(a).body, name));
+                a = a + 1;
+            }
+            return n;
+        }
+        Stmt::RegionBlock(_, _, _, _, _, rb, _) => { return cow_uses_stmts(rb, name); }
+        Stmt::Unsafe(ub, _) => { return cow_uses_stmts(ub, name); }
+        Stmt::Sandbox(sb, _) => { return cow_uses_stmts(sb, name); }
+        _ => {}
+    }
+    // defer, handlers, select, parallel, transactions and the rest: not looked into
+    return COW_MANY;
+}
+
+fn cow_uses_exprs(es: Vec<Expr>, name: str) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < es.len() && n < COW_MANY {
+        n = cow_add(n, cow_uses_expr(es.get(i), name));
+        i = i + 1;
+    }
+    return n;
+}
+
+pub fn cow_uses_expr(e: Expr, name: str) -> i64 {
+    match e {
+        Expr::IntLit(_) => { return 0; }
+        Expr::FloatLit(_) => { return 0; }
+        Expr::StringLit(_) => { return 0; }
+        Expr::BoolLit(_) => { return 0; }
+        Expr::ComptimeReflect(_, _) => { return 0; }
+        Expr::Ident(n) => {
+            if n == name { return 1; }
+            return 0;
+        }
+        Expr::Binary(_, l, r) => { return cow_add(cow_uses_expr(box_expr_unbox(l), name), cow_uses_expr(box_expr_unbox(r), name)); }
+        Expr::Unary(_, x) => { return cow_uses_expr(box_expr_unbox(x), name); }
+        Expr::Call(_, args) => { return cow_uses_exprs(args, name); }
+        Expr::FieldAccess(o, _) => { return cow_uses_expr(box_expr_unbox(o), name); }
+        Expr::OptionalFieldAccess(o2, _) => { return cow_uses_expr(box_expr_unbox(o2), name); }
+        Expr::StructLit(_, fields, spread) => {
+            var n: i64 = 0;
+            var fi: i64 = 0;
+            while fi < fields.len() {
+                n = cow_add(n, cow_uses_expr(fields.get(fi).value, name));
+                fi = fi + 1;
+            }
+            match spread {
+                OptBoxExpr::Some(sp) => { n = cow_add(n, cow_uses_expr(box_expr_unbox(sp), name)); }
+                OptBoxExpr::None => {}
+            }
+            return n;
+        }
+        Expr::If(c, tb, eb) => {
+            return cow_add(cow_uses_expr(box_expr_unbox(c), name), cow_add(cow_uses_stmts(tb, name), cow_uses_opt_stmts(eb, name)));
+        }
+        Expr::Range(a, b, _) => { return cow_add(cow_uses_expr(box_expr_unbox(a), name), cow_uses_expr(box_expr_unbox(b), name)); }
+        Expr::Block(bs) => { return cow_uses_stmts(bs, name); }
+        Expr::MethodCall(rc, _, margs) => { return cow_add(cow_uses_expr(box_expr_unbox(rc), name), cow_uses_exprs(margs, name)); }
+        Expr::ArrayLit(_, els) => { return cow_uses_exprs(els, name); }
+        Expr::Index(ia, ib) => { return cow_add(cow_uses_expr(box_expr_unbox(ia), name), cow_uses_expr(box_expr_unbox(ib), name)); }
+        Expr::Match(me, arms) => {
+            var n2: i64 = cow_uses_expr(box_expr_unbox(me), name);
+            var ai: i64 = 0;
+            while ai < arms.len() {
+                n2 = cow_add(n2, cow_uses_stmts(arms.get(ai).body, name));
+                ai = ai + 1;
+            }
+            return n2;
+        }
+        Expr::EnumLit(_, _, eargs) => { return cow_uses_exprs(eargs, name); }
+        Expr::Ref(rx, _) => {
+            if cow_uses_expr(box_expr_unbox(rx), name) > 0 { return COW_MANY; }
+            return 0;
+        }
+        Expr::Deref(dx) => { return cow_uses_expr(box_expr_unbox(dx), name); }
+        Expr::StrConcat(sl, sr) => { return cow_add(cow_uses_expr(box_expr_unbox(sl), name), cow_uses_expr(box_expr_unbox(sr), name)); }
+        Expr::Try(tx) => { return cow_uses_expr(box_expr_unbox(tx), name); }
+        Expr::Coalesce(ca, cb) => { return cow_add(cow_uses_expr(box_expr_unbox(ca), name), cow_uses_expr(box_expr_unbox(cb), name)); }
+        Expr::IsCheck(ix, _) => { return cow_uses_expr(box_expr_unbox(ix), name); }
+        Expr::TupleLit(tels) => { return cow_uses_exprs(tels, name); }
+        Expr::Closure(_, cbody, _) => {
+            if cow_uses_stmts(cbody, name) > 0 { return COW_MANY; }
+            return 0;
+        }
+        Expr::Cast(cx, _) => { return cow_uses_expr(box_expr_unbox(cx), name); }
+        Expr::QuantCast(qx, _) => { return cow_uses_expr(box_expr_unbox(qx), name); }
+        Expr::Await(ax) => { return cow_uses_expr(box_expr_unbox(ax), name); }
+        Expr::NamedArg(_, nx) => { return cow_uses_expr(box_expr_unbox(nx), name); }
+        Expr::PipeForward(pa, pb) => { return cow_add(cow_uses_expr(box_expr_unbox(pa), name), cow_uses_expr(box_expr_unbox(pb), name)); }
+        _ => {}
+    }
+    // f-strings, try blocks, spawn, asm, comptime: not looked into
+    return COW_MANY;
+}

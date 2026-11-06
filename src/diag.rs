@@ -85,10 +85,19 @@ pub enum ErrCode {
     NotLinear,
     LinearConsumed,
     LinearInLoop,
+    RegionEscape,
+    RegionUseAfterFree,
+    RegionBudgetExceeded,
+    GpuRegionViolation,
+    KvRegionViolation,
+    MisplacedAnnotation,
+    EscapeViolation,
+    SecrecyViolation,
 
     // Borrow checker (E080-E089)
     BorrowConflict,
     MutableBorrowConflict,
+    ThreadSafetyViolation,
 
     // Safety/contract errors (E090-E109)
     CapabilityDenied,
@@ -134,9 +143,18 @@ impl ErrCode {
             ErrCode::NotLinear => "E049",
             ErrCode::LinearConsumed => "E050",
             ErrCode::LinearInLoop => "E051",
+            ErrCode::RegionEscape => "E052",
+            ErrCode::RegionUseAfterFree => "E053",
+            ErrCode::RegionBudgetExceeded => "E054",
+            ErrCode::GpuRegionViolation => "E055",
+            ErrCode::KvRegionViolation => "E056",
+            ErrCode::MisplacedAnnotation => "E057",
+            ErrCode::EscapeViolation => "E058",
+            ErrCode::SecrecyViolation => "E059",
             // Borrow
             ErrCode::BorrowConflict => "E080",
             ErrCode::MutableBorrowConflict => "E081",
+            ErrCode::ThreadSafetyViolation => "E082",
             // Safety
             ErrCode::CapabilityDenied => "E090",
             ErrCode::SandboxViolation => "E091",

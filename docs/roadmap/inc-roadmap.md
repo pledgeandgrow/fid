@@ -4,7 +4,7 @@
 > modules never recompile; semantic (effect-scoped) dependencies skip work
 > that a call graph alone would demand.
 >
-> Created: Oct 30, 2026. Status: Phase A done on both compilers; Phase B at the C level (`--inc`) on both; Phase C not started.
+> Created: Oct 30, 2026. Status (Nov 6): Phase A done on both compilers; `.fidcache` eviction in `fid`; Phase B at the C level (`--inc`) on both; Phase C not started.
 
 ## Where it stands
 
@@ -41,7 +41,9 @@ original plan are noted inline.
       literals and preprocessor lines kept verbatim.
 - [x] A2. Artifact store: `<output_dir>/.fidcache/<key>.exe`, key =
       hash(canon, cc, opt flags, target). Gitignored. Atomic write via
-      tmp+rename; cache failures never break a build.
+      tmp+rename; cache failures never break a build. Nov 4 (`fid`,
+      `compiler/inc.fd` `inc_cache_evict`): least recently used artifacts are
+      evicted past 64 files or 1 GB.
 - [~] A3. Per-*file* source hashes were already in the stamp; per-module
       *C* hashes are impossible until Phase B splits codegen — the C
       backend emits one translation unit. Adjusted scope recorded.
@@ -63,9 +65,9 @@ original plan are noted inline.
       the `c` hash; still holds with v2 stamps).
 - [x] A8'. **Finding, not a bug:** variable/function renames do NOT get a
       shared artifact — and that's *correct*: Fides codegen emits function
-      names as string literals for panic stack traces
-      (`p_call_stack_push("plus")`), so a rename changes observable
-      behavior. The canonicalizer still dedupes raw-C renames; Fides
+      names as string literals for panic stack traces (since Nov 2 in the
+      `__p_fns` table, no longer `p_call_stack_push("plus")`), so a rename
+      changes observable behavior. The canonicalizer still dedupes raw-C renames; Fides
       programs just don't qualify. Roadmap A8 was wrong as stated.
 - [~] A9'. Dead functions can't be dropped either: every function is
       `p_thread_register`ed (spawn-by-name), i.e. address-taken, so there

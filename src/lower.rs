@@ -1255,6 +1255,8 @@ impl Lowerer {
         self.module.add_extern("p_executor_cancel", vec![IrType::I64], IrType::I64);
         // p_task_poll_nonblocking(future) -> i64 — returns value if ready, PENDING_SENTINEL if not
         self.module.add_extern("p_task_poll_nonblocking", vec![IrType::I64], IrType::I64);
+        // p_task_wait_timeout(future, ms) -> i64 — poll until ready or deadline; TIMEOUT_SENTINEL on expiry
+        self.module.add_extern("p_task_wait_timeout", vec![IrType::I64, IrType::I64], IrType::I64);
         // ─── Phase A3: Non-blocking IO ───
         // p_net_connect(host: *u8, port: i64) -> i64 (Future handle)
         self.module.add_extern("p_net_connect",
@@ -2064,7 +2066,7 @@ impl Lowerer {
                 if let Some(t) = ty {
                     self.let_hint = Some(self.resolve_self_in_type(t));
                 }
-                let val = self.lower_expr(expr);
+                let val = self.lower_value(expr);
                 self.let_hint = saved_hint;
                 // The alloca type normally follows the declared type. But when
                 // the value is a pointer to a struct (e.g. from Vec_get) and
@@ -2089,6 +2091,11 @@ impl Lowerer {
                         }
                     }
                     (Some(d), _) => d,
+                    // A struct read from somewhere is copied, as with a
+                    // declared type (value semantics; as lower.fd)
+                    (None, IrType::Ptr(inner)) if matches!(inner.as_ref(), IrType::Struct(n) if !self.enums.contains_key(n)) => {
+                        inner.as_ref().clone()
+                    }
                     (None, _) => val_ty,
                 };
                 let alloca = self.emit_inst(Inst::Alloca {
@@ -2295,7 +2302,7 @@ impl Lowerer {
                     // Mutable variable: use load/store through alloca
                     match op {
                         AssignOp::Assign => {
-                            let val = self.lower_expr(expr);
+                            let val = self.lower_value(expr);
                             // A slot holding the struct itself takes a full
                             // copy (memcpy); a slot holding a pointer to the
                             // struct takes the new pointer: copying the struct
@@ -2324,7 +2331,7 @@ impl Lowerer {
                     }
                 } else {
                     // Non-alloca variable: use direct SSA binding
-                    let val = self.lower_expr(expr);
+                    let val = if *op == AssignOp::Assign { self.lower_value(expr) } else { self.lower_expr(expr) };
                     match op {
                         AssignOp::Assign => {
                             if let Some(ref mut f) = self.current_func {
@@ -2608,7 +2615,7 @@ impl Lowerer {
                                 field_ty: field_ty.clone(),
                             });
                             if *op == AssignOp::Assign {
-                                let val = self.lower_expr(expr);
+                                let val = self.lower_value(expr);
                                 self.emit_inst(Inst::Store { ptr: field_ptr, value: val, store_ty: None });
                             } else {
                                 // Compound assignment: load current field value, apply op, store back
@@ -2644,7 +2651,7 @@ impl Lowerer {
                 } else {
                     match expr {
                         Some(e) => {
-                            let v = self.lower_expr(e);
+                            let v = self.lower_value(e);
                             Some(self.coerce_return(v))
                         }
                         None => None,
@@ -5655,7 +5662,7 @@ impl Lowerer {
                 let layout_clone = self.module.get_struct(&real_name).cloned();
                 if let Some(layout) = layout_clone {
                     for (field_name, field_expr) in fields {
-                        let field_val = self.lower_expr(field_expr);
+                        let field_val = self.lower_value(field_expr);
                         if let Some((idx, _)) = layout.fields.iter()
                             .enumerate()
                             .find(|(_, (n, _, _))| n == field_name)
@@ -7031,6 +7038,91 @@ impl Lowerer {
     }
 
     /// Infer the type of an expression (best-effort, for closure return type inference)
+    /// A value about to be stored in a second place (a variable, a field, an
+    /// element, a struct literal, a returned value): a Vec read from a place
+    /// is shared copy-on-write (proposal 0001), so changing one copy leaves
+    /// the other as it was.
+    fn lower_value(&mut self, expr: &Expr) -> ValueId {
+        let val = self.lower_expr(expr);
+        let place = match expr {
+            Expr::Ident(_) | Expr::FieldAccess { .. } | Expr::Index { .. } => true,
+            Expr::MethodCall { method, .. } => method == "get",
+            _ => false,
+        };
+        if !place {
+            return val;
+        }
+        let ty = self.get_value_type(val);
+        // A HashMap read into a second place is shared copy-on-write too
+        // (proposal 0001; as compiler/lower.fd Lowerer_lower_value).
+        if ty.is_opaque_named("HashMap") {
+            let mut effects = EffectSet::new();
+            effects.add(Effect::Alloc);
+            effects.add(Effect::Write);
+            let env = self.emit_inst_raw(Inst::ConstInt { value: 0, ty: IrType::I64 });
+            return self.emit_inst_raw(Inst::Call { func: "HashMap_share".to_string(), args: vec![env, val], ret_ty: ty.clone(), effects });
+        }
+        if !ty.is_opaque_named("Vec") {
+            return val;
+        }
+        self.emit_vec_share(val, &ty)
+    }
+
+    /// A copy-on-write share of the Vec `val` of type `ty`: Vec_share, or for
+    /// a Vec of Vecs or of structs Vec_share_deep, which gives the new Vec
+    /// elements of its own (proposal 0001).
+    fn emit_vec_share(&mut self, val: ValueId, ty: &IrType) -> ValueId {
+        let raw_elem = ty.generic_elem().cloned();
+        // Vec<str> shares its strings too: duplicated until str is a counted
+        // value (M11), so neither side's elements dangle on the last drop.
+        let str_elems = matches!(&raw_elem,
+            Some(IrType::Ptr(inner)) if **inner == IrType::U8)
+            || raw_elem.as_ref().map(|e| e.is_opaque_named("str") || e.is_opaque_named("String")).unwrap_or(false);
+        let elem = raw_elem.map(|e| match e {
+            IrType::Ptr(inner) => *inner,
+            other => other,
+        });
+        let (kind, words, mask) = match &elem {
+            _ if str_elems => (3i64, 0i64, 0i64),
+            Some(e) if e.is_opaque_named("Vec") => (1, 0, 0),
+            Some(IrType::Struct(n)) if !self.enums.contains_key(n) && self.module.get_struct(n).is_some() => {
+                let words = ((self.module.type_size(&IrType::Struct(n.clone())) + 7) / 8) as i64;
+                (2, words.max(1), self.vec_field_mask(n, 0))
+            }
+            _ => (0, 0, 0),
+        };
+        let mut effects = EffectSet::new();
+        effects.add(Effect::Alloc);
+        effects.add(Effect::Write);
+        let env = self.emit_inst_raw(Inst::ConstInt { value: 0, ty: IrType::I64 });
+        if kind == 0 {
+            return self.emit_inst_raw(Inst::Call { func: "Vec_share".to_string(), args: vec![env, val], ret_ty: ty.clone(), effects });
+        }
+        let k = self.emit_inst_raw(Inst::ConstInt { value: kind, ty: IrType::I64 });
+        let w = self.emit_inst_raw(Inst::ConstInt { value: words, ty: IrType::I64 });
+        let m = self.emit_inst_raw(Inst::ConstInt { value: mask, ty: IrType::I64 });
+        self.emit_inst_raw(Inst::Call { func: "Vec_share_deep".to_string(), args: vec![env, val, k, w, m], ret_ty: ty.clone(), effects })
+    }
+
+    /// Bit i set: word i of the struct `name` (from word `base`) is a Vec.
+    fn vec_field_mask(&self, name: &str, base: i64) -> i64 {
+        let Some(layout) = self.module.get_struct(name).cloned() else { return 0 };
+        let mut mask = 0i64;
+        let mut at = base;
+        for (_, fty, _) in &layout.fields {
+            if fty.is_opaque_named("Vec") && at < 63 {
+                mask |= 1 << at;
+            }
+            if let IrType::Struct(sub) = fty {
+                if !self.enums.contains_key(sub) && base < 32 {
+                    mask |= self.vec_field_mask(sub, at);
+                }
+            }
+            at += ((self.module.type_size(fty) + 7) / 8).max(1) as i64;
+        }
+        mask
+    }
+
     /// An argument, read through when it is a `&mut`/`&` parameter of the
     /// current function holding a Vec, HashMap or str and the callee's
     /// parameter takes the value: the reference points at the caller's slot.
@@ -7535,6 +7627,67 @@ impl Lowerer {
     // ─── Helpers ────────────────────────────────────────────────────────
 
     fn emit_inst(&mut self, inst: Inst) -> ValueId {
+        // A struct stored whole (a copy by value): its Vec fields are shared
+        // copy-on-write (proposal 0001)
+        let copied = match &inst {
+            Inst::Store { ptr, store_ty: Some(IrType::Struct(n)), .. } => Some((*ptr, n.clone())),
+            _ => None,
+        };
+        let id = self.emit_inst_raw(inst);
+        if let Some((ptr, n)) = copied {
+            self.emit_struct_share(ptr, &n, 0);
+        }
+        id
+    }
+
+    /// The Vec fields of the struct at `ptr` (nested struct fields too)
+    /// become copy-on-write shares of the ones they were copied from.
+    fn emit_struct_share(&mut self, ptr: ValueId, name: &str, depth: usize) {
+        if depth > 8 {
+            return;
+        }
+        // An enum's layout lists variant payload slots as fields: walking
+        // them as struct fields would share tag/payload words as Vecs.
+        // Enum copies stay bitwise until variant-aware sharing lands.
+        if self.enums.contains_key(name) {
+            return;
+        }
+        let Some(layout) = self.module.get_struct(name).cloned() else { return };
+        if name == "StructDef" {
+            eprintln!("ESHARE {} fields={:?}", name, layout.fields.iter().map(|(n,t,o)| format!("{}@{:?}@{:?}", n, o, t)).collect::<Vec<_>>());
+        }
+        // The field addresses are taken from a pointer typed as this
+        // struct: `ptr` may be typed as what holds it (an enum's payload
+        // slot, Ptr(I64)), whose layout gives other offsets — without the
+        // cast GetFieldPtr falls back to field_index * 8 and shares words
+        // inside enum payloads (as compiler/lower.fd emit_struct_share).
+        let sty = IrType::Ptr(Box::new(IrType::Struct(name.to_string())));
+        let ptr = if self.get_value_type(ptr) == sty {
+            ptr
+        } else {
+            let from = self.get_value_type(ptr);
+            self.emit_inst_raw(Inst::BitCast { value: ptr, from, to: sty })
+        };
+        for (idx, (_, field_ty, _)) in layout.fields.iter().enumerate() {
+            let is_vec = field_ty.is_opaque_named("Vec");
+            let sub = match field_ty { IrType::Struct(s) => Some(s.clone()), _ => None };
+            if !is_vec && sub.is_none() {
+                continue;
+            }
+            let fp = self.emit_inst_raw(Inst::GetFieldPtr { struct_ptr: ptr, field_index: idx as u32, field_ty: field_ty.clone() });
+            if let Some(s) = sub {
+                if !self.enums.contains_key(&s) {
+                    self.emit_struct_share(fp, &s, depth + 1);
+                }
+                continue;
+            }
+            let v = self.emit_inst_raw(Inst::Load { ptr: fp, ty: field_ty.clone() });
+            let shared = self.emit_vec_share(v, field_ty);
+            self.emit_inst_raw(Inst::Store { ptr: fp, value: shared, store_ty: None });
+        }
+    }
+
+    fn emit_inst_raw(&mut self, inst: Inst) -> ValueId {
         if let Some(ref mut f) = self.current_func {
             let id = f.emit(inst);
             // Set source line for debug info
@@ -8332,11 +8485,17 @@ impl Lowerer {
                     // Nested struct: recurse
                     self.emit_struct_copy(src_field, dst_field, sub_name);
                 } else {
-                    // Scalar field: load + store
+                    // Scalar field: load + store (a Vec field is shared
+                    // copy-on-write)
                     let field_val = self.emit_inst(Inst::Load {
                         ptr: src_field,
                         ty: field_ty.clone(),
                     });
+                    let field_val = if field_ty.is_opaque_named("Vec") {
+                        self.emit_vec_share(field_val, field_ty)
+                    } else {
+                        field_val
+                    };
                     self.emit_inst(Inst::Store {
                         ptr: dst_field,
                         value: field_val,
@@ -8383,6 +8542,9 @@ pub fn lower(program: &Program) -> IrModule {
 const VEC_LOCAL_CALLS: &[&str] = &[
     "Vec_push", "Vec_pop", "Vec_len", "Vec_is_empty", "Vec_get", "Vec_set", "Vec_clear",
     "Vec_capacity", "Vec_contains", "Vec_first", "Vec_last", "Vec_truncate", "Vec_reverse", "Vec_sort",
+    // A share uses the Vec, keeping no reference: the share's count is what
+    // the new owner drops, the source keeps its own.
+    "Vec_share", "Vec_share_deep",
 ];
 
 /// Per function, per argument: 1 for a Vec it only uses, keeping no reference
@@ -8486,7 +8648,9 @@ fn auto_drop_vecs(module: &mut IrModule) {
 
 fn drop_function_vecs(f: &mut IrFunction, borrows: &VecBorrows) {
     let order: Vec<ValueId> = f.blocks.iter().flat_map(|b| b.instructions.iter().copied()).collect();
-    let is_new = |f: &IrFunction, id: &ValueId| matches!(f.instructions.get(id), Some(Inst::Call { func, .. }) if func == "Vec_new");
+    // A share makes a header the slot owns (its buffer is counted), so a
+    // slot receiving one may be dropped like one holding a Vec_new.
+    let is_new = |f: &IrFunction, id: &ValueId| matches!(f.instructions.get(id), Some(Inst::Call { func, .. }) if func == "Vec_new" || func == "Vec_share" || func == "Vec_share_deep");
     if !order.iter().any(|id| is_new(f, id)) {
         return;
     }
@@ -8567,6 +8731,22 @@ fn drop_function_vecs(f: &mut IrFunction, borrows: &VecBorrows) {
                     new.push(detached_inst(f, Inst::Store { ptr: shadow, value, store_ty: None }));
                 }
                 Some(Inst::Return { .. }) => {
+                    // Params the caller shared into, only borrowed here: the
+                    // function's header dies at the return (proposal 0001; as
+                    // compiler/lower.fd). `&Vec` params point at the caller's
+                    // header and are never dropped.
+                    if let Some(row) = borrows.get(&f.name) {
+                        let param_drops: Vec<ValueId> = f.params.iter().enumerate()
+                            .filter(|(i, (_, pty))| {
+                                row.get(*i).copied().unwrap_or(false)
+                                    && matches!(pty, IrType::Generic(n, _) | IrType::Opaque(n) if n == "Vec")
+                            })
+                            .map(|(_, (pid, _))| *pid)
+                            .collect();
+                        for pid in param_drops {
+                            drop_value(f, "Vec_drop", pid, &mut new);
+                        }
+                    }
                     for s in &kept {
                         drop_shadow(f, "Vec_drop", shadows[s], &mut new);
                     }

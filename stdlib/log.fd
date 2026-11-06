@@ -1,7 +1,8 @@
 // Fides Logging standard library
 //
 // A small structured logger:
-//   - levels: TRACE DEBUG INFO WARN ERROR (compile-time-free, runtime gate)
+//   - levels: TRACE DEBUG INFO WARN ERROR (compile-time-free, runtime gate,
+//     plus a per-module override via log_set_module_level/logmf)
 //   - text format (logfmt):  ts=... level=info msg="hello" key=value
 //   - JSON lines:            {"ts":"...","level":"info","msg":"hello","key":"value"}
 //   - sinks: stdout, stderr, or a file (append)
@@ -197,8 +198,9 @@ fn log_json_raw_ok(s: str) -> bool {
     return seen_digit;
 }
 
-/// Build the logfmt text line.
-fn log_render_text(level: i64, msg: str, fields: Vec<str>) -> str {
+/// Build the logfmt text line. Public so a caller (or a test) can check the
+/// output against the format without emitting it.
+pub fn log_render_text(level: i64, msg: str, fields: Vec<str>) -> str {
     var line = "";
     var ts = log_timestamp();
     if str_len(ts) > 0 {
@@ -216,8 +218,9 @@ fn log_render_text(level: i64, msg: str, fields: Vec<str>) -> str {
     return line;
 }
 
-/// Build the JSON line.
-fn log_render_json(level: i64, msg: str, fields: Vec<str>) -> str {
+/// Build the JSON line. Public so a caller (or a test) can parse the output
+/// against the JSON spec without emitting it (CO4).
+pub fn log_render_json(level: i64, msg: str, fields: Vec<str>) -> str {
     var line = "{";
     var first = true;
     var ts = log_timestamp();
@@ -274,6 +277,59 @@ pub fn log_logf(level: i64, msg: str, fields: Vec<str>) -> void {
 pub fn log_log(level: i64, msg: str) -> void {
     var f = Vec::new();
     log_logf(level, msg, f);
+}
+
+// ─── Per-module levels (CO4) ────────────────────────────────────────────
+// A module name can carry its own level: only its messages at or above it
+// are emitted; the others follow the global log_set_level.
+
+var log_module_levels: i64 = 0;   // HashMap module name -> level (0 = unset)
+
+/// Emit `module`'s messages only at or above `level`.
+pub fn log_set_module_level(module: str, level: i64) -> void {
+    if log_module_levels == 0 { log_module_levels = HashMap_new(); }
+    HashMap_insert(log_module_levels, module as i64, level);
+}
+
+/// The level that applies to `module`: its override, else the global one.
+pub fn log_module_level(module: str) -> i64 {
+    if log_module_levels == 0 { return log_min_level; }
+    var v: i64 = HashMap_get(log_module_levels, module as i64);
+    if v == 0 { return log_min_level; }
+    return v;
+}
+
+/// Drop `module`'s override: it follows the global level again.
+pub fn log_clear_module_level(module: str) -> void {
+    if log_module_levels == 0 { return; }
+    HashMap_remove(log_module_levels, module as i64);
+}
+
+/// Log `msg` at `level` for `module`, honoring its override; the module
+/// name is emitted as the "module" field.
+pub fn logmf(level: i64, module: str, msg: str, fields: Vec<str>) -> void {
+    if level < log_module_level(module) { return; }
+    var f: Vec<str> = Vec::new();
+    f.push("module");
+    f.push(module);
+    var i: i64 = 0;
+    while i < fields.len() {
+        f.push(fields.get(i));
+        i = i + 1;
+    }
+    var line: str = "";
+    if log_json == 1 {
+        line = log_render_json(level, msg, f);
+    } else {
+        line = log_render_text(level, msg, f);
+    }
+    log_emit(line);
+}
+
+/// As logmf, without fields.
+pub fn logm(level: i64, module: str, msg: str) -> void {
+    var f: Vec<str> = Vec::new();
+    logmf(level, module, msg, f);
 }
 
 // ─── Level shortcuts ────────────────────────────────────────────────────

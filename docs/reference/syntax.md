@@ -1,13 +1,13 @@
 # Fides Language Syntax Specification
 
 **Version:** 0.5.0
-**Status:** Phase 4D — Direct PE/ELF64 emitters (x86_64) + MASM backend + C codegen backend + WASM/SPIR-V backends + multi-arch assembly (x86-64/ARM64/RISC-V) + IR interpreter + PIR pipeline (L1/L2/L3) + **self-hosted compiler with bootstrap fixpoint**
+**Status (Nov 6, 2026):** self-hosted compiler `fid` with bootstrap fixpoint. Backends: interpreter (`fid run`), C (`fid ccompile`), native Windows x64 (`fid emit`); Linux x64 through C. ARM64, RISC-V, WASM, macOS, native ELF and bare metal are experimental / incomplete.
 
-> **Implementation Status:** This document is the full language specification. Not all features are implemented yet — sections marked with implementation status (✅ working / ⚠️ partial / ❌ parsed-only or planned). See `features.md` for the authoritative feature matrix and `docs/architecture.md` for the compiler pipeline.
+> **Implementation Status:** This document describes the language design, with implementation status marked in places (✅ working / ⚠️ partial / ❌ parsed-only or planned). The language is what the self-hosted compiler `fid` accepts; [reference.md](reference.md) describes it rule by rule from the compiler source and is right where this document disagrees. See `features.md` for the feature matrix and `architecture.md` for the compiler pipeline.
 >
-> **Self-hosting status (session 15):** The Fides compiler is self-hosted. 25 modules (61K LOC) rewritten from Rust to Fides. Bootstrap fixpoint achieved: `fides-c2.c == fides-c3.c` (SHA256-identical, 701,100 lines).
+> **Self-hosting status (Nov 6, 2026):** The Fides compiler is self-hosted: 61 modules (133,688 lines), bootstrap fixpoint (stage 2 C == stage 3 C, 49 MB) checked on every release build. (First reached in session 15 with 25 modules.) Counts: [CURRENT.md → Numbers](../../CURRENT.md#numbers).
 >
-> **Tier 3 OS features (session 16):** `@cpu_local` per-CPU variables (GS segment), inline asm clobber lists, `--no-std` bare-metal mode, cross-compilation target dispatch, UEFI boot services bindings (`stdlib/uefi.fd`).
+> **Tier 3 OS features (session 16):** inline asm clobber lists, `--no-std` bare-metal mode, cross-compilation target dispatch. `stdlib/uefi.fd` and `stdlib/kernel.fd` moved to the fides-os project; bare metal is incomplete (`emit --bare` panics).
 
 ## 1. Design Philosophy
 
@@ -18,8 +18,8 @@ Fides is a systems programming language designed for safety, clarity, and modern
 1. **Safe by default** — Bounds checks, ownership, and capabilities are enforced by default. The `unsafe { }` block exists for opting out of bounds checks (e.g. inside stdlib `core.fd`), but ordinary user code is safe without explicit annotation.
 2. **No hidden control flow** — No exceptions. All effects (IO, async, errors) are explicit in function signatures.
 3. **No macros** — Compile-time code execution via `comptime` blocks. String interpolation via `f"..."`. No macro system at all.
-4. **Region inference** — The compiler deduces memory regions (lifetimes) automatically. Explicit annotations are rare.
-5. **Capability-based security** — No ambient authority. File, network, and hardware access require explicit capabilities.
+4. **No lifetime annotations** — References are second-class (they cannot be stored or returned from locals), so no lifetimes are written. `region r { }` is a scope with an optional size budget.
+5. **Capabilities and effects** — `use m with { IO, FS }` grants capabilities, checked per call by name; inferred effects (`!IO`, `!{}`) are checked through the call graph.
 6. **AI-friendly syntax** — Syntax choices prioritize AI model comprehension. Familiar patterns from Rust, Python, Swift.
 7. **One keyword per concept** — `fn` for all functions (named, anonymous, async, comptime). `val` for all variables. `const` for constants. `cap` for traits/capabilities.
 
@@ -29,13 +29,13 @@ Fides is a systems programming language designed for safety, clarity, and modern
 - Algebraic enums and pattern matching (`match` / `=>`)
 - Traits and impl blocks
 - `Result<T, E>` + `?` operator
-- `@attribute` syntax (Fides-native; `#[...]` also parsed for `#[test]`)
+- `@annotation` syntax (`#[...]` is parsed and ignored)
 - `pub` visibility
 - `<T>` generics with trait bounds
 - `for x in iter` loops
 - `..` and `..=` ranges
-- `&str` / `String` string model
-- `[T; N]` / `Vec<T>` / `&[T]` collection model
+- `str` (owned) / `&str` (borrowed) string model
+- `[T; N]` / `Vec<T>` collection model
 
 ### 1.3 What Fides Does Differently
 
@@ -49,14 +49,14 @@ Fides is a systems programming language designed for safety, clarity, and modern
 | Type alias keyword | `type` | `type` |
 | Closures | `\|x\| x * 2` | `fn(x) { x * 2 }` or `fn(x) => x * 2` |
 | String formatting | `println!("{} + {}", a, b)` | `println(f"{a} + {b}")` |
-| Lifetimes | `'a`, `'b` explicit | Region inference (rarely explicit) |
+| Lifetimes | `'a`, `'b` explicit | None: references cannot be stored or escape |
 | Macros | `macro_rules!`, proc macros | `comptime` blocks (no macros) |
 | Unsafe code | `unsafe { }` blocks | `unsafe { }` blocks (skip bounds checks — used in stdlib `core.fd`) |
 | Error handling | `Result<T, E>` only | `Result<T, E>` + effect handlers (`!Effect`) |
-| Async | `async fn` / `.await` | `async fn` / `.await` (sugar over effects) |
+| Async | `async fn` / `.await` | `async fn` / prefix `await e` |
 | Compile-time code | Procedural macros | `comptime { }` blocks |
-| Hot reload | Not supported | Built-in (`fidesc watch`) |
-| Capability security | Not built-in | Core language feature |
+| Hot reload | Not supported | Rebuild and rerun on save (`fidesc watch`) |
+| Capability security | Not built-in | `use … with { … }`, `sandbox { }` |
 
 ---
 
@@ -81,7 +81,7 @@ true        false
 
 **Note:** `none`, `some`, `ok`, `err` are NOT keywords — they are enum variant names from the standard library (`Option` and `Result`). They are listed here for reference only and are not in the keyword block above.
 
-**Keyword reference** (from `src/lexer.rs`):
+**Keyword reference** (from `compiler/lexer.fd`; the full reserved list, including `yield`, `resume` and the type names, is in reference.md §1.4):
 
 | Keyword | Purpose |
 |---------|---------|
@@ -102,20 +102,20 @@ true        false
 | `comptime` | Compile-time code execution |
 | `defer` | Deferred cleanup (Go-style) |
 | `spawn` | Spawn concurrent task (✅ implemented — OS thread model) |
-| `async` / `await` | Async functions (✅ implemented — eager evaluation, OS thread model; state machine transform pending) |
+| `async` / `await` | Async functions (✅ green tasks on their own stacks; `await e` is prefix; native async crashes) |
 | `try` | Try blocks for error handling |
 | `unsafe` | Unsafe block (skip bounds checks — framework/stdlib use only) |
 | `sandbox` | Sandbox block (restricted execution context) |
-| `txn` | Atomic transaction block with rollback on failure |
-| `persist` | Persistent variable annotation |
-| `given` / `ensure` | Design by Contract — preconditions/postconditions |
+| `txn` | Transaction block: `fid run` snapshots memory at entry; C and native run the body with no rollback |
+| `persist` | Keeps a variable across hot reloads; a plain `val`/`var` otherwise |
+| `given` / `ensure` | Contracts: `given` is checked at calls with constant arguments; `ensure` is parsed and not checked |
 | `guard` | Guard clause |
 | `is` | Type check operator |
 | `select` | Channel select statement |
 | `layer` / `model` / `grad` / `backward` | ML/deep learning primitives |
 | `kernel` / `component` / `system` / `query` / `state` / `on` | Domain-specific declarations |
 | `asm!` | Inline assembly with operands and clobbers (✅ implemented — PE backend, 50+ x86 instructions) |
-| `@cpu_local` | Per-CPU variable annotation (GS segment, ✅ implemented) |
+| `@cpu_local` | Accepted by the name check; no pass reads it in `fid` |
 
 ### 2.2 Operators
 
@@ -153,18 +153,22 @@ Namespace:   ::
 ### 2.5 Literals
 
 ```fides
-42          // i32 (inferred)
-42i64       // explicit i64
+42          // integer; `val x = 42` is an i64
 3.14        // f64
-3.14f32     // explicit f32
 true        // bool
 false       // bool
-"hello"     // &str
+"hello"     // str
+r"C:\dir"   // raw string
 f"hello"    // interpolated string (f-string)
-b"bytes"    // &[u8]
-'c'         // char
-[1, 2, 3]   // array literal
+'c'         // integer: the character's Unicode scalar value (99)
+[1, 2, 3]   // array literal (elements are i64)
+0xFF 0b1010 0o17 1_000_000
 ```
+
+There are no literal suffixes (`42i64` is `42` followed by the keyword `i64`,
+a parse error; write `42 as i64` or annotate the variable), no byte-string
+literals (`b"…"`), and no `char` type. A float literal needs digits on both
+sides of the `.`; `1e5` is not a float.
 
 ### 2.6 F-String Interpolation
 
@@ -179,10 +183,11 @@ f"Hello, {name}!"                    // "Hello, World!"
 f"{x} + {y} = {x + y}"              // "5 + 10 = 15"
 f"Point: ({p.x}, {p.y})"            // field access
 f"Length: {nums.len()}"             // method call
-f"Pi = {3.14159:.2}"                // format specifier → "Pi = 3.14"
-f"Hex: {x:#x}"                      // hex format → "Hex: 0x5"
-f"{{escaped}}"                      // literal braces → "{escaped}"
 ```
+
+There are no format specifiers: the parser reads one expression from the
+braces and ignores the tokens after it (`{x:#x}` is `{x}`). There is no escape
+for a literal brace (`{{` is not one).
 
 ---
 
@@ -191,16 +196,19 @@ f"{{escaped}}"                      // literal braces → "{escaped}"
 ### 3.1 Primitive Types
 
 ```
-Integers:   i8  i16  i32  i64  i128  isize
-            u8  u16  u32  u64  u128  usize
+Integers:   i8  i16  i32  i64  i128
+            u8  u16  u32  u64  u128
 Floats:     f32  f64
 Boolean:    bool
-Character:  char
-String:     str (used as &str)  String (owned)
-Byte:       u8  &[u8]
-Unit:       () (void/empty)
+String:     str (owned)  &str (borrowed)
+Unit:       void, () (empty tuple)
 Never:      ! (diverges / never returns)
 ```
+
+There is no `char` (a character literal is an integer), `isize`, `usize` or
+slice type. `str` is owned text; `&str` is a borrowed string that can be read,
+compared, printed and joined with `+` but not returned as `str` or stored
+(`test_borrowed_str.fd`). `str_clone(s)` makes an owned copy.
 
 ### 3.2 Compound Types
 
@@ -209,19 +217,16 @@ Never:      ! (diverges / never returns)
 [T; N]          // type
 [1, 2, 3]       // literal
 
-// Slice — borrowed view into array/vec
-&[T]            // borrowed slice
-
 // Vector — growable, heap allocated
 Vec<T>          // type
-vec![1, 2, 3]   // literal (function, not macro)
+Vec::new()      // empty; add elements with push (there is no vec![…])
 
 // Tuple
 (T1, T2, T3)    // type
 (a, b, c)       // literal
 
 // Function type
-fn(x: i32) -> i32   // type signature
+fn(i32) -> i32      // type signature (the -> is required)
 ```
 
 ### 3.3 Custom Types
@@ -233,46 +238,44 @@ struct Point {
     y: f64,
 }
 
-// Tuple struct
-struct Color(u8, u8, u8);
-
-// Unit struct
-struct Empty;
-
 // Enum — sum type (algebraic)
 enum Shape {
-    Circle { radius: f64 },
-    Rectangle { width: f64, height: f64 },
-    Triangle(f64, f64, f64),    // tuple variant
-    Point,                       // unit variant
+    Circle(f64),
+    Rectangle(width: f64, height: f64),   // named payload
+    Triangle(f64, f64, f64),
+    Point,                                // unit variant
 }
 
 // Generic type
-struct HashMap<K, V> {
-    buckets: Vec<Option<(K, V)>>,
+struct Pair<K, V> {
+    key: K,
+    value: V,
 }
 
 // type alias
 type Score = i32;
 ```
 
+There are no tuple structs (`struct Color(u8, u8, u8)`), no unit structs
+(`struct Empty;`), no struct-like enum variants (`Circle { radius: f64 }`) and
+no explicit discriminants.
+
 ### 3.4 Standard Library Types
 
 ```fides
-Option<T>        // enum Option<T> { Some(i64), None }  — uniform i64 representation
-Result<T, E>     // enum Result<T, E> { Ok(i64), Err(i64) }  — uniform i64 representation
+Option<T>        // enum Option<T> { Some(T), None }
+Result<T, E>     // enum Result<T, E> { Ok(T), Err(E) }
 Vec<T>           // growable array
-String           // owned string
-HashMap<K, V>    // hash map
+HashMap<K, V>    // hash map (str or integer keys)
 Box<T>           // heap indirection (enables recursive types)
 Rc<T>            // reference-counted smart pointer (manual refcount)
 Arc<T>           // atomic reference-counted smart pointer (manual refcount)
 ```
 
-**Note:** `Option<T>` and `Result<T, E>` are declared with type parameters in
-`stdlib/core.fd`. The type parameters are syntactic — the internal representation
-uses uniform `i64` for all variant data. This means `Option` and `Option<T>` are
-compatible types, and methods like `.unwrap()` work on both.
+**Note:** `Option<T>` and `Result<T, E>` are generic enums in
+`stdlib/core.fd`. `fid` instantiates their methods for each `T` a program uses
+(`Option<f64>`'s `unwrap` returns an `f64`). On an `Option` written without
+its type argument, `T` is `i64`.
 
 **Box<T>** enables recursive types via heap indirection. `enum Expr { Add(Box<Expr>, Box<Expr>) }`
 compiles and runs correctly. `Box::new(x)` allocates on the heap and returns a pointer.
@@ -319,37 +322,37 @@ Fides's stdlib lives in `stdlib/` and is imported explicitly via `use` (except `
 
 ### 3.5 Built-in Type Methods
 
-#### String Methods
+#### String Functions
+
+`str` has no methods; core provides functions (reference.md §13.4):
 
 ```fides
-val s: String = "Hello";
+val s: str = "Hello";
 
-s.len() -> i64              // length in bytes
-s.is_empty() -> bool        // true if length == 0
-s.push_str(other: String) -> String  // concatenation
-s.to_string() -> String     // identity conversion
-s.slice(start: i64, end: i64) -> String  // substring
-s.contains(needle: String) -> bool       // substring search
-s.starts_with(prefix: String) -> bool
-s.ends_with(suffix: String) -> bool
-s.trim() -> String          // strip whitespace
-s.split(delim: String) -> String         // split on delimiter
-s.replace(old: String, new: String) -> String
-s.char_at(idx: i64) -> String           // single char as string
-s.to_uppercase() -> String
-s.to_lowercase() -> String
-s.parse_int() -> i64        // parse string as integer
-s.find(needle: String) -> i64           // index or -1
-s.rfind(needle: String) -> i64          // last index or -1
-s.repeat(n: i64) -> String  // repeated string
-s.bytes() -> i64            // byte count
-s.clone() -> String         // deep copy
+str_len(s) -> i64                       // length in bytes
+str_slice(s, start, end) -> str         // substring
+str_contains(s, needle) -> bool
+str_starts_with(s, prefix) -> bool
+str_ends_with(s, suffix) -> bool
+str_trim(s) -> str
+str_split(s, delim) -> Vec<str>
+str_replace(s, old, new) -> str
+str_to_upper(s) -> str
+str_to_lower(s) -> str
+str_parse_int(s) -> i64
+str_find(s, needle) -> i64              // index or -1
+str_rfind(s, needle) -> i64
+str_repeat(s, n) -> str
+str_byte_at(s, i) -> i64
+str_clone(s) -> str                     // owned copy
 ```
+
+`StringBuilder` (`StringBuilder::new()`, `append_str`, `to_str`) builds strings.
 
 #### Vec Methods
 
 ```fides
-val v: Vec<i64> = vec![1, 2, 3];
+val v: Vec<i64> = Vec::new();
 
 v.push(val: i64)            // append element
 v.pop() -> i64              // remove and return last
@@ -374,20 +377,24 @@ v.clone() -> Vec<i64>       // deep copy
 #### HashMap Methods
 
 ```fides
-val m: HashMap<String, i64> = hashmap![];
+val m: HashMap<str, i64> = HashMap::new();
 
-m.insert(key: String, val: i64)  // insert/update
-m.get(key: String) -> i64        // lookup (0 if missing)
-m.get_or(key: String, default: i64) -> i64  // lookup with default
-m.contains(key: String) -> bool  // key exists
-m.remove(key: String)            // delete by key
+m.insert(key: str, val: i64)     // insert/update
+m.get(key: str) -> i64           // lookup (0 if missing)
+m.get_or(key: str, default: i64) -> i64  // lookup with default
+m.contains(key: str) -> bool     // key exists
+m.remove(key: str)               // delete by key
 m.len() -> i64                   // entry count
 m.is_empty() -> bool             // true if empty
 m.clear()                        // remove all
-m.keys() -> Vec<String>          // all keys
+m.keys() -> Vec<str>             // all keys
 m.values() -> Vec<i64>           // all values
-m.clone() -> HashMap<String, i64>  // deep copy
+m.clone() -> HashMap<str, i64>   // deep copy
 ```
+
+Keys may also be integers (`HashMap<i64, V>`, `test_hashmap_int_keys.fd`).
+0 and -1 are ordinary keys; the two integers `0x5DEECE66D1234567` and its
+complement are reserved and panic.
 
 ---
 
@@ -416,31 +423,29 @@ fn identity<T>(x: T) -> T {
     x
 }
 
-// Generic with cap bound
-fn max<T: Ord>(a: T, b: T) -> T {
-    if a >= b { a } else { b }
+// Generic with cap bounds (each bound is checked at the call)
+fn show_twice<T: Show + Clone>(a: T) -> str {
+    return a.show() + a.show();
 }
 
-// Generic with where clause
-fn merge<T, U>(left: Vec<T>, right: Vec<U>) -> Vec<(T, U)>
-    where T: Clone, U: Clone
-{
-    // ...
-}
+// Default and named arguments
+fn add(a: i64, b: i64 = 10) -> i64 { return a + b; }
+val s = add(b: 2, a: 1);
 
-// Async function
-async fn fetch(url: &str) -> Result<str, NetError> {
-    val response = http_get(url).await?;
-    Ok(response.body)
+// Async function: declared Future<T>, body returns T
+async fn compute(x: i64) -> Future<i64> {
+    return x * 2;
 }
+val r = await compute(1);       // await is a prefix operator
 
-// Function with effect handlers (advanced)
-fn read_config(path: &str) -> Config !FileIO + LogIO {
-    val data = read_file(path)?;
-    handle LogIO::Info(f"Loaded {path}");
-    parse_config(data)
+// Declared effects
+fn read_config(path: str) -> str !{IO} {
+    return read_file(path);
 }
 ```
+
+There are no `where` clauses; write bounds in the parameter list
+(`<T: A + B>`). There is no postfix `.await`.
 
 ### 4.2 Closures
 
@@ -458,17 +463,14 @@ val multiplier = 3;
 val multiply = fn(x: i32) -> i32 => x * multiplier;
 
 // Closure as argument
-val nums = vec![1, 2, 3];
-val doubled = nums.map(fn(x: i32) -> i32 => x * 2);
+val doubled = nums.map(fn(x: i64) -> i64 => x * 2);
 
 // Closure with no parameters
 val greet = fn() => println("Hello!");
-
-// Async closure
-val task = async fn() {
-    fetch("https://example.com").await
-};
 ```
+
+A closure copies the variables it names when it is created. There are no
+async closures.
 
 ### 4.3 Function Pointers
 
@@ -500,10 +502,9 @@ counter += 1;
 val x: i64 = 42;
 var buffer: Vec<u8> = Vec::new();
 
-// Destructuring
-val Point { x, y } = point;
+// Destructuring (tuples only; `val Point { x, y } = p` and
+// `val Some(v) = o` do not parse)
 val (a, b, c) = tuple;
-val Some(value) = option;  // pattern match in let
 
 // Shadowing (allowed, type can change)
 val x = 5;
@@ -516,31 +517,29 @@ val x = "now a string";  // shadows previous x
 // Compile-time constant
 const MAX_PLAYERS: i32 = 64;
 const PI: f64 = 3.14159265358979;
-const GREETING: &str = "Hello, Fides!";
+const GREETING: str = "Hello, Fides!";
 
-// Static (single memory location)
-static COUNTER: AtomicI32 = AtomicI32::new(0);
+// Global (static is another spelling of var)
+var COUNTER: i64 = 0;
 ```
 
-### 5.3 Move Semantics
+### 5.3 Copies, Handles and Moves
 
 ```fides
-// Copy types (i32, bool, f64, etc.) — copied by default
+// Numbers, bool, structs, enums, tuples, arrays: copied
 val a = 5;
-val b = a;      // a is still valid (i32 is Copy)
-println(a);   // works
+val b = a;      // a is still valid
 
-// Move types (String, Vec, etc.) — moved by default
-val s1 = String::from("hello");
-val s2 = s1;        // s1 is moved
-// println(s1);   // ERROR: s1 was moved
-
-// Borrow instead of move
-val s3 = String::from("world");
-val s4 = &s3;       // borrow (s3 still valid)
-println(s3);      // works
-println(s4);      // works
+// Vec, HashMap, str: handles. Assignment gives a second name for the same data
+val v: Vec<i64> = Vec::new();
+var w = v;
+w.push(1);      // v.len() is now 1 as well
 ```
+
+There is no move check for `str` or `Vec`: only `@linear` struct types move
+(used exactly once; reference.md §8.7). Copy-on-write for `Vec`, `str` and
+`HashMap` is decided (proposal 0001) and written behind a switch that is off,
+so today `var b = a` on a `Vec` aliases.
 
 ---
 
@@ -550,8 +549,8 @@ println(s4);      // works
 
 ```fides
 // Shared reference (immutable borrow)
-fn len(s: &str) -> usize {
-    s.len()
+fn len(s: &str) -> i64 {
+    return str_len(s);
 }
 
 // Mutable reference (exclusive borrow)
@@ -578,26 +577,28 @@ Fides deduces regions (lifetimes) automatically. You rarely need to annotate the
 // Rust requires explicit lifetime:
 //   fn longest<'a>(x: &'a str, y: &'a str) -> &'a str
 // Fides: compiler infers the region
-fn longest(x: &str, y: &str) -> &str {
-    if x.len() > y.len() { x } else { y }
-}
-
-// When explicit (rare), use region blocks:
-fn store(data: &str) -> &str {
-    region r {
-        val cached = data.to_string();
-        &cached
-    }
+fn first(x: &i64, y: &i64) -> &i64 {
+    return x;      // allowed: x comes from a reference parameter
 }
 ```
 
+A function may not return a reference to a local or a by-value parameter, and
+a reference may not be stored (field, `Vec`, global) or sent to another task
+(`compiler/escape.fd`; reference.md §8.4). A `region r { }` block is a scope
+with an optional size budget; a reference to a value inside it cannot leave it.
+
 ### 6.3 Ownership Rules
 
-1. Each value has exactly one **owner**
-2. When the owner goes out of scope, the value is dropped (RAII)
-3. You can borrow immutably (`&`) with unlimited readers
-4. You can borrow mutably (`&mut`) with exactly one writer
-5. Borrows must not outlive the owner (enforced by region inference)
+1. You can borrow immutably (`&`) with unlimited readers
+2. You can borrow mutably (`&mut`) with exactly one writer; changing a value
+   while it is borrowed is an error, also a `push` to a `Vec` a `for` loop is
+   walking (`test_iter_invalidation_fail.fd`)
+3. References do not outlive what they point to (escape check)
+4. There is no garbage collector and no general destructor. The compiler frees
+   `Vec`/`HashMap` locals, a `Vec<str>`/`Vec<Vec>` that owns its elements,
+   collections declared in a `region` at its end, and string temporaries when
+   it can prove they are finished (`test_mem_owned_drop.fd`). Everything else
+   lives until the process exits: it leaks, it does not dangle.
 
 ---
 
@@ -629,45 +630,56 @@ val result = if condition {
 ### 7.2 Match
 
 ```fides
-// Basic match
+// Statement match: every arm body is a block
 match color {
+    Color::Red => { println("red"); }
+    Color::Green => { println("green"); }
+    Color::Blue => { println("blue"); }
+}
+
+// Match as a value: an arm body may be an expression
+val rgb = match color {
     Color::Red => 0xFF0000,
     Color::Green => 0x00FF00,
     Color::Blue => 0x0000FF,
-}
+};
 
-// With bindings
+// With bindings (write Option::None: a bare None is a new variable)
 match option {
-    Some(value) => println(f"Got {value}"),
-    None => println("Nothing"),
+    Option::Some(value) => { println(f"Got {value}"); }
+    Option::None => { println("Nothing"); }
 }
 
 // With guards
-match score {
+val grade = match score {
     s if s >= 90 => "A",
     s if s >= 80 => "B",
     s if s >= 70 => "C",
     _ => "F",
-}
+};
 
-// With struct destructuring
-match shape {
-    Shape::Circle { radius } => f"Circle(r={radius})",
-    Shape::Rectangle { width, height } => f"Rect({width}x{height})",
+// Payload bindings
+val desc = match shape {
+    Shape::Circle(r) => f"Circle(r={r})",
+    Shape::Rectangle(w, h) => f"Rect({w}x{h})",
     Shape::Triangle(a, b, c) => f"Tri({a},{b},{c})",
     Shape::Point => "Point",
-}
+};
 
 // Match on ranges
-match x {
+val size = match x {
     0..=9 => "single digit",
     10..=99 => "double digit",
     100..=999 => "triple digit",
     _ => "large",
-}
-
-// Match must be exhaustive (compiler enforces)
+};
 ```
+
+A statement `match x { 1 => f(), _ => g(), }` (expression arms) is a parse
+error. Struct-like patterns (`Shape::Circle { radius }`), nested, tuple and `|`
+patterns do not parse. A `match` on an enum must cover every variant and one
+on `bool` both values, unless an arm is `_` or a name; a `match` on integers or
+strings is not checked for exhaustiveness.
 
 ### 7.3 Loops
 
@@ -677,9 +689,9 @@ for x in nums {
     println(x);
 }
 
-// For with index
-for (i, x) in nums.iter().enumerate() {
-    println(f"{i}: {x}");
+// With an index (`for (i, x) in …` does not parse)
+for i in 0..nums.len() {
+    println(f"{i}: {nums[i]}");
 }
 
 // Range
@@ -710,15 +722,10 @@ loop {
     }
     process(input);
 }
-
-// Break with value
-val result = loop {
-    val input = read_line();
-    if input == "done" {
-        break input;  // returns "done"
-    }
-};
 ```
+
+`loop` is a statement, not an expression: `val r = loop { … }` does not parse,
+and `break expr` evaluates `expr` and discards it. There are no loop labels.
 
 ### 7.4 Return
 
@@ -729,23 +736,28 @@ fn foo(x: i32) -> i32 {
     }
     x * 2             // implicit return (last expression)
 }
+
+fn max(a: i64, b: i64) -> i64 {
+    if a > b { a } else { b }   // a trailing if/match is the value
+}
 ```
 
 ### 7.5 Defer
 
-Fides introduces `defer` for cleanup (inspired by Go, but with RAII):
+`defer` takes a block (braces are required; `defer close(file);` does not
+parse). Deferred blocks run when the function returns, last registered first:
 
 ```fides
-fn process_file(path: &str) -> Result<(), FileError> {
-    val file = open(path)?;
-    defer close(file);          // runs when function exits (even on error)
-
-    val data = read(file)?;
-    process(data)?;
-    Ok(())
-    // close(file) runs here automatically
+fn work() -> i64 {
+    println("start");
+    defer { println("cleanup"); }   // runs at every return after this point
+    return 1;                       // prints "cleanup", then returns
 }
 ```
+
+Deferred blocks run at function exit, not block exit. Every `return` lowered
+after a `defer` statement runs it, also when the `defer` was in a branch that
+did not execute (reference.md §5.5).
 
 ---
 
@@ -781,52 +793,44 @@ pub struct Config {
 // Full literal
 val p = Point { x: 3.0, y: 4.0 };
 
-// Shorthand (when variable name matches field name)
-val x = 3.0;
-val y = 4.0;
-val p = Point { x, y };     // shorthand for Point { x: x, y: y }
-
 // Update syntax (copy remaining fields from another)
-val p2 = Point { x: 5.0, ..fd };   // x=5.0, y=4.0 (from p)
+val p2 = Point { x: 5.0, ..p };   // x=5.0, y=4.0 (from p)
 ```
+
+There is no field shorthand (`Point { x, y }`). A field left out of a literal
+is not reported.
 
 ### 8.3 Impl Blocks
 
 ```fides
 impl Point {
-    // Associated function (constructor)
+    // Associated function (constructor), called as Point::new(1.0, 2.0)
     fn new(x: f64, y: f64) -> Point {
-        Point { x, y }
+        return Point { x: x, y: y };
     }
 
-    // Method (takes &self)
-    fn distance(&self, other: &Point) -> f64 {
+    // Method: `self` (type Self), or `self: &Point`
+    fn distance(self, other: &Point) -> f64 {
         val dx = self.x - other.x;
         val dy = self.y - other.y;
-        (dx * dx + dy * dy).sqrt()
+        return math_sqrt(dx * dx + dy * dy);
     }
 
-    // Mutable method
-    fn translate(&mut self, dx: f64, dy: f64) {
+    // Changing method
+    fn translate(self: &mut Point, dx: f64, dy: f64) {
         self.x += dx;
         self.y += dy;
     }
-
-    // Associated constant
-    const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
 }
 ```
 
+`&self` and `&mut self` are not valid syntax. Annotations cannot be written on
+methods. There are no associated constants.
+
 ### 8.4 Tuple Structs
 
-```fides
-struct Color(u8, u8, u8);
-
-val red = Color(255, 0, 0);
-val r = red.0;    // 255
-val g = red.1;    // 0
-val b = red.2;    // 0
-```
+Not supported: `struct Color(u8, u8, u8)` does not parse. Use a struct with
+named fields.
 
 ---
 
@@ -845,9 +849,9 @@ enum Color {
 // Enum with data
 enum Message {
     Quit,                           // unit variant
-    Move { x: i32, y: i32 },       // struct variant
-    Write(str),                     // tuple variant
-    ChangeColor(u8, u8, u8),       // tuple variant
+    Move(x: i32, y: i32),           // named payload (no struct variants)
+    Write(str),
+    ChangeColor(u8, u8, u8),
 }
 
 // Generic enum
@@ -863,12 +867,12 @@ enum Result<T, E> {
 
 // Enum with methods
 impl Message {
-    fn process(&self) {
+    fn process(self) {
         match self {
-            Message::Quit => println("Quitting"),
-            Message::Move { x, y } => println(f"Move to ({x}, {y})"),
-            Message::Write(text) => println(text),
-            Message::ChangeColor(r, g, b) => println(f"Color: {r},{g},{b}"),
+            Message::Quit => { println("Quitting"); }
+            Message::Move(x, y) => { println(f"Move to ({x}, {y})"); }
+            Message::Write(text) => { println(text); }
+            Message::ChangeColor(r, g, b) => { println(f"Color: {r},{g},{b}"); }
         }
     }
 }
@@ -877,43 +881,25 @@ impl Message {
 ### 9.2 Pattern Matching
 
 ```fides
-// Exhaustive match (compiler enforces all cases)
-match msg {
+// Exhaustive match on an enum (every variant, or `_`)
+val n = match msg {
     Message::Quit => 0,
-    Message::Move { x, y } => x + y,
-    Message::Write(text) => text.len(),
+    Message::Move(x, y) => x + y,
+    Message::Write(text) => str_len(text),
     Message::ChangeColor(r, g, b) => (r as i32 + g as i32 + b as i32),
-}
+};
 
 // Wildcard
-match x {
+val s = match x {
     0 => "zero",
     _ => "nonzero",
-}
-
-// Or-patterns
-match key {
-    "q" | "quit" => exit(),
-    "h" | "help" => show_help(),
-    _ => handle_key(key),
-}
-
-// Nested patterns
-match point {
-    Point { x: 0.0, y: 0.0 } => "origin",
-    Point { x: 0.0, y } => f"on y-axis at {y}",
-    Point { x, y: 0.0 } => f"on x-axis at {x}",
-    Point { x, y } => f"at ({x}, {y})",
-}
-
-// Binding with @
-match age {
-    n @ 0..=12 => f"Child ({n})",
-    n @ 13..=19 => f"Teen ({n})",
-    n @ 20..=150 => f"Adult ({n})",
-    _ => "Invalid age",
-}
+};
 ```
+
+Or-patterns (`"q" | "quit"`), nested patterns and struct patterns
+(`Point { x: 0.0, y }`) and `@` bindings (`n @ 0..=12`) do not parse.
+Integer patterns are non-negative literals and ranges (`0..=9`); `-1 =>` is a
+parse error.
 
 ---
 
@@ -924,29 +910,29 @@ match age {
 ```fides
 // Basic cap
 cap Drawable {
-    fn draw(&self);
-    fn area(&self) -> f64;
+    fn draw(self);
+    fn area(self) -> f64;
 }
 
 // cap with default implementation
 cap Greet {
-    fn greet(&self) {
-        println(f"Hello from {self.name()}");
+    fn greet(self) {
+        println("Hello from " + self.name());
     }
 
-    fn name(&self) -> &str;
+    fn name(self) -> str;
 }
 
-// Generic cap
+// Associated type
 cap Iterator {
     type Item;
 
-    fn next(&mut self) -> Option<Self::Item>;
+    fn next(self: &mut Self) -> Option<Self::Item>;
 }
 
-// cap bounds
+// Supertraits: an impl of Ord must provide Eq's and PartialOrd's methods
 cap Ord: Eq + PartialOrd {
-    fn cmp(&self, other: &Self) -> Ordering;
+    fn cmp(self, other: &Self) -> i64;
 }
 ```
 
@@ -954,50 +940,34 @@ cap Ord: Eq + PartialOrd {
 
 ```fides
 impl Drawable for Point {
-    fn draw(&self) {
+    pub fn draw(self: Point) {
         render_pixel(self.x, self.y);
     }
 
-    fn area(&self) -> f64 {
-        0.0  // points have no area
-    }
-}
-
-impl Iterator for Counter {
-    type Item = i32;
-
-    fn next(&mut self) -> Option<i32> {
-        if self.count < self.max {
-            self.count += 1;
-            Some(self.count)
-        } else {
-            None
-        }
+    pub fn area(self: Point) -> f64 {
+        return 0.0;  // points have no area
     }
 }
 ```
+
+An impl must provide every method without a default and every associated
+type. The type after `for` is a single name: `impl<T> Show for Slot<T>` is a
+parse error. Parameter and return types of impl methods are not compared with
+the trait's.
 
 ### 10.3 Trait (cap) Bounds
 
 ```fides
-// In function signatures
-fn sort<T: Ord>(arr: &mut [T]) {
+// In function signatures; every bound is checked at each call
+fn largest<T: Ord + Clone>(v: Vec<T>) -> T {
     // ...
-}
-
-// With where clause (for complex bounds)
-fn merge<T, U>(left: Vec<T>, right: Vec<U>) -> Vec<(T, U)>
-    where T: Clone + Ord,
-          U: Clone + Hash
-{
-    // ...
-}
-
-// impl cap (abstract types)
-fn make_iter() -> impl Iterator<Item = i32> {
-    0..10
 }
 ```
+
+There are no `where` clauses and no `impl Trait` return types. A call whose
+argument does not implement a bound is an error
+(`i64 does not implement Show (required by T: Show in 'twice')`,
+`test_generic_bound_fail.fd`).
 
 ---
 
@@ -1006,84 +976,54 @@ fn make_iter() -> impl Iterator<Item = i32> {
 ### 11.1 Result Type
 
 ```fides
-// Returning Result
-fn parse_int(s: &str) -> Result<i32, ParseError> {
+// Returning Result (variants are written with the enum name)
+fn parse_num(s: str) -> Result<i64, str> {
     // ...
-    Ok(42)
+    return Result::Ok(42);
 }
 
 // Handling with match
-match parse_int("42") {
-    Ok(n) => println(f"Got {n}"),
-    Err(e) => println(f"Error: {e}"),
+match parse_num("42") {
+    Result::Ok(n) => { println(f"Got {n}"); }
+    Result::Err(e) => { println(f"Error: {e}"); }
 }
 
 // Propagating with ? operator
-fn read_config(path: &str) -> Result<Config, ConfigError> {
-    val data = read_file(path)?;        // ? propagates Err
-    val config = parse_config(data)?;   // ? propagates Err
-    Ok(config)
-}
-
-// ? with different error types (auto-conversion)
-fn load() -> Result<Data, AppError> {
-    val file = open("data.txt")?;       // FileError → AppError (via From)
-    val content = read(file)?;          // FileError → AppError
-    Ok(parse(content))
+fn load(path: str) -> Result<i64, str> {
+    val n = parse_num(path)?;           // ? returns the Err
+    return Result::Ok(n + 1);
 }
 ```
 
-### 11.2 Effect Handlers (⚠️ Partial — Phase 4D)
+`?` does not convert error types (there is no `From`).
 
-> **Implementation status:** Effect annotations (`!IO`, `!Net`, `!Spawn`, `!Alloc`, `!{}`) and effect inference via fixpoint iteration over the call graph are ✅ working. The `handle { do } with` syntax parses and runs, but **full continuation semantics are pending** — effect handlers currently execute their handler bodies but do not support resumable continuations.
+### 11.2 Effects and Effect Handlers
+
+Every function has an inferred set of effects (`IO`, `Net`, `Spawn`,
+`Diverge`, `Alloc`, `Read`, `Write`, `Diff`, `Noise`, `Comm`), propagated
+through calls. A function may declare its effects after the return type
+(`!IO`, `!{IO, Net}`, `!{}`); an inferred effect that is not declared is an
+error. A function that takes a function value gets the effects of the function
+passed at each call site (`effects/test_effect_ho_instantiation.fd`).
+
+Effect handlers (reference.md §9.4):
 
 ```fides
-// Effect type in signature
-fn read_file(path: &str) -> str !FileIO {
-    handle FileIO::Read(path)
-}
-
-// Multiple effects
-fn process() -> Result<Data, Error> !FileIO + LogIO + TimeIO {
-    val start = handle TimeIO::Now;
-    handle LogIO::Info("Starting process");
-
-    val data = handle FileIO::Read("data.txt");
-    val parsed = parse(data)?;
-
-    val elapsed = handle TimeIO::Now - start;
-    handle LogIO::Info(f"Done in {elapsed}ms");
-
-    Ok(parsed)
-}
-
-// Handling effects
-fn main() {
-    handle {
-        process()
-    } with {
-        FileIO::Read(path) => std::fs::read_to_string(path),
-        LogIO::Info(msg) => println(msg),
-        TimeIO::Now => std::time::Instant::now(),
+handle {
+    val x = 10;
+    do IO.print(x);
+    println(x + 1);          // runs after resume
+} with {
+    IO.print(v) => {
+        println(v);
+        resume(cont, 0);
     }
 }
 ```
 
-### 11.3 Async as Effect Sugar
-
-```fides
-// This:
-async fn fetch(url: &str) -> Result<str, NetError> {
-    val resp = http_get(url).await?;
-    Ok(resp.body)
-}
-
-// Desugars to:
-fn fetch(url: &str) -> Result<str, NetError> !Async {
-    val resp = handle Async::Wait(http_get(url))?;
-    Ok(resp.body)
-}
-```
+`do E.op(args)` runs the matching handler with the arguments bound as `i64`;
+`cont` is the rest of the `handle` block, and `resume(cont, v)` runs it
+(`test_effect_handler.fd`, `test_effect_resume.fd`).
 
 ---
 
@@ -1105,19 +1045,20 @@ pub module net::http::client;
 ### 12.2 Imports
 
 ```fides
-// Import specific items
-use std::io::println;
-use std::fs::{read, write};
+// Import a module: all its public items become visible
+use collections;
+use net::http;              // <dir>/net/http.fd, <dir>/net/http/mod.fd, stdlib, project root
 
-// Import module (access via path)
-use std::collections;
+// Qualified calls: http::get(…), or with a rename j::f()
+use json as j;
 
-// Rename
-use std::io::println as print;
-
-// Glob import (discouraged but allowed)
-use std::prelude::*;
+// Grant capabilities
+use file with { IO, FS };
 ```
+
+`use m::{a, b}` and `use m::*` are accepted, but the list does not select:
+they import the whole module. `core` is always loaded. A version pin
+`use m = "1.0";` is a parse error.
 
 ### 12.3 Visibility
 
@@ -1127,11 +1068,10 @@ fn helper() { ... }           // private to module
 
 // Public
 pub fn api() { ... }          // accessible from outside
-
-// Restricted visibility
-pub(crate) fn internal() { ... }    // crate-internal only
-pub(super) fn child_api() { ... }   // parent module only
 ```
+
+A struct field without `pub` is private to its module. There is no
+`pub(crate)` or `pub(super)`.
 
 ---
 
@@ -1144,17 +1084,25 @@ fn identity<T>(x: T) -> T {
     x
 }
 
-fn max<T: Ord>(a: T, b: T) -> T {
-    if a >= b { a } else { b }
-}
-
-fn merge<T, U>(left: Vec<T>, right: Vec<U>) -> Vec<(T, U)>
-    where T: Clone + Ord,
-          U: Clone + Hash
-{
+fn show_all<T: Show + Clone>(v: Vec<T>) -> str {
     // ...
 }
+
+// Explicit type arguments (turbofish); the count must match
+val z = zero::<i64>();
+
+// Const parameter: [T; N] takes the array's length
+fn sum<N: i64>(a: [i64; N]) -> i64 { /* ... */ }
 ```
+
+Generic functions are monomorphised (`compiler/mono.fd`). `fid` infers type
+arguments from the arguments, and from the expected type when only the result
+mentions a parameter (`val z: i64 = zero();`). A parameter nothing gives is an
+error (`cannot infer the type parameter 'T' of 'make'`). Bounds `T: A + B` are
+checked at each call. Tests: `test_generics_full.fd`,
+`test_generic_infer_fail.fd`, `test_generic_bound_fail.fd`,
+`test_turbofish_arity_fail.fd`; design: proposal 0002. There are no `where`
+clauses.
 
 ### 13.2 Generic Types
 
@@ -1169,10 +1117,13 @@ enum Result<T, E> {
     Err(E),
 }
 
-struct HashMap<K: Hash + Eq, V> {
-    buckets: Vec<Option<(K, V)>>,
+impl<T> Slot<T> {
+    fn get(self) -> T { return self.value; }
 }
 ```
+
+Methods of a generic `impl` are typed per receiver: on a `Slot<f64>`, `T` is
+`f64`. Bounds on struct parameters are not part of the grammar.
 
 ### 13.3 Associated Types
 
@@ -1180,23 +1131,25 @@ struct HashMap<K: Hash + Eq, V> {
 cap Iterator {
     type Item;
 
-    fn next(&mut self) -> Option<Self::Item>;
+    fn next(self) -> Option<Self::Item>;
 }
 
 impl Iterator for Range {
-    type Item = i32;
+    type Item = i64;
 
-    fn next(&mut self) -> Option<i32> {
+    pub fn next(self: Range) -> Option<i64> {
         // ...
     }
 }
 ```
 
+The type checker treats an associated type as compatible with every type.
+
 ---
 
 ## 14. Compile-Time Code (comptime) — ✅ Working
 
-Fides replaces macros with `comptime` blocks — real code that runs at compile time. Implemented in `src/comptime.rs`.
+Fides replaces macros with `comptime` blocks — real code that runs at compile time. Implemented in `compiler/comptime_eval.fd`.
 
 ### 14.1 Comptime Blocks
 
@@ -1226,15 +1179,18 @@ const FIB_10: i32 = comptime fibonacci(10);  // 55
 ### 14.2 Comptime Reflection — ✅ Working
 
 ```fides
-comptime {
-    val name = type_name<T>;           // type name as string
-    val is_struct = is_struct<T>;      // true if T is a struct
-    val is_enum = is_enum<T>;          // true if T is an enum
-    val fields = field_names<T>;       // Vec of field name strings
-    val field_types = field_types<T>;  // Vec of type descriptors
-    val variants = enum_variants<T>;   // Vec of variant name strings
-}
+val name = comptime type_name(Point);        // type name as string
+val s = comptime is_struct(Point);           // true if a struct
+val e = comptime is_enum(Shape);             // true if an enum
+val n = comptime field_count(Point);
+val fields = comptime field_names(Point);    // field names
+val types = comptime field_types(Point);
+val variants = comptime enum_variants(Shape);
+val size = comptime struct_size(Point);
 ```
+
+Also `field_offset(T.f)`, `enum_discriminant(E.V)`, `function_effects(f)` and
+`function_capabilities(m)` (`test_comptime_reflect.fd`).
 
 ### 14.3 Comptime vs Macros
 
@@ -1250,168 +1206,150 @@ comptime {
 
 ## 15. Attributes
 
-> **Implementation status:** Fides uses `@attribute` syntax (the Fides-native form). The parser also accepts `#[...]` for `#[test]` compatibility, but `@` is the canonical syntax. `#[test]` is parsed but **not executed** by `fidesc test` (❌ — `fidesc test` runs file-based tests, not `#[test]` functions). `@derive(Debug/Clone/Serialize/Deserialize)` is ✅ implemented (Phase 7.7). `@cfg(platform=...)` is ✅ implemented (conditional compilation). Other attributes shown below are the planned syntax.
+> **Implementation status:** Fides uses `@annotation` syntax, written before a top-level `fn` or `struct`, a function parameter, or a `val`/`var`. Every annotation name is checked: an unknown name is an error (`Unknown annotation`), and one on the wrong kind of item is an error (`Misplaced annotation`). Annotations cannot be written on methods, struct fields, enums or globals. `#[...]` at the top level is parsed and ignored. `fid test file.fd` runs the functions whose names start with `test_` and `bench_`. The full table is in [reference.md §11](reference.md#11-annotations); the safety rules and their tests are in [safety-rules.md](safety-rules.md).
 
 ```fides
-// Standard attributes
-#[test]
-fn test_addition() { assert(1 + 1 == 2); }        // ❌ parsed, not executed by fidesc test
-
-#[test]
-#[should_panic]
-fn test_oob() { val _ = [1, 2, 3][10]; }            // ❌ parsed, not executed by fidesc test
-
-@derive(Debug, Clone)                               // ✅ implemented (Phase 7.7)
+@derive(Debug, Clone)                 // generates Point_debug_str, Point_clone
 struct Point { x: f64, y: f64 }
 
-@derive(Serialize, Deserialize)                     // ✅ implemented (Phase 7.7)
+@derive(Serialize, Deserialize)       // Config_to_json, Config_from_json
 struct Config { /* ... */ }
 
-@cfg(platform = "linux")                            // ✅ implemented
+@cfg(linux)                           // kept only when fid runs on Linux
 fn linux_only() { /* ... */ }
 
-@inline
-fn fast_add(a: i32, b: i32) -> i32 { a + b }
+@cfg(platform = "windows")
+fn windows_only() { /* ... */ }
 
-@deprecated("use new_function() instead")
-fn old_function() { /* ... */ }
+@no-alloc                             // safety rule, checked
+fn fast_add(a: i32, b: i32) -> i32 { a + b }
 ```
+
+`@cfg(…)` filters functions and structs: `linux`, `windows`, `macos`,
+`platform = "…"`, `os = "…"` hold when `fid` itself runs on that system (the
+host, not `--target`); `arch = "x86_64"` and `release` always hold; `debug`
+and the ARM64/RISC-V arches never do (`test_cfg.fd`, all three backends).
+`@inline` and `@deprecated` do not exist.
 
 ---
 
 ## 16. Concurrency (✅ Implemented — Phase 7.6)
 
-> **Implementation status:** `async`, `await`, and `spawn` are ✅ implemented (eager evaluation, OS thread model). `async fn` declares an async function, `await <expr>` waits for a Future, `spawn <expr>` creates a new thread. State machine transform for true cooperative scheduling is pending. Effect annotations (`!Spawn`, `!Async`) and effect inference are ✅ working.
+> **Implementation status:** `spawn f(args)` starts `f` on an OS thread and gives a `Future<T>`. An `async fn` runs as a green task on its own stack; `await e` (prefix) waits for a `Future<T>` and gives `T`. `async fn` with `f64` or struct arguments and results runs as a task (interpreter and C). Native (`fid emit`) programs that use async or spawn+await crash (`test_async`, `test_async_float_struct`). `yield e` evaluates `e`; it is not a suspension. Details: [reference.md §10](reference.md#10-concurrency).
 
-### 16.1 Async / Await (✅ Implemented)
+### 16.1 Async / Await
 
 ```fides
-// Async function
-async fn fetch_data(url: &str) -> Result<str, NetError> {
-    val resp = http_get(url).await?;
-    Ok(resp.body)
+// Declared Future<T>; the body returns T
+async fn compute_value(x: i64) -> Future<i64> {
+    return x * 2;
 }
 
-// Await on any async expression
-async fn main() {
-    val data = fetch_data("https://api.example.com").await?;
-    println(data);
-}
-
-// Concurrent fetches
-async fn fetch_all(urls: Vec<&str>) -> Vec<Result<str, NetError>> {
-    val tasks = urls.map(|url| spawn async { fetch_data(url).await });
-    tasks.await_all()
+fn main() {
+    val r = await compute_value(1);
+    val s = await compute_value(2) + await compute_value(3);
+    println(r + s);
 }
 ```
 
-### 16.2 Spawning Tasks
+### 16.2 Spawning Threads
 
 ```fides
-// Spawn a task (runs concurrently)
-val task = spawn async {
-    fetch_data("https://example.com").await
-};
+fn work(n: i64) -> i64 { return n * n; }
 
-// Do other work...
+val f = spawn work(7);     // runs on another thread; f: Future<i64>
 process_local();
-
-// Wait for result
-val result = task.await;
+val result = await f;
 ```
 
-### 16.3 Synchronization (❌ Planned)
+Every argument of a spawned call must be `@send`: numbers, `bool`, `str`,
+enums, `@send` structs, structs whose fields are all `@send`, and `Vec`,
+`HashMap`, `Option`, `Result`, `Box`, `Future`, `Mutex`, `Channel` of such
+types. References and raw pointers are not (`test_spawn_send_fail.fd`,
+`test_race_ptr_fail.fd`). A function that runs on another thread may not
+assign a global unless it takes a lock (`test_race_global_fail.fd`).
 
-> **Note:** `Rc<T>` and `Arc<T>` are implemented (compiler builtin types with manual refcount management: `new`, `clone`, `drop`, `get`, `count`). Channels are available via `stdlib/channel.fd`. `Mutex<T>` is not yet implemented. The syntax below is the planned design for `Mutex<T>`.
+### 16.3 parallel, spawn scope, channels
 
 ```fides
-// Mutex (planned)
-use std::sync::Mutex;
-
-val data = Mutex::new(0);
-{
-    var guard = data.lock();
-    *guard += 1;
-}  // lock released here
-
-// Channels (for message passing, planned)
-use std::sync::channel;
-
-val (tx, rx) = channel();
-spawn fn() {
-    tx.send(42);
-};
-val received = rx.recv();
+parallel {
+    | a = fib(n);
+    | b = fib(n + 1);
+}
 ```
+
+Branches are separated by `|`. A `x = f(…)` branch is spawned and `x` gets the
+result when the threads are joined; a multi-statement branch that only reads
+word-sized locals runs on its own thread; any other branch runs in order on
+the current thread (`test_parallel_branches.fd`, all three backends).
+`spawn scope { … }` joins every spawned thread at its end; `cancel scope;`
+cancels pending tasks. The `channel` module provides `channel_create`,
+`channel_send`, `channel_recv`, `channel_try_recv`, `channel_close`; `select`
+takes the first case whose channel has a value (`test_channels_select.fd`).
+`Rc<T>` and `Arc<T>` are reference-counted with manual `clone`/`drop`.
 
 ---
 
 ## 17. Capability-Based Security — ✅ Working
 
-Fides has no ambient authority. File, network, and hardware access require explicit capabilities, enforced at compile time with zero runtime overhead (capability elision).
+Capabilities are checked at compile time, with no run-time cost.
 
-> **Implementation status:** ✅ `cap` declarations, `use ... with { IO, FS, Net, Spawn }` capability grants, transitive propagation through the call graph, compile-time denial, and zero-runtime-overhead capability elision all work.
+> **Implementation status:** `use ... with { IO, FS, Net, Spawn, Alloc }` grants capabilities. When any import of the program has a `with` clause, the program runs in strict mode: a call that needs a capability not granted is an error. The check looks at each call by name (`print` needs `IO`, `read_file` needs `FS`, `http_get` needs `Net`, `spawn` needs `Spawn`, `p_malloc` needs `Alloc`), in every function except those of `core`. It does not follow calls through the call graph. Inside `sandbox { }` every such call is an error, whatever was granted (reference.md §9.2–9.3).
 
 ### 17.1 Capability Grants in Imports
 
 ```fides
-// Grant capabilities to an imported module
-use network_lib with { Net, IO };       // network_lib can use Net + IO
-use file_lib with { FS };               // file_lib can use FS only
-use pure_lib;                           // pure_lib gets no capabilities
+use network_lib with { Net, IO };       // grants Net and IO
+use file_lib with { FS };               // grants FS
+use pure_lib;                           // grants nothing
 ```
 
 ### 17.2 Capability Declarations
 
 ```fides
-// Declare a capability/trait
+// `cap` declares a trait (§10); it is not a run-time capability
 cap Database {
-    fn query(&self, sql: &str) -> Result<Vec<Row>, DbError>;
-    fn execute(&self, sql: &str) -> Result<(), DbError>;
-}
-
-// Implement it
-impl Database for InMemoryDB {
-    fn query(&self, sql: &str) -> Result<Vec<Row>, DbError> {
-        // ...
-    }
-    fn execute(&self, sql: &str) -> Result<(), DbError> {
-        // ...
-    }
+    fn query(self, sql: str) -> Vec<str>;
 }
 ```
 
 ### 17.3 Compile-Time Enforcement
 
 ```fides
-// Without capability grant — this won't compile
+use util with { FS };      // strict mode: only FS granted
+
 fn bad() {
-    // ERROR: no Net capability in scope
-    val response = http_get("https://example.com");
+    print("hi");           // ERROR: print() requires the IO capability
 }
 
-// With capability — compiles fine
-fn good() !Net {
-    val response = http_get("https://example.com");
-    // ...
+fn ok() {
+    sandbox {
+        val n = 1 + 2;     // allowed; print() here would be an error
+    }
 }
 ```
 
-### 17.4 Transitive Capabilities
+### 17.4 What Is Not Checked
 
-Capabilities propagate through the call graph. If function A calls function B which requires `Net`, then A must also have `Net` (or declare it). The compiler verifies this at compile time — no runtime checks needed.
+Capabilities do not propagate through the call graph: a function that calls
+another function which prints is not itself checked for `IO`. Effects (§11.2)
+do propagate; declare `!{}` or `!IO` on a function to have the compiler check
+everything it reaches.
 
 ---
 
-## 18. Hot Reload — ✅ Working
+## 18. Hot Reload — ⚠️ Rebuild and rerun only
 
-Fides supports hot-swapping functions at runtime via `fidesc watch`. Implemented in `src/hotreload.rs` — native JIT (ELF64) with function-level change detection via L2 IR hashing.
+`fidesc watch` (the frozen Rust compiler, `src/hotreload.rs`) rebuilds and
+reruns the program when the file is saved and reports which functions changed;
+functions are not swapped in the running process. In `fid`, the `watch`
+command currently runs `bench` (`compiler/main.fd`).
 
 ```fides
-// Any function can be hot-reloaded when using `fidesc watch`
+// With `fidesc watch`, saving the file rebuilds and reruns the program
 pub fn handle_request(req: &Request) -> Response {
-    // This function can be replaced at runtime
-    // without restarting the process
+    // Planned: replace this function at runtime without restarting.
+    // Today the whole program is rebuilt and restarted.
     process(req)
 }
 ```
@@ -1420,8 +1358,8 @@ pub fn handle_request(req: &Request) -> Response {
 # Start watching — compiles to native ELF64, runs, and watches for changes
 fidesc watch main.fd
 
-# When you edit and save a function, only that function is recompiled
-# and swapped in the running process — sub-second iteration
+# When you edit and save, the program is rebuilt and run again; watch
+# reports which functions changed (in-process swapping is planned)
 ```
 
 > **Note:** Hot reload for FidesOS (the OS project) uses the same mechanism with OS-specific integration. The `fidesc watch` command works on any Linux system.
@@ -1433,31 +1371,25 @@ fidesc watch main.fd
 Items available without explicit import (from `stdlib/core.fd`, auto-included):
 
 ```fides
-// Types
-Option<T>     Some(T)     None
-Result<T, E>  Ok(T)       Err(E)
-Vec<T>        String      &str
+// Types (variants are written Option::Some(x), Result::Ok(x))
+Option<T>     Result<T, E>   Vec<T>   HashMap<K, V>   Box<T>   Rc<T>   Arc<T>
+StringBuilder
 
 // Functions
-println       print       eprintln
-vec!          format      dbg
-spawn         handle      // spawn: parsed only, handle: effect handlers
+print         println       assert        assert_msg     assert_eq     assert_ne
+panic         max           min           abs            clamp
+int_to_str    float_to_str  byte_to_str   str_*          (string functions)
 
-// Note: `print` is polymorphic (accepts int, float, bool, str, vec, map)
-// and always appends a trailing newline (like Rust's `println!`).
-// `println` is an alias for `print` with explicit newline semantics.
+// Note: `print` is built in and accepts any value (int, float, bool, str,
+// Vec, HashMap); `println(s)` prints a str followed by "\n".
 
-// Traits (caps)
-Clone         Copy        Debug
-Default       Display     Eq + Ord
-Hash          Iterator    IntoIterator
-From          Into        TryFrom + TryInto
+// Traits (caps) declared in core
+Iterator      Error
 
 // Macros (none — Fides has no macros)
-// All of the above are functions or types
 ```
 
-> **Note:** `Box<T>`, `Rc<T>`, and `Arc<T>` are implemented as compiler builtin types (not stdlib modules). `Box<T>` enables recursive types. `Rc<T>` / `Arc<T>` provide manual reference counting. Channels are available via `stdlib/channel.fd`. `Mutex<T>` is not yet implemented. See section 3.4a for the full list of stdlib modules.
+> **Note:** `Box<T>`, `Rc<T>`, and `Arc<T>` are built-in types. `Box<T>` enables recursive types. `Rc<T>` / `Arc<T>` provide manual reference counting. Channels are in `stdlib/channel.fd`. See section 3.4a for stdlib modules and [reference.md §13](reference.md#13-the-prelude) for the prelude.
 
 ---
 
@@ -1476,32 +1408,17 @@ net/http.fd
 ## 21. Complete Example
 
 ```fides
-use std::io::println;
-use std::fs::read_to_string;
-use std::collections::HashMap;
+use file;
 
 @derive(Debug, Clone)
 struct Config {
     name: str,
-    version: str,
-    settings: HashMap<str, str>,
+    lines: i64,
 }
 
 impl Config {
-    fn new(name: &str) -> Config {
-        Config {
-            name: name.to_string(),
-            version: "0.1.0".to_string(),
-            settings: HashMap::new(),
-        }
-    }
-
-    fn set(&mut self, key: &str, value: &str) {
-        self.settings.insert(key.to_string(), value.to_string());
-    }
-
-    fn get(&self, key: &str) -> Option<&str> {
-        self.settings.get(key).map(|v| v.as_str())
+    fn new(name: str) -> Config {
+        return Config { name: name, lines: 0 };
     }
 }
 
@@ -1510,47 +1427,32 @@ enum LoadError {
     ParseError(str),
 }
 
-fn load_config(path: &str) -> Result<Config, LoadError> {
-    val content = read_to_string(path)
-        .map_err(|_| LoadError::FileNotFound)?;
-
+fn load_config(path: str) -> Result<Config, LoadError> {
+    val content = file_read(path);          // "" when the file cannot be read
+    if str_len(content) == 0 {
+        return Result::Err(LoadError::FileNotFound);
+    }
     var config = Config::new("app");
-    for line in content.lines() {
-        val parts: Vec<&str> = line.splitn(2, '=').collect();
-        if parts.len() == 2 {
-            config.set(parts[0].trim(), parts[1].trim());
+    for line in str_lines(content) {
+        if str_contains(line, "=") {
+            config.lines += 1;
         }
     }
-
-    Ok(config)
+    return Result::Ok(config);
 }
 
-#[test]
+// `fid test file.fd` runs functions whose names start with test_
 fn test_config() {
-    var config = Config::new("test");
-    config.set("key", "value");
-    assert_eq(config.get("key"), Some("value"));
-    assert_eq(config.get("missing"), None);
+    val config = Config::new("test");
+    assert_eq(config.lines, 0);
 }
 
-#[test]
-fn test_config_debug() {
-    val config = Config::new("app");
-    val debug = format(f"{config:?}");
-    assert(debug.contains("Config"));
-}
-
-pub fn main() -> Result<(), LoadError> {
-    val config = load_config("ark.toml")?;
-
-    println(f"Loaded: {config.name} v{config.version}");
-    println(f"Settings: {config.settings.len()} entries");
-
-    for (key, value) in &config.settings {
-        println(f"  {key} = {value}");
+fn main() -> i64 {
+    match load_config("ark.toml") {
+        Result::Ok(c) => { println(f"Loaded: {c.name}, {c.lines} settings"); }
+        Result::Err(e) => { println("no config"); }
     }
-
-    Ok(())
+    return 0;
 }
 ```
 
@@ -1562,8 +1464,7 @@ pub fn main() -> Result<(), LoadError> {
 // Functions
 fn name(params) -> ReturnType { body }
 pub fn name(params) -> ReturnType { body }
-async fn name(params) -> ReturnType { body }
-fn<T: cap> name(x: T) -> T { body }
+async fn name(params) -> Future<T> { body }
 
 // Variables
 val x = value;
@@ -1572,43 +1473,46 @@ val x: Type = value;
 
 // Control flow
 if cond { } else if cond { } else { }
-match value { Pattern => expr, _ => default }
+val v = if cond { a } else { b };
+match value { Pattern => { }, _ => { } }          // statement: block arms
+val v = match value { Pattern => expr, _ => d };  // value: expression arms
 for x in iter { }
 while cond { }
-loop { break value; }
+loop { break; }
 
 // Types
 struct Name { field: Type }
-enum Name { Variant, Variant(T), Variant { field: T } }
-cap Name { fn method(&self); }
-impl Name for Type { fn method(&self) { } }
+enum Name { Variant, Variant(T), Variant(name: T) }
+cap Name { fn method(self); }
+impl Name for Type { fn method(self: Type) { } }
 
 // Generics
-fn name<T: cap>(x: T) -> T { }
+fn name<T: A + B>(x: T) -> T { }
+name::<i64>(x)
 struct Name<T, U> { }
 
 // Error handling
-Result<T, E>    Ok(value)    Err(error)
+Result<T, E>    Result::Ok(value)    Result::Err(error)
 expr?           // propagate error
 
 // Strings
-"literal"       f"interpolated {expr}"
+"literal"       f"interpolated {expr}"    r"raw"
 
 // Collections
-[T; N]          &[T]         Vec<T>
+[T; N]          Vec<T>       HashMap<K, V>
 [a, b, c]       0..10        0..=10
 
 // Modules
-use module::item;
+use module;
+use module with { IO, FS };
 pub fn name() { }
-pub(crate) fn name() { }
 
 // Other
-@attribute
+@annotation
 comptime { }
-defer expr;
-spawn async { }
-expr.await
+defer { stmts }
+spawn f(args)
+await expr
 ```
 
 ---
@@ -1621,11 +1525,11 @@ required.
 ### Starting the LSP Server
 
 ```bash
-fidesc lsp
+fid lsp        # or fidesc lsp
 ```
 
 This starts a JSON-RPC 2.0 server over stdio. Configure your editor to use
-`fidesc lsp` as the language server command.
+`fid lsp` as the language server command.
 
 ### Supported LSP Methods
 
@@ -1679,6 +1583,11 @@ require'lspconfig'.fides.setup{
 > kept — they are short, distinct, and already part of Fides's identity.
 > The migration is complete: the lexer, parser, all test files, and all stdlib
 > modules use the new syntax.
+>
+> The before/after examples below show the keyword rename only. Some of them
+> use syntax that `fid` does not accept: `&self` (write `self` or
+> `self: &T`), `where` clauses, postfix `.await` (write `await e`), and
+> `defer expr;` (write `defer { … }`). See [reference.md](reference.md).
 
 ---
 
@@ -2305,12 +2214,11 @@ These syntax elements remain exactly the same:
 | `use core with { IO }`   | Module import (kept)        |
 | `pub`                    | Public visibility           |
 | `comptime { }`           | Compile-time block          |
-| `defer expr;`            | Deferred cleanup            |
+| `defer { }`              | Deferred cleanup            |
 | `spawn expr;`            | Spawn task                  |
 | `async`/`await`          | Async/await                 |
 | `region { }`             | Region block                |
 | `handle/with`            | Effect handlers             |
-| `move x`                 | Move semantics              |
 | `x as T`                 | Type cast                   |
 | `extern "C"`             | FFI                         |
 | `for x in iter`          | For loop                    |
@@ -2321,12 +2229,11 @@ These syntax elements remain exactly the same:
 | `dyn Trait`              | Dynamic dispatch            |
 | `module foo`             | Module declaration          |
 | `static x: T = v;`       | Static variable             |
-| `where T: Bound`         | Trait bounds                |
 | `try { }`                | Try block                   |
-| `;` (semicolons)         | Required                    |
+| `;` (semicolons)         | Optional after statements   |
 | `//` and `/* */`         | Comments                    |
 | `@attribute`             | Attribute syntax (canonical)|
-| `#[test]`                | Test attribute (also parsed, not executed) |
+| `#[test]`                | Parsed and ignored          |
 | `..` and `..=`           | Ranges                      |
 | `=>`                     | Match arm / closure arrow   |
 | `->`                     | Return type arrow           |

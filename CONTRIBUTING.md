@@ -6,18 +6,25 @@ where a mistake can break every program silently.
 
 ## The two compilers
 
-Fides is self-hosted. The primary compiler is written in Fides
-(`compiler/*.fd`, 54 modules) and is the release compiler (the installer
-ships it as `fid.exe`). A Rust implementation (`src/*.rs`) remains as the
-bootstrap reference: it builds stage 1 of the self-hosted compiler and runs
-the test harness. Both give the same output on the test programs.
+Fides is self-hosted. The compiler is written in Fides (`compiler/*.fd`,
+61 modules) and is the release compiler (the installer ships it as
+`fid.exe`). It is built from a pinned earlier build of itself
+(`release/stage0/fid.exe`, hash in `scripts/stage0.sha256`), as Go and Rust
+are. The Rust implementation (`src/*.rs`) is frozen (roadmap ST1): it runs
+the test harness and starts a cold build when no stage 0 is pinned. New
+features go into `compiler/*.fd` only.
 
 | You want to…                                      | Use                                                     |
 | ------------------------------------------------- | ------------------------------------------------------- |
-| Write Fides programs, add tests, add stdlib modules | either compiler; check with `fidesc test`             |
+| Write Fides programs, add tests, add stdlib modules | `fid`; check with `fidesc test --compiler release/fid.exe` |
 | Build tools (`ark`, `scribe`, `veil`)             | `cargo build --release`                                 |
-| Change the language or compiler internals         | `compiler/*.fd`; the Rust compiler only when the bootstrap needs it (`docs/reference/stability.md`) |
-| Check a `compiler/*.fd` change                    | `RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh` (fixpoint) |
+| Change the language or compiler internals         | `compiler/*.fd` (`docs/reference/stability.md`)         |
+| Check a `compiler/*.fd` change                    | `NATIVE=1 ./scripts/bootstrap.sh` (fixpoint, no C compiler) or `RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh` |
+| Make the checked compiler the next stage 0        | `NATIVE=1 PIN=1 ./scripts/bootstrap.sh`                 |
+
+A change to the language reaches the compiler's own source in two steps: the
+compiler learns it first, and its own source may use it only after the next
+pin, since the pinned stage 0 must still compile that source.
 
 ## Setting up
 
@@ -63,8 +70,16 @@ lists them with the risk level of each. For those:
 3. If a test regresses, bisect stages manually with the dump commands
    (`fidesc dump-ir|dump-pir|dump-c`, `fidesc codegen`) — a bisect script
    (`scripts/bisect.sh`) is planned but not yet written.
-5. Large changes go behind a flag so both paths can be tested before the old
+4. Large changes go behind a flag so both paths can be tested before the old
    one is removed.
+5. **Every bug fixed gets a regression test, always** (roadmap VF20): the
+   smallest program that showed the bug, as `tests/bootstrap/test_<bug>.fd`
+   (or `test_<bug>_fail.fd` for a program that must be rejected), in the same
+   change as the fix. A fix without its test is not finished.
+
+Before a change to code generation or the optimizer, run the random-program
+differential tester (roadmap VF1), which compares every backend on generated
+programs: `python scripts/fuzz/gen_programs.py -n 200 --fid release/fid.exe`.
 
 Never run `git stash`, `git checkout -- <file>`, `git reset --hard`, or
 `git clean` in a shared checkout, never rewrite history, and never delete

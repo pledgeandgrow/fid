@@ -199,13 +199,21 @@ Most modules still have no test, so expect more of this (B12).
 - [x] C3. Free `Vec`s passed only to functions that do not keep them: per-function
       summaries of which arguments are only borrowed (L).
 - [x] C4. Half-step size classes, so a 33-byte string does not take 64 bytes (S).
-- [ ] C5. Free elements of a dropped `Vec<str>` and `Vec<Vec<T>>` when they are
+- [x] C5. Free elements of a dropped `Vec<str>` and `Vec<Vec<T>>` when they are
       owned (L).
-- [ ] C6. Regions really free: `region { }` releases its allocations, with a
+      Done Nov 4: a local `Vec<str>`/`Vec<Vec<T>>` whose elements are fresh and
+      never escape frees them (`Vec_drop_strs`, `Vec_drop_vecs`);
+      test_mem_owned_drop.
+- [x] C6. Regions really free: `region { }` releases its allocations, with a
       compile-time rule that nothing outside can hold them. Today an outer
       `Vec` growing inside a region would dangle, which is why it stays a no-op (L).
-- [ ] C7. `HashMap` locals freed like `Vec`s (M).
-- [ ] C8. `.fidcache` eviction: it grows without limit today (S).
+      Done Nov 4: collections declared in a `region` and kept local are freed at
+      its end (test_mem_owned_drop).
+- [x] C7. `HashMap` locals freed like `Vec`s (M).
+      Done Nov 4: `HashMap` locals freed like `Vec`s (`HashMap_drop`).
+- [x] C8. `.fidcache` eviction: it grows without limit today (S).
+      Done Nov 4: `.fidcache` evicts least recently used artifacts past 64 files
+      or 1 GB.
 
 **Acceptance:** a 24-hour text-processing soak test keeps a flat memory profile;
 30M temporary strings peak under 50 MB.
@@ -226,13 +234,22 @@ the fastest build-to-native among compiled languages, and native code within
       function and short-lived temporaries live in callee-saved registers,
       weighted by loop depth; parameters read more than once keep a register.
       Left: other values that cross blocks, caller-saved registers, floats (L).
-- [ ] D5. Inlining of small functions at IR level (M).
-- [ ] D6. Run the IR optimizer on the native path (M).
-- [ ] D7. Benchmarks in CI, failing on a slowdown over 10% (M).
+- [x] D5. Inlining of small functions at IR level (M).
+      Done Nov 4: compiler/iropt.fd inlines single-block functions of up to 16
+      instructions.
+- [x] D6. Run the IR optimizer on the native path (M).
+      Done Nov 4: `fid emit` runs iropt (inlining, constant folding, dead code)
+      before machine code.
+- [~] D7. Benchmarks in CI, failing on a slowdown over 10% (M).
+      Written Nov 4: bench/check.sh fails on a slowdown over LIMIT_PCT against
+      bench/baseline.txt; not in CI.
 - [ ] D8. Borrow checking is now the slowest compiler phase (about 30 s on the
       compiler itself): profile and fix it, as for the type checker (M).
-- [ ] D9. `emit` of hello world under 0.5 s: stop re-checking the stdlib on each
+- [~] D9. `emit` of hello world under 0.5 s: stop re-checking the stdlib on each
       build, by caching its checked form (L).
+      Done Nov 4: core.fd is checked once per (compiler, core.fd) pair, a stamp
+      in the temp directory skips its bodies after. Hello-world timing not
+      re-measured.
 - [x] D11. Per-call cost on the C path (M). Functions no longer push and pop a
       call-stack array: panic traces walk the machine stack (unwind tables on
       Windows, `_Unwind_Backtrace` elsewhere; `zig cc` off Windows links
@@ -276,11 +293,28 @@ the fastest build-to-native among compiled languages, and native code within
 
 - [x] E1. `extern "C"` from any DLL in native builds: `link "x"` adds to the PE
       import table (M). `ccompile` is needed today beyond msvcrt and kernel32.
-- [ ] E2. `use sqlite` and `use sdl` work through `emit` (depends on E1, B4) (S).
+- [x] E2. `use sqlite` and `use sdl` work through `emit` (depends on E1, B4) (S).
+      Done Nov 6: a `link` DLL is no longer a static import; the program
+      binds it at start-up (LoadLibraryA, GetProcAddress into the same IAT
+      slots). `link "sqlite3"` tries sqlite3.dll, then winsqlite3.dll, which
+      every Windows 10 and 11 has, so `use sqlite` runs with nothing
+      installed (test_pe_sqlite, test_sqlite through `emit`). stdlib/sqlite.fd
+      passed `&s` of a `str` as SQLite's out-parameters, which is the string
+      itself: SQLite wrote its pointers over string literals; now word slots.
+      `use sdl` builds and binds SDL2*.dll the same way; not run here (no
+      SDL2 on this machine), and its `pledge_sdl_*` helpers are still stubs
+      returning 0 natively, as on the C path.
 - [x] E3. Struct-by-value and callback arguments in C calls: a struct of 1, 2, 4
       or 8 bytes by value and as a result, a named Fides function as a callback,
       native and C (M).
-- [ ] E4. `fid` finds and reports a missing library clearly (S).
+- [x] E4. `fid` finds and reports a missing library clearly (S).
+      Done Nov 6 for `emit`: it warns at build time when a `link` DLL is not
+      in the current folder, the system folder or PATH; the program runs,
+      and the first call into a missing DLL or function stops it with
+      `error: this program needs X.dll, which Windows could not load` (or
+      `X.dll has no function F`) and exit code 1 (test_pe_dll_missing_fail,
+      test_pe_dll_nofn_fail). Left: `ccompile` still reports the linker's
+      own message.
 - [ ] E5. `parse-header` output compiles for a real header set (SDL2, SQLite) (M).
 
 **Acceptance:** one SDL2 and one SQLite example build with `fid emit` and no C
@@ -298,13 +332,22 @@ compiler.
 - [x] F2. `fid` builds and bootstraps itself on Linux, in CI (M). Green on Nov 2.
 - [x] F3. Install archives tested on a clean Linux machine: a clean Ubuntu
       container in CI (S). Green on Nov 2.
-- [ ] F4. Native ELF path for `fid`: an IR→ELF backend sharing the x86-64
+- [~] F4. Native ELF path for `fid`: an IR→ELF backend sharing the x86-64
       encoder with `pe_ir` (L).
+      First step Nov 6: `fid emit --elf` (or `--target linux`) writes a
+      static Linux x86-64 executable from pe_ir's code generator, the same
+      machine code as the Windows build, with no C compiler, linker or libc:
+      ELF header, one RWX segment at 0x400000, the bare build's runtime with
+      Linux system calls for output, the heap (mmap) and exit. It runs a
+      program without the stdlib (test_elf_native, run under WSL). Left: the
+      stdlib, i.e. stdlib/pe_runtime on Linux (its msvcrt and kernel32 calls
+      as system calls or a libc), argv, files, threads; and the PIR path in
+      compiler/elf64.fd and linker.fd is not used by it.
 - [ ] F5. macOS x64 and ARM64 through C, in CI (M).
 - [ ] F6. Native ARM64/RISC-V/WASM backends: overflow and divide-by-zero
       semantics match the other backends (M).
 - [ ] F7. Native macOS: Mach-O executables, not only objects (L).
-- [ ] F8. ARM64 and RISC-V: replace the runtime stubs (19 and 18 zero stubs, 46
+- [ ] F8. (Not started Nov 6.) ARM64 and RISC-V: replace the runtime stubs (19 and 18 zero stubs, 46
       capability stubs), and test under QEMU (XL). Their `p_vec_new` (and the
       x86-64 ELF one) keeps the data inside the header block with a fixed
       capacity of 509, while core's `Vec` frees the old data when it grows:
@@ -320,9 +363,23 @@ ARM64 where the system runs there; RISC-V and WASM pass the suite.
 
 - [ ] G1. Bare-metal tests run under QEMU in CI, not hosted, where they are
       expected to fault (M).
-- [ ] G2. `fid emit --bare` works: `pe_ir` panics with "bare mode not ported" (M).
-- [ ] G3. Bare builds define their integer semantics: panics need a handler, so
+- [x] G2. `fid emit --bare` works: `pe_ir` panics with "bare mode not ported" (M).
+      Done Nov 6: `--bare` goes through pe_ir (the PIR path crashed): a flat
+      binary loaded at 0x10000, entered at its first byte. The hardware
+      stubs are ported from src/pe.rs (three of its bugs fixed: the IDT gate
+      flags, the GDT fifth argument, a stray byte in p_page_map); p_malloc is
+      a bump allocator from 0x300000; print goes to COM1; `asm!` templates
+      are encoded (Intel syntax: system, port, control-register, ALU, shift,
+      push/pop, jmp/call through a register), an unknown one is a build error.
+      Run on Linux with scripts/bare-run.c, which plays COM1 and `hlt`
+      (test_bare_print, test_kernel_serial, test_serial_hello); paging and
+      descriptor tables need QEMU (G1), not available here.
+- [x] G3. Bare builds define their integer semantics: panics need a handler, so
       overflow and division are unchecked today (M).
+      Done Nov 6: bare builds check overflow and division like every other
+      backend; a failed check, like any panic, calls the program's
+      `@panic_handler` with the message, else prints `panic: <message>` to
+      COM1, then halts. `@wrapping` wraps (test_bare_panic_handler).
 - [ ] G4. `fides-os` builds with the released compiler, in its own CI (M).
 
 **Acceptance:** a kernel boots and prints under QEMU, from a clean checkout.
@@ -335,19 +392,37 @@ ARM64 where the system runs there; RISC-V and WASM pass the suite.
 - [~] H3. Data races rejected. Done: code reached from `spawn` or
       `p_thread_spawn` may not write a global of the program without a lock. Left:
       shared data reached through pointers and captures (L).
-- [ ] H4. Enforce `@send`/`@sync` for every spawn argument (M).
+      Nov 4–6: raw pointers, references and structs holding them are not `@send`,
+      so they cannot reach another task (test_race_ptr_fail). Left: a `Vec`
+      passed to a task is still the same handle until copy-on-write is on (M5).
+- [x] H4. Enforce `@send`/`@sync` for every spawn argument (M).
+      Done Nov 4: every argument of a spawned call must be `@send`; a struct of
+      `@send` fields is `@send` (test_spawn_send_fail).
 - [x] H5. Real `async`: an `async fn` is a task that runs until it first waits;
-      `await`, `task_sleep` and socket waits suspend it (L, see decision 4). An
-      `async fn` with float, struct or reference arguments or results still runs
-      to its end at the call.
+      `await`, `task_sleep` and socket waits suspend it (L, see decision 4).
+      Float and struct arguments and results run as tasks too since Nov 4
+      (H9); an `async fn` with a reference argument still runs to its end.
 - [x] H6. Green threads outside the interpreter: fibers on Windows, `ucontext` on
       Linux, 10,000 tasks on one thread. The interpreter runs a task to its end.
-- [ ] H7. `parallel { }` runs multi-statement branches concurrently (M).
-- [ ] H8. Allocator: per-thread caches instead of one global lock (M).
-- [ ] H9. An `async fn` with float, struct or reference arguments or results is a
+- [x] H7. `parallel { }` runs multi-statement branches concurrently (M).
+      Done Nov 4: `x = f(..)` branches are spawned and joined; a multi-statement
+      branch that reads only word-sized locals runs as its own function on a
+      thread (test_parallel_branches, all backends). Other branches run in place.
+- [x] H8. Allocator: per-thread caches instead of one global lock (M).
+      Done Nov 4: the C runtime has per-thread arenas and free lists; the native
+      runtime now keeps a free list per thread in a TLS slot (only chunk growth
+      takes the lock). No multi-thread stress test run.
+- [~] H9. An `async fn` with float, struct or reference arguments or results is a
       task too: today it runs to its end at the call (M).
+      Done Nov 4 for the interpreter and C: an `async fn` with f64 or struct
+      arguments or results runs as a task through a word adapter
+      (test_async_float_struct). Natively built programs crash, as all native
+      async does (H10). References are still not task arguments.
 - [ ] H10. Tasks on several threads natively: the C runtime keeps them per thread,
       the native one has a single set (M).
+      Nov 6: the native runtime starts worker threads, but native programs using
+      async or spawn + await crash on them (test_async, test_async_float_struct
+      under `fid emit`).
 
 **Acceptance:** a race test is rejected; 10,000 concurrent tasks run on a few
 threads.
@@ -409,20 +484,38 @@ Nothing here is ready to protect real data yet. Do not write new primitives.
       compiles and only panics at runtime (M).
 - [x] K2. Literal range checks: `var x: u8 = 300` is rejected (S).
 - [x] K3. Silent narrowing rejected: an `i64` assigned to an `i32` truncates (M).
-- [ ] K4. Iterator invalidation: `for x in v { v.push(1); }` is rejected (M).
-- [ ] K5. Borrow-checker gaps: `s.x = 1`, `&v[i]`, trait impl bodies (M).
-- [ ] K6. `&(rvalue)` no longer points at a dead temporary (M).
-- [ ] K7. `@deterministic`, `@crashfree` and `sandbox` cover effects hidden in
+- [x] K4. Iterator invalidation: `for x in v { v.push(1); }` is rejected (M).
+      Done Nov 4: changing a `Vec` while a `for` loop walks it is rejected in
+      `fid` (test_iter_invalidation_fail).
+- [x] K5. Borrow-checker gaps: `s.x = 1`, `&v[i]`, trait impl bodies (M).
+      Done Nov 4 in `fid`: field assignments checked against borrows, `&v[i]`
+      borrows `v`, trait impl bodies checked (test_field_borrow_fail).
+- [x] K6. `&(rvalue)` no longer points at a dead temporary (M).
+      Done Nov 4: the native backend never recycles an alloca's slot, so
+      `&(rvalue)` keeps pointing at live memory.
+- [x] K7. `@deterministic`, `@crashfree` and `sandbox` cover effects hidden in
       method bodies: extend the effect table with `p_file_*`, `p_socket_*`,
       `p_system`, `p_clock_now` (M).
-- [~] K8. `@no-indirect`, `@bounded-stack`, `@tainted` either work or are removed
+      Done Nov 4: file, directory, process, clock, environment and random runtime
+      calls are IO; sockets, TLS, DNS and HTTP are Net.
+- [x] K8. `@no-indirect`, `@bounded-stack`, `@tainted` either work or are removed
       (M). They parse but do nothing useful.
       Done: `@bounded-stack` is checked in both compilers (no recursion, no call
       through a function value in anything it reaches). Left: `@tainted`.
-- [ ] K9. Generic bounds are checked; an unbound `T` is an error, not `i32` (M).
-- [ ] K10. `@cfg` and `@simd` work on `fid` as on `fidesc` (M).
-- [ ] K11. A language reference that matches both compilers, with the differences
+      Done Nov 4: `@no-indirect` rejects calls through function parameters;
+      `@tainted` on a parameter taints the function (test_safety_indirect_fail,
+      test_tainted_param_fail).
+- [x] K9. Generic bounds are checked; an unbound `T` is an error, not `i32` (M).
+      Done Nov 3–4 in `fid` (proposal 0002): bounds checked, an uninferable type
+      parameter is an error (test_generic_bound_fail, test_generic_infer_fail).
+- [~] K10. `@cfg` and `@simd` work on `fid` as on `fidesc` (M).
+      Done Nov 4 for `@cfg` in `fid` (platform/os, arch, debug/release; test_cfg
+      on all backends). `@simd` not compared.
+- [x] K11. A language reference that matches both compilers, with the differences
       closed (M).
+      Done Nov 4: docs/reference/reference.md, written from the compiler source,
+      each rule citing the function that enforces it; differences from `fidesc`
+      in language-guide.md § 10.
 - [x] K12. Semver and a stability promise for 1.0 (S): `docs/reference/stability.md`.
 
 **Acceptance:** every line in `docs/reference/features.md` has a test proving it,
@@ -433,10 +526,20 @@ and a test proving what it rejects.
 Fides must not be described as suitable for medical, automotive or avionics use
 until this track and L5 (set aside) are complete.
 
-- [ ] L1. Every safety annotation enforced, with a negative test per rule (L).
-- [ ] L2. Remaining stubs in the safety-annotation checks closed (M).
-- [ ] L3. `qualify` reports complete evidence (L).
-- [ ] L4. Requirements traceability from each rule to its tests (L).
+- [x] L1. Every safety annotation enforced, with a negative test per rule (L).
+      Done Nov 4: @no-alloc sees method calls and string `+`, @firmware sees
+      runtime calls, @gas counts literal loop trips; a negative test per rule
+      (docs/reference/safety-rules.md, 17 rules).
+- [x] L2. Remaining stubs in the safety-annotation checks closed (M).
+      Done Nov 4: the stubs found (methods unchecked, function-parameter calls,
+      runtime calls skipped before @firmware, @tainted on parameters) are closed.
+- [x] L3. `qualify` reports complete evidence (L).
+      Done Nov 4: `fid qualify <file.fd>` prints JSON evidence (hashes, check
+      result, annotated functions, each rule with its tests and whether they
+      exist). Always "NOT_QUALIFIED".
+- [x] L4. Requirements traceability from each rule to its tests (L).
+      Done Nov 4: docs/reference/safety-rules.md traces each rule to its
+      requirement and its negative and positive tests.
 
 **Acceptance:** every rule has its negative test and traces to its requirement.
 This is our evidence, not a certificate: see "Set aside".
@@ -460,7 +563,7 @@ Tested on Nov 1, native build:
 | Free of a pointer that is not a block | Panics, on the interpreter, C and native paths | Done (M3) |
 | Use after free | Needs `unsafe` to read, but nothing detects it: it read 0 | M7, M8 |
 | Two names for one `Vec` | `var b = a` shares it, with no move check | M4, M5 |
-| `push` during `for` over the same `Vec` | Compiles and runs | K4 |
+| `push` during `for` over the same `Vec` | Rejected in `fid` (Nov 4) | Done (K4) |
 
 - [x] M1. Write down the guarantee in the language guide: what safe code
       promises, and exactly what `unsafe` gives up (S).
@@ -472,8 +575,10 @@ Tested on Nov 1, native build:
       reused cannot be told from a valid one, and frees the new owner's block:
       M5 and M7 close that. Covers the interpreter, C and native Windows paths;
       the native ELF, ARM64 and RISC-V runtimes have their own p_free, unchanged.
-- [ ] M4. Decide what `var b = a` means for `Vec`, `str` and `HashMap`: a move, or
+- [x] M4. Decide what `var b = a` means for `Vec`, `str` and `HashMap`: a move, or
       a shared counted handle (S, see decision 3).
+      Decided Nov 2: copy-on-write for `Vec`, `str` and `HashMap`; `==` by
+      content.
 - [ ] M5. Enforce it: use after move is rejected, or shared handles are counted
       (L).
 - [x] M6. Every compiler-inserted free has tests for each way a value can escape:
@@ -484,17 +589,33 @@ Tested on Nov 1, native build:
       inaccessible and are never reused, blocks end at an inaccessible page;
       the access faults with a trace. `--leaks` reports blocks never freed.
       Left: the PE path.
-- [ ] M8. The suite runs under AddressSanitizer through the C path, in CI (M).
-- [ ] M9. Fuzzing: random programs must agree on the interpreter, C and native
+      Nov 4: `fid emit --checked-alloc` gives every native block pages of its
+      own, ending at a guard page, and makes freed pages inaccessible. Written
+      and built, not yet run on the suite.
+- [~] M8. The suite runs under AddressSanitizer through the C path, in CI (M).
+      Written Nov 4: scripts/sanitize.sh builds each test through C with
+      ASan/UBSan (`FIDES_CFLAGS`) and compares with `fid run`; under ASan the C
+      runtime takes every block from calloc. Needs clang with ASan (Linux/macOS);
+      not run yet, not in CI.
+- [~] M9. Fuzzing: random programs must agree on the interpreter, C and native
       paths and stay clean under M7 and M8, run nightly (L).
+      Written Nov 4: scripts/fuzz/nightly.sh runs the generator on the
+      interpreter, C, native and the checked allocator, and a sample under the
+      sanitizers on Linux. Not scheduled: no CI workflow in the repo.
 - [~] M10. Audit every `unsafe` block in the stdlib: each states why it is sound,
       and no safe stdlib function can be misused into a memory error (L).
       Done: `fid audit <file.fd>` lists the `unsafe` code a program reaches with
       its `// SAFETY:` comment. Left: those comments in the stdlib (core alone
       has 174 blocks without one).
-- [ ] M11. An owned and a borrowed string type, so a server frees its request
+- [x] M11. An owned and a borrowed string type, so a server frees its request
       strings without a promise: `http_serve_scoped` is `@unsafe` until then (L,
       after M4).
+      Done Nov 4: `&str` is the borrowed string, `str` the owned one; a `str`
+      field of a `@scoped` struct reads as `&str`; a borrowed string cannot be
+      stored, returned as `str` or passed to a user function's `str` parameter
+      (`str_clone` copies). `http_serve_scoped` hands the handler a
+      `ScopedRequest` and is no longer `@unsafe` (test_borrowed_str and three
+      expected-fail tests).
 
 K1, K4, K5, K6, C5, C6 and H3 count towards this goal.
 

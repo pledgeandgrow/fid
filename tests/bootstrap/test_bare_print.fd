@@ -1,0 +1,58 @@
+// `fid emit --bare` (release G2): a flat binary that prints to COM1, uses
+// globals, structs, the bump allocator and asm!. Run it under QEMU, or on
+// Linux x86-64 with scripts/bare-run.c, which loads it at 0x10000 and plays
+// COM1 and `hlt`:
+//   fid emit tests/bootstrap/test_bare_print.fd --bare -o bare.bin
+//   gcc -O2 -o bare-run scripts/bare-run.c && ./bare-run bare.bin
+// Hosted backends print the same (the serial calls do nothing there and
+// asm! is not run, so the asm line is computed without it).
+//
+// Expected output:
+// hello from bare metal
+// 6765
+// -42
+// true
+// 30
+// 12
+// done
+
+var g_count: i64 = 0;
+
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+fn fib(n: i64) -> i64 {
+    if n < 2 { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn bump() {
+    g_count = g_count + 10;
+}
+
+fn twice(v: i64) -> i64 {
+    // In a bare build the asm computes it; elsewhere asm! gives 0
+    val r = asm!("mov rax, rcx; add rax, rcx", in("rcx") v, out("rax") v);
+    if r == 0 { return v + v; }
+    return r;
+}
+
+@unsafe
+fn main() -> i64 {
+    p_serial_init();
+    print("hello from bare metal\n");
+    print(fib(20)); print("\n");
+    print(-42); print("\n");
+    print(true); print("\n");
+    bump(); bump(); bump();
+    print(g_count); print("\n");
+    var p = Point { x: 2, y: 4 };
+    var block: i64 = p_malloc(16);
+    var cell: *mut i64 = block;
+    *cell = p.x + p.y;
+    print(twice(*cell)); print("\n");
+    print("done"); print("\n");
+    return 0;
+}

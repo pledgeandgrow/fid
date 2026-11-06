@@ -1627,6 +1627,13 @@ pub fn pe_kernel32_imports() -> Vec<str> {
     v.push("CreateFiberEx");
     v.push("SwitchToFiber");
     v.push("DeleteFiber");
+    // The scheduler's start-up lock and core count (pe_runtime/conc.fd)
+    v.push("CreateMutexA");
+    v.push("ReleaseMutex");
+    v.push("GetSystemInfo");
+    // emit --checked-alloc (release M7): a block's own pages
+    v.push("VirtualAlloc");
+    v.push("VirtualProtect");
     return v;
 }
 
@@ -1686,7 +1693,7 @@ pub fn pe_add_extra_import(dll: str, name: str) {
                 if e.names.get(k) == name { return; }
                 k = k + 1;
             }
-            e.names.push(name);
+            g_pe_extra_imports.get(i).names.push(name);
             return;
         }
         i = i + 1;
@@ -1704,6 +1711,46 @@ pub fn pe_link_dll(lib: str) -> str {
     if lib == "GLU" { return "glu32.dll"; }
     if str_ends_with(lib, ".dll") { return lib; }
     return lib + ".dll";
+}
+
+/// The DLLs the loader binds before the program starts (kernel32, msvcrt).
+/// The others (`link "x"`) have IAT slots too, but the program loads them
+/// itself at start-up (PeirGen_gen_dll_loader), so that a missing library
+/// is reported by name instead of the loader failing silently (release E4).
+pub const PE_STATIC_DLLS: i64 = 2;
+
+/// The files to try, in order, for a `link` DLL: SQLite's own sqlite3.dll,
+/// else the copy every Windows 10 and 11 has (winsqlite3.dll, same API).
+pub fn pe_link_dll_candidates(dll: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(dll);
+    if dll == "sqlite3.dll" { v.push("winsqlite3.dll"); }
+    return v;
+}
+
+/// Is `dll` where LoadLibraryA looks for it (beside `out_dir`, the current
+/// folder, the system folder or a PATH entry)? For a compile-time warning.
+pub fn pe_dll_found(dll: str, out_dir: str) -> bool {
+    var dirs: Vec<str> = Vec::new();
+    if out_dir != "" { dirs.push(out_dir); }
+    dirs.push(".");
+    var root = p_getenv("SystemRoot");
+    if (root as i64) != 0 { dirs.push(root + "\\System32"); } else { dirs.push("C:\\Windows\\System32"); }
+    var path = p_getenv("PATH");
+    if (path as i64) != 0 {
+        var parts: Vec<str> = str_split(path, ";");
+        var pi: i64 = 0;
+        while pi < parts.len() {
+            if str_len(parts.get(pi)) > 0 { dirs.push(parts.get(pi)); }
+            pi = pi + 1;
+        }
+    }
+    var di: i64 = 0;
+    while di < dirs.len() {
+        if p_file_exists(dirs.get(di) + "\\" + dll) != 0 { return true; }
+        di = di + 1;
+    }
+    return false;
 }
 
 /// The DLLs of the import table, in IAT order.
@@ -1821,6 +1868,7 @@ pub fn PeirRdata_string_offset(self: &PeirRdata, s: str) -> i64 {
 
 /// Insertion sort of a string vector (str_compare order), deterministic.
 fn pe_sort_strings(v: Vec<str>) -> Vec<str> {
+    var v = v;
     var i: i64 = 1;
     while i < v.len() {
         var key: str = v.get(i);
@@ -1833,6 +1881,21 @@ fn pe_sort_strings(v: Vec<str>) -> Vec<str> {
         i = i + 1;
     }
     return v;
+}
+
+/// The data of a bare build: the string constants, no import table.
+pub fn PeirRdata_build_strings(self: &mut PeirRdata, string_constants: Vec<str>) -> void {
+    var keys: Vec<str> = pe_sort_strings(string_constants);
+    var ki: i64 = 0;
+    while ki < keys.len() {
+        PeirRdata_add_string(self, keys.get(ki));
+        ki = ki + 1;
+    }
+    PeirRdata_add_string(self, "true");
+    PeirRdata_add_string(self, "false");
+    while (self.data.len() % 8) != 0 {
+        self.data.push(0);
+    }
 }
 
 /// Build the complete .rdata section
@@ -1971,10 +2034,19 @@ pub fn PeirRdata_patch_rvas(self: &mut PeirRdata, rdata_rva: i64) -> void {
             var rva: i64 = rdata_rva + self.import_by_name_offsets.get(k);
             var ilt_entry: i64 = self.ilt_offsets.get(d) + j * 8;
             var iat_entry: i64 = self.dll_iat_offsets.get(d) + j * 8;
-            self.data = pe_put_u32(self.data, ilt_entry, rva);
-            self.data = pe_put_u32(self.data, iat_entry, rva);
+            if d < PE_STATIC_DLLS {
+                self.data = pe_put_u32(self.data, ilt_entry, rva);
+                self.data = pe_put_u32(self.data, iat_entry, rva);
+            } else {
+                // Filled by the start-up loader: no descriptor names it
+                self.data = pe_put_u32(self.data, iat_entry, 0);
+            }
             k = k + 1;
             j = j + 1;
+        }
+        if d >= PE_STATIC_DLLS {
+            d = d + 1;
+            continue;
         }
         // Import descriptor (TimeDateStamp and ForwarderChain stay 0)
         var dir: i64 = self.import_dir_offset + d * 20;
@@ -2022,6 +2094,7 @@ pub fn pe_bytes_hex(bytes: Vec<i64>) -> str {
 }
 
 pub fn pe_push_u64(t: Vec<i64>, v: i64) -> Vec<i64> {
+    var t = t;
     t.push(v & 0xFF);
     t.push((v >> 8) & 0xFF);
     t.push((v >> 16) & 0xFF);
@@ -2034,6 +2107,7 @@ pub fn pe_push_u64(t: Vec<i64>, v: i64) -> Vec<i64> {
 }
 
 pub fn pe_push_u32(t: Vec<i64>, v: i64) -> Vec<i64> {
+    var t = t;
     t.push(v & 0xFF);
     t.push((v >> 8) & 0xFF);
     t.push((v >> 16) & 0xFF);
@@ -2042,12 +2116,14 @@ pub fn pe_push_u32(t: Vec<i64>, v: i64) -> Vec<i64> {
 }
 
 pub fn pe_push_u16(t: Vec<i64>, v: i64) -> Vec<i64> {
+    var t = t;
     t.push(v & 0xFF);
     t.push((v >> 8) & 0xFF);
     return t;
 }
 
 pub fn pe_put_u32(t: Vec<i64>, at: i64, v: i64) -> Vec<i64> {
+    var t = t;
     t.set(at, v & 0xFF);
     t.set(at + 1, (v >> 8) & 0xFF);
     t.set(at + 2, (v >> 16) & 0xFF);
@@ -2056,6 +2132,7 @@ pub fn pe_put_u32(t: Vec<i64>, at: i64, v: i64) -> Vec<i64> {
 }
 
 pub fn pe_push_str(t: Vec<i64>, s: str) -> Vec<i64> {
+    var t = t;
     var i: i64 = 0;
     while i < str_len(s) {
         t.push(str_byte_at(s, i));

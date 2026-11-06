@@ -2,101 +2,129 @@
 
 > Single source of truth for "what are we doing right now."
 > Read this first every session. Updated after every milestone change.
-> Last updated: Oct 27, 2026 — post-Session 34 (self-hosted parity).
+> Last updated: Nov 6, 2026 — release-roadmap batches H, K, L, M and C/D
+> landed in `fid` (uncommitted on `main`); numbers re-counted.
+>
+> **The "Numbers" section below is the one place project numbers are kept.**
+> Other docs round them and link here; change them here first.
 
 ## Current direction: the self-hosted compiler is the release compiler
 
-The self-hosted compiler (`compiler/*.fd`, **54 modules, ~105K LOC**) is the
+The self-hosted compiler (`compiler/*.fd`, **61 modules, ~134K lines**) is the
 primary artifact and the compiler the installer ships (`fid.exe`). The Rust
-compiler (`src/*.rs`, **55 files, ~101K LOC**) is the bootstrap reference: it
-builds stage 1 of the self-hosted compiler and holds the test harness
-(`fidesc test`); it ships beside it as `fidesc.exe`.
+compiler (`src/*.rs`, **57 files, ~113K lines**) is frozen: it builds stage 1
+of the self-hosted compiler and holds the test harness (`fidesc test
+--compiler <fid>`); it ships beside it as `fidesc.exe`. **The language is
+what `fid` accepts**; where the two differ, see
+[language-guide.md § 10](docs/reference/language-guide.md). The rules, with
+the code that enforces each: [reference.md](docs/reference/reference.md).
 
 **v1.0.0 was released Sep 9, 2026** with a Windows installer
-(`Fides-Setup-1.0.0.exe`).
+(`Fides-Setup-1.0.0.exe`). `fid version` still prints `0.1.0` (Cargo.toml).
 
 ### Honest status — what is actually true today
 
-- **Bootstrap fixpoint:** VERIFIED byte-for-byte (stage 2 == stage 3, ~38 MB
-  of C). `RELEASE=1 ./scripts/bootstrap.sh` checks it on every release
-  build, then installs `release/fid.exe` and runs a program from an
-  installed layout.
-- **Self-hosted `run` and `ccompile` match `fidesc`:** `run` on all 302 test
-  programs and all 10 examples; `ccompile` on 242 of 243 test programs
-  (`test_sqlite` needs libsqlite3) and 9 of 10 examples (`minimal_game` needs
-  SDL2); all 59 expected-fail tests are rejected.
-- **Rust compiler suite:** interpreter 280/280, C 278/278, native Windows (PE)
-  282/282, expected-fail 59/59 (`fidesc test`, `fidesc test --fail`).
-- **Self-hosted native backend works:** `fid emit` makes Windows executables
-  with no C compiler and reaches a byte-identical fixpoint. The older
-  `build --native` path (PIR, compiler/pe.fd) still crashes and is unused.
-- **Nondeterministic self-hosted typecheck:** reported earlier (HashMap-order
-  instability); not reproduced in the Oct 25–27 bootstraps.
-- **`verify.sh --golden` and `scripts/bisect.sh` do not exist** —
-  `verify.sh --golden` will fail; bisect manually with `dump-*` commands.
+- **Bootstrap fixpoint:** VERIFIED byte-for-byte on Nov 6 (stage 2 == stage
+  3, 49 MB of C). `RELEASE=1 ./scripts/bootstrap.sh` checks it on every
+  release build. `PIN=1` can pin a stage 0, but none is pinned yet: stage 1
+  is still built by `fidesc`.
+- **Tests:** the last full suite run is from Nov 2 (interpreter 339/339, C
+  343/343, native Windows 345/345, expected-fail 89/89). The Nov 4–6 compiler
+  was checked on the new and the key tests on all three backends, and every
+  new expected-fail test is rejected; the full suite has not been rerun.
+- **Backends:** interpreter (`fid run`), C (`fid ccompile`, needs a C
+  compiler), native Windows x64 (`fid emit`, no C compiler). Native `emit`
+  works again (Nov 6): core's `p_str_free` took plain strings for
+  length-headered ones and freed the wrong address. The old `build
+  --native` path (PIR, compiler/pe.fd) still crashes and is unused.
+- **New in `fid` (Nov 4–6):** generics with inference, bounds and turbofish
+  for functions, enums and `impl<T>` ([0002](docs/proposals/0002-real-generics.md);
+  a literal of a user-defined generic struct is still rejected); `if`/`match` values;
+  `@cfg`; freeing of provably finished locals (Vec, HashMap, owned elements,
+  regions, string temporaries); iterator invalidation and field-borrow
+  checks; `@send` on every spawned argument; `parallel {}` branches on
+  threads; `async fn` with f64 and struct arguments and results; every
+  safety annotation enforced, 17 rules with negative tests
+  ([safety-rules.md](docs/reference/safety-rules.md)) and `fid qualify`
+  evidence; owned and borrowed strings (`&str`, `@scoped`, `str_clone`;
+  `http_serve_scoped` is no longer `@unsafe`); integer-key `HashMap`s;
+  per-call-site effects of higher-order functions.
+- **Value semantics ([0001](docs/proposals/0001-value-semantics.md)):**
+  decided (copy-on-write for `Vec`, `str`, `HashMap`; `==` by content, done).
+  Copy-on-write is written for `Vec`, `HashMap` and the `Vec` fields of
+  copied structs, behind `LOWER_COW` (off): shares are lazy (elements are
+  copied at the first write), counted (freed with their last owner) and left
+  out for copies that are never written or read for the last time. On,
+  test programs get value semantics on every backend and `fid` compiling
+  itself reaches its fixpoint (Nov 6), with a peak of 4.7 GB against 1.8 GB
+  off. It stays off until the full suite has run with it on, so today
+  `var b = a` on a `Vec` still aliases.
+- **Native async is broken:** `fid emit` programs that use `async`/`spawn` +
+  `await` crash on the worker threads (interpreter and C are fine).
+- **Speed:** fib(40) 1.34 s native, 0.81 s through C, 0.53 s Rust (Nov 2).
+  `fid` turns its own source into C in about 133 s (type check 59 s);
+  `fidesc` in 21 s. The native path now runs a small IR optimizer
+  (`compiler/iropt.fd`); there is no full register allocator.
+- **Written, not run yet:** `fid emit --checked-alloc` (blocks on guard
+  pages), `scripts/sanitize.sh` (ASan/UBSan, needs clang on Linux/macOS),
+  `scripts/fuzz/nightly.sh` (no CI workflow in the repo schedules it).
+- **`verify.sh --golden` and `scripts/bisect.sh` do not exist** — bisect
+  with the `dump-*` commands.
 
 ### Recent sessions
 
 | Session | What happened |
 |---------|---------------|
-| 34 | Self-hosted compiler: @conserve check completed, second `impl` blocks in imported modules kept, `extern "C" link` libraries linked. Tests that printed timings or random values, or had no `main`, made deterministic; `examples/riscv_blink` fixed. Self-hosted now matches on 302/302 (`run`) and 242/243 (`ccompile`). |
-| 33 | Self-hosted interpreter and front end ported to parity with the Rust compiler (79 → 241 `run`, 164 → 239 `ccompile`); stdlib found from an installed location; release bootstrap with fixpoint check; installer ships the self-hosted compiler. |
+| Nov 4–6 | Release roadmap: C5–C8 freeing, D5–D9 speed and tooling, H4/H7/H8/H9, K4–K11, L1–L4, M7–M9 scripts, M11; integer-key HashMap; higher-order effects; native `emit` fixed; copy-on-write written (off); language reference and safety-rule traceability written. Fixpoint verified. |
+| Nov 2–3 | Proposal 0002 (generics) in `fid`; `==` by content; `&mut` migration of 403 parameters; Linux CI green; self-compile 4.4× faster. |
+| 34 | Self-hosted compiler: @conserve check completed, second `impl` blocks in imported modules kept, `extern "C" link` libraries linked. Self-hosted matched `fidesc` on 302/302 (`run`) and 242/243 (`ccompile`). |
+| 33 | Self-hosted interpreter and front end ported to parity with the Rust compiler; stdlib found from an installed location; release bootstrap with fixpoint check; installer ships the self-hosted compiler. |
 | 32 | Native Windows executables run every test: a Fides runtime for the PE backend. |
-| 31 | Fast, reproducible and incremental builds; short-circuit, HMAC and PE miscompile fixes. |
-| 30 | Post-codegen constant-time verifier on x86-64 ELF (asm-level `jcc`/`cmov`/indexed-mem/call checks). `cast_arg` `Ptr(inner)→Generic` deref in both C codegens (heals `&mut Vec`→`Vec` forwards — the `record_def`/`ra_vec_find_i64` crash). `cmd /C` quote-strip fix so `cl.exe` links on Windows. |
-| 29 | Reference escape check (`src/escape.rs`, `compiler/escape.fd`): references are second-class. `Vec<f64>` reads + `f64` returns fixed. Fixpoint re-verified. |
-| 28 | Branch consolidation — `release-infra` merged into `main`; 15 `Vec` params made by-value; 92 `&mut` call sites removed; `str_equal` → `==`. |
-| 27 | Soundness pass — typechecker rejects previously-accepted wrong programs. |
-| 26 | Bootstrap fixpoint VERIFIED byte-for-byte (c4==c5); 7 Rust→Fides gap fixes; self-compilation SIGSEGV fixed. |
 
-## Current Baseline
+## Numbers
+
+Counted Nov 6, 2026 (`wc -l`, so blank lines and comments included).
+Measured figures carry their own date.
 
 ```
-compiler/*.fd:  54 modules, ~105K LOC — THE COMPILER (primary source)
-src/*.rs:       55 files, ~101K LOC — bootstrap reference + test harness
-stdlib/*.fd:    104 modules, 30,446 LOC (kernel/uefi moved to fides-os)
-tests:          302 bootstrap + 46 selfhost .fd files
-Binaries:       release/fid.exe (self-hosted, shipped as fid.exe)
-                target/release/fidesc.exe (Rust, shipped as fidesc.exe)
+compiler/*.fd:   61 modules, 133,688 lines — THE COMPILER (primary source)
+src/*.rs:        57 files, 112,511 lines — bootstrap reference + test harness
+stdlib/*.fd:     137 modules, 43,576 lines (+ 4 in stdlib/pe_runtime/)
+tests:           493 .fd under tests/bootstrap/ (452 top level, 91 of them
+                 expected-fail), 51 in tests/selfhost/, 10 examples
+Suite (Nov 2):   interp 339/339, C 343/343, PE 345/345, expected-fail 89/89
+                 (not rerun with the Nov 4–6 compiler)
+Fixpoint:        stage 2 == stage 3, 49 MB of C (Nov 6)
+Self-compile:    fid ~133 s to C (Nov 6), fidesc 21 s
+Platforms:       Tier 1 Windows x64 (interp, C, native) and Linux x64 (interp,
+                 C); everything else tier 2 or 3 — docs/reference/platforms.md
+Binaries:        release/fid.exe (self-hosted, shipped as fid.exe)
+                 target/release/fidesc.exe (Rust, shipped as fidesc.exe)
 ```
 
 ## What's NOT yet done
 
-1. **Strings are not reclaimed** — only `Vec` locals and container buffers are.
-   Extend the local-escape pass (lower.rs `auto_drop_vecs`) to string temporaries.
-2. **Self-hosted typecheck nondeterminism** — reported earlier; not seen in
-   the Oct 25–27 bootstraps. Retry before assuming a regression.
-3. **Post-codegen CT verification is x86-64 ELF only** — PE (`pe.rs` emits
-   bytes directly, no asm text), ARM64, and RISC-V paths are not covered.
-4. **`&mut Vec` and `Vec` param promotion is inconsistent** — mutated params
-   may promote to `Ptr(Vec)` while callers were lowered against the
-   `Generic` signature; `cast_arg` now papers over the common case, but the
-   promotion itself is not yet stable.
-5. ~~**`fidesc test` C-codegen on Windows**~~ — confirmed: 278/278 (Oct 27).
-6. ~~**Docs consolidation leftovers**~~ — FIXED (session 30 docs audit):
-   INDEX.md, selfhost.md, and all cross-links now point at the merged
-   `docs/roadmap/roadmap.md` + `docs/selfhost/selfhost.md`.
-7. **stdlib docs lag** — 30 of the 104 stdlib modules have no
-   `docs/stdlib/<name>.md` page (mostly the game/media batch from
-   session 21).
-8. ~~**`release/fid-dev.c` instrumentation**~~ — regenerated by
-   `./scripts/build-selfhost.sh` (clean `dump-c`, no debug prints).
-
-## What IS done (Sessions 17–30)
-
-- Sessions 17–24: v1.0.0 release, installer, industry stdlib, language
-  features (@zeroize, @secret, @interrupt, @firmware, `parallel {}`, @simd).
-- Sessions 26–29: fixpoint verified (c4==c5), soundness pass, escape check,
-  Vec<f64>/f64-return fixes, branch consolidation.
-- Session 30: post-codegen constant-time verifier (x86-64 ELF), `cast_arg`
-  ABI repair, `cl.exe` quoting fix, alloca-hoist fix for the `--native` path.
-- Sessions 31–34: reproducible/incremental builds, a Fides runtime for the
-  PE backend (all tests run natively), self-hosted `run`/`ccompile` parity,
-  release bootstrap, installer ships the self-hosted compiler.
+1. **Copy-on-write on** (M5): run the full suite with `LOWER_COW = true`,
+   then switch it on. Its memory cost (4.7 GB vs 1.8 GB for the
+   self-compile) comes mostly from shares held by struct copies that are
+   never freed; freeing them at scope end needs a check that no alias read
+   out of the struct outlives it.
+2. **Native async/tasks** crash in `fid emit` programs (H10).
+3. **A full native register allocator** (D4): today 7 callee-saved
+   registers hold the hottest locals, parameters and short-lived values.
+4. **`Vec` elements at their real size and references into containers**
+   (D14, D15).
+5. **Other platforms** (Track F: macOS, native ELF, ARM64/RISC-V/WASM),
+   **bare metal** (Track G: `emit --bare` panics), **crypto** J5–J9,
+   `parse-header` on SDL2/SQLite (E5).
+6. **`// SAFETY:` comments** on the `unsafe` blocks of the stdlib (M10).
+7. **Post-codegen CT verification is x86-64 ELF only** (J7).
+8. **The full suite** has to be rerun with the Nov 4–6 compiler and the
+   baseline saved.
 
 ## Self-Host Module Status
 
-All **54** `compiler/*.fd` modules type-check. The full list and per-file
+All **61** `compiler/*.fd` modules type-check (the compiler builds itself). The full list and per-file
 findings are tracked in `file-analysis/PROGRESS.md` — that file is the
 authoritative per-module ledger (newest: `runtime.fd`, `escape.fd`).
 
@@ -129,6 +157,12 @@ RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh
 .\target\release\fidesc.exe ccompile compiler\main.fd -o ...  # then link with cl/zig
 
 # Full verification
+./target/release/fidesc.exe test --compiler release/fid.exe   # the suite on fid
 ./verify.sh            # tests/bootstrap/ (Rust compiler)
 ./verify-selfhost.sh   # tests/selfhost/ (Fides components, 3 backends)
+
+# Evidence, sanitizers, fuzzing
+.\release\fid.exe qualify file.fd -o evidence.json
+./scripts/sanitize.sh          # needs clang with ASan (Linux/macOS)
+./scripts/fuzz/nightly.sh
 ```

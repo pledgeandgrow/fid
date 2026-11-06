@@ -358,22 +358,250 @@ pub fn Vec_new() -> i64 {
 }
 
 /// Free a Vec's memory (its elements are not freed). The compiler calls this
-/// for a Vec that provably never leaves its local variable.
+/// for a Vec that provably never leaves its local variable. A shared Vec
+/// releases one owner; the buffer is freed when the last owner is.
 pub fn Vec_drop(v: i64) {
     if v == 0 { return; }
     var p: *mut i64 = v;
+    var cp: *mut i64 = v + 16;
     var data: i64 = 0;
-    unsafe { data = *p; }
-    if data != 0 { p_free(data); }
+    var cap: i64 = 0;
+    unsafe { data = *p; cap = *cp; }
+    if cap < 0 {
+        // Shared data: one fewer owner; freed at the last.
+        var bx: i64 = 0 - cap - 1;
+        var b0: *mut i64 = bx;
+        var n: i64 = 0;
+        unsafe { n = *b0; *b0 = n - 1; }
+        if n <= 1 {
+            if data != 0 { p_free(data); }
+            p_free(bx);
+        }
+    } else if data != 0 {
+        p_free(data);
+    }
     p_free(v);
+}
+
+/// Whether this Vec is the last owner of its data: sole (cap >= 0) or the
+/// only one left in its share group.
+pub fn vec_last_owner(v: i64) -> bool {
+    var cp: *mut i64 = v + 16;
+    var cap: i64 = 0;
+    unsafe { cap = *cp; }
+    if cap >= 0 { return true; }
+    var b0: *mut i64 = 0 - cap - 1;
+    var n: i64 = 0;
+    unsafe { n = *b0; }
+    return n <= 1;
+}
+
+/// Free a Vec<str> and the strings it owns (release C5). The compiler calls
+/// this only when every element was a fresh string no one else holds;
+/// Str_drop frees only heap strings, so a literal element is left alone.
+/// Shared elements are freed only by the share's last owner.
+pub fn Vec_drop_strs(v: i64) {
+    if v == 0 { return; }
+    if vec_last_owner(v) {
+        var n: i64 = Vec_len(v);
+        var i: i64 = 0;
+        while i < n {
+            Str_drop(Vec_get(v, i));
+            i = i + 1;
+        }
+    }
+    Vec_drop(v);
+}
+
+/// Free a Vec<Vec<T>> and the Vecs it owns (one level: their elements are
+/// not freed), under the same rule as Vec_drop_strs.
+pub fn Vec_drop_vecs(v: i64) {
+    if v == 0 { return; }
+    if vec_last_owner(v) {
+        var n: i64 = Vec_len(v);
+        var i: i64 = 0;
+        while i < n {
+            Vec_drop(Vec_get(v, i));
+            i = i + 1;
+        }
+    }
+    Vec_drop(v);
+}
+
+/// Free a HashMap's tables and header (release C7); keys and values are not
+/// freed. The compiler calls this for a map that never leaves its local.
+/// A shared map releases one owner; its tables are freed at the last.
+pub fn HashMap_drop(m: i64) {
+    if m == 0 { return; }
+    var kp: *mut i64 = m;
+    var vp: *mut i64 = m + 8;
+    var keys: i64 = 0;
+    var vals: i64 = 0;
+    var sp: *mut i64 = m + 32;
+    var shared: i64 = 0;
+    unsafe { keys = *kp; vals = *vp; shared = *sp; }
+    var last: bool = true;
+    if shared != 0 {
+        var b0: *mut i64 = shared;
+        var n: i64 = 0;
+        unsafe { n = *b0; *b0 = n - 1; }
+        if n <= 1 { p_free(shared); } else { last = false; }
+    }
+    if last {
+        if keys != 0 { p_free(keys); }
+        if vals != 0 { p_free(vals); }
+    }
+    p_free(m);
+}
+
+/// Copy-on-write (proposal 0001): a second Vec over the same data. A shared
+/// buffer gets a reference-count box {owners, capacity, kind, words, mask};
+/// the capacity slot of each owner then holds -box-1 (negative, so cap >= 0
+/// still means "sole owner, real capacity"). The first change to a shared
+/// buffer copies it (vec_own); the buffer is freed when the last owner is
+/// dropped. kind/words/mask say what the elements are (Vec_share_deep): a
+/// copy made by vec_own copies them too, so a deep share costs nothing until
+/// one side writes.
+pub fn Vec_share(v: i64) -> i64 {
+    if v == 0 { return v; }
+    var p0: *mut i64 = v;
+    var p8: *mut i64 = v + 8;
+    var p16: *mut i64 = v + 16;
+    var data: i64 = 0;
+    var len: i64 = 0;
+    var cap: i64 = 0;
+    unsafe { data = *p0; len = *p8; cap = *p16; }
+    if data == 0 { return Vec_new(); }
+    var marked: i64 = cap;
+    if cap >= 0 {
+        var bx: i64 = p_malloc(40);
+        var b0: *mut i64 = bx;
+        var b8: *mut i64 = bx + 8;
+        var b16: *mut i64 = bx + 16;
+        var b24: *mut i64 = bx + 24;
+        var b32: *mut i64 = bx + 32;
+        unsafe { *b0 = 2; *b8 = cap; *b16 = 0; *b24 = 0; *b32 = 0; }
+        marked = 0 - bx - 1;
+        unsafe { *p16 = marked; }
+    } else {
+        var rc: *mut i64 = 0 - cap - 1;
+        var n: i64 = 0;
+        unsafe { n = *rc; *rc = n + 1; }
+    }
+    var nv: i64 = p_malloc(24);
+    var nv0: *mut i64 = nv;
+    var nv8: *mut i64 = nv + 8;
+    var nv16: *mut i64 = nv + 16;
+    unsafe {
+        *nv0 = data;
+        *nv8 = len;
+        *nv16 = marked;
+    }
+    return nv;
+}
+
+/// Copy-on-write for a Vec whose elements are themselves values held by
+/// pointer: Vecs (kind 1), structs of `words` words whose Vec fields are the
+/// words set in `vec_mask` (kind 2), strings (kind 3). Lazy: the buffer is
+/// shared as by Vec_share and the box remembers the element kind; the first
+/// write through either side (vec_own, which the compiler also calls before
+/// a write into an element) copies the elements with the buffer.
+pub fn Vec_share_deep(v: i64, kind: i64, words: i64, vec_mask: i64) -> i64 {
+    var nv: i64 = Vec_share(v);
+    if kind == 0 || nv == 0 { return nv; }
+    var p16: *mut i64 = nv + 16;
+    var cap: i64 = 0;
+    unsafe { cap = *p16; }
+    if cap >= 0 { return nv; }
+    var bx: i64 = 0 - cap - 1;
+    var b16: *mut i64 = bx + 16;
+    var b24: *mut i64 = bx + 24;
+    var b32: *mut i64 = bx + 32;
+    unsafe { *b16 = kind; *b24 = words; *b32 = vec_mask; }
+    return nv;
+}
+
+/// A copy of element `e` of a deep-shared Vec, for the side that writes.
+fn vec_copy_elem(e: i64, kind: i64, words: i64, vec_mask: i64) -> i64 {
+    if e == 0 { return 0; }
+    if kind == 1 { return Vec_share(e); }
+    if kind == 3 {
+        var sl: i64 = p_str_length(e);
+        return String_slice_len(e, sl, 0, sl);
+    }
+    var nb: i64 = p_malloc(words * 8);
+    var w: i64 = 0;
+    while w < words {
+        var src: *mut i64 = e + w * 8;
+        var dst: *mut i64 = nb + w * 8;
+        var x: i64 = 0;
+        unsafe { x = *src; }
+        if w < 63 && (vec_mask >> w) % 2 == 1 { x = Vec_share(x); }
+        unsafe { *dst = x; }
+        w = w + 1;
+    }
+    return nb;
+}
+
+/// Before a change that writes a Vec's data (or one of its elements): if
+/// another Vec shares the data (negative capacity — a refcount box), this
+/// Vec either takes the buffer over as the last owner or gets a copy of its
+/// own, elements included for a deep share, so the change is this Vec's
+/// alone.
+pub fn vec_own(v: i64) {
+    var p16: *mut i64 = v + 16;
+    var cap: i64 = 0;
+    unsafe { cap = *p16; }
+    if cap >= 0 { return; }
+    var bx: i64 = 0 - cap - 1;
+    var b0: *mut i64 = bx;
+    var b8: *mut i64 = bx + 8;
+    var b16: *mut i64 = bx + 16;
+    var b24: *mut i64 = bx + 24;
+    var b32: *mut i64 = bx + 32;
+    var owners: i64 = 0;
+    var kind: i64 = 0;
+    var words: i64 = 0;
+    var vec_mask: i64 = 0;
+    unsafe { owners = *b0; cap = *b8; kind = *b16; words = *b24; vec_mask = *b32; }
+    var p0: *mut i64 = v;
+    var p8: *mut i64 = v + 8;
+    var data: i64 = 0;
+    var len: i64 = 0;
+    unsafe { data = *p0; len = *p8; }
+    if owners <= 1 {
+        // Last owner: keep the buffer and its elements, drop the box.
+        p_free(bx);
+        unsafe { *p16 = cap; }
+        return;
+    }
+    unsafe { *b0 = owners - 1; }
+    if cap < 8 { cap = 8; }
+    if cap < len { cap = len; }
+    var nd: i64 = p_malloc(cap * 8);
+    var i: i64 = 0;
+    while i < len {
+        var src: *mut i64 = data + i * 8;
+        var dst: *mut i64 = nd + i * 8;
+        var e: i64 = 0;
+        unsafe { e = *src; }
+        if kind != 0 { e = vec_copy_elem(e, kind, words, vec_mask); }
+        unsafe { *dst = e; }
+        i = i + 1;
+    }
+    unsafe {
+        *p0 = nd;
+        *p16 = cap;
+    }
 }
 
 /// Free a string nothing else holds: the compiler calls this (auto_drop_strs).
 pub fn Str_drop(s: i64) {
-    p_free(s);
+    p_str_free(s);
 }
 
 pub fn Vec_push(v: i64, value: i64) {
+    vec_own(v);
     var len_ptr: *mut i64 = v + 8;
     var cap_ptr: *mut i64 = v + 16;
     var data_ptr_ptr: *mut i64 = v;
@@ -543,7 +771,37 @@ pub fn vec_get_or(v: Vec<i64>, idx: i64, default: i64) -> i64 {
     return result;
 }
 
+/// `==` on two Vecs of numbers or bools (proposal 0001): same length, and
+/// equal element by element (word by word).
+pub fn Vec_eq_words(a: i64, b: i64) -> bool {
+    if a == b { return true; }
+    if a == 0 || b == 0 { return false; }
+    var n: i64 = Vec_len(a);
+    if n != Vec_len(b) { return false; }
+    var i: i64 = 0;
+    while i < n {
+        if Vec_get(a, i) != Vec_get(b, i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// `==` on two Vec<str>: same length, and equal strings element by element.
+pub fn Vec_eq_strs(a: i64, b: i64) -> bool {
+    if a == b { return true; }
+    if a == 0 || b == 0 { return false; }
+    var n: i64 = Vec_len(a);
+    if n != Vec_len(b) { return false; }
+    var i: i64 = 0;
+    while i < n {
+        if !str_equal(Vec_get(a, i), Vec_get(b, i)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
 pub fn Vec_set(v: i64, idx: i64, value: i64) {
+    vec_own(v);
     var len_ptr: *mut i64 = v + 8;
     var data_ptr_ptr: *mut i64 = v;
 
@@ -583,6 +841,11 @@ pub fn Vec_capacity(v: i64) -> i64 {
     var result: i64;
     unsafe {
         result = *cap_ptr;
+    }
+    // shared data stores -box-1; the capacity is the box's second word
+    if result < 0 {
+        var b8: *mut i64 = 0 - result - 1 + 8;
+        unsafe { result = *b8; }
     }
     return result;
 }
@@ -684,10 +947,12 @@ pub fn Vec_truncate(v: i64, n: i64) {
 }
 
 pub fn Vec_reverse(v: i64) {
+    vec_own(v);
     vec_raw_reverse(v);
 }
 
 pub fn vec_raw_reverse(v: i64) {
+    vec_own(v);
     var len_ptr: *mut i64 = v + 8;
     var data_ptr_ptr: *mut i64 = v;
 
@@ -718,10 +983,12 @@ pub fn vec_raw_reverse(v: i64) {
 }
 
 pub fn Vec_extend(v: i64, other: i64) {
+    vec_own(v);
     vec_raw_extend(v, other);
 }
 
 pub fn vec_raw_extend(v: i64, other: i64) {
+    vec_own(v);
     var other_len_ptr: *mut i64 = other + 8;
     var other_data_ptr_ptr: *mut i64 = other;
 
@@ -749,10 +1016,12 @@ pub fn vec_raw_extend(v: i64, other: i64) {
 }
 
 pub fn Vec_insert(v: i64, idx: i64, value: i64) {
+    vec_own(v);
     vec_raw_insert(v, idx, value);
 }
 
 pub fn vec_raw_insert(v: i64, idx: i64, value: i64) {
+    vec_own(v);
     var len_ptr: *mut i64 = v + 8;
     var data_ptr_ptr: *mut i64 = v;
 
@@ -803,10 +1072,12 @@ pub fn vec_raw_insert(v: i64, idx: i64, value: i64) {
 }
 
 pub fn Vec_remove(v: i64, idx: i64) -> i64 {
+    vec_own(v);
     return vec_raw_remove(v, idx);
 }
 
 pub fn vec_raw_remove(v: i64, idx: i64) -> i64 {
+    vec_own(v);
     var len_ptr: *mut i64 = v + 8;
     var data_ptr_ptr: *mut i64 = v;
 
@@ -924,10 +1195,12 @@ pub fn Vec_to_str(v: i64) -> str {
 /// Sort ascending (elements compared as i64), in place: heapsort,
 /// O(n log n) time and no extra memory.
 pub fn Vec_sort(v: i64) {
+    vec_own(v);
     vec_raw_sort(v);
 }
 
 pub fn vec_raw_sort(v: i64) {
+    vec_own(v);
     var len_ptr: *mut i64 = v + 8;
     var data_ptr_ptr: *mut i64 = v;
 
@@ -1081,19 +1354,156 @@ fn p_str_compare(a: i64, b: i64) -> i64 {
     }
 }
 
+// A HashMap header: [0] keys, [8] values, [16] len, [24] capacity,
+// [32] shared (copy-on-write, proposal 0001: 1 when another header may hold
+// the same arrays), [40] integer keys (1: keys are numbers, hashed and
+// compared as numbers; set by the `_i` functions the compiler calls for a
+// HashMap<i64, V>).
 pub fn HashMap_new() -> i64 {
-    var ptr: i64 = p_malloc(32);
-    var p0: *mut i64 = ptr;
-    var p8: *mut i64 = ptr + 8;
-    var p16: *mut i64 = ptr + 16;
-    var p24: *mut i64 = ptr + 24;
-    unsafe {
-        *p0 = 0;
-        *p8 = 0;
-        *p16 = 0;
-        *p24 = 0;
+    var ptr: i64 = p_malloc(48);
+    var i: i64 = 0;
+    while i < 6 {
+        var pw: *mut i64 = ptr + i * 8;
+        unsafe { *pw = 0; }
+        i = i + 1;
     }
     return ptr;
+}
+
+// Integer keys are stored as key ^ HM_INT_XOR, so that 0 (empty) and -1
+// (removed) stay free; the two keys that would map to them panic.
+const HM_INT_XOR: i64 = 0x5DEECE66D1234567;
+
+fn hm_is_int(m: i64) -> bool {
+    var fp: *mut i64 = m + 40;
+    var f: i64 = 0;
+    unsafe { f = *fp; }
+    return f != 0;
+}
+
+@wrapping fn hm_int_hash(k: i64) -> i64 {
+    var x: i64 = k;
+    x = (x ^ (x >> 31)) * 0x7FB5D329728EA185;
+    x = (x ^ (x >> 27)) * 0x1B03738712FAD5C9;
+    x = x ^ (x >> 33);
+    return x & 0x3FFFFFFFFFFFFFFF;
+}
+
+fn hm_hash(m: i64, key: i64) -> i64 {
+    if hm_is_int(m) { return hm_int_hash(key); }
+    return p_str_hash(key);
+}
+
+fn hm_eq(m: i64, a: i64, b: i64) -> bool {
+    if hm_is_int(m) { return a == b; }
+    return p_str_equal(a, b);
+}
+
+/// The stored form of an integer key; marks the map as integer-keyed.
+fn hm_store_i(m: i64, k: i64) -> i64 {
+    var fp: *mut i64 = m + 40;
+    unsafe { *fp = 1; }
+    var sk: i64 = k ^ HM_INT_XOR;
+    if sk == 0 || sk == -1 { panic("HashMap: this integer key is reserved by the map's layout"); }
+    return sk;
+}
+
+pub fn HashMap_insert_i(m: i64, key: i64, value: i64) {
+    HashMap_insert(m, hm_store_i(m, key), value);
+}
+
+pub fn HashMap_get_i(m: i64, key: i64) -> i64 {
+    return HashMap_get(m, hm_store_i(m, key));
+}
+
+pub fn HashMap_contains_i(m: i64, key: i64) -> bool {
+    return HashMap_contains(m, hm_store_i(m, key));
+}
+
+pub fn HashMap_remove_i(m: i64, key: i64) {
+    HashMap_remove(m, hm_store_i(m, key));
+}
+
+pub fn HashMap_get_or_i(m: i64, key: i64, default: i64) -> i64 {
+    return HashMap_get_or(m, hm_store_i(m, key), default);
+}
+
+pub fn HashMap_keys_i(m: i64) -> i64 {
+    return HashMap_keys(m);
+}
+
+pub fn HashMap_values_i(m: i64) -> i64 {
+    return HashMap_values(m);
+}
+
+/// Copy-on-write (proposal 0001): a second HashMap over the same arrays.
+/// The `shared` word of each owner then holds a reference-count box
+/// (0 still means "sole owner"): the first change to a shared map copies
+/// the arrays (map_own), and they are freed when the last owner is dropped.
+pub fn HashMap_share(m: i64) -> i64 {
+    if m == 0 { return m; }
+    var nm: i64 = p_malloc(48);
+    var i: i64 = 0;
+    while i < 6 {
+        var src: *mut i64 = m + i * 8;
+        var dst: *mut i64 = nm + i * 8;
+        unsafe { *dst = *src; }
+        i = i + 1;
+    }
+    var sp: *mut i64 = m + 32;
+    var nsp: *mut i64 = nm + 32;
+    var shared: i64 = 0;
+    unsafe { shared = *sp; }
+    if shared == 0 {
+        var bx: i64 = p_malloc(8);
+        var b0: *mut i64 = bx;
+        unsafe { *b0 = 2; *sp = bx; *nsp = bx; }
+    } else {
+        var b0: *mut i64 = shared;
+        var n: i64 = 0;
+        unsafe { n = *b0; *b0 = n + 1; *nsp = shared; }
+    }
+    return nm;
+}
+
+/// Before a change: arrays of its own for a shared map. The last owner
+/// keeps them; any other owner gets a copy.
+pub fn map_own(m: i64) {
+    var sp: *mut i64 = m + 32;
+    var shared: i64 = 0;
+    unsafe { shared = *sp; }
+    if shared == 0 { return; }
+    var b0: *mut i64 = shared;
+    var owners: i64 = 0;
+    unsafe { owners = *b0; }
+    if owners <= 1 {
+        p_free(shared);
+        unsafe { *sp = 0; }
+        return;
+    }
+    unsafe { *b0 = owners - 1; }
+    var kp: *mut i64 = m;
+    var vp: *mut i64 = m + 8;
+    var cp: *mut i64 = m + 24;
+    var keys: i64 = 0;
+    var vals: i64 = 0;
+    var cap: i64 = 0;
+    unsafe { keys = *kp; vals = *vp; cap = *cp; }
+    if cap > 0 && keys != 0 {
+        var nk: i64 = p_malloc(cap * 8);
+        var nv: i64 = p_malloc(cap * 8);
+        var i: i64 = 0;
+        while i < cap {
+            var ks: *mut i64 = keys + i * 8;
+            var kd: *mut i64 = nk + i * 8;
+            var vs: *mut i64 = vals + i * 8;
+            var vd: *mut i64 = nv + i * 8;
+            unsafe { *kd = *ks; *vd = *vs; }
+            i = i + 1;
+        }
+        unsafe { *kp = nk; *vp = nv; }
+    }
+    unsafe { *sp = 0; }
 }
 
 // Find the slot index for a key. Returns the index of the key if found,
@@ -1110,7 +1520,7 @@ fn HashMap_find_slot(m: i64, key: i64) -> i64 {
     unsafe {
         keys = *keys_ptr_ptr;
     }
-    var hash_val: i64 = p_str_hash(key);
+    var hash_val: i64 = hm_hash(m, key);
     var idx: i64 = hash_val % capacity;
     var first_tombstone: i64 = -1;
     var i: i64 = 0;
@@ -1127,7 +1537,7 @@ fn HashMap_find_slot(m: i64, key: i64) -> i64 {
         }
         if slot_key == -1 {
             if first_tombstone < 0 { first_tombstone = idx; }
-        } else if p_str_equal(slot_key, key) {
+        } else if hm_eq(m, slot_key, key) {
             return idx;
         }
         idx = idx + 1;
@@ -1191,7 +1601,7 @@ fn HashMap_find_slot(m: i64, key: i64) -> i64 {
                 old_val = *old_vptr;
             }
             // Insert into new arrays
-            var hash_val: i64 = p_str_hash(old_key);
+            var hash_val: i64 = hm_hash(m, old_key);
             var new_idx: i64 = hash_val % new_capacity;
             var probe: i64 = 0;
             while probe < new_capacity {
@@ -1233,6 +1643,7 @@ fn HashMap_find_slot(m: i64, key: i64) -> i64 {
 }
 
 pub fn HashMap_insert(m: i64, key: i64, value: i64) {
+    map_own(m);
     var len_ptr: *mut i64 = m + 16;
     var cap_ptr: *mut i64 = m + 24;
 
@@ -1351,6 +1762,7 @@ pub fn HashMap_contains(m: i64, key: i64) -> bool {
 }
 
 pub fn HashMap_remove(m: i64, key: i64) {
+    map_own(m);
     var cap_ptr: *mut i64 = m + 24;
     var len_ptr: *mut i64 = m + 16;
     var capacity: i64 = 0;
@@ -1405,6 +1817,7 @@ pub fn HashMap_is_empty(m: i64) -> bool {
 }
 
 pub fn HashMap_clear(m: i64) {
+    map_own(m);
     var len_ptr: *mut i64 = m + 16;
     unsafe {
         *len_ptr = 0;
@@ -1450,7 +1863,7 @@ pub fn HashMap_keys(m: i64) -> i64 {
             slot_key = *kptr;
         }
         if slot_key != 0 && slot_key != -1 {
-            Vec_push(result, slot_key);
+            if hm_is_int(m) { Vec_push(result, slot_key ^ HM_INT_XOR); } else { Vec_push(result, slot_key); }
         }
         i = i + 1;
     }
@@ -1468,7 +1881,8 @@ pub fn HashMap_values(m: i64) -> i64 {
     var i: i64 = 0;
     while i < len {
         var k: i64 = Vec_get(keys, i);
-        var v: i64 = HashMap_get(m, k);
+        var v: i64 = 0;
+        if hm_is_int(m) { v = HashMap_get(m, k ^ HM_INT_XOR); } else { v = HashMap_get(m, k); }
         Vec_push(result, v);
         i = i + 1;
     }
@@ -1477,6 +1891,10 @@ pub fn HashMap_values(m: i64) -> i64 {
 
 pub fn HashMap_clone(m: i64) -> i64 {
     var result: i64 = HashMap_new();
+    if hm_is_int(m) {
+        var rf: *mut i64 = result + 40;
+        unsafe { *rf = 1; }
+    }
     var cap_ptr: *mut i64 = m + 24;
     var keys_ptr_ptr: *mut i64 = m;
     var vals_ptr_ptr: *mut i64 = m + 8;
@@ -1554,8 +1972,10 @@ pub fn HashMap_to_str(m: i64) -> str {
     var keys: i64 = HashMap_keys(m);
     var len: i64 = Vec_len(keys);
 
-    // Sort keys lexicographically (simple bubble sort)
+    // Sort keys lexicographically (simple bubble sort); integer keys are
+    // already in numeric order (HashMap_keys sorts them)
     var i: i64 = 0;
+    if hm_is_int(m) { i = len; }
     while i < len {
         var j: i64 = 0;
         while j + 1 < len - i {
@@ -1577,6 +1997,11 @@ pub fn HashMap_to_str(m: i64) -> str {
             result = result + ", ";
         }
         var key: i64 = Vec_get(keys, i);
+        if hm_is_int(m) {
+            result = result + p_to_str(key) + ": " + p_to_str(HashMap_get(m, key ^ HM_INT_XOR));
+            i = i + 1;
+            continue;
+        }
         var value: i64 = HashMap_get(m, key);
         // Read key string from memory
         var key_str: *mut u8 = p_str_from_ptr(key);
@@ -1639,9 +2064,22 @@ fn p_str_from_ptr(s: i64) -> *mut u8 {
     return result_ptr;
 }
 
-// strlen: count bytes until null terminator. s is an i64 address.
+// Length-headered strings (RT2): p_str_alloc returns data at alloc+16 with
+// [magic:i64 at -16][len:i64 at -8] before it, so str_len is O(1) and bytes
+// may contain NUL. Non-headered strings (literals, C-returned pointers)
+// still work — the magic check misses and we scan.
+const P_STR_MAGIC: i64 = 0x4649444553545201;
+
+// strlen: header len when the magic matches, else count to NUL.
 fn p_str_length(s: i64) -> i64 {
     if s == 0 { return 0; }
+    var mp: *mut i64 = s - 16;
+    var lp: *mut i64 = s - 8;
+    unsafe {
+        if *mp == P_STR_MAGIC && p_str_len_word(*lp) {
+            return *lp;
+        }
+    }
     var addr: i64 = s;
     var ptr: *mut u8 = addr;
     var count: i64 = 0;
@@ -1655,6 +2093,40 @@ fn p_str_length(s: i64) -> i64 {
         }
     }
     return count;
+}
+
+// Allocate a headered string of `len` bytes: returns the data pointer
+// (alloc+16) with magic+len written. Caller fills bytes + NUL.
+pub fn p_str_alloc(len: i64) -> i64 {
+    var a: i64 = p_malloc(len + 17);
+    if a == 0 { return 0; }
+    var mp: *mut i64 = a;
+    var lp: *mut i64 = a + 8;
+    unsafe { *mp = P_STR_MAGIC; *lp = len; }
+    return a + 16;
+}
+
+// Free a possibly-headered string.
+pub fn p_str_free(s: i64) {
+    if s == 0 { return; }
+    var mp: *mut i64 = s - 16;
+    var lp: *mut i64 = s - 8;
+    unsafe {
+        if *mp == P_STR_MAGIC && p_str_len_word(*lp) {
+            p_free(s - 16);
+            return;
+        }
+    }
+    p_free(s);
+}
+
+// The word before a headered string's bytes is its length. Before a plain
+// allocated string it is the allocator's block header (P_BLOCK_MAGIC | class,
+// negative as an i64), so a block that merely ends with the magic value (an
+// i64 field holding P_STR_MAGIC, as the compiler's own IR of this file does)
+// is not taken for a header: freeing s - 16 then hit "Invalid free".
+fn p_str_len_word(w: i64) -> bool {
+    return w >= 0 && w < 0x10000000000;
 }
 
 // str_copy_n: copy n bytes from src to dst. Both are i64 addresses.
@@ -1930,7 +2402,7 @@ pub fn String_slice_len(s: i64, len: i64, start: i64, end: i64) -> i64 {
         return result;
     }
     var new_len: i64 = en - st;
-    var result: i64 = p_malloc(new_len + 1);
+    var result: i64 = p_str_alloc(new_len);
     p_str_copy_n(result, s + st, new_len);
     var end_addr: i64 = result + new_len;
     var end_ptr: *mut u8 = end_addr;
@@ -2605,6 +3077,13 @@ pub fn str_split_char(s: str, delim: i64) -> Vec<str> {
 /// Replace all occurrences of `from` with `to` in a string.
 pub fn str_replace(s: str, from: str, to: str) -> str {
     return String_replace(s, from, to);
+}
+
+/// An owned copy of a string: how a borrowed `&str` is kept past its owner
+/// (release M11). Always a new allocation.
+pub fn str_clone(s: str) -> str {
+    val n: i64 = str_len(s);
+    return String_slice_len(s, n, 0, n);
 }
 
 /// Repeat a string n times.

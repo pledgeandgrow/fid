@@ -6,21 +6,52 @@
 #   RELEASE=1 ./scripts/bootstrap.sh              also install the verified
 #                                                 stage-3 compiler as
 #                                                 release/fid(.exe)
+#   NATIVE=1 ./scripts/bootstrap.sh               stages through `fid emit`
+#                                                 (Windows x64): no C compiler
+#   PIN=1 ./scripts/bootstrap.sh                  after a fixpoint, pin the last
+#                                                 stage as the next stage 0
 #
-# Stage 0 is the Rust bootstrap compiler (target/release/fidesc). Each stage N
-# runs the previous compiler's `dump-c compiler/main.fd`, wraps `main` in a
-# thread with a 256MB stack (the compiler recurses deeply), and compiles the C.
-# The fixpoint holds when stage 2 and stage 3 emit identical C (compared with
-# line endings normalized — stdout text mode differs between builds on Windows).
+# Stage 0 is a pinned self-hosted compiler, release/stage0/fid(.exe), checked
+# against the hash in scripts/stage0.sha256 (ST1: the Rust compiler is frozen
+# and only kept as the test harness). Without a pinned stage 0 the build
+# starts cold from the Rust compiler (target/release/fidesc); STAGE0=<exe>
+# overrides both. The compiler's own source must stay compilable by the
+# pinned stage 0: a language change lands in two steps, the compiler first,
+# its own source after the next pin.
+#
+# C mode (default): each stage N runs the previous compiler's
+# `dump-c compiler/main.fd`, wraps `main` in a thread with a 256MB stack (the
+# compiler recurses deeply), and compiles the C. The fixpoint holds when stage
+# 2 and stage 3 emit identical C (compared with line endings normalized —
+# stdout text mode differs between builds on Windows).
+# Native mode: each stage runs `emit compiler/main.fd`; the fixpoint holds when
+# the stage 2 and stage 3 executables are byte-identical.
 #
 # C compiler: $CC if set, else the first of tcc, gcc, clang, `zig cc`.
-# The generated C is one ~30MB translation unit; build it at -O0 (optimizing
+# The generated C is one ~50MB translation unit; build it at -O0 (optimizing
 # it needs >16GB of RAM with clang).
 set -u
 cd "$(dirname "$0")/.." || exit 1
 OUT="${1:-build/bootstrap}"
 STAGES="${2:-3}"
-STAGE0="${STAGE0:-./target/release/fidesc}"
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) X=".exe" ;; *) X="" ;; esac
+PINNED="release/stage0/fid$X"
+if [ -z "${STAGE0:-}" ]; then
+  if [ -x "$PINNED" ]; then
+    STAGE0="$PINNED"
+    if [ -f scripts/stage0.sha256 ] && command -v sha256sum >/dev/null; then
+      want=$(cut -d' ' -f1 scripts/stage0.sha256)
+      have=$(sha256sum "$PINNED" | cut -d' ' -f1)
+      if [ "$want" != "$have" ]; then
+        echo "warning: $PINNED does not match scripts/stage0.sha256 (pin it again with PIN=1)"
+      fi
+    fi
+  else
+    STAGE0=./target/release/fidesc
+    echo "note: no pinned stage 0 ($PINNED); cold start from the frozen Rust compiler"
+  fi
+fi
+echo "stage 0: $STAGE0"
 mkdir -p "$OUT"
 
 if [ -n "${CC:-}" ]; then
@@ -75,6 +106,24 @@ EOF
 }
 
 prev="$STAGE0"
+if [ -n "${NATIVE:-}" ]; then
+  for n in $(seq 1 "$STAGES"); do
+    start=$(date +%s)
+    if ! "$prev" emit compiler/main.fd -o "$OUT/fid-n$n$EXE" > "$OUT/n$n.log" 2>&1; then
+      echo "[stage $n] emit failed:"; grep -iE "error" "$OUT/n$n.log" | head -20; exit 1
+    fi
+    echo "[stage $n] emit ok in $(( $(date +%s) - start ))s ($(wc -c < "$OUT/fid-n$n$EXE") bytes)"
+    prev="$OUT/fid-n$n$EXE"
+  done
+  if [ "$STAGES" -ge 3 ]; then
+    if cmp -s "$OUT/fid-n2$EXE" "$OUT/fid-n3$EXE"; then
+      echo "FIXPOINT OK: stage 2 and stage 3 executables are byte-identical"
+    else
+      echo "FIXPOINT FAILED: stage 2 and stage 3 executables differ"; exit 1
+    fi
+  fi
+  LAST="$OUT/fid-n$STAGES$EXE"
+else
 for n in $(seq 1 "$STAGES"); do
   start=$(date +%s)
   if ! "$prev" dump-c compiler/main.fd > "$OUT/c$n.c" 2> "$OUT/c$n.log"; then
@@ -99,6 +148,19 @@ if [ "$STAGES" -ge 3 ]; then
     exit 1
   fi
 fi
+LAST="$OUT/fides-c$STAGES$EXE"
+fi
+
+# PIN=1: the last stage (it reached the fixpoint) becomes the next stage 0.
+# The binary stays out of git (release/ is ignored); its hash and the commit
+# it was built from are recorded in scripts/stage0.sha256.
+if [ -n "${PIN:-}" ]; then
+  if [ "$STAGES" -lt 3 ]; then echo "PIN needs 3 stages (a checked fixpoint)"; exit 1; fi
+  mkdir -p release/stage0
+  cp "$LAST" "$PINNED"
+  echo "$(sha256sum "$PINNED" | cut -d' ' -f1)  fid$X  built from $(git rev-parse --short HEAD 2>/dev/null)$(git diff --quiet 2>/dev/null || echo '+changes') on $(date +%F)" > scripts/stage0.sha256
+  echo "PINNED: $PINNED ($(cut -c1-16 scripts/stage0.sha256)...)"
+fi
 
 # RELEASE=1: the stage-3 compiler (it compiled itself to the fixpoint) is
 # the release binary. Check it runs and builds a program outside the
@@ -106,7 +168,7 @@ fi
 if [ -n "${RELEASE:-}" ]; then
   if [ "$STAGES" -lt 3 ]; then echo "RELEASE needs 3 stages"; exit 1; fi
   mkdir -p release
-  cp "$OUT/fides-c3$EXE" "release/fid$EXE"
+  cp "$LAST" "release/fid$EXE"
   # The installed layout: fides(.exe) with stdlib/ beside it, started by
   # name from PATH, in a directory with no stdlib/
   smoke="$(pwd)/$OUT/smoke"

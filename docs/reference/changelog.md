@@ -1,6 +1,100 @@
 # Fides Language Changelog
 
+## Release roadmap batches in `fid` (Nov 4–6, 2026)
+
+All in the self-hosted compiler (`fidesc` is frozen). Fixpoint verified
+Nov 6 (49 MB of C); checked on the new and key tests on all three backends;
+the full suite was not rerun.
+
+- **Memory (C5–C8):** a local `Vec<str>`/`Vec<Vec<T>>` that owns fresh
+  elements frees them; `HashMap` locals are freed; collections declared in a
+  `region` are freed at its end; `.fidcache` evicts past 64 files or 1 GB
+  (test_mem_owned_drop).
+- **Speed and tooling (D5–D9):** compiler/iropt.fd (inlining of small
+  functions, constant folding, dead code) runs on the native path; core.fd
+  is checked once per compiler and core version; bench/check.sh; pinned
+  stage 0 (`PIN=1`).
+- **Soundness (K4–K11):** iterator invalidation and field-borrow checks,
+  trait impl bodies borrow-checked, `&v[i]` borrows `v`, the native backend
+  keeps alloca slots, the effect table covers file/socket/process/clock
+  calls, `@cfg` filters items in `fid`, and docs/reference/reference.md is
+  the language reference.
+- **Concurrency (H3, H4, H7–H9):** every spawned argument must be `@send`
+  (a struct of `@send` fields is); `parallel {}` branches run on threads;
+  `async fn` with f64 and struct arguments runs as a task (interpreter, C);
+  per-thread free lists in the native allocator. An f64 *result* came back
+  truncated (an async function was lowered as returning a word); fixed Nov 6
+  (`lw_body_ret_type`: the body returns the T of `Future<T>`).
+- **Not working, found Nov 6:** a literal of a user-defined generic struct
+  (`Pair { first: 1, second: "one" }`) is rejected ("field 'first' expected
+  A"); generic enums and `impl<T>` work.
+- **Safety evidence (L1–L4):** @no-alloc sees methods and string `+`,
+  @no-indirect sees calls through function parameters, @firmware sees
+  runtime calls, @gas counts literal loop trips, @tainted works on
+  parameters; ten new negative tests; `fid qualify`; docs/reference/
+  safety-rules.md traces 17 rules to their tests.
+- **Strings (M11):** `&str` borrowed, `str` owned, `@scoped` structs,
+  `str_clone`; `http_serve_scoped` takes a `ScopedRequest` handler and is no
+  longer `@unsafe`.
+- **Tools (M7–M9, written, not run):** `fid emit --checked-alloc`,
+  scripts/sanitize.sh (`FIDES_CFLAGS`), scripts/fuzz/nightly.sh.
+- **Fixed:** integer keys in `HashMap` (they were read as string pointers);
+  per-call-site effects of higher-order functions (a function taking a
+  function value no longer gets every effect); native `emit` freed the wrong
+  address when a plain string followed a block ending in the string magic;
+  the C runtime freed `p_malloc` strings with `free()` (`p_print_float`,
+  `p_to_str_vec`, `p_to_str_map`).
+- **Copy-on-write (M5), off:** lowering for `Vec`, `HashMap` and the `Vec`
+  fields of copied structs is written behind `LOWER_COW`. Shares are lazy
+  (`Vec_share_deep` records the element kind; `vec_own` copies elements at
+  the first write, and the compiler calls it before a write into an
+  element), counted (owner box, freed at the last drop), skipped for copies
+  never written, and a function that changes a by-value `Vec` parameter takes
+  its own share on entry. On, test programs get value semantics on every
+  backend, and the compiler compiling itself reaches its fixpoint with it on
+  (the first version ran out of memory after 7.7 h): peak 4.7 GB against
+  1.8 GB off. Found with the leak report (`P_LEAKS`): a struct store shared
+  its `Vec` fields twice and for fresh values; read-only copies are now
+  judged on the rest of their block; a variable's last use is moved, not
+  shared. A share no longer counts as owning its elements in the freeing
+  pass (a double free in the borrow checker). Still off until the full suite
+  runs with it on.
+
 ## Session 41 — Scheduler, Compile Speed, ELF Targets (Nov 3, 2026)
+
+- **Work stealing (RT10):** workers keep a local run queue — spawned and
+  resumed tasks stay on the running worker (via `pert_tls_wid`); dry
+  workers pop the global queue then steal a sibling's head. Deadlock
+  detector requires two consecutive dead-looking cycles so steal handoffs
+  don't false-positive. 8/8 task tests, 100k-sleeper bench pass.
+- **Fixed:** `q8` used as a variable name in `stdlib/core.fd` — `q8` is a
+  keyword (quantized `i8` alias); every `emit` failed to parse. Renamed
+  to `nv0/nv8/nv16`.
+
+- **Track CO batch (CO3, CO4, CO6, CO8):** `metrics_serve(m, port)` serves the
+  Prometheus text at `/metrics` in one call; `log` gains per-module levels
+  (`log_set_module_level`, `logmf`/`logm`) and public `log_render_json` /
+  `log_render_text` for spec-checking; `http_serve` serves `/health`, stops on
+  SIGTERM/SIGINT or `http_stop()`, and drains live connections via an atomic
+  counter before closing; new `stdlib/config.fd` loads declared keys from INI
+  file, environment and `--flags` (precedence flag > env > file > default)
+  with errors naming the key. Tests: `test_metrics_serve.fd`,
+  `test_http_health.fd`, `test_log_module.fd`, `test_config.fd`,
+  `test_config_missing_fail.fd`.
+- **`@sensitive` (CO7):** a second information-flow label in the secrecy pass
+  (both `src/secrecy.rs` and `compiler/secrecy.fd`). `@sensitive` data cannot
+  reach output sinks; `stdlib/privacy.fd` gains the consent API —
+  `consent_grant`/`consent_revoke`/`consent_given` over a registry, and
+  `privacy::release`, a `@declassify`d function that verifies consent at
+  runtime (panics without it). Tests: `test_sensitive.fd`,
+  `test_sensitive_fail.fd`.
+
+- **`str` length headers (RT2 stage 1):** freshly allocated strings carry
+  `[magic:i64][len:i64]` at `s-16`/`s-8`; `p_str_length` is O(1) on them and
+  falls back to a NUL scan otherwise, so literals and C-returned strings
+  keep working. `Str_drop` frees the header base only when the magic
+  matches. `p_str_concat`/`String_slice_len` header their results on the
+  `.fd` runtime.
 
 - **PE scheduler:** sleeping tasks live in an indexed deadline min-heap;
   fd/join/pool waiters in a separate intrusive FIFO registry; a task state

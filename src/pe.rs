@@ -4574,10 +4574,32 @@ impl PeCodeGen {
                             self.enc.cmp_rr(Reg::Rcx, Reg::R8);
                             self.enc.jcc_label(0x3, self.arith_panics[PANIC_VEC_INDEX]); // jae
                         }
+                        // Shared data (negative capacity): core's Vec_set copies it first
+                        let own = self.func_labels.get("Vec_set").copied().map(|set| {
+                            let own = self.enc.alloc_label();
+                            let done = self.enc.alloc_label();
+                            self.enc.mov_reg_mem_disp(Reg::R8, Reg::Rax, 16);
+                            self.enc.xor_self(Reg::R9);
+                            self.enc.cmp_rr(Reg::R8, Reg::R9);
+                            self.enc.jcc_label(0xC, own); // jl
+                            (set, own, done)
+                        });
                         self.enc.mov_reg_ptr(Reg::Rax, Reg::Rax);
                         self.enc.shl_r_i8(Reg::Rcx, 3);
                         self.enc.add_rr(Reg::Rax, Reg::Rcx);
                         self.enc.mov_ptr_reg(Reg::Rax, Reg::Rdx);
+                        if let Some((set, own, done)) = own {
+                            self.enc.jmp_label(done);
+                            self.enc.place_label(own);
+                            self.enc.mov_rr(Reg::R9, Reg::Rdx);
+                            self.enc.mov_rr(Reg::R8, Reg::Rcx);
+                            self.enc.mov_rr(Reg::Rdx, Reg::Rax);
+                            self.enc.xor_self(Reg::Rcx);
+                            self.enc.sub_rsp_i32(32);
+                            self.enc.call_label(set);
+                            self.enc.add_rsp_i32(32);
+                            self.enc.place_label(done);
+                        }
                         return;
                     }
                     // Vec_push with room in the buffer; growing stays a call
@@ -4590,7 +4612,8 @@ impl PeCodeGen {
                             self.enc.mov_reg_mem_disp(Reg::Rdx, Reg::Rax, 8);
                             self.enc.mov_reg_mem_disp(Reg::R8, Reg::Rax, 16);
                             self.enc.cmp_rr(Reg::Rdx, Reg::R8);
-                            self.enc.jcc_label(0x3, grow); // jae
+                            // signed: a shared Vec's capacity is negative and takes the call
+                            self.enc.jcc_label(0xD, grow); // jge
                             self.enc.mov_reg_ptr(Reg::R8, Reg::Rax);
                             self.enc.mov_rr(Reg::R9, Reg::Rdx);
                             self.enc.shl_r_i8(Reg::R9, 3);

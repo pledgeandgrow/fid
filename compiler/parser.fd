@@ -209,6 +209,28 @@ Paren,
 var g_import_names: Vec<str> = Vec::new();
 var g_qualified_calls: Vec<str> = Vec::new();
 
+// The type arguments of each turbofish call `name::<T, U>(args)` (proposal
+// 0002), as Type::Generic("", [T, U]). The call is parsed as a call of
+// `name::<#k>`, k its index here; the turbofish pass (mono.fd) instantiates
+// `name` with them before type checking.
+var g_turbofish_types: Vec<Type> = Vec::new();
+
+/// Every turbofish call's type arguments, by number.
+pub fn turbofish_all() -> Vec<Type> {
+    return g_turbofish_types;
+}
+
+/// The type arguments of the turbofish call numbered `k`.
+pub fn turbofish_types(k: i64) -> Vec<Type> {
+    var out: Vec<Type> = Vec::new();
+    if k < 0 || k >= g_turbofish_types.len() { return out; }
+    match g_turbofish_types.get(k) {
+        Type::Generic(_, targs) => { return targs; }
+        _ => {}
+    }
+    return out;
+}
+
 pub fn str_vec_has(v: Vec<str>, s: str) -> bool {
     var i: i64 = 0;
     while i < v.len() {
@@ -701,7 +723,29 @@ fn parse_top_level_item(self: &mut Parser, program: &mut Program, is_pub: bool) 
                 var msd = sd;
                     msd.is_pub = item_is_pub;
                     msd.annotations = annotations;
+                    if annotations.len() > 0 {
+                        p_eprint_str(str_concat(str_concat("ANN n=", int_to_str(annotations.len())), " "));
+                        p_eprint_str(annotations.get(0).name);
+                        p_eprint_str("\n");
+                    }
                     program.structs.push(msd);
+                    var pv: *mut i64 = (program.structs as i64);
+                    var pvd: i64 = 0;
+                    unsafe { pvd = *pv; }
+                    var pvl: i64 = 0;
+                    var pvlp: *mut i64 = (pv as i64) + 8;
+                    unsafe { pvl = *pvlp; }
+                    var lep: *mut i64 = pvd + (pvl - 1) * 8;
+                    var le: i64 = 0;
+                    unsafe { le = *lep; }
+                    var la24p: *mut i64 = le + 24;
+                    var la24: i64 = 0;
+                    unsafe { la24 = *la24p; }
+                    var la24lp: *mut i64 = la24 + 8;
+                    var la24l: i64 = 0;
+                    unsafe { la24l = *la24lp; }
+                    p_eprint_str(str_concat(str_concat("PUSH ", msd.name), str_concat(" a24len=", int_to_str(la24l))));
+                    p_eprint_str("\n");
                     return ParseResultUnit::Ok;
                 }
                 ParseResultStructDef::Err(e) => { return ParseResultUnit::Err(e); }
@@ -1653,9 +1697,10 @@ if self.check(TokenKind::Lt) {
                         ParseResultStr::Err(e) => { return ParseResultFunc::Err(e); }
                     }
                     type_param_bounds.push(StrPair_new(tp, bound));
+                    // T: A + B — every bound is kept and checked (0002)
                     while self.match_tok(TokenKind::Plus) {
                         match self.expect_ident() {
-                            ParseResultStr::Ok(_) => {}
+                            ParseResultStr::Ok(more) => { type_param_bounds.push(StrPair_new(tp, more)); }
                             ParseResultStr::Err(e) => { return ParseResultFunc::Err(e); }
                         }
                     }
@@ -4829,6 +4874,33 @@ if token_kind_eq(k, TokenKind::Ident("")) {
     }
     if self.check(TokenKind::DoubleColon) {
         self.advance();
+        if self.check(TokenKind::Lt) {
+            // Turbofish: name::<T, U>(args)
+            self.advance();
+            var targs: Vec<Type> = Vec::new();
+            loop {
+                match self.parse_type() {
+                    ParseResultType::Ok(t) => { targs.push(t); }
+                    ParseResultType::Err(e) => { return ParseResultExpr::Err(e); }
+                }
+                if !self.match_tok(TokenKind::Comma) { break; }
+            }
+            match self.expect(TokenKind::Gt, ">") {
+                ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+                ParseResultUnit::Ok => {}
+            }
+            match self.expect(TokenKind::LParen, "(") {
+                ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+                ParseResultUnit::Ok => {}
+            }
+            var targ_call_args: Vec<Expr> = Vec::new();
+            match self.parse_expr_list() {
+                ParseResultExprs::Ok(a) => { targ_call_args = a; }
+                ParseResultExprs::Err(e) => { return ParseResultExpr::Err(e); }
+            }
+            g_turbofish_types.push(Type::Generic("", targs));
+            return ParseResultExpr::Ok(Expr::Call(name + "::<#" + int_to_str(g_turbofish_types.len() - 1) + ">", targ_call_args));
+        }
         var variant_or_method: str = "";
         match self.expect_ident() {
             ParseResultStr::Ok(s) => { variant_or_method = s; }
@@ -5354,7 +5426,7 @@ if self.match_tok(TokenKind::LParen) {
         ParseResultUnit::Ok => {}
     }
 }
-if name == "secret" { g_saw_secret = true; }
+if name == "secret" || name == "sensitive" { g_saw_secret = true; }
 var __ret_Annotation: Annotation = Annotation_new(name, args);
 return ParseResultAnnotation::Ok(__ret_Annotation);
 }

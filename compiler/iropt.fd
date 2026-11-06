@@ -1,0 +1,434 @@
+// compiler/iropt.fd — IR optimizations run before native code generation
+// (release D5, D6).
+//
+// The native Windows backend (compiler/pe_ir*.fd) turns IR straight into
+// machine code, with no optimizer in between; these passes give it one:
+//   - inlining of small functions: a call to a function of one block made of
+//     plain instructions (no calls, no prints, no regions) is replaced by a
+//     copy of that block; the call becomes a move of the copied result
+//   - constant folding of integer arithmetic and comparisons whose operands
+//     are both constants, when the result cannot overflow
+//   - removal of constants and other pure values nothing reads
+// Every pass leaves the program's meaning as it was; when in doubt it does
+// nothing.
+
+module compiler::iropt;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::checks;
+
+/// Largest callee (instructions, its return included) that is inlined.
+const IRO_INLINE_MAX: i64 = 16;
+
+/// Run every pass on `module`.
+pub fn iropt_native(module: &mut IrModule) {
+    iro_inline(module);
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var entry: IrFunctionEntry = module.functions.get(i);
+        var f: IrFunction = entry.func;
+        var changed: bool = iro_fold(&mut f);
+        if iro_dce(&mut f) { changed = true; }
+        if changed {
+            entry.func = f;
+            module.functions.set(i, entry);
+        }
+        i = i + 1;
+    }
+}
+
+// --- Helpers ----------------------------------------------------------------
+
+/// A new instruction in `f` that is in no block yet.
+fn iro_detached(f: &mut IrFunction, inst: Inst) -> i64 {
+    var id: i64 = IrFunction_emit(f, inst);
+    var last: i64 = f.current_block_idx;
+    var blk: BasicBlock = f.blocks.get(last);
+    blk.instructions.pop();
+    f.blocks.set(last, blk);
+    return id;
+}
+
+fn iro_is_scalar(t: IrType) -> bool {
+    match t {
+        IrType::I8 => { return true; }
+        IrType::I16 => { return true; }
+        IrType::I32 => { return true; }
+        IrType::I64 => { return true; }
+        IrType::U8 => { return true; }
+        IrType::U16 => { return true; }
+        IrType::U32 => { return true; }
+        IrType::U64 => { return true; }
+        IrType::F32 => { return true; }
+        IrType::F64 => { return true; }
+        IrType::Bool => { return true; }
+        IrType::Ptr(_) => { return true; }
+        _ => { return false; }
+    }
+}
+
+// --- Inlining (release D5) --------------------------------------------------
+
+/// Whether `inst` may be copied into a caller as it is.
+fn iro_inlinable_inst(inst: Inst) -> bool {
+    match inst {
+        Inst::ConstInt(_, _) => { return true; }
+        Inst::ConstFloat(_, _) => { return true; }
+        Inst::ConstBool(_) => { return true; }
+        Inst::ConstStr(_) => { return true; }
+        Inst::ConstNull(_) => { return true; }
+        Inst::GlobalAddr(_, _) => { return true; }
+        Inst::BinOp(_, _, _, _) => { return true; }
+        Inst::UnaryOp(_, _, _) => { return true; }
+        Inst::Alloca(_, _) => { return true; }
+        Inst::Load(_, _) => { return true; }
+        Inst::Store(_, _, _) => { return true; }
+        Inst::GetFieldPtr(_, _, _) => { return true; }
+        Inst::BitCast(_, _, _) => { return true; }
+        Inst::IntExtend(_, _, _) => { return true; }
+        Inst::IntTrunc(_, _, _) => { return true; }
+        Inst::IntToFloat(_, _, _) => { return true; }
+        Inst::FloatToInt(_, _, _) => { return true; }
+        _ => { return false; }
+    }
+}
+
+/// The value `id` names in the caller (map: callee id -> caller id + 1).
+fn iro_m(map: Vec<i64>, id: i64) -> i64 {
+    if id >= 0 && id < map.len() && map.get(id) != 0 { return map.get(id) - 1; }
+    return id;
+}
+
+/// `inst` with its operands renamed through `map` (only the instructions
+/// iro_inlinable_inst accepts).
+fn iro_remap(inst: Inst, map: Vec<i64>) -> Inst {
+    match inst {
+        Inst::BinOp(op, a, b, t) => { return Inst::BinOp(op, iro_m(map, a), iro_m(map, b), t); }
+        Inst::UnaryOp(op, a, t) => { return Inst::UnaryOp(op, iro_m(map, a), t); }
+        Inst::Load(p, t) => { return Inst::Load(iro_m(map, p), t); }
+        Inst::Store(p, v, t) => { return Inst::Store(iro_m(map, p), iro_m(map, v), t); }
+        Inst::GetFieldPtr(p, idx, t) => { return Inst::GetFieldPtr(iro_m(map, p), idx, t); }
+        Inst::BitCast(v, a, b) => { return Inst::BitCast(iro_m(map, v), a, b); }
+        Inst::IntExtend(v, a, b) => { return Inst::IntExtend(iro_m(map, v), a, b); }
+        Inst::IntTrunc(v, a, b) => { return Inst::IntTrunc(iro_m(map, v), a, b); }
+        Inst::IntToFloat(v, a, b) => { return Inst::IntToFloat(iro_m(map, v), a, b); }
+        Inst::FloatToInt(v, a, b) => { return Inst::FloatToInt(iro_m(map, v), a, b); }
+        _ => {}
+    }
+    return inst;
+}
+
+/// The instructions of `callee` to copy (its Return excluded) and the value
+/// it returns, when it can be inlined: one block, at most IRO_INLINE_MAX
+/// plain instructions, a scalar result. ret = -1 when it cannot.
+pub struct IroBody {
+    pub insts: Vec<i64>,
+    pub ret: i64,
+}
+
+fn iro_body(callee: &IrFunction, caller: &IrFunction) -> IroBody {
+    var none: IroBody = IroBody { insts: Vec::new(), ret: -1 };
+    if callee.blocks.len() != 1 { return none; }
+    if callee.name == caller.name || callee.name == "main" { return none; }
+    if callee.is_interrupt || callee.is_wrapping != caller.is_wrapping { return none; }
+    if callee.zeroize_locals.len() > 0 || callee.drop_locals.len() > 0 { return none; }
+    if callee.persist_vars.len() > 0 { return none; }
+    if !iro_is_scalar(callee.ret_ty) { return none; }
+    var ids: Vec<i64> = callee.blocks.get(0).instructions;
+    if ids.len() == 0 || ids.len() > IRO_INLINE_MAX { return none; }
+    var body: Vec<i64> = Vec::new();
+    var ret: i64 = -1;
+    var i: i64 = 0;
+    while i < ids.len() {
+        var id: i64 = ids.get(i);
+        match IrFunction_get_inst(callee, id) {
+            OptInst::Some(inst) => {
+                match inst {
+                    Inst::Return(rv) => {
+                        if i + 1 != ids.len() { return none; }
+                        match rv {
+                            OptValueId::Some(r) => { ret = r; }
+                            OptValueId::None => { return none; }
+                        }
+                    }
+                    _ => {
+                        if !iro_inlinable_inst(inst) { return none; }
+                        body.push(id);
+                    }
+                }
+            }
+            OptInst::None => { return none; }
+        }
+        i = i + 1;
+    }
+    if ret < 0 { return none; }
+    return IroBody { insts: body, ret: ret };
+}
+
+/// Inline small functions at their call sites, in every function.
+pub fn iro_inline(module: &mut IrModule) {
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var entry: IrFunctionEntry = module.functions.get(fi);
+        var f: IrFunction = entry.func;
+        if iro_inline_function(module, &mut f) {
+            entry.func = f;
+            module.functions.set(fi, entry);
+        }
+        fi = fi + 1;
+    }
+}
+
+fn iro_inline_function(module: &IrModule, f: &mut IrFunction) -> bool {
+    var changed: bool = false;
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var blk: BasicBlock = f.blocks.get(b);
+        var old: Vec<i64> = blk.instructions;
+        var fresh: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < old.len() {
+            var id: i64 = old.get(k);
+            var done: bool = false;
+            match IrFunction_get_inst(f, id) {
+                OptInst::Some(inst) => {
+                    match inst {
+                        Inst::Call(name, args, cty, _) => {
+                            if iro_is_scalar(cty) {
+                                match IrModule_get_function(module, name) {
+                                    OptIrFunction::Some(callee) => {
+                                        var body: IroBody = iro_body(&callee, f);
+                                        if body.ret >= 0 && callee.params.len() == args.len() {
+                                            // callee value -> caller value + 1
+                                            var map: Vec<i64> = Vec::new();
+                                            var z: i64 = 0;
+                                            while z < callee.next_value {
+                                                map.push(0);
+                                                z = z + 1;
+                                            }
+                                            var p: i64 = 0;
+                                            while p < callee.params.len() {
+                                                var pid: i64 = callee.params.get(p).id;
+                                                if pid >= 0 && pid < map.len() { map.set(pid, args.get(p) + 1); }
+                                                p = p + 1;
+                                            }
+                                            var q: i64 = 0;
+                                            while q < body.insts.len() {
+                                                var cid: i64 = body.insts.get(q);
+                                                match IrFunction_get_inst(&callee, cid) {
+                                                    OptInst::Some(cinst) => {
+                                                        var nid: i64 = iro_detached(f, iro_remap(cinst, map));
+                                                        if cid < map.len() { map.set(cid, nid + 1); }
+                                                        fresh.push(nid);
+                                                    }
+                                                    OptInst::None => {}
+                                                }
+                                                q = q + 1;
+                                            }
+                                            // The call is now a move of the inlined result
+                                            IrFunction_set_inst(f, id, Inst::BitCast(iro_m(map, body.ret), cty, cty));
+                                            fresh.push(id);
+                                            done = true;
+                                            changed = true;
+                                        }
+                                    }
+                                    OptIrFunction::None => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                OptInst::None => {}
+            }
+            if !done { fresh.push(id); }
+            k = k + 1;
+        }
+        blk.instructions = fresh;
+        f.blocks.set(b, blk);
+        b = b + 1;
+    }
+    return changed;
+}
+
+// --- Constant folding (release D6) ------------------------------------------
+
+fn iro_const_int(f: &IrFunction, id: i64) -> OptI64 {
+    match IrFunction_get_inst(f, id) {
+        OptInst::Some(inst) => {
+            match inst {
+                Inst::ConstInt(v, t) => {
+                    match t {
+                        IrType::I64 => { return OptI64::Some(v); }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        OptInst::None => {}
+    }
+    return OptI64::None;
+}
+
+const IRO_I64_MAX: i64 = 9223372036854775807;
+const IRO_SQRT_MAX: i64 = 3037000499;
+
+/// Fold integer BinOps of two i64 constants. Arithmetic is folded only when
+/// it cannot overflow (an overflow must still panic at run time), division
+/// and remainder never (a zero divisor must panic too).
+fn iro_fold(f: &mut IrFunction) -> bool {
+    var changed: bool = false;
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var ids: Vec<i64> = f.blocks.get(b).instructions;
+        var k: i64 = 0;
+        while k < ids.len() {
+            var id: i64 = ids.get(k);
+            match IrFunction_get_inst(f, id) {
+                OptInst::Some(inst) => {
+                    match inst {
+                        Inst::BinOp(op, l, r, t) => {
+                            match iro_const_int(f, l) {
+                                OptI64::Some(a) => {
+                                    match iro_const_int(f, r) {
+                                        OptI64::Some(c) => {
+                                            var folded: OptInst = iro_fold_binop(op, a, c, t);
+                                            match folded {
+                                                OptInst::Some(ni) => { IrFunction_set_inst(f, id, ni); changed = true; }
+                                                OptInst::None => {}
+                                            }
+                                        }
+                                        OptI64::None => {}
+                                    }
+                                }
+                                OptI64::None => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                OptInst::None => {}
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    return changed;
+}
+
+fn iro_fold_binop(op: BinOp, a: i64, c: i64, t: IrType) -> OptInst {
+    var is_i64: bool = false;
+    match t {
+        IrType::I64 => { is_i64 = true; }
+        _ => {}
+    }
+    if binop_eq(op, BinOp::Eq) { return OptInst::Some(Inst::ConstBool(a == c)); }
+    if binop_eq(op, BinOp::Neq) { return OptInst::Some(Inst::ConstBool(a != c)); }
+    if binop_eq(op, BinOp::Lt) { return OptInst::Some(Inst::ConstBool(a < c)); }
+    if binop_eq(op, BinOp::Gt) { return OptInst::Some(Inst::ConstBool(a > c)); }
+    if binop_eq(op, BinOp::LtEq) { return OptInst::Some(Inst::ConstBool(a <= c)); }
+    if binop_eq(op, BinOp::GtEq) { return OptInst::Some(Inst::ConstBool(a >= c)); }
+    if !is_i64 { return OptInst::None; }
+    if binop_eq(op, BinOp::Add) {
+        if (c > 0 && a > IRO_I64_MAX - c) || (c < 0 && a < (0 - IRO_I64_MAX - 1) - c) { return OptInst::None; }
+        return OptInst::Some(Inst::ConstInt(a + c, t));
+    }
+    if binop_eq(op, BinOp::Sub) {
+        if (c < 0 && a > IRO_I64_MAX + c) || (c > 0 && a < (0 - IRO_I64_MAX - 1) + c) { return OptInst::None; }
+        return OptInst::Some(Inst::ConstInt(a - c, t));
+    }
+    if binop_eq(op, BinOp::Mul) {
+        if a > IRO_SQRT_MAX || a < 0 - IRO_SQRT_MAX || c > IRO_SQRT_MAX || c < 0 - IRO_SQRT_MAX { return OptInst::None; }
+        return OptInst::Some(Inst::ConstInt(a * c, t));
+    }
+    if binop_eq(op, BinOp::BitAnd) { return OptInst::Some(Inst::ConstInt(a & c, t)); }
+    if binop_eq(op, BinOp::BitOr) { return OptInst::Some(Inst::ConstInt(a | c, t)); }
+    if binop_eq(op, BinOp::BitXor) { return OptInst::Some(Inst::ConstInt(a ^ c, t)); }
+    return OptInst::None;
+}
+
+// --- Dead values (release D6) -----------------------------------------------
+
+fn iro_pure(inst: Inst) -> bool {
+    match inst {
+        Inst::ConstInt(_, _) => { return true; }
+        Inst::ConstFloat(_, _) => { return true; }
+        Inst::ConstBool(_) => { return true; }
+        Inst::ConstStr(_) => { return true; }
+        Inst::ConstNull(_) => { return true; }
+        Inst::ConstFnRef(_) => { return true; }
+        Inst::GlobalAddr(_, _) => { return true; }
+        Inst::GetFieldPtr(_, _, _) => { return true; }
+        Inst::BitCast(_, _, _) => { return true; }
+        _ => { return false; }
+    }
+}
+
+/// Drop pure values nothing reads (folding leaves their operands unused).
+fn iro_dce(f: &mut IrFunction) -> bool {
+    var any: bool = false;
+    var round: i64 = 0;
+    while round < 3 {
+        var uses: Vec<i64> = Vec::new();
+        var z: i64 = 0;
+        while z < f.next_value {
+            uses.push(0);
+            z = z + 1;
+        }
+        var b: i64 = 0;
+        while b < f.blocks.len() {
+            var ids: Vec<i64> = f.blocks.get(b).instructions;
+            var k: i64 = 0;
+            while k < ids.len() {
+                match IrFunction_get_inst(f, ids.get(k)) {
+                    OptInst::Some(inst) => {
+                        var ops: Vec<i64> = Vec::new();
+                        peir_inst_operands(inst, &mut ops);
+                        var o: i64 = 0;
+                        while o < ops.len() {
+                            var v: i64 = ops.get(o);
+                            if v >= 0 && v < uses.len() { uses.set(v, uses.get(v) + 1); }
+                            o = o + 1;
+                        }
+                    }
+                    OptInst::None => {}
+                }
+                k = k + 1;
+            }
+            b = b + 1;
+        }
+        var removed: bool = false;
+        b = 0;
+        while b < f.blocks.len() {
+            var blk: BasicBlock = f.blocks.get(b);
+            var keep: Vec<i64> = Vec::new();
+            var k: i64 = 0;
+            while k < blk.instructions.len() {
+                var id: i64 = blk.instructions.get(k);
+                var drop: bool = false;
+                if id >= 0 && id < uses.len() && uses.get(id) == 0 {
+                    match IrFunction_get_inst(f, id) {
+                        OptInst::Some(inst) => { drop = iro_pure(inst); }
+                        OptInst::None => {}
+                    }
+                }
+                if drop { removed = true; } else { keep.push(id); }
+                k = k + 1;
+            }
+            if removed {
+                blk.instructions = keep;
+                f.blocks.set(b, blk);
+            }
+            b = b + 1;
+        }
+        if !removed { return any; }
+        any = true;
+        round = round + 1;
+    }
+    return any;
+}

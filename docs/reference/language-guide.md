@@ -4,7 +4,7 @@
 > to executable binary, covering the type system, memory model, effect system,
 > and compilation pipeline.**
 
-*Last updated: Sep 6, 2026 (session 16 — Tier 3 OS features: @cpu_local, inline asm clobbers, --no-std, UEFI bindings)*
+*Last updated: Nov 6, 2026. The language is what `fid` accepts; the rule-by-rule reference is [reference.md](reference.md).*
 
 ## Table of Contents
 
@@ -25,8 +25,10 @@
 
 Fides is a systems programming language designed around three principles:
 **safety by construction, verifiable correctness, and zero external
-dependencies.** It compiles to native code (x86-64, ARM64, RISC-V), C99,
-WebAssembly, and includes a built-in interpreter.
+dependencies.** It compiles to C99 and to native Windows x64 executables,
+and includes a built-in interpreter. ARM64, RISC-V, Linux ELF and
+WebAssembly backends exist but are not finished or not tested on every
+commit (see [platforms](platforms.md)).
 
 ### What Makes Fides Different
 
@@ -35,9 +37,9 @@ WebAssembly, and includes a built-in interpreter.
 | Memory safety | Compile-time (ownership + regions) | Compile-time (ownership + lifetimes) | Manual |
 | Effect tracking | First-class (effects in type system) | None | None |
 | Capability security | Compile-time capability grants | None | None |
-| Dependency model | Self-contained (no libc, no LLVM) | External (crates, LLVM) | External (libc) |
-| Codegen | Direct machine code emission | Via LLVM | Via gcc/clang |
-| Self-hosting | ✅ Achieved (25 modules, 61K LOC, bootstrap fixpoint verified) | Yes | Yes |
+| Dependency model | No LLVM; native Windows output needs no C compiler or linker (`fid emit`); other targets go through a C compiler | External (crates, LLVM) | External (libc) |
+| Codegen | Direct machine code (Windows x64) or C99 | Via LLVM | Via gcc/clang |
+| Self-hosting | ✅ Achieved (61 modules, 133,688 lines, bootstrap fixpoint verified Nov 6) | Yes | Yes |
 
 ### Design Philosophy
 
@@ -45,8 +47,10 @@ WebAssembly, and includes a built-in interpreter.
    memory safety, capability access, and effect annotations at compile time.
    No runtime checks needed for the core guarantees.
 
-2. **If we depend on it, we build it** — No LLVM, no libc, no external
-   linker. Every byte of machine code is emitted by Fides itself.
+2. **If we depend on it, we build it** — No LLVM and no external linker on
+   the native Windows path: every byte of machine code there is emitted by
+   Fides itself (native executables still import kernel32.dll and
+   msvcrt.dll). The C backend is the portable path and needs a C compiler.
 
 3. **Explicit over implicit** — Effects, capabilities, and ownership
    transfers are visible in the source. The compiler infers types and
@@ -124,7 +128,9 @@ etc.).
 
 #### 2.3 Import Resolution & Merging
 
-1. Parse stdlib (`core.fd` embedded in compiler)
+1. Parse stdlib (`core.fd`: embedded in `fidesc`, read at run time by `fid`;
+   `fid` type-checks core's bodies once per (compiler, core.fd) pair and
+   records a stamp in the temp directory, `FIDES_CHECK_CORE=1` forces the check)
 2. Parse user source
 3. Resolve `use` imports from disk (searches `<base>/<path>.fd`,
    `<base>/<path>/mod.fd`, `stdlib/`, project root)
@@ -139,12 +145,15 @@ etc.).
 #### 2.4 Type Checking (`typechecker.rs` / `typechecker.fd`)
 
 - Bidirectional type inference with integer literal narrowing
-- Region inference (lifetimes deduced automatically)
-- Effect checking (function body effects vs. declared effects)
+- Generic inference, bound checks and turbofish arity (`fid`)
+- Effect checking (function body effects vs. declared effects; higher-order
+  effects instantiated per call site)
 - Capability checking (sandbox restrictions, strict mode)
 - Trait impl verification
-- Linear type checking (`@linear` structs)
-- Borrow checking (separate pass, NLL-based)
+- Linear type checking (`@linear` structs), `@send` for spawned calls
+- Safety annotations (17 rules, [safety-rules.md](safety-rules.md))
+- Borrow checking and the reference escape check (separate passes after type
+  checking)
 
 #### 2.5 IR Lowering (`lower.rs` / `lower.fd`)
 
@@ -166,7 +175,10 @@ SSA IR → three-level PIR (Portable IR):
 
 #### 2.7 Optimization (`opt.rs` / `opt.fd`)
 
-23 optimization passes over L2 PIR:
+The PIR optimizer serves the old PIR native path (`build --native`, which
+crashes in `fid`). `fid emit` uses its own small IR optimizer
+(`compiler/iropt.fd`: inlining of small single-block functions, constant
+folding, dead code removal). The PIR optimizer has 23 passes over L2 PIR:
 - **Constant folding** — evaluate constant expressions at compile time
 - **CSE/GVN** — common subexpression elimination / global value numbering
 - **DCE/DSE** — dead code/store elimination
@@ -180,15 +192,14 @@ SSA IR → three-level PIR (Portable IR):
 
 #### 2.8 Code Generation
 
-| Backend | Output | Use Case |
-|---------|--------|----------|
-| x86-64 (ELF64) | Native Linux binary | Default `build` |
-| x86-64 (PE) | Native Windows binary | Cross-compilation |
-| ARM64 (ELF64) | Native ARM binary | Cross-compilation |
-| RISC-V (ELF64) | Native RISC-V binary | Cross-compilation |
-| C codegen | C99 source | Portability, bootstrap |
-| Interpreter | Direct execution | Testing, debugging |
-| WebAssembly | `.wasm` | Web deployment |
+| Backend | Output | Status |
+|---------|--------|--------|
+| Interpreter (`fid run`) | Direct execution | Working |
+| C codegen (`fid ccompile`) | C99 source, linked by zig cc / clang / gcc / cl | Working; Linux x64 goes this way |
+| x86-64 PE (`fid emit`) | Native Windows binary, no C compiler | Working (native async crashes) |
+| x86-64 ELF64 | Native Linux binary | Experimental / incomplete |
+| ARM64, RISC-V (ELF64) | Native binaries | Experimental / incomplete |
+| WebAssembly | `.wasm` | Experimental / incomplete |
 
 ---
 
@@ -243,7 +254,7 @@ Fides uses **bidirectional inference**:
   hints downward, narrowing integer/float literals
 
 ```fides
-val x = 42;          // infers i32 (smallest fitting)
+val x = 42;          // an i64 (an unannotated val/var of literals is i64)
 val y: i64 = 42;     // hint forces i64
 val z = 3.14;        // infers f64
 val w = if cond { 1 } else { 2 };  // infers from both branches
@@ -254,19 +265,26 @@ val w = if cond { 1 } else { 2 };  // infers from both branches
 ```fides
 fn identity<T>(x: T) -> T { x }
 
-fn max<T: Ord>(a: T, b: T) -> T {
-    if a >= b { a } else { b }
+fn twice<T: Show + Clone>(a: T) -> str {
+    return a.show() + a.show();
 }
 
-struct Vec<T> {
-    data: *T,
-    len: i64,
-    cap: i64,
+struct Slot<T> {
+    value: T,
 }
+
+val z = zero::<i64>();      // explicit type arguments
 ```
 
 Generic functions are **monomorphized** — each concrete instantiation gets
-its own compiled version. Type parameters can have trait bounds (`T: Ord`).
+its own compiled version (`compiler/mono.fd`, proposal 0002). `fid` infers
+type arguments from the arguments, and from the expected type when only the
+result mentions a parameter; a type parameter nothing gives is an error.
+Bounds (`T: A + B`) are checked at each call; a turbofish `f::<T>()` must give
+as many types as `f` has parameters (`test_generics_full.fd`,
+`test_generic_infer_fail.fd`, `test_generic_bound_fail.fd`,
+`test_turbofish_arity_fail.fd`). Methods of a generic `impl` are typed per
+receiver. There are no `where` clauses.
 
 ### 3.5 Traits (caps)
 
@@ -275,21 +293,22 @@ capabilities):
 
 ```fides
 cap Display {
-    fn fmt(&self) -> str;
+    fn fmt(self) -> str;
 }
 
 cap Iterator {
     type Item;  // associated type
-    fn next(&mut self) -> Option<Self::Item>;
+    fn next(self) -> Option<Self::Item>;
 }
 
 impl Display for Point {
-    fn fmt(&self) -> str {
-        f"({self.x}, {self.y})"
+    pub fn fmt(self: Point) -> str {
+        return f"({self.x}, {self.y})";
     }
 }
 ```
 
+- Methods take `self` (type `Self`) or `self: T` / `self: &T` / `self: &mut T`; `&self` is not valid syntax
 - Associated types are supported (`type Item;`)
 - Default method bodies are supported
 - Trait objects via `dyn Trait` (dispatch by type name string at runtime)
@@ -324,7 +343,9 @@ a call to it fits wherever a value of any type is expected.
 - `&&` and `||` short-circuit: the right operand is evaluated only when it
   decides the result, so `i < v.len() && v.get(i) == x` never reads past
   the end
-- `str` ↔ `i64` is allowed (pointer representation)
+- `str` ↔ `i64` is allowed only in the runtime layer and the compiler's own
+  modules; in a program it is a type error (`test_str_int_fail.fd`). To test a
+  runtime `str` for null write `(s as i64) == 0`
 - Type parameters are compatible with anything in their scope
 - `dyn Trait` is compatible with any concrete impl
 - Tuples are checked element-wise
@@ -355,15 +376,18 @@ cross-build through `ccompile` does.
 Fides has no garbage collector. What happens today:
 
 1. `p_malloc` hands out power-of-two blocks from per-class free lists; `p_free`
-   returns one (a double free is ignored).
-2. A `Vec` that provably never leaves its local variable is freed by the
-   compiler: the previous one when the variable is written again, the last one
-   at each return. Its elements are not freed.
+   returns one (a double free panics with `Double free`). The C runtime keeps
+   per-thread arenas and free lists, the native runtime per-thread free lists.
+2. The compiler frees what it can prove is finished: a `Vec` or `HashMap` that
+   never leaves its local variable (the previous one when the variable is
+   written again, the last one at each return), the elements of a
+   `Vec<str>`/`Vec<Vec>` that owns them, collections declared in a `region` at
+   its end, and string temporaries (`test_mem_owned_drop.fd`).
 3. `Vec` growth and `HashMap` rehashing give their old buffers back.
-4. A type with a `drop` method has it called at scope exit, for annotated locals.
-5. Everything else stays allocated until the process exits. **Strings and
-   escaping values are not reclaimed yet**, so a long-running program that
-   builds many strings grows. There is no general ownership or RAII.
+4. For a local declared with an explicit struct type whose struct has a `drop`
+   method, that method is called at function exit, last declared first.
+5. Everything else stays allocated until the process exits: it leaks, it does
+   not dangle. There is no general ownership or RAII.
 
 Structs are copied by default; only `@linear` types move. `Vec` and `HashMap`
 values are handles: assigning one aliases it, and nothing tracks that.
@@ -373,19 +397,25 @@ one writer, and references cannot outlive what they point to.
 
 ### 4.2 Move vs Copy
 
-- **Copy types** (`i32`, `bool`, `f64`, etc.) — copied by default, original
-  still valid
-- **Move types** (`String`, `Vec`, structs without `Copy`) — moved by
-  default, original is invalidated
+- Numbers, `bool`, structs, enums, tuples and arrays are copied on assignment
+  and when passed by value.
+- `Vec`, `HashMap` and `str` are handles: assigning one gives a second name for
+  the same data. There is no move check for them.
+- Only `@linear` struct types move (used exactly once, §4.5).
 
 ```fides
 val a = 5;
-val b = a;       // i32 is Copy — a still valid
+val b = a;       // a still valid
 
-val s1 = String::from("hello");
-val s2 = s1;     // String is Move — s1 is moved
-// println(s1);  // ERROR: s1 was moved
+val v: Vec<i64> = Vec::new();
+var w = v;       // same Vec
+w.push(1);       // v.len() is 1
 ```
+
+Copy-on-write for `Vec`, `str` and `HashMap` is decided (proposal 0001) and
+written behind `LOWER_COW`, which is off: with it on, the compiler compiling
+itself reaches its fixpoint but uses 4.7 GB instead of 1.8 GB (Nov 6), and
+the full suite has not run with it on yet.
 
 ### Module Names
 
@@ -421,14 +451,16 @@ program; the modules it imports are trusted, as is the compiler.
 - What the compiler frees for you never dangles: when it cannot prove a value is
   finished with, it leaves it allocated. The worst case is a leak.
 - A thread cannot write a global of your program without holding a lock.
+- Changing a `Vec` while a `for` loop walks it is rejected
+  (`test_iter_invalidation_fail.fd`); so is `s.x = 1` while `s` is borrowed.
 
 **Does not hold yet:**
 
 - `var b = a` on a `Vec`, `str` or `HashMap` gives two names for one value, with no
   move check. One name can change what the other sees.
-- `push` during a `for` over the same `Vec` compiles. It is bounds-checked, so it
-  cannot read outside the `Vec`, but it can skip or repeat elements.
-- Race checks cover globals only: a `Vec` shared between threads is not checked.
+- Race checks cover globals and the arguments of `spawn` (each must be `@send`;
+  references and raw pointers are not). A `Vec` passed to a thread is shared
+  with the caller, and that sharing is not checked.
 - The rules above about `unsafe` apply to your program, not yet to imported modules.
   The standard library has not been audited.
 
@@ -437,8 +469,11 @@ and then read gives stale data, with nothing to detect it. A double free panics
 unless the block has been reused, in which case it frees the new owner's memory. A
 C library can do anything at all. Inside `unsafe`, those are yours to prevent.
 
-`http_serve_scoped` is an `@unsafe` function for this reason: it frees a request's
-strings after the handler returns, on your promise that the handler kept none.
+`http_serve_scoped(port, fn(ScopedRequest) -> str)` frees a request's memory
+after each response and is not `@unsafe`: `ScopedRequest` is a `@scoped`
+struct, so its `str` fields read as borrowed `&str` and the handler cannot keep
+them (store them, return them as `str`, or send them). `str_clone(s)` makes an
+owned copy (`test_borrowed_str.fd`, `test_scoped_store_fail.fd`).
 
 ### Unsafe Code
 
@@ -531,8 +566,10 @@ fn main() -> i64 {
 }
 ```
 
-An `async fn` whose arguments or result are floats, structs or references runs to
-its end at the call: a task cannot hold those across a suspension yet.
+`async fn` with `f64` or struct arguments and results runs as a task through an
+adapter (interpreter and C). One whose parameters or result a task cannot carry
+(references) runs to its end at the call. Native (`fid emit`) programs that use
+async or spawn+await crash (`test_async`, `test_async_float_struct`).
 
 ### Threads and Globals
 
@@ -552,19 +589,25 @@ functions. Shared data reached through pointers is not checked yet.
 Fides supports region-based memory management via `region` blocks:
 
 ```fides
-fn process(data: &str) -> &str {
-    region r {
-        val cached = data.to_string();
-        &cached    // borrow valid within region r
-    }
+fn count(data: str) -> i64 {
+    var n: i64 = 0;
+    region r with budget(1024) {
+        val parts: Vec<str> = str_split(data, ",");
+        n = parts.len();
+    }                            // parts is freed here
+    return n;
 }
 ```
 
-- Allocations inside a region get `Region::Named(name)`
-- Regions are checked at compile time (scope, budget). They do not free memory yet: `p_region_free` is a no-op
-- Region budgets can limit memory usage
-- GPU regions (`region gpu { ... }`) for GPU-scoped allocation
-- KV-cache regions with sliding window eviction
+- A region is a scope: a variable declared in it is not visible after it, and
+  a reference to it cannot leave it.
+- `with budget(N)` adds up the compile-time sizes of the block's declarations
+  and reports an error when they exceed `N` (`test_budget_fail.fd`).
+- Collections declared in a region are freed at its end
+  (`test_mem_owned_drop.fd`).
+- `region gpu r` and `region kv_cache r with budget(N) [window(W)]` have the
+  same budget check; `kv_cache` requires a budget.
+- There is no region use-after-free check beyond the escape rules (§4.6).
 
 ### 4.4 Borrow Checking
 
@@ -572,7 +615,18 @@ The borrow checker is a separate pass after type checking:
 - **NLL (Non-Lexical Lifetimes):** borrows end at last use, not scope end
 - **Field-wise borrows:** `&s.x` and `&s.y` can coexist
 - **Two-phase borrows:** `&mut` and `&` in same call expression
+- Changing a `Vec` while a `for` loop walks it is rejected; `s.x = 1` while
+  `s` is borrowed, `&v[i]`, and trait impl bodies are checked (`fid` only)
 - Modes: `on` (default), `warn`, `off`
+
+**Owned and borrowed strings.** `str` is owned, `&str` borrowed. A `str` field
+of a `@scoped` struct reads as `&str`. A borrowed string can be read, compared,
+printed, joined with `+` (the result is owned) and passed to `&str`
+parameters; it cannot be returned as `str`, stored, or passed to a user
+function's `str` parameter. `str_clone(s)` makes an owned copy. A `@scoped`
+struct cannot be stored (field, global, collection, result) or sent
+(`test_borrowed_str.fd`, `test_borrowed_str_return_fail.fd`,
+`test_borrowed_str_pass_fail.fd`, `test_scoped_store_fail.fd`).
 
 ### 4.5 Linear Types
 
@@ -678,13 +732,12 @@ annotations.
 
 | Effect | Description |
 |--------|-------------|
-| `Alloc` | Allocates memory (heap or stack) |
-| `IO` | Console/file I/O |
-| `Net` | Network I/O |
+| `Alloc` | Allocating runtime calls (`p_vec_new`, `p_map_insert`, string concatenation, …) |
+| `IO` | Console, file, directory, process, clock and environment runtime calls |
+| `Net` | Socket, HTTP, TLS and DNS runtime calls |
 | `Spawn` | Spawns threads or subprocesses |
-| `Diverge` | May not return (infinite loop, panic) |
-| `Read` | Reads from memory |
-| `Write` | Writes to memory |
+| `Diverge` | `p_panic` |
+| `Read`, `Write` | `p_kv_cache_*` calls |
 | `Diff` | Differentiable operation (autodiff) |
 | `Noise` | Adds noise (differential privacy) |
 | `Comm` | Cross-device communication |
@@ -692,28 +745,42 @@ annotations.
 Functions can declare their effects:
 
 ```fides
-fn read_config(path: &str) -> Config !FileIO {
-    val data = read_file(path)?;
-    parse_config(data)
+fn read_config(path: str) -> str !IO {
+    return file_read(path);
+}
+
+fn pure_add(a: i64, b: i64) -> i64 !{} {
+    return a + b;
 }
 ```
 
-The compiler verifies that the function body only performs declared effects.
+For a top-level function with a declaration, an inferred effect that is not
+declared is an error. Effects propagate through calls to a fixpoint. A
+function that takes a function value gets, at each call site, the effects of
+the function passed there (`effects/test_effect_ho_instantiation.fd`), so a
+`!{}` function can call `apply(pure_fn, x)`. Declared effect names are not
+validated.
 
 ### 5.2 Capability Security
 
 Capabilities control what resources a module can access:
 
 ```fides
-use fs::file with { Read, Write };
-use net::http with { Net };
+use file with { IO, FS };
+use http with { Net };
 ```
 
-- **Strict mode:** When any `with` clause is present, only listed
-  capabilities are granted
-- **Sandbox:** `sandbox { ... }` blocks deny all capabilities not explicitly
-  granted
-- **Transitive:** Imported modules inherit the importer's capabilities
+- **Checked capabilities:** `IO` (`print`, `println`, …), `FS` (`read_file`,
+  `write_file`, `file_open`, `file_read`, `file_write`), `Net` (`http_get`,
+  `http_post`, `socket_*`), `Spawn` (`spawn`, `exec`, `system`,
+  `p_thread_spawn`), `Alloc` (`p_malloc`, `p_free`, …)
+- **Strict mode:** When any import has a `with` clause, a call that needs a
+  capability not granted is an error
+- **Per call, by name:** the check looks at each call in every function except
+  those of `core`. It does not follow the call graph: a function that calls
+  another function which prints is not itself checked for `IO`
+- **Sandbox:** inside `sandbox { ... }` every such call is an error, whatever
+  has been granted. Calls to other functions are allowed
 - **Compile-time:** All checks happen at compile time — no runtime overhead
 
 ### 5.3 Safety Annotations
@@ -721,15 +788,25 @@ use net::http with { Net };
 | Annotation | Meaning |
 |------------|---------|
 | `@deterministic` | Output is purely a function of inputs |
-| `@crashfree` | Function cannot panic or abort |
+| `@crashfree` | `@no-panic` + `@no-unbounded` |
 | `@no-alloc` | Function performs no heap allocation |
-| `@gas(n)` | Function has a gas limit of n operations |
-| `@conserve` | Function conserves a resource (no leaks) |
-| `@audit` | Function is audited for compliance |
-| `@medical` | Function meets medical device safety standards |
+| `@gas(n)` | Static cost (nodes, with literal loop trip counts) of the body and callees is at most n |
+| `@conserve` | Money conservation: no `IO`/`Net`/`Spawn`/`Diverge`, no floats, only `@conserve` callees, never `Money::new`/`Money::from_cents` |
+| `@audit` | Logs entry and exit at run time; satisfies `@requires-audit` |
+| `@medical` | `@no-alloc` + `@no-recursion` + `@no-unbounded` + `@no-panic` + `@requires-audit`; a set of checks, not certification |
 | `@linear` | Struct type is linear (must be consumed) |
-| `@send` | Struct can be sent between threads |
-| `@sync` | Struct can be shared between threads |
+| `@send` | Struct can be sent between threads; a struct of `@send` fields is `@send` |
+| `@sync` | Recorded; no check reads it |
+
+Further safety rules: `@no-alloc` (sees `.push()`, `Vec::new()`, string `+`),
+`@no-recursion`, `@no-unbounded`, `@no-indirect` (no calls through function
+parameters), `@no-panic`, `@bounded-stack[(N)]`, `@firmware` (no OS runtime
+calls), `@tainted` (on parameters). There are 17 rules, each with a negative
+test: [safety-rules.md](safety-rules.md). `fid qualify <file.fd> [-o out.json]`
+writes JSON evidence (compiler and source hashes, check result, annotated
+functions, each rule with its requirement and tests). Its verdict is always
+`NOT_QUALIFIED`: it is evidence, not a certificate, and Fides is not suitable
+for medical, automotive or avionics use.
 
 ### 5.4 Secrets (`@secret`)
 
@@ -782,6 +859,30 @@ fn password_matches(@secret stored: str, attempt: str) -> bool {
 ```
 
 Every release point is then easy to find and review (`grep @declassify`).
+
+### Personal data (`@sensitive`)
+
+`@sensitive` is the same check one notch down (roadmap CO7): personal data
+that *may* reach an output, but only after consent. Sources are `@sensitive`
+parameters, locals and function results, tracked as a second label through
+the same pass — all the sinks in the table above apply. The sanctioned
+release is `privacy::release` (stdlib `privacy`), which checks consent at
+runtime and returns the plain value, panicking without it:
+
+```fides
+use privacy;
+
+fn send_analytics(@sensitive user_id: i64) {
+    val c = consent_grant("alice", "analytics");
+    log_info(release(c, user_id));     // consent verified — public now
+    consent_revoke("alice", "analytics");
+}
+```
+
+A function returns a sensitive value only when marked `@sensitive` (callers
+keep its result sensitive) or `@declassify` — any `@declassify` releases
+sensitive data too, so the audit rule holds: `grep @declassify` finds every
+release point, consented or not.
 
 ### How it works
 
@@ -836,11 +937,10 @@ running time must not depend on a secret.
 ### 6.1 Result Type
 
 ```fides
-// Result is modeled as a struct with a tag field
-// tag 0 = Ok, tag 1 = Err
-fn parse_int(s: &str) -> Result<i64, ParseError> {
+// Result is a generic enum in core: Ok(T) or Err(E)
+fn parse_num(s: str) -> Result<i64, str> {
     // ...
-    Ok(42)
+    return Result::Ok(42);
 }
 ```
 
@@ -849,10 +949,10 @@ fn parse_int(s: &str) -> Result<i64, ParseError> {
 The `?` operator propagates errors:
 
 ```fides
-fn read_file(path: &str) -> Result<str, FileError> {
-    val file = open(path)?;        // if Err, return Err immediately
-    val data = read(file)?;
-    Ok(data)
+fn sum2(a: str, b: str) -> Result<i64, str> {
+    val x = parse_num(a)?;         // if Err, return Err immediately
+    val y = parse_num(b)?;
+    return Result::Ok(x + y);
 }
 ```
 
@@ -870,10 +970,10 @@ fn read_file(path: &str) -> Result<str, FileError> {
 
 ```fides
 val result = try {
-    val a = parse_int(s1)?;
-    val b = parse_int(s2)?;
+    val a = parse_num(s1)?;
+    val b = parse_num(s2)?;
     a + b
-};
+};                              // Result<i64, i64>
 ```
 
 A `try` block pushes an error target onto the `try_stack`. Any `?` inside
@@ -883,12 +983,10 @@ wrapped as `Ok`.
 ### 6.4 Defer
 
 ```fides
-fn process_file(path: &str) -> Result<(), FileError> {
-    val file = open(path)?;
-    defer close(file);          // runs when function exits (even on error)
-    val data = read(file)?;
-    Ok(())
-    // close(file) runs here automatically
+fn work() -> i64 {
+    println("start");
+    defer { println("cleanup"); }   // braces are required
+    return 1;                       // prints "cleanup", then returns
 }
 ```
 
@@ -897,15 +995,28 @@ fn process_file(path: &str) -> Result<(), FileError> {
 - Error propagation from `?`
 - Function epilogue
 
+They run at function exit, not block exit. Every `return` lowered after a
+`defer` statement runs it, also when the `defer` was in a branch that did not
+execute.
+
 ### 6.5 Match
 
 ```fides
 match option {
-    Some(value) => println(f"Got {value}"),
-    None => println("Nothing"),
-    _ => println("Other"),
+    Option::Some(value) => { println(f"Got {value}"); }
+    Option::None => { println("Nothing"); }
 }
+
+val n = match option { Option::Some(v) => v, _ => 0 };
 ```
+
+A statement `match` needs block arms; a `match` used as a value may have
+expression arms. A bare `None` in a pattern is a new variable that matches
+anything: write `Option::None`. A `match` on an enum must cover every variant,
+and one on `bool` both values (unless an arm is `_` or a name); integer and
+string matches are not checked for exhaustiveness. `if`/`match` used as a
+value, also as a function's last statement, give the value of the branch taken
+(`test_if_expr_value.fd`).
 
 **Match lowering:**
 - Scrutinee is lowered once to a value
@@ -929,13 +1040,14 @@ for i in 0..=10 { ... }
 // While
 while condition { ... }
 
-// Infinite loop (with break-value)
-val result = loop {
-    if done { break value; }
-};
+// Infinite loop
+loop {
+    if done { break; }
+}
 ```
 
-`break` can carry a value (the loop expression evaluates to the break value).
+`loop` is a statement, not an expression; `break expr` evaluates `expr` and
+discards it. `for (i, x) in …` does not parse.
 
 ---
 
@@ -1059,15 +1171,15 @@ Enum Foo { Bar(i64), Baz(str), Qux }
 
 ### 8.1 Interpreter
 
-The interpreter is the reference oracle (~4400 LOC). It directly executes
-the SSA IR:
+The interpreter (`fid run`, `compiler/interp.fd`; `src/interp.rs` in
+`fidesc`) directly executes the SSA IR:
 - Walks basic blocks, evaluates each instruction
 - Maintains a value table per function
 - `Call`/`CallPtr` dispatch to `p_*` builtins or user functions
 - Supports recursion depth limiting
 - Auto-detects missing `__env` param and inserts dummy
 
-**Value representation:**
+**Value representation** (`fidesc`'s, `src/interp.rs`):
 ```
 Value::Int(i64), Float(f64), Bool, Str, Ptr(u64), Void
 Vec(Rc<RefCell<SmallVec<[Value; 8]>>>)
@@ -1098,19 +1210,29 @@ IrType::Struct(n) → struct n_s*
 IrType::Array(e, n) → {ctype}[{n}]
 ```
 
-### 8.3 Native Codegen (x86-64/ARM64/RISC-V)
+### 8.3 Native Codegen (Windows x64)
 
-Direct machine code emission — no assembler, no LLVM:
-- PIR L3 → machine code (manual byte encoding)
-- ModRM/SIB bytes, REX prefixes, ABI rules
-- Linear scan register allocation with constant rematerialization
-- Peephole optimizer (9 passes, always on)
-- ELF64 (Linux), PE (Windows), Mach-O (macOS) object file formats
-- Custom linker for raw linking with runtime
+`fid emit` writes a Windows x64 executable directly from the IR, with no
+assembler, linker or C compiler (`compiler/pe_ir.fd`, `pe_ir_enc.fd`,
+`pe_ir_stubs.fd`):
+- A small IR optimizer first (`compiler/iropt.fd`): inlining of small
+  single-block functions, constant folding, dead code removal
+- Values kept in 7 callee-saved registers (hottest locals, parameters,
+  short-lived temporaries); there is no full register allocator (no
+  cross-block values, caller-saved registers, or floats in xmm)
+- The runtime is Fides code in `stdlib/pe_runtime/*.fd`, merged into every
+  program; C library functions through `extern "C"` thunks
+- Native async/tasks crash (`test_async`, `test_async_float_struct`)
+
+The older PIR path (`build --native`: PIR L3, linear scan allocation,
+peephole) crashes. ELF64, Mach-O, ARM64 and RISC-V emitters exist and are
+experimental / incomplete; Linux x64 goes through C.
 
 ### 8.4 Runtime Library
 
-The runtime (`runtime_linux.rs`, etc.) is hand-encoded x86-64 machine code:
+The runtime functions, all named `p_*`, are C in the C backend, Fides
+(`stdlib/pe_runtime/*.fd`) in native Windows executables, and hand-encoded
+machine code in the experimental Linux runtime (`runtime_linux.fd`):
 - Memory: `p_malloc`, `p_free`, `p_region_free`
 - Strings: `p_str_concat`, `p_str_equal`, `p_to_str`, `p_float_to_str`
 - Collections: `p_vec_new/push/pop/len/get/set`, `p_map_*`
@@ -1161,9 +1283,9 @@ ret, mfence, sfence, lfence, pause, wbinvd, int, leave, cld, std, ud2.
 
 ```
 # Compile with zero stdlib dependencies
-fides-c build kernel.fd --bare
-fides-c build kernel.fd --no-std
-fides-c build kernel.fd --no-stdlib
+fid emit kernel.fd --bare
+fid emit kernel.fd --no-std
+fid emit kernel.fd --no-stdlib
 ```
 
 In `--bare`/`--no-std` mode, the compiler:
@@ -1173,12 +1295,14 @@ In `--bare`/`--no-std` mode, the compiler:
 4. Produces output with zero hidden runtime dependencies
 
 This is for kernel/UEFI/bare-metal development where the program must
-not depend on any stdlib functions.
+not depend on any stdlib functions. Bare metal is incomplete: `emit --bare`
+panics today.
 
 ### `@cpu_local` Variables (Per-CPU Data)
 
-For SMP kernel development, `@cpu_local` declares per-CPU storage
-accessed via the GS segment register:
+Not available in `fid`: `@cpu_local` is valid only on globals, and globals
+cannot carry annotations, so no pass reads it. The design (from the Rust PE
+emitter) is per-CPU storage accessed via the GS segment register:
 
 ```
 @cpu_local var current_task: i64 = 0;
@@ -1197,7 +1321,8 @@ Each cpu_local variable gets a unique offset starting at 0x1000
 
 ### UEFI Boot Services
 
-`stdlib/uefi.fd` provides FFI bindings for UEFI boot services:
+`uefi.fd` moved to the fides-os project (Oct 24); it is no longer in this
+repository's `stdlib/`. It provides FFI bindings for UEFI boot services:
 
 ```
 use uefi;
@@ -1220,22 +1345,23 @@ Available functions: `uefi_init`, `uefi_get_boot_services`,
 ### Cross-Compilation Targets
 
 ```
-fides-c build app.fd --target x86-64        # Native (default)
-fides-c build app.fd --target arm64         # ARM64 (C codegen fallback)
-fides-c build app.fd --target aarch64       # AArch64 (C codegen fallback)
-fides-c build app.fd --target riscv64       # RISC-V 64 (C codegen fallback)
+fid emit app.fd                             # Native Windows x64
+fid ccompile app.fd --target arm64          # ARM64 (C codegen fallback)
+fid ccompile app.fd --target aarch64        # AArch64 (C codegen fallback)
+fid ccompile app.fd --target riscv64        # RISC-V 64 (C codegen fallback)
 ```
 
-The self-hosted PE emitter currently supports x86-64 only. ARM64 and
-RISC-V targets fall back to C codegen (the IR is target-independent).
-Native ARM64/RISC-V codegen modules for the self-hosted compiler are
-planned but not yet implemented.
+The self-hosted PE emitter supports x86-64 only. ARM64 and RISC-V targets
+fall back to C codegen (the IR is target-independent). The native ARM64 and
+RISC-V modules (`codegen_arm64.fd`, `codegen_riscv.fd`) are experimental and
+incomplete. `@cfg` uses the host OS, not `--target`.
 
 ---
 
 ## 9. Standard Library
 
-Fides has 99 stdlib modules (~28,370 LOC). Key modules:
+Fides has 137 stdlib modules (43,576 lines, Nov 6), plus 4 in
+`stdlib/pe_runtime/`. Key modules:
 
 ### Core
 | Module | Description |
@@ -1287,9 +1413,9 @@ Fides has 99 stdlib modules (~28,370 LOC). Key modules:
 ### OS / Bare-Metal
 | Module | Description |
 |--------|-------------|
-| `kernel` | OS kernel primitives (scheduler, memory, interrupts) |
 | `volatile` | Volatile memory access (p_volatile_load/store) |
-| `uefi` | UEFI boot services bindings (AllocatePool, GetMemoryMap, ExitBootServices, console) |
+
+`kernel` and `uefi` moved to the fides-os project.
 
 ### ML & AI
 | Module | Description |
@@ -1326,11 +1452,51 @@ Fides has 99 stdlib modules (~28,370 LOC). Key modules:
 ## 10. Self-Hosting
 
 **The Fides compiler is self-hosted.** The compiler has been rewritten from
-Rust (`src/*.rs`, ~91K LOC) into Fides (`compiler/*.fd`, ~61K LOC) and
-achieves a **bootstrap fixpoint**: the self-hosted compiler reproduces
-byte-identical output across generations.
+Rust (`src/*.rs`, 57 files, 112,511 lines) into Fides (`compiler/*.fd`, 61
+modules, 133,688 lines) and achieves a **bootstrap fixpoint**: the self-hosted
+compiler reproduces byte-identical output across generations.
 
-### Current State (session 15)
+### Current State (Nov 6, 2026)
+
+- `RELEASE=1 ./scripts/bootstrap.sh` builds the compiler in three stages,
+  checks that stages 2 and 3 emit identical C (49 MB, Nov 6), and installs
+  `release/fid.exe`, which the installer ships as `fid.exe`. Stage 1 is
+  built from a pinned stage 0 (`release/stage0/fid.exe`, checked against
+  `scripts/stage0.sha256`) when one exists, otherwise cold from `fidesc`;
+  `PIN=1` pins the last stage after a fixpoint. No stage 0 is pinned yet.
+- `fid` compiles itself to C in ~133 s (type check 59 s, borrow check 16 s,
+  lowering 20 s, C generation 12 s; Nov 6), ~6x slower than `fidesc` (~21 s).
+- `fid run` and `fid ccompile` matched `fidesc` on the 302 test programs of
+  Oct 27 (242 of 243 for `ccompile`; `test_sqlite` needs libsqlite3). The last
+  full suite run is Nov 2 (Rust harness, `fidesc` as compiler: interp
+  339/339, C 343/343, PE 345/345, expected-fail 89/89); it has not been rerun
+  with the Nov 4–6 compiler. The Nov 4–6 features were checked with `fid run`,
+  `fid ccompile` and `fid emit` on their tests.
+- `fid emit` makes native Windows executables with no C compiler.
+- Counts and measurements: [CURRENT.md → Numbers](../../CURRENT.md#numbers);
+  the full history: [selfhost.md](selfhost.md).
+
+### Where `fid` and `fidesc` differ (Nov 4)
+
+`fidesc` is frozen: the language is what `fid` accepts. `fid` rejects more:
+
+| Rule | `fid` | `fidesc` |
+|---|---|---|
+| Changing a `Vec` a `for` loop walks; assigning `s.x` while `s` is borrowed | rejected | accepted |
+| Spawned-call arguments must be `@send`; a struct of `@send` fields is `@send` | checked | captures only; structs need `@send` |
+| `@no-alloc` sees `.push()`, `Vec::new()`, string `+`; `@no-indirect` sees calls through a function parameter | yes | free functions only |
+| `@gas` counts trips of loops with literal bounds; `@tainted` on a parameter | yes | no |
+| `@firmware` covers runtime calls (`p_getenv`, `p_file_*`, sockets) | yes | skipped |
+| Effect table: `p_file_*`, `p_socket_*`, `p_process_*`, clocks are IO/Net | yes | partly |
+| Generic bounds, inference failures and turbofish arity | checked | not checked |
+| Borrowed `&str`, `@scoped` structs (not stored, returned as `str` or sent) | checked | not checked |
+
+`@cfg` (platform, os, arch, debug/release) now filters functions and structs
+in both. Both instantiate a higher-order function's effects at each call site
+from the function passed (`effects/test_effect_ho_instantiation.fd`). Each
+rule's requirement and tests: [safety-rules.md](safety-rules.md).
+
+### First fixpoint (session 15, historical)
 
 - **25 modules** in `compiler/`:
   `token`, `diag`, `json`, `fmt`, `ast`, `lexer`, `parser`, `ir`,
@@ -1344,9 +1510,10 @@ byte-identical output across generations.
   - **fides-c2.c == fides-c3.c** (SHA256-identical, 0 diffs / 701,100 lines)
   - Three generations verified, all run test_simple.fd correctly
 
-### Bootstrap Strategy
+### Bootstrap Strategy (session 15, historical)
 
-The bootstrap uses the C codegen path with TCC:
+The first bootstrap used the C codegen path with TCC (today
+`scripts/bootstrap.sh` uses `$CC`, usually `zig cc`):
 1. Rust compiler (`fidesc`) compiles `compiler/*.fd` → C source (706K lines)
 2. C source compiled with TCC → `fides-c.exe` (first-generation)
 3. `fides-c.exe` compiles `compiler/*.fd` → C source (701K lines)
@@ -1375,13 +1542,18 @@ reserve is insufficient for the compiler's deep recursion.
 | `==` on enums | Manual `*_eq()` helper functions (tag-based comparison) |
 | `==` on strings | Lowered to `p_str_equal` by the compiler automatically |
 
-### Remaining Work (post-fixpoint)
+### Remaining Work (Nov 6)
 
-- **Rust vs self-hosted parity gap**: c1=706K vs c2=701K lines (~5K difference)
-- **Debug prints**: 287 `p_eprint_str` calls (go to stderr, don't affect fixpoint)
-- **Mirror `var` feature to `compiler/*.fd`**: Rust supports module-level `var`/`pub var`
-- **PE emitter full compiler support**: struct/enum, floats, many-arg calls
-- **Linux native codegen integration**: port `elf64.rs`, `linker.rs`, `runtime_linux.rs`
+- **Value semantics**: copy-on-write for `Vec`/`str`/`HashMap` is written
+  behind `LOWER_COW` (off); with it on, the compiler compiling itself runs out
+  of memory. Today `var b = a` on a `Vec` aliases.
+- **Native async/tasks**: `fid emit` programs using async or spawn+await crash.
+- **Native register allocation**: 7 callee-saved registers only.
+- **Other targets**: macOS, native ELF, ARM64, RISC-V, WASM and bare metal
+  (`emit --bare` panics) are incomplete.
+- **Self-compile speed**: ~133 s, ~6x slower than `fidesc`.
+- **Written, not run yet**: `fid emit --checked-alloc` (guard pages),
+  `scripts/sanitize.sh` (ASan/UBSan through C), `scripts/fuzz/nightly.sh`.
 
 ---
 

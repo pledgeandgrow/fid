@@ -173,10 +173,51 @@ fn inc_self_hash() -> i64 {
     return 0;
 }
 
+var g_self_hash: i64 = 0;
+var g_self_hash_done: bool = false;
+
+/// inc_self_hash, computed once per run (it reads the whole executable).
+pub fn inc_compiler_hash() -> i64 {
+    if !g_self_hash_done {
+        g_self_hash = inc_self_hash();
+        g_self_hash_done = true;
+    }
+    return g_self_hash;
+}
+
+// --- Checked core (release D9) ----------------------------------------------
+//
+// Once this compiler has checked a given core.fd clean (types, borrows,
+// reference escapes, secrecy), later builds skip core's bodies. The stamp is
+// an empty file in the temporary directory named by the hash of core's text
+// and of the compiler executable, so editing either checks core again.
+
+fn inc_core_stamp_path(core_hash: i64) -> str {
+    var dir: str = env_or_empty("TEMP");
+    if dir == "" { dir = env_or_empty("TMPDIR"); }
+    if dir == "" { dir = "/tmp"; }
+    var name: str = int_to_str(hash_source("core " + int_to_str(core_hash) + " " + int_to_str(inc_compiler_hash())));
+    if str_starts_with(name, "-") { name = "n" + str_slice(name, 1, str_len(name)); }
+    return dir + "/fid-core-" + name + ".ok";
+}
+
+/// Whether this compiler already checked this core clean.
+pub fn inc_core_checked(core_hash: i64) -> bool {
+    if core_hash == 0 || inc_compiler_hash() == 0 { return false; }
+    if env_or_empty("FIDES_CHECK_CORE") != "" { return false; }
+    return p_file_exists(inc_core_stamp_path(core_hash)) != 0;
+}
+
+/// Record that this compiler checked this core clean. Best-effort.
+pub fn inc_core_mark_checked(core_hash: i64) {
+    if core_hash == 0 || inc_compiler_hash() == 0 { return; }
+    p_file_write(inc_core_stamp_path(core_hash), "ok\n");
+}
+
 /// The key of a build: compiler identity, command, arguments, CC,
 /// FIDES_CC_OPT and FID_HOME (which stdlib imports resolve to).
 pub fn inc_build_key(command: str, n: i64, start: i64) -> i64 {
-    var k: str = int_to_str(inc_self_hash()) + " " + command;
+    var k: str = int_to_str(inc_compiler_hash()) + " " + command;
     var i: i64 = start + 1;
     while i < n {
         var a: str = p_argv(i);
@@ -729,6 +770,7 @@ pub fn inc_artifact_path(output: str, canon: i64, tool: str, flags: str) -> str 
 /// Copy `path` to `dest` if the artifact exists.
 pub fn inc_artifact_get(path: str, dest: str) -> bool {
     if p_file_exists(path) == 0 { return false; }
+    inc_lru_touch(path);
     return p_file_write_vec(dest, p_file_read_bytes(path)) >= 0;
 }
 
@@ -739,4 +781,104 @@ pub fn inc_artifact_put(path: str, source: str) {
     var tmp: str = path + ".tmp";
     p_file_write_vec(tmp, p_file_read_bytes(source));
     p_rename(tmp, path);
+    inc_lru_touch(path);
+    inc_cache_evict(inc_dir_of(path));
+}
+
+// --- Eviction (release C8) -------------------------------------------------
+//
+// `.fidcache/lru` lists artifact names, one per line, in the order they were
+// last stored or used (a name may appear more than once; its last line
+// counts). Past INC_CACHE_MAX_FILES artifacts or INC_CACHE_MAX_BYTES bytes,
+// the least recently used are deleted and the list is rewritten.
+
+const INC_CACHE_MAX_FILES: i64 = 64;
+const INC_CACHE_MAX_BYTES: i64 = 1073741824;
+
+/// The file name part of `path`.
+fn inc_base_name(path: str) -> str {
+    var i: i64 = str_len(path) - 1;
+    while i >= 0 {
+        var c: i64 = str_byte_at(path, i);
+        if c == 47 || c == 92 { return str_slice(path, i + 1, str_len(path)); }
+        i = i - 1;
+    }
+    return path;
+}
+
+/// Record that the artifact at `path` was just stored or used.
+fn inc_lru_touch(path: str) {
+    p_file_append(inc_dir_of(path) + "/lru", inc_base_name(path) + "\n");
+}
+
+/// The lines of `text`, without empty ones.
+fn inc_lines(text: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var n: i64 = str_len(text);
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i <= n {
+        if i == n || str_byte_at(text, i) == 10 {
+            var end: i64 = i;
+            if end > start && str_byte_at(text, end - 1) == 13 { end = end - 1; }
+            if end > start { out.push(str_slice(text, start, end)); }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Keep the cache in `dir` (a `.fidcache` directory) under its limits.
+pub fn inc_cache_evict(dir: str) {
+    var log: str = p_file_read(dir + "/lru");
+    if (log as i64) == 0 { return; }
+    var lines: Vec<str> = inc_lines(log);
+    // Most recent first, each name once, only those still on disk
+    var order: Vec<str> = Vec::new();
+    var sizes: Vec<i64> = Vec::new();
+    var i: i64 = lines.len() - 1;
+    while i >= 0 {
+        var name: str = lines.get(i);
+        var seen: bool = false;
+        var k: i64 = 0;
+        while k < order.len() && !seen {
+            if order.get(k) == name { seen = true; }
+            k = k + 1;
+        }
+        if !seen && p_file_exists(dir + "/" + name) != 0 {
+            order.push(name);
+            sizes.push(p_file_size(dir + "/" + name));
+        }
+        i = i - 1;
+    }
+    var total: i64 = 0;
+    i = 0;
+    while i < sizes.len() {
+        total = total + sizes.get(i);
+        i = i + 1;
+    }
+    var compact: bool = lines.len() > 4 * INC_CACHE_MAX_FILES;
+    if order.len() <= INC_CACHE_MAX_FILES && total <= INC_CACHE_MAX_BYTES && !compact { return; }
+    // Keep the most recent within the limits; delete the rest
+    var kept: Vec<str> = Vec::new();
+    var used: i64 = 0;
+    i = 0;
+    while i < order.len() {
+        if kept.len() < INC_CACHE_MAX_FILES && used + sizes.get(i) <= INC_CACHE_MAX_BYTES {
+            kept.push(order.get(i));
+            used = used + sizes.get(i);
+        } else {
+            p_file_delete(dir + "/" + order.get(i));
+        }
+        i = i + 1;
+    }
+    // Rewrite the list oldest first
+    var text: str = "";
+    i = kept.len() - 1;
+    while i >= 0 {
+        text = text + kept.get(i) + "\n";
+        i = i - 1;
+    }
+    p_file_write(dir + "/lru", text);
 }

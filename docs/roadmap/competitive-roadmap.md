@@ -51,8 +51,9 @@ inlines to a store); natively, from 1.63 s to 1.34 s on fib and 1.47 s to 1.04 s
 on the map. The remaining fib gap is the overflow check: Rust's release mode
 drops it, which lets LLVM turn one of the two recursive calls into a loop.
 
-Compile speed: `fid` compiles itself (104,000 lines of Fides, 44 MB of C out) in
-112–137 s, about 800 lines a second; `fidesc` (Rust) does it in 21 s. Go and Zig
+Compile speed: `fid` compiles itself (133,688 lines of Fides, 49 MB of C out) in
+about 133 s on Nov 6, about 1,000 lines a second; `fidesc` (Rust) does it in about
+21 s. Go and Zig
 compile on the order of 100,000 lines a second or more, so this is the widest gap
 on the board: CS1–CS7.
 
@@ -80,9 +81,14 @@ would write it.
 
 Nothing below means anything until this exists.
 
-- [ ] BM1. A benchmark repo: the same programs in Fides, Rust, Go, Zig and C++, one
+- [x] BM1. A benchmark repo: the same programs in Fides, Rust, Go, Zig and C++, one
       command to run them all (M).
-- [ ] BM2. Install Go and a real Clang and GCC beside `zig cc`; pin every version (S).
+      Done (Nov 3): `bench/` with fib, loop, sieve, hashmap in all five
+      languages (Zig has no hashmap yet) and `bench/run.sh`: builds each, checks
+      every language prints the same number, best of N, markdown table.
+- [~] BM2. Install Go and a real Clang and GCC beside `zig cc`; pin every version (S).
+      Done: Go 1.27.3 (winget); Clang through `zig c++`; run.sh prints the
+      versions. Left: GCC, and pinning the versions in a file.
 - [ ] BM3. The Benchmarks Game set: n-body, spectral-norm, mandelbrot,
       fannkuch-redux, binary-trees, fasta, reverse-complement, k-nucleotide,
       regex-redux, pidigits (L).
@@ -95,19 +101,23 @@ Nothing below means anything until this exists.
 - [ ] BM7. Size and memory benchmarks: binary size, peak memory, startup time (S).
 - [ ] BM8. Runs on Windows and Linux, on a quiet machine, several runs, with spread
       reported (M).
-- [ ] BM9. CI fails on a slowdown over 5%, per benchmark (release D7, tighter) (M).
+- [~] BM9. CI fails on a slowdown over 5%, per benchmark (release D7, tighter) (M).
+      Done (Nov 4): `bench/check.sh` fails on a slowdown over `LIMIT_PCT` against
+      `bench/baseline.txt`. Left: running it in CI.
 - [ ] BM10. A public page of results over time, losses included (M).
 
 **Acceptance:** anyone can reproduce every number with one command.
 
 ## Track OP — Optimizer
 
-Today the native path keeps most values in stack slots, inlines nothing at IR
-level and leaves floats in memory. This track is where most of the speed is.
+Today the native path keeps most values in stack slots (seven callee-saved
+registers hold the hottest values), runs a small IR optimizer and leaves floats
+in memory. This track is where most of the speed is.
 
 **Foundations**
 
-- [ ] OP1. Run the IR optimizer on the native path (release D6) (M).
+- [x] OP1. Run the IR optimizer on the native path (release D6) (M).
+      Done (Nov 4): `fid emit` runs `compiler/iropt.fd` before code generation.
 - [ ] OP2. Real SSA: promote stack slots to values (mem2reg) before any other pass
       (L).
 - [ ] OP3. Dominator tree, loop tree and use lists shared by every pass (M).
@@ -115,10 +125,18 @@ level and leaves floats in memory. This track is where most of the speed is.
 
 **Classic passes**
 
-- [ ] OP5. Inlining with a cost model, across modules (release D5) (L).
-- [ ] OP6. Constant propagation, folding and branch elimination (M).
+- [~] OP5. Inlining with a cost model, across modules (release D5) (L).
+      Done (Nov 4, native path): a call to a function of one block of plain
+      instructions, up to 16 instructions, is inlined. Left: a cost model,
+      functions of several blocks.
+- [~] OP6. Constant propagation, folding and branch elimination (M).
+      Done (Nov 4, native path): integer arithmetic and comparisons on two
+      constants are folded when the result cannot overflow. Left: propagation,
+      branch elimination.
 - [ ] OP7. Global value numbering and common subexpressions (M).
-- [ ] OP8. Dead code and dead store elimination (M).
+- [~] OP8. Dead code and dead store elimination (M).
+      Done (Nov 4, native path): constants and other pure values nothing reads
+      are removed. Left: dead stores.
 - [ ] OP9. Loop-invariant code motion (M).
 - [ ] OP10. Strength reduction and induction variables (M).
 - [ ] OP11. Loop unrolling, peeling and rotation (M).
@@ -133,7 +151,9 @@ level and leaves floats in memory. This track is where most of the speed is.
 
 - [ ] OP16. A full register allocator over all registers, caller-saved included,
       live ranges split at calls (release D4 goes further) (L). Native now keeps
-      parameters read more than once in registers (release D13).
+      values in 7 callee-saved registers: the hottest locals, parameters and
+      short-lived temporaries (release D4, D13). Not done: values that cross
+      blocks, caller-saved registers, floats in xmm.
 - [ ] OP17. Floats in xmm registers, not stack slots (L).
 - [~] OP18. Instruction selection: `lea`, addressing modes, `cmov`, `test`, fused
       compare and branch (L). Done: compare and branch without a stored bool,
@@ -176,18 +196,56 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
 - [~] RT1. `Vec<T>` stores `T` inline: a `Vec<u8>` takes one byte per element, and a
       `Vec<Struct>` no pointer per element (L). Stage A done: one `Vec`
       implementation on every backend (release D14).
-- [ ] RT2. `str` carries its length: `str_len` is O(1), zero bytes are allowed, and
+- [~] RT2. `str` carries its length: `str_len` is O(1), zero bytes are allowed, and
       HTTP bodies can be binary (release I8) (XL, touches every backend).
+      Done: 16-byte `[magic][len]` header — `p_str_alloc`/`p_str_free` in
+      `stdlib/core.fd`, `p_str_length` reads `*(s-8)` when the magic at
+      `*(s-16)` matches and falls back to a NUL scan otherwise, so
+      non-headered strings (literals, C returns) still work and degrade
+      gracefully. `Str_drop` frees `s-16` for headered strings only.
+      `p_str_concat`, `String_slice_len`, `p_to_str`, `p_char_to_str`,
+      `p_str_literal_dup`, `p_file_read`, `p_argv` and `p_getenv` produce
+      headered strings on the `.fd` runtime; interp + PE + C verified
+      identical output. Left: PE asm `p_str_concat` headering, `.rdata`
+      literal headers (needs `Str_drop` to know statics aren't freeable),
+      embedded-NUL literals, then the fat `{ptr,len}` ABI if we go all
+      the way.
 - [ ] RT3. Small-string storage with no allocation (M).
-- [ ] RT4. A fast `HashMap`: open addressing with SIMD probing, a strong default hash
+- [~] RT4. A fast `HashMap`: open addressing with SIMD probing, a strong default hash
       (L).
+      Already in `stdlib/core.fd`: open addressing with linear probing,
+      tombstones (`-1` slots), 75%-load growth, FNV-1a string hash (PE
+      overrides with `pert_str_hash`'s word-at-a-time loop). Left: SIMD
+      control-byte probe groups and a stronger finalizer (FNV mixes weakly
+      in the low bits).
 - [ ] RT5. `HashMap<K, V>` with unboxed keys and values (L).
-- [ ] RT6. Generics fully monomorphized, so a `Vec<f64>` holds floats as floats (L).
-- [ ] RT7. Allocator: per-thread caches (release H8), freed memory returned to the
+- [~] RT6. Generics fully monomorphized, so a `Vec<f64>` holds floats as floats (L).
+      Done (Nov 3, verified): `val x: f64 = v.get(0)` round-trips 1.5 — the
+      monomorphized layout already stores floats as floats when the element
+      type is known. Left: `print(v.get(0))` on an untyped `Vec::new()`
+      resolves the element to `i64` and prints float bits as an integer —
+      element-type propagation into `print` dispatch.
+- [~] RT7. Allocator: per-thread caches (release H8), freed memory returned to the
       system (L).
+      Done (written Nov 4): per-thread arenas and free lists in the C runtime,
+      per-thread free lists in the native runtime; every native test runs
+      through them, no multi-thread stress test has been run. Left: freed
+      memory returned to the system.
 - [ ] RT8. Allocator speed on par with mimalloc on its own benchmarks (L).
 - [ ] RT9. Own context switch, not fibers: under 20 ns per task switch (M).
-- [ ] RT10. Tasks across all cores: M:N scheduling with work stealing (XL).
+- [~] RT10. Tasks across all cores: M:N scheduling with work stealing (XL).
+      Done: per-worker local queues — `pe_wq_push` targets the running
+      worker's queue via `pert_tls_wid` (spawn locality); `pe_wq_pop` drains
+      own queue → global → steals a sibling's head. All run queues share
+      `pert_wq`'s lock; `pert_lq_any` feeds the deadlock detector, which now
+      requires two consecutive dead-looking cycles before panicking (steal
+      handoffs look empty for an instant). Verified: all 8 task/async tests,
+      3× `test_tasks` runs, 100k-sleeper bench — no false deadlocks. Left:
+      true Chase-Lev deques (per-worker locks), steal-half batching, and a
+      contention benchmark to prove the locality win. Nov 6: programs built by
+      `fid emit` that use `async` or `spawn` + `await` crash (`test_async`,
+      `test_async_float_struct`); the interpreter and C paths are fine
+      (release H10).
 - [ ] RT11. IOCP on Windows, epoll on Linux, kqueue on macOS, replacing the O(n) poll
       loop (L).
 - [~] RT12. A timer heap, so 100,000 sleeping tasks cost nothing (M).
@@ -223,10 +281,16 @@ This is the race we can win outright, since no rival's speed comes for free.
       hello, ~77 ms off the frontend (196 → ~98 ms); emit 387 → ~301 ms.
       Left: a real binary artifact skipping parse and the whole-program
       analyses, and persistent caching of stdlib comptime output.
-- [ ] CS3. Borrow checking linear in program size (release D8) (M).
-- [~] CS4. Self-compile under 60 s (release), then under 10 s (L). 112–137 s on
-      Nov 2, from 601 s (release D10, D11). Next: string compares in method lookup and the
-      parser, then building the compiler with optimization.
+      Nov 4 (release D9): `fid` type-checks `core.fd` once per (compiler,
+      `core.fd`) pair; a stamp in the temp directory skips its bodies on later
+      builds (`FIDES_CHECK_CORE=1` forces the check).
+- [ ] CS3. Borrow checking linear in program size (release D8) (M). On the
+      compiler itself: 16 s (Nov 6).
+- [~] CS4. Self-compile under 60 s (release), then under 10 s (L). About 133 s on
+      Nov 6 (type check 59 s, borrow check 16 s, lowering 20 s, C generation
+      12 s), from 601 s (release D10, D11); `fidesc` takes about 21 s. Next:
+      string compares in method lookup and the parser, then building the
+      compiler with optimization.
 - [ ] CS5. Parallel front end and code generation on all cores (L).
 - [~] CS6. Incremental native builds per function, under 100 ms for a one-line
       change (L).
@@ -252,8 +316,14 @@ language lives.
 
 **Finding compiler bugs**
 
-- [ ] VF1. A random program generator in the spirit of Csmith: all three backends
+- [~] VF1. A random program generator in the spirit of Csmith: all three backends
       must agree (release M9 is the start) (L).
+      Done (Nov 3): `scripts/fuzz/gen_programs.py` — seeded programs with
+      arithmetic, branches, loops, calls and `Vec`s, run on `run`, `emit` and
+      `ccompile`; disagreements kept with each output. 40 programs, 0
+      disagreements. `scripts/fuzz/nightly.sh` and a `checked` backend
+      (release M9) written Nov 4, not run; no CI workflow schedules it. Left:
+      structs, enums, strings, floats, and long runs.
 - [ ] VF2. Random programs compared with an equivalent C program, built by Clang and
       GCC (L).
 - [ ] VF3. Coverage-guided fuzzing of the lexer, parser, typechecker and every
@@ -278,8 +348,11 @@ language lives.
 
 **Hardening the runtime**
 
-- [ ] VF14. AddressSanitizer, UBSan and ThreadSanitizer through the C path, in CI
+- [~] VF14. AddressSanitizer, UBSan and ThreadSanitizer through the C path, in CI
       (release M8 is the start) (M).
+      `scripts/sanitize.sh` (the tests through C under ASan and UBSan; needs
+      clang with ASan, Linux or macOS) written Nov 4, not run. Left: running it,
+      ThreadSanitizer, CI.
 - [ ] VF15. Fuzz every stdlib parser: JSON, regex, HTTP, TLS records, TOML, XML, CSV
       (L).
 - [ ] VF16. Week-long soak tests of a service under load, with flat memory (release
@@ -292,7 +365,8 @@ language lives.
 
 - [ ] VF19. A public miscompile log: cause, how it escaped, the test that now
       catches it (S).
-- [ ] VF20. Every bug fixed gets a regression test, always (S).
+- [x] VF20. Every bug fixed gets a regression test, always (S).
+      Done: the rule is in CONTRIBUTING.md § Compiler changes.
 
 **Acceptance:** a month of fuzzing on all cores finds no miscompile.
 
@@ -300,12 +374,28 @@ language lives.
 
 Reach what Rust, Go, Zig and C++ programmers expect on day one.
 
-- [ ] LG1. Moves or counted handles decided and enforced (release M4, M5) (L).
-- [ ] LG2. Owned and borrowed strings (release M11) (L).
+- [~] LG1. Moves or counted handles decided and enforced (release M4, M5) (L).
+      Decided (M4, proposal 0001): copy-on-write for `Vec`, `str` and
+      `HashMap`; `==` by content is done. Left (M5): the copy-on-write lowering
+      is behind `LOWER_COW`, off, because the compiler compiling itself runs out
+      of memory with it on; today `var b = a` on a `Vec` still aliases.
+- [x] LG2. Owned and borrowed strings (release M11) (L).
+      Done (Nov 4–6): `str` is owned, `&str` borrowed; a borrowed string cannot
+      be returned as `str`, stored, or passed to a user function's `str`
+      parameter; `str_clone(s)` copies. A `@scoped` struct cannot be stored or
+      sent. `http_serve_scoped` frees request memory after each response and is
+      no longer `@unsafe`. Tests: `test_borrowed_str`,
+      `test_borrowed_str_return_fail`, `test_borrowed_str_pass_fail`,
+      `test_scoped_store_fail`.
 - [ ] LG3. Lifetimes the borrow checker can prove across functions, without
       second-class limits where that matters (XL).
-- [ ] LG4. Traits: bounds checked, associated types, default methods, trait objects
+- [~] LG4. Traits: bounds checked, associated types, default methods, trait objects
       (release K9 is the start) (L).
+      Done (release K9, in `fid`): every bound of `T: A + B` is checked at the
+      call; a type parameter is inferred or an error; turbofish with an arity
+      check (`test_generic_bound_fail`, `test_generic_infer_fail`,
+      `test_turbofish_arity_fail`). Left: associated types, default methods
+      and trait objects, not checked against this goal.
 - [ ] LG5. Zero-cost iterators: `map`, `filter`, `fold` compile to a plain loop (L).
 - [ ] LG6. Closures that capture by reference and by value, with no heap allocation
       when they do not escape (L).
@@ -319,11 +409,17 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
 - [ ] LG11. Structured concurrency with cancellation and timeouts (L).
 - [ ] LG12. A defined memory model for atomics (L).
 - [ ] LG13. Inline assembly on every native target (M).
-- [ ] LG14. `async` for every argument type, and async traits (release H9) (L).
+- [~] LG14. `async` for every argument type, and async traits (release H9) (L).
+      Done (H9): an `async fn` with `f64` or struct arguments or results runs as
+      a task on the interpreter and C paths. Left: reference arguments, native
+      async (`fid emit` programs using `async` crash), async traits.
 - [ ] LG15. C interop without bindings: `@import("header.h")`, as Zig does (L).
 - [ ] LG16. C++ interop for the common cases (XL).
-- [~] LG17. Every annotation works or is removed (release K8) (M).
-      Done: `@bounded-stack`. Left: `@tainted`.
+- [x] LG17. Every annotation works or is removed (release K8) (M).
+      Done: `@bounded-stack`, `@no-indirect` (rejects calls through function
+      parameters) and `@tainted` (a tainted function or parameter reaches no IO
+      or Net effect; no data flow in `fid`). The 17 safety rules each have a
+      negative test: `docs/reference/safety-rules.md` (release L1, L2).
 - [x] LG18. Effect-row polymorphism: functions with `fn`-typed parameters are
       effect-polymorphic, instantiated per call site (M).
       Done (Nov 3): `apply(pure_fn)` is pure, `apply(io_fn)` gets `IO`, closures
@@ -331,6 +427,11 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       (`fn_param_positions` + `instantiate_fn_arg_effects` in `src/typechecker.rs`;
       tests `effects/test_effect_ho_instantiation.fd` and
       `test_effect_ho_violation.fd`.)
+- [x] LG19. Explicit `!E` effect rows in signatures (S).
+      Done (Nov 3): a declared effect name that is not a concrete effect
+      (`!E`, `!{IO, E}`) marks the function effect-polymorphic — the row is
+      instantiated at call sites and under-declaration is not an error for
+      row-annotated functions.
 
 **Acceptance:** each feature in the comparison table has a conformance test.
 
@@ -353,8 +454,11 @@ owning what we ship.
 - [ ] SL12. Database drivers: PostgreSQL, MySQL, SQLite, with parameter binding (L).
 - [~] SL13. Built-in testing: table tests, benchmarks, fuzzing, as in Go (M).
       Done: `fid test <file.fd>` runs each `fn test_*()` in its own process and times each `fn bench_*()`. Left: fuzzing.
-- [~] SL14. Structured logging and metrics (M).
-      Done: `metrics` (counters, gauges, histograms, Prometheus text format). Left: structured fields in `log`.
+- [x] SL14. Structured logging and metrics (M).
+      Done: `metrics` (counters, gauges, histograms, Prometheus text format,
+      `metrics_serve`); `log` with fields, JSON lines (`log_render_json`) and
+      per-module levels (`logmf`, `log_set_module_level`), tests `test_log`,
+      `test_log_module` (complaint CO3, CO4).
 - [ ] SL15. A sampling profiler reachable from a running service (L).
 - [ ] SL16. Big integers and decimals (M).
 - [ ] SL17. Files, paths and processes complete on every platform (M).
@@ -369,8 +473,24 @@ Go and Rust won developers with tools as much as with languages.
 
 - [~] TL1. One binary, `fid`: build, run, test, fmt, doc, lint, bench, fuzz (L).
       Done: `fid` has build, run, test, fmt, doc, lint, bench, check, profile. Left: fuzz (VF).
-- [ ] TL2. Error messages as good as Rust's, each with a suggested fix, and a test
+- [~] TL2. Error messages as good as Rust's, each with a suggested fix, and a test
       per error (L).
+      Done (Nov 3): every diagnostic in `typechecker.rs`/`borrowck.rs` now carries
+      a `Fix:` or `Hint:` line with a concrete code suggestion — borrow
+      (`holder_note`), capability (`use mod with { Cap }`), region escape,
+      use-after-free, budget, sandbox, undefined variable, effect mismatch.
+      Left: a `// expect-error:` conformance test per diagnostic, source-span
+      rendering (caret under the token) for the remaining line-only errors,
+      and a diagnostic-code index. `tests/bootstrap/diagnostics/` has 9
+      conformance tests (capability, cap-propagation, effect, budget, escape,
+      sandbox, undefined-var, borrow-mutation, linear) covering every family.
+      Diagnostic codes are now assigned systematically: `classify_error` maps
+      every message family to a stable `Exxx` (region E052–E053, budget E054,
+      GPU/KV region E055–E056, annotation E057, escape E058, secrecy E059) and
+      `enrich_errors` tags code-less errors too — E090/E091 now render on
+      capability and sandbox failures.
+      Left: caret spans for the remaining line-only messages (some sites carry
+      no position at all) and self-hosted `compiler/*.fd` parity.
 - [ ] TL3. `fid fix`: applies suggested fixes, and upgrades code between versions (L).
 - [ ] TL4. LSP complete: references, rename, formatting, signature help, inlay
       hints, code actions (release N7 is the start) (L).
@@ -412,15 +532,31 @@ Every platform gets a tier, and a tier means CI, not a hope.
 - [ ] PL2. Tier 1: Windows x64, Linux x64, macOS ARM64, Linux ARM64 (release F4–F8)
       (XL).
 - [ ] PL3. Tier 2: Windows ARM64, macOS x64, FreeBSD, RISC-V (L).
-- [ ] PL4. WebAssembly with WASI (release F9) (L).
-- [ ] PL5. Freestanding and embedded: Cortex-M, RISC-V boards, with no OS (release G)
+- [~] PL4. WebAssembly with WASI (release F9) (L).
+      Done: `fidesc wasm` emits a runnable .wasm (80 KB on hello) via
+      `src/wasm.rs`/`compiler/wasm.fd`. Left: it imports a custom Fides
+      `env` host API (`p_print`, `p_str_concat`, `p_panic`, …), not
+      `wasi_snapshot_preview1` — real WASI needs fd_write/proc_exit
+      mapping and a `_start` export.
+- [~] PL5. Freestanding and embedded: Cortex-M, RISC-V boards, with no OS (release G)
       (L).
-- [ ] PL6. Android and iOS (XL).
+      Done: `--no-std` skips `core.fd` and still emits static ELFs —
+      verified on `riscv64-linux` (43 KB) and `arm64-linux` (40 KB) with
+      zero external tools; `compiler/embedded.fd` holds the bare-metal
+      helpers. Left: a true no-OS target (flat binary, no ELF runtime),
+      Cortex-M (needs a Thumb-2 encoder — arm64 emits A64 only).
+- [~] PL6. Android and iOS (XL).
+      Done: the static arm64-linux ELF is Android-adjacent — direct
+      syscalls, no libc dependency, so it should run under `adb shell`
+      (unverified on a device). Left: device testing, Android NDK/ABI
+      quirks, and iOS entirely (needs the Mach-O backend + Apple syscall
+      numbers + code signing).
 - [~] PL7. Native backends for ELF and Mach-O, sharing one encoder (L).
       Done: `build --target` emits valid static ELF64 executables for all
       three arches with zero external tools — x86-64-linux, arm64-linux, and
       riscv64-linux all produce correct ELF headers (machine 62/183/243,
-      ET_EXEC). Fixed a VReg-shadowing bug that printed raw virtual
+      ET_EXEC), and the x86-64 ELF **runs natively under WSL** (prints
+      `Hello, Fides!`). Fixed a VReg-shadowing bug that printed raw virtual
       registers (`str v6`, `sd v9`), non-canonical `fp`/`return` mnemonics,
       unsigned-only immediates on negative offsets (`add xN, x29, #-24` →
       `sub`; `[x29, #-N]` → LDUR/STUR), and >255-byte stack slots (via x9).
@@ -436,6 +572,11 @@ Trust is built by what we do not break.
 - [x] ST1. Freeze the Rust compiler as a bootstrap only: new features land in
       `compiler/*.fd` alone. Writing everything twice is the largest drag on pace (M).
       Done: `docs/reference/stability.md`; `fidesc test --compiler release/fid.exe` runs the suite on `fid`.
+      Nov 3: the Rust compiler gets no new features (proposal 0002 is in `fid`
+      only); `bootstrap.sh` builds from a pinned stage 0 (`NATIVE=1` stages by
+      `fid emit` with a byte-identical check, `PIN=1` pins). No stage 0 is
+      pinned yet: a natively built `fid` stops with "Invalid free" until RT2's
+      native string headers are finished.
 - [x] ST2. A written stability promise: code that compiles on 1.0 compiles on every
       1.x (release K12) (S).
       Done: `docs/reference/stability.md`.

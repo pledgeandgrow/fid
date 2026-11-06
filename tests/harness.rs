@@ -54,6 +54,9 @@ fn is_skip_test(name: &str) -> bool {
         // Links SQLite, which Fides does not ship (`fidesc test` runs it
         // only with FIDES_TEST_EXTERNAL=1).
         | "test_sqlite.fd"
+        | "test_pe_sqlite.fd"
+        // Bare-only (`fid emit --bare`): a hosted build panics
+        | "test_bare_panic_handler.fd"
         // Borrow checker fail test is now in the expected-fail list
         // (borrow checking is on by default as of Phase 5).
     )

@@ -1743,18 +1743,30 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "#define P_UNLIKELY(x) (x)");
     wln(self, "#endif");
     wln(self, "/* A full Vec grows out of line, so push inlines to a store. */");
+    // Copy-on-write (proposal 0001): a negative capacity (-box-1) marks data
+    // other Vecs share; the box holds {owners, capacity}. Growing (or owning
+    // before a write) releases one owner or copies the data.
     wln(self, "P_NOINLINE void __p_vec_grow(int64_t* h) {");
-    wln(self, "    int64_t cap = h[2], nc = cap > 0 ? cap * 2 : 8;");
+    wln(self, "    int64_t cap = h[2], shared = 0;");
+    wln(self, "    if (cap < 0) {");
+    wln(self, "        int64_t* bx = (int64_t*)(intptr_t)(-cap - 1);");
+    wln(self, "        int64_t owners = bx[0];");
+    wln(self, "        cap = bx[1];");
+    wln(self, "        if (owners <= 1) { p_free(bx); h[2] = cap; }");
+    wln(self, "        else { bx[0] = owners - 1; shared = 1; }");
+    wln(self, "    }");
+    wln(self, "    if (!shared && h[1] < cap) return;");
+    wln(self, "    int64_t nc = h[1] < cap ? cap : (cap > 0 ? cap * 2 : 8);");
     wln(self, "    int64_t* nd = (int64_t*)p_malloc(nc * 8);");
     wln(self, "    int64_t* od = (int64_t*)(intptr_t)h[0];");
-    wln(self, "    if (od) { memcpy(nd, od, (size_t)h[1] * 8); p_free(od); }");
+    wln(self, "    if (od) { memcpy(nd, od, (size_t)h[1] * 8); if (!shared) p_free(od); }");
     wln(self, "    h[0] = (int64_t)(intptr_t)nd;");
     wln(self, "    h[2] = nc;");
     wln(self, "}");
     wln(self, "/* Element access a counted loop proved in bounds (pe.rs unchecked_ops). */");
     wln(self, "#define P_VEC_UNCHECKED \\");
     wln(self, "static inline int64_t __p_vec_get_u(void* e, int64_t v, int64_t i) { (void)e; return ((int64_t*)(intptr_t)((int64_t*)(intptr_t)v)[0])[i]; } \\");
-    wln(self, "static inline void __p_vec_set_u(void* e, int64_t v, int64_t i, int64_t x) { (void)e; ((int64_t*)(intptr_t)((int64_t*)(intptr_t)v)[0])[i] = x; } \\");
+    wln(self, "static inline void __p_vec_set_u(void* e, int64_t v, int64_t i, int64_t x) { (void)e; int64_t* __hh = (int64_t*)(intptr_t)v; if (P_UNLIKELY(__hh[2] < 0)) __p_vec_grow(__hh); ((int64_t*)(intptr_t)__hh[0])[i] = x; } \\");
     wln(self, "static inline void* __p_pvec_get_u(PVec* v, int64_t i) { return v->data[i]; } \\");
     wln(self, "static inline void __p_pvec_set_u(PVec* v, int64_t i, void* x) { v->data[i] = x; }");
     wln(self, "P_VEC_UNCHECKED");
@@ -2664,6 +2676,7 @@ fn fast_core_vec_body(name: str, func: IrFunction, c_ret: str) -> Vec<str> {
         out.push("    int64_t* __h = (int64_t*)(intptr_t)" + p.get(1) + ";");
         out.push("    if (" + p.get(2) + " >= __h[1]) p_panic(\"Vec index out of bounds\");");
         out.push("    if (" + p.get(2) + " < 0) p_panic(\"Vec index out of bounds\");");
+        out.push("    if (P_UNLIKELY(__h[2] < 0)) __p_vec_grow(__h);");
         out.push("    ((int64_t*)(intptr_t)__h[0])[" + p.get(2) + "] = " + p.get(3) + ";");
     } else if name == "Vec_push" && n == 3 && c_ret == "void" {
         out.push("    int64_t* __h = (int64_t*)(intptr_t)" + p.get(1) + ";");
@@ -3091,7 +3104,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                         } else if oname == "Vec" {
                             wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + arg_str + "); p_print_str(_s); }");
                         } else if oname == "HashMap" {
-                            wln(self, "    { char* _s = p_to_str_map((PMap*)" + arg_str + "); p_print_str(_s); free(_s); }");
+                            wln(self, "    { char* _s = p_to_str_map((PMap*)" + arg_str + "); p_print_str(_s); p_free(_s); }");
                         } else if oname == "Tensor" {
                             wln(self, "    { char* _s = p_tensor_to_str((PTensor*)" + arg_str + "); p_print_str(_s); free(_s); }");
                         } else {
@@ -3102,7 +3115,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                         if gname == "Vec" {
                             wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + arg_str + "); p_print_str(_s); }");
                         } else if gname == "HashMap" {
-                            wln(self, "    { char* _s = p_to_str_map((PMap*)" + arg_str + "); p_print_str(_s); free(_s); }");
+                            wln(self, "    { char* _s = p_to_str_map((PMap*)" + arg_str + "); p_print_str(_s); p_free(_s); }");
                         } else {
                             wln(self, "    p_print_int((int64_t)" + arg_str + ");");
                         }
@@ -3138,7 +3151,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                         } else if oname == "Vec" {
                             wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + arg_str + "); p_print_str(_s); }");
                         } else if oname == "HashMap" {
-                            wln(self, "    { char* _s = p_to_str_map((PMap*)" + arg_str + "); p_print_str(_s); free(_s); }");
+                            wln(self, "    { char* _s = p_to_str_map((PMap*)" + arg_str + "); p_print_str(_s); p_free(_s); }");
                         } else if oname == "Tensor" {
                             wln(self, "    { char* _s = p_tensor_to_str((PTensor*)" + arg_str + "); p_print_str(_s); free(_s); }");
                         } else {
@@ -3149,7 +3162,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                         if gname == "Vec" {
                             wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + arg_str + "); p_print_str(_s); }");
                         } else if gname == "HashMap" {
-                            wln(self, "    { char* _s = p_to_str_map((PMap*)" + arg_str + "); p_print_str(_s); free(_s); }");
+                            wln(self, "    { char* _s = p_to_str_map((PMap*)" + arg_str + "); p_print_str(_s); p_free(_s); }");
                         } else {
                             wln(self, "    p_print_int((int64_t)" + arg_str + ");");
                         }
@@ -3989,7 +4002,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "void p_flush_stdout(void) { fflush(stdout); }");
     wln(self, "void p_print_int(int64_t val) { char b[32]; int n = snprintf(b, sizeof b, \"%lld\", (long long)val); fwrite(b, 1, (size_t)n, stdout); }");
     wln(self, "void p_print_bool(bool val) { if (val) fwrite(\"true\", 1, 4, stdout); else fwrite(\"false\", 1, 5, stdout); }");
-    wln(self, "void p_print_float(double val) { char* _s = p_to_str_float(val); fwrite(_s, 1, strlen(_s), stdout); free(_s); }");
+    wln(self, "void p_print_float(double val) { char* _s = p_to_str_float(val); fwrite(_s, 1, strlen(_s), stdout); p_free(_s); }");
     wln(self, "void p_print_newline(void) { fwrite(\"\\n\", 1, 1, stdout); }");
     wln(self, "/* Crashes, stack overflow and panic traces. Nothing is recorded per call:");
     wln(self, "   a trace walks the machine stack and names each frame that starts at a");
@@ -4270,6 +4283,19 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "#define P_BLOCK_FREED 0xF1DE5B0000000000ULL");
     wln(self, "#define P_CLASS_LARGE 63");
     wln(self, "static P_THREAD_LOCAL uint64_t* __p_free_lists[41];");
+    // Under AddressSanitizer every block comes from calloc and goes back to
+    // free, so a use after free or an overrun is reported (release M8:
+    // scripts/sanitize.sh); the pooled classes would hide them.
+    wln(self, "#if defined(__SANITIZE_ADDRESS__)");
+    wln(self, "#define P_SAN_ALLOC 1");
+    wln(self, "#elif defined(__has_feature)");
+    wln(self, "#if __has_feature(address_sanitizer)");
+    wln(self, "#define P_SAN_ALLOC 1");
+    wln(self, "#endif");
+    wln(self, "#endif");
+    wln(self, "#ifndef P_SAN_ALLOC");
+    wln(self, "#define P_SAN_ALLOC 0");
+    wln(self, "#endif");
     // Under the debug allocator the block allocator below is renamed; the
     // p_malloc/p_free after it record each block.
     wln(self, "#if defined(P_LEAKS) || defined(P_CHECKED_ALLOC)");
@@ -4283,7 +4309,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "void* p_malloc(int64_t size) {");
     wln(self, "    if (size < 0) { fprintf(stderr, \"p_malloc: negative size %lld\\n\", (long long)size); abort(); }");
     wln(self, "    size_t total = (size_t)size + 8;");
-    wln(self, "    if (total > ((size_t)1 << 20)) {");
+    wln(self, "    if (P_SAN_ALLOC || total > ((size_t)1 << 20)) {");
     wln(self, "        uint64_t* big = (uint64_t*)calloc(1, total);");
     wln(self, "        if (!big) { fprintf(stderr, \"p_malloc: OOM allocating %zu bytes\\n\", total); abort(); }");
     wln(self, "        big[0] = P_BLOCK_MAGIC | P_CLASS_LARGE;");
@@ -4555,7 +4581,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    fseek(f, 0, SEEK_END); long sz = ftell(f);");
     wln(self, "    if (sz < 0) { fclose(f); return NULL; }");
     wln(self, "    fseek(f, 0, SEEK_SET);");
-    wln(self, "    char* buf = (char*)malloc((size_t)sz + 1);");
+    wln(self, "    char* buf = (char*)p_malloc((int64_t)sz + 1);");
     wln(self, "    if (!buf) { fclose(f); return NULL; }");
     wln(self, "    size_t rd = fread(buf, 1, (size_t)sz, f); buf[rd] = 0; fclose(f);");
     wln(self, "    return buf;");
@@ -4714,13 +4740,13 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    WIN32_FIND_DATAA fd; char pat[2056];");
     wln(self, "    snprintf(pat, sizeof pat, \"%s\\\\*\", path);");
     wln(self, "    HANDLE h = FindFirstFileA(pat, &fd);");
-    wln(self, "    if (h == INVALID_HANDLE_VALUE) { char* e = (char*)malloc(1); e[0] = 0; return e; }");
+    wln(self, "    if (h == INVALID_HANDLE_VALUE) { char* e = (char*)p_malloc(1); e[0] = 0; return e; }");
     wln(self, "    do {");
     wln(self, "        if (strcmp(fd.cFileName, \".\") && strcmp(fd.cFileName, \"..\"))");
     wln(self, "            need += strlen(fd.cFileName) + 1;");
     wln(self, "    } while (FindNextFileA(h, &fd));");
     wln(self, "    FindClose(h);");
-    wln(self, "    char* out = (char*)malloc(need);");
+    wln(self, "    char* out = (char*)p_malloc((int64_t)need);");
     wln(self, "    out[0] = 0;");
     wln(self, "    h = FindFirstFileA(pat, &fd);");
     wln(self, "    if (h == INVALID_HANDLE_VALUE) return out;");
@@ -4735,14 +4761,14 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return out;");
     wln(self, "#else");
     wln(self, "    DIR* d = opendir(path);");
-    wln(self, "    if (!d) { char* e = (char*)malloc(1); e[0] = 0; return e; }");
+    wln(self, "    if (!d) { char* e = (char*)p_malloc(1); e[0] = 0; return e; }");
     wln(self, "    struct dirent* ent;");
     wln(self, "    while ((ent = readdir(d)) != NULL) {");
     wln(self, "        if (strcmp(ent->d_name, \".\") && strcmp(ent->d_name, \"..\"))");
     wln(self, "            need += strlen(ent->d_name) + 1;");
     wln(self, "    }");
     wln(self, "    rewinddir(d);");
-    wln(self, "    char* out = (char*)malloc(need);");
+    wln(self, "    char* out = (char*)p_malloc((int64_t)need);");
     wln(self, "    out[0] = 0;");
     wln(self, "    int first = 1;");
     wln(self, "    while ((ent = readdir(d)) != NULL) {");
@@ -5766,9 +5792,9 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    size_t dlen = strlen(delim);");
     wln(self, "    while (*start) {");
     wln(self, "        const char* p = strstr(start, delim);");
-    wln(self, "        if (!p) { p_vec_push(v, (void*)strdup(start)); break; }");
+    wln(self, "        if (!p) { p_vec_push(v, (void*)p_to_str_str(start)); break; }");
     wln(self, "        size_t len = p - start;");
-    wln(self, "        char* part = (char*)malloc(len + 1);");
+    wln(self, "        char* part = (char*)p_malloc((int64_t)len + 1);");
     wln(self, "        memcpy(part, start, len); part[len] = 0;");
     wln(self, "        p_vec_push(v, (void*)part);");
     wln(self, "        start = p + dlen;");
@@ -5838,32 +5864,32 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "");
     // p_to_str variants
     wln(self, "char* p_to_str_vec(PVec* v) {");
-    wln(self, "    char* result = strdup(\"[\");");
+    wln(self, "    char* result = p_to_str_str(\"[\");");
     wln(self, "    for (int64_t i = 0; i < v->len; i++) {");
-    wln(self, "        if (i > 0) { char* tmp = p_str_concat(result, \", \"); free(result); result = tmp; }");
+    wln(self, "        if (i > 0) { char* tmp = p_str_concat(result, \", \"); p_free(result); result = tmp; }");
     wln(self, "        char* s = p_to_str((int64_t)v->data[i]);");
-    wln(self, "        char* tmp = p_str_concat(result, s); free(result); free(s); result = tmp;");
+    wln(self, "        char* tmp = p_str_concat(result, s); p_free(result); p_free(s); result = tmp;");
     wln(self, "    }");
-    wln(self, "    char* tmp = p_str_concat(result, \"]\"); free(result); result = tmp;");
+    wln(self, "    char* tmp = p_str_concat(result, \"]\"); p_free(result); result = tmp;");
     wln(self, "    return result;");
     wln(self, "}");
     wln(self, "char* p_to_str_map(PMap* m) {");
-    wln(self, "    if (!m) return strdup(\"{}\");");
+    wln(self, "    if (!m) return p_to_str_str(\"{}\");");
     wln(self, "    // Sort keys for deterministic output");
     wln(self, "    int64_t* order = (int64_t*)malloc(m->len * sizeof(int64_t));");
     wln(self, "    for (int64_t i = 0; i < m->len; i++) order[i] = i;");
     wln(self, "    for (int64_t i = 0; i < m->len; i++)");
     wln(self, "        for (int64_t j = i+1; j < m->len; j++)");
     wln(self, "            if (strcmp(m->keys[order[i]], m->keys[order[j]]) > 0) { int64_t t = order[i]; order[i] = order[j]; order[j] = t; }");
-    wln(self, "    char* result = strdup(\"{\");");
+    wln(self, "    char* result = p_to_str_str(\"{\");");
     wln(self, "    for (int64_t i = 0; i < m->len; i++) {");
-    wln(self, "        if (i > 0) { char* tmp = p_str_concat(result, \", \"); free(result); result = tmp; }");
-    wln(self, "        char* tmp = p_str_concat(result, m->keys[order[i]]); free(result); result = tmp;");
-    wln(self, "        tmp = p_str_concat(result, \": \"); free(result); result = tmp;");
+    wln(self, "        if (i > 0) { char* tmp = p_str_concat(result, \", \"); p_free(result); result = tmp; }");
+    wln(self, "        char* tmp = p_str_concat(result, m->keys[order[i]]); p_free(result); result = tmp;");
+    wln(self, "        tmp = p_str_concat(result, \": \"); p_free(result); result = tmp;");
     wln(self, "        char* vs = p_to_str(m->vals[order[i]]);");
-    wln(self, "        tmp = p_str_concat(result, vs); free(result); free(vs); result = tmp;");
+    wln(self, "        tmp = p_str_concat(result, vs); p_free(result); p_free(vs); result = tmp;");
     wln(self, "    }");
-    wln(self, "    char* tmp = p_str_concat(result, \"}\"); free(result); result = tmp;");
+    wln(self, "    char* tmp = p_str_concat(result, \"}\"); p_free(result); result = tmp;");
     wln(self, "    free(order);");
     wln(self, "    return result;");
     wln(self, "}");
@@ -5871,7 +5897,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "char* p_char_to_str(int64_t val) { char* s = (char*)p_malloc(2); s[0] = (char)val; s[1] = 0; return s; }");
     wln(self, "char* p_to_str_bool(bool val) { char* r = (char*)p_malloc(6); strcpy(r, val ? \"true\" : \"false\"); return r; }");
     wln(self, "char* p_to_str_float(double val) {");
-    wln(self, "    char* buf = (char*)malloc(512);");
+    wln(self, "    char* buf = (char*)p_malloc(512);");
     wln(self, "    // Match Rust's {} format: shortest representation that round-trips.");
     wln(self, "    // Rust's Display for f64 always uses fixed-point (never scientific notation).");
     wln(self, "    if (val == 0.0) { snprintf(buf, 512, \"0\"); return buf; }");

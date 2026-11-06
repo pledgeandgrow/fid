@@ -56,6 +56,7 @@ fn fast_core_vec_body(name: &str, func: &IrFunction, c_ret: &str) -> Option<Vec<
         ("Vec_set", 4, "void") if checks_bounds => {
             let mut l = vec![hdr(&p[1])];
             l.extend(oob(&p[2]));
+            l.push("    if (P_UNLIKELY(__h[2] < 0)) __p_vec_grow(__h);".into());
             l.push(format!("    ((int64_t*)(intptr_t)__h[0])[{}] = {};", p[2], p[3]));
             l
         }
@@ -757,7 +758,7 @@ impl CCodeGen {
             ("p_co_async", &[p(), I64]),
             ("p_co_spawn", &[p(), I64]),
             ("p_co_tick", &[]),
-            ("p_co_pool_call", &[p(), I64, I64]),
+            ("p_co_pool_call", &[p(), I64, p()]),
             ("p_co_sleep", &[I64]),
             ("p_co_wait_fd", &[I64, I64, I64]),
             ("p_co_detach", &[I64]),
@@ -1348,18 +1349,30 @@ impl CCodeGen {
         wln!(self, "#define P_UNLIKELY(x) (x)");
         wln!(self, "#endif");
         wln!(self, "/* A full Vec grows out of line, so push inlines to a store. */");
+        // Copy-on-write (proposal 0001): a negative capacity (-box-1) marks
+        // data other Vecs share; the box holds {owners, capacity}. Growing
+        // (or owning before a write) releases one owner or copies the data.
         wln!(self, "P_NOINLINE void __p_vec_grow(int64_t* h) {{");
-        wln!(self, "    int64_t cap = h[2], nc = cap > 0 ? cap * 2 : 8;");
+        wln!(self, "    int64_t cap = h[2], shared = 0;");
+        wln!(self, "    if (cap < 0) {{");
+        wln!(self, "        int64_t* bx = (int64_t*)(intptr_t)(-cap - 1);");
+        wln!(self, "        int64_t owners = bx[0];");
+        wln!(self, "        cap = bx[1];");
+        wln!(self, "        if (owners <= 1) {{ p_free(bx); h[2] = cap; }}");
+        wln!(self, "        else {{ bx[0] = owners - 1; shared = 1; }}");
+        wln!(self, "    }}");
+        wln!(self, "    if (!shared && h[1] < cap) return;");
+        wln!(self, "    int64_t nc = h[1] < cap ? cap : (cap > 0 ? cap * 2 : 8);");
         wln!(self, "    int64_t* nd = (int64_t*)p_malloc(nc * 8);");
         wln!(self, "    int64_t* od = (int64_t*)(intptr_t)h[0];");
-        wln!(self, "    if (od) {{ memcpy(nd, od, (size_t)h[1] * 8); p_free(od); }}");
+        wln!(self, "    if (od) {{ memcpy(nd, od, (size_t)h[1] * 8); if (!shared) p_free(od); }}");
         wln!(self, "    h[0] = (int64_t)(intptr_t)nd;");
         wln!(self, "    h[2] = nc;");
         wln!(self, "}}");
         wln!(self, "/* Element access a counted loop proved in bounds (pe.rs unchecked_ops). */");
         wln!(self, "#define P_VEC_UNCHECKED \\");
         wln!(self, "static inline int64_t __p_vec_get_u(void* e, int64_t v, int64_t i) {{ (void)e; return ((int64_t*)(intptr_t)((int64_t*)(intptr_t)v)[0])[i]; }} \\");
-        wln!(self, "static inline void __p_vec_set_u(void* e, int64_t v, int64_t i, int64_t x) {{ (void)e; ((int64_t*)(intptr_t)((int64_t*)(intptr_t)v)[0])[i] = x; }} \\");
+        wln!(self, "static inline void __p_vec_set_u(void* e, int64_t v, int64_t i, int64_t x) {{ (void)e; int64_t* __hh = (int64_t*)(intptr_t)v; if (P_UNLIKELY(__hh[2] < 0)) __p_vec_grow(__hh); ((int64_t*)(intptr_t)__hh[0])[i] = x; }} \\");
         wln!(self, "static inline void* __p_pvec_get_u(PVec* v, int64_t i) {{ return v->data[i]; }} \\");
         wln!(self, "static inline void __p_pvec_set_u(PVec* v, int64_t i, void* x) {{ v->data[i] = x; }}");
         wln!(self, "P_VEC_UNCHECKED");
@@ -3752,10 +3765,19 @@ impl CCodeGen {
         wln!(self, "    }");
         wln!(self, "}");
         wln!(self, "typedef struct { int64_t (*fn)(); int64_t nargs; int64_t args[8]; atomic_int* done; } p_thread_arg_t;");
-        wln!(self, "#ifndef _WIN32");
+        wln!(self, "#if !defined(_WIN32) && !defined(__APPLE__)");
         wln!(self, "#include <ucontext.h>");
+        wln!(self, "#endif");
+        wln!(self, "#ifndef _WIN32");
         wln!(self, "#include <poll.h>");
         wln!(self, "#include <time.h>");
+        wln!(self, "#endif");
+        wln!(self, "#if !defined(_WIN32)");
+        wln!(self, "#if defined(__APPLE__)");
+        wln!(self, "typedef struct {{ void* sp; }} __p_ctx_t;");
+        wln!(self, "#else");
+        wln!(self, "typedef ucontext_t __p_ctx_t;");
+        wln!(self, "#endif");
         wln!(self, "#endif");
         wln!(self, "typedef struct __p_co {{ int64_t (*fn)(); int64_t nargs; int64_t args[8]; int64_t result; int done; int detached;");
         wln!(self, "    struct __p_co* awaits; struct __p_co* back;");
@@ -3763,7 +3785,7 @@ impl CCodeGen {
         wln!(self, "#ifdef _WIN32");
         wln!(self, "    void* fiber;");
         wln!(self, "#else");
-        wln!(self, "    ucontext_t ctx; char* stack;");
+        wln!(self, "    __p_ctx_t ctx; char* stack;");
         wln!(self, "#endif");
         wln!(self, "}} __p_co;");
         wln!(self, "static P_THREAD_LOCAL __p_co** __p_cos = NULL;");
@@ -3774,7 +3796,7 @@ impl CCodeGen {
         wln!(self, "#ifdef _WIN32");
         wln!(self, "static P_THREAD_LOCAL void* __p_co_sched = NULL;");
         wln!(self, "#else");
-        wln!(self, "static P_THREAD_LOCAL ucontext_t __p_co_sched;");
+        wln!(self, "static P_THREAD_LOCAL __p_ctx_t __p_co_sched;");
         wln!(self, "#endif");
         wln!(self, "#define __P_CO_TAG 0x7FA5");
         wln!(self, "static int64_t __p_co_now(void) {{");
@@ -3790,6 +3812,75 @@ impl CCodeGen {
         wln!(self, "#endif");
         wln!(self, "/* A task stack on POSIX, with a guard page at its low end. */");
         wln!(self, "#define P_CO_STACK (256 * 1024 + 4096)");
+        wln!(self, "/* macOS/iOS have no ucontext on arm64 (and only deprecated it on x86_64),");
+        wln!(self, "   so coroutines there use a direct callee-saved register + sp switch.");
+        wln!(self, "   A new task starts through __p_co_enter_start, which pulls the __p_co*");
+        wln!(self, "   out of a fabricated frame register (x19 on arm64, r15 on x86_64). */");
+        wln!(self, "#if defined(__APPLE__)");
+        wln!(self, "void __p_co_switch(void** save_sp, void** load_sp);");
+        wln!(self, "void __p_co_enter_start(void);");
+        wln!(self, "#if defined(__x86_64__)");
+        wln!(self, "__asm__(");
+        wln!(self, "    \".text\\n\"");
+        wln!(self, "    \".global ___p_co_switch\\n\"");
+        wln!(self, "    \".p2align 4\\n\"");
+        wln!(self, "    \"___p_co_switch:\\n\"");
+        wln!(self, "    \"    pushq %rbp\\n\"");
+        wln!(self, "    \"    pushq %rbx\\n\"");
+        wln!(self, "    \"    pushq %r12\\n\"");
+        wln!(self, "    \"    pushq %r13\\n\"");
+        wln!(self, "    \"    pushq %r14\\n\"");
+        wln!(self, "    \"    pushq %r15\\n\"");
+        wln!(self, "    \"    movq %rsp, (%rdi)\\n\"");
+        wln!(self, "    \"    movq (%rsi), %rsp\\n\"");
+        wln!(self, "    \"    popq %r15\\n\"");
+        wln!(self, "    \"    popq %r14\\n\"");
+        wln!(self, "    \"    popq %r13\\n\"");
+        wln!(self, "    \"    popq %r12\\n\"");
+        wln!(self, "    \"    popq %rbx\\n\"");
+        wln!(self, "    \"    popq %rbp\\n\"");
+        wln!(self, "    \"    retq\\n\"");
+        wln!(self, "    \".global ___p_co_enter_start\\n\"");
+        wln!(self, "    \".p2align 4\\n\"");
+        wln!(self, "    \"___p_co_enter_start:\\n\"");
+        wln!(self, "    \"    movq %r15, %rdi\\n\"");
+        wln!(self, "    \"    jmp ___p_co_body_arg\\n\"");
+        wln!(self, ");");
+        wln!(self, "#elif defined(__aarch64__)");
+        wln!(self, "__asm__(");
+        wln!(self, "    \".text\\n\"");
+        wln!(self, "    \".global ___p_co_switch\\n\"");
+        wln!(self, "    \".p2align 4\\n\"");
+        wln!(self, "    \"___p_co_switch:\\n\"");
+        wln!(self, "    \"    sub sp, sp, #112\\n\"");
+        wln!(self, "    \"    stp x19, x20, [sp, #0]\\n\"");
+        wln!(self, "    \"    stp x21, x22, [sp, #16]\\n\"");
+        wln!(self, "    \"    stp x23, x24, [sp, #32]\\n\"");
+        wln!(self, "    \"    stp x25, x26, [sp, #48]\\n\"");
+        wln!(self, "    \"    stp x27, x28, [sp, #64]\\n\"");
+        wln!(self, "    \"    stp x29, x30, [sp, #80]\\n\"");
+        wln!(self, "    \"    mov x9, sp\\n\"");
+        wln!(self, "    \"    str x9, [x0]\\n\"");
+        wln!(self, "    \"    ldr x9, [x1]\\n\"");
+        wln!(self, "    \"    mov sp, x9\\n\"");
+        wln!(self, "    \"    ldp x19, x20, [sp, #0]\\n\"");
+        wln!(self, "    \"    ldp x21, x22, [sp, #16]\\n\"");
+        wln!(self, "    \"    ldp x23, x24, [sp, #32]\\n\"");
+        wln!(self, "    \"    ldp x25, x26, [sp, #48]\\n\"");
+        wln!(self, "    \"    ldp x27, x28, [sp, #64]\\n\"");
+        wln!(self, "    \"    ldp x29, x30, [sp, #80]\\n\"");
+        wln!(self, "    \"    add sp, sp, #112\\n\"");
+        wln!(self, "    \"    ret\\n\"");
+        wln!(self, "    \".global ___p_co_enter_start\\n\"");
+        wln!(self, "    \".p2align 4\\n\"");
+        wln!(self, "    \"___p_co_enter_start:\\n\"");
+        wln!(self, "    \"    mov x0, x19\\n\"");
+        wln!(self, "    \"    b ___p_co_body_arg\\n\"");
+        wln!(self, ");");
+        wln!(self, "#else");
+        wln!(self, "#error \"unsupported Apple architecture for coroutine switch\"");
+        wln!(self, "#endif");
+        wln!(self, "#endif");
         wln!(self, "static void __p_co_leave(void) {{");
         wln!(self, "    __p_co* c = __p_co_cur;");
         wln!(self, "    __p_co* back = c->back;");
@@ -3797,6 +3888,8 @@ impl CCodeGen {
         wln!(self, "    __p_co_cur = back;");
         wln!(self, "#ifdef _WIN32");
         wln!(self, "    SwitchToFiber(back ? back->fiber : __p_co_sched);");
+        wln!(self, "#elif defined(__APPLE__)");
+        wln!(self, "    __p_co_switch(&c->ctx.sp, back ? &back->ctx.sp : &__p_co_sched.sp);");
         wln!(self, "#else");
         wln!(self, "    swapcontext(&c->ctx, back ? &back->ctx : &__p_co_sched);");
         wln!(self, "#endif");
@@ -3807,6 +3900,8 @@ impl CCodeGen {
         wln!(self, "#ifdef _WIN32");
         wln!(self, "    (void)from;");
         wln!(self, "    SwitchToFiber(c->fiber);");
+        wln!(self, "#elif defined(__APPLE__)");
+        wln!(self, "    __p_co_switch(from ? &from->ctx.sp : &__p_co_sched.sp, &c->ctx.sp);");
         wln!(self, "#else");
         wln!(self, "    swapcontext(from ? &from->ctx : &__p_co_sched, &c->ctx);");
         wln!(self, "#endif");
@@ -3837,6 +3932,9 @@ impl CCodeGen {
         wln!(self, "}}");
         wln!(self, "#ifdef _WIN32");
         wln!(self, "static void WINAPI __p_co_start(void* p) {{ __p_co_body((__p_co*)p); }}");
+        wln!(self, "#elif defined(__APPLE__)");
+        wln!(self, "static void __p_co_body_arg(__p_co* c) __attribute__((used));");
+        wln!(self, "static void __p_co_body_arg(__p_co* c) {{ __p_co_body(c); }}");
         wln!(self, "#else");
         wln!(self, "static void __p_co_start(unsigned lo, unsigned hi) {{ __p_co_body((__p_co*)(((uintptr_t)hi << 32) | lo)); }}");
         wln!(self, "#endif");
@@ -3863,11 +3961,28 @@ impl CCodeGen {
         wln!(self, "    c->stack = (char*)mmap(NULL, P_CO_STACK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);");
         wln!(self, "    if (c->stack == MAP_FAILED) p_panic(\"task: out of memory\");");
         wln!(self, "    mprotect(c->stack, 4096, PROT_NONE);");
+        wln!(self, "#if defined(__APPLE__)");
+        wln!(self, "    {{");
+        wln!(self, "        char* __top = c->stack + P_CO_STACK;");
+        wln!(self, "#if defined(__x86_64__)");
+        wln!(self, "        uint64_t* __fr = (uint64_t*)(__top - 64);");
+        wln!(self, "        __fr[0] = (uint64_t)(uintptr_t)c;");
+        wln!(self, "        __fr[6] = (uint64_t)(uintptr_t)__p_co_enter_start;");
+        wln!(self, "#else");
+        wln!(self, "        uint64_t* __fr = (uint64_t*)(__top - 112);");
+        wln!(self, "        memset(__fr, 0, 112);");
+        wln!(self, "        __fr[0] = (uint64_t)(uintptr_t)c;");
+        wln!(self, "        __fr[11] = (uint64_t)(uintptr_t)__p_co_enter_start;");
+        wln!(self, "#endif");
+        wln!(self, "        c->ctx.sp = __fr;");
+        wln!(self, "    }}");
+        wln!(self, "#else");
         wln!(self, "    getcontext(&c->ctx);");
         wln!(self, "    c->ctx.uc_stack.ss_sp = c->stack;");
         wln!(self, "    c->ctx.uc_stack.ss_size = P_CO_STACK;");
         wln!(self, "    c->ctx.uc_link = NULL;");
         wln!(self, "    makecontext(&c->ctx, (void (*)(void))__p_co_start, 2, (unsigned)(uintptr_t)c, (unsigned)((uintptr_t)c >> 32));");
+        wln!(self, "#endif");
         wln!(self, "#endif");
         wln!(self, "    __p_cos[__p_co_count++] = c;");
         wln!(self, "    __p_co_total++;");

@@ -2,6 +2,14 @@
 
 *Goal: Don't copy LLVM — compete with it by playing a different game. Match where we must, innovate where we can, skip what we don't need.*
 
+> **Status (Nov 6, 2026):** the passes, register allocator and checks marked done
+> below are in the frozen Rust compiler (`src/opt.rs`, `src/regalloc.rs`) and in
+> the PIR path of the self-hosted compiler (`compiler/opt.fd`), which `fid`
+> reaches only through `build --native`; that path crashes. The working native
+> path, `fid emit`, runs `compiler/iropt.fd` only (inlining of small one-block
+> functions, constant folding, dead code removal) and keeps values in 7
+> callee-saved registers, with no full register allocator (release D4–D6).
+
 **The thesis:** LLVM is a general-purpose optimizer for C/C++ — languages that allow anything (pointer arithmetic, use-after-free, integer overflow, exceptions, arbitrary aliasing). LLVM must be conservative because C/C++ is dangerous. Fides is not dangerous. Regions prevent use-after-free. Checked arithmetic prevents overflow. Effects track side effects. Capabilities restrict access. Linear types enforce single ownership. `@crashfree` proves no panics. `@deterministic` proves purity. `@gas` proves termination.
 
 **This means:** LLVM spends optimization passes working around C/C++'s lack of safety. Fides doesn't need those workarounds — it needs different optimizations that exploit its safety guarantees. We don't need to copy LLVM's 50 passes. We need 20 passes that do things LLVM cannot.
@@ -312,7 +320,7 @@ These phases use Fides's semantic information to optimize in ways LLVM fundament
 
 **Why LLVM can't:** LLVM has no concept of determinism, crash-freedom, gas limits, or medical safety. These are Fides-native annotations.
 
-**Status:** I-4A (compile-time memoization) and I-4E (@wrapping reassociation) implemented. Annotations propagated from AST → IR → L1 → L2. Other I-4 items not yet implemented.
+**Status:** I-4A to I-4E implemented on the PIR path (see the items below). Annotations propagated from AST → IR → L1 → L2.
 
 #### I-4A: @deterministic Memoization ✅ (compile-time)
 - [x] A `@deterministic` function's output depends only on its inputs
@@ -398,7 +406,7 @@ These phases use Fides's semantic information to optimize in ways LLVM fundament
 
 **Why LLVM can't:** LLVM has no linear types. C++ move semantics are a library convention, not a type system feature. Rust has affine types (used at most once) but LLVM doesn't exploit this.
 
-**Status:** Linear types exist (89 references in typechecker), not exploited by optimizer
+**Status:** Linear types exist (89 references in typechecker). I-6A and I-6B implemented on the PIR path; I-6C not started.
 
 #### I-6A: Linear Type Stack Promotion ✅
 - [x] A linear value (used exactly once) has a predictable lifetime — it's created, used, consumed
@@ -426,7 +434,7 @@ These phases use Fides's semantic information to optimize in ways LLVM fundament
 
 **Why LLVM can't:** LLVM has no borrow checker. Rust has one but it's separate from LLVM — the borrow checker proves safety, but the information isn't fully exploited by LLVM's optimizer.
 
-**Status:** Borrow checker complete, not yet feeding the optimizer
+**Status:** Borrow checker complete. I-7A feeds alias facts to the optimizer on the PIR path; I-7B and I-7C not started.
 
 #### I-7A: Borrow-Based Alias Analysis ✅
 - [x] If the borrow checker proves two references don't overlap (one is `&mut`, the other is `&`), they don't alias
@@ -489,17 +497,17 @@ These phases use Fides's semantic information to optimize in ways LLVM fundament
 
 | Phase | Priority | Effort | Why | Status |
 |-------|----------|--------|-----|--------|
-| **F-1** (Regalloc) | 🔴 Critical | Medium | Foundation — everything depends on it | Linear scan exists, bug exists |
+| **F-1** (Regalloc) | 🔴 Critical | Medium | Foundation — everything depends on it | Linear scan on the PIR path, clobber bug fixed (F-1A); `fid emit` has none (7 callee-saved registers) |
 | **F-2** (Loop Vec) | 🔴 Critical | Large | 4-8x for numerical code | SLP done (F64+I64), loop vec partial |
-| **F-3** (Opt Passes) | 🔴 Critical | Medium | Closes the quality gap | 10 passes exist, need 8 more |
+| **F-3** (Opt Passes) | 🔴 Critical | Medium | Closes the quality gap | 23 passes on the PIR path; `fid emit` runs 3 (iropt.fd) |
 | **I-1** (Region Memory) | 🔴 Critical | Medium | **Biggest Fides advantage** — 2x+ over LLVM | Region system exists, not exploited |
 | **I-2** (Effect Opt) | 🟡 High | Medium | 10-20% fewer spills in pure code | Effect-reorder exists, limited |
-| **I-4** (Safety Opt) | 🟡 High | Medium | `@deterministic`/`@gas`/`@crashfree` exploitation | Annotations exist, not exploited |
+| **I-4** (Safety Opt) | 🟡 High | Medium | `@deterministic`/`@gas`/`@crashfree` exploitation | I-4A–I-4E on the PIR path |
 | **I-5** (Comptime) | 🟡 High | Medium | Zero-cost metaprogramming | Comptime exists, can be extended |
 | **F-4** (Backends) | 🟡 High | Large | Multi-arch production quality | x86-64 solid, others partial |
-| **I-3** (Cap Stripping) | 🟡 High | Small | 50-90% smaller binaries | `--caps` exists, needs transitive |
-| **I-6** (Linear Types) | 🟡 High | Medium | Zero heap for linear values | Linear types exist, not exploited |
-| **I-7** (Borrow Opt) | 🟡 High | Medium | Definitive alias info | Borrow checker complete |
+| **I-3** (Cap Stripping) | 🟡 High | Small | 50-90% smaller binaries | `--caps` with transitive DCE (I-3A–I-3C) |
+| **I-6** (Linear Types) | 🟡 High | Medium | Zero heap for linear values | I-6A, I-6B on the PIR path; I-6C open |
+| **I-7** (Borrow Opt) | 🟡 High | Medium | Definitive alias info | I-7A on the PIR path; I-7B, I-7C open |
 | **S-1** (Compile Speed) | 🟢 Medium | Small | Maintain 10x advantage | 2-3x faster than GCC currently |
 | **S-1B** (Incremental) | ✅ Done | Small | Cache L2 per function | `src/inc.rs`, 7 unit tests |
 | **S-1C** (Parallelism) | ✅ Done | Small | Parallel function opts | 19/22 passes parallelized |
@@ -508,9 +516,12 @@ These phases use Fides's semantic information to optimize in ways LLVM fundament
 
 ## Self-Hosting Readiness (Next Major Milestone)
 
-**See `roadmap.md` Phase 10** for blocker status, test baseline, and self-hosting
-readiness details. All 3 language-level blockers (generic Vec<T>, enum payloads,
-recursive Box<T>) are resolved. 164/165 tests pass on interp+C codegen, 165/165 PE.
+**Done (Nov 6, 2026):** the self-hosted compiler `fid` is the release compiler;
+the 3-stage bootstrap reaches a byte-identical fixpoint (49 MB of C). The plan
+below is the original estimate, kept for the record. **See `roadmap.md` Phase 10**
+for history. All 3 language-level blockers (generic Vec<T>, enum payloads,
+recursive Box<T>) are resolved. Last full suite (Nov 2, `fidesc test`):
+interpreter 339/339, C 343/343, PE 345/345, expected-fail 89/89.
 
 ### Estimated Effort to Self-Host
 

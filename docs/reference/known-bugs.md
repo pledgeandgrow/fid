@@ -2,7 +2,10 @@
 
 > Things that have broken before and how to avoid re-introducing them.
 >
-> Last updated: Oct 25, 2026 (session 30: standalone-binary stdlib crash, `cast_arg` `Ptr→Generic` ABI repair, nondeterministic self-hosted typecheck, `cmd /C` quoting fix — see §2d).
+> Last updated: Nov 6, 2026 (§2f: open items and fixes of Nov 4–6). Earlier:
+> Oct 25, 2026 (session 30: standalone-binary stdlib crash, `cast_arg`
+> `Ptr→Generic` ABI repair, nondeterministic self-hosted typecheck, `cmd /C`
+> quoting fix — see §2d).
 
 ---
 
@@ -1177,6 +1180,40 @@ Bugs fixed on the way, so they are not re-introduced:
 
 Not bugs: `test_sqlite` needs libsqlite3 and `examples/minimal_game` needs
 SDL2 (both compilers fail the same way without them).
+
+## 2f. Nov 4–6, 2026 — open items and fixes
+
+The Nov 4–6 changes were checked with `fid run`, `fid ccompile` and
+`fid emit` on their tests. The full suite was last run on Nov 2 (Rust
+harness, `fidesc` as compiler: interp 339/339, C 343/343, PE 345/345,
+expected-fail 89/89) and has not been rerun with the Nov 4–6 compiler.
+
+**Open:**
+
+| # | Item | Status |
+|---|------|--------|
+| 2f.1 | Value semantics (M5, proposal 0001): copy-on-write lowering for `Vec`, `HashMap` and the `Vec` fields of copied structs is written behind `LOWER_COW` (off), with lazy and counted shares. With it on, test programs get value semantics on all backends and the compiler compiling itself reaches its fixpoint (Nov 6), at a peak of 4.7 GB against 1.8 GB off. It is off until the full suite has run with it on; today `var b = a` on a `Vec` aliases. | **OPEN** (works, not yet on) |
+| 2f.2 | Native async/tasks: `fid emit` programs using async or spawn+await crash (`test_async`, `test_async_float_struct`). The interpreter and C are fine. | **OPEN** |
+| 2f.3 | `build --native` (the old PIR path) crashes (same as 2e.10); `fid emit` is the native path. | **OPEN** |
+| 2f.4 | D4: native code keeps values in 7 callee-saved registers (hottest locals, parameters, short-lived temporaries). There is no full register allocator: no cross-block values, caller-saved registers, or floats in xmm. | **OPEN** |
+| 2f.5 | D14/D15: `Vec` elements at their real size, references into containers. | **OPEN** |
+| 2f.6 | F: macOS, native ELF, ARM64, RISC-V and WASM backends are experimental / incomplete. G: bare metal, `emit --bare` panics. | **OPEN** |
+| 2f.7 | J5–J9 (crypto), E5 (`parse-header` on SDL2/SQLite headers). | **OPEN** |
+| 2f.8 | `fid` self-compile is ~6x slower than `fidesc`'s (~133 s vs ~21 s). | **OPEN** |
+| 2f.9 | `fid version` prints `fid 0.1.0` (Cargo.toml 0.1.0) while the release is v1.0.0. | **OPEN** (known inconsistency) |
+| 2f.10 | Written, built into the compiler, not run yet: `fid emit --checked-alloc` (M7), `scripts/sanitize.sh` (M8, needs clang with ASan), `scripts/fuzz/nightly.sh` with the `checked` backend (M9; no CI workflow schedules it). The per-thread free lists of the native runtime (H8) are exercised by every native test, but no multi-thread stress test has been run. | **NOT RUN** |
+| 2f.11 | A literal of a user-defined generic struct is rejected: `struct Pair<A, B> { first: A, second: B }` then `Pair { first: 1, second: "one" }` gives "field 'first' expected A, got i8". Generic functions, generic enums and `impl<T>` work. | **OPEN** |
+| 2f.12 | An `async fn ... -> Future<f64>` returned its result truncated (the function was lowered as returning a word; `fid run` printed 0, C a garbage value). Fixed Nov 6 (`lower.fd`, `lw_body_ret_type`: the body returns the T of `Future<T>`); `async fn half(x: f64) -> Future<f64>` gives 2.5 on the interpreter and C. | **FIXED** |
+
+**Fixed:**
+
+| # | Bug | Status |
+|---|-----|--------|
+| 2f.11 | `HashMap` with integer keys crashed. Integer keys are now stored as `key ^ HM_INT_XOR` (`stdlib/core.fd`), so 0 and -1 are ordinary keys; the two keys that would map to the empty and removed markers (`0x5DEECE66D1234567` and its complement) panic. `test_hashmap_int_keys` on all 3 backends. | **FIXED** |
+| 2f.12 | `p_str_free` misread plain (headerless) strings in native emit. | **FIXED** |
+| 2f.13 | The C runtime's `p_print_float` freed the string from `p_to_str_float` with `free()` instead of `p_free` (`compiler/codegen_c.fd`). The frozen `fidesc` (`src/codegen_c.rs`) still calls `free()`. | **FIXED** in `fid` |
+| 2f.14 | Changing a `Vec` while a `for` loop walks it compiled (bounds-checked, but it could skip or repeat elements). Now rejected (K4, `test_iter_invalidation_fail.fd`). | **FIXED** in `fid` |
+| 2f.15 | A higher-order function got every effect in `fid`, so a `!{}` function could not call it. Its effects are now instantiated from the function passed at each call site (`effects/test_effect_ho_instantiation.fd`). | **FIXED** in `fid` |
 
 ---
 

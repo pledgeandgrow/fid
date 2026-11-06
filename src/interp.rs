@@ -24,6 +24,12 @@ use std::sync::{Arc, Mutex};
 /// Sentinel value returned by p_task_poll when a future is still pending.
 /// Chosen to be unlikely to collide with real values.
 const PENDING_SENTINEL: i64 = i64::MIN + 1;
+/// Sentinel returned by p_task_wait_timeout when the deadline elapses first.
+/// Distinct from PENDING_SENTINEL so callers can tell "not ready yet" apart
+/// from "timed out".
+const TIMEOUT_SENTINEL: i64 = i64::MIN + 2;
+/// Sentinel returned by waits when the awaited task was cancelled (CA7).
+const CANCELLED_SENTINEL: i64 = i64::MIN + 3;
 use smallvec::SmallVec;
 use compact_str::CompactString;
 
@@ -368,6 +374,12 @@ pub struct Interpreter {
     /// Phase A1: Task done flags — maps future index to whether the thread has
     /// completed (for non-blocking p_task_poll). Set by the thread before exit.
     task_done: Arc<Mutex<HashMap<usize, bool>>>,
+    /// CA9: panic message per future index — when a task dies, every task that
+    /// awaits it sees `task #N panicked: msg`, so the await chain surfaces.
+    task_panics: Arc<Mutex<HashMap<usize, String>>>,
+    /// CA7: cancelled future indices — waits on a cancelled task return
+    /// CANCELLED_SENTINEL instead of blocking.
+    task_cancelled: Arc<Mutex<HashMap<usize, bool>>>,
     /// Debug hook — called before each instruction execution.
     /// If it returns Some(outcome), that outcome replaces the instruction's
     /// normal execution. If None, the instruction executes normally.
@@ -552,6 +564,8 @@ impl Interpreter {
             ecs_components: HashMap::new(),
             executors: Vec::new(),
             task_done: Arc::new(Mutex::new(HashMap::new())),
+            task_panics: Arc::new(Mutex::new(HashMap::new())),
+            task_cancelled: Arc::new(Mutex::new(HashMap::new())),
             debug_hook: None,
             trace: Vec::new(),
             recording: false,
@@ -5453,17 +5467,20 @@ impl Interpreter {
                 thread_values.extend(thread_args);
 
                 // Run eagerly in the current interpreter (preserves Vec side-table access)
+                // CA9: record a task panic so awaiters see "task #N panicked: msg"
+                // instead of silently getting 0 — the panic walks the await chain.
+                let mut panic_msg: Option<String> = None;
                 let result = if let Some(func) = self.module.functions.get(&func_name).cloned() {
                     match self.run_function(&func, &thread_values) {
                         RunResult::Return(v) => v,
                         RunResult::Panic(msg) => {
-                            eprintln!("Thread panic: {}", msg);
+                            panic_msg = Some(msg);
                             Value::Int(0)
                         }
                         RunResult::Paused => Value::Int(0),
                     }
                 } else {
-                    eprintln!("Thread: unknown function '{}'", func_name);
+                    panic_msg = Some(format!("unknown task function '{}'", func_name));
                     Value::Int(0)
                 };
 
@@ -5471,6 +5488,9 @@ impl Interpreter {
                 // Its slot comes last: the function may have made futures of its own.
                 let future_idx = self.futures.len();
                 self.futures.push(FutureState::Ready(result));
+                if let Some(msg) = panic_msg {
+                    self.task_panics.lock().unwrap().insert(future_idx, msg);
+                }
                 ExecOutcome::Value(Value::Future(future_idx))
             }
 
@@ -5798,6 +5818,52 @@ impl Interpreter {
                             }
                         } else {
                             ExecOutcome::Value(Value::Int(PENDING_SENTINEL))
+                        }
+                    }
+                }
+            }
+
+            "p_task_wait_timeout" => {
+                // p_task_wait_timeout(future, ms) -> i64
+                // CA8: poll the future until it is ready or `ms` elapses.
+                // Returns the task's value, or TIMEOUT_SENTINEL on expiry.
+                let idx = match args.first() {
+                    Some(Value::Future(idx)) => *idx,
+                    Some(Value::Int(n)) => *n as usize,
+                    _ => return ExecOutcome::Panic("task_wait_timeout: not a Future value".to_string()),
+                };
+                let ms = match args.get(1) {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                if idx >= self.futures.len() {
+                    return ExecOutcome::Panic(format!("task_wait_timeout: invalid handle {}", idx));
+                }
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(ms.max(0) as u64);
+                loop {
+                    match &self.futures[idx] {
+                        FutureState::Ready(v) => break ExecOutcome::Value(v.clone()),
+                        FutureState::Pending(_) => {
+                            let done = self.task_done.lock().unwrap()
+                                .get(&idx).copied().unwrap_or(false);
+                            if done {
+                                if let FutureState::Pending(Some(handle)) =
+                                    std::mem::replace(&mut self.futures[idx], FutureState::Ready(Value::Int(0)))
+                                {
+                                    let v = match handle.join() {
+                                        Ok(n) => Value::Int(n),
+                                        Err(_) => Value::Int(0),
+                                    };
+                                    self.futures[idx] = FutureState::Ready(v.clone());
+                                    self.task_done.lock().unwrap().insert(idx, true);
+                                    break ExecOutcome::Value(v);
+                                }
+                            }
+                            if std::time::Instant::now() >= deadline {
+                                break ExecOutcome::Value(Value::Int(TIMEOUT_SENTINEL));
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(1));
                         }
                     }
                 }

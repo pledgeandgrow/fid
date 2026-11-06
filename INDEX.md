@@ -4,15 +4,15 @@
 > directory, with a one-line description. Use this to find anything fast.
 >
 > **Fides is self-hosted and released (v1.0.0).** The primary compiler is in `compiler/*.fd`
-> (54 modules, 104,439 LOC). The Rust source in `src/*.rs` (55 files, 100,935 LOC) is the
-> bootstrap reference implementation, used when changing compiler internals.
+> (61 modules, ~134K lines). The Rust source in `src/*.rs` (57 files, ~113K lines) is the
+> bootstrap reference implementation, frozen: it builds stage 1 and runs the test harness.
 > The self-hosted compiler is the release compiler (`release/fid.exe`,
-> shipped as `fid.exe`); its `run` and `ccompile` match `fidesc` on the
-> test programs (see `AGENTS.md` → Known Bugs #1 for the exceptions).
+> shipped as `fid.exe`) and defines the language:
+> [docs/reference/reference.md](docs/reference/reference.md).
 >
-> **Stats:** 54 self-hosted `.fd` compiler modules (~105K LOC) · 55 `.rs` bootstrap files (~101K LOC) ·
-> 104 stdlib modules (30,446 LOC) · 348 `.fd` test files (302 bootstrap + 46 selfhost) · 10 examples · 4 binaries.
-> Fixpoint: VERIFIED byte-for-byte (stage 2 == stage 3, ~38 MB of C; checked by `RELEASE=1 scripts/bootstrap.sh`).
+> **Stats (Nov 6; exact figures in [CURRENT.md → Numbers](CURRENT.md#numbers)):** 61 self-hosted `.fd` compiler modules (~134K lines) · 57 `.rs` bootstrap files (~113K lines) ·
+> 137 stdlib modules (~44K lines) · 452 `.fd` tests in `tests/bootstrap/` (493 with its subfolders) + 51 in `tests/selfhost/` · 10 examples · 4 binaries.
+> Fixpoint: VERIFIED byte-for-byte (stage 2 == stage 3, 49 MB of C, Nov 6; checked by `RELEASE=1 scripts/bootstrap.sh`).
 > v1.0.0 released Sep 9, 2026 with Windows installer (Fides-Setup-1.0.0.exe, 2.5 MB).
 
 ---
@@ -101,7 +101,7 @@ and `AGENTS.md` first when working on the compiler.
 
 ## Self-Hosted Compiler (compiler/) — PRIMARY
 
-> **This is the primary compiler.** 54 Fides modules (~105K LOC) that compile
+> **This is the primary compiler.** 61 Fides modules (~134K lines) that compile
 > themselves to byte-identical C across generations (bootstrap fixpoint
 > verified, stage 2 == stage 3). The release build
 > (`RELEASE=1 scripts/bootstrap.sh` → `release/fid.exe`) is what the
@@ -110,48 +110,48 @@ and `AGENTS.md` first when working on the compiler.
 
 | File | LOC | Description |
 |------|----:|-------------|
-| [main.fd](../compiler/main.fd) | 2,267 | CLI entry point (command dispatch: run, dump-c, ccompile, fmt, lsp, codegen, build-x86, gpu, wasm, parse-header, …) |
+| [main.fd](../compiler/main.fd) | 2,783 | CLI entry point (command dispatch: run, dump-c, ccompile, fmt, lsp, codegen, build-x86, gpu, wasm, parse-header, …) |
 | [token.fd](../compiler/token.fd) | 564 | Token kind definitions (Yield tag = 136) |
-| [lexer.fd](../compiler/lexer.fd) | 921 | Tokenizer: source text → tokens |
-| [parser.fd](../compiler/parser.fd) | 5,472 | Recursive descent parser: tokens → AST (f-string sub-parse still stubbed) |
-| [ast.fd](../compiler/ast.fd) | 1,278 | AST node definitions: Expr, Stmt, Func, StructDef, EnumDef, etc. |
-| [typechecker.fd](../compiler/typechecker.fd) | 8,300 | Type checking + capability + effect + region + sandbox enforcement (verify layer is permissive) |
-| [borrowck.fd](../compiler/borrowck.fd) | 2,093 | Borrow checker (NLL, field-wise, two-phase, off/warn/on modes) |
-| [escape.fd](../compiler/escape.fd) | 1,502 | Reference escape analysis — second-class references (session 29) |
-| [mono.fd](../compiler/mono.fd) | 2,643 | Generic monomorphization |
-| [ir.fd](../compiler/ir.fd) | 2,640 | SSA IR definitions + verify + dead-function elimination |
-| [lower.fd](../compiler/lower.fd) | 7,059 | AST → SSA IR lowering |
+| [lexer.fd](../compiler/lexer.fd) | 967 | Tokenizer: source text → tokens |
+| [parser.fd](../compiler/parser.fd) | 5,643 | Recursive descent parser: tokens → AST (f-string sub-parse still stubbed) |
+| [ast.fd](../compiler/ast.fd) | 1,289 | AST node definitions: Expr, Stmt, Func, StructDef, EnumDef, etc. |
+| [typechecker.fd](../compiler/typechecker.fd) | 11,449 | Type checking + capability + effect + region + sandbox enforcement (verify layer is permissive) |
+| [borrowck.fd](../compiler/borrowck.fd) | 2,147 | Borrow checker (NLL, field-wise, two-phase, off/warn/on modes) |
+| [escape.fd](../compiler/escape.fd) | 1,538 | Reference escape analysis — second-class references (session 29) |
+| [mono.fd](../compiler/mono.fd) | 2,880 | Generic monomorphization |
+| [ir.fd](../compiler/ir.fd) | 2,688 | SSA IR definitions + verify + dead-function elimination |
+| [lower.fd](../compiler/lower.fd) | 9,326 | AST → SSA IR lowering |
 | [pir.fd](../compiler/pir.fd) | 2,704 | PIR (L1/L2/L3) transforms |
-| [opt.fd](../compiler/opt.fd) | 7,763 | PIR optimizer (~19 passes; Licm/EscapeAnalysis absent) |
-| [peephole.fd](../compiler/peephole.fd) | 1,150 | 9-pass peephole optimizer (always on in `build`) |
+| [opt.fd](../compiler/opt.fd) | 7,764 | PIR optimizer (~19 passes; Licm/EscapeAnalysis absent) |
+| [peephole.fd](../compiler/peephole.fd) | 1,151 | 9-pass peephole optimizer (always on in `build`) |
 | [regalloc.fd](../compiler/regalloc.fd) | 1,354 | Linear scan register allocator (remat, effect-aware clobbers) |
-| [codegen_c.fd](../compiler/codegen_c.fd) | 5,922 | C codegen backend (IR → .c); cast_arg Ptr→Generic deref added session 30 |
+| [codegen_c.fd](../compiler/codegen_c.fd) | 7,681 | C codegen backend (IR → .c); cast_arg Ptr→Generic deref added session 30 |
 | [codegen_x64.fd](../compiler/codegen_x64.fd) | 2,000 | x86-64 native codegen (L3 → asm; float-ABI regression documented) |
 | [codegen_arm64.fd](../compiler/codegen_arm64.fd) | 553 | ARM64 codegen (--target arm64; slot/immediate regressions documented) |
 | [codegen_riscv.fd](../compiler/codegen_riscv.fd) | 554 | RISC-V codegen (--target riscv; same class of issues) |
 | [codegen.fd](../compiler/codegen.fd) | 1,497 | Legacy AST→ARM64 codegen — dead module |
 | [x86.fd](../compiler/x86.fd) | 1,779 | x86-64 MASM-style backend (build-x86) |
 | [elf64.fd](../compiler/elf64.fd) | 2,780 | ELF64 emitter + full x86-64 instruction encoder |
-| [pe.fd](../compiler/pe.fd) | 6,852 | PE format writer — consumes codegen_x64 asm (D1 refactor) |
+| [pe.fd](../compiler/pe.fd) | 6,857 | PE format writer — consumes codegen_x64 asm (D1 refactor) |
 | [coff.fd](../compiler/coff.fd) | 426 | COFF object writer (format-only, shares x86 encoders) |
 | [macho.fd](../compiler/macho.fd) | 445 | Mach-O object writer (format-only, shares x86 encoders) |
 | [linker.fd](../compiler/linker.fd) | 1,077 | ELF relocator/linker |
-| [runtime.fd](../compiler/runtime.fd) | 531 | Fides-authored runtime scaffold (rt_sys_* ABI; not yet wired) |
+| [runtime.fd](../compiler/runtime.fd) | 546 | Fides-authored runtime scaffold (rt_sys_* ABI; not yet wired) |
 | [runtime_linux.fd](../compiler/runtime_linux.fd) | 4,399 | x86-64 Linux runtime — hand-encoded syscalls |
-| [runtime_arm64.fd](../compiler/runtime_arm64.fd) | 799 | ARM64 Linux runtime |
+| [runtime_arm64.fd](../compiler/runtime_arm64.fd) | 800 | ARM64 Linux runtime |
 | [runtime_riscv.fd](../compiler/runtime_riscv.fd) | 827 | RISC-V Linux runtime |
-| [arm64_enc.fd](../compiler/arm64_enc.fd) | 1,851 | ARM64 instruction encoder (asm text → machine code) |
+| [arm64_enc.fd](../compiler/arm64_enc.fd) | 1,854 | ARM64 instruction encoder (asm text → machine code) |
 | [riscv_enc.fd](../compiler/riscv_enc.fd) | 1,191 | RISC-V (RV64) instruction encoder |
-| [comptime_eval.fd](../compiler/comptime_eval.fd) | 1,633 | Compile-time evaluation engine |
-| [compiler.fd](../compiler/compiler.fd) | 3,078 | Pipeline orchestration |
-| [flat_ast.fd](../compiler/flat_ast.fd) | 1,311 | Flat AST serialization (wired: dump-ast-flat) |
+| [comptime_eval.fd](../compiler/comptime_eval.fd) | 2,120 | Compile-time evaluation engine |
+| [compiler.fd](../compiler/compiler.fd) | 4,315 | Pipeline orchestration |
+| [flat_ast.fd](../compiler/flat_ast.fd) | 1,316 | Flat AST serialization (wired: dump-ast-flat) |
 | [diag.fd](../compiler/diag.fd) | 659 | Diagnostics with error codes (dead — call sites dropped) |
 | [fmt.fd](../compiler/fmt.fd) | 1,179 | Source code formatter (known corruption bugs — see file-analysis) |
 | [json.fd](../compiler/json.fd) | 666 | JSON parser/serializer |
 | [lsp.fd](../compiler/lsp.fd) | 1,082 | Language Server Protocol |
-| [inc.fd](../compiler/inc.fd) | 166 | Incremental compilation cache (in-memory) |
+| [inc.fd](../compiler/inc.fd) | 742 | Incremental compilation cache (in-memory) |
 | [ark.fd](../compiler/ark.fd) | 761 | Self-hosted Ark package manager |
-| [scribe.fd](../compiler/scribe.fd) | 986 | Documentation generator |
+| [scribe.fd](../compiler/scribe.fd) | 989 | Documentation generator |
 | [veil.fd](../compiler/veil.fd) | 516 | Coverage tool (debug-hook dependent — 0% known issue) |
 | [wasm.fd](../compiler/wasm.fd) | 1,656 | WASM backend |
 | [gpu.fd](../compiler/gpu.fd) | 826 | SPIR-V/PTX GPU backend (stubs live but broken) |
@@ -161,9 +161,17 @@ and `AGENTS.md` first when working on the compiler.
 | [green_thread.fd](../compiler/green_thread.fd) | 207 | Green-thread scheduler (interp only; C backend lacks p_gt_*) |
 | [debugger.fd](../compiler/debugger.fd) | 977 | IR debugger (dead — `debug` not dispatched) |
 | [native_debugger.fd](../compiler/native_debugger.fd) | 544 | ptrace debugger skeleton (dead — ptrace missing) |
-| [hotreload.fd](../compiler/hotreload.fd) | 635 | Hot reload watcher (decoy — `watch`→bench alias) |
+| [hotreload.fd](../compiler/hotreload.fd) | 636 | Hot reload watcher (decoy — `watch`→bench alias) |
 | [cparser.fd](../compiler/cparser.fd) | 492 | C header parser → FFI bindings (parse-header) |
-| **Total** | **104,439** | **54/54 modules — all type-check; fixpoint verified** |
+| [interp.fd](../compiler/interp.fd) | 7,222 | IR interpreter (`fid run`), the self-hosted twin of interp.rs |
+| [pe_ir.fd](../compiler/pe_ir.fd) | 3,102 | Native Windows backend: IR → x86-64 machine code (`fid emit`) |
+| [pe_ir_enc.fd](../compiler/pe_ir_enc.fd) | 2,279 | x86-64 instruction encoder for the native backend |
+| [pe_ir_stubs.fd](../compiler/pe_ir_stubs.fd) | 5,539 | Runtime stubs and `p_*` builtins for native executables |
+| [checks.fd](../compiler/checks.fd) | 564 | Counted-loop analysis: drops provably safe bounds/overflow checks (shared by C and native) |
+| [secrecy.fd](../compiler/secrecy.fd) | 953 | `@secret` information-flow check: secrets cannot reach output sinks |
+| [iropt.fd](../compiler/iropt.fd) | 434 | IR optimizer for the native path: inlining of small functions, constant folding, dead code |
+| [cowcheck.fd](../compiler/cowcheck.fd) | 412 | Copy-on-write migration report (`FIDES_COW_CHECK=1`): changes that only reach their place through a shared `Vec` |
+| **Total** | **133,688** | **61/61 modules — all type-check; fixpoint verified** (line counts of the working tree, Nov 6; per-module counts above are from Nov 3) |
 
 ---
 
@@ -270,7 +278,7 @@ Specialized subsystems: embedded, hot reload, autograd, tensor, debugger, tools.
 
 ## Standard Library (stdlib/)
 
-104 Fides source modules (30,446 LOC). `core.fd` is auto-included by the
+136 Fides source modules (~43K lines). `core.fd` is auto-included by the
 compiler; others are imported via `use`. The table below lists the
 foundational modules — the full set (including the session-21 game/media
 batch and the industry modules) is in `stdlib/`; per-module docs live in

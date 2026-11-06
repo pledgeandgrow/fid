@@ -1,0 +1,65 @@
+// A window with a moving square, on the raw SDL2 API that `fid parse-header`
+// generated (stdlib/sdl2_h.fd). Builds with no C compiler:
+//   fid emit examples/sdl_window.fd -o sdl_window.exe
+// and needs SDL2.dll beside it or on PATH when it runs (without it, the first
+// SDL call stops the program with a message naming SDL2.dll).
+// Closes after three seconds, or on Escape or the close button.
+use sdl2_h;
+
+@unsafe
+fn main() -> i64 {
+    if SDL_Init(SDL_INIT_VIDEO) != 0 {
+        println("SDL_Init failed: " + SDL_GetError());
+        return 1;
+    }
+    var win: i64 = SDL_CreateWindow("Fides + SDL2", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        640, 480, SDL_WINDOW_SHOWN);
+    if win == 0 {
+        println("SDL_CreateWindow failed: " + SDL_GetError());
+        return 1;
+    }
+    var ren: i64 = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+    // An SDL_Rect (four ints) and an SDL_Event (56 bytes) in raw memory
+    var rect: i64 = p_malloc(16);
+    var event: i64 = p_malloc(64);
+    var rx: *mut i32 = rect;
+    var a4: i64 = rect + 4;
+    var a8: i64 = rect + 8;
+    var a12: i64 = rect + 12;
+    var ry: *mut i32 = a4;
+    var rw: *mut i32 = a8;
+    var rh: *mut i32 = a12;
+    *ry = 200; *rw = 80; *rh = 80;
+    var start: u32 = SDL_GetTicks();
+    var running: bool = true;
+    while running {
+        while SDL_PollEvent(event) != 0 {
+            var etype: *mut u32 = event;
+            var ev: u32 = *etype;
+            var kind: i64 = ev as i64;
+            if kind == SDL_QUIT { running = false; }
+            if kind == SDL_KEYDOWN {
+                // SDL_KeyboardEvent: the scancode is at offset 16
+                var ea: i64 = event + 16;
+                var scan: *mut i32 = ea;
+                var sc: i32 = *scan;
+                if (sc as i64) == SDL_SCANCODE_ESCAPE { running = false; }
+            }
+        }
+        var t: i64 = (SDL_GetTicks() as i64) - (start as i64);
+        if t > 3000 { running = false; }
+        *rx = ((t / 5) % 560) as i32;
+        SDL_SetRenderDrawColor(ren, 20, 20, 40, 255);
+        SDL_RenderClear(ren);
+        SDL_SetRenderDrawColor(ren, 240, 180, 40, 255);
+        SDL_RenderFillRect(ren, rect);
+        SDL_RenderPresent(ren);
+        SDL_Delay(16);
+    }
+    p_free(rect);
+    p_free(event);
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    SDL_Quit();
+    return 0;
+}

@@ -3270,7 +3270,7 @@ impl TypeChecker {
             let mut taint_map: HashMap<String, TaintState> = HashMap::new();
             for param in &func.params {
                 let is_tainted = param.annotations.iter().any(|a| a.name == "tainted");
-                let is_secret = param.annotations.iter().any(|a| a.name == "secret");
+                let is_secret = param.annotations.iter().any(|a| a.name == "secret" || a.name == "sensitive");
                 taint_map.insert(
                     param.name.clone(),
                     if is_tainted { TaintState::Tainted }
@@ -3445,10 +3445,10 @@ impl TypeChecker {
                     .find(|f| f.name == *callee)
                     .map(|f| f.params.iter().any(|p| p.annotations.iter().any(|a| a.name == "tainted")))
                     .unwrap_or(false);
-                // Check if the callee has @secret params (transitive secret)
+                // Check if the callee has @secret/@sensitive params (transitive secret)
                 let callee_has_secret = program.funcs.iter()
                     .find(|f| f.name == *callee)
-                    .map(|f| f.params.iter().any(|p| p.annotations.iter().any(|a| a.name == "secret")))
+                    .map(|f| f.params.iter().any(|p| p.annotations.iter().any(|a| a.name == "secret" || a.name == "sensitive")))
                     .unwrap_or(false);
                 if any_tainted || callee_has_tainted {
                     TaintState::Tainted
@@ -4190,10 +4190,10 @@ impl TypeChecker {
         }
         if self.strict_caps && !self.granted_caps.contains(cap) {
             self.errors.push(format!(
-                "Capability error: '{}' requires '{}' capability (not granted to module '{}').\n\
+                "Capability error (line {}): '{}' requires '{}' capability (not granted to module '{}').\n\
                  \x20\x20\x20\x20Fix: add `use {} with {{ {} }}` at the top of the file to grant \
                  the '{}' capability to this module.",
-                context, cap, self.current_module,
+                self.current_line, context, cap, self.current_module,
                 self.current_module, cap, cap
             ));
             // Mark the current function as not capability-verified
@@ -5002,12 +5002,18 @@ impl TypeChecker {
                         if self.freed_regions.contains(region) {
                             self.errors.push(format!(
                                 "Region error: use-after-free — variable '{}' was in region '{}' \
-                                 which has been freed",
-                                target, region
+                                 which has been freed.\n\
+                                 \x20\x20\x20\x20The `region {} {{ ... }}` block already ended, so every \
+                                 value allocated inside it was freed.\n\
+                                 \x20\x20\x20\x20Fix: move this assignment inside the region block, or \
+                                 re-create '{}' outside the region if it must outlive it.",
+                                target, region, region, target
                             ));
                         } else {
                             self.errors.push(format!(
-                                "Type error: cannot assign to undefined variable '{}'",
+                                "Type error: cannot assign to undefined variable '{}'.\n\
+                                 \x20\x20\x20\x20Fix: declare it first with `val {0} = ...` or `var {0} = ...`, \
+                                 or check the name for a typo.",
                                 target
                             ));
                         }
@@ -5779,11 +5785,11 @@ impl TypeChecker {
                             }
                         } else {
                             self.errors.push(format!(
-                                "Type error: arithmetic requires numeric types.\n\
+                                "Type error: arithmetic requires numeric types ({}:{}).\n\
                                  \x20\x20\x20\x20Left operand:  {}\n\
                                  \x20\x20\x20\x20Right operand: {}\n\
                                  \x20\x20\x20\x20Fix: convert one or both operands to a numeric type (i8, i16, i32, i64, u8, u16, u32, u64, f32, f64).",
-                                lt, rt
+                                self.current_module, self.current_line, lt, rt
                             ));
                             Type::Never
                         }
@@ -5995,12 +6001,11 @@ impl TypeChecker {
                         if arg_types.len() >= 2 {
                             if !self.is_send_type(&arg_types[1]) {
                                 self.errors.push(format!(
-                                    "Thread safety error: p_thread_spawn argument of type {}\
-                                     \n             is not @send.\
-                                     \n             Only @send types can be safely sent across threads.\
-                                     \n             Fix: add @send to the struct definition, or pass only\
-                                     \n             @send types (primitives, @send structs, Vec, HashMap).",
-                                    arg_types[1]
+                                    "Thread safety error (line {}): p_thread_spawn argument of type {} \
+                                     cannot cross a thread — it is not @send.\
+                                     \n             Fix: add @send to its struct, or send a primitive, \
+                                     Vec, HashMap or @send struct instead.",
+                                    self.current_line, arg_types[1]
                                 ));
                             }
                         }
@@ -6010,12 +6015,11 @@ impl TypeChecker {
                         if arg_types.len() >= 2 {
                             if !self.is_send_type(&arg_types[1]) {
                                 self.errors.push(format!(
-                                    "Thread safety error: p_chan_send value of type {}\
-                                     \n             is not @send.\
-                                     \n             Only @send types can be safely sent through channels.\
-                                     \n             Fix: add @send to the struct definition, or send only\
-                                     \n             @send types (primitives, @send structs, Vec, HashMap).",
-                                    arg_types[1]
+                                    "Thread safety error (line {}): p_chan_send value of type {} \
+                                     cannot cross a thread — it is not @send.\
+                                     \n             Fix: add @send to its struct, or send a primitive, \
+                                     Vec, HashMap or @send struct instead.",
+                                    self.current_line, arg_types[1]
                                 ));
                             }
                         }
@@ -7471,14 +7475,12 @@ impl TypeChecker {
                 for (var_name, var_ty) in &captured {
                     if !self.is_send_type(var_ty) {
                         self.errors.push(format!(
-                            "Thread safety error (line 0): spawn captures variable '{}' of type {}\
-                             \n             which is not @send.\
-                             \n             Only @send types can be safely sent across threads.\
-                             \n             Non-@send types include references (&T), raw pointers (*mut T),\
-                             \n             and structs not annotated with @send.\
-                             \n             Fix: add @send to the struct definition, or avoid capturing\
-                             \n             this variable in the spawn expression.",
-                            var_name, var_ty
+                            "Thread safety error (line {}): `spawn` captures '{}' of type {}, \
+                             which cannot cross a thread — it is not @send.\
+                             \n             Fix: add @send to its struct, pass a copy, or move \
+                             the read inside the spawned function.\
+                             \n             (references, raw pointers and unannotated structs are not @send)",
+                            self.current_line, var_name, var_ty
                         ));
                     }
                 }
@@ -9900,6 +9902,7 @@ pub fn enforced_annotations() -> &'static [&'static str] {
         "adapter",
         "tainted",
         "secret",
+        "sensitive",
         "allocator",
     ]
 }
@@ -9925,8 +9928,9 @@ fn annotation_targets(name: &str) -> Option<&'static [&'static str]> {
         "cfg" => &["fn", "struct"],
         // Parameter annotations.
         "tainted" | "public" => &["param"],
-        // @secret marks data: params, locals, or a fn whose result is secret.
-        "secret" => &["fn", "param", "local"],
+        // @secret/@sensitive mark data: params, locals, or a fn whose result
+        // is secret/consent-gated.
+        "secret" | "sensitive" => &["fn", "param", "local"],
         // Local val/var annotations.
         "zeroize" => &["local"],
         // Module-level global annotations.
@@ -10676,6 +10680,7 @@ fn expand_annotations(annotations: &[Annotation]) -> HashSet<&'static str> {
                 "simd" => { /* F23: @simd — recognized but no safety primitives */ }
                 "zeroize" => { /* F88: @zeroize — recognized but no safety primitives */ }
                 "secret" => { /* F74: @secret — recognized but no safety primitives */ }
+                "sensitive" => { /* CO7: @sensitive — consent-gated info flow (secrecy.rs) */ }
                 "declassify" => { /* audited release of @secret values (secrecy.rs) */ }
                 "interrupt" => { /* F29: @interrupt — recognized but no safety primitives */ }
                 _ => {}

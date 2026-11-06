@@ -2,6 +2,39 @@
 
 > Consolidated 2026-10-24 from roadmap/, features-roadmap, release-roadmap, selfhost-roadmap, roadmap-issues, roadmap-limitations, opportunities.
 
+## Current status (Nov 6, 2026)
+
+The sections below are history. What is true now:
+
+- `fid` (self-hosted, `compiler/*.fd`, 61 modules, 133,688 lines) is the
+  release compiler. The 3-stage bootstrap reaches a byte-identical fixpoint
+  (stage 2 C == stage 3 C, 49 MB). `fidesc` (Rust, `src/*.rs`, 57 files) is
+  frozen: it builds stage 1 and runs the test harness.
+- Release v1.0.0 (Sep 9, 2026). `fid version` still prints `fid 0.1.0`. Work
+  since v1.0.0 is uncommitted on `main`.
+- Backends: interpreter (`fid run`), C (`fid ccompile`), native Windows x64
+  (`fid emit`, no C compiler). Linux x64 through C. ARM64, RISC-V, WASM,
+  macOS, native ELF and bare metal are experimental or incomplete.
+- Last full suite: Nov 2 (`fidesc test`): interpreter 339/339, C 343/343, PE
+  345/345, expected-fail 89/89. Not rerun with the Nov 4–6 compiler.
+- Self-compile: about 133 s (`fidesc`: about 21 s).
+- Done in `fid` on Nov 4–6: generics with inference, checked bounds and
+  turbofish (proposal 0002); `if`/`match` as expressions; `@cfg`; frees of
+  `Vec`/`HashMap` locals, owned elements, region collections and string
+  temporaries; iterator invalidation and the K5 borrow gaps rejected; the
+  effect table for runtime IO calls; `@send` on every spawn argument;
+  `parallel` branches on threads; `async fn` with `f64` or struct values as a
+  task (interpreter and C); 17 safety rules with negative tests and
+  `fid qualify`; owned and borrowed strings; `HashMap` with integer keys.
+- Not done: copy-on-write value semantics (`LOWER_COW` off: `var b = a` on a
+  `Vec` aliases); native `async` (crashes under `fid emit`); `build --native`
+  (crashes); a full register allocator on the native path; `emit --bare`
+  (panics). Written Nov 4 but not run: `fid emit --checked-alloc`,
+  `scripts/sanitize.sh`, `scripts/fuzz/nightly.sh`.
+
+Current plans: `release-roadmap.md`, `competitive-roadmap.md`,
+`complaint-roadmap.md`.
+
 
 ## Milestones
 
@@ -20,7 +53,7 @@ Phase 4: Performance         ← MOSTLY COMPLETE — optimizer + LTO + loop-vec 
 Phase 5: Platform            ← MOSTLY COMPLETE — cross-compilation to ARM64/RISC-V/Windows done; DWARF debug info ELF integration DONE (compiler/dwarf.fd + elf64.fd emit .debug_info/.debug_abbrev/.debug_line/.debug_str sections)
 Phase 6: AI/ML               ← COMPLETE — pipeline, layers, shapes, GPU, quantization, KV cache, DP (epsilon budget tracking), sharding (simulated multi-rank), tape-based autodiff (runtime gradient computation), gradient checkpointing (activation recompute)
 Phase 7: Ergonomics          ← MOSTLY COMPLETE — guard, spread, ?., ??, is, contracts, @memo; @differentiable typecheck + runtime autograd done
-Phase 7.5: Tier 1 Safety     ← COMPLETE — all safety annotations enforced; @tainted propagation DONE (full data-flow taint tracking with sanitizer/sink recognition), @constant_time + @tainted effect checks done; @secret info-flow control DONE (F74: secret lattice, output sink rejection, return flow checks — ported to self-hosted compiler/interp.fd + typechecker.fd); @zeroize DONE (F88: compiler-inserted memset at scope exit, @zeroize on let bindings fully wired through AST→parser→lowerer→emit_zeroize); @firmware DONE (F30: OS-dep call rejection — ported to self-hosted typechecker.fd)
+Phase 7.5: Tier 1 Safety     ← COMPLETE — all safety annotations enforced (Nov 6: 17 rules in fid, each with a negative test, docs/reference/safety-rules.md); @tainted propagation DONE in fidesc only (full data-flow taint tracking with sanitizer/sink recognition; fid: a @tainted function or parameter reaches no IO/Net effect), @constant_time + @tainted effect checks done; @secret info-flow control DONE (F74: secret lattice, output sink rejection, return flow checks — ported to self-hosted compiler/interp.fd + typechecker.fd); @zeroize DONE (F88: compiler-inserted memset at scope exit, @zeroize on let bindings fully wired through AST→parser→lowerer→emit_zeroize); @firmware DONE (F30: OS-dep call rejection — ported to self-hosted typechecker.fd)
 Phase 7.55: Borrow Checker   ← COMPLETE — Rules 1-3, field-wise, two-phase, NLL, default on; @send/@sync DONE (parsed on structs, is_send_type/is_sync_type enforced at p_thread_spawn/p_chan_send/spawn capture sites in both Rust + self-hosted typecheckers)
 Phase 7.6: Async/Await       ← MOSTLY COMPLETE — executor, non-blocking poll, async IO, channels, select; state machine transform (parser has parse_state_machine, lower doesn't use it); PE stack traces DONE (p_panic prints message + minimal stack walker, stack alignment fixed)
 Phase 8A: Vec/Mat Math        ← COMPLETE — vec2/vec3/vec4, mat4, quat, swizzle, operator overloading, shape checking
@@ -28,12 +61,12 @@ Phase 8B: ECS/States/Events   ← COMPLETE — component/system/query, state_mac
 Phase 8C: Shaders/SIMD       ← PARTIAL — SIMD stdlib (59 LOC stub) + SPIR-V GPU codegen (826 LOC); @simd annotation DONE (loop vectorization with wider vectors for AVX/AVX2); @shader annotation DONE (alias for @kernel, sets is_kernel for SPIR-V/PTX entry point); compute shaders via @shader/@kernel + `fidesc gpu --target spirv|ptx`; GPU/WASM CLI wiring done
 Phase 8D: Game Stdlib         ← COMPLETE — 26 game stdlib modules, 9,140 LOC (session 21)
 Phase 9: Industry Domains    ← NOT STARTED — only stdlib/banking.fd exists; medical/blockchain/robotics/automotive not built
-Phase 10: Self-Hosting       ← COMPLETE — the self-hosted compiler is the release compiler (Oct 25–27, 2026: release bootstrap with fixpoint check; `run` matches fidesc on 302/302 tests, `ccompile` on 242/243; installer ships it as fid.exe). 52 modules, 100,934 LOC. 38/38 self-host tests pass. Bootstrap fixpoint VERIFIED byte-for-byte (fides-c4.c == fides-c5.c, 29,763,762 bytes). Self-compilation SIGSEGV FIXED (struct global C codegen + SDL false-positive detection + time.fd syntax). 7 Rust-to-Fides gaps closed (str_substring, is_lto_mode, DynCall/TryUnwrap, x86.fd, 19 CLI commands, interp autograd/PRNG, runtime_linux TODOs). v1.0.0 installer released.
-Phase 10B: PE Emitter Rewrite ← PARTIAL — the self-hosted native path (`build --native`: PIR → x86-64 → pe.fd) crashes on every program (Oct 27); next step: port src/pe.rs + src/pe_runtime/ and check byte-for-byte against `fidesc emit`, for a bootstrap with no C compiler. compiler/pe.fd exists (6,800+ LOC, ported from src/pe.rs). Not a from-scratch rewrite. @cpu_local + inline asm clobbers implemented. Full bare-metal stubs ported (p_lidt, p_idt_set_entry, p_lgdt, p_gdt_set_entry, p_cr0/cr4 read/write, p_invlpg, p_page_map/unmap, p_phys_read64/write64, p_inl/outl, p_memset). Issue 67 (val-in-loop) FIXED via L1B regalloc; Issue 68 (str_split) FIXED (p_string_split + Vec known type); Issue 69 (recursive Box<T>) FIXED (Store memcpy for struct types). Serial stubs (p_serial) now always generated. Full parity with Rust reference not verified.
+Phase 10: Self-Hosting       ← COMPLETE — the self-hosted compiler is the release compiler (Oct 25–27, 2026: release bootstrap with fixpoint check; `run` matches fidesc on 302/302 tests, `ccompile` on 242/243; installer ships it as fid.exe). Nov 6: 61 modules, 133,688 lines; 3-stage fixpoint, 49 MB of C (was 52 modules, 100,934 LOC). 38/38 self-host tests pass. Bootstrap fixpoint VERIFIED byte-for-byte (fides-c4.c == fides-c5.c, 29,763,762 bytes). Self-compilation SIGSEGV FIXED (struct global C codegen + SDL false-positive detection + time.fd syntax). 7 Rust-to-Fides gaps closed (str_substring, is_lto_mode, DynCall/TryUnwrap, x86.fd, 19 CLI commands, interp autograd/PRNG, runtime_linux TODOs). v1.0.0 installer released.
+Phase 10B: PE Emitter Rewrite ← DONE (Oct 30–31, see pe-roadmap.md) — `fid emit` (compiler/pe_ir*.fd, ported from src/pe.rs) makes native Windows exes with no C compiler; on Oct 31 a natively emitted fid reproduced itself byte for byte (Nov 3, competitive ST1: a natively built fid stops with "Invalid free" until the native string headers are finished). Nov 6: native async crashes. The old path (`build --native`: PIR → x86-64 → pe.fd) still crashes on every program. compiler/pe.fd exists (6,800+ LOC, ported from src/pe.rs). Not a from-scratch rewrite. @cpu_local + inline asm clobbers implemented. Full bare-metal stubs ported (p_lidt, p_idt_set_entry, p_lgdt, p_gdt_set_entry, p_cr0/cr4 read/write, p_invlpg, p_page_map/unmap, p_phys_read64/write64, p_inl/outl, p_memset). Issue 67 (val-in-loop) FIXED via L1B regalloc; Issue 68 (str_split) FIXED (p_string_split + Vec known type); Issue 69 (recursive Box<T>) FIXED (Store memcpy for struct types). Serial stubs (p_serial) now always generated. Full parity with Rust reference not verified.
 Phase 10C: Windows Installer ← COMPLETE — NSIS installer (Fides-Setup-1.0.0.exe, 2.5 MB) tested on Windows. GitHub Actions CI builds automatically on release tags.
 Phase 11: Ecosystem          ← IN PROGRESS — LSP DONE (wired into CLI, JSON-RPC server with diagnostics/completion/hover/definition/rename); ark DONE (wired into CLI, package manager with init/add/install/remove/list/lock/update/search/publish); formatter, linter, bench, profile work; scribe + veil wired into CLI
-Phase 12: Security Hardening ← MOSTLY COMPLETE — binary hardening done; all safety annotations enforced (effect-based); CFI DONE (Phase 12: forward-edge indirect-call protection — null-check + bounds validation for CallPtr/L3Inst::CallPtr/DynCall in PE backend, closure pointer deref bug fixed); taint tracking DONE (full data-flow with sanitizer/sink recognition); sandbox blocks implemented in lower; @secret + @firmware ported to self-hosted typechecker.fd
-Phase 13: World Class        ← IN PROGRESS — type inference done, SLP+loop-vec done, debugger done, scribe doc generator done, veil coverage tool done; @send/@sync NOT done, ark package manager DONE (wired into CLI), green threads DONE (compiler/green_thread.fd + interp.fd integration — cooperative scheduler with spawn/yield/run_all/is_done/get_result/current/reset)
+Phase 12: Security Hardening ← MOSTLY COMPLETE — binary hardening done; all safety annotations enforced (effect-based); CFI DONE (Phase 12: forward-edge indirect-call protection — null-check + bounds validation for CallPtr/L3Inst::CallPtr/DynCall in PE backend, closure pointer deref bug fixed); taint tracking DONE in fidesc (full data-flow with sanitizer/sink recognition; fid has the coarse effect check); sandbox blocks implemented in lower; @secret + @firmware ported to self-hosted typechecker.fd
+Phase 13: World Class        ← IN PROGRESS — type inference done, SLP+loop-vec done, debugger done, scribe doc generator done, veil coverage tool done; @send/@sync done (Nov 6: every argument of a spawned call must be @send; raw pointers and references are not), ark package manager DONE (wired into CLI), green threads DONE (compiler/green_thread.fd + interp.fd integration — cooperative scheduler with spawn/yield/run_all/is_done/get_result/current/reset)
 Phase 14: Debugging Tools    ← COMPLETE — interpreter debugger (977 LOC), record/replay, hot-reload (635 LOC), post-mortem, native debugger (544 LOC)
 Phase 15: Compete Where We Lose ← IN PROGRESS — 15.1 arena/region allocators DONE, 15.2 web framework DONE, 15.3 data science/scripting DONE (REPL, CSV/JSON, plotting, notebook), 15.4 rapid prototyping DONE (flags wired), 15.5 game engine DONE (ECS, game loop, frame arena); comptime codegen + region inference deferred
 Phase 16: Tier 3 OS           ← PARTIAL — @cpu_local (pe.fd only), inline asm clobbers (pe.fd), --bare/--boot mode, cross-compilation dispatch done; @interrupt DONE (F29: ISR codegen + automatic IDT setup for @interrupt(N)); bare runtime stubs re-added (p_hlt, p_cli, p_sti, p_inb, p_outb, p_serial — always generated including regular L3 path); UEFI bindings NOT done (stdlib/uefi.fd missing), kernel.fd missing, ARM64/RISC-V native codegen + bare runtime stubs remaining
@@ -5038,7 +5071,8 @@ Current:  50 modules, 91,924 LOC (+19 files, +17,010 LOC)
 
 ### Critical Blockers for Self-Hosted Compiler (Sep 9, 2026)
 
-> Full details in `roadmap.md` § Issues & Debates → "Critical Blockers" section.
+> Full details in `roadmap.md` § Issues & Debates → "Critical Blockers" section
+> (status updated there on Nov 6, 2026; this list is the Sep 9 record).
 
 1. **CB1: Safety annotations partially enforced.** `compiler/typechecker.fd`
    now enforces the **core safety primitives** (`@no-alloc`, `@no-panic`,
@@ -8788,10 +8822,25 @@ escapes verified. Random seed time verified.
 > Added Sep 7, 2026 (Session 18). All four items verified by reading source
 > and running tests. These are the highest-priority issues — they undermine
 > the language's core value propositions if left unfixed.
+>
+> **Status on Nov 6, 2026:** CB1 resolved for the 17 rules of
+> `docs/reference/safety-rules.md`; CB2 mostly resolved in `fid`; CB3
+> resolved (Nov 2 suite); CB4, CB5, CB7 resolved; CB6 resolved in the old PIR
+> emitter, which is no longer the native path. Each entry below has its own
+> Nov 6 line.
 
 #### CB1: Self-hosted compiler doesn't enforce all its annotations
 
 **Status:** Resolved — all 13 remaining stubs now enforce effect-based rules
+
+**Nov 6, 2026:** `fid` enforces 17 safety rules, each with a negative test
+and the requirement it implements (`docs/reference/safety-rules.md`; release
+L1, L2). `@no-alloc` sees method calls (`.push()`), `Vec::new()` and string
+`+`; `@no-indirect` rejects calls through function parameters; `@firmware`
+rejects OS runtime calls; `@gas` counts literal loop trip counts; `@tainted`
+works on parameters (no IO or Net effect; no data flow in `fid`).
+`fid qualify` writes the evidence as JSON (release L3), always
+`NOT_QUALIFIED`. Fides is not certified for safety-critical use.
 
 The Rust bootstrap (`src/typechecker.rs`) has real enforcement of
 `@medical`, `@conserve`, `@deterministic`, `@crashfree`, `@gas`, `@dp`,
@@ -8842,6 +8891,16 @@ needs its own verification pass that rejects non-conforming code.
 
 **Status:** ✅ Resolved — Session 19
 
+**Nov 6, 2026:** reopened Nov 2 (`Option`/`Result` were still written over
+`i64`, bounds not checked), then mostly resolved in `fid` (proposal 0002):
+`Option<T>` and `Result<T, E>` are generic in `stdlib/core.fd`, a payload
+keeps its type, a type parameter is inferred or an error, bounds `T: A + B`
+are checked, turbofish has an arity check (`test_generics_full`,
+`test_generic_infer_fail`, `test_generic_bound_fail`,
+`test_turbofish_arity_fail`). Left: per-instantiation layout (a payload is one
+word; wide values go through a heap copy that is not freed), method-level type
+parameters. `fidesc` is frozen and does not get this.
+
 `stdlib/core.fd` previously defined `Result<T,E>` and `Option<T>` with
 `i64` payloads only. This has been fixed — generic type parameters are
 now properly substituted during lowering.
@@ -8859,7 +8918,9 @@ backends (interpreter, C codegen, PE emitter). C codegen returned to
 
 #### CB3: Backend test parity is not 100%
 
-**Status:** Open — updated Sep 9, 2026 (Session 21)
+**Status:** ✅ Resolved — Nov 2, 2026: `fidesc test` interpreter 339/339, C
+343/343, PE 345/345, expected-fail 89/89. Not rerun with the Nov 4–6
+compiler. The Sep 9 record follows.
 
 Current test results from `./target/release/fidesc test`:
 
@@ -8944,6 +9005,10 @@ checking), not a Fides source error. The pre-built
 The Windows installer ships the Rust bootstrap compiler (`fidesc.exe`
 renamed to `fides.exe`) which does not have this limitation.
 
+**Nov 6, 2026:** no longer true. `fid` compiles all of `compiler/*.fd` (61
+modules) through C; the 3-stage bootstrap reaches a byte-identical fixpoint;
+the installer ships the self-hosted compiler as `fid.exe` beside `fidesc.exe`.
+
 ---
 
 #### CB6: PE emitter has 15 stubbed runtime functions
@@ -8973,6 +9038,10 @@ All 15 PE emitter stubs have been replaced with real implementations in
 
 **Impact:** All PE string functions now have real implementations. No
 remaining stubs. Verified by source inspection of `compiler/pe.fd`.
+
+**Nov 6, 2026:** `compiler/pe.fd` is the old PIR emitter (`build --native`),
+which crashes. The native path is `fid emit` (`compiler/pe_ir*.fd`), whose
+runtime is `stdlib/pe_runtime/*.fd`.
 
 ---
 

@@ -1,9 +1,54 @@
 # Fides Language — Feature Status
 
-*Last updated: Sep 5, 2026 (session 15 — bootstrap fixpoint achieved). Verified against actual source code and test runs.
-See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
-*See `docs/reference/syntax.md` for full language syntax reference.*
-*See `docs/roadmap/security-roadmap.md` for security annotation details.*
+*Last updated: Nov 6, 2026. Most tables below were written against the Rust
+compiler `fidesc` (`src/*.rs`), which is now frozen; the language is what the
+self-hosted `fid` (`compiler/*.fd`) accepts. Where a row disagrees with
+[reference.md](reference.md) (written Nov 4 from the compiler source),
+reference.md is right. Counts: [CURRENT.md → Numbers](../../CURRENT.md#numbers).*
+*See `docs/reference/syntax.md` for the language syntax and
+[safety-rules.md](safety-rules.md) for the safety annotations.*
+
+## Current State (Nov 6, 2026)
+
+- Compiler: `compiler/*.fd`, 61 modules, 133,688 lines; `src/*.rs` (frozen
+  bootstrap reference and test harness), 57 files, 112,511 lines; stdlib 137
+  modules, 43,576 lines (+ 4 in `stdlib/pe_runtime/`).
+- Tests: 493 `.fd` under `tests/bootstrap/` (452 top level, 91 of them
+  expected-fail `*_fail.fd`), 51 in `tests/selfhost/`, 10 examples.
+- Fixpoint: stage 2 C == stage 3 C, 49 MB (Nov 6). Self-compile ~133 s.
+- Last full suite run: Nov 2 (Rust harness, `fidesc` as compiler): interp
+  339/339, C 343/343, PE 345/345, expected-fail 89/89. Not rerun with the
+  Nov 4–6 compiler; the features below were checked with `fid run`,
+  `fid ccompile` and `fid emit` on their tests.
+- Backends: interpreter (`fid run`), C (`fid ccompile`, needs zig cc, clang,
+  gcc or cl), native Windows x64 (`fid emit`, no C compiler). Linux x64 goes
+  through C. ARM64, RISC-V, WASM, macOS, native ELF and bare metal are
+  experimental / incomplete.
+
+### New in `fid` since Nov 3
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Generics (proposal 0002) | ✅ | Inference or an error, bounds `T: A + B` checked, turbofish `f::<T>()` with arity check (`test_generics_full`, `test_generic_infer_fail`, `test_generic_bound_fail`, `test_turbofish_arity_fail`) |
+| `if`/`match` values | ✅ | The value of the branch taken, also as a function's last statement (`test_if_expr_value`) |
+| `@cfg` | ✅ | `platform`/`os = "…"`, `linux`/`windows`/`macos`, arch, debug/release filter functions and structs; the host OS decides; `release` always on, `debug` off (`test_cfg`, all 3 backends) |
+| Freeing memory | ✅ | Vec/HashMap locals, a `Vec<str>`/`Vec<Vec>` that owns its elements, collections declared in a `region` at its end, string temporaries (`test_mem_owned_drop`). No GC; everything else lives until exit (leaks, never dangles) |
+| Borrow checks K4/K5 | ✅ | Changing a Vec a `for` loop walks; `s.x = 1` while `s` is borrowed; `&v[i]`; trait impl bodies |
+| Effects of runtime calls (K7) | ✅ | file/socket/process/clock runtime calls are `IO`/`Net` |
+| Higher-order effects | ✅ | A function taking a function value gets the effects of the function passed at each call site (`effects/test_effect_ho_instantiation`) |
+| `@send` | ✅ | Every argument of a spawned call must be `@send`; a struct of `@send` fields is `@send`; raw pointers and references are not (`test_race_ptr_fail`) |
+| `parallel { \| a \| b }` | ✅ | `x = f(..)` branches and multi-statement branches that only read word-sized locals run on threads (`test_parallel_branches`, all 3 backends) |
+| `async fn` with f64/struct | ⚠️ | Runs as a task in the interpreter and C; native async crashes |
+| Per-thread allocation | ⚠️ | C runtime: per-thread arenas and free lists; native runtime: per-thread free lists. Written Nov 4, exercised by every native test; no multi-thread stress test run |
+| Safety annotations | ✅ | `@no-alloc` sees `.push()`, `Vec::new()`, string `+`; `@no-indirect` rejects calls through function parameters; `@firmware` rejects OS runtime calls; `@gas` counts literal loop trip counts; `@tainted` on parameters; `@no-recursion`, `@bounded-stack`. 17 rules, each with a negative test |
+| `fid qualify <file.fd> [-o out.json]` | ✅ | JSON evidence (compiler and source hashes, check result, annotated functions, each rule with its requirement and tests). Always `NOT_QUALIFIED`: evidence, not a certificate |
+| Owned and borrowed strings, `@scoped` | ✅ | `str` owned, `&str` borrowed; `@scoped` struct `str` fields read as `&str`; `str_clone`; `http_serve_scoped` frees request memory after each response and is no longer `@unsafe` (`test_borrowed_str`, `test_borrowed_str_return_fail`, `test_borrowed_str_pass_fail`, `test_scoped_store_fail`) |
+| HashMap integer keys | ✅ | Was a crash; `test_hashmap_int_keys` on all 3 backends. 0 and -1 are ordinary keys; `0x5DEECE66D1234567` and its complement are reserved and panic |
+| Native IR optimizer | ✅ | `fid emit`: inlining of small single-block functions, constant folding, dead code removal (`compiler/iropt.fd`) |
+| core.fd check stamp | ✅ | core.fd is type-checked once per (compiler, core.fd) pair; `FIDES_CHECK_CORE=1` forces it. `.fidcache/` evicts least recently used artifacts past 64 files or 1 GB |
+| `fid emit --checked-alloc` | written, not run | Every block on pages of its own, ending at a guard page; freed pages inaccessible, never reused |
+| `scripts/sanitize.sh`, `scripts/fuzz/nightly.sh` | written, not run | ASan/UBSan through C (needs clang with ASan); fuzzing with a `checked` backend; no CI workflow schedules it |
+| Value semantics (proposal 0001) | ❌ | Copy-on-write written behind `LOWER_COW` (off), lazy and counted; with it on, value semantics hold on the tests and the compiler reaches its fixpoint (4.7 GB peak vs 1.8 GB); not on until the full suite runs with it. `var b = a` on a Vec still aliases |
 
 ## Legend
 
@@ -22,8 +67,8 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | Type Checker (typechecker.rs) | ✅ | Validates types, capabilities, effects, regions, traits |
 | IR Lowering (lower.rs) | ✅ | AST → typed SSA IR with effects/regions |
 | IR Interpreter (interp.rs) | ✅ | Runs IR directly via `fidesc run` |
-| PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables + flat binary (bare-metal mode) |
-| ELF64 Emitter (elf64.rs) | ✅ | Generates native ELF64 executables on Linux (zero external tools) + relocatable objects |
+| PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables. In `fid`, `fid emit` (`compiler/pe_ir*.fd`) is the native path; bare metal (`emit --bare`) panics |
+| ELF64 Emitter (elf64.rs) | ⚠️ | Experimental / incomplete; Linux x64 goes through C |
 | C Codegen (codegen_c.rs) | ✅ | Generates C code, 198/211 tests match interpreter output. Phase 10B: Print calls Fides Vec_to_str/HashMap_to_str for formatting. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic via p_call_stack. Rc/Arc runtime via p_rc_incr/p_rc_decr. Drop trait: compiler-inserted drop calls. Negative size checks on p_malloc/p_shared_alloc/p_allocator_alloc. ftell failure check on p_file_read/p_file_size. |
 | PIR (pir.rs) | ✅ | PIR L1/L2/L3, `fidesc pir` command |
 | Optimizer (opt.rs) | ✅ | 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. 22 in default pass list. Enabled by default in `build` (use `--no-opt` to disable). `--lto` for aggressive inlining. |
@@ -34,20 +79,20 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | WASM Backend (wasm.rs) | ✅ | PIR → WASM binary, `fidesc wasm` command |
 | GPU/SPIR-V Backend (gpu.rs) | ✅ | PIR → SPIR-V binary, `fidesc gpu` command |
 | Comptime (comptime.rs) | ✅ | Compile-time evaluation, reflection, f-string interpolation |
-| Multi-arch Codegen | ✅ | x86-64, ARM64, RISC-V assembly via `fidesc codegen --target` |
+| Multi-arch Codegen | ⚠️ | x86-64, ARM64, RISC-V assembly via `fidesc codegen --target`; ARM64/RISC-V experimental / incomplete |
 | ARM64 Instruction Encoder (arm64_enc.rs) | ✅ | Converts ARM64 assembly text to 4-byte machine code. 17 unit tests. |
 | ARM64 Linux Runtime (runtime_arm64.rs) | ✅ | ARM64 runtime using raw SVC syscalls. 9 unit tests. |
 | RISC-V Instruction Encoder (riscv_enc.rs) | ✅ | Converts RV64 assembly text to 4-byte machine code. 14 unit tests. |
 | RISC-V Linux Runtime (runtime_riscv.rs) | ✅ | RISC-V runtime using raw ECALL syscalls. 7 unit tests. |
-| Cross-compilation (ARM64 Linux ELF) | ✅ | `build --target arm64-linux` → AArch64 ELF64 executable |
-| Cross-compilation (RISC-V Linux ELF) | ✅ | `build --target riscv64-linux` → RISC-V ELF64 executable |
+| Cross-compilation (ARM64 Linux ELF) | ⚠️ | `build --target arm64-linux` → AArch64 ELF64 executable; experimental |
+| Cross-compilation (RISC-V Linux ELF) | ⚠️ | `build --target riscv64-linux` → RISC-V ELF64 executable; experimental |
 | Cross-compilation (Windows PE) | ✅ | `build --target x86-64-windows` → x86-64 PE executable |
 | Target Triple Parsing | ✅ | `parse_target_triple()` normalizes arch-os format strings |
-| @cpu_local variables | ✅ | Per-CPU data via GS segment — `@cpu_local var x: i64;` emits GS-relative addressing |
+| @cpu_local variables | ❌ | In `fid` no pass reads it: it is valid only on globals, which cannot carry annotations (the Rust PE emitter had GS-relative addressing) |
 | Inline asm clobbers | ✅ | `clobber("reg")` syntax, clobber save/restore in PE backend, 50+ x86 instructions encoded |
 | No-stdlib mode | ✅ | `--bare` / `--no-std` / `--no-stdlib` skips stdlib/core.fd, zero hidden runtime deps |
 | Cross-compilation dispatch | ✅ | `--target arm64`/`riscv64` validates and emits diagnostic, falls back to C codegen |
-| UEFI boot services | ✅ | `stdlib/uefi.fd` — AllocatePool, FreePool, GetMemoryMap, ExitBootServices, Stall, console output |
+| UEFI boot services | — | `uefi.fd` moved to the fides-os project (Oct 24) |
 
 ## CLI Commands
 
@@ -62,7 +107,7 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | `fidesc emit <file> --bare -o <bin>` | ✅ | Bare-metal flat binary (no stdlib, no PE headers) |
 | `fidesc build <file> -o <out> [--target] [--opt]` | ✅ | Native build: PIR → codegen → peephole → ELF64/PE executable (zero external tools). Cross-compilation: `--target arm64-linux`, `--target riscv64-linux`, `--target x86-64-windows`. |
 | `fidesc ccompile <file> -o <exe>` | ✅ | C codegen → gcc/clang → executable |
-| `fidesc test` | ✅ | Runs all 165 normal tests across interpreter, PE emitter, and C codegen |
+| `fidesc test` | ✅ | Runs the test programs across interpreter, PE emitter, and C codegen (`--compiler fid` to test the self-hosted compiler). Last full run Nov 2 |
 | `fidesc test --fail` | ✅ | Runs only expected-fail tests (failing = correct) |
 | `fidesc repl` | ✅ | Interactive REPL |
 | `fidesc audit <file>` | ✅ | IR verification pass (also `verify`) |
@@ -74,7 +119,7 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | `fidesc wasm <file> -o <out.wasm>` | ✅ | WebAssembly backend |
 | `fidesc gpu <file>` | ✅ | SPIR-V GPU backend |
 | `fidesc parse-header <file.h>` | ✅ | Parse C header → generate Fides FFI bindings |
-| `fidesc watch <file>` | ✅ | Hot reload: native JIT (ELF64) + function-level change detection |
+| `fidesc watch <file>` | ⚠️ | Rebuilds and reruns on save, reports changed functions; no in-process swap. `fid watch` runs `bench` |
 | `fidesc link <files...>` | ✅ | Link multiple object files |
 | `fidesc lsp` | ✅ | Language Server Protocol server (JSON-RPC over stdio, diagnostics, no external deps) |
 | `fidesc lint <file>` | ✅ | Lint checks (unused functions, unused imports) |
@@ -92,6 +137,9 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | `fidesc diff-test <file> --stage <s>` | ✅ | Differential testing: tokens, ast, ir, pir1/2/3, c, output |
 | `fidesc run <file> --trace` | ✅ | Per-stage compiler timing (Frontend/Lower/Backend/Total) |
 | `fidesc run <file> --max-recursion N` | ✅ | Set recursion depth limit (0 = unlimited, default 1000) |
+| `fid qualify <file> [-o out.json]` | ✅ | Safety evidence as JSON; always `NOT_QUALIFIED` |
+| `fid audit <file> [--stdlib] [--strict]` | ✅ | Unsafe code a program reaches |
+| `fid run <file> --leaks` / `--checked-alloc` | ✅ | Leak report / use-after-free detection (C runtime debug allocator) |
 
 ## Language Features — Interpreter (`fidesc run`)
 
@@ -110,7 +158,7 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | `break` / `continue` | ✅ | Loop control flow |
 | Block expressions `{ }` | ✅ | Scoped blocks with values |
 | Comments `//` and `/* */` | ✅ | Line and block comments |
-| Semicolons `;` | ✅ | Statement terminators |
+| Semicolons `;` | ✅ | Optional statement terminators |
 
 ### Types
 
@@ -120,16 +168,16 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | `u64` / `u32` / `u8` unsigned | ✅ | Unsigned integers |
 | `f64` / `f32` floats | ✅ | Floating point |
 | `bool` | ✅ | Boolean type |
-| `&str` / `String` | ✅ | String types |
+| `str` / `&str` | ✅ | Owned / borrowed strings (`str` has no methods; use `str_*` functions) |
 | `Vec<T>` | ✅ | Dynamic arrays |
-| `HashMap<K,V>` | ✅ | Hash maps |
+| `HashMap<K,V>` | ✅ | Hash maps, `str` or integer keys |
 | `Option<T>` | ✅ | Optional values (Some/None) — declared as `enum Option<T>` in stdlib/core.fd |
 | `Result<T,E>` | ✅ | Error handling (Ok/Err) — declared as `enum Result<T, E>` in stdlib/core.fd |
 | `struct` | ✅ | Struct definitions and instances |
 | `enum` (algebraic) | ✅ | Sum types with data |
 | Generic enums `enum Foo<T>` | ✅ | Type parameters on enum declarations |
 | Generic structs `struct Foo<T>` | ✅ | Type parameters on struct declarations |
-| Generics `<T>` | ✅ | Generic functions and types |
+| Generics `<T>` | ✅ | Generic functions and types; bounds checked, inference, turbofish (`fid`) |
 | Type aliases `type` | ✅ | Type alias declarations |
 
 ### Expressions
@@ -143,7 +191,8 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | f-string interpolation `f"{expr}"` | ✅ | String formatting |
 | Ranges `..` and `..=` | ✅ | Range expressions |
 | Closures `fn(x) { }` / `fn(x) => expr` | ✅ | Anonymous functions |
-| `match` expressions | ✅ | Int, string, enum, wildcard patterns; expression and statement forms |
+| `match` expressions | ✅ | Int, string, enum, wildcard patterns; expression and statement forms (statement arms need blocks) |
+| `if` / `match` as values | ✅ | Value of the branch taken, also as a function's last statement |
 | `?` operator | ✅ | Error propagation |
 | Casts `as` | ✅ | Type casts |
 
@@ -155,7 +204,7 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | `while` | ✅ | While loops |
 | `for` over Vec | ✅ | Iterate vector elements |
 | `for` over range | ✅ | Iterate numeric ranges |
-| `loop` | ✅ | Infinite loops |
+| `loop` | ✅ | Infinite loops (a statement; `break value` discards the value) |
 | `break` / `continue` | ✅ | Loop control |
 | `match` | ✅ | Int, string, enum, wildcard patterns; expression and statement forms |
 
@@ -168,8 +217,9 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | Return values | ✅ | Single return value |
 | Closures | ✅ | Captures environment |
 | Generic functions `fn name<T>()` | ✅ | Type parameters |
-| Default arguments | ❌ | Not implemented |
-| Variadic arguments | ❌ | Not implemented |
+| Default arguments | ✅ | `fn add(a: i64, b: i64 = 10)`; trailing defaulted parameters may be left out |
+| Named arguments | ✅ | `add(b: 2, a: 1)`; put in parameter order by lowering. A named argument's type is not checked |
+| Variadic arguments | ❌ | `...name` is parsed and ignored |
 
 ### Data Structures
 
@@ -191,11 +241,11 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | `&` references | ✅ | Immutable borrows |
 | `&mut` references | ✅ | Mutable borrows, auto-deref for method calls (Issue 45) |
 | `defer` | ✅ | Go-style deferred cleanup |
-| Drop trait | ✅ | Compiler-inserted drop calls at scope exit (LIFO order). Works on all 3 backends. |
-| Region blocks `region r { }` | ✅ | Compile-time region tracking, use-after-free detection |
-| Region escape detection | ✅ | Compile-time dangling pointer detection |
-| Region inference | ✅ | Auto-detect regions via region_stack tracking in typechecker |
-| UAF detection (interpreter) | ✅ | RegionEnd marks addresses freed; Load/Store panic in debug mode if accessing freed memory |
+| Drop trait | ✅ | A `drop` method is called at function exit, last declared first, for locals declared with an explicit struct type. Works on all 3 backends. |
+| Region blocks `region r { }` | ✅ | A scope with an optional size budget; collections declared in it are freed at its end. No region use-after-free check |
+| Reference escape detection | ✅ | References cannot be stored, returned from locals, outlive their block or be sent (`compiler/escape.fd`) |
+| Automatic freeing | ✅ | Vec/HashMap locals, owned `Vec<str>`/`Vec<Vec>` elements, region collections, string temporaries (`test_mem_owned_drop`) |
+| Use-after-free detection | ⚠️ | `fid run --checked-alloc` (debug allocator); `fid emit --checked-alloc` is written, not run |
 | `val` immutability | ✅ | Type error on reassignment + field mutation (Issues 46-47). 247 stdlib vars migrated to `var`. |
 | Non-exhaustive match | ✅ | An error for missing enum variants or bool arms, unless a catch-all arm exists. |
 
@@ -206,20 +256,21 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | `use` imports | ✅ | Module imports |
 | `pub` visibility | ✅ | Public/private visibility |
 | `use ... as` aliases | ✅ | Import aliases |
-| `use ... { }` selective imports | ✅ | Selective imports |
-| `use ... *` glob imports | ✅ | Glob imports |
+| `use ... { }` selective imports | ⚠️ | Parsed; the list does not select: the whole module is imported |
+| `use ... *` glob imports | ⚠️ | Parsed; same as a plain `use` |
 | Re-exports | ✅ | |
 | Multi-file modules | ✅ | |
-| Standard library (stdlib/core.fd) | ✅ | Auto-imported. 99 modules: core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can, uefi |
+| Standard library (stdlib/core.fd) | ✅ | core is auto-imported. 137 modules, 43,576 lines (Nov 6), among them: core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can, task. (uefi and kernel moved to fides-os.) |
 
 ### Capabilities (Security)
 
 | Feature | Status | Notes |
 |---------|--------|-------|
 | `cap` (capability/trait) declarations | ✅ | |
-| Capability grants | ✅ | `use ... with { IO, FS, Net, Spawn }` |
-| Capability denial | ✅ | Compile-time error if not granted |
-| Transitive capabilities | ✅ | Propagation through call graph |
+| Capability grants | ✅ | `use ... with { IO, FS, Net, Spawn, Alloc }` |
+| Capability denial | ✅ | Compile-time error if not granted (strict mode: any import has `with`) |
+| Transitive capabilities | ❌ | Not done: each call is checked by name; capabilities do not propagate through the call graph (effects do) |
+| `sandbox { }` | ✅ | Every capability-needing call inside is an error, granted or not |
 | Capability elision | ✅ | Zero runtime overhead — all checks compile-time |
 
 ### Error Handling
@@ -235,17 +286,20 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `async` / `await` | ✅ | Parsed, lowered, works in interpreter + C codegen (Phase 7.6 — Future<T> type with eager evaluation; typechecker enforces Future<T> for await; state machine transform pending) |
-| `spawn` | ✅ | Parsed, lowered, works in interpreter + C codegen (Phase 7.6 — wraps result in Future<T>; concurrent execution pending) |
+| `async` / `await` | ⚠️ | An `async fn` runs as a green task on its own stack (f64/struct arguments and results through an adapter); prefix `await` gives the result. Interpreter and C work; native (`fid emit`) async crashes |
+| `spawn` | ⚠️ | `spawn f(args)` runs `f` on an OS thread and gives a `Future<T>`; every argument must be `@send`. Native spawn+await crashes |
+| `parallel { \| … }` | ✅ | Branches on threads (see "New in `fid`") |
 | Mutex | ✅ | `sync_mutex_create/lock/unlock` via pthread mutex |
 | RwLock | ✅ | `sync_rwlock_create/read_lock/read_unlock/write_lock/write_unlock` — atomic reader count, no TOCTOU race |
 | AtomicU64 | ✅ | `atomic_u64_new/load/store/fetch_add/cas` wrappers |
 | Channels | ✅ | Bounded, thread-safe message passing (`sync_channel_create/send/recv/try_recv/close`) |
-| Effect handlers `handle { do } with` | ⚠️ | Syntax parses and runs; full continuation semantics pending |
+| Effect handlers `handle { do } with` | ✅ | `do E.op(args)` runs the handler; `resume(cont, v)` runs the rest of the `handle` block (`test_effect_handler`, `test_effect_resume`, `test_effect_noresume`) |
 | Effect annotations `!IO`, `!{}` | ✅ | Compile-time effect inference and checking |
 | Effect propagation | ✅ | Fixpoint iteration over call graph |
-| Effect-row polymorphism | ✅ | Higher-order functions (`fn` params) are instantiated per call site: `apply(pure_fn)` is pure, `apply(io_fn)` gets `IO`. Unknown function values fall back to all effects |
+| Effect-row polymorphism | ✅ | Higher-order functions (`fn` params) are instantiated per call site in both `fid` and `fidesc`: `apply(pure_fn)` is pure, `apply(io_fn)` gets `IO`; closures are scanned directly (`effects/test_effect_ho_instantiation`) |
 | `fidesc diagram <file>` | ✅ | Mermaid sequence diagram of calls annotated with inferred effects (`src/seqdiag.rs`) |
+| `!E` effect rows | ✅ | Declaring a non-concrete effect name marks a function effect-polymorphic; callers instantiate the row |
+| Pure-call CSE | ✅ | `pass_cse` folds duplicate calls to any `is_pure` function (empty effect set), not just `@deterministic` |
 
 ### Safety (Phase 2)
 
@@ -257,8 +311,8 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | `Option::unwrap` panics on None | ✅ | Calls `p_panic` |
 | Effect system (annotations + inference) | ✅ | `!IO`, `!Net`, `!Spawn`, `!Alloc`, `!{}` for pure |
 | Effect checking (under-declaration) | ✅ | Compile-time error if inferred > declared |
-| Region use-after-free detection | ✅ | Compile-time via `freed_regions` tracking |
-| Region escape detection | ✅ | Compile-time via `region_stack` tracking |
+| Region use-after-free detection | ❌ | None: the type checker writes `freed_regions` and never reads it. A region is a scope |
+| Reference escape detection | ✅ | `compiler/escape.fd`: a reference cannot outlive its block |
 | Capability elision | ✅ | Zero runtime overhead, all checks compile-time |
 
 ### Advanced
@@ -286,8 +340,8 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | Const generics | ✅ | `ArrayConst` type variant, monomorphization handles it — `test_const_generic.fd` passes in interpreter |
 | GATs | ✅ | `test_gat.fd` passes in interpreter, outputs correct results |
 | C FFI (`extern "C"`) | ✅ | Parsed, lowered, C codegen, interpreter stubs — `test_ffi.fd`, `test_ffi_full.fd`, `test_ffi_header.fd` pass |
-| Hot reload | ✅ | `fidesc watch` compiles to native ELF64, runs, detects function-level changes via L2 IR hashing |
-| `#[test]` attribute | ❌ | Parsed but not executed by `fidesc test` (tests are file-based) |
+| Hot reload | ⚠️ | `fidesc watch` rebuilds and reruns on save, reports function-level changes; no in-process swap |
+| `#[test]` attribute | ❌ | Parsed and ignored. `fid test file.fd` runs functions named `test_*` and `bench_*` |
 | `@derive` | ✅ | `@derive(Debug/Clone/Serialize/Deserialize)` generates methods (Phase 7.7) |
 | Borrow checker | ✅ | Phases 1-6 complete: `--borrowck=off\|warn\|on`, field-wise borrows, two-phase borrows, NLL, on by default |
 | Raw pointers `*mut T` / `*const T` | ✅ | With `unsafe {}` blocks for dereference |
@@ -295,25 +349,25 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | `@wrapping` arithmetic | ✅ | F65: escape hatch from checked arithmetic |
 | `@gas(N)` budget | ✅ | Compile-time gas budget annotation |
 | `@crashfree` | ✅ | No panic, no unbounded loops |
-| `@medical` (IEC 62304) | ✅ | No alloc, no recursion, no while, must be @audit |
-| `@safety-critical` (ISO 26262) | ✅ | No alloc, no recursion, no unbounded, no indirect |
+| `@medical` | ✅ | No alloc, no recursion, no while, no panic, must be @audit. A set of checks, not IEC 62304 compliance |
+| `@safety-critical` | ✅ | No alloc, no recursion, no unbounded, no panic, no indirect. A set of checks, not ISO 26262 compliance |
 | `@autosar` | ✅ | No alloc, no recursion, no unbounded, no panic |
-| `@linear` types | ✅ | Move semantics, no copy |
-| `@conserve` | ✅ | Proves no money created/destroyed/duplicated |
-| `@audit` | ✅ | Design by contract with full param trail |
+| `@linear` types | ✅ | Used exactly once; the only types that move |
+| `@conserve` | ✅ | Money conservation: no IO/Net/Spawn/Diverge, no floats, only `@conserve` callees, never `Money::new`/`from_cents` |
+| `@audit` | ✅ | Logs entry (with parameters) and exit at run time |
 | `@deterministic` | ✅ | No IO/Net/Spawn, no floating-point |
-| `given`/`ensure` contracts | ✅ | F10: Design by Contract — preconditions verified at call sites |
-| `txn {}` blocks | ✅ | Transaction with rollback (interpreter) |
+| `given`/`ensure` contracts | ⚠️ | `given` is checked at calls with constant arguments; no run-time check. `ensure` is parsed and not checked |
+| `txn {}` blocks | ⚠️ | `fid run` snapshots memory at entry; C and native run the body with no rollback |
 | `sandbox {}` blocks | ✅ | Capability revocation |
 | ECS (component/system/query) | ✅ | Phase 8B: F18 — entity-component-system |
 | State machines | ✅ | Phase 8B: F19 — `state_machine` with states/transitions |
 | Event handlers `on` | ✅ | Phase 8B: F20 — desugars to `__on_<event>` function |
 | Typed strings | ✅ | F67: SQLString/ShellString/HTMLString/JSONString/PathString |
-| `@cfg` conditional compilation | ✅ | Phase 7.7: `@cfg(platform = "linux")`, `@cfg(debug)`, etc. |
+| `@cfg` conditional compilation | ✅ | `@cfg(platform = "linux")`, `@cfg(windows)`, arch, `debug`/`release`; host OS decides (`test_cfg`, all 3 backends) |
 | Dynamic loading | ✅ | `p_dl_open`/`p_dl_sym`/`p_dl_close`/`p_dl_call` — real dlopen in C codegen |
 | Vec stdlib (Phase 10B) | ✅ | `Vec` implemented in `stdlib/core.fd` using raw pointers |
 | HashMap stdlib (Phase 10B) | ✅ | `HashMap` implemented in `stdlib/core.fd` using raw pointers |
-| String stdlib (Phase 10B) | ✅ | `String` implemented in `stdlib/core.fd` using raw pointers |
+| String stdlib (Phase 10B) | ✅ | `str_*` functions and `StringBuilder` in `stdlib/core.fd` |
 | `Rc<T>` smart pointer | ✅ | Reference-counted pointer with manual refcount (new, clone, drop, get, count) |
 | `Arc<T>` smart pointer | ✅ | Atomic reference-counted pointer with manual refcount (new, clone, drop, get, count) |
 | `Box<T>` recursive types | ✅ | Heap indirection enabling recursive types (e.g. `enum Expr { Add(Box<Expr>, Box<Expr>) }`) |
@@ -329,10 +383,11 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | Recursion depth limit | ✅ | Interpreter: `--max-recursion N` (default 1000, 0 = unlimited), with a clear panic. Compiled code has no fixed depth: running out of stack hits the OS guard page and prints "Stack overflow: the recursion is too deep" with a trace. |
 | Iterative parser fallback | ✅ | Shunting-yard parser activates for deeply nested expressions (>256 levels) to prevent stack overflow. |
 | `@constant_time` | ✅ | Security annotation: no early returns, no data-dependent branches, no IO/Net |
-| `@tainted` | ✅ | Taint tracking for untrusted input |
+| `@tainted` | ✅ | On a parameter: the function may have no `IO` or `Net` effect |
+| `@secret` / `@sensitive` | ✅ | Information-flow control: secrets never reach output sinks; sensitive (personal) data only via `privacy::release`'s runtime consent check |
 | `@derive` | ✅ | `@derive(Debug/Clone/Serialize/Deserialize)` generates methods |
 | Profiler (`fidesc profile`) | ✅ | Per-function timing profiler (interpreter mode) |
-| Incremental compilation | ✅ | In-memory cache keyed by (path, hash, opt_flags) — `src/inc.rs` |
+| Incremental compilation | ✅ | `fid`: build cache in `.fidcache/` (LRU eviction past 64 files or 1 GB), core.fd check stamp. `fidesc`: in-memory cache (`src/inc.rs`) |
 | Function-level parallelism | ✅ | 19/22 optimization passes parallelized via `std::thread::scope` |
 | LEA instruction selection | ✅ | `leaq` for struct/array offset calculations instead of shlq+addq |
 | Borrow-based alias analysis | ✅ | `BorrowKind` (Shared/Mutable/None) enables more store-load forwarding |
@@ -349,6 +404,7 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | **ML13: Tensor parallelism** | ✅ | `@shard` annotation verified by typechecker (must have Comm effect, no IO/Net). Simulated multi-rank runtime: `p_tp_rank`/`p_tp_world_size` return rank info, `p_all_reduce` etc. work in single-rank mode. |
 | **ML14: LoRA/Adapter hot-swap** | ✅ | `@adapter` annotation — pure weight transformations, works with `persist` for hot-swap |
 | **`@realtime` annotation** | ✅ | Compile-time enforcement: no alloc, no blocking IO, no while loops, no recursion |
+| **Safety rules (17)** | ✅ | Each with a negative test: [safety-rules.md](safety-rules.md). `fid qualify` writes the evidence |
 
 ---
 
@@ -607,7 +663,7 @@ val out = quant::dequantize_q8(q_out); // dequantize result
 | `@gas(N)` | ✅ DONE | Compile-time gas budget — counts AST nodes, propagates through call graph, rejects if > N |
 | `@crashfree` | ✅ DONE | Compile-time panic prevention — rejects unwrap, p_panic, non-const div/mod, while loops, non-crashfree calls |
 | `@audit` | ✅ DONE | Entry/exit logging with parameter values via IR injection. Type-aware printing. |
-| `txn {}` | ✅ DONE | Parsing + typechecking + interpreter rollback (memory snapshot on TxnBegin, restore on panic, commit on TxnEnd) |
+| `txn {}` | ⚠️ | Parsing + typechecking + interpreter rollback (memory snapshot on TxnBegin, restore on panic, commit on TxnEnd); no rollback in C or native |
 
 ### Financial Safety Stdlib
 
@@ -682,11 +738,11 @@ val out = quant::dequantize_q8(q_out); // dequantize result
 | `@wrapping` (F65) | `@wrapping fn foo() { ... }` | ✅ DONE (escape hatch for wrap-around) |
 | Bounds checking lock (F62) | bounds checks always on | ✅ DONE (skippable in `unsafe {}`) |
 | Parameterized queries (F68) | no concat on typed strings | ✅ DONE (compile error on SQLString + str) |
-| `@medical` (F48) | IEC 62304 compliance | ✅ DONE (no alloc, no recursion, no while, must be @audit) |
+| `@medical` (F48) | Checks named after IEC 62304 (not compliance) | ✅ DONE (no alloc, no recursion, no while, no panic, must be @audit) |
 | `given`/`ensure` contracts (F10) | Design by Contract | ✅ DONE (preconditions verified at call sites with constant args) |
-| `async`/`await`/`spawn` (Phase 7.6) | Cooperative concurrency | ✅ DONE (Future<T> type, eager evaluation, typechecker enforces Future<T> for await, p_future_ready/p_future_poll runtime; state machine transform pending) |
+| `async`/`await`/`spawn` (Phase 7.6) | Cooperative concurrency | ⚠️ (green tasks on their own stacks; interpreter and C work; native async crashes) |
 | Borrow checker (`--borrowck`) | Compile-time aliasing analysis | ✅ Phases 1-6 (Rules 1-3, field-wise, two-phase, NLL; `on` by default; tested) |
-| Generic enums (`enum Option<T>`) | Type-parameterized enums | ✅ DONE (AST, parser, typechecker, lowerer; uniform i64 representation) |
+| Generic enums (`enum Option<T>`) | Type-parameterized enums | ✅ DONE (methods instantiated per `T` in `fid`; a bare `Option` has `T = i64`) |
 | Generic structs (`struct Foo<T>`) | Type-parameterized structs | ✅ DONE (AST, parser; type_params field) |
 | LSP server (`fidesc lsp`) | Language Server Protocol | ✅ DONE (JSON-RPC over stdio, initialize/didOpen/didChange/diagnostics) |
 | Iterators (Phase 7.7) | `for x in vec/map/range` | ✅ DONE (Vec, HashMap, Range iteration; nested Vec support) |
@@ -742,13 +798,13 @@ enabling editor integration (VS Code, Neovim, Emacs, etc.) with live diagnostics
 | Parser | 100% | — | — |
 | Type Checker | 100% | — | — |
 | IR Lowering | 100% | — | — |
-| Interpreter | 209/211 normal | — | Session 15 baseline |
-| PE Emitter | 209/211 normal | — | Session 15 baseline |
-| ELF64 Emitter | ✅ | — | Working executables on Linux (zero external tools) |
-| C Codegen | 198/211 normal | — | Session 15 baseline. Binary hardening enabled. |
-| Multi-arch Codegen | ✅ | — | x86-64, ARM64, RISC-V assembly all work |
-| Cross-compilation (ARM64) | ✅ | — | `build --target arm64-linux` → AArch64 ELF64 (27KB) |
-| Cross-compilation (RISC-V) | ✅ | — | `build --target riscv64-linux` → RISC-V ELF64 (29KB) |
+| Interpreter | 339/339 | — | Nov 2 full suite (Rust harness) |
+| PE Emitter | 345/345 | — | Nov 2 full suite (Rust harness) |
+| ELF64 Emitter | — | ⚠️ | Experimental / incomplete |
+| C Codegen | 343/343 | — | Nov 2 full suite (Rust harness). Binary hardening enabled. |
+| Multi-arch Codegen | — | ⚠️ | ARM64, RISC-V experimental / incomplete |
+| Cross-compilation (ARM64) | — | ⚠️ | `build --target arm64-linux` → AArch64 ELF64; experimental |
+| Cross-compilation (RISC-V) | — | ⚠️ | `build --target riscv64-linux` → RISC-V ELF64; experimental |
 | Cross-compilation (Windows) | ✅ | — | `build --target x86-64-windows` → PE executable (98KB) |
 | ARM64 Encoder | ✅ (17 tests) | — | `arm64_enc.rs` — ARM64 assembly → machine code |
 | ARM64 Runtime | ✅ (9 tests) | — | `runtime_arm64.rs` — SVC syscalls |
@@ -770,21 +826,23 @@ enabling editor integration (VS Code, Neovim, Emacs, etc.) with live diagnostics
 
 ### Test Coverage
 
-**See `AGENTS.md` → "Current Baseline"** for authoritative test counts.
-The snapshot above (and the session-15 table below) is historical; the
-current baseline is in `tests/bootstrap/baseline/test_results.txt` and
+Counts are in [CURRENT.md → Numbers](../../CURRENT.md#numbers). The last full
+suite run is Nov 2 (interp 339/339, C 343/343, PE 345/345, expected-fail
+89/89); it was not rerun with the Nov 4–6 compiler. The saved baselines are
+`tests/bootstrap/baseline/test_results.txt` and
 `tests/selfhost/baseline/test_results.txt`.
 
-### Self-Hosting (session 15 — historical; current state in `docs/selfhost/selfhost.md`)
+### Self-Hosting (current state in [selfhost.md](selfhost.md))
 
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Self-compilation | ✅ | `fides-c.exe` compiles `compiler/main.fd` → up to `fides-c5.exe` (5 generations; session-24 regression fixed in session 26) |
-| Bootstrap fixpoint | ✅ | stage 2 == stage 3 byte-identical (~38 MB of C), checked by `RELEASE=1 scripts/bootstrap.sh` on every release build |
-| Self-host modules | ✅ | 54 `.fd` modules, 104,439 LOC (was 25/61K in session 15) |
-| Self-host tests | ✅ | 38/38 pass on interp + C + PE (`tests/selfhost/`) |
-| PE emitter (self-hosted) | ❌ | `compiler/pe.fd` exists, but its pipeline (`build --native`: PIR → x86-64 → PE) crashes in the optimizer and register allocator; native Windows executables come from `fidesc emit` |
+| Bootstrap fixpoint | ✅ | stage 2 == stage 3 byte-identical (49 MB of C, Nov 6), checked by `RELEASE=1 scripts/bootstrap.sh` on every release build; stage 1 comes from a pinned stage 0 when one exists (`PIN=1` pins one; none yet), otherwise from `fidesc` |
+| Self-host modules | ✅ | 61 `.fd` modules, 133,688 lines (Nov 6; was 25/61K in session 15) |
+| Self-host tests | ✅ | 51 programs in `tests/selfhost/` (`verify-selfhost.sh`; saved baseline 36/47×3) |
+| Self-compile time | ✅ | ~133 s (type check 59 s, borrow check 16 s, lowering 20 s, C generation 12 s; Nov 6); `fidesc` ~21 s |
+| PE emitter (self-hosted) | ✅ | `fid emit` (`compiler/pe_ir*.fd`) makes native Windows executables with no C compiler and reaches a byte-identical fixpoint. The older `build --native` pipeline (`compiler/pe.fd`: PIR → x86-64 → PE) still crashes in the optimizer and register allocator |
 | LSP server (self-hosted) | ✅ | `compiler/lsp.fd` (1,082 lines) — JSON-RPC over stdio |
-| Linux native codegen (self-hosted) | ✅ | `peephole.fd` + `regalloc.fd` + `codegen_x64.fd` — wired into the unified L3 → x86-64 → asm pipeline (session 28-29) |
+| Linux native codegen (self-hosted) | ⚠️ | `peephole.fd` + `regalloc.fd` + `codegen_x64.fd` — wired into the L3 → x86-64 → asm pipeline (session 28-29); experimental, Linux x64 goes through C |
 | Module-level `var` in self-hosted | ✅ | Supported on all backends since session 11 |
 | Standalone binary | ✅ | `release/fid.exe` (`RELEASE=1 scripts/bootstrap.sh`, fixpoint checked), shipped as `fid.exe`; `run` and `ccompile` match `fidesc` on the test programs |

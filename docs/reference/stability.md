@@ -42,17 +42,35 @@ boundary.
 ## The two compilers
 
 `fid` (the compiler written in Fides, `compiler/*.fd`) is the compiler that
-ships. The Rust compiler (`src/*.rs`, `fidesc`) is kept as the bootstrap: it
-builds stage 1 of `fid`, and the test harness runs in it. From Nov 2, 2026
+ships. From Nov 3, 2026 the Rust compiler (`src/*.rs`, `fidesc`) is frozen
 (item ST1):
 
-- New language and library features land in `compiler/*.fd` first.
-- `src/*.rs` takes only what the bootstrap needs: fixes that keep it able to
-  build `fid`, and the harness.
-- The source of `fid` itself may use only features `fidesc` supports, since
-  `fidesc` compiles stage 1. A feature both compilers have can be used anywhere.
-- The suite runs on the shipped compiler too:
-  `fidesc test --compiler release/fid.exe` (item A4).
+- New language and library features land in `compiler/*.fd` only.
+- `fid` is built from a pinned earlier build of itself, as Go and Rust are:
+  `release/stage0/fid.exe`, checked against `scripts/stage0.sha256`.
+  `NATIVE=1 ./scripts/bootstrap.sh` builds three stages with `fid emit` and
+  checks that stages 2 and 3 are byte-identical, with no C compiler;
+  `PIN=1` then makes the checked compiler the next stage 0.
+- The source of `fid` may use a new feature only after a stage 0 that knows
+  it has been pinned: the compiler learns a change first, its own source
+  uses it after the next pin.
+- `src/*.rs` keeps the test harness (`fidesc test --compiler <fid>` runs the
+  suite on any `fid`) and a cold start when no stage 0 is pinned; it gets no
+  new features.
+
+Status (Nov 6): the native stages and pinning are written. No stage 0 is
+pinned yet (there is no `release/stage0/fid.exe` or `scripts/stage0.sha256`),
+so builds start cold from `fidesc`; the C-mode bootstrap reaches the
+byte-identical fixpoint (stage 2 C == stage 3 C, 49 MB). On Nov 3 the
+blocker for pinning was that a natively built `fid` stopped with "Invalid
+free" while string length headers (roadmap RT2) were unfinished in the native
+runtime; that has not been rechecked since.
+
+The language is what `fid` accepts, described in [reference.md](reference.md).
+`fidesc` checks less (see
+[language-guide.md § 10](language-guide.md#where-fid-and-fidesc-differ-nov-4)).
+Two known inconsistencies: `fid version` prints `fid 0.1.0` while the release
+is v1.0.0, and the work since v1.0.0 is not yet in a release.
 
 ## Releases
 

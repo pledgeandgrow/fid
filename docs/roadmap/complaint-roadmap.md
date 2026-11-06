@@ -72,9 +72,15 @@ The ten that matter most, in order:
       accepted (release K5) (L).
       Done: every borrow error names the borrow that holds the value (who, `&` or
       `&mut`, which path, the line it was made on) and a `Fix:` line, in both
-      compilers. Left: the gaps of release K5.
-- [ ] CM3. **"Is this a move or a copy?"** (Rust, C++). One rule for `Vec`, `str`
+      compilers. Release K5's soundness gaps are closed in `fid` (Nov 4–6):
+      `s.x = 1` while `s` is borrowed, `&v[i]` and trait impl bodies are
+      borrow-checked. Left: two-phase borrows and disjoint fields accepted in
+      `fid`, with tests.
+- [~] CM3. **"Is this a move or a copy?"** (Rust, C++). One rule for `Vec`, `str`
       and `HashMap`, checked by the compiler (release M4, M5) (L).
+      Decided (M4, proposal 0001): copy-on-write. Left (M5): the lowering is
+      behind `LOWER_COW`, off (the compiler compiling itself runs out of
+      memory with it on), so `var b = a` on a `Vec` still aliases.
 - [x] CM4. **"Integer overflow is undefined, or silently wraps"** (C, C++, Go,
       Rust in release). Every integer operation means the same on every backend,
       and overflow panics in every build unless `@wrapping` says otherwise.
@@ -85,9 +91,13 @@ The ten that matter most, in order:
       that can give one (`p_file_read`, `p_getenv`, `p_argv`) return `""`, `[]`
       or a `Result` (`file_read_result`). Their null tests were wrong in `fid`
       (`s == 0` on a `str` compared text) and are now `(s as i64) == 0` (M).
-- [~] CM7. **"Garbage collection pauses"** (Go, Java, C#). No collector; the
-      compiler frees what does not escape. Left: `Vec<str>` elements, real regions
-      (release C5, C6) (L).
+- [x] CM7. **"Garbage collection pauses"** (Go, Java, C#). No collector; the
+      compiler frees what does not escape (L).
+      Done (Nov 4–6): `Vec` and `HashMap` locals, a `Vec<str>` or `Vec<Vec>`
+      that owns its elements, collections declared in a `region` at its end,
+      and string temporaries are freed (`test_mem_owned_drop`). What the
+      compiler cannot prove finished lives until exit: a leak, never a
+      dangling pointer.
 - [~] CM8. **"Memory leaks I cannot find"** (C, C++, Go). `fid run --leaks` reports
       every block never freed, with the line that allocated it (M).
       Done: `fid run --leaks` (and `fid ccompile --leaks`) reports at exit the
@@ -98,8 +108,8 @@ The ten that matter most, in order:
       Done: `fid run --checked-alloc`: each block on its own pages ending at an
       inaccessible page; a freed block's pages become inaccessible and are never
       reused, so a use after free or a write past the end faults at that access,
-      with the trace. Left: the native (PE) path; naming the block in the
-      report.
+      with the trace. `fid emit --checked-alloc` (native) written Nov 4, not
+      run. Left: running the native mode; naming the block in the report.
 - [~] CM10. **"`unsafe` hides everywhere in my dependencies"** (Rust, Go, C#).
       `fid audit` lists every `unsafe` block reachable from a program, with its
       written justification (release M10) (M).
@@ -148,17 +158,30 @@ The ten that matter most, in order:
 
 - [~] CA1. **"Function colouring: async infects everything"** (Rust, JS, Python,
       C#). Any function runs inside a task and suspends where it waits; callers
-      do not change. Left: async with float, struct or reference arguments
-      (release H9) (L).
-- [ ] CA2. **"Which async runtime: tokio or async-std?"** (Rust). One runtime,
+      do not change (L). Done (release H9): an `async fn` with `f64` or struct
+      arguments or results runs as a task on the interpreter and C paths.
+      Left: reference arguments; native async (`fid emit` programs using
+      `async` or `spawn` + `await` crash).
+- [x] CA2. **"Which async runtime: tokio or async-std?"** (Rust). One runtime,
       in the standard library, used by every library (M).
-- [ ] CA3. **"`Send` and `Sync` errors I do not understand"** (Rust). Spawning
+      Done: `stdlib/pe_runtime/conc.fd` is the only task runtime — workers,
+      fibers, run queue, poller and blocking pool; every spawn/task/channel
+      goes through it on all backends.
+- [x] CA3. **"`Send` and `Sync` errors I do not understand"** (Rust). Spawning
       checks what crosses threads and says in one sentence what cannot and why
       (release H4) (M).
+      Done: `spawn` captures, `p_thread_spawn` args and `p_chan_send` values
+      are checked for @send; errors say what cannot cross, name the type and
+      suggest the fix — `E082` + `file:line:col` caret via `enrich_errors`
+      (test `diagnostics/err_send_spawn.fd`).
 - [ ] CA4. **"Deadlocks in production"** (Go, C++, Java). Lock order checked across
       the call graph at compile time; a cycle is an error (L).
 - [~] CA5. **"Data races"** (Go, C++, Java). Code reached from `spawn` cannot share
       mutable state unchecked (release H3) (L).
+      Done: every argument of a spawned call must be `@send`; raw pointers and
+      references are not (`test_race_ptr_fail`); a global is not written from
+      spawned code without a lock. Left: collections still alias until
+      copy-on-write is on (release M5).
 - [ ] CA6. **"Goroutine and task leaks"** (Go, JS). Structured concurrency: a task
       cannot outlive the scope that started it unless detached by name
       (competitive LG11) (L).
@@ -168,9 +191,12 @@ The ten that matter most, in order:
       block that waits (M).
 - [ ] CA9. **"Async stack traces are useless"** (Rust, JS, C#). A panic in a task
       shows the chain of tasks that awaited it (M).
-- [ ] CA10. **"Blocking call in async code freezes everything"** (Rust, JS,
+- [~] CA10. **"Blocking call in async code freezes everything"** (Rust, JS,
       Python). The effect system knows which calls block; a blocking call inside a
       task is an error or runs on a worker thread (M).
+      Done: blocking syscalls run on the blocking pool in `conc.fd` — a task
+      in a syscall never stalls its worker. Left: effect-system metadata
+      marking calls blocking so the compiler can warn when one bypasses.
 
 ## Track CT — Testing and debugging
 
@@ -247,8 +273,10 @@ The ten that matter most, in order:
 - [ ] CU7. **"Old tutorials no longer compile"** (fast-moving languages). Examples in
       the docs are compiled and run in CI, so docs and compiler never drift
       (competitive SL19) (M).
-- [ ] CU8. **"The compiler upgrade changed my program's speed"** (all). Benchmarks in
+- [~] CU8. **"The compiler upgrade changed my program's speed"** (all). Benchmarks in
       CI fail on a slowdown over 10% (release D7) (M).
+      Done (Nov 4): `bench/check.sh` fails on a slowdown over `LIMIT_PCT`
+      against `bench/baseline.txt`. Left: running it in CI.
 
 ## Track CL — Language ergonomics
 
@@ -256,9 +284,13 @@ The ten that matter most, in order:
       beside the existing `@derive(Serialize)` (M).
 - [~] CL2. **"No sum types"** (Go, Java before 17). Enums with payloads and `match`.
       Left: exhaustiveness and guards everywhere (competitive LG8) (M).
-- [ ] CL3. **"`String`, `&str`, `OsString`, `CString`... which one?"** (Rust). One
+- [x] CL3. **"`String`, `&str`, `OsString`, `CString`... which one?"** (Rust). One
       owned and one borrowed string type, UTF-8, and nothing else
       (release M11) (L).
+      Done (Nov 4–6): `str` owned, `&str` borrowed; a borrowed string can be
+      read, compared, printed and joined with `+`, but not returned as `str`,
+      stored, or passed to a user function's `str` parameter; `str_clone(s)`
+      copies (`test_borrowed_str` and three `_fail` tests).
 - [ ] CL4. **"No default or named arguments"** (Rust, Go, Java). Default and named
       arguments, checked at compile time (M).
 - [ ] CL5. **"Builder-pattern boilerplate"** (Rust, Java). Struct literals with
@@ -270,9 +302,11 @@ The ten that matter most, in order:
       cannot conflict, since the program's choice wins (M).
 - [ ] CL8. **"String formatting is a mini-language"** (C, Rust, Python).
       Interpolation `"{name} is {age}"` checked at compile time (M).
-- [ ] CL9. **"Equality compares addresses by surprise"** (Java `==`, JS objects,
+- [x] CL9. **"Equality compares addresses by surprise"** (Java `==`, JS objects,
       Fides structs until now). `==` on structs and enums compares contents;
-      ordering needs an explicit `cmp`. (Work in progress, Nov 2.) (M)
+      ordering needs an explicit `cmp` (M).
+      Done (proposal 0001): fields one by one, nested structs and enums through
+      their own `==`, strings by text (`test_struct_eq`).
 - [ ] CL10. **"Units: metres added to seconds"** (all but F#). Units of measure
       checked at compile time, free at run time (stdlib `units` as types) (L).
 
@@ -283,21 +317,25 @@ The ten that matter most, in order:
       Left for adoption: stdlib APIs that take keys mark them `@secret`.
 - [ ] CO2. **"Tracing needs code changes everywhere"** (all). Spans for every
       network, file and database effect, switched on with a flag, no code change (M).
-- [~] CO3. **"Metrics need a library and boilerplate"** (most). `metrics` in the
-      stdlib, Prometheus text format. Left: served by `http` with one call (S).
-- [~] CO4. **"Logs are unstructured"** (most). `log` with fields. Left: JSON output
-      checked against the spec, levels per module (S).
+- [x] CO3. **"Metrics need a library and boilerplate"** (most). `metrics` in the
+      stdlib, Prometheus text format, served by `metrics_serve(m, port)` —
+      one call (S).
+- [x] CO4. **"Logs are unstructured"** (most). `log` with fields, JSON lines
+      checked against the spec (`log_render_json` is public; a test parses it
+      back), per-module levels (`log_set_module_level`, `logmf`) (S).
 - [~] CO5. **"Profiling production needs another tool"** (most). `fid profile`
       samples the native call stack and writes flame graph data. Left: attach to a
       running service (competitive SL15) (L).
-- [ ] CO6. **"Config parsing and validation boilerplate"** (all). A config struct
-      loads from file, environment and flags, with errors that name the key (M).
-- [ ] CO7. **"Personal data leaks into analytics"** (all; GDPR fines).
-      `@personal` data cannot reach logs or the network without a consent check
-      (stdlib `privacy`) (L).
-- [ ] CO8. **"Health checks and graceful shutdown are hand-written"** (servers in
-      all languages). `http_serve` handles SIGTERM, drains connections and serves
-      `/health` (M).
+- [x] CO6. **"Config parsing and validation boilerplate"** (all). `config`:
+      declared keys load from file (INI), environment and `--flags` —
+      precedence flag > env > file > default, errors naming the key (M).
+- [x] CO7. **"Personal data leaks into analytics"** (all; GDPR fines).
+      `@sensitive` data cannot reach logs or the network without a consent check
+      (stdlib `privacy`: `consent_grant`/`consent_revoke`/`consent_given` and
+      the `@declassify`d `privacy::release`) (L).
+- [x] CO8. **"Health checks and graceful shutdown are hand-written"** (servers in
+      all languages). `http_serve` serves `/health`, stops on SIGTERM/SIGINT or
+      `http_stop()`, and drains live connections before closing (M).
 - [ ] CO9. **"Crash dumps are unreadable"** (C, C++). A crash writes a report with
       the trace, the panic message and the build's version, readable by
       `fid inspect` (M).
@@ -347,13 +385,16 @@ The ten that matter most, in order:
 
 ## Summary
 
-100 goals: 10 done, 21 partly done, 69 not started. The first done ones were
+100 goals: 20 done, 21 partly done, 59 not started (Nov 6). The first done ones were
 where the language's design already answers the complaint: no lifetime
 annotations, defined integers, no undefined behaviour in safe code, traces in
 every build, `@secret`, debug and release in one flag, and a written stability
-promise. Tracks CM and CE added: no null `str` from the stdlib, error context,
-the `unwrap` lint, and partly borrow-error explanations, the leak report, the
-checked allocator, `fid audit` and cascade suppression.
+promise. CO7 added `@sensitive` on the same machinery: personal data reaches
+outputs only through `privacy::release`'s runtime consent check. Tracks CM and
+CE added: no null `str` from the stdlib, error context, the `unwrap` lint, and
+partly borrow-error explanations, the leak report, the checked allocator,
+`fid audit` and cascade suppression. Nov 4–6 added owned and borrowed strings
+(CL3), `==` by content (CL9) and the compiler-inserted frees of CM7.
 
 Complaints about learning and day-to-day tooling (out-of-date guides, editor
 support, a playground) are goals of the other roadmaps: release N2, competitive

@@ -9,6 +9,17 @@
 
 > Build the last programming language the world needs.
 >
+> **Today (Nov 6, 2026):** see [CURRENT.md](../../CURRENT.md) for what is
+> true now — the self-hosted compiler `fid` has 61 modules, 133,688 lines,
+> a byte-identical fixpoint checked on every release build (49 MB of C), and
+> native output on Windows x64 (`fid emit`); Linux goes through C, and the
+> other targets are experimental. The language `fid` accepts is described in
+> [reference.md](reference.md). Much of this document states goals: where it
+> says something is a compile-time error, check reference.md for what the
+> compiler checks today (there is, for example, no region use-after-free
+> check, and copy-on-write value semantics are written but switched off).
+> The status below is from September and kept as history.
+>
 > **Status (Sep 6, 2026 — session 16):** Bootstrap fixpoint achieved. The
 > Fides compiler is self-hosted (26 modules, 61K LOC) and reproduces
 > byte-identical output across generations (`fides-c2.c == fides-c3.c`,
@@ -29,8 +40,8 @@ Fides is a systems programming language built from first principles — every la
 
 #### 2. Security — Prevent CVEs by Construction
 - **Capability-based security**: no ambient authority, no implicit filesystem/network access
-- **Region-based memory safety**: use-after-free, double-free, buffer overflow — all compile-time errors
-- **No `unsafe` escape hatch in user code**: framework-only, like capability kernels
+- **Memory safety**: today buffer overflow and double free are run-time panics, dangling references are compile-time errors (borrow and escape checks), and values the compiler cannot prove finished are leaked, never freed early. Region use-after-free as a compile-time error is a goal
+- **`unsafe` is explicit**: raw-pointer operations, `p_malloc`/`p_free` and calls to C need an `unsafe { }` block or an `@unsafe` function in the program's own module; `fid audit` lists every such site a program reaches
 - **Effect system**: IO, network, spawn — all explicit, all auditable
 - **Supply chain defense**: libraries receive only granted capabilities, can't access what they're not given
 - Target: eliminate 90%+ of CWE categories that plague C/C++
@@ -43,15 +54,15 @@ Fides is a systems programming language built from first principles — every la
 - **Memory**: 40% less overhead than Rust via region-based allocation (no Rc/RefCell needed)
 
 #### 4. Memory Safety — Regions First, RC as the Safe Escape Hatch
-- **Regions are the default memory model**: `region r { ... }` for scoped, bulk-freed, zero-overhead allocation. Compile-time escape detection prevents use-after-free.
-- **References are unchecked by default**: `&` and `&mut` work without a borrow checker. Aliasing patterns that Rust rejects are valid in Fides. The borrow checker is opt-in (`--borrowck=on`) for users who want compile-time aliasing safety.
+- **Regions** (goal: the default memory model): `region r { ... }` is today a scope with an optional compile-time size budget; collections declared in it are freed at its end. Compile-time escape detection keeps references from outliving their block.
+- **References are borrow-checked**: the borrow checker is on by default (`--borrowck=on`; `warn` and `off` exist). References are second-class: they cannot be stored, returned from locals or sent to tasks.
 - **RC is the safe alternative to `unsafe`**: when a pattern needs shared ownership (graphs, caches, callbacks, dynamic lifetime), `Rc<T>`/`Arc<T>` provides it memory-safely. This eliminates the need for `unsafe` raw pointers in user code.
-- **No `unsafe` in user code**: raw pointers are framework-only. If you can't use regions and you can't use references, you use RC — never `unsafe`.
+- **Little `unsafe` in user code** (goal): if you can't use regions and you can't use references, you use RC. Today `unsafe { }` is available to programs and checked only for where it is required.
 - **Explicit allocators**: caller chooses allocation strategy (like Zig), but with compile-time safety (like Rust)
 - **Zero runtime cost for the default path**: regions and references are zero-cost. RC has runtime cost, but only when explicitly chosen.
 
 #### 5. Power & Flexibility — Like C, But Safe
-- **Direct hardware access**: raw pointers available in framework code only (not user code — use RC instead)
+- **Direct hardware access**: raw pointers, inside `unsafe { }` or an `@unsafe` function
 - **Inline assembly**: for kernel/embedded development
 - **Zero-cost abstractions**: generics, closures, traits — all compile to optimal code
 - **comptime**: full metaprogramming without macros — regular code at compile time
@@ -61,23 +72,23 @@ Fides is a systems programming language built from first principles — every la
 #### 6. Adoption — Make Switching Easy
 - **C interop**: call C libraries directly, gradual migration path
 - **Familiar syntax**: Rust-like syntax with Fides keywords (val/fn/const)
-- **Hot reload**: instant feedback loop attracts game/GUI/web developers
-- **Fast compilation**: sub-second builds for small projects
+- **Hot reload** (goal): instant feedback loop attracts game/GUI/web developers — today `fidesc watch` recompiles and restarts
+- **Fast compilation**: sub-second builds for small programs; large ones are slow today (~1,000 lines/s for `fid`: 133,688 lines in ~133 s, Nov 6)
 - **AI tooling**: LLM-friendly syntax, semantic IR enables AI-assisted refactoring
 - **Single binary**: no runtime, no VM, no dependencies — just a binary
-- **Cross-compilation**: built-in, not an afterthought — **DONE** (ARM64, RISC-V, Windows)
+- **Cross-compilation**: built-in, not an afterthought — Windows done; ARM64 and RISC-V runtimes are stubs ([platforms](platforms.md))
 
 #### 7. Custom — Everything Built By Us
 - **Custom lexer**: hand-written, not generated
 - **Custom parser**: recursive descent, not parser generators
-- **Custom typechecker**: region inference + effect system + capability checking
+- **Custom typechecker**: generics with inference and bounds + effect system + capability checking + 17 safety rules
 - **Custom IR (PIR)**: Fides Intermediate Representation — typed, semantic, multi-level
 - **Custom optimizer**: semantic-aware, leverages region/effect/capability info
-- **Custom codegen**: direct to machine code (x86-64, ARM64, RISC-V) — **DONE** (with cross-compilation)
+- **Custom codegen**: direct to machine code — **DONE** for Windows x64 (`fid emit`); ARM64 and RISC-V experimental
 - **Custom linker**: integrated, not a separate process — **DONE** (target-aware: x86-64, ARM64, RISC-V)
 - **Custom stdlib**: no libc dependency for core operations
 - **Custom allocator**: region-aware, built into the language runtime
-- Minimal external dependencies: the Rust compiler plus 4 crates (hashbrown, compact_str, smallvec, bumpalo) to build Fides (bootstrapping later)
+- Minimal external dependencies: the self-hosted `fid` builds itself; stage 1 still comes from the frozen Rust compiler (plus 4 crates) until a stage 0 is pinned
 
 #### 8. Innovation — Optimized for AI, Robotics, Hardware, IoT
 - **AI/ML**: comptime specialization for tensor operations, SIMD intrinsics as first-class
@@ -86,7 +97,7 @@ Fides is a systems programming language built from first principles — every la
 - **IoT**: bare-metal targets, deterministic memory (FixedBufferAllocator), tiny binaries
 - **Effect handlers**: model robot sensors, actuators, and control loops as effects
 - **Region-based memory**: predictable allocation for real-time systems
-- **Cross-compilation**: target any architecture from any host — **DONE** (ARM64, RISC-V, Windows with zero external tools)
+- **Cross-compilation**: target any architecture from any host — Windows x64 native done; ARM64/RISC-V through C or the experimental native backends
 - **No runtime**: bare metal, no OS needed
 
 ### What Fides Is NOT
@@ -96,7 +107,7 @@ Fides is a systems programming language built from first principles — every la
 - **Not a garbage-collected language**: zero runtime overhead
 - **Not a managed language**: no VM, no JIT in production mode
 - **Not a macro-based language**: comptime replaces all metaprogramming
-- **Not an unsafe language**: no `unsafe` in user code, ever — RC is the safe escape hatch when regions can't express the ownership pattern
+- **Not an unsafe-by-default language**: `unsafe` must be written out, and `fid audit` lists every use a program reaches; RC is the safe alternative when regions can't express the ownership pattern
 
 ### The North Star
 
@@ -142,7 +153,7 @@ A language where:
 - No hidden control flow (no exceptions, no implicit returns)
 - No hidden casts (no implicit type coercions)
 - No hidden runtime (no GC, no VM, no reflection)
-- No hidden dependencies (no libc, no LLVM, no external linker)
+- No hidden dependencies (no LLVM; no external linker on the native Windows path)
 
 **Anti-pattern:** Implicit garbage collection.
 **Anti-pattern:** Operator overloading that allocates.
@@ -417,6 +428,11 @@ master of none.
 > An honest assessment based on `docs/lessons.md` lessons, `docs/roadmap.md`,
 > `docs/features-roadmap.md`, `docs/roadmap-limitations.md`, `features.md`,
 > and actual test baselines.
+>
+> Written in Aug–Sep 2026; its numbers are from then. Since then (Nov 6): the
+> compiler is self-hosted (61 modules, 133,688 lines), the full suite passes
+> 339/339 interp, 343/343 C, 345/345 PE (Nov 2), and generic `Option<T>` (§6
+> below) is done in `fid`.
 
 ---
 
@@ -644,7 +660,10 @@ after hygiene cleanup (unused imports, unused variables, dead constants
 removed). The remaining warnings are infrastructure for future phases
 (PE emitter rewrite, WASM backend, debugger) and should not be removed.
 
-#### 6. No Generic Option<T> Yet 🟡
+#### 6. No Generic Option<T> Yet 🟡 — resolved in `fid` (Nov 2026)
+
+`fid` now instantiates `Option<T>`'s methods per `T` (proposal 0002); an
+`Option` written without its type argument has `T = i64`. The original note:
 
 The `?.` optional chaining implementation note says: "Full field access on
 wrapped structs requires generic Option<T> (Phase 10)." This means Fides's Option

@@ -15,6 +15,7 @@ module metrics;
 use core;
 use vec;
 use string;
+use http;
 
 pub const METRIC_COUNTER: i64 = 0;
 pub const METRIC_GAUGE: i64 = 1;
@@ -166,4 +167,31 @@ pub fn metrics_text(m: Metrics) -> str {
         id = id + 1;
     }
     return sb.to_str();
+}
+
+// ─── Serving (CO3) ─────────────────────────────────────────────────────────
+// metrics_serve answers GET /metrics with the Prometheus text and /health
+// with the module's health check; SIGTERM, SIGINT or http_stop() stop it
+// and live connections drain (CO8).
+
+var metrics_srv: Metrics = metrics_new();
+
+/// The endpoint body: Prometheus text on /metrics, 404 elsewhere.
+pub fn metrics_http_handler(req: HttpRequest) -> str {
+    if req.path == "/metrics" {
+        return build_response(200, "text/plain; version=0.0.4", metrics_text(metrics_srv));
+    }
+    return build_response(404, "text/plain", "Not Found\n");
+}
+
+/// Point the served endpoint at `m` without starting a server.
+pub fn metrics_serve_set(m: Metrics) {
+    metrics_srv = m;
+}
+
+/// Serve `m` at GET /metrics on `port` — one call (CO3). Returns false when
+/// the port cannot be opened.
+pub fn metrics_serve(m: Metrics, port: i64) -> bool {
+    metrics_serve_set(m);
+    return http_serve(port, metrics_http_handler);
 }

@@ -1521,6 +1521,12 @@ fn real_main() {
                             cross_gcc
                         } else if process::Command::new(&cross_clang).arg("--version").output().is_ok() {
                             cross_clang
+                        } else if std::env::var("CC").is_err()
+                            && process::Command::new("zig").arg("version").output().is_ok() {
+                            // zig cc bundles every cross toolchain (incl. macOS
+                            // targets): `zig cc -target aarch64-macos` works
+                            // from any host with no SDK install.
+                            format!("zig cc -target {}", target)
                         } else {
                             eprintln!("Warning: cross-compiler for target '{}' not found, falling back to default CC", target);
                             std::env::var("CC").unwrap_or_else(|_| "gcc".to_string())
@@ -1594,8 +1600,16 @@ fn real_main() {
                             link_libs.push("-lunwind".to_string());
                         }
                         // Track preprocessor state to only pick up PLINK comments
-                        // that are active on the current platform.
-                        let is_windows = cfg!(target_os = "windows");
+                        // that are active on the target platform — the triple,
+                        // not the host, decides which #ifdef branch is active.
+                        let is_windows = target
+                            .as_deref()
+                            .map(|t| {
+                                let t = t.to_lowercase();
+                                t.contains("windows") || t.contains("win32")
+                                    || t.contains("mingw") || t.contains("msvc")
+                            })
+                            .unwrap_or_else(|| cfg!(target_os = "windows"));
                         let mut in_win32_block: bool = false;
                         let mut in_else_block: bool = false;
                         for line in c_code.lines() {
@@ -2018,6 +2032,36 @@ fn real_main() {
                 "test_secret_branch_fail",
                 "test_secret_global_fail",
                 "test_secret_return_fail",
+                // @sensitive (CO7): consent-gated information flow
+                "test_sensitive_fail",
+                // CO6: a required config key no source supplies panics
+                "test_config_missing_fail",
+                // Proposal 0002: inference, bounds and turbofish arity
+                "test_generic_infer_fail",
+                "test_generic_bound_fail",
+                "test_turbofish_arity_fail",
+                // Release L1: safety annotations see methods, fn parameters,
+                // loop trip counts and @tainted parameters
+                "test_safety_method_alloc_fail",
+                "test_safety_indirect_fail",
+                "test_gas_loop_fail",
+                "test_tainted_param_fail",
+                // Release K4/K5: iterator invalidation, field borrows
+                "test_iter_invalidation_fail",
+                "test_field_borrow_fail",
+                // Release H4: a spawned call's arguments must be @send
+                "test_spawn_send_fail",
+                "test_safety_recursion_fail",
+                "test_firmware_os_fail",
+                "test_bounded_stack_fail",
+                // Release M11: owned and borrowed strings
+                "test_borrowed_str_return_fail",
+                "test_borrowed_str_pass_fail",
+                "test_scoped_store_fail",
+                "test_race_ptr_fail",
+                // Release E4: a missing DLL, a missing function in a DLL
+                "test_pe_dll_missing_fail",
+                "test_pe_dll_nofn_fail",
             ];
 
 
@@ -2142,6 +2186,8 @@ fn real_main() {
                 "test_lexer_harness",
                 "test_parser_harness",
                 "test_sl_debug",
+                // Bare-only (`fid emit --bare`): a hosted build panics
+                "test_bare_panic_handler",
             ];
 
             // C-codegen-only skip list — tests that pass on interpreter + PE
@@ -2173,6 +2219,7 @@ fn real_main() {
             // only with FIDES_TEST_EXTERNAL=1 (the library must be installed).
             let external_lib_tests: &[(&str, &str)] = &[
                 ("test_sqlite", "libsqlite3"),
+                ("test_pe_sqlite", "libsqlite3"),
                 ("test_lib_sdl", "SDL2"),
                 ("test_lib_ui", "SDL2"),
                 ("test_lib_audio_mixer", "SDL2"),
@@ -2252,7 +2299,14 @@ fn real_main() {
                         // Check stderr for "Panic:" or compilation errors.
                         // Error messages contain "error" (e.g. "Type error:", "Budget error (line 5):",
                         // "Region error (line N):", "Sandbox error:", "Capability error:", etc.)
-                        let stderr = String::from_utf8_lossy(&o.stderr).to_lowercase();
+                        // fid's progress lines ("[build] ... Checking errors...")
+                        // are not errors: leave them out (--compiler fid)
+                        let stderr: String = String::from_utf8_lossy(&o.stderr)
+                            .lines()
+                            .filter(|l| !l.starts_with('['))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                            .to_lowercase();
                         !stderr.contains("panic:") && !stderr.contains("error")
                     })
                     .unwrap_or(false);

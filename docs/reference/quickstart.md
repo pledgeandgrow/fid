@@ -16,6 +16,12 @@
 The installer adds `fides` to your PATH, associates `.fd` files, and creates
 Start Menu shortcuts. You can compile `.fd` files immediately.
 
+The v1.0.0 installer (Sep 9, 2026) names the compiler `fides.exe`. An
+installer built from the current tree (`installer/fides.nsi`) ships the
+self-hosted compiler as `fid.exe`, with `fidesc.exe`, `ark.exe`, `scribe.exe`
+and `veil.exe`; the commands below work the same with `fid` in place of
+`fides`. The work since v1.0.0 is not yet in a release.
+
 ### Build from Source
 
 ```bash
@@ -24,16 +30,17 @@ cd p-lang
 cargo build --release
 ```
 
-This produces `target/release/fidesc` (the Rust bootstrap compiler). Use it
-to compile Fides programs:
+This produces `target/release/fidesc`, the frozen Rust compiler that builds
+stage 1 of the self-hosted compiler. Then build `fid`, the release compiler:
 
 ```bash
-./target/release/fidesc ccompile hello.fd -o hello
+RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh    # 3 stages, fixpoint checked
+./release/fid ccompile hello.fd -o hello
 ./hello
 ```
 
-To build the self-hosted compiler (c3), see
-[selfhost.md](../selfhost/selfhost.md) § Build Pipeline.
+`fid` defines the language ([reference.md](reference.md)); `fidesc` checks
+less. See [selfhost.md](selfhost.md) § Build Pipeline.
 
 ## Your First Program
 
@@ -63,7 +70,16 @@ Hello, Fides!
 fides ccompile hello.fd -o hello.exe
 ```
 
-This generates C code, compiles it with gcc, and produces a native executable.
+This generates C code, compiles it with a C compiler (zig cc, clang, gcc or
+cl), and produces a native executable.
+
+## Native Windows Executable
+
+```bash
+fid emit hello.fd -o hello.exe
+```
+
+This writes the executable directly, with no C compiler.
 
 ## Run in Interpreter
 
@@ -74,12 +90,8 @@ fides run hello.fd
 ## Use the Standard Library
 
 ```fides
-use vec;
-use string;
-use math;
-
 fn main() -> void {
-    var v = Vec::new();
+    var v: Vec<i64> = Vec::new();
     v.push(1);
     v.push(2);
     v.push(3);
@@ -95,8 +107,8 @@ The installer (`Fides-Setup-1.0.0.exe`, 2.5 MB) includes:
 
 | Component | Description | Optional |
 |-----------|-------------|----------|
-| Fides Compiler | `fides.exe` — the compiler binary | No (required) |
-| Standard Library | 99 modules (core, vec, string, math, etc.) | Yes |
+| Fides Compiler | `fides.exe` — the compiler binary (`fid.exe` in installers built from the current tree) | No (required) |
+| Standard Library | 99 modules in v1.0.0 (137 in the tree on Nov 6) | Yes |
 | C Runtime | Runtime support files | Yes |
 | Documentation | Language reference, guides, roadmap | Yes |
 | Examples | Sample `.fd` programs | Yes |
@@ -112,7 +124,7 @@ Use **Add/Remove Programs** in Windows Settings, or run:
 
 ## Next Steps
 
-- Read the [language reference](../reference/)
+- Read the [language reference](reference.md)
 - Browse the [standard library](../../stdlib/)
 - Check the [roadmap](../roadmap/)
-- See the [self-hosting docs](../selfhost/) for compiler internals
+- See the [self-hosting docs](selfhost.md) for compiler internals

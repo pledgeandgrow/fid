@@ -26,6 +26,7 @@ module http;
 
 use json;
 use task;
+use signal;
 
 extern "C" include "<string.h>" {
     fn memmove as hc_memmove(dst: *u8, src: *u8, n: i64) -> *u8;
@@ -48,6 +49,28 @@ pub struct HttpRequest {
     pub names: Vec<str>,
     pub vals: Vec<str>,
     pub body: str,
+}
+
+/// The request a handler of http_serve_scoped borrows (release M11): its
+/// strings are freed when the response has been sent. Reading a field gives a
+/// borrowed `&str`, which the compiler keeps from being stored, returned or
+/// passed where an owned str is taken; `str_clone` makes an owned copy. A
+/// ScopedRequest itself cannot be kept (no field, global, collection or
+/// result may hold one). Headers: http_scoped_header.
+@scoped
+pub struct ScopedRequest {
+    pub method: str,
+    pub target: str,
+    pub path: str,
+    pub query: str,
+    pub version: str,
+    pub body: str,
+    raw: HttpRequest,
+}
+
+/// A header of a scoped request, as an owned copy ("" when absent).
+pub fn http_scoped_header(req: ScopedRequest, name: str) -> str {
+    return str_clone(http_header(req.raw, name));
 }
 
 /// Are two header names or tokens the same, ignoring case?
@@ -521,34 +544,115 @@ pub fn http_conn_write(c: i64, data: str) -> bool {
 
 // ─── Serving ──────────────────────────────────────────────────────────────
 
-fn http_not_found(req: HttpRequest) -> str {
+pub fn http_not_found(req: HttpRequest) -> str {
     return build_response(404, "text/plain", "Not Found\n");
 }
 
 var http_handler: fn(HttpRequest) -> str = http_not_found;
 var http_secure: bool = false;
 var http_scoped: bool = false;
+var http_user_handler: fn(HttpRequest) -> str = http_not_found;
+
+fn http_scoped_not_found(req: ScopedRequest) -> str {
+    return build_response(404, "text/plain", "Not Found\n");
+}
+
+var http_scoped_user: fn(ScopedRequest) -> str = http_scoped_not_found;
+
+/// A request for the scoped handler: /health answers itself, the rest gets a
+/// ScopedRequest over the request's own strings.
+fn http_scoped_dispatch(req: HttpRequest) -> str {
+    if req.path == "/health" && http_st != 0 && p_atomic_load(http_st + 16) != 0 {
+        return build_response(200, "application/json", "{\"status\":\"ok\"}\n");
+    }
+    val sreq: ScopedRequest = ScopedRequest {
+        method: req.method,
+        target: req.target,
+        path: req.path,
+        query: req.query,
+        version: req.version,
+        body: req.body,
+        raw: req,
+    };
+    val h: fn(ScopedRequest) -> str = http_scoped_user;
+    return h(sreq);
+}
+
+// Shared server state (CO8): [0] shutdown flag, [8] live-connection count,
+// [16] /health switch — atomic words, safe to touch from any task.
+var http_st: i64 = 0;
+
+/// Allocate and reset the shared server state; called by the serve paths,
+/// safe to call again.
+pub fn http_state_init() {
+    if http_st == 0 {
+        unsafe { http_st = p_shared_alloc(24); }
+        p_atomic_store(http_st, 0);
+        p_atomic_store(http_st + 8, 0);
+        p_atomic_store(http_st + 16, 1);
+    }
+}
+
+/// Ask a running server to stop: the accept loop ends within ~200 ms and
+/// live connections drain. Safe to call from any task.
+pub fn http_stop() {
+    if http_st != 0 {
+        p_atomic_store(http_st, 1);
+    }
+}
+
+/// Turn the built-in /health endpoint on (the default) or off.
+pub fn http_set_health(on: bool) {
+    if http_st == 0 { return; }
+    if on {
+        p_atomic_store(http_st + 16, 1);
+    } else {
+        p_atomic_store(http_st + 16, 0);
+    }
+}
+
+/// /health answers itself; everything else goes to the user's handler.
+pub fn http_health_handler(req: HttpRequest) -> str {
+    if req.path == "/health" && http_st != 0 && p_atomic_load(http_st + 16) != 0 {
+        return build_response(200, "application/json", "{\"status\":\"ok\"}\n");
+    }
+    val h: fn(HttpRequest) -> str = http_user_handler;
+    return h(req);
+}
 
 /// Serve one connection until it closes. The TLS handshake is here, so a client
 /// that stalls holds up only its own task.
 pub fn http_conn_task(c: i64) -> i64 {
+    if http_st != 0 { p_atomic_add(http_st + 8, 1); }
     if http_secure {
         val accept: fn(i64) -> i64 = http_tls_accept;
         val session: i64 = accept(hc_get(c, 0));
         if session == 0 {
             http_conn_close(c);
+            if http_st != 0 { p_atomic_add(http_st + 8, -1); }
             return 0;
         }
         hc_set(c, 1, session);
     }
     while true {
-        val req: HttpRequest = http_read_message(c, HTTP_IDLE_MS, false);
+        // While shutting down, idle keep-alive reads time out fast so the
+        // connection drains instead of lingering for the full idle window.
+        var idle: i64 = HTTP_IDLE_MS;
+        if http_st != 0 && p_atomic_load(http_st) != 0 {
+            idle = 500;
+        }
+        val req: HttpRequest = http_read_message(c, idle, false);
         if req.method == "" {
             break;
         }
-        val handler: fn(HttpRequest) -> str = http_handler;
         val keep: bool = http_keep_alive(req);
-        val response: str = handler(req);
+        var response: str = "";
+        if http_scoped {
+            response = http_scoped_dispatch(req);
+        } else {
+            val handler: fn(HttpRequest) -> str = http_handler;
+            response = handler(req);
+        }
         val sent: bool = http_conn_write(c, response);
         if http_scoped {
             http_request_free(req);
@@ -561,17 +665,30 @@ pub fn http_conn_task(c: i64) -> i64 {
         }
     }
     http_conn_close(c);
+    if http_st != 0 { p_atomic_add(http_st + 8, -1); }
     return 0;
 }
 
-/// Take connections off the listening socket, each its own task.
+/// Take connections off the listening socket, each its own task. On SIGTERM,
+/// SIGINT or http_stop() it stops accepting, drains live connections and
+/// closes the socket (CO8).
 pub fn http_accept_task(fd: i64) -> i64 {
-    while true {
-        val client: i64 = p_co_accept(fd);
-        if client >= 0 {
-            task_detach(task_go("http_conn_task", http_conn_new(client, 0)));
+    while http_st == 0 || p_atomic_load(http_st) == 0 {
+        if sig_shutdown_requested() {
+            if http_st != 0 { p_atomic_store(http_st, 1); }
+            break;
+        }
+        if task_wait_read(fd, 200) {
+            val client: i64 = p_co_accept(fd);
+            if client >= 0 {
+                task_detach(task_go("http_conn_task", http_conn_new(client, 0)));
+            }
         }
     }
+    while http_st != 0 && p_atomic_load(http_st + 8) > 0 {
+        task_sleep(50);
+    }
+    p_socket_close(fd);
     return 0;
 }
 
@@ -590,32 +707,40 @@ pub fn http_serve(port: i64, handler: fn(HttpRequest) -> str) -> bool {
     return true;
 }
 
-/// As http_serve, with memory that stays flat: after each response, the request's
-/// strings and the response are freed. The caller promises that `handler` keeps
-/// none of them past its return, nor returns one it holds elsewhere; a handler
-/// that wants to keep a string copies it (`s + ""`).
-@unsafe
-pub fn http_serve_scoped(port: i64, handler: fn(HttpRequest) -> str) -> bool {
+/// As http_serve, with memory that stays flat: after each response, the
+/// request's strings and the response are freed. The handler borrows the
+/// request (ScopedRequest): the compiler rejects a handler that keeps one of
+/// its strings, so this needs no promise (release M11; it was @unsafe).
+pub fn http_serve_scoped(port: i64, handler: fn(ScopedRequest) -> str) -> bool {
     http_scoped = true;
-    return http_serve(port, handler);
+    http_scoped_user = handler;
+    return http_serve(port, http_not_found);
 }
 
-/// For module `https`.
-pub fn http_set_scoped() {
+/// For module `https`: serve scoped requests with `handler`.
+pub fn http_set_scoped(handler: fn(ScopedRequest) -> str) {
     http_scoped = true;
+    http_scoped_user = handler;
 }
 
 /// Serve a listening socket from tasks and return: the caller goes on, and they
-/// run whenever it waits.
+/// run whenever it waits. /health answers itself (CO8).
 pub fn http_listen_tasks(fd: i64, handler: fn(HttpRequest) -> str) {
-    http_handler = handler;
+    http_state_init();
+    sig_register_shutdown();
+    http_user_handler = handler;
+    http_handler = http_health_handler;
     task_go("http_accept_task", fd);
 }
 
-/// Serve a listening socket until the process ends, over TLS if `secure` (module
-/// `https` has set it up).
+/// Serve a listening socket until SIGTERM, SIGINT or http_stop() asks for
+/// shutdown; live connections drain and the socket closes (CO8). Over TLS if
+/// `secure` (module `https` has set it up).
 pub fn http_serve_on(fd: i64, secure: bool, handler: fn(HttpRequest) -> str) {
-    http_handler = handler;
+    http_state_init();
+    sig_register_shutdown();
+    http_user_handler = handler;
+    http_handler = http_health_handler;
     http_secure = secure;
     task_go("http_accept_task", fd);
     task_run();

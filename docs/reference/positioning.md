@@ -2,6 +2,48 @@
 
 > Build it and they will come — only if switching is easy.
 
+> **Measured, Nov 6, 2026 — read this first.** Much of this document is the
+> strategy as written in Aug–Sep 2026, and several of its claims were goals,
+> not measurements. What is true today:
+>
+> - **Compile speed:** `fidesc emit` builds hello world in 0.39 s (Nov 3);
+>   `fid` turns its own 133,688 lines into C in ~133 s (about 1,000
+>   lines/s; type check 59 s, borrow check 16 s, lowering 20 s, C generation
+>   12 s) and `fidesc` in ~21 s. Go and Zig compile on the order of 100,000
+>   lines/s. "Sub-second" holds for small programs only.
+> - **Runtime speed:** fib(40) 1.34 s native, 0.81 s through C, 0.53 s Rust
+>   ([scoreboard](../roadmap/competitive-roadmap.md#the-scoreboard)).
+> - **Binary size:** hello world from `fidesc emit` is 113 KB; an HTTP server
+>   is 285 KB. The "< 4 KB" figures below are targets.
+> - **Hot reload:** `fidesc watch` recompiles a Linux ELF program on change
+>   and runs it again as a new process. It reports which functions changed;
+>   it does not swap code inside a running process. `fid watch` is not
+>   implemented. There is no `fidesc ai` command.
+> - **Borrow checker:** Fides has one (`--borrowck=on` by default); it is
+>   simpler than Rust's because references cannot be stored or returned.
+> - **Platforms:** native output is Windows x64 (`fid emit`; native async
+>   crashes); Linux through C; ARM64, RISC-V, WASM, macOS, native ELF and
+>   bare metal are experimental / incomplete ([platforms](platforms.md)). The
+>   embedded and robotics niches below depend on those targets.
+> - **Generics** (proposal 0002) are in `fid`: inference or an error, bounds
+>   checked, turbofish with arity check.
+> - **Memory:** no GC; the compiler frees what it can prove is finished
+>   (Vec/HashMap locals, owned elements, region collections, string
+>   temporaries); everything else lives until exit. Copy-on-write value
+>   semantics (proposal 0001) are written and switched off: `var b = a` on a
+>   `Vec` aliases.
+> - **Safety annotations** are 17 checked rules
+>   ([safety-rules.md](safety-rules.md)); `fid qualify` writes evidence that
+>   always says `NOT_QUALIFIED`. Fides is not suitable for medical,
+>   automotive or avionics use: the medical, automotive and avionics sections
+>   below describe a direction, not a product.
+> - **Tests:** the full suite last ran on Nov 2 (interp 339/339, C 343/343,
+>   PE 345/345, expected-fail 89/89); it has not been rerun with the Nov 4–6
+>   compiler.
+>
+> Numbers: [CURRENT.md → Numbers](../../CURRENT.md#numbers).
+
+
 ## The Adoption Problem
 
 Every new language faces the chicken-and-egg problem:
@@ -27,24 +69,24 @@ Every new language faces the chicken-and-egg problem:
 - **Why not Rust:** Async doesn't support real-time well, no hot reload
 - **Why not C:** No memory safety, no real-time guarantees
 - **Target users:** Robotics startups, autonomous vehicle teams
-- **Killer feature:** Hot-reload control code on a running robot without safety violations
+- **Killer feature (target):** Hot-reload control code on a running robot without safety violations — today `watch` restarts the program
 
 ### Niche 3: Safe Embedded Systems
 - **Why Fides wins:** Memory safety + tiny binaries + deterministic memory + RISC-V support
 - **Why not Rust:** Compile times too slow, borrow checker too rigid for embedded patterns
 - **Why not C:** 70% of CVEs are memory safety issues
 - **Target users:** IoT device manufacturers, medical device companies
-- **Killer feature:** Memory-safe firmware with < 4KB binary size
+- **Killer feature (target):** Memory-safe firmware with < 4KB binary size — not measured; ARM64/RISC-V runtimes are still stubs
 
-> **Status update — what's WORKING now:**
-> - ✅ **Bare-metal mode** — no-libc, no-OS targets are functional
-> - ✅ **RISC-V target** — `codegen_riscv.rs` emits RISC-V assembly
-> - ✅ **FixedBufferAllocator** — deterministic, no-allocation embedded memory management is operational (`src/embedded.rs`)
-> - ✅ **Hot reload** — native JIT + function-level change detection works
-> - ✅ **C interop** — C header parser → Fides FFI bindings (`src/cparser.rs`) is functional
-> - ✅ **C codegen backend** — 164/165 test parity
+> **Status (Nov 6, 2026):**
+> - ❌ **Bare-metal mode** — `fid emit --bare` panics
+> - ⚠️ **RISC-V target** — `codegen_riscv.rs` emits RISC-V assembly; the runtime is stubs
+> - ✅ **FixedBufferAllocator** — `src/embedded.rs` (Rust compiler)
+> - ⚠️ **Hot reload** — function-level change detection, then rebuild and restart
+> - ✅ **C interop** — C header parser → Fides FFI bindings (`src/cparser.rs`); `parse-header` on SDL2/SQLite headers is open
+> - ✅ **C codegen backend** — 343/343 tests match the interpreter (Nov 2)
 >
-> These niches are no longer aspirational — the foundational capabilities are built and running.
+> These niches remain aspirational until the embedded targets work.
 
 ---
 
@@ -66,7 +108,7 @@ Every new language faces the chicken-and-egg problem:
 - **Why Fides wins:** Fast compilation + single binary output + no runtime
 - **Migration path:** Simple syntax, familiar to Rust/Go developers
 - **Target users:** Go/Rust CLI tool developers
-- **Killer feature:** Sub-second compile + hot reload during development
+- **Killer feature:** Sub-second compile for small programs + recompile-on-save (`watch`) during development
 
 ---
 
@@ -123,44 +165,31 @@ extern "C" fn SSL_CTX_new(method: *const SSL_METHOD) -> *mut SSL_CTX;
 
 ## Developer Experience — The Secret Weapon
 
-### Sub-Second Compilation
+### Fast Compilation (small programs)
 ```
-$ fidesc build
-Built in 0.3s   ← not 30 minutes
+$ fidesc emit hello.fd
+Emitted native executable (113152 bytes)   ← 0.39 s, Nov 3
 ```
+Large programs are slower: the compiler itself (133,688 lines) takes about
+133 s to turn into C with `fid` (CS1–CS7 in the competitive roadmap).
 
-### Hot Reload
-```
-$ fidesc watch
-Running... (PID 12345)
-File changed: src/main.fd
-Reloaded in 45ms   ← not a full rebuild
-```
+### Hot Reload (target)
+`fidesc watch` rebuilds and reruns the program on save and reports which
+functions changed; it does not swap code in a running process, and `fid
+watch` runs `bench`. In-process reload is a target.
 
 ### Clear Error Messages
+Every error carries an `Exxx` code ([diagnostics.md](diagnostics.md)) and
+the source line. There is no region use-after-free check; the compile-time
+memory errors are borrow and reference-escape errors, for example:
 ```
-Error: use-after-free detected at compile time
-  → src/main.fd:12:5
-   |
-12 |   print(buf[0]);
-   |         ^^^
-   |         buf was freed at line 10
-   |
-   = region r1 was freed at line 10
-   = buf was allocated in region r1 at line 5
-   = help: move the free_region call after the last use of buf
+error: 'r' would outlive 'b'
 ```
 
 ### AI-Assisted Development
-```
-$ fidesc ai "refactor this function to use effect handlers"
-Analyzing...
-Proposed change:
-  - Replace async/await with effect handler
-  - Add !IO effect annotation
-  - Remove Send bound (not needed with effects)
-Apply? [y/n]
-```
+There is no `fidesc ai` or `fid ai` command. The language reference
+([reference.md](reference.md)) cites the compiler function behind each rule,
+which is what an AI assistant needs to write Fides that compiles.
 
 ---
 
@@ -290,42 +319,42 @@ Advocacy (people recommend Fides to others)
 | Dimension | Current | Target | How |
 |---|---|---|---|
 | Performance | 7/10 | 9/10 | Custom codegen with 23 opt passes (enabled by default), LTO (`--lto`), loop vectorization + SLP (SSE2, constant trips). No PGO, no variable-trip vectorization. LLVM is 20+ years ahead but gap is narrowing. |
-| Safety | 9/10 | 10/10 | Regions + capabilities + effects + sandbox + borrow checker all enforced at compile time. No data race prevention yet. Binary hardening (stack canaries, PIE, RELRO, NX stack). |
-| Flexibility | 8/10 | 10/10 | Inline assembly (x86 only), bare metal, comptime, FFI, dynamic loading, conditional compilation, cross-compilation (ARM64, RISC-V, Windows) — all working. No C++ interop. |
-| Compilation | 10/10 | 10/10 | Custom IR, no LLVM, integrated linker, sub-second for small projects |
-| Ecosystem | 2/10 | 8/10 | Package manager (ark) implemented, no crates registry yet, doc generator (scribe) implemented, 99 stdlib modules. Rust has 100k+ crates. C has everything. |
+| Safety | 8/10 | 10/10 | Capabilities + effects + sandbox + borrow checker + reference escape check + 17 safety rules enforced at compile time. Data races: globals need a lock, spawned arguments must be `@send`; a `Vec` passed to a thread is shared unchecked. `var b = a` on a `Vec` aliases (copy-on-write off). Binary hardening (stack canaries, PIE, RELRO, NX stack). |
+| Flexibility | 7/10 | 10/10 | Inline assembly (x86 only), comptime, FFI, dynamic loading, conditional compilation. Bare metal and ARM64/RISC-V are incomplete. No C++ interop. |
+| Compilation | 5/10 | 10/10 | Custom IR, no LLVM, integrated linker on Windows. Sub-second for small programs; ~1,000 lines/s for `fid` on large ones (Nov 6) |
+| Ecosystem | 2/10 | 8/10 | Package manager (ark) implemented, no crates registry yet, doc generator (scribe) implemented, 137 stdlib modules. Rust has 100k+ crates. C has everything. |
 | Metaprogramming | 8/10 | 10/10 | comptime is powerful: `@derive(Debug/Clone/Serialize/Deserialize)`, `comptime gen { }`, reflection. No procedural macros. |
-| Concurrency | 6/10 | 10/10 | OS threads (`spawn`), bounded MPSC channels, executor runtime, async IO, `select` statement. No data race prevention, no atomics, no green threads. |
+| Concurrency | 6/10 | 10/10 | OS threads (`spawn`, `@send` arguments), `parallel { }`, green tasks (`async fn`, `task` module), bounded MPSC channels, `select`, atomics (`use atomic`). Native async crashes. |
 | Developer velocity | 9/10 | 10/10 | Hot reload + persist + watch --diff + LSP (completion/hover/goto-def) + formatter + linter + bench + stack traces. No debugger, no profiler. |
 | Security | 9/10 | 10/10 | sandbox + cap-aware linking + @constant_time + @tainted + binary hardening — compile-time, zero runtime cost. Best-in-class. |
 | Tooling | 6/10 | 8/10 | LSP (diagnostics + completion + hover + goto-def), formatter, linter, bench, stack traces. Debugger (probe/fidesc debug) implemented, profiler (pulse/fidesc bench) partial, doc generator (scribe) implemented, package manager (ark) implemented, coverage tool (veil) implemented. Rust has cargo + rust-analyzer + rustfmt + clippy + rustdoc. |
 | Community | 1/10 | 7/10 | Independent, no corporate backing. Rust has Mozilla/AWS/Google. Zig has Zig Foundation. |
 
-> **Current state (verified Aug 2026):**
-> - ✅ **Compilation is fast** — sub-second for small projects (custom IR, no LLVM, integrated linker)
-> - ✅ **Safety works** — regions + effects + capabilities + borrow checker are enforced at compile time
-> - ✅ **Hot reload works** — native JIT + function-level change detection + `persist` variables
+> **Current state (Aug 2026, corrected Nov 6):**
+> - ⚠️ **Compilation is fast only for small programs** — sub-second for hello world; the 133,688-line compiler takes ~133 s with `fid` (Nov 6)
+> - ✅ **Safety checks work** — effects + capabilities (per call) + borrow checker + escape check are enforced at compile time; regions are scopes with budgets
+> - ⚠️ **Hot reload is recompile-and-restart** — `fidesc watch` rebuilds and reruns (Linux ELF), reports changed functions, keeps `persist` variables; no in-process swap
 > - ✅ **Custom toolchain works** — self-hosted codegen, linker, ELF/PE/Mach-O/COFF emitters
 > - ✅ **`sandbox { }` works** — compile-time capability revocation, zero runtime cost
 > - ✅ **Memory budgets work** — `region r with budget(N)` enforced at compile time
 > - ✅ **`watch --diff` works** — PIR L2 line diff + binary size delta on each reload
 > - ✅ **Capability-aware linking works** — `--caps` flag strips ungranted functions from binary
 > - ✅ **Optimizer enabled by default** — 23 passes including const-fold, CSE, GVN, DCE, DSE, inline, unroll, TCO, loop-vec, SLP. `--lto` for aggressive cross-module inlining.
-> - ✅ **C codegen at 164/165 test parity** — all normal tests match (1 fail: test_compiler_sized, user-added). Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic.
+> - ✅ **C codegen at 343/343 test parity** (Nov 2 full suite). Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic.
 > - ✅ **LSP server works** — `fidesc lsp` provides JSON-RPC over stdio with diagnostics, completion, hover, goto-definition. No external dependencies.
-> - ✅ **Generic enums/structs work** — `enum Option<T>`, `struct Foo<T>` with type parameters
+> - ✅ **Generics work** — `enum Option<T>`, `struct Foo<T>`, generic functions with inference, checked bounds and turbofish (`fid`)
 > - ✅ **Concurrency works** — `spawn` (OS threads), bounded MPSC channels (`p_chan_*`), executor runtime (`p_executor_*`), async IO (`p_net_*`, `p_fs_read_async`), `select` statement
 > - ✅ **Tooling works** — `fidesc fmt` (formatter), `fidesc lint` (linter), `fidesc bench` (benchmarking), stack traces on panic
 > - ✅ **Type inference works** — Bidirectional (contextual literals, `-> _` return type inference)
 > - ✅ **Auto-vectorization works** — Loop-vec (constant trips) + SLP (p_simd_load/store/add/sub/mul/div → SSE2)
-> - ✅ **99 stdlib modules** — core, vec, math, channel, sync, ecs, events, parallel, db, http, json, file, time, uefi, and more
+> - ✅ **137 stdlib modules** (Nov 6) — core, vec, math, channel, sync, atomic, task, ecs, events, parallel, db, http, json, file, time, and more (uefi moved to fides-os)
 > - ✅ **Binary hardening** — All C codegen output compiled with stack canaries, PIE/ASLR, full RELRO, NX stack
 > - ✅ **Security annotations** — `@constant_time` (side-channel defense), `@tainted` (injection defense)
 > - ⚠️ **Package manager (ark)** — path/git deps implemented, registry pending
-> - ❌ **No debugger** — no DWARF debug info, no breakpoint support
-> - ✅ **Cross-compilation** — `build --target arm64-linux`, `--target riscv64-linux`, `--target x86-64-windows` all produce valid executables with zero external tools
-> - ❌ **No green threads** — concurrency uses OS threads, not lightweight coroutines
-> - ❌ **No data race prevention** — no Send/Sync equivalent (planned)
+> - ⚠️ **Debugger** — `fidesc debug` (interpreter); no DWARF debug info
+> - ⚠️ **Cross-compilation** — `build --target arm64-linux`/`riscv64-linux` exist and are experimental; ARM64/RISC-V runtimes are stubs
+> - ✅ **Green tasks** — `async fn` runs as a task on its own stack (interpreter and C; native async crashes)
+> - ⚠️ **Data race checks** — `@send` arguments for `spawn`, locked writes to globals; data shared through a `Vec` handle or pointers is not checked
 
 ---
 
@@ -341,9 +370,9 @@ Advocacy (people recommend Fides to others)
 7. **`watch --diff` optimizer visibility** — ✅ IMPLEMENTED (impossible with LLVM-based compilers)
 8. **Capability-aware linking** — ✅ IMPLEMENTED (no linker strips code based on capabilities)
 9. **comptime metaprogramming** (Zig has it but not type-safe at declaration, Rust uses macros)
-10. **Hot reload** (No systems language has this — Erlang has hot reload but it's not a systems language)
+10. **Recompile-on-save** (`fidesc watch`, Linux only; restarts the program — not in-process hot reload yet)
 11. **Custom toolchain** (Every modern language uses LLVM — we don't. But this also means no LLVM optimizations)
-12. **No external dependencies** (No LLVM, no libc, no external linker, no assembler. But also: no LLVM ecosystem, no libc compatibility layer)
+12. **Few external dependencies** (No LLVM, no external linker or assembler on the native Windows path, which still imports kernel32 and msvcrt; other targets need a C compiler. But also: no LLVM ecosystem)
 13. **Built-in LSP server** — ✅ IMPLEMENTED (`fidesc lsp` with completion, hover, goto-def. No external deps.)
 14. **`@constant_time` annotation** — ✅ IMPLEMENTED (prevents timing side-channel attacks. No other language has this.)
 15. **`@tainted` annotation** — ✅ IMPLEMENTED (prevents injection attacks. No other language has this as a language feature.)
@@ -397,23 +426,22 @@ Zig, Go, C, or Python today that you cannot do in Fides.
 | Feature | Rust | Zig | Go | C | Fides |
 |---------|------|-----|-----|---|-------|
 | OS threads | ✅ `std::thread` | ✅ `std.Thread` | ✅ goroutines (runtime) | ✅ pthreads | ✅ `spawn` + `p_thread_spawn` |
-| Data race prevention | ✅ Send/Sync (compile-time) | ❌ None | ✅ Race detector (runtime) | ❌ None | ❌ Not yet (planned) |
+| Data race prevention | ✅ Send/Sync (compile-time) | ❌ None | ✅ Race detector (runtime) | ❌ None | ⚠️ `@send` for spawned arguments, locked global writes; shared `Vec` handles unchecked |
 | Channels / message passing | ✅ `std::sync::mpsc` | ❌ None | ✅ Built-in channels | ⚠️ Manual | ✅ `p_chan_*` bounded MPSC channels |
 | Mutex / RwLock / Condvar | ✅ `std::sync` | ⚠️ Basic | ✅ `sync` package | ⚠️ pthreads | ⚠️ pthread mutex+condvar (C codegen) |
 | Async runtime | ✅ Tokio (mature) | ❌ None | ✅ Built-in (goroutines) | ❌ None | ✅ Executor runtime (`p_executor_*`) |
 | Async file I/O | ✅ tokio::fs | ❌ None | ✅ Built-in | ❌ None | ✅ `p_fs_read_async`, `p_net_*` |
 | Parallel iterators | ✅ rayon | ❌ None | ⚠️ errgroup | ⚠️ OpenMP | ⚠️ `stdlib/parallel.fd` (basic) |
-| Atomic operations | ✅ `std::sync::atomic` | ✅ `@atomicLoad` | ✅ `sync/atomic` | ✅ `stdatomic.h` | ❌ Not yet |
-| Thread-safe ref counting | ✅ `Arc<T>` | ❌ None | ✅ Built-in | ❌ None | ❌ Not yet |
+| Atomic operations | ✅ `std::sync::atomic` | ✅ `@atomicLoad` | ✅ `sync/atomic` | ✅ `stdatomic.h` | ✅ `use atomic` (all orders run as SeqCst) |
+| Thread-safe ref counting | ✅ `Arc<T>` | ❌ None | ✅ Built-in | ❌ None | ⚠️ `Arc<T>` with manual `clone`/`drop` |
 | Select statement | ❌ None | ❌ None | ✅ `select` | ❌ None | ✅ `select { case ch => x => { } }` |
 
 **Impact:** Fides now has working concurrency: OS threads (`spawn`), bounded
 MPSC channels (`p_chan_*`), an executor runtime with non-blocking poll
-(`p_executor_*`), async IO (`p_net_*`, `p_fs_read_async`), and Go-style
-`select` statements for multi-channel multiplexing. Data race prevention
-(Send/Sync equivalent) and atomics are still missing. Rust's concurrency is
-more mature (Send/Sync, Tokio ecosystem), but Fides has feature parity with
-Go's basic concurrency model.
+(`p_executor_*`), async IO (`p_net_*`, `p_fs_read_async`), Go-style
+`select` statements for multi-channel multiplexing, green tasks, atomics and
+`@send` checks on spawned arguments. Rust's concurrency is more mature
+(Send/Sync, Tokio ecosystem).
 
 ### Tooling & Developer Experience
 
@@ -490,7 +518,7 @@ it does.
 | Path manipulation | ✅ std::path | ✅ path/filepath | ✅ os.path | ❌ Not yet |
 | Process management | ✅ std::process | ✅ os/exec | ✅ subprocess | ⚠️ Basic (stdlib/process.fd) |
 
-**Impact:** Fides's stdlib has ~99 modules. Rust's crates.io has 100k+.
+**Impact:** Fides's stdlib has 137 modules (Nov 6). Rust's crates.io has 100k+.
 Even Go's standard library is vast. For any real project, you'll need
 to build infrastructure that other languages give you for free.
 
@@ -501,10 +529,10 @@ to build infrastructure that other languages give you for free.
 | Iterators / generators | ✅ Iterator trait | ⚠️ Basic | ⚠️ Basic | ❌ None | ✅ `for x in vec`, adapters |
 | Trait `Display`/`Debug` | ✅ Derive macros | ❌ None | ✅ Stringer | ❌ None | ✅ `@derive(Debug)` |
 | `From`/`Into` conversions | ✅ Traits | ❌ None | ❌ None | ❌ None | ❌ Not yet |
-| `Drop` trait (custom cleanup) | ✅ Trait | ✅ `defer` | ✅ `defer` | ❌ None | ✅ `defer` (no custom Drop) |
+| `Drop` trait (custom cleanup) | ✅ Trait | ✅ `defer` | ✅ `defer` | ❌ None | ⚠️ `defer`; a `drop` method runs at function exit for locals with an explicit struct type |
 | `Copy`/`Clone` traits | ✅ Derive | ⚠️ Implicit | ⚠️ Implicit | ⚠️ Implicit | ✅ `@derive(Clone)` |
-| `Default` trait | ✅ Derive | ❌ None | ❌ None | ❌ None | ❌ Not yet |
-| `PartialEq`/`Eq`/`Hash`/`Ord` | ✅ Derive | ❌ None | ⚠️ Built-in | ❌ None | ❌ Not yet |
+| `Default` trait | ✅ Derive | ❌ None | ❌ None | ❌ None | ✅ `@derive(Default)` |
+| `PartialEq`/`Eq`/`Hash`/`Ord` | ✅ Derive | ❌ None | ⚠️ Built-in | ❌ None | ⚠️ `@derive(PartialEq, Eq)`; struct `==` compares fields; no `Hash`/`Ord` |
 | Serialization (serde) | ✅ serde (gold standard) | ❌ None | ✅ encoding/json | ❌ None | ✅ `@derive(Serialize/Deserialize)` |
 | `#[derive]` macros | ✅ Powerful | ❌ None | ❌ None | ❌ None | ✅ `@derive(Debug/Clone/Serialize/Deserialize)` |
 | Error trait / error chaining | ✅ `std::error::Error` | ❌ None | ✅ `error` type | ❌ None | ✅ `?` operator, `try {}`, Result<T,E> |
@@ -527,8 +555,9 @@ to build infrastructure that other languages give you for free.
 with adapters, `@derive(Debug/Clone/Serialize/Deserialize)`, `?` error chaining,
 `try {}` blocks, conditional compilation (`@cfg`), dynamic loading (`p_dl_*`),
 type inference (bidirectional + `-> _`), and `select` for channels. Still
-missing: `From`/`Into` conversions, `Default`, `PartialEq`/`Eq`/`Hash`/`Ord`
-derive, non-exhaustive enums, feature flags, workspaces, panic recovery.
+missing: `From`/`Into` conversions, `Hash`/`Ord` derive, non-exhaustive
+enums, feature flags, workspaces, panic recovery, `where` clauses, nested and
+or-patterns.
 
 ### Platform & Interop
 
@@ -641,7 +670,7 @@ Fides's authority is explicit and revocable, verified at compile time.
 | Inline assembly | ✅ Yes (all architectures) | ⚠️ Yes (`asm!`) — x86 only |
 | Bare metal support | ✅ Yes | ✅ Yes (`--bare` mode, interrupt handlers) |
 | SIMD | ✅ Yes (intrinsics, auto-vec) | ✅ Yes (stdlib `simd.fd` + auto-vec) |
-| Compilation speed | ⚠️ Fast but needs external tools | ✅ Faster (no external linker, no assembler) |
+| Compilation speed | ⚠️ Fast but needs external tools | ⚠️ Not measured against Zig; `fid` ~1,000 lines/s on large code (Nov 6) |
 | Binary size | ⚠️ Can be small with effort | ✅ Smaller by default (DCE, no libc, `--caps` stripping) |
 
 **Verdict:** C wins on raw code quality today (LLVM/GCC have 40+ years of
@@ -837,28 +866,29 @@ Fides can.
 | Inline assembly | ✅ Yes (`asm!`, all arches) | ⚠️ Yes (`asm!`) — x86 only |
 | Bare metal | ✅ Yes (`no_std`) | ✅ Yes (`--bare`) |
 | SIMD | ✅ Yes (std::simd, auto-vec) | ✅ Yes (stdlib `simd.fd` + auto-vec) |
-| Compilation speed | ❌ 2/10 (25-30 min for large projects) | ✅ 10/10 (sub-second, no LLVM) |
+| Compilation speed | ❌ Slow on large projects | ⚠️ Sub-second for small programs; ~133 s for `fid`'s own 133,688 lines (Nov 6) |
 | Binary size | ⚠️ Moderate (monomorphization bloat) | ✅ Small (DCE + `--caps` stripping) |
 | Escape analysis | ✅ LLVM | ❌ Not yet |
 | Tail call optimization | ✅ LLVM | ✅ TCO (enabled by default) |
 
-**Verdict:** Rust wins on code quality today (LLVM is mature). Fides wins
-massively on compilation speed — this is Rust's #1 pain point and Fides's
-#1 advantage. For iteration speed, Fides is 10-100x faster to compile.
+**Verdict:** Rust wins on code quality today (LLVM is mature): fib(40) runs
+in 0.53 s against 1.34 s for native Fides (Nov 2). Compile speed is meant to
+be Fides's advantage, but it is not yet measured against Rust on the same
+program (competitive roadmap BM6).
 
 ### Developer Experience
 
 | Feature | Rust | Fides |
 |---------|------|---|
-| Hot reload | ❌ None (full recompile) | ✅ `fidesc watch` (native JIT) |
+| Hot reload | ❌ None (full recompile) | ⚠️ `fidesc watch` recompiles and restarts (Linux) |
 | Persist state across reloads | ❌ None | ✅ `persist val x = 0;` |
 | See optimizer changes | ❌ None (LLVM black box) | ✅ `fidesc watch --diff` |
 | REPL | ❌ None (evcxr is external) | ✅ `fidesc repl` |
 | Error messages | ✅ Excellent (detailed, helpful, with suggestions) | ⚠️ Basic (line/column, no suggestions) |
-| Borrow checker fights | ❌ Daily reality | ✅ No borrow checker |
+| Borrow checker fights | ❌ Daily reality | ✅ Simpler borrow checker: no lifetime annotations, references cannot be stored |
 | Async complexity | ❌ "Suffering" (their word) | ✅ Effect handlers + executor (no coloring) |
-| Compile times | ❌ 25-30 min (large projects) | ✅ Sub-second (small projects) |
-| Incremental compilation | ⚠️ Partial (still slow) | ✅ Function-level hot reload |
+| Compile times | ❌ Slow on large projects | ⚠️ Sub-second for small programs; not yet compared on large ones |
+| Incremental compilation | ⚠️ Partial (still slow) | ⚠️ Function-level change detection; whole program rebuilt |
 | IDE: diagnostics | ✅ rust-analyzer | ✅ `fidesc lsp` |
 | IDE: completion | ✅ rust-analyzer | ✅ `fidesc lsp` (keywords + symbols) |
 | IDE: goto-def | ✅ rust-analyzer | ✅ `fidesc lsp` |
@@ -983,8 +1013,8 @@ tooling.
 
 | Dimension | Winner | Why |
 |-----------|--------|-----|
-| Compilation speed | **Fides** | Sub-second vs 25-30 min. Not close. |
-| Developer velocity | **Fides** | Hot reload + persist + watch --diff + no borrow checker fights. |
+| Compilation speed | Not measured | Goal, not result: no same-program comparison yet (BM6). |
+| Developer velocity | **Fides** (claimed) | Recompile-on-save + persist + watch --diff + a simpler borrow checker. |
 | Security model | **Fides** | Capabilities + sandbox + cap-aware linking. Rust has nothing. |
 | Effect system | **Fides** | `!IO`, `!Net`, `!Spawn` tracking. Rust has no effects. |
 | Metaprogramming | **Fides** | One unified comptime vs two macro systems. Simpler, type-safe. |
@@ -1000,7 +1030,7 @@ tooling.
 | Tooling | **Rust** | cargo + rustfmt + clippy + rustdoc + cargo-fuzz + criterion. Fides has fmt + lint + bench but no debugger/profiler/doc-gen/package-manager. |
 | Corporate backing | **Rust** | Mozilla, AWS, Google, Microsoft. Fides is independent. |
 | Community | **Rust** | Large, active, 90k+ GitHub stars. Fides is just starting. |
-| Standard library | **Rust** | Vast (collections, net, io, sync, fs, process, etc.). Fides has 99 modules. |
+| Standard library | **Rust** | Vast (collections, net, io, sync, fs, process, etc.). Fides has 137 modules. |
 | Error messages | **Rust** | Gold standard — detailed, helpful, with suggestions. Fides has structured errors with codes + suggestions. |
 | Debugging | **Rust** | Full DWARF, gdb/lldb, backtraces. Fides has stack traces but no debugger. |
 | Cross-compilation | **Tie** | Rust has `cargo build --target`. Fides has zero-tool `--target arm64-linux|riscv64-linux|x86-64-windows`. Both work well. |
@@ -1196,7 +1226,7 @@ just works. Fides requires per-target codegen invocation.
 
 | Dimension | Winner | Why |
 |-----------|--------|-----|
-| Memory safety | **Fides** | Compile-time regions. Zig has nothing. |
+| Memory safety | **Fides** | Run-time bounds and overflow checks; compile-time borrow and reference-escape checks; no GC, values the compiler cannot prove finished leak. Zig has nothing comparable. |
 | Security | **Fides** | Capabilities + sandbox + cap-aware linking. Zig has nothing. |
 | Effect system | **Fides** | `!IO`, `!Net`, `!Spawn` tracking. Zig has no effects. |
 | Compile-time memory budget | **Fides** | `region r with budget(N)`. Zig panics at runtime. |
@@ -1237,7 +1267,7 @@ a runtime and GC while Fides is bare-metal with manual region management.
 | Feature | Go | Fides |
 |---------|-----|-------|
 | Concurrency | ✅ Goroutines + channels (excellent, battle-tested) | ✅ Threads + channels + select + executor |
-| Standard library | ✅ Vast (net, http, json, crypto, sql, encoding, etc.) | ⚠️ 99 modules, basic |
+| Standard library | ✅ Vast (net, http, json, crypto, sql, encoding, etc.) | ⚠️ 137 modules, basic |
 | Tooling | ✅ go fmt + go vet + gopls + pprof + delve | ⚠️ fmt + lint + LSP + bench (no debugger/profiler) |
 | Cross-compilation | ✅ `GOOS=x GOARCH=y go build` | ✅ Zero-tool (`--target`) |
 | Build speed | ✅ Fast (compiled language) | ✅ Faster (no runtime, no LLVM) |
@@ -1261,7 +1291,7 @@ a runtime and GC while Fides is bare-metal with manual region management.
 
 | Feature | Fides | Go |
 |---------|-------|-----|
-| Memory safety | ✅ Compile-time regions | ❌ GC (runtime, stop-the-world pauses) |
+| Memory safety | ✅ Compile-time borrow and escape checks, no GC (leaks what it cannot prove finished) | ❌ GC (runtime, stop-the-world pauses) |
 | No GC pauses | ✅ No runtime, no GC | ❌ GC pauses (even if short) |
 | Deterministic cleanup | ✅ Region-based, `defer` | ❌ GC is non-deterministic |
 | Zero runtime overhead | ✅ No runtime at all | ❌ Goroutine scheduler, GC, stack growth |
@@ -1328,7 +1358,7 @@ for developer experience, library availability, and ease of use.
 | Performance | ✅ Compiled, native speed | ❌ Interpreted, 10-100x slower |
 | Memory usage | ✅ Minimal (no runtime) | ❌ High (interpreter + objects) |
 | Startup time | ✅ Instant (native binary) | ❌ Slow (interpreter startup) |
-| Memory safety | ✅ Compile-time regions | ⚠️ GC (no use-after-free, but GC pauses) |
+| Memory safety | ✅ Compile-time borrow and escape checks, no GC (leaks what it cannot prove finished) | ⚠️ GC (no use-after-free, but GC pauses) |
 | Type safety | ✅ Compile-time static typing | ❌ Runtime type errors (mypy is optional) |
 | Concurrency | ✅ Threads + channels + select | ⚠️ GIL limits threading (asyncio helps) |
 | Bare metal | ✅ `--bare` mode | ❌ Requires interpreter |
@@ -1537,11 +1567,11 @@ exceeds gas. That's something Solidity cannot do.
 | `@realtime` | Compiler analyzes WCET, rejects malloc, rejects unbounded loops | C (manual), Rust (no WCET), Zig (no WCET) |
 | `@interrupt` | Compiler generates ISR code, vector table, register save/restore, RETI | C (manual asm), Rust (manual) |
 | `@firmware` | Compiler strips OS deps, bare metal startup, rejects heap | C (manual linker scripts), Rust (no_std but manual) |
-| `@watchdog` | Compiler auto-inserts watchdog kicks at safe points (loop boundaries) | C (manual), Rust (manual) |
-| `@lowpower` | Compiler inserts WFI/WFE sleep, gates clocks, estimates battery life | C (manual), Rust (no support) |
+| `@watchdog` (not implemented) | Planned: watchdog kicks at safe points (loop boundaries) | C (manual), Rust (manual) |
+| `@lowpower` (not implemented) | Planned: WFI/WFE sleep, clock gating | C (manual), Rust (no support) |
 | Region system | Memory safety without GC, without borrow checker complexity | Rust (borrow checker is hard), C (unsafe) |
 | `@deterministic` | Provably no FP/random/IO in control loop | C (manual review), Rust (no enforcement) |
-| `@pool` | Zero-allocation object pools for sensor data | C (manual), Rust (arena libraries) |
+| `@pool` (not implemented) | Planned: zero-allocation object pools for sensor data | C (manual), Rust (arena libraries) |
 
 ### What They Lose
 
@@ -1618,16 +1648,17 @@ Step 2: Use @audit for automatic FDA-compliant audit trail
 Step 3: Use sandbox { } to isolate patient data access
 Step 4: Use @crashfree to prove the device controller cannot panic
 Step 5: Use effect system to prove pure functions are actually pure
-Step 6: Submit for FDA certification — Fides's compile-time proofs strengthen the case
+Step 6: (future) Submit for FDA certification — not possible today
 ```
 
 ### Verdict
 
-🟢 **Worth it for new medical devices.** `@deterministic` eliminating FP/IO/
-random at compile time is exactly what medical device developers need. The
-`@audit` auto-instrumentation saves thousands of lines of manual logging.
-The barrier is regulatory certification, but Fides's compile-time guarantees
-should make certification *easier*, not harder.
+🔴 **Not usable for medical devices today.** Fides is not suitable for
+medical, automotive or avionics use: the compiler is not qualified, `fid
+qualify` produces evidence marked `NOT_QUALIFIED`, and the full test suite
+has not been rerun on the current compiler. `@deterministic`, `@audit` and
+`@crashfree` are checked rules that a future qualification effort could build
+on.
 
 **Killer demo:** A drug dosage calculator in Fides with `@deterministic` (no FP,
 integer-only math), `@audit` (auto-logged every call), and `@crashfree`

@@ -1,7 +1,18 @@
 # Fides Compiler Architecture
 
 **Version:** 0.6.0
-**Targets:** x86_64 (Windows PE + Linux ELF64), ARM64 (Linux ELF64 cross-compilation), RISC-V (Linux ELF64 cross-compilation), Mach-O (macOS), COFF (Windows), WebAssembly, SPIR-V (GPU), bare-metal flat binary, C codegen, IR interpreter
+**Targets:** working: IR interpreter (`fid run`), C codegen (`fid ccompile`), native Windows x64 PE (`fid emit`); Linux x64 through C. Experimental / incomplete: native Linux ELF64, ARM64, RISC-V, Mach-O, COFF, WebAssembly, SPIR-V (GPU), bare-metal flat binary (`emit --bare` panics).
+
+> **Current state (Nov 6, 2026).** The release compiler is the self-hosted
+> `fid` (`compiler/*.fd`, 61 modules, 133,688 lines). The Rust compiler
+> `fidesc` (`src/*.rs`, 57 files, 112,511 lines) is frozen: it builds stage 1
+> of the bootstrap and runs the test harness. Most of this document was
+> written for `fidesc`; the `src/*.rs` names below have `compiler/*.fd`
+> counterparts. The 3-stage bootstrap reaches a byte-identical fixpoint
+> (stage 2 C == stage 3 C, 49 MB); `fid` compiles itself to C in ~133 s
+> (type check 59 s, borrow check 16 s, lowering 20 s, C generation 12 s). The
+> stdlib has 137 modules, 43,576 lines (+ 4 in `stdlib/pe_runtime/`). The
+> language is described rule by rule in [reference.md](reference.md).
 
 ---
 
@@ -62,9 +73,9 @@ External linkers (ld, lld, link.exe) are separate processes that:
 #### 3. Custom Typechecker — ✅ Complete
 - Region inference + effect system + capability checking, all in `src/typechecker.rs`
 - No external SMT solver (everything built in)
-- **Regions**: compile-time use-after-free detection via `freed_regions` tracking; escape detection via `region_stack`; auto-inference
-- **Effects**: `!IO`, `!Net`, `!Spawn`, `!Alloc`, `!{}` (pure); fixpoint iteration over call graph for inference; under-declaration is a compile error
-- **Capabilities**: `cap` declarations, `use ... with { IO, FS, Net, Spawn }` grants, transitive propagation, compile-time denial, zero runtime overhead (capability elision)
+- **Regions**: a `region` block is a scope with an optional size budget. There is no region use-after-free check (`freed_regions` is written and never read); references are kept from outliving their block by the escape check (`escape.rs` / `compiler/escape.fd`)
+- **Effects**: `!IO`, `!Net`, `!Spawn`, `!Alloc`, `!{}` (pure); fixpoint iteration over call graph for inference; under-declaration is a compile error; a higher-order function's effects are instantiated at each call site from the function passed
+- **Capabilities**: `use ... with { IO, FS, Net, Spawn, Alloc }` grants, compile-time denial checked per call by name (no propagation through the call graph), `sandbox { }` denies all, zero runtime overhead
 
 #### 4. Custom IR — PIR — ✅ Complete
 - Multi-level IR in `src/pir.rs`: L1 (semantic) → L2 (mid-level) → L3 (low-level)
@@ -89,7 +100,7 @@ External linkers (ld, lld, link.exe) are separate processes that:
 - **WASM**: `src/wasm.rs` (PIR → WebAssembly binary, `fidesc wasm`)
 - **SPIR-V / GPU**: `src/gpu.rs` (PIR → SPIR-V binary, `fidesc gpu`)
 - **C source**: `src/codegen_c.rs` (IR → C99, portable fallback compiled by gcc/clang/cl.exe)
-- **Register allocator**: `src/regalloc.rs` — linear scan; has known bug (see Optimizer caveat above)
+- **Register allocator**: `src/regalloc.rs` — linear scan (PIR path). `fid emit` keeps values in 7 callee-saved registers and has no full register allocator
 - `fidesc codegen <file> --target <arch>` for assembly; `--elf|--macho|--coff` for object files
 - **Cross-compilation**: `fidesc build --target arm64-linux|riscv64-linux|x86-64-windows` — zero external tools, built-in encoders + runtimes
 
@@ -103,12 +114,12 @@ External linkers (ld, lld, link.exe) are separate processes that:
 - `fidesc link <files...>` to link multiple object files
 
 #### 8. Custom Runtime — ✅ No libc for Fides Binaries
-- **Linux**: `src/runtime_linux.rs` — hand-encoded x86-64 machine code (raw bytes, not assembly text) implementing all runtime stubs via direct syscalls. System V AMD64 ABI. No libc.
-- **Windows**: `src/pe.rs` runtime stubs link only `kernel32.dll` (HeapAlloc/HeapFree/WriteFile/GetStdHandle/ExitProcess) — not the MSVC C runtime.
+- **Linux**: `src/runtime_linux.rs` — hand-encoded x86-64 machine code (raw bytes, not assembly text) implementing all runtime stubs via direct syscalls. System V AMD64 ABI. No libc. Experimental; Linux x64 programs go through C.
+- **Windows**: `fid emit` merges the Fides runtime `stdlib/pe_runtime/*.fd` into every program and imports `kernel32.dll` and `msvcrt.dll`. Per-thread free lists (written Nov 4, exercised by every native test, no multi-thread stress test run).
 - **Bare metal**: no runtime — `--bare` mode emits flat binary with no stdlib
 - Panic handler (`p_panic`), print stubs (`p_print_str/int/bool/float/newline`), allocator (`p_malloc`/`p_free`/`p_alloc`), string ops (`p_str_concat`/`p_to_str`), Vec/HashMap/String ops
 
-#### 9. Custom Stdlib — ✅ 35 Modules
+#### 9. Custom Stdlib — ✅ 137 Modules (Nov 6)
 - `stdlib/core.fd` (auto-included): `Option`, `Result`, `println`, `assert`, `assert_eq`, `max`, `min`, `abs`, `clamp`
 - `stdlib/vec.fd`: dynamic array (Vec<T> with push/pop/get/len)
 - `stdlib/math.fd`: sqrt, sin, cos, floor, ceil, pow, fabs, constants
@@ -127,23 +138,22 @@ External linkers (ld, lld, link.exe) are separate processes that:
 
 #### 10. Custom Allocator — ✅ Partial
 - `src/embedded.rs` — `FixedBufferAllocator`: pre-allocated buffer, no heap fragmentation, deterministic allocation patterns for embedded/IoT
-- General path: `p_malloc`/`p_free` wrap the platform allocator (HeapAlloc on Windows, hand-coded mmap/brk on Linux runtime)
-- Region allocator (arena-based, tied to the region system): planned, not yet implemented
+- General path: `p_malloc` hands out power-of-two blocks from per-class free lists (per thread; the C runtime also keeps per-thread arenas)
+- The compiler frees what it can prove is finished: `Vec`/`HashMap` locals, a `Vec<str>`/`Vec<Vec>` that owns its elements, collections declared in a `region` at its end, string temporaries. Everything else lives until exit
 - `!RealTime` effect for bounded execution time guarantees: framework in `embedded.rs`
 
 #### 11. Embedded & IoT Support — ✅ Phase 5B
 - RISC-V target via `codegen_riscv.rs`
 - Deterministic memory mode (`FixedBufferAllocator`)
-- Binary size optimization (< 4KB for simple programs)
+- Binary size optimization (target < 4KB for simple programs; hello world is 113 KB from `fidesc emit` today)
 - Real-time guarantees (`!RealTime` effect — bounded execution time)
 - HAL framework
 - Examples: `examples/rpi_led_blink.fd`, `examples/riscv_blink.fd`
 
-#### 12. Hot Reload — ✅
+#### 12. Hot Reload — ⚠️
 - `src/hotreload.rs` + `fidesc watch`
-- Native JIT via ELF64 emission
 - Function-level change detection via L2 IR hashing
-- Recompiles and swaps only changed functions
+- Rebuilds and reruns the program on save; functions are not swapped in the running process. `fid watch` runs `bench`
 
 #### 13. C Header FFI — ✅
 - `src/cparser.rs` + `fidesc parse-header <file.h>`
@@ -162,7 +172,7 @@ External linkers (ld, lld, link.exe) are separate processes that:
 | Windows `kernel32.dll` | Fides binary I/O + heap on Windows | Phase 5 (custom syscall runtime) |
 | `gcc`/`clang`/`cl.exe` | Only for `ccompile` command (C backend) | Never — it's an optional fallback backend |
 
-**Everything else is custom-built. No LLVM, no libc (for Fides binaries), no external linker, no external assembler.**
+**Everything else is custom-built. No LLVM, no external linker, no external assembler.** Native Windows executables import kernel32.dll and msvcrt.dll.
 
 Note: the `ccompile` command intentionally invokes an external C compiler — that's the *portability fallback* backend (Zig-style), not the primary path. The primary paths (`emit`, `build`, `run`) use zero external tools.
 
@@ -206,13 +216,15 @@ Phase 6:
 - RIP-relative addressing, Rel32 relocations, Win64 ABI (RCX/RDX/R8/R9 + shadow space)
 - `fidesc emit <file> -o <exe>` and `fid emit <file> -o <exe>` produce working `.exe`s in one step
 - **Self-hosted fixpoint verified** (Oct 30): `fid-n5 emit compiler/main.fd` produces a byte-identical compiler to `fid-n5` itself (12,304,896 B); the same source emitted by the C-compiled compiler is also byte-identical
+- A small IR optimizer runs first (`compiler/iropt.fd`: inlining of small single-block functions, constant folding, dead code removal)
+- Native async/tasks crash (`test_async`, `test_async_float_struct`); the interpreter and C are fine
 - **Faster than the C build on real work:** `dump-c compiler/main.fd` 3m21s native vs 4m21s C release (0.77×), byte-identical 40 MB output
 - Cheap-codegen wins: block-local slot reuse (~140 KB → ~1.3 KB frames), store→load forwarding, immediates, `cmp`+`jcc` fusion, call-arg immediates, inlined `p_vec_len`/`p_map_len`/`p_*_is_empty`, `rep movsq` struct copies, `strlen`/`memcpy`-based string stubs, `pert_str_hash` word hashing
 - Correctness: Windows guard-page **stack probes** on frames > 4 KB; deterministic output (no HashMap-order leaks in slot assignment)
 
-#### ELF64 Emission (Linux) — ✅
+#### ELF64 Emission (Linux) — ⚠️ Experimental
 - Direct byte emission in `src/elf64.rs`
-- Primary native backend on Linux via `fidesc build`
+- Native backend on Linux via `fidesc build`; incomplete in `fid` (Linux x64 goes through C)
 - Full PIR pipeline: L1 → L2 → L3 → codegen → peephole → ELF64
 - Relocations: `R_X86_64_PC32`, `R_X86_64_PLT32`, `R_X86_64_64`
 - Links against hand-encoded runtime (`runtime_linux.rs`) — raw machine code, no libc
@@ -227,8 +239,8 @@ Phase 6:
 - `src/coff.rs` — object file emission
 - `fidesc codegen <file> --coff <out.o>`
 
-#### Bare-Metal Flat Binary — ✅
-- `fidesc emit <file> --bare -o <bin>`
+#### Bare-Metal Flat Binary — ❌ Incomplete
+- `fidesc emit <file> --bare -o <bin>`; `fid emit --bare` panics
 - No file format headers — raw machine code at a fixed address
 - No stdlib, no runtime
 - For bootloaders, OS kernels, firmware, microcontrollers
@@ -246,7 +258,7 @@ Phase 6:
 - `src/codegen_c.rs` — IR → C99 source
 - `fidesc ccompile <file> -o <exe>` generates `.c`, invokes `gcc`/`clang`/`cl.exe`
 - Used when targeting platforms the native backends don't yet cover
-- Note: 164/165 test parity with interpreter. Binary hardening enabled.
+- Note: 343/343 tests match the interpreter (Nov 2 full suite, Rust harness; not rerun with the Nov 4–6 compiler). Binary hardening enabled.
 
 ---
 
@@ -274,7 +286,7 @@ Fides pipeline (current):
 ```
 C "hello world": ~16KB (with libc)
 Rust "hello world": ~4MB (with stdlib)
-Fides "hello world": ~4KB target (no libc, no runtime, no stdlib bloat)
+Fides "hello world": ~4KB target; 113 KB measured (`fidesc emit`, Nov 3)
 ```
 
 **Why Fides is smaller:**
@@ -394,16 +406,16 @@ Native Binary / WASM / SPIR-V / C Source / Running Code
 - Peephole optimizer: 9 passes, always on in `build`
 - PIR optimizer: 23 passes (const fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias analysis, effect reorder, partial eval, vectorize, strength reduce, devirt, jump thread, loop rotate, loop vec, effect opt, region pool, reassociate, memoize) — enabled by default in `build` (use `--no-opt` to disable), `--lto` for aggressive inlining. Function-level parallelism (19/22 passes parallelized).
 - PE emitter: native x86-64 Windows executables, no external tools
-- ELF64 emitter: native Linux executables + relocatable objects, no external tools
-- Mach-O / COFF object file emission
-- Bare-metal flat binary mode (`--bare`)
-- Multi-arch assembly codegen: x86-64, ARM64, RISC-V
-- WASM backend, SPIR-V/GPU backend
+- ELF64 emitter: native Linux executables + relocatable objects, no external tools (experimental)
+- Mach-O / COFF object file emission (experimental)
+- Bare-metal flat binary mode (`--bare`; panics in `fid`)
+- Multi-arch assembly codegen: x86-64, ARM64, RISC-V (ARM64/RISC-V experimental)
+- WASM backend, SPIR-V/GPU backend (experimental)
 - C source backend (portability fallback via gcc/clang/cl.exe)
 - Integrated linker (ELF64 objects → executable, in-process)
-- Hot reload (`fidesc watch`) — native JIT + function-level change detection
+- Hot reload (`fidesc watch`) — rebuild and rerun on save, function-level change detection (no in-process swap)
 - Custom runtime: hand-encoded x86-64 machine code via raw syscalls (Linux, no libc) / kernel32.dll (Windows)
-- 99 stdlib modules: core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can, uefi
+- 137 stdlib modules (Nov 6), among them: core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can, task (uefi and kernel moved to fides-os)
 - C header FFI parsing (`fidesc parse-header`)
 - Embedded/IoT: FixedBufferAllocator, `!RealTime` effect, RISC-V target, HAL framework
 - Smart pointers: `Box<T>` (recursive types), `Rc<T>` / `Arc<T>` (manual refcount management)
@@ -412,20 +424,21 @@ Native Binary / WASM / SPIR-V / C Source / Running Code
 - Profiler (`fidesc profile`), linter (`fidesc lint`), benchmark (`fidesc bench`), formatter (`fidesc fmt`)
 - Package manager (`ark`), doc generator (`scribe`), coverage tool (`veil`)
 - Interactive debugger (`fidesc debug`), native debugger (`fidesc autopsy`)
-- No external dependencies for primary paths: no LLVM, no libc (in Fides binaries), no external assembler, no external linker
+- No LLVM, no external assembler, no external linker on the native Windows path; the C path needs a C compiler
 
 **What's partial / pending:**
 - ✅ PIR optimizer: enabled by default in `build` (use `--no-opt` to disable). `--lto` for aggressive cross-module inlining. PGO removed.
-- ⚠️ Effect handlers: `handle { do } with` syntax parses and runs; full continuation semantics pending
-- ✅ `async` / `await` / `spawn`: implemented (eager evaluation, OS thread model). State machine transform for cooperative scheduling pending.
-- ❌ `#[test]` attribute: parsed but not executed by `fidesc test`
+- ✅ Effect handlers: `handle { do } with`, `resume(cont, v)` runs the rest of the block
+- ⚠️ `async` / `await` / `spawn`: an `async fn` is a green task on its own stack; `spawn f(args)` runs on an OS thread with `@send` arguments. Native (`fid emit`) async crashes.
+- ❌ `#[test]` attribute: parsed and ignored; `fid test file.fd` runs `test_*` and `bench_*` functions
+- ❌ Value semantics (proposal 0001): copy-on-write written behind `LOWER_COW` (off); `var b = a` on a `Vec` aliases
 - ✅ `@derive(Debug/Clone/Serialize/Deserialize)`: implemented (Phase 7.7)
 - ✅ Borrow checker: Phases 1-6 complete, `on` by default, field-wise borrows, two-phase borrows, NLL
 - ✅ `Box<T>` recursive types: implemented (self-hosting blocker 3 resolved)
 - ✅ `Rc<T>` / `Arc<T>` smart pointers: implemented (manual refcount management)
 - ✅ Vec/Mat math types: vec2/3/4, mat4, quat with operator overloading + swizzle
 - ✅ Incremental compilation: in-memory cache (`src/inc.rs`)
-- ❌ Default arguments, variadic arguments: not implemented
+- ✅ Default and named arguments; ❌ variadic arguments (parsed and ignored)
 - ❌ Region allocator (arena-based, tied to region system): not started
 - ⚠️ Self-hosting (Phase 6): 3 of 5 blockers resolved (enum payloads, generic Vec, recursive Box). Compiler is still written in Rust.
 
@@ -580,12 +593,12 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 - No libc (raw syscalls on Linux, kernel32.dll only on Windows)
 
 #### What's Planned
-- Region allocator: arena-based, tied to the region system (not yet started)
-- Effect runtime: for effect handlers that can't be compiled away (full continuation semantics pending)
+- Region allocator: arena-based, tied to the region system (not started; today the compiler frees collections declared in a region at its end)
+- Copy-on-write `Vec`/`str`/`HashMap` (proposal 0001): written behind `LOWER_COW` (off)
 
 ---
 
-### Custom Stdlib — 34 Modules
+### Custom Stdlib — 137 Modules (Nov 6; selection below)
 
 | Module | File | Contents |
 |--------|------|----------|
@@ -602,7 +615,7 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 | http | `stdlib/http.fd` | socket + HTTP parsing |
 | simd | `stdlib/simd.fd` | elementwise ops, dot, sum, scale (f64x2, f64x4, etc.) |
 | shape | `stdlib/shape.fd` | shape system for tensor ops |
-| Plus 21 more | | env, args, process, regex, quant, money, banking, alloc, file, time, typed_strings, memo, privacy, tilemap, sprite, flowfield, streaming, scene, physics, audio, input |
+| Plus 124 more | | env, args, process, regex, quant, money, banking, alloc, file, time, typed_strings, memo, privacy, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, task, … |
 
 ---
 
@@ -610,10 +623,10 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 
 - **RISC-V target**: `src/codegen_riscv.rs` — assembly output for IoT/custom hardware
 - **Deterministic memory**: `FixedBufferAllocator` in `src/embedded.rs` — pre-allocated buffer, no heap fragmentation
-- **Binary size optimization**: < 4KB for simple programs
+- **Binary size optimization**: target < 4KB for simple programs (not reached; ARM64/RISC-V runtimes are stubs)
 - **Real-time guarantees**: `!RealTime` effect — bounded execution time
 - **HAL framework**: hardware abstraction layer in `src/embedded.rs`
-- **Bare-metal mode**: `fidesc emit <file> --bare -o <bin>` — no headers, no stdlib, raw machine code
+- **Bare-metal mode**: `fidesc emit <file> --bare -o <bin>` — no headers, no stdlib, raw machine code (`fid emit --bare` panics; bare metal is incomplete)
 - **Examples**: `examples/rpi_led_blink.fd`, `examples/riscv_blink.fd`, `tests/bootstrap/test_boot.fd`, `tests/bootstrap/test_bare.fd`
 
 ---
@@ -621,10 +634,10 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 ### Hot Reload (Phase 4D)
 
 - `src/hotreload.rs` + `fidesc watch <file>`
-- Native JIT: compiles to ELF64 in memory, runs immediately
-- Function-level change detection via L2 IR hashing
-- Recompiles and swaps only changed functions
-- Sub-second iteration for development
+- Compiles to an ELF64 executable and runs it as a child process (Linux)
+- Function-level change detection via L2 IR hashing: reports which functions changed
+- Recompiles the whole program and restarts it; no in-process swap yet
+- `fid watch` is not implemented (it runs `bench`)
 
 ---
 
@@ -638,7 +651,7 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 
 ### Bootstrapping Strategy
 
-#### Phase 1–4D: Fides in Rust (Current)
+#### Phase 1–4D: Fides in Rust (done; `fidesc` is now frozen)
 - Compiler written in Rust (`fidesc` binary)
 - Compiles Fides source to native code via custom pipeline
 - Self-hosting IR, PIR, codegen, linker, runtime — all custom-built
@@ -650,10 +663,10 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 - Full effect handler continuation semantics
 - `async` / `await` / `spawn` implementation
 
-#### Phase 6: Fides in Fides (Self-Hosting)
-- Rewrite compiler in Fides
-- Fides compiler compiles itself
-- No Rust dependency for end users
+#### Phase 6: Fides in Fides (Self-Hosting) — reached
+- Compiler rewritten in Fides (`compiler/*.fd`, 61 modules); `fid` is the release compiler
+- Fides compiler compiles itself: 3-stage bootstrap, byte-identical fixpoint (49 MB of C, Nov 6)
+- No Rust dependency for end users; stage 1 is still built by `fidesc` until a stage 0 is pinned (`PIN=1`; none yet)
 - Compiler binary is a Fides binary
 - PIR optimizer runs on Fides compiler code
 - comptime specializes the compiler for the target
@@ -779,7 +792,7 @@ Before type-checking, the compiler:
 4. Merges stdlib + imported modules + user code (user wins on conflicts, `extern_decls` merged)
 5. Type-checks the merged program with module-level visibility enforcement
 
-**Standard library modules** (99 modules in `stdlib/`, 28,370 LOC): `core.fd` (auto-included), `vec.fd`, `math.fd`, `string.fd`, `fmt.fd`, `bits.fd`, `sort.fd`, `hash.fd`, `iter.fd`, `stack.fd`, `queue.fd`, `buffer.fd`, `collections.fd`, `result.fd`, `random.fd`, `path.fd`, `units.fd`, `uuid.fd`, `crypto.fd`, `storage.fd`, `clinical.fd`, `medical.fd`, `ecu.fd`, `scada.fd`, `swift.fd`, `grid.fd`, `ota.fd`, `banking.fd`, `kv_cache.fd`, `quant.fd`, `dp.fd`, `shard.fd`, `channel.fd`, `sync.fd`, `parallel.fd`, `ecs.fd`, `events.fd`, `db.fd`, `http.fd`, `json.fd`, `simd.fd`, `shape.fd`, `tensor.fd`, `money.fd`, `alloc.fd`, `file.fd`, `time.fd`, `typed_strings.fd`, `memo.fd`, `privacy.fd`, `env.fd`, `args.fd`, `process.fd`, `regex.fd`, `tilemap.fd`, `sprite.fd`, `flowfield.fd`, `streaming.fd`, `scene.fd`, `physics.fd`, `audio.fd`, `input.fd`, `arinc.fd`, `can.fd`, `fs.fd`, `io.fd`, `os.fd`, `sys.fd`, `uefi.fd` — imported explicitly via `use`.
+**Standard library modules** (137 modules in `stdlib/`, 43,576 lines, Nov 6; `uefi.fd` below moved to fides-os): `core.fd` (auto-included), `vec.fd`, `math.fd`, `string.fd`, `fmt.fd`, `bits.fd`, `sort.fd`, `hash.fd`, `iter.fd`, `stack.fd`, `queue.fd`, `buffer.fd`, `collections.fd`, `result.fd`, `random.fd`, `path.fd`, `units.fd`, `uuid.fd`, `crypto.fd`, `storage.fd`, `clinical.fd`, `medical.fd`, `ecu.fd`, `scada.fd`, `swift.fd`, `grid.fd`, `ota.fd`, `banking.fd`, `kv_cache.fd`, `quant.fd`, `dp.fd`, `shard.fd`, `channel.fd`, `sync.fd`, `parallel.fd`, `ecs.fd`, `events.fd`, `db.fd`, `http.fd`, `json.fd`, `simd.fd`, `shape.fd`, `tensor.fd`, `money.fd`, `alloc.fd`, `file.fd`, `time.fd`, `typed_strings.fd`, `memo.fd`, `privacy.fd`, `env.fd`, `args.fd`, `process.fd`, `regex.fd`, `tilemap.fd`, `sprite.fd`, `flowfield.fd`, `streaming.fd`, `scene.fd`, `physics.fd`, `audio.fd`, `input.fd`, `arinc.fd`, `can.fd`, `fs.fd`, `io.fd`, `os.fd`, `sys.fd`, `uefi.fd` — imported explicitly via `use`.
 
 **String concatenation**: `str + str` is lowered to a `p_str_concat` runtime call. Works with literals, variables, and inline function call results. `str + i64` is pointer arithmetic (not concatenation).
 
@@ -875,7 +888,8 @@ Validates the AST before lowering. Collects all errors and reports them at once.
 - Pattern match arm type consistency
 - Constant resolution (`const` constants)
 - Type alias resolution (`type`)
-- Generic type parameter registration (simplified)
+- Generics: in `fid`, type-argument inference (or an error), bound checks `T: A + B`, turbofish arity (`compiler/typechecker.fd`, `mono.fd`)
+- Safety annotations (17 rules), `@send` for spawned calls, `@scoped`/borrowed `&str`
 
 **Output:** Either `Ok(())` or `Err(Vec<String>)` with all error messages.
 

@@ -155,6 +155,7 @@ fn pe_ir_strs_contains(v: Vec<str>, s: str) -> bool {
 
 /// Insert `s` into sorted Vec<str> `v` (BTreeSet<String>::insert).
 fn pe_ir_strs_insert_sorted(v: Vec<str>, s: str) -> Vec<str> {
+    var v = v;
     var i: i64 = 0;
     while i < v.len() {
         var c: i64 = str_compare(v.get(i), s);
@@ -177,6 +178,7 @@ fn pe_ir_strs_insert_sorted(v: Vec<str>, s: str) -> Vec<str> {
 
 /// Insertion-sort a Vec<str> with str_compare (deterministic BTree order).
 fn pe_ir_sort_strs(v: Vec<str>) -> Vec<str> {
+    var v = v;
     var i: i64 = 1;
     while i < v.len() {
         var key: str = v.get(i);
@@ -195,6 +197,7 @@ fn pe_ir_sort_strs(v: Vec<str>) -> Vec<str> {
 /// HashMap iteration into id order; ids are already dense but this keeps
 /// the port faithful).
 fn pe_sort_value_id_insts(v: Vec<ValueIdInst>) -> Vec<ValueIdInst> {
+    var v = v;
     var i: i64 = 1;
     while i < v.len() {
         var key: ValueIdInst = v.get(i);
@@ -211,6 +214,7 @@ fn pe_sort_value_id_insts(v: Vec<ValueIdInst>) -> Vec<ValueIdInst> {
 
 /// Insertion-sort a Vec<ValueIdMeta> by value id.
 fn pe_sort_value_id_metas(v: Vec<ValueIdMeta>) -> Vec<ValueIdMeta> {
+    var v = v;
     var i: i64 = 1;
     while i < v.len() {
         var key: ValueIdMeta = v.get(i);
@@ -479,10 +483,34 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
         }
         xi = xi + 1;
     }
+    // A DLL not on this machine: the program reports it when it starts
+    // (PeirGen_gen_dll_loader); say so now too (release E4)
+    var xdlls: Vec<PeDllImport> = pe_dll_imports();
+    var xdi: i64 = PE_STATIC_DLLS;
+    while xdi < xdlls.len() {
+        var xdll: str = xdlls.get(xdi).dll;
+        var xcands: Vec<str> = pe_link_dll_candidates(xdll);
+        var xfound: bool = false;
+        var xci: i64 = 0;
+        while xci < xcands.len() {
+            if pe_dll_found(xcands.get(xci), "") { xfound = true; }
+            xci = xci + 1;
+        }
+        if !xfound {
+            p_eprint_str("warning: " + xdll + " is not on this machine (searched the current folder, the system folder and PATH): a call into it stops the program with a message\n");
+        }
+        xdi = xdi + 1;
+    }
 
-    // 2. Build .rdata section
+    // 2. Build .rdata section (a bare build has no import table)
     var rdata: PeirRdata = PeirRdata_new();
-    PeirRdata_build(&mut rdata, all_strings);
+    if self.bare_mode {
+        all_strings.push("panic: ");
+        all_strings.push("Panic: ");
+        PeirRdata_build_strings(&mut rdata, all_strings);
+    } else {
+        PeirRdata_build(&mut rdata, all_strings);
+    }
 
     // Record string rdata offsets for later codegen
     var si: i64 = 0;
@@ -607,6 +635,7 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
     //     `extern "C"` function of msvcrt.dll / kernel32.dll (a thunk each)
     self.module_fns = func_names;
     var prims: Vec<str> = pe_primitive_names();
+    if self.bare_mode { prims = Vec::new(); }
     var pi: i64 = 0;
     while pi < prims.len() {
         var plabel: i64 = PeirEnc_alloc_label(&mut self.enc);
@@ -637,7 +666,7 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
                 // `fn pe_f64_to_bits as pe_f32_raw(x: f32) -> i64`: another name
                 // (and Fides type) for a primitive
                 var done_ext: bool = false;
-                if pe_ir_strs_contains(pe_primitive_names(), ext.c_name) {
+                if !self.bare_mode && pe_ir_strs_contains(pe_primitive_names(), ext.c_name) {
                     var prim_label: i64 = HashMap_get(self.func_labels, ext.c_name);
                     HashMap_insert(self.func_labels, ext.pledge_name, prim_label);
                     done_ext = true;
@@ -645,7 +674,7 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
                 if !done_ext {
                     var slot: i64 = pe_import_slot(ext.c_name);
                     var sig_idx: i64 = pe_extern_sig_index(module, ext.pledge_name);
-                    if slot >= 0 && sig_idx >= 0 {
+                    if slot >= 0 && sig_idx >= 0 && !self.bare_mode {
                         var sig: StringVecIrType = module.extern_functions.get(sig_idx);
                         var tlabel: i64 = PeirEnc_alloc_label(&mut self.enc);
                         HashMap_insert(self.func_labels, ext.pledge_name, tlabel);
@@ -697,13 +726,16 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
         }
         cbi = cbi + 1;
     }
-    // Functions named by a string constant can be looked up by name
+    // Functions named by a string constant can be looked up by name: the
+    // program's, and the runtime's that are compiled in (the task
+    // scheduler starts its worker, poller and pool threads by name)
     var nf: Vec<str> = Vec::new();
     self.named_fns = nf;
     var ni: i64 = 0;
     while ni < all_strings.len() {
         var ns: str = all_strings.get(ni);
-        if pe_ir_strs_contains(self.module_fns, ns) && !is_pe_runtime_fn(ns) {
+        if pe_ir_strs_contains(self.module_fns, ns)
+            && (!is_pe_runtime_fn(ns) || pe_ir_strs_contains(needed, ns)) {
             self.named_fns.push(ns);
         }
         ni = ni + 1;
@@ -715,6 +747,13 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
         api = api + 1;
     }
     self.crash_filter = PeirEnc_alloc_label(&mut self.enc);
+
+    // A flat binary starts with a jump to its entry point
+    var bare_entry: i64 = -1;
+    if self.bare_mode {
+        bare_entry = PeirEnc_alloc_label(&mut self.enc);
+        PeirEnc_jmp_label(&mut self.enc, bare_entry);
+    }
 
     // 4. Generate code for each function (sorted for deterministic layout);
     //    of the Fides runtime only what the program uses
@@ -737,7 +776,11 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
     // 5. Generate runtime stubs
     PeirGen_gen_runtime_stubs(self);
     PeirGen_gen_arith_panics(self);
-    PeirGen_gen_pe_primitives(self);
+    if self.bare_mode {
+        PeirGen_trap_unplaced(self, pe_runtime_stub_names());
+    } else {
+        PeirGen_gen_pe_primitives(self);
+    }
     var thunks: Vec<CThunk> = self.c_thunks;
     var ti: i64 = 0;
     while ti < thunks.len() {
@@ -761,11 +804,52 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
         si2 = si2 + 1;
     }
 
+    // 5b. The start-up loader of the `link` DLLs (before the entry point,
+    //     which calls it)
+    PeirGen_gen_dll_loader(self, &mut rdata);
+
     // 6. Generate entry point (_main)
+    if self.bare_mode {
+        PeirEnc_align_to(&mut self.enc, 16);
+        PeirEnc_place_label(&mut self.enc, bare_entry);
+    }
     PeirGen_gen_entry_point(self);
 
     // 7. Resolve local labels (jumps/calls within .text)
     PeirEnc_resolve_labels(&mut self.enc);
+
+    // A flat binary (release G2): [code][int3 to a 4 KB boundary][data],
+    // loaded at g_pe_bare_load, entered at its first byte
+    if self.bare_mode {
+        var flat_data: i64 = g_pe_bare_load + pe_align_up(self.enc.code.len(), PE_SECTION_ALIGN);
+        PeirEnc_resolve_rip_refs(&mut self.enc, g_pe_bare_load, flat_data);
+        var fpi: i64 = 0;
+        while fpi < global_str_patches.len() {
+            var fslot: i64 = global_str_patches.get(fpi);
+            var fva: i64 = flat_data + global_str_patches.get(fpi + 1);
+            var fb: i64 = 0;
+            while fb < 8 {
+                rdata.data.set(fslot + fb, (fva >> (8 * fb)) & 0xFF);
+                fb = fb + 1;
+            }
+            fpi = fpi + 2;
+        }
+        var flat: Vec = Vec::new();
+        var ci: i64 = 0;
+        while ci < self.enc.code.len() {
+            flat.push(self.enc.code.get(ci));
+            ci = ci + 1;
+        }
+        while flat.len() < flat_data - g_pe_bare_load {
+            flat.push(0xCC);
+        }
+        var di2: i64 = 0;
+        while di2 < rdata.data.len() {
+            flat.push(rdata.data.get(di2));
+            di2 = di2 + 1;
+        }
+        return flat;
+    }
 
     // 8. Compute .rdata RVA dynamically from actual .text size
     var rdata_rva: i64 = PE_TEXT_RVA + pe_align_up(self.enc.code.len(), PE_SECTION_ALIGN);
@@ -890,6 +974,13 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
             match IrFunction_get_inst(func, aiid) {
                 OptInst::Some(ainst) => {
                     if aiid >= 0 && aiid < nvals { def_block.set(aiid, abi); }
+                    // An alloca's storage lives as long as the function: a
+                    // reference to it can be kept in another variable after
+                    // the alloca's own last use (`val r = &f()`, release K6)
+                    match ainst {
+                        Inst::Alloca(_, _) => { if aiid >= 0 && aiid < nvals { def_block.set(aiid, -1); } }
+                        _ => {}
+                    }
                     match ainst {
                         Inst::TryUnwrap(_, okd, _, _) => {
                             if okd >= 0 && okd < nvals { def_block.set(okd, abi); }
@@ -2024,6 +2115,14 @@ pub fn PeirGen_gen_inst(
         // --- Function Calls ---
         Inst::Call(call_name, args, _, _) => {
             if PeirGen_inline_vec_call(self, call_name, args, dst, frame) { return; }
+            // An f64 lives in its slot as its bits: these copy the word (the
+            // async task adapters of release H9 use them)
+            if (call_name == "p_f64_to_bits" || call_name == "p_f64_from_bits") && args.len() == 1 {
+                var boff: i64 = PeStackFrame_offset(frame, args.get(0));
+                PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, boff);
+                PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+                return;
+            }
             // print(tensor): the runtime formats it, then the string prints
             if call_name == "print" && args.len() > 0 {
                 var arg0: i64 = args.get(0);
@@ -2483,10 +2582,48 @@ pub fn PeirGen_gen_inst(
             PeirEnc_nop(&mut self.enc);
         }
 
-        Inst::Asm(_, _, _, _) => {
-            // Inline assembly not yet supported in PE backend
-            PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
-            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        Inst::Asm(template, inputs, outputs, asm_ty) => {
+            if self.bare_mode {
+                // Bare builds run the template (release G2): inputs into
+                // their registers, the instructions, the first output out
+                var enc_res: PeAsmResult = pe_asm_encode(template);
+                if enc_res.error != "" {
+                    g_pe_asm_errors.push("asm!(\"" + template + "\") in " + func_name + ": " + enc_res.error);
+                }
+                var ii2: i64 = 0;
+                while ii2 < inputs.len() {
+                    var inr: i64 = pe_asm_reg64(inputs.get(ii2).name);
+                    if inr < 0 {
+                        g_pe_asm_errors.push("asm! in " + func_name + ": in(\"" + inputs.get(ii2).name + "\") is not a 64-bit register");
+                    } else {
+                        PeirGen_load_operand(self, inr, inputs.get(ii2).id, frame);
+                    }
+                    ii2 = ii2 + 1;
+                }
+                var bi2: i64 = 0;
+                while bi2 < enc_res.bytes.len() {
+                    PeirEnc_emit_u8(&mut self.enc, enc_res.bytes.get(bi2));
+                    bi2 = bi2 + 1;
+                }
+                var outr: i64 = PEIR_RAX;
+                if outputs.len() > 0 {
+                    outr = pe_asm_reg64(outputs.get(0).name);
+                    if outr < 0 {
+                        g_pe_asm_errors.push("asm! in " + func_name + ": out(\"" + outputs.get(0).name + "\") is not a 64-bit register");
+                        outr = PEIR_RAX;
+                    }
+                } else {
+                    PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
+                }
+                match asm_ty {
+                    IrType::Void => {}
+                    _ => { PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, outr); }
+                }
+            } else {
+                // A Windows process runs no inline assembly (as on the C path)
+                PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
+                PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+            }
         }
 
         Inst::RegionBegin(_, _, _, _) => {
@@ -2578,7 +2715,8 @@ fn PeirGen_jump_panic(self: &mut PeirGen, cc: i64, which: i64) -> void {
 
 /// Integer arithmetic in type `ty`: the one meaning the interpreter and the
 /// C backend implement. A checked operation costs one jcc to a shared panic
-/// stub. Bare-metal code has no panic path and stays plain.
+/// stub. Bare-metal code checks too (release G3): its panics go to the
+/// program's @panic_handler, else to COM1 and a halt (gen_bare_runtime).
 pub fn PeirGen_gen_int_binop(self: &mut PeirGen, op: BinOp, loff: i64, roff: i64, dst: i64, lconst: OptU64, rconst: OptU64, ty: IrType, unsigned_cmp: bool) -> void {
     // A constant operand moves in as an immediate, not a slot load (item 81).
     match lconst {
@@ -2624,7 +2762,7 @@ pub fn PeirGen_gen_int_binop(self: &mut PeirGen, op: BinOp, loff: i64, roff: i64
         OptU64::None => { PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, roff); }
     }
 
-    var checked: bool = !self.bare_mode && !self.cur_wrapping && !self.cur_unchecked;
+    var checked: bool = !self.cur_wrapping && !self.cur_unchecked;
     // jo for i64, jc for u64; narrow types are checked after the operation
     var ovf_cc: i64 = -1;
     if checked && is_i64 { ovf_cc = 0x0; }
@@ -2756,10 +2894,33 @@ fn PeirGen_inline_vec_call(self: &mut PeirGen, name: str, args: Vec<i64>, dst: i
             PeirEnc_cmp_rr(&mut self.enc, PEIR_RCX, PEIR_R8);
             PeirGen_jump_panic(self, 0x3, PEIR_PANIC_VEC_INDEX); // jae
         }
+        // Shared data (negative capacity): core's Vec_set copies it first
+        var own: i64 = -1;
+        var set_done: i64 = -1;
+        if HashMap_contains(self.func_labels, "Vec_set") {
+            own = PeirEnc_alloc_label(&mut self.enc);
+            set_done = PeirEnc_alloc_label(&mut self.enc);
+            PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R8, PEIR_RAX, 16);
+            PeirEnc_xor_self(&mut self.enc, PEIR_R9);
+            PeirEnc_cmp_rr(&mut self.enc, PEIR_R8, PEIR_R9);
+            PeirEnc_jcc_label(&mut self.enc, 0xC, own); // jl
+        }
         PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RAX, PEIR_RAX);
         PeirEnc_shl_r_i8(&mut self.enc, PEIR_RCX, 3);
         PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
         PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_RDX);
+        if own >= 0 {
+            PeirEnc_jmp_label(&mut self.enc, set_done);
+            PeirEnc_place_label(&mut self.enc, own);
+            PeirEnc_mov_rr(&mut self.enc, PEIR_R9, PEIR_RDX);
+            PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_RCX);
+            PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
+            PeirEnc_xor_self(&mut self.enc, PEIR_RCX);
+            PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+            PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "Vec_set"));
+            PeirEnc_add_rsp_i32(&mut self.enc, 32);
+            PeirEnc_place_label(&mut self.enc, set_done);
+        }
         return true;
     }
     // Vec_push with room in the buffer; growing stays a call
@@ -2771,7 +2932,8 @@ fn PeirGen_inline_vec_call(self: &mut PeirGen, name: str, args: Vec<i64>, dst: i
         PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RDX, PEIR_RAX, 8);
         PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R8, PEIR_RAX, 16);
         PeirEnc_cmp_rr(&mut self.enc, PEIR_RDX, PEIR_R8);
-        PeirEnc_jcc_label(&mut self.enc, 0x3, grow); // jae
+        // signed: a shared Vec's capacity is negative and takes the call
+        PeirEnc_jcc_label(&mut self.enc, 0xD, grow); // jge
         PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_R8, PEIR_RAX);
         PeirEnc_mov_rr(&mut self.enc, PEIR_R9, PEIR_RDX);
         PeirEnc_shl_r_i8(&mut self.enc, PEIR_R9, 3);
@@ -2875,7 +3037,7 @@ fn PeirGen_gen_int_div(self: &mut PeirGen, is_mod: bool, rconst: OptU64, ty: IrT
         }
         OptU64::None => {}
     }
-    if !self.bare_mode && may_be_zero {
+    if may_be_zero {
         PeirEnc_test_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
         if is_mod { PeirGen_jump_panic(self, 0x4, PEIR_PANIC_MOD_ZERO); }
         else { PeirGen_jump_panic(self, 0x4, PEIR_PANIC_DIV_ZERO); }
@@ -2885,7 +3047,7 @@ fn PeirGen_gen_int_div(self: &mut PeirGen, is_mod: bool, rconst: OptU64, ty: IrT
     if unsigned {
         PeirEnc_xor_self(&mut self.enc, PEIR_RDX);
         PeirEnc_div_rr(&mut self.enc, PEIR_RCX);
-    } else if !self.bare_mode && may_be_m1 {
+    } else if may_be_m1 {
         var normal: i64 = PeirEnc_alloc_label(&mut self.enc);
         var done: i64 = PeirEnc_alloc_label(&mut self.enc);
         PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, -1);
@@ -3044,6 +3206,98 @@ pub fn PeirGen_gen_float_binop(self: &mut PeirGen, op: BinOp, loff: i64, roff: i
 
 /// Public entry point: generate a PE file from an IR module. Fails when the
 /// program calls runtime functions this native backend does not provide.
+/// `fid emit --bare` (release G2): a flat x86-64 binary, no OS and no C
+/// library. `panic_handler` is the program's @panic_handler function, or "".
+pub fn pe_ir_generate_flat(module: IrModule, panic_handler: str) -> ResultBytes {
+    if !pe_module_has_fn(&module, "main") {
+        return ResultBytes::Err(c_vec1("bare-metal build: the program has no `main` function"));
+    }
+    g_pe_bare_panic_handler = panic_handler;
+    g_pe_asm_errors = Vec::new();
+    var gen: PeirGen = PeirGen_new();
+    gen.bare_mode = true;
+    var bytes: Vec = PeirGen_generate(&mut gen, &module);
+    if g_pe_asm_errors.len() > 0 {
+        return ResultBytes::Err(g_pe_asm_errors);
+    }
+    var reachable: Vec<str> = pe_ir_reachable_functions(&module);
+    var names: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < gen.unresolved.len() {
+        var u: UnresolvedCall = gen.unresolved.get(i);
+        var j: i64 = 0;
+        var hit: bool = false;
+        while j < u.callers.len() {
+            if pe_ir_strs_contains(reachable, u.callers.get(j)) { hit = true; }
+            j = j + 1;
+        }
+        if hit { names.push(u.name); }
+        i = i + 1;
+    }
+    if names.len() > 0 {
+        return ResultBytes::Err(c_vec1("bare-metal build: no OS or C library to provide: "
+            + str_join(names, ", ")));
+    }
+    return ResultBytes::Ok(bytes);
+}
+
+/// `fid emit --elf` (release F4, first step): a static Linux x86-64
+/// executable from the same machine code as the Windows and bare builds.
+/// For now it is the bare build's runtime (print, heap, panic, exit through
+/// Linux system calls), so a program built without the stdlib runs; the
+/// stdlib needs the runtime of stdlib/pe_runtime on Linux (what is left).
+/// Layout: ELF header and one program header, then at 0x401000 the flat
+/// binary ([code][data], entered at its first byte), one RWX segment.
+pub fn pe_ir_generate_elf(module: IrModule) -> ResultBytes {
+    g_pe_elf = true;
+    var saved_load: i64 = g_pe_bare_load;
+    g_pe_bare_load = 0x401000;
+    var flat_res: ResultBytes = pe_ir_generate_flat(module, "");
+    g_pe_elf = false;
+    g_pe_bare_load = saved_load;
+    match flat_res {
+        ResultBytes::Err(e) => { return ResultBytes::Err(e); }
+        ResultBytes::Ok(flat) => {
+            var out: Vec = Vec::new();
+            var total: i64 = 0x1000 + flat.len();
+            // ELF header
+            out.push(0x7F); out.push(0x45); out.push(0x4C); out.push(0x46);
+            out.push(2); out.push(1); out.push(1); out.push(0);     // 64-bit, LE, v1, SysV
+            out = pe_push_u64(out, 0);                               // padding
+            out.push(2); out.push(0);                                // ET_EXEC
+            out.push(0x3E); out.push(0);                             // EM_X86_64
+            out = pe_push_u32(out, 1);                               // e_version
+            out = pe_push_u64(out, 0x401000);                        // e_entry
+            out = pe_push_u64(out, 64);                              // e_phoff
+            out = pe_push_u64(out, 0);                               // e_shoff
+            out = pe_push_u32(out, 0);                               // e_flags
+            out.push(64); out.push(0);                               // e_ehsize
+            out.push(56); out.push(0);                               // e_phentsize
+            out.push(1); out.push(0);                                // e_phnum
+            out.push(64); out.push(0);                               // e_shentsize
+            out.push(0); out.push(0);                                // e_shnum
+            out.push(0); out.push(0);                                // e_shstrndx
+            // PT_LOAD: the whole file at 0x400000, read/write/execute
+            out = pe_push_u32(out, 1);                               // p_type
+            out = pe_push_u32(out, 7);                               // p_flags RWX
+            out = pe_push_u64(out, 0);                               // p_offset
+            out = pe_push_u64(out, 0x400000);                        // p_vaddr
+            out = pe_push_u64(out, 0x400000);                        // p_paddr
+            out = pe_push_u64(out, total);                           // p_filesz
+            out = pe_push_u64(out, total);                           // p_memsz
+            out = pe_push_u64(out, 0x1000);                          // p_align
+            while out.len() < 0x1000 { out.push(0); }
+            var i: i64 = 0;
+            while i < flat.len() {
+                out.push(flat.get(i));
+                i = i + 1;
+            }
+            return ResultBytes::Ok(out);
+        }
+    }
+    return ResultBytes::Err(c_vec1("unreachable"));
+}
+
 pub fn pe_ir_generate_pe(module: IrModule) -> ResultBytes {
     // The entry point calls main (it used to panic when there was none).
     if !pe_module_has_fn(&module, "main") {

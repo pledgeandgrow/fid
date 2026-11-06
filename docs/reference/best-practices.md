@@ -3,7 +3,9 @@
 > Hard-won insights from building a custom toolchain. Read this before making
 > changes. Every rule here exists because something broke.
 
-*Last updated: Aug 2026*
+*Last updated: Aug 2026; language rules in §8 corrected Nov 6, 2026 against
+[reference.md](reference.md). The release compiler is now the self-hosted
+`fid`; `fidesc` is frozen and runs the test harness.*
 
 ---
 
@@ -247,7 +249,7 @@ need a map for output, use `BTreeMap` or `IndexMap`.
 
 ```
                     ┌─────────────┐
-                    │  End-to-end │  fidesc test (215 .fd files)
+                    │  End-to-end │  fidesc test (493 .fd files, Nov 6)
                     │   tests     │  ← tells you SOMETHING broke
                     └──────┬──────┘
                   ┌────────┴────────┐
@@ -539,17 +541,18 @@ Remove debug prints before committing.
 
 ### `val` vs `var` — Immutability
 
-- **`val`** declares an immutable binding. Reassignment is silently ignored
-  (the compiler allows it but the value doesn't change).
+- **`val`** declares a binding that cannot be assigned again: assigning to it
+  is a compile error (`test_val_assign_fail.fd`). It does not freeze the
+  value: methods that change a `Vec` may still be called on a `val`.
 - **`var`** declares a mutable binding. Use this for loop counters,
   accumulators, and any variable that will be reassigned.
 - **Rule**: If you write `x = x + ...` or `x = f(x)`, the variable MUST be
   declared with `var`, not `val`.
 
 ```fides
-// WRONG — result stays "" because val is immutable
+// WRONG — compile error: 'result' is a val
 val result = "";
-for i in 0..n { result = result + "x"; }  // silently ignored!
+for i in 0..n { result = result + "x"; }
 
 // CORRECT — use var for accumulators
 var result = "";
@@ -559,8 +562,9 @@ for i in 0..n { result = result + "x"; }  // works
 ### String Concatenation with `+`
 
 - **`str + str`** works and produces a new string via `p_str_concat`.
-- **`str + i64`** is pointer arithmetic, NOT string concatenation.
-  Use `int_to_str(i)` to convert integers first: `s + int_to_str(n)`.
+- **`str + i64`** is NOT string concatenation. Convert integers first:
+  `s + int_to_str(n)`. In a program, `str` and integers are separate types
+  (`test_str_int_fail.fd`).
 - **Inline function calls** work: `"prefix: " + str_slice(s, 0, 3)` is fine.
 - **`str_byte_at(s, i)`** returns an `i64` (the byte value), not a string.
   For single-character string extraction, use `str_slice(s, i, i + 1)`.
@@ -569,19 +573,20 @@ for i in 0..n { result = result + "x"; }  // works
 val s = "hello";
 val greeting = s + " world";           // "hello world" ✅
 val numbered = s + int_to_str(42);     // "hello42" ✅
-val wrong = s + 42;                    // pointer arithmetic, NOT "hello42" ❌
-val char = str_slice(s, 0, 1);         // "h" ✅
+val wrong = s + 42;                    // NOT "hello42" ❌
+val first = str_slice(s, 0, 1);        // "h" ✅
 val byte = str_byte_at(s, 0);          // 104 (i64) — not a string
 ```
 
 ### `@deterministic` and `@crashfree` Annotations
 
 - **`@deterministic`** requires the function to have no IO, Net, Spawn, or
-  Diverge effects. Floating-point arithmetic is allowed but may produce
-  platform-dependent results.
-- **`@crashfree`** requires the function to never panic. Division, array
-  access, and string operations can panic (division by zero, out-of-bounds),
-  so functions using them cannot be `@crashfree`.
+  Diverge effects and no floating-point arithmetic; methods it calls must be
+  `@deterministic` too.
+- **`@crashfree`** is `@no-panic` + `@no-unbounded`: no `unwrap`/`expect`/
+  `p_panic`, no division or remainder by a value not proven non-zero, no
+  unchecked indexing or overflow (unless `@wrapping`), no `while` loop. The
+  17 safety rules and their tests: [safety-rules.md](safety-rules.md).
 - When in doubt, omit the annotation. The compiler will tell you if a
   function violates the constraints.
 
