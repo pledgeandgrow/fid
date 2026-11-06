@@ -532,13 +532,15 @@ touching them.
    from the layout's `offset`, not from adding up field sizes: an enum
    field is `(1 + payload)` words.
 
-25. **Copy-on-write** (`LOWER_COW`, off): shares must stay lazy
+25. **Copy-on-write** (`LOWER_COW`, on since Nov 6): shares must stay lazy
    (`Vec_share_deep` records the element kind, `vec_own` copies at the first
    write) and counted, a struct store must not share fresh values or last
    uses (`Lowerer_fresh_struct`), and read-only copies are judged on the rest
    of their block (`Lowerer_readonly_copy_in`). The first eager version ran
    the self-compile out of memory. With it on the fixpoint holds (Nov 6,
-   4.7 GB peak); run the full suite before switching it on.
+   4.7 GB peak), and the suite gives the same output on and off. While
+   `LOWER_ARG_SHARE` is off a by-value parameter is the caller's handle:
+   its last use is not a move (`Lowerer_last_use`, test_spawn_vec_copy).
 
 26. **Another agent may be editing `core.fd`/`lower.fd`**: build from a
    snapshot of `compiler/`, `stdlib/` and `scripts/` when files change

@@ -2188,6 +2188,8 @@ fn real_main() {
                 "test_sl_debug",
                 // Bare-only (`fid emit --bare`): a hosted build panics
                 "test_bare_panic_handler",
+                // Copy-on-write (fid only; fidesc shares Vec handles)
+                "test_spawn_vec_copy",
             ];
 
             // C-codegen-only skip list — tests that pass on interpreter + PE
@@ -2220,6 +2222,7 @@ fn real_main() {
             let external_lib_tests: &[(&str, &str)] = &[
                 ("test_sqlite", "libsqlite3"),
                 ("test_pe_sqlite", "libsqlite3"),
+                ("test_parse_header_sqlite", "libsqlite3"),
                 ("test_lib_sdl", "SDL2"),
                 ("test_lib_ui", "SDL2"),
                 ("test_lib_audio_mixer", "SDL2"),

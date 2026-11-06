@@ -111,6 +111,8 @@ pub struct CCodeGen {
     pub extern_func_names: Vec<str>,
     // Struct layouts for GetFieldPtr offset lookup
     pub struct_layouts: Vec<StructLayoutEntry>,
+    // Name -> position in struct_layouts + 1 (D10)
+    pub layout_index: i64,
 }
 
 pub fn CCodeGen_new() -> CCodeGen {
@@ -134,6 +136,7 @@ pub fn CCodeGen_new() -> CCodeGen {
         fn_ret_types: Vec::new(),
         extern_func_names: Vec::new(),
         struct_layouts: Vec::new(),
+        layout_index: HashMap_new(),
     };
     CCodeGen_insert_runtime_sigs(&mut cg);
     return cg;
@@ -2497,6 +2500,12 @@ fn val_name(self: &CCodeGen, id: i64) -> str {
 }
 
 fn lookup_field_offset(self: &CCodeGen, struct_name: str, field_index: i64, default_offset: i64) -> i64 {
+    var at: i64 = HashMap_get(self.layout_index, struct_name) - 1;
+    if at >= 0 && at < self.struct_layouts.len() && self.struct_layouts.get(at).name == struct_name {
+        var lay: StructLayout = self.struct_layouts.get(at).layout;
+        if field_index < lay.fields.len() { return lay.fields.get(field_index).offset; }
+        return default_offset;
+    }
     var i: i64 = 0;
     while i < self.struct_layouts.len() {
         if self.struct_layouts.get(i).name == struct_name {
@@ -3695,9 +3704,12 @@ pub fn CCodeGen_generate(self: &mut CCodeGen, module: IrModule) -> str {
 
     // Copy struct layouts for GetFieldPtr offset lookup
     while self.struct_layouts.len() > 0 { self.struct_layouts.pop(); }
+    HashMap_clear(self.layout_index);
     var sli: i64 = 0;
     while sli < module.struct_layouts.len() {
         self.struct_layouts.push(module.struct_layouts.get(sli));
+        var sln: str = module.struct_layouts.get(sli).name;
+        if !HashMap_contains(self.layout_index, sln) { HashMap_insert(self.layout_index, sln, self.struct_layouts.len()); }
         sli = sli + 1;
     }
 

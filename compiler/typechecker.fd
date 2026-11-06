@@ -295,6 +295,23 @@ pub fn tc_str_vec_contains(v: Vec<str>, s: str) -> bool {
 /// Same as str_vec_contains but takes a &mut Vec<str> reference.
 /// This is needed because the codegen doesn't auto-deref &mut T to T
 /// for function call arguments.
+/// `v` without repeats, in first-seen order: a list of called functions is
+/// gathered with repeats and made a set once (D10: checking it before each
+/// push was quadratic in the size of a function).
+pub fn tc_dedupe_strs(v: Vec<str>) -> Vec<str> {
+    var seen: i64 = HashMap_new();
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        if !HashMap_contains(seen, v.get(i)) {
+            HashMap_insert(seen, v.get(i), 1);
+            out.push(v.get(i));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
 pub fn str_vec_contains_ref(v: Vec<str>, s: str) -> bool {
     var i: i64 = 0;
     while i < v.len() {
@@ -537,8 +554,10 @@ pub fn TypeChecker_lookup_struct_cache(self: &TypeChecker, name: str) -> OptVecS
         return OptVecStructField::None;
     }
     // Fallback: linear scan
-    var i: i64 = 0;
-    while i < self.structs.len() {
+    var i: i64 = TypeChecker_struct_pos_ro(self, name);
+    var i_lim: i64 = i + 1;
+    if i < 0 { i = 0; i_lim = 0; }
+    while i < i_lim {
         if self.structs.get(i).key == name {
             return OptVecStructField::Some(self.structs.get(i).val);
         }
@@ -675,6 +694,7 @@ pub struct TypeChecker {
     enums: Vec<str>,                                 // enum names
     enum_variants: Vec<StringEnumVariants>,          // enum_name -> variants
     enum_type_params: Vec<StringVecString>,          // enum_name -> type params
+    enum_tp_set: i64,  // every name in enum_type_params (HashMap set, D10)
     consts: Vec<StringType>,                         // const_name -> Type
     globals: Vec<StringType>,                         // global_name -> Type (module-level mutable globals)
     type_aliases: Vec<StringType>,                   // alias_name -> Type
@@ -691,6 +711,13 @@ pub struct TypeChecker {
     // method call scanned every struct's method table by name)
     methods_index: i64,
     methods_indexed: i64,
+    // Struct and enum name -> 1 + position, filled as entries are added
+    // (TypeChecker_struct_pos, TypeChecker_enum_pos): a lookup by name
+    // used to scan every struct and enum (D10)
+    sname_index: i64,
+    sname_indexed: i64,
+    ename_index: i64,
+    ename_indexed: i64,
     // Generic functions (proposal 0002): name, type parameters, bounds
     func_generic_names: Vec<str>,
     func_generic_tps: Vec<Vec<str>>,
@@ -861,6 +888,7 @@ impl TypeChecker {
             enums: Vec::new(),
             enum_variants: Vec::new(),
             enum_type_params: Vec::new(),
+            enum_tp_set: HashMap_new(),
             consts: Vec::new(),
             globals: Vec::new(),
             type_aliases: Vec::new(),
@@ -871,6 +899,10 @@ impl TypeChecker {
             scoped_structs: Vec::new(),
             methods_index: HashMap_new(),
             methods_indexed: 0,
+            sname_index: HashMap_new(),
+            sname_indexed: 0,
+            ename_index: HashMap_new(),
+            ename_indexed: 0,
             func_generic_names: Vec::new(),
             func_generic_tps: Vec::new(),
             func_generic_bounds: Vec::new(),
@@ -1048,6 +1080,11 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
         }
         self.enum_variants.push(StringEnumVariants_new(e.name, variants));
         self.enum_type_params.push(StringVecString_new(e.name, e.type_params));
+        var etp: i64 = 0;
+        while etp < e.type_params.len() {
+            HashMap_insert(self.enum_tp_set, e.type_params.get(etp), 1);
+            etp = etp + 1;
+        }
         ei = ei + 1;
     }
 
@@ -1916,6 +1953,43 @@ fn TypeChecker_methods_at(self: &mut TypeChecker, name: str) -> i64 {
     return HashMap_get(self.methods_index, name) - 1;
 }
 
+/// Position of struct `name` in self.structs, or -1 (the first one, as a
+/// scan would find).
+fn TypeChecker_struct_pos(self: &mut TypeChecker, name: str) -> i64 {
+    while self.sname_indexed < self.structs.len() {
+        var key: str = self.structs.get(self.sname_indexed).key;
+        if !HashMap_contains(self.sname_index, key) {
+            HashMap_insert(self.sname_index, key, self.sname_indexed + 1);
+        }
+        self.sname_indexed = self.sname_indexed + 1;
+    }
+    return HashMap_get(self.sname_index, name) - 1;
+}
+
+/// As TypeChecker_struct_pos, without filling the index: what was added
+/// since the last fill is scanned.
+fn TypeChecker_struct_pos_ro(self: &TypeChecker, name: str) -> i64 {
+    if HashMap_contains(self.sname_index, name) { return HashMap_get(self.sname_index, name) - 1; }
+    var i: i64 = self.sname_indexed;
+    while i < self.structs.len() {
+        if self.structs.get(i).key == name { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Position of enum `name` in self.enums, or -1.
+fn TypeChecker_enum_pos(self: &mut TypeChecker, name: str) -> i64 {
+    while self.ename_indexed < self.enums.len() {
+        var key: str = self.enums.get(self.ename_indexed);
+        if !HashMap_contains(self.ename_index, key) {
+            HashMap_insert(self.ename_index, key, self.ename_indexed + 1);
+        }
+        self.ename_indexed = self.ename_indexed + 1;
+    }
+    return HashMap_get(self.ename_index, name) - 1;
+}
+
 fn tc_find_func(program: Program, name: str) -> i64 {
     var i: i64 = 0;
     while i < program.funcs.len() {
@@ -1944,6 +2018,7 @@ fn TypeChecker_verify_no_races(self: &mut TypeChecker, program: Program) {
             if at >= 0 {
                 var called: Vec<str> = Vec::new();
                 TypeChecker_collect_called_funcs(self, program.funcs.get(at).body, &mut called);
+                called = tc_dedupe_strs(called);
                 var c: i64 = 0;
                 while c < called.len() {
                     work.push(called.get(c));
@@ -1959,6 +2034,7 @@ fn TypeChecker_verify_no_races(self: &mut TypeChecker, program: Program) {
             var called: Vec<str> = Vec::new();
             var at: i64 = tc_find_func(program, func);
             if at >= 0 { TypeChecker_collect_called_funcs(self, program.funcs.get(at).body, &mut called); }
+            called = tc_dedupe_strs(called);
             var locked: bool = false;
             var c: i64 = 0;
             while c < called.len() {
@@ -2337,13 +2413,14 @@ pub fn TypeChecker_compute_func_effects(self: &mut TypeChecker, program: Program
     // (if A calls B and B has IO, then A has IO too)
     // Look up bodies by name from program, matching the Rust compiler.
     var changed: bool = true;
+    var body_idx: i64 = tc_body_index(program);
     while changed {
         changed = false;
         var ri2: i64 = 0;
         while ri2 < names.len() {
             var fname: str = names.get(ri2);
             // Find the body for this name
-            var body_opt: OptStmtList = TypeChecker_find_body(self, program, fname);
+            var body_opt: OptStmtList = tc_find_body_indexed(program, body_idx, fname);
             match body_opt {
                 OptStmtList::Some(body) => {
                     var new_effects: Vec<str> = Vec::new();
@@ -2375,6 +2452,41 @@ pub fn TypeChecker_compute_func_effects(self: &mut TypeChecker, program: Program
 
 /// Find the StmtList body for a function by name, searching funcs then impls.
 /// Matches the Rust compiler's `program.funcs.iter().find()` + `program.impls` lookup.
+/// name -> 1 + function index, or -(1 + impl * 65536 + method) for an impl
+/// method; the first of a name wins, as TypeChecker_find_body's scan.
+pub fn tc_body_index(program: Program) -> i64 {
+    var idx: i64 = HashMap_new();
+    var fi: i64 = 0;
+    while fi < program.funcs.len() {
+        if !HashMap_contains(idx, program.funcs.get(fi).name) { HashMap_insert(idx, program.funcs.get(fi).name, fi + 1); }
+        fi = fi + 1;
+    }
+    var impi: i64 = 0;
+    while impi < program.impls.len() {
+        var imp: ImplDef = program.impls.get(impi);
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            if !HashMap_contains(idx, imp.methods.get(mi).name) {
+                HashMap_insert(idx, imp.methods.get(mi).name, 0 - (1 + impi * 65536 + mi));
+            }
+            mi = mi + 1;
+        }
+        impi = impi + 1;
+    }
+    return idx;
+}
+
+/// TypeChecker_find_body through an index from tc_body_index.
+pub fn tc_find_body_indexed(program: Program, idx: i64, name: str) -> OptStmtList {
+    if !HashMap_contains(idx, name) { return OptStmtList::None; }
+    var at: i64 = HashMap_get(idx, name);
+    if at > 0 { return OptStmtList::Some(program.funcs.get(at - 1).body); }
+    var code: i64 = 0 - at - 1;
+    var impi: i64 = code / 65536;
+    var mi: i64 = code % 65536;
+    return OptStmtList::Some(program.impls.get(impi).methods.get(mi).body);
+}
+
 pub fn TypeChecker_find_body(self: &mut TypeChecker, program: Program, name: str) -> OptStmtList {
     var fi: i64 = 0;
     while fi < program.funcs.len() {
@@ -7488,8 +7600,10 @@ pub fn TypeChecker_type_size(self: &TypeChecker, ty: Type) -> i64 {
         Type::U128 => { return 16; }
         Type::Str => { return 16; }
         Type::Named(name) => {
-            var i: i64 = 0;
-            while i < self.structs.len() {
+            var i: i64 = TypeChecker_struct_pos_ro(self, name);
+            var i_lim: i64 = i + 1;
+            if i < 0 { i = 0; i_lim = 0; }
+            while i < i_lim {
                 if self.structs.get(i).key == name {
                     return self.structs.get(i).val.len() * 8;
                 }
@@ -8203,8 +8317,10 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                 Type::Named(name) => {
                     // Find field type
                     var field_ty: OptType = OptType::None;
-                    var si: i64 = 0;
-                    while si < self.structs.len() {
+                    var si: i64 = TypeChecker_struct_pos(self, name);
+                    var si_lim: i64 = si + 1;
+                    if si < 0 { si = 0; si_lim = 0; }
+                    while si < si_lim {
                         if self.structs.get(si).key == name {
                             var fields: Vec<StructField> = self.structs.get(si).val;
                             var fi: i64 = 0;
@@ -9159,8 +9275,10 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             match effective_ty {
                 Type::Named(name) => {
                     // Find struct fields
-                    var si: i64 = 0;
-                    while si < self.structs.len() {
+                    var si: i64 = TypeChecker_struct_pos(self, name);
+                    var si_lim: i64 = si + 1;
+                    if si < 0 { si = 0; si_lim = 0; }
+                    while si < si_lim {
                         if self.structs.get(si).key == name {
                             var fields: Vec<StructField> = self.structs.get(si).val;
                             var fi: i64 = 0;
@@ -9200,8 +9318,10 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             var obj_ty: Type = TypeChecker_check_expr(self, box_expr_unbox(obj_expr));
             match obj_ty {
                 Type::Named(name) => {
-                    var si: i64 = 0;
-                    while si < self.structs.len() {
+                    var si: i64 = TypeChecker_struct_pos(self, name);
+                    var si_lim: i64 = si + 1;
+                    if si < 0 { si = 0; si_lim = 0; }
+                    while si < si_lim {
                         if self.structs.get(si).key == name {
                             var fields: Vec<StructField> = self.structs.get(si).val;
                             var fi: i64 = 0;
@@ -9223,8 +9343,10 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
         Expr::StructLit(name, fields, spread) => {
             var real_name: str = TypeChecker_resolve_struct_name(self, name);
             // Find struct definition
-            var si: i64 = 0;
-            while si < self.structs.len() {
+            var si: i64 = TypeChecker_struct_pos(self, real_name);
+            var si_lim: i64 = si + 1;
+            if si < 0 { si = 0; si_lim = 0; }
+            while si < si_lim {
                 if self.structs.get(si).key == real_name {
                     var struct_fields: Vec<StructField> = self.structs.get(si).val;
                     // Check spread source type
@@ -9780,8 +9902,10 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
             }
             // Check if it's an associated function call (e.g. Point::new(x, y))
             // Check if name is a known struct
-            var si: i64 = 0;
-            while si < self.structs.len() {
+            var si: i64 = TypeChecker_struct_pos(self, name);
+            var si_lim: i64 = si + 1;
+            if si < 0 { si = 0; si_lim = 0; }
+            while si < si_lim {
                 if self.structs.get(si).key == name {
                     var arg_types: Vec<Type> = Vec::new();
                     var ai: i64 = 0;
@@ -9817,8 +9941,10 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
             // Check if name is a known enum -- treat MethodCall as EnumLit
             // This handles cases where the parser didn't know the enum was
             // an enum at parse time (e.g. cross-module enums not yet imported).
-            var ei: i64 = 0;
-            while ei < self.enums.len() {
+            var ei: i64 = TypeChecker_enum_pos(self, name);
+            var ei_lim: i64 = ei + 1;
+            if ei < 0 { ei = 0; ei_lim = 0; }
+            while ei < ei_lim {
                 if self.enums.get(ei) == name {
                     // It's an enum constructor -- check args and return enum type
                     var ai2: i64 = 0;
@@ -10708,11 +10834,7 @@ pub fn type_mentions_any(t: Type, params: Vec<str>) -> bool {
 pub fn TypeChecker_is_enum_type_param(self: &TypeChecker, t: Type) -> bool {
     match t {
         Type::Named(n) => {
-            var ti: i64 = 0;
-            while ti < self.enum_type_params.len() {
-                if str_vec_contains(self.enum_type_params.get(ti).val, n) { return true; }
-                ti = ti + 1;
-            }
+            if HashMap_contains(self.enum_tp_set, n) { return true; }
             return str_vec_contains(self.current_type_params, n);
         }
         _ => { return false; }
@@ -11226,6 +11348,7 @@ pub fn TypeChecker_lint_unused_functions(self: &mut TypeChecker, program: Progra
         }
         timpi = timpi + 1;
     }
+    called = tc_dedupe_strs(called);
     // Report unused functions (skip main, pub, __ prefixed, comptime)
     var fi2: i64 = 0;
     while fi2 < program.funcs.len() {
@@ -11360,7 +11483,7 @@ pub fn TypeChecker_collect_called_funcs_expr(self: &TypeChecker, expr: Expr, cal
         }
         Expr::Unary(_, e) => { TypeChecker_collect_called_funcs_expr(self, box_expr_unbox(e), called); }
         Expr::Call(callee, args) => {
-            if !str_vec_contains_ref(called, callee) { called.push(callee); }
+            called.push(callee); // deduplicated by the caller (tc_dedupe_strs)
             var i: i64 = 0;
             while i < args.len() {
                 TypeChecker_collect_called_funcs_expr(self, args.get(i), called);
@@ -11370,7 +11493,7 @@ pub fn TypeChecker_collect_called_funcs_expr(self: &TypeChecker, expr: Expr, cal
         Expr::MethodCall(receiver, method, args) => {
             // "#unwrap" (no function has that name) marks a call that panics on
             // None or Err, for the lint in lint_unwraps
-            if (method == "unwrap" || method == "expect") && !str_vec_contains_ref(called, "#unwrap") {
+            if method == "unwrap" || method == "expect" {
                 called.push("#unwrap");
             }
             TypeChecker_collect_called_funcs_expr(self, box_expr_unbox(receiver), called);
@@ -11516,6 +11639,7 @@ pub fn TypeChecker_lint_unused_imports(self: &mut TypeChecker, program: Program)
         }
         timpi = timpi + 1;
     }
+    called = tc_dedupe_strs(called);
 
     // For each import, check if any called function starts with the module name
     var i: i64 = 0;

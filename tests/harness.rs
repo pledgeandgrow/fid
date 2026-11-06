@@ -57,6 +57,9 @@ fn is_skip_test(name: &str) -> bool {
         | "test_pe_sqlite.fd"
         // Bare-only (`fid emit --bare`): a hosted build panics
         | "test_bare_panic_handler.fd"
+        // Copy-on-write is fid's (fidesc shares Vec handles)
+        | "test_spawn_vec_copy.fd"
+        | "test_parse_header_sqlite.fd"
         // Borrow checker fail test is now in the expected-fail list
         // (borrow checking is on by default as of Phase 5).
     )

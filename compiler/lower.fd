@@ -467,6 +467,8 @@ pub struct Lowerer {
     pub constants: Vec<StringExprEntry>,
     pub current_sret: OptValueId,
     pub enums: Vec<StringEnumDefEntry>,
+    // Name -> position in enums + 1 (Lowerer_insert_enum keeps it, D10)
+    pub enum_index: i64,
     pub impl_methods: Vec<StringStringFuncEntry>,
     pub defer_stack: Vec<Vec<Stmt>>,
     pub current_captures: Vec<ClosureCapture>,
@@ -554,6 +556,7 @@ pub fn Lowerer_new() -> Lowerer {
         constants: Vec::new(),
         current_sret: OptValueId::None,
         enums: Vec::new(),
+        enum_index: HashMap_new(),
         impl_methods: Vec::new(),
         defer_stack: Vec::new(),
         current_captures: Vec::new(),
@@ -684,6 +687,10 @@ pub fn Lowerer_lookup_struct(self: &Lowerer, name: str) -> OptStructDef {
 }
 
 pub fn Lowerer_lookup_enum(self: &Lowerer, name: str) -> OptEnumDef {
+    var at: i64 = HashMap_get(self.enum_index, name) - 1;
+    if at >= 0 && at < self.enums.len() && self.enums.get(at).key == name {
+        return OptEnumDef::Some(self.enums.get(at).val);
+    }
     var i: i64 = 0;
     while i < self.enums.len() {
         if self.enums.get(i).key == name { return OptEnumDef::Some(self.enums.get(i).val); }
@@ -986,6 +993,7 @@ pub fn Lowerer_insert_struct(self: &mut Lowerer, name: str, val: StructDef) {
 
 pub fn Lowerer_insert_enum(self: &mut Lowerer, name: str, val: EnumDef) {
     self.enums.push(StringEnumDefEntry_new(name, val));
+    if !HashMap_contains(self.enum_index, name) { HashMap_insert(self.enum_index, name, self.enums.len()); }
 }
 
 pub fn Lowerer_insert_alloca(self: &mut Lowerer, name: str, val: i64) {
@@ -6374,8 +6382,10 @@ fn Lowerer_c_callback(self: &Lowerer, ext_idx: i64, i: i64, arg: Expr) -> str {
 /// lazy (Vec_share_deep copies elements at the first write), counted (a box
 /// per shared buffer, freed with its last owner), left out for copies never
 /// written (Lowerer_readonly_copy_in) and for last uses (Lowerer_last_use).
-/// Off until the full suite has run with it on.
-const LOWER_COW: bool = false;
+/// On since Nov 6: the suite (fid emit, 364 programs) gives the same output
+/// with it on and off, and the compiler reaches its fixpoint with it on
+/// (93 s, 4.7 GB peak).
+const LOWER_COW: bool = true;
 
 /// Whether callers pass a copy-on-write share of each by-value Vec argument
 /// (then a callee may free the parameters it only borrows at its return).
@@ -6540,6 +6550,11 @@ fn Lowerer_last_use(self: &Lowerer, n: str) -> bool {
                 Type::Ref(_, _) => { return false; }
                 _ => {}
             }
+            // Without argument shares the caller passes its own handle: a
+            // by-value parameter is not the callee's to hand over (`var w =
+            // v; w.push(..)` changed the caller's Vec, and a spawned task's
+            // raced with it: test_spawn_vec_copy)
+            if !LOWER_ARG_SHARE { return false; }
         }
         OptType::None => {}
     }

@@ -243,13 +243,23 @@ the fastest build-to-native among compiled languages, and native code within
 - [~] D7. Benchmarks in CI, failing on a slowdown over 10% (M).
       Written Nov 4: bench/check.sh fails on a slowdown over LIMIT_PCT against
       bench/baseline.txt; not in CI.
-- [ ] D8. Borrow checking is now the slowest compiler phase (about 30 s on the
+- [~] D8. Borrow checking is now the slowest compiler phase (about 30 s on the
       compiler itself): profile and fix it, as for the type checker (M).
+      Nov 6: profiled (gprof on a Linux -pg build of the compiler): the phase
+      printed as "borrowck" is mostly lints (15 s of 31 under gprof: the
+      called-functions lists were deduplicated by scanning before each push),
+      the escape check (5.6 s) and substitution (4.2 s); borrow checking
+      itself is 1.8 s. Lists now gathered and made sets once: the phase is
+      7 s of a self-compile (31 s under gprof before, which runs about twice
+      as slow). Left: the escape check.
 - [~] D9. `emit` of hello world under 0.5 s: stop re-checking the stdlib on each
       build, by caching its checked form (L).
       Done Nov 4: core.fd is checked once per (compiler, core.fd) pair, a stamp
       in the temp directory skips its bodies after. Hello-world timing not
       re-measured.
+      Measured Nov 6: 3.2–3.7 s (front end 2.2 s, then lowering and codegen of
+      the whole stdlib). Left: the checked stdlib cached in a binary form
+      (competitive CS2) and lowering only what is reached.
 - [x] D11. Per-call cost on the C path (M). Functions no longer push and pop a
       call-stack array: panic traces walk the machine stack (unwind tables on
       Windows, `_Unwind_Backtrace` elsewhere; `zig cc` off Windows links
@@ -286,6 +296,18 @@ the fastest build-to-native among compiled languages, and native code within
       scanned lists by name. Left: string compares in method lookup and in the
       parser's token checks; and the compiler is built at -O0, since optimizing
       one 44 MB C file needs more than 16 GB.
+      Nov 6: 133 s to 93 s (stage 2: 103 s), fixpoint kept. The gprof
+      profile: 48% of the time in string compares, from name scans: every
+      method call on a variable scanned all structs and enums for an
+      associated function, effect inference looked function bodies up by
+      name, enum lookups in lowering and field offsets in the C generator
+      scanned lists. Now hash indexes (TypeChecker struct/enum positions,
+      tc_body_index, Lowerer.enum_index, IrModule.struct_index,
+      CCodeGen.layout_index); type checking 59 s to 24 s. Left: parsing,
+      where token_kind_tag (a 150-arm match) runs 28 million times and its C
+      function zeroes about 1,900 locals per call (an enum match as a C
+      `switch`, or no zeroing of SSA temporaries, would fix it); lowering
+      (19 s) and C generation (10 s).
 
 **Acceptance:** the Target column above; self-compile under 60 s.
 
@@ -315,7 +337,17 @@ the fastest build-to-native among compiled languages, and native code within
       `X.dll has no function F`) and exit code 1 (test_pe_dll_missing_fail,
       test_pe_dll_nofn_fail). Left: `ccompile` still reports the linker's
       own message.
-- [ ] E5. `parse-header` output compiles for a real header set (SDL2, SQLite) (M).
+- [x] E5. `parse-header` output compiles for a real header set (SDL2, SQLite) (M).
+      Done Nov 6: compiler/cparser.fd rewritten: quoted `#include`s followed,
+      object- and function-like macros, attribute macros dropped, typedefs,
+      structs, enums, function pointers, constant expressions (`#define` and
+      enum values, casts and macro calls included). sqlite3.h 3.54.1: 356
+      functions and 530 constants (stdlib/sqlite3_h.fd), the 11 left out are
+      varargs or va_list. SDL.h 2.32.10 and its 60 headers: 852 functions and
+      1413 constants (stdlib/sdl2_h.fd), 26 left out (varargs, va_list, a
+      struct by value). test_parse_header_sqlite runs with `fid emit` and no
+      C compiler; test_parse_header_sdl and examples/sdl_window.fd build (the
+      window needs SDL2.dll, not on this machine).
 
 **Acceptance:** one SDL2 and one SQLite example build with `fid emit` and no C
 compiler.
@@ -389,12 +421,16 @@ ARM64 where the system runs there; RISC-V and WASM pass the suite.
 - [x] H1. `spawn` really runs concurrently on the Windows C path: it runs
       synchronously there today, and differs from native (M).
 - [x] H2. Mutexes on the Windows C path are real (S).
-- [~] H3. Data races rejected. Done: code reached from `spawn` or
+- [x] H3. Data races rejected. Done: code reached from `spawn` or
       `p_thread_spawn` may not write a global of the program without a lock. Left:
       shared data reached through pointers and captures (L).
       Nov 4–6: raw pointers, references and structs holding them are not `@send`,
       so they cannot reach another task (test_race_ptr_fail). Left: a `Vec`
       passed to a task is still the same handle until copy-on-write is on (M5).
+      Done Nov 6: with copy-on-write on (M5) a Vec passed to a task is the
+      task's own copy: two tasks changing theirs and the caller's stay apart
+      (test_spawn_vec_copy). Shared data between tasks goes through locks,
+      channels or atomics, which are @send/@sync.
 - [x] H4. Enforce `@send`/`@sync` for every spawn argument (M).
       Done Nov 4: every argument of a spawned call must be `@send`; a struct of
       `@send` fields is `@send` (test_spawn_send_fail).
@@ -418,11 +454,19 @@ ARM64 where the system runs there; RISC-V and WASM pass the suite.
       arguments or results runs as a task through a word adapter
       (test_async_float_struct). Natively built programs crash, as all native
       async does (H10). References are still not task arguments.
-- [ ] H10. Tasks on several threads natively: the C runtime keeps them per thread,
+      Nov 6: natively built async programs no longer crash (a fix of the
+      native-async session in pe_ir's named_fns): test_async_float_struct and
+      the other async tests agree with the interpreter under `fid emit`.
+      Left: reference arguments. A reference cannot reach another task
+      (second-class references, Session 29), so such an `async fn` still runs
+      to its end at the call; making it a task needs a rule that the future
+      is awaited before the referent goes away.
+- [x] H10. Tasks on several threads natively: the C runtime keeps them per thread,
       the native one has a single set (M).
-      Nov 6: the native runtime starts worker threads, but native programs using
-      async or spawn + await crash on them (test_async, test_async_float_struct
-      under `fid emit`).
+      Done: the native runtime is M:N with work stealing, one worker per core
+      (stdlib/pe_runtime/conc.fd); the Nov 6 crash is fixed. test_tasks_10k:
+      10,000 sleeping tasks at once run on 21 threads (16 workers on a
+      16-core machine) in 0.45 s.
 
 **Acceptance:** a race test is rejected; 10,000 concurrent tasks run on a few
 threads.
@@ -579,8 +623,16 @@ Tested on Nov 1, native build:
       a shared counted handle (S, see decision 3).
       Decided Nov 2: copy-on-write for `Vec`, `str` and `HashMap`; `==` by
       content.
-- [ ] M5. Enforce it: use after move is rejected, or shared handles are counted
+- [x] M5. Enforce it: use after move is rejected, or shared handles are counted
       (L).
+      Done Nov 6: copy-on-write is on (LOWER_COW, proposal 0001): a Vec or
+      HashMap copied, passed or stored is a lazy, counted share; the first
+      write copies, the last owner frees. The suite gives the same output on
+      and off (364 programs through `fid emit`); the compiler reaches its
+      fixpoint with it on (93 s, 4.7 GB peak, 1.8 GB off). Fixed on the way:
+      the last use of a by-value parameter was handed over as a move while
+      callers still pass their own handle (LOWER_ARG_SHARE off), so a callee's
+      copy changed the caller's Vec (test_spawn_vec_copy).
 - [x] M6. Every compiler-inserted free has tests for each way a value can escape:
       assignment, field, return, closure, task, container, `unsafe` (M).
 - [~] M7. A checked allocator mode that keeps and poisons freed blocks, so use

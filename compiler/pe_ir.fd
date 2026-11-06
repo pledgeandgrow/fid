@@ -1016,11 +1016,33 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
     var use_regs: bool = !self.bare_mode && !func.is_interrupt;
     var no_reg: Vec<i64> = peir_zeros(nvals);
     var used_regs: Vec<i64> = Vec::new();
-    if use_regs {
-        used_regs = peir_pick_reg_vars(func, module, &mut frame, &mut no_reg, nvals);
+    var ra_facts: PeirRaFacts = PeirRaFacts_new();
+    // Value id -> 1 + register, from the whole-function allocator (D4)
+    var in_reg_of: Vec<i64> = peir_zeros(nvals);
+    var global_ra: bool = use_regs && PEIR_GLOBAL_RA;
+    if global_ra {
+        peir_pick_reg_vars(func, module, &mut frame, &mut no_reg, nvals, 0, &mut ra_facts);
+        used_regs = peir_global_ra(func, module, &mut frame, &mut no_reg, nvals, &ra_facts, &mut in_reg_of);
+    } else if use_regs {
+        used_regs = peir_pick_reg_vars(func, module, &mut frame, &mut no_reg, nvals, PEIR_VALUE_REGS - 2, &mut ra_facts);
+    }
+    // Values the allocator put in a register: their offset is the register
+    var assigned: Vec<i64> = Vec::new();
+    zi = 0;
+    while zi < nvals { assigned.push(-2); zi = zi + 1; }
+    if global_ra {
+        var gi: i64 = 0;
+        while gi < nvals {
+            if in_reg_of.get(gi) > 0 {
+                var goff: i64 = PEIR_REG_SLOT + in_reg_of.get(gi) - 1;
+                frame.offsets.push(PeOffEnt { id: gi, offset: goff });
+                assigned.set(gi, goff);
+            }
+            gi = gi + 1;
+        }
     }
     var free_regs: Vec<i64> = Vec::new();
-    if use_regs {
+    if use_regs && !global_ra {
         var fr: i64 = PEIR_VALUE_REGS - 1;
         while fr >= used_regs.len() {
             free_regs.push(fr);
@@ -1031,7 +1053,7 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
     var vi: i64 = 0;
     while vi < func.value_metas.len() {
         var vm: ValueIdMeta = func.value_metas.get(vi);
-        if !peir_recyclable(vm.id, def_block, n_use_blocks, a_use_block, nvals) {
+        if !peir_recyclable(vm.id, def_block, n_use_blocks, a_use_block, nvals) && !(vm.id < nvals && in_reg_of.get(vm.id) > 0) {
             var size: i64 = IrModule_type_size(module, vm.meta.ty);
             if size < 8 { size = 8; }
             PeStackFrame_alloc(&mut frame, vm.id, size);
@@ -1040,7 +1062,7 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
     }
     // A parameter read more than once keeps a free register for the whole
     // function, while two stay free for temporaries
-    if use_regs {
+    if use_regs && !global_ra {
         var puses: Vec<i64> = peir_zeros(nvals);
         var pui: i64 = 0;
         while pui < func.insts.len() {
@@ -1079,9 +1101,6 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
     // emit loop runs, so frees/assignments line up. A value's slot frees
     // once the instruction holding its last use passes. `assigned` tracks
     // offsets densely (O(1)) — the Vec<PeOffEnt> map is O(n) per lookup.
-    var assigned: Vec<i64> = Vec::new();
-    zi = 0;
-    while zi < nvals { assigned.push(-2); zi = zi + 1; }
     var free_slots: Vec<i64> = Vec::new();
     pos = 0;
     var sbi: i64 = 0;
@@ -1101,7 +1120,8 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
                             && peir_recyclable(op2, def_block, n_use_blocks, a_use_block, nvals)
                             && assigned.get(op2) != -2 {
                             if assigned.get(op2) >= PEIR_REG_SLOT {
-                                free_regs.push(assigned.get(op2) - PEIR_REG_SLOT);
+                                // the whole-function allocator owns its registers
+                                if !global_ra { free_regs.push(assigned.get(op2) - PEIR_REG_SLOT); }
                             } else {
                                 free_slots.push(assigned.get(op2));
                             }
@@ -1407,8 +1427,371 @@ fn peir_loop_back(index: Vec<i64>, depth: &mut Vec<i64>, target: i64, at: i64) {
     }
 }
 
+// ===========================================================================
+// Whole-function register allocation (release D4, D13)
+//
+// Linear scan over live intervals. The candidates are the word-sized SSA
+// values a register can hold (the ones the per-block scheme took, and now
+// also those that live across blocks and parameters) and the locals
+// (allocas) every access of which is a whole-word load or store. Liveness
+// is computed by the usual dataflow over the blocks (no phis: merges go
+// through allocas), each candidate gets one interval [lo, hi] in layout
+// order that covers every point where it is live, and the seven
+// callee-saved value registers go to intervals by start; when none is
+// free, the coldest interval (uses weighted by loop depth) is left in
+// memory. A register value's frame offset is PEIR_REG_SLOT + r, so the
+// emitting code is unchanged.
+// ===========================================================================
+
+const PEIR_GLOBAL_RA: bool = true;
+
+/// What pick_reg_vars works out, for the allocator: per alloca its weight
+/// + 1 when it is a candidate and whether it must stay in memory; per block
+/// its loop depth; block id -> index.
+pub struct PeirRaFacts {
+    pub weight: Vec<i64>,
+    pub bad: Vec<i64>,
+    pub depth: Vec<i64>,
+    pub index: Vec<i64>,
+}
+
+fn PeirRaFacts_new() -> PeirRaFacts {
+    return PeirRaFacts { weight: Vec::new(), bad: Vec::new(), depth: Vec::new(), index: Vec::new() };
+}
+
+fn peir_bs_test(bs: &Vec<i64>, base: i64, k: i64) -> bool {
+    return ((bs.get(base + k / 64) >> (k % 64)) & 1) != 0;
+}
+
+fn peir_bs_set(bs: &mut Vec<i64>, base: i64, k: i64) {
+    var w: i64 = base + k / 64;
+    bs.set(w, bs.get(w) | (1 << (k % 64)));
+}
+
+/// Allocate registers for the whole function; returns the value registers
+/// used. SSA values that got one are in `in_reg` (1 + register); locals in
+/// frame.reg_vars.
+fn peir_global_ra(func: &IrFunction, module: &IrModule, frame: &mut PeStackFrame, no_reg: &mut Vec<i64>, nvals: i64, facts: &PeirRaFacts, in_reg: &mut Vec<i64>) -> Vec<i64> {
+    var nb: i64 = func.blocks.len();
+    var used: Vec<i64> = Vec::new();
+    if nb == 0 { return used; }
+    var ops: Vec<i64> = Vec::new();
+    // TryUnwrap's second result has a slot of its own
+    var ii: i64 = 0;
+    while ii < func.insts.len() {
+        match func.insts.get(ii).inst {
+            Inst::TryUnwrap(_, okd, _, _) => { peir_mark(no_reg, okd, nvals); }
+            _ => {}
+        }
+        ii = ii + 1;
+    }
+    // Candidates: value id -> candidate index, and whether it is a local
+    var cidx: Vec<i64> = Vec::new();
+    while cidx.len() < nvals { cidx.push(-1); }
+    var cand: Vec<i64> = Vec::new();
+    var is_local: Vec<i64> = Vec::new();
+    var defined: Vec<i64> = peir_zeros(nvals);
+    var b: i64 = 0;
+    while b < nb {
+        var ids: Vec<i64> = func.blocks.get(b).instructions;
+        var k: i64 = 0;
+        while k < ids.len() {
+            var id: i64 = ids.get(k);
+            if id >= 0 && id < nvals {
+                match IrFunction_get_inst(func, id) {
+                    OptInst::Some(inst) => {
+                        match inst {
+                            Inst::Alloca(ty, _) => {
+                                if facts.weight.len() > id && facts.weight.get(id) != 0 && facts.bad.get(id) == 0
+                                    && peir_reg_word(module, ty) && cidx.get(id) < 0 {
+                                    cidx.set(id, cand.len());
+                                    cand.push(id);
+                                    is_local.push(1);
+                                }
+                            }
+                            _ => {
+                                if defined.get(id) == 0 && no_reg.get(id) == 0 && cidx.get(id) < 0 {
+                                    match IrFunction_get_meta(func, id) {
+                                        OptValueMeta::Some(vm) => {
+                                            if peir_reg_type(module, vm.ty) {
+                                                cidx.set(id, cand.len());
+                                                cand.push(id);
+                                                is_local.push(0);
+                                            }
+                                        }
+                                        OptValueMeta::None => {}
+                                    }
+                                }
+                            }
+                        }
+                        defined.set(id, 1);
+                    }
+                    OptInst::None => {}
+                }
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    var pi: i64 = 0;
+    while pi < func.params.len() {
+        var prm: ValueIdType = func.params.get(pi);
+        if prm.id >= 0 && prm.id < nvals && cidx.get(prm.id) < 0 && no_reg.get(prm.id) == 0
+            && peir_reg_word(module, prm.ty) {
+            cidx.set(prm.id, cand.len());
+            cand.push(prm.id);
+            is_local.push(0);
+        }
+        pi = pi + 1;
+    }
+    var nc: i64 = cand.len();
+    if nc == 0 { return used; }
+    var nw: i64 = (nc + 63) / 64;
+    // Per block: upward-exposed uses and definitions; positions and weights
+    var use_bs: Vec<i64> = peir_zeros(nb * nw);
+    var def_bs: Vec<i64> = peir_zeros(nb * nw);
+    var lo: Vec<i64> = Vec::new();
+    var hi: Vec<i64> = Vec::new();
+    var wt: Vec<i64> = peir_zeros(nc);
+    var ci: i64 = 0;
+    while ci < nc { lo.push(1 << 60); hi.push(-2); ci = ci + 1; }
+    var bstart: Vec<i64> = peir_zeros(nb);
+    var bend: Vec<i64> = peir_zeros(nb);
+    // Parameters are defined before the first instruction (position -1)
+    pi = 0;
+    while pi < func.params.len() {
+        var pid: i64 = func.params.get(pi).id;
+        if pid >= 0 && pid < nvals && cidx.get(pid) >= 0 {
+            var pk: i64 = cidx.get(pid);
+            peir_bs_set(&mut def_bs, 0, pk);
+            lo.set(pk, -1);
+            if hi.get(pk) < -1 { hi.set(pk, -1); }
+        }
+        pi = pi + 1;
+    }
+    var pos: i64 = 0;
+    b = 0;
+    while b < nb {
+        bstart.set(b, pos);
+        var cost: i64 = 1;
+        var c: i64 = 0;
+        while c < facts.depth.get(b) && c < 4 {
+            cost = cost * 10;
+            c = c + 1;
+        }
+        var base: i64 = b * nw;
+        var ids: Vec<i64> = func.blocks.get(b).instructions;
+        var k: i64 = 0;
+        while k < ids.len() {
+            var id: i64 = ids.get(k);
+            match IrFunction_get_inst(func, id) {
+                OptInst::Some(inst) => {
+                    // The local a Store writes is defined, not read
+                    var stored: i64 = -1;
+                    match inst {
+                        Inst::Store(sptr, svalue, _) => {
+                            if sptr >= 0 && sptr < nvals && sptr != svalue && cidx.get(sptr) >= 0 && is_local.get(cidx.get(sptr)) == 1 {
+                                stored = sptr;
+                            }
+                        }
+                        _ => {}
+                    }
+                    ops.clear();
+                    peir_inst_operands(inst, &mut ops);
+                    var o: i64 = 0;
+                    while o < ops.len() {
+                        var op: i64 = ops.get(o);
+                        if op >= 0 && op < nvals && op != stored && cidx.get(op) >= 0 {
+                            var ck: i64 = cidx.get(op);
+                            if !peir_bs_test(&def_bs, base, ck) { peir_bs_set(&mut use_bs, base, ck); }
+                            if pos < lo.get(ck) { lo.set(ck, pos); }
+                            if pos > hi.get(ck) { hi.set(ck, pos); }
+                            wt.set(ck, wt.get(ck) + cost);
+                        }
+                        o = o + 1;
+                    }
+                    var dv: i64 = stored;
+                    if dv < 0 && id >= 0 && id < nvals && cidx.get(id) >= 0 && is_local.get(cidx.get(id)) == 0 { dv = id; }
+                    if dv >= 0 {
+                        var dk: i64 = cidx.get(dv);
+                        peir_bs_set(&mut def_bs, base, dk);
+                        if pos < lo.get(dk) { lo.set(dk, pos); }
+                        if pos > hi.get(dk) { hi.set(dk, pos); }
+                        wt.set(dk, wt.get(dk) + cost);
+                    }
+                }
+                OptInst::None => {}
+            }
+            pos = pos + 1;
+            k = k + 1;
+        }
+        bend.set(b, pos - 1);
+        b = b + 1;
+    }
+    // Successors
+    var succ_a: Vec<i64> = Vec::new();
+    var succ_b: Vec<i64> = Vec::new();
+    b = 0;
+    while b < nb {
+        var sa: i64 = -1;
+        var sb: i64 = -1;
+        var ids2: Vec<i64> = func.blocks.get(b).instructions;
+        if ids2.len() > 0 {
+            match IrFunction_get_inst(func, ids2.get(ids2.len() - 1)) {
+                OptInst::Some(last) => {
+                    match last {
+                        Inst::Jump(t) => { if t >= 0 && t < facts.index.len() { sa = facts.index.get(t); } }
+                        Inst::Branch(_, t, e) => {
+                            if t >= 0 && t < facts.index.len() { sa = facts.index.get(t); }
+                            if e >= 0 && e < facts.index.len() { sb = facts.index.get(e); }
+                        }
+                        _ => {}
+                    }
+                }
+                OptInst::None => {}
+            }
+        }
+        succ_a.push(sa);
+        succ_b.push(sb);
+        b = b + 1;
+    }
+    // Liveness: in = use | (out & ~def), out = the ins of the successors
+    var live_in: Vec<i64> = peir_zeros(nb * nw);
+    var live_out: Vec<i64> = peir_zeros(nb * nw);
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        b = nb - 1;
+        while b >= 0 {
+            var base2: i64 = b * nw;
+            var sa2: i64 = succ_a.get(b);
+            var sb2: i64 = succ_b.get(b);
+            var w: i64 = 0;
+            while w < nw {
+                var out: i64 = 0;
+                if sa2 >= 0 { out = out | live_in.get(sa2 * nw + w); }
+                if sb2 >= 0 { out = out | live_in.get(sb2 * nw + w); }
+                live_out.set(base2 + w, out);
+                var inw: i64 = use_bs.get(base2 + w) | (out & ~def_bs.get(base2 + w));
+                if inw != live_in.get(base2 + w) {
+                    live_in.set(base2 + w, inw);
+                    changed = true;
+                }
+                w = w + 1;
+            }
+            b = b - 1;
+        }
+    }
+    // Intervals: every point of a block a candidate is live through
+    b = 0;
+    while b < nb {
+        var base3: i64 = b * nw;
+        var w2: i64 = 0;
+        while w2 < nw {
+            var lin: i64 = live_in.get(base3 + w2);
+            var lout: i64 = live_out.get(base3 + w2);
+            if lin != 0 || lout != 0 {
+                var bit: i64 = 0;
+                while bit < 64 {
+                    var ck2: i64 = w2 * 64 + bit;
+                    if ck2 < nc {
+                        if ((lin >> bit) & 1) != 0 {
+                            if bstart.get(b) < lo.get(ck2) { lo.set(ck2, bstart.get(b)); }
+                            if bstart.get(b) > hi.get(ck2) { hi.set(ck2, bstart.get(b)); }
+                        }
+                        if ((lout >> bit) & 1) != 0 {
+                            if bend.get(b) > hi.get(ck2) { hi.set(ck2, bend.get(b)); }
+                        }
+                    }
+                    bit = bit + 1;
+                }
+            }
+            w2 = w2 + 1;
+        }
+        b = b + 1;
+    }
+    // Candidates by start: a bucket per position (-1 for parameters)
+    var npos: i64 = pos + 2;
+    var head: Vec<i64> = Vec::new();
+    while head.len() < npos { head.push(-1); }
+    var nxt: Vec<i64> = Vec::new();
+    while nxt.len() < nc { nxt.push(-1); }
+    ci = nc - 1;
+    while ci >= 0 {
+        if hi.get(ci) >= lo.get(ci) && lo.get(ci) + 1 < npos {
+            var slot: i64 = lo.get(ci) + 1;
+            nxt.set(ci, head.get(slot));
+            head.set(slot, ci);
+        }
+        ci = ci - 1;
+    }
+    // Linear scan over PEIR_VALUE_REGS registers
+    var active: Vec<i64> = Vec::new();
+    while active.len() < PEIR_VALUE_REGS { active.push(-1); }
+    var reg_of: Vec<i64> = Vec::new();
+    while reg_of.len() < nc { reg_of.push(-1); }
+    var p: i64 = 0;
+    while p < npos {
+        var cur: i64 = head.get(p);
+        while cur >= 0 {
+            var clo: i64 = lo.get(cur);
+            var r: i64 = 0;
+            var free: i64 = -1;
+            while r < PEIR_VALUE_REGS {
+                var a: i64 = active.get(r);
+                // an operand whose last use is where `cur` is defined: read
+                // before the result is written, so they may share
+                if a >= 0 && hi.get(a) <= clo && !(lo.get(a) == -1 && clo == -1) { active.set(r, -1); a = -1; }
+                if a < 0 && free < 0 { free = r; }
+                r = r + 1;
+            }
+            if free >= 0 {
+                active.set(free, cur);
+                reg_of.set(cur, free);
+            } else {
+                // The coldest of the active ones (and `cur`) stays in memory
+                var worst: i64 = -1;
+                r = 0;
+                while r < PEIR_VALUE_REGS {
+                    var a2: i64 = active.get(r);
+                    if worst < 0 || wt.get(a2) < wt.get(active.get(worst))
+                        || (wt.get(a2) == wt.get(active.get(worst)) && hi.get(a2) > hi.get(active.get(worst))) {
+                        worst = r;
+                    }
+                    r = r + 1;
+                }
+                var victim: i64 = active.get(worst);
+                if wt.get(victim) < wt.get(cur) {
+                    reg_of.set(victim, -1);
+                    active.set(worst, cur);
+                    reg_of.set(cur, worst);
+                }
+            }
+            cur = nxt.get(cur);
+        }
+        p = p + 1;
+    }
+    // Results
+    ci = 0;
+    while ci < nc {
+        var rr: i64 = reg_of.get(ci);
+        if rr >= 0 {
+            var v: i64 = cand.get(ci);
+            if is_local.get(ci) == 1 {
+                pe_idmap_put(&mut frame.reg_vars, v, PEIR_REG_SLOT + rr);
+            } else {
+                in_reg.set(v, rr + 1);
+            }
+            peir_mark(no_reg, v, nvals);
+            if !peir_has_i64(used, rr) { used.push(rr); }
+        }
+        ci = ci + 1;
+    }
+    return used;
+}
+
 /// src/pe.rs pick_reg_vars: the locals worth a register, most used first.
-fn peir_pick_reg_vars(func: &IrFunction, module: &IrModule, frame: &mut PeStackFrame, no_reg: &mut Vec<i64>, nvals: i64) -> Vec<i64> {
+fn peir_pick_reg_vars(func: &IrFunction, module: &IrModule, frame: &mut PeStackFrame, no_reg: &mut Vec<i64>, nvals: i64, limit: i64, out: &mut PeirRaFacts) -> Vec<i64> {
     var nb: i64 = func.blocks.len();
     var max_id: i64 = 0;
     var b: i64 = 0;
@@ -1540,7 +1923,12 @@ fn peir_pick_reg_vars(func: &IrFunction, module: &IrModule, frame: &mut PeStackF
         b = b + 1;
     }
     var taken: Vec<i64> = Vec::new();
-    while taken.len() < PEIR_VALUE_REGS - 2 {
+    // The analysis, for the whole-function allocator
+    out.weight = weight;
+    out.bad = bad;
+    out.depth = depth;
+    out.index = index;
+    while taken.len() < limit {
         var best: i64 = -1;
         var best_w: i64 = 3;
         var ii: i64 = 0;

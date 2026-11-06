@@ -1624,6 +1624,8 @@ pub struct IrModule {
     // Name -> position in functions + 1; filled by IrModule_get_function
     pub fn_index: i64,
     pub struct_layouts: Vec<StructLayoutEntry>,
+    // Name -> position in struct_layouts + 1 (IrModule_add_struct keeps it)
+    pub struct_index: i64,
     pub string_constants: Vec<StringStringEntry>,
     // String -> position in string_constants + 1
     pub str_index: i64,
@@ -1709,6 +1711,7 @@ pub fn IrModule_new() -> IrModule {
         functions: Vec::new(),
         fn_index: HashMap_new(),
         struct_layouts: Vec::new(),
+        struct_index: HashMap_new(),
         string_constants: Vec::new(),
         str_index: HashMap_new(),
         extern_functions: Vec::new(),
@@ -1738,6 +1741,11 @@ pub fn c_fn_target(name: str) -> str {
 
 pub fn IrModule_add_struct(self: &mut IrModule, layout: StructLayout) {
     // Replace existing entry if present (fixpoint loop recomputes layouts)
+    var at: i64 = HashMap_get(self.struct_index, layout.name) - 1;
+    if at >= 0 && at < self.struct_layouts.len() && self.struct_layouts.get(at).name == layout.name {
+        self.struct_layouts.set(at, StructLayoutEntry_new(layout.name, layout));
+        return;
+    }
     var i: i64 = 0;
     while i < self.struct_layouts.len() {
         if self.struct_layouts.get(i).name == layout.name {
@@ -1747,9 +1755,14 @@ pub fn IrModule_add_struct(self: &mut IrModule, layout: StructLayout) {
         i = i + 1;
     }
     self.struct_layouts.push(StructLayoutEntry_new(layout.name, layout));
+    HashMap_insert(self.struct_index, layout.name, self.struct_layouts.len());
 }
 
 pub fn IrModule_get_struct(self: &IrModule, name: str) -> OptStructLayout {
+    var at: i64 = HashMap_get(self.struct_index, name) - 1;
+    if at >= 0 && at < self.struct_layouts.len() && self.struct_layouts.get(at).name == name {
+        return OptStructLayout::Some(self.struct_layouts.get(at).layout);
+    }
     var i: i64 = 0;
     while i < self.struct_layouts.len() {
         if self.struct_layouts.get(i).name == name {
