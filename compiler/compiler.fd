@@ -952,13 +952,17 @@ var g_stdlib_dir: str = "stdlib";
 // does, so a call to builtin `p_X` can run `pert_X` (see pe_ir resolve_call).
 pub var g_pe_runtime_merge: bool = false;
 pub fn set_pe_runtime_merge(v: bool) { g_pe_runtime_merge = v; }
+/// The runtime merged: "pe_runtime" (native Windows), or "linux_runtime"
+/// (native Linux AArch64 / RISC-V, compiler/nat_ir.fd, release F8)
+pub var g_native_rt_dir: str = "pe_runtime";
+pub fn set_native_runtime(dir: str) { g_native_rt_dir = dir; g_pe_runtime_merge = true; }
 
 /// Locate a PE runtime source file: under stdlib/pe_runtime/ (repo and
 /// installed layouts alike), with a legacy src/pe_runtime/ fallback.
 pub fn pe_runtime_path(name: str) -> str {
-    var p1: str = c_path_join(stdlib_dir(), c_path_join("pe_runtime", name));
+    var p1: str = c_path_join(stdlib_dir(), c_path_join(g_native_rt_dir, name));
     if c_file_exists(p1) { return p1; }
-    return c_path_join("src", c_path_join("pe_runtime", name));
+    return c_path_join("src", c_path_join(g_native_rt_dir, name));
 }
 
 /// The standard library's directory: ./stdlib (the repository), else that
@@ -1108,9 +1112,20 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
             if g_pe_runtime_merge {
                 var rt_files: Vec<str> = Vec::new();
                 rt_files.push("base.fd");
-                rt_files.push("conc.fd");
-                rt_files.push("tensor.fd");
-                rt_files.push("data.fd");
+                if g_native_rt_dir == "pe_runtime" {
+                    rt_files.push("conc.fd");
+                    rt_files.push("tensor.fd");
+                    rt_files.push("data.fd");
+                } else {
+                    // Linux: its own base, threads, system calls; JSON,
+                    // HTTP, the in-memory DB and tensors are the Windows
+                    // runtime's Fides code, shared
+                    rt_files.push("conc.fd");
+                    rt_files.push("sys.fd");
+                    rt_files.push("math.fd");
+                    rt_files.push("../pe_runtime/data.fd");
+                    rt_files.push("../pe_runtime/tensor.fd");
+                }
                 var rti: i64 = 0;
                 while rti < rt_files.len() {
                     var rt_path: str = pe_runtime_path(rt_files.get(rti));
@@ -2633,6 +2648,21 @@ pub fn merge_programs(stdlib: Program, user: Program) -> Program {
 // apply_cfg_filter -- conditional compilation (@cfg)
 // ===========================================================================
 
+/// The target of a cross build: "" = the host. `fid ccompile --target`
+/// sets them (os: linux, macos, windows; arch: x86_64, aarch64, riscv64).
+pub var g_cfg_os: str = "";
+pub var g_cfg_arch: str = "";
+
+/// Does `@cfg(arch)` name the target's architecture? (x86_64 on the host.)
+fn cfg_arch_is(name: str) -> bool {
+    var want: str = name;
+    if want == "arm64" { want = "aarch64"; }
+    if want == "riscv" { want = "riscv64"; }
+    var arch: str = g_cfg_arch;
+    if arch == "" { arch = "x86_64"; }
+    return want == arch;
+}
+
 /// Conditional compilation (release K10, as src/compiler.rs apply_cfg_filter):
 /// a function or struct whose @cfg names another platform, architecture or
 /// build mode is left out. Lists are rebuilt with plain pushes (the old
@@ -2641,6 +2671,12 @@ pub fn apply_cfg_filter(program: &mut Program) {
     var is_windows: bool = p_getenv("OS") == "Windows_NT";
     var is_linux: bool = !is_windows && c_file_exists("/proc/self/exe");
     var is_macos: bool = !is_windows && !is_linux;
+    // A cross build (`ccompile --target`, release F5/F8) decides by the target
+    if g_cfg_os != "" {
+        is_windows = g_cfg_os == "windows";
+        is_linux = g_cfg_os == "linux";
+        is_macos = g_cfg_os == "macos";
+    }
     var any: bool = false;
     var i: i64 = 0;
     while i < program.funcs.len() && !any {
@@ -2690,8 +2726,7 @@ fn check_cfg(annotations: Vec<Annotation>, is_linux: bool, is_windows: bool, is_
                         if val == "macos" { include = is_macos; }
                     }
                     if key == "target_arch" || key == "arch" {
-                        if val == "x86_64" { include = true; }
-                        if val == "aarch64" || val == "riscv64" { include = false; }
+                        include = cfg_arch_is(val);
                     }
                 } else {
                     if arg == "debug" { include = is_debug; }
@@ -2699,7 +2734,7 @@ fn check_cfg(annotations: Vec<Annotation>, is_linux: bool, is_windows: bool, is_
                     if arg == "linux" { include = is_linux; }
                     if arg == "windows" { include = is_windows; }
                     if arg == "macos" { include = is_macos; }
-                    if arg == "aarch64" || arg == "arm64" || arg == "riscv64" || arg == "riscv" { include = false; }
+                    if arg == "x86_64" || arg == "aarch64" || arg == "arm64" || arg == "riscv64" || arg == "riscv" { include = cfg_arch_is(arg); }
                 }
                 if !include { return false; }
                 j = j + 1;

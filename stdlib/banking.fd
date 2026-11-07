@@ -2,8 +2,9 @@
 //
 // A minimal banking layer built on linear Money + @conserve.
 // Demonstrates compile-time financial conservation — the thing COBOL
-// cannot do. Every function that moves money is @conserve, meaning
-// the compiler proves no money is created, destroyed, or duplicated.
+// cannot do. Deposits and state changes are @conserve: the compiler
+// proves they create, destroy or duplicate no money. Withdraw, transfer
+// and interest rebuild balances from cents, so they are not (yet).
 //
 // Design: Accounts are immutable — each operation consumes the old
 // Account and returns a new one. This fits naturally with linear types:
@@ -55,7 +56,9 @@ pub fn Account_deposit(acc: Account, amount: Money) -> Account {
 /// Withdraw money from an account. Consumes the account,
 /// returns a new account with reduced balance AND the withdrawn cash.
 /// Conservation: old_balance = new_balance + withdrawn.
-@conserve
+/// NOT @conserve: it rebuilds balances from cents (Money_from_cents mints).
+/// A conserving version needs Money_split, blocked by the tuple layout bug
+/// (compiler/lower.fd names every 2-tuple layout `__tuple_2`).
 pub fn Account_withdraw(acc: Account, withdraw_cents: i64) -> (Account, Money) {
     var id = acc.id;
     var c = acc.balance.cents;
@@ -67,7 +70,9 @@ pub fn Account_withdraw(acc: Account, withdraw_cents: i64) -> (Account, Money) {
 /// Transfer money from one account to another. Consumes both accounts,
 /// returns both with updated balances.
 /// Conservation: A loses X, B gains X. Total unchanged.
-@conserve
+/// NOT @conserve: it rebuilds balances from cents (Money_from_cents mints).
+/// A conserving version needs Money_split, blocked by the tuple layout bug
+/// (compiler/lower.fd names every 2-tuple layout `__tuple_2`).
 pub fn Account_transfer(from: Account, to: Account, amount_cents: i64) -> (Account, Account) {
     var from_id = from.id;
     var from_bal = from.balance.cents;
@@ -83,7 +88,7 @@ pub fn Account_transfer(from: Account, to: Account, amount_cents: i64) -> (Accou
 /// Uses integer arithmetic: interest = balance * rate_bps / 10000
 /// (rate_bps = basis points, e.g. 500 = 5.00%)
 /// @deterministic: same inputs always produce same outputs (no float).
-@conserve
+/// NOT @conserve: the interest is new money, paid in by the bank.
 @deterministic
 pub fn Account_accrue_interest(acc: Account, rate_bps: i64) -> Account {
     var c = acc.balance.cents;
@@ -179,7 +184,9 @@ pub fn AccountActive_deposit(acc: AccountActive, amount: Money) -> AccountActive
 }
 
 /// Withdraw money from an active account.
-@conserve
+/// NOT @conserve: it rebuilds balances from cents (Money_from_cents mints).
+/// A conserving version needs Money_split, blocked by the tuple layout bug
+/// (compiler/lower.fd names every 2-tuple layout `__tuple_2`).
 pub fn AccountActive_withdraw(acc: AccountActive, withdraw_cents: i64) -> (AccountActive, Money) {
     var c = acc.balance.cents;
     var new_balance = Money_from_cents(c - withdraw_cents);
@@ -188,7 +195,9 @@ pub fn AccountActive_withdraw(acc: AccountActive, withdraw_cents: i64) -> (Accou
 }
 
 /// Transfer money between two active accounts.
-@conserve
+/// NOT @conserve: it rebuilds balances from cents (Money_from_cents mints).
+/// A conserving version needs Money_split, blocked by the tuple layout bug
+/// (compiler/lower.fd names every 2-tuple layout `__tuple_2`).
 pub fn AccountActive_transfer(from: AccountActive, to: AccountActive,
                                 amount_cents: i64) -> (AccountActive, AccountActive) {
     var from_bal = from.balance.cents;

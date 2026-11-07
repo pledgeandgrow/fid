@@ -59,6 +59,10 @@ fn is_skip_test(name: &str) -> bool {
         | "test_bare_panic_handler.fd"
         // Copy-on-write is fid's (fidesc shares Vec handles)
         | "test_spawn_vec_copy.fd"
+        // fid only: length-headered strings (D16), Vec elements at their
+        // size (D14)
+        | "test_str_length.fd"
+        | "test_vec_sized_layout.fd"
         | "test_parse_header_sqlite.fd"
         // Borrow checker fail test is now in the expected-fail list
         // (borrow checking is on by default as of Phase 5).

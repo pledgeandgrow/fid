@@ -41,6 +41,7 @@ use compiler::coff;
 use compiler::macho;
 use compiler::cparser;
 use compiler::iropt;
+use compiler::nat_ir;
 use compiler::typechecker;
 use compiler::json;
 
@@ -252,7 +253,7 @@ fn find_output_arg(n: i64, start: i64, default: str) -> str {
 // On Linux, executables don't need an extension.
 // On Windows, append .exe if not already present.
 fn ensure_exe_extension(s: str) -> str {
-    if is_linux() {
+    if is_posix_host() {
         return s;
     }
     if str_ends_with(s, ".exe") {
@@ -261,15 +262,63 @@ fn ensure_exe_extension(s: str) -> str {
     return s + ".exe";
 }
 
-// --- Helper: detect Linux platform ----------------------------------------
-fn is_linux() -> bool {
-    // Check for /proc/self/exe which exists on Linux
-    return c_file_exists("/proc/self/exe");
+// --- Cross targets of `ccompile --target` (release F5, F8) ----------------
+// A target names an OS and an architecture: `aarch64-linux`, `arm64-linux`,
+// `riscv64-linux`, `x86_64-linux`, `x86_64-macos`, `aarch64-macos`,
+// `x86_64-windows`, also as full triples (`aarch64-linux-musl`, ...).
+
+/// The target's OS: "linux", "macos", "windows", "wasi" (WebAssembly), or
+/// "" when not known.
+fn cross_target_os(target: str) -> str {
+    if str_contains(target, "wasi") || str_starts_with(target, "wasm") { return "wasi"; }
+    if str_contains(target, "linux") { return "linux"; }
+    if str_contains(target, "macos") || str_contains(target, "darwin") || str_contains(target, "apple") { return "macos"; }
+    if str_contains(target, "windows") || str_contains(target, "mingw") { return "windows"; }
+    return "";
 }
 
-/// Panic traces unwind the stack: zig cc links no unwinder for C on Linux.
+/// The target's architecture: "x86_64", "aarch64", "riscv64", "wasm32", or "".
+fn cross_target_arch(target: str) -> str {
+    if str_starts_with(target, "wasm") || target == "wasi" { return "wasm32"; }
+    if str_starts_with(target, "aarch64") || str_starts_with(target, "arm64") { return "aarch64"; }
+    if str_starts_with(target, "riscv64") || str_starts_with(target, "riscv") { return "riscv64"; }
+    if str_starts_with(target, "x86_64") || str_starts_with(target, "x86-64") || str_starts_with(target, "x64") { return "x86_64"; }
+    return "";
+}
+
+/// The `zig cc -target` triple for a target. Linux builds are static musl
+/// executables, so they run on any Linux and under qemu-user without a
+/// sysroot. "" when the target is not one zig knows here.
+fn cross_zig_triple(target: str) -> str {
+    var os: str = cross_target_os(target);
+    var arch: str = cross_target_arch(target);
+    if os == "" || arch == "" { return ""; }
+    if os == "linux" { return arch + "-linux-musl"; }
+    if os == "macos" { return arch + "-macos"; }
+    if os == "wasi" { return "wasm32-wasi"; }
+    return arch + "-windows-gnu";
+}
+
+// --- Helpers: the host system -----------------------------------------------
+/// The host: "windows", "linux" or "macos" (release F5: before, every host
+/// without /proc was taken for Windows, so `fid` on a Mac named executables
+/// .exe and linked ws2_32).
+fn host_os() -> str {
+    if p_getenv("OS") == "Windows_NT" { return "windows"; }
+    if c_file_exists("/proc/self/exe") { return "linux"; }
+    return "macos";
+}
+
+/// A POSIX host (Linux or macOS): `which`, /dev/null, executables without
+/// an extension, -lm -lpthread.
+fn is_posix_host() -> bool {
+    return host_os() != "windows";
+}
+
+/// Panic traces unwind the stack: zig cc links no unwinder for C on Linux
+/// (macOS has _Unwind_Backtrace in libSystem).
 fn zig_unwind(cc: str) -> str {
-    if is_linux() && str_contains(cc, "zig") { return " -lunwind"; }
+    if host_os() == "linux" && str_contains(cc, "zig") { return " -lunwind"; }
     return "";
 }
 
@@ -623,7 +672,7 @@ fn cmd_run(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     if str_len(mem_flags) > 0 {
         var mexe: str = "_fides_memcheck_tmp.exe";
         var mrun: str = ".\\_fides_memcheck_tmp.exe";
-        if is_linux() {
+        if is_posix_host() {
             mexe = "_fides_memcheck_tmp";
             mrun = "./_fides_memcheck_tmp";
         }
@@ -766,7 +815,7 @@ fn cmd_test_file(n: i64, start: i64) -> i64 {
     p_file_write(main_fd, harness);
     var exe: str = "_fides_test_run.exe";
     var run: str = ".\\_fides_test_run.exe";
-    if is_linux() {
+    if is_posix_host() {
         exe = "_fides_test_run";
         run = "./_fides_test_run";
     }
@@ -829,7 +878,7 @@ fn cmd_test(n: i64, start: i64) -> i64 {
     p_eprint_str("[test] Scanning tests/bootstrap/ directory...\n");
 
     // Use ls/dir command to list .fd files, redirect to temp file
-    if is_linux() {
+    if is_posix_host() {
         p_system("ls tests/bootstrap/*.fd > _fides_test_list.txt 2>/dev/null");
     } else {
         p_system("dir /b tests\\bootstrap\\*.fd > _fides_test_list.txt 2>nul");
@@ -1042,13 +1091,13 @@ fn cmd_test(n: i64, start: i64) -> i64 {
                 var c_file: str = "_fides_test_tmp.c";
                 p_file_write(c_file, c_code);
                 var exe_name: str = "_fides_test_tmp.exe";
-                if is_linux() { exe_name = "_fides_test_tmp"; }
+                if is_posix_host() { exe_name = "_fides_test_tmp"; }
                 var cc: str = env_or_empty("CC");
                 if str_len(cc) == 0 {
-                    if is_linux() { cc = "gcc"; } else { cc = "tcc"; }
+                    if is_posix_host() { cc = "gcc"; } else { cc = "tcc"; }
                 }
                 var cc_cmd: str = "";
-                if is_linux() {
+                if is_posix_host() {
                     cc_cmd = cc + " -O2 -w -o " + exe_name + " " + c_file + " -lm";
                 } else {
                     cc_cmd = cc + " -O2 -w -o " + exe_name + " " + c_file + " -lws2_32";
@@ -1117,7 +1166,7 @@ fn cmd_test(n: i64, start: i64) -> i64 {
     }
 
     // Clean up
-    if is_linux() {
+    if is_posix_host() {
         p_system("rm -f _fides_test_list.txt _fides_test_tmp.c _fides_test_tmp");
     } else {
         p_system("del _fides_test_list.txt");
@@ -1188,9 +1237,9 @@ fn cmd_bench(n: i64, start: i64) -> i64 {
             var c_file: str = "_fides_bench_tmp.c";
             p_file_write(c_file, c_code);
             var exe_name: str = "_fides_bench_tmp.exe";
-            if is_linux() { exe_name = "_fides_bench_tmp"; }
+            if is_posix_host() { exe_name = "_fides_bench_tmp"; }
             var bench_cmd: str = "";
-            if is_linux() {
+            if is_posix_host() {
                 bench_cmd = "gcc -O2 -w -o " + exe_name + " " + c_file + " -lm";
             } else {
                 bench_cmd = "tcc -O2 -w -o " + exe_name + " " + c_file + " -lws2_32";
@@ -1222,7 +1271,7 @@ fn cmd_bench(n: i64, start: i64) -> i64 {
             }
 
             // Clean up
-            if is_linux() {
+            if is_posix_host() {
                 p_system("rm -f _fides_bench_tmp.c _fides_bench_tmp");
             } else {
                 p_system("del _fides_bench_tmp.c");
@@ -1251,7 +1300,7 @@ fn cmd_profile(n: i64, start: i64) -> i64 {
     var out: str = get_flag_value(n, start, "-o", "fides-profile.folded");
     var exe: str = "_fides_profile_tmp.exe";
     var run_exe: str = ".\\_fides_profile_tmp.exe";
-    if is_linux() {
+    if is_posix_host() {
         exe = "_fides_profile_tmp";
         run_exe = "./_fides_profile_tmp";
     }
@@ -1341,16 +1390,16 @@ fn cmd_repl() -> i64 {
             ResultStr::Ok(c_code) => {
                 p_file_write("_fides_repl_tmp.c", c_code);
                 var exe_name: str = "_fides_repl_tmp.exe";
-                if is_linux() { exe_name = "_fides_repl_tmp"; }
+                if is_posix_host() { exe_name = "_fides_repl_tmp"; }
                 var build_cmd: str = "";
-                if is_linux() {
+                if is_posix_host() {
                     build_cmd = "gcc -O2 -w -o " + exe_name + " _fides_repl_tmp.c -lm";
                 } else {
                     build_cmd = "tcc -O2 -w -o " + exe_name + " _fides_repl_tmp.c -lws2_32";
                 }
                 p_system(build_cmd);
                 p_system(exe_name);
-                if is_linux() {
+                if is_posix_host() {
                     p_system("rm -f _fides_repl_tmp.c _fides_repl_tmp");
                 } else {
                     p_system("del _fides_repl_tmp.c");
@@ -1622,7 +1671,7 @@ fn build_c_units(c_code: str, cc: str, gcc_opt: str, is_tcc: bool, output: str, 
         if p_getenv("OS") != "Windows_NT" { link = link + " -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack"; }
     }
     var system_libs: str = " -lm" + zig_unwind(cc);
-    if !is_linux() { system_libs = system_libs + " -lws2_32"; }
+    if !is_posix_host() { system_libs = system_libs + " -lws2_32"; }
     if p_system(link + objs + system_libs + libs) != 0 {
         print("link failed\n");
         return 1;
@@ -1709,10 +1758,25 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
 
     var input: str = p_argv(start + 1);
     var output: str = find_output_arg(n, start, "a.out");
-    output = ensure_exe_extension(output);
 
     // --target <triple> for cross-compilation
     var target: str = get_flag_value(n, start, "--target", "");
+    // The OS the executable is for: the target's, else the host's
+    var tgt_os: str = cross_target_os(target);
+    if str_len(target) > 0 && tgt_os == "" {
+        print("Unknown --target '" + target + "': use <arch>-<os>, e.g. aarch64-linux, riscv64-linux, x86_64-macos, aarch64-macos, x86_64-windows, wasm32-wasi\n");
+        return 1;
+    }
+    if tgt_os == "" {
+        tgt_os = host_os();
+    }
+    if tgt_os == "windows" { output = ensure_exe_extension(output); }
+    if tgt_os == "wasi" && !str_ends_with(output, ".wasm") { output = output + ".wasm"; }
+    // @cfg decides by the target (compiler.fd apply_cfg_filter)
+    if str_len(target) > 0 {
+        g_cfg_os = tgt_os;
+        g_cfg_arch = cross_target_arch(target);
+    }
     // --trace: trace C compilation
     var trace: bool = has_flag(n, start, "--trace");
 
@@ -1767,6 +1831,8 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             var c_file: str = "";
             if str_ends_with(output, ".exe") {
                 c_file = str_replace(output, ".exe", ".c");
+            } else if str_ends_with(output, ".wasm") {
+                c_file = c_str_substr(output, 0, str_len(output) - 5) + ".c";
             } else {
                 c_file = output + ".c";
             }
@@ -1783,7 +1849,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             // Find a C compiler: check CC env var, then gcc, clang, tcc
             var cc: str = env_or_empty("CC");
             if str_len(cc) == 0 {
-                if is_linux() {
+                if is_posix_host() {
                     // Linux: check gcc, clang, cc, tcc
                     if p_system("which gcc >/dev/null 2>&1") == 0 {
                         cc = "gcc";
@@ -1824,11 +1890,27 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 }
             }
 
-            // If --target is specified, try cross-compiler prefix
-            if str_len(target) > 0 {
+            // If --target is specified: zig cc cross-compiles to every target
+            // from any host; else try a cross-compiler prefix
+            var zig_cross: bool = false;
+            if str_len(target) > 0 && cross_zig_triple(target) != "" {
+                var have_zig: bool = str_contains(cc, "zig");
+                if !have_zig && str_len(env_or_empty("CC")) == 0 {
+                    if is_posix_host() {
+                        have_zig = p_system("which zig >/dev/null 2>&1") == 0;
+                    } else {
+                        have_zig = p_system("zig version >nul 2>&1") == 0;
+                    }
+                }
+                if have_zig {
+                    cc = "zig cc -target " + cross_zig_triple(target);
+                    zig_cross = true;
+                }
+            }
+            if str_len(target) > 0 && !zig_cross {
                 var cross_gcc: str = target + "-gcc";
                 var cross_clang: str = target + "-clang";
-                if is_linux() {
+                if is_posix_host() {
                     if p_system("which " + cross_gcc + " >/dev/null 2>&1") == 0 {
                         cc = cross_gcc;
                     } else {
@@ -1874,7 +1956,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             // Also detect "use net;" which needs socket libs.
             var extra_libs: str = "";
             if str_starts_with(source, "use sdl;") || str_contains(source, "\nuse sdl;") {
-                if is_linux() {
+                if is_posix_host() {
                     extra_libs = extra_libs + " -lSDL2 -lSDL2_image -lSDL2_mixer";
                 } else {
                     extra_libs = extra_libs + " -lSDL2 -lSDL2_image -lSDL2_mixer -lglu32 -lopengl32";
@@ -1882,7 +1964,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 p_eprint_str("[main] Detected SDL2 usage, adding link flags\n");
             }
             if str_starts_with(source, "use gl;") || str_contains(source, "\nuse gl;") {
-                if is_linux() {
+                if is_posix_host() {
                     extra_libs = extra_libs + " -lGL -lGLU";
                 } else {
                     extra_libs = extra_libs + " -lopengl32 -lglu32";
@@ -1890,7 +1972,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 p_eprint_str("[main] Detected OpenGL usage, adding link flags\n");
             }
             if str_starts_with(source, "use net;") || str_contains(source, "\nuse net;") {
-                if is_linux() {
+                if tgt_os != "windows" {
                     // sockets are in libc on Linux, no extra lib needed
                 } else {
                     extra_libs = extra_libs + " -lws2_32";
@@ -1936,7 +2018,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 }
                 var rc: i64 = build_c_units(c_code, cc, gcc_opt, is_tcc, output, extra_libs, no_cache);
                 if rc != 0 { return rc; }
-                if !is_linux() { patch_pe_stack(output); }
+                if !is_posix_host() { patch_pe_stack(output); }
                 inc_stamp_commit(stamp_path, build_key, c_hash, input, output);
                 print("Built native executable: " + output + "\n");
                 return 0;
@@ -1961,7 +2043,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             } else {
                 if is_tcc {
                     // tcc: minimal flags
-                    if is_linux() {
+                    if tgt_os != "windows" {
                         cc_cmd = cc + " " + gcc_opt + " -w -o " + output + " " + c_file + " -lm" + extra_libs;
                     } else {
                         cc_cmd = cc + " " + gcc_opt + " -w -o " + output + " " + c_file + " -lws2_32" + extra_libs;
@@ -1971,15 +2053,39 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                     // -fno-strict-aliasing: the generated code type-puns
                     // through pointer casts; -fno-strict-overflow: wrapping
                     // arithmetic must not be assumed away.
-                    var cc_flags: str = " " + gcc_opt + " -w -Wno-int-conversion -Wno-incompatible-pointer-types -fstack-protector-strong -fPIE -fno-strict-overflow -fno-strict-aliasing -o " + output + " " + c_file + " -pie";
+                    // A Linux cross build is a static executable (musl): it
+                    // runs anywhere, also under qemu-user
+                    var link_mode: str = " -pie";
+                    if zig_cross && tgt_os == "linux" { link_mode = " -static"; }
+                    var hardening: str = " -fstack-protector-strong -fPIE";
+                    // WebAssembly: no stack protector or PIE; WASI's libc
+                    // emulates mmap, signal(), clocks and getpid on request
+                    if tgt_os == "wasi" {
+                        link_mode = "";
+                        hardening = " -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID";
+                    }
+                    var cc_flags: str = " " + gcc_opt + " -w -Wno-int-conversion -Wno-incompatible-pointer-types" + hardening + " -fno-strict-overflow -fno-strict-aliasing -o " + output + " " + c_file + link_mode;
                     // FIDES_CFLAGS: extra C compiler flags, e.g. the
                     // sanitizers of scripts/sanitize.sh (release M8)
                     var user_cflags: str = env_or_empty("FIDES_CFLAGS");
                     if str_len(user_cflags) > 0 { cc_flags = " " + user_cflags + cc_flags; }
+                    // zig cc turns on its UB sanitizer at -O0; the generated
+                    // C type-puns by design (string headers read in front of
+                    // unaligned literals), so it would trap on correct
+                    // programs. FIDES_CFLAGS asks for sanitizers explicitly.
+                    if str_contains(cc, "zig") && !str_contains(user_cflags, "sanitize") {
+                        cc_flags = " -fno-sanitize=undefined" + cc_flags;
+                    }
                     // The -z options are ELF-only
-                    if p_getenv("OS") != "Windows_NT" { cc_flags = cc_flags + " -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack"; }
-                    if is_linux() {
-                        cc_cmd = cc + cc_flags + " -lm -lpthread" + zig_unwind(cc) + extra_libs;
+                    if tgt_os == "linux" { cc_flags = cc_flags + " -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack"; }
+                    if tgt_os == "linux" {
+                        var unwind: str = zig_unwind(cc);
+                        if zig_cross { unwind = " -lunwind"; }
+                        cc_cmd = cc + cc_flags + " -lm -lpthread" + unwind + extra_libs;
+                    } else if tgt_os == "macos" {
+                        cc_cmd = cc + cc_flags + " -lm -lpthread" + extra_libs;
+                    } else if tgt_os == "wasi" {
+                        cc_cmd = cc + cc_flags + " -lm -lwasi-emulated-mman -lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid" + extra_libs;
                     } else {
                         cc_cmd = cc + cc_flags + " -lws2_32" + extra_libs;
                     }
@@ -1998,7 +2104,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             // Patch PE stack to 256MB (tcc defaults to 1MB, which is too
             // small for the self-hosted compiler's deep recursion).
             // Only needed on Windows with PE executables.
-            if !is_linux() {
+            if tgt_os == "windows" && !is_posix_host() {
                 patch_pe_stack(output);
             }
             if str_len(art_path) > 0 { inc_artifact_put(art_path, output); }
@@ -2842,10 +2948,60 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         }
     }
 
+    // Native Linux AArch64 / RISC-V 64 (release F8): IR -> machine code in
+    // compiler/nat_ir.fd, the Fides runtime of stdlib/linux_runtime, a
+    // static ELF. `--target aarch64-linux` / `riscv64-linux`; `--native`
+    // with `--target arm64|riscv64` (the old PIR path) comes here too.
+    var nat_arch: i64 = 0;
+    if str_contains(target, "linux") || use_native { nat_arch = nat_target_arch(target); }
+    if nat_arch != 0 && !bare_mode && !boot_mode {
+        var nat_out: str = find_output_arg(n, start, "a.out");
+        set_native_runtime("linux_runtime");
+        // @cfg sees the target, not the host
+        g_cfg_os = "linux";
+        if str_contains(target, "riscv") { g_cfg_arch = "riscv64"; } else { g_cfg_arch = "aarch64"; }
+        var nat_prog: ResultProgram = build_program_with_path_borrowck(source, OptStr::Some(input), g_borrowck);
+        match nat_prog {
+            ResultProgram::Err(nerrs) => {
+                print("Compilation errors:\n");
+                var nei: i64 = 0;
+                while nei < nerrs.len() {
+                    print(nerrs.get(nei));
+                    print("\n");
+                    nei = nei + 1;
+                }
+                return 1;
+            }
+            ResultProgram::Ok(nprogram) => {
+                p_eprint_str("[build] Lowering to IR...\n");
+                var nat_mod: IrModule = lower(nprogram);
+                p_eprint_str("[build] Native Linux code generation...\n");
+                var nat_res: ResultBytes = nat_generate_elf(nat_mod, nat_arch);
+                match nat_res {
+                    ResultBytes::Err(gerrs) => {
+                        var gei: i64 = 0;
+                        while gei < gerrs.len() {
+                            print(gerrs.get(gei));
+                            print("\n");
+                            gei = gei + 1;
+                        }
+                        return 1;
+                    }
+                    ResultBytes::Ok(nat_bytes) => {
+                        p_file_write_vec(nat_out, nat_bytes);
+                        if is_posix_host() { p_system("chmod +x '" + nat_out + "' 2>/dev/null"); }
+                        print("Built native executable: " + nat_out + "\n");
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
+
     // Windows default: emit a PE .exe directly via the pe_ir backend
     // (native, no C compiler). The pe_runtime sources must be merged into
     // the program, so the flag is set before build_program below.
-    var windows_pe: bool = !is_linux() && !bare_mode && !boot_mode && !use_native
+    var windows_pe: bool = !is_posix_host() && !bare_mode && !boot_mode && !use_native
         && target != "arm64" && target != "aarch64" && target != "riscv64";
     if windows_pe { set_pe_runtime_merge(true); }
 
@@ -2936,7 +3092,7 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
 
             // On Linux, use C codegen + system C compiler (gcc/clang)
             // On Windows, use C codegen + TCC
-            if is_linux() {
+            if is_posix_host() {
                 p_eprint_str("[build] Using C codegen (Linux)...\n");
                 var cgen: CCodeGen = CCodeGen_new();
                 var c_source: str = CCodeGen_generate(&mut cgen, ir_mod);

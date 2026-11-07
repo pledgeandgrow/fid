@@ -529,17 +529,175 @@ pub fn PeirEnc_mov_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 // anything else that takes an offset must not get one (emit_mem_rbp panics).
 pub const PEIR_REG_SLOT: i64 = 0x7F000000;
 pub const PEIR_VALUE_REGS: i64 = 7;
+/// Value registers 7 and 8 are r10 and r11: caller-saved, so only a value
+/// whose live range has no call (and nothing else that uses them) gets one
+/// (competitive OP16).
+pub const PEIR_ALL_REGS: i64 = 9;
+/// A frame offset at or above this names xmm register (offset -
+/// PEIR_XMM_SLOT): an f64 value kept in a register (competitive OP17).
+pub const PEIR_XMM_SLOT: i64 = 0x7F000100;
 
-/// The callee-saved registers that hold values instead of stack slots.
+/// The registers that hold values instead of stack slots: seven
+/// callee-saved ones, then r10 and r11.
 pub fn peir_value_reg(i: i64) -> i64 {
     if i == 0 { return PEIR_RBX; }
     if i == 1 { return PEIR_RSI; }
     if i == 2 { return PEIR_RDI; }
+    if i == 7 { return PEIR_R10; }
+    if i == 8 { return PEIR_R11; }
     return PEIR_R12 + i - 3;
+}
+
+pub fn peir_is_xmm_slot(disp: i64) -> bool {
+    return disp >= PEIR_XMM_SLOT;
+}
+
+/// movq r64, xmm
+pub fn PeirEnc_movq_r64_xmm(self: &mut PeirEnc, r: i64, xmm: i64) -> void {
+    self.code.push(0x66);
+    PeirEnc_rex(self, true, false, false, reg_ext(r));
+    self.code.push(0x0F);
+    self.code.push(0x7E);
+    PeirEnc_modrm(self, 3, xmm, peir_reg_code(r));
+}
+
+/// movdqu [rbp + disp], xmm (a callee-saved xmm register, all 128 bits)
+pub fn PeirEnc_movdqu_mem_rbp_xmm(self: &mut PeirEnc, disp: i64, xmm: i64) -> void {
+    self.code.push(0xF3);
+    self.code.push(0x0F);
+    self.code.push(0x7F);
+    PeirEnc_emit_mem_rbp(self, xmm & 7, disp);
+}
+
+/// movdqu xmm, [rbp + disp]
+pub fn PeirEnc_movdqu_xmm_mem_rbp(self: &mut PeirEnc, xmm: i64, disp: i64) -> void {
+    self.code.push(0xF3);
+    self.code.push(0x0F);
+    self.code.push(0x6F);
+    PeirEnc_emit_mem_rbp(self, xmm & 7, disp);
+}
+
+/// cmp r64, imm (the 8-bit form when it fits)
+pub fn PeirEnc_cmp_r_imm(self: &mut PeirEnc, r: i64, imm: i64) -> void {
+    PeirEnc_rex(self, true, false, false, reg_ext(r));
+    if imm >= -128 && imm <= 127 {
+        self.code.push(0x83);
+        PeirEnc_modrm(self, 3, 7, peir_reg_code(r));
+        self.code.push(imm & 0xFF);
+    } else {
+        self.code.push(0x81);
+        PeirEnc_modrm(self, 3, 7, peir_reg_code(r));
+        PeirEnc_emit_i32(self, imm);
+    }
+}
+
+/// add r64, imm (the 8-bit form when it fits)
+pub fn PeirEnc_add_r_imm(self: &mut PeirEnc, r: i64, imm: i64) -> void {
+    if imm >= -128 && imm <= 127 {
+        PeirEnc_add_r_i8(self, r, imm);
+    } else {
+        PeirEnc_add_r_i32(self, r, imm);
+    }
+}
+
+/// imul dst, src, imm (the 8-bit form when it fits)
+pub fn PeirEnc_imul_r_r_imm(self: &mut PeirEnc, dst: i64, src: i64, imm: i64) -> void {
+    if imm >= -128 && imm <= 127 {
+        PeirEnc_rex(self, true, reg_ext(dst), false, reg_ext(src));
+        self.code.push(0x6B);
+        PeirEnc_modrm_rr(self, dst, src);
+        self.code.push(imm & 0xFF);
+    } else {
+        PeirEnc_imul_r_r_imm32(self, dst, src, imm);
+    }
+}
+
+/// lea dst, [base + disp]
+pub fn PeirEnc_lea_base_disp(self: &mut PeirEnc, dst: i64, base: i64, disp: i64) -> void {
+    PeirEnc_rex(self, true, reg_ext(dst), false, reg_ext(base));
+    self.code.push(0x8D);
+    var bc: i64 = peir_reg_code(base);
+    var small: bool = disp >= -128 && disp <= 127;
+    var m: i64 = 2;
+    if small { m = 1; }
+    PeirEnc_modrm(self, m, peir_reg_code(dst), bc);
+    // rsp and r12 as a base need a SIB byte
+    if bc == 4 { self.code.push(0x24); }
+    if small { self.code.push(disp & 0xFF); } else { PeirEnc_emit_i32(self, disp); }
+}
+
+/// lea dst, [base + index * (1 << scale)]
+pub fn PeirEnc_lea_base_index(self: &mut PeirEnc, dst: i64, base: i64, index: i64, scale: i64) -> void {
+    PeirEnc_rex(self, true, reg_ext(dst), reg_ext(index), reg_ext(base));
+    self.code.push(0x8D);
+    var bc: i64 = peir_reg_code(base);
+    // rbp and r13 as a base need a displacement: [base + index*s + 0]
+    if bc == 5 {
+        PeirEnc_modrm(self, 1, peir_reg_code(dst), 4);
+        self.code.push(((scale & 3) << 6) | (peir_reg_code(index) << 3) | bc);
+        self.code.push(0);
+    } else {
+        PeirEnc_modrm(self, 0, peir_reg_code(dst), 4);
+        self.code.push(((scale & 3) << 6) | (peir_reg_code(index) << 3) | bc);
+    }
+}
+
+/// A 64-bit instruction `opcode` with a memory operand [base + disp], or
+/// [base + index*8 + disp] when index >= 0; `reg` is the ModRM reg field
+/// (a register, or an opcode extension when `reg_is_reg` is false).
+pub fn PeirEnc_mem_op(self: &mut PeirEnc, opcode: i64, reg: i64, reg_is_reg: bool, base: i64, index: i64, disp: i64) -> void {
+    PeirEnc_rex(self, true, reg_is_reg && reg_ext(reg), index >= 0 && reg_ext(index), reg_ext(base));
+    self.code.push(opcode);
+    var bc: i64 = peir_reg_code(base);
+    var m: i64 = 2;
+    if disp == 0 && bc != 5 { m = 0; } else if disp >= -128 && disp <= 127 { m = 1; }
+    var rf: i64 = reg & 7;
+    if index >= 0 {
+        PeirEnc_modrm(self, m, rf, 4);
+        self.code.push((3 << 6) | (peir_reg_code(index) << 3) | bc);
+    } else if bc == 4 {
+        PeirEnc_modrm(self, m, rf, 4);
+        self.code.push(0x24);
+    } else {
+        PeirEnc_modrm(self, m, rf, bc);
+    }
+    if m == 1 { self.code.push(disp & 0xFF); }
+    if m == 2 { PeirEnc_emit_i32(self, disp); }
+}
+
+/// cmp r64, [base + disp]
+pub fn PeirEnc_cmp_r_mem(self: &mut PeirEnc, r: i64, base: i64, disp: i64) -> void {
+    PeirEnc_mem_op(self, 0x3B, r, true, base, -1, disp);
+}
+
+/// cmp qword [base + disp], imm8
+pub fn PeirEnc_cmp_mem_imm8(self: &mut PeirEnc, base: i64, disp: i64, imm: i64) -> void {
+    PeirEnc_mem_op(self, 0x83, 7, false, base, -1, disp);
+    self.code.push(imm & 0xFF);
+}
+
+/// or r64, [base + disp]
+pub fn PeirEnc_or_r_mem(self: &mut PeirEnc, r: i64, base: i64, disp: i64) -> void {
+    PeirEnc_mem_op(self, 0x0B, r, true, base, -1, disp);
+}
+
+/// mov r64, [base + index*8]
+pub fn PeirEnc_mov_r_idx8(self: &mut PeirEnc, r: i64, base: i64, index: i64) -> void {
+    PeirEnc_mem_op(self, 0x8B, r, true, base, index, 0);
+}
+
+/// mov [base + index*8], r64
+pub fn PeirEnc_mov_idx8_r(self: &mut PeirEnc, base: i64, index: i64, r: i64) -> void {
+    PeirEnc_mem_op(self, 0x89, r, true, base, index, 0);
 }
 
 /// mov r64, [rbp + disp]
 pub fn PeirEnc_mov_reg_mem_rbp(self: &mut PeirEnc, dst: i64, disp: i64) -> void {
+    if disp >= PEIR_XMM_SLOT {
+        self.last_store_end = -1;
+        PeirEnc_movq_r64_xmm(self, dst, disp - PEIR_XMM_SLOT);
+        return;
+    }
     if disp >= PEIR_REG_SLOT {
         self.last_store_end = -1;
         var src: i64 = peir_value_reg(disp - PEIR_REG_SLOT);
@@ -563,8 +721,15 @@ pub fn PeirEnc_mov_reg_mem_rbp(self: &mut PeirEnc, dst: i64, disp: i64) -> void 
 
 /// mov [rbp + disp], r64
 pub fn PeirEnc_mov_mem_rbp_reg(self: &mut PeirEnc, disp: i64, src: i64) -> void {
+    if disp >= PEIR_XMM_SLOT {
+        self.last_store_end = -1;
+        PeirEnc_movq_xmm_r64(self, disp - PEIR_XMM_SLOT, src);
+        return;
+    }
     if disp >= PEIR_REG_SLOT {
-        PeirEnc_mov_rr(self, peir_value_reg(disp - PEIR_REG_SLOT), src);
+        self.last_store_end = -1;
+        var rd: i64 = peir_value_reg(disp - PEIR_REG_SLOT);
+        if rd != src { PeirEnc_mov_rr(self, rd, src); }
         return;
     }
     PeirEnc_rex(self, true, reg_ext(src), false, false);
@@ -1362,6 +1527,16 @@ pub fn PeirEnc_call_reg(self: &mut PeirEnc, r: i64) -> void {
 
 /// movsd xmm, [rbp + disp]
 pub fn PeirEnc_movsd_xmm_mem_rbp(self: &mut PeirEnc, xmm: i64, disp: i64) -> void {
+    if disp >= PEIR_XMM_SLOT {
+        var src: i64 = disp - PEIR_XMM_SLOT;
+        if src != xmm { PeirEnc_movapd_rr(self, xmm, src); }
+        return;
+    }
+    if disp >= PEIR_REG_SLOT {
+        // an f64 value in a general register (moved as its bits)
+        PeirEnc_movq_xmm_r64(self, xmm, peir_value_reg(disp - PEIR_REG_SLOT));
+        return;
+    }
     self.code.push(0xF2);
     PeirEnc_rex_w(self);
     self.code.push(0x0F);
@@ -1371,6 +1546,15 @@ pub fn PeirEnc_movsd_xmm_mem_rbp(self: &mut PeirEnc, xmm: i64, disp: i64) -> voi
 
 /// movsd [rbp + disp], xmm
 pub fn PeirEnc_movsd_mem_rbp_xmm(self: &mut PeirEnc, disp: i64, xmm: i64) -> void {
+    if disp >= PEIR_XMM_SLOT {
+        var dst: i64 = disp - PEIR_XMM_SLOT;
+        if dst != xmm { PeirEnc_movapd_rr(self, dst, xmm); }
+        return;
+    }
+    if disp >= PEIR_REG_SLOT {
+        PeirEnc_movq_r64_xmm(self, peir_value_reg(disp - PEIR_REG_SLOT), xmm);
+        return;
+    }
     self.code.push(0xF2);
     PeirEnc_rex_w(self);
     self.code.push(0x0F);
@@ -1848,9 +2032,16 @@ pub fn PeirRdata_add_string(self: &mut PeirRdata, s: str) -> i64 {
     if prev != 0 {
         return prev - 1;
     }
+    // [static magic][length] before the bytes, 8-aligned, as core's strings
+    // carry them (release D16): the length is O(1) and comparisons of
+    // different lengths stop at once
+    while (self.data.len() % 8) != 0 { self.data.push(0); }
+    var n: i64 = str_len(s);
+    self.data = pe_push_u64(self.data, 0x4649444553545202);
+    self.data = pe_push_u64(self.data, n);
     var offset: i64 = self.data.len();
     var i: i64 = 0;
-    while i < str_len(s) {
+    while i < n {
         self.data.push(str_byte_at(s, i));
         i = i + 1;
     }

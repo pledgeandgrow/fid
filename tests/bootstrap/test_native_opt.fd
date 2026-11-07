@@ -1,0 +1,131 @@
+// The native optimizer's cases (competitive OP9, OP11, OP16-OP18, OP24): a
+// local's loads and stores sharing its register, chains computed in place,
+// values in r10/r11 and xmm registers across loops and calls, rotated loops
+// whose test reads a length, ranges that drop overflow checks, x / c and
+// x % c by constants, and reads of locals moved out of loops. Every backend
+// prints the same.
+//
+// Expected output:
+// 7999991
+// 333328333350000
+// -6 6 -1 1
+// 4950 9900
+// 2.5 1000000.5
+// 120 3628800
+// 45 10 4
+// 9 -9 2 -2
+// 277 0
+// 499500 999
+// 12 13
+
+fn sum_mod(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + (i % 7) * 3 - 1;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn squares(n: i64) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        t = t + i * i;
+        i = i + 1;
+    }
+    return t;
+}
+
+fn twice(x: i64) -> i64 {
+    return x * 2;
+}
+
+fn favg(v: Vec<i64>) -> f64 {
+    var t: f64 = 0.0;
+    var i: i64 = 0;
+    while i < v.len() {
+        t = t + (v.get(i) as f64);
+        i = i + 1;
+    }
+    return t / (v.len() as f64);
+}
+
+fn fscale(x: f64, k: f64) -> f64 {
+    return x * k + 0.5;
+}
+
+fn fact(n: i64) -> i64 {
+    if n < 2 { return 1; }
+    return n * fact(n - 1);
+}
+
+fn main() -> i64 {
+    println(sum_mod(1000000));
+    println(squares(100000));
+    // remainders and quotients by constants, negative dividends included
+    var a: i64 = -20;
+    println(int_to_str(a % 7) + " " + int_to_str(20 % 7) + " " + int_to_str(-7 / 4) + " " + int_to_str(7 / 4));
+    // a value kept across calls, and one that is not
+    var acc: i64 = 0;
+    var acc2: i64 = 0;
+    var i: i64 = 0;
+    while i < 100 {
+        acc = acc + i;
+        acc2 = acc2 + twice(i);
+        i = i + 1;
+    }
+    println(int_to_str(acc) + " " + int_to_str(acc2));
+    // floats in registers, across a loop and a call
+    var v: Vec<i64> = Vec::new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    v.push(4);
+    var avg: f64 = favg(v);
+    var big: f64 = fscale(1000000.0, 1.0);
+    println(float_to_str(avg) + " " + float_to_str(big));
+    println(int_to_str(fact(5)) + " " + int_to_str(fact(10)));
+    // a rotated loop whose test calls len, and a local read in the loop
+    var w: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 10 { w.push(k); k = k + 1; }
+    var lim: i64 = 4;
+    var s2: i64 = 0;
+    var n2: i64 = 0;
+    var j: i64 = 0;
+    while j < w.len() {
+        s2 = s2 + w.get(j);
+        if w.get(j) < lim { n2 = n2 + 1; }
+        j = j + 1;
+    }
+    println(int_to_str(s2) + " " + int_to_str(w.len()) + " " + int_to_str(n2));
+    // chains: each computed into the local's register
+    var c: i64 = 3;
+    c = c * 3;
+    var d: i64 = 0 - c;
+    var e: i64 = 7;
+    e = e / 3;
+    var f: i64 = -7;
+    f = f / 3;
+    println(int_to_str(c) + " " + int_to_str(d) + " " + int_to_str(e) + " " + int_to_str(f));
+    // masks: x & c is in [0, c], so its sum with a small value is unchecked
+    var m: i64 = 123456789;
+    var lo: i64 = m & 1023;
+    var hi: i64 = (m >> 40) & 255;
+    println(int_to_str(lo + 0 * 5) + " " + int_to_str(hi));
+    // a long loop whose counter lives in a register
+    var tot: i64 = 0;
+    var q: i64 = 0;
+    while q < 1000 {
+        tot = tot + q;
+        q = q + 1;
+    }
+    println(int_to_str(tot) + " " + int_to_str(q - 1));
+    var x: i64 = 41;
+    x = x % 7 + 6;
+    var y: i64 = x - 5;
+    println(int_to_str(x - 6 + 6) + " " + int_to_str(y + 6));
+    return 0;
+}

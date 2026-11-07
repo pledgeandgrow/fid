@@ -10,7 +10,7 @@
 
 ## Current direction: the self-hosted compiler is the release compiler
 
-The self-hosted compiler (`compiler/*.fd`, **61 modules, ~134K lines**) is the
+The self-hosted compiler (`compiler/*.fd`, **63 modules, ~142K lines**) is the
 primary artifact and the compiler the installer ships (`fid.exe`). The Rust
 compiler (`src/*.rs`, **57 files, ~113K lines**) is frozen: it builds stage 1
 of the self-hosted compiler and holds the test harness (`fidesc test
@@ -29,7 +29,9 @@ the code that enforces each: [reference.md](docs/reference/reference.md).
   release build. `PIN=1` can pin a stage 0, but none is pinned yet: stage 1
   is still built by `fidesc`.
 - **Tests:** the last full suite run is from Nov 2 (interpreter 339/339, C
-  343/343, native Windows 345/345, expected-fail 89/89). The Nov 4–6 compiler
+  343/343, native Windows 345/345, expected-fail 89/89), **with `fidesc` as
+  the compiler under test**: the shipped `fid` has never run the full suite
+  (its native output crashed on every task program until Nov 6). The Nov 4–6 compiler
   was checked on the new and the key tests on all three backends, and every
   new expected-fail test is rejected; the full suite has not been rerun.
 - **Backends:** interpreter (`fid run`), C (`fid ccompile`, needs a C
@@ -57,10 +59,27 @@ the code that enforces each: [reference.md](docs/reference/reference.md).
   out for copies that are never written or read for the last time. On,
   test programs get value semantics on every backend and `fid` compiling
   itself reaches its fixpoint (Nov 6), with a peak of 4.7 GB against 1.8 GB
-  off. It stays off until the full suite has run with it on, so today
-  `var b = a` on a `Vec` still aliases.
-- **Native async is broken:** `fid emit` programs that use `async`/`spawn` +
-  `await` crash on the worker threads (interpreter and C are fine).
+  off. As of the afternoon of Nov 6 `LOWER_COW` is `true` in
+  `compiler/lower.fd` (AGENTS.md #25); the full suite has not run with it,
+  and the Nov 2 `release/fid.exe` still aliases on `var b = a` for a `Vec`.
+- **Native async works (Nov 6):** `fid emit` programs that use `async`/`spawn`
+  + `await` crashed on every worker thread: `pe_fn_lookup` left out runtime
+  functions, so the scheduler started its threads at address 0
+  (compiler/pe_ir.fd, uncommitted). The task tests give the interpreter's
+  output, except `test_async_suspend`: both interpreters run an `async fn`
+  to the end at the call, where native and the test's own header have it
+  run until it first waits. `fid ccompile` of that test fails
+  (`p_co_pool_call` is missing from the C runtime).
+- **Claims checked by running (Nov 6):** `@crashfree`, `@gas`, `!{}`, the
+  borrow checker, the unlocked-global race check and `@constant_time`
+  reject what they should. Weaker than documented: `sandbox {}` misses IO in
+  called functions and `p_file_read`; `region ... with budget(N)` counts
+  declared locals, not heap growth; `@conserve` only forbids `Money_new`
+  (`Money_from_cents` mints); `@crashfree`/`@gas` do not bound recursion;
+  `txn {}` is a plain block on C and native; typed-string constructors take
+  any string. Not working in `fid`: `build-x86`
+  (out of memory), `fid wasm` (invalid module), stack traces in native
+  programs. Details: [positioning.md](docs/reference/positioning.md) (top).
 - **Speed:** fib(40) 1.34 s native, 0.81 s through C, 0.53 s Rust (Nov 2).
   `fid` turns its own source into C in about 133 s (type check 59 s);
   `fidesc` in 21 s. The native path now runs a small IR optimizer
@@ -87,7 +106,7 @@ Counted Nov 6, 2026 (`wc -l`, so blank lines and comments included).
 Measured figures carry their own date.
 
 ```
-compiler/*.fd:   61 modules, 133,688 lines — THE COMPILER (primary source)
+compiler/*.fd:   63 modules, 142,378 lines — THE COMPILER (primary source)
 src/*.rs:        57 files, 112,511 lines — bootstrap reference + test harness
 stdlib/*.fd:     137 modules, 43,576 lines (+ 4 in stdlib/pe_runtime/)
 tests:           493 .fd under tests/bootstrap/ (452 top level, 91 of them
@@ -97,26 +116,47 @@ Suite (Nov 2):   interp 339/339, C 343/343, PE 345/345, expected-fail 89/89
 Fixpoint:        stage 2 == stage 3, 49 MB of C (Nov 6)
 Self-compile:    fid ~133 s to C (Nov 6), fidesc 21 s
 Platforms:       Tier 1 Windows x64 (interp, C, native) and Linux x64 (interp,
-                 C); everything else tier 2 or 3 — docs/reference/platforms.md
+                 C); through C cross builds: Linux ARM64 270/286 under QEMU
+                 (Nov 7), RISC-V/macOS/WASI tier 2; native Linux AArch64 and
+                 RISC-V 64 (`fid emit --target`, Nov 7): 225/231 building
+                 tests under QEMU — docs/reference/platforms.md
 Binaries:        release/fid.exe (self-hosted, shipped as fid.exe)
                  target/release/fidesc.exe (Rust, shipped as fidesc.exe)
 ```
 
 ## What's NOT yet done
 
-1. **Copy-on-write on** (M5): run the full suite with `LOWER_COW = true`,
-   then switch it on. Its memory cost (4.7 GB vs 1.8 GB for the
-   self-compile) comes mostly from shares held by struct copies that are
-   never freed; freeing them at scope end needs a check that no alias read
-   out of the struct outlives it.
-2. **Native async/tasks** crash in `fid emit` programs (H10).
+1. **Ownership and layout (proposal 0004, written Nov 7, not yet built):**
+   one compiler-inserted ownership rule (`LOWER_RC`) replaces copy-on-write
+   shares and the auto-drop passes; counted strings everywhere; null-free
+   builtins (`read_file`, `env_var`, `arg_at`, ... give `Option`). Next:
+   the 3-stage fixpoint, the suite, and `scripts/leak-check.sh`.
+2. **Async in the interpreters** runs an `async fn` to the end at the call
+   (`test_async_suspend`); the C runtime has no `p_co_pool_call` (H10).
+   Native async was fixed on Nov 6. Also open: **checks weaker than their
+   names** (Nov 6): `sandbox {}` through called functions, `region` budgets
+   for heap growth, `@conserve` mints other than `Money_new`, recursion
+   under `@crashfree`/`@gas`, `txn {}` rollback on C and native.
 3. **A full native register allocator** (D4): today 7 callee-saved
    registers hold the hottest locals, parameters and short-lived values.
 4. **`Vec` elements at their real size and references into containers**
    (D14, D15).
-5. **Other platforms** (Track F: macOS, native ELF, ARM64/RISC-V/WASM),
-   **bare metal** (Track G: `emit --bare` panics), **crypto** J5–J9,
-   `parse-header` on SDL2/SQLite (E5).
+5. **Other platforms** (Track F). Through C, since Nov 7: `fid ccompile
+   --target aarch64-linux|riscv64-linux|x86_64-linux|x86_64-macos|aarch64-macos|wasm32-wasi`
+   cross-compiles with `zig cc` from any host, and `scripts/cross-test.sh
+   <target>` runs the suite there (qemu-user, Node WASI). AArch64 Linux
+   matched `fid run` on 270 of 286 tests under QEMU; RISC-V, x86-64 Linux
+   and WASI ran sample programs, their suites were stopped unfinished; macOS
+   builds but is not run (CI job in `scripts/ci/cross.yml`, inactive). Left:
+   those full runs; on the native Linux AArch64/RISC-V backend (Nov 7:
+   `fid emit --target aarch64-linux|riscv64-linux`, compiler/nat_ir.fd +
+   nat_enc.fd + stdlib/linux_runtime, 225 of 231 building tests match under
+   QEMU) the builtins it lacks (threads, tasks, channels, atomics, C math,
+   tensors, sockets) and fault messages; native Mach-O executables (F7), a
+   valid native `fid wasm`, native ELF
+   with the stdlib (F4). **Bare metal**: `emit --bare` works since Nov 6,
+   not yet under QEMU (G1). **Crypto** J5–J9, `parse-header` on SDL2/SQLite
+   (E5).
 6. **`// SAFETY:` comments** on the `unsafe` blocks of the stdlib (M10).
 7. **Post-codegen CT verification is x86-64 ELF only** (J7).
 8. **The full suite** has to be rerun with the Nov 4–6 compiler and the

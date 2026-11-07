@@ -2190,6 +2190,10 @@ fn real_main() {
                 "test_bare_panic_handler",
                 // Copy-on-write (fid only; fidesc shares Vec handles)
                 "test_spawn_vec_copy",
+                // fid only: length-headered strings (D16), Vec elements
+                // at their size (D14)
+                "test_str_length",
+                "test_vec_sized_layout",
             ];
 
             // C-codegen-only skip list — tests that pass on interpreter + PE

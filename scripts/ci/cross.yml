@@ -1,0 +1,103 @@
+# Cross-platform CI for the C backend (release F5, F8, F9).
+#
+# Not active here: this repository keeps no .github/ directory (CI is run
+# from outside, see AGENTS.md). Copy this file to .github/workflows/ to run
+# it on GitHub Actions.
+#
+#   macos     macOS on Apple silicon (macos-14) and Intel (macos-13): fid
+#             bootstraps itself with clang, then runs the suite through C
+#             natively and compares it with the interpreter.
+#   cross     Linux on AArch64 and RISC-V: every test is cross-compiled with
+#             zig cc (static musl) and run under qemu-user.
+#   wasm      WebAssembly (WASI preview 1): every test is compiled to .wasm
+#             with zig cc and run under Node's WASI.
+#
+# Locally the same runs are `scripts/cross-test.sh <target>` (see its header).
+
+name: Cross
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-macos
+          - os: macos-13
+            target: x86_64-macos
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      CC: clang
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: Build the Rust bootstrap compiler
+        run: cargo build --release
+      - name: Bootstrap fid (3 stages, fixpoint)
+        run: RELEASE=1 ./scripts/bootstrap.sh
+      - name: hello through C
+        run: |
+          ./release/fid ccompile tests/bootstrap/hello.fd -o hello
+          ./hello
+      - name: Suite through C, compared with the interpreter
+        env:
+          CC: zig cc
+        run: FID=release/fid JOBS=3 bash scripts/cross-test.sh ${{ matrix.target }}
+
+  cross:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-linux, riscv64-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: qemu-user
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user
+      - name: Build fid
+        run: |
+          cargo build --release
+          CC=gcc ./scripts/build-selfhost.sh
+          cp release/fid-dev release/fid
+      - name: Suite on ${{ matrix.target }} (zig cc, qemu-user)
+        env:
+          CC: zig cc
+        run: FID=release/fid JOBS=4 bash scripts/cross-test.sh ${{ matrix.target }}
+
+  wasm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build fid
+        run: |
+          cargo build --release
+          CC=gcc ./scripts/build-selfhost.sh
+          cp release/fid-dev release/fid
+      - name: Suite on wasm32-wasi (zig cc, Node WASI)
+        env:
+          CC: zig cc
+        run: FID=release/fid JOBS=4 bash scripts/cross-test.sh wasm32-wasi

@@ -227,10 +227,18 @@ pub struct RegionBudget {
     pub name: str,
     pub budget: OptI64,
     pub usage: i64,
+    // The first heap allocation whose size is not known at compile time
+    // ("" when there is none)
+    pub heap: str,
+    // A kv_cache region: its budget is the cache's, bounded by its window
+    pub kv: bool,
+    // The loop depth at the region's start: a constant-size allocation in a
+    // loop inside the region has no constant total
+    pub loop0: i64,
 }
 
 pub fn RegionBudget_new(name: str, budget: OptI64, usage: i64) -> RegionBudget {
-    return RegionBudget { name: name, budget: budget, usage: usage };
+    return RegionBudget { name: name, budget: budget, usage: usage, heap: "", kv: false, loop0: 0 };
 }
 
 // Captured variable: (name, type)
@@ -757,6 +765,10 @@ pub struct TypeChecker {
     reported_undefined: Vec<str>,
     // HashMaps: name -> slot + 1 in the table of the same name
     func_effects_index: i64,
+    // Functions that allocate on the heap, themselves or through what they
+    // call (name, and Type.method / Type_method for methods) -> 1. Computed
+    // only for programs with a `region .. with budget(N)`.
+    heap_alloc_index: i64,
     ho_param_effects_index: i64,
     /// Effect polymorphism: the function-typed parameters of the function
     /// whose body is being scanned (calls through them add no effect there),
@@ -932,6 +944,7 @@ impl TypeChecker {
             current_func_name: OptString::None,
             reported_undefined: Vec::new(),
             func_effects_index: HashMap_new(),
+            heap_alloc_index: HashMap_new(),
             ho_param_effects_index: HashMap_new(),
             cur_ho_params: Vec::new(),
             ho_fn_index: HashMap_new(),
@@ -2190,6 +2203,9 @@ fn TypeChecker_check_method_call_rules(self: &mut TypeChecker, caller: str, from
     if tc_has_annotation(from.annotations, "deterministic") && !tc_has_annotation(to.annotations, "deterministic") {
         self.errors.push("Safety error: @deterministic function '" + caller + "' calls method '" + target + "', which is not @deterministic.");
     }
+    if tc_has_annotation(from.annotations, "conserve") && !tc_has_annotation(to.annotations, "conserve") {
+        self.errors.push("Conservation error: function '" + caller + "' is @conserve but calls method '" + target + "', which is not @conserve.");
+    }
     if tc_has_annotation(from.annotations, "constant_time") && !tc_has_annotation(to.annotations, "constant_time") {
         self.errors.push("Safety error: @constant_time function '" + caller + "' calls method '" + target + "', which is not @constant_time.");
     }
@@ -2448,6 +2464,25 @@ pub fn TypeChecker_compute_func_effects(self: &mut TypeChecker, program: Program
             ri2 = ri2 + 1;
         }
     }
+    // Each method under `Type.method` too: the bare names above can be
+    // shared by functions and other types' methods (sandbox looks a method
+    // call up by its receiver's type).
+    impi = 0;
+    while impi < program.impls.len() {
+        var imp2: ImplDef = program.impls.get(impi);
+        var mi2: i64 = 0;
+        while mi2 < imp2.methods.len() {
+            var m2: Func = imp2.methods.get(mi2);
+            var meffs: Vec<str> = Vec::new();
+            self.cur_ho_params = TypeChecker_ho_pnames(self, m2.name);
+            TypeChecker_scan_stmts_for_effects(self, m2.body, &mut meffs);
+            self.cur_ho_params = Vec::new();
+            TypeChecker_set_func_effects(self, imp2.struct_name + "." + m2.name, meffs);
+            mi2 = mi2 + 1;
+        }
+        impi = impi + 1;
+    }
+    TypeChecker_compute_heap_alloc(self, program);
 }
 
 /// Find the StmtList body for a function by name, searching funcs then impls.
@@ -2649,7 +2684,7 @@ pub fn TypeChecker_verify_conserve(self: &mut TypeChecker, program: Program) {
             var ci: i64 = 0;
             while ci < called.len() {
                 var c: str = called.get(ci);
-                if !tc_vec_contains_str(conserve_funcs, c) && TypeChecker_has_func(self, c) {
+                if !tc_vec_contains_str(conserve_funcs, c) && TypeChecker_has_func(self, c) && !tc_is_mint_call(c) {
                     self.errors.push("Conservation error: function '" + func.name + "' is @conserve but calls '" + c + "',\n    which is not @conserve.\n    A @conserve function can only call other @conserve functions —\n    otherwise the callee could create or destroy money.\n    Fix: add @conserve to '" + c + "', or remove the call from '" + func.name + "'.");
                 }
                 ci = ci + 1;
@@ -2661,10 +2696,11 @@ pub fn TypeChecker_verify_conserve(self: &mut TypeChecker, program: Program) {
                 if tc_is_mint_call(c) {
                     self.errors.push("Conservation error: function '" + func.name + "' is @conserve but calls '" + c + "',\n    which creates new Money. @conserve functions cannot mint money —\n    they can only move, split, and merge existing Money.\n    Fix: remove the @conserve annotation, or remove the mint call.");
                 }
-                if c == "Money::new" || c == "Money::from_cents" {
-                    self.errors.push("Conservation error: function '" + func.name + "' is @conserve but calls '" + c + "',\n    which creates new Money. @conserve functions cannot mint money.\n    Fix: remove the @conserve annotation, or remove the mint call.");
-                }
                 ci = ci + 1;
+            }
+            // 5. No `Money { .. }` literal (outside stdlib/money.fd)
+            if tc_conserve_money_lits(func) > 0 && !TypeChecker_in_money_module(self, func.name) {
+                self.errors.push("Conservation error: function '" + func.name + "' is @conserve but builds a 'Money { .. }' literal,\n    which creates new Money from a number. @conserve functions cannot mint money —\n    they can only move and merge (Money_add) existing Money.\n    Fix: remove the @conserve annotation, or use the money module's operations.");
             }
         }
         fi = fi + 1;
@@ -2695,13 +2731,15 @@ pub fn TypeChecker_verify_conserve(self: &mut TypeChecker, program: Program) {
                 var ci: i64 = 0;
                 while ci < called.len() {
                     var c: str = called.get(ci);
-                    if c == "Money::new" || c == "Money::from_cents" {
+                    if tc_is_mint_call(c) {
                         self.errors.push("Conservation error: method '" + qname + "' is @conserve but calls mint function '" + c + "'.");
-                    }
-                    if TypeChecker_has_func(self, c) && !tc_vec_contains_str(conserve_funcs, c) {
+                    } else if TypeChecker_has_func(self, c) && !tc_vec_contains_str(conserve_funcs, c) {
                         self.errors.push("Conservation error: method '" + qname + "' is @conserve but calls '" + c + "', which is not @conserve.");
                     }
                     ci = ci + 1;
+                }
+                if tc_conserve_money_lits(method) > 0 {
+                    self.errors.push("Conservation error: method '" + qname + "' is @conserve but builds a 'Money { .. }' literal, which mints money.");
                 }
             }
             mi = mi + 1;
@@ -2755,8 +2793,37 @@ fn tc_conserve_calls(f: Func) -> Vec<str> {
 }
 
 fn tc_is_mint_call(c: str) -> bool {
-    if c == "Money::new" || c == "Money::from_cents" { return true; }
-    return str_ends_with(c, "::Money::new") || str_ends_with(c, "::Money::from_cents");
+    if c == "Money::new" || c == "Money::from_cents" || c == "Money::from_dollars" { return true; }
+    if c == "Money_new" || c == "Money_from_cents" || c == "Money_from_dollars" { return true; }
+    return str_ends_with(c, "::Money::new") || str_ends_with(c, "::Money::from_cents") || str_ends_with(c, "::Money::from_dollars")
+        || str_ends_with(c, "::Money_new") || str_ends_with(c, "::Money_from_cents") || str_ends_with(c, "::Money_from_dollars");
+}
+
+/// `Money { .. }` literals in a @conserve function: each makes Money from
+/// a number, i.e. mints it. Only stdlib/money.fd's own operations (add,
+/// sub), which build their result from their inputs, may.
+fn tc_conserve_money_lits(f: Func) -> i64 {
+    var raw: Vec<str> = Vec::new();
+    g_scan_struct_lits = true;
+    scan_stmts_for_calls(f.body, &mut raw);
+    g_scan_struct_lits = false;
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < raw.len() {
+        var c: str = raw.get(i);
+        if c == "{Money" || (str_starts_with(c, "{") && str_ends_with(c, "::Money")) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The function is one of stdlib/money.fd's own (module money).
+fn TypeChecker_in_money_module(self: &TypeChecker, name: str) -> bool {
+    match TypeChecker_get_item_module(self, name) {
+        OptString::Some(m) => { return m == "money"; }
+        OptString::None => {}
+    }
+    return false;
 }
 
 // Where a @conserve function uses floating point: its body, parameters
@@ -3633,28 +3700,10 @@ pub fn check_safety_body(
 
     // Builtin methods that allocate (Vec, HashMap, str), and "+" for `a + b`
     // on strings.
-    var alloc_methods: Vec<str> = Vec::new();
-    alloc_methods.push("push"); alloc_methods.push("push_str"); alloc_methods.push("insert");
-    alloc_methods.push("extend"); alloc_methods.push("resize"); alloc_methods.push("reserve");
-    alloc_methods.push("clone"); alloc_methods.push("to_str"); alloc_methods.push("to_string");
-    alloc_methods.push("concat"); alloc_methods.push("split"); alloc_methods.push("keys");
-    alloc_methods.push("values"); alloc_methods.push("append"); alloc_methods.push("collect");
-    alloc_methods.push("map"); alloc_methods.push("filter"); alloc_methods.push("+");
+    var alloc_methods: Vec<str> = tc_alloc_method_names();
 
     // Alloc functions (forbidden by @no-alloc)
-    var alloc_funcs: Vec<str> = Vec::new();
-    alloc_funcs.push("p_vec_new"); alloc_funcs.push("p_vec_push"); alloc_funcs.push("p_vec_push_str");
-    alloc_funcs.push("p_vec_insert"); alloc_funcs.push("p_vec_resize"); alloc_funcs.push("p_vec_extend");
-    alloc_funcs.push("p_hashmap_new"); alloc_funcs.push("p_hashmap_insert");
-    alloc_funcs.push("p_string_new"); alloc_funcs.push("p_string_push"); alloc_funcs.push("p_string_concat");
-    alloc_funcs.push("p_malloc"); alloc_funcs.push("p_alloc"); alloc_funcs.push("p_realloc");
-    alloc_funcs.push("p_arena_new"); alloc_funcs.push("p_arena_alloc");
-    alloc_funcs.push("Vec_new"); alloc_funcs.push("Vec_push"); alloc_funcs.push("Vec_insert"); alloc_funcs.push("Vec_resize");
-    alloc_funcs.push("HashMap_new"); alloc_funcs.push("HashMap_insert");
-    alloc_funcs.push("String_new"); alloc_funcs.push("String_push");
-    alloc_funcs.push("Vec_with_capacity"); alloc_funcs.push("Vec_clone"); alloc_funcs.push("Box_new");
-    alloc_funcs.push("StringBuilder_new"); alloc_funcs.push("int_to_str"); alloc_funcs.push("float_to_str");
-    alloc_funcs.push("p_str_concat"); alloc_funcs.push("p_to_str"); alloc_funcs.push("p_str_alloc");
+    var alloc_funcs: Vec<str> = tc_alloc_func_names();
 
     // Panic functions (forbidden by @no-panic)
     var panic_funcs: Vec<str> = Vec::new();
@@ -3950,6 +3999,9 @@ pub fn scan_stmt_for_calls(stmt: Stmt, calls: &mut Vec<str>) {
 /// L1: the safety checks saw only free-function names, so `v.push(x)` and
 /// `Vec::new()` passed @no-alloc).
 var g_scan_dot_methods: bool = false;
+// When set, scan_expr_for_calls also records each struct literal as
+// "{Name" (the @conserve check looks for `Money { .. }`).
+var g_scan_struct_lits: bool = false;
 
 pub fn scan_expr_for_calls(expr: Expr, calls: &mut Vec<str>) {
     match expr {
@@ -3990,7 +4042,8 @@ pub fn scan_expr_for_calls(expr: Expr, calls: &mut Vec<str>) {
         Expr::Unary(_, e) => { scan_expr_for_calls(box_expr_unbox(e), calls); }
         Expr::FieldAccess(e, _) => { scan_expr_for_calls(box_expr_unbox(e), calls); }
         Expr::OptionalFieldAccess(e, _) => { scan_expr_for_calls(box_expr_unbox(e), calls); }
-        Expr::StructLit(_, fields, spread) => {
+        Expr::StructLit(sl_name, fields, spread) => {
+            if g_scan_struct_lits { calls.push("{" + sl_name); }
             var fi: i64 = 0;
             while fi < fields.len() {
                 scan_expr_for_calls(fields.get(fi).value, calls);
@@ -7626,6 +7679,325 @@ pub fn TypeChecker_type_size(self: &TypeChecker, ty: Type) -> i64 {
     return 8;
 }
 
+// --- heap allocation: @no-alloc and region budgets ---------------------------
+
+/// Builtin methods that allocate (Vec, HashMap, str), and "+" for `a + b`
+/// on strings.
+fn tc_alloc_method_names() -> Vec<str> {
+    var alloc_methods: Vec<str> = Vec::new();
+    alloc_methods.push("push"); alloc_methods.push("push_str"); alloc_methods.push("insert");
+    alloc_methods.push("extend"); alloc_methods.push("resize"); alloc_methods.push("reserve");
+    alloc_methods.push("clone"); alloc_methods.push("to_str"); alloc_methods.push("to_string");
+    alloc_methods.push("concat"); alloc_methods.push("split"); alloc_methods.push("keys");
+    alloc_methods.push("values"); alloc_methods.push("append"); alloc_methods.push("collect");
+    alloc_methods.push("map"); alloc_methods.push("filter"); alloc_methods.push("+");
+    return alloc_methods;
+}
+
+/// Functions that allocate on the heap.
+fn tc_alloc_func_names() -> Vec<str> {
+    var alloc_funcs: Vec<str> = Vec::new();
+    alloc_funcs.push("p_vec_new"); alloc_funcs.push("p_vec_push"); alloc_funcs.push("p_vec_push_str");
+    alloc_funcs.push("p_vec_insert"); alloc_funcs.push("p_vec_resize"); alloc_funcs.push("p_vec_extend");
+    alloc_funcs.push("p_hashmap_new"); alloc_funcs.push("p_hashmap_insert");
+    alloc_funcs.push("p_string_new"); alloc_funcs.push("p_string_push"); alloc_funcs.push("p_string_concat");
+    alloc_funcs.push("p_malloc"); alloc_funcs.push("p_alloc"); alloc_funcs.push("p_realloc");
+    alloc_funcs.push("p_arena_new"); alloc_funcs.push("p_arena_alloc");
+    alloc_funcs.push("Vec_new"); alloc_funcs.push("Vec_push"); alloc_funcs.push("Vec_insert"); alloc_funcs.push("Vec_resize");
+    alloc_funcs.push("HashMap_new"); alloc_funcs.push("HashMap_insert");
+    alloc_funcs.push("String_new"); alloc_funcs.push("String_push");
+    alloc_funcs.push("Vec_with_capacity"); alloc_funcs.push("Vec_clone"); alloc_funcs.push("Box_new");
+    alloc_funcs.push("StringBuilder_new"); alloc_funcs.push("int_to_str"); alloc_funcs.push("float_to_str");
+    alloc_funcs.push("p_str_concat"); alloc_funcs.push("p_to_str"); alloc_funcs.push("p_str_alloc");
+    return alloc_funcs;
+}
+
+/// Charge a heap allocation to the innermost region with a budget: `bytes`
+/// when its size is known at compile time, else (bytes < 0) record it as
+/// one the budget cannot bound.
+fn TypeChecker_budget_heap(self: &mut TypeChecker, what: str, bytes: i64) {
+    if self.region_budgets.len() == 0 { return; }
+    var rb: RegionBudget = self.region_budgets.pop();
+    match rb.budget {
+        OptI64::Some(_) => {
+            var n: i64 = bytes;
+            var desc: str = what;
+            if n >= 0 && self.loop_depth > rb.loop0 { n = -1; desc = what + " in a loop"; }
+            if n >= 0 { rb.usage = rb.usage + n; }
+            else if rb.heap == "" { rb.heap = desc; }
+        }
+        OptI64::None => {}
+    }
+    self.region_budgets.push(rb);
+}
+
+/// A call inside a region with a budget: p_malloc(N) with a constant N
+/// and Vec::new() have a known size; any other allocating builtin, or a
+/// function that allocates (itself or through its callees), has none.
+fn TypeChecker_budget_call(self: &mut TypeChecker, callee: str, args: Vec<Expr>) {
+    if callee == "p_malloc" || callee == "p_alloc" {
+        if args.len() == 1 {
+            match args.get(0) {
+                Expr::IntLit(n) => {
+                    TypeChecker_budget_heap(self, callee + "(" + int_to_str(n) + ")", n);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        TypeChecker_budget_heap(self, callee + "() of a size not known at compile time", -1);
+        return;
+    }
+    if callee == "Vec_new" || callee == "p_vec_new" {
+        TypeChecker_budget_heap(self, "Vec::new()", 32);
+        return;
+    }
+    if tc_vec_contains_str(tc_alloc_func_names(), callee) {
+        TypeChecker_budget_heap(self, "'" + callee + "()'", -1);
+        return;
+    }
+    if HashMap_get(self.heap_alloc_index, callee) != 0 {
+        TypeChecker_budget_heap(self, "'" + callee + "()', which allocates", -1);
+    }
+}
+
+/// A method call on a value inside a region with a budget: a growing
+/// builtin method (push, insert, clone, ...) on a Vec, HashMap or string,
+/// or a user method that allocates.
+fn TypeChecker_budget_method(self: &mut TypeChecker, recv_ty: Type, method: str) {
+    var builtin: bool = false;
+    var owner: str = "";
+    match recv_ty {
+        Type::Str => { builtin = true; }
+        Type::Generic(gn, _) => { builtin = gn == "Vec" || gn == "HashMap" || gn == "Option" || gn == "Result"; owner = gn; }
+        Type::Named(nn) => {
+            if nn == "Vec" || nn == "HashMap" || nn == "String" || nn == "StringBuilder" { builtin = true; }
+            owner = nn;
+        }
+        _ => {}
+    }
+    if owner != "" && HashMap_get(self.heap_alloc_index, owner + "." + method) != 0 {
+        TypeChecker_budget_heap(self, "'." + method + "()' on " + owner + ", which allocates", -1);
+        return;
+    }
+    if builtin && tc_vec_contains_str(tc_alloc_method_names(), method) {
+        TypeChecker_budget_heap(self, "'." + method + "()'", -1);
+    }
+}
+
+/// A name bound in a scope (a variable, not a type name).
+fn TypeChecker_is_local_var(self: &TypeChecker, name: str) -> bool {
+    match TypeChecker_lookup(self, name) {
+        OptType::Some(_) => { return true; }
+        OptType::None => {}
+    }
+    return false;
+}
+
+/// Some statement of `stmts` (or of a block in them) is a region with a
+/// budget.
+fn tc_stmts_have_budget(stmts: Vec<Stmt>) -> bool {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        match stmts.get(i) {
+            Stmt::RegionBlock(_, budget, _, _, _, body, _) => {
+                match budget {
+                    OptI64::Some(_) => { return true; }
+                    OptI64::None => {}
+                }
+                if tc_stmts_have_budget(body) { return true; }
+            }
+            Stmt::If(_, then_b, else_b, _) => {
+                if tc_stmts_have_budget(then_b) { return true; }
+                match else_b {
+                    OptStmts::Some(eb) => { if tc_stmts_have_budget(eb) { return true; } }
+                    OptStmts::None => {}
+                }
+            }
+            Stmt::While(_, body, _) => { if tc_stmts_have_budget(body) { return true; } }
+            Stmt::For(_, _, body, _) => { if tc_stmts_have_budget(body) { return true; } }
+            Stmt::Loop(body, _) => { if tc_stmts_have_budget(body) { return true; } }
+            Stmt::Defer(body, _) => { if tc_stmts_have_budget(body) { return true; } }
+            Stmt::Sandbox(body, _) => { if tc_stmts_have_budget(body) { return true; } }
+            Stmt::Unsafe(body, _) => { if tc_stmts_have_budget(body) { return true; } }
+            Stmt::Txn(body, _) => { if tc_stmts_have_budget(body) { return true; } }
+            Stmt::SpawnScope(body, _) => { if tc_stmts_have_budget(body) { return true; } }
+            Stmt::Match(_, arms, _) => {
+                var ai: i64 = 0;
+                while ai < arms.len() {
+                    if tc_stmts_have_budget(arms.get(ai).body) { return true; }
+                    ai = ai + 1;
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// heap_alloc_index: every function or method that allocates on the heap,
+/// directly (an allocating builtin, a growing method, string `+`) or
+/// through a function it calls. Printing does not count.
+fn TypeChecker_compute_heap_alloc(self: &mut TypeChecker, program: Program) {
+    var any: bool = false;
+    var fi: i64 = 0;
+    while fi < program.funcs.len() && !any {
+        if tc_stmts_have_budget(program.funcs.get(fi).body) { any = true; }
+        fi = fi + 1;
+    }
+    var ii: i64 = 0;
+    while ii < program.impls.len() && !any {
+        var imp0: ImplDef = program.impls.get(ii);
+        var m0: i64 = 0;
+        while m0 < imp0.methods.len() {
+            if tc_stmts_have_budget(imp0.methods.get(m0).body) { any = true; }
+            m0 = m0 + 1;
+        }
+        ii = ii + 1;
+    }
+    if !any { return; }
+    var afuncs: Vec<str> = tc_alloc_func_names();
+    var ameths: Vec<str> = tc_alloc_method_names();
+    var names: Vec<str> = Vec::new();
+    var aliases: Vec<str> = Vec::new();
+    var bodies_calls: Vec<Vec<str>> = Vec::new();
+    fi = 0;
+    while fi < program.funcs.len() {
+        var f: Func = program.funcs.get(fi);
+        names.push(f.name);
+        aliases.push("");
+        var raw: Vec<str> = Vec::new();
+        g_scan_dot_methods = true;
+        scan_stmts_for_calls(f.body, &mut raw);
+        g_scan_dot_methods = false;
+        bodies_calls.push(raw);
+        fi = fi + 1;
+    }
+    ii = 0;
+    while ii < program.impls.len() {
+        var imp: ImplDef = program.impls.get(ii);
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            var m: Func = imp.methods.get(mi);
+            names.push(imp.struct_name + "." + m.name);
+            aliases.push(imp.struct_name + "_" + m.name);
+            var raw2: Vec<str> = Vec::new();
+            g_scan_dot_methods = true;
+            scan_stmts_for_calls(m.body, &mut raw2);
+            g_scan_dot_methods = false;
+            bodies_calls.push(raw2);
+            mi = mi + 1;
+        }
+        ii = ii + 1;
+    }
+    var done: Vec<bool> = Vec::new();
+    var k: i64 = 0;
+    while k < names.len() {
+        var nm: str = names.get(k);
+        var direct: bool = false;
+        if !str_starts_with(nm, "print") && !str_starts_with(nm, "eprint") {
+            var calls: Vec<str> = bodies_calls.get(k);
+            var ci: i64 = 0;
+            while ci < calls.len() && !direct {
+                var c: str = calls.get(ci);
+                if str_starts_with(c, ".") {
+                    if tc_vec_contains_str(ameths, str_slice(c, 1, str_len(c))) { direct = true; }
+                } else if tc_vec_contains_str(afuncs, c) {
+                    direct = true;
+                }
+                ci = ci + 1;
+            }
+        }
+        done.push(direct);
+        if direct {
+            HashMap_insert(self.heap_alloc_index, nm, 1);
+            if aliases.get(k) != "" { HashMap_insert(self.heap_alloc_index, aliases.get(k), 1); }
+        }
+        k = k + 1;
+    }
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        k = 0;
+        while k < names.len() {
+            var nm2: str = names.get(k);
+            if !done.get(k) && !str_starts_with(nm2, "print") && !str_starts_with(nm2, "eprint") {
+                var calls2: Vec<str> = bodies_calls.get(k);
+                var cj: i64 = 0;
+                while cj < calls2.len() {
+                    var c2: str = calls2.get(cj);
+                    if !str_starts_with(c2, ".") && HashMap_get(self.heap_alloc_index, c2) != 0 {
+                        done.set(k, true);
+                        HashMap_insert(self.heap_alloc_index, nm2, 1);
+                        if aliases.get(k) != "" { HashMap_insert(self.heap_alloc_index, aliases.get(k), 1); }
+                        changed = true;
+                        cj = calls2.len();
+                    }
+                    cj = cj + 1;
+                }
+            }
+            k = k + 1;
+        }
+    }
+}
+
+// --- sandbox: effects of what a call runs ----------------------------------
+
+/// The first IO/Net/Spawn effect in `effs`, or "" when there is none:
+/// what a call inside `sandbox { }` may not have.
+fn tc_sandbox_forbidden(effs: Vec<str>) -> str {
+    var i: i64 = 0;
+    while i < effs.len() {
+        var e: str = effs.get(i);
+        if e == "IO" || e == "Net" || e == "Spawn" { return e; }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn TypeChecker_sandbox_reject(self: &mut TypeChecker, what: str, effs: Vec<str>) {
+    var e: str = tc_sandbox_forbidden(effs);
+    if e == "" { return; }
+    self.errors.push("Sandbox error: '" + what + "' has effect '!" + e + "' -- all capabilities are revoked inside sandbox, including in the functions it calls");
+}
+
+/// A call inside sandbox: the builtin's effect (p_file_read is IO, ...),
+/// the inferred effects of a user function (transitive), and for a
+/// higher-order callee the effects of the functions passed to it. A call
+/// through a function value of unknown effects is rejected too.
+fn TypeChecker_check_sandbox_call(self: &mut TypeChecker, callee: str, args: Vec<Expr>) {
+    var effs: Vec<str> = Vec::new();
+    var no_args: Vec<Expr> = Vec::new();
+    TypeChecker_scan_expr_for_effects(self, Expr::Call(callee, no_args), &mut effs);
+    var ho_at: i64 = HashMap_get(self.ho_fn_index, callee);
+    if ho_at != 0 {
+        var hidx: Vec<i64> = self.ho_fn_idx.get(ho_at - 1);
+        var hk: i64 = 0;
+        while hk < hidx.len() {
+            if hidx.get(hk) < args.len() {
+                TypeChecker_passed_fn_effects(self, args.get(hidx.get(hk)), &mut effs);
+            }
+            hk = hk + 1;
+        }
+    }
+    if tc_sandbox_forbidden(effs) == "" && HashMap_get(self.func_effects_index, callee) == 0 {
+        match TypeChecker_lookup(self, callee) {
+            OptType::Some(t) => {
+                match t {
+                    Type::Func(_, _) => {
+                        self.errors.push("Sandbox error: '" + callee + "()' calls a function value whose effects are not known -- all capabilities are revoked inside sandbox");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            OptType::None => {}
+        }
+    }
+    TypeChecker_sandbox_reject(self, callee + "()", effs);
+}
+
 // --- check_capability ----------------------------------------------------
 
 pub fn TypeChecker_check_capability(self: &mut TypeChecker, cap: str, context: str) {
@@ -8507,7 +8879,10 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
         Stmt::RegionBlock(name, budget, is_gpu, is_kv_cache, _, body, line) => {
             self.region_stack.push(name);
             TypeChecker_push_scope(self);
-            self.region_budgets.push(RegionBudget_new(name, budget, 0));
+            var new_rb: RegionBudget = RegionBudget_new(name, budget, 0);
+            new_rb.kv = is_kv_cache;
+            new_rb.loop0 = self.loop_depth;
+            self.region_budgets.push(new_rb);
             map_str_str_set(&mut self.region_lines, name, int_to_str(line));
             if is_gpu { self.gpu_region_depth = self.gpu_region_depth + 1; }
             if is_kv_cache {
@@ -8563,6 +8938,15 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                                 + " bytes but budget is " + int_to_str(b) + " bytes (" + int_to_str(rb.usage - b) + " bytes over)."
                                 + "\n    Hint: reduce allocations inside the " + rkind + "region block, or increase the budget in `region"
                                 + rkw + " " + name + " with budget(" + int_to_str(b) + ") { ... }`.");
+                        }
+                        if rb.heap != "" && !rb.kv {
+                            var hkind: str = "";
+                            if is_gpu { hkind = "GPU "; }
+                            self.errors.push("Budget error (line " + int_to_str(line) + "): " + hkind + "region '" + name + "' with budget(" + int_to_str(b)
+                                + ") allocates on the heap: " + rb.heap + ".\n    The budget is checked at compile time. It counts the region's locals and heap allocations"
+                                + "\n    of a size known at compile time (p_malloc(N), Vec::new(), an f-string of numbers),"
+                                + "\n    not ones that can grow (push, insert, string `+`, an allocation in a loop, a call that allocates)."
+                                + "\n    Fix: allocate before the region, or use a fixed-size buffer.");
                         }
                     }
                     OptI64::None => {}
@@ -8903,6 +9287,10 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             // A borrowed string reads as a string: `+` makes a new, owned one (M11)
             if tc_is_borrowed_str(lt) { lt = Type::Str; lt_r = Type::Str; }
             if tc_is_borrowed_str(rt) { rt = Type::Str; rt_r = Type::Str; }
+            if self.region_budgets.len() > 0 && binop_eq(op, BinOp::Add)
+                && (type_eq(lt_r, Type::Str) || type_eq(rt_r, Type::Str) || type_eq(lt_r, Type::Named("String"))) {
+                TypeChecker_budget_heap(self, "string `+`", -1);
+            }
             // A str is text: comparing it with a number has no meaning outside
             // the runtime layer and the compiler, where a str is a word
             var is_cmp: bool = binop_eq(op, BinOp::Eq) || binop_eq(op, BinOp::Neq) || binop_eq(op, BinOp::Lt)
@@ -8911,7 +9299,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 && ((type_eq(lt_r, Type::Str) && TypeChecker_is_numeric(self, rt_r))
                     || (type_eq(rt_r, Type::Str) && TypeChecker_is_numeric(self, lt_r))) {
                 self.errors.push("Type error (line " + int_to_str(self.current_line) + "): cannot compare a str with a number (" + type_to_str(lt_r)
-                    + " with " + type_to_str(rt_r) + ").\n    `==` on a str compares text. To test a runtime string for null, write `(s as i64) == 0`; to compare with a number, convert one side with `as` or int_to_str.");
+                    + " with " + type_to_str(rt_r) + ").\n    `==` on a str compares text, and a str is never null: a builtin that can fail gives an Option (read_file, env_var, arg_at, read_line). To compare with a number, convert one side with `as` or int_to_str.");
                 return Type::Bool;
             }
             match op {
@@ -9052,6 +9440,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 TypeChecker_require_unsafe(self, "calling the C function " + callee + "()");
             }
             // Check capabilities for built-in functions
+            var sb_errs0: i64 = self.errors.len();
             if callee == "print" || callee == "println" || callee == "print_int" || callee == "print_float" || callee == "print_str" {
                 TypeChecker_check_capability(self, "IO", callee + "()");
             }
@@ -9067,6 +9456,13 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             if callee == "p_malloc" || callee == "p_free" || callee == "p_malloc_persistent" || callee == "p_arena_save" || callee == "p_arena_restore" {
                 TypeChecker_check_capability(self, "Alloc", callee + "()");
             }
+            // Inside sandbox, what the callee does counts too: an IO builtin
+            // (p_file_read, ...) or a function whose inferred effects
+            // include IO/Net/Spawn
+            if self.sandbox_depth > 0 && self.errors.len() == sb_errs0 {
+                TypeChecker_check_sandbox_call(self, callee, args);
+            }
+            if self.region_budgets.len() > 0 { TypeChecker_budget_call(self, callee, args); }
             // GPU kernel builtins
             if callee == "thread_id" || callee == "workgroup_size" || callee == "workgroup_id" || callee == "num_workgroups" {
                 return Type::I64;
@@ -9201,7 +9597,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             }
             // Check for runtime builtin functions (p_*)
             if str_starts_with(callee, "p_") {
-                if callee == "p_json_dump" || callee == "p_json_type" || callee == "p_json_pretty" || callee == "p_json_string" || callee == "p_tensor_to_str" || callee == "p_tensor_to_json" || callee == "p_simd_to_str" || callee == "p_socket_recv_str" || callee == "p_http_build_response" || callee == "p_read_line" || callee == "p_read_stdin" || callee == "p_file_read" || callee == "p_db_mem_query" || callee == "p_getenv" || callee == "p_env_get" || callee == "p_argv" || callee == "p_process_stdout" || callee == "p_process_stderr" || callee == "p_dir_list" || callee == "p_intern_str" || callee == "p_str_join_n" {
+                if callee == "p_json_dump" || callee == "p_json_type" || callee == "p_json_pretty" || callee == "p_json_string" || callee == "p_tensor_to_str" || callee == "p_tensor_to_json" || callee == "p_simd_to_str" || callee == "p_socket_recv_str" || callee == "p_http_build_response" || callee == "p_db_mem_query" || callee == "p_process_stdout" || callee == "p_process_stderr" || callee == "p_dir_list" || callee == "p_intern_str" || callee == "p_str_join_n" {
                     return Type::Str;
                 }
                 if callee == "p_str_concat" || callee == "p_to_str" || callee == "p_float_to_str" || callee == "p_string_replace" || callee == "p_string_trim" || callee == "p_string_to_uppercase" || callee == "p_string_to_lowercase" || callee == "p_string_char_at" || callee == "p_string_repeat" || callee == "p_char_to_str" || callee == "p_bool_to_str" || callee == "p_sb_to_str" {
@@ -9477,13 +9873,25 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             return Type::Never;
         }
         Expr::FString(parts) => {
+            // Its size, when every part has a bound (text, numbers, bools)
+            var fs_bytes: i64 = 1;
+            var fs_known: bool = true;
             var i: i64 = 0;
             while i < parts.len() {
                 match parts.get(i) {
-                    FStringPart::Expr(e) => { TypeChecker_check_expr(self, e); }
-                    FStringPart::Literal(_) => {}
+                    FStringPart::Expr(e) => {
+                        var pt: Type = TypeChecker_resolve_type(self, TypeChecker_check_expr(self, e));
+                        if type_eq(pt, Type::Bool) { fs_bytes = fs_bytes + 5; }
+                        else if TypeChecker_is_integer(self, pt) { fs_bytes = fs_bytes + 20; }
+                        else { fs_known = false; }
+                    }
+                    FStringPart::Literal(lit) => { fs_bytes = fs_bytes + str_len(lit); }
                 }
                 i = i + 1;
+            }
+            if self.region_budgets.len() > 0 {
+                if fs_known { TypeChecker_budget_heap(self, "an f-string", fs_bytes); }
+                else { TypeChecker_budget_heap(self, "an f-string of a value whose length is not known at compile time", -1); }
             }
             return Type::Str;
         }
@@ -9566,6 +9974,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             return Type::Never;
         }
         Expr::StrConcat(left, right) => {
+            if self.region_budgets.len() > 0 { TypeChecker_budget_heap(self, "string `+`", -1); }
             var lt: Type = TypeChecker_check_expr(self, box_expr_unbox(left));
             var rt: Type = TypeChecker_check_expr(self, box_expr_unbox(right));
             if !type_eq(lt, Type::Str) && !type_eq(lt, Type::Named("String")) {
@@ -9850,6 +10259,10 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
     // Check if this is Box::new(x), Rc::new(x), Arc::new(x), Vec::new(), HashMap::new()
     match receiver {
         Expr::Ident(name) => {
+            if self.region_budgets.len() > 0 && str_len(name) > 0 && str_byte_at(name, 0) >= 65 && str_byte_at(name, 0) <= 90
+                && !TypeChecker_is_local_var(self, name) {
+                TypeChecker_budget_call(self, name + "_" + method, args);
+            }
             if name == "Box" && method == "new" {
                 if args.len() > 0 {
                     var arg_ty: Type = TypeChecker_check_expr(self, args.get(0));
@@ -9973,6 +10386,7 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
         Type::Ref(inner, _) => { recv_ty = box_type_unbox(inner); }
         _ => { recv_ty = recv_ty_raw; }
     }
+    if self.region_budgets.len() > 0 { TypeChecker_budget_method(self, recv_ty, method); }
     // Builtin Vec methods
     match recv_ty {
         Type::Generic(name, gargs) => {
@@ -10264,6 +10678,10 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                     while mei < method_map.len() {
                         if method_map.get(mei).key == method {
                             TypeChecker_record_method_call(self, struct_name, method);
+                            if self.sandbox_depth > 0 {
+                                TypeChecker_sandbox_reject(self, struct_name + "." + method + "()",
+                                    TypeChecker_get_func_effects(self, struct_name + "." + method));
+                            }
                             // A generic impl's method on a value without type
                             // arguments (a bare `Option`): the i64 instance, as
                             // monomorphization picks

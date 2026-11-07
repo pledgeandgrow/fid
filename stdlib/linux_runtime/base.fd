@@ -1,0 +1,1258 @@
+// stdlib/linux_runtime/base.fd — the Fides runtime of native Linux
+// executables for AArch64 and RISC-V 64 (release F8; compiler/nat_ir.fd).
+//
+// As stdlib/pe_runtime does for Windows: builtin p_X runs pert_X, in Fides,
+// merged into the program. Here everything stands on two machine-code
+// primitives of the backend: nat_syscall (a Linux system call, generic
+// numbering: the same on AArch64 and RISC-V) and nat_start_sp (the stack
+// the kernel started the process with: argc, argv, envp). No C library.
+// The behaviour is the C backend's and the Windows runtime's: the same
+// output, the same panics ("Double free", "Invalid free: ..."), the same
+// float text.
+//
+// Functions named pert_* / pe_* are runtime code: the backend compiles
+// their arithmetic wrapping, as pe_ir does for stdlib/pe_runtime.
+
+extern "C" {
+    fn nat_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64;
+    fn nat_start_sp() -> i64;
+    fn nat_atomic_load(addr: i64) -> i64;
+    fn nat_atomic_store(addr: i64, v: i64);
+    fn nat_atomic_add(addr: i64, v: i64) -> i64;
+    fn nat_atomic_cas(addr: i64, expected: i64, nv: i64) -> i64;
+    fn nat_ctx_swap(save: i64, sp: i64);
+    fn nat_ctx_tramp() -> i64;
+    fn nat_clone_thread(entry: i64, arg: i64, stack_top: i64, ctid: i64, tls: i64) -> i64;
+    fn nat_call_fn(addr: i64, nargs: i64, argv: i64) -> i64;
+    fn nat_fn_table() -> i64;
+    fn nat_tls_get() -> i64;
+    fn nat_tls_set(v: i64);
+    fn nat_frame_fp() -> i64;
+    fn nat_frame_ret(fp: i64) -> i64;
+    fn nat_frame_next(fp: i64) -> i64;
+    fn nat_fn_names() -> i64;
+    fn nat_sig_handler() -> i64;
+    fn nat_fma(a: i64, b: i64, c: i64) -> i64;
+}
+
+// Linux system calls (asm-generic/unistd.h)
+const PE_SYS_UNLINKAT: i64 = 35;
+const PE_SYS_OPENAT: i64 = 56;
+const PE_SYS_CLOSE: i64 = 57;
+const PE_SYS_LSEEK: i64 = 62;
+const PE_SYS_READ: i64 = 63;
+const PE_SYS_WRITE: i64 = 64;
+const PE_SYS_EXIT_GROUP: i64 = 94;
+const PE_SYS_CLOCK_GETTIME: i64 = 113;
+const PE_SYS_GETPID: i64 = 172;
+const PE_SYS_MUNMAP: i64 = 215;
+const PE_SYS_MMAP: i64 = 222;
+const PE_SYS_GETRANDOM: i64 = 278;
+const PE_AT_FDCWD: i64 = -100;
+
+// ─── Words and bytes ────────────────────────────────────────────────────
+
+fn pe_ld(addr: i64) -> i64 {
+    var p: *mut i64 = addr;
+    var v: i64 = 0;
+    unsafe { v = *p; }
+    return v;
+}
+
+fn pe_st(addr: i64, value: i64) {
+    var p: *mut i64 = addr;
+    unsafe { *p = value; }
+}
+
+fn pe_ldb(addr: i64) -> i64 {
+    var p: *mut u8 = addr;
+    var v: i64 = 0;
+    unsafe { v = *p; }
+    return v;
+}
+
+fn pe_stb(addr: i64, value: i64) {
+    var p: *mut u8 = addr;
+    unsafe { *p = value; }
+}
+
+fn pe_copy(dst: i64, src: i64, n: i64) {
+    var i: i64 = 0;
+    while i + 8 <= n {
+        pe_st(dst + i, pe_ld(src + i));
+        i = i + 8;
+    }
+    while i < n {
+        pe_stb(dst + i, pe_ldb(src + i));
+        i = i + 1;
+    }
+}
+
+fn pe_zero(dst: i64, n: i64) {
+    var i: i64 = 0;
+    while i + 8 <= n {
+        pe_st(dst + i, 0);
+        i = i + 8;
+    }
+    while i < n {
+        pe_stb(dst + i, 0);
+        i = i + 1;
+    }
+}
+
+fn pe_sys(n: i64, a: i64, b: i64, c: i64) -> i64 {
+    return nat_syscall(n, a, b, c, 0, 0, 0);
+}
+
+// ─── Memory: pe_ir's blocks ─────────────────────────────────────────────
+// A block is an 8-byte header, then the payload: the header is PE_MAGIC
+// plus the size class k (the block is 2^k bytes), or the freed magic plus k
+// once freed. Class 63 is a large block of its own mapping, its total size
+// in the word before the header. Freed blocks wait on a list per class
+// (the next one in their first payload word); a reused block is zeroed,
+// as fresh memory is. Once a second thread may run (pe_mt_on), one lock
+// guards the heap.
+
+const PE_LARGE: i64 = 63;
+
+/// The live-block magic: negative, low 32 bits 0 (a block header is never
+/// a plausible string length, core's p_str_len_word relies on it)
+fn pe_magic() -> i64 {
+    return 0 - (1515867892 << 32);
+}
+
+fn pe_freed() -> i64 {
+    return 0 - (1515867893 << 32);
+}
+
+/// A null string (a str is its address)
+fn pe_null_str() -> i64 {
+    return 0;
+}
+
+var pe_heap_cur: i64 = 0;
+var pe_heap_end: i64 = 0;
+var pe_free_lists: i64 = 0;
+
+fn pe_mmap(n: i64) -> i64 {
+    var a: i64 = nat_syscall(PE_SYS_MMAP, 0, n, 3, 34, 0 - 1, 0);  // RW, PRIVATE|ANONYMOUS
+    if a < 0 && a > 0 - 4096 {
+        pe_write_all(2, "Panic: out of memory\n" as i64, 21);
+        pe_sys(PE_SYS_EXIT_GROUP, 1, 0, 0);
+    }
+    return a;
+}
+
+/// `n` bytes of the current chunk (a multiple of 16), a new 4 MB chunk
+/// when it is full.
+fn pe_bump(n: i64) -> i64 {
+    if pe_heap_cur == 0 || pe_heap_cur + n > pe_heap_end {
+        var size: i64 = 4194304;
+        if n > size { size = n; }
+        pe_heap_cur = pe_mmap(size);
+        pe_heap_end = pe_heap_cur + size;
+    }
+    var b: i64 = pe_heap_cur;
+    pe_heap_cur = pe_heap_cur + n;
+    return b;
+}
+
+fn pe_lists() -> i64 {
+    if pe_free_lists == 0 {
+        pe_free_lists = pe_bump(512);
+    }
+    return pe_free_lists;
+}
+
+var pe_mt: i64 = 0;           // 1 once threads may run
+var pe_heap_lock: i64 = 0;    // *i64
+
+/// A spinlock word: 0 free, 1 held.
+fn pe_lock(l: i64) {
+    while nat_atomic_cas(l, 0, 1) == 0 {
+        pe_sys(124, 0, 0, 0);     // sched_yield
+    }
+}
+
+fn pe_unlock(l: i64) {
+    nat_atomic_store(l, 0);
+}
+
+/// Before a second thread can start: the heap gets its lock. Called by
+/// the only thread there is.
+fn pe_mt_on() {
+    if pe_mt == 0 {
+        pe_heap_lock = pe_bump(16);
+        pe_st(pe_heap_lock, 0);
+        pe_mt = 1;
+    }
+}
+
+pub fn pert_malloc(size: i64) -> i64 {
+    if pe_mt == 0 {
+        return pe_malloc_raw(size);
+    }
+    pe_lock(pe_heap_lock);
+    var r: i64 = pe_malloc_raw(size);
+    pe_unlock(pe_heap_lock);
+    return r;
+}
+
+fn pe_malloc_raw(size: i64) -> i64 {
+    var n: i64 = size;
+    if n < 0 { n = 0; }
+    var need: i64 = n + 8;
+    if need > 1048576 {
+        var total: i64 = (n + 16 + 4095) & (0 - 4096);
+        var big: i64 = pe_mmap(total);
+        pe_st(big, total);
+        pe_st(big + 8, pe_magic() + PE_LARGE);
+        return big + 16;
+    }
+    var k: i64 = 4;
+    while (1 << k) < need { k = k + 1; }
+    var lists: i64 = pe_lists();
+    var head: i64 = pe_ld(lists + k * 8);
+    if head != 0 {
+        pe_st(lists + k * 8, pe_ld(head));
+        pe_st(head - 8, pe_magic() + k);
+        pe_zero(head, (1 << k) - 8);
+        return head;
+    }
+    var b: i64 = pe_bump(1 << k);
+    pe_st(b, pe_magic() + k);
+    return b + 8;
+}
+
+pub fn pert_alloc(size: i64) -> i64 {
+    return pert_malloc(size);
+}
+
+pub fn pert_free(p: i64) {
+    if p == 0 { return; }
+    if pe_mt == 0 {
+        pe_free_raw(p);
+        return;
+    }
+    pe_lock(pe_heap_lock);
+    pe_free_raw(p);
+    pe_unlock(pe_heap_lock);
+}
+
+fn pe_free_raw(p: i64) {
+    var h: i64 = pe_ld(p - 8);
+    var k: i64 = h & 255;
+    var magic: i64 = h - k;
+    if magic == pe_freed() {
+        pert_panic("Double free" as i64);
+    }
+    if magic != pe_magic() {
+        pert_panic("Invalid free: not an allocated block" as i64);
+    }
+    if k == PE_LARGE {
+        pe_sys(PE_SYS_MUNMAP, p - 16, pe_ld(p - 16), 0);
+        return;
+    }
+    pe_st(p - 8, pe_freed() + k);
+    var lists: i64 = pe_lists();
+    pe_st(p, pe_ld(lists + k * 8));
+    pe_st(lists + k * 8, p);
+}
+
+// ─── Output and exit ────────────────────────────────────────────────────
+
+fn pe_write_all(fd: i64, buf: i64, n: i64) {
+    var at: i64 = buf;
+    var left: i64 = n;
+    while left > 0 {
+        var w: i64 = pe_sys(PE_SYS_WRITE, fd, at, left);
+        if w <= 0 { return; }
+        at = at + w;
+        left = left - w;
+    }
+}
+
+/// The length of a string: its header's (core's length-headered strings),
+/// else up to its NUL.
+fn pe_len(s: i64) -> i64 {
+    if s == 0 { return 0; }
+    var h: i64 = p_str_hdr_len(s);
+    if h >= 0 { return h; }
+    var n: i64 = 0;
+    while pe_ldb(s + n) != 0 { n = n + 1; }
+    return n;
+}
+
+pub fn pert_print_str(s: i64) {
+    if s == 0 { return; }
+    pe_write_all(1, s, pe_len(s));
+}
+
+pub fn pert_eprint_str(s: i64) {
+    if s == 0 { return; }
+    pe_write_all(2, s, pe_len(s));
+}
+
+pub fn pert_print_newline() {
+    pe_write_all(1, "\n" as i64, 1);
+}
+
+pub fn pert_print_int(v: i64) {
+    var buf: i64 = pert_malloc(32);
+    var n: i64 = pe_int_digits(v, buf);
+    pe_write_all(1, buf, n);
+    pert_free(buf);
+}
+
+pub fn pert_print_bool(b: bool) {
+    if b { pe_write_all(1, "true" as i64, 4); } else { pe_write_all(1, "false" as i64, 5); }
+}
+
+pub fn pert_print_float(val: f64) {
+    var s: i64 = pert_to_str_float(val) as i64;
+    pert_print_str(s);
+    p_str_free(s);
+}
+
+pub fn pert_flush_stdout() {
+}
+
+pub fn pert_panic(msg: i64) {
+    pe_write_all(2, "Panic: " as i64, 7);
+    pert_eprint_str(msg);
+    pe_write_all(2, "\n" as i64, 1);
+    pe_trace_from(nat_frame_fp());
+    pe_sys(PE_SYS_EXIT_GROUP, 1, 0, 0);
+}
+
+pub fn pert_exit(code: i64) {
+    pe_sys(PE_SYS_EXIT_GROUP, code, 0, 0);
+}
+
+// ─── Each thread's block, signals, traces ───────────────────────────────
+// The thread pointer (nat_tls_get) holds the thread's block: [0] the task
+// running on it, [8] its signal stack, [16, 24) its stack's guard region,
+// [32] its table of TLS keys, [40] its stack, [48] the stack's size, [56]
+// scratch for the scheduler.
+
+const PE_SYS_FUTEX: i64 = 98;
+const PE_SYS_SIGALTSTACK: i64 = 132;
+const PE_SYS_RT_SIGACTION: i64 = 134;
+const PE_SYS_MPROTECT: i64 = 226;
+const PE_GUARD: i64 = 65536;
+
+fn pe_tls_new(glo: i64, ghi: i64) -> i64 {
+    var t: i64 = pert_malloc(64);
+    pe_zero(t, 64);
+    pe_st(t + 16, glo);
+    pe_st(t + 24, ghi);
+    return t;
+}
+
+/// This thread's block (made the first time a thread without one asks).
+fn pe_tls() -> i64 {
+    var t: i64 = nat_tls_get();
+    if t == 0 {
+        t = pe_tls_new(0, 0);
+        nat_tls_set(t);
+    }
+    return t;
+}
+
+/// A stack for the signal handler, so it runs when the stack overflowed.
+fn pe_altstack_on(t: i64) {
+    var ss: i64 = pe_mmap(65536);
+    var st: i64 = pert_malloc(24);
+    pe_st(st, ss);
+    pe_st(st + 8, 0);
+    pe_st(st + 16, 65536);
+    pe_sys(PE_SYS_SIGALTSTACK, st, 0, 0);
+    pert_free(st);
+    pe_st(t + 8, ss);
+}
+
+fn pe_altstack_off(t: i64) {
+    var ss: i64 = pe_ld(t + 8);
+    if ss == 0 { return; }
+    var st: i64 = pert_malloc(24);
+    pe_st(st, 0);
+    pe_st(st + 8, 2);                 // SS_DISABLE
+    pe_st(st + 16, 0);
+    pe_sys(PE_SYS_SIGALTSTACK, st, 0, 0);
+    pert_free(st);
+    pe_sys(PE_SYS_MUNMAP, ss, 65536, 0);
+    pe_st(t + 8, 0);
+}
+
+/// Sleep while the 32-bit word at addr holds val, at most ms (< 0: no
+/// limit). `private`: a word only this process waits on.
+fn pe_futex_wait(addr: i64, val: i64, ms: i64, private: bool) {
+    var op: i64 = 0;
+    if private { op = 128; }
+    if ms < 0 {
+        nat_syscall(PE_SYS_FUTEX, addr, op, val, 0, 0, 0);
+        return;
+    }
+    var ts: i64 = pert_malloc(16);
+    pe_st(ts, ms / 1000);
+    pe_st(ts + 8, (ms % 1000) * 1000000);
+    nat_syscall(PE_SYS_FUTEX, addr, op, val, ts, 0, 0);
+    pert_free(ts);
+}
+
+/// Wake up to n waiters of a private futex word.
+fn pe_futex_wake(addr: i64, n: i64) {
+    nat_syscall(PE_SYS_FUTEX, addr, 129, n, 0, 0, 0);
+}
+
+var pe_sig_flags: i64 = 0;    // [0, 64): arrived; [64, 128): registered
+var pe_sigbuf: i64 = 0;
+
+fn pe_sig_install(sig: i64) -> i64 {
+    var act: i64 = pert_malloc(32);
+    pe_zero(act, 32);
+    pe_st(act, nat_sig_handler());
+    pe_st(act + 8, 134217732);        // SA_SIGINFO | SA_ONSTACK
+    var r: i64 = nat_syscall(PE_SYS_RT_SIGACTION, sig, act, 0, 8, 0, 0);
+    pert_free(act);
+    return r;
+}
+
+/// Before main: this thread's block, its signal stack, the crash handler
+/// (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP).
+pub fn pe_rt_init() {
+    var t: i64 = pe_tls_new(0, 0);
+    nat_tls_set(t);
+    pe_altstack_on(t);
+    pe_sigbuf = pert_malloc(32);
+    pe_sig_flags = pert_malloc(1024);
+    pe_zero(pe_sig_flags, 1024);
+    pe_sig_install(11);
+    pe_sig_install(7);
+    pe_sig_install(8);
+    pe_sig_install(4);
+    pe_sig_install(5);
+}
+
+fn pe_eprint_int(v: i64) {
+    var n: i64 = pe_int_digits(v, pe_sigbuf);
+    pe_write_all(2, pe_sigbuf, n);
+}
+
+/// The signal handler (nat_sig_handler): a registered signal is noted
+/// (p_signal_check); anything else is a crash, reported as the C backend
+/// does (a stack overflow when the address is in a guard region), with
+/// the trace, then the exit status 128 + sig. Allocates nothing.
+pub fn pe_on_signal(sig: i64, info: i64) {
+    if sig >= 0 && sig < 64 && pe_sig_flags != 0 && pe_ld(pe_sig_flags + 512 + sig * 8) != 0 {
+        pe_st(pe_sig_flags + sig * 8, 1);
+        return;
+    }
+    var addr: i64 = pe_ld(info + 16);
+    var over: bool = false;
+    if sig == 11 || sig == 7 {
+        var t: i64 = nat_tls_get();
+        if t != 0 {
+            var cur: i64 = pe_ld(t);
+            if cur != 0 {
+                var base: i64 = pe_ld(cur + 120);
+                if base != 0 && addr >= base && addr < base + PE_GUARD { over = true; }
+            }
+            var glo: i64 = pe_ld(t + 16);
+            var ghi: i64 = pe_ld(t + 24);
+            if glo != 0 && addr >= glo && addr < ghi { over = true; }
+            if glo == 0 && cur == 0 {
+                var top: i64 = nat_start_sp();
+                if addr < top && addr >= top - 67108864 { over = true; }
+            }
+        }
+    }
+    if over {
+        pert_eprint_str("\nStack overflow: the recursion is too deep\n" as i64);
+    } else {
+        pert_eprint_str("\n=== CRASH: signal " as i64);
+        pe_eprint_int(sig);
+        if sig == 11 { pert_eprint_str(" (SIGSEGV) ===\n" as i64); }
+        else if sig == 7 { pert_eprint_str(" (SIGBUS) ===\n" as i64); }
+        else if sig == 6 { pert_eprint_str(" (SIGABRT) ===\n" as i64); }
+        else if sig == 8 { pert_eprint_str(" (SIGFPE) ===\n" as i64); }
+        else { pert_eprint_str(" (UNKNOWN) ===\n" as i64); }
+    }
+    pe_trace_from(nat_frame_fp());
+    pe_sys(PE_SYS_EXIT_GROUP, 128 + sig, 0, 0);
+}
+
+/// A runtime function's name (pe_, pert_, nat_): not shown in traces.
+fn pe_is_rt_name(n: i64) -> bool {
+    if pe_ldb(n) == 112 && pe_ldb(n + 1) == 101 {
+        if pe_ldb(n + 2) == 95 { return true; }
+        if pe_ldb(n + 2) == 114 && pe_ldb(n + 3) == 116 && pe_ldb(n + 4) == 95 { return true; }
+    }
+    return pe_ldb(n) == 110 && pe_ldb(n + 1) == 97 && pe_ldb(n + 2) == 116 && pe_ldb(n + 3) == 95;
+}
+
+fn pe_trace_flush(name: i64, reps: i64) {
+    if name == 0 { return; }
+    pert_eprint_str("    -| called from " as i64);
+    pert_eprint_str(name);
+    if reps > 1 {
+        pert_eprint_str(" (" as i64);
+        pe_eprint_int(reps);
+        pert_eprint_str(" times)" as i64);
+    }
+    pert_eprint_str("\n" as i64);
+}
+
+/// The C backend's panic trace, from the frame records (nat_frame_ret,
+/// nat_frame_next) and the function table (nat_fn_names): each frame named
+/// by the function its return address is in, runtime functions left out,
+/// repeats counted. Allocates nothing.
+fn pe_trace_from(fp0: i64) {
+    if pe_sigbuf == 0 { return; }
+    var tab: i64 = nat_fn_names();
+    var m: i64 = 0;
+    while pe_ld(tab + m * 16 + 8) != 0 { m = m + 1; }
+    if m == 0 { return; }
+    var lo_code: i64 = pe_ld(tab);
+    var end_code: i64 = pe_ld(tab + m * 16);
+    var fp: i64 = fp0;
+    var k: i64 = 0;
+    var shown: bool = false;
+    var last: i64 = 0;
+    var reps: i64 = 0;
+    while fp != 0 && (fp & 7) == 0 && k < 256 {
+        var pc: i64 = nat_frame_ret(fp) - 4;
+        fp = nat_frame_next(fp);
+        k = k + 1;
+        if pc >= lo_code && pc < end_code {
+            var lo: i64 = 0;
+            var hi: i64 = m - 1;
+            while lo < hi {
+                var mid: i64 = (lo + hi + 1) / 2;
+                if pe_ld(tab + mid * 16) <= pc { lo = mid; } else { hi = mid - 1; }
+            }
+            var name: i64 = pe_ld(tab + lo * 16 + 8);
+            if !pe_is_rt_name(name) {
+                if !shown {
+                    pert_eprint_str("stack trace:\n    - " as i64);
+                    pert_eprint_str(name);
+                    pert_eprint_str("\n" as i64);
+                    shown = true;
+                } else if last != 0 && pert_str_equal(name, last) {
+                    reps = reps + 1;
+                } else {
+                    pe_trace_flush(last, reps);
+                    last = name;
+                    reps = 1;
+                }
+            }
+        }
+    }
+    pe_trace_flush(last, reps);
+}
+
+// ─── Strings ────────────────────────────────────────────────────────────
+
+/// A new length-headered string of n bytes (NUL after them).
+fn pe_new_str(n: i64) -> i64 {
+    var r: i64 = p_str_alloc(n);
+    pe_stb(r + n, 0);
+    return r;
+}
+
+fn pe_dup(s: i64) -> i64 {
+    var n: i64 = pe_len(s);
+    var r: i64 = pe_new_str(n);
+    pe_copy(r, s, n);
+    return r;
+}
+
+fn pe_dup_range(s: i64, from: i64, n: i64) -> i64 {
+    var r: i64 = pe_new_str(n);
+    pe_copy(r, s + from, n);
+    return r;
+}
+
+pub fn pert_str_concat(a: i64, b: i64) -> i64 {
+    var la: i64 = pe_len(a);
+    var lb: i64 = pe_len(b);
+    var r: i64 = pe_new_str(la + lb);
+    if la > 0 { pe_copy(r, a, la); }
+    if lb > 0 { pe_copy(r + la, b, lb); }
+    return r;
+}
+
+/// The decimal digits of v into buf (at least 21 bytes); returns their count.
+fn pe_int_digits(v: i64, buf: i64) -> i64 {
+    var tmp: i64 = buf + 31;
+    var n: i64 = 0;
+    // Work on the negative value: -MIN does not fit
+    var x: i64 = v;
+    if x > 0 { x = 0 - x; }
+    if x == 0 {
+        pe_stb(buf, 48);
+        return 1;
+    }
+    while x != 0 {
+        var d: i64 = 0 - (x % 10);
+        tmp = tmp - 1;
+        pe_stb(tmp, 48 + d);
+        n = n + 1;
+        x = x / 10;
+    }
+    var at: i64 = 0;
+    if v < 0 {
+        pe_stb(buf, 45);
+        at = 1;
+    }
+    var i: i64 = 0;
+    while i < n {
+        pe_stb(buf + at + i, pe_ldb(tmp + i));
+        i = i + 1;
+    }
+    return at + n;
+}
+
+pub fn pert_to_str(v: i64) -> str {
+    var buf: i64 = pert_malloc(48);
+    var n: i64 = pe_int_digits(v, buf);
+    var r: i64 = pe_dup_range(buf, 0, n);
+    pert_free(buf);
+    return r;
+}
+
+pub fn pert_to_str_bool(b: bool) -> str {
+    if b { return pe_dup("true" as i64); }
+    return pe_dup("false" as i64);
+}
+
+pub fn pert_bool_to_str(b: bool) -> str {
+    return pert_to_str_bool(b);
+}
+
+pub fn pert_to_str_str(s: i64) -> str {
+    return pe_dup(s);
+}
+
+/// One code point as UTF-8.
+pub fn pert_char_to_str(c: i64) -> str {
+    var r: i64 = 0;
+    if c < 128 {
+        r = pe_new_str(1);
+        pe_stb(r, c);
+    } else if c < 2048 {
+        r = pe_new_str(2);
+        pe_stb(r, 192 | (c >> 6));
+        pe_stb(r + 1, 128 | (c & 63));
+    } else if c < 65536 {
+        r = pe_new_str(3);
+        pe_stb(r, 224 | (c >> 12));
+        pe_stb(r + 1, 128 | ((c >> 6) & 63));
+        pe_stb(r + 2, 128 | (c & 63));
+    } else {
+        r = pe_new_str(4);
+        pe_stb(r, 240 | (c >> 18));
+        pe_stb(r + 1, 128 | ((c >> 12) & 63));
+        pe_stb(r + 2, 128 | ((c >> 6) & 63));
+        pe_stb(r + 3, 128 | (c & 63));
+    }
+    return r;
+}
+
+pub fn pert_to_str_vec(v: i64) -> str {
+    return Vec_to_str(v);
+}
+
+pub fn pert_print_vec(v: i64) {
+    var s: i64 = Vec_to_str(v) as i64;
+    pert_print_str(s);
+    p_str_free(s);
+}
+
+pub fn pert_print_map(m: i64) {
+    var s: i64 = HashMap_to_str(m) as i64;
+    pert_print_str(s);
+    p_str_free(s);
+}
+
+pub fn pert_str_equal(a: i64, b: i64) -> bool {
+    if a == b { return true; }
+    if a == 0 || b == 0 { return false; }
+    var la: i64 = pe_len(a);
+    var lb: i64 = pe_len(b);
+    if la != lb { return false; }
+    var i: i64 = 0;
+    while i < la {
+        if pe_ldb(a + i) != pe_ldb(b + i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// FNV-1a over 8 bytes at a time: the Windows runtime's p_str_hash, so a
+/// HashMap of strings is laid out, and printed, the same.
+@wrapping pub fn pert_str_hash(s: i64) -> i64 {
+    var hash: i64 = -3750763034362895579;
+    if s == 0 { return 0; }
+    var addr: i64 = s;
+    while true {
+        var w: i64 = 0;
+        var whole: bool = true;
+        if (addr & 4095) <= 4088 {
+            w = pe_ld(addr);
+            var lo: i64 = w & 4294967295;
+            var hi: i64 = (w >> 32) & 4294967295;
+            if ((lo - 16843009) & (~lo) & 2155905152) != 0
+                || ((hi - 16843009) & (~hi) & 2155905152) != 0 {
+                whole = false;
+            }
+        } else {
+            var k: i64 = 0;
+            while k < 8 && whole {
+                var b: i64 = pe_ldb(addr + k);
+                if b == 0 { whole = false; }
+                w = w | (b << (k * 8));
+                k = k + 1;
+            }
+        }
+        if !whole { break; }
+        hash = hash ^ w;
+        hash = hash * 1099511628211;
+        addr = addr + 8;
+    }
+    var last: i64 = pe_ldb(addr);
+    while last != 0 {
+        hash = hash ^ last;
+        hash = hash * 1099511628211;
+        addr = addr + 1;
+        last = pe_ldb(addr);
+    }
+    return hash & 9223372036854775807;
+}
+
+/// atoll: spaces, a sign, base-10 digits; 0 when there are none.
+@wrapping pub fn pert_str_to_int(s: i64) -> i64 {
+    if s == 0 { return 0; }
+    var i: i64 = 0;
+    while pe_ldb(s + i) == 32 || pe_ldb(s + i) == 9 || pe_ldb(s + i) == 10 || pe_ldb(s + i) == 13 { i = i + 1; }
+    var neg: bool = false;
+    if pe_ldb(s + i) == 45 { neg = true; i = i + 1; }
+    else if pe_ldb(s + i) == 43 { i = i + 1; }
+    var v: i64 = 0;
+    while pe_ldb(s + i) >= 48 && pe_ldb(s + i) <= 57 {
+        v = v * 10 + (pe_ldb(s + i) - 48);
+        i = i + 1;
+    }
+    if neg { return 0 - v; }
+    return v;
+}
+
+fn pe_pow10(k: i64) -> f64 {
+    var p: f64 = 1.0;
+    var i: i64 = 0;
+    while i < k {
+        p = p * 10.0;
+        i = i + 1;
+    }
+    return p;
+}
+
+/// atof: sign, digits, fraction, exponent. Exact (as strtod) whenever the
+/// digits fit in 53 bits and the power of ten is at most 10^22.
+pub fn pert_str_to_float(s: i64) -> f64 {
+    if s == 0 { return 0.0; }
+    var i: i64 = 0;
+    while pe_ldb(s + i) == 32 || pe_ldb(s + i) == 9 || pe_ldb(s + i) == 10 { i = i + 1; }
+    var neg: bool = false;
+    if pe_ldb(s + i) == 45 { neg = true; i = i + 1; }
+    else if pe_ldb(s + i) == 43 { i = i + 1; }
+    var mant: i64 = 0;
+    var digits: i64 = 0;
+    var exp10: i64 = 0;
+    while pe_ldb(s + i) >= 48 && pe_ldb(s + i) <= 57 {
+        if digits < 18 { mant = mant * 10 + (pe_ldb(s + i) - 48); digits = digits + 1; }
+        else { exp10 = exp10 + 1; }
+        i = i + 1;
+    }
+    if pe_ldb(s + i) == 46 {
+        i = i + 1;
+        while pe_ldb(s + i) >= 48 && pe_ldb(s + i) <= 57 {
+            if digits < 18 { mant = mant * 10 + (pe_ldb(s + i) - 48); digits = digits + 1; exp10 = exp10 - 1; }
+            i = i + 1;
+        }
+    }
+    if pe_ldb(s + i) == 101 || pe_ldb(s + i) == 69 {
+        i = i + 1;
+        var eneg: bool = false;
+        if pe_ldb(s + i) == 45 { eneg = true; i = i + 1; }
+        else if pe_ldb(s + i) == 43 { i = i + 1; }
+        var e: i64 = 0;
+        while pe_ldb(s + i) >= 48 && pe_ldb(s + i) <= 57 {
+            if e < 10000 { e = e * 10 + (pe_ldb(s + i) - 48); }
+            i = i + 1;
+        }
+        if eneg { exp10 = exp10 - e; } else { exp10 = exp10 + e; }
+    }
+    var v: f64 = mant as f64;
+    if exp10 > 0 {
+        if exp10 <= 22 { v = v * pe_pow10(exp10); }
+        else { var k: i64 = 0; while k < exp10 && k < 400 { v = v * 10.0; k = k + 1; } }
+    } else if exp10 < 0 {
+        var ne: i64 = 0 - exp10;
+        if ne <= 22 { v = v / pe_pow10(ne); }
+        else { var k2: i64 = 0; while k2 < ne && k2 < 400 { v = v / 10.0; k2 = k2 + 1; } }
+    }
+    if neg { return 0.0 - v; }
+    return v;
+}
+
+// ─── Floats as text ─────────────────────────────────────────────────────
+// As the interpreter prints them (Rust's Display): the shortest fixed-point
+// text that reads back as the same number, no exponent.
+
+/// round(x) for 0 <= x < 2^53, half to even
+fn pe_round(x: f64) -> i64 {
+    var r: i64 = x as i64;
+    var frac: f64 = x - (r as f64);
+    if frac > 0.5 { return r + 1; }
+    if frac == 0.5 && (r & 1) == 1 { return r + 1; }
+    return r;
+}
+
+/// "-"? digits of r, with its last p digits after a point
+fn pe_fixed(neg: bool, r: i64, p: i64) -> i64 {
+    var buf: i64 = pert_malloc(400);
+    var dig: i64 = pert_malloc(48);
+    var nd: i64 = pe_int_digits(r, dig);
+    var at: i64 = 0;
+    if neg { pe_stb(buf, 45); at = 1; }
+    if p == 0 {
+        pe_copy(buf + at, dig, nd);
+        at = at + nd;
+    } else {
+        if nd <= p {
+            // 0.000ddd
+            pe_stb(buf + at, 48);
+            pe_stb(buf + at + 1, 46);
+            at = at + 2;
+            var z: i64 = 0;
+            while z < p - nd { pe_stb(buf + at, 48); at = at + 1; z = z + 1; }
+            pe_copy(buf + at, dig, nd);
+            at = at + nd;
+        } else {
+            pe_copy(buf + at, dig, nd - p);
+            at = at + nd - p;
+            pe_stb(buf + at, 46);
+            at = at + 1;
+            pe_copy(buf + at, dig + nd - p, p);
+            at = at + p;
+        }
+        // No trailing zeros after the point
+        while pe_ldb(buf + at - 1) == 48 { at = at - 1; }
+        if pe_ldb(buf + at - 1) == 46 { at = at - 1; }
+    }
+    var r2: i64 = pe_dup_range(buf, 0, at);
+    pert_free(buf);
+    pert_free(dig);
+    return r2;
+}
+
+/// The exact decimal digits of an integral f64 >= 2^53: m * 2^e in base-10^9
+/// limbs.
+fn pe_big_integer_text(neg: bool, a: f64) -> i64 {
+    var bits: i64 = p_f64_to_bits(a);
+    var e: i64 = ((bits >> 52) & 2047) - 1075;
+    var m: i64 = (bits & 4503599627370495) | 4503599627370496;
+    var limbs: Vec<i64> = Vec::new();
+    limbs.push(m % 1000000000);
+    limbs.push((m / 1000000000) % 1000000000);
+    limbs.push(m / 1000000000000000000);
+    var k: i64 = 0;
+    while k < e {
+        var carry: i64 = 0;
+        var li: i64 = 0;
+        while li < limbs.len() {
+            var x: i64 = limbs.get(li) * 2 + carry;
+            limbs.set(li, x % 1000000000);
+            carry = x / 1000000000;
+            li = li + 1;
+        }
+        if carry > 0 { limbs.push(carry); }
+        k = k + 1;
+    }
+    var top: i64 = limbs.len() - 1;
+    while top > 0 && limbs.get(top) == 0 { top = top - 1; }
+    var buf: i64 = pert_malloc(400);
+    var at: i64 = 0;
+    if neg { pe_stb(buf, 45); at = 1; }
+    var dig: i64 = pert_malloc(48);
+    var nd: i64 = pe_int_digits(limbs.get(top), dig);
+    pe_copy(buf + at, dig, nd);
+    at = at + nd;
+    var j: i64 = top - 1;
+    while j >= 0 {
+        var x2: i64 = limbs.get(j);
+        var d: i64 = 100000000;
+        while d > 0 {
+            pe_stb(buf + at, 48 + (x2 / d) % 10);
+            at = at + 1;
+            d = d / 10;
+        }
+        j = j - 1;
+    }
+    var r: i64 = pe_dup_range(buf, 0, at);
+    pert_free(buf);
+    pert_free(dig);
+    return r;
+}
+
+pub fn pert_to_str_float(val: f64) -> str {
+    if val != val { return pe_dup("NaN" as i64); }
+    var d: f64 = val - val;
+    if d != d {
+        if val > 0.0 { return pe_dup("inf" as i64); }
+        return pe_dup("-inf" as i64);
+    }
+    if val == 0.0 {
+        if p_f64_to_bits(val) < 0 { return pe_dup("-0" as i64); }
+        return pe_dup("0" as i64);
+    }
+    var neg: bool = val < 0.0;
+    var a: f64 = val;
+    if neg { a = 0.0 - a; }
+    if a >= 9007199254740992.0 {
+        return pe_big_integer_text(neg, a);
+    }
+    // The fewest fraction digits p with round(a * 10^p) / 10^p == a. While
+    // the scaled value stays under 2^53 and 10^p is exact (p <= 22), the
+    // division is correctly rounded: the test is strtod's.
+    var p: i64 = 0;
+    var pow: f64 = 1.0;
+    var last_r: i64 = pe_round(a);
+    var last_p: i64 = 0;
+    while p <= 340 {
+        var scaled: f64 = a * pow;
+        if scaled >= 9007199254740992.0 { break; }
+        var r: i64 = pe_round(scaled);
+        last_r = r;
+        last_p = p;
+        if (r as f64) / pow == a {
+            return pe_fixed(neg, r, p);
+        }
+        p = p + 1;
+        pow = pow * 10.0;
+    }
+    return pe_fixed(neg, last_r, last_p);
+}
+
+pub fn pert_float_to_str(val: f64) -> str {
+    return pert_to_str_float(val);
+}
+
+// ─── String builder (as the Windows runtime) ────────────────────────────
+
+pub fn pert_sb_new() -> i64 {
+    var sb: i64 = pert_malloc(24);
+    pe_st(sb, pert_malloc(64));
+    pe_st(sb + 8, 0);
+    pe_st(sb + 16, 64);
+    return sb;
+}
+
+pub fn pert_sb_append(sb: i64, s: i64) {
+    var n: i64 = pe_len(s);
+    var len: i64 = pe_ld(sb + 8);
+    var cap: i64 = pe_ld(sb + 16);
+    if len + n + 1 > cap {
+        while len + n + 1 > cap { cap = cap * 2; }
+        var grown: i64 = pert_malloc(cap);
+        pe_copy(grown, pe_ld(sb), len);
+        pert_free(pe_ld(sb));
+        pe_st(sb, grown);
+        pe_st(sb + 16, cap);
+    }
+    pe_copy(pe_ld(sb) + len, s, n);
+    pe_st(sb + 8, len + n);
+}
+
+pub fn pert_sb_to_str(sb: i64) -> str {
+    return pe_dup_range(pe_ld(sb), 0, pe_ld(sb + 8));
+}
+
+// ─── Allocators: the general heap ───────────────────────────────────────
+
+pub fn pert_allocator_create(arg: i64) -> i64 {
+    return 1;
+}
+
+pub fn pert_allocator_alloc(alloc: i64, size: i64) -> i64 {
+    if size < 0 { return 0; }
+    return pert_malloc(size);
+}
+
+pub fn pert_allocator_free(alloc: i64, ptr: i64) {
+    pert_free(ptr);
+}
+
+pub fn pert_allocator_stats(alloc: i64) -> i64 {
+    return 0;
+}
+
+// ─── String builtins (the C runtime's meaning) ──────────────────────────
+
+pub fn pert_string_len(s: i64) -> i64 {
+    return pe_len(s);
+}
+
+/// The index of `sub` in `s`, or -1
+fn pe_find(s: i64, sub: i64, from: i64) -> i64 {
+    var n: i64 = pe_len(s);
+    var m: i64 = pe_len(sub);
+    var i: i64 = from;
+    while i + m <= n {
+        var j: i64 = 0;
+        while j < m && pe_ldb(s + i + j) == pe_ldb(sub + j) { j = j + 1; }
+        if j == m { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+pub fn pert_string_find(s: i64, sub: i64) -> i64 {
+    if s == 0 || sub == 0 { return 0 - 1; }
+    return pe_find(s, sub, 0);
+}
+
+pub fn pert_string_contains(s: i64, sub: i64) -> bool {
+    if s == 0 || sub == 0 { return false; }
+    return pe_find(s, sub, 0) >= 0;
+}
+
+pub fn pert_string_starts_with(s: i64, prefix: i64) -> bool {
+    if s == 0 || prefix == 0 { return false; }
+    var n: i64 = pe_len(s);
+    var m: i64 = pe_len(prefix);
+    if m > n { return false; }
+    var i: i64 = 0;
+    while i < m {
+        if pe_ldb(s + i) != pe_ldb(prefix + i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn pert_string_ends_with(s: i64, suffix: i64) -> bool {
+    if s == 0 || suffix == 0 { return false; }
+    var n: i64 = pe_len(s);
+    var m: i64 = pe_len(suffix);
+    if m > n { return false; }
+    var i: i64 = 0;
+    while i < m {
+        if pe_ldb(s + n - m + i) != pe_ldb(suffix + i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn pert_string_replace(s: i64, from: i64, to: i64) -> str {
+    if s == 0 { return pe_new_str(0); }
+    var m: i64 = pe_len(from);
+    if from == 0 || m == 0 { return pe_dup(s); }
+    var sb: i64 = pert_sb_new();
+    var n: i64 = pe_len(s);
+    var i: i64 = 0;
+    while i < n {
+        var at: i64 = pe_find(s, from, i);
+        if at < 0 {
+            var rest: i64 = pe_dup_range(s, i, n - i);
+            pert_sb_append(sb, rest);
+            i = n;
+        } else {
+            var part: i64 = pe_dup_range(s, i, at - i);
+            pert_sb_append(sb, part);
+            pert_sb_append(sb, to);
+            i = at + m;
+        }
+    }
+    return pert_sb_to_str(sb);
+}
+
+fn pe_is_space(b: i64) -> bool {
+    return b == 32 || b == 9 || b == 10 || b == 13;
+}
+
+pub fn pert_string_trim(s: i64) -> str {
+    if s == 0 { return pe_new_str(0); }
+    var n: i64 = pe_len(s);
+    var a: i64 = 0;
+    while a < n && pe_is_space(pe_ldb(s + a)) { a = a + 1; }
+    var b: i64 = n;
+    while b > a && pe_is_space(pe_ldb(s + b - 1)) { b = b - 1; }
+    return pe_dup_range(s, a, b - a);
+}
+
+pub fn pert_string_to_uppercase(s: i64) -> str {
+    var r: i64 = pe_dup(s);
+    var n: i64 = pe_len(r);
+    var i: i64 = 0;
+    while i < n {
+        var c: i64 = pe_ldb(r + i);
+        if c >= 97 && c <= 122 { pe_stb(r + i, c - 32); }
+        i = i + 1;
+    }
+    return r;
+}
+
+pub fn pert_string_to_lowercase(s: i64) -> str {
+    var r: i64 = pe_dup(s);
+    var n: i64 = pe_len(r);
+    var i: i64 = 0;
+    while i < n {
+        var c: i64 = pe_ldb(r + i);
+        if c >= 65 && c <= 90 { pe_stb(r + i, c + 32); }
+        i = i + 1;
+    }
+    return r;
+}
+
+/// The pieces of s between the delimiters (a trailing empty piece is not
+/// kept, as in the C runtime).
+pub fn pert_string_split(s: i64, delim: i64) -> i64 {
+    var v: i64 = Vec_new();
+    if s == 0 || delim == 0 { return v; }
+    var n: i64 = pe_len(s);
+    var m: i64 = pe_len(delim);
+    var start: i64 = 0;
+    while start < n {
+        var at: i64 = 0 - 1;
+        if m > 0 { at = pe_find(s, delim, start); }
+        if at < 0 {
+            Vec_push(v, pe_dup_range(s, start, n - start));
+            start = n;
+        } else {
+            Vec_push(v, pe_dup_range(s, start, at - start));
+            start = at + m;
+        }
+    }
+    return v;
+}
+
+// ─── The process: arguments, environment, clocks ────────────────────────
+
+pub fn pert_argc() -> i64 {
+    return pe_ld(nat_start_sp());
+}
+
+pub fn pert_argv(i: i64) -> str {
+    var sp: i64 = nat_start_sp();
+    if i < 0 || i >= pe_ld(sp) { return pe_null_str(); }
+    return pe_ld(sp + 8 + i * 8);
+}
+
+pub fn pert_getenv(name: i64) -> str {
+    if name == 0 { return pe_null_str(); }
+    var sp: i64 = nat_start_sp();
+    var at: i64 = sp + 8 + (pe_ld(sp) + 1) * 8;
+    var n: i64 = pe_len(name);
+    while pe_ld(at) != 0 {
+        var e: i64 = pe_ld(at);
+        var j: i64 = 0;
+        while j < n && pe_ldb(e + j) == pe_ldb(name + j) { j = j + 1; }
+        if j == n && pe_ldb(e + n) == 61 { return p_str_from_ptr(e + n + 1); }
+        at = at + 8;
+    }
+    return pe_null_str();
+}
+
+pub fn pert_getpid() -> i64 {
+    return pe_sys(PE_SYS_GETPID, 0, 0, 0);
+}
+
+/// CLOCK_REALTIME in nanoseconds since 1970
+fn pe_now_ns() -> i64 {
+    var ts: i64 = pert_malloc(16);
+    pe_sys(PE_SYS_CLOCK_GETTIME, 0, ts, 0);
+    var ns: i64 = pe_ld(ts) * 1000000000 + pe_ld(ts + 8);
+    pert_free(ts);
+    return ns;
+}
+
+pub fn pert_clock_now() -> i64 {
+    return pe_now_ns();
+}
+
+pub fn pert_clock_now_us() -> i64 {
+    return pe_now_ns() / 1000;
+}
+
+pub fn pert_clock_now_ms() -> i64 {
+    return pe_now_ns() / 1000000;
+}
+
+pub fn pert_os_random_u64() -> i64 {
+    var buf: i64 = pert_malloc(8);
+    pe_sys(PE_SYS_GETRANDOM, buf, 8, 0);
+    var v: i64 = pe_ld(buf);
+    pert_free(buf);
+    return v;
+}
+
+// ─── Files ──────────────────────────────────────────────────────────────
+
+fn pe_open(path: i64, flags: i64) -> i64 {
+    return nat_syscall(PE_SYS_OPENAT, PE_AT_FDCWD, path, flags, 420, 0, 0);
+}
+
+pub fn pert_file_read(path: i64) -> str {
+    if path == 0 { return pe_null_str(); }
+    var fd: i64 = pe_open(path, 0);
+    if fd < 0 { return pe_null_str(); }
+    var size: i64 = pe_sys(PE_SYS_LSEEK, fd, 0, 2);
+    if size < 0 { pe_sys(PE_SYS_CLOSE, fd, 0, 0); return pe_null_str(); }
+    pe_sys(PE_SYS_LSEEK, fd, 0, 0);
+    var r: i64 = pe_new_str(size);
+    var got: i64 = 0;
+    while got < size {
+        var k: i64 = pe_sys(PE_SYS_READ, fd, r + got, size - got);
+        if k <= 0 { break; }
+        got = got + k;
+    }
+    pe_stb(r + got, 0);
+    pe_sys(PE_SYS_CLOSE, fd, 0, 0);
+    return r;
+}
+
+fn pe_write_file(path: i64, data: i64, n: i64, flags: i64) -> i64 {
+    if path == 0 { return 0 - 1; }
+    var fd: i64 = pe_open(path, flags);
+    if fd < 0 { return 0 - 1; }
+    pe_write_all(fd, data, n);
+    pe_sys(PE_SYS_CLOSE, fd, 0, 0);
+    return 0;
+}
+
+pub fn pert_file_write(path: i64, content: i64) -> i64 {
+    return pe_write_file(path, content, pe_len(content), 577);    // WRONLY|CREAT|TRUNC
+}
+
+pub fn pert_file_write_bin(path: i64, data: i64, n: i64) -> i64 {
+    return pe_write_file(path, data, n, 577);
+}
+
+pub fn pert_file_append(path: i64, content: i64) -> i64 {
+    return pe_write_file(path, content, pe_len(content), 1089);   // WRONLY|CREAT|APPEND
+}
+
+pub fn pert_file_exists(path: i64) -> bool {
+    if path == 0 { return false; }
+    var fd: i64 = pe_open(path, 0);
+    if fd < 0 { return false; }
+    pe_sys(PE_SYS_CLOSE, fd, 0, 0);
+    return true;
+}
+
+pub fn pert_file_delete(path: i64) -> i64 {
+    if path == 0 { return 0 - 1; }
+    if pe_sys(PE_SYS_UNLINKAT, PE_AT_FDCWD, path, 0) < 0 { return 0 - 1; }
+    return 0;
+}

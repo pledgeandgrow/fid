@@ -1,0 +1,84 @@
+// Test: integer semantics are the same on every backend and target
+// (release F6): wrapping arithmetic, signed division and remainder, shifts,
+// narrowing casts and the edges of i64. Run through the interpreter, C and
+// native Windows, and through C on AArch64, RISC-V and WebAssembly
+// (scripts/cross-test.sh). Overflow and division by zero panic instead:
+// test_panic_overflow_fail, test_panic_div_zero_fail, test_panic_min_div_fail.
+
+@wrapping fn wadd(a: i64, b: i64) -> i64 { return a + b; }
+@wrapping fn wsub(a: i64, b: i64) -> i64 { return a - b; }
+@wrapping fn wmul(a: i64, b: i64) -> i64 { return a * b; }
+@wrapping fn wneg(a: i64) -> i64 { return 0 - a; }
+
+fn show(label: str, v: i64) {
+    print(label);
+    print(" = ");
+    print(v);
+    print("\n");
+}
+
+fn main() {
+    val max: i64 = 9223372036854775807;
+    val min: i64 = 0 - 9223372036854775807 - 1;
+
+    // Wrapping arithmetic: two's complement on every target
+    show("max + 1 (wrapping)", wadd(max, 1));
+    show("min - 1 (wrapping)", wsub(min, 1));
+    show("max * 2 (wrapping)", wmul(max, 2));
+    show("min * -1 (wrapping)", wmul(min, 0 - 1));
+    show("-min (wrapping)", wneg(min));
+    show("0x9E3779B97F4A7C15 * 31", wmul(0 - 7046029254386353131, 31));
+
+    // Checked arithmetic at the edge, without overflowing
+    show("max - 1 + 1", max - 1 + 1);
+    show("min + 1 - 1", min + 1 - 1);
+
+    // Division truncates toward zero; the remainder has the dividend's sign
+    show("7 / 2", 7 / 2);
+    show("-7 / 2", (0 - 7) / 2);
+    show("7 / -2", 7 / (0 - 2));
+    show("-7 / -2", (0 - 7) / (0 - 2));
+    show("7 % 3", 7 % 3);
+    show("-7 % 3", (0 - 7) % 3);
+    show("7 % -3", 7 % (0 - 3));
+    show("-7 % -3", (0 - 7) % (0 - 3));
+    show("min / 2", min / 2);
+    show("min % 7", min % 7);
+    show("max / -1", max / (0 - 1));
+
+    // Shifts: left by up to 63, right is arithmetic on i64
+    var one: i64 = 1;
+    show("1 << 62", one << 62);
+    show("-8 >> 1", (0 - 8) >> 1);
+    show("-1 >> 63", (0 - 1) >> 63);
+    show("max >> 62", max >> 62);
+    var k: i64 = 0;
+    var acc: i64 = 0;
+    while k < 64 {
+        acc = acc ^ (max >> k);
+        k = k + 1;
+    }
+    show("xor of max >> k", acc);
+
+    // Bitwise operations
+    show("-1 & 0xFF", (0 - 1) & 255);
+    show("0x0F | 0xF0", 15 | 240);
+    show("0x55 ^ 0xFF", 85 ^ 255);
+    show("~0", ~0);
+
+    // Narrowing casts keep the low bits
+    val big: i64 = 4294967298;
+    val as32: i32 = big as i32;
+    show("4294967298 as i32", as32 as i64);
+    val neg32: i32 = (0 - 1) as i32;
+    show("-1 as i32", neg32 as i64);
+    val b: u8 = 300 as u8;
+    show("300 as u8", b as i64);
+    val nb: u8 = (0 - 1) as u8;
+    show("-1 as u8", nb as i64);
+
+    // Floats to integers truncate toward zero
+    show("3.9 as i64", 3.9 as i64);
+    show("-3.9 as i64", (0.0 - 3.9) as i64);
+    print("OK\n");
+}

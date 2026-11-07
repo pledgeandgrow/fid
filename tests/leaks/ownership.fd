@@ -1,0 +1,141 @@
+// Ownership (proposal 0004): every value has one owner; a copy is counted
+// again and changes only itself; everything is freed by its owner. Checked
+// by scripts/leak-check.sh: the output must match ownership.expected and
+// the leak report must say every block was freed.
+
+struct Bag {
+    name: str,
+    items: Vec<i64>,
+}
+
+struct Shelf {
+    label: str,
+    bags: Vec<Bag>,
+    tags: HashMap<str, str>,
+}
+
+enum Note {
+    Text(str),
+    Count(i64),
+    Pair(str, Vec<str>),
+}
+
+fn make_name(n: i64) -> str {
+    return "bag" + int_to_str(n);
+}
+
+fn fill(n: i64) -> Bag {
+    var b: Bag = Bag { name: make_name(n), items: Vec::new() };
+    var i: i64 = 0;
+    while i < n {
+        b.items.push(i);
+        i = i + 1;
+    }
+    return b;
+}
+
+// A copy of a borrowed parameter changes only itself
+fn grow(v: Vec<i64>) -> i64 {
+    var mine: Vec<i64> = v;
+    mine.push(99);
+    return mine.len();
+}
+
+fn longest(words: Vec<str>) -> str {
+    var best: str = "";
+    for w in words {
+        if str_len(w) > str_len(best) { best = w; }
+    }
+    return best;
+}
+
+fn describe(n: Note) -> str {
+    match n {
+        Note::Text(t) => { return "text " + t; }
+        Note::Count(c) => { return "count " + int_to_str(c); }
+        Note::Pair(k, vs) => { return k + " " + int_to_str(vs.len()); }
+    }
+    return "";
+}
+
+fn main() {
+    // Vec copies are independent
+    var a: Vec<i64> = Vec::new();
+    a.push(1);
+    var b: Vec<i64> = a;
+    b.push(2);
+    println(a.len());
+    println(b.len());
+    println(grow(a));
+    println(a.len());
+
+    // Strings: concatenation, slices, reassignment in a loop
+    var s: str = "x";
+    var k: i64 = 0;
+    while k < 5 {
+        s = s + int_to_str(k);
+        k = k + 1;
+    }
+    println(s);
+    println(str_slice(s, 1, 3));
+
+    // Vec<str> owns its strings
+    var words: Vec<str> = Vec::new();
+    words.push("alpha");
+    words.push(make_name(12345));
+    words.push(str_trim("  beta  "));
+    println(longest(words));
+    var w2: Vec<str> = words;
+    w2.set(0, "gamma");
+    println(words.get(0));
+    println(w2.get(0));
+
+    // Structs holding Vecs and strings; Vec<struct>
+    var shelf: Shelf = Shelf { label: "top", bags: Vec::new(), tags: HashMap::new() };
+    var i: i64 = 1;
+    while i <= 3 {
+        shelf.bags.push(fill(i));
+        i = i + 1;
+    }
+    shelf.tags.insert("color", "red");
+    shelf.tags.insert("size", make_name(7));
+    shelf.tags.insert("color", "blue");
+    var copy: Shelf = shelf;
+    copy.bags.get(0).items.push(42);
+    copy.label = "copy";
+    println(shelf.label + " " + int_to_str(shelf.bags.get(0).items.len()));
+    println(copy.label + " " + int_to_str(copy.bags.get(0).items.len()));
+    println(shelf.tags.get("color"));
+    println(shelf.bags.get(2).name);
+
+    // Enums with payloads, Option
+    var notes: Vec<Note> = Vec::new();
+    notes.push(Note::Text("hello"));
+    notes.push(Note::Count(3));
+    var parts: Vec<str> = Vec::new();
+    parts.push("p");
+    parts.push("q");
+    notes.push(Note::Pair(make_name(1), parts));
+    var j: i64 = 0;
+    while j < notes.len() {
+        println(describe(notes.get(j)));
+        j = j + 1;
+    }
+    var maybe: Option<str> = Option::Some(make_name(2));
+    match maybe {
+        Option::Some(v) => { println(v); }
+        Option::None => { println("none"); }
+    }
+
+    // A value chosen by if/match
+    var pick: str = if k > 3 { make_name(k) } else { "small" };
+    println(pick);
+
+    // Popped and removed elements are the caller's
+    var stack: Vec<str> = Vec::new();
+    stack.push(make_name(8));
+    stack.push(make_name(9));
+    var top: str = stack.pop();
+    println(top);
+    println(stack.len());
+}

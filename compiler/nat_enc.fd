@@ -1,0 +1,672 @@
+// nat_enc.fd -- machine code for the native Linux AArch64 and RISC-V 64
+// backends (release F8): a code buffer with labels and fixups, the
+// instruction encoders of both architectures, and a static ELF writer.
+//
+// The code generator (compiler/nat_ir.fd) emits whole 32-bit instruction
+// words; a word whose target is a label not yet placed is recorded as a
+// fixup and patched in NatEnc_resolve once every label is known. Code and
+// data share one image, mapped read/write/execute at a fixed address
+// (NAT_IMAGE_BASE), so every reference is PC-relative or absolute within it.
+
+module compiler::nat_enc;
+
+use core;
+use vec;
+use string;
+
+pub const NAT_A64: i64 = 1;
+pub const NAT_RV64: i64 = 2;
+
+/// Where the image (code, then data) is mapped: file offset 0x1000 holds
+/// it, the ELF header is in front, one segment maps the file at 0x400000.
+pub const NAT_IMAGE_BASE: i64 = 0x401000;
+
+// Fixup kinds
+pub const NATFIX_A64_B26: i64 = 1;      // B, BL: imm26 words
+pub const NATFIX_A64_B19: i64 = 2;      // B.cond, CBZ, CBNZ: imm19 at bit 5
+pub const NATFIX_A64_ADRP_ADD: i64 = 3; // ADRP + ADD lo12: the label's address
+pub const NATFIX_RV_JAL: i64 = 4;       // JAL: J-type imm20
+pub const NATFIX_RV_AUIPC_I: i64 = 5;   // AUIPC + I-type (ADDI, JALR): pc-relative
+pub const NATFIX_ABS64: i64 = 6;        // 8 data bytes: the label's absolute address
+
+pub struct NatFix {
+    pub pos: i64,
+    pub label: i64,
+    pub kind: i64,
+}
+
+/// The image being built: bytes, label offsets (-1 = not placed yet; label
+/// 0 is never used, so a HashMap miss of 0 is never a label) and fixups.
+pub struct NatEnc {
+    pub code: Vec<i64>,
+    pub labels: Vec<i64>,
+    pub fixups: Vec<NatFix>,
+}
+
+pub fn NatEnc_new() -> NatEnc {
+    var labels: Vec<i64> = Vec::new();
+    labels.push(-1);
+    return NatEnc { code: Vec::new(), labels: labels, fixups: Vec::new() };
+}
+
+pub fn NatEnc_pos(e: &NatEnc) -> i64 {
+    return e.code.len();
+}
+
+pub fn NatEnc_label(e: &mut NatEnc) -> i64 {
+    e.labels.push(-1);
+    return e.labels.len() - 1;
+}
+
+pub fn NatEnc_place(e: &mut NatEnc, label: i64) {
+    e.labels.set(label, e.code.len());
+}
+
+pub fn NatEnc_byte(e: &mut NatEnc, b: i64) {
+    e.code.push(b & 0xFF);
+}
+
+pub fn NatEnc_word(e: &mut NatEnc, w: i64) {
+    e.code.push(w & 0xFF);
+    e.code.push((w >> 8) & 0xFF);
+    e.code.push((w >> 16) & 0xFF);
+    e.code.push((w >> 24) & 0xFF);
+}
+
+pub fn NatEnc_quad(e: &mut NatEnc, v: i64) {
+    var i: i64 = 0;
+    while i < 8 {
+        e.code.push((v >> (i * 8)) & 0xFF);
+        i = i + 1;
+    }
+}
+
+pub fn NatEnc_align(e: &mut NatEnc, n: i64) {
+    while e.code.len() % n != 0 {
+        e.code.push(0);
+    }
+}
+
+/// Record that the word(s) at the current position refer to `label`.
+pub fn NatEnc_fix(e: &mut NatEnc, label: i64, kind: i64) {
+    e.fixups.push(NatFix { pos: e.code.len(), label: label, kind: kind });
+}
+
+fn nat_read32(e: &NatEnc, pos: i64) -> i64 {
+    return e.code.get(pos) | (e.code.get(pos + 1) << 8) | (e.code.get(pos + 2) << 16) | (e.code.get(pos + 3) << 24);
+}
+
+fn nat_write32(e: &mut NatEnc, pos: i64, w: i64) {
+    e.code.set(pos, w & 0xFF);
+    e.code.set(pos + 1, (w >> 8) & 0xFF);
+    e.code.set(pos + 2, (w >> 16) & 0xFF);
+    e.code.set(pos + 3, (w >> 24) & 0xFF);
+}
+
+fn nat_or32(e: &mut NatEnc, pos: i64, bits: i64) {
+    nat_write32(e, pos, nat_read32(e, pos) | (bits & 0xFFFFFFFF));
+}
+
+/// Patch every fixup. Returns "" or the first error (a label never placed,
+/// or a target out of an instruction's range).
+@wrapping pub fn NatEnc_resolve(e: &mut NatEnc) -> str {
+    var i: i64 = 0;
+    while i < e.fixups.len() {
+        var f: NatFix = e.fixups.get(i);
+        var target: i64 = e.labels.get(f.label);
+        if target < 0 {
+            return "native backend: a label was never placed (fixup " + int_to_str(i) + ")";
+        }
+        var delta: i64 = target - f.pos;
+        if f.kind == NATFIX_A64_B26 {
+            if delta < 0 - 134217728 || delta >= 134217728 { return "native backend: branch out of range"; }
+            nat_or32(e, f.pos, (delta >> 2) & 0x3FFFFFF);
+        } else if f.kind == NATFIX_A64_B19 {
+            if delta < 0 - 1048576 || delta >= 1048576 { return "native backend: conditional branch out of range"; }
+            nat_or32(e, f.pos, ((delta >> 2) & 0x7FFFF) << 5);
+        } else if f.kind == NATFIX_A64_ADRP_ADD {
+            // The image base is page-aligned: pages follow from offsets
+            var pd: i64 = ((target >> 12) - (f.pos >> 12));
+            nat_or32(e, f.pos, ((pd & 3) << 29) | (((pd >> 2) & 0x7FFFF) << 5));
+            nat_or32(e, f.pos + 4, (target & 0xFFF) << 10);
+        } else if f.kind == NATFIX_RV_JAL {
+            if delta < 0 - 1048576 || delta >= 1048576 { return "native backend: jump out of range"; }
+            var j: i64 = (((delta >> 20) & 1) << 31) | (((delta >> 1) & 0x3FF) << 21)
+                | (((delta >> 11) & 1) << 20) | (((delta >> 12) & 0xFF) << 12);
+            nat_or32(e, f.pos, j);
+        } else if f.kind == NATFIX_RV_AUIPC_I {
+            var hi: i64 = (delta + 0x800) >> 12;
+            var lo: i64 = delta - (hi << 12);
+            nat_or32(e, f.pos, (hi & 0xFFFFF) << 12);
+            nat_or32(e, f.pos + 4, (lo & 0xFFF) << 20);
+        } else if f.kind == NATFIX_ABS64 {
+            var abs: i64 = NAT_IMAGE_BASE + target;
+            var k: i64 = 0;
+            while k < 8 {
+                e.code.set(f.pos + k, (abs >> (k * 8)) & 0xFF);
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// ===========================================================================
+// AArch64 (A64) encodings. Registers: 0..30 = x0..x30; 31 = xzr or sp,
+// by instruction. Floating point: 0..31 = d0..d31 (s0..s31 for f32).
+// ===========================================================================
+
+pub const A64_SP: i64 = 31;
+pub const A64_ZR: i64 = 31;
+pub const A64_FP: i64 = 29;
+pub const A64_LR: i64 = 30;
+
+// Condition codes
+pub const A64_EQ: i64 = 0;
+pub const A64_NE: i64 = 1;
+pub const A64_HS: i64 = 2;
+pub const A64_LO: i64 = 3;
+pub const A64_MI: i64 = 4;
+pub const A64_VS: i64 = 6;
+pub const A64_HI: i64 = 8;
+pub const A64_LS: i64 = 9;
+pub const A64_GE: i64 = 10;
+pub const A64_LT: i64 = 11;
+pub const A64_GT: i64 = 12;
+pub const A64_LE: i64 = 13;
+
+/// Three-register data processing: base | m << 16 | n << 5 | d.
+pub fn a64_rrr(e: &mut NatEnc, base: i64, d: i64, n: i64, m: i64) {
+    NatEnc_word(e, base | (m << 16) | (n << 5) | d);
+}
+
+pub fn a64_add(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x8B000000, d, n, m); }
+pub fn a64_adds(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0xAB000000, d, n, m); }
+pub fn a64_sub(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0xCB000000, d, n, m); }
+pub fn a64_subs(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0xEB000000, d, n, m); }
+pub fn a64_and(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x8A000000, d, n, m); }
+pub fn a64_orr(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0xAA000000, d, n, m); }
+pub fn a64_eor(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0xCA000000, d, n, m); }
+pub fn a64_mul(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x9B007C00, d, n, m); }
+pub fn a64_smulh(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x9B407C00, d, n, m); }
+pub fn a64_umulh(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x9BC07C00, d, n, m); }
+pub fn a64_sdiv(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x9AC00C00, d, n, m); }
+pub fn a64_udiv(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x9AC00800, d, n, m); }
+pub fn a64_lslv(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x9AC02000, d, n, m); }
+pub fn a64_lsrv(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x9AC02400, d, n, m); }
+pub fn a64_asrv(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x9AC02800, d, n, m); }
+
+/// d = a - n * m
+pub fn a64_msub(e: &mut NatEnc, d: i64, n: i64, m: i64, a: i64) {
+    NatEnc_word(e, 0x9B008000 | (m << 16) | (a << 10) | (n << 5) | d);
+}
+
+/// ADD d, n, #imm (0..4095); n and d may be sp.
+pub fn a64_add_imm(e: &mut NatEnc, d: i64, n: i64, imm: i64) {
+    NatEnc_word(e, 0x91000000 | ((imm & 0xFFF) << 10) | (n << 5) | d);
+}
+
+pub fn a64_sub_imm(e: &mut NatEnc, d: i64, n: i64, imm: i64) {
+    NatEnc_word(e, 0xD1000000 | ((imm & 0xFFF) << 10) | (n << 5) | d);
+}
+
+/// ADD d, n, m, UXTX: n and d may be sp (the extended-register form).
+pub fn a64_add_ext(e: &mut NatEnc, d: i64, n: i64, m: i64) {
+    NatEnc_word(e, 0x8B206000 | (m << 16) | (n << 5) | d);
+}
+
+pub fn a64_sub_ext(e: &mut NatEnc, d: i64, n: i64, m: i64) {
+    NatEnc_word(e, 0xCB206000 | (m << 16) | (n << 5) | d);
+}
+
+/// MOV d, m (ORR d, xzr, m): not for sp.
+pub fn a64_mov(e: &mut NatEnc, d: i64, m: i64) {
+    if d == m { return; }
+    a64_rrr(e, 0xAA000000, d, A64_ZR, m);
+}
+
+pub fn a64_mvn(e: &mut NatEnc, d: i64, m: i64) { a64_rrr(e, 0xAA200000, d, A64_ZR, m); }
+pub fn a64_neg(e: &mut NatEnc, d: i64, m: i64) { a64_rrr(e, 0xCB000000, d, A64_ZR, m); }
+pub fn a64_negs(e: &mut NatEnc, d: i64, m: i64) { a64_rrr(e, 0xEB000000, d, A64_ZR, m); }
+pub fn a64_cmp(e: &mut NatEnc, n: i64, m: i64) { a64_rrr(e, 0xEB000000, A64_ZR, n, m); }
+
+/// CMP n, m, ASR #63 (SUBS xzr, n, m, ASR #63): the high half of a signed
+/// product against the sign of its low half.
+pub fn a64_cmp_asr63(e: &mut NatEnc, n: i64, m: i64) {
+    NatEnc_word(e, 0xEB800000 | (m << 16) | (63 << 10) | (n << 5) | A64_ZR);
+}
+
+/// CSET d, cond (CSINC d, xzr, xzr, !cond)
+pub fn a64_cset(e: &mut NatEnc, d: i64, cond: i64) {
+    NatEnc_word(e, 0x9A9F07E0 | ((cond ^ 1) << 12) | d);
+}
+
+// Sign and zero extension (SBFM / UBFM)
+pub fn a64_sxtb(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x93401C00 | (n << 5) | d); }
+pub fn a64_sxth(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x93403C00 | (n << 5) | d); }
+pub fn a64_sxtw(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x93407C00 | (n << 5) | d); }
+pub fn a64_uxtb(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0xD3401C00 | (n << 5) | d); }
+pub fn a64_uxth(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0xD3403C00 | (n << 5) | d); }
+pub fn a64_uxtw(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0xD3407C00 | (n << 5) | d); }
+
+/// d = n >> 63 (arithmetic): 0 or -1
+pub fn a64_asr63(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x937FFC00 | (n << 5) | d); }
+
+/// Any 64-bit constant: MOVZ (or MOVN) and MOVKs.
+@wrapping pub fn a64_li(e: &mut NatEnc, d: i64, v: i64) {
+    // Count the 16-bit pieces that differ from 0 and from 0xFFFF
+    var zeros: i64 = 0;
+    var ones: i64 = 0;
+    var k: i64 = 0;
+    while k < 4 {
+        var h: i64 = (v >> (k * 16)) & 0xFFFF;
+        if h == 0 { zeros = zeros + 1; }
+        if h == 0xFFFF { ones = ones + 1; }
+        k = k + 1;
+    }
+    var inverted: bool = ones > zeros;
+    var first: bool = true;
+    k = 0;
+    while k < 4 {
+        var h2: i64 = (v >> (k * 16)) & 0xFFFF;
+        var skip: bool = false;
+        if inverted { skip = h2 == 0xFFFF; } else { skip = h2 == 0; }
+        if !skip {
+            if first {
+                if inverted {
+                    // MOVN d, ~h, LSL k*16
+                    NatEnc_word(e, 0x92800000 | (k << 21) | (((~h2) & 0xFFFF) << 5) | d);
+                } else {
+                    NatEnc_word(e, 0xD2800000 | (k << 21) | (h2 << 5) | d);
+                }
+                first = false;
+            } else {
+                NatEnc_word(e, 0xF2800000 | (k << 21) | (h2 << 5) | d);
+            }
+        }
+        k = k + 1;
+    }
+    if first {
+        // 0 or -1
+        if inverted {
+            NatEnc_word(e, 0x92800000 | d);
+        } else {
+            NatEnc_word(e, 0xD2800000 | d);
+        }
+    }
+}
+
+// Loads and stores, [n + imm] with an unsigned scaled immediate. `size` is
+// 1, 2, 4 or 8; a signed load sign-extends into the whole register.
+pub fn a64_ldst_fits(size: i64, imm: i64) -> bool {
+    return imm >= 0 && imm % size == 0 && imm / size < 4096;
+}
+
+pub fn a64_ldr_sized(e: &mut NatEnc, t: i64, n: i64, imm: i64, size: i64, signed: bool) {
+    var base: i64 = 0xF9400000; // LDR x
+    if size == 1 {
+        if signed { base = 0x39800000; } else { base = 0x39400000; }
+    } else if size == 2 {
+        if signed { base = 0x79800000; } else { base = 0x79400000; }
+    } else if size == 4 {
+        if signed { base = 0xB9800000; } else { base = 0xB9400000; }
+    }
+    NatEnc_word(e, base | ((imm / size) << 10) | (n << 5) | t);
+}
+
+pub fn a64_str_sized(e: &mut NatEnc, t: i64, n: i64, imm: i64, size: i64) {
+    var base: i64 = 0xF9000000;
+    if size == 1 { base = 0x39000000; }
+    if size == 2 { base = 0x79000000; }
+    if size == 4 { base = 0xB9000000; }
+    NatEnc_word(e, base | ((imm / size) << 10) | (n << 5) | t);
+}
+
+pub fn a64_ldr(e: &mut NatEnc, t: i64, n: i64, imm: i64) { a64_ldr_sized(e, t, n, imm, 8, false); }
+pub fn a64_str(e: &mut NatEnc, t: i64, n: i64, imm: i64) { a64_str_sized(e, t, n, imm, 8); }
+
+// Branches (targets are labels)
+pub fn a64_b(e: &mut NatEnc, label: i64) {
+    NatEnc_fix(e, label, NATFIX_A64_B26);
+    NatEnc_word(e, 0x14000000);
+}
+
+pub fn a64_bl(e: &mut NatEnc, label: i64) {
+    NatEnc_fix(e, label, NATFIX_A64_B26);
+    NatEnc_word(e, 0x94000000);
+}
+
+pub fn a64_bcond(e: &mut NatEnc, cond: i64, label: i64) {
+    NatEnc_fix(e, label, NATFIX_A64_B19);
+    NatEnc_word(e, 0x54000000 | cond);
+}
+
+pub fn a64_cbz(e: &mut NatEnc, t: i64, label: i64) {
+    NatEnc_fix(e, label, NATFIX_A64_B19);
+    NatEnc_word(e, 0xB4000000 | t);
+}
+
+pub fn a64_cbnz(e: &mut NatEnc, t: i64, label: i64) {
+    NatEnc_fix(e, label, NATFIX_A64_B19);
+    NatEnc_word(e, 0xB5000000 | t);
+}
+
+/// B.cond over the next instruction (+8): the inverse of a far branch.
+pub fn a64_bcond_skip1(e: &mut NatEnc, cond: i64) {
+    NatEnc_word(e, 0x54000000 | (2 << 5) | cond);
+}
+
+pub fn a64_blr(e: &mut NatEnc, n: i64) { NatEnc_word(e, 0xD63F0000 | (n << 5)); }
+pub fn a64_ret(e: &mut NatEnc) { NatEnc_word(e, 0xD65F03C0); }
+pub fn a64_svc0(e: &mut NatEnc) { NatEnc_word(e, 0xD4000001); }
+pub fn a64_brk(e: &mut NatEnc) { NatEnc_word(e, 0xD4200000); }
+
+/// d = the address of `label` (ADRP + ADD).
+pub fn a64_addr(e: &mut NatEnc, d: i64, label: i64) {
+    NatEnc_fix(e, label, NATFIX_A64_ADRP_ADD);
+    NatEnc_word(e, 0x90000000 | d);
+    NatEnc_word(e, 0x91000000 | (d << 5) | d);
+}
+
+// Floating point (double unless named _s)
+pub fn a64_fmov_dx(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x9E670000 | (n << 5) | d); }
+pub fn a64_fmov_xd(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x9E660000 | (n << 5) | d); }
+pub fn a64_fmov_sw(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E270000 | (n << 5) | d); }
+pub fn a64_fmov_ws(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E260000 | (n << 5) | d); }
+pub fn a64_fadd(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x1E602800, d, n, m); }
+pub fn a64_fsub(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x1E603800, d, n, m); }
+pub fn a64_fmul(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x1E600800, d, n, m); }
+pub fn a64_fdiv(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x1E601800, d, n, m); }
+pub fn a64_fcmp(e: &mut NatEnc, n: i64, m: i64) { NatEnc_word(e, 0x1E602000 | (m << 16) | (n << 5)); }
+pub fn a64_fcvt_ds(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E22C000 | (n << 5) | d); }
+pub fn a64_fcvt_sd(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E624000 | (n << 5) | d); }
+pub fn a64_scvtf(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x9E620000 | (n << 5) | d); }
+pub fn a64_fcvtzs(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x9E780000 | (n << 5) | d); }
+pub fn a64_fsqrt(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E61C000 | (n << 5) | d); }
+pub fn a64_fabs(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E60C000 | (n << 5) | d); }
+pub fn a64_frintm(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E654000 | (n << 5) | d); }
+pub fn a64_frintp(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E64C000 | (n << 5) | d); }
+pub fn a64_frintz(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E65C000 | (n << 5) | d); }
+pub fn a64_frinta(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E664000 | (n << 5) | d); }
+
+// Atomics (exclusive and acquire/release forms)
+pub fn a64_ldaxr(e: &mut NatEnc, t: i64, n: i64) { NatEnc_word(e, 0xC85FFC00 | (n << 5) | t); }
+/// STLXR Ws, Xt, [Xn]: Ws = 0 on success
+pub fn a64_stlxr(e: &mut NatEnc, s: i64, t: i64, n: i64) { NatEnc_word(e, 0xC800FC00 | (s << 16) | (n << 5) | t); }
+pub fn a64_ldar(e: &mut NatEnc, t: i64, n: i64) { NatEnc_word(e, 0xC8DFFC00 | (n << 5) | t); }
+pub fn a64_stlr(e: &mut NatEnc, t: i64, n: i64) { NatEnc_word(e, 0xC89FFC00 | (n << 5) | t); }
+pub fn a64_clrex(e: &mut NatEnc) { NatEnc_word(e, 0xD503305F); }
+pub fn a64_dmb(e: &mut NatEnc) { NatEnc_word(e, 0xD5033BBF); }
+/// CBNZ Wt by a fixed word count (no fixup); negative jumps back
+pub fn a64_cbnz_w_words(e: &mut NatEnc, t: i64, words: i64) {
+    NatEnc_word(e, 0x35000000 | ((words & 0x7FFFF) << 5) | t);
+}
+/// B.cond / CBNZ X by a fixed word count
+pub fn a64_bcond_words(e: &mut NatEnc, cond: i64, words: i64) {
+    NatEnc_word(e, 0x54000000 | ((words & 0x7FFFF) << 5) | cond);
+}
+pub fn a64_cbnz_words(e: &mut NatEnc, t: i64, words: i64) {
+    NatEnc_word(e, 0xB5000000 | ((words & 0x7FFFF) << 5) | t);
+}
+
+// ===========================================================================
+// RISC-V 64 (RV64IMFD) encodings. Registers: x0..x31 (zero, ra, sp, ...);
+// floating point f0..f31.
+// ===========================================================================
+
+pub const RV_ZERO: i64 = 0;
+pub const RV_RA: i64 = 1;
+pub const RV_SP: i64 = 2;
+pub const RV_S0: i64 = 8;
+pub const RV_A0: i64 = 10;
+pub const RV_A7: i64 = 17;
+pub const RV_T0: i64 = 5;
+pub const RV_T6: i64 = 31;
+
+pub fn rv_r(e: &mut NatEnc, f7: i64, rs2: i64, rs1: i64, f3: i64, rd: i64, op: i64) {
+    NatEnc_word(e, (f7 << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op);
+}
+
+pub fn rv_i(e: &mut NatEnc, imm: i64, rs1: i64, f3: i64, rd: i64, op: i64) {
+    NatEnc_word(e, ((imm & 0xFFF) << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op);
+}
+
+pub fn rv_s(e: &mut NatEnc, imm: i64, rs2: i64, rs1: i64, f3: i64) {
+    NatEnc_word(e, (((imm >> 5) & 0x7F) << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | ((imm & 0x1F) << 7) | 0x23);
+}
+
+/// A conditional branch by a fixed byte offset (no fixup): -4096..4094.
+pub fn rv_b_off(e: &mut NatEnc, f3: i64, rs1: i64, rs2: i64, off: i64) {
+    var w: i64 = (((off >> 12) & 1) << 31) | (((off >> 5) & 0x3F) << 25) | (rs2 << 20) | (rs1 << 15)
+        | (f3 << 12) | (((off >> 1) & 0xF) << 8) | (((off >> 11) & 1) << 7) | 0x63;
+    NatEnc_word(e, w);
+}
+
+pub const RV_BEQ: i64 = 0;
+pub const RV_BNE: i64 = 1;
+pub const RV_BLT: i64 = 4;
+pub const RV_BGE: i64 = 5;
+pub const RV_BLTU: i64 = 6;
+pub const RV_BGEU: i64 = 7;
+
+pub fn rv_add(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0, b, a, 0, d, 0x33); }
+pub fn rv_sub(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0x20, b, a, 0, d, 0x33); }
+pub fn rv_sll(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0, b, a, 1, d, 0x33); }
+pub fn rv_slt(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0, b, a, 2, d, 0x33); }
+pub fn rv_sltu(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0, b, a, 3, d, 0x33); }
+pub fn rv_xor(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0, b, a, 4, d, 0x33); }
+pub fn rv_srl(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0, b, a, 5, d, 0x33); }
+pub fn rv_sra(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0x20, b, a, 5, d, 0x33); }
+pub fn rv_or(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0, b, a, 6, d, 0x33); }
+pub fn rv_and(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0, b, a, 7, d, 0x33); }
+pub fn rv_mul(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 1, b, a, 0, d, 0x33); }
+pub fn rv_mulh(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 1, b, a, 1, d, 0x33); }
+pub fn rv_mulhu(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 1, b, a, 3, d, 0x33); }
+pub fn rv_div(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 1, b, a, 4, d, 0x33); }
+pub fn rv_divu(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 1, b, a, 5, d, 0x33); }
+pub fn rv_rem(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 1, b, a, 6, d, 0x33); }
+pub fn rv_remu(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 1, b, a, 7, d, 0x33); }
+
+pub fn rv_addi(e: &mut NatEnc, d: i64, a: i64, imm: i64) { rv_i(e, imm, a, 0, d, 0x13); }
+pub fn rv_xori(e: &mut NatEnc, d: i64, a: i64, imm: i64) { rv_i(e, imm, a, 4, d, 0x13); }
+pub fn rv_andi(e: &mut NatEnc, d: i64, a: i64, imm: i64) { rv_i(e, imm, a, 7, d, 0x13); }
+pub fn rv_sltiu(e: &mut NatEnc, d: i64, a: i64, imm: i64) { rv_i(e, imm, a, 3, d, 0x13); }
+pub fn rv_slli(e: &mut NatEnc, d: i64, a: i64, sh: i64) { rv_i(e, sh & 63, a, 1, d, 0x13); }
+pub fn rv_srli(e: &mut NatEnc, d: i64, a: i64, sh: i64) { rv_i(e, sh & 63, a, 5, d, 0x13); }
+pub fn rv_srai(e: &mut NatEnc, d: i64, a: i64, sh: i64) { rv_i(e, 0x400 | (sh & 63), a, 5, d, 0x13); }
+pub fn rv_addiw(e: &mut NatEnc, d: i64, a: i64, imm: i64) { rv_i(e, imm, a, 0, d, 0x1B); }
+pub fn rv_mv(e: &mut NatEnc, d: i64, a: i64) {
+    if d == a { return; }
+    rv_addi(e, d, a, 0);
+}
+
+pub fn rv_lui(e: &mut NatEnc, d: i64, imm20: i64) { NatEnc_word(e, ((imm20 & 0xFFFFF) << 12) | (d << 7) | 0x37); }
+pub fn rv_jalr(e: &mut NatEnc, d: i64, a: i64, imm: i64) { rv_i(e, imm, a, 0, d, 0x67); }
+pub fn rv_ret(e: &mut NatEnc) { rv_jalr(e, RV_ZERO, RV_RA, 0); }
+pub fn rv_ecall(e: &mut NatEnc) { NatEnc_word(e, 0x00000073); }
+pub fn rv_ebreak(e: &mut NatEnc) { NatEnc_word(e, 0x00100073); }
+
+// Loads (funct3: lb 0, lh 1, lw 2, ld 3, lbu 4, lhu 5, lwu 6) and stores
+pub fn rv_load(e: &mut NatEnc, d: i64, a: i64, imm: i64, size: i64, signed: bool) {
+    var f3: i64 = 3;
+    if size == 1 { if signed { f3 = 0; } else { f3 = 4; } }
+    if size == 2 { if signed { f3 = 1; } else { f3 = 5; } }
+    if size == 4 { if signed { f3 = 2; } else { f3 = 6; } }
+    rv_i(e, imm, a, f3, d, 0x03);
+}
+
+pub fn rv_store(e: &mut NatEnc, v: i64, a: i64, imm: i64, size: i64) {
+    var f3: i64 = 3;
+    if size == 1 { f3 = 0; }
+    if size == 2 { f3 = 1; }
+    if size == 4 { f3 = 2; }
+    rv_s(e, imm, v, a, f3);
+}
+
+pub fn rv_fits12(v: i64) -> bool {
+    return v >= 0 - 2048 && v <= 2047;
+}
+
+/// Any 64-bit constant (LUI/ADDI(W)/SLLI sequences).
+@wrapping pub fn rv_li(e: &mut NatEnc, d: i64, v: i64) {
+    if rv_fits12(v) {
+        rv_addi(e, d, RV_ZERO, v);
+        return;
+    }
+    if v >= 0 - 2147483648 && v <= 2147483647 {
+        var lo: i64 = ((v & 0xFFF) ^ 0x800) - 0x800;  // sign-extended low 12 bits
+        var hi: i64 = (v - lo) >> 12;
+        rv_lui(e, d, hi);
+        if lo != 0 { rv_addiw(e, d, d, lo); }
+        else { rv_addiw(e, d, d, 0); }
+        return;
+    }
+    var lo12: i64 = ((v & 0xFFF) ^ 0x800) - 0x800;
+    var rest: i64 = (v - lo12) >> 12;
+    rv_li(e, d, rest);
+    rv_slli(e, d, d, 12);
+    if lo12 != 0 { rv_addi(e, d, d, lo12); }
+}
+
+/// JAL d, label (±1 MB)
+pub fn rv_jal(e: &mut NatEnc, d: i64, label: i64) {
+    NatEnc_fix(e, label, NATFIX_RV_JAL);
+    NatEnc_word(e, (d << 7) | 0x6F);
+}
+
+/// d = the address of `label` (AUIPC + ADDI).
+pub fn rv_addr(e: &mut NatEnc, d: i64, label: i64) {
+    NatEnc_fix(e, label, NATFIX_RV_AUIPC_I);
+    NatEnc_word(e, (d << 7) | 0x17);
+    rv_addi(e, d, d, 0);
+}
+
+/// A call anywhere in the image: AUIPC ra + JALR ra.
+pub fn rv_call(e: &mut NatEnc, label: i64) {
+    NatEnc_fix(e, label, NATFIX_RV_AUIPC_I);
+    NatEnc_word(e, (RV_RA << 7) | 0x17);
+    rv_jalr(e, RV_RA, RV_RA, 0);
+}
+
+/// A jump anywhere in the image through t6: AUIPC t6 + JALR zero.
+pub fn rv_far_jump(e: &mut NatEnc, label: i64) {
+    NatEnc_fix(e, label, NATFIX_RV_AUIPC_I);
+    NatEnc_word(e, (RV_T6 << 7) | 0x17);
+    rv_jalr(e, RV_ZERO, RV_T6, 0);
+}
+
+// Floating point (D, with F for f32 moves and conversions)
+pub fn rv_fmv_dx(e: &mut NatEnc, fd: i64, rs: i64) { NatEnc_word(e, 0xF2000053 | (rs << 15) | (fd << 7)); }
+pub fn rv_fmv_xd(e: &mut NatEnc, rd: i64, fs: i64) { NatEnc_word(e, 0xE2000053 | (fs << 15) | (rd << 7)); }
+pub fn rv_fmv_wx(e: &mut NatEnc, fd: i64, rs: i64) { NatEnc_word(e, 0xF0000053 | (rs << 15) | (fd << 7)); }
+pub fn rv_fmv_xw(e: &mut NatEnc, rd: i64, fs: i64) { NatEnc_word(e, 0xE0000053 | (fs << 15) | (rd << 7)); }
+// rm = 7: the dynamic rounding mode (round to nearest even at start)
+pub fn rv_fop_d(e: &mut NatEnc, base: i64, fd: i64, a: i64, b: i64) {
+    NatEnc_word(e, base | (b << 20) | (a << 15) | (7 << 12) | (fd << 7));
+}
+pub fn rv_fadd_d(e: &mut NatEnc, fd: i64, a: i64, b: i64) { rv_fop_d(e, 0x02000053, fd, a, b); }
+pub fn rv_fsub_d(e: &mut NatEnc, fd: i64, a: i64, b: i64) { rv_fop_d(e, 0x0A000053, fd, a, b); }
+pub fn rv_fmul_d(e: &mut NatEnc, fd: i64, a: i64, b: i64) { rv_fop_d(e, 0x12000053, fd, a, b); }
+pub fn rv_fdiv_d(e: &mut NatEnc, fd: i64, a: i64, b: i64) { rv_fop_d(e, 0x1A000053, fd, a, b); }
+pub fn rv_feq_d(e: &mut NatEnc, rd: i64, a: i64, b: i64) { NatEnc_word(e, 0xA2002053 | (b << 20) | (a << 15) | (rd << 7)); }
+pub fn rv_flt_d(e: &mut NatEnc, rd: i64, a: i64, b: i64) { NatEnc_word(e, 0xA2001053 | (b << 20) | (a << 15) | (rd << 7)); }
+pub fn rv_fle_d(e: &mut NatEnc, rd: i64, a: i64, b: i64) { NatEnc_word(e, 0xA2000053 | (b << 20) | (a << 15) | (rd << 7)); }
+pub fn rv_fcvt_dl(e: &mut NatEnc, fd: i64, rs: i64) { NatEnc_word(e, 0xD2200053 | (rs << 15) | (7 << 12) | (fd << 7)); }
+// fcvt.l.d with rtz (round toward zero), as a C cast
+pub fn rv_fcvt_ld(e: &mut NatEnc, rd: i64, fs: i64) { NatEnc_word(e, 0xC2200053 | (fs << 15) | (1 << 12) | (rd << 7)); }
+pub fn rv_fcvt_ds(e: &mut NatEnc, fd: i64, fs: i64) { NatEnc_word(e, 0x42000053 | (fs << 15) | (fd << 7)); }
+/// fcvt.l.d with an explicit rounding mode (1 rtz, 2 rdn, 3 rup, 4 rmm)
+pub fn rv_fcvt_ld_rm(e: &mut NatEnc, rd: i64, fs: i64, rm: i64) { NatEnc_word(e, 0xC2200053 | (fs << 15) | (rm << 12) | (rd << 7)); }
+pub fn rv_fsqrt_d(e: &mut NatEnc, fd: i64, fs: i64) { NatEnc_word(e, 0x5A000053 | (fs << 15) | (7 << 12) | (fd << 7)); }
+pub fn rv_fsgnj_d(e: &mut NatEnc, fd: i64, a: i64, b: i64) { NatEnc_word(e, 0x22000053 | (b << 20) | (a << 15) | (fd << 7)); }
+pub fn rv_fsgnjx_d(e: &mut NatEnc, fd: i64, a: i64, b: i64) { NatEnc_word(e, 0x22002053 | (b << 20) | (a << 15) | (fd << 7)); }
+
+// Atomics (A extension), acquire + release
+pub fn rv_amoadd_d(e: &mut NatEnc, rd: i64, rs2: i64, rs1: i64) {
+    NatEnc_word(e, (0 << 27) | (1 << 26) | (1 << 25) | (rs2 << 20) | (rs1 << 15) | (3 << 12) | (rd << 7) | 0x2F);
+}
+pub fn rv_lr_d(e: &mut NatEnc, rd: i64, rs1: i64) {
+    NatEnc_word(e, (2 << 27) | (1 << 26) | (1 << 25) | (rs1 << 15) | (3 << 12) | (rd << 7) | 0x2F);
+}
+/// sc.d rd, rs2, (rs1): rd = 0 on success
+pub fn rv_sc_d(e: &mut NatEnc, rd: i64, rs2: i64, rs1: i64) {
+    NatEnc_word(e, (3 << 27) | (1 << 26) | (1 << 25) | (rs2 << 20) | (rs1 << 15) | (3 << 12) | (rd << 7) | 0x2F);
+}
+pub fn rv_fence(e: &mut NatEnc) { NatEnc_word(e, 0x0330000F); }
+pub fn rv_fcvt_sd(e: &mut NatEnc, fd: i64, fs: i64) { NatEnc_word(e, 0x40100053 | (fs << 15) | (7 << 12) | (fd << 7)); }
+
+// ===========================================================================
+// ELF: one PT_LOAD segment, the whole file at 0x400000, read/write/execute;
+// the image at file offset 0x1000 (NAT_IMAGE_BASE).
+// ===========================================================================
+
+fn nat_push_u16(out: Vec<i64>, v: i64) -> Vec<i64> {
+    var o = out;
+    o.push(v & 0xFF);
+    o.push((v >> 8) & 0xFF);
+    return o;
+}
+
+fn nat_push_u32(out: Vec<i64>, v: i64) -> Vec<i64> {
+    var o = out;
+    var i: i64 = 0;
+    while i < 4 {
+        o.push((v >> (i * 8)) & 0xFF);
+        i = i + 1;
+    }
+    return o;
+}
+
+fn nat_push_u64(out: Vec<i64>, v: i64) -> Vec<i64> {
+    var o = out;
+    var i: i64 = 0;
+    while i < 8 {
+        o.push((v >> (i * 8)) & 0xFF);
+        i = i + 1;
+    }
+    return o;
+}
+
+/// A static Linux executable of `image`, entered at image offset `entry`.
+pub fn nat_elf(arch: i64, image: Vec<i64>, entry: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var total: i64 = 0x1000 + image.len();
+    out.push(0x7F); out.push(0x45); out.push(0x4C); out.push(0x46);
+    out.push(2); out.push(1); out.push(1); out.push(0);   // ELF64, LE, v1, SysV
+    out = nat_push_u64(out, 0);                            // padding
+    out = nat_push_u16(out, 2);                            // ET_EXEC
+    var flags: i64 = 0;
+    if arch == NAT_A64 {
+        out = nat_push_u16(out, 183);                      // EM_AARCH64
+    } else {
+        out = nat_push_u16(out, 243);                      // EM_RISCV
+        flags = 4;                                         // double-float ABI
+    }
+    out = nat_push_u32(out, 1);                            // e_version
+    out = nat_push_u64(out, NAT_IMAGE_BASE + entry);       // e_entry
+    out = nat_push_u64(out, 64);                           // e_phoff
+    out = nat_push_u64(out, 0);                            // e_shoff
+    out = nat_push_u32(out, flags);                        // e_flags
+    out = nat_push_u16(out, 64);                           // e_ehsize
+    out = nat_push_u16(out, 56);                           // e_phentsize
+    out = nat_push_u16(out, 1);                            // e_phnum
+    out = nat_push_u16(out, 64);                           // e_shentsize
+    out = nat_push_u16(out, 0);                            // e_shnum
+    out = nat_push_u16(out, 0);                            // e_shstrndx
+    out = nat_push_u32(out, 1);                            // PT_LOAD
+    out = nat_push_u32(out, 7);                            // RWX
+    out = nat_push_u64(out, 0);                            // p_offset
+    out = nat_push_u64(out, 0x400000);                     // p_vaddr
+    out = nat_push_u64(out, 0x400000);                     // p_paddr
+    out = nat_push_u64(out, total);                        // p_filesz
+    out = nat_push_u64(out, total);                        // p_memsz
+    out = nat_push_u64(out, 0x10000);                      // p_align (64 KB pages too)
+    while out.len() < 0x1000 { out.push(0); }
+    var i: i64 = 0;
+    while i < image.len() {
+        out.push(image.get(i));
+        i = i + 1;
+    }
+    return out;
+}

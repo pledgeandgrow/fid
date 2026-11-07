@@ -1213,6 +1213,14 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
         }
         ri = ri + 1;
     }
+    // xmm6 and xmm7 are callee-saved, all 128 bits (id 100 + n)
+    var xsave: i64 = 6;
+    while xsave <= 7 {
+        if peir_has_i64(used_regs, 0x100 + xsave) {
+            self.saved_regs.push(PeOffEnt { id: 100 + xsave, offset: PeStackFrame_alloc_raw(&mut frame, 16) });
+        }
+        xsave = xsave + 1;
+    }
 
     // The outgoing argument area of every call, reserved once: shadow space
     // and the widest call's stack arguments
@@ -1266,7 +1274,11 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
     ri = 0;
     while ri < self.saved_regs.len() {
         var sr: PeOffEnt = self.saved_regs.get(ri);
-        PeirEnc_mov_mem_rbp_reg(&mut self.enc, sr.offset, sr.id);
+        if sr.id >= 100 {
+            PeirEnc_movdqu_mem_rbp_xmm(&mut self.enc, sr.offset, sr.id - 100);
+        } else {
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, sr.offset, sr.id);
+        }
         ri = ri + 1;
     }
 
@@ -1279,7 +1291,9 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
     var pi: i64 = 0;
     while pi < func.params.len() {
         var param: ValueIdType = func.params.get(pi);
-        if pi < 4 {
+        if param.id >= 0 && param.id < self.use_count.len() && self.use_count.get(param.id) == 0 {
+            // nothing reads it (a null environment, most often)
+        } else if pi < 4 {
             var poff: i64 = PeStackFrame_offset(&frame, param.id);
             PeirEnc_mov_mem_rbp_reg(&mut self.enc, poff, arg_regs.get(pi));
         } else {
@@ -1300,6 +1314,16 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
         bi = bi + 1;
     }
 
+    // Block id -> index, for loop rotation
+    var bindex: Vec<i64> = Vec::new();
+    bi = 0;
+    while bi < func.blocks.len() {
+        var bid: i64 = func.blocks.get(bi).id;
+        while bindex.len() <= bid { bindex.push(-1); }
+        bindex.set(bid, bi);
+        bi = bi + 1;
+    }
+
     // Generate code for each basic block
     bi = 0;
     while bi < func.blocks.len() {
@@ -1312,28 +1336,34 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
         if bi + 1 < func.blocks.len() {
             self.next_block = HashMap_get(self.block_labels, pe_block_key(name, func.blocks.get(bi + 1).id));
         }
-        var ii2: i64 = 0;
-        while ii2 < block2.instructions.len() {
-            var inst_id: i64 = block2.instructions.get(ii2);
-            var next_cond: i64 = -1;
-            if ii2 + 1 < block2.instructions.len() {
-                match IrFunction_get_inst(func, block2.instructions.get(ii2 + 1)) {
-                    OptInst::Some(ninst) => {
-                        match ninst {
-                            Inst::Branch(c2, _, _) => { next_cond = c2; }
-                            _ => {}
+        // Loop rotation (competitive OP11): a block that jumps back to a
+        // loop header made only of the loop's test runs that test itself,
+        // so each iteration takes one branch (to the body) instead of a
+        // jump to the header and a branch out of it
+        var ninsts: i64 = block2.instructions.len();
+        var rot: i64 = -1;
+        if PEIR_ROTATE && ninsts > 0 && use_regs {
+            match IrFunction_get_inst(func, block2.instructions.get(ninsts - 1)) {
+                OptInst::Some(lj) => {
+                    match lj {
+                        Inst::Jump(jt) => {
+                            if jt >= 0 && jt < bindex.len() && bindex.get(jt) >= 0 && bindex.get(jt) < bi
+                                && peir_rotatable(func, func.blocks.get(bindex.get(jt))) {
+                                rot = bindex.get(jt);
+                            }
                         }
+                        _ => {}
                     }
-                    OptInst::None => {}
-                }
-            }
-            match IrFunction_get_inst(func, inst_id) {
-                OptInst::Some(inst) => {
-                    PeirGen_gen_inst(self, inst_id, inst, next_cond, &mut frame, func, module, name);
                 }
                 OptInst::None => {}
             }
-            ii2 = ii2 + 1;
+        }
+        if rot >= 0 { ninsts = ninsts - 1; }
+        PeirGen_gen_insts(self, block2.instructions, ninsts, &mut frame, func, module, name);
+        if rot >= 0 {
+            var hb: BasicBlock = func.blocks.get(rot);
+            self.pending_cmp_cc = -1;
+            PeirGen_gen_insts(self, hb.instructions, hb.instructions.len(), &mut frame, func, module, name);
         }
         bi = bi + 1;
     }
@@ -1345,11 +1375,74 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
     PeirEnc_ret(&mut self.enc);
 }
 
+/// The first `n` instructions of a block (a compare is fused with the
+/// Branch after it).
+fn PeirGen_gen_insts(self: &mut PeirGen, ids: Vec<i64>, n: i64, frame: &mut PeStackFrame, func: &IrFunction, module: &IrModule, name: str) -> void {
+    var ii2: i64 = 0;
+    while ii2 < n {
+        var inst_id: i64 = ids.get(ii2);
+        var next_cond: i64 = -1;
+        if ii2 + 1 < ids.len() {
+            match IrFunction_get_inst(func, ids.get(ii2 + 1)) {
+                OptInst::Some(ninst) => {
+                    match ninst {
+                        Inst::Branch(c2, _, _) => { next_cond = c2; }
+                        _ => {}
+                    }
+                }
+                OptInst::None => {}
+            }
+        }
+        match IrFunction_get_inst(func, inst_id) {
+            OptInst::Some(inst) => {
+                PeirGen_gen_inst(self, inst_id, inst, next_cond, frame, func, module, name);
+            }
+            OptInst::None => {}
+        }
+        ii2 = ii2 + 1;
+    }
+}
+
+/// A loop header that only tests: a few loads, constants, integer
+/// operations and `len` calls, then the Branch. Its code may run again at
+/// the end of the loop's body (rotation): it writes nothing but its own
+/// values.
+fn peir_rotatable(func: &IrFunction, blk: BasicBlock) -> bool {
+    var n: i64 = blk.instructions.len();
+    if n == 0 || n > 12 { return false; }
+    var i: i64 = 0;
+    while i < n {
+        match IrFunction_get_inst(func, blk.instructions.get(i)) {
+            OptInst::Some(inst) => {
+                var last: bool = i == n - 1;
+                match inst {
+                    Inst::Branch(_, _, _) => { if !last { return false; } }
+                    Inst::Load(_, _) => { if last { return false; } }
+                    Inst::ConstInt(_, _) => { if last { return false; } }
+                    Inst::ConstBool(_) => { if last { return false; } }
+                    Inst::BinOp(_, _, _, ty) => { if last || ir_type_is_float(ty) { return false; } }
+                    Inst::Call(cn, _, _, _) => {
+                        if last || !(cn == "Vec_len" || cn == "p_vec_len") { return false; }
+                    }
+                    _ => { return false; }
+                }
+            }
+            OptInst::None => { return false; }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
 fn PeirGen_restore_regs(self: &mut PeirGen) -> void {
     var i: i64 = 0;
     while i < self.saved_regs.len() {
         var sr: PeOffEnt = self.saved_regs.get(i);
-        PeirEnc_mov_reg_mem_rbp(&mut self.enc, sr.id, sr.offset);
+        if sr.id >= 100 {
+            PeirEnc_movdqu_xmm_mem_rbp(&mut self.enc, sr.id - 100, sr.offset);
+        } else {
+            PeirEnc_mov_reg_mem_rbp(&mut self.enc, sr.id, sr.offset);
+        }
         i = i + 1;
     }
 }
@@ -1408,6 +1501,29 @@ fn peir_value_float(func: &IrFunction, id: i64) -> bool {
     }
 }
 
+/// A call PeirGen_inline_vec_call writes in place: it reads its constant
+/// arguments as immediates (load_operand), and its environment not at all.
+fn peir_inline_vec_imm(module: &IrModule, callee: str, cargs: Vec<i64>) -> bool {
+    var known: bool = false;
+    match IrModule_get_function(module, callee) {
+        OptIrFunction::Some(_) => { known = true; }
+        OptIrFunction::None => {}
+    }
+    if !known { return false; }
+    if callee == "Vec_len" { return cargs.len() >= 1; }
+    if callee == "Vec_get" { return cargs.len() >= 2; }
+    if callee == "Vec_set" { return cargs.len() >= 3; }
+    if callee == "Vec_push" { return cargs.len() == 3; }
+    return false;
+}
+
+fn peir_value_f64(func: &IrFunction, id: i64) -> bool {
+    match IrFunction_get_meta(func, id) {
+        OptValueMeta::Some(m) => { return ir_type_eq(m.ty, IrType::F64); }
+        OptValueMeta::None => { return false; }
+    }
+}
+
 fn peir_value_word(func: &IrFunction, module: &IrModule, id: i64) -> bool {
     match IrFunction_get_meta(func, id) {
         OptValueMeta::Some(m) => { return peir_reg_word(module, m.ty); }
@@ -1444,6 +1560,14 @@ fn peir_loop_back(index: Vec<i64>, depth: &mut Vec<i64>, target: i64, at: i64) {
 // ===========================================================================
 
 const PEIR_GLOBAL_RA: bool = true;
+/// Copy coalescing: a local's loads and stores share its register (OP16)
+const PEIR_COALESCE: bool = true;
+/// r10 and r11, and xmm2-xmm5, for values no call crosses (OP16)
+const PEIR_VOLATILE_RA: bool = true;
+/// f64 values and locals in xmm registers (OP17)
+const PEIR_XMM_RA: bool = true;
+/// Loop rotation: a loop's test copied to the end of its body (OP11)
+const PEIR_ROTATE: bool = true;
 
 /// What pick_reg_vars works out, for the allocator: per alloca its weight
 /// + 1 when it is a candidate and whether it must stay in memory; per block
@@ -1468,28 +1592,197 @@ fn peir_bs_set(bs: &mut Vec<i64>, base: i64, k: i64) {
     bs.set(w, bs.get(w) | (1 << (k % 64)));
 }
 
+/// Whether an instruction's code leaves r10, r11 and xmm2-xmm5 alone (no
+/// call, no use of them as scratch), so a value may stay in one across it.
+fn peir_ra_volatile_safe(module: &IrModule, inst: Inst) -> bool {
+    match inst {
+        Inst::ConstInt(_, _) => { return true; }
+        Inst::ConstBool(_) => { return true; }
+        Inst::ConstNull(_) => { return true; }
+        Inst::ConstFloat(_, _) => { return true; }
+        Inst::ConstStr(_) => { return true; }
+        Inst::ConstFnRef(_) => { return true; }
+        Inst::GlobalAddr(_, _) => { return true; }
+        Inst::BinOp(_, _, _, _) => { return true; }
+        Inst::UnaryOp(_, _, _) => { return true; }
+        Inst::Alloca(_, _) => { return true; }
+        Inst::Load(_, ty) => { return peir_reg_type(module, ty) || ir_type_eq(ty, IrType::F64); }
+        Inst::Store(_, _, sty) => {
+            match sty {
+                OptIrType::Some(t) => { return peir_reg_type(module, t) || ir_type_eq(t, IrType::F64); }
+                OptIrType::None => { return true; }
+            }
+        }
+        Inst::GetFieldPtr(_, _, _) => { return true; }
+        Inst::GetElemPtr(_, _, _) => { return true; }
+        Inst::IntExtend(_, _, _) => { return true; }
+        Inst::IntTrunc(_, _, _) => { return true; }
+        Inst::BitCast(_, _, _) => { return true; }
+        Inst::IntToFloat(_, _, _) => { return true; }
+        Inst::FloatToInt(_, _, _) => { return true; }
+        Inst::Jump(_) => { return true; }
+        Inst::Branch(_, _, _) => { return true; }
+        Inst::Return(_) => { return true; }
+        _ => { return false; }
+    }
+}
+
+/// An instruction that reads its operands before it calls anything: a
+/// value may end its life in a caller-saved register there. (At most four
+/// arguments: a fifth goes to the stack through r10.)
+fn peir_ra_reads_first(inst: Inst) -> bool {
+    match inst {
+        Inst::Call(_, args, _, _) => { return args.len() <= 4; }
+        _ => { return false; }
+    }
+}
+
+/// An instruction that writes its result after any call it makes.
+fn peir_ra_writes_last(inst: Inst) -> bool {
+    match inst {
+        Inst::Call(_, _, _, _) => { return true; }
+        Inst::CallPtr(_, _, _, _, _) => { return true; }
+        _ => { return false; }
+    }
+}
+
+/// Linear scan of the candidates with part[c] == 1 over `nregs` registers;
+/// registers [0, nfixed) any candidate may get, the others (caller-saved)
+/// only one with vok[c] == 1. A candidate prefers the register of hint[c]
+/// when that is free where it starts. Returns per candidate its register
+/// index or -1 (in memory).
+fn peir_ra_scan(nc: i64, lo: &Vec<i64>, hi: &Vec<i64>, wt: &Vec<i64>, part: &Vec<i64>, vok: &Vec<i64>, hint: &Vec<i64>, nregs: i64, nfixed: i64, npos: i64) -> Vec<i64> {
+    var reg_of: Vec<i64> = Vec::new();
+    while reg_of.len() < nc { reg_of.push(-1); }
+    var head: Vec<i64> = Vec::new();
+    while head.len() < npos { head.push(-1); }
+    var nxt: Vec<i64> = Vec::new();
+    while nxt.len() < nc { nxt.push(-1); }
+    var ci: i64 = nc - 1;
+    while ci >= 0 {
+        if part.get(ci) == 1 && hi.get(ci) >= lo.get(ci) && lo.get(ci) + 1 < npos {
+            var slot: i64 = lo.get(ci) + 1;
+            nxt.set(ci, head.get(slot));
+            head.set(slot, ci);
+        }
+        ci = ci - 1;
+    }
+    var active: Vec<i64> = Vec::new();
+    while active.len() < nregs { active.push(-1); }
+    var p: i64 = 0;
+    while p < npos {
+        var cur: i64 = head.get(p);
+        while cur >= 0 {
+            var clo: i64 = lo.get(cur);
+            var r: i64 = 0;
+            while r < nregs {
+                var a: i64 = active.get(r);
+                // an operand whose last use is where `cur` is defined: read
+                // before the result is written, so they may share
+                if a >= 0 && hi.get(a) <= clo && !(lo.get(a) == -1 && clo == -1) { active.set(r, -1); }
+                r = r + 1;
+            }
+            var can_vol: bool = vok.get(cur) == 1;
+            var pick: i64 = -1;
+            var h: i64 = hint.get(cur);
+            if h >= 0 && reg_of.get(h) >= 0 {
+                var hr: i64 = reg_of.get(h);
+                if active.get(hr) < 0 && (hr < nfixed || can_vol) { pick = hr; }
+            }
+            if pick < 0 && can_vol {
+                // a caller-saved register costs no save and restore
+                r = nfixed;
+                while r < nregs && pick < 0 {
+                    if active.get(r) < 0 { pick = r; }
+                    r = r + 1;
+                }
+            }
+            r = 0;
+            while r < nfixed && pick < 0 {
+                if active.get(r) < 0 { pick = r; }
+                r = r + 1;
+            }
+            if pick >= 0 {
+                active.set(pick, cur);
+                reg_of.set(cur, pick);
+            } else {
+                // The coldest of the active ones (and `cur`) stays in memory
+                var worst: i64 = -1;
+                r = 0;
+                while r < nregs {
+                    if r < nfixed || can_vol {
+                        var a2: i64 = active.get(r);
+                        if worst < 0 || wt.get(a2) < wt.get(active.get(worst))
+                            || (wt.get(a2) == wt.get(active.get(worst)) && hi.get(a2) > hi.get(active.get(worst))) {
+                            worst = r;
+                        }
+                    }
+                    r = r + 1;
+                }
+                if worst >= 0 {
+                    var victim: i64 = active.get(worst);
+                    if wt.get(victim) < wt.get(cur) {
+                        reg_of.set(victim, -1);
+                        active.set(worst, cur);
+                        reg_of.set(cur, worst);
+                    }
+                }
+            }
+            cur = nxt.get(cur);
+        }
+        p = p + 1;
+    }
+    return reg_of;
+}
+
+/// The xmm register of index i of the float register file: xmm6 and xmm7
+/// (callee-saved), then xmm2-xmm5 (caller-saved).
+fn peir_ra_xmm(i: i64) -> i64 {
+    if i == 0 { return 6; }
+    if i == 1 { return 7; }
+    return i;
+}
+
+/// Is BinOp `op` of type `ty` one that int_binop_in_reg computes into its
+/// result's register from the left operand?
+fn peir_ra_in_reg_op(op: BinOp, ty: IrType) -> bool {
+    if !ir_type_eq(ty, IrType::I64) { return false; }
+    match op {
+        BinOp::Add => { return true; }
+        BinOp::Sub => { return true; }
+        BinOp::Mul => { return true; }
+        BinOp::BitAnd => { return true; }
+        BinOp::BitOr => { return true; }
+        BinOp::BitXor => { return true; }
+        _ => { return false; }
+    }
+}
+
 /// Allocate registers for the whole function; returns the value registers
-/// used. SSA values that got one are in `in_reg` (1 + register); locals in
-/// frame.reg_vars.
+/// used (0-8 the general ones, 0x100 + n xmm n). SSA values that got one
+/// are in `in_reg` (1 + register); locals in frame.reg_vars.
 fn peir_global_ra(func: &IrFunction, module: &IrModule, frame: &mut PeStackFrame, no_reg: &mut Vec<i64>, nvals: i64, facts: &PeirRaFacts, in_reg: &mut Vec<i64>) -> Vec<i64> {
     var nb: i64 = func.blocks.len();
     var used: Vec<i64> = Vec::new();
     if nb == 0 { return used; }
     var ops: Vec<i64> = Vec::new();
     // TryUnwrap's second result has a slot of its own
+    var fl_bad: Vec<i64> = peir_zeros(nvals);
     var ii: i64 = 0;
     while ii < func.insts.len() {
         match func.insts.get(ii).inst {
-            Inst::TryUnwrap(_, okd, _, _) => { peir_mark(no_reg, okd, nvals); }
+            Inst::TryUnwrap(_, okd, _, _) => { peir_mark(no_reg, okd, nvals); peir_mark(&mut fl_bad, okd, nvals); }
             _ => {}
         }
         ii = ii + 1;
     }
-    // Candidates: value id -> candidate index, and whether it is a local
+    // Candidates: value id -> candidate index, whether it is a local, and
+    // whether it is an f64 (the xmm file)
     var cidx: Vec<i64> = Vec::new();
     while cidx.len() < nvals { cidx.push(-1); }
     var cand: Vec<i64> = Vec::new();
     var is_local: Vec<i64> = Vec::new();
+    var is_flt: Vec<i64> = Vec::new();
     var defined: Vec<i64> = peir_zeros(nvals);
     var b: i64 = 0;
     while b < nb {
@@ -1502,21 +1795,34 @@ fn peir_global_ra(func: &IrFunction, module: &IrModule, frame: &mut PeStackFrame
                     OptInst::Some(inst) => {
                         match inst {
                             Inst::Alloca(ty, _) => {
-                                if facts.weight.len() > id && facts.weight.get(id) != 0 && facts.bad.get(id) == 0
-                                    && peir_reg_word(module, ty) && cidx.get(id) < 0 {
-                                    cidx.set(id, cand.len());
-                                    cand.push(id);
-                                    is_local.push(1);
+                                if facts.weight.len() > id && facts.weight.get(id) != 0 && facts.bad.get(id) == 0 && cidx.get(id) < 0 {
+                                    if peir_reg_word(module, ty) {
+                                        cidx.set(id, cand.len());
+                                        cand.push(id);
+                                        is_local.push(1);
+                                        is_flt.push(0);
+                                    } else if PEIR_XMM_RA && ir_type_eq(ty, IrType::F64) {
+                                        cidx.set(id, cand.len());
+                                        cand.push(id);
+                                        is_local.push(1);
+                                        is_flt.push(1);
+                                    }
                                 }
                             }
                             _ => {
-                                if defined.get(id) == 0 && no_reg.get(id) == 0 && cidx.get(id) < 0 {
+                                if defined.get(id) == 0 && cidx.get(id) < 0 {
                                     match IrFunction_get_meta(func, id) {
                                         OptValueMeta::Some(vm) => {
-                                            if peir_reg_type(module, vm.ty) {
+                                            if no_reg.get(id) == 0 && peir_reg_type(module, vm.ty) {
                                                 cidx.set(id, cand.len());
                                                 cand.push(id);
                                                 is_local.push(0);
+                                                is_flt.push(0);
+                                            } else if PEIR_XMM_RA && ir_type_eq(vm.ty, IrType::F64) && fl_bad.get(id) == 0 {
+                                                cidx.set(id, cand.len());
+                                                cand.push(id);
+                                                is_local.push(0);
+                                                is_flt.push(1);
                                             }
                                         }
                                         OptValueMeta::None => {}
@@ -1536,11 +1842,18 @@ fn peir_global_ra(func: &IrFunction, module: &IrModule, frame: &mut PeStackFrame
     var pi: i64 = 0;
     while pi < func.params.len() {
         var prm: ValueIdType = func.params.get(pi);
-        if prm.id >= 0 && prm.id < nvals && cidx.get(prm.id) < 0 && no_reg.get(prm.id) == 0
-            && peir_reg_word(module, prm.ty) {
-            cidx.set(prm.id, cand.len());
-            cand.push(prm.id);
-            is_local.push(0);
+        if prm.id >= 0 && prm.id < nvals && cidx.get(prm.id) < 0 {
+            if no_reg.get(prm.id) == 0 && peir_reg_word(module, prm.ty) {
+                cidx.set(prm.id, cand.len());
+                cand.push(prm.id);
+                is_local.push(0);
+                is_flt.push(0);
+            } else if PEIR_XMM_RA && ir_type_eq(prm.ty, IrType::F64) && fl_bad.get(prm.id) == 0 {
+                cidx.set(prm.id, cand.len());
+                cand.push(prm.id);
+                is_local.push(0);
+                is_flt.push(1);
+            }
         }
         pi = pi + 1;
     }
@@ -1557,6 +1870,36 @@ fn peir_global_ra(func: &IrFunction, module: &IrModule, frame: &mut PeStackFrame
     while ci < nc { lo.push(1 << 60); hi.push(-2); ci = ci + 1; }
     var bstart: Vec<i64> = peir_zeros(nb);
     var bend: Vec<i64> = peir_zeros(nb);
+    // For coalescing: where a candidate is defined, which local it was
+    // loaded from, its operands, its uses; every load and store of a local
+    var def_pos: Vec<i64> = Vec::new();
+    var def_blk: Vec<i64> = Vec::new();
+    var ld_from: Vec<i64> = Vec::new();
+    var bin_l: Vec<i64> = Vec::new();
+    var bin_r: Vec<i64> = Vec::new();
+    var hint: Vec<i64> = Vec::new();
+    var nuse: Vec<i64> = peir_zeros(nc);
+    ci = 0;
+    while ci < nc {
+        def_pos.push(-1);
+        def_blk.push(-1);
+        ld_from.push(-1);
+        bin_l.push(-1);
+        bin_r.push(-1);
+        hint.push(-1);
+        ci = ci + 1;
+    }
+    var ld_pos: Vec<i64> = Vec::new();
+    var ld_loc: Vec<i64> = Vec::new();
+    var ld_val: Vec<i64> = Vec::new();
+    var st_pos: Vec<i64> = Vec::new();
+    var st_loc: Vec<i64> = Vec::new();
+    var st_val: Vec<i64> = Vec::new();
+    // Per position: whether a caller-saved register survives the
+    // instruction, may end its life there, or start it there
+    var p_safe: Vec<i64> = Vec::new();
+    var p_hi_ok: Vec<i64> = Vec::new();
+    var p_lo_ok: Vec<i64> = Vec::new();
     // Parameters are defined before the first instruction (position -1)
     pi = 0;
     while pi < func.params.len() {
@@ -1584,14 +1927,48 @@ fn peir_global_ra(func: &IrFunction, module: &IrModule, frame: &mut PeStackFrame
         var k: i64 = 0;
         while k < ids.len() {
             var id: i64 = ids.get(k);
+            var safe: bool = false;
+            var hi_ok: bool = false;
+            var lo_ok: bool = false;
             match IrFunction_get_inst(func, id) {
                 OptInst::Some(inst) => {
+                    safe = peir_ra_volatile_safe(module, inst);
+                    hi_ok = safe || peir_ra_reads_first(inst);
+                    lo_ok = safe || peir_ra_writes_last(inst);
                     // The local a Store writes is defined, not read
                     var stored: i64 = -1;
                     match inst {
                         Inst::Store(sptr, svalue, _) => {
                             if sptr >= 0 && sptr < nvals && sptr != svalue && cidx.get(sptr) >= 0 && is_local.get(cidx.get(sptr)) == 1 {
                                 stored = sptr;
+                                st_pos.push(pos);
+                                st_loc.push(cidx.get(sptr));
+                                st_val.push(svalue);
+                            }
+                        }
+                        Inst::Load(lptr, _) => {
+                            if lptr >= 0 && lptr < nvals && cidx.get(lptr) >= 0 && is_local.get(cidx.get(lptr)) == 1 {
+                                var lk: i64 = -1;
+                                if id >= 0 && id < nvals && cidx.get(id) >= 0 && is_local.get(cidx.get(id)) == 0 {
+                                    lk = cidx.get(id);
+                                    ld_from.set(lk, cidx.get(lptr));
+                                }
+                                ld_pos.push(pos);
+                                ld_loc.push(cidx.get(lptr));
+                                ld_val.push(lk);
+                            }
+                        }
+                        Inst::BinOp(bop, bl, br, bty) => {
+                            if id >= 0 && id < nvals && cidx.get(id) >= 0 && is_local.get(cidx.get(id)) == 0 {
+                                var bk: i64 = cidx.get(id);
+                                if bl >= 0 && bl < nvals && cidx.get(bl) >= 0 && is_flt.get(cidx.get(bl)) == is_flt.get(bk) {
+                                    hint.set(bk, cidx.get(bl));
+                                }
+                                if peir_ra_in_reg_op(bop, bty) && bl >= 0 && bl < nvals && cidx.get(bl) >= 0 {
+                                    bin_l.set(bk, cidx.get(bl));
+                                    if br >= 0 && br < nvals && cidx.get(br) >= 0 { bin_r.set(bk, cidx.get(br)); }
+                                    else { bin_r.set(bk, -2); }
+                                }
                             }
                         }
                         _ => {}
@@ -1607,6 +1984,7 @@ fn peir_global_ra(func: &IrFunction, module: &IrModule, frame: &mut PeStackFrame
                             if pos < lo.get(ck) { lo.set(ck, pos); }
                             if pos > hi.get(ck) { hi.set(ck, pos); }
                             wt.set(ck, wt.get(ck) + cost);
+                            nuse.set(ck, nuse.get(ck) + 1);
                         }
                         o = o + 1;
                     }
@@ -1618,10 +1996,17 @@ fn peir_global_ra(func: &IrFunction, module: &IrModule, frame: &mut PeStackFrame
                         if pos < lo.get(dk) { lo.set(dk, pos); }
                         if pos > hi.get(dk) { hi.set(dk, pos); }
                         wt.set(dk, wt.get(dk) + cost);
+                        if dv == id {
+                            def_pos.set(dk, pos);
+                            def_blk.set(dk, b);
+                        }
                     }
                 }
                 OptInst::None => {}
             }
+            if safe { p_safe.push(1); } else { p_safe.push(0); }
+            if hi_ok { p_hi_ok.push(1); } else { p_hi_ok.push(0); }
+            if lo_ok { p_lo_ok.push(1); } else { p_lo_ok.push(0); }
             pos = pos + 1;
             k = k + 1;
         }
@@ -1710,80 +2095,200 @@ fn peir_global_ra(func: &IrFunction, module: &IrModule, frame: &mut PeStackFrame
         }
         b = b + 1;
     }
-    // Candidates by start: a bucket per position (-1 for parameters)
-    var npos: i64 = pos + 2;
-    var head: Vec<i64> = Vec::new();
-    while head.len() < npos { head.push(-1); }
-    var nxt: Vec<i64> = Vec::new();
-    while nxt.len() < nc { nxt.push(-1); }
-    ci = nc - 1;
-    while ci >= 0 {
-        if hi.get(ci) >= lo.get(ci) && lo.get(ci) + 1 < npos {
-            var slot: i64 = lo.get(ci) + 1;
-            nxt.set(ci, head.get(slot));
-            head.set(slot, ci);
-        }
-        ci = ci - 1;
-    }
-    // Linear scan over PEIR_VALUE_REGS registers
-    var active: Vec<i64> = Vec::new();
-    while active.len() < PEIR_VALUE_REGS { active.push(-1); }
-    var reg_of: Vec<i64> = Vec::new();
-    while reg_of.len() < nc { reg_of.push(-1); }
-    var p: i64 = 0;
-    while p < npos {
-        var cur: i64 = head.get(p);
-        while cur >= 0 {
-            var clo: i64 = lo.get(cur);
-            var r: i64 = 0;
-            var free: i64 = -1;
-            while r < PEIR_VALUE_REGS {
-                var a: i64 = active.get(r);
-                // an operand whose last use is where `cur` is defined: read
-                // before the result is written, so they may share
-                if a >= 0 && hi.get(a) <= clo && !(lo.get(a) == -1 && clo == -1) { active.set(r, -1); a = -1; }
-                if a < 0 && free < 0 { free = r; }
-                r = r + 1;
-            }
-            if free >= 0 {
-                active.set(free, cur);
-                reg_of.set(cur, free);
-            } else {
-                // The coldest of the active ones (and `cur`) stays in memory
-                var worst: i64 = -1;
-                r = 0;
-                while r < PEIR_VALUE_REGS {
-                    var a2: i64 = active.get(r);
-                    if worst < 0 || wt.get(a2) < wt.get(active.get(worst))
-                        || (wt.get(a2) == wt.get(active.get(worst)) && hi.get(a2) > hi.get(active.get(worst))) {
-                        worst = r;
+    // ── Copy coalescing (competitive OP16) ──
+    // A local A in a register and the SSA values that only copy it share
+    // its register, so the moves disappear:
+    //  - a Load of A whose value lives in the block, while nothing stores
+    //    to A (it holds A's contents);
+    //  - a value stored into A, defined in that block, while A's old
+    //    contents are dead from its definition to the store (it holds A's
+    //    next contents);
+    //  - the left operand of such a value's add/sub/mul/and/or/xor when that
+    //    is its only use (computed in place: `add rA, x`).
+    // Members are left out of the scan; A's interval covers theirs.
+    var alias: Vec<i64> = Vec::new();
+    var root: Vec<i64> = Vec::new();
+    ci = 0;
+    while ci < nc { alias.push(-1); root.push(-1); ci = ci + 1; }
+    if PEIR_COALESCE {
+        // Loads
+        ci = 0;
+        while ci < nc {
+            var la: i64 = ld_from.get(ci);
+            if la >= 0 && is_flt.get(la) == is_flt.get(ci) && lo.get(ci) == def_pos.get(ci) && def_blk.get(ci) >= 0
+                && hi.get(ci) >= lo.get(ci) && hi.get(ci) <= bend.get(def_blk.get(ci)) {
+                var ok: bool = true;
+                var si: i64 = 0;
+                while si < st_pos.len() && ok {
+                    if st_loc.get(si) == la && st_pos.get(si) > lo.get(ci) && st_pos.get(si) <= hi.get(ci)
+                        && st_val.get(si) != cand.get(ci) {
+                        ok = false;
                     }
-                    r = r + 1;
+                    si = si + 1;
                 }
-                var victim: i64 = active.get(worst);
-                if wt.get(victim) < wt.get(cur) {
-                    reg_of.set(victim, -1);
-                    active.set(worst, cur);
-                    reg_of.set(cur, worst);
+                if ok { alias.set(ci, la); }
+            }
+            ci = ci + 1;
+        }
+        // Stores, in order
+        var sj: i64 = 0;
+        while sj < st_pos.len() {
+            var a0: i64 = st_loc.get(sj);
+            var sv: i64 = st_val.get(sj);
+            var s0: i64 = st_pos.get(sj);
+            if sv >= 0 && sv < nvals && cidx.get(sv) >= 0 {
+                var wk: i64 = cidx.get(sv);
+                var cur: i64 = wk;
+                var first: bool = true;
+                while cur >= 0 {
+                    var ok2: bool = is_local.get(cur) == 0 && alias.get(cur) < 0 && is_flt.get(cur) == is_flt.get(a0)
+                        && def_blk.get(cur) >= 0 && lo.get(cur) == def_pos.get(cur) && lo.get(cur) < s0
+                        && s0 <= bend.get(def_blk.get(cur)) && s0 >= bstart.get(def_blk.get(cur))
+                        && hi.get(cur) <= bend.get(def_blk.get(cur));
+                    if ok2 && !first {
+                        // the operand of the previous member, used only there
+                        ok2 = nuse.get(cur) == 1;
+                    }
+                    if ok2 && first {
+                        // no other store to A while it lives
+                        var t: i64 = 0;
+                        while t < st_pos.len() && ok2 {
+                            if t != sj && st_loc.get(t) == a0 && st_pos.get(t) > lo.get(cur) && st_pos.get(t) <= hi.get(cur) { ok2 = false; }
+                            t = t + 1;
+                        }
+                    }
+                    if ok2 {
+                        // A's old contents are dead in (lo, s0): no load of A
+                        // there, and no member of A alive there
+                        var t2: i64 = 0;
+                        while t2 < ld_pos.len() && ok2 {
+                            if ld_loc.get(t2) == a0 && ld_pos.get(t2) > lo.get(cur) && ld_pos.get(t2) < s0 { ok2 = false; }
+                            t2 = t2 + 1;
+                        }
+                        var m: i64 = 0;
+                        while m < nc && ok2 {
+                            if alias.get(m) == a0 && root.get(m) != sj
+                                && !(hi.get(m) <= lo.get(cur) || lo.get(m) >= s0) { ok2 = false; }
+                            m = m + 1;
+                        }
+                    }
+                    if !ok2 { break; }
+                    alias.set(cur, a0);
+                    root.set(cur, sj);
+                    first = false;
+                    // The left operand of a value computed in place
+                    var nl: i64 = bin_l.get(cur);
+                    var nr: i64 = bin_r.get(cur);
+                    if nl < 0 || nl == a0 || (nr >= 0 && (nr == a0 || alias.get(nr) == a0)) { break; }
+                    if hi.get(nl) != lo.get(cur) || def_blk.get(nl) != def_blk.get(cur) { break; }
+                    cur = nl;
                 }
             }
-            cur = nxt.get(cur);
+            sj = sj + 1;
         }
-        p = p + 1;
+    }
+    // A's interval and weight take in its members'
+    var olo: Vec<i64> = Vec::new();
+    var ohi: Vec<i64> = Vec::new();
+    var owt: Vec<i64> = Vec::new();
+    ci = 0;
+    while ci < nc { olo.push(lo.get(ci)); ohi.push(hi.get(ci)); owt.push(wt.get(ci)); ci = ci + 1; }
+    ci = 0;
+    while ci < nc {
+        var al: i64 = alias.get(ci);
+        if al >= 0 {
+            if lo.get(ci) < lo.get(al) { lo.set(al, lo.get(ci)); }
+            if hi.get(ci) > hi.get(al) { hi.set(al, hi.get(ci)); }
+            wt.set(al, wt.get(al) + wt.get(ci));
+        }
+        ci = ci + 1;
+    }
+    var npos: i64 = pos + 2;
+    // Unsafe positions, counted from the start: an interval may use a
+    // caller-saved register when none lies inside it
+    var unsafe_before: Vec<i64> = Vec::new();
+    var cnt: i64 = 0;
+    var q: i64 = 0;
+    while q < p_safe.len() {
+        unsafe_before.push(cnt);
+        if p_safe.get(q) == 0 { cnt = cnt + 1; }
+        q = q + 1;
+    }
+    unsafe_before.push(cnt);
+    var reg_gp: Vec<i64> = Vec::new();
+    var reg_x: Vec<i64> = Vec::new();
+    var round: i64 = 0;
+    while round < 3 {
+        var vok: Vec<i64> = peir_zeros(nc);
+        var part_gp: Vec<i64> = peir_zeros(nc);
+        var part_x: Vec<i64> = peir_zeros(nc);
+        ci = 0;
+        while ci < nc {
+            if alias.get(ci) < 0 && !(lo.get(ci) == -1 && hi.get(ci) == -1 && nuse.get(ci) == 0) {
+                if is_flt.get(ci) == 1 { part_x.set(ci, 1); } else { part_gp.set(ci, 1); }
+                var l0: i64 = lo.get(ci);
+                var h0: i64 = hi.get(ci);
+                if PEIR_VOLATILE_RA && h0 >= l0 && h0 < p_safe.len() {
+                    var good: bool = true;
+                    if l0 >= 0 && p_lo_ok.get(l0) == 0 { good = false; }
+                    if h0 > l0 && p_hi_ok.get(h0) == 0 { good = false; }
+                    var from: i64 = l0 + 1;
+                    if from < 0 { from = 0; }
+                    if h0 > from && unsafe_before.get(h0) - unsafe_before.get(from) > 0 { good = false; }
+                    if good { vok.set(ci, 1); }
+                }
+            }
+            ci = ci + 1;
+        }
+        reg_gp = peir_ra_scan(nc, &lo, &hi, &wt, &part_gp, &vok, &hint, PEIR_ALL_REGS, PEIR_VALUE_REGS, npos);
+        reg_x = peir_ra_scan(nc, &lo, &hi, &wt, &part_x, &vok, &hint, 6, 2, npos);
+        // A local left in memory: its members get registers of their own
+        var again: bool = false;
+        ci = 0;
+        while ci < nc {
+            var al2: i64 = alias.get(ci);
+            if al2 >= 0 && reg_gp.get(al2) < 0 && reg_x.get(al2) < 0 {
+                alias.set(ci, -1);
+                lo.set(al2, olo.get(al2));
+                hi.set(al2, ohi.get(al2));
+                wt.set(al2, owt.get(al2));
+                again = true;
+            }
+            ci = ci + 1;
+        }
+        if !again { break; }
+        // the locals that kept members take them in again
+        ci = 0;
+        while ci < nc {
+            var al3: i64 = alias.get(ci);
+            if al3 >= 0 {
+                if lo.get(ci) < lo.get(al3) { lo.set(al3, lo.get(ci)); }
+                if hi.get(ci) > hi.get(al3) { hi.set(al3, hi.get(ci)); }
+            }
+            ci = ci + 1;
+        }
+        round = round + 1;
     }
     // Results
     ci = 0;
     while ci < nc {
-        var rr: i64 = reg_of.get(ci);
-        if rr >= 0 {
+        var owner: i64 = ci;
+        if alias.get(ci) >= 0 { owner = alias.get(ci); }
+        var slotreg: i64 = -1;
+        if is_flt.get(ci) == 1 {
+            if reg_x.get(owner) >= 0 { slotreg = 0x100 + peir_ra_xmm(reg_x.get(owner)); }
+        } else if reg_gp.get(owner) >= 0 {
+            slotreg = reg_gp.get(owner);
+        }
+        if slotreg >= 0 {
             var v: i64 = cand.get(ci);
             if is_local.get(ci) == 1 {
-                pe_idmap_put(&mut frame.reg_vars, v, PEIR_REG_SLOT + rr);
+                pe_idmap_put(&mut frame.reg_vars, v, PEIR_REG_SLOT + slotreg);
             } else {
-                in_reg.set(v, rr + 1);
+                in_reg.set(v, slotreg + 1);
             }
             peir_mark(no_reg, v, nvals);
-            if !peir_has_i64(used, rr) { used.push(rr); }
+            if !peir_has_i64(used, slotreg) { used.push(slotreg); }
         }
         ci = ci + 1;
     }
@@ -1840,7 +2345,7 @@ fn peir_pick_reg_vars(func: &IrFunction, module: &IrModule, frame: &mut PeStackF
                 OptInst::Some(inst) => {
                     match inst {
                         Inst::Alloca(ty, _) => {
-                            if peir_reg_word(module, ty) && id < nvals { weight.set(id, 1); }
+                            if (peir_reg_word(module, ty) || (PEIR_XMM_RA && PEIR_GLOBAL_RA && limit == 0 && ir_type_eq(ty, IrType::F64))) && id < nvals { weight.set(id, 1); }
                         }
                         _ => {}
                     }
@@ -1894,13 +2399,14 @@ fn peir_pick_reg_vars(func: &IrFunction, module: &IrModule, frame: &mut PeStackF
                             var whole: bool = false;
                             match inst {
                                 Inst::Load(ptr, ty) => {
-                                    whole = ptr == op && peir_reg_word(module, ty);
+                                    whole = ptr == op && (peir_reg_word(module, ty) || (PEIR_XMM_RA && PEIR_GLOBAL_RA && ir_type_eq(ty, IrType::F64)));
                                 }
                                 Inst::Store(ptr, value, sty) => {
-                                    whole = ptr == op && value != op && peir_value_word(func, module, value);
+                                    var fval: bool = PEIR_XMM_RA && PEIR_GLOBAL_RA && peir_value_f64(func, value);
+                                    whole = ptr == op && value != op && (peir_value_word(func, module, value) || fval);
                                     match sty {
                                         OptIrType::Some(t) => {
-                                            if !peir_reg_word(module, t) { whole = false; }
+                                            if !peir_reg_word(module, t) && !(fval && ir_type_eq(t, IrType::F64)) { whole = false; }
                                         }
                                         OptIrType::None => {}
                                     }
@@ -1996,7 +2502,7 @@ fn peir_pick_reg_vars(func: &IrFunction, module: &IrModule, frame: &mut PeStackF
                                 // A call's null environment: the generic call
                                 // path loads constant arguments as immediates
                                 Inst::Call(callee, cargs, _, _) => {
-                                    imm = peir_env_imm(module, callee, cargs, op);
+                                    imm = peir_env_imm(module, callee, cargs, op) || peir_inline_vec_imm(module, callee, cargs);
                                 }
                                 _ => {}
                             }
@@ -2083,7 +2589,7 @@ pub fn PeirGen_gen_inst(
     func_name: str,
 ) -> void {
     var dst: i64 = PeStackFrame_offset(frame, id);
-    self.cur_unchecked = id < self.unchecked.len() && self.unchecked.get(id) != 0;
+    self.cur_unchecked = id < self.unchecked.len() && (self.unchecked.get(id) & 1) != 0;
 
     match inst {
         // --- Constants ---
@@ -2166,6 +2672,13 @@ pub fn PeirGen_gen_inst(
                 OptValueMeta::None => {}
             }
             var unsigned_cmp: bool = ir_type_eq(operand_ty, IrType::U64) || ir_type_eq(right_ty, IrType::U64);
+            // For / and %, which compare nothing: the dividend is >= 0
+            // (range analysis bit 2), so a constant divisor needs no sign fix
+            match op {
+                BinOp::Div => { unsigned_cmp = left < self.unchecked.len() && (self.unchecked.get(left) & 2) != 0; }
+                BinOp::Mod => { unsigned_cmp = left < self.unchecked.len() && (self.unchecked.get(left) & 2) != 0; }
+                _ => {}
+            }
             if ir_type_is_float(ty) {
                 PeirGen_gen_float_binop(self, op, loff, roff, dst, ty);
             } else if ir_type_is_float(operand_ty) {
@@ -2241,8 +2754,7 @@ pub fn PeirGen_gen_inst(
 
         Inst::Load(ptr, ty) => {
             if pe_idmap_has(&frame.reg_vars, ptr) {
-                PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, pe_idmap_get(&frame.reg_vars, ptr));
-                PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+                PeirGen_move_slot(self, dst, pe_idmap_get(&frame.reg_vars, ptr));
                 return;
             }
             var poff: i64 = PeStackFrame_offset(frame, ptr);
@@ -2288,8 +2800,17 @@ pub fn PeirGen_gen_inst(
 
         Inst::Store(ptr, value, explicit_ty) => {
             if pe_idmap_has(&frame.reg_vars, ptr) {
-                PeirGen_load_operand(self, PEIR_RAX, value, frame);
-                PeirEnc_mov_mem_rbp_reg(&mut self.enc, pe_idmap_get(&frame.reg_vars, ptr), PEIR_RAX);
+                var rvslot: i64 = pe_idmap_get(&frame.reg_vars, ptr);
+                if peir_is_xmm_slot(rvslot) {
+                    PeirEnc_movsd_xmm_mem_rbp(&mut self.enc, rvslot - PEIR_XMM_SLOT, PeStackFrame_offset(frame, value));
+                    return;
+                }
+                var vreg: i64 = peir_value_reg(rvslot - PEIR_REG_SLOT);
+                if pe_idmap_has(&frame.const_vals, value) {
+                    PeirEnc_mov_imm(&mut self.enc, vreg, pe_idmap_get(&frame.const_vals, value));
+                } else {
+                    PeirEnc_mov_reg_mem_rbp(&mut self.enc, vreg, PeStackFrame_offset(frame, value));
+                }
                 return;
             }
             var poff: i64 = PeStackFrame_offset(frame, ptr);
@@ -2437,8 +2958,13 @@ pub fn PeirGen_gen_inst(
                 bcc = self.pending_cmp_cc;
             } else {
                 var coff: i64 = PeStackFrame_offset(frame, cond);
-                PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, coff);
-                PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                if coff >= PEIR_REG_SLOT && !peir_is_xmm_slot(coff) {
+                    var cr: i64 = peir_value_reg(coff - PEIR_REG_SLOT);
+                    PeirEnc_test_rr(&mut self.enc, cr, cr);
+                } else {
+                    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, coff);
+                    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+                }
             }
             self.pending_cmp_cc = -1;
             self.pending_cmp_vid = -1;
@@ -3106,6 +3632,65 @@ fn PeirGen_jump_panic(self: &mut PeirGen, cc: i64, which: i64) -> void {
 /// stub. Bare-metal code checks too (release G3): its panics go to the
 /// program's @panic_handler, else to COM1 and a halt (gen_bare_runtime).
 pub fn PeirGen_gen_int_binop(self: &mut PeirGen, op: BinOp, loff: i64, roff: i64, dst: i64, lconst: OptU64, rconst: OptU64, ty: IrType, unsigned_cmp: bool) -> void {
+    if PeirGen_int_binop_in_reg(self, op, loff, roff, dst, lconst, rconst, ty) { return; }
+    // An i64 `x / c` or `x % c` by a constant c >= 2: x straight into rcx,
+    // the result stored from where it ends up (no moves through rax)
+    var dmc: i64 = 0;
+    match rconst {
+        OptU64::Some(dv) => { dmc = dv; }
+        OptU64::None => {}
+    }
+    var dm_mod: i64 = -1;
+    match op {
+        BinOp::Div => { dm_mod = 0; }
+        BinOp::Mod => { dm_mod = 1; }
+        _ => {}
+    }
+    if dm_mod >= 0 && dmc >= 2 && ir_type_eq(ty, IrType::I64) {
+        match lconst {
+            OptU64::Some(lv) => { PeirEnc_mov_imm(&mut self.enc, PEIR_RCX, lv); }
+            OptU64::None => { PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, loff); }
+        }
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+        // (gen_inst passes `unsigned_cmp` = the dividend is >= 0 for these)
+        PeirGen_gen_div_const_n(self, dm_mod == 1, dmc, unsigned_cmp);
+        if dm_mod == 1 { PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RCX); }
+        else { PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX); }
+        return;
+    }
+    // A comparison of a value in a register: `cmp r, imm` or `cmp r, r2`
+    // (competitive OP18), no copy to rax
+    var lcmp: bool = false;
+    match lconst {
+        OptU64::None => { lcmp = loff >= PEIR_REG_SLOT && !peir_is_xmm_slot(loff) && peir_int_cmp_cc(op, unsigned_cmp) >= 0; }
+        OptU64::Some(_) => {}
+    }
+    if lcmp {
+        var rl: i64 = peir_value_reg(loff - PEIR_REG_SLOT);
+        match rconst {
+            OptU64::Some(cv) => {
+                if cv > -2147483648 && cv <= 2147483647 {
+                    PeirEnc_cmp_r_imm(&mut self.enc, rl, cv);
+                } else {
+                    PeirEnc_mov_imm(&mut self.enc, PEIR_RCX, cv);
+                    PeirEnc_cmp_rr(&mut self.enc, rl, PEIR_RCX);
+                }
+            }
+            OptU64::None => {
+                if roff >= PEIR_REG_SLOT && !peir_is_xmm_slot(roff) {
+                    PeirEnc_cmp_rr(&mut self.enc, rl, peir_value_reg(roff - PEIR_REG_SLOT));
+                } else {
+                    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, roff);
+                    PeirEnc_cmp_rr(&mut self.enc, rl, PEIR_RCX);
+                }
+            }
+        }
+        if self.flags_only { return; }
+        PeirEnc_setcc_r(&mut self.enc, peir_int_cmp_cc(op, unsigned_cmp), PEIR_RAX);
+        PeirEnc_movzx_r32_r8(&mut self.enc, PEIR_RAX, PEIR_RAX);
+        PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        return;
+    }
     // A constant operand moves in as an immediate, not a slot load (item 81).
     match lconst {
         OptU64::Some(v) => { PeirEnc_mov_imm(&mut self.enc, PEIR_RAX, v); }
@@ -3237,6 +3822,120 @@ pub fn PeirGen_gen_int_binop(self: &mut PeirGen, op: BinOp, loff: i64, roff: i64
     PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
 }
 
+/// An i64 add, sub, mul, and, or or xor whose result is in a register:
+/// computed there (`mov rd, l; op rd, r`), not through rax and rcx (D13).
+/// False when it does not apply.
+fn PeirGen_int_binop_in_reg(self: &mut PeirGen, op: BinOp, loff: i64, roff: i64, dst: i64, lconst: OptU64, rconst: OptU64, ty: IrType) -> bool {
+    if dst < PEIR_REG_SLOT || !ir_type_eq(ty, IrType::I64) { return false; }
+    match lconst {
+        OptU64::Some(_) => { return false; }
+        OptU64::None => {}
+    }
+    var kind: i64 = -1;
+    match op {
+        BinOp::Add => { kind = 0; }
+        BinOp::Sub => { kind = 1; }
+        BinOp::Mul => { kind = 2; }
+        BinOp::BitAnd => { kind = 3; }
+        BinOp::BitOr => { kind = 4; }
+        BinOp::BitXor => { kind = 5; }
+        _ => {}
+    }
+    if kind < 0 { return false; }
+    var rd: i64 = peir_value_reg(dst - PEIR_REG_SLOT);
+    var has_const: bool = false;
+    var rval: i64 = 0;
+    match rconst {
+        OptU64::Some(v) => { has_const = true; rval = v; }
+        OptU64::None => {}
+    }
+    // `mov rd, l` must not overwrite the right operand
+    if !has_const && roff == dst { return false; }
+    var small: bool = has_const && rval > -2147483648 && rval <= 2147483647;
+    var checked: bool = !self.cur_wrapping && !self.cur_unchecked;
+    // Instruction selection (competitive OP18): with the left operand in a
+    // register, no copy first. `imul rd, rl, imm`; and where no overflow
+    // check is needed, `lea rd, [rl + imm]`, `lea rd, [rl + rr]` and
+    // `lea rd, [rl + rl*k]` for * 2, 3, 5 and 9.
+    var lreg: i64 = -1;
+    if loff >= PEIR_REG_SLOT && !peir_is_xmm_slot(loff) { lreg = peir_value_reg(loff - PEIR_REG_SLOT); }
+    if lreg >= 0 && kind == 2 && small {
+        if !checked && (rval == 2 || rval == 3 || rval == 5 || rval == 9) {
+            var sc: i64 = 0;
+            if rval == 3 { sc = 1; }
+            if rval == 5 { sc = 2; }
+            if rval == 9 { sc = 3; }
+            PeirEnc_lea_base_index(&mut self.enc, rd, lreg, lreg, sc);
+            return true;
+        }
+        PeirEnc_imul_r_r_imm(&mut self.enc, rd, lreg, rval);
+        if checked { PeirGen_jump_panic(self, 0x0, PEIR_PANIC_MUL); }
+        return true;
+    }
+    if lreg >= 0 && lreg != rd && !checked && (kind == 0 || kind == 1) {
+        if small && rval > -2147483647 {
+            var disp: i64 = rval;
+            if kind == 1 { disp = 0 - rval; }
+            PeirEnc_lea_base_disp(&mut self.enc, rd, lreg, disp);
+            return true;
+        }
+        if kind == 0 && !has_const && roff >= PEIR_REG_SLOT && !peir_is_xmm_slot(roff) {
+            PeirEnc_lea_base_index(&mut self.enc, rd, lreg, peir_value_reg(roff - PEIR_REG_SLOT), 0);
+            return true;
+        }
+    }
+    PeirEnc_mov_reg_mem_rbp(&mut self.enc, rd, loff);
+    // The right operand: an immediate, its register, or rcx
+    var rs: i64 = PEIR_RCX;
+    if has_const {
+        if !(small && kind <= 2) { PeirEnc_mov_imm(&mut self.enc, PEIR_RCX, rval); }
+    } else if roff >= PEIR_REG_SLOT {
+        rs = peir_value_reg(roff - PEIR_REG_SLOT);
+    } else {
+        PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, roff);
+    }
+    var imm: bool = small && kind <= 2;
+    if kind == 0 {
+        if imm { PeirEnc_add_r_imm(&mut self.enc, rd, rval); } else { PeirEnc_add_rr(&mut self.enc, rd, rs); }
+        if checked { PeirGen_jump_panic(self, 0x0, PEIR_PANIC_ADD); }
+    } else if kind == 1 {
+        if imm { PeirEnc_add_r_imm(&mut self.enc, rd, 0 - rval); } else { PeirEnc_sub_rr(&mut self.enc, rd, rs); }
+        if checked { PeirGen_jump_panic(self, 0x0, PEIR_PANIC_SUB); }
+    } else if kind == 2 {
+        if imm { PeirEnc_imul_r_r_imm(&mut self.enc, rd, rd, rval); } else { PeirEnc_imul_rr(&mut self.enc, rd, rs); }
+        if checked { PeirGen_jump_panic(self, 0x0, PEIR_PANIC_MUL); }
+    } else if kind == 3 {
+        PeirEnc_and_rr(&mut self.enc, rd, rs);
+    } else if kind == 4 {
+        PeirEnc_or_rr(&mut self.enc, rd, rs);
+    } else {
+        PeirEnc_xor_rr(&mut self.enc, rd, rs);
+    }
+    return true;
+}
+
+/// Copy the value at frame offset `src` to frame offset `dst`, either of
+/// which may be a register (D13: one mov between registers).
+fn PeirGen_move_slot(self: &mut PeirGen, dst: i64, src: i64) -> void {
+    if dst == src { return; }
+    if peir_is_xmm_slot(dst) {
+        PeirEnc_movsd_xmm_mem_rbp(&mut self.enc, dst - PEIR_XMM_SLOT, src);
+        return;
+    }
+    if peir_is_xmm_slot(src) {
+        PeirEnc_movsd_mem_rbp_xmm(&mut self.enc, dst, src - PEIR_XMM_SLOT);
+        return;
+    }
+    if dst >= PEIR_REG_SLOT {
+        PeirEnc_mov_reg_mem_rbp(&mut self.enc, peir_value_reg(dst - PEIR_REG_SLOT), src);
+    } else if src >= PEIR_REG_SLOT {
+        PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, peir_value_reg(src - PEIR_REG_SLOT));
+    } else {
+        PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, src);
+        PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+    }
+}
+
 /// `reg` = a value: its constant, or its stack slot.
 fn PeirGen_load_operand(self: &mut PeirGen, reg: i64, value: i64, frame: &PeStackFrame) -> void {
     if pe_idmap_has(&frame.const_vals, value) {
@@ -3262,15 +3961,34 @@ fn PeirGen_inline_vec_call(self: &mut PeirGen, name: str, args: Vec<i64>, dst: i
         PeirGen_load_operand(self, PEIR_RAX, args.get(args.len() - 2), frame);
         PeirGen_load_operand(self, PEIR_RCX, args.get(args.len() - 1), frame);
         if !self.cur_unchecked {
-            PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RDX, PEIR_RAX, 8);
-            PeirEnc_cmp_rr(&mut self.enc, PEIR_RCX, PEIR_RDX);
+            PeirEnc_cmp_r_mem(&mut self.enc, PEIR_RCX, PEIR_RAX, 8);
             PeirGen_jump_panic(self, 0x3, PEIR_PANIC_VEC_INDEX); // jae
         }
-        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RAX, PEIR_RAX);
-        PeirEnc_shl_r_i8(&mut self.enc, PEIR_RCX, 3);
-        PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
-        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RAX, PEIR_RAX);
-        PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+        // Elements at their size (D14, element code at +24): core's Vec_get
+        var sized: i64 = -1;
+        var got: i64 = -1;
+        if HashMap_contains(self.func_labels, "Vec_get") {
+            sized = PeirEnc_alloc_label(&mut self.enc);
+            got = PeirEnc_alloc_label(&mut self.enc);
+            PeirEnc_cmp_mem_imm8(&mut self.enc, PEIR_RAX, 24, 0);
+            PeirEnc_jcc_label(&mut self.enc, 0x5, sized); // jnz
+        }
+        // the element: one load with a scaled index (competitive OP18)
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RDX, PEIR_RAX);
+        PeirEnc_mov_r_idx8(&mut self.enc, PEIR_RDX, PEIR_RDX, PEIR_RCX);
+        if sized >= 0 {
+            PeirEnc_jmp_label(&mut self.enc, got);
+            PeirEnc_place_label(&mut self.enc, sized);
+            PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_RCX);
+            PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
+            PeirEnc_xor_self(&mut self.enc, PEIR_RCX);
+            PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+            PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "Vec_get"));
+            PeirEnc_add_rsp_i32(&mut self.enc, 32);
+            PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
+            PeirEnc_place_label(&mut self.enc, got);
+        }
+        PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RDX);
         return true;
     }
     if name == "Vec_set" && args.len() >= 3 {
@@ -3278,8 +3996,7 @@ fn PeirGen_inline_vec_call(self: &mut PeirGen, name: str, args: Vec<i64>, dst: i
         PeirGen_load_operand(self, PEIR_RCX, args.get(args.len() - 2), frame);
         PeirGen_load_operand(self, PEIR_RDX, args.get(args.len() - 1), frame);
         if !self.cur_unchecked {
-            PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R8, PEIR_RAX, 8);
-            PeirEnc_cmp_rr(&mut self.enc, PEIR_RCX, PEIR_R8);
+            PeirEnc_cmp_r_mem(&mut self.enc, PEIR_RCX, PEIR_RAX, 8);
             PeirGen_jump_panic(self, 0x3, PEIR_PANIC_VEC_INDEX); // jae
         }
         // Shared data (negative capacity): core's Vec_set copies it first
@@ -3288,15 +4005,18 @@ fn PeirGen_inline_vec_call(self: &mut PeirGen, name: str, args: Vec<i64>, dst: i
         if HashMap_contains(self.func_labels, "Vec_set") {
             own = PeirEnc_alloc_label(&mut self.enc);
             set_done = PeirEnc_alloc_label(&mut self.enc);
-            PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R8, PEIR_RAX, 16);
-            PeirEnc_xor_self(&mut self.enc, PEIR_R9);
-            PeirEnc_cmp_rr(&mut self.enc, PEIR_R8, PEIR_R9);
+            PeirEnc_cmp_mem_imm8(&mut self.enc, PEIR_RAX, 16, 0);
             PeirEnc_jcc_label(&mut self.enc, 0xC, own); // jl
+            // Elements at their size (D14, code at +24) or owned by the Vec
+            // (element type at +32, proposal 0004: core's Vec_set drops the
+            // old one): core's Vec_set. One test for both words.
+            PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R8, PEIR_RAX, 24);
+            PeirEnc_or_r_mem(&mut self.enc, PEIR_R8, PEIR_RAX, 32);
+            PeirEnc_jcc_label(&mut self.enc, 0x5, own); // jnz
         }
-        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RAX, PEIR_RAX);
-        PeirEnc_shl_r_i8(&mut self.enc, PEIR_RCX, 3);
-        PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
-        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_RDX);
+        // the store: a scaled index (competitive OP18)
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_R8, PEIR_RAX);
+        PeirEnc_mov_idx8_r(&mut self.enc, PEIR_R8, PEIR_RCX, PEIR_RDX);
         if own >= 0 {
             PeirEnc_jmp_label(&mut self.enc, set_done);
             PeirEnc_place_label(&mut self.enc, own);
@@ -3322,6 +4042,10 @@ fn PeirGen_inline_vec_call(self: &mut PeirGen, name: str, args: Vec<i64>, dst: i
         PeirEnc_cmp_rr(&mut self.enc, PEIR_RDX, PEIR_R8);
         // signed: a shared Vec's capacity is negative and takes the call
         PeirEnc_jcc_label(&mut self.enc, 0xD, grow); // jge
+        // Elements at their size (D14, element code at +24): the call too
+        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R8, PEIR_RAX, 24);
+        PeirEnc_test_rr(&mut self.enc, PEIR_R8, PEIR_R8);
+        PeirEnc_jcc_label(&mut self.enc, 0x5, grow); // jnz
         PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_R8, PEIR_RAX);
         PeirEnc_mov_rr(&mut self.enc, PEIR_R9, PEIR_RDX);
         PeirEnc_shl_r_i8(&mut self.enc, PEIR_R9, 3);
@@ -3376,7 +4100,28 @@ fn peir_emit_shift(e: &mut PeirEnc, op: i64, k: i64) {
 /// truncates toward zero, as idiv's does.
 fn PeirGen_gen_div_const(self: &mut PeirGen, is_mod: bool, d: i64) -> void {
     PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX); // rcx = n
-    if (d & (d - 1)) == 0 {
+    PeirGen_gen_div_const_n(self, is_mod, d, false);
+    if is_mod { PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RCX); }
+}
+
+/// n / d in rax, or n % d in rcx, of n in rax and rcx. `nonneg`: n >= 0
+/// (range analysis), so the quotient needs no rounding toward zero.
+fn PeirGen_gen_div_const_n(self: &mut PeirGen, is_mod: bool, d: i64, nonneg: bool) -> void {
+    if nonneg && (d & (d - 1)) == 0 {
+        var k0: i64 = 0;
+        while (1 << k0) < d { k0 = k0 + 1; }
+        peir_emit_shift(&mut self.enc, 0xF8, k0); // sar rax, k
+    } else if nonneg {
+        var magic0: Vec<i64> = peir_div_magic(d);
+        var m0: i64 = magic0.get(0);
+        var s0: i64 = magic0.get(1);
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, m0);
+        peir_emit2(&mut self.enc, 0x48, 0xF7);
+        PeirEnc_emit_u8(&mut self.enc, 0xE9); // imul rcx: rdx = high half
+        if m0 < 0 { PeirEnc_add_rr(&mut self.enc, PEIR_RDX, PEIR_RCX); }
+        if s0 > 0 { peir_emit_shift(&mut self.enc, 0xFA, s0); } // sar rdx, s
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
+    } else if (d & (d - 1)) == 0 {
         var k: i64 = 0;
         while (1 << k) < d { k = k + 1; }
         PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
@@ -3398,10 +4143,13 @@ fn PeirGen_gen_div_const(self: &mut PeirGen, is_mod: bool, d: i64) -> void {
         PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
     }
     if is_mod {
-        PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, d);
-        PeirEnc_imul_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
+        if d <= 2147483647 {
+            PeirEnc_imul_r_r_imm(&mut self.enc, PEIR_RAX, PEIR_RAX, d);
+        } else {
+            PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, d);
+            PeirEnc_imul_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
+        }
         PeirEnc_sub_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
     }
 }
 

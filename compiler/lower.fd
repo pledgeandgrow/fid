@@ -523,6 +523,36 @@ pub struct Lowerer {
     pub func_param_asts: Vec<Vec<Type>>,
     /// L3A: numbers the continuation closures (__cont_N).
     pub continuation_counter: i64,
+    /// Ownership (proposal 0004): the owned variable slots of the function
+    /// being lowered, where each open scope starts in them, the current
+    /// statements' temporaries, where each open loop's slots and
+    /// temporaries start, and the entry-block instructions of the slots
+    pub own_slots: Vec<OwnSlot>,
+    pub own_marks: Vec<i64>,
+    pub own_temps: Vec<OwnTemp>,
+    pub own_loop_slots: Vec<i64>,
+    pub own_loop_temps: Vec<i64>,
+    pub own_prologue: Vec<i64>,
+    /// Lowering a function body whose values are counted
+    pub own_on: bool,
+    /// Its AST return type
+    pub own_ret_ty: Type,
+    /// A core string builder (String_*, p_str_*): a raw buffer it returns
+    /// as a str is the new string it made, handed over, not counted again
+    pub own_raw_ret: bool,
+    /// extern "C" functions declared to return a str: what C returns is
+    /// copied into a counted string at the call (proposal 0004)
+    pub own_str_externs: Vec<str>,
+    /// Variables another variable borrows from (a read-only copy): their
+    /// value is never moved out
+    pub own_nomove: Vec<str>,
+    /// Struct and enum types with generated drop/dup functions, their index
+    /// by type text, the ownership kind of types by text, and function name
+    /// -> position in func_ret_types + 1
+    pub own_types: Vec<OwnType>,
+    pub own_type_index: i64,
+    pub own_kind_cache: i64,
+    pub own_ret_index: i64,
 }
 
 // --- Lowerer methods ------------------------------------------------------
@@ -592,6 +622,21 @@ pub fn Lowerer_new() -> Lowerer {
         func_info_at: HashMap_new(),
         func_param_asts: Vec::new(),
         continuation_counter: 0,
+        own_slots: Vec::new(),
+        own_marks: Vec::new(),
+        own_temps: Vec::new(),
+        own_loop_slots: Vec::new(),
+        own_loop_temps: Vec::new(),
+        own_prologue: Vec::new(),
+        own_on: false,
+        own_ret_ty: Type::Void,
+        own_raw_ret: false,
+        own_str_externs: Vec::new(),
+        own_nomove: Vec::new(),
+        own_types: Vec::new(),
+        own_type_index: HashMap_new(),
+        own_kind_cache: HashMap_new(),
+        own_ret_index: HashMap_new(),
     };
 }
 
@@ -1018,6 +1063,10 @@ pub fn Lowerer_insert_impl_method(self: &mut Lowerer, struct_name: str, method_n
 
 pub fn Lowerer_insert_func_ret_type(self: &mut Lowerer, name: str, ty: Type) {
     self.func_ret_types.push(StringTypeEntry_new(name, ty));
+    // The first entry for a name is the one lookups find
+    if !HashMap_contains(self.own_ret_index, name) {
+        HashMap_insert(self.own_ret_index, name, self.func_ret_types.len());
+    }
 }
 
 pub fn Lowerer_insert_type_alias(self: &mut Lowerer, name: str, ty: Type) {
@@ -1195,6 +1244,14 @@ pub fn Lowerer_is_struct(self: &Lowerer, name: str) -> bool {
 
 pub fn Lowerer_emit_inst(self: &mut Lowerer, inst: Inst) -> i64 {
     var id: i64 = IrFunction_emit(&mut self.current_func, inst);
+    // A call's result is a temporary the statement owns (proposal 0004)
+    if self.own_on {
+        match inst {
+            Inst::Call(cname, _, cty, _) => { Lowerer_rc_note_call(self, id, cname, cty); }
+            _ => {}
+        }
+    }
+    if !LOWER_COW { return id; }
     // A struct stored whole (a copy by value): its Vec fields are shared
     // copy-on-write (proposal 0001; as src/lower.rs)
     match inst {
@@ -2332,6 +2389,10 @@ pub fn Lowerer_lower_program(self: &mut Lowerer, program: Program) -> IrModule {
         }
         var ret_type: IrType = Lowerer_lower_type(self, ext.ret_ty);
         IrModule_add_extern(&mut self.module, ext.pledge_name, param_types, ret_type);
+        match ext.ret_ty {
+            Type::Str => { self.own_str_externs.push(ext.pledge_name); }
+            _ => {}
+        }
         var fp: i64 = 0;
         while fp < ext.params.len() {
             match ext.params.get(fp).ty {
@@ -2587,6 +2648,10 @@ pub fn Lowerer_lower_program(self: &mut Lowerer, program: Program) -> IrModule {
         i = i + 1;
     }
 
+    // Ownership (proposal 0004): the drop/dup functions of the struct and
+    // enum types the program's values use
+    Lowerer_rc_gen_types(self);
+
     // Propagate linear_structs to IR module
     self.module.linear_structs = self.linear_structs;
 
@@ -2744,8 +2809,14 @@ fn Lowerer_emit_task_adapter(self: &mut Lowerer, func: Func) {
 pub fn lower(program: Program) -> IrModule {
     var l: Lowerer = Lowerer_new();
     var module: IrModule = Lowerer_lower_program(&mut l, program);
-    lw_auto_drop_vecs(&mut module);
-    lw_auto_drop_strs(&mut module);
+    // With ownership (proposal 0004) every value is dropped by its owner:
+    // the passes that freed some finished locals would free them twice
+    if !LOWER_RC {
+        lw_auto_drop_vecs(&mut module);
+        lw_auto_drop_strs(&mut module);
+    } else {
+        lw_rc_cancel_pairs(&mut module);
+    }
     return module;
 }
 
@@ -2817,7 +2888,7 @@ fn lw_is_fresh_elem(f: &IrFunction, id: i64, ekind: i64) -> bool {
         OptInst::Some(inst) => {
             match inst {
                 Inst::Call(name, _, _, _) => {
-                    if ekind == 2 { return name == "Vec_new" || name == "Vec_clone"; }
+                    if ekind == 2 { return name == "Vec_new" || name == "Vec_new_sized" || name == "Vec_clone"; }
                     return name == "p_str_concat" || name == "int_to_str" || name == "p_to_str"
                         || name == "p_char_to_str" || name == "float_to_str" || name == "p_str_literal_dup"
                         || name == "String_slice_len" || name == "str_slice";
@@ -3210,7 +3281,7 @@ fn lw_is_ctor(f: &IrFunction, id: i64, kind: i64) -> bool {
             match inst {
                 Inst::Call(name, _, _, _) => {
                     if kind == 1 { return name == "HashMap_new" || name == "HashMap_share"; }
-                    return name == "Vec_new" || name == "Vec_share" || name == "Vec_share_deep";
+                    return name == "Vec_new" || name == "Vec_new_sized" || name == "Vec_share" || name == "Vec_share_deep";
                 }
                 _ => { return false; }
             }
@@ -3832,6 +3903,18 @@ pub fn Lowerer_lower_func(self: &mut Lowerer, func: Func) {
     var saved_body: Vec<Stmt> = self.cur_body;
     var saved_lists: Vec<Vec<Stmt>> = self.fr_lists;
     var saved_idx: Vec<i64> = self.fr_idx;
+    // A function lowered inside another (a closure, a continuation) has
+    // ownership state of its own
+    var saved_slots: Vec<OwnSlot> = self.own_slots;
+    var saved_marks: Vec<i64> = self.own_marks;
+    var saved_temps: Vec<OwnTemp> = self.own_temps;
+    var saved_lslots: Vec<i64> = self.own_loop_slots;
+    var saved_ltemps: Vec<i64> = self.own_loop_temps;
+    var saved_prologue: Vec<i64> = self.own_prologue;
+    var saved_nomove: Vec<str> = self.own_nomove;
+    var saved_on: bool = self.own_on;
+    var saved_ret: Type = self.own_ret_ty;
+    var saved_raw: bool = self.own_raw_ret;
     self.cur_body = func.body;
     var base: Vec<Vec<Stmt>> = Vec::new();
     base.push(func.body);
@@ -3843,6 +3926,16 @@ pub fn Lowerer_lower_func(self: &mut Lowerer, func: Func) {
     self.cur_body = saved_body;
     self.fr_lists = saved_lists;
     self.fr_idx = saved_idx;
+    self.own_slots = saved_slots;
+    self.own_marks = saved_marks;
+    self.own_temps = saved_temps;
+    self.own_loop_slots = saved_lslots;
+    self.own_loop_temps = saved_ltemps;
+    self.own_prologue = saved_prologue;
+    self.own_nomove = saved_nomove;
+    self.own_on = saved_on;
+    self.own_ret_ty = saved_ret;
+    self.own_raw_ret = saved_raw;
 }
 
 fn Lowerer_lower_func_body(self: &mut Lowerer, func: Func) {
@@ -4038,6 +4131,19 @@ fn Lowerer_lower_func_body(self: &mut Lowerer, func: Func) {
     self.defer_stack = empty_defer_stack;
     var empty_param_types: Vec<StringTypeEntry> = Vec::new();
     self.current_func_param_types = empty_param_types;
+    // Ownership (proposal 0004): this body's values are counted; the
+    // function's own scope holds the parameters it copies
+    self.own_slots = Vec::new();
+    self.own_marks = Vec::new();
+    self.own_temps = Vec::new();
+    self.own_loop_slots = Vec::new();
+    self.own_loop_temps = Vec::new();
+    self.own_prologue = Vec::new();
+    self.own_nomove = Vec::new();
+    self.own_on = LOWER_RC;
+    self.own_ret_ty = lw_body_ret_type(func);
+    self.own_raw_ret = str_starts_with(func.name, "String_") || str_starts_with(func.name, "p_str_");
+    Lowerer_rc_scope_open(self);
 
     // Register parameter AST types (after clearing per-function state)
     var pi: i64 = 0;
@@ -4082,9 +4188,37 @@ fn Lowerer_lower_func_body(self: &mut Lowerer, func: Func) {
             cpi = cpi + 1;
         }
     }
+    // Ownership (proposal 0004): parameters are borrowed; one the body
+    // assigns or changes is copied first, an owner of its own dropped when
+    // the function ends (copy-on-write makes the copy O(1))
+    var owned_params: Vec<str> = Vec::new();
+    if LOWER_RC {
+        var rpi: i64 = 0;
+        while rpi < func.params.len() && rpi < pb_vals.len() {
+            var rp: Param = func.params.get(rpi);
+            var rk: i64 = Lowerer_rc_kind(self, rp.ty);
+            if rk != RC_NONE && (lw_c_str_vec_contains(assigned_params, rp.name) || cow_first_change(func.body, rp.name, 0) > 0) {
+                var mine: i64 = Lowerer_rc_dup(self, pb_vals.get(rpi), rp.ty);
+                if rk == RC_MEM {
+                    // The copy is the parameter's struct from here on
+                    IrFunction_bind_local(&mut self.current_func, rp.name, mine);
+                    pb_vals.set(rpi, mine);
+                    Lowerer_rc_add_slot(self, mine, rp.ty);
+                } else {
+                    var pslot: i64 = Lowerer_rc_new_slot(self, pb_tys.get(rpi), rp.ty);
+                    Lowerer_emit_inst(self, Inst::Store(pslot, mine, OptIrType::None));
+                    Lowerer_insert_alloca(self, rp.name, pslot);
+                    Lowerer_insert_alloca_type(self, pslot, pb_tys.get(rpi));
+                    Lowerer_rc_add_slot(self, pslot, rp.ty);
+                    owned_params.push(rp.name);
+                }
+            }
+            rpi = rpi + 1;
+        }
+    }
     var pbi: i64 = 0;
     while pbi < pb_names.len() {
-        if lw_c_str_vec_contains(assigned_params, pb_names.get(pbi)) {
+        if lw_c_str_vec_contains(assigned_params, pb_names.get(pbi)) && !lw_c_str_vec_contains(owned_params, pb_names.get(pbi)) {
             var slot: i64 = Lowerer_emit_inst(self, Inst::Alloca(pb_tys.get(pbi), Lowerer_current_region(self)));
             var _st: i64 = Lowerer_emit_inst(self, Inst::Store(slot, pb_vals.get(pbi), OptIrType::None));
             Lowerer_insert_alloca(self, pb_names.get(pbi), slot);
@@ -4162,6 +4296,7 @@ fn Lowerer_lower_func_body(self: &mut Lowerer, func: Func) {
     }
     while i < func.body.len() {
         var stmt: Stmt = func.body.get(i);
+        var smark: i64 = self.own_temps.len();
         self.rest_of = func.body;
         self.rest_from = i + 1;
         if self.fr_idx.len() > 0 { self.fr_idx.set(0, i); }
@@ -4202,6 +4337,15 @@ fn Lowerer_lower_func_body(self: &mut Lowerer, func: Func) {
                 if !lowered { Lowerer_lower_stmt(self, stmt); }
             }
         }
+        // The statement's temporaries end with it; the body's value is
+        // handed to the caller (proposal 0004)
+        if i + 1 == func.body.len() && self.own_on && !ir_type_eq(self.current_func.ret_ty, IrType::Void) {
+            match last_expr_val {
+                OptValueId::Some(lv) => { last_expr_val = OptValueId::Some(Lowerer_rc_own_value(self, lv, self.own_ret_ty)); }
+                OptValueId::None => {}
+            }
+        }
+        Lowerer_rc_flush(self, smark);
         i = i + 1;
     }
 
@@ -4211,6 +4355,7 @@ fn Lowerer_lower_func_body(self: &mut Lowerer, func: Func) {
         Lowerer_emit_drops(self);
         Lowerer_emit_defers(self);
         Lowerer_emit_persist_saves(self);
+        Lowerer_rc_drop_all(self);
 
         match self.current_sret {
             OptValueId::Some(_) => {
@@ -4272,6 +4417,7 @@ fn Lowerer_lower_func_body(self: &mut Lowerer, func: Func) {
     // Store the function in the module (replacing pre-registered entry)
     // Save the name first to avoid string corruption when moving the struct.
     var finished_name: str = self.current_func.name;
+    Lowerer_rc_finish_func(self);
     IrModule_replace_function_named(&mut self.module, self.current_func, finished_name);
 }
 
@@ -4316,7 +4462,10 @@ fn Lowerer_lower_tail_handle(self: &mut Lowerer, stmt: Stmt) -> OptValueId {
 pub fn Lowerer_lower_stmts(self: &mut Lowerer, stmts: Vec<Stmt>) {
     self.fr_lists.push(stmts);
     self.fr_idx.push(0);
+    // A block: its variables are dropped at its end (proposal 0004)
+    Lowerer_rc_scope_open(self);
     Lowerer_lower_stmts_in(self, stmts);
+    Lowerer_rc_scope_close(self);
     self.fr_lists.pop();
     self.fr_idx.pop();
 }
@@ -4694,6 +4843,351 @@ fn Lowerer_lift_parallel_branch(self: &mut Lowerer, branch: Vec<Stmt>) -> i64 {
 // --- Lowerer_lower_stmt helper functions ----------------------------------
 // Split out to avoid the statement-dropping bug in long functions.
 
+/// The element code of a `Vec<T>` type (release D14): the size of a small
+/// integer or bool element, negative when it is signed; 0 (one word per
+/// element) for anything else.
+fn lw_vec_elem_code(t: Type) -> i64 {
+    match t {
+        Type::Generic(n, args) => {
+            if n == "Vec" && args.len() == 1 {
+                match args.get(0) {
+                    Type::U8 => { return 1; }
+                    Type::Bool => { return 1; }
+                    Type::I8 => { return -1; }
+                    Type::U16 => { return 2; }
+                    Type::I16 => { return -2; }
+                    Type::U32 => { return 4; }
+                    Type::I32 => { return -4; }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    return 0;
+}
+
+/// Is `e` the call `Vec::new()`?
+/// The parts appended by `name = name + a + b ...` or `name += a`, in
+/// order; empty when the statement is not one, or when a part reads `name`
+/// itself after the first (it would see the string already grown).
+fn lw_rc_append_parts(name: str, op: AssignOp, expr: Expr) -> Vec<Expr> {
+    var out: Vec<Expr> = Vec::new();
+    match op {
+        AssignOp::AddAssign => {
+            out.push(expr);
+            return out;
+        }
+        AssignOp::Assign => {}
+        _ => { return out; }
+    }
+    // Walk down the left of `((name + a) + b) + c`
+    var rev: Vec<Expr> = Vec::new();
+    var cur: Expr = expr;
+    var done: bool = false;
+    while !done {
+        match cur {
+            Expr::Binary(bop, l, r) => {
+                if !binop_eq(bop, BinOp::Add) { return Vec::new(); }
+                rev.push(lw_box_expr_unbox(r));
+                cur = lw_box_expr_unbox(l);
+            }
+            Expr::Ident(ln) => {
+                if ln != name { return Vec::new(); }
+                done = true;
+            }
+            _ => { return Vec::new(); }
+        }
+    }
+    var i: i64 = rev.len() - 1;
+    while i >= 0 {
+        if rev.len() > 1 && cow_uses_expr(rev.get(i), name) > 0 { return Vec::new(); }
+        out.push(rev.get(i));
+        i = i - 1;
+    }
+    return out;
+}
+
+/// `HashMap::new()`.
+fn lw_rc_is_map_new_expr(e: Expr) -> bool {
+    match e {
+        Expr::MethodCall(recv, m, args) => {
+            if m != "new" || args.len() != 0 { return false; }
+            match lw_box_expr_unbox(recv) {
+                Expr::Ident(rn) => { return rn == "HashMap"; }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    return false;
+}
+
+/// `expr` lowered to be kept as a `t`: an empty collection gets the element
+/// types `t` gives it, and the value becomes an owner (proposal 0004).
+fn Lowerer_lower_owned_new(self: &mut Lowerer, expr: Expr, t: Type) -> i64 {
+    var v: i64 = -1;
+    if lw_is_vec_new_expr(expr) || lw_rc_is_map_new_expr(expr) { v = Lowerer_rc_new_coll(self, t); }
+    if v < 0 { v = Lowerer_lower_keep(self, expr); }
+    return Lowerer_rc_own_value(self, v, t);
+}
+
+/// The declared AST type of field `field` of struct `sn`, or Infer.
+fn Lowerer_rc_field_ast_type(self: &Lowerer, sn: str, field: str) -> Type {
+    match Lowerer_lookup_struct(self, sn) {
+        OptStructDef::Some(sd) => {
+            var i: i64 = 0;
+            while i < sd.fields.len() {
+                if sd.fields.get(i).name == field { return sd.fields.get(i).ty; }
+                i = i + 1;
+            }
+        }
+        OptStructDef::None => {}
+    }
+    return Type::Infer;
+}
+
+fn lw_rc_strip_ref(t: Type) -> Type {
+    match t {
+        Type::Ref(inner, _) => { return lw_box_type_unbox(inner); }
+        _ => {}
+    }
+    return t;
+}
+
+/// The AST type of `e` as far as ownership needs it: Lowerer_infer_expr_ast_type
+/// plus fields, indexing and the methods of Vec, HashMap, Option, Result,
+/// str and user structs.
+fn Lowerer_rc_expr_type(self: &Lowerer, e: Expr) -> Type {
+    match e {
+        Expr::FieldAccess(obj, f) => {
+            var ot: Type = lw_rc_strip_ref(Lowerer_resolve_type(self, Lowerer_rc_expr_type(self, lw_box_expr_unbox(obj))));
+            var sn: str = lw_rc_type_name(ot);
+            if sn == "" { return Type::Infer; }
+            match Lowerer_lookup_struct(self, sn) {
+                OptStructDef::Some(sd) => {
+                    var i: i64 = 0;
+                    while i < sd.fields.len() {
+                        if sd.fields.get(i).name == f {
+                            return lw_rc_subst(sd.fields.get(i).ty, sd.type_params, lw_rc_type_args(ot));
+                        }
+                        i = i + 1;
+                    }
+                }
+                OptStructDef::None => {}
+            }
+            return Type::Infer;
+        }
+        Expr::Index(arr, _) => {
+            var at: Type = lw_rc_strip_ref(Lowerer_resolve_type(self, Lowerer_rc_expr_type(self, lw_box_expr_unbox(arr))));
+            match at {
+                Type::Generic(n, a) => {
+                    if n == "Vec" && a.len() == 1 { return a.get(0); }
+                }
+                _ => {}
+            }
+            return Type::Infer;
+        }
+        Expr::MethodCall(recv, m, _) => {
+            var rt: Type = lw_rc_strip_ref(Lowerer_resolve_type(self, Lowerer_rc_expr_type(self, lw_box_expr_unbox(recv))));
+            match rt {
+                Type::Str => {
+                    if m == "len" || m == "find" || m == "rfind" || m == "byte_at" || m == "parse_int" || m == "char_count" { return Type::I64; }
+                    if m == "contains" || m == "starts_with" || m == "ends_with" || m == "is_empty" { return Type::Bool; }
+                    if m == "split" || m == "lines" { return Type::Generic("Vec", lw_rc_one(Type::Str)); }
+                    return Type::Str;
+                }
+                Type::Generic(n, a) => {
+                    if n == "Vec" && a.len() == 1 {
+                        if m == "get" || m == "first" || m == "last" || m == "pop" || m == "remove" { return a.get(0); }
+                        if m == "clone" { return rt; }
+                    }
+                    if n == "HashMap" && a.len() == 2 {
+                        if m == "get" || m == "get_or" || m == "remove" { return a.get(1); }
+                        if m == "keys" { return Type::Generic("Vec", lw_rc_one(a.get(0))); }
+                        if m == "values" { return Type::Generic("Vec", lw_rc_one(a.get(1))); }
+                        if m == "clone" { return rt; }
+                    }
+                    if (n == "Option" || n == "Result") && a.len() > 0 && (m == "unwrap" || m == "unwrap_or" || m == "expect") { return a.get(0); }
+                }
+                _ => {}
+            }
+            var sn2: str = lw_rc_type_name(rt);
+            if sn2 != "" {
+                var ret: Type = Lowerer_rc_ret_type(self, sn2 + "_" + m);
+                match ret {
+                    Type::Infer => {}
+                    _ => { return ret; }
+                }
+            }
+            return Lowerer_infer_expr_ast_type(self, e);
+        }
+        _ => {}
+    }
+    return Lowerer_infer_expr_ast_type(self, e);
+}
+
+/// The type the value of an `if` or `match` is owned as: the let's declared
+/// type, else the first branch value whose type is known to own something.
+fn Lowerer_rc_result_type(self: &mut Lowerer, tails: Vec<Expr>) -> Type {
+    match self.let_hint {
+        OptType::Some(lh) => {
+            if Lowerer_rc_kind(self, lh) != RC_NONE { return lh; }
+        }
+        OptType::None => {}
+    }
+    var i: i64 = 0;
+    while i < tails.len() {
+        var t: Type = Lowerer_rc_expr_type(self, tails.get(i));
+        match tails.get(i) {
+            Expr::StringLit(_) => { t = Type::Str; }
+            _ => {}
+        }
+        if Lowerer_rc_kind(self, t) != RC_NONE { return t; }
+        i = i + 1;
+    }
+    return Type::Infer;
+}
+
+fn lw_rc_one(t: Type) -> Vec<Type> {
+    var v: Vec<Type> = Vec::new();
+    v.push(t);
+    return v;
+}
+
+/// The type to count value `v` (the lowering of `e`) as when nothing else
+/// says: its AST type, else what its IR type stands for.
+fn Lowerer_rc_value_type(self: &mut Lowerer, e: Expr, v: i64) -> Type {
+    var tt: Type = Lowerer_rc_temp_type(self, v);
+    if Lowerer_rc_kind(self, tt) != RC_NONE { return tt; }
+    var et: Type = Lowerer_rc_expr_type(self, e);
+    if Lowerer_rc_kind(self, et) != RC_NONE { return et; }
+    var it: IrType = Lowerer_get_value_type(self, v);
+    var ht: Type = lw_rc_handle_of_ir(it);
+    if Lowerer_rc_kind(self, ht) != RC_NONE { return ht; }
+    var sn: str = "";
+    match it {
+        IrType::Struct(n) => { sn = n; }
+        IrType::Ptr(inner) => {
+            match box_ir_type_unbox(inner) {
+                IrType::Struct(n2) => { sn = n2; }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    if sn != "" { return Type::Named(sn); }
+    return Type::Infer;
+}
+
+/// The element type of the Vec `e` is (through a reference), or Infer.
+fn Lowerer_rc_vec_elem_ast(self: &Lowerer, e: Expr) -> Type {
+    var t: Type = Lowerer_resolve_type(self, Lowerer_rc_expr_type(self, e));
+    match t {
+        Type::Ref(inner, _) => { t = lw_box_type_unbox(inner); }
+        _ => {}
+    }
+    match t {
+        Type::Generic(n, a) => {
+            if n == "Vec" && a.len() == 1 { return a.get(0); }
+        }
+        _ => {}
+    }
+    return Type::Infer;
+}
+
+/// The key and value types of the HashMap `e` is, or an empty list.
+fn Lowerer_rc_map_kv_ast(self: &Lowerer, e: Expr) -> Vec<Type> {
+    var out: Vec<Type> = Vec::new();
+    var t: Type = Lowerer_resolve_type(self, Lowerer_rc_expr_type(self, e));
+    match t {
+        Type::Ref(inner, _) => { t = lw_box_type_unbox(inner); }
+        _ => {}
+    }
+    match t {
+        Type::Generic(n, a) => {
+            if n == "HashMap" && a.len() == 2 {
+                out.push(a.get(0));
+                out.push(a.get(1));
+            }
+        }
+        _ => {}
+    }
+    return out;
+}
+
+/// The AST type of variable `name` (a local or a parameter), or Infer.
+fn Lowerer_rc_var_type(self: &Lowerer, name: str) -> Type {
+    match Lowerer_lookup_var_ast_type(self, name) {
+        OptType::Some(vt) => { return vt; }
+        OptType::None => {}
+    }
+    match Lowerer_lookup_param_type(self, name) {
+        OptType::Some(pt) => { return pt; }
+        OptType::None => {}
+    }
+    return Type::Infer;
+}
+
+/// The handle type an IR type stands for (a global's), or Infer.
+fn lw_rc_handle_of_ir(t: IrType) -> Type {
+    match t {
+        IrType::Ptr(inner) => {
+            match box_ir_type_unbox(inner) {
+                IrType::U8 => { return Type::Str; }
+                _ => {}
+            }
+        }
+        IrType::Generic(gn, _) => {
+            if gn == "Vec" || gn == "HashMap" { return Type::Named(gn); }
+        }
+        IrType::Opaque(onm) => {
+            if onm == "Vec" || onm == "HashMap" { return Type::Named(onm); }
+        }
+        _ => {}
+    }
+    return Type::Infer;
+}
+
+fn lw_is_vec_new_expr(e: Expr) -> bool {
+    match e {
+        Expr::MethodCall(recv, m, args) => {
+            if m != "new" || args.len() != 0 { return false; }
+            match lw_box_expr_unbox(recv) {
+                Expr::Ident(rn) => { return rn == "Vec"; }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    return false;
+}
+
+/// A `let`'s value: `var v: Vec<u8> = Vec::new()` makes a Vec with its
+/// elements at their size (D14); anything else lowers as usual.
+fn Lowerer_lower_let_value_typed(self: &mut Lowerer, ty: OptType, expr: Expr, plain_copy: bool) -> i64 {
+    match ty {
+        OptType::Some(vt) => {
+            var vcode: i64 = lw_vec_elem_code(vt);
+            if vcode != 0 && lw_is_vec_new_expr(expr) && Lowerer_has_function(self, "Vec_new_sized") {
+                return Lowerer_emit_vec_new_sized(self, vcode);
+            }
+        }
+        OptType::None => {}
+    }
+    return Lowerer_lower_let_value(self, expr, plain_copy);
+}
+
+/// An empty Vec of element code `code` (core's Vec_new_sized).
+fn Lowerer_emit_vec_new_sized(self: &mut Lowerer, code: i64) -> i64 {
+    var env: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+    var c: i64 = Lowerer_emit_inst(self, Inst::ConstInt(code, IrType::I64));
+    var args: Vec<i64> = Vec::new();
+    args.push(env);
+    args.push(c);
+    return Lowerer_emit_inst(self, Inst::Call("Vec_new_sized", args, IrType::Opaque("Vec"), EffectSet_new()));
+}
+
 fn Lowerer_lower_let_stmt(self: &mut Lowerer, name: str, ty: OptType, expr: Expr, _is_mut: bool, is_persist: bool, annotations: Vec<Annotation>, _line: i64) {
     var saved_hint: OptType = self.let_hint;
     match ty {
@@ -4703,13 +5197,44 @@ fn Lowerer_lower_let_stmt(self: &mut Lowerer, name: str, ty: OptType, expr: Expr
         OptType::None => {}
     }
 
-    // A copy nobody writes needs no share: `val fields = self.t.get(i).f`
+    // A copy nobody writes needs no share: `lval fields = self.t.get(i).f`
     // read only (proposal 0001)
     var plain_copy: bool = LOWER_COW && Lowerer_readonly_copy(self, name, expr);
-    var val: i64 = Lowerer_lower_let_value(self, expr, plain_copy);
+    var lval: i64 = -1;
+    // A copy only read while its source cannot change borrows it: no count,
+    // and the variable drops nothing (proposal 0004)
+    var borrow_copy: bool = self.own_on && Lowerer_rc_borrow_copy_ok(self, name, expr);
+    if borrow_copy { lval = Lowerer_lower_expr(self, expr); }
+    if self.own_on && !borrow_copy {
+        match ty {
+            OptType::Some(dt) => {
+                if lw_is_vec_new_expr(expr) || lw_rc_is_map_new_expr(expr) {
+                    lval = Lowerer_rc_new_coll(self, Lowerer_resolve_self_in_type(self, dt));
+                }
+            }
+            OptType::None => {}
+        }
+    }
+    if lval < 0 { lval = Lowerer_rc_move_last(self, expr); }
+    if lval < 0 { lval = Lowerer_lower_let_value_typed(self, ty, expr, plain_copy); }
+    // Ownership (proposal 0004): the variable keeps its value
+    var own_ty: Type = Type::Infer;
+    if self.own_on && !borrow_copy {
+        match ty {
+            OptType::Some(dt2) => { own_ty = Lowerer_resolve_self_in_type(self, dt2); }
+            OptType::None => {
+                own_ty = Lowerer_rc_temp_type(self, lval);
+                match own_ty {
+                    Type::Infer => { own_ty = Lowerer_rc_expr_type(self, expr); }
+                    _ => {}
+                }
+            }
+        }
+        lval = Lowerer_rc_own_value(self, lval, own_ty);
+    }
     self.let_hint = saved_hint;
 
-    var val_ty: IrType = Lowerer_get_value_type(self, val);
+    var val_ty: IrType = Lowerer_get_value_type(self, lval);
     var ir_ty: IrType = val_ty;
     match ty {
         OptType::Some(t) => {
@@ -4748,16 +5273,47 @@ fn Lowerer_lower_let_stmt(self: &mut Lowerer, name: str, ty: OptType, expr: Expr
                         _ => { ir_ty = val_ty; }
                     }
                 }
+                IrType::I64 => {
+                    // `var w = v.clone()`: core's Vec_clone returns the Vec as
+                    // an i64; the method's own result type keeps it a Vec (it
+                    // printed as a number)
+                    ir_ty = val_ty;
+                    match expr {
+                        Expr::MethodCall(_, _, _) => {
+                            match Lowerer_infer_expr_type(self, expr) {
+                                IrType::Generic(gn, gargs) => {
+                                    if gn == "Vec" || gn == "HashMap" { ir_ty = IrType::Generic(gn, gargs); }
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 _ => { ir_ty = val_ty; }
             }
         }
     }
 
-    var alloca: i64 = Lowerer_emit_inst(self, Inst::Alloca(ir_ty, Lowerer_current_region(self)));
+    // An owning variable's slot is made and zeroed in the entry block
+    var own_kind: i64 = RC_NONE;
+    if self.own_on && !is_persist { own_kind = Lowerer_rc_kind(self, own_ty); }
+    if own_kind == RC_MEM {
+        match ir_ty {
+            IrType::Struct(_) => {}
+            _ => { own_kind = RC_NONE; }
+        }
+    }
+    var alloca: i64 = 0;
+    if own_kind != RC_NONE {
+        alloca = Lowerer_rc_new_slot(self, ir_ty, own_ty);
+    } else {
+        alloca = Lowerer_emit_inst(self, Inst::Alloca(ir_ty, Lowerer_current_region(self)));
+    }
     Lowerer_insert_alloca_type(self, alloca, ir_ty);
 
     if is_persist {
-        var loaded: i64 = Lowerer_emit_inst(self, Inst::PersistLoad(name, val, ir_ty));
+        var loaded: i64 = Lowerer_emit_inst(self, Inst::PersistLoad(name, lval, ir_ty));
         var _s: i64 = Lowerer_emit_inst(self, Inst::Store(alloca, loaded, OptIrType::None));
         self.current_func.persist_vars.push(StringValueId_new(name, alloca));
     } else {
@@ -4770,8 +5326,9 @@ fn Lowerer_lower_let_stmt(self: &mut Lowerer, name: str, ty: OptType, expr: Expr
         // Store (Lowerer_emit_inst); a fresh struct or a copy nobody writes
         // keeps the handles it has (proposal 0001)
         self.no_struct_share = plain_copy || !lw_is_place_expr(expr) || lw_is_last_use(self, expr);
-        var _s: i64 = Lowerer_emit_inst(self, Inst::Store(alloca, val, store_ty));
+        var _s: i64 = Lowerer_emit_inst(self, Inst::Store(alloca, lval, store_ty));
         self.no_struct_share = false;
+        if own_kind != RC_NONE { Lowerer_rc_add_slot(self, alloca, own_ty); }
     }
 
     Lowerer_insert_alloca(self, name, alloca);
@@ -4887,9 +5444,13 @@ fn Lowerer_lower_index_assign_stmt(self: &mut Lowerer, array_name: Box<Expr>, in
             }
             _ => {}
         }
+        // Ownership (proposal 0004): the Vec keeps an owner of the element
+        // (Vec_set drops the old one)
+        var iet: Type = Type::Infer;
+        if self.own_on { iet = Lowerer_rc_vec_elem_ast(self, lw_box_expr_unbox(array_name)); }
         match op {
             AssignOp::Assign => {
-                var set_val: i64 = Lowerer_lower_expr(self, expr);
+                var set_val: i64 = Lowerer_lower_owned(self, expr, iet);
                 match vec_elem_ty {
                     IrType::Struct(_) => {
                         var size: i64 = IrModule_type_size(&self.module, vec_elem_ty);
@@ -4917,6 +5478,7 @@ fn Lowerer_lower_index_assign_stmt(self: &mut Lowerer, array_name: Box<Expr>, in
                 var current: i64 = Lowerer_emit_inst(self, Inst::Call("Vec_get", get_args, get_ret_ty, EffectSet_new()));
                 var rhs: i64 = Lowerer_lower_expr(self, expr);
                 var new_val: i64 = Lowerer_lower_compound_assign(self, op, current, rhs);
+                new_val = Lowerer_rc_own_value(self, new_val, iet);
                 match vec_elem_ty {
                     IrType::Struct(_) => {
                         var size: i64 = IrModule_type_size(&self.module, vec_elem_ty);
@@ -5066,14 +5628,34 @@ fn Lowerer_lower_select_stmt(self: &mut Lowerer, cases: Vec<SelectCase>, default
     Lowerer_set_current_block(self, merge_block);
 }
 
+/// A statement owns the temporaries it makes: they are dropped at its end
+/// unless something kept them (proposal 0004).
 pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
+    if !self.own_on {
+        Lowerer_lower_stmt_inner(self, stmt);
+        return;
+    }
+    var mark: i64 = self.own_temps.len();
+    Lowerer_lower_stmt_inner(self, stmt);
+    Lowerer_rc_flush(self, mark);
+}
+
+fn Lowerer_lower_stmt_inner(self: &mut Lowerer, stmt: Stmt) {
     match stmt {
         Stmt::Let(name, ty, expr, _is_mut, is_persist, annotations, _line) => {
             Lowerer_lower_let_stmt(self, name, ty, expr, _is_mut, is_persist, annotations, _line);
         }
         Stmt::LetUninit(name, ty, annotations, _line) => {
             var ir_ty: IrType = Lowerer_lower_type(self, ty);
-            var alloca: i64 = Lowerer_emit_inst(self, Inst::Alloca(ir_ty, Lowerer_current_region(self)));
+            var alloca: i64 = 0;
+            // An owning variable starts empty (zeroed in the entry block)
+            var uk: i64 = Lowerer_rc_kind(self, ty);
+            if self.own_on && uk != RC_NONE && (uk != RC_MEM || ir_type_is_aggregate(ir_ty)) {
+                alloca = Lowerer_rc_new_slot(self, ir_ty, ty);
+                Lowerer_rc_add_slot(self, alloca, ty);
+            } else {
+                alloca = Lowerer_emit_inst(self, Inst::Alloca(ir_ty, Lowerer_current_region(self)));
+            }
             Lowerer_insert_alloca_type(self, alloca, ir_ty);
             Lowerer_insert_alloca(self, name, alloca);
             Lowerer_bind_local(self, name, alloca);
@@ -5146,8 +5728,15 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
                     var addr: i64 = Lowerer_emit_inst(self, Inst::GlobalAddr(name, ir_ty));
                     match op {
                         AssignOp::Assign => {
-                            var val: i64 = Lowerer_lower_expr(self, expr);
+                            // A global owns a string, Vec or map it holds
+                            // (proposal 0004)
+                            var gty: Type = Type::Infer;
+                            if self.own_on { gty = lw_rc_handle_of_ir(ir_ty); }
+                            var val: i64 = Lowerer_lower_owned(self, expr, gty);
+                            var gold: i64 = -1;
+                            if Lowerer_rc_kind(self, gty) != RC_NONE { gold = Lowerer_emit_inst(self, Inst::Load(addr, ir_ty)); }
                             var _s: i64 = Lowerer_emit_inst(self, Inst::Store(addr, val, OptIrType::None));
+                            if gold >= 0 { Lowerer_rc_drop(self, gold, gty); }
                         }
                         _ => {
                             // Compound assignment: load current, apply op, store
@@ -5165,9 +5754,47 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
             match Lowerer_lookup_alloca(self, name) {
                 OptValueId::Some(alloca) => {
                     var rv: i64 = 0;
+                    // Ownership (proposal 0004): the variable keeps the new
+                    // value and drops the old one
+                    var avty: Type = Type::Infer;
+                    if self.own_on { avty = Lowerer_rc_var_type(self, name); }
+                    var akind: i64 = Lowerer_rc_kind(self, avty);
+                    // A variable that borrows (a loop variable, a binding)
+                    // has no old value of its own to drop
+                    var a_owned: bool = Lowerer_rc_owns_slot(self, alloca);
+                    // `s = s + x` / `s += x` on a string it owns: appended in
+                    // place when it has one owner and room (core's p_str_append)
+                    if self.own_on && a_owned && akind == RC_STR && Lowerer_has_function(self, "p_str_append") {
+                        var parts: Vec<Expr> = lw_rc_append_parts(name, op, expr);
+                        if parts.len() > 0 {
+                            var sty: IrType = IrType::Ptr(Box::new(IrType::U8));
+                            match Lowerer_lookup_alloca_type(self, alloca) {
+                                OptIrType::Some(st0) => { sty = st0; }
+                                OptIrType::None => {}
+                            }
+                            var pi2: i64 = 0;
+                            while pi2 < parts.len() {
+                                var tv: i64 = Lowerer_lower_expr(self, parts.get(pi2));
+                                var oldv: i64 = Lowerer_emit_inst(self, Inst::Load(alloca, sty));
+                                var aa: Vec<i64> = Vec::new();
+                                aa.push(Lowerer_rc_env(self));
+                                aa.push(Lowerer_rc_as_i64(self, oldv));
+                                aa.push(Lowerer_rc_as_i64(self, tv));
+                                var nv: i64 = Lowerer_emit_inst(self, Inst::Call("p_str_append", aa, sty, lw_rc_eff()));
+                                Lowerer_rc_claim(self, nv);
+                                Lowerer_emit_inst(self, Inst::Store(alloca, nv, OptIrType::None));
+                                pi2 = pi2 + 1;
+                            }
+                            return;
+                        }
+                    }
                     match op {
                         AssignOp::Assign => {
-                            rv = Lowerer_lower_let_value(self, expr, LOWER_COW && Lowerer_readonly_copy_in(self, name, expr, true));
+                            if self.own_on {
+                                rv = Lowerer_lower_owned_new(self, expr, avty);
+                            } else {
+                                rv = Lowerer_lower_let_value(self, expr, LOWER_COW && Lowerer_readonly_copy_in(self, name, expr, true));
+                            }
                         }
                         _ => { rv = Lowerer_lower_expr(self, expr); }
                     }
@@ -5193,7 +5820,23 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
                                 }
                                 _ => {}
                             }
+                            var aold: i64 = -1;
+                            if !a_owned {
+                                // nothing of its own to drop
+                            } else if akind == RC_MEM && !slot_holds_ptr {
+                                // The old struct's fields go; the new one is a
+                                // separate owned value, so `x = f(x)` is safe
+                                Lowerer_rc_call_mem(self, "__own_drop_", alloca, avty);
+                            } else if akind != RC_NONE && akind != RC_MEM {
+                                var aslot_ty: IrType = IrType::I64;
+                                match Lowerer_lookup_alloca_type(self, alloca) {
+                                    OptIrType::Some(ast2) => { aslot_ty = ast2; }
+                                    OptIrType::None => {}
+                                }
+                                aold = Lowerer_emit_inst(self, Inst::Load(alloca, aslot_ty));
+                            }
                             var _s: i64 = Lowerer_emit_inst(self, Inst::Store(alloca, rv, store_ty));
+                            if aold >= 0 { Lowerer_rc_drop(self, aold, avty); }
                         }
                         _ => {
                             // Compound assignment: load current, apply op, store
@@ -5205,6 +5848,8 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
                             var current: i64 = Lowerer_emit_inst(self, Inst::Load(alloca, alloca_ty));
                             var result: i64 = Lowerer_lower_compound_assign(self, op, current, rv);
                             var _s2: i64 = Lowerer_emit_inst(self, Inst::Store(alloca, result, OptIrType::None));
+                            // `s += t`: the slot keeps the new string, drops the old
+                            if akind == RC_STR && Lowerer_rc_claim(self, result) && a_owned { Lowerer_rc_drop(self, current, avty); }
                         }
                     }
                 }
@@ -5232,14 +5877,27 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
             var ret_val: OptValueId = OptValueId::None;
             match expr {
                 OptBoxExpr::Some(e) => {
+                    // The caller gets an owner of the value (proposal 0004)
                     match self.current_sret {
                         OptValueId::Some(sret) => {
-                            var val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(e));
-                            Lowerer_emit_sret_copy(self, val);
+                            var mv: i64 = Lowerer_rc_try_move(self, lw_box_expr_unbox(e));
+                            if mv < 0 { mv = Lowerer_lower_owned(self, lw_box_expr_unbox(e), self.own_ret_ty); }
+                            Lowerer_emit_sret_copy(self, mv);
                         }
                         OptValueId::None => {
-                            var val: i64 = Lowerer_lower_value(self, lw_box_expr_unbox(e));
-                            ret_val = OptValueId::Some(Lowerer_coerce_return(self, val));
+                            var rval: i64 = 0;
+                            var re: Expr = lw_box_expr_unbox(e);
+                            if self.own_on && self.own_raw_ret && Lowerer_rc_kind(self, Lowerer_rc_expr_type(self, re)) == RC_NONE {
+                                // A core builder's new buffer: handed over
+                                rval = Lowerer_lower_expr(self, re);
+                                Lowerer_rc_claim(self, rval);
+                            } else if self.own_on {
+                                rval = Lowerer_rc_try_move(self, re);
+                                if rval < 0 { rval = Lowerer_lower_owned_new(self, re, self.own_ret_ty); }
+                            } else {
+                                rval = Lowerer_lower_value(self, lw_box_expr_unbox(e));
+                            }
+                            ret_val = OptValueId::Some(Lowerer_coerce_return(self, rval));
                         }
                     }
                 }
@@ -5248,6 +5906,7 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
             Lowerer_emit_drops(self);
             Lowerer_emit_defers(self);
             Lowerer_emit_persist_saves(self);
+            Lowerer_rc_drop_all(self);
             Lowerer_emit_terminator(self, Inst::Return(ret_val));
         }
         Stmt::If(cond, then_block, else_block, _line) => {
@@ -5324,12 +5983,14 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
             // Jump to break target
             if self.loop_stack.len() > 0 {
                 var ctx2: LoopContext = self.loop_stack.get(self.loop_stack.len() - 1);
+                Lowerer_rc_loop_exit(self);
                 Lowerer_emit_terminator(self, Inst::Jump(ctx2.break_target));
             }
         }
         Stmt::Continue(_line) => {
             if self.loop_stack.len() > 0 {
                 var ctx: LoopContext = self.loop_stack.get(self.loop_stack.len() - 1);
+                Lowerer_rc_loop_exit(self);
                 Lowerer_emit_terminator(self, Inst::Jump(ctx.continue_target));
             }
         }
@@ -5351,8 +6012,15 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
             }
             match op {
                 AssignOp::Assign => {
-                    var val: i64 = Lowerer_lower_expr(self, expr);
+                    // `*p = v` through a `&mut str`/Vec/map: the place keeps
+                    // its own owner (proposal 0004)
+                    var dty: Type = Type::Infer;
+                    if self.own_on { dty = lw_rc_handle_of_ir(pointee_ty); }
+                    var val: i64 = Lowerer_lower_owned(self, expr, dty);
+                    var dold: i64 = -1;
+                    if Lowerer_rc_kind(self, dty) != RC_NONE { dold = Lowerer_emit_inst(self, Inst::Load(ptr_val, pointee_ty)); }
                     var _s: i64 = Lowerer_emit_inst(self, Inst::Store(ptr_val, val, OptIrType::Some(pointee_ty)));
+                    if dold >= 0 { Lowerer_rc_drop(self, dold, dty); }
                 }
                 _ => {
                     var current: i64 = Lowerer_emit_inst(self, Inst::Load(ptr_val, pointee_ty));
@@ -5365,7 +6033,7 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
         Stmt::FieldAssign(object, field, op, expr, _line) => {
             // `v.get(i).f = x` writes into an element: under copy-on-write
             // the Vecs on the path become this side's own first
-            if LOWER_COW { Lowerer_own_path(self, object); }
+            if LOWER_COW || LOWER_RC { Lowerer_own_path(self, object); }
             var struct_ptr: i64 = Lowerer_lower_expr(self, object);
             var struct_ty: IrType = Lowerer_get_value_type(self, struct_ptr);
             var struct_name: str = "";
@@ -5399,16 +6067,30 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
 
                         if found_field {
                             var field_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(struct_ptr, field_idx, field_ty));
+                            // Ownership (proposal 0004): the field keeps the
+                            // new value and drops the old one
+                            var fast: Type = Type::Infer;
+                            if self.own_on { fast = Lowerer_rc_field_ast_type(self, struct_name, field); }
+                            var fk: i64 = Lowerer_rc_kind(self, fast);
                             match op {
                                 AssignOp::Assign => {
-                                    var val: i64 = Lowerer_lower_value(self, expr);
-                                    var _s: i64 = Lowerer_emit_inst(self, Inst::Store(field_ptr, val, OptIrType::None));
+                                    var fval: i64 = 0;
+                                    if self.own_on { fval = Lowerer_lower_owned_new(self, expr, fast); } else { fval = Lowerer_lower_value(self, expr); }
+                                    var fold: i64 = -1;
+                                    if fk == RC_MEM {
+                                        Lowerer_rc_call_mem(self, "__own_drop_", field_ptr, fast);
+                                    } else if fk != RC_NONE {
+                                        fold = Lowerer_emit_inst(self, Inst::Load(field_ptr, field_ty));
+                                    }
+                                    var _s: i64 = Lowerer_emit_inst(self, Inst::Store(field_ptr, fval, OptIrType::None));
+                                    if fold >= 0 { Lowerer_rc_drop(self, fold, fast); }
                                 }
                                 _ => {
                                     var current: i64 = Lowerer_emit_inst(self, Inst::Load(field_ptr, field_ty));
                                     var rhs: i64 = Lowerer_lower_expr(self, expr);
                                     var new_val: i64 = Lowerer_lower_compound_assign(self, op, current, rhs);
                                     var _s2: i64 = Lowerer_emit_inst(self, Inst::Store(field_ptr, new_val, OptIrType::None));
+                                    if fk == RC_STR && Lowerer_rc_claim(self, new_val) { Lowerer_rc_drop(self, current, fast); }
                                 }
                             }
                         }
@@ -5756,7 +6438,7 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
 pub fn Lowerer_lower_method_call(self: &mut Lowerer, receiver: Box<Expr>, method: str, args: Vec<Expr>) -> i64 {
     // `v.get(i).items.push(x)`: the changing method owns its own receiver
     // (Vec_push calls vec_own); the Vecs it is reached through, here
-    if LOWER_COW && lw_changing_method(method) { Lowerer_own_path(self, lw_box_expr_unbox(receiver)); }
+    if (LOWER_COW || LOWER_RC) && lw_changing_method(method) { Lowerer_own_path(self, lw_box_expr_unbox(receiver)); }
     // Check for associated function calls: Vec::new(), HashMap::new(), String::from()
     match lw_box_expr_unbox(receiver) {
         Expr::Ident(name) => {
@@ -5800,9 +6482,15 @@ pub fn Lowerer_lower_method_call(self: &mut Lowerer, receiver: Box<Expr>, method
 
     // Lower arguments
     var arg_vals: Vec<i64> = Vec::new();
+    var keeps_arg: bool = method == "push" || method == "insert" || method == "set";
     var ai: i64 = 0;
     while ai < args.len() {
-        arg_vals.push(Lowerer_lower_expr(self, args.get(ai)));
+        if keeps_arg && ai + 1 == args.len() {
+            // The element it keeps: a variable's last use is moved
+            arg_vals.push(Lowerer_lower_keep(self, args.get(ai)));
+        } else {
+            arg_vals.push(Lowerer_lower_expr(self, args.get(ai)));
+        }
         ai = ai + 1;
     }
 
@@ -5856,6 +6544,28 @@ pub fn Lowerer_lower_method_call(self: &mut Lowerer, receiver: Box<Expr>, method
     if str_starts_with(mangled_name, "HashMap_") && Lowerer_has_function(self, mangled_name + "_i")
         && Lowerer_map_has_int_keys(self, receiver, recv_ty) {
         mangled_name = mangled_name + "_i";
+    }
+
+    // Ownership (proposal 0004): an element a Vec or a map keeps is an
+    // owner of its own
+    if self.own_on {
+        var recv_e: Expr = lw_box_expr_unbox(receiver);
+        if str_starts_with(mangled_name, "Vec_") && (method == "push" || method == "insert" || method == "set") && arg_vals.len() > 0 {
+            var last: i64 = arg_vals.len() - 1;
+            var et: Type = Lowerer_rc_vec_elem_ast(self, recv_e);
+            if Lowerer_rc_kind(self, et) == RC_NONE { et = Lowerer_rc_value_type(self, args.get(last), arg_vals.get(last)); }
+            arg_vals.set(last, Lowerer_rc_own_value(self, arg_vals.get(last), et));
+        }
+        if str_starts_with(mangled_name, "HashMap_insert") && arg_vals.len() == 2 {
+            var kv: Vec<Type> = Lowerer_rc_map_kv_ast(self, recv_e);
+            var kt: Type = Type::Infer;
+            var vt: Type = Type::Infer;
+            if kv.len() == 2 { kt = kv.get(0); vt = kv.get(1); }
+            if Lowerer_rc_kind(self, kt) == RC_NONE { kt = Lowerer_rc_value_type(self, args.get(0), arg_vals.get(0)); }
+            if Lowerer_rc_kind(self, vt) == RC_NONE { vt = Lowerer_rc_value_type(self, args.get(1), arg_vals.get(1)); }
+            if mangled_name == "HashMap_insert" { arg_vals.set(0, Lowerer_rc_own_value(self, arg_vals.get(0), kt)); }
+            arg_vals.set(1, Lowerer_rc_own_value(self, arg_vals.get(1), vt));
+        }
     }
 
     // Determine return type
@@ -5965,17 +6675,27 @@ pub fn Lowerer_lower_method_call(self: &mut Lowerer, receiver: Box<Expr>, method
                 si = si + 1;
             }
             Lowerer_emit_inst(self, Inst::Call(mangled_name, sret_args, IrType::Void, eff));
+            Lowerer_rc_note_sret(self, sret_ptr, mangled_name);
             return sret_ptr;
         }
         _ => {}
     }
 
-    return Lowerer_emit_inst(self, Inst::Call(mangled_name, call_args, ret_ty, eff));
+    var mres: i64 = Lowerer_emit_inst(self, Inst::Call(mangled_name, call_args, ret_ty, eff));
+    // pop/remove take the element out: the caller owns it (proposal 0004)
+    if self.own_on && (mangled_name == "Vec_pop" || mangled_name == "Vec_remove") {
+        var pet: Type = Lowerer_rc_vec_elem_ast(self, lw_box_expr_unbox(receiver));
+        var pk: i64 = Lowerer_rc_kind(self, pet);
+        if pk == RC_STR || pk == RC_VEC || pk == RC_MAP { Lowerer_rc_temp(self, mres, pet); }
+    }
+    return mres;
 }
 
 // Helper: Box::new(x) lowering
 pub fn Lowerer_lower_box_new(self: &mut Lowerer, arg_expr: Expr) -> i64 {
-    var val: i64 = Lowerer_lower_expr(self, arg_expr);
+    // The box keeps an owner of what it holds (proposal 0004; a Box is
+    // never dropped, so that owner stays)
+    var val: i64 = Lowerer_rc_owned_any(self, arg_expr);
     var val_ty: IrType = Lowerer_get_value_type(self, val);
     var alloc_size: i64 = 8;
     var store_ty: OptIrType = OptIrType::None;
@@ -6031,6 +6751,7 @@ pub fn Lowerer_lower_assoc_call(self: &mut Lowerer, struct_name: str, method: st
                 si = si + 1;
             }
             Lowerer_emit_inst(self, Inst::Call(mangled, sret_args, IrType::Void, seff));
+            Lowerer_rc_note_sret(self, sret_ptr, mangled);
             return sret_ptr;
         }
         _ => {
@@ -6385,7 +7106,7 @@ fn Lowerer_c_callback(self: &Lowerer, ext_idx: i64, i: i64, arg: Expr) -> str {
 /// On since Nov 6: the suite (fid emit, 364 programs) gives the same output
 /// with it on and off, and the compiler reaches its fixpoint with it on
 /// (93 s, 4.7 GB peak).
-const LOWER_COW: bool = true;
+const LOWER_COW: bool = false;
 
 /// Whether callers pass a copy-on-write share of each by-value Vec argument
 /// (then a callee may free the parameters it only borrows at its return).
@@ -6447,6 +7168,7 @@ fn Lowerer_emit_vec_own(self: &mut Lowerer, e: Expr) {
 /// literal, a returned value): a Vec read from a place is shared copy-on-write
 /// (proposal 0001; as src/lower.rs lower_value).
 fn Lowerer_lower_value(self: &mut Lowerer, expr: Expr) -> i64 {
+    if !LOWER_COW { return Lowerer_lower_expr(self, expr); }
     var val: i64 = Lowerer_lower_expr(self, expr);
     var place: bool = false;
     match expr {
@@ -6529,7 +7251,7 @@ fn lw_has_defer(stmts: Vec<Stmt>) -> bool {
 /// is a local or by-value parameter. Then the value can be handed over
 /// without a copy-on-write share.
 fn Lowerer_last_use(self: &Lowerer, n: str) -> bool {
-    if !LOWER_COW { return false; }
+    if !LOWER_COW && !LOWER_RC { return false; }
     var depth: i64 = self.fr_lists.len();
     if depth == 0 || depth != self.fr_idx.len() { return false; }
     var is_local: bool = false;
@@ -6854,7 +7576,13 @@ fn Lowerer_lower_call_expr(self: &mut Lowerer, callee: str, args: Vec<Expr>) -> 
             }
             arg_vals.push(Lowerer_emit_inst(self, Inst::ConstFnRef(c_fn_name(c_fn))));
         } else {
-            arg_vals.push(Lowerer_lower_arg_for_param(self, resolved_args.get(ai), callee, ai));
+            var lav: i64 = Lowerer_lower_arg_for_param(self, resolved_args.get(ai), callee, ai);
+            // core's Vec_push/HashMap_insert keep their element: an owner
+            // of its own (proposal 0004)
+            if self.own_on && lw_rc_consuming_arg(callee, ai) {
+                lav = Lowerer_rc_own_value(self, lav, Lowerer_rc_value_type(self, resolved_args.get(ai), lav));
+            }
+            arg_vals.push(lav);
         }
         ai = ai + 1;
     }
@@ -6870,6 +7598,14 @@ fn Lowerer_lower_call_expr(self: &mut Lowerer, callee: str, args: Vec<Expr>) -> 
         var cai: i64 = 0;
         while cai < arg_vals.len() {
             var av: i64 = arg_vals.get(cai);
+            // The task runs on while its caller goes on: it keeps owners of
+            // its own of what it was given (proposal 0004)
+            if self.own_on && cai < resolved_args.len() {
+                var taty: Type = Lowerer_rc_value_type(self, resolved_args.get(cai), av);
+                var tak: i64 = Lowerer_rc_kind(self, taty);
+                if tak == RC_MEM { av = Lowerer_rc_dup(self, av, taty); }
+                else if tak != RC_NONE { av = Lowerer_rc_own_value(self, av, taty); }
+            }
             if adapted {
                 // f64 as its bits; a struct as a heap copy, since the caller
                 // goes on (and may return) while the task runs
@@ -7053,12 +7789,21 @@ fn Lowerer_lower_call_expr(self: &mut Lowerer, callee: str, args: Vec<Expr>) -> 
                 si = si + 1;
             }
             Lowerer_emit_inst(self, Inst::Call(callee, sret_args, IrType::Void, eff));
+            Lowerer_rc_note_sret(self, sret_ptr, callee);
             return sret_ptr;
         }
         _ => {}
     }
 
-    return Lowerer_emit_inst(self, Inst::Call(callee, call_args, ret_ty, eff));
+    var plain_call: i64 = Lowerer_emit_inst(self, Inst::Call(callee, call_args, ret_ty, eff));
+    // A string from C is C's: the program gets a counted copy ("" for null)
+    if self.own_on && lw_c_str_vec_contains(self.own_str_externs, callee) && Lowerer_has_function(self, "p_str_take") {
+        var ta: Vec<i64> = Vec::new();
+        ta.push(Lowerer_rc_env(self));
+        ta.push(Lowerer_rc_as_i64(self, plain_call));
+        return Lowerer_emit_inst(self, Inst::Call("p_str_take", ta, ret_ty, lw_rc_eff()));
+    }
+    return plain_call;
 }
 
 fn Lowerer_lower_field_access_expr(self: &mut Lowerer, obj: Box<Expr>, field: str) -> i64 {
@@ -7297,6 +8042,26 @@ fn Lowerer_lower_if_expr(self: &mut Lowerer, cond: Box<Expr>, then_block0: Vec<S
     if has_value {
         result_slot = Lowerer_emit_inst(self, Inst::Alloca(result_ty, Lowerer_current_region(self)));
     }
+    // Ownership (proposal 0004): each branch hands an owner of its value to
+    // the result, a temporary of the statement
+    var ires_ty: Type = Type::Infer;
+    if self.own_on && has_value {
+        var tails: Vec<Expr> = Vec::new();
+        match if_branch_tail_expr(then_block) {
+            OptExpr::Some(te2) => { tails.push(te2); }
+            OptExpr::None => {}
+        }
+        match else_block {
+            OptStmts::Some(es2) => {
+                match if_branch_tail_expr(es2) {
+                    OptExpr::Some(ee2) => { tails.push(ee2); }
+                    OptExpr::None => {}
+                }
+            }
+            OptStmts::None => {}
+        }
+        ires_ty = Lowerer_rc_result_type(self, tails);
+    }
 
     var cond_val: i64 = Lowerer_lower_expr(self, box_expr_unbox(cond));
     var then_block_id: i64 = Lowerer_new_block(self);
@@ -7311,12 +8076,15 @@ fn Lowerer_lower_if_expr(self: &mut Lowerer, cond: Box<Expr>, then_block0: Vec<S
     var saved_locals_len: i64 = self.current_func.locals.len();
 
     Lowerer_set_current_block(self, then_block_id);
+    var then_mark: i64 = self.own_temps.len();
+    Lowerer_rc_scope_open(self);
     var ti: i64 = 0;
     while ti < then_block.len() {
         match then_block.get(ti) {
             Stmt::Expr(e, _) => {
                 var tv: i64 = Lowerer_lower_expr(self, e);
                 if has_value && ti + 1 == then_block.len() && !Lowerer_current_block_has_terminator(self) {
+                    tv = Lowerer_rc_own_value(self, tv, ires_ty);
                     Lowerer_emit_inst(self, Inst::Store(result_slot, tv, OptIrType::None));
                 }
             }
@@ -7324,6 +8092,8 @@ fn Lowerer_lower_if_expr(self: &mut Lowerer, cond: Box<Expr>, then_block0: Vec<S
         }
         ti = ti + 1;
     }
+    Lowerer_rc_flush(self, then_mark);
+    Lowerer_rc_scope_close(self);
     if !Lowerer_current_block_has_terminator(self) {
         Lowerer_emit_terminator(self, Inst::Jump(merge_block_id));
     }
@@ -7333,6 +8103,8 @@ fn Lowerer_lower_if_expr(self: &mut Lowerer, cond: Box<Expr>, then_block0: Vec<S
     self.current_func.locals.truncate(saved_locals_len);
 
     Lowerer_set_current_block(self, else_block_id);
+    var else_mark: i64 = self.own_temps.len();
+    Lowerer_rc_scope_open(self);
     match else_block {
         OptStmts::Some(else_stmts) => {
             var ei: i64 = 0;
@@ -7341,6 +8113,7 @@ fn Lowerer_lower_if_expr(self: &mut Lowerer, cond: Box<Expr>, then_block0: Vec<S
                     Stmt::Expr(e2, _) => {
                         var ev: i64 = Lowerer_lower_expr(self, e2);
                         if has_value && ei + 1 == else_stmts.len() && !Lowerer_current_block_has_terminator(self) {
+                            ev = Lowerer_rc_own_value(self, ev, ires_ty);
                             Lowerer_emit_inst(self, Inst::Store(result_slot, ev, OptIrType::None));
                         }
                     }
@@ -7351,6 +8124,8 @@ fn Lowerer_lower_if_expr(self: &mut Lowerer, cond: Box<Expr>, then_block0: Vec<S
         }
         OptStmts::None => {}
     }
+    Lowerer_rc_flush(self, else_mark);
+    Lowerer_rc_scope_close(self);
     if !Lowerer_current_block_has_terminator(self) {
         Lowerer_emit_terminator(self, Inst::Jump(merge_block_id));
     }
@@ -7361,7 +8136,9 @@ fn Lowerer_lower_if_expr(self: &mut Lowerer, cond: Box<Expr>, then_block0: Vec<S
 
     Lowerer_set_current_block(self, merge_block_id);
     if has_value {
-        return Lowerer_emit_inst(self, Inst::Load(result_slot, result_ty));
+        var ires: i64 = Lowerer_emit_inst(self, Inst::Load(result_slot, result_ty));
+        Lowerer_rc_temp(self, ires, ires_ty);
+        return ires;
     }
     return Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
 }
@@ -7379,6 +8156,21 @@ fn Lowerer_lower_match_expr(self: &mut Lowerer, e: Box<Expr>, arms0: Vec<MatchAr
     var result_slot: i64 = 0;
     if has_value {
         result_slot = Lowerer_emit_inst(self, Inst::Alloca(result_ty, Lowerer_current_region(self)));
+    }
+    // Ownership (proposal 0004): each arm hands an owner of its value to
+    // the result, a temporary of the statement
+    var mres_ty: Type = Type::Infer;
+    if self.own_on && has_value {
+        var mtails: Vec<Expr> = Vec::new();
+        var mi: i64 = 0;
+        while mi < arms.len() {
+            match if_branch_tail_expr(arms.get(mi).body) {
+                OptExpr::Some(mt) => { mtails.push(mt); }
+                OptExpr::None => {}
+            }
+            mi = mi + 1;
+        }
+        mres_ty = Lowerer_rc_result_type(self, mtails);
     }
 
     var i: i64 = 0;
@@ -7510,7 +8302,10 @@ fn Lowerer_lower_match_expr(self: &mut Lowerer, e: Box<Expr>, arms0: Vec<MatchAr
                 // Arm guard: evaluated with the bindings in scope.
                 match arm.guard {
                     OptBoxExpr::Some(guard_expr) => {
+                        // A guard runs only for its arm: its temporaries end before the branch
+                        var gmark: i64 = self.own_temps.len();
                         var guard_val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(guard_expr));
+                        Lowerer_rc_flush(self, gmark);
                         var guard_body_block: i64 = Lowerer_new_block(self);
                         Lowerer_emit_terminator(self, Inst::Branch(guard_val, guard_body_block, next_block));
                         Lowerer_set_current_block(self, guard_body_block);
@@ -7520,6 +8315,8 @@ fn Lowerer_lower_match_expr(self: &mut Lowerer, e: Box<Expr>, arms0: Vec<MatchAr
 
                 var arm_result: i64 = 0;
                 var arm_has_value: bool = false;
+                var arm_mark: i64 = self.own_temps.len();
+                Lowerer_rc_scope_open(self);
                 var si: i64 = 0;
                 while si < arm.body.len() {
                     match arm.body.get(si) {
@@ -7528,6 +8325,11 @@ fn Lowerer_lower_match_expr(self: &mut Lowerer, e: Box<Expr>, arms0: Vec<MatchAr
                     }
                     si = si + 1;
                 }
+                if !Lowerer_current_block_has_terminator(self) && has_value && arm_has_value {
+                    arm_result = Lowerer_rc_own_value(self, arm_result, mres_ty);
+                }
+                Lowerer_rc_flush(self, arm_mark);
+                Lowerer_rc_scope_close(self);
                 if !Lowerer_current_block_has_terminator(self) {
                     if has_value && arm_has_value {
                         Lowerer_emit_inst(self, Inst::Store(result_slot, arm_result, OptIrType::None));
@@ -7548,7 +8350,10 @@ fn Lowerer_lower_match_expr(self: &mut Lowerer, e: Box<Expr>, arms0: Vec<MatchAr
         // Arm guard: evaluated with the bindings in scope.
         match arm.guard {
             OptBoxExpr::Some(guard_expr) => {
+                // A guard runs only for its arm: its temporaries end before the branch
+                var gmark: i64 = self.own_temps.len();
                 var guard_val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(guard_expr));
+                Lowerer_rc_flush(self, gmark);
                 var guard_body_block: i64 = Lowerer_new_block(self);
                 Lowerer_emit_terminator(self, Inst::Branch(guard_val, guard_body_block, next_block));
                 Lowerer_set_current_block(self, guard_body_block);
@@ -7557,6 +8362,8 @@ fn Lowerer_lower_match_expr(self: &mut Lowerer, e: Box<Expr>, arms0: Vec<MatchAr
         }
         var arm_result: i64 = 0;
         var arm_has_value: bool = false;
+        var arm_mark: i64 = self.own_temps.len();
+        Lowerer_rc_scope_open(self);
         var si: i64 = 0;
         while si < arm.body.len() {
             match arm.body.get(si) {
@@ -7565,6 +8372,11 @@ fn Lowerer_lower_match_expr(self: &mut Lowerer, e: Box<Expr>, arms0: Vec<MatchAr
             }
             si = si + 1;
         }
+        if !Lowerer_current_block_has_terminator(self) && has_value && arm_has_value {
+            arm_result = Lowerer_rc_own_value(self, arm_result, mres_ty);
+        }
+        Lowerer_rc_flush(self, arm_mark);
+        Lowerer_rc_scope_close(self);
         if !Lowerer_current_block_has_terminator(self) {
             if has_value && arm_has_value {
                 Lowerer_emit_inst(self, Inst::Store(result_slot, arm_result, OptIrType::None));
@@ -7586,15 +8398,17 @@ fn Lowerer_lower_match_expr(self: &mut Lowerer, e: Box<Expr>, arms0: Vec<MatchAr
 
     Lowerer_set_current_block(self, merge_block);
     if has_value {
-        return Lowerer_emit_inst(self, Inst::Load(result_slot, result_ty));
+        var mres: i64 = Lowerer_emit_inst(self, Inst::Load(result_slot, result_ty));
+        Lowerer_rc_temp(self, mres, mres_ty);
+        return mres;
     }
     return Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
 }
 
 fn Lowerer_lower_try_expr(self: &mut Lowerer, e: Box<Expr>) -> i64 {
-    var val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(e));
+    var tval: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(e));
 
-    var tag_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(val, 0, IrType::I64));
+    var tag_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(tval, 0, IrType::I64));
     var tag: i64 = Lowerer_emit_inst(self, Inst::Load(tag_ptr, IrType::I64));
 
     var ok_block: i64 = Lowerer_new_block(self);
@@ -7615,12 +8429,12 @@ fn Lowerer_lower_try_expr(self: &mut Lowerer, e: Box<Expr>) -> i64 {
         var try_err_block: i64 = ctx.error_block;
         var try_err_slot: i64 = ctx.error_result_slot;
 
-        var src_tag_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(val, 0, IrType::I64));
+        var src_tag_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(tval, 0, IrType::I64));
         var src_tag: i64 = Lowerer_emit_inst(self, Inst::Load(src_tag_ptr, IrType::I64));
         var dst_tag_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(try_err_slot, 0, IrType::I64));
         Lowerer_emit_inst(self, Inst::Store(dst_tag_ptr, src_tag, OptIrType::None));
 
-        var src_val_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(val, 1, IrType::I64));
+        var src_val_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(tval, 1, IrType::I64));
         var src_val: i64 = Lowerer_emit_inst(self, Inst::Load(src_val_ptr, IrType::I64));
         var dst_val_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(try_err_slot, 1, IrType::I64));
         Lowerer_emit_inst(self, Inst::Store(dst_val_ptr, src_val, OptIrType::None));
@@ -7629,23 +8443,31 @@ fn Lowerer_lower_try_expr(self: &mut Lowerer, e: Box<Expr>) -> i64 {
     } else {
         Lowerer_emit_drops(self);
         Lowerer_emit_defers(self);
+        // Ownership (proposal 0004): the error goes to the caller with an
+        // owner of its own, then this function's values are dropped. A
+        // Result whose type is unknown here drops nothing (it may borrow).
+        var tty: Type = Lowerer_rc_value_type(self, lw_box_expr_unbox(e), tval);
+        if self.own_on && Lowerer_rc_kind(self, tty) == RC_MEM {
+            tval = Lowerer_rc_dup(self, tval, tty);
+            Lowerer_rc_drop_all(self);
+        }
         match self.current_sret {
             OptValueId::Some(sret) => {
                 // Struct return: the caller reads the result from its
                 // out-param, so copy tag and payload there (as src/lower.rs);
                 // a bare return left the caller's buffer as it was
-                var e_tag_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(val, 0, IrType::I64));
+                var e_tag_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(tval, 0, IrType::I64));
                 var e_tag: i64 = Lowerer_emit_inst(self, Inst::Load(e_tag_ptr, IrType::I64));
                 var r_tag_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(sret, 0, IrType::I64));
                 Lowerer_emit_inst(self, Inst::Store(r_tag_ptr, e_tag, OptIrType::None));
-                var e_val_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(val, 1, IrType::I64));
+                var e_val_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(tval, 1, IrType::I64));
                 var e_val: i64 = Lowerer_emit_inst(self, Inst::Load(e_val_ptr, IrType::I64));
                 var r_val_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(sret, 1, IrType::I64));
                 Lowerer_emit_inst(self, Inst::Store(r_val_ptr, e_val, OptIrType::None));
                 Lowerer_emit_terminator(self, Inst::Return(OptValueId::None));
             }
             OptValueId::None => {
-                Lowerer_emit_terminator(self, Inst::Return(OptValueId::Some(val)));
+                Lowerer_emit_terminator(self, Inst::Return(OptValueId::Some(tval)));
             }
         }
     }
@@ -7663,7 +8485,7 @@ fn Lowerer_lower_try_expr(self: &mut Lowerer, e: Box<Expr>) -> i64 {
         }
         _ => {}
     }
-    var val_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(val, 1, ok_ty));
+    var val_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(tval, 1, ok_ty));
     return Lowerer_emit_inst(self, Inst::Load(val_ptr, ok_ty));
 }
 
@@ -7808,13 +8630,38 @@ fn Lowerer_lower_struct_lit_expr(self: &mut Lowerer, name: str, fields: Vec<Fiel
         }
         OptBoxExpr::None => {}
     }
+    // Ownership (proposal 0004): the copied fields of a `..spread` get one
+    // more owner each; an explicit field then replaces (drops) its copy
+    var lit_ty: Type = Type::Named(real_name);
+    var has_spread: bool = false;
+    match spread {
+        OptBoxExpr::Some(_) => { has_spread = true; }
+        OptBoxExpr::None => {}
+    }
+    if self.own_on && has_spread && Lowerer_rc_kind(self, lit_ty) == RC_MEM {
+        Lowerer_rc_call_mem(self, "__own_dup_", alloca, lit_ty);
+    }
 
     match IrModule_get_struct(&self.module, real_name) {
         OptStructLayout::Some(layout) => {
             var fi: i64 = 0;
             while fi < fields.len() {
                 var field_init: FieldInit = fields.get(fi);
-                var field_val: i64 = Lowerer_lower_value(self, field_init.value);
+                var field_val: i64 = 0;
+                var lfty: Type = Type::Infer;
+                if self.own_on {
+                    lfty = Lowerer_rc_field_ast_type(self, real_name, field_init.name);
+                    if lw_is_vec_new_expr(field_init.value) || lw_rc_is_map_new_expr(field_init.value) {
+                        field_val = Lowerer_rc_new_coll(self, lfty);
+                        if field_val < 0 { field_val = Lowerer_lower_expr(self, field_init.value); }
+                    } else {
+                        field_val = Lowerer_lower_keep(self, field_init.value);
+                    }
+                    if Lowerer_rc_kind(self, lfty) == RC_NONE { lfty = Lowerer_rc_value_type(self, field_init.value, field_val); }
+                    field_val = Lowerer_rc_own_value(self, field_val, lfty);
+                } else {
+                    field_val = Lowerer_lower_value(self, field_init.value);
+                }
                 var field_idx: i64 = -1;
                 var fj: i64 = 0;
                 while fj < layout.fields.len() && field_idx < 0 {
@@ -7824,6 +8671,15 @@ fn Lowerer_lower_struct_lit_expr(self: &mut Lowerer, name: str, fields: Vec<Fiel
                 if field_idx >= 0 {
                     var field_ty: IrType = layout.fields.get(field_idx).ty;
                     var field_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(alloca, field_idx, field_ty));
+                    if self.own_on && has_spread {
+                        // The spread's copy of this field is replaced
+                        var sk: i64 = Lowerer_rc_kind(self, lfty);
+                        if sk == RC_MEM {
+                            Lowerer_rc_call_mem(self, "__own_drop_", field_ptr, lfty);
+                        } else if sk != RC_NONE {
+                            Lowerer_rc_drop(self, Lowerer_emit_inst(self, Inst::Load(field_ptr, field_ty)), lfty);
+                        }
+                    }
                     match field_ty {
                         IrType::Struct(field_struct_name) => {
                             Lowerer_emit_struct_copy(self, field_val, field_ptr, field_struct_name);
@@ -7846,6 +8702,14 @@ fn Lowerer_lower_struct_lit_expr(self: &mut Lowerer, name: str, fields: Vec<Fiel
         }
     }
 
+    // A new struct: a temporary the statement owns
+    match self.let_hint {
+        OptType::Some(lh) => {
+            if lw_rc_type_name(Lowerer_resolve_type(self, lh)) == real_name { lit_ty = Lowerer_resolve_type(self, lh); }
+        }
+        OptType::None => {}
+    }
+    Lowerer_rc_temp(self, alloca, lit_ty);
     return alloca;
 }
 
@@ -8036,8 +8900,12 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                     Lowerer_emit_terminator(self, Inst::Branch(lhs, merge_bb, rhs_bb));
                 }
                 Lowerer_set_current_block(self, rhs_bb);
+                // The right side's temporaries end with it: it may not run
+                // (proposal 0004)
+                var rhs_mark: i64 = self.own_temps.len();
                 var rhs: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(right));
                 Lowerer_emit_inst(self, Inst::Store(slot, rhs, OptIrType::None));
+                Lowerer_rc_flush(self, rhs_mark);
                 Lowerer_emit_terminator(self, Inst::Jump(merge_bb));
                 Lowerer_set_current_block(self, merge_bb);
                 return Lowerer_emit_inst(self, Inst::Load(slot, IrType::Bool));
@@ -8325,6 +9193,10 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                 _ => {}
             }
             var val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(e));
+            // A new string, Vec or map made a raw word (`f() as i64`): the
+            // word now holds it, so the statement does not drop it (code
+            // that does this frees it by hand, proposal 0004)
+            if self.own_on && Lowerer_rc_kind(self, ty) == RC_NONE { Lowerer_rc_claim(self, val); }
             var src_ty: IrType = Lowerer_get_value_type(self, val);
             var dst_ty: IrType = Lowerer_lower_type(self, ty);
             return Lowerer_lower_cast(self, val, src_ty, dst_ty);
@@ -8524,7 +9396,17 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             var field_idx: i64 = 1;
             var ai: i64 = 0;
             while ai < args.len() {
-                var arg_val: i64 = Lowerer_lower_expr(self, args.get(ai));
+                var arg_val: i64 = Lowerer_lower_keep(self, args.get(ai));
+                // Ownership (proposal 0004): the enum keeps an owner of its
+                // payload
+                if self.own_on {
+                    var pty: Type = Type::Infer;
+                    if ai < declared_field_tys.len() { pty = declared_field_tys.get(ai); }
+                    if lw_rc_is_param(pty, enum_type_params) || Lowerer_rc_kind(self, pty) == RC_NONE {
+                        pty = Lowerer_rc_value_type(self, args.get(ai), arg_val);
+                    }
+                    arg_val = Lowerer_rc_own_value(self, arg_val, pty);
+                }
                 var arg_ty: IrType = Lowerer_get_value_type(self, arg_val);
 
                 // Check the declared field type to determine if this field
@@ -8613,6 +9495,8 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                 ai = ai + 1;
             }
 
+            // A new enum value: a temporary the statement owns
+            if self.own_on { Lowerer_rc_temp(self, alloca, Lowerer_enum_lit_ast_type(self, enum_name, variant, args)); }
             return alloca;
         }
         Expr::Match(e, arms) => {
@@ -8642,7 +9526,13 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             Lowerer_emit_terminator(self, Inst::Jump(merge_block));
 
             Lowerer_set_current_block(self, none_block);
+            // The default runs only when the option is None: its temporaries
+            // end here, and a new default value is the result's (left to
+            // leak rather than drop a borrowed Some value, proposal 0004)
+            var dmark: i64 = self.own_temps.len();
             var default_val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(right));
+            Lowerer_rc_claim(self, default_val);
+            Lowerer_rc_flush(self, dmark);
             var _s2: i64 = Lowerer_emit_inst(self, Inst::Store(result_slot, default_val, OptIrType::None));
             Lowerer_emit_terminator(self, Inst::Jump(merge_block));
 
@@ -9325,6 +10215,12 @@ pub fn Lowerer_make_fn_env(self: &mut Lowerer, fn_name: str, captures: Vec<Strin
         var cap_name: str = captures.get(ci).key;
         // Lower the capture value from enclosing scope
         var cap_val: i64 = Lowerer_lower_expr(self, Expr::Ident(cap_name));
+        // A closure may outlive the scope it was made in: it keeps an owner
+        // of a captured string, Vec or map (proposal 0004)
+        var cap_k: i64 = Lowerer_rc_kind(self, captures.get(ci).val);
+        if self.own_on && cap_k != RC_NONE && cap_k != RC_MEM {
+            cap_val = Lowerer_rc_dup(self, cap_val, captures.get(ci).val);
+        }
         var idx: i64 = Lowerer_emit_inst(self, Inst::ConstInt(ci + 1, IrType::I64));
         var field: i64 = Lowerer_emit_inst(self, Inst::GetElemPtr(env_ptr, idx, IrType::I64));
         var _s2: i64 = Lowerer_emit_inst(self, Inst::Store(field, cap_val, OptIrType::None));
@@ -9343,16 +10239,20 @@ pub fn Lowerer_lower_while(self: &mut Lowerer, cond: Expr, body: Vec<Stmt>) {
     // Jump to condition block
     Lowerer_emit_terminator(self, Inst::Jump(cond_block));
 
-    // Condition block
+    // Condition block: its temporaries end before the branch
     Lowerer_set_current_block(self, cond_block);
+    var cmark: i64 = self.own_temps.len();
     var cond_val: i64 = Lowerer_lower_expr(self, cond);
+    Lowerer_rc_flush(self, cmark);
     Lowerer_emit_terminator(self, Inst::Branch(cond_val, body_block, exit_block));
 
     // Body block
     Lowerer_set_current_block(self, body_block);
+    Lowerer_rc_loop_open(self);
     self.loop_stack.push(LoopContext_new(cond_block, exit_block, OptValueId::None));
     Lowerer_lower_stmts(self, body);
     self.loop_stack.pop();
+    Lowerer_rc_loop_close(self);
     if !Lowerer_current_block_has_terminator(self) {
         Lowerer_emit_terminator(self, Inst::Jump(cond_block));
     }
@@ -9390,9 +10290,11 @@ pub fn Lowerer_lower_for(self: &mut Lowerer, loop_var: str, iterator: Expr, body
 
             // Body
             Lowerer_set_current_block(self, body_block);
-            self.loop_stack.push(LoopContext_new(cond_block, exit_block, OptValueId::None));
+            Lowerer_rc_loop_open(self);
+    self.loop_stack.push(LoopContext_new(cond_block, exit_block, OptValueId::None));
             Lowerer_lower_stmts(self, body);
             self.loop_stack.pop();
+    Lowerer_rc_loop_close(self);
 
             // Increment: var += 1
             if !Lowerer_current_block_has_terminator(self) {
@@ -9515,7 +10417,8 @@ pub fn Lowerer_lower_for(self: &mut Lowerer, loop_var: str, iterator: Expr, body
 
             // Body
             Lowerer_set_current_block(self, body_block);
-            self.loop_stack.push(LoopContext_new(cond_block, exit_block, OptValueId::None));
+            Lowerer_rc_loop_open(self);
+    self.loop_stack.push(LoopContext_new(cond_block, exit_block, OptValueId::None));
 
             // Load element: arr[i]
             var elem_ptr: i64 = Lowerer_emit_inst(self, Inst::GetElemPtr(arr_val, idx_val, elem_ty));
@@ -9524,6 +10427,7 @@ pub fn Lowerer_lower_for(self: &mut Lowerer, loop_var: str, iterator: Expr, body
 
             Lowerer_lower_stmts(self, body);
             self.loop_stack.pop();
+    Lowerer_rc_loop_close(self);
 
             // Increment index
             if !Lowerer_current_block_has_terminator(self) {
@@ -9585,9 +10489,11 @@ pub fn Lowerer_lower_for_string(self: &mut Lowerer, loop_var: str, str_val: i64,
     var byte_val: i64 = Lowerer_emit_inst(self, Inst::Call("String_byte_at", byte_args, IrType::I64, EffectSet_new()));
     var _s2: i64 = Lowerer_emit_inst(self, Inst::Store(var_alloca, byte_val, OptIrType::None));
 
+    Lowerer_rc_loop_open(self);
     self.loop_stack.push(LoopContext_new(cond_block, exit_block, OptValueId::None));
     Lowerer_lower_stmts(self, body);
     self.loop_stack.pop();
+    Lowerer_rc_loop_close(self);
 
     if !Lowerer_current_block_has_terminator(self) {
         var cur: i64 = Lowerer_emit_inst(self, Inst::Load(idx_alloca, IrType::I64));
@@ -9642,6 +10548,7 @@ pub fn Lowerer_lower_for_vec(self: &mut Lowerer, loop_var: str, vec_val: i64, bo
 
     // Body
     Lowerer_set_current_block(self, body_block);
+    Lowerer_rc_loop_open(self);
     self.loop_stack.push(LoopContext_new(cond_block, exit_block, OptValueId::None));
 
     // Load element: Vec_get(vec, i) - use word_repr for struct elements
@@ -9654,6 +10561,7 @@ pub fn Lowerer_lower_for_vec(self: &mut Lowerer, loop_var: str, vec_val: i64, bo
 
     Lowerer_lower_stmts(self, body);
     self.loop_stack.pop();
+    Lowerer_rc_loop_close(self);
 
     // Increment index
     if !Lowerer_current_block_has_terminator(self) {
@@ -9675,9 +10583,11 @@ pub fn Lowerer_lower_loop(self: &mut Lowerer, body: Vec<Stmt>) {
 
     // Body block
     Lowerer_set_current_block(self, body_block);
+    Lowerer_rc_loop_open(self);
     self.loop_stack.push(LoopContext_new(body_block, exit_block, OptValueId::None));
     Lowerer_lower_stmts(self, body);
     self.loop_stack.pop();
+    Lowerer_rc_loop_close(self);
 
     // If body doesn't end with terminator, jump back to body (infinite loop)
     if !Lowerer_current_block_has_terminator(self) {
@@ -9832,7 +10742,10 @@ pub fn Lowerer_lower_match(self: &mut Lowerer, expr: Expr, arms: Vec<MatchArm>) 
                 // Arm guard: evaluated with the bindings in scope.
                 match arm.guard {
                     OptBoxExpr::Some(guard_expr) => {
+                        // A guard runs only for its arm: its temporaries end before the branch
+                        var gmark: i64 = self.own_temps.len();
                         var guard_val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(guard_expr));
+                        Lowerer_rc_flush(self, gmark);
                         var guard_body_block: i64 = Lowerer_new_block(self);
                         Lowerer_emit_terminator(self, Inst::Branch(guard_val, guard_body_block, next_block));
                         Lowerer_set_current_block(self, guard_body_block);
@@ -9859,7 +10772,10 @@ pub fn Lowerer_lower_match(self: &mut Lowerer, expr: Expr, arms: Vec<MatchArm>) 
         // Arm guard: evaluated with the bindings in scope.
         match arm.guard {
             OptBoxExpr::Some(guard_expr) => {
+                // A guard runs only for its arm: its temporaries end before the branch
+                var gmark: i64 = self.own_temps.len();
                 var guard_val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(guard_expr));
+                Lowerer_rc_flush(self, gmark);
                 var guard_body_block: i64 = Lowerer_new_block(self);
                 Lowerer_emit_terminator(self, Inst::Branch(guard_val, guard_body_block, next_block));
                 Lowerer_set_current_block(self, guard_body_block);
@@ -10412,14 +11328,32 @@ fn lw_map_method_ret_ty(method: str, recv_ty: IrType) -> IrType {
     if method == "is_empty" || method == "contains" {
         return IrType::Bool;
     }
+    // A typed map (HashMap<K, V>) gives its key and value types (release
+    // D14/RT: `.get` was always an i64 whatever V was)
+    var kv: Vec<IrType> = Vec::new();
+    var rt: IrType = recv_ty;
+    match rt {
+        IrType::Ptr(inner) => { rt = box_ir_type_unbox(inner); }
+        _ => {}
+    }
+    match rt {
+        IrType::Generic(gn, gargs) => {
+            if gn == "HashMap" && gargs.len() == 2 { kv = gargs; }
+        }
+        _ => {}
+    }
+    if kv.len() == 2 && (method == "get" || method == "get_or" || method == "get_i" || method == "get_or_i")
+        && !ir_type_is_float(kv.get(1)) {
+        return word_repr(kv.get(1));
+    }
     if method == "keys" {
         var key_args: Vec<IrType> = Vec::new();
-        key_args.push(IrType::Ptr(Box::new(IrType::U8)));
+        if kv.len() == 2 { key_args.push(kv.get(0)); } else { key_args.push(IrType::Ptr(Box::new(IrType::U8))); }
         return IrType::Generic("Vec", key_args);
     }
     if method == "values" {
         var value_args: Vec<IrType> = Vec::new();
-        value_args.push(IrType::I64);
+        if kv.len() == 2 { value_args.push(kv.get(1)); } else { value_args.push(IrType::I64); }
         return IrType::Generic("Vec", value_args);
     }
     return IrType::I64;
@@ -10991,9 +11925,1245 @@ pub fn Lowerer_lower_vec_sret_call(self: &mut Lowerer, func_name: str, ret_ty: I
         fi = fi + 1;
     }
     var _call: i64 = Lowerer_emit_inst(self, Inst::Call(func_name, sret_args, IrType::Void, effects));
+    Lowerer_rc_note_sret(self, sret_ptr, func_name);
     return sret_ptr;
 }
 
 /// -v of a literal (the literal i64::MIN is its own negation).
 @wrapping
 fn lw_neg_lit(v: i64) -> i64 { return 0 - v; }
+
+// --- Ownership (proposal 0004) --------------------------------------------
+// One rule for every managed value (str, Vec, HashMap, and the structs,
+// enums and generic instances that hold them): a variable owns its value
+// and drops it when its scope ends; reading a variable borrows it; a value
+// kept somewhere (a variable, a field, an element, a return value) is
+// counted again (dup) unless it is a temporary, which is handed over.
+// Temporaries are dropped at the end of their statement, parameters are
+// borrowed, and a function returns an owned value. This replaces the
+// copy-on-write shares of LOWER_COW and the auto-drop passes.
+
+const LOWER_RC: bool = true;
+
+const RC_NONE: i64 = 0;
+const RC_STR: i64 = 1;
+const RC_VEC: i64 = 2;
+const RC_MAP: i64 = 3;
+const RC_MEM: i64 = 4;
+
+/// A variable slot that owns its value.
+pub struct OwnSlot {
+    pub slot: i64,
+    pub ty: Type,
+}
+
+/// A temporary the current statement owns; `claimed` once it was kept.
+pub struct OwnTemp {
+    pub val: i64,
+    pub ty: Type,
+    pub claimed: bool,
+}
+
+/// A struct or enum type with generated drop/dup functions
+/// (__own_drop_<index>, __own_dup_<index>); its element type id is
+/// index + 16.
+pub struct OwnType {
+    pub key: str,
+    pub ty: Type,
+}
+
+fn lw_rc_eff() -> EffectSet {
+    var e: EffectSet = EffectSet_new();
+    EffectSet_add(&mut e, Effect::Write);
+    EffectSet_add(&mut e, Effect::Alloc);
+    return e;
+}
+
+/// `t` with each of `params` replaced by the argument at its position (a
+/// parameter without one is unknown).
+fn lw_rc_subst(t: Type, params: Vec<str>, args: Vec<Type>) -> Type {
+    match t {
+        Type::Named(n) => {
+            var i: i64 = 0;
+            while i < params.len() {
+                if params.get(i) == n {
+                    if i < args.len() { return args.get(i); }
+                    return Type::Infer;
+                }
+                i = i + 1;
+            }
+            return t;
+        }
+        Type::Generic(n, a) => {
+            var na: Vec<Type> = Vec::new();
+            var i: i64 = 0;
+            while i < a.len() {
+                na.push(lw_rc_subst(a.get(i), params, args));
+                i = i + 1;
+            }
+            return Type::Generic(n, na);
+        }
+        Type::Tuple(es) => {
+            var ne: Vec<Type> = Vec::new();
+            var j: i64 = 0;
+            while j < es.len() {
+                ne.push(lw_rc_subst(es.get(j), params, args));
+                j = j + 1;
+            }
+            return Type::Tuple(ne);
+        }
+        _ => { return t; }
+    }
+    return t;
+}
+
+/// The name and type arguments of a struct or enum type, or "".
+fn lw_rc_type_name(t: Type) -> str {
+    match t {
+        Type::Named(n) => { return n; }
+        Type::Generic(n, _) => { return n; }
+        _ => {}
+    }
+    return "";
+}
+
+fn lw_rc_type_args(t: Type) -> Vec<Type> {
+    match t {
+        Type::Generic(_, a) => { return a; }
+        _ => {}
+    }
+    var none: Vec<Type> = Vec::new();
+    return none;
+}
+
+/// Whether `t` is a struct or an enum of the program.
+fn Lowerer_rc_is_mem_type(self: &Lowerer, t: Type) -> bool {
+    var name: str = lw_rc_type_name(t);
+    if name == "" || name == "Vec" || name == "HashMap" || name == "Box" || name == "Rc" || name == "Arc" { return false; }
+    match Lowerer_lookup_struct(self, name) {
+        OptStructDef::Some(_) => { return true; }
+        OptStructDef::None => {}
+    }
+    match Lowerer_lookup_enum(self, name) {
+        OptEnumDef::Some(_) => { return true; }
+        OptEnumDef::None => {}
+    }
+    return false;
+}
+
+/// The types of the fields of struct `t`, or of the payloads of every
+/// variant of enum `t`, with its type parameters replaced by its arguments.
+fn Lowerer_rc_field_types(self: &Lowerer, t: Type) -> Vec<Type> {
+    var out: Vec<Type> = Vec::new();
+    var name: str = lw_rc_type_name(t);
+    if name == "" { return out; }
+    var args: Vec<Type> = lw_rc_type_args(t);
+    match Lowerer_lookup_struct(self, name) {
+        OptStructDef::Some(sd) => {
+            var i: i64 = 0;
+            while i < sd.fields.len() {
+                out.push(lw_rc_subst(sd.fields.get(i).ty, sd.type_params, args));
+                i = i + 1;
+            }
+            return out;
+        }
+        OptStructDef::None => {}
+    }
+    match Lowerer_lookup_enum(self, name) {
+        OptEnumDef::Some(ed) => {
+            var vi: i64 = 0;
+            while vi < ed.variants.len() {
+                match ed.variants.get(vi).data {
+                    OptParams::Some(ps) => {
+                        var pi: i64 = 0;
+                        while pi < ps.len() {
+                            out.push(lw_rc_subst(ps.get(pi).ty, ed.type_params, args));
+                            pi = pi + 1;
+                        }
+                    }
+                    OptParams::None => {}
+                }
+                vi = vi + 1;
+            }
+        }
+        OptEnumDef::None => {}
+    }
+    return out;
+}
+
+/// How values of type `t` are owned: RC_STR, RC_VEC, RC_MAP (a handle),
+/// RC_MEM (a struct, enum or generic instance holding one), RC_NONE.
+pub fn Lowerer_rc_kind(self: &mut Lowerer, t0: Type) -> i64 {
+    if !LOWER_RC { return RC_NONE; }
+    var t: Type = Lowerer_resolve_type(self, t0);
+    match t {
+        Type::Str => { return RC_STR; }
+        Type::Named(n) => {
+            if n == "Vec" { return RC_VEC; }
+            if n == "HashMap" { return RC_MAP; }
+        }
+        Type::Generic(n, _) => {
+            if n == "Vec" { return RC_VEC; }
+            if n == "HashMap" { return RC_MAP; }
+        }
+        _ => { return RC_NONE; }
+    }
+    if !Lowerer_rc_is_mem_type(self, t) { return RC_NONE; }
+    var key: str = type_to_str(t);
+    var cached: i64 = HashMap_get(self.own_kind_cache, key);
+    if cached > 0 { return cached - 1; }
+    // Plain while its fields are looked at: a type that holds itself does
+    // so through a Box or a Vec, never inline
+    HashMap_insert(self.own_kind_cache, key, RC_NONE + 1);
+    var k: i64 = RC_NONE;
+    var fields: Vec<Type> = Lowerer_rc_field_types(self, t);
+    var i: i64 = 0;
+    while i < fields.len() {
+        if Lowerer_rc_kind(self, fields.get(i)) != RC_NONE { k = RC_MEM; }
+        i = i + 1;
+    }
+    HashMap_insert(self.own_kind_cache, key, k + 1);
+    return k;
+}
+
+/// The index of struct-like type `t` among those with generated functions.
+fn Lowerer_rc_type_index(self: &mut Lowerer, t0: Type) -> i64 {
+    var t: Type = Lowerer_resolve_type(self, t0);
+    var key: str = type_to_str(t);
+    var at: i64 = HashMap_get(self.own_type_index, key);
+    if at > 0 { return at - 1; }
+    self.own_types.push(OwnType { key: key, ty: t });
+    HashMap_insert(self.own_type_index, key, self.own_types.len());
+    return self.own_types.len() - 1;
+}
+
+/// The element type id of values of type `t` kept in a Vec or a map
+/// (core's P_TID_*): 1 str, 2 Vec, 3 HashMap, 16 + index for a struct or
+/// enum (held by pointer to a heap copy), 0 for plain values.
+pub fn Lowerer_rc_tid(self: &mut Lowerer, t: Type) -> i64 {
+    var k: i64 = Lowerer_rc_kind(self, t);
+    if k == RC_STR { return 1; }
+    if k == RC_VEC { return 2; }
+    if k == RC_MAP { return 3; }
+    if Lowerer_rc_is_mem_type(self, Lowerer_resolve_type(self, t)) { return 16 + Lowerer_rc_type_index(self, t); }
+    return 0;
+}
+
+/// The IR struct type of a struct-like AST type.
+fn Lowerer_rc_mem_ir(self: &Lowerer, t: Type) -> IrType {
+    return IrType::Struct(lw_rc_type_name(Lowerer_resolve_type(self, t)));
+}
+
+fn Lowerer_rc_env(self: &mut Lowerer) -> i64 {
+    return Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+}
+
+fn Lowerer_rc_as_i64(self: &mut Lowerer, v: i64) -> i64 {
+    var vt: IrType = Lowerer_get_value_type(self, v);
+    match vt {
+        IrType::I64 => { return v; }
+        _ => {}
+    }
+    return Lowerer_emit_inst(self, Inst::BitCast(v, vt, IrType::I64));
+}
+
+/// Call a generated function (`prefix` + the type's index) on the memory
+/// of a struct-like value.
+fn Lowerer_rc_call_mem(self: &mut Lowerer, prefix: str, ptr: i64, t: Type) {
+    var idx: i64 = Lowerer_rc_type_index(self, t);
+    var a: Vec<i64> = Vec::new();
+    a.push(Lowerer_rc_env(self));
+    a.push(Lowerer_rc_as_i64(self, ptr));
+    Lowerer_emit_inst(self, Inst::Call(prefix + int_to_str(idx), a, IrType::Void, lw_rc_eff()));
+}
+
+/// One more owner of `v`: the value to keep (a new handle for a Vec or a
+/// map; for a struct, a copy whose fields have one more owner each).
+pub fn Lowerer_rc_dup(self: &mut Lowerer, v: i64, t: Type) -> i64 {
+    var k: i64 = Lowerer_rc_kind(self, t);
+    // A literal is never counted: nothing to do
+    if k == RC_STR && Lowerer_rc_is_literal(self, v) { return v; }
+    if k == RC_STR {
+        var a: Vec<i64> = Vec::new();
+        a.push(Lowerer_rc_env(self));
+        a.push(Lowerer_rc_as_i64(self, v));
+        Lowerer_emit_inst(self, Inst::Call("Str_dup", a, IrType::I64, lw_rc_eff()));
+        return v;
+    }
+    if k == RC_VEC || k == RC_MAP {
+        var a2: Vec<i64> = Vec::new();
+        a2.push(Lowerer_rc_env(self));
+        a2.push(v);
+        var fname: str = "Vec_share";
+        if k == RC_MAP { fname = "HashMap_share"; }
+        return Lowerer_emit_inst(self, Inst::Call(fname, a2, Lowerer_get_value_type(self, v), lw_rc_eff()));
+    }
+    if k == RC_MEM {
+        var sty: IrType = Lowerer_rc_mem_ir(self, t);
+        var copy: i64 = Lowerer_emit_inst(self, Inst::Alloca(sty, Region::Stack));
+        Lowerer_emit_inst(self, Inst::Store(copy, v, OptIrType::Some(sty)));
+        Lowerer_rc_call_mem(self, "__own_dup_", copy, t);
+        return copy;
+    }
+    return v;
+}
+
+/// Whether value `v` is a string literal (ConstStr) or null.
+fn Lowerer_rc_is_literal(self: &Lowerer, v: i64) -> bool {
+    match IrFunction_get_inst(&self.current_func, v) {
+        OptInst::Some(inst) => {
+            match inst {
+                Inst::ConstStr(_) => { return true; }
+                Inst::ConstNull(_) => { return true; }
+                _ => {}
+            }
+        }
+        OptInst::None => {}
+    }
+    return false;
+}
+
+/// Drop one owner of `v` (for a struct, of each of its fields).
+pub fn Lowerer_rc_drop(self: &mut Lowerer, v: i64, t: Type) {
+    var k: i64 = Lowerer_rc_kind(self, t);
+    if k == RC_NONE { return; }
+    if k == RC_STR && Lowerer_rc_is_literal(self, v) { return; }
+    if k == RC_MEM {
+        Lowerer_rc_call_mem(self, "__own_drop_", v, t);
+        return;
+    }
+    var fname: str = "Str_drop";
+    if k == RC_VEC { fname = "Vec_drop"; }
+    if k == RC_MAP { fname = "HashMap_drop"; }
+    var a: Vec<i64> = Vec::new();
+    a.push(Lowerer_rc_env(self));
+    if k == RC_STR { a.push(Lowerer_rc_as_i64(self, v)); } else { a.push(v); }
+    Lowerer_emit_inst(self, Inst::Call(fname, a, IrType::Void, lw_rc_eff()));
+}
+
+// --- Temporaries ---
+
+/// `v` is a temporary of type `t` that the current statement owns.
+pub fn Lowerer_rc_temp(self: &mut Lowerer, v: i64, t: Type) {
+    if !self.own_on { return; }
+    if Lowerer_rc_kind(self, t) == RC_NONE { return; }
+    self.own_temps.push(OwnTemp { val: v, ty: t, claimed: false });
+}
+
+/// Hand temporary `v` over to whoever keeps it: true when it was one.
+pub fn Lowerer_rc_claim(self: &mut Lowerer, v: i64) -> bool {
+    var i: i64 = self.own_temps.len() - 1;
+    while i >= 0 {
+        var tp: OwnTemp = self.own_temps.get(i);
+        if tp.val == v && !tp.claimed {
+            self.own_temps.set(i, OwnTemp { val: tp.val, ty: tp.ty, claimed: true });
+            return true;
+        }
+        i = i - 1;
+    }
+    return false;
+}
+
+/// The type of temporary `v`, or Infer when it is none.
+fn Lowerer_rc_temp_type(self: &Lowerer, v: i64) -> Type {
+    var i: i64 = self.own_temps.len() - 1;
+    while i >= 0 {
+        if self.own_temps.get(i).val == v && !self.own_temps.get(i).claimed { return self.own_temps.get(i).ty; }
+        i = i - 1;
+    }
+    return Type::Infer;
+}
+
+/// Drop the unclaimed temporaries from `from` on (newest first).
+fn Lowerer_rc_drop_temps(self: &mut Lowerer, from: i64) {
+    var i: i64 = self.own_temps.len() - 1;
+    while i >= from {
+        var tp: OwnTemp = self.own_temps.get(i);
+        if !tp.claimed { Lowerer_rc_drop(self, tp.val, tp.ty); }
+        i = i - 1;
+    }
+}
+
+/// The end of the statement (or branch) whose temporaries start at `mark`.
+pub fn Lowerer_rc_flush(self: &mut Lowerer, mark: i64) {
+    if !self.own_on { return; }
+    if !Lowerer_current_block_has_terminator(self) { Lowerer_rc_drop_temps(self, mark); }
+    while self.own_temps.len() > mark { self.own_temps.pop(); }
+}
+
+/// `v`, kept somewhere that will drop it as a `t`: a temporary is handed
+/// over, anything else gets one more owner.
+pub fn Lowerer_rc_own_value(self: &mut Lowerer, v: i64, t: Type) -> i64 {
+    if !self.own_on { return v; }
+    if Lowerer_rc_claim(self, v) { return v; }
+    if Lowerer_rc_kind(self, t) == RC_NONE { return v; }
+    return Lowerer_rc_dup(self, v, t);
+}
+
+/// Lower `expr` for a place that keeps it, as whatever type it has.
+pub fn Lowerer_rc_owned_any(self: &mut Lowerer, expr: Expr) -> i64 {
+    var v: i64 = Lowerer_lower_keep(self, expr);
+    if !self.own_on { return v; }
+    return Lowerer_rc_own_value(self, v, Lowerer_rc_value_type(self, expr, v));
+}
+
+/// Lower `expr` for a place that keeps it as a `t` (proposal 0004).
+pub fn Lowerer_lower_owned(self: &mut Lowerer, expr: Expr, t: Type) -> i64 {
+    var v: i64 = Lowerer_lower_keep(self, expr);
+    return Lowerer_rc_own_value(self, v, t);
+}
+
+// --- Owned slots and scopes ---
+
+/// Zero instructions for a new owned slot, kept for the entry block.
+fn Lowerer_rc_zero_detached(self: &mut Lowerer, slot: i64, ir_ty: IrType, t: Type) {
+    if Lowerer_rc_kind(self, t) == RC_MEM {
+        var size: i64 = IrModule_type_size(&self.module, Lowerer_rc_mem_ir(self, t));
+        var env: i64 = lw_detached(&mut self.current_func, Inst::ConstInt(0, IrType::I64));
+        var as_int: i64 = lw_detached(&mut self.current_func, Inst::BitCast(slot, IrType::Ptr(Box::new(ir_ty)), IrType::I64));
+        var words: i64 = lw_detached(&mut self.current_func, Inst::ConstInt((size + 7) / 8, IrType::I64));
+        var a: Vec<i64> = Vec::new();
+        a.push(env);
+        a.push(as_int);
+        a.push(words);
+        var call: i64 = lw_detached(&mut self.current_func, Inst::Call("p_zero_words", a, IrType::Void, lw_rc_eff()));
+        self.own_prologue.push(env);
+        self.own_prologue.push(as_int);
+        self.own_prologue.push(words);
+        self.own_prologue.push(call);
+        return;
+    }
+    var zero: i64 = 0;
+    match ir_ty {
+        IrType::Ptr(_) => { zero = lw_detached(&mut self.current_func, Inst::ConstNull(ir_ty)); }
+        _ => { zero = lw_detached(&mut self.current_func, Inst::ConstInt(0, IrType::I64)); }
+    }
+    var st: i64 = lw_detached(&mut self.current_func, Inst::Store(slot, zero, OptIrType::None));
+    self.own_prologue.push(zero);
+    self.own_prologue.push(st);
+}
+
+/// A slot for a variable that owns a `t`: allocated and zeroed in the entry
+/// block, so a drop on a path where the variable was never set does nothing.
+pub fn Lowerer_rc_new_slot(self: &mut Lowerer, ir_ty: IrType, t: Type) -> i64 {
+    var a: i64 = lw_detached(&mut self.current_func, Inst::Alloca(ir_ty, Region::Stack));
+    self.own_prologue.push(a);
+    Lowerer_rc_zero_detached(self, a, ir_ty, t);
+    return a;
+}
+
+/// `slot` owns its value until the current scope ends.
+pub fn Lowerer_rc_add_slot(self: &mut Lowerer, slot: i64, t: Type) {
+    if !self.own_on { return; }
+    if Lowerer_rc_kind(self, t) == RC_NONE { return; }
+    self.own_slots.push(OwnSlot { slot: slot, ty: t });
+}
+
+/// Zero `slot` after its value was dropped or moved out.
+fn Lowerer_rc_clear_slot(self: &mut Lowerer, slot: i64, t: Type) {
+    if Lowerer_rc_kind(self, t) == RC_MEM {
+        var size: i64 = IrModule_type_size(&self.module, Lowerer_rc_mem_ir(self, t));
+        var a: Vec<i64> = Vec::new();
+        a.push(Lowerer_rc_env(self));
+        a.push(Lowerer_rc_as_i64(self, slot));
+        a.push(Lowerer_emit_inst(self, Inst::ConstInt((size + 7) / 8, IrType::I64)));
+        Lowerer_emit_inst(self, Inst::Call("p_zero_words", a, IrType::Void, lw_rc_eff()));
+        return;
+    }
+    var sty: IrType = IrType::I64;
+    match Lowerer_lookup_alloca_type(self, slot) {
+        OptIrType::Some(st) => { sty = st; }
+        OptIrType::None => {}
+    }
+    var zero: i64 = 0;
+    match sty {
+        IrType::Ptr(_) => { zero = Lowerer_emit_inst(self, Inst::ConstNull(sty)); }
+        _ => { zero = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64)); }
+    }
+    Lowerer_emit_inst(self, Inst::Store(slot, zero, OptIrType::None));
+}
+
+/// `return x` of a variable that owns its value: the value is moved out
+/// (the slot is cleared, so the drops that follow leave it alone) instead
+/// of counted again and dropped. -1 when `e` is not such a variable, or when
+/// something runs after the value is taken that may read the variable (a
+/// defer, a persist save, a Drop impl).
+fn Lowerer_rc_try_move(self: &mut Lowerer, e: Expr) -> i64 {
+    if !self.own_on { return -1; }
+    if self.defer_stack.len() > 0 || self.current_func.persist_vars.len() > 0 || self.current_func.drop_locals.len() > 0 { return -1; }
+    var name: str = "";
+    match e {
+        Expr::Ident(n) => { name = n; }
+        _ => { return -1; }
+    }
+    var slot: i64 = -1;
+    match Lowerer_lookup_alloca(self, name) {
+        OptValueId::Some(a) => { slot = a; }
+        OptValueId::None => { return -1; }
+    }
+    var i: i64 = self.own_slots.len() - 1;
+    while i >= 0 {
+        var os: OwnSlot = self.own_slots.get(i);
+        if os.slot == slot {
+            var k: i64 = Lowerer_rc_kind(self, os.ty);
+            if k == RC_MEM {
+                var sty: IrType = Lowerer_rc_mem_ir(self, os.ty);
+                var copy: i64 = Lowerer_emit_inst(self, Inst::Alloca(sty, Region::Stack));
+                Lowerer_emit_inst(self, Inst::Store(copy, slot, OptIrType::Some(sty)));
+                Lowerer_rc_clear_slot(self, slot, os.ty);
+                return copy;
+            }
+            var lty: IrType = IrType::I64;
+            match Lowerer_lookup_alloca_type(self, slot) {
+                OptIrType::Some(st) => { lty = st; }
+                OptIrType::None => {}
+            }
+            var v: i64 = Lowerer_emit_inst(self, Inst::Load(slot, lty));
+            Lowerer_rc_clear_slot(self, slot, os.ty);
+            return v;
+        }
+        i = i - 1;
+    }
+    return -1;
+}
+
+/// `expr` when it is a variable read for the last time that owns its value
+/// (proposal 0004): the value is moved out (the slot cleared) and becomes a
+/// temporary of the statement, which whoever keeps it claims. -1 otherwise.
+fn Lowerer_rc_move_last(self: &mut Lowerer, expr: Expr) -> i64 {
+    if !self.own_on { return -1; }
+    var name: str = "";
+    match expr {
+        Expr::Ident(n) => { name = n; }
+        _ => { return -1; }
+    }
+    if !Lowerer_last_use(self, name) { return -1; }
+    if lw_c_str_vec_contains(self.own_nomove, name) { return -1; }
+    // Not in a loop's own condition or iterator: it runs again
+    var fd: i64 = self.fr_lists.len();
+    if fd > 0 && fd == self.fr_idx.len() {
+        var cur: Vec<Stmt> = self.fr_lists.get(fd - 1);
+        var cat: i64 = self.fr_idx.get(fd - 1);
+        if cat >= 0 && cat < cur.len() {
+            match cur.get(cat) {
+                Stmt::While(_, _, _) => { return -1; }
+                Stmt::For(_, _, _, _) => { return -1; }
+                Stmt::Loop(_, _) => { return -1; }
+                _ => {}
+            }
+        }
+    }
+    var slot: i64 = -1;
+    match Lowerer_lookup_alloca(self, name) {
+        OptValueId::Some(a) => { slot = a; }
+        OptValueId::None => { return -1; }
+    }
+    var ty: Type = Type::Infer;
+    var found: bool = false;
+    var i: i64 = self.own_slots.len() - 1;
+    while i >= 0 && !found {
+        if self.own_slots.get(i).slot == slot { ty = self.own_slots.get(i).ty; found = true; }
+        i = i - 1;
+    }
+    if !found { return -1; }
+    var v: i64 = Lowerer_rc_try_move(self, expr);
+    if v < 0 { return -1; }
+    Lowerer_rc_temp(self, v, ty);
+    return v;
+}
+
+/// Lower `expr` where its value is kept: a variable on its last use is
+/// moved, anything else lowered as usual.
+fn Lowerer_lower_keep(self: &mut Lowerer, expr: Expr) -> i64 {
+    var m: i64 = Lowerer_rc_move_last(self, expr);
+    if m >= 0 { return m; }
+    return Lowerer_lower_expr(self, expr);
+}
+
+/// Whether `var name = expr` may borrow instead of copy: `expr` is a place
+/// whose root is a by-value parameter (the callee cannot change it) or a
+/// variable that owns its value, and in the rest of the block neither the
+/// new variable nor the root is assigned, changed or passed to change.
+/// The root is then never moved out while the copy lives.
+fn Lowerer_rc_borrow_copy_ok(self: &mut Lowerer, name: str, expr: Expr) -> bool {
+    if !lw_is_place_expr(expr) { return false; }
+    // The rest of the let's own list is known (not a branch lowered inline)
+    var fd: i64 = self.fr_lists.len();
+    if fd == 0 || fd != self.fr_idx.len() { return false; }
+    var cur: Vec<Stmt> = self.fr_lists.get(fd - 1);
+    var at: i64 = self.fr_idx.get(fd - 1);
+    if at < 0 || at >= cur.len() { return false; }
+    match cur.get(at) {
+        Stmt::Let(ln, _, _, _, _, _, _) => { if ln != name { return false; } }
+        _ => { return false; }
+    }
+    var root: str = cow_root(expr);
+    if root == "" || root == name { return false; }
+    // The root cannot change while the copy lives: a by-value parameter
+    // (the type checker rejects changing one; a changed one is a local copy
+    // and has a slot), or a string variable (only an assignment, which the
+    // check below sees, changes a string). A method on a struct or Vec
+    // variable could change it unseen.
+    var root_ok: bool = false;
+    match Lowerer_lookup_alloca(self, root) {
+        OptValueId::Some(rs) => {
+            root_ok = Lowerer_rc_owns_slot(self, rs) && Lowerer_rc_kind(self, Lowerer_rc_var_type(self, root)) == RC_STR;
+        }
+        OptValueId::None => {
+            match Lowerer_lookup_param_type(self, root) {
+                OptType::Some(pt) => {
+                    match pt {
+                        Type::Ref(_, _) => {}
+                        _ => { root_ok = true; }
+                    }
+                }
+                OptType::None => {}
+            }
+        }
+    }
+    if !root_ok { return false; }
+    if lw_has_defer(self.cur_body) { return false; }
+    if !Lowerer_readonly_copy_in(self, name, expr, false) { return false; }
+    self.own_nomove.push(root);
+    return true;
+}
+
+/// Whether `slot` owns its value (an owned variable of an open scope).
+pub fn Lowerer_rc_owns_slot(self: &Lowerer, slot: i64) -> bool {
+    var i: i64 = self.own_slots.len() - 1;
+    while i >= 0 {
+        if self.own_slots.get(i).slot == slot { return true; }
+        i = i - 1;
+    }
+    return false;
+}
+
+/// Drop what an owned slot holds, and zero it.
+fn Lowerer_rc_drop_slot(self: &mut Lowerer, s: OwnSlot) {
+    var k: i64 = Lowerer_rc_kind(self, s.ty);
+    if k == RC_MEM {
+        Lowerer_rc_call_mem(self, "__own_drop_", s.slot, s.ty);
+        Lowerer_rc_clear_slot(self, s.slot, s.ty);
+        return;
+    }
+    var sty: IrType = IrType::I64;
+    match Lowerer_lookup_alloca_type(self, s.slot) {
+        OptIrType::Some(st) => { sty = st; }
+        OptIrType::None => {}
+    }
+    var v: i64 = Lowerer_emit_inst(self, Inst::Load(s.slot, sty));
+    Lowerer_rc_drop(self, v, s.ty);
+    Lowerer_rc_clear_slot(self, s.slot, s.ty);
+}
+
+/// Drop the owned slots from `from` on (newest first), keeping the list.
+fn Lowerer_rc_drop_slots(self: &mut Lowerer, from: i64) {
+    var i: i64 = self.own_slots.len() - 1;
+    while i >= from {
+        Lowerer_rc_drop_slot(self, self.own_slots.get(i));
+        i = i - 1;
+    }
+}
+
+pub fn Lowerer_rc_scope_open(self: &mut Lowerer) {
+    self.own_marks.push(self.own_slots.len());
+}
+
+/// The end of a block: its variables are dropped.
+pub fn Lowerer_rc_scope_close(self: &mut Lowerer) {
+    if self.own_marks.len() == 0 { return; }
+    var m: i64 = self.own_marks.get(self.own_marks.len() - 1);
+    self.own_marks.pop();
+    if self.own_on && !Lowerer_current_block_has_terminator(self) { Lowerer_rc_drop_slots(self, m); }
+    while self.own_slots.len() > m { self.own_slots.pop(); }
+}
+
+/// Leaving the function (a return, the `?` error path): every temporary
+/// and owned variable is dropped.
+pub fn Lowerer_rc_drop_all(self: &mut Lowerer) {
+    if !self.own_on { return; }
+    Lowerer_rc_drop_temps(self, 0);
+    Lowerer_rc_drop_slots(self, 0);
+}
+
+/// A loop starts: `break` and `continue` drop what its body made.
+pub fn Lowerer_rc_loop_open(self: &mut Lowerer) {
+    self.own_loop_slots.push(self.own_slots.len());
+    self.own_loop_temps.push(self.own_temps.len());
+}
+
+pub fn Lowerer_rc_loop_close(self: &mut Lowerer) {
+    if self.own_loop_slots.len() > 0 { self.own_loop_slots.pop(); }
+    if self.own_loop_temps.len() > 0 { self.own_loop_temps.pop(); }
+}
+
+/// Before `break`/`continue`: drop the innermost loop body's temporaries
+/// and variables.
+pub fn Lowerer_rc_loop_exit(self: &mut Lowerer) {
+    if !self.own_on || self.own_loop_slots.len() == 0 { return; }
+    Lowerer_rc_drop_temps(self, self.own_loop_temps.get(self.own_loop_temps.len() - 1));
+    Lowerer_rc_drop_slots(self, self.own_loop_slots.get(self.own_loop_slots.len() - 1));
+}
+
+/// Put the owned slots' allocations and zeroing at the start of the entry
+/// block of the function just lowered.
+pub fn Lowerer_rc_finish_func(self: &mut Lowerer) {
+    if self.own_prologue.len() == 0 { return; }
+    if self.current_func.blocks.len() == 0 { return; }
+    var blk: BasicBlock = self.current_func.blocks.get(0);
+    var fresh: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < self.own_prologue.len() {
+        fresh.push(self.own_prologue.get(i));
+        i = i + 1;
+    }
+    var j: i64 = 0;
+    while j < blk.instructions.len() {
+        fresh.push(blk.instructions.get(j));
+        j = j + 1;
+    }
+    blk.instructions = fresh;
+    self.current_func.blocks.set(0, blk);
+}
+
+// --- Calls ---
+
+/// Builtins whose result is a new string the caller owns.
+fn lw_rc_fresh_builtin(name: str) -> bool {
+    return name == "p_str_concat" || name == "p_to_str" || name == "p_to_str_float" || name == "p_float_to_str"
+        || name == "p_to_str_bool" || name == "p_bool_to_str" || name == "p_char_to_str" || name == "p_to_str_vec"
+        || name == "p_vec_to_str" || name == "p_to_str_map" || name == "p_str_join_n" || name == "p_sb_to_str"
+        || name == "p_json_dump" || name == "p_json_pretty" || name == "p_json_string" || name == "p_tensor_to_str"
+        || name == "p_simd_to_str" || name == "p_str_from_ptr" || name == "p_str_take"
+        // The builtins that can fail give a counted copy, or null
+        || name == "p_file_read" || name == "p_read_line" || name == "p_read_stdin" || name == "p_getenv"
+        || name == "p_argv" || name == "p_process_stdout" || name == "p_process_stderr" || name == "p_dir_list";
+}
+
+/// core functions that hand back a new Vec or map as an i64 handle.
+fn lw_rc_fresh_handle_call(name: str) -> bool {
+    return name == "Vec_new" || name == "Vec_new_sized" || name == "Vec_new_typed" || name == "Vec_clone"
+        || name == "HashMap_new" || name == "HashMap_new_typed" || name == "HashMap_clone"
+        || name == "HashMap_keys" || name == "HashMap_values" || name == "HashMap_keys_i"
+        || name == "HashMap_values_i" || name == "String_split";
+}
+
+/// The AST return type of function `name`, or Infer.
+fn Lowerer_rc_ret_type(self: &Lowerer, name: str) -> Type {
+    var at: i64 = HashMap_get(self.own_ret_index, name) - 1;
+    if at >= 0 && at < self.func_ret_types.len() && self.func_ret_types.get(at).key == name {
+        return self.func_ret_types.get(at).val;
+    }
+    return Type::Infer;
+}
+
+/// After a call is emitted: a function returning a string, a Vec or a map
+/// returns one the caller owns, a temporary of the current statement.
+fn Lowerer_rc_note_call(self: &mut Lowerer, id: i64, name: str, ir_ty: IrType) {
+    if lw_rc_fresh_builtin(name) {
+        Lowerer_rc_temp(self, id, Type::Str);
+        return;
+    }
+    if lw_rc_fresh_handle_call(name) {
+        match ir_ty {
+            IrType::Generic(gn, _) => {
+                if gn == "Vec" { Lowerer_rc_temp(self, id, Type::Named("Vec")); }
+                if gn == "HashMap" { Lowerer_rc_temp(self, id, Type::Named("HashMap")); }
+            }
+            IrType::Opaque(onm) => {
+                if onm == "Vec" { Lowerer_rc_temp(self, id, Type::Named("Vec")); }
+                if onm == "HashMap" { Lowerer_rc_temp(self, id, Type::Named("HashMap")); }
+            }
+            _ => {}
+        }
+        return;
+    }
+    var rt: Type = Lowerer_rc_ret_type(self, name);
+    var k: i64 = Lowerer_rc_kind(self, rt);
+    if k == RC_STR || k == RC_VEC || k == RC_MAP { Lowerer_rc_temp(self, id, rt); }
+}
+
+/// After a call that returns a struct through `sret`: the caller owns the
+/// struct written there.
+pub fn Lowerer_rc_note_sret(self: &mut Lowerer, sret: i64, name: str) {
+    if !self.own_on { return; }
+    var rt: Type = Lowerer_rc_ret_type(self, name);
+    if Lowerer_rc_kind(self, rt) == RC_MEM { Lowerer_rc_temp(self, sret, rt); }
+}
+
+/// The argument positions (after env) of core functions that keep their
+/// argument: those get an owned value.
+fn lw_rc_consuming_arg(name: str, pos: i64) -> bool {
+    if name == "Vec_push" || name == "p_vec_push" { return pos == 1; }
+    if name == "Vec_set" || name == "Vec_insert" || name == "p_vec_set" || name == "p_vec_insert" { return pos == 2; }
+    if name == "HashMap_insert" { return pos == 1 || pos == 2; }
+    if name == "HashMap_insert_i" { return pos == 2; }
+    return false;
+}
+
+// --- Generated drop/dup functions ---
+
+/// Address `p + off` as a pointer to an i64 (in the function being built).
+fn Lowerer_rc_word_ptr(self: &mut Lowerer, p: i64, off: i64) -> i64 {
+    var o: i64 = Lowerer_emit_inst(self, Inst::ConstInt(off, IrType::I64));
+    var a: i64 = Lowerer_emit_inst(self, Inst::BinOp(BinOp::Add, p, o, IrType::I64));
+    return Lowerer_emit_inst(self, Inst::BitCast(a, IrType::I64, IrType::Ptr(Box::new(IrType::I64))));
+}
+
+/// Drop (`dup` false) or count again (`dup` true) the value of type `t`
+/// stored at `p + off` inline.
+fn Lowerer_rc_gen_field(self: &mut Lowerer, p: i64, off: i64, t: Type, dup: bool) {
+    var k: i64 = Lowerer_rc_kind(self, t);
+    if k == RC_NONE { return; }
+    if k == RC_MEM {
+        var o: i64 = Lowerer_emit_inst(self, Inst::ConstInt(off, IrType::I64));
+        var a: i64 = Lowerer_emit_inst(self, Inst::BinOp(BinOp::Add, p, o, IrType::I64));
+        var idx: i64 = Lowerer_rc_type_index(self, t);
+        var args: Vec<i64> = Vec::new();
+        args.push(Lowerer_rc_env(self));
+        args.push(a);
+        var prefix: str = "__own_drop_";
+        if dup { prefix = "__own_dup_"; }
+        Lowerer_emit_inst(self, Inst::Call(prefix + int_to_str(idx), args, IrType::Void, lw_rc_eff()));
+        return;
+    }
+    var wp: i64 = Lowerer_rc_word_ptr(self, p, off);
+    var w: i64 = Lowerer_emit_inst(self, Inst::Load(wp, IrType::I64));
+    var fargs: Vec<i64> = Vec::new();
+    fargs.push(Lowerer_rc_env(self));
+    fargs.push(w);
+    if !dup {
+        var dn: str = "Str_drop";
+        if k == RC_VEC { dn = "Vec_drop"; }
+        if k == RC_MAP { dn = "HashMap_drop"; }
+        Lowerer_emit_inst(self, Inst::Call(dn, fargs, IrType::Void, lw_rc_eff()));
+        return;
+    }
+    var un: str = "Str_dup";
+    if k == RC_VEC { un = "Vec_share"; }
+    if k == RC_MAP { un = "HashMap_share"; }
+    var nw: i64 = Lowerer_emit_inst(self, Inst::Call(un, fargs, IrType::I64, lw_rc_eff()));
+    if k != RC_STR { Lowerer_emit_inst(self, Inst::Store(wp, nw, OptIrType::None)); }
+}
+
+/// The same for a payload held as a word because its declared type is a
+/// type parameter: a struct-like argument is a pointer to a heap copy.
+fn Lowerer_rc_gen_param_payload(self: &mut Lowerer, p: i64, off: i64, t: Type, dup: bool) {
+    if !Lowerer_rc_is_mem_type(self, Lowerer_resolve_type(self, t)) {
+        Lowerer_rc_gen_field(self, p, off, t, dup);
+        return;
+    }
+    var wp: i64 = Lowerer_rc_word_ptr(self, p, off);
+    var bx: i64 = Lowerer_emit_inst(self, Inst::Load(wp, IrType::I64));
+    var idx: i64 = Lowerer_rc_type_index(self, t);
+    var tid: i64 = Lowerer_emit_inst(self, Inst::ConstInt(16 + idx, IrType::I64));
+    var args: Vec<i64> = Vec::new();
+    args.push(Lowerer_rc_env(self));
+    args.push(tid);
+    args.push(bx);
+    if dup {
+        var nb: i64 = Lowerer_emit_inst(self, Inst::Call("vec_elem_dup", args, IrType::I64, lw_rc_eff()));
+        Lowerer_emit_inst(self, Inst::Store(wp, nb, OptIrType::None));
+    } else {
+        Lowerer_emit_inst(self, Inst::Call("vec_elem_drop", args, IrType::Void, lw_rc_eff()));
+    }
+}
+
+/// Whether AST type `t` names one of `params` (a type parameter).
+fn lw_rc_is_param(t: Type, params: Vec<str>) -> bool {
+    match t {
+        Type::Named(n) => { return lw_c_str_vec_contains(params, n); }
+        _ => {}
+    }
+    return false;
+}
+
+/// The byte offset of field `name` in IR struct `sn`, or -1.
+fn Lowerer_rc_field_offset(self: &Lowerer, sn: str, name: str) -> i64 {
+    match IrModule_get_struct(&self.module, sn) {
+        OptStructLayout::Some(layout) => {
+            var i: i64 = 0;
+            while i < layout.fields.len() {
+                if layout.fields.get(i).name == name { return layout.fields.get(i).offset; }
+                i = i + 1;
+            }
+        }
+        OptStructLayout::None => {}
+    }
+    return -1;
+}
+
+/// The body of __own_drop_<idx> / __own_dup_<idx> for struct or enum `t`,
+/// whose memory starts at `p` (an i64).
+fn Lowerer_rc_gen_body(self: &mut Lowerer, p: i64, t: Type, dup: bool) {
+    var name: str = lw_rc_type_name(t);
+    var args: Vec<Type> = lw_rc_type_args(t);
+    match Lowerer_lookup_struct(self, name) {
+        OptStructDef::Some(sd) => {
+            var i: i64 = 0;
+            while i < sd.fields.len() {
+                var f: Param = sd.fields.get(i);
+                var off: i64 = Lowerer_rc_field_offset(self, name, f.name);
+                if off >= 0 {
+                    var ft: Type = lw_rc_subst(f.ty, sd.type_params, args);
+                    if lw_rc_is_param(f.ty, sd.type_params) {
+                        Lowerer_rc_gen_param_payload(self, p, off, ft, dup);
+                    } else {
+                        Lowerer_rc_gen_field(self, p, off, ft, dup);
+                    }
+                }
+                i = i + 1;
+            }
+            return;
+        }
+        OptStructDef::None => {}
+    }
+    match Lowerer_lookup_enum(self, name) {
+        OptEnumDef::Some(ed) => {
+            var tp: i64 = Lowerer_rc_word_ptr(self, p, 0);
+            var tag: i64 = Lowerer_emit_inst(self, Inst::Load(tp, IrType::I64));
+            var vi: i64 = 0;
+            while vi < ed.variants.len() {
+                match ed.variants.get(vi).data {
+                    OptParams::Some(ps) => {
+                        // Payloads that own something: test the tag
+                        var any: bool = false;
+                        var pi: i64 = 0;
+                        while pi < ps.len() {
+                            if Lowerer_rc_kind(self, lw_rc_subst(ps.get(pi).ty, ed.type_params, args)) != RC_NONE { any = true; }
+                            pi = pi + 1;
+                        }
+                        if any {
+                            var here: i64 = Lowerer_new_block(self);
+                            var next: i64 = Lowerer_new_block(self);
+                            var want: i64 = Lowerer_emit_inst(self, Inst::ConstInt(vi, IrType::I64));
+                            var is_it: i64 = Lowerer_emit_inst(self, Inst::BinOp(BinOp::Eq, tag, want, IrType::Bool));
+                            Lowerer_emit_terminator(self, Inst::Branch(is_it, here, next));
+                            Lowerer_set_current_block(self, here);
+                            var slot: i64 = 1;
+                            var qi: i64 = 0;
+                            while qi < ps.len() {
+                                var decl: Type = ps.get(qi).ty;
+                                var pt: Type = lw_rc_subst(decl, ed.type_params, args);
+                                if lw_rc_is_param(decl, ed.type_params) {
+                                    Lowerer_rc_gen_param_payload(self, p, slot * 8, pt, dup);
+                                    slot = slot + 1;
+                                } else {
+                                    Lowerer_rc_gen_field(self, p, slot * 8, pt, dup);
+                                    slot = slot + Lowerer_enum_field_slots(self, Lowerer_lower_type(self, decl));
+                                }
+                                qi = qi + 1;
+                            }
+                            Lowerer_emit_terminator(self, Inst::Jump(next));
+                            Lowerer_set_current_block(self, next);
+                        }
+                    }
+                    OptParams::None => {}
+                }
+                vi = vi + 1;
+            }
+        }
+        OptEnumDef::None => {}
+    }
+}
+
+/// Build function `fname(env, p)` with the body Lowerer_rc_gen_body gives.
+fn Lowerer_rc_gen_fn(self: &mut Lowerer, fname: str, t: Type, dup: bool) {
+    var f: IrFunction = IrFunction_new(fname, IrType::Void);
+    var env_ty: IrType = IrType::Ptr(Box::new(IrType::U8));
+    var env_val: i64 = IrFunction_new_value(&mut f, ValueMeta_new(env_ty));
+    f.params.push(ValueIdType_new(env_val, env_ty));
+    var p: i64 = IrFunction_new_value(&mut f, ValueMeta_new(IrType::I64));
+    f.params.push(ValueIdType_new(p, IrType::I64));
+    var prev_func: IrFunction = self.current_func;
+    var prev_has: bool = self.has_current_func;
+    var prev_block: i64 = self.current_block;
+    var prev_on: bool = self.own_on;
+    self.own_on = false;
+    self.current_func = f;
+    self.current_func.name = fname;
+    self.has_current_func = true;
+    self.current_block = 0;
+    self.current_func.current_block_idx = 0;
+    Lowerer_rc_gen_body(self, p, t, dup);
+    Lowerer_emit_terminator(self, Inst::Return(OptValueId::None));
+    var eff: EffectSet = lw_rc_eff();
+    self.current_func.effects = eff;
+    self.module.function_effects.push(StringEffectSetEntry_new(fname, eff));
+    IrModule_add_function(&mut self.module, self.current_func);
+    self.current_func = prev_func;
+    self.has_current_func = prev_has;
+    self.current_block = prev_block;
+    self.own_on = prev_on;
+}
+
+/// Replace the body of core's `__p_elem_drop(tid, e)` / `__p_elem_dup(tid,
+/// e) -> i64` by a dispatch over the struct and enum types numbered here:
+/// an element held in a Vec or a map is a pointer to a heap copy, so a drop
+/// drops its fields and frees it, and a dup makes a copy whose fields have
+/// one more owner each.
+fn Lowerer_rc_gen_elem_fn(self: &mut Lowerer, dup: bool) {
+    var fname: str = "__p_elem_drop";
+    var ret: IrType = IrType::Void;
+    if dup { fname = "__p_elem_dup"; ret = IrType::I64; }
+    if !Lowerer_has_function(self, fname) { return; }
+    var f: IrFunction = IrFunction_new(fname, ret);
+    var env_ty: IrType = IrType::Ptr(Box::new(IrType::U8));
+    var env_val: i64 = IrFunction_new_value(&mut f, ValueMeta_new(env_ty));
+    f.params.push(ValueIdType_new(env_val, env_ty));
+    var tid: i64 = IrFunction_new_value(&mut f, ValueMeta_new(IrType::I64));
+    f.params.push(ValueIdType_new(tid, IrType::I64));
+    var e: i64 = IrFunction_new_value(&mut f, ValueMeta_new(IrType::I64));
+    f.params.push(ValueIdType_new(e, IrType::I64));
+    var prev_func: IrFunction = self.current_func;
+    var prev_has: bool = self.has_current_func;
+    var prev_block: i64 = self.current_block;
+    var prev_on: bool = self.own_on;
+    self.own_on = false;
+    self.current_func = f;
+    self.current_func.name = fname;
+    self.has_current_func = true;
+    self.current_block = 0;
+    self.current_func.current_block_idx = 0;
+    var i: i64 = 0;
+    while i < self.own_types.len() {
+        var ot: OwnType = self.own_types.get(i);
+        var here: i64 = Lowerer_new_block(self);
+        var next: i64 = Lowerer_new_block(self);
+        var want: i64 = Lowerer_emit_inst(self, Inst::ConstInt(16 + i, IrType::I64));
+        var is_it: i64 = Lowerer_emit_inst(self, Inst::BinOp(BinOp::Eq, tid, want, IrType::Bool));
+        Lowerer_emit_terminator(self, Inst::Branch(is_it, here, next));
+        Lowerer_set_current_block(self, here);
+        var sty: IrType = Lowerer_rc_mem_ir(self, ot.ty);
+        if dup {
+            var size: i64 = IrModule_type_size(&self.module, sty);
+            if size < 8 { size = 8; }
+            var sz: Vec<i64> = Vec::new();
+            sz.push(Lowerer_emit_inst(self, Inst::ConstInt(size, IrType::I64)));
+            var nb: i64 = Lowerer_emit_inst(self, Inst::Call("p_malloc", sz, IrType::Ptr(Box::new(sty)), lw_rc_eff()));
+            var src: i64 = Lowerer_emit_inst(self, Inst::BitCast(e, IrType::I64, IrType::Ptr(Box::new(sty))));
+            Lowerer_emit_inst(self, Inst::Store(nb, src, OptIrType::Some(sty)));
+            var nbi: i64 = Lowerer_emit_inst(self, Inst::BitCast(nb, IrType::Ptr(Box::new(sty)), IrType::I64));
+            var da: Vec<i64> = Vec::new();
+            da.push(Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64)));
+            da.push(nbi);
+            Lowerer_emit_inst(self, Inst::Call("__own_dup_" + int_to_str(i), da, IrType::Void, lw_rc_eff()));
+            Lowerer_emit_terminator(self, Inst::Return(OptValueId::Some(nbi)));
+        } else {
+            var dr: Vec<i64> = Vec::new();
+            dr.push(Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64)));
+            dr.push(e);
+            Lowerer_emit_inst(self, Inst::Call("__own_drop_" + int_to_str(i), dr, IrType::Void, lw_rc_eff()));
+            var fr: Vec<i64> = Vec::new();
+            fr.push(Lowerer_emit_inst(self, Inst::BitCast(e, IrType::I64, lw_ptr_u8())));
+            Lowerer_emit_inst(self, Inst::Call("p_free", fr, IrType::Void, lw_rc_eff()));
+            Lowerer_emit_terminator(self, Inst::Return(OptValueId::None));
+        }
+        Lowerer_set_current_block(self, next);
+        i = i + 1;
+    }
+    if dup {
+        Lowerer_emit_terminator(self, Inst::Return(OptValueId::Some(e)));
+    } else {
+        Lowerer_emit_terminator(self, Inst::Return(OptValueId::None));
+    }
+    var eff: EffectSet = lw_rc_eff();
+    self.current_func.effects = eff;
+    var done: str = self.current_func.name;
+    IrModule_replace_function_named(&mut self.module, self.current_func, done);
+    self.current_func = prev_func;
+    self.has_current_func = prev_has;
+    self.current_block = prev_block;
+    self.own_on = prev_on;
+}
+
+/// After every function is lowered: the drop/dup function of each struct
+/// and enum type used (the list grows while it is built: a type's fields
+/// register theirs), then the element dispatchers.
+pub fn Lowerer_rc_gen_types(self: &mut Lowerer) {
+    if !LOWER_RC { return; }
+    var i: i64 = 0;
+    while i < self.own_types.len() {
+        var ot: OwnType = self.own_types.get(i);
+        Lowerer_rc_gen_fn(self, "__own_drop_" + int_to_str(i), ot.ty, false);
+        Lowerer_rc_gen_fn(self, "__own_dup_" + int_to_str(i), ot.ty, true);
+        i = i + 1;
+    }
+    Lowerer_rc_gen_elem_fn(self, false);
+    Lowerer_rc_gen_elem_fn(self, true);
+}
+
+/// The element type ids of a Vec<T> or HashMap<K, V> AST type: [tid] or
+/// [owns string keys (0/1), value tid]; empty when the type says nothing.
+fn Lowerer_rc_coll_tids(self: &mut Lowerer, t0: Type) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var t: Type = Lowerer_resolve_type(self, t0);
+    match t {
+        Type::Generic(n, a) => {
+            if n == "Vec" && a.len() == 1 { out.push(Lowerer_rc_tid(self, a.get(0))); }
+            if n == "HashMap" && a.len() == 2 {
+                var kstr: i64 = 0;
+                if Lowerer_rc_kind(self, a.get(0)) == RC_STR { kstr = 1; }
+                out.push(kstr);
+                out.push(Lowerer_rc_tid(self, a.get(1)));
+            }
+        }
+        _ => {}
+    }
+    return out;
+}
+
+/// An empty collection of AST type `t` that owns its elements by their
+/// type: Vec_new_typed(code, tid) or HashMap_new_typed(keys, vtid); -1 when
+/// `t` says nothing about them (the caller makes it the old way).
+pub fn Lowerer_rc_new_coll(self: &mut Lowerer, t: Type) -> i64 {
+    if !LOWER_RC || !self.own_on { return -1; }
+    var tids: Vec<i64> = Lowerer_rc_coll_tids(self, t);
+    if tids.len() == 1 {
+        if !Lowerer_has_function(self, "Vec_new_typed") { return -1; }
+        var code: i64 = lw_vec_elem_code(t);
+        var a: Vec<i64> = Vec::new();
+        a.push(Lowerer_rc_env(self));
+        a.push(Lowerer_emit_inst(self, Inst::ConstInt(code, IrType::I64)));
+        a.push(Lowerer_emit_inst(self, Inst::ConstInt(tids.get(0), IrType::I64)));
+        return Lowerer_emit_inst(self, Inst::Call("Vec_new_typed", a, Lowerer_lower_type(self, t), EffectSet_new()));
+    }
+    if tids.len() == 2 {
+        if !Lowerer_has_function(self, "HashMap_new_typed") { return -1; }
+        var b: Vec<i64> = Vec::new();
+        b.push(Lowerer_rc_env(self));
+        b.push(Lowerer_emit_inst(self, Inst::ConstBool(tids.get(0) == 1)));
+        b.push(Lowerer_emit_inst(self, Inst::ConstInt(tids.get(1), IrType::I64)));
+        return Lowerer_emit_inst(self, Inst::Call("HashMap_new_typed", b, Lowerer_lower_type(self, t), EffectSet_new()));
+    }
+    return -1;
+}
+
+
+/// A string counted again and dropped in the same block with nothing in
+/// between that could free or keep it (no call, store or terminator), and
+/// the count's result unused: neither is needed (proposal 0004).
+fn lw_rc_cancel_pairs(module: &mut IrModule) {
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var f: IrFunction = module.functions.get(fi);
+        var changed: bool = false;
+        var b: i64 = 0;
+        while b < f.blocks.len() {
+            var blk: BasicBlock = f.blocks.get(b);
+            var ins: Vec<i64> = blk.instructions;
+            var dead: Vec<i64> = Vec::new();
+            var i: i64 = 0;
+            while i < ins.len() {
+                var a: i64 = lw_rc_str_count_arg(&f, ins.get(i), "Str_dup");
+                if a >= 0 {
+                    var j: i64 = i + 1;
+                    var stop: bool = false;
+                    while j < ins.len() && !stop {
+                        var d: i64 = lw_rc_str_count_arg(&f, ins.get(j), "Str_drop");
+                        if d == a {
+                            if !lw_rc_value_used(&f, ins.get(i)) {
+                                dead.push(ins.get(i));
+                                dead.push(ins.get(j));
+                            }
+                            stop = true;
+                        } else if lw_rc_may_free(&f, ins.get(j)) {
+                            stop = true;
+                        }
+                        j = j + 1;
+                    }
+                }
+                i = i + 1;
+            }
+            if dead.len() > 0 {
+                var kept: Vec<i64> = Vec::new();
+                var k: i64 = 0;
+                while k < ins.len() {
+                    if !lw_c_vec_i64_has(dead, ins.get(k)) { kept.push(ins.get(k)); }
+                    k = k + 1;
+                }
+                blk.instructions = kept;
+                f.blocks.set(b, blk);
+                changed = true;
+            }
+            b = b + 1;
+        }
+        if changed { module.functions.set(fi, f); }
+        fi = fi + 1;
+    }
+}
+
+fn lw_c_vec_i64_has(v: Vec<i64>, x: i64) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == x { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The string argument of instruction `id` when it is a call of `fname`
+/// (core's Str_dup/Str_drop, env first), else -1.
+fn lw_rc_str_count_arg(f: &IrFunction, id: i64, fname: str) -> i64 {
+    match IrFunction_get_inst(f, id) {
+        OptInst::Some(inst) => {
+            match inst {
+                Inst::Call(n, args, _, _) => {
+                    if n == fname && args.len() == 2 {
+                        // Through the cast to a word: the value itself
+                        var a: i64 = args.get(1);
+                        match IrFunction_get_inst(f, a) {
+                            OptInst::Some(ai) => {
+                                match ai {
+                                    Inst::BitCast(x, _, _) => { return x; }
+                                    _ => {}
+                                }
+                            }
+                            OptInst::None => {}
+                        }
+                        return a;
+                    }
+                }
+                _ => {}
+            }
+        }
+        OptInst::None => {}
+    }
+    return -1;
+}
+
+/// Whether instruction `id` could free or keep a string (anything but a
+/// pure computation).
+fn lw_rc_may_free(f: &IrFunction, id: i64) -> bool {
+    match IrFunction_get_inst(f, id) {
+        OptInst::Some(inst) => {
+            match inst {
+                Inst::ConstInt(_, _) => { return false; }
+                Inst::ConstBool(_) => { return false; }
+                Inst::ConstStr(_) => { return false; }
+                Inst::BinOp(_, _, _, _) => { return false; }
+                Inst::BitCast(_, _, _) => { return false; }
+                Inst::Load(_, _) => { return false; }
+                Inst::GetFieldPtr(_, _, _) => { return false; }
+                _ => { return true; }
+            }
+        }
+        OptInst::None => {}
+    }
+    return true;
+}
+
+/// Whether any instruction of `f` uses value `v`.
+fn lw_rc_value_used(f: &IrFunction, v: i64) -> bool {
+    var i: i64 = 0;
+    while i < f.insts.len() {
+        var refs: Vec<i64> = inst_value_refs(&f.insts.get(i).inst);
+        var j: i64 = 0;
+        while j < refs.len() {
+            if refs.get(j) == v { return true; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}

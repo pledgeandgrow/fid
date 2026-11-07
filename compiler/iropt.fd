@@ -9,6 +9,9 @@
 //   - constant folding of integer arithmetic and comparisons whose operands
 //     are both constants, when the result cannot overflow
 //   - removal of constants and other pure values nothing reads
+//   - loop-invariant code motion (competitive OP9, OP26): a read of a local
+//     the loop never stores, `v.len()` of a Vec the loop cannot resize, and
+//     pure operations on such values move to the block before the loop
 // Every pass leaves the program's meaning as it was; when in doubt it does
 // nothing.
 
@@ -33,6 +36,7 @@ pub fn iropt_native(module: &mut IrModule) {
         var f: IrFunction = entry.func;
         var changed: bool = iro_fold(&mut f);
         if iro_dce(&mut f) { changed = true; }
+        if IRO_LICM && iro_licm(&mut f) { changed = true; }
         if changed {
             entry.func = f;
             module.functions.set(i, entry);
@@ -431,4 +435,316 @@ fn iro_dce(f: &mut IrFunction) -> bool {
         round = round + 1;
     }
     return any;
+}
+
+// --- Loop-invariant code motion ---------------------------------------------
+
+const IRO_LICM: bool = true;
+
+/// A local only loads and stores use (its address goes nowhere).
+fn iro_plain_locals(f: &IrFunction) -> Vec<i64> {
+    var plain: Vec<i64> = peir_zeros(f.next_value + 1);
+    var i: i64 = 0;
+    while i < f.insts.len() {
+        var ve: ValueIdInst = f.insts.get(i);
+        match ve.inst {
+            Inst::Alloca(_, _) => { if ve.id >= 0 && ve.id < plain.len() { plain.set(ve.id, 1); } }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < f.insts.len() {
+        var inst: Inst = f.insts.get(i).inst;
+        var ops: Vec<i64> = Vec::new();
+        peir_inst_operands(inst, &mut ops);
+        var o: i64 = 0;
+        while o < ops.len() {
+            var v: i64 = ops.get(o);
+            if v >= 0 && v < plain.len() && plain.get(v) == 1 {
+                var ok: bool = false;
+                match inst {
+                    Inst::Load(p, _) => { ok = p == v; }
+                    Inst::Store(p, sv, _) => { ok = p == v && sv != v; }
+                    _ => {}
+                }
+                if !ok { plain.set(v, 0); }
+            }
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+    return plain;
+}
+
+/// Calls a loop may make while its Vecs keep their lengths.
+fn iro_len_safe_call(name: str) -> bool {
+    return name == "Vec_get" || name == "Vec_set" || name == "Vec_len"
+        || name == "p_vec_get" || name == "p_vec_set" || name == "p_vec_len";
+}
+
+fn iro_licm(f: &mut IrFunction) -> bool {
+    var n: i64 = f.blocks.len();
+    if n < 2 { return false; }
+    var max_id: i64 = 0;
+    var b: i64 = 0;
+    while b < n {
+        if f.blocks.get(b).id > max_id { max_id = f.blocks.get(b).id; }
+        b = b + 1;
+    }
+    var index: Vec<i64> = Vec::new();
+    while index.len() <= max_id { index.push(-1); }
+    b = 0;
+    while b < n {
+        index.set(f.blocks.get(b).id, b);
+        b = b + 1;
+    }
+    var succs: Vec<Vec<i64>> = Vec::new();
+    var preds: Vec<Vec<i64>> = Vec::new();
+    b = 0;
+    while b < n {
+        var s0: Vec<i64> = Vec::new();
+        var p0: Vec<i64> = Vec::new();
+        succs.push(s0);
+        preds.push(p0);
+        b = b + 1;
+    }
+    b = 0;
+    while b < n {
+        var ids: Vec<i64> = f.blocks.get(b).instructions;
+        if ids.len() > 0 {
+            match peir_inst_of(f, ids.get(ids.len() - 1)) {
+                Inst::Jump(t) => { peir_add_edge(&mut succs, &mut preds, index, b, t); }
+                Inst::Branch(_, t, e) => {
+                    peir_add_edge(&mut succs, &mut preds, index, b, t);
+                    peir_add_edge(&mut succs, &mut preds, index, b, e);
+                }
+                _ => {}
+            }
+        }
+        b = b + 1;
+    }
+    // Back edges, by depth-first search from the entry
+    var latches: Vec<Vec<i64>> = Vec::new();
+    b = 0;
+    while b < n {
+        var l0: Vec<i64> = Vec::new();
+        latches.push(l0);
+        b = b + 1;
+    }
+    var any_loop: bool = false;
+    var state: Vec<i64> = peir_zeros(n);
+    var st_b: Vec<i64> = Vec::new();
+    var st_next: Vec<i64> = Vec::new();
+    st_b.push(0);
+    st_next.push(0);
+    state.set(0, 1);
+    while st_b.len() > 0 {
+        var top: i64 = st_b.len() - 1;
+        var cur: i64 = st_b.get(top);
+        var next: i64 = st_next.get(top);
+        var cur_succs: Vec<i64> = succs.get(cur);
+        if next < cur_succs.len() {
+            st_next.set(top, next + 1);
+            var sx: i64 = cur_succs.get(next);
+            if state.get(sx) == 0 {
+                state.set(sx, 1);
+                st_b.push(sx);
+                st_next.push(0);
+            } else if state.get(sx) == 1 {
+                latches.get(sx).push(cur);
+                any_loop = true;
+            }
+        } else {
+            state.set(cur, 2);
+            st_b.pop();
+            st_next.pop();
+        }
+    }
+    if !any_loop { return false; }
+    var plain: Vec<i64> = iro_plain_locals(f);
+    // Which block defines each value (-1: a parameter, or none)
+    var def_b: Vec<i64> = Vec::new();
+    while def_b.len() <= f.next_value { def_b.push(-1); }
+    b = 0;
+    while b < n {
+        var ids2: Vec<i64> = f.blocks.get(b).instructions;
+        var k: i64 = 0;
+        while k < ids2.len() {
+            var id: i64 = ids2.get(k);
+            if id >= 0 && id < def_b.len() { def_b.set(id, b); }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    var changed: bool = false;
+    var head: i64 = n - 1;
+    while head >= 0 {
+        if latches.get(head).len() > 0 {
+            if iro_licm_loop(f, head, latches.get(head), preds, n, plain, &mut def_b) { changed = true; }
+        }
+        head = head - 1;
+    }
+    return changed;
+}
+
+fn iro_licm_loop(f: &mut IrFunction, head: i64, lat: Vec<i64>, preds: Vec<Vec<i64>>, n: i64, plain: Vec<i64>, def_b: &mut Vec<i64>) -> bool {
+    var body: Vec<i64> = peir_zeros(n);
+    body.set(head, 1);
+    var work: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < lat.len() {
+        work.push(lat.get(i));
+        i = i + 1;
+    }
+    while work.len() > 0 {
+        var wb: i64 = work.pop();
+        if body.get(wb) == 0 {
+            body.set(wb, 1);
+            var ps: Vec<i64> = preds.get(wb);
+            i = 0;
+            while i < ps.len() {
+                work.push(ps.get(i));
+                i = i + 1;
+            }
+        }
+    }
+    // The one block that enters the loop, by a jump to its header
+    var pre: i64 = -1;
+    var hp: Vec<i64> = preds.get(head);
+    i = 0;
+    while i < hp.len() {
+        if body.get(hp.get(i)) == 0 {
+            if pre >= 0 && pre != hp.get(i) { return false; }
+            pre = hp.get(i);
+        }
+        i = i + 1;
+    }
+    if pre < 0 { return false; }
+    var pids: Vec<i64> = f.blocks.get(pre).instructions;
+    if pids.len() == 0 { return false; }
+    match peir_inst_of(f, pids.get(pids.len() - 1)) {
+        Inst::Jump(_) => {}
+        _ => { return false; }
+    }
+    // What the loop writes: the locals it stores, whether it calls anything
+    // that could resize a Vec
+    var stored: Vec<i64> = peir_zeros(f.next_value + 1);
+    var resizes: bool = false;
+    var b: i64 = 0;
+    while b < n {
+        if body.get(b) == 1 {
+            var ids: Vec<i64> = f.blocks.get(b).instructions;
+            var k: i64 = 0;
+            while k < ids.len() {
+                match peir_inst_of(f, ids.get(k)) {
+                    Inst::Store(p, _, _) => { if p >= 0 && p < stored.len() { stored.set(p, 1); } }
+                    Inst::Call(cn, _, _, _) => { if !iro_len_safe_call(cn) { resizes = true; } }
+                    Inst::CallPtr(_, _, _, _, _) => { resizes = true; }
+                    Inst::DynCall(_, _, _, _, _) => { resizes = true; }
+                    _ => {}
+                }
+                k = k + 1;
+            }
+        }
+        b = b + 1;
+    }
+    var hoisted: Vec<i64> = Vec::new();
+    var round: i64 = 0;
+    while round < 4 {
+        var moved: bool = false;
+        b = 0;
+        while b < n {
+            if body.get(b) == 1 {
+                var blk: BasicBlock = f.blocks.get(b);
+                var keep: Vec<i64> = Vec::new();
+                var k2: i64 = 0;
+                while k2 < blk.instructions.len() {
+                    var id: i64 = blk.instructions.get(k2);
+                    var inst: Inst = peir_inst_of(f, id);
+                    var can: bool = false;
+                    match inst {
+                        Inst::Load(p, _) => {
+                            can = p >= 0 && p < plain.len() && plain.get(p) == 1 && stored.get(p) == 0;
+                        }
+                        Inst::Call(cn, args, _, _) => {
+                            can = (cn == "Vec_len" || cn == "p_vec_len") && !resizes;
+                            if can {
+                                // its Vec comes from outside the loop
+                                var a: i64 = 0;
+                                while a < args.len() {
+                                    var av: i64 = args.get(a);
+                                    if av >= 0 && av < def_b.len() && def_b.get(av) >= 0 && body.get(def_b.get(av)) == 1 { can = false; }
+                                    a = a + 1;
+                                }
+                            }
+                        }
+                        Inst::BinOp(op, _, _, ty) => {
+                            // only what cannot trap: comparisons and bit operations
+                            if !ir_type_is_float(ty) {
+                                match op {
+                                    BinOp::Eq => { can = true; }
+                                    BinOp::Neq => { can = true; }
+                                    BinOp::Lt => { can = true; }
+                                    BinOp::Gt => { can = true; }
+                                    BinOp::LtEq => { can = true; }
+                                    BinOp::GtEq => { can = true; }
+                                    BinOp::BitAnd => { can = true; }
+                                    BinOp::BitOr => { can = true; }
+                                    BinOp::BitXor => { can = true; }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Inst::IntExtend(_, _, _) => { can = true; }
+                        Inst::BitCast(_, _, _) => { can = true; }
+                        _ => {}
+                    }
+                    if can {
+                        // every operand from outside the loop (or already moved)
+                        var ops: Vec<i64> = Vec::new();
+                        peir_inst_operands(inst, &mut ops);
+                        var o: i64 = 0;
+                        while o < ops.len() {
+                            var ov: i64 = ops.get(o);
+                            if ov >= 0 && ov < def_b.len() && def_b.get(ov) >= 0 && body.get(def_b.get(ov)) == 1 { can = false; }
+                            o = o + 1;
+                        }
+                        match inst {
+                            // the loaded local itself is an operand: it is an
+                            // alloca, made before the loop
+                            _ => {}
+                        }
+                    }
+                    if can {
+                        hoisted.push(id);
+                        def_b.set(id, pre);
+                        moved = true;
+                    } else {
+                        keep.push(id);
+                    }
+                    k2 = k2 + 1;
+                }
+                if keep.len() != blk.instructions.len() {
+                    blk.instructions = keep;
+                    f.blocks.set(b, blk);
+                }
+            }
+            b = b + 1;
+        }
+        if !moved { break; }
+        round = round + 1;
+    }
+    if hoisted.len() == 0 { return false; }
+    // Into the block before the loop, ahead of its jump
+    var pblk: BasicBlock = f.blocks.get(pre);
+    var term: i64 = pblk.instructions.pop();
+    var h: i64 = 0;
+    while h < hoisted.len() {
+        pblk.instructions.push(hoisted.get(h));
+        h = h + 1;
+    }
+    pblk.instructions.push(term);
+    f.blocks.set(pre, pblk);
+    return true;
 }

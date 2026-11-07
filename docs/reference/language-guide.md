@@ -780,7 +780,9 @@ use http with { Net };
   those of `core`. It does not follow the call graph: a function that calls
   another function which prints is not itself checked for `IO`
 - **Sandbox:** inside `sandbox { ... }` every such call is an error, whatever
-  has been granted. Calls to other functions are allowed
+  has been granted. It does follow calls: a function, method or builtin
+  (`p_file_read`, …) whose inferred effects include `IO`, `Net` or `Spawn`
+  is rejected too, as is a call through a function value
 - **Compile-time:** All checks happen at compile time — no runtime overhead
 
 ### 5.3 Safety Annotations

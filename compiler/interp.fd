@@ -157,6 +157,57 @@ pub struct Memory {
     pub blocks: I64Table,
 }
 
+/// The element code in a Vec header's +24 word (core's vec_code_word:
+/// 0, or P_VEC_TAG + code + 8; any other word is a word Vec).
+fn interp_vec_decode(w: i64) -> i64 {
+    if w == 0 { return 0; }
+    var low: i64 = w & 255;
+    if w - low != 0x4649445645430000 { return 0; }
+    return low - 8;
+}
+
+/// Bytes per element of a Vec whose +24 word is `word` (release D14).
+fn interp_vec_esz(word: i64) -> i64 {
+    var code: i64 = interp_vec_decode(word);
+    if code == 0 { return 8; }
+    if code < 0 { return 0 - code; }
+    return code;
+}
+
+/// Element `i` of Vec data at `data` with element code `code`.
+fn interp_vec_ld(mem: &Memory, data: i64, i: i64, word: i64) -> i64 {
+    var code: i64 = interp_vec_decode(word);
+    if code == 0 { return Memory_load_i64(mem, data + i * 8); }
+    var esz: i64 = interp_vec_esz(word);
+    var a: i64 = data + i * esz;
+    var v: i64 = 0;
+    var k: i64 = esz - 1;
+    while k >= 0 {
+        v = (v << 8) | Memory_load_byte(mem, a + k);
+        k = k - 1;
+    }
+    if code < 0 {
+        var top: i64 = 1 << (esz * 8 - 1);
+        if v >= top { v = v - top * 2; }
+    }
+    return v;
+}
+
+fn interp_vec_st(mem: &mut Memory, data: i64, i: i64, word: i64, x: i64) {
+    var code: i64 = interp_vec_decode(word);
+    if code == 0 {
+        Memory_store_i64(mem, data + i * 8, x);
+        return;
+    }
+    var esz: i64 = interp_vec_esz(word);
+    var a: i64 = data + i * esz;
+    var k: i64 = 0;
+    while k < esz {
+        Memory_store_byte(mem, a + k, (x >> (k * 8)) & 255);
+        k = k + 1;
+    }
+}
+
 pub fn Memory_new() -> Memory {
     var data: Vec<i64> = Vec::new();
     // Pre-allocate 1MB (1048576 bytes)
@@ -378,10 +429,18 @@ pub fn Memory_copy(self: &mut Memory, dst: i64, src: i64, size: i64) {
     }
 }
 
-// Store a null-terminated string at addr, return the address
+// Store a string as core keeps one (release D16): [magic][length], then
+// the bytes and a terminator. Returns the address of the bytes; zero bytes
+// inside the string are kept, and str_len reads the header.
 pub fn Memory_store_cstr(self: &mut Memory, s: str) -> i64 {
     var slen: i64 = str_len(s);
-    var addr: i64 = Memory_alloc(self, slen + 1);
+    var block: i64 = Memory_alloc(self, slen + 17);
+    Memory_store_i64(self, block, 0x4649444553545201);
+    Memory_store_i64(self, block + 8, slen);
+    var addr: i64 = block + 16;
+    // Freeing the bytes' address directly (not through p_str_free) is a
+    // free of this string too
+    I64Table_set(&mut self.blocks, addr, Value::Int(1));
     var i: i64 = 0;
     while i < slen {
         // Read byte from string using pointer arithmetic
@@ -400,6 +459,21 @@ pub fn Memory_store_cstr(self: &mut Memory, s: str) -> i64 {
 pub fn Memory_load_cstr(self: &Memory, addr: i64) -> str {
     if addr <= 0 { return ""; }
     var result: str = "";
+    // A length-headered string (D16): its length, zero bytes included
+    if addr >= 16 {
+        var magic: i64 = Memory_load_i64(self, addr - 16);
+        if magic == 0x4649444553545201 || magic == 0x4649444553545202 {
+            var hlen: i64 = Memory_load_i64(self, addr - 8);
+            if hlen >= 0 && addr + hlen <= self.data.len() {
+                var hi: i64 = 0;
+                while hi < hlen {
+                    result = result + p_char_to_str(Memory_load_byte(self, addr + hi));
+                    hi = hi + 1;
+                }
+                return result;
+            }
+        }
+    }
     var offset: i64 = addr;
     while offset < self.data.len() {
         var b: i64 = Memory_load_byte(self, offset);
@@ -3214,11 +3288,14 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
     // The interpreter allocates this in simulated memory and tracks it.
     if name == "p_vec_new" {
         // Allocate 24 bytes for the Vec struct {data: i64, len: i64, cap: i64}
-        var vec_addr: i64 = Memory_alloc(&mut self.memory, 24);
-        // Initialize: data=0, len=0, cap=0
+        var vec_addr: i64 = Memory_alloc(&mut self.memory, 40);
+        // Initialize: data=0, len=0, cap=0, element code 0 (a word, D14),
+        // element type 0 (plain values, proposal 0004)
         Memory_store_i64(&mut self.memory, vec_addr, 0);
         Memory_store_i64(&mut self.memory, vec_addr + 8, 0);
         Memory_store_i64(&mut self.memory, vec_addr + 16, 0);
+        Memory_store_i64(&mut self.memory, vec_addr + 24, 0);
+        Memory_store_i64(&mut self.memory, vec_addr + 32, 0);
         // Also create a side-table entry for interpreter-level Vec operations
         var handle: i64 = self.vec_values.len();
         self.vec_values.push(VecValueEntry_new(handle));
@@ -3239,12 +3316,13 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                     if len >= cap {
                         var new_cap: i64 = 8;
                         if cap > 0 { new_cap = cap * 2; }
-                        var new_data: i64 = Memory_alloc(&mut self.memory, new_cap * 8);
+                        var pcode: i64 = Memory_load_i64(&self.memory, vec_addr + 24);
+                        var new_data: i64 = Memory_alloc(&mut self.memory, new_cap * interp_vec_esz(pcode));
                         // Copy old data
                         var ci: i64 = 0;
                         while ci < len {
-                            var v: i64 = Memory_load_i64(&self.memory, data + ci * 8);
-                            Memory_store_i64(&mut self.memory, new_data + ci * 8, v);
+                            var v: i64 = interp_vec_ld(&self.memory, data, ci, pcode);
+                            interp_vec_st(&mut self.memory, new_data, ci, pcode, v);
                             ci = ci + 1;
                         }
                         data = new_data;
@@ -3252,8 +3330,8 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                         Memory_store_i64(&mut self.memory, vec_addr, data);
                         Memory_store_i64(&mut self.memory, vec_addr + 16, cap);
                     }
-                    // Store element
-                    Memory_store_i64(&mut self.memory, data + len * 8, elem);
+                    // Store element (at its size, D14)
+                    interp_vec_st(&mut self.memory, data, len, Memory_load_i64(&self.memory, vec_addr + 24), elem);
                     len = len + 1;
                     Memory_store_i64(&mut self.memory, vec_addr + 8, len);
                     return ExecOutcome::Value(Value::Void);
@@ -3274,7 +3352,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                                 return ExecOutcome::Panic("Vec index out of bounds");
                             }
                             var data: i64 = Memory_load_i64(&self.memory, vec_addr);
-                            var elem: i64 = Memory_load_i64(&self.memory, data + idx * 8);
+                            var elem: i64 = interp_vec_ld(&self.memory, data, idx, Memory_load_i64(&self.memory, vec_addr + 24));
                             return ExecOutcome::Value(Value::Int(elem));
                         }
                         _ => {}
@@ -3297,7 +3375,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                                 return ExecOutcome::Panic("Vec index out of bounds");
                             }
                             var data2: i64 = Memory_load_i64(&self.memory, vec_addr);
-                            Memory_store_i64(&mut self.memory, data2 + idx * 8, elem2);
+                            interp_vec_st(&mut self.memory, data2, idx, Memory_load_i64(&self.memory, vec_addr + 24), elem2);
                             return ExecOutcome::Value(Value::Void);
                         }
                         _ => {}
@@ -3341,7 +3419,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                         return ExecOutcome::Panic("Vec is empty");
                     }
                     var data5: i64 = Memory_load_i64(&self.memory, vec_addr);
-                    var elem5: i64 = Memory_load_i64(&self.memory, data5 + (len5 - 1) * 8);
+                    var elem5: i64 = interp_vec_ld(&self.memory, data5, len5 - 1, Memory_load_i64(&self.memory, vec_addr + 24));
                     len5 = len5 - 1;
                     Memory_store_i64(&mut self.memory, vec_addr + 8, len5);
                     return ExecOutcome::Value(Value::Int(elem5));
@@ -3844,7 +3922,8 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
         if th3 < 0 { return ExecOutcome::Panic("tensor_shape: expected Tensor"); }
         var tsh: TensorData = self.tensors.get(th3);
         var shlen: i64 = tsh.shape.len();
-        var struct_addr: i64 = Memory_alloc(&mut self.memory, 24);
+        var struct_addr: i64 = Memory_alloc(&mut self.memory, 32);
+        Memory_store_i64(&mut self.memory, struct_addr + 24, 0);
         var data_addr: i64 = 0;
         if shlen > 0 {
             data_addr = Memory_alloc(&mut self.memory, shlen * 8);
@@ -4232,7 +4311,9 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
             var s: str = Interpreter_value_to_string(self, args.get(0));
             var delim: str = Interpreter_value_to_string(self, args.get(1));
             // Create a new vec (same as p_vec_new)
-            var vec_addr: i64 = Memory_alloc(&mut self.memory, 24);
+            var vec_addr: i64 = Memory_alloc(&mut self.memory, 40);
+            Memory_store_i64(&mut self.memory, vec_addr + 24, 0);
+            Memory_store_i64(&mut self.memory, vec_addr + 32, 0);
             Memory_store_i64(&mut self.memory, vec_addr, 0);
             Memory_store_i64(&mut self.memory, vec_addr + 8, 0);
             Memory_store_i64(&mut self.memory, vec_addr + 16, 0);
@@ -4341,7 +4422,9 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
             var s: str = Interpreter_value_to_string(self, args.get(0));
             var slen: i64 = str_len(s);
             // Create a new vec to hold byte values
-            var vec_addr: i64 = Memory_alloc(&mut self.memory, 24);
+            var vec_addr: i64 = Memory_alloc(&mut self.memory, 40);
+            Memory_store_i64(&mut self.memory, vec_addr + 24, 0);
+            Memory_store_i64(&mut self.memory, vec_addr + 32, 0);
             Memory_store_i64(&mut self.memory, vec_addr, 0);
             Memory_store_i64(&mut self.memory, vec_addr + 8, 0);
             Memory_store_i64(&mut self.memory, vec_addr + 16, 0);
@@ -4700,16 +4783,19 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                     var src_len: i64 = Memory_load_i64(&self.memory, src_addr + 8);
                     var src_data: i64 = Memory_load_i64(&self.memory, src_addr);
                     // Create a new vec
-                    var new_addr: i64 = Memory_alloc(&mut self.memory, 24);
+                    var new_addr: i64 = Memory_alloc(&mut self.memory, 40);
+                    var kcode: i64 = Memory_load_i64(&self.memory, src_addr + 24);
+                    Memory_store_i64(&mut self.memory, new_addr + 24, kcode);
+                    Memory_store_i64(&mut self.memory, new_addr + 32, 0);
                     var new_cap: i64 = 8;
                     if src_len > 8 { new_cap = src_len; }
                     if new_cap == 0 { new_cap = 8; }
-                    var new_data: i64 = Memory_alloc(&mut self.memory, new_cap * 8);
+                    var new_data: i64 = Memory_alloc(&mut self.memory, new_cap * interp_vec_esz(kcode));
                     // Copy elements
                     var ci: i64 = 0;
                     while ci < src_len {
-                        var v: i64 = Memory_load_i64(&self.memory, src_data + ci * 8);
-                        Memory_store_i64(&mut self.memory, new_data + ci * 8, v);
+                        var v: i64 = interp_vec_ld(&self.memory, src_data, ci, kcode);
+                        interp_vec_st(&mut self.memory, new_data, ci, kcode, v);
                         ci = ci + 1;
                     }
                     Memory_store_i64(&mut self.memory, new_addr, new_data);
@@ -4738,7 +4824,9 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
     // ─── Map extra runtime functions (ported from src/interp.rs ~3208-3579) ───
     if name == "p_map_keys" {
         // Create a new vec to hold keys (empty since map storage is simplified)
-        var vec_addr: i64 = Memory_alloc(&mut self.memory, 24);
+        var vec_addr: i64 = Memory_alloc(&mut self.memory, 40);
+        Memory_store_i64(&mut self.memory, vec_addr + 24, 0);
+        Memory_store_i64(&mut self.memory, vec_addr + 32, 0);
         Memory_store_i64(&mut self.memory, vec_addr, 0);
         Memory_store_i64(&mut self.memory, vec_addr + 8, 0);
         Memory_store_i64(&mut self.memory, vec_addr + 16, 0);
@@ -4746,7 +4834,9 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
     }
     if name == "p_map_values" {
         // Create a new vec to hold values (empty since map storage is simplified)
-        var vec_addr: i64 = Memory_alloc(&mut self.memory, 24);
+        var vec_addr: i64 = Memory_alloc(&mut self.memory, 40);
+        Memory_store_i64(&mut self.memory, vec_addr + 24, 0);
+        Memory_store_i64(&mut self.memory, vec_addr + 32, 0);
         Memory_store_i64(&mut self.memory, vec_addr, 0);
         Memory_store_i64(&mut self.memory, vec_addr + 8, 0);
         Memory_store_i64(&mut self.memory, vec_addr + 16, 0);
@@ -4837,9 +4927,10 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                 if vaddr > 0 {
                     var vdata: i64 = Memory_load_i64(&self.memory, vaddr);
                     var vlen: i64 = Memory_load_i64(&self.memory, vaddr + 8);
+                    var vword: i64 = Memory_load_i64(&self.memory, vaddr + 24);
                     var bi: i64 = 0;
                     while bi < vlen {
-                        bytes.push(Memory_load_i64(&self.memory, vdata + bi * 8));
+                        bytes.push(interp_vec_ld(&self.memory, vdata, bi, vword));
                         bi = bi + 1;
                     }
                 }
@@ -4857,7 +4948,9 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                 Memory_store_i64(&mut self.memory, rdata + ri * 8, read.get(ri));
                 ri = ri + 1;
             }
-            var raddr: i64 = Memory_alloc(&mut self.memory, 24);
+            var raddr: i64 = Memory_alloc(&mut self.memory, 40);
+            Memory_store_i64(&mut self.memory, raddr + 24, 0);
+            Memory_store_i64(&mut self.memory, raddr + 32, 0);
             Memory_store_i64(&mut self.memory, raddr, rdata);
             Memory_store_i64(&mut self.memory, raddr + 8, n);
             Memory_store_i64(&mut self.memory, raddr + 16, cap);
@@ -5109,8 +5202,8 @@ pub fn Interpreter_lookup_vec_value(self: &Interpreter, arg: Value) -> OptValue 
 }
 
 /// read_raw_vec_i64 — read a raw Fides Vec struct from memory.
-/// Vec is 24 bytes: { data: i64, len: i64, cap: i64 }.
-/// Elements are at data[i*8] as raw i64 values.
+/// Vec is 32 bytes: { data: i64, len: i64, cap: i64, code word }.
+/// Elements are at their size (interp_vec_ld; D14).
 pub fn Interpreter_read_raw_vec_i64(self: &Interpreter, addr: i64) -> OptVecI64 {
     if addr == 0 { return OptVecI64::None; }
     var len: i64 = Memory_load_i64(&self.memory, addr + 8);
@@ -5118,9 +5211,10 @@ pub fn Interpreter_read_raw_vec_i64(self: &Interpreter, addr: i64) -> OptVecI64 
     var data: i64 = Memory_load_i64(&self.memory, addr);
     if data <= 0 { return OptVecI64::Some(Vec::new()); }
     var result: Vec<i64> = Vec::new();
+    var word: i64 = Memory_load_i64(&self.memory, addr + 24);
     var i: i64 = 0;
     while i < len {
-        var elem: i64 = Memory_load_i64(&self.memory, data + i * 8);
+        var elem: i64 = interp_vec_ld(&self.memory, data, i, word);
         result.push(elem);
         i = i + 1;
     }

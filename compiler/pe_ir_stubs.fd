@@ -2090,19 +2090,10 @@ pub fn PeirGen_gen_print_str(self: &mut PeirGen) -> void {
     // r12 = string pointer
     PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RCX);
 
-    // Calculate length
-    PeirEnc_xor_self(&mut self.enc, PEIR_R8);
-    var ps_len: i64 = PeirEnc_alloc_label(&mut self.enc);
-    var ps_done: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_place_label(&mut self.enc, ps_len);
-    PeirEnc_cmp_mem_idx_imm8(&mut self.enc, PEIR_R12, PEIR_R8, 0);
-    PeirEnc_jcc_label(&mut self.enc, 0x4, ps_done); // je
-    PeirEnc_inc_r(&mut self.enc, PEIR_R8);
-    PeirEnc_jmp_label(&mut self.enc, ps_len);
-    PeirEnc_place_label(&mut self.enc, ps_done);
-
-    // r13 = length
-    PeirEnc_mov_rr(&mut self.enc, PEIR_R13, PEIR_R8);
+    // r13 = length: the header's (zero bytes print, D16), else strlen
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R12);
+    PeirGen_emit_slen(self, PeirGen_iat_off(self, pe_import_slot("strlen")));
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R13, PEIR_RAX);
 
     // WriteFile(stdout, r12, r13, &written, NULL)
     PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, -11);
@@ -3132,6 +3123,44 @@ pub fn PeirGen_gen_memset(self: &mut PeirGen) -> void {
 /// p_str_concat(rcx=left *u8, rdx=right *u8) -> rax=*u8
 /// Each length is counted once by msvcrt strlen and both halves copy in bulk
 /// via memcpy - not byte-by-byte loops (pe-roadmap item 73).
+/// rax = the length of the string at rcx: its header's (a length-headered
+/// string or literal, release D16), else strlen through the import table.
+/// Uses rax, r10 (and what strlen uses).
+fn PeirGen_emit_slen(self: &mut PeirGen, strlen_off: i64) -> void {
+    var zero: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var check: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var plain: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var done: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirEnc_test_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, zero);                 // jz
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_RCX, -16);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R10, 0x4649444553545201);
+    PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_R10);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, check);                // je
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R10, 0x4649444553545202);
+    PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_R10);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, check);                // je
+    // A counted string (proposal 0004): P_STR_RC + count, count < 2^30
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R10, 0x4649444500000000);
+    PeirEnc_sub_rr(&mut self.enc, PEIR_RAX, PEIR_R10);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R10, 0x40000000);
+    PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_R10);
+    PeirEnc_jcc_label(&mut self.enc, 0x3, plain);                // jae (unsigned)
+    PeirEnc_place_label(&mut self.enc, check);
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_RCX, -8);
+    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x8, plain);                // js
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R10, 0x10000000000);
+    PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_R10);
+    PeirEnc_jcc_label(&mut self.enc, 0x2, done);                 // jb: a length
+    PeirEnc_place_label(&mut self.enc, plain);
+    PeirEnc_call_rip(&mut self.enc, strlen_off);
+    PeirEnc_jmp_label(&mut self.enc, done);
+    PeirEnc_place_label(&mut self.enc, zero);
+    PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_place_label(&mut self.enc, done);
+}
+
 pub fn PeirGen_gen_str_concat(self: &mut PeirGen) -> void {
     var label: i64 = HashMap_get(self.func_labels, "p_str_concat");
     PeirEnc_place_label(&mut self.enc, label);
@@ -3151,12 +3180,13 @@ pub fn PeirGen_gen_str_concat(self: &mut PeirGen) -> void {
     var strlen_off: i64 = PeirGen_iat_off(self, pe_import_slot("strlen"));
     var memcpy_off: i64 = PeirGen_iat_off(self, pe_import_slot("memcpy"));
 
-    // r14 = strlen(left); [rbp-48] = strlen(right)
+    // r14 = len(left); [rbp-48] = len(right): the header's length, so
+    // zero bytes survive (D16), else strlen
     PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R12);
-    PeirEnc_call_rip(&mut self.enc, strlen_off);
+    PeirGen_emit_slen(self, strlen_off);
     PeirEnc_mov_rr(&mut self.enc, PEIR_R14, PEIR_RAX);
     PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R13);
-    PeirEnc_call_rip(&mut self.enc, strlen_off);
+    PeirGen_emit_slen(self, strlen_off);
     PeirEnc_mov_mem_rbp_reg(&mut self.enc, -48, PEIR_RAX);
 
     // block = p_malloc(16 + len_l + len_r + 1): a length header, as core's
@@ -3167,8 +3197,8 @@ pub fn PeirGen_gen_str_concat(self: &mut PeirGen) -> void {
     PeirEnc_add_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
     PeirEnc_add_r_i32(&mut self.enc, PEIR_RCX, 17);
     PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "p_malloc"));
-    // [block] = magic (0x4649444553545201, core's P_STR_MAGIC)
-    PeirEnc_mov_imm64(&mut self.enc, PEIR_R9, 0x4649444553545201);
+    // [block] = a count of one owner (core's P_STR_RC + 1, proposal 0004)
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R9, 0x4649444500000001);
     PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RAX, 0, PEIR_R9);
     // [block + 8] = len_l + len_r
     PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_R10, -48);
@@ -3750,9 +3780,35 @@ pub fn PeirGen_gen_to_str_float(self: &mut PeirGen) -> void {
 
 /// p_to_str_vec(rcx = *Vec) -> rax = *u8
 /// Formats vec as "[1, 2, 3]"
+/// At the entry of p_to_str_vec / p_print_vec (rcx = the Vec): a Vec whose
+/// elements are stored at their size (D14, element code at +24) is turned
+/// into text by core's Vec_to_str (and printed); a word Vec falls through.
+fn PeirGen_sized_vec_to_core(self: &mut PeirGen, print: bool) -> void {
+    if !HashMap_contains(self.func_labels, "Vec_to_str") { return; }
+    var words: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirEnc_test_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, words);                 // jz
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_RCX, 24);
+    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, words);                 // jz: a word Vec
+    PeirEnc_sub_rsp_i32(&mut self.enc, 40);                       // realign, shadow space
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_RCX);
+    PeirEnc_xor_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
+    PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "Vec_to_str"));
+    if print {
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+        PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "p_print_str"));
+        PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    }
+    PeirEnc_add_rsp_i32(&mut self.enc, 40);
+    PeirEnc_ret(&mut self.enc);
+    PeirEnc_place_label(&mut self.enc, words);
+}
+
 pub fn PeirGen_gen_to_str_vec(self: &mut PeirGen) -> void {
     var label: i64 = HashMap_get(self.func_labels, "p_to_str_vec");
     PeirEnc_place_label(&mut self.enc, label);
+    PeirGen_sized_vec_to_core(self, false);
 
     // Prologue: push rbp + 4 callee-saved = 5 pushes = 40 bytes
     PeirEnc_push(&mut self.enc, PEIR_RBP);
@@ -3850,7 +3906,7 @@ pub fn PeirGen_gen_to_str_vec(self: &mut PeirGen) -> void {
 // Vec runtime stubs — Vec layout: { ptr: *u8, len: i64, cap: i64 } = 24 bytes
 // ===========================================================================
 
-/// p_vec_new() -> rax = *Vec (24-byte heap struct, all zeros)
+/// p_vec_new() -> rax = *Vec (32-byte heap struct, all zeros)
 pub fn PeirGen_gen_vec_new(self: &mut PeirGen) -> void {
     var label: i64 = HashMap_get(self.func_labels, "p_vec_new");
     PeirEnc_place_label(&mut self.enc, label);
@@ -3859,15 +3915,16 @@ pub fn PeirGen_gen_vec_new(self: &mut PeirGen) -> void {
     PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
     PeirEnc_sub_rsp_i32(&mut self.enc, 48);
 
-    // malloc(24) — shadow space already in the 48 bytes
-    PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, 24);
+    // malloc(32) — shadow space already in the 48 bytes
+    PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, 32);
     PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "p_malloc"));
 
-    // Zero out 24 bytes (3 qwords)
+    // Zero out 32 bytes: data, len, cap, element code (D14: 0, a word)
     PeirEnc_xor_self(&mut self.enc, PEIR_RCX);
     PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_RCX);
     PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RAX, 8, PEIR_RCX);
     PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RAX, 16, PEIR_RCX);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RAX, 24, PEIR_RCX);
 
     PeirEnc_mov_rr(&mut self.enc, PEIR_RSP, PEIR_RBP);
     PeirEnc_pop(&mut self.enc, PEIR_RBP);
@@ -4081,6 +4138,7 @@ pub fn PeirGen_gen_vec_pop(self: &mut PeirGen) -> void {
 pub fn PeirGen_gen_print_vec(self: &mut PeirGen) -> void {
     var label: i64 = HashMap_get(self.func_labels, "p_print_vec");
     PeirEnc_place_label(&mut self.enc, label);
+    PeirGen_sized_vec_to_core(self, true);
 
     PeirEnc_push(&mut self.enc, PEIR_RBP);
     PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
@@ -5212,11 +5270,17 @@ pub fn PeirGen_gen_char_to_str(self: &mut PeirGen) -> void {
     PeirEnc_sub_rsp_i32(&mut self.enc, 40); // 32 + 8 for alignment
     // Save char code in r12
     PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RCX);
-    // malloc(2)
-    PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, 2);
+    // malloc(16 + 2): a length header, so a zero byte is a 1-byte string
+    // (release D16), then the byte and the terminator
+    PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, 18);
     PeirEnc_sub_rsp_i32(&mut self.enc, 32);
     PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "p_malloc"));
     PeirEnc_add_rsp_i32(&mut self.enc, 32);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R9, 0x4649444500000001);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RAX, 0, PEIR_R9);
+    PeirEnc_mov_imm32(&mut self.enc, PEIR_R9, 1);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RAX, 8, PEIR_R9);
+    PeirEnc_add_r_i32(&mut self.enc, PEIR_RAX, 16);
     // Store char at [rax]
     PeirEnc_mov_mem_reg8_ptr(&mut self.enc, PEIR_RAX, PEIR_R12);
     // Store 0 at [rax+1]

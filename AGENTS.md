@@ -4,7 +4,7 @@
 > Fides compiler safely. Read this before making changes.
 >
 > **Fides is self-hosted and independent.** The primary compiler is in
-> `compiler/*.fd` (61 modules, ~134K lines). The Rust source in `src/*.rs`
+> `compiler/*.fd` (63 modules, ~142K lines). The Rust source in `src/*.rs`
 > (57 files, ~113K lines) is the bootstrap reference, frozen: it builds
 > stage 1 when `compiler/*.fd` changes and runs the test harness. The
 > language is what `fid` accepts: docs/reference/reference.md.
@@ -105,6 +105,19 @@ cargo build
 # Run the LSP server (for editor integration)
 ./target/release/fidesc lsp
 
+# Cross targets through C (zig cc from any host): Linux ARM64/RISC-V/x86-64
+# (static musl), macOS, WebAssembly (WASI). cross-test.sh builds the suite
+# for a target, runs it (qemu-user in WSL/Linux, Node for WASI) and compares
+# output and exit code with `fid run`. Builds at 10 jobs need a lot of RAM.
+.\release\fid.exe ccompile <file.fd> --target aarch64-linux -o out
+.\release\fid.exe ccompile <file.fd> --target wasm32-wasi -o out.wasm
+node scripts/wasm-run.mjs out.wasm
+# Native Linux AArch64 / RISC-V 64, no C compiler (compiler/nat_ir.fd,
+# nat_enc.fd, runtime stdlib/linux_runtime/base.fd); NATIVE=1 for the suite
+.\release\fid.exe emit <file.fd> --target aarch64-linux -o out
+NATIVE=1 FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh riscv64-linux
+FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
+
 # Run lint checks (unused functions, unused imports; fid also unwrap() outside tests)
 ./target/release/fidesc lint <file.fd>
 
@@ -162,7 +175,7 @@ cargo build
 
 ```
 SELF-HOSTED COMPILER (primary source):
-  compiler/*.fd:  61 modules, 133,688 lines — THE COMPILER
+  compiler/*.fd:  63 modules, 142,378 lines — THE COMPILER
   Fixpoint:       VERIFIED byte-for-byte (stage2 == stage3, 49 MB of C,
                   Nov 6; checked by every RELEASE=1 bootstrap)
   Bootstrap:      5 generations verified (Rust → c1 → c2 → c3 → c4 → c5)
@@ -518,12 +531,18 @@ touching them.
    `p_free`, never `free()` (`p_print_float` did: a crash after the second
    float printed).
 
-23. **Freeing a by-value `Vec` parameter needs copy-on-write**
-   (`compiler/lower.fd`, `lw_drop_function_vecs`): a function may free a
-   `Vec` parameter at its return only when callers pass copy-on-write
-   shares, i.e. when `LOWER_COW` is on. With it off the caller's own header
-   arrives, and freeing it is a double free in the caller (seen as
-   "Double free" in `cc_inherit_supertraits` when the compiler built itself).
+23. **Ownership is one rule now** (proposal 0004, `LOWER_RC` in
+   `compiler/lower.fd`, section "Ownership"): a variable owns its value and
+   is dropped at its scope's end; reading borrows; keeping a value (let,
+   assignment, field, element, return, payload) takes an owner
+   (`Lowerer_rc_own_value`: a temporary is handed over, anything else gets
+   `Str_dup`/`Vec_share`/`HashMap_share`/`__own_dup_N`); temporaries are
+   dropped at the end of their statement (`Lowerer_lower_stmt` wrapper);
+   parameters are borrowed (one the body changes is copied at entry).
+   `LOWER_COW` and the auto-drop passes (`lw_auto_drop_vecs/strs`) are off:
+   do not turn them back on with it, they would free values twice. Do not
+   store a str/Vec/map anywhere without going through these helpers; a
+   value cast to `i64` (`f() as i64`) is the raw word's to free by hand.
 
 24. **Field addresses come from a pointer typed as the struct**
    (`Lowerer_emit_struct_share`): a pointer typed as what holds the struct
@@ -532,15 +551,17 @@ touching them.
    from the layout's `offset`, not from adding up field sizes: an enum
    field is `(1 + payload)` words.
 
-25. **Copy-on-write** (`LOWER_COW`, on since Nov 6): shares must stay lazy
-   (`Vec_share_deep` records the element kind, `vec_own` copies at the first
-   write) and counted, a struct store must not share fresh values or last
-   uses (`Lowerer_fresh_struct`), and read-only copies are judged on the rest
-   of their block (`Lowerer_readonly_copy_in`). The first eager version ran
-   the self-compile out of memory. With it on the fixpoint holds (Nov 6,
-   4.7 GB peak), and the suite gives the same output on and off. While
-   `LOWER_ARG_SHARE` is off a by-value parameter is the caller's handle:
-   its last use is not a move (`Lowerer_last_use`, test_spawn_vec_copy).
+25. **Layouts (proposal 0004)**: a heap string is `[P_STR_RC + count][len]`
+   bytes NUL (core `p_str_alloc`, C `p_str_alloc_c`, native concat stub),
+   a literal `[P_STR_STATIC][len]`; every runtime string producer returns a
+   counted string (C: `p_str_own_c` wrappers; native: `p_str_adopt`). A Vec
+   header is 40 bytes `{data, len, cap, code, tid}`, a HashMap 56
+   `{.., types}`; every creator (core, C `PVec`, interpreter `p_vec_new`,
+   C fast bodies) must make the full header. A shared buffer's box is
+   `{owners, cap}`. `p_file_read`, `p_getenv`, `p_argv`, `p_read_line`,
+   `p_read_stdin` are raw `i64` (0 on failure): use `read_file`, `env_var`,
+   `arg_at`, `read_line`, `read_stdin` (Option) or `p_str_take`. Gate:
+   `scripts/leak-check.sh` (tests/leaks: output and "every block was freed").
 
 26. **Another agent may be editing `core.fd`/`lower.fd`**: build from a
    snapshot of `compiler/`, `stdlib/` and `scripts/` when files change

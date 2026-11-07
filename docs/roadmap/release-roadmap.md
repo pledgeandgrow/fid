@@ -234,6 +234,27 @@ the fastest build-to-native among compiled languages, and native code within
       function and short-lived temporaries live in callee-saved registers,
       weighted by loop depth; parameters read more than once keep a register.
       Left: other values that cross blocks, caller-saved registers, floats (L).
+      Nov 6: a whole-function allocator (pe_ir.fd peir_global_ra,
+      PEIR_GLOBAL_RA): liveness by dataflow over the blocks, one interval
+      per word-sized SSA value, parameter and local whose accesses are all
+      whole-word loads and stores, linear scan over the seven callee-saved
+      registers, the coldest interval (uses weighted by loop depth) left in
+      memory. Values that cross blocks, all parameters and any number of
+      locals now get registers. The suite (364 programs, `fid emit`) gives the
+      same output as before. Left: caller-saved registers (the emitter uses
+      rax, rcx, rdx and r8-r11 as scratch) and floats in xmm registers.
+      Nov 7: fixpoint kept with it on (stage 2 == stage 3, 52 MB of C).
+      Then (competitive OP9, OP11, OP16-OP18, OP24): copy coalescing, r10/r11
+      and xmm registers, loop rotation, instruction selection, integer
+      ranges, loop-invariant code motion. 101 native programs (every test
+      with a loop or a float) give the same output as before, and
+      test_native_opt passes on run, C and native; fixpoint kept (52.8 MB).
+      bench/fides, `fid emit`, best of 3: loop 5.2 -> 3.8 s, sieve 0.70 ->
+      0.59 s, fib unchanged (1.3 s: its checks and the save of two registers
+      on the early return).
+      `fid emit`, best of 3, against the compiler before D4/D13/D14:
+      bench/fides fib 1358 -> 1274 ms, loop 8261 -> 5190 ms, sieve
+      793 -> 723 ms.
 - [x] D5. Inlining of small functions at IR level (M).
       Done Nov 4: compiler/iropt.fd inlines single-block functions of up to 16
       instructions.
@@ -277,6 +298,11 @@ the fastest build-to-native among compiled languages, and native code within
       laid out next, parameters in registers, short immediates, `imul` by an
       immediate, no register for a call's null environment. Left: the optimizer
       on this path (D6) and a full register allocator (competitive OP16).
+      Nov 6: with values in registers (D4), an i64 add, sub, mul, and, or or
+      xor whose result is in a register is computed there (`mov rd, l; op rd,
+      r`) instead of through rax and rcx, and loads and stores of a local in
+      a register are one move. Left: comparisons and branches on registers,
+      and copy propagation between the moves that remain.
 - [~] D14. `Vec` elements at their real size (L). Stage A done: one `Vec`
       implementation, core's. Every backend's `p_vec_*` builtins run core's
       `Vec_*` functions; on native and the interpreter they disagreed with it
@@ -284,10 +310,46 @@ the fastest build-to-native among compiled languages, and native code within
       on a core `Vec`): `test_vec_builtins.fd` now agrees everywhere. Left: an
       element size in the header, typed access in lowering, structs inline.
       About 400 places know today's layout.
+      Counted Nov 6: 39 Vec functions in core (30 word-size multiplications),
+      80 `data[i]` accesses in the C runtime (PVec is `void** data`), about
+      57 in the native emitter and stubs, about 60 in stdlib/pe_runtime, 73
+      Vec calls the lowering emits, copy-on-write's element copies
+      (Vec_share_deep), and the interpreter's own Vec. Copy-on-write (M5),
+      its prerequisite, is on since Nov 6.
+      Stage B done Nov 7: small integers and bools at their size. The Vec
+      header is 32 bytes; the word at +24 is the element code (0: one word per
+      element; else a tag plus 1/2/4 for u8/bool, u16, u32, negative for
+      i8/i16/i32, so a 24-byte header from an older runtime reads as a word
+      Vec). `var v: Vec<u8> = Vec::new()` (and the other small types)
+      lowers to core's Vec_new_sized; every core Vec function dispatches on
+      the code (vec_sz_*), as do the C runtime's fast bodies and helpers,
+      native inline get/set/push (sized ones take the core call), print and
+      to_str, zeroize, file writes, copy-on-write (shares keep the code,
+      vec_own copies len × size bytes) and the interpreter.
+      test_vec_sized (same output on every backend, fidesc included) and
+      test_vec_sized_layout (fid only: codes, sharing, growth, a Vec<u8>
+      written as 4 bytes) pass on run, C and native; fixpoint kept. Left: a
+      Vec built any other way (a struct field, a function's result, `Vec<u8>`
+      from p_vec_new) still has word elements; floats and structs stay one
+      word (stage C: structs inline).
 - [ ] D15. References into containers: `&v[i]` and large structs passed by
       pointer, not copied (needs D14) (L).
-- [ ] D16. Strings carry their length: O(1) length, zero bytes allowed,
+- [~] D16. Strings carry their length: O(1) length, zero bytes allowed,
       slices without copying (competitive RT2) (L).
+      Nov 6: every string a program makes has [magic][length] before its
+      bytes: core's (p_str_alloc), the C runtime's concatenation and
+      p_char_to_str, the native ones, and now literals too (a static magic:
+      never freed), in the C generator's string table and in native .rdata.
+      str_len is O(1) for all of them; p_str_equal returns at once on
+      different lengths and compares a word at a time; concatenation,
+      printing, byte access and comparison keep zero bytes (test_str_length).
+      Strings from C (FFI) have no header and are measured as before. Left:
+      slices without copying, which need a (pointer, length) string; the C
+      runtime's other string functions (split, replace, ...) still stop at a
+      zero byte.
+      Nov 7: also on `fid run` (the interpreter stores strings with the
+      header and reads them back by length) and native `==` (it measured
+      with strlen): test_str_length passes on run, C and native.
 - [~] D10. Self-compile under 60 s (M). Profiled with a stack sampler: 601 s to
       136 s, 4.4 times faster, fixpoint kept. Fixed: on Windows `printf` wrote
       stdout a byte at a time (31% of the time, and every printing program on the C
@@ -375,18 +437,82 @@ compiler.
       stdlib, i.e. stdlib/pe_runtime on Linux (its msvcrt and kernel32 calls
       as system calls or a libc), argv, files, threads; and the PIR path in
       compiler/elf64.fd and linker.fd is not used by it.
-- [ ] F5. macOS x64 and ARM64 through C, in CI (M).
-- [ ] F6. Native ARM64/RISC-V/WASM backends: overflow and divide-by-zero
+      Cross targets through C (Nov 6–7, F5/F8/F9): `fid ccompile --target
+      <arch>-<os>` cross-compiles with `zig cc -target` from any host:
+      `aarch64-linux`, `riscv64-linux`, `x86_64-linux` (static musl),
+      `x86_64-macos`, `aarch64-macos`, `wasm32-wasi`, `x86_64-windows`.
+      `@cfg` follows the target (`g_cfg_os`/`g_cfg_arch` in compiler.fd).
+      `scripts/cross-test.sh <target>` builds the suite for a target, runs it
+      (qemu-user in WSL or on Linux, Node for WASI) and compares output and
+      exit code with `fid run`. The C runtime's green tasks switch stacks
+      with their own assembly on x86-64, AArch64 and RISC-V (musl has no
+      ucontext, macOS deprecates it); `p_co_pool_call` exists in the C
+      runtime (it did not: every program using `task_pool_call` failed to
+      build through C, on Windows too). `fid` on a Mac is no longer taken for
+      Windows (`host_os()` in main.fd).
+- [~] F5. macOS x64 and ARM64 through C, in CI (M).
+      Nov 7: `fid ccompile --target x86_64-macos|aarch64-macos` builds Mach-O
+      executables (checked on a sample program; the suite was not built for
+      macOS), and the compiler's own stage-1 C builds for aarch64-macos with
+      the flags scripts/bootstrap.sh now gives Darwin. Not run: there is no
+      Mac here. `scripts/ci/cross.yml` has the macOS job (bootstrap with
+      clang, then the suite through C, compared with the interpreter); this
+      repository keeps no `.github/`, so it is not active. Left: run that job.
+- [~] F6. Native ARM64/RISC-V/WASM backends: overflow and divide-by-zero
       semantics match the other backends (M).
+      Nov 7: through C every target shares the C runtime's checks.
+      `test_int_semantics` (wrapping, signed `/` and `%`, shifts, casts, the
+      edges of i64) and the run-time panic tests `test_panic_overflow_fail`,
+      `test_panic_div_zero_fail`, `test_panic_min_div_fail` give the same
+      output, exit code and panic message on the interpreter, C and native
+      Windows; cross-test.sh compares them on every cross target (not yet run
+      there: the runs were stopped). Native AArch64 and RISC-V (F8, Nov 7):
+      the four tests pass under QEMU (output, exit code, panic message).
+      Left: a native WASM backend (F9).
 - [ ] F7. Native macOS: Mach-O executables, not only objects (L).
-- [ ] F8. (Not started Nov 6.) ARM64 and RISC-V: replace the runtime stubs (19 and 18 zero stubs, 46
-      capability stubs), and test under QEMU (XL). Their `p_vec_new` (and the
-      x86-64 ELF one) keeps the data inside the header block with a fixed
-      capacity of 509, while core's `Vec` frees the old data when it grows:
-      harmless today, since `p_free` there is an `munmap` that refuses the
-      interior pointer. Make them call core's `Vec` functions, as the other
-      backends now do (D14).
-- [ ] F9. WASM: globals, struct copies, collections (L).
+      macOS executables come from the C path (F5) for now.
+- [~] F8. ARM64 and RISC-V: replace the runtime stubs (19 and 18 zero stubs, 46
+      capability stubs), and test under QEMU (XL).
+      Nov 7, through C: AArch64 Linux ran 270 of 286 suite tests the same as
+      `fid run` under qemu-aarch64 (WSL) before the fixes above; of the 16,
+      6 failed to build for want of `p_co_pool_call` (now in the C runtime),
+      2 need SDL2, 1 (`test_args`) trapped in zig's -O0 UB sanitizer on an
+      unaligned string-header read (zig builds now pass
+      `-fno-sanitize=undefined`), and 6 fail the same way through C on the
+      Windows host (in-progress work in the tree, not cross). RISC-V Linux
+      and x86-64 Linux run the sample programs correctly; their full suites
+      have not completed (stopped with the machine out of memory).
+      Native, Nov 7: a new backend, `fid emit <file> --target
+      aarch64-linux|riscv64-linux -o out` (also `--native --target
+      arm64|riscv64`): IR → machine code with pe_ir's semantics, written
+      once over a small architecture layer (compiler/nat_ir.fd), its own
+      A64 and RV64IMFD encoders and a static ELF writer
+      (compiler/nat_enc.fd), no assembler, linker or C library. The runtime
+      is Fides over Linux system calls (stdlib/linux_runtime/base.fd,
+      merged as stdlib/pe_runtime is on Windows): pe_ir's allocator blocks
+      and panics, printing, strings, the float text of the other backends,
+      files, clocks, args, environment; Vec and HashMap are core's. Only
+      what `main` reaches is compiled. Under qemu-aarch64 and qemu-riscv64
+      alike: 225 of the 231 suite tests that build give the interpreter's
+      output and exit code (5 of the 6 failures fail through C too); 76 do
+      not build yet,
+      each refused with the builtins it lacks: threads, tasks, channels,
+      atomics, the C math functions (sqrt, floor, pow...), tensors, sockets,
+      some file builtins. `test_int_semantics` and the three run-time panic
+      tests pass (F6). The old PIR path (codegen_arm64/riscv.fd,
+      runtime_arm64/riscv.fd and their stubs) is no longer used by `fid`.
+      Left: the missing builtins above (math as instructions or in Fides,
+      threads through clone, tasks through a stack switch), stack-overflow
+      and fault messages (no signal handler yet: a fault is a plain SIGSEGV).
+- [~] F9. WASM: globals, struct copies, collections (L).
+      Nov 7, through C: `fid ccompile --target wasm32-wasi -o x.wasm` (zig cc,
+      WASI preview 1) and `node scripts/wasm-run.mjs x.wasm` run the sample
+      programs with globals, structs, `Vec`, strings and floats. Under WASI,
+      tasks run to their end when entered (no stack switching), and
+      processes, signals and socket creation fail. The suite through WASI has
+      not completed. The native backend (`fid wasm`, compiler/wasm.fd) is
+      unchanged: it still writes a module that fails validation (an i64
+      data-segment offset in 32-bit memory) and has no collections.
 
 **Acceptance:** Windows, Linux and macOS are fully supported at 1.0.0, on x64 and
 ARM64 where the system runs there; RISC-V and WASM pass the suite.

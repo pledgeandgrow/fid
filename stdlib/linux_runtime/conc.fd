@@ -1,0 +1,1005 @@
+// stdlib/linux_runtime/conc.fd — threads, futures, tasks, atomics,
+// mutexes and channels of native Linux executables (AArch64, RISC-V 64).
+//
+// The semantics of stdlib/pe_runtime/conc.fd, on the backend's primitives
+// (compiler/nat_ir.fd): nat_clone_thread starts a thread, nat_ctx_swap
+// switches between task stacks, nat_atomic_* are the machines' atomics,
+// nat_call_fn calls a program function by address with an argument array,
+// nat_fn_table lists the functions named by strings, nat_tls_get/set the
+// thread pointer (each thread's block, base.fd pe_tls).
+//
+// Threads are OS threads (clone) on stacks with a guard region below them
+// (an overflow is reported, base.fd pe_on_signal). A thread's stack is freed
+// when it is joined, once the kernel says the thread is gone (it clears the
+// thread's ctid word: CLONE_CHILD_CLEARTID).
+//
+// Tasks are green threads, M:N: a task runs on any of the worker threads
+// (one per CPU but one, at least one) and on a thread that waits for one
+// (await, task_run, scope ends, channels, mutexes run queued tasks
+// meanwhile). A task gives control back when it yields, sleeps, awaits an
+// unfinished task, waits for a socket, a lock or a channel; it may resume
+// on another thread. An idle thread sleeps on a futex, not in a loop.
+
+const PE_SYS_SCHED_YIELD: i64 = 124;
+const PE_SYS_NANOSLEEP: i64 = 101;
+const PE_SYS_GETTID: i64 = 178;
+const PE_SYS_SCHED_GETAFFINITY: i64 = 123;
+const PE_THREAD_STACK: i64 = 8388608;
+const PE_TASK_STACK: i64 = 262144;
+const PE_MAX_WORKERS: i64 = 8;
+
+/// What a non-blocking poll returns for a task still running, and a
+/// receive on a channel closed and empty (C: 0x8000000000000001).
+fn pe_pending() -> i64 {
+    return -9223372036854775807;
+}
+
+/// n zeroed 8-byte slots.
+fn pe_zeroed(n: i64) -> i64 {
+    var b: i64 = pert_malloc(n * 8);
+    pe_zero(b, n * 8);
+    return b;
+}
+
+fn pe_tid() -> i64 {
+    return pe_sys(PE_SYS_GETTID, 0, 0, 0);
+}
+
+/// The address of the program function `name`, 0 if there is none.
+fn pe_fn_lookup(name: str) -> i64 {
+    var t: i64 = nat_fn_table();
+    while pe_ld(t) != 0 {
+        if pert_str_equal(pe_ld(t), name as i64) {
+            return pe_ld(t + 8);
+        }
+        t = t + 16;
+    }
+    return 0;
+}
+
+fn pe_sleep_ms(ms: i64) {
+    if ms <= 0 {
+        pe_sys(PE_SYS_SCHED_YIELD, 0, 0, 0);
+        return;
+    }
+    var ts: i64 = pert_malloc(16);
+    pe_st(ts, ms / 1000);
+    pe_st(ts + 8, (ms % 1000) * 1000000);
+    pe_sys(PE_SYS_NANOSLEEP, ts, 0, 0);
+    pert_free(ts);
+}
+
+/// Atomically: *addr = v; the old value.
+fn pe_xchg(addr: i64, v: i64) -> i64 {
+    var o: i64 = nat_atomic_load(addr);
+    while nat_atomic_cas(addr, o, v) == 0 {
+        o = nat_atomic_load(addr);
+    }
+    return o;
+}
+
+/// The CPUs this process may run on.
+fn pe_cpu_count() -> i64 {
+    var buf: i64 = pe_zeroed(16);
+    var n: i64 = pe_sys(PE_SYS_SCHED_GETAFFINITY, 0, 128, buf);
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < n * 8 && i < 1024 {
+        if (pe_ldb(buf + i / 8) & (1 << (i % 8))) != 0 { count = count + 1; }
+        i = i + 1;
+    }
+    pert_free(buf);
+    if count < 1 { count = 1; }
+    return count;
+}
+
+/// Wait a moment for another thread or task: a task gives control back, a
+/// thread runs a queued task, or else yields the CPU.
+fn pe_relax() {
+    if pe_co_self() != 0 {
+        pe_co_leave();
+        return;
+    }
+    if pe_co_step(1) {
+        return;
+    }
+    pe_sys(PE_SYS_SCHED_YIELD, 0, 0, 0);
+}
+
+/// Wait on the futex word at addr while it holds `seen` (at most ms): a
+/// task (or a thread with tasks to run) relaxes instead of sleeping, so
+/// that what it waits for can run.
+fn pe_wait_word(addr: i64, seen: i64, ms: i64) {
+    if pe_co_self() != 0 {
+        pe_co_leave();
+        return;
+    }
+    if pe_co_step(1) {
+        return;
+    }
+    pe_futex_wait(addr, seen & 4294967295, ms, true);
+}
+
+// ─── Threads ────────────────────────────────────────────────────────────
+
+/// Start entry(env 0, arg) on a new thread: its stack with a guard region
+/// below, its own thread block. *ctid is cleared when it is gone. The tid,
+/// or < 0.
+fn pe_spawn_os(entry: i64, arg: i64, ctid: i64) -> i64 {
+    pe_mt_on();
+    var size: i64 = PE_THREAD_STACK + PE_GUARD;
+    var base: i64 = pe_mmap(size);
+    pe_sys(PE_SYS_MPROTECT, base, PE_GUARD, 0);
+    var t: i64 = pe_tls_new(base, base + PE_GUARD);
+    pe_st(t + 40, base);
+    pe_st(t + 48, size);
+    pe_st(ctid, 1);
+    var tid: i64 = nat_clone_thread(entry, arg, base + size, ctid, t);
+    if tid < 0 {
+        pe_st(ctid, 0);
+        pe_sys(PE_SYS_MUNMAP, base, size, 0);
+        pert_free(t);
+    }
+    return tid;
+}
+
+// The thread table. Per thread i: its start block, its result once
+// joined, whether it was. Start block: [0] function, [1] nargs, [2..10)
+// args, [10] done, [11] result, [12] the kernel's ctid word, [13] the
+// thread's block (its stack, freed at the join).
+
+var pert_thread_blocks: i64 = 0;
+var pert_task_results: i64 = 0;
+var pert_thread_joined: i64 = 0;
+var pert_thread_ctr: i64 = 0;      // *i64: threads started
+var pert_executor_count: i64 = 0;
+
+fn pe_thread_tables() {
+    if pert_thread_blocks == 0 {
+        pe_mt_on();
+        pert_thread_blocks = pe_zeroed(256);
+        pert_task_results = pe_zeroed(256);
+        pert_thread_joined = pe_zeroed(256);
+        pert_thread_ctr = pe_zeroed(1);
+    }
+}
+
+fn pe_thread_count() -> i64 {
+    if pert_thread_ctr == 0 {
+        return 0;
+    }
+    var n: i64 = nat_atomic_load(pert_thread_ctr);
+    if n > 256 {
+        n = 256;
+    }
+    return n;
+}
+
+/// Start the program function `name` with argv[0..nargs) on a new thread.
+pub fn pert_thread_spawn_v(name: str, nargs: i64, argv: i64) -> i64 {
+    var fn_addr: i64 = pe_fn_lookup(name);
+    if fn_addr == 0 {
+        return 0 - 1;
+    }
+    pe_thread_tables();
+    var idx: i64 = nat_atomic_add(pert_thread_ctr, 1);
+    if idx >= 256 {
+        return 0 - 1;
+    }
+    var block: i64 = pe_zeroed(14);
+    pe_st(block, fn_addr);
+    pe_st(block + 8, nargs);
+    var i: i64 = 0;
+    while i < nargs && i < 8 {
+        pe_st(block + 16 + i * 8, pe_ld(argv + i * 8));
+        i = i + 1;
+    }
+    var tid: i64 = pe_spawn_os(pe_fn_lookup("pe_thread_main"), block, block + 96);
+    nat_atomic_store(pert_thread_blocks + idx * 8, block);
+    if tid < 0 {
+        // Could not start: run it here
+        pe_thread_body(block);
+    }
+    return 0 - (idx + 1);
+}
+
+pub fn pert_executor_spawn_v(name: str, nargs: i64, argv: i64) -> i64 {
+    return pert_thread_spawn_v(name, nargs, argv);
+}
+
+fn pe_thread_body(block: i64) -> i64 {
+    var result: i64 = nat_call_fn(pe_ld(block), pe_ld(block + 8), block + 16);
+    pe_st(block + 88, result);
+    nat_atomic_store(block + 80, 1);
+    return result;
+}
+
+/// Runs on the new thread: its signal stack, the function, its result and
+/// done flag.
+pub fn pe_thread_main(block: i64) -> i64 {
+    var t: i64 = nat_tls_get();
+    pe_st(block + 104, t);
+    pe_altstack_on(t);
+    var result: i64 = pe_thread_body(block);
+    pe_altstack_off(t);
+    return result;
+}
+
+/// The table index of future f, or -1 (a ready value or an unknown handle).
+fn pe_task_index(f: i64) -> i64 {
+    if f >= 0 {
+        return 0 - 1;
+    }
+    var idx: i64 = 0 - (f + 1);
+    if idx >= pe_thread_count() {
+        return 0 - 1;
+    }
+    return idx;
+}
+
+fn pe_thread_block(idx: i64) -> i64 {
+    var b: i64 = nat_atomic_load(pert_thread_blocks + idx * 8);
+    while b == 0 {
+        pe_relax();
+        b = nat_atomic_load(pert_thread_blocks + idx * 8);
+    }
+    return b;
+}
+
+fn pe_task_done(idx: i64) -> bool {
+    return nat_atomic_load(pe_thread_block(idx) + 80) != 0;
+}
+
+fn pe_unjoined(idx: i64) -> bool {
+    return pe_ld(pert_thread_joined + idx * 8) == 0;
+}
+
+/// Wait for thread idx (once): its result. Its stack is freed once the
+/// kernel has cleared its ctid word (the thread is gone).
+fn pe_join(idx: i64) -> i64 {
+    if pe_unjoined(idx) {
+        var block: i64 = pe_thread_block(idx);
+        var w: i64 = nat_atomic_load(block + 96) & 4294967295;
+        while w != 0 {
+            if pe_co_self() != 0 || pe_q_n > 0 {
+                pe_relax();
+            } else {
+                pe_futex_wait(block + 96, w, 0 - 1, false);
+            }
+            w = nat_atomic_load(block + 96) & 4294967295;
+        }
+        pe_st(pert_task_results + idx * 8, pe_ld(block + 88));
+        pe_st(pert_thread_joined + idx * 8, 1);
+        var t: i64 = pe_ld(block + 104);
+        if t != 0 {
+            pe_sys(PE_SYS_MUNMAP, pe_ld(t + 40), pe_ld(t + 48), 0);
+            pert_free(t);
+            pe_st(block + 104, 0);
+        }
+    }
+    return pe_ld(pert_task_results + idx * 8);
+}
+
+// ─── Tasks: green threads, M:N ──────────────────────────────────────────
+// A task's block is a thread's, with [12] = 1, then [13] its saved stack
+// pointer, [15] its stack (the guard region at its bottom), [16] the next
+// task in the run queue, [19] when its sleep ends (ms, 0: not sleeping),
+// [20] detached (freed once done), [21] the stack pointer of whoever
+// entered it last (where it goes back to).
+// A future of a task is its block with the tag 0x7FA5 in the top 16 bits.
+// The run queue is one list under pe_q_lock; pe_q_seq is the futex idle
+// workers sleep on, pe_done_seq the one waiters for a finished task do.
+
+var pe_q_lock: i64 = 0;        // *i64
+var pe_q_seq: i64 = 0;         // *i64
+var pe_done_seq: i64 = 0;      // *i64
+var pe_q_head: i64 = 0;
+var pe_q_tail: i64 = 0;
+var pe_q_n: i64 = 0;
+var pe_q_idle: i64 = 0;        // *i64: workers asleep
+var pe_co_live: i64 = 0;       // *i64: unfinished tasks
+var pe_co_total: i64 = 0;      // *i64: tasks there have been
+var pe_workers: i64 = 0;       // *i64: 0 none, 1 starting or started
+
+/// The scheduler's words, once (the first task comes from one thread at
+/// a time: pe_co_new_block's caller has none running yet).
+fn pe_co_init() {
+    if pe_q_lock == 0 {
+        pe_mt_on();
+        pe_q_seq = pe_zeroed(1);
+        pe_done_seq = pe_zeroed(1);
+        pe_q_idle = pe_zeroed(1);
+        pe_co_live = pe_zeroed(1);
+        pe_co_total = pe_zeroed(1);
+        pe_workers = pe_zeroed(1);
+        pe_q_lock = pe_zeroed(1);
+    }
+}
+
+/// The task running on this thread, 0 if none.
+fn pe_co_self() -> i64 {
+    var t: i64 = nat_tls_get();
+    if t == 0 {
+        return 0;
+    }
+    return pe_ld(t);
+}
+
+fn pe_q_push(t: i64) {
+    pe_lock(pe_q_lock);
+    pe_st(t + 128, 0);
+    if pe_q_tail == 0 {
+        pe_q_head = t;
+    } else {
+        pe_st(pe_q_tail + 128, t);
+    }
+    pe_q_tail = t;
+    pe_q_n = pe_q_n + 1;
+    pe_unlock(pe_q_lock);
+    nat_atomic_add(pe_q_seq, 1);
+    if nat_atomic_load(pe_q_idle) > 0 {
+        pe_futex_wake(pe_q_seq, 1);
+    }
+}
+
+/// A queued task that is not sleeping, taken off the queue; 0 if none.
+/// *wake = when the first sleeper wakes (0: none sleeps).
+fn pe_q_take(wake: i64) -> i64 {
+    pe_st(wake, 0);
+    if pe_q_n == 0 {
+        return 0;
+    }
+    var now: i64 = pert_clock_now_ms();
+    pe_lock(pe_q_lock);
+    var n: i64 = pe_q_n;
+    var found: i64 = 0;
+    var first: i64 = 0;
+    while n > 0 && found == 0 {
+        var t: i64 = pe_q_head;
+        pe_q_head = pe_ld(t + 128);
+        if pe_q_head == 0 { pe_q_tail = 0; }
+        pe_q_n = pe_q_n - 1;
+        var dl: i64 = pe_ld(t + 152);
+        if dl == 0 || dl <= now {
+            pe_st(t + 152, 0);
+            found = t;
+        } else {
+            if first == 0 || dl < first { first = dl; }
+            pe_st(t + 128, 0);
+            if pe_q_tail == 0 { pe_q_head = t; } else { pe_st(pe_q_tail + 128, t); }
+            pe_q_tail = t;
+            pe_q_n = pe_q_n + 1;
+        }
+        n = n - 1;
+    }
+    pe_unlock(pe_q_lock);
+    pe_st(wake, first);
+    return found;
+}
+
+/// Start the worker threads, once.
+fn pe_co_workers() {
+    if nat_atomic_load(pe_workers) != 0 {
+        return;
+    }
+    if nat_atomic_cas(pe_workers, 0, 1) == 0 {
+        return;
+    }
+    var n: i64 = pe_cpu_count() - 1;
+    if n < 1 { n = 1; }
+    if n > PE_MAX_WORKERS { n = PE_MAX_WORKERS; }
+    var entry: i64 = pe_fn_lookup("pe_worker_main");
+    var i: i64 = 0;
+    while i < n {
+        var ctid: i64 = pe_zeroed(1);
+        pe_spawn_os(entry, i, ctid);
+        i = i + 1;
+    }
+}
+
+/// A worker: run queued tasks for good, asleep while there are none.
+pub fn pe_worker_main(id: i64) -> i64 {
+    pe_altstack_on(nat_tls_get());
+    var wake: i64 = pe_tls() + 56;
+    while true {
+        var seen: i64 = nat_atomic_load(pe_q_seq);
+        var t: i64 = pe_q_take(wake);
+        if t != 0 {
+            pe_co_enter(t);
+            pe_co_after(t);
+        } else {
+            var ms: i64 = 50;
+            if pe_ld(wake) != 0 {
+                ms = pe_ld(wake) - pert_clock_now_ms();
+                if ms < 1 { ms = 1; }
+                if ms > 50 { ms = 50; }
+            }
+            nat_atomic_add(pe_q_idle, 1);
+            pe_futex_wait(pe_q_seq, seen & 4294967295, ms, true);
+            nat_atomic_add(pe_q_idle, 0 - 1);
+        }
+    }
+    return 0;
+}
+
+fn pe_co_new_block(name: str, nargs: i64, argv: i64) -> i64 {
+    var fn_addr: i64 = pe_fn_lookup(name);
+    if fn_addr == 0 {
+        pert_panic("task: no such function" as i64);
+    }
+    pe_co_init();
+    var block: i64 = pe_zeroed(28);
+    pe_st(block, fn_addr);
+    pe_st(block + 8, nargs);
+    var a: i64 = 0;
+    while a < nargs && a < 8 {
+        pe_st(block + 16 + a * 8, pe_ld(argv + a * 8));
+        a = a + 1;
+    }
+    pe_st(block + 96, 1);
+    var stack: i64 = pe_mmap(PE_TASK_STACK + PE_GUARD);
+    pe_sys(PE_SYS_MPROTECT, stack, PE_GUARD, 0);
+    pe_st(block + 120, stack);
+    // The first switch restores the record at s (nat_ctx_swap): registers
+    // 0, fp 0, lr the trampoline, which calls [s + 112](env 0, [s + 120])
+    var s: i64 = stack + PE_GUARD + PE_TASK_STACK - 128;
+    pe_st(s + 96, 0);
+    pe_st(s + 104, nat_ctx_tramp());
+    pe_st(s + 112, pe_fn_lookup("pe_co_main"));
+    pe_st(s + 120, block);
+    pe_st(block + 104, s);
+    nat_atomic_add(pe_co_live, 1);
+    nat_atomic_add(pe_co_total, 1);
+    pe_co_workers();
+    return block;
+}
+
+/// The body of every task: its function, its result, then back for good.
+pub fn pe_co_main(block: i64) -> i64 {
+    var result: i64 = nat_call_fn(pe_ld(block), pe_ld(block + 8), block + 16);
+    pe_st(block + 88, result);
+    nat_atomic_store(block + 80, 1);
+    pe_co_leave();
+    return result;
+}
+
+/// Run task `block` on this thread until it gives control back or ends.
+fn pe_co_enter(block: i64) {
+    var t: i64 = pe_tls();
+    var prev: i64 = pe_ld(t);
+    pe_st(t, block);
+    nat_ctx_swap(block + 168, pe_ld(block + 104));
+    pe_st(pe_tls(), prev);
+}
+
+/// Give control back to whoever entered the running task.
+fn pe_co_leave() {
+    var t: i64 = pe_ld(pe_tls());
+    nat_ctx_swap(t + 104, pe_ld(t + 168));
+}
+
+fn pe_co_finish(t: i64) {
+    pe_sys(PE_SYS_MUNMAP, pe_ld(t + 120), PE_TASK_STACK + PE_GUARD, 0);
+    nat_atomic_store(t + 120, 0);
+    nat_atomic_add(pe_co_live, 0 - 1);
+    nat_atomic_add(pe_done_seq, 1);
+    pe_futex_wake(pe_done_seq, 2147483647);
+    // Detached: whichever of this and pert_co_detach claims it frees it
+    if nat_atomic_cas(t + 160, 1, 2) != 0 {
+        pert_free(t);
+    }
+}
+
+/// After entering t: finished, or back on the queue.
+fn pe_co_after(t: i64) {
+    if nat_atomic_load(t + 80) != 0 {
+        pe_co_finish(t);
+    } else {
+        pe_q_push(t);
+    }
+}
+
+/// Run one queued task that is not sleeping; when all of them sleep, wait
+/// for the first to wake, at most `limit` ms. False with nothing queued.
+fn pe_co_step(limit: i64) -> bool {
+    if pe_q_n == 0 {
+        return false;
+    }
+    var t: i64 = pe_q_take(pe_tls() + 56);
+    var first: i64 = pe_ld(pe_tls() + 56);
+    if t != 0 {
+        pe_co_enter(t);
+        pe_co_after(t);
+        return true;
+    }
+    if first == 0 {
+        return false;
+    }
+    var w: i64 = first - pert_clock_now_ms();
+    if w > limit { w = limit; }
+    pe_sleep_ms(w);
+    return true;
+}
+
+/// Wait until no task is left unfinished.
+fn pe_co_drain() {
+    if pe_co_live == 0 {
+        return;
+    }
+    while nat_atomic_load(pe_co_live) > 0 {
+        var seen: i64 = nat_atomic_load(pe_done_seq);
+        if !pe_co_step(5) && nat_atomic_load(pe_co_live) > 0 {
+            pe_futex_wait(pe_done_seq, seen & 4294967295, 10, true);
+        }
+    }
+}
+
+pub fn pert_co_go(name: str, arg: i64) -> i64 {
+    var slot: i64 = pe_zeroed(1);
+    pe_st(slot, arg);
+    var block: i64 = pe_co_new_block(name, 1, slot);
+    pert_free(slot);
+    pe_q_push(block);
+    return block;
+}
+
+/// spawn f(args): a green task as a tagged future.
+pub fn pert_co_spawn_v(name: str, nargs: i64, argv: i64) -> i64 {
+    var block: i64 = pe_co_new_block(name, nargs, argv);
+    pe_q_push(block);
+    return block | (0x7FA5 << 48);
+}
+
+/// async f(args): the task runs at once, here, until it first gives
+/// control back.
+pub fn pert_co_async_v(name: str, nargs: i64, argv: i64) -> i64 {
+    var block: i64 = pe_co_new_block(name, nargs, argv);
+    pe_co_enter(block);
+    pe_co_after(block);
+    return block | (0x7FA5 << 48);
+}
+
+pub fn pert_co_yield() {
+    if pe_co_self() != 0 {
+        pe_co_leave();
+    }
+}
+
+/// Loop-backedge safepoint: yield only when other tasks are queued.
+pub fn pert_co_tick() {
+    if pe_q_n > 0 && pe_co_self() != 0 {
+        pe_co_leave();
+    }
+}
+
+/// `task_run()`: wait until every task has finished; how many there have
+/// been.
+pub fn pert_co_run() -> i64 {
+    pe_co_drain();
+    if pe_co_total == 0 {
+        return 0;
+    }
+    return nat_atomic_load(pe_co_total);
+}
+
+fn pe_is_co_future(f: i64) -> bool {
+    return ((f >> 48) & 0xFFFF) == 0x7FA5;
+}
+
+fn pe_co_await(f: i64) -> i64 {
+    var c: i64 = f & 0xFFFFFFFFFFFF;
+    while nat_atomic_load(c + 80) == 0 {
+        var seen: i64 = nat_atomic_load(pe_done_seq);
+        if nat_atomic_load(c + 80) != 0 { break; }
+        pe_wait_word(pe_done_seq, seen, 10);
+    }
+    return pe_ld(c + 88);
+}
+
+pub fn pert_co_sleep(ms: i64) -> i64 {
+    var d: i64 = ms;
+    if d < 0 {
+        d = 0;
+    }
+    var dl: i64 = pert_clock_now_ms() + d;
+    var cur: i64 = pe_co_self();
+    if cur != 0 {
+        pe_st(cur + 152, dl);
+        pe_co_leave();
+        return 0;
+    }
+    // Not a task: run queued tasks meanwhile
+    var now: i64 = pert_clock_now_ms();
+    while now < dl {
+        if !pe_co_step(dl - now) {
+            pe_sleep_ms(dl - now);
+        }
+        now = pert_clock_now_ms();
+    }
+    return 0;
+}
+
+pub fn pert_co_detach(t: i64) {
+    var b: i64 = t & 0xFFFFFFFFFFFF;
+    nat_atomic_store(b + 160, 1);
+    // Already finished and its stack gone: nobody frees it but us
+    if nat_atomic_load(b + 80) != 0 && nat_atomic_load(b + 120) == 0 {
+        if nat_atomic_cas(b + 160, 1, 2) != 0 {
+            pert_free(b);
+        }
+    }
+}
+
+pub fn pert_co_done(t: i64) -> i64 {
+    return nat_atomic_load((t & 0xFFFFFFFFFFFF) + 80);
+}
+
+pub fn pert_co_result(t: i64) -> i64 {
+    return pe_ld((t & 0xFFFFFFFFFFFF) + 88);
+}
+
+/// Wait until fd is readable (or writable): 1, or 0 when `timeout_ms`
+/// (>= 0) passes first. A task gives control back meanwhile.
+pub fn pert_co_wait_fd(fd: i64, write: i64, timeout_ms: i64) -> i64 {
+    var cur: i64 = pe_co_self();
+    if cur == 0 {
+        return pe_poll_fd(fd, write, timeout_ms);
+    }
+    var dl: i64 = 0;
+    if timeout_ms >= 0 { dl = pert_clock_now_ms() + timeout_ms; }
+    while true {
+        // Nothing else to run: wait in the kernel a moment
+        var ms: i64 = 0;
+        if pe_q_n == 0 { ms = 1; }
+        if pe_poll_fd(fd, write, ms) > 0 { return 1; }
+        if dl != 0 && pert_clock_now_ms() >= dl { return 0; }
+        pe_co_leave();
+    }
+    return 0;
+}
+
+// ─── Futures and executors ──────────────────────────────────────────────
+
+pub fn pert_future_ready(value: i64) -> i64 {
+    return value;
+}
+
+pub fn pert_future_poll(f: i64) -> i64 {
+    if pe_is_co_future(f) {
+        return pe_co_await(f);
+    }
+    if f >= 0 {
+        return f;
+    }
+    var idx: i64 = pe_task_index(f);
+    if idx < 0 {
+        return 0;
+    }
+    return pe_join(idx);
+}
+
+pub fn pert_task_poll(f: i64) -> i64 {
+    return pert_future_poll(f);
+}
+
+pub fn pert_task_is_ready(f: i64) -> bool {
+    if pe_is_co_future(f) {
+        return nat_atomic_load((f & 0xFFFFFFFFFFFF) + 80) != 0;
+    }
+    if f >= 0 {
+        return true;
+    }
+    var idx: i64 = pe_task_index(f);
+    if idx < 0 {
+        return false;
+    }
+    return pe_task_done(idx);
+}
+
+pub fn pert_task_poll_nonblocking(f: i64) -> i64 {
+    if pe_is_co_future(f) {
+        if nat_atomic_load((f & 0xFFFFFFFFFFFF) + 80) == 0 {
+            return pe_pending();
+        }
+        return pe_co_await(f);
+    }
+    if f >= 0 {
+        return f;
+    }
+    var idx: i64 = pe_task_index(f);
+    if idx < 0 {
+        return 0;
+    }
+    if !pe_task_done(idx) {
+        return pe_pending();
+    }
+    return pe_join(idx);
+}
+
+pub fn pert_executor_new() -> i64 {
+    var e: i64 = pert_executor_count;
+    pert_executor_count = e + 1;
+    return e;
+}
+
+pub fn pert_executor_block_on(exec: i64, f: i64) -> i64 {
+    return pert_future_poll(f);
+}
+
+/// Join every thread and task still running; the number joined. `spawn
+/// scope { }` exits through here.
+pub fn pert_executor_run_all(exec: i64) -> i64 {
+    var count: i64 = 0;
+    var n: i64 = pe_thread_count();
+    var i: i64 = 0;
+    while i < n {
+        if pe_unjoined(i) {
+            pe_join(i);
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    var joined: i64 = 0;
+    if pe_co_live != 0 { joined = nat_atomic_load(pe_co_live); }
+    pe_co_drain();
+    return count + joined;
+}
+
+/// Join the finished threads; the number still running.
+pub fn pert_executor_poll_all(exec: i64) -> i64 {
+    var pending: i64 = 0;
+    var n: i64 = pe_thread_count();
+    var i: i64 = 0;
+    while i < n {
+        if pe_unjoined(i) {
+            if pe_task_done(i) {
+                pe_join(i);
+            } else {
+                pending = pending + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return pending;
+}
+
+/// Cancel the tasks of a scope: a task cannot be stopped mid-way, so wait
+/// for those still running, drop their results (0), and return how many
+/// were cancelled.
+pub fn pert_executor_cancel(exec: i64) -> i64 {
+    var count: i64 = 0;
+    var n: i64 = pe_thread_count();
+    var i: i64 = 0;
+    while i < n {
+        if pe_unjoined(i) {
+            var was_done: bool = pe_task_done(i);
+            pe_join(i);
+            if !was_done {
+                pe_st(pert_task_results + i * 8, 0);
+                count = count + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+// ─── Shared memory, atomics, mutexes, thread-local storage ─────────────
+
+pub fn pert_shared_alloc(size: i64) -> i64 {
+    if size < 0 {
+        return 0;
+    }
+    return pert_malloc(size);
+}
+
+pub fn pert_atomic_load(addr: i64) -> i64 {
+    return nat_atomic_load(addr);
+}
+
+pub fn pert_atomic_store(addr: i64, value: i64) {
+    nat_atomic_store(addr, value);
+}
+
+/// The previous value.
+pub fn pert_atomic_add(addr: i64, value: i64) -> i64 {
+    return nat_atomic_add(addr, value);
+}
+
+/// The previous value.
+pub fn pert_atomic_sub(addr: i64, value: i64) -> i64 {
+    return nat_atomic_add(addr, 0 - value);
+}
+
+pub fn pert_atomic_cas(addr: i64, expected: i64, new_value: i64) -> bool {
+    return nat_atomic_cas(addr, expected, new_value) != 0;
+}
+
+/// A mutex: a futex word, 0 free, 1 held, 2 held with waiters (not
+/// recursive). A thread waits asleep in the kernel; a task (or a thread
+/// with tasks to run) lets the others run, so a task holding it across a
+/// yield gets to release it.
+pub fn pert_mutex_init() -> i64 {
+    pe_mt_on();
+    return pe_zeroed(1);
+}
+
+pub fn pert_mutex_lock(m: i64) {
+    if nat_atomic_cas(m, 0, 1) != 0 {
+        return;
+    }
+    while true {
+        if pe_co_self() != 0 || pe_q_n > 0 {
+            pe_relax();
+            if nat_atomic_cas(m, 0, 1) != 0 { return; }
+        } else {
+            if pe_xchg(m, 2) == 0 { return; }
+            pe_futex_wait(m, 2, 20, true);
+        }
+    }
+}
+
+pub fn pert_mutex_unlock(m: i64) {
+    if nat_atomic_add(m, 0 - 1) != 1 {
+        nat_atomic_store(m, 0);
+        pe_futex_wake(m, 1);
+    }
+}
+
+// Thread-local storage keys: each thread's block holds its table of 64
+// values ([32]); key k is 1..63.
+var pe_tls_keys: i64 = 0;     // *i64
+
+pub fn pert_tls_create() -> i64 {
+    if pe_tls_keys == 0 {
+        pe_mt_on();
+        pe_tls_keys = pe_zeroed(1);
+    }
+    var k: i64 = nat_atomic_add(pe_tls_keys, 1) + 1;
+    if k >= 64 { return 0 - 1; }
+    return k;
+}
+
+fn pe_tls_table() -> i64 {
+    var t: i64 = pe_tls();
+    if pe_ld(t + 32) == 0 { pe_st(t + 32, pe_zeroed(64)); }
+    return pe_ld(t + 32);
+}
+
+pub fn pert_tls_get(key: i64) -> i64 {
+    if key < 1 || key >= 64 { return 0; }
+    return pe_ld(pe_tls_table() + key * 8);
+}
+
+pub fn pert_tls_set(key: i64, value: i64) {
+    if key < 1 || key >= 64 { return; }
+    pe_st(pe_tls_table() + key * 8, value);
+}
+
+// ─── Channels ───────────────────────────────────────────────────────────
+// [0] lock, [1] change counter (a futex), [2] waiters, [3] head (next
+// read), [4] tail (next write), [5] count, [6] capacity, [7] closed,
+// [8..] buffer. The lock is held only to look and change; a waiter reads
+// the counter, looks, and sleeps on the counter if nothing it wants is
+// there: a change in between makes the sleep return at once.
+
+pub fn pert_chan_create(capacity: i64) -> i64 {
+    var cap: i64 = capacity;
+    if cap < 1 {
+        cap = 1;
+    }
+    pe_mt_on();
+    var ch: i64 = pe_zeroed(8 + cap);
+    pe_st(ch + 48, cap);
+    return ch;
+}
+
+/// After a change: the counter moves, waiters wake.
+fn pe_chan_changed(ch: i64) {
+    nat_atomic_add(ch + 8, 1);
+    if nat_atomic_load(ch + 16) > 0 {
+        pe_futex_wake(ch + 8, 2147483647);
+    }
+}
+
+fn pe_chan_wait(ch: i64, seen: i64) {
+    nat_atomic_add(ch + 16, 1);
+    pe_wait_word(ch + 8, seen, 20);
+    nat_atomic_add(ch + 16, 0 - 1);
+}
+
+/// Wait until there is room or the channel is closed; false if closed.
+pub fn pert_chan_send(ch: i64, value: i64) -> bool {
+    if ch == 0 {
+        return false;
+    }
+    var seen: i64 = nat_atomic_load(ch + 8);
+    pe_lock(ch);
+    while pe_ld(ch + 40) == pe_ld(ch + 48) && pe_ld(ch + 56) == 0 {
+        pe_unlock(ch);
+        pe_chan_wait(ch, seen);
+        seen = nat_atomic_load(ch + 8);
+        pe_lock(ch);
+    }
+    if pe_ld(ch + 56) != 0 {
+        pe_unlock(ch);
+        return false;
+    }
+    var tail: i64 = pe_ld(ch + 32);
+    pe_st(ch + 64 + tail * 8, value);
+    pe_st(ch + 32, (tail + 1) % pe_ld(ch + 48));
+    pe_st(ch + 40, pe_ld(ch + 40) + 1);
+    pe_unlock(ch);
+    pe_chan_changed(ch);
+    return true;
+}
+
+/// The oldest value (the lock held).
+fn pe_chan_take(ch: i64) -> i64 {
+    var head: i64 = pe_ld(ch + 24);
+    var value: i64 = pe_ld(ch + 64 + head * 8);
+    pe_st(ch + 24, (head + 1) % pe_ld(ch + 48));
+    pe_st(ch + 40, pe_ld(ch + 40) - 1);
+    return value;
+}
+
+/// Wait until there is a value or the channel is closed and empty (then
+/// the pending value).
+pub fn pert_chan_recv(ch: i64) -> i64 {
+    if ch == 0 {
+        return 0;
+    }
+    var seen: i64 = nat_atomic_load(ch + 8);
+    pe_lock(ch);
+    while pe_ld(ch + 40) == 0 && pe_ld(ch + 56) == 0 {
+        pe_unlock(ch);
+        pe_chan_wait(ch, seen);
+        seen = nat_atomic_load(ch + 8);
+        pe_lock(ch);
+    }
+    if pe_ld(ch + 40) == 0 {
+        pe_unlock(ch);
+        return pe_pending();
+    }
+    var value: i64 = pe_chan_take(ch);
+    pe_unlock(ch);
+    pe_chan_changed(ch);
+    return value;
+}
+
+/// A value if one is waiting; else 0 if closed, the pending value if not.
+pub fn pert_chan_try_recv(ch: i64) -> i64 {
+    if ch == 0 {
+        return pe_pending();
+    }
+    pe_lock(ch);
+    if pe_ld(ch + 40) == 0 {
+        var closed: i64 = pe_ld(ch + 56);
+        pe_unlock(ch);
+        if closed != 0 {
+            return 0;
+        }
+        return pe_pending();
+    }
+    var value: i64 = pe_chan_take(ch);
+    pe_unlock(ch);
+    pe_chan_changed(ch);
+    return value;
+}
+
+pub fn pert_chan_close(ch: i64) {
+    if ch == 0 {
+        return;
+    }
+    pe_lock(ch);
+    pe_st(ch + 56, 1);
+    pe_unlock(ch);
+    pe_chan_changed(ch);
+}
+
+pub fn pert_chan_is_closed(ch: i64) -> bool {
+    if ch == 0 {
+        return true;
+    }
+    return nat_atomic_load(ch + 56) != 0;
+}

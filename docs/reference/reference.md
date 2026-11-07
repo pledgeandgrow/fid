@@ -969,7 +969,19 @@ compile-time sizes of the `val`/`var` declarations in the block (an integer's
 width in bytes, 8 per `f64` or reference, 16 per `str`, 24 per `Vec`, 48 per
 `HashMap`, 8 per struct field; `TypeChecker_type_size`) and
 reports an error when the sum exceeds `N` (`TypeChecker_check_stmt_inner`,
-`Stmt::RegionBlock`; `test_budget_fail.fd`). `region kv_cache` requires a
+`Stmt::RegionBlock`; `test_budget_fail.fd`). Heap allocations in the block
+count too: one whose size is known at compile time is added to the sum
+(`p_malloc(N)` with a constant `N`, 24 per `Vec::new()`, an f-string of
+text, integers and bools: its literal bytes, 20 per integer, 5 per bool, 1);
+any other is an error (`… allocates on the heap: '.push()'`): growing
+methods (`push`, `insert`, `clone`, `to_str`, …) on a `Vec`, `HashMap` or
+string, string `+`, an allocating builtin, a constant-size allocation inside
+a loop in the region, and a call to a function that allocates, itself or
+through what it calls (`TypeChecker_budget_call`, `TypeChecker_compute_heap_alloc`;
+`test_budget_heap_fail.fd`). A method called on a value of a user type that
+allocates only through another method call is not seen, and neither is a
+region nested in an expression (a closure). The `kv_cache` region's budget
+is not held to the heap rule: the cache is bounded by its window. `region kv_cache` requires a
 budget (`test_kv_cache_fail.fd`); `region gpu` has the same check
 (`test_gpu_region_fail.fd`). A variable declared in a region is not visible
 after it (`regions/test_region_escape.fd`). At a region's end the compiler
@@ -1060,8 +1072,14 @@ is not itself checked for `IO`.
 
 Inside `sandbox { }` every call in the table above is an error, whatever has
 been granted (`Sandbox error: 'print()' requires 'IO' capability`,
-`test_sandbox_fail.fd`). Calls to other functions are allowed, including ones
-that print.
+`test_sandbox_fail.fd`). So is a call to anything whose effects include
+`IO`, `Net` or `Spawn`: an IO builtin (`p_file_read`, `p_getenv`,
+`p_socket_*`, …), a function whose inferred effects (transitive, as for
+`!{}`) include one, a method of a user type that does, a higher-order
+function given such a function, and a call through a function value
+(`Sandbox error: 'logit()' has effect '!IO'`, `TypeChecker_check_sandbox_call`;
+`test_sandbox_helper_io_fail.fd`, `test_sandbox_file_read_fail.fd`). Pure
+functions may be called.
 
 ### 9.4 Effect handlers
 
@@ -1185,7 +1203,7 @@ Every annotation name is checked: a name not in the table below is an error
 | Annotation | On | What it does | Where |
 |---|---|---|---|
 | `@deterministic` | fn | No `IO`, `Net`, `Spawn` or `Diverge` effect and no floating point; methods it calls must be `@deterministic` | `typechecker.fd:TypeChecker_verify_deterministic`, `TypeChecker_check_method_call_rules` |
-| `@conserve` | fn | No `IO`/`Net`/`Spawn`/`Diverge` effect, no floats, calls only `@conserve` functions, never `Money::new` or `Money::from_cents` | `typechecker.fd:TypeChecker_verify_conserve` |
+| `@conserve` | fn | No `IO`/`Net`/`Spawn`/`Diverge` effect, no floats, calls only `@conserve` functions and methods, never a mint (`Money_new`, `Money_from_cents`, `Money_from_dollars`), no `Money { .. }` literal outside `stdlib/money.fd` (whose `Money_add`/`Money_sub` build their result from their inputs; a `Money { .. }` literal does not parse outside the module that declares `Money`) | `typechecker.fd:TypeChecker_verify_conserve` |
 | `@gas(N)` | fn | The body's static cost (nodes, with trips of loops that have literal bounds) plus its callees' must not exceed `N` | `typechecker.fd:TypeChecker_verify_gas` |
 | `@no-alloc` | fn | No allocating call or method (`push`, `Vec::new`, string `+`, …) | `typechecker.fd:check_safety_body` |
 | `@no-recursion` | fn | No direct or indirect recursion | `typechecker.fd:check_safety_body`, `TypeChecker_verify_safety_annotations` |

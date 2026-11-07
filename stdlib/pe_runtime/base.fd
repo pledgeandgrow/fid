@@ -110,8 +110,12 @@ pub fn pert_str_equal(a: i64, b: i64) -> bool {
     if a == b { return true; }
     if a == 0 { return false; }
     if b == 0 { return false; }
-    var la: i64 = pe_c_strlen(a);
-    var lb: i64 = pe_c_strlen(b);
+    // The header's length when the string has one (D16), so a zero byte
+    // inside a string is compared too; else strlen
+    var la: i64 = p_str_hdr_len(a);
+    if la < 0 { la = pe_c_strlen(a); }
+    var lb: i64 = p_str_hdr_len(b);
+    if lb < 0 { lb = pe_c_strlen(b); }
     if la != lb { return false; }
     return pe_c_memcmp(a, b, la) == 0;
 }
@@ -231,7 +235,7 @@ pub fn pert_to_str_float(val: f64) -> str {
         prec = prec + 1;
     }
     pe_c_fmt_prec(buf, 511, "%.*f", max_prec, val);
-    return pe_buf_str(buf);
+    return p_str_adopt(buf);
 }
 
 pub fn pert_float_to_str(val: f64) -> str {
@@ -268,7 +272,7 @@ fn pe_trim_fraction_zeros(buf: i64) -> str {
             pe_set_byte(buf, dot, 0);
         }
     }
-    return pe_buf_str(buf);
+    return p_str_adopt(buf);
 }
 
 fn pe_byte_at(buf: i64, i: i64) -> i64 {
@@ -455,9 +459,12 @@ pub fn pert_exit(code: i64) {
     pe_k_exit_process(code);
 }
 
-/// The variable's value; null when it is not set.
+/// The variable's value, a counted copy (proposal 0004); null when it is
+/// not set (p_getenv is a raw word: core's env_var gives the Option).
 pub fn pert_getenv(name: str) -> str {
-    return pe_c_getenv(name);
+    var r: i64 = pe_c_getenv(name) as i64;
+    if r == 0 { return r; }
+    return p_str_from_ptr(r);
 }
 
 // ─── Directories, processes ─────────────────────────────────────────────
@@ -520,7 +527,7 @@ fn pe_read_all(path: str) -> str {
     }
     pe_set_byte(buf, got, 0);
     pe_c_fclose(f);
-    return pe_buf_str(buf);
+    return p_str_adopt(buf);
 }
 
 /// Entry names of a directory joined by '\n' (no "./.."); "" on failure.
@@ -555,7 +562,7 @@ pub fn pert_dir_list(path: str) -> str {
     var pos: i64 = 0;
     h = pe_k_find_first(pat, data);
     if h == -1 {
-        return pe_buf_str(out);
+        return p_str_adopt(out);
     }
     more = 1;
     while more != 0 {
@@ -581,7 +588,7 @@ pub fn pert_dir_list(path: str) -> str {
     }
     pe_k_find_close(h);
     pe_set_byte(out, pos, 0);
-    return pe_buf_str(out);
+    return p_str_adopt(out);
 }
 
 /// Run a shell command capturing stdout/stderr/exit code. The handle is a
@@ -722,7 +729,7 @@ pub fn pert_sb_to_str(sb: i64) -> str {
     var out: i64 = p_malloc(len + 1);
     pe_c_memcpy(out, pe_sb_get(sb, 0), len);
     pe_set_byte(out, len, 0);
-    return out as str;
+    return p_str_adopt(out);
 }
 
 pub fn pert_alloc(size: i64) -> i64 {
@@ -1076,7 +1083,7 @@ pub fn pert_read_stdin(n: i64) -> str {
         got = got + rd;
     }
     pe_set_byte(buf, got, 0);
-    return pe_buf_str(buf);
+    return p_str_adopt(buf);
 }
 
 /// p_read_line(): one line without the trailing '\n'; "" on EOF or error
@@ -1106,7 +1113,7 @@ pub fn pert_read_line() -> str {
         got = got + 1;
     }
     pe_set_byte(buf, got, 0);
-    return pe_buf_str(buf);
+    return p_str_adopt(buf);
 }
 
 // ─── @zeroize heap wiping ────────────────────────────────────────────────
@@ -1120,7 +1127,8 @@ pub fn pert_str_zeroize(s: i64) {
     p_memset(s, 0, pe_c_strlen(s));
 }
 
-// A Fides Vec is a 24-byte block: [0] data  [8] len  [16] capacity.
+// A Fides Vec is a 32-byte block: [0] data  [8] len  [16] capacity
+// [24] element code (D14: the buffer is capacity * element size bytes).
 pub fn pert_vec_zeroize(v: i64) {
     if v == 0 { return; }
     var data_p: *mut i64 = v;
@@ -1129,6 +1137,6 @@ pub fn pert_vec_zeroize(v: i64) {
     var cap: i64 = 0;
     unsafe { data = *data_p; cap = *cap_p; }
     if data != 0 && cap > 0 {
-        p_memset(data, 0, cap * 8);
+        p_memset(data, 0, cap * vec_esz(vec_code(v)));
     }
 }

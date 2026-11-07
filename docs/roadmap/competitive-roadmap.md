@@ -137,9 +137,18 @@ in memory. This track is where most of the speed is.
 - [~] OP8. Dead code and dead store elimination (M).
       Done (Nov 4, native path): constants and other pure values nothing reads
       are removed. Left: dead stores.
-- [ ] OP9. Loop-invariant code motion (M).
+- [~] OP9. Loop-invariant code motion (M). Done Nov 7 (native path,
+      compiler/iropt.fd): a read of a local the loop never stores, `v.len()` of a
+      Vec the loop cannot resize (it calls nothing but get/set/len, so value
+      semantics say no other name changes its length), and comparisons and bit
+      operations on such values move to the block before the loop. Left: the
+      Vec's data pointer (needs the header loads in the IR), arithmetic that
+      may trap.
 - [ ] OP10. Strength reduction and induction variables (M).
-- [ ] OP11. Loop unrolling, peeling and rotation (M).
+- [~] OP11. Loop unrolling, peeling and rotation (M). Rotation done Nov 7
+      (native): a block that jumps back to a header made only of the loop's test
+      (loads, constants, integer operations, `len`) runs that test itself, so an
+      iteration takes one branch. Left: unrolling, peeling.
 - [ ] OP12. Scalar replacement of structs, and returning small structs in registers
       (L).
 - [ ] OP13. Tail calls, tail recursion into loops (M).
@@ -149,15 +158,29 @@ in memory. This track is where most of the speed is.
 
 **Back end**
 
-- [ ] OP16. A full register allocator over all registers, caller-saved included,
-      live ranges split at calls (release D4 goes further) (L). Native now keeps
-      values in 7 callee-saved registers: the hottest locals, parameters and
-      short-lived temporaries (release D4, D13). Not done: values that cross
-      blocks, caller-saved registers, floats in xmm.
-- [ ] OP17. Floats in xmm registers, not stack slots (L).
+- [~] OP16. A full register allocator over all registers, caller-saved included,
+      live ranges split at calls (release D4 goes further) (L). Native keeps
+      values in 7 callee-saved registers (release D4, D13), and since Nov 7:
+      copy coalescing (a local's loads, the value stored into it and the left
+      operand chain of that value share its register, so `i = i + 1` is one
+      `add`), operand hints, and r10/r11 for any value whose live range has no
+      call (a value may end at a call that reads its arguments first). Left:
+      rax-rdx and r8/r9 (the emitter's scratch), live ranges split at calls.
+- [~] OP17. Floats in xmm registers, not stack slots (L). Done Nov 7: f64
+      values and locals get xmm6/xmm7 (callee-saved, all 128 bits saved) and,
+      with no call in their live range, xmm2-xmm5; every move to and from a
+      value goes through the encoder, which turns a register slot into a
+      register move and refuses (a compile-time panic) any memory operand on
+      one. Left: f32, float operations reading a register operand directly
+      (they still go through xmm0/xmm1).
 - [~] OP18. Instruction selection: `lea`, addressing modes, `cmov`, `test`, fused
       compare and branch (L). Done: compare and branch without a stored bool,
       `imul` by an immediate, short immediate loads, shadow space set once.
+      Nov 7: `cmp r, imm` / `cmp r, r` on a register value, `test r, r` for a
+      branch on one, three-operand `imul`, `lea` for add, sub and * 2/3/5/9
+      where no check is needed, 8-bit immediates, `x % c` and `x / c` without
+      moves through rax. The loop benchmark's body went from 30 instructions
+      to 20. Left: memory operands, `cmov`.
 - [ ] OP19. A peephole pass on the native path (M).
 - [ ] OP20. Modern targets: BMI, AVX2, a `--cpu` switch, safe defaults (M).
 
@@ -174,6 +197,12 @@ in memory. This track is where most of the speed is.
       `while i < v.len()`, `for i in 0..v.len()` and a length kept in a local, on
       the native and the C backends (release D12). Left: range analysis for every
       loop and branch (L).
+      Nov 7 (compiler/checks.fd, both backends): integer ranges from
+      constants, `% c`, `/ c`, `& c`, `>> c`, comparisons, narrow types and
+      lengths; an add, sub or mul of two ranged values that cannot leave i64
+      is unchecked and ranged itself (`(i % 7) * 3 - 1`). Left: ranges of
+      locals across iterations and from branch conditions (the sieve's
+      `m = m + p`).
 - [ ] OP25. Effects drive optimization: `pure` calls merged, moved out of loops and
       removed; no-write calls keep memory facts alive (L).
 - [ ] OP26. Linear types and second-class references as alias facts: no-alias

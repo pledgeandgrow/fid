@@ -33,7 +33,7 @@ case "${CC_CMD[*]}" in
 esac
 LIBS=()
 OUT_EXE=fid-dev
-case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) LIBS=(-lws2_32); OUT_EXE=fid-dev.exe ;; *) LIBS=(-lm -lpthread); case "${CC_CMD[*]}${CC:-}" in *zig*) LIBS+=(-lunwind) ;; esac ;; esac
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) LIBS=(-lws2_32); OUT_EXE=fid-dev.exe ;; Darwin) LIBS=(-lm -lpthread); CFLAGS+=(-D_XOPEN_SOURCE=600 -D_DARWIN_C_SOURCE) ;; *) LIBS=(-lm -lpthread); case "${CC_CMD[*]}${CC:-}" in *zig*) LIBS+=(-lunwind) ;; esac ;; esac
 
 echo "[1/3] $STAGE0 dump-c compiler/main.fd > $OUT/fid-dev.c"
 if ! "$STAGE0" dump-c compiler/main.fd > "$OUT/fid-dev.c" 2> "$OUT/fid-dev.log"; then
