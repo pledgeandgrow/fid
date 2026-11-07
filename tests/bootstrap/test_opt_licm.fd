@@ -1,0 +1,78 @@
+// VF5: loop-invariant code motion (compiler/iropt.fd iro_licm). Reads of
+// locals the loop never stores, `v.len()` of a Vec the loop cannot resize,
+// and pure operations on them may move before the loop. They may not when
+// the loop writes the local (in any branch), resizes the Vec, or when
+// moving them would run something that can panic in a loop that never runs.
+
+fn main() -> i64 {
+    // invariant: k and v.len()
+    var v: Vec<i64> = Vec::new();
+    var j: i64 = 0;
+    while j < 8 { v.push(j * j); j = j + 1; }
+    val k: i64 = 3;
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < 20 {
+        s = s + k * 7 + v.len();
+        i = i + 1;
+    }
+    println(s);
+
+    // not invariant: the local is written in one branch of the loop
+    var m: i64 = 1;
+    var t: i64 = 0;
+    i = 0;
+    while i < 10 {
+        t = t + m * 2;
+        if i == 4 { m = 100; }
+        i = i + 1;
+    }
+    println(t);
+
+    // not invariant: the loop pushes, so v.len() changes
+    var w: Vec<i64> = Vec::new();
+    var lens: i64 = 0;
+    i = 0;
+    while i < 5 {
+        lens = lens + w.len();
+        w.push(i);
+        i = i + 1;
+    }
+    println(lens);
+
+    // a zero-trip loop: hoisting the division would divide by zero
+    val zero: i64 = 0;
+    val n: i64 = 0;
+    var q: i64 = 0;
+    i = 0;
+    while i < n {
+        q = q + 100 / zero;
+        i = i + 1;
+    }
+    println(q);
+
+    // a loop that exits before the invariant expression is reached
+    var u: i64 = 0;
+    i = 0;
+    while i < 10 {
+        if i == 0 { break; }
+        u = u + 50 / zero;
+        i = i + 1;
+    }
+    println(u);
+
+    // nested loops: the inner bound is invariant in the inner loop only
+    var tot: i64 = 0;
+    var a: i64 = 0;
+    while a < 6 {
+        var b: i64 = 0;
+        val lim: i64 = a * 2;
+        while b < lim {
+            tot = tot + a + lim;
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    println(tot);
+    return 0;
+}

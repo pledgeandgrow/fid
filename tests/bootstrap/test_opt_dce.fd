@@ -1,0 +1,61 @@
+// VF5: removal of unused values (compiler/iropt.fd iro_dce). Values nothing
+// reads may go; calls whose results are unused may not, nor stores into a
+// Vec or a struct that is read later, nor the work of a loop whose result
+// is printed. A DCE that removed one of these drops a line or changes a sum.
+
+var calls: i64 = 0;
+
+fn bump(x: i64) -> i64 {
+    calls = calls + 1;
+    return x * 2;
+}
+
+fn noisy(x: i64) -> i64 {
+    print("noisy ");
+    println(x);
+    return x;
+}
+
+struct Pair {
+    a: i64,
+    b: i64,
+}
+
+fn main() -> i64 {
+    // results unused, side effects not
+    bump(1);
+    val unused: i64 = bump(2);
+    noisy(3);
+    val also_unused: i64 = noisy(4) + 1;
+    println(calls);
+
+    // values that look dead but are read through a Vec and a struct
+    var v: Vec<i64> = Vec::new();
+    var t: i64 = 5;
+    v.push(t * 3);
+    t = 100;
+    var p: Pair = Pair { a: 1, b: 2 };
+    p.a = v.get(0);
+    var dead1: i64 = p.a * 1000;
+    dead1 = dead1 + 1;
+    println(p.a + p.b);
+
+    // a loop whose only output is its final sum
+    var s: i64 = 0;
+    var i: i64 = 0;
+    var waste: i64 = 0;
+    while i < 100 {
+        waste = i * i;
+        s = s + i;
+        i = i + 1;
+    }
+    println(s);
+
+    // a value computed, overwritten, then the first one used through a copy
+    var x: i64 = 41;
+    val keep: i64 = x + 1;
+    x = 0;
+    println(keep);
+    println(x);
+    return 0;
+}

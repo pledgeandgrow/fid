@@ -1,0 +1,98 @@
+// VF5: the native register allocator (compiler/pe_ir.fd: PEIR_GLOBAL_RA,
+// PEIR_COALESCE, PEIR_VOLATILE_RA, PEIR_XMM_RA, PEIR_ROTATE). More values
+// live at once than there are registers; values live across calls (a value
+// kept in a volatile register must survive the call); f64 values across
+// calls; copies that swap and rotate in a loop (coalescing must not merge
+// two values that are live together); while loops that run zero times,
+// break and continue (loop rotation).
+
+fn clobber(a: i64, b: i64, c: i64, d: i64) -> i64 {
+    return a * 1 + b * 2 + c * 3 + d * 4;
+}
+
+fn fclobber(x: f64, y: f64) -> f64 {
+    return x * 2.0 + y;
+}
+
+fn main() -> i64 {
+    // twelve live values, a call in the middle
+    var a: i64 = 1;
+    var b: i64 = 2;
+    var c: i64 = 3;
+    var d: i64 = 4;
+    var e: i64 = 5;
+    var f: i64 = 6;
+    var g: i64 = 7;
+    var h: i64 = 8;
+    var i: i64 = 9;
+    var j: i64 = 10;
+    var k: i64 = 11;
+    var l: i64 = 12;
+    val mid: i64 = clobber(l, k, j, i);
+    println(a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7 + h * 8 + i * 9 + j * 10 + k * 11 + l * 12 + mid);
+
+    // swap and rotate in a loop
+    var x: i64 = 1;
+    var y: i64 = 2;
+    var z: i64 = 3;
+    var n: i64 = 0;
+    while n < 7 {
+        val t: i64 = x;
+        x = y;
+        y = z;
+        z = t;
+        n = n + 1;
+    }
+    println(x * 100 + y * 10 + z);
+    var p: i64 = 5;
+    var q: i64 = 9;
+    n = 0;
+    while n < 3 {
+        val t2: i64 = p;
+        p = q;
+        q = t2;
+        n = n + 1;
+    }
+    println(p * 10 + q);
+
+    // fibonacci pairs: two values each defined from both
+    var f0: i64 = 0;
+    var f1: i64 = 1;
+    n = 0;
+    while n < 60 {
+        val nx: i64 = f0 + f1;
+        f0 = f1;
+        f1 = nx;
+        n = n + 1;
+    }
+    println(f0);
+
+    // f64 values live across calls
+    var fa: f64 = 1.5;
+    var fb: f64 = 2.25;
+    var fc: f64 = 0.0;
+    n = 0;
+    while n < 10 {
+        fc = fc + fclobber(fa, fb) + fa;
+        fa = fa + 0.5;
+        n = n + 1;
+    }
+    println((fc * 4.0) as i64);
+
+    // loops that run zero times, break and continue
+    var zt: i64 = 0;
+    n = 10;
+    while n < 5 { zt = zt + 1; n = n + 1; }
+    println(zt);
+    var bc: i64 = 0;
+    n = 0;
+    while n < 100 {
+        n = n + 1;
+        if n % 3 == 0 { continue; }
+        if n > 50 { break; }
+        bc = bc + n;
+    }
+    println(bc);
+    println(a + b + c + d + e + f + g + h + i + j + k + l);
+    return 0;
+}

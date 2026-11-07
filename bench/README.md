@@ -24,8 +24,8 @@ Rivals are built as their users ship them: `rustc -C opt-level=3`,
 
 Each program is written the way a good programmer of that language would
 write it, not translated word for word: Rust's `vec![true; n]`, C++'s
-`std::vector<bool>`, Go's `[]bool`, Fides's `Vec<i64>` (a `Vec<u8>` does not
-store bytes yet, roadmap RT1). Zig has no `hashmap` program yet.
+`std::vector<bool>`, Go's `[]bool`, Fides's `Vec<u8>` (one byte per element
+since release D14; it was a `Vec<i64>` before). Zig has no `hashmap` program yet.
 
 ## Results
 

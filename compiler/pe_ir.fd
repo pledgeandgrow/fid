@@ -60,6 +60,9 @@ pub struct PeStackFrame {
     pub reg_vars: Vec<PeOffEnt>,
     /// Per value: 1 for a constant every use of which takes the immediate
     pub imm_only: Vec<i64>,
+    /// Cold paths of inline Vec calls, emitted after the function: kind,
+    /// entry label, return label, bytes first (four words each)
+    pub cold: Vec<i64>,
 }
 
 pub fn PeStackFrame_new() -> PeStackFrame {
@@ -70,6 +73,7 @@ pub fn PeStackFrame_new() -> PeStackFrame {
         const_vals: Vec::new(),
         reg_vars: Vec::new(),
         imm_only: Vec::new(),
+        cold: Vec::new(),
     };
 }
 
@@ -1373,6 +1377,8 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
     PeirEnc_mov_rr(&mut self.enc, PEIR_RSP, PEIR_RBP);
     PeirEnc_pop(&mut self.enc, PEIR_RBP);
     PeirEnc_ret(&mut self.enc);
+    // The inline Vec calls' cold paths, out of the hot code's way
+    PeirGen_emit_cold(self, &mut frame);
 }
 
 /// The first `n` instructions of a block (a compare is fused with the
@@ -2598,16 +2604,25 @@ pub fn PeirGen_gen_inst(
                 pe_idmap_put(&mut frame.const_vals, id, value);
                 return;
             }
-            PeirEnc_mov_imm(&mut self.enc, PEIR_RAX, value);
-            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+            // straight into its register (competitive OP19)
+            if dst >= PEIR_REG_SLOT && !peir_is_xmm_slot(dst) {
+                PeirEnc_mov_imm(&mut self.enc, peir_value_reg(dst - PEIR_REG_SLOT), value);
+            } else {
+                PeirEnc_mov_imm(&mut self.enc, PEIR_RAX, value);
+                PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+            }
             pe_idmap_put(&mut frame.const_vals, id, value);
         }
 
         Inst::ConstBool(value) => {
             var v8: i64 = 0;
             if value { v8 = 1; }
-            PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, v8);
-            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+            if dst >= PEIR_REG_SLOT && !peir_is_xmm_slot(dst) {
+                PeirEnc_mov_imm(&mut self.enc, peir_value_reg(dst - PEIR_REG_SLOT), v8);
+            } else {
+                PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, v8);
+                PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+            }
         }
 
         Inst::ConstStr(value) => {
@@ -3028,7 +3043,7 @@ pub fn PeirGen_gen_inst(
 
         // --- Function Calls ---
         Inst::Call(call_name, args, _, _) => {
-            if PeirGen_inline_vec_call(self, call_name, args, dst, frame) { return; }
+            if PeirGen_inline_vec_call(self, call_name, args, dst, frame, func) { return; }
             // An f64 lives in its slot as its bits: these copy the word (the
             // async task adapters of release H9 use them)
             if (call_name == "p_f64_to_bits" || call_name == "p_f64_from_bits") && args.len() == 1 {
@@ -3945,11 +3960,60 @@ fn PeirGen_load_operand(self: &mut PeirGen, reg: i64, value: i64, frame: &PeStac
     }
 }
 
-/// Vec_len and Vec_get (core.fd) are the hottest calls of most programs:
-/// their bodies at the call site, bounds check included (unsigned, so a
-/// negative index fails it too). The `__env` argument, when present, is
-/// first. True when the call was generated.
-fn PeirGen_inline_vec_call(self: &mut PeirGen, name: str, args: Vec<i64>, dst: i64, frame: &PeStackFrame) -> bool {
+/// The element-code word of a Vec of bytes (u8 or bool): core's
+/// vec_code_word(1), P_VEC_TAG + 1 + 8 (release D14).
+const PEIR_VEC_BYTES: i64 = 0x4649445645430009;
+
+/// Is `v` typed as a Vec of u8 or bool (its code is most likely bytes)?
+fn peir_vec_bytes_typed(func: &IrFunction, v: i64) -> bool {
+    match IrFunction_get_meta(func, v) {
+        OptValueMeta::Some(m) => {
+            match m.ty {
+                IrType::Generic(n, args) => {
+                    if n == "Vec" && args.len() == 1 {
+                        match args.get(0) {
+                            IrType::U8 => { return true; }
+                            IrType::Bool => { return true; }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        OptValueMeta::None => {}
+    }
+    return false;
+}
+
+/// A cold path: its kind (1 get, 2 set, 3 push), entry and return labels,
+/// whether the hot path tried bytes first; emitted after the function.
+fn peir_cold_add(frame: &mut PeStackFrame, kind: i64, entry: i64, back: i64, bytes: bool) {
+    frame.cold.push(kind);
+    frame.cold.push(entry);
+    frame.cold.push(back);
+    if bytes { frame.cold.push(1); } else { frame.cold.push(0); }
+}
+
+/// rdx = element rcx of the Vec at rax, of one word or one byte
+fn PeirGen_vec_load_word(self: &mut PeirGen) {
+    PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RDX, PEIR_RAX);
+    PeirEnc_mov_r_idx8(&mut self.enc, PEIR_RDX, PEIR_RDX, PEIR_RCX);
+}
+
+fn PeirGen_vec_load_byte(self: &mut PeirGen) {
+    PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RDX, PEIR_RAX);
+    PeirEnc_movzx_r_byte_idx(&mut self.enc, PEIR_RDX, PEIR_RDX, PEIR_RCX);
+}
+
+/// Vec_len, Vec_get, Vec_set and Vec_push (core.fd), the hottest calls of
+/// most programs: their common case at the call site, the rest a call to
+/// core's function out of line (after the function, so the common case
+/// falls through). Bounds checks are unsigned, so a negative index fails
+/// them too. A Vec of words or of bytes (release D14) takes the inline
+/// path; which is tried first follows the Vec's static type. The `__env`
+/// argument, when present, is first. True when the call was generated.
+fn PeirGen_inline_vec_call(self: &mut PeirGen, name: str, args: Vec<i64>, dst: i64, frame: &mut PeStackFrame, func: &IrFunction) -> bool {
     if self.bare_mode { return false; }
     if name == "Vec_len" && args.len() >= 1 {
         PeirGen_load_operand(self, PEIR_RAX, args.get(args.len() - 1), frame);
@@ -3958,27 +4022,139 @@ fn PeirGen_inline_vec_call(self: &mut PeirGen, name: str, args: Vec<i64>, dst: i
         return true;
     }
     if name == "Vec_get" && args.len() >= 2 {
-        PeirGen_load_operand(self, PEIR_RAX, args.get(args.len() - 2), frame);
+        var gv: i64 = args.get(args.len() - 2);
+        PeirGen_load_operand(self, PEIR_RAX, gv, frame);
         PeirGen_load_operand(self, PEIR_RCX, args.get(args.len() - 1), frame);
         if !self.cur_unchecked {
             PeirEnc_cmp_r_mem(&mut self.enc, PEIR_RCX, PEIR_RAX, 8);
             PeirGen_jump_panic(self, 0x3, PEIR_PANIC_VEC_INDEX); // jae
         }
-        // Elements at their size (D14, element code at +24): core's Vec_get
-        var sized: i64 = -1;
-        var got: i64 = -1;
-        if HashMap_contains(self.func_labels, "Vec_get") {
-            sized = PeirEnc_alloc_label(&mut self.enc);
-            got = PeirEnc_alloc_label(&mut self.enc);
-            PeirEnc_cmp_mem_imm8(&mut self.enc, PEIR_RAX, 24, 0);
-            PeirEnc_jcc_label(&mut self.enc, 0x5, sized); // jnz
+        if !HashMap_contains(self.func_labels, "Vec_get") {
+            PeirGen_vec_load_word(self);
+            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RDX);
+            return true;
         }
-        // the element: one load with a scaled index (competitive OP18)
-        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RDX, PEIR_RAX);
-        PeirEnc_mov_r_idx8(&mut self.enc, PEIR_RDX, PEIR_RDX, PEIR_RCX);
-        if sized >= 0 {
-            PeirEnc_jmp_label(&mut self.enc, got);
-            PeirEnc_place_label(&mut self.enc, sized);
+        var gcold: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var gdone: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var gbytes: bool = peir_vec_bytes_typed(func, gv);
+        if gbytes {
+            PeirEnc_mov_imm64(&mut self.enc, PEIR_R9, PEIR_VEC_BYTES);
+            PeirEnc_cmp_r_mem(&mut self.enc, PEIR_R9, PEIR_RAX, 24);
+            PeirEnc_jcc_label(&mut self.enc, 0x5, gcold); // jne
+            PeirGen_vec_load_byte(self);
+        } else {
+            PeirEnc_cmp_mem_imm8(&mut self.enc, PEIR_RAX, 24, 0);
+            PeirEnc_jcc_label(&mut self.enc, 0x5, gcold); // jnz
+            PeirGen_vec_load_word(self);
+        }
+        PeirEnc_place_label(&mut self.enc, gdone);
+        PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RDX);
+        peir_cold_add(frame, 1, gcold, gdone, gbytes);
+        return true;
+    }
+    if name == "Vec_set" && args.len() >= 3 {
+        var sv: i64 = args.get(args.len() - 3);
+        PeirGen_load_operand(self, PEIR_RAX, sv, frame);
+        PeirGen_load_operand(self, PEIR_RCX, args.get(args.len() - 2), frame);
+        PeirGen_load_operand(self, PEIR_RDX, args.get(args.len() - 1), frame);
+        if !self.cur_unchecked {
+            PeirEnc_cmp_r_mem(&mut self.enc, PEIR_RCX, PEIR_RAX, 8);
+            PeirGen_jump_panic(self, 0x3, PEIR_PANIC_VEC_INDEX); // jae
+        }
+        if !HashMap_contains(self.func_labels, "Vec_set") {
+            PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_R8, PEIR_RAX);
+            PeirEnc_mov_idx8_r(&mut self.enc, PEIR_R8, PEIR_RCX, PEIR_RDX);
+            return true;
+        }
+        var scold: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var sdone: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var sbytes: bool = peir_vec_bytes_typed(func, sv);
+        // Shared data (negative capacity: core's Vec_set copies it first),
+        // elements the Vec owns (type at +32, proposal 0004: core drops the
+        // old one) and the other element size go to the cold path
+        PeirEnc_cmp_mem_imm8(&mut self.enc, PEIR_RAX, 16, 0);
+        PeirEnc_jcc_label(&mut self.enc, 0xC, scold); // jl
+        if sbytes {
+            PeirEnc_mov_imm64(&mut self.enc, PEIR_R9, PEIR_VEC_BYTES);
+            PeirEnc_cmp_r_mem(&mut self.enc, PEIR_R9, PEIR_RAX, 24);
+            PeirEnc_jcc_label(&mut self.enc, 0x5, scold); // jne
+            PeirEnc_cmp_mem_imm8(&mut self.enc, PEIR_RAX, 32, 0);
+            PeirEnc_jcc_label(&mut self.enc, 0x5, scold); // jne
+            PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_R8, PEIR_RAX);
+            PeirEnc_mov_byte_idx_r(&mut self.enc, PEIR_R8, PEIR_RCX, PEIR_RDX);
+        } else {
+            PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R8, PEIR_RAX, 24);
+            PeirEnc_or_r_mem(&mut self.enc, PEIR_R8, PEIR_RAX, 32);
+            PeirEnc_jcc_label(&mut self.enc, 0x5, scold); // jnz
+            PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_R8, PEIR_RAX);
+            PeirEnc_mov_idx8_r(&mut self.enc, PEIR_R8, PEIR_RCX, PEIR_RDX);
+        }
+        PeirEnc_place_label(&mut self.enc, sdone);
+        peir_cold_add(frame, 2, scold, sdone, sbytes);
+        return true;
+    }
+    // Vec_push with room in the buffer; growing stays a call
+    if name == "Vec_push" && args.len() == 3 && HashMap_contains(self.func_labels, "Vec_push") {
+        var pcold: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var pdone: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var pbytes: bool = peir_vec_bytes_typed(func, args.get(1));
+        PeirGen_load_operand(self, PEIR_RAX, args.get(1), frame);
+        PeirGen_load_operand(self, PEIR_RCX, args.get(2), frame);
+        if pbytes {
+            PeirEnc_mov_imm64(&mut self.enc, PEIR_R9, PEIR_VEC_BYTES);
+            PeirEnc_cmp_r_mem(&mut self.enc, PEIR_R9, PEIR_RAX, 24);
+            PeirEnc_jcc_label(&mut self.enc, 0x5, pcold); // jne
+        } else {
+            // Elements at their size (D14, element code at +24): the call
+            PeirEnc_cmp_mem_imm8(&mut self.enc, PEIR_RAX, 24, 0);
+            PeirEnc_jcc_label(&mut self.enc, 0x5, pcold); // jnz
+        }
+        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RDX, PEIR_RAX, 8);
+        // signed: a shared Vec's capacity is negative and takes the call
+        PeirEnc_cmp_r_mem(&mut self.enc, PEIR_RDX, PEIR_RAX, 16);
+        PeirEnc_jcc_label(&mut self.enc, 0xD, pcold); // jge
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_R8, PEIR_RAX);
+        if pbytes {
+            PeirEnc_mov_byte_idx_r(&mut self.enc, PEIR_R8, PEIR_RDX, PEIR_RCX);
+        } else {
+            PeirEnc_mov_idx8_r(&mut self.enc, PEIR_R8, PEIR_RDX, PEIR_RCX);
+        }
+        PeirEnc_inc_r(&mut self.enc, PEIR_RDX);
+        PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RAX, 8, PEIR_RDX);
+        PeirEnc_place_label(&mut self.enc, pdone);
+        peir_cold_add(frame, 3, pcold, pdone, false);
+        return true;
+    }
+    return false;
+}
+
+/// The cold paths of the function's inline Vec calls (inline_vec_call):
+/// the other element size, else the call to core. Registers as the hot
+/// path left them: rax the Vec, rcx the index (push: the value), rdx the
+/// value (get: the result).
+fn PeirGen_emit_cold(self: &mut PeirGen, frame: &mut PeStackFrame) {
+    var i: i64 = 0;
+    while i + 3 < frame.cold.len() {
+        var kind: i64 = frame.cold.get(i);
+        var entry: i64 = frame.cold.get(i + 1);
+        var back: i64 = frame.cold.get(i + 2);
+        var bytes: bool = frame.cold.get(i + 3) == 1;
+        PeirEnc_place_label(&mut self.enc, entry);
+        var slow: i64 = PeirEnc_alloc_label(&mut self.enc);
+        if kind == 1 {
+            // the other element size, else core's Vec_get
+            if bytes {
+                PeirEnc_cmp_mem_imm8(&mut self.enc, PEIR_RAX, 24, 0);
+                PeirEnc_jcc_label(&mut self.enc, 0x5, slow);
+                PeirGen_vec_load_word(self);
+            } else {
+                PeirEnc_mov_imm64(&mut self.enc, PEIR_R9, PEIR_VEC_BYTES);
+                PeirEnc_cmp_r_mem(&mut self.enc, PEIR_R9, PEIR_RAX, 24);
+                PeirEnc_jcc_label(&mut self.enc, 0x5, slow);
+                PeirGen_vec_load_byte(self);
+            }
+            PeirEnc_jmp_label(&mut self.enc, back);
+            PeirEnc_place_label(&mut self.enc, slow);
             PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_RCX);
             PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
             PeirEnc_xor_self(&mut self.enc, PEIR_RCX);
@@ -3986,40 +4162,27 @@ fn PeirGen_inline_vec_call(self: &mut PeirGen, name: str, args: Vec<i64>, dst: i
             PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "Vec_get"));
             PeirEnc_add_rsp_i32(&mut self.enc, 32);
             PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
-            PeirEnc_place_label(&mut self.enc, got);
-        }
-        PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RDX);
-        return true;
-    }
-    if name == "Vec_set" && args.len() >= 3 {
-        PeirGen_load_operand(self, PEIR_RAX, args.get(args.len() - 3), frame);
-        PeirGen_load_operand(self, PEIR_RCX, args.get(args.len() - 2), frame);
-        PeirGen_load_operand(self, PEIR_RDX, args.get(args.len() - 1), frame);
-        if !self.cur_unchecked {
-            PeirEnc_cmp_r_mem(&mut self.enc, PEIR_RCX, PEIR_RAX, 8);
-            PeirGen_jump_panic(self, 0x3, PEIR_PANIC_VEC_INDEX); // jae
-        }
-        // Shared data (negative capacity): core's Vec_set copies it first
-        var own: i64 = -1;
-        var set_done: i64 = -1;
-        if HashMap_contains(self.func_labels, "Vec_set") {
-            own = PeirEnc_alloc_label(&mut self.enc);
-            set_done = PeirEnc_alloc_label(&mut self.enc);
+            PeirEnc_jmp_label(&mut self.enc, back);
+        } else if kind == 2 {
+            // not shared and not owning: the other element size
             PeirEnc_cmp_mem_imm8(&mut self.enc, PEIR_RAX, 16, 0);
-            PeirEnc_jcc_label(&mut self.enc, 0xC, own); // jl
-            // Elements at their size (D14, code at +24) or owned by the Vec
-            // (element type at +32, proposal 0004: core's Vec_set drops the
-            // old one): core's Vec_set. One test for both words.
-            PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R8, PEIR_RAX, 24);
-            PeirEnc_or_r_mem(&mut self.enc, PEIR_R8, PEIR_RAX, 32);
-            PeirEnc_jcc_label(&mut self.enc, 0x5, own); // jnz
-        }
-        // the store: a scaled index (competitive OP18)
-        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_R8, PEIR_RAX);
-        PeirEnc_mov_idx8_r(&mut self.enc, PEIR_R8, PEIR_RCX, PEIR_RDX);
-        if own >= 0 {
-            PeirEnc_jmp_label(&mut self.enc, set_done);
-            PeirEnc_place_label(&mut self.enc, own);
+            PeirEnc_jcc_label(&mut self.enc, 0xC, slow);
+            PeirEnc_cmp_mem_imm8(&mut self.enc, PEIR_RAX, 32, 0);
+            PeirEnc_jcc_label(&mut self.enc, 0x5, slow);
+            if bytes {
+                PeirEnc_cmp_mem_imm8(&mut self.enc, PEIR_RAX, 24, 0);
+                PeirEnc_jcc_label(&mut self.enc, 0x5, slow);
+                PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_R8, PEIR_RAX);
+                PeirEnc_mov_idx8_r(&mut self.enc, PEIR_R8, PEIR_RCX, PEIR_RDX);
+            } else {
+                PeirEnc_mov_imm64(&mut self.enc, PEIR_R9, PEIR_VEC_BYTES);
+                PeirEnc_cmp_r_mem(&mut self.enc, PEIR_R9, PEIR_RAX, 24);
+                PeirEnc_jcc_label(&mut self.enc, 0x5, slow);
+                PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_R8, PEIR_RAX);
+                PeirEnc_mov_byte_idx_r(&mut self.enc, PEIR_R8, PEIR_RCX, PEIR_RDX);
+            }
+            PeirEnc_jmp_label(&mut self.enc, back);
+            PeirEnc_place_label(&mut self.enc, slow);
             PeirEnc_mov_rr(&mut self.enc, PEIR_R9, PEIR_RDX);
             PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_RCX);
             PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
@@ -4027,44 +4190,20 @@ fn PeirGen_inline_vec_call(self: &mut PeirGen, name: str, args: Vec<i64>, dst: i
             PeirEnc_sub_rsp_i32(&mut self.enc, 32);
             PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "Vec_set"));
             PeirEnc_add_rsp_i32(&mut self.enc, 32);
-            PeirEnc_place_label(&mut self.enc, set_done);
+            PeirEnc_jmp_label(&mut self.enc, back);
+        } else {
+            // push: grow, share, or another element size
+            PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
+            PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_RCX);
+            PeirEnc_xor_self(&mut self.enc, PEIR_RCX);
+            PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+            PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "Vec_push"));
+            PeirEnc_add_rsp_i32(&mut self.enc, 32);
+            PeirEnc_jmp_label(&mut self.enc, back);
         }
-        return true;
+        i = i + 4;
     }
-    // Vec_push with room in the buffer; growing stays a call
-    if name == "Vec_push" && args.len() == 3 && HashMap_contains(self.func_labels, "Vec_push") {
-        var grow: i64 = PeirEnc_alloc_label(&mut self.enc);
-        var done: i64 = PeirEnc_alloc_label(&mut self.enc);
-        PeirGen_load_operand(self, PEIR_RAX, args.get(1), frame);
-        PeirGen_load_operand(self, PEIR_RCX, args.get(2), frame);
-        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RDX, PEIR_RAX, 8);
-        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R8, PEIR_RAX, 16);
-        PeirEnc_cmp_rr(&mut self.enc, PEIR_RDX, PEIR_R8);
-        // signed: a shared Vec's capacity is negative and takes the call
-        PeirEnc_jcc_label(&mut self.enc, 0xD, grow); // jge
-        // Elements at their size (D14, element code at +24): the call too
-        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R8, PEIR_RAX, 24);
-        PeirEnc_test_rr(&mut self.enc, PEIR_R8, PEIR_R8);
-        PeirEnc_jcc_label(&mut self.enc, 0x5, grow); // jnz
-        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_R8, PEIR_RAX);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_R9, PEIR_RDX);
-        PeirEnc_shl_r_i8(&mut self.enc, PEIR_R9, 3);
-        PeirEnc_add_rr(&mut self.enc, PEIR_R8, PEIR_R9);
-        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_R8, PEIR_RCX);
-        PeirEnc_inc_r(&mut self.enc, PEIR_RDX);
-        PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RAX, 8, PEIR_RDX);
-        PeirEnc_jmp_label(&mut self.enc, done);
-        PeirEnc_place_label(&mut self.enc, grow);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_RCX);
-        PeirEnc_xor_self(&mut self.enc, PEIR_RCX);
-        PeirEnc_sub_rsp_i32(&mut self.enc, 32);
-        PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "Vec_push"));
-        PeirEnc_add_rsp_i32(&mut self.enc, 32);
-        PeirEnc_place_label(&mut self.enc, done);
-        return true;
-    }
-    return false;
+    frame.cold.clear();
 }
 
 /// rax = the value of `rax` in narrow type `ty`; panics (stub `panic` >= 0)

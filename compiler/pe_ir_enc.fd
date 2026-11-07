@@ -665,6 +665,39 @@ pub fn PeirEnc_mem_op(self: &mut PeirEnc, opcode: i64, reg: i64, reg_is_reg: boo
     if m == 2 { PeirEnc_emit_i32(self, disp); }
 }
 
+/// movzx r32, byte [base + index] (zero-extends into all of r64)
+pub fn PeirEnc_movzx_r_byte_idx(self: &mut PeirEnc, r: i64, base: i64, index: i64) -> void {
+    if reg_ext(r) || reg_ext(index) || reg_ext(base) {
+        PeirEnc_rex(self, false, reg_ext(r), reg_ext(index), reg_ext(base));
+    }
+    self.code.push(0x0F);
+    self.code.push(0xB6);
+    PeirEnc_byte_idx_modrm(self, r, base, index);
+}
+
+/// mov byte [base + index], r8 (the low byte of r)
+pub fn PeirEnc_mov_byte_idx_r(self: &mut PeirEnc, base: i64, index: i64, r: i64) -> void {
+    // without a REX prefix, byte registers 4-7 are ah..bh, not spl..dil
+    if reg_ext(r) || reg_ext(index) || reg_ext(base) || peir_reg_code(r) >= 4 {
+        PeirEnc_rex(self, false, reg_ext(r), reg_ext(index), reg_ext(base));
+    }
+    self.code.push(0x88);
+    PeirEnc_byte_idx_modrm(self, r, base, index);
+}
+
+/// ModRM + SIB of [base + index*1]
+fn PeirEnc_byte_idx_modrm(self: &mut PeirEnc, r: i64, base: i64, index: i64) -> void {
+    var bc: i64 = peir_reg_code(base);
+    if bc == 5 {
+        PeirEnc_modrm(self, 1, r & 7, 4);
+        self.code.push((peir_reg_code(index) << 3) | bc);
+        self.code.push(0);
+    } else {
+        PeirEnc_modrm(self, 0, r & 7, 4);
+        self.code.push((peir_reg_code(index) << 3) | bc);
+    }
+}
+
 /// cmp r64, [base + disp]
 pub fn PeirEnc_cmp_r_mem(self: &mut PeirEnc, r: i64, base: i64, disp: i64) -> void {
     PeirEnc_mem_op(self, 0x3B, r, true, base, -1, disp);

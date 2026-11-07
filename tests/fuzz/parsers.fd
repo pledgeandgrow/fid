@@ -1,0 +1,75 @@
+// Fuzz driver for the stdlib parsers (roadmap VF15; scripts/fuzz/fuzz_parsers.py).
+//
+//   parsers <parser> <input file>
+//
+// Runs one parser on the bytes of the file and prints a short summary of
+// the result, so a run that returns shows it reached the end. The parsers
+// here are the stdlib's entry points for untrusted text; none of them is
+// documented to panic (json_parse is; json_parse_safe is the one for
+// untrusted input), so a panic, a crash or a hang is a finding.
+
+use json;
+use regex;
+use http;
+use csv;
+use toml;
+use xml;
+use url;
+use uuid;
+
+fn xml_count(n: XmlNode) -> i64 {
+    var total: i64 = 1;
+    for c in n.children {
+        total = total + xml_count(c);
+    }
+    return total;
+}
+
+fn main() -> i64 {
+    val which: str = arg_at(1) ?? "";
+    val path: str = arg_at(2) ?? "";
+    val text: str = read_file(path) ?? "";
+    if which == "json" {
+        val r = json_parse_safe(text);
+        println(str_len(r));
+        println(json_is_valid(text));
+    } else if which == "regex" {
+        // first line: the pattern, the rest: the subject
+        val nl = str_find(text, "\n");
+        var pat: str = text;
+        var subject: str = "";
+        if nl >= 0 {
+            pat = str_slice(text, 0, nl);
+            subject = str_slice(text, nl + 1, str_len(text));
+        }
+        println(regex_match(subject, pat));
+        println(regex_matches(subject, pat));
+    } else if which == "http" {
+        val req = http_parse_head(text);
+        println(str_len(req.method) + str_len(req.path));
+        val r2 = parse_request(text);
+        println(str_len(r2));
+    } else if which == "csv" {
+        val rows = csv_parse(text);
+        println(rows.len());
+        val recs = csv_parse_records(text);
+        println(recs.len());
+    } else if which == "toml" {
+        val es = toml_parse(text);
+        println(es.len());
+    } else if which == "xml" {
+        val n = xml_parse(text);
+        println(xml_count(n));
+    } else if which == "url" {
+        val u = url_parse(text);
+        println(str_len(u.host) + u.port);
+        println(str_len(url::url_decode(text)));  // encoding.fd (through http) has one too
+    } else if which == "uuid" {
+        val id = uuid_parse(text);
+        println(id.bytes.len());
+    } else {
+        println("unknown parser");
+        return 2;
+    }
+    return 0;
+}
