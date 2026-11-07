@@ -8812,7 +8812,7 @@ escapes verified. Random seed time verified.
   files, PATH works, file association works, uninstall works.
 - GitHub Actions workflow at `.github/workflows/build-installer.yml`
   builds the installer on tagged releases and manual dispatch.
-- Release published at https://github.com/pledgeandgrow/p-lang/releases/tag/v1.0.0
+- Release published at https://github.com/pledgeandgrow/fid/releases/tag/v1.0.0
 - 38/38 self-host tests pass on all 3 backends. No regressions.
 
 ---

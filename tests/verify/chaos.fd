@@ -1,0 +1,69 @@
+// Chaos driver (roadmap VF17; scripts/verify/chaos.py). Each mode does one
+// thing the environment can make fail, and reports what it saw; chaos.py
+// arranges the failure (a full disk, no memory, a server that drops the
+// connection, a reader that goes away) and checks the program fails the way
+// it should: an error result or a panic message and a nonzero exit, never a
+// crash, a hang or silent wrong output.
+//
+//   chaos write <path> <chunks>   append 64 KiB chunks; report the first failure
+//   chaos alloc                   grow memory until it runs out
+//   chaos http <port> <path>      GET from 127.0.0.1:<port>
+//   chaos print <n>               print n lines
+//   chaos deep <n>                recurse n levels
+//   chaos read <path>             read a file
+
+use file;
+use http_client;
+
+fn deep(n: i64) -> i64 {
+    if n == 0 { return 0; }
+    return deep(n - 1) + 1;
+}
+
+fn main() -> i64 {
+    val mode: str = arg_at(1) ?? "";
+    val a2: str = arg_at(2) ?? "";
+    val a3: str = arg_at(3) ?? "0";
+    if mode == "write" {
+        var chunk: str = str_repeat("x", 65536);
+        val n: i64 = str_parse_int(a3);
+        var i: i64 = 0;
+        while i < n {
+            if file_append(a2, chunk) != 0 {
+                println("write-failed at chunk " + int_to_str(i));
+                return 0;
+            }
+            i = i + 1;
+        }
+        println("wrote " + int_to_str(n) + " chunks");
+    } else if mode == "alloc" {
+        var keep: Vec<Vec<i64>> = Vec::new();
+        var total: i64 = 0;
+        while true {
+            var v: Vec<i64> = Vec::new();
+            var j: i64 = 0;
+            while j < 131072 { v.push(j); j = j + 1; }
+            keep.push(v);
+            total = total + 1;
+            if total % 64 == 0 { println("MiB " + int_to_str(total)); }
+        }
+    } else if mode == "http" {
+        val r = http_get("127.0.0.1", str_parse_int(a2), a3);
+        println("status " + int_to_str(r.status) + " body " + int_to_str(str_len(r.body)));
+    } else if mode == "print" {
+        val n: i64 = str_parse_int(a2);
+        var i: i64 = 0;
+        while i < n { println("line " + int_to_str(i)); i = i + 1; }
+    } else if mode == "deep" {
+        println(deep(str_parse_int(a2)));
+    } else if mode == "read" {
+        match read_file(a2) {
+            Option::Some(t) => { println("read " + int_to_str(str_len(t))); }
+            Option::None => { println("none"); }
+        }
+    } else {
+        println("unknown mode");
+        return 2;
+    }
+    return 0;
+}

@@ -96,7 +96,7 @@ cargo build --release
 - **🎉 v1.0.0 RELEASED!** — Windows installer (`Fides-Setup-1.0.0.exe`, 2.5 MB)
   tested and working on Windows. Users can download, install, and compile
   `.fd` files immediately. Available at
-  [GitHub Releases](https://github.com/pledgeandgrow/p-lang/releases/tag/v1.0.0).
+  [GitHub Releases](https://github.com/pledgeandgrow/fid/releases/tag/v1.0.0).
 - **🎉 GitHub Actions CI** — automated installer builds on tagged releases
   (`.github/workflows/build-installer.yml`).
 - **Bootstrap fixpoint (VERIFIED, re-verified session 29)** — The fixpoint was
@@ -1983,7 +1983,7 @@ Also a compiled artifact. The source is `compiler/lower.fd`.
 #### Download (end users)
 
 Download `Fides-Setup-1.0.0.exe` from
-[GitHub Releases](https://github.com/pledgeandgrow/p-lang/releases/tag/v1.0.0)
+[GitHub Releases](https://github.com/pledgeandgrow/fid/releases/tag/v1.0.0)
 and run it. This installs:
 - the compilers to `C:\Program Files\Fides\` (`installer/fides.nsi` today ships `fid.exe`, the self-hosted compiler, plus `fidesc.exe`, `ark.exe`, `scribe.exe`, `veil.exe`)
 - Standard library to `C:\Program Files\Fides\stdlib\` (99 modules in v1.0.0; 137 in the tree on Nov 6)
@@ -2408,7 +2408,7 @@ Probe tests for self-hosting behavior:
 ### 5. Directory Layout
 
 ```
-p-lang/
+fid/
 ├── compiler/             # Self-hosted Fides compiler modules (61 .fd files, 133,688 lines, Nov 6; list below is from session 16)
 │   ├── main.fd           # CLI entry point (ccompile + build + lsp + test + fmt + ...)
 │   ├── compiler.fd       # Pipeline driver

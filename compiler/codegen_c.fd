@@ -1800,6 +1800,11 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "#define P_NOINLINE");
     wln(self, "#define P_UNLIKELY(x) (x)");
     wln(self, "#endif");
+    wln(self, "#if (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)");
+    wln(self, "#define P_LIKELY_C(x) __builtin_expect(!!(x), 1)");
+    wln(self, "#else");
+    wln(self, "#define P_LIKELY_C(x) (x)");
+    wln(self, "#endif");
     wln(self, "/* A full Vec grows out of line, so push inlines to a store. */");
     // Copy-on-write (proposal 0001): a negative capacity (-box-1) marks data
     // other Vecs share; the box holds {owners, capacity}. Growing (or owning
@@ -2754,6 +2759,17 @@ fn fast_core_vec_body(name: str, func: IrFunction, c_ret: str) -> Vec<str> {
         out.push("    int64_t* __h = (int64_t*)p_malloc(40);");
         out.push("    __h[0] = 0; __h[1] = 0; __h[2] = 0; __h[3] = 0; __h[4] = 0;");
         out.push("    return (int64_t)(intptr_t)__h;");
+    } else if name == "p_str_hash" && n == 2 && c_ret == "int64_t" {
+        // The bytes up to the first NUL, as core's byte loop, eight at a
+        // time (HashMap mixes the result again, hm_mix)
+        out.push("    const unsigned char* __s = (const unsigned char*)(intptr_t)" + p.get(1) + ";");
+        out.push("    if (!__s) return 0;");
+        out.push("    size_t __n = strlen((const char*)__s);");
+        out.push("    uint64_t __h = 0xCBF29CE484222325ULL ^ (uint64_t)__n;");
+        out.push("    while (__n >= 8) { uint64_t __w; memcpy(&__w, __s, 8); __h = (__h ^ __w) * 0x9E3779B97F4A7C15ULL; __h ^= __h >> 29; __s += 8; __n -= 8; }");
+        out.push("    uint64_t __t = 0; memcpy(&__t, __s, __n);");
+        out.push("    __h = (__h ^ __t) * 0x9E3779B97F4A7C15ULL; __h ^= __h >> 32;");
+        out.push("    return (int64_t)(__h & 0x7FFFFFFFFFFFFFFFULL);");
     } else if name == "Vec_len" && n == 2 && c_ret == "int64_t" {
         out.push("    int64_t* __h = (int64_t*)(intptr_t)" + p.get(1) + ";");
         out.push("    return __h[1];");
@@ -2917,6 +2933,78 @@ fn gen_function(self: &mut CCodeGen, name: str, func: IrFunction) -> void {
     }
     wln(self, "}");
     wln(self, "");
+}
+
+/// The C type and core's element code word (vec_code_word) of a Vec's
+/// elements, from the IR type of the Vec value: "" when it is not a Vec of
+/// integers or bools. Words (i64/u64) have code word 0.
+fn cg_vec_elem_c(func: IrFunction, v: i64) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    match value_ty_for_id(func, v) {
+        IrType::Generic(n, targs) => {
+            if n != "Vec" || targs.len() != 1 { return out; }
+            var ct: str = "";
+            var cw: str = "";
+            match targs.get(0) {
+                IrType::U8 => { ct = "uint8_t"; cw = "(P_VEC_TAG_C + 9)"; }
+                IrType::Bool => { ct = "uint8_t"; cw = "(P_VEC_TAG_C + 9)"; }
+                IrType::I8 => { ct = "int8_t"; cw = "(P_VEC_TAG_C + 7)"; }
+                IrType::U16 => { ct = "uint16_t"; cw = "(P_VEC_TAG_C + 10)"; }
+                IrType::I16 => { ct = "int16_t"; cw = "(P_VEC_TAG_C + 6)"; }
+                IrType::U32 => { ct = "uint32_t"; cw = "(P_VEC_TAG_C + 12)"; }
+                IrType::I32 => { ct = "int32_t"; cw = "(P_VEC_TAG_C + 4)"; }
+                IrType::I64 => { ct = "int64_t"; cw = "0"; }
+                IrType::U64 => { ct = "int64_t"; cw = "0"; }
+                _ => { return out; }
+            }
+            out.push(ct);
+            out.push(cw);
+        }
+        _ => {}
+    }
+    return out;
+}
+
+/// Vec_get/Vec_set/Vec_push on a Vec of integers or bools, inline at the
+/// element size the IR type says. The fast path checks the Vec really is
+/// stored that way (its code word), is not shared (capacity >= 0) and owns
+/// no elements (+32 zero) for a write, and the index is in bounds (unless a
+/// counted loop proved it); anything else calls core's function, which
+/// behaves the same and panics where it must. True when generated.
+fn cg_inline_typed_vec(self: &mut CCodeGen, func: IrFunction, fname: str, c_fname: str, id: i64, args: Vec<i64>) -> bool {
+    var et: Vec<str> = cg_vec_elem_c(func, args.get(1));
+    if et.len() != 2 { return false; }
+    var ct: str = et.get(0);
+    var cw: str = et.get(1);
+    var env: str = "(void*)" + val_name(self, args.get(0));
+    var hv: str = "(int64_t)(intptr_t)" + val_name(self, args.get(1));
+    var hp: str = "((int64_t*)(intptr_t)" + val_name(self, args.get(1)) + ")";
+    var dataw: str = "((" + ct + "*)(intptr_t)" + hp + "[0])";
+    var checked: bool = !cg_unchecked(self, id);
+    if fname == "Vec_get" {
+        var iv: str = "(int64_t)" + val_name(self, args.get(2));
+        var cond: str = hp + "[3] == " + cw;
+        if checked { cond = cond + " && (uint64_t)" + iv + " < (uint64_t)" + hp + "[1]"; }
+        var dst: str = val_name(self, id);
+        wln(self, "    if (P_LIKELY_C(" + cond + ")) " + dst + " = " + dataw + "[" + iv + "];");
+        wln(self, "    else " + dst + " = Vec_get(" + env + ", " + hv + ", " + iv + ");");
+        return true;
+    }
+    if fname == "Vec_set" {
+        var iv2: str = "(int64_t)" + val_name(self, args.get(2));
+        var xv: str = "(int64_t)" + val_name(self, args.get(3));
+        var cond2: str = hp + "[3] == " + cw + " && " + hp + "[2] >= 0 && " + hp + "[4] == 0";
+        if checked { cond2 = cond2 + " && (uint64_t)" + iv2 + " < (uint64_t)" + hp + "[1]"; }
+        wln(self, "    if (P_LIKELY_C(" + cond2 + ")) " + dataw + "[" + iv2 + "] = (" + ct + ")" + xv + ";");
+        wln(self, "    else Vec_set(" + env + ", " + hv + ", " + iv2 + ", " + xv + ");");
+        return true;
+    }
+    // push: room in an unshared buffer (a shared one has a negative capacity)
+    var pv: str = "(int64_t)" + val_name(self, args.get(2));
+    wln(self, "    { int64_t __pl = " + hp + "[1];");
+    wln(self, "      if (P_LIKELY_C(" + hp + "[3] == " + cw + " && " + hp + "[4] == 0 && __pl < " + hp + "[2])) { " + dataw + "[__pl] = (" + ct + ")" + pv + "; " + hp + "[1] = __pl + 1; }");
+    wln(self, "      else Vec_push(" + env + ", " + hv + ", " + pv + "); }");
+    return true;
 }
 
 fn cg_unchecked(self: &CCodeGen, id: i64) -> bool {
@@ -3210,6 +3298,13 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                 // Vec_set stays core's: it drops the old element (proposal 0004)
                 if fname == "p_vec_get" { c_fname = "__p_pvec_get_u"; }
                 if fname == "p_vec_set" { c_fname = "__p_pvec_set_u"; }
+            }
+            // A Vec of integers or bools whose element type the call site
+            // knows: get/set/push inline at that size, the call to core only
+            // when the Vec is not stored that way, is shared or owns its
+            // elements, or the index is out of bounds (core panics)
+            if (fname == "Vec_get" && args.len() == 3) || (fname == "Vec_set" && args.len() == 4) || (fname == "Vec_push" && args.len() == 3) {
+                if cg_inline_typed_vec(self, func, fname, c_fname, id, args) { return; }
             }
 
             // Special-case: print is polymorphic - dispatch based on arg type

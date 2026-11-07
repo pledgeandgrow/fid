@@ -493,7 +493,7 @@ cargo build --release
 
 ```bash
 #!/bin/bash
-cd /path/to/p-lang
+cd /path/to/fid
 pass=0; fail=0
 for f in tests/*.fd; do
     name=$(basename "$f" .fd)

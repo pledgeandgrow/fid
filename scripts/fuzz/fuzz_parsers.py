@@ -111,6 +111,14 @@ def main():
         per[which] += 1
         if rc == 0:
             continue
+        # a finding must happen again (an OOM can be the machine's)
+        try:
+            q2 = subprocess.run([exe, which, inp], capture_output=True, timeout=a.timeout)
+            if q2.returncode == 0:
+                print(f"[{i}] {which}: not reproducible (exit {rc}), dropped", flush=True)
+                continue
+        except subprocess.TimeoutExpired:
+            pass
         first = next((l for l in out.split("\n") if "Panic" in l or "CRASH" in l or "overflow" in l), out[:80])
         first = re.sub(r"\d+", "N", first.strip())[:100]
         key = f"{which}: {rc if isinstance(rc, str) else 'exit ' + hex(rc & 0xFFFFFFFF)}: {first}"

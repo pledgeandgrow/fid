@@ -687,7 +687,7 @@ See `docs/reference/syntax.md` for the complete syntax specification.
 ## Project Structure
 
 ```
-p-lang/
+fid/
 ├── compiler/               # 63 self-hosted Fides modules (~142K lines) — THE COMPILER
 │   ├── main.fd             # CLI entry point (command dispatch)
 │   ├── lexer.fd / parser.fd / ast.fd / token.fd   # Front end

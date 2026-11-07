@@ -3,10 +3,10 @@
 // Two layers:
 //   regex_matches(s, pat) — simple wildcard match (? one char, * any run),
 //     unchanged from before; also used by fs.glob.
-//   regex_match(s, re)    — a real (small) backtracking regex engine in
-//     pure Fides: literals, '.', classes [abc][a-z][^x], escapes \d \w \s
-//     \n \t \\ \. …, quantifiers * + ? {n} {n,} {n,m}, anchors ^ $,
-//     alternation a|b, grouping ( ).
+//   regex_match(s, re)    — a regex engine in pure Fides, linear in the
+//     input (a Pike VM, no backtracking): literals, '.', classes [abc] [a-z]
+//     [^x], escapes \d \w \s \n \t \\ \. …, quantifiers * + ? {n} {n,} {n,m},
+//     anchors ^ $, alternation a|b (inside groups too), grouping ( ).
 // Plus find/replace/split helpers built on the engine.
 //
 // Usage:
@@ -27,7 +27,8 @@ pub fn regex_matches(s: str, pattern: str) -> bool {
 }
 
 // ─── Real regex engine ──────────────────────────────────────────────────
-// Compiled pattern is a flat Vec of tokens, 5 slots each:
+// (The backtracking engine's token layout, kept for its helpers; the Pike
+// VM below shares the class, escape and {n,m} parsing.) Tokens, 5 slots:
 //   [kind, arg, min, max, -]
 //   kind 0 = literal byte          arg = byte
 //   kind 1 = '.'                   arg = 0
@@ -235,291 +236,365 @@ fn rx_parse_brace(re: str, i: i64, out3: &mut Vec<i64>) -> bool {
     return true;
 }
 
-// Recursive-descent compile of one sequence level. Returns the index of
-// the char that stopped parsing (')' or '|' or end of string), or -1 on
-// error. '|' at depth > 0 is an error (alternation inside groups is not
-// supported — split at top level instead).
-fn rx_compile_level(re: str, i: i64, toks: &mut Vec<i64>, cls: &mut Vec<i64>, depth: i64) -> i64 {
-    var n: i64 = str_len(re);
-    var j: i64 = i;
+// ─── The engine: a Pike VM (Thompson NFA) ───────────────────────────────
+// Linear in the input (competitive SL7): every position of the subject is
+// read once, against at most one thread per instruction, so no pattern
+// takes exponential time ((a?){30}a{30} on 30 a's is instant).
+//
+// Each top-level alternative compiles to its own program of instructions,
+// three words each [op, x, y], stored in r.toks; r.progs holds each
+// program's entry. Matching is leftmost; at the leftmost start the first
+// alternative that matches wins, and within it the longest match (as the
+// backtracking engine before it did). Alternation inside groups works too.
+
+const RV_CHAR: i64 = 0;   // x = byte
+const RV_ANY: i64 = 1;    // any byte but '\n'
+const RV_CLASS: i64 = 2;  // x = class bitmap offset
+const RV_BOL: i64 = 3;
+const RV_EOL: i64 = 4;
+const RV_SPLIT: i64 = 5;  // try x, then y
+const RV_JMP: i64 = 6;    // x
+const RV_MATCH: i64 = 7;
+
+/// Largest repeat count {n,m} expands to (each copy is code)
+const RV_MAX_REPEAT: i64 = 1000;
+
+fn rv_emit(p: &mut Vec<i64>, op: i64, x: i64, y: i64) -> i64 {
+    var pc: i64 = p.len() / 3;
+    p.push(op);
+    p.push(x);
+    p.push(y);
+    return pc;
+}
+
+fn rv_pc(p: &Vec<i64>) -> i64 {
+    return p.len() / 3;
+}
+
+fn rv_set_x(p: &mut Vec<i64>, pc: i64, x: i64) {
+    p.set(pc * 3 + 1, x);
+}
+
+fn rv_set_y(p: &mut Vec<i64>, pc: i64, y: i64) {
+    p.set(pc * 3 + 2, y);
+}
+
+/// Index past the ']' of the class whose body starts at j, or -1.
+fn rv_class_end(re: str, j0: i64, n: i64) -> i64 {
+    var j: i64 = j0;
+    if j < n && str_byte_at(re, j) == 94 { j = j + 1; }
+    var first: bool = true;
     while j < n {
         var c: i64 = str_byte_at(re, j);
-        if c == 41 {              // ')' — end this level
-            return j;
-        }
-        if c == 124 {             // '|'
-            if depth > 0 { return -1; }
-            return j;
-        }
-        if c == 40 {              // '(' — nested group
-            // marker first; the body tokens land right behind it
-            var mti: i64 = rx_ntoks(toks);
-            rx_tok_push(toks, RX_GROUP, 0, 1, 1);
-            var gend: i64 = rx_compile_level(re, j + 1, toks, cls, depth + 1);
-            if gend < 0 { return -1; }
-            if gend >= n || str_byte_at(re, gend) != 41 { return -1; }
-            rx_set_arg(toks, mti, rx_ntoks(toks));
-            j = gend + 1;
-            // quantifier on the group marker
-            var mn: i64 = 1;
-            var mx: i64 = 1;
-            if j < n {
-                var q: i64 = str_byte_at(re, j);
-                if q == 42 { mn = 0; mx = -1; j = j + 1; }
-                else if q == 43 { mn = 1; mx = -1; j = j + 1; }
-                else if q == 63 { mn = 0; mx = 1; j = j + 1; }
-                else if q == 123 {
-                    var gb: Vec<i64> = Vec::new();
-                    if rx_parse_brace(re, j + 1, &mut gb) {
-                        mn = gb.get(0);
-                        mx = gb.get(1);
-                        j = gb.get(2);
-                    }
-                }
-            }
-            toks.set(mti * 5 + 2, mn);
-            toks.set(mti * 5 + 3, mx);
-            continue;
-        }
-        var kind: i64 = RX_LIT;
-        var arg: i64 = c;
-        if c == 46 {              // '.'
-            kind = RX_DOT;
-            arg = 0;
-            j = j + 1;
-        } else if c == 94 {       // '^'
-            kind = RX_BOL;
-            arg = 0;
-            j = j + 1;
-        } else if c == 36 {       // '$'
-            kind = RX_EOL;
-            arg = 0;
-            j = j + 1;
-        } else if c == 91 {       // '[' class
-            var off: i64 = rx_new_cls(cls);
-            var cend: i64 = rx_parse_class(re, j + 1, cls, off);
-            if cend < 0 { return -1; }
-            kind = RX_CLASS;
-            arg = off;
-            j = cend;
-        } else if c == 92 {       // escape
-            if j + 1 >= n { return -1; }
-            var e: i64 = str_byte_at(re, j + 1);
-            var named: i64 = rx_escape_cls(e);
-            if named >= 0 {
-                var off2: i64 = rx_new_cls(cls);
-                rx_cls_apply_named(cls, off2, named);
-                kind = RX_CLASS;
-                arg = off2;
-            } else {
-                kind = RX_LIT;
-                arg = rx_escape_lit(e);
-            }
-            j = j + 2;
-        } else {
-            j = j + 1;
-        }
-        // quantifier
-        var mn: i64 = 1;
-        var mx: i64 = 1;
-        if j < n {
-            var q: i64 = str_byte_at(re, j);
-            if q == 42 { mn = 0; mx = -1; j = j + 1; }
-            else if q == 43 { mn = 1; mx = -1; j = j + 1; }
-            else if q == 63 { mn = 0; mx = 1; j = j + 1; }
-            else if q == 123 {
-                var b3: Vec<i64> = Vec::new();
-                if rx_parse_brace(re, j + 1, &mut b3) {
-                    mn = b3.get(0);
-                    mx = b3.get(1);
-                    j = b3.get(2);
-                }
-            }
-        }
-        rx_tok_push(toks, kind, arg, mn, mx);
-    }
-    return j;
-}
-
-/// Compile `re` into a Regex. `ok` is false on malformed patterns —
-/// regex_match on !ok patterns returns false.
-pub fn regex_compile(re: str) -> Regex {
-    var r: Regex = Regex { toks: Vec::new(), cls: Vec::new(), progs: Vec::new(), ok: false };
-    var i: i64 = 0;
-    var n: i64 = str_len(re);
-    while true {
-        var start: i64 = rx_ntoks(r.toks);
-        var end: i64 = rx_compile_level(re, i, &mut r.toks, &mut r.cls, 0);
-        if end < 0 { return r; }
-        r.progs.push(start);
-        r.progs.push(rx_ntoks(r.toks));
-        if end >= n {
-            r.ok = true;
-            return r;
-        }
-        if str_byte_at(re, end) == 124 {
-            i = end + 1;
-            continue;
-        }
-        if str_byte_at(re, end) == 41 {
-            // unbalanced ')'
-            return r;
-        }
-        return r;
-    }
-    return r;
-}
-
-// One single-character atom (literal, '.', class) at `pos` → pos+1 or -1.
-fn rx_atom(r: Regex, s: str, ti: i64, pos: i64) -> i64 {
-    var n: i64 = str_len(s);
-    if pos >= n { return -1; }
-    var kind: i64 = rx_tok(r.toks, ti);
-    var arg: i64 = rx_arg(r.toks, ti);
-    var ch: i64 = str_byte_at(s, pos);
-    if kind == RX_LIT {
-        if ch == arg { return pos + 1; }
-        return -1;
-    }
-    if kind == RX_DOT {
-        if ch != 10 { return pos + 1; }
-        return -1;
-    }
-    if kind == RX_CLASS {
-        if rx_cls_get(r.cls, arg, ch & 255) { return pos + 1; }
-        return -1;
+        if c == 93 && !first { return j + 1; }
+        first = false;
+        if c == 92 { j = j + 2; } else { j = j + 1; }
     }
     return -1;
 }
 
-fn rx_has(v: Vec<i64>, x: i64) -> bool {
-    var i: i64 = 0;
-    while i < v.len() {
-        if v.get(i) == x { return true; }
-        i = i + 1;
+/// Index past the atom that starts at i (before any quantifier), or -1.
+fn rv_atom_end(re: str, i: i64, n: i64) -> i64 {
+    if i >= n { return -1; }
+    var c: i64 = str_byte_at(re, i);
+    if c == 40 {
+        var j: i64 = i + 1;
+        var d: i64 = 1;
+        while j < n {
+            var ch: i64 = str_byte_at(re, j);
+            if ch == 92 { j = j + 2; continue; }
+            if ch == 91 {
+                j = rv_class_end(re, j + 1, n);
+                if j < 0 { return -1; }
+                continue;
+            }
+            if ch == 40 { d = d + 1; }
+            if ch == 41 {
+                d = d - 1;
+                if d == 0 { return j + 1; }
+            }
+            j = j + 1;
+        }
+        return -1;
     }
-    return false;
+    if c == 91 { return rv_class_end(re, i + 1, n); }
+    if c == 92 {
+        if i + 1 < n { return i + 2; }
+        return -1;
+    }
+    if c == 41 || c == 124 || c == 42 || c == 43 || c == 63 { return -1; }
+    return i + 1;
 }
 
-fn rx_add(v: &mut Vec<i64>, x: i64) -> void {
-    if !rx_has(v, x) { v.push(x); }
-}
-
-// Every end position reachable by matching token range [ti, tend) against
-// s at si (distinct values, any order). Working with the whole set of ends
-// lets a group's body give back characters to what follows it, e.g.
-// "(a*)ab" on "aab", and lets regex_match look for an end at str_len(s).
-fn rx_all(r: Regex, s: str, ti: i64, tend: i64, si: i64) -> Vec<i64> {
+/// Positions of the '|' at the top level of re[i..end)
+fn rv_bars(re: str, i: i64, end: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
-    if ti >= tend {
-        out.push(si);
-        return out;
-    }
-    var kind: i64 = rx_tok(r.toks, ti);
-    var arg: i64 = rx_arg(r.toks, ti);
-    var mn: i64 = rx_min(r.toks, ti);
-    var mx: i64 = rx_max(r.toks, ti);
-    var n: i64 = str_len(s);
-
-    // zero-width anchors
-    if kind == RX_BOL {
-        if si == 0 { return rx_all(r, s, ti + 1, tend, si); }
-        return out;
-    }
-    if kind == RX_EOL {
-        if si == n { return rx_all(r, s, ti + 1, tend, si); }
-        return out;
-    }
-
-    // the outer sequence continues after the group's body for GROUP
-    var next_ti: i64 = ti + 1;
-    if kind == RX_GROUP { next_ti = arg; }
-    var limit: i64 = mx;
-    if limit < 0 { limit = n + 1; }
-
-    // level = positions after `reps` repetitions; `starts` = positions
-    // after an allowed number of repetitions (mn..mx)
-    var starts: Vec<i64> = Vec::new();
-    var level: Vec<i64> = Vec::new();
-    level.push(si);
-    var reps: i64 = 0;
-    while true {
-        if reps >= mn {
-            var a: i64 = 0;
-            while a < level.len() {
-                rx_add(&mut starts, level.get(a));
-                a = a + 1;
-            }
+    var j: i64 = i;
+    var d: i64 = 0;
+    while j < end {
+        var c: i64 = str_byte_at(re, j);
+        if c == 92 { j = j + 2; continue; }
+        if c == 91 {
+            var k: i64 = rv_class_end(re, j + 1, end);
+            if k < 0 { return out; }
+            j = k;
+            continue;
         }
-        if reps >= limit || level.len() == 0 { break; }
-        var nxt: Vec<i64> = Vec::new();
-        var b: i64 = 0;
-        while b < level.len() {
-            var p: i64 = level.get(b);
-            if kind == RX_GROUP {
-                var ends: Vec<i64> = rx_all(r, s, ti + 1, arg, p);
-                var c: i64 = 0;
-                while c < ends.len() {
-                    var e: i64 = ends.get(c);
-                    // past the minimum, a repetition must make progress
-                    // and need not revisit a position already reached
-                    if reps < mn || (e != p && !rx_has(starts, e)) {
-                        rx_add(&mut nxt, e);
-                    }
-                    c = c + 1;
-                }
-            } else {
-                var e1: i64 = rx_atom(r, s, ti, p);
-                if e1 >= 0 { rx_add(&mut nxt, e1); }
-            }
-            b = b + 1;
-        }
-        level = nxt;
-        reps = reps + 1;
-    }
-
-    var k: i64 = 0;
-    while k < starts.len() {
-        var rest: Vec<i64> = rx_all(r, s, next_ti, tend, starts.get(k));
-        var m: i64 = 0;
-        while m < rest.len() {
-            rx_add(&mut out, rest.get(m));
-            m = m + 1;
-        }
-        k = k + 1;
+        if c == 40 { d = d + 1; }
+        if c == 41 { d = d - 1; }
+        if c == 124 && d == 0 { out.push(j); }
+        j = j + 1;
     }
     return out;
 }
 
-/// Match compiled regex `r` starting at position `si` → end position or -1.
-/// Tries each top-level alternative (pattern split on '|') left to right;
-/// the first alternative that matches gives its longest match.
-fn rx_match_at(r: Regex, s: str, si: i64) -> i64 {
-    var p: i64 = 0;
-    while p < r.progs.len() {
-        var ends: Vec<i64> = rx_all(r, s, r.progs.get(p), r.progs.get(p + 1), si);
-        var best: i64 = -1;
-        var i: i64 = 0;
-        while i < ends.len() {
-            if ends.get(i) > best { best = ends.get(i); }
-            i = i + 1;
-        }
-        if best >= 0 { return best; }
-        p = p + 2;
+/// Code for the single atom re[j..aj)
+fn rv_atom(re: str, j: i64, aj: i64, p: &mut Vec<i64>, cls: &mut Vec<i64>, depth: i64) -> bool {
+    if depth > 200 { return false; }
+    var c: i64 = str_byte_at(re, j);
+    if c == 40 { return rv_alt(re, j + 1, aj - 1, p, cls, depth + 1); }
+    if c == 91 {
+        var off: i64 = rx_new_cls(cls);
+        if rx_parse_class(re, j + 1, cls, off) < 0 { return false; }
+        rv_emit(p, RV_CLASS, off, 0);
+        return true;
     }
-    return -1;
+    if c == 46 { rv_emit(p, RV_ANY, 0, 0); return true; }
+    if c == 94 { rv_emit(p, RV_BOL, 0, 0); return true; }
+    if c == 36 { rv_emit(p, RV_EOL, 0, 0); return true; }
+    if c == 92 {
+        var e: i64 = str_byte_at(re, j + 1);
+        var named: i64 = rx_escape_cls(e);
+        if named >= 0 {
+            var off2: i64 = rx_new_cls(cls);
+            rx_cls_apply_named(cls, off2, named);
+            rv_emit(p, RV_CLASS, off2, 0);
+        } else {
+            rv_emit(p, RV_CHAR, rx_escape_lit(e) & 255, 0);
+        }
+        return true;
+    }
+    rv_emit(p, RV_CHAR, c & 255, 0);
+    return true;
 }
 
-/// True when `s` fully matches `re` (anchors implied at both ends):
-/// some alternative must be able to end exactly at the end of `s`.
+/// Code for the sequence re[i..end): atoms and their quantifiers
+fn rv_seq(re: str, i: i64, end: i64, p: &mut Vec<i64>, cls: &mut Vec<i64>, depth: i64) -> bool {
+    var j: i64 = i;
+    var b3: Vec<i64> = Vec::new();
+    while j < end {
+        var aj: i64 = rv_atom_end(re, j, end);
+        if aj < 0 { return false; }
+        var q: i64 = aj;
+        var mn: i64 = 1;
+        var mx: i64 = 1;
+        if aj < end {
+            var qc: i64 = str_byte_at(re, aj);
+            if qc == 42 { mn = 0; mx = -1; q = aj + 1; }
+            else if qc == 43 { mn = 1; mx = -1; q = aj + 1; }
+            else if qc == 63 { mn = 0; mx = 1; q = aj + 1; }
+            else if qc == 123 {
+                b3.clear();
+                if rx_parse_brace(re, aj + 1, &mut b3) && b3.get(2) <= end {
+                    mn = b3.get(0);
+                    mx = b3.get(1);
+                    q = b3.get(2);
+                }
+            }
+        }
+        if mn > RV_MAX_REPEAT || mx > RV_MAX_REPEAT || (mx >= 0 && mx < mn) { return false; }
+        var k: i64 = 0;
+        while k < mn {
+            if !rv_atom(re, j, aj, p, cls, depth) { return false; }
+            k = k + 1;
+        }
+        if mx < 0 {
+            // x*: L: split(body, out); body; jmp L
+            var l0: i64 = rv_emit(p, RV_SPLIT, 0, 0);
+            rv_set_x(p, l0, l0 + 1);
+            if !rv_atom(re, j, aj, p, cls, depth) { return false; }
+            rv_emit(p, RV_JMP, l0, 0);
+            rv_set_y(p, l0, rv_pc(p));
+        } else {
+            k = mn;
+            while k < mx {
+                // x?: split(body, out); body
+                var l1: i64 = rv_emit(p, RV_SPLIT, 0, 0);
+                rv_set_x(p, l1, l1 + 1);
+                if !rv_atom(re, j, aj, p, cls, depth) { return false; }
+                rv_set_y(p, l1, rv_pc(p));
+                k = k + 1;
+            }
+        }
+        j = q;
+    }
+    return true;
+}
+
+/// Code for alternatives re[i..end) separated by '|'
+fn rv_alt(re: str, i: i64, end: i64, p: &mut Vec<i64>, cls: &mut Vec<i64>, depth: i64) -> bool {
+    var bars: Vec<i64> = rv_bars(re, i, end);
+    if bars.len() == 0 { return rv_seq(re, i, end, p, cls, depth); }
+    var jumps: Vec<i64> = Vec::new();
+    var s0: i64 = i;
+    var k: i64 = 0;
+    while k < bars.len() {
+        var sp: i64 = rv_emit(p, RV_SPLIT, 0, 0);
+        rv_set_x(p, sp, sp + 1);
+        if !rv_seq(re, s0, bars.get(k), p, cls, depth) { return false; }
+        jumps.push(rv_emit(p, RV_JMP, 0, 0));
+        rv_set_y(p, sp, rv_pc(p));
+        s0 = bars.get(k) + 1;
+        k = k + 1;
+    }
+    if !rv_seq(re, s0, end, p, cls, depth) { return false; }
+    k = 0;
+    while k < jumps.len() {
+        rv_set_x(p, jumps.get(k), rv_pc(p));
+        k = k + 1;
+    }
+    return true;
+}
+
+pub fn regex_compile(re: str) -> Regex {
+    var r: Regex = Regex { toks: Vec::new(), cls: Vec::new(), progs: Vec::new(), ok: false };
+    var n: i64 = str_len(re);
+    var bars: Vec<i64> = rv_bars(re, 0, n);
+    var s0: i64 = 0;
+    var k: i64 = 0;
+    while k <= bars.len() {
+        var e: i64 = n;
+        if k < bars.len() { e = bars.get(k); }
+        r.progs.push(rv_pc(&r.toks));
+        if !rv_seq(re, s0, e, &mut r.toks, &mut r.cls, 0) { return r; }
+        rv_emit(&mut r.toks, RV_MATCH, 0, 0);
+        s0 = e + 1;
+        k = k + 1;
+    }
+    r.ok = true;
+    return r;
+}
+
+/// Add the thread (pc, st) and what it reaches without reading (jumps,
+/// splits, anchors that hold at `pos`) to the list, once per instruction.
+fn rv_add(r: &Regex, pcs: &mut Vec<i64>, sts: &mut Vec<i64>, mark: &mut Vec<i64>, gen: i64, pc0: i64, st: i64, pos: i64, n: i64, stack: &mut Vec<i64>) {
+    stack.clear();
+    stack.push(pc0);
+    while stack.len() > 0 {
+        var pc: i64 = stack.pop();
+        if mark.get(pc) == gen { continue; }
+        mark.set(pc, gen);
+        var op: i64 = r.toks.get(pc * 3);
+        if op == RV_JMP {
+            stack.push(r.toks.get(pc * 3 + 1));
+        } else if op == RV_SPLIT {
+            // x first: push y below it
+            stack.push(r.toks.get(pc * 3 + 2));
+            stack.push(r.toks.get(pc * 3 + 1));
+        } else if op == RV_BOL {
+            if pos == 0 { stack.push(pc + 1); }
+        } else if op == RV_EOL {
+            if pos == n { stack.push(pc + 1); }
+        } else {
+            pcs.push(pc);
+            sts.push(st);
+        }
+    }
+}
+
+/// The leftmost-longest match of the program at `entry` in s, starting at
+/// `from` (only there when `anchored`; ending only at the end when
+/// `whole`): [start, end], or [-1, -1].
+fn rv_run(r: &Regex, entry: i64, s: str, from: i64, anchored: bool, whole: bool) -> Vec<i64> {
+    var n: i64 = str_len(s);
+    var ninst: i64 = r.toks.len() / 3;
+    var mark: Vec<i64> = Vec::new();
+    while mark.len() < ninst { mark.push(-1); }
+    var cp: Vec<i64> = Vec::new();
+    var cs: Vec<i64> = Vec::new();
+    var np: Vec<i64> = Vec::new();
+    var ns: Vec<i64> = Vec::new();
+    var stack: Vec<i64> = Vec::new();
+    var gen: i64 = 0;
+    var best_s: i64 = -1;
+    var best_e: i64 = -1;
+    rv_add(r, &mut cp, &mut cs, &mut mark, gen, entry, from, from, n, &mut stack);
+    var i: i64 = from;
+    while true {
+        gen = gen + 1;
+        np.clear();
+        ns.clear();
+        var c: i64 = -1;
+        if i < n { c = str_byte_at(s, i); }
+        var t: i64 = 0;
+        while t < cp.len() {
+            var pc: i64 = cp.get(t);
+            var st: i64 = cs.get(t);
+            t = t + 1;
+            if best_s >= 0 && st > best_s { continue; }
+            var op: i64 = r.toks.get(pc * 3);
+            if op == RV_MATCH {
+                if whole && i != n { continue; }
+                if best_s < 0 || st < best_s || (st == best_s && i > best_e) {
+                    best_s = st;
+                    best_e = i;
+                }
+                continue;
+            }
+            if c < 0 { continue; }
+            var ok: bool = false;
+            if op == RV_CHAR { ok = c == r.toks.get(pc * 3 + 1); }
+            else if op == RV_ANY { ok = c != 10; }
+            else if op == RV_CLASS { ok = rx_cls_get(r.cls, r.toks.get(pc * 3 + 1), c & 255); }
+            if ok { rv_add(r, &mut np, &mut ns, &mut mark, gen, pc + 1, st, i + 1, n, &mut stack); }
+        }
+        if i >= n { break; }
+        i = i + 1;
+        // a new start here, last in priority, while nothing has matched
+        if !anchored && best_s < 0 { rv_add(r, &mut np, &mut ns, &mut mark, gen, entry, i, i, n, &mut stack); }
+        if np.len() == 0 { break; }
+        var tp: Vec<i64> = cp;
+        cp = np;
+        np = tp;
+        var ts: Vec<i64> = cs;
+        cs = ns;
+        ns = ts;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(best_s);
+    out.push(best_e);
+    return out;
+}
+
+/// The first match at or after `from`, the earliest start winning and, at
+/// one start, the first alternative: [start, end] or [-1, -1].
+fn rv_find(r: &Regex, s: str, from: i64) -> Vec<i64> {
+    var bs: i64 = -1;
+    var be: i64 = -1;
+    var a: i64 = 0;
+    while a < r.progs.len() {
+        var m: Vec<i64> = rv_run(r, r.progs.get(a), s, from, false, false);
+        if m.get(0) >= 0 && (bs < 0 || m.get(0) < bs) {
+            bs = m.get(0);
+            be = m.get(1);
+        }
+        a = a + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(bs);
+    out.push(be);
+    return out;
+}
+
+/// True when `s` fully matches `re` (anchors implied at both ends).
 pub fn regex_match(s: str, re: str) -> bool {
     var r: Regex = regex_compile(re);
     if !r.ok { return false; }
-    var p: i64 = 0;
-    while p < r.progs.len() {
-        var ends: Vec<i64> = rx_all(r, s, r.progs.get(p), r.progs.get(p + 1), 0);
-        if rx_has(ends, str_len(s)) { return true; }
-        p = p + 2;
+    var a: i64 = 0;
+    while a < r.progs.len() {
+        var m: Vec<i64> = rv_run(&r, r.progs.get(a), s, 0, true, true);
+        if m.get(0) >= 0 { return true; }
+        a = a + 1;
     }
     return false;
 }
@@ -533,37 +608,19 @@ pub fn regex_search(s: str, re: str) -> bool {
 pub fn regex_find_re(s: str, re: str) -> i64 {
     var r: Regex = regex_compile(re);
     if !r.ok { return -1; }
-    var i: i64 = 0;
-    while i <= str_len(s) {
-        var e: i64 = rx_match_at(r, s, i);
-        if e >= 0 { return i; }
-        i = i + 1;
-    }
-    return -1;
+    return rv_find(&r, s, 0).get(0);
 }
 
 /// First match position and end, packed [start, end] in a Vec; [-1,-1] if none.
 pub fn regex_find_span(s: str, re: str) -> Vec<i64> {
-    var out: Vec<i64> = Vec::new();
     var r: Regex = regex_compile(re);
     if !r.ok {
-        out.push(-1);
-        out.push(-1);
-        return out;
+        var bad: Vec<i64> = Vec::new();
+        bad.push(-1);
+        bad.push(-1);
+        return bad;
     }
-    var i: i64 = 0;
-    while i <= str_len(s) {
-        var e: i64 = rx_match_at(r, s, i);
-        if e >= 0 {
-            out.push(i);
-            out.push(e);
-            return out;
-        }
-        i = i + 1;
-    }
-    out.push(-1);
-    out.push(-1);
-    return out;
+    return rv_find(&r, s, 0);
 }
 
 /// Replace every match of `re` in `s` with `rep` (literal text).
@@ -573,20 +630,10 @@ pub fn regex_replace(s: str, re: str, rep: str) -> str {
     var out: str = "";
     var i: i64 = 0;
     var n: i64 = str_len(s);
-    var rounds: i64 = 0;
-    while i <= n && rounds <= n {
-        var j: i64 = i;
-        var found: i64 = -1;
-        var fend: i64 = -1;
-        while j <= n {
-            var e: i64 = rx_match_at(r, s, j);
-            if e >= 0 {
-                found = j;
-                fend = e;
-                break;
-            }
-            j = j + 1;
-        }
+    while i <= n {
+        var m: Vec<i64> = rv_find(&r, s, i);
+        var found: i64 = m.get(0);
+        var fend: i64 = m.get(1);
         if found < 0 {
             out = out + str_slice(s, i, n);
             return out;
@@ -601,7 +648,6 @@ pub fn regex_replace(s: str, re: str, rep: str) -> str {
         } else {
             i = fend;
         }
-        rounds = rounds + 1;
     }
     return out;
 }
@@ -616,20 +662,10 @@ pub fn regex_split(s: str, re: str) -> Vec<str> {
     }
     var i: i64 = 0;
     var n: i64 = str_len(s);
-    var rounds: i64 = 0;
-    while i <= n && rounds <= n {
-        var j: i64 = i;
-        var found: i64 = -1;
-        var fend: i64 = -1;
-        while j <= n {
-            var e: i64 = rx_match_at(r, s, j);
-            if e >= 0 {
-                found = j;
-                fend = e;
-                break;
-            }
-            j = j + 1;
-        }
+    while i <= n {
+        var m: Vec<i64> = rv_find(&r, s, i);
+        var found: i64 = m.get(0);
+        var fend: i64 = m.get(1);
         if found < 0 {
             out.push(str_slice(s, i, n));
             return out;
@@ -640,7 +676,6 @@ pub fn regex_split(s: str, re: str) -> Vec<str> {
         } else {
             i = fend;
         }
-        rounds = rounds + 1;
     }
     return out;
 }

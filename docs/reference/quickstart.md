@@ -5,7 +5,7 @@
 ### Windows (recommended)
 
 1. Download `Fides-Setup-1.0.0.exe` from the
-   [releases page](https://github.com/pledgeandgrow/p-lang/releases).
+   [releases page](https://github.com/pledgeandgrow/fid/releases).
 2. Run the installer.
 3. Open a new Command Prompt or PowerShell window.
 4. Verify installation:
@@ -25,8 +25,8 @@ and `veil.exe`; the commands below work the same with `fid` in place of
 ### Build from Source
 
 ```bash
-git clone https://github.com/pledgeandgrow/p-lang.git
-cd p-lang
+git clone https://github.com/pledgeandgrow/fid.git
+cd fid
 cargo build --release
 ```
 

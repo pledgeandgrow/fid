@@ -85,7 +85,7 @@ is v1.0.0, and the work since v1.0.0 is not yet in a release.
   behaviour, the new one, and what to do.
 - **Downloads** (ST10) come with `SHA256SUMS` and a signed build provenance
   attestation for each archive, checked with
-  `gh attestation verify <archive> --repo pledgeandgrow/p-lang`.
+  `gh attestation verify <archive> --repo pledgeandgrow/fid`.
 
 ## Changing the language
 

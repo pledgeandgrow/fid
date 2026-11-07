@@ -550,7 +550,10 @@ def c_results(csrc, work, seed, ccs):
             key = f"{cc}{opt}"
             if cc == "clang":
                 exe = os.path.join(work, f"{seed}-c{opt}.exe")
-                rc, out, err = run(["zig", "cc", opt, "-w", "-fno-sanitize=all", path, "-o", exe], 300)
+                for _ in range(3):  # zig's shared cache fails now and then under load
+                    rc, out, err = run(["zig", "cc", opt, "-w", "-fno-sanitize=all", path, "-o", exe], 300)
+                    if rc == 0:
+                        break
                 if rc != 0:
                     res[key] = ("cc-failed", err[:2000])
                     continue

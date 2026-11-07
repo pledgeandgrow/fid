@@ -91,8 +91,10 @@ def mutate(r, src, corpus):
     return src[:i] + chr(r.choice([0, 1, 9, 10, 13, 34, 39, 92, 123, 125, 127, 0xe9, 0x2028])) + src[i:]
 
 
-CRASH_MARKS = ("=== CRASH", "Access violation", "Stack overflow", "stack overflow",
-               "Panic:", "panicked", "Segmentation fault", "out of memory")
+# "stack overflow" in lower case is also a diagnostic of @no-recursion, so
+# only the runtime's own messages count
+CRASH_MARKS = ("=== CRASH", "Access violation", "Stack overflow: the recursion",
+               "Panic:", "Segmentation fault", "p_malloc: OOM")
 
 
 def classify(rc, out):
@@ -154,10 +156,19 @@ def main():
         rc, out = run(cmd, a.timeout)
         kind = classify(rc, out)
         if kind:
+            # a finding must happen again (an OOM can be the machine's)
+            rc2, out2 = run(cmd, a.timeout)
+            if not classify(rc2, out2):
+                print(f"[{i}] not reproducible ({kind}), dropped", flush=True)
+                kind = None
+        if kind:
             # the first line that names the problem is the key
             key = kind + ":" + next((l for l in out.split("\n") if any(m in l for m in CRASH_MARKS)), "")[:80]
-            trace = re.findall(r"(?:→|↳ called from|-)\s+([A-Za-z_][A-Za-z0-9_]*)", out)
-            key += ":" + "/".join(trace[:3])
+            if "Stack overflow" not in key:
+                # one bug per place in the compiler; a stack overflow from
+                # deep nesting is one bug wherever the recursion is
+                trace = re.findall(r"(?:→|↳ called from)\s+([A-Za-z_][A-Za-z0-9_]*)", out)
+                key += ":" + "/".join(trace[:3])
             if key not in finds:
                 n = len(finds)
                 finds[key] = n

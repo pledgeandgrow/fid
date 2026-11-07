@@ -11,7 +11,7 @@
 !define VERSION "1.0.0"
 !define PRODUCT_NAME "Fides"
 !define PRODUCT_PUBLISHER "Pledge & Grow"
-!define PRODUCT_URL "https://github.com/pledgeandgrow/p-lang"
+!define PRODUCT_URL "https://github.com/pledgeandgrow/fid"
 !define PRODUCT_REGKEY "Software\Fides"
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Fides"
 !define ENV_HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"

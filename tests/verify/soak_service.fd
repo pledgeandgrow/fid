@@ -1,0 +1,63 @@
+// Soak workload (roadmap VF16; scripts/verify/soak.py). A request handler
+// in a loop: parse an HTTP request head, read a JSON body, build a JSON
+// reply, keep a bounded cache of replies (a HashMap with eviction) and a
+// bounded log (a Vec). Everything it allocates per request is finished with
+// by the next one, so its memory must stay flat however long it runs.
+//
+//   soak_service [requests]     (0 or nothing: run until killed)
+//
+// Every 10000 requests it prints the count and a checksum, which soak.py
+// reads as a heartbeat.
+
+use http;
+use json;
+
+fn soak_handle(i: i64, cache: &mut HashMap<str, str>, keys: &mut Vec<str>) -> i64 {
+    val id: i64 = i % 997;
+    val raw: str = "POST /api/item/" + int_to_str(id) + "?v=" + int_to_str(i % 13)
+        + " HTTP/1.1\r\nHost: soak.local\r\nContent-Type: application/json\r\nContent-Length: 30\r\n\r\n";
+    val req = http_parse_head(raw);
+    val body: str = "{\"id\": " + int_to_str(id) + ", \"name\": \"item" + int_to_str(id) + "\", \"n\": " + int_to_str(i % 100) + "}";
+    val n: i64 = json_get_int(body, "n", 0);
+    val name: str = json_get_str(body, "name");
+    val key: str = req.path + "#" + name;
+    var reply: str = "";
+    if cache.contains(key) {
+        reply = cache.get_or(key, "");
+    } else {
+        reply = "{\"path\": " + json_string(req.path) + ", \"name\": " + json_string(name) + ", \"double\": " + int_to_str(n * 2) + "}";
+        cache.insert(key, reply);
+        keys.push(key);
+        if keys.len() > 512 {
+            // evict the oldest half
+            var k2: Vec<str> = Vec::new();
+            var j: i64 = 0;
+            while j < keys.len() {
+                if j < 256 { cache.remove(keys.get(j)); } else { k2.push(keys.get(j)); }
+                j = j + 1;
+            }
+            keys.clear();
+            for k in k2 { keys.push(k); }
+        }
+    }
+    return str_len(reply) + n;
+}
+
+fn main() -> i64 {
+    var limit: i64 = 0;
+    val arg: str = arg_at(1) ?? "0";
+    limit = str_parse_int(arg);
+    var cache: HashMap<str, str> = HashMap::new();
+    var keys: Vec<str> = Vec::new();
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while limit == 0 || i < limit {
+        sum = (sum + soak_handle(i, &mut cache, &mut keys)) % 1000000007;
+        i = i + 1;
+        if i % 10000 == 0 {
+            println(int_to_str(i) + " " + int_to_str(sum) + " " + int_to_str(cache.len()));
+        }
+    }
+    println(sum);
+    return 0;
+}

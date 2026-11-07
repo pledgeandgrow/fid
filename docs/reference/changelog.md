@@ -1138,7 +1138,7 @@ for normal Fides programs.
 
 ### Architecture
 
-- **Language repo** (`p-lang/`): compiler, stdlib, runtime, tests, installer.
+- **Language repo** (`fid/`): compiler, stdlib, runtime, tests, installer.
 - **OS repo** (`fides-os/`): kernel modules, linker scripts, initrd builder.
 - OS modules (boot, ISR, framebuffer, keyboard, scheduler, VFS, PCI, ATA,
   ACPI, APIC, etc.) moved from `stdlib/` to `fides-os/kernel/`.
@@ -1146,7 +1146,7 @@ for normal Fides programs.
 ### Download
 
 - **Installer:** `Fides-Setup-1.0.0.exe` from
-  [GitHub Releases](https://github.com/pledgeandgrow/p-lang/releases/tag/v1.0.0)
+  [GitHub Releases](https://github.com/pledgeandgrow/fid/releases/tag/v1.0.0)
 - **From source:** `cargo build --release` then use
   `./target/release/fidesc` or build the self-hosted compiler.
 
