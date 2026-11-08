@@ -1,0 +1,383 @@
+// compiler/rules.fd — rewrite rules as data, and pure calls merged
+// (own-backend roadmap ME9, ME10, ME16, WP9).
+//
+// A rule matches an integer binary operation with a constant operand, or
+// with the same value on both sides, and gives the operation's result: the
+// other operand, a constant, or a boolean. Every rule here is exact under
+// the language's checked arithmetic: its left side never overflows, so
+// replacing it cannot remove or add a panic. A value replaced by another
+// becomes `BitCast(other, t, t)`, a move, so no use needs renaming.
+// `fid test-rules` checks each rule on edge and random values.
+//
+// Pure calls: two calls of the same program function with the same
+// arguments, no effects and a scalar result give the same value; the second
+// becomes a move from the first when the first's block dominates it (never
+// hoisted: a pure call may still panic).
+//
+// Switches: FID_NAT_OFF=rules, FID_NAT_OFF=purecse.
+
+module compiler::rules;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::iropt;
+
+// Operation codes of the rules
+const RU_ADD: i64 = 1;
+const RU_SUB: i64 = 2;
+const RU_MUL: i64 = 3;
+const RU_DIV: i64 = 4;
+const RU_AND: i64 = 5;
+const RU_OR: i64 = 6;
+const RU_XOR: i64 = 7;
+const RU_SHL: i64 = 8;
+const RU_SHR: i64 = 9;
+const RU_EQ: i64 = 10;
+const RU_NE: i64 = 11;
+const RU_LT: i64 = 12;
+const RU_LE: i64 = 13;
+const RU_GT: i64 = 14;
+const RU_GE: i64 = 15;
+
+// Shapes
+const RS_RIGHT: i64 = 0;   // x op c
+const RS_LEFT: i64 = 1;    // c op x
+const RS_SAME: i64 = 2;    // x op x
+
+// Results
+const RR_OTHER: i64 = 0;   // the operand that is not the constant (x)
+const RR_CONST: i64 = 1;   // the integer constant `rc`
+const RR_TRUE: i64 = 2;
+const RR_FALSE: i64 = 3;
+
+pub struct RuRule {
+    pub name: str,
+    pub op: i64,
+    pub shape: i64,
+    pub c: i64,
+    pub res: i64,
+    pub rc: i64,
+}
+
+fn ru(name: str, op: i64, shape: i64, c: i64, res: i64, rc: i64) -> RuRule {
+    return RuRule { name: name, op: op, shape: shape, c: c, res: res, rc: rc };
+}
+
+/// The rules, in the order they are tried.
+pub fn ru_rules() -> Vec<RuRule> {
+    var v: Vec<RuRule> = Vec::new();
+    v.push(ru("x + 0 = x", RU_ADD, RS_RIGHT, 0, RR_OTHER, 0));
+    v.push(ru("0 + x = x", RU_ADD, RS_LEFT, 0, RR_OTHER, 0));
+    v.push(ru("x - 0 = x", RU_SUB, RS_RIGHT, 0, RR_OTHER, 0));
+    v.push(ru("x - x = 0", RU_SUB, RS_SAME, 0, RR_CONST, 0));
+    v.push(ru("x * 1 = x", RU_MUL, RS_RIGHT, 1, RR_OTHER, 0));
+    v.push(ru("1 * x = x", RU_MUL, RS_LEFT, 1, RR_OTHER, 0));
+    v.push(ru("x * 0 = 0", RU_MUL, RS_RIGHT, 0, RR_CONST, 0));
+    v.push(ru("0 * x = 0", RU_MUL, RS_LEFT, 0, RR_CONST, 0));
+    v.push(ru("x / 1 = x", RU_DIV, RS_RIGHT, 1, RR_OTHER, 0));
+    v.push(ru("x & 0 = 0", RU_AND, RS_RIGHT, 0, RR_CONST, 0));
+    v.push(ru("0 & x = 0", RU_AND, RS_LEFT, 0, RR_CONST, 0));
+    v.push(ru("x & -1 = x", RU_AND, RS_RIGHT, 0 - 1, RR_OTHER, 0));
+    v.push(ru("x & x = x", RU_AND, RS_SAME, 0, RR_OTHER, 0));
+    v.push(ru("x | 0 = x", RU_OR, RS_RIGHT, 0, RR_OTHER, 0));
+    v.push(ru("0 | x = x", RU_OR, RS_LEFT, 0, RR_OTHER, 0));
+    v.push(ru("x | x = x", RU_OR, RS_SAME, 0, RR_OTHER, 0));
+    v.push(ru("x ^ 0 = x", RU_XOR, RS_RIGHT, 0, RR_OTHER, 0));
+    v.push(ru("0 ^ x = x", RU_XOR, RS_LEFT, 0, RR_OTHER, 0));
+    v.push(ru("x ^ x = 0", RU_XOR, RS_SAME, 0, RR_CONST, 0));
+    v.push(ru("x << 0 = x", RU_SHL, RS_RIGHT, 0, RR_OTHER, 0));
+    v.push(ru("x >> 0 = x", RU_SHR, RS_RIGHT, 0, RR_OTHER, 0));
+    v.push(ru("x == x", RU_EQ, RS_SAME, 0, RR_TRUE, 0));
+    v.push(ru("x != x", RU_NE, RS_SAME, 0, RR_FALSE, 0));
+    v.push(ru("x < x", RU_LT, RS_SAME, 0, RR_FALSE, 0));
+    v.push(ru("x <= x", RU_LE, RS_SAME, 0, RR_TRUE, 0));
+    v.push(ru("x > x", RU_GT, RS_SAME, 0, RR_FALSE, 0));
+    v.push(ru("x >= x", RU_GE, RS_SAME, 0, RR_TRUE, 0));
+    return v;
+}
+
+fn ru_op(op: BinOp) -> i64 {
+    match op {
+        BinOp::Add => { return RU_ADD; }
+        BinOp::Sub => { return RU_SUB; }
+        BinOp::Mul => { return RU_MUL; }
+        BinOp::Div => { return RU_DIV; }
+        BinOp::BitAnd => { return RU_AND; }
+        BinOp::BitOr => { return RU_OR; }
+        BinOp::BitXor => { return RU_XOR; }
+        BinOp::Shl => { return RU_SHL; }
+        BinOp::Shr => { return RU_SHR; }
+        BinOp::Eq => { return RU_EQ; }
+        BinOp::Neq => { return RU_NE; }
+        BinOp::Lt => { return RU_LT; }
+        BinOp::LtEq => { return RU_LE; }
+        BinOp::Gt => { return RU_GT; }
+        BinOp::GtEq => { return RU_GE; }
+        _ => {}
+    }
+    return 0;
+}
+
+fn ru_is_int(t: IrType) -> bool {
+    return ir_type_eq(t, IrType::I64) || ir_type_eq(t, IrType::U64) || ir_type_eq(t, IrType::I32)
+        || ir_type_eq(t, IrType::U32) || ir_type_eq(t, IrType::I16) || ir_type_eq(t, IrType::U16)
+        || ir_type_eq(t, IrType::I8) || ir_type_eq(t, IrType::U8);
+}
+
+fn ru_is_scalar(t: IrType) -> bool {
+    return ru_is_int(t) || ir_type_eq(t, IrType::Bool) || ir_type_eq(t, IrType::F64) || ir_type_eq(t, IrType::F32);
+}
+
+fn ru_meta_ty(f: &IrFunction, id: i64) -> IrType {
+    match IrFunction_get_meta(f, id) {
+        OptValueMeta::Some(m) => { return m.ty; }
+        OptValueMeta::None => {}
+    }
+    return IrType::Void;
+}
+
+/// Value `id` is an integer constant: [1, value]; else [0].
+fn ru_const(f: &IrFunction, id: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    match IrFunction_get_inst(f, id) {
+        OptInst::Some(inst) => {
+            match inst {
+                Inst::ConstInt(v, _) => { out.push(1); out.push(v); return out; }
+                _ => {}
+            }
+        }
+        OptInst::None => {}
+    }
+    out.push(0);
+    return out;
+}
+
+fn ru_set_inst(f: &mut IrFunction, id: i64, inst: Inst) {
+    var at: i64 = f.inst_at.get(id) - 1;
+    var ve: ValueIdInst = f.insts.get(at);
+    ve.inst = inst;
+    f.insts.set(at, ve);
+}
+
+/// Apply the rules to one function: how many operations they replaced.
+fn ru_rewrite(f: &mut IrFunction, rules: &Vec<RuRule>) -> i64 {
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < f.insts.len() {
+        var ve: ValueIdInst = f.insts.get(i);
+        match ve.inst {
+            Inst::BinOp(op, a, b, ty) => {
+                var code: i64 = ru_op(op);
+                var aty: IrType = ru_meta_ty(f, a);
+                if code != 0 && ru_is_int(aty) && ir_type_eq(aty, ru_meta_ty(f, b)) {
+                    var ca: Vec<i64> = ru_const(f, a);
+                    var cb: Vec<i64> = ru_const(f, b);
+                    var ri: i64 = 0;
+                    var done: bool = false;
+                    while ri < rules.len() && !done {
+                        var r: RuRule = rules.get(ri);
+                        var other: i64 = 0 - 1;
+                        if r.op == code {
+                            if r.shape == RS_RIGHT && cb.get(0) == 1 && cb.get(1) == r.c { other = a; }
+                            if r.shape == RS_LEFT && ca.get(0) == 1 && ca.get(1) == r.c { other = b; }
+                            if r.shape == RS_SAME && a == b { other = a; }
+                        }
+                        if other >= 0 {
+                            if r.res == RR_OTHER {
+                                // A move keeps the result's own type
+                                if ir_type_eq(ru_meta_ty(f, other), ty) {
+                                    ru_set_inst(f, ve.id, Inst::BitCast(other, ty, ty));
+                                    done = true;
+                                }
+                            } else if r.res == RR_CONST {
+                                ru_set_inst(f, ve.id, Inst::ConstInt(r.rc, ty));
+                                done = true;
+                            } else {
+                                ru_set_inst(f, ve.id, Inst::ConstBool(r.res == RR_TRUE));
+                                done = true;
+                            }
+                        }
+                        ri = ri + 1;
+                    }
+                    if done { count = count + 1; }
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+/// A call whose second occurrence may reuse the first's result.
+fn ru_pure_call(module: &IrModule, name: str, effects: EffectSet, ret: IrType) -> bool {
+    if effects.effects.len() != 0 || !ru_is_scalar(ret) { return false; }
+    if str_starts_with(name, "p_") || str_starts_with(name, "pe_") || str_starts_with(name, "pert_")
+        || str_starts_with(name, "nat_") { return false; }
+    match IrModule_get_function(module, name) {
+        OptIrFunction::Some(callee) => { return callee.effects.effects.len() == 0; }
+        OptIrFunction::None => {}
+    }
+    return false;
+}
+
+/// Merge pure calls in one function: how many became moves.
+fn ru_pure_cse(module: &IrModule, f: &mut IrFunction) -> i64 {
+    var cfg: IroCfg = iro_cfg(f);
+    // key -> the earlier calls with that key: "block:id;block:id"
+    var seen: i64 = HashMap_new();
+    var count: i64 = 0;
+    var ri: i64 = 0;
+    while ri < cfg.rpo.len() {
+        var bi: i64 = cfg.rpo.get(ri);
+        var block: BasicBlock = f.blocks.get(bi);
+        var k: i64 = 0;
+        while k < block.instructions.len() {
+            var id: i64 = block.instructions.get(k);
+            match IrFunction_get_inst(f, id) {
+                OptInst::Some(inst) => {
+                    match inst {
+                        Inst::Call(name, args, ret, effects) => {
+                            if ru_pure_call(module, name, effects, ret) {
+                                var key: str = name;
+                                var ai: i64 = 0;
+                                while ai < args.len() { key = key + "|" + int_to_str(args.get(ai)); ai = ai + 1; }
+                                var hit: i64 = 0 - 1;
+                                if HashMap_contains(seen, key) {
+                                    var prev: Vec<str> = str_split(HashMap_get(seen, key), ";");
+                                    var pi: i64 = 0;
+                                    while pi < prev.len() && hit < 0 {
+                                        var parts: Vec<str> = str_split(prev.get(pi), ":");
+                                        if parts.len() == 2 {
+                                            var pb: i64 = str_parse_int(parts.get(0));
+                                            if pb == bi || iro_dominates(&cfg, pb, bi) { hit = str_parse_int(parts.get(1)); }
+                                        }
+                                        pi = pi + 1;
+                                    }
+                                }
+                                if hit >= 0 {
+                                    ru_set_inst(f, id, Inst::BitCast(hit, ret, ret));
+                                    count = count + 1;
+                                } else {
+                                    var entry: str = int_to_str(bi) + ":" + int_to_str(id);
+                                    if HashMap_contains(seen, key) { entry = HashMap_get(seen, key) + ";" + entry; }
+                                    HashMap_insert(seen, key, entry);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                OptInst::None => {}
+            }
+            k = k + 1;
+        }
+        ri = ri + 1;
+    }
+    return count;
+}
+
+fn ru_on(name: str) -> bool {
+    var off: str = p_getenv("FID_NAT_OFF");
+    if (off as i64) == 0 || str_len(off) == 0 { return true; }
+    return !str_contains("," + off + ",", "," + name + ",");
+}
+
+/// The rules and pure-call merging over every function of `module`:
+/// [operations rewritten, calls merged].
+pub fn rules_run(module: &mut IrModule) -> Vec<i64> {
+    var rules: Vec<RuRule> = ru_rules();
+    var n_rules: i64 = 0;
+    var n_calls: i64 = 0;
+    var on_rules: bool = ru_on("rules");
+    var on_cse: bool = ru_on("purecse");
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var entry: IrFunctionEntry = module.functions.get(i);
+        var f: IrFunction = entry.func;
+        var changed: i64 = 0;
+        if on_rules { changed = changed + ru_rewrite(&mut f, &rules); }
+        if on_cse {
+            var merged: i64 = ru_pure_cse(module, &mut f);
+            n_calls = n_calls + merged;
+            changed = changed + merged;
+        }
+        if changed > 0 {
+            n_rules = n_rules + changed;
+            entry.func = f;
+            module.functions.set(i, entry);
+        }
+        i = i + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(n_rules - n_calls);
+    out.push(n_calls);
+    return out;
+}
+
+// --- `fid test-rules` ---------------------------------------------------
+
+fn ru_eval(op: i64, x: i64, y: i64) -> i64 {
+    if op == RU_ADD { return x + y; }
+    if op == RU_SUB { return x - y; }
+    if op == RU_MUL { return x * y; }
+    if op == RU_DIV { return x / y; }
+    if op == RU_AND { return x & y; }
+    if op == RU_OR { return x | y; }
+    if op == RU_XOR { return x ^ y; }
+    if op == RU_SHL { return x << y; }
+    if op == RU_SHR { return x >> y; }
+    if op == RU_EQ { if x == y { return 1; } return 0; }
+    if op == RU_NE { if x != y { return 1; } return 0; }
+    if op == RU_LT { if x < y { return 1; } return 0; }
+    if op == RU_LE { if x <= y { return 1; } return 0; }
+    if op == RU_GT { if x > y { return 1; } return 0; }
+    if op == RU_GE { if x >= y { return 1; } return 0; }
+    return 0;
+}
+
+/// Each rule on edge values and pseudo-random ones: its left side computed,
+/// its result compared. Prints a line per rule; the number of failures.
+pub fn rules_selftest() -> i64 {
+    var rules: Vec<RuRule> = ru_rules();
+    var xs: Vec<i64> = Vec::new();
+    xs.push(0); xs.push(1); xs.push(0 - 1); xs.push(2); xs.push(7); xs.push(0 - 7);
+    xs.push(9223372036854775807); xs.push(0 - 9223372036854775807 - 1); xs.push(4611686018427387904);
+    var seed: i64 = 88172645463325252;
+    var i: i64 = 0;
+    while i < 300 {
+        seed = seed ^ (seed << 13);
+        seed = seed ^ (seed >> 7);
+        seed = seed ^ (seed << 17);
+        xs.push(seed);
+        i = i + 1;
+    }
+    var fails: i64 = 0;
+    var ri: i64 = 0;
+    while ri < rules.len() {
+        var r: RuRule = rules.get(ri);
+        var bad: i64 = 0;
+        var xi: i64 = 0;
+        while xi < xs.len() {
+            var x: i64 = xs.get(xi);
+            var lhs: i64 = 0;
+            if r.shape == RS_RIGHT { lhs = ru_eval(r.op, x, r.c); }
+            else if r.shape == RS_LEFT { lhs = ru_eval(r.op, r.c, x); }
+            else { lhs = ru_eval(r.op, x, x); }
+            var rhs: i64 = x;
+            if r.res == RR_CONST { rhs = r.rc; }
+            if r.res == RR_TRUE { rhs = 1; }
+            if r.res == RR_FALSE { rhs = 0; }
+            if lhs != rhs { bad = bad + 1; }
+            xi = xi + 1;
+        }
+        if bad == 0 { print("ok    " + r.name + "\n"); }
+        else { print("FAIL  " + r.name + " (" + int_to_str(bad) + " values)\n"); fails = fails + 1; }
+        ri = ri + 1;
+    }
+    print(int_to_str(rules.len()) + " rules, " + int_to_str(fails) + " failed\n");
+    return fails;
+}

@@ -31,9 +31,16 @@ import os
 import random
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# On Windows `bash` on the PATH can be WSL's (System32\bash.exe), which
+# cannot run the scripts on Windows paths: prefer Git's
+BASH = os.environ.get("BASH_EXE") or next(
+    (p for p in (r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files\Git\usr\bin\bash.exe")
+     if os.name == "nt" and os.path.exists(p)), "bash")
 
 # (name, kind, how, backends)
 #   kind env:   FID_IROPT_OFF value (compiler/iropt.fd iro_pass_on)
@@ -100,8 +107,9 @@ def build(tree, name, edit, fid, out):
     if os.path.exists(exe):
         return exe
     arg = f"{edit[0]}:{edit[1]}=>{edit[2]}" if edit else None
-    cmd = ["bash", os.path.join(ROOT, "scripts", "verify", "build-variant.sh"), tree, exe] + ([arg] if arg else [])
-    env = dict(os.environ, FID=fid)
+    fw = lambda p: p.replace("\\", "/")  # bash on Windows reads backslashes as escapes
+    cmd = [BASH, fw(os.path.join(ROOT, "scripts", "verify", "build-variant.sh")), fw(tree), fw(exe)] + ([arg] if arg else [])
+    env = dict(os.environ, FID=fw(fid))
     print(f"building {name} ...", flush=True)
     rc, out_, err = run(cmd, env, timeout=3600)
     if rc != 0 or not os.path.exists(exe):
@@ -114,6 +122,11 @@ def compile_and_run(fid, env, backend, test, exe_path, cwd):
     if os.path.exists(exe_path):
         os.remove(exe_path)
     rc, out, err = run([fid, backend, test, "-o", exe_path], env)
+    if rc != 0 or not os.path.exists(exe_path):
+        # once more on its own: under load the C compiler's shared cache, or
+        # memory, fails now and then
+        with RETRY_LOCK:
+            rc, out, err = run([fid, backend, test, "-o", exe_path], env)
     if rc != 0 or not os.path.exists(exe_path):
         return ("no-build", "", sha_text(out + err))
     return (sha(exe_path), exe_path, "")
@@ -142,6 +155,10 @@ def gen_tests(n, out):
     return files
 
 
+RETRY_LOCK = threading.Lock()
+BASE = {}  # (test, backend) -> (hash, exe kept for running, (rc, out))
+
+
 def compare(base_fid, var_fid, env_var, backends, tests, out, jobs):
     """Returns (changed binaries, differing outputs, details)."""
     work = os.path.join(out, "work")
@@ -155,22 +172,28 @@ def compare(base_fid, var_fid, env_var, backends, tests, out, jobs):
     def one(tb):
         t, b = tb
         tag = hashlib.md5((t + b + (env_var or var_fid)).encode()).hexdigest()[:10]
-        e1 = os.path.join(work, f"{tag}-base.exe")
+        bt = hashlib.md5((t + b).encode()).hexdigest()[:10]
+        e1 = os.path.join(work, f"{bt}-base.exe")
         e2 = os.path.join(work, f"{tag}-var.exe")
-        h1 = compile_and_run(base_fid, benv, b, t, e1, out)
+        # the base build of a test is the same for every variant: once
+        if (t, b) not in BASE:
+            h = compile_and_run(base_fid, benv, b, t, e1, out)
+            r = run([e1], timeout=60) if h[0] != "no-build" else None
+            BASE[(t, b)] = (h[0], r)
+        h1 = (BASE[(t, b)][0],)
         h2 = compile_and_run(var_fid, venv, b, t, e2, out)
         res = None
         if h1[0] == "no-build" or h2[0] == "no-build":
             if h1[0] != h2[0]:
                 res = (t, b, "builds with one compiler only")
         elif h1[0] != h2[0]:
-            r1 = run([e1], timeout=60)
+            r1 = BASE[(t, b)][1]
             r2 = run([e2], timeout=60)
             if (r1[0], r1[1]) != (r2[0], r2[1]):
                 res = (t, b, f"exit {r1[0]} vs {r2[0]}; output {len(r1[1])} vs {len(r2[1])} bytes")
             else:
                 res = (t, b, None)
-        for e in (e1, e2, e1[:-4] + ".pdb", e2[:-4] + ".pdb"):
+        for e in (e1, e2, e2[:-4] + ".pdb", e1[:-4] + ".pdb"):
             if os.path.exists(e):
                 try:
                     os.remove(e)
@@ -195,6 +218,7 @@ def main():
     ap.add_argument("--tree", default=".")
     ap.add_argument("--tests", default="tests/bootstrap/*.fd")
     ap.add_argument("--gen", type=int, default=0)
+    ap.add_argument("--sample", type=int, default=0, help="a random sample of this many --tests files")
     ap.add_argument("--out", default=os.path.join("build", "variants"))
     ap.add_argument("--only", default="")
     ap.add_argument("--build-only", action="store_true")
@@ -212,7 +236,11 @@ def main():
     os.makedirs(out, exist_ok=True)
     fid = os.path.abspath(a.fid)
     tree = os.path.abspath(a.tree)
-    tests = sorted(glob.glob(a.tests))
+    tests = []
+    for g in a.tests.split(","):
+        tests += sorted(glob.glob(g))
+    if a.sample and len(tests) > a.sample:
+        tests = sorted(random.Random(1).sample(tests, a.sample))
     if a.gen:
         tests += gen_tests(a.gen, out)
     only = set(x for x in a.only.split(",") if x)

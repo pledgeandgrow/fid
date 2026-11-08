@@ -1309,7 +1309,9 @@ Traits `Iterator` and `Error` are declared in core.
 `extend`, `truncate`, `sort`, `for_each`, `fold`, `any`, `all`, `find`,
 `position`, `clone`, `map`, `filter` (`TypeChecker_check_method_call`). `push`
 and `set` check the element type (`test_vec_elem_fail.fd`). A `Vec` written
-without an element type holds `i64`.
+without an element type holds `i64`. `Vec::filled(n, x)` makes `n` elements,
+each `x` (Rust's `vec![x; n]`), for numbers, bools, strings, Vecs and maps; a
+`Vec` of structs or enums is built with `push`.
 
 `HashMap<K, V>`: `HashMap::new()`, `insert`, `get`, `contains`, `remove`, `len`,
 `is_empty`, `clear`, `get_or`, `keys`, `values`, `clone`. Without type

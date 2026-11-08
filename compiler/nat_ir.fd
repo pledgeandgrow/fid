@@ -116,6 +116,20 @@ pub struct NatGen {
     pub names_label: i64,
     pub code_end_label: i64,
     pub placed_fns: Vec<str>,
+    // The machine IR: recording (lowering appends to `mir`), the next vreg,
+    // the promoted locals of the function being recorded (1 + extension
+    // kind), its frame once allocated, every recorded function, label ->
+    // function name, the clobber masks of allocated functions (IPRA), and
+    // how many functions were folded into an identical one
+    pub rec: bool,
+    pub mir: Vec<MInst>,
+    pub nvreg: i64,
+    pub promoted: Vec<i64>,
+    pub frame: i64,
+    pub recs: Vec<NatFnRec>,
+    pub label_fn: i64,
+    pub fn_mask: i64,
+    pub n_folded: i64,
     // The function being compiled
     pub cur_name: str,
     pub cur_wrapping: bool,
@@ -165,6 +179,15 @@ pub fn NatGen_new(arch: i64) -> NatGen {
         names_label: 0,
         code_end_label: 0,
         placed_fns: Vec::new(),
+        rec: false,
+        mir: Vec::new(),
+        nvreg: 0,
+        promoted: Vec::new(),
+        frame: 16,
+        recs: Vec::new(),
+        label_fn: HashMap_new(),
+        fn_mask: HashMap_new(),
+        n_folded: 0,
         cur_name: "",
         cur_wrapping: false,
         slots: Vec::new(),
@@ -189,10 +212,12 @@ fn ng_a64(g: &NatGen) -> bool {
 // ===========================================================================
 
 fn ng_li(g: &mut NatGen, r: i64, v: i64) {
+    if g.rec { ng_rec(g, MO_LI, r, 0, 0, v, 0, 0); return; }
     if ng_a64(g) { a64_li(&mut g.e, r, v); } else { rv_li(&mut g.e, r, v); }
 }
 
 fn ng_mov(g: &mut NatGen, d: i64, s: i64) {
+    if g.rec { ng_rec(g, MO_MOV, d, s, 0, 0, 0, 0); return; }
     if ng_a64(g) { a64_mov(&mut g.e, d, s); } else { rv_mv(&mut g.e, d, s); }
 }
 
@@ -203,6 +228,7 @@ fn ng_argreg(g: &NatGen, i: i64) -> i64 {
 
 /// r = sp + off
 fn ng_slot_addr(g: &mut NatGen, r: i64, off: i64) {
+    if g.rec { ng_rec(g, MO_SLOTADDR, r, 0, 0, off, 0, 0); return; }
     if ng_a64(g) {
         if off >= 0 && off < 4096 {
             a64_add_imm(&mut g.e, r, A64_SP, off);
@@ -221,6 +247,7 @@ fn ng_slot_addr(g: &mut NatGen, r: i64, off: i64) {
 }
 
 fn ng_ld_slot(g: &mut NatGen, r: i64, off: i64) {
+    if g.rec { ng_rec(g, MO_LDSLOT, r, 0, 0, off, 0, 0); return; }
     if ng_a64(g) {
         if a64_ldst_fits(8, off) {
             a64_ldr(&mut g.e, r, A64_SP, off);
@@ -239,6 +266,7 @@ fn ng_ld_slot(g: &mut NatGen, r: i64, off: i64) {
 }
 
 fn ng_st_slot(g: &mut NatGen, off: i64, r: i64) {
+    if g.rec { ng_rec(g, MO_STSLOT, r, 0, 0, off, 0, 0); return; }
     if ng_a64(g) {
         if a64_ldst_fits(8, off) {
             a64_str(&mut g.e, r, A64_SP, off);
@@ -258,6 +286,7 @@ fn ng_st_slot(g: &mut NatGen, off: i64, r: i64) {
 
 /// d = *(base + disp), `size` bytes (1, 2, 4, 8), extended
 fn ng_load(g: &mut NatGen, d: i64, base: i64, disp: i64, size: i64, signed: bool) {
+    if g.rec { var sg: i64 = 0; if signed { sg = 1; } ng_rec(g, MO_LOAD, d, base, 0, disp, size, sg); return; }
     if ng_a64(g) {
         if a64_ldst_fits(size, disp) {
             a64_ldr_sized(&mut g.e, d, base, disp, size, signed);
@@ -279,6 +308,7 @@ fn ng_load(g: &mut NatGen, d: i64, base: i64, disp: i64, size: i64, signed: bool
 
 /// *(base + disp) = v, `size` bytes
 fn ng_store(g: &mut NatGen, base: i64, disp: i64, v: i64, size: i64) {
+    if g.rec { ng_rec(g, MO_STORE, base, v, 0, disp, size, 0); return; }
     if ng_a64(g) {
         if a64_ldst_fits(size, disp) {
             a64_str_sized(&mut g.e, v, base, disp, size);
@@ -299,24 +329,29 @@ fn ng_store(g: &mut NatGen, base: i64, disp: i64, v: i64, size: i64) {
 }
 
 fn ng_addr(g: &mut NatGen, d: i64, label: i64) {
+    if g.rec { ng_rec(g, MO_ADDR, d, 0, 0, label, 0, 0); return; }
     if ng_a64(g) { a64_addr(&mut g.e, d, label); } else { rv_addr(&mut g.e, d, label); }
 }
 
 fn ng_call_label(g: &mut NatGen, label: i64) {
+    if g.rec { ng_rec(g, MO_CALL, 0, 0, 0, label, 0, 0); return; }
     if ng_a64(g) { a64_bl(&mut g.e, label); } else { rv_call(&mut g.e, label); }
 }
 
 fn ng_call_reg(g: &mut NatGen, r: i64) {
+    if g.rec { ng_rec(g, MO_CALLR, r, 0, 0, 0, 0, 0); return; }
     if ng_a64(g) { a64_blr(&mut g.e, r); } else { rv_jalr(&mut g.e, RV_RA, r, 0); }
 }
 
 /// A jump inside the function.
 fn ng_jmp(g: &mut NatGen, label: i64) {
+    if g.rec { ng_rec(g, MO_JMP, 0, 0, 0, label, 0, 0); return; }
     if ng_a64(g) { a64_b(&mut g.e, label); } else { rv_jal(&mut g.e, RV_ZERO, label); }
 }
 
 /// Jump inside the function when r != 0.
 fn ng_bnez(g: &mut NatGen, r: i64, label: i64) {
+    if g.rec { ng_rec(g, MO_BNEZ, r, 0, 0, label, 0, 0); return; }
     if ng_a64(g) {
         a64_cbnz(&mut g.e, r, label);
     } else {
@@ -327,6 +362,7 @@ fn ng_bnez(g: &mut NatGen, r: i64, label: i64) {
 
 /// Jump inside the function when r == 0.
 fn ng_beqz(g: &mut NatGen, r: i64, label: i64) {
+    if g.rec { ng_rec(g, MO_BEQZ, r, 0, 0, label, 0, 0); return; }
     if ng_a64(g) {
         a64_cbz(&mut g.e, r, label);
     } else {
@@ -337,6 +373,7 @@ fn ng_beqz(g: &mut NatGen, r: i64, label: i64) {
 
 /// Panic `which` when r != 0 (the stubs may be anywhere in the image).
 fn ng_panic_if(g: &mut NatGen, r: i64, which: i64) {
+    if g.rec { ng_rec(g, MO_PANICIF, r, 0, 0, which, 0, 0); return; }
     var label: i64 = g.panic_labels.get(which);
     if ng_a64(g) {
         // CBZ r, +8; BL panic (a call: the return address names the
@@ -350,29 +387,33 @@ fn ng_panic_if(g: &mut NatGen, r: i64, which: i64) {
 }
 
 fn ng_trap(g: &mut NatGen) {
+    if g.rec { ng_rec(g, MO_TRAP, 0, 0, 0, 0, 0, 0); return; }
     if ng_a64(g) { a64_brk(&mut g.e); } else { rv_ebreak(&mut g.e); }
 }
 
-fn ng_add(g: &mut NatGen, d: i64, a: i64, b: i64) { if ng_a64(g) { a64_add(&mut g.e, d, a, b); } else { rv_add(&mut g.e, d, a, b); } }
-fn ng_sub(g: &mut NatGen, d: i64, a: i64, b: i64) { if ng_a64(g) { a64_sub(&mut g.e, d, a, b); } else { rv_sub(&mut g.e, d, a, b); } }
-fn ng_mul(g: &mut NatGen, d: i64, a: i64, b: i64) { if ng_a64(g) { a64_mul(&mut g.e, d, a, b); } else { rv_mul(&mut g.e, d, a, b); } }
-fn ng_and(g: &mut NatGen, d: i64, a: i64, b: i64) { if ng_a64(g) { a64_and(&mut g.e, d, a, b); } else { rv_and(&mut g.e, d, a, b); } }
-fn ng_or(g: &mut NatGen, d: i64, a: i64, b: i64) { if ng_a64(g) { a64_orr(&mut g.e, d, a, b); } else { rv_or(&mut g.e, d, a, b); } }
-fn ng_xor(g: &mut NatGen, d: i64, a: i64, b: i64) { if ng_a64(g) { a64_eor(&mut g.e, d, a, b); } else { rv_xor(&mut g.e, d, a, b); } }
-fn ng_shl(g: &mut NatGen, d: i64, a: i64, b: i64) { if ng_a64(g) { a64_lslv(&mut g.e, d, a, b); } else { rv_sll(&mut g.e, d, a, b); } }
-fn ng_sar(g: &mut NatGen, d: i64, a: i64, b: i64) { if ng_a64(g) { a64_asrv(&mut g.e, d, a, b); } else { rv_sra(&mut g.e, d, a, b); } }
-fn ng_shr(g: &mut NatGen, d: i64, a: i64, b: i64) { if ng_a64(g) { a64_lsrv(&mut g.e, d, a, b); } else { rv_srl(&mut g.e, d, a, b); } }
+fn ng_add(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_ADD, d, a, b, 0, 0, 0); return; } if ng_a64(g) { a64_add(&mut g.e, d, a, b); } else { rv_add(&mut g.e, d, a, b); } }
+fn ng_sub(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_SUB, d, a, b, 0, 0, 0); return; } if ng_a64(g) { a64_sub(&mut g.e, d, a, b); } else { rv_sub(&mut g.e, d, a, b); } }
+fn ng_mul(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_MUL, d, a, b, 0, 0, 0); return; } if ng_a64(g) { a64_mul(&mut g.e, d, a, b); } else { rv_mul(&mut g.e, d, a, b); } }
+fn ng_and(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_AND, d, a, b, 0, 0, 0); return; } if ng_a64(g) { a64_and(&mut g.e, d, a, b); } else { rv_and(&mut g.e, d, a, b); } }
+fn ng_or(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_OR, d, a, b, 0, 0, 0); return; } if ng_a64(g) { a64_orr(&mut g.e, d, a, b); } else { rv_or(&mut g.e, d, a, b); } }
+fn ng_xor(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_XOR, d, a, b, 0, 0, 0); return; } if ng_a64(g) { a64_eor(&mut g.e, d, a, b); } else { rv_xor(&mut g.e, d, a, b); } }
+fn ng_shl(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_SHL, d, a, b, 0, 0, 0); return; } if ng_a64(g) { a64_lslv(&mut g.e, d, a, b); } else { rv_sll(&mut g.e, d, a, b); } }
+fn ng_sar(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_SAR, d, a, b, 0, 0, 0); return; } if ng_a64(g) { a64_asrv(&mut g.e, d, a, b); } else { rv_sra(&mut g.e, d, a, b); } }
+fn ng_shr(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_SHR, d, a, b, 0, 0, 0); return; } if ng_a64(g) { a64_lsrv(&mut g.e, d, a, b); } else { rv_srl(&mut g.e, d, a, b); } }
 
 fn ng_neg(g: &mut NatGen, d: i64, a: i64) {
+    if g.rec { ng_rec(g, MO_NEG, d, a, 0, 0, 0, 0); return; }
     if ng_a64(g) { a64_neg(&mut g.e, d, a); } else { rv_sub(&mut g.e, d, RV_ZERO, a); }
 }
 
 fn ng_not_bits(g: &mut NatGen, d: i64, a: i64) {
+    if g.rec { ng_rec(g, MO_NOT, d, a, 0, 0, 0, 0); return; }
     if ng_a64(g) { a64_mvn(&mut g.e, d, a); } else { rv_xori(&mut g.e, d, a, 0 - 1); }
 }
 
 /// d = a / b (b != 0; MIN / -1 handled by the caller)
 fn ng_div(g: &mut NatGen, d: i64, a: i64, b: i64, unsigned: bool) {
+    if g.rec { var u: i64 = 0; if unsigned { u = 1; } ng_rec(g, MO_DIV, d, a, b, u, 0, 0); return; }
     if ng_a64(g) {
         if unsigned { a64_udiv(&mut g.e, d, a, b); } else { a64_sdiv(&mut g.e, d, a, b); }
     } else {
@@ -382,6 +423,7 @@ fn ng_div(g: &mut NatGen, d: i64, a: i64, b: i64, unsigned: bool) {
 
 /// d = a % b (b != 0); d must differ from a and b on AArch64 (it uses ad2)
 fn ng_rem(g: &mut NatGen, d: i64, a: i64, b: i64, unsigned: bool) {
+    if g.rec { var u: i64 = 0; if unsigned { u = 1; } ng_rec(g, MO_REM, d, a, b, u, 0, 0); return; }
     if ng_a64(g) {
         if unsigned { a64_udiv(&mut g.e, g.ad2, a, b); } else { a64_sdiv(&mut g.e, g.ad2, a, b); }
         a64_msub(&mut g.e, d, g.ad2, b, a);
@@ -392,6 +434,7 @@ fn ng_rem(g: &mut NatGen, d: i64, a: i64, b: i64, unsigned: bool) {
 
 /// d = the high 64 bits of a * b
 fn ng_mulh(g: &mut NatGen, d: i64, a: i64, b: i64, unsigned: bool) {
+    if g.rec { var u: i64 = 0; if unsigned { u = 1; } ng_rec(g, MO_MULH, d, a, b, u, 0, 0); return; }
     if ng_a64(g) {
         if unsigned { a64_umulh(&mut g.e, d, a, b); } else { a64_smulh(&mut g.e, d, a, b); }
     } else {
@@ -401,6 +444,7 @@ fn ng_mulh(g: &mut NatGen, d: i64, a: i64, b: i64, unsigned: bool) {
 
 /// d = (a cc b) as 0 / 1
 fn ng_setcc(g: &mut NatGen, d: i64, a: i64, b: i64, cc: i64) {
+    if g.rec { ng_rec(g, MO_SETCC, d, a, b, cc, 0, 0); return; }
     if ng_a64(g) {
         a64_cmp(&mut g.e, a, b);
         var c: i64 = A64_EQ;
@@ -430,6 +474,7 @@ fn ng_setcc(g: &mut NatGen, d: i64, a: i64, b: i64, cc: i64) {
 
 /// d = s extended from its low bits (`kind`: NEXT_*)
 fn ng_ext(g: &mut NatGen, d: i64, s: i64, kind: i64) {
+    if g.rec { ng_rec(g, MO_EXT, d, s, 0, kind, 0, 0); return; }
     if ng_a64(g) {
         if kind == NEXT_SB { a64_sxtb(&mut g.e, d, s); }
         if kind == NEXT_SH { a64_sxth(&mut g.e, d, s); }
@@ -492,6 +537,7 @@ fn ng_fstore0(g: &mut NatGen, d: i64, is32: bool) {
 
 /// d = a op b in floating point (op: 1 add, 2 sub, 3 mul, 4 div)
 fn ng_fbin(g: &mut NatGen, op: i64, d: i64, a: i64, b: i64, is32: bool) {
+    if g.rec { var w: i64 = 0; if is32 { w = 1; } ng_rec(g, MO_FBIN, d, a, b, op, w, 0); return; }
     ng_fload2(g, a, b, is32);
     if ng_a64(g) {
         if op == 1 { a64_fadd(&mut g.e, 0, 0, 1); }
@@ -509,6 +555,7 @@ fn ng_fbin(g: &mut NatGen, op: i64, d: i64, a: i64, b: i64, is32: bool) {
 
 /// d = (a cc b) for floats, IEEE: every comparison with NaN is false but !=
 fn ng_fcmp(g: &mut NatGen, d: i64, a: i64, b: i64, cc: i64, is32: bool) {
+    if g.rec { var w: i64 = 0; if is32 { w = 1; } ng_rec(g, MO_FCMP, d, a, b, cc, w, 0); return; }
     ng_fload2(g, a, b, is32);
     if ng_a64(g) {
         a64_fcmp(&mut g.e, 0, 1);
@@ -531,12 +578,14 @@ fn ng_fcmp(g: &mut NatGen, d: i64, a: i64, b: i64, cc: i64, is32: bool) {
 
 /// d = the float of integer s
 fn ng_i2f(g: &mut NatGen, d: i64, s: i64, to_f32: bool) {
+    if g.rec { var w: i64 = 0; if to_f32 { w = 1; } ng_rec(g, MO_I2F, d, s, 0, w, 0, 0); return; }
     if ng_a64(g) { a64_scvtf(&mut g.e, 0, s); } else { rv_fcvt_dl(&mut g.e, 0, s); }
     ng_fstore0(g, d, to_f32);
 }
 
 /// d = the integer of float bits s, truncated toward zero
 fn ng_f2i(g: &mut NatGen, d: i64, s: i64, from_f32: bool) {
+    if g.rec { var w: i64 = 0; if from_f32 { w = 1; } ng_rec(g, MO_F2I, d, s, 0, w, 0, 0); return; }
     if ng_a64(g) {
         if from_f32 { a64_fmov_sw(&mut g.e, 0, s); a64_fcvt_ds(&mut g.e, 0, 0); }
         else { a64_fmov_dx(&mut g.e, 0, s); }
@@ -551,6 +600,7 @@ fn ng_f2i(g: &mut NatGen, d: i64, s: i64, from_f32: bool) {
 /// Function entry: save the return address and frame pointer, reserve
 /// `frame` bytes (a multiple of 16).
 fn ng_prologue(g: &mut NatGen, frame: i64) {
+    if g.rec { ng_rec(g, MO_PROLOGUE, 0, 0, 0, 0, 0, 0); return; }
     if ng_a64(g) {
         NatEnc_word(&mut g.e, 0xA9BF7BFD);            // stp x29, x30, [sp, #-16]!
         a64_add_imm(&mut g.e, A64_FP, A64_SP, 0);     // mov x29, sp
@@ -580,6 +630,7 @@ fn ng_prologue(g: &mut NatGen, frame: i64) {
 }
 
 fn ng_epilogue(g: &mut NatGen) {
+    if g.rec { ng_rec(g, MO_EPILOGUE, 0, 0, 0, 0, 0, 0); return; }
     var k: i64 = 0;
     while k < g.save_regs.len() {
         ng_ld_slot(g, g.save_regs.get(k), g.save_off + 8 * k);
@@ -600,6 +651,7 @@ fn ng_epilogue(g: &mut NatGen) {
 
 /// r = incoming stack argument k (argument 8 + k)
 fn ng_ld_incoming(g: &mut NatGen, r: i64, k: i64) {
+    if g.rec { ng_rec(g, MO_LDIN, r, 0, 0, k, 0, 0); return; }
     if ng_a64(g) {
         ng_load(g, r, A64_FP, 16 + 8 * k, 8, true);
     } else {
@@ -609,49 +661,62 @@ fn ng_ld_incoming(g: &mut NatGen, r: i64, k: i64) {
 
 /// [sp + off] = r for an outgoing stack argument
 fn ng_st_outgoing(g: &mut NatGen, k: i64, r: i64) {
+    if g.rec { ng_rec(g, MO_STOUT, r, 0, 0, k, 0, 0); return; }
     ng_st_slot(g, 8 * k, r);
 }
 
-/// Copy `size` bytes from the address in src to the address in dst
-/// (registers t0 = dst, t1 = src are kept; t2 is clobbered).
+/// Copy `size` bytes from the address in src to the address in dst (src
+/// and dst are kept). The word in flight is ad2; a long copy walks ad over
+/// dst and x13 / t6 over src, counting in the third spill register: none of
+/// them ever holds a value, so a copy clobbers nothing allocated.
 fn ng_copy(g: &mut NatGen, dst: i64, src: i64, size: i64) {
+    if g.rec { ng_rec(g, MO_COPY, dst, src, 0, size, 0, 0); return; }
+    var w: i64 = g.ad2;
     var off: i64 = 0;
     if size <= 256 {
         while off + 8 <= size {
-            ng_load(g, g.t2, src, off, 8, false);
-            ng_store(g, dst, off, g.t2, 8);
+            ng_load(g, w, src, off, 8, false);
+            ng_store(g, dst, off, w, 8);
             off = off + 8;
         }
-    } else {
-        // A loop over the words: t3 counts down, ad/ad2 walk
-        var words: i64 = size / 8;
-        var top: i64 = NatEnc_label(&mut g.e);
-        ng_mov(g, g.ad, dst);
-        if ng_a64(g) { a64_mov(&mut g.e, 13, src); } else { rv_mv(&mut g.e, 31, src); }
-        ng_li(g, g.t3, words);
-        NatEnc_place(&mut g.e, top);
-        if ng_a64(g) {
-            a64_ldr(&mut g.e, g.t2, 13, 0);
-            a64_str(&mut g.e, g.t2, g.ad, 0);
-            a64_add_imm(&mut g.e, 13, 13, 8);
-            a64_add_imm(&mut g.e, g.ad, g.ad, 8);
-            a64_sub_imm(&mut g.e, g.t3, g.t3, 1);
-            a64_cbnz(&mut g.e, g.t3, top);
-        } else {
-            rv_load(&mut g.e, g.t2, 31, 0, 8, true);
-            rv_store(&mut g.e, g.t2, g.ad, 0, 8);
-            rv_addi(&mut g.e, 31, 31, 8);
-            rv_addi(&mut g.e, g.ad, g.ad, 8);
-            rv_addi(&mut g.e, g.t3, g.t3, 0 - 1);
-            rv_b_off(&mut g.e, RV_BEQ, g.t3, RV_ZERO, 8);
-            rv_jal(&mut g.e, RV_ZERO, top);
+        while off < size {
+            ng_load(g, w, src, off, 1, false);
+            ng_store(g, dst, off, w, 1);
+            off = off + 1;
         }
-        off = words * 8;
+        return;
     }
-    while off < size {
-        ng_load(g, g.t2, src, off, 1, false);
-        ng_store(g, dst, off, g.t2, 1);
-        off = off + 1;
+    var words: i64 = size / 8;
+    var cs: i64 = 13;
+    if !ng_a64(g) { cs = 31; }
+    var cn: i64 = ng_spill_reg(g, 2);
+    var top: i64 = NatEnc_label(&mut g.e);
+    ng_mov(g, g.ad, dst);
+    ng_mov(g, cs, src);
+    ng_li(g, cn, words);
+    NatEnc_place(&mut g.e, top);
+    if ng_a64(g) {
+        a64_ldr(&mut g.e, w, cs, 0);
+        a64_str(&mut g.e, w, g.ad, 0);
+        a64_add_imm(&mut g.e, cs, cs, 8);
+        a64_add_imm(&mut g.e, g.ad, g.ad, 8);
+        a64_sub_imm(&mut g.e, cn, cn, 1);
+        a64_cbnz(&mut g.e, cn, top);
+    } else {
+        rv_load(&mut g.e, w, cs, 0, 8, true);
+        rv_store(&mut g.e, w, g.ad, 0, 8);
+        rv_addi(&mut g.e, cs, cs, 8);
+        rv_addi(&mut g.e, g.ad, g.ad, 8);
+        rv_addi(&mut g.e, cn, cn, 0 - 1);
+        rv_b_off(&mut g.e, RV_BEQ, cn, RV_ZERO, 8);
+        rv_jal(&mut g.e, RV_ZERO, top);
+    }
+    // The bytes after the last word, from the cursors
+    var t: i64 = 0;
+    while t < size - words * 8 {
+        ng_load(g, w, cs, t, 1, false);
+        ng_store(g, g.ad, t, w, 1);
+        t = t + 1;
     }
 }
 
@@ -752,6 +817,10 @@ fn ng_slot(g: &NatGen, id: i64) -> i64 {
 
 /// r = value `id` (0 for a value without a slot)
 fn ng_ld_val(g: &mut NatGen, r: i64, id: i64) {
+    if g.rec {
+        if ng_slot(g, id) >= 0 { ng_mov(g, r, NG_VBASE + id); } else { ng_li(g, r, 0); }
+        return;
+    }
     var vr: i64 = ng_vreg(g, id);
     if vr >= 0 {
         if vr != r { ng_mov(g, r, vr); }
@@ -766,6 +835,10 @@ fn ng_ld_val(g: &mut NatGen, r: i64, id: i64) {
 }
 
 fn ng_st_val(g: &mut NatGen, id: i64, r: i64) {
+    if g.rec {
+        if ng_slot(g, id) >= 0 { ng_mov(g, NG_VBASE + id, r); }
+        return;
+    }
     var vr: i64 = ng_vreg(g, id);
     if vr >= 0 {
         if vr != r { ng_mov(g, vr, r); }
@@ -1189,6 +1262,1013 @@ fn ng_regalloc(g: &mut NatGen, func: &IrFunction, nvals: i64) {
 }
 
 // ===========================================================================
+// The machine IR (own-backend roadmap, Tracks MI and RA)
+//
+// With NG_MIR on, lowering does not encode: each operation of the
+// architecture layer above (ng_li, ng_add, ng_load, ng_call_label, ...)
+// records itself as an MInst whose register operands are physical (< 64:
+// argument registers, sp, the reserved scratch registers) or virtual (>= 64:
+// IR value `id` is vreg 64 + id; each IR instruction gets four fresh scratch
+// vregs as g.t0..g.t3). After every function is recorded, functions are
+// allocated callee first (interprocedural: a caller knows which registers a
+// call really clobbers) by one linear scan over all registers the backend
+// may use, caller-saved included, checked (FID_VERIFY=1) by an independent
+// liveness walk, then replayed through the same operations with physical
+// registers. Spilled vregs live in frame slots, reached through three
+// reserved scratch registers. Identical functions are emitted once.
+//
+// Kill switches (FID_NAT_OFF=name,name): mir (the direct path of before),
+// promote (locals stay in memory), ipra (every call clobbers every
+// caller-saved register), fold (no identical-function folding), hint (no
+// move coalescing hints).
+// ===========================================================================
+
+const NG_MIR: bool = true;
+const NG_VBASE: i64 = 64;
+
+const MO_LI: i64 = 1;
+const MO_MOV: i64 = 2;
+const MO_SLOTADDR: i64 = 3;
+const MO_LDSLOT: i64 = 4;
+const MO_STSLOT: i64 = 5;
+const MO_LOAD: i64 = 6;
+const MO_STORE: i64 = 7;
+const MO_ADDR: i64 = 8;
+const MO_CALL: i64 = 9;
+const MO_CALLR: i64 = 10;
+const MO_JMP: i64 = 11;
+const MO_BNEZ: i64 = 12;
+const MO_BEQZ: i64 = 13;
+const MO_PANICIF: i64 = 14;
+const MO_TRAP: i64 = 15;
+const MO_ADD: i64 = 16;
+const MO_SUB: i64 = 17;
+const MO_MUL: i64 = 18;
+const MO_AND: i64 = 19;
+const MO_OR: i64 = 20;
+const MO_XOR: i64 = 21;
+const MO_SHL: i64 = 22;
+const MO_SAR: i64 = 23;
+const MO_SHR: i64 = 24;
+const MO_NEG: i64 = 25;
+const MO_NOT: i64 = 26;
+const MO_DIV: i64 = 27;
+const MO_REM: i64 = 28;
+const MO_MULH: i64 = 29;
+const MO_SETCC: i64 = 30;
+const MO_EXT: i64 = 31;
+const MO_FBIN: i64 = 32;
+const MO_FCMP: i64 = 33;
+const MO_I2F: i64 = 34;
+const MO_F2I: i64 = 35;
+const MO_PROLOGUE: i64 = 36;
+const MO_EPILOGUE: i64 = 37;
+const MO_LDIN: i64 = 38;
+const MO_STOUT: i64 = 39;
+const MO_COPY: i64 = 40;
+const MO_PLACE: i64 = 41;
+const MO_ASR63: i64 = 42;
+
+pub struct MInst {
+    pub op: i64,
+    pub r0: i64,
+    pub r1: i64,
+    pub r2: i64,
+    pub i0: i64,
+    pub i1: i64,
+    pub i2: i64,
+}
+
+/// A recorded function, waiting for allocation and emission.
+pub struct NatFnRec {
+    pub name: str,
+    pub mir: Vec<MInst>,
+    pub nvreg: i64,
+    pub base_frame: i64,
+    pub slots: Vec<i64>,
+}
+
+/// A backend switch, on unless FID_NAT_OFF names it.
+fn ng_on(name: str) -> bool {
+    var off: str = p_getenv("FID_NAT_OFF");
+    if (off as i64) == 0 || str_len(off) == 0 { return true; }
+    return !str_contains("," + off + ",", "," + name + ",");
+}
+
+fn ng_verify_on() -> bool {
+    var v: str = p_getenv("FID_VERIFY");
+    return (v as i64) != 0 && str_len(v) > 0;
+}
+
+fn ng_rec(g: &mut NatGen, op: i64, r0: i64, r1: i64, r2: i64, i0: i64, i1: i64, i2: i64) {
+    g.mir.push(MInst { op: op, r0: r0, r1: r1, r2: r2, i0: i0, i1: i1, i2: i2 });
+}
+
+fn ng_new_vreg(g: &mut NatGen) -> i64 {
+    var v: i64 = g.nvreg;
+    g.nvreg = v + 1;
+    return v;
+}
+
+/// Four fresh scratch vregs for the next IR instruction.
+fn ng_fresh_temps(g: &mut NatGen) {
+    g.t0 = ng_new_vreg(g);
+    g.t1 = ng_new_vreg(g);
+    g.t2 = ng_new_vreg(g);
+    g.t3 = ng_new_vreg(g);
+}
+
+/// Place a label: an operation of its own in the machine IR.
+fn ng_place(g: &mut NatGen, label: i64) {
+    if g.rec { ng_rec(g, MO_PLACE, 0, 0, 0, label, 0, 0); return; }
+    NatEnc_place(&mut g.e, label);
+}
+
+/// d = s >> 63 (arithmetic)
+fn ng_asr63(g: &mut NatGen, d: i64, s: i64) {
+    if g.rec { ng_rec(g, MO_ASR63, d, s, 0, 0, 0, 0); return; }
+    if ng_a64(g) { a64_asr63(&mut g.e, d, s); } else { rv_srai(&mut g.e, d, s, 63); }
+}
+
+/// r0 of `op` is the register it defines.
+fn mi_defines(op: i64) -> bool {
+    if op == MO_LI || op == MO_MOV || op == MO_SLOTADDR || op == MO_LDSLOT || op == MO_LOAD || op == MO_ADDR { return true; }
+    if op >= MO_ADD && op <= MO_F2I { return true; }
+    return op == MO_LDIN || op == MO_ASR63;
+}
+
+/// The fields of `op` it reads: 1 r0, 2 r1, 4 r2.
+fn mi_use_mask(op: i64) -> i64 {
+    if op == MO_MOV || op == MO_LOAD || op == MO_NEG || op == MO_NOT || op == MO_EXT || op == MO_I2F
+        || op == MO_F2I || op == MO_ASR63 { return 2; }
+    if op == MO_STSLOT || op == MO_CALLR || op == MO_BNEZ || op == MO_BEQZ || op == MO_PANICIF || op == MO_STOUT { return 1; }
+    if op == MO_STORE || op == MO_COPY { return 3; }
+    if op >= MO_ADD && op <= MO_SHR { return 6; }
+    if op == MO_DIV || op == MO_REM || op == MO_MULH || op == MO_SETCC || op == MO_FBIN || op == MO_FCMP { return 6; }
+    return 0;
+}
+
+fn mi_is_call(op: i64) -> bool { return op == MO_CALL || op == MO_CALLR; }
+
+/// Ends a machine block: control does not go on to the next instruction
+/// only (it may jump, or not continue at all).
+fn mi_ends_block(op: i64) -> bool {
+    return op == MO_JMP || op == MO_BNEZ || op == MO_BEQZ || op == MO_EPILOGUE || op == MO_TRAP;
+}
+
+fn mi_field(m: MInst, f: i64) -> i64 {
+    if f == 0 { return m.r0; }
+    if f == 1 { return m.r1; }
+    return m.r2;
+}
+
+/// The registers values may be allocated to: caller-saved (lost at a call
+/// that clobbers them) and callee-saved. The argument registers, sp, fp,
+/// lr, the platform register and the scratch registers the operations use
+/// themselves (ad, ad2, the copy cursor, the three spill registers) are
+/// never allocated.
+fn ng_pool_caller(g: &NatGen) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    if ng_a64(g) { v.push(9); v.push(10); v.push(11); v.push(8); }
+    else { v.push(29); }
+    return v;
+}
+
+fn ng_is_callee_saved(g: &NatGen, r: i64) -> bool {
+    if ng_a64(g) { return r >= 19 && r <= 28; }
+    return r == 9 || (r >= 18 && r <= 27);
+}
+
+/// The spill scratch registers: two for uses, one for the definition.
+fn ng_spill_reg(g: &NatGen, k: i64) -> i64 {
+    if ng_a64(g) {
+        if k == 0 { return 14; }
+        if k == 1 { return 15; }
+        return 12;
+    }
+    if k == 0 { return 6; }
+    if k == 1 { return 7; }
+    return 28;
+}
+
+/// Every pool register a call may clobber (an unknown callee).
+fn ng_full_mask(g: &NatGen) -> i64 {
+    var m: i64 = 0;
+    var p: Vec<i64> = ng_pool_caller(g);
+    var i: i64 = 0;
+    while i < p.len() { m = m | (1 << p.get(i)); i = i + 1; }
+    return m;
+}
+
+// --- Promotion of locals (roadmap ME3 in the backend) -------------------
+
+/// The scalar locals of `func` whose address is only loaded from and stored
+/// to, with the local's own type: they become vregs (their Alloca emits
+/// nothing). 1 per promoted id.
+fn ng_promotable(g: &NatGen, func: &IrFunction, module: &IrModule, n: i64) -> Vec<i64> {
+    var cand: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n { cand.push(0); i = i + 1; }
+    if !ng_on("promote") { return cand; }
+    var atys: Vec<IrType> = Vec::new();
+    i = 0;
+    while i < n { atys.push(IrType::I64); i = i + 1; }
+    i = 0;
+    while i < func.insts.len() {
+        var ve: ValueIdInst = func.insts.get(i);
+        match ve.inst {
+            Inst::Alloca(aty, _) => {
+                var ok: bool = false;
+                match aty {
+                    IrType::Struct(_) => {}
+                    IrType::Array(_, _) => {}
+                    IrType::Void => {}
+                    _ => { ok = IrModule_type_size(module, aty) <= 8; }
+                }
+                if ok && ve.id >= 0 && ve.id < n {
+                    cand.set(ve.id, 1);
+                    atys.set(ve.id, aty);
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    var ops: Vec<i64> = Vec::new();
+    i = 0;
+    while i < func.insts.len() {
+        var ve2: ValueIdInst = func.insts.get(i);
+        var keep_ptr: i64 = 0 - 1;
+        match ve2.inst {
+            Inst::Load(p, lty) => {
+                if p >= 0 && p < n && cand.get(p) != 0 && !ir_type_eq(lty, atys.get(p)) { cand.set(p, 0); }
+                keep_ptr = p;
+            }
+            Inst::Store(p2, v2, ety) => {
+                if p2 >= 0 && p2 < n && cand.get(p2) != 0 {
+                    var sty: IrType = atys.get(p2);
+                    var same: bool = true;
+                    match ety {
+                        OptIrType::Some(t) => { same = ir_type_eq(t, sty); }
+                        OptIrType::None => {}
+                    }
+                    if !same { cand.set(p2, 0); }
+                }
+                keep_ptr = p2;
+                if v2 >= 0 && v2 < n && cand.get(v2) != 0 { cand.set(v2, 0); }
+            }
+            _ => {}
+        }
+        if keep_ptr < 0 {
+            ops.clear();
+            ng_inst_operands(ve2.inst, &mut ops);
+            var k: i64 = 0;
+            while k < ops.len() {
+                var u: i64 = ops.get(k);
+                if u >= 0 && u < n { cand.set(u, 0); }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    // 1 + the extension a load of the local's type does from memory
+    i = 0;
+    while i < n {
+        if cand.get(i) != 0 {
+            var t: IrType = atys.get(i);
+            var kind: i64 = ng_narrow_kind(t);
+            if ir_type_eq(t, IrType::F32) { kind = NEXT_SW; }
+            if ir_type_eq(t, IrType::Bool) { kind = NEXT_ZB; }
+            cand.set(i, 1 + kind);
+        }
+        i = i + 1;
+    }
+    return cand;
+}
+
+fn ng_is_promoted(g: &NatGen, id: i64) -> bool {
+    return g.rec && id >= 0 && id < g.promoted.len() && g.promoted.get(id) != 0;
+}
+
+// --- Allocation ---------------------------------------------------------
+
+pub struct NatAlloc {
+    pub assign: Vec<i64>,      // vreg - 64 -> register, -1 spilled, -2 unused
+    pub spill: Vec<i64>,       // vreg - 64 -> frame offset of its slot (spilled)
+    pub frame: i64,
+    pub save_regs: Vec<i64>,
+    pub save_off: i64,
+    pub mask: i64,             // pool registers this function clobbers
+    pub err: str,
+}
+
+/// Machine blocks: starts, ends, the block of each instruction, successors.
+pub struct MBlocks {
+    pub start: Vec<i64>,
+    pub end: Vec<i64>,
+    pub of: Vec<i64>,
+    pub succs: Vec<Vec<i64>>,
+}
+
+fn mi_blocks(mir: &Vec<MInst>) -> MBlocks {
+    var start: Vec<i64> = Vec::new();
+    var end: Vec<i64> = Vec::new();
+    var of: Vec<i64> = Vec::new();
+    var n: i64 = mir.len();
+    var k: i64 = 0;
+    while k < n {
+        var m: MInst = mir.get(k);
+        var begins: bool = k == 0 || m.op == MO_PLACE;
+        if k > 0 && mi_ends_block(mir.get(k - 1).op) { begins = true; }
+        if begins {
+            if start.len() > 0 { end.push(k - 1); }
+            start.push(k);
+        }
+        of.push(start.len() - 1);
+        k = k + 1;
+    }
+    if start.len() > 0 { end.push(n - 1); }
+    var label_block: i64 = HashMap_new();
+    k = 0;
+    while k < n {
+        var mp: MInst = mir.get(k);
+        if mp.op == MO_PLACE { HashMap_insert(label_block, int_to_str(mp.i0), of.get(k)); }
+        k = k + 1;
+    }
+    var succs: Vec<Vec<i64>> = Vec::new();
+    var b: i64 = 0;
+    while b < start.len() {
+        var s: Vec<i64> = Vec::new();
+        var last: MInst = mir.get(end.get(b));
+        var to: str = int_to_str(last.i0);
+        if last.op == MO_JMP {
+            if HashMap_contains(label_block, to) { s.push(HashMap_get(label_block, to)); }
+        } else if last.op == MO_BNEZ || last.op == MO_BEQZ {
+            if HashMap_contains(label_block, to) { s.push(HashMap_get(label_block, to)); }
+            if b + 1 < start.len() { s.push(b + 1); }
+        } else if last.op != MO_EPILOGUE && last.op != MO_TRAP {
+            if b + 1 < start.len() { s.push(b + 1); }
+        }
+        succs.push(s);
+        b = b + 1;
+    }
+    return MBlocks { start: start, end: end, of: of, succs: succs };
+}
+
+/// Block liveness over the vregs whose index has sel[vi] >= 0 (their bit is
+/// sel[vi]); live_in and live_out as bit sets of `words` words per block.
+fn mi_liveness(mir: &Vec<MInst>, mb: &MBlocks, sel: &Vec<i64>, words: i64, live_in: &mut Vec<i64>, live_out: &mut Vec<i64>) {
+    var nb: i64 = mb.start.len();
+    var use_b: Vec<i64> = Vec::new();
+    var def_b: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < nb * words { use_b.push(0); def_b.push(0); live_in.push(0); live_out.push(0); i = i + 1; }
+    var b: i64 = 0;
+    while b < nb {
+        var k: i64 = mb.start.get(b);
+        while k <= mb.end.get(b) {
+            var m: MInst = mir.get(k);
+            var um: i64 = mi_use_mask(m.op);
+            var f: i64 = 0;
+            while f < 3 {
+                if (um & (1 << f)) != 0 {
+                    var v: i64 = mi_field(m, f);
+                    if v >= NG_VBASE && v - NG_VBASE < sel.len() && sel.get(v - NG_VBASE) >= 0 {
+                        var bit: i64 = sel.get(v - NG_VBASE);
+                        var w: i64 = b * words + bit / 64;
+                        if (def_b.get(w) & (1 << (bit % 64))) == 0 { use_b.set(w, use_b.get(w) | (1 << (bit % 64))); }
+                    }
+                }
+                f = f + 1;
+            }
+            if mi_defines(m.op) && m.r0 >= NG_VBASE && m.r0 - NG_VBASE < sel.len() && sel.get(m.r0 - NG_VBASE) >= 0 {
+                var dbit: i64 = sel.get(m.r0 - NG_VBASE);
+                var dw: i64 = b * words + dbit / 64;
+                def_b.set(dw, def_b.get(dw) | (1 << (dbit % 64)));
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    var changed: bool = true;
+    var rounds: i64 = 0;
+    while changed && rounds < 1000 {
+        changed = false;
+        rounds = rounds + 1;
+        b = nb - 1;
+        while b >= 0 {
+            var ss: Vec<i64> = mb.succs.get(b);
+            var wi: i64 = 0;
+            while wi < words {
+                var o: i64 = 0;
+                var si: i64 = 0;
+                while si < ss.len() { o = o | live_in.get(ss.get(si) * words + wi); si = si + 1; }
+                var at: i64 = b * words + wi;
+                var inn: i64 = use_b.get(at) | (o & ~def_b.get(at));
+                if o != live_out.get(at) { live_out.set(at, o); changed = true; }
+                if inn != live_in.get(at) { live_in.set(at, inn); changed = true; }
+                wi = wi + 1;
+            }
+            b = b - 1;
+        }
+    }
+}
+
+fn ng_touch2(lo: &mut Vec<i64>, hi: &mut Vec<i64>, v: i64, p: i64) {
+    var vi: i64 = v - NG_VBASE;
+    if vi < 0 || vi >= lo.len() { return; }
+    if lo.get(vi) < 0 || p < lo.get(vi) { lo.set(vi, p); }
+    if p > hi.get(vi) { hi.set(vi, p); }
+}
+
+/// The clobber mask of the call at `m` (interprocedural: what the callee
+/// was found to clobber, when it was allocated before; else all).
+fn ng_call_mask(g: &NatGen, m: MInst) -> i64 {
+    if m.op != MO_CALL || !ng_on("ipra") { return ng_full_mask(g); }
+    var key: str = int_to_str(m.i0);
+    if HashMap_contains(g.label_fn, key) {
+        var name: str = HashMap_get(g.label_fn, key);
+        if HashMap_contains(g.fn_mask, name) { return HashMap_get(g.fn_mask, name); }
+    }
+    return ng_full_mask(g);
+}
+
+/// Allocate the vregs of one recorded function.
+fn ng_mir_alloc(g: &mut NatGen, rec: &NatFnRec) -> NatAlloc {
+    var nv: i64 = rec.nvreg - NG_VBASE;
+    var mir: Vec<MInst> = rec.mir;
+    var n: i64 = mir.len();
+    var mb: MBlocks = mi_blocks(&mir);
+    var nb: i64 = mb.start.len();
+    var lo: Vec<i64> = Vec::new();
+    var hi: Vec<i64> = Vec::new();
+    var first_b: Vec<i64> = Vec::new();
+    var sel: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < nv { lo.push(0 - 1); hi.push(0 - 1); first_b.push(0 - 1); sel.push(0 - 1); i = i + 1; }
+    // Positions; a vreg seen in two blocks is global
+    var ng: i64 = 0;
+    var calls: Vec<i64> = Vec::new();
+    var masks: Vec<i64> = Vec::new();
+    var hint: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nv { hint.push(0 - 1); i = i + 1; }
+    var k: i64 = 0;
+    while k < n {
+        var m: MInst = mir.get(k);
+        var bk: i64 = mb.of.get(k);
+        var f: i64 = 0;
+        var um: i64 = mi_use_mask(m.op);
+        while f < 3 {
+            var v: i64 = mi_field(m, f);
+            var used: bool = (um & (1 << f)) != 0;
+            var defd: bool = f == 0 && mi_defines(m.op);
+            if (used || defd) && v >= NG_VBASE && v - NG_VBASE < nv {
+                ng_touch2(&mut lo, &mut hi, v, k);
+                var vi: i64 = v - NG_VBASE;
+                if first_b.get(vi) < 0 { first_b.set(vi, bk); }
+                else if first_b.get(vi) != bk && sel.get(vi) < 0 { sel.set(vi, ng); ng = ng + 1; }
+            }
+            f = f + 1;
+        }
+        if mi_is_call(m.op) { calls.push(k); masks.push(ng_call_mask(g, m)); }
+        if m.op == MO_MOV && m.r0 >= NG_VBASE && m.r1 >= NG_VBASE && ng_on("hint") {
+            if m.r0 - NG_VBASE < nv && m.r1 - NG_VBASE < nv {
+                hint.set(m.r0 - NG_VBASE, m.r1 - NG_VBASE);
+                if hint.get(m.r1 - NG_VBASE) < 0 { hint.set(m.r1 - NG_VBASE, m.r0 - NG_VBASE); }
+            }
+        }
+        k = k + 1;
+    }
+    if ng > 0 && nb > 0 {
+        var words: i64 = (ng + 63) / 64;
+        var lin: Vec<i64> = Vec::new();
+        var lout: Vec<i64> = Vec::new();
+        mi_liveness(&mir, &mb, &sel, words, &mut lin, &mut lout);
+        var gv: Vec<i64> = Vec::new();
+        i = 0;
+        while i < ng { gv.push(0); i = i + 1; }
+        i = 0;
+        while i < nv { if sel.get(i) >= 0 { gv.set(sel.get(i), i); } i = i + 1; }
+        var b: i64 = 0;
+        while b < nb {
+            var gi: i64 = 0;
+            while gi < ng {
+                var bit: i64 = 1 << (gi % 64);
+                var at: i64 = b * words + gi / 64;
+                if (lin.get(at) & bit) != 0 { ng_touch2(&mut lo, &mut hi, gv.get(gi) + NG_VBASE, mb.start.get(b)); }
+                if (lout.get(at) & bit) != 0 { ng_touch2(&mut lo, &mut hi, gv.get(gi) + NG_VBASE, mb.end.get(b)); }
+                gi = gi + 1;
+            }
+            b = b + 1;
+        }
+    }
+
+    // Linear scan in order of start
+    var count: Vec<i64> = Vec::new();
+    i = 0;
+    while i <= n + 1 { count.push(0); i = i + 1; }
+    i = 0;
+    while i < nv {
+        if lo.get(i) >= 0 { count.set(lo.get(i) + 1, count.get(lo.get(i) + 1) + 1); }
+        i = i + 1;
+    }
+    i = 1;
+    while i < count.len() { count.set(i, count.get(i) + count.get(i - 1)); i = i + 1; }
+    var order: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nv { order.push(0 - 1); i = i + 1; }
+    var total: i64 = 0;
+    i = 0;
+    while i < nv {
+        if lo.get(i) >= 0 {
+            var slot: i64 = count.get(lo.get(i));
+            order.set(slot, i);
+            count.set(lo.get(i), slot + 1);
+            total = total + 1;
+        }
+        i = i + 1;
+    }
+    var assign: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nv { assign.push(0 - 2); i = i + 1; }
+    var caller: Vec<i64> = ng_pool_caller(g);
+    var callee: Vec<i64> = ng_callee_saved(g);
+    var busy: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 32 { busy.push(0); i = i + 1; }
+    var active: Vec<i64> = Vec::new();
+    var oi: i64 = 0;
+    while oi < total {
+        var v2: i64 = order.get(oi);
+        var st: i64 = lo.get(v2);
+        // Expire: a range ending where this one starts gives its register
+        // up (every operation reads its operands before it writes)
+        var kept: Vec<i64> = Vec::new();
+        var ai: i64 = 0;
+        while ai < active.len() {
+            var a: i64 = active.get(ai);
+            if hi.get(a) <= st && assign.get(a) >= 0 { busy.set(assign.get(a), 0); } else { kept.push(a); }
+            ai = ai + 1;
+        }
+        active = kept;
+        var r: i64 = 0 - 1;
+        var h: i64 = hint.get(v2);
+        if h >= 0 && assign.get(h) >= 0 && busy.get(assign.get(h)) == 0
+            && ng_reg_ok(g, assign.get(h), lo.get(v2), hi.get(v2), &calls, &masks) {
+            r = assign.get(h);
+        }
+        var ci: i64 = 0;
+        while r < 0 && ci < caller.len() {
+            var c: i64 = caller.get(ci);
+            if busy.get(c) == 0 && ng_reg_ok(g, c, lo.get(v2), hi.get(v2), &calls, &masks) { r = c; }
+            ci = ci + 1;
+        }
+        var ki: i64 = 0;
+        while r < 0 && ki < callee.len() {
+            if busy.get(callee.get(ki)) == 0 { r = callee.get(ki); }
+            ki = ki + 1;
+        }
+        if r < 0 {
+            // The active range that ends last gives up its register if it
+            // ends after this one and the register suits this one
+            var far: i64 = 0 - 1;
+            var fi: i64 = 0;
+            while fi < active.len() {
+                var cand: i64 = active.get(fi);
+                if assign.get(cand) >= 0 && hi.get(cand) > hi.get(v2)
+                    && ng_reg_ok(g, assign.get(cand), lo.get(v2), hi.get(v2), &calls, &masks) {
+                    if far < 0 || hi.get(cand) > hi.get(active.get(far)) { far = fi; }
+                }
+                fi = fi + 1;
+            }
+            if far >= 0 {
+                var loser: i64 = active.get(far);
+                r = assign.get(loser);
+                assign.set(loser, 0 - 1);
+                active.set(far, v2);
+                assign.set(v2, r);
+            } else {
+                assign.set(v2, 0 - 1);
+            }
+        } else {
+            assign.set(v2, r);
+            busy.set(r, 1);
+            active.push(v2);
+        }
+        oi = oi + 1;
+    }
+
+    // Spill slots: an IR value's own slot, else a new one
+    var spill: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nv { spill.push(0 - 1); i = i + 1; }
+    var cur: i64 = rec.base_frame;
+    i = 0;
+    while i < nv {
+        if assign.get(i) == 0 - 1 {
+            if i < rec.slots.len() && rec.slots.get(i) >= 0 {
+                spill.set(i, rec.slots.get(i));
+            } else {
+                spill.set(i, cur);
+                cur = cur + 8;
+            }
+        }
+        i = i + 1;
+    }
+    var save: Vec<i64> = Vec::new();
+    var mask: i64 = 0;
+    var used: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 32 { used.push(0); i = i + 1; }
+    i = 0;
+    while i < nv {
+        if assign.get(i) >= 0 { used.set(assign.get(i), 1); }
+        i = i + 1;
+    }
+    i = 0;
+    while i < callee.len() {
+        if used.get(callee.get(i)) != 0 { save.push(callee.get(i)); }
+        i = i + 1;
+    }
+    i = 0;
+    while i < caller.len() {
+        if used.get(caller.get(i)) != 0 { mask = mask | (1 << caller.get(i)); }
+        i = i + 1;
+    }
+    i = 0;
+    while i < masks.len() { mask = mask | masks.get(i); i = i + 1; }
+    var save_off: i64 = cur;
+    cur = cur + 8 * save.len();
+    var frame: i64 = (cur + 15) & (0 - 16);
+    if frame < 16 { frame = 16; }
+    var al: NatAlloc = NatAlloc { assign: assign, spill: spill, frame: frame, save_regs: save, save_off: save_off, mask: mask, err: "" };
+    if ng_verify_on() { al.err = ng_mir_check(g, rec, &mb, &al, &calls, &masks); }
+    return al;
+}
+
+/// Register r may hold a value live over [lo, hi]: callee-saved, or no call
+/// strictly inside clobbers it.
+fn ng_reg_ok(g: &NatGen, r: i64, lo: i64, hi: i64, calls: &Vec<i64>, masks: &Vec<i64>) -> bool {
+    if ng_is_callee_saved(g, r) { return true; }
+    // the first call after lo (binary search)
+    var a: i64 = 0;
+    var b: i64 = calls.len();
+    while a < b {
+        var mid: i64 = (a + b) / 2;
+        if calls.get(mid) <= lo { a = mid + 1; } else { b = mid; }
+    }
+    while a < calls.len() && calls.get(a) < hi {
+        if (masks.get(a) & (1 << r)) != 0 { return false; }
+        a = a + 1;
+    }
+    return true;
+}
+
+/// The allocation checker (roadmap RA15): exact liveness per instruction,
+/// computed afresh over every vreg; no definition may write a register
+/// another live value holds, and no call may clobber one that holds a live
+/// value. "" when the allocation is sound.
+fn ng_mir_check(g: &NatGen, rec: &NatFnRec, mb: &MBlocks, al: &NatAlloc, calls: &Vec<i64>, masks: &Vec<i64>) -> str {
+    var nv: i64 = rec.nvreg - NG_VBASE;
+    var mir: Vec<MInst> = rec.mir;
+    var sel: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < nv { sel.push(i); i = i + 1; }
+    var words: i64 = (nv + 63) / 64;
+    if words == 0 { return ""; }
+    var lin: Vec<i64> = Vec::new();
+    var lout: Vec<i64> = Vec::new();
+    mi_liveness(&mir, mb, &sel, words, &mut lin, &mut lout);
+    var call_at: i64 = HashMap_new();
+    i = 0;
+    while i < calls.len() { HashMap_insert(call_at, int_to_str(calls.get(i)), masks.get(i)); i = i + 1; }
+    var b: i64 = 0;
+    while b < mb.start.len() {
+        var live: Vec<i64> = Vec::new();
+        var cnt: Vec<i64> = Vec::new();
+        i = 0;
+        while i < 32 { cnt.push(0); i = i + 1; }
+        i = 0;
+        while i < words { live.push(lout.get(b * words + i)); i = i + 1; }
+        i = 0;
+        while i < nv {
+            if (live.get(i / 64) & (1 << (i % 64))) != 0 && al.assign.get(i) >= 0 {
+                cnt.set(al.assign.get(i), cnt.get(al.assign.get(i)) + 1);
+            }
+            i = i + 1;
+        }
+        var k: i64 = mb.end.get(b);
+        while k >= mb.start.get(b) {
+            var m: MInst = mir.get(k);
+            if mi_defines(m.op) && m.r0 >= NG_VBASE && m.r0 - NG_VBASE < nv {
+                var dv: i64 = m.r0 - NG_VBASE;
+                var dr: i64 = al.assign.get(dv);
+                if dr >= 0 {
+                    var mine: i64 = 0;
+                    if (live.get(dv / 64) & (1 << (dv % 64))) != 0 { mine = 1; }
+                    var others: i64 = cnt.get(dr) - mine;
+                    // a move into the register its source already holds
+                    // writes the same value
+                    if others > 0 && !(m.op == MO_MOV && m.r1 >= NG_VBASE && al.assign.get(m.r1 - NG_VBASE) == dr) {
+                        return rec.name + ": instruction " + int_to_str(k) + " writes register " + int_to_str(dr)
+                            + " while another live value holds it";
+                    }
+                }
+            }
+            if mi_is_call(m.op) {
+                var cm: i64 = HashMap_get(call_at, int_to_str(k));
+                var r: i64 = 0;
+                while r < 32 {
+                    if (cm & (1 << r)) != 0 && cnt.get(r) > 0 {
+                        return rec.name + ": the call at " + int_to_str(k) + " clobbers register " + int_to_str(r)
+                            + ", which holds a live value";
+                    }
+                    r = r + 1;
+                }
+            }
+            // live = (live - defs) + uses
+            if mi_defines(m.op) && m.r0 >= NG_VBASE && m.r0 - NG_VBASE < nv {
+                var d2: i64 = m.r0 - NG_VBASE;
+                if (live.get(d2 / 64) & (1 << (d2 % 64))) != 0 {
+                    live.set(d2 / 64, live.get(d2 / 64) & ~(1 << (d2 % 64)));
+                    if al.assign.get(d2) >= 0 { cnt.set(al.assign.get(d2), cnt.get(al.assign.get(d2)) - 1); }
+                }
+            }
+            var um: i64 = mi_use_mask(m.op);
+            var f: i64 = 0;
+            while f < 3 {
+                if (um & (1 << f)) != 0 {
+                    var u: i64 = mi_field(m, f) - NG_VBASE;
+                    if u >= 0 && u < nv && (live.get(u / 64) & (1 << (u % 64))) == 0 {
+                        live.set(u / 64, live.get(u / 64) | (1 << (u % 64)));
+                        if al.assign.get(u) >= 0 { cnt.set(al.assign.get(u), cnt.get(al.assign.get(u)) + 1); }
+                    }
+                }
+                f = f + 1;
+            }
+            k = k - 1;
+        }
+        b = b + 1;
+    }
+    return "";
+}
+
+// --- Emission -----------------------------------------------------------
+
+/// Emit a recorded function with its allocation: each operation through the
+/// architecture layer with physical registers.
+fn ng_mir_emit(g: &mut NatGen, rec: &NatFnRec, al: &NatAlloc) {
+    g.rec = false;
+    g.save_regs = al.save_regs;
+    g.save_off = al.save_off;
+    g.frame = al.frame;
+    var nv: i64 = rec.nvreg - NG_VBASE;
+    var k: i64 = 0;
+    while k < rec.mir.len() {
+        var m: MInst = rec.mir.get(k);
+        var p0: i64 = m.r0;
+        var p1: i64 = m.r1;
+        var p2: i64 = m.r2;
+        var um: i64 = mi_use_mask(m.op);
+        var store_off: i64 = 0 - 1;
+        var loaded_v: i64 = 0 - 1;
+        var nscr: i64 = 0;
+        var f: i64 = 0;
+        while f < 3 {
+            var v: i64 = mi_field(m, f);
+            var used: bool = (um & (1 << f)) != 0;
+            var defd: bool = f == 0 && mi_defines(m.op);
+            var p: i64 = v;
+            if (used || defd) && v >= NG_VBASE && v - NG_VBASE < nv {
+                var vi: i64 = v - NG_VBASE;
+                var r: i64 = al.assign.get(vi);
+                if r >= 0 {
+                    p = r;
+                } else if used {
+                    if v == loaded_v {
+                        p = ng_spill_reg(g, 0);
+                    } else {
+                        p = ng_spill_reg(g, nscr);
+                        if m.op != MO_MOV { ng_ld_slot(g, p, al.spill.get(vi)); }
+                        loaded_v = v;
+                        nscr = nscr + 1;
+                    }
+                } else {
+                    p = ng_spill_reg(g, 2);
+                    store_off = al.spill.get(vi);
+                }
+            }
+            if f == 0 { p0 = p; } else if f == 1 { p1 = p; } else { p2 = p; }
+            f = f + 1;
+        }
+        if m.op == MO_MOV {
+            // Moves to and from slots directly
+            var sv: i64 = m.r1;
+            var src_spilled: bool = sv >= NG_VBASE && sv - NG_VBASE < nv && al.assign.get(sv - NG_VBASE) < 0;
+            if src_spilled && store_off >= 0 {
+                ng_ld_slot(g, p1, al.spill.get(sv - NG_VBASE));
+                ng_st_slot(g, store_off, p1);
+            } else if src_spilled {
+                ng_ld_slot(g, p0, al.spill.get(sv - NG_VBASE));
+            } else if store_off >= 0 {
+                ng_st_slot(g, store_off, p1);
+            } else if p0 != p1 {
+                ng_mov(g, p0, p1);
+            }
+        } else {
+            ng_mi_dispatch(g, m, p0, p1, p2);
+            if store_off >= 0 { ng_st_slot(g, store_off, p0); }
+        }
+        k = k + 1;
+    }
+}
+
+fn ng_mi_dispatch(g: &mut NatGen, m: MInst, p0: i64, p1: i64, p2: i64) {
+    var op: i64 = m.op;
+    if op == MO_LI { ng_li(g, p0, m.i0); return; }
+    if op == MO_SLOTADDR { ng_slot_addr(g, p0, m.i0); return; }
+    if op == MO_LDSLOT { ng_ld_slot(g, p0, m.i0); return; }
+    if op == MO_STSLOT { ng_st_slot(g, m.i0, p0); return; }
+    if op == MO_LOAD { ng_load(g, p0, p1, m.i0, m.i1, m.i2 != 0); return; }
+    if op == MO_STORE { ng_store(g, p0, m.i0, p1, m.i1); return; }
+    if op == MO_ADDR { ng_addr(g, p0, m.i0); return; }
+    if op == MO_CALL { ng_call_label(g, m.i0); return; }
+    if op == MO_CALLR { ng_call_reg(g, p0); return; }
+    if op == MO_JMP { ng_jmp(g, m.i0); return; }
+    if op == MO_BNEZ { ng_bnez(g, p0, m.i0); return; }
+    if op == MO_BEQZ { ng_beqz(g, p0, m.i0); return; }
+    if op == MO_PANICIF { ng_panic_if(g, p0, m.i0); return; }
+    if op == MO_TRAP { ng_trap(g); return; }
+    if op == MO_ADD { ng_add(g, p0, p1, p2); return; }
+    if op == MO_SUB { ng_sub(g, p0, p1, p2); return; }
+    if op == MO_MUL { ng_mul(g, p0, p1, p2); return; }
+    if op == MO_AND { ng_and(g, p0, p1, p2); return; }
+    if op == MO_OR { ng_or(g, p0, p1, p2); return; }
+    if op == MO_XOR { ng_xor(g, p0, p1, p2); return; }
+    if op == MO_SHL { ng_shl(g, p0, p1, p2); return; }
+    if op == MO_SAR { ng_sar(g, p0, p1, p2); return; }
+    if op == MO_SHR { ng_shr(g, p0, p1, p2); return; }
+    if op == MO_NEG { ng_neg(g, p0, p1); return; }
+    if op == MO_NOT { ng_not_bits(g, p0, p1); return; }
+    if op == MO_DIV { ng_div(g, p0, p1, p2, m.i0 != 0); return; }
+    if op == MO_REM { ng_rem(g, p0, p1, p2, m.i0 != 0); return; }
+    if op == MO_MULH { ng_mulh(g, p0, p1, p2, m.i0 != 0); return; }
+    if op == MO_SETCC { ng_setcc(g, p0, p1, p2, m.i0); return; }
+    if op == MO_EXT { ng_ext(g, p0, p1, m.i0); return; }
+    if op == MO_FBIN { ng_fbin(g, m.i0, p0, p1, p2, m.i1 != 0); return; }
+    if op == MO_FCMP { ng_fcmp(g, p0, p1, p2, m.i0, m.i1 != 0); return; }
+    if op == MO_I2F { ng_i2f(g, p0, p1, m.i0 != 0); return; }
+    if op == MO_F2I { ng_f2i(g, p0, p1, m.i0 != 0); return; }
+    if op == MO_PROLOGUE { ng_prologue(g, g.frame); return; }
+    if op == MO_EPILOGUE { ng_epilogue(g); return; }
+    if op == MO_LDIN { ng_ld_incoming(g, p0, m.i0); return; }
+    if op == MO_STOUT { ng_st_outgoing(g, m.i0, p0); return; }
+    if op == MO_COPY { ng_copy(g, p0, p1, m.i0); return; }
+    if op == MO_PLACE { NatEnc_place(&mut g.e, m.i0); return; }
+    if op == MO_ASR63 { ng_asr63(g, p0, p1); return; }
+}
+
+/// A function's identity for folding: two functions with the same
+/// operations, registers, immediates (local labels by order) and frame emit
+/// the same bytes.
+fn ng_mir_key(rec: &NatFnRec, al: &NatAlloc) -> str {
+    var h1: i64 = 0 - 3750763034362895579;
+    var h2: i64 = 1469598103934665603;
+    var local: i64 = HashMap_new();
+    var nloc: i64 = 0;
+    var k: i64 = 0;
+    while k < rec.mir.len() {
+        var m: MInst = rec.mir.get(k);
+        if m.op == MO_PLACE {
+            HashMap_insert(local, int_to_str(m.i0), nloc);
+            nloc = nloc + 1;
+        }
+        k = k + 1;
+    }
+    var nv: i64 = rec.nvreg - NG_VBASE;
+    k = 0;
+    while k < rec.mir.len() {
+        var m2: MInst = rec.mir.get(k);
+        var vals: Vec<i64> = Vec::new();
+        vals.push(m2.op);
+        var f: i64 = 0;
+        while f < 3 {
+            var v: i64 = mi_field(m2, f);
+            if v >= NG_VBASE && v - NG_VBASE < nv {
+                var r: i64 = al.assign.get(v - NG_VBASE);
+                if r >= 0 { vals.push(r); } else { vals.push(1000000 + al.spill.get(v - NG_VBASE)); }
+            } else {
+                vals.push(v);
+            }
+            f = f + 1;
+        }
+        var i0: i64 = m2.i0;
+        if (m2.op == MO_PLACE || m2.op == MO_JMP || m2.op == MO_BNEZ || m2.op == MO_BEQZ)
+            && HashMap_contains(local, int_to_str(i0)) {
+            i0 = 0 - 1 - HashMap_get(local, int_to_str(i0));
+        }
+        vals.push(i0);
+        vals.push(m2.i1);
+        vals.push(m2.i2);
+        var j: i64 = 0;
+        while j < vals.len() {
+            h1 = (h1 ^ vals.get(j)) * 1099511628211;
+            h2 = h2 * 6364136223846793005 + vals.get(j) + 1442695040888963407;
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    var sv: i64 = 0;
+    var si: i64 = 0;
+    while si < al.save_regs.len() { sv = sv * 64 + al.save_regs.get(si); si = si + 1; }
+    return int_to_str(h1) + ":" + int_to_str(h2) + ":" + int_to_str(rec.mir.len()) + ":" + int_to_str(al.frame) + ":" + int_to_str(sv);
+}
+
+/// Allocate and emit every recorded function, callees first.
+fn ng_mir_finish(g: &mut NatGen) -> str {
+    // label -> function name, and each function's callees
+    var by_name: i64 = HashMap_new();
+    var ri: i64 = 0;
+    while ri < g.recs.len() {
+        var r: NatFnRec = g.recs.get(ri);
+        HashMap_insert(by_name, r.name, ri);
+        HashMap_insert(g.label_fn, int_to_str(HashMap_get(g.fn_labels, r.name)), r.name);
+        ri = ri + 1;
+    }
+    // Post-order over the call graph (iterative), roots in recording order
+    var order: Vec<i64> = Vec::new();
+    var state: Vec<i64> = Vec::new();
+    ri = 0;
+    while ri < g.recs.len() { state.push(0); ri = ri + 1; }
+    var root: i64 = 0;
+    while root < g.recs.len() {
+        if state.get(root) == 0 {
+            var stack: Vec<i64> = Vec::new();
+            var pos: Vec<i64> = Vec::new();
+            stack.push(root);
+            pos.push(0);
+            state.set(root, 1);
+            while stack.len() > 0 {
+                var top: i64 = stack.get(stack.len() - 1);
+                var at: i64 = pos.get(pos.len() - 1);
+                var rec: NatFnRec = g.recs.get(top);
+                var next: i64 = 0 - 1;
+                while at < rec.mir.len() && next < 0 {
+                    var m: MInst = rec.mir.get(at);
+                    at = at + 1;
+                    if m.op == MO_CALL {
+                        var key: str = int_to_str(m.i0);
+                        if HashMap_contains(g.label_fn, key) {
+                            var callee: i64 = HashMap_get(by_name, HashMap_get(g.label_fn, key));
+                            if state.get(callee) == 0 { next = callee; }
+                        }
+                    }
+                }
+                pos.set(pos.len() - 1, at);
+                if next >= 0 {
+                    state.set(next, 1);
+                    stack.push(next);
+                    pos.push(0);
+                } else {
+                    state.set(top, 2);
+                    order.push(top);
+                    stack.pop();
+                    pos.pop();
+                }
+            }
+        }
+        root = root + 1;
+    }
+    var folded: i64 = HashMap_new();
+    var fold_on: bool = ng_on("fold");
+    var oi: i64 = 0;
+    while oi < order.len() {
+        var rec2: NatFnRec = g.recs.get(order.get(oi));
+        g.cur_name = rec2.name;
+        var al: NatAlloc = ng_mir_alloc(g, &rec2);
+        if al.err != "" { return "native backend: register allocation check failed: " + al.err; }
+        HashMap_insert(g.fn_mask, rec2.name, al.mask);
+        var label: i64 = HashMap_get(g.fn_labels, rec2.name);
+        var key: str = "";
+        if fold_on { key = ng_mir_key(&rec2, &al); }
+        if fold_on && HashMap_contains(folded, key) {
+            // The same bytes are already in the image: this name points there
+            g.e.labels.set(label, HashMap_get(folded, key));
+            g.n_folded = g.n_folded + 1;
+        } else {
+            NatEnc_align(&mut g.e, 4);
+            NatEnc_place(&mut g.e, label);
+            if fold_on { HashMap_insert(folded, key, g.e.code.len()); }
+            g.placed_fns.push(rec2.name);
+            ng_mir_emit(g, &rec2, &al);
+        }
+        oi = oi + 1;
+    }
+    return "";
+}
+
+// ===========================================================================
 // Calls
 // ===========================================================================
 
@@ -1362,10 +2442,10 @@ fn ng_gen_divmod(g: &mut NatGen, is_mod: bool, ty: IrType, checked: bool) {
         ng_neg(g, g.t0, g.t0);
     }
     ng_jmp(g, done);
-    NatEnc_place(&mut g.e, normal);
+    ng_place(g, normal);
     if is_mod { ng_rem(g, g.t2, g.t0, g.t1, false); ng_mov(g, g.t0, g.t2); }
     else { ng_div(g, g.t0, g.t0, g.t1, false); }
-    NatEnc_place(&mut g.e, done);
+    ng_place(g, done);
 }
 
 /// t0 normalized to narrow type `ty`; with a panic: one that does not fit
@@ -1407,7 +2487,7 @@ fn ng_gen_checked(g: &mut NatGen, kind: i64, ty: IrType, checked: bool) {
         } else {
             ng_mulh(g, g.t3, g.t0, g.t1, false);
             ng_mul(g, g.t2, g.t0, g.t1);
-            if ng_a64(g) { a64_asr63(&mut g.e, g.ad, g.t2); } else { rv_srai(&mut g.e, g.ad, g.t2, 63); }
+            ng_asr63(g, g.ad, g.t2);
             ng_setcc(g, g.t3, g.t3, g.ad, NCC_NE);
             ng_panic_if(g, g.t3, which);
             ng_mov(g, g.t0, g.t2);
@@ -1586,6 +2666,7 @@ fn ng_gen_inst(g: &mut NatGen, id: i64, inst: Inst, func: &IrFunction, module: &
             ng_st_val(g, id, g.t0);
         }
         Inst::Alloca(_, _) => {
+            if ng_is_promoted(g, id) { return; }
             var data: i64 = 0 - 1;
             if id >= 0 && id < g.alloca_data.len() { data = g.alloca_data.get(id); }
             if data >= 0 {
@@ -1594,6 +2675,11 @@ fn ng_gen_inst(g: &mut NatGen, id: i64, inst: Inst, func: &IrFunction, module: &
             }
         }
         Inst::Load(ptr, ty) => {
+            if ng_is_promoted(g, ptr) {
+                ng_mov(g, g.t0, NG_VBASE + ptr);
+                ng_st_val(g, id, g.t0);
+                return;
+            }
             var size: i64 = IrModule_type_size(module, ty);
             var unsigned: bool = false;
             match ty {
@@ -1612,6 +2698,15 @@ fn ng_gen_inst(g: &mut NatGen, id: i64, inst: Inst, func: &IrFunction, module: &
             ng_st_val(g, id, g.t0);
         }
         Inst::Store(ptr, value, explicit_ty) => {
+            if ng_is_promoted(g, ptr) {
+                // The local's type decides the extension a load from memory
+                // would have done
+                ng_ld_val(g, g.t1, value);
+                var pk: i64 = g.promoted.get(ptr) - 1;
+                if pk > 0 { ng_ext(g, g.t1, g.t1, pk); }
+                ng_mov(g, NG_VBASE + ptr, g.t1);
+                return;
+            }
             // The explicit store type, else the pointee type, else the
             // value's type (as the C backend and pe_ir)
             var store_ty: IrType = IrType::I64;
@@ -1762,12 +2857,12 @@ fn ng_gen_inst(g: &mut NatGen, id: i64, inst: Inst, func: &IrFunction, module: &
                     ng_beqz(g, g.t2, next);
                     ng_call_label(g, ng_fn_label(g, mname));
                     ng_jmp(g, done);
-                    NatEnc_place(&mut g.e, next);
+                    ng_place(g, next);
                 }
                 ti = ti + 1;
             }
             ng_trap(g); // no implementation for this type
-            NatEnc_place(&mut g.e, done);
+            ng_place(g, done);
             ng_st_val(g, id, ng_argreg(g, 0));
         }
         Inst::MakeDyn(value, type_name, _) => {
@@ -1892,9 +2987,14 @@ fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModu
     g.cur_name = name;
     // The runtime's arithmetic wraps, as pe_ir's does
     g.cur_wrapping = func.is_wrapping || is_pe_runtime_fn(name);
-    NatEnc_align(&mut g.e, 4);
-    NatEnc_place(&mut g.e, HashMap_get(g.fn_labels, name));
-    g.placed_fns.push(name);
+    // The machine IR records the function (placed when it is emitted, after
+    // allocation); the direct path places and encodes it now
+    var mir_on: bool = NG_MIR && ng_on("mir");
+    if !mir_on {
+        NatEnc_align(&mut g.e, 4);
+        NatEnc_place(&mut g.e, HashMap_get(g.fn_labels, name));
+        g.placed_fns.push(name);
+    }
 
     // Every value id gets a slot (8 bytes, or its type's size)
     var maxid: i64 = 0;
@@ -1982,14 +3082,33 @@ fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModu
         i = i + 1;
     }
     if g.va_off >= 0 { cur = cur + 64; }
-    // Registers for values, and the area that saves them
-    ng_regalloc(g, func, slots.len());
-    g.save_off = cur;
-    cur = cur + 8 * g.save_regs.len();
-    var frame: i64 = (cur + 15) & (0 - 16);
-    if frame < 16 { frame = 16; }
+    var frame: i64 = 16;
+    var base_frame: i64 = cur;
+    if mir_on {
+        g.vreg = Vec::new();
+        g.save_regs = Vec::new();
+    } else {
+        // Registers for values, and the area that saves them
+        ng_regalloc(g, func, slots.len());
+        g.save_off = cur;
+        cur = cur + 8 * g.save_regs.len();
+        frame = (cur + 15) & (0 - 16);
+        if frame < 16 { frame = 16; }
+    }
     g.slots = slots;
     g.alloca_data = adata;
+    var saved_t: Vec<i64> = Vec::new();
+    if mir_on {
+        saved_t.push(g.t0);
+        saved_t.push(g.t1);
+        saved_t.push(g.t2);
+        saved_t.push(g.t3);
+        g.rec = true;
+        g.mir = Vec::new();
+        g.nvreg = NG_VBASE + g.slots.len();
+        g.promoted = ng_promotable(g, func, module, g.slots.len());
+        ng_fresh_temps(g);
+    }
 
     ng_prologue(g, frame);
     // Parameters: registers, then the caller's stack
@@ -2014,7 +3133,7 @@ fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModu
     bi = 0;
     while bi < func.blocks.len() {
         var block: BasicBlock = func.blocks.get(bi);
-        NatEnc_place(&mut g.e, ng_block_label(g, block.id));
+        ng_place(g, ng_block_label(g, block.id));
         g.next_block_label = 0 - 1;
         if bi + 1 < func.blocks.len() {
             g.next_block_label = ng_block_label(g, func.blocks.get(bi + 1).id);
@@ -2022,6 +3141,7 @@ fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModu
         var ii: i64 = 0;
         while ii < block.instructions.len() {
             var iid: i64 = block.instructions.get(ii);
+            if g.rec { ng_fresh_temps(g); }
             match IrFunction_get_inst(func, iid) {
                 OptInst::Some(inst) => { ng_gen_inst(g, iid, inst, func, module); }
                 OptInst::None => {}
@@ -2033,6 +3153,15 @@ fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModu
     // Falling off the end returns 0
     ng_li(g, ng_argreg(g, 0), 0);
     ng_epilogue(g);
+    if mir_on {
+        g.rec = false;
+        g.recs.push(NatFnRec { name: name, mir: g.mir, nvreg: g.nvreg, base_frame: base_frame, slots: g.slots });
+        g.mir = Vec::new();
+        g.t0 = saved_t.get(0);
+        g.t1 = saved_t.get(1);
+        g.t2 = saved_t.get(2);
+        g.t3 = saved_t.get(3);
+    }
 }
 
 // ===========================================================================
@@ -2626,6 +3755,7 @@ pub fn nat_generate_elf(module: IrModule, arch: i64) -> ResultBytes {
     if !pe_module_has_fn(&module, "main") {
         return ResultBytes::Err(c_vec1("native backend: the program has no `main` function"));
     }
+    var t_start: i64 = p_clock_now_ms();
     var g: NatGen = NatGen_new(arch);
     var fi: i64 = 0;
     while fi < module.functions.len() {
@@ -2665,6 +3795,17 @@ pub fn nat_generate_elf(module: IrModule, arch: i64) -> ResultBytes {
         }
         qi = qi + 1;
     }
+    var t_rec: i64 = p_clock_now_ms();
+    if NG_MIR && ng_on("mir") {
+        var merr: str = ng_mir_finish(&mut g);
+        if merr != "" {
+            return ResultBytes::Err(c_vec1(merr));
+        }
+    }
+    var t_emit: i64 = p_clock_now_ms();
+    p_eprint_str("[prof] native: lower " + int_to_str(t_rec - t_start) + "ms, allocate and emit "
+        + int_to_str(t_emit - t_rec) + "ms, " + int_to_str(g.recs.len()) + " functions, "
+        + int_to_str(g.n_folded) + " folded\n");
     NatEnc_align(&mut g.e, 4);
     NatEnc_place(&mut g.e, g.code_end_label);
     ng_gen_data(&mut g, &module);

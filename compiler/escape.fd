@@ -67,6 +67,7 @@ pub struct EscapeChecker {
     pub line: i64,
     pub report: bool,
     pub errors: Vec<str>,
+    pub type_names: i64,       // HashMap: declared struct or enum name -> 1
 }
 
 // --- Root sets ------------------------------------------------------------
@@ -265,6 +266,19 @@ pub fn EscapeChecker_new(program: Program) -> EscapeChecker {
         HashMap_insert(globals, program.consts.get(ci).name, 1);
         ci = ci + 1;
     }
+    // Declared types: a struct or enum cannot hold a reference (rule 2), so
+    // a function returning one has no parameter reaching its result
+    var type_names: i64 = HashMap_new();
+    var si: i64 = 0;
+    while si < program.structs.len() {
+        HashMap_insert(type_names, program.structs.get(si).name, 1);
+        si = si + 1;
+    }
+    var ei: i64 = 0;
+    while ei < program.enums.len() {
+        HashMap_insert(type_names, program.enums.get(ei).name, 1);
+        ei = ei + 1;
+    }
     return EscapeChecker {
         all: all,
         func_index: func_index,
@@ -282,7 +296,35 @@ pub fn EscapeChecker_new(program: Program) -> EscapeChecker {
         line: 0,
         report: false,
         errors: Vec::new(),
+        type_names: type_names,
     };
+}
+
+/// A result type no reference can be in: a scalar, str, void, or a
+/// declared struct or enum (not a type parameter, which a call could make
+/// a reference). Such a function's summary is always empty (CS3).
+fn esc_ret_noref(self: &EscapeChecker, t: Type) -> bool {
+    match t {
+        Type::I8 => { return true; }
+        Type::I16 => { return true; }
+        Type::I32 => { return true; }
+        Type::I64 => { return true; }
+        Type::I128 => { return true; }
+        Type::U8 => { return true; }
+        Type::U16 => { return true; }
+        Type::U32 => { return true; }
+        Type::U64 => { return true; }
+        Type::U128 => { return true; }
+        Type::F32 => { return true; }
+        Type::F64 => { return true; }
+        Type::Bool => { return true; }
+        Type::Str => { return true; }
+        Type::Void => { return true; }
+        Type::Never => { return true; }
+        Type::Named(n) => { return HashMap_get(self.type_names, n) != 0; }
+        _ => { return false; }
+    }
+    return false;
 }
 
 /// A `&mut`/`&` parameter holding a Vec, HashMap or str, given to a value
@@ -1517,12 +1559,21 @@ pub fn escape_check(program: Program) -> Vec<str> {
     esc_check_decls(&mut c, program);
     // Infer which parameters reach each function's result, to a fixpoint.
     // Summaries only grow, so an unchanged total means nothing changed.
+    // Only a function whose result can hold a reference has a summary to
+    // find; the rest are analyzed once, in the reporting pass (CS3: the
+    // fixpoint used to go over every function several times).
+    var with_ref: Vec<i64> = Vec::new();
+    var wi: i64 = 0;
+    while wi < c.all.len() {
+        if !esc_ret_noref(&c, c.all.get(wi).func.ret_ty) { with_ref.push(wi); }
+        wi = wi + 1;
+    }
     var before: i64 = -1;
     while before != esc_summary_total(&c) {
         before = esc_summary_total(&c);
         var i: i64 = 0;
-        while i < c.all.len() {
-            var ef: EscFunc = c.all.get(i);
+        while i < with_ref.len() {
+            var ef: EscFunc = c.all.get(with_ref.get(i));
             esc_analyze_func(&mut c, ef.key, ef.func);
             i = i + 1;
         }

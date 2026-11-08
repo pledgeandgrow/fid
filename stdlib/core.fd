@@ -389,6 +389,88 @@ pub fn Vec_new_typed(code: i64, tid: i64) -> i64 {
     return v;
 }
 
+// A Vec buffer that core allocates keeps room for its share box in front
+// of the data (release item 8): [tag][owners][cap] data..., the tag being
+// P_VBUF_KEY + the data's address. The first copy of a Vec then uses that
+// room (box = data - 16) instead of allocating a box. A buffer made any
+// other way (the C runtime, an older build) has no tag and gets a box of
+// its own, as before; every free below handles both.
+const VEC_BUF_RC: bool = true;
+const P_VBUF_KEY: i64 = 0x5646425546494445;
+
+/// A buffer of `bytes` bytes for a Vec's data, with room for its box.
+@wrapping
+fn vec_buf_alloc(bytes: i64) -> i64 {
+    if !VEC_BUF_RC { return p_malloc(bytes); }
+    var b: i64 = p_malloc(bytes + 24);
+    if b == 0 { return 0; }
+    var d: i64 = b + 24;
+    var t0: *mut i64 = b;
+    var t8: *mut i64 = b + 8;
+    var t16: *mut i64 = b + 16;
+    unsafe { *t0 = P_VBUF_KEY + d; *t8 = 0; *t16 = 0; }
+    return d;
+}
+
+/// Whether the buffer at `d` has room for its box (vec_buf_alloc made it).
+@wrapping
+fn vec_buf_tagged(d: i64) -> bool {
+    if !VEC_BUF_RC || d == 0 { return false; }
+    var tp: *mut i64 = d - 24;
+    var t: i64 = 0;
+    unsafe { t = *tp; }
+    return t == P_VBUF_KEY + d;
+}
+
+/// Free a Vec's data buffer, made by vec_buf_alloc or not.
+pub fn vec_buf_free(d: i64) {
+    if d == 0 { return; }
+    if vec_buf_tagged(d) {
+        var tp: *mut i64 = d - 24;
+        unsafe { *tp = 0; }
+        p_free(d - 24);
+        return;
+    }
+    p_free(d);
+}
+
+/// Free a share box, unless it is the room in front of `data`.
+pub fn vec_box_free(bx: i64, data: i64) {
+    if bx == data - 16 && vec_buf_tagged(data) { return; }
+    p_free(bx);
+}
+
+/// `Vec::filled(n, x)`: `n` elements, each `x`, stored at `code`'s size and
+/// owned as `tid` says (each element is one more owner of `x`; the caller
+/// keeps its own). The C backend replaces the body with a memset or a word
+/// loop (codegen_c.fd fast_core_vec_body).
+pub fn Vec_filled_typed(n: i64, x: i64, code: i64, tid: i64) -> i64 {
+    var v: i64 = Vec_new_typed(code, tid);
+    if n <= 0 { return v; }
+    var esz: i64 = vec_esz(code);
+    var data: i64 = vec_buf_alloc(n * esz);
+    if data == 0 { p_panic("out of memory"); }
+    var i: i64 = 0;
+    if code != 0 {
+        while i < n {
+            vec_st(data, i, code, x);
+            i = i + 1;
+        }
+    } else {
+        while i < n {
+            var wp: *mut i64 = data + i * 8;
+            var e: i64 = vec_elem_dup(tid, x);
+            unsafe { *wp = e; }
+            i = i + 1;
+        }
+    }
+    var p0: *mut i64 = v;
+    var p8: *mut i64 = v + 8;
+    var p16: *mut i64 = v + 16;
+    unsafe { *p0 = data; *p8 = n; *p16 = n; }
+    return v;
+}
+
 /// The element type of a Vec (0: plain values, nothing to drop or copy).
 @crashfree
 @wrapping
@@ -408,6 +490,7 @@ pub fn vec_elem_drop(tid: i64, e: i64) {
     if tid == P_TID_STR { Str_drop(e); return; }
     if tid == P_TID_VEC { Vec_drop(e); return; }
     if tid == P_TID_MAP { HashMap_drop(e); return; }
+    if tid >= P_TID_BOX { Box_drop_t(e, tid - P_TID_BOX); return; }
     __p_elem_drop(tid, e);
 }
 
@@ -417,7 +500,177 @@ pub fn vec_elem_dup(tid: i64, e: i64) -> i64 {
     if tid == P_TID_STR { return Str_dup(e); }
     if tid == P_TID_VEC { return Vec_share(e); }
     if tid == P_TID_MAP { return HashMap_share(e); }
+    if tid >= P_TID_BOX { return Box_dup(e); }
     return __p_elem_dup(tid, e);
+}
+
+// A Box (proposal 0004, ownership of boxes): its block is [count word]
+// then what it holds, and a Box is the address after the count. Copying a
+// Box counts one more owner (the copies share what they hold, as they
+// always did); its last owner drops what it holds and frees the block.
+// The count word is P_BOX_RC + owners; anything else (a Box made another
+// way) is left alone.
+const P_BOX_RC: i64 = 0x464944424F580000;
+const P_BOX_RC_MAX: i64 = 0x40000000;
+const P_BOX_DEAD: i64 = 0x464944424F57FFFF;
+// Element type of a Box: P_TID_BOX + the element type of what it holds
+pub const P_TID_BOX: i64 = 0x8000;
+
+/// One more owner of a Box; returns `b`.
+@wrapping
+pub fn Box_dup(b: i64) -> i64 {
+    if b == 0 { return b; }
+    var hp: *mut i64 = b - 8;
+    var w: i64 = 0;
+    unsafe { w = *hp; }
+    var c: i64 = w - P_BOX_RC;
+    if c >= 1 && c < P_BOX_RC_MAX - 1 {
+        unsafe { *hp = w + 1; }
+    }
+    return b;
+}
+
+/// Drop one owner of a Box holding a value of element type `tid`: the last
+/// owner drops that value and frees the block.
+@wrapping
+pub fn Box_drop_t(b: i64, tid: i64) {
+    if b == 0 { return; }
+    var hp: *mut i64 = b - 8;
+    var w: i64 = 0;
+    unsafe { w = *hp; }
+    var c: i64 = w - P_BOX_RC;
+    if c < 1 || c >= P_BOX_RC_MAX { return; }
+    if c > 1 {
+        unsafe { *hp = w - 1; }
+        return;
+    }
+    unsafe { *hp = P_BOX_DEAD; }
+    if tid != 0 {
+        if tid == P_TID_STR || tid == P_TID_VEC || tid == P_TID_MAP || tid >= P_TID_BOX {
+            // a handle held as one word
+            var wp: *mut i64 = b;
+            var e: i64 = 0;
+            unsafe { e = *wp; }
+            vec_elem_drop(tid, e);
+        } else {
+            // a struct or enum held inline
+            __p_mem_drop(tid, b);
+        }
+    }
+    p_free(b - 8);
+}
+
+// Structs in a Vec's buffer (release D15): element code 16 + words - 1
+// (vec_esz), elements reached by address (vec_ld gives it, vec_st copies
+// one in). The lowering puts a struct into a Vec through Vec_push_mem,
+// Vec_set_mem and Vec_insert_mem, with its size and element type: an empty
+// Vec takes the in-buffer layout, one that holds boxed structs (a pointer
+// to a heap copy each) keeps boxing. Reading needs no change: either way
+// get gives a pointer to the struct.
+
+/// Drop the struct elements [from, to) of `v` held in buffer `data`.
+fn vec_mem_drop_range(v: i64, data: i64, from: i64, to: i64) {
+    var code: i64 = vec_code(v);
+    var tid: i64 = vec_tid(v);
+    if code < 16 || tid < 16 || tid >= P_TID_BOX || data == 0 { return; }
+    var esz: i64 = vec_esz(code);
+    var i: i64 = from;
+    while i < to {
+        __p_mem_drop(tid, data + i * esz);
+        i = i + 1;
+    }
+}
+
+/// One more owner of what each struct element [from, to) of `v` in buffer
+/// `data` holds (after its bytes were copied).
+fn vec_mem_dup_range(v: i64, data: i64, from: i64, to: i64) {
+    var code: i64 = vec_code(v);
+    var tid: i64 = vec_tid(v);
+    if code < 16 || tid < 16 || tid >= P_TID_BOX || data == 0 { return; }
+    var esz: i64 = vec_esz(code);
+    var i: i64 = from;
+    while i < to {
+        __p_mem_dup(tid, data + i * esz);
+        i = i + 1;
+    }
+}
+
+/// A heap copy of the `size` bytes at `x` (a boxed struct element; what
+/// the struct holds moves with it).
+fn vec_mem_box(x: i64, size: i64) -> i64 {
+    var b: i64 = p_malloc(size);
+    if b == 0 { p_panic("out of memory"); }
+    vec_copy_bytes(b, x, size);
+    return b;
+}
+
+/// Whether `v` holds structs of `size` bytes in its buffer: it does
+/// already, or it is empty, not shared and holds words, and takes that
+/// layout now (element type `tid`).
+fn vec_mem_prepare(v: i64, size: i64, tid: i64) -> bool {
+    var code: i64 = vec_code(v);
+    if code >= 16 { return true; }
+    if code != 0 { return false; }
+    if size <= 0 || size % 8 != 0 || size > 232 * 8 { return false; }
+    var p0: *mut i64 = v;
+    var p8: *mut i64 = v + 8;
+    var p16: *mut i64 = v + 16;
+    var p24: *mut i64 = v + 24;
+    var p32: *mut i64 = v + 32;
+    var data: i64 = 0;
+    var len: i64 = 0;
+    var cap: i64 = 0;
+    unsafe { data = *p0; len = *p8; cap = *p16; }
+    if len != 0 || cap < 0 { return false; }
+    if data != 0 { vec_buf_free(data); }
+    unsafe {
+        *p0 = 0;
+        *p16 = 0;
+        *p24 = vec_code_word(15 + size / 8);
+    }
+    if tid >= 16 && tid < P_TID_BOX { unsafe { *p32 = P_TID_TAG + tid; } }
+    return true;
+}
+
+/// `v.push(x)` for a struct `x` of `size` bytes (the Vec takes what it
+/// holds over).
+pub fn Vec_push_mem(v: i64, x: i64, size: i64, tid: i64) {
+    vec_own(v);
+    if vec_mem_prepare(v, size, tid) {
+        vec_sz_push(v, vec_code(v), x);
+        return;
+    }
+    Vec_push(v, vec_mem_box(x, size));
+}
+
+/// `v.set(i, x)` / `v[i] = x` for a struct `x` of `size` bytes.
+pub fn Vec_set_mem(v: i64, idx: i64, x: i64, size: i64, tid: i64) {
+    vec_own(v);
+    if vec_code(v) >= 16 {
+        vec_sz_set(v, idx, x);
+        return;
+    }
+    Vec_set(v, idx, vec_mem_box(x, size));
+}
+
+/// `v.insert(i, x)` for a struct `x` of `size` bytes.
+pub fn Vec_insert_mem(v: i64, idx: i64, x: i64, size: i64, tid: i64) {
+    vec_own(v);
+    if vec_mem_prepare(v, size, tid) {
+        vec_sz_insert(v, vec_code(v), idx, x);
+        return;
+    }
+    Vec_insert(v, idx, vec_mem_box(x, size));
+}
+
+/// One more owner of what the struct or enum of type `tid` at `p` holds
+/// (its bytes were copied). The lowering writes the body.
+pub fn __p_mem_dup(tid: i64, p: i64) {
+}
+
+/// Drop the owners held by the struct or enum of type `tid` (16 and up) at
+/// `p`, which stays allocated. The lowering writes the body.
+pub fn __p_mem_drop(tid: i64, p: i64) {
 }
 
 /// Drop or copy an element of a struct or enum type the compiler numbered
@@ -553,6 +806,7 @@ pub fn vec_code(v: i64) -> i64 {
 pub fn vec_esz(code: i64) -> i64 {
     if code == 0 { return 8; }
     if code < 0 { return 0 - code; }
+    if code >= 16 { return (code - 15) * 8; }
     return code;
 }
 
@@ -560,6 +814,8 @@ pub fn vec_esz(code: i64) -> i64 {
 @crashfree
 @wrapping
 pub fn vec_ld(data: i64, i: i64, code: i64) -> i64 {
+    // a struct stored in the buffer (release D15): its address
+    if code >= 16 { return data + i * vec_esz(code); }
     if code == 1 {
         var p1: *mut u8 = data + i;
         var x1: u8 = 0;
@@ -605,6 +861,11 @@ pub fn vec_ld(data: i64, i: i64, code: i64) -> i64 {
 /// Store `x` (its low bytes) as element `i` of the data at `data`.
 @wrapping
 pub fn vec_st(data: i64, i: i64, code: i64, x: i64) {
+    // a struct stored in the buffer (release D15): its bytes, from `x`
+    if code >= 16 {
+        if x != 0 { vec_copy_bytes(data + i * vec_esz(code), x, vec_esz(code)); }
+        return;
+    }
     if code == 1 || code == -1 {
         var p1: *mut u8 = data + i;
         unsafe { *p1 = (x & 255) as u8; }
@@ -662,11 +923,11 @@ fn vec_sz_reserve(v: i64, code: i64, need: i64) {
     if cap > 0 { nc = cap * 2; }
     if nc < need { nc = need; }
     var esz: i64 = vec_esz(code);
-    var nd: i64 = p_malloc(nc * esz);
+    var nd: i64 = vec_buf_alloc(nc * esz);
     var od: i64 = vec_sz_hdr(v, 0);
     if od != 0 {
         vec_copy_bytes(nd, od, vec_sz_hdr(v, 1) * esz);
-        p_free(od);
+        vec_buf_free(od);
     }
     vec_sz_put(v, 0, nd);
     vec_sz_put(v, 2, nc);
@@ -690,13 +951,18 @@ pub fn vec_sz_set(v: i64, idx: i64, value: i64) {
     var len: i64 = vec_sz_hdr(v, 1);
     if idx >= len { p_panic("Vec index out of bounds"); }
     if idx < 0 { p_panic("Vec index out of bounds"); }
-    vec_st(vec_sz_hdr(v, 0), idx, vec_code(v), value);
+    var code: i64 = vec_code(v);
+    if code >= 16 { vec_mem_drop_range(v, vec_sz_hdr(v, 0), idx, idx + 1); }
+    vec_st(vec_sz_hdr(v, 0), idx, code, value);
 }
 
 pub fn vec_sz_pop(v: i64) -> i64 {
     var len: i64 = vec_sz_hdr(v, 1);
     if len == 0 { return 0; }
     vec_sz_put(v, 1, len - 1);
+    // a struct taken from a buffer other Vecs share stays theirs too: the
+    // caller gets owners of its own
+    if vec_code(v) >= 16 && vec_sz_hdr(v, 2) < 0 { vec_mem_dup_range(v, vec_sz_hdr(v, 0), len - 1, len); }
     return vec_ld(vec_sz_hdr(v, 0), len - 1, vec_code(v));
 }
 
@@ -718,6 +984,22 @@ fn vec_sz_remove(v: i64, code: i64, idx: i64) -> i64 {
     var len: i64 = vec_sz_hdr(v, 1);
     if idx < 0 || idx >= len { p_panic("Vec index out of bounds"); }
     var data: i64 = vec_sz_hdr(v, 0);
+    if code >= 16 {
+        // the struct moves to the slot after the new end, where the caller
+        // finds it (as after a pop)
+        var esz: i64 = vec_esz(code);
+        var tmp: i64 = p_malloc(esz);
+        vec_copy_bytes(tmp, data + idx * esz, esz);
+        var k: i64 = idx;
+        while k + 1 < len {
+            vec_copy_bytes(data + k * esz, data + (k + 1) * esz, esz);
+            k = k + 1;
+        }
+        vec_copy_bytes(data + (len - 1) * esz, tmp, esz);
+        p_free(tmp);
+        vec_sz_put(v, 1, len - 1);
+        return data + (len - 1) * esz;
+    }
     var out: i64 = vec_ld(data, idx, code);
     var i: i64 = idx;
     while i + 1 < len {
@@ -745,6 +1027,8 @@ fn vec_sz_sift(data: i64, code: i64, root: i64, n: i64) {
 fn vec_sz_sort(v: i64, code: i64) {
     var n: i64 = vec_sz_hdr(v, 1);
     if n <= 1 { return; }
+    // structs have no order of their own
+    if code >= 16 { return; }
     var data: i64 = vec_sz_hdr(v, 0);
     var start: i64 = n / 2 - 1;
     while start >= 0 {
@@ -779,11 +1063,12 @@ pub fn Vec_drop(v: i64) {
         var b0: *mut i64 = bx;
         var n: i64 = 0;
         unsafe { n = *b0; *b0 = n - 1; }
-        if n <= 1 { p_free(bx); } else { last = false; }
+        if n <= 1 { vec_box_free(bx, data); } else { last = false; }
     }
     if last && data != 0 {
         if vec_code(v) == 0 { vec_drop_range(data, 0, len, vec_tid(v)); }
-        p_free(data);
+        else { vec_mem_drop_range(v, data, 0, len); }
+        vec_buf_free(data);
     }
     p_free(v);
 }
@@ -862,7 +1147,8 @@ pub fn Vec_share(v: i64) -> i64 {
     if data == 0 { return Vec_new_typed(vec_code(v), vec_tid(v)); }
     var marked: i64 = cap;
     if cap >= 0 {
-        var bx: i64 = p_malloc(16);
+        var bx: i64 = 0;
+        if vec_buf_tagged(data) { bx = data - 16; } else { bx = p_malloc(16); }
         var b0: *mut i64 = bx;
         var b8: *mut i64 = bx + 8;
         unsafe { *b0 = 2; *b8 = cap; }
@@ -918,7 +1204,7 @@ pub fn vec_own(v: i64) {
     unsafe { data = *p0; len = *p8; }
     if owners <= 1 {
         // Last owner: keep the buffer and its elements, drop the box.
-        p_free(bx);
+        vec_box_free(bx, data);
         unsafe { *p16 = cap; }
         return;
     }
@@ -927,8 +1213,10 @@ pub fn vec_own(v: i64) {
     if cap < len { cap = len; }
     var vcode: i64 = vec_code(v);
     if vcode != 0 {
-        var snd: i64 = p_malloc(cap * vec_esz(vcode));
+        var snd: i64 = vec_buf_alloc(cap * vec_esz(vcode));
         vec_copy_bytes(snd, data, len * vec_esz(vcode));
+        // structs in the buffer: the copy is one more owner of each
+        vec_mem_dup_range(v, snd, 0, len);
         unsafe {
             *p0 = snd;
             *p16 = cap;
@@ -936,7 +1224,7 @@ pub fn vec_own(v: i64) {
         return;
     }
     var tid: i64 = vec_tid(v);
-    var nd: i64 = p_malloc(cap * 8);
+    var nd: i64 = vec_buf_alloc(cap * 8);
     var i: i64 = 0;
     while i < len {
         var src: *mut i64 = data + i * 8;
@@ -1015,7 +1303,7 @@ pub fn Vec_push(v: i64, value: i64) {
         if capacity > 0 {
             new_capacity = capacity * 2;
         }
-        var new_data: i64 = p_malloc(new_capacity * 8);
+        var new_data: i64 = vec_buf_alloc(new_capacity * 8);
 
         var i: i64 = 0;
         while i < len {
@@ -1031,7 +1319,7 @@ pub fn Vec_push(v: i64, value: i64) {
         }
 
         if data != 0 {
-            p_free(data);
+            vec_buf_free(data);
         }
 
         unsafe {
@@ -1343,6 +1631,7 @@ pub fn Vec_truncate(v: i64, n: i64) {
     unsafe { len = *len_ptr; cap = *cap_ptr; data = *data_ptr_ptr; }
     if n < 0 || n >= len { return; }
     if cap >= 0 && vec_code(v) == 0 { vec_drop_range(data, n, len, vec_tid(v)); }
+    if cap >= 0 && vec_code(v) >= 16 { vec_mem_drop_range(v, data, n, len); }
     unsafe { *len_ptr = n; }
 }
 
@@ -1404,6 +1693,32 @@ pub fn Vec_extend(v: i64, other: i64) {
 pub fn vec_raw_extend(v: i64, other: i64) {
     vec_own(v);
     var tid: i64 = vec_tid(other);
+    var ocode: i64 = vec_code(other);
+    if ocode >= 16 || vec_code(v) >= 16 {
+        // structs: copied into `v`'s buffer (an empty Vec takes that
+        // layout), or boxed one by one into a Vec that holds boxes
+        var esz: i64 = 0;
+        if ocode >= 16 { esz = vec_esz(ocode); } else { esz = vec_esz(vec_code(v)); }
+        var stid: i64 = tid;
+        if stid == 0 { stid = vec_tid(v); }
+        var inl: bool = vec_mem_prepare(v, esz, stid);
+        var sn: i64 = Vec_len(other);
+        var si: i64 = 0;
+        while si < sn {
+            var src: i64 = Vec_get(other, si);
+            if inl {
+                vec_sz_push(v, vec_code(v), src);
+                var nl: i64 = Vec_len(v);
+                vec_mem_dup_range(v, vec_sz_hdr(v, 0), nl - 1, nl);
+            } else {
+                var bx: i64 = vec_mem_box(src, esz);
+                if stid >= 16 && stid < P_TID_BOX { __p_mem_dup(stid, bx); }
+                Vec_push(v, bx);
+            }
+            si = si + 1;
+        }
+        return;
+    }
     if vec_code(v) != 0 || vec_code(other) != 0 {
         var en: i64 = Vec_len(other);
         var ei: i64 = 0;
@@ -1551,13 +1866,14 @@ pub fn Vec_clone(v: i64) -> i64 {
     var kcode: i64 = vec_code(v);
     var tid: i64 = vec_tid(v);
     if kcode != 0 {
-        var kv: i64 = Vec_new_sized(kcode);
+        var kv: i64 = Vec_new_typed(kcode, tid);
         var kn: i64 = Vec_len(v);
         var ki: i64 = 0;
         while ki < kn {
             vec_sz_push(kv, kcode, vec_sz_get(v, ki));
             ki = ki + 1;
         }
+        vec_mem_dup_range(kv, vec_sz_hdr(kv, 0), 0, kn);
         return kv;
     }
     var len_ptr: *mut i64 = v + 8;
@@ -1856,8 +2172,41 @@ fn hm_types(m: i64) -> i64 {
     var w: i64 = 0;
     unsafe { w = *tp; }
     var t: i64 = w - P_TID_TAG;
-    if t > 0 && t < 0x20000 { return t; }
+    if t > 0 && t < 0x80000 { return t & 0x1FFFF; }
     return 0;
+}
+
+// Set in a map's type word when its values block holds, after the `cap`
+// values, each slot's hash (HashMap_grow makes such a block): a probe then
+// compares hashes before keys, and growing hashes no key again.
+const HM_HASHED: i64 = 0x40000;
+
+/// Whether the map stores its slots' hashes after its values.
+@crashfree
+@wrapping
+fn hm_hashed(m: i64) -> bool {
+    if m == 0 { return false; }
+    var tp: *mut i64 = m + 48;
+    var w: i64 = 0;
+    unsafe { w = *tp; }
+    var t: i64 = w - P_TID_TAG;
+    if t > 0 && t < 0x80000 { return (t & HM_HASHED) != 0; }
+    return false;
+}
+
+/// Mark the map as storing hashes, or not.
+@wrapping
+fn hm_set_hashed(m: i64, on: bool) {
+    var tp: *mut i64 = m + 48;
+    var w: i64 = 0;
+    unsafe { w = *tp; }
+    var base: i64 = 0;
+    var t: i64 = w - P_TID_TAG;
+    if t > 0 && t < 0x80000 { base = t & 0x1FFFF; }
+    if on { base = base + HM_HASHED; }
+    var nw: i64 = 0;
+    if base != 0 { nw = P_TID_TAG + base; }
+    unsafe { *tp = nw; }
 }
 
 /// Whether the map owns its keys (string keys of a typed map).
@@ -1921,7 +2270,6 @@ fn hm_mix(h0: i64) -> i64 {
 
 /// The slot of a hash (>= 0) in a table of `cap` slots: a mask for the
 /// power-of-two capacities HashMap_grow makes, a division otherwise.
-@crashfree
 @wrapping
 fn hm_index(h: i64, cap: i64) -> i64 {
     if (cap & (cap - 1)) == 0 { return h & (cap - 1); }
@@ -2021,7 +2369,11 @@ pub fn map_own(m: i64) {
     var vtid: i64 = hm_vtid(m);
     if cap > 0 && keys != 0 {
         var nk: i64 = p_malloc(cap * 8);
-        var nv: i64 = p_malloc(cap * 8);
+        var hashed: bool = hm_hashed(m);
+        var vwords: i64 = cap;
+        if hashed { vwords = cap * 2; }
+        var nv: i64 = p_malloc(vwords * 8);
+        if hashed { vec_copy_bytes(nv + cap * 8, vals + cap * 8, cap * 8); }
         var i: i64 = 0;
         while i < cap {
             var ks: *mut i64 = keys + i * 8;
@@ -2048,17 +2400,31 @@ pub fn map_own(m: i64) {
 // or the first empty/tombstone slot if not found.
 fn HashMap_find_slot(m: i64, key: i64) -> i64 {
     var cap_ptr: *mut i64 = m + 24;
+    var capacity: i64 = 0;
+    unsafe { capacity = *cap_ptr; }
+    if capacity == 0 { return 0; }
+    return HashMap_find_slot_h(m, key, hm_hash(m, key));
+}
+
+/// HashMap_find_slot with the key's hash already known. A map that stores
+/// hashes compares a slot's hash before its key.
+fn HashMap_find_slot_h(m: i64, key: i64, hash_val: i64) -> i64 {
+    var cap_ptr: *mut i64 = m + 24;
     var keys_ptr_ptr: *mut i64 = m;
+    var vals_ptr_ptr: *mut i64 = m + 8;
     var capacity: i64 = 0;
     unsafe {
         capacity = *cap_ptr;
     }
     if capacity == 0 { return 0; }
     var keys: i64 = 0;
+    var hashes: i64 = 0;
     unsafe {
         keys = *keys_ptr_ptr;
+        hashes = *vals_ptr_ptr;
     }
-    var hash_val: i64 = hm_hash(m, key);
+    var hashed: bool = hm_hashed(m);
+    hashes = hashes + capacity * 8;
     var idx: i64 = hm_index(hash_val, capacity);
     var first_tombstone: i64 = -1;
     var i: i64 = 0;
@@ -2075,8 +2441,15 @@ fn HashMap_find_slot(m: i64, key: i64) -> i64 {
         }
         if slot_key == -1 {
             if first_tombstone < 0 { first_tombstone = idx; }
-        } else if hm_eq(m, slot_key, key) {
-            return idx;
+        } else {
+            var same_hash: bool = true;
+            if hashed {
+                var hp: *mut i64 = hashes + idx * 8;
+                var sh: i64 = 0;
+                unsafe { sh = *hp; }
+                same_hash = sh == hash_val;
+            }
+            if same_hash && hm_eq(m, slot_key, key) { return idx; }
         }
         idx = idx + 1;
         if idx >= capacity { idx = 0; }
@@ -2105,21 +2478,13 @@ fn HashMap_find_slot(m: i64, key: i64) -> i64 {
     if old_capacity > 0 { new_capacity = old_capacity * 2; }
 
     var new_keys: i64 = p_malloc(new_capacity * 8);
-    var new_vals: i64 = p_malloc(new_capacity * 8);
+    // the values, then each slot's hash (HM_HASHED)
+    var new_vals: i64 = p_malloc(new_capacity * 16);
+    var old_hashed: bool = hm_hashed(m);
 
     // Initialize new arrays to 0
-    var i: i64 = 0;
-    while i < new_capacity {
-        var kaddr: i64 = new_keys + i * 8;
-        var kptr: *mut i64 = kaddr;
-        var vaddr: i64 = new_vals + i * 8;
-        var vptr: *mut i64 = vaddr;
-        unsafe {
-            *kptr = 0;
-            *vptr = 0;
-        }
-        i = i + 1;
-    }
+    p_zero_words(new_keys, new_capacity);
+    p_zero_words(new_vals, new_capacity * 2);
 
     // Rehash all entries
     var count: i64 = 0;
@@ -2138,8 +2503,14 @@ fn HashMap_find_slot(m: i64, key: i64) -> i64 {
             unsafe {
                 old_val = *old_vptr;
             }
-            // Insert into new arrays
-            var hash_val: i64 = hm_hash(m, old_key);
+            // Insert into new arrays (the stored hash, else computed)
+            var hash_val: i64 = 0;
+            if old_hashed {
+                var ohp: *mut i64 = old_vals + (old_capacity + old_i) * 8;
+                unsafe { hash_val = *ohp; }
+            } else {
+                hash_val = hm_hash(m, old_key);
+            }
             var new_idx: i64 = hm_index(hash_val, new_capacity);
             var probe: i64 = 0;
             while probe < new_capacity {
@@ -2155,8 +2526,10 @@ fn HashMap_find_slot(m: i64, key: i64) -> i64 {
                     }
                     var nvaddr: i64 = new_vals + new_idx * 8;
                     var nvptr: *mut i64 = nvaddr;
+                    var nhptr: *mut i64 = new_vals + (new_capacity + new_idx) * 8;
                     unsafe {
                         *nvptr = old_val;
+                        *nhptr = hash_val;
                     }
                     break;
                 }
@@ -2171,6 +2544,7 @@ fn HashMap_find_slot(m: i64, key: i64) -> i64 {
 
     if old_keys != 0 { p_free(old_keys); }
     if old_vals != 0 { p_free(old_vals); }
+    hm_set_hashed(m, true);
 
     unsafe {
         *keys_ptr_ptr = new_keys;
@@ -2194,7 +2568,8 @@ pub fn HashMap_insert(m: i64, key: i64, value: i64) {
         HashMap_grow(m);
         unsafe { capacity = *cap_ptr; }
     }
-    var idx: i64 = HashMap_find_slot(m, key);
+    var ih: i64 = hm_hash(m, key);
+    var idx: i64 = HashMap_find_slot_h(m, key, ih);
     var keys_ptr_ptr: *mut i64 = m;
     var vals_ptr_ptr: *mut i64 = m + 8;
     var keys: i64 = 0;
@@ -2206,6 +2581,10 @@ pub fn HashMap_insert(m: i64, key: i64, value: i64) {
     unsafe { existing_key = *kptr; }
     if existing_key == 0 || existing_key == -1 {
         unsafe { *kptr = key; *vptr = value; *len_ptr = len + 1; }
+        if hm_hashed(m) {
+            var hptr: *mut i64 = vals + (capacity + idx) * 8;
+            unsafe { *hptr = ih; }
+        }
     } else {
         var old: i64 = 0;
         unsafe { old = *vptr; *vptr = value; }
@@ -3020,6 +3399,43 @@ pub fn String_char_at(s: i64, idx: i64) -> str {
     var len: i64 = p_str_length(s);
     if idx < 0 || idx >= len { return ""; }
     return String_slice_len(s, len, idx, idx + 1);
+}
+
+/// `s + int_to_str(n)` in one allocation: the lowering's form of that
+/// expression (no string for the number alone, made and freed again).
+pub fn p_str_concat_int(s: i64, n: i64) -> str {
+    if n == -9223372036854775807 - 1 {
+        var t: str = int_to_str(n);
+        return p_str_concat(s, t);
+    }
+    var sl: i64 = p_str_length(s);
+    var u: i64 = n;
+    if n < 0 { u = 0 - n; }
+    var nd: i64 = 1;
+    var q: i64 = u;
+    while q >= 10 {
+        q = q / 10;
+        nd = nd + 1;
+    }
+    var total: i64 = sl + nd;
+    if n < 0 { total = total + 1; }
+    var r: i64 = p_str_buf(total);
+    if sl > 0 { p_str_copy_n(r, s, sl); }
+    if n < 0 {
+        var mp: *mut u8 = r + sl;
+        unsafe { *mp = 45; }
+    }
+    var pos: i64 = total - 1;
+    q = u;
+    var more: bool = true;
+    while more {
+        var dp: *mut u8 = r + pos;
+        unsafe { *dp = (48 + q % 10) as u8; }
+        q = q / 10;
+        pos = pos - 1;
+        more = q != 0;
+    }
+    return r;
 }
 
 pub fn String_repeat(s: i64, n: i64) -> str {

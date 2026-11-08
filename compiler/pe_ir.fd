@@ -759,12 +759,33 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
         PeirEnc_jmp_label(&mut self.enc, bare_entry);
     }
 
-    // 4. Generate code for each function (sorted for deterministic layout);
-    //    of the Fides runtime only what the program uses
+    // 4. Generate code for each function main reaches (competitive CS1:
+    //    the rest of core and the stdlib is not compiled), sorted for a
+    //    deterministic layout; of the Fides runtime only what the program
+    //    uses. A function something else refers to (a function value, a
+    //    name looked up at run time, a stub's callee) is generated on demand
+    //    before the labels are resolved (PeirGen_gen_on_demand).
+    var gen_done: Vec<i64> = peir_zeros(func_names.len());
+    var reach_set: i64 = HashMap_new();
+    var reach: Vec<str> = pe_ir_reachable_functions(module);
+    var rsi: i64 = 0;
+    while rsi < reach.len() {
+        HashMap_insert(reach_set, reach.get(rsi), 1);
+        rsi = rsi + 1;
+    }
+    rsi = 0;
+    while rsi < self.named_fns.len() {
+        HashMap_insert(reach_set, self.named_fns.get(rsi), 1);
+        rsi = rsi + 1;
+    }
     fi = 0;
     while fi < func_names.len() {
         var fname: str = func_names.get(fi);
         if is_pe_runtime_fn(fname) && !pe_ir_strs_contains(needed, fname) {
+            fi = fi + 1;
+            continue;
+        }
+        if PEIR_REACHABLE_ONLY && !HashMap_contains(reach_set, fname) {
             fi = fi + 1;
             continue;
         }
@@ -774,6 +795,7 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
             }
             OptIrFunction::None => {}
         }
+        gen_done.set(fi, 1);
         fi = fi + 1;
     }
 
@@ -818,6 +840,9 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
         PeirEnc_place_label(&mut self.enc, bare_entry);
     }
     PeirGen_gen_entry_point(self);
+
+    // The functions referred to that main's call graph missed
+    PeirGen_gen_on_demand(self, module, func_names, &mut gen_done);
 
     // 7. Resolve local labels (jumps/calls within .text)
     PeirEnc_resolve_labels(&mut self.enc);
@@ -1379,6 +1404,45 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
     PeirEnc_ret(&mut self.enc);
     // The inline Vec calls' cold paths, out of the hot code's way
     PeirGen_emit_cold(self, &mut frame);
+}
+
+/// Only generate the functions main reaches, and those referred to (CS1)
+const PEIR_REACHABLE_ONLY: bool = true;
+
+/// Generate every function whose label some emitted code refers to but
+/// that has no code yet, until there is none (each may refer to others).
+fn PeirGen_gen_on_demand(self: &mut PeirGen, module: &IrModule, func_names: Vec<str>, done: &mut Vec<i64>) {
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        var refd: Vec<i64> = peir_zeros(self.enc.next_label + 1);
+        var ri: i64 = 0;
+        while ri < self.enc.pending_labels.len() {
+            var t: i64 = self.enc.pending_labels.get(ri).target_label;
+            if t >= 0 && t < refd.len() { refd.set(t, 1); }
+            ri = ri + 1;
+        }
+        var fi: i64 = 0;
+        while fi < func_names.len() {
+            if done.get(fi) == 0 {
+                var fname: str = func_names.get(fi);
+                if HashMap_contains(self.func_labels, fname) {
+                    var lab: i64 = HashMap_get(self.func_labels, fname);
+                    if lab >= 0 && lab < refd.len() && refd.get(lab) == 1 && self.enc.labels.get(lab) < 0 {
+                        match IrModule_get_function(module, fname) {
+                            OptIrFunction::Some(func) => {
+                                PeirGen_gen_function(self, fname, &func, module);
+                                changed = true;
+                            }
+                            OptIrFunction::None => {}
+                        }
+                        done.set(fi, 1);
+                    }
+                }
+            }
+            fi = fi + 1;
+        }
+    }
 }
 
 /// The first `n` instructions of a block (a compare is fused with the

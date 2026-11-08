@@ -29,8 +29,8 @@ mkdir -p "$WORK"
 WORK="$(cd "$WORK" && pwd)"
 if [ $# -eq 0 ]; then
   set -- tests/bootstrap/hello.fd tests/bootstrap/test_struct_eq.fd \
-         tests/bootstrap/test_closures.fd tests/bootstrap/test_hashmap.fd \
-         tests/bootstrap/test_strings.fd
+         tests/bootstrap/test_closure.fd tests/bootstrap/test_hashmap.fd \
+         tests/bootstrap/strings.fd tests/bootstrap/test_opt_regalloc.fd
 fi
 bad=0
 total=0

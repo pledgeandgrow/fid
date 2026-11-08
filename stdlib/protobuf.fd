@@ -1,0 +1,299 @@
+// Fides Protocol Buffers wire format (competitive SL11)
+//
+// Encoding and decoding of the protobuf wire format, without a schema
+// compiler: a program writes and reads fields by number. Bytes are kept as
+// Vec<i64> of 0..255, as in stdlib/encoding and stdlib/compress.
+//
+// Wire types: 0 varint (int32/64, uint, bool, enum; sint via zigzag),
+// 1 fixed 64-bit (fixed64, sfixed64, double), 2 length-delimited (string,
+// bytes, embedded messages, packed repeated), 5 fixed 32-bit (fixed32,
+// sfixed32, float).
+//
+// Usage:
+//   use protobuf;
+//   var w: PbWriter = pb_writer_new();
+//   pb_write_varint(&mut w, 1, 150);          // 08 96 01
+//   pb_write_string(&mut w, 2, "testing");    // 12 07 74 65 73 74 69 6e 67
+//   var r: PbReader = pb_reader_new(w.bytes);
+//   while pb_next(&mut r) {
+//       if r.field == 1 { println(pb_read_varint(&mut r)); }
+//       else if r.field == 2 { println(pb_read_string(&mut r)); }
+//       else { pb_skip(&mut r); }
+//   }
+
+module protobuf;
+
+use vec;
+use string;
+
+pub const PB_VARINT: i64 = 0;
+pub const PB_FIXED64: i64 = 1;
+pub const PB_LEN: i64 = 2;
+pub const PB_FIXED32: i64 = 5;
+
+// ─── Writing ────────────────────────────────────────────────────────────
+
+pub struct PbWriter {
+    pub bytes: Vec<i64>,
+}
+
+pub fn pb_writer_new() -> PbWriter {
+    return PbWriter { bytes: Vec::new() };
+}
+
+/// Append v as an unsigned varint (a negative i64 takes ten bytes, as
+/// protobuf's int64 does).
+@wrapping
+pub fn pb_put_varint(out: &mut Vec<i64>, v: i64) {
+    var x: u64 = v as u64;
+    while x >= 128 {
+        out.push(((x & 127) | 128) as i64);
+        x = x >> 7;
+    }
+    out.push(x as i64);
+}
+
+/// sint64 zigzag: 0 -> 0, -1 -> 1, 1 -> 2, -2 -> 3 ...
+@wrapping
+pub fn pb_zigzag(v: i64) -> i64 {
+    return (v << 1) ^ (v >> 63);
+}
+
+@wrapping
+pub fn pb_unzigzag(v: i64) -> i64 {
+    var u: u64 = v as u64;
+    return ((u >> 1) as i64) ^ (0 - ((u & 1) as i64));
+}
+
+fn pb_put_key(w: &mut PbWriter, field: i64, wire: i64) {
+    pb_put_varint(&mut w.bytes, (field << 3) | wire);
+}
+
+/// int32, int64, uint32, uint64, bool or enum field
+pub fn pb_write_varint(w: &mut PbWriter, field: i64, v: i64) {
+    pb_put_key(w, field, PB_VARINT);
+    pb_put_varint(&mut w.bytes, v);
+}
+
+/// sint32 or sint64 field (zigzag: small negatives stay short)
+pub fn pb_write_sint(w: &mut PbWriter, field: i64, v: i64) {
+    pb_write_varint(w, field, pb_zigzag(v));
+}
+
+pub fn pb_write_bool(w: &mut PbWriter, field: i64, b: bool) {
+    if b { pb_write_varint(w, field, 1); } else { pb_write_varint(w, field, 0); }
+}
+
+/// fixed64 or sfixed64 field, little-endian
+@wrapping
+pub fn pb_write_fixed64(w: &mut PbWriter, field: i64, v: i64) {
+    pb_put_key(w, field, PB_FIXED64);
+    var i: i64 = 0;
+    while i < 8 {
+        w.bytes.push((v >> (i * 8)) & 255);
+        i = i + 1;
+    }
+}
+
+/// fixed32 or sfixed32 field, little-endian
+pub fn pb_write_fixed32(w: &mut PbWriter, field: i64, v: i64) {
+    pb_put_key(w, field, PB_FIXED32);
+    var i: i64 = 0;
+    while i < 4 {
+        w.bytes.push((v >> (i * 8)) & 255);
+        i = i + 1;
+    }
+}
+
+/// double field
+pub fn pb_write_double(w: &mut PbWriter, field: i64, x: f64) {
+    pb_write_fixed64(w, field, p_f64_to_bits(x));
+}
+
+/// bytes field (or an embedded message's encoding)
+pub fn pb_write_bytes(w: &mut PbWriter, field: i64, data: Vec<i64>) {
+    pb_put_key(w, field, PB_LEN);
+    pb_put_varint(&mut w.bytes, data.len());
+    var i: i64 = 0;
+    while i < data.len() {
+        w.bytes.push(data.get(i) & 255);
+        i = i + 1;
+    }
+}
+
+/// string field (UTF-8 bytes as they are)
+pub fn pb_write_string(w: &mut PbWriter, field: i64, s: str) {
+    pb_put_key(w, field, PB_LEN);
+    pb_put_varint(&mut w.bytes, str_len(s));
+    var i: i64 = 0;
+    while i < str_len(s) {
+        w.bytes.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+}
+
+/// An embedded message: the bytes another writer made
+pub fn pb_write_message(w: &mut PbWriter, field: i64, inner: PbWriter) {
+    pb_write_bytes(w, field, inner.bytes);
+}
+
+/// A packed repeated varint field
+pub fn pb_write_packed(w: &mut PbWriter, field: i64, values: Vec<i64>) {
+    var body: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < values.len() {
+        pb_put_varint(&mut body, values.get(i));
+        i = i + 1;
+    }
+    pb_write_bytes(w, field, body);
+}
+
+// ─── Reading ────────────────────────────────────────────────────────────
+
+/// A cursor over encoded bytes. After pb_next: `field` and `wire` of the
+/// field at hand; `ok` turns false on malformed input (and stays false).
+pub struct PbReader {
+    pub bytes: Vec<i64>,
+    pub pos: i64,
+    pub end: i64,
+    pub field: i64,
+    pub wire: i64,
+    pub ok: bool,
+}
+
+pub fn pb_reader_new(bytes: Vec<i64>) -> PbReader {
+    var n: i64 = bytes.len();
+    return PbReader { bytes: bytes, pos: 0, end: n, field: 0, wire: 0, ok: true };
+}
+
+@wrapping
+fn pb_get_varint(r: &mut PbReader) -> i64 {
+    var x: u64 = 0;
+    var shift: i64 = 0;
+    while r.pos < r.end && shift < 64 {
+        var b: i64 = r.bytes.get(r.pos);
+        r.pos = r.pos + 1;
+        x = x | (((b & 127) as u64) << shift);
+        if b < 128 { return x as i64; }
+        shift = shift + 7;
+    }
+    r.ok = false;
+    return 0;
+}
+
+/// Move to the next field; false at the end or on malformed input.
+pub fn pb_next(r: &mut PbReader) -> bool {
+    if !r.ok || r.pos >= r.end { return false; }
+    var key: i64 = pb_get_varint(r);
+    if !r.ok { return false; }
+    r.field = key >> 3;
+    r.wire = key & 7;
+    if r.field == 0 || !(r.wire == 0 || r.wire == 1 || r.wire == 2 || r.wire == 5) {
+        r.ok = false;
+        return false;
+    }
+    return true;
+}
+
+pub fn pb_read_varint(r: &mut PbReader) -> i64 {
+    return pb_get_varint(r);
+}
+
+pub fn pb_read_sint(r: &mut PbReader) -> i64 {
+    return pb_unzigzag(pb_get_varint(r));
+}
+
+pub fn pb_read_bool(r: &mut PbReader) -> bool {
+    return pb_get_varint(r) != 0;
+}
+
+@wrapping
+fn pb_get_fixed(r: &mut PbReader, n: i64) -> i64 {
+    if r.pos + n > r.end { r.ok = false; return 0; }
+    var x: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        x = x | (r.bytes.get(r.pos + i) << (i * 8));
+        i = i + 1;
+    }
+    r.pos = r.pos + n;
+    return x;
+}
+
+pub fn pb_read_fixed64(r: &mut PbReader) -> i64 {
+    return pb_get_fixed(r, 8);
+}
+
+pub fn pb_read_fixed32(r: &mut PbReader) -> i64 {
+    return pb_get_fixed(r, 4);
+}
+
+pub fn pb_read_double(r: &mut PbReader) -> f64 {
+    return p_f64_from_bits(pb_get_fixed(r, 8));
+}
+
+/// A length-delimited field's bytes (bytes, or an embedded message to
+/// read with its own pb_reader_new)
+pub fn pb_read_bytes(r: &mut PbReader) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var n: i64 = pb_get_varint(r);
+    if !r.ok || n < 0 || r.pos + n > r.end { r.ok = false; return out; }
+    var i: i64 = 0;
+    while i < n {
+        out.push(r.bytes.get(r.pos + i));
+        i = i + 1;
+    }
+    r.pos = r.pos + n;
+    return out;
+}
+
+pub fn pb_read_string(r: &mut PbReader) -> str {
+    var b: Vec<i64> = pb_read_bytes(r);
+    var s: str = "";
+    var i: i64 = 0;
+    while i < b.len() {
+        s = s + char_to_str(b.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+/// A packed repeated varint field's values
+pub fn pb_read_packed(r: &mut PbReader) -> Vec<i64> {
+    var body: Vec<i64> = pb_read_bytes(r);
+    var out: Vec<i64> = Vec::new();
+    var inner: PbReader = pb_reader_new(body);
+    while inner.ok && inner.pos < inner.end {
+        out.push(pb_get_varint(&mut inner));
+    }
+    if !inner.ok { r.ok = false; }
+    return out;
+}
+
+/// Skip the field at hand (one not wanted, as readers must allow)
+pub fn pb_skip(r: &mut PbReader) {
+    if r.wire == PB_VARINT { pb_get_varint(r); }
+    else if r.wire == PB_FIXED64 { pb_get_fixed(r, 8); }
+    else if r.wire == PB_FIXED32 { pb_get_fixed(r, 4); }
+    else if r.wire == PB_LEN {
+        var n: i64 = pb_get_varint(r);
+        if n < 0 || r.pos + n > r.end { r.ok = false; return; }
+        r.pos = r.pos + n;
+    } else {
+        r.ok = false;
+    }
+}
+
+/// The bytes as lowercase hex, two digits each (for tests and logs)
+pub fn pb_hex(bytes: Vec<i64>) -> str {
+    var digits: str = "0123456789abcdef";
+    var out: str = "";
+    var i: i64 = 0;
+    while i < bytes.len() {
+        var b: i64 = bytes.get(i) & 255;
+        if i > 0 { out = out + " "; }
+        out = out + str_slice(digits, b >> 4, (b >> 4) + 1) + str_slice(digits, b & 15, (b & 15) + 1);
+        i = i + 1;
+    }
+    return out;
+}

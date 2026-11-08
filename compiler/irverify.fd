@@ -1,0 +1,144 @@
+// compiler/irverify.fd — the IR verifier (own-backend roadmap ME4).
+//
+// Checks what every pass after lowering relies on: each instruction of a
+// block exists and is in one block only, every operand is a parameter or an
+// instruction of the function, jumps and branches name blocks of the
+// function, and a value is defined before its use: earlier in the same block,
+// or in a block that dominates the use's block (dominators from iropt).
+// Unreachable blocks are not checked for dominance. Run on the native Linux
+// path with FID_VERIFY=1, after lowering and after each optimizer stage.
+
+module compiler::irverify;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::checks;
+use compiler::iropt;
+
+const IV_MAX_ERRORS: i64 = 20;
+
+/// The problems of `module`, at most IV_MAX_ERRORS; empty when it is sound.
+/// `stage` names the point of the pipeline in each message.
+pub fn ir_verify(module: &IrModule, stage: str) -> Vec<str> {
+    var errs: Vec<str> = Vec::new();
+    var fi: i64 = 0;
+    while fi < module.functions.len() && errs.len() < IV_MAX_ERRORS {
+        var entry: IrFunctionEntry = module.functions.get(fi);
+        var f: IrFunction = entry.func;
+        iv_function(&f, stage, &mut errs);
+        fi = fi + 1;
+    }
+    return errs;
+}
+
+fn iv_err(errs: &mut Vec<str>, f: &IrFunction, stage: str, msg: str) {
+    if errs.len() < IV_MAX_ERRORS {
+        errs.push("IR verifier (" + stage + "): " + f.name + ": " + msg);
+    }
+}
+
+fn iv_function(f: &IrFunction, stage: str, errs: &mut Vec<str>) {
+    var n: i64 = f.next_value;
+    var i: i64 = 0;
+    while i < f.insts.len() {
+        if f.insts.get(i).id >= n { n = f.insts.get(i).id + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < f.params.len() {
+        if f.params.get(i).id >= n { n = f.params.get(i).id + 1; }
+        i = i + 1;
+    }
+    // Where each value is defined: block index and position (-1: nowhere);
+    // parameters are defined before block 0
+    var def_block: Vec<i64> = Vec::new();
+    var def_pos: Vec<i64> = Vec::new();
+    var is_param: Vec<i64> = Vec::new();
+    i = 0;
+    while i < n { def_block.push(0 - 1); def_pos.push(0 - 1); is_param.push(0); i = i + 1; }
+    i = 0;
+    while i < f.params.len() {
+        var pid: i64 = f.params.get(i).id;
+        if pid >= 0 && pid < n { is_param.set(pid, 1); }
+        i = i + 1;
+    }
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var block: BasicBlock = f.blocks.get(b);
+        var k: i64 = 0;
+        while k < block.instructions.len() {
+            var id: i64 = block.instructions.get(k);
+            match IrFunction_get_inst(f, id) {
+                OptInst::Some(_) => {
+                    if id >= 0 && id < n {
+                        if def_block.get(id) >= 0 {
+                            iv_err(errs, f, stage, "value %" + int_to_str(id) + " is in two blocks");
+                        }
+                        def_block.set(id, b);
+                        def_pos.set(id, k);
+                    }
+                }
+                OptInst::None => {
+                    iv_err(errs, f, stage, "block " + int_to_str(block.id) + " lists %" + int_to_str(id) + ", which is no instruction");
+                }
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    var cfg: IroCfg = iro_cfg(f);
+    var ops: Vec<i64> = Vec::new();
+    b = 0;
+    while b < f.blocks.len() {
+        var blk: BasicBlock = f.blocks.get(b);
+        var reachable: bool = cfg.rpo_num.get(b) >= 0;
+        var k2: i64 = 0;
+        while k2 < blk.instructions.len() {
+            var uid: i64 = blk.instructions.get(k2);
+            match IrFunction_get_inst(f, uid) {
+                OptInst::Some(inst) => {
+                    match inst {
+                        Inst::Jump(t) => { iv_target(f, &cfg, t, stage, errs); }
+                        Inst::Branch(_, t1, t2) => {
+                            iv_target(f, &cfg, t1, stage, errs);
+                            iv_target(f, &cfg, t2, stage, errs);
+                        }
+                        _ => {}
+                    }
+                    ops.clear();
+                    peir_inst_operands(inst, &mut ops);
+                    var oi: i64 = 0;
+                    while oi < ops.len() {
+                        var v: i64 = ops.get(oi);
+                        if v < 0 || v >= n || (is_param.get(v) == 0 && def_block.get(v) < 0) {
+                            iv_err(errs, f, stage, "%" + int_to_str(uid) + " uses %" + int_to_str(v) + ", which is defined nowhere");
+                        } else if is_param.get(v) == 0 && reachable {
+                            var db: i64 = def_block.get(v);
+                            if db == b {
+                                if def_pos.get(v) >= k2 {
+                                    iv_err(errs, f, stage, "%" + int_to_str(uid) + " uses %" + int_to_str(v) + " before its definition");
+                                }
+                            } else if !iro_dominates(&cfg, db, b) {
+                                iv_err(errs, f, stage, "%" + int_to_str(uid) + " uses %" + int_to_str(v)
+                                    + ", whose block does not dominate the use");
+                            }
+                        }
+                        oi = oi + 1;
+                    }
+                }
+                OptInst::None => {}
+            }
+            k2 = k2 + 1;
+        }
+        b = b + 1;
+    }
+}
+
+fn iv_target(f: &IrFunction, cfg: &IroCfg, t: i64, stage: str, errs: &mut Vec<str>) {
+    if t < 0 || t >= cfg.index.len() || cfg.index.get(t) < 0 {
+        iv_err(errs, f, stage, "a jump to block " + int_to_str(t) + ", which does not exist");
+    }
+}

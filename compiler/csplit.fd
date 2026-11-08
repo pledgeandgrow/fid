@@ -1,0 +1,440 @@
+// csplit.fd — split one generated C file into several translation units
+// (`fid split-c <in.c> <out-prefix> <n>`), so a large program (the compiler
+// itself: ~60 MB of C) can be compiled at -O2 in parts, in parallel and in
+// normal memory, instead of as one unit at -O0.
+//
+// The file is read as a list of top-level items (preprocessor lines,
+// declarations, function definitions), with strings, character literals
+// and comments skipped while braces are counted. It writes:
+//
+//   <prefix>.h    every item in its declaration form, in the original order:
+//                 types, macros and `static inline` functions as they are;
+//                 a function definition as its prototype; a mutable
+//                 file-scope variable as an `extern` declaration; a
+//                 `static const` variable as it is (each unit has its own
+//                 copy of the constant).
+//   <prefix>_0.c  the whole file, with the function definitions given to
+//                 the other units replaced by their prototypes; `static` is
+//                 taken off functions that are not inline and off mutable
+//                 variables, so the other units can reach them.
+//   <prefix>_K.c  `#include "<prefix>.h"` and the function definitions of
+//                 unit K (K = 1 .. n-1).
+//
+// Only definitions outside any #if go to other units (one inside keeps its
+// condition in unit 0). Units get consecutive runs of definitions of about
+// the same size.
+
+use core;
+
+const CS_PP: i64 = 1;
+const CS_DECL: i64 = 2;
+const CS_FUNC: i64 = 3;
+
+/// One top-level item: [start, end) of the text, its kind, where a function
+/// body starts (-1: none), and how deep in #if it is.
+pub struct CsItem {
+    pub start: i64,
+    pub end: i64,
+    pub kind: i64,
+    pub body: i64,
+    pub pp: i64,
+}
+
+fn cs_is_space(c: i64) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 12 || c == 11;
+}
+
+fn cs_is_ident(c: i64) -> bool {
+    return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95;
+}
+
+/// The index after the string or character literal opening at `i` (quote q).
+fn cs_skip_literal(s: str, n: i64, i: i64, q: i64) -> i64 {
+    var j: i64 = i + 1;
+    while j < n {
+        var c: i64 = str_byte_at(s, j);
+        if c == 92 { j = j + 2; }
+        else if c == q { return j + 1; }
+        else if c == 10 && q == 39 { return j; }
+        else { j = j + 1; }
+    }
+    return n;
+}
+
+/// The index after a comment opening at `i`, or `i` when there is none.
+fn cs_skip_comment(s: str, n: i64, i: i64) -> i64 {
+    if i + 1 >= n || str_byte_at(s, i) != 47 { return i; }
+    var c2: i64 = str_byte_at(s, i + 1);
+    if c2 == 47 {
+        var j: i64 = i + 2;
+        while j < n && str_byte_at(s, j) != 10 { j = j + 1; }
+        return j;
+    }
+    if c2 == 42 {
+        var k: i64 = i + 2;
+        while k + 1 < n {
+            if str_byte_at(s, k) == 42 && str_byte_at(s, k + 1) == 47 { return k + 2; }
+            k = k + 1;
+        }
+        return n;
+    }
+    return i;
+}
+
+/// The end of the preprocessor line starting at `i` (its continuations
+/// included), the newline excluded.
+fn cs_pp_end(s: str, n: i64, i: i64) -> i64 {
+    var j: i64 = i;
+    while j < n {
+        var c: i64 = str_byte_at(s, j);
+        if c == 10 {
+            var k: i64 = j - 1;
+            if k >= 0 && str_byte_at(s, k) == 13 { k = k - 1; }
+            if k >= i && str_byte_at(s, k) == 92 { j = j + 1; }
+            else { return j; }
+        } else {
+            j = j + 1;
+        }
+    }
+    return n;
+}
+
+/// The directive word of a preprocessor line at `i` ("if", "endif", ...).
+fn cs_pp_word(s: str, n: i64, i: i64) -> str {
+    var j: i64 = i + 1;
+    while j < n && (str_byte_at(s, j) == 32 || str_byte_at(s, j) == 9) { j = j + 1; }
+    var k: i64 = j;
+    while k < n && cs_is_ident(str_byte_at(s, k)) { k = k + 1; }
+    return str_slice(s, j, k);
+}
+
+/// The last character before `i` that is not a space, or 0.
+fn cs_last_nonspace(s: str, from: i64, i: i64) -> i64 {
+    var j: i64 = i - 1;
+    while j >= from {
+        var c: i64 = str_byte_at(s, j);
+        if !cs_is_space(c) { return c; }
+        j = j - 1;
+    }
+    return 0;
+}
+
+/// The top-level items of C source `s`.
+pub fn cs_items(s: str) -> Vec<CsItem> {
+    var out: Vec<CsItem> = Vec::new();
+    var n: i64 = str_len(s);
+    var i: i64 = 0;
+    var pp: i64 = 0;
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if cs_is_space(c) { i = i + 1; continue; }
+        var after_comment: i64 = cs_skip_comment(s, n, i);
+        if after_comment > i { i = after_comment; continue; }
+        if c == 35 {
+            var e: i64 = cs_pp_end(s, n, i);
+            var w: str = cs_pp_word(s, n, i);
+            var item_pp: i64 = pp;
+            if w == "if" || w == "ifdef" || w == "ifndef" { pp = pp + 1; }
+            if w == "endif" { pp = pp - 1; item_pp = pp; }
+            out.push(CsItem { start: i, end: e, kind: CS_PP, body: -1, pp: item_pp });
+            i = e;
+            continue;
+        }
+        // a declaration or a definition: to `;` at depth 0, or to the `}`
+        // closing a function body
+        var start: i64 = i;
+        var depth: i64 = 0;
+        var paren: i64 = 0;
+        var body: i64 = -1;
+        var is_func: bool = false;
+        var done: bool = false;
+        while i < n && !done {
+            var ch: i64 = str_byte_at(s, i);
+            if ch == 34 || ch == 39 {
+                i = cs_skip_literal(s, n, i, ch);
+                continue;
+            }
+            if ch == 47 {
+                var ac: i64 = cs_skip_comment(s, n, i);
+                if ac > i { i = ac; continue; }
+            }
+            if ch == 10 && depth == 0 && paren == 0 && body < 0 {
+                // A line that ends in `)` or a name and is not followed by a
+                // body or `;` is a macro use (`P_ARITH(int8_t, i8)`): its
+                // own item, kept as it is
+                var last: i64 = cs_last_nonspace(s, start, i);
+                if last == 41 || cs_is_ident(last) {
+                    var nx: i64 = i + 1;
+                    while nx < n && cs_is_space(str_byte_at(s, nx)) { nx = nx + 1; }
+                    var nc: i64 = 0;
+                    if nx < n { nc = str_byte_at(s, nx); }
+                    if nc != 123 && nc != 59 {
+                        out.push(CsItem { start: start, end: i, kind: CS_PP, body: -1, pp: pp });
+                        done = true;
+                        i = i + 1;
+                        continue;
+                    }
+                }
+            }
+            if ch == 40 { paren = paren + 1; }
+            else if ch == 41 { paren = paren - 1; }
+            else if ch == 123 {
+                if depth == 0 && body < 0 {
+                    body = i;
+                    is_func = cs_last_nonspace(s, start, i) == 41;
+                }
+                depth = depth + 1;
+            } else if ch == 125 {
+                depth = depth - 1;
+                if depth == 0 && is_func {
+                    out.push(CsItem { start: start, end: i + 1, kind: CS_FUNC, body: body, pp: pp });
+                    done = true;
+                }
+            } else if ch == 59 && depth == 0 && paren == 0 {
+                out.push(CsItem { start: start, end: i + 1, kind: CS_DECL, body: body, pp: pp });
+                done = true;
+            }
+            i = i + 1;
+        }
+        if !done {
+            // the rest of the file is one item (unbalanced): kept as it is
+            out.push(CsItem { start: start, end: n, kind: CS_PP, body: -1, pp: pp });
+        }
+    }
+    return out;
+}
+
+/// Whether `t` contains word `w` (bounded by non-identifier characters).
+fn cs_has_word(t: str, w: str) -> bool {
+    var n: i64 = str_len(t);
+    var m: i64 = str_len(w);
+    var i: i64 = 0;
+    while i + m <= n {
+        if str_slice(t, i, i + m) == w {
+            var before_ok: bool = i == 0 || !cs_is_ident(str_byte_at(t, i - 1));
+            var after_ok: bool = i + m == n || !cs_is_ident(str_byte_at(t, i + m));
+            if before_ok && after_ok { return true; }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// `t` without its first word `static` (and the space after it).
+fn cs_strip_static(t: str) -> str {
+    var n: i64 = str_len(t);
+    var i: i64 = 0;
+    while i + 6 <= n {
+        if str_slice(t, i, i + 6) == "static" {
+            var before_ok: bool = i == 0 || !cs_is_ident(str_byte_at(t, i - 1));
+            var after_ok: bool = i + 6 == n || !cs_is_ident(str_byte_at(t, i + 6));
+            if before_ok && after_ok {
+                var j: i64 = i + 6;
+                while j < n && (str_byte_at(t, j) == 32 || str_byte_at(t, j) == 9) { j = j + 1; }
+                return str_slice(t, 0, i) + str_slice(t, j, n);
+            }
+        }
+        i = i + 1;
+    }
+    return t;
+}
+
+/// The index of the first `=` of `t` at depth 0 that is not part of `==`,
+/// `<=`, `>=` or `!=`, or -1.
+fn cs_eq0(t: str) -> i64 {
+    var n: i64 = str_len(t);
+    var depth: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var c: i64 = str_byte_at(t, i);
+        if c == 34 || c == 39 { i = cs_skip_literal(t, n, i, c); continue; }
+        if c == 40 || c == 91 || c == 123 { depth = depth + 1; }
+        else if c == 41 || c == 93 || c == 125 { depth = depth - 1; }
+        else if c == 61 && depth == 0 {
+            var prev: i64 = 0;
+            if i > 0 { prev = str_byte_at(t, i - 1); }
+            var next: i64 = 0;
+            if i + 1 < n { next = str_byte_at(t, i + 1); }
+            if next != 61 && prev != 61 && prev != 60 && prev != 62 && prev != 33 { return i; }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Whether `t` has `(` at depth 0 (a function declarator).
+fn cs_paren0(t: str) -> bool {
+    var n: i64 = str_len(t);
+    var depth: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var c: i64 = str_byte_at(t, i);
+        if c == 91 || c == 123 { depth = depth + 1; }
+        else if c == 93 || c == 125 { depth = depth - 1; }
+        else if c == 40 && depth == 0 { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// What a declaration is: 0 kept as it is (type, extern, static const,
+/// anything not understood), 1 a prototype, 2 a mutable variable.
+fn cs_decl_kind(t: str) -> i64 {
+    var tt: str = str_trim(t);
+    if str_starts_with(tt, "typedef") || cs_has_word(tt, "extern") { return 0; }
+    var eq: i64 = cs_eq0(tt);
+    if (str_starts_with(tt, "struct") || str_starts_with(tt, "union") || str_starts_with(tt, "enum")) && eq < 0 {
+        // `struct X { ... };` or `struct X;` declare a type
+        var close: i64 = str_rfind(tt, "}");
+        if close >= 0 {
+            if str_trim(str_slice(tt, close + 1, str_len(tt) - 1)) == "" { return 0; }
+        } else if !cs_paren0(tt) {
+            var words: Vec<str> = str_split(str_trim(str_slice(tt, 0, str_len(tt) - 1)), " ");
+            if words.len() <= 2 { return 0; }
+        }
+    }
+    if str_starts_with(tt, "static const") || str_starts_with(tt, "static inline") { return 0; }
+    if eq >= 0 { return 2; }
+    if cs_paren0(tt) {
+        if str_contains(tt, "(*") { return 2; }
+        return 1;
+    }
+    if str_starts_with(tt, "static") || cs_is_ident(str_byte_at(tt, 0)) { return 2; }
+    return 0;
+}
+
+/// A mutable variable as an `extern` declaration (no `static`, no value).
+fn cs_extern_of(t: str) -> str {
+    var d: str = cs_strip_static(str_trim(t));
+    var eq: i64 = cs_eq0(d);
+    if eq >= 0 { d = str_trim(str_slice(d, 0, eq)) + ";"; }
+    return "extern " + d;
+}
+
+fn cs_is_inline_head(head: str) -> bool {
+    return cs_has_word(head, "inline") || cs_has_word(head, "__inline") || cs_has_word(head, "__inline__");
+}
+
+/// The prototype of a function definition item.
+fn cs_proto_of(s: str, it: CsItem) -> str {
+    return cs_strip_static(str_trim(str_slice(s, it.start, it.body))) + ";";
+}
+
+/// Split `s` into `parts` units: [header, unit 0, unit 1, ...].
+pub fn cs_split(s: str, parts: i64, header_name: str) -> Vec<str> {
+    var items: Vec<CsItem> = cs_items(s);
+    // the definitions that may move: not inline, outside every #if
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < items.len() {
+        var it: CsItem = items.get(i);
+        if it.kind == CS_FUNC && it.pp == 0 && !cs_is_inline_head(str_slice(s, it.start, it.body)) {
+            total = total + (it.end - it.start);
+        }
+        i = i + 1;
+    }
+    var unit_of: Vec<i64> = Vec::new();
+    var per: i64 = total / parts + 1;
+    var acc: i64 = 0;
+    i = 0;
+    while i < items.len() {
+        var it2: CsItem = items.get(i);
+        var u: i64 = 0;
+        if it2.kind == CS_FUNC && it2.pp == 0 && !cs_is_inline_head(str_slice(s, it2.start, it2.body)) {
+            u = acc / per;
+            if u >= parts { u = parts - 1; }
+            acc = acc + (it2.end - it2.start);
+        }
+        unit_of.push(u);
+        i = i + 1;
+    }
+    var hdr: i64 = p_sb_new();
+    var u0: i64 = p_sb_new();
+    var units: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < parts {
+        var sb: i64 = p_sb_new();
+        if k > 0 { p_sb_append(sb, "#include \"" + header_name + "\"\n"); }
+        units.push(sb);
+        k = k + 1;
+    }
+    i = 0;
+    while i < items.len() {
+        var it3: CsItem = items.get(i);
+        var text: str = str_slice(s, it3.start, it3.end);
+        if it3.kind == CS_FUNC {
+            var head: str = str_slice(s, it3.start, it3.body);
+            if cs_is_inline_head(head) {
+                p_sb_append(hdr, text + "\n");
+                p_sb_append(u0, text + "\n");
+            } else {
+                var proto: str = cs_proto_of(s, it3);
+                var def: str = cs_strip_static(text);
+                p_sb_append(hdr, proto + "\n");
+                var uk: i64 = unit_of.get(i);
+                if uk == 0 {
+                    p_sb_append(u0, def + "\n");
+                } else {
+                    p_sb_append(u0, proto + "\n");
+                    p_sb_append(units.get(uk), def + "\n");
+                }
+            }
+        } else if it3.kind == CS_DECL {
+            var dk: i64 = cs_decl_kind(text);
+            if dk == 1 {
+                var pr: str = text;
+                if !cs_is_inline_head(text) { pr = cs_strip_static(text); }
+                p_sb_append(hdr, pr + "\n");
+                p_sb_append(u0, pr + "\n");
+            } else if dk == 2 {
+                p_sb_append(hdr, cs_extern_of(text) + "\n");
+                p_sb_append(u0, cs_strip_static(text) + "\n");
+            } else {
+                p_sb_append(hdr, text + "\n");
+                p_sb_append(u0, text + "\n");
+            }
+        } else {
+            p_sb_append(hdr, text + "\n");
+            p_sb_append(u0, text + "\n");
+        }
+        i = i + 1;
+    }
+    var out: Vec<str> = Vec::new();
+    out.push(p_sb_to_str(hdr));
+    out.push(p_sb_to_str(u0));
+    k = 1;
+    while k < parts {
+        out.push(p_sb_to_str(units.get(k)));
+        k = k + 1;
+    }
+    return out;
+}
+
+/// `fid split-c <in.c> <out-prefix> <n>`: writes <prefix>.h and
+/// <prefix>_0.c .. <prefix>_<n-1>.c. Returns the exit code.
+pub fn cs_split_files(input: str, prefix: str, parts: i64) -> i64 {
+    var src: str = "";
+    match read_file(input) {
+        Option::Some(t) => { src = t; }
+        Option::None => {
+            p_eprint_str("split-c: could not read " + input + "\n");
+            return 1;
+        }
+    }
+    var n: i64 = parts;
+    if n < 1 { n = 1; }
+    // the header is included by its file name, from the units' directory
+    var hname: str = prefix + ".h";
+    var slash: i64 = str_rfind(hname, "/");
+    var bslash: i64 = str_rfind(hname, "\\");
+    if bslash > slash { slash = bslash; }
+    if slash >= 0 { hname = str_slice(hname, slash + 1, str_len(hname)); }
+    var outs: Vec<str> = cs_split(src, n, hname);
+    p_file_write(prefix + ".h", outs.get(0));
+    var k: i64 = 0;
+    while k < n {
+        p_file_write(prefix + "_" + int_to_str(k) + ".c", outs.get(k + 1));
+        k = k + 1;
+    }
+    return 0;
+}

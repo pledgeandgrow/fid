@@ -40,6 +40,8 @@ def units(lines):
         s = l.strip()
         if not s or s.startswith("}") or s.startswith("//") or s.startswith("fn main"):
             continue
+        if s.startswith("return") and l.startswith("    ") and not l.startswith("     "):
+            continue  # a function's own return: removing it changes the exit status
         if s.endswith("{"):
             depth = 0
             j = i
@@ -82,9 +84,22 @@ def main():
             return False
         if a.match and a.match not in b[2] + b[1]:
             return False
+        # the same failure: each backend keeps its exit status
+        if orig and (b[0] != orig["bad"][0] or g[0] != orig["good"][0]):
+            return False
         return (b[0], b[1]) != (g[0], g[1])
 
-    if not interesting(lines):
+    orig = {}
+
+    def interesting_first(ls):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(ls))
+        orig["bad"] = run(a.fid, a.bad, path, work)
+        orig["good"] = run(a.fid, a.good, path, work)
+        return orig["bad"] is not None and orig["good"] is not None and \
+            (orig["bad"][0], orig["bad"][1]) != (orig["good"][0], orig["good"][1])
+
+    if not interesting_first(lines):
         print("the input does not show the disagreement")
         return
     tries = 0

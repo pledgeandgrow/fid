@@ -558,7 +558,18 @@ touching them.
    header is 40 bytes `{data, len, cap, code, tid}`, a HashMap 56
    `{.., types}`; every creator (core, C `PVec`, interpreter `p_vec_new`,
    C fast bodies) must make the full header. A shared buffer's box is
-   `{owners, cap}`. `p_file_read`, `p_getenv`, `p_argv`, `p_read_line`,
+   `{owners, cap}`; a buffer core allocates (`vec_buf_alloc`) is
+   `[P_VBUF_KEY + data][owners][cap]` data..., so its first share uses that
+   room: free a Vec buffer with `vec_buf_free` (C `__p_vbuf_free`) and a box
+   with `vec_box_free`, never `p_free`. Element codes 16 and up are structs
+   held in the buffer, `code - 15` words each, reached by address
+   (`vec_ld`); structs enter a Vec through `Vec_push_mem`/`Vec_set_mem`/
+   `Vec_insert_mem` (`LOWER_INLINE_STRUCTS`). A Box is `[P_BOX_RC +
+   owners]` then what it holds, the Box the address after the count
+   (`LOWER_BOX_RC`; `Box_dup`, `Box_drop_t`); a Box's element type is
+   `P_TID_BOX + ` what it holds. HashMap types word bit `HM_HASHED`: the
+   values block holds each slot's hash after the `cap` values.
+   `p_file_read`, `p_getenv`, `p_argv`, `p_read_line`,
    `p_read_stdin` are raw `i64` (0 on failure): use `read_file`, `env_var`,
    `arg_at`, `read_line`, `read_stdin` (Option) or `p_str_take`. Gate:
    `scripts/leak-check.sh` (tests/leaks: output and "every block was freed").

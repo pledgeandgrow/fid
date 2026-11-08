@@ -28,8 +28,11 @@
 # the stage 2 and stage 3 executables are byte-identical.
 #
 # C compiler: $CC if set, else the first of tcc, gcc, clang, `zig cc`.
-# The generated C is one ~50MB translation unit; build it at -O0 (optimizing
-# it needs >16GB of RAM with clang).
+# The generated C is one ~60MB file; optimizing it as one unit needs >16GB
+# of RAM. When the previous stage has `fid split-c`, the C is split into
+# SPLIT units (default 8) and a header, compiled at -O2 JOBS at a time
+# (default 4), and linked; otherwise (or with SPLIT=1, or tcc) it is built
+# as one unit at -O0. A split build that fails falls back to one unit.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 OUT="${1:-build/bootstrap}"
@@ -67,6 +70,12 @@ case "${CC_CMD[*]}" in
   *) CFLAGS+=(-fno-sanitize=all -Wno-error -Wno-int-conversion -Wno-incompatible-pointer-types
               -Wno-implicit-function-declaration -Wno-return-type) ;;
 esac
+SPLIT="${SPLIT:-8}"
+JOBS="${JOBS:-4}"
+# -O2 on generated C: no strict aliasing (it reads memory through casts)
+# and wrapping signed arithmetic (@wrapping code relies on it)
+SPLIT_CFLAGS=(-O2 -fno-strict-aliasing -fwrapv)
+for f in "${CFLAGS[@]}"; do [ "$f" != "-O0" ] && SPLIT_CFLAGS+=("$f"); done
 LIBS=()
 EXE=""
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) LIBS=(-lws2_32); EXE=".exe" ;; Darwin) LIBS=(-lm -lpthread); CFLAGS+=(-D_XOPEN_SOURCE=600 -D_DARWIN_C_SOURCE) ;; *) LIBS=(-lm -lpthread); case "${CC_CMD[*]}${CC:-}" in *zig*) LIBS+=(-lunwind) ;; esac ;; esac
@@ -105,6 +114,34 @@ int main(int argc, char** argv) {
 EOF
 }
 
+# compile_c <wrapped.c> <exe> <log> <splitter fid>: the stage's C as SPLIT
+# units at -O2 when the splitter has `split-c`, else as one unit at -O0
+compile_c() {
+  local c="$1" exe="$2" log="$3" fid="$4" base="${1%.c}_u"
+  : > "$log"
+  case "${CC_CMD[*]}" in *tcc*) ;; *)
+  if [ "$SPLIT" -gt 1 ] && "$fid" split-c "$c" "$base" "$SPLIT" >> "$log" 2>&1 && [ -f "$base.h" ]; then
+    local objs=() pids=() k ok=1
+    for k in $(seq 0 $((SPLIT - 1))); do
+      "${CC_CMD[@]}" "${SPLIT_CFLAGS[@]}" -c "${base}_$k.c" -o "${base}_$k.o" >> "$log" 2>&1 &
+      pids+=($!)
+      objs+=("${base}_$k.o")
+      if [ ${#pids[@]} -ge "$JOBS" ]; then
+        wait "${pids[0]}" || ok=0
+        pids=("${pids[@]:1}")
+      fi
+    done
+    for pid in "${pids[@]}"; do wait "$pid" || ok=0; done
+    if [ "$ok" = 1 ] && "${CC_CMD[@]}" "${objs[@]}" -o "$exe" "${LIBS[@]}" >> "$log" 2>&1; then
+      echo "  ($SPLIT units at -O2)"
+      return 0
+    fi
+    echo "  split build failed (see $log); building one unit at -O0"
+  fi ;;
+  esac
+  "${CC_CMD[@]}" "${CFLAGS[@]}" "$c" -o "$exe" "${LIBS[@]}" >> "$log" 2>&1
+}
+
 prev="$STAGE0"
 if [ -n "${NATIVE:-}" ]; then
   for n in $(seq 1 "$STAGES"); do
@@ -132,7 +169,7 @@ for n in $(seq 1 "$STAGES"); do
   echo "[stage $n] dump-c ok in $(( $(date +%s) - start ))s ($(wc -c < "$OUT/c$n.c") bytes)"
   wrap "$OUT/c$n.c" "$OUT/c${n}_wrapped.c"
   start=$(date +%s)
-  if ! "${CC_CMD[@]}" "${CFLAGS[@]}" "$OUT/c${n}_wrapped.c" -o "$OUT/fides-c$n$EXE" "${LIBS[@]}" > "$OUT/c$n.cc.log" 2>&1; then
+  if ! compile_c "$OUT/c${n}_wrapped.c" "$OUT/fides-c$n$EXE" "$OUT/c$n.cc.log" "$prev"; then
     echo "[stage $n] C compile failed:"; grep -E "error" "$OUT/c$n.cc.log" | head -20; exit 1
   fi
   echo "[stage $n] C compile ok in $(( $(date +%s) - start ))s"

@@ -353,27 +353,92 @@ language lives.
       disagreements. `scripts/fuzz/nightly.sh` and a `checked` backend
       (release M9) written Nov 4, not run; no CI workflow schedules it. Left:
       structs, enums, strings, floats, and long runs.
-- [ ] VF2. Random programs compared with an equivalent C program, built by Clang and
+- [~] VF2. Random programs compared with an equivalent C program, built by Clang and
       GCC (L).
-- [ ] VF3. Coverage-guided fuzzing of the lexer, parser, typechecker and every
+      Done (Nov 7): `scripts/fuzz/gen_vs_c.py` writes each program twice from
+      one tree, in Fides and in C (the eight integer types with checked and
+      `@wrapping` arithmetic, casts, shifts, the §4.1 precedence printed with
+      the fewest parentheses, if/while/for/match, `if` values, structs,
+      `Vec<i64>`, helper calls); the C is built with Clang (`zig cc` -O0/-O2)
+      and GCC 15 (WSL, -O0/-O2), which must agree, then `run`, `ccompile` and
+      `emit` must match. `triage.py` groups failures, `reduce.py` shrinks one.
+      Run (seed 100, 60 programs): 47 agree, 12 differ, 1 C-oracle flake.
+      Found M1 (same-width casts are the identity in run/emit), M2 (nested
+      `if` value typed void), M3 (println of a u64), E1, and the unreduced V1
+      class (spurious and missed overflow panics in run/emit); see
+      docs/verification/miscompile-log.md. Left: reduce V1, floats, strings,
+      enums, long runs, CI.
+- [~] VF3. Coverage-guided fuzzing of the lexer, parser, typechecker and every
       optimizer pass; no input may crash the compiler (L).
+      Done (Nov 7): `scripts/fuzz/fuzz_frontend.py` mutates the suite (token
+      edits, splices, cuts, deep nesting, odd bytes) through `fid check`; a
+      crash, internal panic or hang is a finding (re-run to confirm); with
+      `--cov-fid` (a compiler with VF8's counters) it keeps inputs that reach
+      new IR blocks. Run: 1200 inputs, mutational (no coverage compiler built
+      yet): one bug, F1 — no nesting limit in the parser, ~3000 nested
+      brackets crash `fid` with a stack overflow. Left: the coverage-guided
+      run, the optimizer passes (through `emit`), long runs.
 - [ ] VF4. Run every optimizer pass on and off over the whole suite: output must not
       change (M).
-- [ ] VF5. Each optimization has a test that fails if the pass is wrong (M).
+- [~] VF5. Each optimization has a test that fails if the pass is wrong (M).
+      Done (Nov 7): `tests/bootstrap/test_opt_{fold,inline,dce,gvn,tailcall,
+      licm,ranges,ranges_pop_fail,regalloc}.fd`, each a program whose output
+      changes when its pass is wrong (unsigned folds, argument order, values
+      reused across writes, zero-trip loops, swaps live across calls),
+      checked against the interpreter, which runs no optimizer. All pass on
+      run, ccompile and emit. Writing them found M4 (the C path drops the
+      bounds check of `0..v.len() + 1`) and M5 (array literals). VF7 checks
+      that the tests catch broken passes. Left: a test per `PEIR_*` switch.
 - [ ] VF6. Translation validation: a checker proves each optimized function matches
       the original, on a chosen set of passes (XL).
+      Scoped (Nov 7): docs/verification/translation-validation.md — witnesses
+      from each iropt pass checked by a separate small checker, SMT for
+      straight-line code. Nothing built: it needs a `--validate` mode in
+      `compiler/iropt.fd`. Open.
 - [ ] VF7. Mutation testing of the compiler: a broken pass must fail a test (L).
 - [ ] VF8. Line and branch coverage of `compiler/*.fd` over 90%, reported in CI (L).
 
 **Proving behaviour**
 
-- [ ] VF9. A written formal semantics of the core language (XL).
-- [ ] VF10. A conformance suite of a thousand-plus tests, one per sentence of the
+- [~] VF9. A written formal semantics of the core language (XL).
+      First piece (Nov 7): docs/verification/semantics.md, a big-step
+      semantics of the integer core (types, checked/wrapping arithmetic,
+      casts, shifts, short circuit, `if` values, loops, match, calls,
+      structs, `Vec<i64>`), each rule tied to its reference section; its
+      arithmetic rules are the C prelude of `gen_vs_c.py`, so VF2 tests the
+      compiler against it. Left: floats, strings, enums, generics, closures,
+      references, effects, concurrency, memory; mechanisation.
+- [~] VF10. A conformance suite of a thousand-plus tests, one per sentence of the
       reference, as Test262 is for JavaScript (L).
-- [ ] VF11. A proof of the memory-safety claim on a small core calculus (XL).
-- [ ] VF12. Reproducible builds: the same input gives the same binary on any machine
+      Started (Nov 7): `tests/conformance/` — 104 tests, one sentence each
+      (§1–8 and §13; the file name is the section), the expected result
+      taken from the reference, run on all backends by
+      `scripts/verify/expect.py`. 96 pass. Failing: K1 (keyword-named
+      functions cannot be called in an expression, 2 tests), M2, M3, M5/M6
+      (array literals; emit does not bounds-check arrays), D1 (§8.1's shared
+      Vec example contradicts proposal 0004). Left: ~900 more sentences.
+- [~] VF11. A proof of the memory-safety claim on a small core calculus (XL).
+      First piece (Nov 7): docs/verification/memory-safety-core.md — the
+      calculus of proposal 0004's ownership rule, its invariant and a
+      pen-and-paper preservation/progress sketch, with the five compiler
+      checks it rests on (escape check, borrow checker, the lowering's
+      dup/drop insertion, thread copies, collection drops). Left:
+      mechanising it, proving the lowering is that translation,
+      copy-on-write, structs/enums/closures/regions/Rc.
+- [~] VF12. Reproducible builds: the same input gives the same binary on any machine
       (M).
-- [ ] VF13. A second bootstrap path checked regularly: fixpoint from a clean tree (S).
+      Done (Nov 7): `scripts/verify/repro.sh` builds each program twice
+      (another directory, temp folder and time) and compares bytes. Run (3
+      programs): `dump-c` and `emit` byte-identical; `ccompile` executables
+      differ in 20 bytes (R1: PE timestamp, PDB GUID/path from the linker;
+      `SOURCE_DATE_EPOCH=0` fixes the timestamp with `zig cc`). Left: fix R1,
+      a `COMPILER=1` run, a second machine.
+- [~] VF13. A second bootstrap path checked regularly: fixpoint from a clean tree (S).
+      Written (Nov 7): `scripts/verify/clean-bootstrap.sh` — `git archive
+      HEAD` (or `--worktree`) into a new directory, cargo builds the Rust
+      compiler there, `scripts/bootstrap.sh` 3 stages with the fixpoint check,
+      stage 3 runs hello. Not run: the machine had no memory for three more
+      stages beside the other sessions' builds. Left: run it, schedule it.
 
 **Hardening the runtime**
 
@@ -382,18 +447,50 @@ language lives.
       `scripts/sanitize.sh` (the tests through C under ASan and UBSan; needs
       clang with ASan, Linux or macOS) written Nov 4, not run. Left: running it,
       ThreadSanitizer, CI.
-- [ ] VF15. Fuzz every stdlib parser: JSON, regex, HTTP, TLS records, TOML, XML, CSV
+- [~] VF15. Fuzz every stdlib parser: JSON, regex, HTTP, TLS records, TOML, XML, CSV
       (L).
-- [ ] VF16. Week-long soak tests of a service under load, with flat memory (release
+      Done (Nov 7): `scripts/fuzz/fuzz_parsers.py` with the driver
+      `tests/fuzz/parsers.fd` (json, regex, http, csv, toml, xml, url, uuid).
+      Runs: 8000 inputs (two seeds), 3 bugs — P1 `url_parse` overflow panic
+      on a long port, P2 regex `a{39…9}` overflow panic, P3 `xml_parse` on a
+      stray `<` runs out of memory or hangs. JSON, HTTP, CSV, TOML, UUID: no
+      finding. Left: TLS records
+      (the stdlib has no record layer yet), long runs.
+- [~] VF16. Week-long soak tests of a service under load, with flat memory (release
       I6 is 24 hours) (M).
-- [ ] VF17. Chaos tests: dropped connections, full disks, out of memory, clock jumps
+      Done (Nov 7): `scripts/verify/soak.py` runs `tests/verify/soak_service.fd`
+      (HTTP head parse, JSON, a bounded cache) and fits the memory slope of
+      the second half. Run: fails at once — L1, ~3.9 KB leaked per request on
+      the C path, out of memory after ~1 M requests (15 s); `fid run --leaks`
+      names the sites. Left: a 24-hour then week-long run once L1 is fixed,
+      a real socket server under load.
+- [~] VF17. Chaos tests: dropped connections, full disks, out of memory, clock jumps
       (L).
-- [ ] VF18. Sharded tests on thousands of task and thread interleavings (L).
+      Done (Nov 7): `scripts/verify/chaos.py` + `tests/verify/chaos.fd`.
+      Run: dropped and reset connections, half responses, a closed stdout and
+      missing files are handled on ccompile and emit; findings C1 (no read
+      timeout: a silent server hangs the client), C2 (emit `read_file` of a
+      missing file panics), C3 (emit names a stack overflow "invalid memory
+      access"), C4 (Linux: `file_append` reports success when the disk is
+      full), C5 (out of memory aborts with SIGABRT). Left: clock jumps
+      (libfaketime or a VM), partitions between machines.
+- [~] VF18. Sharded tests on thousands of task and thread interleavings (L).
+      Done (Nov 7): `scripts/verify/interleave.py` runs
+      `tests/verify/interleave.fd` (atomics, a mutex, a channel pipeline,
+      parallel branches) on random CPU sets, with and without load, sharded
+      over workers. Run: 300 runs each on ccompile and emit, one result, all
+      totals right. Left: thousands of runs, async tasks, a controlled
+      scheduler (it perturbs the OS scheduler; it does not choose switches).
 
 **Learning from every bug**
 
-- [ ] VF19. A public miscompile log: cause, how it escaped, the test that now
+- [x] VF19. A public miscompile log: cause, how it escaped, the test that now
       catches it (S).
+      Done (Nov 7): docs/verification/miscompile-log.md — the bugs this track
+      found (wrong code, wrong rejections, a compiler crash, parser, runtime
+      and reproducibility bugs), each with a repro in `tests/verify/bugs/`,
+      and the earlier miscompiles of AGENTS.md (none of which names its
+      regression test: open under VF20). Tools: docs/verification/README.md.
 - [x] VF20. Every bug fixed gets a regression test, always (S).
       Done: the rule is in CONTRIBUTING.md § Compiler changes.
 

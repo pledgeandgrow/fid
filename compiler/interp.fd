@@ -5768,7 +5768,7 @@ fn str_find_from(s: str, sub: str, from: i64) -> i64 {
 }
 
 /// Run `func_name` eagerly with `targs` (a spawned thread / task); the
-/// thread's return value (Int(0) on panic).
+/// thread's return value. A panic in it ends the program (status 1).
 pub fn Interpreter_run_eager(self: &mut Interpreter, func_name: str, targs: Vec<Value>, what: str) -> Value {
     var tv: Vec<Value> = Vec::new();
     tv.push(Value::Int(0));
@@ -5782,7 +5782,15 @@ pub fn Interpreter_run_eager(self: &mut Interpreter, func_name: str, targs: Vec<
             match Interpreter_run_function(self, f, tv) {
                 RunResult::Return(v) => { return v; }
                 RunResult::Panic(msg) => {
-                    p_eprint_str("Thread panic: " + msg + "\n");
+                    // A panic in a task or thread ends the whole program,
+                    // as on every backend (reference.md 8.2: no task
+                    // survives another's panic)
+                    p_eprint_str("Panic: " + msg + "\n");
+                    match Interpreter_take_panic_stack_trace(self) {
+                        OptStr::Some(trace) => { p_eprint_str(trace); }
+                        OptStr::None => {}
+                    }
+                    p_exit(1);
                     return Value::Int(0);
                 }
                 RunResult::Paused => { return Value::Int(0); }

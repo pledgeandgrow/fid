@@ -105,6 +105,11 @@ def host_scenarios(exe, work):
         s, port = server(kind)
         res = run([exe, "http", str(port), "/"], 60)
         s.close()
+        if kind == "half":
+            # the driver does not parse a status: it must end and say what it got
+            results.append(judge(label, res, lambda rc, out, err: (
+                rc == 0 and "body" in out, f"ended: {out.strip()[:60]!r}")))
+            continue
         results.append(judge(label, res, lambda rc, out, err: (
             rc == 0 and "status 0" in out, "status 0 (transport failure) reported"
             if "status 0" in out else f"exit {rc}, {out.strip()[:60]!r} {err.strip()[:80]!r}")))
@@ -151,6 +156,7 @@ def linux_scenarios(lexe, work):
     results = []
     lx = to_wsl(lexe)
     tmp = "/tmp/fides-chaos-full.bin"
+    # 2048 blocks of 512 bytes is 1 MiB; 200 chunks of 64 KiB do not fit
     cmd = pre + ["sh", "-c", f"rm -f {tmp}; trap '' XFSZ; ulimit -f 2048; '{lx}' write {tmp} 200; s=$?; rm -f {tmp}; exit $s"]
     results.append(judge("full disk (ulimit -f)", run(cmd, 120), lambda rc, out, err: (
         rc == 0 and "write-failed" in out, f"{out.strip().splitlines()[-1][:60] if out.strip() else ''!r} exit {rc} {err.strip()[:80]!r}")))

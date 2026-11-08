@@ -1664,6 +1664,9 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     tc.run_lints(program);
                     // G8.7: Stash warnings for lint_source to read
                     g_lint_warnings = tc.warnings;
+                    // The typechecker is done: its tables go now, not at the
+                    // end of the build
+                    TypeChecker_free_maps(&mut tc);
 
                     // G8.2: Borrow check — mode controlled by borrowck_mode parameter.
                     //   "off"  : skip borrow checking entirely
@@ -1680,6 +1683,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         var bc: BorrowChecker = BorrowChecker_new(bc_mode);
                         bc.skip_bodies = core_skip;
                         check(&mut bc, program);
+                        BorrowChecker_free_maps(&mut bc);
                         if bc.errors.len() > 0 {
                             var file4: str = "<stdin>";
                             match source_path {
@@ -1766,16 +1770,16 @@ pub fn ccompile_source_with_path(source: str, source_path: str, borrowck_mode: s
     }
 
     p_eprint_str("[ccompile] Building program...\n");
-    var result: ResultProgram = build_program_with_path_borrowck(source, OptStr::Some(source_path), borrowck_mode);
-    match result {
-        ResultProgram::Err(errs) => {
+    // Built and lowered in a function of its own: the program's tree and
+    // the checkers' tables are freed before C generation (release item 10)
+    var t_lower: i64 = p_clock_now_ms();
+    var lowered: ResultIrModule = lower_to_ir_module_with_path(source, source_path, borrowck_mode);
+    match lowered {
+        ResultIrModule::Err(errs) => {
             p_eprint_str("[ccompile] Building program FAILED\n");
             return ResultStr::Err(errs);
         }
-        ResultProgram::Ok(program) => {
-            p_eprint_str("[ccompile] Lowering to IR...\n");
-            var t_lower: i64 = p_clock_now_ms();
-            var module: IrModule = lower(program);
+        ResultIrModule::Ok(lmod) => {
             var t_codegen: i64 = p_clock_now_ms();
             p_eprint_str("[prof] lower: ");
             p_eprint_str(int_to_str(t_codegen - t_lower));
@@ -1784,10 +1788,10 @@ pub fn ccompile_source_with_path(source: str, source_path: str, borrowck_mode: s
             // IrModule_optimize (DCE/const-fold) before C codegen. We match
             // that behavior to produce identical C output.
             // Store in incremental cache for future invocations
-            global_cache_store(source_path, src_hash, module);
+            global_cache_store(source_path, src_hash, lmod);
             p_eprint_str("[ccompile] Generating C code...\n");
             var cg: CCodeGen = CCodeGen_new();
-            var c_code: str = CCodeGen_generate(&mut cg, module);
+            var c_code: str = CCodeGen_generate(&mut cg, lmod);
             var t_cg_end: i64 = p_clock_now_ms();
             p_eprint_str("[prof] codegen: ");
             p_eprint_str(int_to_str(t_cg_end - t_codegen));

@@ -26,6 +26,7 @@ use string;
 use compiler::ast;
 use compiler::ir;
 use compiler::checks;
+use compiler::pe_ir_stubs;
 
 /// Largest callee (instructions, its return included) that is inlined.
 const IRO_INLINE_MAX: i64 = 16;
@@ -43,9 +44,30 @@ pub fn iropt_native(module: &mut IrModule) {
     var on_tail: bool = IRO_TAILCALL && iro_pass_on("tailcall");
     var on_gvn: bool = IRO_GVN && iro_pass_on("gvn");
     var on_licm: bool = IRO_LICM && iro_pass_on("licm");
+    // Only what main reaches is worth optimizing (CS1); a function the
+    // native backend generates on demand is correct without it
+    var reach: i64 = HashMap_new();
+    var has_main: bool = false;
+    var ri: i64 = 0;
+    while ri < module.functions.len() {
+        if module.functions.get(ri).name == "main" { has_main = true; }
+        ri = ri + 1;
+    }
+    if has_main {
+        var rl: Vec<str> = pe_ir_reachable_functions(module);
+        ri = 0;
+        while ri < rl.len() {
+            HashMap_insert(reach, rl.get(ri), 1);
+            ri = ri + 1;
+        }
+    }
     var i: i64 = 0;
     while i < module.functions.len() {
         var entry: IrFunctionEntry = module.functions.get(i);
+        if has_main && !HashMap_contains(reach, entry.name) {
+            i = i + 1;
+            continue;
+        }
         var f: IrFunction = entry.func;
         var changed: bool = false;
         if on_fold && iro_fold(&mut f) { changed = true; n_fold = n_fold + 1; }

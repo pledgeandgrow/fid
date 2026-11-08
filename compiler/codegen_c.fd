@@ -1811,31 +1811,42 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     // before a write) releases one owner or copies the data.
     wln(self, "#define P_VEC_TAG_C 0x4649445645430000LL");
     wln(self, "#define P_VEC_CODE(h) (((h)[3] & ~0xFFLL) == P_VEC_TAG_C ? ((h)[3] & 0xFF) - 8 : 0)");
+    // A buffer core allocated has its share box in front of the data,
+    // behind a tag (core's vec_buf_alloc, release item 8): it is freed with
+    // the data, never on its own
+    wln(self, "#define P_VBUF_KEY_C 0x5646425546494445LL");
+    wln(self, "#define P_VBUF_TAGGED(d) ((d) && ((const int64_t*)(d))[-3] == (int64_t)((uint64_t)P_VBUF_KEY_C + (uint64_t)(uintptr_t)(d)))");
+    wln(self, "static inline void __p_vbuf_free(int64_t* d) { if (!d) return; if (P_VBUF_TAGGED(d)) { d[-3] = 0; p_free(d - 3); } else p_free(d); }");
     wln(self, "P_NOINLINE void __p_vec_grow(int64_t* h) {");
     wln(self, "    int64_t cap = h[2], shared = 0;");
     wln(self, "    if (cap < 0) {");
     wln(self, "        int64_t* bx = (int64_t*)(intptr_t)(-cap - 1);");
     wln(self, "        int64_t owners = bx[0];");
+    wln(self, "        int64_t* bd = (int64_t*)(intptr_t)h[0];");
     wln(self, "        cap = bx[1];");
-    wln(self, "        if (owners <= 1) { p_free(bx); h[2] = cap; }");
+    wln(self, "        if (owners <= 1) { if (!(bx == bd - 2 && P_VBUF_TAGGED(bd))) p_free(bx); h[2] = cap; }");
     wln(self, "        else { bx[0] = owners - 1; shared = 1; }");
     wln(self, "    }");
     wln(self, "    if (!shared && h[1] < cap) return;");
     wln(self, "    int64_t hc = P_VEC_CODE(h);");
-    wln(self, "    int64_t esz = hc == 0 ? 8 : (hc < 0 ? -hc : hc);");
+    wln(self, "    int64_t esz = hc == 0 ? 8 : (hc < 0 ? -hc : (hc >= 16 ? (hc - 15) * 8 : hc));");
     wln(self, "    int64_t nc = h[1] < cap ? cap : (cap > 0 ? cap * 2 : 8);");
     wln(self, "    int64_t* nd = (int64_t*)p_malloc(nc * esz);");
     wln(self, "    int64_t* od = (int64_t*)(intptr_t)h[0];");
-    wln(self, "    if (od) { memcpy(nd, od, (size_t)(h[1] * esz)); if (!shared) p_free(od); }");
+    wln(self, "    if (od) { memcpy(nd, od, (size_t)(h[1] * esz)); if (!shared) __p_vbuf_free(od); }");
     wln(self, "    h[0] = (int64_t)(intptr_t)nd;");
     wln(self, "    h[2] = nc;");
     wln(self, "}");
     // Elements stored at their size (D14): h[3] is core's element code
     // word, 0 or P_VEC_TAG + code + 8 (core's vec_code_word); a word that
     // is neither reads as a word Vec
+    // Codes 16 and up: structs held in the buffer (release D15), reached by
+    // address; a store copies one in
     wln(self, "static inline int64_t __p_vec_ld(const int64_t* h, int64_t i) {");
     wln(self, "    const char* d = (const char*)(intptr_t)h[0];");
-    wln(self, "    switch (P_VEC_CODE(h)) {");
+    wln(self, "    int64_t __c = P_VEC_CODE(h);");
+    wln(self, "    if (__c >= 16) return (int64_t)(intptr_t)(d + i * (__c - 15) * 8);");
+    wln(self, "    switch (__c) {");
     wln(self, "    case 1: return ((const uint8_t*)d)[i]; case -1: return ((const int8_t*)d)[i];");
     wln(self, "    case 2: return ((const uint16_t*)d)[i]; case -2: return ((const int16_t*)d)[i];");
     wln(self, "    case 4: return ((const uint32_t*)d)[i]; case -4: return ((const int32_t*)d)[i];");
@@ -1843,7 +1854,9 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "}");
     wln(self, "static inline void __p_vec_st(int64_t* h, int64_t i, int64_t x) {");
     wln(self, "    char* d = (char*)(intptr_t)h[0];");
-    wln(self, "    switch (P_VEC_CODE(h)) {");
+    wln(self, "    int64_t __c = P_VEC_CODE(h);");
+    wln(self, "    if (__c >= 16) { if (x) memcpy(d + i * (__c - 15) * 8, (const void*)(intptr_t)x, (size_t)((__c - 15) * 8)); return; }");
+    wln(self, "    switch (__c) {");
     wln(self, "    case 1: case -1: ((uint8_t*)d)[i] = (uint8_t)x; break;");
     wln(self, "    case 2: case -2: ((uint16_t*)d)[i] = (uint16_t)x; break;");
     wln(self, "    case 4: case -4: ((uint32_t*)d)[i] = (uint32_t)x; break;");
@@ -2759,6 +2772,25 @@ fn fast_core_vec_body(name: str, func: IrFunction, c_ret: str) -> Vec<str> {
         out.push("    int64_t* __h = (int64_t*)p_malloc(40);");
         out.push("    __h[0] = 0; __h[1] = 0; __h[2] = 0; __h[3] = 0; __h[4] = 0;");
         out.push("    return (int64_t)(intptr_t)__h;");
+    } else if name == "Vec_filled_typed" && n == 5 && c_ret == "int64_t" {
+        // n elements of x: a memset for bytes, a store loop otherwise; owned
+        // elements each get one more owner (core's vec_elem_dup)
+        var nn: str = p.get(1);
+        var xx: str = p.get(2);
+        var cc: str = p.get(3);
+        var tt: str = p.get(4);
+        out.push("    int64_t* __h = (int64_t*)(intptr_t)Vec_new_typed(0, " + cc + ", " + tt + ");");
+        out.push("    if (" + nn + " <= 0) return (int64_t)(intptr_t)__h;");
+        out.push("    int64_t __esz = " + cc + " == 0 ? 8 : (" + cc + " < 0 ? -" + cc + " : " + cc + ");");
+        out.push("    char* __d = (char*)p_malloc(" + nn + " * __esz);");
+        out.push("    if (!__d) p_panic(\"out of memory\");");
+        out.push("    if (__esz == 1) memset(__d, (int)(" + xx + " & 255), (size_t)" + nn + ");");
+        out.push("    else if (__esz == 2) { uint16_t* __q = (uint16_t*)__d; for (int64_t __i = 0; __i < " + nn + "; __i++) __q[__i] = (uint16_t)" + xx + "; }");
+        out.push("    else if (__esz == 4) { uint32_t* __q = (uint32_t*)__d; for (int64_t __i = 0; __i < " + nn + "; __i++) __q[__i] = (uint32_t)" + xx + "; }");
+        out.push("    else if (" + tt + " == 0) { int64_t* __q = (int64_t*)__d; for (int64_t __i = 0; __i < " + nn + "; __i++) __q[__i] = " + xx + "; }");
+        out.push("    else { int64_t* __q = (int64_t*)__d; for (int64_t __i = 0; __i < " + nn + "; __i++) __q[__i] = vec_elem_dup(0, " + tt + ", " + xx + "); }");
+        out.push("    __h[0] = (int64_t)(intptr_t)__d; __h[1] = " + nn + "; __h[2] = " + nn + ";");
+        out.push("    return (int64_t)(intptr_t)__h;");
     } else if name == "p_str_hash" && n == 2 && c_ret == "int64_t" {
         // The bytes up to the first NUL, as core's byte loop, eight at a
         // time (HashMap mixes the result again, hm_mix)
@@ -2790,6 +2822,7 @@ fn fast_core_vec_body(name: str, func: IrFunction, c_ret: str) -> Vec<str> {
         // counted again (core's vec_own); the old element is dropped by
         // the Vec's element type (proposal 0004)
         out.push("    if (P_UNLIKELY(__h[2] < 0)) vec_own(0, " + p.get(1) + ");");
+        out.push("    if (P_UNLIKELY(__h[3]) && P_VEC_CODE(__h) >= 16) { vec_sz_set(0, " + p.get(1) + ", " + p.get(2) + ", " + p.get(3) + "); return; }");
         out.push("    if (P_UNLIKELY(__h[3])) { __p_vec_st(__h, " + p.get(2) + ", " + p.get(3) + "); return; }");
         out.push("    int64_t* __slot = &((int64_t*)(intptr_t)__h[0])[" + p.get(2) + "];");
         out.push("    int64_t __old = *__slot;");
@@ -2806,6 +2839,7 @@ fn fast_core_vec_body(name: str, func: IrFunction, c_ret: str) -> Vec<str> {
     } else if name == "Vec_pop" && n == 2 && c_ret == "int64_t" {
         out.push("    int64_t* __h = (int64_t*)(intptr_t)" + p.get(1) + ";");
         out.push("    if (__h[1] == 0) return 0;");
+        out.push("    if (P_UNLIKELY(__h[3]) && P_VEC_CODE(__h) >= 16) return vec_sz_pop(0, " + p.get(1) + ");");
         out.push("    __h[1] = __h[1] - 1;");
         out.push("    if (P_UNLIKELY(__h[3])) return __p_vec_ld(__h, __h[1]);");
         out.push("    int64_t __e = ((int64_t*)(intptr_t)__h[0])[__h[1]];");

@@ -1,0 +1,82 @@
+// stdlib/dns without a network (competitive SL5): the query packet, a
+// response with an A and an AAAA answer (compression pointers, TTLs),
+// IPv6 text in RFC 5952 form, a truncated packet read safely, and the
+// cache: answers kept for their TTL, then gone.
+//
+// Expected output:
+// query 29 bytes: 7 example 3 com 0 type 1
+// A 93.184.216.34 ttl 300
+// AAAA 2606:2800:220:1:248:1893:25c8:1946 ttl 60
+// v6 ::1 2001:db8::1 fe80::
+// truncated: 1 answer
+// cache: 2 then 0, size 1 then 0
+use dns;
+use vec;
+use string;
+
+fn put(buf: i64, at: i64, bytes: Vec<i64>) -> i64 {
+    var i: i64 = 0;
+    while i < bytes.len() {
+        p_volatile_store8(buf + at + i, bytes.get(i));
+        i = i + 1;
+    }
+    return at + bytes.len();
+}
+
+fn main() -> i64 {
+    var q: Vec<i64> = dns_build_query("example.com", 1);
+    println("query " + int_to_str(q.len()) + " bytes: " + int_to_str(q.get(12)) + " example " + int_to_str(q.get(20))
+        + " com " + int_to_str(q.get(24)) + " type " + int_to_str(q.get(26)));
+    // a response: the query, then two answers naming it by pointer (0xc00c)
+    var r: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < q.len() { r.push(q.get(k)); k = k + 1; }
+    r.set(2, 129); r.set(3, 128);   // response, recursion available
+    r.set(7, 2);                    // two answers
+    var a: Vec<i64> = Vec::new();
+    a.push(192); a.push(12); a.push(0); a.push(1); a.push(0); a.push(1);
+    a.push(0); a.push(0); a.push(1); a.push(44); a.push(0); a.push(4);
+    a.push(93); a.push(184); a.push(216); a.push(34);
+    var aaaa: Vec<i64> = Vec::new();
+    aaaa.push(192); aaaa.push(12); aaaa.push(0); aaaa.push(28); aaaa.push(0); aaaa.push(1);
+    aaaa.push(0); aaaa.push(0); aaaa.push(0); aaaa.push(60); aaaa.push(0); aaaa.push(16);
+    var addr6: Vec<i64> = Vec::new();
+    addr6.push(38); addr6.push(6); addr6.push(40); addr6.push(0); addr6.push(2); addr6.push(32); addr6.push(0); addr6.push(1);
+    addr6.push(2); addr6.push(72); addr6.push(24); addr6.push(147); addr6.push(37); addr6.push(200); addr6.push(25); addr6.push(70);
+    var buf: i64 = 0;
+    unsafe { buf = p_malloc(256); }
+    var n: i64 = put(buf, 0, r);
+    n = put(buf, n, a);
+    n = put(buf, n, aaaa);
+    n = put(buf, n, addr6);
+    var recs: Vec<DnsRecord> = dns_parse_records(buf, n);
+    var i: i64 = 0;
+    while i < recs.len() {
+        var rec: DnsRecord = recs.get(i);
+        var kind: str = "A";
+        if rec.rtype == 28 { kind = "AAAA"; }
+        println(kind + " " + rec.addr + " ttl " + int_to_str(rec.ttl));
+        i = i + 1;
+    }
+    var g1: Vec<i64> = Vec::new();
+    g1.push(0); g1.push(0); g1.push(0); g1.push(0); g1.push(0); g1.push(0); g1.push(0); g1.push(1);
+    var g2: Vec<i64> = Vec::new();
+    g2.push(8193); g2.push(3512); g2.push(0); g2.push(0); g2.push(0); g2.push(0); g2.push(0); g2.push(1);
+    var g3: Vec<i64> = Vec::new();
+    g3.push(65152); g3.push(0); g3.push(0); g3.push(0); g3.push(0); g3.push(0); g3.push(0); g3.push(0);
+    println("v6 " + dns_v6_text(g1) + " " + dns_v6_text(g2) + " " + dns_v6_text(g3));
+    // cut in the middle of the second answer: the first one still reads
+    var cut: Vec<DnsRecord> = dns_parse_records(buf, n - 10);
+    println("truncated: " + int_to_str(cut.len()) + " answer");
+    unsafe { p_free(buf); }
+    var c: DnsCache = dns_cache_new();
+    var ips: Vec<str> = Vec::new();
+    ips.push("10.0.0.1");
+    ips.push("10.0.0.2");
+    dns_cache_put(&mut c, "Example.COM", ips, 30, 1000);
+    var hit: Vec<str> = dns_cache_get(&c, "example.com", 1020);
+    var miss: Vec<str> = dns_cache_get(&c, "example.com", 1031);
+    println("cache: " + int_to_str(hit.len()) + " then " + int_to_str(miss.len()) + ", size " + int_to_str(dns_cache_size(&c, 1020))
+        + " then " + int_to_str(dns_cache_size(&c, 1031)));
+    return 0;
+}

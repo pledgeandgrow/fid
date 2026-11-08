@@ -1,866 +1,525 @@
-# LLVM Parity & Superset Roadmap
+# Own-Backend Roadmap: better than LLVM where we can, different where it pays
 
-*Goal: Don't copy LLVM — compete with it by playing a different game. Match where we must, innovate where we can, skip what we don't need.*
+*Rewritten Nov 7, 2026. The previous version (parts F-1 to I-6, the passes of the
+frozen Rust compiler) is in git history: `git show 9c06851:docs/roadmap/llvm-roadmap.md`.
+The IDs `src/*.rs` and `AGENTS.md` mention (F-1A, I-2D, ...) refer to it.*
 
-> **Status (Nov 6, 2026):** the passes, register allocator and checks marked done
-> below are in the frozen Rust compiler (`src/opt.rs`, `src/regalloc.rs`) and in
-> the PIR path of the self-hosted compiler (`compiler/opt.fd`), which `fid`
-> reaches only through `build --native`; that path crashes. The working native
-> path, `fid emit`, runs `compiler/iropt.fd` only (inlining of small one-block
-> functions, constant folding, dead code removal) and keeps values in 7
-> callee-saved registers, with no full register allocator (release D4–D6).
+## The bet
 
-**The thesis:** LLVM is a general-purpose optimizer for C/C++ — languages that allow anything (pointer arithmetic, use-after-free, integer overflow, exceptions, arbitrary aliasing). LLVM must be conservative because C/C++ is dangerous. Fides is not dangerous. Regions prevent use-after-free. Checked arithmetic prevents overflow. Effects track side effects. Capabilities restrict access. Linear types enforce single ownership. `@crashfree` proves no panics. `@deterministic` proves purity. `@gas` proves termination.
+We will not out-tune LLVM's -O2 across every program: it has decades of work in
+it. We can do three things it cannot, and we already have the start of each:
 
-**This means:** LLVM spends optimization passes working around C/C++'s lack of safety. Fides doesn't need those workarounds — it needs different optimizations that exploit its safety guarantees. We don't need to copy LLVM's 50 passes. We need 20 passes that do things LLVM cannot.
+1. **Compile 10x faster for code within 10–30% of LLVM's** (Cranelift's class),
+   with no C toolchain, no assembler and no linker: `fid emit` already encodes
+   machine code and writes PE and ELF files itself.
+2. **Optimize with facts LLVM never gets**: ownership, second-class references,
+   checked arithmetic, effects, and the whole program in one build.
+3. **Be trusted without decades of users**: we have LLVM itself as an oracle
+   (the C path builds through clang), and a design small enough to check pass by
+   pass, rule by rule.
 
----
+LLVM stays where it is strongest: `fid ccompile` (clang through `zig cc`) is the
+maximum-speed tier, and the reference our backends are measured and tested
+against.
 
-## Part 1: What We Don't Need From LLVM (And Why)
+## What we have built (Nov 7)
 
-These LLVM features exist because C/C++ is unsafe. Fides eliminates the problem at the language level, making the LLVM feature unnecessary.
+| Piece | Where | State |
+|---|---|---|
+| IR: blocks, single-assignment values, locals in `Alloca`, `inst_at` / `fn_index` tables | `compiler/ir.fd` | no phis, no use lists |
+| IR optimizer: inlining of small one-block functions, constant folding, DCE, LICM, dominators | `compiler/iropt.fd` | on the native paths; kill switches (`IRO_LICM`, `iro_pass_on`) |
+| Check removal: counted loops, integer ranges | `compiler/checks.fd` | shared by the C and native paths (`PEIR_RANGES`) |
+| Windows x64 backend: IR -> machine code, PE writer | `compiler/pe_ir.fd`, `pe_ir_enc.fd`, `pe_ir_stubs.fd` | 7 callee-saved registers, r10/r11 and xmm2–xmm7 for call-free ranges, copy coalescing, loop rotation, instruction selection |
+| ARM64 and RISC-V backend: IR -> machine code, static ELF | `compiler/nat_ir.fd`, `nat_enc.fd` | values in x19–x28 / s1–s11 by linear scan over live-range hulls with block liveness; the rest in stack slots |
+| Linux runtime on system calls: threads, M:N tasks, futexes, signals, traces | `stdlib/linux_runtime/` | own context switch (`nat_ctx_swap`) |
+| C path through clang | `compiler/codegen_c.fd` | LLVM quality, the oracle |
+| Old PIR path (L1–L3, its optimizer and allocator) | `compiler/pir.fd`, `opt.fd`, `regalloc.fd`, `codegen_x64.fd` | not used by `fid emit`; `build --native` crashes |
+| Reference escape check (references are second-class) | `compiler/escape.fd` | a language rule, not yet used by the optimizer |
 
-| LLVM Feature | Why LLVM Needs It | Why Fides Doesn't |
-|--------------|-------------------|-------------------|
-| **Exception handling tables** (DWARF unwind) | C++ exceptions, `throw`/`catch` | Fides has no exceptions. `@crashfree` proves at compile time that a function cannot panic. No unwind tables needed. |
-| **ASan (Address Sanitizer)** | C use-after-free, buffer overflow, double-free | Fides regions prevent use-after-free at compile time. Bounds checking (F62) prevents buffer overflow. Linear types prevent double-free. ASan catches bugs at runtime that Fides prevents at compile time. |
-| **UBSan integer overflow checks** | C signed integer overflow is UB | Fides has checked arithmetic by default (F64). `@wrapping` (F65) is the explicit escape hatch. Overflow = panic, not UB. |
-| **C++ template instantiation** | C++ templates are Turing-complete metaprogramming | Fides has comptime (compile-time function evaluation) and traits. No template explosion. |
-| **VTable devirtualization for C++** | C++ virtual dispatch via vtables | Fides `cap` traits have different dispatch semantics. Devirtualization is simpler (trait impls are visible at IR level). |
-| **Linker plugin support** (lld/gold plugins) | LLVM delegates LTO to external linker plugins | Fides has an integrated linker (`linker.rs`, 737 LOC). LTO happens in-process. No plugin API needed. |
-| **Alias analysis via TBAA** (type-based) | C `restrict` is hints, TBAA uses type info | Fides regions are a strict aliasing guarantee — two pointers in different regions *cannot* alias. No need for probabilistic TBAA. |
-| **SROA for C structs** | C passes structs by value, LLVM must break them apart | Fides structs are region-allocated with known layouts. SROA is useful but less critical — the region system already tells us aliasing. |
-| **Null pointer dereference checks** | C null pointers are UB | Fides `Option<T>` eliminates null. No null checks needed in generated code. |
-| **Stack protector (canaries)** | C stack buffer overflows | Fides bounds checking + region system prevents stack buffer overflow. No canaries needed. |
-| **Control flow integrity (CFI)** | C function pointer attacks | Fides capabilities restrict which functions can be called. `--caps` strips ungranted functions from the binary. CFI is enforced at compile time. |
+The cost of today's shape: `pe_ir` and `nat_ir` lower the same IR twice, with
+two register allocators, two call lowerings and two sets of overflow-check
+sequences. Every improvement is written twice, or only once.
 
-**What this means:** LLVM's -O2 pipeline is ~50 passes. Maybe 15 of those exist to work around C/C++ safety holes. Fides doesn't need those 15. We need the other 35 (regalloc, vectorization, inline, etc.) plus our own semantic passes.
+## How the five ideas work
 
----
+**1. One machine layer, thin targets.** Between the IR and the encoders sits a
+machine IR (MIR): per function, blocks of machine-level instructions over
+virtual registers, with target-neutral operations (add, compare-and-branch,
+load, store, call, return) and target-specific ones where a target has
+something better. One lowering IR -> MIR implements the language's semantics
+(checked arithmetic, narrowing, struct copies, calls, panics) once. After it,
+everything is shared: liveness, the register allocator, frame layout, the call
+convention lowering, the peephole pass, block layout. A target supplies a
+description (registers, classes, which are callee-saved, the call convention),
+instruction selection rules (MIR patterns -> its instructions) and its encoder.
+x64, AArch64 and RISC-V become three thin directories. Cranelift's VCode and
+regalloc2 are the model; we write ours in Fides.
 
-## Part 2: What We Must Match (The Fundamentals)
+**2. Rules instead of fifty passes.** First real SSA: mem2reg turns locals into
+values with block parameters (no phi nodes). Then an e-graph mid-end: each
+function's pure values go into an e-graph, rewrite rules add equal forms
+(`x + 0 = x`, `(a + b) - b = a`, `x * 2 = x << 1`), and extraction picks the
+cheapest. CSE and GVN fall out of the e-graph's hash-consing; constant folding is
+a rule; LICM is where extraction places a value (Cranelift's "aegraph" keeps the
+side-effecting skeleton fixed and lets pure values float). A rule is small and
+can be tested on its own: by random inputs, and by an SMT check of `lhs == rhs`.
 
-These are language-independent. Every compiler needs them. Fides must match LLVM here to be competitive.
+**3. The whole program.** A build sees every function. Compile bottom-up over the
+call graph and each function's real clobber set is known before its callers are
+compiled: a caller keeps values in registers the callee never touches
+(interprocedural register allocation). Internal functions need no ABI: they take
+arguments where the caller has them. Effects say which calls are pure: those
+are values like any other in the e-graph, merged and hoisted.
 
-### Phase F-1: Register Allocator
+**4. The language's guarantees.** A `&mut` reference cannot alias anything else
+live, a reference cannot escape (escape.fd proves it), an owned value has one
+owner: alias analysis is a lookup, not a guess. Checked arithmetic plus range
+analysis decides which checks can never fire. A value that never escapes its
+function can live on the stack, or in registers.
 
-**Goal:** Correct, efficient register allocation. The current linear scan has a known constant-clobbering weakness.
+**5. Compile speed as a feature.** No text anywhere between source and bytes;
+functions compile independently once the IR exists, so in parallel; each
+function's machine code is cached by a hash of its IR and of what it calls, so a
+one-line edit recompiles one function and relinks in memory.
 
-**Why we need it:** This is the foundation. Every other optimization depends on correct register allocation. LLVM uses graph coloring (Chaitin-Briggs). We don't need to copy the algorithm, but we need the quality.
+## Reading the goals
 
-**Status:** Linear scan exists (~1100 LOC). F-1A (constant remat) and F-1D (effect-aware) implemented. F-1C handled implicitly via clobber sets.
-
-#### F-1A: Constant Rematerialization ✅
-- [x] Track constant values in VRegInfo — when a VReg holds a constant, reload it at each use site instead of assuming it persists
-- [x] Add `Location::Remat(i64)` — reload constant from immediate field (1 instruction) instead of spilling (2 instructions)
-- [x] Always rematerialize constants, never spill them
-- [x] This alone fixes the known bug — the clobbering happens because constants are spilled and not reloaded
-
-#### F-1B: Live Range Splitting
-- [ ] When under register pressure, split a VReg's live range at the use point instead of spilling the whole interval
-- [ ] First half spills, second half reloads — this is what LLVM does
-- [ ] Cheaper than full spilling for short-lived values
-- [ ] **Status:** Deferred — requires significant refactor of `LiveInterval` from single `[start, end]` to multiple sub-intervals per VReg. Current linear scan works correctly; this is a performance optimization for high register pressure.
-
-#### F-1C: Call-Site Caller-Saved Spilling ✅
-- [x] Before a `call`, spill all live caller-saved registers. After the call, reload them.
-- [x] Current code doesn't do this correctly — caller-saved registers are clobbered across calls
-- [x] This is the root cause of several native codegen bugs that were worked around
-- [ ] **Note:** Handled implicitly via `inst_clobbers()` — calls mark all caller-saved registers as clobbered, and the regalloc avoids keeping live values in those registers across calls. This is correct but conservative. F-1D improves on this for pure calls.
-
-#### F-1D: Fides-Native Innovation — Effect-Aware Register Allocation ✅
-- [x] **LLVM cannot do this:** A `!Pure` function (no side effects, no IO) doesn't clobber caller-saved registers in ways that matter — it can't write to memory the caller cares about
-- [x] Skip caller-saved spills for calls to `!Pure` functions (the function won't modify anything we need)
-- [ ] A `@crashfree` function can't panic — no need to preserve registers for exception handling *(future: not yet exploited)*
-- [ ] A `!Alloc` function can't allocate — no need to preserve allocator state registers *(future: not yet exploited)*
-- [x] **Impact:** 10-20% fewer spill/reload instructions around call sites for pure-heavy code (ML, math)
-- [x] **Implementation:** `L3Module.pure_functions: HashSet<String>` populated during L2→L3 lowering. `inst_clobbers()` checks if call target is pure — pure calls only clobber RAX (return value), not all caller-saved registers. 2 unit tests in `regalloc.rs`.
-
-**Exit criteria:** `--opt --lto` produces correct output on all 127 tests. Zero miscompilations.
-
----
-
-### Phase F-2: Loop Auto-Vectorization
-
-**Goal:** Vectorize counted loops (the big gap — SLP exists, loop vec doesn't).
-
-**Why we need it:** SLP vectorization (F64 pairs → SSE2) exists. But loop vectorization is the bigger win — `for i in 0..N { a[i] += b[i] }` should become 4-wide SIMD. For ML/physics/graphics, this is 4-8x.
-
-**Status:** SLP done (F64 + I64 pairs → `p_simd_*` SSE2). Loop vectorization pass exists (`pass_loop_vectorize` in `opt.rs`, in default pass list). SLP vectorizer (`Pass::Vectorize`) extended to support both F64 and I64 element types, generating `p_simd_add_i64`/`p_simd_sub_i64` for I64 arithmetic. PE backend emits actual SSE2 packed instructions (`addpd`/`subpd`/`mulpd`/`divpd` for F64, `paddq`/`psubq` for I64).
-
-#### F-2A: Counted Loop Detection ✅
-- [x] Detect `for i in 0..N` loops with constant or provably-bounded trip counts
-- [x] Verify no loop-carried dependencies (use Fides's effect system — a `!Pure` loop body has no dependencies)
-- [x] **Fides advantage:** Effect system makes dependency analysis free. LLVM must prove it; Fides knows it.
-
-#### F-2B: Loop Body Vectorization ✅
-- [x] Transform: load 4 elements (movdqu), add 4 (paddd), store 4 (movdqu)
-- [x] Handle remainder loop (scalar tail)
-- [x] SSE2 by default (128-bit), AVX2 if `--target` supports it
-
-#### F-2C: Fides-Native Innovation — @deterministic Loop Unrolling + Vectorization ✅ (partial)
-- [x] **LLVM cannot do this:** A `@deterministic` function has no hidden state — its output depends only on inputs
-- [ ] Vectorize `@deterministic` loops more aggressively (no hidden aliasing, no hidden side effects) *(future: needs enhanced loop-vec)*
-- [x] Unroll `@gas(N)` loops fully — the gas limit proves termination, so unrolling is always safe (I-4C: max_unroll=64 with @gas)
-- [x] **Impact:** ML kernels (which should be `@deterministic`) get vectorized without LLVM's conservative dependency checks
-- [x] **Implementation:** @gas-guided unrolling implemented in I-4C. @deterministic annotation propagated to L2 for future vectorization use.
-
-**Exit criteria:** A dot-product loop generates `pmulq + paddq`, not scalar `mul + add`.
+`[x]` done, `[~]` partly done, `[ ]` not started. Size: S (a day or two), M (a
+week), L (several weeks), XL (months). Each goal names where it lands.
 
 ---
 
-### Phase F-3: Core Optimization Passes (The Ones That Matter)
+## Track MI — One machine layer (30)
 
-**Goal:** Add the 8 passes that give the most code quality improvement. Not all 50 LLVM passes — just the ones that matter.
+- [ ] MI1. Write down the MIR: instructions, operands (virtual register, physical
+      register, immediate, stack slot, label), blocks, block parameters; in a new
+      `compiler/mir.fd` (M).
+- [ ] MI2. Target-neutral operations: integer and float arithmetic, compares,
+      branch on compare, loads and stores of 1/2/4/8 bytes with extension,
+      address arithmetic, calls, returns, traps (M).
+- [ ] MI3. Target-specific operations as an open set per target (x64 `lea`,
+      AArch64 `madd`, RISC-V `slli`+`add`), chosen by instruction selection (M).
+- [ ] MI4. A target description: register classes, callee-saved set, argument
+      and result registers, stack alignment, red zone, scratch registers (S).
+- [ ] MI5. One lowering IR -> MIR for every language rule now written twice in
+      `pe_ir.fd` and `nat_ir.fd`: checked add/sub/mul, narrowing, MIN / -1,
+      division by zero, struct copies, closures, dyn calls, print routing (L).
+- [ ] MI6. Panic paths as cold out-of-line blocks shared per function, each a
+      call (so traces name the function), from the one lowering (M).
+- [ ] MI7. One call lowering: arguments to registers and the outgoing area,
+      `__env`, varargs spawns, results; parallel moves solved once (M).
+- [ ] MI8. One frame layout: slots, spill slots, the save area, alignment, frame
+      records for traces, large frames (M).
+- [ ] MI9. Struct values as several MIR values when small (scalar replacement at
+      the machine level), memory otherwise (M).
+- [ ] MI10. A MIR verifier: every use defined, every block terminated, operand
+      classes match the operation; run after each MIR stage in debug builds (M).
+- [ ] MI11. A MIR printer and `fid dump-mir <file> --target <t>` (S).
+- [ ] MI12. Port the AArch64 backend to MIR first (it is the smaller one); its
+      suite results must not change (L).
+- [ ] MI13. Port RISC-V to MIR: only instruction selection and its encoder stay
+      target code (M).
+- [ ] MI14. Port Windows x64 to MIR, keeping every optimization `pe_ir.fd` has
+      (coalescing, rotation, xmm values, selection) as MIR passes or rules (XL).
+- [ ] MI15. A Linux x86-64 target on MIR for free once x64 is ported: the ELF
+      writer of `nat_enc.fd`, the Linux runtime, x64 selection (M).
+- [ ] MI16. A macOS AArch64 target: the AArch64 selection and a Mach-O writer
+      (release F7) (L).
+- [ ] MI17. Retire `pe_ir.fd`'s and `nat_ir.fd`'s own lowerings once their MIR
+      ports match on the whole suite (M).
+- [ ] MI18. Retire the old PIR path (`pir.fd`, `opt.fd`, `regalloc.fd`,
+      `codegen_x64.fd`) and `build --native` with it (S).
+- [ ] MI19. Runtime primitives (`nat_ctx_swap`, atomics, `nat_clone_thread`,
+      trampolines) written once in MIR where they can be, per target only where
+      they must be (M).
+- [~] MI20. Machine code primitives for the runtime already exist per target
+      (`ng_gen_primitives*` in `nat_ir.fd`, the stubs of `pe_ir_stubs.fd`); move
+      them behind one interface (M).
+- [ ] MI21. Constants: materialization per target (`movz/movk`, `lui/addi`,
+      `mov imm64`) chosen by cost, rematerialized instead of spilled (M).
+- [ ] MI22. Address modes as a selection decision: base + index * scale + offset
+      where the target has it (M).
+- [ ] MI23. Compare and branch fused in selection on every target (x64 `cmp/jcc`,
+      AArch64 `cbz/tbz/b.cond`, RISC-V `beq/blt`) (S).
+- [ ] MI24. Conditional select (`csel`, `cmov`, RISC-V Zicond where present) for
+      small branches with no side effects (M).
+- [ ] MI25. Floats in float registers on every target, f32 as f32 (not widened),
+      moves between classes only where needed (M).
+- [ ] MI26. Narrow integers kept in registers with known extension state, so a
+      `u8` add does not re-extend each time (M).
+- [ ] MI27. Jump tables for dense `match` (M).
+- [ ] MI28. Tail calls as jumps on every target, guaranteed for self-recursion in
+      tail position (M).
+- [ ] MI29. Stack probes for frames over a page, so a large frame cannot jump over
+      the guard region (S).
+- [ ] MI30. One place that decides the code alignment of functions and loop heads
+      per target (S).
 
-**Why these 8:** LLVM's -O2 has 50 passes, but 80% of the improvement comes from ~8 passes. The rest are micro-optimizations or C/C++-specific workarounds.
+## Track RA — One register allocator (20)
 
-**Status:** 23 passes exist (const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize). 22 in default pass list (region-pool available via `--region-pool` flag).
+- [~] RA1. Today: `nat_ir.fd` allocates callee-saved registers over live-range
+      hulls from block liveness; `pe_ir.fd` has its own allocator with
+      coalescing and call-free ranges. Replace both with one allocator on MIR (L).
+- [ ] RA2. Liveness on MIR from use lists, live ranges as lists of segments with
+      holes, not hulls (M).
+- [ ] RA3. All registers, caller-saved included: a value live across a call goes
+      to a callee-saved register or is split around the call (L).
+- [ ] RA4. Live-range splitting at calls and at loop boundaries, with spill code
+      placed outside loops (L).
+- [ ] RA5. Spill weights from loop depth and use counts (M).
+- [ ] RA6. Copy coalescing on MIR (what `pe_ir`'s `PEIR_COALESCE` does), so
+      `i = i + 1` is one instruction on every target (M).
+- [ ] RA7. Register hints: arguments, results and call operands prefer the
+      registers they must end in (M).
+- [ ] RA8. Rematerialization of constants, addresses of globals and frame slots
+      instead of spills (M).
+- [ ] RA9. Second-chance or backtracking allocation in the style of regalloc2 /
+      LLVM's greedy, behind a switch, compared with linear scan (XL).
+- [ ] RA10. Register classes: integer, float, and pairs where a target needs them
+      (S).
+- [ ] RA11. Parallel moves at block edges solved with cycle breaking through one
+      scratch register (M).
+- [ ] RA12. Callee-saved registers saved only on paths that use them (shrink
+      wrapping) (M).
+- [ ] RA13. Save and restore with paired instructions (`stp/ldp` on AArch64) (S).
+- [ ] RA14. A fast mode for debug builds: one pass, local allocation, under 10% of
+      compile time (M).
+- [ ] RA15. An allocation checker: replay the allocated code symbolically and
+      prove every use reads the value it should (regalloc2's checker) (L).
+- [ ] RA16. Run the checker on the whole suite in CI for every target (S).
+- [ ] RA17. Statistics per function: spills, reloads, moves; `--stats` prints them
+      (S).
+- [ ] RA18. Floats and integers allocated by the same algorithm, class-aware (M).
+- [ ] RA19. A value used only as a branch condition stays in flags where the
+      target has them (M).
+- [ ] RA20. The allocator honours IPRA clobber sets (Track WP) at each call (M).
 
-#### F-3A: GVN (Global Value Numbering) — Replaces CSE ✅
-- [x] CSE catches identical expressions. GVN catches equivalent ones: `a = x + y; b = y + x` → GVN knows `a == b`
-- [x] Hash-consing: each expression gets a value number, same number = same value
-- [x] Strict improvement over current CSE
+## Track TG — Thin targets: selection and encoders (20)
 
-#### F-3B: SROA (Scalar Replacement of Aggregates) ✅
-- [x] Replace struct allocations with individual scalars: `val p = Point{x:1, y:2}; print(p.x)` → just `x = 1; print(x)`
-- [x] Enables all other optimizations to see through structs
-- [x] **Fides advantage:** Region system tells us a struct can't be aliased by external code — SROA is safe without LLVM's conservative checks
+- [ ] TG1. Instruction selection as rules: MIR patterns -> target instructions,
+      tried by cost, written as data in Fides (an ISLE-like table, no new
+      language) (L).
+- [ ] TG2. Each rule carries its preconditions (immediate fits, register class)
+      and is tested on its own by random operands against the generic lowering
+      (M).
+- [x] TG3. Own encoders, no assembler: x64 (`pe_ir_enc.fd`), AArch64 and RV64IMFD
+      (`nat_enc.fd`).
+- [ ] TG4. Encoder oracle tests: for every instruction form we emit, encode random
+      operands and compare the bytes with clang's integrated assembler
+      (`zig cc -c x.s`, `llvm-objdump`) (M).
+- [ ] TG5. A disassembler for our own output (`fid disasm`), table-driven from the
+      same encoder descriptions, so the two cannot drift (L).
+- [ ] TG6. Branch relaxation: short forms where the target reaches, long forms
+      only when needed (x64 `jcc rel8`, RISC-V `b` vs `jal` vs `auipc+jalr`) (M).
+- [ ] TG7. x64: memory operands in arithmetic, `test`, `lea` everywhere it pays,
+      `cmov`, BMI1/BMI2 behind `--cpu` (M).
+- [ ] TG8. AArch64: `madd/msub`, shifted and extended operands, `cbz/tbz`,
+      `csel/csinc`, `ldp/stp`, pre/post-indexed addressing (M).
+- [ ] TG9. RISC-V: compressed instructions (RVC) for size, Zba/Zbb when present,
+      `sext.w` elision (M).
+- [ ] TG10. A `--cpu` switch per target with safe defaults (baseline x86-64-v2,
+      armv8.0-a, rv64gc) (S).
+- [ ] TG11. SIMD as MIR vector operations: SSE2/AVX2, NEON, RVV, for the `simd`
+      module and loops the vectorizer picks (XL).
+- [ ] TG12. Object files (COFF, ELF, Mach-O) from the same writer as executables,
+      for linking with C (release F4) (M).
+- [ ] TG13. One image writer for PE, ELF and Mach-O: sections, relocations, symbol
+      tables, written once (L).
+- [ ] TG14. Position-independent executables on Linux and macOS (ASLR) (M).
+- [ ] TG15. Dynamic linking of system libraries where a platform needs it (libc
+      on macOS, `kernel32` on Windows already), through import tables written by
+      us (L).
+- [ ] TG16. A WASM target on MIR: structured control flow from MIR's CFG
+      (relooper / stackifier), our own module writer, replacing the invalid
+      `wasm.fd` output (L).
+- [ ] TG17. Peephole rules per target as data, after allocation: redundant moves,
+      load after store, branch to next block (M).
+- [ ] TG18. A shared peephole pass on MIR before allocation: dead flags, double
+      extension, constant compare (M).
+- [ ] TG19. Code size mode (`--size`): RVC, short encodings, no unrolling, shared
+      panic blocks (S).
+- [ ] TG20. A new target costs under 3,000 lines: description, rules, encoder,
+      image writer; measured by the RISC-V port (S).
 
-#### F-3C: Loop Rotation ✅
-- [x] `while cond { body }` → `if cond { loop { body; if !cond break; } }`
-- [x] Reduces branches, enables unrolling and vectorization
+## Track ME — SSA and a rules mid-end (30)
 
-#### F-3D: Devirtualization ✅
-- [x] When a trait method has only one impl, replace virtual call with direct call
-- [x] Then inline the direct call
-- [x] **Fides advantage:** All trait impls are visible at IR level (no separate compilation units hiding impls). Devirtualization is trivial with LTO.
+- [ ] ME1. Use lists in the IR, kept current by every pass (M).
+- [~] ME2. Dominator tree and loop tree shared by every pass (`iro_cfg`,
+      `iro_dominates` in `iropt.fd` are a start) (M).
+- [ ] ME3. mem2reg: locals whose address never escapes become SSA values with
+      block parameters, on the IR every backend reads (L).
+- [ ] ME4. An IR verifier after every pass in debug builds: types, dominance,
+      terminators, block parameters (M).
+- [ ] ME5. One pass manager: order, per-pass timing, a switch to turn each off
+      (`--no-pass=name`), and `iro_pass_on` folded into it (M).
+- [ ] ME6. An e-graph data structure: e-classes, hash-consed e-nodes, union-find,
+      rebuilding (L).
+- [ ] ME7. Pure values of a function go into the e-graph; side-effecting
+      instructions stay a fixed skeleton (Cranelift's aegraph) (L).
+- [ ] ME8. Extraction by cost, with each value placed at the latest dominating
+      point that covers its uses: LICM and sinking fall out (L).
+- [ ] ME9. Rewrite rules as data: a pattern, a replacement, conditions on types
+      and constants; a file of rules per area (arithmetic, comparisons, bits,
+      floats) (M).
+- [ ] ME10. Constant folding as rules, with the language's overflow semantics (a
+      fold that would panic is not folded) (S).
+- [ ] ME11. CSE and GVN from hash-consing, across blocks by dominance (M).
+- [ ] ME12. Algebraic simplification: identities, reassociation of constants,
+      strength reduction of multiplication and division by constants (M).
+- [ ] ME13. Comparison and branch simplification: `!(a < b)` to `a >= b`, known
+      results from dominating conditions (M).
+- [ ] ME14. Sparse conditional constant propagation over the CFG, dead branches
+      removed (M).
+- [ ] ME15. Dead code and dead store elimination on SSA (M).
+- [ ] ME16. Each rule tested on its own: random inputs evaluated before and after
+      the rewrite, in `fid test-rules` (M).
+- [ ] ME17. Each integer rule proved by an SMT solver on 64-bit vectors (an
+      offline check, run in CI; z3 as a tool, not a dependency) (L).
+- [ ] ME18. Rule statistics: how often each fires on the suite; rules that never
+      fire are deleted (S).
+- [ ] ME19. Saturation limits per function (nodes, iterations), so compile time
+      stays linear in practice (S).
+- [~] ME20. Inlining with a cost model across modules (iropt inlines one-block
+      functions of up to 16 instructions today) (L).
+- [ ] ME21. Inlining decisions from the call graph bottom-up, with sizes known
+      after the callee is optimized (M).
+- [ ] ME22. Loop canonical form: preheaders, single latches, dedicated exits (M).
+- [ ] ME23. Induction variables: strength reduction, exit-value replacement,
+      rotation shared by every backend (`PEIR_ROTATE` moves out of pe_ir) (M).
+- [ ] ME24. Loop unrolling by a small factor for short bodies with known trip
+      counts (M).
+- [ ] ME25. Loop versioning: a fast copy without checks when a cheap test at the
+      entry proves them unnecessary (M).
+- [ ] ME26. Scalar replacement of aggregates on SSA: struct fields as separate
+      values (M).
+- [ ] ME27. Small structs returned in registers (two words) for internal
+      functions (M).
+- [ ] ME28. Switch lowering: ranges, bit tests, jump tables chosen in the mid-end
+      (M).
+- [ ] ME29. Tail recursion into loops (S).
+- [ ] ME30. Every mid-end change measured on the suite: instruction count and
+      compile time before and after, kept in a file per change (S).
 
-#### F-3E: Dead Store Elimination ✅
-- [x] Remove stores to memory that are never read
-- [x] `x = 1; x = 2;` → first store is dead
-- [x] **Fides advantage:** Region-aware alias analysis tells us when a store is visible to external code. LLVM must assume any store might be visible.
+## Track WP — The whole program (20)
 
-#### F-3F: Inline Cost Model ✅
-- [x] Replace fixed limits (3 blocks / 20 instructions) with a cost model
-- [x] Factors: function size, `is_pure` (50% bonus), `@crashfree` (25% bonus), `@deterministic` (10% bonus), LTO mode
-- [ ] Call site frequency (with PGO) *(future — PGO removed)*
-- [ ] Inlining depth tracking *(future)*
-- [x] **Fides advantage:** `@crashfree` functions are always safe to inline (no exception handling code to duplicate). `!Pure` functions are always safe to inline (no side effects to worry about). `@deterministic` functions are predictable.
-- [x] **Implementation:** `inline_cost()` in `opt.rs`. Cost = blocks×5 + insts, minus annotation bonuses (capped at 75%). Threshold: 35 (normal), 100 (LTO). Propagates `is_crashfree` from AST → IR → L1 → L2. 2 unit tests.
+- [x] WP1. Every build sees the whole program; `nat_ir` compiles only what `main`
+      reaches, from a worklist.
+- [ ] WP2. A call graph with strongly connected components, built once per build
+      (M).
+- [ ] WP3. Compile bottom-up: callees before callers, each SCC together (M).
+- [ ] WP4. IPRA: each function's clobbered registers recorded after allocation;
+      a caller keeps values in caller-saved registers across calls that do not
+      touch them (M).
+- [ ] WP5. IPRA through indirect calls: a closure or `dyn` call clobbers the union
+      of its possible targets when they are known, everything otherwise (M).
+- [ ] WP6. Custom conventions for internal functions: arguments in the registers
+      the caller already has them in, more than 8 register arguments, results in
+      several registers (L).
+- [ ] WP7. `__env` dropped from functions that never read it, at every call (S).
+- [ ] WP8. Leaf functions without frames, with no frame record where traces do not
+      need it (S).
+- [ ] WP9. Effects as optimizer facts: a call to a function with no effects is a
+      pure value in the e-graph (merged, hoisted, removed when unused) (M).
+- [ ] WP10. `!read`-only calls merged when no write lies between them (M).
+- [ ] WP11. `@crashfree` functions: their panic paths are absent, so callers need
+      no panic edges for them (S).
+- [ ] WP12. `@no-alloc` functions: no allocator state is live across them (S).
+- [ ] WP13. Interprocedural constant propagation: a parameter always passed the
+      same constant becomes that constant (M).
+- [ ] WP14. Function specialization: a hot function cloned for a constant argument
+      (M).
+- [ ] WP15. Dead function and dead global elimination after optimization, not only
+      before (S).
+- [ ] WP16. Devirtualization: `dyn` calls whose receiver type is known become
+      direct calls; closures called at one site are inlined (M).
+- [ ] WP17. Global layout: hot functions together, cold panic paths at the end of
+      the image (M).
+- [ ] WP18. Globals that are never written after initialization become constants
+      (S).
+- [ ] WP19. Generics fully monomorphized with sharing of identical bodies (code
+      folding by hash) (M).
+- [ ] WP20. Whole-program mode stays the default; a library build records the
+      facts (clobbers, effects, sizes) its users need (M).
 
-#### F-3G: Jump Threading (Cross-Block) ✅
-- [x] Current peephole does basic branch threading within blocks
-- [x] Extend across blocks: `if a { if b { X } }` → `if a && b { X }`
-- [x] Correlated condition propagation
+## Track LF — The language's guarantees as optimizer facts (25)
 
-#### F-3H: Strength Reduction ✅
-- [x] `x * 2` → `shl x, 1` (shift instead of multiply)
-- [x] `x * 0` → `xor x, x` (zero instead of multiply)
-- [x] `x % (2^n)` → `and x, (2^n - 1)` (mask instead of div+mul+sub)
-- [x] LLVM has ~10K patterns; we need the top 50
+- [ ] LF1. Alias facts from types: a `&mut` parameter aliases nothing else live;
+      two `&mut` never alias (M).
+- [~] LF2. References are second-class (`escape.fd` proves it): the optimizer may
+      assume a reference's target outlives every use and is never stored (M).
+- [ ] LF3. Owned values have one owner: a load through an owned `Vec`'s data
+      pointer cannot be changed by a store through any other name (M).
+- [ ] LF4. Alias analysis as a query interface, answered from LF1–LF3, used by
+      DSE, LICM of loads and store forwarding (M).
+- [ ] LF5. Loads hoisted out of loops when the loop writes nothing that aliases
+      them (M).
+- [ ] LF6. Store-to-load forwarding and redundant load removal (M).
+- [~] LF7. Bounds and overflow checks dropped on counted loops (release D12,
+      `checks.fd`) (done for `while i < v.len()` and `for i in 0..n`).
+- [~] LF8. Integer range analysis drops checks whose operands cannot overflow
+      (`checks.fd`, `PEIR_RANGES`); extend it to every loop and branch (L).
+- [ ] LF9. Ranges from conditions: inside `if i < n`, `i < n` is a fact (M).
+- [ ] LF10. Ranges through function boundaries for internal functions (WP13) (M).
+- [ ] LF11. Check hoisting: one check before a loop instead of one per iteration,
+      when the loop is versioned (ME25) (M).
+- [ ] LF12. Narrow types as ranges: a `u8` value needs no overflow check on a
+      widening add (S).
+- [ ] LF13. Escape analysis: a `Vec`, `str` or struct that never leaves its function
+      is allocated on the stack (L).
+- [ ] LF14. Scalar replacement of a non-escaping `Vec` of known small length (M).
+- [ ] LF15. Reference counts removed where ownership is known (proposal 0004): no
+      `Vec_share` / drop pairs on values that are moved (M).
+- [ ] LF16. Copy-on-write checks removed where a value has one owner provably (M).
+- [ ] LF17. Drops of values known to be empty or static removed (S).
+- [ ] LF18. `@deterministic` and `@constant_time` respected by every pass: no rule
+      may add a branch on secret data (the verifier of release session 30 runs on
+      every target) (M).
+- [ ] LF19. `@zeroize` stores kept by DSE (a pass may not remove them) (S).
+- [ ] LF20. `@secret` values never spilled to memory unencrypted where a register
+      will do, and their spill slots cleared (M).
+- [ ] LF21. Regions freed in one step instead of object by object (release C6) (M).
+- [ ] LF22. `comptime` results as constants the mid-end folds further (S).
+- [ ] LF23. Pattern matching facts: after a `match` arm, the scrutinee's variant is
+      known, so later tag checks fold (M).
+- [ ] LF24. `Option` and `Result` in registers: tag and payload as two values, no
+      memory for small payloads (M).
+- [ ] LF25. A document listing each language fact the optimizer uses, the rule that
+      guarantees it, and the test that breaks if the rule is broken (S).
 
-**Exit criteria:** Binary sizes within 10% of GCC -O2 for compute-heavy code.
+## Track SP — Compile speed (20)
+
+- [x] SP1. No text between source and bytes: our own encoders and image writers,
+      no assembler and no linker.
+- [ ] SP2. Per-stage timing for every build (`--time`), in one table: parse,
+      check, lower, each pass, selection, allocation, encoding (S).
+- [ ] SP3. `fid emit` of hello world under 0.5 s, then under 0.1 s (release D9):
+      today the front end takes most of it (M).
+- [ ] SP4. The checked stdlib cached in binary form, not re-parsed on every build
+      (L).
+- [ ] SP5. Code generation in parallel: functions handed to worker threads once
+      the IR exists; the image assembled in order (M).
+- [ ] SP6. A per-function code cache: key = hash of the function's IR, the target,
+      the options and the clobber/effect facts of what it calls (M).
+- [ ] SP7. Incremental relinking in memory: unchanged functions keep their bytes,
+      only relocations are redone (M).
+- [ ] SP8. A one-line edit rebuilds in under 100 ms (with SP4–SP7) (L).
+- [ ] SP9. Front end in parallel per module where modules do not depend on each
+      other (L).
+- [ ] SP10. No linear scans anywhere in the compiler: every lookup by name or id is
+      a table (release CS8) (M).
+- [ ] SP11. Arena allocation for compiler data per function, freed in one step
+      (M).
+- [ ] SP12. Self-compile under 60 s, then under 10 s (M, then L).
+- [ ] SP13. A debug mode with no mid-end and the fast allocator (RA14): 5x faster
+      than release mode (S).
+- [ ] SP14. The e-graph bounded so the release mode stays within 2x of debug (S).
+- [ ] SP15. Compile time measured on every commit, with a limit per stage that
+      fails CI when exceeded by 10% (M).
+- [ ] SP16. The compiler itself built by our own backend and fast (bootstrap with
+      `fid emit` instead of the C path) (L).
+- [ ] SP17. Memory of a build under 1 GB for the compiler itself (M).
+- [ ] SP18. A daemon mode (`fid serve`) that keeps the checked stdlib and caches
+      warm between builds (M).
+- [ ] SP19. `fid check` and the LSP share the daemon's state (M).
+- [ ] SP20. Builds are reproducible byte for byte with the cache on and off (S).
+
+## Track RL — Reliability: trusted without decades (25)
+
+- [~] RL1. Differential testing against LLVM: random programs (release VF1/VF2)
+      built by every backend and by the C path through clang must agree on output
+      and exit status (M).
+- [ ] RL2. The suite run on every backend and target on every change: Windows x64,
+      Linux x64, AArch64 and RISC-V under QEMU, WASM (M).
+- [ ] RL3. A pass on/off matrix: the suite with each mid-end pass and each rule
+      group disabled gives the same output (M).
+- [ ] RL4. A miscompile is fixed only with a test that fails without the fix
+      (always) (S).
+- [ ] RL5. Translation validation for the mid-end: for each function, a checker
+      proves the optimized IR equals the input on random inputs (L).
+- [ ] RL6. Translation validation for instruction selection: each selected
+      sequence evaluated against its MIR operation on random values (M).
+- [ ] RL7. The allocation checker (RA15) on every build in CI (S).
+- [ ] RL8. Encoder oracle tests (TG4) for every target in CI (S).
+- [ ] RL9. Image files checked by the system tools: `llvm-readobj`, `dumpbin`,
+      `readelf`; every executable we write must load and pass them (S).
+- [ ] RL10. Fuzzing of the IR -> machine code path with random IR (not only random
+      source), so backend bugs show without front-end limits (M).
+- [ ] RL11. Mutation testing of the backend: a deliberately broken rule or pass
+      must fail a test (L).
+- [ ] RL12. Line and branch coverage of `compiler/mir*.fd` and every target over
+      90% from the suite and the fuzzers (M).
+- [ ] RL13. Deterministic output: no hash-map order reaches code generation; the
+      same input gives the same bytes on every host (M).
+- [ ] RL14. The fixpoint built by our own backend: stage 2 == stage 3 through
+      `fid emit` on every native host (L).
+- [ ] RL15. Sanitizer runs of the compiler itself through the C path (ASan,
+      UBSan), finding its own memory errors (M).
+- [ ] RL16. Runtime checks of the runtime: `--checked-alloc` and `--leaks` on every
+      native target, not only C (M).
+- [ ] RL17. Concurrency testing of the runtime: thousands of task and thread
+      interleavings under a scheduler that picks randomly (L).
+- [ ] RL18. A public miscompile log: each bug, the pass, why the tests missed it,
+      the test that now catches it (S).
+- [ ] RL19. Kill switches for every pass and rule group, documented, so a user can
+      work around a miscompile on the day it is found (S).
+- [ ] RL20. Crash reports from the compiler with the function and pass that failed
+      and a reduced reproducer (`fid reduce`) (M).
+- [ ] RL21. A reducer: shrink a failing program automatically while it still fails
+      the same way (M).
+- [ ] RL22. Two independent paths kept on purpose: our backend and the C path. A
+      release ships only when both agree on the suite (S).
+- [ ] RL23. Signal-safe runtime paths reviewed: crash handlers allocate nothing,
+      take no lock (the Linux runtime's `pe_on_signal` already) (S).
+- [ ] RL24. Stack overflow reported cleanly on every target: guard regions on
+      every thread and task stack (done on native Linux and the C path) (S).
+- [ ] RL25. Every target's ABI tested against C: calls into C and callbacks from C
+      (`qsort`) on every target (M).
+
+## Track DB — Debugging and visibility (10)
+
+- [ ] DB1. Line tables from the IR to MIR to bytes: every instruction knows its
+      source line (M).
+- [ ] DB2. DWARF on Linux and macOS: line numbers, functions, frames (L).
+- [ ] DB3. PDB / CodeView on Windows (L).
+- [ ] DB4. Locations of variables at `-O0`-like debug builds, in registers and
+      slots (L).
+- [x] DB5. Panic and crash traces from frame records, no per-call bookkeeping
+      (the C path, native Linux).
+- [ ] DB6. Unwind information (Windows `.pdata`, DWARF CFI) so system debuggers and
+      profilers walk our stacks (M).
+- [ ] DB7. `fid explain <function>`: the IR, the MIR after each stage, the machine
+      code, side by side (M).
+- [ ] DB8. Optimization remarks: why a check stayed, why a call was not inlined,
+      why a value spilled (`--remarks`) (M).
+- [ ] DB9. A sampling profiler on every native target that names our functions
+      (from DB6) (M).
+- [ ] DB10. Symbol maps for every image we write, readable by `addr2line`-style
+      tools (S).
 
 ---
 
-### Phase F-4: Backend Maturity
-
-**Goal:** Correct ABI, instruction selection, and multi-arch support.
-
-**Why we need it:** Fides has 6 backends but x86-64 ABI is simplified (everything 8 bytes). Real C interop needs correct struct passing, float passing, variadic args.
-
-**Status:** x86-64 solid but simplified ABI, ARM64/RISC-V less tested
-
-#### F-4A: x86-64 ABI Compliance ✅
-- [x] Correct struct passing/returning (not everything 8 bytes)
-- [x] SSE register passing for floats (currently floats go through integer registers)
-- [ ] Variadic arguments (va_list) *(future)*
-- [x] Test: call C functions with complex signatures from Fides
-- [x] **Implementation:** `gen_call_abi` in `src/codegen_x64.rs` handles System V AMD64 ABI: integer args in RDI/RSI/RDX/RCX/R8/R9, float args in XMM0-XMM7, struct args by value, 16-byte stack alignment. `gen_prologue_abi` saves XMM argument registers for extern functions. Old `gen_call` removed as dead code.
-
-#### F-4B: ARM64 + RISC-V Maturity
-- [x] **FIXED (build pipeline):** `build --target arm64/riscv` previously failed at the assemble stage for all real programs — Store operand shadowing emitted raw `VReg` names (`str v6, [x6]`), `return` was emitted where the assemblers implement `ret`, `arm64_enc` lacked the `fp` alias, negative ADD immediates weren't canonicalized to SUB, and negative LDR/STR offsets lacked LDUR/STUR forms. All fixed; full stdlib-linked executables now build on both targets
-- [x] **FIXED (linker):** ARM64 BL/B/B.cond relocations were patched with an x86-style `P+4` base — ARM64 branches are P-relative; external calls previously landed 4 bytes short of their targets
-- [x] **FIXED (objects):** `codegen --target arm64/riscv --elf` now emits real machine code in `.text` (previously: assembly text stuffed into `.comment`, empty `.text`) with proper ELF relocations (R_AARCH64_CALL26/JUMP26/CONDBR19/ADR_PREL_PG_HI21/ADD_ABS_LO12_NC, R_RISCV_JAL/BRANCH)
-- [ ] Verify AAPCS64 / RISC-V calling conventions
-- [ ] NEON / RVV vector instruction emission
-- [ ] Test via QEMU cross-compilation (executables build; execution unverified — no target hardware in dev environment)
-
-#### F-4C: Instruction Selection ✅
-- [x] Pattern matcher for strength reduction (see F-3H)
-- [x] Address mode matching (LEA for address computation)
-- [x] **Fides advantage:** No need for LLVM's 10K patterns — Fides's IR is simpler (no bitfields, no unions, no packed structs)
-- [x] **Implementation:** `gen_field_addr` uses `leaq off(base), dst` for struct field offsets. `gen_elem_addr` uses `leaq (base, idx, scale), dst` for array element addressing with scale factor, replacing `shlq`+`addq` sequences.
-
-**Exit criteria:** Fides calls C libraries with complex types correctly on x86-64, ARM64, RISC-V.
-
----
-
-## Part 3: Where We Innovate (Beating LLVM)
-
-These phases use Fides's semantic information to optimize in ways LLVM fundamentally cannot. This is the differentiator — not matching LLVM, but making it irrelevant for code that uses Fides's features.
-
-### Phase I-1: Region-Aware Memory System
-
-**Goal:** Use regions to generate better memory code than LLVM can.
-
-**Why LLVM can't:** LLVM doesn't know which pointers belong to which region. It must assume any pointer can alias any other pointer (modulo `restrict` hints and TBAA type info). Fides knows — the region is in the type.
-
-**Status:** Region system exists in typechecker (68 references). I-1D (stack allocation) done implicitly. I-1B (pool allocation) implemented but not in default pass list.
-
-#### I-1A: Region-Aware Alias Analysis (Enhanced) ✅
-- [x] Current `pass_alias_analysis` exists but is conservative
-- [x] Two pointers in different regions *cannot* alias — eliminate all redundant loads between them
-- [x] Example: `region a { x = *p }; region b { y = *q }` — LLVM reloads `*p` after `*q` (might alias). Fides doesn't need to.
-- [x] **Impact:** 15-30% fewer loads in region-isolated code. This is the single biggest Fides advantage.
-- [x] **Implementation:** Enhanced `pass_alias_analysis` in `opt.rs` with:
-  - **Inter-block load elimination**: Loads from a pointer in a dominated block that were already loaded in a single-predecessor block (with no intervening aliasing store) are eliminated. Uses `compute_predecessors()` to build predecessor info (lowering doesn't set it).
-  - **Call invalidation by region**: A call only invalidates loads from regions that its arguments point to. Loads from other regions are safe across the call. This is the key Fides advantage — LLVM must assume any call can modify any memory.
-  - **Dominator tree computation**: `compute_dominators()` using Cooper-Harvey-Kennedy iterative algorithm, with `compute_rpo()` for reverse postorder traversal.
-  - 2 unit tests in `opt.rs`.
-
-#### I-1B: Region Pool Allocation ⚠️ (implemented, not in default pass list)
-- [x] Allocate each region from a memory pool (bump allocator) instead of individual mallocs
-- [x] A region with 100 allocations becomes 1 malloc + 100 bump-pointer allocations (vs 100 mallocs)
-- [ ] **Impact:** 10-100x faster allocation for region-heavy code. LLVM can't do this — it doesn't know which allocations belong together.
-- [ ] **Status:** `pass_region_pool` implemented in `opt.rs`. Replaces N `Alloca` instructions in a named region with 1 `p_alloc` call + N `BinOp(Add, pool, offset)` instructions. Only activates for regions > 4KB (small regions are already stack-allocated). NOT in default pass list — available via `fidesc opt --region-pool`. Needs heap-escape analysis to be safe for general use (currently all allocas are stack-allocated by L2→L3 lowering, so pool allocation would convert free stack allocs to costly heap allocs).
-
-#### I-1C: Region Bulk Free ✅
-- [x] Free an entire region in one operation (one `munmap` or one pool reset)
-- [x] No individual frees needed — the region is gone, all its allocations are gone
-- [x] **Impact:** O(1) cleanup instead of O(N) individual frees. LLVM can't do this — C/C++ has no region concept.
-- [x] **Implementation:** `pass_region_pool` in `opt.rs` now emits `p_region_free(pool)` before every Return instruction when pooling is active. Runtime stub `p_region_free` added to `runtime_linux.rs` (aliases `p_free`/`munmap`). Interpreter and C codegen handle `p_region_free`. 1 unit test verifies free is emitted.
-
-#### I-1D: Region-Aware Stack Allocation ✅ (implicit)
-- [x] If a region's lifetime doesn't escape the function, allocate it on the stack (stack frame extension)
-- [x] No heap allocation at all for short-lived regions
-- [x] **Impact:** Zero malloc overhead for temporary regions. LLVM's stack promotion requires SROA + escape analysis; Fides knows from the region type.
-- [ ] **Note:** Done implicitly — the L2→L3 lowering (`pir.rs` line ~1108) assigns stack slots to ALL `Alloca` instructions regardless of region (Stack, Heap, or Named). This works because Fides's region system prevents regions from escaping in most cases. A future improvement would add proper escape analysis to distinguish stack-allocatable regions from heap-required ones.
-
-**Exit criteria:** A region-heavy benchmark runs 2x+ faster than the equivalent C code compiled with LLVM -O2.
-
----
-
-### Phase I-2: Effect-Based Code Generation
-
-**Goal:** Use effect annotations to generate better code around function calls.
-
-**Why LLVM can't:** LLVM doesn't know what side effects a function has. It must assume the worst (any call can modify any memory, throw an exception, allocate). Fides knows — the effect is in the type.
-
-**Status:** Effect-reorder pass exists. `pass_effect_optimize` (EffectOpt) implemented with dead pure call elimination + pure call hoisting. I-2A/F-1D implemented in regalloc.
-
-#### I-2A: Pure Function Fast Path ✅ (same as F-1D)
-- [x] A `!Pure` function (no IO, no Net, no Alloc, no Spawn) can't modify external state
-- [x] Don't spill caller-saved registers around calls to `!Pure` functions (they can't modify anything we care about)
-- [ ] Don't emit memory fences around `!Pure` calls *(future: not yet implemented)*
-- [x] **Impact:** 10-20% fewer spill/reload instructions in pure-heavy code (math, ML)
-- [x] **Implementation:** See F-1D. `inst_clobbers()` in `regalloc.rs` checks `pure_functions` set — pure calls only clobber RAX.
-
-#### I-2B: Effect-Based Dead Call Elimination ✅
-- [x] If a `!Pure` function's return value is unused, eliminate the call entirely
-- [x] LLVM can't do this — it must assume any function call has side effects
-- [x] Fides knows: `!Pure` means no side effects, so unused result = dead code
-- [x] **Impact:** Eliminates debug logging, assertion checks, and computation whose result is unused
-- [x] **Implementation:** `pass_effect_optimize` in `opt.rs`. Uses `is_effectively_pure()` to identify functions with no observable side effects (allows local stack ops). Dead calls are removed when their result VReg is never referenced.
-
-#### I-2C: Effect-Based Instruction Reordering (Enhanced) ⚠️ (partial)
-- [x] Current `pass_effect_reorder` reorders pure calls
-- [ ] Extend: reorder `!IO` calls relative to each other (IO is commutative if outputs don't feed inputs) *(future)*
-- [x] Hoist `!Pure` calls out of loops (they return the same value every iteration)
-- [ ] **Impact:** Better instruction scheduling for free, using information LLVM must derive
-- [x] **Implementation:** `pass_effect_optimize` in `opt.rs`. Pure calls with loop-invariant arguments are hoisted to the loop preheader. Constant arguments are also hoisted.
-
-#### I-2D: !Alloc Functions — No Allocator State ✅
-- [x] A `!Alloc` function can't allocate — no need to preserve allocator state registers
-- [ ] A `!Alloc` function can't trigger GC — no need for GC safepoints *(future: no GC yet)*
-- [x] **Impact:** Faster calls in allocator-sensitive code (embedded, real-time)
-- [x] **Implementation:** Propagated `is_no_alloc` from AST → IR → L1 → L2. Added `no_alloc_functions: HashSet<String>` to `L3Module`. `inst_clobbers()` in `regalloc.rs` treats `@no-alloc` calls like pure calls — only RAX clobbered (return value), not all caller-saved registers. `@medical` functions are included in the no-alloc set (since `@medical` implies `@no-alloc`). 1 unit test.
-
-**Exit criteria:** Pure-heavy code has 20%+ fewer spill/reload instructions than LLVM -O2 equivalent.
-
----
-
-### Phase I-3: Capability-Based Binary Stripping
-
-**Goal:** Use capabilities to produce smaller, more secure binaries than LLVM can.
-
-**Why LLVM can't:** LLVM's DCE removes unreachable code. But it can't know which functions are *semantically* unreachable (not granted a capability). Fides knows — the capability is in the type.
-
-**Status:** `--caps` flag exists. I-3A (transitive capability DCE) implemented with BFS call graph. I-3B (capability-aware linking) implemented with trap stubs.
-
-#### I-3A: Transitive Capability DCE ✅
-- [x] If `foo()` requires `!File` and `!File` isn't granted, eliminate `foo()`
-- [x] Then eliminate everything only `foo()` calls (transitive closure)
-- [x] Then eliminate their dependencies (stdlib functions only called by eliminated functions)
-- [x] **Impact:** A program using 5 stdlib modules includes code from only those 5, not all 34. Binary sizes 50-90% smaller for capability-restricted programs.
-- [x] **Implementation:** `strip_ungranted_caps()` in `compiler.rs`. Maps capabilities to effects, finds functions requiring ungranted effects, builds call graph (including ConstStr address-taken tracking), BFS from entry points, removes unreachable functions. Handles indirect calls conservatively (keeps address-taken functions unless they require ungranted capabilities).
-
-#### I-3B: Capability-Aware Linking ✅
-- [x] Don't link runtime stubs for ungranted capabilities
-- [x] If `!Net` isn't granted, don't include `p_socket_*` runtime stubs
-- [x] If `!File` isn't granted, don't include `p_file_*` runtime stubs
-- [x] **Impact:** Smaller binaries, smaller attack surface. LLVM links everything and DCEs what it can prove is dead — Fides strips by policy.
-- [x] **Implementation:** `runtime_parts_with_caps()` in `runtime_linux.rs`. `stub_capability()` maps stub names to capabilities (p_socket_*/p_http_* → Net, p_file_*/p_read_file/p_write_file → FS, p_thread_*/p_spawn → Spawn). Stub macros (`stub_zero!`/`stub_void!`) check if the stub belongs to an ungranted capability — if so, emit `ud2` (trap) + `return` instead of the normal stub body. Stubs remain at same offsets (preserving symbol table) but trap immediately if called. 3 unit tests in `runtime_linux.rs`. `compiler.rs` uses `runtime_parts_with_caps` when `--caps` is specified.
-
-#### I-3C: Sandbox-Aware Optimization ✅
-- [x] Inside a `sandbox {}` block, the optimizer knows exactly which functions are available
-- [x] Devirtualize calls inside sandbox (only pure impls are visible — `devirt_sandbox_function`)
-- [x] Inline more aggressively (sandbox call sites use 6 blocks / 40 insts vs normal 3/20)
-- [x] **Impact:** Sandboxed code is both smaller and faster than LLVM-compiled equivalent
-- [x] **Implementation:** Propagates `in_sandbox` flag from AST → IR (`ValueMeta.in_sandbox`) → L1 (`L1Function.sandbox_values`) → L2 (`L2Function.sandbox_values`). The `Lowerer` tracks `sandbox_depth` during lowering. `pass_devirt` builds a `sandbox_single_impl` map — for traits with multiple impls but only one pure impl, sandbox DynCalls are devirtualized to the pure impl. `pass_inline` uses `sandbox_eligible` set with higher limits for sandbox call sites. Runtime: `p_region_free` stub added. 3 unit tests.
-
-**Exit criteria:** A `sandbox {}` program with 3 capabilities produces a binary 80%+ smaller than the full-capability version.
-
----
-
-### Phase I-4: Safety-Annotation-Guided Optimization
-
-**Goal:** Use `@deterministic`, `@crashfree`, `@gas`, `@medical` to optimize in ways LLVM cannot.
-
-**Why LLVM can't:** LLVM has no concept of determinism, crash-freedom, gas limits, or medical safety. These are Fides-native annotations.
-
-**Status:** I-4A to I-4E implemented on the PIR path (see the items below). Annotations propagated from AST → IR → L1 → L2.
-
-#### I-4A: @deterministic Memoization ✅ (compile-time)
-- [x] A `@deterministic` function's output depends only on its inputs
-- [x] Compile-time: if `@deterministic foo(args)` is called twice with the same argument ValueIds, replace the second call with a Copy of the first result
-- [ ] Runtime: insert a cache (HashMap) at call sites for hot deterministic functions *(future)*
-- [ ] Compile-time eval of `@deterministic foo(constant)` → replace with result *(future: needs comptime integration)*
-- [x] **Impact:** Free memoization for deterministic functions. LLVM can't do this — it doesn't know which functions are deterministic.
-- [x] **Implementation:** `pass_memoize` in `opt.rs`. Propagates `is_deterministic` from AST → IR → L1 → L2. Within each block, tracks `(func_name, arg_valueids) → result_pvalue`. Duplicate calls replaced with `L2Inst::Copy`. Most effective for recursive `@deterministic` functions (non-inlinable). 2 unit tests in `opt.rs`.
-
-#### I-4B: @crashfree Code Hoisting ✅
-- [x] A `@crashfree` function cannot panic
-- [x] Hoist `@crashfree` calls out of loops (the loop can't fail, so the call is safe to move)
-- [ ] Don't generate panic handlers around `@crashfree` calls (there are none) *(future: codegen-level)*
-- [x] **Impact:** Tighter loops, less exception-handling overhead. LLVM must assume any C++ function can throw.
-- [x] **Implementation:** Extended `pass_effect_optimize` in `opt.rs`. Added `hoistable_funcs` set that includes `@crashfree` functions that are effectively pure (no IO/Net/Spawn). These are hoisted out of loops when args are loop-invariant. 1 unit test.
-
-#### I-4C: @gas-Guided Unrolling ✅
-- [x] A `@gas(N)` function executes at most N operations
-- [x] Unroll loops up to 64 iterations (the gas limit proves termination — no infinite unrolling risk)
-- [x] LLVM can't unroll loops without proving termination (and often can't prove it)
-- [x] **Impact:** Blockchain/smart-contract code gets fully unrolled. LLVM can't do this.
-- [x] **Implementation:** Propagated `gas_limit: Option<u64>` from AST → IR → L1 → L2. Modified `pass_unroll` to use `max_unroll = 64` when `f.gas_limit.is_some()` (vs normal limit of 8). 2 unit tests.
-- [ ] **Impact:** Blockchain/smart-contract code gets fully unrolled. LLVM can't do this.
-
-#### I-4D: @medical Compile-Time Verification ✅
-- [x] `@medical` functions must not allocate, must not recurse, must not use `while` loops *(typechecker)*
-- [x] The optimizer can assume: no heap pointer dereferences (no allocation), no stack growth (no recursion), bounded iteration (no while)
-- [x] Stack-allocate everything in a `@medical` function (no heap possible)
-- [x] **Impact:** Medical-device code is verifiably safe and optimally compiled. LLVM has no medical safety concept.
-- [x] **Implementation:** Typechecker already verifies `@medical` constraints (no alloc, no recursion, no while, must be @audit). Propagated `is_medical` from AST → IR → L1 → L2. `@medical` functions are included in `no_alloc_functions` set for regalloc (I-2D benefit). 1 unit test.
-
-#### I-4E: @wrapping Arithmetic Optimization ✅
-- [x] `@wrapping` functions use wrap-around arithmetic (no overflow checks)
-- [x] Native codegen already emits `add` instead of `jo panic` (no overflow check needed) — wrapping is the default for native code
-- [x] Reassociate: `(a + b) + c` → `a + (b + c)` (wrapping arithmetic is associative, checked is not)
-- [x] Canonicalize: `a + C` → `C + a` (constant on left for better CSE)
-- [x] **Impact:** 2x faster arithmetic for `@wrapping` code (no overflow checks). LLVM does this for C unsigned, but Fides makes it explicit per-function.
-- [x] **Implementation:** `pass_reassociate` in `opt.rs`. Only applies to functions with `is_wrapping = true`. Propagates `is_wrapping` from AST → IR → L1 → L2. Transforms: constant folding `(a + C1) + C2 → a + (C1+C2)`, canonicalization `a + C → C + a`. 2 unit tests in `opt.rs`.
-
-**Exit criteria:** `@deterministic` functions are memoized. `@gas` loops are fully unrolled. `@crashfree` calls are hoisted. `@wrapping` arithmetic has no overflow checks.
-
----
-
-### Phase I-5: Comptime-Driven Metaprogramming
-
-**Goal:** Use Fides's comptime system to evaluate more at compile time, reducing runtime work to zero.
-
-**Why LLVM can't:** LLVM has `constexpr` (C++) and `const fn` (Rust), but these are limited subsets. Fides's comptime (1007 LOC) can evaluate arbitrary Fides code at compile time.
-
-**Status:** Comptime exists with partial evaluation. Can be extended.
-
-#### I-5A: Aggressive Comptime Evaluation ✅
-- [x] If a `comptime fn` function is called with all-literal arguments, evaluate it at compile time — even without an explicit `comptime` wrapper
-- [x] Replace the call with the constant result
-- [x] **Impact:** Comptime can precompute lookup tables, unroll config-dependent code, specialize generics. LLVM's `constexpr` is more restrictive.
-- [x] **Implementation:** Added `aggressive_comptime_func` pass in `comptime.rs` that runs after normal substitution. Scans all functions for calls to `comptime fn` functions where all args are literals, evaluates them, and replaces with the result. Iterates to fixed point (4 iterations) for chains of comptime calls. Also eliminates dead branches in `if` statements with literal conditions.
-
-#### I-5B: Comptime Specialization ✅ (covered by I-5A + partial_eval)
-- [x] If a generic function is called with a constant type parameter, specialize at compile time *(monomorphization already does this)*
-- [x] `Vec<i32>.push(5)` → specialized `Vec_i32_push(5)` with no type dispatch *(monomorphization)*
-- [x] **Impact:** Zero-cost generics. LLVM monomorphizes but doesn't specialize based on value parameters.
-- [x] **Implementation:** Monomorphization (`src/mono.rs`) handles type-parameter specialization. I-5A handles value-parameter specialization for comptime functions. `pass_partial_eval` in `opt.rs` handles value-parameter specialization for pure functions at the IR level.
-
-#### I-5C: Comptime Code Generation ✅ (already existed)
-- [x] Comptime functions that generate AST nodes (not just values) *(comptime gen blocks)*
-- [x] A comptime function can build a function at compile time, inject it into the program
-- [x] **Impact:** User-defined derive macros, compile-time DSLs, zero-cost abstractions. LLVM can't do this — C++ templates are the closest, and they're far more limited.
-- [x] **Implementation:** `comptime gen { block }` blocks in `comptime.rs`. Block evaluates to a string, which is parsed as Fides source and injected into the program before typechecking.
-
-#### I-5D: Comptime Loop Unrolling ✅
-- [x] If a loop's trip count is a comptime constant, unroll it at compile time (not at opt time)
-- [x] The unrolled body is then available for further comptime optimization
-- [x] **Impact:** Comptime unrolling + comptime const-fold = entire loops evaluated at compile time. LLVM does this in stages (unroll + const-fold), but Fides can do it in one pass.
-- [x] **Implementation:** Added to `aggressive_comptime_stmt` in `comptime.rs`. When a `for` loop has a Range with literal bounds and body ≤ 16 statements, unrolls at the AST level by cloning the body with the loop variable replaced by each iteration value. The original loop is replaced with an empty range (0 iterations). The unrolled body is then available for further comptime optimization.
-
-**Exit criteria:** A comptime-evaluable function called with constants produces zero runtime code. The call site is replaced with a constant.
-
----
-
-### Phase I-6: Linear Type Optimization
-
-**Goal:** Use linear types (single-use) to optimize allocation and ownership.
-
-**Why LLVM can't:** LLVM has no linear types. C++ move semantics are a library convention, not a type system feature. Rust has affine types (used at most once) but LLVM doesn't exploit this.
-
-**Status:** Linear types exist (89 references in typechecker). I-6A and I-6B implemented on the PIR path; I-6C not started.
-
-#### I-6A: Linear Type Stack Promotion ✅
-- [x] A linear value (used exactly once) has a predictable lifetime — it's created, used, consumed
-- [x] If the lifetime doesn't escape, stack-allocate it (no heap allocation)
-- [x] **Impact:** Linear values have zero heap overhead. LLVM must do escape analysis to prove this; Fides knows from the type.
-- [x] **Implementation:** `is_linear` flag in `ValueMeta` propagated from AST through IR to L2. Linear values are identified during lowering and prioritized for stack allocation in L2→L3 lowering.
-
-#### I-6B: Linear Type In-Place Mutation ✅
-- [x] A linear value can be mutated in place (no one else can reference it — it's used once)
-- [x] No need for copy-on-write or defensive copies
-- [x] **Impact:** `Vec<T>` with linear ownership can mutate in place. LLVM/Rust need borrow checker analysis to prove this; Fides knows from linearity.
-- **Implementation:** `linear_structs` propagated from AST → IrModule → L1Module → L2Module. `ValueMeta.is_linear` set during lowering. `alias_analysis_function` tracks `linear_ptrs` (pointers to @linear structs) and uses them to prove non-aliasing: stores through linear pointers don't invalidate loads from other pointers, and vice versa. This enables more aggressive load elimination and reordering.
-
-#### I-6C: Linear Type Resource Elimination
-- [ ] If a linear value is consumed (used exactly once) and the consumption is a no-op (e.g., drop), eliminate the allocation
-- [ ] **Impact:** Intermediate linear values (build a string, print it, drop it) can be fully eliminated if the consumption is inlined.
-
-**Exit criteria:** Linear-typed values are stack-allocated by default. No heap allocation for non-escaping linear values.
-
----
-
-### Phase I-7: Borrow Checker-Guided Optimization
-
-**Goal:** Use Fides's borrow checker (1176 LOC, Phases 1-6 complete) to provide alias information to the optimizer.
-
-**Why LLVM can't:** LLVM has no borrow checker. Rust has one but it's separate from LLVM — the borrow checker proves safety, but the information isn't fully exploited by LLVM's optimizer.
-
-**Status:** Borrow checker complete. I-7A feeds alias facts to the optimizer on the PIR path; I-7B and I-7C not started.
-
-#### I-7A: Borrow-Based Alias Analysis ✅
-- [x] If the borrow checker proves two references don't overlap (one is `&mut`, the other is `&`), they don't alias
-- [x] Feed this to the alias analysis pass — eliminate redundant loads
-- [x] **Impact:** LLVM's TBAA is probabilistic. Fides's borrow checker is definitive. 10-20% fewer loads in borrow-checked code.
-- [x] **Implementation:** `BorrowKind` enum (Shared/Mutable/None) added to `ValueMeta` in `src/ir.rs`, propagated through IR→L1→L2 lowering. `borrow_kinds: HashMap<PValue, BorrowKind>` in L1/L2 functions. `borrow_non_aliasing()` helper in `src/opt.rs` integrated into alias analysis Phase 1 (predecessor replay + main loop) and Phase 2 (cross-region reordering). Shared borrows don't invalidate mutable borrow stores, and vice versa.
-
-#### I-7B: Two-Phase Borrow Optimization
-- [ ] Fides supports two-phase borrows (reserve, use, release)
-- [ ] During the "use" phase, the borrowed value is guaranteed not to be modified
-- [ ] Hoist loads out of two-phase borrow regions (the value can't change)
-- [ ] **Impact:** Fewer reloads inside borrow regions. LLVM has no concept of borrow phases.
-
-#### I-7C: NLL-Based Lifetime Optimization
-- [ ] Non-lexical lifetimes (NLL) give precise last-use information
-- [ ] Kill values at their last use (free registers earlier, reuse for other values)
-- [ ] **Impact:** Better register reuse. LLVM does liveness analysis, but Fides's NLL is more precise for borrow-checked code.
-
-**Exit criteria:** Borrow-checked code has 15%+ fewer loads than the equivalent C code compiled with LLVM -O2.
-
----
-
-## Part 4: Compilation Speed (The Permanent Advantage)
-
-### Phase S-1: Maintain 10x Compilation Speed
-
-**Goal:** As we add optimizations, maintain Fides's compilation speed advantage.
-
-**Why this matters:** Fides compiles in 18ms (vs GCC 44ms). For large programs, LLVM takes 10-30 seconds. This is Fides's most user-visible advantage. Adding LLVM-level optimizations must not lose this.
-
-**Status:** Current: 2-3x faster than GCC for small files
-
-#### S-1A: Pass Skipping ✅
-- [x] Don't run passes that can't help: no loop unrolling on functions without loops, no SROA without structs
-- [x] LLVM runs all passes on all functions; Fides can skip based on PIR analysis
-- [x] **Implementation:** `pass_relevant_for_module()` in `opt.rs` checks module-level patterns before running each pass. Skips: Unroll/LoopRotate/LoopVectorize if no loops, Inline if no calls, TCO if no tail calls, Devirt if no DynCalls, Vectorize/StrengthReduce if no BinOps, SROA if no Allocas, AliasAnalysis if no Load/Store, DSE if no Store, JumpThread if no Branch, EffectReorder/EffectOpt if no calls/IO, PartialEval if no calls with constant args, Reassociate if no @wrapping nested BinOps, Memoize if no @deterministic functions, RegionPool if no named region allocas. ConstFold/CSE/GVN/DCE always run.
-
-#### S-1B: Incremental Compilation ✅
-- [x] Cache PIR per function; only recompile changed functions
-- [x] `fidesc watch` already does this for hot reload — extend to `fidesc build`
-- [x] **Impact:** Rebuilding after a 1-function change takes O(1) time, not O(program)
-- [x] **Implementation:** `src/inc.rs` provides an in-memory `IncrementalCache` that stores optimized L2 modules keyed by (source_path, source_hash, opt_flags). `build_executable_with_lto()` in `compiler.rs` checks the cache before running the full pipeline; on a hit, it skips IR lowering, L1→L2 lowering, and L2 optimization, reusing the cached L2 directly. The cache key incorporates `do_opt`/`do_lto` flags so different optimization levels don't return stale results. A global cache (`global_cache()`) is shared across calls within a process, benefiting LSP server, watch mode, and the test harness. 7 unit tests in `inc.rs` verify store/get/clear/hash behavior.
-
-#### S-1C: Function-Level Parallelism ✅
-- [x] Optimize different functions in parallel (they're independent until LTO)
-- [x] LLVM does this via ThinLTO; Fides can do it more simply (single process, thread pool)
-- [x] **Implementation:** `parallel_functions()` helper in `src/opt.rs` uses `std::thread::scope` to process function chunks in parallel. 19 of 22 optimization passes are parallelized (all except `pass_inline`, `pass_devirt`, `pass_partial_eval` which need cross-function info). For modules with < 4 functions, runs sequentially to avoid thread overhead. Also fixed the loop vectorizer cost model to correctly exclude condition recomputation and induction variable instructions from the cost calculation.
-
-#### S-1D: Small Function Fast Path ✅ (covered by S-1A)
-- [x] Functions < 10 instructions: skip most passes (they won't help)
-- [x] Only run const-fold + DCE (cheap, always helpful)
-- [x] **Implementation:** Covered by S-1A pass skipping. Small functions with no loops/calls/allocas/branches will skip most passes automatically. The pass relevance check is module-level, so small functions in a module with larger functions still get scanned, but the scan is O(1) per pass (just checks if the pattern exists anywhere in the module).
-- [ ] This covers most functions in real programs
-
-**Exit criteria:** 10K LOC program compiles in <1 second. LLVM takes 10+ seconds.
-
----
-
-## Priority Order
-
-| Phase | Priority | Effort | Why | Status |
-|-------|----------|--------|-----|--------|
-| **F-1** (Regalloc) | 🔴 Critical | Medium | Foundation — everything depends on it | Linear scan on the PIR path, clobber bug fixed (F-1A); `fid emit` has none (7 callee-saved registers) |
-| **F-2** (Loop Vec) | 🔴 Critical | Large | 4-8x for numerical code | SLP done (F64+I64), loop vec partial |
-| **F-3** (Opt Passes) | 🔴 Critical | Medium | Closes the quality gap | 23 passes on the PIR path; `fid emit` runs 3 (iropt.fd) |
-| **I-1** (Region Memory) | 🔴 Critical | Medium | **Biggest Fides advantage** — 2x+ over LLVM | Region system exists, not exploited |
-| **I-2** (Effect Opt) | 🟡 High | Medium | 10-20% fewer spills in pure code | Effect-reorder exists, limited |
-| **I-4** (Safety Opt) | 🟡 High | Medium | `@deterministic`/`@gas`/`@crashfree` exploitation | I-4A–I-4E on the PIR path |
-| **I-5** (Comptime) | 🟡 High | Medium | Zero-cost metaprogramming | Comptime exists, can be extended |
-| **F-4** (Backends) | 🟡 High | Large | Multi-arch production quality | x86-64 solid, others partial |
-| **I-3** (Cap Stripping) | 🟡 High | Small | 50-90% smaller binaries | `--caps` with transitive DCE (I-3A–I-3C) |
-| **I-6** (Linear Types) | 🟡 High | Medium | Zero heap for linear values | I-6A, I-6B on the PIR path; I-6C open |
-| **I-7** (Borrow Opt) | 🟡 High | Medium | Definitive alias info | I-7A on the PIR path; I-7B, I-7C open |
-| **S-1** (Compile Speed) | 🟢 Medium | Small | Maintain 10x advantage | 2-3x faster than GCC currently |
-| **S-1B** (Incremental) | ✅ Done | Small | Cache L2 per function | `src/inc.rs`, 7 unit tests |
-| **S-1C** (Parallelism) | ✅ Done | Small | Parallel function opts | 19/22 passes parallelized |
-
----
-
-## Self-Hosting Readiness (Next Major Milestone)
-
-**Done (Nov 6, 2026):** the self-hosted compiler `fid` is the release compiler;
-the 3-stage bootstrap reaches a byte-identical fixpoint (49 MB of C). The plan
-below is the original estimate, kept for the record. **See `roadmap.md` Phase 10**
-for history. All 3 language-level blockers (generic Vec<T>, enum payloads,
-recursive Box<T>) are resolved. Last full suite (Nov 2, `fidesc test`):
-interpreter 339/339, C 343/343, PE 345/345, expected-fail 89/89.
-
-### Estimated Effort to Self-Host
-
-| Phase | Description | Effort |
-|-------|-------------|--------|
-| **Phase 1: Fill gaps** | Add missing stdlib (string builder, char iteration, parsing) | 1-2 sessions |
-| **Phase 2: Lexer** | Rewrite lexer.rs in Fides (~800 LOC) | 1 session |
-| **Phase 3: Parser** | Rewrite parser.rs in Fides (~2000 LOC) | 2-3 sessions |
-| **Phase 4: Typechecker** | Rewrite typechecker.rs in Fides (~3000 LOC) | 3-4 sessions |
-| **Phase 5: Lowerer** | Rewrite lower.rs in Fides (~1500 LOC) | 2 sessions |
-| **Phase 6: IR/PIR** | Rewrite ir.rs + pir.rs in Fides (~2000 LOC) | 2 sessions |
-| **Phase 7: Optimizer** | Rewrite opt.rs in Fides (~3000 LOC) | 3-4 sessions |
-| **Phase 8: Codegen** | Rewrite codegen_x64.rs in Fides (~1500 LOC) | 2 sessions |
-| **Phase 9: Bootstrap** | Fides compiler compiles itself | 1 session |
-| **Total** | | ~15-20 sessions |
-
----
-
-## The Path to "10x Better Than LLVM"
-
-### Step 1: Match the fundamentals (F-1 through F-4)
-Fix regalloc, add loop vectorization, add 8 key opt passes, mature backends. This gets Fides to "within 5% of LLVM -O2" on raw code quality. **This is table stakes — you can't compete without it.**
-
-### Step 2: Exploit semantic information (I-1 through I-7)
-This is where Fides pulls ahead:
-- **Region-aware alias analysis** → 15-30% fewer loads than LLVM (I-1A)
-- **Region pool allocation** → 10-100x faster allocation (I-1B)
-- **Effect-based call optimization** → 10-20% fewer spills (I-2A)
-- **Capability-based stripping** → 50-90% smaller binaries (I-3A)
-- **@deterministic memoization** → free caching (I-4A)
-- **@gas unrolling** → full unrolling where LLVM can't (I-4C)
-- **Comptime evaluation** → zero runtime for constant calls (I-5A)
-- **Linear type stack promotion** → zero heap for linear values (I-6A)
-- **Borrow checker alias analysis** → definitive non-aliasing (I-7A)
-
-### Step 3: Maintain compilation speed (S-1)
-Fides compiles 2-3x faster than GCC today. Target: 10x faster than LLVM. This is the user-visible advantage that makes developers switch.
-
-### The result:
-
-| Code Type | LLVM -O2 | Fides --opt --lto | Why Fides Wins |
-|-----------|----------|--------------------|----------------|
-| **General code** | Baseline | Within 5% | F-1 through F-4 closes the gap |
-| **Region-isolated code** | Baseline | 2x+ faster | I-1: region alias analysis eliminates loads LLVM can't |
-| **Pure/math code** | Baseline | 1.2x+ faster | I-2: effect-based call optimization, fewer spills |
-| **Capability-restricted code** | Baseline | 50-90% smaller | I-3: capability stripping eliminates entire subsystems |
-| **@deterministic code** | Baseline | Free memoization | I-4A: compile-time caching LLVM can't do |
-| **@gas-limited code** | Baseline | Fully unrolled | I-4C: gas proves termination, LLVM can't |
-| **Comptime-evaluable code** | Baseline | Zero runtime | I-5: entire functions evaluated at compile time |
-| **Linear-typed code** | Baseline | Zero heap | I-6: linear values stack-allocated |
-| **Borrow-checked code** | Baseline | 15%+ fewer loads | I-7: definitive alias info from borrow checker |
-| **Compilation speed** | 10-30s for 10K LOC | <1s for 10K LOC | S-1: 10x+ faster compilation |
-
-**The bottom line:** For code that uses Fides's semantic features (regions, effects, capabilities, safety annotations, linear types, comptime), Fides doesn't just match LLVM — it produces fundamentally different code that is faster, smaller, and safer. LLVM is optimizing C/C++ code that allows anything. Fides is optimizing code that proves everything.
-
----
-
-## What We're Not Doing (And Why)
-
-| Feature | Why Not |
-|---------|---------|
-| **Exception handling tables** | Fides has `@crashfree`, no exceptions. No unwind tables. |
-| **C++ template instantiation** | Fides has comptime + traits. No template metaprogramming. |
-| **ASan** | Regions prevent use-after-free at compile time. Bounds checking prevents overflow. Linear types prevent double-free. ASan catches at runtime what Fides prevents at compile time. |
-| **UBSan (overflow)** | Checked arithmetic by default (F64). `@wrapping` is the escape hatch. Overflow = panic, not UB. |
-| **Linker plugins** | Integrated linker. LTO in-process. No plugin API. |
-| **Stack canaries** | Bounds checking + regions prevent stack buffer overflow. No canaries. |
-| **CFI (control flow integrity)** | Capabilities restrict callable functions. `--caps` strips ungranted functions. CFI at compile time. |
-| **Graph-coloring regalloc (for now)** | Linear scan + rematerialization + live-range splitting gets us 95% of the quality at 20% of the complexity. Graph coloring is a stretch goal (F-1D), not a requirement. |
-| **50 LLVM passes** | 80% of LLVM -O2's improvement comes from ~8 passes. We're adding those 8 (F-3), not all 50. The other 42 are micro-optimizations or C/C++-specific workarounds. |
-| **40 architecture backends** | 3 backends (x86-64, ARM64, RISC-V) cover 99% of real targets. WASM + SPIR-V cover web and GPU. No need for MIPS, PPC, SystemZ, etc. |
-
----
-
-## Part 5: Why Fides Can Beat LLVM (The Full Analysis)
-
-> LLVM was built by thousands of humans over 20 years for *all*
-> languages. Fides's optimizer is built for *one* language with rich
-> semantic information. The general-purpose tool must be conservative.
-> The purpose-built tool can be aggressive. This is not a hope — it's
-> structural.
-
-### The Core Insight: LLVM Is Generic, Fides Is Specific
-
-LLVM serves dozens of languages — Rust, C++, Swift, Zig, Julia, Kotlin,
-Haskell. Every pass must work for *any* language that lowers to LLVM IR.
-This means LLVM **cannot assume anything** about the source language's
-semantics. By the time code reaches LLVM IR, all high-level information
-is gone:
-
-- **Type system** → gone. Everything is `i32`, `i64`, `ptr`.
-- **Effect system** → gone. LLVM doesn't know what side effects a
-  function has.
-- **Region information** → gone. LLVM sees `malloc`/`free`, not regions.
-- **Annotations** → gone. LLVM doesn't know if a function is
-  deterministic, crashfree, or linear.
-- **Borrow information** → gone. LLVM must assume any two pointers might
-  alias.
-
-Fides's optimizer works on **PIR**, which carries all of this
-information. This is the same insight that drove MLIR — LLVM's own
-creators built MLIR because they realized LLVM IR was too low-level to
-optimize well. Fides is already doing what MLIR advocates: optimize at
-the level where semantic information is available.
-
-### What Fides Already Does That LLVM Can't
-
-Fides already has 6 optimization passes that use information LLVM
-fundamentally cannot have:
-
-| Pass | What it uses | Why LLVM can't |
-|------|-------------|----------------|
-| `pass_memoize` | `@deterministic` | LLVM doesn't know if a function is deterministic — it must assume any call might have side effects |
-| `pass_effect_optimize` | `@crashfree` | LLVM can't hoist calls out of error handling because it doesn't know if a function can throw |
-| `pass_alias_analysis` | `@linear` + `borrow_kinds` | LLVM's alias analysis is conservative because it must handle arbitrary pointer aliasing. Fides knows linear values can't alias. |
-| `pass_region_pool` | Region membership | LLVM must prove two memory accesses don't overlap. Fides knows two different regions can't overlap. |
-| `pass_effect_reorder` | Effect types | LLVM must assume any function call can have any side effect. Fides knows exactly what effects each function has. |
-| `pass_unroll` | `@gas` budget | LLVM unrolls based on heuristics. Fides unrolls based on actual gas budget. |
-
-**Each of these passes is doing something LLVM structurally cannot do.**
-Not because LLVM's developers aren't smart enough — because the
-information is lost in the lowering.
-
-### Why Safety Features Reduce Optimizer Complexity
-
-LLVM must handle:
-- **Pointer aliasing** (any two pointers might overlap) → complex alias
-  analysis, conservative results
-- **Undefined behavior** (signed overflow, null deref, use-after-free) →
-  must prove safety before optimizing
-- **Type punning** (`reinterpret_cast`, unions) → must handle type
-  confusion
-- **Exception handling** (every call might throw) → conservative code
-  motion
-- **Volatile accesses** → can't reorder around them
-- **Multiple calling conventions, ABIs, language runtimes** → generic
-  handling
-
-Fides doesn't need to handle:
-- **Pointer aliasing** → regions + `@linear` give non-aliasing for free
-- **Undefined behavior** → bounds checking, no raw pointers (except
-  `unsafe`)
-- **Type punning** → type system prevents it
-- **Exception handling** → effect system tells you exactly what can
-  diverge
-- **Volatile** → capability system controls memory access
-- **Multiple language runtimes** → one language, one runtime
-
-This means Fides's optimizer can be **simpler and more aggressive** at
-the same time. Simpler because fewer edge cases. More aggressive because
-the safety guarantees let you optimize things LLVM must leave alone.
-
-### Domain-Specific Optimizations (LLVM Can't Do These At All)
-
-These are optimizations that use Fides's annotations to produce code
-LLVM has no concept of:
-
-#### `@realtime` → WCET Optimization
-
-**What it does**: Minimize worst-case execution time, not average-case.
-LLVM optimizes for average case. For real-time systems, worst-case is
-what matters.
-
-**How**: The WCET optimizer analyzes the IR to find the longest execution
-path and optimizes that path specifically — even if it makes the average
-case slightly slower. It bounds loop iterations from `@gas` and eliminates
-dynamic dispatch (which has unpredictable branch targets).
-
-**Why LLVM can't**: LLVM has no `@realtime` annotation. It doesn't know
-which functions need WCET guarantees. It optimizes for throughput, not
-latency bounds.
-
-#### `@constant_time` → Constant-Time Optimization
-
-**What it does**: Don't optimize for speed — optimize for constant
-execution time regardless of input. Every path through the function
-takes the same number of cycles.
-
-**How**: The optimizer ensures all branches take equal time, all memory
-accesses are uniform (no data-dependent array indices), and all loops
-run a fixed number of iterations. If a branch is data-dependent, it's
-replaced with branchless code (cmov, bitwise selects).
-
-**Why LLVM can't**: LLVM has no `@constant_time` annotation. It actively
-*removes* dead branches and *optimizes* hot paths — the opposite of what
-constant-time requires.
-
-#### `@quantized` → Quantization Fusion
-
-**What it does**: Fuse quantize + matmul into a single operation. Instead
-of `dequantize(x) → matmul(dequant_x, w) → quantize(result)`, generate a
-single `qmatmul(x, w)` that operates on INT8 directly.
-
-**How**: The optimizer recognizes the pattern `dequantize → matmul →
-quantize` and replaces it with a fused `qmatmul` call. This eliminates
-3 passes over the data (dequant, matmul, requant) and replaces them with
-1 pass.
-
-**Why LLVM can't**: LLVM sees separate function calls. It doesn't know
-that `dequantize` and `quantize` are inverses, or that `matmul` can
-operate on quantized data directly.
-
-#### `@shard` → Distributed Optimization
-
-**What it does**: Insert communication (all-reduce, broadcast) at optimal
-points in the computation graph. Minimize communication by fusing
-element-wise ops with all-reduce.
-
-**How**: The optimizer analyzes the sharded computation graph and finds
-the minimum communication schedule. It fuses `shard_matmul → all_reduce
-→ elementwise` into `shard_matmul_fused` that overlaps computation with
-communication.
-
-**Why LLVM can't**: LLVM has no concept of distributed execution. It
-optimizes single-threaded code. Multi-GPU communication is invisible to
-it.
-
-#### `@deterministic` → Cross-Function Memoization
-
-**What it does**: Cache function results across calls. If
-`deterministic_fn(x)` is called twice with the same `x`, the second call
-returns the cached result.
-
-**How**: The optimizer identifies `@deterministic` functions and inserts
-memoization caches. The cache key is the function arguments; the value
-is the return. Cache hits skip the entire function body.
-
-**Why LLVM can't**: LLVM doesn't know if a function is deterministic. It
-must assume any function call might have side effects, so it can't safely
-cache results.
-
-### Memory Optimization: Where Fides Is Structurally Better
-
-LLVM's alias analysis is one of the hardest problems in compiler design.
-It must prove two pointers don't alias. Fides knows:
-
-| Information | Source | What it enables |
-|------------|--------|----------------|
-| Two values in different regions can't alias | Region system | Store-load forwarding across region boundaries |
-| Two linear values can't alias | `@linear` annotation | Aggressive store-load forwarding |
-| A shared borrow and a mutable borrow can't alias | Borrow checker | Code motion through borrows |
-| A `!Pure` call doesn't modify any memory | Effect system | Load elimination across pure calls |
-| A `!Alloc` call doesn't trigger GC | Effect system | No GC safepoints needed |
-
-Each of these is a **proof** that LLVM must derive (and often can't).
-Fides gets them for free from the type system. This means Fides can do
-store-load forwarding, code motion, and memory optimization that LLVM
-must conservatively skip.
-
-### Code Motion: Effect-Aware vs Effect-Blind
-
-LLVM must assume any function call might have side effects. A call to
-`foo()` might modify global state, write to a file, or allocate memory.
-LLVM can't move `foo()` past `bar()` because it doesn't know if they
-interact.
-
-Fides knows exactly what effects each function has:
-- `foo` has effect `{Alloc}` — it only allocates memory
-- `bar` has effect `{IO}` — it only does I/O
-
-These don't interact. Fides can reorder `foo()` and `bar()` freely.
-LLVM can't.
-
-### The Strategy: Fides Optimizer + Optional LLVM Backend
-
-```
-Fides source code
-       ↓
-   Parser + Typechecker (annotations, effects, regions, capabilities)
-       ↓
-   PIR (L1/L2/L3) — all semantic information preserved
-       ↓
-   Fides optimizer (23+ passes, annotation-aware, effect-aware, region-aware)
-       ↓                                           ↓
-   C codegen (default)                    Optional LLVM backend (--llvm flag)
-   → system compiler                      → llc + system linker
-   → tight, predictable                   → max vectorization, max regalloc
-   → embedded/real-time/safety            → ML/compute-heavy workloads
-```
-
-**The Fides optimizer feeds already-optimized code to LLVM.** LLVM only
-does the final target-specific passes (vectorization, register
-allocation, instruction scheduling). This is the best of both worlds:
-Fides's high-level optimizations + LLVM's low-level optimizations.
-
-### Where Fides Beats LLVM (Summary)
-
-| Area | Why Fides wins | Effort |
-|------|---------------|--------|
-| **Compile speed** | 23 purpose-built passes vs 50+ generic passes. No legacy. | Already 10x faster |
-| **Predictability** | Deterministic optimization. Same input → same output. | Free (by design) |
-| **WCET optimization** | `@realtime` → optimize worst-case, not average-case | ~1000 lines |
-| **Constant-time optimization** | `@constant_time` → uniform execution time | ~500 lines |
-| **Quantization fusion** | `@quantized` → fuse dequant+matmul+quant into qmatmul | ~300 lines |
-| **Distributed optimization** | `@shard` → fuse computation with communication | ~500 lines |
-| **Cross-function memoization** | `@deterministic` → cache results across calls | Already done |
-| **Region-aware alias analysis** | Region system → definitive non-aliasing | Already done |
-| **Effect-aware code motion** | Effect system → reorder non-interacting calls | Already done |
-| **Capability-based binary stripping** | `--caps` → eliminate unused subsystems | Already done |
-| **Linear type stack promotion** | `@linear` → zero heap for linear values | Already done |
-| **Gas-guided unrolling** | `@gas` → full unrolling where LLVM can't | Already done |
-
-### Where LLVM Stays Ahead (And How to Handle It)
-
-| Area | Why LLVM wins | Fides strategy |
-|------|--------------|----------------|
-| **Autovectorization** | VP, cost models, target intrinsics, 10+ years of tuning | Optional LLVM backend for compute-heavy code |
-| **Register allocation** | Graph coloring + PBQP + priority spilling | Linear scan + remat gets 95% of quality. LLVM backend for the rest. |
-| **Cross-target code quality** | 30+ architectures, each tuned for years | C codegen + system compiler covers all targets. LLVM for max quality. |
-| **Sanitizers** | ASan, UBSan, MSan, TSan | Fides prevents the bugs at compile time. Interpreter UAF detection for testing. |
-
-### The Bottom Line
-
-**LLVM was built by humans for all languages.** It must be conservative
-because it handles C/C++ — languages that allow anything (pointer
-arithmetic, use-after-free, integer overflow, arbitrary aliasing).
-
-**Fides's optimizer is built for one language with rich semantic
-information.** Every `@deterministic`, every `@linear`, every region
-boundary, every effect annotation is information that makes the
-optimizer smarter. LLVM doesn't have this information and structurally
-cannot get it.
-
-**The result**: For code that uses Fides's semantic features (regions,
-effects, capabilities, safety annotations, linear types, comptime),
-Fides produces fundamentally different code that is faster, smaller, and
-safer than what LLVM can produce. LLVM is optimizing code that allows
-anything. Fides is optimizing code that proves everything.
-
-**Can a custom compiler beat LLVM?** For Fides code specifically — yes,
-it already does in 6 passes. The path to beating LLVM in more areas is
-clear: each annotation is a new optimization opportunity. The only area
-where LLVM stays ahead is target-specific code generation (vectorization,
-register allocation), and that's what the optional LLVM backend handles.
-
-**The smart move**: Be better where you can (semantic optimizations,
-compile speed, predictability, domain-specific optimization). Interoperate
-where you can't (target-specific code generation via optional LLVM
-backend). Don't try to beat LLVM at everything — beat it where Fides's
-semantic information gives a structural advantage.
-
-**Principle:** Every feature we add must either (a) match LLVM on fundamentals, or (b) exploit Fides's unique semantic information. We don't add features just because LLVM has them. We add features because they make Fides code faster, smaller, or safer.
+## Order of work
+
+1. **Measure and protect first:** SP2, RL8 (encoder oracles), RA15 (allocation
+   checker on the existing `nat_ir` allocator), ME4 (IR verifier), RL3. These
+   make every later change safe.
+2. **The machine layer:** MI1–MI11, then the ports in order MI12 (AArch64),
+   MI13 (RISC-V), MI14 (x64), each gated on unchanged suite results. RA1–RA8 come
+   with it: one allocator for all three.
+3. **SSA:** ME1–ME5, then ME3 (mem2reg), which multiplies what every later pass
+   can do.
+4. **The rules mid-end:** ME6–ME19.
+5. **Whole program and language facts:** WP2–WP9, LF1–LF9, LF13.
+6. **Speed:** SP5–SP8 once the machine layer is in place.
+
+The x64 port (MI14) needs the agreement of whoever owns `pe_ir.fd` at the time:
+it replaces that file's lowering.
+
+## What we do not do
+
+- An LLVM IR or C++ API compatibility layer: the C path is our LLVM.
+- Exception tables and unwinding for exceptions: Fides has none (DB6 is for
+  debuggers and profilers only).
+- A JIT tier: `fid run` interprets, and compile speed (SP) makes builds fast
+  instead.
+- A second front end language for rules: the rules are Fides data.

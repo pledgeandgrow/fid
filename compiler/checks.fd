@@ -631,6 +631,10 @@ pub struct PeirRanges {
     pub ref_lo: i64,
     pub ref_hi: i64,
     pub ref_live: bool,
+    // Vec locals that only ever hold a Vec_filled_typed result (or null)
+    // and are never shortened: 1; their least length (-1: unknown)
+    pub vstable: Vec<i64>,
+    pub vlen: Vec<i64>,
 }
 
 fn peir_rng_get_lo(r: &PeirRanges, v: i64) -> i64 {
@@ -669,6 +673,20 @@ fn peir_range_scan(f: &IrFunction, r: &mut PeirRanges, single_pred: &Vec<i64>, i
     var tr: Vec<i64> = Vec::new();
     var t1: Vec<i64> = Vec::new();
     var t2: Vec<i64> = Vec::new();
+    // The refinement in force at the end of each block scanned so far: a
+    // block whose only way in is a jump from one of them keeps it
+    var nb: i64 = f.blocks.len();
+    var x_v: Vec<i64> = Vec::new();
+    var x_loc: Vec<i64> = Vec::new();
+    var x_lo: Vec<i64> = Vec::new();
+    var x_hi: Vec<i64> = Vec::new();
+    var x_live: Vec<i64> = Vec::new();
+    var x_done: Vec<i64> = peir_zeros(nb);
+    var xb: i64 = 0;
+    while xb < nb {
+        x_v.push(-1); x_loc.push(-1); x_lo.push(0); x_hi.push(0); x_live.push(0);
+        xb = xb + 1;
+    }
     var b: i64 = 0;
     while b < f.blocks.len() {
         // The branch into this block, when it is the only way in
@@ -680,6 +698,16 @@ fn peir_range_scan(f: &IrFunction, r: &mut PeirRanges, single_pred: &Vec<i64>, i
             var pids: Vec<i64> = f.blocks.get(pb).instructions;
             if pids.len() > 0 {
                 match peir_inst_of(f, pids.get(pids.len() - 1)) {
+                    Inst::Jump(_) => {
+                        // entered only from `pb`, whose facts hold here too
+                        if x_done.get(pb) == 1 {
+                            r.ref_v = x_v.get(pb);
+                            r.ref_loc = x_loc.get(pb);
+                            r.ref_lo = x_lo.get(pb);
+                            r.ref_hi = x_hi.get(pb);
+                            r.ref_live = x_live.get(pb) == 1;
+                        }
+                    }
                     Inst::Branch(cond, tb, eb) => {
                         var taken: i64 = -1;
                         if tb >= 0 && tb < index.len() && index.get(tb) == b { taken = 1; }
@@ -734,11 +762,22 @@ fn peir_range_scan(f: &IrFunction, r: &mut PeirRanges, single_pred: &Vec<i64>, i
                         // the branch's fact about a local ends at a store to it
                         if r.ref_live && r.ref_loc == p { r.ref_live = false; }
                     }
-                    Inst::Call(name, _, _, _) => {
+                    Inst::Call(name, cargs, _, _) => {
                         // A length: no more elements than bytes of memory
                         if name == "Vec_len" || name == "p_vec_len" || name == "str_len" || name == "String_len"
                             || name == "p_str_length" || name == "p_str_len" {
                             peir_rng_put(r, id, 0, 281474976710656);
+                        }
+                        // An index below the least length of a filled Vec
+                        // that never shrinks: in bounds
+                        if final && (name == "Vec_get" || name == "Vec_set") && cargs.len() >= 3 {
+                            var vs: i64 = peir_filled_slot(f, r, cargs.get(1));
+                            if vs >= 0 {
+                                var ix: i64 = cargs.get(2);
+                                if peir_rng_get_lo(r, ix) >= 0 && peir_rng_get_hi(r, ix) < r.vlen.get(vs) {
+                                    out.set(id, out.get(id) | 1);
+                                }
+                            }
                         }
                     }
                     Inst::BinOp(op, l, rr, ty) => {
@@ -848,6 +887,12 @@ fn peir_range_scan(f: &IrFunction, r: &mut PeirRanges, single_pred: &Vec<i64>, i
             }
             k = k + 1;
         }
+        x_v.set(b, r.ref_v);
+        x_loc.set(b, r.ref_loc);
+        x_lo.set(b, r.ref_lo);
+        x_hi.set(b, r.ref_hi);
+        if r.ref_live { x_live.set(b, 1); } else { x_live.set(b, 0); }
+        x_done.set(b, 1);
         b = b + 1;
     }
     r.ref_v = -1;
@@ -931,7 +976,11 @@ pub fn peir_range_ops(f: &IrFunction, nvals: i64, out: &mut Vec<i64>) {
     var r: PeirRanges = PeirRanges {
         lo: Vec::new(), hi: Vec::new(), loc_lo: Vec::new(), loc_hi: Vec::new(), plain: peir_zeros(nvals),
         ref_v: -1, ref_loc: -1, ref_lo: 0, ref_hi: 0, ref_live: false,
+        vstable: peir_zeros(nvals), vlen: Vec::new(),
     };
+    var vi: i64 = 0;
+    while vi < nvals { r.vlen.push(-1); vi = vi + 1; }
+    peir_filled_vecs(f, nvals, &mut r);
     var i: i64 = 0;
     while i < nvals {
         r.lo.push(PEIR_I64_MIN);
@@ -1099,6 +1148,7 @@ pub fn peir_range_ops(f: &IrFunction, nvals: i64, out: &mut Vec<i64>) {
             }
             s = s + 1;
         }
+        peir_filled_lengths(f, nvals, &mut r);
         i = 0;
         while i < nvals {
             if r.plain.get(i) == 1 {
@@ -1116,4 +1166,164 @@ pub fn peir_range_ops(f: &IrFunction, nvals: i64, out: &mut Vec<i64>) {
         i = i + 1;
     }
     peir_range_scan(f, &mut r, &single, &index, out, true);
+}
+
+// ---------------------------------------------------------------------------
+// Filled Vecs (competitive OP: bounds from Vec::filled)
+//
+// A Vec local whose every store is a Vec_filled_typed(n, ...) result (or a
+// zero: the slot's prologue, a move out) and whose loaded value only feeds
+// get, set, push, len, share or drop never has fewer elements than the least
+// `n` it was filled with: get/set at an index known to be in [0, that n)
+// need no bounds check.
+// ---------------------------------------------------------------------------
+
+/// Is `name` a call that keeps a Vec (its argument 1) at least as long?
+fn peir_vec_keeps_len(name: str) -> bool {
+    return name == "Vec_get" || name == "Vec_set" || name == "Vec_push" || name == "Vec_len"
+        || name == "Vec_drop" || name == "Vec_share" || name == "Vec_capacity" || name == "Vec_is_empty";
+}
+
+/// Is `v` the result of Vec_filled_typed?
+fn peir_is_filled_call(f: &IrFunction, v: i64) -> bool {
+    match peir_inst_of(f, v) {
+        Inst::Call(name, _, _, _) => { return name == "Vec_filled_typed"; }
+        _ => {}
+    }
+    return false;
+}
+
+/// Is `v` a zero constant?
+fn peir_is_zero_const(f: &IrFunction, v: i64) -> bool {
+    match peir_inst_of(f, v) {
+        Inst::ConstInt(c, _) => { return c == 0; }
+        Inst::ConstNull(_) => { return true; }
+        _ => {}
+    }
+    return false;
+}
+
+/// Mark the stable filled Vec locals (r.vstable).
+fn peir_filled_vecs(f: &IrFunction, nvals: i64, r: &mut PeirRanges) {
+    // candidates: allocas with at least one filled store
+    var cand: Vec<i64> = peir_zeros(nvals);
+    var load_of: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < nvals { load_of.push(-1); i = i + 1; }
+    i = 0;
+    while i < f.insts.len() {
+        var ve: ValueIdInst = f.insts.get(i);
+        match ve.inst {
+            Inst::Store(p, sv, _) => {
+                if p >= 0 && p < nvals && peir_is_filled_call(f, sv) {
+                    match peir_inst_of(f, p) {
+                        Inst::Alloca(_, _) => { cand.set(p, 1); }
+                        _ => {}
+                    }
+                }
+            }
+            Inst::Load(p2, _) => {
+                if ve.id >= 0 && ve.id < nvals && p2 >= 0 && p2 < nvals { load_of.set(ve.id, p2); }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    // every use of a candidate, or of a value loaded from it, must keep it
+    // at least as long
+    var ops: Vec<i64> = Vec::new();
+    i = 0;
+    while i < f.insts.len() {
+        var inst: Inst = f.insts.get(i).inst;
+        ops.clear();
+        peir_inst_operands(inst, &mut ops);
+        var o: i64 = 0;
+        while o < ops.len() {
+            var v: i64 = ops.get(o);
+            if v >= 0 && v < nvals {
+                // the slot itself: loads, and stores of a filled Vec or zero
+                if cand.get(v) == 1 {
+                    var ok: bool = false;
+                    match inst {
+                        Inst::Load(lp, _) => { ok = lp == v; }
+                        Inst::Store(sp, sv2, _) => {
+                            ok = sp == v && sv2 != v && (peir_is_filled_call(f, sv2) || peir_is_zero_const(f, sv2));
+                        }
+                        _ => {}
+                    }
+                    if !ok { cand.set(v, 0); }
+                }
+                // a value loaded from it: argument 1 of a call that keeps it
+                var ls: i64 = load_of.get(v);
+                if ls >= 0 && cand.get(ls) == 1 {
+                    var ok2: bool = false;
+                    match inst {
+                        Inst::Call(cn, cargs, _, _) => {
+                            if peir_vec_keeps_len(cn) && cargs.len() >= 2 && cargs.get(1) == v {
+                                ok2 = true;
+                                var a: i64 = 0;
+                                while a < cargs.len() {
+                                    if a != 1 && cargs.get(a) == v { ok2 = false; }
+                                    a = a + 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    if !ok2 { cand.set(ls, 0); }
+                }
+            }
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < nvals {
+        r.vstable.set(i, cand.get(i));
+        i = i + 1;
+    }
+}
+
+/// The least length of each stable filled Vec: the least lower bound of `n`
+/// over its filled stores, from this round's ranges (-1: none known).
+fn peir_filled_lengths(f: &IrFunction, nvals: i64, r: &mut PeirRanges) {
+    var least: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < nvals { least.push(PEIR_I64_MAX); i = i + 1; }
+    i = 0;
+    while i < f.insts.len() {
+        match f.insts.get(i).inst {
+            Inst::Store(p, sv, _) => {
+                if p >= 0 && p < nvals && r.vstable.get(p) == 1 && peir_is_filled_call(f, sv) {
+                    var nlo: i64 = -1;
+                    match peir_inst_of(f, sv) {
+                        Inst::Call(_, fargs, _, _) => {
+                            if fargs.len() >= 2 { nlo = peir_rng_get_lo(r, fargs.get(1)); }
+                        }
+                        _ => {}
+                    }
+                    if nlo < 0 { nlo = -1; }
+                    if nlo < least.get(p) { least.set(p, nlo); }
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < nvals {
+        if r.vstable.get(i) == 1 && least.get(i) != PEIR_I64_MAX { r.vlen.set(i, least.get(i)); } else { r.vlen.set(i, -1); }
+        i = i + 1;
+    }
+}
+
+/// The stable filled Vec local that `v` is loaded from, or -1.
+fn peir_filled_slot(f: &IrFunction, r: &PeirRanges, v: i64) -> i64 {
+    match peir_inst_of(f, v) {
+        Inst::Load(p, _) => {
+            if p >= 0 && p < r.vstable.len() && r.vstable.get(p) == 1 && r.vlen.get(p) > 0 { return p; }
+        }
+        _ => {}
+    }
+    return -1;
 }

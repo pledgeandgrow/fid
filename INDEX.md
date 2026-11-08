@@ -74,7 +74,7 @@ and `AGENTS.md` first when working on the compiler.
 |------|-------------|
 | [roadmap/roadmap.md](roadmap/roadmap.md) | Master roadmap — milestones, features, release/self-host, limitations, issues, opportunities (consolidated 2026-10-24). |
 | [roadmap/release-roadmap.md](roadmap/release-roadmap.md) | Road to public beta and stable 1.0 — every known gap, by track, with acceptance criteria. |
-| [roadmap/llvm-roadmap.md](roadmap/llvm-roadmap.md) | LLVM parity & superset roadmap — compete, don't copy. |
+| [roadmap/llvm-roadmap.md](roadmap/llvm-roadmap.md) | Own-backend roadmap: one machine layer, SSA and a rules mid-end, whole-program and language-fact optimizations, compile speed, reliability (200 goals). |
 | [roadmap/safety-critical.md](roadmap/safety-critical.md) | Safety-critical roadmap (IEC 62304 / DO-178C class work). |
 | [roadmap/security-roadmap.md](roadmap/security-roadmap.md) | Security hardening guide and exploit-class coverage. |
 | [roadmap/bug-audit-2026-10-22.md](roadmap/bug-audit-2026-10-22.md) | Dated bug-audit snapshot. |

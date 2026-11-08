@@ -1,0 +1,94 @@
+// Interleaving workload (roadmap VF18; scripts/verify/interleave.py).
+// Threads that race on purpose through the synchronisation the stdlib
+// gives: an atomic counter, a counter under a mutex, a channel pipeline,
+// and parallel branches. Whatever order the threads run in, the printed
+// totals are the same; interleave.py runs it thousands of times under
+// different CPU sets and loads and reports any run that prints otherwise.
+
+use sync;
+
+fn bump_atomic(addr: i64, n: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        sync_atomic_add(addr, 1);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn bump_locked(m: i64, cell: i64, n: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        sync_mutex_lock(m);
+        val v: i64 = sync_atomic_load(cell);
+        sync_atomic_store(cell, v + 1);
+        sync_mutex_unlock(m);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn producer(ch: i64, start: i64, n: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        sync_channel_send(ch, start + i);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn work(k: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < 20000 { s = (s + i * k) % 1000003; i = i + 1; }
+    return s;
+}
+
+fn main() -> i64 {
+    // four threads add 5000 each to one atomic
+    val a: i64 = sync_atomic_alloc(0);
+    val t1 = spawn bump_atomic(a, 5000);
+    val t2 = spawn bump_atomic(a, 5000);
+    val t3 = spawn bump_atomic(a, 5000);
+    val t4 = spawn bump_atomic(a, 5000);
+    await t1;
+    await t2;
+    await t3;
+    await t4;
+    println(sync_atomic_load(a));
+
+    // a read-modify-write under a mutex
+    val m: i64 = sync_mutex_create();
+    val cell: i64 = sync_atomic_alloc(0);
+    val u1 = spawn bump_locked(m, cell, 3000);
+    val u2 = spawn bump_locked(m, cell, 3000);
+    val u3 = spawn bump_locked(m, cell, 3000);
+    await u1;
+    await u2;
+    await u3;
+    println(sync_atomic_load(cell));
+
+    // two producers, one consumer: the sum does not depend on the order
+    val ch: i64 = sync_channel_create(16);
+    val p1 = spawn producer(ch, 0, 1000);
+    val p2 = spawn producer(ch, 100000, 1000);
+    var sum: i64 = 0;
+    var got: i64 = 0;
+    while got < 2000 {
+        sum = sum + sync_channel_recv(ch);
+        got = got + 1;
+    }
+    await p1;
+    await p2;
+    println(sum);
+
+    // parallel branches joined before the statement ends
+    var x: i64 = 0;
+    var y: i64 = 0;
+    parallel {
+        | x = work(3);
+        | y = work(7);
+    }
+    println(x + y);
+    return 0;
+}

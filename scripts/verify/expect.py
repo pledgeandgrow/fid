@@ -30,7 +30,17 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
+
+
+RETRY_LOCK = threading.Lock()
+
+
+def error_line(text):
+    lines = [l.strip() for l in text.split("\n") if l.strip() and not l.startswith(("[", "  -->", "   |"))]
+    pick = next((l for l in lines if "rror" in l), lines[-1] if lines else "")
+    return pick[:160]
 
 
 def spec_of(path):
@@ -75,6 +85,11 @@ def on_backend(fid, b, path, work):
     exe = os.path.join(work, os.path.basename(path)[:-3] + f".{b}.exe")
     rc, out, err = run([fid, b, path, "-o", exe])
     if rc != 0 or not os.path.exists(exe):
+        # once more on its own: under load the C compiler's shared cache
+        # fails now and then (zig: "file_open Unexpected")
+        with RETRY_LOCK:
+            rc, out, err = run([fid, b, path, "-o", exe])
+    if rc != 0 or not os.path.exists(exe):
         return "compile-error", "", out + err
     res = run([exe], 120)
     for e in (exe, exe[:-4] + ".pdb"):
@@ -95,16 +110,14 @@ def check_file(fid, path, backends, work):
         if rc == 0:
             problems.append("accepted, but must be rejected")
         elif want["error"] not in msg:
-            first = next((l for l in msg.split("\n") if "rror" in l), msg[:200])
-            problems.append(f"rejected with another message: {first.strip()[:160]}")
+            problems.append(f"rejected with another message: {error_line(msg)}")
         return path, problems, {}
     bs = [b for b in backends if not want["backends"] or b in want["backends"]]
     results = {b: on_backend(fid, b, path, work) for b in bs}
     for b, (rc, out, err) in results.items():
         if rc == "compile-error" or (b == "run" and isinstance(rc, int) and rc != 0 and "rror" in err and not out):
             if not path.endswith("_fail.fd"):
-                first = next((l for l in err.split("\n") if "rror" in l), err[:200])
-                problems.append(f"{b}: does not compile: {first.strip()[:160]}")
+                problems.append(f"{b}: does not compile: {error_line(err)}")
             continue
         if want["out"] is not None:
             want_rc = 1 if want["panic"] else (want["exit"] if want["exit"] is not None else 0)

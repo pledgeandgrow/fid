@@ -1,0 +1,293 @@
+// Fides Time Zone standard library (competitive SL8)
+//
+// Named time zones with their daylight-saving rules, over time.fd's
+// LogicalTime (Unix seconds, UTC). A zone is a standard offset from UTC and
+// an optional DST rule: when daylight time starts and ends each year (the
+// month, which weekday of it, the time of day, and whether that time is
+// UTC or the local clock), and how far the clock moves. The table holds
+// the current rules (2026) of the common IANA zones; a time zone database
+// with every historical change is not included, so dates before a zone's
+// present rules (US before 2007, EU before 1996) use today's rules.
+//
+// Usage:
+//   use tz;
+//   val ny = tz_find("America/New_York");
+//   val t = time_new(2026, 7, 4, 16, 0, 0);          // 16:00 UTC
+//   println(tz_format(t, ny, "%Y-%m-%d %H:%M %Z"));  // 2026-07-04 12:00 EDT
+//   println(tz_offset_str(tz_offset(ny, t)));        // -04:00
+//
+// Local times that do not exist (the hour skipped in spring) resolve to
+// the moment after the gap; ones that happen twice (the hour repeated in
+// autumn) to the first of the two, as most libraries do.
+
+module tz;
+
+use time;
+use datetime;
+use vec;
+use string;
+
+/// When a change happens: in `month`, the `week`-th `weekday` (0 Sunday
+/// .. 6 Saturday; week 5 = the last one), at `secs` seconds after midnight
+/// of the local clock (utc = false) or of UTC (utc = true).
+pub struct TzWhen {
+    pub month: i64,
+    pub week: i64,
+    pub weekday: i64,
+    pub secs: i64,
+    pub utc: bool,
+}
+
+/// A time zone: its name, standard offset (seconds east of UTC), and DST:
+/// whether it has one, how far it moves the clock, when it starts and ends.
+pub struct Tz {
+    pub name: str,
+    pub std_off: i64,
+    pub std_abbr: str,
+    pub has_dst: bool,
+    pub dst_save: i64,
+    pub dst_abbr: str,
+    pub start: TzWhen,
+    pub end: TzWhen,
+}
+
+fn tz_when(month: i64, week: i64, weekday: i64, secs: i64, utc: bool) -> TzWhen {
+    return TzWhen { month: month, week: week, weekday: weekday, secs: secs, utc: utc };
+}
+
+fn tz_fixed(name: str, off: i64, abbr: str) -> Tz {
+    return Tz { name: name, std_off: off, std_abbr: abbr, has_dst: false, dst_save: 0, dst_abbr: abbr,
+        start: tz_when(1, 1, 0, 0, false), end: tz_when(1, 1, 0, 0, false) };
+}
+
+// US since 2007: second Sunday of March 02:00 to first Sunday of November 02:00
+fn tz_us(name: str, off: i64, sa: str, da: str) -> Tz {
+    return Tz { name: name, std_off: off, std_abbr: sa, has_dst: true, dst_save: 3600, dst_abbr: da,
+        start: tz_when(3, 2, 0, 7200, false), end: tz_when(11, 1, 0, 7200, false) };
+}
+
+// EU since 1996: last Sunday of March to last Sunday of October, 01:00 UTC
+fn tz_eu(name: str, off: i64, sa: str, da: str) -> Tz {
+    return Tz { name: name, std_off: off, std_abbr: sa, has_dst: true, dst_save: 3600, dst_abbr: da,
+        start: tz_when(3, 5, 0, 3600, true), end: tz_when(10, 5, 0, 3600, true) };
+}
+
+const TZ_HOUR: i64 = 3600;
+
+/// The zones this module knows, by IANA name. Unknown names give UTC.
+pub fn tz_names() -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var all: Vec<Tz> = tz_table();
+    var i: i64 = 0;
+    while i < all.len() {
+        out.push(all.get(i).name);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn tz_table() -> Vec<Tz> {
+    var z: Vec<Tz> = Vec::new();
+    z.push(tz_fixed("UTC", 0, "UTC"));
+    z.push(tz_us("America/New_York", -5 * TZ_HOUR, "EST", "EDT"));
+    z.push(tz_us("America/Toronto", -5 * TZ_HOUR, "EST", "EDT"));
+    z.push(tz_us("America/Chicago", -6 * TZ_HOUR, "CST", "CDT"));
+    z.push(tz_us("America/Denver", -7 * TZ_HOUR, "MST", "MDT"));
+    z.push(tz_fixed("America/Phoenix", -7 * TZ_HOUR, "MST"));
+    z.push(tz_us("America/Los_Angeles", -8 * TZ_HOUR, "PST", "PDT"));
+    z.push(tz_us("America/Vancouver", -8 * TZ_HOUR, "PST", "PDT"));
+    z.push(tz_us("America/Anchorage", -9 * TZ_HOUR, "AKST", "AKDT"));
+    z.push(tz_fixed("Pacific/Honolulu", -10 * TZ_HOUR, "HST"));
+    z.push(tz_fixed("America/Mexico_City", -6 * TZ_HOUR, "CST"));
+    z.push(tz_fixed("America/Bogota", -5 * TZ_HOUR, "-05"));
+    z.push(tz_fixed("America/Sao_Paulo", -3 * TZ_HOUR, "-03"));
+    z.push(tz_fixed("America/Argentina/Buenos_Aires", -3 * TZ_HOUR, "-03"));
+    // Chile: first Sunday of September 04:00 UTC to first Sunday of April 03:00 UTC
+    z.push(Tz { name: "America/Santiago", std_off: -4 * TZ_HOUR, std_abbr: "-04", has_dst: true, dst_save: 3600, dst_abbr: "-03",
+        start: tz_when(9, 1, 0, 4 * TZ_HOUR, true), end: tz_when(4, 1, 0, 3 * TZ_HOUR, true) });
+    z.push(tz_eu("Europe/London", 0, "GMT", "BST"));
+    z.push(tz_eu("Europe/Dublin", 0, "GMT", "IST"));
+    z.push(tz_eu("Europe/Lisbon", 0, "WET", "WEST"));
+    z.push(tz_eu("Europe/Paris", TZ_HOUR, "CET", "CEST"));
+    z.push(tz_eu("Europe/Berlin", TZ_HOUR, "CET", "CEST"));
+    z.push(tz_eu("Europe/Madrid", TZ_HOUR, "CET", "CEST"));
+    z.push(tz_eu("Europe/Rome", TZ_HOUR, "CET", "CEST"));
+    z.push(tz_eu("Europe/Amsterdam", TZ_HOUR, "CET", "CEST"));
+    z.push(tz_eu("Europe/Brussels", TZ_HOUR, "CET", "CEST"));
+    z.push(tz_eu("Europe/Zurich", TZ_HOUR, "CET", "CEST"));
+    z.push(tz_eu("Europe/Stockholm", TZ_HOUR, "CET", "CEST"));
+    z.push(tz_eu("Europe/Warsaw", TZ_HOUR, "CET", "CEST"));
+    z.push(tz_eu("Europe/Athens", 2 * TZ_HOUR, "EET", "EEST"));
+    z.push(tz_eu("Europe/Helsinki", 2 * TZ_HOUR, "EET", "EEST"));
+    z.push(tz_eu("Europe/Kyiv", 2 * TZ_HOUR, "EET", "EEST"));
+    z.push(tz_fixed("Europe/Istanbul", 3 * TZ_HOUR, "+03"));
+    z.push(tz_fixed("Europe/Moscow", 3 * TZ_HOUR, "MSK"));
+    z.push(tz_fixed("Africa/Casablanca", TZ_HOUR, "+01"));
+    z.push(tz_fixed("Africa/Lagos", TZ_HOUR, "WAT"));
+    z.push(tz_fixed("Africa/Johannesburg", 2 * TZ_HOUR, "SAST"));
+    z.push(tz_fixed("Africa/Nairobi", 3 * TZ_HOUR, "EAT"));
+    z.push(tz_fixed("Asia/Dubai", 4 * TZ_HOUR, "+04"));
+    z.push(tz_fixed("Asia/Karachi", 5 * TZ_HOUR, "PKT"));
+    z.push(tz_fixed("Asia/Kolkata", 5 * TZ_HOUR + 1800, "IST"));
+    z.push(tz_fixed("Asia/Kathmandu", 5 * TZ_HOUR + 2700, "+0545"));
+    z.push(tz_fixed("Asia/Dhaka", 6 * TZ_HOUR, "+06"));
+    z.push(tz_fixed("Asia/Bangkok", 7 * TZ_HOUR, "+07"));
+    z.push(tz_fixed("Asia/Jakarta", 7 * TZ_HOUR, "WIB"));
+    z.push(tz_fixed("Asia/Shanghai", 8 * TZ_HOUR, "CST"));
+    z.push(tz_fixed("Asia/Hong_Kong", 8 * TZ_HOUR, "HKT"));
+    z.push(tz_fixed("Asia/Singapore", 8 * TZ_HOUR, "+08"));
+    z.push(tz_fixed("Asia/Taipei", 8 * TZ_HOUR, "CST"));
+    z.push(tz_fixed("Asia/Tokyo", 9 * TZ_HOUR, "JST"));
+    z.push(tz_fixed("Asia/Seoul", 9 * TZ_HOUR, "KST"));
+    z.push(tz_fixed("Australia/Perth", 8 * TZ_HOUR, "AWST"));
+    z.push(tz_fixed("Australia/Brisbane", 10 * TZ_HOUR, "AEST"));
+    // south-east Australia: first Sunday of October 02:00 to first Sunday of April 03:00 (local)
+    z.push(Tz { name: "Australia/Sydney", std_off: 10 * TZ_HOUR, std_abbr: "AEST", has_dst: true, dst_save: 3600, dst_abbr: "AEDT",
+        start: tz_when(10, 1, 0, 2 * TZ_HOUR, false), end: tz_when(4, 1, 0, 3 * TZ_HOUR, false) });
+    z.push(Tz { name: "Australia/Melbourne", std_off: 10 * TZ_HOUR, std_abbr: "AEST", has_dst: true, dst_save: 3600, dst_abbr: "AEDT",
+        start: tz_when(10, 1, 0, 2 * TZ_HOUR, false), end: tz_when(4, 1, 0, 3 * TZ_HOUR, false) });
+    z.push(Tz { name: "Australia/Adelaide", std_off: 9 * TZ_HOUR + 1800, std_abbr: "ACST", has_dst: true, dst_save: 3600, dst_abbr: "ACDT",
+        start: tz_when(10, 1, 0, 2 * TZ_HOUR, false), end: tz_when(4, 1, 0, 3 * TZ_HOUR, false) });
+    // New Zealand: last Sunday of September 02:00 to first Sunday of April 03:00 (local)
+    z.push(Tz { name: "Pacific/Auckland", std_off: 12 * TZ_HOUR, std_abbr: "NZST", has_dst: true, dst_save: 3600, dst_abbr: "NZDT",
+        start: tz_when(9, 5, 0, 2 * TZ_HOUR, false), end: tz_when(4, 1, 0, 3 * TZ_HOUR, false) });
+    return z;
+}
+
+/// The zone of that IANA name ("Europe/Paris"), "UTC", or a fixed offset
+/// written "+05:30" / "-08:00"; anything else is UTC.
+pub fn tz_find(name: str) -> Tz {
+    var all: Vec<Tz> = tz_table();
+    var i: i64 = 0;
+    while i < all.len() {
+        if all.get(i).name == name { return all.get(i); }
+        i = i + 1;
+    }
+    var n: i64 = str_len(name);
+    if n == 6 && (str_byte_at(name, 0) == 43 || str_byte_at(name, 0) == 45) && str_byte_at(name, 3) == 58 {
+        var h: i64 = str_parse_int(str_slice(name, 1, 3));
+        var m: i64 = str_parse_int(str_slice(name, 4, 6));
+        var off: i64 = h * TZ_HOUR + m * 60;
+        if str_byte_at(name, 0) == 45 { off = 0 - off; }
+        return tz_fixed(name, off, name);
+    }
+    return all.get(0);
+}
+
+/// Is `name` one of the zones this module knows?
+pub fn tz_known(name: str) -> bool {
+    var all: Vec<Tz> = tz_table();
+    var i: i64 = 0;
+    while i < all.len() {
+        if all.get(i).name == name { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Midnight UTC of the day `w` names in `year`, as Unix seconds.
+fn tz_rule_day(year: i64, w: TzWhen) -> i64 {
+    var first: LogicalTime = time_from_date(year, w.month, 1);
+    var wd: i64 = time_get_weekday(first);
+    var d: i64 = 1 + ((w.weekday - wd + 7) % 7);
+    if w.week >= 5 {
+        var dim: i64 = days_in_month(year, w.month);
+        while d + 7 <= dim { d = d + 7; }
+    } else {
+        d = d + (w.week - 1) * 7;
+    }
+    return time_from_date(year, w.month, d).seconds;
+}
+
+/// The UTC moment of a change; `before` is the offset in force just
+/// before it (the local clock the rule's time is read on).
+fn tz_rule_utc(year: i64, w: TzWhen, before: i64) -> i64 {
+    var t: i64 = tz_rule_day(year, w) + w.secs;
+    if w.utc { return t; }
+    return t - before;
+}
+
+/// Is daylight time in force at `t` (UTC seconds)?
+pub fn tz_is_dst(z: Tz, t: LogicalTime) -> bool {
+    if !z.has_dst { return false; }
+    var year: i64 = time_get_year(time_from_timestamp(t.seconds + z.std_off));
+    var start: i64 = tz_rule_utc(year, z.start, z.std_off);
+    var end: i64 = tz_rule_utc(year, z.end, z.std_off + z.dst_save);
+    if start < end {
+        // northern hemisphere: summer inside one year
+        return t.seconds >= start && t.seconds < end;
+    }
+    // southern: daylight time spans the new year
+    return t.seconds >= start || t.seconds < end;
+}
+
+/// The zone's offset from UTC at `t`, in seconds east.
+pub fn tz_offset(z: Tz, t: LogicalTime) -> i64 {
+    if tz_is_dst(z, t) { return z.std_off + z.dst_save; }
+    return z.std_off;
+}
+
+/// The abbreviation in force at `t` (EST or EDT, CET or CEST ...).
+pub fn tz_abbr(z: Tz, t: LogicalTime) -> str {
+    if tz_is_dst(z, t) { return z.dst_abbr; }
+    return z.std_abbr;
+}
+
+/// An offset as "+HH:MM" or "-HH:MM".
+pub fn tz_offset_str(off: i64) -> str {
+    var sign: str = "+";
+    var a: i64 = off;
+    if a < 0 { sign = "-"; a = 0 - a; }
+    var h: i64 = a / TZ_HOUR;
+    var m: i64 = (a % TZ_HOUR) / 60;
+    var hs: str = int_to_str(h);
+    if h < 10 { hs = "0" + hs; }
+    var ms: str = int_to_str(m);
+    if m < 10 { ms = "0" + ms; }
+    return sign + hs + ":" + ms;
+}
+
+/// The wall-clock time in zone `z` at the UTC moment `t`, as a LogicalTime
+/// whose fields (time_get_hour ...) read as that local clock.
+pub fn tz_to_local(t: LogicalTime, z: Tz) -> LogicalTime {
+    return time_from_timestamp(t.seconds + tz_offset(z, t));
+}
+
+/// The UTC moment at which zone `z`'s clock shows `local` (built with
+/// time_new). A local time skipped in spring is read after the gap; one
+/// repeated in autumn is its first occurrence.
+pub fn tz_from_local(local: LogicalTime, z: Tz) -> LogicalTime {
+    // try the standard and the daylight offset; keep a consistent one
+    var a: i64 = local.seconds - z.std_off;
+    var b: i64 = local.seconds - z.std_off - z.dst_save;
+    var a_ok: bool = tz_offset(z, time_from_timestamp(a)) == z.std_off;
+    var b_ok: bool = z.has_dst && tz_offset(z, time_from_timestamp(b)) == z.std_off + z.dst_save;
+    if a_ok && b_ok {
+        // repeated hour: the first (daylight) occurrence
+        if b < a { return time_from_timestamp(b); }
+        return time_from_timestamp(a);
+    }
+    if b_ok { return time_from_timestamp(b); }
+    if a_ok { return time_from_timestamp(a); }
+    // skipped hour: the moment the clock jumps, plus how far into the gap
+    return time_from_timestamp(a);
+}
+
+/// dt_format of the local time in `z`, plus %Z (abbreviation) and %z
+/// (offset, "+HH:MM").
+pub fn tz_format(t: LogicalTime, z: Tz, fmt: str) -> str {
+    var off: i64 = tz_offset(z, t);
+    var f: str = str_replace(fmt, "%Z", tz_abbr(z, t));
+    f = str_replace(f, "%z", tz_offset_str(off));
+    return dt_format(time_from_timestamp(t.seconds + off), f);
+}
+
+/// ISO 8601 with the zone's offset: "2026-07-04T12:00:00-04:00".
+pub fn tz_to_iso(t: LogicalTime, z: Tz) -> str {
+    return tz_format(t, z, "%Y-%m-%dT%H:%M:%S%z");
+}
+
+/// The same moment shown in another zone: wall clock of `to`.
+pub fn tz_convert(local: LogicalTime, from: Tz, to: Tz) -> LogicalTime {
+    return tz_to_local(tz_from_local(local, from), to);
+}

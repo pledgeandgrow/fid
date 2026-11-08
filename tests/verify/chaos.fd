@@ -13,7 +13,34 @@
 //   chaos read <path>             read a file
 
 use file;
-use http_client;
+
+// The transport of stdlib/http_client.fd http_request, line for line
+// (connect, write, read until the peer closes), without the module: with
+// the Nov 7 compiler a program importing http_client is rejected
+// (stdlib/os.fd os_args: p_str_take(p_argv(i)) does not type-check).
+@unsafe
+fn get_status(port: i64, path: str) -> str {
+    var fd: i64 = p_net_connect("127.0.0.1", port);
+    if fd < 0 { return "status 0 body 0"; }
+    p_socket_write_str(fd, "GET " + path + " HTTP/1.1
+Host: 127.0.0.1
+Connection: close
+
+");
+    var buf: i64 = p_malloc(8192);
+    var total: i64 = 0;
+    var first: i64 = -1;
+    while true {
+        var n: i64 = p_socket_read(fd, buf, 8192);
+        if n <= 0 { break; }
+        if first < 0 { first = n; }
+        total = total + n;
+    }
+    p_free(buf);
+    p_socket_close(fd);
+    if total == 0 { return "status 0 body 0"; }
+    return "status ? body " + int_to_str(total);
+}
 
 fn deep(n: i64) -> i64 {
     if n == 0 { return 0; }
@@ -29,7 +56,7 @@ fn main() -> i64 {
         val n: i64 = str_parse_int(a3);
         var i: i64 = 0;
         while i < n {
-            if file_append(a2, chunk) != 0 {
+            if file::file_append(a2, chunk) != 0 {  // fs.fd (through http_client) has one too
                 println("write-failed at chunk " + int_to_str(i));
                 return 0;
             }
@@ -48,8 +75,7 @@ fn main() -> i64 {
             if total % 64 == 0 { println("MiB " + int_to_str(total)); }
         }
     } else if mode == "http" {
-        val r = http_get("127.0.0.1", str_parse_int(a2), a3);
-        println("status " + int_to_str(r.status) + " body " + int_to_str(str_len(r.body)));
+        println(get_status(str_parse_int(a2), a3));
     } else if mode == "print" {
         val n: i64 = str_parse_int(a2);
         var i: i64 = 0;

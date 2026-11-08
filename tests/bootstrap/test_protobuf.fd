@@ -1,0 +1,83 @@
+// stdlib/protobuf: the protobuf wire format (competitive SL11): the
+// encodings from the protobuf documentation, zigzag, negative int64 as ten
+// bytes, fixed and double fields, packed repeated fields, an embedded
+// message, unknown fields skipped, and malformed input refused.
+//
+// Expected output:
+// 08 96 01
+// 12 07 74 65 73 74 69 6e 67
+// zigzag 0 1 2 3 4294967294 4294967295
+// -1 takes 11 bytes, reads back -1
+// 1=150 2=testing 3=-75 4=3.5 5=[3 270 86942] 6.1=7
+// skipped 1, fixed32 305419896
+// malformed: false
+use protobuf;
+use vec;
+
+fn main() -> i64 {
+    var a: PbWriter = pb_writer_new();
+    pb_write_varint(&mut a, 1, 150);
+    println(pb_hex(a.bytes));
+    var b: PbWriter = pb_writer_new();
+    pb_write_string(&mut b, 2, "testing");
+    println(pb_hex(b.bytes));
+    println("zigzag " + int_to_str(pb_zigzag(0)) + " " + int_to_str(pb_zigzag(-1)) + " " + int_to_str(pb_zigzag(1)) + " "
+        + int_to_str(pb_zigzag(-2)) + " " + int_to_str(pb_zigzag(2147483647)) + " " + int_to_str(pb_zigzag(-2147483648)));
+    var n: PbWriter = pb_writer_new();
+    pb_write_varint(&mut n, 1, -1);
+    var nr: PbReader = pb_reader_new(n.bytes);
+    pb_next(&mut nr);
+    println("-1 takes " + int_to_str(n.bytes.len()) + " bytes, reads back " + int_to_str(pb_read_varint(&mut nr)));
+    // a whole message
+    var inner: PbWriter = pb_writer_new();
+    pb_write_varint(&mut inner, 1, 7);
+    var m: PbWriter = pb_writer_new();
+    pb_write_varint(&mut m, 1, 150);
+    pb_write_string(&mut m, 2, "testing");
+    pb_write_sint(&mut m, 3, -75);
+    pb_write_double(&mut m, 4, 3.5);
+    var vals: Vec<i64> = Vec::new();
+    vals.push(3);
+    vals.push(270);
+    vals.push(86942);
+    pb_write_packed(&mut m, 5, vals);
+    pb_write_message(&mut m, 6, inner);
+    var r: PbReader = pb_reader_new(m.bytes);
+    var line: str = "";
+    while pb_next(&mut r) {
+        if r.field == 1 { line = line + "1=" + int_to_str(pb_read_varint(&mut r)); }
+        else if r.field == 2 { line = line + " 2=" + pb_read_string(&mut r); }
+        else if r.field == 3 { line = line + " 3=" + int_to_str(pb_read_sint(&mut r)); }
+        else if r.field == 4 { line = line + " 4=" + float_to_str(pb_read_double(&mut r)); }
+        else if r.field == 5 {
+            var p: Vec<i64> = pb_read_packed(&mut r);
+            line = line + " 5=[" + int_to_str(p.get(0)) + " " + int_to_str(p.get(1)) + " " + int_to_str(p.get(2)) + "]";
+        } else if r.field == 6 {
+            var sub: PbReader = pb_reader_new(pb_read_bytes(&mut r));
+            pb_next(&mut sub);
+            line = line + " 6.1=" + int_to_str(pb_read_varint(&mut sub));
+        } else { pb_skip(&mut r); }
+    }
+    println(line);
+    // a field this reader does not know, then one it does
+    var u: PbWriter = pb_writer_new();
+    pb_write_string(&mut u, 9, "ignore me");
+    pb_write_fixed32(&mut u, 2, 305419896);
+    var ur: PbReader = pb_reader_new(u.bytes);
+    var skipped: i64 = 0;
+    var got: i64 = 0;
+    while pb_next(&mut ur) {
+        if ur.field == 2 { got = pb_read_fixed32(&mut ur); } else { pb_skip(&mut ur); skipped = skipped + 1; }
+    }
+    println("skipped " + int_to_str(skipped) + ", fixed32 " + int_to_str(got));
+    // a length past the end
+    var bad: Vec<i64> = Vec::new();
+    bad.push(18);
+    bad.push(50);
+    bad.push(1);
+    var br: PbReader = pb_reader_new(bad);
+    pb_next(&mut br);
+    pb_read_bytes(&mut br);
+    if br.ok { println("malformed: true"); } else { println("malformed: false"); }
+    return 0;
+}

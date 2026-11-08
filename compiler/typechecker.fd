@@ -890,6 +890,30 @@ pub fn StringFuncSig_new(key: str, val: FuncSig) -> StringFuncSig {
 
 // --- TypeChecker implementation ------------------------------------------
 
+/// Free the typechecker's index maps (raw handles, which ownership does
+/// not drop) once checking is over; nothing reads them after.
+pub fn TypeChecker_free_maps(self: &mut TypeChecker) {
+    HashMap_drop(self.enum_tp_set); self.enum_tp_set = HashMap_new();
+    HashMap_drop(self.methods_index); self.methods_index = HashMap_new();
+    HashMap_drop(self.sname_index); self.sname_index = HashMap_new();
+    HashMap_drop(self.ename_index); self.ename_index = HashMap_new();
+    HashMap_drop(self.func_effects_index); self.func_effects_index = HashMap_new();
+    HashMap_drop(self.heap_alloc_index); self.heap_alloc_index = HashMap_new();
+    HashMap_drop(self.ho_param_effects_index); self.ho_param_effects_index = HashMap_new();
+    HashMap_drop(self.ho_fn_index); self.ho_fn_index = HashMap_new();
+    HashMap_drop(self.item_modules_index); self.item_modules_index = HashMap_new();
+    HashMap_drop(self.item_visibility_index); self.item_visibility_index = HashMap_new();
+    HashMap_drop(self.struct_modules_index); self.struct_modules_index = HashMap_new();
+    HashMap_drop(self.func_cache); self.func_cache = HashMap_new();
+    HashMap_drop(self.private_fields); self.private_fields = HashMap_new();
+    HashMap_drop(self.struct_cache); self.struct_cache = HashMap_new();
+    HashMap_drop(self.enum_cache); self.enum_cache = HashMap_new();
+    HashMap_drop(self.const_cache); self.const_cache = HashMap_new();
+    HashMap_drop(self.global_cache); self.global_cache = HashMap_new();
+    HashMap_drop(self.alias_cache); self.alias_cache = HashMap_new();
+    self.ename_indexed = 0;
+}
+
 impl TypeChecker {
 
     pub fn new() -> TypeChecker {
@@ -7706,7 +7730,7 @@ fn tc_alloc_func_names() -> Vec<str> {
     alloc_funcs.push("Vec_new"); alloc_funcs.push("Vec_push"); alloc_funcs.push("Vec_insert"); alloc_funcs.push("Vec_resize");
     alloc_funcs.push("HashMap_new"); alloc_funcs.push("HashMap_insert");
     alloc_funcs.push("String_new"); alloc_funcs.push("String_push");
-    alloc_funcs.push("Vec_with_capacity"); alloc_funcs.push("Vec_clone"); alloc_funcs.push("Box_new");
+    alloc_funcs.push("Vec_with_capacity"); alloc_funcs.push("Vec_filled_typed"); alloc_funcs.push("Vec_clone"); alloc_funcs.push("Box_new");
     alloc_funcs.push("StringBuilder_new"); alloc_funcs.push("int_to_str"); alloc_funcs.push("float_to_str");
     alloc_funcs.push("p_str_concat"); alloc_funcs.push("p_to_str"); alloc_funcs.push("p_str_alloc");
     return alloc_funcs;
@@ -10296,6 +10320,39 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                 }
                 // No declared element type: a bare Vec
                 return Type::Named("Vec");
+            }
+            // `Vec::filled(n, x)`: n elements, each x (Rust's vec![x; n])
+            if name == "Vec" && method == "filled" && args.len() == 2 {
+                var fn_ty: Type = TypeChecker_check_expr(self, args.get(0));
+                if !TypeChecker_is_integer(self, fn_ty) {
+                    self.errors.push("Type error: Vec::filled takes a length (an integer) first, got " + type_to_str(fn_ty));
+                }
+                var fe_hint: Type = Type::Infer;
+                match hint {
+                    Type::Generic(fhn, fhargs) => {
+                        if fhn == "Vec" && fhargs.len() == 1 { fe_hint = fhargs.get(0); }
+                    }
+                    _ => {}
+                }
+                var fx_ty: Type = TypeChecker_check_expr_with_hint(self, args.get(1), fe_hint);
+                var felem: Type = fx_ty;
+                match fe_hint {
+                    Type::Infer => {}
+                    _ => { felem = fe_hint; }
+                }
+                // Struct and enum elements are boxed one by one: push them
+                var fen: str = "";
+                match felem {
+                    Type::Named(fnn) => { fen = fnn; }
+                    Type::Generic(fgn, _) => { if fgn != "Vec" && fgn != "HashMap" { fen = fgn; } }
+                    _ => {}
+                }
+                if fen != "" && fen != "Vec" && fen != "HashMap" && fen != "String" && (tc_is_struct(self, fen) || TypeChecker_enum_pos(self, fen) >= 0) {
+                    self.errors.push("Type error: Vec::filled makes Vecs of numbers, bools, strings, Vecs or maps; a Vec of " + fen + " is made with push");
+                }
+                var fargs: Vec<Type> = Vec::new();
+                fargs.push(felem);
+                return Type::Generic("Vec", fargs);
             }
             if name == "HashMap" && method == "new" {
                 match hint {

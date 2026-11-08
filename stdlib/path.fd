@@ -1,7 +1,9 @@
 // Fides Path standard library
 //
 // File path manipulation utilities. Pure string operations — no filesystem access.
-// Handles both Unix (/) and Windows (\) separators, preferring Unix.
+// Handles both Unix (/) and Windows (\) separators, preferring Unix: every
+// function reads either, and what it builds uses '/'. A Windows drive
+// prefix ("C:") and a UNC prefix ("\\server") are part of the root.
 //
 // Usage:
 //   use path;
@@ -25,6 +27,42 @@ pub fn path_sep() -> str {
     return "/";
 }
 
+fn path_is_sep(c: i64) -> bool {
+    return c == 47 || c == 92;
+}
+
+/// Index of the last separator ('/' or '\\'), or -1.
+fn path_last_sep(path: str) -> i64 {
+    var i: i64 = str_len(path) - 1;
+    while i >= 0 {
+        if path_is_sep(str_byte_at(path, i)) { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+/// Length of a Windows drive prefix ("C:"), or 0.
+fn path_drive_len(path: str) -> i64 {
+    if str_len(path) >= 2 && str_byte_at(path, 1) == 58 {
+        var c: i64 = str_byte_at(path, 0);
+        if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) { return 2; }
+    }
+    return 0;
+}
+
+/// The root of a path: "/", "C:/", "C:", "//" (UNC), or "" (relative).
+pub fn path_root(path: str) -> str {
+    var d: i64 = path_drive_len(path);
+    var n: i64 = str_len(path);
+    if d > 0 {
+        if n > d && path_is_sep(str_byte_at(path, d)) { return str_slice(path, 0, d) + "/"; }
+        return str_slice(path, 0, d);
+    }
+    if n >= 2 && path_is_sep(str_byte_at(path, 0)) && path_is_sep(str_byte_at(path, 1)) { return "//"; }
+    if n >= 1 && path_is_sep(str_byte_at(path, 0)) { return "/"; }
+    return "";
+}
+
 // ─── Join ───────────────────────────────────────────────────────────────
 
 /// Join two path components with a separator.
@@ -34,8 +72,10 @@ pub fn path_sep() -> str {
 pub fn path_join(a: str, b: str) -> str {
     if str_len(a) == 0 { return b; }
     if str_len(b) == 0 { return a; }
-    var a_ends_sep = str_byte_at(a, str_len(a) - 1) == 47;  // '/'
-    var b_starts_sep = str_byte_at(b, 0) == 47;
+    // an absolute b replaces a, as with every OS path API
+    if path_drive_len(b) > 0 { return b; }
+    var a_ends_sep = path_is_sep(str_byte_at(a, str_len(a) - 1));
+    var b_starts_sep = path_is_sep(str_byte_at(b, 0));
     if a_ends_sep && b_starts_sep {
         return a + str_slice(b, 1, str_len(b));
     }
@@ -64,7 +104,7 @@ pub fn path_join_many(parts: Vec<str>) -> str {
 /// path_split("/a/b/c.txt") → ("/a/b", "c.txt")
 pub fn path_split(path: str) -> Vec<str> {
     var result = Vec::new();
-    var last_sep = str_rfind(path, "/");
+    var last_sep = path_last_sep(path);
     if last_sep < 0 {
         result.push("");
         result.push(path);
@@ -83,17 +123,27 @@ pub fn path_split(path: str) -> Vec<str> {
 /// Get the directory name of a path.
 /// path_dirname("/a/b/c.txt") → "/a/b"
 pub fn path_dirname(path: str) -> str {
-    var last_sep = str_rfind(path, "/");
-    if last_sep < 0 { return ""; }
+    var last_sep = path_last_sep(path);
+    if last_sep < 0 {
+        // "C:file" -> "C:"
+        if path_drive_len(path) > 0 { return str_slice(path, 0, 2); }
+        return "";
+    }
     if last_sep == 0 { return "/"; }
+    // "C:\\x" -> "C:/"
+    if last_sep == 2 && path_drive_len(path) > 0 { return str_slice(path, 0, 2) + "/"; }
     return str_slice(path, 0, last_sep);
 }
 
 /// Get the base name (file name) of a path.
 /// path_basename("/a/b/c.txt") → "c.txt"
 pub fn path_basename(path: str) -> str {
-    var last_sep = str_rfind(path, "/");
-    if last_sep < 0 { return path; }
+    var last_sep = path_last_sep(path);
+    if last_sep < 0 {
+        var d: i64 = path_drive_len(path);
+        if d > 0 { return str_slice(path, d, str_len(path)); }
+        return path;
+    }
     return str_slice(path, last_sep + 1, str_len(path));
 }
 
@@ -138,7 +188,27 @@ pub fn path_set_extension(path: str, ext: str) -> str {
 /// Normalize a path by resolving "." and ".." components.
 /// path_normalize("a/./b/../c") → "a/c"
 /// path_normalize("/a/b/../c") → "/a/c"
-pub fn path_normalize(path: str) -> str {
+pub fn path_normalize(path0: str) -> str {
+    if str_len(path0) == 0 { return "."; }
+    // Windows separators read as '/', the drive or UNC prefix kept
+    var path: str = str_replace(path0, "\\", "/");
+    var prefix: str = "";
+    var d: i64 = path_drive_len(path);
+    if d > 0 {
+        prefix = str_slice(path, 0, d);
+        path = str_slice(path, d, str_len(path));
+        if str_len(path) == 0 { return prefix; }
+    } else if str_len(path) >= 2 && str_byte_at(path, 0) == 47 && str_byte_at(path, 1) == 47 {
+        prefix = "/";
+        path = str_slice(path, 1, str_len(path));
+    }
+    if str_len(prefix) > 0 {
+        return prefix + path_normalize_unix(path);
+    }
+    return path_normalize_unix(path);
+}
+
+fn path_normalize_unix(path: str) -> str {
     if str_len(path) == 0 { return "."; }
     var is_absolute = str_byte_at(path, 0) == 47;
     var parts = str_split(path, "/");
@@ -180,7 +250,10 @@ pub fn path_normalize(path: str) -> str {
 /// Check if a path is absolute.
 pub fn path_is_absolute(path: str) -> bool {
     if str_len(path) == 0 { return false; }
-    return str_byte_at(path, 0) == 47;
+    if path_is_sep(str_byte_at(path, 0)) { return true; }
+    // "C:\\x" or "C:/x"; "C:x" is relative to the drive's current directory
+    var d: i64 = path_drive_len(path);
+    return d > 0 && str_len(path) > d && path_is_sep(str_byte_at(path, d));
 }
 
 /// Check if a path is relative.
@@ -199,13 +272,13 @@ pub fn path_has_extension(path: str, ext: str) -> bool {
 /// Split a path into its components.
 /// path_components("/a/b/c") → ["", "a", "b", "c"]
 pub fn path_components(path: str) -> Vec<str> {
-    return str_split(path, "/");
+    return str_split(str_replace(path, "\\", "/"), "/");
 }
 
 /// Get the parent directory (same as dirname but handles trailing slashes).
 pub fn path_parent(path: str) -> str {
     var end = str_len(path);
-    while end > 1 && str_byte_at(path, end - 1) == 47 {
+    while end > 1 && path_is_sep(str_byte_at(path, end - 1)) {
         end = end - 1;
     }
     return path_dirname(str_slice(path, 0, end));

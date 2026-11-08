@@ -42,8 +42,11 @@ use compiler::macho;
 use compiler::cparser;
 use compiler::iropt;
 use compiler::nat_ir;
+use compiler::rules;
+use compiler::irverify;
 use compiler::typechecker;
 use compiler::json;
+use compiler::csplit;
 
 // --- Global flag state ---------------------------------------------------
 // Parsed from --borrowck= and --timeout flags before command dispatch.
@@ -154,6 +157,7 @@ pub fn main() -> i64 {
     if command == "ir" { return cmd_ir(n, start); }
     if command == "dump-ir" { return cmd_ir(n, start); }
     if command == "dump-c" { return cmd_dump_c(n, start); }
+    if command == "split-c" { return cmd_split_c(n, start); }
     if command == "pir" { return cmd_pir(n, start); }
     if command == "dump-pir" { return cmd_pir(n, start); }
     if command == "opt" { return cmd_opt(n, start); }
@@ -163,6 +167,7 @@ pub fn main() -> i64 {
     if command == "bench" { return cmd_bench(n, start); }
     if command == "profile" { return cmd_profile(n, start); }
     if command == "lint" { return cmd_lint(n, start); }
+    if command == "test-rules" { return rules_selftest(); }
     if command == "check" { return cmd_check(n, start); }
     if command == "doc" { return cmd_scribe(n, start); }
     if command == "wasm" { return cmd_wasm(n, start); }
@@ -489,6 +494,22 @@ fn cmd_dump_c(n: i64, start: i64) -> i64 {
         }
     }
     return 1;
+}
+
+// --- split-c -------------------------------------------------------------
+// `fid split-c <in.c> <out-prefix> <n>`: one generated C file as n units
+// and a header (compiler/csplit.fd), to compile a large program at -O2 in
+// parts (scripts/bootstrap.sh does it for the compiler).
+fn cmd_split_c(n: i64, start: i64) -> i64 {
+    if start + 4 > n {
+        p_eprint_str("Usage: fid split-c <in.c> <out-prefix> <n>\n");
+        return 1;
+    }
+    var in_c: str = p_argv(start + 1);
+    var prefix: str = p_argv(start + 2);
+    var parts_s: str = p_argv(start + 3);
+    var parts: i64 = str_parse_int(parts_s);
+    return cs_split_files(in_c, prefix, parts);
 }
 
 // --- pir / dump-pir ------------------------------------------------------
@@ -2744,6 +2765,17 @@ fn cmd_parse_header(n: i64, start: i64) -> i64 {
     return 0;
 }
 
+/// FID_VERIFY: the IR verifier's findings, printed; false when there are any.
+fn nat_verified(m: &IrModule, stage: str) -> bool {
+    var errs: Vec<str> = ir_verify(m, stage);
+    var i: i64 = 0;
+    while i < errs.len() {
+        print(errs.get(i) + "\n");
+        i = i + 1;
+    }
+    return errs.len() == 0;
+}
+
 fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     if start + 2 > n {
         print("Usage: fid build <file.fd> [-o output] [--target <triple>] [--no-opt] [--lto] [--caps <list>]\n");
@@ -2979,6 +3011,18 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             ResultProgram::Ok(nprogram) => {
                 p_eprint_str("[build] Lowering to IR...\n");
                 var nat_mod: IrModule = lower(nprogram);
+                // The mid-end (own-backend roadmap step 3-5): iropt's passes,
+                // then the rules and pure-call merging; the IR verifier
+                // after each stage with FID_VERIFY=1
+                var nat_verify: bool = str_len(env_or_empty("FID_VERIFY")) > 0;
+                var nat_t0: i64 = p_clock_now_ms();
+                if nat_verify && !nat_verified(&nat_mod, "after lowering") { return 1; }
+                iropt_native(&mut nat_mod);
+                if nat_verify && !nat_verified(&nat_mod, "after iropt") { return 1; }
+                var nat_rr: Vec<i64> = rules_run(&mut nat_mod);
+                if nat_verify && !nat_verified(&nat_mod, "after rules") { return 1; }
+                p_eprint_str("[prof] native mid-end: " + int_to_str(p_clock_now_ms() - nat_t0) + "ms, "
+                    + int_to_str(nat_rr.get(0)) + " rewritten by rules, " + int_to_str(nat_rr.get(1)) + " pure calls merged\n");
                 p_eprint_str("[build] Native Linux code generation...\n");
                 var nat_res: ResultBytes = nat_generate_elf(nat_mod, nat_arch);
                 match nat_res {
@@ -3157,6 +3201,7 @@ fn print_usage() {
     p_eprint_str("  fid ast      <file.fd>                Show AST summary\n");
     p_eprint_str("  fid ir       <file.fd>                Show IR\n");
     p_eprint_str("  fid dump-c   <file.fd>                Show generated C source\n");
+    p_eprint_str("  fid split-c  <in.c> <prefix> <n>      Split generated C into n units + a header\n");
     p_eprint_str("  fid pir      <file.fd> [1|2|3|all]    Show PIR (default: L2)\n");
     p_eprint_str("  fid opt      <file.fd>                Optimize PIR L2 and show result\n");
     p_eprint_str("  fid fmt      <file.fd> [--check]      Format source code\n");

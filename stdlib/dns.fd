@@ -68,16 +68,24 @@ fn rd_u32(buf: i64, off: i64) -> i64 {
 }
 
 // Skip a DNS name (handles 0xC0 compression pointers). Returns offset
-// after the name.
-fn dns_skip_name(buf: i64, off: i64) -> i64 {
+// after the name, or -1 when it runs past `end` (a truncated or hostile
+// packet: nothing past the buffer is read).
+fn dns_skip_name_in(buf: i64, off: i64, end: i64) -> i64 {
     var i: i64 = off;
-    while true {
+    while i < end {
         var len: i64 = p_volatile_load8(buf + i);
         if len == 0 { return i + 1; }
-        if (len & 192) == 192 { return i + 2; }            // pointer
+        if (len & 192) == 192 {                            // pointer
+            if i + 2 > end { return -1; }
+            return i + 2;
+        }
         i = i + len + 1;
     }
-    return i;
+    return -1;
+}
+
+fn dns_skip_name(buf: i64, off: i64) -> i64 {
+    return dns_skip_name_in(buf, off, off + 4096);
 }
 
 fn dns_parse_u32_addr(buf: i64, off: i64) -> str {
@@ -88,13 +96,45 @@ fn dns_parse_u32_addr(buf: i64, off: i64) -> str {
 }
 
 fn dns_parse_v6_addr(buf: i64, off: i64) -> str {
-    var out: str = "";
+    var groups: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < 16 {
-        var w: i64 = rd_u16(buf, off + i);
-        if i > 0 { out = out + ":"; }
-        out = out + int_to_hex(w);
+        groups.push(rd_u16(buf, off + i));
         i = i + 2;
+    }
+    return dns_v6_text(groups);
+}
+
+/// An IPv6 address as text (RFC 5952): lowercase hex groups without
+/// leading zeros, the longest run of two or more zero groups as "::".
+pub fn dns_v6_text(groups: Vec<i64>) -> str {
+    var best: i64 = -1;
+    var best_len: i64 = 0;
+    var i: i64 = 0;
+    while i < groups.len() {
+        if groups.get(i) == 0 {
+            var j: i64 = i;
+            while j < groups.len() && groups.get(j) == 0 { j = j + 1; }
+            if j - i > best_len && j - i >= 2 {
+                best = i;
+                best_len = j - i;
+            }
+            i = j;
+        } else {
+            i = i + 1;
+        }
+    }
+    var out: str = "";
+    i = 0;
+    while i < groups.len() {
+        if i == best {
+            out = out + "::";
+            i = i + best_len;
+            continue;
+        }
+        if str_len(out) > 0 && !str_ends_with(out, ":") { out = out + ":"; }
+        out = out + str_to_lower(int_to_hex(groups.get(i)));
+        i = i + 1;
     }
     return out;
 }
@@ -103,31 +143,140 @@ fn dns_parse_v6_addr(buf: i64, off: i64) -> str {
 /// resolved IPs as Vec<str>. qtype 1 → dotted-quad, 28 → hex groups.
 pub fn dns_parse_response(buf: i64, len: i64) -> Vec<str> {
     var ips: Vec<str> = Vec::new();
-    if len < 12 { return ips; }
+    var recs: Vec<DnsRecord> = dns_parse_records(buf, len);
+    var i: i64 = 0;
+    while i < recs.len() {
+        ips.push(recs.get(i).addr);
+        i = i + 1;
+    }
+    return ips;
+}
+
+/// One answer of a response: its type (1 A, 28 AAAA), time to live in
+/// seconds, and address as text.
+pub struct DnsRecord {
+    pub rtype: i64,
+    pub ttl: i64,
+    pub addr: str,
+}
+
+/// The A and AAAA answers of a raw response (`len` bytes at `buf`). Every
+/// read is checked against `len`: a truncated packet gives the answers
+/// before the cut.
+pub fn dns_parse_records(buf: i64, len: i64) -> Vec<DnsRecord> {
+    var out: Vec<DnsRecord> = Vec::new();
+    if len < 12 { return out; }
     var qd: i64 = rd_u16(buf, 4);
     var an: i64 = rd_u16(buf, 6);
     var off: i64 = 12;
     var i: i64 = 0;
     while i < qd {
-        off = dns_skip_name(buf, off) + 4;                 // name + QTYPE+QCLASS
+        off = dns_skip_name_in(buf, off, len);
+        if off < 0 || off + 4 > len { return out; }
+        off = off + 4;                                     // QTYPE + QCLASS
         i = i + 1;
     }
     i = 0;
     while i < an && off < len {
-        off = dns_skip_name(buf, off);
-        if off + 10 > len { break; }
+        off = dns_skip_name_in(buf, off, len);
+        if off < 0 || off + 10 > len { break; }
         var rtype: i64 = rd_u16(buf, off);
+        var ttl: i64 = rd_u32(buf, off + 4);
         var rdlen: i64 = rd_u16(buf, off + 8);
         var rdata: i64 = off + 10;
+        if rdata + rdlen > len { break; }
         if rtype == 1 && rdlen == 4 {
-            ips.push(dns_parse_u32_addr(buf, rdata));
+            out.push(DnsRecord { rtype: 1, ttl: ttl, addr: dns_parse_u32_addr(buf, rdata) });
         } else if rtype == 28 && rdlen == 16 {
-            ips.push(dns_parse_v6_addr(buf, rdata));
+            out.push(DnsRecord { rtype: 28, ttl: ttl, addr: dns_parse_v6_addr(buf, rdata) });
         }
         off = rdata + rdlen;
         i = i + 1;
     }
-    return ips;
+    return out;
+}
+
+// ─── Cache ──────────────────────────────────────────────────────────────
+// Answers kept for their time to live (competitive SL5): a name asked
+// again before it expires costs no packet. Times are seconds, passed in
+// (time_now_secs() in a program, any clock in a test).
+
+pub struct DnsCache {
+    pub names: Vec<str>,
+    pub addrs: Vec<Vec<str>>,
+    pub expires: Vec<i64>,
+}
+
+pub fn dns_cache_new() -> DnsCache {
+    return DnsCache { names: Vec::new(), addrs: Vec::new(), expires: Vec::new() };
+}
+
+fn dns_cache_find(c: &DnsCache, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < c.names.len() {
+        if c.names.get(i) == name { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// The cached addresses of `name` at time `now`; empty when there are
+/// none or they have expired.
+pub fn dns_cache_get(c: &DnsCache, name: str, now: i64) -> Vec<str> {
+    var i: i64 = dns_cache_find(c, str_to_lower(name));
+    if i < 0 || c.expires.get(i) <= now {
+        var none: Vec<str> = Vec::new();
+        return none;
+    }
+    return c.addrs.get(i);
+}
+
+/// Keep `addrs` for `name` until `now + ttl` (seconds; names are not case
+/// sensitive). A ttl of 0 or less keeps nothing.
+pub fn dns_cache_put(c: &mut DnsCache, name: str, addrs: Vec<str>, ttl: i64, now: i64) {
+    var key: str = str_to_lower(name);
+    var i: i64 = dns_cache_find(c, key);
+    if ttl <= 0 || addrs.len() == 0 {
+        if i >= 0 { c.expires.set(i, now); }
+        return;
+    }
+    if i < 0 {
+        c.names.push(key);
+        c.addrs.push(addrs);
+        c.expires.push(now + ttl);
+        return;
+    }
+    c.addrs.set(i, addrs);
+    c.expires.set(i, now + ttl);
+}
+
+/// How many names the cache holds unexpired at `now`.
+pub fn dns_cache_size(c: &DnsCache, now: i64) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < c.names.len() {
+        if c.expires.get(i) > now { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The A records of `hostname`: from the cache while they last, else a
+/// query to `server` (its answers then cached for their smallest TTL).
+pub fn dns_cache_resolve(c: &mut DnsCache, hostname: str, server: str, now: i64) -> Vec<str> {
+    var hit: Vec<str> = dns_cache_get(c, hostname, now);
+    if hit.len() > 0 { return hit; }
+    var recs: Vec<DnsRecord> = dns_query_records(hostname, 1, server, 53, 2000);
+    var addrs: Vec<str> = Vec::new();
+    var ttl: i64 = -1;
+    var i: i64 = 0;
+    while i < recs.len() {
+        addrs.push(recs.get(i).addr);
+        if ttl < 0 || recs.get(i).ttl < ttl { ttl = recs.get(i).ttl; }
+        i = i + 1;
+    }
+    dns_cache_put(c, hostname, addrs, ttl, now);
+    return addrs;
 }
 
 // ─── Resolver ───────────────────────────────────────────────────────────
@@ -136,6 +285,18 @@ pub fn dns_parse_response(buf: i64, len: i64) -> Vec<str> {
 /// answer addresses (empty on failure/timeout). Timeout ~2s.
 pub fn dns_query(hostname: str, qtype: i64, server: str, port: i64, timeout_ms: i64) -> Vec<str> {
     var out: Vec<str> = Vec::new();
+    var recs: Vec<DnsRecord> = dns_query_records(hostname, qtype, server, port, timeout_ms);
+    var i: i64 = 0;
+    while i < recs.len() {
+        out.push(recs.get(i).addr);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The answers to a query, with their TTLs (empty on failure or timeout).
+pub fn dns_query_records(hostname: str, qtype: i64, server: str, port: i64, timeout_ms: i64) -> Vec<DnsRecord> {
+    var out: Vec<DnsRecord> = Vec::new();
     var sock: i64 = net_socket_create();
     if sock < 0 { return out; }
     net_set_recv_timeout(sock, timeout_ms);
@@ -152,7 +313,7 @@ pub fn dns_query(hostname: str, qtype: i64, server: str, port: i64, timeout_ms: 
     if sent < 0 { net_close(sock); p_free(buf); return out; }
     var rbuf: i64 = p_malloc(4096);
     var got: i64 = net_recv_from(sock, rbuf, 4096, &mut addr);
-    if got > 0 { out = dns_parse_response(rbuf, got); }
+    if got > 0 { out = dns_parse_records(rbuf, got); }
     p_free(rbuf);
     p_free(buf);
     net_close(sock);
