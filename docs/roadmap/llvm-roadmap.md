@@ -296,7 +296,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
 
 ## Track ME — SSA and a rules mid-end (30)
 
-- [ ] ME1. Use lists in the IR, kept current by every pass (M).
+- [x] ME1. Use lists in the IR, kept current by every pass (M).
+      `IroUses`/`iro_uses` in `compiler/iropt.fd`: users per value and the
+      block each use sits in; passes rebuild it where they need it (GVN,
+      branch facts, forwarding, DCE).
 - [~] ME2. Dominator tree and loop tree shared by every pass (`iro_cfg`,
       `iro_dominates` in `iropt.fd` are a start) (M).
       iropt's dominators are used by the IR verifier, the e-graph and forwarding.
@@ -306,16 +309,23 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       registers in the backend, and a load becomes the stored value when that
       store is the local's only one and dominates it, or is earlier in its block
       (`compiler/egraph.fd`); no phis yet, the IR is unchanged.
+      Nov 9: `iro_promote` (pass `promote` in `compiler/iropt.fd`) generalizes
+      this in the mid-end: per-alloca reaching-store dataflow replaces every
+      load that has a single reaching store across the whole CFG. Merges
+      where predecessors disagree (or a store meets an uninitialized path)
+      still need phis — Jump/Branch carry no edge arguments — and stay in
+      memory.
 - [x] ME4. An IR verifier after every pass in debug builds: types, dominance,
       terminators, block parameters (M).
       Nov 8: `compiler/irverify.fd` (`FID_VERIFY=1`), after lowering, iropt, the
       rules and the e-graph; it found 3 lowering bugs (2 fixed in lower.fd by the
       ownership session).
-- [~] ME5. One pass manager: order, per-pass timing, a switch to turn each off
+- [x] ME5. One pass manager: order, per-pass timing, a switch to turn each off
       (`--no-pass=name`), and `iro_pass_on` folded into it (M).
       Switches per pass: `FID_IROPT_OFF`, `FID_NAT_OFF` (mir, promote, ipra, fold,
       hint, rules, purecse, egraph, forward, debug); timing in `[prof] native`
-      lines.
+      lines. Nov 9: `iro_time` wraps every iropt pass; `FID_IROPT_STATS=1`
+      prints `iropt: pass <name>: N ms (K calls)` most expensive first.
 - [x] ME6. An e-graph data structure: e-classes, hash-consed e-nodes, union-find,
       rebuilding (L).
       Nov 9: `compiler/egraph.fd`: e-classes, hash-consed e-nodes, union-find,
@@ -338,48 +348,101 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       not folded).
 - [~] ME11. CSE and GVN from hash-consing, across blocks by dominance (M).
       Through the e-graph: an earlier equal value that dominates becomes a move.
-- [ ] ME12. Algebraic simplification: identities, reassociation of constants,
+- [x] ME12. Algebraic simplification: identities, reassociation of constants,
       strength reduction of multiplication and division by constants (M).
-- [~] ME13. Comparison and branch simplification: `!(a < b)` to `a >= b`, known
+      Identities as data in `rules.fd` plus `iro_simplify`: `x+0`, `x-0`,
+      `x*1`, `x*0`, `x|0`, `x^0`, `x&0`, `x&x`, `x|x`, `x^x`, `x<<0`, `x>>0`
+      (integers only — no float rules that would change NaN/-0.0, nothing
+      that would drop a division or shift panic); `(x+c1)+c2` reassociation
+      keeping overflow semantics; `*2^k`→`<<`, `/2^k`→`>>`, `%2^k`→`&` under
+      the documented safety conditions. Nov 9: a native run of the suite with
+      `simplify`, `branchfold` and `dse` on and off differs on test_args,
+      test_bigint, test_brotli, test_decimal and test_counted_loop, so the
+      three are opt-in (`FID_IROPT_ON`) until that is found.
+- [x] ME13. Comparison and branch simplification: `!(a < b)` to `a >= b`, known
       results from dominating conditions (M).
-      Comparisons flipped and same-operand comparisons folded.
-- [ ] ME14. Sparse conditional constant propagation over the CFG, dead branches
+      Comparisons flipped and same-operand comparisons folded. Nov 9: pass
+      `branchfacts` — where a branch target has that branch as its only
+      predecessor, uses of the condition and comparisons over the same
+      operands are folded to constants through the dominated region (set-mask
+      algebra over {lt,eq,gt}).
+- [x] ME14. Sparse conditional constant propagation over the CFG, dead branches
       removed (M).
-- [ ] ME15. Dead code and dead store elimination on SSA (M).
+      `iro_sccp` (pass `sccp`): top/const/varying lattice over the reachable
+      CFG in RPO (sound without iteration — single-def values, defs dominate
+      uses); folds integer binops/unops/trunc/extend/bitcast under checked
+      arithmetic (a fold that would panic stays varying); constant branch
+      conditions become jumps, the dead edge's predecessor link is dropped
+      and unreachable blocks removed.
+- [~] ME15. Dead code and dead store elimination on SSA (M).
+      `iro_dse`/`iro_dce_more` run on the current single-def IR; "on SSA"
+      proper waits on ME3 phis.
 - [x] ME16. Each rule tested on its own: random inputs evaluated before and after
       the rewrite, in `fid test-rules` (M).
       `fid test-rules`: each rule on edge and random values.
 - [~] ME17. Each integer rule proved by an SMT solver on 64-bit vectors (an
       offline check, run in CI; z3 as a tool, not a dependency) (L).
       `fid test-rules --smt <dir>` writes 108 obligations (27 rules at 8, 16, 32,
-      64 bits), `scripts/rules-smt.sh` runs them. Nov 9: z3 5.3 (the z3-solver
-      wheel, through its Python module) proves all 108; a rule broken on
-      purpose gives `sat`. Left: running it in CI.
-- [ ] ME18. Rule statistics: how often each fires on the suite; rules that never
+      64 bits), `scripts/rules-smt.sh` runs them. Nov 9: z3 5.3.3 (the
+      z3-solver wheel, through its Python module) proves all 108; a rule
+      broken on purpose gives `sat`. Left: running it in CI.
+- [x] ME18. Rule statistics: how often each fires on the suite; rules that never
       fire are deleted (S).
+      `g_rule_hits` in `compiler/rules.fd`; `FID_RULE_STATS=1` prints
+      `[rules] <name>: <hits>` per rule at the end of `rules_run`.
 - [x] ME19. Saturation limits per function (nodes, iterations), so compile time
       stays linear in practice (S).
       Node and round limits (`EG_MAX_NODES`, `EG_MAX_ROUNDS`).
 - [~] ME20. Inlining with a cost model across modules (iropt inlines one-block
       functions of up to 16 instructions today) (L).
-- [ ] ME21. Inlining decisions from the call graph bottom-up, with sizes known
+      Nov 9: written, opt-in (`FID_IROPT_ON=inline2`), not run on the suite yet: callees of
+      several blocks (the block is split at the call; returns store the
+      result and jump on), up to 60 instructions, 400 for a callee called
+      once, a caller kept under 4,000 (`compiler/iropt_me.fd` `ime_inline`).
+- [~] ME21. Inlining decisions from the call graph bottom-up, with sizes known
       after the callee is optimized (M).
-- [ ] ME22. Loop canonical form: preheaders, single latches, dedicated exits (M).
-- [ ] ME23. Induction variables: strength reduction, exit-value replacement,
+      Nov 9: written, opt-in (`FID_IROPT_ON=inline2`), not run on the suite yet: post-order over
+      the call graph: a callee is inlined into its callers after its own
+      callees were.
+- [~] ME22. Loop canonical form: preheaders, single latches, dedicated exits (M).
+      Nov 9: written, opt-in (`FID_IROPT_ON=loops`), not run on the suite yet: all three
+      (`ime_canonical_loops`).
+- [~] ME23. Induction variables: strength reduction, exit-value replacement,
       rotation shared by every backend (`PEIR_ROTATE` moves out of pe_ir) (M).
-- [ ] ME24. Loop unrolling by a small factor for short bodies with known trip
+      Nov 9: written, opt-in (`FID_IROPT_ON=ivsr`), not run on the suite yet: i * c in a
+      loop becomes a second stepped variable, in @wrapping functions only
+      (elsewhere the stepped copy could overflow where i * c is never
+      computed). Exit values and rotation are not done.
+- [~] ME24. Loop unrolling by a small factor for short bodies with known trip
       counts (M).
+      Nov 9: written, opt-in (`FID_IROPT_ON=unroll`), not run on the suite yet: a one-block loop
+      of at most 8 iterations known on entry is unrolled fully (`ime_unroll`);
+      partial unrolling is not done.
 - [ ] ME25. Loop versioning: a fast copy without checks when a cheap test at the
       entry proves them unnecessary (M).
-- [ ] ME26. Scalar replacement of aggregates on SSA: struct fields as separate
+      Not started: the copy needs a way to tell the backends that its checks
+      are proved (checks.fd decides them in pe_ir and the C generator).
+- [~] ME26. Scalar replacement of aggregates on SSA: struct fields as separate
       values (M).
+      Nov 9: written, opt-in (`FID_IROPT_ON=sra`), not run on the suite yet: a struct local
+      whose fields are only loaded and stored becomes a local per field
+      (`ime_sra`).
 - [ ] ME27. Small structs returned in registers (two words) for internal
       functions (M).
-- [ ] ME28. Switch lowering: ranges, bit tests, jump tables chosen in the mid-end
+      Not started: a calling-convention change in the backends (pe_ir,
+      nat_ir), not something the IR can say.
+- [~] ME28. Switch lowering: ranges, bit tests, jump tables chosen in the mid-end
       (M).
-- [ ] ME29. Tail recursion into loops (S).
-- [ ] ME30. Every mid-end change measured on the suite: instruction count and
+      Nov 9: written, opt-in (`FID_IROPT_ON=switch`), not run on the suite yet: a chain of four or
+      more `x == k` tests on one value becomes a balanced tree of comparisons
+      (`ime_switch`). Jump tables and bit tests need a new IR instruction.
+- [x] ME29. Tail recursion into loops (S).
+      `iro_tailcalls` (`compiler/iropt.fd`): a `return f(...)` self-call in
+      tail position becomes argument stores + a jump back to the entry.
+- [~] ME30. Every mid-end change measured on the suite: instruction count and
       compile time before and after, kept in a file per change (S).
+      `scripts/me-measure.sh` exists; `FID_IROPT_STATS=1` reports
+      instruction counts and per-pass timing. Files per change not kept yet.
 
 ## Track WP — The whole program (20)
 

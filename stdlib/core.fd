@@ -1053,6 +1053,30 @@ fn vec_sz_sort(v: i64, code: i64) {
 /// last owner of the buffer frees the buffer and drops the elements.
 pub fn Vec_drop(v: i64) {
     if v == 0 { return; }
+    Vec_drop_inplace(v);
+    p_free(v);
+}
+
+/// A Vec whose header is on the stack (LF13: a local that never leaves its
+/// function): the header at `p` set up as Vec_new_typed's would be.
+pub fn Vec_init_typed(p: i64, code: i64, tid: i64) -> i64 {
+    p_zero_words(p, 5);
+    if code != 0 {
+        var p24: *mut i64 = p + 24;
+        unsafe { *p24 = vec_code_word(code); }
+    }
+    if tid != 0 {
+        var p32: *mut i64 = p + 32;
+        unsafe { *p32 = P_TID_TAG + tid; }
+    }
+    return p;
+}
+
+/// Drop what a Vec owns (its elements and its buffer, or one owner of a
+/// shared buffer), but not its header: Vec_drop of a heap header, or the
+/// whole drop of a header on the stack (LF13).
+pub fn Vec_drop_inplace(v: i64) {
+    if v == 0 { return; }
     var p: *mut i64 = v;
     var lp: *mut i64 = v + 8;
     var cp: *mut i64 = v + 16;
@@ -1074,7 +1098,11 @@ pub fn Vec_drop(v: i64) {
         else { vec_mem_drop_range(v, data, 0, len); }
         vec_buf_free(data);
     }
-    p_free(v);
+    // a stack header used again (a loop) starts empty
+    var zp: *mut i64 = v;
+    var zl: *mut i64 = v + 8;
+    var zc: *mut i64 = v + 16;
+    unsafe { *zp = 0; *zl = 0; *zc = 0; }
 }
 
 /// Whether this Vec is the last owner of its data: sole (cap >= 0) or the

@@ -83,10 +83,19 @@ const PE_W_IOCTL_SOCKET: i64 = 59;
 const PE_W_POLL: i64 = 60;
 const PE_W_WSA_ERROR: i64 = 61;
 const PE_W_GETHOSTBYNAME: i64 = 62;
+// epoll over AFD and an I/O completion port (competitive RT11, below)
+const PE_W_CREATE_IOCP: i64 = 63;           // kernel32 CreateIoCompletionPort
+const PE_W_GQCS_EX: i64 = 64;               // kernel32 GetQueuedCompletionStatusEx
+const PE_W_PQCS: i64 = 65;                  // kernel32 PostQueuedCompletionStatus
+const PE_W_NT_IOCTL: i64 = 66;              // ntdll NtDeviceIoControlFile
+const PE_W_NT_CANCEL: i64 = 67;             // ntdll NtCancelIoFileEx
+const PE_W_WSA_IOCTL: i64 = 68;             // ws2_32 WSAIoctl
 
 const PE_WTAG_SOCK: i64 = 281474976710656;    // 1 << 48
 const PE_WTAG_DIR: i64 = 562949953421312;     // 2 << 48
 const PE_WTAG_MASK: i64 = 0 - 281474976710656;
+const PE_WTAG_EVT: i64 = 844424930131968;     // 3 << 48: the eventfd
+const PE_WTAG_EP: i64 = 1125899906842624;     // 4 << 48: the epoll instance
 
 // Pseudo system calls of this layer (the runtime makes them only when
 // nat_os() == 1)
@@ -787,7 +796,319 @@ fn pe_win_raise(sig: i64) -> i64 {
 }
 
 /// Every system call of the Linux runtime (generic numbers), on Windows.
+// ─── epoll over AFD (competitive RT11) ──────────────────────────────────
+// The runtime's task scheduler (conc.fd) waits for sockets with Linux's
+// epoll: eventfd2 (19), epoll_create1 (20), epoll_ctl (21), epoll_pwait
+// (22). Here they are what wepoll and mio do on Windows: each socket a
+// task waits for has one AFD poll (IOCTL_AFD_POLL on its base handle)
+// outstanding, completed on one I/O completion port; epoll_pwait takes
+// completions off the port and re-arms the poll (epoll is level-triggered:
+// a socket still ready completes again at once). The eventfd is a key
+// posted to the port. One epoll instance (the runtime makes one). When
+// the AFD device cannot be opened, epoll_create1 says ENOSYS and the
+// runtime polls each socket as before.
+//
+// A registration: [0] its fd (tagged SOCKET), [8] the epoll events wanted,
+// [16] the data handed back, [24] its outstanding poll (0: none).
+// A poll: [0, 16) IO_STATUS_BLOCK, [16, 48) AFD_POLL_INFO (timeout, count
+// 1, the base handle, events | status), [48] its registration (0 once the
+// registration is gone), [56] 1 once cancelled, [64, 80) the cancel's
+// IO_STATUS_BLOCK.
+
+const PE_WEP_EVT_KEY: i64 = 2;
+
+var pe_wep_port: i64 = 0;       // the completion port (0: none yet)
+var pe_wep_afd: i64 = 0;        // the AFD device, on the port
+var pe_wep_lock: i64 = 0;       // *i64 spinlock: the table and the polls
+var pe_wep_keys: i64 = 0;       // open addressing: fd (0 empty, -1 removed)
+var pe_wep_regs: i64 = 0;       // the registration of each key
+var pe_wep_cap: i64 = 0;
+var pe_wep_used: i64 = 0;
+var pe_wep_evt_on: bool = false;    // the eventfd is in the epoll set
+var pe_wep_evt_data: i64 = 0;
+var pe_wep_ents: i64 = 0;       // OVERLAPPED_ENTRY[64]
+var pe_wep_n: i64 = 0;          // *u32: how many GetQueuedCompletionStatusEx took
+
+fn pe_wep_create() -> i64 {
+    if pe_wep_port != 0 { return PE_WTAG_EP + 1; }
+    var port: i64 = pe_w(PE_W_CREATE_IOCP, 0 - 1, 0, 0, 0);
+    if port == 0 { return 0 - 38; }
+    // \\.\GLOBALROOT\Device\Afd\Fides: the AFD driver, overlapped
+    var afd: i64 = nat_win_call(PE_W_CREATE_FILE, "\\\\.\\GLOBALROOT\\Device\\Afd\\Fides" as i64,
+        1048576, 3, 0, 3, 1073741824, 0, 0, 0, 0);       // SYNCHRONIZE, share r/w, OPEN_EXISTING, OVERLAPPED
+    if afd == 0 - 1 || afd == 0 {
+        pe_w(PE_W_CLOSE_HANDLE, port, 0, 0, 0);
+        return 0 - 38;
+    }
+    if pe_w(PE_W_CREATE_IOCP, afd, port, 0, 0) != port {
+        pe_w(PE_W_CLOSE_HANDLE, afd, 0, 0, 0);
+        pe_w(PE_W_CLOSE_HANDLE, port, 0, 0, 0);
+        return 0 - 38;
+    }
+    pe_wep_lock = pert_malloc(8);
+    pe_st(pe_wep_lock, 0);
+    pe_wep_cap = 64;
+    pe_wep_keys = pert_malloc(pe_wep_cap * 8);
+    pe_zero(pe_wep_keys, pe_wep_cap * 8);
+    pe_wep_regs = pert_malloc(pe_wep_cap * 8);
+    pe_zero(pe_wep_regs, pe_wep_cap * 8);
+    pe_wep_ents = pert_malloc(64 * 32);
+    pe_wep_n = pert_malloc(8);
+    pe_wep_afd = afd;
+    pe_wep_port = port;
+    return PE_WTAG_EP + 1;
+}
+
+/// The slot of fd in the table, or of where it would go (insert true).
+fn pe_wep_slot(fd: i64, insert: bool) -> i64 {
+    var mask: i64 = pe_wep_cap - 1;
+    var i: i64 = ((fd >> 2) * 40503) & mask;
+    var free: i64 = 0 - 1;
+    var n: i64 = 0;
+    while n < pe_wep_cap {
+        var k: i64 = pe_ld(pe_wep_keys + i * 8);
+        if k == fd { return i; }
+        if k == 0 {
+            if insert {
+                if free >= 0 { return free; }
+                return i;
+            }
+            return 0 - 1;
+        }
+        if k == 0 - 1 && free < 0 { free = i; }
+        i = (i + 1) & mask;
+        n = n + 1;
+    }
+    if insert { return free; }
+    return 0 - 1;
+}
+
+fn pe_wep_grow() {
+    var old_keys: i64 = pe_wep_keys;
+    var old_regs: i64 = pe_wep_regs;
+    var old_cap: i64 = pe_wep_cap;
+    pe_wep_cap = old_cap * 2;
+    pe_wep_keys = pert_malloc(pe_wep_cap * 8);
+    pe_zero(pe_wep_keys, pe_wep_cap * 8);
+    pe_wep_regs = pert_malloc(pe_wep_cap * 8);
+    pe_zero(pe_wep_regs, pe_wep_cap * 8);
+    pe_wep_used = 0;
+    var i: i64 = 0;
+    while i < old_cap {
+        var k: i64 = pe_ld(old_keys + i * 8);
+        if k != 0 && k != 0 - 1 {
+            var j: i64 = pe_wep_slot(k, true);
+            pe_st(pe_wep_keys + j * 8, k);
+            pe_st(pe_wep_regs + j * 8, pe_ld(old_regs + i * 8));
+            pe_wep_used = pe_wep_used + 1;
+        }
+        i = i + 1;
+    }
+    pert_free(old_keys);
+    pert_free(old_regs);
+}
+
+/// The AFD events for the epoll events of a registration.
+fn pe_wep_afd_events(ev: i64) -> i64 {
+    var a: i64 = 16 | 32 | 256;                          // ABORT, LOCAL_CLOSE, CONNECT_FAIL
+    if (ev & (1 | 8192)) != 0 { a = a | 1 | 2 | 8 | 128; }   // RECEIVE, EXPEDITED, DISCONNECT, ACCEPT
+    if (ev & 4) != 0 { a = a | 4; }                      // SEND
+    return a;
+}
+
+/// The epoll events for what an AFD poll reported.
+fn pe_wep_epoll_events(a: i64) -> i64 {
+    var e: i64 = 0;
+    if (a & (1 | 2 | 128)) != 0 { e = e | 1; }           // EPOLLIN
+    if (a & 4) != 0 { e = e | 4; }                       // EPOLLOUT
+    if (a & 8) != 0 { e = e | 1 | 8192; }                // EPOLLIN | EPOLLRDHUP
+    if (a & 16) != 0 { e = e | 8 | 16; }                 // EPOLLERR | EPOLLHUP
+    if (a & 32) != 0 { e = e | 16; }                     // EPOLLHUP
+    if (a & 256) != 0 { e = e | 8 | 4; }                 // EPOLLERR | EPOLLOUT
+    return e;
+}
+
+/// Submit the AFD poll of registration r (under the lock).
+fn pe_wep_arm(r: i64) {
+    var fd: i64 = pe_ld(r);
+    var sock: i64 = pe_win_sock(fd);
+    var base: i64 = sock;
+    var out: i64 = pert_malloc(16);
+    pe_zero(out, 16);
+    // SIO_BASE_HANDLE: the socket under any layered provider
+    if pe_w32(nat_win_call(PE_W_WSA_IOCTL, sock, 1207959586, 0, 0, out, 8, out + 8, 0, 0, 0)) == 0 {
+        base = pe_ld(out);
+    }
+    pert_free(out);
+    var op: i64 = pert_malloc(80);
+    pe_zero(op, 80);
+    pe_st(op + 16, 9223372036854775807);
+    pe_st(op + 24, 1);
+    pe_st(op + 32, base);
+    pe_st(op + 40, pe_wep_afd_events(pe_ld(r + 8)));
+    pe_st(op + 48, r);
+    var st: i64 = pe_w32(nat_win_call(PE_W_NT_IOCTL, pe_wep_afd, 0, 0, op, op, 73764, op + 16, 32, op + 16, 32));
+    if st != 0 && st != 259 {
+        // refused: no completion will come; report it ready at the next wait
+        pert_free(op);
+        pe_st(r + 24, 0);
+        pe_w(PE_W_PQCS, pe_wep_port, 0, 3, r);
+        return;
+    }
+    pe_st(r + 24, op);
+}
+
+/// Cancel the outstanding poll of r (it is freed when its completion comes).
+fn pe_wep_cancel(r: i64) {
+    var op: i64 = pe_ld(r + 24);
+    if op == 0 { return; }
+    pe_st(op + 56, 1);
+    pe_st(op + 48, 0);
+    pe_st(r + 24, 0);
+    nat_win_call(PE_W_NT_CANCEL, pe_wep_afd, op, op + 64, 0, 0, 0, 0, 0, 0, 0);
+}
+
+fn pe_wep_ctl(op: i64, fd: i64, ev: i64) -> i64 {
+    if pe_wep_port == 0 { return 0 - 9; }                    // EBADF
+    var events: i64 = 0;
+    var data: i64 = 0;
+    if ev != 0 {
+        events = pe_win_ld32(ev);
+        data = pe_ld(ev + 4);                                // packed on x86-64
+    }
+    if (fd & PE_WTAG_MASK) == PE_WTAG_EVT {
+        if op == 2 { pe_wep_evt_on = false; } else { pe_wep_evt_on = true; pe_wep_evt_data = data; }
+        return 0;
+    }
+    if !pe_win_is_sock(fd) { return 0 - 1; }                 // EPERM: only sockets
+    pe_lock(pe_wep_lock);
+    var slot: i64 = pe_wep_slot(fd, false);
+    var r: i64 = 0;
+    if slot >= 0 { r = pe_ld(pe_wep_regs + slot * 8); }
+    var res: i64 = 0;
+    if op == 1 {                                             // ADD
+        if r != 0 {
+            res = 0 - 17;                                    // EEXIST
+        } else {
+            if (pe_wep_used + 1) * 2 > pe_wep_cap { pe_wep_grow(); }
+            var ns: i64 = pe_wep_slot(fd, true);
+            r = pert_malloc(32);
+            pe_zero(r, 32);
+            pe_st(r, fd);
+            pe_st(r + 8, events);
+            pe_st(r + 16, data);
+            pe_st(pe_wep_keys + ns * 8, fd);
+            pe_st(pe_wep_regs + ns * 8, r);
+            pe_wep_used = pe_wep_used + 1;
+            pe_wep_arm(r);
+        }
+    } else if op == 3 {                                      // MOD
+        if r == 0 {
+            res = 0 - 2;                                     // ENOENT
+        } else {
+            pe_st(r + 8, events);
+            pe_st(r + 16, data);
+            pe_wep_cancel(r);
+            pe_wep_arm(r);
+        }
+    } else if op == 2 {                                      // DEL
+        if r == 0 {
+            res = 0 - 2;
+        } else {
+            pe_wep_cancel(r);
+            pe_st(pe_wep_keys + slot * 8, 0 - 1);
+            pe_st(pe_wep_regs + slot * 8, 0);
+            pe_wep_used = pe_wep_used - 1;
+            pert_free(r);
+        }
+    }
+    pe_unlock(pe_wep_lock);
+    return res;
+}
+
+fn pe_wep_out(events_out: i64, k: i64, ev: i64, data: i64) {
+    var e: i64 = events_out + k * 12;                        // packed epoll_event
+    pe_win_st32(e, ev);
+    var i: i64 = 0;
+    while i < 8 {
+        pe_stb(e + 4 + i, (data >> (i * 8)) & 255);
+        i = i + 1;
+    }
+}
+
+fn pe_wep_wait(events_out: i64, maxev: i64, ms: i64) -> i64 {
+    if pe_wep_port == 0 { return 0 - 9; }
+    var want: i64 = maxev;
+    if want > 64 { want = 64; }
+    if want < 1 { return 0 - 22; }                           // EINVAL
+    var timeout: i64 = ms;
+    if ms < 0 { timeout = 4294967295; }                      // INFINITE
+    pe_st(pe_wep_n, 0);
+    if pe_w32(nat_win_call(PE_W_GQCS_EX, pe_wep_port, pe_wep_ents, want, pe_wep_n, timeout, 0, 0, 0, 0, 0)) == 0 {
+        return 0;                                            // the time passed
+    }
+    var got: i64 = pe_win_ld32(pe_wep_n);
+    var k: i64 = 0;
+    pe_lock(pe_wep_lock);
+    var i: i64 = 0;
+    while i < got {
+        var ent: i64 = pe_wep_ents + i * 32;
+        var key: i64 = pe_ld(ent);
+        var ov: i64 = pe_ld(ent + 8);
+        if key == PE_WEP_EVT_KEY {
+            if pe_wep_evt_on {
+                pe_wep_out(events_out, k, 1, pe_wep_evt_data);
+                k = k + 1;
+            }
+        } else if key == 3 {
+            // a poll AFD refused: the registration, reported ready
+            var r3: i64 = ov;
+            if r3 != 0 && pe_wep_slot(pe_ld(r3), false) >= 0 {
+                pe_wep_out(events_out, k, pe_ld(r3 + 8) | 8, pe_ld(r3 + 16));
+                k = k + 1;
+            }
+        } else if ov != 0 {
+            var op: i64 = ov;
+            var r: i64 = pe_ld(op + 48);
+            if pe_ld(op + 56) == 0 && r != 0 {
+                pe_st(r + 24, 0);
+                var got_ev: i64 = pe_wep_epoll_events(pe_win_ld32(op + 40));
+                var shown: i64 = got_ev & (pe_ld(r + 8) | 8 | 16);
+                if shown != 0 {
+                    pe_wep_out(events_out, k, shown, pe_ld(r + 16));
+                    k = k + 1;
+                }
+                // level-triggered: wait again (completes at once if still ready)
+                pe_wep_arm(r);
+            }
+            pert_free(op);
+        }
+        i = i + 1;
+    }
+    pe_unlock(pe_wep_lock);
+    return k;
+}
+
+/// Is fd one of the epoll emulation's own (the eventfd, the instance)?
+fn pe_wep_own(fd: i64) -> bool {
+    var t: i64 = fd & PE_WTAG_MASK;
+    return fd > 2 && (t == PE_WTAG_EVT || t == PE_WTAG_EP);
+}
+
 pub fn pe_win_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64 {
+    // epoll over AFD (RT11): the eventfd and the epoll instance
+    if n == 19 { return PE_WTAG_EVT + 1; }                  // eventfd2
+    if n == 20 { return pe_wep_create(); }                   // epoll_create1
+    if n == 21 { return pe_wep_ctl(b, c, d); }               // epoll_ctl
+    if n == 22 { return pe_wep_wait(b, c, d); }              // epoll_pwait
+    if (n == 63 || n == 64 || n == 57) && pe_wep_own(a) {
+        if n == 64 && (a & PE_WTAG_MASK) == PE_WTAG_EVT && pe_wep_port != 0 {
+            pe_w(PE_W_PQCS, pe_wep_port, 0, PE_WEP_EVT_KEY, 0);
+            return 8;
+        }
+        if n == 63 { pe_st(b, 1); return 8; }
+        return 0;
+    }
     if n == 63 { return pe_win_read(a, b, c); }
     if n == 64 { return pe_win_write(a, b, c); }
     if n == 56 { return pe_win_open(b, c); }                 // openat

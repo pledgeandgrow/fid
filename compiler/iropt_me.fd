@@ -1,0 +1,1729 @@
+// compiler/iropt_me.fd — the mid-end passes of docs/roadmap/llvm-roadmap.md
+// Track ME that restructure code, run by iropt_native (compiler/iropt.fd)
+// before native code generation:
+//
+//   ME20, ME21  inlining across functions with a cost model, bottom-up over
+//               the call graph: a callee is inlined after its own calls
+//               were, so its size is known; callees of several blocks
+//               (the call's block is split, the callee's returns jump to
+//               the rest)
+//   ME22        loops in canonical form: a preheader, one latch, exits
+//               only loop blocks reach
+//   ME23        induction variables: in an @wrapping function, i * c in a
+//               loop becomes a second variable stepped with i
+//   ME24        full unrolling of a one-block loop of a few iterations
+//               known when it is entered
+//   ME26        scalar replacement: a struct local whose fields are only
+//               loaded and stored becomes one local per field
+//   ME28        switch lowering: a chain of `x == k` tests on one value
+//               (a match) becomes a balanced tree of comparisons
+//
+// Every pass is off unless named in FID_IROPT_ON (a comma list, or "all"),
+// and FID_IROPT_OFF still turns it off: they have not been run on the
+// suite yet. What they must respect (the ownership lowering, proposal 0004):
+// owned slots are allocas zeroed in their function's entry block; the
+// dup/drop calls are calls with effects and are never moved; a move stores
+// 0. None of these passes reorders a call or a store; inlining copies them.
+//
+// ME25 (loop versioning) and ME27 (small structs returned in registers)
+// need the backends: a check-free copy needs a way to tell the backend
+// that its checks are proved (checks.fd decides them there), and a return
+// in two registers is a calling convention of pe_ir/nat_ir. They are not
+// here.
+
+module compiler::iropt_me;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::checks;
+
+/// Is mid-end pass `name` on? Only when FID_IROPT_ON names it (or "all")
+/// and FID_IROPT_OFF does not.
+pub fn ime_on(name: str) -> bool {
+    var on: str = p_getenv("FID_IROPT_ON");
+    if (on as i64) == 0 || str_len(on) == 0 { return false; }
+    var list: str = "," + on + ",";
+    if !str_contains(list, "," + name + ",") && !str_contains(list, ",all,") { return false; }
+    var off: str = p_getenv("FID_IROPT_OFF");
+    if (off as i64) == 0 || str_len(off) == 0 { return true; }
+    return !str_contains("," + off + ",", "," + name + ",");
+}
+
+// --- Helpers ----------------------------------------------------------------
+
+/// A new instruction in `f` that is in no block yet (its type from `inst`).
+fn ime_detached(f: &mut IrFunction, inst: Inst) -> i64 {
+    var id: i64 = IrFunction_emit(f, inst);
+    var last: i64 = f.current_block_idx;
+    var blk: BasicBlock = f.blocks.get(last);
+    blk.instructions.pop();
+    f.blocks.set(last, blk);
+    return id;
+}
+
+fn ime_has(v: Vec<i64>, x: i64) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == x { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ime_size(f: &IrFunction) -> i64 {
+    var n: i64 = 0;
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        n = n + f.blocks.get(b).instructions.len();
+        b = b + 1;
+    }
+    return n;
+}
+
+fn ime_block_index(f: &IrFunction, bid: i64) -> i64 {
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        if f.blocks.get(b).id == bid { return b; }
+        b = b + 1;
+    }
+    return -1;
+}
+
+/// The value `id` names after a copy (map: old id -> new id + 1).
+fn ime_v(map: &Vec<i64>, id: i64) -> i64 {
+    if id >= 0 && id < map.len() && map.get(id) != 0 { return map.get(id) - 1; }
+    return id;
+}
+
+fn ime_vs(map: &Vec<i64>, v: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(ime_v(map, v.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// `inst` with its values renamed through `vm` and its block targets
+/// through `bm` (both: old -> new + 1, 0 = the same).
+fn ime_remap(inst: Inst, vm: &Vec<i64>, bm: &Vec<i64>) -> Inst {
+    match inst {
+        Inst::BinOp(op, a, b, t) => { return Inst::BinOp(op, ime_v(vm, a), ime_v(vm, b), t); }
+        Inst::UnaryOp(op, a, t) => { return Inst::UnaryOp(op, ime_v(vm, a), t); }
+        Inst::Load(p, t) => { return Inst::Load(ime_v(vm, p), t); }
+        Inst::Store(p, v, t) => { return Inst::Store(ime_v(vm, p), ime_v(vm, v), t); }
+        Inst::StructCopy(d, s0, t) => { return Inst::StructCopy(ime_v(vm, d), ime_v(vm, s0), t); }
+        Inst::GetFieldPtr(p, idx, t) => { return Inst::GetFieldPtr(ime_v(vm, p), idx, t); }
+        Inst::GetElemPtr(p, i, t) => { return Inst::GetElemPtr(ime_v(vm, p), ime_v(vm, i), t); }
+        Inst::Jump(t) => { return Inst::Jump(ime_v(bm, t)); }
+        Inst::Branch(c, t, e) => { return Inst::Branch(ime_v(vm, c), ime_v(bm, t), ime_v(bm, e)); }
+        Inst::Return(rv) => {
+            match rv {
+                OptValueId::Some(v) => { return Inst::Return(OptValueId::Some(ime_v(vm, v))); }
+                OptValueId::None => {}
+            }
+        }
+        Inst::Call(nm, args, t, e) => { return Inst::Call(nm, ime_vs(vm, args), t, e); }
+        Inst::CallPtr(fp, args, t, e, z) => { return Inst::CallPtr(ime_v(vm, fp), ime_vs(vm, args), t, e, z); }
+        Inst::DynCall(a1, a2, args, t, e) => { return Inst::DynCall(a1, a2, ime_vs(vm, args), t, e); }
+        Inst::MakeDyn(v, a1, a2) => { return Inst::MakeDyn(ime_v(vm, v), a1, a2); }
+        Inst::BitCast(v, a, b) => { return Inst::BitCast(ime_v(vm, v), a, b); }
+        Inst::IntExtend(v, a, b) => { return Inst::IntExtend(ime_v(vm, v), a, b); }
+        Inst::IntTrunc(v, a, b) => { return Inst::IntTrunc(ime_v(vm, v), a, b); }
+        Inst::IntToFloat(v, a, b) => { return Inst::IntToFloat(ime_v(vm, v), a, b); }
+        Inst::FloatToInt(v, a, b) => { return Inst::FloatToInt(ime_v(vm, v), a, b); }
+        Inst::Print(v, t) => { return Inst::Print(ime_v(vm, v), t); }
+        _ => {}
+    }
+    return inst;
+}
+
+/// Give copy `nid` (in `f`) the source line of `oid` (in `from`): a panic
+/// in copied code still says where it is (types, regions, effects stay
+/// the copy's own).
+fn ime_copy_line(f: &mut IrFunction, from: &IrFunction, oid: i64, nid: i64) {
+    match IrFunction_get_meta(from, oid) {
+        OptValueMeta::Some(om) => {
+            match IrFunction_get_meta(f, nid) {
+                OptValueMeta::Some(nm) => {
+                    var m2: ValueMeta = nm;
+                    m2.source_line = om.source_line;
+                    IrFunction_set_meta(f, nid, m2);
+                }
+                OptValueMeta::None => {}
+            }
+        }
+        OptValueMeta::None => {}
+    }
+}
+
+/// ime_copy_line within one function.
+fn ime_copy_line_self(f: &mut IrFunction, oid: i64, nid: i64) {
+    var line: OptU64 = OptU64::None;
+    var have: bool = false;
+    match IrFunction_get_meta(f, oid) {
+        OptValueMeta::Some(om) => { line = om.source_line; have = true; }
+        OptValueMeta::None => {}
+    }
+    if !have { return; }
+    match IrFunction_get_meta(f, nid) {
+        OptValueMeta::Some(nm) => {
+            var m2: ValueMeta = nm;
+            m2.source_line = line;
+            IrFunction_set_meta(f, nid, m2);
+        }
+        OptValueMeta::None => {}
+    }
+}
+
+/// The value type of `id` (I64 when unknown).
+fn ime_type(f: &IrFunction, id: i64) -> IrType {
+    match IrFunction_get_meta(f, id) {
+        OptValueMeta::Some(m) => { return m.ty; }
+        OptValueMeta::None => {}
+    }
+    return IrType::I64;
+}
+
+/// The constant `id` holds, as OptI64 (i64 constants only).
+fn ime_const(f: &IrFunction, id: i64) -> OptI64 {
+    match peir_inst_of(f, id) {
+        Inst::ConstInt(v, t) => {
+            if ir_type_eq(t, IrType::I64) { return OptI64::Some(v); }
+        }
+        _ => {}
+    }
+    return OptI64::None;
+}
+
+/// Every block's predecessor list again, from the terminators.
+fn ime_recompute_preds(f: &mut IrFunction) {
+    var n: i64 = f.blocks.len();
+    var preds: Vec<Vec<i64>> = Vec::new();
+    var b: i64 = 0;
+    while b < n {
+        preds.push(Vec::new());
+        b = b + 1;
+    }
+    b = 0;
+    while b < n {
+        var ids: Vec<i64> = f.blocks.get(b).instructions;
+        if ids.len() > 0 {
+            var from: i64 = f.blocks.get(b).id;
+            match peir_inst_of(f, ids.get(ids.len() - 1)) {
+                Inst::Jump(t) => { ime_add_pred(f, &mut preds, t, from); }
+                Inst::Branch(_, t, e) => {
+                    ime_add_pred(f, &mut preds, t, from);
+                    if e != t { ime_add_pred(f, &mut preds, e, from); }
+                }
+                _ => {}
+            }
+        }
+        b = b + 1;
+    }
+    b = 0;
+    while b < n {
+        var blk: BasicBlock = f.blocks.get(b);
+        blk.predecessors = preds.get(b);
+        f.blocks.set(b, blk);
+        b = b + 1;
+    }
+}
+
+fn ime_add_pred(f: &IrFunction, preds: &mut Vec<Vec<i64>>, target: i64, from: i64) {
+    var ti: i64 = ime_block_index(f, target);
+    if ti < 0 { return; }
+    var ps: Vec<i64> = preds.get(ti);
+    ps.push(from);
+    preds.set(ti, ps);
+}
+
+/// The terminator of block index `bi` with every edge to `from` sent to `to`.
+fn ime_retarget(f: &mut IrFunction, bi: i64, from: i64, to: i64) {
+    var ids: Vec<i64> = f.blocks.get(bi).instructions;
+    if ids.len() == 0 { return; }
+    var tid: i64 = ids.get(ids.len() - 1);
+    match peir_inst_of(f, tid) {
+        Inst::Jump(t) => { if t == from { IrFunction_set_inst(f, tid, Inst::Jump(to)); } }
+        Inst::Branch(c, t, e) => {
+            var nt: i64 = t;
+            var ne: i64 = e;
+            if t == from { nt = to; }
+            if e == from { ne = to; }
+            IrFunction_set_inst(f, tid, Inst::Branch(c, nt, ne));
+        }
+        _ => {}
+    }
+}
+
+/// A new block (its index) holding just `Jump(to)`.
+fn ime_jump_block(f: &mut IrFunction, to: i64) -> i64 {
+    var nid: i64 = IrFunction_new_block(f);
+    var ni: i64 = f.blocks.len() - 1;
+    var jid: i64 = ime_detached(f, Inst::Jump(to));
+    var blk: BasicBlock = f.blocks.get(ni);
+    blk.instructions.push(jid);
+    f.blocks.set(ni, blk);
+    return nid;
+}
+
+/// Put allocation `id` at the front of the entry block.
+fn ime_into_entry(f: &mut IrFunction, id: i64) {
+    var blk: BasicBlock = f.blocks.get(0);
+    var ids: Vec<i64> = Vec::new();
+    ids.push(id);
+    var k: i64 = 0;
+    while k < blk.instructions.len() {
+        ids.push(blk.instructions.get(k));
+        k = k + 1;
+    }
+    blk.instructions = ids;
+    f.blocks.set(0, blk);
+}
+
+// --- The CFG, dominators and loops -------------------------------------------
+
+pub struct ImeCfg {
+    pub n: i64,
+    pub index: Vec<i64>,
+    pub succs: Vec<Vec<i64>>,
+    pub preds: Vec<Vec<i64>>,
+    pub rpo_num: Vec<i64>,
+    pub idom: Vec<i64>,
+}
+
+fn ime_edge(succs: &mut Vec<Vec<i64>>, preds: &mut Vec<Vec<i64>>, index: &Vec<i64>, from: i64, target: i64) {
+    if target < 0 || target >= index.len() { return; }
+    var t: i64 = index.get(target);
+    if t < 0 { return; }
+    var s: Vec<i64> = succs.get(from);
+    s.push(t);
+    succs.set(from, s);
+    var p: Vec<i64> = preds.get(t);
+    p.push(from);
+    preds.set(t, p);
+}
+
+fn ime_cfg(f: &IrFunction) -> ImeCfg {
+    var n: i64 = f.blocks.len();
+    var max_id: i64 = 0;
+    var b: i64 = 0;
+    while b < n {
+        if f.blocks.get(b).id > max_id { max_id = f.blocks.get(b).id; }
+        b = b + 1;
+    }
+    var index: Vec<i64> = Vec::new();
+    while index.len() <= max_id { index.push(-1); }
+    b = 0;
+    while b < n {
+        index.set(f.blocks.get(b).id, b);
+        b = b + 1;
+    }
+    var succs: Vec<Vec<i64>> = Vec::new();
+    var preds: Vec<Vec<i64>> = Vec::new();
+    b = 0;
+    while b < n {
+        succs.push(Vec::new());
+        preds.push(Vec::new());
+        b = b + 1;
+    }
+    b = 0;
+    while b < n {
+        var ids: Vec<i64> = f.blocks.get(b).instructions;
+        if ids.len() > 0 {
+            match peir_inst_of(f, ids.get(ids.len() - 1)) {
+                Inst::Jump(t) => { ime_edge(&mut succs, &mut preds, &index, b, t); }
+                Inst::Branch(_, t, e) => {
+                    ime_edge(&mut succs, &mut preds, &index, b, t);
+                    if e != t { ime_edge(&mut succs, &mut preds, &index, b, e); }
+                }
+                _ => {}
+            }
+        }
+        b = b + 1;
+    }
+    var rpo_num: Vec<i64> = Vec::new();
+    var idom: Vec<i64> = Vec::new();
+    b = 0;
+    while b < n { rpo_num.push(-1); idom.push(-1); b = b + 1; }
+    if n == 0 {
+        return ImeCfg { n: n, index: index, succs: succs, preds: preds, rpo_num: rpo_num, idom: idom };
+    }
+    // postorder from the entry
+    var post: Vec<i64> = Vec::new();
+    var state: Vec<i64> = peir_zeros(n);
+    var st_b: Vec<i64> = Vec::new();
+    var st_next: Vec<i64> = Vec::new();
+    st_b.push(0);
+    st_next.push(0);
+    state.set(0, 1);
+    while st_b.len() > 0 {
+        var top: i64 = st_b.len() - 1;
+        var cur: i64 = st_b.get(top);
+        var nx: i64 = st_next.get(top);
+        var cs: Vec<i64> = succs.get(cur);
+        if nx < cs.len() {
+            st_next.set(top, nx + 1);
+            var sx: i64 = cs.get(nx);
+            if state.get(sx) == 0 {
+                state.set(sx, 1);
+                st_b.push(sx);
+                st_next.push(0);
+            }
+        } else {
+            post.push(cur);
+            st_b.pop();
+            st_next.pop();
+        }
+    }
+    var rpo: Vec<i64> = Vec::new();
+    var k: i64 = post.len() - 1;
+    while k >= 0 {
+        rpo_num.set(post.get(k), rpo.len());
+        rpo.push(post.get(k));
+        k = k - 1;
+    }
+    idom.set(0, 0);
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        var r: i64 = 1;
+        while r < rpo.len() {
+            var bb: i64 = rpo.get(r);
+            var ps: Vec<i64> = preds.get(bb);
+            var nd: i64 = -1;
+            var pi: i64 = 0;
+            while pi < ps.len() {
+                var p: i64 = ps.get(pi);
+                if idom.get(p) >= 0 {
+                    if nd < 0 { nd = p; }
+                    else {
+                        var x: i64 = p;
+                        var y: i64 = nd;
+                        while x != y {
+                            while rpo_num.get(x) > rpo_num.get(y) { x = idom.get(x); }
+                            while rpo_num.get(y) > rpo_num.get(x) { y = idom.get(y); }
+                        }
+                        nd = x;
+                    }
+                }
+                pi = pi + 1;
+            }
+            if nd >= 0 && idom.get(bb) != nd {
+                idom.set(bb, nd);
+                changed = true;
+            }
+            r = r + 1;
+        }
+    }
+    return ImeCfg { n: n, index: index, succs: succs, preds: preds, rpo_num: rpo_num, idom: idom };
+}
+
+fn ime_dom(cfg: &ImeCfg, a: i64, b: i64) -> bool {
+    if a < 0 || b < 0 || cfg.rpo_num.get(a) < 0 || cfg.rpo_num.get(b) < 0 { return false; }
+    var x: i64 = b;
+    var steps: i64 = 0;
+    while steps <= cfg.n {
+        if x == a { return true; }
+        if x == 0 { return false; }
+        x = cfg.idom.get(x);
+        steps = steps + 1;
+    }
+    return false;
+}
+
+/// Remove the blocks the entry no longer reaches.
+fn ime_drop_unreachable(f: &mut IrFunction) {
+    var cfg: ImeCfg = ime_cfg(f);
+    if cfg.n == 0 { return; }
+    var keep: Vec<BasicBlock> = Vec::new();
+    var gone: bool = false;
+    var b: i64 = 0;
+    while b < cfg.n {
+        if b == 0 || cfg.rpo_num.get(b) >= 0 { keep.push(f.blocks.get(b)); } else { gone = true; }
+        b = b + 1;
+    }
+    if !gone { return; }
+    f.blocks = keep;
+    if f.current_block_idx >= f.blocks.len() { f.current_block_idx = f.blocks.len() - 1; }
+    ime_recompute_preds(f);
+}
+
+/// The blocks (indexes, flags) of the loop with header `h` and latches `lat`.
+fn ime_loop_body(cfg: &ImeCfg, h: i64, lat: Vec<i64>) -> Vec<i64> {
+    var body: Vec<i64> = peir_zeros(cfg.n);
+    body.set(h, 1);
+    var stack: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < lat.len() {
+        if body.get(lat.get(i)) == 0 {
+            body.set(lat.get(i), 1);
+            stack.push(lat.get(i));
+        }
+        i = i + 1;
+    }
+    while stack.len() > 0 {
+        var x: i64 = stack.pop();
+        var ps: Vec<i64> = cfg.preds.get(x);
+        var k: i64 = 0;
+        while k < ps.len() {
+            var p: i64 = ps.get(k);
+            if body.get(p) == 0 && cfg.rpo_num.get(p) >= 0 {
+                body.set(p, 1);
+                stack.push(p);
+            }
+            k = k + 1;
+        }
+    }
+    return body;
+}
+
+/// The header (index) of every natural loop, innermost not first.
+fn ime_headers(cfg: &ImeCfg) -> Vec<i64> {
+    var hs: Vec<i64> = Vec::new();
+    var b: i64 = 0;
+    while b < cfg.n {
+        var ss: Vec<i64> = cfg.succs.get(b);
+        var k: i64 = 0;
+        while k < ss.len() {
+            var h: i64 = ss.get(k);
+            if ime_dom(cfg, h, b) && !ime_has(hs, h) { hs.push(h); }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    return hs;
+}
+
+fn ime_latches(cfg: &ImeCfg, h: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var ps: Vec<i64> = cfg.preds.get(h);
+    var k: i64 = 0;
+    while k < ps.len() {
+        if ime_dom(cfg, h, ps.get(k)) { out.push(ps.get(k)); }
+        k = k + 1;
+    }
+    return out;
+}
+
+// --- ME20, ME21: inlining -----------------------------------------------------
+
+/// A callee of at most this many instructions is inlined at any call site.
+const IME_INLINE_MAX: i64 = 60;
+/// A callee with a single call site in the module: up to this size.
+const IME_INLINE_ONCE_MAX: i64 = 400;
+/// No caller grows past this many instructions by inlining.
+const IME_CALLER_MAX: i64 = 4000;
+/// Call sites inlined into one function at most (one pass).
+const IME_SITES_MAX: i64 = 64;
+
+fn ime_scalar_or_void(t: IrType) -> bool {
+    match t {
+        IrType::Void => { return true; }
+        IrType::I8 => { return true; }
+        IrType::I16 => { return true; }
+        IrType::I32 => { return true; }
+        IrType::I64 => { return true; }
+        IrType::U8 => { return true; }
+        IrType::U16 => { return true; }
+        IrType::U32 => { return true; }
+        IrType::U64 => { return true; }
+        IrType::F32 => { return true; }
+        IrType::F64 => { return true; }
+        IrType::Bool => { return true; }
+        IrType::Ptr(_) => { return true; }
+        _ => { return false; }
+    }
+}
+
+/// May `g`'s body be copied into another function?
+fn ime_callee_ok(g: &IrFunction) -> bool {
+    if g.name == "main" || g.is_interrupt || g.blocks.len() == 0 { return false; }
+    if g.drop_locals.len() > 0 || g.zeroize_locals.len() > 0 || g.persist_vars.len() > 0 { return false; }
+    if !ime_scalar_or_void(g.ret_ty) { return false; }
+    var b: i64 = 0;
+    while b < g.blocks.len() {
+        var blk: BasicBlock = g.blocks.get(b);
+        if blk.params.len() > 0 { return false; }
+        var k: i64 = 0;
+        while k < blk.instructions.len() {
+            match peir_inst_of(g, blk.instructions.get(k)) {
+                Inst::Asm(_, _, _, _) => { return false; }
+                Inst::TryUnwrap(_, _, _, _) => { return false; }
+                Inst::RegionBegin(_, _, _, _) => { return false; }
+                Inst::RegionEnd(_, _, _) => { return false; }
+                Inst::PersistLoad(_, _, _) => { return false; }
+                Inst::PersistSave(_, _) => { return false; }
+                Inst::GradBegin(_) => { return false; }
+                Inst::Backward(_) => { return false; }
+                Inst::Call(cn, _, _, _) => { if cn == g.name { return false; } }
+                _ => {}
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    return true;
+}
+
+/// Copy `g` into `f` at the call `call_id`, position `k` of block index
+/// `bi`: the block is split after the call, the callee's blocks come in
+/// (its parameters are the arguments, its allocas go to f's entry block),
+/// each return stores the result and jumps to the rest, and the call
+/// becomes a load of the result there.
+fn ime_inline_site(f: &mut IrFunction, g: &IrFunction, bi: i64, k: i64, call_id: i64, args: Vec<i64>) {
+    // split the block: what comes before the call stays, the rest moves
+    var all: Vec<i64> = f.blocks.get(bi).instructions;
+    var before: Vec<i64> = Vec::new();
+    var m: i64 = 0;
+    while m < k {
+        before.push(all.get(m));
+        m = m + 1;
+    }
+    var rest_tail: Vec<i64> = Vec::new();
+    var j: i64 = k + 1;
+    while j < all.len() {
+        rest_tail.push(all.get(j));
+        j = j + 1;
+    }
+    var hb0: BasicBlock = f.blocks.get(bi);
+    hb0.instructions = before;
+    f.blocks.set(bi, hb0);
+    var cont_id: i64 = IrFunction_new_block(f);
+    var ci: i64 = f.blocks.len() - 1;
+    var has_ret: bool = true;
+    match g.ret_ty {
+        IrType::Void => { has_ret = false; }
+        _ => {}
+    }
+    var rslot: i64 = -1;
+    var rest: Vec<i64> = Vec::new();
+    if has_ret {
+        rslot = ime_detached(f, Inst::Alloca(g.ret_ty, Region::Stack));
+        ime_into_entry(f, rslot);
+        IrFunction_set_inst(f, call_id, Inst::Load(rslot, g.ret_ty));
+        rest.push(call_id);
+    }
+    j = 0;
+    while j < rest_tail.len() {
+        rest.push(rest_tail.get(j));
+        j = j + 1;
+    }
+    var cont: BasicBlock = f.blocks.get(ci);
+    cont.instructions = rest;
+    f.blocks.set(ci, cont);
+    // the callee's values and blocks
+    var vm: Vec<i64> = peir_zeros(g.next_value + 2);
+    var p: i64 = 0;
+    while p < g.params.len() && p < args.len() {
+        var pid: i64 = g.params.get(p).id;
+        if pid >= 0 && pid < vm.len() { vm.set(pid, args.get(p) + 1); }
+        p = p + 1;
+    }
+    var bm: Vec<i64> = peir_zeros(g.next_block + 2);
+    var new_idx: Vec<i64> = Vec::new();
+    var gb: i64 = 0;
+    while gb < g.blocks.len() {
+        var nid: i64 = IrFunction_new_block(f);
+        var gid: i64 = g.blocks.get(gb).id;
+        if gid >= 0 && gid < bm.len() { bm.set(gid, nid + 1); }
+        new_idx.push(f.blocks.len() - 1);
+        gb = gb + 1;
+    }
+    // pass 1: every instruction gets its id (with its own type)
+    gb = 0;
+    while gb < g.blocks.len() {
+        var gids: Vec<i64> = g.blocks.get(gb).instructions;
+        var q: i64 = 0;
+        while q < gids.len() {
+            var gi: i64 = gids.get(q);
+            var nv: i64 = ime_detached(f, peir_inst_of(g, gi));
+            ime_copy_line(f, g, gi, nv);
+            if gi >= 0 && gi < vm.len() { vm.set(gi, nv + 1); }
+            q = q + 1;
+        }
+        gb = gb + 1;
+    }
+    // pass 2: operands, targets, returns; allocas to the entry block
+    gb = 0;
+    while gb < g.blocks.len() {
+        var gids2: Vec<i64> = g.blocks.get(gb).instructions;
+        var out: Vec<i64> = Vec::new();
+        var q2: i64 = 0;
+        while q2 < gids2.len() {
+            var gi2: i64 = gids2.get(q2);
+            var ni: i64 = ime_v(&vm, gi2);
+            var inst: Inst = peir_inst_of(g, gi2);
+            match inst {
+                Inst::Alloca(_, _) => {
+                    IrFunction_set_inst(f, ni, inst);
+                    ime_into_entry(f, ni);
+                }
+                Inst::Return(rv) => {
+                    match rv {
+                        OptValueId::Some(v) => {
+                            if has_ret {
+                                var st: i64 = ime_detached(f, Inst::Store(rslot, ime_v(&vm, v), OptIrType::Some(g.ret_ty)));
+                                out.push(st);
+                            }
+                        }
+                        OptValueId::None => {}
+                    }
+                    IrFunction_set_inst(f, ni, Inst::Jump(cont_id));
+                    out.push(ni);
+                }
+                _ => {
+                    IrFunction_set_inst(f, ni, ime_remap(inst, &vm, &bm));
+                    out.push(ni);
+                }
+            }
+            q2 = q2 + 1;
+        }
+        var nb: BasicBlock = f.blocks.get(new_idx.get(gb));
+        nb.instructions = out;
+        f.blocks.set(new_idx.get(gb), nb);
+        gb = gb + 1;
+    }
+    // the call's block ends in a jump into the callee (its allocas, if it
+    // is the entry block, are already at its front)
+    var entry_new: i64 = ime_v(&bm, g.blocks.get(0).id);
+    var jid: i64 = ime_detached(f, Inst::Jump(entry_new));
+    var hb: BasicBlock = f.blocks.get(bi);
+    hb.instructions.push(jid);
+    f.blocks.set(bi, hb);
+    ime_recompute_preds(f);
+}
+
+/// Inline the call sites of `f` the cost model accepts; true when any was.
+fn ime_inline_function(module: &IrModule, f: &mut IrFunction, names: i64, sites: &Vec<i64>) -> bool {
+    var any: bool = false;
+    var done: i64 = 0;
+    var again: bool = true;
+    while again && done < IME_SITES_MAX {
+        again = false;
+        var b: i64 = 0;
+        while b < f.blocks.len() && !again {
+            var ids: Vec<i64> = f.blocks.get(b).instructions;
+            var k: i64 = 0;
+            while k < ids.len() && !again {
+                match peir_inst_of(f, ids.get(k)) {
+                    Inst::Call(cn, args, _, _) => {
+                        if cn != f.name && HashMap_contains(names, cn) {
+                            var gi: i64 = HashMap_get(names, cn) - 1;
+                            var g: IrFunction = module.functions.get(gi).func;
+                            var cost: i64 = ime_size(&g);
+                            var cheap: bool = cost <= IME_INLINE_MAX || (sites.get(gi) == 1 && cost <= IME_INLINE_ONCE_MAX);
+                            if cheap && ime_size(f) + cost <= IME_CALLER_MAX && g.is_wrapping == f.is_wrapping
+                                && args.len() == g.params.len() && ime_callee_ok(&g) {
+                                ime_inline_site(f, &g, b, k, ids.get(k), args);
+                                any = true;
+                                again = true;
+                                done = done + 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                k = k + 1;
+            }
+            b = b + 1;
+        }
+    }
+    return any;
+}
+
+/// ME20, ME21: inline across the module, callees before their callers
+/// (post-order over the call graph), so a callee's size is its size after
+/// its own inlining.
+pub fn ime_inline(module: &mut IrModule) {
+    var n: i64 = module.functions.len();
+    var names: i64 = HashMap_new();
+    var i: i64 = 0;
+    while i < n {
+        HashMap_insert(names, module.functions.get(i).name, i + 1);
+        i = i + 1;
+    }
+    // callees and call sites
+    var callees: Vec<Vec<i64>> = Vec::new();
+    var sites: Vec<i64> = peir_zeros(n);
+    i = 0;
+    while i < n {
+        var f: IrFunction = module.functions.get(i).func;
+        var cs: Vec<i64> = Vec::new();
+        var b: i64 = 0;
+        while b < f.blocks.len() {
+            var ids: Vec<i64> = f.blocks.get(b).instructions;
+            var k: i64 = 0;
+            while k < ids.len() {
+                match peir_inst_of(&f, ids.get(k)) {
+                    Inst::Call(cn, _, _, _) => {
+                        if HashMap_contains(names, cn) {
+                            var ci: i64 = HashMap_get(names, cn) - 1;
+                            sites.set(ci, sites.get(ci) + 1);
+                            if !ime_has(cs, ci) { cs.push(ci); }
+                        }
+                    }
+                    _ => {}
+                }
+                k = k + 1;
+            }
+            b = b + 1;
+        }
+        callees.push(cs);
+        i = i + 1;
+    }
+    // post-order: callees first
+    var order: Vec<i64> = Vec::new();
+    var state: Vec<i64> = peir_zeros(n);
+    var root: i64 = 0;
+    while root < n {
+        if state.get(root) == 0 {
+            var st: Vec<i64> = Vec::new();
+            var nx: Vec<i64> = Vec::new();
+            st.push(root);
+            nx.push(0);
+            state.set(root, 1);
+            while st.len() > 0 {
+                var top: i64 = st.len() - 1;
+                var cur: i64 = st.get(top);
+                var cs2: Vec<i64> = callees.get(cur);
+                var at: i64 = nx.get(top);
+                if at < cs2.len() {
+                    nx.set(top, at + 1);
+                    var c: i64 = cs2.get(at);
+                    if state.get(c) == 0 {
+                        state.set(c, 1);
+                        st.push(c);
+                        nx.push(0);
+                    }
+                } else {
+                    order.push(cur);
+                    st.pop();
+                    nx.pop();
+                }
+            }
+        }
+        root = root + 1;
+    }
+    var oi: i64 = 0;
+    while oi < order.len() {
+        var fi: i64 = order.get(oi);
+        var entry: IrFunctionEntry = module.functions.get(fi);
+        var f2: IrFunction = entry.func;
+        if !f2.is_interrupt && ime_inline_function(module, &mut f2, names, &sites) {
+            entry.func = f2;
+            module.functions.set(fi, entry);
+        }
+        oi = oi + 1;
+    }
+}
+
+// --- ME22: loops in canonical form -------------------------------------------
+
+/// Give every loop a preheader, one latch and dedicated exits. True when
+/// anything changed (the CFG is then recomputed by the caller).
+pub fn ime_canonical_loops(f: &mut IrFunction) -> bool {
+    var changed: bool = false;
+    var rounds: i64 = 0;
+    var again: bool = true;
+    while again && rounds < 32 {
+        again = false;
+        rounds = rounds + 1;
+        var cfg: ImeCfg = ime_cfg(f);
+        var hs: Vec<i64> = ime_headers(&cfg);
+        var hi: i64 = 0;
+        while hi < hs.len() && !again {
+            var h: i64 = hs.get(hi);
+            var hid: i64 = f.blocks.get(h).id;
+            var lat: Vec<i64> = ime_latches(&cfg, h);
+            var body: Vec<i64> = ime_loop_body(&cfg, h, lat);
+            // the preheader: one outside predecessor that only goes here
+            var outside: Vec<i64> = Vec::new();
+            var ps: Vec<i64> = cfg.preds.get(h);
+            var k: i64 = 0;
+            while k < ps.len() {
+                if body.get(ps.get(k)) == 0 { outside.push(ps.get(k)); }
+                k = k + 1;
+            }
+            var need_pre: bool = outside.len() > 1 || (outside.len() == 1 && cfg.succs.get(outside.get(0)).len() > 1);
+            if need_pre && h != 0 {
+                var pre: i64 = ime_jump_block(f, hid);
+                k = 0;
+                while k < outside.len() {
+                    ime_retarget(f, outside.get(k), hid, pre);
+                    k = k + 1;
+                }
+                again = true;
+            } else if lat.len() > 1 {
+                // one latch
+                var l2: i64 = ime_jump_block(f, hid);
+                k = 0;
+                while k < lat.len() {
+                    ime_retarget(f, lat.get(k), hid, l2);
+                    k = k + 1;
+                }
+                again = true;
+            } else {
+                // dedicated exits: an exit block only loop blocks enter
+                var b: i64 = 0;
+                while b < cfg.n && !again {
+                    if body.get(b) == 1 {
+                        var ss: Vec<i64> = cfg.succs.get(b);
+                        var s: i64 = 0;
+                        while s < ss.len() && !again {
+                            var x: i64 = ss.get(s);
+                            if body.get(x) == 0 {
+                                var xps: Vec<i64> = cfg.preds.get(x);
+                                var mixed: bool = false;
+                                var q: i64 = 0;
+                                while q < xps.len() {
+                                    if body.get(xps.get(q)) == 0 { mixed = true; }
+                                    q = q + 1;
+                                }
+                                if mixed {
+                                    var xid: i64 = f.blocks.get(x).id;
+                                    var e: i64 = ime_jump_block(f, xid);
+                                    ime_retarget(f, b, xid, e);
+                                    again = true;
+                                }
+                            }
+                            s = s + 1;
+                        }
+                    }
+                    b = b + 1;
+                }
+            }
+            hi = hi + 1;
+        }
+        if again {
+            ime_recompute_preds(f);
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+// --- ME23: induction variables (strength reduction) ---------------------------
+
+/// A local only loads and stores of whole values use.
+fn ime_plain_locals(f: &IrFunction) -> Vec<i64> {
+    var plain: Vec<i64> = peir_zeros(f.next_value + 1);
+    var i: i64 = 0;
+    while i < f.insts.len() {
+        var ve: ValueIdInst = f.insts.get(i);
+        match ve.inst {
+            Inst::Alloca(t, _) => {
+                if ve.id >= 0 && ve.id < plain.len() && ir_type_eq(t, IrType::I64) { plain.set(ve.id, 1); }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < f.insts.len() {
+        var inst: Inst = f.insts.get(i).inst;
+        var ops: Vec<i64> = Vec::new();
+        peir_inst_operands(inst, &mut ops);
+        var o: i64 = 0;
+        while o < ops.len() {
+            var v: i64 = ops.get(o);
+            if v >= 0 && v < plain.len() && plain.get(v) == 1 {
+                var ok: bool = false;
+                match inst {
+                    Inst::Load(p, _) => { ok = p == v; }
+                    Inst::Store(p, sv, _) => { ok = p == v && sv != v; }
+                    _ => {}
+                }
+                if !ok { plain.set(v, 0); }
+            }
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+    var d: i64 = 0;
+    while d < f.drop_locals.len() {
+        var lid: i64 = f.drop_locals.get(d).id;
+        if lid >= 0 && lid < plain.len() { plain.set(lid, 0); }
+        d = d + 1;
+    }
+    return plain;
+}
+
+/// In an @wrapping function (where i * c and its stepped copy wrap alike),
+/// a product `load(i) * c` in a loop whose only store to i is
+/// `i = i + step` becomes a load of a second local j kept equal to i * c:
+/// j = i * c in the preheader, j = j + step * c after each step.
+pub fn ime_strength_reduce(f: &mut IrFunction) -> bool {
+    if !f.is_wrapping { return false; }
+    var changed: bool = false;
+    var cfg: ImeCfg = ime_cfg(f);
+    var plain: Vec<i64> = ime_plain_locals(f);
+    var hs: Vec<i64> = ime_headers(&cfg);
+    var hi: i64 = 0;
+    while hi < hs.len() {
+        var h: i64 = hs.get(hi);
+        var lat: Vec<i64> = ime_latches(&cfg, h);
+        var body: Vec<i64> = ime_loop_body(&cfg, h, lat);
+        // the preheader (canonical form): h's only outside predecessor
+        var pre: i64 = -1;
+        var ps: Vec<i64> = cfg.preds.get(h);
+        var k: i64 = 0;
+        while k < ps.len() {
+            if body.get(ps.get(k)) == 0 {
+                if pre < 0 { pre = ps.get(k); } else { pre = -2; }
+            }
+            k = k + 1;
+        }
+        if pre >= 0 && cfg.succs.get(pre).len() == 1 {
+            // stores to each plain local in the loop
+            var stores: Vec<i64> = peir_zeros(plain.len());
+            var store_at: Vec<i64> = peir_zeros(plain.len());
+            var b: i64 = 0;
+            while b < cfg.n {
+                if body.get(b) == 1 {
+                    var ids: Vec<i64> = f.blocks.get(b).instructions;
+                    var q: i64 = 0;
+                    while q < ids.len() {
+                        match peir_inst_of(f, ids.get(q)) {
+                            Inst::Store(p, _, _) => {
+                                if p >= 0 && p < plain.len() {
+                                    stores.set(p, stores.get(p) + 1);
+                                    store_at.set(p, ids.get(q) + 1);
+                                }
+                            }
+                            _ => {}
+                        }
+                        q = q + 1;
+                    }
+                }
+                b = b + 1;
+            }
+            // products load(i) * c in the loop, i a stepped local
+            b = 0;
+            while b < cfg.n {
+                if body.get(b) == 1 {
+                    var ids2: Vec<i64> = f.blocks.get(b).instructions;
+                    var q2: i64 = 0;
+                    while q2 < ids2.len() {
+                        var mid: i64 = ids2.get(q2);
+                        match peir_inst_of(f, mid) {
+                            Inst::BinOp(op, l, r, t) => {
+                                if binop_eq(op, BinOp::Mul) && ir_type_eq(t, IrType::I64) {
+                                    var c: i64 = 0;
+                                    var ld: i64 = -1;
+                                    match ime_const(f, r) {
+                                        OptI64::Some(cv) => { c = cv; ld = l; }
+                                        OptI64::None => {
+                                            match ime_const(f, l) {
+                                                OptI64::Some(cv2) => { c = cv2; ld = r; }
+                                                OptI64::None => {}
+                                            }
+                                        }
+                                    }
+                                    if ld >= 0 {
+                                        if ime_reduce_one(f, plain, stores, store_at, ids2, q2, mid, ld, c, pre) {
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        q2 = q2 + 1;
+                    }
+                }
+                b = b + 1;
+            }
+        }
+        hi = hi + 1;
+    }
+    return changed;
+}
+
+fn ime_reduce_one(f: &mut IrFunction, plain: Vec<i64>, stores: Vec<i64>, store_at: Vec<i64>, ids: Vec<i64>, pos: i64,
+                  mid: i64, ld: i64, c: i64, pre: i64) -> bool {
+    // ld = load(i), in this block before the product, no store to i between
+    var slot: i64 = -1;
+    match peir_inst_of(f, ld) {
+        Inst::Load(p, _) => { slot = p; }
+        _ => {}
+    }
+    if slot < 0 || slot >= plain.len() || plain.get(slot) != 1 || stores.get(slot) != 1 { return false; }
+    var lpos: i64 = -1;
+    var q: i64 = 0;
+    while q < pos {
+        if ids.get(q) == ld { lpos = q; }
+        q = q + 1;
+    }
+    if lpos < 0 { return false; }
+    q = lpos + 1;
+    while q < pos {
+        match peir_inst_of(f, ids.get(q)) {
+            Inst::Store(p, _, _) => { if p == slot { return false; } }
+            _ => {}
+        }
+        q = q + 1;
+    }
+    // the step: i = load(i) + step (or - step)
+    var sid: i64 = store_at.get(slot) - 1;
+    var step: i64 = 0;
+    var ok: bool = false;
+    match peir_inst_of(f, sid) {
+        Inst::Store(_, sv, _) => {
+            match peir_inst_of(f, sv) {
+                Inst::BinOp(sop, sl, sr, _) => {
+                    var self_load: bool = false;
+                    match peir_inst_of(f, sl) {
+                        Inst::Load(p2, _) => { self_load = p2 == slot; }
+                        _ => {}
+                    }
+                    if self_load {
+                        match ime_const(f, sr) {
+                            OptI64::Some(sc) => {
+                                if binop_eq(sop, BinOp::Add) { step = sc; ok = true; }
+                                if binop_eq(sop, BinOp::Sub) { step = 0 - sc; ok = true; }
+                            }
+                            OptI64::None => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    if !ok { return false; }
+    // j = load(i) * c before the loop
+    var j: i64 = ime_detached(f, Inst::Alloca(IrType::I64, Region::Stack));
+    ime_into_entry(f, j);
+    var pre_idx: i64 = pre;
+    var pblk: BasicBlock = f.blocks.get(pre_idx);
+    var pids: Vec<i64> = pblk.instructions;
+    var term: i64 = pids.pop();
+    var li: i64 = ime_detached(f, Inst::Load(slot, IrType::I64));
+    var cc: i64 = ime_detached(f, Inst::ConstInt(c, IrType::I64));
+    var prod: i64 = ime_detached(f, Inst::BinOp(BinOp::Mul, li, cc, IrType::I64));
+    var st0: i64 = ime_detached(f, Inst::Store(j, prod, OptIrType::Some(IrType::I64)));
+    pids.push(li);
+    pids.push(cc);
+    pids.push(prod);
+    pids.push(st0);
+    pids.push(term);
+    pblk.instructions = pids;
+    f.blocks.set(pre_idx, pblk);
+    // j = j + step * c right after the step's store
+    var sb: i64 = 0;
+    while sb < f.blocks.len() {
+        var blk: BasicBlock = f.blocks.get(sb);
+        var out: Vec<i64> = Vec::new();
+        var hit: bool = false;
+        var t: i64 = 0;
+        while t < blk.instructions.len() {
+            var id: i64 = blk.instructions.get(t);
+            out.push(id);
+            if id == sid {
+                var lj: i64 = ime_detached(f, Inst::Load(j, IrType::I64));
+                var dc: i64 = ime_detached(f, Inst::ConstInt(step * c, IrType::I64));
+                var nj: i64 = ime_detached(f, Inst::BinOp(BinOp::Add, lj, dc, IrType::I64));
+                var sj: i64 = ime_detached(f, Inst::Store(j, nj, OptIrType::Some(IrType::I64)));
+                out.push(lj);
+                out.push(dc);
+                out.push(nj);
+                out.push(sj);
+                hit = true;
+            }
+            t = t + 1;
+        }
+        if hit {
+            blk.instructions = out;
+            f.blocks.set(sb, blk);
+        }
+        sb = sb + 1;
+    }
+    // the product is now a load of j
+    IrFunction_set_inst(f, mid, Inst::Load(j, IrType::I64));
+    return true;
+}
+
+// --- ME24: full unrolling ----------------------------------------------------
+
+const IME_UNROLL_TRIPS: i64 = 8;
+const IME_UNROLL_INSTS: i64 = 160;
+
+/// A loop of one header and one body block, `while i < C { body; i = i +
+/// s }` with i a constant c0 when the loop is entered, runs a known number
+/// of times; when that is at most IME_UNROLL_TRIPS (and the copies stay
+/// small) the body is copied that many times and the loop goes. The
+/// header's test only reads (loads and a comparison), so leaving it out
+/// changes nothing; every operation of the body runs as before, in order.
+pub fn ime_unroll(f: &mut IrFunction) -> bool {
+    var cfg: ImeCfg = ime_cfg(f);
+    var plain: Vec<i64> = ime_plain_locals(f);
+    var hs: Vec<i64> = ime_headers(&cfg);
+    var hi: i64 = 0;
+    while hi < hs.len() {
+        if ime_unroll_one(f, &cfg, plain, hs.get(hi)) {
+            ime_drop_unreachable(f);
+            return true;
+        }
+        hi = hi + 1;
+    }
+    return false;
+}
+
+fn ime_unroll_one(f: &mut IrFunction, cfg: &ImeCfg, plain: Vec<i64>, h: i64) -> bool {
+    var lat: Vec<i64> = ime_latches(cfg, h);
+    if lat.len() != 1 { return false; }
+    var bb: i64 = lat.get(0);
+    if bb == h { return false; }
+    // h: loads, constants, one comparison, Branch(cond, body, exit)
+    var hids: Vec<i64> = f.blocks.get(h).instructions;
+    if hids.len() < 2 { return false; }
+    var bid: i64 = f.blocks.get(bb).id;
+    var exit_id: i64 = -1;
+    var cond: i64 = -1;
+    match peir_inst_of(f, hids.get(hids.len() - 1)) {
+        Inst::Branch(c, t, e) => {
+            if t == bid { exit_id = e; cond = c; }
+        }
+        _ => {}
+    }
+    if exit_id < 0 { return false; }
+    var q: i64 = 0;
+    while q < hids.len() - 1 {
+        match peir_inst_of(f, hids.get(q)) {
+            Inst::Load(p, _) => { if p < 0 || p >= plain.len() || plain.get(p) != 1 { return false; } }
+            Inst::ConstInt(_, _) => {}
+            Inst::BinOp(_, _, _, _) => { if hids.get(q) != cond { return false; } }
+            _ => { return false; }
+        }
+        q = q + 1;
+    }
+    // cond: load(i) < C (or <=, !=)
+    var slot: i64 = -1;
+    var limit: i64 = 0;
+    var kind: i64 = -1;
+    match peir_inst_of(f, cond) {
+        Inst::BinOp(op, l, r, _) => {
+            match peir_inst_of(f, l) {
+                Inst::Load(p, _) => { slot = p; }
+                _ => {}
+            }
+            match ime_const(f, r) {
+                OptI64::Some(cv) => { limit = cv; }
+                OptI64::None => { slot = -1; }
+            }
+            if binop_eq(op, BinOp::Lt) { kind = 0; }
+            if binop_eq(op, BinOp::LtEq) { kind = 1; }
+            if binop_eq(op, BinOp::Neq) { kind = 2; }
+        }
+        _ => {}
+    }
+    if slot < 0 || kind < 0 { return false; }
+    // the body: one block, its only store to i is i = load(i) + step at
+    // its end, before its Jump(h); nothing it defines is used elsewhere
+    var bids: Vec<i64> = f.blocks.get(bb).instructions;
+    var step: i64 = 0;
+    var n_st: i64 = 0;
+    q = 0;
+    while q < bids.len() {
+        match peir_inst_of(f, bids.get(q)) {
+            Inst::Store(p, sv, _) => {
+                if p == slot {
+                    n_st = n_st + 1;
+                    match peir_inst_of(f, sv) {
+                        Inst::BinOp(sop, sl, sr, _) => {
+                            var me: bool = false;
+                            match peir_inst_of(f, sl) {
+                                Inst::Load(p2, _) => { me = p2 == slot; }
+                                _ => {}
+                            }
+                            match ime_const(f, sr) {
+                                OptI64::Some(sc) => { if me && binop_eq(sop, BinOp::Add) { step = sc; } }
+                                OptI64::None => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        q = q + 1;
+    }
+    if n_st != 1 || step <= 0 { return false; }
+    // i's value on entry: the last store to it in the preheader's chain
+    var pre: i64 = -1;
+    var ps: Vec<i64> = cfg.preds.get(h);
+    q = 0;
+    while q < ps.len() {
+        if ps.get(q) != bb {
+            if pre < 0 { pre = ps.get(q); } else { return false; }
+        }
+        q = q + 1;
+    }
+    if pre < 0 { return false; }
+    var c0: i64 = 0;
+    var found: bool = false;
+    var scan: i64 = pre;
+    var hops: i64 = 0;
+    while scan >= 0 && hops < 4 && !found {
+        var sids: Vec<i64> = f.blocks.get(scan).instructions;
+        var z: i64 = sids.len() - 1;
+        var blocked: bool = false;
+        while z >= 0 && !found && !blocked {
+            match peir_inst_of(f, sids.get(z)) {
+                Inst::Store(p, sv, _) => {
+                    if p == slot {
+                        match ime_const(f, sv) {
+                            OptI64::Some(v0) => { c0 = v0; found = true; }
+                            OptI64::None => { blocked = true; }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            z = z - 1;
+        }
+        if blocked { return false; }
+        if !found {
+            var sps: Vec<i64> = cfg.preds.get(scan);
+            if sps.len() != 1 { return false; }
+            scan = sps.get(0);
+            hops = hops + 1;
+        }
+    }
+    if !found { return false; }
+    // the trip count
+    var trips: i64 = 0;
+    if kind == 0 { if limit > c0 { trips = (limit - c0 + step - 1) / step; } }
+    if kind == 1 { if limit >= c0 { trips = (limit - c0) / step + 1; } }
+    if kind == 2 {
+        if limit < c0 || (limit - c0) % step != 0 { return false; }
+        trips = (limit - c0) / step;
+    }
+    if trips > IME_UNROLL_TRIPS || trips * bids.len() > IME_UNROLL_INSTS { return false; }
+    // values of h or the body used outside the body
+    var inner: Vec<i64> = peir_zeros(f.next_value + 1);
+    q = 0;
+    while q < bids.len() {
+        if bids.get(q) < inner.len() { inner.set(bids.get(q), 1); }
+        q = q + 1;
+    }
+    var hdef: Vec<i64> = peir_zeros(f.next_value + 1);
+    q = 0;
+    while q < hids.len() {
+        if hids.get(q) < hdef.len() { hdef.set(hids.get(q), 1); }
+        q = q + 1;
+    }
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var ids: Vec<i64> = f.blocks.get(b).instructions;
+        var k: i64 = 0;
+        while k < ids.len() {
+            var ops: Vec<i64> = Vec::new();
+            peir_inst_operands(peir_inst_of(f, ids.get(k)), &mut ops);
+            var o: i64 = 0;
+            while o < ops.len() {
+                var v: i64 = ops.get(o);
+                if v >= 0 && v < inner.len() {
+                    if b != bb && inner.get(v) == 1 { return false; }
+                    if b == bb && hdef.get(v) == 1 { return false; }
+                    if b != h && b != bb && hdef.get(v) == 1 { return false; }
+                }
+                o = o + 1;
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    // copy the body `trips` times: preheader -> copy 1 -> ... -> exit
+    var hid: i64 = f.blocks.get(h).id;
+    var next_target: i64 = exit_id;
+    var t: i64 = trips;
+    while t > 0 {
+        var nid: i64 = IrFunction_new_block(f);
+        var ni: i64 = f.blocks.len() - 1;
+        var vm: Vec<i64> = peir_zeros(f.next_value + 2);
+        var tmp: Vec<i64> = Vec::new();
+        q = 0;
+        while q < bids.len() {
+            var nv: i64 = ime_detached(f, peir_inst_of(f, bids.get(q)));
+            ime_copy_line_self(f, bids.get(q), nv);
+            if bids.get(q) < vm.len() { vm.set(bids.get(q), nv + 1); }
+            tmp.push(nv);
+            q = q + 1;
+        }
+        var bm: Vec<i64> = peir_zeros(f.next_block + 2);
+        bm.set(hid, next_target + 1);
+        q = 0;
+        while q < bids.len() {
+            IrFunction_set_inst(f, tmp.get(q), ime_remap(peir_inst_of(f, bids.get(q)), &vm, &bm));
+            q = q + 1;
+        }
+        var nb: BasicBlock = f.blocks.get(ni);
+        nb.instructions = tmp;
+        f.blocks.set(ni, nb);
+        next_target = nid;
+        t = t - 1;
+    }
+    ime_retarget(f, pre, hid, next_target);
+    ime_recompute_preds(f);
+    return true;
+}
+
+// --- ME26: scalar replacement of aggregates ----------------------------------
+
+/// A struct local whose every use is a field address used only by loads
+/// and stores becomes one local per field: each field address is replaced
+/// by that field's own local, and the struct's allocation goes.
+pub fn ime_sra(f: &mut IrFunction) -> bool {
+    var n: i64 = f.next_value + 1;
+    // candidate allocas: Alloca of a non-scalar type
+    var cand: Vec<i64> = peir_zeros(n);
+    var i: i64 = 0;
+    while i < f.insts.len() {
+        var ve: ValueIdInst = f.insts.get(i);
+        match ve.inst {
+            Inst::Alloca(t, _) => {
+                if ve.id >= 0 && ve.id < n && !ime_scalar_or_void(t) { cand.set(ve.id, 1); }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    var d: i64 = 0;
+    while d < f.drop_locals.len() {
+        var lid: i64 = f.drop_locals.get(d).id;
+        if lid >= 0 && lid < n { cand.set(lid, 0); }
+        d = d + 1;
+    }
+    d = 0;
+    while d < f.zeroize_locals.len() {
+        var zid: i64 = f.zeroize_locals.get(d).id;
+        if zid >= 0 && zid < n { cand.set(zid, 0); }
+        d = d + 1;
+    }
+    // field address -> its struct (+1), and each field address's uses
+    var gfp_of: Vec<i64> = peir_zeros(n);
+    var gfp_idx: Vec<i64> = peir_zeros(n);
+    i = 0;
+    while i < f.insts.len() {
+        var ve2: ValueIdInst = f.insts.get(i);
+        var ops: Vec<i64> = Vec::new();
+        peir_inst_operands(ve2.inst, &mut ops);
+        var o: i64 = 0;
+        while o < ops.len() {
+            var v: i64 = ops.get(o);
+            if v >= 0 && v < n && cand.get(v) == 1 {
+                var ok: bool = false;
+                match ve2.inst {
+                    Inst::GetFieldPtr(p, idx, ft) => {
+                        if p == v && ime_scalar_or_void(ft) && ve2.id >= 0 && ve2.id < n {
+                            ok = true;
+                            gfp_of.set(ve2.id, v + 1);
+                            gfp_idx.set(ve2.id, idx);
+                        }
+                    }
+                    _ => {}
+                }
+                if !ok { cand.set(v, 0); }
+            }
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+    // a field address may only be loaded from and stored to
+    i = 0;
+    while i < f.insts.len() {
+        var ve3: ValueIdInst = f.insts.get(i);
+        var ops3: Vec<i64> = Vec::new();
+        peir_inst_operands(ve3.inst, &mut ops3);
+        var o3: i64 = 0;
+        while o3 < ops3.len() {
+            var g: i64 = ops3.get(o3);
+            if g >= 0 && g < n && gfp_of.get(g) != 0 {
+                var fine: bool = false;
+                match ve3.inst {
+                    Inst::Load(p, _) => { fine = p == g; }
+                    Inst::Store(p, sv, _) => { fine = p == g && sv != g; }
+                    _ => {}
+                }
+                if !fine { cand.set(gfp_of.get(g) - 1, 0); }
+            }
+            o3 = o3 + 1;
+        }
+        i = i + 1;
+    }
+    // one new local per (struct, field)
+    var any: bool = false;
+    var vm: Vec<i64> = peir_zeros(n + 1);
+    var made: i64 = HashMap_new();
+    var dead: Vec<i64> = peir_zeros(n + 1);
+    var g2: i64 = 0;
+    while g2 < n {
+        var base1: i64 = gfp_of.get(g2);
+        if base1 != 0 && cand.get(base1 - 1) == 1 {
+            var key: str = int_to_str(base1 - 1) + "." + int_to_str(gfp_idx.get(g2));
+            var loc: i64 = 0;
+            if HashMap_contains(made, key) {
+                loc = HashMap_get(made, key);
+            } else {
+                var fty: IrType = IrType::I64;
+                match peir_inst_of(f, g2) {
+                    Inst::GetFieldPtr(_, _, ft2) => { fty = ft2; }
+                    _ => {}
+                }
+                loc = ime_detached(f, Inst::Alloca(fty, Region::Stack));
+                ime_into_entry(f, loc);
+                HashMap_insert(made, key, loc);
+            }
+            vm.set(g2, loc + 1);
+            dead.set(g2, 1);
+            dead.set(base1 - 1, 1);
+            any = true;
+        }
+        g2 = g2 + 1;
+    }
+    if !any { return false; }
+    // uses of the field addresses go to the new locals
+    var no_blocks: Vec<i64> = peir_zeros(1);
+    i = 0;
+    while i < f.insts.len() {
+        var e: ValueIdInst = f.insts.get(i);
+        e.inst = ime_remap(e.inst, &vm, &no_blocks);
+        f.insts.set(i, e);
+        i = i + 1;
+    }
+    // the field addresses and the structs leave their blocks
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var blk: BasicBlock = f.blocks.get(b);
+        var keep: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < blk.instructions.len() {
+            var id: i64 = blk.instructions.get(k);
+            if id >= 0 && id < dead.len() && dead.get(id) == 1 {
+                // gone
+            } else {
+                keep.push(id);
+            }
+            k = k + 1;
+        }
+        blk.instructions = keep;
+        f.blocks.set(b, blk);
+        b = b + 1;
+    }
+    return true;
+}
+
+// --- ME28: switch lowering ---------------------------------------------------
+
+/// The value `x == k` compares (a load of a plain local counts as that
+/// local: -2 - slot) and k; ok false when `c` is not such a comparison.
+pub struct ImeCase {
+    pub key: i64,
+    pub k: i64,
+    pub ok: bool,
+}
+
+fn ime_case_of(f: &IrFunction, c: i64, plain: &Vec<i64>) -> ImeCase {
+    var none: ImeCase = ImeCase { key: 0, k: 0, ok: false };
+    match peir_inst_of(f, c) {
+        Inst::BinOp(op, l, r, _) => {
+            if !binop_eq(op, BinOp::Eq) { return none; }
+            var x: i64 = l;
+            var kv: i64 = 0;
+            match ime_const(f, r) {
+                OptI64::Some(v) => { kv = v; }
+                OptI64::None => {
+                    match ime_const(f, l) {
+                        OptI64::Some(v2) => { kv = v2; x = r; }
+                        OptI64::None => { return none; }
+                    }
+                }
+            }
+            if !ir_type_eq(ime_type(f, x), IrType::I64) { return none; }
+            var key: i64 = x;
+            match peir_inst_of(f, x) {
+                Inst::Load(p, _) => { if p >= 0 && p < plain.len() && plain.get(p) == 1 { key = 0 - 2 - p; } }
+                _ => {}
+            }
+            return ImeCase { key: key, k: kv, ok: true };
+        }
+        _ => {}
+    }
+    return none;
+}
+
+/// Is block index `bi` a link of a test chain: only constants, a load of
+/// the tested local, the comparison and a Branch (it computes nothing
+/// else, so a jump past it changes nothing but which test runs)?
+fn ime_test_block(f: &IrFunction, bi: i64) -> bool {
+    var ids: Vec<i64> = f.blocks.get(bi).instructions;
+    if ids.len() < 2 || ids.len() > 4 { return false; }
+    var q: i64 = 0;
+    while q < ids.len() - 1 {
+        match peir_inst_of(f, ids.get(q)) {
+            Inst::ConstInt(_, _) => {}
+            Inst::Load(_, _) => {}
+            Inst::BinOp(_, _, _, _) => {}
+            _ => { return false; }
+        }
+        q = q + 1;
+    }
+    return true;
+}
+
+const IME_SWITCH_MIN: i64 = 4;
+
+/// A chain of tests `x == k1 -> T1 else x == k2 -> T2 else ... -> D` on one
+/// value becomes a balanced tree of `x < k` tests ending in `x == k`
+/// tests: log2(n) comparisons instead of n.
+pub fn ime_switch(f: &mut IrFunction) -> bool {
+    var plain: Vec<i64> = ime_plain_locals(f);
+    var cfg: ImeCfg = ime_cfg(f);
+    var a: i64 = 0;
+    while a < f.blocks.len() {
+        var ids: Vec<i64> = f.blocks.get(a).instructions;
+        if ids.len() > 0 {
+            match peir_inst_of(f, ids.get(ids.len() - 1)) {
+                Inst::Branch(c, t, e) => {
+                    var first: ImeCase = ime_case_of(f, c, &plain);
+                    if first.ok {
+                        // follow the chain
+                        var keys: Vec<i64> = Vec::new();
+                        var targets: Vec<i64> = Vec::new();
+                        keys.push(first.k);
+                        targets.push(t);
+                        var next: i64 = e;
+                        var x_id: i64 = -1;
+                        match peir_inst_of(f, c) {
+                            Inst::BinOp(_, l0, r0, _) => {
+                                x_id = l0;
+                                match ime_const(f, l0) {
+                                    OptI64::Some(_) => { x_id = r0; }
+                                    OptI64::None => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                        var steps: i64 = 0;
+                        var going: bool = true;
+                        while going && steps < 256 {
+                            going = false;
+                            var ni: i64 = ime_block_index(f, next);
+                            if ni > 0 && cfg.preds.get(ni).len() == 1 && ime_test_block(f, ni) {
+                                var nids: Vec<i64> = f.blocks.get(ni).instructions;
+                                match peir_inst_of(f, nids.get(nids.len() - 1)) {
+                                    Inst::Branch(c2, t2, e2) => {
+                                        var cs: ImeCase = ime_case_of(f, c2, &plain);
+                                        if cs.ok && cs.key == first.key {
+                                            if !ime_has(keys, cs.k) {
+                                                keys.push(cs.k);
+                                                targets.push(t2);
+                                            }
+                                            next = e2;
+                                            going = true;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            steps = steps + 1;
+                        }
+                        if keys.len() >= IME_SWITCH_MIN && x_id >= 0 {
+                            ime_build_switch(f, a, x_id, keys, targets, next);
+                            ime_drop_unreachable(f);
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        a = a + 1;
+    }
+    return false;
+}
+
+/// The tree: blocks in `f`, each a comparison of x; returns the root's id.
+fn ime_build_switch(f: &mut IrFunction, a: i64, x: i64, keys: Vec<i64>, targets: Vec<i64>, dflt: i64) {
+    // sort the cases by key
+    var ks: Vec<i64> = keys;
+    var ts: Vec<i64> = targets;
+    var i: i64 = 1;
+    while i < ks.len() {
+        var j: i64 = i;
+        while j > 0 && ks.get(j - 1) > ks.get(j) {
+            var k1: i64 = ks.get(j - 1);
+            ks.set(j - 1, ks.get(j));
+            ks.set(j, k1);
+            var t1: i64 = ts.get(j - 1);
+            ts.set(j - 1, ts.get(j));
+            ts.set(j, t1);
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+    var root: i64 = ime_switch_node(f, x, ks, ts, 0, ks.len(), dflt);
+    // the chain's first block jumps to the tree
+    var ids: Vec<i64> = f.blocks.get(a).instructions;
+    IrFunction_set_inst(f, ids.get(ids.len() - 1), Inst::Jump(root));
+    ime_recompute_preds(f);
+}
+
+fn ime_switch_node(f: &mut IrFunction, x: i64, ks: Vec<i64>, ts: Vec<i64>, lo: i64, hi: i64, dflt: i64) -> i64 {
+    if hi - lo <= 2 {
+        // a short chain of equality tests
+        var after: i64 = dflt;
+        var k: i64 = hi - 1;
+        while k >= lo {
+            var nid: i64 = IrFunction_new_block(f);
+            var ni: i64 = f.blocks.len() - 1;
+            var kc: i64 = ime_detached(f, Inst::ConstInt(ks.get(k), IrType::I64));
+            var eq: i64 = ime_detached(f, Inst::BinOp(BinOp::Eq, x, kc, IrType::Bool));
+            var br: i64 = ime_detached(f, Inst::Branch(eq, ts.get(k), after));
+            var blk: BasicBlock = f.blocks.get(ni);
+            blk.instructions.push(kc);
+            blk.instructions.push(eq);
+            blk.instructions.push(br);
+            f.blocks.set(ni, blk);
+            after = nid;
+            k = k - 1;
+        }
+        return after;
+    }
+    var mid: i64 = (lo + hi) / 2;
+    var left: i64 = ime_switch_node(f, x, ks, ts, lo, mid, dflt);
+    var right: i64 = ime_switch_node(f, x, ks, ts, mid, hi, dflt);
+    var nid2: i64 = IrFunction_new_block(f);
+    var ni2: i64 = f.blocks.len() - 1;
+    var kc2: i64 = ime_detached(f, Inst::ConstInt(ks.get(mid), IrType::I64));
+    var lt: i64 = ime_detached(f, Inst::BinOp(BinOp::Lt, x, kc2, IrType::Bool));
+    var br2: i64 = ime_detached(f, Inst::Branch(lt, left, right));
+    var blk2: BasicBlock = f.blocks.get(ni2);
+    blk2.instructions.push(kc2);
+    blk2.instructions.push(lt);
+    blk2.instructions.push(br2);
+    f.blocks.set(ni2, blk2);
+    return nid2;
+}
+
+// --- The pass list -------------------------------------------------------------
+
+/// The per-function mid-end passes that are on (FID_IROPT_ON), in order.
+/// True when any changed `f`.
+pub fn ime_function_passes(f: &mut IrFunction) -> bool {
+    var changed: bool = false;
+    if ime_on("sra") && ime_sra(f) { changed = true; }
+    if ime_on("switch") && ime_switch(f) { changed = true; }
+    if ime_on("loops") && ime_canonical_loops(f) { changed = true; }
+    if ime_on("ivsr") && ime_strength_reduce(f) { changed = true; }
+    if ime_on("unroll") && ime_unroll(f) { changed = true; }
+    return changed;
+}

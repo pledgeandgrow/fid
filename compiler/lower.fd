@@ -13417,6 +13417,222 @@ pub fn Lowerer_rc_new_coll(self: &mut Lowerer, t: Type) -> i64 {
 }
 
 
+// Share temporaries only read before their drop are not made (LF15).
+const LOWER_CANCEL_SHARES: bool = true;
+// String slots that only ever hold literals are not counted (LF17).
+const LOWER_LITERAL_SLOTS: bool = true;
+
+/// Calls that only read the Vec or map handle they get as argument 1.
+fn lw_rc_read_only_call(name: str) -> bool {
+    return name == "Vec_len" || name == "Vec_get" || name == "Vec_is_empty" || name == "Vec_contains"
+        || name == "Vec_first" || name == "Vec_last" || name == "Vec_to_str" || name == "Vec_capacity"
+        || name == "p_vec_len" || name == "p_vec_get" || name == "vec_get_or"
+        || name == "HashMap_get" || name == "HashMap_get_i" || name == "HashMap_get_or"
+        || name == "HashMap_get_or_i" || name == "HashMap_contains" || name == "HashMap_contains_i"
+        || name == "HashMap_len" || name == "HashMap_is_empty" || name == "HashMap_to_str";
+}
+
+/// `x = Vec_share(v)` (or HashMap_share) at ins[i]: when, in this block,
+/// every use of x up to `Vec_drop(x)` is argument 1 of a read-only call, and
+/// nothing in between is any other call (which could change v), those reads
+/// take v, and the share and the drop are marked dead. True when done.
+fn lw_rc_cancel_share(f: &mut IrFunction, ins: Vec<i64>, i: i64, dead: &mut Vec<i64>) -> bool {
+    var sid: i64 = ins.get(i);
+    var v: i64 = -1;
+    var drop_name: str = "";
+    match IrFunction_get_inst(f, sid) {
+        OptInst::Some(inst) => {
+            match inst {
+                Inst::Call(n, args, _, _) => {
+                    if (n == "Vec_share" || n == "HashMap_share") && args.len() == 2 {
+                        v = args.get(1);
+                        if n == "Vec_share" { drop_name = "Vec_drop"; } else { drop_name = "HashMap_drop"; }
+                    }
+                }
+                _ => {}
+            }
+        }
+        OptInst::None => {}
+    }
+    if v < 0 { return false; }
+    var reads: Vec<i64> = Vec::new();
+    var drop_at: i64 = -1;
+    var j: i64 = i + 1;
+    while j < ins.len() && drop_at < 0 {
+        var jid: i64 = ins.get(j);
+        var uses_x: bool = false;
+        var other_call: bool = false;
+        var is_drop: bool = false;
+        var is_read: bool = false;
+        match IrFunction_get_inst(f, jid) {
+            OptInst::Some(jinst) => {
+                match jinst {
+                    Inst::Call(cn, cargs, _, _) => {
+                        var k: i64 = 0;
+                        var at1: bool = false;
+                        var elsewhere: bool = false;
+                        while k < cargs.len() {
+                            if cargs.get(k) == sid {
+                                uses_x = true;
+                                if k == 1 { at1 = true; } else { elsewhere = true; }
+                            }
+                            k = k + 1;
+                        }
+                        if uses_x && !elsewhere && at1 && cn == drop_name && cargs.len() == 2 { is_drop = true; }
+                        else if uses_x && !elsewhere && at1 && lw_rc_read_only_call(cn) { is_read = true; }
+                        else if !lw_rc_read_only_call(cn) && cn != "Str_dup" && cn != "Str_drop" { other_call = true; }
+                        else if uses_x { other_call = true; }
+                    }
+                    _ => {
+                        var refs: Vec<i64> = inst_value_refs(&jinst);
+                        var r: i64 = 0;
+                        while r < refs.len() {
+                            if refs.get(r) == sid { uses_x = true; }
+                            r = r + 1;
+                        }
+                        if inst_is_terminator(jinst) { other_call = true; }
+                    }
+                }
+            }
+            OptInst::None => { other_call = true; }
+        }
+        if is_drop { drop_at = j; }
+        else if is_read { reads.push(jid); }
+        else if uses_x || other_call { return false; }
+        j = j + 1;
+    }
+    if drop_at < 0 { return false; }
+    // x used nowhere else (another block, after the drop)
+    if lw_rc_use_count(f, sid) != reads.len() + 1 { return false; }
+    var q: i64 = 0;
+    while q < reads.len() {
+        lw_rc_rewrite_arg(f, reads.get(q), sid, v);
+        q = q + 1;
+    }
+    dead.push(sid);
+    dead.push(ins.get(drop_at));
+    return true;
+}
+
+/// How many operands of `f`'s instructions are value `v`.
+fn lw_rc_use_count(f: &IrFunction, v: i64) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < f.insts.len() {
+        var refs: Vec<i64> = inst_value_refs(&f.insts.get(i).inst);
+        var j: i64 = 0;
+        while j < refs.len() {
+            if refs.get(j) == v { n = n + 1; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// In call `id`, argument `from` becomes `to`.
+fn lw_rc_rewrite_arg(f: &mut IrFunction, id: i64, from: i64, to: i64) {
+    if id < 0 || id >= f.inst_at.len() { return; }
+    var pos: i64 = f.inst_at.get(id) - 1;
+    if pos < 0 || pos >= f.insts.len() { return; }
+    var e: ValueIdInst = f.insts.get(pos);
+    match e.inst {
+        Inst::Call(cn, cargs, cty, ceff) => {
+            var na: Vec<i64> = Vec::new();
+            var k: i64 = 0;
+            while k < cargs.len() {
+                if cargs.get(k) == from { na.push(to); } else { na.push(cargs.get(k)); }
+                k = k + 1;
+            }
+            e.inst = Inst::Call(cn, na, cty, ceff);
+            f.insts.set(pos, e);
+        }
+        _ => {}
+    }
+}
+
+/// LF17: string slots whose every store is a literal or zero (and that are
+/// only loaded and stored) hold nothing counted: the Str_dup / Str_drop of a
+/// value loaded from one is marked dead.
+fn lw_rc_literal_slot_counts(f: &IrFunction, dead: &mut Vec<i64>) {
+    var nv: i64 = f.next_value;
+    if nv <= 0 { return; }
+    var lit: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < nv { lit.push(0); i = i + 1; }
+    // candidates: allocas
+    i = 0;
+    while i < f.insts.len() {
+        var ve: ValueIdInst = f.insts.get(i);
+        match ve.inst {
+            Inst::Alloca(_, _) => { if ve.id >= 0 && ve.id < nv { lit.set(ve.id, 1); } }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    var loaded_from: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nv { loaded_from.push(-1); i = i + 1; }
+    i = 0;
+    while i < f.insts.len() {
+        var ve2: ValueIdInst = f.insts.get(i);
+        var refs: Vec<i64> = inst_value_refs(&ve2.inst);
+        match ve2.inst {
+            Inst::Load(lp, _) => {
+                if ve2.id >= 0 && ve2.id < nv && lp >= 0 && lp < nv { loaded_from.set(ve2.id, lp); }
+            }
+            Inst::Store(sp, sv, _) => {
+                if sp >= 0 && sp < nv && lit.get(sp) == 1 {
+                    if !lw_rc_is_literal_value(f, sv) { lit.set(sp, 0); }
+                }
+                // the slot as a stored value: its address escapes
+                if sv >= 0 && sv < nv { lit.set(sv, 0); }
+            }
+            _ => {
+                var r: i64 = 0;
+                while r < refs.len() {
+                    var rv: i64 = refs.get(r);
+                    if rv >= 0 && rv < nv { lit.set(rv, 0); }
+                    r = r + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < f.insts.len() {
+        var ve3: ValueIdInst = f.insts.get(i);
+        var a1: i64 = lw_rc_str_count_arg(f, ve3.id, "Str_dup");
+        var a2: i64 = lw_rc_str_count_arg(f, ve3.id, "Str_drop");
+        var a: i64 = a1;
+        if a < 0 { a = a2; }
+        if a >= 0 && a < nv {
+            var sl: i64 = loaded_from.get(a);
+            if sl >= 0 && lit.get(sl) == 1 {
+                if a2 >= 0 || !lw_rc_value_used(f, ve3.id) { dead.push(ve3.id); }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+/// A literal string, a null, a zero, or a cast of one of them.
+fn lw_rc_is_literal_value(f: &IrFunction, v: i64) -> bool {
+    match IrFunction_get_inst(f, v) {
+        OptInst::Some(inst) => {
+            match inst {
+                Inst::ConstStr(_) => { return true; }
+                Inst::ConstNull(_) => { return true; }
+                Inst::ConstInt(c, _) => { return c == 0; }
+                Inst::BitCast(x, _, _) => { return lw_rc_is_literal_value(f, x); }
+                _ => {}
+            }
+        }
+        OptInst::None => {}
+    }
+    return false;
+}
+
 /// A string counted again and dropped in the same block with nothing in
 /// between that could free or keep it (no call, store or terminator), and
 /// the count's result unused: neither is needed (proposal 0004).
@@ -13426,31 +13642,48 @@ fn lw_rc_cancel_pairs(module: &mut IrModule) {
         var fentry: IrFunctionEntry = module.functions.get(fi);
         var f: IrFunction = fentry.func;
         var changed: bool = false;
+        var lit_dead: Vec<i64> = Vec::new();
+        if LOWER_LITERAL_SLOTS { lw_rc_literal_slot_counts(&f, &mut lit_dead); }
         var b: i64 = 0;
         while b < f.blocks.len() {
             var blk: BasicBlock = f.blocks.get(b);
             var ins: Vec<i64> = blk.instructions;
             var dead: Vec<i64> = Vec::new();
+            var ld: i64 = 0;
+            while ld < lit_dead.len() { dead.push(lit_dead.get(ld)); ld = ld + 1; }
             var i: i64 = 0;
             while i < ins.len() {
-                var a: i64 = lw_rc_str_count_arg(&f, ins.get(i), "Str_dup");
-                if a >= 0 {
-                    var j: i64 = i + 1;
-                    var stop: bool = false;
-                    while j < ins.len() && !stop {
-                        var d: i64 = lw_rc_str_count_arg(&f, ins.get(j), "Str_drop");
-                        if d == a {
-                            if !lw_rc_value_used(&f, ins.get(i)) {
-                                dead.push(ins.get(i));
-                                dead.push(ins.get(j));
+                // A string or a Box counted again, then dropped (LF15): both
+                // calls give back / take the same pointer
+                var pk: i64 = 0;
+                while pk < 2 {
+                    var dup_name: str = "Str_dup";
+                    var drop_name: str = "Str_drop";
+                    if pk == 1 { dup_name = "Box_dup"; drop_name = "Box_drop_t"; }
+                    var a: i64 = lw_rc_str_count_arg(&f, ins.get(i), dup_name);
+                    if a >= 0 {
+                        var j: i64 = i + 1;
+                        var stop: bool = false;
+                        while j < ins.len() && !stop {
+                            var d: i64 = lw_rc_str_count_arg(&f, ins.get(j), drop_name);
+                            if d == a {
+                                if !lw_rc_value_used(&f, ins.get(i)) {
+                                    dead.push(ins.get(i));
+                                    dead.push(ins.get(j));
+                                }
+                                stop = true;
+                            } else if lw_rc_may_free(&f, ins.get(j)) {
+                                stop = true;
                             }
-                            stop = true;
-                        } else if lw_rc_may_free(&f, ins.get(j)) {
-                            stop = true;
+                            j = j + 1;
                         }
-                        j = j + 1;
                     }
+                    pk = pk + 1;
                 }
+                // A Vec or map shared for a temporary that is only read, then
+                // dropped in the same block (LF15): the reads use the
+                // original, the share and its drop go
+                if LOWER_CANCEL_SHARES && lw_rc_cancel_share(&mut f, ins, i, &mut dead) { changed = true; }
                 i = i + 1;
             }
             if dead.len() > 0 {
@@ -13487,7 +13720,7 @@ fn lw_rc_str_count_arg(f: &IrFunction, id: i64, fname: str) -> i64 {
         OptInst::Some(inst) => {
             match inst {
                 Inst::Call(n, args, _, _) => {
-                    if n == fname && args.len() == 2 {
+                    if n == fname && args.len() >= 2 {
                         // Through the cast to a word: the value itself
                         var a: i64 = args.get(1);
                         match IrFunction_get_inst(f, a) {

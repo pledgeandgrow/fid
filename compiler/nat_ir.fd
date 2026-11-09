@@ -169,6 +169,16 @@ pub struct NatGen {
     // checks.fd's facts for the function being lowered: per value id, bit
     // 1 an operation that needs no overflow or bounds check
     pub unchecked: Vec<i64>,
+    // Panics with the source line (as the interpreter prints them): the
+    // line of the instruction being lowered, and per "which:line" a stub
+    // label ([which, line, label] each in pl_list), emitted after the code
+    pub cur_inst_line: i64,
+    pub pl_keys: i64,
+    pub pl_list: Vec<i64>,
+    // x86-64: the general register whose f64 bits xmm0 / xmm1 hold now (-1:
+    // none), so a chain of float operations stays in xmm (`xmmcache`)
+    pub x0_reg: i64,
+    pub x1_reg: i64,
 }
 
 /// The input file and its functions' names (comma-separated), set by
@@ -237,6 +247,11 @@ pub fn NatGen_new(arch: i64) -> NatGen {
         lines_cur_fn: false,
         cur_line: 0,
         unchecked: Vec::new(),
+        cur_inst_line: 0,
+        pl_keys: HashMap_new(),
+        pl_list: Vec::new(),
+        x0_reg: 0 - 1,
+        x1_reg: 0 - 1,
     };
     if arch == NAT_RV64 {
         // t1, t2, t3, t4 for values; t0 and t5 for addresses; t6 far jumps
@@ -439,9 +454,9 @@ fn ng_beqz(g: &mut NatGen, r: i64, label: i64) {
 
 /// Panic `which` when r != 0 (the stubs may be anywhere in the image).
 fn ng_panic_if(g: &mut NatGen, r: i64, which: i64) {
-    if g.rec { ng_rec(g, MO_PANICIF, r, 0, 0, which, 0, 0); return; }
-    if ng_x64(g) { x64_test(&mut g.e, r, r); x64_jcc8(&mut g.e, X64_E, 5); x64_call(&mut g.e, g.panic_labels.get(which)); return; }
-    var label: i64 = g.panic_labels.get(which);
+    if g.rec { ng_rec(g, MO_PANICIF, r, 0, 0, which, g.cur_inst_line, 0); return; }
+    var label: i64 = ng_panic_label(g, which);
+    if ng_x64(g) { x64_test(&mut g.e, r, r); x64_jcc8(&mut g.e, X64_E, 5); x64_call(&mut g.e, label); return; }
     if ng_a64(g) {
         // CBZ r, +8; BL panic (a call: the return address names the
         // function in a panic trace)
@@ -664,7 +679,15 @@ fn ng_i2f(g: &mut NatGen, d: i64, s: i64, to_f32: bool) {
 /// d = the integer of float bits s, truncated toward zero
 fn ng_f2i(g: &mut NatGen, d: i64, s: i64, from_f32: bool) {
     if g.rec { var w: i64 = 0; if from_f32 { w = 1; } ng_rec(g, MO_F2I, d, s, 0, w, 0, 0); return; }
-    if ng_x64(g) { if from_f32 { x64_movq_xr(&mut g.e, 0, s, false); x64_sse(&mut g.e, 0xF3, 0x5A, 0, 0); } else { x64_movq_xr(&mut g.e, 0, s, true); } x64_cvttsd2si(&mut g.e, d, 0); return; }
+    if ng_x64(g) {
+        if from_f32 { x64_movq_xr(&mut g.e, 0, s, false); x64_sse(&mut g.e, 0xF3, 0x5A, 0, 0); g.x0_reg = 0 - 1; }
+        else if g.x0_reg != s || g.rec || !ng_on("xmmcache") { x64_movq_xr(&mut g.e, 0, s, true); g.x0_reg = s; }
+        if g.rec || !ng_on("xmmcache") { g.x0_reg = 0 - 1; }
+        x64_cvttsd2si(&mut g.e, d, 0);
+        if g.x0_reg == d { g.x0_reg = 0 - 1; }
+        if g.x1_reg == d { g.x1_reg = 0 - 1; }
+        return;
+    }
     if ng_a64(g) {
         if from_f32 { a64_fmov_sw(&mut g.e, 0, s); a64_fcvt_ds(&mut g.e, 0, 0); }
         else { a64_fmov_dx(&mut g.e, 0, s); }
@@ -1384,7 +1407,9 @@ fn ng_regalloc(g: &mut NatGen, func: &IrFunction, nvals: i64) {
 // caller-saved register), fold (no identical-function folding), hint (no
 // move coalescing hints), vecinline (Vec_len/get/set/push always calls),
 // unchecked (every overflow and bounds check stays, checks.fd unused),
-// coalesce (every copy between vregs keeps two of them),
+// coalesce (every copy between vregs keeps two of them), panicline (no
+// " at line N" in division panics), remat (spilled constants reload),
+// xmmcache (every float operation moves its operands into xmm0/xmm1),
 // weights (spill the range ending last, not the
 // cheapest by loop-weighted uses).
 // ===========================================================================
@@ -1669,6 +1694,8 @@ fn ng_is_promoted(g: &NatGen, id: i64) -> bool {
 
 pub struct NatAlloc {
     pub assign: Vec<i64>,      // vreg - 64 -> register, -1 spilled, -2 unused
+    pub remat: Vec<i64>,       // vreg - 64 -> 1: a constant, loaded again where used
+    pub remat_val: Vec<i64>,   // its value
     pub spill: Vec<i64>,       // vreg - 64 -> frame offset of its slot (spilled)
     pub frame: i64,
     pub save_regs: Vec<i64>,
@@ -1943,6 +1970,40 @@ fn ng_mir_alloc(g: &mut NatGen, rec: &NatFnRec) -> NatAlloc {
         }
     }
 
+    // Rematerialization (RA7): a vreg (with its coalesced members) defined
+    // once, by a constant, is never stored: a spilled one is loaded again
+    // where it is used, and costs nothing to spill. `FID_NAT_OFF=remat`.
+    var remat: Vec<i64> = Vec::new();
+    var remat_val: Vec<i64> = Vec::new();
+    var rdefs: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nv { remat.push(0); remat_val.push(0); rdefs.push(0); i = i + 1; }
+    if ng_on("remat") {
+        k = 0;
+        while k < n {
+            var rm: MInst = mir.get(k);
+            if mi_defines(rm.op) && rm.r0 >= NG_VBASE && rm.r0 - NG_VBASE < nv {
+                var rr: i64 = ng_find(&mut crep, rm.r0 - NG_VBASE);
+                rdefs.set(rr, rdefs.get(rr) + 1);
+                if rm.op == MO_LI { remat.set(rr, 1); remat_val.set(rr, rm.i0); } else { remat.set(rr, 2); }
+            }
+            k = k + 1;
+        }
+        i = 0;
+        while i < nv {
+            var rr2: i64 = ng_find(&mut crep, i);
+            var ok2: bool = rdefs.get(rr2) == 1 && remat.get(rr2) == 1;
+            if rr2 == i { if !ok2 { remat.set(i, 0); } }
+            i = i + 1;
+        }
+        i = 0;
+        while i < nv {
+            var rr3: i64 = ng_find(&mut crep, i);
+            if rr3 != i { remat.set(i, remat.get(rr3)); remat_val.set(i, remat_val.get(rr3)); }
+            i = i + 1;
+        }
+    }
+
     // Spill weights (RA5): each use or definition counts 8^(loop depth), the
     // loops being the ranges [label, jump back to it]; the cheapest range
     // is the one to spill (`FID_NAT_OFF=weights`: the range ending last)
@@ -1957,6 +2018,11 @@ fn ng_mir_alloc(g: &mut NatGen, rec: &NatFnRec) -> NatAlloc {
                 if wr != i { weight.set(wr, weight.get(wr) + weight.get(i)); }
                 i = i + 1;
             }
+        }
+        i = 0;
+        while i < nv {
+            if remat.get(i) == 1 { weight.set(i, 1); }
+            i = i + 1;
         }
     }
 
@@ -2137,7 +2203,7 @@ fn ng_mir_alloc(g: &mut NatGen, rec: &NatFnRec) -> NatAlloc {
     cur = cur + 8 * save.len();
     var frame: i64 = (cur + 15) & (0 - 16);
     if frame < 16 { frame = 16; }
-    var al: NatAlloc = NatAlloc { assign: assign, spill: spill, frame: frame, save_regs: save, save_off: save_off, mask: mask, err: "" };
+    var al: NatAlloc = NatAlloc { assign: assign, remat: remat, remat_val: remat_val, spill: spill, frame: frame, save_regs: save, save_off: save_off, mask: mask, err: "" };
     var dump: str = p_getenv("FID_NAT_DUMP");
     if (dump as i64) != 0 && str_len(dump) > 0 && dump == rec.name {
         var dk: i64 = 0;
@@ -2375,9 +2441,12 @@ fn ng_mir_emit(g: &mut NatGen, rec: &NatFnRec, al: &NatAlloc) {
     g.save_off = al.save_off;
     g.frame = al.frame;
     var nv: i64 = rec.nvreg - NG_VBASE;
+    g.x0_reg = 0 - 1;
+    g.x1_reg = 0 - 1;
     var k: i64 = 0;
     while k < rec.mir.len() {
         var m: MInst = rec.mir.get(k);
+        if !ng_xc_keeps(m.op) { g.x0_reg = 0 - 1; g.x1_reg = 0 - 1; }
         var p0: i64 = m.r0;
         var p1: i64 = m.r1;
         var p2: i64 = m.r2;
@@ -2401,13 +2470,16 @@ fn ng_mir_emit(g: &mut NatGen, rec: &NatFnRec, al: &NatAlloc) {
                         p = ng_spill_reg(g, 0);
                     } else {
                         p = ng_spill_reg(g, nscr);
-                        if m.op != MO_MOV { ng_ld_slot(g, p, al.spill.get(vi)); }
+                        if m.op != MO_MOV {
+                            if al.remat.get(vi) == 1 { ng_li(g, p, al.remat_val.get(vi)); } else { ng_ld_slot(g, p, al.spill.get(vi)); }
+                            ng_xc_kill(g, p);
+                        }
                         loaded_v = v;
                         nscr = nscr + 1;
                     }
                 } else {
                     p = ng_spill_reg(g, 2);
-                    store_off = al.spill.get(vi);
+                    if al.remat.get(vi) != 1 { store_off = al.spill.get(vi); }
                 }
             }
             if f == 0 { p0 = p; } else if f == 1 { p1 = p; } else { p2 = p; }
@@ -2418,17 +2490,20 @@ fn ng_mir_emit(g: &mut NatGen, rec: &NatFnRec, al: &NatAlloc) {
             var sv: i64 = m.r1;
             var src_spilled: bool = sv >= NG_VBASE && sv - NG_VBASE < nv && al.assign.get(sv - NG_VBASE) < 0;
             if src_spilled && store_off >= 0 {
-                ng_ld_slot(g, p1, al.spill.get(sv - NG_VBASE));
+                ng_ld_spilled(g, p1, al, sv - NG_VBASE);
                 ng_st_slot(g, store_off, p1);
             } else if src_spilled {
-                ng_ld_slot(g, p0, al.spill.get(sv - NG_VBASE));
+                ng_ld_spilled(g, p0, al, sv - NG_VBASE);
             } else if store_off >= 0 {
                 ng_st_slot(g, store_off, p1);
             } else if p0 != p1 {
                 ng_mov(g, p0, p1);
             }
+            ng_xc_kill(g, p0);
+            ng_xc_kill(g, p1);
         } else {
             ng_mi_dispatch(g, m, p0, p1, p2);
+            if mi_defines(m.op) && m.op != MO_FBIN && m.op != MO_I2F { ng_xc_kill(g, p0); }
             if store_off >= 0 { ng_st_slot(g, store_off, p0); }
         }
         k = k + 1;
@@ -2455,17 +2530,33 @@ fn ng_line_close(g: &mut NatGen) {
 /// Instruction id's source line, when it starts a new one: a row now, or a
 /// MO_LINE recorded for the emission.
 fn ng_note_line(g: &mut NatGen, func: &IrFunction, id: i64) {
-    if id < 0 || id >= func.value_metas.len() { return; }
-    var vm: ValueIdMeta = func.value_metas.get(id);
-    if vm.id != id { return; }
-    var l: i64 = 0;
-    match vm.meta.source_line {
-        OptU64::Some(v) => { l = v as i64; }
-        OptU64::None => {}
-    }
+    var l: i64 = ng_meta_line(func, id);
     if l <= 0 || l == g.cur_line { return; }
     g.cur_line = l;
     if g.rec { ng_rec(g, MO_LINE, 0, 0, 0, l, 0, 0); } else { ng_line_row(g, l); }
+}
+
+/// The xmm cache forgets general register r (just written).
+fn ng_xc_kill(g: &mut NatGen, r: i64) {
+    if g.x0_reg == r { g.x0_reg = 0 - 1; }
+    if g.x1_reg == r { g.x1_reg = 0 - 1; }
+}
+
+/// Operations that write no register but their destination and leave
+/// xmm0/xmm1 alone (or keep the cache right themselves): the cache
+/// survives them. Anything else (calls, labels, division, shifts, copies,
+/// prologues) empties it.
+fn ng_xc_keeps(op: i64) -> bool {
+    if op == MO_FBIN || op == MO_FCMP || op == MO_I2F || op == MO_F2I || op == MO_LINE { return true; }
+    if op == MO_LI || op == MO_MOV || op == MO_LOAD || op == MO_STORE || op == MO_ADDR || op == MO_SLOTADDR { return true; }
+    if op == MO_LDSLOT || op == MO_STSLOT || op == MO_LDIN || op == MO_EXT || op == MO_NEG || op == MO_NOT { return true; }
+    if op == MO_ADD || op == MO_SUB || op == MO_MUL || op == MO_AND || op == MO_OR || op == MO_XOR { return true; }
+    return op == MO_SETCC || op == MO_PANICIF || op == MO_BNEZ || op == MO_BEQZ || op == MO_JMP;
+}
+
+/// r = spilled vreg vi: its constant again, or its slot.
+fn ng_ld_spilled(g: &mut NatGen, r: i64, al: &NatAlloc, vi: i64) {
+    if al.remat.get(vi) == 1 { ng_li(g, r, al.remat_val.get(vi)); } else { ng_ld_slot(g, r, al.spill.get(vi)); }
 }
 
 fn ng_mi_dispatch(g: &mut NatGen, m: MInst, p0: i64, p1: i64, p2: i64) {
@@ -2483,7 +2574,7 @@ fn ng_mi_dispatch(g: &mut NatGen, m: MInst, p0: i64, p1: i64, p2: i64) {
     if op == MO_JMP { ng_jmp(g, m.i0); return; }
     if op == MO_BNEZ { ng_bnez(g, p0, m.i0); return; }
     if op == MO_BEQZ { ng_beqz(g, p0, m.i0); return; }
-    if op == MO_PANICIF { ng_panic_if(g, p0, m.i0); return; }
+    if op == MO_PANICIF { g.cur_inst_line = m.i1; ng_panic_if(g, p0, m.i0); g.cur_inst_line = 0; return; }
     if op == MO_TRAP { ng_trap(g); return; }
     if op == MO_ADD { ng_add(g, p0, p1, p2); return; }
     if op == MO_SUB { ng_sub(g, p0, p1, p2); return; }
@@ -2723,8 +2814,24 @@ fn ng_x64_cc(cc: i64) -> i64 {
     return X64_AE;
 }
 
-/// xmm0, xmm1 = the floats of a and b (an f32 widened)
+/// xmm0, xmm1 = the floats of a and b (an f32 widened); an f64 already
+/// there (the xmm cache) is not moved again.
 fn ng_x64_fload2(g: &mut NatGen, a: i64, b: i64, is32: bool) {
+    if !is32 && !g.rec && ng_on("xmmcache") {
+        if g.x1_reg != b {
+            if g.x0_reg == b && g.x0_reg != a {
+                x64_sse(&mut g.e, 0xF2, 0x10, 1, 0);          // movsd xmm1, xmm0
+            } else {
+                x64_movq_xr(&mut g.e, 1, b, true);
+            }
+        }
+        if g.x0_reg != a { x64_movq_xr(&mut g.e, 0, a, true); }
+        g.x0_reg = a;
+        g.x1_reg = b;
+        return;
+    }
+    g.x0_reg = 0 - 1;
+    g.x1_reg = 0 - 1;
     if is32 {
         x64_movq_xr(&mut g.e, 0, a, false); x64_sse(&mut g.e, 0xF3, 0x5A, 0, 0);
         x64_movq_xr(&mut g.e, 1, b, false); x64_sse(&mut g.e, 0xF3, 0x5A, 1, 1);
@@ -2736,6 +2843,13 @@ fn ng_x64_fload2(g: &mut NatGen, a: i64, b: i64, is32: bool) {
 
 /// d = the bits of xmm0 (f32 bits, zero-extended, if is32)
 fn ng_x64_fstore0(g: &mut NatGen, d: i64, is32: bool) {
+    if g.x1_reg == d { g.x1_reg = 0 - 1; }
+    if !is32 && !g.rec && ng_on("xmmcache") {
+        x64_movq_rx(&mut g.e, d, 0, true);
+        g.x0_reg = d;
+        return;
+    }
+    g.x0_reg = 0 - 1;
     if is32 {
         x64_sse(&mut g.e, 0xF2, 0x5A, 0, 0);
         x64_movq_rx(&mut g.e, d, 0, false);
@@ -3506,10 +3620,16 @@ fn ng_gen_binop(g: &mut NatGen, id: i64, op: BinOp, left: i64, right: i64, ty: I
         BinOp::Sub => { ng_gen_checked(g, 1, ty, checked); }
         BinOp::Mul => { ng_gen_checked(g, 2, ty, checked); }
         BinOp::Div => {
+            g.cur_inst_line = ng_meta_line(func, id);
             ng_gen_divmod(g, false, ty, checked);
             if checked { ng_gen_narrow(g, ty, NP_DIV_OVF); } else { ng_gen_narrow(g, ty, 0 - 1); }
+            g.cur_inst_line = 0;
         }
-        BinOp::Mod => { ng_gen_divmod(g, true, ty, checked); }
+        BinOp::Mod => {
+            g.cur_inst_line = ng_meta_line(func, id);
+            ng_gen_divmod(g, true, ty, checked);
+            g.cur_inst_line = 0;
+        }
         BinOp::BitAnd => { ng_and(g, g.t0, g.t0, g.t1); }
         BinOp::BitOr => { ng_or(g, g.t0, g.t0, g.t1); }
         BinOp::BitXor => { ng_xor(g, g.t0, g.t0, g.t1); }
@@ -4577,6 +4697,70 @@ fn ng_gen_primitives2(g: &mut NatGen) {
     }
 }
 
+/// The stub panic `which` calls: with " at line N" for the messages the
+/// interpreter prints with a line and no operands (division by zero,
+/// modulo by zero, division overflow), when the instruction has one;
+/// `FID_NAT_OFF=panicline`: never.
+fn ng_panic_label(g: &mut NatGen, which: i64) -> i64 {
+    var line: i64 = g.cur_inst_line;
+    if line <= 0 || which < NP_DIV_OVF || !ng_on("panicline") { return g.panic_labels.get(which); }
+    var key: str = int_to_str(which) + ":" + int_to_str(line);
+    if HashMap_contains(g.pl_keys, key) { return HashMap_get(g.pl_keys, key); }
+    var l: i64 = NatEnc_label(&mut g.e);
+    HashMap_insert(g.pl_keys, key, l);
+    g.pl_list.push(which);
+    g.pl_list.push(line);
+    g.pl_list.push(l);
+    return l;
+}
+
+/// The source line of instruction id (0: none).
+fn ng_meta_line(func: &IrFunction, id: i64) -> i64 {
+    match IrFunction_get_meta(func, id) {
+        OptValueMeta::Some(m) => {
+            match m.source_line {
+                OptU64::Some(v) => { return v as i64; }
+                OptU64::None => {}
+            }
+        }
+        OptValueMeta::None => {}
+    }
+    return 0;
+}
+
+/// The stubs of panics with a line (after the code: they are known once
+/// every function is emitted).
+fn ng_gen_panic_line_stubs(g: &mut NatGen) {
+    var msgs: Vec<str> = nat_panic_messages();
+    var i: i64 = 0;
+    while i + 2 < g.pl_list.len() {
+        var which: i64 = g.pl_list.get(i);
+        var line: i64 = g.pl_list.get(i + 1);
+        NatEnc_align(&mut g.e, 4);
+        NatEnc_place(&mut g.e, g.pl_list.get(i + 2));
+        ng_panic_stub_body(g, msgs.get(which) + " at line " + int_to_str(line));
+        i = i + 3;
+    }
+}
+
+fn ng_panic_stub_body(g: &mut NatGen, msg: str) {
+    if ng_x64(g) {
+        x64_push(&mut g.e, 5);
+        x64_mov(&mut g.e, 5, 4);
+    } else if ng_a64(g) {
+        NatEnc_word(&mut g.e, 0xA9BF7BFD);            // stp x29, x30, [sp, #-16]!
+        a64_add_imm(&mut g.e, A64_FP, A64_SP, 0);
+    } else {
+        rv_addi(&mut g.e, RV_SP, RV_SP, 0 - 16);
+        rv_store(&mut g.e, RV_RA, RV_SP, 8, 8);
+        rv_store(&mut g.e, RV_S0, RV_SP, 0, 8);
+        rv_addi(&mut g.e, RV_S0, RV_SP, 16);
+    }
+    ng_addr(g, ng_argreg(g, 0), ng_str_label(g, msg));
+    ng_call_builtin(g, "p_panic", 1);
+    ng_trap(g);
+}
+
 fn ng_gen_panic_stubs(g: &mut NatGen) {
     var msgs: Vec<str> = nat_panic_messages();
     var i: i64 = 0;
@@ -4820,6 +5004,7 @@ fn nat_generate_image(module: IrModule, arch: i64, win: bool) -> ResultBytes {
         }
     }
     ng_line_close(&mut g);
+    ng_gen_panic_line_stubs(&mut g);
     var t_emit: i64 = p_clock_now_ms();
     time_mark("nat alloc+emit", t_rec);
     p_eprint_str("[prof] native: lower " + int_to_str(t_rec - t_start) + "ms, allocate and emit "

@@ -16,8 +16,8 @@ cd "$(dirname "$0")/.." || exit 1
 TARGET="${1:-}"
 if [ -z "$TARGET" ]; then sed -n '2,13p' "$0"; exit 1; fi
 shift
-IROPT="inline fold dce tailcall gvn licm"
-NAT="mir promote ipra fold hint rules purecse weights vecinline unchecked coalesce"
+IROPT="${IROPT-inline fold dce tailcall gvn licm}"
+NAT="${NAT:-mir promote ipra fold hint rules purecse weights vecinline unchecked coalesce panicline remat xmmcache}"
 mkdir -p build/pm
 base=$(env NATIVE=1 OUT=build/pm/all bash scripts/cross-test.sh "$TARGET" "$@" 2>&1 | grep -E "passed" | tail -n 1)
 echo "all on:            $base"

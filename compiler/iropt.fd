@@ -33,6 +33,7 @@ use compiler::ast;
 use compiler::ir;
 use compiler::checks;
 use compiler::pe_ir_stubs;
+use compiler::iropt_me;
 
 /// Largest callee (instructions, its return included) that is inlined.
 const IRO_INLINE_MAX: i64 = 16;
@@ -40,6 +41,8 @@ const IRO_INLINE_MAX: i64 = 16;
 /// Run every pass on `module` (the pass manager: see iro_pass_on).
 pub fn iropt_native(module: &mut IrModule) {
     if iro_pass_on("inline") { iro_inline(module); }
+    // ME20, ME21: inlining across functions, bottom-up (opt-in)
+    if ime_on("inline2") { ime_inline(module); }
     var n_fold: i64 = 0;
     var n_dce: i64 = 0;
     var n_tail: i64 = 0;
@@ -50,12 +53,14 @@ pub fn iropt_native(module: &mut IrModule) {
     var on_tail: bool = IRO_TAILCALL && iro_pass_on("tailcall");
     var on_gvn: bool = IRO_GVN && iro_pass_on("gvn");
     var on_licm: bool = IRO_LICM && iro_pass_on("licm");
-    var on_branch: bool = iro_pass_on("branchfold");
+    // ME12/ME14/ME15 of the first mid-end batch are opt-in (FID_IROPT_ON)
+    // until the suite agrees with them on and off
+    var on_branch: bool = iro_pass_on("branchfold") && ime_on("branchfold");
     var on_facts: bool = iro_pass_on("branchfacts");
     var on_sccp: bool = iro_pass_on("sccp");
     var on_promote: bool = iro_pass_on("promote");
-    var on_dse: bool = iro_pass_on("dse");
-    var on_simplify: bool = iro_pass_on("simplify");
+    var on_dse: bool = iro_pass_on("dse") && ime_on("dse");
+    var on_simplify: bool = iro_pass_on("simplify") && ime_on("simplify");
     var n_branch: i64 = 0;
     var n_facts: i64 = 0;
     var n_sccp: i64 = 0;
@@ -98,6 +103,9 @@ pub fn iropt_native(module: &mut IrModule) {
         var f: IrFunction = entry.func;
         var changed: bool = false;
         if stats { insts_before = insts_before + iro_count_insts(&f); }
+        // ME22-ME28 (compiler/iropt_me.fd, opt-in): restructuring first,
+        // so the cleanup passes below see their result
+        if ime_function_passes(&mut f) { changed = true; }
         if on_fold && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "fold", stats, &mut f) { changed = true; n_fold = n_fold + 1; }
         if on_simplify && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "simplify", stats, &mut f) { changed = true; n_simp = n_simp + 1; }
         if on_branch && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "branchfold", stats, &mut f) { changed = true; n_branch = n_branch + 1; }
@@ -1742,6 +1750,10 @@ fn iro_branch_facts(f: &mut IrFunction) -> bool {
     var cfg: IroCfg = iro_cfg(f);
     var u: IroUses = iro_uses(f);
     var changed: bool = false;
+    // remap buffers live outside the block loop: allocating one per branch
+    // OOMs on large functions
+    var mp: Vec<i64> = peir_zeros(f.next_value + 1);
+    var mp2: Vec<i64> = peir_zeros(f.next_value + 1);
     var b: i64 = 0;
     while b < f.blocks.len() {
         var blk: BasicBlock = f.blocks.get(b);
@@ -1784,7 +1796,6 @@ fn iro_branch_facts(f: &mut IrFunction) -> bool {
                                     var possible: i64 = cmask;
                                     if !truth { possible = 7 - cmask; }
                                     var cid: i64 = -1;
-                                    var mp: Vec<i64> = peir_zeros(f.next_value + 1);
                                     var i2: i64 = 0;
                                     while i2 < f.blocks.len() {
                                         if i2 == ti || iro_dominates(&cfg, ti, i2) {
@@ -1828,6 +1839,7 @@ fn iro_branch_facts(f: &mut IrFunction) -> bool {
                                         }
                                         i2 = i2 + 1;
                                     }
+                                    if c >= 0 && c < mp.len() { mp.set(c, 0); }
                                     // c = !a: the operand is `!val` here
                                     if notof >= 0 && notof < u.users.len() {
                                         var us3: Vec<i64> = u.users.get(notof);
@@ -1837,9 +1849,9 @@ fn iro_branch_facts(f: &mut IrFunction) -> bool {
                                             var ub3: i64 = u.block_of.get(uid3);
                                             if ub3 == ti || (ub3 >= 0 && iro_dominates(&cfg, ti, ub3)) {
                                                 var cid2: i64 = iro_bool_before(f, ti, !truth);
-                                                var mp2: Vec<i64> = peir_zeros(f.next_value + 1);
                                                 mp2.set(notof, cid2 + 1);
                                                 IrFunction_set_inst(f, uid3, iro_remap_all(peir_inst_of(f, uid3), &mp2));
+                                                mp2.set(notof, 0);
                                                 changed = true;
                                             }
                                             ui3 = ui3 + 1;
@@ -2649,6 +2661,15 @@ fn iro_simplify(f: &mut IrFunction) -> bool {
 // IR cannot carry yet (Jump/Branch take no arguments), so those loads
 // stay in memory. Replaced loads are dropped from their blocks; the
 // stores left dead are removed by dse.
+/// The value a store instruction stores now: its operand may have been
+/// renamed by a promotion since the event table recorded the store's id.
+fn iro_store_val(f: &IrFunction, iid: i64) -> i64 {
+    match peir_inst_of(f, iid) {
+        Inst::Store(_, sv, _) => { return sv; }
+        _ => { return -1; }
+    }
+}
+
 fn iro_promote(f: &mut IrFunction) -> bool {
     var cfg: IroCfg = iro_cfg(f);
     if cfg.n == 0 { return false; }
@@ -2677,7 +2698,9 @@ fn iro_promote(f: &mut IrFunction) -> bool {
                 }
                 Inst::Store(p, sv, _) => {
                     if p >= 0 && p < nv && plain.get(p) == 1 {
-                        ea.push(p); ek.push(1); ev.push(sv);
+                        // ev holds the store's inst id; the stored value is
+                        // re-read live (earlier promotions rename operands)
+                        ea.push(p); ek.push(1); ev.push(iid);
                     }
                 }
                 _ => {}
@@ -2688,13 +2711,20 @@ fn iro_promote(f: &mut IrFunction) -> bool {
         b = b + 1;
     }
     var changed: bool = false;
+    // values a TryUnwrap or Asm reads can never be renamed: a load feeding
+    // one stays in memory
+    var bad: Vec<i64> = iro_unhandled_uses(f);
+    // buffers live outside the alloca loop: allocating one per local OOMs
+    // on large functions
+    var in_st: Vec<i64> = Vec::new();
+    var out_st: Vec<i64> = Vec::new();
+    var map: Vec<i64> = peir_zeros(nv);
+    var deadl: Vec<i64> = peir_zeros(nv);
+    var i: i64 = 0;
+    while i < cfg.n { in_st.push(-1); out_st.push(-1); i = i + 1; }
     var a: i64 = 0;
     while a < nv {
         if plain.get(a) == 1 && has_load.get(a) == 1 {
-            var in_st: Vec<i64> = Vec::new();
-            var out_st: Vec<i64> = Vec::new();
-            var i: i64 = 0;
-            while i < cfg.n { in_st.push(-1); out_st.push(-1); i = i + 1; }
             var iter: i64 = 0;
             var stable: bool = false;
             while !stable && iter <= cfg.n {
@@ -2719,7 +2749,7 @@ fn iro_promote(f: &mut IrFunction) -> bool {
                     var ev2: Vec<i64> = ev_v.get(bi);
                     var k2: i64 = 0;
                     while k2 < ea2.len() {
-                        if ea2.get(k2) == a && ek2.get(k2) == 1 { st = ev2.get(k2); }
+                        if ea2.get(k2) == a && ek2.get(k2) == 1 { st = iro_store_val(f, ev2.get(k2)); }
                         k2 = k2 + 1;
                     }
                     if out_st.get(bi) != st { out_st.set(bi, st); stable = false; }
@@ -2728,8 +2758,7 @@ fn iro_promote(f: &mut IrFunction) -> bool {
                 iter = iter + 1;
             }
             // rewrite loads whose single reaching store is known
-            var map: Vec<i64> = peir_zeros(nv);
-            var deadl: Vec<i64> = peir_zeros(nv);
+            var touched: Vec<i64> = Vec::new();
             var found: bool = false;
             var rj: i64 = 0;
             while rj < cfg.rpo.len() {
@@ -2741,10 +2770,13 @@ fn iro_promote(f: &mut IrFunction) -> bool {
                 var k3: i64 = 0;
                 while k3 < ea3.len() {
                     if ea3.get(k3) == a {
-                        if ek3.get(k3) == 1 { st2 = ev3.get(k3); }
+                        if ek3.get(k3) == 1 { st2 = iro_store_val(f, ev3.get(k3)); }
                         else if st2 >= 0 {
                             var lid: i64 = ev3.get(k3);
-                            map.set(lid, st2 + 1); deadl.set(lid, 1); found = true;
+                            if bad.get(lid) == 0 {
+                                if deadl.get(lid) == 0 { touched.push(lid); }
+                                map.set(lid, st2 + 1); deadl.set(lid, 1); found = true;
+                            }
                         }
                     }
                     k3 = k3 + 1;
@@ -2776,6 +2808,14 @@ fn iro_promote(f: &mut IrFunction) -> bool {
                 }
                 changed = true;
             }
+            var rl: i64 = 0;
+            while rl < touched.len() {
+                var tl: i64 = touched.get(rl);
+                map.set(tl, 0); deadl.set(tl, 0);
+                rl = rl + 1;
+            }
+            var rs: i64 = 0;
+            while rs < cfg.n { in_st.set(rs, -1); out_st.set(rs, -1); rs = rs + 1; }
         }
         a = a + 1;
     }

@@ -1,0 +1,44 @@
+// mem2reg (`promote`, compiler/iropt.fd iro_promote) must not leave a
+// dangling value id: a store's operand re-read live after an earlier local
+// was promoted, and a load read by TryUnwrap/Asm stays in memory.
+// Miscompiled before the fix: emitted "Panic: Invalid memory access (null
+// or dangling pointer)" on the emit backend.
+
+fn bump(v: &mut Vec<i64>, n: i64) -> i64 {
+    var i = 0;
+    var t: i64 = 0;
+    while i < n {
+        v.push(i);
+        t = t + v.len();
+        i = i + 1;
+    }
+    return t;
+}
+
+fn chain() -> i64 {
+    // b is stored from a load of a: when a is promoted first, the store's
+    // recorded value must follow the rename.
+    var a: i64 = 5;
+    var b: i64 = a;
+    var c: i64 = b + 1;
+    var d: i64 = c * b;
+    return d;
+}
+
+fn main() -> i64 {
+    var v = Vec::new();
+    var r = bump(&mut v, 10);
+    assert_eq(r, 55);
+    assert_eq(v.len(), 10);
+    assert_eq(chain(), 30);
+    var w = Vec::new();
+    var i = 0;
+    while i < 10000 { w.push(i * 2); i = i + 1; }
+    assert_eq(w.len(), 10000);
+    var s: i64 = 0;
+    var j = 0;
+    while j < w.len() { s = s + w.get(j); j = j + 1; }
+    assert_eq(s, 99990000);
+    println("ok");
+    return 0;
+}
