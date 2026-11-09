@@ -1,0 +1,1082 @@
+// Fides Zstandard standard library
+//
+// Pure-Fides Zstandard decoder (RFC 8878). Decoding only; there is no
+// compressor.
+//
+//   frames:     frame header (descriptor, window descriptor, frame content
+//               size, single-segment flag), raw / RLE / compressed blocks,
+//               several frames one after another, skippable frames
+//               (magic 0x184D2A50..5F, skipped), the optional content
+//               checksum (low 32 bits of XXH64, verified)
+//   literals:   raw, RLE, Huffman-compressed and treeless (the previous
+//               block's Huffman table); Huffman weights FSE-compressed or
+//               direct; 1 or 4 streams
+//   sequences:  predefined, RLE, FSE-compressed and repeat modes for the
+//               literal-length, match-length and offset codes; repeat
+//               offsets, with the special cases for a literal length of 0
+//   window:     a match may reach back at most the window size and only into
+//               the current frame; a block decodes to at most
+//               min(window, 128 KB); output never exceeds the frame content
+//               size and must equal it when the header gives it
+//
+// Limits:
+//   - no dictionaries: a frame whose dictionary ID is not 0 is an error;
+//   - the whole output is kept in memory, as a Vec<i64> of bytes 0..255;
+//     the total is capped (256 MB by default, zstd_decompress_limit);
+//   - an input with no frame at all (empty) is an error; a stream of only
+//     skippable frames decodes to no bytes;
+//   - speed: fine compiled (C or native); `fid run` spends about 2 ms per
+//     output byte, so keep interpreted inputs to a few KB.
+//   Malformed input never panics: every read is bounds-checked and the
+//   result is an error (empty bytes, ok == false).
+//
+// Usage:
+//   use zstd;
+//   val r = zstd_decode(bytes);               // ZstdResult
+//   if r.ok { println(int_to_str(r.bytes.len())); } else { println(r.error); }
+//   val text = zstd_decompress_str(bytes);    // "" on error
+
+module zstd;
+
+use vec;
+use string;
+
+// ─── Public result ──────────────────────────────────────────────────────
+
+/// The outcome of decoding a Zstandard stream. `ok` is false on malformed
+/// input; `bytes` is then empty and `error` says what was wrong. A valid
+/// stream whose content is empty gives ok == true and empty `bytes`.
+pub struct ZstdResult {
+    pub ok: bool,
+    pub bytes: Vec<i64>,
+    pub error: str,
+}
+
+// ─── Internal state ─────────────────────────────────────────────────────
+
+// FSE decoding table: entry for each state = symbol | bits to read << 8 |
+// base of the next state << 16 (one Vec read per state).
+struct ZsFse {
+    ok: bool,
+    log: i64,
+    tab: Vec<i64>,
+}
+
+// Huffman decoding table (2^max_bits entries, symbol | bits << 8) and the
+// size of its description in the input.
+struct ZsHuf {
+    ok: bool,
+    max_bits: i64,
+    tab: Vec<i64>,
+    used: i64,
+}
+
+// Forward bit reader (FSE table descriptions): absolute bit position, and
+// the byte index where the readable data ends. Bits past the end read as 0;
+// the caller checks pos against end afterwards.
+struct ZsFwd {
+    pos: i64,
+    end: i64,
+}
+
+// Backward bit reader: bit position of the stream start (byte * 8) and the
+// number of unread bits above it, which goes negative once the reader runs
+// past the start (those bits read as 0).
+struct ZsRev {
+    bad: bool,
+    start: i64,
+    off: i64,
+}
+
+// Per-frame decoding state.
+struct ZsState {
+    err: str,
+    fstart: i64,      // index in the output where this frame starts
+    win: i64,         // window size
+    block_max: i64,   // min(window, 128 KB)
+    limit: i64,       // cap on the total output
+    huf: ZsHuf,
+    ll: ZsFse,
+    of: ZsFse,
+    ml: ZsFse,
+    rep1: i64,
+    rep2: i64,
+    rep3: i64,
+    llcode: Vec<i64>, // literal-length code -> baseline | extra bits << 24
+    mlcode: Vec<i64>, // match-length code -> baseline | extra bits << 24
+}
+
+fn zs_fse_none() -> ZsFse {
+    return ZsFse { ok: false, log: 0, tab: Vec::new() };
+}
+
+fn zs_huf_none() -> ZsHuf {
+    return ZsHuf { ok: false, max_bits: 0, tab: Vec::new(), used: 0 };
+}
+
+fn zs_fail(st: &mut ZsState, msg: str) -> bool {
+    if str_len(st.err) == 0 { st.err = msg; }
+    return false;
+}
+
+// ─── Small helpers ──────────────────────────────────────────────────────
+
+// Index of the highest set bit; -1 for 0.
+fn zs_hibit(x: i64) -> i64 {
+    var v: i64 = x;
+    var n: i64 = -1;
+    while v > 0 { v = v >> 1; n = n + 1; }
+    return n;
+}
+
+// Little-endian value of `n` bytes at `pos` (caller checks bounds).
+fn zs_le(d: Vec<i64>, pos: i64, n: i64) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        v = v | (d.get(pos + i) << (8 * i));
+        i = i + 1;
+    }
+    return v;
+}
+
+// `n` (0..32) bits starting at absolute bit `bitpos`, LSB first. The caller
+// makes sure every byte touched is inside `d`.
+fn zs_le_bits(d: Vec<i64>, bitpos: i64, n: i64) -> i64 {
+    if n <= 0 { return 0; }
+    var p: i64 = bitpos >> 3;
+    var sh: i64 = bitpos & 7;
+    var v: i64 = d.get(p) >> sh;
+    var got: i64 = 8 - sh;
+    p = p + 1;
+    while got < n {
+        v = v | (d.get(p) << got);
+        got = got + 8;
+        p = p + 1;
+    }
+    return v & ((1 << n) - 1);
+}
+
+// Parse "1,-1,2" into a Vec (used for the fixed tables).
+fn zs_list(s: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    var cur: i64 = 0;
+    var neg: bool = false;
+    var have: bool = false;
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if c == 45 { neg = true; }
+        else if c >= 48 && c <= 57 { cur = cur * 10 + (c - 48); have = true; }
+        else if c == 44 {
+            if have { if neg { out.push(0 - cur); } else { out.push(cur); } }
+            cur = 0; neg = false; have = false;
+        }
+        i = i + 1;
+    }
+    if have { if neg { out.push(0 - cur); } else { out.push(cur); } }
+    return out;
+}
+
+// ─── Bit readers ────────────────────────────────────────────────────────
+
+fn zs_fwd_bits(d: Vec<i64>, r: &mut ZsFwd, n: i64) -> i64 {
+    var lim: i64 = r.end * 8;
+    var p: i64 = r.pos;
+    r.pos = p + n;
+    if n <= 0 || p >= lim { return 0; }
+    if lim - p < n { return zs_le_bits(d, p, lim - p); }
+    return zs_le_bits(d, p, n);
+}
+
+// Open a backward stream of `len` bytes at byte `start`: skip the padding
+// zeros and the 1 marker bit at the top of its last byte.
+fn zs_rev_open(d: Vec<i64>, start: i64, len: i64) -> ZsRev {
+    if len <= 0 || start < 0 || start + len > d.len() {
+        return ZsRev { bad: true, start: 0, off: 0 };
+    }
+    var last: i64 = d.get(start + len - 1);
+    if last == 0 { return ZsRev { bad: true, start: 0, off: 0 }; }
+    var pad: i64 = 8 - zs_hibit(last);
+    return ZsRev { bad: false, start: start * 8, off: len * 8 - pad };
+}
+
+fn zs_rev_bits(d: Vec<i64>, r: &mut ZsRev, n: i64) -> i64 {
+    if n <= 0 { return 0; }
+    r.off = r.off - n;
+    if r.off >= 0 { return zs_le_bits(d, r.start + r.off, n); }
+    var have: i64 = n + r.off;
+    if have <= 0 { return 0; }
+    return zs_le_bits(d, r.start, have) << (0 - r.off);
+}
+
+// ─── FSE tables ─────────────────────────────────────────────────────────
+
+// Build a decoding table from normalized counts (-1 = "less than one").
+fn zs_fse_build(norm: Vec<i64>, nsym: i64, log: i64) -> ZsFse {
+    var size: i64 = 1 << log;
+    var sym: Vec<i64> = Vec::filled(size, 0);
+    var next: Vec<i64> = Vec::filled(nsym + 1, 0);
+    var high: i64 = size;
+    var total: i64 = 0;
+    var s: i64 = 0;
+    while s < nsym {
+        var c0: i64 = norm.get(s);
+        if c0 == -1 {
+            high = high - 1;
+            if high < 0 { return zs_fse_none(); }
+            sym.set(high, s);
+            next.set(s, 1);
+            total = total + 1;
+        } else if c0 > 0 {
+            total = total + c0;
+        } else if c0 < -1 {
+            return zs_fse_none();
+        }
+        s = s + 1;
+    }
+    if total != size { return zs_fse_none(); }
+    var step: i64 = (size >> 1) + (size >> 3) + 3;
+    var mask: i64 = size - 1;
+    var p: i64 = 0;
+    s = 0;
+    while s < nsym {
+        var c: i64 = norm.get(s);
+        if c > 0 {
+            next.set(s, c);
+            var i: i64 = 0;
+            while i < c {
+                sym.set(p, s);
+                p = (p + step) & mask;
+                while p >= high { p = (p + step) & mask; }
+                i = i + 1;
+            }
+        }
+        s = s + 1;
+    }
+    if p != 0 { return zs_fse_none(); }
+    var k: i64 = 0;
+    while k < size {
+        var sy: i64 = sym.get(k);
+        var x: i64 = next.get(sy);
+        next.set(sy, x + 1);
+        var b: i64 = log - zs_hibit(x);
+        sym.set(k, sy | (b << 8) | (((x << b) - size) << 16));
+        k = k + 1;
+    }
+    return ZsFse { ok: true, log: log, tab: sym };
+}
+
+// Read an FSE table description (RFC 8878 4.1.1) at r.pos; leaves r.pos
+// at the next byte boundary.
+fn zs_fse_read(d: Vec<i64>, r: &mut ZsFwd, maxlog: i64, maxsym: i64) -> ZsFse {
+    var log: i64 = zs_fwd_bits(d, r, 4) + 5;
+    if log > maxlog { return zs_fse_none(); }
+    var remaining: i64 = 1 << log;
+    var norm: Vec<i64> = Vec::new();
+    while remaining > 0 && norm.len() < maxsym {
+        var bits: i64 = zs_hibit(remaining + 1) + 1;
+        var v: i64 = zs_fwd_bits(d, r, bits);
+        var lower: i64 = (1 << (bits - 1)) - 1;
+        var threshold: i64 = (1 << bits) - 1 - (remaining + 1);
+        if (v & lower) < threshold {
+            r.pos = r.pos - 1;
+            v = v & lower;
+        } else if v > lower {
+            v = v - threshold;
+        }
+        var p: i64 = v - 1;
+        if p < 0 { remaining = remaining + p; } else { remaining = remaining - p; }
+        norm.push(p);
+        if p == 0 {
+            var rep: i64 = zs_fwd_bits(d, r, 2);
+            while true {
+                var k: i64 = 0;
+                while k < rep && norm.len() < maxsym { norm.push(0); k = k + 1; }
+                if rep == 3 && r.pos <= r.end * 8 { rep = zs_fwd_bits(d, r, 2); }
+                else { break; }
+            }
+        }
+        if r.pos > r.end * 8 { return zs_fse_none(); }
+    }
+    if remaining != 0 || r.pos > r.end * 8 { return zs_fse_none(); }
+    r.pos = ((r.pos + 7) >> 3) << 3;
+    return zs_fse_build(norm, norm.len(), log);
+}
+
+fn zs_fse_rle(s: i64) -> ZsFse {
+    var tab: Vec<i64> = Vec::new();
+    tab.push(s);
+    return ZsFse { ok: true, log: 0, tab: tab };
+}
+
+// Predefined distributions (RFC 8878 3.1.1.3.2.2).
+fn zs_fse_predefined(kind: i64) -> ZsFse {
+    if kind == 0 {
+        var lln: Vec<i64> = zs_list("4,3,2,2,2,2,2,2,2,2,2,2,2,1,1,1,2,2,2,2,2,2,2,2,2,3,2,1,1,1,1,1,-1,-1,-1,-1");
+        return zs_fse_build(lln, lln.len(), 6);
+    }
+    if kind == 1 {
+        var ofn: Vec<i64> = zs_list("1,1,1,1,1,1,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1");
+        return zs_fse_build(ofn, ofn.len(), 5);
+    }
+    var mln: Vec<i64> = zs_list("1,4,3,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1,-1,-1");
+    return zs_fse_build(mln, mln.len(), 6);
+}
+
+// The table for one code type (kind 0 = literal lengths, 1 = offsets,
+// 2 = match lengths) in the given compression mode.
+fn zs_seq_table(d: Vec<i64>, mode: i64, kind: i64, prev: ZsFse, r: &mut ZsFwd) -> ZsFse {
+    var maxlog: i64 = 9;
+    var maxsym: i64 = 36;
+    if kind == 1 { maxlog = 8; maxsym = 32; }
+    if kind == 2 { maxsym = 53; }
+    if mode == 0 { return zs_fse_predefined(kind); }
+    if mode == 1 {
+        var bp: i64 = r.pos >> 3;
+        if bp >= r.end { return zs_fse_none(); }
+        var s: i64 = d.get(bp);
+        r.pos = r.pos + 8;
+        if s >= maxsym { return zs_fse_none(); }
+        return zs_fse_rle(s);
+    }
+    if mode == 2 { return zs_fse_read(d, r, maxlog, maxsym); }
+    return prev;
+}
+
+// ─── Huffman tables ─────────────────────────────────────────────────────
+
+// Build the table from the transmitted weights (the last weight is implied).
+fn zs_huf_build(w: Vec<i64>) -> ZsHuf {
+    var n: i64 = w.len();
+    if n + 1 > 256 || n == 0 { return zs_huf_none(); }
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var x: i64 = w.get(i);
+        if x > 11 || x < 0 { return zs_huf_none(); }
+        if x > 0 { sum = sum + (1 << (x - 1)); }
+        i = i + 1;
+    }
+    if sum == 0 { return zs_huf_none(); }
+    var max_bits: i64 = zs_hibit(sum) + 1;
+    if max_bits > 11 { return zs_huf_none(); }
+    var left: i64 = (1 << max_bits) - sum;
+    if (left & (left - 1)) != 0 { return zs_huf_none(); }
+    var last_w: i64 = zs_hibit(left) + 1;
+    var bits: Vec<i64> = Vec::new();
+    i = 0;
+    while i < n {
+        var y: i64 = w.get(i);
+        if y > 0 { bits.push(max_bits + 1 - y); } else { bits.push(0); }
+        i = i + 1;
+    }
+    bits.push(max_bits + 1 - last_w);
+    var nsym: i64 = n + 1;
+    var size: i64 = 1 << max_bits;
+    var rank_count: Vec<i64> = Vec::filled(max_bits + 2, 0);
+    i = 0;
+    while i < nsym {
+        var b: i64 = bits.get(i);
+        if b > max_bits || b < 0 { return zs_huf_none(); }
+        rank_count.set(b, rank_count.get(b) + 1);
+        i = i + 1;
+    }
+    var rank_idx: Vec<i64> = Vec::filled(max_bits + 2, 0);
+    var tab: Vec<i64> = Vec::filled(size, 0);
+    rank_idx.set(max_bits, 0);
+    var k: i64 = max_bits;
+    while k >= 1 {
+        var lo: i64 = rank_idx.get(k);
+        var hi: i64 = lo + rank_count.get(k) * (1 << (max_bits - k));
+        if hi > size { return zs_huf_none(); }
+        rank_idx.set(k - 1, hi);
+        k = k - 1;
+    }
+    if rank_idx.get(0) != size { return zs_huf_none(); }
+    i = 0;
+    while i < nsym {
+        var bb: i64 = bits.get(i);
+        if bb != 0 {
+            var code: i64 = rank_idx.get(bb);
+            var len: i64 = 1 << (max_bits - bb);
+            var j2: i64 = 0;
+            while j2 < len { tab.set(code + j2, i | (bb << 8)); j2 = j2 + 1; }
+            rank_idx.set(bb, code + len);
+        }
+        i = i + 1;
+    }
+    return ZsHuf { ok: true, max_bits: max_bits, tab: tab, used: 0 };
+}
+
+// Weights compressed with FSE: `len` bytes at `start`, two interleaved
+// states over one backward stream.
+fn zs_huf_fse_weights(d: Vec<i64>, start: i64, len: i64) -> Vec<i64> {
+    var w: Vec<i64> = Vec::new();
+    var r: ZsFwd = ZsFwd { pos: start * 8, end: start + len };
+    var t: ZsFse = zs_fse_read(d, &mut r, 6, 256);
+    if !t.ok { return Vec::new(); }
+    var sb: i64 = r.pos >> 3;
+    var rv: ZsRev = zs_rev_open(d, sb, start + len - sb);
+    if rv.bad { return Vec::new(); }
+    var s1: i64 = zs_rev_bits(d, &mut rv, t.log);
+    var s2: i64 = zs_rev_bits(d, &mut rv, t.log);
+    while true {
+        if w.len() > 255 { return Vec::new(); }
+        var e1: i64 = t.tab.get(s1);
+        w.push(e1 & 255);
+        s1 = (e1 >> 16) + zs_rev_bits(d, &mut rv, (e1 >> 8) & 255);
+        if rv.off < 0 { w.push(t.tab.get(s2) & 255); break; }
+        var e2: i64 = t.tab.get(s2);
+        w.push(e2 & 255);
+        s2 = (e2 >> 16) + zs_rev_bits(d, &mut rv, (e2 >> 8) & 255);
+        if rv.off < 0 { w.push(t.tab.get(s1) & 255); break; }
+    }
+    if w.len() > 255 { return Vec::new(); }
+    return w;
+}
+
+// Read a Huffman tree description at `pos` with `avail` bytes available.
+fn zs_huf_read(d: Vec<i64>, pos: i64, avail: i64) -> ZsHuf {
+    if avail < 1 { return zs_huf_none(); }
+    var h: i64 = d.get(pos);
+    var w: Vec<i64> = Vec::new();
+    var used: i64 = 0;
+    if h < 128 {
+        if h == 0 || h + 1 > avail { return zs_huf_none(); }
+        w = zs_huf_fse_weights(d, pos + 1, h);
+        used = 1 + h;
+    } else {
+        var nw: i64 = h - 127;
+        var nbytes: i64 = (nw + 1) / 2;
+        if 1 + nbytes > avail { return zs_huf_none(); }
+        var i: i64 = 0;
+        while i < nw {
+            var by: i64 = d.get(pos + 1 + i / 2);
+            if (i & 1) == 0 { w.push(by >> 4); } else { w.push(by & 15); }
+            i = i + 1;
+        }
+        used = 1 + nbytes;
+    }
+    if w.len() == 0 { return zs_huf_none(); }
+    var t: ZsHuf = zs_huf_build(w);
+    if !t.ok { return t; }
+    return ZsHuf { ok: true, max_bits: t.max_bits, tab: t.tab, used: used };
+}
+
+// Decode exactly `count` symbols from one Huffman stream; the stream must
+// be consumed exactly. The backward reader is inlined here (as in
+// zs_sequences): `acc` holds the next `cnt` bits, `nxt` is the next byte to
+// load (going down) and `over` counts the zero bits read past the start.
+// The unread bits are cnt + 8 * (nxt - start + 1) - over.
+fn zs_huf_stream(d: Vec<i64>, start: i64, len: i64, h: ZsHuf, count: i64, lits: &mut Vec<i64>) -> bool {
+    if count < 0 || len <= 0 || start < 0 || start + len > d.len() { return false; }
+    var last: i64 = d.get(start + len - 1);
+    if last == 0 { return false; }
+    var cnt: i64 = zs_hibit(last);
+    var acc: i64 = last & ((1 << cnt) - 1);
+    var nxt: i64 = start + len - 2;
+    var over: i64 = 0;
+    var mb: i64 = h.max_bits;
+    var mask: i64 = (1 << mb) - 1;
+    while cnt < mb {
+        if nxt >= start { acc = (acc << 8) | d.get(nxt); nxt = nxt - 1; cnt = cnt + 8; }
+        else { over = over + mb - cnt; acc = acc << (mb - cnt); cnt = mb; }
+    }
+    cnt = cnt - mb;
+    var s: i64 = (acc >> cnt);
+    acc = acc & ((1 << cnt) - 1);
+    var i: i64 = 0;
+    while i < count {
+        if cnt + 8 * (nxt - start + 1) - over <= 0 - mb { return false; }
+        var e: i64 = h.tab.get(s);
+        lits.push(e & 255);
+        var b: i64 = e >> 8;
+        while cnt < b {
+            if nxt >= start { acc = (acc << 8) | d.get(nxt); nxt = nxt - 1; cnt = cnt + 8; }
+            else { over = over + b - cnt; acc = acc << (b - cnt); cnt = b; }
+        }
+        cnt = cnt - b;
+        s = ((s << b) | (acc >> cnt)) & mask;
+        acc = acc & ((1 << cnt) - 1);
+        i = i + 1;
+    }
+    return cnt + 8 * (nxt - start + 1) - over == 0 - mb;
+}
+
+// ─── Literals section ───────────────────────────────────────────────────
+
+// Decode the literals section at `pos` (block ends at `end`) into `lits`.
+// Returns the position after it, or -1.
+fn zs_literals(d: Vec<i64>, pos: i64, end: i64, st: &mut ZsState, lits: &mut Vec<i64>) -> i64 {
+    if pos >= end { zs_fail(st, "missing literals section"); return -1; }
+    var b0: i64 = d.get(pos);
+    var ltype: i64 = b0 & 3;
+    var sf: i64 = (b0 >> 2) & 3;
+    var p: i64 = pos;
+    if ltype <= 1 {
+        var regen: i64 = 0;
+        if sf == 0 || sf == 2 { regen = b0 >> 3; p = p + 1; }
+        else if sf == 1 {
+            if p + 2 > end { zs_fail(st, "truncated literals header"); return -1; }
+            regen = (b0 >> 4) + (d.get(p + 1) << 4);
+            p = p + 2;
+        } else {
+            if p + 3 > end { zs_fail(st, "truncated literals header"); return -1; }
+            regen = (b0 >> 4) + (d.get(p + 1) << 4) + (d.get(p + 2) << 12);
+            p = p + 3;
+        }
+        if regen > st.block_max { zs_fail(st, "literals larger than a block"); return -1; }
+        if ltype == 0 {
+            if p + regen > end { zs_fail(st, "truncated raw literals"); return -1; }
+            var i: i64 = 0;
+            while i < regen { lits.push(d.get(p + i)); i = i + 1; }
+            return p + regen;
+        }
+        if p + 1 > end { zs_fail(st, "truncated RLE literals"); return -1; }
+        var bt: i64 = d.get(p);
+        var j: i64 = 0;
+        while j < regen { lits.push(bt); j = j + 1; }
+        return p + 1;
+    }
+    var hl: i64 = 3;
+    var nbits: i64 = 10;
+    var streams: i64 = 4;
+    if sf == 0 { streams = 1; }
+    else if sf == 2 { hl = 4; nbits = 14; }
+    else if sf == 3 { hl = 5; nbits = 18; }
+    if p + hl > end { zs_fail(st, "truncated literals header"); return -1; }
+    var hv: i64 = zs_le(d, p, hl);
+    var regen2: i64 = (hv >> 4) & ((1 << nbits) - 1);
+    var csize: i64 = (hv >> (4 + nbits)) & ((1 << nbits) - 1);
+    p = p + hl;
+    if p + csize > end { zs_fail(st, "truncated compressed literals"); return -1; }
+    if regen2 > st.block_max { zs_fail(st, "literals larger than a block"); return -1; }
+    var hend: i64 = p + csize;
+    if ltype == 2 {
+        var nh: ZsHuf = zs_huf_read(d, p, csize);
+        if !nh.ok { zs_fail(st, "bad Huffman table"); return -1; }
+        st.huf = nh;
+        p = p + nh.used;
+    } else if !st.huf.ok {
+        zs_fail(st, "treeless literals without a previous table");
+        return -1;
+    }
+    var h: ZsHuf = st.huf;
+    if streams == 1 {
+        if !zs_huf_stream(d, p, hend - p, h, regen2, lits) {
+            zs_fail(st, "bad Huffman stream");
+            return -1;
+        }
+        return hend;
+    }
+    if p + 6 > hend { zs_fail(st, "truncated jump table"); return -1; }
+    var s1: i64 = zs_le(d, p, 2);
+    var s2: i64 = zs_le(d, p + 2, 2);
+    var s3: i64 = zs_le(d, p + 4, 2);
+    var p1: i64 = p + 6;
+    var p2: i64 = p1 + s1;
+    var p3: i64 = p2 + s2;
+    var p4: i64 = p3 + s3;
+    if p4 > hend { zs_fail(st, "bad jump table"); return -1; }
+    var seg: i64 = (regen2 + 3) / 4;
+    var lastn: i64 = regen2 - 3 * seg;
+    if !zs_huf_stream(d, p1, s1, h, seg, lits)
+        || !zs_huf_stream(d, p2, s2, h, seg, lits)
+        || !zs_huf_stream(d, p3, s3, h, seg, lits)
+        || !zs_huf_stream(d, p4, hend - p4, h, lastn, lits) {
+        zs_fail(st, "bad Huffman stream");
+        return -1;
+    }
+    return hend;
+}
+
+// ─── Sequences section and execution ────────────────────────────────────
+
+fn zs_sequences(d: Vec<i64>, pos: i64, end: i64, st: &mut ZsState, lits: Vec<i64>, out: &mut Vec<i64>) -> bool {
+    if pos >= end { return zs_fail(st, "missing sequences section"); }
+    var p: i64 = pos;
+    var b0: i64 = d.get(p);
+    var nseq: i64 = 0;
+    if b0 < 128 { nseq = b0; p = p + 1; }
+    else if b0 < 255 {
+        if p + 2 > end { return zs_fail(st, "truncated sequences header"); }
+        nseq = ((b0 - 128) << 8) + d.get(p + 1);
+        p = p + 2;
+    } else {
+        if p + 3 > end { return zs_fail(st, "truncated sequences header"); }
+        nseq = d.get(p + 1) + (d.get(p + 2) << 8) + 0x7F00;
+        p = p + 3;
+    }
+    var bstart: i64 = out.len();
+    var lp: i64 = 0;
+    var nlit: i64 = lits.len();
+    if nseq == 0 {
+        if p != end { return zs_fail(st, "data after an empty sequences section"); }
+    } else {
+        if p >= end { return zs_fail(st, "missing compression modes"); }
+        var modes: i64 = d.get(p);
+        p = p + 1;
+        if (modes & 3) != 0 { return zs_fail(st, "reserved bits set in compression modes"); }
+        var r: ZsFwd = ZsFwd { pos: p * 8, end: end };
+        var llt: ZsFse = zs_seq_table(d, (modes >> 6) & 3, 0, st.ll, &mut r);
+        if !llt.ok { return zs_fail(st, "bad literal-length table"); }
+        var oft: ZsFse = zs_seq_table(d, (modes >> 4) & 3, 1, st.of, &mut r);
+        if !oft.ok { return zs_fail(st, "bad offset table"); }
+        var mlt: ZsFse = zs_seq_table(d, (modes >> 2) & 3, 2, st.ml, &mut r);
+        if !mlt.ok { return zs_fail(st, "bad match-length table"); }
+        if r.pos > end * 8 { return zs_fail(st, "truncated sequence tables"); }
+        st.ll = llt;
+        st.of = oft;
+        st.ml = mlt;
+        // Backward bitstream, read inline (see zs_huf_stream).
+        var sb: i64 = (r.pos + 7) >> 3;
+        if sb >= end { return zs_fail(st, "missing sequence bitstream"); }
+        var lastb: i64 = d.get(end - 1);
+        if lastb == 0 { return zs_fail(st, "bad sequence bitstream"); }
+        var cnt: i64 = zs_hibit(lastb);
+        var acc: i64 = lastb & ((1 << cnt) - 1);
+        var nxt: i64 = end - 2;
+        var over: i64 = 0;
+        var need: i64 = llt.log + oft.log + mlt.log;
+        while cnt < need {
+            if nxt >= sb { acc = (acc << 8) | d.get(nxt); nxt = nxt - 1; cnt = cnt + 8; }
+            else { over = over + need - cnt; acc = acc << (need - cnt); cnt = need; }
+        }
+        cnt = cnt - llt.log;
+        var lls: i64 = (acc >> cnt);
+        acc = acc & ((1 << cnt) - 1);
+        cnt = cnt - oft.log;
+        var ofs: i64 = (acc >> cnt);
+        acc = acc & ((1 << cnt) - 1);
+        cnt = cnt - mlt.log;
+        var mls: i64 = (acc >> cnt);
+        acc = acc & ((1 << cnt) - 1);
+        var r1: i64 = st.rep1;
+        var r2: i64 = st.rep2;
+        var r3: i64 = st.rep3;
+        var llcode: Vec<i64> = st.llcode;
+        var mlcode: Vec<i64> = st.mlcode;
+        var lltab: Vec<i64> = llt.tab;
+        var oftab: Vec<i64> = oft.tab;
+        var mltab: Vec<i64> = mlt.tab;
+        var i: i64 = 0;
+        while i < nseq {
+            var ell: i64 = lltab.get(lls);
+            var eof: i64 = oftab.get(ofs);
+            var eml: i64 = mltab.get(mls);
+            var ofc: i64 = eof & 255;
+            var cml: i64 = mlcode.get(eml & 255);
+            var cll: i64 = llcode.get(ell & 255);
+            // offset extra bits (up to 31)
+            while cnt < ofc {
+                if nxt >= sb { acc = (acc << 8) | d.get(nxt); nxt = nxt - 1; cnt = cnt + 8; }
+                else { over = over + ofc - cnt; acc = acc << (ofc - cnt); cnt = ofc; }
+            }
+            cnt = cnt - ofc;
+            var ofv: i64 = (1 << ofc) + (acc >> cnt);
+            acc = acc & ((1 << cnt) - 1);
+            // match-length, then literal-length extra bits (up to 16 each)
+            var mlbits: i64 = cml >> 24;
+            var llbits: i64 = cll >> 24;
+            need = mlbits + llbits;
+            while cnt < need {
+                if nxt >= sb { acc = (acc << 8) | d.get(nxt); nxt = nxt - 1; cnt = cnt + 8; }
+                else { over = over + need - cnt; acc = acc << (need - cnt); cnt = need; }
+            }
+            cnt = cnt - mlbits;
+            var ml: i64 = (cml & 0xFFFFFF) + (acc >> cnt);
+            acc = acc & ((1 << cnt) - 1);
+            cnt = cnt - llbits;
+            var ll: i64 = (cll & 0xFFFFFF) + (acc >> cnt);
+            acc = acc & ((1 << cnt) - 1);
+            var off: i64 = 0;
+            if ofv > 3 {
+                off = ofv - 3;
+                r3 = r2; r2 = r1; r1 = off;
+            } else {
+                var idx: i64 = ofv - 1;
+                if ll == 0 { idx = idx + 1; }
+                if idx == 0 { off = r1; }
+                else {
+                    if idx == 1 { off = r2; }
+                    else if idx == 2 { off = r3; }
+                    else { off = r1 - 1; }
+                    if idx > 1 { r3 = r2; }
+                    r2 = r1;
+                    r1 = off;
+                }
+            }
+            if i + 1 < nseq {
+                // state updates: literal length, match length, offset
+                var nll: i64 = (ell >> 8) & 255;
+                var nml: i64 = (eml >> 8) & 255;
+                var nof: i64 = (eof >> 8) & 255;
+                need = nll + nml + nof;
+                while cnt < need {
+                    if nxt >= sb { acc = (acc << 8) | d.get(nxt); nxt = nxt - 1; cnt = cnt + 8; }
+                    else { over = over + need - cnt; acc = acc << (need - cnt); cnt = need; }
+                }
+                cnt = cnt - nll;
+                lls = (ell >> 16) + (acc >> cnt);
+                acc = acc & ((1 << cnt) - 1);
+                cnt = cnt - nml;
+                mls = (eml >> 16) + (acc >> cnt);
+                acc = acc & ((1 << cnt) - 1);
+                cnt = cnt - nof;
+                ofs = (eof >> 16) + (acc >> cnt);
+                acc = acc & ((1 << cnt) - 1);
+            }
+            // execute: literals, then the match
+            if lp + ll > nlit { return zs_fail(st, "sequence uses more literals than decoded"); }
+            if out.len() - bstart + ll + ml > st.block_max { return zs_fail(st, "block larger than the maximum"); }
+            var k: i64 = 0;
+            while k < ll { out.push(lits.get(lp + k)); k = k + 1; }
+            lp = lp + ll;
+            if off < 1 || off > out.len() - st.fstart || off > st.win {
+                return zs_fail(st, "match offset out of range");
+            }
+            var src: i64 = out.len() - off;
+            var m: i64 = 0;
+            while m < ml { out.push(out.get(src + m)); m = m + 1; }
+            i = i + 1;
+        }
+        if cnt + 8 * (nxt - sb + 1) - over != 0 { return zs_fail(st, "sequence bitstream not fully consumed"); }
+        st.rep1 = r1;
+        st.rep2 = r2;
+        st.rep3 = r3;
+    }
+    if out.len() - bstart + (nlit - lp) > st.block_max { return zs_fail(st, "block larger than the maximum"); }
+    while lp < nlit { out.push(lits.get(lp)); lp = lp + 1; }
+    return true;
+}
+
+fn zs_block(d: Vec<i64>, pos: i64, bsize: i64, st: &mut ZsState, out: &mut Vec<i64>) -> bool {
+    var end: i64 = pos + bsize;
+    var lits: Vec<i64> = Vec::new();
+    var p: i64 = zs_literals(d, pos, end, st, &mut lits);
+    if p < 0 { return false; }
+    return zs_sequences(d, p, end, st, lits, out);
+}
+
+// ─── XXH64 ──────────────────────────────────────────────────────────────
+
+const ZS_P1: i64 = (0x9E3779B1 << 32) | 0x85EBCA87;
+const ZS_P2: i64 = (0xC2B2AE3D << 32) | 0x27D4EB4F;
+const ZS_P3: i64 = (0x165667B1 << 32) | 0x9E3779F9;
+const ZS_P4: i64 = (0x85EBCA77 << 32) | 0xC2B2AE63;
+const ZS_P5: i64 = (0x27D4EB2F << 32) | 0x165667C5;
+
+@wrapping
+fn zs_rotl(x: i64, r: i64) -> i64 {
+    return (x << r) | ((x >> (64 - r)) & ((1 << r) - 1));
+}
+
+// Logical shift right by n (1..63).
+@wrapping
+fn zs_shr(x: i64, n: i64) -> i64 {
+    return (x >> n) & ((1 << (64 - n)) - 1);
+}
+
+@wrapping
+fn zs_xxh_round(acc: i64, input: i64) -> i64 {
+    var a: i64 = acc + input * ZS_P2;
+    a = zs_rotl(a, 31);
+    return a * ZS_P1;
+}
+
+@wrapping
+fn zs_xxh_merge(acc: i64, v: i64) -> i64 {
+    var a: i64 = acc ^ zs_xxh_round(0, v);
+    return a * ZS_P1 + ZS_P4;
+}
+
+@wrapping
+fn zs_rd64(d: Vec<i64>, p: i64) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < 8 {
+        v = v | ((d.get(p + i) & 255) << (8 * i));
+        i = i + 1;
+    }
+    return v;
+}
+
+/// XXH64 of bytes `from` .. `to` (exclusive) of `d`, with `seed`. The
+/// result is the 64-bit hash as an i64 (it may be negative). A Zstandard
+/// content checksum is its low 32 bits.
+@wrapping
+pub fn zstd_xxh64_range(d: Vec<i64>, from: i64, to: i64, seed: i64) -> i64 {
+    var len: i64 = to - from;
+    var p: i64 = from;
+    var h: i64 = 0;
+    if len >= 32 {
+        var v1: i64 = seed + ZS_P1 + ZS_P2;
+        var v2: i64 = seed + ZS_P2;
+        var v3: i64 = seed;
+        var v4: i64 = seed - ZS_P1;
+        while p + 32 <= to {
+            v1 = zs_xxh_round(v1, zs_rd64(d, p));
+            v2 = zs_xxh_round(v2, zs_rd64(d, p + 8));
+            v3 = zs_xxh_round(v3, zs_rd64(d, p + 16));
+            v4 = zs_xxh_round(v4, zs_rd64(d, p + 24));
+            p = p + 32;
+        }
+        h = zs_rotl(v1, 1) + zs_rotl(v2, 7) + zs_rotl(v3, 12) + zs_rotl(v4, 18);
+        h = zs_xxh_merge(h, v1);
+        h = zs_xxh_merge(h, v2);
+        h = zs_xxh_merge(h, v3);
+        h = zs_xxh_merge(h, v4);
+    } else {
+        h = seed + ZS_P5;
+    }
+    h = h + len;
+    while p + 8 <= to {
+        h = h ^ zs_xxh_round(0, zs_rd64(d, p));
+        h = zs_rotl(h, 27) * ZS_P1 + ZS_P4;
+        p = p + 8;
+    }
+    if p + 4 <= to {
+        var w: i64 = zs_le(d, p, 4);
+        h = h ^ (w * ZS_P1);
+        h = zs_rotl(h, 23) * ZS_P2 + ZS_P3;
+        p = p + 4;
+    }
+    while p < to {
+        h = h ^ ((d.get(p) & 255) * ZS_P5);
+        h = zs_rotl(h, 11) * ZS_P1;
+        p = p + 1;
+    }
+    h = h ^ zs_shr(h, 33);
+    h = h * ZS_P2;
+    h = h ^ zs_shr(h, 29);
+    h = h * ZS_P3;
+    h = h ^ zs_shr(h, 32);
+    return h;
+}
+
+/// XXH64 of a whole byte Vec with `seed` (see zstd_xxh64_range).
+pub fn zstd_xxh64(bytes: Vec<i64>, seed: i64) -> i64 {
+    return zstd_xxh64_range(bytes, 0, bytes.len(), seed);
+}
+
+// ─── Frames ─────────────────────────────────────────────────────────────
+
+// Decode one Zstandard frame whose magic is at `pos`. Returns the position
+// after the frame, or -1.
+fn zs_frame(d: Vec<i64>, pos: i64, st: &mut ZsState, out: &mut Vec<i64>) -> i64 {
+    var n: i64 = d.len();
+    var p: i64 = pos + 4;
+    if p >= n { zs_fail(st, "truncated frame header"); return -1; }
+    var fhd: i64 = d.get(p);
+    p = p + 1;
+    var fcs_flag: i64 = fhd >> 6;
+    var single: i64 = (fhd >> 5) & 1;
+    var has_ck: i64 = (fhd >> 2) & 1;
+    var did_flag: i64 = fhd & 3;
+    if ((fhd >> 3) & 1) != 0 { zs_fail(st, "reserved bit set in frame header"); return -1; }
+    var win: i64 = 0;
+    if single == 0 {
+        if p >= n { zs_fail(st, "truncated frame header"); return -1; }
+        var wd: i64 = d.get(p);
+        p = p + 1;
+        var wbase: i64 = 1 << (10 + (wd >> 3));
+        win = wbase + (wbase >> 3) * (wd & 7);
+    }
+    var did_size: i64 = 0;
+    if did_flag == 1 { did_size = 1; }
+    else if did_flag == 2 { did_size = 2; }
+    else if did_flag == 3 { did_size = 4; }
+    if p + did_size > n { zs_fail(st, "truncated frame header"); return -1; }
+    if zs_le(d, p, did_size) != 0 { zs_fail(st, "dictionaries are not supported"); return -1; }
+    p = p + did_size;
+    var fcs_size: i64 = single;
+    if fcs_flag == 1 { fcs_size = 2; }
+    else if fcs_flag == 2 { fcs_size = 4; }
+    else if fcs_flag == 3 { fcs_size = 8; }
+    if p + fcs_size > n { zs_fail(st, "truncated frame header"); return -1; }
+    var fcs: i64 = -1;
+    if fcs_size == 8 {
+        if d.get(p + 7) >= 128 { zs_fail(st, "frame content size too large"); return -1; }
+        fcs = zs_le(d, p, 8);
+    } else if fcs_size > 0 {
+        fcs = zs_le(d, p, fcs_size);
+        if fcs_size == 2 { fcs = fcs + 256; }
+    }
+    p = p + fcs_size;
+    if single == 1 { win = fcs; }
+    if fcs >= 0 && fcs > st.limit - out.len() { zs_fail(st, "frame content size over the limit"); return -1; }
+    st.win = win;
+    st.block_max = win;
+    if st.block_max > 131072 { st.block_max = 131072; }
+    st.fstart = out.len();
+    st.huf = zs_huf_none();
+    st.ll = zs_fse_none();
+    st.of = zs_fse_none();
+    st.ml = zs_fse_none();
+    st.rep1 = 1;
+    st.rep2 = 4;
+    st.rep3 = 8;
+    var last: i64 = 0;
+    while last == 0 {
+        if p + 3 > n { zs_fail(st, "truncated block header"); return -1; }
+        var bh: i64 = zs_le(d, p, 3);
+        p = p + 3;
+        last = bh & 1;
+        var btype: i64 = (bh >> 1) & 3;
+        var bsize: i64 = bh >> 3;
+        if btype == 3 { zs_fail(st, "reserved block type"); return -1; }
+        if bsize > st.block_max { zs_fail(st, "block larger than the maximum"); return -1; }
+        if btype == 0 {
+            if p + bsize > n { zs_fail(st, "truncated raw block"); return -1; }
+            var i: i64 = 0;
+            while i < bsize { out.push(d.get(p + i)); i = i + 1; }
+            p = p + bsize;
+        } else if btype == 1 {
+            if p + 1 > n { zs_fail(st, "truncated RLE block"); return -1; }
+            var b: i64 = d.get(p);
+            var j: i64 = 0;
+            while j < bsize { out.push(b); j = j + 1; }
+            p = p + 1;
+        } else {
+            if p + bsize > n { zs_fail(st, "truncated compressed block"); return -1; }
+            if !zs_block(d, p, bsize, st, out) { return -1; }
+            p = p + bsize;
+        }
+        if out.len() > st.limit { zs_fail(st, "output over the limit"); return -1; }
+        if fcs >= 0 && out.len() - st.fstart > fcs {
+            zs_fail(st, "more data than the frame content size");
+            return -1;
+        }
+    }
+    if fcs >= 0 && out.len() - st.fstart != fcs {
+        zs_fail(st, "less data than the frame content size");
+        return -1;
+    }
+    if has_ck == 1 {
+        if p + 4 > n { zs_fail(st, "truncated checksum"); return -1; }
+        var stored: i64 = zs_le(d, p, 4);
+        var h: i64 = zstd_xxh64_range(out, st.fstart, out.len(), 0) & 0xFFFFFFFF;
+        if h != stored { zs_fail(st, "content checksum mismatch"); return -1; }
+        p = p + 4;
+    }
+    return p;
+}
+
+fn zs_new_state(limit: i64) -> ZsState {
+    // code -> baseline | extra bits << 24 (RFC 8878 3.1.1.3.2.1)
+    var llcode: Vec<i64> = Vec::new();
+    var c: i64 = 0;
+    while c < 16 { llcode.push(c); c = c + 1; }
+    var llb2: Vec<i64> = zs_list("16,18,20,22,24,28,32,40,48,64,128,256,512,1024,2048,4096,8192,16384,32768,65536");
+    var llx2: Vec<i64> = zs_list("1,1,1,1,2,2,3,3,4,6,7,8,9,10,11,12,13,14,15,16");
+    var i: i64 = 0;
+    while i < llb2.len() { llcode.push(llb2.get(i) | (llx2.get(i) << 24)); i = i + 1; }
+    var mlcode: Vec<i64> = Vec::new();
+    c = 0;
+    while c < 32 { mlcode.push(c + 3); c = c + 1; }
+    var mlb2: Vec<i64> = zs_list("35,37,39,41,43,47,51,59,67,83,99,131,259,515,1027,2051,4099,8195,16387,32771,65539");
+    var mlx2: Vec<i64> = zs_list("1,1,1,1,2,2,3,3,4,4,5,7,8,9,10,11,12,13,14,15,16");
+    i = 0;
+    while i < mlb2.len() { mlcode.push(mlb2.get(i) | (mlx2.get(i) << 24)); i = i + 1; }
+    return ZsState {
+        err: "", fstart: 0, win: 0, block_max: 0, limit: limit,
+        huf: zs_huf_none(), ll: zs_fse_none(), of: zs_fse_none(), ml: zs_fse_none(),
+        rep1: 1, rep2: 4, rep3: 8,
+        llcode: llcode, mlcode: mlcode
+    };
+}
+
+// ─── Public API ─────────────────────────────────────────────────────────
+
+/// Decode a Zstandard stream (one or more frames, skippable frames
+/// skipped) into at most `max_out` bytes. On malformed input, or output
+/// over `max_out`, the result has ok == false, empty bytes and a message.
+pub fn zstd_decode_limit(data: Vec<i64>, max_out: i64) -> ZstdResult {
+    var st: ZsState = zs_new_state(max_out);
+    var out: Vec<i64> = Vec::new();
+    var n: i64 = data.len();
+    if n == 0 {
+        return ZstdResult { ok: false, bytes: Vec::new(), error: "empty input" };
+    }
+    var i: i64 = 0;
+    while i < n {
+        var b: i64 = data.get(i);
+        if b < 0 || b > 255 {
+            return ZstdResult { ok: false, bytes: Vec::new(), error: "input is not bytes" };
+        }
+        i = i + 1;
+    }
+    var p: i64 = 0;
+    while p < n {
+        if p + 4 > n {
+            return ZstdResult { ok: false, bytes: Vec::new(), error: "truncated frame" };
+        }
+        var magic: i64 = zs_le(data, p, 4);
+        if magic == 0xFD2FB528 {
+            p = zs_frame(data, p, &mut st, &mut out);
+            if p < 0 {
+                return ZstdResult { ok: false, bytes: Vec::new(), error: st.err };
+            }
+        } else if (magic & 0xFFFFFFF0) == 0x184D2A50 {
+            if p + 8 > n {
+                return ZstdResult { ok: false, bytes: Vec::new(), error: "truncated skippable frame" };
+            }
+            var size: i64 = zs_le(data, p + 4, 4);
+            if size > n - p - 8 {
+                return ZstdResult { ok: false, bytes: Vec::new(), error: "truncated skippable frame" };
+            }
+            p = p + 8 + size;
+        } else {
+            return ZstdResult { ok: false, bytes: Vec::new(), error: "bad magic number" };
+        }
+    }
+    return ZstdResult { ok: true, bytes: out, error: "" };
+}
+
+/// Decode a Zstandard stream (output capped at 256 MB). See ZstdResult.
+pub fn zstd_decode(data: Vec<i64>) -> ZstdResult {
+    return zstd_decode_limit(data, 268435456);
+}
+
+/// Decompress a Zstandard stream. Returns the decoded bytes, or an empty
+/// Vec on malformed input; use zstd_ok or zstd_decode to tell an error
+/// from a stream whose content is empty.
+pub fn zstd_decompress(data: Vec<i64>) -> Vec<i64> {
+    var r: ZstdResult = zstd_decode(data);
+    return r.bytes;
+}
+
+/// Decompress with the output capped at `max_out` bytes (a
+/// decompression-bomb guard). Empty Vec on error or over the cap.
+pub fn zstd_decompress_limit(data: Vec<i64>, max_out: i64) -> Vec<i64> {
+    var r: ZstdResult = zstd_decode_limit(data, max_out);
+    return r.bytes;
+}
+
+/// Whether `data` is a valid Zstandard stream (it is decoded in full to
+/// find out; to keep the bytes as well, call zstd_decode once).
+pub fn zstd_ok(data: Vec<i64>) -> bool {
+    var r: ZstdResult = zstd_decode(data);
+    return r.ok;
+}
+
+/// Why `data` does not decode, or "" when it does.
+pub fn zstd_error(data: Vec<i64>) -> str {
+    var r: ZstdResult = zstd_decode(data);
+    return r.error;
+}
+
+/// Decompress and interpret the result as a string ("" on error). The
+/// string ends at the first NUL byte, as every Fides str does.
+pub fn zstd_decompress_str(data: Vec<i64>) -> str {
+    var bytes: Vec<i64> = zstd_decompress(data);
+    var sb: StringBuilder = StringBuilder::new();
+    var i: i64 = 0;
+    while i < bytes.len() {
+        sb.append_char(bytes.get(i));
+        i = i + 1;
+    }
+    return sb.to_str();
+}

@@ -261,7 +261,21 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       through them, no multi-thread stress test has been run. Left: freed
       memory returned to the system.
 - [ ] RT8. Allocator speed on par with mimalloc on its own benchmarks (L).
-- [ ] RT9. Own context switch, not fibers: under 20 ns per task switch (M).
+- [~] RT9. Own context switch, not fibers: under 20 ns per task switch (M).
+      Done Nov 8 on Windows, both paths. Native: `pe_ctx_swap`
+      (compiler/pe_ir_stubs.fd, the same bytes in src/pe.rs, checked against
+      the assembler) saves the callee-saved registers, xmm6-15 and the TEB's
+      stack fields; `stdlib/pe_runtime/conc.fd` lays out task stacks as
+      Windows does for a thread (1 MB reserved, guard page) and keeps 256
+      finished ones. C path: the same switch for x64 Windows under clang/gcc
+      (cl.exe and tcc keep fibers). A yield, two switches plus the scheduler:
+      native 8.7 us -> 0.23 us, C 283 -> 58 ns; 100,000 sleepers 56 -> 19 s.
+      Two races of the native scheduler fixed with it: a task woken on another
+      worker could be resumed before it had saved its registers (a context's
+      busy word, cleared by the switch once on the new stack), and a worker
+      inferred "it yielded" from a state a wake had already changed (the task
+      now tells the context it returns to). Left: the switch alone under
+      20 ns is not measured apart from the scheduler.
 - [~] RT10. Tasks across all cores: M:N scheduling with work stealing (XL).
       Done: per-worker local queues — `pe_wq_push` targets the running
       worker's queue via `pert_tls_wid` (spawn locality); `pe_wq_pop` drains
@@ -275,8 +289,19 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       `fid emit` that use `async` or `spawn` + `await` crash (`test_async`,
       `test_async_float_struct`); the interpreter and C paths are fine
       (release H10).
-- [ ] RT11. IOCP on Windows, epoll on Linux, kqueue on macOS, replacing the O(n) poll
+- [~] RT11. IOCP on Windows, epoll on Linux, kqueue on macOS, replacing the O(n) poll
       loop (L).
+      Done Nov 8. Native Windows: a task waiting for a socket submits one AFD
+      poll (`IOCTL_AFD_POLL` on the socket's base handle, as wepoll and mio
+      do) completed on an I/O completion port the poller waits on; a deadline
+      cancels it. No wait set is rebuilt or scanned (WSAPoll stays the
+      fallback when `\Device\Afd` cannot be opened). C path: epoll on Linux,
+      kqueue on macOS and BSD, one registration per wait (a reader and a
+      writer can share a socket; a second waiter the same way uses the poll
+      set); its connect no longer blocks the thread. 200 clients and a task
+      per connection: native 0.37 s (was 1.3-7 s). Left: native Linux
+      (`stdlib/linux_runtime`), the C path on Windows (WSAPoll), 1M idle
+      connections not measured.
 - [~] RT12. A timer heap, so 100,000 sleeping tasks cost nothing (M).
       Done on the PE path: `pe_runtime/conc.fd` arms deadlines in a min-heap
       (indexed removal, so finishing tasks can't dangle) and keeps fd/join/
@@ -285,11 +310,21 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       arms 100,000 sleeping tasks and awaits them all: passes (~56 s wall,
       dominated by fiber spawn, not polling). Full suite green on all three
       backends. Left: interp/C-path schedulers still use their own waits.
-- [~] RT13. Growable task stacks, or checked stack limits with a clear panic (L).
-      Done on the C path: the OS guard page with a handler that reports the
-      overflow, a guard page under every POSIX task stack. Left: native.
+- [x] RT13. Growable task stacks, or checked stack limits with a clear panic (L).
+      Done: a guard page under every task stack on all backends (native
+      Windows: the system's own stack growth, through the TEB fields the
+      switch carries; C: POSIX guard pages, Windows the same as native), and
+      an overflow in a task is `Panic: Stack overflow`, status 1, as on the
+      main thread (Nov 8).
 - [ ] RT14. Zero-copy file and socket I/O where the system allows it (M).
-- [ ] RT15. Panics unwind cleanly, or abort by a documented rule (L).
+- [x] RT15. Panics unwind cleanly, or abort by a documented rule (L).
+      Done Nov 8: the rule is reference.md 8.2. A panic, in main or in any
+      task or thread, prints `Panic: <message>` and the trace, flushes stdout
+      and ends the process with status 1; nothing unwinds. Stack overflow and
+      memory faults are panics with the same words on `fid run`, C and native
+      (the C runtime's handlers, a vectored handler on Windows; the
+      interpreter no longer goes on after a task's panic).
+      `test_task_panic_fail.fd`.
 
 **Acceptance:** binary-trees and k-nucleotide ahead of Go; 1M idle connections on
 one machine; 100,000 requests/s on one core.
@@ -301,6 +336,11 @@ This is the race we can win outright, since no rival's speed comes for free.
 - [~] CS1. `emit` of hello world under 0.5 s (release D9), then under 0.1 s (L).
       Done: ~360 ms (Nov 2, fidesc). Left: the 0.1 s stretch — needs CS2's full
       cache (comptime alone is ~90 ms) plus backend work.
+      Nov 8-9 (`fid`): native code only for what main reaches (and what it
+      names), iropt on those only: hello's executable 127 KB -> 33 KB. With
+      the compiler itself built at -O2 (split into 8 units, `split-c`) hello
+      takes 1.7 s instead of 6.4 s (type check 0.36 s, borrow check 0.19,
+      lowering 0.45, native code 0.09; `[prof]` lines on `emit`).
 - [~] CS2. Cache the checked stdlib in a binary form, not re-parsed each build (L).
       Done: trusted-module fast path — the baked-in core.fd and backend runtime
       skip per-function body checks and error reporting (~26 ms off hello's
@@ -313,9 +353,18 @@ This is the race we can win outright, since no rival's speed comes for free.
       Nov 4 (release D9): `fid` type-checks `core.fd` once per (compiler,
       `core.fd`) pair; a stamp in the temp directory skips its bodies on later
       builds (`FIDES_CHECK_CORE=1` forces the check).
-- [ ] CS3. Borrow checking linear in program size (release D8) (M). On the
+- [~] CS3. Borrow checking linear in program size (release D8) (M). On the
       compiler itself: 16 s (Nov 6).
-- [~] CS4. Self-compile under 60 s (release), then under 10 s (L). About 133 s on
+      Nov 8: the reference-escape check iterates its fixpoint only over the
+      functions whose result can hold a reference (scalars, strings and
+      declared types cannot), not every function. With the -O2 compiler the
+      borrow check of the compiler is 5.4 s. Left: the check's own
+      per-statement work.
+- [~] CS4. Self-compile under 60 s (release), then under 10 s (L). Nov 9: 74 s
+      with the compiler built at -O2 (8 split units), against 229 s at -O0;
+      the -O2 compiler emits the same C (fixpoint). Of the 74 s: type check
+      18 s, borrow check 5, mono 5, lowering 24, C generation 20. Next:
+      bootstrap.sh's split build is the release build. About 133 s on
       Nov 6 (type check 59 s, borrow check 16 s, lowering 20 s, C generation
       12 s), from 601 s (release D10, D11); `fidesc` takes about 21 s. Next:
       string compares in method lookup and the parser, then building the
@@ -363,7 +412,8 @@ language lives.
       and GCC 15 (WSL, -O0/-O2), which must agree, then `run`, `ccompile` and
       `emit` must match. `triage.py` groups failures, `reduce.py` shrinks one.
       Run (seed 100, 60 programs): 47 agree, 12 differ, 1 C-oracle flake.
-      Found M1 (same-width casts are the identity in run/emit), M2 (nested
+      Found M1 (same-width casts are the identity in run/emit), M7 (emit
+      does not sign-extend a narrowing cast; seeds 103 and 137), M2 (nested
       `if` value typed void), M3 (println of a u64), E1, and the unreduced V1
       class (spurious and missed overflow panics in run/emit); see
       docs/verification/miscompile-log.md. Left: reduce V1, floats, strings,
@@ -378,8 +428,19 @@ language lives.
       yet): one bug, F1 — no nesting limit in the parser, ~3000 nested
       brackets crash `fid` with a stack overflow. Left: the coverage-guided
       run, the optimizer passes (through `emit`), long runs.
-- [ ] VF4. Run every optimizer pass on and off over the whole suite: output must not
+- [~] VF4. Run every optimizer pass on and off over the whole suite: output must not
       change (M).
+      Done (Nov 7–8): `scripts/verify/variants.py toggle` — the iropt passes
+      off at run time (`FID_IROPT_OFF`), the `PEIR_*` constants off in
+      compilers rebuilt by `scripts/verify/build-variant.sh`; each test is
+      built by both compilers, run when the binaries differ, and compared.
+      Run (emit): inline, fold, dce, tailcall, gvn, licm each off over 53
+      programs (the VF5 tests, 24 sampled suite tests, 20 generated): no
+      output changed (two "builds with one compiler only" were a build
+      flake under load, identical when rebuilt alone). Not run: the six
+      `PEIR_*`/`PEIR_RANGES` variants — `dump-c compiler/main.fd` with the
+      Nov 7 compiler ran out of memory each time it was tried beside the
+      other sessions' work. Left: those six, the whole suite, CI.
 - [~] VF5. Each optimization has a test that fails if the pass is wrong (M).
       Done (Nov 7): `tests/bootstrap/test_opt_{fold,inline,dce,gvn,tailcall,
       licm,ranges,ranges_pop_fail,regalloc}.fd`, each a program whose output
@@ -568,15 +629,63 @@ owning what we ship.
 
 - [ ] SL1. HTTP/2 client and server (L).
 - [ ] SL2. HTTP/3 and QUIC (XL).
-- [ ] SL3. WebSockets, committed and tested (M).
+- [x] SL3. WebSockets, committed and tested (M).
+      Done: `stdlib/ws.fd` (RFC 6455: the Upgrade handshake with its SHA-1
+      and base64 key, frames with masking, ping/pong, close), `test_ws.fd`
+      checked against Python on C and native. Nov 9: wss:// (`stdlib/wss.fd`:
+      `wss_connect`, `wss_accept`, `ws_connect_url`, over `tls`, which `ws`
+      never links), fragmented messages reassembled with a ping in their
+      middle answered, the handshake no longer reads past its headers, and
+      binary frames sent byte-exact; `test_ws_local.fd` (a server and a
+      client over IPv6 and IPv4) and a TLS round trip with a self-signed
+      certificate on C and native. Left: permessage-deflate.
 - [ ] SL4. TLS 1.3 on every platform (release I7) (M).
-- [ ] SL5. DNS with caching, IPv6 everywhere (M).
+- [~] SL5. DNS with caching, IPv6 everywhere (M).
+      Done: `stdlib/dns.fd` parses every answer record with its TTL
+      (bounds-checked names), A and AAAA, IPv6 text as RFC 5952, a cache by
+      TTL (`dns_cache_resolve`); `test_dns.fd`. Nov 9: IPv6 sockets on the C
+      path and native Windows: a listening socket takes IPv6 and IPv4 clients
+      (dual stack), connect tries each address of a name, IPv6 ones included.
+      Left: native Linux (its resolver reads only IPv4 and /etc/hosts).
 - [ ] SL6. JSON at simdjson-class speed (L).
-- [ ] SL7. A linear-time regex engine (L).
-- [ ] SL8. Time zones, calendars, formatting and parsing (L).
+- [x] SL7. A linear-time regex engine (L).
+      Done: `regex_match` in `stdlib/regex.fd` is a Pike VM (no
+      backtracking): classes, escapes, counted quantifiers, groups,
+      alternation, anchors; `test_regex_linear.fd` runs a pattern that is
+      exponential for a backtracking engine in linear time.
+- [~] SL8. Time zones, calendars, formatting and parsing (L).
+      Done: `stdlib/tz.fd`: 57 named zones with their current DST rules (US,
+      EU, southern hemisphere), fixed offsets ("+05:30"), local to UTC and
+      back (a skipped hour moves forward, a repeated one takes the first),
+      `tz_format` with %Z %z, ISO 8601; `test_tz.fd` checked against Python
+      zoneinfo. Nov 9: the IANA database itself: `tz_from_tzif` reads TZif
+      files (RFC 8536, versions 1 to 4) with every past transition and the
+      file's POSIX rule after the last one (`tz_from_posix`, negative DST
+      and 24:00 change times included); `tz_load` finds the system's files
+      ($TZDIR, /usr/share/zoneinfo) and falls back to the table;
+      `test_tzif.fd` (Kolkata, Phoenix, Lord Howe, New York since 1883)
+      against zoneinfo on the same files. Left: calendars other than the
+      Gregorian, the Julian forms of POSIX rule dates.
 - [ ] SL9. Unicode: normalization, segmentation, case folding (L).
-- [ ] SL10. Compression: gzip, zstd, brotli decode (L).
-- [ ] SL11. Encoding: base64, hex, CSV, XML, YAML, TOML, protobuf (L).
+- [x] SL10. Compression: gzip, zstd, brotli decode (L).
+      Done: `stdlib/compress.fd` inflates DEFLATE, zlib and gzip (fixed and
+      dynamic Huffman) and writes them (stored blocks); `test_compress.fd`
+      decodes streams made by Python's zlib. Nov 9: `stdlib/zstd.fd`
+      (RFC 8878: raw, RLE and compressed blocks, Huffman and FSE, repeat
+      offsets, skippable frames, the XXH64 checksum; no dictionaries) and
+      `stdlib/brotli.fd` (RFC 7932 complete: context modelling, the static
+      dictionary in `brotli_dict.fd` with all 121 transforms), both in
+      Fides, so native builds have them; `test_zstd.fd`, `test_brotli.fd`
+      on all backends, against streams of Python's encoders (522 brotli
+      streams and 1,800 corrupted ones decode as the reference decoder
+      does; 39,000 corrupted zstd streams never panic). Left: compressing
+      encoders for zstd and brotli.
+- [~] SL11. Encoding: base64, hex, CSV, XML, YAML, TOML, protobuf (L).
+      Done: CSV (RFC 4180, `test_csv.fd`) and the protobuf wire format
+      (`stdlib/protobuf.fd`: varint, zigzag, fixed, length-delimited,
+      packed, skipping unknown fields; `test_protobuf.fd` against bytes from
+      Python). base64/hex (`encoding`), XML, YAML and TOML modules exist.
+      Left: tests for XML, YAML and TOML against their specifications.
 - [ ] SL12. Database drivers: PostgreSQL, MySQL, SQLite, with parameter binding (L).
 - [~] SL13. Built-in testing: table tests, benchmarks, fuzzing, as in Go (M).
       Done: `fid test <file.fd>` runs each `fn test_*()` in its own process and times each `fn bench_*()`. Left: fuzzing.
@@ -586,8 +695,14 @@ owning what we ship.
       per-module levels (`logmf`, `log_set_module_level`), tests `test_log`,
       `test_log_module` (complaint CO3, CO4).
 - [ ] SL15. A sampling profiler reachable from a running service (L).
-- [ ] SL16. Big integers and decimals (M).
-- [ ] SL17. Files, paths and processes complete on every platform (M).
+- [x] SL16. Big integers and decimals (M).
+      Done: `stdlib/bigint.fd` (`test_bigint.fd`) and `stdlib/decimal.fd`:
+      exact decimals on a BigInt mantissa, division and rounding to a scale
+      with six rounding modes (half-even by default); `test_decimal.fd`.
+- [~] SL17. Files, paths and processes complete on every platform (M).
+      Done: `stdlib/path.fd` reads both separators, Windows drives and UNC
+      roots in join, split, normalize, parent and components
+      (`test_path.fd`). Left: files and processes checked the same way.
 - [ ] SL18. Crypto through reviewed libraries, the set of release J5 (L).
 - [ ] SL19. Every public function documented with an example that runs in CI (L).
 

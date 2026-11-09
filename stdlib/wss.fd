@@ -1,0 +1,142 @@
+// Fides secure WebSocket standard library: wss://, module `ws` over `tls`.
+//
+// The frames, the handshake and ws_recv/ws_send_* are module ws's; this
+// module only opens the TLS session and hands ws its reads and writes, so
+// a program that never says `use wss;` never links TLS.
+//
+// Usage (client):
+//   use wss;
+//   val c: WsConn = ws_connect_url("wss://example.com/chat");
+//   if ws_ok(c) {
+//       ws_send_text(c, "hello");
+//       println(ws_recv(c).text);
+//       ws_close(c);
+//   }
+//
+// Usage (server): accept the TCP connection as for ws, then
+//   val creds: i64 = tls_server("cert.pem", "key.pem");     // other systems
+//   val creds: i64 = tls_server("server.pfx", "password");  // Windows
+//   val c: WsConn = wss_accept(creds, fd);
+
+module wss;
+
+use ws;
+use tls;
+use string;
+
+fn wss_recv(s: i64, buf: i64, n: i64, timeout_ms: i64) -> i64 {
+    return tls_session_recv(s, buf, n, timeout_ms);
+}
+
+fn wss_send(s: i64, buf: i64, n: i64) -> i64 {
+    return tls_session_send(s, buf, n);
+}
+
+fn wss_close(s: i64) -> i64 {
+    return tls_session_close(s);
+}
+
+fn wss_hooks() {
+    ws_set_tls(wss_recv, wss_send, wss_close);
+}
+
+fn wss_failed() -> WsConn {
+    return ws_failed(true);
+}
+
+/// Client: TLS to host:port (its certificate checked against the system's
+/// store and `host`), then the Upgrade handshake for `path`. A WsConn with
+/// fd < 0 on failure.
+pub fn wss_connect(host: str, port: i64, path: str) -> WsConn {
+    wss_hooks();
+    val s: i64 = tls_connect(host, port);
+    if s == 0 {
+        return wss_failed();
+    }
+    return ws_handshake(tls_session_fd(s), s, host, path);
+}
+
+/// As wss_connect, but accept any certificate. For tests of a local server
+/// only: it does not know whom it is talking to.
+pub fn wss_connect_unchecked(host: str, port: i64, path: str) -> WsConn {
+    wss_hooks();
+    val s: i64 = tls_connect_unchecked(host, port);
+    if s == 0 {
+        return wss_failed();
+    }
+    return ws_handshake(tls_session_fd(s), s, host, path);
+}
+
+/// Server: the TLS handshake on the accepted socket `fd` with the server
+/// credentials `creds` (tls_server), then the client's Upgrade request and
+/// the 101 answer. A WsConn with fd < 0 on failure.
+pub fn wss_accept(creds: i64, fd: i64) -> WsConn {
+    wss_hooks();
+    val s: i64 = tls_accept(creds, fd);
+    if s == 0 {
+        return ws_failed(false);
+    }
+    val c: WsConn = ws_accept_on(fd, s, ws_read_request(fd, s));
+    if c.fd < 0 {
+        tls_session_close(s);
+    }
+    return c;
+}
+
+/// The parts of a ws:// or wss:// URL: 0 scheme, 1 host, 2 port, 3 path.
+pub fn ws_url_part(url: str, part: i64) -> str {
+    var rest: str = url;
+    var scheme: str = "ws";
+    val mark: i64 = str_find(url, "://");
+    if mark >= 0 {
+        scheme = str_to_lower(str_slice(url, 0, mark));
+        rest = str_slice(url, mark + 3, str_len(url));
+    }
+    var path: str = "/";
+    val slash: i64 = str_find(rest, "/");
+    if slash >= 0 {
+        path = str_slice(rest, slash, str_len(rest));
+        rest = str_slice(rest, 0, slash);
+    }
+    var port: str = "80";
+    if scheme == "wss" {
+        port = "443";
+    }
+    // [::1]:8080 — an IPv6 address in brackets
+    if str_starts_with(rest, "[") {
+        val close: i64 = str_find(rest, "]");
+        if close > 0 {
+            val after: str = str_slice(rest, close + 1, str_len(rest));
+            if str_starts_with(after, ":") {
+                port = str_slice(after, 1, str_len(after));
+            }
+            rest = str_slice(rest, 1, close);
+        }
+    } else {
+        val colon: i64 = str_find(rest, ":");
+        if colon >= 0 {
+            port = str_slice(rest, colon + 1, str_len(rest));
+            rest = str_slice(rest, 0, colon);
+        }
+    }
+    if part == 0 { return scheme; }
+    if part == 1 { return rest; }
+    if part == 2 { return port; }
+    return path;
+}
+
+/// Connect to a ws:// or wss:// URL. A WsConn with fd < 0 on failure (or
+/// another scheme).
+pub fn ws_connect_url(url: str) -> WsConn {
+    val scheme: str = ws_url_part(url, 0);
+    val host: str = ws_url_part(url, 1);
+    val port: i64 = str_parse_int(ws_url_part(url, 2));
+    val path: str = ws_url_part(url, 3);
+    if scheme == "wss" {
+        return wss_connect(host, port, path);
+    }
+    if scheme == "ws" {
+        return ws_connect(host, port, path);
+    }
+    return wss_failed();
+}

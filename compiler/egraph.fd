@@ -1,0 +1,790 @@
+// compiler/egraph.fd — an e-graph mid-end (own-backend roadmap ME6–ME11)
+// and store-to-load forwarding for locals (a first step of ME3).
+//
+// Per function, every pure integer or boolean value (constants, binary and
+// unary operations, integer casts) becomes an e-node; anything else is a
+// leaf of its own. Equality saturation applies rewrite rules until nothing
+// changes or a limit is reached: commuted operations and flipped
+// comparisons, the identities of rules.fd, constant folding, x * 2 = x + x,
+// and in @wrapping code (where overflow does not panic) reassociation of
+// constants and multiplication by a power of two as a shift. Two forms are
+// equal only if they also panic in the same cases: checked arithmetic is not
+// reassociated. Extraction picks each class's cheapest form; an instruction
+// is then rewritten in place into it, when its operands exist as values that
+// dominate it: a cheaper equal form, a constant, or an earlier equal value
+// (a move). No instruction is added, so the IR's shape stays as it was.
+//
+// Forwarding: a load of a local whose address is only loaded from and
+// stored to becomes the stored value when that store is the local's only
+// one and dominates the load, or the last store before it in its block.
+//
+// Switches: FID_NAT_OFF=egraph, FID_NAT_OFF=forward.
+
+module compiler::egraph;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::checks;
+use compiler::iropt;
+
+const EG_MAX_NODES: i64 = 20000;
+const EG_MAX_ROUNDS: i64 = 8;
+
+// Node kinds
+const EK_LEAF: i64 = 0;     // an opaque value: `a` is its id
+const EK_CONST: i64 = 1;    // `a` is the integer (booleans 0 / 1)
+const EK_BIN: i64 = 2;      // `op` a binary code, children a, b
+const EK_NEG: i64 = 3;      // child a
+const EK_NOT: i64 = 4;      // boolean not, child a
+const EK_BNOT: i64 = 5;     // bitwise not, child a
+
+// Binary codes (as compiler/rules.fd)
+const EB_ADD: i64 = 1;
+const EB_SUB: i64 = 2;
+const EB_MUL: i64 = 3;
+const EB_DIV: i64 = 4;
+const EB_MOD: i64 = 5;
+const EB_AND: i64 = 6;
+const EB_OR: i64 = 7;
+const EB_XOR: i64 = 8;
+const EB_SHL: i64 = 9;
+const EB_SHR: i64 = 10;
+const EB_EQ: i64 = 11;
+const EB_NE: i64 = 12;
+const EB_LT: i64 = 13;
+const EB_LE: i64 = 14;
+const EB_GT: i64 = 15;
+const EB_GE: i64 = 16;
+
+pub struct ENode {
+    pub kind: i64,
+    pub op: i64,
+    pub a: i64,
+    pub b: i64,
+    pub ty: str,
+}
+
+pub struct EGraph {
+    pub nodes: Vec<ENode>,
+    pub node_class: Vec<i64>,
+    pub parent: Vec<i64>,      // union-find over classes
+    pub hash: i64,             // canonical node key -> node
+    pub wrapping: bool,
+    pub unions: i64,
+}
+
+fn eg_on(name: str) -> bool {
+    var off: str = p_getenv("FID_NAT_OFF");
+    if (off as i64) == 0 || str_len(off) == 0 { return true; }
+    return !str_contains("," + off + ",", "," + name + ",");
+}
+
+fn eg_find(g: &mut EGraph, c: i64) -> i64 {
+    var r: i64 = c;
+    while g.parent.get(r) != r { r = g.parent.get(r); }
+    var x: i64 = c;
+    while g.parent.get(x) != r {
+        var nx: i64 = g.parent.get(x);
+        g.parent.set(x, r);
+        x = nx;
+    }
+    return r;
+}
+
+fn eg_key(g: &mut EGraph, n: ENode) -> str {
+    var a: i64 = n.a;
+    var b: i64 = n.b;
+    if n.kind == EK_BIN { a = eg_find(g, a); b = eg_find(g, b); }
+    if n.kind == EK_NEG || n.kind == EK_NOT || n.kind == EK_BNOT { a = eg_find(g, a); }
+    return int_to_str(n.kind) + "," + int_to_str(n.op) + "," + int_to_str(a) + "," + int_to_str(b) + "," + n.ty;
+}
+
+/// The class of node n, adding it (and a class) when it is new.
+fn eg_add(g: &mut EGraph, n: ENode) -> i64 {
+    var key: str = eg_key(g, n);
+    if HashMap_contains(g.hash, key) {
+        return eg_find(g, g.node_class.get(HashMap_get(g.hash, key)));
+    }
+    var id: i64 = g.nodes.len();
+    g.nodes.push(n);
+    var c: i64 = g.parent.len();
+    g.parent.push(c);
+    g.node_class.push(c);
+    HashMap_insert(g.hash, key, id);
+    return c;
+}
+
+fn eg_union(g: &mut EGraph, a: i64, b: i64) -> bool {
+    var ra: i64 = eg_find(g, a);
+    var rb: i64 = eg_find(g, b);
+    if ra == rb { return false; }
+    if ra < rb { g.parent.set(rb, ra); } else { g.parent.set(ra, rb); }
+    g.unions = g.unions + 1;
+    return true;
+}
+
+/// Restore congruence: nodes whose canonical keys now coincide join one
+/// class (repeat until stable).
+fn eg_rebuild(g: &mut EGraph) {
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        var seen: i64 = HashMap_new();
+        var i: i64 = 0;
+        while i < g.nodes.len() {
+            var key: str = eg_key(g, g.nodes.get(i));
+            if HashMap_contains(seen, key) {
+                if eg_union(g, g.node_class.get(i), g.node_class.get(HashMap_get(seen, key))) { changed = true; }
+            } else {
+                HashMap_insert(seen, key, i);
+            }
+            i = i + 1;
+        }
+        g.hash = seen;
+    }
+}
+
+/// The constant of class c: [1, value] or [0].
+fn eg_class_const(g: &mut EGraph, c: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var rc: i64 = eg_find(g, c);
+    var i: i64 = 0;
+    while i < g.nodes.len() {
+        var n: ENode = g.nodes.get(i);
+        if n.kind == EK_CONST && eg_find(g, g.node_class.get(i)) == rc {
+            out.push(1);
+            out.push(n.a);
+            return out;
+        }
+        i = i + 1;
+    }
+    out.push(0);
+    return out;
+}
+
+fn eg_is_cmp(op: i64) -> bool { return op >= EB_EQ && op <= EB_GE; }
+
+fn eg_bits(ty: str) -> i64 {
+    if ty == "i8" || ty == "u8" { return 8; }
+    if ty == "i16" || ty == "u16" { return 16; }
+    if ty == "i32" || ty == "u32" { return 32; }
+    return 64;
+}
+
+fn eg_signed(ty: str) -> bool { return ty == "i8" || ty == "i16" || ty == "i32" || ty == "i64"; }
+
+/// Fold a op b of type ty, as the program would compute it: [1, value], or
+/// [0] when it would panic (overflow, division by zero) or does not fit.
+@wrapping
+fn eg_fold(op: i64, a: i64, b: i64, ty: str, wrapping: bool) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var r: i64 = 0;
+    var bits: i64 = eg_bits(ty);
+    var max: i64 = 9223372036854775807;
+    var min: i64 = 0 - 9223372036854775807 - 1;
+    if op == EB_ADD {
+        r = a + b;
+        if !wrapping && ((a > 0 && b > 0 && r < 0) || (a < 0 && b < 0 && r >= 0)) { out.push(0); return out; }
+    } else if op == EB_SUB {
+        r = a - b;
+        if !wrapping && ((a >= 0 && b < 0 && r < 0) || (a < 0 && b > 0 && r >= 0)) { out.push(0); return out; }
+    } else if op == EB_MUL {
+        // only small products are folded: no overflow possible
+        if a > 3037000499 || a < 0 - 3037000499 || b > 3037000499 || b < 0 - 3037000499 { out.push(0); return out; }
+        r = a * b;
+    } else if op == EB_DIV || op == EB_MOD {
+        if b == 0 || (a == min && b == 0 - 1) { out.push(0); return out; }
+        if op == EB_DIV { r = a / b; } else { r = a % b; }
+    } else if op == EB_AND { r = a & b; }
+    else if op == EB_OR { r = a | b; }
+    else if op == EB_XOR { r = a ^ b; }
+    else if op == EB_EQ { if a == b { r = 1; } }
+    else if op == EB_NE { if a != b { r = 1; } }
+    else if op == EB_LT { if a < b { r = 1; } }
+    else if op == EB_LE { if a <= b { r = 1; } }
+    else if op == EB_GT { if a > b { r = 1; } }
+    else if op == EB_GE { if a >= b { r = 1; } }
+    else { out.push(0); return out; }
+    // A narrow result must fit its type (else it would panic or wrap)
+    if !eg_is_cmp(op) && bits < 64 {
+        var lo: i64 = 0;
+        var hi: i64 = (1 << bits) - 1;
+        if eg_signed(ty) { lo = 0 - (1 << (bits - 1)); hi = (1 << (bits - 1)) - 1; }
+        if r < lo || r > hi { out.push(0); return out; }
+    }
+    // u64 values at or above 2^63 do not fit the signed arithmetic here
+    if ty == "u64" { out.push(0); return out; }
+    out.push(1);
+    out.push(r);
+    return out;
+}
+
+/// One round of every rule over the nodes there are now: true if anything
+/// was joined.
+fn eg_round(g: &mut EGraph) -> bool {
+    var any: bool = false;
+    var count: i64 = g.nodes.len();
+    var i: i64 = 0;
+    while i < count && g.nodes.len() < EG_MAX_NODES {
+        var n: ENode = g.nodes.get(i);
+        var c: i64 = g.node_class.get(i);
+        if n.kind == EK_BIN {
+            var op: i64 = n.op;
+            // Commutative operations, flipped comparisons
+            if op == EB_ADD || op == EB_MUL || op == EB_AND || op == EB_OR || op == EB_XOR || op == EB_EQ || op == EB_NE {
+                if eg_union(g, c, eg_add(g, ENode { kind: EK_BIN, op: op, a: n.b, b: n.a, ty: n.ty })) { any = true; }
+            }
+            var flip: i64 = 0;
+            if op == EB_LT { flip = EB_GT; }
+            if op == EB_GT { flip = EB_LT; }
+            if op == EB_LE { flip = EB_GE; }
+            if op == EB_GE { flip = EB_LE; }
+            if flip != 0 {
+                if eg_union(g, c, eg_add(g, ENode { kind: EK_BIN, op: flip, a: n.b, b: n.a, ty: n.ty })) { any = true; }
+            }
+            // Constants
+            var ka: Vec<i64> = eg_class_const(g, n.a);
+            var kb: Vec<i64> = eg_class_const(g, n.b);
+            if ka.get(0) == 1 && kb.get(0) == 1 {
+                var f: Vec<i64> = eg_fold(op, ka.get(1), kb.get(1), n.ty, g.wrapping);
+                if f.get(0) == 1 {
+                    var cty: str = n.ty;
+                    if eg_is_cmp(op) { cty = "bool"; }
+                    if eg_union(g, c, eg_add(g, ENode { kind: EK_CONST, op: 0, a: f.get(1), b: 0, ty: cty })) { any = true; }
+                }
+            }
+            // Identities (exact under checked arithmetic)
+            if kb.get(0) == 1 {
+                var k: i64 = kb.get(1);
+                if ((op == EB_ADD || op == EB_SUB || op == EB_OR || op == EB_XOR || op == EB_SHL || op == EB_SHR) && k == 0)
+                    || ((op == EB_MUL || op == EB_DIV) && k == 1) || (op == EB_AND && k == 0 - 1) {
+                    if eg_union(g, c, n.a) { any = true; }
+                }
+                if (op == EB_MUL || op == EB_AND) && k == 0 {
+                    if eg_union(g, c, eg_add(g, ENode { kind: EK_CONST, op: 0, a: 0, b: 0, ty: n.ty })) { any = true; }
+                }
+                // x * 2 = x + x (both overflow exactly when 2x does not fit)
+                if op == EB_MUL && k == 2 {
+                    if eg_union(g, c, eg_add(g, ENode { kind: EK_BIN, op: EB_ADD, a: n.a, b: n.a, ty: n.ty })) { any = true; }
+                }
+                // Wrapping code: x * 2^s = x << s, (x + c1) + c2 = x + (c1 + c2)
+                if g.wrapping && op == EB_MUL && k > 2 && (k & (k - 1)) == 0 && k < 4611686018427387904 {
+                    var s: i64 = 0;
+                    while (1 << s) < k { s = s + 1; }
+                    var sc: i64 = eg_add(g, ENode { kind: EK_CONST, op: 0, a: s, b: 0, ty: n.ty });
+                    if eg_union(g, c, eg_add(g, ENode { kind: EK_BIN, op: EB_SHL, a: n.a, b: sc, ty: n.ty })) { any = true; }
+                }
+                if g.wrapping && op == EB_ADD {
+                    var inner: Vec<i64> = eg_add_const_child(g, n.a, n.ty);
+                    if inner.get(0) == 1 {
+                        var sumc: i64 = eg_add(g, ENode { kind: EK_CONST, op: 0, a: inner.get(2) + k, b: 0, ty: n.ty });
+                        if eg_union(g, c, eg_add(g, ENode { kind: EK_BIN, op: EB_ADD, a: inner.get(1), b: sumc, ty: n.ty })) { any = true; }
+                    }
+                }
+            }
+            if n.a == n.b || eg_find(g, n.a) == eg_find(g, n.b) {
+                if op == EB_SUB || op == EB_XOR {
+                    if eg_union(g, c, eg_add(g, ENode { kind: EK_CONST, op: 0, a: 0, b: 0, ty: n.ty })) { any = true; }
+                }
+                if op == EB_AND || op == EB_OR { if eg_union(g, c, n.a) { any = true; } }
+                if op == EB_EQ || op == EB_LE || op == EB_GE {
+                    if eg_union(g, c, eg_add(g, ENode { kind: EK_CONST, op: 0, a: 1, b: 0, ty: "bool" })) { any = true; }
+                }
+                if op == EB_NE || op == EB_LT || op == EB_GT {
+                    if eg_union(g, c, eg_add(g, ENode { kind: EK_CONST, op: 0, a: 0, b: 0, ty: "bool" })) { any = true; }
+                }
+            }
+        } else if n.kind == EK_NOT {
+            // !!b = b
+            var j: i64 = 0;
+            while j < count {
+                var m: ENode = g.nodes.get(j);
+                if m.kind == EK_NOT && eg_find(g, g.node_class.get(j)) == eg_find(g, n.a) {
+                    if eg_union(g, c, m.a) { any = true; }
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    eg_rebuild(g);
+    return any;
+}
+
+/// Class c holds x + k for a constant k: [1, class of x, k], else [0].
+fn eg_add_const_child(g: &mut EGraph, c: i64, ty: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var rc: i64 = eg_find(g, c);
+    var i: i64 = 0;
+    while i < g.nodes.len() {
+        var n: ENode = g.nodes.get(i);
+        if n.kind == EK_BIN && n.op == EB_ADD && n.ty == ty && eg_find(g, g.node_class.get(i)) == rc {
+            var kb: Vec<i64> = eg_class_const(g, n.b);
+            if kb.get(0) == 1 && eg_find(g, n.a) != rc {
+                out.push(1); out.push(n.a); out.push(kb.get(1));
+                return out;
+            }
+        }
+        i = i + 1;
+    }
+    out.push(0);
+    return out;
+}
+
+fn eg_cost(op: i64) -> i64 {
+    if op == EB_MUL { return 3; }
+    if op == EB_DIV || op == EB_MOD { return 20; }
+    return 1;
+}
+
+// --- From the IR and back -------------------------------------------------
+
+fn eg_binop(op: BinOp) -> i64 {
+    match op {
+        BinOp::Add => { return EB_ADD; }
+        BinOp::Sub => { return EB_SUB; }
+        BinOp::Mul => { return EB_MUL; }
+        BinOp::Div => { return EB_DIV; }
+        BinOp::Mod => { return EB_MOD; }
+        BinOp::BitAnd => { return EB_AND; }
+        BinOp::BitOr => { return EB_OR; }
+        BinOp::BitXor => { return EB_XOR; }
+        BinOp::Shl => { return EB_SHL; }
+        BinOp::Shr => { return EB_SHR; }
+        BinOp::Eq => { return EB_EQ; }
+        BinOp::Neq => { return EB_NE; }
+        BinOp::Lt => { return EB_LT; }
+        BinOp::LtEq => { return EB_LE; }
+        BinOp::Gt => { return EB_GT; }
+        BinOp::GtEq => { return EB_GE; }
+        _ => {}
+    }
+    return 0;
+}
+
+fn eg_to_binop(op: i64) -> BinOp {
+    if op == EB_ADD { return BinOp::Add; }
+    if op == EB_SUB { return BinOp::Sub; }
+    if op == EB_MUL { return BinOp::Mul; }
+    if op == EB_DIV { return BinOp::Div; }
+    if op == EB_MOD { return BinOp::Mod; }
+    if op == EB_AND { return BinOp::BitAnd; }
+    if op == EB_OR { return BinOp::BitOr; }
+    if op == EB_XOR { return BinOp::BitXor; }
+    if op == EB_SHL { return BinOp::Shl; }
+    if op == EB_SHR { return BinOp::Shr; }
+    if op == EB_EQ { return BinOp::Eq; }
+    if op == EB_NE { return BinOp::Neq; }
+    if op == EB_LT { return BinOp::Lt; }
+    if op == EB_LE { return BinOp::LtEq; }
+    if op == EB_GT { return BinOp::Gt; }
+    return BinOp::GtEq;
+}
+
+fn eg_int_ty(t: IrType) -> str {
+    if ir_type_eq(t, IrType::I64) { return "i64"; }
+    if ir_type_eq(t, IrType::U64) { return "u64"; }
+    if ir_type_eq(t, IrType::I32) { return "i32"; }
+    if ir_type_eq(t, IrType::U32) { return "u32"; }
+    if ir_type_eq(t, IrType::I16) { return "i16"; }
+    if ir_type_eq(t, IrType::U16) { return "u16"; }
+    if ir_type_eq(t, IrType::I8) { return "i8"; }
+    if ir_type_eq(t, IrType::U8) { return "u8"; }
+    if ir_type_eq(t, IrType::Bool) { return "bool"; }
+    return "";
+}
+
+fn eg_meta_ty(f: &IrFunction, id: i64) -> IrType {
+    match IrFunction_get_meta(f, id) {
+        OptValueMeta::Some(m) => { return m.ty; }
+        OptValueMeta::None => {}
+    }
+    return IrType::Void;
+}
+
+fn eg_set_inst(f: &mut IrFunction, id: i64, inst: Inst) {
+    var at: i64 = f.inst_at.get(id) - 1;
+    var ve: ValueIdInst = f.insts.get(at);
+    ve.inst = inst;
+    f.insts.set(at, ve);
+}
+
+/// The e-graph pass over one function: how many instructions it rewrote.
+fn eg_function(f: &mut IrFunction, module: &IrModule) -> i64 {
+    var cfg: IroCfg = iro_cfg(f);
+    var g: EGraph = EGraph { nodes: Vec::new(), node_class: Vec::new(), parent: Vec::new(), hash: HashMap_new(),
+        wrapping: f.is_wrapping, unions: 0 };
+    var n: i64 = f.next_value;
+    var i: i64 = 0;
+    while i < f.insts.len() { if f.insts.get(i).id >= n { n = f.insts.get(i).id + 1; } i = i + 1; }
+    i = 0;
+    while i < f.params.len() { if f.params.get(i).id >= n { n = f.params.get(i).id + 1; } i = i + 1; }
+    var cls: Vec<i64> = Vec::new();        // value id -> class (-1: none)
+    var blk: Vec<i64> = Vec::new();        // value id -> block index
+    var pos: Vec<i64> = Vec::new();        // value id -> position in its block
+    i = 0;
+    while i < n { cls.push(0 - 1); blk.push(0 - 1); pos.push(0 - 1); i = i + 1; }
+    // Values in dominance order (reverse postorder of blocks)
+    var order: Vec<i64> = Vec::new();
+    var ri: i64 = 0;
+    while ri < cfg.rpo.len() {
+        var bi: i64 = cfg.rpo.get(ri);
+        var block: BasicBlock = f.blocks.get(bi);
+        var k: i64 = 0;
+        while k < block.instructions.len() {
+            var id: i64 = block.instructions.get(k);
+            if id >= 0 && id < n { blk.set(id, bi); pos.set(id, k); order.push(id); }
+            k = k + 1;
+        }
+        ri = ri + 1;
+    }
+    // Classes: an opaque value of each operand first seen, a node per pure
+    // instruction
+    var oi: i64 = 0;
+    while oi < order.len() && g.nodes.len() < EG_MAX_NODES {
+        var id2: i64 = order.get(oi);
+        match IrFunction_get_inst(f, id2) {
+            OptInst::Some(inst) => {
+                var c: i64 = 0 - 1;
+                match inst {
+                    Inst::ConstInt(v, t) => {
+                        var ts: str = eg_int_ty(t);
+                        if ts != "" { c = eg_add(&mut g, ENode { kind: EK_CONST, op: 0, a: v, b: 0, ty: ts }); }
+                    }
+                    Inst::ConstBool(b) => {
+                        var bv: i64 = 0;
+                        if b { bv = 1; }
+                        c = eg_add(&mut g, ENode { kind: EK_CONST, op: 0, a: bv, b: 0, ty: "bool" });
+                    }
+                    Inst::BinOp(op, a, b2, t) => {
+                        var code: i64 = eg_binop(op);
+                        var ots: str = eg_int_ty(eg_meta_ty(f, a));
+                        if code != 0 && ots != "" && ots != "bool" && eg_int_ty(eg_meta_ty(f, b2)) == ots
+                            && eg_int_ty(t) != "" {
+                            var ca: i64 = eg_value(&mut g, &mut cls, a);
+                            var cb: i64 = eg_value(&mut g, &mut cls, b2);
+                            c = eg_add(&mut g, ENode { kind: EK_BIN, op: code, a: ca, b: cb, ty: ots });
+                        }
+                    }
+                    _ => {}
+                }
+                if c >= 0 { cls.set(id2, c); }
+            }
+            OptInst::None => {}
+        }
+        oi = oi + 1;
+    }
+    if g.nodes.len() == 0 { return 0; }
+    var round: i64 = 0;
+    while round < EG_MAX_ROUNDS && g.nodes.len() < EG_MAX_NODES && eg_round(&mut g) { round = round + 1; }
+    if g.unions == 0 { return 0; }
+
+    // Best node per class (cost fixpoint)
+    var nc: i64 = g.parent.len();
+    var best: Vec<i64> = Vec::new();
+    var bcost: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nc { best.push(0 - 1); bcost.push(1000000000); i = i + 1; }
+    var changed: bool = true;
+    var iters: i64 = 0;
+    while changed && iters < 50 {
+        changed = false;
+        iters = iters + 1;
+        i = 0;
+        while i < g.nodes.len() {
+            var nd: ENode = g.nodes.get(i);
+            var rc: i64 = eg_find(&mut g, g.node_class.get(i));
+            var cost: i64 = 1000000000;
+            if nd.kind == EK_LEAF { cost = 0; }
+            if nd.kind == EK_CONST { cost = 1; }
+            if nd.kind == EK_BIN {
+                var x: i64 = bcost.get(eg_find(&mut g, nd.a));
+                var y: i64 = bcost.get(eg_find(&mut g, nd.b));
+                if x < 1000000000 && y < 1000000000 { cost = eg_cost(nd.op) + x + y; }
+            }
+            if cost < bcost.get(rc) { bcost.set(rc, cost); best.set(rc, i); changed = true; }
+            i = i + 1;
+        }
+    }
+    // The values of each class, in dominance order (parameters first)
+    var members: Vec<Vec<i64>> = Vec::new();
+    i = 0;
+    while i < nc { var mv: Vec<i64> = Vec::new(); members.push(mv); i = i + 1; }
+    i = 0;
+    while i < f.params.len() {
+        var pv: i64 = f.params.get(i).id;
+        if pv >= 0 && pv < n && cls.get(pv) >= 0 {
+            var pc: i64 = eg_find(&mut g, cls.get(pv));
+            var pl: Vec<i64> = members.get(pc);
+            pl.push(pv);
+            members.set(pc, pl);
+            pos.set(pv, 0 - 1);
+        }
+        i = i + 1;
+    }
+    oi = 0;
+    while oi < order.len() {
+        var ov: i64 = order.get(oi);
+        if cls.get(ov) >= 0 {
+            var oc: i64 = eg_find(&mut g, cls.get(ov));
+            var ol: Vec<i64> = members.get(oc);
+            ol.push(ov);
+            members.set(oc, ol);
+        }
+        oi = oi + 1;
+    }
+    // Rewrite each pure instruction into its class's best form, where that
+    // form's operands are values dominating it
+    var rewrites: i64 = 0;
+    oi = 0;
+    while oi < order.len() {
+        var id3: i64 = order.get(oi);
+        var c3: i64 = cls.get(id3);
+        if c3 >= 0 {
+            var rc3: i64 = eg_find(&mut g, c3);
+            var bn: i64 = best.get(rc3);
+            var tty: IrType = eg_meta_ty(f, id3);
+            if bn >= 0 {
+                var bnode: ENode = g.nodes.get(bn);
+                var cur: Inst = Inst::Unreachable;
+                match IrFunction_get_inst(f, id3) {
+                    OptInst::Some(ci) => { cur = ci; }
+                    OptInst::None => {}
+                }
+                var done: bool = false;
+                var is_const_now: bool = false;
+                match cur {
+                    Inst::ConstInt(_, _) => { is_const_now = true; }
+                    Inst::ConstBool(_) => { is_const_now = true; }
+                    _ => {}
+                }
+                if bnode.kind == EK_CONST && !is_const_now {
+                    if ir_type_eq(tty, IrType::Bool) {
+                        eg_set_inst(f, id3, Inst::ConstBool(bnode.a != 0));
+                        done = true;
+                    } else if eg_int_ty(tty) != "" && eg_int_ty(tty) != "bool" {
+                        eg_set_inst(f, id3, Inst::ConstInt(bnode.a, tty));
+                        done = true;
+                    }
+                }
+                if !done && !is_const_now {
+                    // An earlier value of the same class: a move
+                    var prev: i64 = eg_member_before(&members, &cfg, &blk, &pos, rc3, id3, f);
+                    if prev >= 0 && ir_type_eq(eg_meta_ty(f, prev), tty) {
+                        eg_set_inst(f, id3, Inst::BitCast(prev, tty, tty));
+                        done = true;
+                    }
+                }
+                if !done && bnode.kind == EK_BIN && !is_const_now {
+                    var cost_now: i64 = eg_inst_cost(cur);
+                    if eg_cost(bnode.op) < cost_now {
+                        var va: i64 = eg_member_before(&members, &cfg, &blk, &pos, eg_find(&mut g, bnode.a), id3, f);
+                        var vb: i64 = eg_member_before(&members, &cfg, &blk, &pos, eg_find(&mut g, bnode.b), id3, f);
+                        if va >= 0 && vb >= 0 {
+                            match cur {
+                                Inst::BinOp(_, _, _, rt) => {
+                                    eg_set_inst(f, id3, Inst::BinOp(eg_to_binop(bnode.op), va, vb, rt));
+                                    done = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                if done { rewrites = rewrites + 1; }
+            }
+        }
+        oi = oi + 1;
+    }
+    return rewrites;
+}
+
+fn eg_inst_cost(inst: Inst) -> i64 {
+    match inst {
+        Inst::BinOp(op, _, _, _) => { return eg_cost(eg_binop(op)); }
+        _ => {}
+    }
+    return 1;
+}
+
+/// The class of value v: its own when it has one, else a new leaf.
+fn eg_value(g: &mut EGraph, cls: &mut Vec<i64>, v: i64) -> i64 {
+    if v >= 0 && v < cls.len() && cls.get(v) >= 0 { return cls.get(v); }
+    var c: i64 = eg_add(g, ENode { kind: EK_LEAF, op: 0, a: v, b: 0, ty: "" });
+    if v >= 0 && v < cls.len() { cls.set(v, c); }
+    return c;
+}
+
+/// A value of class rc available at `at`: a parameter, or an instruction
+/// whose block dominates at's (earlier in the same block). -1 if none.
+fn eg_member_before(members: &Vec<Vec<i64>>, cfg: &IroCfg, blk: &Vec<i64>, pos: &Vec<i64>, rc: i64, at: i64,
+                    f: &IrFunction) -> i64 {
+    if rc < 0 || rc >= members.len() { return 0 - 1; }
+    var list: Vec<i64> = members.get(rc);
+    var ab: i64 = blk.get(at);
+    var k: i64 = 0;
+    while k < list.len() {
+        var v: i64 = list.get(k);
+        if v != at {
+            var vb: i64 = blk.get(v);
+            if vb < 0 && pos.get(v) == 0 - 1 { return v; }     // a parameter
+            if vb >= 0 && ab >= 0 {
+                if vb == ab { if pos.get(v) < pos.get(at) { return v; } }
+                else if iro_dominates(cfg, vb, ab) { return v; }
+            }
+        }
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+// --- Store-to-load forwarding ---------------------------------------------
+
+/// Forward loads of locals: how many loads became moves.
+fn eg_forward(f: &mut IrFunction) -> i64 {
+    var cfg: IroCfg = iro_cfg(f);
+    var n: i64 = f.next_value;
+    var i: i64 = 0;
+    while i < f.insts.len() { if f.insts.get(i).id >= n { n = f.insts.get(i).id + 1; } i = i + 1; }
+    // Candidate locals: only loaded from and stored to; their stores
+    var cand: Vec<i64> = Vec::new();
+    var nstores: Vec<i64> = Vec::new();
+    var the_store: Vec<i64> = Vec::new();
+    i = 0;
+    while i < n { cand.push(0); nstores.push(0); the_store.push(0 - 1); i = i + 1; }
+    i = 0;
+    while i < f.insts.len() {
+        var ve: ValueIdInst = f.insts.get(i);
+        match ve.inst {
+            Inst::Alloca(t, _) => {
+                match t {
+                    IrType::Struct(_) => {}
+                    IrType::Array(_, _) => {}
+                    _ => { if ve.id >= 0 && ve.id < n { cand.set(ve.id, 1); } }
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    var ops: Vec<i64> = Vec::new();
+    i = 0;
+    while i < f.insts.len() {
+        var ve2: ValueIdInst = f.insts.get(i);
+        var ok_ptr: i64 = 0 - 1;
+        match ve2.inst {
+            Inst::Load(p, _) => { ok_ptr = p; }
+            Inst::Store(p2, v2, _) => {
+                ok_ptr = p2;
+                if p2 >= 0 && p2 < n {
+                    nstores.set(p2, nstores.get(p2) + 1);
+                    the_store.set(p2, ve2.id);
+                }
+                if v2 >= 0 && v2 < n { cand.set(v2, 0); }
+            }
+            _ => {}
+        }
+        if ok_ptr < 0 {
+            ops.clear();
+            peir_inst_operands(ve2.inst, &mut ops);
+            var k: i64 = 0;
+            while k < ops.len() { var u: i64 = ops.get(k); if u >= 0 && u < n { cand.set(u, 0); } k = k + 1; }
+        }
+        i = i + 1;
+    }
+    // Where each instruction is
+    var blk: Vec<i64> = Vec::new();
+    var pos: Vec<i64> = Vec::new();
+    i = 0;
+    while i < n { blk.push(0 - 1); pos.push(0 - 1); i = i + 1; }
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var block: BasicBlock = f.blocks.get(b);
+        var k2: i64 = 0;
+        while k2 < block.instructions.len() {
+            var id: i64 = block.instructions.get(k2);
+            if id >= 0 && id < n { blk.set(id, b); pos.set(id, k2); }
+            k2 = k2 + 1;
+        }
+        b = b + 1;
+    }
+    var count: i64 = 0;
+    b = 0;
+    while b < f.blocks.len() {
+        var blk2: BasicBlock = f.blocks.get(b);
+        // the last store to each local seen so far in this block
+        var last: i64 = HashMap_new();
+        var k3: i64 = 0;
+        while k3 < blk2.instructions.len() {
+            var lid: i64 = blk2.instructions.get(k3);
+            match IrFunction_get_inst(f, lid) {
+                OptInst::Some(inst) => {
+                    match inst {
+                        Inst::Store(sp, sv, _) => {
+                            if sp >= 0 && sp < n && cand.get(sp) != 0 { HashMap_insert(last, int_to_str(sp), sv); }
+                        }
+                        Inst::Load(lp, lty) => {
+                            if lp >= 0 && lp < n && cand.get(lp) != 0 {
+                                var src: i64 = 0 - 1;
+                                if HashMap_contains(last, int_to_str(lp)) {
+                                    src = HashMap_get(last, int_to_str(lp));
+                                } else if nstores.get(lp) == 1 {
+                                    var st: i64 = the_store.get(lp);
+                                    var sb: i64 = blk.get(st);
+                                    if sb >= 0 && sb != b && iro_dominates(&cfg, sb, b) {
+                                        match IrFunction_get_inst(f, st) {
+                                            OptInst::Some(sinst) => {
+                                                match sinst {
+                                                    Inst::Store(_, v3, _) => { src = v3; }
+                                                    _ => {}
+                                                }
+                                            }
+                                            OptInst::None => {}
+                                        }
+                                    }
+                                }
+                                if src >= 0 && ir_type_eq(eg_meta_ty(f, src), lty) && ir_type_eq(eg_meta_ty(f, lid), lty) {
+                                    eg_set_inst(f, lid, Inst::BitCast(src, lty, lty));
+                                    count = count + 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                OptInst::None => {}
+            }
+            k3 = k3 + 1;
+        }
+        b = b + 1;
+    }
+    return count;
+}
+
+/// The pass over every function: [loads forwarded, instructions rewritten].
+pub fn egraph_run(module: &mut IrModule) -> Vec<i64> {
+    var nf: i64 = 0;
+    var ne: i64 = 0;
+    var on_f: bool = eg_on("forward");
+    var on_e: bool = eg_on("egraph");
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var entry: IrFunctionEntry = module.functions.get(i);
+        var f: IrFunction = entry.func;
+        var c: i64 = 0;
+        if on_f { var a: i64 = eg_forward(&mut f); nf = nf + a; c = c + a; }
+        if on_e { var e: i64 = eg_function(&mut f, module); ne = ne + e; c = c + e; }
+        if c > 0 {
+            entry.func = f;
+            module.functions.set(i, entry);
+        }
+        i = i + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(nf);
+    out.push(ne);
+    return out;
+}

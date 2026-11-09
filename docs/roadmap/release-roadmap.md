@@ -501,9 +501,29 @@ compiler.
       some file builtins. `test_int_semantics` and the three run-time panic
       tests pass (F6). The old PIR path (codegen_arm64/riscv.fd,
       runtime_arm64/riscv.fd and their stubs) is no longer used by `fid`.
-      Left: the missing builtins above (math as instructions or in Fides,
-      threads through clone, tasks through a stack switch), stack-overflow
-      and fault messages (no signal handler yet: a fault is a plain SIGSEGV).
+      Nov 7–9: the missing builtins are in: threads through clone (a guard
+      region under each stack, freed at the join), M:N green tasks on worker
+      threads with an own context switch, futex waits for mutexes and
+      channels, sockets, processes, qsort callbacks, musl's exp/log/pow and
+      fdlibm's sin/cos, JSON/HTTP/DB/tensors shared with the Windows runtime
+      (stdlib/linux_runtime). Faults and stack overflow are panics with the
+      C path's trace (RT15). The backend records a machine IR and allocates
+      registers once for AArch64, RISC-V and now x86-64 Linux (own-backend
+      roadmap, docs/roadmap/llvm-roadmap.md), with an IR verifier and an
+      allocation checker (FID_VERIFY=1), iropt plus rules and an e-graph on
+      this path. Suite, Nov 9, with every check on: AArch64 273 passed,
+      RISC-V 271, x86-64 272 (of 317; 7–9 do not build: two lowering bugs
+      found by the verifier, three front-end errors, x86-64-only `@cfg`,
+      bare-metal and SDL tests). Left: the native mismatches older than this
+      work (`test_args`, `test_free_escape`, `test_sensitive` / integer-key
+      HashMap through an i64 handle, `test_str_return3`), and a rerun
+      against a current interpreter (many references failed in the 19:03
+      snapshot's).
+      Nov 9: Windows x64 on the same layer, opt-in (`fid emit --nat`): a PE
+      written by nat_enc.fd, the Linux runtime over kernel32 / ws2_32
+      (stdlib/linux_runtime/win.fd maps each system call); 301 of 338 suite
+      tests match. Processes wait for a `nat_os()` hook in `pe_sh`. Line
+      tables (`.debug_line`) in every native Linux executable.
 - [~] F9. WASM: globals, struct copies, collections (L).
       Nov 7, through C: `fid ccompile --target wasm32-wasi -o x.wasm` (zig cc,
       WASI preview 1) and `node scripts/wasm-run.mjs x.wasm` run the sample

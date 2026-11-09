@@ -540,6 +540,10 @@ pub struct Lowerer {
     /// A core string builder (String_*, p_str_*): a raw buffer it returns
     /// as a str is the new string it made, handed over, not counted again
     pub own_raw_ret: bool,
+    /// The source line of the statement being lowered (0: none); every
+    /// instruction emitted gets it as its ValueMeta.source_line (DWARF line
+    /// tables, IrModule_source_map)
+    pub cur_line: i64,
     /// extern "C" functions declared to return a str: what C returns is
     /// copied into a counted string at the call (proposal 0004)
     pub own_str_externs: Vec<str>,
@@ -631,6 +635,7 @@ pub fn Lowerer_new() -> Lowerer {
         own_on: false,
         own_ret_ty: Type::Void,
         own_raw_ret: false,
+        cur_line: 0,
         own_str_externs: Vec::new(),
         own_nomove: Vec::new(),
         own_types: Vec::new(),
@@ -1244,6 +1249,14 @@ pub fn Lowerer_is_struct(self: &Lowerer, name: str) -> bool {
 
 pub fn Lowerer_emit_inst(self: &mut Lowerer, inst: Inst) -> i64 {
     var id: i64 = IrFunction_emit(&mut self.current_func, inst);
+    // The statement's line (value ids are value_metas indexes)
+    if self.cur_line > 0 && id >= 0 && id < self.current_func.value_metas.len() {
+        var vme: ValueIdMeta = self.current_func.value_metas.get(id);
+        if vme.id == id {
+            vme.meta.source_line = OptU64::Some(self.cur_line as u64);
+            self.current_func.value_metas.set(id, vme);
+        }
+    }
     // A call's result is a temporary the statement owns (proposal 0004)
     if self.own_on {
         match inst {
@@ -5196,7 +5209,8 @@ fn Lowerer_concat_int(self: &mut Lowerer, left: i64, right: i64) -> i64 {
     Lowerer_rc_claim(self, right);
     var a: Vec<i64> = Vec::new();
     a.push(Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64)));
-    a.push(Lowerer_rc_as_i64(self, left));
+    // the string as it is (the interpreter keeps its own string values)
+    a.push(left);
     a.push(nv);
     return Lowerer_emit_inst(self, Inst::Call("p_str_concat_int", a, lw_ptr_u8(), lw_rc_eff()));
 }
@@ -5521,6 +5535,10 @@ fn Lowerer_lower_index_assign_stmt(self: &mut Lowerer, array_name: Box<Expr>, in
         }
     }
 
+    // `v[i] = x` through a `&mut Vec<T>` (a parameter's slot holds the
+    // address of the caller's Vec): the Vec it points at, as a method call
+    // on it reads it (it was written as a plain array, into the pointer)
+    arr_val = Lowerer_auto_deref_recv(self, arr_val, Lowerer_get_value_type(self, arr_val));
     var idx_val: i64 = Lowerer_lower_expr(self, index);
     var arr_ty: IrType = Lowerer_get_value_type(self, arr_val);
 
@@ -5748,13 +5766,18 @@ fn Lowerer_lower_select_stmt(self: &mut Lowerer, cases: Vec<SelectCase>, default
 /// A statement owns the temporaries it makes: they are dropped at its end
 /// unless something kept them (proposal 0004).
 pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
+    var saved_line: i64 = self.cur_line;
+    var sl: i64 = stmt_line(stmt);
+    if sl > 0 { self.cur_line = sl; }
     if !self.own_on {
         Lowerer_lower_stmt_inner(self, stmt);
+        self.cur_line = saved_line;
         return;
     }
     var mark: i64 = self.own_temps.len();
     Lowerer_lower_stmt_inner(self, stmt);
     Lowerer_rc_flush(self, mark);
+    self.cur_line = saved_line;
 }
 
 fn Lowerer_lower_stmt_inner(self: &mut Lowerer, stmt: Stmt) {
@@ -8051,6 +8074,19 @@ fn Lowerer_lower_field_access_expr(self: &mut Lowerer, obj: Box<Expr>, field: st
             _ => {}
         }
     }
+    // `b.f` on a Box of a struct (a Box field, a Box variable): the Box is
+    // the struct's address, as its AST type says
+    if str_len(struct_name) == 0 {
+        match Lowerer_resolve_type(self, Lowerer_rc_expr_type(self, obj_expr)) {
+            Type::Generic(bn, bargs) => {
+                if bn == "Box" && bargs.len() == 1 && Lowerer_rc_is_mem_type(self, Lowerer_resolve_type(self, bargs.get(0))) {
+                    struct_name = lw_rc_type_name(Lowerer_resolve_type(self, bargs.get(0)));
+                    obj_val = Lowerer_emit_inst(self, Inst::BitCast(obj_val, obj_ty, IrType::Ptr(Box::new(IrType::Struct(struct_name)))));
+                }
+            }
+            _ => {}
+        }
+    }
 
     // Swizzle access for vec types (Phase 8A): v.xyz / v.rgb / v.yx ...
     if is_vec_type_name(struct_name) && str_len(field) > 1 && is_valid_swizzle(field) {
@@ -8663,8 +8699,11 @@ fn Lowerer_lower_try_expr(self: &mut Lowerer, e: Box<Expr>) -> i64 {
         // owner of its own, then this function's values are dropped. A
         // Result whose type is unknown here drops nothing (it may borrow).
         var tty: Type = Lowerer_rc_value_type(self, lw_box_expr_unbox(e), tval);
+        var eval_r: i64 = tval;
         if self.own_on && Lowerer_rc_kind(self, tty) == RC_MEM {
-            tval = Lowerer_rc_dup(self, tval, tty);
+            // a copy for the error path only: the Ok path after the merge
+            // reads the original (the copy's block does not dominate it)
+            eval_r = Lowerer_rc_dup(self, tval, tty);
             Lowerer_rc_drop_all(self);
         }
         match self.current_sret {
@@ -8672,18 +8711,18 @@ fn Lowerer_lower_try_expr(self: &mut Lowerer, e: Box<Expr>) -> i64 {
                 // Struct return: the caller reads the result from its
                 // out-param, so copy tag and payload there (as src/lower.rs);
                 // a bare return left the caller's buffer as it was
-                var e_tag_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(tval, 0, IrType::I64));
+                var e_tag_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(eval_r, 0, IrType::I64));
                 var e_tag: i64 = Lowerer_emit_inst(self, Inst::Load(e_tag_ptr, IrType::I64));
                 var r_tag_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(sret, 0, IrType::I64));
                 Lowerer_emit_inst(self, Inst::Store(r_tag_ptr, e_tag, OptIrType::None));
-                var e_val_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(tval, 1, IrType::I64));
+                var e_val_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(eval_r, 1, IrType::I64));
                 var e_val: i64 = Lowerer_emit_inst(self, Inst::Load(e_val_ptr, IrType::I64));
                 var r_val_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(sret, 1, IrType::I64));
                 Lowerer_emit_inst(self, Inst::Store(r_val_ptr, e_val, OptIrType::None));
                 Lowerer_emit_terminator(self, Inst::Return(OptValueId::None));
             }
             OptValueId::None => {
-                Lowerer_emit_terminator(self, Inst::Return(OptValueId::Some(tval)));
+                Lowerer_emit_terminator(self, Inst::Return(OptValueId::Some(eval_r)));
             }
         }
     }
@@ -9309,6 +9348,8 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
         }
         Expr::Index(arr, idx) => {
             var arr_val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(arr));
+            // through a `&Vec` / `&mut Vec`: the Vec it refers to
+            arr_val = Lowerer_auto_deref_recv(self, arr_val, Lowerer_get_value_type(self, arr_val));
             var idx_val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(idx));
             var arr_ty: IrType = Lowerer_get_value_type(self, arr_val);
 
@@ -9554,6 +9595,18 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             // (src/lower.rs).
             match load_ty {
                 IrType::Struct(_) => { return ptr_val; }
+                _ => {}
+            }
+            // A Box of a struct or enum whose IR type says nothing of it (a
+            // binding of an enum payload is a plain pointer): its AST type
+            // does, and the Box is the struct's address
+            match Lowerer_resolve_type(self, Lowerer_rc_expr_type(self, lw_box_expr_unbox(e))) {
+                Type::Generic(bn, bargs) => {
+                    if bn == "Box" && bargs.len() == 1 && Lowerer_rc_is_mem_type(self, Lowerer_resolve_type(self, bargs.get(0))) {
+                        var sty: IrType = Lowerer_rc_mem_ir(self, bargs.get(0));
+                        return Lowerer_emit_inst(self, Inst::BitCast(ptr_val, ptr_ty, IrType::Ptr(Box::new(sty))));
+                    }
+                }
                 _ => {}
             }
             return Lowerer_emit_inst(self, Inst::Load(ptr_val, load_ty));

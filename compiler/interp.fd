@@ -1131,15 +1131,29 @@ pub fn Interpreter_value_to_string(self: &Interpreter, v: Value) -> str {
                 }
             }
             if i > 0 && Memory_is_valid_addr(&self.memory, i) {
-                var out: str = "";
+                // A string in memory: the length its header gives (core's
+                // counted, uncounted and literal strings), else up to the NUL.
+                // An empty one is "" (its address is not a number to print).
+                var hlen: i64 = -1;
+                if i >= 16 && Memory_is_valid_addr(&self.memory, i - 16) {
+                    var hw: i64 = Memory_load_i64(&self.memory, i - 16);
+                    var hl: i64 = Memory_load_i64(&self.memory, i - 8);
+                    if (hw - 0x4649444500000000) >= 0 && (hw - 0x4649444500000000) < 0x100000000 && hl >= 0 && hl < 0x10000000000 {
+                        hlen = hl;
+                    }
+                    if (hw == 0x4649444553545201 || hw == 0x4649444553545202) && hl >= 0 && hl < 0x10000000000 { hlen = hl; }
+                }
+                var osb: i64 = p_sb_new();
                 var n: i64 = 0;
-                while n < 256 {
+                var limit: i64 = 16777216;
+                if hlen >= 0 { limit = hlen; }
+                while n < limit {
                     var b: i64 = Memory_load_byte(&self.memory, i + n);
-                    if b == 0 { break; }
-                    out = out + p_char_to_str(b);
+                    if b == 0 && hlen < 0 { break; }
+                    p_sb_append(osb, p_char_to_str(b));
                     n = n + 1;
                 }
-                if n > 0 { return out; }
+                return p_sb_to_str(osb);
             }
             return int_to_str(i);
         }
@@ -1398,6 +1412,15 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
                         IrType::Ptr(_) => { pval = Value::Ptr(str_addr); }
                         _ => { pval = Value::Int(str_addr); }
                     }
+                }
+            }
+            // An f64 passed where a word is taken (core's Vec_push / Vec_set
+            // of a Vec<f64>): its bits, as the C backend passes it
+            Value::Float(pf) => {
+                match param.ty {
+                    IrType::I64 => { pval = Value::Int(p_f64_to_bits(pf)); }
+                    IrType::U64 => { pval = Value::Int(p_f64_to_bits(pf)); }
+                    _ => {}
                 }
             }
             _ => {}
@@ -2913,7 +2936,20 @@ pub fn Interpreter_cast_value(self: &Interpreter, v: Value, to: IrType) -> Value
             match to {
                 IrType::F32 => { return Value::Float((i as f64)); }
                 IrType::F64 => { return Value::Float((i as f64)); }
+                // An address made a pointer (`p + off` cast to *T): a Store
+                // or Load through it needs a pointer value, or it went to 0
+                IrType::Ptr(_) => {
+                    if i == 0 { return Value::Int(0); }
+                    return Value::Ptr(i);
+                }
                 _ => { return Value::Int(i); }
+            }
+        }
+        Value::Ptr(pa) => {
+            match to {
+                IrType::I64 => { return Value::Int(pa); }
+                IrType::U64 => { return Value::Int(pa); }
+                _ => { return v; }
             }
         }
         Value::Float(f) => {
@@ -2985,6 +3021,11 @@ pub fn Interpreter_is_runtime_func_uncached(self: &Interpreter, name: str) -> bo
     if str_starts_with(name, "p_tp_") { return true; }
     if str_starts_with(name, "p_checkpoint_") { return true; }
     if str_starts_with(name, "p_volatile_") { return true; }
+    // The lowering's fused string forms (`s + int_to_str(n)`, `s = s + x`):
+    // core writes them into memory, but here strings are the interpreter's
+    // own values, so they run as builtins even though core defines them
+    if name == "p_str_concat_int" || name == "p_str_append" { return true; }
+    if str_starts_with(name, "p_signal_") { return true; }
     // The runtime set of src/interp.rs ends here. A name the program or
     // core defines as a Fides function runs that function (core implements
     // p_str_equal, p_str_length, ... itself): the builtins below are only
@@ -3014,6 +3055,7 @@ pub fn Interpreter_is_runtime_func_uncached(self: &Interpreter, name: str) -> bo
     if name == "p_free" { return true; }
     if name == "p_region_free" { return true; }
     if name == "p_str_concat" { return true; }
+    if name == "p_str_concat_int" { return true; }
     if name == "p_to_str" { return true; }
     if name == "p_char_to_str" { return true; }
     if name == "p_float_to_str" { return true; }
@@ -3174,6 +3216,48 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
         if args.len() > 0 { left = Interpreter_value_to_string(self, args.get(0)); }
         if args.len() > 1 { right = Interpreter_value_to_string(self, args.get(1)); }
         return ExecOutcome::Value(Value::Str(left + right));
+    }
+    // Signals within the process (stdlib/signal.fd): registered and pending
+    // flags per signal number (< 64)
+    if name == "p_signal_register" || name == "p_signal_raise" || name == "p_signal_check" {
+        var sn: i64 = arg_int(args, args.len() - 1, 0);
+        if sn < 0 || sn >= 64 { return ExecOutcome::Value(Value::Int(-1)); }
+        var bit: i64 = 1 << sn;
+        if name == "p_signal_register" {
+            g_interp_sig_registered = g_interp_sig_registered | bit;
+            return ExecOutcome::Value(Value::Int(0));
+        }
+        if name == "p_signal_raise" {
+            if (g_interp_sig_registered & bit) != 0 { g_interp_sig_pending = g_interp_sig_pending | bit; }
+            return ExecOutcome::Value(Value::Int(0));
+        }
+        var was: i64 = 0;
+        if (g_interp_sig_pending & bit) != 0 { was = 1; }
+        g_interp_sig_pending = g_interp_sig_pending & (~bit);
+        return ExecOutcome::Value(Value::Int(was));
+    }
+    if name == "p_str_append" {
+        var al: str = "";
+        var ar: str = "";
+        if args.len() >= 2 {
+            al = Interpreter_value_to_string(self, args.get(args.len() - 2));
+            ar = Interpreter_value_to_string(self, args.get(args.len() - 1));
+        }
+        return ExecOutcome::Value(Value::Str(al + ar));
+    }
+    // `s + int_to_str(n)` fused by the lowering (core's p_str_concat_int):
+    // on the interpreter's own strings, as p_str_concat
+    if name == "p_str_concat_int" {
+        var cl: str = "";
+        var cn: i64 = 0;
+        if args.len() >= 2 {
+            cl = Interpreter_value_to_string(self, args.get(args.len() - 2));
+            match args.get(args.len() - 1) {
+                Value::Int(ci) => { cn = ci; }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Str(cl + int_to_str(cn)));
     }
     if name == "p_to_str" {
         if args.len() > 0 {
@@ -4870,17 +4954,20 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
     // ─── Clock runtime functions (ported from src/interp.rs ~4990-5006) ───
     // Use step_count as a simple monotonic counter for timing.
     if name == "p_clock_now" {
-        return ExecOutcome::Value(Value::Int(self.step_count));
+        // the wall clock, as the C and native runtimes give it
+        return ExecOutcome::Value(Value::Int(p_clock_now()));
     }
     if name == "p_clock_now_us" {
-        return ExecOutcome::Value(Value::Int(self.step_count));
+        // the wall clock, as the C and native runtimes give it
+        return ExecOutcome::Value(Value::Int(p_clock_now_us()));
     }
     // 64 bits from the operating system's secure generator (the C runtime's)
     if name == "p_os_random_u64" {
         return ExecOutcome::Value(Value::Int(p_os_random_u64()));
     }
     if name == "p_clock_now_ms" {
-        return ExecOutcome::Value(Value::Int(self.step_count));
+        // the wall clock, as the C and native runtimes give it
+        return ExecOutcome::Value(Value::Int(p_clock_now_ms()));
     }
 
     // @zeroize heap wipe: interpreter strings and Vecs are managed values, not
@@ -5016,6 +5103,10 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                 if d.pledge_name == name { c_name = d.c_name; }
                 di = di + 1;
             }
+            // The C library calls the interpreter's own runtime can make
+            // for real (stdlib/os.fd); others have no source of truth here
+            var lout: ExecOutcome = Interpreter_libc_call(self, c_name, args);
+            if !outcome_is_unhandled(lout) { return lout; }
             return ExecOutcome::Panic("FFI function '" + name + "' (extern \"C\" " + c_name + ") is not available in the interpreter — this program requires native FFI; build it with `fid ccompile` instead of `fid run`");
         }
         ei = ei + 1;
@@ -7315,6 +7406,47 @@ pub fn Interpreter_display_vec_quoted(self: &Interpreter, h: i64) -> str {
 }
 
 /// ExecOutcome::Jump(-99): a builtin dispatcher did not know the name.
+/// An `extern "C"` call to the C library that the interpreter can make
+/// through its own runtime (getenv, printf of a plain string, system, exit,
+/// getpid); Jump(-99) for any other.
+pub fn Interpreter_libc_call(self: &mut Interpreter, c_name: str, args: Vec<Value>) -> ExecOutcome {
+    if c_name == "getenv" {
+        var gname: str = "";
+        if args.len() > 0 { gname = Interpreter_value_to_string(self, args.get(args.len() - 1)); }
+        match env_var(gname) {
+            Option::Some(gv) => { return ExecOutcome::Value(Value::Str(gv)); }
+            Option::None => { return ExecOutcome::Value(Value::Int(0)); }
+        }
+    }
+    if c_name == "printf" || c_name == "puts" {
+        var ptext: str = "";
+        if args.len() > 0 { ptext = Interpreter_value_to_string(self, args.get(args.len() - 1)); }
+        if c_name == "puts" { ptext = ptext + "\n"; }
+        p_print_str(ptext);
+        return ExecOutcome::Value(Value::Int(str_len(ptext)));
+    }
+    if c_name == "system" {
+        var scmd: str = "";
+        if args.len() > 0 { scmd = Interpreter_value_to_string(self, args.get(args.len() - 1)); }
+        var sh: i64 = p_process_run(scmd);
+        p_print_str(p_process_stdout(sh));
+        p_eprint_str(p_process_stderr(sh));
+        var scode: i64 = p_process_code(sh);
+        p_process_close(sh);
+        return ExecOutcome::Value(Value::Int(scode));
+    }
+    if c_name == "exit" {
+        p_exit(arg_int(args, args.len() - 1, 0));
+        return ExecOutcome::Value(Value::Void);
+    }
+    if c_name == "getpid" { return ExecOutcome::Value(Value::Int(p_getpid())); }
+    return ExecOutcome::Jump(-99);
+}
+
+// Interpreted signals: bit n set when signal n is registered / pending
+var g_interp_sig_registered: i64 = 0;
+var g_interp_sig_pending: i64 = 0;
+
 fn outcome_is_unhandled(o: ExecOutcome) -> bool {
     match o {
         ExecOutcome::Jump(j) => { return j == -99; }

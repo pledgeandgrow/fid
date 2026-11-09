@@ -29,6 +29,7 @@ use compiler::ast;
 use compiler::ir;
 use compiler::pe_ir_stubs;
 use compiler::nat_enc;
+use compiler::checks;
 
 // Integer compare kinds
 const NCC_EQ: i64 = 0;
@@ -146,7 +147,34 @@ pub struct NatGen {
     pub ad2: i64,
     pub zr: i64,
     pub arg0: i64,
+    // Windows x64 (x86_64-windows on this layer): the import address
+    // table's slot per import (ng_win_imports), a table of their
+    // addresses, the TLS index, the import directory and IAT bounds
+    pub win: bool,
+    pub win_slot_labels: Vec<i64>,
+    pub win_slots_label: i64,
+    pub win_tls_label: i64,
+    pub win_imp_label: i64,
+    pub win_imp_end: i64,
+    pub win_iat_label: i64,
+    pub win_iat_end: i64,
+    // Line rows for .debug_line (DB1): the functions of the input file,
+    // [image offset, line, 1 = end of a sequence] per row, whether a
+    // sequence is open, the function being lowered gets rows, its line
+    pub line_fns: i64,
+    pub lrows: Vec<i64>,
+    pub lrow_open: bool,
+    pub lines_cur_fn: bool,
+    pub cur_line: i64,
+    // checks.fd's facts for the function being lowered: per value id, bit
+    // 1 an operation that needs no overflow or bounds check
+    pub unchecked: Vec<i64>,
 }
+
+/// The input file and its functions' names (comma-separated), set by
+/// main.fd for the line table; empty: no line rows.
+pub var g_nat_lines_file: str = "";
+pub var g_nat_lines_names: str = "";
 
 pub fn NatGen_new(arch: i64) -> NatGen {
     var g: NatGen = NatGen {
@@ -195,10 +223,29 @@ pub fn NatGen_new(arch: i64) -> NatGen {
         block_labels: HashMap_new(),
         next_block_label: -1,
         t0: 9, t1: 10, t2: 11, t3: 12, ad: 16, ad2: 17, zr: 31, arg0: 0,
+        win: false,
+        win_slot_labels: Vec::new(),
+        win_slots_label: 0,
+        win_tls_label: 0,
+        win_imp_label: 0,
+        win_imp_end: 0,
+        win_iat_label: 0,
+        win_iat_end: 0,
+        line_fns: HashMap_new(),
+        lrows: Vec::new(),
+        lrow_open: false,
+        lines_cur_fn: false,
+        cur_line: 0,
+        unchecked: Vec::new(),
     };
     if arch == NAT_RV64 {
         // t1, t2, t3, t4 for values; t0 and t5 for addresses; t6 far jumps
         g.t0 = 6; g.t1 = 7; g.t2 = 28; g.t3 = 29; g.ad = 5; g.ad2 = 30; g.zr = 0; g.arg0 = 10;
+    }
+    if arch == NAT_X64 {
+        // no zero register: 60 stands for one in comparisons (a physical
+        // number the machine IR leaves alone: vregs start at 64)
+        g.t0 = 0; g.t1 = 2; g.t2 = 1; g.t3 = 8; g.ad = 10; g.ad2 = 11; g.zr = 60; g.arg0 = 7;
     }
     return g;
 }
@@ -213,22 +260,31 @@ fn ng_a64(g: &NatGen) -> bool {
 
 fn ng_li(g: &mut NatGen, r: i64, v: i64) {
     if g.rec { ng_rec(g, MO_LI, r, 0, 0, v, 0, 0); return; }
+    if ng_x64(g) { x64_li(&mut g.e, r, v); return; }
     if ng_a64(g) { a64_li(&mut g.e, r, v); } else { rv_li(&mut g.e, r, v); }
 }
 
 fn ng_mov(g: &mut NatGen, d: i64, s: i64) {
     if g.rec { ng_rec(g, MO_MOV, d, s, 0, 0, 0, 0); return; }
+    if ng_x64(g) { if d != s { x64_mov(&mut g.e, d, s); } return; }
     if ng_a64(g) { a64_mov(&mut g.e, d, s); } else { rv_mv(&mut g.e, d, s); }
 }
 
 /// The argument register `i` (0..7).
 fn ng_argreg(g: &NatGen, i: i64) -> i64 {
+    if g.arch == NAT_X64 {
+        if i == 0 { return 7; }
+        if i == 1 { return 6; }
+        if i == 2 { return 2; }
+        return 1;
+    }
     return g.arg0 + i;
 }
 
 /// r = sp + off
 fn ng_slot_addr(g: &mut NatGen, r: i64, off: i64) {
     if g.rec { ng_rec(g, MO_SLOTADDR, r, 0, 0, off, 0, 0); return; }
+    if ng_x64(g) { x64_lea(&mut g.e, r, 4, off); return; }
     if ng_a64(g) {
         if off >= 0 && off < 4096 {
             a64_add_imm(&mut g.e, r, A64_SP, off);
@@ -248,6 +304,7 @@ fn ng_slot_addr(g: &mut NatGen, r: i64, off: i64) {
 
 fn ng_ld_slot(g: &mut NatGen, r: i64, off: i64) {
     if g.rec { ng_rec(g, MO_LDSLOT, r, 0, 0, off, 0, 0); return; }
+    if ng_x64(g) { x64_load(&mut g.e, r, 4, off, 8, true); return; }
     if ng_a64(g) {
         if a64_ldst_fits(8, off) {
             a64_ldr(&mut g.e, r, A64_SP, off);
@@ -267,6 +324,7 @@ fn ng_ld_slot(g: &mut NatGen, r: i64, off: i64) {
 
 fn ng_st_slot(g: &mut NatGen, off: i64, r: i64) {
     if g.rec { ng_rec(g, MO_STSLOT, r, 0, 0, off, 0, 0); return; }
+    if ng_x64(g) { x64_store(&mut g.e, r, 4, off, 8); return; }
     if ng_a64(g) {
         if a64_ldst_fits(8, off) {
             a64_str(&mut g.e, r, A64_SP, off);
@@ -287,6 +345,7 @@ fn ng_st_slot(g: &mut NatGen, off: i64, r: i64) {
 /// d = *(base + disp), `size` bytes (1, 2, 4, 8), extended
 fn ng_load(g: &mut NatGen, d: i64, base: i64, disp: i64, size: i64, signed: bool) {
     if g.rec { var sg: i64 = 0; if signed { sg = 1; } ng_rec(g, MO_LOAD, d, base, 0, disp, size, sg); return; }
+    if ng_x64(g) { x64_load(&mut g.e, d, base, disp, size, signed); return; }
     if ng_a64(g) {
         if a64_ldst_fits(size, disp) {
             a64_ldr_sized(&mut g.e, d, base, disp, size, signed);
@@ -309,6 +368,7 @@ fn ng_load(g: &mut NatGen, d: i64, base: i64, disp: i64, size: i64, signed: bool
 /// *(base + disp) = v, `size` bytes
 fn ng_store(g: &mut NatGen, base: i64, disp: i64, v: i64, size: i64) {
     if g.rec { ng_rec(g, MO_STORE, base, v, 0, disp, size, 0); return; }
+    if ng_x64(g) { x64_store(&mut g.e, v, base, disp, size); return; }
     if ng_a64(g) {
         if a64_ldst_fits(size, disp) {
             a64_str_sized(&mut g.e, v, base, disp, size);
@@ -330,28 +390,33 @@ fn ng_store(g: &mut NatGen, base: i64, disp: i64, v: i64, size: i64) {
 
 fn ng_addr(g: &mut NatGen, d: i64, label: i64) {
     if g.rec { ng_rec(g, MO_ADDR, d, 0, 0, label, 0, 0); return; }
+    if ng_x64(g) { x64_lea_label(&mut g.e, d, label); return; }
     if ng_a64(g) { a64_addr(&mut g.e, d, label); } else { rv_addr(&mut g.e, d, label); }
 }
 
 fn ng_call_label(g: &mut NatGen, label: i64) {
     if g.rec { ng_rec(g, MO_CALL, 0, 0, 0, label, 0, 0); return; }
+    if ng_x64(g) { x64_call(&mut g.e, label); return; }
     if ng_a64(g) { a64_bl(&mut g.e, label); } else { rv_call(&mut g.e, label); }
 }
 
 fn ng_call_reg(g: &mut NatGen, r: i64) {
     if g.rec { ng_rec(g, MO_CALLR, r, 0, 0, 0, 0, 0); return; }
+    if ng_x64(g) { x64_call_r(&mut g.e, r); return; }
     if ng_a64(g) { a64_blr(&mut g.e, r); } else { rv_jalr(&mut g.e, RV_RA, r, 0); }
 }
 
 /// A jump inside the function.
 fn ng_jmp(g: &mut NatGen, label: i64) {
     if g.rec { ng_rec(g, MO_JMP, 0, 0, 0, label, 0, 0); return; }
+    if ng_x64(g) { x64_jmp(&mut g.e, label); return; }
     if ng_a64(g) { a64_b(&mut g.e, label); } else { rv_jal(&mut g.e, RV_ZERO, label); }
 }
 
 /// Jump inside the function when r != 0.
 fn ng_bnez(g: &mut NatGen, r: i64, label: i64) {
     if g.rec { ng_rec(g, MO_BNEZ, r, 0, 0, label, 0, 0); return; }
+    if ng_x64(g) { x64_test(&mut g.e, r, r); x64_jcc(&mut g.e, X64_NE, label); return; }
     if ng_a64(g) {
         a64_cbnz(&mut g.e, r, label);
     } else {
@@ -363,6 +428,7 @@ fn ng_bnez(g: &mut NatGen, r: i64, label: i64) {
 /// Jump inside the function when r == 0.
 fn ng_beqz(g: &mut NatGen, r: i64, label: i64) {
     if g.rec { ng_rec(g, MO_BEQZ, r, 0, 0, label, 0, 0); return; }
+    if ng_x64(g) { x64_test(&mut g.e, r, r); x64_jcc(&mut g.e, X64_E, label); return; }
     if ng_a64(g) {
         a64_cbz(&mut g.e, r, label);
     } else {
@@ -374,6 +440,7 @@ fn ng_beqz(g: &mut NatGen, r: i64, label: i64) {
 /// Panic `which` when r != 0 (the stubs may be anywhere in the image).
 fn ng_panic_if(g: &mut NatGen, r: i64, which: i64) {
     if g.rec { ng_rec(g, MO_PANICIF, r, 0, 0, which, 0, 0); return; }
+    if ng_x64(g) { x64_test(&mut g.e, r, r); x64_jcc8(&mut g.e, X64_E, 5); x64_call(&mut g.e, g.panic_labels.get(which)); return; }
     var label: i64 = g.panic_labels.get(which);
     if ng_a64(g) {
         // CBZ r, +8; BL panic (a call: the return address names the
@@ -388,32 +455,36 @@ fn ng_panic_if(g: &mut NatGen, r: i64, which: i64) {
 
 fn ng_trap(g: &mut NatGen) {
     if g.rec { ng_rec(g, MO_TRAP, 0, 0, 0, 0, 0, 0); return; }
+    if ng_x64(g) { x64_ud2(&mut g.e); return; }
     if ng_a64(g) { a64_brk(&mut g.e); } else { rv_ebreak(&mut g.e); }
 }
 
-fn ng_add(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_ADD, d, a, b, 0, 0, 0); return; } if ng_a64(g) { a64_add(&mut g.e, d, a, b); } else { rv_add(&mut g.e, d, a, b); } }
-fn ng_sub(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_SUB, d, a, b, 0, 0, 0); return; } if ng_a64(g) { a64_sub(&mut g.e, d, a, b); } else { rv_sub(&mut g.e, d, a, b); } }
-fn ng_mul(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_MUL, d, a, b, 0, 0, 0); return; } if ng_a64(g) { a64_mul(&mut g.e, d, a, b); } else { rv_mul(&mut g.e, d, a, b); } }
-fn ng_and(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_AND, d, a, b, 0, 0, 0); return; } if ng_a64(g) { a64_and(&mut g.e, d, a, b); } else { rv_and(&mut g.e, d, a, b); } }
-fn ng_or(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_OR, d, a, b, 0, 0, 0); return; } if ng_a64(g) { a64_orr(&mut g.e, d, a, b); } else { rv_or(&mut g.e, d, a, b); } }
-fn ng_xor(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_XOR, d, a, b, 0, 0, 0); return; } if ng_a64(g) { a64_eor(&mut g.e, d, a, b); } else { rv_xor(&mut g.e, d, a, b); } }
-fn ng_shl(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_SHL, d, a, b, 0, 0, 0); return; } if ng_a64(g) { a64_lslv(&mut g.e, d, a, b); } else { rv_sll(&mut g.e, d, a, b); } }
-fn ng_sar(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_SAR, d, a, b, 0, 0, 0); return; } if ng_a64(g) { a64_asrv(&mut g.e, d, a, b); } else { rv_sra(&mut g.e, d, a, b); } }
-fn ng_shr(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_SHR, d, a, b, 0, 0, 0); return; } if ng_a64(g) { a64_lsrv(&mut g.e, d, a, b); } else { rv_srl(&mut g.e, d, a, b); } }
+fn ng_add(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_ADD, d, a, b, 0, 0, 0); return; } if ng_x64(g) { ng_x64_bin(g, 1, d, a, b); return; } if ng_a64(g) { a64_add(&mut g.e, d, a, b); } else { rv_add(&mut g.e, d, a, b); } }
+fn ng_sub(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_SUB, d, a, b, 0, 0, 0); return; } if ng_x64(g) { ng_x64_bin(g, 2, d, a, b); return; } if ng_a64(g) { a64_sub(&mut g.e, d, a, b); } else { rv_sub(&mut g.e, d, a, b); } }
+fn ng_mul(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_MUL, d, a, b, 0, 0, 0); return; } if ng_x64(g) { ng_x64_bin(g, 3, d, a, b); return; } if ng_a64(g) { a64_mul(&mut g.e, d, a, b); } else { rv_mul(&mut g.e, d, a, b); } }
+fn ng_and(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_AND, d, a, b, 0, 0, 0); return; } if ng_x64(g) { ng_x64_bin(g, 4, d, a, b); return; } if ng_a64(g) { a64_and(&mut g.e, d, a, b); } else { rv_and(&mut g.e, d, a, b); } }
+fn ng_or(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_OR, d, a, b, 0, 0, 0); return; } if ng_x64(g) { ng_x64_bin(g, 5, d, a, b); return; } if ng_a64(g) { a64_orr(&mut g.e, d, a, b); } else { rv_or(&mut g.e, d, a, b); } }
+fn ng_xor(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_XOR, d, a, b, 0, 0, 0); return; } if ng_x64(g) { ng_x64_bin(g, 6, d, a, b); return; } if ng_a64(g) { a64_eor(&mut g.e, d, a, b); } else { rv_xor(&mut g.e, d, a, b); } }
+fn ng_shl(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_SHL, d, a, b, 0, 0, 0); return; } if ng_x64(g) { ng_x64_bin(g, 7, d, a, b); return; } if ng_a64(g) { a64_lslv(&mut g.e, d, a, b); } else { rv_sll(&mut g.e, d, a, b); } }
+fn ng_sar(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_SAR, d, a, b, 0, 0, 0); return; } if ng_x64(g) { ng_x64_bin(g, 8, d, a, b); return; } if ng_a64(g) { a64_asrv(&mut g.e, d, a, b); } else { rv_sra(&mut g.e, d, a, b); } }
+fn ng_shr(g: &mut NatGen, d: i64, a: i64, b: i64) { if g.rec { ng_rec(g, MO_SHR, d, a, b, 0, 0, 0); return; } if ng_x64(g) { ng_x64_bin(g, 9, d, a, b); return; } if ng_a64(g) { a64_lsrv(&mut g.e, d, a, b); } else { rv_srl(&mut g.e, d, a, b); } }
 
 fn ng_neg(g: &mut NatGen, d: i64, a: i64) {
     if g.rec { ng_rec(g, MO_NEG, d, a, 0, 0, 0, 0); return; }
+    if ng_x64(g) { if d != a { x64_mov(&mut g.e, d, a); } x64_f7(&mut g.e, 3, d); return; }
     if ng_a64(g) { a64_neg(&mut g.e, d, a); } else { rv_sub(&mut g.e, d, RV_ZERO, a); }
 }
 
 fn ng_not_bits(g: &mut NatGen, d: i64, a: i64) {
     if g.rec { ng_rec(g, MO_NOT, d, a, 0, 0, 0, 0); return; }
+    if ng_x64(g) { if d != a { x64_mov(&mut g.e, d, a); } x64_f7(&mut g.e, 2, d); return; }
     if ng_a64(g) { a64_mvn(&mut g.e, d, a); } else { rv_xori(&mut g.e, d, a, 0 - 1); }
 }
 
 /// d = a / b (b != 0; MIN / -1 handled by the caller)
 fn ng_div(g: &mut NatGen, d: i64, a: i64, b: i64, unsigned: bool) {
     if g.rec { var u: i64 = 0; if unsigned { u = 1; } ng_rec(g, MO_DIV, d, a, b, u, 0, 0); return; }
+    if ng_x64(g) { x64_mov(&mut g.e, 11, b); x64_mov(&mut g.e, 0, a); if unsigned { x64_li(&mut g.e, 2, 0); x64_f7(&mut g.e, 6, 11); } else { x64_cqo(&mut g.e); x64_f7(&mut g.e, 7, 11); } x64_mov(&mut g.e, d, 0); return; }
     if ng_a64(g) {
         if unsigned { a64_udiv(&mut g.e, d, a, b); } else { a64_sdiv(&mut g.e, d, a, b); }
     } else {
@@ -424,6 +495,7 @@ fn ng_div(g: &mut NatGen, d: i64, a: i64, b: i64, unsigned: bool) {
 /// d = a % b (b != 0); d must differ from a and b on AArch64 (it uses ad2)
 fn ng_rem(g: &mut NatGen, d: i64, a: i64, b: i64, unsigned: bool) {
     if g.rec { var u: i64 = 0; if unsigned { u = 1; } ng_rec(g, MO_REM, d, a, b, u, 0, 0); return; }
+    if ng_x64(g) { x64_mov(&mut g.e, 11, b); x64_mov(&mut g.e, 0, a); if unsigned { x64_li(&mut g.e, 2, 0); x64_f7(&mut g.e, 6, 11); } else { x64_cqo(&mut g.e); x64_f7(&mut g.e, 7, 11); } x64_mov(&mut g.e, d, 2); return; }
     if ng_a64(g) {
         if unsigned { a64_udiv(&mut g.e, g.ad2, a, b); } else { a64_sdiv(&mut g.e, g.ad2, a, b); }
         a64_msub(&mut g.e, d, g.ad2, b, a);
@@ -435,6 +507,7 @@ fn ng_rem(g: &mut NatGen, d: i64, a: i64, b: i64, unsigned: bool) {
 /// d = the high 64 bits of a * b
 fn ng_mulh(g: &mut NatGen, d: i64, a: i64, b: i64, unsigned: bool) {
     if g.rec { var u: i64 = 0; if unsigned { u = 1; } ng_rec(g, MO_MULH, d, a, b, u, 0, 0); return; }
+    if ng_x64(g) { x64_mov(&mut g.e, 11, b); x64_mov(&mut g.e, 0, a); if unsigned { x64_f7(&mut g.e, 4, 11); } else { x64_f7(&mut g.e, 5, 11); } x64_mov(&mut g.e, d, 2); return; }
     if ng_a64(g) {
         if unsigned { a64_umulh(&mut g.e, d, a, b); } else { a64_smulh(&mut g.e, d, a, b); }
     } else {
@@ -445,6 +518,7 @@ fn ng_mulh(g: &mut NatGen, d: i64, a: i64, b: i64, unsigned: bool) {
 /// d = (a cc b) as 0 / 1
 fn ng_setcc(g: &mut NatGen, d: i64, a: i64, b: i64, cc: i64) {
     if g.rec { ng_rec(g, MO_SETCC, d, a, b, cc, 0, 0); return; }
+    if ng_x64(g) { if b == 60 { x64_test(&mut g.e, a, a); } else { x64_alu(&mut g.e, 0x39, a, b); } x64_setcc(&mut g.e, ng_x64_cc(cc), 11); x64_movx(&mut g.e, 0xB6, d, 11); return; }
     if ng_a64(g) {
         a64_cmp(&mut g.e, a, b);
         var c: i64 = A64_EQ;
@@ -475,6 +549,7 @@ fn ng_setcc(g: &mut NatGen, d: i64, a: i64, b: i64, cc: i64) {
 /// d = s extended from its low bits (`kind`: NEXT_*)
 fn ng_ext(g: &mut NatGen, d: i64, s: i64, kind: i64) {
     if g.rec { ng_rec(g, MO_EXT, d, s, 0, kind, 0, 0); return; }
+    if ng_x64(g) { if kind == NEXT_SB { x64_movx(&mut g.e, 0xBE, d, s); } if kind == NEXT_SH { x64_movx(&mut g.e, 0xBF, d, s); } if kind == NEXT_SW { x64_movx(&mut g.e, 0x63, d, s); } if kind == NEXT_ZB { x64_movx(&mut g.e, 0xB6, d, s); } if kind == NEXT_ZH { x64_movx(&mut g.e, 0xB7, d, s); } if kind == NEXT_ZW { x64_mov32(&mut g.e, d, s); } return; }
     if ng_a64(g) {
         if kind == NEXT_SB { a64_sxtb(&mut g.e, d, s); }
         if kind == NEXT_SH { a64_sxth(&mut g.e, d, s); }
@@ -538,6 +613,7 @@ fn ng_fstore0(g: &mut NatGen, d: i64, is32: bool) {
 /// d = a op b in floating point (op: 1 add, 2 sub, 3 mul, 4 div)
 fn ng_fbin(g: &mut NatGen, op: i64, d: i64, a: i64, b: i64, is32: bool) {
     if g.rec { var w: i64 = 0; if is32 { w = 1; } ng_rec(g, MO_FBIN, d, a, b, op, w, 0); return; }
+    if ng_x64(g) { ng_x64_fload2(g, a, b, is32); var fo: i64 = 0x58; if op == 2 { fo = 0x5C; } if op == 3 { fo = 0x59; } if op == 4 { fo = 0x5E; } x64_sse(&mut g.e, 0xF2, fo, 0, 1); ng_x64_fstore0(g, d, is32); return; }
     ng_fload2(g, a, b, is32);
     if ng_a64(g) {
         if op == 1 { a64_fadd(&mut g.e, 0, 0, 1); }
@@ -556,6 +632,7 @@ fn ng_fbin(g: &mut NatGen, op: i64, d: i64, a: i64, b: i64, is32: bool) {
 /// d = (a cc b) for floats, IEEE: every comparison with NaN is false but !=
 fn ng_fcmp(g: &mut NatGen, d: i64, a: i64, b: i64, cc: i64, is32: bool) {
     if g.rec { var w: i64 = 0; if is32 { w = 1; } ng_rec(g, MO_FCMP, d, a, b, cc, w, 0); return; }
+    if ng_x64(g) { ng_x64_fload2(g, a, b, is32); if cc == NCC_EQ || cc == NCC_NE { x64_sse(&mut g.e, 0x66, 0x2E, 0, 1); if cc == NCC_EQ { x64_setcc(&mut g.e, X64_E, 11); x64_setcc(&mut g.e, X64_NP, 10); } else { x64_setcc(&mut g.e, X64_NE, 11); x64_setcc(&mut g.e, X64_P, 10); } x64_movx(&mut g.e, 0xB6, 11, 11); x64_movx(&mut g.e, 0xB6, 10, 10); if cc == NCC_EQ { x64_alu(&mut g.e, 0x21, 11, 10); } else { x64_alu(&mut g.e, 0x09, 11, 10); } x64_mov(&mut g.e, d, 11); } else { if cc == NCC_LT || cc == NCC_LE { x64_sse(&mut g.e, 0x66, 0x2E, 1, 0); } else { x64_sse(&mut g.e, 0x66, 0x2E, 0, 1); } if cc == NCC_LT || cc == NCC_GT { x64_setcc(&mut g.e, X64_A, 11); } else { x64_setcc(&mut g.e, X64_AE, 11); } x64_movx(&mut g.e, 0xB6, d, 11); } return; }
     ng_fload2(g, a, b, is32);
     if ng_a64(g) {
         a64_fcmp(&mut g.e, 0, 1);
@@ -579,6 +656,7 @@ fn ng_fcmp(g: &mut NatGen, d: i64, a: i64, b: i64, cc: i64, is32: bool) {
 /// d = the float of integer s
 fn ng_i2f(g: &mut NatGen, d: i64, s: i64, to_f32: bool) {
     if g.rec { var w: i64 = 0; if to_f32 { w = 1; } ng_rec(g, MO_I2F, d, s, 0, w, 0, 0); return; }
+    if ng_x64(g) { x64_cvtsi2sd(&mut g.e, 0, s); ng_x64_fstore0(g, d, to_f32); return; }
     if ng_a64(g) { a64_scvtf(&mut g.e, 0, s); } else { rv_fcvt_dl(&mut g.e, 0, s); }
     ng_fstore0(g, d, to_f32);
 }
@@ -586,6 +664,7 @@ fn ng_i2f(g: &mut NatGen, d: i64, s: i64, to_f32: bool) {
 /// d = the integer of float bits s, truncated toward zero
 fn ng_f2i(g: &mut NatGen, d: i64, s: i64, from_f32: bool) {
     if g.rec { var w: i64 = 0; if from_f32 { w = 1; } ng_rec(g, MO_F2I, d, s, 0, w, 0, 0); return; }
+    if ng_x64(g) { if from_f32 { x64_movq_xr(&mut g.e, 0, s, false); x64_sse(&mut g.e, 0xF3, 0x5A, 0, 0); } else { x64_movq_xr(&mut g.e, 0, s, true); } x64_cvttsd2si(&mut g.e, d, 0); return; }
     if ng_a64(g) {
         if from_f32 { a64_fmov_sw(&mut g.e, 0, s); a64_fcvt_ds(&mut g.e, 0, 0); }
         else { a64_fmov_dx(&mut g.e, 0, s); }
@@ -601,7 +680,11 @@ fn ng_f2i(g: &mut NatGen, d: i64, s: i64, from_f32: bool) {
 /// `frame` bytes (a multiple of 16).
 fn ng_prologue(g: &mut NatGen, frame: i64) {
     if g.rec { ng_rec(g, MO_PROLOGUE, 0, 0, 0, 0, 0, 0); return; }
-    if ng_a64(g) {
+    if ng_x64(g) {
+        x64_push(&mut g.e, 5);                        // push rbp
+        x64_mov(&mut g.e, 5, 4);                      // mov rbp, rsp
+        if frame > 0 { x64_sub_imm(&mut g.e, 4, frame); }
+    } else if ng_a64(g) {
         NatEnc_word(&mut g.e, 0xA9BF7BFD);            // stp x29, x30, [sp, #-16]!
         a64_add_imm(&mut g.e, A64_FP, A64_SP, 0);     // mov x29, sp
         if frame < 4096 {
@@ -636,6 +719,12 @@ fn ng_epilogue(g: &mut NatGen) {
         ng_ld_slot(g, g.save_regs.get(k), g.save_off + 8 * k);
         k = k + 1;
     }
+    if ng_x64(g) {
+        x64_mov(&mut g.e, 4, 5);                      // mov rsp, rbp
+        x64_pop(&mut g.e, 5);
+        x64_ret(&mut g.e);
+        return;
+    }
     if ng_a64(g) {
         a64_add_imm(&mut g.e, A64_SP, A64_FP, 0);     // mov sp, x29
         NatEnc_word(&mut g.e, 0xA8C17BFD);            // ldp x29, x30, [sp], #16
@@ -652,6 +741,7 @@ fn ng_epilogue(g: &mut NatGen) {
 /// r = incoming stack argument k (argument 8 + k)
 fn ng_ld_incoming(g: &mut NatGen, r: i64, k: i64) {
     if g.rec { ng_rec(g, MO_LDIN, r, 0, 0, k, 0, 0); return; }
+    if ng_x64(g) { x64_load(&mut g.e, r, 5, 16 + 8 * k, 8, true); return; }
     if ng_a64(g) {
         ng_load(g, r, A64_FP, 16 + 8 * k, 8, true);
     } else {
@@ -689,13 +779,21 @@ fn ng_copy(g: &mut NatGen, dst: i64, src: i64, size: i64) {
     var words: i64 = size / 8;
     var cs: i64 = 13;
     if !ng_a64(g) { cs = 31; }
+    if ng_x64(g) { cs = 2; }
     var cn: i64 = ng_spill_reg(g, 2);
     var top: i64 = NatEnc_label(&mut g.e);
     ng_mov(g, g.ad, dst);
     ng_mov(g, cs, src);
     ng_li(g, cn, words);
     NatEnc_place(&mut g.e, top);
-    if ng_a64(g) {
+    if ng_x64(g) {
+        x64_load(&mut g.e, w, cs, 0, 8, true);
+        x64_store(&mut g.e, w, g.ad, 0, 8);
+        x64_add_imm(&mut g.e, cs, 8);
+        x64_add_imm(&mut g.e, g.ad, 8);
+        x64_sub_imm(&mut g.e, cn, 1);
+        x64_jcc(&mut g.e, X64_NE, top);
+    } else if ng_a64(g) {
         a64_ldr(&mut g.e, w, cs, 0);
         a64_str(&mut g.e, w, g.ad, 0);
         a64_add_imm(&mut g.e, cs, cs, 8);
@@ -902,6 +1000,10 @@ const NG_REGALLOC: bool = true;
 /// The callee-saved registers values may live in.
 fn ng_callee_saved(g: &NatGen) -> Vec<i64> {
     var v: Vec<i64> = Vec::new();
+    if g.arch == NAT_X64 {
+        v.push(3); v.push(12); v.push(13); v.push(14); v.push(15);
+        return v;
+    }
     if ng_a64(g) {
         var r: i64 = 19;
         while r <= 28 { v.push(r); r = r + 1; }
@@ -1280,7 +1382,11 @@ fn ng_regalloc(g: &mut NatGen, func: &IrFunction, nvals: i64) {
 // Kill switches (FID_NAT_OFF=name,name): mir (the direct path of before),
 // promote (locals stay in memory), ipra (every call clobbers every
 // caller-saved register), fold (no identical-function folding), hint (no
-// move coalescing hints).
+// move coalescing hints), vecinline (Vec_len/get/set/push always calls),
+// unchecked (every overflow and bounds check stays, checks.fd unused),
+// coalesce (every copy between vregs keeps two of them),
+// weights (spill the range ending last, not the
+// cheapest by loop-weighted uses).
 // ===========================================================================
 
 const NG_MIR: bool = true;
@@ -1328,6 +1434,7 @@ const MO_STOUT: i64 = 39;
 const MO_COPY: i64 = 40;
 const MO_PLACE: i64 = 41;
 const MO_ASR63: i64 = 42;
+const MO_LINE: i64 = 43;      // i0: a source line starts here (no code)
 
 pub struct MInst {
     pub op: i64,
@@ -1387,6 +1494,7 @@ fn ng_place(g: &mut NatGen, label: i64) {
 /// d = s >> 63 (arithmetic)
 fn ng_asr63(g: &mut NatGen, d: i64, s: i64) {
     if g.rec { ng_rec(g, MO_ASR63, d, s, 0, 0, 0, 0); return; }
+    if ng_x64(g) { if d != s { x64_mov(&mut g.e, d, s); } x64_shift_imm(&mut g.e, 7, d, 63); return; }
     if ng_a64(g) { a64_asr63(&mut g.e, d, s); } else { rv_srai(&mut g.e, d, s, 63); }
 }
 
@@ -1429,18 +1537,25 @@ fn mi_field(m: MInst, f: i64) -> i64 {
 /// never allocated.
 fn ng_pool_caller(g: &NatGen) -> Vec<i64> {
     var v: Vec<i64> = Vec::new();
+    if g.arch == NAT_X64 { return v; }
     if ng_a64(g) { v.push(9); v.push(10); v.push(11); v.push(8); }
     else { v.push(29); }
     return v;
 }
 
 fn ng_is_callee_saved(g: &NatGen, r: i64) -> bool {
+    if g.arch == NAT_X64 { return r == 3 || (r >= 12 && r <= 15); }
     if ng_a64(g) { return r >= 19 && r <= 28; }
     return r == 9 || (r >= 18 && r <= 27);
 }
 
 /// The spill scratch registers: two for uses, one for the definition.
 fn ng_spill_reg(g: &NatGen, k: i64) -> i64 {
+    if g.arch == NAT_X64 {
+        if k == 0 { return 8; }
+        if k == 1 { return 9; }
+        return 0;
+    }
     if ng_a64(g) {
         if k == 0 { return 14; }
         if k == 1 { return 15; }
@@ -1711,8 +1826,9 @@ fn ng_mir_alloc(g: &mut NatGen, rec: &NatFnRec) -> NatAlloc {
     var calls: Vec<i64> = Vec::new();
     var masks: Vec<i64> = Vec::new();
     var hint: Vec<i64> = Vec::new();
+    var def_in: Vec<i64> = Vec::new();
     i = 0;
-    while i < nv { hint.push(0 - 1); i = i + 1; }
+    while i < nv { hint.push(0 - 1); def_in.push(0 - 1); i = i + 1; }
     var k: i64 = 0;
     while k < n {
         var m: MInst = mir.get(k);
@@ -1726,11 +1842,13 @@ fn ng_mir_alloc(g: &mut NatGen, rec: &NatFnRec) -> NatAlloc {
             if (used || defd) && v >= NG_VBASE && v - NG_VBASE < nv {
                 ng_touch2(&mut lo, &mut hi, v, k);
                 var vi: i64 = v - NG_VBASE;
+                var upward: bool = used && def_in.get(vi) != bk;
                 if first_b.get(vi) < 0 { first_b.set(vi, bk); }
-                else if first_b.get(vi) != bk && sel.get(vi) < 0 { sel.set(vi, ng); ng = ng + 1; }
+                if (first_b.get(vi) != bk || upward) && sel.get(vi) < 0 { sel.set(vi, ng); ng = ng + 1; }
             }
             f = f + 1;
         }
+        if mi_defines(m.op) && m.r0 >= NG_VBASE && m.r0 - NG_VBASE < nv { def_in.set(m.r0 - NG_VBASE, bk); }
         if mi_is_call(m.op) { calls.push(k); masks.push(ng_call_mask(g, m)); }
         if m.op == MO_MOV && m.r0 >= NG_VBASE && m.r1 >= NG_VBASE && ng_on("hint") {
             if m.r0 - NG_VBASE < nv && m.r1 - NG_VBASE < nv {
@@ -1761,6 +1879,84 @@ fn ng_mir_alloc(g: &mut NatGen, rec: &NatFnRec) -> NatAlloc {
                 gi = gi + 1;
             }
             b = b + 1;
+        }
+    }
+
+    // Copy coalescing (RA, aggressive within the hulls): d <- s share one
+    // vreg when one of them never changes while the other lives: d's only
+    // definition is this copy and s is not defined inside d's range, or s
+    // has a single definition and d is not defined inside s's range (but
+    // by this copy). The representative takes the union of the ranges;
+    // the members get its register or slot after the scan, and the copy
+    // becomes a move to itself, which emits nothing. The checker sees the
+    // same thing (a move into the register its source holds).
+    // `FID_NAT_OFF=coalesce`.
+    var crep: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nv { crep.push(i); i = i + 1; }
+    var n_coal: i64 = 0;
+    if ng_on("coalesce") {
+        var defs: Vec<Vec<i64>> = Vec::new();
+        i = 0;
+        while i < nv { defs.push(Vec::new()); i = i + 1; }
+        k = 0;
+        while k < n {
+            var dm: MInst = mir.get(k);
+            if mi_defines(dm.op) && dm.r0 >= NG_VBASE && dm.r0 - NG_VBASE < nv {
+                var dl: Vec<i64> = defs.get(dm.r0 - NG_VBASE);
+                dl.push(k);
+                defs.set(dm.r0 - NG_VBASE, dl);
+            }
+            k = k + 1;
+        }
+        k = 0;
+        while k < n {
+            var cm: MInst = mir.get(k);
+            if cm.op == MO_MOV && cm.r0 >= NG_VBASE && cm.r1 >= NG_VBASE && cm.r0 - NG_VBASE < nv && cm.r1 - NG_VBASE < nv {
+                var cd: i64 = ng_find(&mut crep, cm.r0 - NG_VBASE);
+                var cs: i64 = ng_find(&mut crep, cm.r1 - NG_VBASE);
+                if cd != cs && lo.get(cd) >= 0 && lo.get(cs) >= 0 {
+                    var ddefs: Vec<i64> = defs.get(cd);
+                    var sdefs: Vec<i64> = defs.get(cs);
+                    var ok: bool = false;
+                    if ddefs.len() == 1 && ddefs.get(0) == k && !ng_any_in(sdefs, lo.get(cd), hi.get(cd), 0 - 1) { ok = true; }
+                    if !ok && sdefs.len() == 1 && sdefs.get(0) < k && !ng_any_in(ddefs, lo.get(cs), hi.get(cs), k)
+                        && !ng_class_read(&mir, &mut crep, cd, sdefs.get(0) + 1, k, nv) { ok = true; }
+                    if ok {
+                        crep.set(cd, cs);
+                        if lo.get(cd) < lo.get(cs) { lo.set(cs, lo.get(cd)); }
+                        if hi.get(cd) > hi.get(cs) { hi.set(cs, hi.get(cd)); }
+                        var md: i64 = 0;
+                        while md < ddefs.len() { sdefs.push(ddefs.get(md)); md = md + 1; }
+                        defs.set(cs, sdefs);
+                        n_coal = n_coal + 1;
+                    }
+                }
+            }
+            k = k + 1;
+        }
+        // members leave the scan; their representative stands for them
+        i = 0;
+        while i < nv {
+            if ng_find(&mut crep, i) != i { lo.set(i, 0 - 1); }
+            i = i + 1;
+        }
+    }
+
+    // Spill weights (RA5): each use or definition counts 8^(loop depth), the
+    // loops being the ranges [label, jump back to it]; the cheapest range
+    // is the one to spill (`FID_NAT_OFF=weights`: the range ending last)
+    var weights_on: bool = ng_on("weights");
+    var weight: Vec<i64> = Vec::new();
+    if weights_on {
+        weight = ng_spill_weights(&mir, nv);
+        if n_coal > 0 {
+            i = 0;
+            while i < nv {
+                var wr: i64 = ng_find(&mut crep, i);
+                if wr != i { weight.set(wr, weight.get(wr) + weight.get(i)); }
+                i = i + 1;
+            }
         }
     }
 
@@ -1829,7 +2025,28 @@ fn ng_mir_alloc(g: &mut NatGen, rec: &NatFnRec) -> NatAlloc {
             if busy.get(callee.get(ki)) == 0 { r = callee.get(ki); }
             ki = ki + 1;
         }
-        if r < 0 {
+        if r < 0 && weights_on {
+            // The cheapest active range whose register suits this one gives
+            // it up when it costs less than this one, else this one spills
+            var cheap: i64 = 0 - 1;
+            var wi: i64 = 0;
+            while wi < active.len() {
+                var wc: i64 = active.get(wi);
+                if assign.get(wc) >= 0 && ng_reg_ok(g, assign.get(wc), lo.get(v2), hi.get(v2), &calls, &masks) {
+                    if cheap < 0 || weight.get(wc) < weight.get(active.get(cheap)) { cheap = wi; }
+                }
+                wi = wi + 1;
+            }
+            if cheap >= 0 && weight.get(active.get(cheap)) < weight.get(v2) {
+                var wl: i64 = active.get(cheap);
+                r = assign.get(wl);
+                assign.set(wl, 0 - 1);
+                active.set(cheap, v2);
+                assign.set(v2, r);
+            } else {
+                assign.set(v2, 0 - 1);
+            }
+        } else if r < 0 {
             // The active range that ends last gives up its register if it
             // ends after this one and the register suits this one
             var far: i64 = 0 - 1;
@@ -1859,6 +2076,16 @@ fn ng_mir_alloc(g: &mut NatGen, rec: &NatFnRec) -> NatAlloc {
         oi = oi + 1;
     }
 
+    // Coalesced members: their representative's register (or slot, below)
+    if n_coal > 0 {
+        i = 0;
+        while i < nv {
+            var ar: i64 = ng_find(&mut crep, i);
+            if ar != i { assign.set(i, assign.get(ar)); }
+            i = i + 1;
+        }
+    }
+
     // Spill slots: an IR value's own slot, else a new one
     var spill: Vec<i64> = Vec::new();
     i = 0;
@@ -1875,6 +2102,14 @@ fn ng_mir_alloc(g: &mut NatGen, rec: &NatFnRec) -> NatAlloc {
             }
         }
         i = i + 1;
+    }
+    if n_coal > 0 {
+        i = 0;
+        while i < nv {
+            var sr: i64 = ng_find(&mut crep, i);
+            if sr != i && assign.get(i) == 0 - 1 { spill.set(i, spill.get(sr)); }
+            i = i + 1;
+        }
     }
     var save: Vec<i64> = Vec::new();
     var mask: i64 = 0;
@@ -1903,8 +2138,124 @@ fn ng_mir_alloc(g: &mut NatGen, rec: &NatFnRec) -> NatAlloc {
     var frame: i64 = (cur + 15) & (0 - 16);
     if frame < 16 { frame = 16; }
     var al: NatAlloc = NatAlloc { assign: assign, spill: spill, frame: frame, save_regs: save, save_off: save_off, mask: mask, err: "" };
+    var dump: str = p_getenv("FID_NAT_DUMP");
+    if (dump as i64) != 0 && str_len(dump) > 0 && dump == rec.name {
+        var dk: i64 = 0;
+        while dk < n {
+            var dm: MInst = mir.get(dk);
+            var line: str = int_to_str(dk) + ": op " + int_to_str(dm.op);
+            var df: i64 = 0;
+            while df < 3 {
+                var dv: i64 = mi_field(dm, df);
+                if dv >= NG_VBASE && dv - NG_VBASE < nv {
+                    line = line + " v" + int_to_str(dv) + "=r" + int_to_str(assign.get(dv - NG_VBASE))
+                        + "[" + int_to_str(lo.get(dv - NG_VBASE)) + "," + int_to_str(hi.get(dv - NG_VBASE)) + "]";
+                } else {
+                    line = line + " p" + int_to_str(dv);
+                }
+                df = df + 1;
+            }
+            line = line + " i " + int_to_str(dm.i0) + " " + int_to_str(dm.i1);
+            p_eprint_str("[mir] " + line + "\n");
+            dk = dk + 1;
+        }
+    }
     if ng_verify_on() { al.err = ng_mir_check(g, rec, &mb, &al, &calls, &masks); }
     return al;
+}
+
+/// Union-find: the representative of vreg index v (paths halved).
+fn ng_find(rep: &mut Vec<i64>, v: i64) -> i64 {
+    var x: i64 = v;
+    while rep.get(x) != x {
+        rep.set(x, rep.get(rep.get(x)));
+        x = rep.get(x);
+    }
+    return x;
+}
+
+/// An instruction in [from, to) reads a vreg of class c.
+fn ng_class_read(mir: &Vec<MInst>, rep: &mut Vec<i64>, c: i64, from: i64, to: i64, nv: i64) -> bool {
+    var k: i64 = from;
+    while k < to {
+        var m: MInst = mir.get(k);
+        var um: i64 = mi_use_mask(m.op);
+        var f: i64 = 0;
+        while f < 3 {
+            var v: i64 = mi_field(m, f);
+            if (um & (1 << f)) != 0 && v >= NG_VBASE && v - NG_VBASE < nv && ng_find(rep, v - NG_VBASE) == c { return true; }
+            f = f + 1;
+        }
+        k = k + 1;
+    }
+    return false;
+}
+
+/// A position of `ps` in [lo, hi], other than `except`.
+fn ng_any_in(ps: Vec<i64>, lo: i64, hi: i64, except: i64) -> bool {
+    var i: i64 = 0;
+    while i < ps.len() {
+        var p: i64 = ps.get(i);
+        if p >= lo && p <= hi && p != except { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The spill cost of each vreg: its uses and definitions, 8^(loop depth)
+/// each (depth up to 4), a loop being [a label, a later jump back to it].
+@wrapping
+fn ng_spill_weights(mir: &Vec<MInst>, nv: i64) -> Vec<i64> {
+    var n: i64 = mir.len();
+    var place: i64 = HashMap_new();
+    var k: i64 = 0;
+    while k < n {
+        var m: MInst = mir.get(k);
+        if m.op == MO_PLACE { HashMap_insert(place, int_to_str(m.i0), k); }
+        k = k + 1;
+    }
+    var diff: Vec<i64> = Vec::new();
+    k = 0;
+    while k <= n { diff.push(0); k = k + 1; }
+    k = 0;
+    while k < n {
+        var m2: MInst = mir.get(k);
+        if m2.op == MO_JMP || m2.op == MO_BNEZ || m2.op == MO_BEQZ {
+            var key: str = int_to_str(m2.i0);
+            if HashMap_contains(place, key) {
+                var at: i64 = HashMap_get(place, key);
+                if at < k {
+                    diff.set(at, diff.get(at) + 1);
+                    diff.set(k + 1, diff.get(k + 1) - 1);
+                }
+            }
+        }
+        k = k + 1;
+    }
+    var w: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < nv { w.push(0); i = i + 1; }
+    var depth: i64 = 0;
+    k = 0;
+    while k < n {
+        depth = depth + diff.get(k);
+        var d: i64 = depth;
+        if d > 4 { d = 4; }
+        var cost: i64 = 1 << (3 * d);
+        var m3: MInst = mir.get(k);
+        var um: i64 = mi_use_mask(m3.op);
+        var f: i64 = 0;
+        while f < 3 {
+            var v: i64 = mi_field(m3, f);
+            var touched: bool = (um & (1 << f)) != 0 || (f == 0 && mi_defines(m3.op));
+            if touched && v >= NG_VBASE && v - NG_VBASE < nv {
+                w.set(v - NG_VBASE, w.get(v - NG_VBASE) + cost);
+            }
+            f = f + 1;
+        }
+        k = k + 1;
+    }
+    return w;
 }
 
 /// Register r may hold a value live over [lo, hi]: callee-saved, or no call
@@ -2084,7 +2435,41 @@ fn ng_mir_emit(g: &mut NatGen, rec: &NatFnRec, al: &NatAlloc) {
     }
 }
 
+/// A line row at the current position.
+fn ng_line_row(g: &mut NatGen, line: i64) {
+    g.lrows.push(NatEnc_pos(&g.e));
+    g.lrows.push(line);
+    g.lrows.push(0);
+    g.lrow_open = true;
+}
+
+/// The end of the open sequence (the function's code ends here).
+fn ng_line_close(g: &mut NatGen) {
+    if !g.lrow_open { return; }
+    g.lrows.push(NatEnc_pos(&g.e));
+    g.lrows.push(0);
+    g.lrows.push(1);
+    g.lrow_open = false;
+}
+
+/// Instruction id's source line, when it starts a new one: a row now, or a
+/// MO_LINE recorded for the emission.
+fn ng_note_line(g: &mut NatGen, func: &IrFunction, id: i64) {
+    if id < 0 || id >= func.value_metas.len() { return; }
+    var vm: ValueIdMeta = func.value_metas.get(id);
+    if vm.id != id { return; }
+    var l: i64 = 0;
+    match vm.meta.source_line {
+        OptU64::Some(v) => { l = v as i64; }
+        OptU64::None => {}
+    }
+    if l <= 0 || l == g.cur_line { return; }
+    g.cur_line = l;
+    if g.rec { ng_rec(g, MO_LINE, 0, 0, 0, l, 0, 0); } else { ng_line_row(g, l); }
+}
+
 fn ng_mi_dispatch(g: &mut NatGen, m: MInst, p0: i64, p1: i64, p2: i64) {
+    if m.op == MO_LINE { ng_line_row(g, m.i0); return; }
     var op: i64 = m.op;
     if op == MO_LI { ng_li(g, p0, m.i0); return; }
     if op == MO_SLOTADDR { ng_slot_addr(g, p0, m.i0); return; }
@@ -2132,6 +2517,7 @@ fn ng_mi_dispatch(g: &mut NatGen, m: MInst, p0: i64, p1: i64, p2: i64) {
 /// A function's identity for folding: two functions with the same
 /// operations, registers, immediates (local labels by order) and frame emit
 /// the same bytes.
+@wrapping
 fn ng_mir_key(rec: &NatFnRec, al: &NatAlloc) -> str {
     var h1: i64 = 0 - 3750763034362895579;
     var h2: i64 = 1469598103934665603;
@@ -2262,10 +2648,441 @@ fn ng_mir_finish(g: &mut NatGen) -> str {
             if fold_on { HashMap_insert(folded, key, g.e.code.len()); }
             g.placed_fns.push(rec2.name);
             ng_mir_emit(g, &rec2, &al);
+            ng_line_close(g);
         }
         oi = oi + 1;
     }
     return "";
+}
+
+
+// ===========================================================================
+// x86-64 Linux (own-backend roadmap MI15): the target's description and its
+// primitives. The internal convention: arguments in rdi, rsi, rdx, rcx, the
+// rest on the stack; the result in rdi (argument register 0, as on the other
+// targets). Reserved: r10 (ad), r11 (ad2), r8 / r9 / rax (the spill
+// registers; rax also for division and the high half of products), rcx (the
+// shift count), rdx (division, the copy cursor). Values live in rbx and
+// r12-r15. The runtime's system call numbers are Linux's generic ones: the
+// nat_syscall primitive maps them to x86-64's.
+// ===========================================================================
+
+fn ng_x64(g: &NatGen) -> bool { return g.arch == NAT_X64; }
+
+/// How many arguments travel in registers.
+fn ng_nregargs(g: &NatGen) -> i64 {
+    if ng_x64(g) { return 4; }
+    return 8;
+}
+
+/// d = a op b for the binary operations: 1 add, 2 sub, 3 mul, 4 and, 5 or,
+/// 6 xor, 7 shl, 8 sar, 9 shr (two-operand forms; a result register that is
+/// also the right operand goes through r11)
+fn ng_x64_bin(g: &mut NatGen, kind: i64, d: i64, a: i64, b: i64) {
+    if kind >= 7 {
+        var ext: i64 = 4;
+        if kind == 8 { ext = 7; }
+        if kind == 9 { ext = 5; }
+        if b != 1 { x64_mov(&mut g.e, 1, b); }
+        if d != a { x64_mov(&mut g.e, d, a); }
+        x64_shift_cl(&mut g.e, ext, d);
+        return;
+    }
+    var code: i64 = 0x01;
+    if kind == 2 { code = 0x29; }
+    if kind == 4 { code = 0x21; }
+    if kind == 5 { code = 0x09; }
+    if kind == 6 { code = 0x31; }
+    var commutes: bool = kind != 2;
+    var src: i64 = b;
+    if d == b && d != a {
+        if commutes {
+            src = a;
+        } else {
+            x64_mov(&mut g.e, 11, a);
+            x64_alu(&mut g.e, code, 11, b);
+            x64_mov(&mut g.e, d, 11);
+            return;
+        }
+    } else if d != a {
+        x64_mov(&mut g.e, d, a);
+    }
+    if kind == 3 { x64_imul(&mut g.e, d, src); } else { x64_alu(&mut g.e, code, d, src); }
+}
+
+fn ng_x64_cc(cc: i64) -> i64 {
+    if cc == NCC_EQ { return X64_E; }
+    if cc == NCC_NE { return X64_NE; }
+    if cc == NCC_LT { return X64_L; }
+    if cc == NCC_LE { return X64_LE; }
+    if cc == NCC_GT { return X64_G; }
+    if cc == NCC_GE { return X64_GE; }
+    if cc == NCC_LTU { return X64_B; }
+    if cc == NCC_LEU { return X64_BE; }
+    if cc == NCC_GTU { return X64_A; }
+    return X64_AE;
+}
+
+/// xmm0, xmm1 = the floats of a and b (an f32 widened)
+fn ng_x64_fload2(g: &mut NatGen, a: i64, b: i64, is32: bool) {
+    if is32 {
+        x64_movq_xr(&mut g.e, 0, a, false); x64_sse(&mut g.e, 0xF3, 0x5A, 0, 0);
+        x64_movq_xr(&mut g.e, 1, b, false); x64_sse(&mut g.e, 0xF3, 0x5A, 1, 1);
+    } else {
+        x64_movq_xr(&mut g.e, 0, a, true);
+        x64_movq_xr(&mut g.e, 1, b, true);
+    }
+}
+
+/// d = the bits of xmm0 (f32 bits, zero-extended, if is32)
+fn ng_x64_fstore0(g: &mut NatGen, d: i64, is32: bool) {
+    if is32 {
+        x64_sse(&mut g.e, 0xF2, 0x5A, 0, 0);
+        x64_movq_rx(&mut g.e, d, 0, false);
+    } else {
+        x64_movq_rx(&mut g.e, d, 0, true);
+    }
+}
+
+/// The generic Linux system call numbers the runtime uses -> x86-64's.
+fn ng_x64_sysmap() -> Vec<i64> {
+    var m: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 300 { m.push(65535); i = i + 1; }
+    var pairs: Vec<i64> = Vec::new();
+    pairs.push(25); pairs.push(72);     // fcntl
+    pairs.push(34); pairs.push(258);    // mkdirat
+    pairs.push(35); pairs.push(263);    // unlinkat
+    pairs.push(56); pairs.push(257);    // openat
+    pairs.push(57); pairs.push(3);      // close
+    pairs.push(61); pairs.push(217);    // getdents64
+    pairs.push(62); pairs.push(8);      // lseek
+    pairs.push(63); pairs.push(0);      // read
+    pairs.push(64); pairs.push(1);      // write
+    pairs.push(73); pairs.push(271);    // ppoll
+    pairs.push(79); pairs.push(262);    // newfstatat
+    pairs.push(93); pairs.push(60);     // exit
+    pairs.push(94); pairs.push(231);    // exit_group
+    pairs.push(98); pairs.push(202);    // futex
+    pairs.push(101); pairs.push(35);    // nanosleep
+    pairs.push(113); pairs.push(228);   // clock_gettime
+    pairs.push(123); pairs.push(204);   // sched_getaffinity
+    pairs.push(124); pairs.push(24);    // sched_yield
+    pairs.push(129); pairs.push(62);    // kill
+    pairs.push(131); pairs.push(234);   // tgkill
+    pairs.push(132); pairs.push(131);   // sigaltstack
+    pairs.push(134); pairs.push(13);    // rt_sigaction
+    pairs.push(172); pairs.push(39);    // getpid
+    pairs.push(173); pairs.push(110);   // getppid
+    pairs.push(174); pairs.push(102);   // getuid
+    pairs.push(176); pairs.push(104);   // getgid
+    pairs.push(178); pairs.push(186);   // gettid
+    pairs.push(179); pairs.push(99);    // sysinfo
+    pairs.push(198); pairs.push(41);    // socket
+    pairs.push(200); pairs.push(49);    // bind
+    pairs.push(201); pairs.push(50);    // listen
+    pairs.push(202); pairs.push(43);    // accept
+    pairs.push(203); pairs.push(42);    // connect
+    pairs.push(206); pairs.push(44);    // sendto
+    pairs.push(207); pairs.push(45);    // recvfrom
+    pairs.push(208); pairs.push(54);    // setsockopt
+    pairs.push(209); pairs.push(55);    // getsockopt
+    pairs.push(215); pairs.push(11);    // munmap
+    pairs.push(220); pairs.push(56);    // clone
+    pairs.push(221); pairs.push(59);    // execve
+    pairs.push(222); pairs.push(9);     // mmap
+    pairs.push(226); pairs.push(10);    // mprotect
+    pairs.push(260); pairs.push(61);    // wait4
+    pairs.push(276); pairs.push(316);   // renameat2
+    pairs.push(278); pairs.push(318);   // getrandom
+    pairs.push(19); pairs.push(290);    // eventfd2
+    pairs.push(20); pairs.push(291);    // epoll_create1
+    pairs.push(21); pairs.push(233);    // epoll_ctl
+    pairs.push(22); pairs.push(281);    // epoll_pwait
+    i = 0;
+    while i < pairs.len() { m.set(pairs.get(i), pairs.get(i + 1)); i = i + 2; }
+    return m;
+}
+
+/// Every primitive of the x86-64 target (what ng_gen_primitives and
+/// ng_gen_primitives2 give the other targets).
+fn ng_gen_primitives_x64(g: &mut NatGen) {
+    if g.win {
+        ng_gen_primitives_win(g);
+    } else {
+        ng_gen_primitives_x64_linux(g);
+    }
+    ng_gen_primitives_x64_common(g);
+}
+
+/// The Linux-only primitives of x86-64: _start, nat_syscall, threads
+/// through clone, the thread pointer, signals.
+fn ng_gen_primitives_x64_linux(g: &mut NatGen) {
+    // _start: keep the initial sp, the runtime's initialization, main(env 0),
+    // exit_group(its result)
+    g.entry_label = NatEnc_label(&mut g.e);
+    NatEnc_place(&mut g.e, g.entry_label);
+    var main_label: i64 = ng_fn_label(g, "main");
+    x64_mov(&mut g.e, 0, 4);
+    x64_store_label(&mut g.e, 0, g.start_sp_label);
+    x64_li(&mut g.e, 5, 0);
+    if ng_has_fn(g, "pe_rt_init") {
+        x64_li(&mut g.e, 7, 0);
+        x64_call(&mut g.e, ng_fn_label(g, "pe_rt_init"));
+    }
+    x64_li(&mut g.e, 7, 0);
+    x64_call(&mut g.e, main_label);
+    x64_li(&mut g.e, 0, 231);
+    x64_syscall(&mut g.e);
+    x64_ud2(&mut g.e);
+
+    // nat_syscall(n, a, b, c, d, e, f): the generic number mapped, then the
+    // kernel's convention (rax; rdi, rsi, rdx, r10, r8, r9)
+    var systab: i64 = NatEnc_label(&mut g.e);
+    ng_prim(g, "nat_syscall");
+    x64_lea_label(&mut g.e, 11, systab);
+    // movzx eax, word [r11 + rdi * 2]
+    NatEnc_byte(&mut g.e, 0x41); NatEnc_byte(&mut g.e, 0x0F); NatEnc_byte(&mut g.e, 0xB7);
+    NatEnc_byte(&mut g.e, 0x04); NatEnc_byte(&mut g.e, 0x7B);
+    x64_mov(&mut g.e, 7, 6);
+    x64_mov(&mut g.e, 6, 2);
+    x64_mov(&mut g.e, 2, 1);
+    x64_load(&mut g.e, 10, 4, 8, 8, true);
+    x64_load(&mut g.e, 8, 4, 16, 8, true);
+    x64_load(&mut g.e, 9, 4, 24, 8, true);
+    x64_syscall(&mut g.e);
+    x64_mov(&mut g.e, 7, 0);
+    x64_ret(&mut g.e);
+    NatEnc_align(&mut g.e, 2);
+    NatEnc_place(&mut g.e, systab);
+    var map: Vec<i64> = ng_x64_sysmap();
+    var si: i64 = 0;
+    while si < map.len() {
+        NatEnc_byte(&mut g.e, map.get(si) & 255);
+        NatEnc_byte(&mut g.e, (map.get(si) >> 8) & 255);
+        si = si + 1;
+    }
+
+    // nat_clone_thread(entry, arg, stack_top, ctid, tls [stack]) -> tid
+    ng_prim(g, "nat_clone_thread");
+    x64_load(&mut g.e, 11, 4, 8, 8, true);       // tls
+    x64_lea(&mut g.e, 9, 2, 0 - 16);             // the child's stack
+    x64_store(&mut g.e, 7, 9, 0, 8);
+    x64_store(&mut g.e, 6, 9, 8, 8);
+    x64_mov(&mut g.e, 10, 1);                    // ctid
+    x64_mov(&mut g.e, 8, 11);                    // tls
+    x64_mov(&mut g.e, 6, 9);                     // newsp
+    x64_li(&mut g.e, 2, 0);                      // ptid
+    x64_li(&mut g.e, 7, 0x2D0F00);
+    x64_li(&mut g.e, 0, 56);                     // clone
+    x64_syscall(&mut g.e);
+    var parent: i64 = NatEnc_label(&mut g.e);
+    x64_test(&mut g.e, 0, 0);
+    x64_jcc(&mut g.e, X64_NE, parent);
+    x64_load(&mut g.e, 0, 4, 0, 8, true);
+    x64_load(&mut g.e, 6, 4, 8, 8, true);
+    x64_li(&mut g.e, 7, 0);
+    x64_li(&mut g.e, 5, 0);
+    x64_call_r(&mut g.e, 0);
+    x64_li(&mut g.e, 7, 0);
+    x64_li(&mut g.e, 0, 60);                     // exit (this thread)
+    x64_syscall(&mut g.e);
+    x64_ud2(&mut g.e);
+    NatEnc_place(&mut g.e, parent);
+    x64_mov(&mut g.e, 7, 0);
+    x64_ret(&mut g.e);
+
+    // The thread pointer: fs; the block's word at +64 is its own address
+    ng_prim(g, "nat_tls_get");
+    x64_load_fs(&mut g.e, 7, 64); x64_ret(&mut g.e);
+    ng_prim(g, "nat_tls_set");
+    x64_mov(&mut g.e, 6, 7);
+    x64_li(&mut g.e, 7, 4098);                   // ARCH_SET_FS
+    x64_li(&mut g.e, 0, 158);                    // arch_prctl
+    x64_syscall(&mut g.e);
+    x64_ret(&mut g.e);
+
+    // Signals: the handler (sig, info, uc) calls pe_on_signal(sig, info);
+    // the restorer returns through rt_sigreturn (x86-64 has no vdso one)
+    var sig_entry: i64 = NatEnc_label(&mut g.e);
+    NatEnc_align(&mut g.e, 4);
+    NatEnc_place(&mut g.e, sig_entry);
+    if ng_has_fn(g, "pe_on_signal") {
+        x64_push(&mut g.e, 5);
+        x64_mov(&mut g.e, 5, 4);
+        x64_mov(&mut g.e, 2, 6);
+        x64_mov(&mut g.e, 6, 7);
+        x64_li(&mut g.e, 7, 0);
+        x64_call(&mut g.e, ng_fn_label(g, "pe_on_signal"));
+        x64_pop(&mut g.e, 5);
+    }
+    x64_ret(&mut g.e);
+    ng_prim(g, "nat_sig_handler");
+    x64_lea_label(&mut g.e, 7, sig_entry); x64_ret(&mut g.e);
+    var restorer: i64 = NatEnc_label(&mut g.e);
+    NatEnc_align(&mut g.e, 4);
+    NatEnc_place(&mut g.e, restorer);
+    x64_li(&mut g.e, 0, 15);                     // rt_sigreturn
+    x64_syscall(&mut g.e);
+    ng_prim(g, "nat_sig_restorer");
+    x64_lea_label(&mut g.e, 7, restorer); x64_ret(&mut g.e);
+}
+
+/// The primitives x86-64 Linux and Windows share.
+fn ng_gen_primitives_x64_common(g: &mut NatGen) {
+    // Atomics (x86's ordering is total for these)
+    ng_prim(g, "nat_atomic_load");
+    x64_load(&mut g.e, 7, 7, 0, 8, true); x64_ret(&mut g.e);
+    ng_prim(g, "nat_atomic_store");
+    x64_xchg_mem(&mut g.e, 7, 6); x64_ret(&mut g.e);
+    ng_prim(g, "nat_atomic_add");
+    x64_lock_xadd(&mut g.e, 7, 6); x64_mov(&mut g.e, 7, 6); x64_ret(&mut g.e);
+    ng_prim(g, "nat_atomic_cas");
+    x64_mov(&mut g.e, 0, 6);
+    x64_lock_cmpxchg(&mut g.e, 7, 2);
+    x64_setcc(&mut g.e, X64_E, 11);
+    x64_movx(&mut g.e, 0xB6, 7, 11);
+    x64_ret(&mut g.e);
+
+    // nat_ctx_swap(save, sp): the same 112-byte record as the other targets
+    // (callee-saved registers, then fp at +96 and the return address at
+    // +104, here the one the call pushed)
+    ng_prim(g, "nat_ctx_swap");
+    x64_sub_imm(&mut g.e, 4, 104);
+    var cs: Vec<i64> = ng_callee_saved(g);
+    var k: i64 = 0;
+    while k < cs.len() { x64_store(&mut g.e, cs.get(k), 4, 8 * k, 8); k = k + 1; }
+    x64_store(&mut g.e, 5, 4, 96, 8);
+    if g.win {
+        // Windows: the TEB's StackLimit travels with the context (a new
+        // task's record holds 0: no stack probes on its committed stack)
+        x64_load_gs(&mut g.e, 11, 16);
+        x64_store(&mut g.e, 11, 4, 48, 8);
+    }
+    x64_store(&mut g.e, 4, 7, 0, 8);
+    x64_mov(&mut g.e, 4, 6);
+    if g.win {
+        x64_load(&mut g.e, 11, 4, 48, 8, true);
+        x64_store_gs(&mut g.e, 11, 16);
+    }
+    k = 0;
+    while k < cs.len() { x64_load(&mut g.e, cs.get(k), 4, 8 * k, 8, true); k = k + 1; }
+    x64_load(&mut g.e, 5, 4, 96, 8, true);
+    x64_add_imm(&mut g.e, 4, 104);
+    x64_ret(&mut g.e);
+    // The first switch to a task returns here: [rsp] entry, [rsp + 8] arg
+    g.tramp_label = NatEnc_label(&mut g.e);
+    NatEnc_align(&mut g.e, 4);
+    NatEnc_place(&mut g.e, g.tramp_label);
+    x64_load(&mut g.e, 0, 4, 0, 8, true);
+    x64_load(&mut g.e, 6, 4, 8, 8, true);
+    x64_li(&mut g.e, 7, 0);
+    x64_call_r(&mut g.e, 0);
+    x64_ud2(&mut g.e);
+    ng_prim(g, "nat_ctx_tramp");
+    x64_lea_label(&mut g.e, 7, g.tramp_label); x64_ret(&mut g.e);
+
+    // nat_call_fn(addr, nargs, argv): addr(env 0, argv[0..8])
+    ng_prim(g, "nat_call_fn");
+    x64_push(&mut g.e, 5);
+    x64_mov(&mut g.e, 5, 4);
+    x64_sub_imm(&mut g.e, 4, 48);
+    x64_mov(&mut g.e, 11, 7);
+    x64_mov(&mut g.e, 10, 2);
+    k = 3;
+    while k < 8 {
+        x64_load(&mut g.e, 0, 10, 8 * k, 8, true);
+        x64_store(&mut g.e, 0, 4, 8 * (k - 3), 8);
+        k = k + 1;
+    }
+    x64_load(&mut g.e, 6, 10, 0, 8, true);
+    x64_load(&mut g.e, 2, 10, 8, 8, true);
+    x64_load(&mut g.e, 1, 10, 16, 8, true);
+    x64_li(&mut g.e, 7, 0);
+    x64_call_r(&mut g.e, 11);
+    x64_mov(&mut g.e, 4, 5);
+    x64_pop(&mut g.e, 5);
+    x64_ret(&mut g.e);
+
+    ng_prim(g, "nat_fn_table");
+    x64_lea_label(&mut g.e, 7, g.fn_table_label); x64_ret(&mut g.e);
+    ng_prim(g, "nat_fn_names");
+    x64_lea_label(&mut g.e, 7, g.names_label); x64_ret(&mut g.e);
+
+    ng_prim(g, "nat_frame_fp");
+    x64_mov(&mut g.e, 7, 5); x64_ret(&mut g.e);
+    ng_prim(g, "nat_frame_ret");
+    x64_load(&mut g.e, 7, 7, 8, 8, true); x64_ret(&mut g.e);
+    ng_prim(g, "nat_frame_next");
+    x64_load(&mut g.e, 7, 7, 0, 8, true); x64_ret(&mut g.e);
+
+    ng_prim(g, "nat_arch");
+    x64_li(&mut g.e, 7, NAT_X64); x64_ret(&mut g.e);
+    // nat_os() -> 0 Linux, 1 Windows
+    ng_prim(g, "nat_os");
+    if g.win { x64_li(&mut g.e, 7, 1); } else { x64_li(&mut g.e, 7, 0); }
+    x64_ret(&mut g.e);
+
+    // nat_fma(a, b, c): FMA3 (x86-64-v3)
+    ng_prim(g, "nat_fma");
+    x64_movq_xr(&mut g.e, 0, 7, true);
+    x64_movq_xr(&mut g.e, 1, 6, true);
+    x64_movq_xr(&mut g.e, 2, 2, true);
+    x64_vfmadd213sd_012(&mut g.e);
+    x64_movq_rx(&mut g.e, 7, 0, true);
+    x64_ret(&mut g.e);
+
+    // The C math functions that are an instruction or a few
+    ng_prim(g, "nat_c_sqrt");
+    x64_movq_xr(&mut g.e, 0, 7, true); x64_sse(&mut g.e, 0xF2, 0x51, 0, 0); x64_movq_rx(&mut g.e, 7, 0, true); x64_ret(&mut g.e);
+    ng_prim(g, "nat_c_fabs");
+    x64_li(&mut g.e, 11, 9223372036854775807); x64_alu(&mut g.e, 0x21, 7, 11); x64_ret(&mut g.e);
+    var modes: Vec<i64> = Vec::new();
+    modes.push(9); modes.push(10); modes.push(11);
+    var mnames: Vec<str> = Vec::new();
+    mnames.push("nat_c_floor"); mnames.push("nat_c_ceil"); mnames.push("nat_c_trunc");
+    var mi: i64 = 0;
+    while mi < 3 {
+        ng_prim(g, mnames.get(mi));
+        x64_movq_xr(&mut g.e, 0, 7, true);
+        x64_roundsd(&mut g.e, 0, 0, modes.get(mi));
+        x64_movq_rx(&mut g.e, 7, 0, true);
+        x64_ret(&mut g.e);
+        mi = mi + 1;
+    }
+    // round: halves away from zero (t = trunc x; |x - t| >= 0.5: t +- 1)
+    ng_prim(g, "nat_c_round");
+    x64_movq_xr(&mut g.e, 0, 7, true);
+    x64_roundsd(&mut g.e, 1, 0, 11);
+    x64_movq_rx(&mut g.e, 11, 0, true);
+    x64_movq_xr(&mut g.e, 2, 11, true);
+    x64_sse(&mut g.e, 0xF2, 0x5C, 2, 1);         // xmm2 = x - t
+    x64_movq_rx(&mut g.e, 11, 2, true);
+    x64_li(&mut g.e, 10, 9223372036854775807);
+    x64_alu(&mut g.e, 0x21, 11, 10);
+    x64_movq_xr(&mut g.e, 2, 11, true);          // |x - t|
+    x64_li(&mut g.e, 10, 4602678819172646912);   // 0.5
+    x64_movq_xr(&mut g.e, 3, 10, true);
+    x64_sse(&mut g.e, 0x66, 0x2E, 2, 3);
+    var rdone: i64 = NatEnc_label(&mut g.e);
+    x64_jcc(&mut g.e, X64_B, rdone);
+    x64_mov(&mut g.e, 11, 7);
+    x64_li(&mut g.e, 10, 0 - 9223372036854775807 - 1);
+    x64_alu(&mut g.e, 0x21, 11, 10);             // the sign of x
+    x64_li(&mut g.e, 10, 4607182418800017408);   // 1.0
+    x64_alu(&mut g.e, 0x09, 11, 10);
+    x64_movq_xr(&mut g.e, 3, 11, true);
+    x64_sse(&mut g.e, 0xF2, 0x58, 1, 3);
+    NatEnc_place(&mut g.e, rdone);
+    x64_movq_rx(&mut g.e, 7, 1, true);
+    x64_ret(&mut g.e);
+
+    // nat_start_sp()
+    var ssp: i64 = NatEnc_label(&mut g.e);
+    HashMap_insert(g.fn_labels, "nat_start_sp", ssp);
+    NatEnc_place(&mut g.e, ssp);
+    x64_load_label(&mut g.e, 7, g.start_sp_label);
+    x64_ret(&mut g.e);
 }
 
 // ===========================================================================
@@ -2275,14 +3092,15 @@ fn ng_mir_finish(g: &mut NatGen) -> str {
 /// Load call arguments: `srcs` are value ids (-1: a null `__env`).
 /// Arguments 8 and up go to the outgoing area.
 fn ng_load_args(g: &mut NatGen, srcs: Vec<i64>) {
-    var i: i64 = 8;
+    var nr: i64 = ng_nregargs(g);
+    var i: i64 = nr;
     while i < srcs.len() {
         if srcs.get(i) < 0 { ng_li(g, g.t0, 0); } else { ng_ld_val(g, g.t0, srcs.get(i)); }
-        ng_st_outgoing(g, i - 8, g.t0);
+        ng_st_outgoing(g, i - nr, g.t0);
         i = i + 1;
     }
     i = 0;
-    while i < srcs.len() && i < 8 {
+    while i < srcs.len() && i < nr {
         var r: i64 = ng_argreg(g, i);
         if srcs.get(i) < 0 { ng_li(g, r, 0); } else { ng_ld_val(g, r, srcs.get(i)); }
         i = i + 1;
@@ -2320,7 +3138,143 @@ fn ng_call_builtin(g: &mut NatGen, name: str, nargs: i64) {
 
 /// IR Call: pe_ir's routing (print, p_to_str by argument type), then the
 /// resolved function with its arguments; the result goes to `dst`.
+/// The element code of a Vec of bytes (core's VEC_BYTES; pe_ir's
+/// PEIR_VEC_BYTES): Vec<u8> and Vec<bool> hold one byte per element.
+const NG_VEC_BYTES: i64 = 0x4649445645430009;
+
+/// Value v's static type is Vec<u8> or Vec<bool>.
+fn ng_vec_bytes_typed(func: &IrFunction, v: i64) -> bool {
+    match IrFunction_get_meta(func, v) {
+        OptValueMeta::Some(m) => {
+            match m.ty {
+                IrType::Generic(n, targs) => {
+                    if n == "Vec" && targs.len() == 1 {
+                        match targs.get(0) {
+                            IrType::U8 => { return true; }
+                            IrType::Bool => { return true; }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        OptValueMeta::None => {}
+    }
+    return false;
+}
+
+/// t3 = 1 when the Vec at t0 holds elements of the static kind (words:
+/// code 0; bytes: NG_VEC_BYTES), via t2; jumps to slow otherwise.
+fn ng_vec_kind_check(g: &mut NatGen, bytes: bool, slow: i64) {
+    ng_load(g, g.t2, g.t0, 24, 8, false);
+    if bytes {
+        ng_li(g, g.t3, NG_VEC_BYTES);
+        ng_setcc(g, g.t3, g.t2, g.t3, NCC_EQ);
+        ng_beqz(g, g.t3, slow);
+    } else {
+        ng_bnez(g, g.t2, slow);
+    }
+}
+
+/// checks.fd proved operation id needs no overflow or bounds check.
+fn ng_unchecked(g: &NatGen, id: i64) -> bool {
+    return id >= 0 && id < g.unchecked.len() && (g.unchecked.get(id) & 1) != 0;
+}
+
+/// t2 = the address of element t1 of the Vec at t0 (data + t1 * size), via t3.
+fn ng_vec_elem_addr(g: &mut NatGen, bytes: bool) {
+    ng_load(g, g.t2, g.t0, 0, 8, false);
+    if bytes {
+        ng_add(g, g.t2, g.t2, g.t1);
+    } else {
+        ng_li(g, g.t3, 3);
+        ng_shl(g, g.t3, g.t1, g.t3);
+        ng_add(g, g.t2, g.t2, g.t3);
+    }
+}
+
+/// Vec_len, Vec_get, Vec_set and Vec_push, the hottest calls of most
+/// programs (pe_ir's PeirGen_inline_vec_call, here on every target): the
+/// common case in place, anything else core's function (an out-of-bounds
+/// index panics there). A Vec is {data, len, cap, code, tid}: a shared
+/// buffer has a negative cap, a Vec owning its elements a tid at +32,
+/// structs held inline element codes of 16 and up. `FID_NAT_OFF=vecinline`.
 fn ng_gen_call(g: &mut NatGen, id: i64, call_name: str, args: Vec<i64>, func: &IrFunction) {
+    if !ng_on("vecinline") || !ng_has_fn(g, call_name) {
+        ng_gen_call_std(g, id, call_name, args, func);
+        return;
+    }
+    var na: i64 = args.len();
+    if call_name == "Vec_len" && na >= 1 {
+        ng_ld_val(g, g.t0, args.get(na - 1));
+        ng_load(g, g.t1, g.t0, 8, 8, false);
+        ng_st_val(g, id, g.t1);
+        return;
+    }
+    var kind: i64 = 0;
+    if call_name == "Vec_get" && na >= 2 { kind = 1; }
+    if call_name == "Vec_set" && na >= 3 { kind = 2; }
+    if call_name == "Vec_push" && na == 3 { kind = 3; }
+    if kind == 0 {
+        ng_gen_call_std(g, id, call_name, args, func);
+        return;
+    }
+    var slow: i64 = NatEnc_label(&mut g.e);
+    var done: i64 = NatEnc_label(&mut g.e);
+    var vid: i64 = args.get(na - 2);
+    if kind == 2 { vid = args.get(na - 3); }
+    if kind == 3 { vid = args.get(1); }
+    var bytes: bool = ng_vec_bytes_typed(func, vid);
+    var esize: i64 = 8;
+    if bytes { esize = 1; }
+    ng_ld_val(g, g.t0, vid);
+    if (kind == 1 || kind == 2) && ng_unchecked(g, id) {
+        if kind == 1 { ng_ld_val(g, g.t1, args.get(na - 1)); } else { ng_ld_val(g, g.t1, args.get(na - 2)); }
+    } else if kind == 1 || kind == 2 {
+        // index < len, unsigned (a negative index fails it too)
+        if kind == 1 { ng_ld_val(g, g.t1, args.get(na - 1)); } else { ng_ld_val(g, g.t1, args.get(na - 2)); }
+        ng_load(g, g.t2, g.t0, 8, 8, false);
+        ng_setcc(g, g.t3, g.t1, g.t2, NCC_LTU);
+        ng_beqz(g, g.t3, slow);
+    }
+    if kind == 2 {
+        // not shared, owning no elements
+        ng_load(g, g.t2, g.t0, 16, 8, false);
+        ng_setcc(g, g.t3, g.t2, g.zr, NCC_LT);
+        ng_bnez(g, g.t3, slow);
+        ng_load(g, g.t2, g.t0, 32, 8, false);
+        ng_bnez(g, g.t2, slow);
+    }
+    ng_vec_kind_check(g, bytes, slow);
+    if kind == 1 {
+        ng_vec_elem_addr(g, bytes);
+        ng_load(g, g.t3, g.t2, 0, esize, false);
+        ng_st_val(g, id, g.t3);
+    } else if kind == 2 {
+        ng_vec_elem_addr(g, bytes);
+        ng_ld_val(g, g.t3, args.get(na - 1));
+        ng_store(g, g.t2, 0, g.t3, esize);
+    } else {
+        // room in the buffer: len < cap, signed (a shared one's is negative)
+        ng_load(g, g.t1, g.t0, 8, 8, false);
+        ng_load(g, g.t2, g.t0, 16, 8, false);
+        ng_setcc(g, g.t3, g.t1, g.t2, NCC_LT);
+        ng_beqz(g, g.t3, slow);
+        ng_vec_elem_addr(g, bytes);
+        ng_ld_val(g, g.t3, args.get(2));
+        ng_store(g, g.t2, 0, g.t3, esize);
+        ng_li(g, g.t3, 1);
+        ng_add(g, g.t1, g.t1, g.t3);
+        ng_store(g, g.t0, 8, g.t1, 8);
+    }
+    ng_jmp(g, done);
+    ng_place(g, slow);
+    ng_gen_call_std(g, id, call_name, args, func);
+    ng_place(g, done);
+}
+
+fn ng_gen_call_std(g: &mut NatGen, id: i64, call_name: str, args: Vec<i64>, func: &IrFunction) {
     // An f64 lives in its slot as its bits: these copy the word
     if (call_name == "p_f64_to_bits" || call_name == "p_f64_from_bits") && args.len() == 1 {
         ng_ld_val(g, g.t0, args.get(0));
@@ -2545,7 +3499,7 @@ fn ng_gen_binop(g: &mut NatGen, id: i64, op: BinOp, left: i64, right: i64, ty: I
         ng_st_val(g, id, g.t0);
         return;
     }
-    var checked: bool = !g.cur_wrapping;
+    var checked: bool = !g.cur_wrapping && !ng_unchecked(g, id);
     var unsigned_cmp: bool = ir_type_eq(lty, IrType::U64) || ir_type_eq(rty, IrType::U64);
     match op {
         BinOp::Add => { ng_gen_checked(g, 0, ty, checked); }
@@ -2985,11 +3939,23 @@ fn ng_note_id(maxid: i64, id: i64) -> i64 {
 
 fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModule) {
     g.cur_name = name;
+    // Line rows (debug sections only, not on Windows): this function's
+    ng_line_close(g);
+    g.lines_cur_fn = !g.win && ng_on("debug") && HashMap_contains(g.line_fns, name);
+    g.cur_line = 0;
     // The runtime's arithmetic wraps, as pe_ir's does
     g.cur_wrapping = func.is_wrapping || is_pe_runtime_fn(name);
+    // Counted loops and integer ranges (checks.fd, shared with pe_ir and C):
+    // the operations that cannot overflow or index out of bounds
+    // (`FID_NAT_OFF=unchecked`: every check stays)
+    if ng_on("unchecked") {
+        g.unchecked = peir_unchecked_ops(func, func.value_metas.len() + func.insts.len() + 16);
+    } else {
+        g.unchecked = Vec::new();
+    }
     // The machine IR records the function (placed when it is emitted, after
     // allocation); the direct path places and encodes it now
-    var mir_on: bool = NG_MIR && ng_on("mir");
+    var mir_on: bool = NG_MIR && (ng_on("mir") || ng_x64(g));
     if !mir_on {
         NatEnc_align(&mut g.e, 4);
         NatEnc_place(&mut g.e, HashMap_get(g.fn_labels, name));
@@ -3024,7 +3990,7 @@ fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModu
         i = i + 1;
     }
     var out: i64 = 0;
-    if most > 8 { out = (most - 8) * 8; }
+    if most > ng_nregargs(g) { out = (most - ng_nregargs(g)) * 8; }
     out = (out + 15) & (0 - 16);
     var cur: i64 = out;
     i = 0;
@@ -3115,10 +4081,10 @@ fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModu
     i = 0;
     while i < func.params.len() {
         var p: ValueIdType = func.params.get(i);
-        if i < 8 {
+        if i < ng_nregargs(g) {
             ng_st_val(g, p.id, ng_argreg(g, i));
         } else {
-            ng_ld_incoming(g, g.t0, i - 8);
+            ng_ld_incoming(g, g.t0, i - ng_nregargs(g));
             ng_st_val(g, p.id, g.t0);
         }
         i = i + 1;
@@ -3142,6 +4108,7 @@ fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModu
         while ii < block.instructions.len() {
             var iid: i64 = block.instructions.get(ii);
             if g.rec { ng_fresh_temps(g); }
+            if g.lines_cur_fn { ng_note_line(g, func, iid); }
             match IrFunction_get_inst(func, iid) {
                 OptInst::Some(inst) => { ng_gen_inst(g, iid, inst, func, module); }
                 OptInst::None => {}
@@ -3169,6 +4136,7 @@ fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModu
 // ===========================================================================
 
 fn ng_gen_primitives(g: &mut NatGen) {
+    if ng_x64(g) { ng_gen_primitives_x64(g); return; }
     // _start: keep the initial sp (argc, argv, envp), call main(env = 0),
     // exit_group(its result)
     g.entry_label = NatEnc_label(&mut g.e);
@@ -3487,6 +4455,21 @@ fn ng_gen_primitives2(g: &mut NatGen) {
     ng_addr(g, ng_argreg(g, 0), sig_entry);
     if a64 { a64_ret(&mut g.e); } else { rv_ret(&mut g.e); }
 
+    // nat_arch() -> the target (1 AArch64, 2 RISC-V 64): for the few
+    // structures whose layout differs between them and x86-64
+    ng_prim(g, "nat_arch");
+    ng_li(g, ng_argreg(g, 0), g.arch);
+    if a64 { a64_ret(&mut g.e); } else { rv_ret(&mut g.e); }
+
+    // nat_sig_restorer() -> 0: the kernel returns from handlers itself here
+    ng_prim(g, "nat_sig_restorer");
+    ng_li(g, ng_argreg(g, 0), 0);
+    if a64 { a64_ret(&mut g.e); } else { rv_ret(&mut g.e); }
+    // nat_os() -> 0: Linux
+    ng_prim(g, "nat_os");
+    ng_li(g, ng_argreg(g, 0), 0);
+    if a64 { a64_ret(&mut g.e); } else { rv_ret(&mut g.e); }
+
     // nat_fma(a, b, c) -> a * b + c rounded once (bits)
     ng_prim(g, "nat_fma");
     if a64 {
@@ -3601,7 +4584,10 @@ fn ng_gen_panic_stubs(g: &mut NatGen) {
         NatEnc_align(&mut g.e, 4);
         NatEnc_place(&mut g.e, g.panic_labels.get(i));
         // A frame record, so the trace walk sees the caller
-        if ng_a64(g) {
+        if ng_x64(g) {
+            x64_push(&mut g.e, 5);
+            x64_mov(&mut g.e, 5, 4);
+        } else if ng_a64(g) {
             NatEnc_word(&mut g.e, 0xA9BF7BFD);            // stp x29, x30, [sp, #-16]!
             a64_add_imm(&mut g.e, A64_FP, A64_SP, 0);
         } else {
@@ -3744,6 +4730,7 @@ fn ng_collect_dyn_types(g: &mut NatGen, module: &IrModule) {
 /// `target`: "aarch64-linux" or "riscv64-linux" (also "arm64-linux",
 /// "riscv-linux", "arm64", "riscv64").
 pub fn nat_target_arch(target: str) -> i64 {
+    if str_starts_with(target, "x86_64") || str_starts_with(target, "x64") || str_starts_with(target, "amd64") { return NAT_X64; }
     if str_starts_with(target, "aarch64") || str_starts_with(target, "arm64") { return NAT_A64; }
     if str_starts_with(target, "riscv") { return NAT_RV64; }
     return 0;
@@ -3752,17 +4739,33 @@ pub fn nat_target_arch(target: str) -> i64 {
 /// A static Linux executable for `arch` from an IR module that has the
 /// Linux runtime (stdlib/linux_runtime) merged in.
 pub fn nat_generate_elf(module: IrModule, arch: i64) -> ResultBytes {
+    return nat_generate_image(module, arch, false);
+}
+
+/// A Windows x64 executable (PE) from an IR module that has the Linux
+/// runtime and its Windows layer (stdlib/linux_runtime/win.fd) merged in.
+pub fn nat_generate_pe(module: IrModule) -> ResultBytes {
+    return nat_generate_image(module, NAT_X64, true);
+}
+
+fn nat_generate_image(module: IrModule, arch: i64, win: bool) -> ResultBytes {
     if !pe_module_has_fn(&module, "main") {
         return ResultBytes::Err(c_vec1("native backend: the program has no `main` function"));
     }
     var t_start: i64 = p_clock_now_ms();
     var g: NatGen = NatGen_new(arch);
+    g.win = win;
     var fi: i64 = 0;
     while fi < module.functions.len() {
         HashMap_insert(g.all_fns, module.functions.get(fi).name, 1);
         fi = fi + 1;
     }
     ng_collect_dyn_types(&mut g, &module);
+    if g_nat_lines_names != "" {
+        var lnames: Vec<str> = str_split(g_nat_lines_names, ",");
+        var lni: i64 = 0;
+        while lni < lnames.len() { HashMap_insert(g.line_fns, lnames.get(lni), 1); lni = lni + 1; }
+    }
     var ei: i64 = 0;
     while ei < module.extern_decls.len() {
         var ext: ExternDecl = module.extern_decls.get(ei);
@@ -3781,6 +4784,19 @@ pub fn nat_generate_elf(module: IrModule, arch: i64) -> ResultBytes {
         pi = pi + 1;
     }
     g.start_sp_label = NatEnc_label(&mut g.e);
+    if g.win {
+        if !ng_has_fn(&g, "pe_win_syscall") {
+            return ResultBytes::Err(c_vec1("native backend: the Windows layer of the runtime (stdlib/linux_runtime/win.fd) is not merged"));
+        }
+        var ni: i64 = 0;
+        while ni < ng_win_imports().len() { g.win_slot_labels.push(NatEnc_label(&mut g.e)); ni = ni + 1; }
+        g.win_slots_label = NatEnc_label(&mut g.e);
+        g.win_tls_label = NatEnc_label(&mut g.e);
+        g.win_imp_label = NatEnc_label(&mut g.e);
+        g.win_imp_end = NatEnc_label(&mut g.e);
+        g.win_iat_label = NatEnc_label(&mut g.e);
+        g.win_iat_end = NatEnc_label(&mut g.e);
+    }
 
     ng_gen_primitives(&mut g);
     // Compile what main reaches, as calls are met; the panic stubs' calls
@@ -3796,19 +4812,30 @@ pub fn nat_generate_elf(module: IrModule, arch: i64) -> ResultBytes {
         qi = qi + 1;
     }
     var t_rec: i64 = p_clock_now_ms();
-    if NG_MIR && ng_on("mir") {
+    time_mark("nat record", t_start);
+    if NG_MIR && (ng_on("mir") || ng_x64(&g)) {
         var merr: str = ng_mir_finish(&mut g);
         if merr != "" {
             return ResultBytes::Err(c_vec1(merr));
         }
     }
+    ng_line_close(&mut g);
     var t_emit: i64 = p_clock_now_ms();
+    time_mark("nat alloc+emit", t_rec);
     p_eprint_str("[prof] native: lower " + int_to_str(t_rec - t_start) + "ms, allocate and emit "
         + int_to_str(t_emit - t_rec) + "ms, " + int_to_str(g.recs.len()) + " functions, "
         + int_to_str(g.n_folded) + " folded\n");
     NatEnc_align(&mut g.e, 4);
     NatEnc_place(&mut g.e, g.code_end_label);
+    // Windows: the data on pages of its own (a read/execute .text, a
+    // read/write .data: one RWX section looks packed to scanners)
+    var data_off: i64 = 0;
+    if g.win {
+        NatEnc_align(&mut g.e, 4096);
+        data_off = NatEnc_pos(&g.e);
+    }
     ng_gen_data(&mut g, &module);
+    if g.win { ng_gen_win_imports(&mut g); }
 
     if g.unresolved.len() > 0 {
         return ResultBytes::Err(c_vec1("native backend: not available in native Linux executables yet: "
@@ -3818,7 +4845,349 @@ pub fn nat_generate_elf(module: IrModule, arch: i64) -> ResultBytes {
     if err != "" {
         return ResultBytes::Err(c_vec1(err));
     }
-    return ResultBytes::Ok(nat_elf(arch, g.e.code, NatEnc_label_offset(&g.e, g.entry_label)));
+    time_mark("nat data+image", t_emit);
+    var entry_off: i64 = NatEnc_label_offset(&g.e, g.entry_label);
+    if g.win {
+        var imp_off: i64 = NatEnc_label_offset(&g.e, g.win_imp_label);
+        var iat_off: i64 = NatEnc_label_offset(&g.e, g.win_iat_label);
+        return ResultBytes::Ok(nat_pe(g.e.code, entry_off, data_off, imp_off,
+            NatEnc_label_offset(&g.e, g.win_imp_end) - imp_off,
+            iat_off, NatEnc_label_offset(&g.e, g.win_iat_end) - iat_off));
+    }
+    if !ng_on("debug") {
+        return ResultBytes::Ok(nat_elf(arch, g.e.code, entry_off));
+    }
+    // Symbols and DWARF for the functions in the image, in address order
+    var dnames: Vec<str> = Vec::new();
+    var dstarts: Vec<i64> = Vec::new();
+    var dends: Vec<i64> = Vec::new();
+    var di: i64 = 0;
+    while di < g.placed_fns.len() {
+        var dn: str = g.placed_fns.get(di);
+        dnames.push(dn);
+        dstarts.push(NatEnc_label_offset(&g.e, HashMap_get(g.fn_labels, dn)));
+        di = di + 1;
+    }
+    di = 0;
+    while di < dstarts.len() {
+        if di + 1 < dstarts.len() { dends.push(dstarts.get(di + 1)); }
+        else { dends.push(NatEnc_label_offset(&g.e, g.code_end_label)); }
+        di = di + 1;
+    }
+    return ResultBytes::Ok(nat_elf_debug(arch, g.e.code, entry_off, dnames, dstarts, dends, g_nat_lines_file, g.lrows));
+}
+
+// ===========================================================================
+// Windows x64 (`--target x86_64-windows --nat`): the x86-64 code of this
+// layer in a PE (nat_pe), the Linux runtime over kernel32 and ws2_32. The
+// runtime's system calls go to pe_win_syscall (stdlib/linux_runtime/win.fd),
+// which calls Windows through nat_win_call(k, ...): k indexes the import
+// list below, in the same order as PE_W_* in win.fd.
+// ===========================================================================
+
+/// "dll|function" per import; the index is the PE_W_* constant of win.fd.
+fn ng_win_imports() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    var k32: Vec<str> = Vec::new();
+    k32.push("ExitProcess"); k32.push("GetStdHandle"); k32.push("WriteFile"); k32.push("ReadFile");
+    k32.push("CreateFileA"); k32.push("CloseHandle"); k32.push("SetFilePointerEx"); k32.push("DeleteFileA");
+    k32.push("RemoveDirectoryA"); k32.push("CreateDirectoryA"); k32.push("MoveFileExA"); k32.push("GetFileAttributesExA");
+    k32.push("FindFirstFileA"); k32.push("FindNextFileA"); k32.push("FindClose"); k32.push("VirtualAlloc");
+    k32.push("VirtualFree"); k32.push("VirtualProtect"); k32.push("GetSystemTimePreciseAsFileTime"); k32.push("QueryPerformanceCounter");
+    k32.push("QueryPerformanceFrequency"); k32.push("Sleep"); k32.push("SwitchToThread"); k32.push("GetCurrentProcessId");
+    k32.push("GetCurrentThreadId"); k32.push("CreateThread"); k32.push("ExitThread"); k32.push("TlsAlloc");
+    k32.push("AddVectoredExceptionHandler"); k32.push("SetThreadStackGuarantee"); k32.push("GetCommandLineA"); k32.push("GetEnvironmentStringsA");
+    k32.push("GetSystemInfo"); k32.push("GlobalMemoryStatusEx"); k32.push("CreateProcessA"); k32.push("WaitForSingleObject");
+    k32.push("GetExitCodeProcess"); k32.push("GetLastError"); k32.push("GetCurrentProcess"); k32.push("TerminateProcess");
+    k32.push("SetConsoleOutputCP"); k32.push("GetFileType"); k32.push("PeekNamedPipe"); k32.push("GetFileSizeEx");
+    var i: i64 = 0;
+    while i < k32.len() { v.push("kernel32.dll|" + k32.get(i)); i = i + 1; }
+    v.push("api-ms-win-core-synch-l1-2-0.dll|WaitOnAddress");
+    v.push("api-ms-win-core-synch-l1-2-0.dll|WakeByAddressSingle");
+    v.push("api-ms-win-core-synch-l1-2-0.dll|WakeByAddressAll");
+    v.push("bcrypt.dll|BCryptGenRandom");
+    var ws: Vec<str> = Vec::new();
+    ws.push("WSAStartup"); ws.push("socket"); ws.push("bind"); ws.push("listen"); ws.push("accept");
+    ws.push("connect"); ws.push("send"); ws.push("recv"); ws.push("closesocket"); ws.push("setsockopt");
+    ws.push("getsockopt"); ws.push("ioctlsocket"); ws.push("WSAPoll"); ws.push("WSAGetLastError"); ws.push("gethostbyname");
+    i = 0;
+    while i < ws.len() { v.push("ws2_32.dll|" + ws.get(i)); i = i + 1; }
+    return v;
+}
+
+fn ng_win_import_index(name: str) -> i64 {
+    var v: Vec<str> = ng_win_imports();
+    var i: i64 = 0;
+    while i < v.len() {
+        var e: str = v.get(i);
+        if str_ends_with(e, "|" + name) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+/// A call from machine code into Windows: the function in import slot
+/// `name` (rcx, rdx, r8, r9 already set; rsp 16-aligned with 32 bytes of
+/// shadow space below the caller's).
+fn ng_win_call_import(g: &mut NatGen, name: str) {
+    x64_load_label(&mut g.e, 0, g.win_slot_labels.get(ng_win_import_index(name)));
+    x64_call_r(&mut g.e, 0);
+}
+
+/// A primitive that is the Fides function `target` taking (env, the
+/// primitive's arguments): four arguments came in rdi, rsi, rdx, rcx and
+/// `nstack` more on the stack; each moves one place up.
+fn ng_win_forward(g: &mut NatGen, target: str, nstack: i64) {
+    x64_push(&mut g.e, 5);
+    x64_mov(&mut g.e, 5, 4);
+    var out: i64 = (nstack + 1) * 8;
+    if (out % 16) != 0 { out = out + 8; }
+    x64_sub_imm(&mut g.e, 4, out);
+    // the 4th register argument becomes the first stack one
+    x64_store(&mut g.e, 1, 4, 0, 8);
+    var j: i64 = 0;
+    while j < nstack {
+        x64_load(&mut g.e, 0, 5, 16 + 8 * j, 8, true);
+        x64_store(&mut g.e, 0, 4, 8 + 8 * j, 8);
+        j = j + 1;
+    }
+    x64_mov(&mut g.e, 1, 2);
+    x64_mov(&mut g.e, 2, 6);
+    x64_mov(&mut g.e, 6, 7);
+    x64_li(&mut g.e, 7, 0);
+    x64_call(&mut g.e, ng_fn_label(g, target));
+    x64_mov(&mut g.e, 4, 5);
+    x64_pop(&mut g.e, 5);
+    x64_ret(&mut g.e);
+}
+
+/// The Windows-only primitives of x86-64 (what ng_gen_primitives_x64_linux
+/// gives Linux).
+fn ng_gen_primitives_win(g: &mut NatGen) {
+    // The entry point (rsp = 8 mod 16): the TLS index, the Linux-style
+    // start block (argc, argv, envp) from the command line and the
+    // environment, the runtime's initialization, main(env 0), ExitProcess
+    g.entry_label = NatEnc_label(&mut g.e);
+    NatEnc_place(&mut g.e, g.entry_label);
+    var main_label: i64 = ng_fn_label(g, "main");
+    x64_align_sp16(&mut g.e);
+    x64_sub_imm(&mut g.e, 4, 32);
+    x64_li(&mut g.e, 5, 0);
+    ng_win_call_import(g, "TlsAlloc");
+    x64_mov32(&mut g.e, 0, 0);
+    x64_store_label(&mut g.e, 0, g.win_tls_label);
+    x64_li(&mut g.e, 7, 0);
+    x64_call(&mut g.e, ng_fn_label(g, "pe_win_start"));
+    x64_store_label(&mut g.e, 7, g.start_sp_label);
+    if ng_has_fn(g, "pe_rt_init") {
+        x64_li(&mut g.e, 7, 0);
+        x64_call(&mut g.e, ng_fn_label(g, "pe_rt_init"));
+    }
+    x64_li(&mut g.e, 7, 0);
+    x64_call(&mut g.e, main_label);
+    x64_mov(&mut g.e, 1, 7);
+    ng_win_call_import(g, "ExitProcess");
+    x64_ud2(&mut g.e);
+
+    // nat_syscall(n, a, b, c, d, e, f) -> pe_win_syscall(env, n, ..., f)
+    ng_prim(g, "nat_syscall");
+    ng_win_forward(g, "pe_win_syscall", 3);
+    // nat_clone_thread(entry, arg, stack_top, ctid, tls) -> pe_win_clone
+    ng_prim(g, "nat_clone_thread");
+    ng_win_forward(g, "pe_win_clone", 1);
+
+    // nat_win_call(k, a, b, c, d, e, f, g, h, i, j): import k with up to
+    // ten arguments in the Windows x64 convention (rcx, rdx, r8, r9, then
+    // the stack above 32 bytes of shadow space); its rax. Windows keeps
+    // rbx, rbp, rdi, rsi, r12-r15: every register this layer allocates.
+    ng_prim(g, "nat_win_call");
+    x64_push(&mut g.e, 5);
+    x64_mov(&mut g.e, 5, 4);
+    x64_align_sp16(&mut g.e);
+    x64_sub_imm(&mut g.e, 4, 96);
+    x64_lea_label(&mut g.e, 11, g.win_slots_label);
+    x64_shift_imm(&mut g.e, 4, 7, 3);
+    x64_alu(&mut g.e, 0x01, 11, 7);
+    x64_load(&mut g.e, 11, 11, 0, 8, true);
+    x64_load(&mut g.e, 11, 11, 0, 8, true);
+    x64_load(&mut g.e, 9, 5, 16, 8, true);
+    var j: i64 = 0;
+    while j < 6 {
+        x64_load(&mut g.e, 0, 5, 24 + 8 * j, 8, true);
+        x64_store(&mut g.e, 0, 4, 32 + 8 * j, 8);
+        j = j + 1;
+    }
+    x64_mov(&mut g.e, 8, 1);
+    x64_mov(&mut g.e, 1, 6);
+    x64_call_r(&mut g.e, 11);
+    x64_mov(&mut g.e, 7, 0);
+    x64_mov(&mut g.e, 4, 5);
+    x64_pop(&mut g.e, 5);
+    x64_ret(&mut g.e);
+
+    // A thread's start routine (Windows: rcx = its parameter):
+    // pe_win_thread_main(env 0, parameter), which never returns
+    var tramp: i64 = NatEnc_label(&mut g.e);
+    NatEnc_align(&mut g.e, 4);
+    NatEnc_place(&mut g.e, tramp);
+    x64_li(&mut g.e, 5, 0);
+    x64_mov(&mut g.e, 6, 1);
+    x64_li(&mut g.e, 7, 0);
+    x64_call(&mut g.e, ng_fn_label(g, "pe_win_thread_main"));
+    x64_ud2(&mut g.e);
+    ng_prim(g, "nat_win_tramp");
+    x64_lea_label(&mut g.e, 7, tramp); x64_ret(&mut g.e);
+
+    // The thread pointer: TLS slot [win_tls] of the TEB (gs:[0x30] is the
+    // TEB's own address, its TlsSlots at +0x1480)
+    ng_prim(g, "nat_tls_get");
+    x64_load_label(&mut g.e, 10, g.win_tls_label);
+    x64_shift_imm(&mut g.e, 4, 10, 3);
+    x64_load_gs(&mut g.e, 11, 48);
+    x64_alu(&mut g.e, 0x01, 11, 10);
+    x64_load(&mut g.e, 7, 11, 0x1480, 8, true);
+    x64_ret(&mut g.e);
+    ng_prim(g, "nat_tls_set");
+    x64_load_label(&mut g.e, 10, g.win_tls_label);
+    x64_shift_imm(&mut g.e, 4, 10, 3);
+    x64_load_gs(&mut g.e, 11, 48);
+    x64_alu(&mut g.e, 0x01, 11, 10);
+    x64_store(&mut g.e, 7, 11, 0x1480, 8);
+    x64_ret(&mut g.e);
+
+    // The vectored exception handler (rcx = EXCEPTION_POINTERS): a frame
+    // record for the faulting function (its rbp and rip from the CONTEXT),
+    // so the trace walks the program's frames, then
+    // pe_win_on_exception(env 0, pointers): 0 continue the search, -1
+    // continue execution
+    var veh: i64 = NatEnc_label(&mut g.e);
+    NatEnc_align(&mut g.e, 4);
+    NatEnc_place(&mut g.e, veh);
+    x64_push(&mut g.e, 5);
+    x64_push(&mut g.e, 7);
+    x64_push(&mut g.e, 6);
+    x64_mov(&mut g.e, 6, 1);
+    x64_load(&mut g.e, 0, 1, 8, 8, true);
+    x64_load(&mut g.e, 10, 0, 0xF8, 8, true);
+    x64_load(&mut g.e, 11, 0, 0xA0, 8, true);
+    x64_push(&mut g.e, 10);
+    x64_push(&mut g.e, 11);
+    x64_mov(&mut g.e, 5, 4);
+    x64_li(&mut g.e, 7, 0);
+    x64_call(&mut g.e, ng_fn_label(g, "pe_win_on_exception"));
+    x64_mov(&mut g.e, 0, 7);
+    x64_add_imm(&mut g.e, 4, 16);
+    x64_pop(&mut g.e, 6);
+    x64_pop(&mut g.e, 7);
+    x64_pop(&mut g.e, 5);
+    x64_ret(&mut g.e);
+    ng_prim(g, "nat_sig_handler");
+    x64_lea_label(&mut g.e, 7, veh); x64_ret(&mut g.e);
+    ng_prim(g, "nat_sig_restorer");
+    x64_li(&mut g.e, 7, 0); x64_ret(&mut g.e);
+}
+
+/// The import directory, the import lookup and address tables, the names,
+/// then the table of slot addresses nat_win_call reads and the TLS index.
+fn ng_gen_win_imports(g: &mut NatGen) {
+    var imps: Vec<str> = ng_win_imports();
+    var dlls: Vec<str> = Vec::new();
+    var fdll: Vec<i64> = Vec::new();
+    var fname: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < imps.len() {
+        var e: str = imps.get(i);
+        var bar: i64 = str_find(e, "|");
+        var dn: str = str_slice(e, 0, bar);
+        fname.push(str_slice(e, bar + 1, str_len(e)));
+        var di: i64 = 0 - 1;
+        var k: i64 = 0;
+        while k < dlls.len() { if dlls.get(k) == dn { di = k; } k = k + 1; }
+        if di < 0 { dlls.push(dn); di = dlls.len() - 1; }
+        fdll.push(di);
+        i = i + 1;
+    }
+    var ilt: Vec<i64> = Vec::new();
+    var iat: Vec<i64> = Vec::new();
+    var dname: Vec<i64> = Vec::new();
+    var hint: Vec<i64> = Vec::new();
+    var d: i64 = 0;
+    while d < dlls.len() {
+        ilt.push(NatEnc_label(&mut g.e));
+        iat.push(NatEnc_label(&mut g.e));
+        dname.push(NatEnc_label(&mut g.e));
+        d = d + 1;
+    }
+    i = 0;
+    while i < imps.len() { hint.push(NatEnc_label(&mut g.e)); i = i + 1; }
+    NatEnc_align(&mut g.e, 8);
+    NatEnc_place(&mut g.e, g.win_imp_label);
+    d = 0;
+    while d < dlls.len() {
+        NatEnc_rva32(&mut g.e, ilt.get(d));
+        NatEnc_u32(&mut g.e, 0);
+        NatEnc_u32(&mut g.e, 0);
+        NatEnc_rva32(&mut g.e, dname.get(d));
+        NatEnc_rva32(&mut g.e, iat.get(d));
+        d = d + 1;
+    }
+    var z: i64 = 0;
+    while z < 5 { NatEnc_u32(&mut g.e, 0); z = z + 1; }
+    NatEnc_place(&mut g.e, g.win_imp_end);
+    // The lookup table, then the address table (the loader fills it)
+    var pass: i64 = 0;
+    while pass < 2 {
+        NatEnc_align(&mut g.e, 8);
+        if pass == 1 { NatEnc_place(&mut g.e, g.win_iat_label); }
+        d = 0;
+        while d < dlls.len() {
+            if pass == 0 { NatEnc_place(&mut g.e, ilt.get(d)); } else { NatEnc_place(&mut g.e, iat.get(d)); }
+            i = 0;
+            while i < imps.len() {
+                if fdll.get(i) == d {
+                    if pass == 1 { NatEnc_place(&mut g.e, g.win_slot_labels.get(i)); }
+                    NatEnc_rva32(&mut g.e, hint.get(i));
+                    NatEnc_u32(&mut g.e, 0);
+                }
+                i = i + 1;
+            }
+            NatEnc_quad(&mut g.e, 0);
+            d = d + 1;
+        }
+        if pass == 1 { NatEnc_place(&mut g.e, g.win_iat_end); }
+        pass = pass + 1;
+    }
+    i = 0;
+    while i < imps.len() {
+        NatEnc_align(&mut g.e, 2);
+        NatEnc_place(&mut g.e, hint.get(i));
+        NatEnc_byte(&mut g.e, 0);
+        NatEnc_byte(&mut g.e, 0);
+        var nm: str = fname.get(i);
+        var c: i64 = 0;
+        while c < str_len(nm) { NatEnc_byte(&mut g.e, str_byte_at(nm, c)); c = c + 1; }
+        NatEnc_byte(&mut g.e, 0);
+        i = i + 1;
+    }
+    d = 0;
+    while d < dlls.len() {
+        NatEnc_place(&mut g.e, dname.get(d));
+        var dn2: str = dlls.get(d);
+        var c2: i64 = 0;
+        while c2 < str_len(dn2) { NatEnc_byte(&mut g.e, str_byte_at(dn2, c2)); c2 = c2 + 1; }
+        NatEnc_byte(&mut g.e, 0);
+        d = d + 1;
+    }
+    NatEnc_align(&mut g.e, 8);
+    NatEnc_place(&mut g.e, g.win_slots_label);
+    i = 0;
+    while i < imps.len() {
+        NatEnc_fix(&mut g.e, g.win_slot_labels.get(i), NATFIX_ABS64);
+        NatEnc_quad(&mut g.e, 0);
+        i = i + 1;
+    }
+    NatEnc_place(&mut g.e, g.win_tls_label);
+    NatEnc_quad(&mut g.e, 0);
 }
 
 fn NatEnc_label_offset(e: &NatEnc, label: i64) -> i64 {

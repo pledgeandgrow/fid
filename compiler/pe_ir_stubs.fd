@@ -369,6 +369,60 @@ pub fn pe_stub_deps() -> Vec<PeirStrPair> {
     v.push(PeirStrPair { a: "p_co_async", b: "pert_co_async_v" });
     // The C-convention thread start routine runs pert_thread_main(arg)
     v.push(PeirStrPair { a: "pe_thread_entry_addr", b: "pert_thread_main" });
+    // The task context switch and the trampoline a new task starts in (RT9)
+    v.push(PeirStrPair { a: "pe_ctx_swap", b: "pe_ctx_switch" });
+    v.push(PeirStrPair { a: "pe_ctx_tramp_addr", b: "pe_ctx_new" });
+    return v;
+}
+
+/// Task context switch (competitive RT9), C convention:
+/// pe_ctx_swap(save, sp) pushes the callee-saved registers, xmm6-15 and the
+/// TEB's StackBase, StackLimit and DeallocationStack, stores rsp at `save`,
+/// switches to `sp`, clears the busy word of the context it left (`save`
+/// + 16: its registers are saved, another thread may resume it) and pops what
+/// was pushed there. The TEB fields make the
+/// system grow a task's stack and report its overflow as for a thread's.
+/// A new context starts in the trampoline: rcx = r12, call r13.
+/// (src/pe.rs has the same bytes.)
+fn pe_ctx_swap_code() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(0x55); v.push(0x53); v.push(0x57); v.push(0x56); v.push(0x41); v.push(0x54); v.push(0x41); v.push(0x55); v.push(0x41); v.push(0x56); v.push(0x41); v.push(0x57);
+    v.push(0x48); v.push(0x81); v.push(0xEC); v.push(0xB8); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0xF3); v.push(0x0F); v.push(0x7F); v.push(0xB4); v.push(0x24);
+    v.push(0x00); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0xF3); v.push(0x0F); v.push(0x7F); v.push(0xBC); v.push(0x24); v.push(0x10); v.push(0x00); v.push(0x00);
+    v.push(0x00); v.push(0xF3); v.push(0x44); v.push(0x0F); v.push(0x7F); v.push(0x84); v.push(0x24); v.push(0x20); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0xF3);
+    v.push(0x44); v.push(0x0F); v.push(0x7F); v.push(0x8C); v.push(0x24); v.push(0x30); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0xF3); v.push(0x44); v.push(0x0F);
+    v.push(0x7F); v.push(0x94); v.push(0x24); v.push(0x40); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0xF3); v.push(0x44); v.push(0x0F); v.push(0x7F); v.push(0x9C);
+    v.push(0x24); v.push(0x50); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0xF3); v.push(0x44); v.push(0x0F); v.push(0x7F); v.push(0xA4); v.push(0x24); v.push(0x60);
+    v.push(0x00); v.push(0x00); v.push(0x00); v.push(0xF3); v.push(0x44); v.push(0x0F); v.push(0x7F); v.push(0xAC); v.push(0x24); v.push(0x70); v.push(0x00); v.push(0x00);
+    v.push(0x00); v.push(0xF3); v.push(0x44); v.push(0x0F); v.push(0x7F); v.push(0xB4); v.push(0x24); v.push(0x80); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0xF3);
+    v.push(0x44); v.push(0x0F); v.push(0x7F); v.push(0xBC); v.push(0x24); v.push(0x90); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0x65); v.push(0x48); v.push(0x8B);
+    v.push(0x04); v.push(0x25); v.push(0x08); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0x48); v.push(0x89); v.push(0x84); v.push(0x24); v.push(0xA0); v.push(0x00);
+    v.push(0x00); v.push(0x00); v.push(0x65); v.push(0x48); v.push(0x8B); v.push(0x04); v.push(0x25); v.push(0x10); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0x48);
+    v.push(0x89); v.push(0x84); v.push(0x24); v.push(0xA8); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0x65); v.push(0x48); v.push(0x8B); v.push(0x04); v.push(0x25);
+    v.push(0x78); v.push(0x14); v.push(0x00); v.push(0x00); v.push(0x48); v.push(0x89); v.push(0x84); v.push(0x24); v.push(0xB0); v.push(0x00); v.push(0x00); v.push(0x00);
+    v.push(0x48); v.push(0x89); v.push(0x21); v.push(0x48); v.push(0x89); v.push(0xD4); v.push(0x48); v.push(0xC7); v.push(0x41); v.push(0x10); v.push(0x00); v.push(0x00);
+    v.push(0x00); v.push(0x00); v.push(0x48); v.push(0x8B); v.push(0x84); v.push(0x24); v.push(0xA0); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0x65); v.push(0x48);
+    v.push(0x89); v.push(0x04); v.push(0x25); v.push(0x08); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0x48); v.push(0x8B); v.push(0x84); v.push(0x24); v.push(0xA8);
+    v.push(0x00); v.push(0x00); v.push(0x00); v.push(0x65); v.push(0x48); v.push(0x89); v.push(0x04); v.push(0x25); v.push(0x10); v.push(0x00); v.push(0x00); v.push(0x00);
+    v.push(0x48); v.push(0x8B); v.push(0x84); v.push(0x24); v.push(0xB0); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0x65); v.push(0x48); v.push(0x89); v.push(0x04);
+    v.push(0x25); v.push(0x78); v.push(0x14); v.push(0x00); v.push(0x00); v.push(0xF3); v.push(0x0F); v.push(0x6F); v.push(0xB4); v.push(0x24); v.push(0x00); v.push(0x00);
+    v.push(0x00); v.push(0x00); v.push(0xF3); v.push(0x0F); v.push(0x6F); v.push(0xBC); v.push(0x24); v.push(0x10); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0xF3);
+    v.push(0x44); v.push(0x0F); v.push(0x6F); v.push(0x84); v.push(0x24); v.push(0x20); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0xF3); v.push(0x44); v.push(0x0F);
+    v.push(0x6F); v.push(0x8C); v.push(0x24); v.push(0x30); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0xF3); v.push(0x44); v.push(0x0F); v.push(0x6F); v.push(0x94);
+    v.push(0x24); v.push(0x40); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0xF3); v.push(0x44); v.push(0x0F); v.push(0x6F); v.push(0x9C); v.push(0x24); v.push(0x50);
+    v.push(0x00); v.push(0x00); v.push(0x00); v.push(0xF3); v.push(0x44); v.push(0x0F); v.push(0x6F); v.push(0xA4); v.push(0x24); v.push(0x60); v.push(0x00); v.push(0x00);
+    v.push(0x00); v.push(0xF3); v.push(0x44); v.push(0x0F); v.push(0x6F); v.push(0xAC); v.push(0x24); v.push(0x70); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0xF3);
+    v.push(0x44); v.push(0x0F); v.push(0x6F); v.push(0xB4); v.push(0x24); v.push(0x80); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0xF3); v.push(0x44); v.push(0x0F);
+    v.push(0x6F); v.push(0xBC); v.push(0x24); v.push(0x90); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0x48); v.push(0x81); v.push(0xC4); v.push(0xB8); v.push(0x00);
+    v.push(0x00); v.push(0x00); v.push(0x41); v.push(0x5F); v.push(0x41); v.push(0x5E); v.push(0x41); v.push(0x5D); v.push(0x41); v.push(0x5C); v.push(0x5E); v.push(0x5F);
+    v.push(0x5B); v.push(0x5D); v.push(0xC3);
+    return v;
+}
+
+fn pe_ctx_tramp_code() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(0x4C); v.push(0x89); v.push(0xE1); v.push(0x48); v.push(0x83); v.push(0xE4); v.push(0xF0); v.push(0x48); v.push(0x83); v.push(0xEC); v.push(0x20); v.push(0x41);
+    v.push(0xFF); v.push(0xD5); v.push(0x0F); v.push(0x0B);
     return v;
 }
 
@@ -6516,6 +6570,22 @@ pub fn PeirGen_gen_pe_primitives(self: &mut PeirGen) -> void {
         PeirEnc_ret(&mut self.enc);
         PeirGen_place_fn(self, "pe_thread_entry_addr");
         PeirEnc_lea_label(&mut self.enc, PEIR_RAX, entry);
+        PeirEnc_ret(&mut self.enc);
+    }
+
+    // Task context switch and the trampoline a new task starts in (RT9)
+    if HashMap_contains(self.func_labels, "pe_ctx_swap") {
+        PeirEnc_align_to(&mut self.enc, 16);
+        PeirGen_place_fn(self, "pe_ctx_swap");
+        PeirEnc_emit(&mut self.enc, pe_ctx_swap_code());
+    }
+    if HashMap_contains(self.func_labels, "pe_ctx_tramp_addr") {
+        var tramp: i64 = PeirEnc_alloc_label(&mut self.enc);
+        PeirEnc_align_to(&mut self.enc, 16);
+        PeirEnc_place_label(&mut self.enc, tramp);
+        PeirEnc_emit(&mut self.enc, pe_ctx_tramp_code());
+        PeirGen_place_fn(self, "pe_ctx_tramp_addr");
+        PeirEnc_lea_label(&mut self.enc, PEIR_RAX, tramp);
         PeirEnc_ret(&mut self.enc);
     }
 

@@ -33,6 +33,8 @@ extern "C" {
     fn nat_fn_names() -> i64;
     fn nat_sig_handler() -> i64;
     fn nat_fma(a: i64, b: i64, c: i64) -> i64;
+    fn nat_sig_restorer() -> i64;
+    fn nat_arch() -> i64;
 }
 
 // Linux system calls (asm-generic/unistd.h)
@@ -333,7 +335,8 @@ pub fn pert_exit(code: i64) {
 // The thread pointer (nat_tls_get) holds the thread's block: [0] the task
 // running on it, [8] its signal stack, [16, 24) its stack's guard region,
 // [32] its table of TLS keys, [40] its stack, [48] the stack's size, [56]
-// scratch for the scheduler.
+// scratch for the scheduler, [64] its own address (x86-64 reads the block
+// through fs: fs:[64]).
 
 const PE_SYS_FUTEX: i64 = 98;
 const PE_SYS_SIGALTSTACK: i64 = 132;
@@ -342,8 +345,9 @@ const PE_SYS_MPROTECT: i64 = 226;
 const PE_GUARD: i64 = 65536;
 
 fn pe_tls_new(glo: i64, ghi: i64) -> i64 {
-    var t: i64 = pert_malloc(64);
-    pe_zero(t, 64);
+    var t: i64 = pert_malloc(80);
+    pe_zero(t, 80);
+    pe_st(t + 64, t);
     pe_st(t + 16, glo);
     pe_st(t + 24, ghi);
     return t;
@@ -413,6 +417,12 @@ fn pe_sig_install(sig: i64) -> i64 {
     pe_zero(act, 32);
     pe_st(act, nat_sig_handler());
     pe_st(act + 8, 134217732);        // SA_SIGINFO | SA_ONSTACK
+    // x86-64 returns from a handler through the restorer it is given
+    var restorer: i64 = nat_sig_restorer();
+    if restorer != 0 {
+        pe_st(act + 8, 134217732 | 67108864);     // | SA_RESTORER
+        pe_st(act + 16, restorer);
+    }
     var r: i64 = nat_syscall(PE_SYS_RT_SIGACTION, sig, act, 0, 8, 0, 0);
     pert_free(act);
     return r;
@@ -439,10 +449,32 @@ fn pe_eprint_int(v: i64) {
     pe_write_all(2, pe_sigbuf, n);
 }
 
+/// `0x` and v in lowercase hex on stderr (as C's %p), allocating nothing.
+fn pe_eprint_hex(v: i64) {
+    pe_stb(pe_sigbuf, 48);
+    pe_stb(pe_sigbuf + 1, 120);
+    var n: i64 = 2;
+    var started: bool = false;
+    var i: i64 = 15;
+    while i >= 0 {
+        var d: i64 = (v >> (i * 4)) & 15;
+        if d != 0 || started || i == 0 {
+            started = true;
+            if d < 10 { pe_stb(pe_sigbuf + n, 48 + d); } else { pe_stb(pe_sigbuf + n, 87 + d); }
+            n = n + 1;
+        }
+        i = i - 1;
+    }
+    pe_write_all(2, pe_sigbuf, n);
+}
+
 /// The signal handler (nat_sig_handler): a registered signal is noted
-/// (p_signal_check); anything else is a crash, reported as the C backend
-/// does (a stack overflow when the address is in a guard region), with
-/// the trace, then the exit status 128 + sig. Allocates nothing.
+/// (p_signal_check); anything else is a panic like any other (reference
+/// §8.2, the same text on every backend): "Panic: Stack overflow" when the
+/// address is in a guard region, "Panic: Invalid memory access (null or
+/// dangling pointer) at 0x..." for another SIGSEGV or SIGBUS, else
+/// "Panic: signal N (NAME)"; then the trace and exit status 1. Allocates
+/// nothing.
 pub fn pe_on_signal(sig: i64, info: i64) {
     if sig >= 0 && sig < 64 && pe_sig_flags != 0 && pe_ld(pe_sig_flags + 512 + sig * 8) != 0 {
         pe_st(pe_sig_flags + sig * 8, 1);
@@ -468,18 +500,20 @@ pub fn pe_on_signal(sig: i64, info: i64) {
         }
     }
     if over {
-        pert_eprint_str("\nStack overflow: the recursion is too deep\n" as i64);
+        pert_eprint_str("Panic: Stack overflow\n" as i64);
+    } else if sig == 11 || sig == 7 {
+        pert_eprint_str("Panic: Invalid memory access (null or dangling pointer) at " as i64);
+        pe_eprint_hex(addr);
+        pert_eprint_str("\n" as i64);
     } else {
-        pert_eprint_str("\n=== CRASH: signal " as i64);
+        pert_eprint_str("Panic: signal " as i64);
         pe_eprint_int(sig);
-        if sig == 11 { pert_eprint_str(" (SIGSEGV) ===\n" as i64); }
-        else if sig == 7 { pert_eprint_str(" (SIGBUS) ===\n" as i64); }
-        else if sig == 6 { pert_eprint_str(" (SIGABRT) ===\n" as i64); }
-        else if sig == 8 { pert_eprint_str(" (SIGFPE) ===\n" as i64); }
-        else { pert_eprint_str(" (UNKNOWN) ===\n" as i64); }
+        if sig == 6 { pert_eprint_str(" (SIGABRT)\n" as i64); }
+        else if sig == 8 { pert_eprint_str(" (SIGFPE)\n" as i64); }
+        else { pert_eprint_str(" (UNKNOWN)\n" as i64); }
     }
     pe_trace_from(nat_frame_fp());
-    pe_sys(PE_SYS_EXIT_GROUP, 128 + sig, 0, 0);
+    pe_sys(PE_SYS_EXIT_GROUP, 1, 0, 0);
 }
 
 /// A runtime function's name (pe_, pert_, nat_): not shown in traces.

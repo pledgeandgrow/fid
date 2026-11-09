@@ -285,7 +285,10 @@ fn pe_join(idx: i64) -> i64 {
 // pointer, [15] its stack (the guard region at its bottom), [16] the next
 // task in the run queue, [19] when its sleep ends (ms, 0: not sleeping),
 // [20] detached (freed once done), [21] the stack pointer of whoever
-// entered it last (where it goes back to).
+// entered it last (where it goes back to); a socket wait (epoll, below):
+// [17] its fd + 1 while the task asks to wait, [18] 1 to wait for writing
+// (+ 2 when it has a deadline), [22] the wait's token while it is armed,
+// [23] the token's generation, [24] how the wait ended.
 // A future of a task is its block with the tag 0x7FA5 in the top 16 bits.
 // The run queue is one list under pe_q_lock; pe_q_seq is the futex idle
 // workers sleep on, pe_done_seq the one waiters for a finished task do.
@@ -313,6 +316,9 @@ fn pe_co_init() {
         pe_co_total = pe_zeroed(1);
         pe_workers = pe_zeroed(1);
         pe_q_lock = pe_zeroed(1);
+        pe_ep_lock = pe_zeroed(1);
+        pe_ep_n = pe_zeroed(1);
+        pe_ep_polling = pe_zeroed(1);
     }
 }
 
@@ -340,6 +346,7 @@ fn pe_q_push(t: i64) {
     if nat_atomic_load(pe_q_idle) > 0 {
         pe_futex_wake(pe_q_seq, 1);
     }
+    pe_ep_poke();
 }
 
 /// A queued task that is not sleeping, taken off the queue; 0 if none.
@@ -414,9 +421,16 @@ pub fn pe_worker_main(id: i64) -> i64 {
                 if ms < 1 { ms = 1; }
                 if ms > 50 { ms = 50; }
             }
-            nat_atomic_add(pe_q_idle, 1);
-            pe_futex_wait(pe_q_seq, seen & 4294967295, ms, true);
-            nat_atomic_add(pe_q_idle, 0 - 1);
+            // One idle worker waits on the sockets tasks wait for (an
+            // eventfd wakes it for new work), the others on the queue
+            if nat_atomic_load(pe_ep_n) > 0 && nat_atomic_cas(pe_ep_polling, 0, 1) != 0 {
+                pe_ep_poll(ms);
+                nat_atomic_store(pe_ep_polling, 0);
+            } else {
+                nat_atomic_add(pe_q_idle, 1);
+                pe_futex_wait(pe_q_seq, seen & 4294967295, ms, true);
+                nat_atomic_add(pe_q_idle, 0 - 1);
+            }
         }
     }
     return 0;
@@ -490,10 +504,14 @@ fn pe_co_finish(t: i64) {
     }
 }
 
-/// After entering t: finished, or back on the queue.
+/// After entering t: finished, waiting for a socket (registered now that it
+/// is off its stack, so a wake cannot resume it before it has left), or
+/// back on the queue.
 fn pe_co_after(t: i64) {
     if nat_atomic_load(t + 80) != 0 {
         pe_co_finish(t);
+    } else if pe_ld(t + 136) != 0 {
+        pe_ep_park(t);
     } else {
         pe_q_push(t);
     }
@@ -638,12 +656,308 @@ pub fn pert_co_result(t: i64) -> i64 {
     return pe_ld((t & 0xFFFFFFFFFFFF) + 88);
 }
 
+// ─── Socket waits: epoll (competitive RT11) ─────────────────────────────
+// A task waiting for a socket asks for the wait ([17], [18]) and gives
+// control back; the thread it left registers the socket with epoll
+// (pe_ep_park) and does not requeue it. An idle worker waits in
+// epoll_pwait (pe_ep_poll) and requeues the task its socket is ready for:
+// a wait costs the same with one socket or 100,000, where polling each one
+// on every turn did not. The table holds, for each fd, the task waiting to
+// read and the one waiting to write (block | generation << 48); a token
+// claimed by compare-and-swap ([22]) wakes the task once, whichever of its
+// socket and its deadline comes first. Without epoll, the old loop (ppoll,
+// give control back) is the wait.
+
+const PE_SYS_EVENTFD2: i64 = 19;
+const PE_SYS_EPOLL_CREATE1: i64 = 20;
+const PE_SYS_EPOLL_CTL: i64 = 21;
+const PE_SYS_EPOLL_PWAIT: i64 = 22;
+const PE_EP_WAKE_DATA: i64 = 2147483647;    // the eventfd's event
+
+var pe_ep: i64 = 0;            // the epoll fd; 0 not yet, -1 none
+var pe_ep_efd: i64 = 0;        // the eventfd that ends the poller's wait
+var pe_ep_lock: i64 = 0;       // *i64: the table and the epoll set
+var pe_ep_tab: i64 = 0;        // fd * 16: reader token, writer token
+var pe_ep_cap: i64 = 0;        // fds the table holds
+var pe_ep_n: i64 = 0;          // *i64: armed waits
+var pe_ep_polling: i64 = 0;    // *i64: 1 while a worker waits in epoll
+var pe_ep_buf: i64 = 0;        // the poller's events
+
+/// epoll and its eventfd, once (under pe_ep_lock): false when the kernel
+/// has none.
+fn pe_ep_ready() -> bool {
+    if pe_ep != 0 { return pe_ep > 0; }
+    var ep: i64 = pe_sys(PE_SYS_EPOLL_CREATE1, 524288, 0, 0);     // EPOLL_CLOEXEC
+    var efd: i64 = pe_sys(PE_SYS_EVENTFD2, 0, 526336, 0);          // EFD_CLOEXEC | EFD_NONBLOCK
+    if ep < 0 || efd < 0 {
+        pe_ep = 0 - 1;
+        return false;
+    }
+    pe_ep_buf = pe_zeroed(64 * 2);
+    var ev: i64 = pe_zeroed(2);
+    pe_ep_event(ev, 1, PE_EP_WAKE_DATA);
+    if pe_sys4(PE_SYS_EPOLL_CTL, ep, 1, efd, ev) < 0 {             // EPOLL_CTL_ADD
+        pe_ep = 0 - 1;
+        return false;
+    }
+    pert_free(ev);
+    pe_ep_efd = efd;
+    pe_ep = ep;
+    return true;
+}
+
+fn pe_sys4(n: i64, a: i64, b: i64, c: i64, d: i64) -> i64 {
+    return nat_syscall(n, a, b, c, d, 0, 0);
+}
+
+/// An epoll_event: packed (12 bytes) on x86-64, 16 on AArch64 and RISC-V.
+fn pe_ep_event(ev: i64, events: i64, data: i64) {
+    if nat_arch() == 3 {
+        pe_st(ev, (events & 4294967295) | ((data & 4294967295) << 32));
+        pe_st(ev + 8, (data >> 32) & 4294967295);
+    } else {
+        pe_st(ev, events & 4294967295);
+        pe_st(ev + 8, data);
+    }
+}
+
+/// The events and data of entry i of the poller's buffer.
+fn pe_ep_entry(i: i64, out: i64) {
+    if nat_arch() == 3 {
+        var e: i64 = pe_ep_buf + i * 12;
+        var w: i64 = pe_ld(e);
+        pe_st(out, w & 4294967295);
+        pe_st(out + 8, ((w >> 32) & 4294967295) | ((pe_ld(e + 8) & 4294967295) << 32));
+    } else {
+        var e2: i64 = pe_ep_buf + i * 16;
+        pe_st(out, pe_ld(e2) & 4294967295);
+        pe_st(out + 8, pe_ld(e2 + 8));
+    }
+}
+
+/// Bring the epoll registration of fd in line with its two slots (under
+/// pe_ep_lock): false when the kernel refused it.
+fn pe_ep_sync(fd: i64) -> bool {
+    var rd: i64 = pe_ld(pe_ep_tab + fd * 16);
+    var wr: i64 = pe_ld(pe_ep_tab + fd * 16 + 8);
+    var events: i64 = 0;
+    if rd != 0 { events = events | 1 | 8192; }      // EPOLLIN | EPOLLRDHUP
+    if wr != 0 { events = events | 4; }             // EPOLLOUT
+    var ev: i64 = pe_zeroed(2);
+    pe_ep_event(ev, events, fd);
+    var ok: bool = true;
+    if events == 0 {
+        pe_sys4(PE_SYS_EPOLL_CTL, pe_ep, 2, fd, ev);                // DEL
+    } else if pe_sys4(PE_SYS_EPOLL_CTL, pe_ep, 3, fd, ev) < 0 {     // MOD
+        if pe_sys4(PE_SYS_EPOLL_CTL, pe_ep, 1, fd, ev) < 0 {        // ADD
+            ok = false;
+        }
+    }
+    pert_free(ev);
+    return ok;
+}
+
+/// Wake the task of a claimed token: its wait ended with the socket ready.
+fn pe_ep_wake(token: i64) {
+    var t: i64 = token & 281474976710655;
+    if nat_atomic_cas(t + 176, token, 0) == 0 {
+        return;     // its deadline came first
+    }
+    nat_atomic_add(pe_ep_n, 0 - 1);
+    pe_st(t + 192, 1);
+    if (pe_ld(t + 144) & 2) != 0 {
+        // on the queue as a sleeper: due now
+        nat_atomic_store(t + 152, 1);
+        nat_atomic_add(pe_q_seq, 1);
+        pe_futex_wake(pe_q_seq, 1);
+    } else {
+        pe_q_push(t);
+    }
+}
+
+/// Register the socket task t asked to wait for (t is off its stack).
+fn pe_ep_park(t: i64) {
+    var fd: i64 = pe_ld(t + 136) - 1;
+    var w: i64 = pe_ld(t + 144) & 1;
+    var timed: bool = (pe_ld(t + 144) & 2) != 0;
+    pe_st(t + 136, 0);
+    var gen: i64 = (pe_ld(t + 184) + 1) & 65535;
+    if gen == 0 { gen = 1; }
+    pe_st(t + 184, gen);
+    var token: i64 = t | (gen << 48);
+    var armed: bool = false;
+    pe_lock(pe_ep_lock);
+    if pe_ep_ready() && fd >= 0 && fd < 1048576 {
+        if fd >= pe_ep_cap {
+            var cap: i64 = pe_ep_cap * 2;
+            if cap < 64 { cap = 64; }
+            while cap <= fd { cap = cap * 2; }
+            var tab: i64 = pe_zeroed(cap * 2);
+            var i: i64 = 0;
+            while i < pe_ep_cap * 2 {
+                pe_st(tab + i * 8, pe_ld(pe_ep_tab + i * 8));
+                i = i + 1;
+            }
+            if pe_ep_tab != 0 { pert_free(pe_ep_tab); }
+            pe_ep_tab = tab;
+            pe_ep_cap = cap;
+        }
+        var slot: i64 = pe_ep_tab + fd * 16 + w * 8;
+        if pe_ld(slot) == 0 {
+            pe_st(slot, token);
+            nat_atomic_store(t + 176, token);
+            if pe_ep_sync(fd) {
+                armed = true;
+                nat_atomic_add(pe_ep_n, 1);
+            } else {
+                pe_st(slot, 0);
+                nat_atomic_store(t + 176, 0);
+            }
+        }
+    }
+    pe_unlock(pe_ep_lock);
+    if !armed {
+        // a second waiter the same way, a file epoll refuses, no epoll:
+        // the task polls for itself
+        pe_st(t + 192, 2);
+        pe_q_push(t);
+        return;
+    }
+    if timed {
+        pe_q_push(t);       // a sleeper until its deadline, or due at its event
+    } else {
+        pe_ep_poke();       // a waiting poller sees the new socket at once
+    }
+}
+
+/// A new task or socket while a worker sits in epoll_pwait: end its wait.
+fn pe_ep_poke() {
+    if pe_ep_polling != 0 && nat_atomic_load(pe_ep_polling) != 0 && pe_ep > 0 {
+        var one: i64 = pe_zeroed(1);
+        pe_st(one, 1);
+        pe_sys(PE_SYS_WRITE, pe_ep_efd, one, 8);
+        pert_free(one);
+    }
+}
+
+/// Wait at most ms for sockets; wake the tasks of those that are ready.
+fn pe_ep_poll(ms: i64) {
+    if pe_ep <= 0 { return; }
+    var k: i64 = nat_syscall(PE_SYS_EPOLL_PWAIT, pe_ep, pe_ep_buf, 64, ms, 0, 8);
+    var e: i64 = pe_zeroed(2);
+    var woke: i64 = pe_zeroed(2 * 64);
+    var nw: i64 = 0;
+    var i: i64 = 0;
+    pe_lock(pe_ep_lock);
+    while i < k {
+        pe_ep_entry(i, e);
+        var events: i64 = pe_ld(e);
+        var fd: i64 = pe_ld(e + 8);
+        if fd == PE_EP_WAKE_DATA {
+            var drain: i64 = pe_zeroed(1);
+            pe_sys(PE_SYS_READ, pe_ep_efd, drain, 8);
+            pert_free(drain);
+        } else if fd >= 0 && fd < pe_ep_cap {
+            var rd: i64 = pe_ld(pe_ep_tab + fd * 16);
+            var wr: i64 = pe_ld(pe_ep_tab + fd * 16 + 8);
+            var changed: bool = false;
+            // readable, hung up, an error: the reader; writable, hung up,
+            // an error: the writer
+            if rd != 0 && (events & (1 | 8 | 16 | 8192)) != 0 {
+                pe_st(pe_ep_tab + fd * 16, 0);
+                pe_st(woke + nw * 8, rd);
+                nw = nw + 1;
+                changed = true;
+            }
+            if wr != 0 && (events & (4 | 8 | 16)) != 0 {
+                pe_st(pe_ep_tab + fd * 16 + 8, 0);
+                pe_st(woke + nw * 8, wr);
+                nw = nw + 1;
+                changed = true;
+            }
+            if changed { pe_ep_sync(fd); }
+        }
+        i = i + 1;
+    }
+    pe_unlock(pe_ep_lock);
+    i = 0;
+    while i < nw {
+        pe_ep_wake(pe_ld(woke + i * 8));
+        i = i + 1;
+    }
+    pert_free(woke);
+    pert_free(e);
+}
+
+/// The task's wait is over (it runs again): 1 its socket is ready, 0 its
+/// deadline came first (the registration is taken back), -1 it was never
+/// armed (wait the old way).
+fn pe_ep_done(t: i64, fd: i64, w: i64) -> i64 {
+    var how: i64 = pe_ld(t + 192);
+    pe_st(t + 192, 0);
+    if how == 2 { return 0 - 1; }
+    var token: i64 = nat_atomic_load(t + 176);
+    if token != 0 && nat_atomic_cas(t + 176, token, 0) != 0 {
+        nat_atomic_add(pe_ep_n, 0 - 1);
+        pe_lock(pe_ep_lock);
+        var slot: i64 = pe_ep_tab + fd * 16 + w * 8;
+        if fd < pe_ep_cap && pe_ld(slot) == token {
+            pe_st(slot, 0);
+            pe_ep_sync(fd);
+        }
+        pe_unlock(pe_ep_lock);
+        return 0;
+    }
+    return 1;
+}
+
+/// A socket is being closed: wake whoever waits for it (their next call
+/// on it reports the error) and forget it.
+fn pe_ep_forget(fd: i64) {
+    if pe_ep <= 0 || pe_ep_lock == 0 || fd < 0 { return; }
+    pe_lock(pe_ep_lock);
+    var rd: i64 = 0;
+    var wr: i64 = 0;
+    if fd < pe_ep_cap {
+        rd = pe_ld(pe_ep_tab + fd * 16);
+        wr = pe_ld(pe_ep_tab + fd * 16 + 8);
+        if rd != 0 || wr != 0 {
+            pe_st(pe_ep_tab + fd * 16, 0);
+            pe_st(pe_ep_tab + fd * 16 + 8, 0);
+            pe_ep_sync(fd);
+        }
+    }
+    pe_unlock(pe_ep_lock);
+    if rd != 0 { pe_ep_wake(rd); }
+    if wr != 0 { pe_ep_wake(wr); }
+}
+
 /// Wait until fd is readable (or writable): 1, or 0 when `timeout_ms`
 /// (>= 0) passes first. A task gives control back meanwhile.
 pub fn pert_co_wait_fd(fd: i64, write: i64, timeout_ms: i64) -> i64 {
     var cur: i64 = pe_co_self();
     if cur == 0 {
         return pe_poll_fd(fd, write, timeout_ms);
+    }
+    // Ready already: no wait at all
+    if pe_poll_fd(fd, write, 0) > 0 { return 1; }
+    if pe_ep >= 0 && pe_ep_lock != 0 {
+        var w: i64 = 0;
+        if write != 0 { w = 1; }
+        var how: i64 = w;
+        pe_st(cur + 152, 0);
+        if timeout_ms >= 0 {
+            how = how + 2;
+            var dl0: i64 = pert_clock_now_ms() + timeout_ms;
+            if dl0 <= 0 { dl0 = 1; }
+            pe_st(cur + 152, dl0);
+        }
+        pe_st(cur + 144, how);
+        pe_st(cur + 192, 0);
+        pe_st(cur + 136, fd + 1);
+        pe_co_leave();
+        var r: i64 = pe_ep_done(cur, fd, w);
+        if r >= 0 { return r; }
     }
     var dl: i64 = 0;
     if timeout_ms >= 0 { dl = pert_clock_now_ms() + timeout_ms; }

@@ -162,6 +162,9 @@ fn ru_set_inst(f: &mut IrFunction, id: i64, inst: Inst) {
     f.insts.set(at, ve);
 }
 
+// ME18: how often each rule fired this build (indexed as ru_rules' Vec).
+var g_rule_hits: Vec<i64> = Vec::new();
+
 /// Apply the rules to one function: how many operations they replaced.
 fn ru_rewrite(f: &mut IrFunction, rules: &Vec<RuRule>) -> i64 {
     var count: i64 = 0;
@@ -199,6 +202,7 @@ fn ru_rewrite(f: &mut IrFunction, rules: &Vec<RuRule>) -> i64 {
                                 ru_set_inst(f, ve.id, Inst::ConstBool(r.res == RR_TRUE));
                                 done = true;
                             }
+                            if done && ri < g_rule_hits.len() { g_rule_hits.set(ri, g_rule_hits.get(ri) + 1); }
                         }
                         ri = ri + 1;
                     }
@@ -287,13 +291,20 @@ fn ru_on(name: str) -> bool {
 }
 
 /// The rules and pure-call merging over every function of `module`:
-/// [operations rewritten, calls merged].
+/// [operations rewritten, calls merged]. FID_RULE_STATS=1 reports how
+/// often each rule fired (ME18; rules that never fire can go).
 pub fn rules_run(module: &mut IrModule) -> Vec<i64> {
     var rules: Vec<RuRule> = ru_rules();
     var n_rules: i64 = 0;
     var n_calls: i64 = 0;
     var on_rules: bool = ru_on("rules");
     var on_cse: bool = ru_on("purecse");
+    var stat_env: str = p_getenv("FID_RULE_STATS");
+    var stat_rules: bool = (stat_env as i64) != 0 && str_len(stat_env) > 0;
+    if stat_rules && g_rule_hits.len() == 0 {
+        var zi: i64 = 0;
+        while zi < rules.len() { g_rule_hits.push(0); zi = zi + 1; }
+    }
     var i: i64 = 0;
     while i < module.functions.len() {
         var entry: IrFunctionEntry = module.functions.get(i);
@@ -311,6 +322,15 @@ pub fn rules_run(module: &mut IrModule) -> Vec<i64> {
             module.functions.set(i, entry);
         }
         i = i + 1;
+    }
+    if stat_rules {
+        var si: i64 = 0;
+        while si < rules.len() {
+            var h: i64 = 0;
+            if si < g_rule_hits.len() { h = g_rule_hits.get(si); }
+            p_eprint_str("[rules] " + rules.get(si).name + ": " + int_to_str(h) + "\n");
+            si = si + 1;
+        }
     }
     var out: Vec<i64> = Vec::new();
     out.push(n_rules - n_calls);
@@ -380,4 +400,68 @@ pub fn rules_selftest() -> i64 {
     }
     print(int_to_str(rules.len()) + " rules, " + int_to_str(fails) + " failed\n");
     return fails;
+}
+
+// --- SMT proof obligations (own-backend roadmap ME17) -------------------
+
+/// The operation as an SMT-LIB bit-vector term.
+fn ru_smt_term(op: i64, a: str, b: str) -> str {
+    if op == RU_ADD { return "(bvadd " + a + " " + b + ")"; }
+    if op == RU_SUB { return "(bvsub " + a + " " + b + ")"; }
+    if op == RU_MUL { return "(bvmul " + a + " " + b + ")"; }
+    if op == RU_DIV { return "(bvsdiv " + a + " " + b + ")"; }
+    if op == RU_AND { return "(bvand " + a + " " + b + ")"; }
+    if op == RU_OR { return "(bvor " + a + " " + b + ")"; }
+    if op == RU_XOR { return "(bvxor " + a + " " + b + ")"; }
+    if op == RU_SHL { return "(bvshl " + a + " " + b + ")"; }
+    if op == RU_SHR { return "(bvashr " + a + " " + b + ")"; }
+    if op == RU_EQ { return "(= " + a + " " + b + ")"; }
+    if op == RU_NE { return "(not (= " + a + " " + b + "))"; }
+    if op == RU_LT { return "(bvslt " + a + " " + b + ")"; }
+    if op == RU_LE { return "(bvsle " + a + " " + b + ")"; }
+    if op == RU_GT { return "(bvsgt " + a + " " + b + ")"; }
+    return "(bvsge " + a + " " + b + ")";
+}
+
+fn ru_smt_const(v: i64, width: i64) -> str {
+    if v < 0 { return "(bvneg (_ bv" + int_to_str(0 - v) + " " + int_to_str(width) + "))"; }
+    return "(_ bv" + int_to_str(v) + " " + int_to_str(width) + ")";
+}
+
+/// Write `dir/<rule>_<width>.smt2` for every rule at 8, 16, 32 and 64 bits:
+/// each asserts that the two sides differ, so `unsat` (z3, cvc5) proves the
+/// rule. scripts/rules-smt.sh runs them. The number of files not written.
+pub fn rules_smt(dir: str) -> i64 {
+    var rules: Vec<RuRule> = ru_rules();
+    var widths: Vec<i64> = Vec::new();
+    widths.push(8); widths.push(16); widths.push(32); widths.push(64);
+    var failed: i64 = 0;
+    var written: i64 = 0;
+    var ri: i64 = 0;
+    while ri < rules.len() {
+        var r: RuRule = rules.get(ri);
+        var wi: i64 = 0;
+        while wi < widths.len() {
+            var w: i64 = widths.get(wi);
+            var c: str = ru_smt_const(r.c, w);
+            var lhs: str = "";
+            if r.shape == RS_RIGHT { lhs = ru_smt_term(r.op, "x", c); }
+            else if r.shape == RS_LEFT { lhs = ru_smt_term(r.op, c, "x"); }
+            else { lhs = ru_smt_term(r.op, "x", "x"); }
+            var rhs: str = "x";
+            if r.res == RR_CONST { rhs = ru_smt_const(r.rc, w); }
+            if r.res == RR_TRUE { rhs = "true"; }
+            if r.res == RR_FALSE { rhs = "false"; }
+            var text: str = "; " + r.name + " at " + int_to_str(w) + " bits: unsat proves it\n"
+                + "(set-logic QF_BV)\n(declare-const x (_ BitVec " + int_to_str(w) + "))\n"
+                + "(assert (not (= " + lhs + " " + rhs + ")))\n(check-sat)\n";
+            var path: str = dir + "/rule" + int_to_str(ri) + "_" + int_to_str(w) + ".smt2";
+            p_file_write(path, text);
+            if c_file_exists(path) { written = written + 1; } else { failed = failed + 1; }
+            wi = wi + 1;
+        }
+        ri = ri + 1;
+    }
+    print(int_to_str(written) + " SMT-LIB files in " + dir + "\n");
+    return failed;
 }

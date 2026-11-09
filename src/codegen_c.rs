@@ -41,8 +41,8 @@ fn fast_core_vec_body(name: &str, func: &IrFunction, c_ret: &str) -> Option<Vec<
     ];
     let lines: Vec<String> = match (name, p.len(), c_ret) {
         ("Vec_new", 1, "int64_t") => vec![
-            "    int64_t* __h = (int64_t*)p_malloc(24);".into(),
-            "    __h[0] = 0; __h[1] = 0; __h[2] = 0;".into(),
+            "    int64_t* __h = (int64_t*)p_malloc(40);".into(),
+            "    __h[0] = 0; __h[1] = 0; __h[2] = 0; __h[3] = 0; __h[4] = 0;".into(),
             "    return (int64_t)(intptr_t)__h;".into(),
         ],
         ("Vec_len", 2, "int64_t") => vec![hdr(&p[1]), "    return __h[1];".into()],
@@ -50,28 +50,45 @@ fn fast_core_vec_body(name: &str, func: &IrFunction, c_ret: &str) -> Option<Vec<
         ("Vec_get", 3, "int64_t") if checks_bounds => {
             let mut l = vec![hdr(&p[1])];
             l.extend(oob(&p[2]));
+            l.push(format!("    if (P_UNLIKELY(__h[3])) return __p_vec_ld(__h, {});", p[2]));
             l.push(format!("    return ((int64_t*)(intptr_t)__h[0])[{}];", p[2]));
             l
         }
         ("Vec_set", 4, "void") if checks_bounds => {
             let mut l = vec![hdr(&p[1])];
             l.extend(oob(&p[2]));
-            l.push("    if (P_UNLIKELY(__h[2] < 0)) __p_vec_grow(__h);".into());
-            l.push(format!("    ((int64_t*)(intptr_t)__h[0])[{}] = {};", p[2], p[3]));
+            // A shared buffer is made this Vec's own first (core's vec_own);
+            // elements at their own size go through core's sized paths, a
+            // struct element through vec_sz_set which drops the old one.
+            l.push(format!("    if (P_UNLIKELY(__h[2] < 0)) vec_own(0, {});", p[1]));
+            l.push(format!("    if (P_UNLIKELY(__h[3]) && P_VEC_CODE(__h) >= 16) {{ vec_sz_set(0, {}, {}, {}); return; }}", p[1], p[2], p[3]));
+            l.push(format!("    if (P_UNLIKELY(__h[3])) {{ __p_vec_st(__h, {}, {}); return; }}", p[2], p[3]));
+            l.push(format!("    int64_t* __slot = &((int64_t*)(intptr_t)__h[0])[{}];", p[2]));
+            l.push("    int64_t __old = *__slot;".into());
+            l.push(format!("    *__slot = {};", p[3]));
+            l.push(format!("    if (P_UNLIKELY(__h[4] != 0) && __old != {}) vec_elem_drop(0, vec_tid(0, {}), __old);", p[3], p[1]));
             l
         }
         ("Vec_push", 3, "void") => vec![
             hdr(&p[1]),
+            format!("    if (P_UNLIKELY(__h[2] < 0)) vec_own(0, {});", p[1]),
             "    int64_t __len = __h[1];".into(),
             "    if (P_UNLIKELY(__len >= __h[2])) __p_vec_grow(__h);".into(),
+            format!("    if (P_UNLIKELY(__h[3])) {{ __p_vec_st(__h, __len, {}); __h[1] = __len + 1; return; }}", p[2]),
             format!("    ((int64_t*)(intptr_t)__h[0])[__len] = {};", p[2]),
             "    __h[1] = __len + 1;".into(),
         ],
         ("Vec_pop", 2, "int64_t") => vec![
             hdr(&p[1]),
             "    if (__h[1] == 0) return 0;".into(),
+            format!("    if (P_UNLIKELY(__h[3]) && P_VEC_CODE(__h) >= 16) return vec_sz_pop(0, {});", p[1]),
             "    __h[1] = __h[1] - 1;".into(),
-            "    return ((int64_t*)(intptr_t)__h[0])[__h[1]];".into(),
+            "    if (P_UNLIKELY(__h[3])) return __p_vec_ld(__h, __h[1]);".into(),
+            "    int64_t __e = ((int64_t*)(intptr_t)__h[0])[__h[1]];".into(),
+            // Taken from a shared buffer: the element stays the other owners'
+            // too, so the caller gets an owner of its own (proposal 0004)
+            format!("    if (P_UNLIKELY(__h[2] < 0 && __h[4] != 0)) __e = vec_elem_dup(0, vec_tid(0, {}), __e);", p[1]),
+            "    return __e;".into(),
         ],
         _ => return None,
     };
@@ -1097,7 +1114,7 @@ impl CCodeGen {
     /// Emit runtime types and function declarations (continuation of emit_runtime_header)
     fn emit_runtime_types(&mut self) {
         wln!(self, "// ─── Runtime types ───");
-        wln!(self, "typedef struct { void** data; int64_t len; int64_t cap; } PVec;");
+        wln!(self, "typedef struct {{ void** data; int64_t len; int64_t cap; int64_t code; int64_t tid; }} PVec;");
         wln!(self, "typedef struct { char** keys; int64_t* vals; int64_t len; int64_t cap; } PMap;");
         wln!(self, "");
         wln!(self, "// ─── Runtime function declarations ───");
@@ -1352,29 +1369,67 @@ impl CCodeGen {
         // Copy-on-write (proposal 0001): a negative capacity (-box-1) marks
         // data other Vecs share; the box holds {owners, capacity}. Growing
         // (or owning before a write) releases one owner or copies the data.
+        // The word at +24 of a Vec header holds its element code word: 0 for
+        // one word per element, else P_VEC_TAG + code + 8 (core's
+        // vec_code_word); codes 16 and up are structs held inline (D15).
+        wln!(self, "#define P_VEC_TAG_C 0x4649445645430000LL");
+        wln!(self, "#define P_VEC_CODE(h) (((h)[3] & ~0xFFLL) == P_VEC_TAG_C ? ((h)[3] & 0xFF) - 8 : 0)");
+        wln!(self, "/* A buffer core allocated has its share box in front of the data,");
+        wln!(self, "   behind a tag (core's vec_buf_alloc): it is freed with the");
+        wln!(self, "   data, never on its own */");
+        wln!(self, "#define P_VBUF_KEY_C 0x5646425546494445LL");
+        wln!(self, "#define P_VBUF_TAGGED(d) ((d) && ((const int64_t*)(d))[-3] == (int64_t)((uint64_t)P_VBUF_KEY_C + (uint64_t)(uintptr_t)(d)))");
+        wln!(self, "static inline void __p_vbuf_free(int64_t* d) {{ if (!d) return; if (P_VBUF_TAGGED(d)) {{ d[-3] = 0; p_free(d - 3); }} else p_free(d); }}");
         wln!(self, "P_NOINLINE void __p_vec_grow(int64_t* h) {{");
         wln!(self, "    int64_t cap = h[2], shared = 0;");
         wln!(self, "    if (cap < 0) {{");
         wln!(self, "        int64_t* bx = (int64_t*)(intptr_t)(-cap - 1);");
         wln!(self, "        int64_t owners = bx[0];");
+        wln!(self, "        int64_t* bd = (int64_t*)(intptr_t)h[0];");
         wln!(self, "        cap = bx[1];");
-        wln!(self, "        if (owners <= 1) {{ p_free(bx); h[2] = cap; }}");
+        wln!(self, "        if (owners <= 1) {{ if (!(bx == bd - 2 && P_VBUF_TAGGED(bd))) p_free(bx); h[2] = cap; }}");
         wln!(self, "        else {{ bx[0] = owners - 1; shared = 1; }}");
         wln!(self, "    }}");
         wln!(self, "    if (!shared && h[1] < cap) return;");
+        wln!(self, "    int64_t hc = P_VEC_CODE(h);");
+        wln!(self, "    int64_t esz = hc == 0 ? 8 : (hc < 0 ? -hc : (hc >= 16 ? (hc - 15) * 8 : hc));");
         wln!(self, "    int64_t nc = h[1] < cap ? cap : (cap > 0 ? cap * 2 : 8);");
-        wln!(self, "    int64_t* nd = (int64_t*)p_malloc(nc * 8);");
+        wln!(self, "    int64_t* nd = (int64_t*)p_malloc(nc * esz);");
         wln!(self, "    int64_t* od = (int64_t*)(intptr_t)h[0];");
-        wln!(self, "    if (od) {{ memcpy(nd, od, (size_t)h[1] * 8); if (!shared) p_free(od); }}");
+        wln!(self, "    if (od) {{ memcpy(nd, od, (size_t)(h[1] * esz)); if (!shared) __p_vbuf_free(od); }}");
         wln!(self, "    h[0] = (int64_t)(intptr_t)nd;");
         wln!(self, "    h[2] = nc;");
         wln!(self, "}}");
+        // Elements stored at their size (D14): h[3] is core's element code
+        // word. Codes 16 and up: structs held in the buffer, reached by
+        // address; a store copies one in.
+        wln!(self, "static inline int64_t __p_vec_ld(const int64_t* h, int64_t i) {{");
+        wln!(self, "    const char* d = (const char*)(intptr_t)h[0];");
+        wln!(self, "    int64_t __c = P_VEC_CODE(h);");
+        wln!(self, "    if (__c >= 16) return (int64_t)(intptr_t)(d + i * (__c - 15) * 8);");
+        wln!(self, "    switch (__c) {{");
+        wln!(self, "    case 1: return ((const uint8_t*)d)[i]; case -1: return ((const int8_t*)d)[i];");
+        wln!(self, "    case 2: return ((const uint16_t*)d)[i]; case -2: return ((const int16_t*)d)[i];");
+        wln!(self, "    case 4: return ((const uint32_t*)d)[i]; case -4: return ((const int32_t*)d)[i];");
+        wln!(self, "    default: return ((const int64_t*)d)[i]; }}");
+        wln!(self, "}}");
+        wln!(self, "static inline void __p_vec_st(int64_t* h, int64_t i, int64_t x) {{");
+        wln!(self, "    char* d = (char*)(intptr_t)h[0];");
+        wln!(self, "    int64_t __c = P_VEC_CODE(h);");
+        wln!(self, "    if (__c >= 16) {{ if (x) memcpy(d + i * (__c - 15) * 8, (const void*)(intptr_t)x, (size_t)((__c - 15) * 8)); return; }}");
+        wln!(self, "    switch (__c) {{");
+        wln!(self, "    case 1: case -1: ((uint8_t*)d)[i] = (uint8_t)x; break;");
+        wln!(self, "    case 2: case -2: ((uint16_t*)d)[i] = (uint16_t)x; break;");
+        wln!(self, "    case 4: case -4: ((uint32_t*)d)[i] = (uint32_t)x; break;");
+        wln!(self, "    default: ((int64_t*)d)[i] = x; }}");
+        wln!(self, "}}");
+        wln!(self, "#define P_VEC_AT(v, i) ((v)->code ? (void*)(intptr_t)__p_vec_ld((const int64_t*)(v), (i)) : (v)->data[i])");
         wln!(self, "/* Element access a counted loop proved in bounds (pe.rs unchecked_ops). */");
         wln!(self, "#define P_VEC_UNCHECKED \\");
-        wln!(self, "static inline int64_t __p_vec_get_u(void* e, int64_t v, int64_t i) {{ (void)e; return ((int64_t*)(intptr_t)((int64_t*)(intptr_t)v)[0])[i]; }} \\");
-        wln!(self, "static inline void __p_vec_set_u(void* e, int64_t v, int64_t i, int64_t x) {{ (void)e; int64_t* __hh = (int64_t*)(intptr_t)v; if (P_UNLIKELY(__hh[2] < 0)) __p_vec_grow(__hh); ((int64_t*)(intptr_t)__hh[0])[i] = x; }} \\");
-        wln!(self, "static inline void* __p_pvec_get_u(PVec* v, int64_t i) {{ return v->data[i]; }} \\");
-        wln!(self, "static inline void __p_pvec_set_u(PVec* v, int64_t i, void* x) {{ v->data[i] = x; }}");
+        wln!(self, "static inline int64_t __p_vec_get_u(void* e, int64_t v, int64_t i) {{ (void)e; int64_t* __hh = (int64_t*)(intptr_t)v; if (P_UNLIKELY(__hh[3])) return __p_vec_ld(__hh, i); return ((int64_t*)(intptr_t)__hh[0])[i]; }} \\");
+        wln!(self, "static inline void __p_vec_set_u(void* e, int64_t v, int64_t i, int64_t x) {{ (void)e; int64_t* __hh = (int64_t*)(intptr_t)v; if (P_UNLIKELY(__hh[2] < 0)) __p_vec_grow(__hh); if (P_UNLIKELY(__hh[3])) {{ __p_vec_st(__hh, i, x); return; }} ((int64_t*)(intptr_t)__hh[0])[i] = x; }} \\");
+        wln!(self, "static inline void* __p_pvec_get_u(PVec* v, int64_t i) {{ return P_VEC_AT(v, i); }} \\");
+        wln!(self, "static inline void __p_pvec_set_u(PVec* v, int64_t i, void* x) {{ if (v->code) {{ __p_vec_st((int64_t*)v, i, (int64_t)(intptr_t)x); return; }} v->data[i] = x; }}");
         wln!(self, "P_VEC_UNCHECKED");
         wln!(self, "int64_t p_arena_save(void);");
         wln!(self, "void p_arena_restore(int64_t mark);");
@@ -2872,7 +2927,7 @@ impl CCodeGen {
         // Vec runtime
         wln!(self, "PVec* p_vec_new(void) {{");
         wln!(self, "    PVec* v = (PVec*)p_malloc(sizeof(PVec));");
-        wln!(self, "    v->data = NULL; v->len = 0; v->cap = 0;");
+        wln!(self, "    v->data = NULL; v->len = 0; v->cap = 0; v->code = 0; v->tid = 0;");
         wln!(self, "    return v;");
         wln!(self, "}}");
         wln!(self, "");
@@ -2889,11 +2944,12 @@ impl CCodeGen {
         wln!(self, "");
         wln!(self, "void* p_vec_get(PVec* v, int64_t idx) {{");
         wln!(self, "    if (!v || idx < 0 || idx >= v->len) return NULL;");
-        wln!(self, "    return v->data[idx];");
+        wln!(self, "    return P_VEC_AT(v, idx);");
         wln!(self, "}}");
         wln!(self, "");
         wln!(self, "void p_vec_set(PVec* v, int64_t idx, void* val) {{");
         wln!(self, "    if (!v || idx < 0 || idx >= v->len) return;");
+        wln!(self, "    if (v->code) {{ __p_vec_st((int64_t*)v, idx, (int64_t)(intptr_t)val); return; }}");
         wln!(self, "    v->data[idx] = val;");
         wln!(self, "}}");
         wln!(self, "");

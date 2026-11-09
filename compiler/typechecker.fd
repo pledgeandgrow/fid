@@ -1224,7 +1224,9 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
                 if method.params.get(0).name == "self" { has_self = true; }
             }
             method_entries.push(MethodMapEntry_new(method.name, MethodInfo_new(param_types, TypeChecker_resolve_type(self, method.ret_ty), has_self, method.is_pub)));
-            TypeChecker_set_item_module(self, method.name, self.current_module);
+            // A method is an item under its struct's name (Vec_take), never
+            // under its bare one: that would make a program's own `take`
+            // the private item of whichever module had a `take` method
             var mangled: str = struct_name + "_" + method.name;
             TypeChecker_set_item_module(self, mangled, module);
             mi = mi + 1;
@@ -1281,7 +1283,8 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
                 if method.params.get(0).name == "self" { has_self = true; }
             }
             new_methods.push(MethodMapEntry_new(method.name, MethodInfo_new(param_types, TypeChecker_resolve_type(self, method.ret_ty), has_self, method.is_pub)));
-            TypeChecker_set_item_module(self, method.name, self.current_module);
+            // under the type's name, as an impl method (not the bare name)
+            TypeChecker_set_item_module(self, type_name + "_" + method.name, module);
             mi = mi + 1;
         }
         // Merge into existing method map or create new
@@ -9867,6 +9870,12 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
         }
         Expr::Index(array, index) => {
             var arr_ty: Type = TypeChecker_check_expr(self, box_expr_unbox(array));
+            // `v[i]` through a reference indexes what it refers to (as
+            // `v[i] = x` does)
+            match arr_ty {
+                Type::Ref(rinner, _) => { arr_ty = box_type_unbox(rinner); }
+                _ => {}
+            }
             // String slicing
             match arr_ty {
                 Type::Named(name) => {

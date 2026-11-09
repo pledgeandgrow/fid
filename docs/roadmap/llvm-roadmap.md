@@ -34,6 +34,10 @@ against.
 | Linux runtime on system calls: threads, M:N tasks, futexes, signals, traces | `stdlib/linux_runtime/` | own context switch (`nat_ctx_swap`) |
 | C path through clang | `compiler/codegen_c.fd` | LLVM quality, the oracle |
 | Old PIR path (L1–L3, its optimizer and allocator) | `compiler/pir.fd`, `opt.fd`, `regalloc.fd`, `codegen_x64.fd` | not used by `fid emit`; `build --native` crashes |
+| **Since Nov 8–9:** machine IR, one allocator (IPRA, checker), x86-64 Linux target, debug sections | `compiler/nat_ir.fd`, `nat_enc.fd` | AArch64, RISC-V, x86-64 Linux; suite 273 / 271 / 272 of 317 (Nov 9) |
+| **Since Nov 8–9:** IR verifier, rules, e-graph and load forwarding | `compiler/irverify.fd`, `rules.fd`, `egraph.fd` | on the native Linux path; `FID_VERIFY=1`, `fid test-rules [--smt]` |
+| **Since Nov 8–9:** encoder oracle, pass matrix, SMT proofs | `scripts/enc-oracle.py`, `pass-matrix.sh`, `rules-smt.sh` | 1,181 forms, 0 mismatches; all 108 rule obligations proved by z3 |
+| **Since Nov 9:** Windows x64 on the machine layer (opt-in `fid emit --nat`), line tables | `compiler/nat_ir.fd`, `nat_enc.fd`, `stdlib/linux_runtime/win.fd` | a PE with imports, the Linux runtime over kernel32; 301 of 338 suite tests; `.debug_line` on Linux |
 | Reference escape check (references are second-class) | `compiler/escape.fd` | a language rule, not yet used by the optimizer |
 
 The cost of today's shape: `pe_ir` and `nat_ir` lower the same IR twice, with
@@ -91,9 +95,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
 
 ## Track MI — One machine layer (30)
 
-- [ ] MI1. Write down the MIR: instructions, operands (virtual register, physical
+- [~] MI1. Write down the MIR: instructions, operands (virtual register, physical
       register, immediate, stack slot, label), blocks, block parameters; in a new
       `compiler/mir.fd` (M).
+      Nov 8–9: `compiler/nat_ir.fd` records each operation of its architecture
+      layer as an `MInst` on virtual registers (Cranelift's VCode shape: selection
+      happens in the layer), for AArch64, RISC-V and x86-64 Linux.
 - [ ] MI2. Target-neutral operations: integer and float arithmetic, compares,
       branch on compare, loads and stores of 1/2/4/8 bytes with extension,
       address arithmetic, calls, returns, traps (M).
@@ -101,28 +108,53 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       AArch64 `madd`, RISC-V `slli`+`add`), chosen by instruction selection (M).
 - [ ] MI4. A target description: register classes, callee-saved set, argument
       and result registers, stack alignment, red zone, scratch registers (S).
-- [ ] MI5. One lowering IR -> MIR for every language rule now written twice in
+- [~] MI5. One lowering IR -> MIR for every language rule now written twice in
       `pe_ir.fd` and `nat_ir.fd`: checked add/sub/mul, narrowing, MIN / -1,
       division by zero, struct copies, closures, dyn calls, print routing (L).
-- [ ] MI6. Panic paths as cold out-of-line blocks shared per function, each a
+      Nov 8–9: one lowering for the three Linux targets; `pe_ir.fd` keeps its own
+      until MI14.
+- [~] MI6. Panic paths as cold out-of-line blocks shared per function, each a
       call (so traces name the function), from the one lowering (M).
+      Panics are calls to shared stubs on every Linux target, so traces name the
+      function.
 - [ ] MI7. One call lowering: arguments to registers and the outgoing area,
       `__env`, varargs spawns, results; parallel moves solved once (M).
 - [ ] MI8. One frame layout: slots, spill slots, the save area, alignment, frame
       records for traces, large frames (M).
 - [ ] MI9. Struct values as several MIR values when small (scalar replacement at
       the machine level), memory otherwise (M).
-- [ ] MI10. A MIR verifier: every use defined, every block terminated, operand
+- [~] MI10. A MIR verifier: every use defined, every block terminated, operand
       classes match the operation; run after each MIR stage in debug builds (M).
-- [ ] MI11. A MIR printer and `fid dump-mir <file> --target <t>` (S).
-- [ ] MI12. Port the AArch64 backend to MIR first (it is the smaller one); its
+      The allocation checker (RA15) runs over the MIR with `FID_VERIFY=1`; a
+      structural MIR verifier is still to write.
+- [~] MI11. A MIR printer and `fid dump-mir <file> --target <t>` (S).
+      `FID_NAT_DUMP=<function>` prints a function's MIR with its allocation and
+      live ranges.
+- [x] MI12. Port the AArch64 backend to MIR first (it is the smaller one); its
       suite results must not change (L).
-- [ ] MI13. Port RISC-V to MIR: only instruction selection and its encoder stay
+      Nov 8: AArch64 on the MIR; suite results kept (261 passed at the first full
+      run).
+- [x] MI13. Port RISC-V to MIR: only instruction selection and its encoder stay
       target code (M).
-- [ ] MI14. Port Windows x64 to MIR, keeping every optimization `pe_ir.fd` has
+      Nov 8: RISC-V on the MIR, only selection and its encoder are target code.
+- [~] MI14. Port Windows x64 to MIR, keeping every optimization `pe_ir.fd` has
       (coalescing, rotation, xmm values, selection) as MIR passes or rules (XL).
-- [ ] MI15. A Linux x86-64 target on MIR for free once x64 is ported: the ELF
+      Nov 9: Windows x64 runs on the MIR, opt-in (`fid emit --nat`; pe_ir stays
+      the default and was not touched): the x86-64 selection and allocator of
+      MI15, a PE with its import table (`nat_pe`, NATFIX_RVA32), Win64 calls
+      through one thunk (`nat_win_call`: rbx and r12–r15, the allocated
+      registers, are callee-saved there too), TLS in a TlsAlloc slot, the
+      TEB's StackLimit per task context. The runtime is the Linux one with its
+      system calls mapped onto kernel32 / ws2_32 / bcrypt (win.fd). Suite: 301
+      of 338 match the interpreter. Left: pe_ir's optimizations (copy
+      coalescing, rotation, xmm values) measured against it, processes (a
+      hook in `pe_sh`), PDB (DB3), then the switch of the default.
+- [x] MI15. A Linux x86-64 target on MIR for free once x64 is ported: the ELF
       writer of `nat_enc.fd`, the Linux runtime, x64 selection (M).
+      Nov 9: Linux x86-64 on the MIR (`fid emit --target x86_64-linux`): its own
+      encoder, 4 register arguments, the generic system call numbers mapped in
+      `nat_syscall`, TLS through fs, FMA3 for `fma` (x86-64-v3 for log/pow only).
+      `--elf` / `--target linux` still use pe_ir's no-stdlib path.
 - [ ] MI16. A macOS AArch64 target: the AArch64 selection and a Mach-O writer
       (release F7) (L).
 - [ ] MI17. Retire `pe_ir.fd`'s and `nat_ir.fd`'s own lowerings once their MIR
@@ -135,12 +167,16 @@ week), L (several weeks), XL (months). Each goal names where it lands.
 - [~] MI20. Machine code primitives for the runtime already exist per target
       (`ng_gen_primitives*` in `nat_ir.fd`, the stubs of `pe_ir_stubs.fd`); move
       them behind one interface (M).
+      Each target's primitives (context switch, thread start, atomics, signals,
+      traces) are behind one set of `nat_*` names.
 - [ ] MI21. Constants: materialization per target (`movz/movk`, `lui/addi`,
       `mov imm64`) chosen by cost, rematerialized instead of spilled (M).
 - [ ] MI22. Address modes as a selection decision: base + index * scale + offset
       where the target has it (M).
-- [ ] MI23. Compare and branch fused in selection on every target (x64 `cmp/jcc`,
+- [~] MI23. Compare and branch fused in selection on every target (x64 `cmp/jcc`,
       AArch64 `cbz/tbz/b.cond`, RISC-V `beq/blt`) (S).
+      x86-64 tests and jumps fused; AArch64/RISC-V compare to a register and
+      branch.
 - [ ] MI24. Conditional select (`csel`, `cmov`, RISC-V Zicond where present) for
       small branches with no side effects (M).
 - [ ] MI25. Floats in float registers on every target, f32 as f32 (not widened),
@@ -160,15 +196,23 @@ week), L (several weeks), XL (months). Each goal names where it lands.
 - [~] RA1. Today: `nat_ir.fd` allocates callee-saved registers over live-range
       hulls from block liveness; `pe_ir.fd` has its own allocator with
       coalescing and call-free ranges. Replace both with one allocator on MIR (L).
-- [ ] RA2. Liveness on MIR from use lists, live ranges as lists of segments with
+      Nov 8: one linear-scan allocator for the three Linux targets
+      (`ng_mir_alloc`); pe_ir keeps its own.
+- [~] RA2. Liveness on MIR from use lists, live ranges as lists of segments with
       holes, not hulls (M).
-- [ ] RA3. All registers, caller-saved included: a value live across a call goes
+      Block liveness to a fixed point, live ranges as hulls (not yet segments with
+      holes).
+- [~] RA3. All registers, caller-saved included: a value live across a call goes
       to a callee-saved register or is split around the call (L).
+      Caller-saved registers for ranges no clobbering call crosses (AArch64
+      x8–x11, RISC-V t4); x86-64 has none spare.
 - [ ] RA4. Live-range splitting at calls and at loop boundaries, with spill code
       placed outside loops (L).
 - [ ] RA5. Spill weights from loop depth and use counts (M).
-- [ ] RA6. Copy coalescing on MIR (what `pe_ir`'s `PEIR_COALESCE` does), so
+- [~] RA6. Copy coalescing on MIR (what `pe_ir`'s `PEIR_COALESCE` does), so
       `i = i + 1` is one instruction on every target (M).
+      Move hints: a move's two sides prefer one register, so `ng_st_val` after an
+      operation costs nothing.
 - [ ] RA7. Register hints: arguments, results and call operands prefer the
       registers they must end in (M).
 - [ ] RA8. Rematerialization of constants, addresses of globals and frame slots
@@ -184,15 +228,20 @@ week), L (several weeks), XL (months). Each goal names where it lands.
 - [ ] RA13. Save and restore with paired instructions (`stp/ldp` on AArch64) (S).
 - [ ] RA14. A fast mode for debug builds: one pass, local allocation, under 10% of
       compile time (M).
-- [ ] RA15. An allocation checker: replay the allocated code symbolically and
+- [x] RA15. An allocation checker: replay the allocated code symbolically and
       prove every use reads the value it should (regalloc2's checker) (L).
-- [ ] RA16. Run the checker on the whole suite in CI for every target (S).
+      Nov 8: `ng_mir_check`, an independent exact liveness walk; it found a real
+      bug at once (a vreg read before its block defines it was treated as local).
+- [~] RA16. Run the checker on the whole suite in CI for every target (S).
+      Run on the whole suite with `FID_VERIFY=1` on AArch64, RISC-V and x86-64;
+      not in CI.
 - [ ] RA17. Statistics per function: spills, reloads, moves; `--stats` prints them
       (S).
 - [ ] RA18. Floats and integers allocated by the same algorithm, class-aware (M).
 - [ ] RA19. A value used only as a branch condition stays in flags where the
       target has them (M).
-- [ ] RA20. The allocator honours IPRA clobber sets (Track WP) at each call (M).
+- [x] RA20. The allocator honours IPRA clobber sets (Track WP) at each call (M).
+      Calls only clobber what their callee was found to clobber (WP4).
 
 ## Track TG — Thin targets: selection and encoders (20)
 
@@ -204,9 +253,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (M).
 - [x] TG3. Own encoders, no assembler: x64 (`pe_ir_enc.fd`), AArch64 and RV64IMFD
       (`nat_enc.fd`).
-- [ ] TG4. Encoder oracle tests: for every instruction form we emit, encode random
+      x86-64 encoder added to `nat_enc.fd` (Nov 9).
+- [x] TG4. Encoder oracle tests: for every instruction form we emit, encode random
       operands and compare the bytes with clang's integrated assembler
       (`zig cc -c x.s`, `llvm-objdump`) (M).
+      Nov 8–9: `scripts/enc-oracle.py`, 1,181 forms of AArch64, RV64IMFD and
+      x86-64 against clang's assembler: 0 mismatches (it found `clrex #0` and a
+      longer `sub rax, imm32`).
 - [ ] TG5. A disassembler for our own output (`fid disasm`), table-driven from the
       same encoder descriptions, so the two cannot drift (L).
 - [ ] TG6. Branch relaxation: short forms where the target reaches, long forms
@@ -246,39 +299,67 @@ week), L (several weeks), XL (months). Each goal names where it lands.
 - [ ] ME1. Use lists in the IR, kept current by every pass (M).
 - [~] ME2. Dominator tree and loop tree shared by every pass (`iro_cfg`,
       `iro_dominates` in `iropt.fd` are a start) (M).
-- [ ] ME3. mem2reg: locals whose address never escapes become SSA values with
+      iropt's dominators are used by the IR verifier, the e-graph and forwarding.
+- [~] ME3. mem2reg: locals whose address never escapes become SSA values with
       block parameters, on the IR every backend reads (L).
-- [ ] ME4. An IR verifier after every pass in debug builds: types, dominance,
+      Nov 8–9: scalar locals whose address is only loaded and stored live in
+      registers in the backend, and a load becomes the stored value when that
+      store is the local's only one and dominates it, or is earlier in its block
+      (`compiler/egraph.fd`); no phis yet, the IR is unchanged.
+- [x] ME4. An IR verifier after every pass in debug builds: types, dominance,
       terminators, block parameters (M).
-- [ ] ME5. One pass manager: order, per-pass timing, a switch to turn each off
+      Nov 8: `compiler/irverify.fd` (`FID_VERIFY=1`), after lowering, iropt, the
+      rules and the e-graph; it found 3 lowering bugs (2 fixed in lower.fd by the
+      ownership session).
+- [~] ME5. One pass manager: order, per-pass timing, a switch to turn each off
       (`--no-pass=name`), and `iro_pass_on` folded into it (M).
-- [ ] ME6. An e-graph data structure: e-classes, hash-consed e-nodes, union-find,
+      Switches per pass: `FID_IROPT_OFF`, `FID_NAT_OFF` (mir, promote, ipra, fold,
+      hint, rules, purecse, egraph, forward, debug); timing in `[prof] native`
+      lines.
+- [x] ME6. An e-graph data structure: e-classes, hash-consed e-nodes, union-find,
       rebuilding (L).
-- [ ] ME7. Pure values of a function go into the e-graph; side-effecting
+      Nov 9: `compiler/egraph.fd`: e-classes, hash-consed e-nodes, union-find,
+      rebuilding.
+- [~] ME7. Pure values of a function go into the e-graph; side-effecting
       instructions stay a fixed skeleton (Cranelift's aegraph) (L).
-- [ ] ME8. Extraction by cost, with each value placed at the latest dominating
+      Pure integer and boolean values are e-nodes, everything else a leaf.
+- [~] ME8. Extraction by cost, with each value placed at the latest dominating
       point that covers its uses: LICM and sinking fall out (L).
-- [ ] ME9. Rewrite rules as data: a pattern, a replacement, conditions on types
+      Extraction by cost; an instruction is rewritten in place into its class's
+      best form when that form's operands dominate it. Placement-based LICM is
+      still to do.
+- [x] ME9. Rewrite rules as data: a pattern, a replacement, conditions on types
       and constants; a file of rules per area (arithmetic, comparisons, bits,
       floats) (M).
-- [ ] ME10. Constant folding as rules, with the language's overflow semantics (a
+      Nov 8: `compiler/rules.fd`, 27 rules as data.
+- [x] ME10. Constant folding as rules, with the language's overflow semantics (a
       fold that would panic is not folded) (S).
-- [ ] ME11. CSE and GVN from hash-consing, across blocks by dominance (M).
+      Folding under the language's checked arithmetic (a fold that would panic is
+      not folded).
+- [~] ME11. CSE and GVN from hash-consing, across blocks by dominance (M).
+      Through the e-graph: an earlier equal value that dominates becomes a move.
 - [ ] ME12. Algebraic simplification: identities, reassociation of constants,
       strength reduction of multiplication and division by constants (M).
-- [ ] ME13. Comparison and branch simplification: `!(a < b)` to `a >= b`, known
+- [~] ME13. Comparison and branch simplification: `!(a < b)` to `a >= b`, known
       results from dominating conditions (M).
+      Comparisons flipped and same-operand comparisons folded.
 - [ ] ME14. Sparse conditional constant propagation over the CFG, dead branches
       removed (M).
 - [ ] ME15. Dead code and dead store elimination on SSA (M).
-- [ ] ME16. Each rule tested on its own: random inputs evaluated before and after
+- [x] ME16. Each rule tested on its own: random inputs evaluated before and after
       the rewrite, in `fid test-rules` (M).
-- [ ] ME17. Each integer rule proved by an SMT solver on 64-bit vectors (an
+      `fid test-rules`: each rule on edge and random values.
+- [~] ME17. Each integer rule proved by an SMT solver on 64-bit vectors (an
       offline check, run in CI; z3 as a tool, not a dependency) (L).
+      `fid test-rules --smt <dir>` writes 108 obligations (27 rules at 8, 16, 32,
+      64 bits), `scripts/rules-smt.sh` runs them. Nov 9: z3 5.3 (the z3-solver
+      wheel, through its Python module) proves all 108; a rule broken on
+      purpose gives `sat`. Left: running it in CI.
 - [ ] ME18. Rule statistics: how often each fires on the suite; rules that never
       fire are deleted (S).
-- [ ] ME19. Saturation limits per function (nodes, iterations), so compile time
+- [x] ME19. Saturation limits per function (nodes, iterations), so compile time
       stays linear in practice (S).
+      Node and round limits (`EG_MAX_NODES`, `EG_MAX_ROUNDS`).
 - [~] ME20. Inlining with a cost model across modules (iropt inlines one-block
       functions of up to 16 instructions today) (L).
 - [ ] ME21. Inlining decisions from the call graph bottom-up, with sizes known
@@ -304,12 +385,16 @@ week), L (several weeks), XL (months). Each goal names where it lands.
 
 - [x] WP1. Every build sees the whole program; `nat_ir` compiles only what `main`
       reaches, from a worklist.
-- [ ] WP2. A call graph with strongly connected components, built once per build
+- [x] WP2. A call graph with strongly connected components, built once per build
       (M).
-- [ ] WP3. Compile bottom-up: callees before callers, each SCC together (M).
-- [ ] WP4. IPRA: each function's clobbered registers recorded after allocation;
+      Nov 8: the call graph of the recorded functions.
+- [x] WP3. Compile bottom-up: callees before callers, each SCC together (M).
+      Functions are allocated and emitted callees first (post-order).
+- [x] WP4. IPRA: each function's clobbered registers recorded after allocation;
       a caller keeps values in caller-saved registers across calls that do not
       touch them (M).
+      Each function's clobber mask after allocation; callers keep values in
+      caller-saved registers across calls that do not touch them.
 - [ ] WP5. IPRA through indirect calls: a closure or `dyn` call clobbers the union
       of its possible targets when they are known, everything otherwise (M).
 - [ ] WP6. Custom conventions for internal functions: arguments in the registers
@@ -318,8 +403,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
 - [ ] WP7. `__env` dropped from functions that never read it, at every call (S).
 - [ ] WP8. Leaf functions without frames, with no frame record where traces do not
       need it (S).
-- [ ] WP9. Effects as optimizer facts: a call to a function with no effects is a
+- [~] WP9. Effects as optimizer facts: a call to a function with no effects is a
       pure value in the e-graph (merged, hoisted, removed when unused) (M).
+      Calls of program functions with no effects and scalar results are merged
+      under dominance (never hoisted: they may panic).
 - [ ] WP10. `!read`-only calls merged when no write lies between them (M).
 - [ ] WP11. `@crashfree` functions: their panic paths are absent, so callers need
       no panic edges for them (S).
@@ -336,8 +423,9 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       the image (M).
 - [ ] WP18. Globals that are never written after initialization become constants
       (S).
-- [ ] WP19. Generics fully monomorphized with sharing of identical bodies (code
+- [~] WP19. Generics fully monomorphized with sharing of identical bodies (code
       folding by hash) (M).
+      Identical functions (same MIR and allocation) are emitted once.
 - [ ] WP20. Whole-program mode stays the default; a library build records the
       facts (clobbers, effects, sizes) its users need (M).
 
@@ -390,8 +478,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
 
 - [x] SP1. No text between source and bytes: our own encoders and image writers,
       no assembler and no linker.
-- [ ] SP2. Per-stage timing for every build (`--time`), in one table: parse,
+- [~] SP2. Per-stage timing for every build (`--time`), in one table: parse,
       check, lower, each pass, selection, allocation, encoding (S).
+      `[prof] native mid-end` and `[prof] native` lines: hello world 0.4 s of
+      mid-end, 82 ms of code generation, the front end over 3 s.
 - [ ] SP3. `fid emit` of hello world under 0.5 s, then under 0.1 s (release D9):
       today the front end takes most of it (M).
 - [ ] SP4. The checked stdlib cached in binary form, not re-parsed on every build
@@ -430,8 +520,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       and exit status (M).
 - [ ] RL2. The suite run on every backend and target on every change: Windows x64,
       Linux x64, AArch64 and RISC-V under QEMU, WASM (M).
-- [ ] RL3. A pass on/off matrix: the suite with each mid-end pass and each rule
+- [~] RL3. A pass on/off matrix: the suite with each mid-end pass and each rule
       group disabled gives the same output (M).
+      `scripts/pass-matrix.sh` (`NATIVE=1`). Nov 9, x86-64 Linux, 8 tests
+      (integers, checked arithmetic, closures, generics, maps, match,
+      floats, tasks), 6 iropt and 7 native switches: each one off gives
+      the same results as all on. One run had a missing interpreter
+      reference (exit 127, out of memory), not a difference. Left: the
+      whole suite, and AArch64/RISC-V.
 - [ ] RL4. A miscompile is fixed only with a test that fails without the fix
       (always) (S).
 - [ ] RL5. Translation validation for the mid-end: for each function, a checker
@@ -439,9 +535,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
 - [ ] RL6. Translation validation for instruction selection: each selected
       sequence evaluated against its MIR operation on random values (M).
 - [ ] RL7. The allocation checker (RA15) on every build in CI (S).
-- [ ] RL8. Encoder oracle tests (TG4) for every target in CI (S).
-- [ ] RL9. Image files checked by the system tools: `llvm-readobj`, `dumpbin`,
+- [x] RL8. Encoder oracle tests (TG4) for every target in CI (S).
+      TG4.
+- [~] RL9. Image files checked by the system tools: `llvm-readobj`, `dumpbin`,
       `readelf`; every executable we write must load and pass them (S).
+      `readelf` reads our ELF executables and their debug sections without a
+      warning.
 - [ ] RL10. Fuzzing of the IR -> machine code path with random IR (not only random
       source), so backend bugs show without front-end limits (M).
 - [ ] RL11. Mutation testing of the backend: a deliberately broken rule or pass
@@ -460,8 +559,9 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       interleavings under a scheduler that picks randomly (L).
 - [ ] RL18. A public miscompile log: each bug, the pass, why the tests missed it,
       the test that now catches it (S).
-- [ ] RL19. Kill switches for every pass and rule group, documented, so a user can
+- [x] RL19. Kill switches for every pass and rule group, documented, so a user can
       work around a miscompile on the day it is found (S).
+      Every native pass and switch above can be turned off.
 - [ ] RL20. Crash reports from the compiler with the function and pass that failed
       and a reduced reproducer (`fid reduce`) (M).
 - [ ] RL21. A reducer: shrink a failing program automatically while it still fails
@@ -470,31 +570,44 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       release ships only when both agree on the suite (S).
 - [ ] RL23. Signal-safe runtime paths reviewed: crash handlers allocate nothing,
       take no lock (the Linux runtime's `pe_on_signal` already) (S).
-- [ ] RL24. Stack overflow reported cleanly on every target: guard regions on
+- [x] RL24. Stack overflow reported cleanly on every target: guard regions on
       every thread and task stack (done on native Linux and the C path) (S).
-- [ ] RL25. Every target's ABI tested against C: calls into C and callbacks from C
+      Native Linux: a 64 KB guard region under every thread and task stack,
+      `Panic: Stack overflow` (Nov 8, RT15's rule).
+- [~] RL25. Every target's ABI tested against C: calls into C and callbacks from C
       (`qsort`) on every target (M).
+      qsort and bsearch call Fides comparisons on the three Linux targets.
 
 ## Track DB — Debugging and visibility (10)
 
-- [ ] DB1. Line tables from the IR to MIR to bytes: every instruction knows its
+- [~] DB1. Line tables from the IR to MIR to bytes: every instruction knows its
       source line (M).
-- [ ] DB2. DWARF on Linux and macOS: line numbers, functions, frames (L).
+      Nov 9: the lowering's source lines (value metadata) become MO_LINE in the
+      MIR and rows at emission; `.debug_line` (DWARF 4, one file) for the
+      functions of the input file, on the three Linux targets (readelf decodes
+      it). Left: rows for statements whose instructions carry no line
+      metadata, the other files of a program (functions do not record theirs).
+- [~] DB2. DWARF on Linux and macOS: line numbers, functions, frames (L).
+      Nov 9: `.symtab`, DWARF 4 `.debug_info` (a compile unit, a subprogram per
+      function) and `.debug_frame` in every native Linux executable; line tables
+      since Nov 9 (DB1).
 - [ ] DB3. PDB / CodeView on Windows (L).
 - [ ] DB4. Locations of variables at `-O0`-like debug builds, in registers and
       slots (L).
 - [x] DB5. Panic and crash traces from frame records, no per-call bookkeeping
       (the C path, native Linux).
-- [ ] DB6. Unwind information (Windows `.pdata`, DWARF CFI) so system debuggers and
+- [~] DB6. Unwind information (Windows `.pdata`, DWARF CFI) so system debuggers and
       profilers walk our stacks (M).
+      `.debug_frame` CFI for our prologues on the three Linux targets.
 - [ ] DB7. `fid explain <function>`: the IR, the MIR after each stage, the machine
       code, side by side (M).
 - [ ] DB8. Optimization remarks: why a check stayed, why a call was not inlined,
       why a value spilled (`--remarks`) (M).
 - [ ] DB9. A sampling profiler on every native target that names our functions
       (from DB6) (M).
-- [ ] DB10. Symbol maps for every image we write, readable by `addr2line`-style
+- [x] DB10. Symbol maps for every image we write, readable by `addr2line`-style
       tools (S).
+      The symbol table (DB2).
 
 ---
 

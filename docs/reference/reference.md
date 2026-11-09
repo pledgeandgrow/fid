@@ -879,6 +879,26 @@ program prints `Panic: <message>` and a stack trace on stderr and exits with
 status 1 (`safety/test_oob_vec_get.fd`, `test_unwrap_none.fd`,
 `test_empty_vec_first.fd`).
 
+**The panic rule** (the same on `fid run`, C and native builds):
+
+- A panic ends the program. It is never caught and never confined to the
+  task or thread that raised it: a panic in a spawned task ends the whole
+  program as one in `main` does (`test_task_panic_fail.fd`). Code that can
+  fail and must go on returns `Result` or `Option` instead; `@no-panic` and
+  `@crashfree` prove a function cannot panic (§12).
+- It prints `Panic: <message>` and the stack trace on stderr, flushes
+  stdout (what the program printed before is not lost), and exits with
+  status 1.
+- Nothing unwinds: no drop or cleanup code runs after a panic. Memory, files
+  and sockets are given back by the operating system when the process ends.
+- A stack overflow is a panic: `Panic: Stack overflow` (an OS guard page
+  catches it; status 1). `fid run` stops at its recursion limit instead
+  (1000 nested calls by default, `--max-recursion N`). A memory fault in
+  `unsafe` code is reported the same way, as `Panic: Invalid memory access
+  (null or dangling pointer)`.
+- In a bare-metal build (`fid emit --bare`) a panic calls the program's
+  `@panic_handler` function if it has one, else prints on COM1 and halts.
+
 ### 8.3 What is freed automatically
 
 There is no garbage collector and no general destructor mechanism. The compiler

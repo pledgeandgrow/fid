@@ -15,6 +15,12 @@
 //   - loop-invariant code motion (competitive OP9, OP26): a read of a local
 //     the loop never stores, `v.len()` of a Vec the loop cannot resize, and
 //     pure operations on such values move to the block before the loop
+//   - the mid-end of docs/roadmap/llvm-roadmap.md Track ME, on use lists
+//     (ME1, iro_uses): branches on constants become jumps (ME14), stores to
+//     a local nobody reads again are dropped and DCE removes more pure values
+//     (ME15), constants are reassociated and multiplication, division and
+//     remainder by powers of two become shifts and masks where no overflow
+//     or zero check is lost (ME12)
 // Every pass leaves the program's meaning as it was; when in doubt it does
 // nothing.
 
@@ -44,6 +50,27 @@ pub fn iropt_native(module: &mut IrModule) {
     var on_tail: bool = IRO_TAILCALL && iro_pass_on("tailcall");
     var on_gvn: bool = IRO_GVN && iro_pass_on("gvn");
     var on_licm: bool = IRO_LICM && iro_pass_on("licm");
+    var on_branch: bool = iro_pass_on("branchfold");
+    var on_facts: bool = iro_pass_on("branchfacts");
+    var on_sccp: bool = iro_pass_on("sccp");
+    var on_promote: bool = iro_pass_on("promote");
+    var on_dse: bool = iro_pass_on("dse");
+    var on_simplify: bool = iro_pass_on("simplify");
+    var n_branch: i64 = 0;
+    var n_facts: i64 = 0;
+    var n_sccp: i64 = 0;
+    var n_promote: i64 = 0;
+    var n_dse: i64 = 0;
+    var n_simp: i64 = 0;
+    var stats: bool = iro_stats_on();
+    var insts_before: i64 = 0;
+    var insts_after: i64 = 0;
+    var t_start: i64 = 0;
+    if stats { t_start = p_clock_now_ms(); }
+    // ME5: per-pass timing, summed over the functions
+    var tp_names: Vec<str> = Vec::new();
+    var tp_ms: Vec<i64> = Vec::new();
+    var tp_hits: Vec<i64> = Vec::new();
     // Only what main reaches is worth optimizing (CS1); a function the
     // native backend generates on demand is correct without it
     var reach: i64 = HashMap_new();
@@ -70,21 +97,90 @@ pub fn iropt_native(module: &mut IrModule) {
         }
         var f: IrFunction = entry.func;
         var changed: bool = false;
-        if on_fold && iro_fold(&mut f) { changed = true; n_fold = n_fold + 1; }
-        if on_dce && iro_dce(&mut f) { changed = true; n_dce = n_dce + 1; }
-        if on_tail && iro_tailcalls(&mut f) { changed = true; n_tail = n_tail + 1; }
-        if on_gvn && iro_gvn(&mut f) { changed = true; n_gvn = n_gvn + 1; }
-        if on_licm && iro_licm(&mut f) { changed = true; n_licm = n_licm + 1; }
+        if stats { insts_before = insts_before + iro_count_insts(&f); }
+        if on_fold && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "fold", stats, &mut f) { changed = true; n_fold = n_fold + 1; }
+        if on_simplify && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "simplify", stats, &mut f) { changed = true; n_simp = n_simp + 1; }
+        if on_branch && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "branchfold", stats, &mut f) { changed = true; n_branch = n_branch + 1; }
+        if on_facts && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "branchfacts", stats, &mut f) { changed = true; n_facts = n_facts + 1; }
+        if on_sccp && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "sccp", stats, &mut f) { changed = true; n_sccp = n_sccp + 1; }
+        if on_promote && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "promote", stats, &mut f) { changed = true; n_promote = n_promote + 1; }
+        if on_dse && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "dse", stats, &mut f) { changed = true; n_dse = n_dse + 1; }
+        if on_dce && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "dce", stats, &mut f) { changed = true; n_dce = n_dce + 1; }
+        if on_tail && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "tailcall", stats, &mut f) { changed = true; n_tail = n_tail + 1; }
+        if on_gvn && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "gvn", stats, &mut f) { changed = true; n_gvn = n_gvn + 1; }
+        if on_licm && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "licm", stats, &mut f) { changed = true; n_licm = n_licm + 1; }
+        if stats { insts_after = insts_after + iro_count_insts(&f); }
         if changed {
             entry.func = f;
             module.functions.set(i, entry);
         }
         i = i + 1;
     }
-    if iro_stats_on() {
-        p_eprint_str("iropt: fold " + int_to_str(n_fold) + ", dce " + int_to_str(n_dce) + ", tailcall " + int_to_str(n_tail)
+    if stats {
+        p_eprint_str("iropt: fold " + int_to_str(n_fold) + ", simplify " + int_to_str(n_simp) + ", branchfold " + int_to_str(n_branch)
+            + ", branchfacts " + int_to_str(n_facts) + ", sccp " + int_to_str(n_sccp) + ", promote " + int_to_str(n_promote) + ", dse " + int_to_str(n_dse) + ", dce " + int_to_str(n_dce) + ", tailcall " + int_to_str(n_tail)
             + ", gvn " + int_to_str(n_gvn) + ", licm " + int_to_str(n_licm) + " functions changed\n");
+        // ME30: what the mid-end did, for scripts/me-measure.sh
+        p_eprint_str("iropt: instructions " + int_to_str(insts_before) + " -> " + int_to_str(insts_after)
+            + " in " + int_to_str(p_clock_now_ms() - t_start) + " ms\n");
+        // ME5: per-pass timing, most expensive first
+        var ti: i64 = 0;
+        while ti < tp_ms.len() {
+            var tj: i64 = ti + 1;
+            while tj < tp_ms.len() {
+                if tp_ms.get(tj) > tp_ms.get(ti) {
+                    var m1: i64 = tp_ms.get(ti);
+                    tp_ms.set(ti, tp_ms.get(tj));
+                    tp_ms.set(tj, m1);
+                    var n1: str = tp_names.get(ti);
+                    tp_names.set(ti, tp_names.get(tj));
+                    tp_names.set(tj, n1);
+                    var h1: i64 = tp_hits.get(ti);
+                    tp_hits.set(ti, tp_hits.get(tj));
+                    tp_hits.set(tj, h1);
+                }
+                tj = tj + 1;
+            }
+            p_eprint_str("iropt: pass " + tp_names.get(ti) + ": " + int_to_str(tp_ms.get(ti)) + " ms ("
+                + int_to_str(tp_hits.get(ti)) + " calls)\n");
+            ti = ti + 1;
+        }
     }
+}
+
+/// Run pass `name` on `f`, adding its time to the table when `stats`.
+/// Fides calls are resolved statically, so the name dispatches.
+fn iro_time(names: &mut Vec<str>, ms: &mut Vec<i64>, hits: &mut Vec<i64>, name: str, stats: bool, f: &mut IrFunction) -> bool {
+    var t0: i64 = 0;
+    if stats { t0 = p_clock_now_ms(); }
+    var changed: bool = false;
+    if name == "fold" { changed = iro_fold(f); }
+    if name == "simplify" { changed = iro_simplify(f); }
+    if name == "branchfold" { changed = iro_branch_fold(f); }
+    if name == "branchfacts" { changed = iro_branch_facts(f); }
+    if name == "sccp" { changed = iro_sccp(f); }
+    if name == "promote" { changed = iro_promote(f); }
+    if name == "dse" { changed = iro_dse(f); }
+    if name == "dce" { changed = iro_dce(f); }
+    if name == "tailcall" { changed = iro_tailcalls(f); }
+    if name == "gvn" { changed = iro_gvn(f); }
+    if name == "licm" { changed = iro_licm(f); }
+    if stats {
+        var dt: i64 = p_clock_now_ms() - t0;
+        var i: i64 = 0;
+        while i < names.len() {
+            if names.get(i) == name {
+                ms.set(i, ms.get(i) + dt);
+                hits.set(i, hits.get(i) + 1);
+                return changed;
+            }
+            i = i + 1;
+        }
+        names.push(name);
+        ms.push(dt);
+        hits.push(1);
+    }
+    return changed;
 }
 
 // --- Helpers ----------------------------------------------------------------
@@ -1391,4 +1487,1298 @@ fn peir_has_id(v: Vec<i64>, x: i64) -> bool {
         i = i + 1;
     }
     return false;
+}
+
+// --- The mid-end (llvm-roadmap Track ME) -----------------------------------
+
+/// Instructions in the blocks of `f` (ME30's measure).
+fn iro_count_insts(f: &IrFunction) -> i64 {
+    var n: i64 = 0;
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        n = n + f.blocks.get(b).instructions.len();
+        b = b + 1;
+    }
+    return n;
+}
+
+/// ME1: the use lists of a function. `count` is how many operands read
+/// each value, `users` the instructions that read it, `block_of` the block
+/// (index) each instruction is in, `pos_of` its place there (-1: in none).
+/// Built in one pass over the blocks; a pass that changes instructions
+/// rebuilds it (iro_uses) or keeps it current with iro_uses_drop.
+pub struct IroUses {
+    pub count: Vec<i64>,
+    pub users: Vec<Vec<i64>>,
+    pub block_of: Vec<i64>,
+    pub pos_of: Vec<i64>,
+}
+
+pub fn iro_uses(f: &IrFunction) -> IroUses {
+    var n: i64 = f.next_value + 1;
+    var u: IroUses = IroUses { count: peir_zeros(n), users: Vec::new(), block_of: Vec::new(), pos_of: Vec::new() };
+    var z: i64 = 0;
+    while z < n {
+        u.users.push(Vec::new());
+        u.block_of.push(-1);
+        u.pos_of.push(-1);
+        z = z + 1;
+    }
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var ids: Vec<i64> = f.blocks.get(b).instructions;
+        var k: i64 = 0;
+        while k < ids.len() {
+            var id: i64 = ids.get(k);
+            if id >= 0 && id < n {
+                u.block_of.set(id, b);
+                u.pos_of.set(id, k);
+            }
+            var ops: Vec<i64> = Vec::new();
+            peir_inst_operands(peir_inst_of(f, id), &mut ops);
+            var o: i64 = 0;
+            while o < ops.len() {
+                var v: i64 = ops.get(o);
+                if v >= 0 && v < n {
+                    u.count.set(v, u.count.get(v) + 1);
+                    var us: Vec<i64> = u.users.get(v);
+                    us.push(id);
+                    u.users.set(v, us);
+                }
+                o = o + 1;
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    return u;
+}
+
+/// Instruction `id` no longer reads its operands (it is removed or replaced).
+fn iro_uses_drop(u: &mut IroUses, f: &IrFunction, id: i64) {
+    var ops: Vec<i64> = Vec::new();
+    peir_inst_operands(peir_inst_of(f, id), &mut ops);
+    var o: i64 = 0;
+    while o < ops.len() {
+        var v: i64 = ops.get(o);
+        if v >= 0 && v < u.count.len() && u.count.get(v) > 0 { u.count.set(v, u.count.get(v) - 1); }
+        o = o + 1;
+    }
+}
+
+/// The block index whose id is `bid`, or -1.
+fn iro_block_index(f: &IrFunction, bid: i64) -> i64 {
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        if f.blocks.get(b).id == bid { return b; }
+        b = b + 1;
+    }
+    return -1;
+}
+
+/// `id` without the predecessor `from` (an edge from it is gone).
+fn iro_drop_pred(f: &mut IrFunction, bid: i64, from: i64) {
+    var bi: i64 = iro_block_index(f, bid);
+    if bi < 0 { return; }
+    var blk: BasicBlock = f.blocks.get(bi);
+    var keep: Vec<i64> = Vec::new();
+    var dropped: bool = false;
+    var k: i64 = 0;
+    while k < blk.predecessors.len() {
+        if !dropped && blk.predecessors.get(k) == from { dropped = true; } else { keep.push(blk.predecessors.get(k)); }
+        k = k + 1;
+    }
+    if dropped {
+        blk.predecessors = keep;
+        f.blocks.set(bi, blk);
+    }
+}
+
+// ME14: a branch whose condition is a constant (after folding and
+// inlining), or whose two targets are one block, becomes a jump. The
+// block left out loses that predecessor; when nothing reaches it any more
+// the backends' unreachable-block handling drops or keeps it as before.
+fn iro_branch_fold(f: &mut IrFunction) -> bool {
+    var changed: bool = false;
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var blk: BasicBlock = f.blocks.get(b);
+        var nk: i64 = blk.instructions.len();
+        if nk > 0 {
+            var tid: i64 = blk.instructions.get(nk - 1);
+            match peir_inst_of(f, tid) {
+                Inst::Branch(c, t, e) => {
+                    var to: i64 = -1;
+                    var gone: i64 = -1;
+                    if t == e {
+                        to = t;
+                    } else {
+                        match peir_inst_of(f, c) {
+                            Inst::ConstBool(v) => {
+                                if v { to = t; gone = e; } else { to = e; gone = t; }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if to >= 0 {
+                        IrFunction_set_inst(f, tid, Inst::Jump(to));
+                        if gone >= 0 { iro_drop_pred(f, gone, blk.id); }
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        b = b + 1;
+    }
+    if changed { iro_drop_unreachable(f); }
+    return changed;
+}
+
+/// Remove the blocks no jump or branch from the entry reaches any more
+/// (a folded branch's other side), so no pass or backend sees code that
+/// uses values from blocks that no longer dominate it.
+fn iro_drop_unreachable(f: &mut IrFunction) {
+    var cfg: IroCfg = iro_cfg(f);
+    if cfg.n == 0 { return; }
+    var keep_blocks: Vec<BasicBlock> = Vec::new();
+    var gone: Vec<i64> = Vec::new();
+    var b: i64 = 0;
+    while b < cfg.n {
+        if b == 0 || cfg.rpo_num.get(b) >= 0 {
+            keep_blocks.push(f.blocks.get(b));
+        } else {
+            gone.push(f.blocks.get(b).id);
+        }
+        b = b + 1;
+    }
+    if gone.len() == 0 { return; }
+    // their edges into the blocks that stay
+    b = 0;
+    while b < keep_blocks.len() {
+        var blk: BasicBlock = keep_blocks.get(b);
+        var ps: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < blk.predecessors.len() {
+            if !peir_has_id(gone, blk.predecessors.get(k)) { ps.push(blk.predecessors.get(k)); }
+            k = k + 1;
+        }
+        blk.predecessors = ps;
+        keep_blocks.set(b, blk);
+        b = b + 1;
+    }
+    f.blocks = keep_blocks;
+    if f.current_block_idx >= f.blocks.len() { f.current_block_idx = f.blocks.len() - 1; }
+}
+
+// ME13: a branch's condition is a fact inside the edge's region: on the
+// `then` side it is true, on the `else` side false — when the target's
+// only way in is this edge, so every block the target dominates inherits
+// it. A comparison `a < b` there also settles the other comparisons of
+// the same operands (and swapped), and a condition `!a` settles `a`.
+
+/// The relation a comparison allows, as a 3-bit mask {lt=1, eq=2, gt=4}.
+fn iro_cmp_mask(op: BinOp) -> i64 {
+    if binop_eq(op, BinOp::Lt) { return 1; }
+    if binop_eq(op, BinOp::Eq) { return 2; }
+    if binop_eq(op, BinOp::Gt) { return 4; }
+    if binop_eq(op, BinOp::LtEq) { return 3; }
+    if binop_eq(op, BinOp::Neq) { return 5; }
+    if binop_eq(op, BinOp::GtEq) { return 6; }
+    return 0;
+}
+
+/// lt <-> gt in a mask.
+fn iro_cmp_mirror(m: i64) -> i64 {
+    return ((m & 1) * 4) + (m & 2) + ((m & 4) / 4);
+}
+
+/// With the real relation known inside `possible` (a mask), what an
+/// instruction's comparison must be: 1, 0, or -1 when unsettled.
+fn iro_cmp_implied(possible: i64, inst_mask: i64) -> i64 {
+    if inst_mask == 0 { return -1; }
+    if (possible & inst_mask) == possible { return 1; }
+    if (possible & inst_mask) == 0 { return 0; }
+    return -1;
+}
+
+/// A ConstBool `v` at the head of block `bi`; its id.
+fn iro_bool_before(f: &mut IrFunction, bi: i64, v: bool) -> i64 {
+    var cid: i64 = iro_detached(f, Inst::ConstBool(v));
+    var blk: BasicBlock = f.blocks.get(bi);
+    var ids: Vec<i64> = Vec::new();
+    ids.push(cid);
+    var k: i64 = 0;
+    while k < blk.instructions.len() {
+        ids.push(blk.instructions.get(k));
+        k = k + 1;
+    }
+    blk.instructions = ids;
+    f.blocks.set(bi, blk);
+    return cid;
+}
+
+/// Rewrite every use of `v` in blocks dominated by `dom` to `cid`
+/// (`map` has `v` -> `cid` + 1 only). Use lists `u` find the candidates.
+fn iro_rewrite_uses(f: &mut IrFunction, u: &IroUses, cfg: &IroCfg, v: i64, dom: i64, map: &Vec<i64>) -> bool {
+    var changed: bool = false;
+    if v < 0 || v >= u.users.len() { return false; }
+    var us: Vec<i64> = u.users.get(v);
+    var i: i64 = 0;
+    while i < us.len() {
+        var uid: i64 = us.get(i);
+        var ub: i64 = u.block_of.get(uid);
+        if ub == dom || (ub >= 0 && iro_dominates(cfg, dom, ub)) {
+            IrFunction_set_inst(f, uid, iro_remap_all(peir_inst_of(f, uid), map));
+            changed = true;
+        }
+        i = i + 1;
+    }
+    return changed;
+}
+
+fn iro_branch_facts(f: &mut IrFunction) -> bool {
+    if f.blocks.len() == 0 { return false; }
+    var cfg: IroCfg = iro_cfg(f);
+    var u: IroUses = iro_uses(f);
+    var changed: bool = false;
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var blk: BasicBlock = f.blocks.get(b);
+        var nk: i64 = blk.instructions.len();
+        if nk > 0 {
+            var tid: i64 = blk.instructions.get(nk - 1);
+            match peir_inst_of(f, tid) {
+                Inst::Branch(c, t1, t2) => {
+                    if t1 != t2 {
+                        // what the condition says about its operands
+                        var cmask: i64 = 0;
+                        var cx: i64 = -1;
+                        var cy: i64 = -1;
+                        var notof: i64 = -1;
+                        match peir_inst_of(f, c) {
+                            Inst::BinOp(cop, lx, ly, _) => {
+                                cmask = iro_cmp_mask(cop);
+                                cx = lx;
+                                cy = ly;
+                            }
+                            Inst::UnaryOp(uop, a0, _) => {
+                                match uop {
+                                    UnaryOp::Not => { notof = a0; }
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                        var side: i64 = 0;
+                        while side < 2 {
+                            var tgt: i64 = t1;
+                            var truth: bool = true;
+                            if side == 1 { tgt = t2; truth = false; }
+                            var ti: i64 = -1;
+                            if tgt >= 0 && tgt < cfg.index.len() { ti = cfg.index.get(tgt); }
+                            if ti >= 0 {
+                                var ps: Vec<i64> = cfg.preds.get(ti);
+                                var sole: bool = ps.len() == 1 && ps.get(0) == b;
+                                if sole {
+                                    var possible: i64 = cmask;
+                                    if !truth { possible = 7 - cmask; }
+                                    var cid: i64 = -1;
+                                    var mp: Vec<i64> = peir_zeros(f.next_value + 1);
+                                    var i2: i64 = 0;
+                                    while i2 < f.blocks.len() {
+                                        if i2 == ti || iro_dominates(&cfg, ti, i2) {
+                                            var db: BasicBlock = f.blocks.get(i2);
+                                            var k2: i64 = 0;
+                                            while k2 < db.instructions.len() {
+                                                var uid: i64 = db.instructions.get(k2);
+                                                var ui: Inst = peir_inst_of(f, uid);
+                                                // a comparison of the same
+                                                // operands is settled too
+                                                match ui {
+                                                    Inst::BinOp(iop, il, ir, _) => {
+                                                        if cmask != 0 && iop_is_cmp(iop) {
+                                                            var m: i64 = -1;
+                                                            if il == cx && ir == cy { m = iro_cmp_implied(possible, iro_cmp_mask(iop)); }
+                                                            else if il == cy && ir == cx { m = iro_cmp_implied(possible, iro_cmp_mirror(iro_cmp_mask(iop))); }
+                                                            if m >= 0 {
+                                                                IrFunction_set_inst(f, uid, Inst::ConstBool(m == 1));
+                                                                changed = true;
+                                                            }
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
+                                                // and c itself is `val` here
+                                                var uses_c: bool = false;
+                                                var ops2: Vec<i64> = Vec::new();
+                                                peir_inst_operands(ui, &mut ops2);
+                                                var o2: i64 = 0;
+                                                while o2 < ops2.len() {
+                                                    if ops2.get(o2) == c { uses_c = true; }
+                                                    o2 = o2 + 1;
+                                                }
+                                                if uses_c {
+                                                    if cid < 0 { cid = iro_bool_before(f, ti, truth); mp.set(c, cid + 1); }
+                                                    IrFunction_set_inst(f, uid, iro_remap_all(ui, &mp));
+                                                    changed = true;
+                                                }
+                                                k2 = k2 + 1;
+                                            }
+                                        }
+                                        i2 = i2 + 1;
+                                    }
+                                    // c = !a: the operand is `!val` here
+                                    if notof >= 0 && notof < u.users.len() {
+                                        var us3: Vec<i64> = u.users.get(notof);
+                                        var ui3: i64 = 0;
+                                        while ui3 < us3.len() {
+                                            var uid3: i64 = us3.get(ui3);
+                                            var ub3: i64 = u.block_of.get(uid3);
+                                            if ub3 == ti || (ub3 >= 0 && iro_dominates(&cfg, ti, ub3)) {
+                                                var cid2: i64 = iro_bool_before(f, ti, !truth);
+                                                var mp2: Vec<i64> = peir_zeros(f.next_value + 1);
+                                                mp2.set(notof, cid2 + 1);
+                                                IrFunction_set_inst(f, uid3, iro_remap_all(peir_inst_of(f, uid3), &mp2));
+                                                changed = true;
+                                            }
+                                            ui3 = ui3 + 1;
+                                        }
+                                    }
+                                }
+                            }
+                            side = side + 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        b = b + 1;
+    }
+    if changed { iro_branch_fold(f); iro_dce_more(f); }
+    return changed;
+}
+
+/// `op` orders two values (not And/Or on booleans, not arithmetic).
+fn iop_is_cmp(op: BinOp) -> bool {
+    return binop_eq(op, BinOp::Eq) || binop_eq(op, BinOp::Neq) || binop_eq(op, BinOp::Lt)
+        || binop_eq(op, BinOp::Gt) || binop_eq(op, BinOp::LtEq) || binop_eq(op, BinOp::GtEq);
+}
+
+// ME14: sparse conditional constant propagation. Every value has a single
+// definition (verifier-checked), so each lattice cell is evaluated once:
+// blocks are visited in reverse postorder restricted to feasible edges —
+// a block's operands are always defined in dominators that ran first.
+// Lattice: 0 top (not evaluated), 1 constant (lat_v), 2 varying.
+// Const-valued instructions become ConstInt/ConstBool; a branch on a
+// constant loses the dead edge; unreachable blocks are dropped after.
+
+fn iro_sccp_eval(op: BinOp, a: i64, b: i64, out: &mut Vec<i64>) {
+    // out: [tag, value]; tag 1 const, 2 varying (a fold that would panic
+    // is varying, not a constant — the runtime raises the panic).
+    var r: i64 = 0;
+    var tag: i64 = 2;
+    var ok: bool = false;
+    var i64min: i64 = 0 - 9223372036854775807 - 1;
+    if binop_eq(op, BinOp::Add) {
+        r = a + b;
+        if !((a > 0 && b > 0 && r <= 0) || (a < 0 && b < 0 && r >= 0)) { ok = true; }
+    } else if binop_eq(op, BinOp::Sub) {
+        r = a - b;
+        if !((b < 0 && a >= 0 && r < 0) || (b > 0 && a <= 0 && r > 0)) { ok = true; }
+    } else if binop_eq(op, BinOp::Mul) {
+        r = a * b;
+        var ov: bool = false;
+        if a == i64min && b == 0 - 1 { ov = true; }
+        else if a != 0 && r / a != b { ov = true; }
+        if !ov { ok = true; }
+    } else if binop_eq(op, BinOp::Div) {
+        if b != 0 && !(a == i64min && b == 0 - 1) { r = a / b; ok = true; }
+    } else if binop_eq(op, BinOp::Mod) {
+        if b != 0 && !(a == i64min && b == 0 - 1) { r = a % b; ok = true; }
+    } else if binop_eq(op, BinOp::Shl) {
+        if b >= 0 && b < 64 { r = a << b; ok = true; }
+    } else if binop_eq(op, BinOp::Shr) {
+        if b >= 0 && b < 64 { r = a >> b; ok = true; }
+    } else if binop_eq(op, BinOp::BitAnd) { r = a & b; ok = true; }
+    else if binop_eq(op, BinOp::BitOr) { r = a | b; ok = true; }
+    else if binop_eq(op, BinOp::BitXor) { r = a ^ b; ok = true; }
+    else if binop_eq(op, BinOp::And) { if a != 0 && b != 0 { r = 1; } ok = true; }
+    else if binop_eq(op, BinOp::Or) { if a != 0 || b != 0 { r = 1; } ok = true; }
+    else if binop_eq(op, BinOp::Eq) { if a == b { r = 1; } ok = true; }
+    else if binop_eq(op, BinOp::Neq) { if a != b { r = 1; } ok = true; }
+    else if binop_eq(op, BinOp::Lt) { if a < b { r = 1; } ok = true; }
+    else if binop_eq(op, BinOp::Gt) { if a > b { r = 1; } ok = true; }
+    else if binop_eq(op, BinOp::LtEq) { if a <= b { r = 1; } ok = true; }
+    else if binop_eq(op, BinOp::GtEq) { if a >= b { r = 1; } ok = true; }
+    if ok { tag = 1; }
+    out.push(tag); out.push(r);
+}
+
+/// Bits kept by an IntTrunc/IntExtend into `to`, with `to`'s sign.
+fn iro_eval_narrow(v: i64, to: IrType) -> i64 {
+    var bits: i64 = ir_type_size(to) * 8;
+    if bits >= 64 { return v; }
+    var mask: i64 = (1 << bits) - 1;
+    var r: i64 = v & mask;
+    var top: i64 = 1 << (bits - 1);
+    if !iro_unsigned(to) && (r & top) != 0 { r = r - (1 << bits); }
+    return r;
+}
+
+fn iro_sccp(f: &mut IrFunction) -> bool {
+    var cfg: IroCfg = iro_cfg(f);
+    if cfg.n == 0 { return false; }
+    var n: i64 = f.next_value + 1;
+    var lat_t: Vec<i64> = peir_zeros(n);   // 0 top, 1 const, 2 varying
+    var lat_v: Vec<i64> = peir_zeros(n);
+    var live: Vec<i64> = peir_zeros(cfg.n);
+    var entry_b: i64 = -1;
+    var e: i64 = 0;
+    while e < f.blocks.len() {
+        if f.blocks.get(e).id == f.entry { entry_b = e; break; }
+        e = e + 1;
+    }
+    if entry_b < 0 { entry_b = 0; }
+    live.set(entry_b, 1);
+    var changed: bool = false;
+    var ri: i64 = 0;
+    while ri < cfg.rpo.len() {
+        var bi: i64 = cfg.rpo.get(ri);
+        if live.get(bi) == 0 { ri = ri + 1; continue; }
+        var blk: BasicBlock = f.blocks.get(bi);
+        var k: i64 = 0;
+        while k < blk.instructions.len() {
+            var id: i64 = blk.instructions.get(k);
+            if id >= 0 && id < n && lat_t.get(id) == 0 {
+                var tag: i64 = 2;
+                var cval: i64 = 0;
+                match peir_inst_of(f, id) {
+                    Inst::ConstInt(v, _) => { tag = 1; cval = v; }
+                    Inst::ConstBool(v) => { tag = 1; if v { cval = 1; } }
+                    Inst::ConstNull(_) => { tag = 1; cval = 0; }
+                    Inst::BinOp(op, a, bb, t) => {
+                        if iro_int_ty(t) && a >= 0 && a < n && bb >= 0 && bb < n
+                            && lat_t.get(a) == 1 && lat_t.get(bb) == 1 {
+                            var ev: Vec<i64> = Vec::new();
+                            iro_sccp_eval(op, lat_v.get(a), lat_v.get(bb), &mut ev);
+                            tag = ev.get(0); cval = ev.get(1);
+                        }
+                    }
+                    Inst::UnaryOp(uop, a, t) => {
+                        if iro_int_ty(t) && a >= 0 && a < n && lat_t.get(a) == 1 {
+                            var av: i64 = lat_v.get(a);
+                            match uop {
+                                UnaryOp::Neg => {
+                                    if av == 0 - 9223372036854775807 - 1 { tag = 2; }
+                                    else { tag = 1; cval = 0 - av; }
+                                }
+                                UnaryOp::BitNot => { tag = 1; cval = 0 - av - 1; }
+                                UnaryOp::Not => { tag = 1; if av == 0 { cval = 1; } }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Inst::IntExtend(a, _, tt) => {
+                        if iro_int_ty(tt) && a >= 0 && a < n && lat_t.get(a) == 1 {
+                            tag = 1; cval = iro_eval_narrow(lat_v.get(a), tt);
+                        }
+                    }
+                    Inst::IntTrunc(a, _, tt) => {
+                        if iro_int_ty(tt) && a >= 0 && a < n && lat_t.get(a) == 1 {
+                            tag = 1; cval = iro_eval_narrow(lat_v.get(a), tt);
+                        }
+                    }
+                    Inst::BitCast(a, _, tt) => {
+                        if iro_int_ty(tt) && a >= 0 && a < n && lat_t.get(a) == 1 {
+                            tag = 1; cval = lat_v.get(a);
+                        }
+                    }
+                    _ => {}
+                }
+                lat_t.set(id, tag);
+                lat_v.set(id, cval);
+            }
+            k = k + 1;
+        }
+        if blk.instructions.len() > 0 {
+            var last: i64 = blk.instructions.get(blk.instructions.len() - 1);
+            var mark: Vec<i64> = Vec::new();
+            match peir_inst_of(f, last) {
+                Inst::Jump(t) => { mark.push(t); }
+                Inst::Branch(c, t1, t2) => {
+                    var is_c: bool = c >= 0 && c < n && lat_t.get(c) == 1;
+                    var keep_t: i64 = -1;
+                    if is_c {
+                        if lat_v.get(c) != 0 { keep_t = t1; } else { keep_t = t2; }
+                    }
+                    if keep_t >= 0 {
+                        IrFunction_set_inst(f, last, Inst::Jump(keep_t));
+                        var gone: i64 = t2;
+                        if keep_t == t2 { gone = t1; }
+                        iro_drop_pred(f, gone, blk.id);
+                        mark.push(keep_t);
+                        changed = true;
+                    } else { mark.push(t1); mark.push(t2); }
+                }
+                _ => {}
+            }
+            var mi: i64 = 0;
+            while mi < mark.len() {
+                var mid: i64 = mark.get(mi);
+                var midx: i64 = -1;
+                if mid >= 0 && mid < cfg.index.len() { midx = cfg.index.get(mid); }
+                if midx >= 0 { live.set(midx, 1); }
+                mi = mi + 1;
+            }
+        }
+        ri = ri + 1;
+    }
+    var ri2: i64 = 0;
+    while ri2 < cfg.rpo.len() {
+        var bi2: i64 = cfg.rpo.get(ri2);
+        if live.get(bi2) != 0 {
+            var blk2: BasicBlock = f.blocks.get(bi2);
+            var k2: i64 = 0;
+            while k2 < blk2.instructions.len() {
+                var id2: i64 = blk2.instructions.get(k2);
+                if id2 >= 0 && id2 < n && lat_t.get(id2) == 1 {
+                    match peir_inst_of(f, id2) {
+                        Inst::ConstInt(_, _) => {}
+                        Inst::ConstBool(_) => {}
+                        Inst::ConstNull(_) => {}
+                        Inst::BinOp(op, _, _, t) => {
+                            if iop_is_cmp(op) || binop_eq(op, BinOp::And) || binop_eq(op, BinOp::Or) {
+                                IrFunction_set_inst(f, id2, Inst::ConstBool(lat_v.get(id2) != 0));
+                            } else {
+                                IrFunction_set_inst(f, id2, Inst::ConstInt(lat_v.get(id2), t));
+                            }
+                            changed = true;
+                        }
+                        Inst::UnaryOp(uop, _, t) => {
+                            var isbool: bool = false;
+                            match uop { UnaryOp::Not => { isbool = true; } _ => {} }
+                            if isbool {
+                                IrFunction_set_inst(f, id2, Inst::ConstBool(lat_v.get(id2) != 0));
+                            } else {
+                                IrFunction_set_inst(f, id2, Inst::ConstInt(lat_v.get(id2), t));
+                            }
+                            changed = true;
+                        }
+                        Inst::IntExtend(_, _, t) => {
+                            if iro_int_ty(t) { IrFunction_set_inst(f, id2, Inst::ConstInt(lat_v.get(id2), t)); changed = true; }
+                        }
+                        Inst::IntTrunc(_, _, t) => {
+                            if iro_int_ty(t) { IrFunction_set_inst(f, id2, Inst::ConstInt(lat_v.get(id2), t)); changed = true; }
+                        }
+                        Inst::BitCast(_, _, t) => {
+                            if iro_int_ty(t) { IrFunction_set_inst(f, id2, Inst::ConstInt(lat_v.get(id2), t)); changed = true; }
+                        }
+                        _ => {}
+                    }
+                }
+                k2 = k2 + 1;
+            }
+        }
+        ri2 = ri2 + 1;
+    }
+    if changed { iro_drop_unreachable(f); }
+    return changed;
+}
+
+// ME15: dead stores. A local whose address goes nowhere but loads and
+// stores (iro_plain_locals), that the backend does not read by itself
+// (drops, @zeroize, @persist), and that is never loaded: every store to it
+// is dead.
+// stores (iro_plain_locals), that the backend does not read by itself
+// (drops, @zeroize, @persist), and that is never loaded: every store to it
+// is dead. In a block, a store followed by another store to the same such
+// local with no load of it in between is dead too (no other code can read
+// the local; what a panic between them would skip is never seen, since
+// nothing unwinds). The stored values stay: only the stores go.
+
+fn iro_backend_reads(f: &IrFunction, loc: i64) -> bool {
+    var i: i64 = 0;
+    while i < f.drop_locals.len() {
+        if f.drop_locals.get(i).id == loc { return true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < f.zeroize_locals.len() {
+        if f.zeroize_locals.get(i).id == loc { return true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < f.persist_vars.len() {
+        if f.persist_vars.get(i).id == loc { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Does `inst` leave the middle of its block (a stored value may then be
+/// read elsewhere)?
+fn iro_dse_barrier(inst: Inst) -> bool {
+    match inst {
+        Inst::TryUnwrap(_, _, _, _) => { return true; }
+        Inst::Asm(_, _, _, _) => { return true; }
+        Inst::PersistLoad(_, _, _) => { return true; }
+        Inst::PersistSave(_, _) => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn iro_dse(f: &mut IrFunction) -> bool {
+    var plain: Vec<i64> = iro_plain_locals(f);
+    var n: i64 = plain.len();
+    // the plain locals that are read at all
+    var loaded: Vec<i64> = peir_zeros(n);
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var ids: Vec<i64> = f.blocks.get(b).instructions;
+        var k: i64 = 0;
+        while k < ids.len() {
+            match peir_inst_of(f, ids.get(k)) {
+                Inst::Load(p, _) => { if p >= 0 && p < n { loaded.set(p, 1); } }
+                _ => {}
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    var changed: bool = false;
+    b = 0;
+    while b < f.blocks.len() {
+        var blk: BasicBlock = f.blocks.get(b);
+        var dead: Vec<i64> = peir_zeros(blk.instructions.len());
+        // the last store to each local in this block not read since (index + 1)
+        var pending: i64 = HashMap_new();
+        var any: bool = false;
+        var k: i64 = 0;
+        while k < blk.instructions.len() {
+            var inst: Inst = peir_inst_of(f, blk.instructions.get(k));
+            if iro_dse_barrier(inst) {
+                HashMap_clear(pending);
+            }
+            match inst {
+                Inst::Store(p, _, _) => {
+                    if p >= 0 && p < n && plain.get(p) == 1 && !iro_backend_reads(f, p) {
+                        if loaded.get(p) == 0 {
+                            dead.set(k, 1);
+                            any = true;
+                        } else {
+                            var key: str = int_to_str(p);
+                            if HashMap_contains(pending, key) {
+                                dead.set(HashMap_get(pending, key) - 1, 1);
+                                any = true;
+                            }
+                            HashMap_insert(pending, key, k + 1);
+                        }
+                    }
+                }
+                Inst::Load(p2, _) => {
+                    if p2 >= 0 && p2 < n { HashMap_remove(pending, int_to_str(p2)); }
+                }
+                _ => {}
+            }
+            k = k + 1;
+        }
+        if any {
+            var keep: Vec<i64> = Vec::new();
+            k = 0;
+            while k < blk.instructions.len() {
+                if dead.get(k) == 0 { keep.push(blk.instructions.get(k)); }
+                k = k + 1;
+            }
+            blk.instructions = keep;
+            f.blocks.set(b, blk);
+            changed = true;
+        }
+        b = b + 1;
+    }
+    if changed { iro_dce_more(f); }
+    return changed;
+}
+
+/// Values DCE may drop beyond iro_pure: ones that cannot panic, read no
+/// memory others write and do nothing else (comparisons, bit operations,
+/// widening, a load of a plain local). Checked arithmetic is not among
+/// them: dropping it would drop its overflow panic.
+fn iro_removable(inst: Inst, plain: &Vec<i64>) -> bool {
+    if iro_pure(inst) { return true; }
+    match inst {
+        Inst::BinOp(op, _, _, _) => {
+            return binop_eq(op, BinOp::Eq) || binop_eq(op, BinOp::Neq) || binop_eq(op, BinOp::Lt)
+                || binop_eq(op, BinOp::Gt) || binop_eq(op, BinOp::LtEq) || binop_eq(op, BinOp::GtEq)
+                || binop_eq(op, BinOp::BitAnd) || binop_eq(op, BinOp::BitOr) || binop_eq(op, BinOp::BitXor)
+                || binop_eq(op, BinOp::And) || binop_eq(op, BinOp::Or);
+        }
+        Inst::IntExtend(_, _, _) => { return true; }
+        Inst::Load(p, _) => { return p >= 0 && p < plain.len() && plain.get(p) == 1; }
+        _ => { return false; }
+    }
+}
+
+/// DCE with iro_removable, until nothing more goes (the values the dead
+/// stores stored, the loads and comparisons only they used).
+fn iro_dce_more(f: &mut IrFunction) -> bool {
+    var plain: Vec<i64> = iro_plain_locals(f);
+    var any: bool = false;
+    var round: i64 = 0;
+    while round < 4 {
+        var u: IroUses = iro_uses(f);
+        var removed: bool = false;
+        var b: i64 = 0;
+        while b < f.blocks.len() {
+            var blk: BasicBlock = f.blocks.get(b);
+            var keep: Vec<i64> = Vec::new();
+            var gone: bool = false;
+            var k: i64 = 0;
+            while k < blk.instructions.len() {
+                var id: i64 = blk.instructions.get(k);
+                if id >= 0 && id < u.count.len() && u.count.get(id) == 0 && iro_removable(peir_inst_of(f, id), &plain) {
+                    gone = true;
+                } else {
+                    keep.push(id);
+                }
+                k = k + 1;
+            }
+            if gone {
+                blk.instructions = keep;
+                f.blocks.set(b, blk);
+                removed = true;
+            }
+            b = b + 1;
+        }
+        if !removed { return any; }
+        any = true;
+        round = round + 1;
+    }
+    return any;
+}
+
+// ME12: algebraic simplification beyond the identities of rules.fd.
+//   - (x + c1) + c2 -> x + (c1 + c2), and the same with subtractions, when
+//     c1 and c2 move x the same way: the sum overflows exactly when one of
+//     the two steps did, so every overflow panic stays (the inner step,
+//     read only here, goes)
+//   - x * 2^k -> x << k where the multiplication needs no overflow check
+//     (checks.fd's flags, or an @wrapping function)
+//   - x / 2^k -> x >> k and x % 2^k -> x & (2^k - 1) for x known >= 0 or
+//     of an unsigned type (the divisor is not zero: no check is lost)
+
+/// k when c is 2^k (1 <= k <= 62), else -1.
+fn iro_log2(c: i64) -> i64 {
+    if c < 2 { return -1; }
+    var k: i64 = 0;
+    var v: i64 = c;
+    while v > 1 {
+        if (v & 1) != 0 { return -1; }
+        v = v >> 1;
+        k = k + 1;
+    }
+    if k > 62 { return -1; }
+    return k;
+}
+
+fn iro_unsigned(t: IrType) -> bool {
+    match t {
+        IrType::U8 => { return true; }
+        IrType::U16 => { return true; }
+        IrType::U32 => { return true; }
+        IrType::U64 => { return true; }
+        _ => { return false; }
+    }
+}
+
+/// The signed step `id` adds to its first operand: x + c is c, x - c is -c
+/// (OptI64::None when it is not one, or -c would not fit).
+fn iro_step(f: &IrFunction, id: i64) -> OptI64 {
+    match peir_inst_of(f, id) {
+        Inst::BinOp(op, _, r, t) => {
+            if !ir_type_eq(t, IrType::I64) { return OptI64::None; }
+            match iro_const_int(f, r) {
+                OptI64::Some(c) => {
+                    if binop_eq(op, BinOp::Add) { return OptI64::Some(c); }
+                    if binop_eq(op, BinOp::Sub) && c != 0 - IRO_I64_MAX - 1 { return OptI64::Some(0 - c); }
+                }
+                OptI64::None => {}
+            }
+        }
+        _ => {}
+    }
+    return OptI64::None;
+}
+
+fn iro_first_operand(f: &IrFunction, id: i64) -> i64 {
+    match peir_inst_of(f, id) {
+        Inst::BinOp(_, l, _, _) => { return l; }
+        _ => { return -1; }
+    }
+}
+
+/// A constant placed in front of position `pos` of block `bi`.
+fn iro_const_before(f: &mut IrFunction, bi: i64, pos: i64, v: i64, t: IrType) -> i64 {
+    var cid: i64 = iro_detached(f, Inst::ConstInt(v, t));
+    var blk: BasicBlock = f.blocks.get(bi);
+    var ids: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < blk.instructions.len() {
+        if k == pos { ids.push(cid); }
+        ids.push(blk.instructions.get(k));
+        k = k + 1;
+    }
+    if pos >= blk.instructions.len() { ids.push(cid); }
+    blk.instructions = ids;
+    f.blocks.set(bi, blk);
+    return cid;
+}
+
+fn iro_remove_from_block(f: &mut IrFunction, id: i64) {
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var blk: BasicBlock = f.blocks.get(b);
+        var keep: Vec<i64> = Vec::new();
+        var found: bool = false;
+        var k: i64 = 0;
+        while k < blk.instructions.len() {
+            if blk.instructions.get(k) == id { found = true; } else { keep.push(blk.instructions.get(k)); }
+            k = k + 1;
+        }
+        if found {
+            blk.instructions = keep;
+            f.blocks.set(b, blk);
+            return;
+        }
+        b = b + 1;
+    }
+}
+
+/// An integer or boolean type: identities never apply to floats
+/// (`x * 0` is not 0 for NaN, `x - x` is not 0 for -0.0).
+fn iro_int_ty(t: IrType) -> bool {
+    match t {
+        IrType::I8 => { return true; }
+        IrType::I16 => { return true; }
+        IrType::I32 => { return true; }
+        IrType::I64 => { return true; }
+        IrType::U8 => { return true; }
+        IrType::U16 => { return true; }
+        IrType::U32 => { return true; }
+        IrType::U64 => { return true; }
+        IrType::Bool => { return true; }
+        _ => { return false; }
+    }
+}
+
+/// `v` renamed through `map` until it maps nowhere (the value an identity
+/// leaves behind can itself have been folded).
+fn iro_map_final(map: &Vec<i64>, v: i64) -> i64 {
+    var x: i64 = v;
+    var gi: i64 = 0;
+    while x >= 0 && x < map.len() && map.get(x) != 0 && gi < 10000 {
+        x = map.get(x) - 1;
+        gi = gi + 1;
+    }
+    return x;
+}
+
+/// A ConstBool instruction as 0/1.
+fn iro_const_bool_val(f: &IrFunction, id: i64) -> OptI64 {
+    match peir_inst_of(f, id) {
+        Inst::ConstBool(v) => { if v { return OptI64::Some(1); } return OptI64::Some(0); }
+        _ => { return OptI64::None; }
+    }
+}
+
+/// ME12: identities — an op whose result is a constant or one of its
+/// operands. Only where removing the op cannot remove a panic: under
+/// checked arithmetic `x / x`, `0 / x`, `0 % x` and `0 << x` stay
+/// (they can still panic); `x + 0`, `x * 0`, `x / 1`, `x % 1`, `x - x`,
+/// `x << 0` and every bit op never can.
+fn iro_identities(f: &mut IrFunction) -> bool {
+    var bad: Vec<i64> = iro_unhandled_uses(f);
+    var map: Vec<i64> = peir_zeros(f.next_value + 1);
+    var dead: Vec<i64> = peir_zeros(f.next_value + 1);
+    var changed: bool = false;
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var ids: Vec<i64> = f.blocks.get(b).instructions;
+        var k: i64 = 0;
+        while k < ids.len() {
+            var id: i64 = ids.get(k);
+            if id >= 0 && id < bad.len() && bad.get(id) == 0 {
+                var alias: i64 = -1;
+                var bkonst: i64 = -1;
+                match peir_inst_of(f, id) {
+                    Inst::BinOp(op, l, r, t) => {
+                        var lkonst: OptI64 = iro_const_int(f, l);
+                        var rkonst: OptI64 = iro_const_int(f, r);
+                        var lc0: bool = false;
+                        var rc0: bool = false;
+                        var lc1: bool = false;
+                        var rc1: bool = false;
+                        var lneg1: bool = false;
+                        var rneg1: bool = false;
+                        match lkonst { OptI64::Some(c) => { lc0 = c == 0; lc1 = c == 1; lneg1 = c == 0 - 1; } OptI64::None => {} }
+                        match rkonst { OptI64::Some(c) => { rc0 = c == 0; rc1 = c == 1; rneg1 = c == 0 - 1; } OptI64::None => {} }
+                        if iro_int_ty(t) {
+                            if binop_eq(op, BinOp::Add) {
+                                if rc0 { alias = l; } else if lc0 { alias = r; }
+                            } else if binop_eq(op, BinOp::Sub) {
+                                if rc0 { alias = l; } else if l == r { IrFunction_set_inst(f, id, Inst::ConstInt(0, t)); changed = true; }
+                            } else if binop_eq(op, BinOp::Mul) {
+                                if lc0 || rc0 { IrFunction_set_inst(f, id, Inst::ConstInt(0, t)); changed = true; }
+                                else if lc1 { alias = r; } else if rc1 { alias = l; }
+                            } else if binop_eq(op, BinOp::Div) {
+                                if rc1 { alias = l; }
+                            } else if binop_eq(op, BinOp::Mod) {
+                                if rc1 { IrFunction_set_inst(f, id, Inst::ConstInt(0, t)); changed = true; }
+                            } else if binop_eq(op, BinOp::Shl) || binop_eq(op, BinOp::Shr) {
+                                if rc0 { alias = l; }
+                            } else if binop_eq(op, BinOp::BitAnd) {
+                                if lc0 || rc0 { IrFunction_set_inst(f, id, Inst::ConstInt(0, t)); changed = true; }
+                                else if l == r { alias = l; }
+                                else if rneg1 && (ir_type_eq(t, IrType::I64) || ir_type_eq(t, IrType::U64)) { alias = l; }
+                                else if lneg1 && (ir_type_eq(t, IrType::I64) || ir_type_eq(t, IrType::U64)) { alias = r; }
+                            } else if binop_eq(op, BinOp::BitOr) {
+                                if rc0 { alias = l; } else if lc0 { alias = r; }
+                                else if l == r { alias = l; }
+                                else if (lneg1 || rneg1) && (ir_type_eq(t, IrType::I64) || ir_type_eq(t, IrType::U64)) {
+                                    IrFunction_set_inst(f, id, Inst::ConstInt(0 - 1, t)); changed = true;
+                                }
+                            } else if binop_eq(op, BinOp::BitXor) {
+                                if rc0 { alias = l; } else if lc0 { alias = r; }
+                                else if l == r { IrFunction_set_inst(f, id, Inst::ConstInt(0, t)); changed = true; }
+                            } else if binop_eq(op, BinOp::And) || binop_eq(op, BinOp::Or) {
+                                var lb: OptI64 = iro_const_bool_val(f, l);
+                                var rb: OptI64 = iro_const_bool_val(f, r);
+                                var lbv: i64 = -1;
+                                var rbv: i64 = -1;
+                                match lb { OptI64::Some(v) => { lbv = v; } OptI64::None => {} }
+                                match rb { OptI64::Some(v) => { rbv = v; } OptI64::None => {} }
+                                if binop_eq(op, BinOp::And) {
+                                    if rbv == 0 || lbv == 0 { bkonst = 0; }
+                                    else if rbv == 1 { alias = l; } else if lbv == 1 { alias = r; }
+                                } else {
+                                    if rbv == 1 || lbv == 1 { bkonst = 1; }
+                                    else if rbv == 0 { alias = l; } else if lbv == 0 { alias = r; }
+                                }
+                            } else {
+                                // comparisons of a value with itself: Eq,
+                                // LtEq, GtEq always true; Neq, Lt, Gt false
+                                if l == r && !binop_eq(op, BinOp::And) && !binop_eq(op, BinOp::Or) {
+                                    if binop_eq(op, BinOp::Eq) || binop_eq(op, BinOp::LtEq) || binop_eq(op, BinOp::GtEq) { bkonst = 1; }
+                                    if binop_eq(op, BinOp::Neq) || binop_eq(op, BinOp::Lt) || binop_eq(op, BinOp::Gt) { bkonst = 0; }
+                                }
+                            }
+                        } else if !iro_int_ty(t) && l == r {
+                            // a pointer compared to itself: still total
+                            match t {
+                                IrType::Ptr(_) => {
+                                    if binop_eq(op, BinOp::Eq) { bkonst = 1; }
+                                    if binop_eq(op, BinOp::Neq) { bkonst = 0; }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Inst::UnaryOp(uop, a, _) => {
+                        // -(-x), !( !x ), ~(~x): the inner op keeps its own
+                        // panic (Neg of MIN), the outer one cannot add one
+                        match peir_inst_of(f, a) {
+                            Inst::UnaryOp(uop2, a2, _) => {
+                                var same: bool = false;
+                                match uop {
+                                    UnaryOp::Neg => { match uop2 { UnaryOp::Neg => { same = true; } _ => {} } }
+                                    UnaryOp::Not => { match uop2 { UnaryOp::Not => { same = true; } _ => {} } }
+                                    UnaryOp::BitNot => { match uop2 { UnaryOp::BitNot => { same = true; } _ => {} } }
+                                    _ => {}
+                                }
+                                if same { alias = a2; }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+                if alias >= 0 && alias < map.len() {
+                    var fx: i64 = iro_map_final(&map, alias);
+                    if fx != id {
+                        map.set(id, fx + 1);
+                        dead.set(id, 1);
+                        changed = true;
+                    }
+                }
+                if bkonst >= 0 {
+                    IrFunction_set_inst(f, id, Inst::ConstBool(bkonst == 1));
+                    changed = true;
+                }
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    if changed {
+        iro_apply_map(f, &map);
+        b = 0;
+        while b < f.blocks.len() {
+            var blk: BasicBlock = f.blocks.get(b);
+            var keep: Vec<i64> = Vec::new();
+            var k2: i64 = 0;
+            while k2 < blk.instructions.len() {
+                var i2: i64 = blk.instructions.get(k2);
+                if i2 < 0 || i2 >= dead.len() || dead.get(i2) == 0 { keep.push(i2); }
+                k2 = k2 + 1;
+            }
+            blk.instructions = keep;
+            f.blocks.set(b, blk);
+            b = b + 1;
+        }
+    }
+    return changed;
+}
+
+fn iro_simplify(f: &mut IrFunction) -> bool {
+    var changed: bool = false;
+    if iro_identities(f) { changed = true; }
+    var flags: Vec<i64> = peir_unchecked_ops(f, f.next_value + 1);
+    var u: IroUses = iro_uses(f);
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var k: i64 = 0;
+        while k < f.blocks.get(b).instructions.len() {
+            var id: i64 = f.blocks.get(b).instructions.get(k);
+            match peir_inst_of(f, id) {
+                Inst::BinOp(op, l, r, t) => {
+                    var done: bool = false;
+                    // reassociation of constant steps
+                    if binop_eq(op, BinOp::Add) || binop_eq(op, BinOp::Sub) {
+                        match iro_step(f, id) {
+                            OptI64::Some(d2) => {
+                                if l >= 0 && l < u.count.len() && u.count.get(l) == 1 && u.block_of.get(l) == b {
+                                    match iro_step(f, l) {
+                                        OptI64::Some(d1) => {
+                                            var same: bool = (d1 > 0 && d2 > 0) || (d1 < 0 && d2 < 0);
+                                            var fits: bool = (d1 > 0 && d2 <= IRO_I64_MAX - d1) || (d1 < 0 && d2 >= (0 - IRO_I64_MAX) - d1);
+                                            if same && fits {
+                                                var x: i64 = iro_first_operand(f, l);
+                                                var d: i64 = d1 + d2;
+                                                var cid: i64 = 0;
+                                                if d > 0 {
+                                                    cid = iro_const_before(f, b, k, d, t);
+                                                    IrFunction_set_inst(f, id, Inst::BinOp(BinOp::Add, x, cid, t));
+                                                } else {
+                                                    cid = iro_const_before(f, b, k, 0 - d, t);
+                                                    IrFunction_set_inst(f, id, Inst::BinOp(BinOp::Sub, x, cid, t));
+                                                }
+                                                iro_remove_from_block(f, l);
+                                                u = iro_uses(f);
+                                                changed = true;
+                                                done = true;
+                                            }
+                                        }
+                                        OptI64::None => {}
+                                    }
+                                }
+                            }
+                            OptI64::None => {}
+                        }
+                    }
+                    // multiplication by a power of two
+                    if !done && binop_eq(op, BinOp::Mul) && (ir_type_eq(t, IrType::I64) || iro_unsigned(t)) {
+                        var unchecked: bool = f.is_wrapping || (id < flags.len() && (flags.get(id) & 1) != 0);
+                        if unchecked {
+                            var x2: i64 = -1;
+                            var sh: i64 = -1;
+                            match iro_const_int(f, r) {
+                                OptI64::Some(c) => { sh = iro_log2(c); x2 = l; }
+                                OptI64::None => {
+                                    match iro_const_int(f, l) {
+                                        OptI64::Some(c2) => { sh = iro_log2(c2); x2 = r; }
+                                        OptI64::None => {}
+                                    }
+                                }
+                            }
+                            if sh > 0 {
+                                var kid: i64 = iro_const_before(f, b, k, sh, t);
+                                IrFunction_set_inst(f, id, Inst::BinOp(BinOp::Shl, x2, kid, t));
+                                u = iro_uses(f);
+                                changed = true;
+                                done = true;
+                            }
+                        }
+                    }
+                    // division and remainder by a power of two
+                    if !done && (binop_eq(op, BinOp::Div) || binop_eq(op, BinOp::Mod)) && (ir_type_eq(t, IrType::I64) || iro_unsigned(t)) {
+                        var nonneg: bool = iro_unsigned(t) || (l >= 0 && l < flags.len() && (flags.get(l) & 2) != 0);
+                        match iro_const_int(f, r) {
+                            OptI64::Some(c3) => {
+                                var sh2: i64 = iro_log2(c3);
+                                if nonneg && sh2 > 0 {
+                                    if binop_eq(op, BinOp::Div) {
+                                        var kid2: i64 = iro_const_before(f, b, k, sh2, t);
+                                        IrFunction_set_inst(f, id, Inst::BinOp(BinOp::Shr, l, kid2, t));
+                                    } else {
+                                        var mid: i64 = iro_const_before(f, b, k, c3 - 1, t);
+                                        IrFunction_set_inst(f, id, Inst::BinOp(BinOp::BitAnd, l, mid, t));
+                                    }
+                                    u = iro_uses(f);
+                                    changed = true;
+                                }
+                            }
+                            OptI64::None => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    return changed;
+}
+
+// ME3 (partial): promote a plain local to SSA values when every load of
+// it has exactly one reaching store. Forward dataflow per alloca over the
+// reachable CFG; the state is the stored value id, -1 when no store has
+// reached the point yet, -2 when predecessors disagree or a store could
+// join an uninitialized path — the cases that would need phis, which the
+// IR cannot carry yet (Jump/Branch take no arguments), so those loads
+// stay in memory. Replaced loads are dropped from their blocks; the
+// stores left dead are removed by dse.
+fn iro_promote(f: &mut IrFunction) -> bool {
+    var cfg: IroCfg = iro_cfg(f);
+    if cfg.n == 0 { return false; }
+    var plain: Vec<i64> = iro_plain_locals(f);
+    var nv: i64 = plain.len();
+    // per-block events on plain locals: alloca id, kind (0 load, 1 store),
+    // payload (the load's inst id / the stored value id)
+    var ev_a: Vec<Vec<i64>> = Vec::new();
+    var ev_k: Vec<Vec<i64>> = Vec::new();
+    var ev_v: Vec<Vec<i64>> = Vec::new();
+    var has_load: Vec<i64> = peir_zeros(nv);
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var ea: Vec<i64> = Vec::new();
+        var ek: Vec<i64> = Vec::new();
+        var ev: Vec<i64> = Vec::new();
+        var ids: Vec<i64> = f.blocks.get(b).instructions;
+        var k: i64 = 0;
+        while k < ids.len() {
+            var iid: i64 = ids.get(k);
+            match peir_inst_of(f, iid) {
+                Inst::Load(p, _) => {
+                    if p >= 0 && p < nv && plain.get(p) == 1 {
+                        ea.push(p); ek.push(0); ev.push(iid); has_load.set(p, 1);
+                    }
+                }
+                Inst::Store(p, sv, _) => {
+                    if p >= 0 && p < nv && plain.get(p) == 1 {
+                        ea.push(p); ek.push(1); ev.push(sv);
+                    }
+                }
+                _ => {}
+            }
+            k = k + 1;
+        }
+        ev_a.push(ea); ev_k.push(ek); ev_v.push(ev);
+        b = b + 1;
+    }
+    var changed: bool = false;
+    var a: i64 = 0;
+    while a < nv {
+        if plain.get(a) == 1 && has_load.get(a) == 1 {
+            var in_st: Vec<i64> = Vec::new();
+            var out_st: Vec<i64> = Vec::new();
+            var i: i64 = 0;
+            while i < cfg.n { in_st.push(-1); out_st.push(-1); i = i + 1; }
+            var iter: i64 = 0;
+            var stable: bool = false;
+            while !stable && iter <= cfg.n {
+                stable = true;
+                var ri: i64 = 0;
+                while ri < cfg.rpo.len() {
+                    var bi: i64 = cfg.rpo.get(ri);
+                    var m: i64 = -3;
+                    var ps: Vec<i64> = cfg.preds.get(bi);
+                    var pi: i64 = 0;
+                    while pi < ps.len() {
+                        var s: i64 = out_st.get(ps.get(pi));
+                        if m == -3 { m = s; }
+                        else if m != s { m = -2; }
+                        pi = pi + 1;
+                    }
+                    if m == -3 { m = -1; }
+                    if in_st.get(bi) != m { in_st.set(bi, m); stable = false; }
+                    var st: i64 = m;
+                    var ea2: Vec<i64> = ev_a.get(bi);
+                    var ek2: Vec<i64> = ev_k.get(bi);
+                    var ev2: Vec<i64> = ev_v.get(bi);
+                    var k2: i64 = 0;
+                    while k2 < ea2.len() {
+                        if ea2.get(k2) == a && ek2.get(k2) == 1 { st = ev2.get(k2); }
+                        k2 = k2 + 1;
+                    }
+                    if out_st.get(bi) != st { out_st.set(bi, st); stable = false; }
+                    ri = ri + 1;
+                }
+                iter = iter + 1;
+            }
+            // rewrite loads whose single reaching store is known
+            var map: Vec<i64> = peir_zeros(nv);
+            var deadl: Vec<i64> = peir_zeros(nv);
+            var found: bool = false;
+            var rj: i64 = 0;
+            while rj < cfg.rpo.len() {
+                var bj: i64 = cfg.rpo.get(rj);
+                var st2: i64 = in_st.get(bj);
+                var ea3: Vec<i64> = ev_a.get(bj);
+                var ek3: Vec<i64> = ev_k.get(bj);
+                var ev3: Vec<i64> = ev_v.get(bj);
+                var k3: i64 = 0;
+                while k3 < ea3.len() {
+                    if ea3.get(k3) == a {
+                        if ek3.get(k3) == 1 { st2 = ev3.get(k3); }
+                        else if st2 >= 0 {
+                            var lid: i64 = ev3.get(k3);
+                            map.set(lid, st2 + 1); deadl.set(lid, 1); found = true;
+                        }
+                    }
+                    k3 = k3 + 1;
+                }
+                rj = rj + 1;
+            }
+            if found {
+                var wb: i64 = 0;
+                while wb < f.blocks.len() {
+                    var blk: BasicBlock = f.blocks.get(wb);
+                    var keep: Vec<i64> = Vec::new();
+                    var k4: i64 = 0;
+                    var dropped: bool = false;
+                    while k4 < blk.instructions.len() {
+                        var iid2: i64 = blk.instructions.get(k4);
+                        if iid2 >= 0 && iid2 < nv && deadl.get(iid2) == 1 {
+                            dropped = true;
+                        } else {
+                            IrFunction_set_inst(f, iid2, iro_remap_all(peir_inst_of(f, iid2), &map));
+                            keep.push(iid2);
+                        }
+                        k4 = k4 + 1;
+                    }
+                    if dropped {
+                        blk.instructions = keep;
+                        f.blocks.set(wb, blk);
+                    }
+                    wb = wb + 1;
+                }
+                changed = true;
+            }
+        }
+        a = a + 1;
+    }
+    if changed { iro_dce_more(f); }
+    return changed;
 }

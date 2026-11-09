@@ -955,6 +955,9 @@ pub fn set_pe_runtime_merge(v: bool) { g_pe_runtime_merge = v; }
 /// The runtime merged: "pe_runtime" (native Windows), or "linux_runtime"
 /// (native Linux AArch64 / RISC-V, compiler/nat_ir.fd, release F8)
 pub var g_native_rt_dir: str = "pe_runtime";
+// Windows x64 on the machine layer (`fid emit --nat`): the Linux runtime
+// plus its Windows layer (linux_runtime/win.fd)
+pub var g_native_rt_win: bool = false;
 pub fn set_native_runtime(dir: str) { g_native_rt_dir = dir; g_pe_runtime_merge = true; }
 
 /// Locate a PE runtime source file: under stdlib/pe_runtime/ (repo and
@@ -1044,6 +1047,39 @@ pub fn set_borrowck_mode(mode: str) {
     g_borrowck_mode = mode;
 }
 
+// SP2 (own-backend roadmap): one per-stage timing table for `--time`.
+// Stages are recorded only while the flag is on; the helpers cost a clock
+// read plus two Vec pushes per mark.
+pub var g_time_on: bool = false;
+var g_time_names: Vec<str> = Vec::new();
+var g_time_ms: Vec<i64> = Vec::new();
+
+/// Turn the --time table on (main.fd: globals are set through functions).
+pub fn set_time_on() {
+    g_time_on = true;
+}
+
+/// Record `now - since` under `name` when --time is on; returns `now`, so
+/// stages chain as `t = time_mark("stage", t)`.
+pub fn time_mark(name: str, since: i64) -> i64 {
+    var now: i64 = p_clock_now_ms();
+    if g_time_on {
+        g_time_names.push(name);
+        g_time_ms.push(now - since);
+    }
+    return now;
+}
+
+/// Print the table to stderr: one `[time] <stage>: <ms> ms` line per stage.
+pub fn time_report() {
+    if !g_time_on { return; }
+    var i: i64 = 0;
+    while i < g_time_names.len() {
+        p_eprint_str("[time] " + g_time_names.get(i) + ": " + int_to_str(g_time_ms.get(i)) + " ms\n");
+        i = i + 1;
+    }
+}
+
 /// Get the cached parsed stdlib. Parses on first call, returns cache on subsequent calls.
 /// Returns (stdlib_program, struct_names, enum_names).
 pub fn get_cached_stdlib() -> OptProgram {
@@ -1075,6 +1111,7 @@ pub fn get_cached_stdlib() -> OptProgram {
 /// G8.2: borrowck_mode is "off", "warn", or "on" (default).
 pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrowck_mode: str) -> ResultProgram {
     var t0: i64 = p_clock_now_ms();
+    var t_t: i64 = t0;
     match source_path {
         OptStr::Some(main_path) => { inc_record_file(main_path); }
         OptStr::None => {}
@@ -1090,6 +1127,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
         }
         OptProgram::Some(stdlib_parsed) => {
             var stdlib: Program = stdlib_parsed;
+            t_t = time_mark("stdlib", t_t);
             p_eprint_str("[build] Stdlib parsed ok (cached). Extracting names...\n");
             // Extract stdlib struct/enum names for parser
             var struct_names: Vec<str> = Vec::new();
@@ -1125,6 +1163,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     rt_files.push("math.fd");
                     rt_files.push("../pe_runtime/data.fd");
                     rt_files.push("../pe_runtime/tensor.fd");
+                    if g_native_rt_win { rt_files.push("win.fd"); }
                 }
                 var rti: i64 = 0;
                 while rti < rt_files.len() {
@@ -1160,6 +1199,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                 }
             }
 
+            t_t = time_mark("runtime", t_t);
             // Parse user code with stdlib names pre-populated
             p_eprint_str("[build] Lexing user code...\n");
             var t3: i64 = p_clock_now_ms();
@@ -1187,6 +1227,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
             p_eprint_str("[build] Parser created. Calling parse()...\n");
             var user_result: ParseResultProgram = p.parse();
             var t6: i64 = p_clock_now_ms();
+            t_t = time_mark("user lex+parse", t_t);
             p_eprint_str("[prof] user parse: ");
             p_eprint_str(int_to_str(t6 - t5));
             p_eprint_str("ms\n");
@@ -1473,6 +1514,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         }
                     }
 
+                    t_t = time_mark("imports", t_t);
                     // A user function named like a function of one imported
                     // module: each side keeps its own (module__name).
                     cc_qualify_shadowed_imports(&mut imported_modules, imported_module_names, &mut user, stdlib);
@@ -1571,6 +1613,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         return ResultProgram::Err(enrich_errors(tf_errors, source, file_tf));
                     }
 
+                    t_t = time_mark("merge+desugar", t_t);
                     p_eprint_str("[build] Type checking...\n");
                     var t_tc: i64 = p_clock_now_ms();
                     // Type check -- register each module with its own name
@@ -1622,7 +1665,9 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         }
                         OptProgram::None => {}
                     }
+                    t_t = time_mark("tc register", t_t);
                     TypeChecker_check_bodies(&mut tc, program);
+                    t_t = time_mark("typecheck", t_t);
 
                     if tc.errors.len() > 0 {
                         p_eprint_str("[build] FAILED: type errors\n");
@@ -1654,6 +1699,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         }
                         return ResultProgram::Err(enrich_errors(secret_errors, source, file8));
                     }
+                    t_t = time_mark("escape+secrecy", t_t);
                     p_eprint_str("[build] Type check ok.\n");
                     var t_bc: i64 = p_clock_now_ms();
                     p_eprint_str("[prof] typecheck: ");
@@ -1662,6 +1708,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
 
                     // Run lints (warnings only)
                     tc.run_lints(program);
+                    t_t = time_mark("lints", t_t);
                     // G8.7: Stash warnings for lint_source to read
                     g_lint_warnings = tc.warnings;
                     // The typechecker is done: its tables go now, not at the
@@ -1706,6 +1753,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     } else {
                         p_eprint_str("[build] Borrow checking skipped (mode=off).\n");
                     }
+                    t_t = time_mark("borrowck", t_t);
 
                     // FIDES_COW_CHECK=1: the copy-on-write migration report
                     // (proposal 0001, release M5): changes that only reach
@@ -1726,6 +1774,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     // Everything in core passed: later builds skip its bodies
                     if !core_checked && borrowck_mode == "on" { inc_core_mark_checked(g_stdlib_hash); }
                     program = substitute(program);
+                    t_t = time_mark("comptime", t_t);
 
                     p_eprint_str("[build] Monomorphizing...\n");
                     var t_mono: i64 = p_clock_now_ms();
@@ -1735,6 +1784,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     // Monomorphize generics
                     var mono_result: Program = monomorphize(program);
                     var t_mono_end: i64 = p_clock_now_ms();
+                    t_t = time_mark("mono", t_t);
                     p_eprint_str("[prof] mono: ");
                     p_eprint_str(int_to_str(t_mono_end - t_mono));
                     p_eprint_str("ms\n");
@@ -4085,7 +4135,7 @@ fn cc_inherit_supertraits(p: &mut Program, defs: Vec<TraitDef>, errors: &mut Vec
             var out: Vec<TraitMethod> = Vec::new();
             var seen: Vec<str> = Vec::new();
             cc_collect_trait_methods(t.name, defs, &mut seen, &mut out);
-            t.methods = out;
+            t.methods = out.clone();
             p.traits.set(i, t);
         }
         i = i + 1;

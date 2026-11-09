@@ -44,6 +44,7 @@ use compiler::iropt;
 use compiler::nat_ir;
 use compiler::rules;
 use compiler::irverify;
+use compiler::egraph;
 use compiler::typechecker;
 use compiler::json;
 use compiler::csplit;
@@ -167,7 +168,12 @@ pub fn main() -> i64 {
     if command == "bench" { return cmd_bench(n, start); }
     if command == "profile" { return cmd_profile(n, start); }
     if command == "lint" { return cmd_lint(n, start); }
-    if command == "test-rules" { return rules_selftest(); }
+    if command == "test-rules" {
+        // fid test-rules [--smt <dir>]: the rules on values; with --smt, an
+        // SMT-LIB proof obligation per rule and width as well
+        if start + 3 <= n && p_argv(start + 1) == "--smt" { return rules_selftest() + rules_smt(p_argv(start + 2)); }
+        return rules_selftest();
+    }
     if command == "check" { return cmd_check(n, start); }
     if command == "doc" { return cmd_scribe(n, start); }
     if command == "wasm" { return cmd_wasm(n, start); }
@@ -1504,6 +1510,8 @@ fn cmd_notebook(n: i64, start: i64) -> i64 {
 // --- lint ----------------------------------------------------------------
 /// fid check: type, borrow and effect checks with no code generation.
 fn cmd_check(n: i64, start: i64) -> i64 {
+    var t_start: i64 = p_clock_now_ms();
+    if has_flag(n, start, "--time") { set_time_on(); }
     if start + 2 > n {
         p_eprint_str("Usage: fid check <file.fd>\n");
         return 1;
@@ -1517,6 +1525,8 @@ fn cmd_check(n: i64, start: i64) -> i64 {
     var t0: i64 = p_clock_now_ms();
     match build_program_with_path_borrowck(source, OptStr::Some(input), "on") {
         ResultProgram::Ok(_) => {
+            time_mark("total", t_start);
+            time_report();
             p_eprint_str(input + ": no errors (" + int_to_str(p_clock_now_ms() - t0) + " ms)\n");
             return 0;
         }
@@ -2777,6 +2787,8 @@ fn nat_verified(m: &IrModule, stage: str) -> bool {
 }
 
 fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
+    var t_start: i64 = p_clock_now_ms();
+    if has_flag(n, start, "--time") { set_time_on(); }
     if start + 2 > n {
         print("Usage: fid build <file.fd> [-o output] [--target <triple>] [--no-opt] [--lto] [--caps <list>]\n");
         return 1;
@@ -2790,6 +2802,10 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     var target: str = get_flag_value(n, start, "--target", "x86-64");
     // --no-opt: disable PIR optimizer (enabled by default)
     var do_opt: bool = !has_flag(n, start, "--no-opt");
+    // --debug (SP13): fastest correct build — no mid-end at all
+    // (iropt, rules and the e-graph all skipped), default codegen.
+    var debug_mode: bool = has_flag(n, start, "--debug");
+    if debug_mode { do_opt = false; }
     // --lto: enable link-time optimization
     var do_lto: bool = has_flag(n, start, "--lto");
     // --native: use native backend (ELF64/PE) instead of C codegen
@@ -2845,6 +2861,7 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         print("\n");
         return 1;
     }
+    var t_run: i64 = time_mark("read+args", t_start);
     p_eprint_str("[build] Source read ok. Compiling...\n");
 
     // --boot mode: multiboot2 kernel binary (no stdlib, boot entry point)
@@ -2884,8 +2901,10 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     }
 
     // --elf (or --target linux): a static Linux x86-64 executable from the
-    // native code generator (release F4, first step: no stdlib yet)
-    if has_flag(n, start, "--elf") || target == "linux" || target == "x86_64-linux" {
+    // native code generator (release F4, first step: no stdlib yet).
+    // `--target x86_64-linux` goes to the machine-layer backend below
+    // (compiler/nat_ir.fd, with the stdlib and the Linux runtime).
+    if has_flag(n, start, "--elf") || target == "linux" {
         var elf_out: str = find_output_arg(n, start, "a.out");
         p_eprint_str("[build] ELF mode: static Linux x86-64 executable (no stdlib yet)...\n");
         var elf_result: ResultProgram = build_program_no_std(source, OptStr::Some(input));
@@ -2990,13 +3009,24 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     // with `--target arm64|riscv64` (the old PIR path) comes here too.
     var nat_arch: i64 = 0;
     if str_contains(target, "linux") || use_native { nat_arch = nat_target_arch(target); }
+    // `--nat`: Windows x64 through the same layer (a PE; the Linux runtime
+    // over kernel32, stdlib/linux_runtime/win.fd). pe_ir stays the default.
+    var nat_win: bool = has_flag(n, start, "--nat")
+        && (target == "" || str_contains(target, "windows") || (!is_posix_host() && !str_contains(target, "linux")));
+    if nat_win { nat_arch = nat_target_arch("x86_64"); }
     if nat_arch != 0 && !bare_mode && !boot_mode {
         var nat_out: str = find_output_arg(n, start, "a.out");
+        if nat_win { nat_out = ensure_exe_extension(find_output_arg(n, start, "a.exe")); }
         set_native_runtime("linux_runtime");
+        g_native_rt_win = nat_win;
         // @cfg sees the target, not the host
         g_cfg_os = "linux";
-        if str_contains(target, "riscv") { g_cfg_arch = "riscv64"; } else { g_cfg_arch = "aarch64"; }
+        if nat_win { g_cfg_os = "windows"; }
+        if str_contains(target, "riscv") { g_cfg_arch = "riscv64"; }
+        else if nat_arch == nat_target_arch("x86_64") { g_cfg_arch = "x86_64"; }
+        else { g_cfg_arch = "aarch64"; }
         var nat_prog: ResultProgram = build_program_with_path_borrowck(source, OptStr::Some(input), g_borrowck);
+        t_run = time_mark("front end", t_run);
         match nat_prog {
             ResultProgram::Err(nerrs) => {
                 print("Compilation errors:\n");
@@ -3009,22 +3039,52 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 return 1;
             }
             ResultProgram::Ok(nprogram) => {
+                // The line table (DB1): rows for the functions of the input file
+                var nl_lex: Lexer = Lexer::new(source);
+                var nl_parser: Parser = Parser_new(nl_lex.tokenize());
+                match nl_parser.parse() {
+                    ParseResultProgram::Ok(nl_prog) => {
+                        var nl_names: Vec<str> = Vec::new();
+                        var nli: i64 = 0;
+                        while nli < nl_prog.funcs.len() { nl_names.push(nl_prog.funcs.get(nli).name); nli = nli + 1; }
+                        g_nat_lines_names = str_join(nl_names, ",");
+                        g_nat_lines_file = input;
+                    }
+                    ParseResultProgram::Err(_) => {}
+                }
+                t_run = time_mark("line-table reparse", t_run);
                 p_eprint_str("[build] Lowering to IR...\n");
                 var nat_mod: IrModule = lower(nprogram);
+                t_run = time_mark("lower", t_run);
                 // The mid-end (own-backend roadmap step 3-5): iropt's passes,
                 // then the rules and pure-call merging; the IR verifier
                 // after each stage with FID_VERIFY=1
                 var nat_verify: bool = str_len(env_or_empty("FID_VERIFY")) > 0;
                 var nat_t0: i64 = p_clock_now_ms();
                 if nat_verify && !nat_verified(&nat_mod, "after lowering") { return 1; }
-                iropt_native(&mut nat_mod);
-                if nat_verify && !nat_verified(&nat_mod, "after iropt") { return 1; }
-                var nat_rr: Vec<i64> = rules_run(&mut nat_mod);
-                if nat_verify && !nat_verified(&nat_mod, "after rules") { return 1; }
+                var nat_rr: Vec<i64> = Vec::new();
+                nat_rr.push(0); nat_rr.push(0);
+                var nat_eg: Vec<i64> = Vec::new();
+                nat_eg.push(0); nat_eg.push(0);
+                if !debug_mode {
+                    iropt_native(&mut nat_mod);
+                    t_run = time_mark("iropt", t_run);
+                    if nat_verify && !nat_verified(&nat_mod, "after iropt") { return 1; }
+                    nat_rr = rules_run(&mut nat_mod);
+                    t_run = time_mark("rules", t_run);
+                    if nat_verify && !nat_verified(&nat_mod, "after rules") { return 1; }
+                    nat_eg = egraph_run(&mut nat_mod);
+                    t_run = time_mark("egraph", t_run);
+                    if nat_verify && !nat_verified(&nat_mod, "after the e-graph") { return 1; }
+                }
                 p_eprint_str("[prof] native mid-end: " + int_to_str(p_clock_now_ms() - nat_t0) + "ms, "
-                    + int_to_str(nat_rr.get(0)) + " rewritten by rules, " + int_to_str(nat_rr.get(1)) + " pure calls merged\n");
+                    + int_to_str(nat_rr.get(0)) + " rewritten by rules, " + int_to_str(nat_rr.get(1)) + " pure calls merged, "
+                    + int_to_str(nat_eg.get(0)) + " loads forwarded, " + int_to_str(nat_eg.get(1)) + " rewritten by the e-graph\n");
                 p_eprint_str("[build] Native Linux code generation...\n");
-                var nat_res: ResultBytes = nat_generate_elf(nat_mod, nat_arch);
+                var nat_res: ResultBytes = ResultBytes::Err(Vec::new());
+                if nat_win { nat_res = nat_generate_pe(nat_mod); }
+                else { nat_res = nat_generate_elf(nat_mod, nat_arch); }
+                t_run = time_mark("native code", t_run);
                 match nat_res {
                     ResultBytes::Err(gerrs) => {
                         var gei: i64 = 0;
@@ -3038,6 +3098,9 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                     ResultBytes::Ok(nat_bytes) => {
                         p_file_write_vec(nat_out, nat_bytes);
                         if is_posix_host() { p_system("chmod +x '" + nat_out + "' 2>/dev/null"); }
+                        t_run = time_mark("write", t_run);
+                        time_mark("total", t_start);
+                        time_report();
                         print("Built native executable: " + nat_out + "\n");
                         return 0;
                     }
@@ -3061,13 +3124,17 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         var stamp: IncStamp = inc_stamp_read(stamp_path);
         if !has_flag(n, start, "--no-cache") && str_len(env_or_empty("FIDES_NO_CACHE")) == 0
             && inc_up_to_date(stamp, build_key, output) {
+            time_mark("total", t_start);
+            time_report();
             print(output + " is up to date\n");
             return 0;
         }
         inc_deps_reset();
     }
 
+    t_run = time_mark("inc check", t_run);
     var result: ResultProgram = build_program_with_path_borrowck(source, OptStr::Some(input), g_borrowck);
+    t_run = time_mark("front end", t_run);
     match result {
         ResultProgram::Err(errs) => {
             print("Compilation errors:\n");
@@ -3083,6 +3150,7 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             p_eprint_str("[build] Lowering to IR...\n");
             var t_lw: i64 = p_clock_now_ms();
             var ir_mod: IrModule = lower(program);
+            t_run = time_mark("lower", t_run);
             p_eprint_str("[prof] lower: " + int_to_str(p_clock_now_ms() - t_lw) + "ms\n");
 
             // Windows default: direct IR -> PE machine code (pe_ir backend)
@@ -3090,10 +3158,12 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 // Inlining and folding before machine code (release D5, D6)
                 var t_io: i64 = p_clock_now_ms();
                 if do_opt { iropt_native(&mut ir_mod); }
+                t_run = time_mark("iropt", t_run);
                 p_eprint_str("[prof] iropt: " + int_to_str(p_clock_now_ms() - t_io) + "ms\n");
                 p_eprint_str("[build] Emitting PE via pe_ir backend...\n");
                 var t_pe: i64 = p_clock_now_ms();
                 var pe_res: ResultBytes = pe_ir_generate_pe(ir_mod);
+                t_run = time_mark("native code", t_run);
                 p_eprint_str("[prof] native code: " + int_to_str(p_clock_now_ms() - t_pe) + "ms\n");
                 match pe_res {
                     ResultBytes::Err(perrs) => {
@@ -3109,6 +3179,9 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                     ResultBytes::Ok(pe_bytes) => {
                         p_file_write_vec(output, pe_bytes);
                         inc_stamp_commit(stamp_path, build_key, 0, input, output);
+                        t_run = time_mark("write+stamp", t_run);
+                        time_mark("total", t_start);
+                        time_report();
                         print("Built native executable: ");
                         print(output);
                         print("\n");

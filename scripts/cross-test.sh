@@ -37,7 +37,7 @@ JOBS="${JOBS:-8}"
 OUT="${OUT:-build/cross/$TARGET}"
 if [ "${NATIVE:-}" = 1 ]; then OUT="${OUT}-native"; fi
 EXT=bin
-case "$TARGET" in wasm*|wasi) EXT=wasm ;; esac
+case "$TARGET" in wasm*|wasi) EXT=wasm ;; *-windows*) EXT=exe ;; esac
 mkdir -p "$OUT"
 export CC="${CC:-zig cc}"
 
@@ -45,6 +45,7 @@ case "$TARGET" in
   aarch64-linux*|arm64-linux*) RUNNER=qemu-aarch64; OS=linux ;;
   riscv64-linux*)              RUNNER=qemu-riscv64; OS=linux ;;
   x86_64-linux*)               RUNNER="";           OS=linux ;;
+  x86_64-windows*)             RUNNER="";           OS=windows ;;   # NATIVE=1: emit --nat, run here
   *-macos*)                    RUNNER="";           OS=macos ;;
   wasm32-wasi*|wasm*|wasi)     RUNNER="node scripts/wasm-run.mjs"; OS=wasi ;;
   *) echo "unknown target: $TARGET"; exit 1 ;;
@@ -80,7 +81,9 @@ build_one() {
   echo $? > "$OUT/$b.expected_rc"
   if [ "${NATIVE:-}" = 1 ]; then
     # The native backend (compiler/nat_ir.fd): no C compiler
-    timeout 600 "$FID" emit "$f" --target "$TARGET" -o "$OUT/$b.$EXT" > "$OUT/$b.build.log" 2>&1
+    local nat=""
+    case "$TARGET" in *-windows*) nat=--nat ;; esac
+    timeout 600 "$FID" emit "$f" --target "$TARGET" $nat -o "$OUT/$b.$EXT" > "$OUT/$b.build.log" 2>&1
   else
     timeout 600 "$FID" ccompile "$f" --target "$TARGET" --cc-opt 0 --no-cache -o "$OUT/$b.$EXT" > "$OUT/$b.build.log" 2>&1
   fi
@@ -109,7 +112,7 @@ chmod +x "$RUNS"
 if [ "$OS" = macos ] && [ "$HOST" != macos ]; then
   echo "macOS binaries built; run $RUNS on a Mac (scripts/cross-run.sh), then rerun this script there"
   RAN=0
-elif [ "$HOST" = windows ] && [ "$OS" != wasi ]; then
+elif [ "$HOST" = windows ] && [ "$OS" != wasi ] && [ "$OS" != windows ]; then
   # C:/x/y -> /mnt/c/x/y; MSYS must not rewrite the path given to wsl
   WROOT=$(cygpath -m "$ROOT" | sed -E 's#^([A-Za-z]):#/mnt/\L\1#')
   MSYS_NO_PATHCONV=1 wsl ${WSL_DISTRO:+-d "$WSL_DISTRO"} bash "$WROOT/$RUNS"

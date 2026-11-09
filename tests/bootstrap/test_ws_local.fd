@@ -1,0 +1,112 @@
+// stdlib/ws over loopback (competitive SL3, SL5): a server task and a
+// client in one process, over IPv6 (::1) and then IPv4 (127.0.0.1) to the
+// same dual-stack listening socket. The server sends a message in three
+// frames with a ping in their middle: the client's ws_recv answers the
+// ping and returns the whole message; the server sees the pong, then the
+// client's reply. Needs tasks that really run side by side: C and native
+// builds (`fid run` runs a task to its end when it starts).
+//
+// Expected output:
+// [::1] message: Hello, world (fin true)
+// [::1] server got pong: p
+// [::1] server got: bye from ::1
+// [127.0.0.1] message: Hello, world (fin true)
+// [127.0.0.1] server got pong: p
+// [127.0.0.1] server got: bye from 127.0.0.1
+use ws;
+use task;
+use vec;
+use string;
+
+var g_port: i64 = 0;
+var g_log: Vec<str> = Vec::new();
+
+fn raw(fd: i64, bytes: Vec<i64>) {
+    unsafe {
+        var buf: i64 = p_malloc(bytes.len() + 1);
+        var i: i64 = 0;
+        while i < bytes.len() {
+            p_volatile_store8(buf + i, bytes.get(i));
+            i = i + 1;
+        }
+        p_co_send(fd, buf, bytes.len());
+        p_free(buf);
+    }
+}
+
+fn frame(first: i64, text: str) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(first);
+    v.push(str_len(text));
+    var i: i64 = 0;
+    while i < str_len(text) {
+        v.push(str_byte_at(text, i));
+        i = i + 1;
+    }
+    return v;
+}
+
+/// One connection: the message in fragments, a ping between them
+fn serve(lfd: i64) -> i64 {
+    var k: i64 = 0;
+    while k < 2 {
+        task_wait_read(lfd, -1);
+        var fd: i64 = p_socket_accept(lfd);
+        var c: WsConn = ws_accept(fd, ws_read_request(fd, 0));
+        raw(fd, frame(1, "Hello"));         // text, not final
+        raw(fd, frame(137, "p"));           // ping
+        raw(fd, frame(0, ", "));            // continuation, not final
+        raw(fd, frame(128, "world"));       // continuation, final
+        var pong: WsFrame = ws_recv(c);
+        if pong.opcode == 10 {
+            g_log.push("server got pong: " + pong.text);
+        } else {
+            g_log.push("server expected a pong, got opcode " + int_to_str(pong.opcode));
+        }
+        var reply: WsFrame = ws_recv(c);
+        g_log.push("server got: " + reply.text);
+        ws_close(c);
+        k = k + 1;
+    }
+    return 0;
+}
+
+fn clients(n: i64) -> i64 {
+    client("::1");
+    client("127.0.0.1");
+    return n;
+}
+
+fn client(host: str) {
+    var c: WsConn = ws_connect(host, g_port, "/chat");
+    if !ws_ok(c) {
+        println("[" + host + "] could not connect");
+        return;
+    }
+    var m: WsFrame = ws_recv(c);
+    println("[" + host + "] message: " + m.text + " (fin " + p_to_str(m.fin) + ")");
+    ws_send_text(c, "bye from " + host);
+    // wait for the server to finish with this connection
+    var end: WsFrame = ws_recv(c);
+    var i: i64 = 0;
+    while i < g_log.len() {
+        println("[" + host + "] " + g_log.get(i));
+        i = i + 1;
+    }
+    g_log = Vec::new();
+    ws_close(c);
+}
+
+fn main() -> i64 {
+    var port: i64 = 18640;
+    var lfd: i64 = p_socket_listen(port);
+    while lfd < 0 && port < 18680 {
+        port = port + 1;
+        lfd = p_socket_listen(port);
+    }
+    g_port = port;
+    var s: i64 = task_go("serve", lfd);
+    var c: i64 = task_go("clients", 0);
+    task_run();
+    return 0;
+}

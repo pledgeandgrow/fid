@@ -8731,22 +8731,11 @@ fn drop_function_vecs(f: &mut IrFunction, borrows: &VecBorrows) {
                     new.push(detached_inst(f, Inst::Store { ptr: shadow, value, store_ty: None }));
                 }
                 Some(Inst::Return { .. }) => {
-                    // Params the caller shared into, only borrowed here: the
-                    // function's header dies at the return (proposal 0001; as
-                    // compiler/lower.fd). `&Vec` params point at the caller's
-                    // header and are never dropped.
-                    if let Some(row) = borrows.get(&f.name) {
-                        let param_drops: Vec<ValueId> = f.params.iter().enumerate()
-                            .filter(|(i, (_, pty))| {
-                                row.get(*i).copied().unwrap_or(false)
-                                    && matches!(pty, IrType::Generic(n, _) | IrType::Opaque(n) if n == "Vec")
-                            })
-                            .map(|(_, (pid, _))| *pid)
-                            .collect();
-                        for pid in param_drops {
-                            drop_value(f, "Vec_drop", pid, &mut new);
-                        }
-                    }
+                    // Vec params are never dropped at the return: without COW
+                    // the caller passes its own header, so Vec_drop(param)
+                    // frees the caller's Vec (as compiler/lower.fd, where the
+                    // param drop is gated behind LOWER_COW && LOWER_ARG_SHARE,
+                    // both off). &Vec params point at the caller's header too.
                     for s in &kept {
                         drop_shadow(f, "Vec_drop", shadows[s], &mut new);
                     }

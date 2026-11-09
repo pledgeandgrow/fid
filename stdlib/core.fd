@@ -395,7 +395,11 @@ pub fn Vec_new_typed(code: i64, tid: i64) -> i64 {
 // room (box = data - 16) instead of allocating a box. A buffer made any
 // other way (the C runtime, an older build) has no tag and gets a box of
 // its own, as before; every free below handles both.
-const VEC_BUF_RC: bool = true;
+// Off until the stage 0 compiler's C runtime frees tagged buffers
+// (__p_vbuf_free in codegen_c.fd): a stage built by an older C generator
+// frees a grown buffer with p_free and would fail on one. Turn it on once
+// a compiler built with this core is the stage 0.
+const VEC_BUF_RC: bool = false;
 const P_VBUF_KEY: i64 = 0x5646425546494445;
 
 /// A buffer of `bytes` bytes for a Vec's data, with room for its box.
@@ -2061,30 +2065,15 @@ pub fn p_str_equal(a: i64, b: i64) -> bool {
     if a == 0 { return false; }
     if b == 0 { return false; }
     // Both carry their length (D16): different lengths differ at once, and
-    // equal ones compare a word at a time, zero bytes included
+    // equal ones compare their bytes, zero bytes included (p_bytes_eq: a
+    // byte loop for the interpreter, which cannot read a string's first
+    // word as data; memcmp in C)
     var la: i64 = p_str_hdr_len(a);
     if la >= 0 {
         var lb: i64 = p_str_hdr_len(b);
         if lb >= 0 {
             if la != lb { return false; }
-            var off: i64 = 0;
-            unsafe {
-                while off + 8 <= la {
-                    var wa: *mut i64 = a + off;
-                    var wb: *mut i64 = b + off;
-                    if *wa != *wb { return false; }
-                    off = off + 8;
-                }
-                while off < la {
-                    var ba: *mut u8 = a + off;
-                    var bb: *mut u8 = b + off;
-                    var x: i64 = *ba;
-                    var y: i64 = *bb;
-                    if x != y { return false; }
-                    off = off + 1;
-                }
-            }
-            return true;
+            return p_bytes_eq(a, b, la);
         }
     }
     var ai: i64 = a;
@@ -3112,9 +3101,15 @@ fn p_str_len_word(w: i64) -> bool {
 
 // str_copy_n: copy n bytes from src to dst. Both are i64 addresses.
 fn p_str_copy_n(dst: i64, src: i64, n: i64) {
-    // A word at a time, then the last bytes (every slice, concatenation,
-    // replace and split goes through here)
-    vec_copy_bytes(dst, src, n);
+    // Byte by byte: the interpreter cannot read its strings a word at a
+    // time. The C backend replaces the body with memcpy (fast_core_vec_body).
+    var i: i64 = 0;
+    while i < n {
+        var sp: *mut u8 = src + i;
+        var dp: *mut u8 = dst + i;
+        unsafe { *dp = *sp; }
+        i = i + 1;
+    }
 }
 
 pub fn String_from(s: i64) -> str {
@@ -3308,19 +3303,11 @@ pub fn String_replace(s: i64, from: i64, to: i64) -> str {
     return result;
 }
 
-/// Whether the `n` bytes at `a` and `b` are equal (a word at a time,
-/// then byte by byte).
+/// Whether the `n` bytes at `a` and `b` are equal (byte by byte: the
+/// interpreter cannot read strings a word at a time; the C backend uses
+/// memcmp, fast_core_vec_body).
 fn p_bytes_eq(a: i64, b: i64, n: i64) -> bool {
     var j: i64 = 0;
-    while j + 8 <= n {
-        var aw: *mut i64 = a + j;
-        var bw: *mut i64 = b + j;
-        var xw: i64 = 0;
-        var yw: i64 = 0;
-        unsafe { xw = *aw; yw = *bw; }
-        if xw != yw { return false; }
-        j = j + 8;
-    }
     while j < n {
         var ap: *mut u8 = a + j;
         var bp: *mut u8 = b + j;

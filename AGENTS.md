@@ -112,9 +112,24 @@ cargo build
 .\release\fid.exe ccompile <file.fd> --target aarch64-linux -o out
 .\release\fid.exe ccompile <file.fd> --target wasm32-wasi -o out.wasm
 node scripts/wasm-run.mjs out.wasm
-# Native Linux AArch64 / RISC-V 64, no C compiler (compiler/nat_ir.fd,
-# nat_enc.fd, runtime stdlib/linux_runtime/base.fd); NATIVE=1 for the suite
+# Native Linux AArch64 / RISC-V 64 / x86-64, no C compiler (compiler/nat_ir.fd:
+# machine IR, one allocator; nat_enc.fd encoders; runtime stdlib/linux_runtime/);
+# NATIVE=1 for the suite. `--target x86_64-linux` uses this backend; `--elf` /
+# `--target linux` stay on pe_ir's no-stdlib ELF path.
 .\release\fid.exe emit <file.fd> --target aarch64-linux -o out
+.\release\fid.exe emit <file.fd> --target x86_64-linux -o out
+# Windows x64 on the same machine layer (opt-in; pe_ir stays the default):
+# a PE, the Linux runtime over kernel32/ws2_32 (stdlib/linux_runtime/win.fd)
+.\release\fid.exe emit <file.fd> --nat -o out.exe
+NATIVE=1 FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh x86_64-windows
+# Checks of the own backend (docs/roadmap/llvm-roadmap.md): FID_VERIFY=1 runs
+# the IR verifier and the register-allocation checker; FID_NAT_OFF=<passes>
+# turns native passes off (mir, promote, ipra, fold, hint, rules, purecse,
+# egraph, forward, debug); FID_NAT_DUMP=<function> prints its machine IR
+python3 scripts/enc-oracle.py --fid release/fid.exe   # encoders vs clang's assembler
+.\release\fid.exe test-rules                          # rewrite rules on values
+bash scripts/rules-smt.sh release/fid.exe              # rules proved by z3 (pip install z3-solver)
+NATIVE=1 bash scripts/pass-matrix.sh aarch64-linux     # each pass off: same results
 NATIVE=1 FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh riscv64-linux
 FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 

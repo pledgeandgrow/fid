@@ -9,6 +9,8 @@
 
 extern "C" {
     fn nat_c_sqrt(bits: i64) -> i64;
+    // 1 on Windows (`fid emit --nat`, win.fd), 0 on Linux
+    fn nat_os() -> i64;
 }
 
 const PE_SYS_MKDIRAT: i64 = 34;
@@ -94,7 +96,11 @@ fn pe_mode(path: i64) -> i64 {
     if path == 0 { return 0 - 1; }
     var st: i64 = pert_malloc(256);
     var r: i64 = nat_syscall(PE_SYS_NEWFSTATAT, PE_AT_FDCWD, path, st, 0, 0, 0);
-    var mode: i64 = pe_ld(st + 16) & 4294967295;
+    // st_mode: at 16 in the generic layout (AArch64, RISC-V), at 24 on
+    // x86-64 (st_nlink is 8 bytes and comes first there)
+    var mode_at: i64 = 16;
+    if nat_arch() == 3 { mode_at = 24; }
+    var mode: i64 = pe_ld(st + mode_at) & 4294967295;
     pert_free(st);
     if r < 0 { return 0 - 1; }
     return mode;
@@ -463,10 +469,12 @@ fn pe_sqrt(x: f64) -> f64 {
     return p_f64_from_bits(nat_c_sqrt(p_f64_to_bits(x)));
 }
 
-// ─── Sockets (IPv4 TCP) ─────────────────────────────────────────────────
+// ─── Sockets (TCP, IPv4 and IPv6) ───────────────────────────────────────
 // A task's socket calls wait without blocking its thread: the socket is
 // non-blocking and the task gives control back until it is ready
-// (pert_co_wait_fd). Host names: dotted quads, "localhost", /etc/hosts.
+// (pert_co_wait_fd, epoll). Host names: dotted quads, IPv6 addresses
+// ("::1", "[fe80::1]"), "localhost", /etc/hosts (IPv4 lines first, then
+// IPv6 ones). A listening socket takes IPv6 and IPv4 clients (dual stack).
 
 const PE_SYS_FCNTL: i64 = 25;
 const PE_SYS_PPOLL: i64 = 73;
@@ -546,8 +554,135 @@ fn pe_parse_ipv4(s: i64, n: i64) -> i64 {
     return out;
 }
 
+/// IPv6 text ("::1", "2001:db8::42", brackets allowed) as 16 bytes at out;
+/// false when it is not one.
+fn pe_parse_ipv6(s0: i64, n0: i64, out: i64) -> bool {
+    var s: i64 = s0;
+    var n: i64 = n0;
+    if n >= 2 && pe_ldb(s) == 91 && pe_ldb(s + n - 1) == 93 {
+        s = s + 1;
+        n = n - 2;
+    }
+    if n < 2 { return false; }
+    var groups: i64 = pe_zeroed(8);
+    var ng: i64 = 0;
+    var gap: i64 = 0 - 1;           // where "::" stands, in groups
+    var i: i64 = 0;
+    if pe_ldb(s) == 58 {
+        if pe_ldb(s + 1) != 58 { pert_free(groups); return false; }
+        gap = 0;
+        i = 2;
+    }
+    var ok: bool = true;
+    while i < n && ok {
+        var v: i64 = 0;
+        var digits: i64 = 0;
+        while i < n && digits < 5 {
+            var c: i64 = pe_ldb(s + i);
+            var d: i64 = 0 - 1;
+            if c >= 48 && c <= 57 { d = c - 48; }
+            else if c >= 97 && c <= 102 { d = c - 87; }
+            else if c >= 65 && c <= 70 { d = c - 55; }
+            if d < 0 { break; }
+            v = v * 16 + d;
+            digits = digits + 1;
+            i = i + 1;
+        }
+        if digits == 0 || digits > 4 || ng >= 8 { ok = false; }
+        else {
+            pe_st(groups + ng * 8, v);
+            ng = ng + 1;
+            if i < n {
+                if pe_ldb(s + i) != 58 { ok = false; }
+                else if i + 1 < n && pe_ldb(s + i + 1) == 58 {
+                    if gap >= 0 { ok = false; }
+                    gap = ng;
+                    i = i + 2;
+                } else {
+                    i = i + 1;
+                    if i == n { ok = false; }
+                }
+            }
+        }
+    }
+    if ok && gap < 0 && ng != 8 { ok = false; }
+    if ok && gap >= 0 && ng > 7 { ok = false; }
+    if ok {
+        var j: i64 = 0;
+        while j < 16 { pe_stb(out + j, 0); j = j + 1; }
+        // groups after "::" move right by the zero groups it stands for
+        var k: i64 = 0;
+        while k < ng {
+            var at: i64 = k;
+            if gap >= 0 && k >= gap { at = k + (8 - ng); }
+            var g: i64 = pe_ld(groups + k * 8);
+            pe_stb(out + at * 2, (g >> 8) & 255);
+            pe_stb(out + at * 2 + 1, g & 255);
+            k = k + 1;
+        }
+    }
+    pert_free(groups);
+    return ok;
+}
+
+/// A sockaddr_in6 (28 bytes) for the 16-byte address at a, port.
+fn pe_sockaddr6(a: i64, port: i64) -> i64 {
+    var sa: i64 = pe_zeroed(4);
+    pe_st(sa, 10 | ((port & 255) << 24) | (((port >> 8) & 255) << 16));   // AF_INET6
+    var j: i64 = 0;
+    while j < 16 {
+        pe_stb(sa + 8 + j, pe_ldb(a + j));
+        j = j + 1;
+    }
+    return sa;
+}
+
+/// An IPv6 address of host from /etc/hosts, at out (16 bytes): false if
+/// there is none.
+fn pe_resolve6(host: i64, out: i64) -> bool {
+    var n: i64 = pe_len(host);
+    if pe_parse_ipv6(host, n, out) { return true; }
+    var text: i64 = pert_file_read("/etc/hosts" as i64) as i64;
+    if text == 0 { return false; }
+    var tl: i64 = pe_len(text);
+    var at: i64 = 0;
+    var found: bool = false;
+    var addr: i64 = pe_zeroed(2);
+    while at < tl && !found {
+        var eol: i64 = at;
+        while eol < tl && pe_ldb(text + eol) != 10 { eol = eol + 1; }
+        var a0: i64 = at;
+        while a0 < eol && (pe_ldb(text + a0) == 32 || pe_ldb(text + a0) == 9) { a0 = a0 + 1; }
+        var a1: i64 = a0;
+        while a1 < eol && pe_ldb(text + a1) != 32 && pe_ldb(text + a1) != 9 && pe_ldb(text + a1) != 35 { a1 = a1 + 1; }
+        var is6: bool = a1 > a0 && pe_parse_ipv6(text + a0, a1 - a0, addr);
+        var w: i64 = a1;
+        while is6 && w < eol && pe_ldb(text + w) != 35 && !found {
+            while w < eol && (pe_ldb(text + w) == 32 || pe_ldb(text + w) == 9) { w = w + 1; }
+            var w1: i64 = w;
+            while w1 < eol && pe_ldb(text + w1) != 32 && pe_ldb(text + w1) != 9 && pe_ldb(text + w1) != 35 { w1 = w1 + 1; }
+            if w1 - w == n && w1 > w {
+                var j: i64 = 0;
+                while j < n && pe_ldb(text + w + j) == pe_ldb(host + j) { j = j + 1; }
+                if j == n { found = true; }
+            }
+            if w1 == w { w = eol; } else { w = w1; }
+        }
+        at = eol + 1;
+    }
+    if found {
+        var k: i64 = 0;
+        while k < 16 { pe_stb(out + k, pe_ldb(addr + k)); k = k + 1; }
+    }
+    pert_free(addr);
+    p_str_free(text);
+    return found;
+}
+
 /// The IPv4 address of host, or -1: a dotted quad, localhost, /etc/hosts.
 fn pe_resolve(host: i64) -> i64 {
+    // Windows: the system resolver, through win.fd (its syscall 1001)
+    if nat_os() == 1 { return nat_syscall(1001, host, 0, 0, 0, 0, 0); }
     var n: i64 = pe_len(host);
     var direct: i64 = pe_parse_ipv4(host, n);
     if direct >= 0 { return direct; }
@@ -584,8 +719,25 @@ fn pe_resolve(host: i64) -> i64 {
     return found;
 }
 
-/// A TCP socket on all addresses, listening, or -1.
+/// A TCP socket on all addresses, listening, or -1: IPv6 and IPv4 clients
+/// on one socket (IPV6_V6ONLY off), IPv4 alone without IPv6.
 pub fn pert_socket_listen(port: i64) -> i64 {
+    var s6: i64 = pe_sys(PE_SYS_SOCKET, 10, 1, 0);                 // AF_INET6
+    if s6 >= 0 {
+        var opt: i64 = pe_zeroed(1);
+        pe_st(opt, 1);
+        nat_syscall(PE_SYS_SETSOCKOPT, s6, 1, 2, opt, 4, 0);         // SO_REUSEADDR
+        pe_st(opt, 0);
+        nat_syscall(PE_SYS_SETSOCKOPT, s6, 41, 26, opt, 4, 0);       // IPV6_V6ONLY off
+        pert_free(opt);
+        var any: i64 = pe_zeroed(2);
+        var sa6: i64 = pe_sockaddr6(any, port);
+        pert_free(any);
+        var ok6: bool = pe_sys(PE_SYS_BIND, s6, sa6, 28) == 0 && pe_sys(PE_SYS_LISTEN, s6, 4096, 0) == 0;
+        pert_free(sa6);
+        if ok6 { return s6; }
+        pe_sys(PE_SYS_CLOSE, s6, 0, 0);
+    }
     var s: i64 = pe_sys(PE_SYS_SOCKET, 2, 1, 0);
     if s < 0 { return 0 - 1; }
     var on: i64 = pe_zeroed(1);
@@ -595,7 +747,7 @@ pub fn pert_socket_listen(port: i64) -> i64 {
     var sa: i64 = pe_sockaddr(0, port);
     var bound: i64 = pe_sys(PE_SYS_BIND, s, sa, 16);
     pert_free(sa);
-    if bound != 0 || pe_sys(PE_SYS_LISTEN, s, 128, 0) != 0 {
+    if bound != 0 || pe_sys(PE_SYS_LISTEN, s, 4096, 0) != 0 {
         pe_sys(PE_SYS_CLOSE, s, 0, 0);
         return 0 - 1;
     }
@@ -639,10 +791,12 @@ pub fn pert_socket_write_str(fd: i64, data: str) -> i64 {
 }
 
 pub fn pert_socket_close(fd: i64) {
+    pe_ep_forget(fd);
     pe_sys(PE_SYS_CLOSE, fd, 0, 0);
 }
 
 pub fn pert_net_close(fd: i64) {
+    pe_ep_forget(fd);
     pe_sys(PE_SYS_CLOSE, fd, 0, 0);
 }
 
@@ -659,18 +813,36 @@ pub fn pert_socket_recv_str(fd: i64) -> str {
     return r;
 }
 
-/// A TCP connection to host:port, or -1.
+/// A TCP connection to host:port, or -1: an IPv4 address of the host if
+/// it has one, else an IPv6 one.
 pub fn pert_net_connect(host: str, port: i64) -> i64 {
     if (host as i64) == 0 { return 0 - 1; }
+    var family: i64 = 2;
+    var salen: i64 = 16;
+    var sa: i64 = 0;
     var ip: i64 = pe_resolve(host as i64);
-    if ip < 0 { return 0 - 1; }
-    var s: i64 = pe_sys(PE_SYS_SOCKET, 2, 1, 0);
-    if s < 0 { return 0 - 1; }
-    var sa: i64 = pe_sockaddr(ip, port);
+    if ip >= 0 {
+        sa = pe_sockaddr(ip, port);
+    } else {
+        var a6: i64 = pe_zeroed(2);
+        if !pe_resolve6(host as i64, a6) {
+            pert_free(a6);
+            return 0 - 1;
+        }
+        sa = pe_sockaddr6(a6, port);
+        pert_free(a6);
+        family = 10;
+        salen = 28;
+    }
+    var s: i64 = pe_sys(PE_SYS_SOCKET, family, 1, 0);
+    if s < 0 {
+        pert_free(sa);
+        return 0 - 1;
+    }
     var r: i64 = 0;
     if pe_co_self() != 0 {
         pe_nonblock(s);
-        r = pe_sys(PE_SYS_CONNECT, s, sa, 16);
+        r = pe_sys(PE_SYS_CONNECT, s, sa, salen);
         if r == PE_EINPROGRESS {
             pert_co_wait_fd(s, 1, 30000);
             var err: i64 = pe_zeroed(1);
@@ -682,7 +854,7 @@ pub fn pert_net_connect(host: str, port: i64) -> i64 {
             pert_free(len);
         }
     } else {
-        r = pe_sys(PE_SYS_CONNECT, s, sa, 16);
+        r = pe_sys(PE_SYS_CONNECT, s, sa, salen);
     }
     pert_free(sa);
     if r != 0 {
@@ -743,6 +915,8 @@ pub fn pert_co_send(fd: i64, buf: i64, n: i64) -> i64 {
 /// Run `/bin/sh -c cmd`: its exit status (128 + n when killed by signal n),
 /// -1 if it could not start.
 fn pe_sh(cmd: i64) -> i64 {
+    // Windows cannot fork: win.fd runs the command (its syscall 1000)
+    if nat_os() == 1 { return nat_syscall(1000, cmd, 0, 0, 0, 0, 0); }
     var argv: i64 = pe_zeroed(4);
     pe_st(argv, "/bin/sh" as i64);
     pe_st(argv + 8, "-c" as i64);

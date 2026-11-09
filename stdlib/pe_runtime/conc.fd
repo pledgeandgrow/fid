@@ -25,10 +25,11 @@ extern "C" {
     fn SleepConditionVariableSRW as pe_k_cond_wait(cond: i64, lock: i64, ms: i64, flags: i64) -> i32;
     fn WakeConditionVariable as pe_k_cond_signal(cond: i64);
     fn WakeAllConditionVariable as pe_k_cond_broadcast(cond: i64);
-    fn ConvertThreadToFiber as pe_k_thread_to_fiber(arg: i64) -> i64;
-    fn CreateFiberEx as pe_k_create_fiber(commit: i64, reserve: i64, flags: i64, start: i64, arg: i64) -> i64;
-    fn SwitchToFiber as pe_k_switch_fiber(fiber: i64);
-    fn DeleteFiber as pe_k_delete_fiber(fiber: i64);
+    fn VirtualAlloc as pe_k_valloc(addr: i64, size: i64, kind: i64, prot: i64) -> i64;
+    fn VirtualFree as pe_k_vfree(addr: i64, size: i64, kind: i64) -> i32;
+    fn CreateIoCompletionPort as pe_k_iocp_create(file: i64, port: i64, key: i64, threads: i64) -> i64;
+    fn GetQueuedCompletionStatusEx as pe_k_gqcs_ex(port: i64, entries: i64, count: i64, removed: i64, ms: i64, alertable: i64) -> i32;
+    fn PostQueuedCompletionStatus as pe_k_pqcs(port: i64, bytes: i64, key: i64, overlapped: i64) -> i32;
     fn GetTickCount64 as pe_k_ticks() -> i64;
     fn Sleep as pe_k_sleep(ms: i64);
     fn TlsAlloc as pe_k_tls_alloc() -> u32;
@@ -42,9 +43,20 @@ extern "C" {
     fn pe_fn_lookup(name: str) -> i64;
     fn pe_call_fn(addr: i64, nargs: i64, argv: i64) -> i64;
     fn pe_thread_entry_addr() -> i64;
+    fn pe_ctx_swap(save: i64, sp: i64);
+    fn pe_ctx_tramp_addr() -> i64;
+}
+
+// Readiness of a socket through its AFD driver, completed on an I/O
+// completion port (competitive RT11): what wepoll, mio and libuv use
+extern "C" link "ntdll" {
+    fn NtCreateFile as pe_nt_create_file(handle: i64, access: i64, attrs: i64, iosb: i64, alloc: i64, fattrs: i64, share: i64, disposition: i64, options: i64, ea: i64, ealen: i64) -> i32;
+    fn NtDeviceIoControlFile as pe_nt_ioctl(file: i64, event: i64, apc: i64, apc_ctx: i64, iosb: i64, code: i64, inb: i64, inlen: i64, outb: i64, outlen: i64) -> i32;
+    fn NtCancelIoFileEx as pe_nt_cancel(file: i64, iosb: i64, cancel_iosb: i64) -> i32;
 }
 
 extern "C" link "ws2_32" {
+    fn WSAIoctl as pe_w_wsaioctl(s: i64, code: i64, inb: i64, inlen: i64, outb: i64, outlen: i64, ret: i64, overlapped: i64, routine: i64) -> i32;
     fn WSAPoll as pe_k_wsa_poll(fds: i64, n: i64, timeout: i32) -> i32;
     fn WSAStartup as pe_w_startup(version: i64, data: i64) -> i32;
     fn WSAGetLastError as pe_w_last_error() -> i32;
@@ -150,22 +162,140 @@ pub fn pert_thread_main(block: i64) -> i64 {
     var result: i64 = pe_call_fn(pe_load(block), pe_load(block + 8), block + 16);
     pe_store(block + 88, result);
     pe_atomic_store(block + 80, 1);
-    // A task runs on its fiber: it ends by giving control back for good
+    // A task runs on its own stack: it ends by giving control back for good
     if pe_load(block + 96) != 0 {
         pe_co_leave();
     }
     return result;
 }
 
+// ─── Task contexts (competitive RT9) ─────────────────────
+// Tasks switch with their own machine code (pe_ctx_swap, compiler/
+// pe_ir_stubs.fd), not Windows fibers. A context is two words: [0] its saved
+// stack pointer, [1] the base of the stack it owns (0: a thread's own), [2]
+// busy: 1 while it runs or is still saving its registers (pe_ctx_swap clears
+// it once on the new stack, so a context woken on another thread is resumed
+// only after that), [3] why the task that last switched to it left: 1 still
+// runnable (a yield), 0 blocked or finished. The task says so itself: its
+// state word can already be changed by a wake on another thread. A
+// task stack is laid out as Windows lays out a thread's: 1 MB reserved, the
+// top 16 KB committed, a guard page under them; the switch carries the TEB's
+// stack fields, so the system grows the stack and reports its overflow
+// ("Panic: Stack overflow") as on a thread. Finished tasks' stacks are kept
+// for the next ones (up to 256).
+
+var pert_stk_lock: i64 = 0;    // SRWLOCK of the stack cache
+var pert_stk_free: i64 = 0;    // cached stack bases
+var pert_stk_n: i64 = 0;
+
+/// The context of the running thread's own stack
+fn pe_ctx_thread() -> i64 {
+    var ctx: i64 = pe_zeroed(4);
+    pe_store(ctx + 16, 1);
+    return ctx;
+}
+
+/// Claim `to` for this thread: wait until it has saved its registers
+/// (pe_ctx_swap clears its busy word), then mark it busy. A task woken on
+/// another thread can still be leaving there: claim it before writing its
+/// block (where it returns to), or it reads this thread's values on its way out.
+fn pe_ctx_claim(to: i64) {
+    while pe_atomic_load(to + 16) != 0 {
+    }
+    pe_store(to + 16, 1);
+}
+
+/// Save the running context in `from`, resume `to` (claimed)
+fn pe_ctx_resume(from: i64, to: i64) {
+    pe_ctx_swap(from, pe_load(to));
+}
+
+/// Save the running context in `from`, resume `to` (once it is saved)
+fn pe_ctx_switch(from: i64, to: i64) {
+    pe_ctx_claim(to);
+    pe_ctx_resume(from, to);
+}
+
+fn pe_ctx_stack() -> i64 {
+    var base: i64 = 0;
+    pe_k_lock(pert_stk_lock);
+    if pert_stk_n > 0 {
+        pert_stk_n = pert_stk_n - 1;
+        base = pe_load(pert_stk_free + pert_stk_n * 8);
+    }
+    pe_k_unlock(pert_stk_lock);
+    if base != 0 {
+        return base;
+    }
+    base = pe_k_valloc(0, 1048576, 0x2000, 4);          // MEM_RESERVE
+    if base == 0 {
+        return 0;
+    }
+    var top: i64 = base + 1048576;
+    if pe_k_valloc(top - 16384, 16384, 0x1000, 4) == 0 {  // MEM_COMMIT
+        pe_k_vfree(base, 0, 0x8000);
+        return 0;
+    }
+    pe_k_valloc(top - 20480, 4096, 0x1000, 0x104);        // PAGE_GUARD
+    return base;
+}
+
+/// A new task's context: its first switch "returns" into the trampoline,
+/// which calls entry(arg) (C convention)
+fn pe_ctx_new(entry: i64, arg: i64) -> i64 {
+    var base: i64 = pe_ctx_stack();
+    if base == 0 {
+        return 0;
+    }
+    var top: i64 = base + 1048576;
+    var s: i64 = top - 256;
+    var i: i64 = 0;
+    while i < 32 {
+        pe_store(s + i * 8, 0);
+        i = i + 1;
+    }
+    // xmm6-15 [0, 160), the TEB stack fields, r15 r14 r13 r12 rsi rdi rbx
+    // rbp, the return address
+    pe_store(s + 160, top);
+    pe_store(s + 168, top - 16384);
+    pe_store(s + 176, base);
+    pe_store(s + 200, entry);
+    pe_store(s + 208, arg);
+    pe_store(s + 248, pe_ctx_tramp_addr());
+    var ctx: i64 = pe_zeroed(4);
+    pe_store(ctx, s);
+    pe_store(ctx + 8, base);
+    return ctx;
+}
+
+/// Free a finished task's context (never the running one)
+fn pe_ctx_free(ctx: i64) {
+    var base: i64 = pe_load(ctx + 8);
+    if base != 0 {
+        pe_k_lock(pert_stk_lock);
+        if pert_stk_n < 256 {
+            pe_store(pert_stk_free + pert_stk_n * 8, base);
+            pert_stk_n = pert_stk_n + 1;
+            base = 0;
+        }
+        pe_k_unlock(pert_stk_lock);
+        if base != 0 {
+            pe_k_vfree(base, 0, 0x8000);                  // MEM_RELEASE
+        }
+    }
+    p_free(ctx);
+}
+
 // ─── Tasks: green threads (M:N scheduler) ─────────────────
-// A task's block is a thread's, with [12] = 1 and [13] its fiber, then [14] the
+// A task's block is a thread's, with [12] = 1 and [13] its context, then [14] the
 // task it awaits, [15] the task it returns to when it first suspends, [16] the
 // socket it waits for (-1: none), [17] 1 to wait for writing, [18] the result
 // of the wait, [19] when the wait ends in ms (0: never), [20] freed once done,
-// [21] the scheduler fiber it yields back to, [22] queue links, [23] a pending
+// [21] the scheduler context it yields back to, [22] queue links, [23] a pending
 // blocking-pool job, [24] the wait state: 0 runnable-or-running, 1 blocked on a
 // wait in the registry (fd/join/pool), 2 already requeued by a wake, 3 blocked
-// on a deadline in the timer heap only.
+// on a deadline in the timer heap only, 4 blocked on a socket poll on the
+// completion port; [28] that poll (RT11).
 // [24] exists because two threads can requeue a task: its worker when it
 // yields runnable, the poller/pool when its wait ends. A yielded task leaves
 // with [24] = 0 and only its worker requeues it; a blocked task leaves with
@@ -174,7 +304,7 @@ pub fn pert_thread_main(block: i64) -> i64 {
 // queue twice.
 // A future of a task is its block with the tag 0x7FA5 in the top 16 bits.
 //
-// M:N: `pert_nworkers` OS worker threads each run a scheduler fiber that pops
+// M:N: `pert_nworkers` OS worker threads each run a scheduler context that pops
 // runnable tasks off one global run queue (`pert_wq`), so tasks migrate across
 // CPUs and there is no stealing to implement — the shared queue IS the work
 // distribution. A dedicated poller thread owns the fd-wait set (WSAPoll),
@@ -188,7 +318,7 @@ var pert_co_cap: i64 = 0;
 var pert_co_total: i64 = 0;
 
 var pert_tls_cur: i64 = 0;     // TLS slot: current task on this thread
-var pert_tls_sched: i64 = 0;   // TLS slot: this thread's scheduler fiber
+var pert_tls_sched: i64 = 0;   // TLS slot: this thread's scheduler context
 var pert_tls_wid: i64 = 0;     // TLS slot: worker id + 1 (0 = not a worker)
 var pert_lq: i64 = 0;          // per-worker queues: [wid*16]=head [wid*16+8]=tail
 var pert_lq_any: i64 = 0;      // *i64 — count of tasks on all local queues
@@ -297,6 +427,19 @@ fn pe_wq_push(t: i64) {
     pe_k_unlock(pert_wq);
 }
 
+/// Requeue a task that yielded on worker `wid` (0-based): its own queue, which
+/// the worker pops next. Another worker is woken only for a backlog: waking
+/// one per yield made every yield an OS thread switch.
+fn pe_wq_push_yielded(t: i64, wid: i64) {
+    pe_k_lock(pert_wq);
+    var backlog: bool = pe_load(pert_lq + wid * 16 + 8) != 0 || pert_wq_head != 0;
+    pe_lq_push_locked(t, wid);
+    if backlog && pe_atomic_load(pert_idle) > 0 {
+        pe_k_cond_signal(pert_wq + 8);
+    }
+    pe_k_unlock(pert_wq);
+}
+
 fn pe_wq_pop(wid: i64) -> i64 {
     pe_k_lock(pert_wq);
     while true {
@@ -334,7 +477,7 @@ fn pe_co_new_block(name: str, nargs: i64, argv: i64) -> i64 {
         p_panic("task: no such function");
     }
     pe_co_ensure();
-    var block: i64 = pe_zeroed(28);
+    var block: i64 = pe_zeroed(29);
     pe_store(block, fn_addr);
     pe_store(block + 8, nargs);
     var a: i64 = 0;
@@ -346,11 +489,11 @@ fn pe_co_new_block(name: str, nargs: i64, argv: i64) -> i64 {
     pe_store(block + 128, -1);
     // +192 in-wait-list flag and +208/+216 links stay 0 until registered
     pe_store(block + 200, 0 - 1);   // timer-heap slot
-    var fiber: i64 = pe_k_create_fiber(16384, 1048576, 0, pe_thread_entry_addr(), block);
-    if fiber == 0 {
+    var ctx: i64 = pe_ctx_new(pe_thread_entry_addr(), block);
+    if ctx == 0 {
         p_panic("task: out of memory");
     }
-    pe_store(block + 104, fiber);
+    pe_store(block + 104, ctx);
     pe_k_lock(pert_reg);
     if pert_co_count == pert_co_cap {
         var cap: i64 = pert_co_cap * 2;
@@ -399,6 +542,10 @@ fn pe_co_ensure() {
     pert_tls_cur = pe_k_tls_alloc();
     pert_tls_sched = pe_k_tls_alloc();
     pert_tls_wid = pe_k_tls_alloc();
+    pert_stk_lock = pe_zeroed(1);
+    pe_k_lock_init(pert_stk_lock);
+    pert_stk_free = pe_zeroed(256);
+    pe_afd_init();
     pert_wq = pe_zeroed(2);
     pe_k_lock_init(pert_wq);
     pe_k_cond_init(pert_wq + 8);
@@ -461,39 +608,55 @@ fn pe_co_ensure() {
     }
 }
 
-/// The running task gives up control: back to the task that entered it
-/// ([15], the async-chain parent), else to its worker's scheduler fiber.
+/// The running task gives up control, blocked (or finished): back to the
+/// task that entered it ([15], the async-chain parent), else to its worker's
+/// scheduler context.
 fn pe_co_leave() {
+    pe_co_leave_as(0);
+}
+
+/// Leave, telling the context resumed whether this task is still runnable
+fn pe_co_leave_as(runnable: i64) {
     var c: i64 = pe_co_cur();
     if c == 0 {
         return;
     }
     var back: i64 = pe_load(c + 120);
     pe_store(c + 120, 0);
+    var to: i64 = pe_load(c + 168);
     if back != 0 {
         pe_k_tls_set(pert_tls_cur, back);
-        pe_k_switch_fiber(pe_load(back + 104));
+        to = pe_load(back + 104);
     } else {
         pe_k_tls_set(pert_tls_cur, 0);
-        pe_k_switch_fiber(pe_load(c + 168));
     }
+    pe_store(to + 24, runnable);
+    pe_ctx_switch(pe_load(c + 104), to);
 }
 
-/// Enter `block` on this thread: the caller's scheduler fiber becomes its
+/// Enter `block` on this thread: the caller's scheduler context becomes its
 /// yield target, the caller (task or not) its return target. Restores the
 /// caller's task context on the way back — a task can enter another task.
-fn pe_co_enter(block: i64) {
+/// Returns 1 if `block` left still runnable (it yielded), else 0.
+fn pe_co_enter(block: i64) -> i64 {
     var sched: i64 = pe_k_tls_get(pert_tls_sched);
     if sched == 0 {
-        sched = pe_k_thread_to_fiber(0);
+        sched = pe_ctx_thread();
         pe_k_tls_set(pert_tls_sched, sched);
     }
     var prev: i64 = pe_k_tls_get(pert_tls_cur);
+    pe_ctx_claim(pe_load(block + 104));
     pe_store(block + 168, sched);
     pe_store(block + 120, prev);
     pe_k_tls_set(pert_tls_cur, block);
-    pe_k_switch_fiber(pe_load(block + 104));
+    // The running context: the task that enters, else the thread's own
+    var from: i64 = sched;
+    if prev != 0 {
+        from = pe_load(prev + 104);
+    }
+    pe_ctx_resume(from, pe_load(block + 104));
     pe_k_tls_set(pert_tls_cur, prev);
+    return pe_load(from + 24);
 }
 
 // ─── Wait registry: tasks blocked on fd / join / pool ─────
@@ -675,7 +838,7 @@ fn pe_timer_pop() -> i64 {
     return block;
 }
 
-/// Task finished: drop the fiber, count down, wake joiners/task_run.
+/// Task finished: free its context, count down, wake joiners/task_run.
 fn pe_co_finish_task(block: i64) {
     pe_k_lock(pert_reg);
     pe_wait_remove(block);
@@ -694,7 +857,7 @@ fn pe_co_finish_task(block: i64) {
         pert_co_count = pert_co_count - 1;
     }
     pe_k_unlock(pert_reg);
-    pe_k_delete_fiber(pe_load(block + 104));
+    pe_ctx_free(pe_load(block + 104));
     pe_k_lock(pert_done);
     pe_atomic_add(pert_live, 0 - 1);
     pe_k_cond_broadcast(pert_done + 8);
@@ -704,28 +867,24 @@ fn pe_co_finish_task(block: i64) {
     }
 }
 
-/// Worker OS thread: scheduler fiber + pop-run loop forever.
+/// Worker OS thread: scheduler context + pop-run loop forever.
 pub fn pert_worker_main(id: i64) -> i64 {
-    var sched: i64 = pe_k_thread_to_fiber(0);
+    var sched: i64 = pe_ctx_thread();
     pe_k_tls_set(pert_tls_sched, sched);
     pe_k_tls_set(pert_tls_wid, id + 1);
     while true {
         var t: i64 = pe_wq_pop(id);
+        pe_ctx_claim(pe_load(t + 104));
         pe_store(t + 168, sched);
         pe_k_tls_set(pert_tls_cur, t);
-        pe_k_switch_fiber(pe_load(t + 104));
+        pe_ctx_resume(sched, pe_load(t + 104));
         pe_k_tls_set(pert_tls_cur, 0);
         if pe_load(t + 80) != 0 {
             pe_co_finish_task(t);
-        } else {
-            // Requeue only a runnable task ([24] == 0). A blocked one is the
-            // poller/pool's to wake — checking under the registry lock makes
-            // the handoff atomic against their wake-and-push.
-            pe_k_lock(pert_reg);
-            if pe_load(t + 192) == 0 {
-                pe_wq_push(t);
-            }
-            pe_k_unlock(pert_reg);
+        } else if pe_load(sched + 24) != 0 {
+            // It yielded: requeue it. A blocked one is the poller/pool's to
+            // wake, and may already be running again on another worker.
+            pe_wq_push_yielded(t, id);
         }
     }
     return 0;
@@ -790,7 +949,7 @@ pub fn pert_poller_main(id: i64) -> i64 {
         }
         // Soonest deadline is the heap top; armed timers count as waiters.
         first = pe_timer_peek();
-        waiters = waiters + pert_timer_n;
+        waiters = waiters + pert_timer_n + pert_afd_n;
         var live_n: i64 = pe_atomic_load(pert_live);
         var idle_n: i64 = pe_atomic_load(pert_idle);
         var queue_empty: bool = pert_wq_head == 0 && pe_atomic_load(pert_lq_any) == 0;
@@ -821,7 +980,17 @@ pub fn pert_poller_main(id: i64) -> i64 {
                 timeout = 25;
             }
         }
-        if n > 0 {
+        var got: i64 = 0;
+        if pert_afd != 0 {
+            // Socket polls, pokes and the deadline all end this wait
+            pe_store(pert_iocp_n, 0);
+            if pe_k_gqcs_ex(pert_iocp, pert_iocp_ents, 64, pert_iocp_n, timeout, 0) != 0 {
+                got = pe_load(pert_iocp_n) & 0xFFFFFFFF;
+            }
+            if n > 0 {
+                pe_k_wsa_poll(fds, n, 0);
+            }
+        } else if n > 0 {
             pe_k_wsa_poll(fds, n, timeout);
         } else if waiters > 0 {
             pe_k_sleep(timeout);
@@ -837,6 +1006,14 @@ pub fn pert_poller_main(id: i64) -> i64 {
         // lock so a task can't be pushed twice for the same wait. Only the
         // wait registry is walked — sleepers stay in the heap.
         pe_k_lock(pert_reg);
+        var ei: i64 = 0;
+        while ei < got {
+            var op: i64 = pe_load(pert_iocp_ents + ei * 32 + 8);
+            if op != 0 {
+                pe_afd_done(op);
+            }
+            ei = ei + 1;
+        }
         var c2: i64 = pert_wait_head;
         while c2 != 0 {
             var nx2: i64 = pe_load(c2 + 208);
@@ -885,6 +1062,7 @@ pub fn pert_poller_main(id: i64) -> i64 {
         while more {
             var tb: i64 = pe_timer_pop();
             if pe_load(tb + 152) != 0 {
+                pe_afd_cancel(tb);
                 pe_store(tb + 144, 0);
                 pe_store(tb + 128, -1);
                 pe_store(tb + 152, 0);
@@ -901,10 +1079,161 @@ pub fn pert_poller_main(id: i64) -> i64 {
 
 /// A task that just registered a wait pokes the poller out of its idle sleep.
 fn pe_poller_poke() {
+    if pert_afd != 0 {
+        pe_k_pqcs(pert_iocp, 0, 1, 0);
+        return;
+    }
     if pert_poll_cond != 0 {
         pe_k_lock(pert_poll_cond);
         pe_k_cond_signal(pert_poll_cond + 8);
         pe_k_unlock(pert_poll_cond);
+    }
+}
+
+// ─── Socket readiness on the completion port (RT11) ──────
+// A task waiting for a socket submits one AFD poll (IOCTL_AFD_POLL on the
+// socket's base handle) and is woken by its completion: no set of sockets is
+// rebuilt or scanned per cycle, so a wait costs the same with one socket or
+// 100,000. A poll is [0] its IO_STATUS_BLOCK, [2..6) AFD_POLL_INFO (timeout,
+// handle count, the handle, events), [6] the task, [7] 1 once its deadline
+// won (cancelled: freed when its completion comes), [8..10) the cancel's
+// IO_STATUS_BLOCK. Without the AFD device (pert_afd == 0) the poller polls
+// the wait set with WSAPoll as before.
+
+var pert_iocp: i64 = 0;        // the completion port
+var pert_afd: i64 = 0;         // \Device\Afd\Fides, on the port (0: none)
+var pert_afd_n: i64 = 0;       // polls a task waits on (under pert_reg)
+var pert_iocp_ents: i64 = 0;   // OVERLAPPED_ENTRY[64] the poller dequeues into
+var pert_iocp_n: i64 = 0;      // *u32: how many it got
+
+fn pe_afd_init() {
+    pert_iocp_ents = pe_zeroed(64 * 4);
+    pert_iocp_n = pe_zeroed(1);
+    pert_iocp = pe_k_iocp_create(0 - 1, 0, 0, 0);
+    if pert_iocp == 0 {
+        return;
+    }
+    // L"\Device\Afd\Fides"
+    var name: i64 = pe_zeroed(5);
+    pe_store(name, 0x7600650044005C);
+    pe_store(name + 8, 0x5C006500630069);
+    pe_store(name + 16, 0x5C006400660041);
+    pe_store(name + 24, 0x65006400690046);
+    pe_store(name + 32, 0x73);
+    var us: i64 = pe_zeroed(2);                // UNICODE_STRING
+    pe_store(us, 34 + (36 << 16));
+    pe_store(us + 8, name);
+    var oa: i64 = pe_zeroed(6);                // OBJECT_ATTRIBUTES
+    pe_store(oa, 48);
+    pe_store(oa + 16, us);
+    var iosb: i64 = pe_zeroed(2);
+    var h: i64 = pe_zeroed(1);
+    // SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN
+    var st: i32 = pe_nt_create_file(h, 0x100000, oa, iosb, 0, 0, 3, 1, 0, 0, 0);
+    if st == 0 {
+        var afd: i64 = pe_load(h);
+        if pe_k_iocp_create(afd, pert_iocp, 0, 0) == pert_iocp {
+            pert_afd = afd;
+        } else {
+            pe_k_close_handle(afd);
+        }
+    }
+    p_free(h);
+    p_free(iosb);
+    p_free(oa);
+    p_free(us);
+    p_free(name);
+}
+
+/// The socket under any layered service provider: what AFD polls
+fn pe_afd_base(fd: i64) -> i64 {
+    var out: i64 = pe_zeroed(2);
+    var b: i64 = fd;
+    if pe_w_wsaioctl(fd, 0x48000022, 0, 0, out, 8, out + 8, 0, 0) == 0 {   // SIO_BASE_HANDLE
+        b = pe_load(out);
+    }
+    p_free(out);
+    return b;
+}
+
+fn pe_afd_wait(cur: i64, fd: i64, write: i64, timeout_ms: i64) -> i64 {
+    var op: i64 = pe_zeroed(10);
+    pe_store(op + 16, 0x7FFFFFFFFFFFFFFF);
+    pe_store(op + 24, 1);
+    pe_store(op + 32, pe_afd_base(fd));
+    // read: receive, expedited, disconnect, abort, local close, accept,
+    // connect failed; write: send, abort, local close, connect failed
+    if write != 0 {
+        pe_store(op + 40, 0x134);
+    } else {
+        pe_store(op + 40, 0x1BB);
+    }
+    pe_store(op + 48, cur);
+    pe_k_lock(pert_reg);
+    pe_store(cur + 128, fd);
+    pe_store(cur + 136, write);
+    pe_store(cur + 144, 0);
+    if timeout_ms >= 0 {
+        pe_store(cur + 152, pe_k_ticks() + timeout_ms + 1);
+        pe_timer_push(pe_load(cur + 152), cur);
+    } else {
+        pe_store(cur + 152, 0);
+    }
+    pe_store(cur + 224, op);
+    pe_store(cur + 192, 4);
+    pert_afd_n = pert_afd_n + 1;
+    var st: i32 = pe_nt_ioctl(pert_afd, 0, 0, op, op, 0x12024, op + 16, 32, op + 16, 32);
+    if st != 0 && st != 259 {
+        // Refused (no completion comes): ready now, the next call on the
+        // socket reports its error
+        pert_afd_n = pert_afd_n - 1;
+        pe_store(cur + 224, 0);
+        pe_store(cur + 192, 0);
+        pe_store(cur + 128, -1);
+        if pe_load(cur + 152) != 0 {
+            pe_store(cur + 152, 0);
+            pe_timer_disarm(cur);
+        }
+        pe_k_unlock(pert_reg);
+        p_free(op);
+        return 1;
+    }
+    pe_k_unlock(pert_reg);
+    if timeout_ms >= 0 {
+        pe_poller_poke();      // its deadline may come before the poller wakes
+    }
+    pe_co_leave();
+    return pe_load(cur + 144);
+}
+
+/// A poll completed (poller, under pert_reg): wake its task, unless its
+/// deadline already did
+fn pe_afd_done(op: i64) {
+    if pe_load(op + 56) == 0 {
+        var t: i64 = pe_load(op + 48);
+        pert_afd_n = pert_afd_n - 1;
+        pe_store(t + 224, 0);
+        pe_store(t + 144, 1);
+        pe_store(t + 128, -1);
+        if pe_load(t + 152) != 0 {
+            pe_store(t + 152, 0);
+            pe_timer_disarm(t);
+        }
+        pe_store(t + 192, 2);
+        pe_wq_push(t);
+    }
+    p_free(op);
+}
+
+/// A task's deadline came first (poller, under pert_reg): cancel its poll;
+/// the poll is freed when its completion arrives
+fn pe_afd_cancel(t: i64) {
+    var op: i64 = pe_load(t + 224);
+    if op != 0 {
+        pe_store(op + 56, 1);
+        pe_store(t + 224, 0);
+        pert_afd_n = pert_afd_n - 1;
+        pe_nt_cancel(pert_afd, op, op + 64);
     }
 }
 
@@ -999,25 +1328,19 @@ pub fn pert_co_spawn_v(name: str, nargs: i64, argv: i64) -> i64 {
 
 pub fn pert_co_async_v(name: str, nargs: i64, argv: i64) -> i64 {
     var block: i64 = pe_co_new_block(name, nargs, argv);
-    pe_co_enter(block);
+    var runnable: i64 = pe_co_enter(block);
     if pe_load(block + 80) != 0 {
         pe_co_finish_task(block);
-    } else {
-        // Requeue only if truly runnable ([24] == 0). Blocked tasks are the
-        // poller/pool's to wake ([24] == 1); one already pushed by a wake is
-        // marked [24] == 2 — pushing either again would double-queue it.
-        pe_k_lock(pert_reg);
-        if pe_load(block + 192) == 0 {
-            pe_wq_push(block);
-        }
-        pe_k_unlock(pert_reg);
+    } else if runnable != 0 {
+        // It yielded: queue it. A blocked one is the poller/pool's to wake.
+        pe_wq_push(block);
     }
     return block | (0x7FA5 << 48);
 }
 
 pub fn pert_co_yield() {
     if pe_co_cur() != 0 {
-        pe_co_leave();
+        pe_co_leave_as(1);
     }
 }
 
@@ -1025,7 +1348,7 @@ pub fn pert_co_yield() {
 /// so tight loops can't starve other tasks but don't pay when uncontended.
 pub fn pert_co_tick() {
     if pe_co_cur() != 0 && pert_wq_head != 0 {
-        pe_co_leave();
+        pe_co_leave_as(1);
     }
 }
 
@@ -1090,6 +1413,9 @@ pub fn pert_co_sleep(ms: i64) -> i64 {
 
 pub fn pert_co_wait_fd(fd: i64, write: i64, timeout_ms: i64) -> i64 {
     var cur: i64 = pe_co_cur();
+    if cur != 0 && pert_afd != 0 {
+        return pe_afd_wait(cur, fd, write, timeout_ms);
+    }
     if cur != 0 {
         pe_k_lock(pert_reg);
         pe_store(cur + 128, fd);
@@ -1139,9 +1465,28 @@ fn pe_port_word(port: i64, rest: i64) -> i64 {
     return (rest & ~4294901760) | ((port & 255) << 24) | (((port >> 8) & 255) << 16);
 }
 
-/// A TCP socket on all addresses, listening, or -1.
+/// A TCP socket on all addresses, listening, or -1: IPv6 and IPv4 clients on
+/// one socket (IPV6_V6ONLY off, Windows has it on by default), IPv4 alone
+/// where the system has no IPv6.
 pub fn pert_socket_listen(port: i64) -> i64 {
     pe_wsa();
+    var s6: i64 = pe_w_socket(23, 1, 0);                       // AF_INET6
+    if s6 != -1 {
+        var opt: i64 = pe_zeroed(1);
+        pe_store(opt, 1);
+        pe_w_setsockopt(s6, 65535, 4, opt, 4);                 // SO_REUSEADDR
+        pe_store(opt, 0);
+        pe_w_setsockopt(s6, 41, 27, opt, 4);                   // IPV6_V6ONLY off
+        p_free(opt);
+        var a6: i64 = pe_zeroed(4);                            // sockaddr_in6, 28 bytes
+        pe_store(a6, pe_port_word(port, 23));
+        var ok6: bool = pe_w_bind(s6, a6, 28) == 0 && pe_w_listen(s6, 0x7FFFFFFF) == 0;
+        p_free(a6);
+        if ok6 {
+            return s6;
+        }
+        pe_w_close(s6);
+    }
     var s: i64 = pe_w_socket(2, 1, 0);
     if s == -1 {
         return -1;
@@ -1154,7 +1499,8 @@ pub fn pert_socket_listen(port: i64) -> i64 {
     pe_store(addr, pe_port_word(port, 2));
     var bound: i64 = pe_w_bind(s, addr, 16);
     p_free(addr);
-    if bound != 0 || pe_w_listen(s, 128) != 0 {
+    // SOMAXCONN: the system's longest queue of connections not yet accepted
+    if bound != 0 || pe_w_listen(s, 0x7FFFFFFF) != 0 {
         pe_w_close(s);
         return -1;
     }
@@ -1229,8 +1575,9 @@ pub fn pert_net_connect(host: str, port: i64) -> i64 {
 
 fn pert_net_connect_sync(host: str, port: i64) -> i64 {
     pe_wsa();
+    // Any family (AF_UNSPEC): the host's IPv6 and IPv4 addresses, in the
+    // order the system ranks them, each tried until one connects
     var hints: i64 = pe_zeroed(6);
-    pe_store(hints, 2 << 32);
     pe_store(hints + 8, 1);
     var res: i64 = pe_zeroed(1);
     var failed: i64 = pe_w_getaddrinfo(host, 0, hints, res);
@@ -1240,24 +1587,37 @@ fn pert_net_connect_sync(host: str, port: i64) -> i64 {
     if failed != 0 || info == 0 {
         return -1;
     }
-    var addr: i64 = pe_zeroed(2);
-    var from: i64 = pe_load(info + 32);
-    pe_store(addr, pe_port_word(port, pe_load(from)));
-    pe_store(addr + 8, pe_load(from + 8));
-    pe_w_freeaddrinfo(info);
-    var s: i64 = pe_w_socket(2, 1, 0);
-    if s == -1 {
-        p_free(addr);
-        return -1;
+    var first: i64 = info;
+    var conn: i64 = -1;
+    while info != 0 && conn == -1 {
+        // addrinfo: [4] family, [16] address length, [32] the address, [40] next
+        var fam: i64 = (pe_load(info) >> 32) & 0xFFFFFFFF;
+        var alen: i64 = pe_load(info + 16);
+        var from: i64 = pe_load(info + 32);
+        if (fam == 2 || fam == 23) && alen > 0 && alen <= 32 {
+            var a: i64 = pe_zeroed(4);
+            var w: i64 = 0;
+            while w * 8 < alen {
+                pe_store(a + w * 8, pe_load(from + w * 8));
+                w = w + 1;
+            }
+            pe_store(a, pe_port_word(port, pe_load(a)));
+            var sk: i64 = pe_w_socket(fam, 1, 0);
+            if sk != -1 {
+                if pe_w_connect(sk, a, alen) == 0 {
+                    conn = sk;
+                } else {
+                    pe_w_close(sk);
+                }
+            }
+            p_free(a);
+        }
+        info = pe_load(info + 40);
     }
-    var joined: i64 = pe_w_connect(s, addr, 16);
-    p_free(addr);
-    if joined != 0 {
-        pe_w_close(s);
-        return -1;
-    }
-    return s;
+    pe_w_freeaddrinfo(first);
+    return conn;
 }
+
 
 fn pe_co_nonblock(fd: i64) {
     var on: i64 = pe_zeroed(1);
