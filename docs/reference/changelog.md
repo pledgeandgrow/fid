@@ -1,5 +1,69 @@
 # Fides Language Changelog
 
+## Own backend, ownership layouts and speed in `fid` (Nov 7–9, 2026)
+
+All in the self-hosted compiler. Fixpoint verified Nov 8 (stage 2 == stage 3,
+67 MB of C, with the ownership layouts below); later changes were checked on
+one-stage builds and the native suites. The full suite was not rerun with
+`fid` as the compiler. Details: docs/roadmap/llvm-roadmap.md,
+docs/roadmap/competitive-roadmap.md.
+
+- **Machine layer (`compiler/nat_ir.fd`, `nat_enc.fd`):** one machine IR and
+  one register allocator (linear scan, spill weights, IPRA clobber sets, an
+  allocation checker under `FID_VERIFY=1`) for Linux AArch64, RISC-V 64 and
+  x86-64 (`fid emit --target ...`, static ELF, `.debug_line`), and opt-in
+  Windows x64 (`fid emit --nat`: a PE over kernel32/ws2_32 with the Linux
+  runtime, `stdlib/linux_runtime/win.fd`). Nov 9 suites: 273 / 271 / 272 of
+  317 on Linux, 301 of 338 with `--nat`. Runtime on system calls:
+  threads, M:N tasks with an own context switch, futexes, signals, epoll.
+- **Mid-end (`compiler/iropt.fd`, `iropt_me.fd`, `egraph.fd`, `rules.fd`,
+  `irverify.fd`):** use lists, an IR verifier after every pass
+  (`FID_VERIFY=1`), one pass manager with per-pass switches, rewrite rules as
+  data (`fid test-rules`; all 108 integer obligations proved by z3 with
+  `scripts/rules-smt.sh`), an e-graph, SCCP, tail recursion into loops, LICM
+  and loop rotation, load forwarding. `scripts/enc-oracle.py` checks the
+  encoders against clang's assembler (1,181 forms, 0 mismatches);
+  `scripts/pass-matrix.sh` runs the suite with each pass off.
+- **Ownership layouts (proposal 0004, `compiler/lower.fd`, `stdlib/core.fd`):**
+  counted strings `[RC + count][len]` bytes; a 40-byte `Vec` header; counted
+  Boxes, freed with their last owner (`LOWER_BOX_RC`); structs held inline in a
+  `Vec` (`LOWER_INLINE_STRUCTS`, element codes 16 and up); `HashMap` slots keep
+  their hash (`HM_HASHED`). A counted `Vec` buffer (`VEC_BUF_RC`) is written
+  and off. Leak gate: `scripts/leak-check.sh` over `tests/leaks/`.
+- **Language facts in the optimizer:** narrow types as ranges (LF12),
+  `@zeroize` stores kept (LF19), shares cancelled where ownership is known
+  (LF15), drops of literal slots removed (LF17), a `Vec` that never leaves its
+  function gets its header on the stack (LF13), `&mut` parameters marked as
+  exclusive borrows (LF1, part). docs/reference/optimizer-facts.md lists
+  each fact and the rule behind it (LF25).
+- **Speed:** `Vec::filled(n, x)`; typed `Vec` get/set/push inlined in the C
+  path; `memcpy`/`memcmp` bodies for string copies and compares; the
+  compiler's C split into units compiled at -O2 (`fid split-c`,
+  `compiler/csplit.fd`, used by scripts/bootstrap.sh); the type and borrow
+  checkers free their tables after their phase. Self-compile 74 s with the
+  -O2 compiler (229 s at -O0), from ~133 s on Nov 6.
+- **Native Windows (`pe_ir`):** tasks switch on their own stacks
+  (`pe_ctx_swap`), sockets wait through IOCP/AFD; a panic follows the rule of
+  reference.md 8.2; native code only for what `main` reaches.
+- **Interpreter (`compiler/interp.fd`):** 19 of 21 failing test programs
+  fixed (casts of integers to pointers, f64 bits to i64 parameters, string
+  lengths from headers, libc calls, signals, real clocks).
+- **Verification:** `tests/conformance/` (104 tests on reference.md),
+  docs/verification/ (semantics, memory-safety core, translation validation,
+  the miscompile log), fuzzers for the front end and stdlib parsers, soak,
+  chaos and interleaving harnesses (scripts/fuzz, scripts/verify).
+- **Stdlib:** 146 modules. New since Nov 6: brotli (+ brotli_dict) and zstd
+  decoders, decimal, protobuf, tz (the IANA TZif database), wss; IPv6 in dns;
+  the native Linux runtime `stdlib/linux_runtime/` (5 files).
+- **Fixed the same day:** native async under `fid emit` broke in builds of
+  Nov 9 afternoon (iropt passes envtrim, gconst, deadf) and works again in
+  the evening's fid31 (known-bugs 2f.2); envtrim and deadf are opt-in, and
+  rules.fd counts a callee's own effects for calls inside it (pure-call
+  merging had merged two calls of a function that writes through a
+  parameter). Checked with fid32 on pe_ir and `--nat`: the async, task,
+  brotli, bigint, decimal, args, counted-loop and fs tests match the
+  interpreter. deadf, envtrim, readcse and branchfold stay opt-in.
+
 ## Release roadmap batches in `fid` (Nov 4–6, 2026)
 
 All in the self-hosted compiler (`fidesc` is frozen). Fixpoint verified

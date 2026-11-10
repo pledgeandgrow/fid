@@ -22,6 +22,7 @@ module unicode;
 use vec;
 use string;
 use encoding;
+use unicode_data;
 
 // ─── Codepoint iteration ────────────────────────────────────────────────
 
@@ -383,4 +384,148 @@ pub fn uni_normalize_lite(s: str) -> str {
         i = i + 1;
     }
     return uni_from_codepoints(out);
+}
+
+// ─── Normalization (UAX#15, Unicode 16 tables) ─────────────────────────
+
+/// Hangul syllable decomposition (algorithmic, UAX#15 §Hangul). False when
+/// `cp` is not a precomposed Hangul syllable.
+fn uni_decomp_hangul(cp: i64, out: &mut Vec) -> bool {
+    if cp < 44032 || cp >= 55204 { return false; }
+    var si: i64 = cp - 44032;
+    out.push(4352 + si / 588);
+    out.push(4449 + (si % 588) / 28);
+    var t: i64 = si % 28;
+    if t > 0 { out.push(4519 + t); }
+    return true;
+}
+
+/// Full (recursive) decomposition of one codepoint, canonical or compat.
+fn uni_decomp_full(cp: i64, compat: bool, out: &mut Vec) {
+    if uni_decomp_hangul(cp, out) { return; }
+    if compat { udata_decomp_compat(cp, out); }
+    else { udata_decomp_canon(cp, out); }
+}
+
+/// Canonical ordering: stable sort of combining marks by their class.
+fn uni_reorder_ccc(src: Vec) -> Vec {
+    var cps: Vec = src;
+    var i: i64 = 1;
+    while i < cps.len() {
+        var cc: i64 = udata_ccc(cps.get(i));
+        if cc > 0 {
+            var v: i64 = cps.get(i);
+            var j: i64 = i;
+            while j > 0 && udata_ccc(cps.get(j - 1)) > cc {
+                cps.set(j, cps.get(j - 1));
+                j = j - 1;
+            }
+            cps.set(j, v);
+        }
+        i = i + 1;
+    }
+    return cps;
+}
+
+/// Hangul jamo composition (L+V -> LV, LV+T -> LVT), else canonical table.
+fn uni_compose_full(a: i64, b: i64) -> i64 {
+    if a >= 4352 && a < 4371 && b >= 4449 && b < 4470 {
+        return 44032 + ((a - 4352) * 21 + (b - 4449)) * 28;
+    }
+    if a >= 44032 && a < 55204 && (a - 44032) % 28 == 0 && b >= 4520 && b < 4547 {
+        return a + (b - 4519);
+    }
+    return udata_compose(a, b);
+}
+
+/// Decompose `s` codepoint-wise (canonical or compat) and reorder by CCC.
+fn uni_decomposed(s: str, compat: bool) -> Vec {
+    var d: Vec = Vec::new();
+    var src: Vec = uni_to_codepoints(s);
+    var i: i64 = 0;
+    while i < src.len() {
+        uni_decomp_full(src.get(i), compat, &mut d);
+        i = i + 1;
+    }
+    return uni_reorder_ccc(d);
+}
+
+/// Canonical recomposition of a decomposed (already CCC-ordered) sequence.
+fn uni_compose_seq(cps: Vec) -> Vec {
+    var out: Vec = Vec::new();
+    var starter_i: i64 = -1;
+    var max_ccc: i64 = 0;
+    var i: i64 = 0;
+    while i < cps.len() {
+        var cp: i64 = cps.get(i);
+        var c: i64 = udata_ccc(cp);
+        var fused: i64 = -1;
+        if starter_i >= 0 {
+            var ok: bool = false;
+            if c == 0 { ok = out.len() == starter_i + 1; }
+            else { ok = c > max_ccc; }
+            if ok { fused = uni_compose_full(out.get(starter_i), cp); }
+        }
+        if fused >= 0 {
+            out.set(starter_i, fused);
+        } else {
+            out.push(cp);
+            if c == 0 { starter_i = out.len() - 1; max_ccc = 0; }
+            else if c > max_ccc { max_ccc = c; }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Canonical decomposition (NFD).
+/// Example:
+///   var v = uni_to_codepoints(uni_nfd("\u{00E9}"));
+///   // [101, 769] — e followed by combining acute
+///   println(int_to_str(v.len()));
+pub fn uni_nfd(s: str) -> str {
+    var v: Vec = Vec::new();
+    var cps: Vec = uni_decomposed(s, false);
+    var i: i64 = 0;
+    while i < cps.len() { v.push(cps.get(i)); i = i + 1; }
+    return uni_from_codepoints(v);
+}
+
+/// Compatibility decomposition (NFKD).
+/// Example:
+///   var v = uni_to_codepoints(uni_nfkd("\u{00BD}"));
+///   // [49, 8260, 50] — "1⁄2" (one, fraction slash, two)
+///   println(int_to_str(v.len()));
+pub fn uni_nfkd(s: str) -> str {
+    var v: Vec = Vec::new();
+    var cps: Vec = uni_decomposed(s, true);
+    var i: i64 = 0;
+    while i < cps.len() { v.push(cps.get(i)); i = i + 1; }
+    return uni_from_codepoints(v);
+}
+
+/// Canonical composition (NFC) — NFD then canonical recomposition.
+/// Example:
+///   if str_equal(uni_nfc("e\u{0301}"), "\u{00E9}") {
+///     println("composed");
+///   }
+pub fn uni_nfc(s: str) -> str {
+    var v: Vec = Vec::new();
+    var cps: Vec = uni_compose_seq(uni_decomposed(s, false));
+    var i: i64 = 0;
+    while i < cps.len() { v.push(cps.get(i)); i = i + 1; }
+    return uni_from_codepoints(v);
+}
+
+/// Compatibility composition (NFKC) — NFKD then canonical recomposition.
+/// Example:
+///   if str_equal(uni_nfkc("\u{339F}"), "mm") {
+///     println("squared mm folded");
+///   }
+pub fn uni_nfkc(s: str) -> str {
+    var v: Vec = Vec::new();
+    var cps: Vec = uni_compose_seq(uni_decomposed(s, true));
+    var i: i64 = 0;
+    while i < cps.len() { v.push(cps.get(i)); i = i + 1; }
+    return uni_from_codepoints(v);
 }

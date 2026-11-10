@@ -2591,7 +2591,7 @@ pub fn Lowerer_lower_program(self: &mut Lowerer, program: Program) -> IrModule {
     // Lower each function
     i = 0;
     while i < program.funcs.len() {
-        Lowerer_lower_func(self, program.funcs.get(i));
+        if lw_keep("fn:" + program.funcs.get(i).name) { Lowerer_lower_func(self, program.funcs.get(i)); }
         i = i + 1;
     }
 
@@ -2604,6 +2604,10 @@ pub fn Lowerer_lower_program(self: &mut Lowerer, program: Program) -> IrModule {
         var j: i64 = 0;
         while j < imp.methods.len() {
             var method: Func = imp.methods.get(j);
+            if !lw_keep("impl:" + imp.struct_name + ":" + method.name) {
+                j = j + 1;
+                continue;
+            }
             var mangled: Func = method;
             mangled.name = imp.struct_name + "_" + method.name;
             // Resolve Self in param types and return type
@@ -2819,6 +2823,18 @@ fn Lowerer_emit_task_adapter(self: &mut Lowerer, func: Func) {
 
 // --- Public entry point ---------------------------------------------------
 
+/// The functions to lower (compile time, CS4): a HashMap of "fn:<name>" /
+/// "impl:<type>:<method>" keys computed on the AST by compiler/reach.fd for
+/// `fid emit`, or 0 to lower every function (the C path, `fid run`). Trait
+/// impl methods are always lowered. The ownership helpers are generated
+/// after the bodies from what was lowered.
+pub var g_lower_keep: i64 = 0;
+
+fn lw_keep(key: str) -> bool {
+    if g_lower_keep == 0 { return true; }
+    return HashMap_contains(g_lower_keep, key);
+}
+
 pub fn lower(program: Program) -> IrModule {
     var l: Lowerer = Lowerer_new();
     var module: IrModule = Lowerer_lower_program(&mut l, program);
@@ -2830,6 +2846,7 @@ pub fn lower(program: Program) -> IrModule {
         lw_auto_drop_strs(&mut module);
     } else {
         lw_rc_cancel_pairs(&mut module);
+        if LOWER_STACK_VECS { lw_rc_stack_vecs(&mut module); }
     }
     return module;
 }
@@ -4121,6 +4138,14 @@ fn Lowerer_lower_func_body(self: &mut Lowerer, func: Func) {
         var meta: ValueMeta = ValueMeta_new(ir_ty);
         meta.region = Lowerer_current_region(self);
         meta.is_linear = is_linear;
+        // A reference parameter says so (LF1): `&mut T` is the only way the
+        // function writes the caller's T, `&T` never does
+        match param.ty {
+            Type::Ref(_, pmut) => {
+                if pmut { meta.borrow_kind = BorrowKind::Mut; } else { meta.borrow_kind = BorrowKind::Shared; }
+            }
+            _ => {}
+        }
         var val: i64 = IrFunction_new_value(&mut ir_func, meta);
         ir_func.params.push(ValueIdType_new(val, ir_ty));
         IrFunction_bind_local(&mut ir_func, param.name, val);
@@ -13416,6 +13441,240 @@ pub fn Lowerer_rc_new_coll(self: &mut Lowerer, t: Type) -> i64 {
     return -1;
 }
 
+
+// A local Vec that never leaves its function keeps its header on the stack
+// (LF13): Vec_init_typed instead of Vec_new_typed, Vec_drop_inplace instead
+// of Vec_drop.
+const LOWER_STACK_VECS: bool = true;
+
+/// Whether the module has function `name`.
+fn lw_module_has_fn(module: &IrModule, name: str) -> bool {
+    match IrModule_get_function(module, name) {
+        OptIrFunction::Some(_) => { return true; }
+        OptIrFunction::None => {}
+    }
+    return false;
+}
+
+/// LF13 over every function.
+fn lw_rc_stack_vecs(module: &mut IrModule) {
+    if !lw_module_has_fn(module, "Vec_init_typed") || !lw_module_has_fn(module, "Vec_drop_inplace") { return; }
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var fentry: IrFunctionEntry = module.functions.get(fi);
+        // core's own Vec functions keep their headers on the heap
+        if !str_starts_with(fentry.name, "Vec_") && !str_starts_with(fentry.name, "vec_") {
+            var f: IrFunction = fentry.func;
+            if lw_rc_stack_vecs_fn(&mut f) {
+                module.functions.set(fi, IrFunctionEntry_new(fentry.name, f));
+            }
+        }
+        fi = fi + 1;
+    }
+}
+
+/// A call whose argument 1 may be a Vec header on the stack: core's Vec
+/// functions use the header in place and never free it (Vec_drop is turned
+/// into Vec_drop_inplace).
+fn lw_rc_header_safe_call(name: str) -> bool {
+    if name == "Vec_share_deep" { return false; }
+    return str_starts_with(name, "Vec_") || str_starts_with(name, "vec_") || str_starts_with(name, "p_vec_");
+}
+
+/// LF13 in one function: true when it changed. A `h = Vec_new_typed(...)`
+/// (or Vec_new) qualifies when h is only stored into one slot S, every other
+/// store to S is a zero, S is used only by those loads and stores, and every
+/// value loaded from S is only argument 1 of core's Vec functions.
+fn lw_rc_stack_vecs_fn(f: &mut IrFunction) -> bool {
+    var nv: i64 = f.next_value;
+    if nv <= 0 || f.blocks.len() == 0 { return false; }
+    var loaded_from: Vec<i64> = Vec::new();
+    var created: Vec<i64> = Vec::new();   // 1: a Vec_new_typed / Vec_new result
+    var slot_of: Vec<i64> = Vec::new();   // h -> the slot it is stored in
+    var h_of: Vec<i64> = Vec::new();      // S -> the h stored in it (-2: several)
+    var ok_slot: Vec<i64> = Vec::new();   // S -> 1 while it qualifies
+    var i: i64 = 0;
+    while i < nv {
+        loaded_from.push(-1); created.push(0); slot_of.push(-1); h_of.push(-1); ok_slot.push(0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < f.insts.len() {
+        var ve: ValueIdInst = f.insts.get(i);
+        match ve.inst {
+            Inst::Call(cn, cargs, _, _) => {
+                if (cn == "Vec_new_typed" && cargs.len() == 3) || (cn == "Vec_new" && cargs.len() == 1) {
+                    if ve.id >= 0 && ve.id < nv { created.set(ve.id, 1); }
+                }
+            }
+            Inst::Alloca(_, _) => { if ve.id >= 0 && ve.id < nv { ok_slot.set(ve.id, 1); } }
+            Inst::Load(lp, _) => { if ve.id >= 0 && ve.id < nv && lp >= 0 && lp < nv { loaded_from.set(ve.id, lp); } }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    // stores: which h goes into which slot
+    i = 0;
+    while i < f.insts.len() {
+        match f.insts.get(i).inst {
+            Inst::Store(sp, sv, _) => {
+                if sp >= 0 && sp < nv && sv >= 0 && sv < nv && created.get(sv) == 1 {
+                    if slot_of.get(sv) >= 0 && slot_of.get(sv) != sp { created.set(sv, 0); }
+                    slot_of.set(sv, sp);
+                    if h_of.get(sp) == -1 { h_of.set(sp, sv); } else if h_of.get(sp) != sv { h_of.set(sp, -2); }
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    // every use checked
+    i = 0;
+    while i < f.insts.len() {
+        var ue: ValueIdInst = f.insts.get(i);
+        var refs: Vec<i64> = inst_value_refs(&ue.inst);
+        var r: i64 = 0;
+        while r < refs.len() {
+            var u: i64 = refs.get(r);
+            if u >= 0 && u < nv {
+                // h: only its one store into a slot
+                if created.get(u) == 1 {
+                    var fine_h: bool = false;
+                    match ue.inst {
+                        Inst::Store(hsp, hsv, _) => { fine_h = hsv == u && hsp != u; }
+                        _ => {}
+                    }
+                    if !fine_h { created.set(u, 0); }
+                }
+                // S: loads, and stores of its h or of zero
+                if ok_slot.get(u) == 1 {
+                    var fine_s: bool = false;
+                    match ue.inst {
+                        Inst::Load(lsp, _) => { fine_s = lsp == u; }
+                        Inst::Store(ssp, ssv, _) => {
+                            fine_s = ssp == u && ssv != u && (ssv == h_of.get(u) || lw_rc_is_literal_value(f, ssv));
+                        }
+                        _ => {}
+                    }
+                    if !fine_s { ok_slot.set(u, 0); }
+                }
+                // a value loaded from S: argument 1 of core's Vec functions
+                var ls: i64 = loaded_from.get(u);
+                if ls >= 0 && ok_slot.get(ls) == 1 {
+                    var fine_l: bool = false;
+                    match ue.inst {
+                        Inst::Call(lcn, lcargs, _, _) => {
+                            // core's Vec_* take an env first; the p_vec_*
+                            // builtins take the Vec first
+                            var at: i64 = 1;
+                            if str_starts_with(lcn, "p_vec_") { at = 0; }
+                            if lw_rc_header_safe_call(lcn) && lcargs.len() > at && lcargs.get(at) == u {
+                                fine_l = true;
+                                var a: i64 = 0;
+                                while a < lcargs.len() {
+                                    if a != at && lcargs.get(a) == u { fine_l = false; }
+                                    a = a + 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    if !fine_l { ok_slot.set(ls, 0); }
+                }
+            }
+            r = r + 1;
+        }
+        i = i + 1;
+    }
+    // the creations that qualify
+    var changed: bool = false;
+    var pro: Vec<i64> = Vec::new();
+    var h: i64 = 0;
+    while h < nv {
+        if created.get(h) == 1 && slot_of.get(h) >= 0 {
+            var sl: i64 = slot_of.get(h);
+            if ok_slot.get(sl) == 1 && h_of.get(sl) == h {
+                lw_rc_stack_vec_rewrite(f, h, sl, &mut pro);
+                changed = true;
+            }
+        }
+        h = h + 1;
+    }
+    if !changed { return false; }
+    // the stack areas, at the start of the entry block
+    var blk: BasicBlock = f.blocks.get(0);
+    var fresh: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < pro.len() { fresh.push(pro.get(k)); k = k + 1; }
+    k = 0;
+    while k < blk.instructions.len() { fresh.push(blk.instructions.get(k)); k = k + 1; }
+    blk.instructions = fresh;
+    f.blocks.set(0, blk);
+    return true;
+}
+
+/// Turn creation `h` (stored in slot `sl`) into Vec_init_typed on a stack
+/// area made in `pro`, and every Vec_drop of a value loaded from `sl` into
+/// Vec_drop_inplace.
+fn lw_rc_stack_vec_rewrite(f: &mut IrFunction, h: i64, sl: i64, pro: &mut Vec<i64>) {
+    var area: i64 = lw_detached(f, Inst::Alloca(IrType::Array(Box::new(IrType::I64), 5), Region::Stack));
+    var ai: i64 = lw_detached(f, Inst::BitCast(area, IrType::Ptr(Box::new(IrType::Array(Box::new(IrType::I64), 5))), IrType::I64));
+    pro.push(area);
+    pro.push(ai);
+    if h < 0 || h >= f.inst_at.len() { return; }
+    var pos: i64 = f.inst_at.get(h) - 1;
+    if pos < 0 || pos >= f.insts.len() { return; }
+    var e: ValueIdInst = f.insts.get(pos);
+    match e.inst {
+        Inst::Call(cn, cargs, cty, ceff) => {
+            var na: Vec<i64> = Vec::new();
+            na.push(cargs.get(0));
+            na.push(ai);
+            if cn == "Vec_new_typed" {
+                na.push(cargs.get(1));
+                na.push(cargs.get(2));
+            } else {
+                var z1: i64 = lw_detached(f, Inst::ConstInt(0, IrType::I64));
+                var z2: i64 = lw_detached(f, Inst::ConstInt(0, IrType::I64));
+                pro.push(z1);
+                pro.push(z2);
+                na.push(z1);
+                na.push(z2);
+            }
+            e.inst = Inst::Call("Vec_init_typed", na, cty, ceff);
+            f.insts.set(pos, e);
+        }
+        _ => {}
+    }
+    // its drops
+    var q: i64 = 0;
+    while q < f.insts.len() {
+        var de: ValueIdInst = f.insts.get(q);
+        match de.inst {
+            Inst::Call(dn, dargs, dty, deff) => {
+                if dn == "Vec_drop" && dargs.len() == 2 {
+                    var dv: i64 = dargs.get(1);
+                    var from_sl: bool = false;
+                    match IrFunction_get_inst(f, dv) {
+                        OptInst::Some(dinst) => {
+                            match dinst {
+                                Inst::Load(dp, _) => { from_sl = dp == sl; }
+                                _ => {}
+                            }
+                        }
+                        OptInst::None => {}
+                    }
+                    if from_sl {
+                        de.inst = Inst::Call("Vec_drop_inplace", dargs, dty, deff);
+                        f.insts.set(q, de);
+                    }
+                }
+            }
+            _ => {}
+        }
+        q = q + 1;
+    }
+}
 
 // Share temporaries only read before their drop are not made (LF15).
 const LOWER_CANCEL_SHARES: bool = true;

@@ -1,119 +1,89 @@
-# comptime_eval.fd — comptime evaluator + substitution (1,632 LOC)
+# comptime_eval.fd
 
-> **Re-verified 2026-10-23:** all headline findings confirmed — env cloned per nested block (:1172), return-comptime never substituted, impl/trait methods skipped, errors dropped. Still accurate.
+> **Re-audited 2026-11-09** against the current source and the latest `fid` build (s18).
+> `return comptime` and loop accumulation are fixed; impl methods, `if` assignments inside
+> comptime functions, and dropped errors are still open.
 
-## Role
+- **Path:** `compiler/comptime_eval.fd`
+- **LOC:** 2,120 (was 1,632; Rust `src/comptime.rs`: 1,358)
+- **Role:** compile-time evaluation. `process_gen` runs `comptime gen { }` blocks, parses the
+  string they produce and appends its functions and structs. `substitute` replaces each
+  `comptime expr` / `comptime { }` / `comptime reflect(T)` with a literal, then evaluates calls to
+  `comptime fn` whose arguments are all literals (I-5A), unrolls small literal loops (I-5D) and
+  drops dead `if` branches.
 
-Two public entry points used by `compiler.fd`:
+## Callers
 
-| Export | Caller | Purpose |
-|--------|--------|---------|
-| `process_gen` | `compiler.fd:804,1266` | eval `comptime gen {…}` blocks → parse emitted source → append funcs/structs |
-| `substitute` | `compiler.fd:1358` | replace every `comptime expr` with its literal value, then aggressive lit-args eval (I-5A) + loop unroll (I-5D) + dead-if elimination |
+| Caller | Site | Use |
+|---|---|---|
+| `compiler/compiler.fd` | :831 | `process_gen` on imported modules |
+| `compiler/compiler.fd` | :1598 | `process_gen` in the main build (before type check) |
+| `compiler/compiler.fd` | :1776 | `substitute` (after type check and borrow check, before mono) |
 
-Internally: `evaluate`/`evaluate_with_env`/`evaluate_block_with_env`
-(tree-walk eval with `ComptimeEnv`), `eval_binop`/`eval_unaryop`,
-`evaluate_reflect` (all 7 ReflectOps implemented), `call_comptime_func`,
-`replace_ident_*`, `stmt_has_break_or_continue`. Port of `src/comptime.rs`
-(1,358 LOC).
+Reached from every command that builds a program (`run`, `ccompile`, `build`/`emit`, `check`,
+`lsp`, ...). Because `substitute` runs after the type checker, comptime calls are type-checked as
+ordinary calls (an unknown function in `comptime f()` is reported by the type checker).
 
-## Where it's called
+## What the module does now
 
-- `compiler/compiler.fd:36` import; only the two sites above. Leaf consumer
-  of lexer+parser for `parse_generated_code` (:239).
+- Evaluator `evaluate_block_rt` (:1142-1294) shares the caller's env Vecs, so assignments to
+  outer variables inside `if` / `for` bodies in a `comptime { }` block persist; names a block
+  declares are truncated at its end.
+- `call_comptime_func` (:1468-1660) is a separate, one-level evaluator for `comptime fn` bodies.
+- Reflection: all 12 `ReflectOp`s including struct layout (`ce_struct_layout`, :1859), field
+  offsets, enum discriminants, function effects and capabilities (:1917-1975).
+- `stmt_has_break_or_continue` is now recursive (:804-850).
 
 ## Findings
 
-### F1 — `return comptime expr` is never substituted — HIGH (port regression)
+### Verified live (probe file, `fid run` + `fid dump-ir`)
 
-`substitute_stmt` :332-340 — unboxes the return expr, substitutes into the
-copy, then *"Can't re-wrap into Box easily; skip for now"* — the substituted
-expr is **dropped**. Same drop in `aggressive_comptime_stmt` :568-576.
-`return comptime f()` — the most common comptime usage — reaches
-typecheck/mono unevaluated. Rust substitutes in place (`opt`'s `&mut`,
-src:505-508). Fix: `*opt = OptBoxExpr::Some(box_expr_new(inner))`.
+| Source | Result | Status |
+|---|---|---|
+| `var a = comptime sq(4)` | 16, a constant | ok |
+| `fn ret() { return comptime sq(5); }` | constant + return | **FIXED** (`substitute_stmt` rebuilds the return, :357-363) |
+| `comptime tri(5)` (for-loop sum) | 10, a constant | **FIXED** (loop body assigns into `env`) |
+| method `return comptime sq(6)` in `impl P` | `Call sq` at run time | **STILL TRUE** |
+| `comptime pick(true)` with `if b { r = 7; }` | **1** (should be 7) | **STILL TRUE**, wrong value |
+| `comptime (10 / 0)` | no diagnostic; panics at run time | **STILL TRUE** |
+| `(comptime sq(2), 1)` (tuple) | `Call sq` at run time | **STILL TRUE** |
 
-### F2 — Comptime in impl/trait methods never substituted — HIGH (port regression)
+- **HIGH — wrong value from `if` in a `comptime fn`.** In `call_comptime_func` the `if` arm runs
+  its body in a clone (`sub_env`, :1539) and handles only `Let`, `Return`, `Expr` (:1543-1565).
+  An `Assign` there is skipped, so the value is silently the old one. The for-loop body (:1610-1650)
+  handles `Assign` but not nested `if`/`for`.
+- **HIGH — comptime in impl / trait methods is not substituted.** All phases loop over
+  `prog.funcs` only (:136-140, :146-150, :262-293). The value is computed at run time
+  instead (correct result, not compile time; `@comptime`-only code would not work).
+- **HIGH — errors are dropped.** `substitute` and `process_gen` collect `errs` and never return
+  them (:131-166, :255-297). A failed evaluation leaves the expression in place; `10 / 0` becomes
+  a run-time panic. A `comptime gen` block that fails is removed with no message (:212-222).
 
-All three phases iterate `prog.funcs` only (:138, :263, :272, :281).
-Rust also iterates `program.impls[].funcs` and `trait_impls[].methods`
-(src:80-106 `for method in …`). Any `comptime` inside a method body or a
-`comptime gen` block inside a method is invisible to every pass.
+### From code inspection
 
-### F3 — `substitute` drops all errors (Rust returns `Result`) — HIGH (port regression)
+- **MEDIUM — STILL TRUE — `evaluate` returns non-evaluable expressions as they are** (:1124),
+  indistinguishable from success.
+- **MEDIUM — walker coverage.** `substitute_expr` (:434-552) handles 20 `Expr` kinds; `TupleLit`,
+  `Await`, `Try`, `PipeForward`, `Closure`, `IsCheck`, `QuantCast`, `Spawn`, `Yield` fall to
+  `_ => {}`. `aggressive_comptime_expr` (:730-791) only walks `Binary`, `Unary`, `Call`,
+  `MethodCall`. `aggressive_comptime_stmt` (:601-728) covers 7 statement kinds and drops its
+  rewritten `Return` value (:606-612, the copy is never written back).
+- **MEDIUM — STILL TRUE — no recursion cap** in `call_comptime_func`; fixed 8 + 1 + 4 passes
+  (:262-293) with no fixpoint check.
+- **LOW — `!` on an integer gives `IntLit(0/1)`** (:1773-1777), not a bool.
+- **INFO — `ct_comptime_fns` is a module global hash map** (:587), rebuilt per `substitute`.
 
-Rust: `fn substitute(&Program) -> Result<Program, Vec<String>>` — eval
-failures propagate to the caller as diagnostics. Fides: `-> Program`,
-`errs` accumulated then **discarded** (:257). Every comptime failure —
-missing comptime fn, non-bool if, div-by-zero, bad gen parse — produces a
-raw `Expr::Comptime` that sails into typecheck/mono with zero diagnostic.
-`process_gen` also drops errs (gen block is removed regardless — on failure
-the `ComptimeGen` stmt silently vanishes :230).
+## Fix order
 
-### F4 — Loop/if-body assignments die with the env clone — HIGH (port regression)
-
-`evaluate_block_with_env` clones its input env (:1103); for-loop bodies
-and if-arms call it again → `Stmt::Assign`/`Let` inside a `for` or `if`
-body writes to a **private clone** → `comptime { s=0; for i in 0..5 { s+=i } s }`
-evaluates `s` → **0**. Rust's for-body writes to the *same* `env`
-(src:855-870 `env.insert(target,…)`). String accumulation in `comptime gen`
-loops — the feature's main use case — is broken.
-(Rust also loses `Assign` inside `if` bodies via `_ => {}` — the Fides
-version *executes* them then discards the clone — same net result, more
-confusing mechanism.)
-
-### F5 — `evaluate`'s env-less fallthrough returns the input — MEDIUM
-
-`evaluate` (:1092) `_ => { return ResultExpr::Ok(*expr); }` — any
-non-evaluable variant (Ident, StructLit, closures, MethodCall…) is
-returned **as-is**. `substitute_expr_comptime` then writes it back —
-silent non-substitution, indistinguishable from success.
-
-### F6 — Thin walker coverage — MEDIUM
-
-- `substitute_expr` handles ~18 Expr variants; `Await`/`Try`/`Yield`/
-  `PipeForward`/`TupleLit`/`Asm`/`IsCheck`/`QuantCast`/`Closure`/
-  `ComptimeAssign`-adjacent cases hit `_ => {}` → nested `comptime` in
-  those positions unsubstituted.
-- `aggressive_comptime_expr` recurses into only 4 shapes
-  (Binary/Unary/Call/MethodCall) — lit-arg calls inside `If`, `Match`,
-  `Index`, `ArrayLit`, `Block`, casts… never aggressively evaluated.
-- `aggressive_comptime_stmt` misses `Match`/`Defer`/`Txn`/`Sandbox`/
-  `Unsafe`/`Handle`/`Query`/`Parallel`/`Backward` that `substitute_stmt`
-  does handle — inconsistent pass coverage.
-- `Stmt::While` inside comptime eval → `_ => {}` skipped (inherited —
-  Rust omits it too).
-
-### F7 — Recursion/iteration hazards — MEDIUM (inherited)
-
-- `call_comptime_func` has no depth cap — recursive `comptime fn`
-  → unbounded recursion → compiler stack overflow (same in Rust).
-- Phase-1 runs 8 iterations, Phase-3 4 iterations — fixed caps, no
-  fixpoint check; deeply nested comptime can remain partially substituted
-  silently.
-- Fides Phase-1 substitutes **all** functions; Rust restricts it to
-  `is_comptime` fns — extra work + mild drift.
-
-### F8 — Smaller notes — LOW
-
-- `eval_unaryop` `!` on IntLit → `IntLit(0/1)` — type-inconsistent vs
-  BoolLit the rest of the pipeline expects.
-- `BitNot` → `-1 ^ n` — correct two's-complement trick ✓.
-- `FloatLit` lacks `Mod`/bit ops — errors, fine.
-- Loop unroll (I-5D) caps `trip ≤ 16 && body ≤ 16` + break/continue scan —
-  `stmt_has_break_or_continue` only checks top-level stmts, so a break
-  nested in an inner `if` inside the loop body won't block unrolling →
-  `break` semantics silently change (check nesting — likely inherited).
-- No `Stmt::While`/`Match` in the *evaluator* (`_ => {}` skip).
+1. Replace `call_comptime_func`'s own statement loop with `evaluate_block_rt` (one evaluator;
+   fixes `if` assignments and nesting).
+2. Return `errs` from `substitute` / `process_gen` and report them as build errors.
+3. Walk `impls[].methods` and `trait_impls[].methods` in every phase.
+4. Extend `substitute_expr` to the missing `Expr` kinds; write back the `Return` in the
+   aggressive pass.
 
 ## Verification state
 
-- Every public fn traced; the four HIGHs confirmed by direct Rust-vs-Fides
-  line comparison (Return arm, impl iteration, Result signature,
-  env-sharing).
-- `>>` parse blocker still blocks E2E; findings from inspection + Rust
-  oracle.
-
-## Next
-
-`cparser.fd`.
+- `fid check compiler/comptime_eval.fd`: no errors (16 s).
+- Live probes as in the table (scratch files `ct.fd`, `ct2.fd`). IR read with `fid dump-ir`
+  (which prints instruction kinds, not constant values).

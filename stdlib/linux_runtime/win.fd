@@ -775,6 +775,17 @@ fn pe_win_sysinfo(si: i64) -> i64 {
 }
 
 fn pe_win_mprotect(addr: i64, len: i64, prot: i64) -> i64 {
+    // The runtime's guard regions (PROT_NONE under a stack): read/write with
+    // a PAGE_GUARD page on top, as a Windows thread stack has, so touching
+    // it is STATUS_STACK_OVERFLOW with the region left for the handler (the
+    // task's TEB fields come with nat_ctx_swap)
+    if prot == 0 && len >= 8192 {
+        var old0: i64 = pert_malloc(8);
+        var ok0: i64 = pe_w32(pe_w(PE_W_VIRTUAL_PROTECT, addr + len - 4096, 4096, 260, old0));
+        pert_free(old0);
+        if ok0 == 0 { return 0 - 22; }
+        return 0;
+    }
     var p: i64 = 1;                                          // PAGE_NOACCESS
     if (prot & 2) != 0 { p = 4; } else if (prot & 1) != 0 { p = 2; }
     if (prot & 4) != 0 { p = 64; }                           // PAGE_EXECUTE_READWRITE

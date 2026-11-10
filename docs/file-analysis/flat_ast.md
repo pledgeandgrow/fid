@@ -1,71 +1,55 @@
-# flat_ast.fd — flat/tree AST printer (1,287 LOC)
+# flat_ast.fd
 
-> **Re-verified 2026-10-23:** still dead — `dump-ast-flat` still aliases to `cmd_ast` (main.fd:146). The one-line wiring gap stands.
+> **Re-audited 2026-11-09** against the current source and the latest `fid` build (s18).
+> Still dead, and now it no longer type-checks.
 
-## Role
+- **Path:** `compiler/flat_ast.fd`
+- **LOC:** 1,316 (was 1,287; Rust `src/flat_ast.rs`: 780)
+- **Role:** `Program` to an indented line-per-node text (`type_flat`, `expr_flat`, `stmt_flat`,
+  `func_flat`, `program_flat`). Meant for `dump-ast-flat` and parser differential tests.
 
-Complete `Program` → indented-tree formatter: `type_flat`, `expr_flat`,
-`stmt_flat`, `func_flat`, `program_flat`, plus per-node helpers. Port of
-`src/flat_ast.rs` (780 LOC; Fides grew due to variant-count and the
-`*_flat` decomposition needed for the self-hosted type system).
-
-## Where it's called
+## Callers
 
 | Caller | Site | What |
-|--------|------|------|
-| — | — | **Nothing.** No importer; `program_flat`/`expr_flat`/`stmt_flat` referenced nowhere outside the file. |
+|---|---|---|
+| — | — | Nothing. No `use compiler::flat_ast` anywhere in `compiler/`, `stdlib/` or `tests/`. |
 
-Rust wires it: `compiler.rs:1273` `parse_to_ast_flat_raw` →
-`program_flat`, and `main.rs:718` maps `fidesc dump-ast-flat` to it —
-`main.rs:833` notes the format is consumed by
-`tests/selfhost/test_parser_harness.fd`. **The port dropped the call
-site**: `main.fd` aliases `dump-ast-flat` to `cmd_ast` (:137), which
-prints only a decl-count summary with the telling comment *"no full AST
-formatter yet"* — the formatter exists, unwired, in this file.
-Eighth dead module.
+`fid dump-ast-flat` is an alias of `cmd_ast` (`main.fd:157`), which prints a short summary
+(`main.fd:402-446`, comment "no full AST formatter yet"). The Rust side wires it
+(`src/compiler.rs:1676` → `flat_ast::program_flat`). AGENTS.md lists the module among the 8
+that nothing reachable from `main.fd` imports.
+
+## What the module does now
+
+- Covers all 41 `Expr` and all 33 `Stmt` variants, including `Resume`, `SpawnScope`,
+  `CancelScope` (:1067-1090, added Oct 24-25). Every `Type` variant is handled.
+- No `_ =>` fallthroughs.
 
 ## Findings
 
-### F1 — `dump-ast-flat` silently degraded — HIGH (wiring gap)
+### Verified live
 
-`fidesc dump-ast-flat file.fd` (Rust) → full tree. `fides-c3
-dump-ast-flat` → 5-line decl summary. Any golden test or harness
-comparing flat-AST output against the self-hosted CLI gets a
-summary instead of the tree — `test_parser_harness.fd`-style
-verification is unportable until `cmd_ast` calls `program_flat`
-(it's a one-line fix: the build path already returns `Program`).
+- **HIGH — NEW — the module does not compile.** `fid check compiler/flat_ast.fd`:
+  `non-exhaustive match at line 580 in compiler::flat_ast — missing variant(s): AsmDir::Clobber`.
+  The `Expr::Asm` arm matches only `In` and `Out` (:580-583). `AsmDir::Clobber` was added to
+  ast.fd after this file was last touched. Nothing notices because nothing imports it.
+- **HIGH — STILL TRUE — `dump-ast-flat` is not wired.** It prints the summary, not the tree.
 
-### F2 — Coverage is complete — INFO (positive)
+### From code inspection
 
-Verified: all **40 `Expr` variants** and all **29 `Stmt` variants**
-have explicit arms in `expr_flat`/`stmt_flat` — including the
-Fides-only additions (`Yield`, `NamedArg`, `Parallel`) and the
-full comptime/region/sandbox/select/txn vocabulary. **Zero `_ =>`
-fallthroughs** in the file — the same coverage audit that found
-missing-arms bugs in borrowck/comptime_eval comes back clean here.
-`program_flat` covers impls, traits, trait_impls, externs, imports,
-attributes; ML/game decls degrade to counts (Layers/Models/… — fine).
+- **LOW — STILL TRUE — repeated trailing-newline trim** (`str_ends_with(s, "\n")` then slice)
+  about 15 times; a helper would do.
+- **LOW — quadratic `esc`.** `esc` appends one character at a time with `str_concat` (:21-49).
 
-### F3 — Structural notes — LOW
+## Fix order
 
-- Trailing-newline trimming repeats `str_ends_with(s,"\n") → slice`
-  ~15 times — a `rstrip_nl(s)` helper would collapse it.
-- `esc(s)` escapes string literals; check whether `\n` inside a
-  source string could still break single-line golden compares
-  (it escapes to `\\n` — verified by reading `esc`, correct).
-- `param_flat`/`annotation_flat`/`binop_flat`/`type_flat` mirrors
-  Rust's label choices — output is byte-compatible with the Rust
-  printer for the common constructs (the point of the format).
+1. Add `AsmDir::Clobber => { dir = "Clobber"; }` at :582.
+2. Either wire it (`use compiler::flat_ast` in main.fd, `dump-ast-flat` → `program_flat` on the
+   parsed user program) or delete the module.
 
 ## Verification state
 
-- Dead status verified: zero importers; `cmd_ast` confirmed to print
-  the summary instead.
-- Coverage verified mechanically: per-variant presence checked for
-  Expr (40/40) and Stmt (29/29), no fallthroughs.
-- No port regressions inside the file — the only regression is the
-  dropped wiring (`compiler.rs:1273` equivalent missing).
-
-## Next
-
-`fmt.fd`.
+- `fid check compiler/flat_ast.fd`: 1 error (above).
+- Importers: grep over `compiler/`, `stdlib/`, `tests/` found none.
+- `fid lint` cannot check it (lint does not resolve `compiler::` imports: it reports
+  `undefined function 'box_type_unbox'`).

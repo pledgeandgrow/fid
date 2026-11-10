@@ -5,7 +5,7 @@
 
 > **Implementation Status:** This document describes the language design, with implementation status marked in places (✅ working / ⚠️ partial / ❌ parsed-only or planned). The language is what the self-hosted compiler `fid` accepts; [reference.md](reference.md) describes it rule by rule from the compiler source and is right where this document disagrees. See `features.md` for the feature matrix and `architecture.md` for the compiler pipeline.
 >
-> **Self-hosting status (Nov 6, 2026):** The Fides compiler is self-hosted: 61 modules (133,688 lines), bootstrap fixpoint (stage 2 C == stage 3 C, 49 MB) checked on every release build. (First reached in session 15 with 25 modules.) Counts: [CURRENT.md → Numbers](../../CURRENT.md#numbers).
+> **Self-hosting status (Nov 9, 2026):** The Fides compiler is self-hosted: 68 modules (158,516 lines, Nov 9), bootstrap fixpoint (stage 2 C == stage 3 C, 49 MB) checked on every release build. (First reached in session 15 with 25 modules.) Counts: [selfhost.md → Numbers](selfhost.md#numbers).
 >
 > **Tier 3 OS features (session 16):** inline asm clobber lists, `--no-std` bare-metal mode, cross-compilation target dispatch. `stdlib/uefi.fd` and `stdlib/kernel.fd` moved to the fides-os project; bare metal is incomplete (`emit --bare` panics).
 
@@ -537,9 +537,10 @@ w.push(1);      // v.len() is now 1 as well
 ```
 
 There is no move check for `str` or `Vec`: only `@linear` struct types move
-(used exactly once; reference.md §8.7). Copy-on-write for `Vec`, `str` and
-`HashMap` is decided (proposal 0001) and written behind a switch that is off,
-so today `var b = a` on a `Vec` aliases.
+(used exactly once; reference.md §8.7). `var b = a` on a `Vec`, `str` or
+`HashMap` gives an independent value: the data is shared until the first
+write copies it (proposal 0004; reference.md §8.1). A copied struct still
+shares its `Vec` fields.
 
 ---
 

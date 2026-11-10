@@ -4,17 +4,18 @@
 compiler `fidesc` (`src/*.rs`), which is now frozen; the language is what the
 self-hosted `fid` (`compiler/*.fd`) accepts. Where a row disagrees with
 [reference.md](reference.md) (written Nov 4 from the compiler source),
-reference.md is right. Counts: [CURRENT.md → Numbers](../../CURRENT.md#numbers).*
+reference.md is right. Counts: [selfhost.md → Numbers](selfhost.md#numbers).*
 *See `docs/reference/syntax.md` for the language syntax and
 [safety-rules.md](safety-rules.md) for the safety annotations.*
 
 ## Current State (Nov 6, 2026)
 
-- Compiler: `compiler/*.fd`, 61 modules, 133,688 lines; `src/*.rs` (frozen
+- Compiler: `compiler/*.fd`, 68 modules, 158,516 lines; `src/*.rs` (frozen
   bootstrap reference and test harness), 57 files, 112,511 lines; stdlib 137
-  modules, 43,576 lines (+ 4 in `stdlib/pe_runtime/`).
-- Tests: 493 `.fd` under `tests/bootstrap/` (452 top level, 91 of them
-  expected-fail `*_fail.fd`), 51 in `tests/selfhost/`, 10 examples.
+  modules, 51,496 lines (+ 4 in `stdlib/pe_runtime/`, 5 in `stdlib/linux_runtime/`).
+- Tests: 543 `.fd` under `tests/bootstrap/` (502 top level, 105 of them
+  expected-fail `*_fail.fd`), 51 in `tests/selfhost/`, 104 in
+  `tests/conformance/`, 3 in `tests/leaks/`, 11 examples.
 - Fixpoint: stage 2 C == stage 3 C, 49 MB (Nov 6). Self-compile ~133 s.
 - Last full suite run: Nov 2 (Rust harness, `fidesc` as compiler): interp
   339/339, C 343/343, PE 345/345, expected-fail 89/89. Not rerun with the
@@ -48,7 +49,7 @@ reference.md is right. Counts: [CURRENT.md → Numbers](../../CURRENT.md#numbers
 | core.fd check stamp | ✅ | core.fd is type-checked once per (compiler, core.fd) pair; `FIDES_CHECK_CORE=1` forces it. `.fidcache/` evicts least recently used artifacts past 64 files or 1 GB |
 | `fid emit --checked-alloc` | written, not run | Every block on pages of its own, ending at a guard page; freed pages inaccessible, never reused |
 | `scripts/sanitize.sh`, `scripts/fuzz/nightly.sh` | written, not run | ASan/UBSan through C (needs clang with ASan); fuzzing with a `checked` backend; no CI workflow schedules it |
-| Value semantics (proposal 0001) | ❌ | Copy-on-write written behind `LOWER_COW` (off), lazy and counted; with it on, value semantics hold on the tests and the compiler reaches its fixpoint (4.7 GB peak vs 1.8 GB); not on until the full suite runs with it. `var b = a` on a Vec still aliases |
+| Value semantics (proposals 0001, 0004) | ⚠️ | Since the ownership rule of 0004 (`LOWER_RC` on, Nov 7–8): `var b = a` on a `Vec`, `str` or `HashMap` gives an independent value, shared until the first write copies it (checked Nov 9, interpreter and C). A copied struct still shares its `Vec` fields (`var t = s; t.v.push(2)` changes `s.v`). `LOWER_COW`, 0001's lowering, is off |
 
 ## Legend
 
@@ -67,7 +68,7 @@ reference.md is right. Counts: [CURRENT.md → Numbers](../../CURRENT.md#numbers
 | Type Checker (typechecker.rs) | ✅ | Validates types, capabilities, effects, regions, traits |
 | IR Lowering (lower.rs) | ✅ | AST → typed SSA IR with effects/regions |
 | IR Interpreter (interp.rs) | ✅ | Runs IR directly via `fidesc run` |
-| PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables. In `fid`, `fid emit` (`compiler/pe_ir*.fd`) is the native path; bare metal (`emit --bare`) panics |
+| PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables. In `fid`, `fid emit` (`compiler/pe_ir*.fd`) is the native Windows path; bare metal (`emit --bare`, pe_ir_stubs) builds since Nov 6, not yet run under QEMU |
 | ELF64 Emitter (elf64.rs) | ⚠️ | Experimental / incomplete; Linux x64 goes through C |
 | C Codegen (codegen_c.rs) | ✅ | Generates C code, 198/211 tests match interpreter output. Phase 10B: Print calls Fides Vec_to_str/HashMap_to_str for formatting. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic via p_call_stack. Rc/Arc runtime via p_rc_incr/p_rc_decr. Drop trait: compiler-inserted drop calls. Negative size checks on p_malloc/p_shared_alloc/p_allocator_alloc. ftell failure check on p_file_read/p_file_size. |
 | PIR (pir.rs) | ✅ | PIR L1/L2/L3, `fidesc pir` command |
@@ -115,7 +116,7 @@ reference.md is right. Counts: [CURRENT.md → Numbers](../../CURRENT.md#numbers
 | `fidesc pir <file> [1\|2\|3\|all] [--opt]` | ✅ | PIR output (L1/L2/L3) with optional optimization |
 | `fidesc opt <file> [passes]` | ✅ | Run PIR optimizer, print statistics |
 | `fidesc codegen <file> --target <arch>` | ✅ | x86-64, ARM64, or RISC-V assembly output |
-| `fidesc codegen <file> --elf\|--macho\|--coff <o>` | ✅ | Emit ELF64, Mach-O, or COFF object files |
+| `fidesc codegen <file> --elf\|--macho\|--coff <o>` | ⚠️ | Emit ELF64, Mach-O, or COFF object files. In `fid` (Nov 9): COFF is valid; Mach-O has a correct header but was never linked; the x86-64 ELF `.o` has malformed section headers (56 bytes, `sh_addr` never written) and arm64/riscv `--elf` write an empty object |
 | `fidesc wasm <file> -o <out.wasm>` | ✅ | WebAssembly backend |
 | `fidesc gpu <file>` | ✅ | SPIR-V GPU backend |
 | `fidesc parse-header <file.h>` | ✅ | Parse C header → generate Fides FFI bindings |
@@ -176,7 +177,7 @@ reference.md is right. Counts: [CURRENT.md → Numbers](../../CURRENT.md#numbers
 | `struct` | ✅ | Struct definitions and instances |
 | `enum` (algebraic) | ✅ | Sum types with data |
 | Generic enums `enum Foo<T>` | ✅ | Type parameters on enum declarations |
-| Generic structs `struct Foo<T>` | ✅ | Type parameters on struct declarations |
+| Generic structs `struct Foo<T>` | ⚠️ | Parsed, but `fid` rejects using one ("field 'v' expected T", Nov 9); generic enums, functions and `impl<T>` work |
 | Generics `<T>` | ✅ | Generic functions and types; bounds checked, inference, turbofish (`fid`) |
 | Type aliases `type` | ✅ | Type alias declarations |
 
@@ -260,7 +261,7 @@ reference.md is right. Counts: [CURRENT.md → Numbers](../../CURRENT.md#numbers
 | `use ... *` glob imports | ⚠️ | Parsed; same as a plain `use` |
 | Re-exports | ✅ | |
 | Multi-file modules | ✅ | |
-| Standard library (stdlib/core.fd) | ✅ | core is auto-imported. 137 modules, 43,576 lines (Nov 6), among them: core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can, task. (uefi and kernel moved to fides-os.) |
+| Standard library (stdlib/core.fd) | ✅ | core is auto-imported. 146 modules, 51,496 lines (Nov 9), among them: core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can, task. (uefi and kernel moved to fides-os.) |
 
 ### Capabilities (Security)
 
@@ -743,7 +744,7 @@ val out = quant::dequantize_q8(q_out); // dequantize result
 | `async`/`await`/`spawn` (Phase 7.6) | Cooperative concurrency | ⚠️ (green tasks on their own stacks; interpreter and C work; native async crashes) |
 | Borrow checker (`--borrowck`) | Compile-time aliasing analysis | ✅ Phases 1-6 (Rules 1-3, field-wise, two-phase, NLL; `on` by default; tested) |
 | Generic enums (`enum Option<T>`) | Type-parameterized enums | ✅ DONE (methods instantiated per `T` in `fid`; a bare `Option` has `T = i64`) |
-| Generic structs (`struct Foo<T>`) | Type-parameterized structs | ✅ DONE (AST, parser; type_params field) |
+| Generic structs (`struct Foo<T>`) | Type-parameterized structs | ⚠️ PARSED (AST, parser; type_params field); a literal or field use is rejected by `fid` (Nov 9) |
 | LSP server (`fidesc lsp`) | Language Server Protocol | ✅ DONE (JSON-RPC over stdio, initialize/didOpen/didChange/diagnostics) |
 | Iterators (Phase 7.7) | `for x in vec/map/range` | ✅ DONE (Vec, HashMap, Range iteration; nested Vec support) |
 | Error chaining (Phase 7.7) | `?` on Option/Result | ✅ DONE (propagates errors, try blocks, Option/Result methods) |
@@ -756,7 +757,7 @@ val out = quant::dequantize_q8(q_out); // dequantize result
 | Auto-vectorization (Phase 3.4) | Loop-vec + SLP | ✅ DONE (loop-vec for constant trips, SLP vectorizer with p_simd_load/store/add/sub/mul/div → SSE2) |
 | Binary hardening (Phase 12) | Stack canaries, PIE, RELRO, NX stack | ✅ DONE (all C codegen output hardened by default, no opt-in) |
 | @constant_time (Phase 12) | Side-channel defense | ✅ DONE (no early returns, no data-dependent branches, no IO/Net/Spawn) |
-| @tainted (Phase 12) | Injection defense | ✅ DONE (prevents tainted values in SQL/shell/HTML/path sinks) |
+| @tainted (Phase 12) | Injection defense | ⚠️ PARTIAL (on parameters only: a function that receives a tainted parameter may not do IO/Net; no sink tracking for SQL/shell/HTML/path; function-level @tainted is rejected as misplaced) |
 | Stack traces (Phase 12) | Panic call stack | ✅ DONE (interpreter; C codegen from the machine stack since Nov 2, 2026, replacing per-call p_call_stack_push/pop) |
 
 ---
@@ -826,7 +827,7 @@ enabling editor integration (VS Code, Neovim, Emacs, etc.) with live diagnostics
 
 ### Test Coverage
 
-Counts are in [CURRENT.md → Numbers](../../CURRENT.md#numbers). The last full
+Counts are in [selfhost.md → Numbers](selfhost.md#numbers). The last full
 suite run is Nov 2 (interp 339/339, C 343/343, PE 345/345, expected-fail
 89/89); it was not rerun with the Nov 4–6 compiler. The saved baselines are
 `tests/bootstrap/baseline/test_results.txt` and
@@ -838,10 +839,10 @@ suite run is Nov 2 (interp 339/339, C 343/343, PE 345/345, expected-fail
 |---------|--------|-------|
 | Self-compilation | ✅ | `fides-c.exe` compiles `compiler/main.fd` → up to `fides-c5.exe` (5 generations; session-24 regression fixed in session 26) |
 | Bootstrap fixpoint | ✅ | stage 2 == stage 3 byte-identical (49 MB of C, Nov 6), checked by `RELEASE=1 scripts/bootstrap.sh` on every release build; stage 1 comes from a pinned stage 0 when one exists (`PIN=1` pins one; none yet), otherwise from `fidesc` |
-| Self-host modules | ✅ | 61 `.fd` modules, 133,688 lines (Nov 6; was 25/61K in session 15) |
+| Self-host modules | ✅ | 68 `.fd` modules, 158,516 lines (Nov 9; was 25/61K in session 15) |
 | Self-host tests | ✅ | 51 programs in `tests/selfhost/` (`verify-selfhost.sh`; saved baseline 36/47×3) |
 | Self-compile time | ✅ | ~133 s (type check 59 s, borrow check 16 s, lowering 20 s, C generation 12 s; Nov 6); `fidesc` ~21 s |
-| PE emitter (self-hosted) | ✅ | `fid emit` (`compiler/pe_ir*.fd`) makes native Windows executables with no C compiler and reaches a byte-identical fixpoint. The older `build --native` pipeline (`compiler/pe.fd`: PIR → x86-64 → PE) still crashes in the optimizer and register allocator |
+| PE emitter (self-hosted) | ✅ | `fid emit` (`compiler/pe_ir*.fd`) makes native Windows executables with no C compiler and reaches a byte-identical fixpoint. The older `build --native` pipeline (default target: compiler.fd `build_executable`, PIR → opt → codegen_x64 → elf64 → linker) crashes in opt.fd `pass_jump_thread`; compiler/pe.fd is reached only by `emit --boot`, which panics |
 | LSP server (self-hosted) | ✅ | `compiler/lsp.fd` (1,082 lines) — JSON-RPC over stdio |
 | Linux native codegen (self-hosted) | ⚠️ | `peephole.fd` + `regalloc.fd` + `codegen_x64.fd` — wired into the L3 → x86-64 → asm pipeline (session 28-29); experimental, Linux x64 goes through C |
 | Module-level `var` in self-hosted | ✅ | Supported on all backends since session 11 |

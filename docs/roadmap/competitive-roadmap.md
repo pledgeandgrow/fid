@@ -51,9 +51,9 @@ inlines to a store); natively, from 1.63 s to 1.34 s on fib and 1.47 s to 1.04 s
 on the map. The remaining fib gap is the overflow check: Rust's release mode
 drops it, which lets LLVM turn one of the two recursive calls into a loop.
 
-Compile speed: `fid` compiles itself (133,688 lines of Fides, 49 MB of C out) in
-about 133 s on Nov 6, about 1,000 lines a second; `fidesc` (Rust) does it in about
-21 s. Go and Zig
+Compile speed: `fid` compiles itself (158,516 lines of Fides, 67 MB of C out) in
+74 s on Nov 9 when built at -O2 (229 s at -O0), about 2,100 lines a second;
+about 133 s on Nov 6; `fidesc` (Rust) does it in about 21 s. Go and Zig
 compile on the order of 100,000 lines a second or more, so this is the widest gap
 on the board: CS1–CS7.
 
@@ -334,8 +334,12 @@ one machine; 100,000 requests/s on one core.
 This is the race we can win outright, since no rival's speed comes for free.
 
 - [~] CS1. `emit` of hello world under 0.5 s (release D9), then under 0.1 s (L).
-      Done: ~360 ms (Nov 2, fidesc). Left: the 0.1 s stretch — needs CS2's full
-      cache (comptime alone is ~90 ms) plus backend work.
+      Done: ~360 ms (Nov 2, fidesc); ~370 ms internal build time today
+      (`fid emit hello.fd --target x86_64-linux`, ~780 ms wall incl. process
+      start; type check ~85, borrow ~170, mid-end ~170). Left: the 0.1 s
+      stretch — needs CS2's full cache (comptime alone is ~90 ms) plus
+      backend work; even with all bodies skipped the merged stdlib is
+      iterated per decl.
       Nov 8-9 (`fid`): native code only for what main reaches (and what it
       names), iropt on those only: hello's executable 127 KB -> 33 KB. With
       the compiler itself built at -O2 (split into 8 units, `split-c`) hello
@@ -358,17 +362,26 @@ This is the race we can win outright, since no rival's speed comes for free.
       Nov 8: the reference-escape check iterates its fixpoint only over the
       functions whose result can hold a reference (scalars, strings and
       declared types cannot), not every function. With the -O2 compiler the
-      borrow check of the compiler is 5.4 s. Left: the check's own
-      per-statement work.
+      borrow check of the compiler is 5.4 s.
+      Nov (later): `release_dead_borrows` no longer scans every live borrow
+      per statement — borrows are bucketed by the statement after their
+      last_use (`dead_at`), released in one batched pass with per-call
+      key->index maps. Left: keyed per-op lookups and the field-prefix
+      "inclusive" scans still walk the borrow vecs (a per-vec HashMap index
+      was tried and measured slower under interleaved push/remove — index
+      thrash; and NLL release bookkeeping still costs per-release scans).
 - [~] CS4. Self-compile under 60 s (release), then under 10 s (L). Nov 9: 74 s
       with the compiler built at -O2 (8 split units), against 229 s at -O0;
       the -O2 compiler emits the same C (fixpoint). Of the 74 s: type check
-      18 s, borrow check 5, mono 5, lowering 24, C generation 20. Next:
-      bootstrap.sh's split build is the release build. About 133 s on
-      Nov 6 (type check 59 s, borrow check 16 s, lowering 20 s, C generation
-      12 s), from 601 s (release D10, D11); `fidesc` takes about 21 s. Next:
-      string compares in method lookup and the parser, then building the
-      compiler with optimization.
+      18 s, borrow check 5, mono 5, lowering 24, C generation 20.
+      Later (this machine): `dump-c compiler/main.fd` on the -O2 release
+      compiler ~25 s wall (71.9 MB C) — the 60 s target is met; <10 s
+      remains. With the same release binary, `check compiler/main.fd
+      --time` reports type check ~23-30 s on a loaded machine (was ~29 s
+      before the CS8 tables on a comparable run — noisy machine, treat
+      ±20%). `fid-dev.exe` is -O0: expect ~11x inflation there.
+      Next: the <10 s stretch needs CS2's binary stdlib artifact and
+      cheaper merge+desugar/import work (together ~30 s of check).
 - [ ] CS5. Parallel front end and code generation on all cores (L).
 - [~] CS6. Incremental native builds per function, under 100 ms for a one-line
       change (L).
@@ -381,9 +394,21 @@ This is the race we can win outright, since no rival's speed comes for free.
       the 100 ms target).
 - [x] CS7. A fast debug mode with no optimizer, and a release mode (S).
       Done: `--debug` (C at -O0) and `--release` (-O2) on `ccompile` in both compilers.
-- [~] CS8. No linear scans in the self-hosted compiler: tables, not `Vec` searches
+- [x] CS8. No linear scans in the self-hosted compiler: tables, not `Vec` searches
       (M). Done: instructions, functions, strings, defaults and comptime functions
-      by table. Left: method lookup in the type checker, the parser's token checks.
+      by table. Method lookup in the type checker is now
+      `methods_index` (type -> method Vec) plus `methods_hm` (per-type
+      method-name -> entry, lazy, dropped on Vec rewrite) — call sites
+      `x.m()`, `T::f()` and the `&mut self` probe all O(1). Parser:
+      `alias_set`/`g_import_set`/`struct_name_set`/`enum_name_set` HashMaps
+      replace the alias, import and struct-name Vec scans; lexer keywords
+      already dispatch by first char. Typecheck of the compiler measured
+      ~23 s vs ~29 s before on a loaded machine.
+      Remaining by nature, not oversight: `shared_borrows`/`mut_borrow`/
+      `borrow_of` field-prefix "inclusive" queries (a prefix is a range,
+      not a hash key), tiny cold lists (reserved borrows, scope stacks),
+      and the parser's sequential `token_kind_eq` chains (O(1)
+      discriminant reads, not Vec scans).
 - [x] CS9. `fid check`: type errors with no code generation, under 50 ms on an edit
       Done: `fidesc check <file.fd>` runs parse + register + type/borrow/effect
       checks only and exits — hello world reports in 43 ms.
@@ -628,7 +653,12 @@ Go's lesson: a deep stdlib replaces a thousand packages. It suits our rule of
 owning what we ship.
 
 - [ ] SL1. HTTP/2 client and server (L).
+      `stdlib/http.fd` + `stdlib/http_client.fd` are HTTP/1.1 only
+      (Content-Length + chunked, keep-alive, task-per-connection); no
+      HPACK, frames, or streams exist.
 - [ ] SL2. HTTP/3 and QUIC (XL).
+      Unstarted — also gated on real TLS 1.3 (SL4) since QUIC carries
+      its own handshake.
 - [x] SL3. WebSockets, committed and tested (M).
       Done: `stdlib/ws.fd` (RFC 6455: the Upgrade handshake with its SHA-1
       and base64 key, frames with masking, ping/pong, close), `test_ws.fd`
@@ -639,7 +669,15 @@ owning what we ship.
       binary frames sent byte-exact; `test_ws_local.fd` (a server and a
       client over IPv6 and IPv4) and a TLS round trip with a self-signed
       certificate on C and native. Left: permessage-deflate.
-- [ ] SL4. TLS 1.3 on every platform (release I7) (M).
+- [~] SL4. TLS 1.3 on every platform (release I7) (M).
+      Verified live: `fetch("https://github.com/")` over Schannel returns
+      200 + full body on the PE backend; `tls_session_protocol` (new,
+      QueryContextAttributes CONNECTION_INFO) reports the negotiated
+      version — 2048 (TLS 1.2) today. Pinning SP_PROT_TLS1_3 in
+      grbitEnabledProtocols fails the handshake: Schannel 1.3 needs the
+      SCH_CRED + TLS_PARAMETERS credentials structure. Unix side goes
+      through OpenSSL (1.3-capable). Left: SCH_CRED credentials path on
+      Windows + a suite-visible handshake check (needs network).
 - [~] SL5. DNS with caching, IPv6 everywhere (M).
       Done: `stdlib/dns.fd` parses every answer record with its TTL
       (bounds-checked names), A and AAAA, IPv6 text as RFC 5952, a cache by
@@ -647,7 +685,16 @@ owning what we ship.
       path and native Windows: a listening socket takes IPv6 and IPv4 clients
       (dual stack), connect tries each address of a name, IPv6 ones included.
       Left: native Linux (its resolver reads only IPv4 and /etc/hosts).
-- [ ] SL6. JSON at simdjson-class speed (L).
+- [~] SL6. JSON at simdjson-class speed (L).
+      Measured (5.9 MB nested doc, PE emit): `json_is_valid` ~10 MB/s,
+      `json_parse` (validate + canonicalize) ~1.6 MB/s — three orders of
+      magnitude from simdjson-class. `j_canon` now writes into one
+      StringBuilder and sorts member indices instead of copying value
+      strings (was `out = out + ...` per member); canon is linear at
+      ~6× the validate pass. Left: an indexed DOM (one scan, no
+      canonicalize reserialize, zero-copy `str_slice` values) is the
+      only route near the goal; the `str`-in/`str`-out API reserializes
+      by design.
 - [x] SL7. A linear-time regex engine (L).
       Done: `regex_match` in `stdlib/regex.fd` is a Pike VM (no
       backtracking): classes, escapes, counted quantifiers, groups,
@@ -666,7 +713,20 @@ owning what we ship.
       `test_tzif.fd` (Kolkata, Phoenix, Lord Howe, New York since 1883)
       against zoneinfo on the same files. Left: calendars other than the
       Gregorian, the Julian forms of POSIX rule dates.
-- [ ] SL9. Unicode: normalization, segmentation, case folding (L).
+- [x] SL9. Unicode: normalization, segmentation, case folding (L).
+      Done: `stdlib/unicode_data.fd` (generated from Unicode 16, packed
+      fixed-width-decimal tables — const arrays re-evaluate per access on
+      the interpreter and `[i64; N]` by-value params truncate on emit,
+      known-bugs §2g.23): canonical + compatibility recursive
+      decomposition, canonical combining classes, canonical composition
+      (composition exclusions filtered via NFC oracle). `stdlib/unicode.fd`:
+      `uni_nfd`/`uni_nfkd`/`uni_nfc`/`uni_nfkc` with Hangul algorithmic
+      decomposition/composition, canonical ordering, and the UAX#15
+      blocked rule; grapheme segmentation and case folding already there.
+      `test_lib_unicode.fd` covers NFD/NFC/NFKD/NFKC incl. reordering,
+      Hangul both ways, compat ligatures, the 18-cp ﷺ case and
+      composition exclusion U+095B; a 400-string × 4-form differential
+      run against Python unicodedata passed 1600/1600 on interp and emit.
 - [x] SL10. Compression: gzip, zstd, brotli decode (L).
       Done: `stdlib/compress.fd` inflates DEFLATE, zlib and gzip (fixed and
       dynamic Huffman) and writes them (stored blocks); `test_compress.fd`
@@ -686,7 +746,14 @@ owning what we ship.
       packed, skipping unknown fields; `test_protobuf.fd` against bytes from
       Python). base64/hex (`encoding`), XML, YAML and TOML modules exist.
       Left: tests for XML, YAML and TOML against their specifications.
-- [ ] SL12. Database drivers: PostgreSQL, MySQL, SQLite, with parameter binding (L).
+- [~] SL12. Database drivers: PostgreSQL, MySQL, SQLite, with parameter binding (L).
+      Done: `stdlib/sqlite.fd` binds the system sqlite3 (`SQLite::open*`,
+      exec/query → JSON rows) and implements `db.fd`'s `Database`
+      capability; `SQLite::query_params` binds parameters through
+      `sqlite3_bind_text` — verified on emit that `' OR 1=1 --` stays a
+      literal (`test_pe_sqlite.fd`). `db.fd` also ships an in-memory
+      `MemoryDB` for tests. Left: PostgreSQL and MySQL wire-protocol
+      drivers behind the same capability.
 - [~] SL13. Built-in testing: table tests, benchmarks, fuzzing, as in Go (M).
       Done: `fid test <file.fd>` runs each `fn test_*()` in its own process and times each `fn bench_*()`. Left: fuzzing.
 - [x] SL14. Structured logging and metrics (M).
@@ -695,6 +762,10 @@ owning what we ship.
       per-module levels (`logmf`, `log_set_module_level`), tests `test_log`,
       `test_log_module` (complaint CO3, CO4).
 - [ ] SL15. A sampling profiler reachable from a running service (L).
+      `stdlib/profiler.fd` is a scope profiler (caller-driven
+      begin/end regions, frame/GPU timing) and `fidesc profile` is
+      one-shot; nothing samples a running service or exposes stacks
+      over a control channel.
 - [x] SL16. Big integers and decimals (M).
       Done: `stdlib/bigint.fd` (`test_bigint.fd`) and `stdlib/decimal.fd`:
       exact decimals on a BigInt mantissa, division and rounding to a scale
@@ -703,8 +774,24 @@ owning what we ship.
       Done: `stdlib/path.fd` reads both separators, Windows drives and UNC
       roots in join, split, normalize, parent and components
       (`test_path.fd`). Left: files and processes checked the same way.
-- [ ] SL18. Crypto through reviewed libraries, the set of release J5 (L).
-- [ ] SL19. Every public function documented with an example that runs in CI (L).
+- [~] SL18. Crypto through reviewed libraries, the set of release J5 (L).
+      Done: `test_crypto_tls_vectors.fd` proves the primitives against
+      published vectors — ChaCha20 block/stream (RFC 8439 §2.3.2/§2.4.2),
+      Poly1305 (§2.5.2), ChaCha20-Poly1305 AEAD encrypt+decrypt (§2.8.2),
+      HKDF extract/expand (RFC 5869 case 1) — plus the existing NIST
+      SHA-256 and RFC 4231 HMAC vectors; fixed `aead_mac` interleaving
+      the length blocks (was unverifiable until the interp struct-assign
+      bug was found). Left: signatures (no Ed25519/ECDSA/RSA anywhere),
+      and "reviewed libraries" — today's set is pure-Fides; J5 wants
+      bindings (CNG/OpenSSL) for the same primitives.
+- [~] SL19. Every public function documented with an example that runs in CI (L).
+      Done: `scripts/doctest.py` extracts `/// Example:` code blocks from
+      .fd sources and runs each as a program through `fid run` — CI-gatable
+      (exit 1 on any failure); `(native only)` marker skips FFI examples on
+      the interpreter. Measured: 6210 pub items scanned, 6 examples, all
+      pass (arena, db, the four uni_n* normalizers). Left: writing examples
+      for the remaining ~6200 items — a content task, not a tooling task.
+      examples (`scribe` renders docs only).
 
 **Acceptance:** a real web service needs no package outside the stdlib.
 
@@ -847,7 +934,16 @@ Only this produces true production years. It starts now, at small scale.
 
 **Using it ourselves**
 
-- [ ] AD1. `ark`, `scribe` and `veil` written in Fides (release N8) (L).
+- [~] AD1. `ark`, `scribe` and `veil` written in Fides (release N8) (L). The
+      implementations exist in `compiler/{ark,scribe,veil}.fd` and now have
+      standalone `fn main` entries in `tools/`. `ark.exe` builds and runs
+      end-to-end (`version`, `list` verified); `scribe.exe` builds and
+      generates docs (module-name CRLF bug found and fixed); `veil` builds
+      fully as a Linux ELF through the nat backend (2,570 functions — needed
+      the `p_f32_to_bits`/`p_int_to_float`/`p_float_to_int` shims, added to
+      `ng_gen_call_std`). Windows `veil.exe` via the PE backend needs more
+      RAM than a small machine has (deterministic 2 MB alloc OOM at PE
+      emission). Shipped binaries are still the Rust ones.
 - [ ] AD2. The project website served by a Fides program (M).
 - [ ] AD3. `fides-os` as a standing test of bare-metal work (release G4) (M).
 - [ ] AD4. Every internal tool that can be in Fides is (M).
@@ -856,12 +952,25 @@ Only this produces true production years. It starts now, at small scale.
 
 **Being reachable**
 
-- [ ] AD6. The book: a full guide, from first program to writing a service (L).
-- [ ] AD7. A cookbook of common tasks (M).
-- [ ] AD8. Guides for people arriving from Rust, Go, Zig and C (M).
-- [ ] AD9. A channel for questions, answered (S).
-- [ ] AD10. Good first issues, kept current (S).
-- [ ] AD11. A compiler internals guide, so others can contribute (M).
+- [~] AD6. The book: a full guide, from first program to writing a service (L).
+      `docs/book/` draft exists — intro/install, first program, tour, ownership,
+      and the service chapter written; effects/errors/toolchain/concurrency/
+      shipping are stubs.
+- [x] AD7. A cookbook of common tasks (M). `docs/cookbook.md` — args, files,
+      collections, strings, JSON, errors, HTTP server/client, config, tasks,
+      timing, crypto, testing; recipes use verified stdlib signatures.
+- [x] AD8. Guides for people arriving from Rust, Go, Zig and C (M).
+      `docs/guides/from-{rust,go,zig,c}.md` — syntax maps, ownership-model
+      deltas, real ports, what doesn't carry over.
+- [x] AD9. A channel for questions, answered (S). GitHub Discussions enabled
+      on pledgeandgrow/fid; `SUPPORT.md` routes questions/bugs/contributing.
+      "Answered" is ongoing by definition.
+- [x] AD10. Good first issues, kept current (S). Issues #2–#6 filed from
+      real known-bugs/limitations (debug-print gating, scribe readdir,
+      non-ASCII CI check, ark stubs, GlobalAddr on other targets).
+- [x] AD11. A compiler internals guide, so others can contribute (M).
+      `docs/compiler-internals.md` — pipeline, IR shapes, pass list + kill
+      switches, calling conventions, lib-facts format, contributor traps.
 
 **Earning users**
 

@@ -1,88 +1,87 @@
 # tensor.fd
 
-- **Path:** `compiler/tensor.fd`
-- **LOC:** 755 (Rust `src/tensor.rs`: 609)
-- **Role:** Pure-Fides n-dimensional tensor library — `Tensor` (shape/strides/data), elementwise ops, matmul/dot, reductions, activations (relu/sigmoid/softmax), **Q8 quantization** (ML10: `quantize_q8`/`dequantize_q8`/`find_quant_params`), `to_json`, and `KvCache` with sliding-window eviction (ML9). Phase 5C.1 AI/ML foundation.
+- **Path:** `compiler/tensor.fd` — module `compiler::tensor`
+- **LOC:** 757 (2026-11-09). Rust `src/tensor.rs`: 609.
+- **Role:** the interpreter's tensor library: `TensorData` (shape, strides,
+  `Vec<f64>` data), creation, indexing, elementwise ops, matmul/dot,
+  reductions, relu/sigmoid/softmax, Q8 quantization helpers, JSON/string
+  output, and `KvCache` (ML9). Pure Fides, no builtins of its own.
+- **Status:** LIVE on `fid run` only (through interp.fd's `p_tensor_*`,
+  `p_kv_cache_*`, `p_find_quant_params`, autograd). The C and Windows
+  backends have their own tensor runtimes and do not use this file.
+- **Re-audited:** 2026-11-09.
 
-## Where called
+## Where it is called
 
-**WIRED since 2026-10-23** — the suggested fix order item #1 was done.
+| Caller | Site | What |
+|---|---|---|
+| `compiler/interp.fd` | :27 import; `tensors: Vec<TensorData>`, `kv_caches: Vec<KvCache>` (:819-822) | `call_tensor` (:7039) and the `p_tensor_*` block (~:3950-4300) call `Tensor_*` / `KvCache_*`; `Interpreter_alloc_tensor` (:5414) wraps a `TensorData` as `Value::Ptr` |
+| `compiler/main.fd` | :30 | `use compiler::tensor`: nothing in main.fd uses it (interp pulls it in anyway) |
 
-| Evidence | Detail |
-|---|---|
-| `compiler/interp.fd` | `p_tensor_*`/`p_quantize_*`/`p_kv_*` builtins now call the real `Tensor_*`/`KvCache_*` functions — the `:2701` block header reads "wired to compiler::tensor", e.g. `p_tensor_zeros` → `Interpreter_alloc_tensor(Tensor_zeros(shape))` (:2703-2707). ~35 call sites implemented |
-| `compiler/main.fd` | `use compiler::tensor` — no longer vestigial (interp pulls the module transitively) |
-| `runtime_linux.fd` | 9 `p_tensor_*` xor/ret stubs — **still stubbed**: compiled (ELF) binaries still can't reach real tensors. Only `fides-c run` (interp) works |
+Reached from: `fid run` (and `fid veil`, which runs the interpreter).
 
-Rust uses `crate::tensor::Tensor`/`KvCache` directly inside `src/interp.rs` (~20 call sites) — the Fides interp now does the equivalent via `Interpreter_alloc_tensor` wrapping `Value::Ptr` handles.
+Other tensor implementations (not this file): the C runtime in
+`compiler/codegen_c.fd` (112 `p_tensor_` references), `stdlib/pe_runtime/
+tensor.fd` (Windows `emit`), `stdlib/tensor.fd` (the user-facing wrapper).
+`stdlib/linux_runtime/` has no `p_tensor_*`. The old
+`compiler/runtime_linux.fd` still registers `p_tensor_*` symbols (:3110+).
+
+Unused public functions (no caller outside this file):
+`Tensor_quantize_q8`, `Tensor_dequantize_q8`, `Tensor_to_string`
+(interp.fd has its own `interp_quantize_q8`, `interp_dequantize_q8`,
+`interp_tensor_to_string`, :7340-7372). `Tensor_sigmoid`, `Tensor_softmax`,
+`Tensor_to_json` are called only from interp.fd handlers that cannot be
+reached (:4135-4144, :4288; `call_tensor` answers those names first,
+:3096), so in practice also unused.
 
 ## Findings
 
-### MEDIUM → RESOLVED on interp path (2026-10-23) — the port now executes under `run`
+### Verified live (2026-11-09, `s18.exe run`)
 
-The ML9+ML10 port itself was verified faithful and is unchanged — what changed
-is that `fides-c run` can now reach it through the wired `p_tensor_*` builtins.
-Remaining gap: the **native/ELF path** still has xor/ret `p_tensor_*` stubs in
-`runtime_linux.fd`, and `codegen_c`'s C runtime has its own tensor story — a
-program using tensors works under `run` but not yet under `build`/`emit` (ELF).
+1. **FIXED (was MEDIUM) — module unreachable.** Wired through interp.fd
+   since 2026-10-23. `tests/bootstrap/test_tensor.fd`, `test_kv_cache.fd`,
+   `test_quantization.fd`, `test_tensor_shape_vec.fd` run to exit 0 with
+   plausible output (matmul `[[58, 64], [139, 154]]`, transpose, JSON).
+2. **FIXED (was HIGH) — `Tensor` struct name clashed with the builtin type.**
+   Renamed `TensorData`; still so.
 
-Verified per-function parity:
+### From code inspection
 
-- **`matmul`/`dot`**: identical O(m·n·k) triple loop through `get`/`set`, same 2D/inner-dim guards (Fides error strings are shorter — no dimension echo).
-- **`KvCache`**: all six methods (`new`/`append`/`get`/`len`/`clear`/`evict_oldest`) ported — the sliding-window eviction (ML9) logic present.
-- **Quantization**: `quantize_q8`/`dequantize_q8`/`find_quant_params` + `QuantParams` — the ML10 round-trip (min/max → scale/zero-point → clamp [−128,127] → back).
-- **Activations**: relu/sigmoid/softmax (max-subtracted stable softmax via `tensor_exp`), sum/mean/max/min reductions, transpose, reshape.
-- **`to_json`/`to_string`** formatting ported.
+3. **NEW, MEDIUM — `tensor_exp` is a 12-term Taylor series** (:735-747):
+   inaccurate for |x| > ~5, returns `1e8` for x > 20 and 0 for x < -20.
+   It feeds `Tensor_sigmoid` and `Tensor_softmax`. Not visible today
+   because interp.fd uses `math_exp` versions instead (:7219-7262, comment
+   says why); anyone calling these two directly gets wrong values.
+4. **NEW, LOW — `Tensor_quantize_q8` truncates** (`p_float_to_int`, :439);
+   Rust rounds (`src/tensor.rs` `(v / scale).round()`). Unused (interp
+   rounds in its own copy).
+5. **NEW, LOW — no per-dimension bounds check.** `Tensor_get/set` (:121-135)
+   flatten the index with the strides and only check the flat offset, so
+   `[0, 5]` on a 2x3 tensor reads element `[1, 2]`; a fully out-of-range
+   index returns 0.0 / ignores the write silently.
+6. **NEW, LOW — empty tensors.** `Tensor_max`, `Tensor_min`,
+   `Tensor_find_quant_params` read `data.get(0)` without a length check
+   (:339, :350, :468).
+7. **NEW, INFO — `KvCache_get` builds a `Vec<i64>` of f64 bit patterns and
+   passes it as the `Vec<f64>` data of a tensor** (:666-681). It works
+   because a Vec stores 8-byte words either way, and it type-checks under
+   the lenient checking of `compiler::*` modules.
+8. **STILL TRUE, LOW — `I64Vec` wrapper** (:577) exists only to avoid a
+   nested-generic parse problem; harmless.
+9. **CHANGED — "runtime_linux p_tensor stubs".** The native Linux backend
+   is now `nat_ir` + `stdlib/linux_runtime/`, which has no `p_tensor_*`
+   at all (grep). A tensor program built with `emit --target *-linux` has
+   unresolved builtins (not run here).
 
-Because nothing called it, tensor builtins on all three live paths used to return
-garbage-free-but-empty defaults. **Status now:** interp path → real values;
-ELF path → still xor/ret `0` (`runtime_linux` stubs). `Vec<f64>` "tensor"
-programs work under `run` but still silently zero under native ELF builds.
+## Fix order
 
-### LOW — `I64Vec` shim struct
+1. Replace `tensor_exp` with `math_exp`, round in `Tensor_quantize_q8`,
+   and delete interp.fd's duplicates and dead handlers so there is one
+   implementation.
+2. Bounds-check each index against `shape`; length-check the reductions.
+3. Remove the unused `use compiler::tensor` from main.fd.
 
-`pub struct I64Vec` (:575) exists to box `Vec<i64>` where nested generics were needed — boilerplate artifact, harmless.
+## Verification state
 
-## Suggested fix order — updated
-
-1. ~~Wire `interp.fd`'s `p_tensor_*`/`p_quantize_*`/`p_kv_*` builtins to `Tensor_*`/`KvCache_*`~~ — **DONE (2026-10-23)**.
-2. `runtime_linux.fd`'s `p_tensor_*` stubs still need real impls for compiled binaries (bigger lift — the same missing-runtime story as `p_string_*`/`p_map_*` — which are *also* dropped, see runtime_linux.md).
-3. Functional check: run a tensor/matmul/kv-cache program under `fides-c run` to confirm the `Value::Ptr`-based `Interpreter_alloc_tensor` path returns correct values (wiring is code-reviewed, not runtime-verified here).
-
-## Verification
-
-Inspection-only — no self-hosted binary; and moot anyway since the module has no reachable entry point. Parity verified by function-signature and algorithm diff against `src/tensor.rs`; deadness verified by exhaustive grep for `Tensor_`/`tensor` across `compiler/` and `stdlib/` (only the import line and this file itself match).
-
-## Post-verification addendum (runtime check)
-
-Runtime probing after A3 wiring surfaced a defect the static pass missed — one
-that made the entire module unusable regardless of callers:
-
-### HIGH (fixed) — `Tensor` struct name collides with the builtin type
-
-`Tensor` is a **language-builtin type name**: `lower.fd:1195` special-cases it
-alongside `Vec`/`HashMap`/`Allocator` (resolves to `IrType::Opaque("Tensor")`),
-and `typechecker.fd:5081` matches `Type::Named("Tensor")`. So every `self:
-&Tensor` / `: Tensor` annotation in this module bound to the *builtin opaque
-type*, not the local struct. Result: direct field access on a value worked
-(`t.shape.len() == 2`), but any `&Tensor` method arg saw all Vec fields as
-empty (`Tensor_ndim(&t) == 0`, `Tensor_sum(&t) == 0`, matmul "requires 2D
-tensors"). The struct could never pass through its own API — a port-level
-defect invisible while the module was dead.
-
-Minimal reproduction: identical-shape struct `PHolder3{a,b,c: Vec}` through `&`
-works; `Tensor` through `&` reads zeros, under both local and cross-module
-imports. Confirmed not a general struct/Vec/borrow bug.
-
-**Fix applied:** struct renamed `Tensor` → `TensorData` (all 42 sites in
-tensor.fd + 9 type refs in interp.fd). Verified live under `fidesc run`:
-filled(2x2,1.5)+set(0,0,3) → ndim=2, size=4, get=3, sum=7.5, matmul(0,0)=11.25,
-KvCache_len=1 — all correct.
-
-### Caveat on the interp handle path
-
-`p_tensor_*` extern args arrive as `Value::Ptr` handles into `interp.tensors`
-(side table of `TensorData`). The side-table ops are typechecked and the callee
-side is runtime-verified; the full `interpret_source` path through the Fides
-interpreter is verified structurally but the meta-interpreting run is too slow
-to have completed in-session.
+- 2026-11-09: whole file read; callers by grep; four repo tensor tests run
+  under `fid run`. Output not compared against the C backend.

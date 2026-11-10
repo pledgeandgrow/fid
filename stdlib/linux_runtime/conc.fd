@@ -332,6 +332,13 @@ fn pe_co_self() -> i64 {
 }
 
 fn pe_q_push(t: i64) {
+    pe_q_push2(t, true);
+}
+
+/// Queue t; wake an idle worker when `wake` (a task that just yielded is
+/// queued again by the thread that will take the next one at once: no
+/// wake, or two threads fight over the queue on every yield).
+fn pe_q_push2(t: i64, wake: bool) {
     pe_lock(pe_q_lock);
     pe_st(t + 128, 0);
     if pe_q_tail == 0 {
@@ -343,6 +350,7 @@ fn pe_q_push(t: i64) {
     pe_q_n = pe_q_n + 1;
     pe_unlock(pe_q_lock);
     nat_atomic_add(pe_q_seq, 1);
+    if !wake { return; }
     if nat_atomic_load(pe_q_idle) > 0 {
         pe_futex_wake(pe_q_seq, 1);
     }
@@ -356,7 +364,8 @@ fn pe_q_take(wake: i64) -> i64 {
     if pe_q_n == 0 {
         return 0;
     }
-    var now: i64 = pert_clock_now_ms();
+    // the clock only when a queued task sleeps (a system call under qemu)
+    var now: i64 = 0;
     pe_lock(pe_q_lock);
     var n: i64 = pe_q_n;
     var found: i64 = 0;
@@ -367,6 +376,7 @@ fn pe_q_take(wake: i64) -> i64 {
         if pe_q_head == 0 { pe_q_tail = 0; }
         pe_q_n = pe_q_n - 1;
         var dl: i64 = pe_ld(t + 152);
+        if dl != 0 && now == 0 { now = pert_clock_now_ms(); }
         if dl == 0 || dl <= now {
             pe_st(t + 152, 0);
             found = t;
@@ -457,6 +467,13 @@ fn pe_co_new_block(name: str, nargs: i64, argv: i64) -> i64 {
     // The first switch restores the record at s (nat_ctx_swap): registers
     // 0, fp 0, lr the trampoline, which calls [s + 112](env 0, [s + 120])
     var s: i64 = stack + PE_GUARD + PE_TASK_STACK - 128;
+    // Windows (nat_ctx_swap there): the TEB's StackBase, StackLimit and
+    // DeallocationStack for this stack, so an overflow into its guard page
+    // is a stack overflow the handler can run on. Elsewhere these words are
+    // callee-saved registers a fresh task does not read.
+    pe_st(s + 40, stack + PE_GUARD + PE_TASK_STACK);
+    pe_st(s + 48, stack + PE_GUARD);
+    pe_st(s + 56, stack);
     pe_st(s + 96, 0);
     pe_st(s + 104, nat_ctx_tramp());
     pe_st(s + 112, pe_fn_lookup("pe_co_main"));
@@ -513,7 +530,7 @@ fn pe_co_after(t: i64) {
     } else if pe_ld(t + 136) != 0 {
         pe_ep_park(t);
     } else {
-        pe_q_push(t);
+        pe_q_push2(t, false);
     }
 }
 
@@ -677,7 +694,7 @@ const PE_EP_WAKE_DATA: i64 = 2147483647;    // the eventfd's event
 var pe_ep: i64 = 0;            // the epoll fd; 0 not yet, -1 none
 var pe_ep_efd: i64 = 0;        // the eventfd that ends the poller's wait
 var pe_ep_lock: i64 = 0;       // *i64: the table and the epoll set
-var pe_ep_tab: i64 = 0;        // fd * 16: reader token, writer token
+var pe_ep_tab: i64 = 0;        // pe_ep_ix(fd) * 16: reader token, writer token
 var pe_ep_cap: i64 = 0;        // fds the table holds
 var pe_ep_n: i64 = 0;          // *i64: armed waits
 var pe_ep_polling: i64 = 0;    // *i64: 1 while a worker waits in epoll
@@ -710,6 +727,12 @@ fn pe_sys4(n: i64, a: i64, b: i64, c: i64, d: i64) -> i64 {
     return nat_syscall(n, a, b, c, d, 0, 0);
 }
 
+/// fd's row in pe_ep_tab: its low 48 bits (on Windows a socket fd is the
+/// SOCKET under a tag in the high bits, stdlib/linux_runtime/win.fd)
+fn pe_ep_ix(fd: i64) -> i64 {
+    return fd & 281474976710655;
+}
+
 /// An epoll_event: packed (12 bytes) on x86-64, 16 on AArch64 and RISC-V.
 fn pe_ep_event(ev: i64, events: i64, data: i64) {
     if nat_arch() == 3 {
@@ -738,8 +761,9 @@ fn pe_ep_entry(i: i64, out: i64) {
 /// Bring the epoll registration of fd in line with its two slots (under
 /// pe_ep_lock): false when the kernel refused it.
 fn pe_ep_sync(fd: i64) -> bool {
-    var rd: i64 = pe_ld(pe_ep_tab + fd * 16);
-    var wr: i64 = pe_ld(pe_ep_tab + fd * 16 + 8);
+    var ix: i64 = pe_ep_ix(fd);
+    var rd: i64 = pe_ld(pe_ep_tab + ix * 16);
+    var wr: i64 = pe_ld(pe_ep_tab + ix * 16 + 8);
     var events: i64 = 0;
     if rd != 0 { events = events | 1 | 8192; }      // EPOLLIN | EPOLLRDHUP
     if wr != 0 { events = events | 4; }             // EPOLLOUT
@@ -787,11 +811,12 @@ fn pe_ep_park(t: i64) {
     var token: i64 = t | (gen << 48);
     var armed: bool = false;
     pe_lock(pe_ep_lock);
-    if pe_ep_ready() && fd >= 0 && fd < 1048576 {
-        if fd >= pe_ep_cap {
+    var ix: i64 = pe_ep_ix(fd);
+    if pe_ep_ready() && fd >= 0 && ix < 1048576 {
+        if ix >= pe_ep_cap {
             var cap: i64 = pe_ep_cap * 2;
             if cap < 64 { cap = 64; }
-            while cap <= fd { cap = cap * 2; }
+            while cap <= ix { cap = cap * 2; }
             var tab: i64 = pe_zeroed(cap * 2);
             var i: i64 = 0;
             while i < pe_ep_cap * 2 {
@@ -802,7 +827,7 @@ fn pe_ep_park(t: i64) {
             pe_ep_tab = tab;
             pe_ep_cap = cap;
         }
-        var slot: i64 = pe_ep_tab + fd * 16 + w * 8;
+        var slot: i64 = pe_ep_tab + ix * 16 + w * 8;
         if pe_ld(slot) == 0 {
             pe_st(slot, token);
             nat_atomic_store(t + 176, token);
@@ -857,20 +882,21 @@ fn pe_ep_poll(ms: i64) {
             var drain: i64 = pe_zeroed(1);
             pe_sys(PE_SYS_READ, pe_ep_efd, drain, 8);
             pert_free(drain);
-        } else if fd >= 0 && fd < pe_ep_cap {
-            var rd: i64 = pe_ld(pe_ep_tab + fd * 16);
-            var wr: i64 = pe_ld(pe_ep_tab + fd * 16 + 8);
+        } else if fd >= 0 && pe_ep_ix(fd) < pe_ep_cap {
+            var row: i64 = pe_ep_tab + pe_ep_ix(fd) * 16;
+            var rd: i64 = pe_ld(row);
+            var wr: i64 = pe_ld(row + 8);
             var changed: bool = false;
             // readable, hung up, an error: the reader; writable, hung up,
             // an error: the writer
             if rd != 0 && (events & (1 | 8 | 16 | 8192)) != 0 {
-                pe_st(pe_ep_tab + fd * 16, 0);
+                pe_st(row, 0);
                 pe_st(woke + nw * 8, rd);
                 nw = nw + 1;
                 changed = true;
             }
             if wr != 0 && (events & (4 | 8 | 16)) != 0 {
-                pe_st(pe_ep_tab + fd * 16 + 8, 0);
+                pe_st(row + 8, 0);
                 pe_st(woke + nw * 8, wr);
                 nw = nw + 1;
                 changed = true;
@@ -900,8 +926,8 @@ fn pe_ep_done(t: i64, fd: i64, w: i64) -> i64 {
     if token != 0 && nat_atomic_cas(t + 176, token, 0) != 0 {
         nat_atomic_add(pe_ep_n, 0 - 1);
         pe_lock(pe_ep_lock);
-        var slot: i64 = pe_ep_tab + fd * 16 + w * 8;
-        if fd < pe_ep_cap && pe_ld(slot) == token {
+        var slot: i64 = pe_ep_tab + pe_ep_ix(fd) * 16 + w * 8;
+        if pe_ep_ix(fd) < pe_ep_cap && pe_ld(slot) == token {
             pe_st(slot, 0);
             pe_ep_sync(fd);
         }
@@ -918,12 +944,13 @@ fn pe_ep_forget(fd: i64) {
     pe_lock(pe_ep_lock);
     var rd: i64 = 0;
     var wr: i64 = 0;
-    if fd < pe_ep_cap {
-        rd = pe_ld(pe_ep_tab + fd * 16);
-        wr = pe_ld(pe_ep_tab + fd * 16 + 8);
+    var row: i64 = pe_ep_tab + pe_ep_ix(fd) * 16;
+    if pe_ep_ix(fd) < pe_ep_cap {
+        rd = pe_ld(row);
+        wr = pe_ld(row + 8);
         if rd != 0 || wr != 0 {
-            pe_st(pe_ep_tab + fd * 16, 0);
-            pe_st(pe_ep_tab + fd * 16 + 8, 0);
+            pe_st(row, 0);
+            pe_st(row + 8, 0);
             pe_ep_sync(fd);
         }
     }

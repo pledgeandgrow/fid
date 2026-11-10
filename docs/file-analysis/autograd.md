@@ -1,73 +1,60 @@
 # autograd.fd — file analysis
 
-> **Re-verified 2026-10-23:** still a 41-LOC no-op shim, zero importers, interp Grad*/Backward still no-ops. Accurate.
-
-- **Path:** `compiler/autograd.fd` — 41 LOC
-- **Role:** Documented no-op shim for reverse-mode AD; `process_module()` is
-  intentionally empty (gradients are a runtime/tape feature, not an IR pass).
-  Ported from `src/autograd.rs` (32 LOC, equally a no-op).
-- **Analyzed:** 2026-10-22 — run 4 of 52 (alphabetical order)
+- **Path:** `compiler/autograd.fd` — module `compiler::autograd`
+- **LOC:** 41 (2026-11-09, unchanged). Rust `src/autograd.rs`: 32.
+- **Role:** a no-op shim: `process_module(&mut IrModule)` does nothing.
+  Gradients are computed at run time, not by an IR pass.
+- **Status:** DEAD. Nothing imports it.
+- **Re-audited:** 2026-11-09.
 
 ## Where it is called
 
-**Nowhere.** No `use compiler::autograd` exists in the tree — the module is
-unreachable from `main.fd`'s import graph and `process_module` has zero Fides
-callers. In Rust it's invoked from `src/compiler.rs:1678,1689` — the call
-site was dropped in the port (harmless today since both are no-ops, but the
-extension point is gone: filling this in later would silently do nothing).
+**Nowhere.** No `use compiler::autograd` in `compiler/`, `stdlib/`,
+`tests/` or `scripts/` (grep 2026-11-09), and no call of `process_module`
+from this module. Not reachable from `main.fd`; no CLI command reaches it.
+Rust calls its shim at `src/compiler.rs:1678,1689`; the port dropped the
+call.
 
-Imports: `core`, `compiler::ir`. Leaf module.
+Imports: `core`, `compiler::ir`. Type-checks clean (`s18.exe check
+compiler/autograd.fd`: no errors).
+
+Where autograd actually lives now:
+- `lower.fd:6304-6316` emits `GradBegin` / `GradEnd` / `Backward`.
+- `interp.fd` (`fid run`): a real tape (`ag_tape`), `Interpreter_run_backward`
+  (:6916-7017), `p_grad_get` / `p_grad_zero` (:7162-7177).
+  `tests/bootstrap/test_autodiff_grad.fd` runs under `fid run`.
+- `codegen_c.fd`: `p_autograd_begin/end/backward` and the C tape runtime
+  (:1633-1635, :3904-3907).
 
 ## Findings
 
-### Verified live
+### From code inspection (`fid lint` not re-run)
 
-1. **LOW — unused import.** `fidesc lint` →
-   `warning: unused import: 'compiler::ir'` — the `&mut IrModule` parameter
-   doesn't count as a use for lint (or the type resolves without it).
-   `use core` is equally unused.
+1. **STILL TRUE, LOW — unused import.** `compiler::ir` is only used for the
+   parameter type of an empty function; `core` is unused.
 
-### From code inspection
+2. **CHANGED, MEDIUM — the header comment is half right now.** Lines 4-8
+   and 31-37 say the interpreter builds a tape and computes gradients at
+   `Backward`: that is now true (it was false on 2026-10-22). But the table
+   at :9-18 says `mul` gives `grad_a = grad_out * b` and `matmul` gives
+   `grad_out * b^T`; the interpreter passes `grad_out` unchanged to both
+   inputs of `mul` and all-ones tensors to both inputs of `matmul`
+   (interp.fd:6956-6958, :6965-6967), as `src/interp.rs` does. The comment
+   describes math that no backend in this file's reach implements.
+3. **FIXED (was MEDIUM) — "under `fid run` grad blocks compute nothing".**
+   The interpreter now differentiates add, sub, scale, relu, sigmoid, sum,
+   mean correctly; mul and matmul as in finding 2.
+4. **STILL TRUE, LOW — whole-file dead code.** Either delete it or call
+   `process_module` from `compiler.fd` after lowering; as an empty pass it
+   changes nothing either way.
 
-2. **MEDIUM — the header comment describes the wrong implementation.**
-   Lines 4-8 + 31-37 claim gradients happen "at runtime in the interpreter…
-   the interpreter builds a tape" and ops are "implemented in
-   `compiler/interp.fd`". In fact `compiler/interp.fd:1616-1618` stubs
-   `GradBegin`/`GradEnd`/`Backward` to `ExecOutcome::Continue` — **no tape,
-   no `run_backward` in the self-hosted interpreter** (line 400 even says
-   "autograd … stubbed"). The real Fides implementation is in the C backend:
-   `codegen_c.fd` emits `p_autograd_begin/end/backward` + the `ag_tape`
-   runtime (ML3, ML11 checkpoint mode). The comment was copied from the Rust
-   design where `src/interp.rs:369-2202` *does* hold `autograd_tape` and
-   `run_backward` — it's now misleading documentation pointing at a stub.
+## Fix order
 
-3. **MEDIUM — interp/backend divergence it hides:** under `fidesc run`,
-   `grad { … backward(loss) }` silently computes nothing — `Backward` is a
-   no-op, so a program can produce zero grads with no error. Only the C
-   native backend actually differentiates. (Details belong to interp.fd's
-   run; flagged here because this file's doc is what misdescribes it.)
-
-4. **LOW — whole-file dead code.** Either delete the file, or re-add
-   `use compiler::autograd` + `process_module(&mut module)` in `compiler.fd`
-   at the Rust call sites to keep parity as an extension point. Keeping a
-   doc-shim with no caller is fine too — but then its comment should at
-   least be true.
-
-## Suggested fix order
-
-1. Rewrite the header comment to describe reality: tape engine lives in the
-   C-backend runtime (`p_autograd_*`), `interp.fd` stubs the instructions,
-   native codegen is the only backend that differentiates today.
-2. Either delete the module or wire `process_module` into `compiler.fd`
-   (post-lower, pre-opt — the Rust call sites are in that slot).
-3. Drop unused `use compiler::ir` / `use core`.
+1. Fix the gradient table in the comment, or fix `mul`/`matmul` in
+   interp.fd's `run_backward` (needs forward values on the tape).
+2. Delete the module (preferred), or wire it as an extension point.
 
 ## Verification state
 
-- `fidesc lint` run (unused-import warning).
-- `compiler/interp.fd:1616-1618` read: all three autograd insts → `Continue`.
-- `src/compiler.rs:1678,1689` + `src/interp.rs:369-2202` checked: Rust calls
-  the shim and implements the tape in its interpreter — the comment is true
-  for Rust, false for Fides.
-- `codegen_c.fd` grep: `p_autograd_begin/end/backward` emitted + `ag_tape`
-  runtime present — the actual Fides implementation site.
+- 2026-11-09: file read; importers grepped; `s18.exe check` clean;
+  interp.fd's tape code read; `test_autodiff_grad.fd` run under `fid run`.

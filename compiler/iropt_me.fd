@@ -17,8 +17,14 @@
 //               loaded and stored becomes one local per field
 //   ME28        switch lowering: a chain of `x == k` tests on one value
 //               (a match) becomes a balanced tree of comparisons
+//   LF1-LF4     one alias query from the language's guarantees (locals,
+//               parameters a function writes, fields), used by:
+//   LF5         loads moved out of loops that cannot change what they read
+//   LF6         store-to-load forwarding and repeated loads removed
+//   LF23        match facts: in an arm, the scrutinee's tag is a constant
 //
-// Every pass is off unless named in FID_IROPT_ON (a comma list, or "all"),
+// Every pass is off unless named in FID_IROPT_ON (a comma list, or "all":
+// inline2 sra switch loops ivsr unroll loadhoist forward matchfacts),
 // and FID_IROPT_OFF still turns it off: they have not been run on the
 // suite yet. What they must respect (the ownership lowering, proposal 0004):
 // owned slots are allocas zeroed in their function's entry block; the
@@ -1725,5 +1731,612 @@ pub fn ime_function_passes(f: &mut IrFunction) -> bool {
     if ime_on("loops") && ime_canonical_loops(f) { changed = true; }
     if ime_on("ivsr") && ime_strength_reduce(f) { changed = true; }
     if ime_on("unroll") && ime_unroll(f) { changed = true; }
+    // Track LF (opt-in): facts from the language's guarantees
+    if ime_on("loadhoist") && ime_hoist_loads(f) { changed = true; }
+    if ime_on("forward") && ime_forward(f) { changed = true; }
+    if ime_on("matchfacts") && ime_match_facts(f) { changed = true; }
+    return changed;
+}
+
+// --- Track LF: the language's guarantees as facts ---------------------------
+//
+// LF1-LF4: one alias query, ime_may_alias(p, q), answered from what the
+// language guarantees about where an address comes from (ime_addr):
+//   - two different locals never overlap; a local whose address goes only
+//     to loads, stores and field addresses (not escaped) overlaps nothing
+//     else at all (LF3 for owned locals: they have one owner);
+//   - two different parameters never overlap when either is written: a
+//     function writes only through a `&mut`, and the borrow rules let no
+//     other reference to that place be live (LF1); references never escape
+//     (escape.fd, LF2). Raw `*u8` (strings, unsafe code) are left out;
+//   - two different fields of one place never overlap;
+//   - anything else (an address read from memory or returned by a call, a
+//     global) may overlap.
+// LF5 (loads out of loops), LF6 (store-to-load forwarding, repeated loads)
+// and LF23 (match facts) use it. Calls are writes to every place reachable
+// from a pointer they receive, and to every place that has escaped.
+
+/// Where an address comes from: kind 1 a local, 2 a parameter written
+/// through (`&mut`, or unmarked and not `*u8`), 4 a `&` parameter, 3 a
+/// global, 0 unknown; `base` the local or parameter (the global's GlobalAddr id);
+/// `path` the fields and constant elements from it ("f2.e5.", "e?." for an
+/// element not known).
+pub struct ImeAddr {
+    pub kind: i64,
+    pub base: i64,
+    pub path: str,
+}
+
+fn ime_param_index(f: &IrFunction, v: i64) -> i64 {
+    var i: i64 = 0;
+    while i < f.params.len() {
+        if f.params.get(i).id == v { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// The borrow kind the lowering gave value `v`: 2 `&mut`, 1 `&`, 0 none.
+fn ime_borrow(f: &IrFunction, v: i64) -> i64 {
+    match IrFunction_get_meta(f, v) {
+        OptValueMeta::Some(m) => {
+            match m.borrow_kind {
+                BorrowKind::Mut => { return 2; }
+                BorrowKind::Shared => { return 1; }
+                BorrowKind::None => { return 0; }
+            }
+        }
+        OptValueMeta::None => {}
+    }
+    return 0;
+}
+
+fn ime_raw_ptr(t: IrType) -> bool {
+    if ir_type_eq(t, IrType::Ptr(Box::new(IrType::U8))) { return true; }
+    match t {
+        IrType::Ptr(_) => { return false; }
+        _ => { return true; }
+    }
+}
+
+fn ime_addr(f: &IrFunction, p0: i64) -> ImeAddr {
+    var p: i64 = p0;
+    var path: str = "";
+    var steps: i64 = 0;
+    while steps < 32 {
+        match peir_inst_of(f, p) {
+            Inst::GetFieldPtr(q, idx, _) => { path = "f" + int_to_str(idx) + "." + path; p = q; }
+            Inst::GetElemPtr(q, ei, _) => {
+                match ime_const(f, ei) {
+                    OptI64::Some(c) => { path = "e" + int_to_str(c) + "." + path; }
+                    OptI64::None => { path = "e?." + path; }
+                }
+                p = q;
+            }
+            Inst::BitCast(q, _, _) => { p = q; }
+            Inst::Alloca(_, _) => { return ImeAddr { kind: 1, base: p, path: path }; }
+            Inst::GlobalAddr(_, _) => { return ImeAddr { kind: 3, base: p, path: path }; }
+            _ => {
+                if ime_param_index(f, p) >= 0 {
+                    // the lowering marks `&mut T` and `&T` parameters
+                    var bk: i64 = ime_borrow(f, p);
+                    if bk == 2 { return ImeAddr { kind: 2, base: p, path: path }; }
+                    if bk == 1 { return ImeAddr { kind: 4, base: p, path: path }; }
+                    if !ime_raw_ptr(ime_type(f, p)) { return ImeAddr { kind: 2, base: p, path: path }; }
+                }
+                return ImeAddr { kind: 0, base: p, path: path };
+            }
+        }
+        steps = steps + 1;
+    }
+    return ImeAddr { kind: 0, base: p, path: path };
+}
+
+/// Locals whose address goes nowhere but loads, stores (as the address)
+/// and field or element addresses that do the same.
+pub fn ime_unescaped(f: &IrFunction) -> Vec<i64> {
+    var n: i64 = f.next_value + 1;
+    var ok: Vec<i64> = peir_zeros(n);
+    var i: i64 = 0;
+    while i < f.insts.len() {
+        var ve: ValueIdInst = f.insts.get(i);
+        match ve.inst {
+            Inst::Alloca(_, _) => { if ve.id >= 0 && ve.id < n { ok.set(ve.id, 1); } }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    // an address derived from a local, and the local it is derived from
+    var root: Vec<i64> = peir_zeros(n);
+    var changed: bool = true;
+    var rounds: i64 = 0;
+    while changed && rounds < 8 {
+        changed = false;
+        i = 0;
+        while i < f.insts.len() {
+            var ve2: ValueIdInst = f.insts.get(i);
+            var from: i64 = -1;
+            match ve2.inst {
+                Inst::GetFieldPtr(q, _, _) => { from = q; }
+                Inst::GetElemPtr(q2, _, _) => { from = q2; }
+                Inst::BitCast(q3, _, _) => { from = q3; }
+                _ => {}
+            }
+            if from >= 0 && from < n && ve2.id >= 0 && ve2.id < n && root.get(ve2.id) == 0 {
+                var r: i64 = 0;
+                if ok.get(from) == 1 { r = from + 1; } else { r = root.get(from); }
+                if r != 0 { root.set(ve2.id, r); changed = true; }
+            }
+            i = i + 1;
+        }
+        rounds = rounds + 1;
+    }
+    // any other use of such an address lets it escape
+    i = 0;
+    while i < f.insts.len() {
+        var ve3: ValueIdInst = f.insts.get(i);
+        var ops: Vec<i64> = Vec::new();
+        peir_inst_operands(ve3.inst, &mut ops);
+        var o: i64 = 0;
+        while o < ops.len() {
+            var v: i64 = ops.get(o);
+            if v >= 0 && v < n {
+                var loc: i64 = -1;
+                if ok.get(v) == 1 { loc = v; }
+                if root.get(v) != 0 { loc = root.get(v) - 1; }
+                if loc >= 0 {
+                    var fine: bool = false;
+                    match ve3.inst {
+                        Inst::Load(p, _) => { fine = p == v; }
+                        Inst::Store(pst, sv, _) => { fine = pst == v && sv != v; }
+                        Inst::GetFieldPtr(_, _, _) => { fine = true; }
+                        Inst::GetElemPtr(qge, _, _) => { fine = qge == v; }
+                        Inst::BitCast(_, _, _) => { fine = true; }
+                        _ => {}
+                    }
+                    if !fine { ok.set(loc, 0); }
+                }
+            }
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+    // drops and @zeroize read locals behind the IR's back
+    var d: i64 = 0;
+    while d < f.drop_locals.len() {
+        var lid: i64 = f.drop_locals.get(d).id;
+        if lid >= 0 && lid < n { ok.set(lid, 0); }
+        d = d + 1;
+    }
+    d = 0;
+    while d < f.zeroize_locals.len() {
+        var zid: i64 = f.zeroize_locals.get(d).id;
+        if zid >= 0 && zid < n { ok.set(zid, 0); }
+        d = d + 1;
+    }
+    return ok;
+}
+
+/// Can the places at paths a and b (from one base) overlap: one a prefix
+/// of the other, an unknown element matching any element?
+fn ime_paths_overlap(a: str, b: str) -> bool {
+    var pa: Vec<str> = str_split(a, ".");
+    var pb: Vec<str> = str_split(b, ".");
+    var i: i64 = 0;
+    while i < pa.len() && i < pb.len() {
+        var x: str = pa.get(i);
+        var y: str = pb.get(i);
+        if str_len(x) == 0 || str_len(y) == 0 { return true; }
+        if x != y {
+            var both_elems: bool = str_starts_with(x, "e") && str_starts_with(y, "e");
+            if !(both_elems && (x == "e?" || y == "e?")) { return false; }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn ime_global_name(f: &IrFunction, id: i64) -> str {
+    match peir_inst_of(f, id) {
+        Inst::GlobalAddr(x, _) => { return x; }
+        _ => {}
+    }
+    return "";
+}
+
+/// LF4: may the places at addresses p and q overlap?
+pub fn ime_may_alias(f: &IrFunction, unesc: &Vec<i64>, p: i64, q: i64) -> bool {
+    if p == q { return true; }
+    var a: ImeAddr = ime_addr(f, p);
+    var b: ImeAddr = ime_addr(f, q);
+    if a.kind == 1 && b.kind == 1 {
+        if a.base != b.base { return false; }
+        return ime_paths_overlap(a.path, b.path);
+    }
+    // an unescaped local overlaps only itself
+    if a.kind == 1 && a.base < unesc.len() && unesc.get(a.base) == 1 { return false; }
+    if b.kind == 1 && b.base < unesc.len() && unesc.get(b.base) == 1 { return false; }
+    if a.kind == 2 && b.kind == 2 {
+        if a.base != b.base { return false; }
+        return ime_paths_overlap(a.path, b.path);
+    }
+    // a `&` parameter's place is never a `&mut` one's (borrow rules)
+    if (a.kind == 4 && b.kind == 2) || (a.kind == 2 && b.kind == 4) { return false; }
+    if a.kind == 4 && b.kind == 4 && a.base == b.base { return ime_paths_overlap(a.path, b.path); }
+    if a.kind == 3 && b.kind == 3 {
+        if ime_global_name(f, a.base) != ime_global_name(f, b.base) { return false; }
+        return ime_paths_overlap(a.path, b.path);
+    }
+    return true;
+}
+
+/// May a call with these arguments write the place at address p? A call
+/// writes what its pointer arguments reach and anything that escaped
+/// (unknown places, globals); never an unescaped local, nor a parameter's
+/// place no argument is derived from.
+fn ime_call_writes(f: &IrFunction, unesc: &Vec<i64>, args: Vec<i64>, p: i64) -> bool {
+    var a: ImeAddr = ime_addr(f, p);
+    if a.kind == 1 && a.base < unesc.len() && unesc.get(a.base) == 1 { return false; }
+    // nothing writes what a `&` parameter refers to while it is borrowed
+    if a.kind == 4 { return false; }
+    if a.kind == 2 {
+        var i: i64 = 0;
+        while i < args.len() {
+            var b: ImeAddr = ime_addr(f, args.get(i));
+            if b.base == a.base || b.kind == 0 { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    return true;
+}
+
+/// Does `inst` write memory that may overlap the place at p?
+fn ime_writes(f: &IrFunction, unesc: &Vec<i64>, inst: Inst, p: i64) -> bool {
+    match inst {
+        Inst::Store(q, _, _) => { return ime_may_alias(f, unesc, p, q); }
+        Inst::StructCopy(d, _, _) => { return ime_may_alias(f, unesc, p, d); }
+        Inst::Call(_, args, _, _) => { return ime_call_writes(f, unesc, args, p); }
+        Inst::CallPtr(_, args2, _, _, _) => { return ime_call_writes(f, unesc, args2, p); }
+        Inst::DynCall(_, _, args3, _, _) => { return ime_call_writes(f, unesc, args3, p); }
+        Inst::Asm(_, _, _, _) => { return true; }
+        Inst::PersistLoad(_, _, _) => { return true; }
+        Inst::RegionEnd(_, _, _) => { return true; }
+        Inst::Backward(_) => { return true; }
+        _ => { return false; }
+    }
+}
+
+/// Instructions after which nothing known about memory holds (control may
+/// leave the block, or memory changes in ways the query does not see).
+fn ime_barrier(inst: Inst) -> bool {
+    match inst {
+        Inst::TryUnwrap(_, _, _, _) => { return true; }
+        Inst::Asm(_, _, _, _) => { return true; }
+        Inst::RegionBegin(_, _, _, _) => { return true; }
+        Inst::RegionEnd(_, _, _) => { return true; }
+        Inst::PersistLoad(_, _, _) => { return true; }
+        Inst::PersistSave(_, _) => { return true; }
+        Inst::GradBegin(_) => { return true; }
+        Inst::Backward(_) => { return true; }
+        _ => { return false; }
+    }
+}
+
+/// A place that is valid to read even where the original load did not run
+/// (a local's or a parameter's own fields): a hoisted load cannot fault.
+fn ime_safe_to_read(f: &IrFunction, p: i64) -> bool {
+    var a: ImeAddr = ime_addr(f, p);
+    return (a.kind == 1 || a.kind == 2 || a.kind == 4) && !str_contains(a.path, "e");
+}
+
+fn ime_is_write(inst: Inst) -> bool {
+    match inst {
+        Inst::Store(_, _, _) => { return true; }
+        Inst::StructCopy(_, _, _) => { return true; }
+        Inst::Call(_, _, _, _) => { return true; }
+        Inst::CallPtr(_, _, _, _, _) => { return true; }
+        Inst::DynCall(_, _, _, _, _) => { return true; }
+        Inst::Asm(_, _, _, _) => { return true; }
+        Inst::PersistLoad(_, _, _) => { return true; }
+        Inst::RegionEnd(_, _, _) => { return true; }
+        Inst::Backward(_) => { return true; }
+        _ => { return false; }
+    }
+}
+
+// --- LF5: loads out of loops ---------------------------------------------------
+
+/// In a loop with a preheader, a load whose address is computed before the
+/// loop and whose place nothing in the loop may write (LF4) moves to the
+/// preheader: it reads the same value on every iteration.
+pub fn ime_hoist_loads(f: &mut IrFunction) -> bool {
+    var changed: bool = false;
+    var cfg: ImeCfg = ime_cfg(f);
+    var unesc: Vec<i64> = ime_unescaped(f);
+    var hs: Vec<i64> = ime_headers(&cfg);
+    var hi: i64 = 0;
+    while hi < hs.len() {
+        var h: i64 = hs.get(hi);
+        var lat: Vec<i64> = ime_latches(&cfg, h);
+        var body: Vec<i64> = ime_loop_body(&cfg, h, lat);
+        var pre: i64 = -1;
+        var ps: Vec<i64> = cfg.preds.get(h);
+        var k: i64 = 0;
+        while k < ps.len() {
+            if body.get(ps.get(k)) == 0 { if pre < 0 { pre = ps.get(k); } else { pre = -2; } }
+            k = k + 1;
+        }
+        if pre >= 0 && cfg.succs.get(pre).len() == 1 {
+            var inloop: Vec<i64> = peir_zeros(f.next_value + 1);
+            var writes: Vec<i64> = Vec::new();
+            var b: i64 = 0;
+            while b < cfg.n {
+                if body.get(b) == 1 {
+                    var ids: Vec<i64> = f.blocks.get(b).instructions;
+                    var q: i64 = 0;
+                    while q < ids.len() {
+                        if ids.get(q) < inloop.len() { inloop.set(ids.get(q), 1); }
+                        if ime_is_write(peir_inst_of(f, ids.get(q))) { writes.push(ids.get(q)); }
+                        q = q + 1;
+                    }
+                }
+                b = b + 1;
+            }
+            var hoist: Vec<i64> = Vec::new();
+            b = 0;
+            while b < cfg.n {
+                if body.get(b) == 1 {
+                    var ids2: Vec<i64> = f.blocks.get(b).instructions;
+                    var q2: i64 = 0;
+                    while q2 < ids2.len() {
+                        var lid: i64 = ids2.get(q2);
+                        match peir_inst_of(f, lid) {
+                            Inst::Load(p, _) => {
+                                if p >= 0 && p < inloop.len() && inloop.get(p) == 0 && ime_safe_to_read(f, p) {
+                                    var clobbered: bool = false;
+                                    var w: i64 = 0;
+                                    while w < writes.len() && !clobbered {
+                                        if ime_writes(f, &unesc, peir_inst_of(f, writes.get(w)), p) { clobbered = true; }
+                                        w = w + 1;
+                                    }
+                                    if !clobbered { hoist.push(lid); }
+                                }
+                            }
+                            _ => {}
+                        }
+                        q2 = q2 + 1;
+                    }
+                }
+                b = b + 1;
+            }
+            if hoist.len() > 0 {
+                b = 0;
+                while b < f.blocks.len() {
+                    var blk: BasicBlock = f.blocks.get(b);
+                    var keep: Vec<i64> = Vec::new();
+                    var t: i64 = 0;
+                    while t < blk.instructions.len() {
+                        if !ime_has(hoist, blk.instructions.get(t)) { keep.push(blk.instructions.get(t)); }
+                        t = t + 1;
+                    }
+                    blk.instructions = keep;
+                    f.blocks.set(b, blk);
+                    b = b + 1;
+                }
+                var pblk: BasicBlock = f.blocks.get(pre);
+                var pids: Vec<i64> = pblk.instructions;
+                var term: i64 = pids.pop();
+                var z: i64 = 0;
+                while z < hoist.len() {
+                    pids.push(hoist.get(z));
+                    z = z + 1;
+                }
+                pids.push(term);
+                pblk.instructions = pids;
+                f.blocks.set(pre, pblk);
+                changed = true;
+                cfg = ime_cfg(f);
+            }
+        }
+        hi = hi + 1;
+    }
+    return changed;
+}
+
+// --- LF6: store-to-load forwarding, repeated loads ------------------------------
+
+/// In each block, a load of a place whose value is known (just stored, or
+/// loaded and not written since, per LF4) becomes that value. Only values
+/// of the load's own type are forwarded.
+pub fn ime_forward(f: &mut IrFunction) -> bool {
+    var unesc: Vec<i64> = ime_unescaped(f);
+    var n: i64 = f.next_value + 1;
+    var map: Vec<i64> = peir_zeros(n + 1);
+    var dead: Vec<i64> = peir_zeros(n + 1);
+    var any: bool = false;
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var addrs: Vec<i64> = Vec::new();
+        var vals: Vec<i64> = Vec::new();
+        var ids: Vec<i64> = f.blocks.get(b).instructions;
+        var k: i64 = 0;
+        while k < ids.len() {
+            var id: i64 = ids.get(k);
+            var inst: Inst = peir_inst_of(f, id);
+            var done: bool = false;
+            match inst {
+                Inst::Load(p, t) => {
+                    var known: i64 = -1;
+                    var i: i64 = 0;
+                    while i < addrs.len() {
+                        if addrs.get(i) == p { known = vals.get(i); }
+                        i = i + 1;
+                    }
+                    if known >= 0 && ir_type_eq(ime_type(f, known), t) && id < map.len() {
+                        map.set(id, ime_v(&map, known) + 1);
+                        dead.set(id, 1);
+                        any = true;
+                    } else {
+                        addrs.push(p);
+                        vals.push(id);
+                    }
+                    done = true;
+                }
+                Inst::Store(p2, v, _) => {
+                    var na: Vec<i64> = Vec::new();
+                    var nv: Vec<i64> = Vec::new();
+                    var i2: i64 = 0;
+                    while i2 < addrs.len() {
+                        if !ime_may_alias(f, &unesc, addrs.get(i2), p2) {
+                            na.push(addrs.get(i2));
+                            nv.push(vals.get(i2));
+                        }
+                        i2 = i2 + 1;
+                    }
+                    na.push(p2);
+                    nv.push(ime_v(&map, v));
+                    addrs = na;
+                    vals = nv;
+                    done = true;
+                }
+                _ => {}
+            }
+            if !done {
+                if ime_barrier(inst) {
+                    addrs = Vec::new();
+                    vals = Vec::new();
+                } else if ime_is_write(inst) {
+                    var na2: Vec<i64> = Vec::new();
+                    var nv2: Vec<i64> = Vec::new();
+                    var i3: i64 = 0;
+                    while i3 < addrs.len() {
+                        if !ime_writes(f, &unesc, inst, addrs.get(i3)) {
+                            na2.push(addrs.get(i3));
+                            nv2.push(vals.get(i3));
+                        }
+                        i3 = i3 + 1;
+                    }
+                    addrs = na2;
+                    vals = nv2;
+                }
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    if !any { return false; }
+    // every use of a forwarded load reads the known value
+    var nob: Vec<i64> = peir_zeros(1);
+    var i4: i64 = 0;
+    while i4 < f.insts.len() {
+        var e: ValueIdInst = f.insts.get(i4);
+        e.inst = ime_remap(e.inst, &map, &nob);
+        f.insts.set(i4, e);
+        i4 = i4 + 1;
+    }
+    b = 0;
+    while b < f.blocks.len() {
+        var blk: BasicBlock = f.blocks.get(b);
+        var keep: Vec<i64> = Vec::new();
+        var t2: i64 = 0;
+        while t2 < blk.instructions.len() {
+            var x: i64 = blk.instructions.get(t2);
+            if x < 0 || x >= dead.len() || dead.get(x) == 0 { keep.push(x); }
+            t2 = t2 + 1;
+        }
+        blk.instructions = keep;
+        f.blocks.set(b, blk);
+        b = b + 1;
+    }
+    return true;
+}
+
+// --- LF23: match facts ---------------------------------------------------------
+
+/// Where `Branch(load(tag) == k, T, E)` enters T (T's only predecessor),
+/// every load of that same address in the blocks T dominates reads k, as
+/// long as nothing in that area may write it (LF4): it becomes the
+/// constant, so a later test of the same tag folds.
+pub fn ime_match_facts(f: &mut IrFunction) -> bool {
+    var changed: bool = false;
+    var cfg: ImeCfg = ime_cfg(f);
+    var unesc: Vec<i64> = ime_unescaped(f);
+    var b: i64 = 0;
+    while b < cfg.n {
+        var ids: Vec<i64> = f.blocks.get(b).instructions;
+        if ids.len() > 0 {
+            var addr: i64 = -1;
+            var kv: i64 = 0;
+            var tgt: i64 = -1;
+            match peir_inst_of(f, ids.get(ids.len() - 1)) {
+                Inst::Branch(c, t, _) => {
+                    match peir_inst_of(f, c) {
+                        Inst::BinOp(op, l, r, _) => {
+                            if binop_eq(op, BinOp::Eq) {
+                                match peir_inst_of(f, l) {
+                                    Inst::Load(p, lt) => {
+                                        match ime_const(f, r) {
+                                            OptI64::Some(cv) => {
+                                                if ir_type_eq(lt, IrType::I64) { addr = p; kv = cv; tgt = t; }
+                                            }
+                                            OptI64::None => {}
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            var ti: i64 = -1;
+            if tgt >= 0 && tgt < cfg.index.len() { ti = cfg.index.get(tgt); }
+            if addr >= 0 && ti >= 0 && cfg.preds.get(ti).len() == 1 {
+                var area: Vec<i64> = Vec::new();
+                var x: i64 = 0;
+                while x < cfg.n {
+                    if ime_dom(&cfg, ti, x) { area.push(x); }
+                    x = x + 1;
+                }
+                var clean: bool = true;
+                var ri: i64 = 0;
+                while ri < area.len() && clean {
+                    var rids: Vec<i64> = f.blocks.get(area.get(ri)).instructions;
+                    var q: i64 = 0;
+                    while q < rids.len() && clean {
+                        var rinst: Inst = peir_inst_of(f, rids.get(q));
+                        if ime_barrier(rinst) || ime_writes(f, &unesc, rinst, addr) { clean = false; }
+                        q = q + 1;
+                    }
+                    ri = ri + 1;
+                }
+                if clean {
+                    ri = 0;
+                    while ri < area.len() {
+                        var rids2: Vec<i64> = f.blocks.get(area.get(ri)).instructions;
+                        var q2: i64 = 0;
+                        while q2 < rids2.len() {
+                            var lid: i64 = rids2.get(q2);
+                            match peir_inst_of(f, lid) {
+                                Inst::Load(p2, lt2) => {
+                                    if p2 == addr && ir_type_eq(lt2, IrType::I64) {
+                                        IrFunction_set_inst(f, lid, Inst::ConstInt(kv, IrType::I64));
+                                        changed = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            q2 = q2 + 1;
+                        }
+                        ri = ri + 1;
+                    }
+                }
+            }
+        }
+        b = b + 1;
+    }
     return changed;
 }

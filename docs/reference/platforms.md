@@ -17,7 +17,7 @@ tests. The table lists what Tier 1 covered when CI ran.
 
 | Platform | Backends | What CI runs |
 |---|---|---|
-| Windows x64 | interpreter, C, native (PE, `fid emit`) | the suite on all three, expected failures, every stdlib module, the native fixpoint, an installed `fid`. Native async/tasks work since Nov 6; the interpreters run an `async fn` to the end at the call (`test_async_suspend`) |
+| Windows x64 | interpreter, C, native (PE, `fid emit`) | the suite on all three, expected failures, every stdlib module, the native fixpoint, an installed `fid`. Native async/tasks worked on Nov 6 and broke in builds of Nov 9 afternoon (iropt passes; fixed again in the evening's fid31, known-bugs 2f.2); the interpreters run an `async fn` to the end at the call (`test_async_suspend`) |
 | Linux x64 | interpreter, C | the suite, expected failures, `fid` bootstrapping itself, the release archive on a clean Ubuntu |
 
 ## Tier 2: builds, partly tested
@@ -39,7 +39,8 @@ Run a target's suite with `scripts/cross-test.sh <target>`: it builds every
 test through C for the target, runs it (qemu-user in WSL or on Linux, Node for
 WASI; macOS binaries are only built off a Mac) and compares the output and
 exit code with the interpreter's. `NATIVE=1` builds with the native backend
-(`fid emit --target aarch64-linux|riscv64-linux`) instead of C.
+(`fid emit --target aarch64-linux|riscv64-linux|x86_64-linux`, and `--nat`
+for `x86_64-windows`) instead of C.
 
 ## Tier 3: present, not supported
 
@@ -48,6 +49,7 @@ exit code with the interpreter's. `NATIVE=1` builds with the native backend
 | WebAssembly native | `fid wasm` | its modules fail validation; no collections (release F9) |
 | macOS native | Mach-O objects | no executables yet (release F7) |
 | Bare metal | `emit --bare`, `--boot` | `fid emit --bare` writes flat binaries since Nov 6 (release G2); run on a hosted test runner, not yet under QEMU (G1) |
+| Old PIR backends | `build --native` (default target), `build-x86`, `codegen --target x86-64\|arm64\|riscv`, `codegen --elf\|--coff\|--macho`, `emit --boot` | Nov 9: `build --native` panics in the PIR optimizer, `build-x86` writes an exe that segfaults, `emit --boot` panics; `codegen` prints assembly (ARM64/RISC-V assembly is wrong: `return` for `ret`); COFF objects are valid, Mach-O headers correct but never linked, x86-64 ELF objects have malformed section headers (known-bugs 2g.16) |
 | Android, iOS | none | not started (PL6) |
 
 ## What decides a platform's tier

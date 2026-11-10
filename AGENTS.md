@@ -4,7 +4,7 @@
 > Fides compiler safely. Read this before making changes.
 >
 > **Fides is self-hosted and independent.** The primary compiler is in
-> `compiler/*.fd` (63 modules, ~142K lines). The Rust source in `src/*.rs`
+> `compiler/*.fd` (68 modules, ~159K lines). The Rust source in `src/*.rs`
 > (57 files, ~113K lines) is the bootstrap reference, frozen: it builds
 > stage 1 when `compiler/*.fd` changes and runs the test harness. The
 > language is what `fid` accepts: docs/reference/reference.md.
@@ -28,7 +28,9 @@ RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh
 
 # Single stage (development; same output name, not fixpoint-checked):
 # release/fid-dev.c (generated C) + release/fid-dev(.exe)
-./scripts/build-selfhost.sh          # fidesc dump-c + C compile → release/fid-dev.exe
+./scripts/build-selfhost.sh          # stage-0 dump-c + C compile → release/fid-dev.exe
+#   (8 units at -O2 when STAGE0 has `fid split-c`, else one unit at -O0;
+#    STAGE0=release/fid.exe for the fast path: fid at -O2 runs ~17x faster)
 
 .\release\fid.exe dump-c compiler/main.fd > c2.c   # self-compile (fixpoint)
 .\release\fid.exe run tests/bootstrap/hello.fd    # interpreter (as fidesc run)
@@ -65,7 +67,7 @@ cargo build
 # Build the self-hosted compiler into release/ (manual two-step)
 #   1. fidesc ccompile compiler\main.fd -o ... generates C via the Rust bootstrap
 #   2. link the generated C with a C compiler (zig cc / cl / tcc)
-#   See docs/selfhost/selfhost.md § Build Pipeline for details.
+#   See docs/reference/selfhost.md § Build Pipeline for details.
 # (build-selfhost.ps1 no longer exists — do not reference it.)
 
 # NOTE: scripts/gen_golden.sh and scripts/bisect.sh do NOT exist —
@@ -124,8 +126,18 @@ node scripts/wasm-run.mjs out.wasm
 NATIVE=1 FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh x86_64-windows
 # Checks of the own backend (docs/roadmap/llvm-roadmap.md): FID_VERIFY=1 runs
 # the IR verifier and the register-allocation checker; FID_NAT_OFF=<passes>
-# turns native passes off (mir, promote, ipra, fold, hint, rules, purecse,
-# egraph, forward, debug); FID_NAT_DUMP=<function> prints its machine IR
+# turns native passes off (nat_ir: mir, promote, ipra, fold, hint, coalesce,
+# remat, weights, vecinline, unchecked, panicline, xmmcache, debug; rules.fd:
+# rules, purecse; egraph.fd: egraph, forward); FID_NAT_DUMP=<function> prints
+# its machine IR. IR optimizer (compiler/iropt.fd): FID_IROPT_OFF=<passes>,
+# FID_IROPT_ON=<opt-in passes>|all, FID_IROPT_STATS=1; FID_RULES_ON=readcse.
+# The C path (ccompile, dump-c) runs no IR optimizer.
+# Compile time (output unchanged; each has a switch to compare against):
+# the checked-library stamp (D9) skips the bodies of core and the merged
+# runtime once checked clean (FIDES_CHECK_CORE=1: check them); comptime
+# substitution skips functions it cannot change (FID_CT_FULL=1: all);
+# `emit` lowers only what compiler/reach.fd finds reachable (FID_LOWER_ALL=1:
+# everything; the C path and `run` always lower everything).
 python3 scripts/enc-oracle.py --fid release/fid.exe   # encoders vs clang's assembler
 .\release\fid.exe test-rules                          # rewrite rules on values
 bash scripts/rules-smt.sh release/fid.exe              # rules proved by z3 (pip install z3-solver)
@@ -135,6 +147,11 @@ FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 
 # Run lint checks (unused functions, unused imports; fid also unwrap() outside tests)
 ./target/release/fidesc lint <file.fd>
+.\release\fid.exe lint <file.fd> --perf      # + quadratic patterns in loops (CP9)
+
+# Explain what the optimizer did (CP3) and where a function allocates (CP2)
+.\release\fid.exe explain <file.fd> [<name-substring>]   # checks removed vs kept, and why
+.\release\fid.exe explain <file.fd> --alloc [<name>]     # allocation sites + why heap
 
 # Self-hosted only: unsafe code a program reaches, leaks, use after free
 .\release\fid.exe audit <file.fd> [--stdlib] [--strict]
@@ -153,7 +170,8 @@ FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 # Parse a C header and generate Fides FFI bindings
 ./target/release/fidesc parse-header <header.h>
 
-# Debug a Fides program (interactive debugger)
+# Debug a Fides program (interactive debugger; fidesc only: fid has no
+# debug/replay/autopsy command, compiler/debugger.fd is not wired)
 ./target/release/fidesc debug <file.fd>
 
 # Replay a recorded execution trace
@@ -184,25 +202,40 @@ FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 # Manual trigger: gh workflow run build-installer.yml -f version=1.0.0
 ```
 
-## Current Baseline (Nov 6 2026; full suite last run Nov 2)
+## Current Baseline (Nov 9 2026; full suite last run Nov 2)
 
-> Project-wide numbers live in `CURRENT.md` → "Numbers"; keep the two in step.
+> Project-wide numbers are kept in docs/reference/selfhost.md → "Numbers"
+> (CURRENT.md was removed on Nov 8); keep the two in step.
 
 ```
 SELF-HOSTED COMPILER (primary source):
-  compiler/*.fd:  63 modules, 142,378 lines — THE COMPILER
+  compiler/*.fd:  68 modules, 158,516 lines — THE COMPILER. 60 are reached
+                  from main.fd; 8 are imported by nothing that main.fd
+                  reaches (autograd, debugger, diag, embedded, flat_ast,
+                  hotreload, native_debugger, runtime)
   Fixpoint:       VERIFIED byte-for-byte (stage2 == stage3, 49 MB of C,
-                  Nov 6; checked by every RELEASE=1 bootstrap)
+                  Nov 6; again Nov 8 with ownership 0004, 67 MB of C, in a
+                  3-stage rebuild from a source snapshot).
+                  Changes since Nov 8 (LF13/LF15/LF17, the machine layer's
+                  newer passes) are checked on a one-stage build only.
   Bootstrap:      5 generations verified (Rust → c1 → c2 → c3 → c4 → c5)
-  Binary:         release/fid.exe (RELEASE=1 scripts/bootstrap.sh):
-                  fixpoint. Shipped as fid.exe. The Nov 4–6 compiler was
-                  checked on the new and key tests on all 3 backends; the
-                  full suite has not been rerun with it.
-  Self-compile:   `dump-c compiler/main.fd` ~133 s (Nov 6: type check 59 s),
-                  fidesc 21 s. The compiler is built at -O0 (bootstrap.sh).
+  Binary:         release/fid.exe, shipped as fid.exe. The Nov 4–9
+                  compilers were checked on the new and key tests; the full
+                  suite has not been rerun with fid as the compiler.
+  Self-compile:   `dump-c compiler/main.fd`, Nov 9: 74 s with the compiler
+                  built at -O2 (8 split units; type check 18 s, borrow
+                  check 5, mono 5, lowering 24, C 20), 229 s at -O0
+                  (competitive-roadmap CS4). `check compiler/main.fd --time`
+                  (fid31, -O0): 137 s, of which comptime substitution 43 s,
+                  imports 29 s, type check 26 s. Several fid processes at
+                  once (other sessions' builds) can make a stage 10-200x
+                  slower: time on a quiet machine. scripts/bootstrap.sh splits
+                  each stage's C into 8 units at -O2 when the previous stage
+                  has `fid split-c` (SPLIT=n units, JOBS=n at a time;
+                  SPLIT=1 or tcc: one unit at -O0).
 
 RUST BOOTSTRAP (reference + test harness):
-  src/*.rs:       57 files, 112,511 lines — bootstrap reference (frozen)
+  src/*.rs:       57 files, 112,598 lines — bootstrap reference (frozen)
   Used when:      compiler/*.fd changes (builds stage 1); runs `fidesc test`
   Suite (Nov 2):  interp 339/339, C 343/343, PE 345/345, expected-fail 89/89
                   (saved baseline: an earlier run, 334/338/341)
@@ -216,16 +249,32 @@ WINDOWS INSTALLER (v1.0.0):
                  Rust compiler, stdlib/ and examples/ beside them
 
 TESTS:
-  tests/bootstrap/: 452 .fd at top level (91 expected-fail), 493 with
+  tests/bootstrap/: 502 .fd at top level (105 expected-fail), 543 with
                     capability/, effects/, regions/, safety/, diagnostics/
   tests/selfhost/:  51 .fd files (verify-selfhost.sh; baseline saved 36/47×3)
+  tests/leaks/:     3 programs + .expected (scripts/leak-check.sh)
+  tests/conformance/: 104 .fd, each checking a rule of a section of
+                    docs/reference/reference.md (`//! error:` = rejected)
   Baseline:         tests/bootstrap/baseline/test_results.txt
 
 STDLIB:
-  stdlib/*.fd:    137 modules, 43,576 lines (+ 4 in stdlib/pe_runtime/;
-                  kernel/uefi moved to the fides-os project)
+  stdlib/*.fd:    146 modules, 51,496 lines; runtimes: stdlib/pe_runtime/
+                  (4 files, 5,688 lines: native Windows, pe_ir) and
+                  stdlib/linux_runtime/ (5 files, 5,627 lines: nat_ir's
+                  Linux targets and --nat Windows). kernel/uefi moved to the
+                  fides-os project
 
 RECENT IMPROVEMENTS:
+  Nov 7–9:        machine layer (nat_ir/nat_enc): one MIR and allocator for
+                  Linux AArch64/RISC-V/x86-64 and opt-in `--nat` Windows;
+                  mid-end: iropt passes, iropt_me (opt-in), rules (z3-proved),
+                  e-graph, irverify; ownership 0004 layouts (counted strings
+                  and Boxes, inline structs in Vec, 40-byte Vec header,
+                  HM_HASHED); LF12/13/15/17/19/25; `Vec::filled`; split C at
+                  -O2 (csplit.fd, self-compile 74 s); pe_ir task switching
+                  and IOCP sockets; tests/conformance and docs/verification.
+                  Nov 9: every compiler module re-audited
+                  (docs/file-analysis/, open bugs: known-bugs.md §2g).
   Nov 4–6:        fid: generics (0002), if/match values, @cfg, freeing of
                   provably finished locals (C5–C8), K4/K5 borrow checks, K7
                   effects, @send on spawn args (H4), parallel branches (H7),
@@ -300,8 +349,11 @@ RECENT IMPROVEMENTS:
   Rc/Arc:         stdlib/rc.fd — reference counting (rc_new, rc_clone, rc_drop, etc.)
   @repr(C):       C-compatible struct layout for hardware/FFI/kernel
   Kernel:         stdlib/kernel.fd — MOVED to the fides-os project (Oct 24)
-  @cpu_local:     Per-CPU variables via GS segment (compiler/pe.fd)
-  Inline asm:     Clobber lists, 50+ x86 instructions encoded (compiler/pe.fd)
+  @cpu_local:     Per-CPU variables via GS segment (compiler/pe.fd; nothing
+                  generates it any more: pe.fd's tables are never filled)
+  Inline asm:     Clobber lists, 50+ x86 instructions encoded (now
+                  pe_ir_stubs `pe_asm_encode`, bare builds only; a Windows
+                  build gives 0 for `asm!`)
   --no-std:       Bare-metal mode skips stdlib/core.fd (compiler/compiler.fd)
   UEFI:           stdlib/uefi.fd — MOVED to the fides-os project (Oct 24)
   Cross-comp:     --target arm64/riscv64 validation with C codegen fallback
@@ -316,7 +368,7 @@ Binaries:     4 (fidesc, ark, scribe, veil) + the self-hosted fid
   build in their scratch folder (`CARGO_TARGET_DIR`), not in the repository.
 - `release/` — Self-hosted compiler output: `fid.exe` (from the release
   bootstrap, or a single stage with `fid.c` from build-selfhost.sh) — gitignored
-- `compiler/` — Self-hosted compiler source (54 `.fd` modules) — THE PRIMARY COMPILER
+- `compiler/` — Self-hosted compiler source (68 `.fd` modules) — THE PRIMARY COMPILER
 
 **Changelog:** See `docs/reference/changelog.md` for the full history of
 features and fixes. (Previously duplicated here — removed to avoid maintaining
@@ -336,7 +388,10 @@ touching them.
 | `src/peephole.rs` | **CRITICAL** | 9 passes, always on in `build`. A wrong transform silently corrupts all output. |
 | `src/elf64.rs` | **HIGH** | ELF64 header bytes, section layout, relocations (R_X86_64_PC32/PLT32/64). Off-by-one = corrupt binary. Self-hosted port in `compiler/elf64.fd` (2,423 LOC, 85% parity) includes full x86-64 instruction encoder, assembly parser, and ELF builder. |
 | `src/pe.rs` | **HIGH** | PE header bytes, import table (kernel32.dll + msvcrt.dll: every name in `IMPORTS`/`MSVCRT_IMPORTS` must be a real export, or no program starts), section layout. Off-by-one = corrupt .exe. Machine-code stubs must not keep a value in a volatile register (rcx, rdx, r8–r11) across a call (HeapFree clobbers them). |
-| `stdlib/pe_runtime/*.fd` | **MEDIUM** | The Fides runtime of native Windows executables: builtin `p_X` runs `pert_X` (base, conc, tensor, data). Merged into every `emit`: a type error here breaks every PE build. C functions via `extern "C"` thunks; helpers prefixed `pe_`/`pet_`/`ped_` (unused ones are left out of the .exe). |
+| `stdlib/linux_runtime/*.fd` | **MEDIUM** | The runtime of the machine layer (compiler/nat_ir.fd): Linux system calls (base, conc, math, sys) and `win.fd` for `--nat` Windows over kernel32/ws2_32. Merged into every nat_ir build. |
+| `compiler/nat_ir.fd`, `compiler/nat_enc.fd` | **HIGH** | Machine IR, register allocator and encoders of the Linux targets and `--nat`. Checks: `FID_VERIFY=1`, `scripts/enc-oracle.py`, `scripts/pass-matrix.sh`. |
+| `compiler/pe_ir*.fd` | **HIGH** | Default Windows native backend: machine code, imports, PE writer. Same byte-level risk as `src/pe.rs`. |
+| `stdlib/pe_runtime/*.fd` | **MEDIUM** | The Fides runtime of native Windows executables (pe_ir): builtin `p_X` and `__X` run `pert_X` (base, conc, tensor, data); `pert_c_<C name>` overrides a C function. Merged into the Windows `emit`/`build` (also `build --native --target windows`), not into `--bare`, `--elf`, `--boot` or C; `data.fd` and `tensor.fd` are also merged into every nat_ir build (Linux targets, `--nat`). A type error here breaks those builds. `p_vec_*` never reaches `pert_*`: `pe_runtime_alias` sends it to core first. Helpers prefixed `pe_`/`pet_`/`ped_` (unused ones are left out of the .exe). |
 | `src/coff.rs` | **HIGH** | COFF object file format. Same byte-level risk as PE/ELF. |
 | `src/macho.rs` | **HIGH** | Mach-O object file format. Same byte-level risk. |
 | `src/codegen_x64.rs` | **HIGH** | PIR L3 → x86-64 instruction encoding. ModRM/SIB bytes, REX prefixes, ABI rules. |
@@ -349,7 +404,7 @@ touching them.
 | `src/comptime.rs` | **LOW** | Comptime evaluation engine. Evaluates `comptime <expr>`, `comptime { block }`, `comptime reflect_op(T)`, `comptime gen { block }` at compile time. I-5A: Aggressive comptime evaluation — auto-evaluates calls to `comptime fn` functions with all-literal args (no explicit `comptime` wrapper needed). I-5D: Comptime loop unrolling — unrolls `for` loops with literal bounds (≤16 iterations, ≤16 body stmts) at AST level. Also eliminates dead `if` branches with literal conditions. |
 | `src/runtime_linux.rs` | **HIGH** | Hand-encoded x86-64 machine code (raw bytes). No assembler — every byte is manual. |
 | `src/linker.rs` | **MEDIUM** | Relocation resolution. Wrong offset = crash or silent corruption. |
-| `src/interp.rs` | **MEDIUM** | The reference oracle (~6060 LOC). If this is wrong, all backends "match" but produce wrong results. `p_vec_new` uses `vec_side_table` to separate raw struct fields from `Value::Vec`. `run_function` auto-detects missing `__env` param and inserts dummy. Self-hosted port in `compiler/interp.fd` (~7,200 lines) runs every test program `fidesc run` does. |
+| `src/interp.rs` | **MEDIUM** | The reference oracle (~6060 LOC). If this is wrong, all backends "match" but produce wrong results. `p_vec_new` uses `vec_side_table` to separate raw struct fields from `Value::Vec`. `run_function` auto-detects missing `__env` param and inserts dummy. Self-hosted port in `compiler/interp.fd` (7,456 lines, Nov 9) ran every test program `fidesc run` did (Oct 27); it cannot run FFI other than a few libc calls, `sysconf`, interleaving tasks or blocking channel receives. |
 
 ## LOWER-RISK FILES
 
@@ -365,7 +420,7 @@ touching them.
 | `src/compiler.rs` | LOW | Pipeline orchestration — changes are visible. Phase 12: `enrich_errors()` post-processes errors with source context + error codes. |
 | `src/diag.rs` | LOW | Diagnostic system — structured error/warning/note/help with error codes, source context, color. Zero external deps. |
 | `src/lsp.rs` | LOW | LSP server — JSON-RPC over stdio, no external deps. |
-| `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. 137 stdlib modules, among them: alloc, animation2d, arena, args, arinc, asset, audio, audio_mixer, banking, bitfield, bits, buffer, camera, can, channel, chunk, clinical, collections, collision_broad, core, crypto, data, db, dp, ecs, ecu, editor, env, events, file, flowfield, fmt, font, fs, game, gameloop, gl, grid, hash, http, image, input, io, iter, json, kv_cache, math, medical, memo, mesh, money, navmesh, net, os, ota, parallel, particles, path, physics, physics3d, plot, privacy, process, profiler, quant, queue, random, raycast, rc, regex, replay, result, scada, scene, sdl, serialize, shader, shape, shard, simd, skel, sort, sprite, sqlite, stack, storage, streaming, string, swift, sync, sys, template, tensor, terrain, test, tilemap, time, touch, typed_strings, ui, units, uuid, vec, volatile. (kernel.fd + uefi.fd moved to the fides-os project.) |
+| `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. 146 stdlib modules: alloc, animation2d, arena, args, arinc, asset, async, atomic, audio, audio_mixer, banking, bigint, bitfield, bits, bitset, brotli, brotli_dict, buffer, camera, can, channel, chunk, clinical, collections, collision_broad, compress, config, core, crypto, csv, data, datetime, db, decimal, diff, dns, dp, ecs, ecu, editor, encoding, env, events, file, flowfield, fmt, font, fs, game, gameloop, gl, grid, hash, http, http_client, https, image, ini, input, io, iter, json, kv_cache, log, markdown, math, medical, memo, mesh, metrics, mime, mmap, money, navmesh, net, os, ota, parallel, particles, path, physics, physics3d, plot, privacy, process, profiler, protobuf, quant, queue, random, raycast, rc, regex, replay, result, scada, scene, sdl, sdl2_h, semver, serialize, set, shader, shape, shard, signal, simd, skel, sort, sprite, sqlite, sqlite3_h, stack, storage, streaming, string, swift, sync, sys, task, template, tensor, term, terrain, test, tilemap, time, tls_crypto, tls_unix, tls_windows, toml, touch, typed_strings, tz, ui, unicode, units, url, uuid, vec, volatile, ws, wss, xml, yaml, zstd; runtimes in `stdlib/pe_runtime/` and `stdlib/linux_runtime/`. (kernel.fd + uefi.fd moved to the fides-os project.) |
 
 ## Known Bugs (Do Not Re-Introduce)
 
@@ -386,9 +441,13 @@ touching them.
    tests are rejected. The rest:
    - `test_sqlite` needs libsqlite3 and `examples/minimal_game` needs SDL2
      (the Rust compiler fails the same way without them).
-   - `build --native` (compiler/pe.fd via PIR) still crashes (optimizer
-     `pass_dse`, register allocation); `fid emit` (compiler/pe_ir*.fd) is the
-     working native path.
+   - `build --native` with the default target (`x86-64`) goes to the old PIR
+     path (compiler.fd `build_executable`: opt, codegen_x64, elf64, linker)
+     and crashes in opt.fd `pass_jump_thread` (Vec index out of bounds); with
+     `--no-opt` it fails at link. `--native --target arm64|riscv64|x64` goes
+     to nat_ir. `fid emit` (pe_ir on Windows, nat_ir for Linux targets) is
+     the working native path; compiler/pe.fd is reached only by `emit --boot`,
+     which panics.
    Fixed Oct 25–27 (docs/reference/known-bugs.md §2e): block jumps ended
    functions, byte loads read side-table strings, builtins shadowed core
    functions, the comptime loop unroller, String/HashMap result types,
@@ -434,7 +493,8 @@ touching them.
 6. **Session-16 regression — bare runtime stubs**: the `p_hlt`/`p_cli`/
    `p_sti`/`p_inb`/`p_outb`/`p_serial_*` stubs lost in the
    `git checkout -- compiler/pe.fd` incident (known-bugs.md §1.37) were
-   re-added; verify `emit --bare` still emits them before touching pe.fd.
+   re-added. `emit --bare` now builds through pe_ir_stubs
+   (`PeirGen_gen_bare_runtime`), not pe.fd: check the bare stubs there.
 
 7. **Register allocator clobbering** (`regalloc.rs`): Previously, constants not
    loaded into registers before use could be clobbered by intervening
@@ -507,8 +567,10 @@ touching them.
    (main.rs, main.fd, bootstrap.sh, build-selfhost.sh add it).
 
 16. **One `Vec` implementation** (`pe_runtime_alias`, `pe_ir_stubs.fd`,
-   `interp.rs core_vec_fn`): every `p_vec_*` builtin runs core's `Vec_*`
-   function. Do not add a backend stub with its own semantics; the old ones
+   moving to ir.fd on Nov 9; `interp.rs core_vec_fn`): every native
+   `p_vec_*` builtin (pe_ir and nat_ir) runs core's `Vec_*` function.
+   compiler/interp.fd keeps its own `p_vec_*` over simulated memory, and
+   pe_ir still emits its old machine `p_vec_*` stubs (unused). Do not add a backend stub with its own semantics; the old ones
    disagreed (`clone` shared data, `first` returned garbage). The C runtime's
    `PVec` functions share core's layout and must keep doing so.
    `test_vec_builtins.fd` checks every backend agrees.
@@ -593,6 +655,14 @@ touching them.
    snapshot of `compiler/`, `stdlib/` and `scripts/` when files change
    during a build, or the stage-3 C differs only because a file changed
    between the stages.
+
+27. **The Nov 9 module audit** (docs/file-analysis/<module>.md for all 68
+   modules, docs/reference/known-bugs.md §2g for the open bugs). Two reach
+   the shipped compiler: csplit.fd `cs_strip_static` removes `static` from
+   function locals of the split C (`p_process_run`, `p_net_connect`), and
+   iropt's SCCP folds narrow integer types with 64-bit arithmetic (a lost
+   overflow panic). `fid veil`, `fid lsp` symbol requests and `fid fmt` are
+   broken (2g.2, 2g.5, 2g.6).
 
 ## NEVER DO THESE (Hard Rules)
 
@@ -713,6 +783,11 @@ If you need to see the original state of a file, use `git show HEAD:<path>`
 or `git diff <path>` — these are read-only and safe.
 
 ## File Map (Quick Reference)
+
+The self-hosted compiler's modules, grouped by stage with line counts and
+state, are in INDEX.md ("Self-Hosted Compiler") and
+docs/reference/architecture.md ("Self-hosted pipeline"). The table below is
+the frozen Rust compiler.
 
 | File | Role |
 |------|------|

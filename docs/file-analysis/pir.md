@@ -1,55 +1,67 @@
 # pir.fd — PIR L1/L2/L3 transforms
 
-> > **FIXED 2026-10-23 (v2):** `StructCopy` at :1125 now lowers to `L1Inst::Store(dst, src, OptIrType::Some(ty), {write})` matching src/pir.rs:801 (was `skip→ConstInt(0)`). `codegen_x64::gen_store` already handles struct stores via `gen_struct_copy`. `is_pure` now sees Write effects from the ir.fd fix. `borrow_kinds` still unconsumed (opt.md).
+> **Re-audited 2026-11-09.** StructCopy fixed (Oct 23/24). PIR is no longer on any default build
+> path; it backs `pir`, `opt`, `codegen`, `gpu`, `emit --boot` and `build --native` (default
+> target only).
 
-> *Superseded re-verify:* confirmed — StructCopy still dropped at L1 (:1125 → `ConstInt(0)`), `is_pure` propagation still carries the missing-effects bug into the optimizer. `borrow_kinds` still populated but consumed nowhere (compounds opt.md).
-
-- **Path:** `compiler/pir.fd` — **2,719 LOC** (Rust `src/pir.rs` = 2,262, ~120%)
-- **Role:** the three-stage PIR lowering — `lower_ir_to_l1` (region/effect/capability annotation), `lower_l1_to_l2` (region resolution + drop), `lower_l2_to_l3` (vreg assignment, stack-frame/slot layout, materialization) — plus `generate_pir` pretty-printers for `pir`/`dump-pir`.
+- **Path:** `compiler/pir.fd` — **2,704 LOC** (Rust `src/pir.rs` = 2,262)
+- **Role:** `lower_ir_to_l1` (:964), `lower_l1_to_l2` (:1284), `lower_l2_to_l3` (:1504), plus
+  `format_l1/l2/l3` printers.
 
 ## Where it is called
 
-| Caller | Site | Mechanism |
+| Caller | Site | Command |
 |---|---|---|
-| `compiler.fd` | :1669-1678 | `lower_ir_to_l1` → `lower_l1_to_l2` → (opt) → `lower_l2_to_l3` — every `build` path |
-| `main.fd` | :450-514, :1760s | `pir`/`dump-pir`/`ir` diagnostics |
+| `main.fd` `cmd_pir` | :557-583 | `fid pir` / `dump-pir` (L1, L2, L3, all) |
+| `main.fd` `cmd_opt` | :620 | `fid opt` |
+| `main.fd` `cmd_codegen` | :2225 | `fid codegen` (x86-64, arm64, riscv asm; ELF/COFF/Mach-O objects) |
+| `main.fd` `cmd_gpu` | :2326 | `fid gpu` (SPIR-V / PTX from L3) |
+| `main.fd` `cmd_build --boot` | :2887 | multiboot2 kernel via `pe.fd generate_boot_binary` |
+| `compiler.fd` `build_executable` | :2143-2152 | `build --native` (default target x86-64, or `windows`) |
 
-Live on every compiled build; `generate_pir` backs the diagnostic dumps.
-
-## Verified faithful (code inspection)
-
-- All three lowerings are structurally 1:1 — inst-for-inst mapping tables, same erasures: `ConstFnRef`→`ConstStr` (:1057/Rust:761), `PersistLoad`→`Copy(default)` (:1111/:893), `PersistSave`→`Copy(0,I64)` (:1114/:897).
-- Metadata harvest + propagation complete: `sandbox_values`, `linear_values`, `borrow_kinds`, `gas_limit`, `is_*` flags all collected from `ValueMeta` (:1160-1190) and carried through `L1Function`/`L2Function` field-for-field (:1226-1235, :1457-1469). The pipeline *would* deliver them — run-30's lower-side gap and run-36's opt-side gap are the actual breaks.
-- `lower_l2_inst_to_l3` covers every `L2Inst` arm including `Copy` (:1971), `TryUnwrap`, `Print`, `Panic`, all casts — `S-17` parity.
-- `FieldAddr` uses real struct layout when the base resolves to a named struct (:1914-1929) — not blind `index*8`.
-- `materialize_slot`/`AddrOfSlot`/`StackAlloc` fallback chain correct; vregs sorted for deterministic slot assignment (S-17 determinism).
+Importers: codegen_arm64, codegen_riscv, codegen_x64, compiler, elf64, gpu, main, opt, pe,
+regalloc. Default `build`/`emit` (pe_ir on Windows, C on posix) and the nat_ir targets do not
+use it.
 
 ## Findings
 
-### MEDIUM — `StructCopy` silently dropped at L1 *(port regression, currently latent)*
+### Verified live
 
-pir.fd:1125 — `Inst::StructCopy` → `skip = true` + `L1Inst::ConstInt(0, I64)` placeholder. Rust :801 lowers it to a real `L1Inst::Store` (a typed memcpy with Write effect).
+- `s18.exe pir hello.fd 3` and `codegen hello.fd --peephole` work (L3 printed, 34,558 asm lines).
+- `emit --boot` on a 3-line program panics in `pe.fd` (`PeCodeGen_iat_off` ←
+  `PeCodeGen_gen_print_int`), after PIR lowering: not this file.
 
-Latent today because `lower.fd` **never emits** `StructCopy` (zero sites — it uses `Inst::Store(ptr, val, Some(Struct))` at :5007 instead). But if any path ever produces it, the copy evaporates: no code, no effect, no ref. Third leg of the StructCopy hole (ir.fd: no effects arm + no refs arm; here: no lowering).
+### Code inspection
 
-### MEDIUM — `is_pure` inherits the effects hole *(propagation of run-26)*
+#### StructCopy dropped at L1 — FIXED
 
-`L2Function.is_pure = EffectSet_is_pure(&f.effects)` (:1457) — and `func_effects` folds `inst_effects`, which omits `StructCopy` (run 26). Any struct-memcpy-only function produced downstream would be marked pure → DCE strips it. Latent for the same reason as above, but it's the *propagation point* — the ir.fd metadata gap becomes an optimizer-visible wrongness here.
+pir.fd:1125-1129 lowers `StructCopy(dst, src, ty)` to `L1Inst::Store(dst, src, Some(ty), {write})`.
+ir.fd now has effects (:1163) and refs (:1256) arms for it.
 
-### Inherited — `ConstStr` name-collision → `ImmFunc`
+#### `is_pure` inherits the effects hole — FIXED (upstream)
 
-`lower_l2_inst_to_l3` (:1866-1870): a `ConstStr` whose text equals a function name emits `Operand::ImmFunc` instead of `ImmStr`. So `var s = "main"` while `fn main` exists → the "string" is actually a function address. Same heuristic in Rust (:1460) — shared latent bug, only safe because `ConstFnRef`→`ConstStr` sites are the intended producers and user literals rarely collide with fn names.
+`is_pure: EffectSet_is_pure(&f.effects)` (:1461) is unchanged, but `inst_effects` now gives
+StructCopy a Write effect (ir.fd:1163), so the propagation no longer marks a copy-only function pure.
 
-### Inherited — block params carried but never bound
+#### LOW (inherited) — `ConstStr` equal to a function name becomes `ImmFunc` — STILL TRUE
 
-`params: b.params` at :1201/:1445/:1797 — params get typed `VReg`s at :1684-1791, but no predecessor ever moves values into them (`Jump`/`Branch` carry no args at any level — IR, L1, L2, or L3). Matches Rust exactly — a shared design gap: phi-less SSA where block params are declared, typed, and never bound. Consistent with run-30's interp-side finding (Void-prefilled reads).
+:1859-1862. A string literal that spells a function name becomes that function's address.
+
+#### INFO (inherited) — block params carried but never bound — STILL TRUE
+
+`params: b.params` (:1205, :1449); Jump/Branch carry no arguments at any level.
+
+#### INFO — metadata
+
+`borrow_kinds` collected from `ValueMeta` (:1181-1188). The lowering now sets them on parameters
+(lower.fd:4129); opt.fd still does not read them (opt.md).
 
 ## Fix order
 
-1. Lower `StructCopy` to a `Store` (or keep `skip` but emit the `Store` explicitly) — 5 lines; makes the variant safe if produced.
-2. Fix `inst_effects`/`inst_value_refs` in ir.fd — the actual upstream break feeding the `is_pure` wrongness.
-3. (Feature decision) whether `Jump`/`Branch` should gain arg lists to make block params real — matches Rust, so parity argues to leave it.
+1. None needed for correctness here; whether to keep PIR at all is the question (no default path
+   uses it).
 
 ## Verification state
 
-- No live runs — three lowering functions audited arm-by-arm against `src/pir.rs` (inst tables, erasure arms, metadata propagation lists); the `ConstFnRef`/`Persist*`/`StructCopy` erasures compared literally; param-vreg handling traced through L2→L3.
+- Re-checked by grep and reading the cited lines; StructCopy fix confirmed in the source; live
+  `pir`/`codegen` runs with s18.

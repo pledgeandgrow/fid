@@ -1,119 +1,96 @@
-# elf64.fd — ELF64 assembler + object writer (2,693 LOC)
+# elf64.fd — AT&T x86-64 assembler and ELF64 object writer
 
-> > **FIXED 2026-10-23 (v2):** (a) `offset*256+base` decode → `floor_div`/`floor_mod` at all 68 sites; wrong `off+=256` pseudo-fix removed. (b) `movapd`/`movupd`/`movaps`/`movups` + `jo`(0x80)/`jno`(0x81) + `addpd`-`xorpd` encoders wired. (c) `.rela.rodata` emitted as sec 7 + header (was collected, never emitted); `.rela.text` `sh_link`/`sh_info` un-swapped (1/3→3/1). `encode_asm_block` IS called now (runtime_linux:2858).
+Re-audited 2026-11-09 (previous audit 2026-10-22/23).
 
-> *Superseded re-verify:* all CRITICAL findings confirmed — `offset*256+base` pack + trunc-division decode (:624, ~40 sites incl. the `off+256` pseudo-fix at :857), `.rela.rodata` collected never emitted, `jo`/`movapd` unhandled while codegen_x64 emits `movapd` (:1896/1910). `encode_asm_block` exists (:2477) but runtime_linux never calls it.
+- **Path:** `compiler/elf64.fd`
+- **LOC:** 2,780
+- **Role:** the assembler of the old PIR-era backends: AT&T x86-64 text
+  → machine code, symbols and relocations (`ElfEmitter_assemble`), then an
+  ELF64 relocatable object (`ElfEmitter_build_elf`). Also `encode_asm_block`
+  (runtime_linux's asm part) and `dump_symbols`. Port of `src/elf64.rs`.
+  The new native backend (`nat_ir.fd` / `nat_enc.fd`) does not use it.
 
+## Where it is called
 
-> C1 also fixed 2026-10-23 (v3): hex-immediate parse added via `parse_dollar_imm` — `xorq $0x5DEADBEEFCAFEBABE` canary no longer encodes as `xor $0` (was F4). Applied to encode_alu, encode_cmp, mov imm→mem.
+| Caller | What |
+|--------|------|
+| `compiler.fd` `build_executable` (x86-64) | `emit_object_file(0, asm)` |
+| `compiler.fd` `build_x86_linux` | `emit_object_file(0, asm)` |
+| `main.fd` `cmd_codegen` | `emit_object_file` (`--elf`), `emit_object_file_for_target` (arm64/riscv `--elf`) |
+| `pe.fd` `pe_build` | `ElfEmitter_assemble` (PIR boot / flat / PE images) |
+| `coff.fd`, `macho.fd` | `ElfEmitter_assemble`, then their own writers |
+| `runtime_linux.fd` | `encode_asm_block(runtime_asm)` |
 
-## Role
-
-AT&T-assembly → ELF64 relocatable-object pipeline: mnemonic dispatch,
-instruction encoders (GP + SSE), symbol/rodata tables, `build_elf` byte
-writer, `dump_symbols`. Port of `src/elf64.rs` (2,852 LOC). AGENTS.md
-rates this file HIGH-risk.
-
-## Where it's called
-
-| Caller | Site | What |
-|--------|------|------|
-| `compiler/compiler.fd` | :1644 | `emit_object_file(0, asm)` — the `build` path for x86-64 ELF (asm → peephole → ELF → `link_with_runtime`). The same-named functions in `coff.fd`/`macho.fd` are dead (module-scope resolution picks this one). |
-
-`runtime_linux.fd:2852` still has a TODO to call `encode_asm_block` —
-that entry point exists here (:2477) but is not yet consumed.
+CLI commands that reach it: `fid codegen f.fd [--target x86-64] --elf|--coff|--macho <o>`,
+`fid codegen f.fd --target arm64|riscv --elf <o>`, `fid build-x86`,
+`fid build --native` (default target `x86-64` only), `fid emit --boot`.
 
 ## Findings
 
-### F1 — PORT REGRESSION (CRITICAL): every negative displacement is off by +1
+### Verified live (2026-11-09, `s18.exe`, scratch files)
 
-`try_parse_mem` (`:609-627`) packs `offset * 256 + base` into a single
-i64 where Rust returns a real `(off, base)` tuple (:2512). Callers
-unpack with `packed / 256` / `packed % 256`. Fides `/` truncates toward
-zero — **verified live**: `-2043 / 256 = -7`, `% 256 = -251`.
+1. **HIGH (new) — every section header is 56 bytes, not 64.**
+   `ElfEmitter_build_elf` (:2497-2537) writes name, type, flags, then the
+   offset: `sh_addr` is missing on all headers, the null one included.
+   `e_shentsize` says 64. `codegen p.fd --elf p.o` wrote 465,569 bytes with
+   `e_shoff` 465,121: readelf says the headers run past the end of file,
+   objdump says "file format not recognized". The Rust original writes
+   `sh_addr: 0`. Consequence: `linker.fd` reads 64-byte headers, gets
+   garbage offsets, finds no `.text` or symbols. So:
+   - `fid build-x86` writes a 120-byte executable (header + one empty
+     segment) that segfaults;
+   - `fid build --native --no-opt` fails "Undefined symbols: main"
+     (only the runtime is linked).
+   Fix: emit `emit_u64(&mut buf, 0)` for `sh_addr` after `sh_flags` in
+   all nine header writers.
+2. **MEDIUM (was F6, still true) — arm64 / riscv `--elf` objects are
+   empty.** `emit_object_file_for_target` (:325-350) leaves `.text` empty
+   and stores the asm in `emitter.comment`, which `build_elf` never writes.
+   `codegen --target arm64 --elf` wrote a 603-byte object with no code
+   and no text.
+3. **INFO — the assembler itself encodes correctly enough for COFF.** The
+   same `ElfEmitter` output, written by `coff.fd`, loads in objdump and
+   disassembles `main` correctly (push/mov/sub, canary xor, call relocs).
 
-So `-8(%rbp)` → packed `-2043` → decoded `off = -7`, `base = -251`
-(`base & 7` recovers 5 by luck). `encode_modrm_mem` then emits disp8
-`0xF9` = **-7** — every stack-relative access lands **one byte above
-the intended slot**, overlapping the adjacent slot: `movq -8(%rbp),
-%rax` reads -7..0, `movq` to -16(%rbp) writes -15..-8.
+### Code inspection (old findings re-checked)
 
-Scope: **all** spill loads/stores, locals, stack args, `movapd -N(%rbp)`
-— the most common operand shape in generated code. Same defect in the
-SIB packer (`/4096` trunc, `-16(%rbx,%rcx,8)` → -15). The `off < 0 →
-off + 256` patch at :857 converts to the correct byte pattern only
-because it preserves the wrong value (-7 → 249 = -7 disp8).
+4. **F1 negative displacements — FIXED.** The pack is still
+   `offset * 256 + base` (:640) and `offset * 4096 + ...` (:687), but all
+   decoders use `floor_div` / `floor_mod` (71 uses, :596-604).
+5. **F2 `.rela.rodata` never emitted — FIXED.** Written as section 7
+   (:2466-2476, :2518-2519). `.rela.text` link/info are 3/1.
+6. **F3 unknown instructions → NOP — CHANGED.** `jo`/`jno` (:1042),
+   `movapd`/`movupd` (:1130), `*pd` arithmetic, `ud2` are encoded now. The
+   fallback NOP is still there for anything else (:1194, :1507, :1630,
+   :1770, :2003, :2138) — silent, LOW.
+7. **F4 hex immediates — FIXED** (`parse_dollar_imm`). Note the canary
+   `xorq $0x5DEADBEEFCAFEBABE` is encoded as imm32 `0xCAFEBABE`
+   sign-extended (x86 has no xor imm64); prologue and epilogue agree, so it
+   works as a weaker canary (INFO).
+8. **F5 custom-section names after shstrtab is written — STILL TRUE,
+   wider.** The `.shstrtab` bytes are copied at :2451, then
+   `ElfEmitter_add_shstrtab` is called for every header name (:2499-2524).
+   Built-in names are pre-seeded in `ElfEmitter_new`, so only custom
+   sections get offsets past the table. No caller adds custom sections.
+9. **LOW — `encode_asm_block` hides assembler errors** (:2564-2570): an
+   `Err` returns empty bytes, so runtime_linux links without its asm part.
+10. **F6 rest:** `.align`/`.section`/`.globl`/`.type` ignored — not
+    re-checked. `encode_jcc` local-label assumption — not re-checked.
 
-Fix: pack `offset` and `base` in separate fields/struct, or decode with
-floor semantics (`off = (packed - base_guess)/256` won't help — the
-pack is lossy at the boundary). Cleanest: return `MemInfo`/`MemInfoSib`
-structs — they already exist (:596-606) but are unused.
+## Fix order
 
-### F2 — PORT REGRESSION (HIGH): `.rela.rodata` collected but never emitted
-
-`handle_directive` records `.quad <symbol>` into `rodata_relocations`
-(:447, :469), and `.rela.rodata` is even pre-seeded in shstrtab (:178) —
-but `build_elf` writes **only `.rela.text`** (:2380-2392). Rust emits
-the full `.rela.rodata` section (src:2060-2068).
-
-Impact: vtables emit `.quad method` → 8 zero bytes + a reloc that never
-reaches the file → **every vtable entry is 0 → every trait-object call
-on the ELF path jumps to address 0**. `linker.fd:596-597` explicitly
-looks for `.rela.rodata` and never finds it.
-
-### F3 — Unknown/unhandled instructions → `0x90` NOP (inherited, live)
-
-Six sites emit nop on unhandled forms: the dispatch fallthrough (:1142)
-plus `encode_mov` (:1443), `encode_alu` (:1566), `encode_cmp` (:1706),
-`encode_lea` (:1939), `encode_setcc` (:2066). codegen_x64 emits
-**`jo`** (overflow trap after every non-wrapping `addq`/`subq`/`imulq`
-— codegen_x64.fd:904/910/918), **`movapd`/`movupd`** (XMM spills
-:1896/1910, SIMD :1842/1849), and **`addpd/subpd/mulpd/divpd`** — none
-are in the dispatch table. On the ELF path these become 1-byte NOPs:
-**integer-overflow checks silently deleted; packed-float ops and
-unaligned XMM spills silently dropped** (leaving garbage in xmm0).
-Rust has the identical fallthrough (src:867) — inherited, but the
-missing mnemonics make it a live hole.
-
-### F4 — `xorq $imm64` stack canary → `xor $0` (inherited, live)
-
-`encode_alu` parses immediates with `str_parse_int` only (:1496) —
-no hex path (unlike `encode_mov` :1197). The canary
-`xorq $0x5DEADBEEFCAFEBABE, %rax` (run 10) parses to 0 → imm8 form
-`83 F? 00` → **canary compare becomes `xor rax, 0`** — never detects
-smashing, silently.
-
-### F5 — Custom-section names emitted after shstrtab is frozen (latent)
-
-`build_elf` copies `self.shstrtab` into the file at :2378, then adds
-custom-section names at :2437 — names land in the table after its bytes
-were already written → custom sections (.data/.bss for kernel work)
-get `sh_name` offsets past the emitted table → nameless/garbage-named
-sections. No current caller of `add_custom_section` — latent.
-
-### F6 — Additional gaps
-
-- `.align`/`.section`/`.globl`/`.type`/`.size` all ignored (:473) —
-  no alignment enforcement anywhere.
-- `emit_object_file_for_target` arm64/riscv (:329-345) produces a
-  structurally-valid ELF with **empty .text** and the raw asm text in
-  `.comment` — silent non-functional object. Dead path today
-  (compiler.fd only calls for x86-64).
-- `encode_jcc` (:1835) unconditionally makes targets local labels —
-  a `jcc non_dot_L` would create a shadowing STB_LOCAL undef symbol.
-  All current jcc targets are `.L*` — latent.
+1. Add `sh_addr` to every section header (1). This alone may revive
+   `build-x86`, `build --native` and `codegen --elf`; then test them end to
+   end in WSL.
+2. Either encode arm64/riscv through `arm64_enc`/`riscv_enc` or make
+   `--elf` for those targets an error (2).
+3. Turn the NOP fallbacks and `encode_asm_block` errors into errors (6, 9).
 
 ## Verification state
 
-- F1 verified live: Fides `-2043 / 256` → `-7` under fidesc interp;
-  every negative-disp consumer confirmed by reading the unpack sites.
-- F2 verified by absence: `rodata_relocations` has exactly two push
-  sites and zero readers in `build_elf`; Rust counterpart emits it.
-- F3/F4 verified against codegen_x64's emission vocabulary — `jo`,
-  `movapd`, `movupd`, `*pd` arithmetic all absent from the dispatch.
-- Can't be exercised end-to-end without running the self-hosted
-  compiler; findings are from source + interp semantics.
-
-## Next
-
-`embedded.fd`.
+- Probes: `s18.exe codegen p2.fd --elf` → readelf/objdump in WSL;
+  `build-x86` output run in WSL (segfault, 120 bytes); `build --native
+  --no-opt` → "Undefined symbols: main"; `codegen --target arm64 --elf`
+  → 603-byte object.
+- Read: emitter structs, `emit_object_file*`, memory-operand parsers,
+  dispatch samples, `build_elf` in full, `encode_asm_block`.

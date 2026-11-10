@@ -1,61 +1,64 @@
-# runtime.fd — Fides-authored runtime layer (NEW, 531 LOC)
+# runtime.fd — Fides-authored runtime scaffold (superseded)
 
-> **Created 2026-10-23** as the consolidation target for the three
-> hand-written runtimes (runtime_linux 4,370 LOC / runtime_arm64 794 /
-> runtime_riscv 825 — each builtin encoded 3× in raw bytes/text-asm).
-> Implements builtin *logic* once in Fides; per-arch keeps only a thin
-> asm stub layer.
+- **Path:** `compiler/runtime.fd` — module `compiler::runtime`
+- **LOC:** 546 (2026-11-09).
+- **Role (intended):** the `p_*` builtins of native binaries written once in
+  Fides over a small `rt_sys_*` per-arch ABI (`extern "C"` block :76-87):
+  a first-fit allocator over `rt_sys_mmap`, memset/memcpy, C-string
+  helpers, print/panic/exit, file read/write/append/exists, argv/getenv,
+  clocks.
+- **Status:** DEAD and does **not type-check**. Superseded by
+  `stdlib/linux_runtime/*.fd` (native Linux and `--nat` Windows, built on
+  `nat_syscall` and friends) and `stdlib/pe_runtime/*.fd` (Windows `emit`).
+- **Re-audited:** 2026-11-09.
 
-- **Path:** `compiler/runtime.fd` — **module `compiler::runtime`**
-- **Status:** scaffold — typechecks clean under `fidesc run`; NOT yet
-  wired into any build path.
+## Where it is called
 
-## Architecture
+**Nowhere.** No `use compiler::runtime` (grep 2026-11-09 over `compiler/`,
+`stdlib/`, `tests/`, `scripts/`). Nothing provides `rt_sys_*` either: no
+backend emits those symbols. Not reachable from main.fd.
 
-```
-user code → core.fd (Vec/String/Map — already Fides over p_malloc)
-         → p_* builtins = THIS FILE (Fides logic, unsafe ptr ops)
-         → rt_sys_* ABI boundary → per-arch asm stubs (~150 LOC each)
-```
+Imports: `core`, `vec`, `string`.
 
-`rt_sys_*` extern block declares the full per-arch contract: write/read/
-open/close/mmap/exit/argc/argv/getenv/clock_ns, plus deferred ctx-switch
-and atomic ops (documented in file header with per-arch syscall numbers
-and register conventions for x86-64/aarch64/riscv64 Linux + Win64 notes).
+## Findings
 
-## What it implements
+### Verified live
 
-- `p_malloc`/`p_free`/`p_alloc` — first-fit free-list allocator over
-  `rt_sys_mmap` (24B block header [size|free|next], 16B align, 64KB
-  grow chunks). **No coalescing yet** — documented limitation.
-- `p_memset`/`p_memcpy` — byte loops.
-- String layer: `p_str_length` (strlen), `p_str_concat`, `p_str_equal`,
-  `p_str_compare`, `p_to_str` (itoa), `p_char_to_str`, `p_bool_to_str`.
-- I/O: `p_write_str`, `p_print_str`/`p_eprint_str`/`p_print`/`p_eprint`,
-  `p_print_int`/`p_print_bool`/`p_print_newline`, `p_panic` (msg + exit 1),
-  `p_exit`.
-- Files (Linux flag numbers): `p_file_write`/`p_file_append`/`p_file_exists`/
-  `p_file_read` (doubling buffer read loop).
-- Process: `p_argc`/`p_argv`/`p_getenv`, `p_clock_now`/`_ms`/`_us`.
+1. **NEW, HIGH (for anyone reviving it) — type check fails.**
+   `s18.exe check compiler/runtime.fd` → 7 errors, all
+   "Visibility error: 'p_str_length' is private to module 'core'". core
+   now has its own private `p_str_length` (stdlib/core.fd:3059); this
+   file's `pub fn p_str_length` (:242) and its callers collide with it.
+   (The 2026-10-23 doc said "typechecks clean"; no longer true.)
 
-## Integration contract (not yet wired)
+### From code inspection
 
-- Native pipeline should prepend this file to the program (same mechanism
-  as core.fd) and link the per-arch stub object; `p_*` definitions then
-  shadow the builtin extern decls.
-- C backend does NOT use this file — codegen_c emits its own C runtime.
-- `--no-std`/bare-metal skips it (bare mode keeps pe.fd's stub set).
+2. **NEW, HIGH — every byte operation works on 8-byte words.** `p_memset`
+   (:217), `p_memcpy` (:227), `p_str_length` (:242), `p_str_equal` (:268),
+   `p_str_compare` (:288), `p_to_str` (:312) and the NUL writes use
+   `*mut i64` where a byte is meant: memset/memcpy write 8 bytes per
+   index (7 bytes past the end), strlen stops only at 8 zero bytes in a
+   row. None of it would work if linked.
+3. **NEW, MEDIUM — string layout is out of date.** Strings here are plain
+   NUL-terminated blocks (or `p_str_alloc`'s layout at the time). Proposal
+   0004 strings are `[P_STR_RC + count][len]` bytes NUL (AGENTS.md rule
+   25); a runtime built from this file would not match core.
+4. **CHANGED — "consolidation target for the three runtimes".** That role
+   went to `stdlib/linux_runtime/` (header: "builtin p_X runs pert_X, in
+   Fides, merged into the program … No C library"), which implements the
+   whole builtin surface this file lists as TODO (:531-546).
+5. **STILL TRUE, LOW — allocator never coalesces** (:131-208, documented).
+6. **INFO — the file header (:1-64) still describes it as the plan for
+   native backends.** It is not; INDEX.md:139 calls it "not yet wired",
+   which undersells that it is replaced.
 
-## Open work (tracked in-file)
+## Fix order
 
-~140 builtins remain beyond the scaffold: sb/join/string-ops, float
-formatting (needs dtoa), maps/channels (need rt_futex or spin-lock),
-green threads (needs rt_ctx_save/restore + scheduler over this file),
-sockets/net/http/db/dl/tensor/grad.
+1. Delete it (preferred): `stdlib/linux_runtime/` does this job.
+2. If kept as a reference: rename `p_str_length`, switch the byte loops to
+   `*mut u8`, and mark the header as historical.
 
-## Verification
+## Verification state
 
-- Typecheck: clean via `use compiler::runtime` probe (fidesc run, exit 0).
-- Allocator/string/itoa logic exercised indirectly through that probe
-  (p_malloc/p_free/p_to_str/p_str_length run on interp builtins — the
-  Fides bodies themselves verified by reading, not yet linked natively).
+- 2026-11-09: whole file read; importers grepped; `s18.exe check` run
+  (7 visibility errors).

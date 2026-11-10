@@ -1108,6 +1108,30 @@ impl Interpreter {
         Value::Int(addr as i64)
     }
 
+    /// Copy `size` bytes of struct data src -> dst and migrate the opaque
+    /// side-table entries inside the range: Vec/Str/Map/Dyn field values are
+    /// keyed by slot address, so a plain memcpy would leave the destination
+    /// fields reading stale (or dangling) side-table entries.
+    fn struct_memcpy(&mut self, src_addr: u64, dst_addr: u64, size: usize) {
+        if src_addr == dst_addr {
+            return;
+        }
+        let src_bytes = self.memory.load(src_addr, size);
+        self.memory.store(dst_addr, &src_bytes);
+        let end = dst_addr + size as u64;
+        self.opaque_values
+            .retain(|k, _| *k < dst_addr || *k >= end);
+        let moved: Vec<(u64, Value)> = self
+            .opaque_values
+            .iter()
+            .filter(|(k, _)| **k >= src_addr && **k < src_addr + size as u64)
+            .map(|(k, v)| (*k - src_addr + dst_addr, v.clone()))
+            .collect();
+        for (k, v) in moved {
+            self.opaque_values.insert(k, v);
+        }
+    }
+
     /// Run a specific function with arguments
     fn run_function(&mut self, func: &IrFunction, args: &[Value]) -> RunResult {
         // SH-1.4: Recursion depth limit — check before pushing to call_stack.
@@ -1590,8 +1614,7 @@ impl Interpreter {
                         _ => None,
                     };
                     if let Some(src_addr) = src {
-                        let src_bytes = self.memory.load(src_addr, size);
-                        self.memory.store(addr, &src_bytes);
+                        self.struct_memcpy(src_addr, addr, size);
                         return ExecOutcome::Continue;
                     }
                 }
@@ -1664,9 +1687,15 @@ impl Interpreter {
                 // struct data, and store_ty tells us the struct type.
                 if let IrType::Struct(_) = &store_ty {
                     let size = self.module.type_size(&store_ty) as usize;
-                    if let Some(Value::Ptr(src_addr)) = values.get(value) {
-                        let src_bytes = self.memory.load(*src_addr, size);
-                        self.memory.store(addr, &src_bytes);
+                    // The source may arrive as an Int: a struct-returning call
+                    // produces Value::Int(addr) (see reinterpret_word), not Ptr.
+                    let src = match values.get(value) {
+                        Some(Value::Ptr(a)) => Some(*a),
+                        Some(Value::Int(a)) if *a > 0 && self.memory.is_valid_addr(*a as u64) => Some(*a as u64),
+                        _ => None,
+                    };
+                    if let Some(src_addr) = src {
+                        self.struct_memcpy(src_addr, addr, size);
                         return ExecOutcome::Continue;
                     }
                 }
@@ -1730,8 +1759,7 @@ impl Interpreter {
                 };
                 let size = self.module.type_size(ty) as usize;
                 if size > 0 {
-                    let src_bytes = self.memory.load(src_addr, size);
-                    self.memory.store(dst_addr, &src_bytes);
+                    self.struct_memcpy(src_addr, dst_addr, size);
                 }
                 return ExecOutcome::Continue;
             }

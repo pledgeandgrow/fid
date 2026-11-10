@@ -22,12 +22,12 @@ medical, automotive or avionics use (release roadmap, Track L).
 | SR-9 | `@gas(N)` | Static cost within N; a loop with literal bounds counts per trip | `test_gas_fail`, `test_gas_loop_fail` | `test_gas` |
 | SR-10 | `@bounded-stack` | Nothing reachable recurses or calls through a function value | `test_bounded_stack_fail` | `test_bounded_stack` |
 | SR-11 | `@deterministic` | No IO, time or randomness effect | `test_deterministic_fail` | `test_deterministic` |
-| SR-12 | `@tainted` | A tainted function or parameter reaches no IO or Net effect | `test_tainted_param_fail` | none yet |
-| SR-13 | `@secret` | A secret reaches no output, global, branch or unmarked return | `test_secret_output_fail`, `test_secret_global_fail`, `test_secret_branch_fail`, `test_secret_helper_fail`, `test_secret_return_fail` | `test_secret` |
+| SR-12 | `@tainted` | A function with a tainted parameter does no IO or Net effect (on parameters only: function-level `@tainted` is rejected as misplaced; impl methods are not checked, Nov 9) | `test_tainted_param_fail` | none yet |
+| SR-13 | `@secret` | A secret reaches no output, global, branch or unmarked return. Not yet (Nov 9): a match guard on a secret does not taint its arm, early returns and loop exits are not tracked, and file writes (`p_file_write_vec`, `p_write*`) are not sinks | `test_secret_output_fail`, `test_secret_global_fail`, `test_secret_branch_fail`, `test_secret_helper_fail`, `test_secret_return_fail` | `test_secret` |
 | SR-14 | `@constant_time` | No secret-dependent branch, early return or index | `test_constant_time_fail`, `test_constant_time_branch_fail`, `test_constant_time_index_fail` | `test_constant_time` |
 | SR-15 | `sandbox` | Code in a sandbox uses only granted capabilities | `test_sandbox_fail`, `test_sandbox_alloc_fail` | `test_sandbox` |
 | SR-16 | `@send` | A spawned call's arguments and captures are `@send` | `test_spawn_send_fail`, `test_send_fail` | `test_async` |
-| SR-17 | borrows | No change to a `Vec` a `for` loop walks; no field assignment while borrowed | `test_iter_invalidation_fail`, `test_field_borrow_fail` | `test_borrowck` |
+| SR-17 | borrows | No change to a `Vec` a `for` loop walks; no one-level field assignment `s.x =` while borrowed (a nested `s.a.z =` under `&s.a` is accepted, Nov 9) | `test_iter_invalidation_fail`, `test_field_borrow_fail` | `test_borrowck` |
 
 The tests are in `tests/bootstrap/`; each negative test names the error it
 expects on its first line (`// expect-error:`), and the harness

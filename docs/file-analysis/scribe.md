@@ -1,49 +1,58 @@
 # scribe.fd
 
-> **Re-verified 2026-10-23:** confirmed — still no `create_dir_all` + unchecked `p_file_write` → prints "Generated..." when nothing was written.
+> **Re-audited 2026-11-09** against the current source and the latest `fid` build (s18).
+> Oct 23 findings still true; two new live bugs on Windows (CRLF module names, `::` file names).
 
 - **Path:** `compiler/scribe.fd`
-- **LOC:** 999 (Rust `src/scribe.rs`: 881)
-- **Role:** Documentation generator — scrapes `///` doc comments + `fn`/`struct`/`enum`/`impl`/`const`/`cap` declarations via line scanning (not the AST), renders HTML (sidebar + grouped sections + CSS) or Markdown, writes `docs/<module>.{html,md}`.
+- **LOC:** 989 (Rust `src/scribe.rs`: 881)
+- **Role:** documentation generator. Scans lines (not the AST) for `///` comments and
+  `fn` / `struct` / `enum` / `impl` / `const` / `cap` declarations, renders HTML (sidebar, CSS) or
+  Markdown, writes `<output>/<module>.<html|md>`.
 
-## Where called
+## Callers
 
-| Caller | Line | Mechanism |
+| Caller | Site | Use |
 |---|---|---|
-| `compiler/main.fd` | 25 | `use compiler::scribe` |
-| `compiler/main.fd` | 153 | `scribe` command → `cmd_scribe` (:1883) |
-| `compiler/main.fd` | 1891 | `scribe_process_file(input, output_dir, format)` |
+| `compiler/main.fd` | :178 `doc`, :182 `scribe` → `cmd_scribe` (:3316) → `scribe_process_file` | `fid doc` / `fid scribe <file.fd> [--output dir] [--format html|markdown]` |
 
-Shipped as the standalone `scribe` binary per AGENTS.md. Line-scanning approach means it works on syntactically-broken files too (arguably a feature for a doc tool).
+`process_directory` (:863) and `scribe_print_help` (:924) have no caller: `scribe <dir>` is not
+reachable. `cmd_scribe` returns 0 in every case, even "Cannot read".
 
 ## Findings
 
-### MEDIUM — output directory is never created + write result unchecked
+### Verified live
 
-`scribe_process_file` (:854-855) writes `output_dir + "/" + module_name + "." + ext` via `p_file_write` — but unlike Rust (`fs::create_dir_all` at `src/scribe.rs:817`), **no mkdir happens**. If `docs/` (the default) doesn't exist, `p_file_write` presumably fails — and its return value is ignored, so scribe prints `Generated docs/x.html (N items)` **even when nothing was written**. Silent failure producing a success message.
+- **HIGH — NEW — module name keeps the `;` on CRLF files.** `extract_module_name` (:899-921)
+  splits on `\n`, then `str_trim_end_char(s, 59)` stops at the trailing `\r`. The repo has CRLF
+  files (`core.autocrlf=true`). `fid scribe stdlib/math.fd` writes `math;.md` with the title
+  `# math; -- Fides Documentation`.
+- **HIGH — NEW — `module a::b;` gives a file name with `:`.** `fid scribe compiler/token.fd`
+  prints `Generated .../compiler::token;.md (7 items)` and writes nothing (`:` is not allowed in
+  Windows file names).
+- **MEDIUM — STILL TRUE — output folder is not created and the write is not checked.**
+  `--output <missing dir>` prints `Generated ...` and writes nothing (:857-860).
+- **LOW — STILL TRUE — empty file reported as "Cannot read"** (:839-841).
 
-### LOW — empty file conflated with read failure
+### From code inspection
 
-`str_len(source) == 0` → `"Cannot read <path>"` (:836) — same `p_file_read` ambiguity catalogued in earlier files. Rust distinguishes `fs::read_to_string` errors. Cosmetic for a doc tool, but a genuinely-empty `.fd` reports "Cannot read".
+- **LOW — CHANGED — directory listing.** The comment at :864-870 says the runtime has no
+  directory listing. It has one now (`p_dir_list`, used by `stdlib/fs.fd:87`; `p_mkdir` at
+  `fs.fd:108`). `process_directory` still reads the "directory" as a list of paths, and is not
+  called anyway.
+- **LOW — declarations after an `@annotation` line lose their doc comment**: the annotation line
+  ends the comment block and is skipped (:116-163). `pub var`, `type` aliases and `module`-level
+  `var`s are not documented.
+- **INFO — FIXED — the dead duplicate `pub fn` arm** of the Rust port is gone (:117).
 
-### LOW — no directory listing (documented limitation)
+## Fix order
 
-`process_directory` (:860-893) admits it: no `readdir`/`getdents` in the Fides runtime, so `scribe <dir>` can't enumerate `.fd` files like Rust's `std::fs::read_dir` (:842). The workaround is reasonable — treats a non-`.fd` input as a *file containing newline-separated paths* and batch-processes it. Still, `scribe stdlib/` (the help text's own example) doesn't work as advertised.
+1. Strip `\r` and `;`, and replace `::` with `_` or `.` in the module name used for the file name.
+2. Create the output folder (`fs.fd` has a recursive mkdir) and check the write; return non-zero
+   on failure.
+3. Wire `scribe <dir>` through `p_dir_list`.
 
-### Verified faithful (inspection)
+## Verification state
 
-- **`extract_docs` dispatch 1:1** — `pub fn/fn`, `pub struct/struct`, `pub enum/enum`, `impl`, `pub const/const`, `cap`/`pub cap` — including Rust's own dead duplicate `pub fn` arm (`:90`, "Already handled above"), faithfully ported.
-- **All six parsers present**: `parse_function`, `scribe_parse_struct`, `scribe_parse_enum`, `parse_impl` (depth-1 method detection), `scribe_parse_const`, `scribe_parse_trait`.
-- **`escape_html` correct**: `&`→`&amp;` applied *first* (the `"&" + "amp;"` concat produces the same literal), then `<`/`>`/`"` — same order as Rust, no double-escaping.
-- **Grouping logic identical**: functions/structs/enums/consts gated on `is_pub`; `impl` and `trait` ungated — matches Rust's match arms exactly.
-- **Module-name extraction**: `module X;` decl → else filename-stem fallback — same algorithm.
-
-## Suggested fix order
-
-1. `mkdir -p` the output dir before `p_file_write` (or check the write result and report failure) — currently the "success" message lies.
-2. Distinguish empty-vs-unreadable in `process_file` if `p_file_read` ever gains error returns.
-3. If `readdir`/`getdents` ever lands in the runtime (the `native_debugger`/`hotreload` runs showed the same syscall gap), wire real `process_directory`.
-
-## Verification
-
-Inspection-only — no self-hosted binary. Structure, dispatch, escaping, grouping, and I/O paths verified by direct diff against `src/scribe.rs`; this file has no machine-code or correctness-critical transforms, so the risk profile is low. The runtime-API gaps (mkdir, readdir, file-error distinction) are the systemic Fides-runtime limitation seen across `native_debugger`, `hotreload`, and the `runtime_*` runs.
+- `fid check compiler/scribe.fd`: no errors. `fid lint`: `unused import: 'string'`.
+- Live: `fid scribe stdlib/math.fd`, `fid scribe compiler/token.fd`, and a missing `--output`
+  folder, all writing into the session scratch folder.

@@ -2,6 +2,16 @@
 
 > Things that have broken before and how to avoid re-introducing them.
 >
+> Nov 11: `fidesc run` (the Rust bootstrap interpreter) silently ignored
+> whole-struct re-assignment (`x = f()` left `x` unchanged): the struct
+> memcpy updated byte memory but the opaque side-table entries for field
+> slots (Vec/Str/Map values, keyed by address) stayed stale. Every
+> `var x = ...; x = struct_result` loop was a no-op — bigint_pow/modpow
+> returned 1, Poly1305 returned 0. Fixed by `Interpreter::struct_memcpy`
+> migrating opaque entries src→dst (src/interp.rs); verified vs `fid run`
+> and the RFC 8439/5869 vectors. Also fixed `aead_mac` interleaving the
+> aad/ct length blocks (stdlib/tls_crypto.fd).
+>
 > Last updated: Nov 6, 2026 (§2f: open items and fixes of Nov 4–6). Earlier:
 > Oct 25, 2026 (session 30: standalone-binary stdlib crash, `cast_arg`
 > `Ptr→Generic` ABI repair, nondeterministic self-hosted typecheck, `cmd /C`
@@ -1006,12 +1016,16 @@ Already documented as bug 2.12 above. The `var` feature now makes this fixable.
 
 #### 2c.8 `inc.fd:134-145` — `global_cache_*` are no-ops
 
+> **FIXED (re-checked Nov 9, 2026):** the global cache works; inc.fd also keeps on-disk build stamps and `.fidcache` (docs/file-analysis/inc.md).
+
 Already documented in architecture.md. Now fixable with the `var` feature
 implemented in the Rust compiler. The Fides `inc.fd` can use `var` to
 implement a real global cache once the `var` feature is mirrored to the
 Fides self-hosted compiler.
 
 #### 2c.9 `lower.fd:6005` — `f64_to_bits` always returns 0
+
+> **FIXED (re-checked Nov 9, 2026):** it calls `p_f64_to_bits` (docs/file-analysis/lower.md).
 
 **Symptom:** Float bitcast operations produce 0.
 
@@ -1114,6 +1128,8 @@ skip for now."
 
 #### 2c.18 `typechecker.fd:1451-1505` — 13 safety verification stubs
 
+> **FIXED (re-checked Nov 9, 2026):** the `verify_*` passes are implemented and each safety rule has a negative test (safety-rules.md); remaining gaps are in docs/file-analysis/typechecker.md.
+
 All 13 `verify_*` functions for safety annotations (`@conserve`, `@gas`,
 `@constant_time`, `@realtime`, `@differentiable`, `@quantized`, `@checkpoint`,
 `@dp`, `@shard`, `@adapter`, `@tainted`, `@contracts`, `@allocator_params`)
@@ -1121,6 +1137,8 @@ are empty no-ops. Safety annotations are accepted but not enforced. Not
 needed for bootstrap, but dangerous for production use.
 
 #### 2c.19 `parser.fd:4847` — `parse_fstring_parts` is a stub
+
+> **FIXED (re-checked Nov 9, 2026):** f-strings are parsed (docs/file-analysis/parser.md).
 
 F-string interpolation is extracted as raw text, not parsed. The `Lexer::new`
 call is commented out with "TODO: Re-enable when cross-module Lexer usage is
@@ -1176,7 +1194,7 @@ Bugs fixed on the way, so they are not re-introduced:
 | 2e.7 | `@conserve` only checked effects; calls to non-@conserve functions, money-creating calls and floats were not checked. | **FIXED** (ported from `src/typechecker.rs`) |
 | 2e.8 | Self-hosted `ccompile` did not link `extern "C" link "lib"` libraries (`// PLINK:` lines). | **FIXED** |
 | 2e.9 | `p_gt_is_done` typed i64 by the typechecker (lowering says bool). | **FIXED** |
-| 2e.10 | Native backend (`build --native`: PIR → x86-64 → `compiler/pe.fd`) crashes on every program: `pass_dse` calls the wrong equality function, then register allocation reads null. `build`/`ccompile` go through C instead. | **OPEN** |
+| 2e.10 | Native backend (`build --native`: PIR → x86-64 → `compiler/pe.fd`) crashes on every program: `pass_dse` calls the wrong equality function, then register allocation reads null. `build`/`ccompile` go through C instead. Nov 9: `build --native` with the default target goes through compiler.fd `build_executable` (opt, codegen_x64, elf64, linker), not pe.fd, and panics in opt.fd `pass_jump_thread`; with `--no-opt` the link fails ("Undefined symbols: main": elf64 writes 56-byte section headers). | **OPEN** |
 
 Not bugs: `test_sqlite` needs libsqlite3 and `examples/minimal_game` needs
 SDL2 (both compilers fail the same way without them).
@@ -1192,14 +1210,14 @@ expected-fail 89/89) and has not been rerun with the Nov 4–6 compiler.
 
 | # | Item | Status |
 |---|------|--------|
-| 2f.1 | Value semantics (M5, proposal 0001): copy-on-write lowering for `Vec`, `HashMap` and the `Vec` fields of copied structs is written behind `LOWER_COW` (off), with lazy and counted shares. With it on, test programs get value semantics on all backends and the compiler compiling itself reaches its fixpoint (Nov 6), at a peak of 4.7 GB against 1.8 GB off. It is off until the full suite has run with it on; today `var b = a` on a `Vec` aliases. | **OPEN** (works, not yet on) |
-| 2f.2 | Native async/tasks: `fid emit` programs using async or spawn+await crash (`test_async`, `test_async_float_struct`). The interpreter and C are fine. | **OPEN** |
+| 2f.1 | Value semantics (M5, proposal 0001): copy-on-write lowering for `Vec`, `HashMap` and the `Vec` fields of copied structs is written behind `LOWER_COW` (off), with lazy and counted shares. With it on, test programs get value semantics on all backends and the compiler compiling itself reaches its fixpoint (Nov 6), at a peak of 4.7 GB against 1.8 GB off. It stays off: since Nov 7–8 the ownership rule of proposal 0004 (`LOWER_RC`) gives `var b = a` on a `Vec`, `str` or `HashMap` an independent value (shared until the first write). Still open (Nov 9): copying a struct does not separate its `Vec` fields (`var t = s; t.v.push(2)` changes `s.v`, interpreter and C). | **OPEN** (struct fields only) |
+| 2f.2 | Native async/tasks: `fid emit` programs using async or spawn+await crash (`test_async`, `test_async_float_struct`). The interpreter and C are fine. Fixed Nov 6 (worker threads were started through a name lookup that returned 0); broken again in builds of Nov 9 afternoon: `test_async` printed 0 for every task result, `test_async_float_struct` panicked. Cause: three iropt passes on by default (envtrim shifted the arguments of async bodies started by name, gconst folded runtime globals to their initial values, deadf removed runtime functions). Fixed in iropt.fd: deadf opt-in, gconst in two phases, functions named by a string skipped. Verified that evening with fid31 (today's tree plus the fixes): both tests match the interpreter on pe_ir and `--nat`, with no switches. envtrim is opt-in now (`FID_IROPT_ON=envtrim`): a caller still passes the trimmed environment slot. Confirmed again with fid32 (adds the rules.fd fix for calls inside a callee): test_async, test_async_float_struct, test_tasks, test_brotli, test_bigint, test_decimal, test_args, test_counted_loop and test_fs match the interpreter on pe_ir and `--nat`. Still opt-in: deadf (WP15), envtrim (WP7), readcse (WP10), branchfold. | **FIXED** (Nov 9, fid31/fid32) |
 | 2f.3 | `build --native` (the old PIR path) crashes (same as 2e.10); `fid emit` is the native path. | **OPEN** |
-| 2f.4 | D4: native code keeps values in 7 callee-saved registers (hottest locals, parameters, short-lived temporaries). There is no full register allocator: no cross-block values, caller-saved registers, or floats in xmm. | **OPEN** |
+| 2f.4 | (Nov 9: pe_ir has a whole-function linear-scan allocator with r10/r11 and xmm registers, `PEIR_GLOBAL_RA`; nat_ir has its own with IPRA.) D4: native code keeps values in 7 callee-saved registers (hottest locals, parameters, short-lived temporaries). There is no full register allocator: no cross-block values, caller-saved registers, or floats in xmm. | **OPEN** |
 | 2f.5 | D14/D15: `Vec` elements at their real size, references into containers. | **OPEN** |
-| 2f.6 | F: macOS, native ELF, ARM64, RISC-V and WASM backends are experimental / incomplete. G: bare metal, `emit --bare` panics. | **OPEN** |
+| 2f.6 | F: macOS, native ELF, ARM64, RISC-V and WASM backends are experimental / incomplete. G: bare metal, `emit --bare` panics. Nov 9: native Linux AArch64/RISC-V/x86-64 work through nat_ir (273/271/272 of 317), `emit --bare` builds (not run under QEMU); WASM and the PIR-era backends remain incomplete. | **OPEN** (partly) |
 | 2f.7 | J5–J9 (crypto), E5 (`parse-header` on SDL2/SQLite headers). | **OPEN** |
-| 2f.8 | `fid` self-compile is ~6x slower than `fidesc`'s (~133 s vs ~21 s). | **OPEN** |
+| 2f.8 | `fid` self-compile is ~6x slower than `fidesc`'s (~133 s vs ~21 s). Nov 9: 74 s with the compiler built at -O2 (split C). | **OPEN** (~3.5x) |
 | 2f.9 | `fid version` prints `fid 0.1.0` (Cargo.toml 0.1.0) while the release is v1.0.0. | **OPEN** (known inconsistency) |
 | 2f.10 | Written, built into the compiler, not run yet: `fid emit --checked-alloc` (M7), `scripts/sanitize.sh` (M8, needs clang with ASan), `scripts/fuzz/nightly.sh` with the `checked` backend (M9; no CI workflow schedules it). The per-thread free lists of the native runtime (H8) are exercised by every native test, but no multi-thread stress test has been run. | **NOT RUN** |
 | 2f.11 | A literal of a user-defined generic struct is rejected: `struct Pair<A, B> { first: A, second: B }` then `Pair { first: 1, second: "one" }` gives "field 'first' expected A, got i8". Generic functions, generic enums and `impl<T>` work. | **OPEN** |
@@ -1217,6 +1235,39 @@ expected-fail 89/89) and has not been rerun with the Nov 4–6 compiler.
 
 ---
 
+## 2g. Nov 9, 2026 — module audit: open bugs
+
+Found by re-auditing every `compiler/*.fd` module against its
+docs/file-analysis/<module>.md (all 68 rewritten Nov 9). "Seen" means
+reproduced with a `fid` binary of Nov 9; the rest is from reading the code.
+Details and line numbers are in each module's file-analysis doc.
+
+| # | Module | Bug | Evidence |
+|---|--------|-----|----------|
+| 2g.1 | csplit | `cs_strip_static` removes the first `static` anywhere in a function, so the `static` locals of `p_process_run` and `p_net_connect` become plain locals in the split (release) build of `fid` | seen in the split C |
+| 2g.2 | lower | an uninitialised `var m: M;` assigned from a match payload is freed twice: `fid veil` panics "Double free" before writing a report | seen, 15-line repro in veil.md |
+| 2g.3 | lower | copying a struct does not separate its `Vec` fields: `var t = s; t.v.push(2)` changes `s.v` (interpreter and C) | seen |
+| 2g.4 | lower, checks | an `asm!` clobber is stored as an input with value id -1; a clobber inside a loop crashes `dump-c` and `emit` (checks.fd `peir_loop_facts`) and irverify reports it | seen |
+| 2g.5 | lsp | completion, hover, definition and rename end with "Double free"; diagnostics are published at line 0 | seen |
+| 2g.6 | fmt | `a < b` and `>>` open and never close a generic, so the rest of the file loses its spaces; `fid fmt` overwrites the input with it | seen |
+| 2g.7 | typechecker | match exhaustiveness ignores guards and generic enums (`Option`, `Result`, user `<T>`): a non-exhaustive match compiles and runs no arm | seen |
+| 2g.8 | mono | a generic call inside a closure, f-string, `\|>`, `sandbox`, `parallel` (and region/txn/select/spawn/await) is not renamed: `run` panics "Unknown function", C calls the unmangled name | seen |
+| 2g.9 | compiler, borrowck | `--borrowck=warn` prints nothing (compiler.fd reads `bc.errors`, warn fills `bc.warnings`); `g(&mut x, &mut x) as i64` and a nested field write `s.a.z =` under `&s.a` are accepted | seen |
+| 2g.10 | secrecy | a match guard on a secret does not taint the arm; `p_file_write_vec`/`p_write*` are not sinks | seen |
+| 2g.11 | iropt (on by default) | SCCP folds i8..u64 with i64 arithmetic: an i32 overflow panic is lost, u64 compares and divides as signed, and the evaluation itself can overflow in the compiler | code |
+| 2g.12 | iropt (on by default) | branchfacts makes `a >= b` true on the false edge of `a < b` for floats, wrong for NaN | code |
+| 2g.13 | codegen_c | `f32 % f32` and a bit cast to/from a float produce invalid C; a user function named like a libc function (`fopen`) clashes | seen with zig cc |
+| 2g.14 | compiler | `@cfg(debug)` never holds (`check_cfg` is always called with `is_debug = false`), even with `ccompile --debug` | seen |
+| 2g.15 | inc | the build stamp ignores `FID_VERIFY`, `FIDES_CFLAGS`, `FID_RULES_ON`, `FID_NAT_ON`, `FID_LIBFACTS*`: a stamp hit skips verification | seen |
+| 2g.16 | elf64, linker, x86 | x86-64 ELF objects have 56-byte section headers (`sh_addr` never written): readelf rejects them, linker.fd links no user code, `build-x86` writes a 120-byte exe that segfaults | seen |
+| 2g.17 | opt, pe | the PIR optimizer panics on hello world (`jump_thread_redirect`), so `opt`, `pir --opt` and `build --native` (default target) fail; `emit --boot` panics in pe.fd | seen |
+| 2g.18 | lexer | `5e3` lexes as `5` then `e3`; an unknown character ends an imported module silently | seen |
+| 2g.19 | comptime_eval | an assignment inside an `if` in a `comptime fn` is lost (`pick(true)` gives 1, not 7) | seen |
+| 2g.20 | interp | `printf` prints its format string unformatted; green threads: a thread that yields twice stops the next one from running | seen |
+| 2g.21 | wasm, gpu | every WASM module fails validation; SPIR-V word counts are off by one and PTX labels do not match | seen |
+| 2g.22 | flat_ast, diag, runtime | these unreachable modules no longer pass `fid check` | seen |
+| 2g.23 | pe_ir emit | a fixed array `[i64; N]` passed by value as a function param truncates past ~index 3500 (~28 KB): reads return out-of-bounds memory. `pub const` arrays index correctly | seen (unicode_data 3832-elem table: `udata_find` returned -1 for keys past the cut; a local `var` copy of the same array read fine) |
+
 ## 3. Gotchas
 
 ### 3.1 `Box<T>` in compiler source is not the same as language `Box`
@@ -1226,6 +1277,8 @@ expected-fail 89/89) and has not been rerun with the Nov 4–6 compiler.
 - Match patterns on `Box<T>` auto-unbox, but explicit `box_*_unbox()` helpers are needed for `Box<Expr>`, `Box<Type>`, `Box<IrType>`.
 
 ### 3.2 `Expr` variants in `lower.fd` are out of sync with `ast.fd`
+
+> **FIXED (re-checked Nov 9, 2026):** `lw_box_expr_unbox` (lower.fd:73) lists only real variants.
 
 `box_expr_unbox` in `compiler/lower.fd` (lines 71-111) lists variants that do not exist in `compiler/ast.fd`: `Lambda`, `Throw`, `TryUnwrap`, `Assign`, `CompoundAssign`, `ConstExpr`, `ComptimeGen`, `QuantCast`, `Await`, `Spawn`.
 
@@ -1559,7 +1612,7 @@ lower.fd and codegen_c.fd).
 | `ir` / `dump-ir` | COMPLETE | |
 | `dump-c` | COMPLETE | |
 | `dump-pir` / `pir` | COMPLETE | Levels + `--opt` supported |
-| `fmt` | COMPLETE | Supports `--check` |
+| `fmt` | COMPLETE (historical; Nov 9: it corrupts files, see 2g) | Supports `--check` |
 | `tokens` / `dump-tokens` | PARTIAL | Prints `line:col kind`, no token values |
 | `ast` / `dump-ast` | PARTIAL | Prints summary only, not full AST |
 | `build` | PARTIAL | PE emitter only; missing `--target`, `--no-opt`, `--lto`, `--caps` |
@@ -1649,7 +1702,7 @@ lower.fd and codegen_c.fd).
 
 ### 3. typechecker.rs → typechecker.fd (completion: ~35%) — MAJOR GAPS
 
-#### Effect/annotation verification — ALL STUBBED (0%)
+#### Effect/annotation verification — ALL STUBBED (0%) (historical: implemented since, see 2c.18)
 
 | Function | Status | Impact |
 |----------|--------|--------|
@@ -1856,7 +1909,7 @@ All 23 optimization passes are present. 17 are complete, 4 are partial, 1 is stu
 37. **lower OptionalFieldAccess** — None unwrap branch
 38. **opt dominator tree infrastructure** — compute_dominators, compute_rpo, compute_predecessors
 39. **main.fd global flags** — --borrowck, --timeout
-40. **parser.fd f-string interpolation** — parse_fstring_parts is a stub
+40. **parser.fd f-string interpolation** — parse_fstring_parts is a stub (fixed since; Nov 9)
 41. **comptime_eval aggressive recursion** — only recurses into Binary/Unary/Call/MethodCall
 
 ---

@@ -1,101 +1,171 @@
-# lower.fd — AST → SSA IR Lowering
+# lower.fd — AST → SSA IR lowering, with ownership (proposal 0004)
 
-> **Re-verified 2026-10-23:** all findings confirmed — `await` → `p_future_poll` still unimplemented (Int(0) under `run`), spawn → `p_thread_spawn` still fake-handled, borrow_kind tags still never emitted (compounds pir/opt dead metadata).
+> **Re-audited 2026-11-09** against the working tree (lower.fd has uncommitted
+> edits; another session may be editing it). Probes ran with the latest
+> self-built compiler (`s18.exe`) on test files outside the repository.
 
-**6,930 LOC** vs `src/lower.rs` 7,629 LOC (~91%). The largest compiler module — lowers every
-`Stmt`/`Expr` into the 42-variant `Inst` vocabulary in ir.fd, builds `IrModule`, registers
-externs, resolves named/default args, mangles impl/trait methods, computes function effects.
+**Path:** `compiler/lower.fd` — **14,023 lines** (was 6,930 on Oct 22).
+358 functions. Imports `ast`, `cowcheck`, `ir`, `pe_ir`.
 
-## Where it's called (live — the mandatory middle of every path)
+**Role:** lowers the checked, monomorphized AST into the `Inst` IR of
+`ir.fd`. Builds the `IrModule` (layouts, externs, strings, globals), mangles
+impl/trait methods, resolves named/default arguments, computes function
+effects, and since Nov 7 inserts every ownership operation (dup, drop, move)
+of proposal 0004. The entry point is `lower(program)` (lower.fd:2822).
 
-- `compiler/compiler.fd:1455,1486,1568,1581,1666` — `lower(program)` in `lower_to_ir_module`,
-  `lower_to_ir_module_with_path`, `ccompile_source_with_path` (post-cache-miss), interp path,
-  `build_executable`.
-- `compiler/main.fd:1709,1740,1768` — `dump-ir`, `ir`, `pir` commands.
-- Imported by `compiler/debugger.fd:46` (dead module).
+## Callers
 
-## Structure — verified faithful port
+| Caller | Site | Reached from |
+|--------|------|--------------|
+| `compiler.fd` `lower_to_ir_module` | :2014 | `ir`/`dump-ir`, `pir`, `opt` (main.fd:462/546/617); `interpret_source*` (`run`, `test`, `bench`, `profile`); `veil`; `hotreload` (dead) |
+| `compiler.fd` `lower_to_ir_module_with_path` | :2027 | `ccompile`/`compile`/`dump-c`/`split-c` (via `ccompile_source_with_path` :1826), `run` (:2082), `codegen`, `gpu`, `verify`, `sourcemap` (main.fd:2221/2322/2678/2719), `build_x86_linux` (:2382) |
+| `compiler.fd` `compile_to_wasm` | :1863 | `wasm` |
+| `compiler.fd` `build_executable` | :2135 | `build --native` |
+| `main.fd` `cmd_build` | :2885, :2923, :2976, :3057, :3152 | `build` / `emit` (pe_ir PE, ELF, bare, nat_ir Linux / `--nat`) |
+| `debugger.fd` | :794 | nothing imports debugger.fd (dead) |
 
-- `lower_program` driver is 1:1: consts → globals → aliases → structs (incl. `@linear` tracking)
-  → enums → externs → impl/trait method **pre-registration with mangled names** → trait
-  method-name table → per-function lowering. The pre-registration correctly handles the
-  impl-method visibility gap found in comptime_eval.
-- `Expr` coverage: all 38 Rust arms present + Fides-added `NamedArg`/`Some`/`None`/`Yield`.
-- `Stmt` coverage: all 30 Fides-AST variants. `Pattern` coverage 7/7.
-- `defer_stack`/`emit_defers`/`emit_persist_saves` at the same 3 sites (Return, fn end, try).
-- `__env` dummy insertion (`:3963`), `CallPtr` for locals w/ `has_env:true` (`:3949`),
-  `p_future_ready` wrap on async calls (`:3972`), sret alloca for struct returns (`:3979`),
-  `Inst::Print` desugar, `thread_id`/`workgroup_*` → `ConstInt(0)` — all match Rust.
-- `runtime_effects` (:352) — the Write/Alloc/IO table AGENTS.md flags as DCE-load-bearing —
-  is substantially ported (vec/map/string/atomic/chan/mutex/io families).
+`tests/selfhost/test_lower.fd` and `test_mut.fd` import it directly.
 
-## Findings
+## Switches (all `const`, no environment variable)
 
-### MEDIUM — `borrow_kind` provenance tags dropped (I-7A port gap)
+| Name | Value | Effect |
+|------|-------|--------|
+| `LOWER_RC` (:12230) | **true** | Proposal 0004 ownership: a variable owns its value and is dropped at scope end; reads borrow; keeping a value takes an owner (`Lowerer_rc_own_value`); temporaries are dropped at statement end; parameters are borrowed. Off: the old auto-drop passes run instead. |
+| `LOWER_BOX_RC` (:12234) | true | `Box::new` makes a counted block (`Box_dup`, `Box_drop_t`). Off: a Box is never freed. |
+| `LOWER_INLINE_STRUCTS` (:12239) | true | Structs go into a Vec's buffer through `Vec_push_mem`/`Vec_set_mem`/`Vec_insert_mem` (size ≤ 232 words). Off: each struct element is a heap copy. |
+| `LOWER_STACK_VECS` (:13432) | true | LF13: a local Vec that never leaves its function keeps its 40-byte header on the stack (`Vec_init_typed`, `Vec_drop_inplace`). |
+| `LOWER_CANCEL_SHARES` (:13664) | true | LF15: a `Vec_share`/`HashMap_share` only read before its drop is not made. |
+| `LOWER_LITERAL_SLOTS` (:13666) | true | LF17: string slots that only hold literals are not counted. |
+| `LOWER_COW` (:7357) | **false** | Proposal 0001 copy-on-write shares and struct Vec-field shares. Superseded by `LOWER_RC`; must stay off (double frees). |
+| `LOWER_ARG_SHARE` (:7363) | false | Callers pass a share of each by-value Vec argument. Only acts with `LOWER_COW`. |
 
-Rust's `Expr::Ref` lowering tags the alloca `ValueMeta.borrow_kind` with `Mut`/`Shared` at
-**three** sites (src/lower.rs:5671,5702,5714). The Fides `Expr::Ref` arm (:4824) ports all
-the pointer-shape logic (SRET double-indirection avoidance etc.) but **drops every
-`borrow_kind` write** — `compiler/lower.fd` contains zero `borrow_kind` references.
+`RC_NONE..RC_BOX` (:12241-12246) are kind codes, not switches.
 
-Downstream: `pir.fd:1183` harvests `meta.borrow_kind` into `f.borrow_kinds`, which opt's
-`borrow_non_aliasing` (src/opt.rs:5031) consults for dead-store/load elimination. With all
-metadata `None`, that alias-analysis family is **silently dead** — missed optimizations, not
-miscompiles (conservative direction).
+## What it does now (features the Oct doc missed)
 
-### MEDIUM — async lowering emits calls the interpreter can't run (cross-file)
+- **Ownership section** (:12220-14023): kind of a type (`Lowerer_rc_kind`),
+  dup/drop (`Str_dup`/`Str_drop`, `Vec_share`/`Vec_drop`,
+  `HashMap_share`/`HashMap_drop`, `Box_dup`/`Box_drop_t`, generated
+  `__own_dup_N`/`__own_drop_N` per struct/enum and the `__p_mem_drop` /
+  `__p_mem_dup` dispatchers), temporaries per statement (`Lowerer_lower_stmt`
+  wrapper :5777 → `Lowerer_rc_flush`), scopes and loops, move on last use
+  (`Lowerer_rc_move_last`, `Lowerer_rc_try_move`), borrow instead of copy
+  (`Lowerer_rc_borrow_copy_ok`), parameters copied at entry only when the
+  body changes them (:4224-4246).
+- **Post passes in `lower()`** (:2822): `lw_rc_cancel_pairs` (dup+drop pairs,
+  LF15, LF17) and `lw_rc_stack_vecs` (LF13).
+- Value types: `Vec::filled` (`Vec_filled_typed`, :5246), integer-key HashMap
+  detection, struct elements stored inline, element type ids (16 + index,
+  `P_TID_BOX` for boxes).
+- Concurrency: async task adapters for f64/struct arguments
+  (`Lowerer_emit_task_adapter`, H9), `parallel` branches lifted to threads
+  (`Lowerer_lift_parallel_branch`, H7), `spawn scope` / `cancel scope`
+  (:6563, :6572), `await` restores f64/struct/pointer results (:10075).
+- Effects: `do` with a continuation closure and `resume` (L3A,
+  `Lowerer_lower_do_with_continuation` :4535, `Stmt::Resume` :6553); a
+  `handle` ending a function gives its value (`Lowerer_lower_tail_handle`).
+- `&T`/`&mut T` parameters tag `ValueMeta.borrow_kind` (LF1, :4129).
+- Source line on every value (`Lowerer_emit_inst` :1250), C callbacks
+  (`Lowerer_c_callback`), borrowed `&str` (M11), `p_str_concat_int` fusion,
+  `select` statement, if/match as values (`lw_value_tail`).
 
-- `Expr::Spawn` (:5278) and `Stmt::Parallel` (:3219) correctly emit
-  `p_thread_spawn`/`p_thread_join` — but interp.fd's `p_thread_spawn` (:3414) returns a **fake
-  negative handle and never runs the function**. Rust's version (`src/interp.rs:5093`) runs
-  the callee eagerly and pushes `FutureState::Ready` — so `spawn f()` under `fidesc run` is a
-  semantic no-op in the port. (interp-side defect; noted again here because lower produces the
-  call.)
-- `Expr::Await` (:5271) emits `p_future_poll` — **not implemented in interp.fd** (only claimed
-  by `is_runtime` at :1868) → falls to the `Int(0)` default. `p_future_ready` (wrapped around
-  every async call, :3976) is likewise unimplemented → async calls return `0` under `run`.
-- Rust's L3B `scope_executor_stack` path (`p_executor_spawn` when inside `spawn scope`) is
-  absent — consistent with `Stmt::SpawnScope` not existing in the Fides AST (see below).
+## Findings — verified live
 
-### LOW (latent) — block-param merge values are unreachable & unbindable
+### HIGH — `asm!` with a `clobber` inside a loop crashes every compiled backend
 
-- `add_block_param` is called at three merge points (:4108 if-expr, :4282, :5051 Coalesce)
-  where only *some* predecessors deliver a value. `Expr::Coalesce`'s then-block at :5039
-  **never binds the param** — `Jump`/`Branch` carry no args and the interp's block loop never
-  reads `block.params` (verified: `values` Vec is pre-filled `Void` at interp.fd:744-748 and
-  only `set` on `ExecOutcome::Value`). Inherited design gap — Rust's interp ignores params too.
-- Reachability: the typechecker rejects `if`/`match` as expressions (verified: "cannot assign
-  void to variable"), and `Option ?? default` is desugared to `Match` in mono.fd:981 →
-  **`Expr::Coalesce` is unreachable end-to-end** (typechecker restricts `??` to `Option<T>`,
-  verified live). If any path ever reaches these arms, the merged value is `Void`→0 under
-  `fidesc run`.
+Lowering encodes a clobber as an input operand with value id -1
+(`StringValueId_new("CL:" + reg, -1)`, :10186). `checks.fd`
+`peir_inst_operands` passes the -1 on and `peir_loop_facts` does
+`Vec_set(-1)`. Probe (`while` loop holding `asm!("nop", clobber("rax"))`):
+`fid run` prints 3; `dump-c` and `emit` (default PE and `--nat`) panic
+"Vec index out of bounds" in `peir_loop_facts`. The native Linux path
+rejects any clobber ("in(\"CL:rax\") is not a 64-bit register"), and
+`irverify` reports the -1 as "defined nowhere" (see irverify.md). Fix: give
+clobbers their own list in `Inst::Asm`, or have every consumer skip ids < 0.
+
+### Fixed since Oct 23
+
+- `await` / `spawn` under `run`: FIXED. `spawn f(21)` then `await` prints 42
+  (interp.fd now runs `p_thread_spawn`/`p_future_poll`).
+- `Expr::Coalesce` unreachable / unbound block params: FIXED. `??` lowers
+  through a result slot (:9792); `o ?? 7` prints 7. No code calls
+  `Lowerer_add_block_param` any more (:1427 is unused).
+- `borrow_kind` never set: CHANGED. Reference parameters are tagged (:4129);
+  `Expr::Ref` allocas still are not.
+- `Stmt::Resume`/`SpawnScope`/`CancelScope` missing: FIXED, all three lower.
+- Ownership end to end: a Vec of structs with str and Vec fields plus a Box,
+  `run --leaks` (CC=zig cc): "every block was freed"; `var b = a; b.push(2)`
+  leaves `a` at length 1 under `run` and `emit`.
+
+### STILL TRUE
+
+- `str` slicing (`s[1..3]`): the typechecker still rejects it ("cannot index
+  type str"); lower has no `p_string_slice`.
+
+## Findings — code inspection
+
+### MEDIUM — calls emitted with an empty effect set
+
+`p_thread_spawn` (:4872, :6361, :6405, :10148), `p_future_poll`,
+`p_executor_new/run_all/cancel` (:6566-6576), `Vec_set` for `v[i] = x` and
+`v[i] op= x` (:5613, :5642), `Vec_get`, `p_vec_get` (:9407), `p_malloc` (6
+sites) and `p_chan_try_recv` (:5715) get `EffectSet_new()`.
+`runtime_effects` (:354) is applied only on the method/assoc/call paths
+(:6822, :6944, :7974). iropt's DCE never drops calls, so nothing is removed,
+but `rules.fd` `ru_ext_effects` builds a callee's visible effects from
+`inst_effects`: a function whose only effect is a spawn looks pure to
+`purecse`. A probe (`start()` = `spawn work()`, called twice) reported
+"0 pure calls merged" on aarch64, so no miscompile was seen.
+
+### LOW — `spawn scope` does not use its executor
+
+`spawn` inside a scope still emits `p_thread_spawn`; `p_executor_spawn` is
+registered (:2254) but never emitted. The join works only because the C
+runtime's `p_executor_run_all` joins every thread ever spawned and ignores
+`exec` (codegen_c.fd:6114). With C the probe printed 6 three times. The PE
+backend (`emit`) refuses these programs (`pe_ctx_swap`).
 
 ### LOW — `Expr::Index` treats any `I64` receiver as a Vec
 
-`Expr::Index` (:4696): `ir_type_eq(arr_ty, IrType::I64)` → `p_vec_get`. Rust only routes
-`Opaque("Vec")`. The `I64` clause is a Fides-added catch for type-decayed Vecs, but a genuine
-`i64` receiver indexing (e.g. an FFI handle) silently becomes a vec access instead of a GEP.
-Normally unreachable (typechecker rejects `cannot index type str` — verified), so latent.
+STILL TRUE (:9366): `ir_type_eq(arr_ty, IrType::I64)` → `p_vec_get`.
+Latent (the typechecker rejects indexing non-collections).
 
-### Noted / inherited
+### LOW — `use compiler::pe_ir` only for `peir_inst_operands`
 
-- `String[i..j]` slicing (Rust → `p_string_slice`, src/lower.rs:5267) is absent; typecheck
-  blocks `str` indexing outright — latent.
-- `Expr::ComptimeReflect` → `ConstInt(0)` — inherited verbatim (Rust :6320, "should not reach
-  here after comptime substitution" — but see comptime_eval.md: substitution drops mean it
-  *can* reach here).
-- `Expr::Yield` — Fides-only variant (absent from Rust's AST); lowers to eval-inner + no-op.
-- `Vec` indexing calls runtime `p_vec_get` directly (:4737) — Rust routes through stdlib
-  `Vec_get` with `__env`. Deliberate port adaptation; skips the stdlib bounds-check layer.
-- `Stmt::Handle`/`Stmt::Do` implement one-way effects only: handlers bind args + inline their
-  body, with **no resume** — `Stmt::Resume`/`SpawnScope`/`CancelScope` don't exist in the
-  Fides `Stmt` enum at all (feature dropped at AST level, not just lowering).
+lower.fd:35 imports pe_ir (and so pe_ir_enc, pe_ir_stubs) to reach a
+function that lives in checks.fd. That is the import AGENTS.md item 17 warns
+about. `use compiler::checks` is enough.
 
-## Assessment
+### INFO — dead code kept behind switches
 
-The single most structurally-faithful large port yet — the driver, SSA plumbing, sret, `__env`
-convention, defer/persist emission, and effect folding all match. The real losses are
-metadata-level: `borrow_kind` tags (alias analysis silently dead) and the interp-side
-spawn/await gap (async is decorative under `fidesc run`). The block-param machinery is
-half-built in both implementations — lower emits params, nothing binds them; only pir.fd's
-phi resolution makes them meaningful on compiled paths.
+`lw_auto_drop_vecs`/`lw_auto_drop_strs` and helpers (:3223-3896, about 670
+lines) run only with `LOWER_RC` off. `Lowerer_emit_struct_share` (:1328),
+`Lowerer_emit_vec_share`, `Lowerer_readonly_copy*` and the copy-on-write
+parts of `Lowerer_emit_inst` run only with `LOWER_COW` on.
+
+### INFO — stale comment on `LOWER_COW`
+
+The doc comment (:7347-7356) says "On since Nov 6"; the value is false and
+the Ownership section says it is replaced.
+
+### Not re-checked / unchanged inherited notes
+
+- `Expr::ComptimeReflect` → `ConstInt(0)` (:10163) and `Expr::Yield`
+  evaluating its operand only (:10156): unchanged, not probed.
+- Without a handler, `do` evaluates its arguments and continues (:4555).
+
+## Fix order
+
+1. Asm clobber encoding (crash on every compiled backend).
+2. Give the direct `Inst::Call` sites their `runtime_effects`.
+3. `use compiler::checks` instead of `pe_ir`; delete or isolate the
+   `LOWER_COW`/auto-drop code once proposal 0004 is final.
+4. Emit `p_executor_spawn` inside `spawn scope`.
+
+## Verification state
+
+Static: all switches, `lower()`, the Ownership section headers, the
+statement wrapper, parameter copies and the old findings' sites read in
+current source. Live (s18.exe): asm crash (dump-c, emit, emit --nat),
+await/spawn and `??` under `run`, `--leaks` clean, value semantics, spawn
+scope under C. Not run: the test suites.

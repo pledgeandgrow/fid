@@ -251,69 +251,72 @@ fn j_type_at(s: str, i: i64) -> str {
 // ─── Canonicalizer (minify + recursively sorted object keys) ───────────
 
 fn j_canon(s: str, i: i64) -> str {
-    var j: i64 = j_ws(s, i);
-    if j >= str_len(s) { return ""; }
-    var c: i64 = str_byte_at(s, j);
-    if c == 123 { return j_canon_obj(s, j); }
-    if c == 91 { return j_canon_arr(s, j); }
-    var e: i64 = j_scan_val(s, j);
-    if e < 0 { return ""; }
-    return str_slice(s, j, e);
+    var sb: StringBuilder = StringBuilder::new();
+    j_canon_into(s, i, &mut sb);
+    return sb.to_str();
 }
 
-fn j_canon_obj(s: str, i: i64) -> str {
+fn j_canon_into(s: str, i: i64, out: &mut StringBuilder) {
+    var j: i64 = j_ws(s, i);
+    if j >= str_len(s) { return; }
+    var c: i64 = str_byte_at(s, j);
+    if c == 123 { j_canon_obj_into(s, j, out); return; }
+    if c == 91 { j_canon_arr_into(s, j, out); return; }
+    var e: i64 = j_scan_val(s, j);
+    if e < 0 { return; }
+    out.append_str(str_slice(s, j, e));
+}
+
+fn j_canon_obj_into(s: str, i: i64, out: &mut StringBuilder) {
     var mem: Vec<i64> = j_members(s, i);
     var n: i64 = mem.len() / 4;
     var keys: Vec<str> = Vec::new();
-    var vals: Vec<str> = Vec::new();
+    var ord: Vec<i64> = Vec::new();
     var m: i64 = 0;
     while m < n {
         var kend: i64 = mem.get(m * 4 + 1);
         keys.push(json_unescape(str_slice(s, mem.get(m * 4), kend)));
-        vals.push(j_canon(s, mem.get(m * 4 + 2)));
+        ord.push(m);
         m = m + 1;
     }
-    // Insertion sort by unescaped key text (matches historical canonical form)
+    // Insertion sort of member indices by unescaped key text (canonical form)
     var a: i64 = 1;
     while a < n {
-        var kk: str = keys.get(a);
-        var vv: str = vals.get(a);
+        var io: i64 = ord.get(a);
+        var kk: str = keys.get(io);
         var b: i64 = a - 1;
         while b >= 0 {
-            var kb: str = keys.get(b);
-            if str_compare(kb, kk) <= 0 { break; }
-            keys.set(b + 1, kb);
-            var vb: str = vals.get(b);
-            vals.set(b + 1, vb);
+            if str_compare(keys.get(ord.get(b)), kk) <= 0 { break; }
+            ord.set(b + 1, ord.get(b));
             b = b - 1;
         }
-        keys.set(b + 1, kk);
-        vals.set(b + 1, vv);
+        ord.set(b + 1, io);
         a = a + 1;
     }
-    var out: str = "{";
-    var m2: i64 = 0;
-    while m2 < n {
-        if m2 > 0 { out = out + ","; }
-        var rk: str = keys.get(m2);
-        var rv: str = vals.get(m2);
-        out = out + json_string(rk) + ":" + rv;
-        m2 = m2 + 1;
-    }
-    return out + "}";
-}
-
-fn j_canon_arr(s: str, i: i64) -> str {
-    var mem: Vec<i64> = j_members(s, i);
-    var n: i64 = mem.len() / 2;
-    var out: str = "[";
-    var m: i64 = 0;
+    out.append_str("{");
+    m = 0;
     while m < n {
-        if m > 0 { out = out + ","; }
-        out = out + j_canon(s, mem.get(m * 2));
+        if m > 0 { out.append_str(","); }
+        var mm: i64 = ord.get(m);
+        out.append_str(json_string(keys.get(mm)));
+        out.append_str(":");
+        j_canon_into(s, mem.get(mm * 4 + 2), out);
         m = m + 1;
     }
-    return out + "]";
+    out.append_str("}");
+}
+
+fn j_canon_arr_into(s: str, i: i64, out: &mut StringBuilder) {
+    var mem: Vec<i64> = j_members(s, i);
+    var n: i64 = mem.len() / 2;
+    out.append_str("[");
+    var m: i64 = 0;
+    while m < n {
+        if m > 0 { out.append_str(","); }
+        j_canon_into(s, mem.get(m * 2), out);
+        m = m + 1;
+    }
+    out.append_str("]");
 }
 
 // ─── Escaping ───────────────────────────────────────────────────────────

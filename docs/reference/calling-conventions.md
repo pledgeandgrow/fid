@@ -351,12 +351,22 @@ the loop is rejected by the borrow checker (`test_iter_invalidation_fail.fd`).
 
 ### Handles and freeing
 
-A `Vec` or `HashMap` value is a handle: assigning it, or copying a struct that
-holds it, shares the data. Copy-on-write (`core.fd:Vec_share`, proposal 0001)
-is written behind `LOWER_COW` in `lower.fd` and is off. The compiler frees a
-`Vec`/`HashMap` local that provably never leaves its variable
-(`lower.fd:lw_auto_drop_vecs`); a `Vec<str>` or `Vec<Vec>` that owns its
-elements frees them too.
+Ownership follows proposal 0004 (`lower.fd`, section "Ownership",
+`LOWER_RC = true`): a variable owns its value and drops it at the end of its
+scope; reading borrows; keeping a value (let, assignment, field, element,
+return, payload) takes an owner (`Lowerer_rc_own_value`: a temporary is
+handed over, anything else gets `Str_dup` / `Vec_share` / `HashMap_share` /
+`__own_dup_N`). A shared `Vec` buffer is copied at the first write
+(`core.fd:vec_own`), so `var b = a` gives an independent value. Copying a
+struct does not yet separate its `Vec` fields (known-bugs 2g.3).
+
+A `Vec` header is 40 bytes `{data, len, cap, code, tid}`; element codes 16
+and up are structs held inline (`code - 15` words, `LOWER_INLINE_STRUCTS`);
+a local `Vec` that never leaves its function keeps its header on the stack
+(`Vec_init_typed` / `Vec_drop_inplace`, `LOWER_STACK_VECS`). A Box is
+`[P_BOX_RC + owners]` then its payload (`LOWER_BOX_RC`). The older passes
+`lw_auto_drop_vecs/strs` and copy-on-write (`LOWER_COW`, proposal 0001) are
+off and must stay off.
 
 ### HashMap keys
 
@@ -379,10 +389,11 @@ would map to the markers panic (`test_hashmap_int_keys.fd`).
 ### `str` in IR
 
 `IrType::Str` is `IrType::Ptr(Box::new(IrType::U8))`. A `str` value points at
-NUL-terminated bytes. A heap string may carry a header (a magic word and the
-length in the 16 bytes before the bytes) or be a plain C string;
-`core.fd:p_str_free` frees either. String temporaries that provably die where
-they are used are freed by the compiler (`lower.fd:lw_auto_drop_strs`).
+NUL-terminated bytes. A heap string is counted: `[P_STR_RC + count][len]`
+before the bytes (core `p_str_alloc`); a literal is `[P_STR_STATIC][len]`;
+a plain C string has no header (`core.fd:p_str_len_word` tells them apart).
+String temporaries are dropped at the end of their statement by the
+ownership rule (proposal 0004).
 
 ### String operations
 
@@ -473,7 +484,7 @@ Always verify the cast is safe. A missing cast causes C compiler warnings or inc
 
 ## 12. PE Emitter Calling Conventions (session 5)
 
-The PE emitter (`compiler/pe.fd`) generates x86-64 machine code directly,
+The PE emitter (session 5: `compiler/pe.fd`; since Oct–Nov the default Windows backend is `compiler/pe_ir*.fd`, see docs/file-analysis/pe_ir.md) generates x86-64 machine code directly,
 bypassing C entirely. It uses the Windows x64 calling convention:
 
 ### Register usage

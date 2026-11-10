@@ -634,8 +634,10 @@ Depends on B, C, H5 and J.
 - [x] I5. `examples/http_server` runs on a native build (S).
 - [ ] I6. A sample service survives a 24-hour load test (M). A short run:
       160,000 requests stay at 5.2 MB with `http_serve_scoped`.
-- [ ] I7. TLS 1.3 on Windows: Schannel needs its newer credentials structure; 1.2
-      is negotiated today (S).
+- [ ] I7. TLS 1.3 on Windows: Schannel needs its newer credentials structure
+      (SCH_CRED + TLS_PARAMETERS); the SP_PROT_TLS1_3 bit in SCHANNEL_CRED
+      fails the handshake (verified — `tls_session_protocol` reads the
+      negotiated version, 1.2 today) (S).
 - [ ] I8. Binary HTTP bodies: a body is a `str`, so a zero byte ends it (M).
 - [ ] I9. `net`: `net_reliable_recv` never recognises an ACK, and the ACK it builds
       is never sent (S).

@@ -255,13 +255,27 @@ fn parse_generated_code(source: str) -> OptProgram {
 pub fn substitute(program: Program) -> Program {
     var prog: Program = program;
     var errs: Vec<str> = Vec::new();
+    // Compile time (CS4): a function with no node a phase rewrites is left
+    // as it is, not rebuilt 13 times. A function without comptime nodes gets
+    // none from substitution, and one without phase 3's patterns (an `if`
+    // on a bool literal, a `for` over a literal range, a call to a comptime
+    // fn) gets none from phase 3, so the result is the same; the scans visit
+    // the variants the phases visit. FID_CT_FULL=1: every function, as before.
+    var ct_full_env: str = p_getenv("FID_CT_FULL");
+    var full: bool = (ct_full_env as i64) != 0 && str_len(ct_full_env) > 0;
+    var need: Vec<bool> = Vec::new();
+    var ni: i64 = 0;
+    while ni < prog.funcs.len() {
+        need.push(full || ct_scan_stmts_sub(prog.funcs.get(ni).body));
+        ni = ni + 1;
+    }
 
     // Phase 1: Pre-substitute comptime expressions inside comptime function bodies
     var iter: i64 = 0;
     while iter < 8 {
         var fi: i64 = 0;
         while fi < prog.funcs.len() {
-            substitute_func(&mut prog.funcs, fi, &prog, &mut errs);
+            if need.get(fi) { substitute_func(&mut prog.funcs, fi, &prog, &mut errs); }
             fi = fi + 1;
         }
         iter = iter + 1;
@@ -270,7 +284,7 @@ pub fn substitute(program: Program) -> Program {
     // Phase 2: Substitute comptime expressions everywhere
     var fi2: i64 = 0;
     while fi2 < prog.funcs.len() {
-        substitute_func(&mut prog.funcs, fi2, &prog, &mut errs);
+        if need.get(fi2) { substitute_func(&mut prog.funcs, fi2, &prog, &mut errs); }
         fi2 = fi2 + 1;
     }
 
@@ -284,17 +298,223 @@ pub fn substitute(program: Program) -> Program {
         }
         cf = cf + 1;
     }
+    var need3: Vec<bool> = Vec::new();
+    var nj: i64 = 0;
+    while nj < prog.funcs.len() {
+        need3.push(full || ct_scan_stmts_aggr(prog.funcs.get(nj).body));
+        nj = nj + 1;
+    }
     var iter2: i64 = 0;
     while iter2 < 4 {
         var fi3: i64 = 0;
         while fi3 < prog.funcs.len() {
-            aggressive_comptime_func(&mut prog.funcs, fi3, &prog);
+            if need3.get(fi3) { aggressive_comptime_func(&mut prog.funcs, fi3, &prog); }
             fi3 = fi3 + 1;
         }
         iter2 = iter2 + 1;
     }
 
     return prog;
+}
+
+// --- Which functions a phase can change (read-only scans) -----------------
+// Each visits at least the variants its phase visits, so `false` means the
+// phase leaves the function as it is.
+
+/// Phases 1-2: a comptime expression or a ComptimeGen statement.
+fn ct_scan_stmts_sub(stmts: Vec<Stmt>) -> bool {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        if ct_scan_stmt_sub(stmts.get(i)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ct_scan_opt_sub(o: OptStmts) -> bool {
+    match o {
+        OptStmts::Some(b) => { return ct_scan_stmts_sub(b); }
+        OptStmts::None => {}
+    }
+    return false;
+}
+
+fn ct_scan_arms_sub(arms: Vec<MatchArm>) -> bool {
+    var i: i64 = 0;
+    while i < arms.len() {
+        if ct_scan_stmts_sub(arms.get(i).body) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ct_scan_stmt_sub(stmt: Stmt) -> bool {
+    match stmt {
+        Stmt::Let(_, _, e, _, _, _, _) => { return ct_scan_expr_sub(e); }
+        Stmt::LetTuple(_, e, _) => { return ct_scan_expr_sub(e); }
+        Stmt::Assign(_, _, e, _) => { return ct_scan_expr_sub(e); }
+        Stmt::IndexAssign(_, ix, _, e, _) => { return ct_scan_expr_sub(ix) || ct_scan_expr_sub(e); }
+        Stmt::DerefAssign(pe, _, e, _) => { return ct_scan_expr_sub(pe) || ct_scan_expr_sub(e); }
+        Stmt::FieldAssign(ob, _, _, e, _) => { return ct_scan_expr_sub(ob) || ct_scan_expr_sub(e); }
+        Stmt::Expr(e, _) => { return ct_scan_expr_sub(e); }
+        Stmt::Return(opt, _) => {
+            match opt {
+                OptBoxExpr::Some(b) => { return ct_scan_expr_sub(ct_box_expr_unbox(b)); }
+                OptBoxExpr::None => {}
+            }
+        }
+        Stmt::If(c, t, e, _) => { return ct_scan_expr_sub(c) || ct_scan_stmts_sub(t) || ct_scan_opt_sub(e); }
+        Stmt::While(c, b, _) => { return ct_scan_expr_sub(c) || ct_scan_stmts_sub(b); }
+        Stmt::For(_, it, b, _) => { return ct_scan_expr_sub(it) || ct_scan_stmts_sub(b); }
+        Stmt::Match(e, arms, _) => { return ct_scan_expr_sub(e) || ct_scan_arms_sub(arms); }
+        Stmt::Defer(b, _) => { return ct_scan_stmts_sub(b); }
+        Stmt::Txn(b, _) => { return ct_scan_stmts_sub(b); }
+        Stmt::RegionBlock(_, _, _, _, _, b, _) => { return ct_scan_stmts_sub(b); }
+        Stmt::Sandbox(b, _) => { return ct_scan_stmts_sub(b); }
+        Stmt::Unsafe(b, _) => { return ct_scan_stmts_sub(b); }
+        Stmt::ComptimeGen(_, _) => { return true; }
+        Stmt::Handle(b, hs, _) => {
+            if ct_scan_stmts_sub(b) { return true; }
+            var hi: i64 = 0;
+            while hi < hs.len() {
+                if ct_scan_stmts_sub(hs.get(hi).body) { return true; }
+                hi = hi + 1;
+            }
+        }
+        Stmt::Query(_, b, _) => { return ct_scan_stmts_sub(b); }
+        Stmt::Parallel(brs, _) => {
+            var bi: i64 = 0;
+            while bi < brs.len() {
+                if ct_scan_stmts_sub(brs.get(bi)) { return true; }
+                bi = bi + 1;
+            }
+        }
+        Stmt::Backward(l, _) => { return ct_scan_expr_sub(l); }
+        Stmt::Resume(c, v, _) => { return ct_scan_expr_sub(c) || ct_scan_expr_sub(v); }
+        Stmt::SpawnScope(b, _) => { return ct_scan_stmts_sub(b); }
+        _ => {}
+    }
+    return false;
+}
+
+fn ct_scan_exprs_sub(es: Vec<Expr>) -> bool {
+    var i: i64 = 0;
+    while i < es.len() {
+        if ct_scan_expr_sub(es.get(i)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ct_scan_expr_sub(expr: Expr) -> bool {
+    match expr {
+        Expr::Binary(_, l, r) => { return ct_scan_expr_sub(ct_box_expr_unbox(l)) || ct_scan_expr_sub(ct_box_expr_unbox(r)); }
+        Expr::Unary(_, e) => { return ct_scan_expr_sub(ct_box_expr_unbox(e)); }
+        Expr::Call(_, args) => { return ct_scan_exprs_sub(args); }
+        Expr::MethodCall(r, _, args) => { return ct_scan_expr_sub(ct_box_expr_unbox(r)) || ct_scan_exprs_sub(args); }
+        Expr::FieldAccess(e, _) => { return ct_scan_expr_sub(ct_box_expr_unbox(e)); }
+        Expr::StructLit(_, fields, _) => {
+            var fi: i64 = 0;
+            while fi < fields.len() {
+                if ct_scan_expr_sub(fields.get(fi).value) { return true; }
+                fi = fi + 1;
+            }
+        }
+        Expr::If(c, t, e) => { return ct_scan_expr_sub(c) || ct_scan_stmts_sub(t) || ct_scan_opt_sub(e); }
+        Expr::Block(b) => { return ct_scan_stmts_sub(b); }
+        Expr::Index(a, i) => { return ct_scan_expr_sub(ct_box_expr_unbox(a)) || ct_scan_expr_sub(ct_box_expr_unbox(i)); }
+        Expr::ArrayLit(_, els) => { return ct_scan_exprs_sub(els); }
+        Expr::Match(e, arms) => { return ct_scan_expr_sub(e) || ct_scan_arms_sub(arms); }
+        Expr::Range(a, b, _) => { return ct_scan_expr_sub(ct_box_expr_unbox(a)) || ct_scan_expr_sub(ct_box_expr_unbox(b)); }
+        Expr::Ref(e, _) => { return ct_scan_expr_sub(ct_box_expr_unbox(e)); }
+        Expr::Deref(e) => { return ct_scan_expr_sub(ct_box_expr_unbox(e)); }
+        Expr::StrConcat(l, r) => { return ct_scan_expr_sub(ct_box_expr_unbox(l)) || ct_scan_expr_sub(ct_box_expr_unbox(r)); }
+        Expr::Cast(e, _) => { return ct_scan_expr_sub(ct_box_expr_unbox(e)); }
+        Expr::Comptime(_) => { return true; }
+        Expr::ComptimeBlock(_) => { return true; }
+        Expr::ComptimeReflect(_, _) => { return true; }
+        _ => {}
+    }
+    return false;
+}
+
+/// Phase 3: an `if` on a bool literal, a `for` over a literal range, or a
+/// call to a comptime fn (ct_comptime_fns), where phase 3 looks.
+fn ct_scan_stmts_aggr(stmts: Vec<Stmt>) -> bool {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        if ct_scan_stmt_aggr(stmts.get(i)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ct_scan_stmt_aggr(stmt: Stmt) -> bool {
+    match stmt {
+        Stmt::Let(_, _, e, _, _, _, _) => { return ct_scan_expr_aggr(e); }
+        Stmt::Assign(_, _, e, _) => { return ct_scan_expr_aggr(e); }
+        Stmt::Expr(e, _) => { return ct_scan_expr_aggr(e); }
+        Stmt::Return(opt, _) => {
+            match opt {
+                OptBoxExpr::Some(b) => { return ct_scan_expr_aggr(ct_box_expr_unbox(b)); }
+                OptBoxExpr::None => {}
+            }
+        }
+        Stmt::If(c, t, e, _) => {
+            match c {
+                Expr::BoolLit(_) => { return true; }
+                _ => {}
+            }
+            if ct_scan_expr_aggr(c) || ct_scan_stmts_aggr(t) { return true; }
+            match e {
+                OptStmts::Some(eb) => { return ct_scan_stmts_aggr(eb); }
+                OptStmts::None => {}
+            }
+        }
+        Stmt::For(_, it, b, _) => {
+            match it {
+                Expr::Range(a, z, _) => {
+                    var a2: Expr = ct_box_expr_unbox(a);
+                    var z2: Expr = ct_box_expr_unbox(z);
+                    var lit_a: bool = false;
+                    var lit_z: bool = false;
+                    match a2 { Expr::IntLit(_) => { lit_a = true; } _ => {} }
+                    match z2 { Expr::IntLit(_) => { lit_z = true; } _ => {} }
+                    if lit_a && lit_z { return true; }
+                }
+                _ => {}
+            }
+            return ct_scan_expr_aggr(it) || ct_scan_stmts_aggr(b);
+        }
+        Stmt::While(c, b, _) => { return ct_scan_expr_aggr(c) || ct_scan_stmts_aggr(b); }
+        _ => {}
+    }
+    return false;
+}
+
+fn ct_scan_expr_aggr(expr: Expr) -> bool {
+    match expr {
+        Expr::Binary(_, l, r) => { return ct_scan_expr_aggr(ct_box_expr_unbox(l)) || ct_scan_expr_aggr(ct_box_expr_unbox(r)); }
+        Expr::Unary(_, e) => { return ct_scan_expr_aggr(ct_box_expr_unbox(e)); }
+        Expr::Call(callee, args) => {
+            if HashMap_get(ct_comptime_fns, callee) != 0 { return true; }
+            var ai: i64 = 0;
+            while ai < args.len() {
+                if ct_scan_expr_aggr(args.get(ai)) { return true; }
+                ai = ai + 1;
+            }
+        }
+        Expr::MethodCall(r, _, args) => {
+            if ct_scan_expr_aggr(ct_box_expr_unbox(r)) { return true; }
+            var mi: i64 = 0;
+            while mi < args.len() {
+                if ct_scan_expr_aggr(args.get(mi)) { return true; }
+                mi = mi + 1;
+            }
+        }
+        _ => {}
+    }
+    return false;
 }
 
 fn substitute_func(funcs: &mut Vec<Func>, idx: i64, original: &Program, errs: &mut Vec<str>) {

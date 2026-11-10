@@ -20,6 +20,48 @@
 
 ---
 
+## `fid` commands (Nov 9, 2026)
+
+The self-hosted `fid` has every tool built in; there are no separate
+binaries. Dispatch is in compiler/main.fd (docs/file-analysis/main.md).
+
+| Command | What it does | State (Nov 9) |
+|---|---|---|
+| `run <file>` | IR interpreter. `--leaks` / `--checked-alloc` rebuild through C (`ccompile --debug`, needs `CC`) and run with the debug allocator | works |
+| `ccompile` (`compile`) `<file> -o <out>` | C, then a C compiler. `--target`, `--cc-opt`, `--debug`, `--release`, `--inc`, `--no-cache`, `--profile`, `--leaks`, `--checked-alloc` | works |
+| `emit` / `build <file> -o <out>` | native: Windows PE (pe_ir) by default on Windows; `--target aarch64-linux\|riscv64-linux\|x86_64-linux` and `--nat` use the machine layer; `--bare`, `--elf`, `--boot`; through C on a POSIX host without `--target`; `--no-opt`, `--debug`, `--checked-alloc` | works except `--boot` and `--native` with the default target (panic) |
+| `dump-c`, `split-c <c> <prefix> <n>` | generated C to stdout; cut a C file into a header and n units | works |
+| `check <file> [--time]` | front end only: types, borrows, escapes | works |
+| `lint <file>` | unused functions and imports, `unwrap()` outside tests | works (does not resolve `compiler::` imports) |
+| `fmt <file> [--check]` | formatter, rewrites the file | **corrupts files** (known-bugs 2g.6) |
+| `test [<file>] [--fail]` | a file's `test_*`/`bench_*` functions, or the suite / expected-fail list | works on Windows; without a file broken on POSIX |
+| `test-rules [--smt <dir>]` | checks the rewrite rules on values; writes SMT obligations | works |
+| `qualify <file>` | safety evidence as JSON | works |
+| `audit <file> [--stdlib] [--strict]` | unsafe code a program reaches and its `// SAFETY:` comments | works |
+| `doc` / `scribe` | documentation generator | works, buggy (CRLF, `::` names) |
+| `veil` | coverage | **crashes** (Double free, 2g.2) |
+| `lsp` | language server | diagnostics only; symbol requests crash (2g.5) |
+| `ark ...` | package manager | works, buggy |
+| `parse-header <h>` | C header to Fides bindings | works |
+| `profile <file>` | `ccompile --profile`, run, top-20 table | works |
+| `bench <file>`, `watch` | run an executable N times (`watch` is the same as `bench`) | works |
+| `repl` | compile and run each line with tcc/gcc | not checked Nov 9 |
+| `tokens`, `ast` (`dump-ast`, `dump-ast-raw`, `dump-ast-flat`), `ir`, `pir`, `verify`, `sourcemap` | dumps (the four `ast` forms print the same summary) | work; `pir --opt` panics |
+| `opt`, `codegen`, `build-x86`, `gpu`, `wasm` | old PIR path and experimental back ends | `opt` panics; `codegen` prints assembly; the rest produce broken output (platforms.md, Tier 3) |
+| `notebook` | HTML page of a file's code blocks (evaluates nothing) | works |
+| `version` | version string (`0.1.0`) | works |
+
+Global flags: `--borrowck=off|on` (`warn` prints nothing), `--timeout N`
+(parsed, not enforced); arguments after `--` go to the program. Environment:
+`CC`, `FIDES_CC_OPT`, `FIDES_CFLAGS`, `FIDES_NO_CACHE`, `FID_HOME`,
+`FID_VERIFY`, `FIDES_COW_CHECK`, `FIDES_INC_FLAT`, and the pass switches
+`FID_IROPT_OFF`/`FID_IROPT_ON`/`FID_NAT_OFF`/`FID_RULES_ON`
+(docs/reference/architecture.md, "Self-hosted pipeline"). Not in `fid`
+(`fidesc` only): `debug`, `replay`, `autopsy`, `diff-test`, `link`, `sbom`,
+`spdx`.
+
+---
+
 ## Name Rationale
 
 ### ark -- Package Manager
@@ -33,9 +75,11 @@ the packages (like crates). Package manifests are `ark.toml`, lock files are
 
 **Status: ✅ Implemented (Rust + self-hosted)** — Two implementations:
 - **Rust ark** (`src/ark.rs`, `src/bin/ark.rs`) — the bootstrap version
-- **Self-hosted ark** (`compiler/ark.fd`) — written in Fides, compiled by
-  the self-hosted compiler (`fid ccompile compiler/ark.fd`, or
-  `fidesc dump-c compiler/ark.fd`)
+- **Self-hosted ark** (`compiler/ark.fd`) — written in Fides and built into
+  `fid`: run it as `fid ark <command>` (ark.fd has no `main` of its own).
+  Nov 9: a directory path dependency is reported as missing on Windows,
+  `lock` drops dependencies silently, and `update <name>` ignores the name
+  (docs/file-analysis/ark.md).
 
 Supports path dependencies (files and directories), git dependencies (clone
 with `--depth 1`, branch/tag support), lock file generation, and a custom
@@ -98,8 +142,11 @@ completes this identifier?". The name is already used informally in the
 Fides codebase (the interpreter is called "the reference oracle"). Now
 it's the official name for the language server.
 
-**Status: ✅ Implemented (as `fidesc lsp`)** — The LSP server is available
-as `fidesc lsp` (see `src/lsp.rs`). It implements JSON-RPC 2.0 over stdio
+**Status: ✅ Implemented (as `fidesc lsp`); ⚠️ `fid lsp` diagnostics only** —
+`fid lsp` (compiler/lsp.fd, Nov 9) publishes diagnostics (always at line 0)
+and has completion, hover, definition and rename, but each of those four
+ends with "Double free" (known-bugs 2g.5); it has no references. The LSP
+server below is `fidesc lsp` (see `src/lsp.rs`). It implements JSON-RPC 2.0 over stdio
 with no external dependencies (built-in JSON parser/serializer). Supports:
 `initialize`, `initialized`, `shutdown`, `exit`, `textDocument/didOpen`,
 `didChange`, `didClose`, `publishDiagnostics`, hover, goto-def, completion,

@@ -1,6 +1,6 @@
 # TEST.md — Fides Test Results
 
-*Last updated: Nov 6, 2026. The bootstrap fixpoint is VERIFIED byte-for-byte (stage 2 C == stage 3 C, 49 MB, Nov 6, checked by `RELEASE=1 scripts/bootstrap.sh`). 493 .fd test files under `tests/bootstrap/` (452 top level, 91 of them expected-fail `*_fail.fd`), 51 in `tests/selfhost/`, 10 examples. Current results are in "Current Results" below; the Session-16-era tables after it are kept for history — see `tests/bootstrap/baseline/test_results.txt` (via `./verify.sh`) for the saved baseline, and [CURRENT.md → Numbers](../../CURRENT.md#numbers) for the project's counts.*
+*Last updated: Nov 9, 2026. The bootstrap fixpoint is VERIFIED byte-for-byte (stage 2 C == stage 3 C: 49 MB on Nov 6, checked by `RELEASE=1 scripts/bootstrap.sh`; 67 MB on Nov 8 with ownership 0004). 543 .fd test files under `tests/bootstrap/` (502 top level, 105 of them expected-fail), 51 in `tests/selfhost/`, 104 in `tests/conformance/`, 3 in `tests/leaks/`, 11 examples. Current results are in "Current Results" below; the Session-16-era tables after it are kept for history — see `tests/bootstrap/baseline/test_results.txt` (via `./verify.sh`) for the saved baseline, and [selfhost.md → Numbers](selfhost.md#numbers) for the project's counts.*
 
 ## Current Results
 
@@ -29,9 +29,23 @@ backends), `test_mem_owned_drop`, `test_iter_invalidation_fail`,
 `test_borrowed_str_pass_fail`, `test_scoped_store_fail`,
 `test_hashmap_int_keys` (all 3 backends),
 `effects/test_effect_ho_instantiation`, and one negative test per safety rule
-([safety-rules.md](safety-rules.md)). `test_async` and
-`test_async_float_struct` crash under `fid emit` (native async is broken);
-the interpreter and C are fine.
+([safety-rules.md](safety-rules.md)). Native async under `fid emit` was
+fixed on Nov 6 and broke again in builds of Nov 9 afternoon
+(`release/fid-dev.exe` of 16:41: `test_async` printed 0 for every task
+result, `test_async_float_struct` panicked). Cause: the iropt passes
+envtrim, gconst and deadf; fixed again that evening in fid31, which matches the interpreter on pe_ir and `--nat`
+(known-bugs 2f.2). The interpreter and C are fine.
+
+**Nov 7–9 (fid only, quick runs; the full suite was not run):**
+
+| Check | Result |
+|---|---|
+| Native Linux, machine layer (`NATIVE=1 scripts/cross-test.sh`, QEMU) | AArch64 273, RISC-V 271, x86-64 272 of 317 match the interpreter (Nov 9) |
+| Windows x64 on the machine layer (`fid emit --nat`) | 301 of 338 (Nov 9) |
+| Leak gate (`scripts/leak-check.sh`, tests/leaks) | boxes, ownership, value_semantics: output and "every block was freed" (Nov 9) |
+| Key tests on a one-stage build with LF13/LF15/LF17 | 23 of 23 (interpreter and C); `test_vec_filled` also under `--leaks` (Nov 9) |
+| Encoder oracle (`scripts/enc-oracle.py`) | 1,181 forms, 0 mismatches against clang's assembler |
+| Rewrite rules (`scripts/rules-smt.sh`) | all 108 obligations proved by z3 |
 
 **Self-hosted compiler vs `fidesc`** (same program, outputs compared),
 Oct 27, 2026, on the 302 test programs of that date — not rerun since the

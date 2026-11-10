@@ -261,6 +261,9 @@ fn ts_acquire(s: i64, usage: i64, flags: i64, cert_slot: i64) -> bool {
         ts_set32(cred + 4, 1);
         ts_set(cred + 8, cert_slot);
     }
+    // grbitEnabledProtocols stays 0 (system default): pinning TLS1_3 bits
+    // fails the handshake — Schannel 1.3 needs the SCH_CRED + TLS_PARAMETERS
+    // credentials structure (release-roadmap I7), not the protocol field.
     ts_set32(cred + 72, flags);
     val expiry: i64 = ts_zeroed(1);
     val rc: i64 = sc_acquire(0, TS_PACKAGE, usage, 0, cred, 0, 0, s + TS_CRED * 8, expiry);
@@ -382,6 +385,18 @@ pub fn tls_accept(server: i64, fd: i64) -> i64 {
 /// The session's socket.
 pub fn tls_session_fd(s: i64) -> i64 {
     return ts_field(s, TS_FD);
+}
+
+/// The negotiated protocol: SP_PROT_TLS1_3_CLIENT (8192) for TLS 1.3,
+/// SP_PROT_TLS1_2_CLIENT (2048) for 1.2, -1 when not connected.
+pub fn tls_session_protocol(s: i64) -> i64 {
+    if ts_field(s, TS_CTX) == 0 { return -1; }
+    val info: i64 = ts_zeroed(4);
+    val rc: i64 = sc_query(s + TS_CTX * 8, 90, info);
+    if rc != 0 { p_free(info); return -1; }
+    val proto: i64 = ts_get32(info);
+    p_free(info);
+    return proto;
 }
 
 /// Send `n` bytes at `addr`. Returns `n`, or -1.

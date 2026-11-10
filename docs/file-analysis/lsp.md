@@ -1,76 +1,70 @@
-# lsp.fd — LSP Server (JSON-RPC over stdio)
+# lsp.fd
 
-> **Re-verified 2026-10-23:** confirmed — symbol handlers still bail to Json::Null on any lex/parse/type error (LSP dark on broken code), still syntactic-only (no TypeChecker data, no trait_impls).
+> **Re-audited 2026-11-09** against the current source and the latest `fid` build (s18).
+> New: every symbol request crashes the server (double free). Oct 23 findings still true.
 
-**1,082 LOC** vs `src/lsp.rs` 1,039 LOC (~104%). Live and nominally complete:
-message loop, Content-Length framing, all five handlers, diagnostics.
+- **Path:** `compiler/lsp.fd`
+- **LOC:** 1,082 (Rust `src/lsp.rs`: 1,039)
+- **Role:** language server over stdio: Content-Length framing, `initialize`, `shutdown`, `exit`,
+  `didOpen` / `didChange` (full sync) / `didClose`, `publishDiagnostics`, `completion`, `hover`,
+  `definition`, `rename`; `-32601` for unknown requests.
 
-## Where it's called
+## Callers
 
-- `compiler/main.fd:152` — `fides-c lsp` → `lsp_run()`. Sole caller.
-- Imports `compiler::json` (the sole consumer — see json.md).
+| Caller | Site | Use |
+|---|---|---|
+| `compiler/main.fd` | :181 `lsp` → `lsp_run()` | `fid lsp` |
 
-## Verified faithful
+Imports `compiler::ast`, `compiler::json`, `compiler::compiler` (`build_program_with_path`,
+`get_diagnostics`). Because of the last one, `fid check compiler/lsp.fd` type-checks the whole
+compiler (did not finish in 115 s).
 
-- Wire protocol 1:1: `Content-Length` header parse, `p_read_stdin(len)` body read,
-  `Content-Length: N\r\n\r\n` response framing, `-32601` for unknown requests.
-- `initialize` capabilities byte-for-byte equivalent (full sync=1, `diagnosticProvider`,
-  completion trigger `.`, hover/definition/rename on).
-- `p_read_line`/`p_read_stdin`/`p_stdin_eof` exist in codegen_c (:901-903, :3618-3631) —
-  the stdin primitives debugger.fd claimed missing. They work **only** on the compiled
-  binary; under `fidesc run` they hit the `Int(0)` runtime-default (irrelevant — nobody
-  interprets an LSP server).
-- `didChange` takes `changes[0].text` — correct given declared `textDocumentSync: 1` (Full).
+Changed since Oct 23: `doc_set` / `doc_remove` take `&mut Vec<DocEntry>` (commit e655b58, Nov 3).
+Before, opened documents were not kept.
 
 ## Findings
 
-### HIGH — every symbol feature dies while code is broken (the normal editing state)
+### Verified live (scripted JSON-RPC session piped into `fid lsp`)
 
-All four handlers (`completion` :486, `hover` :598, `definition` :737, `rename` :817) call
-`build_program_with_path` → `ResultProgram::Err` on **any** lex/parse/type/borrowck failure
-→ `Json::Null`. Rust's `build_program_for_lsp` (src/compiler.rs:1297-1310) does
-`parser.parse().unwrap_or_default()` — *"tolerate errors, we still want partial symbols"*.
+- **CRITICAL — NEW — completion, hover, definition and rename all crash.** After
+  `initialize` + `didOpen` of a valid two-function file, each of the four requests ends the
+  process with `Panic: Double free` in `vec_buf_free`, called from `Vec_drop` ←
+  `__own_drop_67` ← `__own_drop_4` ← `handle_<request>` ← `lsp_run`. Common code: each handler
+  gets a `Program` from `build_program_with_path` (:488, :604, :743, :823) into
+  `var program: Program;` and drops it at the end. The program likely shares Vec buffers with
+  the cached stdlib (cause is in ownership lowering or compiler.fd, not confirmed).
+- **MEDIUM — NEW — diagnostics point at the wrong place.** A type error on line 2 is published with
+  range line 0, character 0..1. The message keeps `(line 2)` but `parse_error_position`
+  (compiler.fd) does not extract it.
+- **OK:** `initialize` response, empty diagnostics for clean code, `-32601` for an unknown method.
 
-An editor sends requests precisely while the file is mid-edit (unclosed braces, half-typed
-idents). The Rust LSP keeps answering on the partial AST; **the Fides LSP goes completely
-dark on the first syntax error**. This is the single biggest LSP UX regression — hover,
-completion, goto-def and rename all stop working while you're actually typing.
+### From code inspection
 
-### MEDIUM — no TypeChecker data: syntactic decls only
+- **HIGH — STILL TRUE — every symbol feature gives up on broken code.** Each handler returns
+  `Json::Null` when the build fails (:493, :609, :748, :828). Rust parses with
+  `unwrap_or_default` and keeps going. Handlers also pass `OptStr::None` as the path (:488 etc.),
+  so files with local `use` imports fail too.
+- **MEDIUM — STILL TRUE — full pipeline per request.** Parse, stdlib merge, type check, borrow
+  check on every keystroke and every request (a tiny file takes about 4-6 s with s18).
+- **MEDIUM — STILL TRUE — trait-impl methods invisible.** Only `program.impls` is scanned
+  (:504, :707, :791, :863); `trait_impls` is never read.
+- **LOW — STILL TRUE — rename is a text search** (`find_all_occurrences`, :931): it rewrites
+  matches in comments and strings.
+- **LOW — columns are bytes**, LSP positions are UTF-16 units: wrong after non-ASCII text.
+- **LOW — parser globals grow** across requests (see parser.md).
+- **INFO — the raw runtime strings** `p_read_line` / `p_read_stdin` are used as `str` (:48, :78).
+  `str_len` of the null at EOF is 0 (`p_str_length` checks 0), so the EOF test works.
 
-Rust's handlers consume `tc.get_funcs()`/`get_structs()`/`get_consts()`/`get_methods()` —
-*resolved* types after typecheck. Fides walks `program.funcs`/`structs`/`enums`/`consts`/
-`traits` — shows **as-written** types (`type_to_str` on AST nodes). Functionally similar for
-annotated code but: no inferred-type display, no trait-impl method resolution (see below),
-and every handler **re-runs the full pipeline** (parse + stdlib merge + typecheck + borrowck
-+ `enrich_errors`) per keystroke — Rust's lsp path skips desugar/borrowck entirely
-("simple merge — no desugaring/comptime for LSP", src/compiler.rs:1314).
+## Fix order
 
-### MEDIUM — trait-impl methods invisible to all features
+1. Find the double free (run `fid lsp` with `--checked-alloc`, or reduce: build a program and
+   drop it twice). Until then the LSP only serves diagnostics.
+2. Return partial programs on parse/type errors for the symbol handlers; pass the document path.
+3. Fix the diagnostic range (parse `(line N)` in `parse_error_position`).
+4. Read `trait_impls`; skip borrow check for symbol requests.
 
-`trait_impls` is **never referenced** — completion (:504), hover (:707), definition (:791),
-rename (:863) scan `program.impls` only. `impl Iterator for MyType { ... }` methods are
-dark to hover/goto-def/rename. Rust sees them via `tc.get_methods()` (impl + trait merged).
+## Verification state
 
-### LOW (inherited) — rename rewrites comments and string literals
-
-`find_all_occurrences` (:931) is a raw whole-word scan with no lexing — renaming `foo`
-also edits `"foo"` in string literals and `// foo` in comments. **Identical in Rust**
-(src/lsp.rs:918-942 — same byte-scan). Semantic rename was never implemented on either side.
-
-### Noted
-
-- Stdlib symbols **are** visible — `build_program_with_path` merges cached stdlib, matching
-  Rust's `get_cached_stdlib`. Parity.
-- `[build]`/`[prof]` `p_eprint_str` spam per request → stderr only, doesn't corrupt stdout
-  JSON-RPC, but noisy.
-- `word_at_position`/`ident_before_dot`/`find_word_after`/`location_json` — careful
-  word-boundary logic, 1:1 with Rust incl. the `pub fn `/`pub val ` keyword patterns.
-
-## Assessment
-
-A working, wire-correct LSP whose utility is capped by two port regressions: the
-all-or-nothing program build (kills every feature on broken code — the exact moment an LSP
-matters) and the missing typechecker/trait-impl data (methods defined via traits are
-invisible). The fix is a tolerant `build_program_for_lsp` equivalent returning partial
-symbols — the machinery exists; only the strictness differs.
+- Live: four scripted sessions (one per symbol request) and one diagnostics session, input built
+  with a small Python script; stdout and stderr read.
+- `fid check compiler/lsp.fd`: not finished within 115 s (pulls in compiler.fd).

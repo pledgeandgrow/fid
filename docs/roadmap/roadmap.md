@@ -6,7 +6,7 @@
 
 The sections below are history. What is true now:
 
-- `fid` (self-hosted, `compiler/*.fd`, 61 modules, 133,688 lines) is the
+- `fid` (self-hosted, `compiler/*.fd`, 68 modules, 158,516 lines) is the
   release compiler. The 3-stage bootstrap reaches a byte-identical fixpoint
   (stage 2 C == stage 3 C, 49 MB). `fidesc` (Rust, `src/*.rs`, 57 files) is
   frozen: it builds stage 1 and runs the test harness.
@@ -7952,7 +7952,7 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 ##### L10F — Community
 - [ ] Community forum (Discourse or similar)
 - [ ] Discord/Matrix for real-time chat
-- [ ] GitHub Discussions for Q&A
+- [x] GitHub Discussions for Q&A
 - [ ] Contributing guide (how to contribute to compiler, stdlib, docs)
 - [ ] Code of conduct
 - [ ] **Overlaps with:** Existing roadmap Phase 7D

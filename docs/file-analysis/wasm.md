@@ -1,53 +1,68 @@
-# wasm.fd
+# wasm.fd — WebAssembly backend
 
-> **Re-verified 2026-10-23:** confirmed — DynCall/CallPtr still emit silent `0x41`/`i32.const 0` placeholders (:1163/:1169); `--wat` still a section dump; StructCopy still dropped (still unreachable anyway).
+> **Re-audited 2026-11-09.** Since 10-23 the only change is `str_equal(a,b)`
+> → `a == b` (commit 34259be). Probes with the latest self-hosted binary
+> (s18) and Node's `WebAssembly.Module`.
 
 - **Path:** `compiler/wasm.fd`
 - **LOC:** 1,656 (Rust `src/wasm.rs`: 1,277)
-- **Role:** WASM/WAT backend — `IrModule` → WASM binary (or `--wat` debug dump). Custom `WasmBuf` byte emitter, full module layout, host-import table, block-dispatch control-flow scheme (`cur_block` local + `br $dispatch`).
+- **Role:** `IrModule` → WASM binary (`generate_wasm` :1580), or a section
+  listing (`dump_wat` :1586). `WasmBuf` byte emitter; host imports from
+  `env`; control flow as a `cur_block` local + `br $dispatch` loop.
 
-## Where called
+## Where it's called
 
-| Caller | Line | Mechanism |
+| Caller | Line | What |
 |---|---|---|
-| `compiler/main.fd` | 29, 150 | `use` + `wasm` command → `cmd_wasm` (:1285) |
-| `compiler/compiler.fd` | 55 | `use compiler::wasm` |
-| `compiler/compiler.fd` | 1481 | `compile_to_wasm` — build_program → `lower` → `generate_wasm`/`dump_wat` |
+| `main.fd` | 32, 179 | `wasm` → `cmd_wasm` :1584 |
+| `compiler.fd` | 59, 1858 | `compile_to_wasm`: front end → `lower` → `generate_wasm` / `dump_wat` |
 
-Live: `fides-c wasm file.fd [-o out.wasm] [--wat]`. Pipeline identical to Rust's `compile_to_wasm` (`src/compiler.rs:1691`).
+The working WebAssembly route is `ccompile --target wasm32-wasi` (C via
+zig cc), not this module.
 
-## Findings
+## Findings — verified live
 
-### LOW — `--wat` is a section-summary dump, not WAT
+### HIGH — every module fails validation (NEW, inherited)
 
-`dump_wat` (:1586) generates the binary then renders `; magic:`, `; section N (name) size=M`, `; Functions:` — a *structural listing*, not WAT text. `cmd_wasm` writes it to `.wat` anyway ("Emitted WAT text" message overstates). **Inherited verbatim** — Rust's `dump_wat` (:1213) is the same byte-dump. A `.wat` output file can't be fed to `wat2wasm`. Cosmetic, same both sides.
+Probe: hello world (`fn add` + `println`) → 129,632-byte module (all of
+core is compiled in). `WebAssembly.Module` rejects it: "type error in
+constant expression (expected i32, got i64)" — the data segment offset is
+`i64.const` (:1536) for a 32-bit memory (limits flag 0x00, :1439).
+Patching that byte in a scratch copy gives the next error: "i64.load
+expected type i32, found local.get of type i64" — addresses are i64 for a
+32-bit memory. Rust's wasm.rs has the same `i64.const` (src/wasm.rs:1182).
+So no program compiled by `fid wasm` loads in any engine. Fix: wrap
+addresses to i32 (`i32.wrap_i64`) before memory ops and use `i32.const`
+offsets, or declare memory64 (limits flag 0x04) everywhere.
 
-### LOW (inherited) — several Inst arms are stubs/no-ops; call defaults are silent
+## Findings — code inspection
 
-Both sides identically:
+### LOW — `--wat` is a section listing, not WAT (STILL TRUE)
 
-- `MakeDyn`/`DynCall`/`CallPtr` → `i32.const 0` / default-typed 0 (:1162-1183 == Rust :834-863) — dynamic dispatch and indirect calls unsupported, silently returning 0.
-- Unknown callee → typed-0 default (:1150-1158 == Rust :821-830). The header comment at :20 claims `p_vec_*`/`p_map_*`/`p_string_*` emit `unreachable` — **they don't**; they hit the unknown-callee arm and emit `0`. Doc-vs-code mismatch, verbatim from Rust.
-- `TxnBegin/End`, `UnsafeBegin/End`, `GradBegin/End`, `Backward`, `RegionBegin/End` → no-ops / const-0 (:1275-1300 == Rust :963).
-- `StructCopy` → Fides drops it (`{}` + TODO :1282); Rust at least emits `memory.copy` with a placeholder size-0 (:966-972) — still wrong-but-present vs absent. Given `lower.fd` never emits `StructCopy` anyway (run-40 finding), unreachable in practice.
-- `Asm` → const-0 / drop (:1291+) — inline asm unsupported in WASM, correct direction.
+`dump_wat` :1586 prints sizes and function names; `cmd_wasm` says "Emitted
+WAT text".
 
-### Verified faithful (the parts that matter)
+### LOW — stubs and silent zeros (STILL TRUE)
 
-- **Inst-arm coverage is a superset**: 45 arms vs Rust's 43 — adds `None`/`Some` handling, zero missing.
-- **Module layout 1:1**: Type(1) → Import(2) → Function(3) → Memory(5) → Global(6) → Export(7) → Code(10) → Data(11) — spec-correct order, same `section()` helper shape.
-- **Host imports**: all 16 names identical (`print`, `println`, `eprint*`, `p_print_*`, `p_panic`, `p_malloc`, `p_alloc`, `p_free`, `p_str_concat`, `p_to_str*`) — env-module imports with matching param types.
-- **Call lowering**: host-import index → `call $hi` with i32↔i64 extension (`0xAC`/`0xA7` opcodes) matching signatures; user-fn index → `call $fidx` — 1:1.
-- **Control flow**: `Jump`/`Branch` → `cur_block` local + `br $dispatch` state-machine; `Return` with i32↔i64 fix-up; `Unreachable` → `0x00`; `Panic` → intern string + `p_panic` import + `unreachable`.
-- **Memory ops**: `Alloca`/`Load`/`Store`/`GetFieldPtr`/`GetElemPtr` (with elem-size scale) all present.
-- **`compile_to_wasm`**: `build_program_with_path` → `lower` → `generate_wasm` (or `dump_wat`→bytes) — same as Rust's :1691-1697; `cmd_wasm` arg parsing (`-o`, `--wat`, default stem derivation) faithful.
+- `MakeDyn`/`DynCall`/`CallPtr` → `i32.const 0` / typed zero (:1162-1183).
+- Unknown callees → typed zero; the header comment (:20-21) says
+  `p_vec_*`/`p_map_*`/`p_string_*` emit `unreachable`; they do not.
+- `StructCopy` dropped (:1282 TODO); `Txn*`, `Unsafe*`, `Grad*`,
+  `Backward`, `Region*` no-ops; `Asm` dropped (:1292).
 
-## Suggested fix order
+### Unchanged, faithful to Rust
 
-1. Nothing load-bearing is broken — this file is a competent port of a deliberately-minimal backend. The honest improvements: emit real `unreachable` for `p_vec_*`/`p_map_*`/`p_string_*` (matching the header's claim) instead of silent 0s, or fix the comment.
-2. If WAT output matters, emit real text format instead of the byte-dump.
-3. `memory.copy` for `StructCopy` is a one-line addition when/if lower ever emits it.
+Section order, host import table (16 names), call lowering with i32↔i64
+extension, block dispatch, `Panic` → `p_panic` + `unreachable`.
 
-## Verification
+## Fix order
 
-Inspection-only — no self-hosted binary. Verified by Inst-arm diff (superset, 2 extra), host-import diff (16/16 identical), section-order check, and direct arm-by-arm read of calls/conversions/control-flow vs `src/wasm.rs`. The gap list matches Rust's own TODO/no-op set almost exactly — this backend's limitations are upstream, not port-induced.
+1. Make the module valid (address width) — nothing else matters before.
+2. `unreachable` for unsupported builtins (or fix the comment).
+3. Real WAT text if wanted; `memory.copy` for StructCopy.
+
+## Verification state
+
+Probe: `fid wasm` → module → `WebAssembly.validate` false (two errors
+found, above). Arms re-read at the cited lines. Runtime behaviour not
+tested (module does not load).

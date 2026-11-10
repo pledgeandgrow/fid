@@ -1,0 +1,83 @@
+// tls_crypto.fd against published vectors:
+//   ChaCha20 block + stream — RFC 8439 §2.3.2 / §2.4.2
+//   Poly1305 tag — RFC 8439 §2.5.2
+//   ChaCha20-Poly1305 AEAD — RFC 8439 §2.8.2
+//   HKDF-SHA256 — RFC 5869 test case 1
+// A wrong answer panics on every backend.
+use tls_crypto;
+use encoding;
+
+fn hb(h: str) -> Vec<i64> { return hex_decode_bytes(h); }
+
+fn he(v: Vec) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        var b: i64 = v.get(i);
+        if b < 16 { out = out + "0"; }
+        out = out + int_to_hex(b);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn check(label: str, got: str, want: str) {
+    if !str_equal(got, want) {
+        p_panic(label + ": got " + got + ", want " + want);
+    }
+    println(label + " ok");
+}
+
+fn main() -> i64 {
+    // RFC 8439 §2.3.2 — block function (note the 09 word in the nonce)
+    var block: Vec = chacha20_block(
+        hb("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"),
+        hb("000000090000004a00000000"), 1);
+    check("chacha block", he(block),
+        "10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4e" +
+        "d2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e");
+    // RFC 8439 §2.4.2 — stream encryption
+    var ct: Vec = chacha20_encrypt(
+        hb("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"),
+        hb("000000000000004a00000000"), 1,
+        hb("4c616469657320616e642047656e746c656d656e206f662074686520636c617373206f66202739393a204966204920636f756c64206f6666657220796f75206f6e6c79206f6e652074697020666f7220746865206675747572652c2073756e73637265656e20776f756c642062652069742e"));
+    check("chacha enc", he(ct),
+        "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0b" +
+        "f91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d8" +
+        "07ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab7793736" +
+        "5af90bbf74a35be6b40b8eedf2785e42874d");
+    // RFC 8439 §2.5.2 — Poly1305 tag
+    var tag: Vec = poly1305_tag(
+        hb("43727970746f6772617068696320466f72756d2052657365617263682047726f7570"),
+        hb("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b"));
+    check("poly tag", he(tag), "a8061dc1305136c6c22b8baf0c0127a9");
+    // RFC 8439 §2.8.2 — AEAD encrypt, then decrypt round-trips
+    var aead: Vec = chacha20poly_encrypt(
+        hb("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"),
+        hb("070000004041424344454647"),
+        hb("50515253c0c1c2c3c4c5c6c7"),
+        hb("4c616469657320616e642047656e746c656d656e206f662074686520636c617373206f66202739393a204966204920636f756c64206f6666657220796f75206f6e6c79206f6e652074697020666f7220746865206675747572652c2073756e73637265656e20776f756c642062652069742e"));
+    check("aead ct", he(aead),
+        "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d6" +
+        "3dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b36" +
+        "92ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc" +
+        "3ff4def08e4b7a9de576d26586cec64b61161ae10b594f09e26a7e902ecbd060" +
+        "0691");
+    var pt: Vec = chacha20poly_decrypt(
+        hb("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"),
+        hb("070000004041424344454647"),
+        hb("50515253c0c1c2c3c4c5c6c7"), aead);
+    check("aead rt", he(pt),
+        "4c616469657320616e642047656e746c656d656e206f662074686520636c617373206f66202739393a204966204920636f756c64206f6666657220796f75206f6e6c79206f6e652074697020666f7220746865206675747572652c2073756e73637265656e20776f756c642062652069742e");
+    // RFC 5869 case 1 — HKDF extract + expand
+    var prk: Vec = hkdf_extract(
+        hb("000102030405060708090a0b0c"),
+        hb("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"));
+    check("hkdf prk", he(prk),
+        "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5");
+    var okm: Vec = hkdf_expand(prk, hb("f0f1f2f3f4f5f6f7f8f9"), 42);
+    check("hkdf okm", he(okm),
+        "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
+    println("tls_crypto vectors ok");
+    return 0;
+}

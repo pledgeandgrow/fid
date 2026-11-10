@@ -1,17 +1,19 @@
 # Fides Compiler Architecture
 
 **Version:** 0.6.0
-**Targets:** working: IR interpreter (`fid run`), C codegen (`fid ccompile`), native Windows x64 PE (`fid emit`); Linux x64 through C. Experimental / incomplete: native Linux ELF64, ARM64, RISC-V, Mach-O, COFF, WebAssembly, SPIR-V (GPU), bare-metal flat binary (`emit --bare` panics).
+**Targets (Nov 9):** working: IR interpreter (`fid run`), C codegen (`fid ccompile`, cross targets through `zig cc`), native Windows x64 PE (`fid emit`, compiler/pe_ir*.fd), native Linux AArch64 / RISC-V 64 / x86-64 static ELF (`fid emit --target aarch64-linux|riscv64-linux|x86_64-linux`, the machine layer compiler/nat_ir.fd + nat_enc.fd), and Windows x64 on the machine layer (opt-in `fid emit --nat`). Experimental / incomplete: the old PIR path (`build --native` with the default target, `emit --boot`: they panic), PIR-era ARM64/RISC-V assembly, Mach-O, COFF, WebAssembly, SPIR-V (GPU), bare-metal flat binary (`emit --bare`).
 
-> **Current state (Nov 6, 2026).** The release compiler is the self-hosted
-> `fid` (`compiler/*.fd`, 61 modules, 133,688 lines). The Rust compiler
-> `fidesc` (`src/*.rs`, 57 files, 112,511 lines) is frozen: it builds stage 1
+> **Current state (Nov 9, 2026).** The release compiler is the self-hosted
+> `fid` (`compiler/*.fd`, 68 modules, 158,516 lines). The Rust compiler
+> `fidesc` (`src/*.rs`, 57 files, 112,598 lines) is frozen: it builds stage 1
 > of the bootstrap and runs the test harness. Most of this document was
 > written for `fidesc`; the `src/*.rs` names below have `compiler/*.fd`
-> counterparts. The 3-stage bootstrap reaches a byte-identical fixpoint
-> (stage 2 C == stage 3 C, 49 MB); `fid` compiles itself to C in ~133 s
-> (type check 59 s, borrow check 16 s, lowering 20 s, C generation 12 s). The
-> stdlib has 137 modules, 43,576 lines (+ 4 in `stdlib/pe_runtime/`). The
+> counterparts; the self-hosted pipeline as it is now is in § "Self-hosted
+> pipeline (Nov 9)" below. The 3-stage bootstrap reaches a byte-identical
+> fixpoint (stage 2 C == stage 3 C, 67 MB on Nov 8); `fid` compiles itself to
+> C in 74 s when it is built at -O2 (type check 18 s, borrow check 5 s, mono
+> 5 s, lowering 24 s, C generation 20 s), 229 s at -O0. The
+> stdlib has 146 modules, 51,496 lines (+ 4 in `stdlib/pe_runtime/`, 5 in `stdlib/linux_runtime/`). The
 > language is described rule by rule in [reference.md](reference.md).
 
 ---
@@ -119,7 +121,7 @@ External linkers (ld, lld, link.exe) are separate processes that:
 - **Bare metal**: no runtime — `--bare` mode emits flat binary with no stdlib
 - Panic handler (`p_panic`), print stubs (`p_print_str/int/bool/float/newline`), allocator (`p_malloc`/`p_free`/`p_alloc`), string ops (`p_str_concat`/`p_to_str`), Vec/HashMap/String ops
 
-#### 9. Custom Stdlib — ✅ 137 Modules (Nov 6)
+#### 9. Custom Stdlib — ✅ 146 Modules (Nov 9)
 - `stdlib/core.fd` (auto-included): `Option`, `Result`, `println`, `assert`, `assert_eq`, `max`, `min`, `abs`, `clamp`
 - `stdlib/vec.fd`: dynamic array (Vec<T> with push/pop/get/len)
 - `stdlib/math.fd`: sqrt, sin, cos, floor, ceil, pow, fabs, constants
@@ -217,7 +219,7 @@ Phase 6:
 - `fidesc emit <file> -o <exe>` and `fid emit <file> -o <exe>` produce working `.exe`s in one step
 - **Self-hosted fixpoint verified** (Oct 30): `fid-n5 emit compiler/main.fd` produces a byte-identical compiler to `fid-n5` itself (12,304,896 B); the same source emitted by the C-compiled compiler is also byte-identical
 - A small IR optimizer runs first (`compiler/iropt.fd`: inlining of small single-block functions, constant folding, dead code removal)
-- Native async/tasks crash (`test_async`, `test_async_float_struct`); the interpreter and C are fine
+- Native async/tasks crashed until Nov 6 and broke again in builds of Nov 9 afternoon (iropt passes; fixed again in the evening's fid31, known-bugs 2f.2) (`test_async`, `test_async_float_struct`); the interpreter and C are fine
 - **Faster than the C build on real work:** `dump-c compiler/main.fd` 3m21s native vs 4m21s C release (0.77×), byte-identical 40 MB output
 - Cheap-codegen wins: block-local slot reuse (~140 KB → ~1.3 KB frames), store→load forwarding, immediates, `cmp`+`jcc` fusion, call-arg immediates, inlined `p_vec_len`/`p_map_len`/`p_*_is_empty`, `rep movsq` struct copies, `strlen`/`memcpy`-based string stubs, `pert_str_hash` word hashing
 - Correctness: Windows guard-page **stack probes** on frames > 4 KB; deterministic output (no HashMap-order leaks in slot assignment)
@@ -415,7 +417,7 @@ Native Binary / WASM / SPIR-V / C Source / Running Code
 - Integrated linker (ELF64 objects → executable, in-process)
 - Hot reload (`fidesc watch`) — rebuild and rerun on save, function-level change detection (no in-process swap)
 - Custom runtime: hand-encoded x86-64 machine code via raw syscalls (Linux, no libc) / kernel32.dll (Windows)
-- 137 stdlib modules (Nov 6), among them: core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can, task (uefi and kernel moved to fides-os)
+- 146 stdlib modules (Nov 9), among them: core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can, task (uefi and kernel moved to fides-os)
 - C header FFI parsing (`fidesc parse-header`)
 - Embedded/IoT: FixedBufferAllocator, `!RealTime` effect, RISC-V target, HAL framework
 - Smart pointers: `Box<T>` (recursive types), `Rc<T>` / `Arc<T>` (manual refcount management)
@@ -429,9 +431,9 @@ Native Binary / WASM / SPIR-V / C Source / Running Code
 **What's partial / pending:**
 - ✅ PIR optimizer: enabled by default in `build` (use `--no-opt` to disable). `--lto` for aggressive cross-module inlining. PGO removed.
 - ✅ Effect handlers: `handle { do } with`, `resume(cont, v)` runs the rest of the block
-- ⚠️ `async` / `await` / `spawn`: an `async fn` is a green task on its own stack; `spawn f(args)` runs on an OS thread with `@send` arguments. Native (`fid emit`) async crashes.
+- ⚠️ `async` / `await` / `spawn`: an `async fn` is a green task on its own stack; `spawn f(args)` runs on an OS thread with `@send` arguments. Native (`fid emit`) async worked Nov 6 and broke in builds of Nov 9 afternoon (iropt passes; fixed again in the evening's fid31).
 - ❌ `#[test]` attribute: parsed and ignored; `fid test file.fd` runs `test_*` and `bench_*` functions
-- ❌ Value semantics (proposal 0001): copy-on-write written behind `LOWER_COW` (off); `var b = a` on a `Vec` aliases
+- ⚠️ Value semantics: `var b = a` on a `Vec`/`str`/`HashMap` copies (shared until the first write; proposal 0004, `LOWER_RC`); a copied struct still shares its `Vec` fields. `LOWER_COW` (proposal 0001's lowering) is off
 - ✅ `@derive(Debug/Clone/Serialize/Deserialize)`: implemented (Phase 7.7)
 - ✅ Borrow checker: Phases 1-6 complete, `on` by default, field-wise borrows, two-phase borrows, NLL
 - ✅ `Box<T>` recursive types: implemented (self-hosting blocker 3 resolved)
@@ -594,11 +596,11 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 
 #### What's Planned
 - Region allocator: arena-based, tied to the region system (not started; today the compiler frees collections declared in a region at its end)
-- Copy-on-write `Vec`/`str`/`HashMap` (proposal 0001): written behind `LOWER_COW` (off)
+- Value semantics for `Vec`/`str`/`HashMap`: done by the ownership rule of proposal 0004 (shared until the first write); proposal 0001's `LOWER_COW` stays off; struct copies do not separate their `Vec` fields yet
 
 ---
 
-### Custom Stdlib — 137 Modules (Nov 6; selection below)
+### Custom Stdlib — 146 Modules (Nov 9; selection below)
 
 | Module | File | Contents |
 |--------|------|----------|
@@ -664,7 +666,7 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 - `async` / `await` / `spawn` implementation
 
 #### Phase 6: Fides in Fides (Self-Hosting) — reached
-- Compiler rewritten in Fides (`compiler/*.fd`, 61 modules); `fid` is the release compiler
+- Compiler rewritten in Fides (`compiler/*.fd`, 68 modules); `fid` is the release compiler
 - Fides compiler compiles itself: 3-stage bootstrap, byte-identical fixpoint (49 MB of C, Nov 6)
 - No Rust dependency for end users; stage 1 is still built by `fidesc` until a stage 0 is pinned (`PIN=1`; none yet)
 - Compiler binary is a Fides binary
@@ -675,7 +677,56 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 
 ---
 
-## 1. Pipeline Overview
+## Self-hosted pipeline (Nov 9)
+
+What `fid` (`compiler/*.fd`) does today, read from the code on Nov 9, 2026.
+Sections 1–5 below describe `fidesc` (`src/*.rs`) and the PIR path. Each
+module's own doc is `docs/file-analysis/<module>.md`.
+
+**Front end** (compiler.fd `build_program_with_path_borrowck`), shared by
+every command:
+
+1. `stdlib/core.fd`, parsed once per process; a native build first merges
+   its runtime (`stdlib/pe_runtime/` for pe_ir, `stdlib/linux_runtime/` plus
+   pe_runtime's data and tensor for nat_ir).
+2. Lex (lexer.fd, token.fd) and parse (parser.fd) the program; resolve
+   `use` imports and merge stdlib, imports and program.
+3. AST passes: `@cfg` filter, derives, synthesized `==`, desugaring,
+   `comptime gen` (comptime_eval.fd), default trait methods, turbofish
+   (mono.fd).
+4. Checks: typechecker.fd (types, effects, capabilities, safety
+   annotations, generics; core's bodies are skipped once a core version
+   checked clean), escape.fd (second-class references), secrecy.fd
+   (`@secret`, only when the program uses it), lints, borrowck.fd, the
+   optional copy-on-write report (cowcheck.fd, `FIDES_COW_CHECK=1`), comptime
+   substitution, monomorphization (mono.fd).
+5. Lowering to SSA IR (lower.fd, ir.fd), with the ownership rule of
+   proposal 0004 (`LOWER_RC`): every dup, drop and move is inserted here.
+
+**Back ends:**
+
+| Command | Path |
+|---|---|
+| `run` | interp.fd: the IR interpreter over a simulated byte memory |
+| `ccompile`, `dump-c`, `split-c` | codegen_c.fd: IR to C99 plus an embedded C runtime; no IR optimizer; checks.fd drops proven bounds/overflow checks; then a C compiler (`CC`, zig cc, gcc, clang, tcc). `split-c` (csplit.fd) cuts the C into units |
+| `emit` / `build`, Windows host (default) | iropt.fd (IR optimizer), then pe_ir.fd + pe_ir_enc.fd + pe_ir_stubs.fd: machine code and a PE32+ file, no C compiler |
+| `emit --target aarch64-linux \| riscv64-linux \| x86_64-linux`, `emit --nat` | iropt.fd, rules.fd, egraph.fd, then the machine layer nat_ir.fd + nat_enc.fd: static ELF, or a PE for `--nat` |
+| `emit --bare`, `emit --elf` | pe_ir's flat binary / no-std ELF |
+| `build`, POSIX host, no `--target` | through C |
+| `build --native` (default target), `opt`, `pir --opt`, `codegen`, `emit --boot` | the old PIR path: pir.fd, opt.fd, regalloc.fd, codegen_x64/arm64/riscv.fd, peephole.fd, elf64.fd, linker.fd, pe.fd. Only `codegen` and `pir` without `--opt` work; the optimizer panics (known-bugs 2g.17) |
+| `wasm`, `gpu` | wasm.fd, gpu.fd: run, output does not validate |
+| `check`, `lint`, `fmt`, `lsp`, `doc`, `veil`, `ark`, `qualify`, `audit`, `parse-header`, `test`, `test-rules` | tools: main.fd dispatches each (full list in docs/file-analysis/main.md) |
+
+**Checks of the own backends:** `FID_VERIFY=1` (irverify.fd after each
+mid-end stage, nat_ir's allocation checker), `scripts/enc-oracle.py`,
+`scripts/pass-matrix.sh`, `fid test-rules --smt`. Pass switches:
+`FID_IROPT_OFF`, `FID_IROPT_ON`, `FID_NAT_OFF`, `FID_RULES_ON`.
+
+**Not reached from `main.fd`:** autograd, debugger, diag, embedded,
+flat_ast, hotreload, native_debugger, runtime. codegen.fd is imported by
+compiler.fd but nothing in it is called.
+
+## 1. Pipeline Overview (`fidesc`)
 
 ```
 Source (.fd)
@@ -745,7 +796,7 @@ Source (.fd)
                                                      Native .exe
 ```
 
-The **`build` command** uses the full PIR pipeline (L1→L2→L3 → codegen → peephole → ELF64) and is the primary native backend on Linux — it produces working ELF64 executables directly with zero external tool dependencies. **Cross-compilation** to ARM64 (`--target arm64-linux`) and RISC-V (`--target riscv64-linux`) uses built-in instruction encoders and runtime libraries with raw Linux syscalls, also producing valid ELF64 executables. Cross-compilation to Windows (`--target x86-64-windows`) uses the PE emitter. The **`emit` command** bypasses PIR entirely: it operates directly on IR to produce Windows `.exe` files via the PE emitter (or bare-metal flat binaries with `--bare`). The **WASM backend** (`wasm.rs`) and **SPIR-V GPU backend** (`gpu.rs`) both consume PIR L3. The **C codegen** (`codegen_c.rs`) consumes IR directly. The **interpreter** provides rapid testing without any external tools. Object file formats (ELF64, Mach-O, COFF) are available via `codegen --elf|--macho|--coff`, and multiple object files can be linked with the integrated `linker.rs`.
+In `fidesc`, the **`build` command** uses the full PIR pipeline (L1→L2→L3 → codegen → peephole → ELF64) and is the primary native backend on Linux — it produces working ELF64 executables directly with zero external tool dependencies. (In `fid` this path panics; native Linux comes from the machine layer, see "Self-hosted pipeline".) **Cross-compilation** to ARM64 (`--target arm64-linux`) and RISC-V (`--target riscv64-linux`) uses built-in instruction encoders and runtime libraries with raw Linux syscalls, also producing valid ELF64 executables. Cross-compilation to Windows (`--target x86-64-windows`) uses the PE emitter. The **`emit` command** bypasses PIR entirely: it operates directly on IR to produce Windows `.exe` files via the PE emitter (or bare-metal flat binaries with `--bare`). The **WASM backend** (`wasm.rs`) and **SPIR-V GPU backend** (`gpu.rs`) both consume PIR L3. The **C codegen** (`codegen_c.rs`) consumes IR directly. The **interpreter** provides rapid testing without any external tools. Object file formats (ELF64, Mach-O, COFF) are available via `codegen --elf|--macho|--coff`, and multiple object files can be linked with the integrated `linker.rs`.
 
 ### Entry Points (`compiler.rs`)
 
@@ -792,7 +843,7 @@ Before type-checking, the compiler:
 4. Merges stdlib + imported modules + user code (user wins on conflicts, `extern_decls` merged)
 5. Type-checks the merged program with module-level visibility enforcement
 
-**Standard library modules** (137 modules in `stdlib/`, 43,576 lines, Nov 6; `uefi.fd` below moved to fides-os): `core.fd` (auto-included), `vec.fd`, `math.fd`, `string.fd`, `fmt.fd`, `bits.fd`, `sort.fd`, `hash.fd`, `iter.fd`, `stack.fd`, `queue.fd`, `buffer.fd`, `collections.fd`, `result.fd`, `random.fd`, `path.fd`, `units.fd`, `uuid.fd`, `crypto.fd`, `storage.fd`, `clinical.fd`, `medical.fd`, `ecu.fd`, `scada.fd`, `swift.fd`, `grid.fd`, `ota.fd`, `banking.fd`, `kv_cache.fd`, `quant.fd`, `dp.fd`, `shard.fd`, `channel.fd`, `sync.fd`, `parallel.fd`, `ecs.fd`, `events.fd`, `db.fd`, `http.fd`, `json.fd`, `simd.fd`, `shape.fd`, `tensor.fd`, `money.fd`, `alloc.fd`, `file.fd`, `time.fd`, `typed_strings.fd`, `memo.fd`, `privacy.fd`, `env.fd`, `args.fd`, `process.fd`, `regex.fd`, `tilemap.fd`, `sprite.fd`, `flowfield.fd`, `streaming.fd`, `scene.fd`, `physics.fd`, `audio.fd`, `input.fd`, `arinc.fd`, `can.fd`, `fs.fd`, `io.fd`, `os.fd`, `sys.fd`, `uefi.fd` — imported explicitly via `use`.
+**Standard library modules** (146 modules in `stdlib/`, 51,496 lines, Nov 9; `uefi.fd` below moved to fides-os): `core.fd` (auto-included), `vec.fd`, `math.fd`, `string.fd`, `fmt.fd`, `bits.fd`, `sort.fd`, `hash.fd`, `iter.fd`, `stack.fd`, `queue.fd`, `buffer.fd`, `collections.fd`, `result.fd`, `random.fd`, `path.fd`, `units.fd`, `uuid.fd`, `crypto.fd`, `storage.fd`, `clinical.fd`, `medical.fd`, `ecu.fd`, `scada.fd`, `swift.fd`, `grid.fd`, `ota.fd`, `banking.fd`, `kv_cache.fd`, `quant.fd`, `dp.fd`, `shard.fd`, `channel.fd`, `sync.fd`, `parallel.fd`, `ecs.fd`, `events.fd`, `db.fd`, `http.fd`, `json.fd`, `simd.fd`, `shape.fd`, `tensor.fd`, `money.fd`, `alloc.fd`, `file.fd`, `time.fd`, `typed_strings.fd`, `memo.fd`, `privacy.fd`, `env.fd`, `args.fd`, `process.fd`, `regex.fd`, `tilemap.fd`, `sprite.fd`, `flowfield.fd`, `streaming.fd`, `scene.fd`, `physics.fd`, `audio.fd`, `input.fd`, `arinc.fd`, `can.fd`, `fs.fd`, `io.fd`, `os.fd`, `sys.fd`, `uefi.fd` — imported explicitly via `use`.
 
 **String concatenation**: `str + str` is lowered to a `p_str_concat` runtime call. Works with literals, variables, and inline function call results. `str + i64` is pointer arithmetic (not concatenation).
 
@@ -1094,7 +1145,7 @@ Translates SSA IR to portable C99 code that compiles with MSVC (`cl.exe`), GCC, 
 
 ### 2.9 Build Pipeline (`main.rs`)
 
-The `build` command is the primary native backend on Linux — it uses the full PIR pipeline with zero external tools:
+In `fidesc`, the `build` command is the primary native backend on Linux — it uses the full PIR pipeline with zero external tools (not in `fid`: see "Self-hosted pipeline"):
 
 1. `compiler::build_executable(source, path)` → PIR (L1→L2→L3) → codegen → peephole → ELF64 bytes
 2. Write bytes directly to executable file

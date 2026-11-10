@@ -1,0 +1,305 @@
+// compiler/reach.fd — which functions `lower` needs (compile time, CS4)
+//
+// `fid emit` generates code only for what main reaches, but lowering used to
+// turn every function of the program into IR first. reach_keep_set computes,
+// on the AST, the functions a build can reach, conservatively; lower.fd
+// lowers those only (g_lower_keep). Roots: main, every core function, every
+// runtime function (pe_/pert_/ped_/pet_/nat_/p_/__: lowering, the backends
+// and the C runtime call them by name), trait impl methods (dynamic
+// dispatch), comptime functions and any function with an annotation. A
+// kept body marks every name it mentions: calls (also `A::b` as `A_b`),
+// method names (any impl method of that name), identifiers (function values)
+// and string literals (functions started by name: task_go("f"), spawns).
+// The ownership helpers (__own_*, __p_mem_*) are generated after the bodies
+// from what was lowered, as before.
+//
+// Only `emit` uses it (main.fd); the C path and `fid run` lower everything.
+// FID_LOWER_ALL=1: lower every function, as before.
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+
+/// A HashMap of keys "fn:<name>" and "impl:<type>:<method>" to keep, or 0
+/// (keep everything) when FID_LOWER_ALL is set.
+pub fn reach_keep_set(program: Program, core_names: Vec<str>) -> i64 {
+    var all_env: str = p_getenv("FID_LOWER_ALL");
+    if (all_env as i64) != 0 && str_len(all_env) > 0 { return 0; }
+    var core: i64 = HashMap_new();
+    var ci: i64 = 0;
+    while ci < core_names.len() { HashMap_insert(core, core_names.get(ci), 1); ci = ci + 1; }
+    var names: i64 = HashMap_new();
+    var keep: i64 = HashMap_new();
+    // Bodies still to scan: (kind 0 fn / 1 impl, index, method index)
+    var todo: Vec<i64> = Vec::new();
+    var fi: i64 = 0;
+    while fi < program.funcs.len() {
+        var f: Func = program.funcs.get(fi);
+        if rc_root(f, HashMap_contains(core, f.name)) {
+            HashMap_insert(keep, "fn:" + f.name, 1);
+            todo.push(0); todo.push(fi); todo.push(0);
+        }
+        fi = fi + 1;
+    }
+    var ii: i64 = 0;
+    while ii < program.impls.len() {
+        var imp: ImplDef = program.impls.get(ii);
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            var m: Func = imp.methods.get(mi);
+            if rc_root(m, HashMap_contains(core, imp.struct_name + "_" + m.name) || HashMap_contains(core, m.name)) {
+                HashMap_insert(keep, "impl:" + imp.struct_name + ":" + m.name, 1);
+                todo.push(1); todo.push(ii); todo.push(mi);
+            }
+            mi = mi + 1;
+        }
+        ii = ii + 1;
+    }
+    // Trait impl methods are always lowered (lower.fd does not ask): scan them
+    var ti: i64 = 0;
+    while ti < program.trait_impls.len() {
+        var tim: TraitImpl = program.trait_impls.get(ti);
+        var tm: i64 = 0;
+        while tm < tim.methods.len() {
+            rc_collect_stmts(tim.methods.get(tm).body, names);
+            tm = tm + 1;
+        }
+        ti = ti + 1;
+    }
+    // Globals' and constants' initializers may name functions too
+    var gi: i64 = 0;
+    while gi < program.globals.len() {
+        rc_collect_expr(program.globals.get(gi).init, names);
+        gi = gi + 1;
+    }
+    // To a fixpoint: scan kept bodies, keep what they name
+    var changed: bool = true;
+    while changed {
+        while todo.len() > 0 {
+            var mth: i64 = todo.get(todo.len() - 1); todo.pop();
+            var idx: i64 = todo.get(todo.len() - 1); todo.pop();
+            var kind: i64 = todo.get(todo.len() - 1); todo.pop();
+            if kind == 0 {
+                rc_collect_func(program.funcs.get(idx), names);
+            } else {
+                rc_collect_func(program.impls.get(idx).methods.get(mth), names);
+            }
+        }
+        changed = false;
+        fi = 0;
+        while fi < program.funcs.len() {
+            var f2: Func = program.funcs.get(fi);
+            var k2: str = "fn:" + f2.name;
+            if !HashMap_contains(keep, k2) && HashMap_contains(names, f2.name) {
+                HashMap_insert(keep, k2, 1);
+                todo.push(0); todo.push(fi); todo.push(0);
+                changed = true;
+            }
+            fi = fi + 1;
+        }
+        ii = 0;
+        while ii < program.impls.len() {
+            var imp2: ImplDef = program.impls.get(ii);
+            var mj: i64 = 0;
+            while mj < imp2.methods.len() {
+                var m2: Func = imp2.methods.get(mj);
+                var k3: str = "impl:" + imp2.struct_name + ":" + m2.name;
+                if !HashMap_contains(keep, k3)
+                    && (HashMap_contains(names, "#m:" + m2.name) || HashMap_contains(names, imp2.struct_name + "_" + m2.name)
+                        || HashMap_contains(names, m2.name)) {
+                    HashMap_insert(keep, k3, 1);
+                    todo.push(1); todo.push(ii); todo.push(mj);
+                    changed = true;
+                }
+                mj = mj + 1;
+            }
+            ii = ii + 1;
+        }
+    }
+    return keep;
+}
+
+/// Kept whatever the program calls: main, core, the runtime and builtins,
+/// comptime functions and annotated functions.
+fn rc_root(f: Func, in_core: bool) -> bool {
+    if in_core || f.is_comptime || f.annotations.len() > 0 { return true; }
+    var n: str = f.name;
+    if n == "main" || n == "main_entry" { return true; }
+    return str_starts_with(n, "p_") || str_starts_with(n, "pe_") || str_starts_with(n, "pert_")
+        || str_starts_with(n, "ped_") || str_starts_with(n, "pet_") || str_starts_with(n, "nat_")
+        || str_starts_with(n, "__");
+}
+
+fn rc_name(names: i64, n: str) {
+    if !HashMap_contains(names, n) { HashMap_insert(names, n, 1); }
+}
+
+fn rc_collect_func(f: Func, names: i64) {
+    rc_collect_stmts(f.body, names);
+    var pi: i64 = 0;
+    while pi < f.params.len() {
+        if f.params.get(pi).has_default { rc_collect_expr(f.params.get(pi).default_expr, names); }
+        pi = pi + 1;
+    }
+    var qi: i64 = 0;
+    while qi < f.preconditions.len() { rc_collect_expr(f.preconditions.get(qi), names); qi = qi + 1; }
+    qi = 0;
+    while qi < f.postconditions.len() { rc_collect_expr(f.postconditions.get(qi), names); qi = qi + 1; }
+}
+
+fn rc_collect_stmts(stmts: Vec<Stmt>, names: i64) {
+    var i: i64 = 0;
+    while i < stmts.len() { rc_collect_stmt(stmts.get(i), names); i = i + 1; }
+}
+
+fn rc_collect_opt(o: OptStmts, names: i64) {
+    match o {
+        OptStmts::Some(b) => { rc_collect_stmts(b, names); }
+        OptStmts::None => {}
+    }
+}
+
+fn rc_collect_optbox(o: OptBoxExpr, names: i64) {
+    match o {
+        OptBoxExpr::Some(b) => { rc_collect_expr(box_expr_unbox(b), names); }
+        OptBoxExpr::None => {}
+    }
+}
+
+fn rc_collect_exprs(es: Vec<Expr>, names: i64) {
+    var i: i64 = 0;
+    while i < es.len() { rc_collect_expr(es.get(i), names); i = i + 1; }
+}
+
+fn rc_collect_arms(arms: Vec<MatchArm>, names: i64) {
+    var i: i64 = 0;
+    while i < arms.len() {
+        var a: MatchArm = arms.get(i);
+        rc_collect_optbox(a.guard, names);
+        rc_collect_stmts(a.body, names);
+        i = i + 1;
+    }
+}
+
+fn rc_collect_stmt(stmt: Stmt, names: i64) {
+    match stmt {
+        Stmt::Let(_, _, e, _, _, _, _) => { rc_collect_expr(e, names); }
+        Stmt::LetTuple(_, e, _) => { rc_collect_expr(e, names); }
+        Stmt::LetUninit(_, _, _, _) => {}
+        Stmt::Assign(_, _, e, _) => { rc_collect_expr(e, names); }
+        Stmt::IndexAssign(_, ix, _, e, _) => { rc_collect_expr(ix, names); rc_collect_expr(e, names); }
+        Stmt::DerefAssign(pe, _, e, _) => { rc_collect_expr(pe, names); rc_collect_expr(e, names); }
+        Stmt::FieldAssign(ob, _, _, e, _) => { rc_collect_expr(ob, names); rc_collect_expr(e, names); }
+        Stmt::Expr(e, _) => { rc_collect_expr(e, names); }
+        Stmt::Return(o, _) => { rc_collect_optbox(o, names); }
+        Stmt::If(c, t, e, _) => { rc_collect_expr(c, names); rc_collect_stmts(t, names); rc_collect_opt(e, names); }
+        Stmt::While(c, b, _) => { rc_collect_expr(c, names); rc_collect_stmts(b, names); }
+        Stmt::For(_, it, b, _) => { rc_collect_expr(it, names); rc_collect_stmts(b, names); }
+        Stmt::Loop(b, _) => { rc_collect_stmts(b, names); }
+        Stmt::Break(o, _) => { rc_collect_optbox(o, names); }
+        Stmt::Defer(b, _) => { rc_collect_stmts(b, names); }
+        Stmt::Match(e, arms, _) => { rc_collect_expr(e, names); rc_collect_arms(arms, names); }
+        Stmt::Handle(b, hs, _) => {
+            rc_collect_stmts(b, names);
+            var hi: i64 = 0;
+            while hi < hs.len() {
+                rc_name(names, hs.get(hi).op);
+                rc_collect_stmts(hs.get(hi).body, names);
+                hi = hi + 1;
+            }
+        }
+        Stmt::Do(eff, op, args, _) => { rc_name(names, op); rc_name(names, eff + "_" + op); rc_collect_exprs(args, names); }
+        Stmt::RegionBlock(_, _, _, _, _, b, _) => { rc_collect_stmts(b, names); }
+        Stmt::Sandbox(b, _) => { rc_collect_stmts(b, names); }
+        Stmt::Unsafe(b, _) => { rc_collect_stmts(b, names); }
+        Stmt::Txn(b, _) => { rc_collect_stmts(b, names); }
+        Stmt::ComptimeGen(b, _) => { rc_collect_stmts(b, names); }
+        Stmt::GradBlock(_, b, _) => { rc_collect_stmts(b, names); }
+        Stmt::Backward(e, _) => { rc_collect_expr(e, names); }
+        Stmt::Query(_, b, _) => { rc_collect_stmts(b, names); }
+        Stmt::Select(cases, dflt, _) => {
+            var si: i64 = 0;
+            while si < cases.len() {
+                rc_collect_expr(cases.get(si).channel, names);
+                rc_collect_stmts(cases.get(si).body, names);
+                si = si + 1;
+            }
+            rc_collect_opt(dflt, names);
+        }
+        Stmt::Parallel(brs, _) => {
+            var bi: i64 = 0;
+            while bi < brs.len() { rc_collect_stmts(brs.get(bi), names); bi = bi + 1; }
+        }
+        Stmt::Resume(c, v, _) => { rc_collect_expr(c, names); rc_collect_expr(v, names); }
+        Stmt::SpawnScope(b, _) => { rc_collect_stmts(b, names); }
+        _ => {}
+    }
+}
+
+fn rc_collect_expr(expr: Expr, names: i64) {
+    match expr {
+        Expr::StringLit(s) => { if str_len(s) > 0 && str_len(s) < 128 { rc_name(names, s); } }
+        Expr::Ident(n) => { rc_name(names, n); }
+        Expr::Binary(_, l, r) => { rc_collect_expr(box_expr_unbox(l), names); rc_collect_expr(box_expr_unbox(r), names); }
+        Expr::Unary(_, e) => { rc_collect_expr(box_expr_unbox(e), names); }
+        Expr::Call(callee, args) => {
+            rc_name(names, callee);
+            if str_contains(callee, "::") { rc_name(names, str_replace(callee, "::", "_")); }
+            if str_contains(callee, ".") { rc_name(names, str_replace(callee, ".", "_")); }
+            rc_collect_exprs(args, names);
+        }
+        Expr::FieldAccess(e, f) => { rc_name(names, "#m:" + f); rc_collect_expr(box_expr_unbox(e), names); }
+        Expr::OptionalFieldAccess(e, f) => { rc_name(names, "#m:" + f); rc_collect_expr(box_expr_unbox(e), names); }
+        Expr::StructLit(ty, fields, spread) => {
+            rc_name(names, ty);
+            var fi: i64 = 0;
+            while fi < fields.len() { rc_collect_expr(fields.get(fi).value, names); fi = fi + 1; }
+            rc_collect_optbox(spread, names);
+        }
+        Expr::If(c, t, e) => { rc_collect_expr(box_expr_unbox(c), names); rc_collect_stmts(t, names); rc_collect_opt(e, names); }
+        Expr::Range(a, b, _) => { rc_collect_expr(box_expr_unbox(a), names); rc_collect_expr(box_expr_unbox(b), names); }
+        Expr::Block(b) => { rc_collect_stmts(b, names); }
+        Expr::MethodCall(r, m, args) => { rc_name(names, "#m:" + m); rc_collect_expr(box_expr_unbox(r), names); rc_collect_exprs(args, names); }
+        Expr::ArrayLit(_, els) => { rc_collect_exprs(els, names); }
+        Expr::Index(a, i) => { rc_collect_expr(box_expr_unbox(a), names); rc_collect_expr(box_expr_unbox(i), names); }
+        Expr::FString(parts) => {
+            var pi: i64 = 0;
+            while pi < parts.len() {
+                match parts.get(pi) {
+                    FStringPart::Expr(pe) => { rc_collect_expr(pe, names); }
+                    FStringPart::Literal(_) => {}
+                }
+                pi = pi + 1;
+            }
+        }
+        Expr::Match(e, arms) => { rc_collect_expr(box_expr_unbox(e), names); rc_collect_arms(arms, names); }
+        Expr::EnumLit(ty, v, args) => { rc_name(names, ty); rc_name(names, ty + "_" + v); rc_collect_exprs(args, names); }
+        Expr::Ref(e, _) => { rc_collect_expr(box_expr_unbox(e), names); }
+        Expr::Deref(e) => { rc_collect_expr(box_expr_unbox(e), names); }
+        Expr::StrConcat(l, r) => { rc_collect_expr(box_expr_unbox(l), names); rc_collect_expr(box_expr_unbox(r), names); }
+        Expr::Try(e) => { rc_collect_expr(box_expr_unbox(e), names); }
+        Expr::Coalesce(l, r) => { rc_collect_expr(box_expr_unbox(l), names); rc_collect_expr(box_expr_unbox(r), names); }
+        Expr::IsCheck(e, _) => { rc_collect_expr(box_expr_unbox(e), names); }
+        Expr::TryBlock(b) => { rc_collect_stmts(b, names); }
+        Expr::TupleLit(es) => { rc_collect_exprs(es, names); }
+        Expr::Closure(params, b, _) => {
+            rc_collect_stmts(b, names);
+            var cp: i64 = 0;
+            while cp < params.len() {
+                if params.get(cp).has_default { rc_collect_expr(params.get(cp).default_expr, names); }
+                cp = cp + 1;
+            }
+        }
+        Expr::Cast(e, _) => { rc_collect_expr(box_expr_unbox(e), names); }
+        Expr::Comptime(e) => { rc_collect_expr(box_expr_unbox(e), names); }
+        Expr::ComptimeBlock(b) => { rc_collect_stmts(b, names); }
+        Expr::PipeForward(l, r) => { rc_collect_expr(box_expr_unbox(l), names); rc_collect_expr(box_expr_unbox(r), names); }
+        Expr::QuantCast(e, _) => { rc_collect_expr(box_expr_unbox(e), names); }
+        Expr::Await(e) => { rc_collect_expr(box_expr_unbox(e), names); }
+        Expr::Spawn(e) => { rc_collect_expr(box_expr_unbox(e), names); }
+        Expr::Yield(e) => { rc_collect_expr(box_expr_unbox(e), names); }
+        Expr::NamedArg(_, e) => { rc_collect_expr(box_expr_unbox(e), names); }
+        _ => {}
+    }
+}

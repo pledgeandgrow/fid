@@ -4032,14 +4032,17 @@ fn emit_file_write_bin_impl(self: &mut CCodeGen) -> void {
     wln(self, "    while ((c = fgetc(f)) != EOF) p_vec_push(v, (void*)(intptr_t)c);");
     wln(self, "    fclose(f); return v;");
     wln(self, "}");
+    // One fwrite of the bytes (one per byte took a lock each: 300 ms for
+    // a 300 KB executable on Windows); the same file
     wln(self, "int64_t p_file_write_vec(const char* path, PVec* v) {");
     wln(self, "    FILE* f = fopen(path, \"wb\");");
     wln(self, "    if (!f) return -1;");
-    wln(self, "    for (int64_t i = 0; i < v->len; i++) {");
-    wln(self, "        unsigned char b = (unsigned char)(int64_t)P_VEC_AT(v, i);");
-    wln(self, "        fwrite(&b, 1, 1, f);");
-    wln(self, "    }");
-    wln(self, "    fclose(f); return 0;");
+    wln(self, "    unsigned char* buf = (unsigned char*)malloc(v->len > 0 ? (size_t)v->len : 1);");
+    wln(self, "    if (!buf) { for (int64_t i = 0; i < v->len; i++) { unsigned char b = (unsigned char)(int64_t)P_VEC_AT(v, i); fwrite(&b, 1, 1, f); } fclose(f); return 0; }");
+    wln(self, "    for (int64_t i = 0; i < v->len; i++) buf[i] = (unsigned char)(int64_t)P_VEC_AT(v, i);");
+    wln(self, "    size_t w = fwrite(buf, 1, (size_t)v->len, f);");
+    wln(self, "    free(buf);");
+    wln(self, "    fclose(f); return w == (size_t)v->len ? 0 : -1;");
     wln(self, "}");
 }
 

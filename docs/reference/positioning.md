@@ -7,9 +7,10 @@
 > not measurements. What is true today:
 >
 > - **Compile speed:** `fidesc emit` builds hello world in 0.39 s (Nov 3);
->   `fid` turns its own 133,688 lines into C in ~133 s (about 1,000
->   lines/s; type check 59 s, borrow check 16 s, lowering 20 s, C generation
->   12 s) and `fidesc` in ~21 s. Go and Zig compile on the order of 100,000
+>   `fid` turns its own 158,516 lines into C in 74 s when built at -O2
+>   (Nov 9; about 2,100 lines/s; type check 18 s, borrow check 5 s, mono
+>   5 s, lowering 24 s, C generation 20 s), 229 s at -O0, and `fidesc` in
+>   ~21 s. Go and Zig compile on the order of 100,000
 >   lines/s. "Sub-second" holds for small programs only.
 > - **Runtime speed:** fib(40) 1.34 s native, 0.81 s through C, 0.53 s Rust
 >   ([scoreboard](../roadmap/competitive-roadmap.md#the-scoreboard)).
@@ -30,9 +31,10 @@
 > - **Memory:** no GC; the compiler frees what it can prove is finished
 >   (Vec/HashMap locals, owned elements, region collections, string
 >   temporaries); everything else lives until exit. Copy-on-write value
->   semantics (proposal 0001) were switched on in the working tree on Nov 6
->   (`LOWER_COW`); the full suite has not run with them, and the compiler of
->   Nov 2 (`release/fid.exe`) still aliases on `var b = a` for a `Vec`.
+>   semantics hold for `var b = a` on a `Vec`, `str` or `HashMap` since the
+>   ownership rule of proposal 0004 (Nov 7–8; data shared until the first
+>   write); a copied struct still shares its `Vec` fields, and the full
+>   suite has not run with `fid` as the compiler.
 > - **Safety annotations** are 17 checked rules
 >   ([safety-rules.md](safety-rules.md)); `fid qualify` writes evidence that
 >   always says `NOT_QUALIFIED`. Fides is not suitable for medical,
@@ -77,7 +79,7 @@
 >   assembles or runs). The 23-pass optimizer, peephole and LTO rows below
 >   are `fidesc`'s `build` path; `fid emit` runs a small IR optimizer.
 >
-> Numbers: [CURRENT.md → Numbers](../../CURRENT.md#numbers).
+> Numbers: [selfhost.md → Numbers](selfhost.md#numbers).
 
 
 ## The Adoption Problem
@@ -206,8 +208,8 @@ extern "C" fn SSL_CTX_new(method: *const SSL_METHOD) -> *mut SSL_CTX;
 $ fidesc emit hello.fd
 Emitted native executable (113152 bytes)   ← 0.39 s, Nov 3
 ```
-Large programs are slower: the compiler itself (133,688 lines) takes about
-133 s to turn into C with `fid` (CS1–CS7 in the competitive roadmap).
+Large programs are slower: the compiler itself (158,516 lines) takes 74 s
+to turn into C with an -O2 `fid` (Nov 9; CS1–CS7 in the competitive roadmap).
 
 ### Hot Reload (target)
 `fidesc watch` rebuilds and reruns the program on save and reports which
@@ -358,16 +360,16 @@ Advocacy (people recommend Fides to others)
 | Safety | 8/10 | 10/10 | Capabilities + effects + sandbox + borrow checker + reference escape check + 17 safety rules enforced at compile time. Data races: globals need a lock, spawned arguments must be `@send`; a `Vec` passed to a thread is shared unchecked. `var b = a` on a `Vec` aliases (copy-on-write off). Binary hardening (stack canaries, PIE, RELRO, NX stack). |
 | Flexibility | 7/10 | 10/10 | Inline assembly (x86 only), comptime, FFI, dynamic loading, conditional compilation. Bare metal and ARM64/RISC-V are incomplete. No C++ interop. |
 | Compilation | 5/10 | 10/10 | Custom IR, no LLVM, integrated linker on Windows. Sub-second for small programs; ~1,000 lines/s for `fid` on large ones (Nov 6) |
-| Ecosystem | 2/10 | 8/10 | Package manager (ark) implemented, no crates registry yet, doc generator (scribe) implemented, 137 stdlib modules. Rust has 100k+ crates. C has everything. |
+| Ecosystem | 2/10 | 8/10 | Package manager (ark) implemented, no crates registry yet, doc generator (scribe) implemented, 146 stdlib modules. Rust has 100k+ crates. C has everything. |
 | Metaprogramming | 8/10 | 10/10 | comptime is powerful: `@derive(Debug/Clone/Serialize/Deserialize)`, `comptime gen { }`, reflection. No procedural macros. |
 | Concurrency | 6/10 | 10/10 | OS threads (`spawn`, `@send` arguments), `parallel { }`, green tasks (`async fn`, `task` module), bounded MPSC channels, `select`, atomics (`use atomic`). Native async works since Nov 6. |
 | Developer velocity | 9/10 | 10/10 | Hot reload + persist + watch --diff + LSP (completion/hover/goto-def) + formatter + linter + bench + stack traces. No debugger, no profiler. |
 | Security | 9/10 | 10/10 | sandbox + cap-aware linking + @constant_time + @tainted + binary hardening — compile-time, zero runtime cost. Best-in-class. |
-| Tooling | 6/10 | 8/10 | LSP (diagnostics + completion + hover + goto-def), formatter, linter, bench, stack traces. Debugger (probe/fidesc debug) implemented, profiler (pulse/fidesc bench) partial, doc generator (scribe) implemented, package manager (ark) implemented, coverage tool (veil) implemented. Rust has cargo + rust-analyzer + rustfmt + clippy + rustdoc. |
+| Tooling | 6/10 | 8/10 | LSP (diagnostics + completion + hover + goto-def), formatter, linter, bench, stack traces. Debugger (`fidesc debug`; `fid` has none) implemented in `fidesc` only, profiler (pulse/fidesc bench) partial, doc generator (scribe) implemented, package manager (ark) implemented, coverage tool (veil) implemented. Rust has cargo + rust-analyzer + rustfmt + clippy + rustdoc. |
 | Community | 1/10 | 7/10 | Independent, no corporate backing. Rust has Mozilla/AWS/Google. Zig has Zig Foundation. |
 
 > **Current state (Aug 2026, corrected Nov 6):**
-> - ⚠️ **Compilation is fast only for small programs** — sub-second for hello world; the 133,688-line compiler takes ~133 s with `fid` (Nov 6)
+> - ⚠️ **Compilation is fast only for small programs** — sub-second for hello world; the 158,516-line compiler takes 74 s with an -O2 `fid` (Nov 9)
 > - ✅ **Safety checks work** — effects + capabilities (per call) + borrow checker + escape check are enforced at compile time; regions are scopes with budgets
 > - ⚠️ **Hot reload is recompile-and-restart** — `fidesc watch` rebuilds and reruns (Linux ELF), reports changed functions, keeps `persist` variables; no in-process swap
 > - ✅ **Custom toolchain works** — self-hosted codegen, linker, ELF/PE/Mach-O/COFF emitters
@@ -383,11 +385,11 @@ Advocacy (people recommend Fides to others)
 > - ✅ **Tooling works** — `fidesc fmt` (formatter), `fidesc lint` (linter), `fidesc bench` (benchmarking), stack traces on panic
 > - ✅ **Type inference works** — Bidirectional (contextual literals, `-> _` return type inference)
 > - ✅ **Auto-vectorization works** — Loop-vec (constant trips) + SLP (p_simd_load/store/add/sub/mul/div → SSE2)
-> - ✅ **137 stdlib modules** (Nov 6) — core, vec, math, channel, sync, atomic, task, ecs, events, parallel, db, http, json, file, time, and more (uefi moved to fides-os)
+> - ✅ **146 stdlib modules** (Nov 9) — core, vec, math, channel, sync, atomic, task, ecs, events, parallel, db, http, json, file, time, and more (uefi moved to fides-os)
 > - ✅ **Binary hardening** — All C codegen output compiled with stack canaries, PIE/ASLR, full RELRO, NX stack
 > - ✅ **Security annotations** — `@constant_time` (side-channel defense), `@tainted` (injection defense)
 > - ⚠️ **Package manager (ark)** — path/git deps implemented, registry pending
-> - ⚠️ **Debugger** — `fidesc debug` (interpreter); no DWARF debug info
+> - ⚠️ **Debugger** — `fidesc debug` (interpreter) only: `fid` has no debug command (compiler/debugger.fd is not wired); native Linux builds carry `.debug_line` since Nov 9
 > - ⚠️ **Cross-compilation** — `build --target arm64-linux`/`riscv64-linux` exist and are experimental; ARM64/RISC-V runtimes are stubs
 > - ✅ **Green tasks** — `async fn` runs as a task on its own stack (native since Nov 6; the interpreters run an async body to the end at the call)
 > - ⚠️ **Data race checks** — `@send` arguments for `spawn`, locked writes to globals; data shared through a `Vec` handle or pointers is not checked
@@ -554,7 +556,7 @@ it does.
 | Path manipulation | ✅ std::path | ✅ path/filepath | ✅ os.path | ❌ Not yet |
 | Process management | ✅ std::process | ✅ os/exec | ✅ subprocess | ⚠️ Basic (stdlib/process.fd) |
 
-**Impact:** Fides's stdlib has 137 modules (Nov 6). Rust's crates.io has 100k+.
+**Impact:** Fides's stdlib has 146 modules (Nov 9). Rust's crates.io has 100k+.
 Even Go's standard library is vast. For any real project, you'll need
 to build infrastructure that other languages give you for free.
 
@@ -647,7 +649,7 @@ the coldest of cold starts.
 | 10x easier concurrency than Rust | **Plausible** | Effect handlers + channels + select are simpler than Rust's async/Send/Sync/Pin. No "async coloring" of functions. But Fides lacks data race prevention (Send/Sync). |
 | 10x smaller binaries than C | **Plausible** | Dead code elimination at IR level, no libc, `--caps` stripping. But C with `-Os` and manual stripping can get close. |
 | 10x safer than Rust | **Not plausible** | Rust's borrow checker is proven at scale (Firefox, Linux kernel). Fides's regions are unproven in production. Both are memory-safe. |
-| 10x better DX than Rust | **Plausible for iteration** | Hot reload + fast compilation + LSP + formatter + linter. But Rust has mature registry — Fides has ark (package manager), scribe (doc generator), veil (coverage), probe (debugger) implemented, but no registry yet. |
+| 10x better DX than Rust | **Plausible for iteration** | Hot reload + fast compilation + LSP + formatter + linter. But Rust has mature registry — Fides has ark (package manager), scribe (doc generator), veil (coverage), probe (debugger, `fidesc` only) implemented, but no registry yet. |
 
 **The "100x" is about compilation speed and iteration, not runtime performance
 or overall developer experience.** Fides compiles fast and hot-reloads, but
@@ -905,7 +907,7 @@ can't do IO.
 | Inline assembly | ✅ Yes (`asm!`, all arches) | ⚠️ Yes (`asm!`) — x86 only |
 | Bare metal | ✅ Yes (`no_std`) | ⚠️ `fid emit --bare` since Nov 6 (flat binary, COM1; not yet run under QEMU) |
 | SIMD | ✅ Yes (std::simd, auto-vec) | ✅ Yes (stdlib `simd.fd` + auto-vec) |
-| Compilation speed | ❌ Slow on large projects | ⚠️ Sub-second for small programs; ~133 s for `fid`'s own 133,688 lines (Nov 6) |
+| Compilation speed | ❌ Slow on large projects | ⚠️ Sub-second for small programs; 74 s for `fid`'s own 158,516 lines with an -O2 `fid` (Nov 9) |
 | Binary size | ⚠️ Moderate (monomorphization bloat) | ✅ Small (DCE + `--caps` stripping) |
 | Escape analysis | ✅ LLVM | ❌ Not yet |
 | Tail call optimization | ✅ LLVM | ✅ TCO (enabled by default) |
@@ -1069,7 +1071,7 @@ tooling.
 | Tooling | **Rust** | cargo + rustfmt + clippy + rustdoc + cargo-fuzz + criterion. Fides has fmt + lint + bench but no debugger/profiler/doc-gen/package-manager. |
 | Corporate backing | **Rust** | Mozilla, AWS, Google, Microsoft. Fides is independent. |
 | Community | **Rust** | Large, active, 90k+ GitHub stars. Fides is just starting. |
-| Standard library | **Rust** | Vast (collections, net, io, sync, fs, process, etc.). Fides has 137 modules. |
+| Standard library | **Rust** | Vast (collections, net, io, sync, fs, process, etc.). Fides has 146 modules. |
 | Error messages | **Rust** | Gold standard — detailed, helpful, with suggestions. Fides has structured errors with codes + suggestions. |
 | Debugging | **Rust** | Full DWARF, gdb/lldb, backtraces. Fides has stack traces but no debugger. |
 | Cross-compilation | **Tie** | Rust has `cargo build --target`. Fides has zero-tool `--target arm64-linux|riscv64-linux|x86-64-windows`. Both work well. |
@@ -1306,7 +1308,7 @@ a runtime and GC while Fides is bare-metal with manual region management.
 | Feature | Go | Fides |
 |---------|-----|-------|
 | Concurrency | ✅ Goroutines + channels (excellent, battle-tested) | ✅ Threads + channels + select + executor |
-| Standard library | ✅ Vast (net, http, json, crypto, sql, encoding, etc.) | ⚠️ 137 modules, basic |
+| Standard library | ✅ Vast (net, http, json, crypto, sql, encoding, etc.) | ⚠️ 146 modules, basic |
 | Tooling | ✅ go fmt + go vet + gopls + pprof + delve | ⚠️ fmt + lint + LSP + bench (no debugger/profiler) |
 | Cross-compilation | ✅ `GOOS=x GOARCH=y go build` | ✅ Zero-tool (`--target`) |
 | Build speed | ✅ Fast (compiled language) | ✅ Faster (no runtime, no LLVM) |

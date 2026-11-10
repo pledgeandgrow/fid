@@ -206,7 +206,7 @@ Paren,
 
 // The names modules are imported under, for `module::name()`, and each
 // `module::name` called so far
-var g_import_names: Vec<str> = Vec::new();
+var g_import_set: i64 = HashMap_new();
 var g_qualified_calls: Vec<str> = Vec::new();
 
 // The type arguments of each turbofish call `name::<T, U>(args)` (proposal
@@ -266,7 +266,7 @@ pub struct_names: Vec<str>,
 pub enum_names: Vec<str>,
 pub struct_name_set: i64,  // HashMap for O(1) lookup
 pub enum_name_set: i64,    // HashMap for O(1) lookup
-pub alias_to_struct: Vec<str>,
+pub alias_set: i64,      // HashMap: type alias -> struct target (CS8)
 pub errors: Vec<str>,
 pub expr_depth: i64,
 pub max_expr_depth: i64,
@@ -325,7 +325,7 @@ pub fn Parser_new(tokens: Vec<Token>) -> Parser {
         enum_names: en,
         struct_name_set: sn_set,
         enum_name_set: en_set,
-        alias_to_struct: Vec::new(),
+        alias_set: HashMap_new(),
         errors: Vec::new(),
         expr_depth: 0,
         max_expr_depth: 256,
@@ -377,7 +377,7 @@ impl Parser {
             enum_names: en,
             struct_name_set: sn_set,
             enum_name_set: en_set,
-            alias_to_struct: Vec::new(),
+            alias_set: HashMap_new(),
             errors: Vec::new(),
             expr_depth: 0,
             max_expr_depth: 256,
@@ -502,12 +502,8 @@ fn expect_ident_or_keyword(self: &mut Parser) -> ParseResultStr {
 fn is_struct_name(self: &Parser, name: str) -> bool {
     // O(1) HashMap lookup (string interning optimization)
     if HashMap_get(self.struct_name_set, name) != 0 { return true; }
-    // Check aliases (small list, linear scan is fine)
-    var j: i64 = 0;
-    while j < self.alias_to_struct.len() {
-        if self.alias_to_struct.get(j) == name { return true; }
-        j = j + 1;
-    }
+    // Check aliases
+    if HashMap_get(self.alias_set, name) != 0 { return true; }
     return false;
 }
 
@@ -1242,12 +1238,8 @@ self.match_tok(TokenKind::Semicolon);
 // If alias points to a named struct, track it
 match alias_for {
     Type::Named(target) => {
-        var i: i64 = 0;
-        while i < self.struct_names.len() {
-            if self.struct_names.get(i) == target {
-                self.alias_to_struct.push(name);
-            }
-            i = i + 1;
+        if HashMap_get(self.struct_name_set, target) != 0 {
+            HashMap_insert(self.alias_set, name, 1);
         }
     }
     _ => {}
@@ -4907,7 +4899,7 @@ if token_kind_eq(k, TokenKind::Ident("")) {
                 ParseResultExprs::Err(e) => { return ParseResultExpr::Err(e); }
             }
         }
-        if called && !self.is_enum_name(name) && !str_vec_has(self.struct_names, name) && str_vec_has(g_import_names, name) {
+        if called && !self.is_enum_name(name) && HashMap_get(self.struct_name_set, name) == 0 && HashMap_get(g_import_set, name) != 0 {
             var qcall: str = name + "::" + variant_or_method;
             g_qualified_calls.push(qcall);
             return ParseResultExpr::Ok(Expr::Call(qcall, args));
@@ -5358,8 +5350,8 @@ if self.match_tok(TokenKind::Eq) {
 self.match_tok(TokenKind::Semicolon);
 var import_result: ImportDef = ImportDef_new_full(path, items, capabilities, version, alias, false, is_glob);
 match alias {
-    OptStr::Some(al) => { g_import_names.push(al); }
-    OptStr::None => { g_import_names.push(path_last(path)); }
+    OptStr::Some(al) => { HashMap_insert(g_import_set, al, 1); }
+    OptStr::None => { HashMap_insert(g_import_set, path_last(path), 1); }
 }
 return ParseResultImportDef::Ok(import_result);
 }
@@ -5593,7 +5585,7 @@ pub fn Parser_with_names(tokens: Vec<Token>, struct_names: Vec<str>, enum_names:
         enum_names: enum_names,
         struct_name_set: sn_set,
         enum_name_set: en_set,
-        alias_to_struct: Vec::new(),
+        alias_set: HashMap_new(),
         errors: Vec::new(),
         expr_depth: 0,
         max_expr_depth: 256,

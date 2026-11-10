@@ -226,6 +226,11 @@ pub fn inc_build_key(command: str, n: i64, start: i64) -> i64 {
     }
     k = k + " CC=" + env_or_empty("CC") + " FIDES_CC_OPT=" + env_or_empty("FIDES_CC_OPT");
     k = k + " FID_HOME=" + env_or_empty("FID_HOME");
+    // Pass-selection env vars change the emitted code: a stamp written under
+    // one FID_IROPT_OFF/FID_IROPT_ON/FID_NAT_OFF set is not the same build.
+    k = k + " FID_IROPT_OFF=" + env_or_empty("FID_IROPT_OFF")
+        + " FID_IROPT_ON=" + env_or_empty("FID_IROPT_ON")
+        + " FID_NAT_OFF=" + env_or_empty("FID_NAT_OFF");
     return hash_source(k);
 }
 
@@ -290,13 +295,33 @@ pub fn inc_c_unchanged(st: IncStamp, key: i64, output: str, c_hash: i64) -> bool
 /// `main_input`: a pipeline that does not record its inputs must never be
 /// reported up to date.
 pub fn inc_stamp_commit(path: str, key: i64, c_hash: i64, main_input: str, output: str) {
+    inc_stamp_commit_hash(path, key, c_hash, main_input, p_file_hash(output));
+}
+
+/// FNV-1a 64 of the bytes (each element's low byte): p_file_hash of a file
+/// holding them. `emit` hashes its output in memory, not by reopening the
+/// file it just wrote (on Windows the first read of a new .exe waits for the
+/// virus scanner: 350 ms for a 300 KB program).
+@wrapping
+pub fn inc_bytes_hash(bytes: Vec<i64>) -> i64 {
+    var h: i64 = -3750763034362895579;
+    var i: i64 = 0;
+    while i < bytes.len() {
+        h = (h ^ (bytes.get(i) & 255)) * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+/// inc_stamp_commit with the output's hash already known.
+pub fn inc_stamp_commit_hash(path: str, key: i64, c_hash: i64, main_input: str, out_hash: i64) {
     inc_deps_ensure();
     if !inc_str_vec_has(g_dep_files, main_input) {
         p_file_delete(path);
         return;
     }
     var s: str = "fides-stamp-fd 2\nkey " + int_to_str(key) + "\nc " + int_to_str(c_hash) + "\n";
-    s = s + "out " + int_to_str(p_file_hash(output)) + "\n";
+    s = s + "out " + int_to_str(out_hash) + "\n";
     var i: i64 = 0;
     while i < g_dep_files.len() {
         s = s + "file " + int_to_str(g_dep_hashes.get(i)) + " " + g_dep_files.get(i) + "\n";

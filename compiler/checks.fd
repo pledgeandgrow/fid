@@ -36,7 +36,10 @@ pub struct PeirLoopFacts {
 pub fn peir_inst_of(f: &IrFunction, id: i64) -> Inst {
     match IrFunction_get_inst(f, id) {
         OptInst::Some(i) => { return i; }
-        OptInst::None => { return Inst::ConstBool(false); }
+        // Unreachable, not a constant: a Const* fallback reads a missing id
+        // (a parameter, a global value) as that constant — iro_ipcp took
+        // every such argument for literal 0 (M9).
+        OptInst::None => { return Inst::Unreachable; }
     }
 }
 
@@ -1326,4 +1329,153 @@ fn peir_filled_slot(f: &IrFunction, r: &PeirRanges, v: i64) -> i64 {
         _ => {}
     }
     return -1;
+}
+
+// --- CP3: fid explain -------------------------------------------------------
+// peir_unchecked_ops already computes which runtime checks a counted loop or
+// the range analysis makes needless. `fid explain` surfaces that: per
+// function, the checks removed and the checks still emitted.
+
+/// The check an instruction would emit, or "" when it never emits one.
+fn explain_check_kind(inst: Inst) -> str {
+    match inst {
+        Inst::BinOp(op, _, _, _) => {
+            if op == BinOp::Add { return "add overflow check"; }
+            if op == BinOp::Sub { return "sub overflow check"; }
+            if op == BinOp::Mul { return "mul overflow check"; }
+            if op == BinOp::Div { return "div check"; }
+            if op == BinOp::Mod { return "mod check"; }
+            return "";
+        }
+        Inst::Call(n, _, _, _) => {
+            if n == "Vec_get" || n == "p_vec_get" { return "bounds check"; }
+            if n == "Vec_set" || n == "p_vec_set" { return "bounds check"; }
+            return "";
+        }
+        _ => { return ""; }
+    }
+    return "";
+}
+
+/// Per function: checks removed (with the proof that removed them) vs kept.
+/// `filt` ("" = all) keeps only functions whose name contains it.
+pub fn explain_checks(module: IrModule, filt: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var ent: IrFunctionEntry = module.functions.get(fi);
+        if str_len(filt) > 0 && str_find(ent.name, filt) < 0 {
+            fi = fi + 1;
+            continue;
+        }
+        var f: IrFunction = ent.func;
+        var nvals: i64 = f.value_metas.len() + f.insts.len() + 16;
+        var flags: Vec<i64> = peir_unchecked_ops(&f, nvals);
+        var rflag: Vec<i64> = peir_zeros(nvals);
+        peir_range_ops(&f, nvals, &mut rflag);
+        var removed: Vec<str> = Vec::new();
+        var kept: i64 = 0;
+        var bi: i64 = 0;
+        while bi < f.blocks.len() {
+            var ids: Vec<i64> = f.blocks.get(bi).instructions;
+            var ii: i64 = 0;
+            while ii < ids.len() {
+                var id: i64 = ids.get(ii);
+                var kind: str = explain_check_kind(peir_inst_of(&f, id));
+                if str_len(kind) > 0 {
+                    var bit: i64 = 0;
+                    if id >= 0 && id < flags.len() { bit = flags.get(id); }
+                    if (bit & 1) != 0 {
+                        var why: str = "counted loop";
+                        if id >= 0 && id < rflag.len() && (rflag.get(id) & 1) != 0 { why = "range analysis"; }
+                        removed.push("    removed " + kind + " (v" + int_to_str(id) + ", " + why + ")");
+                    } else {
+                        kept = kept + 1;
+                    }
+                }
+                ii = ii + 1;
+            }
+            bi = bi + 1;
+        }
+        if removed.len() > 0 || kept > 0 {
+            out.push("fn " + ent.name + ": " + int_to_str(removed.len()) + " check(s) removed, " + int_to_str(kept) + " kept");
+            var ri: i64 = 0;
+            while ri < removed.len() {
+                out.push(removed.get(ri));
+                ri = ri + 1;
+            }
+        }
+        fi = fi + 1;
+    }
+    if out.len() == 0 { out.push("no runtime checks in this program"); }
+    return out;
+}
+
+/// A rough "why on the heap" for an instruction that allocates, or "".
+fn explain_alloc_kind(inst: Inst) -> str {
+    match inst {
+        Inst::Call(n, _, _, _) => {
+            if n == "p_malloc" || n == "p_alloc" || n == "p_calloc" || n == "p_realloc" {
+                return "heap allocation (runtime allocator)";
+            }
+            if str_starts_with(n, "Vec_new") || str_starts_with(n, "Vec_filled") || str_starts_with(n, "Vec_init") {
+                return "Vec buffer (heap: resizable)";
+            }
+            if str_starts_with(n, "HashMap_new") {
+                return "HashMap table (heap: resizable)";
+            }
+            if n == "Str_dup" || n == "str_concat" || n == "String_from" {
+                return "string copy (heap: dynamic length)";
+            }
+            if str_ends_with(n, "_to_str") || n == "int_to_str" || n == "f64_to_str" || n == "f32_to_str" || n == "bool_to_str" {
+                return "string result (heap: dynamic length)";
+            }
+            if n == "Vec_share" || n == "Vec_share_deep" || n == "Vec_clone" {
+                return "Vec copy for COW sharing";
+            }
+            return "";
+        }
+        Inst::MakeDyn(_, _, _) => { return "trait object (heap: dyn box)"; }
+        _ => { return ""; }
+    }
+    return "";
+}
+
+/// Per function: the instructions that allocate, and why the value is on the
+/// heap. `filt` ("" = all) keeps only functions whose name contains it.
+pub fn explain_allocs(module: IrModule, filt: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var ent: IrFunctionEntry = module.functions.get(fi);
+        if str_len(filt) == 0 || str_find(ent.name, filt) >= 0 {
+            var f: IrFunction = ent.func;
+            var lines: Vec<str> = Vec::new();
+            var bi: i64 = 0;
+            while bi < f.blocks.len() {
+                var ids: Vec<i64> = f.blocks.get(bi).instructions;
+                var ii: i64 = 0;
+                while ii < ids.len() {
+                    var id: i64 = ids.get(ii);
+                    var kind: str = explain_alloc_kind(peir_inst_of(&f, id));
+                    if str_len(kind) > 0 {
+                        lines.push("    v" + int_to_str(id) + ": " + kind);
+                    }
+                    ii = ii + 1;
+                }
+                bi = bi + 1;
+            }
+            if lines.len() > 0 {
+                out.push("fn " + ent.name + ": " + int_to_str(lines.len()) + " allocation(s)");
+                var li: i64 = 0;
+                while li < lines.len() {
+                    out.push(lines.get(li));
+                    li = li + 1;
+                }
+            }
+        }
+        fi = fi + 1;
+    }
+    if out.len() == 0 { out.push("no heap allocations"); }
+    return out;
 }

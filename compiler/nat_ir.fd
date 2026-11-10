@@ -134,6 +134,11 @@ pub struct NatGen {
     // The function being compiled
     pub cur_name: str,
     pub cur_wrapping: bool,
+    pub cur_crashfree: bool,
+    pub leaf: i64,
+    pub internal: i64,
+    pub fact_path: str,
+    pub lib_mask: i64,
     pub slots: Vec<i64>,
     pub alloca_data: Vec<i64>,
     pub block_labels: i64,
@@ -228,6 +233,11 @@ pub fn NatGen_new(arch: i64) -> NatGen {
         n_folded: 0,
         cur_name: "",
         cur_wrapping: false,
+        cur_crashfree: false,
+        leaf: 0,
+        internal: HashMap_new(),
+        fact_path: "",
+        lib_mask: HashMap_new(),
         slots: Vec::new(),
         alloca_data: Vec::new(),
         block_labels: HashMap_new(),
@@ -454,7 +464,15 @@ fn ng_beqz(g: &mut NatGen, r: i64, label: i64) {
 
 /// Panic `which` when r != 0 (the stubs may be anywhere in the image).
 fn ng_panic_if(g: &mut NatGen, r: i64, which: i64) {
-    if g.rec { ng_rec(g, MO_PANICIF, r, 0, 0, which, g.cur_inst_line, 0); return; }
+    if g.rec {
+        // WP11: opt-in — eliding checks on an unverified @crashfree turns a
+        // would-be panic into silent wrong answers where the emit path does
+        // not enforce the annotation (FID_NAT_ON=crashfree).
+        var non: str = p_getenv("FID_NAT_ON");
+        if g.cur_crashfree && (non as i64) != 0 && str_contains("," + non + ",", ",crashfree,") { return; }
+        ng_rec(g, MO_PANICIF, r, 0, 0, which, g.cur_inst_line, 0);
+        return;
+    }
     var label: i64 = ng_panic_label(g, which);
     if ng_x64(g) { x64_test(&mut g.e, r, r); x64_jcc8(&mut g.e, X64_E, 5); x64_call(&mut g.e, label); return; }
     if ng_a64(g) {
@@ -699,10 +717,35 @@ fn ng_f2i(g: &mut NatGen, d: i64, s: i64, from_f32: bool) {
     }
 }
 
+/// d = the true f32 bit pattern (zero-extended) of the f32 value whose
+/// widened-f64 bits are in s — `p_f32_to_bits` for the runtime shims.
+fn ng_f32bits(g: &mut NatGen, d: i64, s: i64) {
+    if g.rec { ng_rec(g, MO_F32BITS, d, s, 0, 0, 0, 0); return; }
+    if ng_x64(g) {
+        x64_movq_xr(&mut g.e, 0, s, true);
+        x64_sse(&mut g.e, 0xF2, 0x5A, 0, 0);          // cvtsd2ss xmm0, xmm0
+        x64_movq_rx(&mut g.e, d, 0, false);         // movd eax, xmm0 (zero-extends)
+        g.x0_reg = 0 - 1;
+        if g.x1_reg == d { g.x1_reg = 0 - 1; }
+        return;
+    }
+    if ng_a64(g) {
+        a64_fmov_dx(&mut g.e, 0, s);
+        a64_fcvt_sd(&mut g.e, 0, 0);
+        a64_fmov_ws(&mut g.e, d, 0);                // writes w, upper x cleared
+        return;
+    }
+    rv_fmv_dx(&mut g.e, 0, s);
+    rv_fcvt_sd(&mut g.e, 0, 0);
+    rv_fmv_xw(&mut g.e, d, 0);
+    ng_ext(g, d, d, NEXT_ZW);
+}
+
 /// Function entry: save the return address and frame pointer, reserve
 /// `frame` bytes (a multiple of 16).
 fn ng_prologue(g: &mut NatGen, frame: i64) {
     if g.rec { ng_rec(g, MO_PROLOGUE, 0, 0, 0, 0, 0, 0); return; }
+    if g.leaf > 0 { return; }
     if ng_x64(g) {
         x64_push(&mut g.e, 5);                        // push rbp
         x64_mov(&mut g.e, 5, 4);                      // mov rbp, rsp
@@ -737,6 +780,13 @@ fn ng_prologue(g: &mut NatGen, frame: i64) {
 
 fn ng_epilogue(g: &mut NatGen) {
     if g.rec { ng_rec(g, MO_EPILOGUE, 0, 0, 0, 0, 0, 0); return; }
+    // WP8: a leaf function needs no frame record — just the return
+    if g.leaf > 0 {
+        if ng_x64(g) { x64_ret(&mut g.e); }
+        else if ng_a64(g) { a64_ret(&mut g.e); }
+        else { rv_ret(&mut g.e); }
+        return;
+    }
     var k: i64 = 0;
     while k < g.save_regs.len() {
         ng_ld_slot(g, g.save_regs.get(k), g.save_off + 8 * k);
@@ -1460,6 +1510,7 @@ const MO_COPY: i64 = 40;
 const MO_PLACE: i64 = 41;
 const MO_ASR63: i64 = 42;
 const MO_LINE: i64 = 43;      // i0: a source line starts here (no code)
+const MO_F32BITS: i64 = 44;   // r0 = zero-extended f32 pattern of widened-f64 r1
 
 pub struct MInst {
     pub op: i64,
@@ -1527,13 +1578,13 @@ fn ng_asr63(g: &mut NatGen, d: i64, s: i64) {
 fn mi_defines(op: i64) -> bool {
     if op == MO_LI || op == MO_MOV || op == MO_SLOTADDR || op == MO_LDSLOT || op == MO_LOAD || op == MO_ADDR { return true; }
     if op >= MO_ADD && op <= MO_F2I { return true; }
-    return op == MO_LDIN || op == MO_ASR63;
+    return op == MO_LDIN || op == MO_ASR63 || op == MO_F32BITS;
 }
 
 /// The fields of `op` it reads: 1 r0, 2 r1, 4 r2.
 fn mi_use_mask(op: i64) -> i64 {
     if op == MO_MOV || op == MO_LOAD || op == MO_NEG || op == MO_NOT || op == MO_EXT || op == MO_I2F
-        || op == MO_F2I || op == MO_ASR63 { return 2; }
+        || op == MO_F2I || op == MO_ASR63 || op == MO_F32BITS { return 2; }
     if op == MO_STSLOT || op == MO_CALLR || op == MO_BNEZ || op == MO_BEQZ || op == MO_PANICIF || op == MO_STOUT { return 1; }
     if op == MO_STORE || op == MO_COPY { return 3; }
     if op >= MO_ADD && op <= MO_SHR { return 6; }
@@ -1827,10 +1878,124 @@ fn ng_touch2(lo: &mut Vec<i64>, hi: &mut Vec<i64>, v: i64, p: i64) {
 /// was found to clobber, when it was allocated before; else all).
 fn ng_call_mask(g: &NatGen, m: MInst) -> i64 {
     if m.op != MO_CALL || !ng_on("ipra") { return ng_full_mask(g); }
-    var key: str = int_to_str(m.i0);
+    return ng_label_mask(g, m.i0);
+}
+
+fn ng_label_mask(g: &NatGen, label: i64) -> i64 {
+    var key: str = int_to_str(label);
     if HashMap_contains(g.label_fn, key) {
         var name: str = HashMap_get(g.label_fn, key);
         if HashMap_contains(g.fn_mask, name) { return HashMap_get(g.fn_mask, name); }
+        // WP20: a library function's recorded clobber mask
+        if HashMap_contains(g.lib_mask, name) { return HashMap_get(g.lib_mask, name); }
+    }
+    return -1;
+}
+
+/// First index of char `ch` at or after `from`, or -1.
+fn ng_find_ch(s: str, ch: i64, from: i64) -> i64 {
+    var i: i64 = from;
+    while i < str_len(s) {
+        if str_byte_at(s, i) == ch { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// WP20 consumer: load `ext <name> mask=N size=M` lines from the
+/// FID_LIBFACTS_IN artifact into `g.lib_mask`, so IPRA keeps live values
+/// across calls to functions outside this module. Malformed lines skip.
+fn ng_libfacts_load(g: &mut NatGen) {
+    var path: str = p_getenv("FID_LIBFACTS_IN");
+    if (path as i64) == 0 || str_len(path) == 0 { return; }
+    var data: str = p_file_read(path);
+    if (data as i64) == 0 { return; }
+    // Same contract as the rules consumer: the version header is required.
+    if !str_starts_with(data, "# fid-facts 1\n") { return; }
+    var ls: Vec<str> = str_split(data, "\n");
+    var li: i64 = 0;
+    while li < ls.len() {
+        var line: str = ls.get(li);
+        li = li + 1;
+        if !str_starts_with(line, "ext ") { continue; }
+        var sp: i64 = ng_find_ch(line, 32, 4);
+        var mp: i64 = str_find(line, " mask=");
+        if sp < 0 || mp < 0 || mp < sp { continue; }
+        var nm: str = str_slice(line, 4, sp);
+        var me: i64 = mp + 6;
+        var mend: i64 = ng_find_ch(line, 32, me);
+        if mend < 0 { mend = str_len(line); }
+        var mv: i64 = str_parse_int(str_slice(line, me, mend));
+        HashMap_insert(g.lib_mask, nm, mv);
+    }
+}
+
+/// Trace `v` back through its most recent definitions before mir index `k`
+/// in the same block: [label] when the chain ends at MO_ADDR, [-1] when an
+/// unknown op writes it, [-2, v] when it was last defined in another block.
+fn ng_trace_label(mir: &Vec<MInst>, bs: i64, k: i64, v0: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var v: i64 = v0;
+    var j: i64 = k - 1;
+    var steps: i64 = 0;
+    while j >= bs && steps < 64 {
+        var dm: MInst = mir.get(j);
+        if mi_defines(dm.op) && dm.r0 == v {
+            if dm.op == MO_ADDR { out.push(dm.i0); return out; }
+            if dm.op == MO_MOV { v = dm.r1; }
+            else { out.push(-1); return out; }
+        }
+        j = j - 1;
+        steps = steps + 1;
+    }
+    out.push(-2);
+    out.push(v);
+    return out;
+}
+
+fn ng_block_start(mb: &MBlocks, k: i64) -> i64 {
+    return mb.start.get(mb.of.get(k));
+}
+
+/// WP5: the clobber mask of the call at mir index `k`. Direct calls keep the
+/// recorded callee mask; indirect calls trace the target back to the
+/// address-of-function values that can reach it and take the union of their
+/// masks — only when every possible target resolves, else all registers.
+fn ng_call_mask_i(g: &NatGen, mir: &Vec<MInst>, mb: &MBlocks, k: i64) -> i64 {
+    var m: MInst = mir.get(k);
+    if !ng_on("ipra") { return ng_full_mask(g); }
+    if m.op == MO_CALL {
+        var lm: i64 = ng_label_mask(g, m.i0);
+        if lm >= 0 { return lm; }
+        return ng_full_mask(g);
+    }
+    if m.op != MO_CALLR { return ng_full_mask(g); }
+    var bs: i64 = ng_block_start(mb, k);
+    var tr: Vec<i64> = ng_trace_label(mir, bs, k, m.r0);
+    if tr.get(0) >= 0 {
+        var lm2: i64 = ng_label_mask(g, tr.get(0));
+        if lm2 >= 0 { return lm2; }
+        return ng_full_mask(g);
+    }
+    if tr.get(0) == -2 && tr.len() == 2 {
+        var v: i64 = tr.get(1);
+        var mask: i64 = 0;
+        var ok: bool = true;
+        var j2: i64 = 0;
+        while j2 < mir.len() && ok {
+            var dm: MInst = mir.get(j2);
+            if mi_defines(dm.op) && dm.r0 == v {
+                if dm.op == MO_MOV {
+                    var tr2: Vec<i64> = ng_trace_label(mir, ng_block_start(mb, j2), j2, dm.r1);
+                    if tr2.get(0) >= 0 {
+                        var lm3: i64 = ng_label_mask(g, tr2.get(0));
+                        if lm3 < 0 { ok = false; } else { mask = mask | lm3; }
+                    } else { ok = false; }
+                } else { ok = false; }
+            }
+            j2 = j2 + 1;
+        }
+        if ok { return mask; }
     }
     return ng_full_mask(g);
 }
@@ -1876,7 +2041,7 @@ fn ng_mir_alloc(g: &mut NatGen, rec: &NatFnRec) -> NatAlloc {
             f = f + 1;
         }
         if mi_defines(m.op) && m.r0 >= NG_VBASE && m.r0 - NG_VBASE < nv { def_in.set(m.r0 - NG_VBASE, bk); }
-        if mi_is_call(m.op) { calls.push(k); masks.push(ng_call_mask(g, m)); }
+        if mi_is_call(m.op) { calls.push(k); masks.push(ng_call_mask_i(g, &mir, &mb, k)); }
         if m.op == MO_MOV && m.r0 >= NG_VBASE && m.r1 >= NG_VBASE && ng_on("hint") {
             if m.r0 - NG_VBASE < nv && m.r1 - NG_VBASE < nv {
                 hint.set(m.r0 - NG_VBASE, m.r1 - NG_VBASE);
@@ -2440,6 +2605,15 @@ fn ng_mir_emit(g: &mut NatGen, rec: &NatFnRec, al: &NatAlloc) {
     g.save_regs = al.save_regs;
     g.save_off = al.save_off;
     g.frame = al.frame;
+    // WP8: a function that calls nothing and has nothing on the stack is a
+    // leaf — its prologue/epilogue is only a return.
+    g.leaf = 1;
+    if al.save_regs.len() > 0 || al.frame > 0 { g.leaf = 0; }
+    var lc: i64 = 0;
+    while lc < rec.mir.len() {
+        if mi_is_call(rec.mir.get(lc).op) { g.leaf = 0; lc = rec.mir.len(); }
+        lc = lc + 1;
+    }
     var nv: i64 = rec.nvreg - NG_VBASE;
     g.x0_reg = 0 - 1;
     g.x1_reg = 0 - 1;
@@ -2499,8 +2673,17 @@ fn ng_mir_emit(g: &mut NatGen, rec: &NatFnRec, al: &NatAlloc) {
             } else if p0 != p1 {
                 ng_mov(g, p0, p1);
             }
-            ng_xc_kill(g, p0);
-            ng_xc_kill(g, p1);
+            if src_spilled || store_off >= 0 {
+                ng_xc_kill(g, p0);
+                ng_xc_kill(g, p1);
+            } else if p0 != p1 {
+                // both hold the value now: the cache follows the destination
+                var c0: bool = g.x0_reg == p1;
+                var c1: bool = g.x1_reg == p1;
+                ng_xc_kill(g, p0);
+                if c0 { g.x0_reg = p0; }
+                if c1 { g.x1_reg = p0; }
+            }
         } else {
             ng_mi_dispatch(g, m, p0, p1, p2);
             if mi_defines(m.op) && m.op != MO_FBIN && m.op != MO_I2F { ng_xc_kill(g, p0); }
@@ -2547,7 +2730,7 @@ fn ng_xc_kill(g: &mut NatGen, r: i64) {
 /// survives them. Anything else (calls, labels, division, shifts, copies,
 /// prologues) empties it.
 fn ng_xc_keeps(op: i64) -> bool {
-    if op == MO_FBIN || op == MO_FCMP || op == MO_I2F || op == MO_F2I || op == MO_LINE { return true; }
+    if op == MO_FBIN || op == MO_FCMP || op == MO_I2F || op == MO_F2I || op == MO_F32BITS || op == MO_LINE { return true; }
     if op == MO_LI || op == MO_MOV || op == MO_LOAD || op == MO_STORE || op == MO_ADDR || op == MO_SLOTADDR { return true; }
     if op == MO_LDSLOT || op == MO_STSLOT || op == MO_LDIN || op == MO_EXT || op == MO_NEG || op == MO_NOT { return true; }
     if op == MO_ADD || op == MO_SUB || op == MO_MUL || op == MO_AND || op == MO_OR || op == MO_XOR { return true; }
@@ -2596,6 +2779,7 @@ fn ng_mi_dispatch(g: &mut NatGen, m: MInst, p0: i64, p1: i64, p2: i64) {
     if op == MO_FCMP { ng_fcmp(g, p0, p1, p2, m.i0, m.i1 != 0); return; }
     if op == MO_I2F { ng_i2f(g, p0, p1, m.i0 != 0); return; }
     if op == MO_F2I { ng_f2i(g, p0, p1, m.i0 != 0); return; }
+    if op == MO_F32BITS { ng_f32bits(g, p0, p1); return; }
     if op == MO_PROLOGUE { ng_prologue(g, g.frame); return; }
     if op == MO_EPILOGUE { ng_epilogue(g); return; }
     if op == MO_LDIN { ng_ld_incoming(g, p0, m.i0); return; }
@@ -2717,6 +2901,31 @@ fn ng_mir_finish(g: &mut NatGen) -> str {
         }
         root = root + 1;
     }
+    // WP17: functions that are only panic paths — trap dispatchers with no
+    // real body — go to the end of the image, after the hot code.
+    var cold: Vec<i64> = Vec::new();
+    var warm: Vec<i64> = Vec::new();
+    var wi: i64 = 0;
+    while wi < order.len() {
+        var wrec: NatFnRec = g.recs.get(order.get(wi));
+        var wk: i64 = 0;
+        var traps: i64 = 0;
+        var calls: i64 = 0;
+        while wk < wrec.mir.len() {
+            var wop: i64 = wrec.mir.get(wk).op;
+            if wop == MO_TRAP { traps = traps + 1; }
+            if wop == MO_CALL { calls = calls + 1; }
+            wk = wk + 1;
+        }
+        if traps > 0 && calls == 0 && wrec.mir.len() < 24 { cold.push(order.get(wi)); }
+        else { warm.push(order.get(wi)); }
+        wi = wi + 1;
+    }
+    order = Vec::new();
+    wi = 0;
+    while wi < warm.len() { order.push(warm.get(wi)); wi = wi + 1; }
+    wi = 0;
+    while wi < cold.len() { order.push(cold.get(wi)); wi = wi + 1; }
     var folded: i64 = HashMap_new();
     var fold_on: bool = ng_on("fold");
     var oi: i64 = 0;
@@ -2738,7 +2947,14 @@ fn ng_mir_finish(g: &mut NatGen) -> str {
             NatEnc_place(&mut g.e, label);
             if fold_on { HashMap_insert(folded, key, g.e.code.len()); }
             g.placed_fns.push(rec2.name);
+            var pre_sz: i64 = g.e.code.len();
             ng_mir_emit(g, &rec2, &al);
+            // WP20: the backend's half of the facts artifact — the callee's
+            // clobber mask and emitted size, which iropt cannot see.
+            if (g.fact_path as i64) != 0 && str_len(g.fact_path) > 0 {
+                p_file_append(g.fact_path, "ext " + rec2.name + " mask=" + int_to_str(al.mask)
+                    + " size=" + int_to_str(g.e.code.len() - pre_sz) + "\n");
+            }
             ng_line_close(g);
         }
         oi = oi + 1;
@@ -2764,6 +2980,46 @@ fn ng_x64(g: &NatGen) -> bool { return g.arch == NAT_X64; }
 fn ng_nregargs(g: &NatGen) -> i64 {
     if ng_x64(g) { return 4; }
     return 8;
+}
+
+/// WP6: functions only ever called from inside the program may use the
+/// extended convention — argument registers the platform ABI spends on
+/// nothing else. x64 gains r9 (r8/r10/r11 are the generator's temporaries),
+/// AArch64 gains x13–x15, RISC-V gains t6.
+fn ng_nregargs_i(g: &NatGen, internal: bool) -> i64 {
+    if !internal { return ng_nregargs(g); }
+    if ng_x64(g) { return 5; }
+    if ng_a64(g) { return 11; }
+    return 9;
+}
+
+fn ng_argreg_i(g: &NatGen, i: i64, internal: bool) -> i64 {
+    if !internal || i < ng_nregargs(g) { return ng_argreg(g, i); }
+    if ng_x64(g) { return 9; }
+    if ng_a64(g) { return 13 + (i - 8); }
+    return 31;
+}
+
+fn ng_internal(g: &NatGen, name: str) -> bool {
+    return HashMap_contains(g.internal, name);
+}
+
+/// ng_load_args under convention `internal`: the first registers are the
+/// extended set, the rest go to the outgoing stack slots past them.
+fn ng_load_args_i(g: &mut NatGen, srcs: Vec<i64>, internal: bool) {
+    var nr: i64 = ng_nregargs_i(g, internal);
+    var i: i64 = nr;
+    while i < srcs.len() {
+        if srcs.get(i) < 0 { ng_li(g, g.t0, 0); } else { ng_ld_val(g, g.t0, srcs.get(i)); }
+        ng_st_outgoing(g, i - nr, g.t0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < srcs.len() && i < nr {
+        var r: i64 = ng_argreg_i(g, i, internal);
+        if srcs.get(i) < 0 { ng_li(g, r, 0); } else { ng_ld_val(g, r, srcs.get(i)); }
+        i = i + 1;
+    }
 }
 
 /// d = a op b for the binary operations: 1 add, 2 sub, 3 mul, 4 and, 5 or,
@@ -3068,16 +3324,26 @@ fn ng_gen_primitives_x64_common(g: &mut NatGen) {
     while k < cs.len() { x64_store(&mut g.e, cs.get(k), 4, 8 * k, 8); k = k + 1; }
     x64_store(&mut g.e, 5, 4, 96, 8);
     if g.win {
-        // Windows: the TEB's StackLimit travels with the context (a new
-        // task's record holds 0: no stack probes on its committed stack)
+        // Windows: the TEB's StackBase (gs:8), StackLimit (gs:16) and
+        // DeallocationStack (gs:0x1478) travel with the context at +40,
+        // +48, +56 (a new task's record has its own stack's: pe_co_new_block),
+        // so a task's overflow into its guard page is STATUS_STACK_OVERFLOW
+        x64_load_gs(&mut g.e, 11, 8);
+        x64_store(&mut g.e, 11, 4, 40, 8);
         x64_load_gs(&mut g.e, 11, 16);
         x64_store(&mut g.e, 11, 4, 48, 8);
+        x64_load_gs(&mut g.e, 11, 0x1478);
+        x64_store(&mut g.e, 11, 4, 56, 8);
     }
     x64_store(&mut g.e, 4, 7, 0, 8);
     x64_mov(&mut g.e, 4, 6);
     if g.win {
+        x64_load(&mut g.e, 11, 4, 40, 8, true);
+        x64_store_gs(&mut g.e, 11, 8);
         x64_load(&mut g.e, 11, 4, 48, 8, true);
         x64_store_gs(&mut g.e, 11, 16);
+        x64_load(&mut g.e, 11, 4, 56, 8, true);
+        x64_store_gs(&mut g.e, 11, 0x1478);
     }
     k = 0;
     while k < cs.len() { x64_load(&mut g.e, cs.get(k), 4, 8 * k, 8, true); k = k + 1; }
@@ -3395,6 +3661,25 @@ fn ng_gen_call_std(g: &mut NatGen, id: i64, call_name: str, args: Vec<i64>, func
         ng_st_val(g, id, g.t0);
         return;
     }
+    // Float/int runtime shims: conversions are native ops already.
+    if call_name == "p_int_to_float" && args.len() == 1 {
+        ng_ld_val(g, g.t0, args.get(0));
+        ng_i2f(g, g.t0, g.t0, false);
+        ng_st_val(g, id, g.t0);
+        return;
+    }
+    if call_name == "p_float_to_int" && args.len() == 1 {
+        ng_ld_val(g, g.t0, args.get(0));
+        ng_f2i(g, g.t0, g.t0, false);
+        ng_st_val(g, id, g.t0);
+        return;
+    }
+    if call_name == "p_f32_to_bits" && args.len() == 1 {
+        ng_ld_val(g, g.t0, args.get(0));
+        ng_f32bits(g, g.t0, g.t0);
+        ng_st_val(g, id, g.t0);
+        return;
+    }
     // Varargs spawns: the arguments after `nargs` go to the function's
     // varargs area and are handed over as an array (as pe_ir's stubs do)
     var va_target: str = "";
@@ -3474,7 +3759,9 @@ fn ng_gen_call_std(g: &mut NatGen, id: i64, call_name: str, args: Vec<i64>, func
         srcs.push(args.get(ai));
         ai = ai + 1;
     }
-    ng_load_args(g, srcs);
+    // WP6: an internal callee takes its arguments in the extended register
+    // set; every other target keeps the platform convention.
+    ng_load_args_i(g, srcs, ng_internal(g, resolved));
     ng_emit_call(g, resolved);
     ng_st_val(g, id, ng_argreg(g, 0));
 }
@@ -4065,6 +4352,8 @@ fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModu
     g.cur_line = 0;
     // The runtime's arithmetic wraps, as pe_ir's does
     g.cur_wrapping = func.is_wrapping || is_pe_runtime_fn(name);
+    // WP11: @crashfree asserts no panic path exists — panic checks are dead
+    g.cur_crashfree = func.is_crashfree;
     // Counted loops and integer ranges (checks.fd, shared with pe_ir and C):
     // the operations that cannot overflow or index out of bounds
     // (`FID_NAT_OFF=unchecked`: every check stays)
@@ -4199,12 +4488,13 @@ fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModu
     ng_prologue(g, frame);
     // Parameters: registers, then the caller's stack
     i = 0;
+    var ic: bool = func.internal_conv;
     while i < func.params.len() {
         var p: ValueIdType = func.params.get(i);
-        if i < ng_nregargs(g) {
-            ng_st_val(g, p.id, ng_argreg(g, i));
+        if i < ng_nregargs_i(g, ic) {
+            ng_st_val(g, p.id, ng_argreg_i(g, i, ic));
         } else {
-            ng_ld_incoming(g, g.t0, i - ng_nregargs(g));
+            ng_ld_incoming(g, g.t0, i - ng_nregargs_i(g, ic));
             ng_st_val(g, p.id, g.t0);
         }
         i = i + 1;
@@ -4242,7 +4532,9 @@ fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModu
     ng_epilogue(g);
     if mir_on {
         g.rec = false;
-        g.recs.push(NatFnRec { name: name, mir: g.mir, nvreg: g.nvreg, base_frame: base_frame, slots: g.slots });
+        // WP17: panic paths — segments containing MO_TRAP — go to the end of
+        // the function's code so the hot path stays compact and contiguous.
+        g.recs.push(NatFnRec { name: name, mir: ng_cold_last(&g.mir), nvreg: g.nvreg, base_frame: base_frame, slots: g.slots });
         g.mir = Vec::new();
         g.t0 = saved_t.get(0);
         g.t1 = saved_t.get(1);
@@ -4942,8 +5234,13 @@ fn nat_generate_image(module: IrModule, arch: i64, win: bool) -> ResultBytes {
     var fi: i64 = 0;
     while fi < module.functions.len() {
         HashMap_insert(g.all_fns, module.functions.get(fi).name, 1);
+        if module.functions.get(fi).func.internal_conv {
+            HashMap_insert(g.internal, module.functions.get(fi).name, 1);
+        }
         fi = fi + 1;
     }
+    g.fact_path = p_getenv("FID_LIBFACTS");
+    ng_libfacts_load(&mut g);
     ng_collect_dyn_types(&mut g, &module);
     if g_nat_lines_names != "" {
         var lnames: Vec<str> = str_split(g_nat_lines_names, ",");
@@ -5097,6 +5394,13 @@ fn ng_win_imports() -> Vec<str> {
     ws.push("getsockopt"); ws.push("ioctlsocket"); ws.push("WSAPoll"); ws.push("WSAGetLastError"); ws.push("gethostbyname");
     i = 0;
     while i < ws.len() { v.push("ws2_32.dll|" + ws.get(i)); i = i + 1; }
+    // 63-68: epoll over AFD and an I/O completion port (win.fd, RT11)
+    v.push("kernel32.dll|CreateIoCompletionPort");
+    v.push("kernel32.dll|GetQueuedCompletionStatusEx");
+    v.push("kernel32.dll|PostQueuedCompletionStatus");
+    v.push("ntdll.dll|NtDeviceIoControlFile");
+    v.push("ntdll.dll|NtCancelIoFileEx");
+    v.push("ws2_32.dll|WSAIoctl");
     return v;
 }
 
@@ -5377,4 +5681,39 @@ fn ng_gen_win_imports(g: &mut NatGen) {
 
 fn NatEnc_label_offset(e: &NatEnc, label: i64) -> i64 {
     return e.labels.get(label);
+}
+
+/// WP17: reorder a recorded function's segments so runs that end in a trap
+/// (the panic paths) come last. Segments end at block terminators; a
+/// MO_PLACE starts a fresh one. Label ids are absolute, so moving a run is
+/// layout-only.
+fn ng_cold_last(mir: &Vec<MInst>) -> Vec<MInst> {
+    var out: Vec<MInst> = Vec::new();
+    var cold: Vec<MInst> = Vec::new();
+    var seg: Vec<MInst> = Vec::new();
+    var traps: bool = false;
+    var k: i64 = 0;
+    while k < mir.len() {
+        var m: MInst = mir.get(k);
+        if m.op == MO_PLACE && seg.len() > 0 {
+            if traps { var z: i64 = 0; while z < seg.len() { cold.push(seg.get(z)); z = z + 1; } }
+            else { var z2: i64 = 0; while z2 < seg.len() { out.push(seg.get(z2)); z2 = z2 + 1; } }
+            seg = Vec::new();
+            traps = false;
+        }
+        seg.push(m);
+        if m.op == MO_TRAP { traps = true; }
+        if mi_ends_block(m.op) {
+            if traps { var z3: i64 = 0; while z3 < seg.len() { cold.push(seg.get(z3)); z3 = z3 + 1; } }
+            else { var z4: i64 = 0; while z4 < seg.len() { out.push(seg.get(z4)); z4 = z4 + 1; } }
+            seg = Vec::new();
+            traps = false;
+        }
+        k = k + 1;
+    }
+    if traps { var z5: i64 = 0; while z5 < seg.len() { cold.push(seg.get(z5)); z5 = z5 + 1; } }
+    else { var z6: i64 = 0; while z6 < seg.len() { out.push(seg.get(z6)); z6 = z6 + 1; } }
+    var k2: i64 = 0;
+    while k2 < cold.len() { out.push(cold.get(k2)); k2 = k2 + 1; }
+    return out;
 }

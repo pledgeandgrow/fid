@@ -228,6 +228,10 @@ pub struct BorrowChecker {
     pub in_reservation_phase: bool,
 
     // Phase 6: NLL. Maps each variable name to the last statement index.
+    // dead_at[i]: borrowers to release once stmt_index reaches i. Lets
+    // release_dead_borrows check one bucket per statement instead of
+    // scanning every live borrow (CS3: was stmts x borrows quadratic).
+    pub dead_at: Vec<StringVec>,
     pub last_use: Vec<StringI64Entry>,
     // name -> index in last_use + 1 (release D8: the lists were searched by
     // name on every statement, quadratic in the size of a function)
@@ -274,6 +278,7 @@ pub fn BorrowChecker_new(mode: BorrowckMode) -> BorrowChecker {
         temp_checkpoints: Vec::new(),
         reserved_mut_borrows: Vec::new(),
         in_reservation_phase: false,
+        dead_at: Vec::new(),
         last_use: Vec::new(),
         last_use_index: HashMap_new(),
         iterating: Vec::new(),
@@ -353,6 +358,21 @@ pub fn check_func(self: &mut BorrowChecker, func: Func) -> void {
     // each variable. This lets us release borrows at the borrower's last use
     // rather than at scope end.
     compute_last_use(self, func.body);
+    // Bucket borrowers by the statement after their last use so
+    // release_dead_borrows releases one bucket, not a scan of every borrow.
+    var maxlu: i64 = 0;
+    var li: i64 = 0;
+    while li < self.last_use.len() {
+        var lu: i64 = self.last_use.get(li).val;
+        if lu > maxlu { maxlu = lu; }
+        li = li + 1;
+    }
+    self.dead_at = Vec::new();
+    var di: i64 = 0;
+    while di <= maxlu + 2 {
+        self.dead_at.push(StringVec_new());
+        di = di + 1;
+    }
 
     // Parameters are in scope at function entry.
     var p: i64 = 0;
@@ -823,6 +843,76 @@ pub fn bc_skips(self: &BorrowChecker, key: str) -> bool {
 // last use, not at scope end.
 fn release_dead_borrows(self: &mut BorrowChecker) -> void {
     var current_idx: i64 = self.stmt_index;
+    if current_idx < self.dead_at.len() {
+        // Bucketed fast path (CS3): only borrowers dying at this statement.
+        var names: Vec<str> = self.dead_at.get(current_idx).items;
+        if names.len() > 0 {
+            // One borrow_of pass for the whole bucket: removing one at a
+            // time would drop and rebuild the index per name.
+            var set: i64 = HashMap_new();
+            var j: i64 = 0;
+            while j < names.len() {
+                HashMap_insert(set, names.get(j), 1);
+                j = j + 1;
+            }
+            var pairs: Vec<StrPair> = Vec::new();
+            var i: i64 = self.borrow_of.len() - 1;
+            while i >= 0 {
+                if HashMap_contains(set, self.borrow_of.get(i).borrower) {
+                    pairs.push(StrPair_new(self.borrow_of.get(i).borrower, self.borrow_of.get(i).borrowed));
+                    self.borrow_of.remove(i);
+                }
+                i = i - 1;
+            }
+            HashMap_drop(set);
+            // Release the pairs with per-call key->index maps: the shared
+            // and mut vecs stay structurally stable through the batch, so
+            // one build each serves every release (CS3, was k full scans).
+            var sb_ix: i64 = HashMap_new();
+            var si: i64 = 0;
+            while si < self.shared_borrows.len() {
+                HashMap_insert(sb_ix, self.shared_borrows.get(si).key, si + 1);
+                si = si + 1;
+            }
+            var mb_ix: i64 = HashMap_new();
+            var mi: i64 = 0;
+            while mi < self.mut_borrow.len() {
+                HashMap_insert(mb_ix, self.mut_borrow.get(mi).key, mi + 1);
+                mi = mi + 1;
+            }
+            var k: i64 = 0;
+            while k < pairs.len() {
+                var borr: str = pairs.get(k).a;
+                var bord: str = pairs.get(k).b;
+                if HashMap_contains(sb_ix, bord) {
+                    var ei: i64 = HashMap_get(sb_ix, bord) - 1;
+                    var borrowers: Vec<str> = self.shared_borrows.get(ei).borrowers;
+                    var bj: i64 = 0;
+                    while bj < borrowers.len() {
+                        if borrowers.get(bj) == borr {
+                            self.shared_borrows.get(ei).borrowers.remove(bj);
+                            bj = borrowers.len();
+                        }
+                        bj = bj + 1;
+                    }
+                }
+                if HashMap_contains(mb_ix, bord) {
+                    var em: i64 = HashMap_get(mb_ix, bord) - 1;
+                    match self.mut_borrow.get(em).borrower {
+                        OptStr::Some(b) => {
+                            if b == borr { self.mut_borrow.get(em).borrower = OptStr::None; }
+                        }
+                        OptStr::None => {}
+                    }
+                }
+                k = k + 1;
+            }
+            HashMap_drop(sb_ix);
+            HashMap_drop(mb_ix);
+        }
+        self.dead_at.get(current_idx).items.clear();
+        return;
+    }
     // Collect dead borrowers.
     var dead: Vec<str> = Vec::new();
     var i: i64 = 0;
@@ -1179,6 +1269,13 @@ fn borrow_of_add(self: &mut BorrowChecker, borrower: str, borrowed: str, is_mut:
         i = i + 1;
     }
     self.borrow_of.push(BorrowOfEntry_new(borrower, borrowed, is_mut, line));
+    // Bucket for NLL release: dies at the statement after its last use.
+    var last: i64 = last_use_get(self, borrower);
+    if last >= 0 && self.dead_at.len() > 0 {
+        var slot: i64 = last + 1;
+        if slot <= self.stmt_index { slot = self.stmt_index + 1; }
+        if slot < self.dead_at.len() { self.dead_at.get(slot).items.push(borrower); }
+    }
 }
 
 // CM2: which borrow holds `path` (or a field of it, or what it is a field

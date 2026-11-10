@@ -1,95 +1,69 @@
-# fmt.fd — source formatter (1,179 LOC)
+# fmt.fd
 
-> **Re-verified 2026-10-23:** corruption mechanism confirmed — `generic_depth` handling at :985-1015 still suppresses whitespace inside fake generics, `>>` never closes it, prefix-op spacing rules still dead. Exact output bytes not re-run.
+> **Re-audited 2026-11-09** against the current source and the latest `fid` build (s18).
+> Unchanged since Oct 22 (no commits). All three corruption bugs reproduce; they also spread
+> across function boundaries.
 
-## Role
+- **Path:** `compiler/fmt.fd`
+- **LOC:** 1,179 (Rust `src/fmt.rs`: 1,236)
+- **Role:** token-based (not AST) formatter: `fmt_tokenize` → `need_space` → `format_source`.
+  Keeps comments and blank lines, 4-space indent from brace depth.
 
-Token-based (not AST) formatter: `fmt_tokenize` → `need_space` →
-`format_source`, plus `is_formatted` for `--check`. Preserves comments
-and blank lines; 4-space indent via brace tracking. Port of
-`src/fmt.rs` (1,236 LOC).
+## Callers
 
-## Where it's called
+| Caller | Site | Use |
+|---|---|---|
+| `compiler/main.fd` | :165 dispatch, :638 `cmd_fmt` | `fid fmt <file> [--check]` |
+| `tests/selfhost/test_fmt*.fd` (6 files) | tests |
 
-| Caller | Site | What |
-|--------|------|------|
-| `main.fd` | :23 import, :144 `cmd_fmt` | `fides-c fmt <file> [--check]` — **live**, user-facing. |
+`cmd_fmt` writes the result **over the input file** (`main.fd:669`) unless `--check`.
+`is_formatted` (:1177) has no caller; `cmd_fmt` compares strings itself.
 
 ## Findings
 
-### F1 — `word < word` poisons `generic_depth` → file collapses — CRITICAL (verified live, inherited)
+### Verified live
 
-`is_generic_open` (:651-668) treats `word < word` as a generic open —
-it only excludes `is_cond_or_match_kw`/`is_type_word` as *prev*. Any
-comparison `a < b` (both idents) opens a "generic" that never closes:
+Input (scratch copy) and the file `fid fmt` wrote back:
 
 ```
-in :  if a < b { return 1; } return 0;
-out:  ifa<b{return1;}return0;
+fn f(a: i64, b: i64) -> i64 { if a < b { return 1; } return 0; }
+fn g(x: &i64) -> i64 { var y: i64 = -5; return *x + y; }
+--->
+    if a<b{
+        return1;
+    ...
+fng(x: &i64)->i64{
+    vary: i64=-5;
+    return*x+y;
 ```
 
-`generic_depth` stays ≥1 forever → the `:1004` override forces
-`need_space_before=false` for every later token except after `:`/`,`
-→ **all whitespace in the rest of the function disappears** → `ifa`,
-`return1`, `return0` — single identifiers. Output doesn't parse.
+- **CRITICAL — STILL TRUE — `a < b` between two words opens a "generic" that never closes.**
+  `is_generic_open` (:651-669) returns true for word `<` word. `generic_depth` (:857) then stays
+  above 0 and the override at :1004 removes spaces from every later token. It is never reset at
+  a function boundary, so the rest of the **file** collapses: `return1`, `fng`, `vary`, `ifn`.
+  The output does not compile, and it replaced the input.
+- **CRITICAL — STILL TRUE — `>>` never closes generics.** `Vec<Vec<i64>>` leaves depth 2
+  (the close check at :981-991 only sees a single `>`). Same collapse.
+- **HIGH — STILL TRUE — prefix operators get spaces or lose them wrongly.** `is_binop` (:420) is
+  checked at :734-735 before the prefix rules, so `&x`, `*x`, `-5` are treated as binary. In
+  the collapsed output this shows as `=-5`, `return*x`; in a clean file as `& y`, `- 5`.
 
-Verified live with `fidesc fmt` (the Rust binary — **inherited**:
-`src/fmt.rs:513-532` has the identical heuristic + single-`>` close).
+### From code inspection
 
-### F2 — `>>` never decrements `generic_depth` — CRITICAL (verified live, inherited)
+- **LOW — STILL TRUE — `..` is not a multi-char punct** (`try_multi_punct`, :50); `-` after `??`,
+  `|>`, `~>` and compound assignments is not seen as prefix.
+- **LOW — `is_cond_kw` is unused** (`fid lint`), `use string` unused.
 
-`try_multi_punct` lexes `>>` as one token; `cur_is_generic_close`
-(:981-991) only fires on single `>`. `Vec<Vec<i64>>` leaves
-`generic_depth=2` permanently → everything after the type collapses:
+## Fix order
 
-```
-in :  var x: Vec<Vec<i64>> = Vec::new(); if a < b { ...
-out:  var x: Vec<Vec<i64>>=Vec::new(); ifa<b&&b>0{ ...
-```
-
-Same file-poisoning mechanism as F1 — combined, they make `fmt`
-unsafe on **any** file using generics or `<` comparisons, i.e.
-virtually all real code. `--check` (`is_formatted`) then reports
-canonical source as "unformatted" — CI usage fails both ways.
-
-### F3 — All prefix-operator "no space" rules are dead code — HIGH (verified live, inherited)
-
-`is_binop` (:436) contains `&`, `*`, `-`, `!`… and the check at
-:734-735 (`is_binop(cur)||is_binop(prev)`) returns `true` **before**
-the prefix rules at :752-799 (`!x`, `~x`, `&x`, `*x`, `-5` contexts)
-are reached. Verified live:
-
-```
-in :  foo(&y, &mut y);  var y: i64 = -5;  return *x + 1;
-out:  foo(& y, & mut y);  var y: i64 = - 5;  return * x + 1;
-```
-
-Parses the same (whitespace-insensitive) but every borrow/deref/
-negative is defaced — the exact output `--check` then demands.
-Rust is identical (:1002 before :1040 — same dead rule, comment even
-rationalizes it: *"we already returned true for binop above"* —
-the reasoning is wrong: `foo(&x)` hits the binop arm too).
-
-### F4 — Additional gaps — LOW/MEDIUM
-
-- `try_multi_punct` lacks `..` — `0..5` survives only because two
-  `.` tokens also get no space. `0..-1` → `0..- 1` (`-` prefix).
-- Missing prefix contexts for `-`: `??`, `|>`, `~>`, compound
-  assigns (`x += -1` → `x += - 1`).
-- `is_generic_open` can't be fixed heuristically — needs lookahead
-  to a matching `>`/`(` or an AST-aware pass.
-- `str_starts_with(prev,"f")` at :811 — any `f*`-ident + `{` gets
-  a space (intended: f-strings; redundant with :806).
+1. Stop writing the file when the formatted text does not lex to the same tokens as the input
+   (cheap safety net: compare `fmt_tokenize` of both, ignoring whitespace).
+2. Reset `generic_depth` at `;`, `{`, `}`; treat `>>` as two closes.
+3. Decide prefix vs binary from the previous significant token before the `is_binop` rule.
+4. Longer term: format from the AST.
 
 ## Verification state
 
-- **All three findings reproduced live** on `fidesc fmt` (Rust build,
-  same logic both sides — inherited, not port regressions).
-- `fmt` on `if a < b` or `Vec<Vec<T>>` produces **non-compiling
-  output** — the tool is unsafe to run on the codebase that ships it.
-- Positive: comments/blank-lines/raw-strings/f-strings handled;
-  simple programs are idempotent (`already formatted` verified).
-
-## Next
-
-`gpu.fd`.
+- `fid check compiler/fmt.fd`: no errors.
+- Live: `fid fmt` on a scratch file (copy kept as `fm_orig.fd` in the session scratch folder).
+- `fid lint compiler/fmt.fd`: `unused function 'is_cond_kw'`, `unused import: 'string'`.

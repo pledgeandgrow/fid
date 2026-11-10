@@ -249,7 +249,7 @@ need a map for output, use `BTreeMap` or `IndexMap`.
 
 ```
                     ┌─────────────┐
-                    │  End-to-end │  fidesc test (493 .fd files, Nov 6)
+                    │  End-to-end │  fidesc test (543 .fd files, Nov 9)
                     │   tests     │  ← tells you SOMETHING broke
                     └──────┬──────┘
                   ┌────────┴────────┐

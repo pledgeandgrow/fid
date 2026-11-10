@@ -1,7 +1,9 @@
 # Diagnostic Codes
 
-Every compiler error carries a stable `Exxx` code. This index maps each code to
-its meaning and the usual fix.
+Every `fidesc` error carries a stable `Exxx` code. This index maps each code to
+its meaning and the usual fix. `fid` (Nov 9) prints its errors without codes:
+its diagnostics module, compiler/diag.fd, is not wired in (and no longer
+passes `fid check`; known-bugs 2g.22).
 
 ## Lexer (E001–E019)
 

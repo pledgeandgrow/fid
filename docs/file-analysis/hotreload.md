@@ -1,84 +1,76 @@
-# hotreload.fd — watch-mode + hot-reload scaffolding (635 LOC)
+# hotreload.fd — watch-mode / hot-reload scaffold
 
-> **Re-verified 2026-10-23:** still dead — `watch` still aliases `cmd_bench` (main.fd:160), `p_file_modified_ms`/`p_file_remove` still implemented nowhere.
+- **Path:** `compiler/hotreload.fd` — module `compiler::hotreload`
+- **LOC:** 636 (2026-11-09, unchanged). Rust `src/hotreload.rs`: 559.
+- **Role:** per-function change detection over IR (`FunctionSnapshot`,
+  `FunctionDiff`, FNV-style hashes), `compile_and_run` (lower, then run in
+  the interpreter), `PersistentState` (key=value file between reloads),
+  `Watcher` (poll file times), and a small `Debugger` call-stack struct.
+- **Status:** DEAD. Nothing imports it; `fid watch` runs `bench`.
+- **Re-audited:** 2026-11-09.
 
-## Role
+## Where it is called
 
-Four subsystems: `FunctionSnapshot`/`FunctionDiff` (IR-level
-per-function change detection via FNV-1a content hashes),
-`compile_and_run` (JIT: lower → interpret), `PersistentState`
-(key=value file across reloads), `Watcher` (poll-for-changes loop),
-plus a second `Debugger` struct. Port of `src/hotreload.rs` (559 LOC).
+**Nowhere.** No `use compiler::hotreload` (grep 2026-11-09). `fid watch`
+dispatches to `cmd_bench` (main.fd:180), which builds through C and times
+the run; nothing watches files. Not reachable from main.fd.
 
-## Where it's called
-
-| Caller | Site | What |
-|--------|------|------|
-| — | — | **Nothing** — no importer anywhere. |
-
-Rust wires `fidesc watch` → `FunctionSnapshot::from_l2` +
-`Watcher::run` + `compile_and_run` (main.rs:2348-2509). Fides's
-`watch` command **aliases `cmd_bench`** (main.fd dispatch) — running
-`fides-c watch file.fd` benchmarks once and exits; it never watches.
-Tenth dead module.
+Imports: `core`, `vec`, `string`, `compiler::ir`, `compiler::compiler`
+(`lower_to_ir_module`), `compiler::interp` (`interpret_ir_module`).
 
 ## Findings
 
-### F1 — `watch` command is a decoy — HIGH (wiring)
+### Verified live (probe)
 
-`watch → cmd_bench` means the documented watch mode doesn't exist —
-users get a benchmark run, not a file watcher. The real machinery
-(FunctionSnapshot diff → recompile-on-change) is all here, unwired.
+1. **NEW, MEDIUM — `PersistentState_load` never finds `=`.** :377 calls the
+   local `str_find_char(line, "=")`, which takes a byte (`ch: i64`) and so
+   compares each byte with the literal's address. A probe of the same
+   function returns -1 for `":"` and the right index for `58`. Every saved
+   line is skipped on load.
 
-### F2 — `p_file_modified_ms` doesn't exist — HIGH
+### From code inspection
 
-`Watcher_watch`/`Watcher_poll` (:448, :458) call
-`p_file_modified_ms` — **not implemented in interp.fd or codegen_c.fd**
-(the file primitives are `p_file_read/write/exists/append/delete/
-size`). Any call to `Watcher_*` would fail to resolve — the watcher
-can't have ever run in the self-hosted build.
+2. **STILL TRUE, HIGH — `watch` is a decoy.** `watch` → `cmd_bench`
+   (main.fd:180). docs/reference/features.md:123 and architecture.md:642
+   say so too.
+3. **STILL TRUE, HIGH — `p_file_modified_ms` does not exist.** Called at
+   :449 and :459; not defined in core, lower.fd's extern list
+   (:2115-2124 has read/write/exists/append/delete/size/hash), the
+   interpreter, or the C runtime (grep). `Watcher_*` cannot link.
+4. **STILL TRUE, MEDIUM — `p_file_remove` does not exist** (:433); the
+   builtin is `p_file_delete`.
+5. **STILL TRUE, MEDIUM — `Watcher_run` spins.** 1000 polls with no sleep,
+   `interval_ms` unused (:484-505). A sleep exists now for tasks
+   (`task_sleep`, stdlib/task.fd), so "no sleep facility" (:483) is stale.
+6. **STILL TRUE, MEDIUM — state file path is `/tmp/pledge_state_<hash>.json`**
+   (:359): not valid on Windows; the content is key=value, not JSON.
+7. **STILL TRUE, LOW — `JitResult` stdout/stderr are always ""** for a run
+   (:338); the interpreter prints straight to the process streams.
+8. **STILL TRUE, LOW — second `pub struct Debugger`** (:509) would clash
+   with debugger.fd's if both were imported; local copies of
+   `int_to_str`, `char_from_digit`, `str_lines`, `str_find_char`
+   (:590-636).
+9. **NEW, LOW — `p_file_read` used as `str`** (:370, :494), a raw `i64` now
+   (AGENTS.md rule 25).
+10. **INFO — type check.** `s18.exe check compiler/hotreload.fd` did not
+    finish in 125 s (it pulls in the compiler). A scratch copy with the
+    two compiler imports replaced by stubs: as `module compiler::hotreload`
+    no errors; renamed out of `compiler::`, three errors (`p_file_read`
+    i64 → str at :370 and :494, `str_find_char` str for i64 at :377). The
+    missing `p_file_modified_ms` / `p_file_remove` are not reported by
+    `check`; they would fail at C compile or link (not run).
+11. **STILL TRUE, INFO — the good part.** `FunctionSnapshot_from_ir`
+    (:157-217) and `FunctionSnapshot_diff` (:72) are sound and reusable.
 
-### F3 — `Watcher_run` busy-polls, no sleep — MEDIUM (by design, still wrong)
+## Fix order
 
-`interval_ms` accepted but unused ("no sleep facility"), loop is
-`max_iterations=1000` of tight `stat`-style polls → 100% CPU burn
-then silent exit — not a daemon, a CPU spin followed by termination.
-
-### F4 — `PersistentState` Unix-only + wrong remove builtin — MEDIUM
-
-- State file path hardcoded `/tmp/pledge_state_<hash>.json` (:358) —
-  no such directory on Windows; `p_file_write` would fail.
-- `PersistentState_clear` calls `p_file_remove` (:432) — the actual
-  builtin is `p_file_delete` — undefined-symbol failure.
-
-### F5 — `JitResult` misleads + Debugger name collision — LOW
-
-- `compile_and_run` returns `stdout`/`stderr` fields that are always
-  `""` — the interpreter prints directly to the process streams;
-  nothing captures them.
-- Declares `pub struct Debugger` (:508) — a second, unrelated
-  Debugger type; co-importing with `compiler::debugger` would collide
-  or silently shadow depending on import rules.
-- Local `str_lines`/`int_to_str`/`char_from_digit`/`hash_str`
-  duplicated at :571-635 (stdlib shadows again).
-
-### F6 — The good part — INFO
-
-`FunctionSnapshot_from_ir` (:157-217) is the real workhorse and is
-sound: hashes name + ret_ty + entry + params + per-block inst-ids +
-inst-kind names + value metas — a function's hash changes on any
-structural edit; `FunctionDiff` gives added/modified/removed sets.
-This is the piece `fidesc watch` actually needed — it's reusable as-is.
+1. Delete, or wire a real `watch` (mtime builtin, sleep, re-run on change)
+   that reuses `FunctionSnapshot_*`.
+2. If kept: `p_file_delete`, a byte for `str_find_char`, `read_file`, a
+   temp path from the environment.
 
 ## Verification state
 
-- Dead status verified: zero importers; `watch` dispatch confirmed to
-  alias `cmd_bench`.
-- `p_file_modified_ms`/`p_file_remove` absence verified by grepping
-  all p_file_* implementations in interp.fd + codegen_c.fd.
-- Dead-in-Rust: false — Rust's `watch` is fully wired (this one is a
-  pure port-orphan, not inherited).
-
-## Next
-
-`inc.fd`.
+- 2026-11-09: header, all function headers, `compile_and_run`,
+  `PersistentState`, `Watcher` read; importers and dispatch grepped;
+  stubbed type checks run; `str_find_char` behaviour probed.

@@ -43,11 +43,13 @@ use compiler::cparser;
 use compiler::iropt;
 use compiler::nat_ir;
 use compiler::rules;
+use compiler::checks;
 use compiler::irverify;
 use compiler::egraph;
 use compiler::typechecker;
 use compiler::json;
 use compiler::csplit;
+use compiler::reach;
 
 // --- Global flag state ---------------------------------------------------
 // Parsed from --borrowck= and --timeout flags before command dispatch.
@@ -168,6 +170,7 @@ pub fn main() -> i64 {
     if command == "bench" { return cmd_bench(n, start); }
     if command == "profile" { return cmd_profile(n, start); }
     if command == "lint" { return cmd_lint(n, start); }
+    if command == "explain" { return cmd_explain(n, start); }
     if command == "test-rules" {
         // fid test-rules [--smt <dir>]: the rules on values; with --smt, an
         // SMT-LIB proof obligation per rule and width as well
@@ -1544,6 +1547,12 @@ fn cmd_lint(n: i64, start: i64) -> i64 {
         return 1;
     }
     var input: str = p_argv(start + 1);
+    var perf: bool = false;
+    var ai: i64 = start + 2;
+    while ai < n {
+        if p_argv(ai) == "--perf" { perf = true; }
+        ai = ai + 1;
+    }
     var source: str = c_file_read(input);
     if str_len(source) == 0 {
         p_eprint_str("Error: could not read file: ");
@@ -1552,8 +1561,9 @@ fn cmd_lint(n: i64, start: i64) -> i64 {
         return 1;
     }
     // G8.7: Real lint implementation — calls lint_source which runs
-    // unused-function and unused-import lints.
-    var result: ResultVecStr = lint_source(source, input);
+    // unused-function and unused-import lints; --perf adds the CP9
+    // quadratic-pattern warnings.
+    var result: ResultVecStr = lint_source(source, input, perf);
     match result {
         ResultVecStr::Ok(warnings) => {
             if warnings.len() == 0 {
@@ -1574,6 +1584,54 @@ fn cmd_lint(n: i64, start: i64) -> i64 {
         ResultVecStr::Err(errs) => {
             print_errors(errs);
             return 1;
+        }
+    }
+    return 1;
+}
+
+// --- explain --------------------------------------------------------------
+// CP3: `fid explain <file.fd>` — for each function, the runtime checks the
+// mid-end proved needless (and which proof removed them) versus the checks
+// the backends still emit.
+fn cmd_explain(n: i64, start: i64) -> i64 {
+    if start + 2 > n {
+        p_eprint_str("Usage: fid explain <file.fd> [--alloc] [<name-substring>]\n");
+        return 1;
+    }
+    var input: str = p_argv(start + 1);
+    var alloc_mode: bool = false;
+    var filt: str = "";
+    var ai: i64 = start + 2;
+    while ai < n {
+        var a: str = p_argv(ai);
+        if a == "--alloc" { alloc_mode = true; }
+        else if str_len(a) > 0 { filt = a; }
+        ai = ai + 1;
+    }
+    var source: str = c_file_read(input);
+    if str_len(source) == 0 {
+        p_eprint_str("Error: could not read file: ");
+        p_eprint_str(input);
+        p_eprint_str("\n");
+        return 1;
+    }
+    var mod_result: ResultIrModule = lower_to_ir_module_with_path(source, input, "on");
+    match mod_result {
+        ResultIrModule::Err(errs) => {
+            print_errors(errs);
+            return 1;
+        }
+        ResultIrModule::Ok(m) => {
+            var lines: Vec<str> = Vec::new();
+            if alloc_mode { lines = explain_allocs(m, filt); }
+            else { lines = explain_checks(m, filt); }
+            var i: i64 = 0;
+            while i < lines.len() {
+                print(lines.get(i));
+                print("\n");
+                i = i + 1;
+            }
+            return 0;
         }
     }
     return 1;
@@ -2776,6 +2834,28 @@ fn cmd_parse_header(n: i64, start: i64) -> i64 {
 }
 
 /// FID_VERIFY: the IR verifier's findings, printed; false when there are any.
+/// The functions `lower` needs for a native build (compiler/reach.fd): every
+/// core function is a root (lowering and the runtimes call them by name).
+/// 0 (lower everything) without a parsed core.
+fn lw_keep_set(program: Program) -> i64 {
+    var core_names: Vec<str> = Vec::new();
+    match g_stdlib_cache {
+        OptProgram::Some(cp) => {
+            var i: i64 = 0;
+            while i < cp.funcs.len() { core_names.push(cp.funcs.get(i).name); i = i + 1; }
+            i = 0;
+            while i < cp.impls.len() {
+                var im: ImplDef = cp.impls.get(i);
+                var j: i64 = 0;
+                while j < im.methods.len() { core_names.push(im.struct_name + "_" + im.methods.get(j).name); j = j + 1; }
+                i = i + 1;
+            }
+        }
+        OptProgram::None => { return 0; }
+    }
+    return reach_keep_set(program, core_names);
+}
+
 fn nat_verified(m: &IrModule, stage: str) -> bool {
     var errs: Vec<str> = ir_verify(m, stage);
     var i: i64 = 0;
@@ -3054,7 +3134,9 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 }
                 t_run = time_mark("line-table reparse", t_run);
                 p_eprint_str("[build] Lowering to IR...\n");
+                g_lower_keep = lw_keep_set(nprogram);
                 var nat_mod: IrModule = lower(nprogram);
+                g_lower_keep = 0;
                 t_run = time_mark("lower", t_run);
                 // The mid-end (own-backend roadmap step 3-5): iropt's passes,
                 // then the rules and pure-call merging; the IR verifier
@@ -3149,7 +3231,10 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         ResultProgram::Ok(program) => {
             p_eprint_str("[build] Lowering to IR...\n");
             var t_lw: i64 = p_clock_now_ms();
+            // pe_ir lowers only what the program can reach (compiler/reach.fd)
+            if windows_pe { g_lower_keep = lw_keep_set(program); }
             var ir_mod: IrModule = lower(program);
+            g_lower_keep = 0;
             t_run = time_mark("lower", t_run);
             p_eprint_str("[prof] lower: " + int_to_str(p_clock_now_ms() - t_lw) + "ms\n");
 
@@ -3157,9 +3242,12 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             if windows_pe {
                 // Inlining and folding before machine code (release D5, D6)
                 var t_io: i64 = p_clock_now_ms();
+                var pe_verify: bool = str_len(env_or_empty("FID_VERIFY")) > 0;
+                if pe_verify && !nat_verified(&ir_mod, "after lowering") { return 1; }
                 if do_opt { iropt_native(&mut ir_mod); }
                 t_run = time_mark("iropt", t_run);
                 p_eprint_str("[prof] iropt: " + int_to_str(p_clock_now_ms() - t_io) + "ms\n");
+                if pe_verify && !nat_verified(&ir_mod, "after iropt") { return 1; }
                 p_eprint_str("[build] Emitting PE via pe_ir backend...\n");
                 var t_pe: i64 = p_clock_now_ms();
                 var pe_res: ResultBytes = pe_ir_generate_pe(ir_mod);
@@ -3178,7 +3266,7 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                     }
                     ResultBytes::Ok(pe_bytes) => {
                         p_file_write_vec(output, pe_bytes);
-                        inc_stamp_commit(stamp_path, build_key, 0, input, output);
+                        inc_stamp_commit_hash(stamp_path, build_key, 0, input, inc_bytes_hash(pe_bytes));
                         t_run = time_mark("write+stamp", t_run);
                         time_mark("total", t_start);
                         time_report();
@@ -3299,6 +3387,7 @@ fn print_usage() {
     p_eprint_str("  fid gpu      <file.fd> --target spirv|ptx [-o <out>] [--text]\n");
     p_eprint_str("                                           Generate GPU code\n");
     p_eprint_str("  fid verify   <file.fd>              Verify IR correctness\n");
+    p_eprint_str("  fid explain  <file.fd>              Runtime checks the optimizer removed, and why\n");
     p_eprint_str("  fid audit    <file.fd> [--stdlib] [--strict]  List the unsafe code it can reach\n");
     p_eprint_str("  fid qualify  <file.fd> [-o out.json]  Safety evidence: rules, their tests, the program's annotations\n");
     p_eprint_str("  fid sourcemap <file.fd>             Show IR-to-source mapping\n");

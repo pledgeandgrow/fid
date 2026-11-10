@@ -1,67 +1,64 @@
-# gpu.fd — SPIR-V + PTX GPU codegen (826 LOC)
+# gpu.fd — SPIR-V + PTX GPU codegen
 
-## Role
+> **Re-audited 2026-11-09.** Since 10-23 the only change is tuples →
+> `GpuStrI64`/`GpuI64I64` structs and `str_equal` → `==` (commit e1b2c3f).
+> Probes with the latest self-hosted binary (s18).
 
-L3 → SPIR-V word emitter (`SpirVCodeGen`, header/capabilities/memory
-model/entry point + per-inst dispatch) and L3 → PTX text emitter
-(`PtxCodeGen`), plus `generate_spirv`/`generate_spirv_text`/
-`generate_ptx` public API and a structural disassembler. Port of
-`src/gpu.rs` (590 LOC; Fides is larger due to `GpuStrI64`/`GpuI64I64`
-tuple-workaround structs and explicit enum dispatch).
+- **Path:** `compiler/gpu.fd`
+- **LOC:** 826 (Rust `src/gpu.rs`: 590)
+- **Role:** PIR L3 → SPIR-V words (`SpirVCodeGen`, `generate_spirv` :786,
+  `generate_spirv_text` :793 + `disassemble` :523) and L3 → PTX text
+  (`PtxCodeGen`, `generate_ptx` :800).
 
 ## Where it's called
 
 | Caller | Site | What |
-|--------|------|------|
-| `main.fd` | :29 `use compiler::gpu`, :1785 `cmd_gpu` | **`fidesc gpu <file> -o out`** now wired — runs the full L1→L2→L3 pipeline and calls `generate_spirv` (`.spv`, binary) or `generate_ptx` (`.ptx`, text). **Since 2026-10-23.** |
+|---|---|---|
+| `main.fd` | :31 import, :187 → `cmd_gpu` :2303 | `fid gpu <file> --target spirv|ptx [-o out] [--text]`: front end → `lower` → L1 → L2 → L3 (no optimizer) → generator |
 
-Mirrors Rust's `fidesc codegen --target spirv`/`ptx` (main.rs:2266/2280/2300)
-as a dedicated command rather than a codegen flag. Was the ninth dead module.
+Nothing else imports it.
 
-## Findings
+## Findings — verified live
 
-### F1 — ~~Dead~~ now reachable + structurally broken output (inherited) — HIGH
+### HIGH — SPIR-V output is malformed from the first types (STILL TRUE, worse than recorded)
 
-**Now wired via `fidesc gpu`** — the stubs below are live, not latent. Every
-one is inherited from Rust (src:257-355) but now produces real bad output:
+- `SpirVCodeGen_emit_with_result(_id)` writes word count `2 + operands`
+  (:149, :162) but emits header + type + id + operands (3 + operands).
+- `OpTypeVoid`/`OpTypeInt`/`OpTypeBool` are emitted through `emit` with
+  no result id (:178-205): the allocated id is never written.
+- Probe (`@kernel fn add1`): words decode as Capability, Capability,
+  MemoryModel, TypeVoid (1 word, no id), TypeFunction, then an
+  instruction header with word count 0. Same bug in src/gpu.rs:139/370.
+- Branch targets are fresh ids never bound to labels (:482-496), `Mov`
+  emits nothing (:434-447), `Call` emits nothing (:498-505), `_ => {}`
+  drops Load/Store/Cast/... (:506). Only one function (first `@kernel`,
+  else function 0) is emitted; the entry point has no name.
 
-- **Branches target nonexistent IDs** — `Jmp`/`Br` allocate *fresh*
-  label IDs (:483, :490-491) never bound to blocks — every
-  `OpBranch`/`OpBranchConditional` points to an undefined ID →
-  invalid SPIR-V (validation fails). Rust identical.
-- **`Mov` emits nothing** — IDs computed "for side effects" (:435-445),
-  no `OpStore`/`OpCopyMemory` — every assignment vanishes.
-- **`Call` skipped** — arg IDs computed then dropped (:498-505).
-- `_ => {}` catch-all (:506) — `Load`/`Store`/`Cast`/`CallPtr`/
-  `ElemAddr`/`Vec*`/all SIMD silently produce no opcodes.
+### MEDIUM — `--text` labels every instruction "OpNop" (NEW)
 
-### F2 — PTX branch/register bugs (inherited) — HIGH
+`opcode_name` (:545) matches on constant names (`OP_NOP => ...`). In a
+match these bind like a variable, so the first arm takes every value.
+Probe: all lines "OpNop (n words)". The same trap may exist wherever
+`match` uses `const` names; the type checker does not warn.
 
-- `bra target_N` (:650/656) — block labels emit as `func_bN` (:623) —
-  **no `target_N` label ever exists** → won't assemble.
-- `mov.u64 ret_val, ...` (:643) — `ret_val` never declared (`.reg`
-  only declares `r<32>`/`p<8>`) → undeclared identifier.
-- `.reg .u64 r<32>` + `r0`-style uses (:612, :628) — PTX register
-  syntax is `%r<32>`/`%r0` — likely rejected by `ptxas`/`nvdisasm`.
-- Only 4 binops (add/sub/mul/div); `mul.lo.u64` correct; `Br`'s
-  `setp.eq.u64 p0, cond, 0` + `@p0 bra else` logic is right.
+### HIGH — PTX output does not assemble (STILL TRUE)
 
-### F3 — Coverage notes — INFO
+Probe: 16,482 lines, 281 `.entry` (every function of the program, core
+included, is an entry), 5,978 "// unhandled" comments (comparisons,
+loads, stores, calls). `bra target_N` but labels are `<fn>_bN` (:623,
+:650-657); `ret_val` undeclared (:643); only `r<32>` declared while
+registers up to `r275` are used; parameters not declared. Only
+add/sub/mul/div (:741-756). `ptxas` not available to confirm.
 
-`binop_to_spirv_opcode` matches Rust's 16-op table exactly; SPIR-V
-header words (magic/version/bound/schema) and section ordering are
-correct in shape; `disassemble` is a stub-quality dump. Workgroup
-size honored from `func.workgroup_size`. Kernel selection: first
-`is_kernel` fn or func 0 — no multi-entry support.
+## Fix order
+
+1. SPIR-V: correct word counts, result ids on type instructions, bound
+   labels per block, real stores/calls — or remove the command until then.
+2. PTX: emit only kernels, block labels that match `bra`, declare
+   registers/params, comparisons.
+3. `opcode_name`: compare with `==` (or literal patterns).
 
 ## Verification state
 
-- Dead status verified: imported but never called; `--target spirv`/
-  `ptx` absent from main.fd dispatch.
-- All defects confirmed inherited — the Fides `gen_inst` is a line-
-  for-line port of Rust's equally-stubbed version.
-- Can't be exercised (no caller).
-
-## Next
-
-`green_thread.fd`.
+Whole generator read. Probes: `gpu --target spirv` (70 words, decoded),
+`--text`, `--target ptx`. No SPIR-V validator or `ptxas` run.

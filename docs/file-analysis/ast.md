@@ -1,124 +1,89 @@
-# ast.fd — file analysis
+# ast.fd
 
-> **Re-verified 2026-10-23:** all headline findings re-checked against current source — still accurate (AsmDir Clobber missing, undeclared-variant tag-0, no Resume).
+> **Re-audited 2026-11-09** against the current source and the latest `fid` build (s18).
+> The three headline Oct 22/23 findings (no `AsmDir::Clobber`, undeclared variants became tag 0,
+> no `Stmt::Resume`) are fixed.
 
-- **Path:** `compiler/ast.fd` — 1,153 LOC
-- **Role:** The AST vocabulary — `Type`, `Expr` (41 variants), `Stmt` (30),
-  `Pattern`, decl structs, `Program`, plus display/unbox/constructor helpers.
-  Rewritten from `src/ast.rs` (936 LOC Rust).
-- **Analyzed:** 2026-10-22 — run 3 of 52 (alphabetical order)
+- **Path:** `compiler/ast.fd`
+- **LOC:** 1,289 (was 1,153; Rust `src/ast.rs`: 936)
+- **Role:** the AST vocabulary: `Type` (28 variants), `Expr` (41), `Stmt` (33), `Pattern` (7),
+  operator enums, declaration structs, `Program`, constructors, unbox helpers, `type_to_str`,
+  and a few shared helpers used across the compiler.
 
-## Where it is called
+## Callers
 
-**26 importers — the most-depended-on module in the compiler.** Every pipeline
-stage imports it: parser, typechecker, borrowck, mono, comptime_eval, flat_ast,
-lower, ir, interp, opt, pir, regalloc, all codegens, pe, peephole, x86, wasm,
-gpu, lsp, compiler, main. Consumption is implicit everywhere (variant
-construction + matching) rather than through a narrow API.
+37 compiler modules import it (every pipeline stage plus `lsp`, `gpu`, `wasm`, `egraph`,
+`rules`, `iropt`, `nat_ir`, `cowcheck`, `checks`, `flat_ast`) and 12 selfhost tests.
 
-Helper usage: `box_expr_unbox` 515 sites, `binop_eq` 97, `box_type_unbox` 69,
-`type_to_str` 44, `unaryop_eq` 12, `OptFunc` 12, `stmt_line` 3,
-`box_pattern_unbox` 2, `program_new` 2. `box_type_to_str` and
-`shape_dim_to_str` have **no external callers** (internal to `type_to_str`).
+| Helper | Uses outside ast.fd | Files |
+|---|---|---|
+| `box_expr_unbox` | 420 | 4 |
+| `binop_eq` | 265 | 10 |
+| `box_expr_deref` | 193 | 4 |
+| `box_type_unbox` | 95 | 4 |
+| `type_to_str` | 85 | 5 |
+| `str_vec_contains` | 37 | 6 |
+| `box_expr_new` | 32 | 2 |
+| `unaryop_eq` | 12 | 5 |
+| `stmt_line` | 9 | 5 |
+| `vec_contains_str` | 7 | 1 |
+| `escape_str` | 6 | 1 |
+| `box_pattern_unbox`, `box_type_to_str`, `shape_dim_to_str` | 0 | 0 |
 
-Imports: `core`, `vec`, `string`. Leaf module.
+Pipeline stage: data definitions for parser through lowering.
+
+## What the module does now
+
+- `AsmDir` is `In, Out, Clobber` (`ast.fd:240-244`).
+- `Stmt` gained `Resume(cont, value, line)`, `SpawnScope(body, line)`, `CancelScope(line)`
+  (:353-355); `stmt_line` covers all 33 (:597-635).
+- `Program.globals: Vec<GlobalVar>` holds module-level `var`s (:422-427, :552).
+- `Func` carries `type_params`, `type_param_bounds`, `const_params`, `declared_effects`,
+  `annotations`, pre/postconditions, `is_async` (:375-392). `TraitDef.supertraits` (:450-456).
+- `ReflectOp` has 12 ops, including `FieldOffset`, `EnumDiscriminant`, `FunctionEffects`,
+  `FunctionCapabilities` (:223-238).
+- Shared helpers at the end of the file: `str_vec_contains`, `vec_contains_str`, `escape_str`,
+  `vec_contains_i64`, `vec_find_i64`, `box_expr_deref` (:1179-1289).
 
 ## Findings
 
 ### Verified live
 
-1. **HIGH — `AsmDir` is missing `Clobber`; every clobber operand silently
-   becomes `in("reg") 0`.**
-   `ast.fd:233-236` declares only `In, Out` — Rust has `In, Out, Clobber`
-   (`src/ast.rs:328`). But `parser.fd:4657` constructs `AsmDir::Clobber`,
-   `lower.fd:5360`/`mono.fd`/`typechecker.fd:5989`/`flat_ast.fd:581` all match
-   or compare it. Live probe: `var y: Two = Two::C` (undeclared variant)
-   **resolves to tag 0** — verified in the interpreter (`y is A`) and in
-   generated C (`v33 = 0LL` stored for `y`). So `clobber("rcx")` parses →
-   stored as direction `In` with `expr=IntLit(0)` → lowered as a regular input
-   loading **0 into rcx**, and the `CL:`-prefix clobber path in lower.fd:5360
-   plus all of `pe.fd`'s clobber save/restore (is_clobber_reg, push/pop) is
-   **unreachable dead code**. Fix is one line: add `Clobber` to the enum.
-   *(Was masked because parser accidentally does the right thing for the
-   no-expr case: `direction != AsmDir::Clobber` compares tag0==tag0 → false →
-   skips expr parse.)*
-
-2. **HIGH — undeclared enum variants silently resolve to tag 0, in every
-   backend.** `Two::C` on `enum Two {A,B}` constructs tag 0 (interp **and**
-   C codegen verified above); a `Two::C` match arm is accepted and dead.
-   The typechecker never validates variant names — so this isn't just the
-   `AsmDir` bug, it's a general hole: any typo'd variant (`Some::Thign`)
-   compiles and aliases variant 0. Finding lives in ast.fd's report because
-   this file is where the missing-variant drift manifested; the fix belongs
-   to typechecker/lowering validation (watch for it in the typechecker.fd
-   run).
+- **FIXED — `AsmDir::Clobber` missing.** Added (:243). `flat_ast.fd` was not updated and now fails
+  to type-check because of it (see flat_ast.md).
+- **FIXED — undeclared enum variants became tag 0.** `Two::C` on `enum Two { A, B }` is now
+  `Type error: enum 'Two' has no variant 'C'` (the check lives in the typechecker). The error is
+  printed twice for one use (typechecker detail, not ast.fd).
+- **FIXED — `Stmt::Resume` missing.**
+- **LOW — STILL TRUE — `use string` is unused.** `fid lint compiler/ast.fd`:
+  `warning: unused import: 'string'`.
 
 ### From code inspection
 
-3. **MEDIUM — `Stmt::Resume` missing vs Rust.** `src/ast.rs:489` has
-   `Resume{cont, value}` for effect-handler continuations (lowered in
-   `src/lower.rs:2507`, continuation built at :3715+). The Fides AST has no
-   Resume, no token, no lowering — `resume(cont, v)` in user code parses as a
-   plain `Call` and dies at typecheck as "unknown function" instead of
-   getting continuation semantics. Feature gap (L3A) vs the bootstrap.
+- **LOW — STILL TRUE — silent fallbacks after exhaustive matches.** `box_type_unbox` returns
+  `Type::Never` (:1003), `box_pattern_unbox` `Pattern::Wildcard` (:1016), `box_expr_unbox` and
+  `box_expr_deref` `Expr::IntLit(0)` (:1067, :1288). Unreachable today. Since the typechecker now
+  rejects non-exhaustive matches (it caught `flat_ast.fd`), a new variant would be reported there
+  first; the tails could become `panic`.
+- **LOW — duplicate helpers.** `box_expr_deref` is a copy of `box_expr_unbox`;
+  `vec_contains_str` is a copy of `str_vec_contains` (and of `parser.fd`'s `str_vec_has`).
+- **LOW — dead tails** `return false` after exhaustive matches in `binop_eq`/`unaryop_eq`
+  (:178, :187). `box_pattern_unbox`, `box_type_to_str`, `shape_dim_to_str` are `pub` with no
+  outside callers.
+- **INFO — `type_to_str` boxes its argument** to reuse `box_type_to_str` (:768-772): one
+  allocation per call.
+- **INFO — `binop_eq` is a nested match per operator** (:157-179); with 265 call sites a tag
+  compare (as `token_kind_tag` does) would be smaller.
 
-4. **LOW — Fides-only AST divergence (deliberate but worth tracking):**
-   `Expr::Yield`, `Expr::NamedArg`, `Stmt::Parallel` don't exist in
-   `src/ast.rs`. Yield is produced by `parser.fd:4608`; NamedArg is consumed
-   by lower/typechecker; Parallel is F13 (Session 23). If the two ASTs must
-   stay serializable-compatible (flat_ast round-trips), `flat_ast.fd`'s
-   tagging order drifts from `src/flat_ast.rs` accordingly — worth
-   confirming tag indices match for shared variants.
+## Fix order
 
-5. **LOW — silent default fallbacks in unbox helpers.** `box_expr_unbox`
-   falls through to `Expr::IntLit(0)` (:1044), `box_type_unbox` →
-   `Type::Never` (:985), `box_pattern_unbox` → `Wildcard` (:998) if a variant
-   is ever unhandled. Today all 41/28/7 arms are exhaustive so they're dead —
-   but combined with finding #2 (the typechecker can't verify), a future
-   variant added without updating these helpers produces **IntLit(0)/Never/
-   Wildcard corruption with zero diagnostics**. Safer: panic on fallthrough,
-   or eliminate helpers once non-copy unbox exists.
-
-6. **LOW — `use string` unused.** `fidesc lint` →
-   `warning: unused import: 'string'`. (`vec`, `core` are used.)
-
-7. **LOW — dead tails after exhaustive matches.** `binop_eq`/`unaryop_eq`
-   trailing `return false` (:178,187) unreachable — same codebase pattern,
-   harmless but noisy. `shape_dim_to_str`/`box_type_to_str` pub yet
-   internal-only.
-
-8. **INFO — `type_to_str` boxes every Type to display it** (:752-755) —
-   one Box alloc per call in hot diagnostic paths. Cheap enough today
-   (documented in the comment); a `match t` duplicate would avoid it but
-   doubles the 28-arm table.
-
-9. **INFO — type surface notes:** `Expr::FloatLit(f64)` is the only non-i64
-   scalar payload in the big enums — works, but it's the layout that hit the
-   Session-21 `Vec<f64>` bit-pattern bug class; worth remembering if enum
-   payloads ever grow. `Param.default_expr` uses `has_default`+`IntLit(0)`
-   sentinel (Option can't hold Expr — documented); `Attribute` vs
-   `Annotation` duplication mirrors Rust.
-
-## Suggested fix order
-
-1. Add `Clobber` to `AsmDir` (ast.fd:233) — restores the whole clobber chain.
-2. Typechecker/lowering: reject undeclared enum variants at construction and
-   in match arms (the real fix for the tag-0 hole; flag for typechecker.fd).
-3. Decide: implement `Stmt::Resume` (continuation lowering exists in Rust to
-   port) or document as intentionally unsupported.
-4. Make unbox fallbacks panic (`p_panic`/`unreachable`) instead of returning
-   sentinel values.
-5. Drop `use string`.
-6. Non-pub `box_type_to_str`/`shape_dim_to_str` if no external use is planned.
+1. Drop `use string`.
+2. Remove `box_expr_deref` and `vec_contains_str` (rename call sites).
+3. Make the unreachable fallbacks panic; make internal helpers non-`pub`.
 
 ## Verification state
 
-- `fidesc lint`: 1 warning (unused `string` import).
-- Live probe `enum_probe.fd`: `Two::C` → tag 0 in interpreter output and in
-  `dump-c` generated code (`*(int64_t*)v = 0LL`) — tag-collapse confirmed in
-  both backends. Test file removed.
-- `src/ast.rs` diffed enum-by-enum: Type 28/28, Expr 41 (Fides superset),
-  Pattern 7/7, Stmt — missing `Resume`, extra `Parallel`; `AsmDir` missing
-  `Clobber`.
-- Consumption map: all decl structs used (`compiler.fd:2237+` desugars the
-  ML/game decls then clears the vecs — not dead fields).
+- `fid check compiler/ast.fd`: no errors.
+- Live probe: `Two::C` rejected at type check (scratch file).
+- Variant counts taken from the enum bodies (:103-131, :252-294, :297-305, :322-356).
+- Call counts by grep over `compiler/*.fd`.

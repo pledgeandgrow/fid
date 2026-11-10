@@ -2,30 +2,32 @@
 
 **Fides is a self-hosted systems programming language.** The Fides compiler is written in Fides, compiles itself, and produces byte-identical output across generations (bootstrap fixpoint). It is the release compiler: the Windows installer ships it as `fid.exe`. The Rust compiler (`src/`) is the bootstrap reference implementation, used to build the self-hosted compiler and shipped beside it as `fidesc.exe`.
 
-The self-hosted compiler generates **native PE executables on Windows** and **C code** for portability. It includes a full IR interpreter and a PE emitter for direct native code generation. A bare-metal flat binary mode (`fid emit --bare`) works since Nov 6 on the hosted test runner, not yet under QEMU. ARM64/RISC-V assembly and WebAssembly are started but do not work yet (Nov 6: `fid wasm` output fails validation, the ARM64/RISC-V assembly is not assembled or run).
+The self-hosted compiler generates **native executables without a C toolchain** — Windows x64 PE (`fid emit`) and, since Nov 7–9, static Linux ELF for AArch64, RISC-V 64 and x86-64 (`fid emit --target ...`) — and **C code** for every other target. It includes a full IR interpreter (`fid run`). A bare-metal flat binary mode (`fid emit --bare`) works since Nov 6 on the hosted test runner, not yet under QEMU. WebAssembly and the old PIR-era ARM64/RISC-V assembly are started but do not work (Nov 6: `fid wasm` output fails validation); WASI works through C (`ccompile --target wasm32-wasi`).
 
 ## Status
 
 **Self-Hosting — Bootstrap fixpoint achieved and verified.** The Fides compiler compiles itself to byte-identical C across generations (stage 2 == stage 3, 49 MB of C, verified Nov 6, 2026). `RELEASE=1 ./scripts/bootstrap.sh` checks this on every release build.
 
-**63 self-hosted modules** (~142K lines) in `compiler/*.fd` — lexer, parser, type checker, borrow checker, escape analyzer, monomorphizer, IR lowering, IR and PIR optimizers, C codegen, native PE emitter, x86-64/ARM64/RISC-V codegen, register allocator, peephole optimizer, comptime evaluator, LSP server, formatter, diagnostics, JSON, incremental compilation, ELF/COFF/Mach-O writers, per-arch runtimes, and the Ark package manager.
+**68 self-hosted modules** (~159K lines) in `compiler/*.fd` — lexer, parser, type checker, borrow checker, escape analyzer, monomorphizer, IR lowering, IR and PIR optimizers, C codegen, native PE emitter, x86-64/ARM64/RISC-V codegen, register allocator, peephole optimizer, comptime evaluator, LSP server, formatter, diagnostics, JSON, incremental compilation, ELF/COFF/Mach-O writers, per-arch runtimes, and the Ark package manager.
 
 **The language is what `fid` accepts.** The rules, each with the compiler function that enforces it, are in the [language reference](docs/reference/reference.md). The Rust compiler (`fidesc`) is frozen and checks less: [the differences](docs/reference/language-guide.md).
 
 **Tests.** The last full suite run is from Nov 2 (interpreter 339/339, C 343/343, native Windows 345/345, expected-fail 89/89), **with `fidesc`, the Rust compiler, as the compiler under test**: the shipped `fid` has not run the full suite. The compiler of Nov 4–6 was checked on the new and the key test programs on all three backends, and every new expected-fail test is rejected; the full suite has not been rerun with it.
 
+**New in `fid` (Nov 7–9):** the machine layer (`compiler/nat_ir.fd`: one machine IR and register allocator for Linux AArch64/RISC-V/x86-64 and opt-in Windows x64), a rule- and e-graph-based mid-end with an IR verifier and z3-proved rules, ownership layouts of proposal 0004 (counted strings and Boxes, structs inline in a `Vec`), `Vec::filled`, the compiler built from split C at -O2 (self-compile 74 s), and language facts used by the optimizer ([optimizer-facts.md](docs/reference/optimizer-facts.md)). [Changelog](docs/reference/changelog.md).
+
 **New in `fid` (Nov 4–6):** generics with inference, bounds and turbofish for functions, enums and `impl<T>` ([0002](docs/proposals/0002-real-generics.md); a literal of a user-defined generic struct is still rejected); `if`/`match` as values; `@cfg`; freeing of locals the compiler proves finished; iterator-invalidation and field-borrow checks; `@send` on spawned arguments; `parallel {}` branches on threads; `async fn` with float and struct arguments; every safety annotation enforced with a negative test per rule ([safety-rules.md](docs/reference/safety-rules.md)) and `fid qualify` evidence; owned and borrowed strings (`&str`, `@scoped`, `str_clone`); integer-key `HashMap`s; per-call-site effects of higher-order functions.
 
 **Limits:**
-- The self-hosted `ccompile` and `build` go through C, so they need a C compiler (`$CC`, gcc, clang, `zig cc` or tcc). For native Windows executables without a C compiler, use `fid emit`; the older `build --native` path does not work.
-- Native output without a C compiler: Windows x64 (`fid emit`), and since Nov 7 Linux AArch64 and RISC-V 64 (`fid emit --target aarch64-linux|riscv64-linux`: 225 of the 231 suite tests that build match the interpreter under QEMU; threads, tasks, channels, atomics and the C math functions are not there yet). Other systems go through C: `fid ccompile --target aarch64-linux` (also `riscv64-linux`, `x86_64-linux`, `x86_64-macos`, `aarch64-macos`, `wasm32-wasi`) cross-compiles with `zig cc` from any host. Linux ARM64 matched the interpreter on 270 of 286 tests under QEMU; RISC-V and WASI run sample programs; macOS builds but has not been run. See [platforms](docs/reference/platforms.md).
-- Native `async`/`spawn` + `await` work since Nov 6 (the worker threads were started through a name lookup that returned 0). The interpreters (`fid run`, `fidesc run`) run an `async fn` to the end when it is called instead of until it first waits, so a program that interleaves tasks prints in a different order there (`test_async_suspend`).
-- Value semantics ([0001](docs/proposals/0001-value-semantics.md)): copy-on-write was switched on in the working tree on Nov 6 (`LOWER_COW`, fixpoint reached with it); the full suite has not run with it. The compiler of Nov 2 (`release/fid.exe`) still gives a second name for the same data on `var b = a` for a `Vec`.
+- `fid ccompile` goes through C, so it needs a C compiler (`$CC`, gcc, clang, `zig cc` or tcc). `fid build` is the same command as `fid emit`: on a Windows host it writes a native PE with no C compiler; on other hosts, without `--target`, it goes through C. `build --native` with the default target goes to the old PIR path and crashes (opt.fd `pass_jump_thread`).
+- Native output without a C compiler: Windows x64 (`fid emit`; opt-in on the new machine layer with `--nat`: 301 of 338 suite tests, Nov 9), and Linux AArch64, RISC-V 64 and x86-64 (`fid emit --target aarch64-linux|riscv64-linux|x86_64-linux`: 273, 271 and 272 of 317 suite tests match the interpreter under QEMU, Nov 9; the runtime has threads, M:N tasks, futexes and signals on system calls). Other systems go through C: `fid ccompile --target aarch64-linux` (also `riscv64-linux`, `x86_64-linux`, `x86_64-macos`, `aarch64-macos`, `wasm32-wasi`) cross-compiles with `zig cc` from any host. Linux ARM64 matched the interpreter on 270 of 286 tests under QEMU; RISC-V and WASI run sample programs; macOS builds but has not been run. See [platforms](docs/reference/platforms.md).
+- Native `async`/`spawn` + `await` under `fid emit` were fixed on Nov 6 (the worker threads were started through a name lookup that returned 0) and broke again in builds of Nov 9 afternoon (three iropt passes on by default; fixed again in the evening's fid31, which matches the interpreter on pe_ir and `--nat`; known-bugs 2f.2). The interpreters (`fid run`, `fidesc run`) run an `async fn` to the end when it is called instead of until it first waits, so a program that interleaves tasks prints in a different order there (`test_async_suspend`).
+- Value semantics and ownership: since Nov 7 one ownership rule ([0004](docs/proposals/0004-ownership-and-layout.md), `LOWER_RC` on): a variable owns its value and is dropped at the end of its scope, keeping a value takes an owner, parameters are borrowed. Strings, `Vec` buffers and Boxes are counted; copy-on-write (`LOWER_COW`, [0001](docs/proposals/0001-value-semantics.md)) is off. The full suite has not run with it; the leak gate (`scripts/leak-check.sh`) passes.
 - Some compile-time checks are weaker than their names (checked by running, Nov 6): `sandbox {}` does not see IO done by the functions it calls, `region ... with budget(N)` counts declared locals but not heap growth, `@conserve` only forbids `Money_new`, `@crashfree` does not bound recursion, and `txn {}` rolls nothing back on C or native. The list, with what does hold: [positioning.md](docs/reference/positioning.md) (top).
-- Speed: fib(40) takes 1.34 s native and 0.81 s through C, against 0.53 s for Rust (Nov 2, [scoreboard](docs/roadmap/competitive-roadmap.md#the-scoreboard)). `fid` compiles its own ~134K lines to C in about 133 s; the native backend has no full register allocator.
+- Speed: fib(40) takes 1.34 s native and 0.81 s through C, against 0.53 s for Rust (Nov 2, [scoreboard](docs/roadmap/competitive-roadmap.md#the-scoreboard)). `fid` compiles its own ~159K lines to C in 74 s when built at -O2 (Nov 9; 229 s at -O0); `fidesc` takes ~21 s.
 - Fides is not suitable for safety-critical use: `fid qualify` gives evidence, not a certification.
 
-**Numbers:** [CURRENT.md → Numbers](CURRENT.md#numbers) is the one place counts and measurements are kept.
+**Numbers:** [selfhost.md → Numbers](docs/reference/selfhost.md#numbers) is the one place counts and measurements are kept.
 
 **Phase status:** See `docs/roadmap/roadmap.md` for the consolidated roadmap (features, release, self-host, limitations, opportunities).
 
@@ -56,7 +58,7 @@ The self-hosted compiler generates **native PE executables on Windows** and **C 
 | `@medical` | `@medical @audit fn foo() { ... }` | IEC 62304: no dynamic alloc, no recursion, no while, no unwrap, must be @audit |
 | `given` contracts | `fn foo(x: i64) -> i64 given x >= 0 { ... }` | Preconditions: a call whose constant arguments break one is rejected at compile time (`ensure` parses but is not checked) |
 | `async`/`await`/`spawn` | `async fn foo() -> Future<T> { ... }` | Green tasks on worker threads — async functions, await, spawn (interpreters run an async body to the end at the call) |
-| Borrow checker | `--borrowck=on` / `--borrowck=warn` | Compile-time aliasing analysis — `&mut` exclusivity, no mutation while borrowed |
+| Borrow checker | `--borrowck=on` (default) / `off` | Compile-time aliasing analysis — `&mut` exclusivity, no mutation while borrowed. `--borrowck=warn` prints nothing in `fid` (Nov 9: the warnings are never read) |
 
 ### Tier 3 OS Features (New — Session 16)
 
@@ -196,7 +198,7 @@ Most rows were verified with `fidesc` and the Nov 2 suite; rows corrected on Nov
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `async` / `await` | ✅ Works (C, native since Nov 6) | An `async fn` is a task that runs until it first waits; `await` suspends it. Float and struct arguments and results work (Nov 4). The interpreters run an async body to the end at the call. |
+| `async` / `await` | ⚠️ Works through C; native (`fid emit`) worked Nov 6, broke in Nov 9 afternoon builds, fixed again that evening | An `async fn` is a task that runs until it first waits; `await` suspends it. Float and struct arguments and results work (Nov 4). The interpreters run an async body to the end at the call. |
 | `spawn` | ✅ Works | `spawn f(args)` runs `f` on an OS thread; every argument must be `@send` (references and raw pointers are not). `spawn { block }` runs the block in place. |
 | `#[test]` attribute | Parsed | Not yet executed by `fidesc test` |
 | `@derive` | ✅ Works | Phase 7.7 — `@derive(Debug/Clone/Serialize/Deserialize)` generates methods |
@@ -211,8 +213,8 @@ Most rows were verified with `fidesc` and the Nov 2 suite; rows corrected on Nov
 - **ARM64 and RISC-V native: tier 3** — `fidesc build --target arm64-linux` / `--target riscv64-linux` run the built-in encoders (`arm64_enc.rs`, `riscv_enc.rs`), but the runtimes (`runtime_arm64.rs`, `runtime_riscv.rs`) still have stubs that do nothing. Use the C backend with a cross-compiler for these targets. See [platforms](docs/reference/platforms.md).
 - **PE emitter targets Windows x64 only** — `fid emit`, `fidesc emit` or `fidesc build --target x86-64-windows` produce PE32+ executables; `fidesc`'s emitter (src/pe.rs) matched the interpreter on 345/345 (Nov 2); `fid emit` (compiler/pe_ir*.fd) has not run the full suite
 - **Register allocator** — Linear scan allocator with constant rematerialization (F-1A). Effect-aware allocation (F-1D): pure/@no-alloc calls only clobber RAX. Works correctly for all passing tests.
-- **Peephole optimizer always on** — 9 passes run automatically in the `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection
-- **L2 optimizer enabled by default** — PIR optimizer runs automatically in `build` (use `--no-opt` to disable) with 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. `--lto` enables aggressive cross-module inlining.
+- **Peephole optimizer (`fidesc build`; in `fid` only on the PIR commands `codegen --peephole`, `emit --boot`, `build --native`)** — 9 passes: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection
+- **L2 optimizer** — `fidesc build` runs the PIR optimizer by default (use `--no-opt` to disable). In `fid` it is reached only by `build --native` (default target), `opt` and `pir --opt`, and it panics there (Nov 9); `fid`'s native paths use the IR optimizer compiler/iropt.fd instead. Passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. `--lto` enables aggressive cross-module inlining.
 - **`#[test]` attribute** — parsed but not executed by `fidesc test` (tests are file-based)
 - **C codegen coverage** — 343/343 normal tests match interpreter output (Nov 2). Phase 10B: Vec/HashMap/String now implemented in Fides stdlib using raw pointers. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack.
 - **214 compiler warnings** — dead code, unused variables (cleanup needed)
@@ -285,7 +287,7 @@ cargo run -- test
 
 | Command | Description |
 |---------|-------------|
-| `build <file.fd> -o <out>` | `fid`: through C, needs a C compiler (`build --native`, the PIR path, crashes). `fidesc build --target x86-64\|arm64\|riscv64-linux\|x86-64-windows`: its own ELF64/PE path, tier 2–3. |
+| `build <file.fd> -o <out>` | `fid`: same as `emit` (native PE on a Windows host; through C on other hosts without `--target`; `build --native` with the default target, the PIR path, crashes). `fidesc build --target x86-64\|arm64\|riscv64-linux\|x86-64-windows`: its own ELF64/PE path, tier 2–3. |
 | `emit <file.fd> -o <out.exe> [--checked-alloc]` | **Native Windows executable**, no C compiler: IR → x86-64 machine code → PE. `--checked-alloc` puts every block on pages of its own (use after free and overruns fault; written Nov 4, not yet run on the suite). |
 | `emit <file.fd> -o <out.bin> --bare` | Bare-metal flat binary (`fid` since Nov 6: loaded at 0x10000, print to COM1; not yet run under QEMU) |
 | `ccompile <file.fd> -o <out>` | C codegen pipeline: lex → parse → typecheck → lower → C source → `gcc`/`clang` → executable |
@@ -294,8 +296,8 @@ cargo run -- test
 | `qualify <file.fd> [-o out.json]` | Safety evidence as JSON: compiler and source hashes, check result, annotated functions, each rule with its tests ([safety-rules.md](docs/reference/safety-rules.md)). Always "NOT_QUALIFIED". |
 | `audit <file.fd> [--stdlib] [--strict]` | List the `unsafe` code a program reaches, with its `// SAFETY:` comments |
 | `ir <file.fd>` | Lex → parse → typecheck → lower → print SSA IR |
-| `pir <file.fd> [1\|2\|3\|all] [--opt]` | Lower to PIR (L1/L2/L3) and print; `--opt` runs optimization passes |
-| `opt <file.fd> [pass1,pass2,...]` | Run PIR optimizer and print statistics (const-fold, cse, dce, inline, unroll, tco) |
+| `pir <file.fd> [1\|2\|3\|all] [--opt]` | Lower to PIR (L1/L2/L3) and print; `--opt` runs optimization passes (panics in `fid`, Nov 9) |
+| `opt <file.fd> [pass1,pass2,...]` | Run PIR optimizer and print statistics (`fid` ignores the pass list and panics in `jump_thread_redirect`, Nov 9) |
 | `codegen <file.fd> --target <arch> [--peephole] [--elf\|--macho\|--coff <o>]` | Generate assembly for x86-64, ARM64, or RISC-V; optionally emit object files |
 | `wasm <file.fd> -o <out.wasm> [--wat]` | WebAssembly backend: PIR → WASM binary |
 | `gpu <file.fd>` | SPIR-V GPU backend: PIR → SPIR-V binary |
@@ -688,33 +690,28 @@ See `docs/reference/syntax.md` for the complete syntax specification.
 
 ```
 fid/
-├── compiler/               # 63 self-hosted Fides modules (~142K lines) — THE COMPILER
-│   ├── main.fd             # CLI entry point (command dispatch)
-│   ├── lexer.fd / parser.fd / ast.fd / token.fd   # Front end
-│   ├── typechecker.fd      # Type checking + capability + effect + region + sandbox
-│   ├── borrowck.fd         # Borrow checker (NLL, field-wise, two-phase)
-│   ├── escape.fd           # Reference escape analysis (session 29)
-│   ├── mono.fd             # Generic monomorphization
-│   ├── ir.fd / lower.fd    # SSA IR + AST → IR lowering
-│   ├── pir.fd / opt.fd / peephole.fd / regalloc.fd  # Middle end
-│   ├── codegen_c.fd        # C codegen backend (IR -> .c)
-│   ├── codegen_x64.fd / codegen_arm64.fd / codegen_riscv.fd / x86.fd  # asm backends
-│   ├── elf64.fd / pe.fd / coff.fd / macho.fd / linker.fd  # object/executable writers
-│   ├── runtime.fd / runtime_linux.fd / runtime_arm64.fd / runtime_riscv.fd
-│   ├── arm64_enc.fd / riscv_enc.fd  # instruction encoders
-│   ├── comptime_eval.fd / flat_ast.fd / inc.fd   # compile-time + caching
-│   ├── diag.fd / fmt.fd / json.fd / lsp.fd       # tooling
-│   ├── scribe.fd / veil.fd / ark.fd              # doc gen / coverage / pkg manager
-│   ├── wasm.fd / gpu.fd / tensor.fd / autograd.fd # wasm / GPU / ML
-│   ├── embedded.fd / green_thread.fd / debugger.fd / native_debugger.fd / hotreload.fd
-│   └── cparser.fd          # C header parser → FFI bindings
+├── compiler/               # 68 self-hosted Fides modules (~159K lines) — THE COMPILER
+│   ├── main.fd / compiler.fd / inc.fd / csplit.fd  # CLI, pipeline, build cache, split C
+│   ├── lexer.fd / parser.fd / ast.fd / token.fd / comptime_eval.fd  # Front end
+│   ├── typechecker.fd / escape.fd / secrecy.fd / borrowck.fd / mono.fd / cowcheck.fd  # Checks
+│   ├── lower.fd / ir.fd / checks.fd / irverify.fd  # AST → SSA IR (ownership 0004), check removal, IR verifier
+│   ├── iropt.fd / iropt_me.fd / rules.fd / egraph.fd  # IR mid-end (native paths)
+│   ├── interp.fd / green_thread.fd / tensor.fd  # `fid run`
+│   ├── codegen_c.fd        # IR → C99 + embedded C runtime
+│   ├── pe_ir.fd / pe_ir_enc.fd / pe_ir_stubs.fd  # Native Windows x64 (default `emit`)
+│   ├── nat_ir.fd / nat_enc.fd  # Machine layer: Linux AArch64/RISC-V/x86-64, `--nat` Windows
+│   ├── fmt.fd / lsp.fd / json.fd / scribe.fd / veil.fd / ark.fd / cparser.fd  # Tools
+│   ├── pir.fd / opt.fd / regalloc.fd / peephole.fd / codegen_x64.fd / codegen_arm64.fd / codegen_riscv.fd
+│   ├── elf64.fd / linker.fd / coff.fd / macho.fd / x86.fd / pe.fd / runtime_*.fd / *_enc.fd  # Old PIR path
+│   ├── wasm.fd / gpu.fd    # Experimental back ends (output does not validate)
+│   └── autograd.fd / codegen.fd / debugger.fd / diag.fd / embedded.fd / flat_ast.fd / hotreload.fd / native_debugger.fd / runtime.fd  # Not used
 ├── src/                    # Rust bootstrap reference (57 files, ~112K lines)
 │   ├── main.rs             # CLI entry point (used to generate first-generation C)
 │   ├── escape.rs           # Reference escape analysis (Rust twin of escape.fd)
 │   ├── dwarf.rs            # DWARF debug info (started)
 │   ├── ...                 # Mirrors compiler/*.fd in Rust (reference implementation)
 │   └── bin/                # Binary entry points (fidesc, ark, scribe, veil)
-├── stdlib/                 # 136 standard library modules (~43K lines)
+├── stdlib/                 # 146 standard library modules (~51K lines)
 │   ├── core.fd             # Option, Result, println, assert, max, min, abs, clamp
 │   ├── vec.fd              # Vec<T> with iterator adapters
 │   ├── rc.fd               # Rc<T> / Arc<T> reference counting
@@ -813,6 +810,14 @@ Run all tests: `./target/release/fidesc test` (or `cargo test --test harness`)
 - `docs/reference/testing.md` — Test results across all backends + test batch specifications
 - `docs/reference/tool.md` — Tooling guide
 
+### Learn & contribute
+
+- `docs/book/` — The Fides Book (draft): first program → writing a service
+- `docs/cookbook.md` — Common-task recipes (files, JSON, HTTP, tasks)
+- `docs/guides/` — Coming from Rust / Go / Zig / C
+- `docs/compiler-internals.md` — Pipeline map for compiler contributors
+- `SUPPORT.md` — Questions (Discussions), bugs (Issues), contributing
+
 ---
 
 ## Roadmap
@@ -820,4 +825,4 @@ Run all tests: `./target/release/fidesc test` (or `cargo test --test harness`)
 See `docs/roadmap/roadmap.md` for the full phase status and milestones.
 See `docs/roadmap/roadmap.md` § Self-Host Details for the self-hosting plan.
 
-**Self-hosting status:** Bootstrap fixpoint verified (stage 2 == stage 3 byte-for-byte, checked on every release build; last verified Nov 6, 2026). 61 self-hosted modules (~137K lines) in `compiler/*.fd`. The self-hosted compiler is the release compiler (`fid.exe`) and defines the language; the Rust compiler (`fidesc.exe`) is frozen.
+**Self-hosting status:** Bootstrap fixpoint verified (stage 2 == stage 3 byte-for-byte, checked on every release build; last verified Nov 6, 2026). 68 self-hosted modules (~159K lines) in `compiler/*.fd`. The self-hosted compiler is the release compiler (`fid.exe`) and defines the language; the Rust compiler (`fidesc.exe`) is frozen.

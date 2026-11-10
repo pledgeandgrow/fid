@@ -44,6 +44,7 @@ pub fn iropt_native(module: &mut IrModule) {
     // ME20, ME21: inlining across functions, bottom-up (opt-in)
     if ime_on("inline2") { ime_inline(module); }
     var n_fold: i64 = 0;
+    var n_spec: i64 = 0;
     var n_dce: i64 = 0;
     var n_tail: i64 = 0;
     var n_gvn: i64 = 0;
@@ -59,12 +60,27 @@ pub fn iropt_native(module: &mut IrModule) {
     var on_facts: bool = iro_pass_on("branchfacts");
     var on_sccp: bool = iro_pass_on("sccp");
     var on_promote: bool = iro_pass_on("promote");
+    // WP13 stays opt-in (FID_IROPT_ON) until the suite agrees with it on and
+    // off: iro_ipcp miscompiled &mut Vec + loop programs (only Inst::Call
+    // sites are counted; DynCall/CallPtr can reach callees unseen).
+    // Opt-in (FID_IROPT_ON=envtrim): it changes calling conventions, and a
+    // caller it misses still passes the env slot (test_brotli's bs_fill got
+    // its `s` as 0, Nov 9; functions named by strings are excluded now, but
+    // that was not the only path)
+    var on_envtrim: bool = iro_pass_on("envtrim") && ime_on("envtrim");
+    var on_ipcp: bool = iro_pass_on("ipcp") && ime_on("ipcp");
+    var on_spec: bool = iro_pass_on("spec") && ime_on("spec");
+    var on_devirt: bool = iro_pass_on("devirt");
+    var on_gconst: bool = iro_pass_on("gconst");
     var on_dse: bool = iro_pass_on("dse") && ime_on("dse");
     var on_simplify: bool = iro_pass_on("simplify") && ime_on("simplify");
     var n_branch: i64 = 0;
     var n_facts: i64 = 0;
     var n_sccp: i64 = 0;
     var n_promote: i64 = 0;
+    var n_ipcp: i64 = 0;
+    var n_devirt: i64 = 0;
+    var n_gconst: i64 = 0;
     var n_dse: i64 = 0;
     var n_simp: i64 = 0;
     var stats: bool = iro_stats_on();
@@ -93,6 +109,19 @@ pub fn iropt_native(module: &mut IrModule) {
             ri = ri + 1;
         }
     }
+    // WP6: the internal-convention flag is set before cloning so
+    // specialized copies inherit it; it is signature-independent.
+    if has_main { iro_conv_mark(module); }
+    // WP7: unused __env parameters (and their call-site arguments) are
+    // dropped before IPCP/specialization see the call signatures.
+    if has_main && on_envtrim { iro_env_trim(module); }
+    // WP13: constants from the call sites move into the callees first, so the
+    // per-function passes below see them.
+    if has_main && on_ipcp { n_ipcp = iro_ipcp(module); }
+    // WP14: mixed constant/varying parameters get specialized clones.
+    if has_main && on_spec { n_spec = iro_specialize(module); }
+    // WP18: never-written globals fold to their initializer.
+    if has_main && on_gconst { n_gconst = iro_const_globals(module); }
     var i: i64 = 0;
     while i < module.functions.len() {
         var entry: IrFunctionEntry = module.functions.get(i);
@@ -112,6 +141,7 @@ pub fn iropt_native(module: &mut IrModule) {
         if on_facts && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "branchfacts", stats, &mut f) { changed = true; n_facts = n_facts + 1; }
         if on_sccp && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "sccp", stats, &mut f) { changed = true; n_sccp = n_sccp + 1; }
         if on_promote && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "promote", stats, &mut f) { changed = true; n_promote = n_promote + 1; }
+        if on_devirt && iro_devirt(module, &mut f) { changed = true; n_devirt = n_devirt + 1; }
         if on_dse && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "dse", stats, &mut f) { changed = true; n_dse = n_dse + 1; }
         if on_dce && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "dce", stats, &mut f) { changed = true; n_dce = n_dce + 1; }
         if on_tail && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "tailcall", stats, &mut f) { changed = true; n_tail = n_tail + 1; }
@@ -124,10 +154,21 @@ pub fn iropt_native(module: &mut IrModule) {
         }
         i = i + 1;
     }
+    // WP15: functions optimization made unreachable (callers inlined,
+    // calls rewritten) are removed now, not only before optimization.
+    var deadf: i64 = 0;
+    // Opt-in (FID_IROPT_ON=deadf): its roots are main and p_* only, not the
+    // runtime functions machine code calls (pe_win_*, pe_rt_init,
+    // pe_on_signal, task bodies found by name), and the native backends
+    // compile only what main reaches anyway.
+    if has_main && iro_pass_on("deadf") && ime_on("deadf") { deadf = IrModule_dead_function_elimination(module); }
+    // WP20: emit the library-facts artifact when the consumer asked for one.
+    iro_libfacts(module);
     if stats {
+        if deadf > 0 { p_eprint_str("iropt: dead functions " + int_to_str(deadf) + "\n"); }
         p_eprint_str("iropt: fold " + int_to_str(n_fold) + ", simplify " + int_to_str(n_simp) + ", branchfold " + int_to_str(n_branch)
-            + ", branchfacts " + int_to_str(n_facts) + ", sccp " + int_to_str(n_sccp) + ", promote " + int_to_str(n_promote) + ", dse " + int_to_str(n_dse) + ", dce " + int_to_str(n_dce) + ", tailcall " + int_to_str(n_tail)
-            + ", gvn " + int_to_str(n_gvn) + ", licm " + int_to_str(n_licm) + " functions changed\n");
+            + ", branchfacts " + int_to_str(n_facts) + ", sccp " + int_to_str(n_sccp) + ", promote " + int_to_str(n_promote) + ", ipcp " + int_to_str(n_ipcp) + ", devirt " + int_to_str(n_devirt) + ", gconst " + int_to_str(n_gconst) + ", dse " + int_to_str(n_dse) + ", dce " + int_to_str(n_dce) + ", tailcall " + int_to_str(n_tail)
+            + ", gvn " + int_to_str(n_gvn) + ", licm " + int_to_str(n_licm) + ", spec " + int_to_str(n_spec) + " functions changed\n");
         // ME30: what the mid-end did, for scripts/me-measure.sh
         p_eprint_str("iropt: instructions " + int_to_str(insts_before) + " -> " + int_to_str(insts_after)
             + " in " + int_to_str(p_clock_now_ms() - t_start) + " ms\n");
@@ -192,6 +233,24 @@ fn iro_time(names: &mut Vec<str>, ms: &mut Vec<i64>, hits: &mut Vec<i64>, name: 
 }
 
 // --- Helpers ----------------------------------------------------------------
+
+/// Instruction `to` of `f` gets the source line of instruction `from` of
+/// `src` (only the line: its type, region and effects stay).
+fn iro_copy_line(src: &IrFunction, from: i64, f: &mut IrFunction, to: i64) {
+    match IrFunction_get_meta(src, from) {
+        OptValueMeta::Some(cm) => {
+            match IrFunction_get_meta(f, to) {
+                OptValueMeta::Some(nm) => {
+                    var m2: ValueMeta = nm;
+                    m2.source_line = cm.source_line;
+                    IrFunction_set_meta(f, to, m2);
+                }
+                OptValueMeta::None => {}
+            }
+        }
+        OptValueMeta::None => {}
+    }
+}
 
 /// A new instruction in `f` that is in no block yet.
 fn iro_detached(f: &mut IrFunction, inst: Inst) -> i64 {
@@ -372,6 +431,9 @@ fn iro_inline_function(module: &IrModule, f: &mut IrFunction) -> bool {
                                                 match IrFunction_get_inst(&callee, cid) {
                                                     OptInst::Some(cinst) => {
                                                         var nid: i64 = iro_detached(f, iro_remap(cinst, map));
+                                                        // the callee's source line (a panic in inlined
+                                                        // code says where, as the interpreter does)
+                                                        iro_copy_line(&callee, cid, f, nid);
                                                         if cid < map.len() { map.set(cid, nid + 1); }
                                                         fresh.push(nid);
                                                     }
@@ -1893,18 +1955,33 @@ fn iro_sccp_eval(op: BinOp, a: i64, b: i64, out: &mut Vec<i64>) {
     var tag: i64 = 2;
     var ok: bool = false;
     var i64min: i64 = 0 - 9223372036854775807 - 1;
+    var i64max: i64 = 9223372036854775807;
+    // Fides arithmetic is checked: computing a + b / a - b / a * b to see
+    // whether it overflows panics before the check runs. Bound first, then
+    // compute only when the result is provably in range.
     if binop_eq(op, BinOp::Add) {
-        r = a + b;
-        if !((a > 0 && b > 0 && r <= 0) || (a < 0 && b < 0 && r >= 0)) { ok = true; }
+        if b == 0 { r = a; ok = true; }
+        else if b > 0 { if a <= i64max - b { r = a + b; ok = true; } }
+        else { if a >= i64min - b { r = a + b; ok = true; } }
     } else if binop_eq(op, BinOp::Sub) {
-        r = a - b;
-        if !((b < 0 && a >= 0 && r < 0) || (b > 0 && a <= 0 && r > 0)) { ok = true; }
+        if b == 0 { r = a; ok = true; }
+        else if b > 0 { if a >= i64min + b { r = a - b; ok = true; } }
+        else { if a <= i64max + b { r = a - b; ok = true; } }
     } else if binop_eq(op, BinOp::Mul) {
-        r = a * b;
-        var ov: bool = false;
-        if a == i64min && b == 0 - 1 { ov = true; }
-        else if a != 0 && r / a != b { ov = true; }
-        if !ov { ok = true; }
+        if a == 0 || b == 0 { r = 0; ok = true; }
+        else if a == 1 { r = b; ok = true; }
+        else if b == 1 { r = a; ok = true; }
+        else if a == 0 - 1 { if b != i64min { r = 0 - b; ok = true; } }
+        else if b == 0 - 1 { if a != i64min { r = 0 - a; ok = true; } }
+        else if a != i64min && b != i64min {
+            // a>0: a*b<=MAX iff b<=MAX/a, >=MIN iff b>=MIN/a (trunc=exact bound)
+            // a<0: inequalities flip — hi=MIN/a, lo=MAX/a. Neither division
+            // overflows here (|a|,|b|>1, neither is i64min).
+            var hi: i64 = 0; var lo: i64 = 0;
+            if a > 0 { hi = i64max / a; lo = i64min / a; }
+            else { hi = i64min / a; lo = i64max / a; }
+            if b <= hi && b >= lo { r = a * b; ok = true; }
+        }
     } else if binop_eq(op, BinOp::Div) {
         if b != 0 && !(a == i64min && b == 0 - 1) { r = a / b; ok = true; }
     } else if binop_eq(op, BinOp::Mod) {
@@ -2821,4 +2898,850 @@ fn iro_promote(f: &mut IrFunction) -> bool {
     }
     if changed { iro_dce_more(f); }
     return changed;
+}
+
+fn iro_name_in(v: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == s { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// WP13: a parameter every call site passes the same constant for is replaced
+/// by that constant inside the callee. One pass collects per-candidate
+/// constant arguments (flattened, at most 8 parameters); a second pass emits
+/// the constants into each candidate's entry block and renames the uses.
+pub fn iro_ipcp(module: &mut IrModule) -> i64 {
+    var count: i64 = 0;
+    var nfn: i64 = module.functions.len();
+    var fidx: i64 = HashMap_new();
+    var taken: Vec<str> = Vec::new();
+    var dtys: Vec<str> = Vec::new();
+    var dmeths: Vec<str> = Vec::new();
+    var fi: i64 = 0;
+    while fi < nfn {
+        HashMap_insert(fidx, module.functions.get(fi).name, fi + 1);
+        fi = fi + 1;
+    }
+    fi = 0;
+    while fi < nfn {
+        var sf: IrFunction = module.functions.get(fi).func;
+        var si: i64 = 0;
+        while si < sf.insts.len() {
+            match sf.insts.get(si).inst {
+                Inst::ConstFnRef(nm) => { if !iro_name_in(taken, nm) { taken.push(nm); } }
+                // a function named by a string is called by name at run time
+                // (task_go("f", ..), thread spawns, the runtime's lookups) with
+                // the env slot first: its signature must stay
+                Inst::ConstStr(cs) => { if HashMap_contains(fidx, cs) && !iro_name_in(taken, cs) { taken.push(cs); } }
+                Inst::MakeDyn(_, dty, _) => { if !iro_name_in(dtys, dty) { dtys.push(dty); } }
+                Inst::DynCall(_, dm, _, _, _) => { if !iro_name_in(dmeths, dm) { dmeths.push(dm); } }
+                _ => {}
+            }
+            si = si + 1;
+        }
+        fi = fi + 1;
+    }
+    // A DynCall(trait, m) reaches t_m for every MakeDyn'd t: those callees are
+    // not safe candidates either (same rule dead elimination uses).
+    var dyn_names: Vec<str> = Vec::new();
+    var di: i64 = 0;
+    while di < dtys.len() {
+        var mi: i64 = 0;
+        while mi < dmeths.len() {
+            dyn_names.push(dtys.get(di) + "_" + dmeths.get(mi));
+            mi = mi + 1;
+        }
+        di = di + 1;
+    }
+    var ext_names: Vec<str> = Vec::new();
+    di = 0;
+    while di < module.extern_functions.len() {
+        ext_names.push(module.extern_functions.get(di).name);
+        di = di + 1;
+    }
+    var cands: Vec<i64> = Vec::new();   // function index + 1
+    var npar: Vec<i64> = Vec::new();
+    var cvals: Vec<i64> = Vec::new();   // cand * 8 + j: 0 unseen, -1 varies, v+2 constant
+    var bad: Vec<i64> = Vec::new();
+    var cidx: i64 = HashMap_new();      // name -> cand index + 1
+    fi = 0;
+    while fi < nfn {
+        var g: IrFunction = module.functions.get(fi).func;
+        var ii: i64 = 0;
+        while ii < g.insts.len() {
+            match g.insts.get(ii).inst {
+                Inst::Call(nm, args, _r, _e) => {
+                    var ci: i64 = -1;
+                    if HashMap_contains(cidx, nm) { ci = HashMap_get(cidx, nm) - 1; }
+                    else {
+                        var at: i64 = 0;
+                        if HashMap_contains(fidx, nm) { at = HashMap_get(fidx, nm); }
+                        if at > 0 && nm != "main" && !iro_name_in(taken, nm)
+                            && !iro_name_in(dyn_names, nm)
+                            && !iro_name_in(ext_names, nm)
+                            && !iro_name_in(module.c_callbacks, nm)
+                            && !str_starts_with(nm, "p_") && !str_starts_with(nm, "pe_")
+                            && !str_starts_with(nm, "pert_") && !str_starts_with(nm, "nat_") {
+                            var np0: i64 = module.functions.get(at - 1).func.params.len();
+                            if np0 > 0 && np0 <= 8 {
+                                ci = cands.len();
+                                cands.push(at);
+                                npar.push(np0);
+                                var q: i64 = 0;
+                                while q < 8 { cvals.push(0); q = q + 1; }
+                                bad.push(0);
+                            }
+                        }
+                        HashMap_insert(cidx, nm, ci + 1);
+                    }
+                    if ci >= 0 && bad.get(ci) == 0 {
+                        var np: i64 = npar.get(ci);
+                        if args.len() != np { bad.set(ci, 1); }
+                        else {
+                            var aj: i64 = 0;
+                            while aj < np {
+                                if cvals.get(ci * 8 + aj) >= 0 {
+                                    var got: i64 = 0;
+                                    var cval: i64 = 0;
+                                    // Not peir_inst_of: its None fallback is ConstBool(false),
+                                    // which would read every non-inst argument as constant 0.
+                                    match IrFunction_get_inst(g, args.get(aj)) {
+                                        OptInst::Some(ai) => {
+                                            match ai {
+                                                Inst::ConstInt(v, _t) => { got = 1; cval = v; }
+                                                Inst::ConstBool(b) => { got = 1; if b { cval = 1; } }
+                                                _ => {}
+                                            }
+                                        }
+                                        OptInst::None => {}
+                                    }
+                                    var old: i64 = cvals.get(ci * 8 + aj);
+                                    if got == 0 { cvals.set(ci * 8 + aj, -1); }
+                                    else if old == 0 { cvals.set(ci * 8 + aj, cval + 2); }
+                                    else if old != cval + 2 { cvals.set(ci * 8 + aj, -1); }
+                                }
+                                aj = aj + 1;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            ii = ii + 1;
+        }
+        fi = fi + 1;
+    }
+    var ci2: i64 = 0;
+    while ci2 < cands.len() {
+        if bad.get(ci2) == 0 {
+            var ent: IrFunctionEntry = module.functions.get(cands.get(ci2) - 1);
+            var f: IrFunction = ent.func;
+            var np2: i64 = npar.get(ci2);
+            var dirty: bool = false;
+            var j2: i64 = 0;
+            while j2 < np2 {
+                var cv: i64 = cvals.get(ci2 * 8 + j2);
+                if cv > 0 {
+                    var p: ValueIdType = f.params.get(j2);
+                    var v: i64 = cv - 2;
+                    var nid: i64 = -1;
+                    if ir_type_eq(p.ty, IrType::Bool) {
+                        f.current_block_idx = 0;
+                        nid = IrFunction_emit(&mut f, Inst::ConstBool(v != 0));
+                    } else if iro_int_ty(p.ty) {
+                        f.current_block_idx = 0;
+                        nid = IrFunction_emit(&mut f, Inst::ConstInt(v, p.ty));
+                    }
+                    if nid >= 0 {
+                        var blk0: BasicBlock = f.blocks.get(0);
+                        var ins: Vec<i64> = Vec::new();
+                        ins.push(nid);
+                        var ki: i64 = 0;
+                        while ki < blk0.instructions.len() {
+                            var oid: i64 = blk0.instructions.get(ki);
+                            if oid != nid { ins.push(oid); }
+                            ki = ki + 1;
+                        }
+                        blk0.instructions = ins;
+                        f.blocks.set(0, blk0);
+                        var map: Vec<i64> = peir_zeros(f.next_value + 1);
+                        map.set(p.id, nid + 1);
+                        var vi: i64 = 0;
+                        while vi < f.insts.len() {
+                            var ve: ValueIdInst = f.insts.get(vi);
+                            ve.inst = iro_remap_all(ve.inst, &map);
+                            f.insts.set(vi, ve);
+                            vi = vi + 1;
+                        }
+                        count = count + 1;
+                        dirty = true;
+                    }
+                }
+                j2 = j2 + 1;
+            }
+            if dirty {
+                ent.func = f;
+                module.functions.set(cands.get(ci2) - 1, ent);
+            }
+        }
+        ci2 = ci2 + 1;
+    }
+    return count;
+}
+
+/// WP16: a DynCall whose receiver is a MakeDyn of a known type is a direct
+/// call to type_method — the type-id dispatch chain can be skipped.
+fn iro_devirt(module: &IrModule, f: &mut IrFunction) -> bool {
+    var changed: bool = false;
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        var blk: BasicBlock = f.blocks.get(bi);
+        var k: i64 = 0;
+        while k < blk.instructions.len() {
+            var iid: i64 = blk.instructions.get(k);
+            match peir_inst_of(f, iid) {
+                Inst::DynCall(_trait, method, args, ret, _eff) => {
+                    if args.len() > 0 {
+                        match peir_inst_of(f, args.get(0)) {
+                            Inst::MakeDyn(v, tname, _tn) => {
+                                var mname: str = tname + "_" + method;
+                                match IrModule_get_function(module, mname) {
+                                    OptIrFunction::Some(cf) => {
+                                        f.current_block_idx = bi;
+                                        var env0: i64 = IrFunction_emit(f, Inst::ConstInt(0, IrType::I64));
+                                        var nargs: Vec<i64> = Vec::new();
+                                        nargs.push(env0);
+                                        nargs.push(v);
+                                        var ai: i64 = 1;
+                                        while ai < args.len() { nargs.push(args.get(ai)); ai = ai + 1; }
+                                        IrFunction_set_inst(f, iid, Inst::Call(mname, nargs, ret, cf.effects));
+                                        var blk2: BasicBlock = f.blocks.get(bi);
+                                        var ins: Vec<i64> = Vec::new();
+                                        var ki: i64 = 0;
+                                        while ki < blk2.instructions.len() {
+                                            var oid: i64 = blk2.instructions.get(ki);
+                                            if oid == iid { ins.push(env0); }
+                                            if oid != env0 { ins.push(oid); }
+                                            ki = ki + 1;
+                                        }
+                                        blk2.instructions = ins;
+                                        f.blocks.set(bi, blk2);
+                                        changed = true;
+                                    }
+                                    OptIrFunction::None => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+            k = k + 1;
+        }
+        bi = bi + 1;
+    }
+    return changed;
+}
+
+/// WP18: a global with a constant initializer whose address is only ever
+/// loaded — never stored through and never escaping — has its loads folded
+/// to the initializer. cval per global: 0 not an int constant, -1 excluded.
+pub fn iro_const_globals(module: &mut IrModule) -> i64 {
+    var count: i64 = 0;
+    if module.globals.len() == 0 { return 0; }
+    var cval: Vec<i64> = Vec::new();
+    var gmap: i64 = HashMap_new();
+    var gi: i64 = 0;
+    while gi < module.globals.len() {
+        var g: GlobalEntry = module.globals.get(gi);
+        var v: i64 = 0;
+        match g.init {
+            Expr::IntLit(iv) => { v = iv + 2; }
+            _ => {}
+        }
+        cval.push(v);
+        if v > 0 { HashMap_insert(gmap, g.name, gi + 1); }
+        gi = gi + 1;
+    }
+    if count < 0 { return 0; }
+    // Two phases: 0 excludes (cval -1) every global whose address is used
+    // for anything but a load in ANY function; 1 folds the loads of the
+    // rest. (One phase folded a global's loads in one function although
+    // another function stored to it: the heap pointer, the runtime's state.)
+    var phase: i64 = 0;
+    while phase < 2 {
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var f: IrFunction = module.functions.get(fi).func;
+        var cand: Vec<i64> = peir_zeros(f.next_value + 1);
+        var bad: Vec<i64> = peir_zeros(f.next_value + 1);
+        var any: bool = false;
+        var ii: i64 = 0;
+        while ii < f.insts.len() {
+            var ve: ValueIdInst = f.insts.get(ii);
+            match ve.inst {
+                Inst::GlobalAddr(gn, _t) => {
+                    if HashMap_contains(gmap, gn) {
+                        var gat: i64 = HashMap_get(gmap, gn) - 1;
+                        if cval.get(gat) > 0 { cand.set(ve.id, gat + 1); any = true; }
+                    }
+                }
+                _ => {}
+            }
+            ii = ii + 1;
+        }
+        if any {
+            // every operand that is a global's address must be a Load's ptr
+            var jj: i64 = 0;
+            while jj < f.insts.len() {
+                var ve2: ValueIdInst = f.insts.get(jj);
+                var ops: Vec<i64> = Vec::new();
+                peir_inst_operands(ve2.inst, &mut ops);
+                var oi: i64 = 0;
+                while oi < ops.len() {
+                    var o: i64 = ops.get(oi);
+                    if o >= 0 && o < cand.len() && cand.get(o) > 0 {
+                        var isload: bool = false;
+                        if oi == 0 {
+                            match ve2.inst { Inst::Load(p, _lt) => { if p == o { isload = true; } } _ => {} }
+                        }
+                        if !isload {
+                            bad.set(o, 1);
+                            cval.set(cand.get(o) - 1, 0 - 1);
+                        }
+                    }
+                    oi = oi + 1;
+                }
+                jj = jj + 1;
+            }
+            // fold the surviving loads
+            var kk: i64 = 0;
+            if phase == 0 { kk = f.insts.len(); }
+            while kk < f.insts.len() {
+                var ve3: ValueIdInst = f.insts.get(kk);
+                match ve3.inst {
+                    Inst::Load(p, lty) => {
+                        if p >= 0 && p < cand.len() && cand.get(p) > 0 && bad.get(p) == 0
+                            && iro_int_ty(lty) {
+                            var cv2: i64 = cval.get(cand.get(p) - 1) - 2;
+                            IrFunction_set_inst(&mut f, ve3.id, Inst::ConstInt(cv2, lty));
+                            count = count + 1;
+                        }
+                    }
+                    _ => {}
+                }
+                kk = kk + 1;
+            }
+            if phase == 1 {
+                var ent2: IrFunctionEntry = module.functions.get(fi);
+                ent2.func = f;
+                module.functions.set(fi, ent2);
+            }
+        }
+        fi = fi + 1;
+    }
+    phase = phase + 1;
+    }
+    return count;
+}
+
+
+fn iro_i64_in(v: Vec<i64>, x: i64) -> bool {
+    var i: i64 = 0;
+    while i < v.len() { if v.get(i) == x { return true; } i = i + 1; }
+    return false;
+}
+
+/// Emit a constant for parameter `p` at the front of the entry block and
+/// rewrite its uses — shared by specialization's clones.
+fn iro_emit_param_const(f: &mut IrFunction, pid: i64, pty: IrType, v: i64) -> bool {
+    var nid: i64 = -1;
+    if ir_type_eq(pty, IrType::Bool) {
+        f.current_block_idx = 0;
+        nid = IrFunction_emit(f, Inst::ConstBool(v != 0));
+    } else if iro_int_ty(pty) {
+        f.current_block_idx = 0;
+        nid = IrFunction_emit(f, Inst::ConstInt(v, pty));
+    }
+    if nid < 0 { return false; }
+    var blk0: BasicBlock = f.blocks.get(0);
+    var ins: Vec<i64> = Vec::new();
+    ins.push(nid);
+    var ki: i64 = 0;
+    while ki < blk0.instructions.len() {
+        var oid: i64 = blk0.instructions.get(ki);
+        if oid != nid { ins.push(oid); }
+        ki = ki + 1;
+    }
+    blk0.instructions = ins;
+    f.blocks.set(0, blk0);
+    var map: Vec<i64> = peir_zeros(f.next_value + 1);
+    map.set(pid, nid + 1);
+    var vi: i64 = 0;
+    while vi < f.insts.len() {
+        var ve: ValueIdInst = f.insts.get(vi);
+        ve.inst = iro_remap_all(ve.inst, &map);
+        f.insts.set(vi, ve);
+        vi = vi + 1;
+    }
+    return true;
+}
+
+/// WP14: deep-enough clone for specialization — every Vec the clone may
+/// mutate is copied; inst payload Vecs stay shared (they are only replaced
+/// whole, never edited in place).
+fn iro_clone_function(f: IrFunction, newname: str) -> IrFunction {
+    var nf: IrFunction = f;
+    nf.name = newname;
+    nf.params = f.params.clone();
+    nf.value_metas = f.value_metas.clone();
+    nf.insts = f.insts.clone();
+    nf.inst_at = f.inst_at.clone();
+    var nbl: Vec<BasicBlock> = Vec::new();
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        var bb: BasicBlock = f.blocks.get(bi);
+        bb.instructions = bb.instructions.clone();
+        nbl.push(bb);
+        bi = bi + 1;
+    }
+    nf.blocks = nbl;
+    nf.locals = f.locals.clone();
+    nf.persist_vars = f.persist_vars.clone();
+    nf.drop_locals = f.drop_locals.clone();
+    nf.zeroize_locals = f.zeroize_locals.clone();
+    nf.workgroup_size = f.workgroup_size.clone();
+    var neff: EffectSet = f.effects;
+    neff.effects = f.effects.effects.clone();
+    nf.effects = neff;
+    return nf;
+}
+
+/// WP6: mark every function that may use the internal calling convention.
+/// The predicate is the same one env-trim uses for safety: not address-taken,
+/// not a dyn trait target, not an extern or C callback, not a runtime
+/// stand-in — functions only ever reached through direct Inst::Call sites,
+/// which all read the same flag when picking a register count. Runs
+/// unconditionally (unlike env trimming): the flag only selects a wider
+/// arg-register set in the backend; it changes no signatures.
+pub fn iro_conv_mark(module: &mut IrModule) -> i64 {
+    var nfn: i64 = module.functions.len();
+    var taken: Vec<str> = Vec::new();
+    var dtys: Vec<str> = Vec::new();
+    var dmeths: Vec<str> = Vec::new();
+    var fi: i64 = 0;
+    while fi < nfn {
+        var sf: IrFunction = module.functions.get(fi).func;
+        var si: i64 = 0;
+        while si < sf.insts.len() {
+            match sf.insts.get(si).inst {
+                Inst::ConstFnRef(nm) => { if !iro_name_in(taken, nm) { taken.push(nm); } }
+                Inst::ConstStr(cs) => {
+                    var fi2: i64 = 0;
+                    var hit: bool = false;
+                    while fi2 < nfn {
+                        if module.functions.get(fi2).name == cs { hit = true; fi2 = nfn; }
+                        fi2 = fi2 + 1;
+                    }
+                    if hit && !iro_name_in(taken, cs) { taken.push(cs); }
+                }
+                Inst::MakeDyn(_, dty, _) => { if !iro_name_in(dtys, dty) { dtys.push(dty); } }
+                Inst::DynCall(_, dm, _, _, _) => { if !iro_name_in(dmeths, dm) { dmeths.push(dm); } }
+                _ => {}
+            }
+            si = si + 1;
+        }
+        fi = fi + 1;
+    }
+    var dyn_names: Vec<str> = Vec::new();
+    var di: i64 = 0;
+    while di < dtys.len() {
+        var mi: i64 = 0;
+        while mi < dmeths.len() { dyn_names.push(dtys.get(di) + "_" + dmeths.get(mi)); mi = mi + 1; }
+        di = di + 1;
+    }
+    var ext_names: Vec<str> = Vec::new();
+    di = 0;
+    while di < module.extern_functions.len() { ext_names.push(module.extern_functions.get(di).name); di = di + 1; }
+    var count: i64 = 0;
+    fi = 0;
+    while fi < nfn {
+        var nm2: str = module.functions.get(fi).name;
+        if nm2 != "main" && nm2 != "main_entry"
+            && !iro_name_in(taken, nm2) && !iro_name_in(dyn_names, nm2)
+            && !iro_name_in(ext_names, nm2) && !iro_name_in(module.c_callbacks, nm2)
+            && !str_starts_with(nm2, "p_") && !str_starts_with(nm2, "pe_")
+            && !str_starts_with(nm2, "pert_") && !str_starts_with(nm2, "nat_")
+            && !pe_runtime_alias_target(nm2) {
+            var ent: IrFunctionEntry = module.functions.get(fi);
+            if !ent.func.internal_conv {
+                ent.func.internal_conv = true;
+                module.functions.set(fi, ent);
+                count = count + 1;
+            }
+        }
+        fi = fi + 1;
+    }
+    return count;
+}
+
+/// WP7: drop the synthetic __env parameter (params[0]) from functions that
+/// never read it, and the matching args[0] at every direct call to them.
+/// Address-taken functions (ConstFnRef), trait-impl targets of DynCall,
+/// externs, C callbacks and runtime helpers keep the uniform convention —
+/// CallPtr always passes an environment.
+pub fn iro_env_trim(module: &mut IrModule) -> i64 {
+    var count: i64 = 0;
+    var nfn: i64 = module.functions.len();
+    var fidx: i64 = HashMap_new();
+    var taken: Vec<str> = Vec::new();
+    var dtys: Vec<str> = Vec::new();
+    var dmeths: Vec<str> = Vec::new();
+    var fi: i64 = 0;
+    while fi < nfn { HashMap_insert(fidx, module.functions.get(fi).name, fi + 1); fi = fi + 1; }
+    fi = 0;
+    while fi < nfn {
+        var sf: IrFunction = module.functions.get(fi).func;
+        var si: i64 = 0;
+        while si < sf.insts.len() {
+            match sf.insts.get(si).inst {
+                Inst::ConstFnRef(nm) => { if !iro_name_in(taken, nm) { taken.push(nm); } }
+                // a function named by a string is called by name at run time
+                // (task_go("f", ..), thread spawns, the runtime's lookups) with
+                // the env slot first: its signature must stay
+                Inst::ConstStr(cs) => { if HashMap_contains(fidx, cs) && !iro_name_in(taken, cs) { taken.push(cs); } }
+                Inst::MakeDyn(_, dty, _) => { if !iro_name_in(dtys, dty) { dtys.push(dty); } }
+                Inst::DynCall(_, dm, _, _, _) => { if !iro_name_in(dmeths, dm) { dmeths.push(dm); } }
+                _ => {}
+            }
+            si = si + 1;
+        }
+        fi = fi + 1;
+    }
+    var dyn_names: Vec<str> = Vec::new();
+    var di: i64 = 0;
+    while di < dtys.len() {
+        var mi: i64 = 0;
+        while mi < dmeths.len() { dyn_names.push(dtys.get(di) + "_" + dmeths.get(mi)); mi = mi + 1; }
+        di = di + 1;
+    }
+    var ext_names: Vec<str> = Vec::new();
+    di = 0;
+    while di < module.extern_functions.len() { ext_names.push(module.extern_functions.get(di).name); di = di + 1; }
+    var trim_names: Vec<str> = Vec::new();
+    fi = 0;
+    while fi < nfn {
+        var g: IrFunction = module.functions.get(fi).func;
+        var nm2: str = g.name;
+        if g.params.len() > 0 && nm2 != "main" && nm2 != "main_entry"
+            && !iro_name_in(taken, nm2) && !iro_name_in(dyn_names, nm2)
+            && !iro_name_in(ext_names, nm2) && !iro_name_in(module.c_callbacks, nm2)
+            && !str_starts_with(nm2, "p_") && !str_starts_with(nm2, "pe_")
+            && !str_starts_with(nm2, "pert_") && !str_starts_with(nm2, "nat_")
+            // The backends call pe_runtime_alias stand-ins with a null env
+            // inserted first — their env slot must stay even when unused.
+            && !pe_runtime_alias_target(nm2) {
+            // WP6: every function meeting the internal predicate may use
+            // the extended calling convention, whether or not its env
+            // parameter can also be trimmed (WP7).
+            var ent_i: IrFunctionEntry = module.functions.get(fi);
+            ent_i.func.internal_conv = true;
+            module.functions.set(fi, ent_i);
+            var env_id: i64 = g.params.get(0).id;
+            var used: bool = false;
+            var ii: i64 = 0;
+            while ii < g.insts.len() && !used {
+                var ops: Vec<i64> = Vec::new();
+                peir_inst_operands(g.insts.get(ii).inst, &mut ops);
+                var oi: i64 = 0;
+                while oi < ops.len() {
+                    if ops.get(oi) == env_id { used = true; oi = ops.len(); }
+                    oi = oi + 1;
+                }
+                ii = ii + 1;
+            }
+            if !used { trim_names.push(nm2); }
+        }
+        fi = fi + 1;
+    }
+    if trim_names.len() == 0 { return 0; }
+    fi = 0;
+    while fi < nfn {
+        var ent: IrFunctionEntry = module.functions.get(fi);
+        var f2: IrFunction = ent.func;
+        var changed: bool = false;
+        if iro_name_in(trim_names, f2.name) && f2.params.len() > 0 {
+            var np2: Vec<ValueIdType> = Vec::new();
+            var pj: i64 = 1;
+            while pj < f2.params.len() { np2.push(f2.params.get(pj)); pj = pj + 1; }
+            f2.params = np2;
+            changed = true;
+        }
+        var ii2: i64 = 0;
+        while ii2 < f2.insts.len() {
+            var ve: ValueIdInst = f2.insts.get(ii2);
+            match ve.inst {
+                Inst::Call(nm3, args, r, e) => {
+                    if iro_name_in(trim_names, nm3) && args.len() > 0 {
+                        var na: Vec<i64> = Vec::new();
+                        var aj: i64 = 1;
+                        while aj < args.len() { na.push(args.get(aj)); aj = aj + 1; }
+                        ve.inst = Inst::Call(nm3, na, r, e);
+                        f2.insts.set(ii2, ve);
+                        changed = true;
+                        count = count + 1;
+                    }
+                }
+                _ => {}
+            }
+            ii2 = ii2 + 1;
+        }
+        if changed { module.functions.set(fi, IrFunctionEntry_new(f2.name, f2)); }
+        fi = fi + 1;
+    }
+    return count;
+}
+
+/// WP14: specialize functions on the constant arguments some — not all —
+/// call sites pass. Params constant at every site are IPCP's job; here we
+/// clone per observed constant value and redirect just those sites.
+pub fn iro_specialize(module: &mut IrModule) -> i64 {
+    var count: i64 = 0;
+    var nfn: i64 = module.functions.len();
+    var fidx: i64 = HashMap_new();
+    var taken: Vec<str> = Vec::new();
+    var dtys: Vec<str> = Vec::new();
+    var dmeths: Vec<str> = Vec::new();
+    var fi: i64 = 0;
+    while fi < nfn { HashMap_insert(fidx, module.functions.get(fi).name, fi + 1); fi = fi + 1; }
+    fi = 0;
+    while fi < nfn {
+        var sf: IrFunction = module.functions.get(fi).func;
+        var si: i64 = 0;
+        while si < sf.insts.len() {
+            match sf.insts.get(si).inst {
+                Inst::ConstFnRef(nm) => { if !iro_name_in(taken, nm) { taken.push(nm); } }
+                // a function named by a string is called by name at run time
+                // (task_go("f", ..), thread spawns, the runtime's lookups) with
+                // the env slot first: its signature must stay
+                Inst::ConstStr(cs) => { if HashMap_contains(fidx, cs) && !iro_name_in(taken, cs) { taken.push(cs); } }
+                Inst::MakeDyn(_, dty, _) => { if !iro_name_in(dtys, dty) { dtys.push(dty); } }
+                Inst::DynCall(_, dm, _, _, _) => { if !iro_name_in(dmeths, dm) { dmeths.push(dm); } }
+                _ => {}
+            }
+            si = si + 1;
+        }
+        fi = fi + 1;
+    }
+    var dyn_names: Vec<str> = Vec::new();
+    var di: i64 = 0;
+    while di < dtys.len() {
+        var mi: i64 = 0;
+        while mi < dmeths.len() { dyn_names.push(dtys.get(di) + "_" + dmeths.get(mi)); mi = mi + 1; }
+        di = di + 1;
+    }
+    var ext_names: Vec<str> = Vec::new();
+    di = 0;
+    while di < module.extern_functions.len() { ext_names.push(module.extern_functions.get(di).name); di = di + 1; }
+    var cands: Vec<i64> = Vec::new();
+    var npar: Vec<i64> = Vec::new();
+    var mixed: Vec<i64> = Vec::new();
+    var cidx: i64 = HashMap_new();
+    fi = 0;
+    while fi < nfn {
+        var g: IrFunction = module.functions.get(fi).func;
+        var ii: i64 = 0;
+        while ii < g.insts.len() {
+            match g.insts.get(ii).inst {
+                Inst::Call(nm, args, _r, _e) => {
+                    var ci: i64 = -1;
+                    if HashMap_contains(cidx, nm) { ci = HashMap_get(cidx, nm) - 1; }
+                    else {
+                        var at: i64 = 0;
+                        if HashMap_contains(fidx, nm) { at = HashMap_get(fidx, nm); }
+                        if at > 0 && nm != "main" && !iro_name_in(taken, nm)
+                            && !iro_name_in(dyn_names, nm) && !iro_name_in(ext_names, nm)
+                            && !iro_name_in(module.c_callbacks, nm)
+                            && !str_starts_with(nm, "p_") && !str_starts_with(nm, "pe_")
+                            && !str_starts_with(nm, "pert_") && !str_starts_with(nm, "nat_") {
+                            var cfn: IrFunction = module.functions.get(at - 1).func;
+                            var np0: i64 = cfn.params.len();
+                            if np0 > 0 && np0 <= 8 && cfn.insts.len() <= 200 {
+                                ci = cands.len();
+                                cands.push(at);
+                                npar.push(np0);
+                                var q: i64 = 0;
+                                while q < 8 { mixed.push(0); q = q + 1; }
+                            }
+                        }
+                        HashMap_insert(cidx, nm, ci + 1);
+                    }
+                    if ci >= 0 {
+                        var np: i64 = npar.get(ci);
+                        if args.len() == np {
+                            var aj: i64 = 0;
+                            while aj < np {
+                                var is_c: bool = false;
+                                match IrFunction_get_inst(g, args.get(aj)) {
+                                    OptInst::Some(ai) => {
+                                        match ai {
+                                            Inst::ConstInt(_v, _t) => { is_c = true; }
+                                            Inst::ConstBool(_b) => { is_c = true; }
+                                            _ => {}
+                                        }
+                                    }
+                                    OptInst::None => {}
+                                }
+                                var slot: i64 = ci * 8 + aj;
+                                var st: i64 = mixed.get(slot);
+                                if is_c {
+                                    if st == 0 { mixed.set(slot, 1); }
+                                    if st == 2 { mixed.set(slot, 3); }
+                                } else {
+                                    if st == 0 { mixed.set(slot, 2); }
+                                    if st == 1 { mixed.set(slot, 3); }
+                                }
+                                aj = aj + 1;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            ii = ii + 1;
+        }
+        fi = fi + 1;
+    }
+    var ci2: i64 = 0;
+    while ci2 < cands.len() {
+        var at2: i64 = cands.get(ci2);
+        var cent: IrFunctionEntry = module.functions.get(at2 - 1);
+        var np2: i64 = npar.get(ci2);
+        var clones: i64 = 0;
+        var j2: i64 = 0;
+        while j2 < np2 && clones < 4 {
+            if mixed.get(ci2 * 8 + j2) == 3 {
+                var bvals: Vec<i64> = Vec::new();
+                fi = 0;
+                while fi < nfn && bvals.len() < 2 {
+                    var g2: IrFunction = module.functions.get(fi).func;
+                    var ii2: i64 = 0;
+                    while ii2 < g2.insts.len() && bvals.len() < 2 {
+                        match g2.insts.get(ii2).inst {
+                            Inst::Call(nm4, args4, _r4, _e4) => {
+                                if nm4 == cent.name && args4.len() == np2 {
+                                    match IrFunction_get_inst(g2, args4.get(j2)) {
+                                        OptInst::Some(ai4) => {
+                                            var has4: bool = false;
+                                            var bv4: i64 = 0;
+                                            match ai4 {
+                                                Inst::ConstInt(v4, _t4) => { has4 = true; bv4 = v4; }
+                                                Inst::ConstBool(b4) => { has4 = true; if b4 { bv4 = 1; } }
+                                                _ => {}
+                                            }
+                                            if has4 && bv4 >= 0 && bv4 < 1000000 && !iro_i64_in(bvals, bv4) {
+                                                bvals.push(bv4);
+                                            }
+                                        }
+                                        OptInst::None => {}
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        ii2 = ii2 + 1;
+                    }
+                    fi = fi + 1;
+                }
+                var bi2: i64 = 0;
+                while bi2 < bvals.len() && clones < 4 {
+                    var cv: i64 = bvals.get(bi2);
+                    var cname: str = cent.name + "_sc" + int_to_str(j2) + "_" + int_to_str(cv);
+                    if !HashMap_contains(fidx, cname) {
+                        var nf: IrFunction = iro_clone_function(cent.func, cname);
+                        var pj: ValueIdType = nf.params.get(j2);
+                        if iro_emit_param_const(&mut nf, pj.id, pj.ty, cv) {
+                            module.functions.push(IrFunctionEntry_new(cname, nf));
+                            clones = clones + 1;
+                            count = count + 1;
+                            fi = 0;
+                            while fi < nfn {
+                                var g3: IrFunction = module.functions.get(fi).func;
+                                var ii3: i64 = 0;
+                                var ch3: bool = false;
+                                while ii3 < g3.insts.len() {
+                                    var ve3: ValueIdInst = g3.insts.get(ii3);
+                                    match ve3.inst {
+                                        Inst::Call(nm5, args5, r5, e5) => {
+                                            if nm5 == cent.name && args5.len() == np2 {
+                                                var mv5: i64 = -1;
+                                                var isc5: bool = false;
+                                                match IrFunction_get_inst(g3, args5.get(j2)) {
+                                                    OptInst::Some(ai5) => {
+                                                        match ai5 {
+                                                            Inst::ConstInt(v5, _t5) => { isc5 = true; mv5 = v5; }
+                                                            Inst::ConstBool(b5) => { isc5 = true; if b5 { mv5 = 1; } else { mv5 = 0; } }
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                    OptInst::None => {}
+                                                }
+                                                if isc5 && mv5 == cv {
+                                                    ve3.inst = Inst::Call(cname, args5, r5, e5);
+                                                    g3.insts.set(ii3, ve3);
+                                                    ch3 = true;
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    ii3 = ii3 + 1;
+                                }
+                                if ch3 {
+                                    var ent3: IrFunctionEntry = module.functions.get(fi);
+                                    ent3.func = g3;
+                                    module.functions.set(fi, ent3);
+                                }
+                                fi = fi + 1;
+                            }
+                        }
+                    }
+                    bi2 = bi2 + 1;
+                }
+            }
+            j2 = j2 + 1;
+        }
+        ci2 = ci2 + 1;
+    }
+    return count;
+}
+
+/// WP20: library-facts artifact — with FID_LIBFACTS=<path>, write one line
+/// per optimized function: name, parameter count, declared effects and
+/// annotation flags, for consumers that build against the library without
+/// whole-program mode.
+pub fn iro_libfacts(module: &IrModule) {
+    var path: str = p_getenv("FID_LIBFACTS");
+    if (path as i64) == 0 || str_len(path) == 0 { return; }
+    var out: str = "# fid-facts 1\n";
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var f: IrFunction = module.functions.get(fi).func;
+        var line: str = "fn " + f.name + " params=" + int_to_str(f.params.len())
+            + " effects=" + EffectSet_to_str(&f.effects);
+        if f.internal_conv { line = line + " conv=internal"; }
+        if f.is_crashfree { line = line + " @crashfree"; }
+        if f.is_no_alloc { line = line + " @no-alloc"; }
+        if f.is_wrapping { line = line + " @wrapping"; }
+        if f.is_deterministic { line = line + " @deterministic"; }
+        if f.is_interrupt { line = line + " @interrupt"; }
+        if f.is_kernel { line = line + " @kernel"; }
+        out = out + line + "\n";
+        fi = fi + 1;
+    }
+    p_file_write(path, out);
 }

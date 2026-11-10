@@ -1,116 +1,46 @@
-# codegen_riscv.fd — PIR L3 → RISC-V (RV64) asm selector (554 LOC)
+# codegen_riscv.fd — PIR L3 → RISC-V 64 assembly
 
-> **Re-verified 2026-10-23:** all headline findings confirmed — Slot-operand regression, `return` not `ret` (:412), immediates→t0 catch-all (:508), `sub reg,sp,imm` invalid, lui +0x800 miss, vreg%23 wrap. Still accurate.
+Re-audited 2026-11-09 (previous audit 2026-10-22/23).
 
-## Role
+- **Path:** `compiler/codegen_riscv.fd`
+- **LOC:** 554
+- **Role:** instruction selector of the old PIR path for RV64: a clone of
+  codegen_arm64 with RISC-V mnemonics (vregs `5 + id % 23`, fixed
+  256-byte frame). Port of `src/codegen_riscv.rs`. The working RISC-V
+  backend is now nat_ir (`fid emit --target riscv64-linux`).
 
-Third target in the multi-arch backend: `L3Module → RV64 assembly text` →
-`assemble_riscv` → `runtime_parts_riscv` → `linker`. Port of
-`src/codegen_riscv.rs` (388 LOC). Structurally a clone of `codegen_arm64.fd`
-with RISC-V mnemonics — and shares most of its defects.
+## Where it is called
 
-## Where it's called
+| Caller | What |
+|--------|------|
+| `main.fd` `cmd_codegen` | `generate_asm_riscv(l3)` for `--target riscv|riscv64` |
+| `compiler.fd` `build_executable` | riscv branch — unreachable from the CLI (`build --native --target riscv*` goes to nat_ir) |
 
-| Caller | Site | What |
-|--------|------|------|
-| `compiler/compiler.fd:52` | `use compiler::codegen_riscv` | import |
-| `compiler/compiler.fd:1764` | `generate_asm_riscv(l3)` | `--target riscv`/`riscv64` — the only call site |
-
-Exported helpers (`reg_name`, `riscv_arg_reg`, `riscv_escape_string`,
-`riscv_operand_to_reg`, `riscv_cast_kind_eq`) have no external callers.
+Only live command: `fid codegen f.fd --target riscv [--elf o]` (the
+`--elf` object is empty, elf64.md 2).
 
 ## Findings
 
-### F1 — `Load`/`Store` lost `Operand::Slot` handling — HIGH (port regression)
+All from code inspection (no RISC-V probe run; the arm64 twin was probed
+and shows the same pattern, see codegen_arm64.md).
 
-Same regression as codegen_arm64: Rust `src/codegen_riscv.rs:204-232`
-matches `ptr`/`Operand::Slot(s)` → `ld/sd reg, -N(fp)`. The Fides port
-(:234-243) routes all pointers through `riscv_operand_to_reg` → Slot → `"t0"`
-→ **every stack-slot load/store emits `ld/sd …, 0(t0)`** — through
-uninitialized scratch. Fix: restore the `Operand::Slot` match arms.
+1. **F1 Load/Store lost `Operand::Slot` — STILL TRUE** (only `AddrOfSlot`,
+   :212).
+2. **F2 non-VReg operands → `t0`, which is also vreg 0's register —
+   STILL TRUE** (:57, :508-510).
+3. **F3 `return` instead of `ret` — STILL TRUE** (:412).
+4. **F4 StackAlloc `sub reg, sp, imm` — STILL TRUE** (:232).
+5. **F5 `lui` without `+0x800`, 32-bit only — STILL TRUE** (:320-325).
+6. **F6 `fcvt` on integer registers — STILL TRUE** (:495).
+7. **F7 `% 23` aliasing — STILL TRUE** (:51).
+8. **F8 TryUnwrap `beqz` on the pointer — STILL TRUE** (:292).
+9. **F9 misc (CallPtr `i < 7`, GlobalAddr → 0, frame 256) — STILL TRUE**
+   (:440, :216, :184).
 
-### F2 — `riscv_operand_to_reg` maps 6/7 Operand variants → `"t0"` — HIGH (inherited, extra-sharp here)
+## Fix order
 
-Only `Operand::VReg` survives; Slot/ImmI/ImmF/ImmStr/ImmFunc/ImmNull → `"t0"`.
-Worse than arm64's `"x9"`: **t0 is a live allocated register** — `reg_name`
-maps vreg 0 → t0 — so materializing an immediate/slot into "t0" **clobbers a
-live vreg**. `Ret(ImmI)` → `mv a0, t0`; call args `mv a0, t0`; `ImmFunc` →
-`jalr t0`. Same inherited design flaw, more damage because the scratch
-overlaps the allocation pool.
-
-### F3 — `gen_ret` emits `    return` (not `ret`) — HIGH (inherited)
-
-:412 — `return` is not a RISC-V mnemonic; the assembler rejects every
-function containing a Ret. Identical in src:270. Correct form: `ret`
-(=`jalr zero, ra, 0`).
-
-### F4 — `StackAlloc` emits `sub reg, sp, imm` — invalid — MEDIUM (inherited)
-
-:232 `sub ` + reg + `, sp, ` + int — **RISC-V `sub` is register-register
-only**; the immediate form must be `addi reg, sp, -N`. Won't assemble.
-Identical in src:202.
-
-### F5 — `lui`/`addi` immediate loading is wrong twice — MEDIUM (inherited)
-
-`gen_mov` (:320-326): `hi = v >> 12` — missing the `+0x800` rounding, so any
-immediate with bit 11 set is **off by 0x1000** (addi's sign-extension eats
-the carry). Also: `lui`+`addi` only materializes 32 bits — **any immediate
-above 2³² silently truncates** (Rust truncates further via `hi as i32`).
-Immediates needing the full 64-bit path (li-pseudo expansion / li.s
-sequences) aren't handled. Identical in src:148-153.
-
-### F6 — `fcvt.s.l`/`fcvt.l.s` on GPR names — MEDIUM (inherited)
-
-`gen_cast` (:495-497): `fcvt` instructions require FP registers (f0-f31);
-`d`/`s` here are integer ABI names (`a0`, `t0`, …) → **invalid asm** + no
-integer↔FP register-file move even if it assembled (`fmv.w.x`/`fmv.x.w`
-needed). Identical in src:329-330.
-
-### F7 — Register wrap + scratch aliasing — MEDIUM (inherited)
-
-`reg_name`: `mapped = 5 + (idx % 23)` → vregs 0-22 → t0-t6,s0-s11,a0-a7,s2+
-(x5-x27). vreg ≥23 **wraps and aliases** (vreg 23→t0 = vreg 0's register)
-→ silent register collisions in big functions. Same in src:44.
-
-### F8 — `TryUnwrap` semantic divergence — LOW-MEDIUM (inherited)
-
-:292 `beqz v, err` — checks **pointer==0**. The C backend checks the tag:
-`*(int64_t*)v == 0`. A non-null Result pointer with tag=err → C says err,
-RISC-V says ok — divergent semantics across backends.
-
-### F9 — Misc — LOW (all inherited)
-
-- `string_consts`/`float_consts` never populated → `.rodata` emission dead.
-- `riscv_arg_reg(i≥8)` → `"a0"` fallback (args 9+ dropped anyway — AAPCS-style
-  stack passing unimplemented); `gen_call_ptr` caps `i<7` (arg 7 dropped —
-  inconsistent with `call`/`dyn_call`'s `<8`).
-- `.globl main` vestigial (:145); `GlobalAddr` → `li d, 0` (:219) = every
-  global at address 0.
-- `ElemAddr` hardcodes 8-byte elements; `sext.w` is fine for i32→i64 but
-  IntTrunc (`mv` only, :493) doesn't actually mask — relies on later loads.
-- Bin op lowering is correct: `Gt`→`slt r,l`, `LtEq`→`!(r<l)`, `GtEq`→`!(l<r)`,
-  `Eq`→`sub;seqz` — the comparator math is right (unlike arm64's bitfield
-  swap in the encoder).
-- `Br` uses `bnez` — correct conditional; label scheme `.L<fn><ctr>_b<id>`
-  consistent with the encoder's expectations.
-- Escape helper covers only `\` and `"` — newlines in string consts would
-  break `.asciz` — but the const tables are never populated anyway (dead
-  code layered on dead code).
-
-## Compound story
-
-`--target riscv` is broken at the same three layers as arm64:
-selector emits wrong asm (`return`, `sub`-imm, `fcvt`, `[t0]` operands) →
-`riscv_enc`/`assembler` can't parse or mis-encodes → linker + runtime
-unverified. Priority fixes: `return`→`ret`, restore Slot arms, materialize
-immediates into a *non-allocated* scratch (or real operand selection),
-fix `sub`→`addi -`, fix `lui` hi computation, real FP regs for fcvt.
+Retire with the PIR path (roadmap MI17); not worth fixing.
 
 ## Verification state
 
-- Call sites/exhaustiveness verified; 22 L3Inst arms all covered.
-- Cannot execute E2E — upstream `--target` chain already dead; all findings
-  grounded in line-by-line Rust-vs-Fides comparison.
-- Notably **the comparator/branch logic is correct** — this file's lowerings
-  are less buggy than codegen_arm64's where it differs (Shl/Shr/comparisons
-  fine); the damage concentrates in operand materialization + ret/sub/fcvt.
+- Read: the sites above. No probe.

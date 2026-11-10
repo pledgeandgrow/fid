@@ -1,37 +1,37 @@
 # Self-Hosted Fides Compiler
 
-> **Status (Nov 6, 2026):** the self-hosted compiler `fid` (`compiler/*.fd`,
-> 61 modules, 133,688 lines) is the release compiler and defines the
-> language ([reference.md](reference.md)); the Rust compiler `fidesc`
-> (`src/*.rs`, 57 files, 112,511 lines) is frozen and builds stage 1 and runs
-> the test harness. `RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh` builds
-> `fid` in three stages, checks that stages 2 and 3 emit identical C (49 MB,
-> Nov 6), installs `release/fid.exe` and runs a program from an installed
-> layout; the installer ships it as `fid.exe`. Stage 1 is built from a
-> pinned stage 0 (`release/stage0/fid.exe`, checked against
-> `scripts/stage0.sha256`) when one exists, otherwise cold from `fidesc`;
-> `PIN=1` pins the last stage after a fixpoint. No stage 0 is pinned yet.
-> `fid` compiles itself to C in ~133 s (type check
-> 59 s, borrow check 16 s, lowering 20 s, C generation 12 s), ~6x slower than
-> `fidesc` (~21 s).
+> **Status (Nov 9, 2026):** the self-hosted compiler `fid` (`compiler/*.fd`,
+> 68 modules, 158,516 lines; 60 reached from `main.fd`) is the release
+> compiler and defines the language ([reference.md](reference.md)); the Rust
+> compiler `fidesc` (`src/*.rs`, 57 files, 112,598 lines) is frozen and builds
+> stage 1 and runs the test harness. `RELEASE=1 CC="zig cc"
+> ./scripts/bootstrap.sh` builds `fid` in three stages, each stage's C split
+> into 8 units compiled at -O2 when the previous stage has `fid split-c`,
+> checks that stages 2 and 3 emit identical C, installs `release/fid.exe` and
+> runs a program from an installed layout; the installer ships it as
+> `fid.exe`. The fixpoint was last reached on Nov 8 (67 MB of C, with the
+> ownership layouts of proposal 0004); later changes were checked on
+> one-stage builds. `fid` compiles itself to C in 74 s when built at -O2
+> (229 s at -O0); `fidesc` takes ~21 s.
 >
-> Against `fidesc` (Oct 27): `run` matched on all 302 test programs of that
-> date, `ccompile` on 242 of 243 (`test_sqlite` needs libsqlite3), and all 59
-> expected-fail tests were rejected. The last full suite run is Nov 2 (Rust
-> harness, `fidesc` as compiler: interp 339/339, C 343/343, PE 345/345,
-> expected-fail 89/89); it has not been rerun with the Nov 4–6 compiler,
-> whose additions (generics, `if`/`match` values, `@cfg`, memory freeing,
-> borrow checks K4/K5, `@send`, `parallel`, async with f64/struct, safety
-> annotations and `fid qualify`, borrowed strings and `@scoped`, HashMap
-> integer keys, higher-order effects) were checked with `fid run`,
-> `fid ccompile` and `fid emit` on their tests.
+> The last full suite run is Nov 2 (Rust harness, `fidesc` as compiler:
+> interp 339/339, C 343/343, PE 345/345, expected-fail 89/89); it has not
+> been rerun with `fid` as the compiler. Native suites on Nov 9: Linux
+> AArch64 273, RISC-V 271, x86-64 272 of 317 (`NATIVE=1
+> scripts/cross-test.sh`), Windows `--nat` 301 of 338.
 >
-> Native Windows executables come from `fid emit` (compiler/pe_ir*.fd, with
-> the `compiler/iropt.fd` optimizer), with no C compiler; native async/tasks
-> crash there. The older `build --native` path (PIR, compiler/pe.fd) crashes,
-> so `build` and `ccompile` go through C. Open items:
-> [known-bugs.md §2f](known-bugs.md#2f-nov-46-2026--open-items-and-fixes).
-> Current counts are in [CURRENT.md → Numbers](../../CURRENT.md#numbers).
+> Native executables, no C compiler: Windows x64 from `fid emit`/`fid build`
+> (compiler/pe_ir*.fd, with the compiler/iropt.fd optimizer), Linux
+> AArch64/RISC-V/x86-64 and opt-in Windows `--nat` from the machine layer
+> (compiler/nat_ir.fd, nat_enc.fd, runtime in stdlib/linux_runtime/). The
+> old PIR path (`build --native` with the default target: opt.fd,
+> codegen_x64, elf64, linker) panics in opt.fd `pass_jump_thread`;
+> compiler/pe.fd is reached only by `emit --boot`, which panics. Native async
+> under `emit` broke in builds of Nov 9 afternoon (iropt passes; fixed again in the evening's fid31, known-bugs 2f.2). Open items:
+> [known-bugs.md §2g](known-bugs.md#2g-nov-9-2026--module-audit-open-bugs)
+> (Nov 9 audit) and §2f. Each module is described in
+> `docs/file-analysis/<module>.md` (all rewritten Nov 9).
+> Current counts are in [§ Numbers](#numbers).
 > Most of this file is the history of getting here; commands below that
 > mention `release.fid.exe` or `C:\tcc` are historical.
 
@@ -54,7 +54,7 @@
 | `selfhost.md` § Vision | Are we on the right path? What the language can do now, what's missing | 2 |
 | `selfhost.md` § Capability Comparison | What Fides can do today + honest comparison vs C/Rust/Zig/Go/Python | 3 |
 | `selfhost.md` § Path to Fixpoint | **The steps from current state to self-reproduction** | 4 |
-| `CURRENT.md` (repo root) | What are we doing right now (not in this folder) | 5 |
+| `AGENTS.md` → Current Baseline (repo root) | What is true right now: counts, fixpoint, open items | 5 |
 | `selfhost.md` § Architecture | File-by-file breakdown of every `compiler/*.fd` module (including `pe.fd`) | 4 |
 | `selfhost.md` § Language Constraints | What the Fides language must respect: types, effects, regions, patterns, closures, FFI, defer, try | 5 |
 | `calling-conventions.md` | SRET, enum layout, struct copy, Box semantics, Vec handling — the low-level machinery | 6 |
@@ -91,7 +91,37 @@ cargo build --release
 ./verify.sh
 ```
 
-### Current Status (Sep 9, 2026 — v1.0.0 released)
+### Numbers
+
+The one place project counts and measurements are kept (other docs round
+them and link here). Counted with `wc -l` on Nov 9, 2026.
+
+| Component | Files | Lines |
+|-----------|-------|-------|
+| Self-hosted compiler (`compiler/*.fd`) | 68 (60 reached from `main.fd`) | 158,516 |
+| Rust compiler (`src/*.rs`, frozen) | 57 | 112,598 |
+| Stdlib (`stdlib/*.fd`) | 146 | 51,496 |
+| Native runtimes (`stdlib/pe_runtime/`, `stdlib/linux_runtime/`) | 4 + 5 | 5,688 + 5,627 |
+| Tests (`tests/bootstrap/`) | 543 .fd (502 top level, 105 expected-fail) | — |
+| Tests (`tests/selfhost/`) | 51 .fd | — |
+| Tests (`tests/conformance/`) | 104 .fd (each checks a rule of reference.md) | — |
+| Tests (`tests/leaks/`) | 3 .fd + .expected (`scripts/leak-check.sh`) | — |
+| Examples (`examples/`) | 11 .fd | — |
+| Installer (`installer/`) | 5 | — |
+
+| Measurement | Value |
+|-------------|-------|
+| Last full suite (Rust harness, `fidesc` as the compiler) | Nov 2: interp 339/339, C 343/343, PE 345/345, expected-fail 89/89 |
+| Full suite with `fid` as the compiler | not run |
+| Native Linux suite (`NATIVE=1 scripts/cross-test.sh`, Nov 9) | AArch64 273, RISC-V 271, x86-64 272 of 317 match the interpreter |
+| Windows x64 on the machine layer (`fid emit --nat`, Nov 9) | 301 of 338 |
+| Bootstrap fixpoint | stage 2 C == stage 3 C: Nov 6 (49 MB), Nov 8 (67 MB, ownership 0004) |
+| Self-compile (`dump-c compiler/main.fd`) | Nov 9: 74 s with the compiler built at -O2 in 8 split units (type check 18 s, borrow check 5, mono 5, lowering 24, C 20), 229 s at -O0; Nov 6: ~133 s; `fidesc`: ~21 s |
+
+Session 30 (Oct 2026) for comparison: compiler 54 files / 104,439 lines, Rust
+55 / 100,935, stdlib 104 / 30,446, 302 bootstrap tests.
+
+### Status at v1.0.0 (Sep 9, 2026; history)
 
 - **🎉 v1.0.0 RELEASED!** — Windows installer (`Fides-Setup-1.0.0.exe`, 2.5 MB)
   tested and working on Windows. Users can download, install, and compile
@@ -138,20 +168,6 @@ cargo build --release
 - **23/23 self-host tests pass** on interp + PE (tests/compiler/)
 - **Strict fixpoint (VERIFIED)** — `fides-c4.c` == `fides-c5.c` (byte-identical, ~29.7 MB) re-verified in session 29. The earlier `fides-c2.c` == `fides-c3.c` proof (session 15) was superseded, not lost.
 
-#### Codebase size (Nov 6, 2026, `wc -l`)
-| Component | Files | Lines |
-|-----------|-------|-------|
-| Self-hosted compiler (`compiler/*.fd`) | 61 | 133,688 |
-| Rust compiler (`src/*.rs`) | 57 | 112,511 |
-| Stdlib (`stdlib/*.fd`) | 137 (+ 4 in `pe_runtime/`) | 43,576 |
-| Tests (`tests/bootstrap/`) | 493 .fd (452 top level, 91 expected-fail) | — |
-| Tests (`tests/selfhost/`) | 51 .fd | — |
-| Examples | 10 | — |
-| Installer (`installer/`) | 5 | — |
-
-Session 30 (Oct 2026) for comparison: compiler 54 files / 104,439 lines, Rust
-55 / 100,935, stdlib 104 / 30,446, 302 bootstrap tests.
-
 #### Test results (v1.0.0, Session 24)
 | Backend | Result |
 |---------|--------|
@@ -190,7 +206,7 @@ Pre-existing failures (documented in `known-bugs.md` §2b.8): test_codegen_c, te
 13. Integrate Linux native codegen (port `elf64.rs`, `linker.rs`, `runtime_linux.rs`, wire into pipeline)
 14. ~~Assess debugger.rs porting feasibility~~ — **ASSESSED (session 9): NOT feasible without porting interp.rs (5,834 LOC, 251 runtime handlers, closures for debug hooks). Skip — debugger is a dev tool, not needed for self-hosting.**
 
-See `docs/roadmap/roadmap.md` for the comprehensive gap analysis (Categories A–F) and `docs/selfhost/known-bugs.md` for the full bug history.
+See `docs/roadmap/roadmap.md` for the comprehensive gap analysis (Categories A–F) and `docs/reference/known-bugs.md` for the full bug history.
 
 ### For Parallel Sessions
 
@@ -241,10 +257,10 @@ If a test fails, understand why before fixing. Do not guess. Use the tools:
 
 Every session, in this order:
 
-1. `CURRENT.md` — what is the current blocker and where we stopped.
+1. `AGENTS.md` → Current Baseline and Known Bugs — the current state and open items.
 2. `AGENTS.md` — build/test commands and high-risk files.
-3. `docs/selfhost/selfhost.md` — this docs index.
-4. The relevant section of `docs/selfhost/selfhost.md` § Architecture or § Language Constraints or `calling-conventions.md`.
+3. `docs/reference/selfhost.md` — this file.
+4. The relevant section of `docs/reference/selfhost.md` § Architecture or § Language Constraints or `calling-conventions.md`.
 5. `docs/roadmap/roadmap.md` — the phase you are in.
 
 ---
@@ -470,14 +486,14 @@ Tells you whether the divergence is in lexer, parser, IR, or C codegen.
 If you discover new information about the self-hosted compiler, update these
 files:
 
-- `CURRENT.md` — current focus and blocker
+- `AGENTS.md` → Current Baseline and `docs/reference/selfhost.md` → Numbers — counts and state
 - `docs/roadmap/roadmap.md` — phase status and known tasks (SH-13 for PE emitter)
-- `docs/selfhost/known-bugs.md` — new bugs or gotchas
-- `docs/selfhost/calling-conventions.md` — new low-level conventions
-- `docs/selfhost/selfhost.md` § Architecture — new modules or pipeline changes
+- `docs/reference/known-bugs.md` — new bugs or gotchas
+- `docs/reference/calling-conventions.md` — new low-level conventions
+- `docs/reference/selfhost.md` § Architecture and `docs/file-analysis/<module>.md` — new modules or pipeline changes
 
 Do **not** create new files for every small note. Prefer appending to the
-existing files in `docs/selfhost/`.
+existing files in `docs/reference/`.
 
 ---
 
@@ -496,14 +512,14 @@ Otherwise, keep trying reasonable approaches, run the tools, and verify.
 
 ### 10. Quick Checklist for Every Session
 
-- [ ] Read `CURRENT.md`.
-- [ ] Read the relevant `docs/selfhost/*.md` files.
+- [ ] Read `AGENTS.md` → Current Baseline.
+- [ ] Read the relevant `docs/reference/*.md` and `docs/file-analysis/*.md` files.
 - [ ] Run `./verify.sh` (or at least check the current state).
 - [ ] Make the smallest change that fixes the issue.
 - [ ] Rebuild the self-hosted compiler if `compiler/*.fd` changed.
 - [ ] Run the relevant tests.
 - [ ] Run `./verify.sh` and `./verify-selfhost.sh` before declaring done.
-- [ ] Update `CURRENT.md` and `docs/selfhost/` if you learned something new.
+- [ ] Update `AGENTS.md` and `docs/reference/` if you learned something new.
 
 
 ## Coordination
@@ -526,7 +542,7 @@ Otherwise, keep trying reasonable approaches, run the tools, and verify.
 2. Check "Active Sessions" — are any sessions working on files you need?
 3. Check "Architectural Decisions" — has a direction changed since you last read the docs?
 4. Add your session to "Active Sessions" with the files you plan to touch.
-5. Read `CURRENT.md` for the current blocker.
+5. Read `AGENTS.md` → Current Baseline for the current state.
 
 #### During work
 1. If you make an architectural decision, add it to "Architectural Decisions" immediately.
@@ -535,9 +551,9 @@ Otherwise, keep trying reasonable approaches, run the tools, and verify.
 
 #### After finishing
 1. Run `./verify.sh` and `./verify-selfhost.sh`.
-2. Update `CURRENT.md` with what you did.
+2. Update `AGENTS.md` → Current Baseline and `docs/reference/changelog.md` with what you did.
 3. Remove your session from "Active Sessions".
-4. Update relevant docs in `docs/selfhost/` if you learned something new.
+4. Update relevant docs in `docs/reference/` if you learned something new.
 
 ---
 
@@ -801,7 +817,7 @@ differential testing.
 - Comptime evaluation handled by `comptime_eval.fd` (AST-level)
 - `interp.rs` (5782 lines) has features not needed for self-hosting
 
-**Status:** `flat_ast.fd` builds successfully. `ast.fd` changes verified —
+**Status (session 9; Nov 9: `flat_ast.fd` no longer passes `fid check` and nothing imports it):** `flat_ast.fd` builds successfully. `ast.fd` changes verified —
 all 22/23 self-host tests still pass (1 pre-existing failure in
 `test_codegen_c.fd` due to missing `p_sb_new` runtime function).
 
@@ -1048,7 +1064,7 @@ runtime, float arithmetic, many-arg function calls. See SH-13 sub-tasks in
 #### [F4] Self-compilation works — Sep 9, 2026 (session 4)
 
 `fides-c.exe` successfully compiles `compiler/main.fd` → `fides-c2.exe`.
-Six bugs were fixed to achieve this (see `docs/selfhost/known-bugs.md`
+Six bugs were fixed to achieve this (see `docs/reference/known-bugs.md`
 sections 1.11-1.16). The generated `fides-c2.exe` correctly compiles
 `test_strconcat.fd` → "hello world".
 
@@ -1091,8 +1107,8 @@ This means `Inst::Load` with `IrType::Struct(_)` reads 8 bytes (a pointer), not 
 
 Before touching any file:
 
-- [ ] Read this file (`docs/selfhost/selfhost.md` § Coordination)
-- [ ] Read `CURRENT.md`
+- [ ] Read this file (`docs/reference/selfhost.md` § Coordination)
+- [ ] Read `AGENTS.md` → Current Baseline
 - [ ] Check "Active Sessions" — no conflicts with your planned files
 - [ ] Check "Architectural Decisions" — no direction changes since last time
 - [ ] Run `./verify.sh` to confirm baseline
@@ -1123,15 +1139,15 @@ Before touching any file:
 | `compiler/lsp.fd` | Fides LSP server — must mirror `src/lsp.rs` | This file |
 | `compiler/main.fd` | CLI entry point — `.exe` extension, command dispatch, `lsp` command | This file |
 | `compiler/ast.fd` | Canonical AST — changes require updating `box_*_unbox` everywhere | This file |
-| `CURRENT.md` | Current status — update after every milestone | Session that completes a milestone |
+| `AGENTS.md` → Current Baseline | Current status — update after every milestone | Session that completes a milestone |
 
 ---
 
 ### Session Protocol
 
 #### Starting a session
-1. Read this file + `CURRENT.md` + `AGENTS.md`.
-2. Pick a task from `CURRENT.md` "Next steps" or from the roadmap.
+1. Read this file + `AGENTS.md`.
+2. Pick a task from the roadmaps (`docs/roadmap/`).
 3. Add your session to "Active Sessions" with the files you'll touch.
 4. Run `./verify.sh`.
 
@@ -1143,8 +1159,8 @@ Before touching any file:
 
 #### Finishing a session
 1. Run `./verify.sh` and `./verify-selfhost.sh`.
-2. Update `CURRENT.md` with what you did and the new state.
-3. Update relevant docs in `docs/selfhost/`.
+2. Update `AGENTS.md` → Current Baseline and `docs/reference/changelog.md` with what you did and the new state.
+3. Update relevant docs in `docs/reference/`.
 4. Remove your session from "Active Sessions".
 5. Commit your changes.
 
@@ -1152,7 +1168,7 @@ Before touching any file:
 
 ### Common Mistakes to Avoid
 
-1. **Following outdated docs.** Always check "Architectural Decisions" first. The docs in `docs/selfhost/` may be stale.
+1. **Following outdated docs.** Always check "Architectural Decisions" first. The docs in `docs/reference/` may be stale.
 
 2. **Editing files another session is working on.** Check "Active Sessions" first.
 
@@ -1173,6 +1189,12 @@ Before touching any file:
 
 > File-by-file breakdown of the self-hosted compiler modules in `compiler/`.
 >
+> **Historical (sessions 11–20).** The current description of every module
+> (role, callers, the commands that reach it, open problems with line
+> numbers) is `docs/file-analysis/<module>.md`, rewritten for all 68 modules
+> on Nov 9, 2026; the one-line map is in INDEX.md. Known issues listed below
+> were mostly fixed since; known-bugs.md §2g has the open ones.
+>
 > **Last updated:** Sep 6, 2026 (session 16 — Tier 3 OS features added: @cpu_local, inline asm clobbers, --no-std, UEFI bindings. Bootstrap fixpoint preserved.)
 >
 > **Note on line numbers:** Source line numbers in "Known issues (session 11
@@ -1180,7 +1202,7 @@ Before touching any file:
 > sessions 12–14. Treat them as approximate guides, not exact references.
 > Re-verify with `grep` before editing based on these numbers.
 >
-> **Module count:** 61 `.fd` files in `compiler/` (133,688 lines, Nov 6);
+> **Module count:** 68 `.fd` files in `compiler/` (158,516 lines, Nov 9);
 > the breakdown below was written for the 25 modules of session 16 (57,021
 > lines) and does not cover the later ones (among them `interp.fd`,
 > `escape.fd`, `secrecy.fd`, `checks.fd`, `iropt.fd`, `pe_ir*.fd`,
@@ -1428,7 +1450,7 @@ must use the `ast.fd` canonical enums; `lower.fd` needs to be reconciled to them
   (lines 1637-1639) and `parse_model` (lines 1704-1706). **P0.**
 - **`parse_use` version-pin always errors** — lines 4684-4695: even when a
   valid version string is found, the function returns `Err`. **P1.**
-- **`parse_fstring_parts` is a stub** — line 4847: f-string interpolation is
+- **`parse_fstring_parts` is a stub** (fixed since; Nov 9) — line 4847: f-string interpolation is
   extracted as raw text, not parsed. **P2.**
 - **Non-exhaustive `match` patterns** — several helper functions
   (`expect_ident`, `read_type_name`, `parse_type` extraction, `parse_pattern`
@@ -1447,7 +1469,7 @@ must use the `ast.fd` canonical enums; `lower.fd` needs to be reconciled to them
 
 #### Known issues (session 11 analysis)
 
-- **13 empty safety verification stubs** — lines 1451-1505: `verify_conserve`,
+- **13 empty safety verification stubs** (implemented since, each rule with a negative test; Nov 9) — lines 1451-1505: `verify_conserve`,
   `verify_gas`, `verify_safety_annotations`, `verify_constant_time`,
   `verify_realtime`, `verify_differentiable`, `verify_quantized`,
   `verify_checkpoint`, `verify_dp`, `verify_shard`, `verify_adapter`,
@@ -1986,7 +2008,7 @@ Download `Fides-Setup-1.0.0.exe` from
 [GitHub Releases](https://github.com/pledgeandgrow/fid/releases/tag/v1.0.0)
 and run it. This installs:
 - the compilers to `C:\Program Files\Fides\` (`installer/fides.nsi` today ships `fid.exe`, the self-hosted compiler, plus `fidesc.exe`, `ark.exe`, `scribe.exe`, `veil.exe`)
-- Standard library to `C:\Program Files\Fides\stdlib\` (99 modules in v1.0.0; 137 in the tree on Nov 6)
+- Standard library to `C:\Program Files\Fides\stdlib\` (99 modules in v1.0.0; 146 in the tree on Nov 9)
 - C runtime files to `C:\Program Files\Fides\runtime\`
 - Documentation to `C:\Program Files\Fides\docs\`
 - PATH integration (system-wide)
@@ -2409,7 +2431,7 @@ Probe tests for self-hosting behavior:
 
 ```
 fid/
-├── compiler/             # Self-hosted Fides compiler modules (61 .fd files, 133,688 lines, Nov 6; list below is from session 16)
+├── compiler/             # Self-hosted Fides compiler modules (68 .fd files, 158,516 lines, Nov 9; list below is from session 16)
 │   ├── main.fd           # CLI entry point (ccompile + build + lsp + test + fmt + ...)
 │   ├── compiler.fd       # Pipeline driver
 │   ├── token.fd          # Token kinds (133 variants)
@@ -2435,11 +2457,11 @@ fid/
 │   ├── diag.fd           # Structured diagnostics
 │   ├── json.fd           # JSON parser/serializer
 │   └── inc.fd            # Incremental compilation cache
-├── docs/selfhost/        # This documentation
+├── docs/reference/       # This documentation (selfhost.md, known-bugs.md, ...)
 ├── release/              # Self-hosted build artifacts (gitignored)
 ├── src/                  # Rust reference compiler, frozen (57 .rs files, 112,511 lines)
-├── stdlib/               # Fides standard library (137 .fd modules, 43,576 lines)
-├── tests/bootstrap/      # Language tests (493 .fd files)
+├── stdlib/               # Fides standard library (146 .fd modules, 51,496 lines)
+├── tests/bootstrap/      # Language tests (543 .fd files)
 ├── tests/selfhost/       # Self-host module tests (51 .fd files)
 ├── tests/selfhost/       # Bootstrap probe tests
 ├── target/               # Rust build artifacts
@@ -4385,7 +4407,7 @@ diff fides-self fides-self-2  # must be identical
 
 **Total: 25 files, 61,145 LOC. Bootstrap fixpoint achieved (session 15).**
 
-#### Session 20 Additions (19 new files, 14,577 LOC)
+#### Session 20 Additions (19 new files, 14,577 LOC; historical — current status per module in docs/file-analysis/)
 
 **Ported from Rust reference (12 modules):**
 

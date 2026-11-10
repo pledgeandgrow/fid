@@ -1,79 +1,56 @@
-# diag.fd — structured diagnostics (659 LOC)
+# diag.fd
 
-> **Re-verified 2026-10-23:** still dead — zero importers; self-hosted compiler still emits bare strings (no error codes/context/suggestions).
+> **Re-audited 2026-11-09** against the current source and the latest `fid` build (s18).
+> Still dead, and now it no longer type-checks.
 
-## Role
+- **Path:** `compiler/diag.fd`
+- **LOC:** 659 (Rust `src/diag.rs`: 463)
+- **Role:** structured diagnostics: `Severity`, `ErrCode` (37 codes, `E001`..`E999`), `Diag`
+  (source line, caret span, help, notes), `DiagList`, ANSI color rendering, `diag_extract_line`,
+  Levenshtein "did you mean".
 
-Structured diagnostic system: `Severity`/`ErrCode` enums, `Diag` struct
-with source context + caret spans + help/notes, `DiagList` accumulator,
-color rendering, `diag_extract_line`, Levenshtein "did you mean".
-Port of `src/diag.rs` (463 LOC, "SH-6.2 rewrite").
-
-## Where it's called
+## Callers
 
 | Caller | Site | What |
-|--------|------|------|
-| — | — | **Nothing.** Zero `use compiler::diag`; zero references to `Diag_*`/`ErrCode_*`/`diag_*` outside the file. |
+|---|---|---|
+| `tests/selfhost/test_diag.fd`, `tests/selfhost/test_sl_debug.fd` | `use compiler::diag` | tests only |
+| compiler | — | nothing. No `use compiler::diag` in `compiler/` or `stdlib/`. |
 
-Rust wires it in: `compiler.rs` uses `ErrCode`/`error_with_source`,
-`main.rs` calls `diag::set_color`, `typechecker.rs:3973` delegates
-did-you-mean to `diag::levenshtein`. **All call sites dropped in the
-port** — the self-hosted pipeline reports errors as bare strings
-(`ResultProgram::Err(Vec<str>)` → printed raw in main.fd:784-787; the
-LSP gets `StrTriple`s from `compiler.fd::get_diagnostics`). Sixth dead
-module (autograd, codegen, coff, cparser, debugger, this).
+Not reached from any CLI command. The self-hosted compiler formats errors as plain strings in
+`compiler.fd` `enrich_errors` (:408): `error: Type error (line N): ...`, then `--> file:line:col`,
+the source line and a caret. No error code, no did-you-mean.
 
 ## Findings
 
-### F1 — Structured diagnostics exist but nothing emits them — HIGH (gap)
+### Verified live
 
-Every error the self-hosted compiler produces is a plain string — no
-error codes, no source-context caret, no did-you-mean suggestions,
-no notes/help. Rust users get `error[E044]: type mismatch` with the
-offending line; self-hosted users get `errors.get(i)` verbatim. This is
-the single largest *user-visible* regression in the port so far, and the
-fix is call-site wiring (typechecker/parser would need to return `Diag`
-or `ErrCode` instead of `str`) — a large refactor, not a bug fix.
+- **HIGH — NEW — the module does not compile.** `fid check compiler/diag.fd` gives 4 errors:
+  `Diag_with_source` (:276), `Diag_with_span` (:283), `Diag_with_help` (:294), `Diag_with_note`
+  (:301) change their by-value parameter `d` ("the caller would not see the change"). The
+  type checker now rejects this. `tests/selfhost/test_diag.fd` therefore cannot build either.
+- **HIGH — STILL TRUE — nothing emits structured diagnostics.** fid errors carry no `Exxx` code
+  and no suggestion. Partial change: source context and caret now exist, from `enrich_errors`
+  in compiler.fd, not from this module.
 
-### F2 — Gutter line number never printed — LOW (inherited)
+### From code inspection
 
-`Diag_render` (:402-412) computes `line_str`/`line_width` then emits
-`line_width` **spaces** — the source line renders as `   | code` with no
-number, despite the comment saying `"  2 | val x: str = 42;"`. Rust
-(src:276-278) does the identical thing — `" ".repeat(line_width)` —
-inherited cosmetic bug; the `--> file:line:col` header still carries
-the location.
+- **LOW — STILL TRUE — gutter prints spaces, not the line number** (:402-405,
+  `diag_repeat_char(32, line_width)`). `enrich_errors` output has the same look (`   | code`).
+- **LOW — `DiagList` keeps rendered strings and an untyped `Vec`** (:474-482). The comment says
+  Vecs cannot hold structs; that limit is gone (structs are held in Vec buffers, AGENTS.md item 25).
+- **INFO — workarounds for old interpreter bugs** remain: `p_str_concat(cand, "")` as a copy
+  (:648), `Severity_*()` / `ErrCode_*()` constructor shims (:65-68, :172-204).
+- **INFO — 37 codes, several for passes no self-hosted check produces** (medical, gas,
+  conservation).
 
-### F3 — Adaptation notes — INFO
+## Fix order
 
-- Color: Rust's global `AtomicBool` + `set_color` → a `use_color` param
-  threaded through render. Reasonable (Fides has no module-level `var`),
-  but every future caller must plumb it.
-- `DiagList` stores **rendered strings**, not `Diag`s — comment cites a
-  Vec-can't-hold-structs limitation (:474-476) — same interp family as
-  the `&mut Vec` no-op from run 2. `has_errors` works via a parallel
-  counter.
-- `diag_suggest_did_you_mean` uses `p_str_concat(cand, "")` as a
-  str-copy workaround (:648) — "str-to-str assignment from Vec.get
-  doesn't work in the interpreter".
-- `diag_levenshtein` is a correct two-row byte-wise impl; `suggest`
-  threshold ≤2.
-- Constructor functions (`Severity_error()`, `ErrCode_*()`) exist for
-  "enum names not visible across imports" — a parser limitation shim
-  that generated ~40 lines of boilerplate.
-
-### F4 — ErrCode coverage gap — LOW
-
-37 codes vs Rust's enum; `Internal`→E999, `Custom`→E000. Codes exist for
-borrowck/capability/conservation/medical that no self-hosted pass
-produces — the vocabulary outlives its speakers.
+1. Make the four builders copy first (`var d = d;`) so the file compiles again.
+2. Decide: wire it into `enrich_errors` (codes, did-you-mean via `diag_levenshtein`) or delete it
+   and its two tests.
 
 ## Verification state
 
-- Dead status verified: no importer anywhere in `compiler/` or `stdlib/`.
-- Render path reviewed against Rust: faithful including the gutter quirk.
-- Can't be exercised — nothing calls it.
-
-## Next
-
-`elf64.fd` — the ELF object writer/encoder (HIGH-risk per AGENTS.md).
+- `fid check compiler/diag.fd`: 4 errors (above). `fid lint` reports the same 4 errors.
+- Importers by grep over `compiler/`, `stdlib/`, `tests/`.
+- Live error format observed in several `fid run` probes this session.

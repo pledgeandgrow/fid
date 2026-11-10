@@ -1,157 +1,155 @@
-# borrowck.fd — Borrow checker (2,067 LOC)
+# borrowck.fd — Borrow checker
 
-> **Re-verified 2026-10-23:** headline findings confirmed — `--borrowck=warn` still silent (caller reads `bc.errors`), 9× `_ => {}` catch-alls still hide casts/pipes/tuples. Rule-3 field/deref skip mechanism consistent with source; exact arm not re-traced.
+> **Re-audited 2026-11-09** against the current source, with live probes
+> (`s18.exe run`). Fixed since 10-22: field assignment on a variable,
+> trait impl bodies, read-only methods, `for`-loop invalidation, the dead
+> no-std checker. Still open: `--borrowck=warn` prints nothing, catch-alls
+> hide casts and tuples, nested field writes, closures.
 
-## Role
+- **Path:** `compiler/borrowck.fd`
+- **LOC:** 2,230 (was 2,067 on 10-22; Rust `src/borrowck.rs`: 1,221)
+- **Role:** Lexical/NLL borrow checker, a separate pass after type checking, escape and secrecy, before comptime `substitute` and mono.
+- **Imports:** `core`, `vec`, `string`, `compiler::ast`.
 
-Lexical/NLL borrow checker — a separate pass that runs **after typecheck, before
-comptime substitution and monomorphization**. Port of `src/borrowck.rs` (1,221 LOC).
+Rules (header :7-10): (1) `&mut x` while any borrow of x is active; (2) `&x`
+while `&mut x` is active; (3) changing x while any borrow of x is active.
+Also: field-path borrows (`&s.x` and `&s.y` coexist), `&v[i]` borrows `v`
+(:982, release K5), two-phase `&mut` in call arguments, NLL release at the
+borrower's last read, closure captures, and changing a Vec a `for` loop
+walks (`iterating`, :1318 and :1226, release K4). Errors name the borrow that
+holds the place and how to free it (`holder_note` :1187, CM2).
 
-Three rules (header :7-10):
-1. `&mut x` while any borrow on x is active → error
-2. `&x` while `&mut x` is active → error
-3. mutating `x` while any borrow on x is active → error
-
-Field-path borrows (`&s.x` vs `&s.y` coexist), two-phase borrows (Phase 4:
-reserved `&mut` in call args), NLL release at borrower's last use (Phase 6),
-closure-capture borrow tracking. Modes: `--borrowck=off|warn|on` (default on).
-
-## Where it's called
+## Callers
 
 | Caller | Site | What |
 |--------|------|------|
-| `compiler/main.fd:76` | `borrowck_mode_parse(bval)` | parses `--borrowck=` CLI flag |
-| `compiler/main.fd:127-131,643,1442,1754` | mode threaded through all cmd_* | string `off/warn/on` → pipeline |
-| `compiler/compiler.fd:1332-1333` | `BorrowChecker_new(mode)` + `check(&mut bc, program)` | **the only real invocation** — after typecheck+lints, before `substitute()`/`monomorphize` |
-| `compiler/compiler.fd:848` | `BorrowChecker_new(BorrowckMode::Off)` | **dead code** — created in no-std path, `check()` never called, value dropped |
+| `main.fd:95` | `borrowck_mode_parse(bval)` | `--borrowck=` flag (`off/0/no`, `warn/warning/w`, `on/1/yes/err/error`) |
+| `compiler.fd:1722-1755` | `BorrowChecker_new(mode)`, `bc.skip_bodies = core_skip`, `check`, `BorrowChecker_free_maps` | main pipeline, after lints |
+| `compiler.fd:898-926` | same, no core skip | no-std path (the dead `BorrowChecker_new(Off)` is gone) |
+| `tests/selfhost/test_borrowck.fd` | | self-host test |
 
-`pattern_bindings`/`str_to_lower`/`box_expr_unbox` are `pub` but have no callers
-outside the module (`box_expr_unbox` duplicates `ast.fd:1001` — 45-line copy).
-
-## Live verification (fidesc = Rust oracle; Fides ports logic verbatim)
-
-| Test | Result |
-|------|--------|
-| `val a = &x; x = 9;` | REJECTED — rule 3 works for whole vars |
-| `val r = &s.x; s.x = 99;` | **ACCEPTED** — field-write hole (see F2) |
-| `g(&mut x, &mut x)` | REJECTED — "mutable borrow already reserved" (two-phase works) |
-| `g(&mut x, &mut x) as i64` | **ACCEPTED** — Cast hides the call (see F3) |
-| `val r = &mut x; x = 1;` | ACCEPTED — Rust releases never-read borrow (Fides diverges, see F4) |
-| lint on the file | **blocked** — transitive `compiler/ast.fd:344` `Vec<Vec<Stmt>>` hits the in-progress split_gt parser work (`expected > but got 'Shr'`); same for autograd. Not a borrowck issue. |
+Not run by `lint` (`lint_source`). `pattern_bindings`, `str_to_lower` and
+`bc_box_expr_unbox` are `pub` with no outside callers; `str_to_lower`
+(:2051) duplicates core's (`stdlib/core.fd:3911`).
 
 ## Findings
 
-### F1 — `--borrowck=warn` prints nothing (caller regression) — HIGH
+### Verified live
 
-`violation()` (:1248-1251) routes Warn-mode messages to `bc.warnings`.
-But `compiler.fd:1340-1348` iterates **`bc.errors`** in the warn branch — always
-empty in Warn mode. Result: warn mode produces zero output and never fails —
-functionally identical to `off` (minus the wasted analysis time).
+#### HIGH — `--borrowck=warn` prints nothing (caller reads the wrong list)
 
-Rust got it right: `src/compiler.rs:543-546` iterates `bc.warnings`.
-**Fix:** in `compiler.fd`, loop `bc.warnings` (and drop the `bc.errors.len() > 0`
-gate for warn). 3-line fix in the caller; borrowck itself is correct.
+`violation` (:1355-1359) puts Warn-mode messages in `bc.warnings`. Both
+callers print `bc.errors` in their warn branch (compiler.fd:1735-1750 and
+:907-922), which is empty in Warn mode. Probe: `val r = &x; x = 9;` is an
+error with the default mode and prints no warning with `--borrowck=warn`;
+warn behaves as `off`. (`README.md:61` advertises `--borrowck=warn`.)
 
-### F2 — FieldAssign / DerefAssign skip Rule 3 — HIGH (inherited from Rust)
+#### HIGH — catch-alls hide casts, tuples, pipes
 
-`check_stmt` (:1289-1302): `IndexAssign` calls `check_mutation(array)` ✓ but
-`FieldAssign` and `DerefAssign` only `check_expr` the operands — **no mutation
-check**. `s.x = 99` while `&s.x` (or `&s`) is live is silently accepted —
-verified live (prints `1`, no error).
+`check_expr` ends in `_ => {}` (:1986), `collect_var_uses_expr` too (:791).
+Not walked: `Cast`, `QuantCast`, `IsCheck`, `PipeForward`, `TupleLit`, `Asm`,
+`Comptime`, `ComptimeBlock`, `ComptimeReflect`. Probe:
+`g(&mut x, &mut x) as i64` compiles and prints 2 (both writes through one
+variable); without `as i64` it is rejected.
 
-Identical in `src/borrowck.rs:853-866` → inherited design gap, not port drift.
-**Fix:** `FieldAssign`: `extract_field_path(object)` → `check_mutation(path)`.
-`DerefAssign` needs points-to tracking the checker lacks — at minimum document.
+#### MEDIUM — a nested field write is not checked
 
-### F3 — `_ => {}` fallthroughs hide whole Expr families — HIGH (inherited)
+`FieldAssign` checks only an `Expr::Ident` object (:1422-1433). Probe:
+`val r: &In = &s.a; s.a.z = 99; print(r.z)` compiles and prints 99. One-level
+`s.x = 99` while `&s.x` is live is rejected (fixed). `DerefAssign` still has
+no mutation check (:1413-1416).
 
-Both `check_expr` (:1823) and `collect_var_uses_expr` (:742) end in catch-alls.
-Unhandled variants with expr children: **`Cast`, `QuantCast`, `IsCheck`,
-`PipeForward`, `Asm`, `Comptime`, `ComptimeBlock`, `ComptimeReflect`, `TupleLit`**.
+#### MEDIUM — a closure that changes a captured Vec conflicts with itself
 
-Consequences, verified live:
-- `g(&mut x, &mut x) as i64` — the call is never walked → **double-`&mut`
-  accepted**. `val t = (&mut x, &mut x)` same via TupleLit.
-- NLL `last_use` under-recorded for uses inside those exprs → borrows released
-  early (wrong-accept) or, combined with F4, wrongly reported.
+`v.push(1)` inside a closure is not seen as a write by
+`collect_assigned_stmt_fd` (Assign/FieldAssign only, :2180), so the capture
+is a shared borrow (:1970-1972); checking the body then sees `v.push` as a
+change of `v` while that borrow is held. Probe: `val f = fn() { v.push(1); };`
+is rejected: "cannot mutate v: shared borrow(s) are active ... Held by: a
+closure that captures 'v' (&v, line 0)". Capture borrows also use line 0
+(:1972).
 
-With the ast.fd finding (typechecker can't catch a missing match arm), the only
-safe pattern is **explicit arms for every variant** — delete the catch-alls.
+#### MEDIUM — a borrow that is never read lives to the end of the scope
 
-### F4 — Port drift: never-read borrowers never released — MEDIUM
+`collect_var_uses_stmt` does not record a definition as a use (:399-415), so
+`release_dead_borrows` (:832) never frees a borrower that is never read.
+Probe: `val r = &mut x; x = 1;` is rejected (Rust's checker and rustc accept
+it). Stricter than the reference; intended per the comment, untested.
 
-Rust `collect_var_uses_stmt` records the **defined** name (`src/borrowck.rs:230`
-`self.last_use.insert(name, idx)` for Let/LetTuple/LetUninit/Assign targets).
-The Fides port (:360-378) deliberately omits this — comment: "a definition is
-not a 'use' in NLL… the borrow persists until scope end."
+### Code inspection
 
-Net effect: `val r = &mut x; x = 1;` — Rust releases r's borrow at stmt 1 →
-**accepts** (verified). Fides: `last_use(r)` unset → `release_dead_borrows`
-guard `last >= 0` fails → borrow held to scope end → **rejects** (false positive
-vs the reference oracle and rustc NLL). Intentional-looking but divergent —
-either restore Rust behavior or document + test the stricter semantics.
+#### MEDIUM — closure capture checking is partial
 
-### F5 — Closure-capture checking is multiply broken — MEDIUM
+- `collect_captures_stmt_fd` / `_expr_fd` (:2071-2167) end in `_ => {}`:
+  captures inside struct/array/enum literals, `if`/`match` expressions,
+  f-strings, `match` statements, loops, etc. are missed.
+- Capture borrows are pushed into the closure's own scope (:1936, :1973) and
+  released at its end (:1982): a closure that escapes (stored, returned)
+  holds no borrow afterwards.
 
-`Expr::Closure` (:1769-1820):
-- `collect_captures_expr_fd` (:2002) has its own `_ => {}` — misses captures in
-  StructLit/ArrayLit/If/Match/Deref/StrConcat/etc → under-collected.
-- Capture borrows are pushed to the closure's scope → released at `pop_scope`
-  → an **escaping** closure keeps no borrow → wrong-accept.
-- `is_mut` inferred only from `Assign`/`FieldAssign` — `v.push(x)` in a closure
-  counts as *shared* capture → misclassified.
-- Compounded by the proven interp `&mut Vec` no-op (arm64_enc report):
-  `collect_captures_stmt_fd(..., &mut captured)` writes nothing under
-  `fidesc run` → capture checking is a complete no-op in the interpreter;
-  only the C backend sees it.
+#### LOW — the header says `unsafe` skips all checks
 
-### F6 — All method calls treated as mutations — MEDIUM (design cap)
+Header :12 and :1606. `unsafe_depth` only stops borrow creation (:1891,
+:1999) and capture borrows (:1969); `check_mutation` still runs inside
+`unsafe`.
 
-`Expr::MethodCall` (:1664) `check_mutation(name, 0)` for **every** call on an
-Ident receiver: `v.len()` while `&v` is live → spurious error. Rust has the same
-approximation — but Rust's `BorrowChecker::new(&tc, mode)` holds the
-typechecker; Fides `BorrowChecker_new(mode)` **dropped the tc param**, so
-type-aware fixes aren't even possible here. Also: `line=0` → errors report
-"line 0" (visible in T5 output).
+#### LOW — a borrow nested in an initializer is not promoted
 
-### F7 — `unsafe` doc vs behavior — LOW
+`maybe_record_borrow_from_expr` (:1996) promotes only a bare `Expr::Ref`
+initializer. `val a = (&x, 1)` or `val a = if c { &x } else { &y }` leaves a
+`__tmp_ref_N` borrow to the end of the scope and does not tie it to `a`.
 
-Header (:12): "unsafe { ... } blocks skip all checks". Actually `unsafe_depth`
-only gates Ref-borrow creation (:1728) and capture borrows (:1806) —
-`check_mutation` still fires inside unsafe (`test_borrowck.fd:60-65` relies on
-this: `*r1 = 1` under unsafe). Fix the comment.
+#### LOW — method calls are matched by name
 
-### F8 — Temp-borrow leaks in non-trivial initializers — LOW-MEDIUM
+`bc_read_method` (:1365) lists read-only methods; any other method on an
+`Ident` receiver is a change (:1805, :1827), whatever the receiver's type.
+`BorrowChecker_new` takes no typechecker, so it cannot ask. A user method
+named `get` that changes its receiver is treated as a read.
 
-`maybe_record_borrow_from_expr` (:1833) only promotes a bare `Expr::Ref`
-initializer. A `Ref` nested deeper (`val a = &x + f(0)`, tuples, match arms)
-leaves its `__tmp_ref_N` borrow live to scope end — over-conservative false
-positives — and `a` is never registered as a borrower.
+#### INFO — cost
 
-### F9 — Misc — LOW
+All maps are Vecs searched linearly; `last_use` has an index
+(`last_use_index`, release D8). Off mode returns at once (:296). Core bodies
+are skipped once a core was checked clean (`skip_bodies`, D9). Borrow check
+of the compiler itself took 16 s on Nov 6 (language-guide § 10).
 
-- `compiler.fd:848` dead `BorrowChecker_new(Off)` — remove.
-- NLL granularity is top-level-statement-only (:330 `stmt_index = i`); nested
-  uses collapse to the enclosing index — documented-but-coarse.
-- Everything is `Vec`-linear-scan (O(vars²) per function); header admits
-  "extremely slow on stdlib" — the Off early-out (:273) exists because of this.
-- `str_to_lower`/`pattern_bindings`/`box_expr_unbox` local copies — drift risk
-  with the typechecker/ast versions; share or dedupe.
-- `check` skips entirely in Off mode (:273) — good; but the `errors`/`warnings`
-  vecs persist across `check_func` calls by design (accumulation).
+## Status of the 2026-10-22 findings
+
+| Finding | Status |
+|---------|--------|
+| F1 `--borrowck=warn` silent | **STILL TRUE** — compiler.fd:1740 and :914 read `bc.errors`. |
+| F2 FieldAssign / DerefAssign skip rule 3 | **CHANGED** — `s.x = ..` on a variable is checked (:1417-1434, release K5); nested objects and `DerefAssign` are not (above). |
+| F3 `_ => {}` hides Cast/PipeForward/TupleLit/... | **STILL TRUE** — :1986, :791; `as i64` probe accepted. |
+| F4 never-read borrows not released | **STILL TRUE** — :399-415. |
+| F5 closure capture checking | **STILL TRUE**, plus the self-conflict on `v.push` (above). |
+| F6 every method call is a mutation; `line=0` | **CHANGED** — read-only methods are exempt (`bc_read_method` :1365); method-call errors use `stmt_line`. Still name-based; captures still line 0. |
+| F7 `unsafe` comment vs behavior | **STILL TRUE** (:12). |
+| F8 temp-borrow leaks in non-trivial initializers | **STILL TRUE** (:1996). |
+| F9 dead `BorrowChecker_new(Off)` in no-std path | **FIXED** — the no-std path runs the checker with the requested mode (compiler.fd:898). |
+| F9 statement-level NLL granularity | **STILL TRUE** (:367, `stmt_index = i` on top-level statements). |
+| F9 local copies (`str_to_lower`, `pattern_bindings`, `box_expr_unbox`) | **CHANGED** — `box_expr_unbox` renamed `bc_box_expr_unbox` (:109); `str_to_lower` duplicates core's. |
+| Trait impl bodies never checked | **FIXED** (:317-328, release K5). |
 
 ## Fix order
 
-1. `compiler.fd` warn-mode → `bc.warnings` (F1) — one-line caller fix.
-2. `check_mutation` on `FieldAssign` via `extract_field_path` (F2).
-3. Explicit Expr arms replacing `_ => {}` in `check_expr`/`collect_var_uses_expr`
-   (F3) — biggest soundness win.
-4. Decide F4: match Rust (release never-read borrows) or document deviation.
-5. F5/F6 need design work (capture lifetime, tc access) — document for now.
-6. Doc fixes (F7), dead code (F9), tests for each hole.
+1. compiler.fd warn branches: print `bc.warnings` (two places).
+2. Explicit arms for every Expr in `check_expr` and `collect_var_uses_expr`.
+3. `FieldAssign` on any place: `extract_field_path(object)` → `check_mutation`.
+4. Closures: count changing method calls as mutable captures; keep capture borrows for an escaping closure.
+5. Decide F4 (release never-read borrows or document and test it).
+6. Fix the header comment; promote nested refs in initializers.
 
 ## Test coverage
 
-`tests/bootstrap/test_borrowck.fd` + `test_borrowck_fail.fd` cover rules 1-3 on
-whole vars, field-wise shared borrows, two-phase borrows, basic NLL, unsafe
-escape. Nothing exercises F2/F3/F4/F5 holes — which is why they survive.
+`tests/bootstrap/test_borrowck.fd`, `test_borrowck_fail.fd`,
+`test_iter_invalidation_fail.fd`, `test_field_borrow_fail.fd` (SR-17).
+Nothing covers warn mode, casts/tuples around a call, nested field writes,
+or a closure that pushes to a captured Vec.
+
+## Verification
+
+Static read of the whole statement and expression walkers, the NLL
+pre-pass, the borrow maps and the closure helpers. Live probes: field write
+under a borrow (rejected), nested field write (accepted, prints 99),
+`as i64` double `&mut` (accepted), never-read `&mut` (rejected), closure
+`v.push` (rejected, false positive), warn mode (silent).

@@ -855,19 +855,22 @@ gp             = T [":" Trait {"+" Trait}] | N ":" int-type
 
 - Numbers, `bool`, structs, enums, tuples and arrays are values: assignment and
   by-value passing copy them.
-- `Vec`, `HashMap` and `str` are handles. Assigning one, or copying a struct
-  that holds one, gives a second name for the same data:
+- `Vec`, `HashMap` and `str` behave as values too: assigning one gives an
+  independent value. The data is shared until one side writes; the first
+  write copies it (`core.fd:Vec_share`, `vec_own`; ownership rule of
+  proposal 0004, `lower.fd` `LOWER_RC = true`):
 
   ```fides
-  val a: Vec<i64> = Vec::new();
+  var a: Vec<i64> = Vec::new();
   a.push(1);
   var b = a;
+  b.set(0, 99);
   b.push(2);
-  print(a.len());   // 2
+  print(a.len());   // 1, and a.get(0) is still 1
   ```
 
-  Copy-on-write sharing is written (`core.fd:Vec_share`) but switched off
-  (`lower.fd`, `LOWER_COW = false`).
+  Exception (Nov 9): copying a struct does not separate the `Vec` fields it
+  holds. After `var t = s; t.v.push(2)`, `s.v` sees the push too.
 - `str` values are immutable, so sharing one is not observable.
 - Only `@linear` struct types move (§8.7).
 

@@ -39,7 +39,7 @@ commit (see [platforms](platforms.md)).
 | Capability security | Compile-time capability grants | None | None |
 | Dependency model | No LLVM; native Windows output needs no C compiler or linker (`fid emit`); other targets go through a C compiler | External (crates, LLVM) | External (libc) |
 | Codegen | Direct machine code (Windows x64) or C99 | Via LLVM | Via gcc/clang |
-| Self-hosting | ✅ Achieved (61 modules, 133,688 lines, bootstrap fixpoint verified Nov 6) | Yes | Yes |
+| Self-hosting | ✅ Achieved (68 modules, 158,516 lines, bootstrap fixpoint verified Nov 6 and Nov 8) | Yes | Yes |
 
 ### Design Philosophy
 
@@ -456,8 +456,10 @@ program; the modules it imports are trusted, as is the compiler.
 
 **Does not hold yet:**
 
-- `var b = a` on a `Vec`, `str` or `HashMap` gives two names for one value, with no
-  move check. One name can change what the other sees.
+- Copying a struct does not separate the `Vec` fields it holds: after
+  `var t = s; t.v.push(2)`, `s.v` sees the push. (`var b = a` on a `Vec`,
+  `str` or `HashMap` itself gives an independent value since the ownership
+  rule of proposal 0004.)
 - Race checks cover globals and the arguments of `spawn` (each must be `@send`;
   references and raw pointers are not). A `Vec` passed to a thread is shared
   with the caller, and that sharing is not checked.
@@ -1224,7 +1226,7 @@ assembler, linker or C compiler (`compiler/pe_ir.fd`, `pe_ir_enc.fd`,
   cross-block values, caller-saved registers, or floats in xmm)
 - The runtime is Fides code in `stdlib/pe_runtime/*.fd`, merged into every
   program; C library functions through `extern "C"` thunks
-- Native async/tasks crash (`test_async`, `test_async_float_struct`)
+- Native async/tasks crashed until Nov 6 and broke again in builds of Nov 9 afternoon (iropt passes; fixed again in the evening's fid31, known-bugs 2f.2) (`test_async`, `test_async_float_struct`; known-bugs 2f.2)
 
 The older PIR path (`build --native`: PIR L3, linear scan allocation,
 peephole) crashes. ELF64, Mach-O, ARM64 and RISC-V emitters exist and are
@@ -1362,7 +1364,7 @@ incomplete. `@cfg` uses the host OS, not `--target`.
 
 ## 9. Standard Library
 
-Fides has 137 stdlib modules (43,576 lines, Nov 6), plus 4 in
+Fides has 146 stdlib modules (51,496 lines, Nov 9), plus 4 in
 `stdlib/pe_runtime/`. Key modules:
 
 ### Core
@@ -1455,7 +1457,7 @@ Fides has 137 stdlib modules (43,576 lines, Nov 6), plus 4 in
 
 **The Fides compiler is self-hosted.** The compiler has been rewritten from
 Rust (`src/*.rs`, 57 files, 112,511 lines) into Fides (`compiler/*.fd`, 61
-modules, 133,688 lines) and achieves a **bootstrap fixpoint**: the self-hosted
+modules, 158,516 lines) and achieves a **bootstrap fixpoint**: the self-hosted
 compiler reproduces byte-identical output across generations.
 
 ### Current State (Nov 6, 2026)
@@ -1475,7 +1477,7 @@ compiler reproduces byte-identical output across generations.
   with the Nov 4–6 compiler. The Nov 4–6 features were checked with `fid run`,
   `fid ccompile` and `fid emit` on their tests.
 - `fid emit` makes native Windows executables with no C compiler.
-- Counts and measurements: [CURRENT.md → Numbers](../../CURRENT.md#numbers);
+- Counts and measurements: [selfhost.md → Numbers](selfhost.md#numbers);
   the full history: [selfhost.md](selfhost.md).
 
 ### Where `fid` and `fidesc` differ (Nov 4)
@@ -1484,13 +1486,13 @@ compiler reproduces byte-identical output across generations.
 
 | Rule | `fid` | `fidesc` |
 |---|---|---|
-| Changing a `Vec` a `for` loop walks; assigning `s.x` while `s` is borrowed | rejected | accepted |
+| Changing a `Vec` a `for` loop walks; assigning `s.x` while `s` is borrowed (one level: `s.a.z =` is not checked) | rejected | accepted |
 | Spawned-call arguments must be `@send`; a struct of `@send` fields is `@send` | checked | captures only; structs need `@send` |
 | `@no-alloc` sees `.push()`, `Vec::new()`, string `+`; `@no-indirect` sees calls through a function parameter | yes | free functions only |
 | `@gas` counts trips of loops with literal bounds; `@tainted` on a parameter | yes | no |
 | `@firmware` covers runtime calls (`p_getenv`, `p_file_*`, sockets) | yes | skipped |
 | Effect table: `p_file_*`, `p_socket_*`, `p_process_*`, clocks are IO/Net | yes | partly |
-| Generic bounds, inference failures and turbofish arity | checked | not checked |
+| Generic bounds, inference failures and turbofish arity (an unknown trait name in a bound is accepted) | checked | not checked |
 | Borrowed `&str`, `@scoped` structs (not stored, returned as `str` or sent) | checked | not checked |
 
 `@cfg` (platform, os, arch, debug/release) now filters functions and structs
@@ -1546,14 +1548,18 @@ reserve is insufficient for the compiler's deep recursion.
 
 ### Remaining Work (Nov 6)
 
-- **Value semantics**: copy-on-write for `Vec`/`str`/`HashMap` is written
-  behind `LOWER_COW` (off); with it on, the compiler compiling itself runs out
-  of memory. Today `var b = a` on a `Vec` aliases.
-- **Native async/tasks**: `fid emit` programs using async or spawn+await crash.
-- **Native register allocation**: 7 callee-saved registers only.
-- **Other targets**: macOS, native ELF, ARM64, RISC-V, WASM and bare metal
-  (`emit --bare` panics) are incomplete.
-- **Self-compile speed**: ~133 s, ~6x slower than `fidesc`.
+- **Value semantics**: `var b = a` on a `Vec`/`str`/`HashMap` gives an
+  independent value (ownership rule of proposal 0004, `LOWER_RC` on; the
+  data is copied at the first write). A copied struct still shares its `Vec`
+  fields. `LOWER_COW`, the earlier copy-on-write lowering, is off.
+- **Native async/tasks**: worked under `fid emit` on Nov 6; wrong results in
+  builds of Nov 9 afternoon (an iropt bug; fixed again in the evening's fid31, known-bugs 2f.2).
+- **Other targets**: native Linux AArch64/RISC-V/x86-64 work through the
+  machine layer (273/271/272 of 317 suite tests, Nov 9); macOS (C only, not
+  run), WASM (`fid wasm` does not validate) and bare metal (`emit --bare`
+  builds, not run under QEMU) are incomplete.
+- **Self-compile speed**: 74 s with the compiler built at -O2 (Nov 9), ~3.5x
+  slower than `fidesc`.
 - **Written, not run yet**: `fid emit --checked-alloc` (guard pages),
   `scripts/sanitize.sh` (ASan/UBSan through C), `scripts/fuzz/nightly.sh`.
 

@@ -1127,6 +1127,10 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
         }
         OptProgram::Some(stdlib_parsed) => {
             var stdlib: Program = stdlib_parsed;
+            // The checked-library stamp (release D9) covers core and the
+            // runtime merged into it: a library checked clean once is not
+            // checked again until core, a runtime file or the compiler changes
+            var lib_hash: i64 = g_stdlib_hash;
             t_t = time_mark("stdlib", t_t);
             p_eprint_str("[build] Stdlib parsed ok (cached). Extracting names...\n");
             // Extract stdlib struct/enum names for parser
@@ -1173,6 +1177,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     if (rt_raw as i64) == 0 {
                         return ResultProgram::Err(c_vec1("PE runtime source not found: " + rt_path));
                     }
+                    lib_hash = hash_source(int_to_str(lib_hash) + " " + rt_files.get(rti) + " " + int_to_str(hash_source(rt_raw)));
                     var rt_lex: Lexer = Lexer::new(rt_raw);
                     var rt_tokens: Vec<Token> = rt_lex.tokenize();
                     var rt_parser: Parser = Parser_with_names(rt_tokens, struct_names, enum_names);
@@ -1649,8 +1654,11 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     var core_checked: bool = false;
                     var core_skip: i64 = 0;
                     match g_stdlib_cache {
-                        OptProgram::Some(core_prog) => {
-                            core_checked = inc_core_checked(g_stdlib_hash);
+                        OptProgram::Some(_core_only) => {
+                            // the skip set covers the merged library (core and
+                            // the runtime), keyed by both (lib_hash)
+                            var core_prog: Program = stdlib;
+                            core_checked = inc_core_checked(lib_hash);
                             if core_checked {
                                 var others: Vec<Program> = Vec::new();
                                 others.push(user);
@@ -1772,7 +1780,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
 
                     // Comptime: substitute comptime expressions with their values
                     // Everything in core passed: later builds skip its bodies
-                    if !core_checked && borrowck_mode == "on" { inc_core_mark_checked(g_stdlib_hash); }
+                    if !core_checked && borrowck_mode == "on" { inc_core_mark_checked(lib_hash); }
                     program = substitute(program);
                     t_t = time_mark("comptime", t_t);
 
@@ -1882,9 +1890,10 @@ pub fn compile_to_wasm(source: str, source_path: str, wat_mode: bool) -> ResultB
 
 /// G8.7: Lint a source file. Returns warnings as a vector of strings.
 /// Returns Err with errors if compilation fails.
-pub fn lint_source(source: str, source_path: str) -> ResultVecStr {
+pub fn lint_source(source: str, source_path: str, perf: bool) -> ResultVecStr {
     // G8.7: Lint a source file. Returns warnings as a vector of strings.
     // We do a minimal parse + typecheck + lint, without monomorphization.
+    // `perf` adds the CP9 quadratic-pattern warnings (`fid lint --perf`).
     g_lint_warnings = Vec::new();
 
     // Parse user code
@@ -1939,6 +1948,14 @@ pub fn lint_source(source: str, source_path: str) -> ResultVecStr {
                     // Run lints
                     tc.run_lints(program);
                     lint_unwraps(&mut tc, user, source, source_path);
+                    if perf {
+                        var pw: Vec<str> = lint_perf(user);
+                        var pi: i64 = 0;
+                        while pi < pw.len() {
+                            tc.warnings.push(pw.get(pi));
+                            pi = pi + 1;
+                        }
+                    }
                     return ResultVecStr::Ok(tc.warnings);
                 }
             }
@@ -2003,6 +2020,422 @@ fn lint_unwrap_where(source: str, name: str) -> str {
         k = k + 1;
     }
     return "line " + int_to_str(line) + ": ";
+}
+
+// --- CP9: fid lint --perf ---------------------------------------------------
+// Quadratic patterns that read as cheap: `str + str` inside a loop (each +
+// copies the whole string), `v.remove(0)` inside a loop (shifts every
+// element), and linear lookups (`find`, `index_of`, `position`, `contains`,
+// `rfind`) nested in a loop.
+
+/// All `--perf` warnings in one user program.
+pub fn lint_perf(user: Program) -> Vec<str> {
+    var warnings: Vec<str> = Vec::new();
+    var fi: i64 = 0;
+    while fi < user.funcs.len() {
+        lint_perf_func(user.funcs.get(fi), &mut warnings);
+        fi = fi + 1;
+    }
+    var ii: i64 = 0;
+    while ii < user.impls.len() {
+        var imp: ImplDef = user.impls.get(ii);
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            lint_perf_func(imp.methods.get(mi), &mut warnings);
+            mi = mi + 1;
+        }
+        ii = ii + 1;
+    }
+    return warnings;
+}
+
+fn lint_perf_func(f: Func, warnings: &mut Vec<str>) {
+    var str_names: Vec<str> = Vec::new();
+    var pi: i64 = 0;
+    while pi < f.params.len() {
+        var prm: Param = f.params.get(pi);
+        if lint_perf_ty_str(prm.ty) { str_names.push(prm.name); }
+        pi = pi + 1;
+    }
+    lint_perf_stmts(f.body, f.name, 0, str_names.clone(), warnings);
+}
+
+/// True when a declared type is `str`/`String` (or a reference to one).
+fn lint_perf_ty_str(ty: Type) -> bool {
+    match ty {
+        Type::Str => { return true; }
+        Type::Named(n) => { return n == "str" || n == "String"; }
+        Type::Ref(inner, _) => { return lint_perf_ty_str(box_type_unbox(inner)); }
+        _ => { return false; }
+    }
+    return false;
+}
+
+/// True when a `Let` declares `name` as `str`-typed or string-initialised.
+fn lint_perf_let_str(oty: OptType, init: Expr, str_names: Vec<str>) -> bool {
+    match oty {
+        OptType::Some(t) => { return lint_perf_ty_str(t); }
+        OptType::None => { return lint_perf_is_str(init, str_names); }
+    }
+    return false;
+}
+
+/// True when `e` is visibly a string value: a literal, a known `str` var, a
+/// string-producing call/method, or `+` on something already a string.
+fn lint_perf_is_str(e: Expr, str_names: Vec<str>) -> bool {
+    match e {
+        Expr::StringLit(_) => { return true; }
+        Expr::FString(_) => { return true; }
+        Expr::StrConcat(_, _) => { return true; }
+        Expr::Ident(n) => {
+            var i: i64 = 0;
+            while i < str_names.len() {
+                if str_names.get(i) == n { return true; }
+                i = i + 1;
+            }
+            return false;
+        }
+        Expr::MethodCall(_, m, _) => {
+            return m == "to_str" || m == "concat" || m == "join" || m == "slice"
+                || m == "as_str" || m == "to_string" || m == "substr" || m == "upper"
+                || m == "lower" || m == "trim" || m == "replace" || m == "repeat";
+        }
+        Expr::Call(n, _) => {
+            return n == "int_to_str" || n == "f64_to_str" || n == "f32_to_str"
+                || n == "bool_to_str" || n == "str_slice" || n == "str_concat"
+                || n == "char_to_str" || n == "u64_to_str" || n == "i64_to_str";
+        }
+        Expr::Binary(o2, a, b) => {
+            if o2 == BinOp::Add {
+                return lint_perf_is_str(box_expr_unbox(a), str_names.clone())
+                    || lint_perf_is_str(box_expr_unbox(b), str_names.clone());
+            }
+            return false;
+        }
+        Expr::Coalesce(a, b) => {
+            return lint_perf_is_str(box_expr_unbox(a), str_names.clone())
+                || lint_perf_is_str(box_expr_unbox(b), str_names.clone());
+        }
+        _ => { return false; }
+    }
+    return false;
+}
+
+/// True when `e` is a `str`-typed *variable* — the accumulating operand of a
+/// quadratic `s = s + piece` concat. Fresh short strings (int_to_str(x) + y)
+/// are linear, not quadratic, and are deliberately not flagged.
+fn lint_perf_is_str_var(e: Expr, str_names: Vec<str>) -> bool {
+    match e {
+        Expr::Ident(n) => {
+            var i: i64 = 0;
+            while i < str_names.len() {
+                if str_names.get(i) == n { return true; }
+                i = i + 1;
+            }
+            return false;
+        }
+        _ => { return false; }
+    }
+    return false;
+}
+
+fn lint_perf_warn(warnings: &mut Vec<str>, fname: str, line: i64, what: str) {
+    warnings.push(fname + ": line " + int_to_str(line) + ": " + what);
+}
+
+fn lint_perf_stmts(body: Vec<Stmt>, fname: str, depth: i64, base_names: Vec<str>, warnings: &mut Vec<str>) {
+    // Pre-pass: names this block declares `str`-typed are visible everywhere
+    // in the block (slight over-approximation is fine for a lint).
+    var str_names: Vec<str> = base_names;
+    var i: i64 = 0;
+    while i < body.len() {
+        match body.get(i) {
+            Stmt::Let(n, oty, e, _, _, _, _) => {
+                if lint_perf_let_str(oty, e, str_names.clone()) { str_names.push(n); }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    var j: i64 = 0;
+    while j < body.len() {
+        var st: Stmt = body.get(j);
+        lint_perf_stmt(st, fname, depth, stmt_line(st), str_names.clone(), warnings);
+        j = j + 1;
+    }
+}
+
+fn lint_perf_stmt(s: Stmt, fname: str, depth: i64, site: i64, str_names: Vec<str>, warnings: &mut Vec<str>) {
+    match s {
+        Stmt::Let(n, oty, e, _, _, _, _) => {
+            lint_perf_expr(e, fname, depth, site, str_names.clone(), warnings);
+        }
+        Stmt::LetTuple(_, e, _) => { lint_perf_expr(e, fname, depth, site, str_names.clone(), warnings); }
+        Stmt::LetUninit(_, _, _, _) => {}
+        Stmt::Assign(_, _, e, _) => { lint_perf_expr(e, fname, depth, site, str_names.clone(), warnings); }
+        Stmt::IndexAssign(_, a, _, b, _) => {
+            lint_perf_expr(a, fname, depth, site, str_names.clone(), warnings);
+            lint_perf_expr(b, fname, depth, site, str_names.clone(), warnings);
+        }
+        Stmt::DerefAssign(a, _, b, _) => {
+            lint_perf_expr(a, fname, depth, site, str_names.clone(), warnings);
+            lint_perf_expr(b, fname, depth, site, str_names.clone(), warnings);
+        }
+        Stmt::FieldAssign(a, _, _, b, _) => {
+            lint_perf_expr(a, fname, depth, site, str_names.clone(), warnings);
+            lint_perf_expr(b, fname, depth, site, str_names.clone(), warnings);
+        }
+        Stmt::Expr(e, _) => { lint_perf_expr(e, fname, depth, site, str_names.clone(), warnings); }
+        Stmt::Return(oe, _) => {
+            match oe {
+                OptBoxExpr::Some(be) => { lint_perf_expr(box_expr_unbox(be), fname, depth, site, str_names.clone(), warnings); }
+                OptBoxExpr::None => {}
+            }
+        }
+        Stmt::If(c, t, e, _) => {
+            lint_perf_expr(c, fname, depth, site, str_names.clone(), warnings);
+            lint_perf_stmts(t, fname, depth, str_names.clone(), warnings);
+            match e {
+                OptStmts::Some(eb) => { lint_perf_stmts(eb, fname, depth, str_names.clone(), warnings); }
+                OptStmts::None => {}
+            }
+        }
+        // The condition and range re-evaluate every iteration: they count as
+        // inside the loop.
+        Stmt::While(c, b, _) => {
+            lint_perf_expr(c, fname, depth + 1, site, str_names.clone(), warnings);
+            lint_perf_stmts(b, fname, depth + 1, str_names.clone(), warnings);
+        }
+        Stmt::For(_, e, b, _) => {
+            lint_perf_expr(e, fname, depth + 1, site, str_names.clone(), warnings);
+            lint_perf_stmts(b, fname, depth + 1, str_names.clone(), warnings);
+        }
+        Stmt::Loop(b, _) => {
+            lint_perf_stmts(b, fname, depth + 1, str_names.clone(), warnings);
+        }
+        Stmt::Break(obe, _) => {
+            match obe {
+                OptBoxExpr::Some(be2) => { lint_perf_expr(box_expr_unbox(be2), fname, depth, site, str_names.clone(), warnings); }
+                OptBoxExpr::None => {}
+            }
+        }
+        Stmt::Continue(_) => {}
+        Stmt::Defer(b, _) => { lint_perf_stmts(b, fname, 0, str_names.clone(), warnings); }
+        Stmt::Match(e, arms, _) => {
+            lint_perf_expr(e, fname, depth, site, str_names.clone(), warnings);
+            var ai: i64 = 0;
+            while ai < arms.len() {
+                var arm: MatchArm = arms.get(ai);
+                match arm.guard {
+                    OptBoxExpr::Some(ge) => { lint_perf_expr(box_expr_unbox(ge), fname, depth, site, str_names.clone(), warnings); }
+                    OptBoxExpr::None => {}
+                }
+                lint_perf_stmts(arm.body, fname, depth, str_names.clone(), warnings);
+                ai = ai + 1;
+            }
+        }
+        Stmt::Use(_, _, _) => {}
+        Stmt::Handle(b, hs, _) => {
+            lint_perf_stmts(b, fname, depth, str_names.clone(), warnings);
+            var hi: i64 = 0;
+            while hi < hs.len() {
+                lint_perf_stmts(hs.get(hi).body, fname, depth, str_names.clone(), warnings);
+                hi = hi + 1;
+            }
+        }
+        Stmt::Do(_, _, args, _) => {
+            var di: i64 = 0;
+            while di < args.len() {
+                lint_perf_expr(args.get(di), fname, depth, site, str_names.clone(), warnings);
+                di = di + 1;
+            }
+        }
+        Stmt::RegionBlock(_, _, _, _, _, b, _) => { lint_perf_stmts(b, fname, depth, str_names.clone(), warnings); }
+        Stmt::Sandbox(b, _) => { lint_perf_stmts(b, fname, depth, str_names.clone(), warnings); }
+        Stmt::Unsafe(b, _) => { lint_perf_stmts(b, fname, depth, str_names.clone(), warnings); }
+        Stmt::Txn(b, _) => { lint_perf_stmts(b, fname, depth, str_names.clone(), warnings); }
+        Stmt::ComptimeGen(b, _) => { lint_perf_stmts(b, fname, 0, str_names.clone(), warnings); }
+        Stmt::GradBlock(_, b, _) => { lint_perf_stmts(b, fname, depth, str_names.clone(), warnings); }
+        Stmt::Backward(e, _) => { lint_perf_expr(e, fname, depth, site, str_names.clone(), warnings); }
+        Stmt::Query(_, b, _) => { lint_perf_stmts(b, fname, depth, str_names.clone(), warnings); }
+        Stmt::Select(cases, dflt, _) => {
+            var ci: i64 = 0;
+            while ci < cases.len() {
+                var sc: SelectCase = cases.get(ci);
+                lint_perf_expr(sc.channel, fname, depth, site, str_names.clone(), warnings);
+                lint_perf_stmts(sc.body, fname, depth, str_names.clone(), warnings);
+                ci = ci + 1;
+            }
+            match dflt {
+                OptStmts::Some(db) => { lint_perf_stmts(db, fname, depth, str_names.clone(), warnings); }
+                OptStmts::None => {}
+            }
+        }
+        Stmt::Parallel(branches, _) => {
+            var pi: i64 = 0;
+            while pi < branches.len() {
+                lint_perf_stmts(branches.get(pi), fname, depth, str_names.clone(), warnings);
+                pi = pi + 1;
+            }
+        }
+        Stmt::Resume(a, b, _) => {
+            lint_perf_expr(a, fname, depth, site, str_names.clone(), warnings);
+            lint_perf_expr(b, fname, depth, site, str_names.clone(), warnings);
+        }
+        Stmt::SpawnScope(b, _) => { lint_perf_stmts(b, fname, depth, str_names.clone(), warnings); }
+        Stmt::CancelScope(_) => {}
+    }
+}
+
+fn lint_perf_exprs(args: Vec<Expr>, fname: str, depth: i64, site: i64, str_names: Vec<str>, warnings: &mut Vec<str>) {
+    var i: i64 = 0;
+    while i < args.len() {
+        lint_perf_expr(args.get(i), fname, depth, site, str_names.clone(), warnings);
+        i = i + 1;
+    }
+}
+
+fn lint_perf_expr(e: Expr, fname: str, depth: i64, site: i64, str_names: Vec<str>, warnings: &mut Vec<str>) {
+    match e {
+        Expr::StrConcat(a, b) => {
+            if depth > 0 {
+                lint_perf_warn(warnings, fname, site,
+                    "str + str in a loop copies the whole string each iteration — quadratic.\n    Fix: append to a StringBuilder and to_str once after the loop.");
+            }
+            lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings);
+            lint_perf_expr(box_expr_unbox(b), fname, depth, site, str_names.clone(), warnings);
+        }
+        Expr::MethodCall(recv, m, args) => {
+            if depth > 0 {
+                if m == "remove" && args.len() > 0 {
+                    match args.get(0) {
+                        Expr::IntLit(z) => {
+                            if z == 0 {
+                                lint_perf_warn(warnings, fname, site,
+                                    "v.remove(0) in a loop shifts every element each call — quadratic.\n    Fix: pop from the end, collect indices and remove once, or use a deque.");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if m == "index_of" || m == "position" || m == "find" || m == "rfind" || m == "contains" {
+                    lint_perf_warn(warnings, fname, site,
+                        m + " in a loop is a linear lookup each iteration — quadratic on a Vec.\n    Fix: use a HashMap/Set, or hoist the lookup out of the loop.");
+                }
+            }
+            lint_perf_expr(box_expr_unbox(recv), fname, depth, site, str_names.clone(), warnings);
+            lint_perf_exprs(args, fname, depth, site, str_names.clone(), warnings);
+        }
+        Expr::Call(_, args) => { lint_perf_exprs(args, fname, depth, site, str_names.clone(), warnings); }
+        Expr::Binary(op, a, b) => {
+            if op == BinOp::Add && depth > 0 {
+                if lint_perf_is_str_var(box_expr_unbox(a), str_names.clone()) {
+                    lint_perf_warn(warnings, fname, site,
+                        "str + str in a loop copies the whole string each iteration — quadratic.\n    Fix: append to a StringBuilder and to_str once after the loop.");
+                }
+            }
+            lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings);
+            lint_perf_expr(box_expr_unbox(b), fname, depth, site, str_names.clone(), warnings);
+        }
+        Expr::Unary(_, a) => { lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings); }
+        Expr::FieldAccess(a, _) => { lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings); }
+        Expr::OptionalFieldAccess(a, _) => { lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings); }
+        Expr::StructLit(_, inits, base) => {
+            var si: i64 = 0;
+            while si < inits.len() {
+                lint_perf_expr(inits.get(si).value, fname, depth, site, str_names.clone(), warnings);
+                si = si + 1;
+            }
+            match base {
+                OptBoxExpr::Some(bv) => { lint_perf_expr(box_expr_unbox(bv), fname, depth, site, str_names.clone(), warnings); }
+                OptBoxExpr::None => {}
+            }
+        }
+        Expr::If(c, t, e2) => {
+            lint_perf_expr(box_expr_unbox(c), fname, depth, site, str_names.clone(), warnings);
+            lint_perf_stmts(t, fname, depth, str_names.clone(), warnings);
+            match e2 {
+                OptStmts::Some(eb) => { lint_perf_stmts(eb, fname, depth, str_names.clone(), warnings); }
+                OptStmts::None => {}
+            }
+        }
+        Expr::ArrayLit(_, elems) => { lint_perf_exprs(elems, fname, depth, site, str_names.clone(), warnings); }
+        Expr::Index(a, b) => {
+            lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings);
+            lint_perf_expr(box_expr_unbox(b), fname, depth, site, str_names.clone(), warnings);
+        }
+        Expr::FString(parts) => {
+            var fi: i64 = 0;
+            while fi < parts.len() {
+                match parts.get(fi) {
+                    FStringPart::Expr(pe) => { lint_perf_expr(pe, fname, depth, site, str_names.clone(), warnings); }
+                    FStringPart::Literal(_) => {}
+                }
+                fi = fi + 1;
+            }
+        }
+        Expr::Match(me, arms) => {
+            lint_perf_expr(box_expr_unbox(me), fname, depth, site, str_names.clone(), warnings);
+            var ai: i64 = 0;
+            while ai < arms.len() {
+                var arm: MatchArm = arms.get(ai);
+                match arm.guard {
+                    OptBoxExpr::Some(ge) => { lint_perf_expr(box_expr_unbox(ge), fname, depth, site, str_names.clone(), warnings); }
+                    OptBoxExpr::None => {}
+                }
+                lint_perf_stmts(arm.body, fname, depth, str_names.clone(), warnings);
+                ai = ai + 1;
+            }
+        }
+        Expr::EnumLit(_, _, args) => { lint_perf_exprs(args, fname, depth, site, str_names.clone(), warnings); }
+        Expr::Ref(a, _) => { lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings); }
+        Expr::Deref(a) => { lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings); }
+        Expr::Try(a) => { lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings); }
+        Expr::Coalesce(a, b) => {
+            lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings);
+            lint_perf_expr(box_expr_unbox(b), fname, depth, site, str_names.clone(), warnings);
+        }
+        Expr::IsCheck(a, _) => { lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings); }
+        Expr::TupleLit(elems) => { lint_perf_exprs(elems, fname, depth, site, str_names.clone(), warnings); }
+        // A closure runs when called, not per enclosing iteration: the loop
+        // depth resets and only its own loops count.
+        Expr::Closure(_, body, _) => {
+            lint_perf_stmts(body, fname, 0, str_names.clone(), warnings);
+        }
+        Expr::Cast(a, _) => { lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings); }
+        Expr::Asm(_, ops) => {
+            var ai: i64 = 0;
+            while ai < ops.len() {
+                lint_perf_expr(ops.get(ai).expr, fname, depth, site, str_names.clone(), warnings);
+                ai = ai + 1;
+            }
+        }
+        Expr::Comptime(a) => { lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings); }
+        Expr::ComptimeBlock(b) => {
+            lint_perf_stmts(b, fname, 0, str_names.clone(), warnings);
+        }
+        Expr::ComptimeReflect(_, _) => {}
+        Expr::PipeForward(a, b) => {
+            lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings);
+            lint_perf_expr(box_expr_unbox(b), fname, depth, site, str_names.clone(), warnings);
+        }
+        Expr::QuantCast(a, _) => { lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings); }
+        Expr::Await(a) => { lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings); }
+        Expr::Spawn(a) => { lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings); }
+        Expr::Yield(a) => { lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings); }
+        Expr::NamedArg(_, a) => { lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings); }
+        Expr::Block(b) => {
+            lint_perf_stmts(b, fname, depth, str_names.clone(), warnings);
+        }
+        Expr::TryBlock(b) => {
+            lint_perf_stmts(b, fname, depth, str_names.clone(), warnings);
+        }
+        Expr::Range(a, b, _) => {
+            lint_perf_expr(box_expr_unbox(a), fname, depth, site, str_names.clone(), warnings);
+            lint_perf_expr(box_expr_unbox(b), fname, depth, site, str_names.clone(), warnings);
+        }
+        _ => {}
+    }
 }
 
 /// Lower source to an IR module.

@@ -1,40 +1,51 @@
-# regalloc.fd — linear-scan register allocator
+# regalloc.fd — linear-scan register allocator (PIR path)
 
-> **Re-verified 2026-10-23:** still the cleanest file — no defects found. All AGENTS-flagged features (F-1A remat, F-1D/I-2D clobber sets, S-17 determinism) verified ported.
+> **Re-audited 2026-11-09.** Same features as Oct 23. Nov 3 (e655b58) fixed a family of helpers
+> that sorted or filled a by-value `Vec` (value semantics dropped the writes). Only the PIR x86-64
+> path uses this file; the native backends have their own allocators (pe_ir, nat_ir).
 
-- **Path:** `compiler/regalloc.fd` — **1,354 LOC** (Rust `src/regalloc.rs` = 1,509, ~90%)
-- **Role:** `allocate(func, pure_funcs, no_alloc_funcs)` — linear-scan over L3: live-interval computation, arg preassignment, free-pool/eviction, spill slots, remat, callee-saved tracking. Feeds `ModuleAllocation` into codegen.
+- **Path:** `compiler/regalloc.fd` — **1,354 LOC** (Rust `src/regalloc.rs` = 1,509)
+- **Role:** `allocate(func, pure_funcs, no_alloc_funcs)` (:283) and `allocate_module` (:555):
+  live intervals over L3, argument preassignment, free pool and eviction, spill slots,
+  rematerialized constants, callee-saved tracking.
 
 ## Where it is called
 
-| Caller | Site | Mechanism |
+| Caller | Site | Command |
 |---|---|---|
-| `codegen_x64.fd` | :40 | `allocate_module(module)` — the **only** real consumer; x86-64 path |
+| `codegen_x64.fd` `generate_asm` | :40 | `fid codegen` (x86-64), `build --native` (default target), `emit --boot` |
 
-Only `codegen_x64.fd` imports it (`use compiler::regalloc` at :31). arm64/riscv headers *say* "L3Module → (regalloc)" but never call it — they use their own simpler assignment.
-
-## Verified faithful — all AGENTS-flagged features present
-
-- **F-1A rematerialization**: `Location::Remat(i64)` (:184), `compute_constant_vregs` finds `Mov src=ImmI` defs, remat applied on assign/evict/spill at :462-513 — same sites as Rust (:377-416, :638-651).
-- **F-1D + I-2D effect-aware clobbering**: `inst_clobbers` (:918) is **1:1** — pure/`@no-alloc` calls clobber only `RAX`; `CallPtr`/`DynCall`/`Panic`/non-pure `Call` clobber full caller-saved; `Div`/`Mod` → `RAX+RCX+RDX`, other bins → `RCX+RDX`; `Neg`→`RAX+RCX`, `Not`→`RAX`. Every arm's clobber set matches Rust :942+ exactly.
-- **S-17 determinism — preserved by construction**: Rust needs `(start, vreg_id)` sort because HashMap order was the bug. Fides has no HashMap — intervals are built first-seen into parallel Vecs (params → blocks → insts, all ordered) and `sort_intervals_by_start` is a *stable* bubble sort on `start` only. Deterministic; ties resolve in first-seen order vs Rust's vreg-id order → different allocation on ties but repeatable. Cosmetic divergence, not a defect.
-- `inst_def`/`inst_uses` cover all 22 `L3Inst` arms each — parity with Rust's :1032/:1060.
-- Arg preassignment (arg_regs → `Location::Reg`, spill after N regs at `16 + (i-N)*8`), clobber-in-range check before honoring a preassigned reg (:361), eviction remat, callee-saved usage tracking — all present.
+Only importer: `codegen_x64.fd`. arm64/riscv codegens do not use it.
 
 ## Findings
 
-### LOW — tie-break order differs from Rust *(cosmetic)*
+### Code inspection
 
-Missing the explicit `(start, vreg_id)` secondary key — bubble sort is stable, so ties keep first-seen order rather than vreg-id order. Deterministic either way; produces *different-but-valid* allocations vs the reference on equal-start ties. If exact-parity output ever matters (golden diffs), add the secondary key — otherwise harmless.
+#### Features — STILL TRUE
 
-### Inherited — clobber model granularity
+- F-1A remat: `Location::Remat` (:184), applied at :465, :485, :500, :513;
+  `compute_constant_vregs` (:573).
+- F-1D / I-2D clobbers: `inst_clobbers` (:918), pure and `@no-alloc` calls clobber only RAX.
+- `inst_def` (:1045) / `inst_uses` (:1089).
 
-`inst_clobbers` is instruction-granular only — a `Call` anywhere in a live range blocks the reg for the whole range (conservative). Same model as Rust; noted for completeness.
+#### CHANGED — by-value Vec helpers
+
+`compute_constant_vregs`, `record_def`, `sort_intervals_by_start`, `sort_pool`,
+`sort_active_by_end`, `set_loc_in_vec`, `sort_vec_i64` now take `&mut Vec` (e655b58, Nov 3).
+Before that, under value semantics, sorting and spill-slot recording were silently lost. Scan of
+the file on Nov 9: no remaining by-value `Vec` parameter that is mutated.
+
+#### LOW — tie-break order differs from Rust — STILL TRUE
+
+`sort_intervals_by_start` (:1274) is a stable bubble sort on `start` only (no vreg-id key).
+Deterministic; also O(n²) per function.
+
+#### INFO (inherited) — whole-range clobber model — STILL TRUE
 
 ## Fix order
 
-1. (Optional) add `vreg_id` secondary key to `sort_intervals_by_start` for byte-parity with Rust's allocation choices.
+1. (Optional) vreg-id secondary key; a non-quadratic sort if the PIR path stays.
 
 ## Verification state
 
-- No live runs — the audit here was feature-by-feature against the AGENTS.md risk list: Remat sites, clobber sets per arm, sort stability + interval production order (the S-17 mechanism), `inst_def`/`inst_uses` arm coverage (22/22), preassignment + clobber-check path.
+- Re-read cited lines and the e655b58 diff. Live: `codegen` (which allocates) runs on hello.fd.

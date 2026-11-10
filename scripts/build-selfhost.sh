@@ -10,8 +10,9 @@
 #   STAGE0=./build/bootstrap/fides-c3 ./scripts/build-selfhost.sh   # self-compile
 #
 # C compiler: $CC if set, else the first of tcc, gcc, clang, `zig cc`.
-# The generated C is one ~30MB translation unit; build at -O0 (optimizing
-# needs >16GB RAM with clang).
+# The generated C is split into 8 units built at -O2 when the stage-0
+# compiler has `split-c` (SPLIT, JOBS), else one ~70MB unit at -O0
+# (optimizing it whole needs >16GB RAM with clang).
 set -u
 cd "$(dirname "$0")/.." || exit 1
 OUT=release
@@ -75,7 +76,41 @@ int main(int argc, char** argv) {
 EOF
 
 echo "[3/3] ${CC_CMD[*]} -> $OUT/$OUT_EXE"
-if ! "${CC_CMD[@]}" "${CFLAGS[@]}" "$OUT/fid-dev_wrapped.c" -o "$OUT/$OUT_EXE" "${LIBS[@]}" > "$OUT/fid-dev.cc.log" 2>&1; then
+# As scripts/bootstrap.sh: when the stage-0 compiler has `fid split-c`, the C
+# is split into SPLIT units (default 8) compiled at -O2, JOBS at a time
+# (default 4), and linked; the compiler is about 3x faster than one unit at
+# -O0 (the Rust bootstrap, tcc, SPLIT=1 or a failed split: one unit at -O0).
+# The generated C is the same either way: only the C compiler's work differs.
+SPLIT="${SPLIT:-8}"
+JOBS="${JOBS:-4}"
+SPLIT_CFLAGS=(-O2 -fno-strict-aliasing -fwrapv)
+for f in "${CFLAGS[@]}"; do [ "$f" != "-O0" ] && SPLIT_CFLAGS+=("$f"); done
+built=0
+: > "$OUT/fid-dev.cc.log"
+base="$OUT/fid-dev_wrapped_u"
+case "${CC_CMD[*]}" in *tcc*) ;; *)
+  if [ "$SPLIT" -gt 1 ] && "$STAGE0" split-c "$OUT/fid-dev_wrapped.c" "$base" "$SPLIT" >> "$OUT/fid-dev.cc.log" 2>&1 && [ -f "$base.h" ]; then
+    objs=(); pids=(); ok=1
+    for k in $(seq 0 $((SPLIT - 1))); do
+      "${CC_CMD[@]}" "${SPLIT_CFLAGS[@]}" -c "${base}_$k.c" -o "${base}_$k.o" >> "$OUT/fid-dev.cc.log" 2>&1 &
+      pids+=($!)
+      objs+=("${base}_$k.o")
+      if [ ${#pids[@]} -ge "$JOBS" ]; then
+        wait "${pids[0]}" || ok=0
+        pids=("${pids[@]:1}")
+      fi
+    done
+    for pid in "${pids[@]}"; do wait "$pid" || ok=0; done
+    if [ "$ok" = 1 ] && "${CC_CMD[@]}" "${objs[@]}" -o "$OUT/$OUT_EXE" "${LIBS[@]}" >> "$OUT/fid-dev.cc.log" 2>&1; then
+      echo "      ($SPLIT units at -O2)"
+      built=1
+    else
+      echo "      split build failed (see $OUT/fid-dev.cc.log); building one unit at -O0"
+    fi
+    rm -f "${base}"_*.c "${base}"_*.o "$base.h"
+  fi ;;
+esac
+if [ "$built" = 0 ] && ! "${CC_CMD[@]}" "${CFLAGS[@]}" "$OUT/fid-dev_wrapped.c" -o "$OUT/$OUT_EXE" "${LIBS[@]}" >> "$OUT/fid-dev.cc.log" 2>&1; then
   echo "C compile failed:"; grep -E "error" "$OUT/fid-dev.cc.log" | head -20; exit 1
 fi
 rm -f "$OUT/fid-dev_wrapped.c"

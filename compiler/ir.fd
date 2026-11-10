@@ -1383,6 +1383,7 @@ pub struct IrFunction {
     pub workgroup_size: Vec<i64>,
     pub is_simd: bool,           // F23: @simd — aggressive loop vectorization
     pub zeroize_locals: Vec<ValueIdU64>,  // F88: @zeroize — locals to zero at scope exit
+    pub internal_conv: bool,   // WP6: internal-only function — may use the extended calling convention
 }
 
 pub struct ValueIdMeta {
@@ -1429,6 +1430,7 @@ pub fn IrFunction_new(name: str, ret_ty: IrType) -> IrFunction {
         is_no_alloc: false,
         is_medical: false,
         is_kernel: false,
+        internal_conv: false,
         workgroup_size: Vec::new(),
         is_simd: false,
         zeroize_locals: Vec::new(),
@@ -2014,152 +2016,367 @@ pub fn IrModule_optimize(self: &mut IrModule) -> i64 {
     return total;
 }
 
-/// Remove functions that are never called (except `main` and `p_*` runtime stubs).
-/// This reduces the size of the generated C code significantly.
-pub fn IrModule_dead_function_elimination(self: &mut IrModule) -> i64 {
-    if self.functions.len() <= 1 { return 0; }
+// --- Backend name resolution + call-graph reachability -----------------------
+// (moved from pe_ir_stubs.fd: these are IrModule-level helpers shared by dead
+// function elimination and the pe_ir / nat_ir backends — one reachability
+// truth, so a kept function is always one a backend can call)
 
-    // Collect all function names
-    var all_names: Vec<str> = Vec::new();
+/// A (stub, Fides runtime function) dependency pair.
+pub struct PeirStrPair {
+    pub a: str,
+    pub b: str,
+}
+
+/// Linear-scan membership for Vec<str> (BTreeSet<String>::contains).
+pub fn pe_strs_contains(v: Vec<str>, s: str) -> bool {
     var i: i64 = 0;
-    while i < self.functions.len() {
-        all_names.push(self.functions.get(i).name);
+    while i < v.len() {
+        if v.get(i) == s { return true; }
         i = i + 1;
     }
+    return false;
+}
 
-    // Mark reachable functions starting from main
-    var reachable: Vec<str> = Vec::new();
-    var worklist: Vec<str> = Vec::new();
+/// Insertion-sort a Vec<str> with str_compare (deterministic BTree order).
+pub fn pe_sort_strs(v: Vec<str>) -> Vec<str> {
+    var v = v;
+    var i: i64 = 1;
+    while i < v.len() {
+        var key: str = v.get(i);
+        var j: i64 = i - 1;
+        while j >= 0 && str_compare(v.get(j), key) > 0 {
+            v.set(j + 1, v.get(j));
+            j = j - 1;
+        }
+        v.set(j + 1, key);
+        i = i + 1;
+    }
+    return v;
+}
 
-    // Start with main and all p_* runtime functions (they may be called from C runtime)
-    i = 0;
-    while i < all_names.len() {
-        var name: str = all_names.get(i);
-        if name == "main" || name == "main_entry" || (str_len(name) >= 2 && str_byte_at(name, 0) == 112 && str_byte_at(name, 1) == 95) {
-            reachable.push(name);
-            worklist.push(name);
+/// Machine code that only exists with the Fides function it hands over to:
+/// (stub, Fides runtime function).
+pub fn pe_stub_deps() -> Vec<PeirStrPair> {
+    var v: Vec<PeirStrPair> = Vec::new();
+    // p_thread_spawn(name, nargs, ...): varargs, captured into an array
+    v.push(PeirStrPair { a: "p_thread_spawn", b: "pert_thread_spawn_v" });
+    v.push(PeirStrPair { a: "p_executor_spawn", b: "pert_executor_spawn_v" });
+    v.push(PeirStrPair { a: "p_co_async", b: "pert_co_async_v" });
+    // The C-convention thread start routine runs pert_thread_main(arg)
+    v.push(PeirStrPair { a: "pe_thread_entry_addr", b: "pert_thread_main" });
+    // The task context switch and the trampoline a new task starts in (RT9)
+    v.push(PeirStrPair { a: "pe_ctx_swap", b: "pe_ctx_switch" });
+    v.push(PeirStrPair { a: "pe_ctx_tramp_addr", b: "pe_ctx_new" });
+    return v;
+}
+
+/// The builtins `print`, `p_to_str` and the Print instruction dispatch to.
+pub fn pe_print_builtins() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push("p_print_float"); v.push("p_print_int"); v.push("p_print_str");
+    v.push("p_print_bool"); v.push("p_to_str_float"); v.push("p_to_str");
+    v.push("p_to_str_str"); v.push("p_to_str_bool");
+    return v;
+}
+
+/// A function of the Fides PE runtime (src/pe_runtime/): builtins `pert_*`
+/// and the helpers of each file (`pe_*`, `pet_*` tensors, `ped_*` data).
+pub fn is_pe_runtime_fn(name: str) -> bool {
+    return str_starts_with(name, "pert_") || str_starts_with(name, "pe_")
+        || str_starts_with(name, "pet_") || str_starts_with(name, "ped_");
+}
+
+/// The Fides runtime's stand-in for runtime builtin `p_X` / `__X`: `pert_X`.
+/// Returns "" when `name` has no `p_`/`__` prefix (Option::None).
+pub fn pert_name(name: str) -> str {
+    if str_starts_with(name, "p_") {
+        return "pert_" + str_slice(name, 2, str_len(name));
+    }
+    if str_starts_with(name, "__") {
+        return "pert_" + str_slice(name, 2, str_len(name));
+    }
+    return "";
+}
+
+/// Runtime builtins this backend implements with core's Fides code.
+pub fn pe_runtime_alias(name: str) -> str {
+    if name == "p_vec_insert" { return "vec_raw_insert"; }
+    // One Vec implementation: core's. (The machine stubs disagreed with it:
+    // clone shared the data, first returned garbage.)
+    if name == "p_vec_clone" { return "Vec_clone"; }
+    if name == "p_vec_new" { return "Vec_new"; }
+    if name == "p_vec_push" { return "Vec_push"; }
+    if name == "p_vec_len" { return "Vec_len"; }
+    if name == "p_vec_get" { return "Vec_get"; }
+    if name == "p_vec_set" { return "Vec_set"; }
+    if name == "p_vec_pop" { return "Vec_pop"; }
+    if name == "p_vec_is_empty" { return "Vec_is_empty"; }
+    if name == "p_vec_clear" { return "Vec_clear"; }
+    if name == "p_vec_capacity" { return "Vec_capacity"; }
+    if name == "p_vec_first" { return "Vec_first"; }
+    if name == "p_vec_last" { return "Vec_last"; }
+    if name == "p_vec_contains" { return "Vec_contains"; }
+    if name == "p_vec_truncate" { return "Vec_truncate"; }
+    if name == "p_vec_remove" { return "vec_raw_remove"; }
+    if name == "p_vec_reverse" { return "vec_raw_reverse"; }
+    if name == "p_vec_extend" { return "vec_raw_extend"; }
+    if name == "p_vec_sort" { return "vec_raw_sort"; }
+    return name;
+}
+
+/// Is `name` a Fides stand-in `pe_runtime_alias` maps a builtin to?  Such a
+/// function keeps the `__env`-first convention: the native backends call it
+/// through the p_* builtin name with a null env inserted, whatever its body
+/// uses (mirrors the outputs of `pe_runtime_alias`).
+pub fn pe_runtime_alias_target(name: str) -> bool {
+    return name == "vec_raw_insert" || name == "vec_raw_remove"
+        || name == "vec_raw_reverse" || name == "vec_raw_extend"
+        || name == "vec_raw_sort" || str_starts_with(name, "Vec_");
+}
+
+/// Does the module define a function `name`?
+pub fn pe_module_has_fn(module: &IrModule, name: str) -> bool {
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        if module.functions.get(i).name == name { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// A C library function the Fides runtime implements itself, for `extern
+/// "C"` function `name`: `pert_c_<C name>` (putchar, puts: stdout goes
+/// through this backend's own output, unbuffered and in order with print,
+/// as all of it goes through C stdio in the C backend).  "" = no override.
+pub fn pe_ir_c_override(module: &IrModule, name: str) -> str {
+    var i: i64 = 0;
+    while i < module.extern_decls.len() {
+        var ext: ExternDecl = module.extern_decls.get(i);
+        if ext.pledge_name == name {
+            var over: str = "pert_c_" + ext.c_name;
+            if pe_module_has_fn(module, over) { return over; }
+            return "";
         }
         i = i + 1;
     }
+    return "";
+}
 
-    // Also keep functions registered as extern (they may be called from outside)
-    i = 0;
-    while i < self.extern_functions.len() {
-        var ename: str = self.extern_functions.get(i).name;
-        if !ir_c_str_vec_contains(reachable, ename) {
-            reachable.push(ename);
-            worklist.push(ename);
+/// `PeirGen::resolve_call` for the call graph: an alias, or the Fides
+/// runtime's `pert_X` for builtin `p_X` when the program has it.
+pub fn pe_ir_resolve_callee(module: &IrModule, name: str) -> str {
+    var over: str = pe_ir_c_override(module, name);
+    if over != "" { return over; }
+    var alias: str = pe_runtime_alias(name);
+    if alias != name { return alias; }
+    var p: str = pert_name(name);
+    if p != "" && pe_module_has_fn(module, p) { return p; }
+    return name;
+}
+
+/// The Fides function that formats a printed collection, if any. "" = none.
+pub fn pe_ir_print_formatter(ty: IrType) -> str {
+    match ty {
+        IrType::Opaque(n) => {
+            if n == "Vec" { return "Vec_to_str"; }
+            if n == "HashMap" { return "HashMap_to_str"; }
+            // The Fides runtime's p_tensor_to_str (src/pe_runtime/)
+            if n == "Tensor" { return "pert_tensor_to_str"; }
+            return "";
         }
-        i = i + 1;
+        IrType::Generic(n, _) => {
+            if n == "Vec" { return "Vec_to_str"; }
+            if n == "HashMap" { return "HashMap_to_str"; }
+            return "";
+        }
+        _ => { return ""; }
     }
+    return "";
+}
 
-    // Pre-pass: collect address-taken functions (ConstFnRef targets). These are
-    // the only possible CallPtr/DynCall targets, so on any indirect call we keep
-    // the whole set rather than stripping every closure/dispatch callee.
-    var addr_taken: Vec<str> = Vec::new();
-    var fi0: i64 = 0;
-    while fi0 < self.functions.len() {
-        var f0: IrFunction = self.functions.get(fi0).func;
-        var b0: i64 = 0;
-        while b0 < f0.blocks.len() {
-            var blk0: BasicBlock = f0.blocks.get(b0);
-            var i0: i64 = 0;
-            while i0 < blk0.instructions.len() {
-                match IrFunction_get_inst(&f0, blk0.instructions.get(i0)) {
-                    OptInst::Some(inst0) => {
-                        match inst0 {
-                            Inst::ConstFnRef(fn_name) => {
-                                var taken: str = c_fn_target(fn_name);
-                                if !ir_c_str_vec_contains(addr_taken, taken) {
-                                    addr_taken.push(taken);
+/// IrType::is_opaque_named — Opaque(n) or Generic(n, _) with n == name.
+fn pe_ir_is_opaque_named(ty: IrType, name: str) -> bool {
+    match ty {
+        IrType::Opaque(n) => { return n == name; }
+        IrType::Generic(n, _) => { return n == name; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+/// The runtime builtin an autograd instruction calls (as in the C backend).
+pub fn pe_ir_autograd_builtin(inst: Inst) -> str {
+    match inst {
+        Inst::GradBegin(_) => { return "p_autograd_begin"; }
+        Inst::GradEnd => { return "p_autograd_end"; }
+        _ => { return "p_autograd_backward"; }
+    }
+    return "p_autograd_backward";
+}
+
+/// Functions reachable from `roots`: through calls, function references
+/// (closures, thread entries) and `dyn` method dispatch — the exact set of
+/// names the native backends may emit a call for.
+pub fn pe_ir_reachable_from(module: &IrModule, roots: Vec<str>) -> Vec<str> {
+    var seen: Vec<str> = Vec::new();
+    var work: Vec<str> = roots;
+    var deps: Vec<PeirStrPair> = pe_stub_deps();
+    var prints: Vec<str> = pe_print_builtins();
+    while work.len() > 0 {
+        var f: str = work.pop();
+        if !pe_strs_contains(seen, f) {
+            seen.push(f);
+            // A stub that hands over to the Fides runtime needs that function
+            var di: i64 = 0;
+            while di < deps.len() {
+                var dep: PeirStrPair = deps.get(di);
+                if f == dep.a { work.push(dep.b); }
+                di = di + 1;
+            }
+            match IrModule_get_function(module, f) {
+                OptIrFunction::Some(func) => {
+                    var ii: i64 = 0;
+                    while ii < func.insts.len() {
+                        var inst: Inst = func.insts.get(ii).inst;
+                        match inst {
+                            Inst::Call(callee, args, _, _) => {
+                                work.push(pe_ir_resolve_callee(module, callee));
+                                // print / p_to_str dispatch on the argument type
+                                // (see gen_inst): the Fides runtime may replace
+                                // any of them
+                                if callee == "print" || callee == "p_to_str" {
+                                    var bi: i64 = 0;
+                                    while bi < prints.len() {
+                                        work.push(pe_ir_resolve_callee(module, prints.get(bi)));
+                                        bi = bi + 1;
+                                    }
+                                }
+                                // print(tensor) formats it with p_tensor_to_str
+                                var tensor_arg: bool = false;
+                                if args.len() > 0 {
+                                    var a0: i64 = args.get(0);
+                                    match IrFunction_get_meta(&func, a0) {
+                                        OptValueMeta::Some(m) => {
+                                            tensor_arg = pe_ir_is_opaque_named(m.ty, "Tensor");
+                                        }
+                                        OptValueMeta::None => {}
+                                    }
+                                }
+                                if callee == "print" && tensor_arg {
+                                    work.push(pe_ir_resolve_callee(module, "p_tensor_to_str"));
+                                }
+                            }
+                            Inst::GradBegin(_) => {
+                                work.push(pe_ir_resolve_callee(module, pe_ir_autograd_builtin(inst)));
+                            }
+                            Inst::GradEnd => {
+                                work.push(pe_ir_resolve_callee(module, pe_ir_autograd_builtin(inst)));
+                            }
+                            Inst::Backward(_) => {
+                                work.push(pe_ir_resolve_callee(module, pe_ir_autograd_builtin(inst)));
+                            }
+                            // A function named in a string: a thread or task
+                            // entry point
+                            Inst::ConstStr(value) => {
+                                if pe_module_has_fn(module, value) { work.push(value); }
+                            }
+                            Inst::ConstFnRef(n) => { work.push(c_fn_target(n)); }
+                            Inst::Print(_, ty) => {
+                                var pf: str = pe_ir_print_formatter(ty);
+                                if pf != "" { work.push(pf); }
+                                var bi2: i64 = 0;
+                                while bi2 < prints.len() {
+                                    work.push(pe_ir_resolve_callee(module, prints.get(bi2)));
+                                    bi2 = bi2 + 1;
+                                }
+                            }
+                            Inst::DynCall(_, method, _, _, _) => {
+                                var suffix: str = "_" + method;
+                                var fi: i64 = 0;
+                                while fi < module.functions.len() {
+                                    var fn_name: str = module.functions.get(fi).name;
+                                    if str_ends_with(fn_name, suffix) { work.push(fn_name); }
+                                    fi = fi + 1;
                                 }
                             }
                             _ => {}
                         }
-                    }
-                    OptInst::None => {}
-                }
-                i0 = i0 + 1;
-            }
-            b0 = b0 + 1;
-        }
-        fi0 = fi0 + 1;
-    }
-
-    // BFS: for each reachable function, find all Call targets
-    while worklist.len() > 0 {
-        var fname: str = worklist.get(worklist.len() - 1);
-        worklist.pop();
-
-        match IrModule_get_function(self, fname) {
-            OptIrFunction::Some(func) => {
-                // Scan all instructions for Call targets
-                var bi: i64 = 0;
-                while bi < func.blocks.len() {
-                    var block: BasicBlock = func.blocks.get(bi);
-                    var ii: i64 = 0;
-                    while ii < block.instructions.len() {
-                        var inst_id: i64 = block.instructions.get(ii);
-                        match IrFunction_get_inst(&func, inst_id) {
-                            OptInst::Some(inst) => {
-                                match inst {
-                                    Inst::Call(target, _, _, _) => {
-                                        if !ir_c_str_vec_contains(reachable, target) {
-                                            // Check if the target exists in this module
-                                            match IrModule_get_function(self, target) {
-                                                OptIrFunction::Some(_) => {
-                                                    reachable.push(target);
-                                                    worklist.push(target);
-                                                }
-                                                OptIrFunction::None => {}
-                                            }
-                                        }
-                                    }
-                                    Inst::CallPtr(_, _, _, _, _) => {
-                                        var ati: i64 = 0;
-                                        while ati < addr_taken.len() {
-                                            var atn: str = addr_taken.get(ati);
-                                            if !ir_c_str_vec_contains(reachable, atn) {
-                                                match IrModule_get_function(self, atn) {
-                                                    OptIrFunction::Some(_) => {
-                                                        reachable.push(atn);
-                                                        worklist.push(atn);
-                                                    }
-                                                    OptIrFunction::None => {}
-                                                }
-                                            }
-                                            ati = ati + 1;
-                                        }
-                                    }
-                                    Inst::DynCall(_, _, _, _, _) => {
-                                        var ati2: i64 = 0;
-                                        while ati2 < addr_taken.len() {
-                                            var atn2: str = addr_taken.get(ati2);
-                                            if !ir_c_str_vec_contains(reachable, atn2) {
-                                                match IrModule_get_function(self, atn2) {
-                                                    OptIrFunction::Some(_) => {
-                                                        reachable.push(atn2);
-                                                        worklist.push(atn2);
-                                                    }
-                                                    OptIrFunction::None => {}
-                                                }
-                                            }
-                                            ati2 = ati2 + 1;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            OptInst::None => {}
-                        }
                         ii = ii + 1;
                     }
-                    bi = bi + 1;
                 }
+                OptIrFunction::None => {}
             }
-            OptIrFunction::None => {}
         }
     }
+    return pe_sort_strs(seen);
+}
+
+/// The Fides runtime functions an executable needs: those reachable from
+/// the functions it is made of (every program and stdlib function is
+/// compiled, used or not).
+pub fn pe_ir_needed_functions(module: &IrModule) -> Vec<str> {
+    var roots: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var n: str = module.functions.get(i).name;
+        if !is_pe_runtime_fn(n) { roots.push(n); }
+        i = i + 1;
+    }
+    return pe_ir_reachable_from(module, roots);
+}
+
+/// Functions reachable from `main`: through calls, function references
+/// (closures, thread entries) and `dyn` method dispatch.  Everything, when
+/// there is no `main`.
+pub fn pe_ir_reachable_functions(module: &IrModule) -> Vec<str> {
+    if !pe_module_has_fn(module, "main") {
+        var all: Vec<str> = Vec::new();
+        var i: i64 = 0;
+        while i < module.functions.len() {
+            all.push(module.functions.get(i).name);
+            i = i + 1;
+        }
+        return pe_sort_strs(all);
+    }
+    var roots: Vec<str> = Vec::new();
+    roots.push("main");
+    return pe_ir_reachable_from(module, roots);
+}
+
+/// Remove functions that are never called (except `main` and `p_*` runtime stubs).
+/// This reduces the size of the generated C code significantly.
+///
+/// Reachability is `pe_ir_reachable_from` — the same set of names the pe_ir
+/// and nat_ir backends may emit a call for (resolved aliases / pert_*
+/// stand-ins, function references, dyn method candidates, print dispatch,
+/// thread entry names, autograd builtins).  Keeping anything less removed
+/// functions a backend still calls (M10).
+pub fn IrModule_dead_function_elimination(self: &mut IrModule) -> i64 {
+    if self.functions.len() <= 1 { return 0; }
+
+    // Roots: main, the p_* runtime functions (they may be called from the C
+    // runtime), functions handed to C as callbacks, and extern functions.
+    var roots: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < self.functions.len() {
+        var name: str = self.functions.get(i).name;
+        if name == "main" || name == "main_entry" || (str_len(name) >= 2 && str_byte_at(name, 0) == 112 && str_byte_at(name, 1) == 95) {
+            roots.push(name);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < self.c_callbacks.len() {
+        roots.push(self.c_callbacks.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < self.extern_functions.len() {
+        roots.push(self.extern_functions.get(i).name);
+        i = i + 1;
+    }
+
+    var reachable: Vec<str> = pe_ir_reachable_from(self, roots);
 
     // Remove unreachable functions
     var removed: i64 = 0;

@@ -1,56 +1,85 @@
 # parser.fd — recursive-descent parser
 
-> **Re-verified 2026-10-23:** confirmed — f-string sub-parse still commented out (:5172-5175, Literal(expr_src) instead), resume/spawn-scope/cancel-scope still unparseable (Resume still not a token — see token.md).
+> **Re-audited 2026-11-09** against the current source and the latest `fid` build (s18).
+> The two Oct 23 findings (f-string stub, missing resume/spawn scope/cancel scope) are fixed.
 
-- **Path:** `compiler/parser.fd` — **5,358 LOC** (Rust `src/parser.rs` = 3,657, ~147%)
-- **Role:** token stream → `Program` AST. Produces `ParseResult*` tagged enums (Fides has no `Result<T,E>` — the +1,700 LOC delta is almost entirely this boilerplate, not features).
+- **Path:** `compiler/parser.fd`
+- **LOC:** 5,708 (was 5,358; Rust `src/parser.rs`: 3,657)
+- **Role:** `Vec<Token>` to `Program`. Each `parse_*` returns a `ParseResult*` enum (Ok/Err).
+  Errors are collected per top-level item; `parse()` returns them joined with `"\n"` (:569-571).
 
-## Where it is called
+## Callers
 
-| Caller | Site | Mechanism |
+| Caller | Site | Use |
 |---|---|---|
-| `compiler.fd` | :231-232 | `Parser_with_names(toks, struct_names, enum_names).parse()` — main pipeline (pre-seeded with stdlib type names for struct-literal disambiguation) |
-| `compiler.fd` | :636 | `Parser_new` on a sub-path |
-| `compiler.fd` | :1275-1276 | re-parse after incremental changes |
-| `comptime_eval.fd` | :242-243 | `Parser_new(...).parse()` for comptime source |
+| `compiler/compiler.fd` | :235 `cached_parse` | stdlib and imports (with stdlib type names) |
+| `compiler/compiler.fd` | :653, :697, :789, :1178, :1226, :1475, :1507 | main file, `--no-std`, imports, runtime file, re-parses |
+| `compiler/compiler.fd` | :1605 `turbofish_all()`, :3963 `take_qualified_calls()` | turbofish pass, `module::name` calls |
+| `compiler/comptime_eval.fd` | :242 `Parser_new` | code from `comptime gen` |
+| `compiler/secrecy.fd` | :933 `parser_saw_secret()` | skip the secrecy pass when no `@secret` was seen |
+| `compiler/main.fd` | :3044 | function names for the native line table (`emit`) |
 
-Importers: `compiler.fd`, `comptime_eval.fd`. Both entry points (`Parser_new`, `Parser_with_names`) are live.
+Reached from every command that compiles source. Pipeline stage: front end, after the lexer.
 
-## Verified faithful (code inspection)
+## What the module does now (features missing from the old doc)
 
-- **Precedence parity confirmed**: recursive chain `or → bit_or → bit_xor → bit_and → shift → and → equality → comparison → addition → mult → unary` is *identical* in both trees, and `peek_bin_op`'s numeric table (1–13) matches the chain order — `&&` is deliberately tighter than `|` in this grammar (unconventional vs C, but internally consistent).
-- `recover_to_sync_token` sync set 1:1 (`;` consume, `}`/`fn`/`pub`/`struct`/`enum`/`impl`/`use` stop); error accumulation + `Err(errors.join("\n"))` — same shape.
-- `split_gt` ported: `>>`→`Gt`, `>>=`→`GtEq`, `>=`→`Eq` — nested generics `Vec<Vec<T>>` close correctly.
-- `alias_to_struct` tracked + consulted (:450/:1182 vs Rust :428/:843).
-- `@annotation` on local `val`/`var` ported 1:1 (:2406+); all 15 exotic constructs exist both sides (layer/model/component/system/state-machine/event-handler/query/select/parallel/persist/handle/do/asm/fstring/guard).
-- `parse_type` variant coverage identical; stmt dispatch 1:1 after accounting for `parse_assign_or_expr` split; `?` → `Expr::Try`, `select`, `try {}`, `await`, `spawn <expr>` all present.
-- `parse_block` statement-level recovery: push error + `recover_to_sync_token` + continue — same as Rust.
+- **f-strings parse their expressions** (`parse_fstring_parts`, :5518-5572): each `{expr}` is
+  re-lexed and parsed into `FStringPart::Expr`. `f"v={x + 1}"` prints `v=5` for `x = 4` (verified).
+- **`resume(cont, v)`** (:2634, :3561), **`spawn scope { }`** (contextual, :2637-2647, :3594),
+  **`cancel scope;`** (contextual, :2649-2664, :3622).
+- **Turbofish** `f::<T, U>(args)` (:4870-4896): the type list goes to the module global
+  `g_turbofish_types` and the call is renamed `f::<#k>`; `mono.fd` instantiates it.
+- **Module-qualified calls** `m::f()` for names imported with `use` (:4910-4913, :5361-5362),
+  recorded in `g_qualified_calls`.
+- `@secret` / `@sensitive` set `g_saw_secret` (:5422).
+- Generic bounds on functions (`type_param_bounds`, :1654-1681), trait supertraits (:1440-1445),
+  module-level `var` globals (`parse_global_var`, :1169), type aliases, `asm!` with
+  `clobber(...)` (:5038-5086), if/match as expressions (`parse_if_expr`, `parse_match_expr`).
+- `split_gt` (:439) splits `>>`, `>>=`, `>=` so nested generics close.
+- Precedence chain (documented in docs/reference/reference.md § 4.1): `|>` < `??` < range <
+  `||` < `|` < `^` < `&` < shifts < `&&` < `==` < `<` < `+` < `*` < unary < postfix.
 
 ## Findings
 
-### HIGH — f-string interpolation is dead end-to-end *(verified by inspection)*
+### Verified live
 
-`parse_fstring_parts` (:5129-5184) extracts `{expr}` correctly (brace-depth tracking at :5146-5165) — then the sub-lex/sub-parse is **commented out** behind a TODO ("Re-enable when cross-module Lexer usage is fixed") and the raw source is pushed as `FStringPart::Literal(expr_src)` (:5175).
+- **FIXED — f-string interpolation.** Sub-parse restored (:5554-5562).
+- **FIXED — `resume`, `spawn scope`, `cancel scope`.** All three parse to their `Stmt` variants.
+- **INFO — errors are joined into one string.** Two parse errors in one file come back as one
+  `Err` text; `enrich_errors` then shows the source caret only for the first (seen in a probe:
+  errors at 1:87 and 1:151, one caret).
 
-Rust does the real thing at src/parser.rs:3642-3646 — `Lexer::new` + `Parser::new` + `parse_expr` → `FStringPart::Expr`.
+### From code inspection
 
-**Effect:** `f"val={x + 1}"` parses to `[Lit("val="), Lit("x + 1")]` — braces stripped, expression never evaluated, renders `val=x + 1`. Silently wrong output. `FStringPart::Expr` is fully wired downstream (borrowck :684/:1684, codegen :1322) but the parser never produces it — dead variant in practice.
-
-*Not verified live — no `release/fides-c3.exe` in this workspace; `fidesc.exe` uses the Rust parser which works.*
-
-### MEDIUM — `resume`, `spawn scope {}`, `cancel scope;` unparseable *(code inspection)*
-
-Rust's parser handles all three (`parse_resume_stmt` :1578, `Stmt::SpawnScope` :1858, `Stmt::CancelScope` :1867). Fides has **zero** references — `resume` isn't even a `TokenKind`, `spawn` only parses the expression form (`Expr::Spawn` at :4610), `cancel` falls through to ident. Source-level drop matching run-30's AST-level absence — effect handlers can bind but never resume; structured concurrency scopes don't exist.
-
-### Positive — `parse_expr_iterative` depth escape hatch *(Fides-only)*
-
-Explicit-stack shunting-yard (:4747) invoked when `expr_depth > 256` inside tuple-element parsing (:4828-4838) — a self-hosting adaptation the Rust side doesn't need. Precedence table verified identical to the recursive chain — deep expressions don't flip semantics.
+- **MEDIUM — `parse_expr_iterative` is dead and wrong.** Its only call is from itself (:5208), so
+  the recursive parser never uses it. If it were used: `peek_bin_op` maps `|>` and `??` to
+  `BinOp::Or` (:5103-5104), and it calls `parse_primary`, so unary, postfix, `as` and ranges are
+  not handled. The old doc listed it as a working depth escape hatch; that is wrong. The
+  `expr_depth` / `max_expr_depth` counters (:4694-4699, :4926-4932) only feed this dead path.
+  Deep nesting relies on the recursive parser and the stack guard. Delete it or fix and wire it.
+- **LOW — module globals are never reset.** `g_turbofish_types`, `g_import_names` (:209-216) and
+  `g_saw_secret` (:5707) live for the whole process. In `fid lsp`, which parses on every
+  request, they grow without bound and an `@secret` seen once stays set.
+- **LOW — f-string sub-parser loses context.** It uses `Parser::new` (:5558), so the user's struct
+  and enum names are not known inside `{...}` (struct literals there may parse as blocks), and
+  error positions are relative to the snippet (line 1).
+- **LOW — `Parser_new` and `Parser::new` are the same 50 lines twice** (:275-334, :336-385),
+  including the hard-coded list of the compiler's own AST type names.
+- **LOW — `where` is a keyword but has no grammar rule.** A `where` clause is a parse error.
+  docs/reference/reference.md says this is intended (reserved).
+- **INFO — `str_vec_has(self.struct_names, ...)` is a linear scan** (:4910) next to the
+  `struct_name_set` hash map that exists for this purpose.
 
 ## Fix order
 
-1. **Restore f-string sub-parse** — highest user-facing impact; the infrastructure (`Lexer` in parser.fd scope, `FStringPart::Expr` consumers) already exists. Needs the "cross-module Lexer" issue resolved or worked around (parser.fd already imports lexer indirectly? check what's blocking).
-2. Port `resume`/`spawn scope`/`cancel scope` only if effects/structured-concurrency are a real target — they need AST variants first (ast.fd), so this is a feature decision, not a parser fix.
+1. Delete `parse_expr_iterative`, `OpEntry`, `reduce_one_op`, `BinOpInfo`, `peek_bin_op` and the
+   depth counters (or fix the operator table and the primary/unary call before wiring it).
+2. Reset the parser globals at the start of each build (needed for the LSP).
+3. Pass the caller's struct/enum names to the f-string sub-parser and offset its error lines.
+4. Merge `Parser_new` and `Parser::new`.
 
 ## Verification state
 
-- No live runs (self-hosted binary absent). All findings from side-by-side source inspection: dispatch coverage diffed token-by-token, precedence tables compared numerically, recovery sets compared literally, construct lists counted 15/15.
+- `fid check compiler/parser.fd`: no errors (14 s).
+- Live probes with `fid run`: f-string interpolation, parse error reporting.
+- `parse_expr_iterative` call sites found by grep over `compiler/*.fd` (one self-call only).

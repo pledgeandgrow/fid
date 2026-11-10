@@ -40,6 +40,35 @@ against.
 | **Since Nov 9:** Windows x64 on the machine layer (opt-in `fid emit --nat`), line tables | `compiler/nat_ir.fd`, `nat_enc.fd`, `stdlib/linux_runtime/win.fd` | a PE with imports, the Linux runtime over kernel32; 301 of 338 suite tests; `.debug_line` on Linux |
 | Reference escape check (references are second-class) | `compiler/escape.fd` | a language rule, not yet used by the optimizer |
 
+**Audit notes (Nov 9, from reading every module; details in
+docs/file-analysis/):** the table above is from Nov 7–9 and lags the code
+in these places.
+- iropt.fd has about 20 passes, not 4: module passes inline, gconst (on)
+  and inline2, envtrim, ipcp, spec (opt-in); per function fold,
+  branchfacts, sccp, promote, devirt, dce, tailcall, gvn, licm (on) and
+  the iropt_me passes, simplify, branchfold, dse (opt-in); deadf is opt-in.
+  `FID_IROPT_OFF` / `FID_IROPT_ON=name|all` are the switches: there is no
+  `--no-pass` flag (ME5), and `iro_time` does not time devirt or the
+  module passes. Not run on the C path.
+- WP7 (envtrim) is written and opt-in since the evening of Nov 9 (a
+  caller still passes the trimmed environment slot); WP14 (specialize) is written, opt-in;
+  WP15 (deadf) and WP10 (read-only call merging, `FID_RULES_ON=readcse`)
+  are opt-in now, and WP10 misses a write after the call in a loop body;
+  WP5 never takes effect (the only indirect-call target comes from a load);
+  WP8 and WP17 have uncommitted code (WP8 never fires); WP20's facts
+  writer and reader disagree on the effect format.
+- ME13 and branchfacts treat float compares like integer ones (wrong for
+  NaN); ME14/SCCP folds narrow integer types with 64-bit arithmetic, so a
+  narrow overflow panic is lost (known-bugs 2g.11, 2g.12).
+- The machine layer is also x86-64 (Linux and `--nat`), its pool includes
+  caller-saved registers with IPRA, and `ng_regalloc` remains for
+  `FID_NAT_OFF=mir`. rules and the e-graph run on `--nat` Windows too.
+- The old PIR path is still used by `emit --boot`, `codegen` and
+  `build --native` with the default target (which panics in
+  `pass_jump_thread`, not `pass_dse`).
+- LF1: lower.fd now sets `borrow_kind` on reference parameters
+  (uncommitted, Nov 9).
+
 The cost of today's shape: `pe_ir` and `nat_ir` lower the same IR twice, with
 two register allocators, two call lowerings and two sets of overflow-check
 sequences. Every improvement is written twice, or only once.
@@ -146,9 +175,20 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       registers, are callee-saved there too), TLS in a TlsAlloc slot, the
       TEB's StackLimit per task context. The runtime is the Linux one with its
       system calls mapped onto kernel32 / ws2_32 / bcrypt (win.fd). Suite: 301
-      of 338 match the interpreter. Left: pe_ir's optimizations (copy
-      coalescing, rotation, xmm values) measured against it, processes (a
-      hook in `pe_sh`), PDB (DB3), then the switch of the default.
+      of 338 match the interpreter (304 with the `pe_sh` hook platforms added).
+      Measured against pe_ir (best of 3, Nov 9): fib 1400 / 1598 ms, loop
+      4018 / 13043, sieve 485 / 1003 (3537 before), hashmap 1450 / 2568,
+      float loop 642 / 1364. Closed since: inline `Vec_len/get/set/push`
+      (`vecinline`, on every target), checks.fd's unchecked operations
+      (`unchecked`), RA5, RA6, RA8, RA18's first step, division panics with
+      " at line N" (`panicline`). The runtime conditions (platforms, RT9,
+      RT13, RT15): a task yield 252 ns (pe_ir 243), a task's stack overflow
+      "Panic: Stack overflow" with status 1 (the TEB stack fields travel
+      with nat_ctx_swap, the guard a PAGE_GUARD page), 200 echo clients.
+      pe_runtime retires with pe_ir (agreed with platforms). Left before the
+      default switches: the speed gap above (an xmm register class,
+      splitting at calls, cheaper calls), RT11's epoll over AFD (platforms,
+      in win.fd), PDB (DB3).
 - [x] MI15. A Linux x86-64 target on MIR for free once x64 is ported: the ELF
       writer of `nat_enc.fd`, the Linux runtime, x64 selection (M).
       Nov 9: Linux x86-64 on the MIR (`fid emit --target x86_64-linux`): its own
@@ -208,15 +248,25 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       x8–x11, RISC-V t4); x86-64 has none spare.
 - [ ] RA4. Live-range splitting at calls and at loop boundaries, with spill code
       placed outside loops (L).
-- [ ] RA5. Spill weights from loop depth and use counts (M).
+- [x] RA5. Spill weights from loop depth and use counts (M).
+      Nov 9: `ng_spill_weights`: each use or definition 8^(loop depth), the
+      loops from back edges in the MIR; with no register free the cheapest
+      range gives its register up (`FID_NAT_OFF=weights`: the range ending
+      last, linear scan's rule).
 - [~] RA6. Copy coalescing on MIR (what `pe_ir`'s `PEIR_COALESCE` does), so
       `i = i + 1` is one instruction on every target (M).
       Move hints: a move's two sides prefer one register, so `ng_st_val` after an
-      operation costs nothing.
+      operation costs nothing. Nov 9: coalescing in `ng_mir_alloc` (union-find
+      over vreg copies whose two sides never change while the other lives),
+      the copy left a move to itself; the checker validates it
+      (`FID_NAT_OFF=coalesce`).
 - [ ] RA7. Register hints: arguments, results and call operands prefer the
       registers they must end in (M).
-- [ ] RA8. Rematerialization of constants, addresses of globals and frame slots
+- [~] RA8. Rematerialization of constants, addresses of globals and frame slots
       instead of spills (M).
+      Nov 9: constants: a vreg defined once by MO_LI is never stored, a spilled
+      one is loaded again where used, and its spill weight is 1
+      (`FID_NAT_OFF=remat`). Left: addresses of globals and slots.
 - [ ] RA9. Second-chance or backtracking allocation in the style of regalloc2 /
       LLVM's greedy, behind a switch, compared with linear scan (XL).
 - [ ] RA10. Register classes: integer, float, and pairs where a target needs them
@@ -233,11 +283,17 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       Nov 8: `ng_mir_check`, an independent exact liveness walk; it found a real
       bug at once (a vreg read before its block defines it was treated as local).
 - [~] RA16. Run the checker on the whole suite in CI for every target (S).
-      Run on the whole suite with `FID_VERIFY=1` on AArch64, RISC-V and x86-64;
-      not in CI.
+      Run on the whole suite with `FID_VERIFY=1` on AArch64, RISC-V and x86-64.
+      Nov 9: `scripts/nat-gate.sh`, the gate CI runs (one job per host after
+      fid is built): the verifier and the checker on every native target,
+      `fid test-rules`, the z3 proofs; exits non-zero on any failure.
 - [ ] RA17. Statistics per function: spills, reloads, moves; `--stats` prints them
       (S).
-- [ ] RA18. Floats and integers allocated by the same algorithm, class-aware (M).
+- [~] RA18. Floats and integers allocated by the same algorithm, class-aware (M).
+      Nov 9, a first step on x86-64: floats still live in general registers,
+      but the emitter remembers which register xmm0/xmm1 mirror and does not
+      move an operand again (`FID_NAT_OFF=xmmcache`): the float loop 1834 ->
+      1364 ms. Left: an xmm register class in the allocator.
 - [ ] RA19. A value used only as a branch condition stays in flags where the
       target has them (M).
 - [x] RA20. The allocator honours IPRA clobber sets (Track WP) at each call (M).
@@ -314,12 +370,18 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       load that has a single reaching store across the whole CFG. Merges
       where predecessors disagree (or a store meets an uninitialized path)
       still need phis — Jump/Branch carry no edge arguments — and stay in
-      memory.
+      memory. Nov 9 (later): two soundness bugs fixed — store operands are
+      re-read live (`iro_store_val`) so an earlier promotion cannot leave a
+      dangling id, and loads read by `TryUnwrap`/`Asm` are never dropped
+      (`iro_unhandled_uses`); regression `tests/bootstrap/test_mem2reg_promote.fd`,
+      log M8.
 - [x] ME4. An IR verifier after every pass in debug builds: types, dominance,
       terminators, block parameters (M).
       Nov 8: `compiler/irverify.fd` (`FID_VERIFY=1`), after lowering, iropt, the
       rules and the e-graph; it found 3 lowering bugs (2 fixed in lower.fd by the
-      ownership session).
+      ownership session). Nov 9: wired into the Windows PE emit path too
+      (`main.fd`, checks after lowering and after `iropt_native`) — it does
+      not flag semantic miscompiles like M9 (structurally-valid-but-wrong IR).
 - [x] ME5. One pass manager: order, per-pass timing, a switch to turn each off
       (`--no-pass=name`), and `iro_pass_on` folded into it (M).
       Switches per pass: `FID_IROPT_OFF`, `FID_NAT_OFF` (mir, promote, ipra, fold,
@@ -356,9 +418,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       that would drop a division or shift panic); `(x+c1)+c2` reassociation
       keeping overflow semantics; `*2^k`→`<<`, `/2^k`→`>>`, `%2^k`→`&` under
       the documented safety conditions. Nov 9: a native run of the suite with
-      `simplify`, `branchfold` and `dse` on and off differs on test_args,
-      test_bigint, test_brotli, test_decimal and test_counted_loop, so the
-      three are opt-in (`FID_IROPT_ON`) until that is found.
+      `simplify`, `branchfold` and `dse` on and off differed on some
+      programs; turning one pass off at a time puts every difference on
+      `branchfold` (10 programs, wrong booleans); `simplify` and `dse` change
+      no output. The three are opt-in (`FID_IROPT_ON`); `branchfold` stays off
+      (SCCP folds constant branches anyway).
 - [x] ME13. Comparison and branch simplification: `!(a < b)` to `a >= b`, known
       results from dominating conditions (M).
       Comparisons flipped and same-operand comparisons folded. Nov 9: pass
@@ -458,34 +522,107 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       touch them (M).
       Each function's clobber mask after allocation; callers keep values in
       caller-saved registers across calls that do not touch them.
-- [ ] WP5. IPRA through indirect calls: a closure or `dyn` call clobbers the union
+- [x] WP5. IPRA through indirect calls: a closure or `dyn` call clobbers the union
       of its possible targets when they are known, everything otherwise (M).
-- [ ] WP6. Custom conventions for internal functions: arguments in the registers
+      `ng_call_mask_i` (`compiler/nat_ir.fd`): the CALLR operand is traced back
+      through in-block MOV chains to `MO_ADDR` labels (and, for cross-block
+      vregs, the union over its def sites); each label's recorded callee mask
+      is OR-ed in. Any unresolved def falls back to the full mask.
+- [~] WP6. Custom conventions for internal functions: arguments in the registers
       the caller already has them in, more than 8 register arguments, results in
       several registers (L).
-- [ ] WP7. `__env` dropped from functions that never read it, at every call (S).
-- [ ] WP8. Leaf functions without frames, with no frame record where traces do not
+      `internal_conv` on `IrFunction`, marked by `iro_env_trim` for every
+      function meeting the internal predicate (not address-taken, not a dyn
+      target, not extern/callback/runtime). nat_ir consults it on both sides:
+      `ng_load_args_i`/`ng_argreg_i`/`ng_nregargs_i` give internal calls the
+      extended set — x64 gains r9 (4->5; r8/r10/r11 are the generator's
+      temporaries), AArch64 gains x13-x15 (8->11), RISC-V gains t6 (8->9).
+      pe_ir ignores the flag and keeps the platform convention everywhere —
+      consistent because a call is emitted by one backend. Not done:
+      multi-register results (IR `Return` is single-value) and the
+      args-already-in-registers case the allocator's hints mostly cover.
+- [x] WP7. `__env` dropped from functions that never read it, at every call (S).
+      `iro_env_trim` (`compiler/iropt.fd`): removes `params[0]` and the
+      matching `args[0]` at every direct `Inst::Call`. Address-taken
+      (`ConstFnRef`), `Type_method` dyn targets, externs, C callbacks,
+      runtime prefixes, `main`/`main_entry` keep the uniform convention, so
+      `CallPtr` closures still pass an environment. Same pass marks
+      `internal_conv` (WP6).
+- [~] WP8. Leaf functions without frames, with no frame record where traces do not
       need it (S).
-- [~] WP9. Effects as optimizer facts: a call to a function with no effects is a
+      `g.leaf` in nat_ir: a function with no calls, no callee-saved spills
+      and an empty frame skips the prologue/epilogue — `ng_epilogue` emits
+      only the architecture return on x64/a64/rv. MIR path only (the
+      default); a64/rv runtime behaviour unverified (no qemu).
+- [x] WP9. Effects as optimizer facts: a call to a function with no effects is a
       pure value in the e-graph (merged, hoisted, removed when unused) (M).
-      Calls of program functions with no effects and scalar results are merged
-      under dominance (never hoisted: they may panic).
-- [ ] WP10. `!read`-only calls merged when no write lies between them (M).
-- [ ] WP11. `@crashfree` functions: their panic paths are absent, so callers need
+      `ru_pure_cse` (`compiler/rules.fd`): merged under dominance, never
+      hoisted — calls may panic. Eligibility uses `ru_ext_effects`: local
+      Alloca traffic and stores through unescaped Allocas are invisible, so
+      `!read`-annotated callees with local writes still qualify. Call args key
+      on constant *values* (each call emits its own ConstInt).
+- [x] WP10. `!read`-only calls merged when no write lies between them (M).
+      `ru_read_call`/`ru_read_reuse`: same-block and dominating-block merges
+      with a backward CFG scan for barriers — any side-effecting inst except
+      a Store to an unescaped caller Alloca (invisible to the callee).
+      Verified: two adjacent `!read` calls merge; a `poke()` between them
+      blocks the merge.
+- [~] WP11. `@crashfree` functions: their panic paths are absent, so callers need
       no panic edges for them (S).
-- [ ] WP12. `@no-alloc` functions: no allocator state is live across them (S).
-- [ ] WP13. Interprocedural constant propagation: a parameter always passed the
+      Two uses. Optimizer: `ru_ext_effects` strips `Diverge` so `@crashfree`
+      `!read` callees (e.g. stdlib `vec_code`) merge as read-only calls.
+      Codegen: `ng_panic_if` elides recorded panic checks — opt-in via
+      `FID_NAT_ON=crashfree`, because the emit path does not verify the
+      annotation and a wrong one silently miscompiles (panicking program
+      ran clean before the gate). No caller-side panic edges exist in this
+      backend (panic aborts; no unwinding).
+- [~] WP12. `@no-alloc` functions: no allocator state is live across them (S).
+      `ru_ext_effects` strips `Alloc` under the same annotation-trust model
+      as `@wrapping`, improving effect classification for merging. The
+      literal item — keeping no allocator state live across the call — has
+      no mechanism to attach to: the nat backend caches no allocator state
+      in registers across calls.
+- [x] WP13. Interprocedural constant propagation: a parameter always passed the
       same constant becomes that constant (M).
-- [ ] WP14. Function specialization: a hot function cloned for a constant argument
+      `iro_ipcp` (`compiler/iropt.fd`): one pass collects per-candidate
+      constant arguments across all `Inst::Call` sites; constants are emitted
+      into each candidate's entry block and uses renamed. Excluded: `main`,
+      address-taken (`ConstFnRef`), `dyn` targets (`Type_method` reachable via
+      DynCall), externs, C callbacks, runtime prefixes. Opt-in (`FID_IROPT_ON`)
+      per the earlier miscompile note.
+- [~] WP14. Function specialization: a hot function cloned for a constant argument
       (M).
-- [ ] WP15. Dead function and dead global elimination after optimization, not only
+      `iro_specialize` + `iro_clone_function` (`compiler/iropt.fd`): params
+      constant at some but not all call sites get a clone per observed
+      constant (`name_sc<param>_<value>`, <=2 values/param, <=4 clones/fn,
+      <=200 insts) with the constant emitted in the clone's entry and the
+      matching sites redirected. Same exclusions as IPCP. Opt-in
+      (`FID_IROPT_ON=spec`) given the IPCP miscompile history; verified
+      `spec 44` clones with identical program output.
+- [x] WP15. Dead function and dead global elimination after optimization, not only
       before (S).
-- [ ] WP16. Devirtualization: `dyn` calls whose receiver type is known become
+      `iropt_native` calls `IrModule_dead_function_elimination` after the pass
+      loop. Seeds fixed for correctness: `c_callbacks` and `Type_method`
+      targets of `DynCall` (found via `MakeDyn`) are kept — previously dropped,
+      which miscompiled trait-object programs.
+- [~] WP16. Devirtualization: `dyn` calls whose receiver type is known become
       direct calls; closures called at one site are inlined (M).
-- [ ] WP17. Global layout: hot functions together, cold panic paths at the end of
+      `iro_devirt` (`compiler/iropt.fd`): a `DynCall` whose receiver's
+      definition is `MakeDyn` becomes a direct `Call` to `Type_method` with
+      the callee's real effects. One-site closure inlining not done (closure
+      {fn,env} pairs are built at runtime, not traceable in the IR).
+- [~] WP17. Global layout: hot functions together, cold panic paths at the end of
       the image (M).
-- [ ] WP18. Globals that are never written after initialization become constants
+      `ng_cold_last` (nat_ir): within each function, MIR segments ending in
+      `MO_TRAP` — the panic paths — are moved to the end so the hot path
+      stays compact. Function-local reorder only; program-level hot/cold
+      function ordering across the image not done.
+- [x] WP18. Globals that are never written after initialization become constants
       (S).
+      `iro_const_globals` (`compiler/iropt.fd`): a global with an `IntLit`
+      initializer whose address is only ever loaded — no stores through it,
+      no escaping uses — has its integer loads folded to the initializer.
+      Verified: ~295 loads folded per build on the suite, outputs unchanged.
 - [~] WP19. Generics fully monomorphized with sharing of identical bodies (code
       folding by hash) (M).
       Identical functions (same MIR and allocation) are emitted once.
@@ -494,48 +631,94 @@ week), L (several weeks), XL (months). Each goal names where it lands.
 
 ## Track LF — The language's guarantees as optimizer facts (25)
 
-- [ ] LF1. Alias facts from types: a `&mut` parameter aliases nothing else live;
+- [~] LF1. Alias facts from types: a `&mut` parameter aliases nothing else live;
       two `&mut` never alias (M).
+      Nov 9 (`compiler/iropt_me.fd`, `ime_may_alias`): two different
+      parameters never overlap (a function writes only through a `&mut`, and
+      the borrow rules let nothing else reach that place); `*u8` parameters
+      (strings, unsafe code) are left out, and parameters against globals may
+      overlap. The IR does not mark `&mut` (`borrow_kind` is never set), so
+      the rule rests on the borrow checker.
 - [~] LF2. References are second-class (`escape.fd` proves it): the optimizer may
       assume a reference's target outlives every use and is never stored (M).
-- [ ] LF3. Owned values have one owner: a load through an owned `Vec`'s data
+      Nov 9: the alias query relies on it (a parameter's place is reached
+      only through that parameter and what is derived from it).
+- [~] LF3. Owned values have one owner: a load through an owned `Vec`'s data
       pointer cannot be changed by a store through any other name (M).
-- [ ] LF4. Alias analysis as a query interface, answered from LF1–LF3, used by
+      Nov 9: for locals: a local whose address goes only to loads, stores and
+      field addresses overlaps nothing else, and no call can write it
+      (`ime_unescaped`). A Vec's buffer is reached through calls to core, so
+      its elements are not yet in the query.
+- [~] LF4. Alias analysis as a query interface, answered from LF1–LF3, used by
       DSE, LICM of loads and store forwarding (M).
-- [ ] LF5. Loads hoisted out of loops when the loop writes nothing that aliases
+      Nov 9: `ime_may_alias(p, q)` and `ime_writes(inst, p)` (where an address
+      comes from: a local, a parameter, a global, with its field path); used
+      by LF5, LF6 and LF23. DSE (`iro_dse`, iropt.fd) does not use it yet.
+- [~] LF5. Loads hoisted out of loops when the loop writes nothing that aliases
       them (M).
-- [ ] LF6. Store-to-load forwarding and redundant load removal (M).
+      Nov 9: written, opt-in (`FID_IROPT_ON=loadhoist`), not run on the suite yet: a load of a
+      local's or a parameter's field whose address is computed before the loop
+      moves to the preheader when nothing in the loop may write it
+      (`ime_hoist_loads`).
+- [~] LF6. Store-to-load forwarding and redundant load removal (M).
+      Nov 9: written, opt-in (`FID_IROPT_ON=forward`), not run on the suite yet: in a block, a
+      load of a place just stored or loaded, with no write that may overlap
+      it between, becomes that value (`ime_forward`).
 - [~] LF7. Bounds and overflow checks dropped on counted loops (release D12,
       `checks.fd`) (done for `while i < v.len()` and `for i in 0..n`).
 - [~] LF8. Integer range analysis drops checks whose operands cannot overflow
       (`checks.fd`, `PEIR_RANGES`); extend it to every loop and branch (L).
-- [ ] LF9. Ranges from conditions: inside `if i < n`, `i < n` is a fact (M).
+      Nov 9: facts carried through jumps into single-entry blocks (`n - 1`
+      after `if n < 2 { return }` is unchecked), and a Vec only filled with
+      `Vec::filled(n, x)` and never shortened bounds its indexes (sieve).
+      Not yet: facts merged at joins.
+- [~] LF9. Ranges from conditions: inside `if i < n`, `i < n` is a fact (M).
+      Holds in blocks with that branch as their only way in, and through
+      jumps from them (`peir_range_refine`); not after a join.
 - [ ] LF10. Ranges through function boundaries for internal functions (WP13) (M).
 - [ ] LF11. Check hoisting: one check before a loop instead of one per iteration,
       when the loop is versioned (ME25) (M).
-- [ ] LF12. Narrow types as ranges: a `u8` value needs no overflow check on a
-      widening add (S).
-- [ ] LF13. Escape analysis: a `Vec`, `str` or struct that never leaves its function
-      is allocated on the stack (L).
+- [x] LF12. Narrow types as ranges: a `u8` value needs no overflow check on a
+      widening add (S). `peir_type_range` on narrow loads and `IntExtend`.
+- [~] LF13. Escape analysis: a `Vec`, `str` or struct that never leaves its function
+      is allocated on the stack (L). Nov 9: a local Vec whose value only
+      reaches core's Vec functions keeps its 40-byte header on the stack
+      (`lw_rc_stack_vecs`, `LOWER_STACK_VECS`); not yet strings, structs or the
+      buffer itself, or a Vec passed to the program's own functions.
 - [ ] LF14. Scalar replacement of a non-escaping `Vec` of known small length (M).
-- [ ] LF15. Reference counts removed where ownership is known (proposal 0004): no
-      `Vec_share` / drop pairs on values that are moved (M).
+- [~] LF15. Reference counts removed where ownership is known (proposal 0004): no
+      `Vec_share` / drop pairs on values that are moved (M). Moves on last use
+      (Nov 7), and in one block: Str and Box count/drop pairs, a Vec or map
+      shared only to be read (`lw_rc_cancel_pairs`, `LOWER_CANCEL_SHARES`).
+      Not yet across blocks.
 - [ ] LF16. Copy-on-write checks removed where a value has one owner provably (M).
-- [ ] LF17. Drops of values known to be empty or static removed (S).
+      Low gain now: the C and native fast paths test the capacity's sign once.
+- [~] LF17. Drops of values known to be empty or static removed (S). String
+      literals, and string variables only ever assigned literals
+      (`LOWER_LITERAL_SLOTS`); an empty Vec still frees its header.
 - [ ] LF18. `@deterministic` and `@constant_time` respected by every pass: no rule
       may add a branch on secret data (the verifier of release session 30 runs on
       every target) (M).
-- [ ] LF19. `@zeroize` stores kept by DSE (a pass may not remove them) (S).
+- [x] LF19. `@zeroize` stores kept by DSE (a pass may not remove them) (S).
+      iropt's `dse` never touches `zeroize_locals`.
 - [ ] LF20. `@secret` values never spilled to memory unencrypted where a register
       will do, and their spill slots cleared (M).
 - [ ] LF21. Regions freed in one step instead of object by object (release C6) (M).
-- [ ] LF22. `comptime` results as constants the mid-end folds further (S).
-- [ ] LF23. Pattern matching facts: after a `match` arm, the scrutinee's variant is
+- [~] LF22. `comptime` results as constants the mid-end folds further (S).
+      Nov 9: what `comptime` computes reaches the IR as constants already
+      (the front end's comptime pass); fold, SCCP and branch facts fold
+      further from them. No pass of its own is needed; a test that checks it
+      is still to write.
+- [~] LF23. Pattern matching facts: after a `match` arm, the scrutinee's variant is
       known, so later tag checks fold (M).
+      Nov 9: written, opt-in (`FID_IROPT_ON=matchfacts`), not run on the suite yet: where a branch on
+      `load(tag) == k` enters its arm, loads of that tag in the blocks the arm
+      dominates become k when nothing there may write it (`ime_match_facts`).
 - [ ] LF24. `Option` and `Result` in registers: tag and payload as two values, no
       memory for small payloads (M).
-- [ ] LF25. A document listing each language fact the optimizer uses, the rule that
+- [x] LF25. A document listing each language fact the optimizer uses, the rule that
       guarantees it, and the test that breaks if the rule is broken (S).
+      docs/reference/optimizer-facts.md.
 
 ## Track SP — Compile speed (20)
 

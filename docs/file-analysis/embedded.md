@@ -1,84 +1,61 @@
-# embedded.fd — embedded/IoT support scaffolding (511 LOC)
+# embedded.fd — embedded/IoT scaffolding
 
-> **Re-verified 2026-10-23:** still dead in both implementations — zero importers on either side. Findings accurate.
+- **Path:** `compiler/embedded.fd` — module `compiler::embedded`
+- **LOC:** 511 (2026-11-09, unchanged). Rust `src/embedded.rs`: 622.
+- **Role:** four "Phase 5B" models: `FixedBufferAllocator` (a bump
+  allocator over a `Vec<i64>`), `BinarySizeOptimizer` (size report and
+  advice strings), `RealTimeAnalyzer` (flags → Safe/Violation), and
+  `HalFramework` (device/register table → generated Fides accessor source).
+- **Status:** DEAD. Nothing imports it, here or in Rust.
+- **Re-audited:** 2026-11-09.
 
-## Role
+## Where it is called
 
-"Phase 5B" embedded features: `FixedBufferAllocator` (deterministic
-bump allocator), `BinarySizeOptimizer` (size report/recommendations),
-`RealTimeAnalyzer` (real-time safety checks), `HalFramework` (device
-registry + Fides FFI-binding generator). Port of `src/embedded.rs`
-(622 LOC).
+**Nowhere.** No `use compiler::embedded` and no reference to any of its
+types outside the file (grep 2026-11-09 over `compiler/`, `stdlib/`,
+`tests/`, `scripts/`). Not reachable from main.fd; no CLI command or
+pipeline stage uses it. Rust: `src/lib.rs` declares `pub mod embedded`,
+nothing uses it.
 
-## Where it's called
+The language features with similar names are implemented elsewhere and do
+not use this file: `@firmware` / bare-metal checks in typechecker.fd
+(`is_os_dependent_func`, :3608), `p_phys_read*/write*` in codegen_c.fd and
+the interpreter stubs. There is no `RealTime` effect in typechecker.fd.
 
-| Caller | Site | What |
-|--------|------|------|
-| — | — | **Nothing.** No `use compiler::embedded`; no references to any of its types outside the file. **Dead in Rust too** — `src/lib.rs:54` declares `pub mod embedded` but `embedded::` is referenced nowhere in `src/`. |
-
-Seventh dead module — and the first that was dead *before* the port.
+Imports: `core`, `vec`, `string`. `s18.exe check compiler/embedded.fd`: no
+errors.
 
 ## Findings
 
-### F1 — Spec-feature scaffolding, dead on both sides — HIGH (dead)
+### From code inspection
 
-None of the four subsystems is wired to a pipeline stage, CLI flag, or
-effect check. The module documents intended design (F13/embedded
-targets) rather than working code.
+1. **STILL TRUE, HIGH (dead) — scaffolding only.** None of the four parts
+   is wired to a stage, flag or effect check.
+2. **STILL TRUE, MEDIUM — `RealTimeAnalyzer_status` says `Safe(0)` for a
+   function never checked** (:264-276). Needs an "unchecked" state.
+3. **STILL TRUE, MEDIUM — `BinarySizeOptimizer_analyze` counts the whole
+   binary as `.text`** (:155-165); data/bss/debug are hard 0; the
+   recommendations are the same strings whatever the input.
+4. **STILL TRUE, LOW — `FixedBufferAllocator`** hands out offsets into its
+   own `Vec<i64>` (one i64 per "byte"); `free` drops the record without
+   reclaiming (:43-75).
+5. **STILL TRUE, LOW — HAL generator** (:371-407): emits
+   `fn dev_reg_read() -> uN !Read { return p_phys_readN(0x…); }` and a
+   `_write` for non-read-only registers. Write-1-to-clear gets a plain
+   write; widths other than 8/16/32/64 produce types such as `u24`; no
+   read-modify-write helper. `p_phys_read*`/`write*` exist in the C runtime.
+6. **STILL TRUE, LOW — local `int_to_str` / `int_to_hex`** (:470-500)
+   duplicate the stdlib ones; `char_from_digit` / `hex_char` are `pub`
+   (:501, :507) for no caller.
 
-### F2 — `RealTimeAnalyzer_status` returns `Safe(0)` for unchecked — MEDIUM (latent)
+## Fix order
 
-`:264-276` — looking up a function that was never analyzed returns
-`Safe(0)` instead of an "unverified" state — a caller iterating a
-program would see **unverified functions reported as real-time-safe**.
-Should be a third variant (`Unknown`/`Unchecked`).
-
-### F3 — `BinarySizeOptimizer_analyze` is a stub in disguise — MEDIUM
-
-`:155-165` — `total_size = binary.len()`, `text_size = binary.len()`,
-data/bss/debug hard-zeroed: it counts the *entire* binary as .text
-with no section parsing — the "report" is `len()` with extra steps.
-`recommendations` emits generic advice strings regardless of content.
-
-### F4 — `FixedBufferAllocator` is a simulation, not an allocator — LOW (by design)
-
-It manages a `Vec<i64>` of "bytes" — offsets, not real pointers —
-fine as a model, but `alloc` returning raw offsets means generated
-embedded code couldn't use it for actual storage; `free` removes the
-record without reclaiming (documented, still a leak-by-design).
-
-### F5 — `HalFramework_generate_bindings` — latent issues — LOW
-
-The generator is the most substantive piece (emits
-`fn dev_reg_read() -> u32 !Read { return p_phys_read32(0xADDR); }`
-per register — `p_phys_read*` builtins **do exist** in codegen_c
-:756-763, so emitted code could compile). But:
-- `WriteToClear` access gets a plain `_write` fn — W1C semantics
-  (write-1-to-clear) aren't modeled.
-- `txctrl`/`rxctrl`-style shared registers generate per-register
-  read/write fns with no read-modify-write helper — user must handle
-  partial-field updates.
-- Generates `u<width>` return types — `u32` etc. — needs the width
-  to be a valid Fides type name (widths other than 8/16/32/64 emit
-  garbage like `u24`).
-
-### F6 — Local duplicates + misplaced `pub` — LOW
-
-Private `int_to_str`/`int_to_hex` reimplemented (:470-511) while
-`use string` is imported — the stdlib versions exist (stdlib/string.fd);
-the imports are probably unused (lint would flag). `char_from_digit`/
-`hex_char` marked `pub` (:506/:510) — leaking helpers; `int_to_hex`
-returns "" for negatives (fine for addresses).
+1. Delete the module, or move the HAL generator (the only useful part) to
+   a tool that something calls.
+2. If kept: an `Unchecked` status, real section parsing, width check in
+   the generator.
 
 ## Verification state
 
-- Dead status verified: zero importers in `compiler/`+`stdlib/`; also
-  dead in Rust (`pub mod` with zero references).
-- `check_function`/`status` semantics verified by reading; can't be
-  exercised (no caller).
-- No port regressions — the file is a faithful port of already-dead
-  Rust scaffolding.
-
-## Next
-
-`errors.fd`.
+- 2026-11-09: whole file read; importers grepped; `s18.exe check` clean.
+  Nothing can be exercised (no caller).

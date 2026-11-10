@@ -719,6 +719,10 @@ pub struct TypeChecker {
     // method call scanned every struct's method table by name)
     methods_index: i64,
     methods_indexed: i64,
+    // methods[i] -> HashMap(method name -> inner index + 1), 0 = not built.
+    // A method call used to scan the type's whole method Vec by name (CS8).
+    // Dropped (set to 0) when methods[i] is rewritten.
+    methods_hm: Vec<i64>,
     // Struct and enum name -> 1 + position, filled as entries are added
     // (TypeChecker_struct_pos, TypeChecker_enum_pos): a lookup by name
     // used to scan every struct and enum (D10)
@@ -895,6 +899,13 @@ pub fn StringFuncSig_new(key: str, val: FuncSig) -> StringFuncSig {
 pub fn TypeChecker_free_maps(self: &mut TypeChecker) {
     HashMap_drop(self.enum_tp_set); self.enum_tp_set = HashMap_new();
     HashMap_drop(self.methods_index); self.methods_index = HashMap_new();
+    var hm_i: i64 = 0;
+    while hm_i < self.methods_hm.len() {
+        var hm: i64 = self.methods_hm.get(hm_i);
+        if hm != 0 { HashMap_drop(hm); }
+        hm_i = hm_i + 1;
+    }
+    self.methods_hm = Vec::new();
     HashMap_drop(self.sname_index); self.sname_index = HashMap_new();
     HashMap_drop(self.ename_index); self.ename_index = HashMap_new();
     HashMap_drop(self.func_effects_index); self.func_effects_index = HashMap_new();
@@ -935,6 +946,7 @@ impl TypeChecker {
             scoped_structs: Vec::new(),
             methods_index: HashMap_new(),
             methods_indexed: 0,
+            methods_hm: Vec::new(),
             sname_index: HashMap_new(),
             sname_indexed: 0,
             ename_index: HashMap_new(),
@@ -1233,31 +1245,25 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
         }
         // A second `impl` block for the struct adds its methods to the
         // existing map (a method already there keeps its first definition).
-        var found: bool = false;
-        var mi2: i64 = 0;
-        while mi2 < self.methods.len() {
-            if self.methods.get(mi2).key == struct_name {
-                var existing_val: Vec<MethodMapEntry> = self.methods.get(mi2).val;
-                var ni: i64 = 0;
-                while ni < method_entries.len() {
-                    var have: bool = false;
-                    var ei: i64 = 0;
-                    while ei < existing_val.len() {
-                        if existing_val.get(ei).key == method_entries.get(ni).key { have = true; }
-                        ei = ei + 1;
-                    }
-                    if !have { existing_val.push(method_entries.get(ni)); }
-                    ni = ni + 1;
+        var mi2: i64 = TypeChecker_methods_at(self, struct_name);
+        if mi2 >= 0 && mi2 < self.methods.len() {
+            var existing_val: Vec<MethodMapEntry> = self.methods.get(mi2).val;
+            var ni: i64 = 0;
+            while ni < method_entries.len() {
+                var have: bool = false;
+                var ei: i64 = 0;
+                while ei < existing_val.len() {
+                    if existing_val.get(ei).key == method_entries.get(ni).key { have = true; }
+                    ei = ei + 1;
                 }
-                var m_entry: StringMethodMap = self.methods.get(mi2);
-                m_entry.val = existing_val;
-                self.methods.set(mi2, m_entry);
-                found = true;
-                break;
+                if !have { existing_val.push(method_entries.get(ni)); }
+                ni = ni + 1;
             }
-            mi2 = mi2 + 1;
-        }
-        if !found {
+            var m_entry: StringMethodMap = self.methods.get(mi2);
+            m_entry.val = existing_val;
+            self.methods.set(mi2, m_entry);
+            TypeChecker_methods_hm_clear(self, mi2);
+        } else {
             self.methods.push(StringMethodMap_new(struct_name, method_entries));
         }
         impi = impi + 1;
@@ -1288,25 +1294,19 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
             mi = mi + 1;
         }
         // Merge into existing method map or create new
-        var found: bool = false;
-        var mi2: i64 = 0;
-        while mi2 < self.methods.len() {
-            if self.methods.get(mi2).key == type_name {
-                var existing_val: Vec<MethodMapEntry> = self.methods.get(mi2).val;
-                var ni: i64 = 0;
-                while ni < new_methods.len() {
-                    method_map_set_entry(&mut existing_val, new_methods.get(ni).key, new_methods.get(ni).val);
-                    ni = ni + 1;
-                }
-                var m_entry: StringMethodMap = self.methods.get(mi2);
-                m_entry.val = existing_val;
-                self.methods.set(mi2, m_entry);
-                found = true;
-                break;
+        var mi2: i64 = TypeChecker_methods_at(self, type_name);
+        if mi2 >= 0 && mi2 < self.methods.len() {
+            var existing_val: Vec<MethodMapEntry> = self.methods.get(mi2).val;
+            var ni: i64 = 0;
+            while ni < new_methods.len() {
+                method_map_set_entry(&mut existing_val, new_methods.get(ni).key, new_methods.get(ni).val);
+                ni = ni + 1;
             }
-            mi2 = mi2 + 1;
-        }
-        if !found {
+            var m_entry: StringMethodMap = self.methods.get(mi2);
+            m_entry.val = existing_val;
+            self.methods.set(mi2, m_entry);
+            TypeChecker_methods_hm_clear(self, mi2);
+        } else {
             self.methods.push(StringMethodMap_new(type_name, new_methods));
         }
         tii = tii + 1;
@@ -1366,25 +1366,19 @@ pub fn TypeChecker_register_trait_impls(self: &mut TypeChecker, program: Program
             mi = mi + 1;
         }
         // Merge into existing method map or create new
-        var found: bool = false;
-        var mi2: i64 = 0;
-        while mi2 < self.methods.len() {
-            if self.methods.get(mi2).key == type_name {
-                var existing_val: Vec<MethodMapEntry> = self.methods.get(mi2).val;
-                var ni: i64 = 0;
-                while ni < new_methods.len() {
-                    method_map_set_entry(&mut existing_val, new_methods.get(ni).key, new_methods.get(ni).val);
-                    ni = ni + 1;
-                }
-                var m_entry: StringMethodMap = self.methods.get(mi2);
-                m_entry.val = existing_val;
-                self.methods.set(mi2, m_entry);
-                found = true;
-                break;
+        var mi2: i64 = TypeChecker_methods_at(self, type_name);
+        if mi2 >= 0 && mi2 < self.methods.len() {
+            var existing_val: Vec<MethodMapEntry> = self.methods.get(mi2).val;
+            var ni: i64 = 0;
+            while ni < new_methods.len() {
+                method_map_set_entry(&mut existing_val, new_methods.get(ni).key, new_methods.get(ni).val);
+                ni = ni + 1;
             }
-            mi2 = mi2 + 1;
-        }
-        if !found {
+            var m_entry: StringMethodMap = self.methods.get(mi2);
+            m_entry.val = existing_val;
+            self.methods.set(mi2, m_entry);
+            TypeChecker_methods_hm_clear(self, mi2);
+        } else {
             self.methods.push(StringMethodMap_new(type_name, new_methods));
         }
         // Register associated type bindings
@@ -1525,12 +1519,8 @@ pub fn TypeChecker_register_generated_decls(self: &mut TypeChecker, program: Pro
     var impi: i64 = 0;
     while impi < program.impls.len() {
         var imp: ImplDef = program.impls.get(impi);
-        var idx: i64 = -1;
-        var k3: i64 = 0;
-        while k3 < self.methods.len() && idx < 0 {
-            if self.methods.get(k3).key == imp.struct_name { idx = k3; }
-            k3 = k3 + 1;
-        }
+        var idx: i64 = TypeChecker_methods_at(self, imp.struct_name);
+        if idx >= self.methods.len() { idx = -1; }
         var existing_val: Vec<MethodMapEntry> = Vec::new();
         if idx >= 0 { existing_val = self.methods.get(idx).val; }
         var to_add: Vec<MethodMapEntry> = Vec::new();
@@ -1569,6 +1559,7 @@ pub fn TypeChecker_register_generated_decls(self: &mut TypeChecker, program: Pro
             var m_entry: StringMethodMap = self.methods.get(idx);
             m_entry.val = existing_val;
             self.methods.set(idx, m_entry);
+            TypeChecker_methods_hm_clear(self, idx);
         }
         impi = impi + 1;
     }
@@ -1991,6 +1982,58 @@ fn TypeChecker_methods_at(self: &mut TypeChecker, name: str) -> i64 {
     }
     if !HashMap_contains(self.methods_index, name) { return self.methods.len(); }
     return HashMap_get(self.methods_index, name) - 1;
+}
+
+/// Position of method `mname` in type `tname`'s method Vec, or -1.
+/// Builds a per-type HashMap on first use (CS8: every x.m() call scanned
+/// the type's method Vec by name — Vec has ~40 methods and the compiler
+/// calls methods thousands of times).
+fn TypeChecker_method_find(self: &mut TypeChecker, tname: str, mname: str) -> i64 {
+    var mi: i64 = TypeChecker_methods_at(self, tname);
+    if mi < 0 || mi >= self.methods.len() { return -1; }
+    while self.methods_hm.len() <= mi { self.methods_hm.push(0); }
+    var hm: i64 = self.methods_hm.get(mi);
+    if hm == 0 {
+        hm = HashMap_new();
+        var mm: Vec<MethodMapEntry> = self.methods.get(mi).val;
+        var i: i64 = 0;
+        while i < mm.len() {
+            var k: str = mm.get(i).key;
+            if !HashMap_contains(hm, k) { HashMap_insert(hm, k, i + 1); }
+            i = i + 1;
+        }
+        self.methods_hm.set(mi, hm);
+    }
+    if !HashMap_contains(hm, mname) { return -1; }
+    return HashMap_get(hm, mname) - 1;
+}
+
+/// methods[i] was rewritten: forget its method index.
+fn TypeChecker_methods_hm_clear(self: &mut TypeChecker, mi: i64) {
+    if mi < 0 || mi >= self.methods_hm.len() { return; }
+    var hm: i64 = self.methods_hm.get(mi);
+    if hm != 0 { HashMap_drop(hm); self.methods_hm.set(mi, 0); }
+}
+
+/// Read-only TypeChecker_method_find: uses the per-type index when it is
+/// built, scans the type's method Vec when it is not. -1 on miss.
+fn TypeChecker_method_find_ro(self: &TypeChecker, tname: str, mname: str) -> i64 {
+    var mi: i64 = TypeChecker_methods_at_ro(self, tname);
+    if mi < 0 || mi >= self.methods.len() { return -1; }
+    if mi < self.methods_hm.len() {
+        var hm: i64 = self.methods_hm.get(mi);
+        if hm != 0 {
+            if !HashMap_contains(hm, mname) { return -1; }
+            return HashMap_get(hm, mname) - 1;
+        }
+    }
+    var mm: Vec<MethodMapEntry> = self.methods.get(mi).val;
+    var i: i64 = 0;
+    while i < mm.len() {
+        if mm.get(i).key == mname { return i; }
+        i = i + 1;
+    }
+    return -1;
 }
 
 /// Position of struct `name` in self.structs, or -1 (the first one, as a
@@ -7419,22 +7462,16 @@ fn TypeChecker_method_takes_mut_self(self: &TypeChecker, receiver: Expr, method:
         if self.value_param_names.get(i) == root {
             match TypeChecker_resolve_type(self, self.value_param_types.get(i)) {
                 Type::Named(sn) => {
-                    var mi: i64 = TypeChecker_methods_at_ro(self, sn);
-                    while mi < self.methods.len() {
-                        if self.methods.get(mi).key == sn {
-                            var mm: Vec<MethodMapEntry> = self.methods.get(mi).val;
-                            var k: i64 = 0;
-                            while k < mm.len() {
-                                if mm.get(k).key == method && mm.get(k).val.has_self && mm.get(k).val.param_types.len() > 0 {
-                                    match mm.get(k).val.param_types.get(0) {
-                                        Type::Ref(_, is_mut) => { return is_mut; }
-                                        _ => { return false; }
-                                    }
-                                }
-                                k = k + 1;
+                    var mei: i64 = TypeChecker_method_find_ro(self, sn, method);
+                    if mei >= 0 {
+                        var mi: i64 = TypeChecker_methods_at_ro(self, sn);
+                        var mm: Vec<MethodMapEntry> = self.methods.get(mi).val;
+                        if mm.get(mei).val.has_self && mm.get(mei).val.param_types.len() > 0 {
+                            match mm.get(mei).val.param_types.get(0) {
+                                Type::Ref(_, is_mut) => { return is_mut; }
+                                _ => { return false; }
                             }
                         }
-                        mi = mi + 1;
                     }
                 }
                 _ => {}
@@ -10393,24 +10430,13 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                         ai = ai + 1;
                     }
                     // Find method in method map
-                    var mi: i64 = TypeChecker_methods_at(self, name);
-                    while mi < self.methods.len() {
-                        if self.methods.get(mi).key == name {
-                            var method_map: Vec<MethodMapEntry> = self.methods.get(mi).val;
-                            var mei: i64 = 0;
-                            while mei < method_map.len() {
-                                if method_map.get(mei).key == method {
-                                    var info: MethodInfo = method_map.get(mei).val;
-                                    if info.param_types.len() != arg_types.len() {
-                                        self.errors.push("Type error: associated function '" + name + "::" + method + "' expects " + int_to_str(info.param_types.len()) + " args, got " + int_to_str(arg_types.len()));
-                                    }
-                                    return info.ret_ty;
-                                }
-                                mei = mei + 1;
-                            }
-                            mi = self.methods.len();
+                    var mei: i64 = TypeChecker_method_find(self, name, method);
+                    if mei >= 0 {
+                        var info: MethodInfo = self.methods.get(TypeChecker_methods_at(self, name)).val.get(mei).val;
+                        if info.param_types.len() != arg_types.len() {
+                            self.errors.push("Type error: associated function '" + name + "::" + method + "' expects " + int_to_str(info.param_types.len()) + " args, got " + int_to_str(arg_types.len()));
                         }
-                        mi = mi + 1;
+                        return info.ret_ty;
                     }
                     self.errors.push("Type error: no associated function '" + method + "' on struct '" + name + "'");
                     return Type::Never;
@@ -10737,39 +10763,31 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
         Type::Named(struct_name) => {
             // Find method in method map
             var mi: i64 = TypeChecker_methods_at(self, struct_name);
-            while mi < self.methods.len() {
-                if self.methods.get(mi).key == struct_name {
-                    var method_map: Vec<MethodMapEntry> = self.methods.get(mi).val;
-                    var mei: i64 = 0;
-                    while mei < method_map.len() {
-                        if method_map.get(mei).key == method {
-                            TypeChecker_record_method_call(self, struct_name, method);
-                            if self.sandbox_depth > 0 {
-                                TypeChecker_sandbox_reject(self, struct_name + "." + method + "()",
-                                    TypeChecker_get_func_effects(self, struct_name + "." + method));
-                            }
-                            // A generic impl's method on a value without type
-                            // arguments (a bare `Option`): the i64 instance, as
-                            // monomorphization picks
-                            var btps: Vec<str> = TypeChecker_impl_type_params(self, struct_name);
-                            if btps.len() > 0 && !tc_str_vec_contains(self.current_type_params, struct_name) {
-                                var bnames: Vec<str> = Vec::new();
-                                var btypes: Vec<Type> = Vec::new();
-                                var bk: i64 = 0;
-                                while bk < btps.len() {
-                                    bnames.push(btps.get(bk));
-                                    btypes.push(Type::I64);
-                                    bk = bk + 1;
-                                }
-                                return tc_subst_type_params(method_map.get(mei).val.ret_ty, bnames, btypes);
-                            }
-                            return method_map.get(mei).val.ret_ty;
-                        }
-                        mei = mei + 1;
-                    }
-                    mi = self.methods.len();
+            var mei: i64 = -1;
+            if mi < self.methods.len() { mei = TypeChecker_method_find(self, struct_name, method); }
+            if mei >= 0 {
+                var method_map: Vec<MethodMapEntry> = self.methods.get(mi).val;
+                TypeChecker_record_method_call(self, struct_name, method);
+                if self.sandbox_depth > 0 {
+                    TypeChecker_sandbox_reject(self, struct_name + "." + method + "()",
+                        TypeChecker_get_func_effects(self, struct_name + "." + method));
                 }
-                mi = mi + 1;
+                // A generic impl's method on a value without type
+                // arguments (a bare `Option`): the i64 instance, as
+                // monomorphization picks
+                var btps: Vec<str> = TypeChecker_impl_type_params(self, struct_name);
+                if btps.len() > 0 && !tc_str_vec_contains(self.current_type_params, struct_name) {
+                    var bnames: Vec<str> = Vec::new();
+                    var btypes: Vec<Type> = Vec::new();
+                    var bk: i64 = 0;
+                    while bk < btps.len() {
+                        bnames.push(btps.get(bk));
+                        btypes.push(Type::I64);
+                        bk = bk + 1;
+                    }
+                    return tc_subst_type_params(method_map.get(mei).val.ret_ty, bnames, btypes);
+                }
+                return method_map.get(mei).val.ret_ty;
             }
             // Check if this is a type param with a trait bound
             if tc_str_vec_contains(self.current_type_params, struct_name) {
@@ -10795,34 +10813,26 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
         Type::Generic(gen_name, recv_args) => {
             // Generic type: look up methods by base name
             var mi: i64 = TypeChecker_methods_at(self, gen_name);
-            while mi < self.methods.len() {
-                if self.methods.get(mi).key == gen_name {
-                    var method_map: Vec<MethodMapEntry> = self.methods.get(mi).val;
-                    var mei: i64 = 0;
-                    while mei < method_map.len() {
-                        if method_map.get(mei).key == method {
-                            // `impl<T> Slot` on a Slot<f64>: the method's type with T=f64
-                            var gtps: Vec<str> = TypeChecker_impl_type_params(self, gen_name);
-                            if gtps.len() > 0 {
-                                var gnames: Vec<str> = Vec::new();
-                                var gtypes: Vec<Type> = Vec::new();
-                                var gk: i64 = 0;
-                                while gk < gtps.len() && gk < recv_args.len() {
-                                    gnames.push(gtps.get(gk));
-                                    gtypes.push(recv_args.get(gk));
-                                    gk = gk + 1;
-                                }
-                                var gret: Type = tc_subst_type_params(method_map.get(mei).val.ret_ty, gnames, gtypes);
-                                if TypeChecker_type_contains_param(self, gret) { return Type::Never; }
-                                return gret;
-                            }
-                            return method_map.get(mei).val.ret_ty;
-                        }
-                        mei = mei + 1;
+            var mei: i64 = -1;
+            if mi < self.methods.len() { mei = TypeChecker_method_find(self, gen_name, method); }
+            if mei >= 0 {
+                var method_map: Vec<MethodMapEntry> = self.methods.get(mi).val;
+                // `impl<T> Slot` on a Slot<f64>: the method's type with T=f64
+                var gtps: Vec<str> = TypeChecker_impl_type_params(self, gen_name);
+                if gtps.len() > 0 {
+                    var gnames: Vec<str> = Vec::new();
+                    var gtypes: Vec<Type> = Vec::new();
+                    var gk: i64 = 0;
+                    while gk < gtps.len() && gk < recv_args.len() {
+                        gnames.push(gtps.get(gk));
+                        gtypes.push(recv_args.get(gk));
+                        gk = gk + 1;
                     }
-                    mi = self.methods.len();
+                    var gret: Type = tc_subst_type_params(method_map.get(mei).val.ret_ty, gnames, gtypes);
+                    if TypeChecker_type_contains_param(self, gret) { return Type::Never; }
+                    return gret;
                 }
-                mi = mi + 1;
+                return method_map.get(mei).val.ret_ty;
             }
             self.errors.push("Type error: no method '" + method + "' on generic type '" + gen_name + "'");
         }

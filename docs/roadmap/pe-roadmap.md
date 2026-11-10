@@ -4,18 +4,26 @@
 > itself with no C compiler and no Rust; native programs run about as fast
 > as C-built ones.
 >
-> Last updated: Nov 6, 2026.
+> Last updated: Nov 9, 2026 (status block; the items below are the Oct 27–Nov 6 record).
 
 ## Where it stands
 
-- **Now (Nov 6, 2026):** `fid emit` (`compiler/pe_ir*.fd`) is the native
-  Windows x64 path and needs no C compiler. It runs a small IR optimizer
-  (`compiler/iropt.fd`: inlining of small one-block functions, constant
-  folding, dead code removal) and keeps values in 7 callee-saved registers;
-  there is no full register allocator. Programs that use `async` or
-  `spawn` + `await` crash natively (`test_async`, `test_async_float_struct`).
-  `emit --bare` panics. `build --native` (the old PIR path, `compiler/pe.fd`)
-  still crashes. The paragraphs below are the Oct 27–31 record.
+- **Now (Nov 9, 2026):** `fid emit` / `fid build` on Windows
+  (`compiler/pe_ir*.fd`) is the native Windows x64 path and needs no C
+  compiler. It runs the IR optimizer (`compiler/iropt.fd`, about 20 passes;
+  docs/file-analysis/iropt.md) and a whole-function linear-scan register
+  allocator (`PEIR_GLOBAL_RA`) that also uses r10/r11 for values no call
+  crosses and xmm registers for f64 (`PEIR_VOLATILE_RA`, `PEIR_XMM_RA`), with
+  copy coalescing and loop rotation. Only functions reachable from `main` are
+  generated. Tasks switch on their own stacks (`pe_ctx_swap`) and sockets wait
+  through IOCP/AFD (Nov 8); native async worked on Nov 6 and broke in builds
+  of Nov 9 afternoon (iropt passes envtrim/gconst/deadf; fixed again in
+  the evening's fid31, known-bugs 2f.2). `emit --bare` builds
+  (pe_ir_stubs' bare runtime). `build --native` with the default target goes
+  to the old PIR path in compiler.fd `build_executable` (not pe.fd) and
+  panics in opt.fd; compiler/pe.fd is reached only by `emit --boot`, which
+  panics. Opt-in alternative: `fid emit --nat` (the machine layer, nat_ir).
+  The paragraphs below are the Oct 27–31 record.
 - **In the repository (`main`, 1305b74, Oct 27):** the self-hosted compiler makes
   executables only through C (`fid ccompile`, `fid build`); its own native
   path (`build --native`: PIR → x86-64 → `compiler/pe.fd`) crashes on every

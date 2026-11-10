@@ -9,8 +9,8 @@
 
 > Build the last programming language the world needs.
 >
-> **Today (Nov 6, 2026):** see [CURRENT.md](../../CURRENT.md) for what is
-> true now — the self-hosted compiler `fid` has 61 modules, 133,688 lines,
+> **Today (Nov 6, 2026):** see [AGENTS.md → Current Baseline](../../AGENTS.md#current-baseline-nov-9-2026-full-suite-last-run-nov-2) for what is
+> true now — the self-hosted compiler `fid` has 68 modules, 158,516 lines,
 > a byte-identical fixpoint checked on every release build (49 MB of C), and
 > native output on Windows x64 (`fid emit`); Linux goes through C, and the
 > other targets are experimental. The language `fid` accepts is described in
@@ -73,7 +73,7 @@ Fides is a systems programming language built from first principles — every la
 - **C interop**: call C libraries directly, gradual migration path
 - **Familiar syntax**: Rust-like syntax with Fides keywords (val/fn/const)
 - **Hot reload** (goal): instant feedback loop attracts game/GUI/web developers — today `fidesc watch` recompiles and restarts
-- **Fast compilation**: sub-second builds for small programs; large ones are slow today (~1,000 lines/s for `fid`: 133,688 lines in ~133 s, Nov 6)
+- **Fast compilation**: sub-second builds for small programs; large ones are slow today (~2,100 lines/s for an -O2 `fid`: 158,516 lines in 74 s, Nov 9)
 - **AI tooling**: LLM-friendly syntax, semantic IR enables AI-assisted refactoring
 - **Single binary**: no runtime, no VM, no dependencies — just a binary
 - **Cross-compilation**: built-in, not an afterthought — Windows done; ARM64 and RISC-V runtimes are stubs ([platforms](platforms.md))
@@ -430,7 +430,7 @@ master of none.
 > and actual test baselines.
 >
 > Written in Aug–Sep 2026; its numbers are from then. Since then (Nov 6): the
-> compiler is self-hosted (61 modules, 133,688 lines), the full suite passes
+> compiler is self-hosted (68 modules, 158,516 lines), the full suite passes
 > 339/339 interp, 343/343 C, 345/345 PE (Nov 2), and generic `Option<T>` (§6
 > below) is done in `fid`.
 

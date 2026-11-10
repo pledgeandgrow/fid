@@ -1,84 +1,89 @@
-# green_thread.fd — cooperative green threads (207 LOC)
+# green_thread.fd — cooperative green-thread scheduler
 
-> **CONSOLIDATED + VERIFIED LIVE 2026-10-23 (v2):** the three-layer fiction
-> is one real layer now —
-> * `gt_global_*` constant stubs **deleted**; `green_thread_c_runtime`
->   130-line C blob **deleted** (F3's name-mismatch stranded code gone).
-> * `GreenThread.func_id` → `func_name: str` — matches the C backend's
->   name→fnptr dispatch model.
-> * `interp.fd` owns an `Interpreter.gt_scheduler`; `p_gt_spawn` queues a
->   READY thread, `p_gt_run_all` resolves the name and **executes** it,
->   `p_gt_is_done`/`p_gt_get_result` return real state (F1, F4 fixed).
->   `p_thread_spawn`/`p_future_poll`/`p_executor_*` given the same real
->   treatment — `spawn f(x)`/`await` now return actual results.
-> * VERIFIED: spawn/await → 41; multi-spawn `9 16 25` → 50 aggregate.
-> * F2 (no C backend for `p_gt_*`) **remains**: C-compiled programs calling
->   gt builtins still fail to link — pending a C-runtime table or
->   runtime.fd fold-in (Phase 2).
+- **Path:** `compiler/green_thread.fd` — module `compiler::green_thread`
+- **LOC:** 207 (2026-11-09). Rust `src/green_thread.rs`: 600 (dead there).
+- **Role:** thread records and scheduler bookkeeping (`GreenThread`,
+  `GreenThreadScheduler`) for the interpreter's `p_gt_*` builtins. It does
+  not run anything itself: the interpreter resolves the function by name
+  and runs it.
+- **Status:** partly live: live under `fid run` through interp.fd; no other
+  backend implements `p_gt_*`.
+- **Re-audited:** 2026-11-09.
 
-## Role
-
-`GreenThread`/`GreenThreadScheduler` — the single scheduler layer, driven
-by `compiler/interp.fd`'s `p_gt_*` handlers (lazy cooperative semantics:
-spawn queues, run_all executes by name). Port of `src/green_thread.rs`
-(600 LOC — dead there too).
-
-## Where it's called
+## Where it is called
 
 | Caller | Site | What |
-|--------|------|------|
-| `compiler/interp.fd` | :26 import, :2618-2653 | `p_gt_spawn`/`yield`/`run_all`/`is_done`/`get_result`/`current`/`reset` builtins → `gt_global_*` — **live on the interp path**. |
-| `compiler/compiler.fd` | :40 | `use compiler::green_thread` — import only, no calls. |
+|---|---|---|
+| `compiler/interp.fd` | :26 import; field `gt_scheduler` (:874, :941); :3849-3936 | `p_gt_spawn` → `GreenThreadScheduler_spawn`; `p_gt_yield` → `_yield_current`; `p_gt_is_done` / `_get_result` / `_current`; `p_gt_reset` → `_new`. `p_gt_run_all` runs threads itself (does not call `_run_all`). |
+| `compiler/compiler.fd` | :43 | `use compiler::green_thread`: import only, nothing used. |
+| `compiler/lower.fd` | :2263-2269 | declares the seven `p_gt_*` externs |
+| `tests/selfhost/test_spawn_gt.fd` | | runs `p_gt_*` programs inside the interpreter |
 
-`lower.fd:1768-1774` declares all seven `p_gt_*` externs — any program
-using gt builtins or `spawn` lowers to these symbols.
+Reached from: `fid run` only (via interp.fd). Not used by `stdlib/task.fd`
+(that is `p_co_*`, a different runtime).
+
+Unused public functions: `GreenThreadScheduler_finish_current`,
+`_has_ready_threads`, `_run_all` (no caller anywhere).
+
+## What it does
+
+- `GreenThreadScheduler_new` (:85) makes 256 empty slots; `spawn` (:99)
+  fills the next slot (slots are never reused: after 256 spawns it returns
+  -1 until `p_gt_reset`) and appends the id to `ready_queue`.
+- `yield_current` (:114) marks the current thread SUSPENDED, appends it to
+  the queue, then pops from the front (O(n) shift) until it finds a READY or
+  SUSPENDED thread, marks it RUNNING and makes it current.
+- `is_done` / `get_result` read the slot.
+- Constants `GREEN_THREAD_STACK_SIZE` (65536), `MAX_GREEN_THREADS` (256),
+  states `GT_READY/RUNNING/SUSPENDED/DONE` (0-3).
 
 ## Findings
 
-### F1 — `gt_global_*` are all stubs — spawn never runs — HIGH (live)
+### Verified live (2026-11-09, `s18.exe run`)
 
-The seven functions the interpreter actually calls return constants:
-`gt_global_spawn` → `0`, `is_done` → `true`, `get_result` → `0`,
-`current` → `-1`, `yield`/`run_all`/`init`/`reset` → no-ops
-(:210-245). `p_gt_spawn` in the interpreter hands back a fake ID and
-**the spawned function is never evaluated** — spawn is pure fiction:
-`spawn f(5)` silently drops `f`, `get_result` says `0`, `is_done`
-says `true`. The comment ("interpreter runs eagerly") misrepresents
-it — there's no eager call anywhere.
+1. **NEW, HIGH — a thread that yields twice makes the next thread never
+   run.** `p_gt_run_all` (interp.fd:3872-3916) runs threads in id order and
+   only runs those still READY or SUSPENDED. `yield_current` (:114-140)
+   picks the next queued thread and marks it RUNNING without running it.
+   The queue still holds every spawned id (spawn appends, `run_all` never
+   pops), so the first yield hands back the yielding thread itself, but the
+   second yield hands out the next thread; `run_all` then skips it. Probe:
+   `w1` calls `p_gt_yield()` twice, `w2` spawned after it:
+   `is_done(w2) == false`, `get_result(w2) == 0`. With one yield both finish
+   (11 and 22). Fix: make `yield` a no-op inside `run_all` (threads run to
+   their end anyway), or have `run_all` drain `ready_queue`.
+2. **FIXED (was F1, HIGH) — `gt_global_*` stubs.** Deleted; spawn now runs
+   the function (verified 2026-10-23 and again here: one-yield probe gives
+   real results).
+3. **FIXED (was F3) — stranded C runtime blob.** Deleted.
+4. **CHANGED (was F4) — scheduler never instantiated.** It is the
+   interpreter's `gt_scheduler`; but its own `_run_all` (:179-199) is still a
+   stub that marks every thread DONE with result 0, and nothing calls it.
 
-### F2 — `p_gt_*` has no C backend — HIGH (link failure)
+### From code inspection
 
-`codegen_c.fd` implements none of the `p_gt_*` symbols — any program
-calling `p_gt_spawn`/`p_gt_yield`/… compiles to C that **fails to
-link** (undefined symbol). The whole `p_gt_*` vocabulary is
-Fides-port-added (absent from src/ entirely).
+5. **STILL TRUE, HIGH — no `p_gt_*` outside the interpreter.** No
+   definition in `codegen_c.fd`, `stdlib/pe_runtime/`, or
+   `stdlib/linux_runtime/` (grep, 2026-11-09). A `p_gt_*` program built
+   with `ccompile` / `emit` has undefined symbols (not linked here).
+6. **NEW, LOW — `yield` re-queues without bound.** Every yield appends to
+   `ready_queue`; nothing removes finished ids except the pop in `yield`
+   itself, so the queue grows with each `spawn` and yield.
+7. **NEW, INFO — stale comment.** :175-177 says "The C runtime handles real
+   context switching via inline asm"; there is no such C runtime.
+8. **NEW, INFO — unused import** in compiler.fd:43.
 
-### F3 — `green_thread_c_runtime` never emitted + wrong names — MEDIUM
+## Fix order
 
-The real implementation (asm context switch, dispatch table,
-`gt_spawn`/`gt_yield`/`gt_run_all`) is stranded: nothing calls
-`green_thread_c_runtime()` — and even if it were emitted, it defines
-`gt_*` while `lower.fd` declares `p_gt_*` — a name-mismatch stub
-either way. Dead code carrying real effort.
-
-### F4 — `GreenThreadScheduler` never instantiated — MEDIUM
-
-The actual simulation (round-robin ready queue, state machine,
-256-thread cap) is bypassed entirely — `gt_global_*` don't create or
-touch a scheduler. `run_all` (:179-199) also just marks every thread
-`GT_DONE` with `result=0` — even the simulation never "runs" a thread;
-`yield_current` re-queues correctly but pops via O(n) shift.
+1. Finding 1 (scheduler / `run_all` disagreement).
+2. Decide whether `p_gt_*` stays: either implement it in the C and native
+   runtimes (they already have `p_co_*` green threads, stdlib/task.fd) or
+   remove the builtins and this module in favour of `p_co_*`.
+3. Delete the unused `_run_all` / `_finish_current` / `_has_ready_threads`
+   and the stale comment; drop the import in compiler.fd.
 
 ## Verification state
 
-- **LIVE-VERIFIED 2026-10-23:** self-hosted compiler runs `spawn worker(20)`
-  → `await f` → 41 (real result, not 0); three spawned computations →
-  `9 16 25` → aggregate 50. `is_done`/`get_result` read actual scheduler
-  state. tests/selfhost/test_spawn_gt.fd covers 4 cases.
-- F2 still open: `codegen_c.fd` has zero `p_gt_*` → C-path link failure on
-  gt programs (needs a name→fnptr table like `p_thread_spawn` uses).
-- Dead-in-Rust confirmed: no `green_thread::`/`p_gt_` refs in `src/`.
-
-## Next
-
-`hotreload.fd`.
+- 2026-11-09: whole file read; interp.fd's `p_gt_*` block read; probes with
+  one and two yields run under `fid run`. C/native link failure not run
+  (inspection only).
