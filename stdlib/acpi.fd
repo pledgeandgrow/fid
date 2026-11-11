@@ -1,0 +1,203 @@
+// ACPI table parsing — RSDP discovery, SDT headers, MADT and MCFG.
+// Tables arrive as raw bytes (Vec<i64>) as read from physical memory;
+// on a kernel the caller maps the physical region first. All structure
+// fields are little-endian.
+module acpi;
+
+use vec;
+
+pub fn acpi_u8(b: Vec<i64>, o: i64) -> i64 { return b.get(o); }
+pub fn acpi_u16(b: Vec<i64>, o: i64) -> i64 {
+    return b.get(o) + b.get(o + 1) * 256;
+}
+pub fn acpi_u32(b: Vec<i64>, o: i64) -> i64 {
+    return acpi_u16(b, o) + acpi_u16(b, o + 2) * 65536;
+}
+@wrapping
+pub fn acpi_u64(b: Vec<i64>, o: i64) -> i64 {
+    return acpi_u32(b, o) + acpi_u32(b, o + 4) * 4294967296;
+}
+
+/// Checksum over b[o .. o+n): valid when the byte sum mod 256 is 0.
+pub fn acpi_checksum(b: Vec<i64>, o: i64, n: i64) -> bool {
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        sum = (sum + b.get(o + i)) % 256;
+        i = i + 1;
+    }
+    return sum == 0;
+}
+
+// --- RSDP -------------------------------------------------------------------
+
+pub struct Rsdp {
+    pub valid: bool,
+    pub revision: i64,
+    pub rsdt: i64,
+    pub xsdt: i64,
+}
+
+/// Validate an RSDP at offset o ("RSD PTR " signature + checksum).
+pub fn rsdp_at(b: Vec<i64>, o: i64) -> Rsdp {
+    var r: Rsdp = Rsdp{valid: false, revision: 0, rsdt: 0, xsdt: 0};
+    if b.get(o) != 82 || b.get(o + 1) != 83 || b.get(o + 2) != 68 { return r; }
+    if b.get(o + 7) != 32 { return r; }              // trailing space of sig
+    if !acpi_checksum(b, o, 20) { return r; }
+    r.revision = b.get(o + 15);
+    r.rsdt = acpi_u32(b, o + 16);
+    if r.revision >= 2 && acpi_checksum(b, o, 36) {
+        r.xsdt = acpi_u64(b, o + 24);
+    }
+    r.valid = true;
+    return r;
+}
+
+/// Scan the BIOS search areas — 0x40E EBDA pointer then the 0xE0000 and
+/// legacy 0xF0000 ranges — for an RSDP. mem is the low 1 MiB of physical
+/// memory; returns the offset or -1.
+pub fn rsdp_find(mem: Vec<i64>) -> i64 {
+    var ebda: i64 = acpi_u16(mem, 0x40E) * 16;
+    var base: i64 = ebda;
+    var end: i64 = ebda + 1024;
+    var tries: i64 = 0;
+    while tries < 3 {
+        var o: i64 = base;
+        while o + 36 <= end && o + 36 <= mem.len() {
+            if rsdp_at(mem, o).valid { return o; }
+            o = o + 16;                            // RSDP is 16-byte aligned
+        }
+        tries = tries + 1;
+        if tries == 1 { base = 0xE0000; end = 0x100000; }
+        if tries == 2 { base = 0xF0000; end = 0x100000; }
+    }
+    return -1;
+}
+
+// --- SDT headers ------------------------------------------------------------
+
+pub struct SdtHeader {
+    pub valid: bool,
+    pub length: i64,
+    pub revision: i64,
+    pub oem: str,
+    pub oem_table: str,
+}
+
+fn sdt_sig_str(b: Vec<i64>, o: i64) -> str {
+    var s: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 4 { s.push(b.get(o + i)); i = i + 1; }
+    return str_from_bytes(s);
+}
+
+/// SDT header at offset o; expected is the 4-char signature ("APIC",
+/// "MCFG", ...). Returns valid=false on mismatch, bad checksum, or
+/// overrun of the byte buffer.
+pub fn sdt_at(b: Vec<i64>, o: i64, expected: str) -> SdtHeader {
+    var h: SdtHeader = SdtHeader{valid: false, length: 0, revision: 0,
+        oem: "", oem_table: ""};
+    var len: i64 = acpi_u32(b, o + 4);
+    if o + len > b.len() { return h; }
+    if str_byte_at(expected, 0) != b.get(o) { return h; }
+    var i: i64 = 1;
+    while i < 4 {
+        if str_byte_at(expected, i) != b.get(o + i) { return h; }
+        i = i + 1;
+    }
+    if !acpi_checksum(b, o, len) { return h; }
+    h.length = len;
+    h.revision = b.get(o + 8);
+    var oem: Vec<i64> = Vec::new();
+    var oemt: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 6 { oem.push(b.get(o + 10 + i)); i = i + 1; }
+    i = 0;
+    while i < 8 { oemt.push(b.get(o + 16 + i)); i = i + 1; }
+    h.oem = str_from_bytes(oem);
+    h.oem_table = str_from_bytes(oemt);
+    h.valid = true;
+    return h;
+}
+
+// --- RSDT / XSDT walk -------------------------------------------------------
+
+/// Number of 4-byte (rsdt) or 8-byte (xsdt) table pointers in the SDT
+/// whose header is at o. Entries sit after the 36-byte header.
+pub fn sdt_entry_count(b: Vec<i64>, o: i64, xsdt: bool) -> i64 {
+    var len: i64 = acpi_u32(b, o + 4);
+    var sz: i64 = 4;
+    if xsdt { sz = 8; }
+    return (len - 36) / sz;
+}
+
+/// Physical address of table i inside the root SDT at o.
+@wrapping
+pub fn sdt_entry(b: Vec<i64>, o: i64, i: i64, xsdt: bool) -> i64 {
+    if xsdt { return acpi_u64(b, o + 36 + i * 8); }
+    return acpi_u32(b, o + 36 + i * 4);
+}
+
+// --- MADT -------------------------------------------------------------------
+// MADT body starts at offset 44 (36-byte header + local APIC addr + flags);
+// each entry is {type:u8, length:u8, ...}.
+
+/// Number of interrupt-controller structure entries in a MADT at o.
+pub fn madt_entry_count(madt: Vec<i64>) -> i64 {
+    var len: i64 = acpi_u32(madt, 4);
+    var o: i64 = 44;
+    var n: i64 = 0;
+    while o < len {
+        n = n + 1;
+        o = o + madt.get(o + 1);
+    }
+    return n;
+}
+
+/// Offset of MADT entry i (type at +0, length at +1), or -1.
+pub fn madt_entry(madt: Vec<i64>, i: i64) -> i64 {
+    var len: i64 = acpi_u32(madt, 4);
+    var o: i64 = 44;
+    var k: i64 = 0;
+    while o < len {
+        if k == i { return o; }
+        o = o + madt.get(o + 1);
+        k = k + 1;
+    }
+    return -1;
+}
+
+/// Offsets of all MADT entries of a given type (0 = LAPIC, 1 = IOAPIC,
+/// 2 = ISO, 9 = x2APIC).
+pub fn madt_entries_of(madt: Vec<i64>, want_type: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var len: i64 = acpi_u32(madt, 4);
+    var o: i64 = 44;
+    while o < len {
+        if madt.get(o) == want_type { out.push(o); }
+        o = o + madt.get(o + 1);
+    }
+    return out;
+}
+
+// --- MCFG -------------------------------------------------------------------
+// Each 16-byte entry at offset 44+: base u64, segment u16, bus u8, end u8.
+
+pub struct McfgEntry {
+    pub base: i64,
+    pub segment: i64,
+    pub bus_start: i64,
+    pub bus_end: i64,
+}
+
+/// ECAM window i of the MCFG table at o.
+pub fn mcfg_entry(mcfg: Vec<i64>, i: i64) -> McfgEntry {
+    var o: i64 = 44 + i * 16;
+    return McfgEntry{base: acpi_u64(mcfg, o), segment: acpi_u16(mcfg, o + 8),
+        bus_start: mcfg.get(o + 10), bus_end: mcfg.get(o + 11)};
+}
+
+/// Number of ECAM windows in a MCFG at o.
+pub fn mcfg_entry_count(mcfg: Vec<i64>) -> i64 {
+    return (acpi_u32(mcfg, 4) - 44) / 16;
+}

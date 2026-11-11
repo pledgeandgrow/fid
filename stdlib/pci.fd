@@ -1,0 +1,118 @@
+// PCI configuration space decoding. The caller supplies the 256-byte
+// (or 4-KiB ECAM) config space of one device as raw bytes; this module
+// decodes the standard header, classifies BARs, and walks the capability
+// list. Actual port/ECAM reads are platform code (CF8/CFC or the MCFG
+// window from acpi.fd).
+module pci;
+
+use vec;
+
+pub fn pci_u16(c: Vec<i64>, o: i64) -> i64 {
+    return c.get(o) + c.get(o + 1) * 256;
+}
+pub fn pci_u32(c: Vec<i64>, o: i64) -> i64 {
+    return pci_u16(c, o) + pci_u16(c, o + 2) * 65536;
+}
+
+// Standard header fields.
+pub fn pci_vendor(c: Vec<i64>) -> i64 { return pci_u16(c, 0); }
+pub fn pci_device(c: Vec<i64>) -> i64 { return pci_u16(c, 2); }
+pub fn pci_command(c: Vec<i64>) -> i64 { return pci_u16(c, 4); }
+pub fn pci_status(c: Vec<i64>) -> i64 { return pci_u16(c, 6); }
+pub fn pci_revision(c: Vec<i64>) -> i64 { return c.get(8); }
+pub fn pci_progif(c: Vec<i64>) -> i64 { return c.get(9); }
+pub fn pci_subclass(c: Vec<i64>) -> i64 { return c.get(10); }
+pub fn pci_class(c: Vec<i64>) -> i64 { return c.get(11); }
+pub fn pci_header_type(c: Vec<i64>) -> i64 { return c.get(14) & 0x7F; }
+pub fn pci_multifunction(c: Vec<i64>) -> bool { return (c.get(14) & 0x80) != 0; }
+
+/// True when the config space is a present device (not all-ones).
+pub fn pci_present(c: Vec<i64>) -> bool {
+    var v: i64 = pci_vendor(c);
+    return v != 0xFFFF && v != 0;
+}
+
+// --- BARs -------------------------------------------------------------------
+// k = 0..5, dword offset 16 + 4k. Type encoded in the low bits.
+
+pub struct PciBar {
+    pub present: bool,
+    pub is_io: bool,       // I/O-space BAR (bit 0 = 1)
+    pub is64: bool,        // 64-bit memory BAR (bits 2:1 = 10)
+    pub prefetch: bool,
+    pub addr: i64,         // base address, flags masked off (low 32 bits)
+    pub hi: i64,           // raw next dword for 64-bit BARs
+}
+
+/// Decode BAR k of a type-0 header. For 64-bit BARs the caller must skip
+/// the following BAR index — hi carries its dword.
+pub fn pci_bar(c: Vec<i64>, k: i64) -> PciBar {
+    var b: PciBar = PciBar{present: false, is_io: false, is64: false,
+        prefetch: false, addr: 0, hi: 0};
+    var o: i64 = 16 + k * 4;
+    var v: i64 = pci_u32(c, o);
+    if v == 0 { return b; }
+    b.present = true;
+    if (v & 1) != 0 {
+        b.is_io = true;
+        b.addr = v & 0xFFFFFFFC;
+    } else {
+        var kind: i64 = (v >> 1) & 3;
+        b.is64 = kind == 2;
+        b.prefetch = (v & 8) != 0;
+        b.addr = v & 0xFFFFFFF0;
+        if b.is64 { b.hi = pci_u32(c, o + 4); }
+    }
+    return b;
+}
+
+/// Probed size of memory BAR k: caller writes all-ones to the BAR, reads
+/// it back as `sized`, then restores. Returns mask-derived size, 0 when
+/// the BAR reports no size. (Driver-side helper for after the probe.)
+@wrapping
+pub fn pci_bar_size(sized: i64, is_io: bool) -> i64 {
+    var mask: i64 = 0;
+    if is_io { mask = 0xFFFFFFFC; } else { mask = 0xFFFFFFF0; }
+    var m: i64 = sized & mask;
+    if m == 0 { return 0; }
+    return 4294967296 - m;                  // two's complement, 32-bit
+}
+
+// --- capabilities -----------------------------------------------------------
+// Status bit 4 = capability list; list pointer at 0x34 (type 0 header).
+// Each entry: {id:u8, next:u8}.
+
+/// Capability IDs present in the device, as a Vec of {id, offset} pairs
+/// encoded id*256+offset.
+pub fn pci_caps(c: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if (pci_status(c) & 0x10) == 0 { return out; }
+    var p: i64 = c.get(0x34) & 0xFC;
+    var tries: i64 = 0;
+    while p != 0 && tries < 48 {
+        out.push(c.get(p) * 256 + p);
+        p = c.get(p + 1) & 0xFC;
+        tries = tries + 1;
+    }
+    return out;
+}
+
+/// Offset of capability `want` in the config space, or -1 (MSI=0x05,
+/// MSIX=0x11, PCIe=0x10, PM=0x01).
+pub fn pci_cap_offset(c: Vec<i64>, want: i64) -> i64 {
+    var caps: Vec<i64> = pci_caps(c);
+    var i: i64 = 0;
+    while i < caps.len() {
+        var e: i64 = caps.get(i);
+        if e / 256 == want { return e % 256; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// --- legacy CF8/CFC address (port I/O done by the OS) ------------------------
+
+/// CONFIG_ADDRESS dword for bus/slot/func/offset (offset < 256).
+pub fn pci_cf8(bus: i64, slot: i64, func: i64, off: i64) -> i64 {
+    return 0x80000000 + bus * 65536 + slot * 2048 + func * 256 + (off & 0xFC);
+}

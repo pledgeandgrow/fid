@@ -1,0 +1,56 @@
+// 16550 UART register model — the first serial driver every kernel
+// writes. Port I/O itself is platform code (outb/inb via volatile or
+// extern); this module provides the offsets, bit fields, divisor math
+// and the standard init sequence so drivers don't re-derive them.
+module uart;
+
+use vec;
+
+// Register offsets from the port base (DLAB=0 view).
+pub fn UART_RBR() -> i64 { return 0; }   // receiver buffer (read)
+pub fn UART_THR() -> i64 { return 0; }   // transmitter holding (write)
+pub fn UART_IER() -> i64 { return 1; }   // interrupt enable
+pub fn UART_IIR() -> i64 { return 2; }   // interrupt identification (read)
+pub fn UART_FCR() -> i64 { return 2; }   // FIFO control (write)
+pub fn UART_LCR() -> i64 { return 3; }   // line control
+pub fn UART_MCR() -> i64 { return 4; }   // modem control
+pub fn UART_LSR() -> i64 { return 5; }   // line status
+pub fn UART_MSR() -> i64 { return 6; }   // modem status
+pub fn UART_SCR() -> i64 { return 7; }   // scratch
+// DLAB=1 view (LCR bit 7 set): baud divisor latch at 0 (lo) and 1 (hi).
+
+// LSR bits.
+pub fn UART_LSR_DATA() -> i64 { return 1; }    // data ready
+pub fn UART_LSR_THRE() -> i64 { return 32; }   // TX holding empty
+pub fn UART_LSR_TEMT() -> i64 { return 64; }   // transmitter empty
+
+/// Divisor for a 1.8432 MHz crystal (COM ports): divisor = 115200/baud.
+pub fn uart_divisor(baud: i64) -> i64 {
+    if baud <= 0 { return 1; }
+    return 115200 / baud;
+}
+
+/// Divisor from an arbitrary crystal Hz.
+pub fn uart_divisor_clk(crystal_hz: i64, baud: i64) -> i64 {
+    if baud <= 0 { return 1; }
+    return crystal_hz / (16 * baud);
+}
+
+/// LCR byte for 8 data bits, no parity, 1 stop bit.
+pub fn uart_lcr_8n1() -> i64 { return 3; }
+
+/// Standard COM1 init: the register writes, in order, as {port_off, val}
+/// packed off*256+val — disables IRQs, sets DLAB, divisor 3 (38400),
+/// 8N1, FIFO on, DTR/RTS/OUT2 up.
+pub fn uart_init_seq(baud: i64) -> Vec<i64> {
+    var d: i64 = uart_divisor(baud);
+    var seq: Vec<i64> = Vec::new();
+    seq.push(UART_IER() * 256 + 0x00);            // IRQs off
+    seq.push(UART_LCR() * 256 + 0x80);            // DLAB on
+    seq.push(0 * 256 + (d & 255));                // divisor lo
+    seq.push(1 * 256 + ((d >> 8) & 255));         // divisor hi
+    seq.push(UART_LCR() * 256 + uart_lcr_8n1());  // 8N1, DLAB off
+    seq.push(UART_FCR() * 256 + 0xC7);            // FIFO on, 14B trigger
+    seq.push(UART_MCR() * 256 + 0x0B);            // DTR+RTS+OUT2
+    return seq;
+}

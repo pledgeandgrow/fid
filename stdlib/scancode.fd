@@ -1,0 +1,58 @@
+// PS/2 set-1 scancode decoding — make/break split, shift state, and the
+// US-QWERTY ASCII tables. Port IRQ handling is the driver's job; this
+// maps raw scancode bytes to keys/chars.
+module scancode;
+
+use vec;
+
+/// Key press (make) when the byte's high bit is clear.
+pub fn sc_is_make(code: i64) -> bool { return (code & 0x80) == 0; }
+/// The scancode without its break bit.
+pub fn sc_base(code: i64) -> i64 { return code & 0x7F; }
+
+// Modifier scancodes (base values).
+pub fn SC_LSHIFT() -> i64 { return 0x2A; }
+pub fn SC_RSHIFT() -> i64 { return 0x36; }
+pub fn SC_LCTRL() -> i64 { return 0x1D; }
+pub fn SC_CAPS() -> i64 { return 0x3A; }
+
+// Unshifted US map, scancode 0..83. Packed 3-digit decimals: code*8+char
+// is not used — chars are stored directly, 0 = unmapped.
+pub const SC_MAP: [i64; 84] = [0,27,49,50,51,52,53,54,55,56,57,48,45,61,8,9,113,119,101,114,116,121,117,105,111,112,91,93,10,0,97,115,100,102,103,104,106,107,108,59,39,96,0,92,122,120,99,118,98,110,109,44,46,47,0,42,0,32,0,0,0,0,0,0,0,0,0,0,0,0,0,55,56,57,45,52,53,54,43,49,50,51,48,46];
+pub const SC_MAP_SHIFT: [i64; 84] = [0,27,33,64,35,36,37,94,38,42,40,41,95,43,8,9,81,87,69,82,84,89,85,73,79,80,123,125,10,0,65,83,68,70,71,72,74,75,76,58,34,126,0,124,90,88,67,86,66,78,77,60,62,63,0,42,0,32,0,0,0,0,0,0,0,0,0,0,0,0,0,55,56,57,45,52,53,54,43,49,50,51,48,46];
+
+/// ASCII for a base scancode with current shift state, or 0 when the
+/// key is unmapped / non-printable. Caps lock handled by the caller:
+/// letters only.
+pub fn sc_ascii(code: i64, shifted: bool) -> i64 {
+    var b: i64 = sc_base(code);
+    if b >= 84 { return 0; }
+    if shifted { return SC_MAP_SHIFT[b]; }
+    return SC_MAP[b];
+}
+
+/// Update the modifier state from a scancode byte. state bit0=shift,
+/// bit1=caps. Returns the new state.
+pub fn sc_mod_update(code: i64, state: i64) -> i64 {
+    var b: i64 = sc_base(code);
+    var s: i64 = state;
+    if b == SC_LSHIFT() || b == SC_RSHIFT() {
+        if sc_is_make(code) { s = s | 1; } else { s = s & -2; }
+    }
+    if b == SC_CAPS() && sc_is_make(code) { s = s ^ 2; }
+    return s;
+}
+
+/// ASCII for a make-code honouring shift AND caps (caps flips letters).
+pub fn sc_key_char(code: i64, state: i64) -> i64 {
+    if !sc_is_make(code) { return 0; }
+    var b: i64 = sc_base(code);
+    var sh: bool = (state & 1) != 0;
+    var c: i64 = sc_ascii(b, sh);
+    if c >= 97 && c <= 122 && (state & 2) != 0 {
+        c = c - 32;
+    } else {
+        if c >= 65 && c <= 90 && (state & 2) != 0 { c = c + 32; }
+    }
+    return c;
+}

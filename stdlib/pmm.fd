@@ -1,0 +1,124 @@
+// Physical page-frame management: a bitmap allocator over 4-KiB frames,
+// plus x86-64 paging helpers (table index extraction, entry encode,
+// flags). The bitmap lives in caller memory — a kernel typically carves
+// it from the first usable e820 range (see multiboot.fd).
+module pmm;
+
+use vec;
+
+pub fn PAGE_SIZE() -> i64 { return 4096; }
+
+pub struct Pmm {
+    pub total: i64,        // frames managed
+    pub used: i64,
+    pub map: Vec<i64>,     // 1 bit per frame, 1 = used (i64 per 64 frames)
+    pub hint: i64,         // last alloc word — scan resumes here
+}
+
+/// Allocator for `frames` frames, all free. Map bytes = ceil(frames/64).
+pub fn pmm_new(frames: i64) -> Pmm {
+    var words: i64 = (frames + 63) / 64;
+    var m: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < words { m.push(0); i = i + 1; }
+    return Pmm{total: frames, used: 0, map: m, hint: 0};
+}
+
+/// Mark frame f used (no bounds check beyond the map).
+pub fn pmm_mark(p: &mut Pmm, f: i64) {
+    var w: i64 = f / 64;
+    var bit: i64 = f % 64;
+    var v: i64 = p.map.get(w);
+    if (v & (1 << bit)) == 0 {
+        p.map.set(w, v | (1 << bit));
+        p.used = p.used + 1;
+    }
+}
+
+/// Mark all frames in [start_frame, start_frame+n) used — for kernel
+/// image, bitmap itself, reserved e820 ranges.
+pub fn pmm_mark_range(p: &mut Pmm, start: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        if start + i < p.total { pmm_mark(p, start + i); }
+        i = i + 1;
+    }
+}
+
+/// Free frame f.
+pub fn pmm_free(p: &mut Pmm, f: i64) {
+    var w: i64 = f / 64;
+    var bit: i64 = f % 64;
+    var v: i64 = p.map.get(w);
+    if (v & (1 << bit)) != 0 {
+        p.map.set(w, v & ~(1 << bit));
+        p.used = p.used - 1;
+    }
+}
+
+/// First free frame index or -1. Scans whole words, so the bit walk
+/// only runs on words that are not all-ones.
+pub fn pmm_alloc(p: &mut Pmm) -> i64 {
+    var words: i64 = p.map.len();
+    var w: i64 = p.hint;
+    var pass: i64 = 0;
+    while pass < 2 {
+        while w < words {
+            var v: i64 = p.map.get(w);
+            if v != -1 {
+                var bit: i64 = 0;
+                while bit < 64 {
+                    if (v & (1 << bit)) == 0 {
+                        var f: i64 = w * 64 + bit;
+                        if f >= p.total { return -1; }
+                        pmm_mark(p, f);
+                        p.hint = w;
+                        return f;
+                    }
+                    bit = bit + 1;
+                }
+            }
+            w = w + 1;
+        }
+        w = 0;
+        pass = pass + 1;
+    }
+    return -1;
+}
+
+/// Frame -> byte address and back helpers.
+@wrapping
+pub fn pmm_frame_addr(f: i64) -> i64 { return f * 4096; }
+pub fn pmm_addr_frame(a: i64) -> i64 { return a / 4096; }
+
+// --- x86-64 4-level paging --------------------------------------------------
+// A table is 512 u64 entries; indices from bits 47..12 of the virtual
+// address. Entries: phys | flags.
+
+pub fn PT_PRESENT() -> i64 { return 1; }
+pub fn PT_WRITE() -> i64 { return 2; }
+pub fn PT_USER() -> i64 { return 4; }
+pub fn PT_PWT() -> i64 { return 8; }
+pub fn PT_PCD() -> i64 { return 16; }
+pub fn PT_HUGE() -> i64 { return 128; }
+@wrapping
+pub fn PT_NX() -> i64 { return -9223372036854775808; }   // bit 63
+
+pub fn pg_pml4i(va: i64) -> i64 { return (va >> 39) & 511; }
+pub fn pg_pdpti(va: i64) -> i64 { return (va >> 30) & 511; }
+pub fn pg_pdi(va: i64) -> i64 { return (va >> 21) & 511; }
+pub fn pg_pti(va: i64) -> i64 { return (va >> 12) & 511; }
+pub fn pg_offset(va: i64) -> i64 { return va & 4095; }
+
+/// Table entry: 4K-aligned phys address | flags.
+@wrapping
+pub fn pg_entry(phys: i64, flags: i64) -> i64 {
+    return (phys & 0x7FFFFFFFF000) | flags;
+}
+
+/// Physical address carried by a present entry.
+@wrapping
+pub fn pg_entry_phys(e: i64) -> i64 { return e & 0x7FFFFFFFF000; }
+
+pub fn pg_is_present(e: i64) -> bool { return (e & 1) != 0; }
+pub fn pg_is_huge(e: i64) -> bool { return (e & 128) != 0; }

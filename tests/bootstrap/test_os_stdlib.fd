@@ -1,0 +1,234 @@
+use elf;
+use acpi;
+use pci;
+use virtio;
+use multiboot;
+use fdt;
+use uart;
+use scancode;
+use pmm;
+use slab;
+use vec;
+use string;
+
+fn ck(name: str, got: i64, want: i64) {
+    if got != want {
+        p_panic(name + ": got " + int_to_str(got) + " want " + int_to_str(want));
+    }
+}
+fn cks(name: str, got: str, want: str) {
+    if !str_equal(got, want) { p_panic(name + ": got " + got); }
+}
+fn ckb(name: str, got: bool) {
+    if !got { p_panic(name); }
+}
+
+fn wbe(b: &mut Vec<i64>, o: i64, v: i64) {
+    b.set(o, (v >> 24) & 255); b.set(o + 1, (v >> 16) & 255);
+    b.set(o + 2, (v >> 8) & 255); b.set(o + 3, v & 255);
+}
+fn w32(b: &mut Vec<i64>, o: i64, v: i64) {
+    b.set(o, v & 255); b.set(o + 1, (v >> 8) & 255);
+    b.set(o + 2, (v >> 16) & 255); b.set(o + 3, (v >> 24) & 255);
+}
+@wrapping
+fn w64(b: &mut Vec<i64>, o: i64, v: i64) {
+    w32(b, o, v); w32(b, o + 4, v / 4294967296);
+}
+fn fixsum(b: &mut Vec<i64>, o: i64, n: i64, csum_off: i64) {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n { s = s + b.get(o + i); i = i + 1; }
+    b.set(o + csum_off, (256 - (s % 256)) % 256);
+}
+fn bytes(n: i64) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n { b.push(0); i = i + 1; }
+    return b;
+}
+fn puts(b: &mut Vec<i64>, o: i64, s: str) {
+    var i: i64 = 0;
+    while i < str_len(s) { b.set(o + i, str_byte_at(s, i)); i = i + 1; }
+}
+
+fn main() -> i64 {
+    // --- ELF64 ---
+    var e: Vec<i64> = bytes(256);
+    e.set(0, 127); e.set(1, 69); e.set(2, 76); e.set(3, 70);
+    e.set(4, 2); e.set(5, 1); e.set(6, 1);
+    w32(&mut e, 16, 2);            // ET_EXEC
+    w32(&mut e, 18, 62);           // x86-64
+    w64(&mut e, 24, 0x401000);     // entry
+    w64(&mut e, 32, 64);           // phoff
+    w64(&mut e, 40, 128);          // shoff
+    w32(&mut e, 54, 56); w32(&mut e, 56, 1);   // phentsize, phnum
+    w32(&mut e, 58, 64); w32(&mut e, 60, 2); w32(&mut e, 62, 1);
+    w32(&mut e, 64, 1);            // PT_LOAD
+    w64(&mut e, 72, 0x1000);       // offset
+    // shdr0 null; shdr1 = shstrtab ".shstrtab\0.text\0" at 200
+    puts(&mut e, 200, ".shstrtab"); e.set(209, 0);
+    puts(&mut e, 210, ".text"); e.set(215, 0);
+    w32(&mut e, 128 + 64, 0);      // shdr1 name_off -> ".shstrtab"
+    w64(&mut e, 128 + 64 + 24, 200);
+    var h: Elf64Ehdr = elf_ehdr(e);
+    ckb("elf valid", h.valid);
+    ck("elf machine", h.machine, 62);
+    ck("elf phnum", h.phnum, 1);
+    var p: Elf64Phdr = elf_phdr(e, h, 0);
+    ck("elf ptype", p.ptype, 1);
+    cks("elf shname", elf_shdr_name(e, h, 1), ".shstrtab");
+
+    // --- ACPI: RSDP + XSDT + MADT + MCFG ---
+    // EBDA route: pointer at 0x40E is a segment; base = seg*16.
+    var mem: Vec<i64> = bytes(0x9000);
+    mem.set(0x40E, 0x00); mem.set(0x40F, 0x08);   // seg 0x800 -> 0x8000
+    var r: i64 = 0x8000;
+    puts(&mut mem, r, "RSD PTR ");
+    mem.set(r + 15, 2);                     // revision
+    w32(&mut mem, r + 16, 0xF0000);         // rsdt (bytes 16-19)
+    w32(&mut mem, r + 20, 36);              // length (bytes 20-23)
+    w64(&mut mem, r + 24, 0xF1000);         // xsdt
+    fixsum(&mut mem, r, 20, 9);             // v1 checksum covers 0-19
+    fixsum(&mut mem, r, 36, 32);            // ext checksum covers 0-35
+    ck("rsdp find", rsdp_find(mem), r);
+    var rp: Rsdp = rsdp_at(mem, r);
+    ckb("rsdp valid", rp.valid);
+    ck("rsdp xsdt", rp.xsdt, 0xF1000);
+    // MADT at 0: header + 2 LAPIC + 1 IOAPIC entries
+    var madt: Vec<i64> = bytes(64);
+    puts(&mut madt, 0, "APIC");
+    w32(&mut madt, 4, 64);
+    w32(&mut madt, 36, 1);                  // local apic addr lo? (flags 40)
+    madt.set(44, 0); madt.set(45, 8);       // LAPIC
+    madt.set(52, 0); madt.set(53, 8);       // LAPIC
+    madt.set(60, 1); madt.set(61, 4);       // IOAPIC
+    fixsum(&mut madt, 0, 64, 9);
+    ckb("madt hdr", sdt_at(madt, 0, "APIC").valid);
+    ck("madt count", madt_entry_count(madt), 3);
+    ck("madt lapics", madt_entries_of(madt, 0).len(), 2);
+    // MCFG: len 60, one entry base=0xE0000000 buses 0-255
+    var mcfg: Vec<i64> = bytes(60);
+    puts(&mut mcfg, 0, "MCFG");
+    w32(&mut mcfg, 4, 60);
+    w64(&mut mcfg, 44, 0xE0000000);
+    mcfg.set(55, 255);
+    fixsum(&mut mcfg, 0, 60, 9);
+    ckb("mcfg hdr", sdt_at(mcfg, 0, "MCFG").valid);
+    ck("mcfg count", mcfg_entry_count(mcfg), 1);
+    ck("mcfg buses", mcfg_entry(mcfg, 0).bus_end, 255);
+
+    // --- PCI config space ---
+    var c: Vec<i64> = bytes(256);
+    w32(&mut c, 0, 0x12345678);             // dev+vendor
+    w32(&mut c, 4, 0x00100006);             // status|command (cap bit)
+    c.set(8, 1); c.set(9, 0); c.set(10, 0); c.set(11, 2);  // class 2 = net
+    c.set(14, 0x80);                        // header type 0 + multifn
+    w32(&mut c, 16, 0xFEBF000C);            // BAR0: mem 64-bit pref
+    w32(&mut c, 20, 0x00000000);
+    c.set(0x34, 0x40);                      // cap ptr
+    c.set(0x40, 0x11); c.set(0x41, 0x50);   // MSI-X -> 0x50
+    c.set(0x50, 0x05); c.set(0x51, 0x00);   // MSI, end
+    ckb("pci present", pci_present(c));
+    ck("pci vendor", pci_vendor(c), 0x5678);
+    ck("pci class", pci_class(c), 2);
+    var bar: PciBar = pci_bar(c, 0);
+    ckb("pci bar mem", !bar.is_io && bar.is64 && bar.prefetch);
+    ck("pci bar addr", bar.addr, 0xFEBF0000);
+    ck("pci msix off", pci_cap_offset(c, 0x11), 0x40);
+    ck("pci msi off", pci_cap_offset(c, 0x05), 0x50);
+    ck("pci barsize", pci_bar_size(0xFFFFF000, false), 4096);
+
+    // --- virtio queue ---
+    var q: Vec<i64> = bytes(vq_total_size(4));
+    ckb("vq size", vq_total_size(4) >= 4 * 16 + 4 + 8 + 2 + 4 + 32 + 2);
+    vq_desc(&mut q, 4, 0, 0x1000, 512, VQ_F_WRITE(), 0);
+    ck("vq desc flags", vq_desc_flags(q, 0), VQ_F_WRITE());
+    vq_avail_push(&mut q, 4, 0);
+    ck("vq avail idx", vq_avail_idx(q, 4), 1);
+    var f: VqFree = vq_free_new(4);
+    var got: Vec<i64> = Vec::new();
+    ckb("vq take 2", vq_free_take(&mut f, 2, &mut got));
+    ck("vq take got", got.get(0), 0);
+    ck("vq count", f.count, 2);
+    vq_free_chain(&mut f, q, 0);
+    ck("vq freed", f.count, 3);
+
+    // --- multiboot2 ---
+    var m: Vec<i64> = bytes(256);
+    w32(&mut m, 0, 200);
+    w32(&mut m, 8, 1);  w32(&mut m, 12, 24);      // cmdline tag sz 24
+    puts(&mut m, 16, "root=/dev/x");
+    w32(&mut m, 32, 6); w32(&mut m, 36, 64);      // mmap tag sz 64
+    w32(&mut m, 40, 24);                          // esize
+    w64(&mut m, 48, 0x100000); w64(&mut m, 56, 0x7F000); w32(&mut m, 64, 1);
+    w64(&mut m, 72, 0x180000); w64(&mut m, 80, 0x8000); w32(&mut m, 88, 2);
+    w32(&mut m, 96, 0); w32(&mut m, 100, 8);      // END tag
+    ckb("mbi valid", mbi_valid(m));
+    ck("mbi tags", mbi_tag_count(m), 2);
+    var cp: i64 = mbi_tag_find(m, MB_TAG_CMDLINE());
+    cks("mbi cmdline", mb_str(m, cp), "root=/dev/x");
+    var mp: i64 = mbi_tag_find(m, MB_TAG_MMAP());
+    ck("mmap count", mmap_count(m, mp), 2);
+    ck("mmap usable", mmap_usable(m, mp), 0x7F000);
+    ck("e820 type", mmap_entry(m, mp, 1).etype, 2);
+
+    // --- FDT ---
+    var dtb: Vec<i64> = bytes(256);
+    wbe(&mut dtb, 0, 0xD00DFEED); wbe(&mut dtb, 4, 200);
+    wbe(&mut dtb, 8, 40);                           // struct off
+    wbe(&mut dtb, 12, 128);                         // strings off
+    wbe(&mut dtb, 32, 88);                          // struct size
+    // struct: BEGIN_NODE "" / PROP len4 nameoff0 "compatible" data / END_NODE / END
+    wbe(&mut dtb, 40, 1); dtb.set(44, 0);             // BEGIN_NODE + empty name
+    wbe(&mut dtb, 48, 3); wbe(&mut dtb, 52, 4); wbe(&mut dtb, 56, 0);
+    wbe(&mut dtb, 60, 0x12345678);
+    wbe(&mut dtb, 64, 2); wbe(&mut dtb, 68, 9);
+    puts(&mut dtb, 128, "compatible"); dtb.set(138, 0);
+    var fh: FdtHeader = fdt_header(dtb);
+    ckb("fdt valid", fh.valid);
+    var t: FdtTok = fdt_next(dtb, fh, 40);
+    ck("fdt begin", t.kind, 1);
+    var t2: FdtTok = fdt_next(dtb, fh, 48);
+    ck("fdt prop", t2.kind, 3);
+    cks("fdt propname", t2.name, "compatible");
+    ck("fdt propval", fdt_u32(dtb, t2.data_off), 0x12345678);
+    ck("fdt find", fdt_prop_find(dtb, fh, 40, "compatible"), 60);
+
+    // --- uart + scancode ---
+    ck("uart div", uart_divisor(115200), 1);
+    ck("uart seq", uart_init_seq(38400).len(), 7);
+    ck("sc a", sc_key_char(0x1E, 0), 97);
+    ck("sc A shift", sc_key_char(0x1E, 1), 65);
+    ck("sc A caps", sc_key_char(0x1E, 2), 65);
+    ck("sc break", sc_key_char(0x9E, 0), 0);
+    ck("sc mod", sc_mod_update(0x2A, 0), 1);
+
+    // --- pmm + paging ---
+    var pm: Pmm = pmm_new(256);
+    ck("pmm f1", pmm_alloc(&mut pm), 0);
+    pmm_mark_range(&mut pm, 4, 3);
+    ck("pmm f2", pmm_alloc(&mut pm), 1);
+    ck("pmm f3", pmm_alloc(&mut pm), 2);
+    ck("pmm f4", pmm_alloc(&mut pm), 3);
+    ck("pmm f5", pmm_alloc(&mut pm), 7);
+    pmm_free(&mut pm, 5);
+    ck("pmm reuse", pmm_alloc(&mut pm), 5);
+    ck("pg pml4", pg_pml4i(0xFFFF800000000000), 256);
+    ck("pg pti", pg_pti(0x12345000 + 0x678), 325);
+    ck("pg entry", pg_entry_phys(pg_entry(0x12345000, 3)), 0x12345000);
+    ckb("pg present", pg_is_present(pg_entry(0x1000, 1)));
+
+    // --- slab ---
+    var s: Slab = slab_new(16, 4);
+    ck("slab a", slab_alloc(&mut s), 0);
+    ck("slab b", slab_alloc(&mut s), 1);
+    slab_free(&mut s, 0);
+    ck("slab reuse", slab_alloc(&mut s), 0);
+    slab_alloc(&mut s); slab_alloc(&mut s);
+    ck("slab full", slab_alloc(&mut s), -1);
+    ck("slab used", s.used, 4);
+
+    println("all ok");
+    return 0;
+}

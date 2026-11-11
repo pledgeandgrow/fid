@@ -1,0 +1,156 @@
+// Flattened Device Tree (FDT / .dtb) parsing — the boot handoff on
+// ARM64 and RISC-V (and QEMU -dtb anywhere). The blob is raw bytes;
+// all multi-byte fields are big-endian.
+module fdt;
+
+use vec;
+
+pub fn fdt_u32(b: Vec<i64>, o: i64) -> i64 {
+    return b.get(o) * 16777216 + b.get(o + 1) * 65536
+        + b.get(o + 2) * 256 + b.get(o + 3);
+}
+@wrapping
+pub fn fdt_u64(b: Vec<i64>, o: i64) -> i64 {
+    return fdt_u32(b, o) * 4294967296 + fdt_u32(b, o + 4);
+}
+
+// Token values inside the struct block.
+pub fn FDT_BEGIN_NODE() -> i64 { return 1; }
+pub fn FDT_END_NODE() -> i64 { return 2; }
+pub fn FDT_PROP() -> i64 { return 3; }
+pub fn FDT_NOP() -> i64 { return 4; }
+pub fn FDT_END() -> i64 { return 9; }
+
+pub struct FdtHeader {
+    pub valid: bool,
+    pub totalsize: i64,
+    pub off_struct: i64,
+    pub off_strings: i64,
+    pub off_mem_rsv: i64,
+    pub version: i64,
+    pub size_struct: i64,
+}
+
+/// Validate the FDT magic (0xD00DFEED) and read the header fields.
+pub fn fdt_header(b: Vec<i64>) -> FdtHeader {
+    var h: FdtHeader = FdtHeader{valid: false, totalsize: 0, off_struct: 0,
+        off_strings: 0, off_mem_rsv: 0, version: 0, size_struct: 0};
+    if b.len() < 40 { return h; }
+    if fdt_u32(b, 0) != 0xD00DFEED { return h; }
+    h.totalsize = fdt_u32(b, 4);
+    if h.totalsize > b.len() { return h; }
+    h.off_struct = fdt_u32(b, 8);
+    h.off_strings = fdt_u32(b, 12);
+    h.off_mem_rsv = fdt_u32(b, 16);
+    h.version = fdt_u32(b, 20);
+    h.size_struct = fdt_u32(b, 32);
+    h.valid = true;
+    return h;
+}
+
+/// NUL-terminated name in the strings block.
+pub fn fdt_string(b: Vec<i64>, h: FdtHeader, stroff: i64) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = h.off_strings + stroff;
+    while i < b.len() {
+        var c: i64 = b.get(i);
+        if c == 0 { break; }
+        out.push(c);
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+// --- struct-block walk -------------------------------------------------------
+// Iteration model: fdt_walk calls are stepwise — fdt_next advances a
+// cursor (a byte offset) and reports the token at it. Nodes carry a name
+// directly after BEGIN_NODE; props carry {len u32, nameoff u32} + data.
+
+pub struct FdtTok {
+    pub kind: i64,       // FDT_* token or 0 at end/garbage
+    pub pos: i64,        // offset of the token
+    pub name: str,       // node name (BEGIN_NODE) or prop name (PROP)
+    pub data_off: i64,   // prop data offset (PROP), else 0
+    pub data_len: i64,
+    pub next: i64,       // offset of the following token
+}
+
+fn zstr(b: Vec<i64>, o: i64) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = o;
+    while i < b.len() {
+        var c: i64 = b.get(i);
+        if c == 0 { break; }
+        out.push(c);
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+fn zlen(b: Vec<i64>, o: i64) -> i64 {
+    var i: i64 = o;
+    while i < b.len() {
+        if b.get(i) == 0 { return i - o + 1; }
+        i = i + 1;
+    }
+    return i - o;
+}
+
+/// Read the token at struct-block offset `pos` (start with
+/// h.off_struct). NOPs are skipped.
+pub fn fdt_next(b: Vec<i64>, h: FdtHeader, pos: i64) -> FdtTok {
+    var p: i64 = pos;
+    var t: FdtTok = FdtTok{kind: 0, pos: p, name: "", data_off: 0,
+        data_len: 0, next: p};
+    var send: i64 = h.off_struct + h.size_struct;
+    while p + 4 <= send && p + 4 <= b.len() {
+        var kind: i64 = fdt_u32(b, p);
+        if kind == 4 { p = p + 4; continue; }      // NOP
+        t.kind = kind;
+        t.pos = p;
+        if kind == 1 {                             // BEGIN_NODE
+            t.name = zstr(b, p + 4);
+            var nl: i64 = zlen(b, p + 4);
+            t.next = p + 4 + ((nl + 3) / 4) * 4;
+        } else if kind == 3 {                      // PROP
+            var dl: i64 = fdt_u32(b, p + 4);
+            var no: i64 = fdt_u32(b, p + 8);
+            t.name = fdt_string(b, h, no);
+            t.data_off = p + 12;
+            t.data_len = dl;
+            t.next = p + 12 + ((dl + 3) / 4) * 4;
+        } else {
+            t.next = p + 4;                        // END_NODE/END
+        }
+        return t;
+    }
+    return t;
+}
+
+/// First prop named `name` under the node that starts at token offset
+/// `nodepos` (a BEGIN_NODE). Scans that node's direct props only —
+/// stops at the next BEGIN_NODE or END_NODE. Returns data offset, or -1.
+pub fn fdt_prop_find(b: Vec<i64>, h: FdtHeader, nodepos: i64, name: str) -> i64 {
+    var t: FdtTok = fdt_next(b, h, nodepos);
+    var p: i64 = t.next;
+    while p > 0 {
+        var k: FdtTok = fdt_next(b, h, p);
+        if k.kind == 3 {
+            if str_equal(k.name, name) { return k.data_off; }
+        }
+        if k.kind == 1 || k.kind == 2 || k.kind == 9 || k.kind == 0 { return -1; }
+        p = k.next;
+    }
+    return -1;
+}
+
+// --- cell helpers ------------------------------------------------------------
+// #address-cells / #size-cells sized ints; a reg entry is
+// (ac cells of addr)(sc cells of size).
+
+/// Read `cells` big-endian u32s as one value (cells 1 or 2).
+@wrapping
+pub fn fdt_cell(b: Vec<i64>, o: i64, cells: i64) -> i64 {
+    if cells == 2 { return fdt_u64(b, o); }
+    return fdt_u32(b, o);
+}

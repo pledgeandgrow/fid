@@ -1,0 +1,146 @@
+// Multiboot2 boot-information parsing — the tag list a Multiboot2
+// bootloader leaves for the kernel. mbi is the raw bytes as mapped at
+// the physical address the bootloader placed in %ebx. Also decodes the
+// e820-style memory-map entries of tag type 6.
+module multiboot;
+
+use vec;
+
+pub fn mb_u32(b: Vec<i64>, o: i64) -> i64 {
+    return b.get(o) + b.get(o + 1) * 256 + b.get(o + 2) * 65536
+        + b.get(o + 3) * 16777216;
+}
+@wrapping
+pub fn mb_u64(b: Vec<i64>, o: i64) -> i64 {
+    return mb_u32(b, o) + mb_u32(b, o + 4) * 4294967296;
+}
+
+// Tag types (subset).
+pub fn MB_TAG_END() -> i64 { return 0; }
+pub fn MB_TAG_CMDLINE() -> i64 { return 1; }
+pub fn MB_TAG_BOOTLOADER() -> i64 { return 2; }
+pub fn MB_TAG_MODULE() -> i64 { return 3; }
+pub fn MB_TAG_MEM_BASIC() -> i64 { return 4; }
+pub fn MB_TAG_BOOTDEV() -> i64 { return 5; }
+pub fn MB_TAG_MMAP() -> i64 { return 6; }
+pub fn MB_TAG_FRAMEBUFFER() -> i64 { return 8; }
+
+/// Valid mbi? (total_size u32 then reserved u32; the byte following the
+/// tags is always an END tag pair).
+pub fn mbi_valid(b: Vec<i64>) -> bool {
+    var total: i64 = mb_u32(b, 0);
+    return total >= 16 && total <= b.len();
+}
+
+/// Total tag count (END tag excluded).
+pub fn mbi_tag_count(b: Vec<i64>) -> i64 {
+    var o: i64 = 8;
+    var n: i64 = 0;
+    while o + 8 <= b.len() {
+        var t: i64 = mb_u32(b, o);
+        if t == 0 { break; }
+        n = n + 1;
+        var sz: i64 = mb_u32(b, o + 4);
+        o = o + ((sz + 7) / 8) * 8;               // tags align to 8
+    }
+    return n;
+}
+
+/// Offset of tag i's payload (its `type` and `size` fields are the 8
+/// bytes just before), or -1.
+pub fn mbi_tag(b: Vec<i64>, i: i64) -> i64 {
+    var o: i64 = 8;
+    var k: i64 = 0;
+    while o + 8 <= b.len() {
+        var t: i64 = mb_u32(b, o);
+        if t == 0 { return -1; }
+        if k == i { return o + 8; }
+        var sz: i64 = mb_u32(b, o + 4);
+        o = o + ((sz + 7) / 8) * 8;
+        k = k + 1;
+    }
+    return -1;
+}
+
+/// Offset of the first tag of `want` type's payload, or -1.
+pub fn mbi_tag_find(b: Vec<i64>, want: i64) -> i64 {
+    var o: i64 = 8;
+    while o + 8 <= b.len() {
+        var t: i64 = mb_u32(b, o);
+        if t == 0 { return -1; }
+        if t == want { return o + 8; }
+        var sz: i64 = mb_u32(b, o + 4);
+        o = o + ((sz + 7) / 8) * 8;
+    }
+    return -1;
+}
+
+/// NUL-terminated string at payload offset p (cmdline/bootloader tags).
+pub fn mb_str(b: Vec<i64>, p: i64) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = p;
+    while i < b.len() {
+        var c: i64 = b.get(i);
+        if c == 0 { break; }
+        out.push(c);
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+// --- memory map (tag 6) -----------------------------------------------------
+
+pub struct E820Entry {
+    pub base: i64,
+    pub length: i64,
+    pub etype: i64,          // 1 usable, 2 reserved, 3 ACPI, 4 NVS, 5 bad
+}
+
+/// Number of e820 entries in the mmap tag payload at p.
+pub fn mmap_count(b: Vec<i64>, p: i64) -> i64 {
+    var esize: i64 = mb_u32(b, p);
+    var size: i64 = mb_u32(b, p - 4);             // tag size field
+    var body: i64 = size - 8 - 8;                 // minus tag hdr + hdr fields
+    if esize == 0 { return 0; }
+    return (body - 0) / esize;
+}
+
+/// e820 entry i: {base u64, length u64, type u32, reserved u32}.
+pub fn mmap_entry(b: Vec<i64>, p: i64, i: i64) -> E820Entry {
+    var esize: i64 = mb_u32(b, p);
+    var o: i64 = p + 8 + i * esize;
+    return E820Entry{base: mb_u64(b, o), length: mb_u64(b, o + 8),
+        etype: mb_u32(b, o + 16)};
+}
+
+/// Total usable (type-1) bytes in the map.
+@wrapping
+pub fn mmap_usable(b: Vec<i64>, p: i64) -> i64 {
+    var n: i64 = mmap_count(b, p);
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var e: E820Entry = mmap_entry(b, p, i);
+        if e.etype == 1 { total = total + e.length; }
+        i = i + 1;
+    }
+    return total;
+}
+
+// --- framebuffer (tag 8) ----------------------------------------------------
+
+pub struct FbInfo {
+    pub addr: i64,
+    pub pitch: i64,
+    pub width: i64,
+    pub height: i64,
+    pub bpp: i64,
+    pub fbtype: i64,
+}
+
+/// Framebuffer tag payload at p.
+pub fn fb_info(b: Vec<i64>, p: i64) -> FbInfo {
+    return FbInfo{addr: mb_u64(b, p), pitch: mb_u32(b, p + 8),
+        width: mb_u32(b, p + 12), height: mb_u32(b, p + 16),
+        bpp: b.get(p + 20), fbtype: b.get(p + 21)};
+}

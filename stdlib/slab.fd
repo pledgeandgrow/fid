@@ -1,0 +1,80 @@
+// Slab allocator — fixed-size object allocation without per-object
+// headers. Objects are indexed (not pointers), so the same code runs
+// under the interpreter for tests and on kernel memory in an OS.
+// The backing store is a byte Vec the caller owns; free slots chain
+// through a 4-byte index stored in the slot itself.
+module slab;
+
+use vec;
+
+pub struct Slab {
+    pub obj_size: i64,
+    pub capacity: i64,
+    pub used: i64,
+    pub free_head: i64,      // first free object index, -1 when full
+    pub backing: Vec<i64>,   // obj_size * capacity bytes
+}
+
+fn slab_u32(s: &Slab, o: i64) -> i64 {
+    return s.backing.get(o) + s.backing.get(o + 1) * 256
+        + s.backing.get(o + 2) * 65536 + s.backing.get(o + 3) * 16777216;
+}
+fn slab_w32(s: &mut Slab, o: i64, v: i64) {
+    s.backing.set(o, v & 255);
+    s.backing.set(o + 1, (v >> 8) & 255);
+    s.backing.set(o + 2, (v >> 16) & 255);
+    s.backing.set(o + 3, (v >> 24) & 255);
+}
+
+/// Slab of `capacity` objects of `obj_size` bytes (>= 4, so the free
+/// link fits). Free list threads index+1 through each slot (0 = end).
+pub fn slab_new(obj_size: i64, capacity: i64) -> Slab {
+    var sz: i64 = obj_size;
+    if sz < 4 { sz = 4; }
+    var s: Slab = Slab{obj_size: sz, capacity: capacity, used: 0,
+        free_head: 0, backing: Vec::new()};
+    var i: i64 = 0;
+    while i < sz * capacity { s.backing.push(0); i = i + 1; }
+    if capacity == 0 { s.free_head = -1; return s; }
+    i = 0;
+    while i < capacity {
+        var nx: i64 = 0;                       // 0 marks list end
+        if i + 1 < capacity { nx = i + 2; }    // store index+1
+        slab_w32(&mut s, i * sz, nx);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// Allocate an object: returns its index (byte offset / obj_size), or
+/// -1 when the slab is exhausted.
+pub fn slab_alloc(s: &mut Slab) -> i64 {
+    if s.free_head < 0 { return -1; }
+    var i: i64 = s.free_head;
+    var nx: i64 = slab_u32(s, i * s.obj_size);
+    if nx == 0 { s.free_head = -1; } else { s.free_head = nx - 1; }
+    s.used = s.used + 1;
+    return i;
+}
+
+/// Return object i to the free list.
+pub fn slab_free(s: &mut Slab, i: i64) {
+    var nx: i64 = 0;
+    if s.free_head >= 0 { nx = s.free_head + 1; }
+    slab_w32(s, i * s.obj_size, nx);
+    s.free_head = i;
+    s.used = s.used - 1;
+}
+
+/// Byte offset of object i inside the backing store.
+pub fn slab_off(s: &Slab, i: i64) -> i64 { return i * s.obj_size; }
+
+/// Fill object i's bytes with a value (0 to clear).
+pub fn slab_clear(s: &mut Slab, i: i64, v: i64) {
+    var o: i64 = i * s.obj_size;
+    var k: i64 = 0;
+    while k < s.obj_size {
+        s.backing.set(o + k, v & 255);
+        k = k + 1;
+    }
+}

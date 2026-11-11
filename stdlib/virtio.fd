@@ -1,0 +1,154 @@
+// virtio split virtqueue layout and bookkeeping (spec §2.6+).
+// Queue memory is caller-allocated raw bytes (Vec<i64>); the module
+// computes ring offsets/sizes and encodes/deserializes ring entries so a
+// driver does not re-derive the layout. Device I/O (notify, isr) is the
+// caller's transport code.
+module virtio;
+
+use vec;
+
+// Descriptor flags (vring_desc.flags).
+pub fn VQ_F_NEXT() -> i64 { return 1; }
+pub fn VQ_F_WRITE() -> i64 { return 2; }
+pub fn VQ_F_INDIRECT() -> i64 { return 4; }
+
+// --- layout -----------------------------------------------------------------
+
+/// Byte offset of the descriptor table inside a queue block.
+pub fn vq_desc_off() -> i64 { return 0; }
+
+/// Byte offset of the avail ring (driver area) — right after 16-byte
+/// descriptors.
+pub fn vq_avail_off(qsz: i64) -> i64 { return 16 * qsz; }
+
+/// Byte offset of the used ring (device area): avail ring is
+/// 4 + 2*qsz + 2 bytes, then padded to the 4-byte alignment used by
+/// virtio's avail-side alignment rule.
+pub fn vq_used_off(qsz: i64) -> i64 {
+    var a: i64 = vq_avail_off(qsz) + 4 + 2 * qsz + 2;
+    var r: i64 = a % 4;
+    if r != 0 { a = a + 4 - r; }
+    return a;
+}
+
+/// Total queue-block bytes for queue size qsz (used ring is
+/// 4 + 8*qsz + 2 bytes of used elems and avail_event).
+pub fn vq_total_size(qsz: i64) -> i64 {
+    return vq_used_off(qsz) + 4 + 8 * qsz + 2;
+}
+
+// --- ring writes/reads ------------------------------------------------------
+
+fn vu16(q: Vec<i64>, o: i64) -> i64 {
+    return q.get(o) + q.get(o + 1) * 256;
+}
+fn vu32(q: Vec<i64>, o: i64) -> i64 {
+    return vu16(q, o) + vu16(q, o + 2) * 65536;
+}
+@wrapping
+fn vu64(q: Vec<i64>, o: i64) -> i64 {
+    return vu32(q, o) + vu32(q, o + 4) * 4294967296;
+}
+fn wu16(q: &mut Vec<i64>, o: i64, v: i64) {
+    q.set(o, v & 255);
+    q.set(o + 1, (v >> 8) & 255);
+}
+fn wu32(q: &mut Vec<i64>, o: i64, v: i64) {
+    wu16(q, o, v & 65535);
+    wu16(q, o + 2, (v >> 16) & 65535);
+}
+@wrapping
+fn wu64(q: &mut Vec<i64>, o: i64, v: i64) {
+    wu32(q, o, v);
+    wu32(q, o + 4, v / 4294967296);
+}
+
+/// Write descriptor i: {addr:u64, len:u32, flags:u16, next:u16}.
+pub fn vq_desc(q: &mut Vec<i64>, qsz: i64, i: i64, addr: i64, len: i64,
+        flags: i64, next: i64) {
+    var o: i64 = 16 * i;
+    wu64(q, o, addr);
+    wu32(q, o + 8, len);
+    wu16(q, o + 12, flags);
+    wu16(q, o + 14, next);
+}
+
+pub fn vq_desc_flags(q: Vec<i64>, i: i64) -> i64 { return vu16(q, 16 * i + 12); }
+
+/// Avail: number of entries pushed so far (idx field).
+pub fn vq_avail_idx(q: Vec<i64>, qsz: i64) -> i64 {
+    return vu16(q, vq_avail_off(qsz) + 2);
+}
+
+/// Push descriptor head `head` into the avail ring.
+pub fn vq_avail_push(q: &mut Vec<i64>, qsz: i64, head: i64) {
+    var a: i64 = vq_avail_off(qsz);
+    var idx: i64 = vu16(q, a + 2);
+    wu16(q, a + 4 + 2 * (idx % qsz), head);
+    wu16(q, a + 2, (idx + 1) & 65535);
+}
+
+/// Used: number of completions the device has written.
+pub fn vq_used_idx(q: Vec<i64>, qsz: i64) -> i64 {
+    return vu16(q, vq_used_off(qsz) + 2);
+}
+
+/// Read used element i as id*4294967296+len... not portable for len
+/// near 2^31; use vq_used_id / vq_used_len instead.
+pub fn vq_used_id(q: Vec<i64>, qsz: i64, i: i64) -> i64 {
+    return vu32(q, vq_used_off(qsz) + 4 + 8 * (i % qsz));
+}
+
+pub fn vq_used_len(q: Vec<i64>, qsz: i64, i: i64) -> i64 {
+    return vu32(q, vq_used_off(qsz) + 4 + 8 * (i % qsz) + 4);
+}
+
+/// A chain-head tracker for the driver side: which descriptor ids are
+/// free, and the head of the free list.
+pub struct VqFree {
+    pub qsz: i64,
+    pub head: i64,          // first free descriptor, -1 when empty
+    pub count: i64,
+    pub next: Vec<i64>,     // next[i] = next free desc or -1
+}
+
+/// All qsz descriptors initially free (0 -> 1 -> ... -> -1).
+pub fn vq_free_new(qsz: i64) -> VqFree {
+    var nx: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < qsz {
+        if i + 1 < qsz { nx.push(i + 1); } else { nx.push(-1); }
+        i = i + 1;
+    }
+    return VqFree{qsz: qsz, head: 0, count: qsz, next: nx};
+}
+
+/// Take n free descriptor ids into a caller Vec; returns false when the
+/// queue has fewer than n.
+pub fn vq_free_take(f: &mut VqFree, n: i64, into: &mut Vec<i64>) -> bool {
+    if f.count < n { return false; }
+    var i: i64 = 0;
+    while i < n {
+        var d: i64 = f.head;
+        f.head = f.next.get(d);
+        into.push(d);
+        i = i + 1;
+    }
+    f.count = f.count - n;
+    return true;
+}
+
+/// Return a chain head's descriptors to the free list (follows NEXT
+/// flags in the queue block).
+pub fn vq_free_chain(f: &mut VqFree, q: Vec<i64>, head: i64) {
+    var d: i64 = head;
+    var done: bool = false;
+    while !done {
+        var nx: i64 = vu16(q, 16 * d + 14);
+        var more: bool = (vu16(q, 16 * d + 12) & 1) != 0;
+        f.next.set(d, f.head);
+        f.head = d;
+        f.count = f.count + 1;
+        if more { d = nx; } else { done = true; }
+    }
+}
