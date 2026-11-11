@@ -1,0 +1,136 @@
+// AI stdlib path: safetensors load -> BPE tokenize -> inference kernels.
+use safetensors;
+use bpe;
+use infer;
+use noise;
+use vec;
+use string;
+
+fn ck(name: str, got: i64, want: i64) {
+    if got != want { p_panic(name + ": got " + int_to_str(got) + " want " + int_to_str(want)); }
+}
+fn ckf(name: str, got: f64, want: f64, tol: f64) {
+    var d: f64 = got - want;
+    if d < 0.0 { d = 0.0 - d; }
+    if d > tol { p_panic(name + ": got " + float_to_str(got)); }
+}
+fn ckb(name: str, got: bool) {
+    if !got { p_panic(name); }
+}
+fn cks2(name: str, got: str, want: str) {
+    if !str_equal(got, want) { p_panic(name + ": got " + got); }
+}
+
+fn push_u64le(b: &mut Vec<i64>, v: i64) {
+    var i: i64 = 0;
+    while i < 8 { b.push((v >> (i * 8)) & 255); i = i + 1; }
+}
+fn push_str(b: &mut Vec<i64>, s: str) {
+    var i: i64 = 0;
+    while i < str_len(s) { b.push(str_byte_at(s, i)); i = i + 1; }
+}
+
+fn main() -> i64 {
+    // --- safetensors: header + one F32 [2,2] tensor + I64 [2] ---
+    var f: Vec<i64> = Vec::new();
+    var hdr: str = "{\"w\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,16]},\"ids\":{\"dtype\":\"I64\",\"shape\":[2],\"data_offsets\":[16,32]},\"__metadata__\":{\"format\":\"pt\"}}";
+    push_u64le(&mut f, str_len(hdr));
+    push_str(&mut f, hdr);
+    // 4 f32: 1.0, -2.0, 0.5, 3.0  (little-endian bit patterns)
+    var w: Vec<i64> = Vec::new();
+    w.push(0x3F800000); w.push(0xC0000000); w.push(0x3F000000); w.push(0x40400000);
+    var i: i64 = 0;
+    while i < 4 {
+        var v: i64 = w.get(i);
+        f.push(v & 255); f.push((v >> 8) & 255); f.push((v >> 16) & 255); f.push((v >> 24) & 255);
+        i = i + 1;
+    }
+    // 2 i64: -1, 7
+    f.push(255); f.push(255); f.push(255); f.push(255); f.push(255); f.push(255); f.push(255); f.push(255);
+    f.push(7); f.push(0); f.push(0); f.push(0); f.push(0); f.push(0); f.push(0); f.push(0);
+    var st: StFile = st_open(f);
+    ckb("st open", st.ok);
+    ck("st names", st.names.len(), 2);
+    var tw: StTensor = st_tensor(f, st, "w");
+    ckb("st w found", tw.found);
+    ck("st w shape", tw.shape.get(0), 2);
+    ckf("st w[0]", st_f32(f, tw, 0), 1.0, 0.001);
+    ckf("st w[1]", st_f32(f, tw, 1), -2.0, 0.001);
+    ckf("st w[2]", st_f32(f, tw, 2), 0.5, 0.001);
+    var ti: StTensor = st_tensor(f, st, "ids");
+    ck("st ids[0]", st_int(f, ti, 0), -1);
+    ck("st ids[1]", st_int(f, ti, 1), 7);
+    cks2("st meta", st_meta(st, "format"), "pt");
+    // f16: 1.0 = 0x3C00, -2.0 = 0xC000, 0.5 = 0x3800
+    ckf("st f16 1", st_f16_f32(0x3C00), 1.0, 0.001);
+    ckf("st f16 -2", st_f16_f32(0xC000), -2.0, 0.001);
+    ckf("st f16 .5", st_f16_f32(0x3800), 0.5, 0.001);
+    ckf("st bf16 1", st_bf16_f32(0x3F80), 1.0, 0.001);
+
+    // --- bpe: merges "e r", "er t", vocab chars+merged ---
+    var vocab: str = "{\"<unk>\":0,\"t\":1,\"e\":2,\"r\":3,\"s\":4,\"er\":5,\"ter\":6}";
+    var merges: str = "#version: 0.2\ne r\nt er\n";
+    var bp: Bpe = bpe_new(vocab, merges);
+    ckb("bpe ok", bp.ok);
+    var ids: Vec<i64> = bpe_encode(bp, "ter");
+    ck("bpe len", ids.len(), 1);
+    ck("bpe id", ids.get(0), 6);
+    var ids2: Vec<i64> = bpe_encode(bp, "tes");
+    ck("bpe tes len", ids2.len(), 3);
+    ck("bpe tes0", ids2.get(0), 1);
+    cks2("bpe decode", bpe_decode(bp, ids), "ter");
+
+    // --- infer kernels ---
+    var mw: Vec<f64> = Vec::new();
+    mw.push(1.0); mw.push(2.0); mw.push(3.0); mw.push(4.0);  // [2,2]
+    var mx: Vec<f64> = Vec::new();
+    mx.push(1.0); mx.push(1.0);
+    var y: Vec<f64> = infer_matvec(mw, 2, 2, mx);
+    ckf("matvec0", y.get(0), 3.0, 0.001);
+    ckf("matvec1", y.get(1), 7.0, 0.001);
+    var xr: Vec<f64> = Vec::new();
+    xr.push(1.0); xr.push(1.0);
+    var rw: Vec<f64> = Vec::new();
+    rw.push(1.0); rw.push(1.0);
+    var rn: Vec<f64> = infer_rmsnorm(xr, rw, 0.00000001);
+    ckf("rmsnorm", rn.get(0), 1.0, 0.01);
+    var sm: Vec<f64> = infer_softmax(mx);
+    ckf("softmax", sm.get(0), 0.5, 0.001);
+    ck("argmax", infer_argmax(y), 1);
+    var tk: Vec<i64> = infer_top_k(y, 1);
+    ck("topk", tk.get(0), 1);
+    var q: Vec<f64> = Vec::new();
+    q.push(1.0); q.push(0.0);
+    var kv: Vec<f64> = Vec::new();
+    kv.push(1.0); kv.push(0.0); kv.push(0.0); kv.push(1.0);  // 2 keys
+    var vv: Vec<f64> = Vec::new();
+    vv.push(10.0); vv.push(0.0); vv.push(0.0); vv.push(10.0);
+    var att: Vec<f64> = infer_attn(q, kv, vv, 2, 2);
+    ckb("attn k1 > k2", att.get(0) > att.get(1));
+    ckf("attn sum", att.get(0) + att.get(1), 10.0, 0.01);
+    var rq: Vec<f64> = infer_rope(q, 2, 0, 10000.0);
+    ckf("rope pos0", rq.get(0), 1.0, 0.001);
+
+    // --- noise determinism + poisson spacing ---
+    ckf("noise same", noise2(1.5, 2.5, 42), noise2(1.5, 2.5, 42), 0.0001);
+    ckb("noise range", noise2(1.5, 2.5, 42) < 2.0 && noise2(1.5, 2.5, 42) > -2.0);
+    var pts: Vec<i64> = poisson2(60, 60, 10, 8, 7);
+    ckb("poisson nonempty", pts.len() >= 4);
+    var pi: i64 = 0;
+    var min2: i64 = 999999;
+    while pi + 3 < pts.len() {
+        var pj: i64 = pi + 2;
+        while pj + 1 < pts.len() {
+            var dx: i64 = pts.get(pi) - pts.get(pj);
+            var dy: i64 = pts.get(pi + 1) - pts.get(pj + 1);
+            var d2: i64 = dx * dx + dy * dy;
+            if d2 < min2 { min2 = d2; }
+            pj = pj + 2;
+        }
+        pi = pi + 2;
+    }
+    ckb("poisson spacing", min2 >= 100);
+
+    println("all ok");
+    return 0;
+}

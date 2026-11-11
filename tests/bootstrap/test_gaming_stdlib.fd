@@ -1,0 +1,146 @@
+// Gaming stdlib: gltf (GLB container + accessors -> Mesh) and tiled (TMJ).
+use gltf;
+use tiled;
+use tilemap;
+use vec;
+use string;
+
+fn ck(name: str, got: i64, want: i64) {
+    if got != want { p_panic(name + ": got " + int_to_str(got) + " want " + int_to_str(want)); }
+}
+fn ckf(name: str, got: f64, want: f64, tol: f64) {
+    var d: f64 = got - want;
+    if d < 0.0 { d = 0.0 - d; }
+    if d > tol { p_panic(name + ": got " + float_to_str(got)); }
+}
+fn ckb(name: str, got: bool) {
+    if !got { p_panic(name); }
+}
+fn cks(name: str, got: str, want: str) {
+    if !str_equal(got, want) { p_panic(name + ": got " + got); }
+}
+
+fn u32le(b: &mut Vec<i64>, v: i64) {
+    b.push(v & 255); b.push((v >> 8) & 255);
+    b.push((v >> 16) & 255); b.push((v >> 24) & 255);
+}
+fn f32le(b: &mut Vec<i64>, v: f64) {
+    // encode small integers/halves exactly: use f64->f32 bit pattern
+    // for the test we only use whole/halves — build via math trick:
+    // v * 2^k... simpler: pass through known constants table below.
+    var w: i64 = 0;
+    if v == 0.0 { w = 0x00000000; }
+    if v == 1.0 { w = 0x3F800000; }
+    if v == 2.0 { w = 0x40000000; }
+    if v == 3.0 { w = 0x40400000; }
+    if v == -1.0 { w = 0xBF800000; }
+    if v == 0.5 { w = 0x3F000000; }
+    u32le(b, w);
+}
+
+fn main() -> i64 {
+    // ---- glTF: GLB with one triangle mesh ----
+    // accessors: 0 = POSITION (3 verts, float VEC3),
+    //            1 = indices (3 x u16 SCALAR)
+    var js: str = "{\"asset\":{\"version\":\"2.0\"},"
+        + "\"meshes\":[{\"name\":\"tri\",\"primitives\":[{\"attributes\":{\"POSITION\":0},\"indices\":1,\"mode\":4}]}],"
+        + "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+        + "{\"bufferView\":1,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}],"
+        + "\"bufferViews\":[{\"buffer\":0,\"byteOffset\":0,\"byteLength\":36},"
+        + "{\"buffer\":0,\"byteOffset\":36,\"byteLength\":6}],"
+        + "\"buffers\":[{\"byteLength\":42}]}";
+    var jb: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(js) { jb.push(str_byte_at(js, i)); i = i + 1; }
+    // pad JSON to 4 with spaces
+    while jb.len() % 4 != 0 { jb.push(32); }
+    // BIN chunk: 3 vec3 floats + 3 u16 indices (+2 pad)
+    var bin: Vec<i64> = Vec::new();
+    f32le(&mut bin, 0.0); f32le(&mut bin, 0.0); f32le(&mut bin, 0.0);
+    f32le(&mut bin, 1.0); f32le(&mut bin, 0.0); f32le(&mut bin, 0.0);
+    f32le(&mut bin, 0.0); f32le(&mut bin, 1.0); f32le(&mut bin, 0.0);
+    bin.push(0); bin.push(0);   // idx 0
+    bin.push(1); bin.push(0);   // idx 1
+    bin.push(2); bin.push(0);   // idx 2
+    bin.push(0); bin.push(0);   // pad to 4
+    // GLB: header + JSON chunk + BIN chunk
+    var glb: Vec<i64> = Vec::new();
+    u32le(&mut glb, 0x46546C67);       // magic
+    u32le(&mut glb, 2);                // version
+    u32le(&mut glb, 12 + 8 + jb.len() + 8 + bin.len());
+    u32le(&mut glb, jb.len());
+    u32le(&mut glb, 0x4E4F534A);       // JSON
+    i = 0;
+    while i < jb.len() { glb.push(jb.get(i)); i = i + 1; }
+    u32le(&mut glb, bin.len());
+    u32le(&mut glb, 0x004E4942);       // BIN
+    i = 0;
+    while i < bin.len() { glb.push(bin.get(i)); i = i + 1; }
+    var doc: GltfDoc = gltf_open(glb);
+    ckb("glb ok", doc.ok);
+    ck("glb bin", doc.bin_len, bin.len());
+    ck("mesh count", gltf_mesh_count(doc), 1);
+    var m: Mesh = gltf_mesh(glb, doc, 0, 0);
+    ckb("mesh valid", m.valid);
+    cks("mesh name", m.name, "tri");
+    ck("verts", mesh_vertex_count(m), 3);
+    ck("tris", mesh_triangle_count(m), 1);
+    ckf("v1.x", m.vertices.get(1).x, 1.0, 0.001);
+    ckf("v2.y", m.vertices.get(2).y, 1.0, 0.001);
+    ck("face", m.faces.get(0).v2, 2);
+    // JSON-only doc + external bin
+    var d2: GltfDoc = gltf_open_json(js);
+    ckb("json ok", d2.ok);
+    var m2: Mesh = gltf_mesh(bin, d2, 0, 0);
+    ck("ext bin verts", mesh_vertex_count(m2), 3);
+
+    // ---- tiled TMJ ----
+    var tmj: str = "{\"width\":4,\"height\":3,\"tilewidth\":16,\"tileheight\":16,"
+        + "\"layers\":["
+        + "{\"type\":\"tilelayer\",\"name\":\"ground\",\"visible\":true,"
+        + " \"data\":[1,0,0,2, 0,3,0,0, 5,0,0,4]},"
+        + "{\"type\":\"tilelayer\",\"name\":\"solid\",\"visible\":true,"
+        + " \"data\":[0,0,0,0, 0,1,0,0, 0,0,0,0]},"
+        + "{\"type\":\"objectgroup\",\"name\":\"spawns\",\"objects\":["
+        + " {\"id\":1,\"name\":\"player\",\"type\":\"spawn\",\"x\":32.5,\"y\":16.0,"
+        + "  \"width\":0,\"height\":0,\"point\":true,"
+        + "  \"properties\":[{\"name\":\"hp\",\"type\":\"int\",\"value\":7}]},"
+        + " {\"id\":2,\"name\":\"crate\",\"type\":\"prop\",\"x\":8.0,\"y\":8.0,"
+        + "  \"width\":16.0,\"height\":16.0,\"gid\":9}]}],"
+        + "\"tilesets\":[{\"firstgid\":1,\"source\":\"tiles.tsx\"}],"
+        + "\"properties\":[{\"name\":\"theme\",\"type\":\"string\",\"value\":\"cave\"}]}";
+    var tm: TiledMap = tiled_open(tmj);
+    ckb("tmj ok", tm.ok);
+    ck("tmj w", tm.width, 4);
+    ck("tmj h", tm.height, 3);
+    ck("tmj tilew", tm.tile_w, 16);
+    ck("layers", tiled_layer_count(tm), 3);
+    cks("layer0", tiled_layer_name(tm, 0), "ground");
+    ck("tile(0,0)", tiled_tile(tm, 0, 0, 0), 1);
+    ck("tile(3,0)", tiled_tile(tm, 0, 3, 0), 2);
+    ck("tile(1,1)", tiled_tile(tm, 0, 1, 1), 3);
+    ck("tile(3,2)", tiled_tile(tm, 0, 3, 2), 4);
+    ck("tile(0,2)", tiled_tile(tm, 0, 0, 2), 5);
+    ck("oob", tiled_tile(tm, 0, 99, 0), 0);
+    var tmap: Tilemap = tiled_to_tilemap(tm, 0, 1);
+    ck("tm tile", tilemap_get(tmap, 1, 1), 3);
+    ckb("tm solid", tilemap_is_solid(tmap, 1, 1));
+    ckb("tm passable", tilemap_is_passable(tmap, 0, 0));
+    ck("objs", tiled_object_count(tm, 2), 2);
+    var o1: TiledObj = tiled_object(tm, 2, 0);
+    ck("obj id", o1.id, 1);
+    cks("obj name", o1.name, "player");
+    cks("obj kind", o1.kind, "spawn");
+    ckb("obj point", o1.point);
+    ckf("obj x", o1.x, 32.5, 0.01);
+    var o2: TiledObj = tiled_object(tm, 2, 1);
+    ck("obj2 gid", o2.gid, 9);
+    cks("obj prop", tiled_obj_prop(tm, 2, 0, "hp"), "7");
+    cks("map prop", tiled_map_prop(tm, "theme"), "cave");
+    // flip flags
+    ckb("hflip", tiled_hflip(0x80000005));
+    ck("gid strip", tiled_gid(0x80000005), 5);
+
+    println("all ok");
+    return 0;
+}

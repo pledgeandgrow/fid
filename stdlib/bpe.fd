@@ -1,0 +1,153 @@
+// Byte-pair encoding (BPE) tokenizer — GPT-2 style. Loads a vocab
+// (token->id JSON object) plus an ordered merges list ("a b" lines, the
+// order IS the rank), encodes text to token ids and decodes back.
+// Byte-level alphabets are the caller's base vocab; this module only
+// applies merge ranks — same contract as the reference tokenizers.
+module bpe;
+
+use vec;
+use string;
+use json;
+
+pub struct Bpe {
+    pub ok: bool,
+    pub vocab: str,          // the vocab JSON object, kept for lookups
+    pub id2tok: Vec<str>,    // id -> token string (dense)
+    pub merges: Vec<str>,    // "a\x01b" pair keys in rank order
+    pub max_len: i64,        // longest token byte length
+}
+
+fn pair_key(a: str, b: str) -> str { return a + "\u{0001}" + b; }
+
+/// Build a tokenizer. vocab_json: {"<tok>": id, ...}. merges_text: the
+/// merges file content, one "left right" pair per line (header lines
+/// starting with '#' are skipped).
+pub fn bpe_new(vocab_json: str, merges_text: str) -> Bpe {
+    var bp: Bpe = Bpe{ok: false, vocab: vocab_json, id2tok: Vec::new(),
+        merges: Vec::new(), max_len: 0};
+    if !str_equal(json_type(vocab_json), "object") { return bp; }
+    // dense id table
+    var keys: Vec<str> = json_keys(vocab_json);
+    var maxid: i64 = 0;
+    var i: i64 = 0;
+    while i < keys.len() {
+        var vid: i64 = json_get_int(vocab_json, keys.get(i), -1);
+        if vid > maxid { maxid = vid; }
+        i = i + 1;
+    }
+    var tbl: Vec<str> = Vec::new();
+    i = 0;
+    while i <= maxid { tbl.push(""); i = i + 1; }
+    i = 0;
+    while i < keys.len() {
+        var k: str = keys.get(i);
+        var vid: i64 = json_get_int(vocab_json, k, -1);
+        if vid >= 0 && vid < tbl.len() {
+            tbl.set(vid, k);
+            if str_len(k) > bp.max_len { bp.max_len = str_len(k); }
+        }
+        i = i + 1;
+    }
+    bp.id2tok = tbl;
+    // merges in order
+    var line: str = "";
+    i = 0;
+    while i <= str_len(merges_text) {
+        var c: i64 = 10;
+        if i < str_len(merges_text) { c = str_byte_at(merges_text, i); }
+        if c == 10 || i == str_len(merges_text) {
+            if str_len(line) > 0 && str_byte_at(line, 0) != 35 {
+                var sp: i64 = str_find(line, " ");
+                if sp > 0 {
+                    bp.merges.push(pair_key(
+                        str_slice(line, 0, sp), str_slice(line, sp + 1, str_len(line))));
+                }
+            }
+            line = "";
+        } else {
+            if c != 13 { line = line + str_slice(merges_text, i, i + 1); }
+        }
+        i = i + 1;
+    }
+    bp.ok = true;
+    return bp;
+}
+
+/// id -> token string, or "" for an id outside the vocab.
+pub fn bpe_token(bp: Bpe, id: i64) -> str {
+    if id < 0 || id >= bp.id2tok.len() { return ""; }
+    return bp.id2tok.get(id);
+}
+
+/// token string -> id, or -1 (linear scan over vocab keys would be
+/// quadratic; uses the JSON object's own lookup which is indexed).
+pub fn bpe_id(bp: Bpe, tok: str) -> i64 {
+    if !json_has(bp.vocab, tok) { return -1; }
+    return json_get_int(bp.vocab, tok, -1);
+}
+
+/// Merge rank for (a,b), or -1. Merges list is rank-ordered so the
+/// first match is also the lowest rank.
+fn merge_rank(bp: Bpe, a: str, b: str) -> i64 {
+    var key: str = pair_key(a, b);
+    var i: i64 = 0;
+    while i < bp.merges.len() {
+        if str_equal(bp.merges.get(i), key) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Encode: split text into chars as initial symbols, then repeatedly
+/// merge the lowest-rank pair — the standard BPE application order.
+pub fn bpe_encode(bp: Bpe, text: str) -> Vec<i64> {
+    var syms: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(text) {
+        syms.push(str_slice(text, i, i + 1));
+        i = i + 1;
+    }
+    var merged: bool = true;
+    while merged && syms.len() > 1 {
+        merged = false;
+        var best_rank: i64 = 2147483647;
+        var best_i: i64 = -1;
+        i = 0;
+        while i + 1 < syms.len() {
+            var r: i64 = merge_rank(bp, syms.get(i), syms.get(i + 1));
+            if r >= 0 && r < best_rank { best_rank = r; best_i = i; }
+            i = i + 1;
+        }
+        if best_i >= 0 {
+            var j: i64 = best_i;
+            syms.set(j, syms.get(j) + syms.get(j + 1));
+            j = best_i + 1;
+            while j + 1 < syms.len() {
+                syms.set(j, syms.get(j + 1));
+                j = j + 1;
+            }
+            syms.pop();
+            merged = true;
+        }
+    }
+    var out: Vec<i64> = Vec::new();
+    i = 0;
+    while i < syms.len() {
+        var id: i64 = bpe_id(bp, syms.get(i));
+        if id < 0 { id = 0; }                 // unk -> id 0
+        out.push(id);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Decode ids to the token-concatenated string.
+pub fn bpe_decode(bp: Bpe, ids: Vec<i64>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < ids.len() {
+        out = out + bpe_token(bp, ids.get(i));
+        i = i + 1;
+    }
+    return out;
+}

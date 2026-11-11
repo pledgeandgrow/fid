@@ -6408,6 +6408,20 @@ impl Interpreter {
                     ExecOutcome::Value(Value::Float(0.0))
                 }
             }
+            "exp" | "c_exp" | "pledge_exp" => {
+                if let Some(Value::Float(f)) = args.first() {
+                    ExecOutcome::Value(Value::Float(f.exp()))
+                } else {
+                    ExecOutcome::Value(Value::Float(0.0))
+                }
+            }
+            "log" | "c_log" | "pledge_log" => {
+                if let Some(Value::Float(f)) = args.first() {
+                    ExecOutcome::Value(Value::Float(f.ln()))
+                } else {
+                    ExecOutcome::Value(Value::Float(0.0))
+                }
+            }
             "strcmp" | "c_strcmp" => {
                 if let (Some(Value::Str(a)), Some(Value::Str(b))) = (args.get(0), args.get(1)) {
                     ExecOutcome::Value(Value::Int(a.cmp(b) as i64))

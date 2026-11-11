@@ -1,0 +1,321 @@
+// gltf.fd — glTF 2.0 asset loading (parse/layout half).
+//
+// Covers: .glb container framing (magic/version/chunks), the .gltf JSON
+// document (meshes/primitives/accessors/bufferViews), accessor decoding
+// for every componentType (byte/ubyte/short/ushort/uint/float) and type
+// (SCALAR..MAT4), and assembly into mesh.fd's Mesh. External .bin
+// buffers are the caller's bytes: pass the buffer blob alongside the
+// JSON (or the GLB's BIN chunk, which gltf_open exposes as bin_off/bin_len).
+//
+// Not covered (caller/renderer territory): skins/joints, animations,
+// PBR material parameters beyond baseColorFactor, sparse accessors,
+// KHR extensions, Draco/meshopt compression.
+
+use vec;
+use string;
+use json;
+use math;
+use mesh;
+
+pub const GLB_MAGIC: i64 = 0x46546C67;   // "glTF" little-endian
+pub const GLB_JSON: i64 = 0x4E4F534A;    // "JSON"
+pub const GLB_BIN: i64 = 0x004E4942;     // "BIN\0"
+
+fn rd_u16(b: Vec<i64>, o: i64) -> i64 {
+    return b.get(o) + b.get(o + 1) * 256;
+}
+fn rd_u32(b: Vec<i64>, o: i64) -> i64 {
+    return rd_u16(b, o) + rd_u16(b, o + 2) * 65536;
+}
+fn rd_i16(b: Vec<i64>, o: i64) -> i64 {
+    var v: i64 = rd_u16(b, o);
+    if v >= 32768 { v = v - 65536; }
+    return v;
+}
+fn rd_i8(b: Vec<i64>, o: i64) -> i64 {
+    var v: i64 = b.get(o);
+    if v >= 128 { v = v - 256; }
+    return v;
+}
+
+/// Parsed asset: `json` is the canonicalized JSON document; `bin_off`/
+/// `bin_len` locate the BIN chunk inside `b` for GLB sources (bin_len 0
+/// for JSON-only .gltf — caller supplies the .bin blob as `b` then).
+pub struct GltfDoc {
+    pub ok: bool,
+    pub json: str,
+    pub bin_off: i64,
+    pub bin_len: i64,
+}
+
+/// Parse a .glb blob: 12-byte header + length-prefixed chunks.
+/// ok=false when magic/version/length don't check out.
+pub fn gltf_open(b: Vec<i64>) -> GltfDoc {
+    var d: GltfDoc = GltfDoc{ok: false, json: "", bin_off: 0, bin_len: 0};
+    if b.len() < 20 { return d; }
+    if rd_u32(b, 0) != GLB_MAGIC { return d; }
+    if rd_u32(b, 4) != 2 { return d; }              // glTF 2.0 only
+    if rd_u32(b, 8) != b.len() { return d; }
+    var off: i64 = 12;
+    var js: str = "";
+    while off + 8 <= b.len() {
+        var clen: i64 = rd_u32(b, off);
+        var ctype: i64 = rd_u32(b, off + 4);
+        if off + 8 + clen > b.len() { return d; }
+        if ctype == GLB_JSON {
+            var jb: Vec<i64> = Vec::new();
+            var i: i64 = 0;
+            while i < clen {
+                jb.push(b.get(off + 8 + i));
+                i = i + 1;
+            }
+            js = json_parse_safe(str_from_bytes(jb));
+        } else {
+            if ctype == GLB_BIN {
+                d.bin_off = off + 8;
+                d.bin_len = clen;
+            }
+        }
+        off = off + 8 + clen + (4 - clen % 4) % 4;   // chunks 4-aligned
+    }
+    if str_len(js) == 0 { return d; }
+    d.ok = true;
+    d.json = js;
+    return d;
+}
+
+/// Wrap a standalone .gltf JSON string (buffers external — pass the .bin
+/// bytes as `b` to the accessor readers).
+pub fn gltf_open_json(j: str) -> GltfDoc {
+    var d: GltfDoc = GltfDoc{ok: true, json: json_parse_safe(j), bin_off: 0, bin_len: 0};
+    return d;
+}
+
+fn gltf_array(d: GltfDoc, key: str) -> str {
+    if !json_has(d.json, key) { return ""; }
+    return json_get_safe(d.json, key);
+}
+fn gltf_elem(d: GltfDoc, key: str, i: i64) -> str {
+    var a: str = gltf_array(d, key);
+    if str_len(a) == 0 { return ""; }
+    if i < 0 || i >= json_len_safe(a) { return ""; }
+    return json_at_safe(a, i);
+}
+
+pub fn gltf_mesh_count(d: GltfDoc) -> i64 {
+    var a: str = gltf_array(d, "meshes");
+    if str_len(a) == 0 { return 0; }
+    return json_len_safe(a);
+}
+pub fn gltf_node_count(d: GltfDoc) -> i64 {
+    var a: str = gltf_array(d, "nodes");
+    if str_len(a) == 0 { return 0; }
+    return json_len_safe(a);
+}
+
+// --- accessors --------------------------------------------------------------
+
+/// componentType -> byte size, or 0 when unknown.
+pub fn gltf_comp_size(ct: i64) -> i64 {
+    if ct == 5120 || ct == 5121 { return 1; }
+    if ct == 5122 || ct == 5123 { return 2; }
+    if ct == 5125 || ct == 5126 { return 4; }
+    return 0;
+}
+
+/// type string -> number of components per element.
+pub fn gltf_type_count(t: str) -> i64 {
+    if str_equal(t, "SCALAR") { return 1; }
+    if str_equal(t, "VEC2") { return 2; }
+    if str_equal(t, "VEC3") { return 3; }
+    if str_equal(t, "VEC4") { return 4; }
+    if str_equal(t, "MAT2") { return 4; }
+    if str_equal(t, "MAT3") { return 9; }
+    if str_equal(t, "MAT4") { return 16; }
+    return 0;
+}
+
+/// Resolved accessor — the JSON lookups happen once in gltf_acc; the
+/// per-element readers below then touch only the binary buffer (a real
+/// model's POSITION accessor would otherwise re-parse JSON per vertex).
+pub struct GltfAcc {
+    pub ok: bool,
+    pub off: i64,        // absolute byte offset into b
+    pub stride: i64,     // bytes between elements (packed or byteStride)
+    pub count: i64,
+    pub ctype: i64,      // componentType
+    pub csize: i64,      // bytes per component
+    pub ncomp: i64,      // components per element (VEC3 -> 3)
+    pub norm: bool,      // normalized flag
+}
+
+/// Resolve accessor `ai`: bufferView + byteOffset + byteStride. `base`
+/// is the buffer's offset inside `b` (d.bin_off for GLB, 0 for .bin).
+pub fn gltf_acc(d: GltfDoc, ai: i64, base: i64) -> GltfAcc {
+    var a: GltfAcc = GltfAcc{ok: false, off: 0, stride: 0, count: 0,
+        ctype: 0, csize: 0, ncomp: 0, norm: false};
+    var acc: str = gltf_elem(d, "accessors", ai);
+    if str_len(acc) == 0 { return a; }
+    if !json_has(acc, "bufferView") { return a; }
+    var bv: str = gltf_elem(d, "bufferViews", json_get_int(acc, "bufferView", -1));
+    if str_len(bv) == 0 { return a; }
+    a.ctype = json_get_int(acc, "componentType", 0);
+    a.csize = gltf_comp_size(a.ctype);
+    a.ncomp = gltf_type_count(json_get_str(acc, "type"));
+    if a.csize == 0 || a.ncomp == 0 { return a; }
+    a.count = json_get_int(acc, "count", 0);
+    a.norm = json_get_bool(acc, "normalized", false);
+    a.off = base + json_get_int(bv, "byteOffset", 0)
+        + json_get_int(acc, "byteOffset", 0);
+    a.stride = json_get_int(bv, "byteStride", 0);
+    if a.stride == 0 { a.stride = a.csize * a.ncomp; }
+    a.ok = true;
+    return a;
+}
+
+/// Unsigned component j of element i — BYTE/UNSIGNED_*/unsigned ints.
+pub fn gltf_acc_uint_at(b: Vec<i64>, a: GltfAcc, i: i64, j: i64) -> i64 {
+    var o: i64 = a.off + i * a.stride + j * a.csize;
+    if a.ctype == 5121 { return b.get(o); }
+    if a.ctype == 5123 { return rd_u16(b, o); }
+    if a.ctype == 5125 { return rd_u32(b, o); }
+    if a.ctype == 5120 { return rd_i8(b, o) + 256; }
+    if a.ctype == 5122 { return rd_i16(b, o) + 65536; }
+    return 0;
+}
+
+/// Signed variant (BYTE=5120, SHORT=5122).
+pub fn gltf_acc_int_at(b: Vec<i64>, a: GltfAcc, i: i64, j: i64) -> i64 {
+    var o: i64 = a.off + i * a.stride + j * a.csize;
+    if a.ctype == 5120 { return rd_i8(b, o); }
+    if a.ctype == 5122 { return rd_i16(b, o); }
+    return gltf_acc_uint_at(b, a, i, j);
+}
+
+/// Float component — FLOAT (5126) directly, integer types as raw value
+/// or /max when the accessor is normalized.
+pub fn gltf_acc_f32_at(b: Vec<i64>, a: GltfAcc, i: i64, j: i64) -> f64 {
+    var o: i64 = a.off + i * a.stride + j * a.csize;
+    if a.ctype == 5126 {
+        var bits: i64 = rd_u32(b, o);
+        var sgn: f64 = 1.0;
+        if (bits & 0x80000000) != 0 { sgn = -1.0; }
+        var ex: i64 = (bits >> 23) & 255;
+        var man: i64 = bits & 0x7FFFFF;
+        if ex == 255 { return sgn * math_pow(2.0, 1024.0); }
+        if ex == 0 { return sgn * (man as f64) * math_pow(2.0, -149.0); }
+        return sgn * (1.0 + (man as f64) / 8388608.0) * math_pow(2.0, (ex - 127) as f64);
+    }
+    if a.norm {
+        if a.ctype == 5121 { return (b.get(o) as f64) / 255.0; }
+        if a.ctype == 5123 { return (rd_u16(b, o) as f64) / 65535.0; }
+        if a.ctype == 5120 { return (rd_i8(b, o) as f64) / 127.0; }
+        if a.ctype == 5122 { return (rd_i16(b, o) as f64) / 32767.0; }
+    }
+    return gltf_acc_int_at(b, a, i, j) as f64;
+}
+
+// --- mesh assembly ------------------------------------------------------------
+
+/// Build mesh.fd's Mesh from mesh `mi`, primitive `pi` (default 0).
+/// Reads POSITION/NORMAL/TEXCOORD_0 attributes and the index accessor.
+/// Unindexed primitives assume consecutive triangles. valid=false when
+/// the mesh/primitive or its POSITION accessor is missing.
+pub fn gltf_mesh(b: Vec<i64>, d: GltfDoc, mi: i64, pi: i64) -> Mesh {
+    var m: Mesh = mesh_create();
+    var me: str = gltf_elem(d, "meshes", mi);
+    if str_len(me) == 0 { m.valid = false; return m; }
+    m.name = json_get_str(me, "name");
+    var prims: str = json_get_safe(me, "primitives");
+    if str_len(prims) == 0 || pi >= json_len_safe(prims) { m.valid = false; return m; }
+    var pr: str = json_at_safe(prims, pi);
+    var attrs: str = json_get_safe(pr, "attributes");
+    if str_len(attrs) == 0 { m.valid = false; return m; }
+    var base: i64 = d.bin_off;
+    var pa: GltfAcc = gltf_acc(d, json_get_int(attrs, "POSITION", -1), base);
+    if !pa.ok || pa.ncomp < 3 { m.valid = false; return m; }
+    var i: i64 = 0;
+    while i < pa.count {
+        m.vertices.push(vertex_create(
+            gltf_acc_f32_at(b, pa, i, 0),
+            gltf_acc_f32_at(b, pa, i, 1),
+            gltf_acc_f32_at(b, pa, i, 2)));
+        i = i + 1;
+    }
+    var na: GltfAcc = gltf_acc(d, json_get_int(attrs, "NORMAL", -1), base);
+    if na.ok && na.ncomp >= 3 {
+        i = 0;
+        while i < na.count {
+            m.normals.push(vertex_create(
+                gltf_acc_f32_at(b, na, i, 0),
+                gltf_acc_f32_at(b, na, i, 1),
+                gltf_acc_f32_at(b, na, i, 2)));
+            i = i + 1;
+        }
+    }
+    var ta: GltfAcc = gltf_acc(d, json_get_int(attrs, "TEXCOORD_0", -1), base);
+    if ta.ok && ta.ncomp >= 2 {
+        i = 0;
+        while i < ta.count {
+            m.texcoords.push(texcoord_create(
+                gltf_acc_f32_at(b, ta, i, 0),
+                gltf_acc_f32_at(b, ta, i, 1)));
+            i = i + 1;
+        }
+    }
+    var iai: i64 = json_get_int(pr, "indices", -1);
+    var mode: i64 = json_get_int(pr, "mode", 4);
+    if mode != 4 { m.valid = false; return m; }   // triangles only
+    var nv: i64 = pa.count;
+    if iai >= 0 {
+        var ia: GltfAcc = gltf_acc(d, iai, base);
+        if !ia.ok { m.valid = false; return m; }
+        i = 0;
+        while i + 2 < ia.count {
+            var f: Face = face_create(
+                gltf_acc_uint_at(b, ia, i, 0),
+                gltf_acc_uint_at(b, ia, i + 1, 0),
+                gltf_acc_uint_at(b, ia, i + 2, 0));
+            if ta.ok {
+                f.t0 = f.v0; f.t1 = f.v1; f.t2 = f.v2;
+            }
+            if na.ok {
+                f.n0 = f.v0; f.n1 = f.v1; f.n2 = f.v2;
+            }
+            m.faces.push(f);
+            i = i + 3;
+        }
+    } else {
+        i = 0;
+        while i + 2 < nv {
+            var f2: Face = face_create(i, i + 1, i + 2);
+            if ta.ok { f2.t0 = i; f2.t1 = i + 1; f2.t2 = i + 2; }
+            if na.ok { f2.n0 = i; f2.n1 = i + 1; f2.n2 = i + 2; }
+            m.faces.push(f2);
+            i = i + 3;
+        }
+    }
+    return m;
+}
+
+/// baseColorFactor of material `mi` as [r,g,b,a] (defaults 1,1,1,1).
+pub fn gltf_material_color(d: GltfDoc, mi: i64) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    var c: str = "";
+    var ma: str = gltf_elem(d, "materials", mi);
+    if str_len(ma) != 0 {
+        var pbr: str = json_get_safe(ma, "pbrMetallicRoughness");
+        if str_len(pbr) != 0 { c = json_get_safe(pbr, "baseColorFactor"); }
+    }
+    var i: i64 = 0;
+    while i < 4 {
+        var f: f64 = 1.0;
+        if str_len(c) != 0 && i < json_len_safe(c) {
+            var v: str = json_at_safe(c, i);
+            f = json_get_num("{\"v\":" + v + "}", "v", 1.0);
+        }
+        out.push(f);
+        i = i + 1;
+    }
+    return out;
+}

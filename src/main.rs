@@ -2219,6 +2219,9 @@ fn real_main() {
                 "test_pe_dll_import",
                 "test_pe_task_order",
                 "test_spawn_gt",
+                // glTF+Tiled: correct but each json_* call re-validates
+                // the document — O(n^2) per lookup on the interpreter.
+                "test_gaming_stdlib",
             ];
 
             // Tests that link a system library Fides does not ship. They run

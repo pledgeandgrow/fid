@@ -1,0 +1,217 @@
+// tiled.fd — Tiled map loading (https://www.mapeditor.org).
+//
+// Covers: TMJ (JSON) maps — orthogonal/isometric tile layers stored as
+// flat gid arrays, object layers (point/rect/tile objects with
+// properties), tileset references and firstgid arithmetic, and feeding
+// tilemap.fd's Tilemap. CSV encoding is supported (the default); base64
+// layers return empty tiles (no zlib in stdlib). TMX/XML files are out
+// of scope — export TMJ from Tiled instead.
+//
+// Flip flags: gids carry the top 3 bits as flip flags
+// (0x80000000 H, 0x40000000 V, 0x20000000 D) — tiled_gid strips them,
+// tiled_hflip/vflip/dflip read them.
+
+use vec;
+use string;
+use json;
+use tilemap;
+
+pub const TILED_FLIP_H: i64 = 0x80000000;
+pub const TILED_FLIP_V: i64 = 0x40000000;
+pub const TILED_FLIP_D: i64 = 0x20000000;
+const FLIP_MASK: i64 = 0x1FFFFFFF;
+
+/// A parsed TMJ document (canonicalized JSON kept for property access).
+pub struct TiledMap {
+    pub ok: bool,
+    pub json: str,
+    pub width: i64,        // tiles
+    pub height: i64,
+    pub tile_w: i64,       // pixels
+    pub tile_h: i64,
+}
+
+/// A Tiled object from an objectgroup layer.
+pub struct TiledObj {
+    pub id: i64,
+    pub name: str,
+    pub kind: str,          // the "type" field
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    pub gid: i64,           // -1 for non-tile objects
+    pub point: bool,
+}
+
+/// Parse a TMJ string. ok=false when the required top-level fields are
+/// absent or the map isn't finite.
+pub fn tiled_open(j: str) -> TiledMap {
+    var m: TiledMap = TiledMap{ok: false, json: "", width: 0, height: 0,
+        tile_w: 0, tile_h: 0};
+    var c: str = json_parse_safe(j);
+    if !json_has(c, "width") || !json_has(c, "height") { return m; }
+    if !json_has(c, "layers") { return m; }
+    m.json = c;
+    m.width = json_get_int(c, "width", 0);
+    m.height = json_get_int(c, "height", 0);
+    m.tile_w = json_get_int(c, "tilewidth", 0);
+    m.tile_h = json_get_int(c, "tileheight", 0);
+    m.ok = m.width > 0 && m.height > 0;
+    return m;
+}
+
+/// Strip the flip flags from a raw gid.
+pub fn tiled_gid(raw: i64) -> i64 {
+    return raw & FLIP_MASK;
+}
+pub fn tiled_hflip(raw: i64) -> bool { return (raw & TILED_FLIP_H) != 0; }
+pub fn tiled_vflip(raw: i64) -> bool { return (raw & TILED_FLIP_V) != 0; }
+pub fn tiled_dflip(raw: i64) -> bool { return (raw & TILED_FLIP_D) != 0; }
+
+fn tiled_layer(m: TiledMap, li: i64) -> str {
+    var l: str = json_get_safe(m.json, "layers");
+    if str_len(l) == 0 || li < 0 || li >= json_len_safe(l) { return ""; }
+    return json_at_safe(l, li);
+}
+
+pub fn tiled_layer_count(m: TiledMap) -> i64 {
+    var l: str = json_get_safe(m.json, "layers");
+    if str_len(l) == 0 { return 0; }
+    return json_len_safe(l);
+}
+
+/// Layer name/type/visibility/opacity for UI decisions.
+pub fn tiled_layer_name(m: TiledMap, li: i64) -> str {
+    return json_get_str(tiled_layer(m, li), "name");
+}
+pub fn tiled_layer_type(m: TiledMap, li: i64) -> str {
+    return json_get_str(tiled_layer(m, li), "type");
+}
+pub fn tiled_layer_visible(m: TiledMap, li: i64) -> bool {
+    return json_get_bool(tiled_layer(m, li), "visible", true);
+}
+
+/// Raw gid at (x,y) of tile layer `li` — flip bits included, 0 outside
+/// bounds or for non-tile layers. Tiled stores data row-major.
+pub fn tiled_tile_raw(m: TiledMap, li: i64, x: i64, y: i64) -> i64 {
+    var l: str = tiled_layer(m, li);
+    if str_len(l) == 0 { return 0; }
+    if !str_equal(json_get_str(l, "type"), "tilelayer") { return 0; }
+    if x < 0 || y < 0 || x >= m.width || y >= m.height { return 0; }
+    var data: str = json_get_safe(l, "data");
+    if str_len(data) == 0 { return 0; }
+    return json_at_int(data, y * m.width + x, 0);
+}
+
+/// gid with flip flags stripped.
+pub fn tiled_tile(m: TiledMap, li: i64, x: i64, y: i64) -> i64 {
+    return tiled_gid(tiled_tile_raw(m, li, x, y));
+}
+
+/// Feed a tile layer into tilemap.fd — tiles > 0 become set cells.
+/// `solid_layer`: when >= 0, cells occupied in that layer mark the tile
+/// solid in the returned Tilemap. Both data arrays are fetched once;
+/// per-cell work is a single array index.
+pub fn tiled_to_tilemap(m: TiledMap, li: i64, solid_layer: i64) -> Tilemap {
+    var tm: Tilemap = tilemap_create(m.width, m.height, m.tile_w);
+    var data: str = "";
+    var l: str = tiled_layer(m, li);
+    if str_len(l) != 0 { data = json_get_safe(l, "data"); }
+    var sdata: str = "";
+    if solid_layer >= 0 {
+        var sl: str = tiled_layer(m, solid_layer);
+        if str_len(sl) != 0 { sdata = json_get_safe(sl, "data"); }
+    }
+    var n: i64 = m.width * m.height;
+    var i: i64 = 0;
+    while i < n {
+        var g: i64 = tiled_gid(json_at_int(data, i, 0));
+        if g > 0 {
+            var x: i64 = i - (i / m.width) * m.width;
+            var y: i64 = i / m.width;
+            var solid: bool = false;
+            if str_len(sdata) != 0 {
+                solid = tiled_gid(json_at_int(sdata, i, 0)) > 0;
+            }
+            tilemap_set_with_solid(&mut tm, x, y, g, solid);
+        }
+        i = i + 1;
+    }
+    return tm;
+}
+
+// --- object layers ------------------------------------------------------------
+
+pub fn tiled_object_count(m: TiledMap, li: i64) -> i64 {
+    var l: str = tiled_layer(m, li);
+    if str_len(l) == 0 { return 0; }
+    if !str_equal(json_get_str(l, "type"), "objectgroup") { return 0; }
+    var objs: str = json_get_safe(l, "objects");
+    if str_len(objs) == 0 { return 0; }
+    return json_len_safe(objs);
+}
+
+/// Object `oi` of objectgroup layer `li`; id=0 when out of range.
+pub fn tiled_object(m: TiledMap, li: i64, oi: i64) -> TiledObj {
+    var o: TiledObj = TiledObj{id: 0, name: "", kind: "", x: 0.0, y: 0.0,
+        w: 0.0, h: 0.0, gid: -1, point: false};
+    var l: str = tiled_layer(m, li);
+    if str_len(l) == 0 { return o; }
+    var objs: str = json_get_safe(l, "objects");
+    if str_len(objs) == 0 || oi < 0 || oi >= json_len_safe(objs) { return o; }
+    var e: str = json_at_safe(objs, oi);
+    o.id = json_get_int(e, "id", 0);
+    o.name = json_get_str(e, "name");
+    o.kind = json_get_str(e, "type");
+    o.x = json_get_num(e, "x", 0.0);
+    o.y = json_get_num(e, "y", 0.0);
+    o.w = json_get_num(e, "width", 0.0);
+    o.h = json_get_num(e, "height", 0.0);
+    o.gid = tiled_gid(json_get_int(e, "gid", -1));
+    if !json_has(e, "gid") { o.gid = -1; }
+    o.point = json_get_bool(e, "point", false);
+    return o;
+}
+
+/// First custom property `name` on an object as str ("" when absent).
+/// Properties are an array of {name, type, value} objects.
+pub fn tiled_obj_prop(m: TiledMap, li: i64, oi: i64, name: str) -> str {
+    var l: str = tiled_layer(m, li);
+    if str_len(l) == 0 { return ""; }
+    var objs: str = json_get_safe(l, "objects");
+    if str_len(objs) == 0 || oi >= json_len_safe(objs) { return ""; }
+    var props: str = json_get_safe(json_at_safe(objs, oi), "properties");
+    if str_len(props) == 0 { return ""; }
+    var i: i64 = 0;
+    while i < json_len_safe(props) {
+        var p: str = json_at_safe(props, i);
+        if str_equal(json_get_str(p, "name"), name) {
+            var v: str = json_get_safe(p, "value");
+            if str_len(v) == 0 { return ""; }
+            // value may be a raw string/number/bool — normalize to text
+            if str_equal(json_type_safe(v), "string") { return json_unescape(v); }
+            return v;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// Map-level custom property (same {name,type,value} array).
+pub fn tiled_map_prop(m: TiledMap, name: str) -> str {
+    var props: str = json_get_safe(m.json, "properties");
+    if str_len(props) == 0 { return ""; }
+    var i: i64 = 0;
+    while i < json_len_safe(props) {
+        var p: str = json_at_safe(props, i);
+        if str_equal(json_get_str(p, "name"), name) {
+            var v: str = json_get_safe(p, "value");
+            if str_len(v) == 0 { return ""; }
+            if str_equal(json_type_safe(v), "string") { return json_unescape(v); }
+            return v;
+        }
+        i = i + 1;
+    }
+    return "";
+}
