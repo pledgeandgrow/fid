@@ -1,0 +1,1693 @@
+// CS2: binary serialization for the front-end AST (Program). The checked
+// stdlib/runtime artifact persists a parsed Program so later compiles skip
+// lexing and parsing entirely. Format: "FIDA" + version + payload hash +
+// the program; integers are 8 little-endian bytes, strings/vecs are a
+// length prefix then items. Everything is tagged so a stale or partial
+// artifact fails the read and the caller falls back to source.
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+
+pub struct AwBuf {
+    pub bytes: Vec<i64>,
+}
+
+pub struct ArBuf {
+    pub v: Vec<i64>,
+    pub pos: i64,
+    pub ok: bool,
+}
+
+pub fn aw_u8(b: &mut AwBuf, v: i64) {
+    b.bytes.push(v & 255);
+}
+
+@wrapping
+pub fn aw_i64(b: &mut AwBuf, v: i64) {
+    var x: i64 = v;
+    var i: i64 = 0;
+    while i < 8 {
+        b.bytes.push(x & 255);
+        x = x >> 8;
+        i = i + 1;
+    }
+}
+
+pub fn aw_bool(b: &mut AwBuf, v: bool) {
+    if v { aw_u8(b, 1); } else { aw_u8(b, 0); }
+}
+
+pub fn aw_str(b: &mut AwBuf, s: str) {
+    aw_i64(b, str_len(s));
+    var i: i64 = 0;
+    while i < str_len(s) {
+        aw_u8(b, str_byte_at(s, i));
+        i = i + 1;
+    }
+}
+
+pub fn aw_f64(b: &mut AwBuf, v: f64) {
+    aw_i64(b, p_f64_to_bits(v));
+}
+
+pub fn ar_u8(r: &mut ArBuf) -> i64 {
+    if r.pos < 0 || r.pos >= r.v.len() {
+        r.ok = false;
+        return 0;
+    }
+    var v: i64 = r.v.get(r.pos);
+    r.pos = r.pos + 1;
+    return v;
+}
+
+@wrapping
+pub fn ar_i64(r: &mut ArBuf) -> i64 {
+    var bytes: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 8 { bytes.push(ar_u8(r)); i = i + 1; }
+    if !r.ok { return 0; }
+    var v: i64 = bytes.get(7);
+    if v >= 128 { v = v - 256; }
+    var j: i64 = 6;
+    while j >= 0 {
+        v = v * 256 + bytes.get(j);
+        j = j - 1;
+    }
+    return v;
+}
+
+pub fn ar_bool(r: &mut ArBuf) -> bool {
+    return ar_u8(r) == 1;
+}
+
+pub fn ar_str(r: &mut ArBuf) -> str {
+    var n: i64 = ar_i64(r);
+    if !r.ok || n < 0 || n > r.v.len() { r.ok = false; return ""; }
+    var s: i64 = p_str_buf(n);
+    var i: i64 = 0;
+    while i < n {
+        var p: *mut u8 = (s + i) as *mut u8;
+        unsafe { *p = ar_u8(r) as u8; }
+        i = i + 1;
+    }
+    if !r.ok { return ""; }
+    return s as str;
+}
+
+pub fn ar_f64(r: &mut ArBuf) -> f64 {
+    return p_f64_from_bits(ar_i64(r));
+}
+
+// --- options ---------------------------------------------------------------
+
+pub fn aw_optstr(b: &mut AwBuf, v: OptStr) {
+    match v {
+        OptStr::Some(s) => { aw_u8(b, 1); aw_str(b, s); }
+        OptStr::None => { aw_u8(b, 0); }
+    }
+}
+
+pub fn ar_optstr(r: &mut ArBuf) -> OptStr {
+    if ar_u8(r) == 1 { return OptStr::Some(ar_str(r)); }
+    return OptStr::None;
+}
+
+pub fn aw_opti64(b: &mut AwBuf, v: OptI64) {
+    match v {
+        OptI64::Some(x) => { aw_u8(b, 1); aw_i64(b, x); }
+        OptI64::None => { aw_u8(b, 0); }
+    }
+}
+
+pub fn ar_opti64(r: &mut ArBuf) -> OptI64 {
+    if ar_u8(r) == 1 { return OptI64::Some(ar_i64(r)); }
+    return OptI64::None;
+}
+
+// --- leaf enums ------------------------------------------------------------
+
+pub fn aw_binop(b: &mut AwBuf, op: BinOp) {
+    var t: i64 = 0;
+    match op {
+        BinOp::Add => { t = 0; }
+        BinOp::Sub => { t = 1; }
+        BinOp::Mul => { t = 2; }
+        BinOp::Div => { t = 3; }
+        BinOp::Mod => { t = 4; }
+        BinOp::Eq => { t = 5; }
+        BinOp::Neq => { t = 6; }
+        BinOp::Lt => { t = 7; }
+        BinOp::Gt => { t = 8; }
+        BinOp::LtEq => { t = 9; }
+        BinOp::GtEq => { t = 10; }
+        BinOp::And => { t = 11; }
+        BinOp::Or => { t = 12; }
+        BinOp::BitAnd => { t = 13; }
+        BinOp::BitOr => { t = 14; }
+        BinOp::BitXor => { t = 15; }
+        BinOp::Shl => { t = 16; }
+        BinOp::Shr => { t = 17; }
+    }
+    aw_u8(b, t);
+}
+
+pub fn ar_binop(r: &mut ArBuf) -> BinOp {
+    var t: i64 = ar_u8(r);
+    if t == 1 { return BinOp::Sub; }
+    if t == 2 { return BinOp::Mul; }
+    if t == 3 { return BinOp::Div; }
+    if t == 4 { return BinOp::Mod; }
+    if t == 5 { return BinOp::Eq; }
+    if t == 6 { return BinOp::Neq; }
+    if t == 7 { return BinOp::Lt; }
+    if t == 8 { return BinOp::Gt; }
+    if t == 9 { return BinOp::LtEq; }
+    if t == 10 { return BinOp::GtEq; }
+    if t == 11 { return BinOp::And; }
+    if t == 12 { return BinOp::Or; }
+    if t == 13 { return BinOp::BitAnd; }
+    if t == 14 { return BinOp::BitOr; }
+    if t == 15 { return BinOp::BitXor; }
+    if t == 16 { return BinOp::Shl; }
+    if t == 17 { return BinOp::Shr; }
+    return BinOp::Add;
+}
+
+pub fn aw_unop(b: &mut AwBuf, op: UnaryOp) {
+    match op {
+        UnaryOp::Neg => { aw_u8(b, 0); }
+        UnaryOp::Not => { aw_u8(b, 1); }
+        UnaryOp::BitNot => { aw_u8(b, 2); }
+    }
+}
+
+pub fn ar_unop(r: &mut ArBuf) -> UnaryOp {
+    var t: i64 = ar_u8(r);
+    if t == 1 { return UnaryOp::Not; }
+    if t == 2 { return UnaryOp::BitNot; }
+    return UnaryOp::Neg;
+}
+
+pub fn aw_assignop(b: &mut AwBuf, op: AssignOp) {
+    var t: i64 = 0;
+    match op {
+        AssignOp::Assign => { t = 0; }
+        AssignOp::AddAssign => { t = 1; }
+        AssignOp::SubAssign => { t = 2; }
+        AssignOp::MulAssign => { t = 3; }
+        AssignOp::DivAssign => { t = 4; }
+        AssignOp::ModAssign => { t = 5; }
+        AssignOp::BitAndAssign => { t = 6; }
+        AssignOp::BitOrAssign => { t = 7; }
+        AssignOp::BitXorAssign => { t = 8; }
+        AssignOp::ShlAssign => { t = 9; }
+        AssignOp::ShrAssign => { t = 10; }
+    }
+    aw_u8(b, t);
+}
+
+pub fn ar_assignop(r: &mut ArBuf) -> AssignOp {
+    var t: i64 = ar_u8(r);
+    if t == 1 { return AssignOp::AddAssign; }
+    if t == 2 { return AssignOp::SubAssign; }
+    if t == 3 { return AssignOp::MulAssign; }
+    if t == 4 { return AssignOp::DivAssign; }
+    if t == 5 { return AssignOp::ModAssign; }
+    if t == 6 { return AssignOp::BitAndAssign; }
+    if t == 7 { return AssignOp::BitOrAssign; }
+    if t == 8 { return AssignOp::BitXorAssign; }
+    if t == 9 { return AssignOp::ShlAssign; }
+    if t == 10 { return AssignOp::ShrAssign; }
+    return AssignOp::Assign;
+}
+
+pub fn aw_reflectop(b: &mut AwBuf, op: ReflectOp) {
+    var t: i64 = 0;
+    match op {
+        ReflectOp::TypeName => { t = 0; }
+        ReflectOp::IsStruct => { t = 1; }
+        ReflectOp::IsEnum => { t = 2; }
+        ReflectOp::FieldCount => { t = 3; }
+        ReflectOp::FieldNames => { t = 4; }
+        ReflectOp::FieldTypes => { t = 5; }
+        ReflectOp::EnumVariants => { t = 6; }
+        ReflectOp::StructSize => { t = 7; }
+        ReflectOp::FieldOffset => { t = 8; }
+        ReflectOp::EnumDiscriminant => { t = 9; }
+        ReflectOp::FunctionEffects => { t = 10; }
+        ReflectOp::FunctionCapabilities => { t = 11; }
+    }
+    aw_u8(b, t);
+}
+
+pub fn ar_reflectop(r: &mut ArBuf) -> ReflectOp {
+    var t: i64 = ar_u8(r);
+    if t == 1 { return ReflectOp::IsStruct; }
+    if t == 2 { return ReflectOp::IsEnum; }
+    if t == 3 { return ReflectOp::FieldCount; }
+    if t == 4 { return ReflectOp::FieldNames; }
+    if t == 5 { return ReflectOp::FieldTypes; }
+    if t == 6 { return ReflectOp::EnumVariants; }
+    if t == 7 { return ReflectOp::StructSize; }
+    if t == 8 { return ReflectOp::FieldOffset; }
+    if t == 9 { return ReflectOp::EnumDiscriminant; }
+    if t == 10 { return ReflectOp::FunctionEffects; }
+    if t == 11 { return ReflectOp::FunctionCapabilities; }
+    return ReflectOp::TypeName;
+}
+
+pub fn aw_asmdir(b: &mut AwBuf, d: AsmDir) {
+    match d {
+        AsmDir::In => { aw_u8(b, 0); }
+        AsmDir::Out => { aw_u8(b, 1); }
+        AsmDir::Clobber => { aw_u8(b, 2); }
+    }
+}
+
+pub fn ar_asmdir(r: &mut ArBuf) -> AsmDir {
+    var t: i64 = ar_u8(r);
+    if t == 1 { return AsmDir::Out; }
+    if t == 2 { return AsmDir::Clobber; }
+    return AsmDir::In;
+}
+
+pub fn aw_shapedim(b: &mut AwBuf, d: ShapeDim) {
+    match d {
+        ShapeDim::Known(v) => { aw_u8(b, 0); aw_i64(b, v); }
+        ShapeDim::Symbolic(s) => { aw_u8(b, 1); aw_str(b, s); }
+    }
+}
+
+pub fn ar_shapedim(r: &mut ArBuf) -> ShapeDim {
+    if ar_u8(r) == 1 { return ShapeDim::Symbolic(ar_str(r)); }
+    return ShapeDim::Known(ar_i64(r));
+}
+
+// --- Type -------------------------------------------------------------------
+
+pub fn aw_type(b: &mut AwBuf, t: Type) {
+    match t {
+        Type::I8 => { aw_u8(b, 0); }
+        Type::I16 => { aw_u8(b, 1); }
+        Type::I32 => { aw_u8(b, 2); }
+        Type::I64 => { aw_u8(b, 3); }
+        Type::I128 => { aw_u8(b, 4); }
+        Type::U8 => { aw_u8(b, 5); }
+        Type::U16 => { aw_u8(b, 6); }
+        Type::U32 => { aw_u8(b, 7); }
+        Type::U64 => { aw_u8(b, 8); }
+        Type::U128 => { aw_u8(b, 9); }
+        Type::F32 => { aw_u8(b, 10); }
+        Type::F64 => { aw_u8(b, 11); }
+        Type::Bool => { aw_u8(b, 12); }
+        Type::Str => { aw_u8(b, 13); }
+        Type::Void => { aw_u8(b, 14); }
+        Type::Never => { aw_u8(b, 15); }
+        Type::Infer => { aw_u8(b, 16); }
+        Type::Named(n) => { aw_u8(b, 17); aw_str(b, n); }
+        Type::Array(inner, n) => {
+            aw_u8(b, 18);
+            aw_type(b, inner);
+            aw_i64(b, n);
+        }
+        Type::ArrayConst(inner, n) => {
+            aw_u8(b, 19);
+            aw_type(b, inner);
+            aw_str(b, n);
+        }
+        Type::Ref(inner, m) => {
+            aw_u8(b, 20);
+            aw_type(b, inner);
+            aw_bool(b, m);
+        }
+        Type::RawPtr(inner, m) => {
+            aw_u8(b, 21);
+            aw_type(b, inner);
+            aw_bool(b, m);
+        }
+        Type::Generic(n, args) => {
+            aw_u8(b, 22);
+            aw_str(b, n);
+            aw_i64(b, args.len());
+            var i: i64 = 0;
+            while i < args.len() { aw_type(b, args.get(i)); i = i + 1; }
+        }
+        Type::Tuple(items) => {
+            aw_u8(b, 23);
+            aw_i64(b, items.len());
+            var i: i64 = 0;
+            while i < items.len() { aw_type(b, items.get(i)); i = i + 1; }
+        }
+        Type::Func(params, ret) => {
+            aw_u8(b, 24);
+            aw_i64(b, params.len());
+            var i: i64 = 0;
+            while i < params.len() { aw_type(b, params.get(i)); i = i + 1; }
+            aw_type(b, ret);
+        }
+        Type::Assoc(a, c, d, args) => {
+            aw_u8(b, 25);
+            aw_str(b, a);
+            aw_str(b, c);
+            aw_str(b, d);
+            aw_i64(b, args.len());
+            var i: i64 = 0;
+            while i < args.len() { aw_type(b, args.get(i)); i = i + 1; }
+        }
+        Type::Dyn(n) => { aw_u8(b, 26); aw_str(b, n); }
+        Type::ShapedTensor(inner, dims) => {
+            aw_u8(b, 27);
+            aw_type(b, inner);
+            aw_i64(b, dims.len());
+            var i: i64 = 0;
+            while i < dims.len() { aw_shapedim(b, dims.get(i)); i = i + 1; }
+        }
+    }
+}
+
+pub fn ar_type(r: &mut ArBuf) -> Type {
+    var t: i64 = ar_u8(r);
+    if t == 0 { return Type::I8; }
+    if t == 1 { return Type::I16; }
+    if t == 2 { return Type::I32; }
+    if t == 3 { return Type::I64; }
+    if t == 4 { return Type::I128; }
+    if t == 5 { return Type::U8; }
+    if t == 6 { return Type::U16; }
+    if t == 7 { return Type::U32; }
+    if t == 8 { return Type::U64; }
+    if t == 9 { return Type::U128; }
+    if t == 10 { return Type::F32; }
+    if t == 11 { return Type::F64; }
+    if t == 12 { return Type::Bool; }
+    if t == 13 { return Type::Str; }
+    if t == 14 { return Type::Void; }
+    if t == 15 { return Type::Never; }
+    if t == 16 { return Type::Infer; }
+    if t == 17 { return Type::Named(ar_str(r)); }
+    if t == 18 { return Type::Array(Box::new(ar_type(r)), ar_i64(r)); }
+    if t == 19 { return Type::ArrayConst(Box::new(ar_type(r)), ar_str(r)); }
+    if t == 20 { return Type::Ref(Box::new(ar_type(r)), ar_bool(r)); }
+    if t == 21 { return Type::RawPtr(Box::new(ar_type(r)), ar_bool(r)); }
+    if t == 22 {
+        var n: str = ar_str(r);
+        var cnt: i64 = ar_i64(r);
+        var args: Vec<Type> = Vec::new();
+        var i: i64 = 0;
+        while i < cnt { args.push(ar_type(r)); i = i + 1; }
+        return Type::Generic(n, args);
+    }
+    if t == 23 {
+        var cnt: i64 = ar_i64(r);
+        var items: Vec<Type> = Vec::new();
+        var i: i64 = 0;
+        while i < cnt { items.push(ar_type(r)); i = i + 1; }
+        return Type::Tuple(items);
+    }
+    if t == 24 {
+        var cnt: i64 = ar_i64(r);
+        var params: Vec<Type> = Vec::new();
+        var i: i64 = 0;
+        while i < cnt { params.push(ar_type(r)); i = i + 1; }
+        return Type::Func(params, Box::new(ar_type(r)));
+    }
+    if t == 25 {
+        var a: str = ar_str(r);
+        var c: str = ar_str(r);
+        var d: str = ar_str(r);
+        var cnt: i64 = ar_i64(r);
+        var args: Vec<Type> = Vec::new();
+        var i: i64 = 0;
+        while i < cnt { args.push(ar_type(r)); i = i + 1; }
+        return Type::Assoc(a, c, d, args);
+    }
+    if t == 26 { return Type::Dyn(ar_str(r)); }
+    if t == 27 {
+        var inner: Type = ar_type(r);
+        var cnt: i64 = ar_i64(r);
+        var dims: Vec<ShapeDim> = Vec::new();
+        var i: i64 = 0;
+        while i < cnt { dims.push(ar_shapedim(r)); i = i + 1; }
+        return Type::ShapedTensor(Box::new(inner), dims);
+    }
+    r.ok = false;
+    return Type::Void;
+}
+
+pub fn aw_opttype(b: &mut AwBuf, v: OptType) {
+    match v {
+        OptType::Some(t) => { aw_u8(b, 1); aw_type(b, t); }
+        OptType::None => { aw_u8(b, 0); }
+    }
+}
+
+pub fn ar_opttype(r: &mut ArBuf) -> OptType {
+    if ar_u8(r) == 1 { return OptType::Some(ar_type(r)); }
+    return OptType::None;
+}
+
+// --- small structs -----------------------------------------------------------
+
+pub fn aw_strpair(b: &mut AwBuf, p: StrPair) {
+    aw_str(b, p.a);
+    aw_str(b, p.b);
+}
+
+pub fn ar_strpair(r: &mut ArBuf) -> StrPair {
+    var p: StrPair = StrPair_new(ar_str(r), ar_str(r));
+    return p;
+}
+
+pub fn aw_strs(b: &mut AwBuf, v: Vec<str>) {
+    aw_i64(b, v.len());
+    var i: i64 = 0;
+    while i < v.len() { aw_str(b, v.get(i)); i = i + 1; }
+}
+
+pub fn ar_strs(r: &mut ArBuf) -> Vec<str> {
+    var n: i64 = ar_i64(r);
+    var v: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < n { v.push(ar_str(r)); i = i + 1; }
+    return v;
+}
+
+pub fn aw_annotation(b: &mut AwBuf, a: Annotation) {
+    aw_str(b, a.name);
+    aw_strs(b, a.args);
+}
+
+pub fn ar_annotation(r: &mut ArBuf) -> Annotation {
+    return Annotation_new(ar_str(r), ar_strs(r));
+}
+
+pub fn aw_annotations(b: &mut AwBuf, v: Vec<Annotation>) {
+    aw_i64(b, v.len());
+    var i: i64 = 0;
+    while i < v.len() { aw_annotation(b, v.get(i)); i = i + 1; }
+}
+
+pub fn ar_annotations(r: &mut ArBuf) -> Vec<Annotation> {
+    var n: i64 = ar_i64(r);
+    var v: Vec<Annotation> = Vec::new();
+    var i: i64 = 0;
+    while i < n { v.push(ar_annotation(r)); i = i + 1; }
+    return v;
+}
+
+pub fn aw_fieldinit(b: &mut AwBuf, f: FieldInit) {
+    aw_str(b, f.name);
+    aw_expr(b, f.value);
+}
+
+pub fn ar_fieldinit(r: &mut ArBuf) -> FieldInit {
+    return FieldInit_new(ar_str(r), ar_expr(r));
+}
+
+pub fn aw_exprs(b: &mut AwBuf, v: Vec<Expr>) {
+    aw_i64(b, v.len());
+    var i: i64 = 0;
+    while i < v.len() { aw_expr(b, v.get(i)); i = i + 1; }
+}
+
+pub fn ar_exprs(r: &mut ArBuf) -> Vec<Expr> {
+    var n: i64 = ar_i64(r);
+    var v: Vec<Expr> = Vec::new();
+    var i: i64 = 0;
+    while i < n { v.push(ar_expr(r)); i = i + 1; }
+    return v;
+}
+
+pub fn aw_optexpr(b: &mut AwBuf, v: OptBoxExpr) {
+    match v {
+        OptBoxExpr::Some(e) => { aw_u8(b, 1); aw_expr(b, e); }
+        OptBoxExpr::None => { aw_u8(b, 0); }
+    }
+}
+
+pub fn ar_optexpr(r: &mut ArBuf) -> OptBoxExpr {
+    if ar_u8(r) == 1 { return OptBoxExpr::Some(Box::new(ar_expr(r))); }
+    return OptBoxExpr::None;
+}
+
+pub fn aw_optstmts(b: &mut AwBuf, v: OptStmts) {
+    match v {
+        OptStmts::Some(s) => { aw_u8(b, 1); aw_stmts(b, s); }
+        OptStmts::None => { aw_u8(b, 0); }
+    }
+}
+
+pub fn ar_optstmts(r: &mut ArBuf) -> OptStmts {
+    if ar_u8(r) == 1 { return OptStmts::Some(ar_stmts(r)); }
+    return OptStmts::None;
+}
+
+pub fn aw_matcharm(b: &mut AwBuf, m: MatchArm) {
+    aw_pattern(b, m.pattern);
+    aw_optexpr(b, m.guard);
+    aw_stmts(b, m.body);
+}
+
+pub fn ar_matcharm(r: &mut ArBuf) -> MatchArm {
+    return MatchArm_new(ar_pattern(r), ar_optexpr(r), ar_stmts(r));
+}
+
+pub fn aw_matcharms(b: &mut AwBuf, v: Vec<MatchArm>) {
+    aw_i64(b, v.len());
+    var i: i64 = 0;
+    while i < v.len() { aw_matcharm(b, v.get(i)); i = i + 1; }
+}
+
+pub fn ar_matcharms(r: &mut ArBuf) -> Vec<MatchArm> {
+    var n: i64 = ar_i64(r);
+    var v: Vec<MatchArm> = Vec::new();
+    var i: i64 = 0;
+    while i < n { v.push(ar_matcharm(r)); i = i + 1; }
+    return v;
+}
+
+pub fn aw_fstringpart(b: &mut AwBuf, p: FStringPart) {
+    match p {
+        FStringPart::Literal(s) => { aw_u8(b, 0); aw_str(b, s); }
+        FStringPart::Expr(e) => { aw_u8(b, 1); aw_expr(b, e); }
+    }
+}
+
+pub fn ar_fstringpart(r: &mut ArBuf) -> FStringPart {
+    if ar_u8(r) == 1 { return FStringPart::Expr(ar_expr(r)); }
+    return FStringPart::Literal(ar_str(r));
+}
+
+pub fn aw_fstringparts(b: &mut AwBuf, v: Vec<FStringPart>) {
+    aw_i64(b, v.len());
+    var i: i64 = 0;
+    while i < v.len() { aw_fstringpart(b, v.get(i)); i = i + 1; }
+}
+
+pub fn ar_fstringparts(r: &mut ArBuf) -> Vec<FStringPart> {
+    var n: i64 = ar_i64(r);
+    var v: Vec<FStringPart> = Vec::new();
+    var i: i64 = 0;
+    while i < n { v.push(ar_fstringpart(r)); i = i + 1; }
+    return v;
+}
+
+pub fn aw_asmoperand(b: &mut AwBuf, o: AsmOperand) {
+    aw_asmdir(b, o.direction);
+    aw_str(b, o.reg);
+    aw_expr(b, o.expr);
+}
+
+pub fn ar_asmoperand(r: &mut ArBuf) -> AsmOperand {
+    return AsmOperand_new(ar_asmdir(r), ar_str(r), ar_expr(r));
+}
+
+pub fn aw_asmoperands(b: &mut AwBuf, v: Vec<AsmOperand>) {
+    aw_i64(b, v.len());
+    var i: i64 = 0;
+    while i < v.len() { aw_asmoperand(b, v.get(i)); i = i + 1; }
+}
+
+pub fn ar_asmoperands(r: &mut ArBuf) -> Vec<AsmOperand> {
+    var n: i64 = ar_i64(r);
+    var v: Vec<AsmOperand> = Vec::new();
+    var i: i64 = 0;
+    while i < n { v.push(ar_asmoperand(r)); i = i + 1; }
+    return v;
+}
+
+pub fn aw_expr(b: &mut AwBuf, e: Expr) {
+    match e {
+        Expr::IntLit(v) => { aw_u8(b, 0); aw_i64(b, v); }
+        Expr::FloatLit(v) => { aw_u8(b, 1); aw_f64(b, v); }
+        Expr::StringLit(s) => { aw_u8(b, 2); aw_str(b, s); }
+        Expr::BoolLit(v) => { aw_u8(b, 3); aw_bool(b, v); }
+        Expr::Ident(s) => { aw_u8(b, 4); aw_str(b, s); }
+        Expr::Binary(op, l, r2) => {
+            aw_u8(b, 5); aw_binop(b, op); aw_expr(b, l); aw_expr(b, r2);
+        }
+        Expr::Unary(op, x) => { aw_u8(b, 6); aw_unop(b, op); aw_expr(b, x); }
+        Expr::Call(n, args) => {
+            aw_u8(b, 7); aw_str(b, n); aw_exprs(b, args);
+        }
+        Expr::FieldAccess(x, n) => {
+            aw_u8(b, 8); aw_expr(b, x); aw_str(b, n);
+        }
+        Expr::OptionalFieldAccess(x, n) => {
+            aw_u8(b, 9); aw_expr(b, x); aw_str(b, n);
+        }
+        Expr::StructLit(n, fields, rest) => {
+            aw_u8(b, 10); aw_str(b, n);
+            aw_i64(b, fields.len());
+            var i: i64 = 0;
+            while i < fields.len() { aw_fieldinit(b, fields.get(i)); i = i + 1; }
+            aw_optexpr(b, rest);
+        }
+        Expr::If(c, then, els) => {
+            aw_u8(b, 11); aw_expr(b, c); aw_stmts(b, then); aw_optstmts(b, els);
+        }
+        Expr::Range(l, r2, inc) => {
+            aw_u8(b, 12); aw_expr(b, l); aw_expr(b, r2); aw_bool(b, inc);
+        }
+        Expr::Block(s) => { aw_u8(b, 13); aw_stmts(b, s); }
+        Expr::MethodCall(x, n, args) => {
+            aw_u8(b, 14); aw_expr(b, x); aw_str(b, n); aw_exprs(b, args);
+        }
+        Expr::ArrayLit(ty, items) => {
+            aw_u8(b, 15); aw_type(b, ty); aw_exprs(b, items);
+        }
+        Expr::Index(x, i) => { aw_u8(b, 16); aw_expr(b, x); aw_expr(b, i); }
+        Expr::FString(parts) => { aw_u8(b, 17); aw_fstringparts(b, parts); }
+        Expr::Match(x, arms) => {
+            aw_u8(b, 18); aw_expr(b, x); aw_matcharms(b, arms);
+        }
+        Expr::EnumLit(a, c, args) => {
+            aw_u8(b, 19); aw_str(b, a); aw_str(b, c); aw_exprs(b, args);
+        }
+        Expr::Ref(x, m) => { aw_u8(b, 20); aw_expr(b, x); aw_bool(b, m); }
+        Expr::Deref(x) => { aw_u8(b, 21); aw_expr(b, x); }
+        Expr::StrConcat(l, r2) => { aw_u8(b, 22); aw_expr(b, l); aw_expr(b, r2); }
+        Expr::Try(x) => { aw_u8(b, 23); aw_expr(b, x); }
+        Expr::Coalesce(l, r2) => { aw_u8(b, 24); aw_expr(b, l); aw_expr(b, r2); }
+        Expr::IsCheck(x, n) => { aw_u8(b, 25); aw_expr(b, x); aw_str(b, n); }
+        Expr::TryBlock(s) => { aw_u8(b, 26); aw_stmts(b, s); }
+        Expr::TupleLit(items) => { aw_u8(b, 27); aw_exprs(b, items); }
+        Expr::Closure(params, body, ret) => {
+            aw_u8(b, 28); aw_params(b, params); aw_stmts(b, body); aw_opttype(b, ret);
+        }
+        Expr::Cast(x, ty) => { aw_u8(b, 29); aw_expr(b, x); aw_type(b, ty); }
+        Expr::Asm(tpl, ops) => { aw_u8(b, 30); aw_str(b, tpl); aw_asmoperands(b, ops); }
+        Expr::Comptime(x) => { aw_u8(b, 31); aw_expr(b, x); }
+        Expr::ComptimeBlock(s) => { aw_u8(b, 32); aw_stmts(b, s); }
+        Expr::ComptimeReflect(op, ty) => {
+            aw_u8(b, 33); aw_reflectop(b, op); aw_type(b, ty);
+        }
+        Expr::PipeForward(l, r2) => { aw_u8(b, 34); aw_expr(b, l); aw_expr(b, r2); }
+        Expr::QuantCast(x, ty) => { aw_u8(b, 35); aw_expr(b, x); aw_type(b, ty); }
+        Expr::Await(x) => { aw_u8(b, 36); aw_expr(b, x); }
+        Expr::Spawn(x) => { aw_u8(b, 37); aw_expr(b, x); }
+        Expr::Yield(x) => { aw_u8(b, 38); aw_expr(b, x); }
+        Expr::NamedArg(n, x) => { aw_u8(b, 39); aw_str(b, n); aw_expr(b, x); }
+    }
+}
+
+pub fn ar_expr(r: &mut ArBuf) -> Expr {
+    var t: i64 = ar_u8(r);
+    if t == 0 { return Expr::IntLit(ar_i64(r)); }
+    if t == 1 { return Expr::FloatLit(ar_f64(r)); }
+    if t == 2 { return Expr::StringLit(ar_str(r)); }
+    if t == 3 { return Expr::BoolLit(ar_bool(r)); }
+    if t == 4 { return Expr::Ident(ar_str(r)); }
+    if t == 5 {
+        var op: BinOp = ar_binop(r);
+        return Expr::Binary(op, Box::new(ar_expr(r)), Box::new(ar_expr(r)));
+    }
+    if t == 6 { return Expr::Unary(ar_unop(r), Box::new(ar_expr(r))); }
+    if t == 7 { return Expr::Call(ar_str(r), ar_exprs(r)); }
+    if t == 8 { return Expr::FieldAccess(Box::new(ar_expr(r)), ar_str(r)); }
+    if t == 9 { return Expr::OptionalFieldAccess(Box::new(ar_expr(r)), ar_str(r)); }
+    if t == 10 {
+        var n: str = ar_str(r);
+        var cnt: i64 = ar_i64(r);
+        var fields: Vec<FieldInit> = Vec::new();
+        var i: i64 = 0;
+        while i < cnt { fields.push(ar_fieldinit(r)); i = i + 1; }
+        return Expr::StructLit(n, fields, ar_optexpr(r));
+    }
+    if t == 11 {
+        var c: Expr = ar_expr(r);
+        return Expr::If(Box::new(c), ar_stmts(r), ar_optstmts(r));
+    }
+    if t == 12 {
+        var l: Expr = ar_expr(r);
+        return Expr::Range(Box::new(l), Box::new(ar_expr(r)), ar_bool(r));
+    }
+    if t == 13 { return Expr::Block(ar_stmts(r)); }
+    if t == 14 {
+        var x: Expr = ar_expr(r);
+        return Expr::MethodCall(Box::new(x), ar_str(r), ar_exprs(r));
+    }
+    if t == 15 { return Expr::ArrayLit(Box::new(ar_type(r)), ar_exprs(r)); }
+    if t == 16 {
+        return Expr::Index(Box::new(ar_expr(r)), Box::new(ar_expr(r)));
+    }
+    if t == 17 { return Expr::FString(ar_fstringparts(r)); }
+    if t == 18 { return Expr::Match(Box::new(ar_expr(r)), ar_matcharms(r)); }
+    if t == 19 { return Expr::EnumLit(ar_str(r), ar_str(r), ar_exprs(r)); }
+    if t == 20 { return Expr::Ref(Box::new(ar_expr(r)), ar_bool(r)); }
+    if t == 21 { return Expr::Deref(Box::new(ar_expr(r))); }
+    if t == 22 {
+        return Expr::StrConcat(Box::new(ar_expr(r)), Box::new(ar_expr(r)));
+    }
+    if t == 23 { return Expr::Try(Box::new(ar_expr(r))); }
+    if t == 24 {
+        return Expr::Coalesce(Box::new(ar_expr(r)), Box::new(ar_expr(r)));
+    }
+    if t == 25 { return Expr::IsCheck(Box::new(ar_expr(r)), ar_str(r)); }
+    if t == 26 { return Expr::TryBlock(ar_stmts(r)); }
+    if t == 27 { return Expr::TupleLit(ar_exprs(r)); }
+    if t == 28 { return Expr::Closure(ar_params(r), ar_stmts(r), ar_opttype(r)); }
+    if t == 29 { return Expr::Cast(Box::new(ar_expr(r)), ar_type(r)); }
+    if t == 30 { return Expr::Asm(ar_str(r), ar_asmoperands(r)); }
+    if t == 31 { return Expr::Comptime(Box::new(ar_expr(r))); }
+    if t == 32 { return Expr::ComptimeBlock(ar_stmts(r)); }
+    if t == 33 { return Expr::ComptimeReflect(ar_reflectop(r), ar_type(r)); }
+    if t == 34 {
+        return Expr::PipeForward(Box::new(ar_expr(r)), Box::new(ar_expr(r)));
+    }
+    if t == 35 { return Expr::QuantCast(Box::new(ar_expr(r)), ar_type(r)); }
+    if t == 36 { return Expr::Await(Box::new(ar_expr(r))); }
+    if t == 37 { return Expr::Spawn(Box::new(ar_expr(r))); }
+    if t == 38 { return Expr::Yield(Box::new(ar_expr(r))); }
+    if t == 39 { return Expr::NamedArg(ar_str(r), Box::new(ar_expr(r))); }
+    r.ok = false;
+    return Expr::IntLit(0);
+}
+
+pub fn aw_binding(b: &mut AwBuf, x: Binding) {
+    aw_str(b, x.name);
+    aw_str(b, x.ty);
+}
+
+pub fn ar_binding(r: &mut ArBuf) -> Binding {
+    return Binding_new(ar_str(r), ar_str(r));
+}
+
+pub fn aw_pattern(b: &mut AwBuf, p: Pattern) {
+    match p {
+        Pattern::Wildcard => { aw_u8(b, 0); }
+        Pattern::IntLit(v) => { aw_u8(b, 1); aw_i64(b, v); }
+        Pattern::BoolLit(v) => { aw_u8(b, 2); aw_bool(b, v); }
+        Pattern::Ident(s) => { aw_u8(b, 3); aw_str(b, s); }
+        Pattern::EnumVariant(a, c, bs) => {
+            aw_u8(b, 4); aw_str(b, a); aw_str(b, c);
+            aw_i64(b, bs.len());
+            var i: i64 = 0;
+            while i < bs.len() { aw_binding(b, bs.get(i)); i = i + 1; }
+        }
+        Pattern::StrLit(s) => { aw_u8(b, 5); aw_str(b, s); }
+        Pattern::Range(l, r2) => { aw_u8(b, 6); aw_pattern(b, l); aw_pattern(b, r2); }
+    }
+}
+
+pub fn ar_pattern(r: &mut ArBuf) -> Pattern {
+    var t: i64 = ar_u8(r);
+    if t == 1 { return Pattern::IntLit(ar_i64(r)); }
+    if t == 2 { return Pattern::BoolLit(ar_bool(r)); }
+    if t == 3 { return Pattern::Ident(ar_str(r)); }
+    if t == 4 {
+        var a: str = ar_str(r);
+        var c: str = ar_str(r);
+        var cnt: i64 = ar_i64(r);
+        var bs: Vec<Binding> = Vec::new();
+        var i: i64 = 0;
+        while i < cnt { bs.push(ar_binding(r)); i = i + 1; }
+        return Pattern::EnumVariant(a, c, bs);
+    }
+    if t == 5 { return Pattern::StrLit(ar_str(r)); }
+    if t == 6 {
+        return Pattern::Range(Box::new(ar_pattern(r)), Box::new(ar_pattern(r)));
+    }
+    return Pattern::Wildcard;
+}
+
+pub fn aw_param(b: &mut AwBuf, p: Param) {
+    aw_str(b, p.name);
+    aw_type(b, p.ty);
+    aw_bool(b, p.is_pub);
+    aw_annotations(b, p.annotations);
+    aw_bool(b, p.has_default);
+    aw_expr(b, p.default_expr);
+    aw_bool(b, p.is_variadic);
+}
+
+pub fn ar_param(r: &mut ArBuf) -> Param {
+    var p: Param = Param_new(ar_str(r), ar_type(r), ar_bool(r));
+    p.annotations = ar_annotations(r);
+    p.has_default = ar_bool(r);
+    p.default_expr = ar_expr(r);
+    p.is_variadic = ar_bool(r);
+    return p;
+}
+
+pub fn aw_params(b: &mut AwBuf, v: Vec<Param>) {
+    aw_i64(b, v.len());
+    var i: i64 = 0;
+    while i < v.len() { aw_param(b, v.get(i)); i = i + 1; }
+}
+
+pub fn ar_params(r: &mut ArBuf) -> Vec<Param> {
+    var n: i64 = ar_i64(r);
+    var v: Vec<Param> = Vec::new();
+    var i: i64 = 0;
+    while i < n { v.push(ar_param(r)); i = i + 1; }
+    return v;
+}
+
+pub fn aw_optparams(b: &mut AwBuf, v: OptParams) {
+    match v {
+        OptParams::Some(ps) => { aw_u8(b, 1); aw_params(b, ps); }
+        OptParams::None => { aw_u8(b, 0); }
+    }
+}
+
+pub fn ar_optparams(r: &mut ArBuf) -> OptParams {
+    if ar_u8(r) == 1 { return OptParams::Some(ar_params(r)); }
+    return OptParams::None;
+}
+
+pub fn aw_selectcase(b: &mut AwBuf, c: SelectCase) {
+    aw_expr(b, c.channel);
+    aw_str(b, c.var_name);
+    aw_stmts(b, c.body);
+}
+
+pub fn ar_selectcase(r: &mut ArBuf) -> SelectCase {
+    return SelectCase_new(ar_expr(r), ar_str(r), ar_stmts(r));
+}
+
+pub fn aw_effecthandler(b: &mut AwBuf, h: EffectHandler) {
+    aw_str(b, h.effect);
+    aw_str(b, h.op);
+    aw_strs(b, h.params);
+    aw_stmts(b, h.body);
+}
+
+pub fn ar_effecthandler(r: &mut ArBuf) -> EffectHandler {
+    return EffectHandler_new(ar_str(r), ar_str(r), ar_strs(r), ar_stmts(r));
+}
+
+pub fn aw_selectcases(b: &mut AwBuf, v: Vec<SelectCase>) {
+    aw_i64(b, v.len());
+    var i: i64 = 0;
+    while i < v.len() { aw_selectcase(b, v.get(i)); i = i + 1; }
+}
+
+pub fn ar_selectcases(r: &mut ArBuf) -> Vec<SelectCase> {
+    var n: i64 = ar_i64(r);
+    var v: Vec<SelectCase> = Vec::new();
+    var i: i64 = 0;
+    while i < n { v.push(ar_selectcase(r)); i = i + 1; }
+    return v;
+}
+
+pub fn aw_effecthandlers(b: &mut AwBuf, v: Vec<EffectHandler>) {
+    aw_i64(b, v.len());
+    var i: i64 = 0;
+    while i < v.len() { aw_effecthandler(b, v.get(i)); i = i + 1; }
+}
+
+pub fn ar_effecthandlers(r: &mut ArBuf) -> Vec<EffectHandler> {
+    var n: i64 = ar_i64(r);
+    var v: Vec<EffectHandler> = Vec::new();
+    var i: i64 = 0;
+    while i < n { v.push(ar_effecthandler(r)); i = i + 1; }
+    return v;
+}
+
+pub fn aw_stmt(b: &mut AwBuf, s: Stmt) {
+    match s {
+        Stmt::Let(n, ty, e, m, st, anns, ln) => {
+            aw_u8(b, 0); aw_str(b, n); aw_opttype(b, ty); aw_expr(b, e);
+            aw_bool(b, m); aw_bool(b, st); aw_annotations(b, anns); aw_i64(b, ln);
+        }
+        Stmt::LetTuple(ns, e, ln) => {
+            aw_u8(b, 1); aw_strs(b, ns); aw_expr(b, e); aw_i64(b, ln);
+        }
+        Stmt::LetUninit(n, ty, anns, ln) => {
+            aw_u8(b, 2); aw_str(b, n); aw_type(b, ty); aw_annotations(b, anns); aw_i64(b, ln);
+        }
+        Stmt::Assign(n, op, e, ln) => {
+            aw_u8(b, 3); aw_str(b, n); aw_assignop(b, op); aw_expr(b, e); aw_i64(b, ln);
+        }
+        Stmt::IndexAssign(n, idx, op, e, ln) => {
+            aw_u8(b, 4); aw_str(b, n); aw_expr(b, idx); aw_assignop(b, op);
+            aw_expr(b, e); aw_i64(b, ln);
+        }
+        Stmt::DerefAssign(x, op, e, ln) => {
+            aw_u8(b, 5); aw_expr(b, x); aw_assignop(b, op); aw_expr(b, e); aw_i64(b, ln);
+        }
+        Stmt::FieldAssign(x, n, op, e, ln) => {
+            aw_u8(b, 6); aw_expr(b, x); aw_str(b, n); aw_assignop(b, op);
+            aw_expr(b, e); aw_i64(b, ln);
+        }
+        Stmt::Expr(e, ln) => { aw_u8(b, 7); aw_expr(b, e); aw_i64(b, ln); }
+        Stmt::Return(x, ln) => { aw_u8(b, 8); aw_optexpr(b, x); aw_i64(b, ln); }
+        Stmt::If(c, then, els, ln) => {
+            aw_u8(b, 9); aw_expr(b, c); aw_stmts(b, then); aw_optstmts(b, els); aw_i64(b, ln);
+        }
+        Stmt::While(c, body, ln) => {
+            aw_u8(b, 10); aw_expr(b, c); aw_stmts(b, body); aw_i64(b, ln);
+        }
+        Stmt::For(n, it, body, ln) => {
+            aw_u8(b, 11); aw_str(b, n); aw_expr(b, it); aw_stmts(b, body); aw_i64(b, ln);
+        }
+        Stmt::Loop(body, ln) => { aw_u8(b, 12); aw_stmts(b, body); aw_i64(b, ln); }
+        Stmt::Break(x, ln) => { aw_u8(b, 13); aw_optexpr(b, x); aw_i64(b, ln); }
+        Stmt::Continue(ln) => { aw_u8(b, 14); aw_i64(b, ln); }
+        Stmt::Defer(body, ln) => { aw_u8(b, 15); aw_stmts(b, body); aw_i64(b, ln); }
+        Stmt::Match(x, arms, ln) => {
+            aw_u8(b, 16); aw_expr(b, x); aw_matcharms(b, arms); aw_i64(b, ln);
+        }
+        Stmt::Use(n, items, ln) => {
+            aw_u8(b, 17); aw_str(b, n); aw_strs(b, items); aw_i64(b, ln);
+        }
+        Stmt::Handle(body, hs, ln) => {
+            aw_u8(b, 18); aw_stmts(b, body); aw_effecthandlers(b, hs); aw_i64(b, ln);
+        }
+        Stmt::Do(a, c, args, ln) => {
+            aw_u8(b, 19); aw_str(b, a); aw_str(b, c); aw_exprs(b, args); aw_i64(b, ln);
+        }
+        Stmt::RegionBlock(n, cp, is_s, is_t, lim, body, ln) => {
+            aw_u8(b, 20); aw_str(b, n); aw_opti64(b, cp);
+            aw_bool(b, is_s); aw_bool(b, is_t); aw_opti64(b, lim);
+            aw_stmts(b, body); aw_i64(b, ln);
+        }
+        Stmt::Sandbox(body, ln) => { aw_u8(b, 21); aw_stmts(b, body); aw_i64(b, ln); }
+        Stmt::Unsafe(body, ln) => { aw_u8(b, 22); aw_stmts(b, body); aw_i64(b, ln); }
+        Stmt::Txn(body, ln) => { aw_u8(b, 23); aw_stmts(b, body); aw_i64(b, ln); }
+        Stmt::ComptimeGen(body, ln) => { aw_u8(b, 24); aw_stmts(b, body); aw_i64(b, ln); }
+        Stmt::GradBlock(n, body, ln) => {
+            aw_u8(b, 25); aw_str(b, n); aw_stmts(b, body); aw_i64(b, ln);
+        }
+        Stmt::Backward(x, ln) => { aw_u8(b, 26); aw_expr(b, x); aw_i64(b, ln); }
+        Stmt::Query(ns, body, ln) => {
+            aw_u8(b, 27); aw_strs(b, ns); aw_stmts(b, body); aw_i64(b, ln);
+        }
+        Stmt::Select(cs, els, ln) => {
+            aw_u8(b, 28); aw_selectcases(b, cs); aw_optstmts(b, els); aw_i64(b, ln);
+        }
+        Stmt::Parallel(bs, ln) => {
+            aw_u8(b, 29); aw_i64(b, bs.len());
+            var i: i64 = 0;
+            while i < bs.len() { aw_stmts(b, bs.get(i)); i = i + 1; }
+            aw_i64(b, ln);
+        }
+        Stmt::Resume(a, c, ln) => {
+            aw_u8(b, 30); aw_expr(b, a); aw_expr(b, c); aw_i64(b, ln);
+        }
+        Stmt::SpawnScope(body, ln) => { aw_u8(b, 31); aw_stmts(b, body); aw_i64(b, ln); }
+        Stmt::CancelScope(ln) => { aw_u8(b, 32); aw_i64(b, ln); }
+    }
+}
+
+pub fn aw_stmts(b: &mut AwBuf, v: Vec<Stmt>) {
+    aw_i64(b, v.len());
+    var i: i64 = 0;
+    while i < v.len() { aw_stmt(b, v.get(i)); i = i + 1; }
+}
+
+pub fn ar_stmt(r: &mut ArBuf) -> Stmt {
+    var t: i64 = ar_u8(r);
+    if t == 0 {
+        var n: str = ar_str(r);
+        var ty: OptType = ar_opttype(r);
+        var e: Expr = ar_expr(r);
+        var m: bool = ar_bool(r);
+        var st: bool = ar_bool(r);
+        var anns: Vec<Annotation> = ar_annotations(r);
+        return Stmt::Let(n, ty, e, m, st, anns, ar_i64(r));
+    }
+    if t == 1 { return Stmt::LetTuple(ar_strs(r), ar_expr(r), ar_i64(r)); }
+    if t == 2 {
+        var n: str = ar_str(r);
+        var ty: Type = ar_type(r);
+        return Stmt::LetUninit(n, ty, ar_annotations(r), ar_i64(r));
+    }
+    if t == 3 {
+        var n: str = ar_str(r);
+        var op: AssignOp = ar_assignop(r);
+        return Stmt::Assign(n, op, ar_expr(r), ar_i64(r));
+    }
+    if t == 4 {
+        var n: str = ar_str(r);
+        var idx: Expr = ar_expr(r);
+        var op: AssignOp = ar_assignop(r);
+        return Stmt::IndexAssign(n, idx, op, ar_expr(r), ar_i64(r));
+    }
+    if t == 5 {
+        var x: Expr = ar_expr(r);
+        var op: AssignOp = ar_assignop(r);
+        return Stmt::DerefAssign(x, op, ar_expr(r), ar_i64(r));
+    }
+    if t == 6 {
+        var x: Expr = ar_expr(r);
+        var n: str = ar_str(r);
+        var op: AssignOp = ar_assignop(r);
+        return Stmt::FieldAssign(x, n, op, ar_expr(r), ar_i64(r));
+    }
+    if t == 7 { return Stmt::Expr(ar_expr(r), ar_i64(r)); }
+    if t == 8 { return Stmt::Return(ar_optexpr(r), ar_i64(r)); }
+    if t == 9 {
+        var c: Expr = ar_expr(r);
+        return Stmt::If(c, ar_stmts(r), ar_optstmts(r), ar_i64(r));
+    }
+    if t == 10 {
+        var c: Expr = ar_expr(r);
+        return Stmt::While(c, ar_stmts(r), ar_i64(r));
+    }
+    if t == 11 {
+        var n: str = ar_str(r);
+        var it: Expr = ar_expr(r);
+        return Stmt::For(n, it, ar_stmts(r), ar_i64(r));
+    }
+    if t == 12 { return Stmt::Loop(ar_stmts(r), ar_i64(r)); }
+    if t == 13 { return Stmt::Break(ar_optexpr(r), ar_i64(r)); }
+    if t == 14 { return Stmt::Continue(ar_i64(r)); }
+    if t == 15 { return Stmt::Defer(ar_stmts(r), ar_i64(r)); }
+    if t == 16 {
+        var x: Expr = ar_expr(r);
+        return Stmt::Match(x, ar_matcharms(r), ar_i64(r));
+    }
+    if t == 17 {
+        var n: str = ar_str(r);
+        return Stmt::Use(n, ar_strs(r), ar_i64(r));
+    }
+    if t == 18 { return Stmt::Handle(ar_stmts(r), ar_effecthandlers(r), ar_i64(r)); }
+    if t == 19 {
+        var a: str = ar_str(r);
+        var c: str = ar_str(r);
+        return Stmt::Do(a, c, ar_exprs(r), ar_i64(r));
+    }
+    if t == 20 {
+        var n: str = ar_str(r);
+        var cp: OptI64 = ar_opti64(r);
+        var is_s: bool = ar_bool(r);
+        var is_t: bool = ar_bool(r);
+        var lim: OptI64 = ar_opti64(r);
+        return Stmt::RegionBlock(n, cp, is_s, is_t, lim, ar_stmts(r), ar_i64(r));
+    }
+    if t == 21 { return Stmt::Sandbox(ar_stmts(r), ar_i64(r)); }
+    if t == 22 { return Stmt::Unsafe(ar_stmts(r), ar_i64(r)); }
+    if t == 23 { return Stmt::Txn(ar_stmts(r), ar_i64(r)); }
+    if t == 24 { return Stmt::ComptimeGen(ar_stmts(r), ar_i64(r)); }
+    if t == 25 {
+        var n: str = ar_str(r);
+        return Stmt::GradBlock(n, ar_stmts(r), ar_i64(r));
+    }
+    if t == 26 { return Stmt::Backward(ar_expr(r), ar_i64(r)); }
+    if t == 27 { return Stmt::Query(ar_strs(r), ar_stmts(r), ar_i64(r)); }
+    if t == 28 {
+        var cs: Vec<SelectCase> = ar_selectcases(r);
+        return Stmt::Select(cs, ar_optstmts(r), ar_i64(r));
+    }
+    if t == 29 {
+        var cnt: i64 = ar_i64(r);
+        var bs: Vec<Vec<Stmt>> = Vec::new();
+        var i: i64 = 0;
+        while i < cnt { bs.push(ar_stmts(r)); i = i + 1; }
+        return Stmt::Parallel(bs, ar_i64(r));
+    }
+    if t == 30 {
+        var a: Expr = ar_expr(r);
+        return Stmt::Resume(a, ar_expr(r), ar_i64(r));
+    }
+    if t == 31 { return Stmt::SpawnScope(ar_stmts(r), ar_i64(r)); }
+    if t == 32 { return Stmt::CancelScope(ar_i64(r)); }
+    r.ok = false;
+    return Stmt::Continue(0);
+}
+
+pub fn ar_stmts(r: &mut ArBuf) -> Vec<Stmt> {
+    var n: i64 = ar_i64(r);
+    var v: Vec<Stmt> = Vec::new();
+    var i: i64 = 0;
+    while i < n { v.push(ar_stmt(r)); i = i + 1; }
+    return v;
+}
+
+// --- declarations ------------------------------------------------------------
+
+pub fn aw_func(b: &mut AwBuf, f: Func) {
+    aw_str(b, f.name);
+    aw_strs(b, f.type_params);
+    aw_i64(b, f.type_param_bounds.len());
+    var i: i64 = 0;
+    while i < f.type_param_bounds.len() { aw_strpair(b, f.type_param_bounds.get(i)); i = i + 1; }
+    aw_i64(b, f.const_params.len());
+    i = 0;
+    while i < f.const_params.len() { aw_strpair(b, f.const_params.get(i)); i = i + 1; }
+    aw_params(b, f.params);
+    aw_type(b, f.ret_ty);
+    aw_stmts(b, f.body);
+    aw_bool(b, f.is_pub);
+    aw_bool(b, f.is_comptime);
+    aw_strs(b, f.declared_effects);
+    aw_bool(b, f.has_effect_annotation);
+    aw_bool(b, f.is_interrupt);
+    aw_annotations(b, f.annotations);
+    aw_exprs(b, f.preconditions);
+    aw_exprs(b, f.postconditions);
+    aw_bool(b, f.is_async);
+}
+
+pub fn ar_func(r: &mut ArBuf) -> Func {
+    var f: Func = Func_new(ar_str(r), Type::Void);
+    f.type_params = ar_strs(r);
+    var n: i64 = ar_i64(r);
+    var bps: Vec<StrPair> = Vec::new();
+    var i: i64 = 0;
+    while i < n { bps.push(ar_strpair(r)); i = i + 1; }
+    f.type_param_bounds = bps;
+    n = ar_i64(r);
+    var cps: Vec<StrPair> = Vec::new();
+    i = 0;
+    while i < n { cps.push(ar_strpair(r)); i = i + 1; }
+    f.const_params = cps;
+    f.params = ar_params(r);
+    f.ret_ty = ar_type(r);
+    f.body = ar_stmts(r);
+    f.is_pub = ar_bool(r);
+    f.is_comptime = ar_bool(r);
+    f.declared_effects = ar_strs(r);
+    f.has_effect_annotation = ar_bool(r);
+    f.is_interrupt = ar_bool(r);
+    f.annotations = ar_annotations(r);
+    f.preconditions = ar_exprs(r);
+    f.postconditions = ar_exprs(r);
+    f.is_async = ar_bool(r);
+    return f;
+}
+
+pub fn aw_funcs(b: &mut AwBuf, v: Vec<Func>) {
+    aw_i64(b, v.len());
+    var i: i64 = 0;
+    while i < v.len() { aw_func(b, v.get(i)); i = i + 1; }
+}
+
+pub fn ar_funcs(r: &mut ArBuf) -> Vec<Func> {
+    var n: i64 = ar_i64(r);
+    var v: Vec<Func> = Vec::new();
+    var i: i64 = 0;
+    while i < n { v.push(ar_func(r)); i = i + 1; }
+    return v;
+}
+
+pub fn aw_structdef(b: &mut AwBuf, d: StructDef) {
+    aw_str(b, d.name);
+    aw_params(b, d.fields);
+    aw_bool(b, d.is_pub);
+    aw_annotations(b, d.annotations);
+    aw_strs(b, d.type_params);
+}
+
+pub fn ar_structdef(r: &mut ArBuf) -> StructDef {
+    var d: StructDef = StructDef_new(ar_str(r), false);
+    d.fields = ar_params(r);
+    d.is_pub = ar_bool(r);
+    d.annotations = ar_annotations(r);
+    d.type_params = ar_strs(r);
+    return d;
+}
+
+pub fn aw_enumvariant(b: &mut AwBuf, v: EnumVariant) {
+    aw_str(b, v.name);
+    aw_optparams(b, v.data);
+}
+
+pub fn ar_enumvariant(r: &mut ArBuf) -> EnumVariant {
+    return EnumVariant_new(ar_str(r), ar_optparams(r));
+}
+
+pub fn aw_enumdef(b: &mut AwBuf, d: EnumDef) {
+    aw_str(b, d.name);
+    aw_i64(b, d.variants.len());
+    var i: i64 = 0;
+    while i < d.variants.len() { aw_enumvariant(b, d.variants.get(i)); i = i + 1; }
+    aw_bool(b, d.is_pub);
+    aw_strs(b, d.type_params);
+}
+
+pub fn ar_enumdef(r: &mut ArBuf) -> EnumDef {
+    var d: EnumDef = EnumDef_new(ar_str(r), Vec::new(), false);
+    var n: i64 = ar_i64(r);
+    var vs: Vec<EnumVariant> = Vec::new();
+    var i: i64 = 0;
+    while i < n { vs.push(ar_enumvariant(r)); i = i + 1; }
+    d.variants = vs;
+    d.is_pub = ar_bool(r);
+    d.type_params = ar_strs(r);
+    return d;
+}
+
+pub fn aw_constdef(b: &mut AwBuf, d: ConstDef) {
+    aw_str(b, d.name);
+    aw_type(b, d.ty);
+    aw_expr(b, d.expr);
+    aw_bool(b, d.is_pub);
+}
+
+pub fn ar_constdef(r: &mut ArBuf) -> ConstDef {
+    return ConstDef_new(ar_str(r), ar_type(r), ar_expr(r), ar_bool(r));
+}
+
+pub fn aw_globalvar(b: &mut AwBuf, d: GlobalVar) {
+    aw_str(b, d.name);
+    aw_type(b, d.ty);
+    aw_expr(b, d.init);
+    aw_bool(b, d.is_pub);
+}
+
+pub fn ar_globalvar(r: &mut ArBuf) -> GlobalVar {
+    return GlobalVar_new(ar_str(r), ar_type(r), ar_expr(r), ar_bool(r));
+}
+
+pub fn aw_typealias(b: &mut AwBuf, d: TypeAlias) {
+    aw_str(b, d.name);
+    aw_type(b, d.alias_for);
+    aw_bool(b, d.is_pub);
+}
+
+pub fn ar_typealias(r: &mut ArBuf) -> TypeAlias {
+    return TypeAlias_new(ar_str(r), ar_type(r), ar_bool(r));
+}
+
+pub fn aw_impldef(b: &mut AwBuf, d: ImplDef) {
+    aw_str(b, d.struct_name);
+    aw_strs(b, d.type_params);
+    aw_funcs(b, d.methods);
+}
+
+pub fn ar_impldef(r: &mut ArBuf) -> ImplDef {
+    return ImplDef_new_full(ar_str(r), ar_strs(r), ar_funcs(r));
+}
+
+pub fn aw_assoctypedecl(b: &mut AwBuf, d: AssocTypeDecl) {
+    aw_str(b, d.name);
+    aw_strs(b, d.type_params);
+}
+
+pub fn ar_assoctypedecl(r: &mut ArBuf) -> AssocTypeDecl {
+    return AssocTypeDecl_new(ar_str(r), ar_strs(r));
+}
+
+pub fn aw_assoctypebinding(b: &mut AwBuf, d: AssocTypeBinding) {
+    aw_str(b, d.name);
+    aw_type(b, d.ty);
+}
+
+pub fn ar_assoctypebinding(r: &mut ArBuf) -> AssocTypeBinding {
+    return AssocTypeBinding_new(ar_str(r), ar_type(r));
+}
+
+pub fn aw_traitmethod(b: &mut AwBuf, m: TraitMethod) {
+    aw_str(b, m.name);
+    aw_params(b, m.params);
+    aw_type(b, m.ret_ty);
+    aw_bool(b, m.has_self);
+    aw_bool(b, m.is_pub);
+    aw_optstmts(b, m.default_body);
+}
+
+pub fn ar_traitmethod(r: &mut ArBuf) -> TraitMethod {
+    var m: TraitMethod = TraitMethod_new(ar_str(r), Type::Void, false);
+    m.params = ar_params(r);
+    m.ret_ty = ar_type(r);
+    m.has_self = ar_bool(r);
+    m.is_pub = ar_bool(r);
+    m.default_body = ar_optstmts(r);
+    return m;
+}
+
+pub fn aw_traitdef(b: &mut AwBuf, d: TraitDef) {
+    aw_str(b, d.name);
+    aw_i64(b, d.methods.len());
+    var i: i64 = 0;
+    while i < d.methods.len() { aw_traitmethod(b, d.methods.get(i)); i = i + 1; }
+    aw_i64(b, d.associated_types.len());
+    i = 0;
+    while i < d.associated_types.len() { aw_assoctypedecl(b, d.associated_types.get(i)); i = i + 1; }
+    aw_bool(b, d.is_pub);
+    aw_strs(b, d.supertraits);
+}
+
+pub fn ar_traitdef(r: &mut ArBuf) -> TraitDef {
+    var d: TraitDef = TraitDef_new(ar_str(r), Vec::new());
+    var n: i64 = ar_i64(r);
+    var ms: Vec<TraitMethod> = Vec::new();
+    var i: i64 = 0;
+    while i < n { ms.push(ar_traitmethod(r)); i = i + 1; }
+    d.methods = ms;
+    n = ar_i64(r);
+    var ats: Vec<AssocTypeDecl> = Vec::new();
+    i = 0;
+    while i < n { ats.push(ar_assoctypedecl(r)); i = i + 1; }
+    d.associated_types = ats;
+    d.is_pub = ar_bool(r);
+    d.supertraits = ar_strs(r);
+    return d;
+}
+
+pub fn aw_traitimpl(b: &mut AwBuf, d: TraitImpl) {
+    aw_str(b, d.trait_name);
+    aw_str(b, d.type_name);
+    aw_strs(b, d.type_params);
+    aw_funcs(b, d.methods);
+    aw_i64(b, d.associated_types.len());
+    var i: i64 = 0;
+    while i < d.associated_types.len() { aw_assoctypebinding(b, d.associated_types.get(i)); i = i + 1; }
+}
+
+pub fn ar_traitimpl(r: &mut ArBuf) -> TraitImpl {
+    var d: TraitImpl = TraitImpl_new(ar_str(r), ar_str(r));
+    d.type_params = ar_strs(r);
+    d.methods = ar_funcs(r);
+    var n: i64 = ar_i64(r);
+    var ats: Vec<AssocTypeBinding> = Vec::new();
+    var i: i64 = 0;
+    while i < n { ats.push(ar_assoctypebinding(r)); i = i + 1; }
+    d.associated_types = ats;
+    return d;
+}
+
+pub fn aw_importdef(b: &mut AwBuf, d: ImportDef) {
+    aw_str(b, d.path);
+    aw_strs(b, d.items);
+    aw_strs(b, d.capabilities);
+    aw_optstr(b, d.version);
+    aw_optstr(b, d.alias);
+    aw_bool(b, d.is_pub);
+    aw_bool(b, d.is_glob);
+}
+
+pub fn ar_importdef(r: &mut ArBuf) -> ImportDef {
+    return ImportDef_new_full(ar_str(r), ar_strs(r), ar_strs(r),
+        ar_optstr(r), ar_optstr(r), ar_bool(r), ar_bool(r));
+}
+
+pub fn aw_attribute(b: &mut AwBuf, a: Attribute) {
+    aw_str(b, a.name);
+    aw_strs(b, a.args);
+}
+
+pub fn ar_attribute(r: &mut ArBuf) -> Attribute {
+    return Attribute_new(ar_str(r), ar_strs(r));
+}
+
+pub fn aw_externdecl(b: &mut AwBuf, d: ExternDecl) {
+    aw_str(b, d.abi);
+    aw_str(b, d.c_name);
+    aw_str(b, d.pledge_name);
+    aw_params(b, d.params);
+    aw_type(b, d.ret_ty);
+    aw_optstr(b, d.include);
+    aw_optstr(b, d.link_lib);
+}
+
+pub fn ar_externdecl(r: &mut ArBuf) -> ExternDecl {
+    var abi: str = ar_str(r);
+    var cn: str = ar_str(r);
+    var pn: str = ar_str(r);
+    var d: ExternDecl = ExternDecl_new(abi, cn, pn, Type::Void);
+    d.params = ar_params(r);
+    d.ret_ty = ar_type(r);
+    d.include = ar_optstr(r);
+    d.link_lib = ar_optstr(r);
+    return d;
+}
+
+pub fn aw_layerinst(b: &mut AwBuf, d: LayerInst) {
+    aw_str(b, d.field);
+    aw_str(b, d.layer_type);
+    aw_strs(b, d.args);
+}
+
+pub fn ar_layerinst(r: &mut ArBuf) -> LayerInst {
+    return LayerInst_new(ar_str(r), ar_str(r), ar_strs(r));
+}
+
+pub fn aw_layerdef(b: &mut AwBuf, d: LayerDef) {
+    aw_str(b, d.name);
+    aw_params(b, d.fields);
+    aw_strs(b, d.constructor_args);
+    aw_func(b, d.forward);
+    aw_bool(b, d.is_pub);
+}
+
+pub fn ar_layerdef(r: &mut ArBuf) -> LayerDef {
+    var d: LayerDef = LayerDef_new(ar_str(r), Func_new("f", Type::Void), false);
+    d.fields = ar_params(r);
+    d.constructor_args = ar_strs(r);
+    d.forward = ar_func(r);
+    d.is_pub = ar_bool(r);
+    return d;
+}
+
+pub fn aw_modeldef(b: &mut AwBuf, d: ModelDef) {
+    aw_str(b, d.name);
+    aw_i64(b, d.layers.len());
+    var i: i64 = 0;
+    while i < d.layers.len() { aw_layerinst(b, d.layers.get(i)); i = i + 1; }
+    aw_func(b, d.forward);
+    aw_bool(b, d.is_pub);
+}
+
+pub fn ar_modeldef(r: &mut ArBuf) -> ModelDef {
+    var d: ModelDef = ModelDef_new(ar_str(r), Vec::new(), Func_new("f", Type::Void), false);
+    var n: i64 = ar_i64(r);
+    var ls: Vec<LayerInst> = Vec::new();
+    var i: i64 = 0;
+    while i < n { ls.push(ar_layerinst(r)); i = i + 1; }
+    d.layers = ls;
+    d.forward = ar_func(r);
+    d.is_pub = ar_bool(r);
+    return d;
+}
+
+pub fn aw_componentdef(b: &mut AwBuf, d: ComponentDef) {
+    aw_str(b, d.name);
+    aw_params(b, d.fields);
+    aw_bool(b, d.is_pub);
+}
+
+pub fn ar_componentdef(r: &mut ArBuf) -> ComponentDef {
+    var d: ComponentDef = ComponentDef_new(ar_str(r), false);
+    d.fields = ar_params(r);
+    d.is_pub = ar_bool(r);
+    return d;
+}
+
+pub fn aw_systemdef(b: &mut AwBuf, d: SystemDef) {
+    aw_str(b, d.name);
+    aw_params(b, d.params);
+    aw_stmts(b, d.body);
+    aw_bool(b, d.is_pub);
+}
+
+pub fn ar_systemdef(r: &mut ArBuf) -> SystemDef {
+    var d: SystemDef = SystemDef_new(ar_str(r));
+    d.params = ar_params(r);
+    d.body = ar_stmts(r);
+    d.is_pub = ar_bool(r);
+    return d;
+}
+
+pub fn aw_statetransition(b: &mut AwBuf, d: StateTransition) {
+    aw_str(b, d.event);
+    aw_str(b, d.target);
+}
+
+pub fn ar_statetransition(r: &mut ArBuf) -> StateTransition {
+    return StateTransition_new(ar_str(r), ar_str(r));
+}
+
+pub fn aw_statedef(b: &mut AwBuf, d: StateDef) {
+    aw_str(b, d.name);
+    aw_i64(b, d.transitions.len());
+    var i: i64 = 0;
+    while i < d.transitions.len() { aw_statetransition(b, d.transitions.get(i)); i = i + 1; }
+}
+
+pub fn ar_statedef(r: &mut ArBuf) -> StateDef {
+    var d: StateDef = StateDef_new(ar_str(r));
+    var n: i64 = ar_i64(r);
+    var ts: Vec<StateTransition> = Vec::new();
+    var i: i64 = 0;
+    while i < n { ts.push(ar_statetransition(r)); i = i + 1; }
+    d.transitions = ts;
+    return d;
+}
+
+pub fn aw_statemachinedef(b: &mut AwBuf, d: StateMachineDef) {
+    aw_str(b, d.name);
+    aw_i64(b, d.states.len());
+    var i: i64 = 0;
+    while i < d.states.len() { aw_statedef(b, d.states.get(i)); i = i + 1; }
+    aw_bool(b, d.is_pub);
+}
+
+pub fn ar_statemachinedef(r: &mut ArBuf) -> StateMachineDef {
+    var d: StateMachineDef = StateMachineDef_new(ar_str(r), false);
+    var n: i64 = ar_i64(r);
+    var ss: Vec<StateDef> = Vec::new();
+    var i: i64 = 0;
+    while i < n { ss.push(ar_statedef(r)); i = i + 1; }
+    d.states = ss;
+    d.is_pub = ar_bool(r);
+    return d;
+}
+
+pub fn aw_eventhandlerdef(b: &mut AwBuf, d: EventHandlerDef) {
+    aw_str(b, d.event_name);
+    aw_params(b, d.params);
+    aw_stmts(b, d.body);
+    aw_bool(b, d.is_pub);
+}
+
+pub fn ar_eventhandlerdef(r: &mut ArBuf) -> EventHandlerDef {
+    var d: EventHandlerDef = EventHandlerDef_new(ar_str(r));
+    d.params = ar_params(r);
+    d.body = ar_stmts(r);
+    d.is_pub = ar_bool(r);
+    return d;
+}
+
+pub fn aw_program(b: &mut AwBuf, p: Program) {
+    aw_optstr(b, p.module);
+    aw_funcs(b, p.funcs);
+    aw_i64(b, p.structs.len());
+    var i: i64 = 0;
+    while i < p.structs.len() { aw_structdef(b, p.structs.get(i)); i = i + 1; }
+    aw_i64(b, p.enums.len());
+    i = 0;
+    while i < p.enums.len() { aw_enumdef(b, p.enums.get(i)); i = i + 1; }
+    aw_i64(b, p.consts.len());
+    i = 0;
+    while i < p.consts.len() { aw_constdef(b, p.consts.get(i)); i = i + 1; }
+    aw_i64(b, p.globals.len());
+    i = 0;
+    while i < p.globals.len() { aw_globalvar(b, p.globals.get(i)); i = i + 1; }
+    aw_i64(b, p.type_aliases.len());
+    i = 0;
+    while i < p.type_aliases.len() { aw_typealias(b, p.type_aliases.get(i)); i = i + 1; }
+    aw_i64(b, p.impls.len());
+    i = 0;
+    while i < p.impls.len() { aw_impldef(b, p.impls.get(i)); i = i + 1; }
+    aw_i64(b, p.imports.len());
+    i = 0;
+    while i < p.imports.len() { aw_importdef(b, p.imports.get(i)); i = i + 1; }
+    aw_i64(b, p.attributes.len());
+    i = 0;
+    while i < p.attributes.len() { aw_attribute(b, p.attributes.get(i)); i = i + 1; }
+    aw_i64(b, p.traits.len());
+    i = 0;
+    while i < p.traits.len() { aw_traitdef(b, p.traits.get(i)); i = i + 1; }
+    aw_i64(b, p.trait_impls.len());
+    i = 0;
+    while i < p.trait_impls.len() { aw_traitimpl(b, p.trait_impls.get(i)); i = i + 1; }
+    aw_i64(b, p.extern_decls.len());
+    i = 0;
+    while i < p.extern_decls.len() { aw_externdecl(b, p.extern_decls.get(i)); i = i + 1; }
+    aw_i64(b, p.layers.len());
+    i = 0;
+    while i < p.layers.len() { aw_layerdef(b, p.layers.get(i)); i = i + 1; }
+    aw_i64(b, p.models.len());
+    i = 0;
+    while i < p.models.len() { aw_modeldef(b, p.models.get(i)); i = i + 1; }
+    aw_i64(b, p.components.len());
+    i = 0;
+    while i < p.components.len() { aw_componentdef(b, p.components.get(i)); i = i + 1; }
+    aw_i64(b, p.systems.len());
+    i = 0;
+    while i < p.systems.len() { aw_systemdef(b, p.systems.get(i)); i = i + 1; }
+    aw_i64(b, p.state_machines.len());
+    i = 0;
+    while i < p.state_machines.len() { aw_statemachinedef(b, p.state_machines.get(i)); i = i + 1; }
+    aw_i64(b, p.event_handlers.len());
+    i = 0;
+    while i < p.event_handlers.len() { aw_eventhandlerdef(b, p.event_handlers.get(i)); i = i + 1; }
+}
+
+pub fn ar_program(r: &mut ArBuf) -> Program {
+    var p: Program = program_new();
+    p.module = ar_optstr(r);
+    p.funcs = ar_funcs(r);
+    var n: i64 = ar_i64(r);
+    var i: i64 = 0;
+    while i < n { p.structs.push(ar_structdef(r)); i = i + 1; }
+    n = ar_i64(r); i = 0;
+    while i < n { p.enums.push(ar_enumdef(r)); i = i + 1; }
+    n = ar_i64(r); i = 0;
+    while i < n { p.consts.push(ar_constdef(r)); i = i + 1; }
+    n = ar_i64(r); i = 0;
+    while i < n { p.globals.push(ar_globalvar(r)); i = i + 1; }
+    n = ar_i64(r); i = 0;
+    while i < n { p.type_aliases.push(ar_typealias(r)); i = i + 1; }
+    n = ar_i64(r); i = 0;
+    while i < n { p.impls.push(ar_impldef(r)); i = i + 1; }
+    n = ar_i64(r); i = 0;
+    while i < n { p.imports.push(ar_importdef(r)); i = i + 1; }
+    n = ar_i64(r); i = 0;
+    while i < n { p.attributes.push(ar_attribute(r)); i = i + 1; }
+    n = ar_i64(r); i = 0;
+    while i < n { p.traits.push(ar_traitdef(r)); i = i + 1; }
+    n = ar_i64(r); i = 0;
+    while i < n { p.trait_impls.push(ar_traitimpl(r)); i = i + 1; }
+    n = ar_i64(r); i = 0;
+    while i < n { p.extern_decls.push(ar_externdecl(r)); i = i + 1; }
+    n = ar_i64(r); i = 0;
+    while i < n { p.layers.push(ar_layerdef(r)); i = i + 1; }
+    n = ar_i64(r); i = 0;
+    while i < n { p.models.push(ar_modeldef(r)); i = i + 1; }
+    n = ar_i64(r); i = 0;
+    while i < n { p.components.push(ar_componentdef(r)); i = i + 1; }
+    n = ar_i64(r); i = 0;
+    while i < n { p.systems.push(ar_systemdef(r)); i = i + 1; }
+    n = ar_i64(r); i = 0;
+    while i < n { p.state_machines.push(ar_statemachinedef(r)); i = i + 1; }
+    n = ar_i64(r); i = 0;
+    while i < n { p.event_handlers.push(ar_eventhandlerdef(r)); i = i + 1; }
+    return p;
+}
+
+// --- entry points ------------------------------------------------------------
+
+// Serialize a Program to a byte vector: "FIDA" + version(i64) + payload.
+// The caller writes the hash/stamp header around this payload.
+pub fn ast_ser_program(p: Program) -> Vec<i64> {
+    var b: AwBuf = AwBuf { bytes: Vec::new() };
+    aw_i64(&mut b, 4473414);   // "FID" magic (versioned below)
+    aw_i64(&mut b, 2);         // format version
+    aw_program(&mut b, p);
+    return b.bytes;
+}
+
+// Deserialize; returns OptProgram::None on any truncation/mismatch.
+pub fn ast_deser_program(v: Vec<i64>) -> Program {
+    var r: ArBuf = ArBuf { v: v, pos: 0, ok: true };
+    var magic: i64 = ar_i64(&mut r);
+    var ver: i64 = ar_i64(&mut r);
+    if magic != 4473414 || ver != 2 {
+        r.ok = false;
+        return program_new();
+    }
+    var p: Program = ar_program(&mut r);
+    if !r.ok { return program_new(); }
+    return p;
+}
+
+pub fn ast_deser_ok(v: Vec<i64>) -> bool {
+    var r: ArBuf = ArBuf { v: v, pos: 0, ok: true };
+    var magic: i64 = ar_i64(&mut r);
+    var ver: i64 = ar_i64(&mut r);
+    return magic == 4473414 && ver == 2 && r.ok;
+}
+
+pub fn awbuf_new() -> AwBuf { return AwBuf { bytes: Vec::new() }; }
+pub fn arbuf_new(v: Vec<i64>) -> ArBuf { return ArBuf { v: v, pos: 0, ok: true }; }
+pub fn arbuf_ok(r: &ArBuf) -> bool { return r.ok; }
+pub fn awbuf_bytes(b: &AwBuf) -> Vec<i64> { return b.bytes; }
+
+// Fast bytes -> counted str (str_from_bytes concats per byte: O(n^2)).
+pub fn ast_bytes_to_str(bytes: Vec<i64>) -> str {
+    var s: i64 = p_str_buf(bytes.len());
+    var i: i64 = 0;
+    while i < bytes.len() {
+        var p: *mut u8 = (s + i) as *mut u8;
+        unsafe { *p = bytes.get(i) as u8; }
+        i = i + 1;
+    }
+    return s as str;
+}

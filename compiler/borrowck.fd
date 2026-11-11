@@ -236,6 +236,18 @@ pub struct BorrowChecker {
     // name -> index in last_use + 1 (release D8: the lists were searched by
     // name on every statement, quadratic in the size of a function)
     pub last_use_index: i64,
+    // CS3: eagerly-maintained indexes. Vec entries are tombstoned instead
+    // of removed (clear borrowers / OptStr::None / borrower == ""), so
+    // positions never shift and these maps never go stale inside a
+    // function. They are rebuilt cheaply by .clear() at function start.
+    pub sb_ix: i64,   // key -> shared_borrows index + 1
+    pub mb_ix: i64,   // key -> mut_borrow index + 1
+    pub bo_ix: i64,   // borrower -> borrow_of index + 1
+    // Prefix -> count of live borrowers on that path or any path under it
+    // (key "x.y.z" counts toward "x.y.z", "x.y" and "x"). Turns the
+    // inclusive queries from scans into one lookup each.
+    pub sb_pfx: i64,
+    pub mb_pfx: i64,
     // Variables a `for` loop is iterating over, innermost last (release K4):
     // changing one inside the loop body is an error
     pub iterating: Vec<str>,
@@ -256,10 +268,20 @@ pub struct BorrowChecker {
     pub mode: BorrowckMode,
 }
 
-/// Free the borrow checker's last-use index (a raw handle) once checked.
+/// Free the borrow checker's index maps (raw handles) once checked.
 pub fn BorrowChecker_free_maps(self: &mut BorrowChecker) {
     HashMap_drop(self.last_use_index);
     self.last_use_index = HashMap_new();
+    HashMap_drop(self.sb_ix);
+    self.sb_ix = HashMap_new();
+    HashMap_drop(self.mb_ix);
+    self.mb_ix = HashMap_new();
+    HashMap_drop(self.bo_ix);
+    self.bo_ix = HashMap_new();
+    HashMap_drop(self.sb_pfx);
+    self.sb_pfx = HashMap_new();
+    HashMap_drop(self.mb_pfx);
+    self.mb_pfx = HashMap_new();
 }
 
 pub fn BorrowChecker_new(mode: BorrowckMode) -> BorrowChecker {
@@ -281,6 +303,11 @@ pub fn BorrowChecker_new(mode: BorrowckMode) -> BorrowChecker {
         dead_at: Vec::new(),
         last_use: Vec::new(),
         last_use_index: HashMap_new(),
+        sb_ix: HashMap_new(),
+        mb_ix: HashMap_new(),
+        bo_ix: HashMap_new(),
+        sb_pfx: HashMap_new(),
+        mb_pfx: HashMap_new(),
         iterating: Vec::new(),
         skip_bodies: 0,
         stmt_index: 0,
@@ -292,6 +319,49 @@ pub fn BorrowChecker_new(mode: BorrowckMode) -> BorrowChecker {
 
 // --- Check entry points ---------------------------------------------------
 
+// CS5: worker count for the parallel borrow check. FID_PAR=N opts in;
+// default 1 keeps the sequential path (also the only path when warnings
+// must be collected, and on backends where spawn is a green task there is
+// no speedup but the code stays correct).
+// The units a parallel check walks, shared read-only with the workers for
+// the duration of the spawn/await block: spawn arguments must be @send and
+// Vec<Func> is not, so the worker receives only chunk bounds.
+pub var g_bc_units: Vec<Func> = Vec::new();
+
+pub fn bc_par_workers() -> i64 {
+    var r: i64 = p_getenv("FID_PAR");
+    if r == 0 { return 1; }
+    var s: str = p_str_adopt(r);
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if c < 48 || c > 57 { return 1; }
+        n = n * 10 + (c - 48);
+        i = i + 1;
+    }
+    if n < 1 { return 1; }
+    if n > 16 { return 16; }
+    return n;
+}
+
+// Worker for the parallel borrow check (CS5). A spawned worker checks a
+// contiguous chunk of functions with its own BorrowChecker; concatenating
+// the chunks' results in order reproduces the sequential diagnostic order
+// exactly. Vec arguments arrive copy-on-write, so workers share nothing
+// mutable with the caller or each other.
+pub fn bc_par_worker(s: i64, e: i64) -> Vec<str> {
+    var bc: BorrowChecker = BorrowChecker_new(BorrowckMode::On);
+    var i: i64 = s;
+    while i < e {
+        check_func(&mut bc, g_bc_units.get(i));
+        i = i + 1;
+    }
+    var out: Vec<str> = bc.errors;
+    BorrowChecker_free_maps(&mut bc);
+    return out;
+}
+
 // Check an entire program. Walks every function and impl method body.
 pub fn check(self: &mut BorrowChecker, program: Program) -> void {
     // Skip entirely when borrow checking is off -- the full analysis walks
@@ -302,10 +372,14 @@ pub fn check(self: &mut BorrowChecker, program: Program) -> void {
         BorrowckMode::Off => { return; }
         _ => {}
     }
+
+    // Gather the checkable units in sequential order: funcs, then impl
+    // methods, then trait-impl methods.
+    var units: Vec<Func> = Vec::new();
     var i: i64 = 0;
     while i < program.funcs.len() {
         var f: Func = program.funcs.get(i);
-        if !bc_skips(self, "fn:" + f.name) { check_func(self, f); }
+        if !bc_skips(self, "fn:" + f.name) { units.push(f); }
         i = i + 1;
     }
     var j: i64 = 0;
@@ -314,7 +388,7 @@ pub fn check(self: &mut BorrowChecker, program: Program) -> void {
         var k: i64 = 0;
         while k < impl_.methods.len() {
             var m: Func = impl_.methods.get(k);
-            if !bc_skips(self, "impl:" + impl_.struct_name + ":" + m.name) { check_func(self, m); }
+            if !bc_skips(self, "impl:" + impl_.struct_name + ":" + m.name) { units.push(m); }
             k = k + 1;
         }
         j = j + 1;
@@ -326,10 +400,49 @@ pub fn check(self: &mut BorrowChecker, program: Program) -> void {
         var tm: i64 = 0;
         while tm < ti.methods.len() {
             var m2: Func = ti.methods.get(tm);
-            if !bc_skips(self, "trait:" + ti.type_name + ":" + m2.name) { check_func(self, m2); }
+            if !bc_skips(self, "trait:" + ti.type_name + ":" + m2.name) { units.push(m2); }
             tm = tm + 1;
         }
         t = t + 1;
+    }
+
+    // CS5 parallel path: On mode only (workers collect errors, not
+    // warnings), enough units to be worth spawning threads.
+    var nw: i64 = bc_par_workers();
+    if nw > 1 && units.len() >= 64 {
+        match self.mode {
+            BorrowckMode::On => {
+                g_bc_units = units;
+                var per: i64 = (g_bc_units.len() + nw - 1) / nw;
+                var futs: Vec<Future<Vec<str>>> = Vec::new();
+                var wi: i64 = 0;
+                while wi < nw {
+                    var s: i64 = wi * per;
+                    var e: i64 = s + per;
+                    if e > g_bc_units.len() { e = g_bc_units.len(); }
+                    futs.push(spawn bc_par_worker(s, e));
+                    wi = wi + 1;
+                }
+                wi = 0;
+                while wi < futs.len() {
+                    var errs: Vec<str> = await futs.get(wi);
+                    var ei: i64 = 0;
+                    while ei < errs.len() {
+                        self.errors.push(errs.get(ei));
+                        ei = ei + 1;
+                    }
+                    wi = wi + 1;
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    var i2: i64 = 0;
+    while i2 < units.len() {
+        check_func(self, units.get(i2));
+        i2 = i2 + 1;
     }
 }
 
@@ -351,6 +464,11 @@ pub fn check_func(self: &mut BorrowChecker, func: Func) -> void {
     self.in_reservation_phase = false;
     self.last_use.clear();
     HashMap_clear(self.last_use_index);
+    HashMap_clear(self.sb_ix);
+    HashMap_clear(self.mb_ix);
+    HashMap_clear(self.bo_ix);
+    HashMap_clear(self.sb_pfx);
+    HashMap_clear(self.mb_pfx);
     self.iterating.clear();
     self.stmt_index = 0;
 
@@ -844,71 +962,13 @@ pub fn bc_skips(self: &BorrowChecker, key: str) -> bool {
 fn release_dead_borrows(self: &mut BorrowChecker) -> void {
     var current_idx: i64 = self.stmt_index;
     if current_idx < self.dead_at.len() {
-        // Bucketed fast path (CS3): only borrowers dying at this statement.
+        // Bucketed fast path (CS3): release_borrow_by is O(1) via bo_ix,
+        // so the bucket costs only its own names.
         var names: Vec<str> = self.dead_at.get(current_idx).items;
-        if names.len() > 0 {
-            // One borrow_of pass for the whole bucket: removing one at a
-            // time would drop and rebuild the index per name.
-            var set: i64 = HashMap_new();
-            var j: i64 = 0;
-            while j < names.len() {
-                HashMap_insert(set, names.get(j), 1);
-                j = j + 1;
-            }
-            var pairs: Vec<StrPair> = Vec::new();
-            var i: i64 = self.borrow_of.len() - 1;
-            while i >= 0 {
-                if HashMap_contains(set, self.borrow_of.get(i).borrower) {
-                    pairs.push(StrPair_new(self.borrow_of.get(i).borrower, self.borrow_of.get(i).borrowed));
-                    self.borrow_of.remove(i);
-                }
-                i = i - 1;
-            }
-            HashMap_drop(set);
-            // Release the pairs with per-call key->index maps: the shared
-            // and mut vecs stay structurally stable through the batch, so
-            // one build each serves every release (CS3, was k full scans).
-            var sb_ix: i64 = HashMap_new();
-            var si: i64 = 0;
-            while si < self.shared_borrows.len() {
-                HashMap_insert(sb_ix, self.shared_borrows.get(si).key, si + 1);
-                si = si + 1;
-            }
-            var mb_ix: i64 = HashMap_new();
-            var mi: i64 = 0;
-            while mi < self.mut_borrow.len() {
-                HashMap_insert(mb_ix, self.mut_borrow.get(mi).key, mi + 1);
-                mi = mi + 1;
-            }
-            var k: i64 = 0;
-            while k < pairs.len() {
-                var borr: str = pairs.get(k).a;
-                var bord: str = pairs.get(k).b;
-                if HashMap_contains(sb_ix, bord) {
-                    var ei: i64 = HashMap_get(sb_ix, bord) - 1;
-                    var borrowers: Vec<str> = self.shared_borrows.get(ei).borrowers;
-                    var bj: i64 = 0;
-                    while bj < borrowers.len() {
-                        if borrowers.get(bj) == borr {
-                            self.shared_borrows.get(ei).borrowers.remove(bj);
-                            bj = borrowers.len();
-                        }
-                        bj = bj + 1;
-                    }
-                }
-                if HashMap_contains(mb_ix, bord) {
-                    var em: i64 = HashMap_get(mb_ix, bord) - 1;
-                    match self.mut_borrow.get(em).borrower {
-                        OptStr::Some(b) => {
-                            if b == borr { self.mut_borrow.get(em).borrower = OptStr::None; }
-                        }
-                        OptStr::None => {}
-                    }
-                }
-                k = k + 1;
-            }
-            HashMap_drop(sb_ix);
-            HashMap_drop(mb_ix);
+        var j: i64 = 0;
+        while j < names.len() {
+            release_borrow_by(self, names.get(j));
+            j = j + 1;
         }
         self.dead_at.get(current_idx).items.clear();
         return;
@@ -979,19 +1039,11 @@ fn scope_stack_remove_name(self: &mut BorrowChecker, name: str) -> void {
 // Release any borrow held by `borrower`. Called when the borrower goes out
 // of scope or is reassigned.
 fn release_borrow_by(self: &mut BorrowChecker, borrower: str) -> void {
-    var found_idx: i64 = -1;
-    var borrowed: str = "";
-    var i: i64 = 0;
-    while i < self.borrow_of.len() {
-        if self.borrow_of.get(i).borrower == borrower {
-            borrowed = self.borrow_of.get(i).borrowed;
-            found_idx = i;
-            break;
-        }
-        i = i + 1;
-    }
-    if found_idx < 0 { return; }
-    self.borrow_of.remove(found_idx);
+    var i: i64 = HashMap_get(self.bo_ix, borrower);
+    if i <= 0 { return; }
+    var borrowed: str = self.borrow_of.get(i - 1).borrowed;
+    self.borrow_of.get(i - 1).borrower = "";
+    HashMap_remove(self.bo_ix, borrower);
     // Remove borrower from shared_borrows set.
     shared_borrows_remove_borrower(self, borrowed, borrower);
     // Clear mut_borrow if it points to this borrower.
@@ -1076,66 +1128,42 @@ fn extract_field_path(expr: Expr) -> OptStr {
 
 // --- Borrow state queries -------------------------------------------------
 
-fn has_shared_borrow(self: &BorrowChecker, var: str) -> bool {
-    var i: i64 = 0;
-    while i < self.shared_borrows.len() {
-        if self.shared_borrows.get(i).key == var {
-            return self.shared_borrows.get(i).borrowers.len() > 0;
-        }
-        i = i + 1;
+// Add `delta` to the live count of `key` and every dotted prefix of it.
+// Called on every transition of the live-borrower count under `key`
+// (CS3): keeps the *_pfx maps exact so inclusive queries are O(1).
+fn bc_pfx_add(map: i64, key: str, delta: i64) -> void {
+    var p: str = key;
+    while true {
+        HashMap_insert(map, p, HashMap_get(map, p) + delta);
+        var dot: i64 = str_rfind(p, ".");
+        if dot < 0 { return; }
+        p = str_slice(p, 0, dot);
     }
-    return false;
+}
+
+fn has_shared_borrow(self: &BorrowChecker, var: str) -> bool {
+    var i: i64 = HashMap_get(self.sb_ix, var);
+    if i <= 0 { return false; }
+    return self.shared_borrows.get(i - 1).borrowers.len() > 0;
 }
 
 fn has_mut_borrow(self: &BorrowChecker, var: str) -> bool {
-    var i: i64 = 0;
-    while i < self.mut_borrow.len() {
-        var k: str = self.mut_borrow.get(i).key;
-        if k == var {
-            var b: OptStr = self.mut_borrow.get(i).borrower;
-            match b {
-                OptStr::Some(_) => { return true; }
-                OptStr::None => { return false; }
-            }
-        }
-        i = i + 1;
+    var i: i64 = HashMap_get(self.mb_ix, var);
+    if i <= 0 { return false; }
+    match self.mut_borrow.get(i - 1).borrower {
+        OptStr::Some(_) => { return true; }
+        OptStr::None => { return false; }
     }
-    return false;
 }
 
 // Check if any shared borrow exists on var OR any field path under it.
 fn has_shared_borrow_inclusive(self: &BorrowChecker, var: str) -> bool {
-    if has_shared_borrow(self, var) { return true; }
-    var prefix: str = var + ".";
-    var i: i64 = 0;
-    while i < self.shared_borrows.len() {
-        var path: str = self.shared_borrows.get(i).key;
-        if str_starts_with(path, prefix) {
-            if self.shared_borrows.get(i).borrowers.len() > 0 {
-                return true;
-            }
-        }
-        i = i + 1;
-    }
-    return false;
+    return HashMap_get(self.sb_pfx, var) > 0;
 }
 
 // Check if any mutable borrow exists on var OR any field path under it.
 fn has_mut_borrow_inclusive(self: &BorrowChecker, var: str) -> bool {
-    if has_mut_borrow(self, var) { return true; }
-    var prefix: str = var + ".";
-    var i: i64 = 0;
-    while i < self.mut_borrow.len() {
-        var path: str = self.mut_borrow.get(i).key;
-        if str_starts_with(path, prefix) {
-            match self.mut_borrow.get(i).borrower {
-                OptStr::Some(_) => { return true; }
-                OptStr::None => {}
-            }
-        }
-        i = i + 1;
-    }
-    return false;
+    return HashMap_get(self.mb_pfx, var) > 0;
 }
 
 // Check if any shared borrow exists on a PREFIX of path.
@@ -1164,111 +1192,107 @@ fn has_mut_borrow_on_prefix(self: &BorrowChecker, path: str) -> bool {
 
 // --- shared_borrows / mut_borrow map helpers ------------------------------
 
+// Tombstone instead of remove: clearing the payload keeps vec positions
+// (and the *_ix maps) stable. has_* treats an empty payload as absent.
 fn shared_borrows_remove(self: &mut BorrowChecker, key: str) -> void {
-    var i: i64 = 0;
-    while i < self.shared_borrows.len() {
-        if self.shared_borrows.get(i).key == key {
-            self.shared_borrows.remove(i);
-            return;
-        }
-        i = i + 1;
+    var i: i64 = HashMap_get(self.sb_ix, key);
+    if i <= 0 { return; }
+    var n: i64 = self.shared_borrows.get(i - 1).borrowers.len();
+    if n > 0 {
+        self.shared_borrows.get(i - 1).borrowers.clear();
+        bc_pfx_add(self.sb_pfx, key, 0 - n);
     }
 }
 
 fn mut_borrow_remove(self: &mut BorrowChecker, key: str) -> void {
-    var i: i64 = 0;
-    while i < self.mut_borrow.len() {
-        if self.mut_borrow.get(i).key == key {
-            self.mut_borrow.remove(i);
-            return;
+    var i: i64 = HashMap_get(self.mb_ix, key);
+    if i <= 0 { return; }
+    match self.mut_borrow.get(i - 1).borrower {
+        OptStr::Some(_) => {
+            self.mut_borrow.get(i - 1).borrower = OptStr::None;
+            bc_pfx_add(self.mb_pfx, key, 0 - 1);
         }
-        i = i + 1;
+        OptStr::None => {}
     }
 }
 
 fn shared_borrows_remove_borrower(self: &mut BorrowChecker, borrowed: str, borrower: str) -> void {
-    var i: i64 = 0;
-    while i < self.shared_borrows.len() {
-        if self.shared_borrows.get(i).key == borrowed {
-            var borrowers: Vec<str> = self.shared_borrows.get(i).borrowers;
-            var j: i64 = 0;
-            while j < borrowers.len() {
-                if borrowers.get(j) == borrower {
-                    self.shared_borrows.get(i).borrowers.remove(j);
-                    return;
-                }
-                j = j + 1;
-            }
+    var i: i64 = HashMap_get(self.sb_ix, borrowed);
+    if i <= 0 { return; }
+    var borrowers: Vec<str> = self.shared_borrows.get(i - 1).borrowers;
+    var j: i64 = 0;
+    while j < borrowers.len() {
+        if borrowers.get(j) == borrower {
+            self.shared_borrows.get(i - 1).borrowers.remove(j);
+            bc_pfx_add(self.sb_pfx, borrowed, 0 - 1);
             return;
         }
-        i = i + 1;
+        j = j + 1;
     }
 }
 
 fn mut_borrow_clear_if_borrower(self: &mut BorrowChecker, borrowed: str, borrower: str) -> void {
-    var i: i64 = 0;
-    while i < self.mut_borrow.len() {
-        if self.mut_borrow.get(i).key == borrowed {
-            match self.mut_borrow.get(i).borrower {
-                OptStr::Some(b) => {
-                    if b == borrower {
-                        self.mut_borrow.get(i).borrower = OptStr::None;
-                    }
-                }
-                OptStr::None => {}
+    var i: i64 = HashMap_get(self.mb_ix, borrowed);
+    if i <= 0 { return; }
+    match self.mut_borrow.get(i - 1).borrower {
+        OptStr::Some(b) => {
+            if b == borrower {
+                self.mut_borrow.get(i - 1).borrower = OptStr::None;
+                bc_pfx_add(self.mb_pfx, borrowed, 0 - 1);
             }
-            return;
         }
-        i = i + 1;
+        OptStr::None => {}
     }
 }
 
 fn shared_borrows_get_or_create(self: &mut BorrowChecker, key: str) -> void {
-    var i: i64 = 0;
-    while i < self.shared_borrows.len() {
-        if self.shared_borrows.get(i).key == key {
-            return;
-        }
-        i = i + 1;
-    }
+    if HashMap_get(self.sb_ix, key) > 0 { return; }
     self.shared_borrows.push(SharedBorrowEntry_new(key));
+    HashMap_insert(self.sb_ix, key, self.shared_borrows.len());
 }
 
 fn shared_borrows_add_borrower(self: &mut BorrowChecker, key: str, borrower: str) -> void {
-    shared_borrows_get_or_create(self, key);
-    var i: i64 = 0;
-    while i < self.shared_borrows.len() {
-        if self.shared_borrows.get(i).key == key {
-            self.shared_borrows.get(i).borrowers.push(borrower);
-            return;
-        }
-        i = i + 1;
+    var i: i64 = HashMap_get(self.sb_ix, key);
+    if i <= 0 {
+        self.shared_borrows.push(SharedBorrowEntry_new(key));
+        i = self.shared_borrows.len();
+        HashMap_insert(self.sb_ix, key, i);
     }
+    self.shared_borrows.get(i - 1).borrowers.push(borrower);
+    bc_pfx_add(self.sb_pfx, key, 1);
 }
 
 fn mut_borrow_set(self: &mut BorrowChecker, key: str, borrower: OptStr) -> void {
-    var i: i64 = 0;
-    while i < self.mut_borrow.len() {
-        if self.mut_borrow.get(i).key == key {
-            self.mut_borrow.get(i).borrower = borrower;
-            return;
+    var i: i64 = HashMap_get(self.mb_ix, key);
+    if i <= 0 {
+        self.mut_borrow.push(MutBorrowEntry_new(key, borrower));
+        HashMap_insert(self.mb_ix, key, self.mut_borrow.len());
+        match borrower {
+            OptStr::Some(_) => { bc_pfx_add(self.mb_pfx, key, 1); }
+            OptStr::None => {}
         }
-        i = i + 1;
+        return;
     }
-    self.mut_borrow.push(MutBorrowEntry_new(key, borrower));
+    var e: i64 = i - 1;
+    match self.mut_borrow.get(e).borrower {
+        OptStr::Some(_) => { bc_pfx_add(self.mb_pfx, key, 0 - 1); }
+        OptStr::None => {}
+    }
+    self.mut_borrow.get(e).borrower = borrower;
+    match borrower {
+        OptStr::Some(_) => { bc_pfx_add(self.mb_pfx, key, 1); }
+        OptStr::None => {}
+    }
 }
 
 fn borrow_of_add(self: &mut BorrowChecker, borrower: str, borrowed: str, is_mut: bool, line: i64) -> void {
-    // Remove existing entry for this borrower if any (reassignment).
-    var i: i64 = 0;
-    while i < self.borrow_of.len() {
-        if self.borrow_of.get(i).borrower == borrower {
-            self.borrow_of.remove(i);
-            break;
-        }
-        i = i + 1;
+    // Tombstone an existing entry for this borrower (reassignment).
+    var old: i64 = HashMap_get(self.bo_ix, borrower);
+    if old > 0 {
+        self.borrow_of.get(old - 1).borrower = "";
     }
     self.borrow_of.push(BorrowOfEntry_new(borrower, borrowed, is_mut, line));
+    HashMap_insert(self.bo_ix, borrower, self.borrow_of.len());
     // Bucket for NLL release: dies at the statement after its last use.
     var last: i64 = last_use_get(self, borrower);
     if last >= 0 && self.dead_at.len() > 0 {
@@ -1286,7 +1310,8 @@ fn holder_note(self: &BorrowChecker, path: str, want: i64) -> str {
     var i: i64 = 0;
     while i < self.borrow_of.len() {
         var e: BorrowOfEntry = self.borrow_of.get(i);
-        var related: bool = e.borrowed == path || str_starts_with(e.borrowed, path + ".") || str_starts_with(path, e.borrowed + ".");
+        // "" is a tombstone (released or reassigned borrower); skip it.
+        var related: bool = e.borrower != "" && (e.borrowed == path || str_starts_with(e.borrowed, path + ".") || str_starts_with(path, e.borrowed + "."));
         var kind_ok: bool = (want == 1) == e.is_mut;
         if related && kind_ok {
             if best < 0 {
