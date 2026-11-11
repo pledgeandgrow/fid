@@ -337,26 +337,55 @@ This is the race we can win outright, since no rival's speed comes for free.
       Done: ~360 ms (Nov 2, fidesc); ~370 ms internal build time today
       (`fid emit hello.fd --target x86_64-linux`, ~780 ms wall incl. process
       start; type check ~85, borrow ~170, mid-end ~170). Left: the 0.1 s
-      stretch — needs CS2's full cache (comptime alone is ~90 ms) plus
-      backend work; even with all bodies skipped the merged stdlib is
-      iterated per decl.
+      stretch — CS2's binary artifact now skips the parse+merge (stdlib
+      frontend ~1033 → ~210 ms at -O0; ~226 ms → ~40-80 ms expected at
+      -O2), but the merged stdlib is still iterated per decl downstream
+      (tc register, lints, mono) and the mid-end needs CS6's format work.
       Nov 8-9 (`fid`): native code only for what main reaches (and what it
       names), iropt on those only: hello's executable 127 KB -> 33 KB. With
       the compiler itself built at -O2 (split into 8 units, `split-c`) hello
       takes 1.7 s instead of 6.4 s (type check 0.36 s, borrow check 0.19,
       lowering 0.45, native code 0.09; `[prof]` lines on `emit`).
-- [~] CS2. Cache the checked stdlib in a binary form, not re-parsed each build (L).
+- [x] CS2. Cache the checked stdlib in a binary form, not re-parsed each build (L).
       Done: trusted-module fast path — the baked-in core.fd and backend runtime
       skip per-function body checks and error reporting (~26 ms off hello's
       frontend; FIDES_CHECK_STDLIB restores full checking). Comptime pass
       skips its 8+4 bounded re-clone iterations entirely when the program
       defines no `comptime pf` functions (stdlib has none): 91 ms → 14 ms on
       hello, ~77 ms off the frontend (196 → ~98 ms); emit 387 → ~301 ms.
-      Left: a real binary artifact skipping parse and the whole-program
-      analyses, and persistent caching of stdlib comptime output.
       Nov 4 (release D9): `fid` type-checks `core.fd` once per (compiler,
       `core.fd`) pair; a stamp in the temp directory skips its bodies on later
       builds (`FIDES_CHECK_CORE=1` forces the check).
+      Binary AST artifact (this session, `compiler/ast_ser.fd` + the
+      `astcache_*` glue in compiler.fd): the merged core+runtime `Program`
+      persists as a versioned binary file (magic, format version 2, the
+      lib_hash fold over every source file's hash plus the compiler's own
+      hash — the same key as the D9 stamp). The file stores two Programs:
+      core alone (what `get_cached_stdlib`/`reach_keep_set` sees) and the
+      merged program the pipeline consumes. ~1,700 lines of codecs cover all
+      53 AST types (Type 28 variants, Expr 40, Pattern 7, Stmt 33, all 17
+      declaration lists) — complete by construction, not a public-decl
+      subset. Artifacts live in the temp dir named by the key hash;
+      `FID_ASTCACHE=<file>` overrides. A source edit, a rebuilt compiler or
+      a corrupt/truncated file misses and falls back to the parse path
+      (verified: byte-corrupting the stored hash and truncating to 2–5 KB
+      both reparse and re-save). On the miss path the artifact is written
+      once; `p_file_write_vec`/`p_file_read_bytes` carry raw bytes since
+      counted strings can't hold NULs.
+      Measured (fid-dev at -O0, hello emit): `stdlib` mark 415 ms → ~210 ms
+      (file reads + hashes + deser of the 619 KB artifact) and `runtime`
+      618 ms → 0 ms — stdlib frontend ~1,033 ms → ~210 ms (~5x, ~820 ms
+      saved). Emitted executables byte-identical hit vs miss on every test
+      (hello, struct, test_borrowed_str). On the -O2 release compiler the
+      same skip applies to a ~226 ms parse+merge — expect deser there of
+      ~40-80 ms. The 210 ms that remains on hits is hash Source + file IO +
+      the deserializer itself; shrinking it further is format work, not
+      correctness.
+      Left: nothing structural — the artifact is complete and verified
+      equivalent. The <100 ms hello stretch and CS4's <10 s still need the
+      mid-end side (CS6's per-function native artifacts are the backend
+      half; the text cache format there costs ~20 s to load at -O0 and
+      wants the same byte treatment).
 - [~] CS3. Borrow checking linear in program size (release D8) (M). On the
       compiler itself: 16 s (Nov 6).
       Nov 8: the reference-escape check iterates its fixpoint only over the
@@ -366,10 +395,16 @@ This is the race we can win outright, since no rival's speed comes for free.
       Nov (later): `release_dead_borrows` no longer scans every live borrow
       per statement — borrows are bucketed by the statement after their
       last_use (`dead_at`), released in one batched pass with per-call
-      key->index maps. Left: keyed per-op lookups and the field-prefix
-      "inclusive" scans still walk the borrow vecs (a per-vec HashMap index
-      was tried and measured slower under interleaved push/remove — index
-      thrash; and NLL release bookkeeping still costs per-release scans).
+      key->index maps.
+      Later: the remaining keyed scans are gone — borrow entries are
+      tombstones (borrowers.clear() / borrower=None instead of Vec.remove,
+      so positions never move) behind eagerly maintained maps: sb_ix /
+      mb_ix / bo_ix for exact queries and sb_pfx / mb_pfx prefix-count maps
+      for the "inclusive" queries (prefix = range, still not hashable as an
+      exact key). `declare_var`'s per-var release went O(live borrows) ->
+      O(1). Borrow-dense synthetic (500 vars, 1500 borrows): ~2.3 s -> ~135
+      ms (~17x); borrowck of the compiler is ~0.16-0.6 s of a ~5 s check.
+      All expected-fail borrow diagnostics byte-identical.
 - [~] CS4. Self-compile under 60 s (release), then under 10 s (L). Nov 9: 74 s
       with the compiler built at -O2 (8 split units), against 229 s at -O0;
       the -O2 compiler emits the same C (fixpoint). Of the 74 s: type check
@@ -380,9 +415,25 @@ This is the race we can win outright, since no rival's speed comes for free.
       --time` reports type check ~23-30 s on a loaded machine (was ~29 s
       before the CS8 tables on a comparable run — noisy machine, treat
       ±20%). `fid-dev.exe` is -O0: expect ~11x inflation there.
-      Next: the <10 s stretch needs CS2's binary stdlib artifact and
-      cheaper merge+desugar/import work (together ~30 s of check).
-- [ ] CS5. Parallel front end and code generation on all cores (L).
+      Next: the <10 s stretch — CS2's artifact is landed (stdlib parse+merge
+      skipped on hit; deser ~40-80 ms expected at -O2), so what remains is
+      cheaper merge+desugar/import/typecheck work (together ~30 s of check)
+      plus a binary format for CS6's native cache.
+- [~] CS5. Parallel front end and code generation on all cores (L).
+      Done (borrowck slice, opt-in): `FID_PAR=N` splits the borrow check's
+      function set across N workers (own `BorrowChecker` each, chunks merged
+      in order — diagnostics byte-identical to sequential, verified on an
+      80-function borrow-error file). Units pass as chunk bounds over a
+      shared read-only `g_bc_units` (spawn args must be `@send`; `Vec<Func>`
+      is not). The spawn table `p_thread_entries` was raised 2048 -> 8192 in
+      both codegens — the compiler's own ~4.9k functions overran it
+      silently. Measured: borrowck of the compiler 7.9 s seq vs 10.1 s par
+      (-O0, loaded machine) — a net loss: borrowck is now a small share of
+      check post-CS3, and OS-thread spawn + join overhead exceeds it. Left
+      (the real targets): imports and escape+secrecy are the same per-unit
+      shape and are the larger phases (imports ~1.3 s, escape ~1.0 s,
+      typecheck ~1.3 s vs borrowck ~0.16 s on a quiet check); imports has
+      name-set ordering constraints.
 - [~] CS6. Incremental native builds per function, under 100 ms for a one-line
       change (L).
       Done: whole-output incremental caching on `emit`, `ccompile`, and `build`
@@ -390,6 +441,27 @@ This is the race we can win outright, since no rival's speed comes for free.
       file hash; unchanged inputs print "is up to date" and do no work, and a
       touched dep correctly invalidates. An in-memory L2 IR cache keys modules
       by source hash within a process. Left: per-function native code reuse —
+      the artifact machinery now exists (below) but its text format makes
+      the load dominate.
+      Artifact cache (opt-in, `FID_FNCACHE=<path>`): per-function record of
+      pre-resolve bytes + symbolic fixups keyed by a content hash of the
+      whole `IrFunction` (instructions, blocks, value metas, flags) plus a
+      module/config salt (layouts, globals, externs, trait tables, function
+      set, arch, pass toggles, libfacts). On a key+salt hit the function is
+      a synthetic record (same MIR length, trap/call counts, and call edges —
+      so postorder and the cold splitter see the same shape); at emit its
+      bytes replay at the new offset and fixups re-register against the live
+      label space (fn names, string/global data, singletons, and lazily
+      re-created panic-line stubs). Verified: miss and uncached emits are
+      byte-identical (zero cost when off); hit emits are deterministic
+      (converged images equal across runs) and run correctly — layouts can
+      legitimately differ from all-fresh images since replays relink.
+      Left: the text row format (hex bytes + decimal fields) costs ~20 s to
+      parse at -O0 for a 550 KB / 144-fn file — a net loss until the format
+      is binary (`ast_ser.fd`'s byte codec is the model: Vec<i64> payload +
+      `p_file_write_vec`, no NUL-through-str); also cold-split fidelity is
+      approximate (order can shift) and cached functions get no line-table
+      rows. The frontend half is done (CS2).
       a one-line change still recompiles the whole binary (~0.5 s on hello vs
       the 100 ms target).
 - [x] CS7. A fast debug mode with no optimizer, and a release mode (S).
@@ -792,6 +864,16 @@ owning what we ship.
       pass (arena, db, the four uni_n* normalizers). Left: writing examples
       for the remaining ~6200 items — a content task, not a tooling task.
       examples (`scribe` renders docs only).
+- [x] SL20. OS-development primitives: firmware tables, buses, memory (M).
+      Done (Nov 10): the parse/layout halves a kernel needs, pure Fides so
+      they run anywhere — `elf.fd` (ELF64 ehdr/phdr/shdr + names), `acpi.fd`
+      (RSDP scan, checksums, SDT headers, MADT/MCFG), `pci.fd` (config
+      decode, BAR classify, capability list, CF8), `virtio.fd` (split-queue
+      layout, desc/avail/used rings, free chains), `multiboot.fd` (MB2 tags,
+      e820 map, framebuffer), `fdt.fd` (Device Tree), `uart.fd` (16550),
+      `scancode.fd` (PS/2 set-1), `pmm.fd` (bitmap PMM + x86-64 paging),
+      `slab.fd`. `test_os_stdlib.fd` passes on interp and native. Port and
+      MMIO access stays platform driver code by design.
 
 **Acceptance:** a real web service needs no package outside the stdlib.
 
