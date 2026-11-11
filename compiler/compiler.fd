@@ -40,6 +40,7 @@ use compiler::pe;
 use compiler::pe_ir;
 use compiler::inc;
 use compiler::interp;
+use compiler::ast_ser;
 use compiler::green_thread;
 use compiler::elf64;
 use compiler::linker;
@@ -1105,6 +1106,106 @@ pub fn get_cached_stdlib() -> OptProgram {
     }
 }
 
+// --- CS2: binary checked-stdlib artifact ------------------------------------
+// The merged (core + runtime) Program persists to a versioned binary file.
+// The key is the same lib_hash the checked-library stamp uses (a fold over
+// every source file's hash) plus this compiler's hash, so a changed source,
+// a changed runtime file or a rebuilt compiler misses and the parse path
+// runs. The artifact stores two Programs: core alone (what get_cached_stdlib
+// returns for reach_keep_set) and the merged program the pipeline merges.
+var g_astcache_hit: bool = false;
+var g_astcache_lib_hash: i64 = 0;
+var g_astcache_rt_files: Vec<str> = Vec::new();
+var g_astcache_rt_raws: Vec<str> = Vec::new();
+
+fn astcache_path(lib_hash: i64) -> str {
+    var over: str = env_or_empty("FID_ASTCACHE");
+    if str_len(over) > 0 { return over; }
+    var dir: str = env_or_empty("TEMP");
+    if dir == "" { dir = env_or_empty("TMPDIR"); }
+    if dir == "" { dir = "/tmp"; }
+    var name: str = int_to_str(hash_source("ast2 " + int_to_str(lib_hash) + " " + int_to_str(inc_compiler_hash())));
+    if str_starts_with(name, "-") { name = "n" + str_slice(name, 1, str_len(name)); }
+    return dir + "/fid-ast-" + name + ".bin";
+}
+
+fn astcache_save(lib_hash: i64, core_p: Program, merged_p: Program) {
+    var b: AwBuf = awbuf_new();
+    aw_i64(&mut b, 4473414);
+    aw_i64(&mut b, 2);
+    aw_i64(&mut b, lib_hash);
+    aw_program(&mut b, core_p);
+    aw_program(&mut b, merged_p);
+    p_file_write_vec(astcache_path(lib_hash), b.bytes);
+}
+
+// Load stdlib: reads core + the runtime files once (the lib_hash fold needs
+// them anyway), returns the merged Program on an artifact hit or the parsed
+// core Program on a miss, in which case the caller runs the runtime merge
+// over g_astcache_rt_raws.
+fn astcache_load() -> OptProgram {
+    g_astcache_hit = false;
+    var rt_files: Vec<str> = Vec::new();
+    if g_pe_runtime_merge {
+        rt_files.push("base.fd");
+        if g_native_rt_dir == "pe_runtime" {
+            rt_files.push("conc.fd");
+            rt_files.push("tensor.fd");
+            rt_files.push("data.fd");
+        } else {
+            // Linux: its own base, threads, system calls; JSON, HTTP, the
+            // in-memory DB and tensors are the Windows runtime's Fides code.
+            rt_files.push("conc.fd");
+            rt_files.push("sys.fd");
+            rt_files.push("math.fd");
+            rt_files.push("../pe_runtime/data.fd");
+            rt_files.push("../pe_runtime/tensor.fd");
+            if g_native_rt_win { rt_files.push("win.fd"); }
+        }
+    }
+    var core_raw: str = p_file_read(c_path_join(stdlib_dir(), "core.fd"));
+    if (core_raw as i64) == 0 { return OptProgram::None; }
+    g_stdlib_hash = hash_source(core_raw);
+    var lib_hash: i64 = g_stdlib_hash;
+    g_astcache_rt_files = rt_files;
+    g_astcache_rt_raws = Vec::new();
+    var rti: i64 = 0;
+    while rti < rt_files.len() {
+        var rt_path: str = pe_runtime_path(rt_files.get(rti));
+        inc_record_file(rt_path);
+        var rt_raw: str = p_file_read(rt_path);
+        if (rt_raw as i64) == 0 {
+            p_eprint_str("[build] PE runtime source not found: " + rt_path + "\n");
+            return OptProgram::None;
+        }
+        lib_hash = hash_source(int_to_str(lib_hash) + " " + rt_files.get(rti) + " " + int_to_str(hash_source(rt_raw)));
+        g_astcache_rt_raws.push(rt_raw);
+        rti = rti + 1;
+    }
+    g_astcache_lib_hash = lib_hash;
+    var path: str = astcache_path(lib_hash);
+    if p_file_exists(path) != 0 {
+        var vb: Vec<i64> = p_file_read_bytes(path);
+        if vb.len() > 24 {
+            var r: ArBuf = arbuf_new(vb);
+            var magic: i64 = ar_i64(&mut r);
+            var ver: i64 = ar_i64(&mut r);
+            var stored: i64 = ar_i64(&mut r);
+            if magic == 4473414 && ver == 2 && stored == lib_hash {
+                var core_p: Program = ar_program(&mut r);
+                var merged_p: Program = ar_program(&mut r);
+                if r.ok {
+                    g_stdlib_cache = OptProgram::Some(core_p);
+                    g_stdlib_cache_init = true;
+                    g_astcache_hit = true;
+                    return OptProgram::Some(merged_p);
+                }
+            }
+        }
+    }
+    return get_cached_stdlib();
+}
+
 /// This is the main entry point for the compiler pipeline:
 ///   parse stdlib -> parse user -> resolve imports -> merge -> cfg filter ->
 ///   derive -> desugar layers/models -> comptime -> typecheck -> borrowck -> mono
@@ -1118,8 +1219,10 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
     }
     // core is read from disk here (Rust embeds it): an input like any other
     inc_record_file(c_path_join(stdlib_dir(), "core.fd"));
-    // Parse stdlib first (use cache if available)
-    var stdlib_opt: OptProgram = get_cached_stdlib();
+    // Parse stdlib first (use cache if available); CS2: astcache_load
+    // returns the merged core+runtime Program straight from the binary
+    // artifact when its lib_hash key matches.
+    var stdlib_opt: OptProgram = astcache_load();
     match stdlib_opt {
         OptProgram::None => {
             p_eprint_str("[build] FAILED: stdlib/core.fd not found or parse error\n");
@@ -1130,7 +1233,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
             // The checked-library stamp (release D9) covers core and the
             // runtime merged into it: a library checked clean once is not
             // checked again until core, a runtime file or the compiler changes
-            var lib_hash: i64 = g_stdlib_hash;
+            var lib_hash: i64 = g_astcache_lib_hash;
             t_t = time_mark("stdlib", t_t);
             p_eprint_str("[build] Stdlib parsed ok (cached). Extracting names...\n");
             // Extract stdlib struct/enum names for parser
@@ -1151,33 +1254,13 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
             // (pe_runtime/*.fd): merged into core before the user program
             // is parsed — the same merge as Rust's
             // build_program_with_runtime (core's definitions win).
-            if g_pe_runtime_merge {
-                var rt_files: Vec<str> = Vec::new();
-                rt_files.push("base.fd");
-                if g_native_rt_dir == "pe_runtime" {
-                    rt_files.push("conc.fd");
-                    rt_files.push("tensor.fd");
-                    rt_files.push("data.fd");
-                } else {
-                    // Linux: its own base, threads, system calls; JSON,
-                    // HTTP, the in-memory DB and tensors are the Windows
-                    // runtime's Fides code, shared
-                    rt_files.push("conc.fd");
-                    rt_files.push("sys.fd");
-                    rt_files.push("math.fd");
-                    rt_files.push("../pe_runtime/data.fd");
-                    rt_files.push("../pe_runtime/tensor.fd");
-                    if g_native_rt_win { rt_files.push("win.fd"); }
-                }
+            // Skipped on an artifact hit: stdlib arrives already merged.
+            if g_pe_runtime_merge && !g_astcache_hit {
+                var rt_files: Vec<str> = g_astcache_rt_files;
+                var rt_raws: Vec<str> = g_astcache_rt_raws;
                 var rti: i64 = 0;
                 while rti < rt_files.len() {
-                    var rt_path: str = pe_runtime_path(rt_files.get(rti));
-                    inc_record_file(rt_path);
-                    var rt_raw: str = p_file_read(rt_path);
-                    if (rt_raw as i64) == 0 {
-                        return ResultProgram::Err(c_vec1("PE runtime source not found: " + rt_path));
-                    }
-                    lib_hash = hash_source(int_to_str(lib_hash) + " " + rt_files.get(rti) + " " + int_to_str(hash_source(rt_raw)));
+                    var rt_raw: str = rt_raws.get(rti);
                     var rt_lex: Lexer = Lexer::new(rt_raw);
                     var rt_tokens: Vec<Token> = rt_lex.tokenize();
                     var rt_parser: Parser = Parser_with_names(rt_tokens, struct_names, enum_names);
@@ -1202,6 +1285,9 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     }
                     rti = rti + 1;
                 }
+                // First full parse under this key: persist the artifact for
+                // later compiles (stdlib_parsed is the core-only Program).
+                astcache_save(lib_hash, stdlib_parsed, stdlib);
             }
 
             t_t = time_mark("runtime", t_t);

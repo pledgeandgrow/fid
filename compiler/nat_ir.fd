@@ -30,6 +30,8 @@ use compiler::ir;
 use compiler::pe_ir_stubs;
 use compiler::nat_enc;
 use compiler::checks;
+use compiler::inc;
+use compiler::ast_ser;
 
 // Integer compare kinds
 const NCC_EQ: i64 = 0;
@@ -184,6 +186,20 @@ pub struct NatGen {
     // none), so a chain of float operations stays in xmm (`xmmcache`)
     pub x0_reg: i64,
     pub x1_reg: i64,
+    // CS6: per-function native artifact cache — opt-in via FID_FNCACHE=<path>.
+    // nc_old holds entries read from disk; nc_new entries captured this run.
+    pub nc_on: bool,
+    pub nc_path: str,
+    pub nc_old: Vec<NcEntry>,
+    pub nc_ix: i64,    // name -> index into nc_old + 1
+    pub nc_new: Vec<NcEntry>,
+    pub nc_hit: i64,   // name -> index into nc_old + 1 (content key matched)
+    pub nc_key: i64,   // name -> content key computed this run
+    pub nc_salt: i64,
+    pub label_id: i64, // label -> "F:name" / "S:content" / "G:singleton"
+    pub fn_label_names: Vec<str>, // fn_labels keys in insertion order
+    pub pl_names: Vec<str>,       // pl_keys keys in insertion order
+    pub nc_hit_names: Vec<str>,
 }
 
 /// The input file and its functions' names (comma-separated), set by
@@ -262,6 +278,18 @@ pub fn NatGen_new(arch: i64) -> NatGen {
         pl_list: Vec::new(),
         x0_reg: 0 - 1,
         x1_reg: 0 - 1,
+        nc_on: false,
+        nc_path: "",
+        nc_old: Vec::new(),
+        nc_ix: HashMap_new(),
+        nc_new: Vec::new(),
+        nc_hit: HashMap_new(),
+        nc_key: HashMap_new(),
+        nc_salt: 0,
+        label_id: HashMap_new(),
+        fn_label_names: Vec::new(),
+        pl_names: Vec::new(),
+        nc_hit_names: Vec::new(),
     };
     if arch == NAT_RV64 {
         // t1, t2, t3, t4 for values; t0 and t5 for addresses; t6 far jumps
@@ -918,6 +946,7 @@ fn ng_fn_label(g: &mut NatGen, name: str) -> i64 {
     if !ng_has_fn(g, name) { return 0; }
     var l: i64 = NatEnc_label(&mut g.e);
     HashMap_insert(g.fn_labels, name, l);
+    g.fn_label_names.push(name);
     g.queue.push(name);
     return l;
 }
@@ -2928,34 +2957,60 @@ fn ng_mir_finish(g: &mut NatGen) -> str {
     while wi < cold.len() { order.push(cold.get(wi)); wi = wi + 1; }
     var folded: i64 = HashMap_new();
     var fold_on: bool = ng_on("fold");
+    if g.nc_on { nc_label_ids(g); }
     var oi: i64 = 0;
     while oi < order.len() {
         var rec2: NatFnRec = g.recs.get(order.get(oi));
         g.cur_name = rec2.name;
-        var al: NatAlloc = ng_mir_alloc(g, &rec2);
-        if al.err != "" { return "native backend: register allocation check failed: " + al.err; }
-        HashMap_insert(g.fn_mask, rec2.name, al.mask);
-        var label: i64 = HashMap_get(g.fn_labels, rec2.name);
-        var key: str = "";
-        if fold_on { key = ng_mir_key(&rec2, &al); }
-        if fold_on && HashMap_contains(folded, key) {
-            // The same bytes are already in the image: this name points there
-            g.e.labels.set(label, HashMap_get(folded, key));
-            g.n_folded = g.n_folded + 1;
-        } else {
+        var hix: i64 = nc_hit_at(g, rec2.name);
+        if hix != 0 {
+            // CS6: a cache hit — the recorded bytes replay at this offset and
+            // their symbolic fixups re-register against this image's labels.
+            var ent: NcEntry = g.nc_old.get(hix - 1);
+            var label2: i64 = HashMap_get(g.fn_labels, rec2.name);
             NatEnc_align(&mut g.e, 4);
-            NatEnc_place(&mut g.e, label);
-            if fold_on { HashMap_insert(folded, key, g.e.code.len()); }
+            NatEnc_place(&mut g.e, label2);
             g.placed_fns.push(rec2.name);
-            var pre_sz: i64 = g.e.code.len();
-            ng_mir_emit(g, &rec2, &al);
-            // WP20: the backend's half of the facts artifact — the callee's
-            // clobber mask and emitted size, which iropt cannot see.
+            var fbase: i64 = g.e.code.len();
+            var rerr: str = nc_replay(g, &ent);
+            if rerr != "" { return rerr; }
+            HashMap_insert(g.fn_mask, rec2.name, ent.mask);
+            if fold_on && str_len(ent.fold_key) > 0 {
+                HashMap_insert(folded, ent.fold_key, fbase);
+            }
             if (g.fact_path as i64) != 0 && str_len(g.fact_path) > 0 {
-                p_file_append(g.fact_path, "ext " + rec2.name + " mask=" + int_to_str(al.mask)
-                    + " size=" + int_to_str(g.e.code.len() - pre_sz) + "\n");
+                p_file_append(g.fact_path, "ext " + rec2.name + " mask=" + int_to_str(ent.mask)
+                    + " size=" + int_to_str(ent.bytes.len()) + "\n");
             }
             ng_line_close(g);
+        } else {
+            var al: NatAlloc = ng_mir_alloc(g, &rec2);
+            if al.err != "" { return "native backend: register allocation check failed: " + al.err; }
+            HashMap_insert(g.fn_mask, rec2.name, al.mask);
+            var label: i64 = HashMap_get(g.fn_labels, rec2.name);
+            var key: str = "";
+            if fold_on { key = ng_mir_key(&rec2, &al); }
+            if fold_on && HashMap_contains(folded, key) {
+                // The same bytes are already in the image: this name points there
+                g.e.labels.set(label, HashMap_get(folded, key));
+                g.n_folded = g.n_folded + 1;
+            } else {
+                NatEnc_align(&mut g.e, 4);
+                NatEnc_place(&mut g.e, label);
+                if fold_on { HashMap_insert(folded, key, g.e.code.len()); }
+                g.placed_fns.push(rec2.name);
+                var pre_sz: i64 = g.e.code.len();
+                var pre_fx: i64 = g.e.fixups.len();
+                ng_mir_emit(g, &rec2, &al);
+                if g.nc_on { var cap_ok: bool = nc_capture(g, &rec2, pre_sz, pre_fx, key); }
+                // WP20: the backend's half of the facts artifact — the callee's
+                // clobber mask and emitted size, which iropt cannot see.
+                if (g.fact_path as i64) != 0 && str_len(g.fact_path) > 0 {
+                    p_file_append(g.fact_path, "ext " + rec2.name + " mask=" + int_to_str(al.mask)
+                        + " size=" + int_to_str(g.e.code.len() - pre_sz) + "\n");
+                }
+                ng_line_close(g);
+            }
         }
         oi = oi + 1;
     }
@@ -3460,6 +3515,7 @@ fn ng_gen_primitives_x64_common(g: &mut NatGen) {
     // nat_start_sp()
     var ssp: i64 = NatEnc_label(&mut g.e);
     HashMap_insert(g.fn_labels, "nat_start_sp", ssp);
+    g.fn_label_names.push("nat_start_sp");
     NatEnc_place(&mut g.e, ssp);
     x64_load_label(&mut g.e, 7, g.start_sp_label);
     x64_ret(&mut g.e);
@@ -4587,6 +4643,7 @@ fn ng_gen_primitives(g: &mut NatGen) {
     // nat_syscall(n, a, b, c, d, e, f) -> result
     var sys: i64 = NatEnc_label(&mut g.e);
     HashMap_insert(g.fn_labels, "nat_syscall", sys);
+    g.fn_label_names.push("nat_syscall");
     NatEnc_align(&mut g.e, 4);
     NatEnc_place(&mut g.e, sys);
     if ng_a64(g) {
@@ -4608,6 +4665,7 @@ fn ng_gen_primitives(g: &mut NatGen) {
     // nat_start_sp() -> the stack pointer the process started with
     var ssp: i64 = NatEnc_label(&mut g.e);
     HashMap_insert(g.fn_labels, "nat_start_sp", ssp);
+    g.fn_label_names.push("nat_start_sp");
     NatEnc_place(&mut g.e, ssp);
     if ng_a64(g) {
         a64_addr(&mut g.e, g.t0, g.start_sp_label);
@@ -4624,6 +4682,7 @@ fn ng_gen_primitives(g: &mut NatGen) {
 fn ng_prim(g: &mut NatGen, name: str) -> i64 {
     var l: i64 = NatEnc_label(&mut g.e);
     HashMap_insert(g.fn_labels, name, l);
+    g.fn_label_names.push(name);
     NatEnc_align(&mut g.e, 4);
     NatEnc_place(&mut g.e, l);
     return l;
@@ -5000,6 +5059,7 @@ fn ng_panic_label(g: &mut NatGen, which: i64) -> i64 {
     if HashMap_contains(g.pl_keys, key) { return HashMap_get(g.pl_keys, key); }
     var l: i64 = NatEnc_label(&mut g.e);
     HashMap_insert(g.pl_keys, key, l);
+    g.pl_names.push(key);
     g.pl_list.push(which);
     g.pl_list.push(line);
     g.pl_list.push(l);
@@ -5279,6 +5339,7 @@ fn nat_generate_image(module: IrModule, arch: i64, win: bool) -> ResultBytes {
         g.win_iat_end = NatEnc_label(&mut g.e);
     }
 
+    nc_start(&mut g, &module);
     ng_gen_primitives(&mut g);
     // Compile what main reaches, as calls are met; the panic stubs' calls
     // come last but are queued like any other
@@ -5287,7 +5348,11 @@ fn nat_generate_image(module: IrModule, arch: i64, win: bool) -> ResultBytes {
     while qi < g.queue.len() {
         var name: str = g.queue.get(qi);
         match IrModule_get_function(&module, name) {
-            OptIrFunction::Some(func) => { ng_gen_function(&mut g, name, &func, &module); }
+            OptIrFunction::Some(func) => {
+                var nix: i64 = nc_lookup(&mut g, &func);
+                if nix != 0 { nc_skel_fn(&mut g, name, nix); }
+                else { ng_gen_function(&mut g, name, &func, &module); }
+            }
             OptIrFunction::None => {}
         }
         qi = qi + 1;
@@ -5299,6 +5364,7 @@ fn nat_generate_image(module: IrModule, arch: i64, win: bool) -> ResultBytes {
         if merr != "" {
             return ResultBytes::Err(c_vec1(merr));
         }
+        nc_finish(&mut g);
     }
     ng_line_close(&mut g);
     ng_gen_panic_line_stubs(&mut g);
@@ -5716,4 +5782,809 @@ fn ng_cold_last(mir: &Vec<MInst>) -> Vec<MInst> {
     var k2: i64 = 0;
     while k2 < cold.len() { out.push(cold.get(k2)); k2 = k2 + 1; }
     return out;
+}
+
+// ===========================================================================
+// CS6: per-function native artifact cache (opt-in, FID_FNCACHE=<path>).
+//
+// Each cache entry is a function's emitted bytes BEFORE fixup resolution plus
+// the relocation descriptors (position, patch kind, symbolic target). On a
+// rebuild whose content key matches — post-opt IR, module salt, and backend
+// configuration all identical — the bytes are replayed into the current
+// NatEnc at whatever offset the function lands, and the symbolic fixups are
+// re-registered against the new label space. Raw linked bytes are never
+// reused: every image layout is relinked.
+// ===========================================================================
+
+pub struct NcFix {
+    pub pos: i64,    // byte offset inside the function's slice
+    pub kind: i64,   // NatFix kind (patch format)
+    pub tkind: i64,  // 0 internal offset, 1 function, 2 string, 3 singleton
+    pub toff: i64,   // tkind 0: offset inside the function
+    pub tstr: str,   // tkind 1/2/3: target identity
+}
+
+pub struct NcEntry {
+    pub name: str,
+    pub key: i64,
+    pub mir_len: i64,
+    pub n_traps: i64,
+    pub n_calls: i64,
+    pub mask: i64,
+    pub bytes: Vec<i64>,
+    pub fixes: Vec<NcFix>,
+    pub edges: Vec<str>, // call-graph edges (MIR calls that resolve to fns)
+    pub refs: Vec<str>,  // every function the code references (queue deps)
+    pub fold_key: str,   // ng_mir_key under the run's alloc — lets fresh fns fold onto the copy
+}
+
+// --- content hash ---------------------------------------------------------
+
+@wrapping
+fn nc_h(h: i64, v: i64) -> i64 { return h * 131 + v; }
+
+fn nc_hs(h: i64, s: str) -> i64 { return nc_h(h, hash_source(s)); }
+
+fn nc_hty(h: i64, t: IrType) -> i64 {
+    match t {
+        IrType::I8 => { return nc_h(h, 1); }
+        IrType::I16 => { return nc_h(h, 2); }
+        IrType::I32 => { return nc_h(h, 3); }
+        IrType::I64 => { return nc_h(h, 4); }
+        IrType::U8 => { return nc_h(h, 5); }
+        IrType::U16 => { return nc_h(h, 6); }
+        IrType::U32 => { return nc_h(h, 7); }
+        IrType::U64 => { return nc_h(h, 8); }
+        IrType::F32 => { return nc_h(h, 9); }
+        IrType::F64 => { return nc_h(h, 10); }
+        IrType::Bool => { return nc_h(h, 11); }
+        IrType::Ptr(inner) => { return nc_hty(nc_h(h, 12), inner); }
+        IrType::Struct(n) => { return nc_hs(nc_h(h, 13), n); }
+        IrType::Array(inner, n) => { return nc_hty(nc_h(nc_h(h, 14), n), inner); }
+        IrType::Void => { return nc_h(h, 15); }
+        IrType::Never => { return nc_h(h, 16); }
+        IrType::Opaque(n) => { return nc_hs(nc_h(h, 17), n); }
+        IrType::Generic(n, args) => {
+            var hh: i64 = nc_hs(nc_h(h, 18), n);
+            var i: i64 = 0;
+            while i < args.len() { hh = nc_hty(hh, args.get(i)); i = i + 1; }
+            return hh;
+        }
+    }
+    return h;
+}
+
+fn nc_hopt_ty(h: i64, t: OptIrType) -> i64 {
+    match t {
+        OptIrType::Some(inner) => { return nc_hty(nc_h(h, 1), inner); }
+        OptIrType::None => { return nc_h(h, 0); }
+    }
+    return h;
+}
+
+fn nc_hbinop(h: i64, op: BinOp) -> i64 {
+    match op {
+        BinOp::Add => { return nc_h(h, 1); }
+        BinOp::Sub => { return nc_h(h, 2); }
+        BinOp::Mul => { return nc_h(h, 3); }
+        BinOp::Div => { return nc_h(h, 4); }
+        BinOp::Mod => { return nc_h(h, 5); }
+        BinOp::Eq => { return nc_h(h, 6); }
+        BinOp::Neq => { return nc_h(h, 7); }
+        BinOp::Lt => { return nc_h(h, 8); }
+        BinOp::Gt => { return nc_h(h, 9); }
+        BinOp::LtEq => { return nc_h(h, 10); }
+        BinOp::GtEq => { return nc_h(h, 11); }
+        BinOp::And => { return nc_h(h, 12); }
+        BinOp::Or => { return nc_h(h, 13); }
+        BinOp::BitAnd => { return nc_h(h, 14); }
+        BinOp::BitOr => { return nc_h(h, 15); }
+        BinOp::BitXor => { return nc_h(h, 16); }
+        BinOp::Shl => { return nc_h(h, 17); }
+        BinOp::Shr => { return nc_h(h, 18); }
+    }
+    return h;
+}
+
+fn nc_hunop(h: i64, op: UnaryOp) -> i64 {
+    match op {
+        UnaryOp::Neg => { return nc_h(h, 1); }
+        UnaryOp::Not => { return nc_h(h, 2); }
+        UnaryOp::BitNot => { return nc_h(h, 3); }
+    }
+    return h;
+}
+
+fn nc_heff(h: i64, e: EffectSet) -> i64 {
+    var i: i64 = 0;
+    while i < e.effects.len() {
+        var tag: i64 = 0;
+        match e.effects.get(i) {
+            Effect::Alloc => { tag = 1; }
+            Effect::IO => { tag = 2; }
+            Effect::Net => { tag = 3; }
+            Effect::Spawn => { tag = 4; }
+            Effect::Diverge => { tag = 5; }
+            Effect::Read => { tag = 6; }
+            Effect::Write => { tag = 7; }
+            Effect::Diff => { tag = 8; }
+            Effect::Noise => { tag = 9; }
+            Effect::Comm => { tag = 10; }
+        }
+        h = nc_h(h, tag);
+        i = i + 1;
+    }
+    return h;
+}
+
+fn nc_hregion(h: i64, r: Region) -> i64 {
+    match r {
+        Region::Stack => { return nc_h(h, 1); }
+        Region::Heap => { return nc_h(h, 2); }
+        Region::Static => { return nc_h(h, 3); }
+        Region::Named(n) => { return nc_hs(nc_h(h, 4), n); }
+    }
+    return h;
+}
+
+fn nc_hids(h: i64, v: Vec<i64>) -> i64 {
+    var i: i64 = 0;
+    while i < v.len() { h = nc_h(h, v.get(i)); i = i + 1; }
+    return nc_h(h, v.len());
+}
+
+fn nc_hinst(h: i64, inst: Inst) -> i64 {
+    match inst {
+        Inst::ConstInt(v, ty) => { return nc_hty(nc_h(nc_h(h, 1), v), ty); }
+        Inst::ConstFloat(v, ty) => { return nc_hty(nc_h(nc_h(h, 2), p_f64_to_bits(v)), ty); }
+        Inst::ConstBool(v) => { if v { return nc_h(h, 4); } return nc_h(h, 3); }
+        Inst::ConstStr(s) => { return nc_hs(nc_h(h, 5), s); }
+        Inst::ConstFnRef(n) => { return nc_hs(nc_h(h, 6), n); }
+        Inst::ConstNull(ty) => { return nc_hty(nc_h(h, 7), ty); }
+        Inst::GlobalAddr(n, ty) => { return nc_hty(nc_hs(nc_h(h, 8), n), ty); }
+        Inst::BinOp(op, l, r, ty) => { return nc_hty(nc_h(nc_h(nc_hbinop(nc_h(h, 9), op), l), r), ty); }
+        Inst::UnaryOp(op, v, ty) => { return nc_hty(nc_h(nc_hunop(nc_h(h, 10), op), v), ty); }
+        Inst::Alloca(ty, r) => { return nc_hregion(nc_hty(nc_h(h, 11), ty), r); }
+        Inst::Load(p, ty) => { return nc_hty(nc_h(nc_h(h, 12), p), ty); }
+        Inst::Store(p, v, ty) => { return nc_hopt_ty(nc_h(nc_h(nc_h(h, 13), p), v), ty); }
+        Inst::GetFieldPtr(b, f, ty) => { return nc_hty(nc_h(nc_h(nc_h(h, 14), b), f), ty); }
+        Inst::GetElemPtr(b, i, ty) => { return nc_hty(nc_h(nc_h(nc_h(h, 15), b), i), ty); }
+        Inst::Jump(t) => { return nc_h(nc_h(h, 16), t); }
+        Inst::Branch(c, t, f) => { return nc_h(nc_h(nc_h(nc_h(h, 17), c), t), f); }
+        Inst::Return(v) => {
+            match v {
+                OptValueId::Some(x) => { return nc_h(nc_h(h, 18), x); }
+                OptValueId::None => { return nc_h(h, 19); }
+            }
+            return h;
+        }
+        Inst::Unreachable => { return nc_h(h, 20); }
+        Inst::Call(n, args, ty, fx) => {
+            return nc_heff(nc_hty(nc_hids(nc_hs(nc_h(h, 21), n), args), ty), fx);
+        }
+        Inst::CallPtr(fp, args, ty, fx, tail) => {
+            var hh: i64 = nc_heff(nc_hty(nc_hids(nc_h(nc_h(h, 22), fp), args), ty), fx);
+            if tail { return nc_h(hh, 1); }
+            return hh;
+        }
+        Inst::DynCall(tn, mn, args, ty, fx) => {
+            return nc_heff(nc_hty(nc_hids(nc_hs(nc_hs(nc_h(h, 23), tn), mn), args), ty), fx);
+        }
+        Inst::MakeDyn(v, tn, mn) => {
+            return nc_hs(nc_hs(nc_h(nc_h(h, 24), v), tn), mn);
+        }
+        Inst::BitCast(v, a, b) => { return nc_hty(nc_hty(nc_h(nc_h(h, 25), v), a), b); }
+        Inst::IntExtend(v, a, b) => { return nc_hty(nc_hty(nc_h(nc_h(h, 26), v), a), b); }
+        Inst::IntTrunc(v, a, b) => { return nc_hty(nc_hty(nc_h(nc_h(h, 27), v), a), b); }
+        Inst::IntToFloat(v, a, b) => { return nc_hty(nc_hty(nc_h(nc_h(h, 28), v), a), b); }
+        Inst::FloatToInt(v, a, b) => { return nc_hty(nc_hty(nc_h(nc_h(h, 29), v), a), b); }
+        Inst::TryUnwrap(v, ok, bad, out) => {
+            return nc_h(nc_h(nc_h(nc_h(nc_h(h, 30), v), ok), bad), out);
+        }
+        Inst::Print(v, ty) => { return nc_hty(nc_h(nc_h(h, 31), v), ty); }
+        Inst::Panic(m) => { return nc_hs(nc_h(h, 32), m); }
+        Inst::Asm(tpl, outs, ins, ty) => {
+            var hh: i64 = nc_hty(nc_hs(nc_h(h, 33), tpl), ty);
+            var i: i64 = 0;
+            while i < outs.len() {
+                hh = nc_h(nc_hs(hh, outs.get(i).name), outs.get(i).id);
+                i = i + 1;
+            }
+            var j: i64 = 0;
+            while j < ins.len() {
+                hh = nc_h(nc_hs(hh, ins.get(j).name), ins.get(j).id);
+                j = j + 1;
+            }
+            return hh;
+        }
+        Inst::RegionBegin(n, a, b, l) => {
+            var hh: i64 = nc_hs(nc_h(h, 34), n);
+            if a { hh = nc_h(hh, 1); }
+            if b { hh = nc_h(hh, 2); }
+            match l {
+                OptU64::Some(x) => { return nc_h(hh, x); }
+                OptU64::None => { return hh; }
+            }
+            return hh;
+        }
+        Inst::RegionEnd(n, a, b) => {
+            var hh: i64 = nc_hs(nc_h(h, 35), n);
+            if a { hh = nc_h(hh, 1); }
+            if b { hh = nc_h(hh, 2); }
+            return hh;
+        }
+        Inst::PersistLoad(n, v, ty) => { return nc_hty(nc_h(nc_hs(nc_h(h, 36), n), v), ty); }
+        Inst::PersistSave(n, v) => { return nc_h(nc_hs(nc_h(h, 37), n), v); }
+        Inst::TxnBegin => { return nc_h(h, 38); }
+        Inst::TxnEnd => { return nc_h(h, 39); }
+        Inst::UnsafeBegin => { return nc_h(h, 40); }
+        Inst::UnsafeEnd => { return nc_h(h, 41); }
+        Inst::GradBegin(n) => { return nc_hs(nc_h(h, 42), n); }
+        Inst::GradEnd => { return nc_h(h, 43); }
+        Inst::Backward(v) => { return nc_h(nc_h(h, 44), v); }
+        Inst::StructCopy(d, s, ty) => { return nc_hty(nc_h(nc_h(nc_h(h, 45), d), s), ty); }
+    }
+    return h;
+}
+
+/// The content key: everything about the function that can change the bytes
+/// the backend emits for it. Covers the instructions, block shape, value
+/// types/regions, params, return type, and every codegen-relevant flag.
+fn nc_fn_hash(f: &IrFunction) -> i64 {
+    var h: i64 = nc_hs(1469598103934665603, f.name);
+    h = nc_hty(h, f.ret_ty);
+    h = nc_h(h, f.entry);
+    var i: i64 = 0;
+    while i < f.params.len() {
+        h = nc_hty(nc_h(h, f.params.get(i).id), f.params.get(i).ty);
+        i = i + 1;
+    }
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var bb: BasicBlock = f.blocks.get(b);
+        h = nc_h(h, bb.id);
+        h = nc_hids(h, bb.instructions);
+        h = nc_hids(h, bb.predecessors);
+        var p: i64 = 0;
+        while p < bb.params.len() {
+            h = nc_hty(nc_h(h, bb.params.get(p).id), bb.params.get(p).ty);
+            p = p + 1;
+        }
+        b = b + 1;
+    }
+    var v: i64 = 0;
+    while v < f.value_metas.len() {
+        var vm: ValueIdMeta = f.value_metas.get(v);
+        h = nc_hregion(nc_hty(nc_h(h, vm.id), vm.meta.ty), vm.meta.region);
+        v = v + 1;
+    }
+    var j: i64 = 0;
+    while j < f.insts.len() {
+        h = nc_hinst(nc_h(h, f.insts.get(j).id), f.insts.get(j).inst);
+        j = j + 1;
+    }
+    var k: i64 = 0;
+    while k < f.locals.len() {
+        h = nc_h(nc_hs(h, f.locals.get(k).name), f.locals.get(k).id);
+        k = k + 1;
+    }
+    var w: i64 = 0;
+    while w < f.persist_vars.len() {
+        h = nc_h(nc_hs(h, f.persist_vars.get(w).name), f.persist_vars.get(w).id);
+        w = w + 1;
+    }
+    var d: i64 = 0;
+    while d < f.drop_locals.len() {
+        h = nc_h(nc_hs(h, f.drop_locals.get(d).name), f.drop_locals.get(d).id);
+        d = d + 1;
+    }
+    var z: i64 = 0;
+    while z < f.zeroize_locals.len() {
+        h = nc_h(nc_h(h, f.zeroize_locals.get(z).id), f.zeroize_locals.get(z).val);
+        z = z + 1;
+    }
+    h = nc_hids(h, f.workgroup_size);
+    h = nc_heff(h, f.effects);
+    if f.is_wrapping { h = nc_h(h, 1); }
+    if f.is_deterministic { h = nc_h(h, 2); }
+    if f.is_crashfree { h = nc_h(h, 4); }
+    if f.is_no_alloc { h = nc_h(h, 8); }
+    if f.is_medical { h = nc_h(h, 16); }
+    if f.is_kernel { h = nc_h(h, 32); }
+    if f.is_simd { h = nc_h(h, 64); }
+    if f.is_interrupt { h = nc_h(h, 128); }
+    if f.internal_conv { h = nc_h(h, 256); }
+    h = nc_h(h, f.interrupt_vector);
+    match f.gas_limit {
+        OptU64::Some(x) => { h = nc_h(h, x); }
+        OptU64::None => {}
+    }
+    return h;
+}
+
+// --- salts -----------------------------------------------------------------
+
+/// Backend configuration that can change emitted bytes: target, output
+/// format, and every pass toggle that feeds the machine layer.
+fn nc_cfg_salt(g: &NatGen) -> i64 {
+    var s: str = "nc1;" + int_to_str(g.arch) + ";";
+    if g.win { s = s + "w;"; }
+    s = s + env_or_empty("FID_NAT_OFF") + ";" + env_or_empty("FID_NAT_LINES") + ";"
+        + env_or_empty("FID_IROPT_OFF") + ";" + env_or_empty("FID_IROPT_ON") + ";"
+        + env_or_empty("FID_RULES_ON") + ";" + env_or_empty("FID_RULES_OFF") + ";"
+        + env_or_empty("FID_EGRAPH_OFF") + ";" + env_or_empty("FID_NAT_DEBUG") + ";"
+        + env_or_empty("FID_VERIFY") + ";";
+    var lp: str = env_or_empty("FID_LIBFACTS");
+    if str_len(lp) > 0 {
+        if p_file_exists(lp) { s = s + int_to_str(hash_source(p_file_read(lp))); }
+    }
+    return hash_source(s);
+}
+
+/// Module state outside any one function that still steers its codegen:
+/// struct layouts (field offsets), globals, externs, the dyn-dispatch
+/// tables, the internal-convention set, and the full function-name set.
+fn nc_mod_salt(g: &NatGen, m: &IrModule) -> i64 {
+    var h: i64 = 1469598103934665603;
+    var i: i64 = 0;
+    while i < m.struct_layouts.len() {
+        var sl: StructLayout = m.struct_layouts.get(i).layout;
+        h = nc_hs(h, sl.name);
+        h = nc_h(h, sl.size);
+        h = nc_h(h, sl.align);
+        if sl.repr_c { h = nc_h(h, 1); }
+        if sl.packed_layout { h = nc_h(h, 2); }
+        var f: i64 = 0;
+        while f < sl.fields.len() {
+            var fd: StringIrTypeOffset = sl.fields.get(f);
+            h = nc_hty(nc_h(nc_hs(h, fd.name), fd.offset), fd.ty);
+            f = f + 1;
+        }
+        i = i + 1;
+    }
+    var gi: i64 = 0;
+    while gi < m.globals.len() {
+        h = nc_hty(nc_hs(h, m.globals.get(gi).name), m.globals.get(gi).ty);
+        gi = gi + 1;
+    }
+    var ei: i64 = 0;
+    while ei < m.extern_functions.len() {
+        var ef: StringVecIrType = m.extern_functions.get(ei);
+        h = nc_hs(h, ef.name);
+        h = nc_hty(h, ef.ret);
+        var p: i64 = 0;
+        while p < ef.params.len() { h = nc_hty(h, ef.params.get(p)); p = p + 1; }
+        ei = ei + 1;
+    }
+    var ed: i64 = 0;
+    while ed < m.extern_decls.len() {
+        var d: ExternDecl = m.extern_decls.get(ed);
+        h = nc_hs(nc_hs(nc_h(h, d.params.len()), d.pledge_name), d.c_name);
+        ed = ed + 1;
+    }
+    var cb: i64 = 0;
+    while cb < m.c_callbacks.len() { h = nc_hs(h, m.c_callbacks.get(cb)); cb = cb + 1; }
+    var tm: i64 = 0;
+    while tm < m.trait_methods.len() {
+        var t: StringVecStr = m.trait_methods.get(tm);
+        h = nc_hs(h, t.name);
+        var q: i64 = 0;
+        while q < t.items.len() { h = nc_hs(h, t.items.get(q)); q = q + 1; }
+        tm = tm + 1;
+    }
+    var ti: i64 = 0;
+    while ti < m.trait_impls.len() {
+        var t2: StringVecStr = m.trait_impls.get(ti);
+        h = nc_hs(h, t2.name);
+        var q2: i64 = 0;
+        while q2 < t2.items.len() { h = nc_hs(h, t2.items.get(q2)); q2 = q2 + 1; }
+        ti = ti + 1;
+    }
+    var ls: i64 = 0;
+    while ls < m.linear_structs.len() { h = nc_hs(h, m.linear_structs.get(ls)); ls = ls + 1; }
+    var fi: i64 = 0;
+    while fi < m.functions.len() {
+        h = nc_hs(h, m.functions.get(fi).name);
+        if m.functions.get(fi).func.internal_conv { h = nc_h(h, 1); }
+        fi = fi + 1;
+    }
+    return h;
+}
+
+// --- symbolic label identities ---------------------------------------------
+
+fn nc_lid(g: &mut NatGen, label: i64, id: str) {
+    HashMap_insert(g.label_id, int_to_str(label), id);
+}
+
+/// label -> identity, for every label a function's fixups can legally point
+/// at: other functions, string/data blobs, and the backend's singletons.
+/// Intra-function labels are handled by offset at capture time.
+fn nc_label_ids(g: &mut NatGen) {
+    var i: i64 = 0;
+    while i < g.fn_label_names.len() {
+        var fn2: str = g.fn_label_names.get(i);
+        nc_lid(g, HashMap_get(g.fn_labels, fn2), "F:" + fn2);
+        i = i + 1;
+    }
+    var j: i64 = 0;
+    while j < g.strs.len() {
+        nc_lid(g, HashMap_get(g.str_labels, g.strs.get(j)), "S:" + g.strs.get(j));
+        j = j + 1;
+    }
+    var k: i64 = 0;
+    while k < g.globs.len() {
+        nc_lid(g, HashMap_get(g.glob_labels, g.globs.get(k)), "G:glob:" + g.globs.get(k));
+        k = k + 1;
+    }
+    nc_lid(g, g.entry_label, "G:entry");
+    nc_lid(g, g.start_sp_label, "G:start_sp");
+    nc_lid(g, g.fn_table_label, "G:fn_table");
+    nc_lid(g, g.names_label, "G:names");
+    nc_lid(g, g.code_end_label, "G:code_end");
+    nc_lid(g, g.tramp_label, "G:tramp");
+    var p: i64 = 0;
+    while p < g.panic_labels.len() {
+        nc_lid(g, g.panic_labels.get(p), "G:panic:" + int_to_str(p));
+        p = p + 1;
+    }
+    var w: i64 = 0;
+    while w < g.win_slot_labels.len() {
+        nc_lid(g, g.win_slot_labels.get(w), "G:winslot:" + int_to_str(w));
+        w = w + 1;
+    }
+    nc_lid(g, g.win_tls_label, "G:win_tls");
+    nc_lid(g, g.win_imp_label, "G:win_imp");
+    nc_lid(g, g.win_imp_end, "G:win_imp_end");
+    nc_lid(g, g.win_iat_label, "G:win_iat");
+    nc_lid(g, g.win_iat_end, "G:win_iat_end");
+}
+
+/// Singleton identity -> this run's label. 0 when that label does not
+/// exist on this target (the fixup can only have referenced one that did).
+fn nc_singleton(g: &mut NatGen, id: str) -> i64 {
+    if id == "G:entry" { return g.entry_label; }
+    if id == "G:start_sp" { return g.start_sp_label; }
+    if id == "G:fn_table" { return g.fn_table_label; }
+    if id == "G:names" { return g.names_label; }
+    if id == "G:code_end" { return g.code_end_label; }
+    if id == "G:tramp" { return g.tramp_label; }
+    if id == "G:win_tls" { return g.win_tls_label; }
+    if id == "G:win_imp" { return g.win_imp_label; }
+    if id == "G:win_imp_end" { return g.win_imp_end; }
+    if id == "G:win_iat" { return g.win_iat_label; }
+    if id == "G:win_iat_end" { return g.win_iat_end; }
+    if str_starts_with(id, "G:panic:") {
+        var n: i64 = str_parse_int(str_slice(id, 8, str_len(id)));
+        if n >= 0 && n < g.panic_labels.len() { return g.panic_labels.get(n); }
+        return 0;
+    }
+    if str_starts_with(id, "G:winslot:") {
+        var n2: i64 = str_parse_int(str_slice(id, 10, str_len(id)));
+        if n2 >= 0 && n2 < g.win_slot_labels.len() { return g.win_slot_labels.get(n2); }
+        return 0;
+    }
+    if str_starts_with(id, "G:glob:") {
+        var nm: str = str_slice(id, 7, str_len(id));
+        if HashMap_contains(g.glob_labels, nm) { return HashMap_get(g.glob_labels, nm); }
+        return 0;
+    }
+    return 0;
+}
+
+// --- capture / replay ------------------------------------------------------
+
+fn nc_hit_at(g: &NatGen, name: str) -> i64 {
+    if !g.nc_on { return 0; }
+    if HashMap_contains(g.nc_hit, name) { return HashMap_get(g.nc_hit, name); }
+    return 0;
+}
+
+/// Key the function under and return its cache entry index + 1 on a hit
+/// (same content key), 0 on a miss. The key is recorded either way — the
+/// emit path uses it for the entry it captures.
+fn nc_lookup(g: &mut NatGen, f: &IrFunction) -> i64 {
+    if !g.nc_on { return 0; }
+    var key: i64 = nc_fn_hash(f);
+    HashMap_insert(g.nc_key, f.name, key);
+    if HashMap_contains(g.nc_ix, f.name) {
+        var ix: i64 = HashMap_get(g.nc_ix, f.name);
+        var e: NcEntry = g.nc_old.get(ix - 1);
+        if e.key == key { return ix; }
+    }
+    return 0;
+}
+
+/// Panic-line stub labels get registered in label_id lazily: the ones a
+/// function references are created during its own emit, after the map was
+/// first built.
+fn nc_sync_pl(g: &mut NatGen) {
+    var i: i64 = 0;
+    while i < g.pl_names.len() {
+        var l: i64 = HashMap_get(g.pl_keys, g.pl_names.get(i));
+        var lk: str = int_to_str(l);
+        if !HashMap_contains(g.label_id, lk) {
+            HashMap_insert(g.label_id, lk, "P:" + g.pl_names.get(i));
+        }
+        i = i + 1;
+    }
+}
+
+/// A "P:which:line" target back to a live stub label, registering the stub
+/// for emission like a fresh compile would have.
+fn nc_pl_label(g: &mut NatGen, key: str) -> i64 {
+    if HashMap_contains(g.pl_keys, key) { return HashMap_get(g.pl_keys, key); }
+    var l: i64 = NatEnc_label(&mut g.e);
+    HashMap_insert(g.pl_keys, key, l);
+    g.pl_names.push(key);
+    var ci: i64 = str_find(key, ":");
+    g.pl_list.push(str_parse_int(str_slice(key, 0, ci)));
+    g.pl_list.push(str_parse_int(str_slice(key, ci + 1, str_len(key))));
+    g.pl_list.push(l);
+    HashMap_insert(g.label_id, int_to_str(l), "P:" + key);
+    return l;
+}
+
+/// Capture the just-emitted function at [base, code.len): its bytes and its
+/// fixups with symbolic targets. Returns false (and stores nothing) when a
+/// fixup points at a label with no describable identity.
+fn nc_capture(g: &mut NatGen, rec: &NatFnRec, base: i64, fstart: i64, fold_key: str) -> bool {
+    nc_sync_pl(g);
+    var e: NcEntry = NcEntry {
+        name: rec.name,
+        key: HashMap_get(g.nc_key, rec.name),
+        mir_len: rec.mir.len(),
+        n_traps: 0,
+        n_calls: 0,
+        mask: HashMap_get(g.fn_mask, rec.name),
+        bytes: Vec::new(),
+        fixes: Vec::new(),
+        edges: Vec::new(),
+        refs: Vec::new(),
+        fold_key: fold_key,
+    };
+    var end: i64 = g.e.code.len();
+    var i: i64 = base;
+    while i < end { e.bytes.push(g.e.code.get(i)); i = i + 1; }
+    var k: i64 = 0;
+    while k < rec.mir.len() {
+        var mop: i64 = rec.mir.get(k).op;
+        if mop == MO_TRAP { e.n_traps = e.n_traps + 1; }
+        if mop == MO_CALL {
+            e.n_calls = e.n_calls + 1;
+            var lk: str = int_to_str(rec.mir.get(k).i0);
+            if HashMap_contains(g.label_fn, lk) { e.edges.push(HashMap_get(g.label_fn, lk)); }
+        }
+        k = k + 1;
+    }
+    var f: i64 = fstart;
+    var ok: bool = true;
+    while f < g.e.fixups.len() {
+        var fx: NatFix = g.e.fixups.get(f);
+        if fx.pos >= base && fx.pos < end {
+            var lk2: str = int_to_str(fx.label);
+            if HashMap_contains(g.label_id, lk2) {
+                var id: str = HashMap_get(g.label_id, lk2);
+                var tk: i64 = 3;
+                var tstr: str = id;
+                if str_starts_with(id, "F:") {
+                    tk = 1;
+                    tstr = str_slice(id, 2, str_len(id));
+                    e.refs.push(tstr);
+                } else {
+                    if str_starts_with(id, "S:") { tk = 2; tstr = str_slice(id, 2, str_len(id)); }
+                }
+                e.fixes.push(NcFix { pos: fx.pos - base, kind: fx.kind, tkind: tk, toff: 0, tstr: tstr });
+            } else {
+                var loff: i64 = g.e.labels.get(fx.label);
+                if loff >= base && loff < end {
+                    e.fixes.push(NcFix { pos: fx.pos - base, kind: fx.kind, tkind: 0, toff: loff - base, tstr: "" });
+                } else { ok = false; }
+            }
+        }
+        f = f + 1;
+    }
+    if ok { g.nc_new.push(e); }
+    return ok;
+}
+
+/// Replay a cached function at the current position: bytes verbatim,
+/// fixups re-registered against this run's label space.
+fn nc_replay(g: &mut NatGen, e: &NcEntry) -> str {
+    var base: i64 = g.e.code.len();
+    var i: i64 = 0;
+    while i < e.bytes.len() { g.e.code.push(e.bytes.get(i)); i = i + 1; }
+    var k: i64 = 0;
+    while k < e.fixes.len() {
+        var fx: NcFix = e.fixes.get(k);
+        var tl: i64 = 0;
+        if fx.tkind == 0 {
+            tl = NatEnc_label(&mut g.e);
+            g.e.labels.set(tl, base + fx.toff);
+        } else {
+            if fx.tkind == 1 {
+                tl = ng_fn_label(g, fx.tstr);
+                if tl == 0 { return "native cache: " + e.name + " references missing function " + fx.tstr; }
+            } else {
+                if fx.tkind == 2 { tl = ng_str_label(g, fx.tstr); }
+                else {
+                    if str_starts_with(fx.tstr, "P:") {
+                        tl = nc_pl_label(g, str_slice(fx.tstr, 2, str_len(fx.tstr)));
+                    } else {
+                        if str_starts_with(fx.tstr, "G:glob:") {
+                            tl = ng_glob_label(g, str_slice(fx.tstr, 7, str_len(fx.tstr)));
+                        } else { tl = nc_singleton(g, fx.tstr); }
+                    }
+                }
+            }
+            if tl == 0 { return "native cache: " + e.name + " has stale target " + fx.tstr; }
+        }
+        NatEnc_fix_at(&mut g.e, base + fx.pos, tl, fx.kind);
+        k = k + 1;
+    }
+    return "";
+}
+
+/// A cache hit's record: a synthetic MIR with the same trap/call counts and
+/// the same call edges, so the postorder and the cold splitter see the same
+/// shape; allocation/emission is skipped for it.
+fn nc_skel_fn(g: &mut NatGen, name: str, ix: i64) {
+    var e: NcEntry = g.nc_old.get(ix - 1);
+    var rec2: NatFnRec = NatFnRec { name: name, mir: Vec::new(), nvreg: 0, base_frame: 0, slots: Vec::new() };
+    var i: i64 = 0;
+    while i < e.n_traps {
+        rec2.mir.push(MInst { op: MO_TRAP, r0: 0, r1: 0, r2: 0, i0: 0, i1: 0, i2: 0 });
+        i = i + 1;
+    }
+    var c: i64 = 0;
+    while c < e.edges.len() {
+        var l: i64 = ng_fn_label(g, e.edges.get(c));
+        rec2.mir.push(MInst { op: MO_CALL, r0: 0, r1: 0, r2: 0, i0: l, i1: 0, i2: 0 });
+        c = c + 1;
+    }
+    var pc: i64 = e.n_calls - e.edges.len();
+    while pc > 0 {
+        rec2.mir.push(MInst { op: MO_CALL, r0: 0, r1: 0, r2: 0, i0: 0, i1: 0, i2: 0 });
+        pc = pc - 1;
+    }
+    while rec2.mir.len() < e.mir_len {
+        rec2.mir.push(MInst { op: MO_LI, r0: 0, r1: 0, r2: 0, i0: 0, i1: 0, i2: 0 });
+    }
+    g.recs.push(rec2);
+    var r: i64 = 0;
+    while r < e.refs.len() { var rl: i64 = ng_fn_label(g, e.refs.get(r)); r = r + 1; }
+    HashMap_insert(g.nc_hit, name, ix);
+    g.nc_hit_names.push(name);
+}
+
+// --- disk format ------------------------------------------------------------
+//
+// FIDFNC1
+// <salt>
+// <count>
+// then per entry: header line, hex name, space-separated bytes,
+// per-fixup "pos kind tkind toff hex(tstr)", hex edge names, hex ref names,
+// hex fold key.
+
+// CS6 cache file format v2: a binary byte vector (the text/hex format
+// cost ~20 s to parse at -O0 for a 550 KB file). Magic + version + salt,
+// then entries through the shared byte codec in compiler::ast_ser.
+fn nc_wentry(b: &mut AwBuf, e: NcEntry) {
+    aw_i64(b, e.key);
+    aw_i64(b, e.mir_len);
+    aw_i64(b, e.n_traps);
+    aw_i64(b, e.n_calls);
+    aw_i64(b, e.mask);
+    aw_str(b, e.name);
+    aw_i64(b, e.bytes.len());
+    var i: i64 = 0;
+    while i < e.bytes.len() { aw_u8(b, e.bytes.get(i)); i = i + 1; }
+    aw_i64(b, e.fixes.len());
+    var k: i64 = 0;
+    while k < e.fixes.len() {
+        var fx: NcFix = e.fixes.get(k);
+        aw_i64(b, fx.pos);
+        aw_i64(b, fx.kind);
+        aw_i64(b, fx.tkind);
+        aw_i64(b, fx.toff);
+        aw_str(b, fx.tstr);
+        k = k + 1;
+    }
+    aw_strs(b, e.edges);
+    aw_strs(b, e.refs);
+    aw_str(b, e.fold_key);
+}
+
+fn nc_rentry(r: &mut ArBuf) -> NcEntry {
+    var key: i64 = ar_i64(r);
+    var mir_len: i64 = ar_i64(r);
+    var n_traps: i64 = ar_i64(r);
+    var n_calls: i64 = ar_i64(r);
+    var mask: i64 = ar_i64(r);
+    var name: str = ar_str(r);
+    var nb: i64 = ar_i64(r);
+    var bytes: Vec<i64> = Vec::new();
+    var bi: i64 = 0;
+    while bi < nb { bytes.push(ar_u8(r)); bi = bi + 1; }
+    var nf: i64 = ar_i64(r);
+    var fixes: Vec<NcFix> = Vec::new();
+    var fi: i64 = 0;
+    while fi < nf {
+        fixes.push(NcFix {
+            pos: ar_i64(r),
+            kind: ar_i64(r),
+            tkind: ar_i64(r),
+            toff: ar_i64(r),
+            tstr: ar_str(r),
+        });
+        fi = fi + 1;
+    }
+    var edges: Vec<str> = ar_strs(r);
+    var refs: Vec<str> = ar_strs(r);
+    var fold: str = ar_str(r);
+    return NcEntry {
+        name: name,
+        key: key,
+        mir_len: mir_len,
+        n_traps: n_traps,
+        n_calls: n_calls,
+        mask: mask,
+        bytes: bytes,
+        fixes: fixes,
+        edges: edges,
+        refs: refs,
+        fold_key: fold,
+    };
+}
+
+fn nc_load(g: &mut NatGen) {
+    var vb: Vec<i64> = p_file_read_bytes(g.nc_path);
+    if vb.len() < 32 { return; }
+    var r: ArBuf = arbuf_new(vb);
+    if ar_i64(&mut r) != 4473415 { return; }
+    if ar_i64(&mut r) != 2 { return; }
+    if ar_i64(&mut r) != g.nc_salt { return; }
+    var count: i64 = ar_i64(&mut r);
+    var i: i64 = 0;
+    while i < count && r.ok {
+        var e: NcEntry = nc_rentry(&mut r);
+        if !r.ok { return; }
+        g.nc_old.push(e);
+        HashMap_insert(g.nc_ix, e.name, g.nc_old.len());
+        i = i + 1;
+    }
+}
+
+/// Write back the entries that were used or freshly captured � hits stay
+/// live in the cache, misses get replaced, dead functions drop out.
+fn nc_finish(g: &mut NatGen) {
+    if !g.nc_on { return; }
+    var b: AwBuf = awbuf_new();
+    aw_i64(&mut b, 4473415);
+    aw_i64(&mut b, 2);
+    aw_i64(&mut b, g.nc_salt);
+    aw_i64(&mut b, g.nc_new.len() + g.nc_hit_names.len());
+    var i: i64 = 0;
+    while i < g.nc_hit_names.len() {
+        var ix: i64 = HashMap_get(g.nc_hit, g.nc_hit_names.get(i));
+        nc_wentry(&mut b, g.nc_old.get(ix - 1));
+        i = i + 1;
+    }
+    var j: i64 = 0;
+    while j < g.nc_new.len() { nc_wentry(&mut b, g.nc_new.get(j)); j = j + 1; }
+    p_file_write_vec(g.nc_path, b.bytes);
+}
+
+/// Enable the cache when FID_FNCACHE names a file and the MIR path is the
+/// one that will emit (the record/direct path has no per-function slice to
+/// capture). The salt folds the whole backend configuration and module
+/// layout; a mismatch makes every stored entry dead on arrival.
+fn nc_start(g: &mut NatGen, m: &IrModule) {
+    var path: str = p_getenv("FID_FNCACHE");
+    if str_len(path) == 0 { return; }
+    if !(NG_MIR && (ng_on("mir") || ng_x64(g))) { return; }
+    g.nc_salt = nc_h(nc_cfg_salt(g), nc_mod_salt(g, m));
+    g.nc_on = true;
+    g.nc_path = path;
+    if p_file_exists(path) { nc_load(g); }
 }
