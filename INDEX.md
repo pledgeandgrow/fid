@@ -13,7 +13,7 @@
 > **Stats (Nov 9; exact figures in [selfhost.md → Numbers](docs/reference/selfhost.md#numbers)):** 68 self-hosted `.fd` compiler modules (~159K lines) · 57 `.rs` bootstrap files (~113K lines) ·
 > 146 stdlib modules (~51K lines) · 502 `.fd` tests in `tests/bootstrap/` (543 with its subfolders) + 51 in `tests/selfhost/` + 104 in `tests/conformance/` · 11 examples · 4 binaries.
 > Fixpoint: VERIFIED byte-for-byte (stage 2 == stage 3, 49 MB of C, Nov 6; checked by `RELEASE=1 scripts/bootstrap.sh`).
-> v1.0.0 released Sep 9, 2026 with Windows installer (Fides-Setup-1.0.0.exe, 2.5 MB).
+> v1.0.0 released Sep 9, 2026 with Windows installer (Fides-Setup-1.0.0.exe, 2.5 MB). v0.8.0-unstable prerelease Nov 10, 2026 (Fides-Setup-0.8.0.exe, 6.6 MB).
 
 ---
 
