@@ -41,6 +41,7 @@ use compiler::pe_ir;
 use compiler::inc;
 use compiler::interp;
 use compiler::ast_ser;
+use compiler::reach;
 use compiler::green_thread;
 use compiler::elf64;
 use compiler::linker;
@@ -1773,7 +1774,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         return ResultProgram::Err(enrich_errors(tc.errors, source, file3));
                     }
                     // References are second-class: none may outlive what it points to.
-                    var escape_errors: Vec<str> = escape_check(program);
+                    var escape_errors: Vec<str> = escape_check_skipped(program, core_skip);
                     if escape_errors.len() > 0 {
                         p_eprint_str("[build] FAILED: reference errors\n");
                         var file5: str = "<stdin>";
@@ -1783,7 +1784,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         }
                         return ResultProgram::Err(enrich_errors(escape_errors, source, file5));
                     }
-                    var secret_errors: Vec<str> = secrecy_check(program);
+                    var secret_errors: Vec<str> = secrecy_check_skipped(program, core_skip);
                     if secret_errors.len() > 0 {
                         p_eprint_str("[build] FAILED: @secret/@sensitive errors\n");
                         var file8: str = "<stdin>";
@@ -2543,11 +2544,42 @@ pub fn lower_to_ir_module_with_path(source: str, source_path: str, borrowck_mode
     match result {
         ResultProgram::Err(errs) => { return ResultIrModule::Err(errs); }
         ResultProgram::Ok(program) => {
+            // FID_C_REACH=1 (opt-in): lower only what reach_keep_set keeps, as
+            // `emit` does by default. The default stays "lower everything" so
+            // the C output keeps matching the Rust bootstrap's whole-program C.
+            var reach_env: str = p_getenv("FID_C_REACH");
+            if (reach_env as i64) != 0 && str_len(reach_env) > 0 {
+                g_lower_keep = c_reach_keep_set(program);
+                var module: IrModule = lower(program);
+                g_lower_keep = 0;
+                return ResultIrModule::Ok(module);
+            }
             var module: IrModule = lower(program);
             return ResultIrModule::Ok(module);
         }
     }
     return ResultIrModule::Err(c_vec1("unreachable"));
+}
+
+/// Core-name list for reach_keep_set from the cached core program (the same
+/// shape main.fd's lw_keep_set builds for the native emit path).
+fn c_reach_keep_set(program: Program) -> i64 {
+    var core_names: Vec<str> = Vec::new();
+    match g_stdlib_cache {
+        OptProgram::Some(cp) => {
+            var i: i64 = 0;
+            while i < cp.funcs.len() { core_names.push(cp.funcs.get(i).name); i = i + 1; }
+            i = 0;
+            while i < cp.impls.len() {
+                var im: ImplDef = cp.impls.get(i);
+                var j: i64 = 0;
+                while j < im.methods.len() { core_names.push(im.struct_name + "_" + im.methods.get(j).name); j = j + 1; }
+                i = i + 1;
+            }
+        }
+        OptProgram::None => { return 0; }
+    }
+    return reach_keep_set(program, core_names);
 }
 
 /// Interpret a source file by lowering to IR and executing via the

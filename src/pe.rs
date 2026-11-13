@@ -10874,7 +10874,12 @@ pub(crate) fn unchecked_ops(func: &IrFunction) -> std::collections::HashSet<u32>
             "Vec_get" | "Vec_set" | "Vec_len" | "Vec_push" | "Vec_is_empty" | "Vec_capacity"
             | "p_vec_get" | "p_vec_set" | "p_vec_len" | "p_vec_push" | "p_vec_is_empty"
             | "print" | "println" | "int_to_str" | "p_print_int" | "p_print_str" | "p_print_float"
-            | "p_print_bool" | "p_print_newline"),
+            | "p_print_bool" | "p_print_newline"
+            // Destructors and to-string helpers run after a value's last use;
+            // they only ever free other temporaries inside the region.
+            | "Str_drop" | "Vec_drop" | "Vec_drop_inplace" | "Box_drop_t" | "__p_mem_drop"
+            | "__p_elem_drop" | "p_allocator_free" | "p_free" | "vec_box_free" | "vec_buf_free"
+            | "byte_to_str" | "p_char_to_str" | "p_float_to_str" | "p_to_str" | "p_sb_to_str"),
         Some(Inst::CallPtr { .. } | Inst::DynCall { .. } | Inst::Asm { .. } | Inst::Backward { .. }) => true,
         _ => false,
     };

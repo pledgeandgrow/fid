@@ -30,6 +30,7 @@ use core;
 use vec;
 use string;
 use compiler::ast;
+use compiler::ir_ser;
 use compiler::cowcheck;
 use compiler::ir;
 use compiler::pe_ir;
@@ -2836,8 +2837,10 @@ fn lw_keep(key: str) -> bool {
 }
 
 pub fn lower(program: Program) -> IrModule {
+    irc_begin(program);
     var l: Lowerer = Lowerer_new();
     var module: IrModule = Lowerer_lower_program(&mut l, program);
+    irc_finish();
     Lowerer_free_maps(&mut l);
     // With ownership (proposal 0004) every value is dropped by its owner:
     // the passes that freed some finished locals would free them twice
@@ -3940,6 +3943,54 @@ pub enum OptAnnotation {
 // --- Lower function -------------------------------------------------------
 
 pub fn Lowerer_lower_func(self: &mut Lowerer, func: Func) {
+    if g_irc_on {
+        var irc_key: i64 = irc_fn_key(func);
+        var irc_bytes: Vec<i64> = irc_lookup(irc_key, func.name);
+        if irc_bytes.len() > 0 {
+            var rr: ArBuf = arbuf_new(irc_bytes);
+            var cached_fn: IrFunction = irc_replay(&mut rr, &mut self.module, self);
+            if rr.ok && cached_fn.name == func.name {
+                var ri: i64 = 0;
+                while ri < g_irc_rtypes.len() {
+                    var _rix: i64 = Lowerer_rc_type_index(self, g_irc_rtypes.get(ri));
+                    ri = ri + 1;
+                }
+                g_irc_rtypes = Vec::new();
+                Lowerer_register_ret_tuple(self, func.ret_ty);
+                irc_reintern(&mut self.module, cached_fn);
+                IrModule_add_function(&mut self.module, cached_fn);
+                return;
+            }
+        }
+        var irc_before: i64 = self.module.functions.len();
+        var irc_own_before: i64 = self.own_types.len();
+        Lowerer_lower_func_uncached(self, func);
+        var irc_types: Vec<Type> = Vec::new();
+        var ti: i64 = irc_own_before;
+        while ti < self.own_types.len() {
+            irc_types.push(self.own_types.get(ti).ty);
+            ti = ti + 1;
+        }
+        var irc_spawned: Vec<IrFunction> = Vec::new();
+        var si: i64 = irc_before;
+        while si < self.module.functions.len() {
+            irc_spawned.push(self.module.functions.get(si).func);
+            si = si + 1;
+        }
+        var ci: i64 = 0;
+        while ci < self.module.functions.len() {
+            if self.module.functions.get(ci).name == func.name {
+                irc_record(irc_key, self.module.functions.get(ci).func, irc_spawned, irc_types);
+                ci = self.module.functions.len();
+            }
+            ci = ci + 1;
+        }
+        return;
+    }
+    Lowerer_lower_func_uncached(self, func);
+}
+
+fn Lowerer_lower_func_uncached(self: &mut Lowerer, func: Func) {
     var saved_body: Vec<Stmt> = self.cur_body;
     var saved_lists: Vec<Vec<Stmt>> = self.fr_lists;
     var saved_idx: Vec<i64> = self.fr_idx;
@@ -12438,7 +12489,7 @@ pub fn Lowerer_rc_kind(self: &mut Lowerer, t0: Type) -> i64 {
 }
 
 /// The index of struct-like type `t` among those with generated functions.
-fn Lowerer_rc_type_index(self: &mut Lowerer, t0: Type) -> i64 {
+pub fn Lowerer_rc_type_index(self: &mut Lowerer, t0: Type) -> i64 {
     var t: Type = Lowerer_resolve_type(self, t0);
     var key: str = type_to_str(t);
     var at: i64 = HashMap_get(self.own_type_index, key);

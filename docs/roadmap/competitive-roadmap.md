@@ -336,11 +336,20 @@ This is the race we can win outright, since no rival's speed comes for free.
 - [~] CS1. `emit` of hello world under 0.5 s (release D9), then under 0.1 s (L).
       Done: ~360 ms (Nov 2, fidesc); ~370 ms internal build time today
       (`fid emit hello.fd --target x86_64-linux`, ~780 ms wall incl. process
-      start; type check ~85, borrow ~170, mid-end ~170). Left: the 0.1 s
-      stretch — CS2's binary artifact now skips the parse+merge (stdlib
-      frontend ~1033 → ~210 ms at -O0; ~226 ms → ~40-80 ms expected at
-      -O2), but the merged stdlib is still iterated per decl downstream
-      (tc register, lints, mono) and the mid-end needs CS6's format work.
+      start; type check ~85, borrow ~170, mid-end ~170).
+      Nov (this session, -O2 fid-dev, hello `--nat` with the CS2 artifact
+      and the CS6 binary fn-cache both warm): **631 ms total** — frontend
+      138 ms (stdlib deser 45, tc register 19, typecheck 25, escape+secrecy
+      16, lints 6, mono 17, borrowck 0), lower 185, mid-end 256 (iropt 68 +
+      rules 48 + egraph 140), native code 43 (alloc+emit 8 on cache hit).
+      The trusted-core skip was extended to escape/secrecy report passes and
+      the lint body-walk (typecheck 43→25, escape+secrecy 27→16, lints 12→6
+      ms vs before the extension); all escape/secrecy expected-fail tests
+      still fire and lint output is unchanged. Summaries still flow through
+      the fixpoints — only trusted bodies' reporting is skipped.
+      Left (the 0.1 s stretch): lower 185 + mid-end 256 are now ~2/3 of the
+      time — both per-decl work on the merged stdlib that nothing caches;
+      stdlib deser itself is 45. Frontend is no longer the bottleneck.
       Nov 8-9 (`fid`): native code only for what main reaches (and what it
       names), iropt on those only: hello's executable 127 KB -> 33 KB. With
       the compiler itself built at -O2 (split into 8 units, `split-c`) hello
@@ -415,10 +424,17 @@ This is the race we can win outright, since no rival's speed comes for free.
       --time` reports type check ~23-30 s on a loaded machine (was ~29 s
       before the CS8 tables on a comparable run — noisy machine, treat
       ±20%). `fid-dev.exe` is -O0: expect ~11x inflation there.
-      Next: the <10 s stretch — CS2's artifact is landed (stdlib parse+merge
-      skipped on hit; deser ~40-80 ms expected at -O2), so what remains is
-      cheaper merge+desugar/import/typecheck work (together ~30 s of check)
-      plus a binary format for CS6's native cache.
+      Next: the <10 s stretch — measured (this session, -O2 fid-dev,
+      `dump-c compiler/main.fd`, 22.9 s): the premise that frontend work
+      dominates is stale at -O2. Real split: frontend to mono ~5.7 s
+      (imports ~1.3, typecheck ~2.9, escape+secrecy ~1.5), **lower 16.4 s +
+      C codegen 6.1 s = ~22.5 s of the 22.9**. `FID_C_REACH=1` (new, opt-in)
+      applies reach_keep_set to the C path — verified the filtered C still
+      compiles and runs — but on the self-compile reach keeps ~97% of fns
+      (73.6→71.4 MB C; lower unchanged): it only pays off on small programs
+      (a `use vec` hello: −7.5% C). The honest lever for <10 s is a CS6-style
+      per-function *lowered-IR* artifact (cache `IrFunction`s, not just
+      native bytes), applied before C codegen — the frontend side is done.
 - [~] CS5. Parallel front end and code generation on all cores (L).
       Done (borrowck slice, opt-in): `FID_PAR=N` splits the borrow check's
       function set across N workers (own `BorrowChecker` each, chunks merged
@@ -456,14 +472,25 @@ This is the race we can win outright, since no rival's speed comes for free.
       byte-identical (zero cost when off); hit emits are deterministic
       (converged images equal across runs) and run correctly — layouts can
       legitimately differ from all-fresh images since replays relink.
-      Left: the text row format (hex bytes + decimal fields) costs ~20 s to
-      parse at -O0 for a 550 KB / 144-fn file — a net loss until the format
-      is binary (`ast_ser.fd`'s byte codec is the model: Vec<i64> payload +
-      `p_file_write_vec`, no NUL-through-str); also cold-split fidelity is
-      approximate (order can shift) and cached functions get no line-table
-      rows. The frontend half is done (CS2).
-      a one-line change still recompiles the whole binary (~0.5 s on hello vs
-      the 100 ms target).
+      Binary format (this session): the cache now uses ast_ser.fd's byte
+      codec (AwBuf/ArBuf, `p_file_write_vec`/`p_file_read_bytes` — no
+      NUL-through-str), version 2 with a `GBD`-magic header. Measured on the
+      -O2 fid-dev, hello `--nat`: 288 KB artifact (was ~550 KB text), and on
+      a warm hit `native code` 138→35 ms with `nat alloc+emit` 86→9 ms;
+      repeated hits converge deterministically and the emitted binary runs.
+      Left: cold-split fidelity is approximate (order can shift), cached
+      functions get no line-table rows, and a one-line change still
+      recompiles the whole binary (~0.5 s on hello vs the 100 ms target —
+      the frontend+mid-end around the cache is the gap, not the cache).
+      Nov 13 blocker analysis (fid-dev -O2, hello --nat, all caches warm):
+      frontend 125 ms (astcache deser ~40 + typecheck 33 + borrowck 11 +
+      mono 18), mid-end 237 ms, native-with-fncache ~30 ms. The mid-end is
+      the next cache boundary but it is NOT per-function: iro_inline,
+      iro_conv_mark, iro_ipcp/spec/envtrim (iro_pass_on defaults on) read
+      and rewrite across the module — a callee change alters callers'
+      optimized IR, so a pre-opt per-function key is unsound. Phase C
+      needs call-graph transitive-closure keys (or a per-fn/module pass
+      split) before hits can skip the mid-end.
 - [x] CS7. A fast debug mode with no optimizer, and a release mode (S).
       Done: `--debug` (C at -O0) and `--release` (-O2) on `ccompile` in both compilers.
 - [x] CS8. No linear scans in the self-hosted compiler: tables, not `Vec` searches
@@ -742,14 +769,16 @@ owning what we ship.
       client over IPv6 and IPv4) and a TLS round trip with a self-signed
       certificate on C and native. Left: permessage-deflate.
 - [~] SL4. TLS 1.3 on every platform (release I7) (M).
-      Verified live: `fetch("https://github.com/")` over Schannel returns
-      200 + full body on the PE backend; `tls_session_protocol` (new,
-      QueryContextAttributes CONNECTION_INFO) reports the negotiated
-      version — 2048 (TLS 1.2) today. Pinning SP_PROT_TLS1_3 in
-      grbitEnabledProtocols fails the handshake: Schannel 1.3 needs the
-      SCH_CRED + TLS_PARAMETERS credentials structure. Unix side goes
-      through OpenSSL (1.3-capable). Left: SCH_CRED credentials path on
-      Windows + a suite-visible handshake check (needs network).
+      Verified live: `tls_connect13("github.com", 443)` over Schannel
+      negotiates SP_PROT_TLS1_3_CLIENT (8192, checked via
+      tls_session_protocol) — the SCH_CRED + TLS_PARAMETERS credentials
+      path is in (`tls_client13`/`tls_connect13`/`ts_acquire13` pin
+      grbitDisabledProtocols = ~SP_PROT_TLS1_3; the legacy
+      grbitEnabledProtocols field can't express 1.3). Default
+      tls_client keeps system negotiation (TLS 1.2 on some servers).
+      Unix side goes through OpenSSL (1.3-capable). Left: TLS 1.3 on
+      the server-credential path (paSecret vs paPublic) + a
+      suite-visible handshake check (needs network).
 - [~] SL5. DNS with caching, IPv6 everywhere (M).
       Done: `stdlib/dns.fd` parses every answer record with its TTL
       (bounds-checked names), A and AAAA, IPv6 text as RFC 5952, a cache by
@@ -837,7 +866,14 @@ owning what we ship.
       `stdlib/profiler.fd` is a scope profiler (caller-driven
       begin/end regions, frame/GPU timing) and `fidesc profile` is
       one-shot; nothing samples a running service or exposes stacks
-      over a control channel.
+      over a control channel. Investigated (Nov 11) whether the pe_runtime
+      green-task scheduler can sample other tasks' PCs: a parked task's
+      context keeps only [saved RSP, stack base] — its stack can be walked
+      from there (pe_runtime/conc.fd §"Task contexts"), giving a
+      WAIT-profile of where tasks yield or block. CPU-time sampling needs
+      suspending an OS worker mid-run (SuspendThread + GetThreadContext on
+      worker handles, which the scheduler does not currently export) —
+      real L work in the runtime, not a stdlib add-on.
 - [x] SL16. Big integers and decimals (M).
       Done: `stdlib/bigint.fd` (`test_bigint.fd`) and `stdlib/decimal.fd`:
       exact decimals on a BigInt mantissa, division and rounding to a scale
@@ -874,6 +910,33 @@ owning what we ship.
       `scancode.fd` (PS/2 set-1), `pmm.fd` (bitmap PMM + x86-64 paging),
       `slab.fd`. `test_os_stdlib.fd` passes on interp and native. Port and
       MMIO access stays platform driver code by design.
+- [x] SL21. AI weight-path and inference kernels (M).
+      Done (Nov 11): `safetensors.fd` — the standard HF weight format:
+      u64 header length, JSON map, per-tensor dtype/shape/data_offsets
+      validation, aligned-buffer reads; f16/bf16/f32 decode in pure
+      Fides bit math (the interps have no f32-from-bits primitive).
+      `bpe.fd` — vocab.json + merges.txt tokenizer (encode/decode).
+      `infer.fd` — the transformer kernels on flat Vec<f64>: matvec,
+      RMSNorm, RoPE, stable softmax, argmax, top-k, top-p sampling,
+      single-head attention. `noise.fd` — Perlin/fBm/Poisson-disk for
+      procgen. `test_ai_stdlib.fd` passes interp + native. A full
+      forward pass still needs the glue (embedding lookup, per-layer
+      loop, kv_cache wiring) — the pieces are verified, the model loop
+      is the next step.
+- [x] SL22. Game content pipeline: glTF + Tiled + noise (M).
+      Done (Nov 11): `gltf.fd` — .glb container framing (magic/version/
+      chunks), accessor resolution to a struct (once per accessor, not
+      per element — per-lookup JSON is unusable at real model sizes),
+      every componentType and VEC/MAT arity, byteStride, normalized
+      ints; feeds mesh.fd's Mesh (positions/normals/uv/indices).
+      `tiled.fd` — TMJ maps: tile layers into tilemap.fd with an
+      optional solid layer, object groups (point/rect/tile + custom
+      properties), flip-flag gids. `test_gaming_stdlib.fd` passes
+      native; interp-skipped (each json_* call revalidates the doc —
+      O(n^2) per lookup on the interpreter). mesh.fd grew
+      texcoord_create (cross-module struct literals don't parse);
+      mesh/asset/data moved off the nonportable
+      p_str_take(p_file_read()) onto core's file_read.
 
 **Acceptance:** a real web service needs no package outside the stdlib.
 

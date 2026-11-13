@@ -47,6 +47,7 @@ pub enum OptEscVar {
 /// A function body with the name it is called by (`Type_method` for methods).
 pub struct EscFunc {
     pub key: str,
+    pub skey: str,   // skip-set key ("fn:n" / "impl:s:m" / "trait:t:m")
     pub func: Func,
 }
 
@@ -203,7 +204,7 @@ pub fn EscapeChecker_new(program: Program) -> EscapeChecker {
     var i: i64 = 0;
     while i < program.funcs.len() {
         var f: Func = program.funcs.get(i);
-        all.push(EscFunc { key: f.name, func: f });
+        all.push(EscFunc { key: f.name, skey: "fn:" + f.name, func: f });
         i = i + 1;
     }
     var ii: i64 = 0;
@@ -212,7 +213,7 @@ pub fn EscapeChecker_new(program: Program) -> EscapeChecker {
         var mi: i64 = 0;
         while mi < imp.methods.len() {
             var m: Func = imp.methods.get(mi);
-            all.push(EscFunc { key: imp.struct_name + "_" + m.name, func: m });
+            all.push(EscFunc { key: imp.struct_name + "_" + m.name, skey: "impl:" + imp.struct_name + ":" + m.name, func: m });
             mi = mi + 1;
         }
         ii = ii + 1;
@@ -223,7 +224,7 @@ pub fn EscapeChecker_new(program: Program) -> EscapeChecker {
         var tmi: i64 = 0;
         while tmi < timp.methods.len() {
             var tm: Func = timp.methods.get(tmi);
-            all.push(EscFunc { key: timp.type_name + "_" + tm.name, func: tm });
+            all.push(EscFunc { key: timp.type_name + "_" + tm.name, skey: "trait:" + timp.type_name + ":" + tm.name, func: tm });
             tmi = tmi + 1;
         }
         ti = ti + 1;
@@ -1555,6 +1556,13 @@ fn esc_idents_expr(e: Expr, out: &mut Vec<str>) {
 
 /// Run the escape check over every function of `program`.
 pub fn escape_check(program: Program) -> Vec<str> {
+    return escape_check_skipped(program, 0);
+}
+
+// Trusted bodies were checked clean once: the summary fixpoint still runs
+// over every function (user code may receive references back), but the
+// reporting pass skips bodies in the skip set.
+pub fn escape_check_skipped(program: Program, skip: i64) -> Vec<str> {
     var c: EscapeChecker = EscapeChecker_new(program);
     esc_check_decls(&mut c, program);
     // Infer which parameters reach each function's result, to a fixpoint.
@@ -1582,7 +1590,9 @@ pub fn escape_check(program: Program) -> Vec<str> {
     var j: i64 = 0;
     while j < c.all.len() {
         var ef2: EscFunc = c.all.get(j);
-        esc_analyze_func(&mut c, ef2.key, ef2.func);
+        if skip == 0 || !HashMap_contains(skip, ef2.skey) {
+            esc_analyze_func(&mut c, ef2.key, ef2.func);
+        }
         j = j + 1;
     }
     return c.errors;

@@ -272,9 +272,52 @@ fn ts_acquire(s: i64, usage: i64, flags: i64, cert_slot: i64) -> bool {
     return rc == TS_OK;
 }
 
+// SCH_CRED: 104 bytes; dwVersion at 0 (SCH_CRED_VERSION = 5), cCreds at 4,
+// paSecret at 8, paPublic at 16, grbitEnabledProtocols at 56, dwFlags at 72,
+// cTlsParameters at 80, pTlsParameters at 88. TLS_PARAMETERS: 40 bytes;
+// cAlpnIds at 0, rgstrAlpnIds at 8, grbitDisabledProtocols at 16,
+// cDisabledCrypto at 20, pDisabledCrypto at 24, dwFlags at 32. TLS 1.3 can
+// only be requested this way: the legacy grbitEnabledProtocols field stops
+// at TLS 1.2 (release-roadmap I7).
+fn ts_acquire13(s: i64, usage: i64, flags: i64, cert_slot: i64, disabled: i64) -> bool {
+    val params: i64 = ts_zeroed(5);
+    ts_set32(params + 16, disabled);
+    val cred: i64 = ts_zeroed(13);
+    ts_set32(cred, 5);
+    if cert_slot != 0 {
+        ts_set32(cred + 4, 1);
+        ts_set(cred + 8, cert_slot);
+    }
+    ts_set32(cred + 72, flags);
+    ts_set32(cred + 80, 1);
+    ts_set(cred + 88, params);
+    val expiry: i64 = ts_zeroed(1);
+    val rc: i64 = sc_acquire(0, TS_PACKAGE, usage, 0, cred, 0, 0, s + TS_CRED * 8, expiry);
+    p_free(cred);
+    p_free(params);
+    p_free(expiry);
+    return rc == TS_OK;
+}
+
 fn ts_client(fd: i64, host: str, flags: i64) -> i64 {
     val s: i64 = ts_session(fd);
     if !ts_acquire(s, 2, flags, 0) {
+        ts_free_session(s);
+        return 0;
+    }
+    ts_put(s, TS_OWNS_CRED, 1);
+    if !ts_handshake(s, host, false) {
+        sc_free_cred(s + TS_CRED * 8);
+        ts_free_session(s);
+        return 0;
+    }
+    return s;
+}
+
+fn ts_client13(fd: i64, host: str, flags: i64) -> i64 {
+    val s: i64 = ts_session(fd);
+    // Disable every protocol bit except SP_PROT_TLS1_3 (0x3000): 0xFFFFCFFF.
+    if !ts_acquire13(s, 2, flags, 0, 4294945535) {
         ts_free_session(s);
         return 0;
     }
@@ -301,6 +344,27 @@ pub fn tls_connect(host: str, port: i64) -> i64 {
         return 0;
     }
     val s: i64 = tls_client(fd, host);
+    if s == 0 {
+        p_socket_close(fd);
+    }
+    return s;
+}
+
+/// A TLS 1.3-only session over the connected socket `fd`, checking `host`'s
+/// certificate. Needs Windows 11 / Server 2022+. Returns 0 on failure.
+/// tls_session_protocol on a success returns SP_PROT_TLS1_3_CLIENT (8192).
+pub fn tls_client13(fd: i64, host: str) -> i64 {
+    return ts_client13(fd, host, 4194352);
+}
+
+/// As tls_connect, but pinned to TLS 1.3. The session owns the socket.
+/// Returns 0 when the OS or peer lacks TLS 1.3.
+pub fn tls_connect13(host: str, port: i64) -> i64 {
+    val fd: i64 = p_co_connect(host, port);
+    if fd < 0 {
+        return 0;
+    }
+    val s: i64 = tls_client13(fd, host);
     if s == 0 {
         p_socket_close(fd);
     }

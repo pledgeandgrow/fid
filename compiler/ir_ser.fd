@@ -1,0 +1,674 @@
+// Binary codec for IrFunction — the per-function lowered-IR cache (CS4).
+// Same AwBuf/ArBuf byte codec as ast_ser.fd; instructions reference
+// functions/strings/globals by name, so a replayed IrFunction needs no
+// fixups — names re-intern against the live module tables.
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::ast_ser;
+use compiler::inc;
+
+fn iw_bool(b: &mut AwBuf, v: bool) { if v { aw_i64(b, 1); } else { aw_i64(b, 0); } }
+fn ir_bool(r: &mut ArBuf) -> bool { return ar_i64(r) != 0; }
+
+fn iw_vec_i64(b: &mut AwBuf, v: Vec<i64>) {
+    aw_i64(b, v.len()); var i: i64 = 0;
+    while i < v.len() { aw_i64(b, v.get(i)); i = i + 1; }
+}
+fn ir_vec_i64(r: &mut ArBuf) -> Vec<i64> {
+    var n: i64 = ar_i64(r); var v: Vec<i64> = Vec::new(); var i: i64 = 0;
+    while i < n { v.push(ar_i64(r)); i = i + 1; }
+    return v;
+}
+
+pub fn iw_irtype(b: &mut AwBuf, t: IrType) {
+    match t {
+        IrType::I8 => { aw_i64(b, 0); }
+        IrType::I16 => { aw_i64(b, 1); }
+        IrType::I32 => { aw_i64(b, 2); }
+        IrType::I64 => { aw_i64(b, 3); }
+        IrType::U8 => { aw_i64(b, 4); }
+        IrType::U16 => { aw_i64(b, 5); }
+        IrType::U32 => { aw_i64(b, 6); }
+        IrType::U64 => { aw_i64(b, 7); }
+        IrType::F32 => { aw_i64(b, 8); }
+        IrType::F64 => { aw_i64(b, 9); }
+        IrType::Bool => { aw_i64(b, 10); }
+        IrType::Ptr(inner) => { aw_i64(b, 11); iw_irtype(b, inner); }
+        IrType::Struct(n) => { aw_i64(b, 12); aw_str(b, n); }
+        IrType::Array(elem, count) => { aw_i64(b, 13); iw_irtype(b, elem); aw_i64(b, count); }
+        IrType::Void => { aw_i64(b, 14); }
+        IrType::Never => { aw_i64(b, 15); }
+        IrType::Opaque(n) => { aw_i64(b, 16); aw_str(b, n); }
+        IrType::Generic(n, ps) => {
+            aw_i64(b, 17); aw_str(b, n); aw_i64(b, ps.len());
+            var i: i64 = 0;
+            while i < ps.len() { iw_irtype(b, ps.get(i)); i = i + 1; }
+        }
+    }
+}
+pub fn ir_irtype(r: &mut ArBuf) -> IrType {
+    var t: i64 = ar_i64(r);
+    if t == 0 { return IrType::I8; }
+    if t == 1 { return IrType::I16; }
+    if t == 2 { return IrType::I32; }
+    if t == 3 { return IrType::I64; }
+    if t == 4 { return IrType::U8; }
+    if t == 5 { return IrType::U16; }
+    if t == 6 { return IrType::U32; }
+    if t == 7 { return IrType::U64; }
+    if t == 8 { return IrType::F32; }
+    if t == 9 { return IrType::F64; }
+    if t == 10 { return IrType::Bool; }
+    if t == 11 { var x: IrType = ir_irtype(r); return IrType::Ptr(Box::new(x)); }
+    if t == 12 { return IrType::Struct(ar_str(r)); }
+    if t == 13 { var e: IrType = ir_irtype(r); return IrType::Array(Box::new(e), ar_i64(r)); }
+    if t == 14 { return IrType::Void; }
+    if t == 15 { return IrType::Never; }
+    if t == 16 { return IrType::Opaque(ar_str(r)); }
+    if t == 17 {
+        var n: str = ar_str(r); var c: i64 = ar_i64(r);
+        var ps: Vec<IrType> = Vec::new(); var i: i64 = 0;
+        while i < c { ps.push(ir_irtype(r)); i = i + 1; }
+        return IrType::Generic(n, ps);
+    }
+    r.ok = false; return IrType::Void;
+}
+
+fn iw_region(b: &mut AwBuf, rg: Region) {
+    match rg {
+        Region::Stack => { aw_i64(b, 0); }
+        Region::Heap => { aw_i64(b, 1); }
+        Region::Static => { aw_i64(b, 2); }
+        Region::Named(n) => { aw_i64(b, 3); aw_str(b, n); }
+    }
+}
+fn ir_region(r: &mut ArBuf) -> Region {
+    var t: i64 = ar_i64(r);
+    if t == 0 { return Region::Stack; }
+    if t == 1 { return Region::Heap; }
+    if t == 2 { return Region::Static; }
+    if t == 3 { return Region::Named(ar_str(r)); }
+    r.ok = false; return Region::Stack;
+}
+
+fn iw_effect(b: &mut AwBuf, e: Effect) {
+    var t: i64 = 0;
+    match e {
+        Effect::Alloc => { t = 0; }
+        Effect::IO => { t = 1; }
+        Effect::Net => { t = 2; }
+        Effect::Spawn => { t = 3; }
+        Effect::Diverge => { t = 4; }
+        Effect::Read => { t = 5; }
+        Effect::Write => { t = 6; }
+        Effect::Diff => { t = 7; }
+        Effect::Noise => { t = 8; }
+        Effect::Comm => { t = 9; }
+    }
+    aw_i64(b, t);
+}
+fn ir_effect(r: &mut ArBuf) -> Effect {
+    var t: i64 = ar_i64(r);
+    if t == 0 { return Effect::Alloc; }
+    if t == 1 { return Effect::IO; }
+    if t == 2 { return Effect::Net; }
+    if t == 3 { return Effect::Spawn; }
+    if t == 4 { return Effect::Diverge; }
+    if t == 5 { return Effect::Read; }
+    if t == 6 { return Effect::Write; }
+    if t == 7 { return Effect::Diff; }
+    if t == 8 { return Effect::Noise; }
+    if t == 9 { return Effect::Comm; }
+    r.ok = false; return Effect::Alloc;
+}
+
+fn iw_effects(b: &mut AwBuf, s: EffectSet) {
+    aw_i64(b, s.effects.len()); var i: i64 = 0;
+    while i < s.effects.len() { iw_effect(b, s.effects.get(i)); i = i + 1; }
+}
+fn ir_effects(r: &mut ArBuf) -> EffectSet {
+    var n: i64 = ar_i64(r); var s: EffectSet = EffectSet_new(); var i: i64 = 0;
+    while i < n { s.effects.push(ir_effect(r)); i = i + 1; }
+    return s;
+}
+
+fn iw_borrow(b: &mut AwBuf, k: BorrowKind) {
+    var t: i64 = 0;
+    match k {
+        BorrowKind::None => { t = 0; }
+        BorrowKind::Shared => { t = 1; }
+        BorrowKind::Mut => { t = 2; }
+    }
+    aw_i64(b, t);
+}
+fn ir_borrow(r: &mut ArBuf) -> BorrowKind {
+    var t: i64 = ar_i64(r);
+    if t == 0 { return BorrowKind::None; }
+    if t == 1 { return BorrowKind::Shared; }
+    if t == 2 { return BorrowKind::Mut; }
+    r.ok = false; return BorrowKind::None;
+}
+
+fn iw_optu64(b: &mut AwBuf, o: OptU64) {
+    match o {
+        OptU64::Some(v) => { aw_i64(b, 1); aw_i64(b, v); }
+        OptU64::None => { aw_i64(b, 0); }
+    }
+}
+fn ir_optu64(r: &mut ArBuf) -> OptU64 {
+    if ar_i64(r) != 0 { return OptU64::Some(ar_i64(r)); }
+    return OptU64::None;
+}
+
+fn iw_optirtype(b: &mut AwBuf, o: OptIrType) {
+    match o {
+        OptIrType::Some(t) => { aw_i64(b, 1); iw_irtype(b, t); }
+        OptIrType::None => { aw_i64(b, 0); }
+    }
+}
+fn ir_optirtype(r: &mut ArBuf) -> OptIrType {
+    if ar_i64(r) != 0 { return OptIrType::Some(ir_irtype(r)); }
+    return OptIrType::None;
+}
+
+fn iw_optvalueid(b: &mut AwBuf, o: OptValueId) {
+    match o {
+        OptValueId::Some(v) => { aw_i64(b, 1); aw_i64(b, v); }
+        OptValueId::None => { aw_i64(b, 0); }
+    }
+}
+fn ir_optvalueid(r: &mut ArBuf) -> OptValueId {
+    if ar_i64(r) != 0 { return OptValueId::Some(ar_i64(r)); }
+    return OptValueId::None;
+}
+
+fn iw_vidtype(b: &mut AwBuf, v: ValueIdType) { aw_i64(b, v.id); iw_irtype(b, v.ty); }
+fn ir_vidtype(r: &mut ArBuf) -> ValueIdType { var vid: i64 = ar_i64(r); return ValueIdType_new(vid, ir_irtype(r)); }
+fn iw_vidstr(b: &mut AwBuf, v: ValueIdString) { aw_i64(b, v.id); aw_str(b, v.name); }
+fn ir_vidstr(r: &mut ArBuf) -> ValueIdString { return ValueIdString_new(ar_i64(r), ar_str(r)); }
+fn iw_strvid(b: &mut AwBuf, v: StringValueId) { aw_str(b, v.name); aw_i64(b, v.id); }
+fn ir_strvid(r: &mut ArBuf) -> StringValueId { return StringValueId_new(ar_str(r), ar_i64(r)); }
+fn iw_vidu64(b: &mut AwBuf, v: ValueIdU64) { aw_i64(b, v.id); aw_i64(b, v.val); }
+fn ir_vidu64(r: &mut ArBuf) -> ValueIdU64 { return ValueIdU64_new(ar_i64(r), ar_i64(r)); }
+
+fn iw_meta(b: &mut AwBuf, m: ValueMeta) {
+    iw_irtype(b, m.ty); iw_region(b, m.region); iw_effects(b, m.effects);
+    iw_optu64(b, m.source_line); iw_bool(b, m.in_sandbox);
+    iw_bool(b, m.is_linear); iw_borrow(b, m.borrow_kind);
+}
+fn ir_meta(r: &mut ArBuf) -> ValueMeta {
+    var m: ValueMeta = ValueMeta_new(ir_irtype(r));
+    m.region = ir_region(r); m.effects = ir_effects(r);
+    m.source_line = ir_optu64(r); m.in_sandbox = ir_bool(r);
+    m.is_linear = ir_bool(r); m.borrow_kind = ir_borrow(r);
+    return m;
+}
+
+fn iw_binop(b: &mut AwBuf, o: BinOp) {
+    var t: i64 = 0;
+    match o {
+        BinOp::Add => { t = 0; } BinOp::Sub => { t = 1; } BinOp::Mul => { t = 2; }
+        BinOp::Div => { t = 3; } BinOp::Mod => { t = 4; } BinOp::Eq => { t = 5; }
+        BinOp::Neq => { t = 6; } BinOp::Lt => { t = 7; } BinOp::Gt => { t = 8; }
+        BinOp::LtEq => { t = 9; } BinOp::GtEq => { t = 10; } BinOp::And => { t = 11; }
+        BinOp::Or => { t = 12; } BinOp::BitAnd => { t = 13; } BinOp::BitOr => { t = 14; }
+        BinOp::BitXor => { t = 15; } BinOp::Shl => { t = 16; } BinOp::Shr => { t = 17; }
+    }
+    aw_i64(b, t);
+}
+fn ir_binop(r: &mut ArBuf) -> BinOp {
+    var t: i64 = ar_i64(r);
+    if t == 0 { return BinOp::Add; } if t == 1 { return BinOp::Sub; }
+    if t == 2 { return BinOp::Mul; } if t == 3 { return BinOp::Div; }
+    if t == 4 { return BinOp::Mod; } if t == 5 { return BinOp::Eq; }
+    if t == 6 { return BinOp::Neq; } if t == 7 { return BinOp::Lt; }
+    if t == 8 { return BinOp::Gt; } if t == 9 { return BinOp::LtEq; }
+    if t == 10 { return BinOp::GtEq; } if t == 11 { return BinOp::And; }
+    if t == 12 { return BinOp::Or; } if t == 13 { return BinOp::BitAnd; }
+    if t == 14 { return BinOp::BitOr; } if t == 15 { return BinOp::BitXor; }
+    if t == 16 { return BinOp::Shl; } if t == 17 { return BinOp::Shr; }
+    r.ok = false; return BinOp::Add;
+}
+fn iw_unop(b: &mut AwBuf, o: UnaryOp) {
+    var t: i64 = 0;
+    match o {
+        UnaryOp::Neg => { t = 0; }
+        UnaryOp::Not => { t = 1; }
+        UnaryOp::BitNot => { t = 2; }
+    }
+    aw_i64(b, t);
+}
+fn ir_unop(r: &mut ArBuf) -> UnaryOp {
+    var t: i64 = ar_i64(r);
+    if t == 0 { return UnaryOp::Neg; }
+    if t == 1 { return UnaryOp::Not; }
+    if t == 2 { return UnaryOp::BitNot; }
+    r.ok = false; return UnaryOp::Neg;
+}
+
+fn iw_inst(b: &mut AwBuf, x: Inst) {
+    match x {
+        Inst::ConstInt(v, ty) => { aw_i64(b, 0); aw_i64(b, v); iw_irtype(b, ty); }
+        Inst::ConstFloat(v, ty) => { aw_i64(b, 1); aw_i64(b, p_f64_to_bits(v)); iw_irtype(b, ty); }
+        Inst::ConstBool(v) => { aw_i64(b, 2); iw_bool(b, v); }
+        Inst::ConstStr(s) => { aw_i64(b, 3); aw_str(b, s); }
+        Inst::ConstFnRef(s) => { aw_i64(b, 4); aw_str(b, s); }
+        Inst::ConstNull(ty) => { aw_i64(b, 5); iw_irtype(b, ty); }
+        Inst::GlobalAddr(n, ty) => { aw_i64(b, 6); aw_str(b, n); iw_irtype(b, ty); }
+        Inst::BinOp(o, l, rr, ty) => { aw_i64(b, 7); iw_binop(b, o); aw_i64(b, l); aw_i64(b, rr); iw_irtype(b, ty); }
+        Inst::UnaryOp(o, v, ty) => { aw_i64(b, 8); iw_unop(b, o); aw_i64(b, v); iw_irtype(b, ty); }
+        Inst::Alloca(ty, rg) => { aw_i64(b, 9); iw_irtype(b, ty); iw_region(b, rg); }
+        Inst::Load(a, ty) => { aw_i64(b, 10); aw_i64(b, a); iw_irtype(b, ty); }
+        Inst::Store(a, v, ty) => { aw_i64(b, 11); aw_i64(b, a); aw_i64(b, v); iw_optirtype(b, ty); }
+        Inst::GetFieldPtr(a, f, ty) => { aw_i64(b, 12); aw_i64(b, a); aw_i64(b, f); iw_irtype(b, ty); }
+        Inst::GetElemPtr(a, ix, ty) => { aw_i64(b, 13); aw_i64(b, a); aw_i64(b, ix); iw_irtype(b, ty); }
+        Inst::Jump(t) => { aw_i64(b, 14); aw_i64(b, t); }
+        Inst::Branch(c, t1, t2) => { aw_i64(b, 15); aw_i64(b, c); aw_i64(b, t1); aw_i64(b, t2); }
+        Inst::Return(v) => { aw_i64(b, 16); iw_optvalueid(b, v); }
+        Inst::Unreachable => { aw_i64(b, 17); }
+        Inst::Call(n, args, ty, fx) => {
+            aw_i64(b, 18); aw_str(b, n); iw_vec_i64(b, args); iw_irtype(b, ty); iw_effects(b, fx);
+        }
+        Inst::CallPtr(p, args, ty, fx, tail) => {
+            aw_i64(b, 19); aw_i64(b, p); iw_vec_i64(b, args); iw_irtype(b, ty); iw_effects(b, fx); iw_bool(b, tail);
+        }
+        Inst::DynCall(t, m, args, ty, fx) => {
+            aw_i64(b, 20); aw_str(b, t); aw_str(b, m); iw_vec_i64(b, args); iw_irtype(b, ty); iw_effects(b, fx);
+        }
+        Inst::MakeDyn(v, t, m) => { aw_i64(b, 21); aw_i64(b, v); aw_str(b, t); aw_str(b, m); }
+        Inst::BitCast(v, f, t) => { aw_i64(b, 22); aw_i64(b, v); iw_irtype(b, f); iw_irtype(b, t); }
+        Inst::IntExtend(v, f, t) => { aw_i64(b, 23); aw_i64(b, v); iw_irtype(b, f); iw_irtype(b, t); }
+        Inst::IntTrunc(v, f, t) => { aw_i64(b, 24); aw_i64(b, v); iw_irtype(b, f); iw_irtype(b, t); }
+        Inst::IntToFloat(v, f, t) => { aw_i64(b, 25); aw_i64(b, v); iw_irtype(b, f); iw_irtype(b, t); }
+        Inst::FloatToInt(v, f, t) => { aw_i64(b, 26); aw_i64(b, v); iw_irtype(b, f); iw_irtype(b, t); }
+        Inst::TryUnwrap(a, b1, c1, d1) => { aw_i64(b, 27); aw_i64(b, a); aw_i64(b, b1); aw_i64(b, c1); aw_i64(b, d1); }
+        Inst::Print(v, ty) => { aw_i64(b, 28); aw_i64(b, v); iw_irtype(b, ty); }
+        Inst::Panic(s) => { aw_i64(b, 29); aw_str(b, s); }
+        Inst::Asm(code, ins, outs, ty) => {
+            aw_i64(b, 30); aw_str(b, code);
+            aw_i64(b, ins.len()); var i: i64 = 0;
+            while i < ins.len() { iw_strvid(b, ins.get(i)); i = i + 1; }
+            aw_i64(b, outs.len()); i = 0;
+            while i < outs.len() { iw_strvid(b, outs.get(i)); i = i + 1; }
+            iw_irtype(b, ty);
+        }
+        Inst::RegionBegin(n, a, c, l) => { aw_i64(b, 31); aw_str(b, n); iw_bool(b, a); iw_bool(b, c); iw_optu64(b, l); }
+        Inst::RegionEnd(n, a, c) => { aw_i64(b, 32); aw_str(b, n); iw_bool(b, a); iw_bool(b, c); }
+        Inst::PersistLoad(n, v, ty) => { aw_i64(b, 33); aw_str(b, n); aw_i64(b, v); iw_irtype(b, ty); }
+        Inst::PersistSave(n, v) => { aw_i64(b, 34); aw_str(b, n); aw_i64(b, v); }
+        Inst::TxnBegin => { aw_i64(b, 35); }
+        Inst::TxnEnd => { aw_i64(b, 36); }
+        Inst::UnsafeBegin => { aw_i64(b, 37); }
+        Inst::UnsafeEnd => { aw_i64(b, 38); }
+        Inst::GradBegin(n) => { aw_i64(b, 39); aw_str(b, n); }
+        Inst::GradEnd => { aw_i64(b, 40); }
+        Inst::Backward(v) => { aw_i64(b, 41); aw_i64(b, v); }
+        Inst::StructCopy(d, s, ty) => { aw_i64(b, 42); aw_i64(b, d); aw_i64(b, s); iw_irtype(b, ty); }
+    }
+}
+
+fn ir_inst(r: &mut ArBuf) -> Inst {
+    var t: i64 = ar_i64(r);
+    if t == 0 { return Inst::ConstInt(ar_i64(r), ir_irtype(r)); }
+    if t == 1 { return Inst::ConstFloat(p_f64_from_bits(ar_i64(r)), ir_irtype(r)); }
+    if t == 2 { return Inst::ConstBool(ir_bool(r)); }
+    if t == 3 { return Inst::ConstStr(ar_str(r)); }
+    if t == 4 { return Inst::ConstFnRef(ar_str(r)); }
+    if t == 5 { return Inst::ConstNull(ir_irtype(r)); }
+    if t == 6 { return Inst::GlobalAddr(ar_str(r), ir_irtype(r)); }
+    if t == 7 { var o: BinOp = ir_binop(r); return Inst::BinOp(o, ar_i64(r), ar_i64(r), ir_irtype(r)); }
+    if t == 8 { var u: UnaryOp = ir_unop(r); return Inst::UnaryOp(u, ar_i64(r), ir_irtype(r)); }
+    if t == 9 { var ty: IrType = ir_irtype(r); return Inst::Alloca(ty, ir_region(r)); }
+    if t == 10 { return Inst::Load(ar_i64(r), ir_irtype(r)); }
+    if t == 11 { var a: i64 = ar_i64(r); var v: i64 = ar_i64(r); return Inst::Store(a, v, ir_optirtype(r)); }
+    if t == 12 { return Inst::GetFieldPtr(ar_i64(r), ar_i64(r), ir_irtype(r)); }
+    if t == 13 { return Inst::GetElemPtr(ar_i64(r), ar_i64(r), ir_irtype(r)); }
+    if t == 14 { return Inst::Jump(ar_i64(r)); }
+    if t == 15 { return Inst::Branch(ar_i64(r), ar_i64(r), ar_i64(r)); }
+    if t == 16 { return Inst::Return(ir_optvalueid(r)); }
+    if t == 17 { return Inst::Unreachable; }
+    if t == 18 { var n: str = ar_str(r); var a: Vec<i64> = ir_vec_i64(r); var ty: IrType = ir_irtype(r); return Inst::Call(n, a, ty, ir_effects(r)); }
+    if t == 19 { var p: i64 = ar_i64(r); var a2: Vec<i64> = ir_vec_i64(r); var t2: IrType = ir_irtype(r); var fx: EffectSet = ir_effects(r); return Inst::CallPtr(p, a2, t2, fx, ir_bool(r)); }
+    if t == 20 { var tn: str = ar_str(r); var m: str = ar_str(r); var a3: Vec<i64> = ir_vec_i64(r); var t3: IrType = ir_irtype(r); return Inst::DynCall(tn, m, a3, t3, ir_effects(r)); }
+    if t == 21 { return Inst::MakeDyn(ar_i64(r), ar_str(r), ar_str(r)); }
+    if t == 22 { return Inst::BitCast(ar_i64(r), ir_irtype(r), ir_irtype(r)); }
+    if t == 23 { return Inst::IntExtend(ar_i64(r), ir_irtype(r), ir_irtype(r)); }
+    if t == 24 { return Inst::IntTrunc(ar_i64(r), ir_irtype(r), ir_irtype(r)); }
+    if t == 25 { return Inst::IntToFloat(ar_i64(r), ir_irtype(r), ir_irtype(r)); }
+    if t == 26 { return Inst::FloatToInt(ar_i64(r), ir_irtype(r), ir_irtype(r)); }
+    if t == 27 { return Inst::TryUnwrap(ar_i64(r), ar_i64(r), ar_i64(r), ar_i64(r)); }
+    if t == 28 { return Inst::Print(ar_i64(r), ir_irtype(r)); }
+    if t == 29 { return Inst::Panic(ar_str(r)); }
+    if t == 30 {
+        var code: str = ar_str(r);
+        var ni: i64 = ar_i64(r); var ins: Vec<StringValueId> = Vec::new(); var i: i64 = 0;
+        while i < ni { ins.push(ir_strvid(r)); i = i + 1; }
+        var no: i64 = ar_i64(r); var outs: Vec<StringValueId> = Vec::new(); i = 0;
+        while i < no { outs.push(ir_strvid(r)); i = i + 1; }
+        return Inst::Asm(code, ins, outs, ir_irtype(r));
+    }
+    if t == 31 { var n2: str = ar_str(r); var a4: bool = ir_bool(r); var c2: bool = ir_bool(r); return Inst::RegionBegin(n2, a4, c2, ir_optu64(r)); }
+    if t == 32 { return Inst::RegionEnd(ar_str(r), ir_bool(r), ir_bool(r)); }
+    if t == 33 { return Inst::PersistLoad(ar_str(r), ar_i64(r), ir_irtype(r)); }
+    if t == 34 { return Inst::PersistSave(ar_str(r), ar_i64(r)); }
+    if t == 35 { return Inst::TxnBegin; }
+    if t == 36 { return Inst::TxnEnd; }
+    if t == 37 { return Inst::UnsafeBegin; }
+    if t == 38 { return Inst::UnsafeEnd; }
+    if t == 39 { return Inst::GradBegin(ar_str(r)); }
+    if t == 40 { return Inst::GradEnd; }
+    if t == 41 { return Inst::Backward(ar_i64(r)); }
+    if t == 42 { return Inst::StructCopy(ar_i64(r), ar_i64(r), ir_irtype(r)); }
+    r.ok = false; return Inst::Unreachable;
+}
+
+fn iw_block(b: &mut AwBuf, bb: BasicBlock) {
+    aw_i64(b, bb.id); iw_vec_i64(b, bb.instructions); iw_vec_i64(b, bb.predecessors);
+    aw_i64(b, bb.params.len()); var i: i64 = 0;
+    while i < bb.params.len() { iw_vidtype(b, bb.params.get(i)); i = i + 1; }
+}
+fn ir_block(r: &mut ArBuf) -> BasicBlock {
+    var bb: BasicBlock = BasicBlock_new(ar_i64(r));
+    bb.instructions = ir_vec_i64(r);
+    bb.predecessors = ir_vec_i64(r);
+    var n: i64 = ar_i64(r); var i: i64 = 0;
+    while i < n { bb.params.push(ir_vidtype(r)); i = i + 1; }
+    return bb;
+}
+
+/// Serialize one lowered function (post-Lowerer_lower_func, pre auto-drop
+/// passes — the auto-drop passes run on all functions uniformly after).
+pub fn iw_irfunc(b: &mut AwBuf, f: IrFunction) {
+    aw_str(b, f.name);
+    aw_i64(b, f.params.len()); var i: i64 = 0;
+    while i < f.params.len() { iw_vidtype(b, f.params.get(i)); i = i + 1; }
+    iw_irtype(b, f.ret_ty);
+    aw_i64(b, f.blocks.len()); i = 0;
+    while i < f.blocks.len() { iw_block(b, f.blocks.get(i)); i = i + 1; }
+    aw_i64(b, f.value_metas.len()); i = 0;
+    while i < f.value_metas.len() {
+        var vm: ValueIdMeta = f.value_metas.get(i);
+        aw_i64(b, vm.id); iw_meta(b, vm.meta);
+        i = i + 1;
+    }
+    aw_i64(b, f.insts.len()); i = 0;
+    while i < f.insts.len() {
+        var vi: ValueIdInst = f.insts.get(i);
+        aw_i64(b, vi.id); iw_inst(b, vi.inst);
+        i = i + 1;
+    }
+    iw_vec_i64(b, f.inst_at);
+    iw_effects(b, f.effects);
+    aw_i64(b, f.next_value); aw_i64(b, f.next_block);
+    aw_i64(b, f.current_block_idx); aw_i64(b, f.entry);
+    aw_i64(b, f.locals.len()); i = 0;
+    while i < f.locals.len() { iw_strvid(b, f.locals.get(i)); i = i + 1; }
+    iw_bool(b, f.is_interrupt); aw_i64(b, f.interrupt_vector);
+    aw_i64(b, f.persist_vars.len()); i = 0;
+    while i < f.persist_vars.len() { iw_strvid(b, f.persist_vars.get(i)); i = i + 1; }
+    aw_i64(b, f.drop_locals.len()); i = 0;
+    while i < f.drop_locals.len() { iw_vidstr(b, f.drop_locals.get(i)); i = i + 1; }
+    iw_bool(b, f.is_wrapping); iw_bool(b, f.is_deterministic);
+    iw_bool(b, f.is_crashfree); iw_optu64(b, f.gas_limit);
+    iw_bool(b, f.is_no_alloc); iw_bool(b, f.is_medical); iw_bool(b, f.is_kernel);
+    iw_vec_i64(b, f.workgroup_size); iw_bool(b, f.is_simd);
+    aw_i64(b, f.zeroize_locals.len()); i = 0;
+    while i < f.zeroize_locals.len() { iw_vidu64(b, f.zeroize_locals.get(i)); i = i + 1; }
+    iw_bool(b, f.internal_conv);
+}
+
+/// Deserialize an IrFunction; r.ok is false on any truncation/desync.
+pub fn ir_irfunc(r: &mut ArBuf) -> IrFunction {
+    var f: IrFunction = IrFunction_new(ar_str(r), IrType::Void);
+    // IrFunction_new seeds an entry block and workgroup_size [1,1,1];
+    // the serialized values are the whole truth — start from empty.
+    f.blocks = Vec::new();
+    f.workgroup_size = Vec::new();
+    var n: i64 = ar_i64(r); var i: i64 = 0;
+    while i < n { f.params.push(ir_vidtype(r)); i = i + 1; }
+    f.ret_ty = ir_irtype(r);
+    n = ar_i64(r); i = 0;
+    while i < n { f.blocks.push(ir_block(r)); i = i + 1; }
+    n = ar_i64(r); i = 0;
+    while i < n { var id: i64 = ar_i64(r); var m: ValueMeta = ir_meta(r); f.value_metas.push(ValueIdMeta_new(id, m)); i = i + 1; }
+    n = ar_i64(r); i = 0;
+    while i < n { var id2: i64 = ar_i64(r); var x: Inst = ir_inst(r); f.insts.push(ValueIdInst_new(id2, x)); i = i + 1; }
+    f.inst_at = ir_vec_i64(r);
+    f.effects = ir_effects(r);
+    f.next_value = ar_i64(r); f.next_block = ar_i64(r);
+    f.current_block_idx = ar_i64(r); f.entry = ar_i64(r);
+    n = ar_i64(r); i = 0;
+    while i < n { f.locals.push(ir_strvid(r)); i = i + 1; }
+    f.is_interrupt = ir_bool(r); f.interrupt_vector = ar_i64(r);
+    n = ar_i64(r); i = 0;
+    while i < n { f.persist_vars.push(ir_strvid(r)); i = i + 1; }
+    n = ar_i64(r); i = 0;
+    while i < n { f.drop_locals.push(ir_vidstr(r)); i = i + 1; }
+    f.is_wrapping = ir_bool(r); f.is_deterministic = ir_bool(r);
+    f.is_crashfree = ir_bool(r); f.gas_limit = ir_optu64(r);
+    f.is_no_alloc = ir_bool(r); f.is_medical = ir_bool(r); f.is_kernel = ir_bool(r);
+    f.workgroup_size = ir_vec_i64(r); f.is_simd = ir_bool(r);
+    n = ar_i64(r); i = 0;
+    while i < n { f.zeroize_locals.push(ir_vidu64(r)); i = i + 1; }
+    f.internal_conv = ir_bool(r);
+    return f;
+}
+
+// --- Per-function lowered-IR cache (FID_IRCACHE) ---
+// Key: hash over the function's AST (aw_func). Salt: hash over the program's
+// declaration context a body can consult while lowering — struct/enum/global/
+// extern/trait decls plus every function and method *signature* (bodies are
+// per-function keys, not salt: a body edit must not invalidate the world).
+// Env: FID_IRCACHE=<file>. Miss and uncached lowers produce identical modules.
+
+pub struct IrcEntry {
+    pub key: i64,
+    pub name: str,
+    pub bytes: Vec<i64>,
+}
+pub fn IrcEntry_new(k: i64, n: str, b: Vec<i64>) -> IrcEntry {
+    return IrcEntry { key: k, name: n, bytes: b };
+}
+
+pub var g_irc_on: bool = false;
+pub var g_irc_path: str = "";
+pub var g_irc_salt: i64 = 0;
+pub var g_irc_old: Vec<IrcEntry> = Vec::new();
+pub var g_irc_ix: i64 = 0;
+pub var g_irc_new: Vec<IrcEntry> = Vec::new();
+pub var g_irc_hits: i64 = 0;
+/// Types a replayed record carried: the caller re-registers them into the
+/// lowerer's own_types (Lowerer is not importable here -- circular dep).
+pub var g_irc_rtypes: Vec<Type> = Vec::new();
+
+@wrapping
+fn irc_hash_bytes(v: Vec<i64>) -> i64 {
+    var h: i64 = 1469598103934665603;
+    var i: i64 = 0;
+    while i < v.len() {
+        h = (h ^ v.get(i)) * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+/// Signature-only hash of one Func (params + ret + flags — NOT the body).
+fn irc_sig(b: &mut AwBuf, f: Func) {
+    aw_str(b, f.name); aw_params(b, f.params); aw_type(b, f.ret_ty);
+    aw_bool(b, f.is_async); aw_bool(b, f.is_comptime); aw_bool(b, f.is_pub);
+    aw_bool(b, f.is_interrupt);
+    aw_i64(b, f.annotations.len()); var ai: i64 = 0;
+    while ai < f.annotations.len() {
+        aw_str(b, f.annotations.get(ai).name);
+        ai = ai + 1;
+    }
+}
+
+/// Declaration-context salt for a whole Program.
+fn irc_salt(program: Program) -> i64 {
+    var b: AwBuf = awbuf_new();
+    aw_i64(&mut b, 7);
+    var i: i64 = 0;
+    while i < program.structs.len() { aw_structdef(&mut b, program.structs.get(i)); i = i + 1; }
+    i = 0;
+    while i < program.enums.len() { aw_enumdef(&mut b, program.enums.get(i)); i = i + 1; }
+    i = 0;
+    while i < program.globals.len() { aw_globalvar(&mut b, program.globals.get(i)); i = i + 1; }
+    i = 0;
+    while i < program.extern_decls.len() { aw_externdecl(&mut b, program.extern_decls.get(i)); i = i + 1; }
+    i = 0;
+    while i < program.traits.len() { aw_traitdef(&mut b, program.traits.get(i)); i = i + 1; }
+    i = 0;
+    while i < program.trait_impls.len() { aw_traitimpl(&mut b, program.trait_impls.get(i)); i = i + 1; }
+    i = 0;
+    while i < program.funcs.len() { irc_sig(&mut b, program.funcs.get(i)); i = i + 1; }
+    i = 0;
+    while i < program.impls.len() {
+        var imp: ImplDef = program.impls.get(i);
+        aw_str(&mut b, imp.struct_name);
+        var j: i64 = 0;
+        while j < imp.methods.len() { irc_sig(&mut b, imp.methods.get(j)); j = j + 1; }
+        i = i + 1;
+    }
+    return irc_hash_bytes(awbuf_bytes(&b));
+}
+
+/// Content key for one function: its whole AST.
+pub fn irc_fn_key(f: Func) -> i64 {
+    var b: AwBuf = awbuf_new();
+    aw_func(&mut b, f);
+    return irc_hash_bytes(awbuf_bytes(&b));
+}
+
+fn irc_rentry(r: &mut ArBuf) -> IrcEntry {
+    var e: IrcEntry = IrcEntry_new(ar_i64(r), ar_str(r), Vec::new());
+    var n: i64 = ar_i64(r); var i: i64 = 0;
+    while i < n { e.bytes.push(ar_i64(r)); i = i + 1; }
+    return e;
+}
+fn irc_wentry(b: &mut AwBuf, e: IrcEntry) {
+    aw_i64(b, e.key); aw_str(b, e.name); iw_vec_i64(b, e.bytes);
+}
+
+/// Initialize the cache for one lower() call; returns immediately when
+/// FID_IRCACHE is unset or the salt differs (file rewritten at finish).
+pub fn irc_begin(program: Program) {
+    var path: str = env_or_empty("FID_IRCACHE");
+    if str_len(path) == 0 { g_irc_on = false; return; }
+    g_irc_on = true; g_irc_path = path; g_irc_hits = 0;
+    g_irc_salt = irc_salt(program);
+    g_irc_old = Vec::new(); g_irc_new = Vec::new();
+    g_irc_ix = HashMap_new();
+    if p_file_exists(path) == 0 { return; }
+    var vb: Vec<i64> = p_file_read_bytes(path);
+    if vb.len() < 32 { return; }
+    var r: ArBuf = arbuf_new(vb);
+    var magic: i64 = ar_i64(&mut r);
+    var ver: i64 = ar_i64(&mut r);
+    var salt: i64 = ar_i64(&mut r);
+    var count: i64 = ar_i64(&mut r);
+    if magic != 5062211 || ver != 1 || salt != g_irc_salt { return; }
+    var i: i64 = 0;
+    while i < count {
+        var e: IrcEntry = irc_rentry(&mut r);
+        if !r.ok { return; }
+        g_irc_old.push(e);
+        HashMap_insert_i(g_irc_ix, e.key, g_irc_old.len());
+        i = i + 1;
+    }
+}
+
+/// Look up a cached function by (key,name); returns its serialized bytes
+/// or an empty Vec. The name check keeps same-key collisions honest.
+/// Hits re-record into g_irc_new so irc_finish keeps used entries alive.
+pub fn irc_lookup(key: i64, name: str) -> Vec<i64> {
+    var at: i64 = HashMap_get_i(g_irc_ix, key);
+    if at == 0 { return Vec::new(); }
+    var e: IrcEntry = g_irc_old.get(at - 1);
+    g_irc_new.push(e);
+    g_irc_hits = g_irc_hits + 1;
+    return e.bytes;
+}
+
+/// Record a just-lowered function for the finish write. `spawned` holds
+/// the functions its body-lower synthesized (__own_drop/dup_N and friends):
+/// on a later hit they are replayed back into the module too.
+pub fn irc_record(key: i64, f: IrFunction, spawned: Vec<IrFunction>, types: Vec<Type>) {
+    var b: AwBuf = awbuf_new();
+    aw_i64(&mut b, types.len());
+    var ti: i64 = 0;
+    while ti < types.len() { aw_type(&mut b, types.get(ti)); ti = ti + 1; }
+    aw_i64(&mut b, spawned.len());
+    var i: i64 = 0;
+    while i < spawned.len() {
+        var sb: AwBuf = awbuf_new();
+        iw_irfunc(&mut sb, spawned.get(i));
+        aw_str(&mut b, spawned.get(i).name);
+        iw_vec_i64(&mut b, awbuf_bytes(&sb));
+        i = i + 1;
+    }
+    var mb: AwBuf = awbuf_new();
+    iw_irfunc(&mut mb, f);
+    iw_vec_i64(&mut b, awbuf_bytes(&mb));
+    g_irc_new.push(IrcEntry_new(key, f.name, awbuf_bytes(&b)));
+}
+
+/// Re-intern the string constants a fresh lower would have registered.
+/// (Lowerer interns ConstStr operands at emit; Panic/Asm strings stay
+/// inside their insts and are not interned.)
+pub fn irc_reintern(module: &mut IrModule, f: IrFunction) {
+    var i: i64 = 0;
+    while i < f.insts.len() {
+        match f.insts.get(i).inst {
+            Inst::ConstStr(s) => { var _l: str = IrModule_intern_string(module, s); }
+            _ => {}
+        }
+        i = i + 1;
+    }
+}
+
+/// Replay a cached record: returns the main IrFunction after pushing any
+/// spawned helpers into the module. Sets r.ok false on desync.
+pub fn irc_replay(r: &mut ArBuf, module: &mut IrModule, l: &mut Lowerer) -> IrFunction {
+    var nty: i64 = ar_i64(r); var ti: i64 = 0;
+    g_irc_rtypes = Vec::new();
+    while ti < nty {
+        g_irc_rtypes.push(ar_type(r));
+        if !r.ok { return IrFunction_new("", IrType::Void); }
+        ti = ti + 1;
+    }
+    var nsp: i64 = ar_i64(r); var i: i64 = 0;
+    while i < nsp {
+        var nm: str = ar_str(r);
+        var sb: Vec<i64> = ir_vec_i64(r);
+        var sr: ArBuf = arbuf_new(sb);
+        var sf: IrFunction = ir_irfunc(&mut sr);
+        if !sr.ok { r.ok = false; return sf; }
+        irc_reintern(module, sf);
+        IrModule_add_function(module, sf);
+        i = i + 1;
+    }
+    var mb: Vec<i64> = ir_vec_i64(r);
+    var mr: ArBuf = arbuf_new(mb);
+    var f: IrFunction = ir_irfunc(&mut mr);
+    if !mr.ok { r.ok = false; }
+    return f;
+}
+
+/// Write back the records produced this build (fresh captures replace stale
+/// hits; dead functions drop out).
+pub fn irc_finish() {
+    if !g_irc_on { return; }
+    var b: AwBuf = awbuf_new();
+    aw_i64(&mut b, 5062211);
+    aw_i64(&mut b, 1);
+    aw_i64(&mut b, g_irc_salt);
+    aw_i64(&mut b, g_irc_new.len());
+    var i: i64 = 0;
+    while i < g_irc_new.len() { irc_wentry(&mut b, g_irc_new.get(i)); i = i + 1; }
+    p_file_write_vec(g_irc_path, awbuf_bytes(&b));
+    g_irc_on = false;
+}

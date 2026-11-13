@@ -377,10 +377,14 @@ The ten that matter most, in order:
       dedicated "clone required here because …" diagnostic (M).
 - [ ] CP5. **"`async` costs more than threads would"** (Rust, C#). Tasks switch in
       under 20 ns and allocate nothing per await (competitive RT9) (L).
-- [~] CP6. **"Bounds checks I can't get rid of safely"** (Rust, Go). The counted-loop
-      proof and range analysis already remove provably-safe checks — `fid explain`
-      shows `removed bounds check` on `while i < v.len() { v[i] }` (verified
-      Nov 10). Not done: facts from `if i < n` guards reaching the block (L).
+- [x] CP6. **"Bounds checks I can't get rid of safely"** (Rust, Go). The counted-loop
+      proof, range analysis, AND `if i < v.len()` guard-fact propagation now
+      remove provably-safe checks — `fid explain` shows `removed bounds check`
+      on both shapes (verified Nov 11: 3/3 removed in the guarded block;
+      kept when the index can be negative, when the vec is shrunk inside the
+      guard, and when the index is an unproven param — `&&` guards stay
+      conservative). peir_guard_ops in compiler/checks.fd; the may-shorten
+      whitelist now covers destructors/to-string helpers (pe.rs + checks.fd).
 - [x] CP7. **"Startup time is slow"** (Java, Python, JS). PE binaries have no
       runtime: hello measures at the raw C-binary floor (8.9 ms wall vs 9.9 ms
       for a trivial C exe — Windows process creation dominates; in-process
@@ -394,10 +398,10 @@ The ten that matter most, in order:
 
 ## Summary
 
-100 goals: 26 done, 23 partly done, 51 not started (Nov 10; CP1/CP7/CP8 verified
-by measurement, CP9 `fid lint --perf`, CP2/CP3 `fid explain` implemented, CP4/CP6
-partly — `--alloc` shows COW copies; counted-loop + range proofs remove checks,
-`if i < n` guard facts not yet propagated). The first done ones were
+100 goals: 27 done, 22 partly done, 51 not started (Nov 11; CP1/CP7/CP8 verified
+by measurement, CP9 `fid lint --perf`, CP2/CP3 `fid explain` implemented, CP6
+done — counted-loop, range, and `if i < v.len()` guard facts all remove checks;
+CP4 partly — `--alloc` shows COW copies). The first done ones were
 where the language's design already answers the complaint: no lifetime
 annotations, defined integers, no undefined behaviour in safe code, traces in
 every build, `@secret`, debug and release in one flag, and a written stability

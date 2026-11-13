@@ -37,6 +37,7 @@ pub struct SecSummary {
 
 pub struct SecFunc {
     pub key: str,
+    pub skey: str,   // skip-set key ("fn:n" / "impl:s:m" / "trait:t:m")
     pub func: Func,
 }
 
@@ -144,7 +145,7 @@ pub fn SecrecyChecker_new(program: Program) -> SecrecyChecker {
     var i: i64 = 0;
     while i < program.funcs.len() {
         var f: Func = program.funcs.get(i);
-        all.push(SecFunc { key: f.name, func: f });
+        all.push(SecFunc { key: f.name, skey: "fn:" + f.name, func: f });
         i = i + 1;
     }
     var ii: i64 = 0;
@@ -153,7 +154,7 @@ pub fn SecrecyChecker_new(program: Program) -> SecrecyChecker {
         var mi: i64 = 0;
         while mi < imp.methods.len() {
             var m: Func = imp.methods.get(mi);
-            all.push(SecFunc { key: imp.struct_name + "_" + m.name, func: m });
+            all.push(SecFunc { key: imp.struct_name + "_" + m.name, skey: "impl:" + imp.struct_name + ":" + m.name, func: m });
             mi = mi + 1;
         }
         ii = ii + 1;
@@ -164,7 +165,7 @@ pub fn SecrecyChecker_new(program: Program) -> SecrecyChecker {
         var tmi: i64 = 0;
         while tmi < timp.methods.len() {
             var tm: Func = timp.methods.get(tmi);
-            all.push(SecFunc { key: timp.type_name + "_" + tm.name, func: tm });
+            all.push(SecFunc { key: timp.type_name + "_" + tm.name, skey: "trait:" + timp.type_name + ":" + tm.name, func: tm });
             tmi = tmi + 1;
         }
         ti = ti + 1;
@@ -929,6 +930,13 @@ fn sec_method_call(self: &mut SecrecyChecker, receiver: Expr, method: str, args:
 
 /// Run the @secret check over every function of `program`.
 pub fn secrecy_check(program: Program) -> Vec<str> {
+    return secrecy_check_skipped(program, 0);
+}
+
+// Trusted bodies were checked clean once: the summary fixpoint still runs
+// over every function (secrets can flow back through return values), but
+// the reporting pass skips bodies in the skip set.
+pub fn secrecy_check_skipped(program: Program, skip: i64) -> Vec<str> {
     // Every label starts at an @secret annotation: none parsed, none to track.
     if !parser_saw_secret() { return Vec::new(); }
     var c: SecrecyChecker = SecrecyChecker_new(program);
@@ -946,7 +954,9 @@ pub fn secrecy_check(program: Program) -> Vec<str> {
     var j: i64 = 0;
     while j < c.all.len() {
         var sf2: SecFunc = c.all.get(j);
-        sec_analyze_func(&mut c, sf2.key, sf2.func);
+        if skip == 0 || !HashMap_contains(skip, sf2.skey) {
+            sec_analyze_func(&mut c, sf2.key, sf2.func);
+        }
         j = j + 1;
     }
     return c.errors;
