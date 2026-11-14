@@ -36,6 +36,7 @@ use compiler::escape;
 use compiler::secrecy;
 use compiler::codegen_c;
 use compiler::comptime_eval;
+use compiler::cparser;
 use compiler::pe;
 use compiler::pe_ir;
 use compiler::inc;
@@ -1420,6 +1421,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
 
                             var found_path: str = "";
                             var found: bool = false;
+                            var is_header: bool = false;
                             var ci: i64 = 0;
                             while ci < candidates.len() {
                                 if c_file_exists(candidates.get(ci)) {
@@ -1432,14 +1434,55 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                                 ci = ci + 1;
                             }
 
+                            if !found {
+                                // LG15: `use foo` with no foo.fd but a foo.h
+                                // beside the program (or at the project root)
+                                // imports generated C bindings — the Zig
+                                // @cImport shape, resolved by filename.
+                                var hc: Vec<str> = Vec::new();
+                                hc.push(c_path_join(base_dir, str_concat(path_str, ".h")));
+                                hc.push(c_path_join(project_root, str_concat(path_str, ".h")));
+                                ci = 0;
+                                while ci < hc.len() {
+                                    if c_file_exists(hc.get(ci)) {
+                                        found_path = hc.get(ci);
+                                        found = true;
+                                        is_header = true;
+                                        break;
+                                    }
+                                    inc_record_absent(hc.get(ci));
+                                    ci = ci + 1;
+                                }
+                            }
+
                             if found {
                                 inc_record_file(found_path);
-                                // OPTIMIZATION: use cached file read + cached lex + cached parse
-                                var pre_toks: Vec<Token> = cached_lex(&mut token_cache, &mut content_cache, found_path);
+                                var pre_result_opt: OptProgram = OptProgram::None;
+                                var pre_toks: Vec<Token> = Vec::new();
+                                if is_header {
+                                    p_eprint_str("[build] C header import: ");
+                                    p_eprint_str(found_path);
+                                    p_eprint_str("\n");
+                                    var hsrc: str = cparse_header_file(found_path, "", "");
+                                    var hlex: Lexer = Lexer::new(hsrc);
+                                    var htoks: Vec<Token> = hlex.tokenize();
+                                    var hpar: Parser = Parser_with_names(htoks, struct_names, enum_names);
+                                    match hpar.parse() {
+                                        ParseResultProgram::Ok(hprog) => {
+                                            pre_result_opt = OptProgram::Some(hprog);
+                                        }
+                                        ParseResultProgram::Err(herr) => {
+                                            return ResultProgram::Err(c_vec1("C header import " + found_path + ": " + herr));
+                                        }
+                                    }
+                                } else {
+                                    // OPTIMIZATION: use cached file read + cached lex + cached parse
+                                    pre_toks = cached_lex(&mut token_cache, &mut content_cache, found_path);
 
-                                // Pre-scan: parse to extract imports and type names.
-                                // OPTIMIZATION: use cached_parse to avoid re-parsing deferred modules.
-                                var pre_result_opt: OptProgram = cached_parse(&mut parse_cache, &mut token_cache, &mut content_cache, found_path, struct_names, enum_names);
+                                    // Pre-scan: parse to extract imports and type names.
+                                    // OPTIMIZATION: use cached_parse to avoid re-parsing deferred modules.
+                                    pre_result_opt = cached_parse(&mut parse_cache, &mut token_cache, &mut content_cache, found_path, struct_names, enum_names);
+                                }
 
                                 match pre_result_opt {
                                     OptProgram::Some(pre_prog) => {

@@ -432,9 +432,23 @@ This is the race we can win outright, since no rival's speed comes for free.
       applies reach_keep_set to the C path — verified the filtered C still
       compiles and runs — but on the self-compile reach keeps ~97% of fns
       (73.6→71.4 MB C; lower unchanged): it only pays off on small programs
-      (a `use vec` hello: −7.5% C). The honest lever for <10 s is a CS6-style
-      per-function *lowered-IR* artifact (cache `IrFunction`s, not just
-      native bytes), applied before C codegen — the frontend side is done.
+      (a `use vec` hello: −7.5% C).
+      `FID_IRCACHE=<file>` (opt-in, this session): the CS6-style per-function
+      *lowered-IR* artifact — `compiler/ir_ser.fd` (620 lines: `IrFunction`
+      codec over all 45 `Inst` variants; key = `aw_func` AST hash, salt =
+      signatures+decl context; spawned `__own_*` helpers and `own_types`
+      deltas replayed with the fn; strings re-interned). Verified correct:
+      hit-vs-miss and miss-vs-nocache C byte-identical incl. `use vec`
+      programs, truncated file falls back. **Measured negative**: warm hit
+      ~6.9 s vs fresh ~1.6 s on a `use vec` hello (~4.5x slower) —
+      deserializing an `IrFunction` costs ≈ lowering it (same Vec/Inst
+      construction plus decode), the salt+per-fn key pass serializes every
+      signature and fn AST each build, and the artifact is ~126 MB for a
+      trivial program. Post-lower is the wrong cache point: CS6's
+      post-encode native bytes replay cheaply because the cached payload is
+      opaque; IR is not. Left for <10 s: make `lower()` itself faster —
+      profile for hot spots (the pass is per-fn linear work today), or cut
+      what it lowers; there is no artifact shortcut here.
 - [~] CS5. Parallel front end and code generation on all cores (L).
       Done (borrowck slice, opt-in): `FID_PAR=N` splits the borrow check's
       function set across N workers (own `BorrowChecker` each, chunks merged
@@ -698,8 +712,12 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       no longer `@unsafe`. Tests: `test_borrowed_str`,
       `test_borrowed_str_return_fail`, `test_borrowed_str_pass_fail`,
       `test_scoped_store_fail`.
-- [ ] LG3. Lifetimes the borrow checker can prove across functions, without
+- [~] LG3. Lifetimes the borrow checker can prove across functions, without
       second-class limits where that matters (XL).
+      Done (Nov 13 check): `fn f(p: &i64) -> &i64` — parameter-derived borrow
+      returns are inferred and check clean. Left: named lifetime syntax
+      (`'a`) does not exist; multi-borrow-out and region-polymorphic APIs
+      have no way to disambiguate which parameter a return borrows from.
 - [~] LG4. Traits: bounds checked, associated types, default methods, trait objects
       (release K9 is the start) (L).
       Done (release K9, in `fid`): every bound of `T: A + B` is checked at the
@@ -707,24 +725,64 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       check (`test_generic_bound_fail`, `test_generic_infer_fail`,
       `test_turbofish_arity_fail`). Left: associated types, default methods
       and trait objects, not checked against this goal.
-- [ ] LG5. Zero-cost iterators: `map`, `filter`, `fold` compile to a plain loop (L).
-- [ ] LG6. Closures that capture by reference and by value, with no heap allocation
+- [~] LG5. Zero-cost iterators: `map`, `filter`, `fold` compile to a plain loop (L).
+      Done (Nov 13): `iro_closure_devirt` (iropt.fd) rewrites `CallPtr` to a
+      direct `Call` when the env's fn ref is a `ConstFnRef` — devirtualized
+      calls inline like any other; `FID_IROPT_OFF=closuredevirt` disables.
+      Left: `Vec_map`/`Vec_fold`-style higher-order stdlib fns still dispatch
+      at runtime — the env crosses a call boundary before the `CallPtr`, so
+      the target isn't statically known at the call site; needs callsite
+      specialization (iro_specialize) or inlining of the HOF first.
+- [~] LG6. Closures that capture by reference and by value, with no heap allocation
       when they do not escape (L).
-- [ ] LG7. Const generics (M).
-- [ ] LG8. Sum types and pattern matching with guards, nesting and exhaustiveness in
+      Done (Nov 13): the same `iro_closure_devirt` pass replaces an env's
+      `p_malloc` with `Alloca(..., Region::Stack)` when the env is used only
+      by direct `CallPtr`s — escaping envs (passed as call args) correctly
+      stay on the heap. Verified: `var f = fn(y){y+x}; f(5)` lowers clean;
+      `v.map(fn)` envs stay heap (sound — the env outlives the frame).
+- [x] LG7. Const generics (M).
+      Done (existing, verified Nov 13): `fn sum<N: i64>(arr: [i64; N]) -> i64`
+      typechecks, monomorphizes per `N` and runs; `sum<3>(...)` calls work.
+      (`test_const_generic*.fd`.)
+- [~] LG8. Sum types and pattern matching with guards, nesting and exhaustiveness in
       every position (M).
-- [ ] LG9. Hygienic macros, or a comptime that covers what they do (L).
+      Done (verified Nov 13): `match` arms with `if` guards, literal +
+      wildcard arms, and exhaustiveness errors naming the missing variants.
+      Left: nested constructor patterns (`Some(Ok(x))`) do not parse —
+      patterns are one level deep.
+- [~] LG9. Hygienic macros, or a comptime that covers what they do (L).
+      Done (existing): `comptime` blocks/functions run at compile time.
+      Left: no syntactic macro system; comptime does not generate decls.
 - [x] LG10. Error handling with context and no allocation on the happy path (M).
       `Result.context(msg)`, `with_context(f)`, `Option.context(msg)` (complaint
       CE1).
-- [ ] LG11. Structured concurrency with cancellation and timeouts (L).
-- [ ] LG12. A defined memory model for atomics (L).
-- [ ] LG13. Inline assembly on every native target (M).
+- [~] LG11. Structured concurrency with cancellation and timeouts (L).
+      Done (existing + Nov 13): `spawn scope`/`cancel scope`/`select` are
+      language-level (pe_ir + nat runtimes). `task.fd` grew
+      `task_join_timeout` (poll `task_done` until deadline) and cooperative
+      `scope_cancel` via a shared flag — verified on `--nat`: join 10/20,
+      timeout join → -1, cancel → -7. Left: no preemptive kill; interp runs
+      tasks serially so scope semantics are trivially true there.
+- [x] LG12. A defined memory model for atomics (L).
+      Done (existing, verified Nov 13): `stdlib/atomic.fd` documents the
+      C++11 model (SeqCst default; Acquire/Release/AcqRel/Relaxed orders
+      exposed); ops verify on `--nat` (cas/xchg/fetch-add correct).
+- [~] LG13. Inline assembly on every native target (M).
+      Done (existing, verified Nov 13): `asm!` parses, lowers to `Inst::Asm`
+      and emits on PE `--nat` (x86-64) and `emit --target aarch64-linux`.
+      Left: RISC-V encoding path untested; no constraint syntax beyond the
+      fixed register set the lowerer exposes.
 - [~] LG14. `async` for every argument type, and async traits (release H9) (L).
       Done (H9): an `async fn` with `f64` or struct arguments or results runs as
       a task on the interpreter and C paths. Left: reference arguments, native
       async (`fid emit` programs using `async` crash), async traits.
-- [ ] LG15. C interop without bindings: `@import("header.h")`, as Zig does (L).
+- [~] LG15. C interop without bindings: `@import("header.h")`, as Zig does (L).
+      Done (Nov 13): `use foo` falls back to `foo.h` when no `foo.fd` exists;
+      `compiler/cparser.fd` generates Fides bindings which merge through the
+      normal import pipeline with `extern "C" link` metadata. Verified
+      end-to-end natively: `use libcput` → `libcput.h` → real `puts` call.
+      Left: literal `@import` syntax not added (`use`-fallback covers it);
+      extern calls still need `unsafe`.
 - [ ] LG16. C++ interop for the common cases (XL).
 - [x] LG17. Every annotation works or is removed (release K8) (M).
       Done: `@bounded-stack`, `@no-indirect` (rejects calls through function

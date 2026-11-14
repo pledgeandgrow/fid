@@ -1,0 +1,44 @@
+// LG5/LG6: iro_closure_devirt turns CallPtr on a locally built env into
+// a direct call and stack-allocates the env when it does not escape.
+// Correctness test: results must be identical with or without the pass.
+use vec;
+
+fn apply(c: fn(i64) -> i64, v: i64) -> i64 {
+    return c(v);
+}
+
+fn main() -> i64 {
+    // non-escaping env, direct local call
+    var x: i64 = 10;
+    var f = fn(y: i64) -> i64 { y + x };
+    print(f(5));       // 15
+
+    // no captures
+    var g = fn(y: i64) -> i64 { y * 2 };
+    print(g(6));       // 12
+
+    // env crosses a call boundary — runtime dispatch, still correct
+    var h = fn(y: i64) -> i64 { y + 100 };
+    print(apply(h, 3)); // 103
+
+    // env returned from a function — opaque, must dispatch at runtime
+    var add7 = make_adder(7);
+    print(add7(10));   // 17
+
+    // env into a higher-order stdlib call — escapes, stays correct
+    var v: Vec<i64> = Vec::new();
+    v.push(1); v.push(2); v.push(3);
+    var w: Vec<i64> = v.map(fn(y: i64) -> i64 { y + x });
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < w.len() {
+        sum = sum + w.get(i);
+        i = i + 1;
+    }
+    print(sum);        // 36
+    return 0;
+}
+
+fn make_adder(n: i64) -> fn(i64) -> i64 {
+    return fn(z: i64) { z + n };
+}

@@ -16,6 +16,9 @@
 
 module task;
 
+use vec;
+use sync;
+
 /// Start the function `name`, which takes one i64, as a task. It starts on a
 /// worker as soon as one is free. Returns the task.
 pub fn task_go(name: str, arg: i64) -> i64 {
@@ -71,4 +74,95 @@ pub fn task_result(t: i64) -> i64 {
 /// the function returned.
 pub fn task_pool_call(name: str, nargs: i64, args: i64) -> i64 {
     return p_co_pool_call(name, nargs, args);
+}
+
+// --- Structured concurrency -------------------------------------------------
+//
+// A TaskScope tracks the tasks started in it. Joining the scope waits for
+// every child — including any a child spawns after another finished, since
+// task_run drains the whole scheduler. Cancellation is cooperative: children
+// poll task_scope_cancelled (or the flag's address, via task_scope_flag_ptr)
+// and stop early; there is no forced kill of a running task.
+//
+// Usage:
+//   var s: TaskScope = task_scope_new();
+//   task_scope_go(&mut s, "fetch_a", 0);
+//   task_scope_go(&mut s, "fetch_b", 1);
+//   val rs: Vec<i64> = task_scope_join(&mut s);   // results in spawn order
+
+/// A group of tasks started together, joined together.
+pub struct TaskScope {
+    pub tasks: Vec<i64>,   // handles, in spawn order
+    pub flag: i64,         // shared cancel flag (0/1); one per scope
+}
+
+/// An empty scope.
+pub fn task_scope_new() -> TaskScope {
+    return TaskScope { tasks: Vec::new(), flag: sync_atomic_alloc(0) };
+}
+
+/// Start `name(arg)` as a child of the scope.
+pub fn task_scope_go(s: &mut TaskScope, name: str, arg: i64) -> i64 {
+    var t: i64 = task_go(name, arg);
+    s.tasks.push(t);
+    return t;
+}
+
+/// The scope's cancel flag as an i64 address: hand it to a child's arg (or
+/// pack it into a struct) so the child can poll
+/// `sync_atomic_load(flag_ptr) != 0` and stop early.
+pub fn task_scope_flag_ptr(s: &TaskScope) -> i64 {
+    return s.flag;
+}
+
+/// True once someone cancelled the scope. Children poll this.
+pub fn task_scope_cancelled(s: &TaskScope) -> bool {
+    return sync_atomic_load(s.flag) != 0;
+}
+
+/// Ask every child (cooperatively) to stop. Does not wait.
+pub fn task_scope_cancel(s: &mut TaskScope) -> void {
+    sync_atomic_store(s.flag, 1);
+}
+
+/// Wait until the task finishes, at most `ms` (-1: no limit).
+/// Returns its result, or -1 on a timeout; the task keeps running.
+/// Poll granularity is ~1 ms.
+pub fn task_join_timeout(t: i64, ms: i64) -> i64 {
+    var left: i64 = ms;
+    while ms < 0 || left > 0 {
+        if task_done(t) { return task_result(t); }
+        task_sleep(1);
+        if ms >= 0 { left = left - 1; }
+    }
+    if task_done(t) { return task_result(t); }
+    return -1;
+}
+
+/// Wait for every child of the scope. Returns the results in spawn order.
+/// Children that spawned more children are covered too: task_run drains the
+/// scheduler before the per-handle results are read.
+pub fn task_scope_join(s: &mut TaskScope) -> Vec<i64> {
+    task_run();
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < s.tasks.len() {
+        out.push(task_result(s.tasks.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Cancel the scope, then wait for every child to observe the flag and end.
+/// Returns the results of children that finished (spawn order; a child that
+/// ignores cancellation still has its result once it ends).
+pub fn task_scope_cancel_join(s: &mut TaskScope) -> Vec<i64> {
+    task_scope_cancel(s);
+    return task_scope_join(s);
+}
+
+/// Run `name(arg)` as a task and wait at most `ms` for it. Returns the
+/// result, or -1 on a timeout (the task keeps running).
+pub fn task_timeout(name: str, arg: i64, ms: i64) -> i64 {
+    return task_join_timeout(task_go(name, arg), ms);
 }

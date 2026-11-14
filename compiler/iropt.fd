@@ -40,6 +40,20 @@ const IRO_INLINE_MAX: i64 = 16;
 
 /// Run every pass on `module` (the pass manager: see iro_pass_on).
 pub fn iropt_native(module: &mut IrModule) {
+    // LG5/LG6: resolve closure-env CallPtrs to direct Calls before the
+    // inliner runs so the tiny closures flatten like any other call.
+    if iro_pass_on("closuredevirt") {
+        var cfi: i64 = 0;
+        while cfi < module.functions.len() {
+            var cent: IrFunctionEntry = module.functions.get(cfi);
+            var cfn: IrFunction = cent.func;
+            if iro_closure_devirt(module, &mut cfn) {
+                cent.func = cfn;
+                module.functions.set(cfi, cent);
+            }
+            cfi = cfi + 1;
+        }
+    }
     if iro_pass_on("inline") { iro_inline(module); }
     // ME20, ME21: inlining across functions, bottom-up (opt-in)
     if ime_on("inline2") { ime_inline(module); }
@@ -49,11 +63,13 @@ pub fn iropt_native(module: &mut IrModule) {
     var n_tail: i64 = 0;
     var n_gvn: i64 = 0;
     var n_licm: i64 = 0;
+    var n_iv: i64 = 0;
     var on_fold: bool = iro_pass_on("fold");
     var on_dce: bool = iro_pass_on("dce");
     var on_tail: bool = IRO_TAILCALL && iro_pass_on("tailcall");
     var on_gvn: bool = IRO_GVN && iro_pass_on("gvn");
     var on_licm: bool = IRO_LICM && iro_pass_on("licm");
+    var on_iv: bool = IRO_IV && iro_pass_on("iv");
     // ME12/ME14/ME15 of the first mid-end batch are opt-in (FID_IROPT_ON)
     // until the suite agrees with them on and off
     var on_branch: bool = iro_pass_on("branchfold") && ime_on("branchfold");
@@ -74,6 +90,7 @@ pub fn iropt_native(module: &mut IrModule) {
     var on_gconst: bool = iro_pass_on("gconst");
     var on_dse: bool = iro_pass_on("dse") && ime_on("dse");
     var on_simplify: bool = iro_pass_on("simplify") && ime_on("simplify");
+    var n_cdev: i64 = 0;
     var n_branch: i64 = 0;
     var n_facts: i64 = 0;
     var n_sccp: i64 = 0;
@@ -142,11 +159,16 @@ pub fn iropt_native(module: &mut IrModule) {
         if on_sccp && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "sccp", stats, &mut f) { changed = true; n_sccp = n_sccp + 1; }
         if on_promote && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "promote", stats, &mut f) { changed = true; n_promote = n_promote + 1; }
         if on_devirt && iro_devirt(module, &mut f) { changed = true; n_devirt = n_devirt + 1; }
+        // LG5/LG6: closure-env CallPtr -> direct Call (+ stack envs).
+        // Runs before the cleanup passes so the devirtualized calls get
+        // folded/inlined by what follows.
+        if iro_pass_on("closuredevirt") && iro_closure_devirt(module, &mut f) { changed = true; n_cdev = n_cdev + 1; }
         if on_dse && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "dse", stats, &mut f) { changed = true; n_dse = n_dse + 1; }
         if on_dce && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "dce", stats, &mut f) { changed = true; n_dce = n_dce + 1; }
         if on_tail && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "tailcall", stats, &mut f) { changed = true; n_tail = n_tail + 1; }
         if on_gvn && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "gvn", stats, &mut f) { changed = true; n_gvn = n_gvn + 1; }
         if on_licm && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "licm", stats, &mut f) { changed = true; n_licm = n_licm + 1; }
+        if on_iv && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "iv", stats, &mut f) { changed = true; n_iv = n_iv + 1; }
         if stats { insts_after = insts_after + iro_count_insts(&f); }
         if changed {
             entry.func = f;
@@ -168,7 +190,8 @@ pub fn iropt_native(module: &mut IrModule) {
         if deadf > 0 { p_eprint_str("iropt: dead functions " + int_to_str(deadf) + "\n"); }
         p_eprint_str("iropt: fold " + int_to_str(n_fold) + ", simplify " + int_to_str(n_simp) + ", branchfold " + int_to_str(n_branch)
             + ", branchfacts " + int_to_str(n_facts) + ", sccp " + int_to_str(n_sccp) + ", promote " + int_to_str(n_promote) + ", ipcp " + int_to_str(n_ipcp) + ", devirt " + int_to_str(n_devirt) + ", gconst " + int_to_str(n_gconst) + ", dse " + int_to_str(n_dse) + ", dce " + int_to_str(n_dce) + ", tailcall " + int_to_str(n_tail)
-            + ", gvn " + int_to_str(n_gvn) + ", licm " + int_to_str(n_licm) + ", spec " + int_to_str(n_spec) + " functions changed\n");
+            + ", gvn " + int_to_str(n_gvn) + ", licm " + int_to_str(n_licm) + ", iv " + int_to_str(n_iv) + ", spec " + int_to_str(n_spec)
+            + ", cdevirt " + int_to_str(n_cdev) + " functions changed\n");
         // ME30: what the mid-end did, for scripts/me-measure.sh
         p_eprint_str("iropt: instructions " + int_to_str(insts_before) + " -> " + int_to_str(insts_after)
             + " in " + int_to_str(p_clock_now_ms() - t_start) + " ms\n");
@@ -214,6 +237,7 @@ fn iro_time(names: &mut Vec<str>, ms: &mut Vec<i64>, hits: &mut Vec<i64>, name: 
     if name == "tailcall" { changed = iro_tailcalls(f); }
     if name == "gvn" { changed = iro_gvn(f); }
     if name == "licm" { changed = iro_licm(f); }
+    if name == "iv" { changed = iro_iv(f); }
     if stats {
         var dt: i64 = p_clock_now_ms() - t0;
         var i: i64 = 0;
@@ -645,6 +669,279 @@ fn iro_dce(f: &mut IrFunction) -> bool {
     return any;
 }
 
+// --- Induction-variable strength reduction (OP10) ----------------------------
+
+const IRO_IV: bool = true;
+
+/// Insert a detached instruction into block `bi` at position `pos`.
+fn iro_iv_insert(f: &mut IrFunction, bi: i64, pos: i64, inst: Inst) -> i64 {
+    var id: i64 = iro_detached(f, inst);
+    var blk: BasicBlock = f.blocks.get(bi);
+    var ids: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < blk.instructions.len() {
+        if k == pos { ids.push(id); }
+        ids.push(blk.instructions.get(k));
+        k = k + 1;
+    }
+    if pos >= blk.instructions.len() { ids.push(id); }
+    blk.instructions = ids;
+    f.blocks.set(bi, blk);
+    return id;
+}
+
+/// `id` as a `Load` of local `loc`, or -1.
+fn iro_iv_load_of(f: &IrFunction, id: i64, loc: i64) -> bool {
+    match peir_inst_of(f, id) {
+        Inst::Load(p, _) => { return p == loc; }
+        _ => {}
+    }
+    return false;
+}
+
+/// `sv` as `Load(loc) + ConstInt` or `Load(loc) - ConstInt`: the step, or none.
+fn iro_iv_step(f: &IrFunction, sv: i64, loc: i64) -> OptI64 {
+    match peir_inst_of(f, sv) {
+        Inst::BinOp(op, a, b, _) => {
+            var sgn: i64 = 0;
+            var cid: i64 = -1;
+            if binop_eq(op, BinOp::Add) {
+                if iro_iv_load_of(f, a, loc) { cid = b; sgn = 1; }
+                else if iro_iv_load_of(f, b, loc) { cid = a; sgn = 1; }
+            } else if binop_eq(op, BinOp::Sub) {
+                if iro_iv_load_of(f, a, loc) { cid = b; sgn = -1; }
+            }
+            if cid < 0 { return OptI64::None; }
+            match iro_const_int(f, cid) {
+                OptI64::Some(d) => {
+                    if sgn < 0 { return OptI64::Some(0 - d); }
+                    return OptI64::Some(d);
+                }
+                OptI64::None => {}
+            }
+        }
+        _ => {}
+    }
+    return OptI64::None;
+}
+
+/// One loop: find `L = L +/- d` locals stored once, shadow `Load(L)*c`
+/// multiplies proved non-overflowing with a local bumped `c*d` at the
+/// same store — the shadow and the product stay in the same epoch
+/// because the multiply's load and the multiply sit in one block with
+/// no `Store(L)` between them.
+fn iro_iv_loop(f: &mut IrFunction, cfg: &IroCfg, head: i64, lat: Vec<i64>, plain: Vec<i64>, flags: Vec<i64>) -> bool {
+    var n: i64 = f.blocks.len();
+    var body: Vec<i64> = peir_zeros(n);
+    body.set(head, 1);
+    var work: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < lat.len() { work.push(lat.get(i)); i = i + 1; }
+    while work.len() > 0 {
+        var wb: i64 = work.pop();
+        if body.get(wb) == 0 {
+            body.set(wb, 1);
+            var ps: Vec<i64> = cfg.preds.get(wb);
+            i = 0;
+            while i < ps.len() { work.push(ps.get(i)); i = i + 1; }
+        }
+    }
+    // The one outside predecessor of the header, ending in a jump
+    var pre: i64 = -1;
+    var hp: Vec<i64> = cfg.preds.get(head);
+    i = 0;
+    while i < hp.len() {
+        if body.get(hp.get(i)) == 0 {
+            if pre >= 0 && pre != hp.get(i) { return false; }
+            pre = hp.get(i);
+        }
+        i = i + 1;
+    }
+    if pre < 0 { return false; }
+    var pids: Vec<i64> = f.blocks.get(pre).instructions;
+    if pids.len() == 0 { return false; }
+    match peir_inst_of(f, pids.get(pids.len() - 1)) {
+        Inst::Jump(_) => {}
+        _ => { return false; }
+    }
+    // Induction locals: plain, i64, stored exactly once as L = L +/- d
+    var iv_loc: Vec<i64> = Vec::new();
+    var iv_step: Vec<i64> = Vec::new();
+    var iv_sb: Vec<i64> = Vec::new();
+    var iv_sk: Vec<i64> = Vec::new();
+    var nstores: Vec<i64> = peir_zeros(f.next_value + 1);
+    var b: i64 = 0;
+    while b < n {
+        if body.get(b) == 1 {
+            var ids: Vec<i64> = f.blocks.get(b).instructions;
+            var k: i64 = 0;
+            while k < ids.len() {
+                match peir_inst_of(f, ids.get(k)) {
+                    Inst::Store(p, _, _) => { if p >= 0 && p < nstores.len() { nstores.set(p, nstores.get(p) + 1); } }
+                    _ => {}
+                }
+                k = k + 1;
+            }
+        }
+        b = b + 1;
+    }
+    b = 0;
+    while b < n {
+        if body.get(b) == 1 {
+            var ids2: Vec<i64> = f.blocks.get(b).instructions;
+            var k2: i64 = 0;
+            while k2 < ids2.len() {
+                match peir_inst_of(f, ids2.get(k2)) {
+                    Inst::Store(p, sv, _) => {
+                        if p >= 0 && p < plain.len() && plain.get(p) == 1 && nstores.get(p) == 1 {
+                            match iro_iv_step(f, sv, p) {
+                                OptI64::Some(d) => {
+                                    if d != 0 { iv_loc.push(p); iv_step.push(d); iv_sb.push(b); iv_sk.push(k2); }
+                                }
+                                OptI64::None => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                k2 = k2 + 1;
+            }
+        }
+        b = b + 1;
+    }
+    if iv_loc.len() == 0 { return false; }
+    // Candidate multiplies: w = Load(L) * ConstInt, proved unchecked
+    var changed: bool = false;
+    var sh_loc: Vec<i64> = Vec::new();   // per shadow: which iv, which c, the slot
+    var sh_iv: Vec<i64> = Vec::new();
+    var sh_c: Vec<i64> = Vec::new();
+    var sh_slot: Vec<i64> = Vec::new();
+    b = 0;
+    while b < n {
+        if body.get(b) == 1 {
+            var ids3: Vec<i64> = f.blocks.get(b).instructions;
+            var k3: i64 = 0;
+            while k3 < ids3.len() {
+                var w: i64 = ids3.get(k3);
+                match peir_inst_of(f, w) {
+                    Inst::BinOp(op, a, bb, t) => {
+                        if binop_eq(op, BinOp::Mul) && ir_type_eq(t, IrType::I64)
+                            && w >= 0 && w < flags.len() && (flags.get(w) & 1) != 0 {
+                            var vi: i64 = -1;
+                            var ci: i64 = -1;
+                            var li: i64 = -1;
+                            // operand forms: Mul(load, const) or Mul(const, load)
+                            i = 0;
+                            while i < iv_loc.len() {
+                                var loc2: i64 = iv_loc.get(i);
+                                if iro_iv_load_of(f, a, loc2) { vi = i; ci = bb; li = a; }
+                                else if iro_iv_load_of(f, bb, loc2) { vi = i; ci = a; li = bb; }
+                                i = i + 1;
+                            }
+                            if vi >= 0 && ci >= 0 {
+                                match iro_const_int(f, ci) {
+                                    OptI64::Some(c) => {
+                                        // the load must be in this block, before
+                                        // w, with no Store(L) between them
+                                        var lp: i64 = -1;
+                                        var stp: i64 = -1;
+                                        var loc3: i64 = iv_loc.get(vi);
+                                        var k4: i64 = 0;
+                                        while k4 < ids3.len() {
+                                            if ids3.get(k4) == li { lp = k4; }
+                                            if k4 > lp && lp >= 0 {
+                                                match peir_inst_of(f, ids3.get(k4)) {
+                                                    Inst::Store(sp2, _, _) => { if sp2 == loc3 && k4 < k3 { stp = k4; } }
+                                                    _ => {}
+                                                }
+                                            }
+                                            k4 = k4 + 1;
+                                        }
+                                        if lp >= 0 && lp < k3 && stp < 0 {
+                                            // shadow for (iv, c) once
+                                            var si: i64 = -1;
+                                            i = 0;
+                                            while i < sh_loc.len() {
+                                                if sh_iv.get(i) == vi && sh_c.get(i) == c { si = i; }
+                                                i = i + 1;
+                                            }
+                                            var slot: i64 = -1;
+                                            if si < 0 {
+                                                slot = iro_iv_insert(f, 0, 0, Inst::Alloca(IrType::I64, Region::Stack));
+                                                var lastp: i64 = f.blocks.get(pre).instructions.len() - 1;
+                                                var l0: i64 = iro_iv_insert(f, pre, lastp, Inst::Load(loc3, IrType::I64));
+                                                var c0: i64 = iro_iv_insert(f, pre, lastp + 1, Inst::ConstInt(c, IrType::I64));
+                                                var m0: i64 = iro_iv_insert(f, pre, lastp + 2, Inst::BinOp(BinOp::Mul, l0, c0, IrType::I64));
+                                                iro_iv_insert(f, pre, lastp + 3, Inst::Store(slot, m0, OptIrType::None));
+                                                var sb: i64 = iv_sb.get(vi);
+                                                var sk: i64 = iv_sk.get(vi) + 1;
+                                                var u0: i64 = iro_iv_insert(f, sb, sk, Inst::Load(slot, IrType::I64));
+                                                var d0: i64 = iro_iv_insert(f, sb, sk + 1, Inst::ConstInt(c * iv_step.get(vi), IrType::I64));
+                                                var a0: i64 = iro_iv_insert(f, sb, sk + 2, Inst::BinOp(BinOp::Add, u0, d0, IrType::I64));
+                                                iro_iv_insert(f, sb, sk + 3, Inst::Store(slot, a0, OptIrType::None));
+                                                sh_iv.push(vi);
+                                                sh_c.push(c);
+                                                sh_loc.push(0);
+                                                sh_slot.push(slot);
+                                            } else {
+                                                slot = sh_slot.get(si);
+                                            }
+                                            IrFunction_set_inst(f, w, Inst::Load(slot, IrType::I64));
+                                            changed = true;
+                                        }
+                                    }
+                                    OptI64::None => {}
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                k3 = k3 + 1;
+            }
+        }
+        b = b + 1;
+    }
+    return changed;
+}
+
+fn iro_iv(f: &mut IrFunction) -> bool {
+    var cfg: IroCfg = iro_cfg(f);
+    if cfg.n == 0 { return false; }
+    var plain: Vec<i64> = iro_plain_locals(f);
+    var flags: Vec<i64> = peir_unchecked_ops(f, f.next_value + 1);
+    var latches: Vec<Vec<i64>> = Vec::new();
+    var b: i64 = 0;
+    while b < cfg.n { var l0: Vec<i64> = Vec::new(); latches.push(l0); b = b + 1; }
+    var any: bool = false;
+    b = 0;
+    while b < cfg.n {
+        var ss: Vec<i64> = cfg.succs.get(b);
+        var i: i64 = 0;
+        while i < ss.len() {
+            var s: i64 = ss.get(i);
+            if s >= 0 && iro_dominates(&cfg, s, b) {
+                var ll: Vec<i64> = latches.get(s);
+                ll.push(b);
+                latches.set(s, ll);
+                any = true;
+            }
+            i = i + 1;
+        }
+        b = b + 1;
+    }
+    if !any { return false; }
+    var changed: bool = false;
+    var head: i64 = cfg.n - 1;
+    while head >= 0 {
+        if latches.get(head).len() > 0 {
+            if iro_iv_loop(f, &cfg, head, latches.get(head), plain, flags) { changed = true; }
+        }
+        head = head - 1;
+    }
+    return changed;
+}
+
 // --- Loop-invariant code motion ---------------------------------------------
 
 const IRO_LICM: bool = true;
@@ -987,6 +1284,10 @@ pub struct IroCfg {
     pub rpo: Vec<i64>,
     pub rpo_num: Vec<i64>,
     pub idom: Vec<i64>,
+    // Dominator-tree interval numbering: a dominates b iff
+    // tin[a] <= tin[b] && tout[b] <= tout[a]; -1 when unreachable.
+    pub tin: Vec<i64>,
+    pub tout: Vec<i64>,
 }
 
 pub fn iro_cfg(f: &IrFunction) -> IroCfg {
@@ -1037,7 +1338,7 @@ pub fn iro_cfg(f: &IrFunction) -> IroCfg {
     while b < n { rpo_num.push(-1); idom.push(-1); b = b + 1; }
     var rpo: Vec<i64> = Vec::new();
     if n == 0 {
-        return IroCfg { n: n, index: index, succs: succs, preds: preds, rpo: rpo, rpo_num: rpo_num, idom: idom };
+        return IroCfg { n: n, index: index, succs: succs, preds: preds, rpo: rpo, rpo_num: rpo_num, idom: idom, tin: Vec::new(), tout: Vec::new() };
     }
     var state: Vec<i64> = peir_zeros(n);
     var st_b: Vec<i64> = Vec::new();
@@ -1105,20 +1406,56 @@ pub fn iro_cfg(f: &IrFunction) -> IroCfg {
             r = r + 1;
         }
     }
-    return IroCfg { n: n, index: index, succs: succs, preds: preds, rpo: rpo, rpo_num: rpo_num, idom: idom };
+    // Dominator-tree intervals: DFS over the tree rooted at the entry
+    // (idom[0] == 0); reachable blocks get [tin, tout], others stay -1.
+    var tin: Vec<i64> = Vec::new();
+    var tout: Vec<i64> = Vec::new();
+    var kids: Vec<Vec<i64>> = Vec::new();
+    b = 0;
+    while b < n {
+        tin.push(-1);
+        tout.push(-1);
+        var k0: Vec<i64> = Vec::new();
+        kids.push(k0);
+        b = b + 1;
+    }
+    b = 0;
+    while b < n {
+        var p2: i64 = idom.get(b);
+        if p2 >= 0 && p2 != b { var kl: Vec<i64> = kids.get(p2); kl.push(b); kids.set(p2, kl); }
+        b = b + 1;
+    }
+    var tick: i64 = 0;
+    var d_st: Vec<i64> = Vec::new();
+    var d_nx: Vec<i64> = Vec::new();
+    d_st.push(0);
+    d_nx.push(0);
+    while d_st.len() > 0 {
+        var dt: i64 = d_st.len() - 1;
+        var dcur: i64 = d_st.get(dt);
+        var dnx: i64 = d_nx.get(dt);
+        if dnx == 0 { tin.set(dcur, tick); tick = tick + 1; }
+        var dks: Vec<i64> = kids.get(dcur);
+        if dnx < dks.len() {
+            d_nx.set(dt, dnx + 1);
+            d_st.push(dks.get(dnx));
+            d_nx.push(0);
+        } else {
+            tout.set(dcur, tick - 1);
+            d_st.pop();
+            d_nx.pop();
+        }
+    }
+    return IroCfg { n: n, index: index, succs: succs, preds: preds, rpo: rpo, rpo_num: rpo_num, idom: idom, tin: tin, tout: tout };
 }
 
-/// Does block `a` dominate block `b` (indexes)?
+/// Does block `a` dominate block `b` (indexes)? O(1): the dominator
+/// tree's DFS interval of `a` covers `b`'s.
 pub fn iro_dominates(cfg: &IroCfg, a: i64, b: i64) -> bool {
-    if a < 0 || b < 0 || cfg.rpo_num.get(a) < 0 || cfg.rpo_num.get(b) < 0 { return false; }
-    var x: i64 = b;
-    while true {
-        if x == a { return true; }
-        var up: i64 = cfg.idom.get(x);
-        if up == x || up < 0 { return false; }
-        x = up;
-    }
-    return false;
+    if a < 0 || b < 0 || a >= cfg.tin.len() || b >= cfg.tin.len() { return false; }
+    var ta: i64 = cfg.tin.get(a);
+    var tb: i64 = cfg.tin.get(b);
+    return ta >= 0 && tb >= 0 && ta <= tb && cfg.tout.get(b) <= cfg.tout.get(a);
 }
 
 // --- Renaming every operand -------------------------------------------------
@@ -1634,6 +1971,47 @@ fn iro_uses_drop(u: &mut IroUses, f: &IrFunction, id: i64) {
         if v >= 0 && v < u.count.len() && u.count.get(v) > 0 { u.count.set(v, u.count.get(v) - 1); }
         o = o + 1;
     }
+}
+
+/// Grow `u`'s arrays to hold value ids up to `n - 1` (a pass detached
+/// fresh instructions after `u` was built). count/block_of/pos_of stay
+/// exact; the `users` lists only grow, so a dropped use still lists its
+/// former user — passes that consume `users` must rebuild instead.
+fn iro_uses_grow(u: &mut IroUses, n: i64) {
+    while u.count.len() < n {
+        u.count.push(0);
+        var e: Vec<i64> = Vec::new();
+        u.users.push(e);
+        u.block_of.push(-1);
+        u.pos_of.push(-1);
+    }
+}
+
+/// Instruction `id` now reads its operands (a replacement was stored).
+/// Grows `u` first so fresh ids are covered; keeps count and users exact.
+fn iro_uses_add_ops(u: &mut IroUses, f: &IrFunction, id: i64) {
+    iro_uses_grow(u, f.next_value + 1);
+    var ops: Vec<i64> = Vec::new();
+    peir_inst_operands(peir_inst_of(f, id), &mut ops);
+    var o: i64 = 0;
+    while o < ops.len() {
+        var v: i64 = ops.get(o);
+        if v >= 0 && v < u.count.len() {
+            u.count.set(v, u.count.get(v) + 1);
+            var us: Vec<i64> = u.users.get(v);
+            us.push(id);
+            u.users.set(v, us);
+        }
+        o = o + 1;
+    }
+}
+
+/// Fresh detached instruction `id` was inserted into block `b` (its
+/// operands, if any, still need `iro_uses_add_ops`).
+fn iro_uses_reg(u: &mut IroUses, id: i64, b: i64) {
+    iro_uses_grow(u, id + 1);
+    u.block_of.set(id, b);
+    u.pos_of.set(id, -1);
 }
 
 /// The block index whose id is `bid`, or -1.
@@ -2655,6 +3033,8 @@ fn iro_simplify(f: &mut IrFunction) -> bool {
                                                 var x: i64 = iro_first_operand(f, l);
                                                 var d: i64 = d1 + d2;
                                                 var cid: i64 = 0;
+                                                iro_uses_drop(&mut u, f, id);
+                                                iro_uses_drop(&mut u, f, l);
                                                 if d > 0 {
                                                     cid = iro_const_before(f, b, k, d, t);
                                                     IrFunction_set_inst(f, id, Inst::BinOp(BinOp::Add, x, cid, t));
@@ -2662,8 +3042,9 @@ fn iro_simplify(f: &mut IrFunction) -> bool {
                                                     cid = iro_const_before(f, b, k, 0 - d, t);
                                                     IrFunction_set_inst(f, id, Inst::BinOp(BinOp::Sub, x, cid, t));
                                                 }
+                                                iro_uses_reg(&mut u, cid, b);
+                                                iro_uses_add_ops(&mut u, f, id);
                                                 iro_remove_from_block(f, l);
-                                                u = iro_uses(f);
                                                 changed = true;
                                                 done = true;
                                             }
@@ -2691,9 +3072,11 @@ fn iro_simplify(f: &mut IrFunction) -> bool {
                                 }
                             }
                             if sh > 0 {
+                                iro_uses_drop(&mut u, f, id);
                                 var kid: i64 = iro_const_before(f, b, k, sh, t);
                                 IrFunction_set_inst(f, id, Inst::BinOp(BinOp::Shl, x2, kid, t));
-                                u = iro_uses(f);
+                                iro_uses_reg(&mut u, kid, b);
+                                iro_uses_add_ops(&mut u, f, id);
                                 changed = true;
                                 done = true;
                             }
@@ -2706,14 +3089,17 @@ fn iro_simplify(f: &mut IrFunction) -> bool {
                             OptI64::Some(c3) => {
                                 var sh2: i64 = iro_log2(c3);
                                 if nonneg && sh2 > 0 {
+                                    iro_uses_drop(&mut u, f, id);
+                                    var kid2: i64 = -1;
                                     if binop_eq(op, BinOp::Div) {
-                                        var kid2: i64 = iro_const_before(f, b, k, sh2, t);
+                                        kid2 = iro_const_before(f, b, k, sh2, t);
                                         IrFunction_set_inst(f, id, Inst::BinOp(BinOp::Shr, l, kid2, t));
                                     } else {
-                                        var mid: i64 = iro_const_before(f, b, k, c3 - 1, t);
-                                        IrFunction_set_inst(f, id, Inst::BinOp(BinOp::BitAnd, l, mid, t));
+                                        kid2 = iro_const_before(f, b, k, c3 - 1, t);
+                                        IrFunction_set_inst(f, id, Inst::BinOp(BinOp::BitAnd, l, kid2, t));
                                     }
-                                    u = iro_uses(f);
+                                    iro_uses_reg(&mut u, kid2, b);
+                                    iro_uses_add_ops(&mut u, f, id);
                                     changed = true;
                                 }
                             }
@@ -3143,6 +3529,334 @@ fn iro_devirt(module: &IrModule, f: &mut IrFunction) -> bool {
             k = k + 1;
         }
         bi = bi + 1;
+    }
+    return changed;
+}
+
+/// LG5/LG6: a `CallPtr` through a closure env whose field 0 holds a
+/// `ConstFnRef` is a direct call to that function (inlinable next pass, so a
+/// `map`/`fold` closure can compile to a plain loop). When the env pointer
+/// never escapes — its only uses are the GEP/Store field init, GEP/Load
+/// field reads and those `CallPtr`s — its `p_malloc` becomes a stack
+/// `Alloca` (no heap for a non-escaping closure). An env stored into memory,
+/// returned, or passed to another function keeps its malloc; the `CallPtr`s
+/// are still devirtualized.
+/// Result of tracing one closure env's uses in a function.
+struct CdevEnv {
+    pub fname: str,
+    pub escape: bool,
+    pub msafe: bool,
+    pub calls: Vec<i64>,
+}
+
+/// Does the devirtualized callee treat its __env parameter (arg 0) as
+/// field access only? env passed on as a call arg, stored anywhere, or
+/// returned would dangle a stack-allocated env.
+fn iro_cdev_callee_ok(cf: &IrFunction) -> bool {
+    if cf.params.len() == 0 { return false; }
+    var envp: i64 = cf.params.get(0).id;
+    var geps: Vec<i64> = Vec::new();
+    var b: i64 = 0;
+    while b < cf.blocks.len() {
+        var ids: Vec<i64> = cf.blocks.get(b).instructions;
+        var k: i64 = 0;
+        while k < ids.len() {
+            match peir_inst_of(cf, ids.get(k)) {
+                Inst::GetElemPtr(gb, _, _) => { if gb == envp { geps.push(ids.get(k)); } }
+                _ => {}
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    b = 0;
+    while b < cf.blocks.len() {
+        var ids2: Vec<i64> = cf.blocks.get(b).instructions;
+        var k2: i64 = 0;
+        while k2 < ids2.len() {
+            var id2: i64 = ids2.get(k2);
+            var ops: Vec<i64> = Vec::new();
+            peir_inst_operands(peir_inst_of(cf, id2), &mut ops);
+            var o: i64 = 0;
+            while o < ops.len() {
+                var v: i64 = ops.get(o);
+                var bad: bool = false;
+                if v == envp {
+                    match peir_inst_of(cf, id2) {
+                        Inst::GetElemPtr(_, _, _) => {}
+                        _ => { bad = true; }
+                    }
+                }
+                if iro_i64_in(geps, v) {
+                    match peir_inst_of(cf, id2) {
+                        Inst::Load(lp, _) => { if lp != v { bad = true; } }
+                        Inst::Store(sp, sv, _) => { if sp != v { bad = true; } }
+                        _ => { bad = true; }
+                    }
+                }
+                if bad { return false; }
+                o = o + 1;
+            }
+            k2 = k2 + 1;
+        }
+        b = b + 1;
+    }
+    return true;
+}
+
+/// Follow every use of a closure env (`env_id`, the p_malloc result):
+/// GetElemPtr field writes at init, CallPtrs that call it, and Stores
+/// that park it in a local slot whose Loads feed CallPtrs. Collects the
+/// ConstFnRef stored at field 0 and every reachable CallPtr site.
+fn iro_cdev_scan(module: &IrModule, f: &IrFunction, u: &IroUses, env_id: i64) -> CdevEnv {
+    var r: CdevEnv = CdevEnv { fname: "", escape: false, msafe: true, calls: Vec::new() };
+    var us: Vec<i64> = u.users.get(env_id);
+    var ui: i64 = 0;
+    while ui < us.len() {
+        var uid: i64 = us.get(ui);
+        match peir_inst_of(f, uid) {
+            Inst::GetElemPtr(_, gidx, _) => {
+                var off: i64 = -1;
+                match peir_inst_of(f, gidx) {
+                    Inst::ConstInt(ov, _) => { off = ov; }
+                    _ => {}
+                }
+                if off < 0 { r.escape = true; }
+                var gus: Vec<i64> = u.users.get(uid);
+                var gi: i64 = 0;
+                while gi < gus.len() {
+                    var gid: i64 = gus.get(gi);
+                    match peir_inst_of(f, gid) {
+                        Inst::Store(_, sv, _) => {
+                            if sv == env_id { r.escape = true; }
+                            if off == 0 {
+                                match peir_inst_of(f, sv) {
+                                    Inst::ConstFnRef(n) => {
+                                        if r.fname != "" && r.fname != n { r.escape = true; }
+                                        r.fname = n;
+                                    }
+                                    _ => { r.escape = true; }
+                                }
+                            }
+                        }
+                        _ => { r.escape = true; }
+                    }
+                    gi = gi + 1;
+                }
+            }
+            Inst::Store(sp, sv, _) => {
+                // Env parked in a local slot (`var f = fn ..`). The slot
+                // must be a plain Alloca, every store to it must park
+                // this env, and every load's uses must be CallPtr callees.
+                if sv != env_id { r.escape = true; }
+                var slot_ok: bool = false;
+                match peir_inst_of(f, sp) {
+                    Inst::Alloca(_, _) => { slot_ok = true; }
+                    _ => {}
+                }
+                if !slot_ok { r.escape = true; }
+                var lus: Vec<i64> = u.users.get(sp);
+                var li: i64 = 0;
+                while li < lus.len() {
+                    var lid: i64 = lus.get(li);
+                    match peir_inst_of(f, lid) {
+                        Inst::Store(_, sv2, _) => { if sv2 != env_id { r.escape = true; } }
+                        Inst::Load(_, _) => {
+                            var cus: Vec<i64> = u.users.get(lid);
+                            var cj: i64 = 0;
+                            while cj < cus.len() {
+                                var cid: i64 = cus.get(cj);
+                                match peir_inst_of(f, cid) {
+                                    Inst::CallPtr(callee, cargs, _, _, _) => {
+                                        if callee == lid {
+                                            if !iro_i64_in(r.calls, cid) { r.calls.push(cid); }
+                                        } else { r.escape = true; }
+                                        var ci2: i64 = 0;
+                                        while ci2 < cargs.len() {
+                                            if cargs.get(ci2) == lid { r.escape = true; }
+                                            ci2 = ci2 + 1;
+                                        }
+                                    }
+                                    _ => { r.escape = true; }
+                                }
+                                cj = cj + 1;
+                            }
+                        }
+                        _ => { r.escape = true; }
+                    }
+                    li = li + 1;
+                }
+            }
+            Inst::CallPtr(callee, cargs, _, _, _) => {
+                if callee == env_id {
+                    if !iro_i64_in(r.calls, uid) { r.calls.push(uid); }
+                } else { r.escape = true; }
+                var ci3: i64 = 0;
+                while ci3 < cargs.len() {
+                    if cargs.get(ci3) == env_id { r.escape = true; }
+                    ci3 = ci3 + 1;
+                }
+            }
+            _ => { r.escape = true; }
+        }
+        ui = ui + 1;
+    }
+    if r.calls.len() == 0 || r.fname == "" { r.msafe = false; }
+    if r.fname != "" {
+        match IrModule_get_function(module, r.fname) {
+            OptIrFunction::Some(cf) => { if !iro_cdev_callee_ok(&cf) { r.msafe = false; } }
+            OptIrFunction::None => { r.msafe = false; }
+        }
+    }
+    return r;
+}
+
+/// LG5/LG6: a CallPtr on a statically known closure env — a p_malloc of
+/// N*8 bytes with a ConstFnRef stored at field 0, built by
+/// Lowerer_make_fn_env — is an indirect call to a known target. Rewrite
+/// it to a direct Call (inlinable downstream) and, when the env provably
+/// stays inside this frame, move it from p_malloc to a stack Alloca.
+fn iro_closure_devirt(module: &IrModule, f: &mut IrFunction) -> bool {
+    // Cheap pre-scan: most functions have no CallPtr at all.
+    var any: bool = false;
+    var b0: i64 = 0;
+    while b0 < f.blocks.len() {
+        var ids0: Vec<i64> = f.blocks.get(b0).instructions;
+        var k0: i64 = 0;
+        while k0 < ids0.len() {
+            match peir_inst_of(f, ids0.get(k0)) {
+                Inst::CallPtr(_, _, _, _, _) => { any = true; }
+                _ => {}
+            }
+            k0 = k0 + 1;
+        }
+        b0 = b0 + 1;
+    }
+    if !any { return false; }
+    var u: IroUses = iro_uses(f);
+    var changed: bool = false;
+    var stack_envs: Vec<i64> = Vec::new();
+    var env_sizes: Vec<i64> = Vec::new();
+    var done_envs: Vec<i64> = Vec::new();
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var blk: BasicBlock = f.blocks.get(b);
+        var k: i64 = 0;
+        while k < blk.instructions.len() {
+            var iid: i64 = blk.instructions.get(k);
+            match peir_inst_of(f, iid) {
+                Inst::CallPtr(fp, _a0, _r0, _e0, _h0) => {
+                    // Resolve fp to the env inst: the malloc'd env itself,
+                    // or a Load of a slot every store to which parks it.
+                    var env_id: i64 = fp;
+                    var is_load: bool = false;
+                    var lptr: i64 = -1;
+                    match peir_inst_of(f, fp) {
+                        Inst::Load(lp, _) => { is_load = true; lptr = lp; }
+                        _ => {}
+                    }
+                    if is_load {
+                        env_id = -1;
+                        var sb: i64 = 0;
+                        while sb < f.blocks.len() {
+                            var sids: Vec<i64> = f.blocks.get(sb).instructions;
+                            var sk: i64 = 0;
+                            while sk < sids.len() {
+                                var sid: i64 = sids.get(sk);
+                                match peir_inst_of(f, sid) {
+                                    Inst::Store(sp, sv, _) => {
+                                        if sp == lptr {
+                                            if env_id < 0 { env_id = sv; }
+                                            else { if env_id != sv { env_id = -2; } }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                sk = sk + 1;
+                            }
+                            sb = sb + 1;
+                        }
+                        if env_id == -2 { env_id = -1; }
+                    }
+                    var env_size: i64 = 0;
+                    if env_id >= 0 && !iro_i64_in(done_envs, env_id) {
+                        match peir_inst_of(f, env_id) {
+                            Inst::Call(nm, margs, _, _) => {
+                                if nm == "p_malloc" && margs.len() > 0 {
+                                    match peir_inst_of(f, margs.get(0)) {
+                                        Inst::ConstInt(sz, _) => { if sz > 0 && sz % 8 == 0 { env_size = sz; } }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if env_size > 0 {
+                        done_envs.push(env_id);
+                        var r: CdevEnv = iro_cdev_scan(module, f, &u, env_id);
+                        if r.fname != "" && r.calls.len() > 0 {
+                            var n_eff: EffectSet = EffectSet_new();
+                            match IrModule_get_function(module, r.fname) {
+                                OptIrFunction::Some(cf) => { n_eff = cf.effects; }
+                                OptIrFunction::None => {}
+                            }
+                            var ri: i64 = 0;
+                            while ri < r.calls.len() {
+                                var call_id: i64 = r.calls.get(ri);
+                                var cblk: i64 = u.block_of.get(call_id);
+                                match peir_inst_of(f, call_id) {
+                                    Inst::CallPtr(_cfp, cargs, cret, _ceff, chas_env) => {
+                                        var nargs: Vec<i64> = Vec::new();
+                                        var env_arg: i64 = env_id;
+                                        if !chas_env {
+                                            f.current_block_idx = cblk;
+                                            env_arg = IrFunction_emit(f, Inst::ConstInt(0, IrType::I64));
+                                            // Emit appends at block end — move
+                                            // the constant before its CallPtr.
+                                            var blk3: BasicBlock = f.blocks.get(cblk);
+                                            var ins3: Vec<i64> = Vec::new();
+                                            var ki3: i64 = 0;
+                                            while ki3 < blk3.instructions.len() {
+                                                var oid3: i64 = blk3.instructions.get(ki3);
+                                                if oid3 == call_id { ins3.push(env_arg); }
+                                                if oid3 != env_arg { ins3.push(oid3); }
+                                                ki3 = ki3 + 1;
+                                            }
+                                            blk3.instructions = ins3;
+                                            f.blocks.set(cblk, blk3);
+                                        }
+                                        nargs.push(env_arg);
+                                        var ai: i64 = 0;
+                                        while ai < cargs.len() { nargs.push(cargs.get(ai)); ai = ai + 1; }
+                                        IrFunction_set_inst(f, call_id, Inst::Call(r.fname, nargs, cret, n_eff));
+                                        changed = true;
+                                    }
+                                    _ => {}
+                                }
+                                ri = ri + 1;
+                            }
+                            if !r.escape && r.msafe {
+                                stack_envs.push(env_id);
+                                env_sizes.push(env_size);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    var si: i64 = 0;
+    while si < stack_envs.len() {
+        var fp2: i64 = stack_envs.get(si);
+        IrFunction_set_inst(f, fp2, Inst::Alloca(
+            IrType::Array(Box::new(IrType::I64), env_sizes.get(si) / 8),
+            Region::Stack));
+        changed = true;
+        si = si + 1;
     }
     return changed;
 }
