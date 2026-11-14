@@ -2722,6 +2722,17 @@ if token_kind_eq(k, TokenKind::Ident("")) {
             if s == "parallel" {
                 return self.parse_parallel_stmt();
             }
+            // `abort;` inside txn { }: roll the block back and leave it.
+            // A contextual keyword: parsed as a call of the builtin
+            // __txn_abort, which the type checker allows only inside txn.
+            if s == "abort" && self.pos + 1 < self.tokens.len()
+                && token_kind_eq(self.tokens.get(self.pos + 1).kind, TokenKind::Semicolon) {
+                var aline: i64 = self.peek_token().line;
+                self.advance();
+                self.advance();
+                var no_args: Vec<Expr> = Vec::new();
+                return ParseResultStmt::Ok(Stmt::Expr(Expr::Call("__txn_abort", no_args), aline));
+            }
         }
         _ => {}
     }

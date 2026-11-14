@@ -39,35 +39,54 @@ pub fn Money_from_cents(cents: i64) -> Money {
 }
 
 // ─── @conserve operations (move, split, merge — no creation) ───────────────
+// Each keeps the total: what goes in comes out. The amount (`cents`) is
+// only read or changed here: a @conserve function elsewhere that touches
+// `.cents` is a compile error, so these are the whole trusted base.
 
-/// Add two money amounts. Both inputs are consumed (linear), producing one output.
+/// Merge two amounts into one. Both inputs are consumed (linear).
 @conserve
 pub fn Money_add(a: Money, b: Money) -> Money {
     return Money { cents: a.cents + b.cents };
 }
 
-/// Subtract b from a. Both consumed, result is a - b.
+/// Split: move `cents` out of `m` into a new Money. `m` keeps the rest,
+/// so the two together hold what `m` held.
 @conserve
+pub fn Money_take(m: &mut Money, cents: i64) -> Money {
+    m.cents = m.cents - cents;
+    return Money { cents: cents };
+}
+
+/// The amount, read through a borrow: nothing is consumed.
+@conserve
+pub fn Money_cents(m: &Money) -> i64 {
+    return m.cents;
+}
+
+/// Is the amount non-negative? Borrows, consumes nothing.
+@conserve
+pub fn Money_is_non_negative(m: &Money) -> bool {
+    return m.cents >= 0;
+}
+
+/// Are the two amounts equal? Borrows both, consumes nothing.
+@conserve
+pub fn Money_eq(a: &Money, b: &Money) -> bool {
+    return a.cents == b.cents;
+}
+
+// ─── Destroying operations (NOT @conserve) ─────────────────────────────────
+
+/// a - b, both consumed: `b` and as much of `a` are destroyed. To pay `b`
+/// out of `a` and keep both, use Money_take. Not @conserve.
 pub fn Money_sub(a: Money, b: Money) -> Money {
     return Money { cents: a.cents - b.cents };
 }
 
-/// Get the cents value. Consumes the money (linear).
-@conserve
+/// The cents value, consuming the Money: it leaves the money system (a
+/// payout, a report at the end). Not @conserve; use Money_cents(&m) to read.
 pub fn Money_to_cents(m: Money) -> i64 {
     return m.cents;
-}
-
-/// Check if money is non-negative. Consumes the input.
-@conserve
-pub fn Money_is_non_negative(m: Money) -> bool {
-    return m.cents >= 0;
-}
-
-/// Check if two money amounts are equal. Both consumed.
-@conserve
-pub fn Money_eq(a: Money, b: Money) -> bool {
-    return a.cents == b.cents;
 }
 
 /// Print money as dollars.cents (e.g. "$12.34"). NOT @conserve (has IO effect).
