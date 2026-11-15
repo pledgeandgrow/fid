@@ -38,6 +38,10 @@ impl JsonValue {
         if let JsonValue::Str(s) = self { Some(s) } else { None }
     }
 
+    fn as_bool(&self) -> Option<bool> {
+        if let JsonValue::Bool(b) = self { Some(*b) } else { None }
+    }
+
     fn as_int(&self) -> Option<i64> {
         match self {
             JsonValue::Int(n) => Some(*n),
@@ -327,6 +331,14 @@ pub fn run() -> i32 {
                         ("hoverProvider".to_string(), JsonValue::Bool(true)),
                         ("definitionProvider".to_string(), JsonValue::Bool(true)),
                         ("renameProvider".to_string(), JsonValue::Bool(true)),
+                        ("referencesProvider".to_string(), JsonValue::Bool(true)),
+                        ("documentFormattingProvider".to_string(), JsonValue::Bool(true)),
+                        ("signatureHelpProvider".to_string(), JsonValue::Object(vec![
+                            ("triggerCharacters".to_string(), JsonValue::Array(vec![
+                                JsonValue::Str("(".to_string()),
+                                JsonValue::Str(",".to_string()),
+                            ])),
+                        ])),
                     ])),
                     ("serverInfo".to_string(), JsonValue::Object(vec![
                         ("name".to_string(), JsonValue::Str("fides-lsp".to_string())),
@@ -446,6 +458,56 @@ pub fn run() -> i32 {
                     .unwrap_or("new_name");
                 let text = documents.get(&uri).map(|s| s.as_str()).unwrap_or("");
                 let result = handle_rename(text, &uri, line, character, new_name);
+                send_response(&mut stdout, id.unwrap(), result);
+            }
+            "textDocument/references" => {
+                let uri = params.get("textDocument")
+                    .and_then(|v| v.get("uri"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let line = params.get("position")
+                    .and_then(|v| v.get("line"))
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0) as usize;
+                let character = params.get("position")
+                    .and_then(|v| v.get("character"))
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0) as usize;
+                let include_decl = params.get("context")
+                    .and_then(|v| v.get("includeDeclaration"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let text = documents.get(&uri).map(|s| s.as_str()).unwrap_or("");
+                let result = handle_references(text, &uri, line, character, include_decl);
+                send_response(&mut stdout, id.unwrap(), result);
+            }
+            "textDocument/formatting" => {
+                let uri = params.get("textDocument")
+                    .and_then(|v| v.get("uri"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let text = documents.get(&uri).map(|s| s.as_str()).unwrap_or("");
+                let result = handle_formatting(text);
+                send_response(&mut stdout, id.unwrap(), result);
+            }
+            "textDocument/signatureHelp" => {
+                let uri = params.get("textDocument")
+                    .and_then(|v| v.get("uri"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let line = params.get("position")
+                    .and_then(|v| v.get("line"))
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0) as usize;
+                let character = params.get("position")
+                    .and_then(|v| v.get("character"))
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0) as usize;
+                let text = documents.get(&uri).map(|s| s.as_str()).unwrap_or("");
+                let result = handle_signature_help(text, line, character);
                 send_response(&mut stdout, id.unwrap(), result);
             }
             _ => {
@@ -1035,5 +1097,144 @@ fn location_json(uri: &str, line: usize, col: usize, word: &str) -> JsonValue {
                 ("character".to_string(), JsonValue::Int((col + word_len) as i64)),
             ])),
         ])),
+    ])
+}
+
+/// Handle textDocument/references — every whole-word occurrence of the
+/// symbol at position as an LSP Location (same document).
+fn handle_references(text: &str, uri: &str, line: usize, character: usize, include_decl: bool) -> JsonValue {
+    let word = word_at_position(text, line, character);
+    if word.is_empty() {
+        return JsonValue::Array(vec![]);
+    }
+    let mut locs = Vec::new();
+    for (l, c, _len) in find_all_occurrences(text, &word) {
+        // Skip the declaration itself only when the client asked to —
+        // cheap filter: the word right after a `fn`/`struct`/etc keyword
+        // on that line. includeDeclaration defaults to include.
+        if !include_decl {
+            let line_text = text.lines().nth(l).unwrap_or("");
+            let before = line_text[..c.min(line_text.len())].trim_end();
+            if before.ends_with("fn") || before.ends_with("struct")
+                || before.ends_with("enum") || before.ends_with("const")
+                || before.ends_with("type") || before.ends_with("cap") {
+                continue;
+            }
+        }
+        locs.push(location_json(uri, l, c, &word));
+    }
+    JsonValue::Array(locs)
+}
+
+/// Handle textDocument/formatting — run the canonical formatter and
+/// return a single whole-document TextEdit (empty array when clean).
+fn handle_formatting(text: &str) -> JsonValue {
+    let formatted = crate::fmt::format(text);
+    if formatted == text {
+        return JsonValue::Array(vec![]);
+    }
+    let last_line = text.lines().count().saturating_sub(1);
+    let last_col = text.lines().last().map(|l| l.chars().count()).unwrap_or(0);
+    JsonValue::Array(vec![JsonValue::Object(vec![
+        ("range".to_string(), JsonValue::Object(vec![
+            ("start".to_string(), JsonValue::Object(vec![
+                ("line".to_string(), JsonValue::Int(0)),
+                ("character".to_string(), JsonValue::Int(0)),
+            ])),
+            ("end".to_string(), JsonValue::Object(vec![
+                ("line".to_string(), JsonValue::Int(last_line as i64)),
+                ("character".to_string(), JsonValue::Int(last_col as i64)),
+            ])),
+        ])),
+        ("newText".to_string(), JsonValue::Str(formatted)),
+    ])])
+}
+
+/// Handle textDocument/signatureHelp — walk back from the cursor to the
+/// nearest unmatched `(`, take the callee name before it, and report its
+/// signature plus the active argument index (commas before the cursor).
+fn handle_signature_help(text: &str, line: usize, character: usize) -> JsonValue {
+    // Byte offset of the cursor.
+    let mut off = 0usize;
+    for (i, l) in text.lines().enumerate() {
+        if i == line {
+            off += l[..character.min(l.len())].len();
+            break;
+        }
+        off += l.len() + 1;
+    }
+    let bytes = text.as_bytes();
+    // Scan back: depth<0 means the `(` we just saw opens our call.
+    let mut depth: i64 = 0;
+    let mut i = off;
+    let mut open = usize::MAX;
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth < 0 { open = i; break; }
+            }
+            _ => {}
+        }
+    }
+    if open == usize::MAX {
+        return JsonValue::Null;
+    }
+    // Callee = identifier immediately before the `(` (skip whitespace).
+    let mut e = open;
+    while e > 0 && (bytes[e - 1] as char).is_whitespace() { e -= 1; }
+    let mut s = e;
+    while s > 0 && is_ident_char(bytes[s - 1] as char) { s -= 1; }
+    if s == e {
+        return JsonValue::Null;
+    }
+    let name = &text[s..e];
+
+    // Active parameter: top-level commas between `(` and cursor.
+    let mut active: i64 = 0;
+    let mut d2: i64 = 0;
+    let mut j = open + 1;
+    while j < off {
+        match bytes[j] {
+            b'(' | b'[' | b'{' => d2 += 1,
+            b')' | b']' | b'}' => d2 -= 1,
+            b',' if d2 == 0 => active += 1,
+            _ => {}
+        }
+        j += 1;
+    }
+
+    let (_program, tc) = compiler::build_program_for_lsp(text);
+    let mut sigs: Vec<JsonValue> = Vec::new();
+    let mut push_sig = |label: String| {
+        sigs.push(JsonValue::Object(vec![
+            ("label".to_string(), JsonValue::Str(label)),
+        ]));
+    };
+    if let Some((params, ret)) = tc.get_funcs().get(name) {
+        let ps: Vec<String> = params.iter().map(|t| t.to_string()).collect();
+        push_sig(format!("fn {}({}) -> {}", name, ps.join(", "), ret));
+    }
+    // Methods: `recv.name(` — the name before ours may be the receiver.
+    for (struct_name, mmap) in tc.get_methods() {
+        if let Some((params, ret, has_self, _p)) = mmap.get(name) {
+            let ps: Vec<String> = params.iter().map(|t| t.to_string()).collect();
+            let label = if *has_self {
+                format!("fn {}::{}(self, {}) -> {}", struct_name, name, ps.join(", "), ret)
+            } else {
+                format!("fn {}::{}({}) -> {}", struct_name, name, ps.join(", "), ret)
+            };
+            push_sig(label);
+        }
+    }
+    if sigs.is_empty() {
+        return JsonValue::Null;
+    }
+    JsonValue::Object(vec![
+        ("signatures".to_string(), JsonValue::Array(sigs)),
+        ("activeSignature".to_string(), JsonValue::Int(0)),
+        ("activeParameter".to_string(), JsonValue::Int(active)),
     ])
 }

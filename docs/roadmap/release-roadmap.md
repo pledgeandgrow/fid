@@ -755,12 +755,30 @@ Nothing here is ready to protect real data yet. Do not write new primitives.
       `crypto_random_bytes`, `crypto_random_u64` over the builtin
       `p_os_random_u64` (rand_s / BCryptGenRandom on Windows, /dev/urandom
       elsewhere), on every backend.
-- [ ] J5. AEAD, signatures and a KDF through bindings (L, see decision 2).
-- [ ] J6. Apply `@constant_time`, `@secret` and `@zeroize` in `stdlib/crypto.fd`
-      itself: it uses none of them today (M).
-- [ ] J7. `@constant_time` verified on the PE path: its asm verifier covers x86-64
-      ELF only (L).
-- [ ] J8. `@zeroize` reaches old `Vec` buffers and cannot be optimised away (M).
+- [x] J5. AEAD, signatures and a KDF through bindings (L, see decision 2).
+      `stdlib/crypto_bind.fd` binds BCrypt/CNG on Windows: AES-GCM,
+      PBKDF2-HMAC-SHA256 and ECDSA P-256. Verified by
+      `tests/bootstrap/test_crypto_bind.fd` (NIST GCM vector, tamper
+      rejection, RFC 7914 PBKDF2 vector, sign/verify/corrupt). An
+      OpenSSL-EVP twin for other platforms is still open.
+- [x] J6. Apply `@constant_time`, `@secret` and `@zeroize` in `stdlib/crypto.fd`
+      itself: the pure helpers carry `@constant_time`, HMAC carries
+      `@secret`/`@zeroize`/`@declassify`; the checker rejects branches and
+      division on secret data (M).
+- [x] J7. `@constant_time` verified on the PE path: the IR carries
+      `is_constant_time` into `nat_ir`, where a MIR-level verifier rejects
+      secret-dependent branches, division and calls to non-CT functions
+      before emission; `emit --nat` fails violating programs. The older
+      post-codegen asm verifier still covers x86-64 ELF (L).
+- [~] J8. `@zeroize` reaches old `Vec` buffers and cannot be optimised away (M).
+      A sensitive-buffer registry (generated-C runtime) wipes buffers on
+      growth (`__p_vec_grow`), on every `__p_vbuf_free` — including shared
+      buffers' last owner — and on drop; volatile byte writes.
+      `tests/bootstrap/test_zeroize_vec.fd` counts 3 wipes on the C path.
+      The matching `pert_sensitive_*` registry is wired into the native
+      runtimes but `--nat` executables cannot yet report results (no
+      stdout/exit-code propagation in that environment) — native
+      end-to-end verification is open.
 
 **Acceptance:** vectors pass in CI; the documented claims match the tests.
 
@@ -989,7 +1007,9 @@ and go to definition in VS Code, then format, test and build it.
 These need an outside party or money, so they wait, and they do not block 1.0.0.
 
 - [ ] J9. Independent security review before anything is called production
-      ready (external).
+      ready (external). The internal evidence index is prepared at
+      `docs/security/review-index.md`; the review itself still needs an
+      outside party — not done and not claimed.
 - [ ] L5. A qualified toolchain process per IEC 62304, ISO 26262 or DO-178C,
       through a certification body (XL, external).
 

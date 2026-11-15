@@ -1,0 +1,266 @@
+// stdlib/toml against a selection of the toml-test suite
+// (https://github.com/toml-lang/toml-test, main branch, files listed in
+// tests/files-toml-1.0.0): 24 files of tests/valid (strings and escapes,
+// integers, floats, date-times, arrays and tables, keys, comments), each
+// compared with its .json file (the same JSON with keys sorted), and every
+// fourth file of each tests/invalid directory (129), each of which must be
+// rejected. The specification's own examples are in test_toml_spec.fd.
+//
+// In the strings below `\x7b` and `\x7d` are braces (a brace in a Fides
+// string literal may start an interpolation) and tb("hex") builds a text
+// from bytes (control characters, invalid UTF-8).
+use toml;
+
+fn tb(hex: str) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i + 1 < str_len(hex) {
+        out.push(str_parse_hex("0x" + str_slice(hex, i, i + 2)));
+        i = i + 2;
+    }
+    return str_from_bytes(out);
+}
+
+fn ok(name: str, text: str, want: str) {
+    val d: TomlDoc = toml_load(text);
+    if !d.ok {
+        println(name + ": rejected: " + d.error);
+        p_panic("toml spec: " + name + " should be valid");
+    }
+    val got: str = toml_to_json(d);
+    if !str_equal(got, want) {
+        println(name + ": got  " + got);
+        println(name + ": want " + want);
+        p_panic("toml spec: " + name + " parsed wrong");
+    }
+    println(name + ": ok");
+}
+
+fn bad(name: str, text: str) {
+    val d: TomlDoc = toml_load(text);
+    if d.ok {
+        println(name + ": accepted: " + toml_to_json(d));
+        p_panic("toml spec: " + name + " should be rejected");
+    }
+    println(name + ": rejected (" + d.error + ")");
+}
+
+
+// ─── toml-test cases ─────────────────────────────────────────────────────
+
+// valid cases (toml-test tests/valid/...)
+fn valid_0() {
+    ok("string/escapes", "backspace     = \"|\\b.\"\ntab           = \"|\\t.\"\nnewline       = \"|\\n.\"\nformfeed      = \"|\\f.\"\ncarriage      = \"|\\r.\"\nquote         = \"|\\\".\"\nbackslash     = \"|\\\\.\"\ndelete        = \"|\\u007F.\"\nunitseparator = \"|\\u001F.\"\n\n# \\u is escaped, so should NOT be interperted as a \\u escape.\nnotunicode1   = \"|\\\\u.\"\nnotunicode2   = \"|\\u005Cu.\"\nnotunicode3   = \"|\\\\u0075.\"\nnotunicode4   = \"|\\\\\\u0075.\"\n",
+       "\x7b\"backslash\":\x7b\"type\":\"string\",\"value\":\"|\\\\.\"\x7d,\"backspace\":\x7b\"type\":\"string\",\"value\":\"|\\u0008.\"\x7d,\"carriage\":\x7b\"type\":\"string\",\"value\":\"|\\r.\"\x7d,\"delete\":\x7b\"type\":\"string\",\"value\":\"|\\u007f.\"\x7d,\"formfeed\":\x7b\"type\":\"string\",\"value\":\"|\\u000c.\"\x7d,\"newline\":\x7b\"type\":\"string\",\"value\":\"|\\n.\"\x7d,\"notunicode1\":\x7b\"type\":\"string\",\"value\":\"|\\\\u.\"\x7d,\"notunicode2\":\x7b\"type\":\"string\",\"value\":\"|\\\\u.\"\x7d,\"notunicode3\":\x7b\"type\":\"string\",\"value\":\"|\\\\u0075.\"\x7d,\"notunicode4\":\x7b\"type\":\"string\",\"value\":\"|\\\\u.\"\x7d,\"quote\":\x7b\"type\":\"string\",\"value\":\"|\\\".\"\x7d,\"tab\":\x7b\"type\":\"string\",\"value\":\"|\\t.\"\x7d,\"unitseparator\":\x7b\"type\":\"string\",\"value\":\"|\\u001f.\"\x7d\x7d");
+    ok("string/escape-tricky", "end_esc = \"String does not end here\\\" but ends here\\\\\"\nlit_end_esc = 'String ends here\\'\n\nmultiline_unicode = \"\"\"\n\\u00a0\"\"\"\n\nmultiline_not_unicode = \"\"\"\n\\\\u0041\"\"\"\n\nmultiline_end_esc = \"\"\"When will it end? \\\"\"\"...\"\"\\\" should be here\\\"\"\"\"\n\nlit_multiline_not_unicode = '''\n\\u007f'''\n\nlit_multiline_end = '''There is no escape\\'''\n",
+       "\x7b\"end_esc\":\x7b\"type\":\"string\",\"value\":\"String does not end here\\\" but ends here\\\\\"\x7d,\"lit_end_esc\":\x7b\"type\":\"string\",\"value\":\"String ends here\\\\\"\x7d,\"lit_multiline_end\":\x7b\"type\":\"string\",\"value\":\"There is no escape\\\\\"\x7d,\"lit_multiline_not_unicode\":\x7b\"type\":\"string\",\"value\":\"\\\\u007f\"\x7d,\"multiline_end_esc\":\x7b\"type\":\"string\",\"value\":\"When will it end? \\\"\\\"\\\"...\\\"\\\"\\\" should be here\\\"\"\x7d,\"multiline_not_unicode\":\x7b\"type\":\"string\",\"value\":\"\\\\u0041\"\x7d,\"multiline_unicode\":\x7b\"type\":\"string\",\"value\":\" \"\x7d\x7d");
+    ok("string/multiline", "# NOTE: this file includes some literal tab characters.\n\nequivalent_one = \"The quick brown fox jumps over the lazy dog.\"\nequivalent_two = \"\"\"\nThe quick brown \\\n\n\n  fox jumps over \\\n    the lazy dog.\"\"\"\n\nequivalent_three = \"\"\"\\\n       The quick brown \\\n       fox jumps over \\\n       the lazy dog.\\\n       \"\"\"\n\nwhitespace-after-bs = \"\"\"\\\n       The quick brown \\\n       fox jumps over \\   \n       the lazy dog.\\\t\n       \"\"\"\n\nno-space = \"\"\"a\\\n    b\"\"\"\n\n# Has tab character.\nkeep-ws-before = \"\"\"a   \t\\\n   b\"\"\"\n\nescape-bs-1 = \"\"\"a \\\\\nb\"\"\"\n\nescape-bs-2 = \"\"\"a \\\\\\\nb\"\"\"\n\nescape-bs-3 = \"\"\"a \\\\\\\\\n  b\"\"\"\n",
+       "\x7b\"equivalent_one\":\x7b\"type\":\"string\",\"value\":\"The quick brown fox jumps over the lazy dog.\"\x7d,\"equivalent_three\":\x7b\"type\":\"string\",\"value\":\"The quick brown fox jumps over the lazy dog.\"\x7d,\"equivalent_two\":\x7b\"type\":\"string\",\"value\":\"The quick brown fox jumps over the lazy dog.\"\x7d,\"escape-bs-1\":\x7b\"type\":\"string\",\"value\":\"a \\\\\\nb\"\x7d,\"escape-bs-2\":\x7b\"type\":\"string\",\"value\":\"a \\\\b\"\x7d,\"escape-bs-3\":\x7b\"type\":\"string\",\"value\":\"a \\\\\\\\\\n  b\"\x7d,\"keep-ws-before\":\x7b\"type\":\"string\",\"value\":\"a   \\tb\"\x7d,\"no-space\":\x7b\"type\":\"string\",\"value\":\"ab\"\x7d,\"whitespace-after-bs\":\x7b\"type\":\"string\",\"value\":\"The quick brown fox jumps over the lazy dog.\"\x7d\x7d");
+    ok("string/multiline-quotes", "# Make sure that quotes inside multiline strings are allowed, including right\n# after the opening '''/\"\"\" and before the closing '''/\"\"\"\n\nlit_one = ''''one quote''''\nlit_two = '''''two quotes'''''\nlit_one_space = ''' 'one quote' '''\nlit_two_space = ''' ''two quotes'' '''\n\none = \"\"\"\"one quote\"\"\"\"\ntwo = \"\"\"\"\"two quotes\"\"\"\"\"\none_space = \"\"\" \"one quote\" \"\"\"\ntwo_space = \"\"\" \"\"two quotes\"\" \"\"\"\n\nmismatch1 = \"\"\"aaa'''bbb\"\"\"\nmismatch2 = '''aaa\"\"\"bbb'''\n\n# Three opening \"\"\", then one escaped \", then two \"\" (allowed), and then three\n# closing \"\"\"\nescaped = \"\"\"lol\\\"\"\"\"\"\"\n\nfive-quotes = \"\"\"\nClosing with five quotes\n\"\"\"\"\"\nfour-quotes = \"\"\"\nClosing with four quotes\n\"\"\"\"\n",
+       "\x7b\"escaped\":\x7b\"type\":\"string\",\"value\":\"lol\\\"\\\"\\\"\"\x7d,\"five-quotes\":\x7b\"type\":\"string\",\"value\":\"Closing with five quotes\\n\\\"\\\"\"\x7d,\"four-quotes\":\x7b\"type\":\"string\",\"value\":\"Closing with four quotes\\n\\\"\"\x7d,\"lit_one\":\x7b\"type\":\"string\",\"value\":\"'one quote'\"\x7d,\"lit_one_space\":\x7b\"type\":\"string\",\"value\":\" 'one quote' \"\x7d,\"lit_two\":\x7b\"type\":\"string\",\"value\":\"''two quotes''\"\x7d,\"lit_two_space\":\x7b\"type\":\"string\",\"value\":\" ''two quotes'' \"\x7d,\"mismatch1\":\x7b\"type\":\"string\",\"value\":\"aaa'''bbb\"\x7d,\"mismatch2\":\x7b\"type\":\"string\",\"value\":\"aaa\\\"\\\"\\\"bbb\"\x7d,\"one\":\x7b\"type\":\"string\",\"value\":\"\\\"one quote\\\"\"\x7d,\"one_space\":\x7b\"type\":\"string\",\"value\":\" \\\"one quote\\\" \"\x7d,\"two\":\x7b\"type\":\"string\",\"value\":\"\\\"\\\"two quotes\\\"\\\"\"\x7d,\"two_space\":\x7b\"type\":\"string\",\"value\":\" \\\"\\\"two quotes\\\"\\\" \"\x7d\x7d");
+    ok("string/unicode-escape", "delta-1 = \"\\u03B4\"\ndelta-2 = \"\\U000003B4\"\na       = \"\\u0061\"\nb       = \"\\u0062\"\nc       = \"\\U00000063\"\nnull-1  = \"\\u0000\"\nnull-2  = \"\\U00000000\"\n\nml-delta-1 = \"\"\"\\u03B4\"\"\"\nml-delta-2 = \"\"\"\\U000003B4\"\"\"\nml-a       = \"\"\"\\u0061\"\"\"\nml-b       = \"\"\"\\u0062\"\"\"\nml-c       = \"\"\"\\U00000063\"\"\"\nml-null-1  = \"\"\"\\u0000\"\"\"\nml-null-2  = \"\"\"\\U00000000\"\"\"\n",
+       "\x7b\"a\":\x7b\"type\":\"string\",\"value\":\"a\"\x7d,\"b\":\x7b\"type\":\"string\",\"value\":\"b\"\x7d,\"c\":\x7b\"type\":\"string\",\"value\":\"c\"\x7d,\"delta-1\":\x7b\"type\":\"string\",\"value\":\"δ\"\x7d,\"delta-2\":\x7b\"type\":\"string\",\"value\":\"δ\"\x7d,\"ml-a\":\x7b\"type\":\"string\",\"value\":\"a\"\x7d,\"ml-b\":\x7b\"type\":\"string\",\"value\":\"b\"\x7d,\"ml-c\":\x7b\"type\":\"string\",\"value\":\"c\"\x7d,\"ml-delta-1\":\x7b\"type\":\"string\",\"value\":\"δ\"\x7d,\"ml-delta-2\":\x7b\"type\":\"string\",\"value\":\"δ\"\x7d,\"ml-null-1\":\x7b\"type\":\"string\",\"value\":\"\\u0000\"\x7d,\"ml-null-2\":\x7b\"type\":\"string\",\"value\":\"\\u0000\"\x7d,\"null-1\":\x7b\"type\":\"string\",\"value\":\"\\u0000\"\x7d,\"null-2\":\x7b\"type\":\"string\",\"value\":\"\\u0000\"\x7d\x7d");
+    ok("integer/literals", "bin1 = 0b11010110\nbin2 = 0b1_0_1\n\noct1 = 0o01234567\noct2 = 0o755\noct3 = 0o7_6_5\n\nhex1 = 0xDEADBEEF\nhex2 = 0xdeadbeef\nhex3 = 0xdead_beef\nhex4 = 0x00987\n",
+       "\x7b\"bin1\":\x7b\"type\":\"integer\",\"value\":\"214\"\x7d,\"bin2\":\x7b\"type\":\"integer\",\"value\":\"5\"\x7d,\"hex1\":\x7b\"type\":\"integer\",\"value\":\"3735928559\"\x7d,\"hex2\":\x7b\"type\":\"integer\",\"value\":\"3735928559\"\x7d,\"hex3\":\x7b\"type\":\"integer\",\"value\":\"3735928559\"\x7d,\"hex4\":\x7b\"type\":\"integer\",\"value\":\"2439\"\x7d,\"oct1\":\x7b\"type\":\"integer\",\"value\":\"342391\"\x7d,\"oct2\":\x7b\"type\":\"integer\",\"value\":\"493\"\x7d,\"oct3\":\x7b\"type\":\"integer\",\"value\":\"501\"\x7d\x7d");
+    ok("integer/long", "# int64 \"should\" be supported, but is not mandatory. It's fine to skip this\n# test.\nint64-max     = 9223372036854775807\nint64-max-neg = -9223372036854775808\n",
+       "\x7b\"int64-max\":\x7b\"type\":\"integer\",\"value\":\"9223372036854775807\"\x7d,\"int64-max-neg\":\x7b\"type\":\"integer\",\"value\":\"-9223372036854775808\"\x7d\x7d");
+    ok("float/exponent", "# Please keep exponent-upper.toml in sync with this.\n\nexp       = 3e2\npos-exp   = 3e+2\nneg-exp   = 3e-2\nzero-exp  = 3e0\nfrac      = 3.1e2\nneg       = -1e-1\nzero      = 0e2\nzero-plus = +0e2\n",
+       "\x7b\"exp\":\x7b\"type\":\"float\",\"value\":\"3e2\"\x7d,\"frac\":\x7b\"type\":\"float\",\"value\":\"3.1e2\"\x7d,\"neg\":\x7b\"type\":\"float\",\"value\":\"-1e-1\"\x7d,\"neg-exp\":\x7b\"type\":\"float\",\"value\":\"3e-2\"\x7d,\"pos-exp\":\x7b\"type\":\"float\",\"value\":\"3e2\"\x7d,\"zero\":\x7b\"type\":\"float\",\"value\":\"0e2\"\x7d,\"zero-exp\":\x7b\"type\":\"float\",\"value\":\"3e0\"\x7d,\"zero-plus\":\x7b\"type\":\"float\",\"value\":\"0e2\"\x7d\x7d");
+    ok("float/inf-and-nan", "# We don't encode +nan and -nan back with the signs; many languages don't\n# support a sign on NaN (it doesn't really make much sense).\nnan = nan\nnan_neg = -nan\nnan_plus = +nan\ninfinity = inf\ninfinity_neg = -inf\ninfinity_plus = +inf\n",
+       "\x7b\"infinity\":\x7b\"type\":\"float\",\"value\":\"inf\"\x7d,\"infinity_neg\":\x7b\"type\":\"float\",\"value\":\"-inf\"\x7d,\"infinity_plus\":\x7b\"type\":\"float\",\"value\":\"inf\"\x7d,\"nan\":\x7b\"type\":\"float\",\"value\":\"nan\"\x7d,\"nan_neg\":\x7b\"type\":\"float\",\"value\":\"nan\"\x7d,\"nan_plus\":\x7b\"type\":\"float\",\"value\":\"nan\"\x7d\x7d");
+    ok("datetime/edge", "first-offset = 0001-01-01 00:00:00Z\nfirst-local  = 0001-01-01 00:00:00\nfirst-date   = 0001-01-01\n\nlast-offset = 9999-12-31 23:59:59Z\nlast-local  = 9999-12-31 23:59:59\nlast-date   = 9999-12-31\n",
+       "\x7b\"first-date\":\x7b\"type\":\"date-local\",\"value\":\"0001-01-01\"\x7d,\"first-local\":\x7b\"type\":\"datetime-local\",\"value\":\"0001-01-01T00:00:00\"\x7d,\"first-offset\":\x7b\"type\":\"datetime\",\"value\":\"0001-01-01T00:00:00Z\"\x7d,\"last-date\":\x7b\"type\":\"date-local\",\"value\":\"9999-12-31\"\x7d,\"last-local\":\x7b\"type\":\"datetime-local\",\"value\":\"9999-12-31T23:59:59\"\x7d,\"last-offset\":\x7b\"type\":\"datetime\",\"value\":\"9999-12-31T23:59:59Z\"\x7d\x7d");
+    ok("datetime/leap-year", "2000-datetime       = 2000-02-29 15:15:15Z\n2000-datetime-local = 2000-02-29 15:15:15\n2000-date           = 2000-02-29\n\n2024-datetime       = 2024-02-29 15:15:15Z\n2024-datetime-local = 2024-02-29 15:15:15\n2024-date           = 2024-02-29\n",
+       "\x7b\"2000-date\":\x7b\"type\":\"date-local\",\"value\":\"2000-02-29\"\x7d,\"2000-datetime\":\x7b\"type\":\"datetime\",\"value\":\"2000-02-29T15:15:15Z\"\x7d,\"2000-datetime-local\":\x7b\"type\":\"datetime-local\",\"value\":\"2000-02-29T15:15:15\"\x7d,\"2024-date\":\x7b\"type\":\"date-local\",\"value\":\"2024-02-29\"\x7d,\"2024-datetime\":\x7b\"type\":\"datetime\",\"value\":\"2024-02-29T15:15:15Z\"\x7d,\"2024-datetime-local\":\x7b\"type\":\"datetime-local\",\"value\":\"2024-02-29T15:15:15\"\x7d\x7d");
+    ok("datetime/milliseconds", "utc1  = 1987-07-05T17:45:56.123Z\nutc2  = 1987-07-05T17:45:56.6Z\nwita1 = 1987-07-05T17:45:56.123+08:00\nwita2 = 1987-07-05T17:45:56.6+08:00\n",
+       "\x7b\"utc1\":\x7b\"type\":\"datetime\",\"value\":\"1987-07-05T17:45:56.123Z\"\x7d,\"utc2\":\x7b\"type\":\"datetime\",\"value\":\"1987-07-05T17:45:56.6Z\"\x7d,\"wita1\":\x7b\"type\":\"datetime\",\"value\":\"1987-07-05T17:45:56.123+08:00\"\x7d,\"wita2\":\x7b\"type\":\"datetime\",\"value\":\"1987-07-05T17:45:56.6+08:00\"\x7d\x7d");
+    ok("datetime/timezone", "utc  = 1987-07-05T17:45:56Z\npdt  = 1987-07-05T17:45:56-05:00\nnzst = 1987-07-05T17:45:56+12:00\nnzdt = 1987-07-05T17:45:56+13:00  # DST\n",
+       "\x7b\"nzdt\":\x7b\"type\":\"datetime\",\"value\":\"1987-07-05T17:45:56+13:00\"\x7d,\"nzst\":\x7b\"type\":\"datetime\",\"value\":\"1987-07-05T17:45:56+12:00\"\x7d,\"pdt\":\x7b\"type\":\"datetime\",\"value\":\"1987-07-05T17:45:56-05:00\"\x7d,\"utc\":\x7b\"type\":\"datetime\",\"value\":\"1987-07-05T17:45:56Z\"\x7d\x7d");
+    ok("array/nested-inline-table", "a = [ \x7b b = \x7b\x7d \x7d ]\n",
+       "\x7b\"a\":[\x7b\"b\":\x7b\x7d\x7d]\x7d");
+    ok("table/array-nest", "[[albums]]\nname = \"Born to Run\"\n\n  [[albums.songs]]\n  name = \"Jungleland\"\n\n  [[albums.songs]]\n  name = \"Meeting Across the River\"\n\n[[albums]]\nname = \"Born in the USA\"\n  \n  [[albums.songs]]\n  name = \"Glory Days\"\n\n  [[albums.songs]]\n  name = \"Dancing in the Dark\"\n",
+       "\x7b\"albums\":[\x7b\"name\":\x7b\"type\":\"string\",\"value\":\"Born to Run\"\x7d,\"songs\":[\x7b\"name\":\x7b\"type\":\"string\",\"value\":\"Jungleland\"\x7d\x7d,\x7b\"name\":\x7b\"type\":\"string\",\"value\":\"Meeting Across the River\"\x7d\x7d]\x7d,\x7b\"name\":\x7b\"type\":\"string\",\"value\":\"Born in the USA\"\x7d,\"songs\":[\x7b\"name\":\x7b\"type\":\"string\",\"value\":\"Glory Days\"\x7d\x7d,\x7b\"name\":\x7b\"type\":\"string\",\"value\":\"Dancing in the Dark\"\x7d\x7d]\x7d]\x7d");
+    ok("table/array-table-array", "[[a]]\n    [[a.b]]\n        [a.b.c]\n            d = \"val0\"\n    [[a.b]]\n        [a.b.c]\n            d = \"val1\"\n",
+       "\x7b\"a\":[\x7b\"b\":[\x7b\"c\":\x7b\"d\":\x7b\"type\":\"string\",\"value\":\"val0\"\x7d\x7d\x7d,\x7b\"c\":\x7b\"d\":\x7b\"type\":\"string\",\"value\":\"val1\"\x7d\x7d\x7d]\x7d]\x7d");
+    ok("table/array-within-dotted", "[fruit]\napple.color = \"red\"\n\n[[fruit.apple.seeds]]\nsize = 2\n",
+       "\x7b\"fruit\":\x7b\"apple\":\x7b\"color\":\x7b\"type\":\"string\",\"value\":\"red\"\x7d,\"seeds\":[\x7b\"size\":\x7b\"type\":\"integer\",\"value\":\"2\"\x7d\x7d]\x7d\x7d\x7d");
+    ok("key/escapes", "\"\\n\" = \"newline\"\n\"\\b\" = \"bell\"\n\"\\u00c0\" = \"latin capital letter A with grave\"\n\"\\\"\" = \"just a quote\"\n\n[\"backsp\\b\\b\"]\n\n[\"\\\"quoted\\\"\"]\nquote = true\n\n[\"a.b\".\"\\u00c0\"]\n",
+       "\x7b\"\\u0008\":\x7b\"type\":\"string\",\"value\":\"bell\"\x7d,\"\\n\":\x7b\"type\":\"string\",\"value\":\"newline\"\x7d,\"\\\"\":\x7b\"type\":\"string\",\"value\":\"just a quote\"\x7d,\"\\\"quoted\\\"\":\x7b\"quote\":\x7b\"type\":\"bool\",\"value\":\"true\"\x7d\x7d,\"a.b\":\x7b\"À\":\x7b\x7d\x7d,\"backsp\\u0008\\u0008\":\x7b\x7d,\"À\":\x7b\"type\":\"string\",\"value\":\"latin capital letter A with grave\"\x7d\x7d");
+    ok("key/numeric-01", "1     = true\n",
+       "\x7b\"1\":\x7b\"type\":\"bool\",\"value\":\"true\"\x7d\x7d");
+    ok("key/quoted-dots", "plain = 1\n\"with.dot\" = 2\n\n[plain_table]\nplain = 3\n\"with.dot\" = 4\n\n[table.withdot]\nplain = 5\n\"key.with.dots\" = 6\n\"escaped\\u002edot\" = 7\n",
+       "\x7b\"plain\":\x7b\"type\":\"integer\",\"value\":\"1\"\x7d,\"plain_table\":\x7b\"plain\":\x7b\"type\":\"integer\",\"value\":\"3\"\x7d,\"with.dot\":\x7b\"type\":\"integer\",\"value\":\"4\"\x7d\x7d,\"table\":\x7b\"withdot\":\x7b\"escaped.dot\":\x7b\"type\":\"integer\",\"value\":\"7\"\x7d,\"key.with.dots\":\x7b\"type\":\"integer\",\"value\":\"6\"\x7d,\"plain\":\x7b\"type\":\"integer\",\"value\":\"5\"\x7d\x7d\x7d,\"with.dot\":\x7b\"type\":\"integer\",\"value\":\"2\"\x7d\x7d");
+}
+
+// valid cases (toml-test tests/valid/...)
+fn valid_1() {
+    ok("inline-table/key-dotted-02", "many.dots.here.dot.dot.dot = \x7ba.b.c = 1, a.b.d = 2\x7d\n",
+       "\x7b\"many\":\x7b\"dots\":\x7b\"here\":\x7b\"dot\":\x7b\"dot\":\x7b\"dot\":\x7b\"a\":\x7b\"b\":\x7b\"c\":\x7b\"type\":\"integer\",\"value\":\"1\"\x7d,\"d\":\x7b\"type\":\"integer\",\"value\":\"2\"\x7d\x7d\x7d\x7d\x7d\x7d\x7d\x7d\x7d\x7d");
+    ok("inline-table/nest", "tbl_tbl_empty = \x7b tbl_0 = \x7b\x7d \x7d\ntbl_tbl_val   = \x7b tbl_1 = \x7b one = 1 \x7d \x7d\ntbl_arr_tbl   = \x7b arr_tbl = [ \x7b one = 1 \x7d ] \x7d\narr_tbl_tbl   = [ \x7b tbl = \x7b one = 1 \x7d \x7d ]\n\n# Array-of-array-of-table is interesting because it can only\n# be represented in inline form.\narr_arr_tbl_empty = [ [ \x7b\x7d ] ]\narr_arr_tbl_val = [ [ \x7b one = 1 \x7d ] ]\narr_arr_tbls  = [ [ \x7b one = 1 \x7d, \x7b two = 2 \x7d ] ]\n",
+       "\x7b\"arr_arr_tbl_empty\":[[\x7b\x7d]],\"arr_arr_tbl_val\":[[\x7b\"one\":\x7b\"type\":\"integer\",\"value\":\"1\"\x7d\x7d]],\"arr_arr_tbls\":[[\x7b\"one\":\x7b\"type\":\"integer\",\"value\":\"1\"\x7d\x7d,\x7b\"two\":\x7b\"type\":\"integer\",\"value\":\"2\"\x7d\x7d]],\"arr_tbl_tbl\":[\x7b\"tbl\":\x7b\"one\":\x7b\"type\":\"integer\",\"value\":\"1\"\x7d\x7d\x7d],\"tbl_arr_tbl\":\x7b\"arr_tbl\":[\x7b\"one\":\x7b\"type\":\"integer\",\"value\":\"1\"\x7d\x7d]\x7d,\"tbl_tbl_empty\":\x7b\"tbl_0\":\x7b\x7d\x7d,\"tbl_tbl_val\":\x7b\"tbl_1\":\x7b\"one\":\x7b\"type\":\"integer\",\"value\":\"1\"\x7d\x7d\x7d\x7d");
+    ok("comment/everywhere", "# Top comment.\n  # Top comment.\n# Top comment.\n\n# [no-extraneous-groups-please]\n\n[group] # Comment\nanswer = 42 # Comment\n# no-extraneous-keys-please = 999\n# Inbetween comment.\nmore = [ # Comment\n  # What about multiple # comments?\n  # Can you handle it?\n  #\n          # Evil.\n# Evil.\n  42, 42, # Comments within arrays are fun.\n  # What about multiple # comments?\n  # Can you handle it?\n  #\n          # Evil.\n# Evil.\n# ] Did I fool you?\n] # Hopefully not.\n\n# Make sure the space between the datetime and \"#\" isn't lexed.\ndt = 1979-05-27T07:32:12-07:00  # c\nd = 1979-05-27 # Comment\n\n[[aot]] # Comment\nk = 98 # Comment\n[[aot]]# Comment\nk = 99# Comment\n",
+       "\x7b\"aot\":[\x7b\"k\":\x7b\"type\":\"integer\",\"value\":\"98\"\x7d\x7d,\x7b\"k\":\x7b\"type\":\"integer\",\"value\":\"99\"\x7d\x7d],\"group\":\x7b\"answer\":\x7b\"type\":\"integer\",\"value\":\"42\"\x7d,\"d\":\x7b\"type\":\"date-local\",\"value\":\"1979-05-27\"\x7d,\"dt\":\x7b\"type\":\"datetime\",\"value\":\"1979-05-27T07:32:12-07:00\"\x7d,\"more\":[\x7b\"type\":\"integer\",\"value\":\"42\"\x7d,\x7b\"type\":\"integer\",\"value\":\"42\"\x7d]\x7d\x7d");
+    ok("implicit-groups", "[a.b.c]\nanswer = 42\n",
+       "\x7b\"a\":\x7b\"b\":\x7b\"c\":\x7b\"answer\":\x7b\"type\":\"integer\",\"value\":\"42\"\x7d\x7d\x7d\x7d\x7d");
+}
+
+// invalid cases (toml-test tests/invalid/...)
+fn invalid_0() {
+    bad("array/double-comma-01", "double-comma-01 = [1,,2]\n");
+    bad("array/missing-separator-01", "arrr = [true false]\n");
+    bad("array/no-close-03", "no-close-03 = [42 #]\n");
+    bad("array/no-close-07", "no-close-07 = [\x7b key = 42\x7d #]\n");
+    bad("array/no-close-table-03", "no-close-table-03 = [1,\x7ba=1]\n");
+    bad("array/no-comma-03", "no-comma-03 = [ 1 #,]\n");
+    bad("array/tables-02", "# INVALID TOML DOC\n[[fruit]]\n  name = \"apple\"\n\n  [[fruit.variety]]\n    name = \"red delicious\"\n\n  # This table conflicts with the previous table\n  [fruit.variety]\n    name = \"granny smith\"\n");
+    bad("bool/almost-false-with-extra", "almost-false-with-extra = falsify\n");
+    bad("bool/capitalized-false", "capitalized-false        = False\n");
+    bad("bool/mixed-case-false", "mixed-case-false        = falsE\n");
+    bad("bool/starting-same-true", "starting-same-true      = truer\n");
+    bad("control/bare-cr", "# The following line contains a single carriage return control character\r\n\r");
+    bad("control/comment-cr", "comment-cr   = \"Carriage return in comment\" # \ra=1\n");
+    bad("control/comment-null", tb("636f6d6d656e742d6e756c6c203d20226e756c6c222020202320000a"));
+    bad("control/linetab-number-03", tb("6c696e657461622d6e756d6265722d3033203d20307866660b0a"));
+    bad("control/multi-null", tb("6d756c74692d6e756c6c203d202222226e756c6c002222220a"));
+    bad("control/only-vt", tb("0b"));
+    bad("control/rawmulti-us", tb("7261776d756c74692d75732020203d202727276e756c6c1f2727270a"));
+    bad("control/rawstring-null", tb("726177737472696e672d6e756c6c203d20276e756c6c00270a"));
+    bad("control/string-del", tb("737472696e672d64656c20203d20226e756c6c7f220a"));
+    bad("datetime/day-zero", "foo = 1997-09-00T09:09:09.09Z\n");
+    bad("datetime/leading-zero-date", "# No leading zero on year allowed.\nd = 02026-05-07\n");
+    bad("datetime/minute-over", "# time-minute     = 2DIGIT  ; 00-59\nd = 2006-01-01T00:60:00-00:00\n");
+    bad("datetime/no-leads-month", "# Month \"7\" instead of \"07\"; the leading zero is required.\nno-leads = 1987-7-05T17:45:00Z\n");
+    bad("datetime/no-secs", "# No seconds in time.\nno-secs = 1987-07-05T17:45Z\n");
+    bad("datetime/offset-minus-no-hour-minute-sep", "foo = 1997-09-09T09:09:09.09+0909\n");
+    bad("datetime/offset-overflow-minute", "d = 1985-06-18 17:04:07+12:60\n");
+    bad("datetime/offset-plus-no-minute", "foo = 1997-09-09T09:09:09.09+09\n");
+    bad("datetime/second-over", "# time-second     = 2DIGIT  ; 00-58, 00-59, 00-60 based on leap second\n#                           ; rules\nd = 2006-01-01T00:00:61-00:00\n");
+    bad("datetime/trailing-x", "sign=2020-01-01x\n");
+}
+
+// invalid cases (toml-test tests/invalid/...)
+fn invalid_1() {
+    bad("encoding/bad-codepoint", tb("2320496e76616c696420636f6465706f696e7420552b44383030203a20eda0800a"));
+    bad("encoding/bad-utf8-in-multiline-literal", tb("232054686520666f6c6c6f77696e67206c696e6520636f6e7461696e7320616e20696e76616c6964205554462d382073657175656e63652e0a626164203d20272727c32727270a"));
+    bad("encoding/bom-not-at-start-01", "# Contains UTF-8 BOM between = and 1\na=﻿1\n");
+    bad("encoding/utf16-bom", tb("feff00230020005500540046002d003100360020007700690074006800200042004f004d000a"));
+    bad("float/arabic-zero-01", "arabic-zero-01 = 1.٠\n");
+    bad("float/double-dot-01", "double-dot-01 = 0..1\n");
+    bad("float/exp-dot-03", "exp-dot-03 = 3.e+20\n");
+    bad("float/exp-double-sign-02", "exp-double-sign-02 = 1e--23\n");
+    bad("float/exp-trailing-us-02", "exp-trailing-us-02 = 1.2_e2\n");
+    bad("float/inf-incomplete-02", "inf-incomplete-02 = +in\n");
+    bad("float/leading-dot-plus", "leading-dot-plus = +.12345\n");
+    bad("float/leading-zero-plus", "leading-zero-plus = +03.14\n");
+    bad("float/nan-incomplete-02", "nan-incomplete-02 = +na\n");
+    bad("float/trailing-dot-02", "a = 1.\nb = 2\n");
+    bad("float/trailing-exp-dot", "trailing-exp-dot =  0.e\n");
+    bad("float/trailing-us-exp-01", "trailing-us-exp-1 = 1_e2\n");
+    bad("float/us-before-dot", "us-before-dot = 1_.2\n");
+    bad("inline-table/bad-key-syntax", "tbl = \x7b a = 1, [b] \x7d\n");
+    bad("inline-table/duplicate-key-03", "tbl = \x7b fruit = \x7b apple.color = \"red\" \x7d, fruit.apple.texture = \x7b smooth = true \x7d \x7d\n\n");
+    bad("inline-table/empty-03", "t = \x7b\n,\n\x7d\n");
+    bad("inline-table/linebreak-04", "json_like = \x7b\n          first = \"Tom\",\n          last = \"Preston-Werner\"\n\x7d\n");
+    bad("inline-table/no-comma-02", "arrr = \x7b comma-missing = true valid-toml = false \x7d\n");
+    bad("inline-table/overwrite-04", "inline-t = \x7b nest = \x7b\x7d \x7d\n\n[[inline-t.nest]]\n");
+    bad("inline-table/overwrite-08", "tab = \x7b inner = \x7b dog = \"best\" \x7d, inner.cat = \"worst\" \x7d");
+    bad("integer/arabic-zero-01", "arabic-zero-01 = 1٠\n");
+    bad("integer/capital-bin", "capital-bin = 0B0\n");
+    bad("integer/double-sign-plus", "double-sign-plus = ++99\n");
+    bad("integer/incomplete-oct", "incomplete-oct = 0o\n");
+    bad("integer/invalid-hex-03", "a = 0x-1\n");
+    bad("integer/leading-us-oct", "leading-us-oct = _0o1\n");
+}
+
+// invalid cases (toml-test tests/invalid/...)
+fn invalid_2() {
+    bad("integer/leading-zero-03", "leading-zero-03 = 0_0\n");
+    bad("integer/negative-bin", "negative-bin = -0b11010110\n");
+    bad("integer/positive-hex", "positive-hex = +0xff\n");
+    bad("integer/trailing-us-hex", "trailing-us-hex = 0x1_\n");
+    bad("integer/us-after-hex", "us-after-hex = 0x_1\n");
+    bad("key/after-array", "[[agencies]] owner = \"S Cjelli\"\n");
+    bad("key/bare-invalid-character-02", "bare!key = 123\n");
+    bad("key/dotted-redefine-table-02", "# Defined a.b as int\na.b = 1\n# Tries to access it as table: error\na.b.c = 2\n");
+    bad("key/duplicate-keys-04", "spelling   = \"favorite\"\n'spelling' = \"favourite\"\n");
+    bad("key/duplicate-keys-08", "arr = [1]\narr = [2]\n");
+    bad("key/escape", "\\u00c0 = \"latin capital letter A with grave\"\n");
+    bad("key/multiline-key-03", "\"\"\"key\"\"\" = \"\"\"v\"\"\"\n");
+    bad("key/newline-03", "'quoted\nkey' = 1\n");
+    bad("key/no-eol-01", "a = 1 b = 2\n");
+    bad("key/no-eol-05", "0=[0]00=[0,0,0]t=[\"0\",\"0\",\"0\"]s=[1000-00-00T00:00:00Z,2000-00-00T00:00:00Z]\n");
+    bad("key/only-int", "1\n");
+    bad("key/quoted-unclosed-01", "\"key = x\n");
+    bad("key/space", "a b = 1\n");
+    bad("key/tab-quoted", "# Tab literal between a and b below.\n\"a\"\t\"b\" = 1\n");
+    bad("key/two-equals-03", "a=b=1\n");
+    bad("key/without-value-04", "\"key\" = \n");
+    bad("local-date/day-1digit", "foo = 1997-09-9\n");
+    bad("local-date/mday-under", "# date-mday       = 2DIGIT  ; 01-28, 01-29, 01-30, 01-31 based on\n#                           ; month/year\nd = 2006-01-00\n");
+    bad("local-date/no-leads", "# Month \"7\" instead of \"07\"; the leading zero is required.\nno-leads = 1987-7-05\n");
+    bad("local-date/y10k", "# Maximum RFC3399 year is 9999.\nd = 10000-01-01\n");
+    bad("local-datetime/feb-29", "\"not a leap year\" = 2100-02-29T15:15:15\n");
+    bad("local-datetime/mday-under", "# date-mday       = 2DIGIT  ; 01-28, 01-29, 01-30, 01-31 based on\n#                           ; month/year\nd = 2006-01-00T00:00:00\n");
+    bad("local-datetime/no-leads-with-milli", "# Day \"5\" instead of \"05\"; the leading zero is required.\nwith-milli = 1987-07-5T17:45:00.12\n");
+    bad("local-datetime/no-t", "# No \"t\" or \"T\" between the date and time.\nno-t = 1987-07-0517:45:00\n");
+    bad("local-time/hour-over", "# time-hour       = 2DIGIT  ; 00-23\nd = 24:00:00\n");
+}
+
+// invalid cases (toml-test tests/invalid/...)
+fn invalid_3() {
+    bad("local-time/time-no-leads-01", "# Leading 0 is always required.\nd = 1:32:00\n");
+    bad("local-time/with-timezone-offset-01", "# local-time can't have timezone\nfoo = 17:45:00+02:00\n");
+    bad("string/bad-byte-escape", "naughty = \"\\xAg\"\n");
+    bad("string/bad-escape-03", "backslash = \"\\\"\n");
+    bad("string/bad-hex-esc-02", "bad-hex-esc-02 = \"\\xG0\"\n");
+    bad("string/bad-multiline", "multi = \"first line\nsecond line\"\n");
+    bad("string/bad-uni-esc-03", "bad-uni-esc-03 = \"val\\U0000000\"\n");
+    bad("string/bad-uni-esc-07", "bad-uni-esc-07 = \"\\uabag\"\n");
+    bad("string/bad-uni-esc-ml-04", "bad-uni-esc-ml-04 = \"\"\"val\\U0000\"\"\"\n");
+    bad("string/basic-byte-escapes", "answer = \"\\x33\"\n");
+    bad("string/basic-multiline-unknown-escape", "a = \"\"\"\\@\"\"\"\n");
+    bad("string/literal-multiline-quotes-01", "a = '''6 apostrophes: ''''''\n\n");
+    bad("string/missing-quotes", "name = value\n");
+    bad("string/multiline-bad-escape-04", "backslash = \"\"\"\\\"\"\"\n");
+    bad("string/multiline-lit-no-close-02", "x='''\n");
+    bad("string/multiline-no-close-02", "x=\"\"\"\n");
+    bad("string/multiline-quotes-01", "a = \"\"\"6 quotes: \"\"\"\"\"\"\n");
+    bad("string/no-close-04", "'a-string'.must-be = 'closed\n");
+    bad("string/no-close-08", "# No newline at end\n'a-string'.must-be = 'closed");
+    bad("string/no-open-02", "a = [a\"]\n");
+    bad("string/no-open-06", "a = [a\"\"\"]\n");
+    bad("string/wrong-close", "bad-ending-quote = \"double and single'\n");
+    bad("table/append-with-dotted-keys-01", "# First a.b.c defines a table: a.b.c = \x7bz=9\x7d\n#\n# Then we define a.b.c.t = \"str\" to add a str to the above table, making it:\n#\n#   a.b.c = \x7bz=9, t=\"...\"\x7d\n#\n# While this makes sense, logically, it was decided this is not valid TOML as\n# it's too confusing/convoluted.\n# \n# See: https://github.com/toml-lang/toml/issues/846\n#      https://github.com/toml-lang/toml/pull/859\n\n[a.b.c]\n  z = 9\n\n[a]\n  b.c.t = \"Using dotted keys to add to [a.b.c] after explicitly defining it above is not allowed\"\n");
+    bad("table/append-with-dotted-keys-05", "a.b.c = 1\na.b = 2\n");
+    bad("table/array-empty", "[[]]\nname = \"Born to Run\"\n");
+    bad("table/array-no-close-03", "[[a\n[[b]]\n");
+    bad("table/bare-invalid-character-01", "[!]\nk = 123\n");
+    bad("table/duplicate-key-01", "[a]\nb = 1\n\n[a]\nc = 2\n");
+    bad("table/duplicate-key-05", "[fruit]\napple.taste.sweet = true\n\n[fruit.apple.taste] # INVALID\n");
+    bad("table/duplicate-key-09", "[a]\nfoo=\"bar\"\n[a.b]\nfoo=\"bar\"\n[a]\n");
+}
+
+// invalid cases (toml-test tests/invalid/...)
+fn invalid_4() {
+    bad("table/duplicate-key-13", "[a.b]\n[a]\n[a.b]\n");
+    bad("table/equals-sign", "[name=bad]\n");
+    bad("table/nested-brackets-close", "[a]b]\nzyx = 42\n");
+    bad("table/newline-03", "[\"tbl\"\n]\nk = 1\n");
+    bad("table/no-close-02", "[closing-bracket.missingö\nblaa=2\n");
+    bad("table/no-close-06", "[a\n[b]\n[c\n[d]\n");
+    bad("table/overwrite-array-in-parent", "[[parent-table.arr]]\n[parent-table]\nnot-arr = 1\narr = 2\n");
+    bad("table/redefine-02", "# Define t2 as a table via dotted key in [t1] block, and then redefine [t1.t2]\n[t1]\nt2.t3.v = 0\n[t1.t2]\n");
+    bad("table/text-after-table", "[error] this shouldn't be here\n");
+}
+
+fn main() -> i64 {
+    valid_0();
+    valid_1();
+    invalid_0();
+    invalid_1();
+    invalid_2();
+    invalid_3();
+    invalid_4();
+    println("test_toml_suite_spec ok");
+    return 0;
+}

@@ -228,8 +228,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       tail position (M).
 - [ ] MI29. Stack probes for frames over a page, so a large frame cannot jump over
       the guard region (S).
-- [ ] MI30. One place that decides the code alignment of functions and loop heads
+- [x] MI30. One place that decides the code alignment of functions and loop heads
       per target (S).
+      Nov 15: `ng_code_align`/`NG_ALIGN_FN` in nat_ir.fd is the single decision
+      point; every code-entry and loop-head `align` call routes through it.
 
 ## Track RA — One register allocator (20)
 
@@ -287,8 +289,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       Nov 9: `scripts/nat-gate.sh`, the gate CI runs (one job per host after
       fid is built): the verifier and the checker on every native target,
       `fid test-rules`, the z3 proofs; exits non-zero on any failure.
-- [ ] RA17. Statistics per function: spills, reloads, moves; `--stats` prints them
+- [x] RA17. Statistics per function: spills, reloads, moves; `--stats` prints them
       (S).
+      Nov 15: `fid emit --stats` sets `g_nat_stats`; `ng_mir_stats` prints
+      per-function spill/reload/move counts after allocation.
 - [~] RA18. Floats and integers allocated by the same algorithm, class-aware (M).
       Nov 9, a first step on x86-64: floats still live in general registers,
       but the emitter remembers which register xmm0/xmm1 mirror and does not
@@ -326,8 +330,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `csel/csinc`, `ldp/stp`, pre/post-indexed addressing (M).
 - [ ] TG9. RISC-V: compressed instructions (RVC) for size, Zba/Zbb when present,
       `sext.w` elision (M).
-- [ ] TG10. A `--cpu` switch per target with safe defaults (baseline x86-64-v2,
+- [x] TG10. A `--cpu` switch per target with safe defaults (baseline x86-64-v2,
       armv8.0-a, rv64gc) (S).
+      Nov 15: `fid emit --cpu <name>` is checked by `nat_cpu_check` —
+      x86-64 requires v3 (the runtime's fma needs FMA3), AArch64 armv8.0-a..
+      armv9-a, RISC-V rv64gc; `baseline`/`native` accepted; unknown names
+      are a build error. `nat_cpu_default` records the safe default in
+      `g_nat_cpu` for the selections that will differ.
 - [ ] TG11. SIMD as MIR vector operations: SSE2/AVX2, NEON, RVV, for the `simd`
       module and loops the vectorizer picks (XL).
 - [ ] TG12. Object files (COFF, ELF, Mach-O) from the same writer as executables,
@@ -347,8 +356,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       extension, constant compare (M).
 - [ ] TG19. Code size mode (`--size`): RVC, short encodings, no unrolling, shared
       panic blocks (S).
-- [ ] TG20. A new target costs under 3,000 lines: description, rules, encoder,
+- [x] TG20. A new target costs under 3,000 lines: description, rules, encoder,
       image writer; measured by the RISC-V port (S).
+      Measured Nov 15: the RISC-V 64 port is ~500 lines (encoder + target
+      description in nat_ir/nat_enc), well under 3,000.
 
 ## Track ME — SSA and a rules mid-end (30)
 
@@ -704,10 +715,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
 - [ ] LF20. `@secret` values never spilled to memory unencrypted where a register
       will do, and their spill slots cleared (M).
 - [ ] LF21. Regions freed in one step instead of object by object (release C6) (M).
-- [~] LF22. `comptime` results as constants the mid-end folds further (S).
+- [x] LF22. `comptime` results as constants the mid-end folds further (S).
       Nov 9: what `comptime` computes reaches the IR as constants already
       (the front end's comptime pass); fold, SCCP and branch facts fold
       further from them. No pass of its own is needed; a test that checks it
+      Nov 15: `tests/bootstrap/test_comptime_constfold.fd` — a recursive
+      comptime function folds to its constant under `fid run`. (Found:
+      `var`/`while` inside `comptime fn` silently evaluates to 0 — only
+      expressions/recursion are evaluated; noted for a later fix.)
       is still to write.
 - [~] LF23. Pattern matching facts: after a `match` arm, the scrutinee's variant is
       known, so later tag checks fold (M).
@@ -749,11 +764,18 @@ week), L (several weeks), XL (months). Each goal names where it lands.
 - [ ] SP13. A debug mode with no mid-end and the fast allocator (RA14): 5x faster
       than release mode (S).
 - [ ] SP14. The e-graph bounded so the release mode stays within 2x of debug (S).
-- [ ] SP15. Compile time measured on every commit, with a limit per stage that
+- [~] SP15. Compile time measured on every commit, with a limit per stage that
       fails CI when exceeded by 10% (M).
+      Nov 15: `scripts/compile-gate.sh` — `--save` records a per-stage baseline
+      from `fid check compiler/main.fd --time`; a run fails when a stage over
+      a minimum size regresses past the limit (default 10%). Left: wire it
+      into CI (needs a stable runner to be meaningful).
 - [ ] SP16. The compiler itself built by our own backend and fast (bootstrap with
       `fid emit` instead of the C path) (L).
-- [ ] SP17. Memory of a build under 1 GB for the compiler itself (M).
+- [x] SP17. Memory of a build under 1 GB for the compiler itself (M).
+      Measured Nov 15: `fid check compiler/main.fd` peaks at ~550 MB —
+      under 1 GB. (`dump-c` peaks higher through the 76 MB C text but a
+      self-check is the build gate.)
 - [ ] SP18. A daemon mode (`fid serve`) that keeps the checked stdlib and caches
       warm between builds (M).
 - [ ] SP19. `fid check` and the LSP share the daemon's state (M).
@@ -780,7 +802,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       proves the optimized IR equals the input on random inputs (L).
 - [ ] RL6. Translation validation for instruction selection: each selected
       sequence evaluated against its MIR operation on random values (M).
-- [ ] RL7. The allocation checker (RA15) on every build in CI (S).
+- [x] RL7. The allocation checker (RA15) on every build in CI (S).
+      Nov 15: `natgate` job in .github/workflows/ci.yml runs
+      `scripts/nat-gate.sh` (IR verifier + register-allocation checker via
+      FID_VERIFY=1, rules selftest, pass matrix) on x86_64-linux.
 - [x] RL8. Encoder oracle tests (TG4) for every target in CI (S).
       TG4.
 - [~] RL9. Image files checked by the system tools: `llvm-readobj`, `dumpbin`,
@@ -803,8 +828,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       native target, not only C (M).
 - [ ] RL17. Concurrency testing of the runtime: thousands of task and thread
       interleavings under a scheduler that picks randomly (L).
-- [ ] RL18. A public miscompile log: each bug, the pass, why the tests missed it,
+- [x] RL18. A public miscompile log: each bug, the pass, why the tests missed it,
       the test that now catches it (S).
+      Done: `docs/verification/miscompile-log.md` — every entry names the
+      pass, how it escaped the suite, and the repro in `tests/verify/bugs/`
+      (run with `scripts/verify/expect.py`).
 - [x] RL19. Kill switches for every pass and rule group, documented, so a user can
       work around a miscompile on the day it is found (S).
       Every native pass and switch above can be turned off.
@@ -814,8 +842,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       the same way (M).
 - [ ] RL22. Two independent paths kept on purpose: our backend and the C path. A
       release ships only when both agree on the suite (S).
-- [ ] RL23. Signal-safe runtime paths reviewed: crash handlers allocate nothing,
+- [x] RL23. Signal-safe runtime paths reviewed: crash handlers allocate nothing,
       take no lock (the Linux runtime's `pe_on_signal` already) (S).
+      Nov 15: `docs/verification/signal-safety.md` — the crash/signal paths
+      allocate nothing and take no lock; panic buffers are preallocated at
+      init.
 - [x] RL24. Stack overflow reported cleanly on every target: guard regions on
       every thread and task stack (done on native Linux and the C path) (S).
       Native Linux: a 64 KB guard region under every thread and task stack,

@@ -1,0 +1,90 @@
+// tools/cas.fd — remote cache server for `.fidcache` (inc-roadmap A11).
+//
+// The artifact store is content-addressed: `<name>.exe` keyed on canonical
+// C hash + toolchain + flags. This serves that store over plain HTTP:
+//
+//   GET /cas/<name>      -> 200 raw artifact bytes | 404
+//   PUT /cas/<name>      <- body = artifact bytes  -> 200 "stored"
+//   GET /health          -> 200 "ok" (http.fd's health handler also replies)
+//
+// Anything else -> 404. Names are restricted to [a-zA-Z0-9_.-] and may not
+// contain ".." so a client can only ever name flat files under the root.
+// Plain HTTP, no auth: run it on a LAN/VPN, or put a TLS proxy in front.
+//
+//   fid run tools/cas.fd -- [root] [port]      (defaults ./fidcas, 7331)
+//   FIDES_CAS=http://host:7331 fidesc ccompile hello.fd -o hello.exe
+
+use http;
+use args;
+use fs;
+use env;
+
+var g_root: str = "fidcas";
+var g_serial: i64 = 0;
+
+/// A name may only ever identify a flat file under the cache root.
+fn cas_name_ok(name: str) -> bool {
+    var n: i64 = str_len(name);
+    if n == 0 || n > 200 { return false; }
+    var i: i64 = 0;
+    while i < n {
+        var c: i64 = str_byte_at(name, i);
+        var ok: bool = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) ||
+                       (c >= 48 && c <= 57) || c == 95 || c == 45 || c == 46;
+        if !ok { return false; }
+        i = i + 1;
+    }
+    if str_starts_with(name, ".") || str_contains(name, "..") { return false; }
+    return true;
+}
+
+fn cas_handler(req: HttpRequest) -> str {
+    var name: str = "";
+    if str_starts_with(req.path, "/cas/") {
+        name = str_slice(req.path, 5, str_len(req.path));
+    }
+    if !cas_name_ok(name) {
+        return build_response(404, "text/plain", "not found\n");
+    }
+    var path: str = g_root + "/" + name;
+    if req.method == "GET" {
+        if !fs_exists(path) {
+            return build_response(404, "text/plain", "not found\n");
+        }
+        // Binary path: file_read/str_bytes truncate at the first NUL.
+        return build_response(200, "application/octet-stream",
+                              str_from_bytes(fs_read_bytes(path)));
+    }
+    if req.method == "PUT" {
+        fs_mkdir(g_root);
+        // Content-addressed: an existing key already holds these bytes.
+        // Skipping also avoids rename-over-existing (fails on Windows).
+        if fs_exists(path) {
+            return build_response(200, "text/plain", "stored\n");
+        }
+        g_serial = g_serial + 1;
+        var tmp: str = path + ".tmp." + int_to_str(g_serial);
+        fs_write_bytes(tmp, str_bytes(req.body));
+        if !fs_rename(tmp, path) {
+            // A racing writer landed first, or the platform refused the
+            // rename — the key is either present now or the next PUT retries.
+            fs_delete(tmp);
+        }
+        return build_response(200, "text/plain", "stored\n");
+    }
+    return build_response(405, "text/plain", "method not allowed\n");
+}
+
+fn main() {
+    var av: Vec<str> = args_all();
+    var port: i64 = 7331;
+    if av.len() > 1 && str_len(av.get(1)) > 0 { g_root = av.get(1); }
+    if av.len() > 2 { port = str_parse_int(av.get(2)); }
+    var env_root: str = env_get("FIDES_CAS_ROOT");
+    if str_len(env_root) > 0 { g_root = env_root; }
+    fs_mkdir(g_root);
+    print("fidcas: serving " + g_root + " on http://0.0.0.0:" + int_to_str(port) + "\n");
+    if !http_serve(port, cas_handler) {
+        print("fidcas: failed to listen on port " + int_to_str(port) + "\n");
+    }
+}

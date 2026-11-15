@@ -1,0 +1,50 @@
+// x25519.fd against the iterated test of RFC 7748 §5.2: k = u = 9, then
+// k, u = X25519(k, u), k; checked after 1 and 1,000 iterations (1,000,000
+// is left out). 1,000 scalar multiplications take about a second through C
+// or native Windows, but far too long for the interpreter (`fid run`
+// needs minutes per multiplication): run this one compiled.
+// A wrong answer panics on every backend.
+use x25519;
+use encoding;
+
+fn hb(h: str) -> Vec<i64> { return hex_decode_bytes(h); }
+
+fn he(v: Vec<i64>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        val b: i64 = v.get(i);
+        if b < 16 { out = out + "0"; }
+        out = out + int_to_hex(b);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn check(label: str, got: str, want: str) {
+    if !str_equal(got, want) {
+        p_panic(label + ": got " + got + ", want " + want);
+    }
+    println(label + " ok");
+}
+
+fn main() -> i64 {
+    // RFC 7748 §5.2, iterated: k = u = 9; k, u = X25519(k, u), k
+    var k: Vec<i64> = hb("0900000000000000000000000000000000000000000000000000000000000000");
+    var u: Vec<i64> = k;
+    var n: i64 = 0;
+    while n < 1000 {
+        val r: Vec<i64> = x25519_scalarmult(k, u);
+        u = k;
+        k = r;
+        n = n + 1;
+        if n == 1 {
+            check("x25519 1 iteration", he(k),
+                "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079");
+        }
+    }
+    check("x25519 1,000 iterations", he(k),
+        "684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51");
+    println("x25519 iterated ok");
+    return 0;
+}

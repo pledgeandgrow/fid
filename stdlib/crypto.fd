@@ -105,6 +105,7 @@ pub const H7_INIT: i64 = 0x5be0cd19;
 
 /// Mask to 32 bits.
 @crashfree
+@constant_time
 fn mask32(x: i64) -> i64 {
     return x & 0xFFFFFFFF;
 }
@@ -112,6 +113,7 @@ fn mask32(x: i64) -> i64 {
 /// Rotate right (32-bit).
 @crashfree
 @wrapping
+@constant_time
 fn rotr32(x: i64, n: i64) -> i64 {
     var m = mask32(x);
     return mask32((m >> n) | (m << (32 - n)));
@@ -119,36 +121,42 @@ fn rotr32(x: i64, n: i64) -> i64 {
 
 /// SHA-256 choice function: x ? y : z (bitwise).
 @crashfree
+@constant_time
 fn ch(x: i64, y: i64, z: i64) -> i64 {
     return mask32((x & y) ^ (~x & z));
 }
 
 /// SHA-256 majority function.
 @crashfree
+@constant_time
 fn maj(x: i64, y: i64, z: i64) -> i64 {
     return mask32((x & y) ^ (x & z) ^ (y & z));
 }
 
 /// SHA-256 big sigma 0.
 @crashfree
+@constant_time
 fn big_sigma0(x: i64) -> i64 {
     return mask32(rotr32(x, 2) ^ rotr32(x, 13) ^ rotr32(x, 22));
 }
 
 /// SHA-256 big sigma 1.
 @crashfree
+@constant_time
 fn big_sigma1(x: i64) -> i64 {
     return mask32(rotr32(x, 6) ^ rotr32(x, 11) ^ rotr32(x, 25));
 }
 
 /// SHA-256 small sigma 0.
 @crashfree
+@constant_time
 fn small_sigma0(x: i64) -> i64 {
     return mask32(rotr32(x, 7) ^ rotr32(x, 18) ^ (x >> 3));
 }
 
 /// SHA-256 small sigma 1.
 @crashfree
+@constant_time
 fn small_sigma1(x: i64) -> i64 {
     return mask32(rotr32(x, 17) ^ rotr32(x, 19) ^ (x >> 10));
 }
@@ -416,9 +424,12 @@ pub fn crypto_nonce_reset(tracker: &mut NonceTracker) -> void {
 
 /// Compute HMAC-SHA256.
 /// Returns a 32-byte Vec.
-pub fn crypto_hmac_sha256(key: str, message: str) -> Vec<i64> {
+@declassify
+pub fn crypto_hmac_sha256(@secret key: str, message: str) -> Vec<i64> {
     // Prepare key: if > 64 bytes, hash it; pad to 64 bytes
+    @zeroize
     var key_bytes: Vec<i64> = str_bytes(key);
+    @zeroize
     var key_block = Vec::new();
     if key_bytes.len() > 64 {
         var key_hash: Vec<i64> = crypto_sha256(key);
@@ -436,7 +447,9 @@ pub fn crypto_hmac_sha256(key: str, message: str) -> Vec<i64> {
     }
 
     // Create inner and outer padded keys
+    @zeroize
     var inner_key = Vec::new();
+    @zeroize
     var outer_key = Vec::new();
     for i in 0..64 {
         inner_key.push(key_block.get(i) ^ 0x36);
@@ -446,6 +459,7 @@ pub fn crypto_hmac_sha256(key: str, message: str) -> Vec<i64> {
     // Inner hash: H(ipad || message), all in bytes (the key and the digest
     // are binary: going through a string would cut them at a 0x00 byte).
     var message_bytes: Vec<i64> = str_bytes(message);
+    @zeroize
     var inner_input = Vec::new();
     for i in 0..64 {
         inner_input.push(inner_key.get(i));
@@ -456,6 +470,7 @@ pub fn crypto_hmac_sha256(key: str, message: str) -> Vec<i64> {
     var inner_hash: Vec<i64> = crypto_sha256_bytes(inner_input);
 
     // Outer hash: H(opad || inner_hash)
+    @zeroize
     var outer_input_bytes = Vec::new();
     for i in 0..64 {
         outer_input_bytes.push(outer_key.get(i));

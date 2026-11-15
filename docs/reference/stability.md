@@ -25,6 +25,12 @@ What is not covered: the internals of the compiler and the runtime (`p_*`
 builtins, generated C, object file layout), the exact text of error messages,
 the speed of a program, and anything marked experimental in the reference.
 
+There is no nightly track. A feature under development ships behind a named
+flag (`FID_*` environment variable or a documented `@experimental` marker);
+it either graduates into the language — after which the flag is removed and
+the feature is covered by the promise above — or it is removed. Nothing stays
+flag-only across a stable release.
+
 ## Versions
 
 Releases follow semantic versioning: `1.x.y` where `y` changes for fixes only,

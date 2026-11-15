@@ -49,6 +49,9 @@ fn url_is_unreserved(c: i64) -> bool {
 }
 
 /// Percent-encode `s` — only unreserved bytes pass through.
+///
+/// Example:
+///   assert_eq(url_encode("a b/c"), "a%20b%2Fc");
 pub fn url_encode(s: str) -> str {
     var out: str = "";
     var i: i64 = 0;
@@ -84,11 +87,17 @@ fn url_encode_keep(s: str, keep: str) -> str {
 }
 
 /// Percent-encode a path, keeping "/" and the other characters a path may hold.
+///
+/// Example:
+///   assert_eq(url_encode_path("/docs/my file.txt"), "/docs/my%20file.txt");
 pub fn url_encode_path(s: str) -> str { return url_encode_keep(s, "/:@!$&'()*+,;="); }
 fn url_enc_userinfo(s: str) -> str { return url_encode_keep(s, ":!$&'()*+,;="); }
 fn url_enc_fragment(s: str) -> str { return url_encode_keep(s, "/?:@!$&'()*+,;="); }
 
 /// Encode for query/form values — like url_encode but space → '+'.
+///
+/// Example:
+///   assert_eq(url_encode_form("a b&c"), "a+b%26c");
 pub fn url_encode_form(s: str) -> str {
     var out: str = "";
     var i: i64 = 0;
@@ -109,6 +118,9 @@ pub fn url_encode_form(s: str) -> str {
 
 /// Percent-decode `s`; '+' stays literal (use url_decode_form for query).
 /// Invalid % sequences are passed through unchanged.
+///
+/// Example:
+///   assert_eq(url_decode("a%20b%2Fc"), "a b/c");
 pub fn url_decode(s: str) -> str {
     var out: str = "";
     var bytes: Vec = Vec::new();
@@ -140,6 +152,9 @@ pub fn url_decode(s: str) -> str {
 }
 
 /// Percent-decode with '+' → ' ' (application/x-www-form-urlencoded).
+///
+/// Example:
+///   assert_eq(url_decode_form("a+b%26c"), "a b&c");
 pub fn url_decode_form(s: str) -> str {
     return url_decode(str_replace(s, "+", " "));
 }
@@ -148,6 +163,17 @@ pub fn url_decode_form(s: str) -> str {
 
 /// Parse a URL string into a Url struct. Lenient: missing components
 /// are left empty; port is -1 when absent or unparseable.
+///
+/// Example:
+///   var u = url_parse("https://user@example.com:8443/a/b?x=1&y=2#top");
+///   assert_eq(u.scheme, "https");
+///   assert_eq(u.userinfo, "user");
+///   assert_eq(u.host, "example.com");
+///   assert_eq(u.port, 8443);
+///   assert_eq(u.path, "/a/b");
+///   assert_eq(u.query, "x=1&y=2");
+///   assert_eq(u.fragment, "top");
+///   assert_eq(url_parse("http://example.com").port, -1);
 pub fn url_parse(s: str) -> Url {
     var u: Url = Url {
         scheme: "", userinfo: "", host: "", port: -1,
@@ -239,6 +265,11 @@ fn url_valid_scheme(s: str) -> bool {
 }
 
 /// Serialize a Url struct back to a string (components re-encoded).
+///
+/// Example:
+///   var u = url_parse("http://example.com/x?q=1");
+///   u.path = "/y";
+///   assert_eq(url_to_str(u), "http://example.com/y?q=1");
 pub fn url_to_str(u: Url) -> str {
     var out: str = "";
     if str_len(u.scheme) > 0 { out = out + u.scheme + ":"; }
@@ -261,6 +292,10 @@ pub fn url_to_str(u: Url) -> str {
 // ─── Query string ───────────────────────────────────────────────────────
 
 /// Value of `key` in a query string ("a=1&b=2"); "" when absent.
+///
+/// Example:
+///   assert_eq(url_query_get("name=Ada%20L&age=36", "name"), "Ada L");
+///   assert_eq(url_query_get("a=1", "b"), "");
 pub fn url_query_get(query: str, key: str) -> str {
     var pairs: Vec = str_split(query, "&");
     var i: i64 = 0;
@@ -280,6 +315,10 @@ pub fn url_query_get(query: str, key: str) -> str {
 }
 
 /// True if `key` appears in the query string.
+///
+/// Example:
+///   assert(url_query_has("debug&x=1", "debug"));
+///   assert(!url_query_has("x=1", "y"));
 pub fn url_query_has(query: str, key: str) -> bool {
     var pairs: Vec = str_split(query, "&");
     var i: i64 = 0;
@@ -295,6 +334,11 @@ pub fn url_query_has(query: str, key: str) -> bool {
 }
 
 /// All keys of the query string in order (decoded).
+///
+/// Example:
+///   var k = url_query_keys("a=1&b=2&c");
+///   assert_eq(k.len(), 3);
+///   assert_eq(k.get(2), "c");
 pub fn url_query_keys(query: str) -> Vec<str> {
     var out: Vec<str> = Vec::new();
     var pairs: Vec = str_split(query, "&");
@@ -312,6 +356,13 @@ pub fn url_query_keys(query: str) -> Vec<str> {
 }
 
 /// Build a query string from parallel key/value vecs (form-encoded).
+///
+/// Example:
+///   var k: Vec<str> = Vec::new();
+///   var v: Vec<str> = Vec::new();
+///   k.push("q"); v.push("fides lang");
+///   k.push("page"); v.push("2");
+///   assert_eq(url_query_build(k, v), "q=fides+lang&page=2");
 pub fn url_query_build(keys: Vec<str>, values: Vec<str>) -> str {
     var out: str = "";
     var i: i64 = 0;
@@ -328,6 +379,11 @@ pub fn url_query_build(keys: Vec<str>, values: Vec<str>) -> str {
 
 /// Resolve `rel` against `base` (RFC 3986 §5.2, no scheme changes).
 /// Handles absolute paths, relative paths, and dot segments.
+///
+/// Example:
+///   var base = url_parse("http://a.com/b/c/d");
+///   assert_eq(url_resolve(base, "../e"), "http://a.com/b/e");
+///   assert_eq(url_resolve(base, "/x"), "http://a.com/x");
 pub fn url_resolve(base: Url, rel: str) -> str {
     var r: Url = url_parse(rel);
     if str_len(r.scheme) > 0 { return rel; }        // absolute URL wins
@@ -367,6 +423,9 @@ pub fn url_resolve(base: Url, rel: str) -> str {
 }
 
 /// Collapse "." and ".." segments in a path.
+///
+/// Example:
+///   assert_eq(url_normalize_path("/a/./b/../c"), "/a/c");
 pub fn url_normalize_path(p: str) -> str {
     var segs: Vec = str_split(p, "/");
     var stack: Vec<str> = Vec::new();

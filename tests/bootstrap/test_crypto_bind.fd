@@ -1,0 +1,88 @@
+// J5: BCrypt bindings — AES-GCM, PBKDF2-HMAC-SHA256, ECDSA P-256.
+// (native/ccompile only: needs bcrypt.dll)
+use crypto_bind;
+use crypto;
+
+fn bytes(s: str) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(s) { v.push(str_byte_at(s, i)); i = i + 1; }
+    return v;
+}
+
+fn eq(a: &Vec, b: &Vec) -> bool {
+    if a.len() != b.len() { return false; }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn main() -> i64 {
+    // NIST GCM test case 2: all-zero 128-bit key, 96-bit IV, empty pt+aad
+    // -> tag 58e2fcce... (the IV must be 12 bytes for this vector)
+    var key: Vec<i64> = Vec::new();
+    var nonce: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 { key.push(0); i = i + 1; }
+    i = 0;
+    while i < 12 { nonce.push(0); i = i + 1; }
+    var aad: Vec<i64> = Vec::new();
+    var pt: Vec<i64> = Vec::new();
+    val ct = cb_gcm_encrypt(&key, &nonce, &aad, &pt);
+    if ct.len() != 16 { println("GCM encrypt failed"); return 1; }
+    var tag_ok: bool = true;
+    var expect: Vec<i64> = Vec::new();
+    val expect_hex = "58e2fccefa7e3061367f1d57a4e7455a";
+    var hi: i64 = 0;
+    while hi < 32 {
+        expect.push(str_parse_hex(str_slice(expect_hex, hi, hi + 2)));
+        hi = hi + 2;
+    }
+    if !eq(&ct, &expect) { println("GCM tag mismatch"); return 1; }
+    println("gcm-tag ok");
+    val dec = cb_gcm_decrypt(&key, &nonce, &aad, &ct);
+    if dec.len() != 0 { println("GCM empty-pt decrypt mismatch"); return 1; }
+    // tampered tag must fail
+    var bad: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 16 { bad.push(ct.get(i)); i = i + 1; }
+    bad.set(0, bad.get(0) ^ 1);
+    if cb_gcm_decrypt(&key, &nonce, &aad, &bad).len() != 0 { println("GCM tamper accepted"); return 1; }
+    println("gcm-decrypt ok");
+
+    // RFC 7914 / draft-josefsson PBKDF2-HMAC-SHA256: "password","salt",1,32
+    val pw = bytes("password");
+    val salt = bytes("salt");
+    val dk = cb_pbkdf2_derive(&pw, &salt, 1, 32);
+    var expect_dk: Vec<i64> = Vec::new();
+    val dk_hex = "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b";
+    hi = 0;
+    while hi < 64 {
+        expect_dk.push(str_parse_hex(str_slice(dk_hex, hi, hi + 2)));
+        hi = hi + 2;
+    }
+    if !eq(&dk, &expect_dk) { println("PBKDF2 mismatch"); return 1; }
+    println("pbkdf2 ok");
+
+    // ECDSA P-256: generate, sign sha256("abc"), verify, then corrupt
+    var priv_blob: Vec<i64> = Vec::new();
+    var pub_blob: Vec<i64> = Vec::new();
+    if cb_ecdsa_generate(&mut priv_blob, &mut pub_blob) != 0 {
+        println("ECDSA generate failed"); return 1;
+    }
+    val h = crypto_sha256("abc");
+    val sig = cb_ecdsa_sign(&priv_blob, &h);
+    if sig.len() != 64 { println("ECDSA sign failed"); return 1; }
+    if !cb_ecdsa_verify(&pub_blob, &h, &sig) { println("ECDSA verify failed"); return 1; }
+    var badsig: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 64 { badsig.push(sig.get(i)); i = i + 1; }
+    badsig.set(5, badsig.get(5) ^ 255);
+    if cb_ecdsa_verify(&pub_blob, &h, &badsig) { println("ECDSA bad sig accepted"); return 1; }
+    println("ecdsa ok");
+    println("crypto_bind: all ok");
+    return 0;
+}

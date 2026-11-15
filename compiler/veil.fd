@@ -6,6 +6,8 @@ use string;
 use compiler::ir;
 use compiler::compiler;
 use compiler::interp;
+use compiler::ast;
+use compiler::comptime_eval;
 
 pub struct CovLineEntry {
     pub a: str,
@@ -230,7 +232,7 @@ pub fn CoverageData_compute_func_counts(self: &mut CoverageData) -> void {
     }
 }
 
-pub fn collect_all_coverage(module: IrModule) -> CoverageData {
+pub fn collect_all_coverage(module: &IrModule) -> CoverageData {
     var data: CoverageData = CoverageData_new();
 
     var fi: i64 = 0;
@@ -279,10 +281,64 @@ pub fn collect_all_coverage(module: IrModule) -> CoverageData {
     return data;
 }
 
+/// Keep only what belongs to functions and methods `up` defines (a method
+/// lowers as `Type_method`, a generic instance as `name__...`).
+fn vl_keep_user(data: &mut CoverageData, up: &Program) {
+    var names: i64 = HashMap_new();
+    var fi: i64 = 0;
+    while fi < up.funcs.len() {
+        HashMap_insert(names, up.funcs.get(fi).name, 1);
+        fi = fi + 1;
+    }
+    var ii: i64 = 0;
+    while ii < up.impls.len() {
+        var imp: ImplDef = up.impls.get(ii);
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            HashMap_insert(names, imp.struct_name + "_" + imp.methods.get(mi).name, 1);
+            mi = mi + 1;
+        }
+        ii = ii + 1;
+    }
+    data.all_functions = vl_keep_names(data.all_functions, names);
+    data.called_functions = vl_keep_names(data.called_functions, names);
+    data.all_lines = vl_keep_entries(data.all_lines, names);
+    data.covered_lines = vl_keep_entries(data.covered_lines, names);
+    data.all_instructions = vl_keep_entries(data.all_instructions, names);
+    data.covered_instructions = vl_keep_entries(data.covered_instructions, names);
+}
+
+fn vl_is_user(names: i64, n: str) -> bool {
+    if HashMap_get(names, n) != 0 { return true; }
+    var cut: i64 = str_find(n, "__");
+    if cut > 0 && HashMap_get(names, str_slice(n, 0, cut)) != 0 { return true; }
+    return false;
+}
+
+fn vl_keep_names(v: Vec<str>, names: i64) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        if vl_is_user(names, v.get(i)) { out.push(v.get(i)); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn vl_keep_entries(v: Vec<CovLineEntry>, names: i64) -> Vec<CovLineEntry> {
+    var out: Vec<CovLineEntry> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        if vl_is_user(names, v.get(i).a) { out.push(v.get(i)); }
+        i = i + 1;
+    }
+    return out;
+}
+
 /// What the interpreter ran, into `data`: each instruction (they come
 /// once each), its function, and its source line (once per function and
 /// line). Tables, not the linear mark_* scans: a run covers core too.
-fn vl_record_covered(data: &mut CoverageData, interp: &Interpreter, module: IrModule) {
+fn vl_record_covered(data: &mut CoverageData, interp: &Interpreter, module: &IrModule) {
     var fn_at: i64 = HashMap_new();
     var fi: i64 = 0;
     while fi < module.functions.len() {
@@ -339,8 +395,8 @@ fn vl_record_covered(data: &mut CoverageData, interp: &Interpreter, module: IrMo
 /// it runs (once); those give the covered instructions, functions and
 /// source lines.
 pub fn run_with_coverage(source: str, source_path: str) -> CoverageRunResult {
-    // 1. Build IR from source
-    var module_result: ResultIrModule = lower_to_ir_module(source);
+    // 1. Build IR from source (with the path, so `use` imports resolve)
+    var module_result: ResultIrModule = lower_to_ir_module_with_path(source, source_path, "on");
     var module: IrModule;
     match module_result {
         ResultIrModule::Ok(m) => { module = m; }
@@ -357,14 +413,21 @@ pub fn run_with_coverage(source: str, source_path: str) -> CoverageRunResult {
     }
 
     // 2. Collect all structural coverage points
-    var data: CoverageData = collect_all_coverage(module);
+    var data: CoverageData = collect_all_coverage(&module);
 
     // 3. Run interpreter with debug hook for coverage tracking.
     var interp: Interpreter = Interpreter_new(module);
     Interpreter_set_debug_hook(&mut interp);
     var result: RunResult = Interpreter_run(&mut interp);
     var trace: OptStr = Interpreter_take_panic_stack_trace(&mut interp);
-    vl_record_covered(&mut data, &interp, module);
+    vl_record_covered(&mut data, &interp, &interp.module);
+
+    // The report covers the user's own functions: core and the stdlib a
+    // program pulls in would otherwise make up most of it
+    match parse_program_only(source) {
+        OptProgram::Some(up) => { vl_keep_user(&mut data, &up); }
+        OptProgram::None => {}
+    }
 
     // 4. Compute per-function line counts
     CoverageData_compute_func_counts(&mut data);
@@ -387,7 +450,6 @@ pub fn veil_run(input_path: str, format: str, output_dir: str) -> str {
     }
 
     var cov: CoverageRunResult = run_with_coverage(source, input_path);
-    var data: CoverageData = cov.data;
     var status_line: str = "";
     if cov.status != "ok" {
         status_line = cov.status + "\n";
@@ -400,12 +462,12 @@ pub fn veil_run(input_path: str, format: str, output_dir: str) -> str {
     // The output directory may not exist yet (an existing one is fine)
     var _mk: i64 = p_mkdir(output_dir);
     if format == "html" {
-        var html: str = generate_html_report(data, source, filename);
+        var html: str = generate_html_report(&cov.data, source, filename);
         var path: str = output_dir + "/coverage.html";
         if p_file_write(path, html) < 0 { return status_line + "\nError: could not write " + path; }
         return status_line + "\nCoverage report: " + path;
     } else {
-        var text: str = generate_text_report(data, source);
+        var text: str = generate_text_report(&cov.data, source);
         var path: str = output_dir + "/coverage.txt";
         if p_file_write(path, text) < 0 { return status_line + text + "\n\nError: could not write " + path; }
         return status_line + text + "\n\nCoverage report: " + path;

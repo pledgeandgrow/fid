@@ -162,6 +162,10 @@ pub struct CCodeGen {
     /// Byte ranges in `out` for each emitted function body
     /// (name, start, end) — for per-module TU splitting (Phase B).
     fn_marks: Vec<(String, usize, usize)>,
+    /// Byte ranges in `out` for each emitted user-function prototype
+    /// (sanitized C name, start, end) — per-unit prototype scoping (Phase C:
+    /// a signature edit rebuilds only units whose bodies reference the fn).
+    proto_marks: Vec<(String, usize, usize)>,
     /// Byte offset in `out` where the tail (main wrapper + runtime impl)
     /// begins.
     tail_mark: usize,
@@ -192,6 +196,7 @@ impl CCodeGen {
             fn_ret_types: HashMap::new(),
             extern_func_names: std::collections::HashSet::new(),
             fn_marks: Vec::new(),
+            proto_marks: Vec::new(),
             tail_mark: 0,
             line_file: None,
             c_line_last: 0,
@@ -1379,7 +1384,22 @@ impl CCodeGen {
         wln!(self, "   data, never on its own */");
         wln!(self, "#define P_VBUF_KEY_C 0x5646425546494445LL");
         wln!(self, "#define P_VBUF_TAGGED(d) ((d) && ((const int64_t*)(d))[-3] == (int64_t)((uint64_t)P_VBUF_KEY_C + (uint64_t)(uintptr_t)(d)))");
-        wln!(self, "static inline void __p_vbuf_free(int64_t* d) {{ if (!d) return; if (P_VBUF_TAGGED(d)) {{ d[-3] = 0; p_free(d - 3); }} else p_free(d); }}");
+        // J8: sensitive-buffer registry (mirrors codegen_c.fd). Buffers of a
+        // marked @zeroize Vec live in __p_sens_buf; __p_vbuf_free wipes them
+        // so the wipe follows the buffer through growth and shared owners.
+        wln!(self, "static void* __p_sensitive[256];");
+        wln!(self, "static int64_t __p_sensitive_esz[256];");
+        wln!(self, "static int __p_sensitive_n = 0;");
+        wln!(self, "static int64_t __p_sensitive_wipes = 0;");
+        wln!(self, "static void* __p_sens_buf[256];");
+        wln!(self, "static int64_t __p_sens_bufsz[256];");
+        wln!(self, "static int __p_sens_bn = 0;");
+        wln!(self, "static int __p_sensitive_at(const void* v) {{ for (int i = 0; i < __p_sensitive_n; i++) if (__p_sensitive[i] == v) return i; return -1; }}");
+        wln!(self, "static int __p_sens_bat(const void* d) {{ for (int i = 0; i < __p_sens_bn; i++) if (__p_sens_buf[i] == d) return i; return -1; }}");
+        wln!(self, "static void __p_sens_buf_add(void* d, int64_t sz) {{ if (!d) return; int i = __p_sens_bat(d); if (i >= 0) {{ __p_sens_bufsz[i] = sz; return; }} if (__p_sens_bn < 256) {{ __p_sens_buf[__p_sens_bn] = d; __p_sens_bufsz[__p_sens_bn++] = sz; }} }}");
+        wln!(self, "static void __p_sens_buf_remove(void* d) {{ int i = __p_sens_bat(d); if (i < 0) return; __p_sens_buf[i] = __p_sens_buf[--__p_sens_bn]; __p_sens_bufsz[i] = __p_sens_bufsz[__p_sens_bn]; }}");
+        wln!(self, "static void __p_sens_buf_free(void* d) {{ int i = __p_sens_bat(d); if (i < 0) return; volatile uint8_t* w = (volatile uint8_t*)d; int64_t n = __p_sens_bufsz[i]; for (int64_t k = 0; k < n; k++) w[k] = 0; __p_sens_buf[i] = __p_sens_buf[--__p_sens_bn]; __p_sens_bufsz[i] = __p_sens_bufsz[__p_sens_bn]; __p_sensitive_wipes++; }}");
+        wln!(self, "static inline void __p_vbuf_free(int64_t* d) {{ if (!d) return; __p_sens_buf_free(d); if (P_VBUF_TAGGED(d)) {{ d[-3] = 0; p_free(d - 3); }} else p_free(d); }}");
         wln!(self, "P_NOINLINE void __p_vec_grow(int64_t* h) {{");
         wln!(self, "    int64_t cap = h[2], shared = 0;");
         wln!(self, "    if (cap < 0) {{");
@@ -1397,6 +1417,7 @@ impl CCodeGen {
         wln!(self, "    int64_t* nd = (int64_t*)p_malloc(nc * esz);");
         wln!(self, "    int64_t* od = (int64_t*)(intptr_t)h[0];");
         wln!(self, "    if (od) {{ memcpy(nd, od, (size_t)(h[1] * esz)); if (!shared) __p_vbuf_free(od); }}");
+        wln!(self, "    if (__p_sensitive_at(h) >= 0) __p_sens_buf_add(nd, nc * esz);");
         wln!(self, "    h[0] = (int64_t)(intptr_t)nd;");
         wln!(self, "    h[2] = nc;");
         wln!(self, "}}");
@@ -1437,6 +1458,12 @@ impl CCodeGen {
         wln!(self, "void p_memset(void* ptr, int val, int64_t size);");
         wln!(self, "void p_str_zeroize(void* s);");
         wln!(self, "void p_vec_zeroize(void* v);");
+        wln!(self, "void p_sensitive_mark(void* v);");
+        wln!(self, "int64_t p_sensitive_check(int64_t v);");
+        wln!(self, "void p_sensitive_unmark(void* v);");
+        wln!(self, "void p_sensitive_remark(int64_t v);");
+        wln!(self, "void p_sensitive_free(int64_t v, int64_t buf, int64_t cap);");
+        wln!(self, "int64_t p_sensitive_wipes(void);");
         // File I/O builtins
         wln!(self, "char* p_file_read(const char* path);");
         wln!(self, "int64_t p_file_write(const char* path, const char* content);");
@@ -1735,7 +1762,9 @@ impl CCodeGen {
                 .iter()
                 .map(|(id, ty)| Self::c_param_decl(ty, &format!("v{}", id.0)))
                 .collect();
+            let ps = self.out.len();
             wln!(self, "{} {}({});", ret_ty, proto_name, params.join(", "));
+            self.proto_marks.push((proto_name, ps, self.out.len()));
         }
         // C takes a struct by value and Fides has a pointer to it
         for ext in module.extern_decls.iter().filter(|e| self.c_wrapped.contains(&e.pledge_name)) {
@@ -3420,7 +3449,42 @@ impl CCodeGen {
         wln!(self, "    if (!pv || !pv->data) return;");
         wln!(self, "    volatile char* p = (volatile char*)pv->data;");
         wln!(self, "    for (int64_t i = 0; i < pv->cap * (int64_t)sizeof(void*); i++) p[i] = 0;");
+        wln!(self, "    p_sensitive_unmark((int64_t)pv->data);");
         wln!(self, "}}");
+        // J8: public sensitive-registry entry points (tables and buffer set
+        // are defined earlier, before __p_vbuf_free).
+        wln!(self, "static int64_t __p_sens_esz(const int64_t* h) {{ int64_t pc = P_VEC_CODE(h); return pc == 0 ? 8 : (pc < 0 ? -pc : (pc >= 16 ? (pc - 15) * 8 : pc)); }}");
+        wln!(self, "void p_sensitive_mark(void* v) {{");
+        wln!(self, "    if (!v || __p_sensitive_n >= 256 || __p_sensitive_at(v) >= 0) return;");
+        wln!(self, "    int64_t* h = (int64_t*)v;");
+        wln!(self, "    __p_sensitive[__p_sensitive_n] = v;");
+        wln!(self, "    int64_t esz = __p_sens_esz(h);");
+        wln!(self, "    __p_sensitive_esz[__p_sensitive_n++] = esz;");
+        wln!(self, "    if (h[0]) __p_sens_buf_add((void*)(intptr_t)h[0], (h[2] < 0 ? h[1] : h[2]) * esz);");
+        wln!(self, "}}");
+        wln!(self, "void p_sensitive_remark(int64_t v) {{");
+        wln!(self, "    if (__p_sensitive_at((void*)v) < 0) return;");
+        wln!(self, "    int64_t* h = (int64_t*)(intptr_t)v;");
+        wln!(self, "    if (h[0]) __p_sens_buf_add((void*)(intptr_t)h[0], (h[2] < 0 ? h[1] : h[2]) * __p_sens_esz(h));");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_sensitive_check(int64_t v) {{ return __p_sensitive_at((void*)v) >= 0 ? 1 : 0; }}");
+        wln!(self, "void p_sensitive_unmark(void* v) {{");
+        wln!(self, "    int i = __p_sensitive_at(v);");
+        wln!(self, "    if (i < 0) return;");
+        wln!(self, "    __p_sens_buf_remove((void*)(intptr_t)((int64_t*)v)[0]);");
+        wln!(self, "    __p_sensitive[i] = __p_sensitive[--__p_sensitive_n];");
+        wln!(self, "    __p_sensitive_esz[i] = __p_sensitive_esz[__p_sensitive_n];");
+        wln!(self, "}}");
+        wln!(self, "void p_sensitive_free(int64_t v, int64_t buf, int64_t cap) {{");
+        wln!(self, "    int i = __p_sensitive_at((void*)v);");
+        wln!(self, "    if (i < 0 || !buf) return;");
+        wln!(self, "    __p_sens_buf_remove((void*)(intptr_t)buf);");
+        wln!(self, "    volatile char* p = (volatile char*)(intptr_t)buf;");
+        wln!(self, "    if (cap < 0) cap = -cap;");
+        wln!(self, "    for (int64_t j = 0; j < cap * __p_sensitive_esz[i]; j++) p[j] = 0;");
+        wln!(self, "    __p_sensitive_wipes++;");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_sensitive_wipes(void) {{ return __p_sensitive_wipes; }}");
         // Arena mark: (1-based chunk index << 32) | offset in that chunk.
         // Restoring frees the chunks after the marked one: they only hold
         // memory allocated after the save.
@@ -5004,8 +5068,18 @@ impl CCodeGen {
         wln!(self, "    return (n < 0) ? -1 : (int64_t)n;");
         wln!(self, "}");
         wln!(self, "");
+        // Counted-string length, else strlen: a counted str may hold binary
+        // data (HTTP request bodies), and strlen stops at its first NUL.
+        wln!(self, "static inline int64_t __p_sock_slen(const char* s) {");
+        wln!(self, "    if (!s || ((uintptr_t)s & 7)) return -1;");
+        wln!(self, "    const int64_t* h = (const int64_t*)(s - 16);");
+        wln!(self, "    uint64_t w = (uint64_t)h[0] - 0x4649444500000000ULL;");
+        wln!(self, "    if ((h[0] == 0x4649444553545201LL || h[0] == 0x4649444553545202LL || (w < 0x100000000ULL && !(w & 0x40000000ULL) && (w & 0x3FFFFFFFULL) >= 1)) && h[1] >= 0 && h[1] < 0x10000000000LL) return h[1];");
+        wln!(self, "    return -1;");
+        wln!(self, "}");
         wln!(self, "int64_t p_socket_write_str(int64_t fd, const char* buf) {");
-        wln!(self, "    return p_socket_write(fd, buf, strlen(buf));");
+        wln!(self, "    int64_t n = __p_sock_slen(buf);");
+        wln!(self, "    return p_socket_write(fd, buf, n >= 0 ? (size_t)n : strlen(buf));");
         wln!(self, "}");
         wln!(self, "");
         wln!(self, "void p_socket_close(int64_t fd) {");
@@ -6591,7 +6665,23 @@ pub fn generate_c_units(
     let full = gen.generate(module);
 
     let first_fn_start = gen.fn_marks.iter().map(|(_, s, _)| *s).min().unwrap_or(gen.tail_mark);
-    let prelude = &full[..first_fn_start];
+    let flat = std::env::var_os("FIDES_INC_FLAT").is_some();
+    // User-function prototypes leave the shared prelude: each unit re-emits
+    // only the protos it references, so a signature edit rebuilds just the
+    // units whose bodies name that fn (C2 sig-edge, C9). Effects mode off
+    // (C6 escape hatch) or a single flat unit keeps them shared — every
+    // unit then sees every proto, the old all-dependents behavior.
+    let scope_protos = !flat && std::env::var("FIDES_INC_EFFECTS").map(|v| v != "off").unwrap_or(true);
+    let mut prelude_str = full[..first_fn_start].to_string();
+    let mut proto_lines: Vec<(String, String)> = Vec::new();
+    if scope_protos {
+        for (name, s, e) in gen.proto_marks.iter().rev() {
+            proto_lines.push((name.clone(), prelude_str[*s..*e].to_string()));
+            prelude_str.replace_range(*s..*e, "");
+        }
+        proto_lines.reverse();
+    }
+    let prelude = &prelude_str[..];
     let mut tail = full[gen.tail_mark..].to_string();
 
     // The prelude carries a few small runtime *definitions* (call-stack
@@ -6604,22 +6694,36 @@ pub fn generate_c_units(
     {
         let defs = crate::inc::c_fn_defs(prelude);
         let mut cursor = 0usize;
-        for (_, s, brace, e) in defs {
-            prelude_stripped.push_str(&prelude[cursor..s]);
+        for (_, _, brace, e) in defs {
+            // The header is the text from the last completed construct
+            // (`;`, `}` or newline) to the `{`. Generated decls are one
+            // line each; token stmt_start can't anchor them because bare
+            // macro invocations like `P_ARITH(int8_t, i8)` have no `;`.
+            let s = prelude[..brace]
+                .rfind(|c| c == '\n' || c == ';' || c == '}')
+                .map(|i| i + 1)
+                .unwrap_or(0);
             let header = prelude[s..brace].trim();
-            protos.push_str(header);
-            protos.push_str(";\n");
+            // `static` helpers stay: internal linkage can't cross a TU, so
+            // every unit keeps its own copy (as P_VEC_UNCHECKED's callees).
+            if header.starts_with("static") {
+                continue;
+            }
+            prelude_stripped.push_str(&prelude[cursor..s]);
+            // The prototype stands where the definition stood: collecting
+            // them at the end of the prelude broke macros that expand into
+            // calls mid-prelude (P_VEC_UNCHECKED before the vec helpers).
+            prelude_stripped.push_str(header);
+            prelude_stripped.push_str(";\n");
             moved_defs.push_str(&prelude[s..e]);
             moved_defs.push('\n');
             cursor = e;
         }
         prelude_stripped.push_str(&prelude[cursor..]);
-        prelude_stripped.push_str(&protos);
         tail = format!("{}\n{}", moved_defs, tail);
     }
     let prelude = &prelude_stripped[..];
 
-    let flat = std::env::var_os("FIDES_INC_FLAT").is_some();
     // The unit that owns the entry point, globals definitions, and the
     // runtime tail. This is the module `main` lives in — NOT always a unit
     // literally named "main" (a file `test_caps.fd` produces a `test_caps`
@@ -6717,6 +6821,28 @@ pub fn generate_c_units(
     let mut units: Vec<(String, String)> = Vec::new();
     for (name, body) in &bodies {
         let mut code = pre_common.clone();
+        if scope_protos {
+            // Protos for the fns this unit defines (their def lines name
+            // them) plus every fn its bodies — or, for the owner, the
+            // registration tail — name. One ident pass over the text; an
+            // extra proto is harmless, a missing one won't link.
+            let mut idents: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            c_collect_idents(body, &mut idents);
+            if *name == owner {
+                c_collect_idents(&tail, &mut idents);
+            }
+            let mut n_proto = 0usize;
+            for (pname, ptext) in &proto_lines {
+                if idents.contains(pname.as_str()) {
+                    code.push_str(ptext);
+                    n_proto += 1;
+                }
+            }
+            // The effect-edge table, inspectable: unit -> protos it names.
+            if std::env::var_os("FIDES_INC_DEBUG").is_some() {
+                eprintln!("[inc] unit {}: {} of {} protos", name, n_proto, proto_lines.len());
+            }
+        }
         if let Some(used) = unit_strs.get(name) {
             for sname in used {
                 if let Some(decl) = str_decls.get(sname) {
@@ -6743,6 +6869,25 @@ pub fn generate_c_units(
         units.push((name.clone(), code));
     }
     units
+}
+
+/// Every C identifier in `src` (runs of [A-Za-z0-9_], digit-led runs
+/// skipped) — the cheap per-unit scan that scopes prototypes.
+fn c_collect_idents<'a>(src: &'a str, out: &mut std::collections::HashSet<&'a str>) {
+    let b = src.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut i = 0usize;
+    while i < b.len() {
+        if ident(b[i]) && !b[i].is_ascii_digit() {
+            let s = i;
+            while i < b.len() && ident(b[i]) {
+                i += 1;
+            }
+            out.insert(&src[s..i]);
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// The suffix and C type of the checked-arithmetic helpers for `ty`.

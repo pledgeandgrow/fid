@@ -706,6 +706,18 @@ fn parse_top_level_item(self: &mut Parser, program: &mut Program, is_pub: bool) 
         }
     }
 
+    // LG15: `@import("foo.h")` imports the C header as `use foo` does when
+    // there is no foo.fd: bindings generated from the header
+    if token_kind_eq(k, TokenKind::At) && self.pd_at_import() {
+        match self.parse_at_import() {
+            ParseResultImportDef::Ok(imp) => {
+                program.imports.push(imp);
+                return ParseResultUnit::Ok;
+            }
+            ParseResultImportDef::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
     if token_kind_eq(k, TokenKind::At) {
         var annotations: Vec<Annotation> = Vec::new();
         while self.check(TokenKind::At) {
@@ -1310,6 +1322,23 @@ if self.match_tok(TokenKind::For) {
         ParseResultStr::Ok(s) => { type_name = s; }
         ParseResultStr::Err(e) => { return ParseResultImplOrTrait::Err(e); }
     }
+    // `impl<T> Show for Slot<T>`: the type's arguments repeat the impl's
+    // parameters, as in `impl<T> Slot<T>` above
+    if self.check(TokenKind::Lt) {
+        var fdepth: i64 = 0;
+        var fscan: bool = true;
+        while fscan {
+            if self.check(TokenKind::Lt) {
+                fdepth = fdepth + 1;
+            } else if self.check(TokenKind::Gt) {
+                fdepth = fdepth - 1;
+            } else if self.check(TokenKind::Shr) {
+                fdepth = fdepth - 2;
+            }
+            self.advance();
+            if fdepth <= 0 || self.is_at_end() { fscan = false; }
+        }
+    }
     match self.expect(TokenKind::LBrace, "{") {
         ParseResultUnit::Err(e) => { return ParseResultImplOrTrait::Err(e); }
         ParseResultUnit::Ok => {}
@@ -1377,7 +1406,7 @@ if self.match_tok(TokenKind::For) {
 
     var __ti: TraitImpl = TraitImpl_new(trait_name, type_name);
     __ti.type_params = type_params;
-    __ti.methods = methods;
+    __ti.methods = pd_generic_self(methods, type_name, type_params);
     __ti.associated_types = associated_types;
     var __iot1: ImplOrTrait = ImplOrTrait {
         tag: 1,
@@ -1417,7 +1446,7 @@ match self.expect(TokenKind::RBrace, "}") {
 
 var __si: ImplDef = ImplDef_new(struct_name);
 __si.type_params = type_params;
-__si.methods = methods;
+__si.methods = pd_generic_self(methods, struct_name, type_params);
 var __iot0: ImplOrTrait = ImplOrTrait {
     tag: 0,
     struct_impl: __si,
@@ -2510,7 +2539,7 @@ while !self.check(TokenKind::RBrace) && !self.is_at_end() {
         }
     }
 }
-return ParseResultStmts::Ok(stmts);
+return ParseResultStmts::Ok(pd_infer_vec_lets(stmts));
 }
 
 fn parse_stmt(self: &mut Parser) -> ParseResultStmt {
@@ -5014,7 +5043,10 @@ if token_kind_eq(k, TokenKind::Ident("")) {
     if self.match_tok(TokenKind::LParen) {
         return self.parse_call_expr(name);
     }
-    if self.check(TokenKind::LBrace) && self.is_struct_name(name) {
+    // A struct of an imported module is not among the file's own names when
+    // the file is first parsed (known-bugs 2g.38): `Name { field: ..` is a
+    // literal all the same (no block starts with `ident:`)
+    if self.check(TokenKind::LBrace) && (self.is_struct_name(name) || self.pd_field_init_follows(name)) {
         self.advance();
         return self.parse_struct_lit_expr(name);
     }
@@ -5406,6 +5438,57 @@ if vals.len() == 0 {
 return ParseResultExpr::Ok(vals.pop());
 }
 
+/// `{ ident :` at the parser's position, after a capitalised name.
+fn pd_field_init_follows(self: &Parser, name: str) -> bool {
+    if str_len(name) == 0 { return false; }
+    var c0: i64 = str_byte_at(name, 0);
+    if c0 < 65 || c0 > 90 { return false; }
+    if self.pos + 2 >= self.tokens.len() { return false; }
+    var is_id: bool = false;
+    match self.tokens.get(self.pos + 1).kind {
+        TokenKind::Ident(_fi: str) => { is_id = true; }
+        _ => {}
+    }
+    return is_id && token_kind_eq(self.tokens.get(self.pos + 2).kind, TokenKind::Colon);
+}
+
+/// `@import(` at the parser's position.
+fn pd_at_import(self: &Parser) -> bool {
+    if self.pos + 2 >= self.tokens.len() { return false; }
+    var is_import: bool = false;
+    match self.tokens.get(self.pos + 1).kind {
+        TokenKind::Ident(nm: str) => { is_import = nm == "import"; }
+        _ => {}
+    }
+    return is_import && token_kind_eq(self.tokens.get(self.pos + 2).kind, TokenKind::LParen);
+}
+
+/// `@import("path/foo.h")`: the import of `path/foo`, found as a header
+/// (compiler.fd's import resolution: `.fd` first, then `.h`).
+fn parse_at_import(self: &mut Parser) -> ParseResultImportDef {
+    self.advance();
+    self.advance();
+    self.advance();
+    var tok: Token = self.peek_token();
+    var hpath: str = "";
+    var ok: bool = false;
+    match tok.kind {
+        TokenKind::StringLit(sv: str) => { hpath = sv; ok = true; }
+        _ => {}
+    }
+    if !ok || !str_ends_with(hpath, ".h") {
+        return ParseResultImportDef::Err("Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) + ": @import takes a C header name, as in @import(\"foo.h\")");
+    }
+    self.advance();
+    match self.expect(TokenKind::RParen, ")") {
+        ParseResultUnit::Err(e) => { return ParseResultImportDef::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    self.match_tok(TokenKind::Semicolon);
+    var base: str = str_slice(hpath, 0, str_len(hpath) - 2);
+    return ParseResultImportDef::Ok(ImportDef_new_full(str_replace(base, "/", "::"), Vec::new(), Vec::new(), OptStr::None, OptStr::None, false, false));
+}
+
 fn parse_use(self: &mut Parser) -> ParseResultImportDef {
 match self.expect(TokenKind::Use, "use") {
     ParseResultUnit::Err(e) => { return ParseResultImportDef::Err(e); }
@@ -5501,12 +5584,13 @@ if self.match_tok(TokenKind::Eq) {
             self.advance();
             version = OptStr::Some(s);
         }
-        _ => {}
+        _ => {
+            return ParseResultImportDef::Err(
+                "Parse error at " + int_to_str(vtok.line) + ":" + int_to_str(vtok.col) +
+                ": expected version string but got '" + token_kind_to_str(vtok.kind) + "'"
+            );
+        }
     }
-    return ParseResultImportDef::Err(
-        "Parse error at " + int_to_str(vtok.line) + ":" + int_to_str(vtok.col) +
-        ": expected version string but got '" + token_kind_to_str(vtok.kind) + "'"
-    );
 }
 self.match_tok(TokenKind::Semicolon);
 var import_result: ImportDef = ImportDef_new_full(path, items, capabilities, version, alias, false, is_glob);
@@ -5859,3 +5943,179 @@ return false;
 // An @secret annotation was parsed: the secrecy analysis has work to do.
 var g_saw_secret: bool = false;
 pub fn parser_saw_secret() -> bool { return g_saw_secret; }
+
+/// RT6: `var v = Vec::new()` written without a type takes its element type
+/// from a later `v.push(x)` in the same block (nested blocks included) whose
+/// argument is a float, string or bool literal; without it the element was
+/// an i64, and `print(v.get(0))` printed a float's bits.
+fn pd_infer_vec_lets(stmts: Vec<Stmt>) -> Vec<Stmt> {
+    var i: i64 = 0;
+    var changed: bool = false;
+    var out: Vec<Stmt> = Vec::new();
+    while i < stmts.len() {
+        var st: Stmt = stmts.get(i);
+        match st {
+            Stmt::Let(name, lty, init, is_mut, is_persist, anns, line) => {
+                var untyped: bool = false;
+                match lty {
+                    OptType::None => { untyped = true; }
+                    OptType::Some(_) => {}
+                }
+                // `val d = v as dyn Tr` is a `dyn Tr`: its method calls are
+                // dispatched (untyped, they looked for a `dyn_<method>`)
+                if untyped {
+                    match init {
+                        Expr::Cast(_, cty) => {
+                            match cty {
+                                Type::Dyn(_) => {
+                                    st = Stmt::Let(name, OptType::Some(cty), init, is_mut, is_persist, anns, line);
+                                    changed = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if untyped && pd_is_vec_new(init) {
+                    var et: Type = Type::Infer;
+                    var j: i64 = i + 1;
+                    while j < stmts.len() && type_eq_infer(et) {
+                        et = pd_push_lit_type(stmts.get(j), name);
+                        j = j + 1;
+                    }
+                    if !type_eq_infer(et) {
+                        var targs: Vec<Type> = Vec::new();
+                        targs.push(et);
+                        st = Stmt::Let(name, OptType::Some(Type::Generic("Vec", targs)), init, is_mut, is_persist, anns, line);
+                        changed = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        out.push(st);
+        i = i + 1;
+    }
+    if changed { return out; }
+    return stmts;
+}
+
+fn type_eq_infer(t: Type) -> bool {
+    match t {
+        Type::Infer => { return true; }
+        _ => {}
+    }
+    return false;
+}
+
+fn pd_is_vec_new(e: Expr) -> bool {
+    match e {
+        Expr::MethodCall(recv, m, args) => {
+            if m != "new" || args.len() != 0 { return false; }
+            match box_expr_deref(recv) {
+                Expr::Ident(rn) => { return rn == "Vec"; }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    return false;
+}
+
+/// The type of a literal: f64, str or bool (Infer for anything else).
+fn pd_lit_type(e: Expr) -> Type {
+    match e {
+        Expr::FloatLit(_) => { return Type::F64; }
+        Expr::StringLit(_) => { return Type::Str; }
+        Expr::BoolLit(_) => { return Type::Bool; }
+        Expr::Unary(_, inner) => {
+            match box_expr_deref(inner) {
+                Expr::FloatLit(_) => { return Type::F64; }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    return Type::Infer;
+}
+
+/// The literal type pushed onto `name` by statement `st` (searching nested
+/// blocks), or Infer.
+fn pd_push_lit_type(st: Stmt, name: str) -> Type {
+    match st {
+        Stmt::Expr(e, _) => {
+            match e {
+                Expr::MethodCall(recv, m, args) => {
+                    if m == "push" && args.len() == 1 {
+                        match box_expr_deref(recv) {
+                            Expr::Ident(rn) => {
+                                if rn == name { return pd_lit_type(args.get(0)); }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Stmt::If(_, then_b, else_b, _) => {
+            var t1: Type = pd_push_lit_type_block(then_b, name);
+            if !type_eq_infer(t1) { return t1; }
+            match else_b {
+                OptStmts::Some(eb) => { return pd_push_lit_type_block(eb, name); }
+                OptStmts::None => {}
+            }
+        }
+        Stmt::While(_, body, _) => { return pd_push_lit_type_block(body, name); }
+        Stmt::For(_, _, body, _) => { return pd_push_lit_type_block(body, name); }
+        Stmt::Loop(body, _) => { return pd_push_lit_type_block(body, name); }
+        _ => {}
+    }
+    return Type::Infer;
+}
+
+fn pd_push_lit_type_block(stmts: Vec<Stmt>, name: str) -> Type {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        var t: Type = pd_push_lit_type(stmts.get(i), name);
+        if !type_eq_infer(t) { return t; }
+        i = i + 1;
+    }
+    return Type::Infer;
+}
+
+/// A bare `self` in `impl<T> Slot<T>` (or `impl<T> Tr for Slot<T>`) is a
+/// `Slot<T>`: typed as `Self`, it resolved to the bare struct, whose layout
+/// does not know T, and a field after a `T` field read the wrong word.
+fn pd_generic_self(methods: Vec<Func>, type_name: str, type_params: Vec<str>) -> Vec<Func> {
+    if type_params.len() == 0 { return methods; }
+    var targs: Vec<Type> = Vec::new();
+    var k: i64 = 0;
+    while k < type_params.len() {
+        targs.push(Type::Named(type_params.get(k)));
+        k = k + 1;
+    }
+    var out: Vec<Func> = Vec::new();
+    var i: i64 = 0;
+    while i < methods.len() {
+        var f: Func = methods.get(i);
+        if f.params.len() > 0 {
+            var p0: Param = f.params.get(0);
+            var is_self_ty: bool = false;
+            match p0.ty {
+                Type::Named(n) => { is_self_ty = n == "Self"; }
+                _ => {}
+            }
+            if p0.name == "self" && is_self_ty {
+                p0.ty = Type::Generic(type_name, targs);
+                var ps: Vec<Param> = f.params;
+                ps.set(0, p0);
+                f.params = ps;
+            }
+        }
+        out.push(f);
+        i = i + 1;
+    }
+    return out;
+}

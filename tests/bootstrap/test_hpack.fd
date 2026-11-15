@@ -1,0 +1,326 @@
+// stdlib/hpack (competitive SL1): every example of RFC 7541 Appendix C.
+// Each header block is decoded (the header list and the dynamic table after
+// it are printed, as the RFC shows them) and the header list is encoded
+// again by our encoder, which must give the RFC's bytes exactly. Then the
+// Huffman code on all 256 byte values, its decoding errors (5.2), and
+// dynamic table size updates (4.2, 6.3).
+//
+// Expected output: the RFC's tables; every "encode" line says "same bytes".
+use hpack;
+use vec;
+use string;
+use encoding;
+
+struct HL {
+    names: Vec<str>,
+    vals: Vec<str>,
+}
+
+fn hl() -> HL {
+    return HL { names: Vec::new(), vals: Vec::new() };
+}
+
+fn add(l: &mut HL, n: str, v: str) {
+    l.names.push(n);
+    l.vals.push(v);
+}
+
+fn show_list(names: Vec<str>, vals: Vec<str>) {
+    var i: i64 = 0;
+    while i < names.len() {
+        println("  " + names.get(i) + ": " + vals.get(i));
+        i = i + 1;
+    }
+}
+
+fn same(label: str, got: Vec<i64>, want_hex: str) {
+    val want: str = hex_encode_bytes(hex_decode_bytes(want_hex));
+    val have: str = hex_encode_bytes(got);
+    if have == want {
+        println(label + " encode: same bytes (" + int_to_str(got.len()) + ")");
+    } else {
+        println(label + " encode: DIFFERENT " + have + " want " + want);
+    }
+}
+
+// Decode `hex` with `dec`, print the list and the table, compare with `want`.
+fn check_decode(label: str, dec: &mut Hpack, hex: str, want: HL) {
+    val r: HpackHeaders = hpack_decode(dec, hex_decode_bytes(hex));
+    if !r.ok {
+        println(label + " decode: ERROR " + r.error);
+        return;
+    }
+    var match_: bool = r.names.len() == want.names.len();
+    var i: i64 = 0;
+    while match_ && i < r.names.len() {
+        if r.names.get(i) != want.names.get(i) || r.vals.get(i) != want.vals.get(i) {
+            match_ = false;
+        }
+        i = i + 1;
+    }
+    if match_ {
+        println(label + " decode: ok");
+    } else {
+        println(label + " decode: WRONG LIST");
+    }
+    show_list(r.names, r.vals);
+    print(hpack_table_dump(dec));
+}
+
+// One request or response of C.3 to C.6: decode, then encode again.
+fn step(label: str, dec: &mut Hpack, enc: &mut Hpack, hex: str, want: HL) {
+    check_decode(label, dec, hex, want);
+    same(label, hpack_encode(enc, want.names, want.vals), hex);
+}
+
+fn ints() {
+    // C.1: 10 and 1337 with a 5-bit prefix, 42 at an octet boundary
+    var a: Vec<i64> = Vec::new();
+    hpack_put_int(&mut a, 0, 5, 10);
+    same("C.1.1", a, "0a");
+    var b: Vec<i64> = Vec::new();
+    hpack_put_int(&mut b, 0, 5, 1337);
+    same("C.1.2", b, "1f9a0a");
+    var c: Vec<i64> = Vec::new();
+    hpack_put_int(&mut c, 0, 8, 42);
+    same("C.1.3", c, "2a");
+    var p: i64 = 0;
+    val x: i64 = hpack_get_int(b, &mut p, 5);
+    var q: i64 = 0;
+    val y: i64 = hpack_get_int(c, &mut q, 8);
+    var r: i64 = 0;
+    println("C.1 decode: " + int_to_str(hpack_get_int(a, &mut r, 5)) + " " + int_to_str(x) + " (end " + int_to_str(p) + ") " + int_to_str(y));
+    var trunc: i64 = 0;
+    println("truncated integer: " + int_to_str(hpack_get_int(hex_decode_bytes("1f9a"), &mut trunc, 5)) + " pos " + int_to_str(trunc));
+}
+
+fn literals() {
+    // C.2.1: literal with indexing, new name
+    var d1: Hpack = hpack_new(4096);
+    var l1: HL = hl();
+    add(&mut l1, "custom-key", "custom-header");
+    val h1: str = "400a 6375 7374 6f6d 2d6b 6579 0d63 7573 746f 6d2d 6865 6164 6572";
+    check_decode("C.2.1", &mut d1, h1, l1);
+    var e1: Hpack = hpack_new(4096);
+    e1.huffman = false;
+    var o1: Vec<i64> = Vec::new();
+    hpack_encode_field(&mut e1, &mut o1, "custom-key", "custom-header", HPACK_INDEX);
+    same("C.2.1", o1, h1);
+
+    // C.2.2: literal without indexing, indexed name
+    var d2: Hpack = hpack_new(4096);
+    var l2: HL = hl();
+    add(&mut l2, ":path", "/sample/path");
+    val h2: str = "040c 2f73 616d 706c 652f 7061 7468";
+    check_decode("C.2.2", &mut d2, h2, l2);
+    var e2: Hpack = hpack_new(4096);
+    e2.huffman = false;
+    var o2: Vec<i64> = Vec::new();
+    hpack_encode_field(&mut e2, &mut o2, ":path", "/sample/path", HPACK_NO_INDEX);
+    same("C.2.2", o2, h2);
+
+    // C.2.3: literal never indexed
+    var d3: Hpack = hpack_new(4096);
+    var l3: HL = hl();
+    add(&mut l3, "password", "secret");
+    val h3: str = "1008 7061 7373 776f 7264 0673 6563 7265 74";
+    check_decode("C.2.3", &mut d3, h3, l3);
+    val r3: HpackHeaders = hpack_decode(&mut d3, hex_decode_bytes(h3));
+    println("C.2.3 never indexed flag: " + bool_to_str(r3.never.get(0)));
+    var e3: Hpack = hpack_new(4096);
+    e3.huffman = false;
+    var o3: Vec<i64> = Vec::new();
+    hpack_encode_field(&mut e3, &mut o3, "password", "secret", HPACK_NEVER_INDEX);
+    same("C.2.3", o3, h3);
+
+    // C.2.4: indexed field
+    var d4: Hpack = hpack_new(4096);
+    var l4: HL = hl();
+    add(&mut l4, ":method", "GET");
+    check_decode("C.2.4", &mut d4, "82", l4);
+    var e4: Hpack = hpack_new(4096);
+    same("C.2.4", hpack_encode(&mut e4, l4.names, l4.vals), "82");
+}
+
+fn req1() -> HL {
+    var l: HL = hl();
+    add(&mut l, ":method", "GET");
+    add(&mut l, ":scheme", "http");
+    add(&mut l, ":path", "/");
+    add(&mut l, ":authority", "www.example.com");
+    return l;
+}
+
+fn req2() -> HL {
+    var l: HL = req1();
+    add(&mut l, "cache-control", "no-cache");
+    return l;
+}
+
+fn req3() -> HL {
+    var l: HL = hl();
+    add(&mut l, ":method", "GET");
+    add(&mut l, ":scheme", "https");
+    add(&mut l, ":path", "/index.html");
+    add(&mut l, ":authority", "www.example.com");
+    add(&mut l, "custom-key", "custom-value");
+    return l;
+}
+
+fn requests(sec: str, huffman: bool, h1: str, h2: str, h3: str) {
+    var dec: Hpack = hpack_new(4096);
+    var enc: Hpack = hpack_new(4096);
+    enc.huffman = huffman;
+    step(sec + ".1", &mut dec, &mut enc, h1, req1());
+    step(sec + ".2", &mut dec, &mut enc, h2, req2());
+    step(sec + ".3", &mut dec, &mut enc, h3, req3());
+}
+
+fn resp(status: str, date: str) -> HL {
+    var l: HL = hl();
+    add(&mut l, ":status", status);
+    add(&mut l, "cache-control", "private");
+    add(&mut l, "date", date);
+    add(&mut l, "location", "https://www.example.com");
+    return l;
+}
+
+fn resp3() -> HL {
+    var l: HL = resp("200", "Mon, 21 Oct 2013 20:13:22 GMT");
+    add(&mut l, "content-encoding", "gzip");
+    add(&mut l, "set-cookie", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1");
+    return l;
+}
+
+fn responses(sec: str, huffman: bool, h1: str, h2: str, h3: str) {
+    var dec: Hpack = hpack_new(256);
+    var enc: Hpack = hpack_new(256);
+    enc.huffman = huffman;
+    step(sec + ".1", &mut dec, &mut enc, h1, resp("302", "Mon, 21 Oct 2013 20:13:21 GMT"));
+    step(sec + ".2", &mut dec, &mut enc, h2, resp("307", "Mon, 21 Oct 2013 20:13:21 GMT"));
+    step(sec + ".3", &mut dec, &mut enc, h3, resp3());
+}
+
+fn huffman_checks() {
+    // Every byte value, alone and all together
+    var all: Vec<i64> = Vec::new();
+    var bad: i64 = 0;
+    var b: i64 = 0;
+    while b < 256 {
+        all.push(b);
+        var one: Vec<i64> = Vec::new();
+        one.push(b);
+        val back: Option<Vec<i64>> = huffman_decode(huffman_encode(one));
+        match back {
+            Option::Some(v) => {
+                if v.len() != 1 || v.get(0) != b { bad = bad + 1; }
+            }
+            Option::None => { bad = bad + 1; }
+        }
+        b = b + 1;
+    }
+    val coded: Vec<i64> = huffman_encode(all);
+    var round: bool = false;
+    match huffman_decode(coded) {
+        Option::Some(v) => { round = hex_encode_bytes(v) == hex_encode_bytes(all); }
+        Option::None => { round = false; }
+    }
+    println("huffman: 256 single bytes, " + int_to_str(bad) + " wrong; all 256 in one string: "
+        + int_to_str(coded.len()) + " bytes, round trip " + bool_to_str(round));
+    println("huffman len of EOS code: " + int_to_str(huffman_code_len(256)) + ", code of 'a': "
+        + int_to_hex(huffman_code(97)) + " (" + int_to_str(huffman_code_len(97)) + " bits)");
+    println("huffman \"www.example.com\": " + hex_encode_bytes(huffman_encode(str_bytes("www.example.com"))));
+    // Errors (5.2): EOS inside, 8 bits of padding, padding that is not ones
+    println("EOS in string rejected: " + bool_to_str(huffman_decode(hex_decode_bytes("ffffffff")).is_none()));
+    println("8 padding bits rejected: " + bool_to_str(huffman_decode(hex_decode_bytes("1fff")).is_none()));
+    println("zero padding rejected: " + bool_to_str(huffman_decode(hex_decode_bytes("00")).is_none()));
+    println("'0' with padding ok: " + bool_to_str(huffman_decode(hex_decode_bytes("07")).is_some()));
+}
+
+fn size_updates() {
+    // Decoder: a size update first is fine, after a field it is an error,
+    // and above the limit (our SETTINGS_HEADER_TABLE_SIZE) too.
+    var d: Hpack = hpack_new(4096);
+    hpack_table_add(&mut d, "a", "b");
+    hpack_table_add(&mut d, "c", "d");
+    val r1: HpackHeaders = hpack_decode(&mut d, hex_decode_bytes("20 3f e1 1f 82"));
+    println("size update 0 then 4096: ok " + bool_to_str(r1.ok) + ", table emptied: "
+        + int_to_str(hpack_table_len(&d)) + " entries, max " + int_to_str(d.max_size));
+    val r2: HpackHeaders = hpack_decode(&mut d, hex_decode_bytes("82 20"));
+    println("size update after a field: ok " + bool_to_str(r2.ok) + " (" + r2.error + ")");
+    val r3: HpackHeaders = hpack_decode(&mut d, hex_decode_bytes("3f e2 1f"));
+    println("size update to 4097: ok " + bool_to_str(r3.ok) + " (" + r3.error + ")");
+    val r4: HpackHeaders = hpack_decode(&mut d, hex_decode_bytes("c0"));
+    println("index past the table: ok " + bool_to_str(r4.ok) + " (" + r4.error + ")");
+    val r5: HpackHeaders = hpack_decode(&mut d, hex_decode_bytes("80"));
+    println("index 0: ok " + bool_to_str(r5.ok) + " (" + r5.error + ")");
+    val r6: HpackHeaders = hpack_decode(&mut d, hex_decode_bytes("41 8c f1 e3"));
+    println("truncated literal: ok " + bool_to_str(r6.ok) + " (" + r6.error + ")");
+
+    // Eviction: entries of 40 bytes in a 100-byte table keep the last two
+    var t: Hpack = hpack_new(100);
+    hpack_table_add(&mut t, "k1", "123456");
+    hpack_table_add(&mut t, "k2", "123456");
+    hpack_table_add(&mut t, "k3", "123456");
+    print(hpack_table_dump(&t));
+    hpack_table_resize(&mut t, 50);
+    print(hpack_table_dump(&t));
+    hpack_table_add(&mut t, "big", "a value that does not fit in fifty bytes");
+    print(hpack_table_dump(&t));
+
+    // Encoder: going down to 0 and up to 4096 announces both, then fields
+    var e: Hpack = hpack_new(4096);
+    e.huffman = false;
+    hpack_table_add(&mut e, "x", "y");
+    hpack_set_max_size(&mut e, 0);
+    hpack_set_max_size(&mut e, 4096);
+    var l: HL = hl();
+    add(&mut l, ":method", "GET");
+    val out: Vec<i64> = hpack_encode(&mut e, l.names, l.vals);
+    same("size updates 0, 4096, :method GET", out, "20 3fe11f 82");
+    var d2: Hpack = hpack_new(4096);
+    hpack_table_add(&mut d2, "x", "y");
+    val r7: HpackHeaders = hpack_decode(&mut d2, out);
+    println("decoded: ok " + bool_to_str(r7.ok) + ", " + int_to_str(r7.names.len()) + " field, table "
+        + int_to_str(hpack_table_len(&d2)) + " entries");
+    // A credential is never indexed; an entry bigger than the table is not
+    var e2: Hpack = hpack_new(64);
+    e2.huffman = false;
+    var l2: HL = hl();
+    add(&mut l2, "authorization", "Basic x");
+    add(&mut l2, "x-long", "0123456789012345678901234567890123456789");
+    add(&mut l2, "x-short", "1");
+    val o2: Vec<i64> = hpack_encode(&mut e2, l2.names, l2.vals);
+    println("authorization first byte: " + int_to_hex(o2.get(0)) + ", table after: "
+        + int_to_str(hpack_table_len(&e2)) + " entry");
+    var d3: Hpack = hpack_new(64);
+    val r8: HpackHeaders = hpack_decode(&mut d3, o2);
+    println("decoded: ok " + bool_to_str(r8.ok) + ", never " + bool_to_str(r8.never.get(0)) + ", "
+        + r8.names.get(1) + "=" + r8.vals.get(1) + ", table " + int_to_str(hpack_table_len(&d3)) + " entry");
+}
+
+fn main() -> i64 {
+    println("static table: 1 " + hpack_static_name(1) + ", 2 " + hpack_static_name(2) + " "
+        + hpack_static_value(2) + ", 61 " + hpack_static_name(61));
+    ints();
+    literals();
+    requests("C.3", false,
+        "8286 8441 0f77 7777 2e65 7861 6d70 6c65 2e63 6f6d",
+        "8286 84be 5808 6e6f 2d63 6163 6865",
+        "8287 85bf 400a 6375 7374 6f6d 2d6b 6579 0c63 7573 746f 6d2d 7661 6c75 65");
+    requests("C.4", true,
+        "8286 8441 8cf1 e3c2 e5f2 3a6b a0ab 90f4 ff",
+        "8286 84be 5886 a8eb 1064 9cbf",
+        "8287 85bf 4088 25a8 49e9 5ba9 7d7f 8925 a849 e95b b8e8 b4bf");
+    responses("C.5", false,
+        "4803 3330 3258 0770 7269 7661 7465 611d 4d6f 6e2c 2032 3120 4f63 7420 3230 3133 2032 303a 3133 3a32 3120 474d 546e 1768 7474 7073 3a2f 2f77 7777 2e65 7861 6d70 6c65 2e63 6f6d",
+        "4803 3330 37c1 c0bf",
+        "88c1 611d 4d6f 6e2c 2032 3120 4f63 7420 3230 3133 2032 303a 3133 3a32 3220 474d 54c0 5a04 677a 6970 7738 666f 6f3d 4153 444a 4b48 514b 425a 584f 5157 454f 5049 5541 5851 5745 4f49 553b 206d 6178 2d61 6765 3d33 3630 303b 2076 6572 7369 6f6e 3d31");
+    responses("C.6", true,
+        "4882 6402 5885 aec3 771a 4b61 96d0 7abe 9410 54d4 44a8 2005 9504 0b81 66e0 82a6 2d1b ff6e 919d 29ad 1718 63c7 8f0b 97c8 e9ae 82ae 43d3",
+        "4883 640e ffc1 c0bf",
+        "88c1 6196 d07a be94 1054 d444 a820 0595 040b 8166 e084 a62d 1bff c05a 839b d9ab 77ad 94e7 821d d7f2 e6c7 b335 dfdf cd5b 3960 d5af 2708 7f36 72c1 ab27 0fb5 291f 9587 3160 65c0 03ed 4ee5 b106 3d50 07");
+    huffman_checks();
+    size_updates();
+    return 0;
+}

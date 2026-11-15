@@ -5,6 +5,8 @@
 #   selfhost  the self-hosted compiler fid is built from compiler/*.fd in one
 #             stage (scripts/build-selfhost.sh) and runs and compiles a few
 #             programs, and the leak gate passes.
+#   natgate   the own-backend gate (scripts/nat-gate.sh) on x86_64-linux:
+#             the IR verifier and the allocation checker on every emit.
 #
 # The full suite, the 3-stage fixpoint and the cross targets take hours and
 # run before a release (docs/reference/releasing.md, scripts/ci/cross.yml).
@@ -75,3 +77,32 @@ jobs:
         env:
           CC: zig cc
         run: bash scripts/leak-check.sh release/fid-dev
+      - name: Doc examples (CU7)
+        run: python3 scripts/doctest.py stdlib --fid ./release/fid-dev
+
+  natgate:
+    # The own-backend gate (docs/roadmap/llvm-roadmap.md RL7): the IR
+    # verifier and the register-allocation checker on every emit, the rules
+    # tested and proved. x86_64-linux runs natively on ubuntu-latest; the
+    # qemu targets run with the release cross builds (scripts/ci/cross.yml).
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: mold
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+      - name: Build the Rust bootstrap compiler
+        run: cargo build --release
+      - name: Build fid (one stage)
+        env:
+          CC: zig cc
+        run: ./scripts/build-selfhost.sh
+      - name: nat-gate on x86_64-linux
+        env:
+          CC: zig cc
+          FID: release/fid-dev
+        run: bash scripts/nat-gate.sh x86_64-linux

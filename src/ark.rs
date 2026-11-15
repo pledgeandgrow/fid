@@ -369,6 +369,40 @@ pub fn cmd_add(args: &[String]) -> Result<(), String> {
     let cwd = std::env::current_dir()
         .map_err(|e| format!("Cannot get current directory: {}", e))?;
     let mut manifest = Manifest::load(&cwd)?;
+
+    // CD6: warn when the name is one edit away from a known package —
+    // a dep already in the manifest, or one in the local index copy.
+    let mut near: Vec<String> = manifest
+        .dependencies
+        .keys()
+        .filter(|k| k.as_str() != dep_name && edit_distance(dep_name, k) == 1)
+        .cloned()
+        .collect();
+    let home = std::env::var("ARK_HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    if !home.is_empty() {
+        let index = Path::new(&home).join(".ark").join("index");
+        if let Ok(rd) = fs::read_dir(&index) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().to_string();
+                if !n.starts_with('.') && n != dep_name.as_str()
+                    && edit_distance(dep_name, &n) == 1 && !near.contains(&n)
+                {
+                    near.push(n);
+                }
+            }
+        }
+    }
+    if !near.is_empty() {
+        eprintln!(
+            "warning: '{}' is one edit away from {} — a typosquat? check the name",
+            dep_name,
+            near.iter().map(|n| format!("'{}'", n)).collect::<Vec<_>>().join(", ")
+        );
+    }
+
     manifest.dependencies.insert(dep_name.clone(), dep);
     manifest.save(&cwd)?;
 
@@ -666,6 +700,21 @@ struct IndexEntry {
     git: String,
     tag: String,
     commit: String,
+}
+
+/// Levenshtein distance between two names (CD6's typosquat check).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            cur.push((prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + usize::from(ca != cb)));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
 }
 
 fn git_output(dir: &Path, args: &[&str]) -> Result<String, String> {

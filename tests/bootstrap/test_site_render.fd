@@ -1,0 +1,136 @@
+// Test: the website program (tools/site.fd, roadmap AD2) without a network:
+// request paths that try to leave the site are refused before any file is
+// named, pages route to their Markdown files, links and anchors are
+// rewritten, tables and raw HTML render. Run from the repository root (the
+// routes look at README.md and docs/).
+//
+// Expected output:
+// / -> 200 page README.md
+// /index.html -> 200 page README.md
+// /docs/cookbook.html -> 200 page docs/cookbook.md
+// /docs/cookbook.md -> 200 page docs/cookbook.md
+// /docs/book/ -> 200 page docs/book/README.md
+// /docs/book -> 301 redirect /docs/book/
+// /docs/reference/ -> 200 index docs/reference
+// /docs/reference/syntax.html -> 200 page docs/reference/syntax.md
+// /style.css -> 200 css
+// /pages.html -> 200 pages
+// /nope.html -> 404 missing
+// /docs/roadmap/roadmap.html -> 404 missing
+// /AGENTS.md -> 404 missing
+// /../AGENTS.md -> 403 refused
+// /docs/../AGENTS.md -> 403 refused
+// /docs/reference/../../AGENTS.md -> 403 refused
+// /%2e%2e/AGENTS.md -> 403 refused
+// /docs/..%2f..%2fAGENTS.md -> 403 refused
+// /docs\reference\syntax.html -> 403 refused
+// /docs/..%5cAGENTS.md -> 403 refused
+// /C:/Windows/win.ini -> 403 refused
+// //etc/passwd -> 403 refused
+// /.git/config -> 403 refused
+// /docs/%252e%252e/AGENTS.md -> 403 refused
+// /docs/cookbook.md%00.html -> 403 refused
+// /./index.html -> 403 refused
+// docs/x.md -> 403 refused
+//  -> 403 refused
+// GET /../x: HTTP/1.1 403 Forbidden
+// POST /: HTTP/1.1 405 Method Not Allowed
+// GET /docs/book: HTTP/1.1 301 Moved Permanently
+// resolve: docs/book/x.md | docs/x.md | (above root)
+// link: ../../docs/book/02-first-program.html#top
+// link: ../../index.html
+// link: https://github.com/pledgeandgrow/fid/blob/main/compiler/lower.fd
+// link: https://example.com/a.md
+// link: #local
+// link: ../../docs/fid-logo.svg
+// slug: crypto--hashing | 31-primitive-types | p_malloc-and-friends
+// cells: 3 [a] [b | c] [`d`]
+// <div class="table"><table>
+// <thead><tr><th>A</th><th style="text-align:right">B</th></tr></thead>
+// <tbody>
+// <tr><td><code>x_y</code></td><td style="text-align:right">2</td></tr>
+// </tbody></table></div>
+// <p align="center">raw</p>
+// <p>CI</p>
+// <h1 id="top">Top</h1>
+// <h2 id="intro">Intro</h2>
+// <h2 id="intro-1">Intro</h2>
+// title: Top
+
+use core;
+use tools::site;
+
+fn show(path: str) {
+    val r: SiteRoute = site_route(path);
+    var line: str = path + " -> " + int_to_str(r.status) + " " + r.kind;
+    if r.target != "" { line = line + " " + r.target; }
+    println(line);
+}
+
+fn first_line(resp: str) -> str {
+    val e: i64 = str_find(resp, "\r\n");
+    if e < 0 { return resp; }
+    return str_slice(resp, 0, e);
+}
+
+fn main() -> i64 {
+    show("/");
+    show("/index.html");
+    show("/docs/cookbook.html");
+    show("/docs/cookbook.md");
+    show("/docs/book/");
+    show("/docs/book");
+    show("/docs/reference/");
+    show("/docs/reference/syntax.html");
+    show("/style.css");
+    show("/pages.html");
+    show("/nope.html");
+    show("/docs/roadmap/roadmap.html");
+    show("/AGENTS.md");
+    show("/../AGENTS.md");
+    show("/docs/../AGENTS.md");
+    show("/docs/reference/../../AGENTS.md");
+    show("/%2e%2e/AGENTS.md");
+    show("/docs/..%2f..%2fAGENTS.md");
+    show("/docs\\reference\\syntax.html");
+    show("/docs/..%5cAGENTS.md");
+    show("/C:/Windows/win.ini");
+    show("//etc/passwd");
+    show("/.git/config");
+    show("/docs/%252e%252e/AGENTS.md");
+    show("/docs/cookbook.md%00.html");
+    show("/./index.html");
+    show("docs/x.md");
+    show("");
+
+    println("GET /../x: " + first_line(site_respond("GET", "/../x")));
+    println("POST /: " + first_line(site_respond("POST", "/")));
+    println("GET /docs/book: " + first_line(site_respond("GET", "/docs/book")));
+
+    var above: str = site_resolve("docs", "../../x.md");
+    if above == "" { above = "(above root)"; }
+    println("resolve: " + site_resolve("docs/book", "./x.md") + " | " +
+            site_resolve("docs/book", "../x.md") + " | " + above);
+
+    println("link: " + site_link("02-first-program.md#top", "docs/book/01-intro.md"));
+    println("link: " + site_link("../../README.md", "docs/reference/syntax.md"));
+    println("link: " + site_link("../../compiler/lower.fd", "docs/reference/syntax.md"));
+    println("link: " + site_link("https://example.com/a.md", "docs/reference/syntax.md"));
+    println("link: " + site_link("#local", "docs/reference/syntax.md"));
+    println("link: " + site_link("/docs/fid-logo.svg", "docs/reference/syntax.md"));
+
+    println("slug: " + site_slug("Crypto / hashing") + " | " + site_slug("3.1 Primitive Types") + " | " +
+            site_slug("p_malloc and friends"));
+
+    val cells: Vec<str> = site_cells("| a | b \\| c | `d` |");
+    println("cells: " + int_to_str(cells.len()) + " [" + cells.get(0) + "] [" + cells.get(1) + "] [" + cells.get(2) + "]");
+
+    print(site_render_md("| A | B |\n|---|--:|\n| `x_y` | 2 |\n"));
+    print(site_render_md("<p align=\"center\">raw</p>\n"));
+    println(str_trim(site_render_md("<p><img alt=\"CI\" src=\"https://example.com/badge.svg\"></p>\n")));
+
+    var title: str = "";
+    print(site_anchor_headings("<h1>Top</h1>\n<h2>Intro</h2>\n<h2>Intro</h2>\n", &mut title));
+    println("title: " + title);
+    return 0;
+}

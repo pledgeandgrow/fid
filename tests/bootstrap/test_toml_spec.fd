@@ -1,0 +1,505 @@
+// stdlib/toml against the TOML 1.0.0 specification (https://toml.io/en/v1.0.0).
+//
+// Part 1 checks each section of the specification by hand: keys, every
+// string form and escape, integers, floats, booleans, the four date/time
+// kinds, arrays, inline tables, tables and arrays of tables, and the
+// documents the specification calls invalid (each must be rejected; the
+// error names the line). Part 2 holds the specification's own examples as
+// the toml-test suite has them (https://github.com/toml-lang/toml-test,
+// main branch: all 48 files of tests/valid/spec-1.0.0, compared with their
+// .json files, and the 8 of tests/invalid/spec-1.0.0, which must fail).
+// More toml-test cases are in test_toml_suite_spec.fd; the whole toml-test
+// 1.0.0 list (tests/files-toml-1.0.0: 208 valid, 509 invalid) passes too,
+// but is too slow for the interpreter to carry here.
+//
+// In the strings below `\x7b` and `\x7d` are braces (a brace in a Fides
+// string literal may start an interpolation) and tb("hex") builds a text
+// from bytes (control characters, invalid UTF-8).
+use toml;
+
+fn tb(hex: str) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i + 1 < str_len(hex) {
+        out.push(str_parse_hex("0x" + str_slice(hex, i, i + 2)));
+        i = i + 2;
+    }
+    return str_from_bytes(out);
+}
+
+fn ok(name: str, text: str, want: str) {
+    val d: TomlDoc = toml_load(text);
+    if !d.ok {
+        println(name + ": rejected: " + d.error);
+        p_panic("toml spec: " + name + " should be valid");
+    }
+    val got: str = toml_to_json(d);
+    if !str_equal(got, want) {
+        println(name + ": got  " + got);
+        println(name + ": want " + want);
+        p_panic("toml spec: " + name + " parsed wrong");
+    }
+    println(name + ": ok");
+}
+
+fn bad(name: str, text: str) {
+    val d: TomlDoc = toml_load(text);
+    if d.ok {
+        println(name + ": accepted: " + toml_to_json(d));
+        p_panic("toml spec: " + name + " should be rejected");
+    }
+    println(name + ": rejected (" + d.error + ")");
+}
+
+fn check_s(label: str, got: str, want: str) {
+    println(label + " = [" + got + "]");
+    if !str_equal(got, want) { p_panic("toml spec: " + label + " gave '" + got + "', want '" + want + "'"); }
+}
+
+fn check_i(label: str, got: i64, want: i64) {
+    println(label + " = " + int_to_str(got));
+    if got != want { p_panic("toml spec: " + label + " wrong"); }
+}
+
+// The bytes of a string, as decimal numbers.
+fn bytes_of(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if i > 0 { out = out + " "; }
+        out = out + int_to_str(str_byte_at(s, i));
+        i = i + 1;
+    }
+    return out;
+}
+
+// "kind:value" at a dotted path
+fn kv(d: TomlDoc, path: str) -> str {
+    val n: i64 = toml_lookup(d, path);
+    return toml_node_kind(d, n) + ":" + toml_node_value(d, n);
+}
+
+// ─── Part 1: the specification, section by section ─────────────────────
+
+fn spec_keys() {
+    println("-- Keys");
+    var t: str = "key = 1\nbare_key = 2\nbare-key = 3\n1234 = 4\n\"127.0.0.1\" = 5\n";
+    t = t + "\"character encoding\" = 6\n\"ʎǝʞ\" = 7\n'key2' = 8\n'quoted \"value\"' = 9\n";
+    t = t + "\"\" = 10\nname = \"Orange\"\nphysical.color = \"orange\"\nphysical.shape = \"round\"\n";
+    t = t + "site.\"google.com\" = true\nfruit . flavor = \"banana\"\n3.14159 = \"pi\"\n";
+    t = t + "\"tab\\there\" = 11\n";
+    val d: TomlDoc = toml_load(t);
+    check_s("ok", bool_to_str(d.ok) + d.error, "true");
+    check_s("bare", kv(d, "bare-key"), "integer:3");
+    check_s("digits key", kv(d, "1234"), "integer:4");
+    check_s("quoted with dots", toml_node_value(d, toml_node_child(d, 0, "127.0.0.1")), "5");
+    check_s("quoted with space", kv(d, "character encoding"), "integer:6");
+    check_s("unicode key", kv(d, "ʎǝʞ"), "integer:7");
+    check_s("literal key", kv(d, "key2"), "integer:8");
+    check_s("literal key quotes", kv(d, "quoted \"value\""), "integer:9");
+    check_s("empty key", toml_node_value(d, toml_node_child(d, 0, "")), "10");
+    check_s("dotted", kv(d, "physical.shape"), "string:round");
+    check_s("dotted kind", toml_node_kind(d, toml_lookup(d, "physical")), "table");
+    check_s("dotted quoted", toml_node_value(d, toml_node_child(d, toml_lookup(d, "site"), "google.com")), "true");
+    check_s("dotted spaces", kv(d, "fruit.flavor"), "string:banana");
+    check_s("float-like key", kv(d, "3.14159"), "string:pi");
+    check_s("escape in key", kv(d, "tab\there"), "integer:11");
+    check_i("root keys", toml_node_len(d, 0), 16);
+    check_s("first keys", toml_node_keys(d, 0).get(0) + "," + toml_node_keys(d, 0).get(1), "key,bare_key");
+    bad("key without value", "key = # INVALID\n");
+    bad("value on next line", "first = \"Tom\" last = \"Preston-Werner\" # INVALID\n");
+    bad("empty bare key", "= \"no key name\"  # INVALID\n");
+    bad("key with space", "bad key = 1\n");
+    bad("duplicate key", "name = \"Tom\"\nname = \"Pradyun\"\n");
+    bad("duplicate quoted/bare", "spelling = \"favorite\"\n\"spelling\" = \"favourite\"\n");
+    bad("value then table", "fruit.apple = 1\nfruit.apple.smooth = true\n");
+    bad("multi-line string key", "\"\"\"key\"\"\" = 1\n");
+    bad("newline before =", "key\n= 1\n");
+    ok("dotted order free", "apple.type = \"fruit\"\norange.type = \"fruit\"\napple.skin = \"thin\"\n",
+       "\x7b\"apple\":\x7b\"skin\":\x7b\"type\":\"string\",\"value\":\"thin\"\x7d,\"type\":\x7b\"type\":\"string\",\"value\":\"fruit\"\x7d\x7d,\"orange\":\x7b\"type\":\x7b\"type\":\"string\",\"value\":\"fruit\"\x7d\x7d\x7d");
+}
+
+fn spec_strings() {
+    println("-- Strings");
+    // every escape of a basic string
+    var t: str = "e = \"\\b\\t\\n\\f\\r\\\"\\\\\\u00E9\\U0001F600\\u0041\"\n";
+    t = t + "lit = 'C:\\Users\\nodejs\\templates'\nq = '<\\i\\c*\\s*>'\n";
+    t = t + "ml = \"\"\"\nRoses are red\nViolets are blue\"\"\"\n";
+    t = t + "fold = \"\"\"\nThe quick brown \\\n\n\n  fox jumps over \\\n    the lazy dog.\"\"\"\n";
+    t = t + "fold2 = \"\"\"\\\n       The quick brown \\   \n       fox.\\\n       \"\"\"\n";
+    t = t + "quotes = \"\"\"Here are two quotation marks: \"\". Simple enough.\"\"\"\n";
+    t = t + "q5 = \"\"\"\"This,\" she said.\"\"\"\"\n";
+    t = t + "rawml = '''\nThe first newline is\ntrimmed in raw strings.\n   All other whitespace\n   is preserved.\n'''\n";
+    t = t + "lq = ''''That,' she said.''''\n";
+    t = t + "crlf = \"\"\"a\r\nb\"\"\"\n";
+    t = t + "tab = \"a\tb\"\n";
+    val d: TomlDoc = toml_load(t);
+    check_s("ok", bool_to_str(d.ok) + d.error, "true");
+    check_s("escapes", bytes_of(toml_node_value(d, toml_lookup(d, "e"))),
+            "8 9 10 12 13 34 92 195 169 240 159 152 128 65");
+    check_s("literal", kv(d, "lit"), "string:C:\\Users\\nodejs\\templates");
+    check_s("literal regex", kv(d, "q"), "string:<\\i\\c*\\s*>");
+    check_s("multi-line", kv(d, "ml"), "string:Roses are red\nViolets are blue");
+    check_s("line-ending backslash", kv(d, "fold"), "string:The quick brown fox jumps over the lazy dog.");
+    check_s("backslash then spaces", kv(d, "fold2"), "string:The quick brown fox.");
+    check_s("two quotes inside", kv(d, "quotes"), "string:Here are two quotation marks: \"\". Simple enough.");
+    check_s("quote before close", kv(d, "q5"), "string:\"This,\" she said.\"");
+    check_s("multi-line literal", kv(d, "rawml"), "string:The first newline is\ntrimmed in raw strings.\n   All other whitespace\n   is preserved.\n");
+    check_s("literal quotes", kv(d, "lq"), "string:'That,' she said.'");
+    check_s("CRLF read as LF", bytes_of(toml_node_value(d, toml_lookup(d, "crlf"))), "97 10 98");
+    check_s("tab allowed", bytes_of(toml_node_value(d, toml_lookup(d, "tab"))), "97 9 98");
+    bad("unknown escape", "s = \"a\\qb\"\n");
+    bad("escape \\x (TOML 1.1)", "s = \"\\x41\"\n");
+    bad("escape \\e (TOML 1.1)", "s = \"\\e\"\n");
+    bad("short \\u", "s = \"\\u00G0\"\n");
+    bad("surrogate escape", "s = \"\\uD800\"\n");
+    bad("escape above 10FFFF", "s = \"\\U00110000\"\n");
+    bad("newline in basic string", "s = \"a\nb\"\n");
+    bad("unterminated basic", "s = \"abc\n");
+    bad("unterminated literal", "s = 'abc\n");
+    bad("three quotes inside", "s = \"\"\"Here are three quotation marks: \"\"\".\"\"\"\n");
+    bad("six quotes at end", "s = \"\"\"a\"\"\"\"\"\"\n");
+    bad("control char", "s = \"a" + tb("01") + "b\"\n");
+    bad("DEL in literal", "s = 'a" + tb("7f") + "'\n");
+    bad("lone CR in multi-line", "s = \"\"\"a" + tb("0d") + "b\"\"\"\n");
+    bad("invalid UTF-8", "s = \"" + tb("c3") + "\"\n");
+    bad("overlong UTF-8", "s = \"" + tb("c0af") + "\"\n");
+}
+
+fn spec_numbers() {
+    println("-- Integers");
+    var t: str = "a = +99\nb = 42\nc = 0\nd = -17\ne = 1_000\nf = 5_349_221\ng = 53_49_221\nh = 1_2_3_4_5\n";
+    t = t + "hex1 = 0xDEADBEEF\nhex2 = 0xdeadbeef\nhex3 = 0xdead_beef\noct1 = 0o01234567\noct2 = 0o755\n";
+    t = t + "bin1 = 0b11010110\nmax = 9223372036854775807\nmin = -9223372036854775808\n";
+    t = t + "mz = -0\npz = +0\nhexmax = 0x7FFFFFFFFFFFFFFF\nhex0 = 0x0\n";
+    val d: TomlDoc = toml_load(t);
+    check_s("ok", bool_to_str(d.ok) + d.error, "true");
+    check_s("plus", kv(d, "a"), "integer:99");
+    check_s("neg", kv(d, "d"), "integer:-17");
+    check_s("underscores", kv(d, "f"), "integer:5349221");
+    check_s("odd underscores", kv(d, "h"), "integer:12345");
+    check_s("hex", kv(d, "hex1"), "integer:3735928559");
+    check_s("hex lower", kv(d, "hex2"), "integer:3735928559");
+    check_s("hex underscore", kv(d, "hex3"), "integer:3735928559");
+    check_s("octal", kv(d, "oct1"), "integer:342391");
+    check_s("octal 755", kv(d, "oct2"), "integer:493");
+    check_s("binary", kv(d, "bin1"), "integer:214");
+    check_s("max", kv(d, "max"), "integer:9223372036854775807");
+    check_s("min", kv(d, "min"), "integer:-9223372036854775808");
+    check_s("-0", kv(d, "mz"), "integer:0");
+    check_s("+0", kv(d, "pz"), "integer:0");
+    check_s("hex max", kv(d, "hexmax"), "integer:9223372036854775807");
+    bad("leading zero", "x = 0123\n");
+    bad("leading underscore", "x = _123\n");
+    bad("trailing underscore", "x = 123_\n");
+    bad("double underscore", "x = 1__23\n");
+    bad("sign on hex", "x = +0xff\n");
+    bad("uppercase 0X", "x = 0XFF\n");
+    bad("bad octal digit", "x = 0o8\n");
+    bad("bad binary digit", "x = 0b102\n");
+    bad("above max", "x = 9223372036854775808\n");
+    bad("below min", "x = -9223372036854775809\n");
+    bad("hex above max", "x = 0x8000000000000000\n");
+    bad("empty hex", "x = 0x\n");
+    println("-- Floats");
+    var f: str = "f1 = +1.0\nf2 = 3.1415\nf3 = -0.01\nf4 = 5e+22\nf5 = 1e06\nf6 = -2E-2\nf7 = 6.626e-34\n";
+    f = f + "f8 = 224_617.445_991_228\nsf1 = inf\nsf2 = +inf\nsf3 = -inf\nsf4 = nan\nsf5 = +nan\nsf6 = -nan\n";
+    f = f + "z1 = 0.0\nz2 = -0.0\nz3 = 0e0\n";
+    val e: TomlDoc = toml_load(f);
+    check_s("ok", bool_to_str(e.ok) + e.error, "true");
+    check_s("plus", kv(e, "f1"), "float:1.0");
+    check_s("fraction", kv(e, "f2"), "float:3.1415");
+    check_s("exp plus", kv(e, "f4"), "float:5e22");
+    check_s("exp zeros", kv(e, "f5"), "float:1e06");
+    check_s("exp upper neg", kv(e, "f6"), "float:-2e-2");
+    check_s("both", kv(e, "f7"), "float:6.626e-34");
+    check_s("underscores", kv(e, "f8"), "float:224617.445991228");
+    check_s("inf", kv(e, "sf1") + " " + kv(e, "sf2") + " " + kv(e, "sf3"), "float:inf float:inf float:-inf");
+    check_s("nan", kv(e, "sf4") + " " + kv(e, "sf5") + " " + kv(e, "sf6"), "float:nan float:nan float:nan");
+    check_s("zeros", kv(e, "z1") + " " + kv(e, "z2") + " " + kv(e, "z3"), "float:0.0 float:-0.0 float:0e0");
+    bad("no digits before point", "x = .7\n");
+    bad("no digits after point", "x = 7.\n");
+    bad("point before exp", "x = 3.e+20\n");
+    bad("leading zero float", "x = 03.14\n");
+    bad("underscore at point", "x = 1_.5\n");
+    bad("exp without digits", "x = 1e\n");
+    bad("Inf capital", "x = Inf\n");
+    bad("nan with digits", "x = nan1\n");
+    println("-- Booleans");
+    val b: TomlDoc = toml_load("t = true\nf = false\n");
+    check_s("bools", kv(b, "t") + " " + kv(b, "f"), "bool:true bool:false");
+    bad("True", "x = True\n");
+    bad("truthy", "x = truee\n");
+}
+
+fn spec_dates() {
+    println("-- Date-times");
+    var t: str = "odt1 = 1979-05-27T07:32:00Z\nodt2 = 1979-05-27T00:32:00-07:00\n";
+    t = t + "odt3 = 1979-05-27T00:32:00.999999-07:00\nodt4 = 1979-05-27 07:32:00Z\n";
+    t = t + "odt5 = 1979-05-27t07:32:00z\nldt1 = 1979-05-27T07:32:00\nldt2 = 1979-05-27T00:32:00.999999\n";
+    t = t + "ld1 = 1979-05-27\nlt1 = 07:32:00\nlt2 = 00:32:00.999999\nleap = 2000-02-29\nsec60 = 1990-12-31T23:59:60Z\n";
+    t = t + "after = 1979-05-27 # space then comment\n";
+    val d: TomlDoc = toml_load(t);
+    check_s("ok", bool_to_str(d.ok) + d.error, "true");
+    check_s("offset Z", kv(d, "odt1"), "datetime:1979-05-27T07:32:00Z");
+    check_s("offset -07:00", kv(d, "odt2"), "datetime:1979-05-27T00:32:00-07:00");
+    check_s("fraction", kv(d, "odt3"), "datetime:1979-05-27T00:32:00.999999-07:00");
+    check_s("space separator", kv(d, "odt4"), "datetime:1979-05-27T07:32:00Z");
+    check_s("lower t and z", kv(d, "odt5"), "datetime:1979-05-27T07:32:00Z");
+    check_s("local date-time", kv(d, "ldt1"), "datetime-local:1979-05-27T07:32:00");
+    check_s("local fraction", kv(d, "ldt2"), "datetime-local:1979-05-27T00:32:00.999999");
+    check_s("local date", kv(d, "ld1"), "date-local:1979-05-27");
+    check_s("local time", kv(d, "lt1"), "time-local:07:32:00");
+    check_s("local time fraction", kv(d, "lt2"), "time-local:00:32:00.999999");
+    check_s("leap day", kv(d, "leap"), "date-local:2000-02-29");
+    check_s("leap second", kv(d, "sec60"), "datetime:1990-12-31T23:59:60Z");
+    check_s("date then comment", kv(d, "after"), "date-local:1979-05-27");
+    bad("Feb 29 1900", "x = 1900-02-29\n");
+    bad("month 13", "x = 2000-13-01\n");
+    bad("day 32", "x = 2000-01-32\n");
+    bad("April 31", "x = 2000-04-31\n");
+    bad("hour 24", "x = 2000-01-01T24:00:00\n");
+    bad("minute 60", "x = 12:60:00\n");
+    bad("second 61", "x = 12:00:61\n");
+    bad("no seconds (TOML 1.1)", "x = 12:00\n");
+    bad("one-digit month", "x = 2000-1-01\n");
+    bad("offset hour 24", "x = 2000-01-01T00:00:00+24:00\n");
+    bad("offset without colon", "x = 2000-01-01T00:00:00+0100\n");
+    bad("fraction without digits", "x = 2000-01-01T00:00:00.Z\n");
+    bad("T without time", "x = 2000-01-01T\n");
+}
+
+fn spec_arrays_tables() {
+    println("-- Arrays");
+    var t: str = "integers = [ 1, 2, 3 ]\ncolors = [ \"red\", \"yellow\", \"green\" ]\n";
+    t = t + "nested = [ [ 1, 2 ], [\"a\", \"b\", \"c\"] ]\nmixed = [ 0.1, 1, \"x\", true, 1979-05-27, \x7b a = 1 \x7d ]\n";
+    t = t + "multi = [\n  1,\n  2, # this is ok\n]\nempty = []\nnl = [\n]\n";
+    val d: TomlDoc = toml_load(t);
+    check_s("ok", bool_to_str(d.ok) + d.error, "true");
+    check_i("len", toml_node_len(d, toml_lookup(d, "integers")), 3);
+    check_s("element", kv(d, "colors.2"), "string:green");
+    check_s("nested", kv(d, "nested.1.0"), "string:a");
+    check_s("mixed kinds", toml_node_kind(d, toml_lookup(d, "mixed.0")) + " " + toml_node_kind(d, toml_lookup(d, "mixed.2"))
+            + " " + toml_node_kind(d, toml_lookup(d, "mixed.4")) + " " + toml_node_kind(d, toml_lookup(d, "mixed.5")),
+            "float string date-local table");
+    check_s("table in array", kv(d, "mixed.5.a"), "integer:1");
+    check_i("trailing comma", toml_node_len(d, toml_lookup(d, "multi")), 2);
+    check_i("empty", toml_node_len(d, toml_lookup(d, "empty")), 0);
+    check_i("empty multi-line", toml_node_len(d, toml_lookup(d, "nl")), 0);
+    check_i("out of range", toml_node_at(d, toml_lookup(d, "integers"), 3), -1);
+    bad("missing comma", "x = [1 2]\n");
+    bad("leading comma", "x = [,1]\n");
+    bad("two commas", "x = [1,,2]\n");
+    bad("unclosed", "x = [1, 2\n");
+    println("-- Inline tables");
+    var it: str = "name = \x7b first = \"Tom\", last = \"Preston-Werner\" \x7d\npoint = \x7b x = 1, y = 2 \x7d\n";
+    it = it + "animal = \x7b type.name = \"pug\" \x7d\nempty = \x7b\x7d\n";
+    val e: TomlDoc = toml_load(it);
+    check_s("ok", bool_to_str(e.ok) + e.error, "true");
+    check_s("field", kv(e, "name.last"), "string:Preston-Werner");
+    check_s("dotted inside", kv(e, "animal.type.name"), "string:pug");
+    check_i("empty", toml_node_len(e, toml_lookup(e, "empty")), 0);
+    bad("trailing comma", "x = \x7b a = 1, \x7d\n");
+    bad("newline inside (TOML 1.1)", "x = \x7b a = 1,\n b = 2 \x7d\n");
+    bad("added to by a header", "[product]\ntype = \x7b name = \"Nail\" \x7d\n[product.type.extra]\nx = 1\n");
+    bad("added to by dotted key", "[product]\ntype = \x7b name = \"Nail\" \x7d\ntype.edible = false\n");
+    bad("duplicate inside", "x = \x7b a = 1, a = 2 \x7d\n");
+    bad("inline then dotted inside", "x = \x7b a = \x7b b = 1 \x7d, a.c = 2 \x7d\n");
+    println("-- Tables");
+    var tb2: str = "[table-1]\nkey1 = \"some string\"\nkey2 = 123\n[dog.\"tater.man\"]\ntype.name = \"pug\"\n";
+    tb2 = tb2 + "[ j . \"ʞ\" . 'l' ]\nx = 1\n[x.y.z.w]\n[x]\n[fruit]\napple.color = \"red\"\napple.taste.sweet = true\n";
+    tb2 = tb2 + "[fruit.apple.texture]\nsmooth = true\n";
+    val f: TomlDoc = toml_load(tb2);
+    check_s("ok", bool_to_str(f.ok) + f.error, "true");
+    check_s("header", kv(f, "table-1.key2"), "integer:123");
+    check_s("quoted header part", toml_node_value(f, toml_node_child(f, toml_node_child(f,
+            toml_node_child(f, toml_lookup(f, "dog"), "tater.man"), "type"), "name")), "pug");
+    check_s("spaces in header", kv(f, "j.ʞ.l.x"), "integer:1");
+    check_s("super-table later", toml_node_kind(f, toml_lookup(f, "x.y.z.w")), "table");
+    check_s("sub-table of dotted", kv(f, "fruit.apple.texture.smooth"), "bool:true");
+    bad("table twice", "[fruit]\napple = \"red\"\n[fruit]\norange = \"orange\"\n");
+    bad("table over value", "[fruit]\napple = \"red\"\n[fruit.apple]\ntexture = \"smooth\"\n");
+    bad("header over dotted table", "[fruit]\napple.color = \"red\"\n[fruit.apple]\n");
+    bad("header over dotted sub-table", "[fruit]\napple.taste.sweet = true\n[fruit.apple.taste]\n");
+    bad("dotted keys into a header table", "[a.b.c]\nz = 9\n[a]\nb.c.t = 9\n");
+    bad("dotted table from another section", "a.b = 1\n[x]\n[a]\nc = 2\n");
+    bad("empty header", "[]\n");
+    bad("unclosed header", "[a\n");
+    bad("text after header", "[a] b = 1\n");
+    println("-- Arrays of tables");
+    var at: str = "[[products]]\nname = \"Hammer\"\nsku = 738594937\n[[products]]\n[[products]]\nname = \"Nail\"\n";
+    at = at + "[[fruits]]\nname = \"apple\"\n[fruits.physical]\ncolor = \"red\"\n[[fruits.varieties]]\nname = \"red delicious\"\n";
+    at = at + "[[fruits.varieties]]\nname = \"granny smith\"\n[[fruits]]\nname = \"banana\"\n[[fruits.varieties]]\nname = \"plantain\"\n";
+    val g: TomlDoc = toml_load(at);
+    check_s("ok", bool_to_str(g.ok) + g.error, "true");
+    check_i("products", toml_node_len(g, toml_lookup(g, "products")), 3);
+    check_i("empty element", toml_node_len(g, toml_lookup(g, "products.1")), 0);
+    check_s("element field", kv(g, "products.2.name"), "string:Nail");
+    check_s("sub-table of element", kv(g, "fruits.0.physical.color"), "string:red");
+    check_s("nested array", kv(g, "fruits.0.varieties.1.name"), "string:granny smith");
+    check_s("nested in second", kv(g, "fruits.1.varieties.0.name"), "string:plantain");
+    bad("table after array of tables", "[[fruits]]\nname = \"apple\"\n[fruits]\n");
+    bad("array of tables after table", "[fruit.physical]\ncolor = \"red\"\n[[fruit]]\n");
+    bad("array of tables over static array", "fruits = []\n[[fruits]]\n");
+    bad("sub-table before parent element", "[fruit.physical]\ncolor = \"red\"\n[[fruit]]\nname = \"x\"\n");
+    bad("header into static array", "a = [\x7b b = 1 \x7d]\n[a.c]\n");
+}
+
+fn api_and_errors() {
+    println("-- Errors and accessors");
+    val d: TomlDoc = toml_load("a = 1\nb = 2\n[t]\nc = 3\nc = 4\n");
+    check_s("error line", d.error, "line 5: duplicate key 'c'");
+    check_s("no json after an error", toml_to_json(d), "");
+    check_i("lookup after an error", toml_lookup(d, "a"), -1);
+    val e: TomlDoc = toml_load("# comment only\n\n");
+    check_s("empty document", toml_to_json(e), "\x7b\x7d");
+    val bom: TomlDoc = toml_load(tb("efbbbf") + "a = 1\n");
+    check_s("byte order mark", kv(bom, "a"), "integer:1");
+    check_s("missing path", toml_node_kind(e, toml_lookup(e, "nope")), "missing");
+    check_s("missing value", toml_node_value(e, -1), "");
+    // the flat form now reads multi-line arrays, inline tables and dates too
+    val flat: Vec<TomlEntry> = toml_parse("p = \x7b x = 1, y = \"two\" \x7d\nlist = [\n  1,\n  2,\n]\nwhen = 1979-05-27\ns = \"\"\"a\nb\"\"\"\n");
+    check_i("flat inline x", toml_get_int(flat, "p.x", 0), 1);
+    check_s("flat inline y", toml_get_str(flat, "p.y"), "two");
+    check_i("flat multi-line array", toml_get(flat, "list").items.len(), 2);
+    check_s("flat date", toml_kind(flat, "when") + ":" + toml_get_str(flat, "when"), "date-local:1979-05-27");
+    check_s("flat multi-line string", toml_get_str(flat, "s"), "a\nb");
+}
+
+
+// ─── toml-test cases ─────────────────────────────────────────────────────
+
+// valid cases (toml-test tests/valid/...)
+fn valid_0() {
+    ok("spec-1.0.0/array-0", "integers = [ 1, 2, 3 ]\ncolors = [ \"red\", \"yellow\", \"green\" ]\nnested_arrays_of_ints = [ [ 1, 2 ], [3, 4, 5] ]\nnested_mixed_array = [ [ 1, 2 ], [\"a\", \"b\", \"c\"] ]\nstring_array = [ \"all\", 'strings', \"\"\"are the same\"\"\", '''type''' ]\n\n# Mixed-type arrays are allowed\nnumbers = [ 0.1, 0.2, 0.5, 1, 2, 5 ]\ncontributors = [\n  \"Foo Bar <foo@example.com>\",\n  \x7b name = \"Baz Qux\", email = \"bazqux@example.com\", url = \"https://example.com/bazqux\" \x7d\n]\n",
+       "\x7b\"colors\":[\x7b\"type\":\"string\",\"value\":\"red\"\x7d,\x7b\"type\":\"string\",\"value\":\"yellow\"\x7d,\x7b\"type\":\"string\",\"value\":\"green\"\x7d],\"contributors\":[\x7b\"type\":\"string\",\"value\":\"Foo Bar <foo@example.com>\"\x7d,\x7b\"email\":\x7b\"type\":\"string\",\"value\":\"bazqux@example.com\"\x7d,\"name\":\x7b\"type\":\"string\",\"value\":\"Baz Qux\"\x7d,\"url\":\x7b\"type\":\"string\",\"value\":\"https://example.com/bazqux\"\x7d\x7d],\"integers\":[\x7b\"type\":\"integer\",\"value\":\"1\"\x7d,\x7b\"type\":\"integer\",\"value\":\"2\"\x7d,\x7b\"type\":\"integer\",\"value\":\"3\"\x7d],\"nested_arrays_of_ints\":[[\x7b\"type\":\"integer\",\"value\":\"1\"\x7d,\x7b\"type\":\"integer\",\"value\":\"2\"\x7d],[\x7b\"type\":\"integer\",\"value\":\"3\"\x7d,\x7b\"type\":\"integer\",\"value\":\"4\"\x7d,\x7b\"type\":\"integer\",\"value\":\"5\"\x7d]],\"nested_mixed_array\":[[\x7b\"type\":\"integer\",\"value\":\"1\"\x7d,\x7b\"type\":\"integer\",\"value\":\"2\"\x7d],[\x7b\"type\":\"string\",\"value\":\"a\"\x7d,\x7b\"type\":\"string\",\"value\":\"b\"\x7d,\x7b\"type\":\"string\",\"value\":\"c\"\x7d]],\"numbers\":[\x7b\"type\":\"float\",\"value\":\"0.1\"\x7d,\x7b\"type\":\"float\",\"value\":\"0.2\"\x7d,\x7b\"type\":\"float\",\"value\":\"0.5\"\x7d,\x7b\"type\":\"integer\",\"value\":\"1\"\x7d,\x7b\"type\":\"integer\",\"value\":\"2\"\x7d,\x7b\"type\":\"integer\",\"value\":\"5\"\x7d],\"string_array\":[\x7b\"type\":\"string\",\"value\":\"all\"\x7d,\x7b\"type\":\"string\",\"value\":\"strings\"\x7d,\x7b\"type\":\"string\",\"value\":\"are the same\"\x7d,\x7b\"type\":\"string\",\"value\":\"type\"\x7d]\x7d");
+    ok("spec-1.0.0/array-1", "integers2 = [\n  1, 2, 3\n]\n\nintegers3 = [\n  1,\n  2, # this is ok\n]\n",
+       "\x7b\"integers2\":[\x7b\"type\":\"integer\",\"value\":\"1\"\x7d,\x7b\"type\":\"integer\",\"value\":\"2\"\x7d,\x7b\"type\":\"integer\",\"value\":\"3\"\x7d],\"integers3\":[\x7b\"type\":\"integer\",\"value\":\"1\"\x7d,\x7b\"type\":\"integer\",\"value\":\"2\"\x7d]\x7d");
+    ok("spec-1.0.0/array-of-tables-0", "[[products]]\nname = \"Hammer\"\nsku = 738594937\n\n[[products]]  # empty table within the array\n\n[[products]]\nname = \"Nail\"\nsku = 284758393\n\ncolor = \"gray\"\n",
+       "\x7b\"products\":[\x7b\"name\":\x7b\"type\":\"string\",\"value\":\"Hammer\"\x7d,\"sku\":\x7b\"type\":\"integer\",\"value\":\"738594937\"\x7d\x7d,\x7b\x7d,\x7b\"color\":\x7b\"type\":\"string\",\"value\":\"gray\"\x7d,\"name\":\x7b\"type\":\"string\",\"value\":\"Nail\"\x7d,\"sku\":\x7b\"type\":\"integer\",\"value\":\"284758393\"\x7d\x7d]\x7d");
+    ok("spec-1.0.0/array-of-tables-1", "[[fruits]]\nname = \"apple\"\n\n[fruits.physical]  # subtable\ncolor = \"red\"\nshape = \"round\"\n\n[[fruits.varieties]]  # nested array of tables\nname = \"red delicious\"\n\n[[fruits.varieties]]\nname = \"granny smith\"\n\n\n[[fruits]]\nname = \"banana\"\n\n[[fruits.varieties]]\nname = \"plantain\"\n",
+       "\x7b\"fruits\":[\x7b\"name\":\x7b\"type\":\"string\",\"value\":\"apple\"\x7d,\"physical\":\x7b\"color\":\x7b\"type\":\"string\",\"value\":\"red\"\x7d,\"shape\":\x7b\"type\":\"string\",\"value\":\"round\"\x7d\x7d,\"varieties\":[\x7b\"name\":\x7b\"type\":\"string\",\"value\":\"red delicious\"\x7d\x7d,\x7b\"name\":\x7b\"type\":\"string\",\"value\":\"granny smith\"\x7d\x7d]\x7d,\x7b\"name\":\x7b\"type\":\"string\",\"value\":\"banana\"\x7d,\"varieties\":[\x7b\"name\":\x7b\"type\":\"string\",\"value\":\"plantain\"\x7d\x7d]\x7d]\x7d");
+    ok("spec-1.0.0/array-of-tables-2", "points = [ \x7b x = 1, y = 2, z = 3 \x7d,\n           \x7b x = 7, y = 8, z = 9 \x7d,\n           \x7b x = 2, y = 4, z = 8 \x7d ]\n",
+       "\x7b\"points\":[\x7b\"x\":\x7b\"type\":\"integer\",\"value\":\"1\"\x7d,\"y\":\x7b\"type\":\"integer\",\"value\":\"2\"\x7d,\"z\":\x7b\"type\":\"integer\",\"value\":\"3\"\x7d\x7d,\x7b\"x\":\x7b\"type\":\"integer\",\"value\":\"7\"\x7d,\"y\":\x7b\"type\":\"integer\",\"value\":\"8\"\x7d,\"z\":\x7b\"type\":\"integer\",\"value\":\"9\"\x7d\x7d,\x7b\"x\":\x7b\"type\":\"integer\",\"value\":\"2\"\x7d,\"y\":\x7b\"type\":\"integer\",\"value\":\"4\"\x7d,\"z\":\x7b\"type\":\"integer\",\"value\":\"8\"\x7d\x7d]\x7d");
+    ok("spec-1.0.0/boolean-0", "bool1 = true\nbool2 = false\n",
+       "\x7b\"bool1\":\x7b\"type\":\"bool\",\"value\":\"true\"\x7d,\"bool2\":\x7b\"type\":\"bool\",\"value\":\"false\"\x7d\x7d");
+    ok("spec-1.0.0/comment-0", "# This is a full-line comment\nkey = \"value\"  # This is a comment at the end of a line\nanother = \"# This is not a comment\"\n",
+       "\x7b\"another\":\x7b\"type\":\"string\",\"value\":\"# This is not a comment\"\x7d,\"key\":\x7b\"type\":\"string\",\"value\":\"value\"\x7d\x7d");
+    ok("spec-1.0.0/float-0", "# fractional\nflt1 = +1.0\nflt2 = 3.1415\nflt3 = -0.01\n\n# exponent\nflt4 = 5e+22\nflt5 = 1e06\nflt6 = -2E-2\n\n# both\nflt7 = 6.626e-34\n",
+       "\x7b\"flt1\":\x7b\"type\":\"float\",\"value\":\"1.0\"\x7d,\"flt2\":\x7b\"type\":\"float\",\"value\":\"3.1415\"\x7d,\"flt3\":\x7b\"type\":\"float\",\"value\":\"-0.01\"\x7d,\"flt4\":\x7b\"type\":\"float\",\"value\":\"5e22\"\x7d,\"flt5\":\x7b\"type\":\"float\",\"value\":\"1e06\"\x7d,\"flt6\":\x7b\"type\":\"float\",\"value\":\"-2e-2\"\x7d,\"flt7\":\x7b\"type\":\"float\",\"value\":\"6.626e-34\"\x7d\x7d");
+    ok("spec-1.0.0/float-1", "flt8 = 224_617.445_991_228\n",
+       "\x7b\"flt8\":\x7b\"type\":\"float\",\"value\":\"224617.445991228\"\x7d\x7d");
+    ok("spec-1.0.0/float-2", "# infinity\nsf1 = inf  # positive infinity\nsf2 = +inf # positive infinity\nsf3 = -inf # negative infinity\n\n# not a number\nsf4 = nan  # actual sNaN/qNaN encoding is implementation-specific\nsf5 = +nan # same as `nan`\nsf6 = -nan # valid, actual encoding is implementation-specific\n",
+       "\x7b\"sf1\":\x7b\"type\":\"float\",\"value\":\"inf\"\x7d,\"sf2\":\x7b\"type\":\"float\",\"value\":\"inf\"\x7d,\"sf3\":\x7b\"type\":\"float\",\"value\":\"-inf\"\x7d,\"sf4\":\x7b\"type\":\"float\",\"value\":\"nan\"\x7d,\"sf5\":\x7b\"type\":\"float\",\"value\":\"nan\"\x7d,\"sf6\":\x7b\"type\":\"float\",\"value\":\"nan\"\x7d\x7d");
+    ok("spec-1.0.0/inline-table-0", "name = \x7b first = \"Tom\", last = \"Preston-Werner\" \x7d\npoint = \x7b x = 1, y = 2 \x7d\nanimal = \x7b type.name = \"pug\" \x7d\n",
+       "\x7b\"animal\":\x7b\"type\":\x7b\"name\":\x7b\"type\":\"string\",\"value\":\"pug\"\x7d\x7d\x7d,\"name\":\x7b\"first\":\x7b\"type\":\"string\",\"value\":\"Tom\"\x7d,\"last\":\x7b\"type\":\"string\",\"value\":\"Preston-Werner\"\x7d\x7d,\"point\":\x7b\"x\":\x7b\"type\":\"integer\",\"value\":\"1\"\x7d,\"y\":\x7b\"type\":\"integer\",\"value\":\"2\"\x7d\x7d\x7d");
+    ok("spec-1.0.0/inline-table-1", "[name]\nfirst = \"Tom\"\nlast = \"Preston-Werner\"\n\n[point]\nx = 1\ny = 2\n\n[animal]\ntype.name = \"pug\"\n",
+       "\x7b\"animal\":\x7b\"type\":\x7b\"name\":\x7b\"type\":\"string\",\"value\":\"pug\"\x7d\x7d\x7d,\"name\":\x7b\"first\":\x7b\"type\":\"string\",\"value\":\"Tom\"\x7d,\"last\":\x7b\"type\":\"string\",\"value\":\"Preston-Werner\"\x7d\x7d,\"point\":\x7b\"x\":\x7b\"type\":\"integer\",\"value\":\"1\"\x7d,\"y\":\x7b\"type\":\"integer\",\"value\":\"2\"\x7d\x7d\x7d");
+    ok("spec-1.0.0/inline-table-2", "[product]\ntype = \x7b name = \"Nail\" \x7d\n# type.edible = false  # INVALID\n",
+       "\x7b\"product\":\x7b\"type\":\x7b\"name\":\x7b\"type\":\"string\",\"value\":\"Nail\"\x7d\x7d\x7d\x7d");
+    ok("spec-1.0.0/inline-table-3", "[product]\ntype.name = \"Nail\"\n# type = \x7b edible = false \x7d  # INVALID\n",
+       "\x7b\"product\":\x7b\"type\":\x7b\"name\":\x7b\"type\":\"string\",\"value\":\"Nail\"\x7d\x7d\x7d\x7d");
+    ok("spec-1.0.0/integer-0", "int1 = +99\nint2 = 42\nint3 = 0\nint4 = -17\n",
+       "\x7b\"int1\":\x7b\"type\":\"integer\",\"value\":\"99\"\x7d,\"int2\":\x7b\"type\":\"integer\",\"value\":\"42\"\x7d,\"int3\":\x7b\"type\":\"integer\",\"value\":\"0\"\x7d,\"int4\":\x7b\"type\":\"integer\",\"value\":\"-17\"\x7d\x7d");
+    ok("spec-1.0.0/integer-1", "int5 = 1_000\nint6 = 5_349_221\nint7 = 53_49_221  # Indian number system grouping\nint8 = 1_2_3_4_5  # VALID but discouraged\n",
+       "\x7b\"int5\":\x7b\"type\":\"integer\",\"value\":\"1000\"\x7d,\"int6\":\x7b\"type\":\"integer\",\"value\":\"5349221\"\x7d,\"int7\":\x7b\"type\":\"integer\",\"value\":\"5349221\"\x7d,\"int8\":\x7b\"type\":\"integer\",\"value\":\"12345\"\x7d\x7d");
+    ok("spec-1.0.0/integer-2", "# hexadecimal with prefix `0x`\nhex1 = 0xDEADBEEF\nhex2 = 0xdeadbeef\nhex3 = 0xdead_beef\n\n# octal with prefix `0o`\noct1 = 0o01234567\noct2 = 0o755 # useful for Unix file permissions\n\n# binary with prefix `0b`\nbin1 = 0b11010110\n",
+       "\x7b\"bin1\":\x7b\"type\":\"integer\",\"value\":\"214\"\x7d,\"hex1\":\x7b\"type\":\"integer\",\"value\":\"3735928559\"\x7d,\"hex2\":\x7b\"type\":\"integer\",\"value\":\"3735928559\"\x7d,\"hex3\":\x7b\"type\":\"integer\",\"value\":\"3735928559\"\x7d,\"oct1\":\x7b\"type\":\"integer\",\"value\":\"342391\"\x7d,\"oct2\":\x7b\"type\":\"integer\",\"value\":\"493\"\x7d\x7d");
+    ok("spec-1.0.0/key-value-pair-0", "key = \"value\"\n",
+       "\x7b\"key\":\x7b\"type\":\"string\",\"value\":\"value\"\x7d\x7d");
+    ok("spec-1.0.0/keys-0", "key = \"value\"\nbare_key = \"value\"\nbare-key = \"value\"\n1234 = \"value\"\n",
+       "\x7b\"1234\":\x7b\"type\":\"string\",\"value\":\"value\"\x7d,\"bare-key\":\x7b\"type\":\"string\",\"value\":\"value\"\x7d,\"bare_key\":\x7b\"type\":\"string\",\"value\":\"value\"\x7d,\"key\":\x7b\"type\":\"string\",\"value\":\"value\"\x7d\x7d");
+    ok("spec-1.0.0/keys-1", "\"127.0.0.1\" = \"value\"\n\"character encoding\" = \"value\"\n\"ʎǝʞ\" = \"value\"\n'key2' = \"value\"\n'quoted \"value\"' = \"value\"\n",
+       "\x7b\"127.0.0.1\":\x7b\"type\":\"string\",\"value\":\"value\"\x7d,\"character encoding\":\x7b\"type\":\"string\",\"value\":\"value\"\x7d,\"key2\":\x7b\"type\":\"string\",\"value\":\"value\"\x7d,\"quoted \\\"value\\\"\":\x7b\"type\":\"string\",\"value\":\"value\"\x7d,\"ʎǝʞ\":\x7b\"type\":\"string\",\"value\":\"value\"\x7d\x7d");
+}
+
+// valid cases (toml-test tests/valid/...)
+fn valid_1() {
+    ok("spec-1.0.0/keys-3", "name = \"Orange\"\nphysical.color = \"orange\"\nphysical.shape = \"round\"\nsite.\"google.com\" = true\n",
+       "\x7b\"name\":\x7b\"type\":\"string\",\"value\":\"Orange\"\x7d,\"physical\":\x7b\"color\":\x7b\"type\":\"string\",\"value\":\"orange\"\x7d,\"shape\":\x7b\"type\":\"string\",\"value\":\"round\"\x7d\x7d,\"site\":\x7b\"google.com\":\x7b\"type\":\"bool\",\"value\":\"true\"\x7d\x7d\x7d");
+    ok("spec-1.0.0/keys-4", "fruit.name = \"banana\"     # this is best practice\nfruit. color = \"yellow\"    # same as fruit.color\nfruit . flavor = \"banana\"   # same as fruit.flavor\n",
+       "\x7b\"fruit\":\x7b\"color\":\x7b\"type\":\"string\",\"value\":\"yellow\"\x7d,\"flavor\":\x7b\"type\":\"string\",\"value\":\"banana\"\x7d,\"name\":\x7b\"type\":\"string\",\"value\":\"banana\"\x7d\x7d\x7d");
+    ok("spec-1.0.0/keys-5", "# VALID BUT DISCOURAGED\n\napple.type = \"fruit\"\norange.type = \"fruit\"\n\napple.skin = \"thin\"\norange.skin = \"thick\"\n\napple.color = \"red\"\norange.color = \"orange\"\n",
+       "\x7b\"apple\":\x7b\"color\":\x7b\"type\":\"string\",\"value\":\"red\"\x7d,\"skin\":\x7b\"type\":\"string\",\"value\":\"thin\"\x7d,\"type\":\x7b\"type\":\"string\",\"value\":\"fruit\"\x7d\x7d,\"orange\":\x7b\"color\":\x7b\"type\":\"string\",\"value\":\"orange\"\x7d,\"skin\":\x7b\"type\":\"string\",\"value\":\"thick\"\x7d,\"type\":\x7b\"type\":\"string\",\"value\":\"fruit\"\x7d\x7d\x7d");
+    ok("spec-1.0.0/keys-6", "# RECOMMENDED\n\napple.type = \"fruit\"\napple.skin = \"thin\"\napple.color = \"red\"\n\norange.type = \"fruit\"\norange.skin = \"thick\"\norange.color = \"orange\"\n",
+       "\x7b\"apple\":\x7b\"color\":\x7b\"type\":\"string\",\"value\":\"red\"\x7d,\"skin\":\x7b\"type\":\"string\",\"value\":\"thin\"\x7d,\"type\":\x7b\"type\":\"string\",\"value\":\"fruit\"\x7d\x7d,\"orange\":\x7b\"color\":\x7b\"type\":\"string\",\"value\":\"orange\"\x7d,\"skin\":\x7b\"type\":\"string\",\"value\":\"thick\"\x7d,\"type\":\x7b\"type\":\"string\",\"value\":\"fruit\"\x7d\x7d\x7d");
+    ok("spec-1.0.0/keys-7", "3.14159 = \"pi\"\n",
+       "\x7b\"3\":\x7b\"14159\":\x7b\"type\":\"string\",\"value\":\"pi\"\x7d\x7d\x7d");
+    ok("spec-1.0.0/local-date-0", "ld1 = 1979-05-27\n",
+       "\x7b\"ld1\":\x7b\"type\":\"date-local\",\"value\":\"1979-05-27\"\x7d\x7d");
+    ok("spec-1.0.0/local-date-time-0", "ldt1 = 1979-05-27T07:32:00\nldt2 = 1979-05-27T00:32:00.999\n",
+       "\x7b\"ldt1\":\x7b\"type\":\"datetime-local\",\"value\":\"1979-05-27T07:32:00\"\x7d,\"ldt2\":\x7b\"type\":\"datetime-local\",\"value\":\"1979-05-27T00:32:00.999\"\x7d\x7d");
+    ok("spec-1.0.0/local-time-0", "lt1 = 07:32:00\nlt2 = 00:32:00.999\n",
+       "\x7b\"lt1\":\x7b\"type\":\"time-local\",\"value\":\"07:32:00\"\x7d,\"lt2\":\x7b\"type\":\"time-local\",\"value\":\"00:32:00.999\"\x7d\x7d");
+    ok("spec-1.0.0/offset-date-time-0", "odt1 = 1979-05-27T07:32:00Z\nodt2 = 1979-05-27T00:32:00-07:00\nodt3 = 1979-05-27T00:32:00.999-07:00\n",
+       "\x7b\"odt1\":\x7b\"type\":\"datetime\",\"value\":\"1979-05-27T07:32:00Z\"\x7d,\"odt2\":\x7b\"type\":\"datetime\",\"value\":\"1979-05-27T00:32:00-07:00\"\x7d,\"odt3\":\x7b\"type\":\"datetime\",\"value\":\"1979-05-27T00:32:00.999-07:00\"\x7d\x7d");
+    ok("spec-1.0.0/offset-date-time-1", "odt4 = 1979-05-27 07:32:00Z\n",
+       "\x7b\"odt4\":\x7b\"type\":\"datetime\",\"value\":\"1979-05-27T07:32:00Z\"\x7d\x7d");
+    ok("spec-1.0.0/string-0", "str = \"I'm a string. \\\"You can quote me\\\". Name\\tJos\\u00E9\\nLocation\\tSF.\"\n",
+       "\x7b\"str\":\x7b\"type\":\"string\",\"value\":\"I'm a string. \\\"You can quote me\\\". Name\\tJosé\\nLocation\\tSF.\"\x7d\x7d");
+    ok("spec-1.0.0/string-1", "str1 = \"\"\"\nRoses are red\nViolets are blue\"\"\"\n",
+       "\x7b\"str1\":\x7b\"type\":\"string\",\"value\":\"Roses are red\\nViolets are blue\"\x7d\x7d");
+    ok("spec-1.0.0/string-2", "# On a Unix system, the above multi-line string will most likely be the same as:\nstr2 = \"Roses are red\\nViolets are blue\"\n\n# On a Windows system, it will most likely be equivalent to:\nstr3 = \"Roses are red\\r\\nViolets are blue\"\n",
+       "\x7b\"str2\":\x7b\"type\":\"string\",\"value\":\"Roses are red\\nViolets are blue\"\x7d,\"str3\":\x7b\"type\":\"string\",\"value\":\"Roses are red\\r\\nViolets are blue\"\x7d\x7d");
+    ok("spec-1.0.0/string-3", "# The following strings are byte-for-byte equivalent:\nstr1 = \"The quick brown fox jumps over the lazy dog.\"\n\nstr2 = \"\"\"\nThe quick brown \\\n\n\n  fox jumps over \\\n    the lazy dog.\"\"\"\n\nstr3 = \"\"\"\\\n       The quick brown \\\n       fox jumps over \\\n       the lazy dog.\\\n       \"\"\"\n",
+       "\x7b\"str1\":\x7b\"type\":\"string\",\"value\":\"The quick brown fox jumps over the lazy dog.\"\x7d,\"str2\":\x7b\"type\":\"string\",\"value\":\"The quick brown fox jumps over the lazy dog.\"\x7d,\"str3\":\x7b\"type\":\"string\",\"value\":\"The quick brown fox jumps over the lazy dog.\"\x7d\x7d");
+    ok("spec-1.0.0/string-4", "str4 = \"\"\"Here are two quotation marks: \"\". Simple enough.\"\"\"\n# str5 = \"\"\"Here are three quotation marks: \"\"\".\"\"\"  # INVALID\nstr5 = \"\"\"Here are three quotation marks: \"\"\\\".\"\"\"\nstr6 = \"\"\"Here are fifteen quotation marks: \"\"\\\"\"\"\\\"\"\"\\\"\"\"\\\"\"\"\\\".\"\"\"\n\n# \"This,\" she said, \"is just a pointless statement.\"\nstr7 = \"\"\"\"This,\" she said, \"is just a pointless statement.\"\"\"\"\n",
+       "\x7b\"str4\":\x7b\"type\":\"string\",\"value\":\"Here are two quotation marks: \\\"\\\". Simple enough.\"\x7d,\"str5\":\x7b\"type\":\"string\",\"value\":\"Here are three quotation marks: \\\"\\\"\\\".\"\x7d,\"str6\":\x7b\"type\":\"string\",\"value\":\"Here are fifteen quotation marks: \\\"\\\"\\\"\\\"\\\"\\\"\\\"\\\"\\\"\\\"\\\"\\\"\\\"\\\"\\\".\"\x7d,\"str7\":\x7b\"type\":\"string\",\"value\":\"\\\"This,\\\" she said, \\\"is just a pointless statement.\\\"\"\x7d\x7d");
+    ok("spec-1.0.0/string-5", "# What you see is what you get.\nwinpath  = 'C:\\Users\\nodejs\\templates'\nwinpath2 = '\\\\ServerX\\admin$\\system32\\'\nquoted   = 'Tom \"Dubs\" Preston-Werner'\nregex    = '<\\i\\c*\\s*>'\n",
+       "\x7b\"quoted\":\x7b\"type\":\"string\",\"value\":\"Tom \\\"Dubs\\\" Preston-Werner\"\x7d,\"regex\":\x7b\"type\":\"string\",\"value\":\"<\\\\i\\\\c*\\\\s*>\"\x7d,\"winpath\":\x7b\"type\":\"string\",\"value\":\"C:\\\\Users\\\\nodejs\\\\templates\"\x7d,\"winpath2\":\x7b\"type\":\"string\",\"value\":\"\\\\\\\\ServerX\\\\admin$\\\\system32\\\\\"\x7d\x7d");
+    ok("spec-1.0.0/string-6", "regex2 = '''I [dw]on't need \\d\x7b2\x7d apples'''\nlines  = '''\nThe first newline is\ntrimmed in raw strings.\n   All other whitespace\n   is preserved.\n'''\n",
+       "\x7b\"lines\":\x7b\"type\":\"string\",\"value\":\"The first newline is\\ntrimmed in raw strings.\\n   All other whitespace\\n   is preserved.\\n\"\x7d,\"regex2\":\x7b\"type\":\"string\",\"value\":\"I [dw]on't need \\\\d\x7b2\x7d apples\"\x7d\x7d");
+    ok("spec-1.0.0/string-7", "quot15 = '''Here are fifteen quotation marks: \"\"\"\"\"\"\"\"\"\"\"\"\"\"\"'''\n\n# apos15 = '''Here are fifteen apostrophes: ''''''''''''''''''  # INVALID\napos15 = \"Here are fifteen apostrophes: '''''''''''''''\"\n\n# 'That,' she said, 'is still pointless.'\nstr = ''''That,' she said, 'is still pointless.''''\n",
+       "\x7b\"apos15\":\x7b\"type\":\"string\",\"value\":\"Here are fifteen apostrophes: '''''''''''''''\"\x7d,\"quot15\":\x7b\"type\":\"string\",\"value\":\"Here are fifteen quotation marks: \\\"\\\"\\\"\\\"\\\"\\\"\\\"\\\"\\\"\\\"\\\"\\\"\\\"\\\"\\\"\"\x7d,\"str\":\x7b\"type\":\"string\",\"value\":\"'That,' she said, 'is still pointless.'\"\x7d\x7d");
+    ok("spec-1.0.0/table-0", "[table]\n",
+       "\x7b\"table\":\x7b\x7d\x7d");
+    ok("spec-1.0.0/table-1", "[table-1]\nkey1 = \"some string\"\nkey2 = 123\n\n[table-2]\nkey1 = \"another string\"\nkey2 = 456\n",
+       "\x7b\"table-1\":\x7b\"key1\":\x7b\"type\":\"string\",\"value\":\"some string\"\x7d,\"key2\":\x7b\"type\":\"integer\",\"value\":\"123\"\x7d\x7d,\"table-2\":\x7b\"key1\":\x7b\"type\":\"string\",\"value\":\"another string\"\x7d,\"key2\":\x7b\"type\":\"integer\",\"value\":\"456\"\x7d\x7d\x7d");
+}
+
+// valid cases (toml-test tests/valid/...)
+fn valid_2() {
+    ok("spec-1.0.0/table-2", "[dog.\"tater.man\"]\ntype.name = \"pug\"\n",
+       "\x7b\"dog\":\x7b\"tater.man\":\x7b\"type\":\x7b\"name\":\x7b\"type\":\"string\",\"value\":\"pug\"\x7d\x7d\x7d\x7d\x7d");
+    ok("spec-1.0.0/table-3", "[a.b.c]            # this is best practice\n[ d.e.f ]          # same as [d.e.f]\n[ g .  h  . i ]    # same as [g.h.i]\n[ j . \"ʞ\" . 'l' ]  # same as [j.\"ʞ\".'l']\n",
+       "\x7b\"a\":\x7b\"b\":\x7b\"c\":\x7b\x7d\x7d\x7d,\"d\":\x7b\"e\":\x7b\"f\":\x7b\x7d\x7d\x7d,\"g\":\x7b\"h\":\x7b\"i\":\x7b\x7d\x7d\x7d,\"j\":\x7b\"ʞ\":\x7b\"l\":\x7b\x7d\x7d\x7d\x7d");
+    ok("spec-1.0.0/table-4", "# [x] you\n# [x.y] don't\n# [x.y.z] need these\n[x.y.z.w] # for this to work\n\n[x] # defining a super-table afterward is ok\n",
+       "\x7b\"x\":\x7b\"y\":\x7b\"z\":\x7b\"w\":\x7b\x7d\x7d\x7d\x7d\x7d");
+    ok("spec-1.0.0/table-5", "# VALID BUT DISCOURAGED\n[fruit.apple]\n[animal]\n[fruit.orange]\n",
+       "\x7b\"animal\":\x7b\x7d,\"fruit\":\x7b\"apple\":\x7b\x7d,\"orange\":\x7b\x7d\x7d\x7d");
+    ok("spec-1.0.0/table-6", "# RECOMMENDED\n[fruit.apple]\n[fruit.orange]\n[animal]\n",
+       "\x7b\"animal\":\x7b\x7d,\"fruit\":\x7b\"apple\":\x7b\x7d,\"orange\":\x7b\x7d\x7d\x7d");
+    ok("spec-1.0.0/table-7", "# Top-level table begins.\nname = \"Fido\"\nbreed = \"pug\"\n\n# Top-level table ends.\n[owner]\nname = \"Regina Dogman\"\nmember_since = 1999-08-04\n",
+       "\x7b\"breed\":\x7b\"type\":\"string\",\"value\":\"pug\"\x7d,\"name\":\x7b\"type\":\"string\",\"value\":\"Fido\"\x7d,\"owner\":\x7b\"member_since\":\x7b\"type\":\"date-local\",\"value\":\"1999-08-04\"\x7d,\"name\":\x7b\"type\":\"string\",\"value\":\"Regina Dogman\"\x7d\x7d\x7d");
+    ok("spec-1.0.0/table-8", "fruit.apple.color = \"red\"\n# Defines a table named fruit\n# Defines a table named fruit.apple\n\nfruit.apple.taste.sweet = true\n# Defines a table named fruit.apple.taste\n# fruit and fruit.apple were already created\n",
+       "\x7b\"fruit\":\x7b\"apple\":\x7b\"color\":\x7b\"type\":\"string\",\"value\":\"red\"\x7d,\"taste\":\x7b\"sweet\":\x7b\"type\":\"bool\",\"value\":\"true\"\x7d\x7d\x7d\x7d\x7d");
+    ok("spec-1.0.0/table-9", "[fruit]\napple.color = \"red\"\napple.taste.sweet = true\n\n# [fruit.apple]  # INVALID\n# [fruit.apple.taste]  # INVALID\n\n[fruit.apple.texture]  # you can add sub-tables\nsmooth = true\n",
+       "\x7b\"fruit\":\x7b\"apple\":\x7b\"color\":\x7b\"type\":\"string\",\"value\":\"red\"\x7d,\"taste\":\x7b\"sweet\":\x7b\"type\":\"bool\",\"value\":\"true\"\x7d\x7d,\"texture\":\x7b\"smooth\":\x7b\"type\":\"bool\",\"value\":\"true\"\x7d\x7d\x7d\x7d\x7d");
+}
+
+// invalid cases (toml-test tests/invalid/...)
+fn invalid_0() {
+    bad("spec-1.0.0/inline-table-2-0", "[product]\ntype = \x7b name = \"Nail\" \x7d\ntype.edible = false  # INVALID\n");
+    bad("spec-1.0.0/inline-table-3-0", "[product]\ntype.name = \"Nail\"\ntype = \x7b edible = false \x7d  # INVALID\n");
+    bad("spec-1.0.0/key-value-pair-1", "key = # INVALID\n");
+    bad("spec-1.0.0/keys-2", "= \"no key name\"  # INVALID\n\"\" = \"blank\"     # VALID but discouraged\n'' = 'blank'     # VALID but discouraged\n");
+    bad("spec-1.0.0/string-4-0", "str4 = \"\"\"Here are two quotation marks: \"\". Simple enough.\"\"\"\nstr5 = \"\"\"Here are three quotation marks: \"\"\".\"\"\"  # INVALID\nstr5 = \"\"\"Here are three quotation marks: \"\"\\\".\"\"\"\nstr6 = \"\"\"Here are fifteen quotation marks: \"\"\\\"\"\"\\\"\"\"\\\"\"\"\\\"\"\"\\\".\"\"\"\n\n# \"This,\" she said, \"is just a pointless statement.\"\nstr7 = \"\"\"\"This,\" she said, \"is just a pointless statement.\"\"\"\"\n");
+    bad("spec-1.0.0/string-7-0", "quot15 = '''Here are fifteen quotation marks: \"\"\"\"\"\"\"\"\"\"\"\"\"\"\"'''\n\napos15 = '''Here are fifteen apostrophes: ''''''''''''''''''  # INVALID\napos15 = \"Here are fifteen apostrophes: '''''''''''''''\"\n\n# 'That,' she said, 'is still pointless.'\nstr = ''''That,' she said, 'is still pointless.''''\n");
+    bad("spec-1.0.0/table-9-0", "[fruit]\napple.color = \"red\"\napple.taste.sweet = true\n\n[fruit.apple]  # INVALID\n# [fruit.apple.taste]  # INVALID\n\n[fruit.apple.texture]  # you can add sub-tables\nsmooth = true\n");
+    bad("spec-1.0.0/table-9-1", "[fruit]\napple.color = \"red\"\napple.taste.sweet = true\n\n# [fruit.apple]  # INVALID\n[fruit.apple.taste]  # INVALID\n\n[fruit.apple.texture]  # you can add sub-tables\nsmooth = true\n");
+}
+
+fn main() -> i64 {
+    spec_keys();
+    spec_strings();
+    spec_numbers();
+    spec_dates();
+    spec_arrays_tables();
+    api_and_errors();
+    valid_0();
+    valid_1();
+    valid_2();
+    invalid_0();
+    println("test_toml_spec ok");
+    return 0;
+}

@@ -1,0 +1,209 @@
+// stdlib/yaml against YAML 1.2.2 (https://yaml.org/spec/1.2.2/): the
+// examples of chapter 2 ("Language Overview", 2.1 to 2.28), each read with
+// yaml_load (or yaml_load_all for the streams) and its entries compared
+// with what the specification says the example means. Examples 2.11 and
+// 2.25 use explicit "? " keys, which stdlib/yaml does not support: they
+// must be rejected. Then the parts the examples leave out: block scalar
+// chomping and indentation indicators, every double-quoted escape, folding
+// of quoted scalars, flow collections over lines, and documents yaml_load
+// rejects. Entries print as path=kind:value, ';' between them, a line
+// break inside a value as \n.
+use yaml;
+
+fn esc(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if c == 10 { out = out + "\\n"; }
+        else if c == 9 { out = out + "\\t"; }
+        else if c == 13 { out = out + "\\r"; }
+        else if c < 32 || c == 127 {
+            val hx: str = "0123456789abcdef";
+            out = out + "\\x" + str_slice(hx, c / 16, c / 16 + 1) + str_slice(hx, c % 16, c % 16 + 1);
+        }
+        else { out = out + str_slice(s, i, i + 1); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn dump(es: Vec<YamlEntry>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < es.len() {
+        var e: YamlEntry = es.get(i);
+        if i > 0 { out = out + "; "; }
+        out = out + e.path + "=" + e.value.kind + ":" + esc(e.value.sval);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn same(name: str, got: str, want: str) {
+    println(name + ": " + got);
+    if !str_equal(got, want) {
+        println(name + ": want " + want);
+        p_panic("yaml spec: " + name + " read wrong");
+    }
+}
+
+// one document
+fn ex(name: str, text: str, want: str) {
+    val d: YamlDoc = yaml_load(text);
+    if !d.ok {
+        println(name + ": rejected: " + d.error);
+        p_panic("yaml spec: " + name + " should be read");
+    }
+    same(name, dump(d.entries), want);
+}
+
+// a stream: the documents' dumps joined by " | "
+fn exs(name: str, text: str, want: str) {
+    val ds: Vec<YamlDoc> = yaml_load_all(text);
+    var out: str = "";
+    var k: i64 = 0;
+    while k < ds.len() {
+        val d: YamlDoc = ds.get(k);
+        if !d.ok {
+            println(name + ": document " + int_to_str(k) + " rejected: " + d.error);
+            p_panic("yaml spec: " + name + " should be read");
+        }
+        if k > 0 { out = out + " | "; }
+        out = out + dump(d.entries);
+        k = k + 1;
+    }
+    same(name, out, want);
+}
+
+fn bad(name: str, text: str) {
+    val d: YamlDoc = yaml_load(text);
+    if d.ok {
+        println(name + ": accepted: " + dump(d.entries));
+        p_panic("yaml spec: " + name + " should be rejected");
+    }
+    println(name + ": rejected (" + d.error + ")");
+}
+
+fn chapter2_collections() {
+    println("-- 2.1 Collections");
+    ex("2.1 sequence of scalars", "- Mark McGwire\n- Sammy Sosa\n- Ken Griffey\n",
+       "0=str:Mark McGwire; 1=str:Sammy Sosa; 2=str:Ken Griffey");
+    ex("2.2 mapping scalars to scalars", "hr:  65    # Home runs\navg: 0.278 # Batting average\nrbi: 147   # Runs Batted In\n",
+       "hr=int:65; avg=float:0.278; rbi=int:147");
+    ex("2.3 mapping scalars to sequences", "american:\n- Boston Red Sox\n- Detroit Tigers\n- New York Yankees\nnational:\n- New York Mets\n- Chicago Cubs\n- Atlanta Braves\n",
+       "american=list:; american.0=str:Boston Red Sox; american.1=str:Detroit Tigers; american.2=str:New York Yankees; national=list:; national.0=str:New York Mets; national.1=str:Chicago Cubs; national.2=str:Atlanta Braves");
+    ex("2.4 sequence of mappings", "-\n  name: Mark McGwire\n  hr:   65\n  avg:  0.278\n-\n  name: Sammy Sosa\n  hr:   63\n  avg:  0.288\n",
+       "0=map:; 0.name=str:Mark McGwire; 0.hr=int:65; 0.avg=float:0.278; 1=map:; 1.name=str:Sammy Sosa; 1.hr=int:63; 1.avg=float:0.288");
+    ex("2.5 sequence of sequences", "- [name        , hr, avg  ]\n- [Mark McGwire, 65, 0.278]\n- [Sammy Sosa  , 63, 0.288]\n",
+       "0=list:; 0.0=str:name; 0.1=str:hr; 0.2=str:avg; 1=list:; 1.0=str:Mark McGwire; 1.1=int:65; 1.2=float:0.278; 2=list:; 2.0=str:Sammy Sosa; 2.1=int:63; 2.2=float:0.288");
+    ex("2.6 mapping of mappings", "Mark McGwire: \x7bhr: 65, avg: 0.278\x7d\nSammy Sosa: \x7b\n    hr: 63,\n    avg: 0.288,\n \x7d\n",
+       "Mark McGwire=map:; Mark McGwire.hr=int:65; Mark McGwire.avg=float:0.278; Sammy Sosa=map:; Sammy Sosa.hr=int:63; Sammy Sosa.avg=float:0.288");
+    println("-- 2.2 Structures");
+    exs("2.7 two documents in a stream", "# Ranking of 1998 home runs\n---\n- Mark McGwire\n- Sammy Sosa\n- Ken Griffey\n\n# Team ranking\n---\n- Chicago Cubs\n- St Louis Cardinals\n",
+       "0=str:Mark McGwire; 1=str:Sammy Sosa; 2=str:Ken Griffey | 0=str:Chicago Cubs; 1=str:St Louis Cardinals");
+    exs("2.8 play by play feed", "---\ntime: 20:03:20\nplayer: Sammy Sosa\naction: strike (miss)\n...\n---\ntime: 20:03:47\nplayer: Sammy Sosa\naction: grand slam\n...\n",
+       "time=str:20:03:20; player=str:Sammy Sosa; action=str:strike (miss) | time=str:20:03:47; player=str:Sammy Sosa; action=str:grand slam");
+    ex("2.9 single document with two comments", "---\nhr: # 1998 hr ranking\n- Mark McGwire\n- Sammy Sosa\n# 1998 rbi ranking\nrbi:\n- Sammy Sosa\n- Ken Griffey\n",
+       "hr=list:; hr.0=str:Mark McGwire; hr.1=str:Sammy Sosa; rbi=list:; rbi.0=str:Sammy Sosa; rbi.1=str:Ken Griffey");
+    ex("2.10 node appears twice (anchor, alias)", "---\nhr:\n- Mark McGwire\n# Following node labeled SS\n- &SS Sammy Sosa\nrbi:\n- *SS # Subsequent occurrence\n- Ken Griffey\n",
+       "hr=list:; hr.0=str:Mark McGwire; hr.1=str:Sammy Sosa; rbi=list:; rbi.0=str:Sammy Sosa; rbi.1=str:Ken Griffey");
+    bad("2.11 mapping between sequences (? keys)", "? - Detroit Tigers\n  - Chicago cubs\n: - 2001-07-23\n\n? [ New York Yankees,\n    Atlanta Braves ]\n: [ 2001-07-02, 2001-08-12,\n    2001-08-14 ]\n");
+    ex("2.12 compact nested mapping", "---\n# Products purchased\n- item    : Super Hoop\n  quantity: 1\n- item    : Basketball\n  quantity: 4\n- item    : Big Shoes\n  quantity: 1\n",
+       "0=map:; 0.item=str:Super Hoop; 0.quantity=int:1; 1=map:; 1.item=str:Basketball; 1.quantity=int:4; 2=map:; 2.item=str:Big Shoes; 2.quantity=int:1");
+}
+
+fn chapter2_scalars() {
+    println("-- 2.3 Scalars");
+    ex("2.13 literal block", "# ASCII Art\n--- |\n  \\//||\\/||\n  // ||  ||__\n",
+       "=str:\\//||\\/||\\n// ||  ||__\\n");
+    ex("2.14 folded block", "--- >\n  Mark McGwire's\n  year was crippled\n  by a knee injury.\n",
+       "=str:Mark McGwire's year was crippled by a knee injury.\\n");
+    ex("2.15 folded, more indented and blank lines", ">\n Sammy Sosa completed another\n fine season with great stats.\n\n   63 Home Runs\n   0.288 Batting Average\n\n What a year!\n",
+       "=str:Sammy Sosa completed another fine season with great stats.\\n\\n  63 Home Runs\\n  0.288 Batting Average\\n\\nWhat a year!\\n");
+    ex("2.16 indentation determines scope", "name: Mark McGwire\naccomplishment: >\n  Mark set a major league\n  home run record in 1998.\nstats: |\n  65 Home Runs\n  0.278 Batting Average\n",
+       "name=str:Mark McGwire; accomplishment=str:Mark set a major league home run record in 1998.\\n; stats=str:65 Home Runs\\n0.278 Batting Average\\n");
+    ex("2.17 quoted scalars", "unicode: \"Sosa did fine.\\u263A\"\ncontrol: \"\\b1998\\t1999\\t2000\\n\"\nhex esc: \"\\x0d\\x0a is \\r\\n\"\n\nsingle: '\"Howdy!\" he cried.'\nquoted: ' # Not a ''comment''.'\ntie-fighter: '|\\-*-/|'\n",
+       "unicode=str:Sosa did fine.☺; control=str:\\x081998\\t1999\\t2000\\n; hex esc=str:\\r\\n is \\r\\n; single=str:\"Howdy!\" he cried.; quoted=str: # Not a 'comment'.; tie-fighter=str:|\\-*-/|");
+    ex("2.18 multi-line flow scalars", "plain:\n  This unquoted scalar\n  spans many lines.\n\nquoted: \"So does this\n  quoted scalar.\\n\"\n",
+       "plain=str:This unquoted scalar spans many lines.; quoted=str:So does this quoted scalar.\\n");
+    println("-- 2.4 Tags");
+    ex("2.19 integers", "canonical: 12345\ndecimal: +12345\noctal: 0o14\nhexadecimal: 0xC\n",
+       "canonical=int:12345; decimal=int:+12345; octal=int:0o14; hexadecimal=int:0xC");
+    ex("2.20 floating point", "canonical: 1.23015e+3\nexponential: 12.3015e+02\nfixed: 1230.15\nnegative infinity: -.inf\nnot a number: .nan\n",
+       "canonical=float:1.23015e+3; exponential=float:12.3015e+02; fixed=float:1230.15; negative infinity=float:-.inf; not a number=float:.nan");
+    ex("2.21 miscellaneous", "null:\nbooleans: [ true, false ]\nstring: '012345'\n",
+       "null=null:; booleans=list:; booleans.0=bool:true; booleans.1=bool:false; string=str:012345");
+    ex("2.22 timestamps (strings in the core schema)", "canonical: 2001-12-15T02:59:43.1Z\niso8601: 2001-12-14t21:59:43.10-05:00\nspaced: 2001-12-14 21:59:43.10 -5\ndate: 2002-12-14\n",
+       "canonical=str:2001-12-15T02:59:43.1Z; iso8601=str:2001-12-14t21:59:43.10-05:00; spaced=str:2001-12-14 21:59:43.10 -5; date=str:2002-12-14");
+    ex("2.23 various explicit tags", "---\nnot-date: !!str 2002-04-28\n\npicture: !!binary |\n R0lGODlhDAAMAIQAAP//9/X\n 17unp5WZmZgAAAOfn515eXv\n Pz7Y6OjuDg4J+fn5OTk6enp\n 56enmleECcgggoBADs=\n\napplication specific tag: !something |\n The semantics of the tag\n above may be different for\n different documents.\n",
+       "not-date=str:2002-04-28; picture=str:R0lGODlhDAAMAIQAAP//9/X\\n17unp5WZmZgAAAOfn515eXv\\nPz7Y6OjuDg4J+fn5OTk6enp\\n56enmleECcgggoBADs=\\n; application specific tag=str:The semantics of the tag\\nabove may be different for\\ndifferent documents.\\n");
+    ex("2.24 global tags", "%TAG ! tag:clarkevans.com,2002:\n--- !shape\n  # Use the ! handle for presenting\n  # tag:clarkevans.com,2002:circle\n- !circle\n  center: &ORIGIN \x7bx: 73, y: 129\x7d\n  radius: 7\n- !line\n  start: *ORIGIN\n  finish: \x7b x: 89, y: 102 \x7d\n- !label\n  start: *ORIGIN\n  color: 0xFFEEBB\n  text: Pretty vector drawing.\n",
+       "0=map:; 0.center=map:; 0.center.x=int:73; 0.center.y=int:129; 0.radius=int:7; 1=map:; 1.start=map:; 1.start.x=int:73; 1.start.y=int:129; 1.finish=map:; 1.finish.x=int:89; 1.finish.y=int:102; 2=map:; 2.start=map:; 2.start.x=int:73; 2.start.y=int:129; 2.color=int:0xFFEEBB; 2.text=str:Pretty vector drawing.");
+    bad("2.25 unordered sets (? keys)", "# Sets are represented as a\n# Mapping where each key is\n# associated with a null value\n--- !!set\n? Mark McGwire\n? Sammy Sosa\n? Ken Griffey\n");
+    ex("2.26 ordered mappings", "# Ordered maps are represented as\n# A sequence of mappings, with\n# each mapping having one key\n--- !!omap\n- Mark McGwire: 65\n- Sammy Sosa: 63\n- Ken Griffy: 58\n",
+       "0=map:; 0.Mark McGwire=int:65; 1=map:; 1.Sammy Sosa=int:63; 2=map:; 2.Ken Griffy=int:58");
+}
+
+fn chapter2_full() {
+    println("-- 2.5 Full length examples");
+    ex("2.27 invoice", "--- !<tag:clarkevans.com,2002:invoice>\ninvoice: 34843\ndate   : 2001-01-23\nbill-to: &id001\n  given  : Chris\n  family : Dumars\n  address:\n    lines: |\n      458 Walkman Dr.\n      Suite #292\n    city    : Royal Oak\n    state   : MI\n    postal  : 48046\nship-to: *id001\nproduct:\n- sku         : BL394D\n  quantity    : 4\n  description : Basketball\n  price       : 450.00\n- sku         : BL4438H\n  quantity    : 1\n  description : Super Hoop\n  price       : 2392.00\ntax  : 251.42\ntotal: 4443.52\ncomments:\n  Late afternoon is best.\n  Backup contact is Nancy\n  Billsmer @ 338-4338.\n",
+       "invoice=int:34843; date=str:2001-01-23; bill-to=map:; bill-to.given=str:Chris; bill-to.family=str:Dumars; bill-to.address=map:; bill-to.address.lines=str:458 Walkman Dr.\\nSuite #292\\n; bill-to.address.city=str:Royal Oak; bill-to.address.state=str:MI; bill-to.address.postal=int:48046; ship-to=map:; ship-to.given=str:Chris; ship-to.family=str:Dumars; ship-to.address=map:; ship-to.address.lines=str:458 Walkman Dr.\\nSuite #292\\n; ship-to.address.city=str:Royal Oak; ship-to.address.state=str:MI; ship-to.address.postal=int:48046; product=list:; product.0=map:; product.0.sku=str:BL394D; product.0.quantity=int:4; product.0.description=str:Basketball; product.0.price=float:450.00; product.1=map:; product.1.sku=str:BL4438H; product.1.quantity=int:1; product.1.description=str:Super Hoop; product.1.price=float:2392.00; tax=float:251.42; total=float:4443.52; comments=str:Late afternoon is best. Backup contact is Nancy Billsmer @ 338-4338.");
+    exs("2.28 log file", "---\nTime: 2001-11-23 15:01:42 -5\nUser: ed\nWarning:\n  This is an error message\n  for the log file\n---\nTime: 2001-11-23 15:02:31 -5\nUser: ed\nWarning:\n  A slightly different error\n  message.\n---\nDate: 2001-11-23 15:03:17 -5\nUser: ed\nFatal:\n  Unknown variable \"bar\"\nStack:\n- file: TopClass.py\n  line: 23\n  code: |\n    x = MoreObject(\"345\\n\")\n- file: MoreClass.py\n  line: 58\n  code: |-\n    foo = bar\n",
+       "Time=str:2001-11-23 15:01:42 -5; User=str:ed; Warning=str:This is an error message for the log file | Time=str:2001-11-23 15:02:31 -5; User=str:ed; Warning=str:A slightly different error message. | Date=str:2001-11-23 15:03:17 -5; User=str:ed; Fatal=str:Unknown variable \"bar\"; Stack=list:; Stack.0=map:; Stack.0.file=str:TopClass.py; Stack.0.line=int:23; Stack.0.code=str:x = MoreObject(\"345\\n\")\\n; Stack.1=map:; Stack.1.file=str:MoreClass.py; Stack.1.line=int:58; Stack.1.code=str:foo = bar");
+}
+
+fn beyond_chapter2() {
+    println("-- Block scalars: chomping and indentation");
+    ex("clip strip keep", "clip: |\n  text\n\nstrip: |-\n  text\n\nkeep: |+\n  text\n\nend: 1\n",
+       "clip=str:text\\n; strip=str:text; keep=str:text\\n\\n; end=int:1");
+    ex("folded strip keep", "a: >-\n  one\n  two\n\nb: >+\n  one\n\n\nc: 1\n",
+       "a=str:one two; b=str:one\\n\\n\\n; c=int:1");
+    ex("indentation indicator", "a: |2\n   leading spaces\n  kept\nb: >1\n  more\n x\n",
+       "a=str: leading spaces\\nkept\\n; b=str: more\\nx\\n");
+    ex("empty block scalars", "a: |\nb: |+\n\nc: >-\n",
+       "a=str:; b=str:\\n; c=str:");
+    ex("comment lines inside a literal", "a: |\n  # not a comment\n  x: not a key\n",
+       "a=str:# not a comment\\nx: not a key\\n");
+    println("-- Quoted scalars");
+    ex("every double-quoted escape", "e: \"\\0\\a\\b\\t\\n\\v\\f\\r\\e\\ \\\"\\/\\\\\\N\\_\\L\\P\\x41\\u00e9\\U0001F600\"\n",
+       "e=str:\\x00\\x07\\x08\\t\\n\\x0b\\x0c\\r\\x1b \"/\\   Aé😀");
+    ex("folding in quotes", "d: \"one\n  two\n\n  three\\\n  four\"\ns: 'it''s\n  folded'\n",
+       "d=str:one two\\nthreefour; s=str:it's folded");
+    println("-- Flow collections");
+    ex("nested flow", "a: [1, [2, 3], \x7bk: v, n\x7d, 'q', \"d\", ]\nb: \x7b url: http://x.org:80/p, list: [x, y] \x7d\n",
+       "a=list:; a.0=int:1; a.1=list:; a.1.0=int:2; a.1.1=int:3; a.2=map:; a.2.k=str:v; a.2.n=null:; a.3=str:q; a.4=str:d; b=map:; b.url=str:http://x.org:80/p; b.list=list:; b.list.0=str:x; b.list.1=str:y");
+    ex("flow over lines", "a: [\n  one,   # first\n  two\n]\n",
+       "a=list:; a.0=str:one; a.1=str:two");
+    println("-- Typing (core schema)");
+    ex("core schema", "a: ~\nb: Null\nc: TRUE\nd: yes\ne: 0o17\nf: 0x1f\ng: 1_000\nh: .Inf\ni: -.INF\nj: 0777\nk: '1'\n",
+       "a=null:; b=null:; c=bool:true; d=str:yes; e=int:0o17; f=int:0x1f; g=str:1_000; h=float:.inf; i=float:-.inf; j=int:0777; k=str:1");
+    val d: YamlDoc = yaml_load("o: 0o17\nh: 0x1f\np: +7\n");
+    println("ints: " + int_to_str(yaml_get_int(d.entries, "o", 0)) + " " + int_to_str(yaml_get_int(d.entries, "h", 0)) + " " + int_to_str(yaml_get_int(d.entries, "p", 0)));
+    if yaml_get_int(d.entries, "o", 0) != 15 || yaml_get_int(d.entries, "h", 0) != 31 || yaml_get_int(d.entries, "p", 0) != 7 { p_panic("yaml spec: ints"); }
+    println("-- Rejected");
+    bad("duplicate key", "a: 1\nb: 2\na: 3\n");
+    bad("duplicate flow key", "a: \x7bx: 1, x: 2\x7d\n");
+    bad("tab indentation", "a:\n\tb: 1\n");
+    bad("bad indentation", "a: 1\n   b: 2\n");
+    bad("key after a value on its line", "a: b: c\n");
+    bad("unterminated double quote", "a: \"abc\nb: 1\n");
+    bad("unterminated flow", "a: [1, 2\nb: 3\n");
+    bad("unknown escape", "a: \"\\q\"\n");
+    bad("alias without anchor", "a: *nope\n");
+    bad("text after quoted", "a: \"x\" y\n");
+    bad("two documents", "a: 1\n---\nb: 2\n");
+    bad("mapping in flow sequence", "a: [k: v]\n");
+    // the lenient form keeps going
+    val lax: Vec<YamlEntry> = yaml_parse("a: 1\na: 2\n\tb: 3\nc: [x, y]\n");
+    same("lenient", dump(lax), "a=int:1; a=int:2; b=int:3; c=str:[x, y]");
+}
+
+fn main() -> i64 {
+    chapter2_collections();
+    chapter2_scalars();
+    chapter2_full();
+    beyond_chapter2();
+    println("yaml spec ok");
+    return 0;
+}

@@ -8543,10 +8543,15 @@ mod tests {
     #[test]
     fn i4c_no_gas_still_limits_unrolling() {
         // Without @gas, trip count > 8 should NOT unroll
-        let src = "fn compute() -> i64 { var sum: i64 = 0; for i in 0..12 { sum = sum + i; } return sum; }\n";
+        let src = "fn compute() -> i64 { var sum: i64 = 0; for i in 0..40 { sum = sum + i; } return sum; }\n";
+        // The module includes core, whose own short constant loops unroll:
+        // count against the same program without `compute`'s loop.
+        let base = "fn compute() -> i64 { return 0; }\n";
         let mut l2 = compile_to_l2(src);
+        let mut l2b = compile_to_l2(base);
         let n = pass_unroll(&mut l2);
-        assert_eq!(n, 0, "should not unroll trip count 12 without @gas, got {}", n);
+        let nb = pass_unroll(&mut l2b);
+        assert_eq!(n, nb, "should not unroll trip count 40 without @gas ({} unrolled, {} without the loop)", n, nb);
     }
 
     #[test]

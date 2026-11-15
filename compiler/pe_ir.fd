@@ -2799,16 +2799,10 @@ pub fn PeirGen_gen_inst(
             var loff: i64 = PeStackFrame_offset(frame, left);
             var roff: i64 = PeStackFrame_offset(frame, right);
             // A comparison's type is Bool: its operands' type decides
-            var operand_ty: IrType = IrType::I64;
-            var right_ty: IrType = IrType::I64;
-            match IrFunction_get_meta(func, left) {
-                OptValueMeta::Some(m) => { operand_ty = m.ty; }
-                OptValueMeta::None => {}
-            }
-            match IrFunction_get_meta(func, right) {
-                OptValueMeta::Some(m) => { right_ty = m.ty; }
-                OptValueMeta::None => {}
-            }
+            // (a parameter has no instruction: its type is in the
+            // parameter list; `x > 1` on a u64 parameter compared signed)
+            var operand_ty: IrType = peir_operand_ty(func, left);
+            var right_ty: IrType = peir_operand_ty(func, right);
             var unsigned_cmp: bool = ir_type_eq(operand_ty, IrType::U64) || ir_type_eq(right_ty, IrType::U64);
             // For / and %, which compare nothing: the dividend is >= 0
             // (range analysis bit 2), so a constant divisor needs no sign fix
@@ -3710,6 +3704,21 @@ pub fn peir_recyclable(v: i64, def_block: Vec<i64>, n_use_blocks: Vec<i64>, a_us
 
 /// The jcc code jumping when an integer comparison `a OP b` holds (the
 /// setcc-style numbering gen_int_binop uses: 4=E, 5=NE, C=L, D=GE, E=LE,
+/// The IR type of value `id` of `func`: its instruction's, or a
+/// parameter's declared type; i64 when neither is recorded.
+pub fn peir_operand_ty(func: &IrFunction, id: i64) -> IrType {
+    match IrFunction_get_meta(func, id) {
+        OptValueMeta::Some(m) => { return m.ty; }
+        OptValueMeta::None => {}
+    }
+    var i: i64 = 0;
+    while i < func.params.len() {
+        if func.params.get(i).id == id { return func.params.get(i).ty; }
+        i = i + 1;
+    }
+    return IrType::I64;
+}
+
 /// F=G; unsigned 2=B, 3=AE, 6=BE, 7=A), or -1 for a non-comparison.
 pub fn peir_int_cmp_cc(op: BinOp, unsigned: bool) -> i64 {
     match op {

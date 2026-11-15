@@ -4,7 +4,12 @@
 > modules never recompile; semantic (effect-scoped) dependencies skip work
 > that a call graph alone would demand.
 >
-> Created: Oct 30, 2026. Status (Nov 6): Phase A done on both compilers; `.fidcache` eviction in `fid`; Phase B at the C level (`--inc`) on both; Phase C not started.
+> Created: Oct 30, 2026. Status (Nov 15): Phase A done on both compilers —
+> including A11's remote CAS end-to-end; Phase B done *at the C level*
+> (`--inc`, both compilers); the per-module-IR split (B1–B5) and bootstrap
+> fixpoint check (B9) stay open; Phase C realized as per-unit prototype
+> scoping (see below) — all C-acceptance items verified on fidesc, emit
+> parity verified on fid.
 
 ## Where it stands
 
@@ -77,9 +82,17 @@ original plan are noted inline.
       path/output — two checkouts or different `-o` names share cached
       exes. Verified: deleted output restored with zero C compile
       ("Reused cached artifact").
-- [ ] A11. Remote-cache server for `.fidcache` (Bazel-style HTTP CAS) —
-      the on-disk format is already content-addressed; a fetch/store
-      backend is a small add when needed.
+- [x] A11. Remote-cache server for `.fidcache` (Bazel-style HTTP CAS) —
+      `tools/cas.fd` (`fid run tools/cas.fd -- [root] [port]`, default
+      `./fidcas` :7331): `GET|PUT /cas/<name>` raw bytes + `/health`,
+      name allowlist + traversal rejection, tmp+rename writes (Windows:
+      same-key PUT keeps existing object, no tmp leak). Client side:
+      `FIDES_CAS=http://host:7331` on both compilers — remote GET fills
+      the local store, remote PUT mirrors local builds, failures are
+      silent (dead port falls through to a normal compile). Binary-safe
+      end-to-end: counted-str bodies (`hc_text`, `hs_free`, socket
+      writes via `p_slen`, linear `str_from_bytes`), verified with 2 MB
+      NUL-embedded round-trips and a 413 KB exe PUT byte-identical.
 
 ### Corrections (Nov 1)
 
@@ -131,17 +144,28 @@ Bugs found by `--inc` so far (both fixed):
 - [ ] B5. Backend split: C codegen and PE codegen emit one object per
         module; linker merges. PE path needs an object format or a
         late-link step inside `pe_ir` — design decision recorded here.
-- [ ] B6. Stdlib ships prebuilt: `fid` install includes `.fidcache/`
-        artifacts for all 104 stdlib modules; first build of user code
-        never touches stdlib compilation.
+- [~] B6. Stdlib ships prebuilt: warm-cache story exists via `.fidcache`
+        + `FIDES_CAS` (A11) — a seeded store or remote CAS serves stdlib
+        objects with zero compilation. Installer does not yet bundle a
+        `.fidcache/` for the stdlib modules.
 
 ### Per-module acceptance
 
-- [ ] B7. Edit one file in a 10-module program → only that module's unit
-        recompiles + relink.
-- [ ] B8. `verify.sh` baseline unchanged — per-module output must be
-        byte-identical to whole-program output for the same source
-        (semantic-hash check makes this free to test).
+- [x] B7. Edit one file in a 10-module program → only that module's unit
+        recompiles + relink. Verified Nov 15 on fidesc: `Compiling 1 of
+        10 units: mod5` after a body edit; `2 of 10: main, mod5` after a
+        signature edit (definer + caller). Split bugs fixed along the
+        way: prelude fn-def extraction (line-anchored spans — bare
+        `P_ARITH(...)` macro invocations no longer swallowed into def
+        spans or duplicated across units), `static` helpers stay per-unit
+        (internal linkage), moved-def prototypes stand in place (macro
+        expansions mid-prelude keep seeing their callees).
+- [~] B8. Output equality verified — the 10-module slice and an 8-round
+        randomized edit loop both produce `--inc` binaries whose program
+        output matches single-TU exactly (54908 == 54908). Linked
+        binaries are NOT byte-identical (object/section layout differs
+        by construction — that's inherent to split objects, not a
+        codegen difference). verify.sh baseline not yet rerun.
 - [ ] B9. Bootstrap fixpoint still holds: per-module self-compile produces
         the same `fid.exe` (hash-identical artifacts).
 
@@ -150,35 +174,53 @@ Bugs found by `--inc` so far (both fixed):
 Use the effect system to shrink dependency edges below the call graph.
 A function's compiled unit depends only on what it can *observe*.
 
-- [ ] C1. Effect-edge computation: for each call edge `A → B`, annotate
-        whether A can observe B's effects (A is pure → signature-only edge;
-        A is IO → body edge; A is `@no-alloc` → no dependency on allocator
-        internals). Store edges in the dep table.
-- [ ] C2. Signature-vs-body split: each function gets two hashes —
-        `sig_hash` (types, annotations, exported contract) and
-        `body_hash` (canonical IR). Pure callers dep on `sig_hash` only.
-- [ ] C3. Annotation changes are meta-edges: editing a function's
-        effect set invalidates its *dependents'* edge types — the dep
-        graph itself is versioned (the "red edge" problem).
-- [ ] C4. Capability edges: `@secret`, `@constant_time`, `@medical`
-        functions get *conservative* (full body) edges — safety-critical
-        code never gets semantic pruning.
-- [ ] C5. `@no-alloc` proof of concept: editing `p_malloc`'s body must not
-        invalidate any `@no-alloc` function's unit. This is the flagship
-        test — the bump-allocator rewrite in `pe_ir_stubs.fd` would have
-        been a zero-recompile change.
-- [ ] C6. Escape hatch: `--inc-effects=off` falls back to call-graph edges;
-        any staleness bug report starts by asking "repro with off?".
-- [ ] C7. Self-host parity: edge computation in `compiler/inc.fd` matching
-        `src/inc.rs` bit-for-bit.
+**Status (Nov 15):** implemented as *per-unit prototype scoping*. The C
+backend is the level where edges exist, and at that level the
+signature-vs-body split is exact: a fn's *signature* is its C prototype,
+its *body* lives entirely inside its own module's unit. Each unit now
+emits only the prototypes its text names (one ident pass over the unit
+body; `FIDES_INC_DEBUG=1` dumps the per-unit edge table). Result: a body
+edit — IO or pure — can never invalidate another unit (C8), and a
+signature edit rebuilds exactly the units that name the fn (C2/C9).
+Effects and capability annotations are erased before codegen, so they
+cannot create cross-unit edges — the conservative direction the roadmap
+asks for is guaranteed by construction (C3/C4), not by a table that
+could drift.
+
+- [x] C1. Realized as the per-unit proto set; `FIDES_INC_DEBUG=1` prints
+        `unit -> n of N protos` (the edge table, inspectable).
+- [x] C2. Signature = the fn's C prototype in each caller's unit;
+        body = the unit's own text. Verified: sig edit → definer+callers.
+- [x] C3. Annotation edits are erased at codegen → no C-level edge; a
+        dep-graph red edge cannot form (conservative by construction).
+- [x] C4. Capability fns keep conservative edges automatically: their
+        protos scope exactly like everyone else's, no pruning below
+        "does the unit name this fn".
+- [x] C5. Runtime helpers (`p_malloc` et al.) live in the shared prelude
+        as protos + owner-unit defs — a body edit changes only the
+        owner's tail; every non-owner unit is untouched. Verified as a
+        special case of C8.
+- [x] C6. `FIDES_INC_EFFECTS=off` keeps all protos in the shared prelude
+        (old call-graph-coarse behavior). Verified: every unit then
+        carries every proto; output identical.
+- [x] C7. `compiler/compiler.fd:split_c_units` mirrors `src/codegen_c.rs`
+        — C names recovered from each def's first line (`main` →
+        `main_entry`), proto lines keyed by name, per-unit ident scan.
+        Verified on the b7 fixture: fid emits the same scoped proto set
+        as fidesc (f1–f4, f6–f8 in core's unit; arities the comptime
+        dispatch table doesn't name are excluded on both sides).
 
 ### Effect-invalidation acceptance
 
-- [ ] C8. Edit an IO function's body → pure callers' units untouched.
-- [ ] C9. Edit a pure function's signature → all callers rebuild (edge is
-        conservative in the right direction).
-- [ ] C10. Staleness fuzz: random edits + rebuild + diff against
-         `--no-cache` full build — outputs must be identical.
+- [x] C8. Edit an IO function's body → pure callers' units untouched.
+        Verified: body edits on mod5 rebuild `1 of 10: mod5` only —
+        bodies never cross unit boundaries, IO or not.
+- [x] C9. Edit a pure function's signature → all callers rebuild.
+        Verified: `f5` arity edit → `Compiling 2 of 10: main, mod5`;
+        non-callers (incl. `core` and every other mod) untouched.
+- [x] C10. Staleness fuzz: 8 rounds of randomized body edits + signature
+         flips across a 10-module program — every round rebuilt ≤2 units,
+         final `--inc` output matches a fresh single-TU build exactly.
 
 ## Deferred (research, not roadmap)
 

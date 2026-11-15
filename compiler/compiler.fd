@@ -666,6 +666,17 @@ fn parse_source(source: str) -> ParseResultProgram {
     return p.parse();
 }
 
+/// The user's program as parsed, without the stdlib, type checking or
+/// lowering: what an editor can still show symbols from while the code
+/// has a type error (fid lsp).
+pub fn parse_program_only(source: str) -> OptProgram {
+    match parse_source(source) {
+        ParseResultProgram::Ok(p) => { return OptProgram::Some(p); }
+        ParseResultProgram::Err(_) => {}
+    }
+    return OptProgram::None;
+}
+
 /// Build a program from source code (no path -- no import resolution).
 pub fn build_program(source: str) -> ResultProgram {
     return build_program_with_path(source, OptStr::None);
@@ -1758,6 +1769,15 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
 
                     // Comptime: process gen blocks (before typechecking so generated code is visible)
                     program = process_gen(program);
+                    var ctg_errors: Vec<str> = comptime_gen_errors();
+                    if ctg_errors.len() > 0 {
+                        var file_ctg: str = "<stdin>";
+                        match source_path {
+                            OptStr::Some(pcg) => { file_ctg = pcg; }
+                            OptStr::None => { }
+                        }
+                        return ResultProgram::Err(enrich_errors(ctg_errors, source, file_ctg));
+                    }
 
                     // Phase 3B.1: Fill in default trait methods
                     fill_default_trait_methods(&mut program);
@@ -4970,6 +4990,40 @@ fn c_collect_str_names(body: str, used: i64) {
     }
 }
 
+/// Byte is a C identifier character.
+fn c_ident_byte(c: i64) -> bool {
+    return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95;
+}
+
+/// Every C identifier in `src` (digit-led runs skipped) — the per-unit
+/// scan that scopes prototypes to the fns a unit's text names.
+fn c_collect_idents(src: str, set: i64) {
+    var n: i64 = str_len(src);
+    var i: i64 = 0;
+    while i < n {
+        var c: i64 = str_byte_at(src, i);
+        if c_ident_byte(c) && !(c >= 48 && c <= 57) {
+            var s: i64 = i;
+            while i < n && c_ident_byte(str_byte_at(src, i)) { i = i + 1; }
+            HashMap_insert(set, str_slice(src, s, i), 1);
+        } else {
+            i = i + 1;
+        }
+    }
+}
+
+/// The function name in a one-line C declaration — the identifier just
+/// before the first `(`. "" when the line has no `(`.
+fn c_decl_name(line: str) -> str {
+    var op: i64 = str_find(line, "(");
+    if op < 0 { return ""; }
+    var e: i64 = op;
+    while e > 0 && str_byte_at(line, e - 1) == 32 { e = e - 1; }
+    var s: i64 = e;
+    while s > 0 && c_ident_byte(str_byte_at(line, s - 1)) { s = s - 1; }
+    return str_slice(line, s, e);
+}
+
 /// Offset of the next "//@FN " line after `from`, else limit + 1.
 fn c_next_fn_mark(full: str, from: i64, limit: i64) -> i64 {
     var i: i64 = from;
@@ -5001,38 +5055,68 @@ pub fn split_c_units(full: str) -> Vec<CUnit> {
     var flat: bool = str_len(env_or_empty("FIDES_INC_FLAT")) > 0;
     if flat { owner = "main"; }
 
-    // Move the prelude's definitions to the tail
+    // Move the prelude's definitions to the tail; each prototype stands
+    // where its definition stood (collecting them at the end broke macros
+    // that expand into calls mid-prelude, like P_VEC_UNCHECKED).
     var spans: CDefSpans = inc_c_fn_defs(prelude);
     var stripped: StringBuilder = StringBuilder::new();
-    var protos: StringBuilder = StringBuilder::new();
     var moved: StringBuilder = StringBuilder::new();
     var cursor: i64 = 0;
     var si: i64 = 0;
     while si < spans.names.len() {
-        var s: i64 = spans.starts.get(si);
-        stripped.append_str(str_slice(prelude, cursor, s));
-        protos.append_str(str_trim(str_slice(prelude, s, spans.braces.get(si))));
-        protos.append_str(";\n");
-        moved.append_str(str_slice(prelude, s, spans.ends.get(si)));
-        moved.append_str("\n");
-        cursor = spans.ends.get(si);
+        var brace: i64 = spans.braces.get(si);
+        // The header is the text from the last completed construct
+        // (`;`, `}` or newline) to the `{`. Generated decls are one line
+        // each; token stmt_start can't anchor them because bare macro
+        // invocations like `P_ARITH(int8_t, i8)` have no `;`.
+        var s: i64 = str_rfind(str_slice(prelude, 0, brace), "\n");
+        var sc: i64 = str_rfind(str_slice(prelude, 0, brace), ";");
+        var bc: i64 = str_rfind(str_slice(prelude, 0, brace), "}");
+        if sc > s { s = sc; }
+        if bc > s { s = bc; }
+        s = s + 1;
+        var header: str = str_trim(str_slice(prelude, s, brace));
+        // `static` helpers stay: internal linkage can't cross a TU, so
+        // every unit keeps its own copy (as P_VEC_UNCHECKED's callees).
+        if !str_starts_with(header, "static") {
+            stripped.append_str(str_slice(prelude, cursor, s));
+            stripped.append_str(header);
+            stripped.append_str(";\n");
+            moved.append_str(str_slice(prelude, s, spans.ends.get(si)));
+            moved.append_str("\n");
+            cursor = spans.ends.get(si);
+        }
         si = si + 1;
     }
     stripped.append_str(str_slice(prelude, cursor, str_len(prelude)));
-    stripped.append_str(protos.to_str());
     tail = moved.to_str() + "\n" + tail;
 
-    // Function bodies by unit
+    // Function bodies by unit; the C name of each fn is read off its
+    // definition's first line (//@FN carries the source name, which
+    // sanitization can rename — `main` emits as `main_entry`).
     var unit_names: Vec<str> = Vec::new();
     var fn_units: Vec<i64> = Vec::new();
     var fn_starts: Vec<i64> = Vec::new();
     var fn_ends: Vec<i64> = Vec::new();
+    var fn_cnames: Vec<str> = Vec::new();
     var at: i64 = first + 1;
     while at < tail_at {
         var line_end: i64 = at;
         while str_byte_at(full, line_end) != 10 { line_end = line_end + 1; }
         var fname: str = str_slice_len(full, full_len, at + 6, line_end);
         var body_end: i64 = c_next_fn_mark(full, line_end, tail_at);
+        var cname: str = "";
+        var dl: i64 = line_end + 1;
+        while dl < body_end && cname == "" {
+            var de: i64 = dl;
+            while de < body_end && str_byte_at(full, de) != 10 { de = de + 1; }
+            var dline: str = str_slice_len(full, full_len, dl, de);
+            if str_find(dline, "(") >= 0 && !str_starts_with(str_trim(dline), "#") {
+                cname = c_decl_name(dline);
+            }
+            dl = de + 1;
+        }
+        fn_cnames.push(cname);
         var unit: str = "main";
         if !flat { unit = func_module_of(fname, owner); }
         var slot: i64 = c_unit_slot(unit_names, unit);
@@ -5046,7 +5130,22 @@ pub fn split_c_units(full: str) -> Vec<CUnit> {
         at = body_end;
     }
 
-    // Prelude lines: shared, global definitions, string constants
+    // Prelude lines: shared, global definitions, string constants. With
+    // effect-scoped protos (C2/C9, on unless FIDES_INC_EFFECTS=off or a
+    // flat split) a user-fn prototype leaves the shared prelude: each
+    // unit re-emits only the protos its text names, so a signature edit
+    // rebuilds just the units that call or define that fn.
+    var scope: bool = !flat && env_or_empty("FIDES_INC_EFFECTS") != "off";
+    var cname_set: i64 = HashMap_new();
+    if scope {
+        var ci: i64 = 0;
+        while ci < fn_cnames.len() {
+            if str_len(fn_cnames.get(ci)) > 0 { HashMap_insert(cname_set, fn_cnames.get(ci), 1); }
+            ci = ci + 1;
+        }
+    }
+    var proto_names: Vec<str> = Vec::new();
+    var proto_lines: Vec<str> = Vec::new();
     var pre_common: StringBuilder = StringBuilder::new();
     var global_defs: Vec<str> = Vec::new();
     var global_externs: Vec<str> = Vec::new();
@@ -5057,7 +5156,17 @@ pub fn split_c_units(full: str) -> Vec<CUnit> {
     while li < lines.len() {
         var line: str = lines.get(li);
         var t: str = str_trim(line);
-        if str_starts_with(t, "static ") && str_contains(t, " _g_") {
+        var is_proto: bool = false;
+        if scope && str_ends_with(t, ";") && !str_starts_with(t, "#") && !str_starts_with(t, "//") {
+            var pn: str = c_decl_name(t);
+            if str_len(pn) > 0 && HashMap_get(cname_set, pn) != 0 {
+                proto_names.push(pn);
+                proto_lines.push(line);
+                is_proto = true;
+            }
+        }
+        if is_proto {
+        } else if str_starts_with(t, "static ") && str_contains(t, " _g_") {
             var decl: str = str_slice(t, 7, str_len(t));
             var eq: i64 = str_find(decl, " = ");
             if eq >= 0 { decl = str_slice(decl, 0, eq); }
@@ -5109,6 +5218,19 @@ pub fn split_c_units(full: str) -> Vec<CUnit> {
         if unit_names.get(idx) == owner { c_collect_str_names(tail, used); }
         var code: StringBuilder = StringBuilder::new();
         code.append_str(common);
+        if scope {
+            var idents: i64 = HashMap_new();
+            c_collect_idents(body, idents);
+            if unit_names.get(idx) == owner { c_collect_idents(tail, idents); }
+            var pi: i64 = 0;
+            while pi < proto_lines.len() {
+                if HashMap_get(idents, proto_names.get(pi)) != 0 {
+                    code.append_str(proto_lines.get(pi));
+                    code.append_str("\n");
+                }
+                pi = pi + 1;
+            }
+        }
         var d: i64 = 0;
         while d < str_decls.len() {
             var dl: str = str_decls.get(d);

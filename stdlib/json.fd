@@ -171,6 +171,10 @@ fn j_scan_obj(s: str, i: i64) -> i64 {
 
 /// True when `s` is well-formed JSON (RFC 8259 grammar, no trailing junk).
 /// Pure Fides — never panics.
+///
+/// Example:
+///   assert(json_is_valid("{\"a\": [1, 2, true]}"));
+///   assert(!json_is_valid("{\"a\": }"));
 pub fn json_is_valid(s: str) -> bool {
     var end: i64 = j_scan_val(s, 0);
     if end < 0 { return false; }
@@ -335,6 +339,11 @@ fn j_hex4(c: i64) -> str {
 }
 
 /// Serialize a plain string as a JSON string literal (quotes + escaping).
+///
+/// Example:
+///   var lit = json_string("say \"hi\"");
+///   println(lit);
+///   assert_eq(lit, "\"say \\\"hi\\\"\"");
 pub fn json_string(s: str) -> str {
     var out: str = "\"";
     var i: i64 = 0;
@@ -361,6 +370,9 @@ pub fn json_string(s: str) -> str {
 /// Decode a JSON string literal (with surrounding quotes) to plain text.
 /// Handles \" \\ \/ \n \r \t \b \f and \uXXXX (UTF-8 encoded).
 /// On malformed input returns the input unchanged.
+///
+/// Example:
+///   assert_eq(json_unescape("\"a\\nb\""), "a\nb");
 pub fn json_unescape(lit: str) -> str {
     var n: i64 = str_len(lit);
     if n < 2 || str_byte_at(lit, 0) != 34 || str_byte_at(lit, n - 1) != 34 {
@@ -436,6 +448,11 @@ pub fn json_unescape(lit: str) -> str {
 /// Parse a JSON string and return its canonical (minified, keys sorted
 /// recursively) form. PANICS on parse error — use json_parse_safe for a
 /// non-panicking version.
+///
+/// Example:
+///   var c = json_parse("{ \"b\": 2, \"a\": [1, 2] }");
+///   println(c);
+///   assert_eq(c, "{\"a\":[1,2],\"b\":2}");
 pub fn json_parse(s: str) -> str {
     if !json_is_valid(s) { panic("json_parse: invalid JSON"); }
     return j_canon(s, 0);
@@ -449,6 +466,12 @@ pub fn json_dump(s: str) -> str {
 /// Extract a field from a JSON object. Returns the raw JSON value as a
 /// string, or "null" when the key is absent.
 /// PANICS if `s` is not a valid JSON object — use json_get_safe instead.
+///
+/// Example:
+///   var doc = "{\"name\": \"Ada\", \"age\": 36}";
+///   assert_eq(json_get(doc, "age"), "36");
+///   assert_eq(json_get(doc, "name"), "\"Ada\"");
+///   assert_eq(json_get(doc, "missing"), "null");
 pub fn json_get(s: str, key: str) -> str {
     if !json_is_valid(s) || !str_equal(j_type_at(s, j_ws(s, 0)), "object") {
         panic("json_get: not an object");
@@ -468,6 +491,9 @@ pub fn json_get(s: str, key: str) -> str {
 
 /// Extract an element from a JSON array by index.
 /// PANICS on out-of-bounds or non-array — use json_at_safe instead.
+///
+/// Example:
+///   assert_eq(json_at("[10, 20, 30]", 1), "20");
 pub fn json_at(s: str, idx: i64) -> str {
     if !json_is_valid(s) || !str_equal(j_type_at(s, j_ws(s, 0)), "array") {
         panic("json_at: not an array");
@@ -480,6 +506,11 @@ pub fn json_at(s: str, idx: i64) -> str {
 
 /// Type name of a JSON value: "object"|"array"|"string"|"number"|
 /// "boolean"|"null". PANICS on invalid JSON — use json_type_safe instead.
+///
+/// Example:
+///   assert_eq(json_type("[1]"), "array");
+///   assert_eq(json_type("\"x\""), "string");
+///   assert_eq(json_type("3.5"), "number");
 pub fn json_type(s: str) -> str {
     if !json_is_valid(s) { panic("json_type: invalid JSON"); }
     return j_type_at(s, j_ws(s, 0));
@@ -487,6 +518,10 @@ pub fn json_type(s: str) -> str {
 
 /// Length of a JSON object or array. PANICS for scalar types or invalid
 /// JSON — use json_len_safe instead.
+///
+/// Example:
+///   assert_eq(json_len("[1, 2, 3]"), 3);
+///   assert_eq(json_len("{\"a\": 1}"), 1);
 pub fn json_len(s: str) -> i64 {
     if !json_is_valid(s) { panic("json_len: invalid JSON"); }
     var t: str = j_type_at(s, j_ws(s, 0));
@@ -503,6 +538,11 @@ fn j_ind(n: i64) -> str {
 
 /// Pretty-print a JSON string with 2-space indentation (canonical key
 /// order). PANICS on invalid JSON — use json_pretty_safe instead.
+///
+/// Example:
+///   var p = json_pretty("{\"a\":1}");
+///   println(p);
+///   assert_eq(p, "{\n  \"a\": 1\n}");
 pub fn json_pretty(s: str) -> str {
     if !json_is_valid(s) { panic("json_pretty: invalid JSON"); }
     var src: str = j_canon(s, 0);
@@ -558,6 +598,9 @@ pub fn json_pretty(s: str) -> str {
 }
 
 /// Build a JSON object from a key and raw JSON value. Returns {"key":value}.
+///
+/// Example:
+///   assert_eq(json_pair("n", "1"), "{\"n\":1}");
 pub fn json_pair(key: str, value: str) -> str {
     return "{" + json_string(key) + ":" + value + "}";
 }
@@ -565,12 +608,20 @@ pub fn json_pair(key: str, value: str) -> str {
 // ─── Safe wrappers (never panic) ────────────────────────────────────────
 
 /// Canonicalize `s`, or "" when it is not valid JSON.
+///
+/// Example:
+///   assert_eq(json_parse_safe("[1, 2]"), "[1,2]");
+///   assert_eq(json_parse_safe("[1,"), "");
 pub fn json_parse_safe(s: str) -> str {
     if !json_is_valid(s) { return ""; }
     return j_canon(s, 0);
 }
 
 /// Type name of a JSON value, or "error" when `s` is not valid JSON.
+///
+/// Example:
+///   assert_eq(json_type_safe("null"), "null");
+///   assert_eq(json_type_safe("{oops"), "error");
 pub fn json_type_safe(s: str) -> str {
     if !json_is_valid(s) { return "error"; }
     return j_type_at(s, j_ws(s, 0));
@@ -578,6 +629,10 @@ pub fn json_type_safe(s: str) -> str {
 
 /// Field of a JSON object as raw JSON text; "" on any failure, "null"
 /// when the key is absent (matching historical json_get semantics).
+///
+/// Example:
+///   assert_eq(json_get_safe("{\"a\": true}", "a"), "true");
+///   assert_eq(json_get_safe("not json", "a"), "");
 pub fn json_get_safe(s: str, key: str) -> str {
     if !str_equal(json_type_safe(s), "object") { return ""; }
     var mem: Vec<i64> = j_members(s, j_ws(s, 0));
@@ -594,6 +649,9 @@ pub fn json_get_safe(s: str, key: str) -> str {
 }
 
 /// Element of a JSON array as raw JSON text; "" on any failure.
+///
+/// Example:
+///   assert_eq(json_at_safe("[1, 2]", 5), "");
 pub fn json_at_safe(s: str, idx: i64) -> str {
     if !str_equal(json_type_safe(s), "array") { return ""; }
     var mem: Vec<i64> = j_members(s, j_ws(s, 0));
@@ -603,6 +661,10 @@ pub fn json_at_safe(s: str, idx: i64) -> str {
 }
 
 /// Length of a JSON object/array; -1 otherwise.
+///
+/// Example:
+///   assert_eq(json_len_safe("[]"), 0);
+///   assert_eq(json_len_safe("42"), -1);
 pub fn json_len_safe(s: str) -> i64 {
     var t: str = json_type_safe(s);
     if str_equal(t, "object") { return j_members(s, j_ws(s, 0)).len() / 4; }
@@ -620,6 +682,10 @@ pub fn json_pretty_safe(s: str) -> str {
 
 /// Field of an object as a plain (unescaped) string; "" when the field is
 /// missing, not a string, or the input is invalid.
+///
+/// Example:
+///   assert_eq(json_get_str("{\"name\": \"Ada\"}", "name"), "Ada");
+///   assert_eq(json_get_str("{\"n\": 1}", "n"), "");
 pub fn json_get_str(s: str, key: str) -> str {
     var v: str = json_get_safe(s, key);
     if !str_equal(json_type_safe(v), "string") { return ""; }
@@ -627,6 +693,11 @@ pub fn json_get_str(s: str, key: str) -> str {
 }
 
 /// Field of an object as an integer; `def` when missing/not a number.
+///
+/// Example:
+///   var doc = "{\"port\": 8080}";
+///   assert_eq(json_get_int(doc, "port", 80), 8080);
+///   assert_eq(json_get_int(doc, "timeout", 30), 30);
 pub fn json_get_int(s: str, key: str, def: i64) -> i64 {
     var v: str = json_get_safe(s, key);
     if !str_equal(json_type_safe(v), "number") { return def; }
@@ -634,6 +705,9 @@ pub fn json_get_int(s: str, key: str, def: i64) -> i64 {
 }
 
 /// Field of an object as a float; `def` when missing/not a number.
+///
+/// Example:
+///   assert(json_get_num("{\"x\": 2.5}", "x", 0.0) == 2.5);
 pub fn json_get_num(s: str, key: str, def: f64) -> f64 {
     var v: str = json_get_safe(s, key);
     if !str_equal(json_type_safe(v), "number") { return def; }
@@ -641,6 +715,10 @@ pub fn json_get_num(s: str, key: str, def: f64) -> f64 {
 }
 
 /// Field of an object as a bool; `def` when missing/not a boolean.
+///
+/// Example:
+///   assert(json_get_bool("{\"debug\": true}", "debug", false));
+///   assert(!json_get_bool("{}", "debug", false));
 pub fn json_get_bool(s: str, key: str, def: bool) -> bool {
     var v: str = json_get_safe(s, key);
     if str_equal(v, "true") { return true; }
@@ -649,6 +727,10 @@ pub fn json_get_bool(s: str, key: str, def: bool) -> bool {
 }
 
 /// True when `key` exists on object `s` (even if its value is null).
+///
+/// Example:
+///   assert(json_has("{\"a\": null}", "a"));
+///   assert(!json_has("{\"a\": null}", "b"));
 pub fn json_has(s: str, key: str) -> bool {
     var keys: Vec<str> = json_keys(s);
     var i: i64 = 0;
@@ -661,6 +743,9 @@ pub fn json_has(s: str, key: str) -> bool {
 }
 
 /// Array element as a plain string; "" when out of bounds or not a string.
+///
+/// Example:
+///   assert_eq(json_at_str("[\"x\", \"y\"]", 1), "y");
 pub fn json_at_str(s: str, idx: i64) -> str {
     var v: str = json_at_safe(s, idx);
     if !str_equal(json_type_safe(v), "string") { return ""; }
@@ -668,6 +753,10 @@ pub fn json_at_str(s: str, idx: i64) -> str {
 }
 
 /// Array element as an integer; `def` otherwise.
+///
+/// Example:
+///   assert_eq(json_at_int("[4, 5]", 0, -1), 4);
+///   assert_eq(json_at_int("[4, 5]", 9, -1), -1);
 pub fn json_at_int(s: str, idx: i64, def: i64) -> i64 {
     var v: str = json_at_safe(s, idx);
     if !str_equal(json_type_safe(v), "number") { return def; }
@@ -678,6 +767,11 @@ pub fn json_at_int(s: str, idx: i64, def: i64) -> i64 {
 
 /// Top-level keys of a JSON object as a Vec of plain strings, in document
 /// order. Empty Vec when `s` is not an object.
+///
+/// Example:
+///   var keys = json_keys("{\"b\": 1, \"a\": 2}");
+///   assert_eq(keys.len(), 2);
+///   assert_eq(keys.get(0), "b");
 pub fn json_keys(s: str) -> Vec<str> {
     var out: Vec<str> = Vec::new();
     if !str_equal(json_type_safe(s), "object") { return out; }
@@ -693,6 +787,11 @@ pub fn json_keys(s: str) -> Vec<str> {
 
 /// Top-level elements of a JSON array as a Vec of raw JSON strings.
 /// Empty Vec when `s` is not an array.
+///
+/// Example:
+///   var items = json_items("[1, \"two\", [3]]");
+///   assert_eq(items.len(), 3);
+///   assert_eq(items.get(2), "[3]");
 pub fn json_items(s: str) -> Vec<str> {
     var out: Vec<str> = Vec::new();
     if !str_equal(json_type_safe(s), "array") { return out; }
@@ -711,6 +810,10 @@ pub fn json_items(s: str) -> Vec<str> {
 /// Navigate a dot-separated path: "a.b.0.c" reads field a, then b, then
 /// array index 0, then c. Returns raw JSON text or "" on any miss
 /// ("null" when the final lookup lands on a missing key).
+///
+/// Example:
+///   var doc = "{\"users\": [{\"name\": \"Ada\"}]}";
+///   assert_eq(json_path(doc, "users.0.name"), "\"Ada\"");
 pub fn json_path(s: str, path: str) -> str {
     var cur: str = s;
     var segs: Vec<str> = str_split(path, ".");
@@ -736,6 +839,11 @@ pub fn json_path(s: str, path: str) -> str {
 
 /// Set (or replace) field `key` on JSON object `obj` with raw JSON `value`.
 /// Works on any valid object text; returns obj unchanged if invalid.
+///
+/// Example:
+///   var o = json_obj_set("{\"a\": 1}", "b", "2");
+///   assert_eq(json_get_int(o, "b", 0), 2);
+///   assert_eq(json_get_int(o, "a", 0), 1);
 pub fn json_obj_set(obj: str, key: str, value: str) -> str {
     if !str_equal(json_type_safe(obj), "object") { return obj; }
     var mem: Vec<i64> = j_members(obj, j_ws(obj, 0));
@@ -762,6 +870,11 @@ pub fn json_obj_set(obj: str, key: str, value: str) -> str {
 }
 
 /// Append raw JSON `value` to JSON array `arr`; returns arr if invalid.
+///
+/// Example:
+///   var a = json_arr_push("[1]", "2");
+///   assert_eq(json_len(a), 2);
+///   assert_eq(json_at(a, 1), "2");
 pub fn json_arr_push(arr: str, value: str) -> str {
     if !str_equal(json_type_safe(arr), "array") { return arr; }
     var trimmed: str = str_trim(arr);
@@ -774,17 +887,26 @@ pub fn json_arr_push(arr: str, value: str) -> str {
 }
 
 /// Number literal for building JSON.
+///
+/// Example:
+///   assert_eq(json_num(-5), "-5");
 pub fn json_num(n: i64) -> str {
     return int_to_str(n);
 }
 
 /// Bool literal for building JSON.
+///
+/// Example:
+///   assert_eq(json_bool(true), "true");
 pub fn json_bool(b: bool) -> str {
     if b { return "true"; }
     return "false";
 }
 
 /// Null literal.
+///
+/// Example:
+///   assert_eq(json_null(), "null");
 pub fn json_null() -> str {
     return "null";
 }

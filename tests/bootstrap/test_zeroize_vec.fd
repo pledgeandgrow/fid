@@ -1,0 +1,26 @@
+// J8: @zeroize on a Vec must reach OLD element buffers — the buffer
+// replaced by growth and the buffer freed at drop are both wiped.
+// p_sensitive_wipes counts buffers wiped by the runtime registry
+// (growth frees go through __p_vbuf_free / p_sensitive_free).
+// The interpreter manages Vecs itself: the registry is a no-op there and
+// the check returns 0, so the test skips on that path.
+extern fn p_sensitive_wipes() -> i64;
+extern fn p_sensitive_check(v: i64) -> i64;
+
+fn main() -> i64 {
+    {
+        @zeroize
+        var v: Vec<i64> = Vec::new();
+        if p_sensitive_check(v as i64) != 1 { println("interp: skipped"); return 0; }
+        var i: i64 = 0;
+        // capacity grows 0 -> 8 -> 16 -> 32 -> 64: three old buffers are
+        // freed and must be wiped
+        while i < 40 { v.push(i); i = i + 1; }
+        if p_sensitive_check(v as i64) != 1 { println("mark lost on growth"); return 1; }
+    }
+    var n: i64 = p_sensitive_wipes();
+    println(n);
+    if n < 3 { println("J8=0"); return 1; }
+    println("J8 ok");
+    return 0;
+}

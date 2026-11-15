@@ -16,6 +16,7 @@ use compiler::token;
 use compiler::lexer;
 use compiler::parser;
 use compiler::ir;
+use compiler::pgo;
 use compiler::pir;
 use compiler::opt;
 use compiler::compiler;
@@ -94,6 +95,8 @@ pub fn main() -> i64 {
         // --debug: a debug build, where @cfg(debug) holds (the command
         // reads the flag too, for its own options)
         if garg == "--debug" { g_cfg_debug = true; }
+        // --profile-use <file>: a profile from `fid run --profile` (OP30)
+        if garg == "--profile-use" && gi + 1 < n { g_pgo_use_path = p_argv(gi + 1); }
         // --borrowck=off|warn|on
         if str_starts_with(garg, "--borrowck=") {
             var bval: str = str_substring_from(garg, 11);
@@ -783,7 +786,18 @@ fn cmd_run(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     var max_memory_bytes: i64 = max_memory * 1048576;
 
     // G8.2: Pass borrowck mode through the pipeline (globals don't persist in C codegen)
-    return interpret_source_with_path(source, input, max_recursion, max_steps, max_memory_bytes, verbose, g_borrowck);
+    // --profile <file>: count the calls of every function and write them
+    // (`fid emit ... --profile-use <file>` then uses them, OP30)
+    var prof_out: str = get_flag_value(n, start, "--profile", "");
+    if prof_out != "" { g_pgo_record = true; }
+    var run_rc: i64 = interpret_source_with_path(source, input, max_recursion, max_steps, max_memory_bytes, verbose, g_borrowck);
+    if prof_out != "" {
+        if pgo_write(prof_out) { p_eprint_str("profile written: " + prof_out + "
+"); }
+        else { p_eprint_str("error: cannot write profile " + prof_out + "
+"); }
+    }
+    return run_rc;
 }
 
 // --- test ----------------------------------------------------------------
@@ -811,6 +825,26 @@ fn test_fns(source: str, prefix: str) -> Vec<str> {
     return out;
 }
 
+/// The functions of `source` named `fn fuzz_*` that take one argument
+/// (`fn fuzz_x(data: Vec<u8>)`) — CT4's fuzz targets.
+fn test_fns_fuzz(source: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var lines: Vec<str> = str_split(source, "\n");
+    var i: i64 = 0;
+    while i < lines.len() {
+        var t: str = str_trim(lines.get(i));
+        if str_starts_with(t, "pub ") { t = str_slice(t, 4, str_len(t)); }
+        if str_starts_with(t, "fn fuzz_") {
+            var open: i64 = str_find(t, "(");
+            if open > 3 && str_find(t, "()") != open {
+                out.push(str_slice(t, 3, open));
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
 /// fid test <file.fd>: each `fn test_*()` runs in its own process (a panic
 /// fails that test only), then each `fn bench_*()` runs until it has taken
 /// 200 ms and reports its time per call, as `go test -bench` does.
@@ -823,21 +857,50 @@ fn cmd_test_file(n: i64, start: i64) -> i64 {
     }
     var tests: Vec<str> = test_fns(source, "test_");
     var benches: Vec<str> = test_fns(source, "bench_");
+    // CT4: `fn fuzz_*(data: Vec<u8>)` run under --fuzz with deterministic
+    // seeds; CT5: --update rewrites snapshots; CT8: --coverage through veil.
+    var fuzz_mode: bool = has_flag(n, start, "--fuzz");
+    var update_snaps: bool = has_flag(n, start, "--update");
+    var coverage: bool = has_flag(n, start, "--coverage");
+    var fuzzes: Vec<str> = Vec::new();
+    if fuzz_mode { fuzzes = test_fns_fuzz(source); }
     if str_find(source, "fn main(") >= 0 {
         p_eprint_str("fid test: " + input + " has a main; a test file holds only fn test_*() and fn bench_*()\n");
         return 1;
     }
-    if tests.len() + benches.len() == 0 {
+    if tests.len() + benches.len() + fuzzes.len() == 0 {
         p_eprint_str("fid test: no fn test_*() or fn bench_*() in " + input + "\n");
         return 1;
     }
     // The harness: the file and a main that runs the function its argument
-    // names, as many times as the second argument says
-    var harness: str = source + "\n\nfn main() -> i64 {\n    val which: str = p_argv(1);\n"
-        + "    val reps: i64 = str_parse_int(p_argv(2));\n";
+    // names, as many times as the second argument says. A fuzz function
+    // gets `reps` deterministic inputs from _fuzz_input's seeds.
+    var harness: str = source + "\n\nfn _fuzz_input(seed: i64) -> Vec<u8> {\n"
+        + "    var d: Vec<u8> = Vec::new();\n"
+        + "    var s: i64 = (seed * 2654435761 + 1) % 2147483648;\n"
+        + "    var n: i64 = 64 + (seed % 960);\n"
+        + "    var i: i64 = 0;\n"
+        + "    while i < n {\n"
+        + "        s = (s * 1103515245 + 12345) % 2147483648;\n"
+        + "        d.push((s >> 16) & 255);\n"
+        + "        i = i + 1;\n"
+        + "    }\n"
+        + "    return d;\n"
+        + "}\n\nfn main() -> i64 {\n    var which: str = \"all\";\n"
+        + "    match arg_at(1) { Option::Some(a) => { which = a; } Option::None => {} }\n"
+        + "    var reps: i64 = 1;\n"
+        + "    match arg_at(2) { Option::Some(a) => { reps = str_parse_int(a); } Option::None => {} }\n";
     var i: i64 = 0;
     while i < tests.len() {
-        harness = harness + "    if which == \"" + tests.get(i) + "\" { " + tests.get(i) + "(); }\n";
+        harness = harness + "    if which == \"all\" || which == \"" + tests.get(i) + "\" { " + tests.get(i) + "(); }\n";
+        i = i + 1;
+    }
+    i = 0;
+    while i < fuzzes.len() {
+        harness = harness + "    if which == \"" + fuzzes.get(i) + "\" {\n"
+            + "        var r2: i64 = 0;\n"
+            + "        while r2 < reps { " + fuzzes.get(i) + "(_fuzz_input(r2 + 1)); r2 = r2 + 1; }\n"
+            + "    }\n";
         i = i + 1;
     }
     i = 0;
@@ -868,11 +931,28 @@ fn cmd_test_file(n: i64, start: i64) -> i64 {
     }
     var failed: i64 = 0;
     i = 0;
+    // --update: the snapshots of expect_snapshot are rewritten
+    var run_cmd: str = run;
+    if update_snaps {
+        if is_posix_host() { run_cmd = "FIDES_UPDATE=1 " + run; }
+        else { run_cmd = "set FIDES_UPDATE=1 && " + run; }
+    }
     while i < tests.len() {
-        if p_system(run + " " + tests.get(i) + " 1") == 0 {
+        if p_system(run_cmd + " " + tests.get(i) + " 1") == 0 {
             print("ok    " + tests.get(i) + "\n");
         } else {
             print("FAIL  " + tests.get(i) + "\n");
+            failed = failed + 1;
+        }
+        i = i + 1;
+    }
+    // --fuzz: each fn fuzz_* gets 100 deterministic inputs in one process
+    i = 0;
+    while i < fuzzes.len() {
+        if p_system(run + " " + fuzzes.get(i) + " 100") == 0 {
+            print("ok    " + fuzzes.get(i) + " (100 seeds)\n");
+        } else {
+            print("FAIL  " + fuzzes.get(i) + "\n");
             failed = failed + 1;
         }
         i = i + 1;
@@ -901,6 +981,11 @@ fn cmd_test_file(n: i64, start: i64) -> i64 {
             }
         }
         i = i + 1;
+    }
+    // --coverage (CT8): one process that runs every test, through veil
+    if coverage {
+        print(veil_run(main_fd, "text", "coverage"));
+        print("\n");
     }
     p_file_delete(main_fd);
     p_file_delete("_fides_bench_out.txt");
@@ -3162,6 +3247,16 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     if nat_arch != 0 && !bare_mode && !boot_mode {
         var nat_out: str = find_output_arg(n, start, "a.out");
         if nat_win { nat_out = ensure_exe_extension(find_output_arg(n, start, "a.exe")); }
+        // --cpu <name> (TG10): the microarchitecture of the target, safe
+        // default per target (nat_cpu_default); --stats (RA17): per-function
+        // spill/reload/move counts on stderr.
+        var cpu_arg: str = get_flag_value(n, start, "--cpu", "");
+        if str_len(cpu_arg) > 0 {
+            var cpu_err: str = nat_cpu_check(nat_arch, cpu_arg);
+            if str_len(cpu_err) > 0 { print(cpu_err + "\n"); return 1; }
+            g_nat_cpu = cpu_arg;
+        }
+        if has_flag(n, start, "--stats") { g_nat_stats = true; }
         set_native_runtime("linux_runtime");
         g_native_rt_win = nat_win;
         g_native_rt_mac = nat_mac;

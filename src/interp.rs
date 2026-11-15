@@ -3019,6 +3019,13 @@ impl Interpreter {
                 // managed values, not raw memory, so there is nothing to wipe.
                 ExecOutcome::Value(Value::Void)
             }
+            // J8: no raw Vec buffers in the interpreter — no-op stubs
+            "p_sensitive_check" => ExecOutcome::Value(Value::Int(0)),
+            "p_sensitive_wipes" => ExecOutcome::Value(Value::Int(0)),
+            "p_sensitive_mark" | "p_sensitive_unmark"
+            | "p_sensitive_remark" | "p_sensitive_free" => {
+                ExecOutcome::Value(Value::Void)
+            }
             "p_region_free" => {
                 // I-1C: Region bulk free — interpreter doesn't actually free
                 ExecOutcome::Value(Value::Void)

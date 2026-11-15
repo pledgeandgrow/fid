@@ -1449,6 +1449,29 @@ pub fn TypeChecker_verify_trait_impls(self: &mut TypeChecker, program: Program) 
                     }
                     tmi = tmi + 1;
                 }
+                // The signature of each impl method against the trait's: the
+                // number of parameters, then each type the trait writes out
+                // in concrete types (one naming Self, an associated type or a
+                // type parameter is not compared)
+                var assoc_names: Vec<str> = Vec::new();
+                var an: i64 = 0;
+                while an < td.associated_types.len() {
+                    assoc_names.push(td.associated_types.get(an).name);
+                    an = an + 1;
+                }
+                var smi: i64 = 0;
+                while smi < ti.methods.len() {
+                    var im: Func = ti.methods.get(smi);
+                    var stj: i64 = 0;
+                    while stj < td.methods.len() {
+                        var stm: TraitMethod = td.methods.get(stj);
+                        if stm.name == im.name {
+                            TypeChecker_check_impl_sig(self, ti, stm, im, assoc_names);
+                        }
+                        stj = stj + 1;
+                    }
+                    smi = smi + 1;
+                }
                 // Check associated types
                 var provided_assoc: Vec<str> = Vec::new();
                 var ai: i64 = 0;
@@ -1476,6 +1499,76 @@ pub fn TypeChecker_verify_trait_impls(self: &mut TypeChecker, program: Program) 
 pub enum OptTraitDef {
     Some(TraitDef),
     None,
+}
+
+/// Whether a trait's type `ts` (as type_to_str writes it) is concrete enough
+/// to compare with an impl's: no `Self`, associated type, type parameter
+/// (a capitalised name of one or two letters) or trait object.
+fn tc_trait_ty_concrete(ts: str, assoc_names: Vec<str>) -> bool {
+    var n: i64 = str_len(ts);
+    var i: i64 = 0;
+    while i < n {
+        var c: i64 = str_byte_at(ts, i);
+        var is_start: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+        if is_start {
+            var j: i64 = i;
+            while j < n {
+                var d: i64 = str_byte_at(ts, j);
+                var word: bool = (d >= 65 && d <= 90) || (d >= 97 && d <= 122) || (d >= 48 && d <= 57) || d == 95;
+                if !word { break; }
+                j = j + 1;
+            }
+            var w: str = str_slice(ts, i, j);
+            if w == "Self" || w == "dyn" || w == "impl" { return false; }
+            if tc_str_vec_contains(assoc_names, w) { return false; }
+            if c >= 65 && c <= 90 && j - i <= 2 { return false; }
+            i = j;
+        } else {
+            i = i + 1;
+        }
+    }
+    return true;
+}
+
+/// An impl method `im` against the trait's method `tm` (LG4): the same
+/// number of parameters after `self`, and the same parameter and return
+/// types wherever the trait writes a concrete type.
+fn TypeChecker_check_impl_sig(self: &mut TypeChecker, ti: TraitImpl, tm: TraitMethod, im: Func, assoc_names: Vec<str>) {
+    var t0: i64 = 0;
+    if tm.has_self { t0 = 1; }
+    var i0: i64 = 0;
+    if im.params.len() > 0 {
+        if im.params.get(0).name == "self" { i0 = 1; }
+    }
+    var where_s: str = "method '" + im.name + "' of impl " + ti.trait_name + " for " + ti.type_name;
+    if tm.has_self != (i0 == 1) {
+        if tm.has_self {
+            self.errors.push("Type error: " + where_s + " has no self parameter; the trait's method takes self");
+        } else {
+            self.errors.push("Type error: " + where_s + " takes self; the trait's method does not");
+        }
+        return;
+    }
+    var tn: i64 = tm.params.len() - t0;
+    var inn: i64 = im.params.len() - i0;
+    if tn != inn {
+        self.errors.push("Type error: " + where_s + " takes " + int_to_str(inn) + " parameter(s); the trait's method takes " + int_to_str(tn));
+        return;
+    }
+    var k: i64 = 0;
+    while k < tn {
+        var ts: str = type_to_str(TypeChecker_resolve_type(self, tm.params.get(t0 + k).ty));
+        var ist: str = type_to_str(TypeChecker_resolve_type(self, im.params.get(i0 + k).ty));
+        if tc_trait_ty_concrete(ts, assoc_names) && ts != ist {
+            self.errors.push("Type error: " + where_s + ": parameter '" + im.params.get(i0 + k).name + "' is " + ist + "; the trait's method says " + ts);
+        }
+        k = k + 1;
+    }
+    var tr: str = type_to_str(TypeChecker_resolve_type(self, tm.ret_ty));
+    var ir: str = type_to_str(TypeChecker_resolve_type(self, im.ret_ty));
+    if tc_trait_ty_concrete(tr, assoc_names) && tr != ir {
+        self.errors.push("Type error: " + where_s + " returns " + ir + "; the trait's method returns " + tr);
+    }
 }
 
 // --- check_bodies and verification passes --------------------------------
@@ -10765,8 +10858,25 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             return Type::Func(closure_params, Box::new(closure_ret));
         }
         Expr::Cast(e, target_ty) => {
-            TypeChecker_check_expr(self, box_expr_unbox(e));
-            return TypeChecker_resolve_type(self, target_ty);
+            var cast_src: Type = TypeChecker_check_expr(self, box_expr_unbox(e));
+            var cast_dst: Type = TypeChecker_resolve_type(self, target_ty);
+            // `v as dyn Trait` (LG4): v's type must implement Trait, or the
+            // call through the object finds no method at run time
+            match cast_dst {
+                Type::Dyn(dyn_tr) => {
+                    var cast_named: bool = false;
+                    match cast_src {
+                        Type::Named(_) => { cast_named = true; }
+                        Type::Generic(_, _) => { cast_named = true; }
+                        _ => {}
+                    }
+                    if cast_named && TypeChecker_is_trait_name(self, dyn_tr) && !TypeChecker_satisfies_bound(self, cast_src, dyn_tr) {
+                        self.errors.push("Type error: " + type_to_str(cast_src) + " does not implement " + dyn_tr + " (in `as dyn " + dyn_tr + "`)");
+                    }
+                }
+                _ => {}
+            }
+            return cast_dst;
         }
         Expr::Asm(_, operands) => {
             if self.sandbox_depth > 0 {

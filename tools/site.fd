@@ -1,0 +1,960 @@
+// tools/site.fd — the project website, served by a Fides program (AD2).
+//
+// Renders the repository's Markdown to HTML when a page is asked for:
+// README.md is the home page; docs/book/, docs/guides/, docs/reference/ and
+// a few top-level docs/*.md pages are the rest. One layout (header, nav, a
+// sidebar of the section's pages), one stylesheet served by the program, no
+// external assets.
+//
+//   fid ccompile tools/site.fd -o site.exe        (CC="zig cc")
+//   site.exe [--port 8080] [--root .]             serve on http://localhost:8080/
+//   site.exe --build out [--base /fid/]           write the same pages as files
+//   site.exe --get /docs/cookbook.html            print one response, no network
+//
+// URL /a/b.html is the page of a/b.md (also /a/b.md); / and /index.html are
+// README.md; /docs/book/ is that section's README.md, /docs/guides/ and
+// /docs/reference/ a generated list of their pages; /pages.html lists every
+// page; /style.css is the stylesheet. A request path with "..", ".", a
+// segment starting with '.', a backslash, ':', "//", '%' left after
+// decoding, "%00" or a control byte is refused (403) before any file is
+// named, and only the Markdown files above are ever read. Docs: docs/website.md.
+
+module site;
+
+use core;
+use http;
+use args;
+use fs;
+use markdown;
+
+/// Where the repository is (README.md, docs/).
+var g_site_root: str = ".";
+/// The URL path of the site's root, for the static 404 page (--base).
+var g_site_base: str = "/";
+
+pub fn site_repo_url() -> str {
+    return "https://github.com/pledgeandgrow/fid";
+}
+
+// ─── Which files are pages ────────────────────────────────────────────────
+
+/// Directories whose *.md files (one level) are pages.
+pub fn site_sections() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push("docs/book");
+    v.push("docs/guides");
+    v.push("docs/reference");
+    return v;
+}
+
+/// Pages outside the sections.
+pub fn site_top_pages() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push("README.md");
+    v.push("docs/cookbook.md");
+    v.push("docs/benchmarks.md");
+    v.push("docs/internal-tools.md");
+    v.push("docs/website.md");
+    return v;
+}
+
+/// The parts joined, pairwise (no quadratic copying; core's StringBuilder
+/// keeps its buffer for good, which a server cannot afford).
+pub fn site_join(parts: Vec<str>) -> str {
+    if parts.len() == 0 { return ""; }
+    var cur: Vec<str> = parts;
+    while cur.len() > 1 {
+        var next: Vec<str> = Vec::new();
+        var i: i64 = 0;
+        while i + 1 < cur.len() {
+            next.push(cur.get(i) + cur.get(i + 1));
+            i = i + 2;
+        }
+        if i < cur.len() { next.push(cur.get(i)); }
+        cur = next;
+    }
+    return cur.get(0);
+}
+
+fn site_vec_has(v: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == s { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn site_is_section(dir: str) -> bool {
+    return site_vec_has(site_sections(), dir);
+}
+
+/// May repository path `rel` be shown as a page? (It need not exist.)
+pub fn site_is_source(rel: str) -> bool {
+    if str_contains(rel, "..") || str_contains(rel, "\\") || str_contains(rel, ":") { return false; }
+    if site_vec_has(site_top_pages(), rel) { return true; }
+    if !str_ends_with(rel, ".md") { return false; }
+    val slash: i64 = str_rfind(rel, "/");
+    if slash <= 0 { return false; }
+    val name: str = str_slice(rel, slash + 1, str_len(rel));
+    if str_len(name) <= 3 || str_byte_at(name, 0) == 46 { return false; }
+    return site_is_section(str_slice(rel, 0, slash));
+}
+
+fn site_file(rel: str) -> str {
+    return g_site_root + "/" + rel;
+}
+
+/// A page that exists.
+pub fn site_has_page(rel: str) -> bool {
+    return site_is_source(rel) && fs_is_file(site_file(rel));
+}
+
+/// The site path of page `src`: README.md is index.html, a.md is a.html.
+pub fn site_html_path(src: str) -> str {
+    if src == "README.md" { return "index.html"; }
+    return str_slice(src, 0, str_len(src) - 3) + ".html";
+}
+
+/// "../" once per directory of site path `html`: from that page to the root.
+pub fn site_prefix(html: str) -> str {
+    var p: str = "";
+    var i: i64 = 0;
+    while i < str_len(html) {
+        if str_byte_at(html, i) == 47 { p = p + "../"; }
+        i = i + 1;
+    }
+    return p;
+}
+
+// ─── Request paths ────────────────────────────────────────────────────────
+
+fn site_hex(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    return -1;
+}
+
+/// Percent-decoding of a request path ('+' stays '+'; a '%' not followed
+/// by two hex digits stays, and site_clean_path then refuses it).
+pub fn site_pct_decode(s: str) -> str {
+    var sb: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    val n: i64 = str_len(s);
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        if c == 37 && i + 2 < n && site_hex(str_byte_at(s, i + 1)) >= 0 && site_hex(str_byte_at(s, i + 2)) >= 0 {
+            sb.push(byte_to_str(site_hex(str_byte_at(s, i + 1)) * 16 + site_hex(str_byte_at(s, i + 2))));
+            i = i + 3;
+        } else {
+            sb.push(byte_to_str(c));
+            i = i + 1;
+        }
+    }
+    return site_join(sb);
+}
+
+/// The decoded request path, still starting with '/', or "" when it is
+/// refused: not starting with '/', too long, "%00", a control byte, a
+/// backslash, ':', "//", a '%' left after decoding (double encoding), or a
+/// segment that is "..", "." or starts with '.'.
+pub fn site_clean_path(raw: str) -> str {
+    val n: i64 = str_len(raw);
+    if n == 0 || n > 1024 || str_byte_at(raw, 0) != 47 { return ""; }
+    if str_contains(raw, "%00") { return ""; }
+    val p: str = site_pct_decode(raw);
+    var i: i64 = 0;
+    while i < str_len(p) {
+        val c: i64 = str_byte_at(p, i);
+        if c < 32 || c == 127 || c == 92 || c == 58 || c == 37 { return ""; }
+        if c == 47 && i + 1 < str_len(p) {
+            val d: i64 = str_byte_at(p, i + 1);
+            if d == 47 || d == 46 { return ""; }   // "//", "/." (also "/..")
+        }
+        i = i + 1;
+    }
+    return p;
+}
+
+/// Where a request goes. `kind`: "page" (target: the Markdown file),
+/// "index" (target: a section), "pages", "css", "svg" (target: the file),
+/// "redirect" (target: the Location), "missing" (404), "refused" (403).
+pub struct SiteRoute {
+    pub status: i64,
+    pub kind: str,
+    pub target: str,
+}
+
+fn site_r(status: i64, kind: str, target: str) -> SiteRoute {
+    return SiteRoute { status: status, kind: kind, target: target };
+}
+
+/// Route a raw request path (no query).
+pub fn site_route(raw: str) -> SiteRoute {
+    val clean: str = site_clean_path(raw);
+    if clean == "" { return site_r(403, "refused", ""); }
+    var rel: str = str_slice(clean, 1, str_len(clean));
+    if site_is_section(rel) {
+        return site_r(301, "redirect", "/" + rel + "/");
+    }
+    if rel == "" || str_ends_with(rel, "/") { rel = rel + "index.html"; }
+    if rel == "style.css" { return site_r(200, "css", ""); }
+    if rel == "pages.html" { return site_r(200, "pages", ""); }
+    if rel == "docs/fid-logo.svg" {
+        if fs_is_file(site_file(rel)) { return site_r(200, "svg", rel); }
+        return site_r(404, "missing", "");
+    }
+    if rel == "index.html" || rel == "README.html" || rel == "README.md" {
+        return site_r(200, "page", "README.md");
+    }
+    if str_ends_with(rel, "/index.html") {
+        val dir: str = str_slice(rel, 0, str_len(rel) - 11);
+        if site_is_section(dir) {
+            if site_has_page(dir + "/README.md") { return site_r(200, "page", dir + "/README.md"); }
+            return site_r(200, "index", dir);
+        }
+    }
+    if str_ends_with(rel, ".html") {
+        val src: str = str_slice(rel, 0, str_len(rel) - 5) + ".md";
+        if site_has_page(src) { return site_r(200, "page", src); }
+    }
+    if str_ends_with(rel, ".md") && site_has_page(rel) {
+        return site_r(200, "page", rel);
+    }
+    return site_r(404, "missing", "");
+}
+
+// ─── Markdown beyond markdown.fd: tables and HTML blocks ─────────────────
+
+fn site_is_sep_row(t: str) -> bool {
+    if !str_contains(t, "|") || !str_contains(t, "-") { return false; }
+    var i: i64 = 0;
+    while i < str_len(t) {
+        val c: i64 = str_byte_at(t, i);
+        if c != 124 && c != 45 && c != 58 && c != 32 && c != 9 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The cells of a table row: split at '|' not escaped by '\', outer pipes
+/// dropped, "\|" read as '|' (GitHub's rule, also inside `code`).
+pub fn site_cells(line: str) -> Vec<str> {
+    var t: str = str_trim(line);
+    if str_starts_with(t, "|") { t = str_slice(t, 1, str_len(t)); }
+    if str_ends_with(t, "|") && !str_ends_with(t, "\\|") { t = str_slice(t, 0, str_len(t) - 1); }
+    var cells: Vec<str> = Vec::new();
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(t) {
+        val c: i64 = str_byte_at(t, i);
+        if c == 92 && i + 1 < str_len(t) {
+            i = i + 2;
+            continue;
+        }
+        if c == 124 {
+            cells.push(str_trim(str_replace(str_slice(t, start, i), "\\|", "|")));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    cells.push(str_trim(str_replace(str_slice(t, start, str_len(t)), "\\|", "|")));
+    return cells;
+}
+
+fn site_align(sep: str) -> str {
+    val left: bool = str_starts_with(sep, ":");
+    val right: bool = str_ends_with(sep, ":");
+    if left && right { return " style=\"text-align:center\""; }
+    if right { return " style=\"text-align:right\""; }
+    return "";
+}
+
+fn site_table(rows: Vec<str>) -> str {
+    val head: Vec<str> = site_cells(rows.get(0));
+    val seps: Vec<str> = site_cells(rows.get(1));
+    var aligns: Vec<str> = Vec::new();
+    var k: i64 = 0;
+    while k < head.len() {
+        if k < seps.len() { aligns.push(site_align(seps.get(k))); } else { aligns.push(""); }
+        k = k + 1;
+    }
+    var sb: Vec<str> = Vec::new();
+    sb.push("<div class=\"table\"><table>\n<thead><tr>");
+    k = 0;
+    while k < head.len() {
+        sb.push("<th" + aligns.get(k) + ">" + md_inline(head.get(k)) + "</th>");
+        k = k + 1;
+    }
+    sb.push("</tr></thead>\n<tbody>\n");
+    var r: i64 = 2;
+    while r < rows.len() {
+        val cells: Vec<str> = site_cells(rows.get(r));
+        sb.push("<tr>");
+        k = 0;
+        while k < head.len() {
+            var cell: str = "";
+            if k < cells.len() { cell = cells.get(k); }
+            sb.push("<td" + aligns.get(k) + ">" + md_inline(cell) + "</td>");
+            k = k + 1;
+        }
+        sb.push("</tr>\n");
+        r = r + 1;
+    }
+    sb.push("</tbody></table></div>\n");
+    return site_join(sb);
+}
+
+// Does trimmed line `t` start an HTML block (a tag, a closing tag or a
+// comment, not an <http://autolink>)?
+fn site_is_html_start(t: str) -> bool {
+    if str_len(t) < 2 || str_byte_at(t, 0) != 60 { return false; }
+    if str_starts_with(t, "<http://") || str_starts_with(t, "<https://") { return false; }
+    val c: i64 = str_byte_at(t, 1);
+    return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 47 || c == 33;
+}
+
+fn site_attr(tag: str, name: str) -> str {
+    val at: i64 = str_find(tag, name + "=\"");
+    if at < 0 { return ""; }
+    val from: i64 = at + str_len(name) + 2;
+    var e: i64 = from;
+    while e < str_len(tag) && str_byte_at(tag, e) != 34 { e = e + 1; }
+    return str_slice(tag, from, e);
+}
+
+/// Raw HTML from the repository's own Markdown is passed through, except an
+/// <img> from another site (a badge), which becomes its alt text: the site
+/// loads nothing from elsewhere.
+pub fn site_strip_external_img(html: str) -> str {
+    var sb: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    var last: i64 = 0;
+    val n: i64 = str_len(html);
+    while i + 4 < n {
+        if str_byte_at(html, i) == 60 && str_slice(html, i, i + 4) == "<img" {
+            var e: i64 = i;
+            while e < n && str_byte_at(html, e) != 62 { e = e + 1; }
+            val tag: str = str_slice(html, i, e);
+            val src: str = site_attr(tag, "src");
+            if str_starts_with(src, "http:") || str_starts_with(src, "https:") || str_starts_with(src, "//") {
+                sb.push(str_slice(html, last, i));
+                sb.push(md_escape(site_attr(tag, "alt")));
+                last = e + 1;
+                i = e + 1;
+                continue;
+            }
+        }
+        i = i + 1;
+    }
+    if last < n { sb.push(str_slice(html, last, n)); }
+    return site_join(sb);
+}
+
+/// Markdown to an HTML fragment: tables and HTML blocks here, the rest by
+/// markdown.fd's md_to_html.
+pub fn site_render_md(text0: str) -> str {
+    val text: str = str_replace(text0, "\r", "");
+    val lines: Vec<str> = str_lines(text);
+    var sb: Vec<str> = Vec::new();
+    var chunk: Vec<str> = Vec::new();
+    var in_fence: bool = false;
+    var prev_blank: bool = true;
+    var i: i64 = 0;
+    val n: i64 = lines.len();
+    while i < n {
+        val line: str = lines.get(i);
+        val t: str = str_trim(line);
+        if str_starts_with(t, "```") {
+            in_fence = !in_fence;
+            chunk.push(line + "\n");
+            prev_blank = false;
+            i = i + 1;
+            continue;
+        }
+        if !in_fence && prev_blank && site_is_html_start(t) {
+            sb.push(md_to_html(site_join(chunk)));
+            chunk = Vec::new();
+            var raw: Vec<str> = Vec::new();
+            while i < n && str_len(str_trim(lines.get(i))) > 0 {
+                raw.push(lines.get(i) + "\n");
+                i = i + 1;
+            }
+            sb.push(site_strip_external_img(site_join(raw)));
+            continue;
+        }
+        if !in_fence && str_contains(t, "|") && i + 1 < n && site_is_sep_row(str_trim(lines.get(i + 1))) {
+            sb.push(md_to_html(site_join(chunk)));
+            chunk = Vec::new();
+            var rows: Vec<str> = Vec::new();
+            rows.push(t);
+            rows.push(str_trim(lines.get(i + 1)));
+            i = i + 2;
+            while i < n && str_len(str_trim(lines.get(i))) > 0 && str_contains(lines.get(i), "|") {
+                rows.push(str_trim(lines.get(i)));
+                i = i + 1;
+            }
+            sb.push(site_table(rows));
+            prev_blank = true;
+            continue;
+        }
+        chunk.push(line + "\n");
+        prev_blank = str_len(t) == 0;
+        i = i + 1;
+    }
+    sb.push(md_to_html(site_join(chunk)));
+    return site_join(sb);
+}
+
+// ─── Links and heading anchors ────────────────────────────────────────────
+
+/// `rel` resolved against directory `dir` ("" is the root), with "." and
+/// ".." taken out; "" when it climbs above the root.
+pub fn site_resolve(dir: str, rel: str) -> str {
+    var parts: Vec<str> = Vec::new();
+    var all: str = rel;
+    if str_len(dir) > 0 { all = dir + "/" + rel; }
+    val segs: Vec<str> = str_split(all, "/");
+    var i: i64 = 0;
+    while i < segs.len() {
+        val s: str = segs.get(i);
+        if s == ".." {
+            if parts.len() == 0 { return ""; }
+            parts.pop();
+        } else if s != "." && s != "" {
+            parts.push(s);
+        }
+        i = i + 1;
+    }
+    var out: str = "";
+    i = 0;
+    while i < parts.len() {
+        if i > 0 { out = out + "/"; }
+        out = out + parts.get(i);
+        i = i + 1;
+    }
+    if str_ends_with(rel, "/") && str_len(out) > 0 { out = out + "/"; }
+    return out;
+}
+
+fn site_dirname(rel: str) -> str {
+    val slash: i64 = str_rfind(rel, "/");
+    if slash < 0 { return ""; }
+    return str_slice(rel, 0, slash);
+}
+
+/// A link of page `src` (a repository path) as the site writes it: a page
+/// becomes its .html, relative to this page; the logo stays here; any other
+/// file of the repository goes to GitHub; other sites and #anchors are kept.
+pub fn site_link(href: str, src: str) -> str {
+    if str_len(href) == 0 || str_starts_with(href, "#") || str_starts_with(href, "//") { return href; }
+    val colon: i64 = str_find(href, ":");
+    val slash0: i64 = str_find(href, "/");
+    if colon >= 0 && (slash0 < 0 || colon < slash0) { return href; }   // http:, mailto:, ...
+    var path: str = href;
+    var frag: str = "";
+    val hash: i64 = str_find(href, "#");
+    if hash >= 0 {
+        path = str_slice(href, 0, hash);
+        frag = str_slice(href, hash, str_len(href));
+    }
+    var target: str = "";
+    if str_starts_with(path, "/") {
+        target = site_resolve("", str_slice(path, 1, str_len(path)));
+    } else {
+        target = site_resolve(site_dirname(src), path);
+    }
+    if target == "" { return href; }
+    val prefix: str = site_prefix(site_html_path(src));
+    if str_ends_with(target, "/") && site_is_section(str_slice(target, 0, str_len(target) - 1)) {
+        return prefix + target + "index.html" + frag;
+    }
+    if site_has_page(target) { return prefix + site_html_path(target) + frag; }
+    if target == "docs/fid-logo.svg" { return prefix + target; }
+    return site_repo_url() + "/blob/main/" + target + frag;
+}
+
+/// Every href="..." and src="..." of `html` through site_link.
+pub fn site_rewrite_links(html: str, src: str) -> str {
+    var sb: Vec<str> = Vec::new();
+    val n: i64 = str_len(html);
+    var i: i64 = 0;
+    var last: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(html, i);
+        var skip: i64 = 0;
+        if c == 104 && i + 6 <= n && str_slice(html, i, i + 6) == "href=\"" { skip = 6; }
+        if c == 115 && i + 5 <= n && str_slice(html, i, i + 5) == "src=\"" { skip = 5; }
+        if skip > 0 && i > 0 && str_byte_at(html, i - 1) == 32 {
+            val from: i64 = i + skip;
+            var e: i64 = from;
+            while e < n && str_byte_at(html, e) != 34 { e = e + 1; }
+            sb.push(str_slice(html, last, from));
+            sb.push(site_link(str_slice(html, from, e), src));
+            last = e;
+            i = e;
+            continue;
+        }
+        i = i + 1;
+    }
+    sb.push(str_slice(html, last, n));
+    return site_join(sb);
+}
+
+/// Text of an HTML fragment: tags dropped, the entities md_escape makes read.
+pub fn site_text(html: str) -> str {
+    var sb: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    var in_tag: bool = false;
+    while i < str_len(html) {
+        val c: i64 = str_byte_at(html, i);
+        if c == 60 { in_tag = true; }
+        else if c == 62 { in_tag = false; }
+        else if !in_tag { sb.push(byte_to_str(c)); }
+        i = i + 1;
+    }
+    var t: str = site_join(sb);
+    t = str_replace(t, "&lt;", "<");
+    t = str_replace(t, "&gt;", ">");
+    t = str_replace(t, "&quot;", "\"");
+    t = str_replace(t, "&amp;", "&");
+    return t;
+}
+
+/// GitHub's anchor of a heading: lower case, spaces to '-', other
+/// punctuation dropped (also the common non-ASCII marks: — – → § “ ”).
+pub fn site_slug(text: str) -> str {
+    var sb: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    val n: i64 = str_len(text);
+    while i < n {
+        val c: i64 = str_byte_at(text, i);
+        if (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95 || c == 45 {
+            sb.push(byte_to_str(c));
+        } else if c >= 65 && c <= 90 {
+            sb.push(byte_to_str(c + 32));
+        } else if c == 32 {
+            sb.push(byte_to_str(45));
+        } else if c == 226 {
+            i = i + 2;            // U+2000..U+2FFF: punctuation, arrows, symbols
+        } else if c == 194 {
+            i = i + 1;            // U+0080..U+00BF: Latin-1 symbols
+        } else if c >= 240 {
+            i = i + 3;            // emoji
+        } else if c >= 128 {
+            sb.push(byte_to_str(c));    // letters of other scripts
+        }
+        i = i + 1;
+    }
+    return site_join(sb);
+}
+
+/// Give each <hN> of md_to_html an id (GitHub's anchor; a repeat gets -1,
+/// -2, ...). The first <h1>'s text comes back through `title`.
+pub fn site_anchor_headings(html: str, title: &mut str) -> str {
+    var sb: Vec<str> = Vec::new();
+    var used: Vec<str> = Vec::new();
+    val n: i64 = str_len(html);
+    var i: i64 = 0;
+    var last: i64 = 0;
+    while i + 3 < n {
+        if str_byte_at(html, i) == 60 && str_byte_at(html, i + 1) == 104 &&
+           str_byte_at(html, i + 2) >= 49 && str_byte_at(html, i + 2) <= 54 && str_byte_at(html, i + 3) == 62 {
+            val level: str = str_slice(html, i + 2, i + 3);
+            val close: str = "</h" + level + ">";
+            var e: i64 = i + 4;
+            while e + 5 <= n && str_slice(html, e, e + 5) != close { e = e + 1; }
+            if e + 5 <= n {
+                val inner: str = str_slice(html, i + 4, e);
+                val text: str = site_text(inner);
+                if level == "1" && *title == "" { *title = str_trim(text); }
+                val base: str = site_slug(text);
+                var slug: str = base;
+                var k: i64 = 1;
+                while site_vec_has(used, slug) {
+                    slug = base + "-" + int_to_str(k);
+                    k = k + 1;
+                }
+                used.push(slug);
+                sb.push(str_slice(html, last, i));
+                sb.push("<h" + level + " id=\"" + slug + "\">" + inner + close);
+                i = e + 5;
+                last = i;
+                continue;
+            }
+        }
+        i = i + 1;
+    }
+    sb.push(str_slice(html, last, n));
+    return site_join(sb);
+}
+
+// ─── Layout ───────────────────────────────────────────────────────────────
+
+/// The first "# " heading of a Markdown file, or its name.
+pub fn site_title_of(src: str) -> str {
+    val text: str = fs_read_text(site_file(src));
+    val lines: Vec<str> = str_lines(text);
+    var i: i64 = 0;
+    while i < lines.len() && i < 60 {
+        val t: str = str_trim(lines.get(i));
+        if str_starts_with(t, "# ") { return site_text(md_inline(str_trim(str_slice(t, 2, str_len(t))))); }
+        i = i + 1;
+    }
+    if src == "README.md" { return "Fides"; }
+    val slash: i64 = str_rfind(src, "/");
+    return str_slice(src, slash + 1, str_len(src) - 3);
+}
+
+fn site_sort(v: &mut Vec<str>) {
+    var i: i64 = 1;
+    while i < v.len() {
+        val x: str = v.get(i);
+        var j: i64 = i - 1;
+        while j >= 0 && str_compare(v.get(j), x) > 0 {
+            v.set(j + 1, v.get(j));
+            j = j - 1;
+        }
+        v.set(j + 1, x);
+        i = i + 1;
+    }
+}
+
+/// The pages of a section, README.md first, then by file name.
+pub fn site_section_pages(dir: str) -> Vec<str> {
+    var names: Vec<str> = fs_list_dir(site_file(dir));
+    site_sort(&mut names);
+    var out: Vec<str> = Vec::new();
+    if site_has_page(dir + "/README.md") { out.push(dir + "/README.md"); }
+    var i: i64 = 0;
+    while i < names.len() {
+        val rel: str = dir + "/" + names.get(i);
+        if names.get(i) != "README.md" && site_has_page(rel) { out.push(rel); }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The section a page belongs to ("" for a top-level page).
+fn site_section_of(src: str) -> str {
+    val d: str = site_dirname(src);
+    if site_is_section(d) { return d; }
+    return "";
+}
+
+fn site_nav_link(prefix: str, href: str, label: str, on: bool) -> str {
+    var cls: str = "";
+    if on { cls = " class=\"on\""; }
+    return "<a" + cls + " href=\"" + prefix + href + "\">" + label + "</a>";
+}
+
+/// The page around `body`. `html` is the page's own site path (it sets the
+/// relative prefix), `src` its Markdown file ("" for a generated page),
+/// `section` the sidebar to show ("" for none).
+pub fn site_layout(title: str, body: str, html: str, src: str, section: str) -> str {
+    val prefix: str = site_prefix(html);
+    var sb: Vec<str> = Vec::new();
+    sb.push("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
+    sb.push("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+    var full: str = "Fides";
+    if title != "" && title != "Fides" { full = title + " · Fides"; }
+    sb.push("<title>" + md_escape(full) + "</title>\n");
+    sb.push("<link rel=\"stylesheet\" href=\"" + prefix + "style.css\">\n</head>\n<body>\n");
+    sb.push("<header class=\"top\">\n<a class=\"brand\" href=\"" + prefix + "index.html\">Fides</a>\n<nav>");
+    sb.push(site_nav_link(prefix, "index.html", "Home", src == "README.md"));
+    if site_has_page("docs/book/README.md") {
+        sb.push(site_nav_link(prefix, "docs/book/index.html", "Book", section == "docs/book"));
+    }
+    if site_has_page("docs/cookbook.md") {
+        sb.push(site_nav_link(prefix, "docs/cookbook.html", "Cookbook", src == "docs/cookbook.md"));
+    }
+    sb.push(site_nav_link(prefix, "docs/guides/index.html", "Guides", section == "docs/guides"));
+    sb.push(site_nav_link(prefix, "docs/reference/index.html", "Reference", section == "docs/reference"));
+    if site_has_page("docs/benchmarks.md") {
+        sb.push(site_nav_link(prefix, "docs/benchmarks.html", "Benchmarks", src == "docs/benchmarks.md"));
+    }
+    sb.push(site_nav_link(prefix, "pages.html", "All pages", html == "pages.html"));
+    sb.push("<a href=\"" + site_repo_url() + "\">GitHub</a>");
+    sb.push("</nav>\n</header>\n<div class=\"wrap\">\n");
+    if section != "" {
+        val pages: Vec<str> = site_section_pages(section);
+        sb.push("<aside><ul>\n");
+        var i: i64 = 0;
+        while i < pages.len() {
+            val p: str = pages.get(i);
+            var cls: str = "";
+            if p == src { cls = " class=\"on\""; }
+            sb.push("<li><a" + cls + " href=\"" + prefix + site_html_path(p) + "\">" +
+                          md_escape(site_title_of(p)) + "</a></li>\n");
+            i = i + 1;
+        }
+        sb.push("</ul></aside>\n");
+    }
+    sb.push("<main>\n" + body + "</main>\n</div>\n<footer>Served by <code>tools/site.fd</code>, a Fides program.");
+    if src != "" {
+        sb.push(" Source of this page: <a href=\"" + site_repo_url() + "/blob/main/" + src + "\">" + src + "</a>.");
+    }
+    sb.push(" Corrections welcome: <a href=\"" + site_repo_url() + "/issues\">issues</a>.</footer>\n</body>\n</html>\n");
+    return site_join(sb);
+}
+
+/// The HTML page of Markdown file `src`.
+pub fn site_render_page(src: str) -> str {
+    val text: str = fs_read_text(site_file(src));
+    var title: str = "";
+    val body: str = site_anchor_headings(site_rewrite_links(site_render_md(text), src), &mut title);
+    if title == "" { title = site_title_of(src); }
+    var html: str = site_html_path(src);
+    // /docs/book/ shows the book's README.md: its links are relative to
+    // that directory either way.
+    return site_layout(title, body, html, src, site_section_of(src));
+}
+
+fn site_list(pages: Vec<str>, prefix: str) -> str {
+    var sb: Vec<str> = Vec::new();
+    sb.push("<ul class=\"pages\">\n");
+    var i: i64 = 0;
+    while i < pages.len() {
+        val p: str = pages.get(i);
+        sb.push("<li><a href=\"" + prefix + site_html_path(p) + "\">" + md_escape(site_title_of(p)) +
+                      "</a> <span class=\"path\">" + p + "</span></li>\n");
+        i = i + 1;
+    }
+    sb.push("</ul>\n");
+    return site_join(sb);
+}
+
+fn site_section_name(dir: str) -> str {
+    if dir == "docs/book" { return "The Fides Book"; }
+    if dir == "docs/guides" { return "Guides"; }
+    if dir == "docs/reference" { return "Reference"; }
+    return dir;
+}
+
+/// The generated list of a section without a README.md.
+pub fn site_render_index(dir: str) -> str {
+    val html: str = dir + "/index.html";
+    val body: str = "<h1>" + site_section_name(dir) + "</h1>\n" + site_list(site_section_pages(dir), site_prefix(html));
+    return site_layout(site_section_name(dir), body, html, "", dir);
+}
+
+/// Every page of the site.
+pub fn site_all_pages() -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val tops: Vec<str> = site_top_pages();
+    var i: i64 = 0;
+    while i < tops.len() {
+        if site_has_page(tops.get(i)) { out.push(tops.get(i)); }
+        i = i + 1;
+    }
+    val secs: Vec<str> = site_sections();
+    i = 0;
+    while i < secs.len() {
+        val ps: Vec<str> = site_section_pages(secs.get(i));
+        var j: i64 = 0;
+        while j < ps.len() {
+            out.push(ps.get(j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn site_render_pages() -> str {
+    var sb: Vec<str> = Vec::new();
+    sb.push("<h1>All pages</h1>\n");
+    var tops: Vec<str> = Vec::new();
+    val tl: Vec<str> = site_top_pages();
+    var i: i64 = 0;
+    while i < tl.len() {
+        if site_has_page(tl.get(i)) { tops.push(tl.get(i)); }
+        i = i + 1;
+    }
+    sb.push(site_list(tops, ""));
+    val secs: Vec<str> = site_sections();
+    i = 0;
+    while i < secs.len() {
+        val d: str = secs.get(i);
+        sb.push("<h2 id=\"" + site_slug(site_section_name(d)) + "\">" + site_section_name(d) + "</h2>\n");
+        sb.push(site_list(site_section_pages(d), ""));
+        i = i + 1;
+    }
+    return site_layout("All pages", site_join(sb), "pages.html", "", "");
+}
+
+/// The 404 page. Its links start at `base` (the site's root URL path): it
+/// is shown for a path of any depth.
+pub fn site_render_missing(base: str) -> str {
+    return "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n" +
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n" +
+        "<title>Not found · Fides</title>\n<link rel=\"stylesheet\" href=\"" + base + "style.css\">\n</head>\n<body>\n" +
+        "<header class=\"top\">\n<a class=\"brand\" href=\"" + base + "index.html\">Fides</a>\n<nav>" +
+        "<a href=\"" + base + "index.html\">Home</a><a href=\"" + base + "pages.html\">All pages</a></nav>\n</header>\n" +
+        "<div class=\"wrap\">\n<main>\n<h1>Not found</h1>\n<p>There is no page here. " +
+        "<a href=\"" + base + "pages.html\">All pages</a> lists what there is.</p>\n</main>\n</div>\n</body>\n</html>\n";
+}
+
+pub fn site_css() -> str {
+    return ":root{--bg:#fdfdfc;--fg:#1d2126;--muted:#5d6670;--line:#e3e6ea;--accent:#2b5fab;--code:#f3f4f6;--side:#f7f8f9}\n" +
+        "@media (prefers-color-scheme:dark){:root{--bg:#15181c;--fg:#e4e7eb;--muted:#9aa3ad;--line:#2a3038;--accent:#7fa8e8;--code:#1f242a;--side:#1a1e23}}\n" +
+        "*{box-sizing:border-box}\n" +
+        "html{-webkit-text-size-adjust:100%}\n" +
+        "body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 system-ui,-apple-system,\"Segoe UI\",Roboto,sans-serif}\n" +
+        "a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\n" +
+        "header.top{display:flex;flex-wrap:wrap;align-items:center;gap:.4rem 1.2rem;padding:.7rem 1rem;border-bottom:1px solid var(--line)}\n" +
+        "header.top .brand{font-weight:700;font-size:1.15rem;color:var(--fg)}\n" +
+        "header.top nav{display:flex;flex-wrap:wrap;gap:.2rem .9rem;font-size:.95rem}\n" +
+        "header.top nav a{color:var(--muted)}header.top nav a.on{color:var(--fg);font-weight:600}\n" +
+        ".wrap{display:flex;max-width:72rem;margin:0 auto;gap:2rem;padding:0 1rem}\n" +
+        "aside{flex:0 0 14rem;padding:1.2rem 0;font-size:.9rem}\n" +
+        "aside ul{list-style:none;margin:0;padding:0;position:sticky;top:1rem}\n" +
+        "aside li{margin:.15rem 0}aside a{color:var(--muted)}aside a.on{color:var(--fg);font-weight:600}\n" +
+        "main{flex:1;min-width:0;padding:1rem 0 3rem}\n" +
+        "main h1,main h2,main h3{line-height:1.25;margin:1.6em 0 .5em}main h1{margin-top:.6em;font-size:2rem}\n" +
+        "main h2{padding-bottom:.25em;border-bottom:1px solid var(--line)}\n" +
+        "code{font:.88em/1.4 ui-monospace,\"Cascadia Code\",Consolas,monospace;background:var(--code);padding:.1em .3em;border-radius:4px}\n" +
+        "pre{background:var(--code);padding:.8rem 1rem;border-radius:6px;overflow-x:auto}pre code{padding:0;background:none;font-size:.85em}\n" +
+        "blockquote{margin:1rem 0;padding:.1rem 1rem;border-left:3px solid var(--line);color:var(--muted)}\n" +
+        ".table{overflow-x:auto;margin:1rem 0}table{border-collapse:collapse;font-size:.92em}\n" +
+        "th,td{border:1px solid var(--line);padding:.35rem .6rem;vertical-align:top;text-align:left}th{background:var(--side)}\n" +
+        "img{max-width:100%}hr{border:0;border-top:1px solid var(--line);margin:2rem 0}\n" +
+        "ul.pages{padding-left:1.2rem}ul.pages .path{color:var(--muted);font-size:.85em;margin-left:.4rem}\n" +
+        "footer{max-width:72rem;margin:0 auto;padding:1.5rem 1rem 2.5rem;border-top:1px solid var(--line);color:var(--muted);font-size:.85rem}\n" +
+        "@media (max-width:760px){.wrap{display:block}aside{padding:.6rem 0;border-bottom:1px solid var(--line)}aside ul{position:static;columns:2}}\n";
+}
+
+// ─── Responses ────────────────────────────────────────────────────────────
+
+fn site_headers() -> str {
+    return "X-Content-Type-Options: nosniff\r\n" +
+           "Content-Security-Policy: default-src 'none'; style-src 'self'; img-src 'self'\r\n";
+}
+
+/// A whole response; for HEAD the head alone, with the body's length.
+fn site_reply(status: i64, ctype: str, extra: str, body: str, head_only: bool) -> str {
+    val resp: str = build_response_headers(status, ctype, site_headers() + extra, body);
+    if head_only { return str_slice(resp, 0, str_len(resp) - str_len(body)); }
+    return resp;
+}
+
+/// The response to `method` on raw request path `path` (no query).
+pub fn site_respond(method: str, path: str) -> str {
+    val head_only: bool = method == "HEAD";
+    if method != "GET" && !head_only {
+        return site_reply(405, "text/plain; charset=utf-8", "Allow: GET, HEAD\r\n", "Method Not Allowed\n", false);
+    }
+    val r: SiteRoute = site_route(path);
+    val html: str = "text/html; charset=utf-8";
+    if r.kind == "refused" {
+        return site_reply(403, "text/plain; charset=utf-8", "", "Forbidden\n", head_only);
+    }
+    if r.kind == "redirect" {
+        return site_reply(301, "text/plain; charset=utf-8", "Location: " + r.target + "\r\n", "Moved: " + r.target + "\n", head_only);
+    }
+    if r.kind == "css" { return site_reply(200, "text/css; charset=utf-8", "", site_css(), head_only); }
+    if r.kind == "svg" { return site_reply(200, "image/svg+xml", "", fs_read_text(site_file(r.target)), head_only); }
+    if r.kind == "page" { return site_reply(200, html, "", site_render_page(r.target), head_only); }
+    if r.kind == "index" { return site_reply(200, html, "", site_render_index(r.target), head_only); }
+    if r.kind == "pages" { return site_reply(200, html, "", site_render_pages(), head_only); }
+    return site_reply(404, html, "", site_render_missing("/"), head_only);
+}
+
+// http_serve, not http_serve_scoped: with the Nov 15 compiler the scoped
+// path frees a request twice after the first response ("Double free" in
+// http_conn_task; see docs/website.md).
+fn site_handler(req: HttpRequest) -> str {
+    val resp: str = site_respond(req.method, req.path);
+    println(req.method + " " + req.path + " " + str_slice(resp, 9, 12));
+    return resp;
+}
+
+// ─── Static build ─────────────────────────────────────────────────────────
+
+fn site_write(out: str, rel: str, content: str) -> bool {
+    val path: str = out + "/" + rel;
+    val dir: str = site_dirname(path);
+    if dir != "" && !fs_is_dir(dir) { fs_mkdir_all(dir); }
+    if !fs_write_text(path, content) {
+        println("site: cannot write " + path);
+        return false;
+    }
+    return true;
+}
+
+/// Write every page, the stylesheet, the logo, a 404.html and .nojekyll to
+/// `out` (GitHub Pages serves such a directory as it is). Files written.
+pub fn site_build(out: str) -> i64 {
+    var count: i64 = 0;
+    val pages: Vec<str> = site_all_pages();
+    var i: i64 = 0;
+    while i < pages.len() {
+        val src: str = pages.get(i);
+        val page: str = site_render_page(src);
+        if site_write(out, site_html_path(src), page) { count = count + 1; }
+        // A section's README.md is its directory's index.html too.
+        if str_ends_with(src, "/README.md") && site_write(out, site_dirname(src) + "/index.html", page) {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    val secs: Vec<str> = site_sections();
+    i = 0;
+    while i < secs.len() {
+        if !site_has_page(secs.get(i) + "/README.md") &&
+           site_write(out, secs.get(i) + "/index.html", site_render_index(secs.get(i))) {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    if site_write(out, "pages.html", site_render_pages()) { count = count + 1; }
+    if site_write(out, "style.css", site_css()) { count = count + 1; }
+    if site_write(out, "404.html", site_render_missing(g_site_base)) { count = count + 1; }
+    if site_write(out, ".nojekyll", "") { count = count + 1; }
+    if fs_is_file(site_file("docs/fid-logo.svg")) &&
+       site_write(out, "docs/fid-logo.svg", fs_read_text(site_file("docs/fid-logo.svg"))) {
+        count = count + 1;
+    }
+    return count;
+}
+
+// ─── Entry ────────────────────────────────────────────────────────────────
+
+fn site_usage() {
+    println("usage: site [--port N] [--root DIR]        serve the website (default port 8080)");
+    println("       site --build OUTDIR [--base /path/] write it as static files");
+    println("       site --get /url/path                 print one response");
+}
+
+fn main() -> i64 {
+    val av: Vec<str> = args_all();
+    if args_flag_in(av, "-h", "--help") {
+        site_usage();
+        return 0;
+    }
+    g_site_root = args_option_in(av, "-r", "--root", ".");
+    g_site_base = args_option_in(av, "", "--base", "/");
+    if !fs_is_file(site_file("README.md")) {
+        println("site: no README.md under " + g_site_root + " (use --root)");
+        return 1;
+    }
+    val get: str = args_option_in(av, "-g", "--get", "");
+    if get != "" {
+        print(site_respond("GET", get));
+        return 0;
+    }
+    val out: str = args_option_in(av, "-b", "--build", "");
+    if out != "" {
+        val n: i64 = site_build(out);
+        println("site: wrote " + int_to_str(n) + " files to " + out);
+        return 0;
+    }
+    val port: i64 = args_int_in(av, "-p", "--port", 8080);
+    println("site: serving " + g_site_root + " on http://localhost:" + int_to_str(port) + "/");
+    if !http_serve(port, site_handler) {
+        println("site: cannot listen on port " + int_to_str(port));
+        return 1;
+    }
+    return 0;
+}

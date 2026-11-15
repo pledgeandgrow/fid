@@ -45,16 +45,30 @@ var log_sink_path: str = "";
 // ─── Configuration ─────────────────────────────────────────────────────
 
 /// Only emit messages at or above this level.
+///
+/// Example:
+///   log_set_level(LOG_WARN);
+///   assert_eq(log_get_level(), LOG_WARN);
+///   log_info("not printed");
+///   log_warn("printed");
 pub fn log_set_level(level: i64) -> void {
     log_min_level = level;
 }
 
+/// The current global level (LOG_INFO unless changed).
+///
+/// Example:
+///   assert_eq(log_get_level(), LOG_INFO);
 pub fn log_get_level() -> i64 {
     return log_min_level;
 }
 
 /// Parse a level name ("trace".."error", case-insensitive).
 /// Returns -1 for unknown names.
+///
+/// Example:
+///   assert_eq(log_level_from_str("WARN"), LOG_WARN);
+///   assert_eq(log_level_from_str("verbose"), -1);
 pub fn log_level_from_str(name: str) -> i64 {
     var n = str_to_lower(name);
     if str_equal(n, "trace") { return LOG_TRACE; }
@@ -67,11 +81,19 @@ pub fn log_level_from_str(name: str) -> i64 {
 }
 
 /// Turn timestamps on/off. Off by default so tests are deterministic.
+///
+/// Example:
+///   log_set_timestamps(false);
+///   log_info("no ts= field on this line");
 pub fn log_set_timestamps(on: bool) -> void {
     if on { log_show_ts = 1; } else { log_show_ts = 0; }
 }
 
 /// Switch between logfmt text (false) and JSON lines (true).
+///
+/// Example:
+///   log_set_json(true);
+///   log_info("as a JSON line");
 pub fn log_set_json(on: bool) -> void {
     if on { log_json = 1; } else { log_json = 0; }
 }
@@ -83,6 +105,11 @@ pub fn log_to_stdout() -> void {
 }
 
 /// Send output to stderr.
+///
+/// Example:
+///   log_to_stderr();
+///   log_error("goes to stderr");
+///   log_to_stdout();
 pub fn log_to_stderr() -> void {
     log_sink = 1;
     log_sink_path = "";
@@ -123,6 +150,9 @@ fn log_safe_byte(b: i64) -> bool {
 }
 
 /// Escape a string for JSON output (quotes, backslashes, controls).
+///
+/// Example:
+///   assert_eq(log_json_escape("a\"b\n"), "a\\\"b\\n");
 pub fn log_json_escape(s: str) -> str {
     var out = "";
     var i = 0;
@@ -200,6 +230,13 @@ fn log_json_raw_ok(s: str) -> bool {
 
 /// Build the logfmt text line. Public so a caller (or a test) can check the
 /// output against the format without emitting it.
+///
+/// Example:
+///   var f: Vec<str> = Vec::new();
+///   f.push("port"); f.push("8080"); f.push("host"); f.push("a b");
+///   var line = log_render_text(LOG_INFO, "listening", f);
+///   println(line);
+///   assert_eq(line, "level=info msg=listening port=8080 host=\"a b\"");
 pub fn log_render_text(level: i64, msg: str, fields: Vec<str>) -> str {
     var line = "";
     var ts = log_timestamp();
@@ -220,6 +257,11 @@ pub fn log_render_text(level: i64, msg: str, fields: Vec<str>) -> str {
 
 /// Build the JSON line. Public so a caller (or a test) can parse the output
 /// against the JSON spec without emitting it (CO4).
+///
+/// Example:
+///   var f: Vec<str> = Vec::new();
+///   f.push("port"); f.push("8080");
+///   assert_eq(log_render_json(LOG_WARN, "slow", f), "{\"level\":\"warn\",\"msg\":\"slow\",\"port\":8080}");
 pub fn log_render_json(level: i64, msg: str, fields: Vec<str>) -> str {
     var line = "{";
     var first = true;
@@ -262,6 +304,11 @@ fn log_emit(line: str) -> void {
 }
 
 /// Core: log at an explicit level with a field list (flat k,v pairs).
+///
+/// Example:
+///   var f: Vec<str> = Vec::new();
+///   f.push("user"); f.push("ada");
+///   log_logf(LOG_INFO, "login", f);
 pub fn log_logf(level: i64, msg: str, fields: Vec<str>) -> void {
     if level < log_min_level { return; }
     var line = "";
@@ -274,6 +321,9 @@ pub fn log_logf(level: i64, msg: str, fields: Vec<str>) -> void {
 }
 
 /// Log at an explicit level without fields.
+///
+/// Example:
+///   log_log(LOG_ERROR, "disk full");
 pub fn log_log(level: i64, msg: str) -> void {
     var f = Vec::new();
     log_logf(level, msg, f);
@@ -286,6 +336,12 @@ pub fn log_log(level: i64, msg: str) -> void {
 var log_module_levels: i64 = 0;   // HashMap module name -> level (0 = unset)
 
 /// Emit `module`'s messages only at or above `level`.
+///
+/// Example:
+///   log_set_module_level("db", LOG_ERROR);
+///   assert_eq(log_module_level("db"), LOG_ERROR);
+///   assert_eq(log_module_level("http"), LOG_INFO);
+///   logm(LOG_INFO, "db", "not printed");
 pub fn log_set_module_level(module: str, level: i64) -> void {
     if log_module_levels == 0 { log_module_levels = HashMap_new(); }
     HashMap_insert(log_module_levels, module as i64, level);
@@ -300,6 +356,11 @@ pub fn log_module_level(module: str) -> i64 {
 }
 
 /// Drop `module`'s override: it follows the global level again.
+///
+/// Example:
+///   log_set_module_level("db", LOG_OFF);
+///   log_clear_module_level("db");
+///   assert_eq(log_module_level("db"), log_get_level());
 pub fn log_clear_module_level(module: str) -> void {
     if log_module_levels == 0 { return; }
     HashMap_remove(log_module_levels, module as i64);
@@ -327,6 +388,9 @@ pub fn logmf(level: i64, module: str, msg: str, fields: Vec<str>) -> void {
 }
 
 /// As logmf, without fields.
+///
+/// Example:
+///   logm(LOG_ERROR, "db", "connection lost");
 pub fn logm(level: i64, module: str, msg: str) -> void {
     var f: Vec<str> = Vec::new();
     logmf(level, module, msg, f);
@@ -336,12 +400,24 @@ pub fn logm(level: i64, module: str, msg: str) -> void {
 
 pub fn log_trace(msg: str) -> void { log_log(LOG_TRACE, msg); }
 pub fn log_debug(msg: str) -> void { log_log(LOG_DEBUG, msg); }
+/// Log `msg` at INFO level (log_trace, log_debug, log_warn and log_error
+/// are the same at their level).
+///
+/// Example:
+///   log_info("server started");
 pub fn log_info(msg: str) -> void { log_log(LOG_INFO, msg); }
 pub fn log_warn(msg: str) -> void { log_log(LOG_WARN, msg); }
 pub fn log_error(msg: str) -> void { log_log(LOG_ERROR, msg); }
 
 pub fn log_tracef(msg: str, fields: Vec<str>) -> void { log_logf(LOG_TRACE, msg, fields); }
 pub fn log_debugf(msg: str, fields: Vec<str>) -> void { log_logf(LOG_DEBUG, msg, fields); }
+/// Log `msg` at INFO level with flat key, value fields (log_tracef,
+/// log_debugf, log_warnf and log_errorf are the same at their level).
+///
+/// Example:
+///   var f: Vec<str> = Vec::new();
+///   f.push("port"); f.push("8080");
+///   log_infof("listening", f);
 pub fn log_infof(msg: str, fields: Vec<str>) -> void { log_logf(LOG_INFO, msg, fields); }
 pub fn log_warnf(msg: str, fields: Vec<str>) -> void { log_logf(LOG_WARN, msg, fields); }
 pub fn log_errorf(msg: str, fields: Vec<str>) -> void { log_logf(LOG_ERROR, msg, fields); }

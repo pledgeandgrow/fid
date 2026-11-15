@@ -22,6 +22,7 @@ module compiler::inc;
 use core;
 use vec;
 use string;
+use http_client;
 use compiler::ir;
 
 // --- FNV-1a 64-bit hash --------------------------------------------------
@@ -567,6 +568,17 @@ fn c_tok_is(src: str, t: &CTokens, i: i64, c: i64) -> bool {
     return t.is_ident.get(i) == 0 && t.ends.get(i) - t.starts.get(i) == 1 && str_byte_at(src, t.starts.get(i)) == c;
 }
 
+/// Is this token a preprocessor line or a retained comment line? Either
+/// way it is not part of a declaration's text — a stmt_start pointing at
+/// one would swallow it into the def's span (a `#define` slab moved into
+/// the owner's tail, then duplicated in every unit's prelude).
+fn inc_c_tok_is_meta(src: str, t: &CTokens, i: i64) -> bool {
+    if t.is_ident.get(i) != 0 { return false; }
+    var s: i64 = t.starts.get(i);
+    if str_byte_at(src, s) == 35 { return true; }
+    return str_byte_at(src, s) == 47 && s + 1 < t.ends.get(i) && str_byte_at(src, s + 1) == 47;
+}
+
 /// Top-level function definitions: `... name ( ... ) { ... }` at depth 0.
 pub struct CDefs {
     pub names: Vec<str>,
@@ -612,9 +624,14 @@ pub fn inc_find_c_defs(src: str, t: &CTokens) -> CDefs {
                 }
                 var e: i64 = m + 1;
                 if e > n { e = n; }
+                // The def's own text starts at its first non-directive
+                // token, not at stmt_start — `#define`/`//` lines between
+                // statements belong to the shared prelude, not to this def.
+                var s: i64 = stmt_start;
+                while s < j && inc_c_tok_is_meta(src, t, s) { s = s + 1; }
                 defs.names.push(str_slice_len(src, slen, t.starts.get(j), t.ends.get(j)));
                 defs.name_toks.push(j);
-                defs.start_toks.push(stmt_start);
+                defs.start_toks.push(s);
                 defs.end_toks.push(e);
                 j = m + 1;
                 stmt_start = j;
@@ -792,15 +809,28 @@ pub fn inc_artifact_path(output: str, canon: i64, tool: str, flags: str) -> str 
     return inc_dir_of(output) + "/.fidcache/" + name + ".exe";
 }
 
-/// Copy `path` to `dest` if the artifact exists.
+/// Copy `path` to `dest` if the artifact exists — local `.fidcache` first,
+/// then the remote CAS (`FIDES_CAS`, served by tools/cas.fd). A remote hit
+/// is also written back into the local store.
 pub fn inc_artifact_get(path: str, dest: str) -> bool {
-    if p_file_exists(path) == 0 { return false; }
+    if p_file_exists(path) != 0 {
+        inc_lru_touch(path);
+        return p_file_write_vec(dest, p_file_read_bytes(path)) >= 0;
+    }
+    var body: str = inc_cas_get(inc_base_name(path));
+    if str_len(body) == 0 { return false; }
+    if p_file_write_vec(dest, str_bytes(body)) < 0 { return false; }
+    // Populate the local store so the next build stays off the network.
+    p_mkdir(inc_dir_of(path));
+    var tmp: str = path + ".tmp";
+    p_file_write_vec(tmp, str_bytes(body));
+    if p_rename(tmp, path) != 0 { p_file_delete(tmp); }
     inc_lru_touch(path);
-    return p_file_write_vec(dest, p_file_read_bytes(path)) >= 0;
+    return true;
 }
 
 /// Store `source` under `path`. Best-effort: a cache failure never breaks a
-/// build.
+/// build. When `FIDES_CAS` is set the artifact is also mirrored remotely.
 pub fn inc_artifact_put(path: str, source: str) {
     p_mkdir(inc_dir_of(path));
     var tmp: str = path + ".tmp";
@@ -808,6 +838,45 @@ pub fn inc_artifact_put(path: str, source: str) {
     p_rename(tmp, path);
     inc_lru_touch(path);
     inc_cache_evict(inc_dir_of(path));
+    inc_cas_put(inc_base_name(path), source);
+}
+
+// --- Remote cache (inc-roadmap A11) ----------------------------------------
+//
+// FIDES_CAS=http://host:port enables a shared content-addressed store
+// (tools/cas.fd serves it). Every remote failure is silent — a down or
+// unreachable cache server never fails a build.
+
+/// The FIDES_CAS base URL without trailing slashes; "" when unset.
+fn inc_cas_base() -> str {
+    var u: str = env_or_empty("FIDES_CAS");
+    while str_len(u) > 0 && str_byte_at(u, str_len(u) - 1) == 47 {
+        u = str_slice(u, 0, str_len(u) - 1);
+    }
+    return u;
+}
+
+/// GET <FIDES_CAS>/cas/<name>: the body, or "" on a miss/any error.
+/// An artifact body is never empty, so "" unambiguously means "no hit".
+fn inc_cas_get(name: str) -> str {
+    var base: str = inc_cas_base();
+    if str_len(base) == 0 { return ""; }
+    var r: HttpResponse = http_get_url(base + "/cas/" + name);
+    if r.status != 200 { return ""; }
+    // A truncated transfer would store a corrupt artifact — poison for every
+    // later build — so a declared Content-Length must match the body.
+    var cl: str = http_resp_header(r, "content-length");
+    if str_len(cl) > 0 && str_parse_int(cl) != str_len(r.body) { return ""; }
+    return r.body;
+}
+
+/// PUT <FIDES_CAS>/cas/<name> with the artifact bytes. Fire-and-forget.
+fn inc_cas_put(name: str, source: str) {
+    var base: str = inc_cas_base();
+    if str_len(base) == 0 { return; }
+    var body: str = str_from_bytes(p_file_read_bytes(source));
+    if str_len(body) == 0 { return; }
+    http_put_url(base + "/cas/" + name, body);
 }
 
 // --- Eviction (release C8) -------------------------------------------------

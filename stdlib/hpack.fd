@@ -1,0 +1,969 @@
+// Fides HPACK standard library
+//
+// RFC 7541 header compression for HTTP/2 (module `http2`): the static
+// table (Appendix A), the dynamic table with size updates and eviction
+// (section 4), integers with an N-bit prefix (5.1), string literals (5.2),
+// and the Huffman code of Appendix B for both decoding and encoding.
+//
+// Bytes are Vec<i64>, one value 0..255 each (as module `ws` does). A header
+// list is two parallel Vec<str>, names and values, as HttpRequest has them.
+//
+// Usage:
+//   use hpack;
+//   var enc: Hpack = hpack_new(4096);
+//   var dec: Hpack = hpack_new(4096);
+//   val block: Vec<i64> = hpack_encode(&mut enc, names, vals);
+//   val got: HpackHeaders = hpack_decode(&mut dec, block);
+//   if got.ok { println(got.names.get(0) + ": " + got.vals.get(0)); }
+//
+// The encoder and the decoder of one direction of a connection each keep
+// their own Hpack: the dynamic table is state that both ends must update in
+// the same order.
+
+module hpack;
+
+use vec;
+use string;
+
+/// How a literal field is represented (RFC 7541 6.2).
+pub const HPACK_INDEX: i64 = 0;          // literal with incremental indexing
+pub const HPACK_NO_INDEX: i64 = 1;       // literal without indexing
+pub const HPACK_NEVER_INDEX: i64 = 2;    // literal never indexed
+
+/// The static table has 61 entries (Appendix A); dynamic entries follow.
+pub const HPACK_STATIC_LEN: i64 = 61;
+
+/// The largest integer a decoder accepts (bigger ones are an error: no
+/// table, string or size in HTTP/2 comes near it).
+const HP_INT_MAX: i64 = 2147483647;
+
+/// Encoder or decoder state of one direction: the dynamic table.
+pub struct Hpack {
+    pub names: Vec<str>,      // dynamic table, newest first (index 62)
+    pub vals: Vec<str>,
+    pub size: i64,            // sum of entry sizes (name + value + 32)
+    pub max_size: i64,        // the table's current maximum size
+    pub limit: i64,           // decoder: the largest size update allowed
+                              // (our SETTINGS_HEADER_TABLE_SIZE)
+    pub update: i64,          // encoder: size to announce in the next block, -1: none
+    pub update_min: i64,      // encoder: smallest size set since the last block
+    pub huffman: bool,        // encoder: Huffman-code a string when it is shorter
+}
+
+/// A decoded header block. `ok` false: `error` says why (a COMPRESSION_ERROR).
+pub struct HpackHeaders {
+    pub ok: bool,
+    pub error: str,
+    pub names: Vec<str>,
+    pub vals: Vec<str>,
+    pub never: Vec<bool>,     // field was "never indexed" (6.2.3)
+}
+
+/// Encoder and decoder state with a dynamic table of `max_size` bytes
+/// (4096 is the HTTP/2 default). The encoder Huffman-codes strings.
+pub fn hpack_new(max_size: i64) -> Hpack {
+    return Hpack {
+        names: Vec::new(), vals: Vec::new(), size: 0, max_size: max_size,
+        limit: max_size, update: -1, update_min: -1, huffman: true,
+    };
+}
+
+// ─── Static table (Appendix A) and Huffman code (Appendix B) ──────────────
+
+var hp_st_names: Vec<str> = Vec::new();
+var hp_st_vals: Vec<str> = Vec::new();
+var hp_huff_code: Vec<i64> = Vec::new();
+var hp_huff_len: Vec<i64> = Vec::new();
+// Decoding: the code is canonical (codes of one length are consecutive,
+// in symbol order, after those of shorter lengths), so per length L the
+// codes are hp_first[L] .. hp_first[L] + hp_count[L] - 1, and the symbols
+// in code order start at hp_sorted[hp_start[L]].
+var hp_first: Vec<i64> = Vec::new();
+var hp_count: Vec<i64> = Vec::new();
+var hp_start: Vec<i64> = Vec::new();
+var hp_sorted: Vec<i64> = Vec::new();
+
+fn hp_st(name: str, value: str) {
+    hp_st_names.push(name);
+    hp_st_vals.push(value);
+}
+
+fn hp_hc(code: i64, len: i64) {
+    hp_huff_code.push(code);
+    hp_huff_len.push(len);
+}
+
+fn hp_init() {
+    if hp_st_names.len() > 0 {
+        return;
+    }
+    hp_init_static();
+    hp_init_huffman();
+    hp_build_canon();
+}
+
+fn hp_init_static() {
+    hp_st(":authority", "");   // 1
+    hp_st(":method", "GET");   // 2
+    hp_st(":method", "POST");   // 3
+    hp_st(":path", "/");   // 4
+    hp_st(":path", "/index.html");   // 5
+    hp_st(":scheme", "http");   // 6
+    hp_st(":scheme", "https");   // 7
+    hp_st(":status", "200");   // 8
+    hp_st(":status", "204");   // 9
+    hp_st(":status", "206");   // 10
+    hp_st(":status", "304");   // 11
+    hp_st(":status", "400");   // 12
+    hp_st(":status", "404");   // 13
+    hp_st(":status", "500");   // 14
+    hp_st("accept-charset", "");   // 15
+    hp_st("accept-encoding", "gzip, deflate");   // 16
+    hp_st("accept-language", "");   // 17
+    hp_st("accept-ranges", "");   // 18
+    hp_st("accept", "");   // 19
+    hp_st("access-control-allow-origin", "");   // 20
+    hp_st("age", "");   // 21
+    hp_st("allow", "");   // 22
+    hp_st("authorization", "");   // 23
+    hp_st("cache-control", "");   // 24
+    hp_st("content-disposition", "");   // 25
+    hp_st("content-encoding", "");   // 26
+    hp_st("content-language", "");   // 27
+    hp_st("content-length", "");   // 28
+    hp_st("content-location", "");   // 29
+    hp_st("content-range", "");   // 30
+    hp_st("content-type", "");   // 31
+    hp_st("cookie", "");   // 32
+    hp_st("date", "");   // 33
+    hp_st("etag", "");   // 34
+    hp_st("expect", "");   // 35
+    hp_st("expires", "");   // 36
+    hp_st("from", "");   // 37
+    hp_st("host", "");   // 38
+    hp_st("if-match", "");   // 39
+    hp_st("if-modified-since", "");   // 40
+    hp_st("if-none-match", "");   // 41
+    hp_st("if-range", "");   // 42
+    hp_st("if-unmodified-since", "");   // 43
+    hp_st("last-modified", "");   // 44
+    hp_st("link", "");   // 45
+    hp_st("location", "");   // 46
+    hp_st("max-forwards", "");   // 47
+    hp_st("proxy-authenticate", "");   // 48
+    hp_st("proxy-authorization", "");   // 49
+    hp_st("range", "");   // 50
+    hp_st("referer", "");   // 51
+    hp_st("refresh", "");   // 52
+    hp_st("retry-after", "");   // 53
+    hp_st("server", "");   // 54
+    hp_st("set-cookie", "");   // 55
+    hp_st("strict-transport-security", "");   // 56
+    hp_st("transfer-encoding", "");   // 57
+    hp_st("user-agent", "");   // 58
+    hp_st("vary", "");   // 59
+    hp_st("via", "");   // 60
+    hp_st("www-authenticate", "");   // 61
+}
+
+// Symbol 0..255 and EOS (256): code (right-aligned), length in bits.
+fn hp_init_huffman() {
+    hp_hc(0x1ff8, 13);   //   0
+    hp_hc(0x7fffd8, 23);   //   1
+    hp_hc(0xfffffe2, 28);   //   2
+    hp_hc(0xfffffe3, 28);   //   3
+    hp_hc(0xfffffe4, 28);   //   4
+    hp_hc(0xfffffe5, 28);   //   5
+    hp_hc(0xfffffe6, 28);   //   6
+    hp_hc(0xfffffe7, 28);   //   7
+    hp_hc(0xfffffe8, 28);   //   8
+    hp_hc(0xffffea, 24);   //   9
+    hp_hc(0x3ffffffc, 30);   //  10
+    hp_hc(0xfffffe9, 28);   //  11
+    hp_hc(0xfffffea, 28);   //  12
+    hp_hc(0x3ffffffd, 30);   //  13
+    hp_hc(0xfffffeb, 28);   //  14
+    hp_hc(0xfffffec, 28);   //  15
+    hp_hc(0xfffffed, 28);   //  16
+    hp_hc(0xfffffee, 28);   //  17
+    hp_hc(0xfffffef, 28);   //  18
+    hp_hc(0xffffff0, 28);   //  19
+    hp_hc(0xffffff1, 28);   //  20
+    hp_hc(0xffffff2, 28);   //  21
+    hp_hc(0x3ffffffe, 30);   //  22
+    hp_hc(0xffffff3, 28);   //  23
+    hp_hc(0xffffff4, 28);   //  24
+    hp_hc(0xffffff5, 28);   //  25
+    hp_hc(0xffffff6, 28);   //  26
+    hp_hc(0xffffff7, 28);   //  27
+    hp_hc(0xffffff8, 28);   //  28
+    hp_hc(0xffffff9, 28);   //  29
+    hp_hc(0xffffffa, 28);   //  30
+    hp_hc(0xffffffb, 28);   //  31
+    hp_hc(0x14, 6);   //  32 ' '
+    hp_hc(0x3f8, 10);   //  33 '!'
+    hp_hc(0x3f9, 10);   //  34 '"'
+    hp_hc(0xffa, 12);   //  35 '#'
+    hp_hc(0x1ff9, 13);   //  36 '$'
+    hp_hc(0x15, 6);   //  37 '%'
+    hp_hc(0xf8, 8);   //  38 '&'
+    hp_hc(0x7fa, 11);   //  39 "'"
+    hp_hc(0x3fa, 10);   //  40 '('
+    hp_hc(0x3fb, 10);   //  41 ')'
+    hp_hc(0xf9, 8);   //  42 '*'
+    hp_hc(0x7fb, 11);   //  43 '+'
+    hp_hc(0xfa, 8);   //  44 ','
+    hp_hc(0x16, 6);   //  45 '-'
+    hp_hc(0x17, 6);   //  46 '.'
+    hp_hc(0x18, 6);   //  47 '/'
+    hp_hc(0x0, 5);   //  48 '0'
+    hp_hc(0x1, 5);   //  49 '1'
+    hp_hc(0x2, 5);   //  50 '2'
+    hp_hc(0x19, 6);   //  51 '3'
+    hp_hc(0x1a, 6);   //  52 '4'
+    hp_hc(0x1b, 6);   //  53 '5'
+    hp_hc(0x1c, 6);   //  54 '6'
+    hp_hc(0x1d, 6);   //  55 '7'
+    hp_hc(0x1e, 6);   //  56 '8'
+    hp_hc(0x1f, 6);   //  57 '9'
+    hp_hc(0x5c, 7);   //  58 ':'
+    hp_hc(0xfb, 8);   //  59 ';'
+    hp_hc(0x7ffc, 15);   //  60 '<'
+    hp_hc(0x20, 6);   //  61 '='
+    hp_hc(0xffb, 12);   //  62 '>'
+    hp_hc(0x3fc, 10);   //  63 '?'
+    hp_hc(0x1ffa, 13);   //  64 '@'
+    hp_hc(0x21, 6);   //  65 'A'
+    hp_hc(0x5d, 7);   //  66 'B'
+    hp_hc(0x5e, 7);   //  67 'C'
+    hp_hc(0x5f, 7);   //  68 'D'
+    hp_hc(0x60, 7);   //  69 'E'
+    hp_hc(0x61, 7);   //  70 'F'
+    hp_hc(0x62, 7);   //  71 'G'
+    hp_hc(0x63, 7);   //  72 'H'
+    hp_hc(0x64, 7);   //  73 'I'
+    hp_hc(0x65, 7);   //  74 'J'
+    hp_hc(0x66, 7);   //  75 'K'
+    hp_hc(0x67, 7);   //  76 'L'
+    hp_hc(0x68, 7);   //  77 'M'
+    hp_hc(0x69, 7);   //  78 'N'
+    hp_hc(0x6a, 7);   //  79 'O'
+    hp_hc(0x6b, 7);   //  80 'P'
+    hp_hc(0x6c, 7);   //  81 'Q'
+    hp_hc(0x6d, 7);   //  82 'R'
+    hp_hc(0x6e, 7);   //  83 'S'
+    hp_hc(0x6f, 7);   //  84 'T'
+    hp_hc(0x70, 7);   //  85 'U'
+    hp_hc(0x71, 7);   //  86 'V'
+    hp_hc(0x72, 7);   //  87 'W'
+    hp_hc(0xfc, 8);   //  88 'X'
+    hp_hc(0x73, 7);   //  89 'Y'
+    hp_hc(0xfd, 8);   //  90 'Z'
+    hp_hc(0x1ffb, 13);   //  91 '['
+    hp_hc(0x7fff0, 19);   //  92 '\\'
+    hp_hc(0x1ffc, 13);   //  93 ']'
+    hp_hc(0x3ffc, 14);   //  94 '^'
+    hp_hc(0x22, 6);   //  95 '_'
+    hp_hc(0x7ffd, 15);   //  96 '`'
+    hp_hc(0x3, 5);   //  97 'a'
+    hp_hc(0x23, 6);   //  98 'b'
+    hp_hc(0x4, 5);   //  99 'c'
+    hp_hc(0x24, 6);   // 100 'd'
+    hp_hc(0x5, 5);   // 101 'e'
+    hp_hc(0x25, 6);   // 102 'f'
+    hp_hc(0x26, 6);   // 103 'g'
+    hp_hc(0x27, 6);   // 104 'h'
+    hp_hc(0x6, 5);   // 105 'i'
+    hp_hc(0x74, 7);   // 106 'j'
+    hp_hc(0x75, 7);   // 107 'k'
+    hp_hc(0x28, 6);   // 108 'l'
+    hp_hc(0x29, 6);   // 109 'm'
+    hp_hc(0x2a, 6);   // 110 'n'
+    hp_hc(0x7, 5);   // 111 'o'
+    hp_hc(0x2b, 6);   // 112 'p'
+    hp_hc(0x76, 7);   // 113 'q'
+    hp_hc(0x2c, 6);   // 114 'r'
+    hp_hc(0x8, 5);   // 115 's'
+    hp_hc(0x9, 5);   // 116 't'
+    hp_hc(0x2d, 6);   // 117 'u'
+    hp_hc(0x77, 7);   // 118 'v'
+    hp_hc(0x78, 7);   // 119 'w'
+    hp_hc(0x79, 7);   // 120 'x'
+    hp_hc(0x7a, 7);   // 121 'y'
+    hp_hc(0x7b, 7);   // 122 'z'
+    hp_hc(0x7ffe, 15);   // 123 '{'
+    hp_hc(0x7fc, 11);   // 124 '|'
+    hp_hc(0x3ffd, 14);   // 125 '}'
+    hp_hc(0x1ffd, 13);   // 126 '~'
+    hp_hc(0xffffffc, 28);   // 127
+    hp_hc(0xfffe6, 20);   // 128
+    hp_hc(0x3fffd2, 22);   // 129
+    hp_hc(0xfffe7, 20);   // 130
+    hp_hc(0xfffe8, 20);   // 131
+    hp_hc(0x3fffd3, 22);   // 132
+    hp_hc(0x3fffd4, 22);   // 133
+    hp_hc(0x3fffd5, 22);   // 134
+    hp_hc(0x7fffd9, 23);   // 135
+    hp_hc(0x3fffd6, 22);   // 136
+    hp_hc(0x7fffda, 23);   // 137
+    hp_hc(0x7fffdb, 23);   // 138
+    hp_hc(0x7fffdc, 23);   // 139
+    hp_hc(0x7fffdd, 23);   // 140
+    hp_hc(0x7fffde, 23);   // 141
+    hp_hc(0xffffeb, 24);   // 142
+    hp_hc(0x7fffdf, 23);   // 143
+    hp_hc(0xffffec, 24);   // 144
+    hp_hc(0xffffed, 24);   // 145
+    hp_hc(0x3fffd7, 22);   // 146
+    hp_hc(0x7fffe0, 23);   // 147
+    hp_hc(0xffffee, 24);   // 148
+    hp_hc(0x7fffe1, 23);   // 149
+    hp_hc(0x7fffe2, 23);   // 150
+    hp_hc(0x7fffe3, 23);   // 151
+    hp_hc(0x7fffe4, 23);   // 152
+    hp_hc(0x1fffdc, 21);   // 153
+    hp_hc(0x3fffd8, 22);   // 154
+    hp_hc(0x7fffe5, 23);   // 155
+    hp_hc(0x3fffd9, 22);   // 156
+    hp_hc(0x7fffe6, 23);   // 157
+    hp_hc(0x7fffe7, 23);   // 158
+    hp_hc(0xffffef, 24);   // 159
+    hp_hc(0x3fffda, 22);   // 160
+    hp_hc(0x1fffdd, 21);   // 161
+    hp_hc(0xfffe9, 20);   // 162
+    hp_hc(0x3fffdb, 22);   // 163
+    hp_hc(0x3fffdc, 22);   // 164
+    hp_hc(0x7fffe8, 23);   // 165
+    hp_hc(0x7fffe9, 23);   // 166
+    hp_hc(0x1fffde, 21);   // 167
+    hp_hc(0x7fffea, 23);   // 168
+    hp_hc(0x3fffdd, 22);   // 169
+    hp_hc(0x3fffde, 22);   // 170
+    hp_hc(0xfffff0, 24);   // 171
+    hp_hc(0x1fffdf, 21);   // 172
+    hp_hc(0x3fffdf, 22);   // 173
+    hp_hc(0x7fffeb, 23);   // 174
+    hp_hc(0x7fffec, 23);   // 175
+    hp_hc(0x1fffe0, 21);   // 176
+    hp_hc(0x1fffe1, 21);   // 177
+    hp_hc(0x3fffe0, 22);   // 178
+    hp_hc(0x1fffe2, 21);   // 179
+    hp_hc(0x7fffed, 23);   // 180
+    hp_hc(0x3fffe1, 22);   // 181
+    hp_hc(0x7fffee, 23);   // 182
+    hp_hc(0x7fffef, 23);   // 183
+    hp_hc(0xfffea, 20);   // 184
+    hp_hc(0x3fffe2, 22);   // 185
+    hp_hc(0x3fffe3, 22);   // 186
+    hp_hc(0x3fffe4, 22);   // 187
+    hp_hc(0x7ffff0, 23);   // 188
+    hp_hc(0x3fffe5, 22);   // 189
+    hp_hc(0x3fffe6, 22);   // 190
+    hp_hc(0x7ffff1, 23);   // 191
+    hp_hc(0x3ffffe0, 26);   // 192
+    hp_hc(0x3ffffe1, 26);   // 193
+    hp_hc(0xfffeb, 20);   // 194
+    hp_hc(0x7fff1, 19);   // 195
+    hp_hc(0x3fffe7, 22);   // 196
+    hp_hc(0x7ffff2, 23);   // 197
+    hp_hc(0x3fffe8, 22);   // 198
+    hp_hc(0x1ffffec, 25);   // 199
+    hp_hc(0x3ffffe2, 26);   // 200
+    hp_hc(0x3ffffe3, 26);   // 201
+    hp_hc(0x3ffffe4, 26);   // 202
+    hp_hc(0x7ffffde, 27);   // 203
+    hp_hc(0x7ffffdf, 27);   // 204
+    hp_hc(0x3ffffe5, 26);   // 205
+    hp_hc(0xfffff1, 24);   // 206
+    hp_hc(0x1ffffed, 25);   // 207
+    hp_hc(0x7fff2, 19);   // 208
+    hp_hc(0x1fffe3, 21);   // 209
+    hp_hc(0x3ffffe6, 26);   // 210
+    hp_hc(0x7ffffe0, 27);   // 211
+    hp_hc(0x7ffffe1, 27);   // 212
+    hp_hc(0x3ffffe7, 26);   // 213
+    hp_hc(0x7ffffe2, 27);   // 214
+    hp_hc(0xfffff2, 24);   // 215
+    hp_hc(0x1fffe4, 21);   // 216
+    hp_hc(0x1fffe5, 21);   // 217
+    hp_hc(0x3ffffe8, 26);   // 218
+    hp_hc(0x3ffffe9, 26);   // 219
+    hp_hc(0xffffffd, 28);   // 220
+    hp_hc(0x7ffffe3, 27);   // 221
+    hp_hc(0x7ffffe4, 27);   // 222
+    hp_hc(0x7ffffe5, 27);   // 223
+    hp_hc(0xfffec, 20);   // 224
+    hp_hc(0xfffff3, 24);   // 225
+    hp_hc(0xfffed, 20);   // 226
+    hp_hc(0x1fffe6, 21);   // 227
+    hp_hc(0x3fffe9, 22);   // 228
+    hp_hc(0x1fffe7, 21);   // 229
+    hp_hc(0x1fffe8, 21);   // 230
+    hp_hc(0x7ffff3, 23);   // 231
+    hp_hc(0x3fffea, 22);   // 232
+    hp_hc(0x3fffeb, 22);   // 233
+    hp_hc(0x1ffffee, 25);   // 234
+    hp_hc(0x1ffffef, 25);   // 235
+    hp_hc(0xfffff4, 24);   // 236
+    hp_hc(0xfffff5, 24);   // 237
+    hp_hc(0x3ffffea, 26);   // 238
+    hp_hc(0x7ffff4, 23);   // 239
+    hp_hc(0x3ffffeb, 26);   // 240
+    hp_hc(0x7ffffe6, 27);   // 241
+    hp_hc(0x3ffffec, 26);   // 242
+    hp_hc(0x3ffffed, 26);   // 243
+    hp_hc(0x7ffffe7, 27);   // 244
+    hp_hc(0x7ffffe8, 27);   // 245
+    hp_hc(0x7ffffe9, 27);   // 246
+    hp_hc(0x7ffffea, 27);   // 247
+    hp_hc(0x7ffffeb, 27);   // 248
+    hp_hc(0xffffffe, 28);   // 249
+    hp_hc(0x7ffffec, 27);   // 250
+    hp_hc(0x7ffffed, 27);   // 251
+    hp_hc(0x7ffffee, 27);   // 252
+    hp_hc(0x7ffffef, 27);   // 253
+    hp_hc(0x7fffff0, 27);   // 254
+    hp_hc(0x3ffffee, 26);   // 255
+    hp_hc(0x3fffffff, 30);   // 256 EOS
+}
+
+fn hp_build_canon() {
+    var l: i64 = 0;
+    while l <= 30 {
+        hp_first.push(-1);
+        hp_count.push(0);
+        hp_start.push(0);
+        l = l + 1;
+    }
+    var sym: i64 = 0;
+    while sym < 257 {
+        val len: i64 = hp_huff_len.get(sym);
+        val code: i64 = hp_huff_code.get(sym);
+        hp_count.set(len, hp_count.get(len) + 1);
+        if hp_first.get(len) < 0 || code < hp_first.get(len) {
+            hp_first.set(len, code);
+        }
+        hp_sorted.push(0);
+        sym = sym + 1;
+    }
+    var at: i64 = 0;
+    l = 0;
+    while l <= 30 {
+        hp_start.set(l, at);
+        at = at + hp_count.get(l);
+        l = l + 1;
+    }
+    sym = 0;
+    while sym < 257 {
+        val len: i64 = hp_huff_len.get(sym);
+        hp_sorted.set(hp_start.get(len) + hp_huff_code.get(sym) - hp_first.get(len), sym);
+        sym = sym + 1;
+    }
+}
+
+/// The Huffman code of a symbol (0..255, 256 = EOS), right-aligned.
+pub fn huffman_code(sym: i64) -> i64 {
+    hp_init();
+    return hp_huff_code.get(sym);
+}
+
+/// The length in bits of a symbol's Huffman code.
+pub fn huffman_code_len(sym: i64) -> i64 {
+    hp_init();
+    return hp_huff_len.get(sym);
+}
+
+/// Name of static entry `i` (1..61).
+pub fn hpack_static_name(i: i64) -> str {
+    hp_init();
+    return hp_st_names.get(i - 1);
+}
+
+/// Value of static entry `i` (1..61).
+pub fn hpack_static_value(i: i64) -> str {
+    hp_init();
+    return hp_st_vals.get(i - 1);
+}
+
+// ─── Huffman (5.2, Appendix B) ────────────────────────────────────────────
+
+/// Bytes the Huffman coding of `bytes` takes.
+pub fn huffman_encoded_len(bytes: Vec<i64>) -> i64 {
+    hp_init();
+    var bits: i64 = 0;
+    var i: i64 = 0;
+    while i < bytes.len() {
+        bits = bits + hp_huff_len.get(bytes.get(i) & 255);
+        i = i + 1;
+    }
+    return (bits + 7) / 8;
+}
+
+/// Huffman-code `bytes`; the last byte is padded with the high bits of EOS
+/// (ones).
+pub fn huffman_encode(bytes: Vec<i64>) -> Vec<i64> {
+    hp_init();
+    var out: Vec<i64> = Vec::new();
+    var acc: i64 = 0;       // pending bits, the low `nbits` of it
+    var nbits: i64 = 0;
+    var i: i64 = 0;
+    while i < bytes.len() {
+        val b: i64 = bytes.get(i) & 255;
+        val len: i64 = hp_huff_len.get(b);
+        acc = (acc << len) | hp_huff_code.get(b);
+        nbits = nbits + len;
+        while nbits >= 8 {
+            out.push((acc >> (nbits - 8)) & 255);
+            nbits = nbits - 8;
+        }
+        acc = acc & ((1 << nbits) - 1);
+        i = i + 1;
+    }
+    if nbits > 0 {
+        val pad: i64 = 8 - nbits;
+        out.push(((acc << pad) | ((1 << pad) - 1)) & 255);
+    }
+    return out;
+}
+
+/// Decode `n` Huffman-coded bytes of `b` from `from` into `out`. False when
+/// the input holds EOS, is padded with more than 7 bits, or with bits that
+/// are not the start of EOS (RFC 7541 5.2): a decoding error.
+pub fn huffman_decode_into(b: Vec<i64>, from: i64, n: i64, out: &mut Vec<i64>) -> bool {
+    hp_init();
+    var code: i64 = 0;          // bits since the last symbol
+    var len: i64 = 0;           // how many
+    var i: i64 = from;
+    while i < from + n {
+        val byte: i64 = b.get(i);
+        var bit: i64 = 7;
+        while bit >= 0 {
+            code = (code << 1) | ((byte >> bit) & 1);
+            len = len + 1;
+            if len > 30 {
+                return false;
+            }
+            val cnt: i64 = hp_count.get(len);
+            if cnt > 0 {
+                val off: i64 = code - hp_first.get(len);
+                if off >= 0 && off < cnt {
+                    val sym: i64 = hp_sorted.get(hp_start.get(len) + off);
+                    if sym == 256 {
+                        return false;
+                    }
+                    out.push(sym);
+                    code = 0;
+                    len = 0;
+                }
+            }
+            bit = bit - 1;
+        }
+        i = i + 1;
+    }
+    // Padding: at most 7 bits, all ones (the start of EOS)
+    return len <= 7 && code == (1 << len) - 1;
+}
+
+/// Decode a whole Huffman-coded string; Option::None on a decoding error.
+pub fn huffman_decode(b: Vec<i64>) -> Option<Vec<i64>> {
+    var out: Vec<i64> = Vec::new();
+    if huffman_decode_into(b, 0, b.len(), &mut out) {
+        return Option::Some(out);
+    }
+    return Option::None;
+}
+
+// ─── Integers (5.1) and string literals (5.2) ─────────────────────────────
+
+/// Append `value` as an integer with an N-bit prefix (`prefix` 1..8); `first`
+/// holds the bits above the prefix in the first byte (the representation's
+/// pattern, such as 0x80 for an indexed field).
+pub fn hpack_put_int(out: &mut Vec<i64>, first: i64, prefix: i64, value: i64) {
+    val max: i64 = (1 << prefix) - 1;
+    if value < max {
+        out.push(first | value);
+        return;
+    }
+    out.push(first | max);
+    var v: i64 = value - max;
+    while v >= 128 {
+        out.push((v % 128) + 128);
+        v = v / 128;
+    }
+    out.push(v);
+}
+
+/// Read an integer with an N-bit prefix at `*pos`, moving `*pos` past it.
+/// -1 (and `*pos` -1) when the input ends first or the value is too large.
+pub fn hpack_get_int(b: Vec<i64>, pos: &mut i64, prefix: i64) -> i64 {
+    val at: i64 = *pos;
+    if at < 0 || at >= b.len() {
+        *pos = -1;
+        return -1;
+    }
+    val max: i64 = (1 << prefix) - 1;
+    var v: i64 = b.get(at) & max;
+    var p: i64 = at + 1;
+    if v == max {
+        var shift: i64 = 0;
+        var more: bool = true;
+        while more {
+            if p >= b.len() || shift > 28 {
+                *pos = -1;
+                return -1;
+            }
+            val c: i64 = b.get(p);
+            p = p + 1;
+            v = v + ((c & 127) << shift);
+            shift = shift + 7;
+            more = (c & 128) != 0;
+        }
+        if v > HP_INT_MAX {
+            *pos = -1;
+            return -1;
+        }
+    }
+    *pos = p;
+    return v;
+}
+
+/// Append a string literal: Huffman-coded when `huffman` and that is not
+/// longer, raw otherwise.
+pub fn hpack_put_str(out: &mut Vec<i64>, s: str, huffman: bool) {
+    val bytes: Vec<i64> = str_bytes(s);
+    if huffman && huffman_encoded_len(bytes) <= bytes.len() {
+        val coded: Vec<i64> = huffman_encode(bytes);
+        hpack_put_int(out, 128, 7, coded.len());
+        var i: i64 = 0;
+        while i < coded.len() {
+            out.push(coded.get(i));
+            i = i + 1;
+        }
+        return;
+    }
+    hpack_put_int(out, 0, 7, bytes.len());
+    var j: i64 = 0;
+    while j < bytes.len() {
+        out.push(bytes.get(j));
+        j = j + 1;
+    }
+}
+
+/// Read a string literal at `*pos`. On an error `*pos` becomes -1.
+pub fn hpack_get_str(b: Vec<i64>, pos: &mut i64) -> str {
+    if *pos < 0 || *pos >= b.len() {
+        *pos = -1;
+        return "";
+    }
+    val huff: bool = (b.get(*pos) & 128) != 0;
+    val n: i64 = hpack_get_int(b, pos, 7);
+    if n < 0 {
+        return "";
+    }
+    val at: i64 = *pos;
+    if at + n > b.len() {
+        *pos = -1;
+        return "";
+    }
+    var bytes: Vec<i64> = Vec::new();
+    if huff {
+        if !huffman_decode_into(b, at, n, &mut bytes) {
+            *pos = -1;
+            return "";
+        }
+    } else {
+        var i: i64 = 0;
+        while i < n {
+            bytes.push(b.get(at + i));
+            i = i + 1;
+        }
+    }
+    *pos = at + n;
+    return str_from_bytes(bytes);
+}
+
+// ─── Dynamic table (2.3.2, 4) ─────────────────────────────────────────────
+
+/// The size an entry takes in the table (4.1).
+pub fn hpack_entry_size(name: str, value: str) -> i64 {
+    return str_len(name) + str_len(value) + 32;
+}
+
+/// Number of entries in the dynamic table.
+pub fn hpack_table_len(h: &Hpack) -> i64 {
+    return h.names.len();
+}
+
+// Evict the oldest entries until `room` more bytes fit (4.4).
+fn hp_evict(h: &mut Hpack, room: i64) {
+    while h.names.len() > 0 && h.size + room > h.max_size {
+        val n: str = h.names.pop();
+        val v: str = h.vals.pop();
+        h.size = h.size - hpack_entry_size(n, v);
+    }
+}
+
+/// Add an entry, evicting as needed. One bigger than the whole table
+/// leaves it empty (4.4).
+pub fn hpack_table_add(h: &mut Hpack, name: str, value: str) {
+    val esz: i64 = hpack_entry_size(name, value);
+    if esz > h.max_size {
+        h.names.clear();
+        h.vals.clear();
+        h.size = 0;
+        return;
+    }
+    hp_evict(h, esz);
+    h.names.insert(0, name);
+    h.vals.insert(0, value);
+    h.size = h.size + esz;
+}
+
+/// Change the table's maximum size, evicting what no longer fits (4.3).
+pub fn hpack_table_resize(h: &mut Hpack, max_size: i64) {
+    h.max_size = max_size;
+    hp_evict(h, 0);
+}
+
+/// Is `i` an index of the static or dynamic table?
+pub fn hpack_index_valid(h: &Hpack, i: i64) -> bool {
+    return i >= 1 && i <= HPACK_STATIC_LEN + h.names.len();
+}
+
+/// Name at index `i` of the combined index space (2.3.3).
+pub fn hpack_name_at(h: &Hpack, i: i64) -> str {
+    if i <= HPACK_STATIC_LEN {
+        return hpack_static_name(i);
+    }
+    return h.names.get(i - HPACK_STATIC_LEN - 1);
+}
+
+/// Value at index `i` of the combined index space.
+pub fn hpack_value_at(h: &Hpack, i: i64) -> str {
+    if i <= HPACK_STATIC_LEN {
+        return hpack_static_value(i);
+    }
+    return h.vals.get(i - HPACK_STATIC_LEN - 1);
+}
+
+/// The dynamic table as RFC 7541 Appendix C prints it.
+pub fn hpack_table_dump(h: &Hpack) -> str {
+    var out: str = "";
+    if h.names.len() == 0 {
+        out = "  empty.\n";
+    }
+    var i: i64 = 0;
+    while i < h.names.len() {
+        val n: str = h.names.get(i);
+        val v: str = h.vals.get(i);
+        out = out + "[" + str_pad_left(int_to_str(i + 1), 3, 32) + "] (s = "
+            + str_pad_left(int_to_str(hpack_entry_size(n, v)), 3, 32) + ") " + n + ": " + v + "\n";
+        i = i + 1;
+    }
+    return out + "      Table size: " + str_pad_left(int_to_str(h.size), 3, 32) + "\n";
+}
+
+// ─── Decoding (3, 6) ──────────────────────────────────────────────────────
+
+fn hp_fail(r: HpackHeaders, why: str) -> HpackHeaders {
+    return HpackHeaders { ok: false, error: why, names: r.names, vals: r.vals, never: r.never };
+}
+
+/// Decode a header block, updating the dynamic table.
+pub fn hpack_decode(h: &mut Hpack, block: Vec<i64>) -> HpackHeaders {
+    hp_init();
+    var r: HpackHeaders = HpackHeaders {
+        ok: true, error: "", names: Vec::new(), vals: Vec::new(), never: Vec::new(),
+    };
+    var pos: i64 = 0;
+    var fields: i64 = 0;
+    while pos < block.len() {
+        val b: i64 = block.get(pos);
+        if (b & 128) != 0 {
+            // Indexed field (6.1)
+            val idx: i64 = hpack_get_int(block, &mut pos, 7);
+            if pos < 0 || idx == 0 || !hpack_index_valid(h, idx) {
+                return hp_fail(r, "bad index");
+            }
+            r.names.push(hpack_name_at(h, idx));
+            r.vals.push(hpack_value_at(h, idx));
+            r.never.push(false);
+            fields = fields + 1;
+        } else if (b & 224) == 32 {
+            // Dynamic table size update (6.3): only before the first field
+            val size: i64 = hpack_get_int(block, &mut pos, 5);
+            if pos < 0 {
+                return hp_fail(r, "truncated size update");
+            }
+            if fields > 0 {
+                return hp_fail(r, "size update after a field");
+            }
+            if size > h.limit {
+                return hp_fail(r, "size update above the limit");
+            }
+            hpack_table_resize(h, size);
+        } else {
+            // Literal (6.2): with incremental indexing (01), without (0000),
+            // never indexed (0001)
+            var prefix: i64 = 4;
+            var mode: i64 = HPACK_NO_INDEX;
+            if (b & 192) == 64 {
+                prefix = 6;
+                mode = HPACK_INDEX;
+            } else if (b & 240) == 16 {
+                mode = HPACK_NEVER_INDEX;
+            }
+            val idx: i64 = hpack_get_int(block, &mut pos, prefix);
+            if pos < 0 {
+                return hp_fail(r, "truncated literal");
+            }
+            var name: str = "";
+            if idx == 0 {
+                name = hpack_get_str(block, &mut pos);
+            } else {
+                if !hpack_index_valid(h, idx) {
+                    return hp_fail(r, "bad name index");
+                }
+                name = hpack_name_at(h, idx);
+            }
+            if pos < 0 {
+                return hp_fail(r, "bad name literal");
+            }
+            val value: str = hpack_get_str(block, &mut pos);
+            if pos < 0 {
+                return hp_fail(r, "bad value literal");
+            }
+            if mode == HPACK_INDEX {
+                hpack_table_add(h, name, value);
+            }
+            r.names.push(name);
+            r.vals.push(value);
+            r.never.push(mode == HPACK_NEVER_INDEX);
+            fields = fields + 1;
+        }
+    }
+    return r;
+}
+
+// ─── Encoding (6) ─────────────────────────────────────────────────────────
+
+/// Encoder: change the table's maximum size (to at most the peer's
+/// SETTINGS_HEADER_TABLE_SIZE). The change is announced at the start of the
+/// next header block; when it went down and then up again, both (4.2).
+pub fn hpack_set_max_size(h: &mut Hpack, max_size: i64) {
+    hpack_table_resize(h, max_size);
+    if h.update_min < 0 || max_size < h.update_min {
+        h.update_min = max_size;
+    }
+    h.update = max_size;
+}
+
+/// Append the pending size updates, if any. hpack_encode calls it; a caller
+/// that writes fields one by one calls it before the first.
+pub fn hpack_put_size_updates(h: &mut Hpack, out: &mut Vec<i64>) {
+    if h.update < 0 {
+        return;
+    }
+    if h.update_min < h.update {
+        hpack_put_int(out, 32, 5, h.update_min);
+    }
+    hpack_put_int(out, 32, 5, h.update);
+    h.update = -1;
+    h.update_min = -1;
+}
+
+// The index of an entry with this name and value (0: none): the static
+// table first, then the dynamic one.
+fn hp_find_full(h: &Hpack, name: str, value: str) -> i64 {
+    var i: i64 = 0;
+    while i < HPACK_STATIC_LEN {
+        if hp_st_names.get(i) == name && hp_st_vals.get(i) == value {
+            return i + 1;
+        }
+        i = i + 1;
+    }
+    var j: i64 = 0;
+    while j < h.names.len() {
+        if h.names.get(j) == name && h.vals.get(j) == value {
+            return HPACK_STATIC_LEN + j + 1;
+        }
+        j = j + 1;
+    }
+    return 0;
+}
+
+// The index of an entry with this name (0: none), static table first.
+fn hp_find_name(h: &Hpack, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < HPACK_STATIC_LEN {
+        if hp_st_names.get(i) == name {
+            return i + 1;
+        }
+        i = i + 1;
+    }
+    var j: i64 = 0;
+    while j < h.names.len() {
+        if h.names.get(j) == name {
+            return HPACK_STATIC_LEN + j + 1;
+        }
+        j = j + 1;
+    }
+    return 0;
+}
+
+/// Append one field. With HPACK_INDEX a field already in a table is sent
+/// as its index; otherwise as a literal of that kind, its name indexed when
+/// a table has it. HPACK_NEVER_INDEX is for values such as passwords that
+/// no intermediary may index.
+pub fn hpack_encode_field(h: &mut Hpack, out: &mut Vec<i64>, name: str, value: str, mode: i64) {
+    hp_init();
+    if mode == HPACK_INDEX {
+        val full: i64 = hp_find_full(h, name, value);
+        if full > 0 {
+            hpack_put_int(out, 128, 7, full);
+            return;
+        }
+    }
+    val ni: i64 = hp_find_name(h, name);
+    if mode == HPACK_INDEX {
+        hpack_put_int(out, 64, 6, ni);
+    } else if mode == HPACK_NEVER_INDEX {
+        hpack_put_int(out, 16, 4, ni);
+    } else {
+        hpack_put_int(out, 0, 4, ni);
+    }
+    if ni == 0 {
+        hpack_put_str(out, name, h.huffman);
+    }
+    hpack_put_str(out, value, h.huffman);
+    if mode == HPACK_INDEX {
+        hpack_table_add(h, name, value);
+    }
+}
+
+/// The representation hpack_encode picks for a field: never indexed for
+/// credentials, without indexing for entries too big for the table, with
+/// incremental indexing otherwise.
+pub fn hpack_default_mode(h: &Hpack, name: str, value: str) -> i64 {
+    if name == "authorization" || name == "proxy-authorization" {
+        return HPACK_NEVER_INDEX;
+    }
+    if hpack_entry_size(name, value) > h.max_size {
+        return HPACK_NO_INDEX;
+    }
+    return HPACK_INDEX;
+}
+
+/// Encode a header list (names must be lowercase in HTTP/2).
+pub fn hpack_encode(h: &mut Hpack, names: Vec<str>, vals: Vec<str>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    hpack_put_size_updates(h, &mut out);
+    var i: i64 = 0;
+    while i < names.len() {
+        val n: str = names.get(i);
+        val v: str = vals.get(i);
+        hpack_encode_field(h, &mut out, n, v, hpack_default_mode(h, n, v));
+        i = i + 1;
+    }
+    return out;
+}

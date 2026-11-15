@@ -1,0 +1,253 @@
+// Files, directories and processes (competitive SL17), checked the way
+// test_path.fd checks paths: what each operation must do on every
+// platform. Everything happens in a fresh directory under the system temp
+// directory, removed at the end; no path or generated name is printed.
+//   files: create, read, overwrite (truncates), append, sizes, empty
+//     files, bytes 0..255 (zero bytes included) round trip, CR LF kept
+//     as written (no text-mode translation), a 64 KiB file, rename,
+//     delete; a missing file is an error value, not a crash (None, "",
+//     -1, false)
+//   directories: create, create twice, a missing parent, nested creation,
+//     listing (sorted here: the order is the platform's), an empty and a
+//     missing directory, removing an empty, a non-empty and a nested one
+//   processes: a child's standard output, standard error and exit status
+//     (process.fd runs it through the platform shell: sh -c or cmd /C)
+use fs;
+use env;
+use path;
+use process;
+
+fn check_b(label: str, got: bool, want: bool) {
+    println(label + " = " + bool_to_str(got));
+    if got != want { p_panic("files spec: wrong value for " + label); }
+}
+
+fn check_i(label: str, got: i64, want: i64) {
+    println(label + " = " + int_to_str(got));
+    if got != want { p_panic("files spec: wrong value for " + label); }
+}
+
+fn check_s(label: str, got: str, want: str) {
+    println(label + " = [" + got + "]");
+    if !str_equal(got, want) { p_panic("files spec: wrong value for " + label); }
+}
+
+fn temp_base() -> str {
+    var t: str = env_get("TEMP");
+    if str_len(t) > 0 && fs_is_dir(t) { return t; }
+    t = env_get("TMPDIR");
+    if str_len(t) > 0 && fs_is_dir(t) { return t; }
+    if fs_is_dir("/tmp") { return "/tmp"; }
+    return ".";
+}
+
+// The names in a directory, sorted bytewise and joined by ",".
+fn listing(dir: str) -> str {
+    var names: Vec<str> = fs_list_dir(dir);
+    var i: i64 = 1;
+    while i < names.len() {
+        var cur: str = names.get(i);
+        var j: i64 = i;
+        while j > 0 && str_less(cur, names.get(j - 1)) {
+            names.set(j, names.get(j - 1));
+            j = j - 1;
+        }
+        names.set(j, cur);
+        i = i + 1;
+    }
+    return str_join(names, ",");
+}
+
+fn str_less(a: str, b: str) -> bool {
+    var k: i64 = 0;
+    while k < str_len(a) && k < str_len(b) {
+        if str_byte_at(a, k) != str_byte_at(b, k) { return str_byte_at(a, k) < str_byte_at(b, k); }
+        k = k + 1;
+    }
+    return str_len(a) < str_len(b);
+}
+
+fn is_none(path: str) -> bool {
+    match read_file(path) {
+        Option::Some(content) => { return false; }
+        Option::None => {}
+    }
+    return true;
+}
+
+fn files(root: str) {
+    println("-- files");
+    val f: str = path_join(root, "a.txt");
+    check_b("missing before", fs_exists(f), false);
+    check_b("write", fs_write_text(f, "hello"), true);
+    check_b("exists", fs_exists(f), true);
+    check_b("is a file", fs_is_file(f), true);
+    check_b("is not a dir", fs_is_dir(f), false);
+    check_i("size", fs_file_size(f), 5);
+    check_s("read", fs_read_text(f), "hello");
+    check_b("overwrite", fs_write_text(f, "hi"), true);
+    check_s("overwrite truncates", fs_read_text(f), "hi");
+    check_i("size after overwrite", fs_file_size(f), 2);
+    check_b("append", fs_append_text(f, " there"), true);
+    check_b("append again", fs_append_text(f, "\nline 2\n"), true);
+    check_s("read after append", fs_read_text(f), "hi there\nline 2\n");
+    check_i("lines", fs_read_lines(f).len(), 3);
+    val nf: str = path_join(root, "new.txt");
+    check_b("append creates", fs_append_text(nf, "x"), true);
+    check_s("appended new", fs_read_text(nf), "x");
+    // empty file
+    val e: str = path_join(root, "empty.txt");
+    check_b("write empty", fs_write_text(e, ""), true);
+    check_b("empty exists", fs_exists(e), true);
+    check_i("empty size", fs_file_size(e), 0);
+    // (read_file of an empty file is Some("") through C and native, None on
+    // the interpreter: not checked here)
+    check_s("empty text", fs_read_text(e), "");
+    // bytes 0..255, zero bytes included
+    var bytes: Vec<i64> = Vec::new();
+    var b: i64 = 0;
+    while b < 256 { bytes.push(b); b = b + 1; }
+    bytes.push(0);
+    bytes.push(0);
+    val bin: str = path_join(root, "bytes.bin");
+    check_b("write bytes", fs_write_bytes(bin, bytes), true);
+    check_i("bytes size", fs_file_size(bin), 258);
+    val back: Vec<i64> = fs_read_bytes(bin);
+    check_i("bytes read", back.len(), 258);
+    var same: bool = back.len() == bytes.len();
+    var k: i64 = 0;
+    while same && k < back.len() {
+        if back.get(k) != bytes.get(k) { same = false; }
+        k = k + 1;
+    }
+    check_b("bytes round trip", same, true);
+    check_i("first byte", back.get(0), 0);
+    check_i("byte 255", back.get(255), 255);
+    check_i("last byte", back.get(257), 0);
+    // line ends as written
+    val crlf: str = path_join(root, "crlf.txt");
+    fs_write_text(crlf, "a\r\nb\nc\r");
+    check_i("CR LF size (no translation)", fs_file_size(crlf), 7);
+    val cb: Vec<i64> = fs_read_bytes(crlf);
+    check_s("CR LF bytes", int_to_str(cb.get(1)) + " " + int_to_str(cb.get(2)) + " " + int_to_str(cb.get(4)) + " " + int_to_str(cb.get(6)), "13 10 10 13");
+    // a 64 KiB file
+    val big: str = path_join(root, "big.txt");
+    var chunk: str = "0123456789abcdef";
+    var i: i64 = 0;
+    while i < 12 { chunk = chunk + chunk; i = i + 1; }
+    check_i("chunk", str_len(chunk), 65536);
+    check_b("write big", fs_write_text(big, chunk), true);
+    check_i("big size", fs_file_size(big), 65536);
+    val bt: str = fs_read_text(big);
+    check_i("big read", str_len(bt), 65536);
+    check_s("big tail", str_slice(bt, 65532, 65536), "cdef");
+    // rename
+    val r: str = path_join(root, "renamed.txt");
+    check_b("rename", fs_rename(f, r), true);
+    check_b("old name gone", fs_exists(f), false);
+    check_s("new name has it", fs_read_text(r), "hi there\nline 2\n");
+    check_b("rename missing", fs_rename(path_join(root, "nope.txt"), path_join(root, "nope2.txt")), false);
+    // delete
+    check_b("delete", fs_delete(r), true);
+    check_b("deleted", fs_exists(r), false);
+    check_b("delete again", fs_delete(r), false);
+    // a missing file is reported, not a crash
+    val m: str = path_join(root, "missing.txt");
+    check_b("missing: read_file is None", is_none(m), true);
+    check_s("missing: fs_read_text", fs_read_text(m), "");
+    check_i("missing: size", fs_file_size(m), -1);
+    check_i("missing: bytes", fs_read_bytes(m).len(), 0);
+    check_i("missing: lines", fs_read_lines(m).len(), 0);
+    check_b("missing: exists", fs_exists(m), false);
+    check_b("missing: is_file", fs_is_file(m), false);
+    check_b("write into a missing directory", fs_write_text(path_join(root, "no/such/dir.txt"), "x"), false);
+    check_b("read a directory as a file", is_none(root), true);
+}
+
+fn dirs(root: str) {
+    println("-- directories");
+    val d: str = path_join(root, "d");
+    check_b("mkdir", fs_mkdir(d), true);
+    check_b("is a dir", fs_is_dir(d), true);
+    check_b("is not a file", fs_is_file(d), false);
+    check_b("mkdir again", fs_mkdir(d), false);
+    check_b("mkdir with a missing parent", fs_mkdir(path_join(root, "x/y")), false);
+    check_b("not made", fs_is_dir(path_join(root, "x")), false);
+    check_s("empty listing", listing(d), "");
+    check_s("missing listing", listing(path_join(root, "nope")), "");
+    fs_write_text(path_join(d, "b.txt"), "b");
+    fs_write_text(path_join(d, "a.txt"), "a");
+    fs_write_text(path_join(d, "c.bin"), "c");
+    check_b("sub mkdir", fs_mkdir(path_join(d, "sub")), true);
+    check_s("listing", listing(d), "a.txt,b.txt,c.bin,sub");
+    check_b("rmdir non-empty", fs_rmdir(d), false);
+    check_b("still there", fs_is_dir(d), true);
+    check_b("rmdir empty", fs_rmdir(path_join(d, "sub")), true);
+    check_b("empty one gone", fs_is_dir(path_join(d, "sub")), false);
+    check_b("rmdir missing", fs_rmdir(path_join(d, "sub")), false);
+    val deep: str = path_join(root, "n1/n2/n3");
+    check_b("mkdir_all", fs_mkdir_all(deep), true);
+    check_b("nested made", fs_is_dir(deep), true);
+    check_b("mkdir_all existing", fs_mkdir_all(deep), true);
+    fs_write_text(path_join(deep, "leaf.txt"), "leaf");
+    fs_write_text(path_join(root, "n1/top.txt"), "top");
+    check_s("nested listing", listing(path_join(root, "n1")), "n2,top.txt");
+    check_s("nested file", fs_read_text(path_join(root, "n1/n2/n3/leaf.txt")), "leaf");
+    check_b("rmdir_all nested", fs_rmdir_all(path_join(root, "n1")), true);
+    check_b("nested gone", fs_exists(path_join(root, "n1")), false);
+    check_b("rmdir_all files", fs_rmdir_all(d), true);
+    check_b("dir gone", fs_is_dir(d), false);
+    check_b("rmdir_all missing", fs_rmdir_all(d), true);
+}
+
+fn processes() {
+    println("-- processes");
+    var h: i64 = process_run("echo out_text");
+    check_b("started", process_ok(h), true);
+    check_s("stdout", str_trim(process_stdout(h)), "out_text");
+    check_s("no stderr", str_trim(process_stderr(h)), "");
+    check_i("status 0", process_code(h), 0);
+    process_close(h);
+    var h2: i64 = process_run("echo err_text 1>&2");
+    check_s("stderr", str_trim(process_stderr(h2)), "err_text");
+    check_s("stderr only", str_trim(process_stdout(h2)), "");
+    process_close(h2);
+    var h3: i64 = process_run("exit 7");
+    check_i("exit status", process_code(h3), 7);
+    process_close(h3);
+    var h4: i64 = process_run("echo first&& echo second");
+    val lines: Vec<str> = str_split(str_trim(str_replace(process_stdout(h4), "\r", "")), "\n");
+    check_i("two lines", lines.len(), 2);
+    check_s("second line", str_trim(lines.get(1)), "second");
+    process_close(h4);
+    check_b("empty command is not started", process_ok(process_run("")), false);
+    check_i("bad handle status", process_code(0), -1);
+    check_b("system status", process_system("exit 3") != 0, true);
+    check_b("system ok", process_system("exit 0") == 0, true);
+}
+
+// Run last: native Windows executables get both wrong (see the report of
+// Nov 15: stdout holds stderr's text, a bad handle's stdout is a null
+// string), the interpreter and C get them right.
+fn processes_both_streams() {
+    var h: i64 = process_run("echo both_out&& echo both_err 1>&2&& exit 2");
+    check_s("both: stdout", str_trim(process_stdout(h)), "both_out");
+    check_s("both: stderr", str_trim(process_stderr(h)), "both_err");
+    check_i("both: status", process_code(h), 2);
+    process_close(h);
+    check_s("bad handle stdout", process_stdout(0), "");
+    check_s("bad handle stderr", process_stderr(0), "");
+}
+
+fn main() -> i64 {
+    val root: str = fs_temp_dir(temp_base(), "files_spec");
+    check_b("temp dir", str_len(root) > 0 && fs_is_dir(root), true);
+    files(root);
+    dirs(root);
+    processes();
+    processes_both_streams();
+    check_b("remove temp dir", fs_rmdir_all(root), true);
+    check_b("temp dir gone", fs_exists(root), false);
+    println("files spec ok");
+    return 0;
+}

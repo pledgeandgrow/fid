@@ -28,6 +28,8 @@ fn runtime_effects(name: &str) -> Option<EffectSet> {
         | "p_vec_insert" | "p_vec_remove" | "p_vec_reverse" | "p_vec_extend"
         | "p_vec_truncate" | "p_vec_sort" | "p_vec_resize"
         | "p_memset" | "p_str_zeroize" | "p_vec_zeroize"
+        | "p_sensitive_mark" | "p_sensitive_check" | "p_sensitive_unmark"
+        | "p_sensitive_remark" | "p_sensitive_free" | "p_sensitive_wipes"
     ) {
         effects.add(Effect::Write);
         return Some(effects);
@@ -1092,6 +1094,13 @@ impl Lowerer {
         // @zeroize: wipe the bytes a str / the buffer a Vec owns
         self.module.add_extern("p_str_zeroize", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Void);
         self.module.add_extern("p_vec_zeroize", vec![IrType::I64], IrType::Void);
+        // J8: sensitive-Vec buffer registry (wipes grown/dropped buffers)
+        self.module.add_extern("p_sensitive_mark", vec![IrType::I64], IrType::Void);
+        self.module.add_extern("p_sensitive_check", vec![IrType::I64], IrType::I64);
+        self.module.add_extern("p_sensitive_unmark", vec![IrType::I64], IrType::Void);
+        self.module.add_extern("p_sensitive_remark", vec![IrType::I64], IrType::Void);
+        self.module.add_extern("p_sensitive_free", vec![IrType::I64, IrType::I64, IrType::I64], IrType::Void);
+        self.module.add_extern("p_sensitive_wipes", vec![], IrType::I64);
 
         // ─── Phase 5A.4: MMU/page table management (bare-metal) ───
         self.module.add_extern("p_cr3_read", vec![], IrType::I64);         // read CR3 (page table base)
@@ -2167,6 +2176,7 @@ impl Lowerer {
                         }
                     }
                 }
+                if has_zeroize { self.mark_sensitive_vec(alloca); }
             }
             Stmt::LetUninit { name, ty, annotations, line: _ } => {
                 // Uninitialized variable — allocate storage but don't store a value.
@@ -2193,6 +2203,7 @@ impl Lowerer {
                         }
                     }
                 }
+                if has_zeroize { self.mark_sensitive_vec(alloca); }
             }
             Stmt::LetTuple { names, expr, line: _ } => {
                 // Lower the tuple expression — returns a pointer to a __tuple_N struct
@@ -8411,6 +8422,24 @@ impl Lowerer {
                 effects,
             });
         }
+    }
+
+    /// J8: register a @zeroize Vec's element buffer with the runtime's
+    /// sensitive table so the grow/drop paths wipe it before freeing.
+    fn mark_sensitive_vec(&mut self, alloca: ValueId) {
+        let is_vec = self.alloca_types.get(&alloca)
+            .map(|t| t.is_opaque_named("Vec")).unwrap_or(false);
+        if !is_vec { return; }
+        let ty = self.alloca_types[&alloca].clone();
+        let held = self.emit_inst(Inst::Load { ptr: alloca, ty });
+        let mut effects = EffectSet::new();
+        effects.add(Effect::Write);
+        self.emit_inst(Inst::Call {
+            func: "p_sensitive_mark".to_string(),
+            args: vec![held],
+            ret_ty: IrType::Void,
+            effects,
+        });
     }
 
     /// Check if a struct type has a Drop impl (a `drop` method).

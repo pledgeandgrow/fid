@@ -607,6 +607,96 @@ fn pe_dup_range(s: i64, from: i64, n: i64) -> i64 {
     return r;
 }
 
+// Core's copy, compare and byte search, a word at a time where both
+// addresses are aligned (competitive roadmap OP23; RISC-V traps on
+// misaligned words), a byte at a time for the rest.
+pub fn pert_mem_copy(dst: i64, src: i64, n: i64) {
+    var off: i64 = 0;
+    if ((dst | src) & 7) == 0 {
+        while off + 8 <= n {
+            var s8: *mut i64 = src + off;
+            var d8: *mut i64 = dst + off;
+            unsafe { *d8 = *s8; }
+            off = off + 8;
+        }
+    }
+    while off < n {
+        var s1: *mut u8 = src + off;
+        var d1: *mut u8 = dst + off;
+        unsafe { *d1 = *s1; }
+        off = off + 1;
+    }
+}
+
+pub fn pert_str_copy_n(dst: i64, src: i64, n: i64) {
+    pert_mem_copy(dst, src, n);
+}
+
+pub fn pert_bytes_eq(a: i64, b: i64, n: i64) -> bool {
+    var off: i64 = 0;
+    if ((a | b) & 7) == 0 {
+        while off + 8 <= n {
+            var a8: *mut i64 = a + off;
+            var b8: *mut i64 = b + off;
+            var x: i64 = 0;
+            var y: i64 = 0;
+            unsafe { x = *a8; y = *b8; }
+            if x != y { return false; }
+            off = off + 8;
+        }
+    }
+    while off < n {
+        var a1: *mut u8 = a + off;
+        var b1: *mut u8 = b + off;
+        var xb: i64 = 0;
+        var yb: i64 = 0;
+        unsafe { xb = *a1; yb = *b1; }
+        if xb != yb { return false; }
+        off = off + 1;
+    }
+    return true;
+}
+
+/// memchr: eight bytes per step once aligned (a word holds `b` when
+/// ((w ^ bbbb...) - 0x0101...) & ~(w ^ bbbb...) & 0x8080... is not zero).
+@wrapping
+pub fn pert_mem_find_byte(p: i64, n: i64, b: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n && ((p + i) & 7) != 0 {
+        var hp: *mut u8 = p + i;
+        var hx: i64 = 0;
+        unsafe { hx = *hp; }
+        if hx == b { return i; }
+        i = i + 1;
+    }
+    var lo: i64 = 0x0101010101010101;
+    var hi: i64 = 0 - 0x7F7F7F7F7F7F7F80;
+    var rep: i64 = (b & 255) * lo;
+    var scanning: bool = true;
+    while scanning && i + 8 <= n {
+        var wp: *mut i64 = p + i;
+        var w: i64 = 0;
+        unsafe { w = *wp; }
+        var x: i64 = w ^ rep;
+        // a zero byte in x is a match in w: stop, the tail finds which
+        if ((x - lo) & (0 - x - 1) & hi) != 0 { scanning = false; } else { i = i + 8; }
+    }
+    // the bytes left, and the word that held a match, one by one
+    return pert_mem_find_byte_tail(p, n, b, i);
+}
+
+fn pert_mem_find_byte_tail(p: i64, n: i64, b: i64, from: i64) -> i64 {
+    var j: i64 = from;
+    while j < n {
+        var tp: *mut u8 = p + j;
+        var tx: i64 = 0;
+        unsafe { tx = *tp; }
+        if tx == b { return j; }
+        j = j + 1;
+    }
+    return -1;
+}
+
 pub fn pert_str_concat(a: i64, b: i64) -> i64 {
     var la: i64 = pe_len(a);
     var lb: i64 = pe_len(b);
@@ -1274,3 +1364,106 @@ pub fn pert_file_delete(path: i64) -> i64 {
     if pe_sys(PE_SYS_UNLINKAT, PE_AT_FDCWD, path, 0) < 0 { return 0 - 1; }
     return 0;
 }
+
+// ─── J8: sensitive-Vec buffer registry ────────────────────────────────────
+// p_sensitive_* calls come from core's Vec functions; on this backend they
+// resolve to pert_sensitive_*. Same scheme as pe_runtime/base.fd.
+
+pub fn pert_memset(dst: i64, v: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n { pe_stb(dst + i, v & 255); i = i + 1; }
+}
+
+// @zeroize: wipe a heap string's bytes and a Vec's element buffer.
+// A Fides Vec is a 40-byte block: [0] data [8] len [16] cap, element code
+// at [24] (vec_code reads it). Byte stores keep the wipe off the
+// optimizer's dead-store list on this backend.
+pub fn pert_str_zeroize(s: i64) {
+    if s == 0 { return; }
+    var i: i64 = 0;
+    while pe_ldb(s + i) != 0 { pe_stb(s + i, 0); i = i + 1; }
+}
+
+pub fn pert_vec_zeroize(v: i64) {
+    if v == 0 { return; }
+    var data: i64 = pe_ld(v);
+    var cap: i64 = pe_ld(v + 16);
+    if data != 0 && cap > 0 {
+        var n: i64 = cap * vec_esz(vec_code(v));
+        var i: i64 = 0;
+        while i < n { pe_stb(data + i, 0); i = i + 1; }
+    }
+    pert_sensitive_unmark(v);
+}
+
+// Header-keyed, mirroring the C runtime: entries are (header, current
+// buffer, element size). Core's grow/drop paths check the header and wipe
+// the outgoing buffer; remark refreshes the tracked buffer after growth.
+var lrt_sens_tab: i64 = 0;
+var lrt_sens_n: i64 = 0;
+var lrt_sens_wipes: i64 = 0;
+
+fn lrt_sens_table() -> i64 {
+    if lrt_sens_tab == 0 {
+        lrt_sens_tab = pert_malloc(256 * 24);
+        var zi: i64 = 0;
+        while zi < 256 * 24 { pe_stb(lrt_sens_tab + zi, 0); zi = zi + 1; }
+    }
+    return lrt_sens_tab;
+}
+
+fn lrt_sens_find(hdr: i64) -> i64 {
+    var t: i64 = lrt_sens_table();
+    var i: i64 = 0;
+    while i < lrt_sens_n {
+        if pe_ld(t + i * 24) == hdr { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn pert_sensitive_mark(v: i64) {
+    if v == 0 || lrt_sens_n >= 256 || lrt_sens_find(v) >= 0 { return; }
+    var e: i64 = lrt_sens_table() + lrt_sens_n * 24;
+    pe_st(e, v);
+    pe_st(e + 8, pe_ld(v));
+    pe_st(e + 16, vec_esz(vec_code(v)));
+    lrt_sens_n = lrt_sens_n + 1;
+}
+
+pub fn pert_sensitive_remark(v: i64) {
+    var i: i64 = lrt_sens_find(v);
+    if i < 0 { return; }
+    var e: i64 = lrt_sens_table() + i * 24;
+    pe_st(e + 8, pe_ld(v));
+    pe_st(e + 16, vec_esz(vec_code(v)));
+}
+
+pub fn pert_sensitive_check(v: i64) -> i64 {
+    if lrt_sens_find(v) >= 0 { return 1; }
+    return 0;
+}
+
+pub fn pert_sensitive_unmark(v: i64) {
+    var i: i64 = lrt_sens_find(v);
+    if i < 0 { return; }
+    var t: i64 = lrt_sens_table();
+    var last: i64 = t + (lrt_sens_n - 1) * 24;
+    var e: i64 = t + i * 24;
+    pe_st(e, pe_ld(last));
+    pe_st(e + 8, pe_ld(last + 8));
+    pe_st(e + 16, pe_ld(last + 16));
+    lrt_sens_n = lrt_sens_n - 1;
+}
+
+pub fn pert_sensitive_free(v: i64, buf: i64, cap: i64) {
+    var i: i64 = lrt_sens_find(v);
+    if i < 0 || buf == 0 { return; }
+    var esz: i64 = pe_ld(lrt_sens_table() + i * 24 + 16);
+    if cap < 0 { cap = 0 - cap; }
+    var j: i64 = 0;
+    while j < cap * esz { pe_stb(buf + j, 0); j = j + 1; }
+    lrt_sens_wipes = lrt_sens_wipes + 1;
+}
+
+pub fn pert_sensitive_wipes() -> i64 { return lrt_sens_wipes; }

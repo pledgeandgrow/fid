@@ -1,0 +1,149 @@
+// pgo.fd — profiles from a real run, for profile-guided optimization
+// (competitive roadmap OP30).
+//
+//   fid run <file.fd> --profile <out.prof>
+//       the interpreter counts the calls of every function and writes them:
+//       a line "fides-profile 1", then one line "<calls> <function>" each,
+//       most called first.
+//   fid emit|ccompile|build <file.fd> ... --profile-use <out.prof>
+//       lowering puts the functions the run called most first in the module
+//       (hot code together on every backend), and `pgo_count` gives any
+//       pass the counts (an inliner or a block layout can weigh by them).
+//
+// Function names are the IR's (after monomorphization): the profile is for
+// the program as it was when profiled; a function it does not know counts 0.
+
+use core;
+use vec;
+use string;
+use compiler::ir;
+
+/// `--profile`: the interpreter is counting calls.
+pub var g_pgo_record: bool = false;
+/// `--profile-use`: the profile lowering applies ("" = none).
+pub var g_pgo_use_path: str = "";
+
+var g_pgo_counts: i64 = 0;          // name -> calls (recording or loaded)
+var g_pgo_names: Vec<str> = Vec::new();
+var g_pgo_loaded: bool = false;
+
+/// The interpreter calls this on entry to each function while recording.
+pub fn pgo_note_call(name: str) {
+    if !g_pgo_record { return; }
+    if g_pgo_counts == 0 { g_pgo_counts = HashMap_new(); }
+    var c: i64 = HashMap_get(g_pgo_counts, name);
+    if c == 0 { g_pgo_names.push(name); }
+    HashMap_insert(g_pgo_counts, name, c + 1);
+}
+
+/// How many times the profiled run called `name` (0: never, or no profile).
+pub fn pgo_count(name: str) -> i64 {
+    if !g_pgo_loaded { pgo_load_use(); }
+    if g_pgo_counts == 0 { return 0; }
+    return HashMap_get(g_pgo_counts, name);
+}
+
+/// Indices of `names` ordered by their counts, most first; equal counts
+/// keep their order.
+fn pgo_order(names: Vec<str>, counts: Vec<i64>) -> Vec<i64> {
+    var idx: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < names.len() { idx.push(i); i = i + 1; }
+    // insertion sort, stable: profiles have a few thousand entries at most
+    var k: i64 = 1;
+    while k < idx.len() {
+        var cur: i64 = idx.get(k);
+        var j: i64 = k - 1;
+        while j >= 0 && counts.get(idx.get(j)) < counts.get(cur) {
+            idx.set(j + 1, idx.get(j));
+            j = j - 1;
+        }
+        idx.set(j + 1, cur);
+        k = k + 1;
+    }
+    return idx;
+}
+
+/// Write the recorded counts to `path`; false when it cannot be written.
+pub fn pgo_write(path: str) -> bool {
+    var counts: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < g_pgo_names.len() {
+        counts.push(HashMap_get(g_pgo_counts, g_pgo_names.get(i)));
+        i = i + 1;
+    }
+    var order: Vec<i64> = pgo_order(g_pgo_names, counts);
+    var out: str = "fides-profile 1\n";
+    var k: i64 = 0;
+    while k < order.len() {
+        var at: i64 = order.get(k);
+        out = out + int_to_str(counts.get(at)) + " " + g_pgo_names.get(at) + "\n";
+        k = k + 1;
+    }
+    return p_file_write(path, out) >= 0;
+}
+
+/// Read the profile `--profile-use` names, once.
+fn pgo_load_use() {
+    g_pgo_loaded = true;
+    if g_pgo_use_path == "" { return; }
+    match read_file(g_pgo_use_path) {
+        Option::Some(text) => {
+            var lines: Vec<str> = str_split(text, "\n");
+            if lines.len() == 0 || str_trim(lines.get(0)) != "fides-profile 1" {
+                p_eprint_str("warning: " + g_pgo_use_path + " is not a fides profile (fid run --profile): ignored\n");
+                return;
+            }
+            g_pgo_counts = HashMap_new();
+            var i: i64 = 1;
+            while i < lines.len() {
+                var ln: str = str_trim(lines.get(i));
+                var sp: i64 = str_find(ln, " ");
+                if sp > 0 {
+                    var name: str = str_slice(ln, sp + 1, str_len(ln));
+                    HashMap_insert(g_pgo_counts, name, str_parse_int(str_slice(ln, 0, sp)));
+                    g_pgo_names.push(name);
+                }
+                i = i + 1;
+            }
+        }
+        Option::None => {
+            p_eprint_str("warning: cannot read profile " + g_pgo_use_path + ": ignored\n");
+        }
+    }
+}
+
+/// With a profile: the module's functions the run called, most called
+/// first, then the others in their order (the backends lay functions out in
+/// module order, so the hot ones end up together).
+pub fn pgo_apply(module: &mut IrModule) {
+    if g_pgo_use_path == "" { return; }
+    if !g_pgo_loaded { pgo_load_use(); }
+    if g_pgo_counts == 0 { return; }
+    var names: Vec<str> = Vec::new();
+    var counts: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var nm: str = module.functions.get(i).name;
+        names.push(nm);
+        counts.push(HashMap_get(g_pgo_counts, nm));
+        i = i + 1;
+    }
+    var order: Vec<i64> = pgo_order(names, counts);
+    var moved: bool = false;
+    var k: i64 = 0;
+    while k < order.len() {
+        if order.get(k) != k { moved = true; }
+        k = k + 1;
+    }
+    if !moved { return; }
+    var nf: Vec<IrFunctionEntry> = Vec::new();
+    k = 0;
+    while k < order.len() {
+        nf.push(module.functions.get(order.get(k)));
+        k = k + 1;
+    }
+    module.functions = nf;
+    // the index of names to positions is stale now (AGENTS.md 14)
+    HashMap_clear(module.fn_index);
+}

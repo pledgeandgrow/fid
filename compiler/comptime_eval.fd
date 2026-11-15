@@ -113,6 +113,91 @@ pub fn ComptimeEnv_clone(env: &ComptimeEnv) -> ComptimeEnv {
     return new_env;
 }
 
+// --- Comptime tables (OP28) ------------------------------------------------
+// A Vec built at compile time is an ArrayLit whose element type is
+// __ctvec<T>; where its value lands in the program it becomes a block that
+// builds the Vec from the computed elements, so the work that made them
+// is gone from the binary.
+
+pub fn ct_vec_of(elem_ty: Type, elements: Vec<Expr>) -> Expr {
+    var a: Vec<Type> = Vec::new();
+    a.push(elem_ty);
+    return Expr::ArrayLit(Box::new(Type::Generic("__ctvec", a)), elements);
+}
+
+/// The elements of comptime Vec `e`, when it is one.
+pub fn ct_vec_elems(e: Expr, out: &mut Vec<Expr>) -> bool {
+    match e {
+        Expr::ArrayLit(t, els) => {
+            match ct_box_type_unbox(t) {
+                Type::Generic(n, _) => {
+                    if n == "__ctvec" {
+                        var i: i64 = 0;
+                        while i < els.len() { out.push(els.get(i)); i = i + 1; }
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    return false;
+}
+
+fn ct_box_type_unbox(b: Box<Type>) -> Type {
+    return *b;
+}
+
+/// The type of a computed element: what its literal is.
+fn ct_lit_type(e: Expr) -> Type {
+    match e {
+        Expr::IntLit(_) => { return Type::I64; }
+        Expr::FloatLit(_) => { return Type::F64; }
+        Expr::StringLit(_) => { return Type::Str; }
+        Expr::BoolLit(_) => { return Type::Bool; }
+        _ => {}
+    }
+    return Type::I64;
+}
+
+/// Program code for comptime value `v`: itself, or for a comptime Vec
+/// `{ var __ctv: Vec<T> = Vec::new(); __ctv.push(e0); ...; __ctv }`.
+pub fn ct_materialize(v: Expr) -> Expr {
+    var els: Vec<Expr> = Vec::new();
+    if !ct_vec_elems(v, &mut els) { return v; }
+    var et: Type = Type::I64;
+    if els.len() > 0 { et = ct_lit_type(els.get(0)); }
+    var targs: Vec<Type> = Vec::new();
+    targs.push(et);
+    var no_args: Vec<Expr> = Vec::new();
+    var body: Vec<Stmt> = Vec::new();
+    body.push(Stmt::Let("__ctv", OptType::Some(Type::Generic("Vec", targs)),
+        Expr::MethodCall(Box::new(Expr::Ident("Vec")), "new", no_args), true, false, Vec::new(), 0));
+    var i: i64 = 0;
+    while i < els.len() {
+        var pa: Vec<Expr> = Vec::new();
+        pa.push(els.get(i));
+        body.push(Stmt::Expr(Expr::MethodCall(Box::new(Expr::Ident("__ctv")), "push", pa), 0));
+        i = i + 1;
+    }
+    body.push(Stmt::Expr(Expr::Ident("__ctv"), 0));
+    return Expr::Block(body);
+}
+
+// Explicit `comptime` that could not be evaluated: reported once each (it
+// then runs when the program does; it used to be silent).
+var g_ct_warn_on: bool = false;
+var g_ct_warned: i64 = 0;
+
+fn ct_warn(msg: str) {
+    if !g_ct_warn_on { return; }
+    if g_ct_warned == 0 { g_ct_warned = HashMap_new(); }
+    if HashMap_get(g_ct_warned, msg) != 0 { return; }
+    HashMap_insert(g_ct_warned, msg, 1);
+    p_eprint_str("warning: comptime: " + msg + " -- evaluated when the program runs instead\n");
+}
+
 // --- Result type for comptime evuation ---------------------------------
 
 pub enum OptExpr {
@@ -129,8 +214,17 @@ pub enum ResultExpr {
 // Process `comptime gen` blocks: evaluate them, parse the result as Fides
 // source, and inject generated functions/structs into the program.
 
+// The errors of the last process_gen (they were dropped before: a failed
+// parse of generated code or an evaluation error was silent)
+var g_ct_gen_errors: Vec<str> = Vec::new();
+
+pub fn comptime_gen_errors() -> Vec<str> {
+    return g_ct_gen_errors;
+}
+
 pub fn process_gen(program: Program) -> Program {
     var prog: Program = program;
+    g_ct_gen_errors = Vec::new();
 
     // First, substitute comptime expressions inside comptime gen blocks
     var errs: Vec<str> = Vec::new();
@@ -161,7 +255,7 @@ pub fn process_gen(program: Program) -> Program {
         prog.structs.push(generated_structs.get(si));
         si = si + 1;
     }
-
+    g_ct_gen_errors = errs;
     return prog;
 }
 
@@ -170,10 +264,10 @@ fn substitute_comptime_gen_blocks(funcs: &mut Vec<Func>, idx: i64, original: &Pr
     var si: i64 = 0;
     while si < func.body.len() {
         match func.body.get(si) {
-            Stmt::ComptimeGen(block, _) => {
+            Stmt::ComptimeGen(block, gen_line) => {
                 var block_copy: Vec<Stmt> = block;
                 substitute_stmts(&mut block_copy, original, errs);
-                func.body.set(si, Stmt::ComptimeGen(block_copy, 0));
+                func.body.set(si, Stmt::ComptimeGen(block_copy, gen_line));
             }
             _ => {}
         }
@@ -197,14 +291,27 @@ fn process_comptime_gen_in_func(funcs: &mut Vec<Func>, idx: i64, original: &Prog
                                 var parse_result: OptProgram = parse_generated_code(source);
                                 match parse_result {
                                     OptProgram::Some(gen_prog) => {
+                                        // LG9: a generated name never silently
+                                        // replaces or shadows one the program (or
+                                        // an earlier generation) declares
                                         var gfi: i64 = 0;
                                         while gfi < gen_prog.funcs.len() {
-                                            generated_funcs.push(gen_prog.funcs.get(gfi));
+                                            var gname: str = gen_prog.funcs.get(gfi).name;
+                                            if ct_gen_func_taken(original, generated_funcs, gname) {
+                                                errs.push("comptime gen (line " + int_to_str(line) + "): generated function '" + gname + "' collides with a function already declared; give the generated one a unique name");
+                                            } else {
+                                                generated_funcs.push(gen_prog.funcs.get(gfi));
+                                            }
                                             gfi = gfi + 1;
                                         }
                                         var gsi: i64 = 0;
                                         while gsi < gen_prog.structs.len() {
-                                            generated_structs.push(gen_prog.structs.get(gsi));
+                                            var gsname: str = gen_prog.structs.get(gsi).name;
+                                            if ct_gen_struct_taken(original, generated_structs, gsname) {
+                                                errs.push("comptime gen (line " + int_to_str(line) + "): generated struct '" + gsname + "' collides with a type already declared; give the generated one a unique name");
+                                            } else {
+                                                generated_structs.push(gen_prog.structs.get(gsi));
+                                            }
                                             gsi = gsi + 1;
                                         }
                                     }
@@ -234,6 +341,39 @@ fn process_comptime_gen_in_func(funcs: &mut Vec<Func>, idx: i64, original: &Prog
 pub enum OptProgram {
     Some(Program),
     None,
+}
+
+fn ct_gen_func_taken(original: &Program, generated: &Vec<Func>, name: str) -> bool {
+    var i: i64 = 0;
+    while i < original.funcs.len() {
+        if original.funcs.get(i).name == name { return true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < generated.len() {
+        if generated.get(i).name == name { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ct_gen_struct_taken(original: &Program, generated: &Vec<StructDef>, name: str) -> bool {
+    var i: i64 = 0;
+    while i < original.structs.len() {
+        if original.structs.get(i).name == name { return true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < original.enums.len() {
+        if original.enums.get(i).name == name { return true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < generated.len() {
+        if generated.get(i).name == name { return true; }
+        i = i + 1;
+    }
+    return false;
 }
 
 fn parse_generated_code(source: str) -> OptProgram {
@@ -281,11 +421,29 @@ pub fn substitute(program: Program) -> Program {
         iter = iter + 1;
     }
 
-    // Phase 2: Substitute comptime expressions everywhere
+    // Phase 2: Substitute comptime expressions everywhere (an explicit one
+    // that fails in an ordinary function is reported)
     var fi2: i64 = 0;
     while fi2 < prog.funcs.len() {
-        if need.get(fi2) { substitute_func(&mut prog.funcs, fi2, &prog, &mut errs); }
+        if need.get(fi2) {
+            g_ct_warn_on = !prog.funcs.get(fi2).is_comptime;
+            substitute_func(&mut prog.funcs, fi2, &prog, &mut errs);
+            g_ct_warn_on = false;
+        }
         fi2 = fi2 + 1;
+    }
+    // A constant's initializer: `const TABLE: Vec<i64> = comptime make()`
+    // (it was left a run-time call)
+    var ci: i64 = 0;
+    while ci < prog.consts.len() {
+        var cd: ConstDef = prog.consts.get(ci);
+        if ct_scan_expr_sub(cd.expr) {
+            g_ct_warn_on = true;
+            substitute_expr(&mut cd.expr, &prog, &mut errs);
+            g_ct_warn_on = false;
+            prog.consts.set(ci, cd);
+        }
+        ci = ci + 1;
     }
 
     // Phase 3: Aggressive comptime evuation -- auto-evaluate calls to
@@ -777,8 +935,8 @@ fn substitute_expr_comptime(expr: &mut Expr, inner: Box<Expr>, original: &Progra
     // Now evaluate the comptime expression
     var result: ResultExpr = evaluate(&e, original);
     match result {
-        ResultExpr::Ok(v) => { *expr = v; }
-        ResultExpr::Err(msg) => { errs.push("comptime error: " + msg); }
+        ResultExpr::Ok(v) => { *expr = ct_materialize(v); }
+        ResultExpr::Err(msg) => { errs.push("comptime error: " + msg); ct_warn(msg); }
     }
 }
 
@@ -786,8 +944,8 @@ fn substitute_expr_comptime_block(expr: &mut Expr, stmts: &mut Vec<Stmt>, origin
     substitute_stmts(stmts, original, errs);
     var result: ResultExpr = evaluate_block(stmts, original);
     match result {
-        ResultExpr::Ok(v) => { *expr = v; }
-        ResultExpr::Err(msg) => { errs.push("comptime error: " + msg); }
+        ResultExpr::Ok(v) => { *expr = ct_materialize(v); }
+        ResultExpr::Err(msg) => { errs.push("comptime error: " + msg); ct_warn(msg); }
     }
 }
 
@@ -1000,7 +1158,7 @@ fn aggressive_comptime_expr(expr: &mut Expr, original: &Program) {
                 if all_lit {
                     var result: ResultExpr = evaluate(expr, original);
                     match result {
-                        ResultExpr::Ok(v) => { *expr = v; }
+                        ResultExpr::Ok(v) => { *expr = ct_materialize(v); }
                         ResultExpr::Err(_) => {} // Leave as-is on error
                     }
                 }
@@ -1353,13 +1511,13 @@ fn evaluate_block(stmts: Vec<Stmt>, original: &Program) -> ResultExpr {
 fn evaluate_block_with_env(stmts: Vec<Stmt>, original: &Program, env: &ComptimeEnv) -> ResultExpr {
     var returned: Vec<i64> = Vec::new();
     var block_env: ComptimeEnv = ComptimeEnv_clone(env);
-    return evaluate_block_rt(stmts, original, &block_env, &mut returned);
+    return evaluate_block_rt(stmts, original, &mut block_env, &mut returned);
 }
 
 /// Runs `stmts` in `env` itself (its Vecs are shared): assignments to
 /// outer variables persist (a loop accumulating into `out`), names the
 /// block declares are dropped at its end.
-fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &ComptimeEnv, returned: &mut Vec<i64>) -> ResultExpr {
+fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &mut ComptimeEnv, returned: &mut Vec<i64>) -> ResultExpr {
     var local_env: ComptimeEnv = ComptimeEnv { names: env.names, values: env.values };
     var n_outer: i64 = local_env.names.len();
     var result: Expr = Expr::IntLit(0);
@@ -1407,6 +1565,57 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &ComptimeEnv, re
             }
             Stmt::Expr(e, _) => {
                 result = Expr::IntLit(0);
+                // `t.push(x)` / `t.set(i, x)` on a comptime table
+                var handled: bool = false;
+                match e {
+                    Expr::MethodCall(pr, pm, pargs) => {
+                        match ct_box_expr_unbox(pr) {
+                            Expr::Ident(pv) => {
+                                if pm == "push" || pm == "set" {
+                                    var cur: OptExpr = ComptimeEnv_get(&local_env, pv);
+                                    match cur {
+                                        OptExpr::Some(cv) => {
+                                            var tel: Vec<Expr> = Vec::new();
+                                            if ct_vec_elems(cv, &mut tel) {
+                                                var vals: Vec<Expr> = Vec::new();
+                                                var pa: i64 = 0;
+                                                while pa < pargs.len() {
+                                                    var ax: Expr = pargs.get(pa);
+                                                    match evaluate_with_env(&ax, &local_env, original) {
+                                                        ResultExpr::Ok(av) => { vals.push(av); }
+                                                        ResultExpr::Err(am) => { return ResultExpr::Err(am); }
+                                                    }
+                                                    pa = pa + 1;
+                                                }
+                                                var et: Type = Type::I64;
+                                                if pm == "push" && vals.len() == 1 {
+                                                    tel.push(vals.get(0));
+                                                    et = ct_lit_type(vals.get(0));
+                                                    handled = true;
+                                                } else if pm == "set" && vals.len() == 2 {
+                                                    match vals.get(0) {
+                                                        Expr::IntLit(si2) => {
+                                                            if si2 < 0 || si2 >= tel.len() { return ResultExpr::Err("comptime Vec index " + int_to_str(si2) + " out of bounds"); }
+                                                            tel.set(si2, vals.get(1));
+                                                            et = ct_lit_type(vals.get(1));
+                                                            handled = true;
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                                if handled { ComptimeEnv_set(&mut local_env, pv, ct_vec_of(et, tel)); }
+                                            }
+                                        }
+                                        OptExpr::None => {}
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+                if handled { si = si + 1; continue; }
                 var vr: ResultExpr = evaluate_with_env(e, &local_env, original);
                 match vr {
                     ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
@@ -1431,7 +1640,7 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &ComptimeEnv, re
                         match c {
                             Expr::BoolLit(b) => {
                                 if b {
-                                    var br: ResultExpr = evaluate_block_rt(then_block, original, &local_env, returned);
+                                    var br: ResultExpr = evaluate_block_rt(then_block, original, &mut local_env, returned);
                                     if returned.len() > 0 { return br; }
                                     match br {
                                         ResultExpr::Ok(v) => { result = v; }
@@ -1440,7 +1649,7 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &ComptimeEnv, re
                                 } else {
                                     match else_block {
                                         OptStmts::Some(eb) => {
-                                            var br: ResultExpr = evaluate_block_rt(eb, original, &local_env, returned);
+                                            var br: ResultExpr = evaluate_block_rt(eb, original, &mut local_env, returned);
                                             if returned.len() > 0 { return br; }
                                             match br {
                                                 ResultExpr::Ok(v) => { result = v; }
@@ -1452,6 +1661,34 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &ComptimeEnv, re
                                 }
                             }
                             _ => { return ResultExpr::Err("comptime if condition must be boolean"); }
+                        }
+                    }
+                }
+            }
+            Stmt::While(wcond, wbody, _) => {
+                // at most 10 million iterations: a comptime loop that does
+                // not end is an error, not a hang
+                var guard: i64 = 0;
+                var going: bool = true;
+                while going {
+                    var wc: ResultExpr = evaluate_with_env(wcond, &local_env, original);
+                    match wc {
+                        ResultExpr::Err(wm) => { return ResultExpr::Err(wm); }
+                        ResultExpr::Ok(wv) => {
+                            match wv {
+                                Expr::BoolLit(wb) => { going = wb; }
+                                _ => { return ResultExpr::Err("comptime while condition must be boolean"); }
+                            }
+                        }
+                    }
+                    if going {
+                        guard = guard + 1;
+                        if guard > 10000000 { return ResultExpr::Err("comptime while loop ran 10 million times"); }
+                        var wr: ResultExpr = evaluate_block_rt(wbody, original, &mut local_env, returned);
+                        if returned.len() > 0 { return wr; }
+                        match wr {
+                            ResultExpr::Ok(_) => {}
+                            ResultExpr::Err(wem) => { return ResultExpr::Err(wem); }
                         }
                     }
                 }
@@ -1480,7 +1717,7 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &ComptimeEnv, re
                                                                 var i: i64 = a;
                                                                 while i < b {
                                                                     ComptimeEnv_set(&mut local_env, loop_var, Expr::IntLit(i));
-                                                                    var br: ResultExpr = evaluate_block_rt(body, original, &local_env, returned);
+                                                                    var br: ResultExpr = evaluate_block_rt(body, original, &mut local_env, returned);
                                                                     if returned.len() > 0 { return br; }
                                                                     match br {
                                                                         ResultExpr::Ok(v) => { result = v; }
@@ -1508,8 +1745,14 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &ComptimeEnv, re
         }
         si = si + 1;
     }
-    local_env.names.truncate(n_outer);
-    local_env.values.truncate(n_outer);
+    // The variables of the enclosing blocks get what this block assigned
+    // them (the copy's buffers are not shared with `env` under copy-on-
+    // write, so a `while` body's `i = i + 1` was lost: an endless loop)
+    var wk: i64 = 0;
+    while wk < n_outer {
+        env.values.set(wk, local_env.values.get(wk));
+        wk = wk + 1;
+    }
     return ResultExpr::Ok(result);
 }
 
@@ -1549,7 +1792,47 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
                 ResultExpr::Ok(v) => { return eval_unaryop(op, v); }
             }
         }
+        Expr::MethodCall(mrecv, mname, margs) => {
+            var rcv: Expr = ct_box_expr_unbox(mrecv);
+            // Vec::new() / Vec::with_capacity(n): an empty comptime table
+            match rcv {
+                Expr::Ident(rn) => {
+                    if rn == "Vec" && (mname == "new" || mname == "with_capacity") {
+                        return ResultExpr::Ok(ct_vec_of(Type::I64, Vec::new()));
+                    }
+                }
+                _ => {}
+            }
+            var rv: ResultExpr = evaluate_with_env(&rcv, env, original);
+            match rv {
+                ResultExpr::Err(m) => { return ResultExpr::Err(m); }
+                ResultExpr::Ok(recv_v) => {
+                    var els: Vec<Expr> = Vec::new();
+                    if ct_vec_elems(recv_v, &mut els) {
+                        if mname == "len" { return ResultExpr::Ok(Expr::IntLit(els.len())); }
+                        if mname == "is_empty" { return ResultExpr::Ok(Expr::BoolLit(els.len() == 0)); }
+                        if mname == "get" && margs.len() == 1 {
+                            var gi: Expr = margs.get(0);
+                            match evaluate_with_env(&gi, env, original) {
+                                ResultExpr::Ok(iv) => {
+                                    match iv {
+                                        Expr::IntLit(ix) => {
+                                            if ix >= 0 && ix < els.len() { return ResultExpr::Ok(els.get(ix)); }
+                                            return ResultExpr::Err("comptime Vec index " + int_to_str(ix) + " out of bounds");
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                ResultExpr::Err(m2) => { return ResultExpr::Err(m2); }
+                            }
+                        }
+                    }
+                }
+            }
+            return ResultExpr::Err("method '" + mname + "' is not evaluated at compile time");
+        }
         Expr::Call(callee, args) => {
+            if callee == "Vec_new" && args.len() == 0 { return ResultExpr::Ok(ct_vec_of(Type::I64, Vec::new())); }
             var func_idx: i64 = -1;
             var fi: i64 = 0;
             while fi < original.funcs.len() {
@@ -1695,186 +1978,12 @@ fn call_comptime_func(func: Func, args: Vec<Expr>, original: &Program) -> Result
         ComptimeEnv_set(&mut env, func.params.get(i).name, args.get(i));
         i = i + 1;
     }
-    // The statement forms and scoping of src/comptime.rs call_comptime_func:
-    // an if branch runs let/return/expression statements in a copy of the
-    // environment; a for body runs let/assign/expression/return statements.
-    var result: Expr = Expr::IntLit(0);
-    var si: i64 = 0;
-    while si < func.body.len() {
-        var stmt: Stmt = func.body.get(si);
-        match stmt {
-            Stmt::Let(lname, _, lexpr, _, _, _, _) => {
-                match evaluate_with_env(&lexpr, &env, original) {
-                    ResultExpr::Ok(v) => { ComptimeEnv_set(&mut env, lname, v); }
-                    ResultExpr::Err(m) => { return ResultExpr::Err(m); }
-                }
-            }
-            Stmt::Assign(target, op, aexpr, _) => {
-                match evaluate_with_env(&aexpr, &env, original) {
-                    ResultExpr::Ok(v) => {
-                        match ce_assign(&env, target, op, v) {
-                            ResultExpr::Ok(nv) => { ComptimeEnv_set(&mut env, target, nv); }
-                            ResultExpr::Err(m) => { return ResultExpr::Err(m); }
-                        }
-                    }
-                    ResultExpr::Err(m) => { return ResultExpr::Err(m); }
-                }
-            }
-            Stmt::Expr(e, _) => {
-                match evaluate_with_env(&e, &env, original) {
-                    ResultExpr::Ok(v) => { result = v; }
-                    ResultExpr::Err(m) => { return ResultExpr::Err(m); }
-                }
-            }
-            Stmt::Return(opt, _) => {
-                match opt {
-                    OptBoxExpr::Some(re) => {
-                        var rinner: Expr = ct_box_expr_unbox(re);
-                        return evaluate_with_env(&rinner, &env, original);
-                    }
-                    OptBoxExpr::None => { return ResultExpr::Ok(Expr::IntLit(0)); }
-                }
-            }
-            Stmt::If(cond, then_block, else_block, _) => {
-                var branch: Vec<Stmt> = Vec::new();
-                var take: bool = false;
-                match evaluate_with_env(&cond, &env, original) {
-                    ResultExpr::Ok(c) => {
-                        match c {
-                            Expr::BoolLit(b) => {
-                                if b { branch = then_block; take = true; }
-                                else {
-                                    match else_block {
-                                        OptStmts::Some(eb) => { branch = eb; take = true; }
-                                        OptStmts::None => {}
-                                    }
-                                }
-                            }
-                            _ => { return ResultExpr::Err("comptime if condition must be boolean"); }
-                        }
-                    }
-                    ResultExpr::Err(m) => { return ResultExpr::Err(m); }
-                }
-                if take {
-                    var sub_env: ComptimeEnv = ComptimeEnv_clone(&env);
-                    var bi: i64 = 0;
-                    while bi < branch.len() {
-                        match branch.get(bi) {
-                            Stmt::Let(bname, _, bexpr, _, _, _, _) => {
-                                match evaluate_with_env(&bexpr, &sub_env, original) {
-                                    ResultExpr::Ok(v) => { ComptimeEnv_set(&mut sub_env, bname, v); }
-                                    ResultExpr::Err(m) => { return ResultExpr::Err(m); }
-                                }
-                            }
-                            Stmt::Return(bopt, _) => {
-                                match bopt {
-                                    OptBoxExpr::Some(bre) => {
-                                        var binner: Expr = ct_box_expr_unbox(bre);
-                                        return evaluate_with_env(&binner, &sub_env, original);
-                                    }
-                                    OptBoxExpr::None => { return ResultExpr::Ok(Expr::IntLit(0)); }
-                                }
-                            }
-                            Stmt::Expr(be, _) => {
-                                match evaluate_with_env(&be, &sub_env, original) {
-                                    ResultExpr::Ok(v) => { result = v; }
-                                    ResultExpr::Err(m) => { return ResultExpr::Err(m); }
-                                }
-                            }
-                            _ => {}
-                        }
-                        bi = bi + 1;
-                    }
-                }
-            }
-            Stmt::For(fvar, iterator, fbody, _) => {
-                var lo: i64 = 0;
-                var hi: i64 = 0;
-                match evaluate_with_env(&iterator, &env, original) {
-                    ResultExpr::Ok(iv) => {
-                        match iv {
-                            Expr::Range(sb, eb2, _) => {
-                                var se: Expr = ct_box_expr_unbox(sb);
-                                var ee: Expr = ct_box_expr_unbox(eb2);
-                                var sr: ResultExpr = evaluate_with_env(&se, &env, original);
-                                var er: ResultExpr = evaluate_with_env(&ee, &env, original);
-                                var ok: bool = false;
-                                match sr {
-                                    ResultExpr::Ok(sv) => {
-                                        match er {
-                                            ResultExpr::Ok(ev) => {
-                                                match sv {
-                                                    Expr::IntLit(a) => {
-                                                        match ev {
-                                                            Expr::IntLit(b) => { lo = a; hi = b; ok = true; }
-                                                            _ => {}
-                                                        }
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                            ResultExpr::Err(m) => { return ResultExpr::Err(m); }
-                                        }
-                                    }
-                                    ResultExpr::Err(m) => { return ResultExpr::Err(m); }
-                                }
-                                if !ok { return ResultExpr::Err("comptime for range must be ints"); }
-                            }
-                            _ => { return ResultExpr::Err("comptime for requires a range"); }
-                        }
-                    }
-                    ResultExpr::Err(m) => { return ResultExpr::Err(m); }
-                }
-                var it: i64 = lo;
-                while it < hi {
-                    ComptimeEnv_set(&mut env, fvar, Expr::IntLit(it));
-                    var fi: i64 = 0;
-                    while fi < fbody.len() {
-                        match fbody.get(fi) {
-                            Stmt::Let(fname, _, fexpr, _, _, _, _) => {
-                                match evaluate_with_env(&fexpr, &env, original) {
-                                    ResultExpr::Ok(v) => { ComptimeEnv_set(&mut env, fname, v); }
-                                    ResultExpr::Err(m) => { return ResultExpr::Err(m); }
-                                }
-                            }
-                            Stmt::Assign(ftarget, fop, faexpr, _) => {
-                                match evaluate_with_env(&faexpr, &env, original) {
-                                    ResultExpr::Ok(v) => {
-                                        match ce_assign(&env, ftarget, fop, v) {
-                                            ResultExpr::Ok(nv) => { ComptimeEnv_set(&mut env, ftarget, nv); }
-                                            ResultExpr::Err(m) => { return ResultExpr::Err(m); }
-                                        }
-                                    }
-                                    ResultExpr::Err(m) => { return ResultExpr::Err(m); }
-                                }
-                            }
-                            Stmt::Expr(fe, _) => {
-                                match evaluate_with_env(&fe, &env, original) {
-                                    ResultExpr::Ok(v) => { result = v; }
-                                    ResultExpr::Err(m) => { return ResultExpr::Err(m); }
-                                }
-                            }
-                            Stmt::Return(fopt, _) => {
-                                match fopt {
-                                    OptBoxExpr::Some(fre) => {
-                                        var finner: Expr = ct_box_expr_unbox(fre);
-                                        return evaluate_with_env(&finner, &env, original);
-                                    }
-                                    OptBoxExpr::None => { return ResultExpr::Ok(Expr::IntLit(0)); }
-                                }
-                            }
-                            _ => {}
-                        }
-                        fi = fi + 1;
-                    }
-                    it = it + 1;
-                }
-            }
-            _ => {}
-        }
-        si = si + 1;
-    }
-    return ResultExpr::Ok(result);
+    // The body runs in the block evaluator, with all its statements (let,
+    // assignment, if, for, while, return, table updates) -- OP28. It had a
+    // smaller interpreter of its own (no while, no `t.push`), so a table
+    // built in a loop was left to run when the program did.
+    var returned: Vec<i64> = Vec::new();
+    return evaluate_block_rt(func.body, original, &mut env, &mut returned);
 }
 
 /// New value of `target` after `target op= v` (src/comptime.rs).

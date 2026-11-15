@@ -1,0 +1,165 @@
+// stdlib/xml against XML 1.0 (Fifth Edition, https://www.w3.org/TR/xml/):
+// the XML declaration (2.8), elements and end tags (3.1), attributes in
+// both quotes and their normalization (3.3.3), the five predefined
+// entities and character references (4.1, 4.6), CDATA sections (2.7),
+// comments (2.5), processing instructions (2.6), line ends (2.11), white
+// space kept in content (2.10), internal entities of a DOCTYPE (4.2), and
+// the well-formedness errors a processor must report: each is rejected by
+// xml_load with its line and column. A tree prints as
+// tag[name=value,...]{text}(children...), a line break in text as \n.
+use xml;
+
+fn esc(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if c == 10 { out = out + "\\n"; }
+        else if c == 9 { out = out + "\\t"; }
+        else if c == 13 { out = out + "\\r"; }
+        else { out = out + str_slice(s, i, i + 1); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn tree(n: XmlNode) -> str {
+    var out: str = n.tag;
+    if n.attr_names.len() > 0 {
+        out = out + "[";
+        var a: i64 = 0;
+        while a < n.attr_names.len() {
+            if a > 0 { out = out + ","; }
+            out = out + n.attr_names.get(a) + "=" + esc(n.attr_vals.get(a));
+            a = a + 1;
+        }
+        out = out + "]";
+    }
+    if str_len(n.text) > 0 { out = out + "\x7b" + esc(n.text) + "\x7d"; }
+    if n.children.len() > 0 {
+        out = out + "(";
+        var c: i64 = 0;
+        while c < n.children.len() {
+            if c > 0 { out = out + " "; }
+            out = out + tree(n.children.get(c));
+            c = c + 1;
+        }
+        out = out + ")";
+    }
+    return out;
+}
+
+fn ok(name: str, text: str, want: str) {
+    val d: XmlDoc = xml_load(text);
+    if !d.ok {
+        println(name + ": rejected: " + d.error);
+        p_panic("xml spec: " + name + " should be well-formed");
+    }
+    val got: str = tree(d.root);
+    println(name + ": " + got);
+    if !str_equal(got, want) {
+        println(name + ": want " + want);
+        p_panic("xml spec: " + name + " read wrong");
+    }
+}
+
+fn same(name: str, got: str, want: str) {
+    println(name + ": " + got);
+    if !str_equal(got, want) { p_panic("xml spec: " + name + " gave " + got); }
+}
+
+fn bad(name: str, text: str) {
+    val d: XmlDoc = xml_load(text);
+    if d.ok {
+        println(name + ": accepted: " + tree(d.root));
+        p_panic("xml spec: " + name + " should be rejected");
+    }
+    println(name + ": rejected (" + d.error + ")");
+}
+
+fn main() -> i64 {
+    println("-- 2.8 XML declaration");
+    ok("version only", "<?xml version=\"1.0\"?><a/>", "a");
+    ok("encoding and standalone, single quotes", "<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>\n<a/>", "a");
+    ok("no declaration", "<a/>", "a");
+    ok("byte order mark", "\u{feff}<a/>", "a");
+    bad("declaration not first", "\n<?xml version=\"1.0\"?><a/>");
+    bad("declaration later", "<a/><?xml version=\"1.0\"?>");
+    bad("declaration without version", "<?xml encoding=\"UTF-8\"?><a/>");
+    bad("declaration out of order", "<?xml encoding=\"UTF-8\" version=\"1.0\"?><a/>");
+    bad("unknown version", "<?xml version=\"2.0\"?><a/>");
+    bad("standalone maybe", "<?xml version=\"1.0\" standalone=\"maybe\"?><a/>");
+    println("-- 3.1 Elements");
+    ok("nested and empty", "<a><b><c/></b><d></d><e /></a>", "a(b(c) d e)");
+    ok("names", "<x:y-z.1_é><_a/><b.c/></x:y-z.1_é>", "x:y-z.1_é(_a b.c)");
+    ok("end tag with space", "<a><b></b   ></a >", "a(b)");
+    bad("mismatched end tag", "<a><b></a></b>");
+    bad("unclosed element", "<a><b></b>");
+    bad("end tag without start", "<a></a></b>");
+    bad("two root elements", "<a/><b/>");
+    bad("no root element", "<!-- only a comment -->");
+    bad("empty document", "");
+    bad("text before the root", "hello <a/>");
+    bad("text after the root", "<a/> tail");
+    bad("space after <", "< a/>");
+    bad("name starting with a digit", "<1a/>");
+    bad("unterminated start tag", "<a x=\"1\"");
+    println("-- 3.3 Attributes");
+    ok("both quotes", "<a x=\"1\" y='2' q='say \"hi\"' r=\"it's\"/>", "a[x=1,y=2,q=say \"hi\",r=it's]");
+    ok("references in values", "<a v=\"&lt;&gt;&amp;&quot;&apos;&#65;&#x42;\"/>", "a[v=<>&\"'AB]");
+    ok("normalization: literal tab and newline become spaces", "<a v=\"one\ttwo\nthree\" w=\"x&#10;y&#9;z\"/>", "a[v=one two three,w=x\\ny\\tz]");
+    ok("white space around =", "<a  x = \"1\"\n   y\t=\t'2' />", "a[x=1,y=2]");
+    bad("duplicate attribute", "<a x=\"1\" x=\"2\"/>");
+    bad("unquoted value", "<a x=1/>");
+    bad("attribute without value", "<a x/>");
+    bad("< in a value", "<a x=\"a<b\"/>");
+    bad("& alone in a value", "<a x=\"a & b\"/>");
+    bad("no space between attributes", "<a x=\"1\"y=\"2\"/>");
+    bad("unterminated value", "<a x=\"1/>");
+    println("-- 4.1 and 4.6 References");
+    ok("predefined entities", "<a>&lt;tag&gt; &amp; &quot;q&quot; &apos;s&apos;</a>", "a\x7b<tag> & \"q\" 's'\x7d");
+    ok("character references", "<a>&#60;&#x3C;&#x3c;&#233;&#xE9;&#x1F600;&#38;amp;</a>", "a\x7b<<<éé😀&amp;\x7d");
+    bad("unknown entity", "<a>&nbsp;</a>");
+    bad("bare &", "<a>fish & chips</a>");
+    bad("& without ;", "<a>&amp</a>");
+    bad("reference to NUL", "<a>&#0;</a>");
+    bad("reference to a surrogate", "<a>&#xD800;</a>");
+    bad("reference to FFFE", "<a>&#xFFFE;</a>");
+    bad("bad digits", "<a>&#12a;</a>");
+    bad("uppercase X", "<a>&#X41;</a>");
+    bad("< in text", "<a>1 < 2</a>");
+    bad("< at the end", "<a>1 <");
+    println("-- 2.7 CDATA sections");
+    ok("CDATA kept as written", "<a>x<![CDATA[<b> & ]] &amp;]]>y</a>", "a\x7bx<b> & ]] &amp;y\x7d");
+    ok("empty CDATA", "<a><![CDATA[]]></a>", "a");
+    bad("]]> in text", "<a>x ]]> y</a>");
+    bad("CDATA outside the root", "<![CDATA[x]]><a/>");
+    bad("unterminated CDATA", "<a><![CDATA[x</a>");
+    println("-- 2.5 Comments");
+    ok("comments anywhere", "<!-- before --><a><!-- inside -->t<!---->u</a><!-- after -->", "a\x7btu\x7d");
+    bad("-- in a comment", "<a><!-- a -- b --></a>");
+    bad("comment ending --->", "<a><!-- a ---></a>");
+    bad("unterminated comment", "<a><!-- a </a>");
+    println("-- 2.6 Processing instructions");
+    ok("PIs inside and outside", "<?xml-stylesheet href=\"s.css\"?><a><?php echo 1; ?>t</a><?done?>", "a\x7bt\x7d");
+    bad("PI named xml", "<a><?xml x?></a>");
+    bad("PI named XmL", "<a><?XmL x?></a>");
+    bad("PI without target", "<a><? x ?></a>");
+    bad("unterminated PI", "<a><?pi x</a>");
+    println("-- 2.10, 2.11 White space and line ends");
+    ok("white space kept", "<a>  x\n\t y  <b> </b></a>", "a\x7b  x\\n\\t y  \x7d(b\x7b \x7d)");
+    ok("CR LF and CR read as LF", "<a>1\r\n2\r3</a>", "a\x7b1\\n2\\n3\x7d");
+    ok("white space outside the root", "\n\n  <a/>\n\n", "a");
+    println("-- 2.8, 4.2 DOCTYPE and internal entities");
+    ok("DOCTYPE skipped", "<?xml version=\"1.0\"?>\n<!DOCTYPE note SYSTEM \"note.dtd\">\n<note/>", "note");
+    ok("internal entities", "<!DOCTYPE r [\n  <!ELEMENT r (#PCDATA)>\n  <!ENTITY who \"World &#33;\">\n  <!-- a ] in a comment -->\n]>\n<r a=\"&who;\">Hello &who;</r>", "r[a=World !]\x7bHello World !\x7d");
+    bad("DOCTYPE after the root", "<a/><!DOCTYPE a>");
+    bad("DOCTYPE inside an element", "<a><!DOCTYPE a></a>");
+    bad("control character", "<a>\x01</a>");
+    println("-- the lenient parser still returns");
+    same("lenient <", xml_parse("<").tag, "");
+    same("lenient unclosed", tree(xml_parse("<a><b>t")), "a(b\x7bt\x7d)");
+    same("lenient bad entity", tree(xml_parse("<a x=\"&q;\">&nbsp; & </a>")), "a[x=&q;]\x7b&nbsp; & \x7d");
+    println("xml spec ok");
+    return 0;
+}

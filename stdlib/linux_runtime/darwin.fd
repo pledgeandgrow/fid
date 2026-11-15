@@ -58,6 +58,13 @@ const PE_M_PTHREAD_ATTR_INIT: i64 = 32;
 const PE_M_PTHREAD_ATTR_SETSTACK: i64 = 33;
 const PE_M_PTHREAD_ATTR_SETDETACH: i64 = 34;
 const PE_M_ABORT: i64 = 35;
+const PE_M_ERROR: i64 = 36;        // __error(): the thread's errno
+const PE_M_FDOPENDIR: i64 = 37;
+const PE_M_READDIR: i64 = 38;
+const PE_M_TELLDIR: i64 = 39;
+const PE_M_SEEKDIR: i64 = 40;
+const PE_M_CLOSEDIR: i64 = 41;
+const PE_M_DUP: i64 = 42;
 
 fn pe_m(k: i64, a: i64, b: i64, c: i64) -> i64 {
     return nat_mac_call(k, a, b, c, 0, 0, 0);
@@ -232,11 +239,165 @@ fn pe_mac_oflags(f: i64) -> i64 {
     return m;
 }
 
+/// The Linux number of macOS errno `e` (1-34 are the same but EDEADLK).
+fn pe_mac_errno_linux(e: i64) -> i64 {
+    if e == 11 { return 35; }                  // EDEADLK
+    if e >= 1 && e <= 34 { return e; }
+    if e == 35 { return 11; }                  // EAGAIN
+    if e == 36 { return 115; }                 // EINPROGRESS
+    if e == 37 { return 114; }                 // EALREADY
+    if e == 38 { return 88; }                  // ENOTSOCK
+    if e == 48 { return 98; }                  // EADDRINUSE
+    if e == 49 { return 99; }                  // EADDRNOTAVAIL
+    if e == 54 { return 104; }                 // ECONNRESET
+    if e == 57 { return 107; }                 // ENOTCONN
+    if e == 60 { return 110; }                 // ETIMEDOUT
+    if e == 61 { return 111; }                 // ECONNREFUSED
+    if e == 62 { return 40; }                  // ELOOP
+    if e == 63 { return 36; }                  // ENAMETOOLONG
+    if e == 66 { return 39; }                  // ENOTEMPTY
+    if e == 78 { return 38; }                  // ENOSYS
+    return 5;                                  // EIO
+}
+
 fn pe_mac_errno_ret(r: i64) -> i64 {
-    // libc returns -1 and sets errno; we cannot read errno easily, so map
-    // a failure to a generic -EIO (the shared runtime only checks < 0).
-    if r < 0 { return 0 - 5; }
+    // libc returns -1 and sets errno (__error() is its address); the shared
+    // runtime expects the negative Linux number, as the kernel returns it
+    if r == 0 - 1 {
+        var ep: i64 = pe_m(PE_M_ERROR, 0, 0, 0);
+        var e: i64 = 5;
+        if ep != 0 { e = pe_ld(ep) & 0xFFFFFFFF; }
+        return 0 - pe_mac_errno_linux(e);
+    }
     return r;
+}
+
+// ─── Directories: getdents64 over fdopendir/readdir ────────────────────
+// A Linux `struct linux_dirent64` is { ino u64, off i64, reclen u16, type
+// u8, name NUL }; macOS's 64-bit-inode `struct dirent` is { ino u64,
+// seekoff u64, reclen u16, namlen u16, type u8, name[1024] }. Each fd being
+// listed keeps a DIR* (opened on a dup, so closedir does not close the
+// runtime's fd); 64 at a time.
+
+var pe_mac_dirs: i64 = 0;       // 64 x { fd + 1, DIR* }
+
+fn pe_mac_dir_for(fd: i64) -> i64 {
+    if pe_mac_dirs == 0 {
+        pe_mac_dirs = pert_malloc(64 * 16);
+        pe_zero(pe_mac_dirs, 64 * 16);
+    }
+    var i: i64 = 0;
+    while i < 64 {
+        if pe_ld(pe_mac_dirs + i * 16) == fd + 1 { return pe_ld(pe_mac_dirs + i * 16 + 8); }
+        i = i + 1;
+    }
+    var d2: i64 = pe_m(PE_M_DUP, fd, 0, 0);
+    if d2 < 0 { return 0; }
+    var dirp: i64 = pe_m(PE_M_FDOPENDIR, d2, 0, 0);
+    if dirp == 0 { pe_m(PE_M_CLOSE, d2, 0, 0); return 0; }
+    i = 0;
+    while i < 64 {
+        if pe_ld(pe_mac_dirs + i * 16) == 0 {
+            pe_st(pe_mac_dirs + i * 16, fd + 1);
+            pe_st(pe_mac_dirs + i * 16 + 8, dirp);
+            return dirp;
+        }
+        i = i + 1;
+    }
+    pe_m(PE_M_CLOSEDIR, dirp, 0, 0);
+    return 0;
+}
+
+fn pe_mac_dir_close(fd: i64) {
+    if pe_mac_dirs == 0 { return; }
+    var i: i64 = 0;
+    while i < 64 {
+        if pe_ld(pe_mac_dirs + i * 16) == fd + 1 {
+            pe_m(PE_M_CLOSEDIR, pe_ld(pe_mac_dirs + i * 16 + 8), 0, 0);
+            pe_st(pe_mac_dirs + i * 16, 0);
+            pe_st(pe_mac_dirs + i * 16 + 8, 0);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+fn pe_mac_getdents(fd: i64, buf: i64, count: i64) -> i64 {
+    var dirp: i64 = pe_mac_dir_for(fd);
+    if dirp == 0 { return 0 - 9; }                                 // EBADF
+    var used: i64 = 0;
+    while true {
+        var pos: i64 = pe_m(PE_M_TELLDIR, dirp, 0, 0);
+        var ent: i64 = pe_m(PE_M_READDIR, dirp, 0, 0);
+        if ent == 0 { return used; }
+        var namlen: i64 = pe_ldb(ent + 18) | (pe_ldb(ent + 19) << 8);
+        var rl: i64 = (19 + namlen + 1 + 7) & (0 - 8);
+        if used + rl > count {
+            pe_m(PE_M_SEEKDIR, dirp, pos, 0);
+            if used == 0 { return 0 - 22; }                       // EINVAL: buffer too small
+            return used;
+        }
+        var o: i64 = buf + used;
+        pe_zero(o, rl);
+        pe_st(o, pe_ld(ent));
+        pe_st(o + 8, used + rl);
+        pe_stb(o + 16, rl & 255);
+        pe_stb(o + 17, (rl >> 8) & 255);
+        pe_stb(o + 18, pe_ldb(ent + 20));
+        var k: i64 = 0;
+        while k < namlen {
+            pe_stb(o + 19 + k, pe_ldb(ent + 21 + k));
+            k = k + 1;
+        }
+        used = used + rl;
+    }
+    return used;
+}
+
+// ─── Signal numbers ─────────────────────────────────────────────────────
+// Linux and macOS agree on 1-6, 8, 9, 11, 13-15 and 21-28.
+
+fn pe_mac_sig_from_linux(s: i64) -> i64 {
+    if s == 7 { return 10; }       // SIGBUS
+    if s == 10 { return 30; }      // SIGUSR1
+    if s == 12 { return 31; }      // SIGUSR2
+    if s == 17 { return 20; }      // SIGCHLD
+    if s == 18 { return 19; }      // SIGCONT
+    if s == 19 { return 17; }      // SIGSTOP
+    if s == 20 { return 18; }      // SIGTSTP
+    if s == 23 { return 16; }      // SIGURG
+    if s == 29 { return 23; }      // SIGIO
+    if s == 31 { return 12; }      // SIGSYS
+    return s;
+}
+
+fn pe_mac_sig_to_linux(s: i64) -> i64 {
+    if s == 10 { return 7; }
+    if s == 30 { return 10; }
+    if s == 31 { return 12; }
+    if s == 20 { return 17; }
+    if s == 19 { return 18; }
+    if s == 17 { return 19; }
+    if s == 18 { return 20; }
+    if s == 16 { return 23; }
+    if s == 23 { return 29; }
+    if s == 12 { return 31; }
+    return s;
+}
+
+/// The macOS signal handler's call into the shared runtime: macOS numbers
+/// and siginfo_t (si_addr at 24) become Linux ones (si_addr at 16), in
+/// pe_mac_info. Called by nat_ir's macOS nat_sig_handler.
+pub fn pe_mac_on_signal(sig: i64, info: i64) {
+    var addr: i64 = 0;
+    if info != 0 { addr = pe_ld(info + 24); }
+    if pe_mac_info != 0 {
+        pe_zero(pe_mac_info, 128);
+        pe_st(pe_mac_info + 16, addr);
+        pe_on_signal(pe_mac_sig_to_linux(sig), pe_mac_info);
+        return;
+    }
+    pe_on_signal(pe_mac_sig_to_linux(sig), info);
 }
 
 // ─── Signals ────────────────────────────────────────────────────────────
@@ -250,7 +411,7 @@ fn pe_mac_sigaction(sig: i64, act: i64) -> i64 {
     pe_st(ma, pe_ld(act));                 // handler
     var i: i64 = 0;
     while i < 4 { pe_stb(ma + 12 + i, (0x40 >> (i * 8)) & 255); i = i + 1; }  // SA_SIGINFO
-    var r: i64 = pe_m(PE_M_SIGACTION, sig, ma, 0);
+    var r: i64 = pe_m(PE_M_SIGACTION, pe_mac_sig_from_linux(sig), ma, 0);
     pert_free(ma);
     return r;
 }
@@ -321,13 +482,10 @@ pub fn pe_mac_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) ->
         var fd: i64 = nat_mac_call(PE_M_OPEN, 0 - 2, b, pe_mac_oflags(c), d, 0, 0);
         return pe_mac_errno_ret(fd);
     }
-    if n == 57 { return pe_mac_errno_ret(pe_m(PE_M_CLOSE, a, 0, 0)); }        // close
+    if n == 57 { pe_mac_dir_close(a); return pe_mac_errno_ret(pe_m(PE_M_CLOSE, a, 0, 0)); }   // close
     if n == 62 { return pe_mac_errno_ret(pe_m(PE_M_LSEEK, a, b, c)); }        // lseek
     if n == 79 { return pe_mac_stat(b, c); }                                 // newfstatat
-    // getdents64: not supported yet. Darwin's getdirentries gives its own
-    // record layout, not the Linux dirent64 sys.fd parses, so a listing
-    // comes back empty rather than garbled (needs opendir/readdir).
-    if n == 61 { return 0 - 38; }
+    if n == 61 { return pe_mac_getdents(a, b, c); }                          // getdents64
     if n == 35 {                                                             // unlinkat
         return pe_mac_errno_ret(nat_mac_call(PE_M_UNLINKAT, 0 - 2, b, c, 0, 0, 0));
     }
@@ -362,7 +520,9 @@ pub fn pe_mac_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) ->
     }
     if n == 132 { return 0; }                                              // sigaltstack: pthreads handle this
     if n == 129 || n == 131 {                                              // kill / tgkill
-        return pe_m(PE_M_KILL, pe_m(PE_M_GETPID, 0, 0, 0), c, 0);
+        var ksig: i64 = c;
+        if n == 129 { ksig = b; }
+        return pe_mac_errno_ret(pe_m(PE_M_KILL, pe_m(PE_M_GETPID, 0, 0, 0), pe_mac_sig_from_linux(ksig), 0));
     }
     if n == 179 { return 0 - 38; }                                         // sysinfo: none
     if n == 25 { return 0; }                                               // fcntl: non-blocking handled elsewhere

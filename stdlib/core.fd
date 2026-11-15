@@ -3,6 +3,14 @@
 
 module core;
 
+// J8: the @zeroize Vec-buffer registry (the C runtime provides these; the
+// native runtimes define pert_sensitive_*). Declared here so the calls in
+// the Vec grow/drop paths have a signature on every stage.
+extern fn p_sensitive_check(v: i64) -> i64;
+extern fn p_sensitive_remark(v: i64);
+extern fn p_sensitive_free(v: i64, buf: i64, cap: i64);
+extern fn p_sensitive_wipes() -> i64;
+
 // Builtin: print — outputs to stdout
 // (Implemented natively in the compiler for Phase 1)
 
@@ -626,7 +634,7 @@ fn vec_mem_prepare(v: i64, size: i64, tid: i64) -> bool {
     var cap: i64 = 0;
     unsafe { data = *p0; len = *p8; cap = *p16; }
     if len != 0 || cap < 0 { return false; }
-    if data != 0 { vec_buf_free(data); }
+    if data != 0 { p_sensitive_free(v, data, cap); vec_buf_free(data); }
     unsafe {
         *p0 = 0;
         *p16 = 0;
@@ -903,6 +911,14 @@ pub fn vec_st(data: i64, i: i64, code: i64, x: i64) {
 
 /// Copy `n` bytes.
 fn vec_copy_bytes(dst: i64, src: i64, n: i64) {
+    p_mem_copy(dst, src, n);
+}
+
+/// Copy `n` bytes from `src` to `dst` (the areas do not overlap), a word at
+/// a time. The native runtimes replace it (`pert_mem_copy`: msvcrt's
+/// vectorized memcpy on Windows, aligned words on Linux) -- competitive
+/// roadmap OP23; this body is what the interpreter and C run.
+pub fn p_mem_copy(dst: i64, src: i64, n: i64) {
     var off: i64 = 0;
     while off + 8 <= n {
         var s8: *mut i64 = src + off;
@@ -941,8 +957,10 @@ fn vec_sz_reserve(v: i64, code: i64, need: i64) {
     var esz: i64 = vec_esz(code);
     var nd: i64 = vec_buf_alloc(nc * esz);
     var od: i64 = vec_sz_hdr(v, 0);
+    var sens: i64 = p_sensitive_check(v);
     if od != 0 {
         vec_copy_bytes(nd, od, vec_sz_hdr(v, 1) * esz);
+        if sens != 0 { p_sensitive_free(v, od, cap); }
         vec_buf_free(od);
     }
     vec_sz_put(v, 0, nd);
@@ -1103,11 +1121,12 @@ pub fn Vec_drop_inplace(v: i64) {
         var b0: *mut i64 = bx;
         var n: i64 = 0;
         unsafe { n = *b0; *b0 = n - 1; }
-        if n <= 1 { vec_box_free(bx, data); } else { last = false; }
+        if n <= 1 { p_sensitive_free(v, data, len); vec_box_free(bx, data); } else { last = false; }
     }
     if last && data != 0 {
         if vec_code(v) == 0 { vec_drop_range(data, 0, len, vec_tid(v)); }
         else { vec_mem_drop_range(v, data, 0, len); }
+        p_sensitive_free(v, data, cap);
         vec_buf_free(data);
     }
     // a stack header used again (a loop) starts empty
@@ -1290,6 +1309,8 @@ pub fn vec_own(v: i64) {
 /// string already freed through its count stops the program.
 pub fn Str_drop(s: i64) {
     if s == 0 { return; }
+    // no header before an unaligned pointer (see p_str_hdr_len)
+    if (s & 7) != 0 { return; }
     var mp: *mut i64 = s - 16;
     var lp: *mut i64 = s - 8;
     var w: i64 = 0;
@@ -1310,6 +1331,8 @@ pub fn Str_drop(s: i64) {
 /// One more owner of a string (proposal 0004); returns `s`.
 pub fn Str_dup(s: i64) -> i64 {
     if s == 0 { return s; }
+    // no header before an unaligned pointer (see p_str_hdr_len)
+    if (s & 7) != 0 { return s; }
     var mp: *mut i64 = s - 16;
     var lp: *mut i64 = s - 8;
     var w: i64 = 0;
@@ -1362,7 +1385,9 @@ pub fn Vec_push(v: i64, value: i64) {
             i = i + 1;
         }
 
+        var sens: i64 = p_sensitive_check(v);
         if data != 0 {
+            if sens != 0 { p_sensitive_free(v, data, capacity); }
             vec_buf_free(data);
         }
 
@@ -1370,6 +1395,7 @@ pub fn Vec_push(v: i64, value: i64) {
             *data_ptr_ptr = new_data;
             *cap_ptr = new_capacity;
         }
+        if sens != 0 { p_sensitive_remark(v); }
     }
 
     unsafe {
@@ -3096,7 +3122,8 @@ const P_BLOCK_MAGIC_CORE: i64 = 0xF1DE5A0000000000;
 /// plain block of the allocator.
 pub fn p_str_adopt(buf: i64) -> str {
     if buf == 0 { return ""; }
-    if buf != 0 {
+    // (no header before an unaligned pointer, see p_str_hdr_len)
+    if (buf & 7) == 0 {
         var amp: *mut i64 = buf - 16;
         var alp: *mut i64 = buf - 8;
         var aw: i64 = 0;
@@ -3119,6 +3146,8 @@ pub fn p_str_adopt(buf: i64) -> str {
 /// anything else (a C string, a plain buffer) is copied; "" for null.
 pub fn p_str_take(s: i64) -> str {
     if s == 0 { return ""; }
+    // no header before an unaligned pointer (see p_str_hdr_len)
+    if (s & 7) != 0 { return p_str_from_ptr(s); }
     var mp: *mut i64 = s - 16;
     var lp: *mut i64 = s - 8;
     var w: i64 = 0;
@@ -3135,6 +3164,11 @@ pub fn p_str_take(s: i64) -> str {
 /// The length in the header of `s`, or -1 when it has none.
 pub fn p_str_hdr_len(s: i64) -> i64 {
     if s == 0 { return -1; }
+    // A headered string starts 8-byte aligned (after its two header
+    // words); any other pointer (a C literal, a pointer into a buffer)
+    // has no header, and reading words before it was a misaligned load
+    // (zig cc's UBSan stopped on it)
+    if (s & 7) != 0 { return -1; }
     var mp: *mut i64 = s - 16;
     var lp: *mut i64 = s - 8;
     var w: i64 = 0;
@@ -3172,7 +3206,7 @@ fn p_pow2_at_least(n: i64) -> i64 {
 pub fn p_str_append(s: i64, x: i64) -> str {
     var xl: i64 = p_str_length(x);
     var sl: i64 = p_str_length(s);
-    if s != 0 {
+    if s != 0 && (s & 7) == 0 {
         var mp: *mut i64 = s - 16;
         var w: i64 = 0;
         unsafe { w = *mp; }
@@ -3250,6 +3284,8 @@ pub fn p_str_buf(len: i64) -> i64 {
 // anything else is taken for a plain allocation.
 pub fn p_str_free(s: i64) {
     if s == 0 { return; }
+    // no header before an unaligned pointer (see p_str_hdr_len)
+    if (s & 7) != 0 { p_free(s); return; }
     var mp: *mut i64 = s - 16;
     var lp: *mut i64 = s - 8;
     unsafe {
@@ -3412,7 +3448,26 @@ pub fn String_find(s: i64, sub: i64) -> i64 {
     var i: i64 = 0;
     var last: i64 = s_len - sub_len;
     while i <= last {
-        if p_byte_of(s, i) == first && p_bytes_eq(s + i, sub, sub_len) { return i; }
+        // skip to the next place the first byte occurs (memchr natively)
+        var at: i64 = p_mem_find_byte(s + i, last - i + 1, first);
+        if at < 0 { return -1; }
+        i = i + at;
+        if p_bytes_eq(s + i, sub, sub_len) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// The index of the first byte `b` in the `n` bytes at `p`, or -1. The
+/// native runtimes replace it (`pert_mem_find_byte`: msvcrt memchr on
+/// Windows, a word at a time on Linux) -- OP23.
+pub fn p_mem_find_byte(p: i64, n: i64, b: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        var bp: *mut u8 = p + i;
+        var x: i64 = 0;
+        unsafe { x = *bp; }
+        if x == b { return i; }
         i = i + 1;
     }
     return -1;
@@ -3850,12 +3905,16 @@ pub fn str_bytes(s: str) -> Vec<i64> {
 }
 
 /// Build a string from a Vec of byte values.
+/// Linear: one counted allocation + a byte copy (was a concat per byte,
+/// quadratic — a multi-MB body took minutes).
 pub fn str_from_bytes(bytes: Vec<i64>) -> str {
-    var result: str = "";
-    var i: i64 = 0;
     var n: i64 = bytes.len();
+    if n == 0 { return ""; }
+    var result: i64 = p_str_buf(n);
+    var i: i64 = 0;
     while i < n {
-        result = result + p_char_to_str(bytes.get(i));
+        var ptr: *mut u8 = result + i;
+        unsafe { *ptr = bytes.get(i); }
         i = i + 1;
     }
     return result;

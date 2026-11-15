@@ -13,21 +13,35 @@ module bits;
 // ─── Single-bit operations ──────────────────────────────────────────────
 
 /// Get the value of bit at position `idx` (0 or 1).
+///
+/// Example:
+///   assert_eq(bit_get(5, 0), 1);
+///   assert_eq(bit_get(5, 1), 0);
 pub fn bit_get(n: i64, idx: i64) -> i64 {
     return (n >> idx) & 1;
 }
 
 /// Set bit at position `idx` to 1. Returns the new value.
+///
+/// Example:
+///   assert_eq(bit_set(0, 3), 8);
 pub fn bit_set(n: i64, idx: i64) -> i64 {
     return n | (1 << idx);
 }
 
 /// Set bit at position `idx` to 0 (clear). Returns the new value.
+///
+/// Example:
+///   assert_eq(bit_clear(15, 0), 14);
 pub fn bit_clear(n: i64, idx: i64) -> i64 {
     return n & ~(1 << idx);
 }
 
 /// Toggle bit at position `idx`. Returns the new value.
+///
+/// Example:
+///   assert_eq(bit_toggle(5, 1), 7);
+///   assert_eq(bit_toggle(7, 1), 5);
 pub fn bit_toggle(n: i64, idx: i64) -> i64 {
     return n ^ (1 << idx);
 }
@@ -35,42 +49,58 @@ pub fn bit_toggle(n: i64, idx: i64) -> i64 {
 // ─── Population count / leading/trailing zeros ──────────────────────────
 
 /// Count the number of 1-bits in n (population count / Hamming weight).
+/// Branchless (SWAR): a fixed dozen operations whatever n is; C compilers
+/// turn it into one `popcnt` (OP20). The bit-at-a-time loop it replaces
+/// never ended for a negative n (`>>` keeps the sign bit).
+///
+/// Example:
+///   assert_eq(bit_popcount(255), 8);
+///   assert_eq(bit_popcount(-1), 64);
+@wrapping
 pub fn bit_popcount(n: i64) -> i64 {
-    var count = 0;
-    var value = n;
-    while value != 0 {
-        count = count + (value & 1);
-        value = value >> 1;
-    }
-    return count;
+    var x: i64 = n - ((n >> 1) & 0x5555555555555555);
+    x = (x & 0x3333333333333333) + ((x >> 2) & 0x3333333333333333);
+    x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0F;
+    return ((x * 0x0101010101010101) >> 56) & 0xFF;
 }
 
-/// Count leading zeros (number of 0-bits before the most significant 1).
+/// Count leading zeros (number of 0-bits before the most significant 1):
+/// a binary search of six steps; 64 for 0, 0 for a negative n.
+///
+/// Example:
+///   assert_eq(bit_leading_zeros(1), 63);
+///   assert_eq(bit_leading_zeros(0), 64);
+@wrapping
 pub fn bit_leading_zeros(n: i64) -> i64 {
     if n == 0 { return 64; }
-    var count = 0;
-    var value = n;
-    value = value >> 1;
-    while value != 0 {
-        count = count + 1;
-        value = value >> 1;
-    }
-    return 63 - count;
+    if n < 0 { return 0; }
+    var x: i64 = n;
+    var c: i64 = 0;
+    if (x & 0x7FFFFFFF00000000) == 0 { c = c + 32; x = x << 32; }
+    if (x & 0x7FFF000000000000) == 0 { c = c + 16; x = x << 16; }
+    if (x & 0x7F00000000000000) == 0 { c = c + 8; x = x << 8; }
+    if (x & 0x7000000000000000) == 0 { c = c + 4; x = x << 4; }
+    if (x & 0x6000000000000000) == 0 { c = c + 2; x = x << 2; }
+    if (x & 0x4000000000000000) == 0 { c = c + 1; }
+    return c + 1;
 }
 
-/// Count trailing zeros (number of 0-bits after the least significant 1).
+/// Count trailing zeros (number of 0-bits after the least significant 1):
+/// the popcount of the bits below the lowest set one; 64 for 0.
+///
+/// Example:
+///   assert_eq(bit_trailing_zeros(8), 3);
+@wrapping
 pub fn bit_trailing_zeros(n: i64) -> i64 {
     if n == 0 { return 64; }
-    var count = 0;
-    var value = n;
-    while (value & 1) == 0 {
-        count = count + 1;
-        value = value >> 1;
-    }
-    return count;
+    return bit_popcount((n & (0 - n)) - 1);
 }
 
 /// Find the position of the highest set bit. Returns -1 if n == 0.
+///
+/// Example:
+///   assert_eq(bit_highest_set(10), 3);
+///   assert_eq(bit_highest_set(0), -1);
 pub fn bit_highest_set(n: i64) -> i64 {
     if n == 0 { return -1; }
     var pos = 0;
@@ -84,6 +114,9 @@ pub fn bit_highest_set(n: i64) -> i64 {
 }
 
 /// Find the position of the lowest set bit. Returns -1 if n == 0.
+///
+/// Example:
+///   assert_eq(bit_lowest_set(12), 2);
 pub fn bit_lowest_set(n: i64) -> i64 {
     if n == 0 { return -1; }
     return bit_trailing_zeros(n);
@@ -92,6 +125,10 @@ pub fn bit_lowest_set(n: i64) -> i64 {
 // ─── Rotation ───────────────────────────────────────────────────────────
 
 /// Rotate bits left by k positions (64-bit).
+///
+/// Example:
+///   assert_eq(bit_rotate_left(1, 4), 16);
+///   assert_eq(bit_rotate_left(bit_rotate_right(12345, 7), 7), 12345);
 pub fn bit_rotate_left(n: i64, k: i64) -> i64 {
     var shift = k & 63;
     if shift == 0 { return n; }
@@ -99,6 +136,10 @@ pub fn bit_rotate_left(n: i64, k: i64) -> i64 {
 }
 
 /// Rotate bits right by k positions (64-bit).
+///
+/// Example:
+///   assert_eq(bit_rotate_right(16, 4), 1);
+///   assert_eq(bit_rotate_right(1, 1), bit_set(0, 63));
 pub fn bit_rotate_right(n: i64, k: i64) -> i64 {
     var shift = k & 63;
     if shift == 0 { return n; }
@@ -108,16 +149,25 @@ pub fn bit_rotate_right(n: i64, k: i64) -> i64 {
 // ─── Byte / nibble extraction ───────────────────────────────────────────
 
 /// Extract byte at position `idx` (0 = least significant byte).
+///
+/// Example:
+///   assert_eq(bit_byte_at(0x1234, 1), 0x12);
 pub fn bit_byte_at(n: i64, idx: i64) -> i64 {
     return (n >> (idx * 8)) & 0xFF;
 }
 
 /// Extract the high nibble (upper 4 bits of the lowest byte).
+///
+/// Example:
+///   assert_eq(bit_high_nibble(0xAB), 0xA);
 pub fn bit_high_nibble(n: i64) -> i64 {
     return (n >> 4) & 0xF;
 }
 
 /// Extract the low nibble (lower 4 bits).
+///
+/// Example:
+///   assert_eq(bit_low_nibble(0xAB), 0xB);
 pub fn bit_low_nibble(n: i64) -> i64 {
     return n & 0xF;
 }
@@ -125,6 +175,10 @@ pub fn bit_low_nibble(n: i64) -> i64 {
 // ─── Power-of-two utilities ─────────────────────────────────────────────
 
 /// Check if n is a power of two.
+///
+/// Example:
+///   assert(bit_is_power_of_two(64));
+///   assert(!bit_is_power_of_two(65));
 pub fn bit_is_power_of_two(n: i64) -> bool {
     if n <= 0 { return false; }
     return (n & (n - 1)) == 0;
@@ -132,6 +186,10 @@ pub fn bit_is_power_of_two(n: i64) -> bool {
 
 /// Round up to the next power of two. Returns n if already a power of two.
 /// Returns 0 if n == 0. Returns -1 if n > 2^62.
+///
+/// Example:
+///   assert_eq(bit_next_power_of_two(100), 128);
+///   assert_eq(bit_next_power_of_two(64), 64);
 pub fn bit_next_power_of_two(n: i64) -> i64 {
     if n <= 0 { return 0; }
     if bit_is_power_of_two(n) { return n; }
@@ -144,11 +202,18 @@ pub fn bit_next_power_of_two(n: i64) -> i64 {
 }
 
 /// Round up to the next power of two (alias).
+///
+/// Example:
+///   assert_eq(bit_ceil(5), 8);
 pub fn bit_ceil(n: i64) -> i64 {
     return bit_next_power_of_two(n);
 }
 
 /// Floor log2 of n. Returns -1 if n <= 0.
+///
+/// Example:
+///   assert_eq(bit_log2(1024), 10);
+///   assert_eq(bit_log2(1000), 9);
 pub fn bit_log2(n: i64) -> i64 {
     if n <= 0 { return -1; }
     return bit_highest_set(n);
@@ -157,6 +222,10 @@ pub fn bit_log2(n: i64) -> i64 {
 // ─── Bit reversal ───────────────────────────────────────────────────────
 
 /// Reverse the bits of a byte (8-bit reversal).
+///
+/// Example:
+///   assert_eq(bit_reverse_byte(1), 128);
+///   assert_eq(bit_reverse_byte(0xF0), 0x0F);
 pub fn bit_reverse_byte(b: i64) -> i64 {
     var b = b & 0xFF;
     var r = b & 1;
@@ -178,6 +247,9 @@ pub fn bit_reverse_byte(b: i64) -> i64 {
 }
 
 /// Reverse all 64 bits.
+///
+/// Example:
+///   assert_eq(bit_reverse(1), bit_set(0, 63));
 pub fn bit_reverse(n: i64) -> i64 {
     var result = 0;
     var i = 0;
@@ -192,25 +264,40 @@ pub fn bit_reverse(n: i64) -> i64 {
 
 /// Create a mask of `count` least-significant 1-bits.
 /// bit_mask(4) → 0b1111
+///
+/// Example:
+///   assert_eq(bit_mask(4), 15);
+///   assert_eq(bit_mask(63), 9223372036854775807);
 pub fn bit_mask(count: i64) -> i64 {
     if count >= 64 { return -1; }
     if count <= 0 { return 0; }
-    return (1 << count) - 1;
+    return ~(-1 << count);
 }
 
 /// Create a mask of `count` most-significant 1-bits (in 64-bit space).
+///
+/// Example:
+///   assert_eq(bit_mask_high(1), bit_set(0, 63));
+///   assert_eq(bit_mask_high(63), -2);
 pub fn bit_mask_high(count: i64) -> i64 {
     if count >= 64 { return -1; }
     if count <= 0 { return 0; }
-    return ~((1 << (64 - count)) - 1);
+    return -1 << (64 - count);
 }
 
 /// Extract `bits` bits starting from position `offset`.
+///
+/// Example:
+///   assert_eq(bit_extract(0xABCD, 4, 8), 0xBC);
 pub fn bit_extract(n: i64, offset: i64, bits: i64) -> i64 {
     return (n >> offset) & bit_mask(bits);
 }
 
 /// Insert `bits` bits of `value` into `n` starting at position `offset`.
+///
+/// Example:
+///   assert_eq(bit_insert(0, 5, 4, 3), 80);
+///   assert_eq(bit_insert(0xFF, 0, 0, 4), 0xF0);
 pub fn bit_insert(n: i64, value: i64, offset: i64, bits: i64) -> i64 {
     var mask = bit_mask(bits) << offset;
     return (n & ~mask) | ((value & bit_mask(bits)) << offset);

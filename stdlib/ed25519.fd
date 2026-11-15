@@ -1,0 +1,416 @@
+// Fides Ed25519 signatures (RFC 8032 §5.1), pure Fides.
+//
+// Key generation from a 32-byte seed, signing and verification, on the
+// field code of x25519.fd (ten 25.5-bit limbs mod 2^255-19) and SHA-512
+// from sha512.fd. Points are in extended coordinates (X:Y:Z:T), x = X/Z,
+// y = Y/Z, x*y = T/Z, with the complete addition and the doubling formulas
+// of RFC 8032 §5.1.4. Scalars mod L = 2^252 + 27742317777372353535851937790883648493
+// are 32-byte little-endian Vec<i64>, reduced with TweetNaCl's radix-2^8
+// modL in i64.
+//
+// Verification ([RFC 8032 §5.1.7], cofactorless form, as libsodium and
+// ref10): the signature is rejected unless the public key is 32 bytes that
+// decode to a curve point (y < p, x recoverable, no "negative zero"), the
+// signature is 64 bytes, S < L (non-canonical S is rejected: no
+// malleability), every input element is a byte 0..255, and
+// encode([S]B - [k]A) equals the first 32 bytes R. Comparing encodings
+// also rejects a non-canonical R. Small-order public keys are not refused
+// (RFC 8032 does not ask for it).
+//
+// Constant time. What is constant time:
+//   - Key generation and signing multiply the base point by a secret
+//     scalar (the clamped key a, the nonce r) with a 255-step Montgomery
+//     ladder on the Edwards curve: one doubling and one addition per bit
+//     whatever its value, the swap done by masks (ge_select), no branch or
+//     memory index on a secret. The field code (x25519.fd) is branch-free.
+//   - sc_mul_add / ed_mod_l run fixed loops with no secret-dependent branch.
+// What is not:
+//   - Verification works on public data only and is variable time
+//     (Straus double-scalar multiply, ge_double_scalarmult_vartime).
+//   - The compiler does not promise constant-time machine code (overflow
+//     checks are branches, never taken here; see x25519.fd), the
+//     interpreter is not constant time, and secret bytes in Vec<i64>
+//     buffers are not wiped.
+//   - SHA-512 hashes the seed with length-dependent but not
+//     content-dependent work.
+//
+// Usage:
+//   use ed25519;
+//   val kp  = ed25519_keypair(seed);         // 64 bytes: seed || public key
+//   val pk  = ed25519_public_key(seed);      // 32 bytes
+//   val sig = ed25519_sign(kp, msg);         // or ed25519_sign(seed, msg)
+//   val ok  = ed25519_verify(pk, msg, sig);  // bool
+// Bytes are Vec<i64> of values 0..255.
+
+module ed25519;
+
+use vec;
+use x25519;
+use sha512;
+
+/// A point in extended coordinates.
+pub struct Ge25519 {
+    x: Fe25519,
+    y: Fe25519,
+    z: Fe25519,
+    t: Fe25519,
+}
+
+/// The result of decoding 32 bytes: `ok` false when they are no point.
+pub struct Ge25519Decoded {
+    ok: bool,
+    p: Ge25519,
+}
+
+// ─── Byte helpers ───────────────────────────────────────────────────────
+
+fn ed_slice(v: &Vec<i64>, from: i64, to: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to { out.push(v.get(i)); i = i + 1; }
+    return out;
+}
+
+fn ed_append(out: &mut Vec<i64>, v: &Vec<i64>) {
+    var i: i64 = 0;
+    while i < v.len() { out.push(v.get(i)); i = i + 1; }
+}
+
+/// True when every element is a byte 0..255.
+fn ed_all_bytes(v: &Vec<i64>) -> bool {
+    var bad: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() { bad = bad | (v.get(i) & ~255); i = i + 1; }
+    return bad == 0;
+}
+
+/// Bit i of a little-endian byte string.
+fn ed_bit(s: &Vec<i64>, i: i64) -> i64 {
+    return (s.get(i >> 3) >> (i & 7)) & 1;
+}
+
+// ─── Points ─────────────────────────────────────────────────────────────
+
+@constant_time
+fn ge_identity() -> Ge25519 {
+    return Ge25519 { x: f25_zero(), y: f25_one(), z: f25_one(), t: f25_zero() };
+}
+
+/// The base point B of RFC 8032 §5.1.
+@constant_time
+fn ge_base() -> Ge25519 {
+    return Ge25519 { x: f25_const_bx(), y: f25_const_by(), z: f25_one(), t: f25_const_bt() };
+}
+
+/// p + q, complete (also for p = q and the identity): 9 multiplications.
+@constant_time
+fn ge_add(p: Ge25519, q: Ge25519) -> Ge25519 {
+    val a: Fe25519 = f25_mul(f25_sub(p.y, p.x), f25_sub(q.y, q.x));
+    val b: Fe25519 = f25_mul(f25_add(p.y, p.x), f25_add(q.y, q.x));
+    val c: Fe25519 = f25_mul(f25_mul(p.t, q.t), f25_const_d2());
+    val zz: Fe25519 = f25_mul(p.z, q.z);
+    val d: Fe25519 = f25_add(zz, zz);
+    val e: Fe25519 = f25_sub(b, a);
+    val f: Fe25519 = f25_sub(d, c);
+    val g: Fe25519 = f25_add(d, c);
+    val h: Fe25519 = f25_add(b, a);
+    return Ge25519 { x: f25_mul(e, f), y: f25_mul(g, h), z: f25_mul(f, g), t: f25_mul(e, h) };
+}
+
+/// 2p: 4 squarings, 4 multiplications.
+@constant_time
+fn ge_dbl(p: Ge25519) -> Ge25519 {
+    val a: Fe25519 = f25_sq(p.x);
+    val b: Fe25519 = f25_sq(p.y);
+    val zz: Fe25519 = f25_sq(p.z);
+    val c: Fe25519 = f25_add(zz, zz);
+    val h: Fe25519 = f25_add(a, b);
+    val e: Fe25519 = f25_sub(h, f25_sq(f25_add(p.x, p.y)));
+    val g: Fe25519 = f25_sub(a, b);
+    val f: Fe25519 = f25_add(c, g);
+    return Ge25519 { x: f25_mul(e, f), y: f25_mul(g, h), z: f25_mul(f, g), t: f25_mul(e, h) };
+}
+
+/// -p
+@constant_time
+fn ge_neg(p: Ge25519) -> Ge25519 {
+    return Ge25519 { x: f25_neg(p.x), y: p.y, z: p.z, t: f25_neg(p.t) };
+}
+
+/// q when b == 1, p when b == 0, by masks.
+@constant_time
+fn ge_select(p: Ge25519, q: Ge25519, b: i64) -> Ge25519 {
+    return Ge25519 {
+        x: f25_select(p.x, q.x, b), y: f25_select(p.y, q.y, b),
+        z: f25_select(p.z, q.z, b), t: f25_select(p.t, q.t, b),
+    };
+}
+
+/// [s] p for a secret 32-byte scalar s < 2^255: Montgomery ladder over bits
+/// 254..0 keeping r1 = r0 + p, one ge_add and one ge_dbl per bit, swaps by
+/// mask. Constant time in s.
+@constant_time
+fn ge_scalarmult_ct(s: &Vec<i64>, p: Ge25519) -> Ge25519 {
+    var r0: Ge25519 = ge_identity();
+    var r1: Ge25519 = p;
+    var i: i64 = 254;
+    while i >= 0 {
+        val b: i64 = (s.get(i >> 3) >> (i & 7)) & 1;
+        val a0: Ge25519 = ge_select(r0, r1, b);
+        val a1: Ge25519 = ge_select(r1, r0, b);
+        val n1: Ge25519 = ge_add(a0, a1);
+        val n0: Ge25519 = ge_dbl(a0);
+        r0 = ge_select(n0, n1, b);
+        r1 = ge_select(n1, n0, b);
+        i = i - 1;
+    }
+    return r0;
+}
+
+/// [k] a + [s] B for public scalars k, s < 2^253 (Straus/Shamir, variable
+/// time: verification only).
+fn ge_double_scalarmult_vartime(k: &Vec<i64>, a: Ge25519, s: &Vec<i64>) -> Ge25519 {
+    val bp: Ge25519 = ge_base();
+    val ab: Ge25519 = ge_add(a, bp);
+    var r: Ge25519 = ge_identity();
+    var i: i64 = 252;
+    while i >= 0 {
+        r = ge_dbl(r);
+        val bk: i64 = ed_bit(k, i);
+        val bs: i64 = ed_bit(s, i);
+        if bk == 1 && bs == 1 {
+            r = ge_add(r, ab);
+        } else if bk == 1 {
+            r = ge_add(r, a);
+        } else if bs == 1 {
+            r = ge_add(r, bp);
+        }
+        i = i - 1;
+    }
+    return r;
+}
+
+/// RFC 8032 §5.1.2: y little-endian, the low bit of x in bit 255.
+fn ge_encode(p: Ge25519) -> Vec<i64> {
+    val zi: Fe25519 = f25_invert(p.z);
+    val x: Fe25519 = f25_mul(p.x, zi);
+    var out: Vec<i64> = f25_to_bytes(f25_mul(p.y, zi));
+    out.set(31, out.get(31) | (f25_is_odd(x) << 7));
+    return out;
+}
+
+/// RFC 8032 §5.1.3: 32 bytes to a point, or ok = false.
+fn ge_decode(s: &Vec<i64>) -> Ge25519Decoded {
+    val fail: Ge25519Decoded = Ge25519Decoded { ok: false, p: ge_identity() };
+    if s.len() != 32 { return fail; }
+    val sign: i64 = (s.get(31) >> 7) & 1;
+    val y: Fe25519 = f25_from_bytes_at(s, 0);
+    // y must be canonical: its encoding gives back the bytes (bit 255 off).
+    val yb: Vec<i64> = f25_to_bytes(y);
+    var diff: i64 = (yb.get(31) ^ (s.get(31) & 127));
+    var i: i64 = 0;
+    while i < 31 { diff = diff | (yb.get(i) ^ s.get(i)); i = i + 1; }
+    if diff != 0 { return fail; }
+    // x^2 = u / v with u = y^2 - 1, v = d y^2 + 1.
+    val y2: Fe25519 = f25_sq(y);
+    val u: Fe25519 = f25_sub(y2, f25_one());
+    val v: Fe25519 = f25_add(f25_mul(f25_const_d(), y2), f25_one());
+    val v3: Fe25519 = f25_mul(f25_sq(v), v);
+    val v7: Fe25519 = f25_mul(f25_sq(v3), v);
+    var x: Fe25519 = f25_mul(f25_mul(u, v3), f25_pow22523(f25_mul(u, v7)));
+    val vxx: Fe25519 = f25_mul(v, f25_sq(x));
+    if f25_equal(vxx, u) == 0 {
+        if f25_equal(vxx, f25_neg(u)) == 0 { return fail; }
+        x = f25_mul(x, f25_const_sqrtm1());
+    }
+    if f25_is_zero(x) == 1 && sign == 1 { return fail; }
+    if f25_is_odd(x) != sign { x = f25_neg(x); }
+    return Ge25519Decoded { ok: true, p: Ge25519 { x: x, y: y, z: f25_one(), t: f25_mul(x, y) } };
+}
+
+// ─── Scalars mod L ──────────────────────────────────────────────────────
+
+/// L little-endian.
+@constant_time
+fn ed_l() -> Vec<i64> {
+    var l: Vec<i64> = Vec::new();
+    l.push(0xed); l.push(0xd3); l.push(0xf5); l.push(0x5c); l.push(0x1a); l.push(0x63); l.push(0x12); l.push(0x58);
+    l.push(0xd6); l.push(0x9c); l.push(0xf7); l.push(0xa2); l.push(0xde); l.push(0xf9); l.push(0xde); l.push(0x14);
+    var i: i64 = 16;
+    while i < 31 { l.push(0); i = i + 1; }
+    l.push(0x10);
+    return l;
+}
+
+/// x (64 signed radix-2^8 digits, as TweetNaCl's modL) mod L, 32 bytes.
+@constant_time
+fn ed_mod_l(x: &mut Vec<i64>) -> Vec<i64> {
+    val l: Vec<i64> = ed_l();
+    var carry: i64 = 0;
+    var i: i64 = 63;
+    var j: i64 = 0;
+    while i >= 32 {
+        carry = 0;
+        j = i - 32;
+        while j < i - 12 {
+            x.set(j, x.get(j) + carry - 16 * x.get(i) * l.get(j - (i - 32)));
+            carry = (x.get(j) + 128) >> 8;
+            x.set(j, x.get(j) - carry * 256);
+            j = j + 1;
+        }
+        x.set(j, x.get(j) + carry);
+        x.set(i, 0);
+        i = i - 1;
+    }
+    carry = 0;
+    j = 0;
+    while j < 32 {
+        x.set(j, x.get(j) + carry - (x.get(31) >> 4) * l.get(j));
+        carry = x.get(j) >> 8;
+        x.set(j, x.get(j) & 255);
+        j = j + 1;
+    }
+    j = 0;
+    while j < 32 { x.set(j, x.get(j) - carry * l.get(j)); j = j + 1; }
+    var out: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 32 {
+        x.set(i + 1, x.get(i + 1) + (x.get(i) >> 8));
+        out.push(x.get(i) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// A 64-byte hash as a scalar mod L.
+fn sc_reduce64(h: &Vec<i64>) -> Vec<i64> {
+    var x: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 64 { x.push(h.get(i)); i = i + 1; }
+    return ed_mod_l(&mut x);
+}
+
+/// (r + k a) mod L for 32-byte r, k, a.
+@constant_time
+fn sc_mul_add(k: &Vec<i64>, a: &Vec<i64>, r: &Vec<i64>) -> Vec<i64> {
+    var x: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 64 { x.push(0); i = i + 1; }
+    i = 0;
+    while i < 32 { x.set(i, r.get(i)); i = i + 1; }
+    i = 0;
+    while i < 32 {
+        var j: i64 = 0;
+        while j < 32 {
+            x.set(i + j, x.get(i + j) + k.get(i) * a.get(j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return ed_mod_l(&mut x);
+}
+
+/// True when the 32 bytes s[off..off+32] are a little-endian number < L.
+fn sc_is_canonical(s: &Vec<i64>, off: i64) -> bool {
+    val l: Vec<i64> = ed_l();
+    var i: i64 = 31;
+    while i >= 0 {
+        val a: i64 = s.get(off + i);
+        val b: i64 = l.get(i);
+        if a < b { return true; }
+        if a > b { return false; }
+        i = i - 1;
+    }
+    return false;    // s == L
+}
+
+// ─── Keys, signing, verification ────────────────────────────────────────
+
+/// SHA-512 of the seed; the first half clamped (RFC 8032 §5.1.5).
+fn ed_expand(seed: &Vec<i64>) -> Vec<i64> {
+    var h: Vec<i64> = sha512_bytes(ed_slice(seed, 0, 32));
+    h.set(0, h.get(0) & 248);
+    h.set(31, (h.get(31) & 127) | 64);
+    return h;
+}
+
+fn ed_check_seed(seed: &Vec<i64>, what: str) {
+    if !ed_all_bytes(seed) {
+        p_panic("ed25519: " + what + " holds a value outside 0..255");
+    }
+}
+
+/// The 32-byte public key of a 32-byte seed (the RFC 8032 secret key).
+pub fn ed25519_public_key(seed: Vec<i64>) -> Vec<i64> {
+    if seed.len() != 32 {
+        p_panic("ed25519: a seed is 32 bytes, got " + int_to_str(seed.len()));
+    }
+    ed_check_seed(&seed, "the seed");
+    val h: Vec<i64> = ed_expand(&seed);
+    val a: Vec<i64> = ed_slice(&h, 0, 32);
+    return ge_encode(ge_scalarmult_ct(&a, ge_base()));
+}
+
+/// seed || public key (64 bytes), the libsodium secret-key layout that
+/// ed25519_sign accepts to skip recomputing the public key.
+pub fn ed25519_keypair(seed: Vec<i64>) -> Vec<i64> {
+    val pk: Vec<i64> = ed25519_public_key(seed);
+    var out: Vec<i64> = ed_slice(&seed, 0, 32);
+    ed_append(&mut out, &pk);
+    return out;
+}
+
+/// The 64-byte signature R || S of msg (RFC 8032 §5.1.6). `secret_key` is
+/// the 32-byte seed, or the 64-byte seed || public key of ed25519_keypair
+/// (the public half must be the seed's: signing with another public key
+/// leaks the secret key, so never take it from untrusted input).
+/// Panics on any other length.
+pub fn ed25519_sign(secret_key: Vec<i64>, msg: Vec<i64>) -> Vec<i64> {
+    var pk: Vec<i64> = Vec::new();
+    if secret_key.len() == 64 {
+        ed_check_seed(&secret_key, "the secret key");
+        pk = ed_slice(&secret_key, 32, 64);
+    } else if secret_key.len() == 32 {
+        pk = ed25519_public_key(secret_key);
+    } else {
+        p_panic("ed25519: a secret key is 32 or 64 bytes, got " + int_to_str(secret_key.len()));
+    }
+    val h: Vec<i64> = ed_expand(&secret_key);
+    val a: Vec<i64> = ed_slice(&h, 0, 32);
+    // r = SHA-512(prefix || msg) mod L
+    var rin: Vec<i64> = ed_slice(&h, 32, 64);
+    ed_append(&mut rin, &msg);
+    val r: Vec<i64> = sc_reduce64(&sha512_bytes(rin));
+    val rb: Vec<i64> = ge_encode(ge_scalarmult_ct(&r, ge_base()));
+    // k = SHA-512(R || A || msg) mod L
+    var kin: Vec<i64> = ed_slice(&rb, 0, 32);
+    ed_append(&mut kin, &pk);
+    ed_append(&mut kin, &msg);
+    val k: Vec<i64> = sc_reduce64(&sha512_bytes(kin));
+    val s: Vec<i64> = sc_mul_add(&k, &a, &r);
+    var sig: Vec<i64> = rb;
+    ed_append(&mut sig, &s);
+    return sig;
+}
+
+/// True when sig is a valid signature of msg under public_key (RFC 8032
+/// §5.1.7, cofactorless). False for wrong lengths, non-byte elements, a
+/// public key that is no point, S >= L, or a wrong signature.
+pub fn ed25519_verify(public_key: Vec<i64>, msg: Vec<i64>, sig: Vec<i64>) -> bool {
+    if public_key.len() != 32 || sig.len() != 64 { return false; }
+    if !ed_all_bytes(&public_key) || !ed_all_bytes(&sig) || !ed_all_bytes(&msg) { return false; }
+    if !sc_is_canonical(&sig, 32) { return false; }
+    val dec: Ge25519Decoded = ge_decode(&public_key);
+    if !dec.ok { return false; }
+    var kin: Vec<i64> = ed_slice(&sig, 0, 32);
+    ed_append(&mut kin, &public_key);
+    ed_append(&mut kin, &msg);
+    val k: Vec<i64> = sc_reduce64(&sha512_bytes(kin));
+    val s: Vec<i64> = ed_slice(&sig, 32, 64);
+    // R' = [S]B - [k]A must encode to R.
+    val rcheck: Vec<i64> = ge_encode(ge_double_scalarmult_vartime(&k, ge_neg(dec.p), &s));
+    var diff: i64 = 0;
+    var i: i64 = 0;
+    while i < 32 { diff = diff | (rcheck.get(i) ^ sig.get(i)); i = i + 1; }
+    return diff == 0;
+}

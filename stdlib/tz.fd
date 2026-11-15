@@ -40,6 +40,10 @@ use fs;
 /// When a change happens: in `month`, the `week`-th `weekday` (0 Sunday
 /// .. 6 Saturday; week 5 = the last one), at `secs` seconds after midnight
 /// of the local clock (utc = false) or of UTC (utc = true).
+/// `month` 0 is a day of the year instead (the POSIX Julian forms), held
+/// in `weekday`: with `week` 1 it is "Jn", n from 1 to 365 with February 29
+/// never counted (J60 is always March 1); with `week` 0 it is "n", n from
+/// 0 to 365 counting February 29 (59 is February 29 in a leap year).
 pub struct TzWhen {
     pub month: i64,
     pub week: i64,
@@ -218,6 +222,14 @@ pub fn tz_known(name: str) -> bool {
 
 /// Midnight UTC of the day `w` names in `year`, as Unix seconds.
 fn tz_rule_day(year: i64, w: TzWhen) -> i64 {
+    if w.month == 0 {
+        var days: i64 = w.weekday;                  // "n": zero-based
+        if w.week == 1 {
+            days = w.weekday - 1;                   // "Jn": one-based, no Feb 29
+            if days >= 59 && days_in_month(year, 2) == 29 { days = days + 1; }
+        }
+        return time_from_date(year, 1, 1).seconds + days * 86400;
+    }
     var first: LogicalTime = time_from_date(year, w.month, 1);
     var wd: i64 = time_get_weekday(first);
     var d: i64 = 1 + ((w.weekday - wd + 7) % 7);
@@ -542,13 +554,16 @@ fn tzp_time(s: str, i: i64, out: &mut Vec<i64>) -> i64 {
     return j;
 }
 
-/// A rule date "Mm.w.d[/time]" at `i`: a TzWhen in `out`, or -1 (the
-/// Julian forms "Jn" and "n" are not read).
+/// A rule date at `i`: "Mm.w.d", "Jn" or "n", then an optional
+/// "/time" (02:00 when absent; it may be negative or above 24 hours, as
+/// RFC 8536 allows). A TzWhen in `out` and the end position, or -1.
 fn tzp_when(s: str, i: i64, out: &mut Vec<TzWhen>) -> i64 {
     var n: i64 = str_len(s);
-    if i >= n || str_byte_at(s, i) != 77 { return -1; }
+    if i >= n { return -1; }
+    var c0: i64 = str_byte_at(s, i);
     var nums: Vec<i64> = Vec::new();
     var j: i64 = i + 1;
+    if c0 != 77 && c0 != 74 { j = i; }              // 'M', 'J', or a digit
     var cur: i64 = 0;
     var digits: i64 = 0;
     while j < n {
@@ -556,7 +571,7 @@ fn tzp_when(s: str, i: i64, out: &mut Vec<TzWhen>) -> i64 {
         if c >= 48 && c <= 57 {
             cur = cur * 10 + (c - 48);
             digits = digits + 1;
-        } else if c == 46 && digits > 0 {
+        } else if c == 46 && digits > 0 && c0 == 77 {
             nums.push(cur);
             cur = 0;
             digits = 0;
@@ -567,20 +582,34 @@ fn tzp_when(s: str, i: i64, out: &mut Vec<TzWhen>) -> i64 {
     }
     if digits == 0 { return -1; }
     nums.push(cur);
-    if nums.len() != 3 { return -1; }
-    var secs: i64 = 7200;
+    var w: TzWhen = tz_when(0, 0, 0, 7200, false);
+    if c0 == 77 {
+        if nums.len() != 3 { return -1; }
+        var mo: i64 = nums.get(0);
+        var wk: i64 = nums.get(1);
+        var wd: i64 = nums.get(2);
+        if mo < 1 || mo > 12 || wk < 1 || wk > 5 || wd > 6 { return -1; }
+        w = tz_when(mo, wk, wd, 7200, false);
+    } else if c0 == 74 {
+        if cur < 1 || cur > 365 { return -1; }
+        w = tz_when(0, 1, cur, 7200, false);
+    } else {
+        if cur > 365 { return -1; }
+        w = tz_when(0, 0, cur, 7200, false);
+    }
     if j < n && str_byte_at(s, j) == 47 {
         var tv: Vec<i64> = Vec::new();
         j = tzp_time(s, j + 1, &mut tv);
         if j < 0 { return -1; }
-        secs = tv.get(0);
+        w.secs = tv.get(0);
     }
-    out.push(TzWhen { month: nums.get(0), week: nums.get(1), weekday: nums.get(2), secs: secs, utc: false });
+    out.push(w);
     return j;
 }
 
 /// The zone a POSIX TZ string describes ("CET-1CEST,M3.5.0,M10.5.0/3",
-/// "<+0530>-5:30"); a zone whose name is "" when it cannot be read. POSIX
+/// "<+0530>-5:30", "<+0330>-3:30<+0430>,J79/24,J263/24"); a zone
+/// whose name is "" when it cannot be read. POSIX
 /// offsets count west, so "EST5" is five hours behind UTC.
 pub fn tz_from_posix(name: str, s: str) -> Tz {
     var bad: Tz = tz_fixed("", 0, "UTC");

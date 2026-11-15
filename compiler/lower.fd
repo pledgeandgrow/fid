@@ -34,6 +34,7 @@ use compiler::ir_ser;
 use compiler::cowcheck;
 use compiler::ir;
 use compiler::pe_ir;
+use compiler::pgo;
 
 // --- Box unbox helpers ---------------------------------------------------
 
@@ -2203,6 +2204,13 @@ pub fn Lowerer_register_runtime(self: &mut Lowerer) {
     // @zeroize: wipe the bytes a str / the buffer a Vec owns
     Lowerer_add_extern_1(self, "p_str_zeroize", lw_ptr_u8(), IrType::Void);
     Lowerer_add_extern_1(self, "p_vec_zeroize", IrType::I64, IrType::Void);
+    var sens_ptr: IrType = IrType::I64;
+    Lowerer_add_extern_1(self, "p_sensitive_mark", sens_ptr, IrType::Void);
+    Lowerer_add_extern_1(self, "p_sensitive_check", sens_ptr, IrType::I64);
+    Lowerer_add_extern_1(self, "p_sensitive_unmark", sens_ptr, IrType::Void);
+    Lowerer_add_extern_1(self, "p_sensitive_remark", sens_ptr, IrType::Void);
+    Lowerer_add_extern_3(self, "p_sensitive_free", IrType::I64, IrType::I64, IrType::I64, IrType::Void);
+    Lowerer_add_extern_0(self, "p_sensitive_wipes", IrType::I64);
 
     // MMU/page table
     Lowerer_add_extern_0(self, "p_cr3_read", IrType::I64);
@@ -2877,6 +2885,8 @@ pub fn lower(program: Program) -> IrModule {
         lw_rc_cancel_pairs(&mut module);
         if LOWER_STACK_VECS { lw_rc_stack_vecs(&mut module); }
     }
+    // --profile-use: the run's hot functions first (OP30)
+    pgo_apply(&mut module);
     return module;
 }
 
@@ -4098,6 +4108,7 @@ fn Lowerer_lower_func_body(self: &mut Lowerer, func: Func) {
         }
         ai = ai + 1;
     }
+    ir_func.is_constant_time = has_annotation(func.annotations, "constant_time");
     ir_func.is_wrapping = has_annotation(func.annotations, "wrapping");
     ir_func.is_deterministic = has_annotation(func.annotations, "deterministic");
     ir_func.is_crashfree = has_annotation(func.annotations, "crashfree");
@@ -5930,6 +5941,7 @@ fn Lowerer_lower_let_stmt(self: &mut Lowerer, name: str, ty: OptType, expr: Expr
         var size: i64 = ir_type_size(ir_ty);
         if size > 0 {
             self.current_func.zeroize_locals.push(ValueIdU64_new(alloca, size));
+            Lowerer_mark_sensitive(self, alloca, ir_ty);
         }
     }
 }
@@ -6236,6 +6248,7 @@ fn Lowerer_lower_stmt_inner(self: &mut Lowerer, stmt: Stmt) {
                 var size: i64 = ir_type_size(ir_ty);
                 if size > 0 {
                     self.current_func.zeroize_locals.push(ValueIdU64_new(alloca, size));
+                    Lowerer_mark_sensitive(self, alloca, ir_ty);
                 }
             }
         }
@@ -8274,6 +8287,22 @@ fn Lowerer_lower_arg_for_param(self: &mut Lowerer, arg: Expr, callee: str, i: i6
 }
 
 fn Lowerer_lower_call_expr(self: &mut Lowerer, callee: str, args: Vec<Expr>) -> i64 {
+    // A string, Vec or HashMap sent over a channel is copied whole first
+    // (core p_send_copy), as for spawn: the receiver owns a value of its
+    // own and the two threads share no buffer or owner count. A value
+    // cast to a raw word (`v as i64`) is sent as it is, the caller's to
+    // manage by hand.
+    if (callee == "p_chan_send" || callee == "channel_send" || callee == "p_chan_try_send") && args.len() == 2 {
+        var sk: i64 = Lowerer_rc_kind(self, Lowerer_rc_expr_type(self, args.get(1)));
+        if sk == RC_STR || sk == RC_VEC || sk == RC_MAP {
+            var wrapped: Vec<Expr> = Vec::new();
+            wrapped.push(args.get(0));
+            var one: Vec<Expr> = Vec::new();
+            one.push(args.get(1));
+            wrapped.push(Expr::Call("__send_copy", one));
+            return Lowerer_lower_call_expr(self, callee, wrapped);
+        }
+    }
     // Resolve named arguments to positional order and fill in defaults
     var resolved_args: Vec<Expr> = Lowerer_resolve_call_args(self, callee, args);
     var arg_vals: Vec<i64> = Vec::new();
@@ -9876,6 +9905,21 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             if callee == "__txn_abort" {
                 Lowerer_txn_abort(self);
                 return Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+            }
+            // The whole copy a channel send hands over (raw word)
+            if callee == "__send_copy" && args.len() == 1 {
+                var sv: i64 = Lowerer_lower_expr(self, args.get(0));
+                var sk2: i64 = Lowerer_rc_kind(self, Lowerer_rc_value_type(self, args.get(0), sv));
+                var stid: i64 = 0;
+                if sk2 == RC_STR { stid = 1; }
+                if sk2 == RC_VEC { stid = 2; }
+                if sk2 == RC_MAP { stid = 3; }
+                if stid == 0 { return Lowerer_rc_as_i64(self, sv); }
+                var sca: Vec<i64> = Vec::new();
+                sca.push(Lowerer_rc_env(self));
+                sca.push(Lowerer_rc_as_i64(self, sv));
+                sca.push(Lowerer_emit_inst(self, Inst::ConstInt(stid, IrType::I64)));
+                return Lowerer_emit_inst(self, Inst::Call("p_send_copy", sca, IrType::I64, lw_rc_eff()));
             }
             // A spawn wrapper frees the copy its thread was given
             if callee == "__thread_drop" && args.len() == 1 {
@@ -11711,6 +11755,21 @@ pub fn Lowerer_emit_drops(self: &mut Lowerer) {
 /// F88: Emit compiler-inserted memset(0) calls for all @zeroize locals.
 /// Called before drops and returns. Wipes secrets from memory at scope exit.
 /// Emits in reverse declaration order (LIFO — last declared wiped first).
+/// J8: a @zeroize Vec keeps its contents in a heap buffer that growth
+/// replaces — register the local with the runtime's sensitive-Vec table so
+/// vec_sz_reserve wipes the old buffer before freeing it. The table key is
+/// the alloca (the Vec header's address), which is what the Vec primitives
+/// receive.
+pub fn Lowerer_mark_sensitive(self: &mut Lowerer, alloca: i64, ir_ty: IrType) {
+    if !ir_type_is_opaque_named(ir_ty, "Vec") { return; }
+    var held: i64 = Lowerer_emit_inst(self, Inst::Load(alloca, ir_ty));
+    var args: Vec<i64> = Vec::new();
+    args.push(held);
+    var eff: EffectSet = EffectSet_new();
+    EffectSet_add(eff, Effect::Write);
+    var _c: i64 = Lowerer_emit_inst(self, Inst::Call("p_sensitive_mark", args, IrType::Void, eff));
+}
+
 pub fn Lowerer_emit_zeroize(self: &mut Lowerer) {
     var i: i64 = self.current_func.zeroize_locals.len() - 1;
     while i >= 0 {

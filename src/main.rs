@@ -1292,7 +1292,7 @@ fn real_main() {
                 }
             };
             // Incremental build: skip all work when no input changed.
-            let build_cache = fidesc::inc::BuildCache::open("ccompile", &args[2..], input, &output, &["CC", "FIDES_CC_OPT", "FID_HOME", "FIDES_INC_FLAT"]);
+            let build_cache = fidesc::inc::BuildCache::open("ccompile", &args[2..], input, &output, &["CC", "FIDES_CC_OPT", "FID_HOME", "FIDES_INC_FLAT", "FIDES_INC_EFFECTS"]);
             if build_cache.up_to_date() {
                 println!("{} is up to date", output);
                 return;
@@ -2219,6 +2219,8 @@ fn real_main() {
                 "test_pe_dll_import",
                 "test_pe_task_order",
                 "test_spawn_gt",
+                // J5: BCrypt (CNG) is a real DLL the interpreter cannot call.
+                "test_crypto_bind",
                 // glTF+Tiled: correct but each json_* call re-validates
                 // the document — O(n^2) per lookup on the interpreter.
                 "test_gaming_stdlib",

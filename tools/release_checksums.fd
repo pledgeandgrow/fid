@@ -1,0 +1,120 @@
+// tools/release_checksums.fd — SHA-256 checksums of release files, to
+// publish beside them on the GitHub release page: the Fides port of
+// scripts/release-checksums.sh (roadmap AD4). It needs no sha256sum.
+//
+//   fid ccompile tools/release_checksums.fd -o release_checksums.exe
+//   release_checksums.exe [--out FILE] [file ...]
+//
+// Without files it checksums the installer(s) installer/Fides-Setup-*.exe
+// and the shipped binaries in release/ (fid.exe, fidesc.exe, ark.exe,
+// scribe.exe, veil.exe) that exist. Writes FILE (default SHA256SUMS.txt in
+// the current directory: run it from the repository root, as the script
+// does) in sha256sum's format, "<hex>  <name>", names without directories,
+// and prints it. --out is the one addition, so a check can write elsewhere.
+//
+// Users check a download with:
+//   sha256sum -c SHA256SUMS.txt --ignore-missing          (Linux, Git Bash)
+//   Get-FileHash Fides-Setup-1.0.0.exe -Algorithm SHA256  (PowerShell)
+
+use core;
+use args;
+use fs;
+use io;
+use crypto;
+
+fn rc_basename(path: str) -> str {
+    var i: i64 = str_len(path) - 1;
+    while i >= 0 {
+        val c: i64 = str_byte_at(path, i);
+        if c == 47 || c == 92 { return str_slice(path, i + 1, str_len(path)); }
+        i = i - 1;
+    }
+    return path;
+}
+
+fn rc_sort(v: &mut Vec<str>) {
+    var i: i64 = 1;
+    while i < v.len() {
+        val x: str = v.get(i);
+        var j: i64 = i - 1;
+        while j >= 0 && str_compare(v.get(j), x) > 0 {
+            v.set(j + 1, v.get(j));
+            j = j - 1;
+        }
+        v.set(j + 1, x);
+        i = i + 1;
+    }
+}
+
+/// The default files: installer/Fides-Setup-*.exe (in name order, as the
+/// shell's glob gives them), then the release binaries that exist.
+pub fn rc_default_files() -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var names: Vec<str> = fs_list_dir("installer");
+    rc_sort(&mut names);
+    var i: i64 = 0;
+    while i < names.len() {
+        val n: str = names.get(i);
+        if str_starts_with(n, "Fides-Setup-") && str_ends_with(n, ".exe") && fs_is_file("installer/" + n) {
+            out.push("installer/" + n);
+        }
+        i = i + 1;
+    }
+    var bins: Vec<str> = Vec::new();
+    bins.push("release/fid.exe");
+    bins.push("release/fidesc.exe");
+    bins.push("release/ark.exe");
+    bins.push("release/scribe.exe");
+    bins.push("release/veil.exe");
+    i = 0;
+    while i < bins.len() {
+        if fs_is_file(bins.get(i)) { out.push(bins.get(i)); }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// sha256sum's line for one file. Read as bytes: a binary holds NULs,
+/// which a str would stop at.
+pub fn rc_line(path: str) -> str {
+    return crypto_sha256_hex(crypto_sha256_bytes(fs_read_bytes(path))) + "  " + rc_basename(path) + "\n";
+}
+
+fn main() -> i64 {
+    val av: Vec<str> = args_all();
+    var out: str = "SHA256SUMS.txt";
+    var files: Vec<str> = Vec::new();
+    var i: i64 = 1;
+    while i < av.len() {
+        val a: str = av.get(i);
+        if a == "--out" && i + 1 < av.len() {
+            out = av.get(i + 1);
+            i = i + 2;
+            continue;
+        }
+        files.push(a);
+        i = i + 1;
+    }
+    if files.len() == 0 { files = rc_default_files(); }
+    if files.len() == 0 {
+        io_eprintln("release-checksums: no files to checksum");
+        return 1;
+    }
+    var text: str = "";
+    i = 0;
+    while i < files.len() {
+        if !fs_is_file(files.get(i)) {
+            io_eprintln("release-checksums: no such file: " + files.get(i));
+            return 1;
+        }
+        text = text + rc_line(files.get(i));
+        i = i + 1;
+    }
+    if !fs_write_text(out, text) {
+        io_eprintln("release-checksums: cannot write " + out);
+        return 1;
+    }
+    println("== " + out);
+    print(text);
+    return 0;
+}

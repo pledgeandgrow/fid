@@ -53,6 +53,13 @@ fn ped_copy(addr: i64, n: i64) -> str {
     return p_str_adopt(buf);
 }
 
+/// ped_copy for a word kept in a runtime list or table: the string is
+/// owned by whoever keeps the word (a `str` temporary would be freed at the
+/// end of its statement and leave the word dangling; known-bugs 2g.24).
+fn ped_copy_raw(addr: i64, n: i64) -> i64 {
+    return ped_copy(addr, n) as i64;
+}
+
 /// strcmp: <0, 0 or >0 (bytes compared unsigned).
 fn ped_cmp(a: i64, b: i64) -> i64 {
     var i: i64 = 0;
@@ -284,7 +291,7 @@ pub fn pert_json_parse(s: str) -> str {
                 while pe_byte_at(base, i) == 32 || pe_byte_at(base, i) == 9 {
                     i = i + 1;
                 }
-                var key: i64 = pe_str_addr(ped_copy(base + ks, klen));
+                var key: i64 = ped_copy_raw(base + ks, klen);
                 var b: i64 = pe_byte_at(base, i);
                 if b == 34 {
                     i = i + 1;
@@ -297,7 +304,7 @@ pub fn pert_json_parse(s: str) -> str {
                         i = i + 1;
                     }
                     ped_list_push(keys, key);
-                    ped_list_push(vals, pe_str_addr(ped_copy(base + vs, vlen)));
+                    ped_list_push(vals, ped_copy_raw(base + vs, vlen));
                 } else if b == 116 {
                     ped_list_push(keys, key);
                     ped_list_push(vals, pe_str_addr("true"));
@@ -318,7 +325,7 @@ pub fn pert_json_parse(s: str) -> str {
                         d = pe_byte_at(base, i);
                     }
                     ped_list_push(keys, key);
-                    ped_list_push(vals, pe_str_addr(ped_copy(base + ns, i - ns)));
+                    ped_list_push(vals, ped_copy_raw(base + ns, i - ns));
                 }
             } else {
                 i = i + 1;
@@ -917,13 +924,13 @@ pub fn pert_db_mem_exec(db: i64, query: str) -> i64 {
     var vs: i64 = i;
     var vlen: i64 = ped_len(q + vs);
     if (ped_eq(cmd, pe_str_addr("insert")) || ped_eq(cmd, pe_str_addr("set"))) && klen > 0 {
-        var v: i64 = pe_str_addr(ped_copy(q + vs, vlen));
+        var v: i64 = ped_copy_raw(q + vs, vlen);
         var at: i64 = ped_db_find(db, q + ks, klen);
         if at >= 0 {
             ped_list_set(ped_ld(db + 8), at, v);
             return 1;
         }
-        ped_list_push(ped_ld(db), pe_str_addr(ped_copy(q + ks, klen)));
+        ped_list_push(ped_ld(db), ped_copy_raw(q + ks, klen));
         ped_list_push(ped_ld(db + 8), v);
         return 1;
     }

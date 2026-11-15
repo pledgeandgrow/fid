@@ -52,11 +52,18 @@ The ten that matter most, in order:
 - [~] CB6. **"The build is not reproducible"** (C, C++, npm). The same source and
       compiler give the same bytes. Done for the compiler itself (the bootstrap
       fixpoint). Left: guaranteed and tested for user programs (M).
+      Nov 15: `scripts/verify/repro.sh` run on user programs — `dump-c` and the
+      native `emit` exe are byte-identical across directories, temp dirs and
+      time. `ccompile` differs only in the PE timestamp the linker writes
+      (20 bytes in the COFF header): left, pass `/Brepro` when the linker is lld.
 - [x] CB7. **"Debug or release: which flags?"** (C, C++). `--debug` and `--release`,
       nothing else to know.
-- [ ] CB8. **"The build cache serves stale results"** (Bazel, Gradle, ccache).
+- [x] CB8. **"The build cache serves stale results"** (Bazel, Gradle, ccache).
       Content hashes of everything an artifact depends on, tested against changes in
       each input. (A stale hit was found and fixed on Nov 2.) (M)
+      Done Nov 15: `scripts/stale-cache-test.sh` proves a change to an imported
+      module or to the flags re-runs the build, `--no-cache` forces it, and an
+      unchanged rebuild still hits the cache.
 - [ ] CB9. **"Linker errors are unreadable"** (C, C++, Rust). The linker is part of
       the compiler: a missing symbol is reported as a Fides error with its source
       line and the library that should have provided it (M).
@@ -132,9 +139,13 @@ The ten that matter most, in order:
       `unwrap` outside tests; `@crashfree` forbids it (S).
       `fid lint` warns at each function that calls `unwrap()` or `expect()`,
       except `fn test_*`, `fn bench_*` and `*_test.fd` files.
-- [ ] CE3. **"Exceptions I did not know a function could throw"** (Java, C#,
+- [x] CE3. **"Exceptions I did not know a function could throw"** (Java, C#,
       Python, JS). A function's failure modes are in its type; there are no hidden
       exceptions (M).
+      Verified Nov 15: the language has no exception mechanism — recoverable
+      failure is `Result`/`Option` in the type (reference §8.2), panic is a
+      documented abort with a stack trace, `@no-panic`/`@crashfree` prove a
+      function cannot panic. Conformance tests cover the panic behaviours.
 - [~] CE4. **"Compiler errors I cannot read"** (C++ templates, Rust generics, Scala
       implicits). Every error has a code, the source line, and a `Fix:` line.
       Left: a test for each error message (competitive TL2) (L).
@@ -208,17 +219,31 @@ The ten that matter most, in order:
       Left: table tests with a name per row, filters, parallel runs (M).
 - [ ] CT3. **"Flaky tests from time and randomness"** (all). Under `fid test`,
       time and random numbers are fixed per test unless the test asks otherwise (M).
-- [ ] CT4. **"Fuzzing needs another tool"** (C, C++, Rust). `fn fuzz_*(data: Vec<u8>)`
+- [x] CT4. **"Fuzzing needs another tool"** (C, C++, Rust). `fn fuzz_*(data: Vec<u8>)`
       runs under `fid test --fuzz`, as in Go (competitive SL13) (M).
-- [ ] CT5. **"Snapshot tests are hand-rolled"** (most). `expect_snapshot(value)`
+      Done Nov 15: `fid test <file> --fuzz` runs each `fn fuzz_*(data: Vec<u8>)`
+      on 100 deterministic seeded inputs (`_fuzz_input`'s bounded LCG); a
+      panic in a target fails the run. Verified: a mutating target caught an
+      overflow; a fold-only target passes `(100 seeds)`.
+- [x] CT5. **"Snapshot tests are hand-rolled"** (most). `expect_snapshot(value)`
       writes and checks a stored file, updated with `--update` (S).
+      Done Nov 15: `expect_snapshot(name, value)` in stdlib/test.fd compares
+      with `<name>.snap` beside the test; `fid test --update` writes it. A
+      missing snapshot fails with "run fid test --update to write it";
+      verified missing→fail, --update→write, re-run→pass.
 - [ ] CT6. **"I can't debug a release build"** (C++, Rust). Line tables and
       variable locations in optimized builds, readable by standard debuggers
       (release N9) (L).
 - [ ] CT7. **"The bug only happens in production"** (all). Record the inputs every
       effect brings in; replay the run exactly, in the interpreter, step by step (L).
-- [ ] CT8. **"Coverage needs another tool"** (C, C++, Go before 1.20). `fid test
+- [~] CT8. **"Coverage needs another tool"** (C, C++, Go before 1.20). `fid test
       --coverage` with lines and branches, from `veil` (M).
+      Done Nov 15: `fid test <file> --coverage` runs the suite's tests through
+      `veil` and prints its line/function/instruction report. Fixed on the
+      way: veil resolved `use` imports (`lower_to_ir_module_with_path`) and
+      three by-value copies that double-freed (`fid veil` crashed on any
+      program). Left: `fid test --coverage` still double-frees when the
+      covered program panics — one more shared-owner site (known-bugs 2g.30).
 - [ ] CT9. **"Debugger shows mangled names and optimized-out values"** (C++, Rust).
       Debug info names Fides functions and types as written (M).
 - [ ] CT10. **"printf debugging needs a recompile"** (all compiled languages).
@@ -242,8 +267,10 @@ The ten that matter most, in order:
 - [ ] CD5. **"Left-pad: a deleted package breaks the world"** (npm). Dependencies
       come from Git or paths with content hashes in the lock file, and are
       vendored with one command (S).
-- [ ] CD6. **"Typosquatted packages"** (npm, PyPI). `ark add` warns about a name
+- [x] CD6. **"Typosquatted packages"** (npm, PyPI). `ark add` warns about a name
       one edit away from a known library (S).
+      Done Nov 15: `ark add` warns when the name is one edit (Levenshtein) from a
+      dependency already in ark.toml or from a package in the local index copy.
 - [ ] CD7. **"I don't know what my dependencies do"** (all). `ark audit` prints each
       dependency's capabilities, `unsafe` blocks and C libraries (M).
 - [ ] CD8. **"Build scripts run arbitrary code at install time"** (npm postinstall,
@@ -262,17 +289,28 @@ The ten that matter most, in order:
       (docs/reference/stability.md).
 - [ ] CU3. **"Deprecations with no replacement path"** (all). `@deprecated(use =
       "new_fn")` warns with the replacement, and `fid fix` applies it (S).
-- [ ] CU4. **"Features stuck on nightly for years"** (Rust). No nightly-only
+- [x] CU4. **"Features stuck on nightly for years"** (Rust). No nightly-only
       features: a feature ships behind a flag in a release, or not at all (S).
+      Done Nov 15: docs/reference/stability.md — there is no nightly track; a
+      flagged feature graduates into the language or is removed; nothing stays
+      flag-only across a stable release.
 - [ ] CU5. **"A minor release broke my build"** (npm semver in practice). `ark`
       checks a library's public API against its last release and refuses a minor
       version that removes or changes anything (M).
-- [~] CU6. **"I can't tell what changed"** (all). Release notes list every change
+- [x] CU6. **"I can't tell what changed"** (all). Release notes list every change
       that can affect a working program under **Breaking** (docs/reference/
       stability.md). Left: generated from the changelog and checked (S).
-- [ ] CU7. **"Old tutorials no longer compile"** (fast-moving languages). Examples in
+      Done Nov 15: `scripts/release-notes.py` renders the newest changelog
+      section as release notes, pulling breaking-change lines into a
+      `## Breaking changes` section on top.
+- [~] CU7. **"Old tutorials no longer compile"** (fast-moving languages). Examples in
       the docs are compiled and run in CI, so docs and compiler never drift
       (competitive SL19) (M).
+      Done Nov 15: `scripts/doctest.py` runs every `/// Example:` block in
+      stdlib against the built `fid` in CI (.github/workflows/ci.yml);
+      `/// Example (native only):` marks examples that need FFI or hit the
+      interpreter UTF-8 bug (known-bugs 2g.29). Left: run the native-only
+      examples through `emit` in CI.
 - [~] CU8. **"The compiler upgrade changed my program's speed"** (all). Benchmarks in
       CI fail on a slowdown over 10% (release D7) (M).
       Done (Nov 4): `bench/check.sh` fails on a slowdown over `LIMIT_PCT`
@@ -398,7 +436,9 @@ The ten that matter most, in order:
 
 ## Summary
 
-100 goals: 27 done, 22 partly done, 51 not started (Nov 11; CP1/CP7/CP8 verified
+100 goals: 34 done, 23 partly done, 43 not started (Nov 15; CE3 verified, CT4/CT5
+fuzz and snapshots in `fid test`, CB8 stale-cache script, CD6 typosquat warnings,
+CU4 nightly policy, CU6 release-notes script, CU7 doctests in CI; Nov 11: CP1/CP7/CP8 verified
 by measurement, CP9 `fid lint --perf`, CP2/CP3 `fid explain` implemented, CP6
 done — counted-loop, range, and `if i < v.len()` guard facts all remove checks;
 CP4 partly — `--alloc` shows COW copies). The first done ones were

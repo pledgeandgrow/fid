@@ -475,6 +475,17 @@ fn lex_c(src: &str) -> Vec<(CTok, usize, usize)> {
 /// Top-level function definitions in tokenized C: (name, name_tok_idx,
 /// def_start_tok_idx, one_past_end_tok_idx). A def is `… name ( … ) { … }`
 /// at brace depth 0.
+/// Is this token a preprocessor line or a retained comment line? Either
+/// way it is not part of a declaration's text — a stmt_start pointing at
+/// one would swallow it into the def's span (a `#define` slab moved into
+/// the owner's tail, then duplicated in every unit's prelude).
+fn c_tok_is_meta(t: &CTok) -> bool {
+    match t {
+        CTok::Lit(l) => l.starts_with('#') || l.starts_with("//"),
+        _ => false,
+    }
+}
+
 fn find_c_defs(toks: &[(CTok, usize, usize)]) -> Vec<(String, usize, usize, usize)> {
     let mut defs = Vec::new();
     let mut depth: i64 = 0;
@@ -511,7 +522,13 @@ fn find_c_defs(toks: &[(CTok, usize, usize)]) -> Vec<(String, usize, usize, usiz
                                 }
                                 m += 1;
                             }
-                            defs.push((name.clone(), j, stmt_start, (m + 1).min(toks.len())));
+                            // The def's own text starts at its first
+                            // non-directive token, not at stmt_start — the
+                            // `#define`/`//` lines between statements belong
+                            // to the shared prelude, not to this def.
+                            let mut s = stmt_start;
+                            while s < j && c_tok_is_meta(&toks[s].0) { s += 1; }
+                            defs.push((name.clone(), j, s, (m + 1).min(toks.len())));
                             j = m + 1;
                             stmt_start = j;
                             continue;
@@ -621,8 +638,14 @@ pub fn canon_hash(c_code: &str) -> u64 {
 /// any build — in this checkout or another, for this output or a different
 /// one — reuses a byte-identical artifact instead of rerunning the C
 /// compiler.
+///
+/// When `FIDES_CAS` is set (e.g. `http://cachehost:7331`, served by
+/// `tools/cas.fd`), `get` falls through to `GET /cas/<key>.exe` on a local
+/// miss and `store` also `PUT`s remotely. Remote failures are silent:
+/// a down or slow cache server never fails a build.
 pub struct ArtifactStore {
     dir: std::path::PathBuf,
+    remote: Option<String>,
 }
 
 impl ArtifactStore {
@@ -635,7 +658,10 @@ impl ArtifactStore {
         let parent = std::path::Path::new(output).parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| std::path::Path::new("."));
-        Some(ArtifactStore { dir: parent.join(".fidcache") })
+        let remote = std::env::var("FIDES_CAS").ok()
+            .map(|u| u.trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty());
+        Some(ArtifactStore { dir: parent.join(".fidcache"), remote })
     }
 
     /// Artifact key for a canonical hash built by `tool` with `flags`.
@@ -647,19 +673,118 @@ impl ArtifactStore {
         self.dir.join(format!("{}.exe", key))
     }
 
-    /// A previously stored artifact for this key.
+    /// A previously stored artifact for this key: local disk first, then
+    /// the remote CAS (whose hits populate the local store).
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
-        std::fs::read(self.path(key)).ok()
+        if let Ok(bytes) = std::fs::read(self.path(key)) {
+            return Some(bytes);
+        }
+        let bytes = self.remote_get(key)?;
+        self.store_local(key, &bytes);
+        Some(bytes)
     }
 
     /// Store `bytes` under `key`. Best-effort: cache failures never break a build.
     pub fn store(&self, key: &str, bytes: &[u8]) {
+        self.store_local(key, bytes);
+        self.remote_put(key, bytes);
+    }
+
+    fn store_local(&self, key: &str, bytes: &[u8]) {
         let _ = std::fs::create_dir_all(&self.dir);
         let tmp = self.dir.join(format!("{}.tmp", key));
         if std::fs::write(&tmp, bytes).is_ok() {
             let _ = std::fs::rename(&tmp, self.path(key));
         }
     }
+
+    /// `GET {remote}/cas/<key>.exe` — the artifact bytes, or None on any
+    /// transport error, non-200 status, or truncated body.
+    fn remote_get(&self, key: &str) -> Option<Vec<u8>> {
+        let (host, port) = cas_endpoint(self.remote.as_ref()?)?;
+        let path = format!("/cas/{}.exe", key);
+        let resp = cas_http(&host, port, "GET", &path, &[])?;
+        let (status, body) = cas_split(&resp)?;
+        if status != 200 { return None; }
+        Some(body)
+    }
+
+    /// `PUT {remote}/cas/<key>.exe` — fire-and-forget.
+    fn remote_put(&self, key: &str, bytes: &[u8]) {
+        let Some((host, port)) = self.remote.as_deref().and_then(cas_endpoint) else { return };
+        let path = format!("/cas/{}.exe", key);
+        if let Some(resp) = cas_http(&host, port, "PUT", &path, bytes) {
+            let _ = resp; // status irrelevant: a missed store is a miss later
+        }
+    }
+}
+
+/// Parse `FIDES_CAS` ("http://host[:port]" or "host[:port]") into (host, port).
+fn cas_endpoint(url: &str) -> Option<(String, u16)> {
+    let s = url.strip_prefix("http://").unwrap_or(url);
+    let s = s.split('/').next()?;
+    let (host, port) = match s.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().ok()?),
+        None => (s, 80),
+    };
+    if host.is_empty() { return None; }
+    Some((host.to_string(), port))
+}
+
+/// One blocking HTTP/1.1 request over TCP with tight timeouts: the remote
+/// cache is a LAN service, so anything slower than a few seconds is down.
+fn cas_http(host: &str, port: u16, method: &str, path: &str, body: &[u8]) -> Option<Vec<u8>> {
+    use std::io::{Read, Write};
+    use std::net::ToSocketAddrs;
+    let addr = (host, port).to_socket_addrs().ok()?.next()?;
+    let mut s = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).ok()?;
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+    let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(10)));
+    let req = format!(
+        "{} {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        method, path, host, port, body.len());
+    s.write_all(req.as_bytes()).ok()?;
+    s.write_all(body).ok()?;
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).ok()?;
+    Some(resp)
+}
+
+/// Split a raw HTTP response into (status, body). Bodies may be binary, so
+/// the head is located by bytes, not by string ops. A declared
+/// Content-Length must match the body exactly — a truncated transfer would
+/// otherwise poison the cache with a corrupt artifact.
+fn cas_split(resp: &[u8]) -> Option<(u16, Vec<u8>)> {
+    let head_end = resp.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = std::str::from_utf8(&resp[..head_end]).ok()?;
+    let status: u16 = head.split_whitespace().nth(1)?.parse().ok()?;
+    let content_length = head.lines().find_map(|l| {
+        let (name, value) = l.split_once(':')?;
+        name.trim().eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())?
+    });
+    let mut body = &resp[head_end + 4..];
+    // Transfer-Encoding: chunked → dechunk by length fields (binary-safe).
+    if head.to_ascii_lowercase().contains("transfer-encoding:") && head.to_ascii_lowercase().contains("chunked") {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        loop {
+            if at + 2 > body.len() { return None; }
+            let eol = body[at..].windows(2).position(|w| w == b"\r\n")? + at;
+            let size_str = std::str::from_utf8(&body[at..eol]).ok()?.split(';').next()?;
+            let size = usize::from_str_radix(size_str.trim(), 16).ok()?;
+            if size == 0 { break; }
+            at = eol + 2;
+            if at + size > body.len() { return None; }
+            out.extend_from_slice(&body[at..at + size]);
+            at += size + 2;
+        }
+        return Some((status, out));
+    }
+    if let Some(n) = content_length {
+        if n != body.len() { return None; }
+    }
+    Some((status, body.to_vec()))
 }
 
 #[cfg(test)]

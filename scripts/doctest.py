@@ -74,9 +74,14 @@ def main():
     if "--emit" in flags:
         emit = True
     if "--fid" in flags:
-        fid = args[flags.index("--fid")]
+        i = sys.argv.index("--fid")
+        fid = sys.argv[i + 1]
+        args = [a for a in args if a != fid]
+        if args:
+            root = args[0]
     elif args:
         root = args[0]
+    fid = os.path.abspath(fid)
     files = sorted(
         os.path.join(dp, f)
         for dp, _, fs in os.walk(root)

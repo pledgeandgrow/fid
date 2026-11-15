@@ -23,6 +23,7 @@ use vec;
 use string;
 use compiler::ast;
 use compiler::ir;
+use compiler::pgo;
 use compiler::green_thread;
 use compiler::tensor;
 use compiler::json;
@@ -50,6 +51,21 @@ pub enum Value {
 
 pub fn Value_int(v: i64) -> Value { return Value::Int(v); }
 
+/// The variant of `v`, for error messages.
+fn interp_value_kind(v: Value) -> str {
+    match v {
+        Value::Int(_) => { return "int"; }
+        Value::Float(_) => { return "float"; }
+        Value::Bool(_) => { return "bool"; }
+        Value::Str(_) => { return "str"; }
+        Value::Ptr(_) => { return "ptr"; }
+        Value::Void => { return "void"; }
+        Value::Vec(_) => { return "vec"; }
+        Value::Map(_) => { return "map"; }
+    }
+    return "?";
+}
+
 // A generic container hands back the 8-byte word it stored; a call typed f64
 // (a Vec<f64> element via Vec_get) reads those bits as a float. Functions
 // declared `-> f64` convert integer results at `return`, so an Int reaching
@@ -65,6 +81,14 @@ pub fn interp_reinterpret_word(v: Value, ty: IrType) -> Value {
         IrType::F32 => {
             match v {
                 Value::Int(bits32) => { return Value::Float(f32_from_bits_i(bits32)); }
+                _ => { return v; }
+            }
+        }
+        // A bool kept as a word (a Vec<bool> element): print as true/false,
+        // as C and native do
+        IrType::Bool => {
+            match v {
+                Value::Int(bw) => { return Value::Bool(bw != 0); }
                 _ => { return v; }
             }
         }
@@ -1354,6 +1378,7 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
         return RunResult::Panic("Recursion depth limit (" + int_to_str(depth) + ") exceeded in function '" + func.name + "' (called from '" + caller + "')");
     }
 
+    pgo_note_call(func.name);
     var saved_func_name: str = self.current_func_name;
     var saved_wrapping: bool = self.cur_wrapping;
     self.current_func_name = func.name;
@@ -1726,6 +1751,36 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                     _ => {}
                 }
             }
+            // Integer arithmetic on a string is arithmetic on its address
+            // (core's `(s & 7)`, `s - 16`): the string goes to memory first,
+            // as when it is passed to an i64 parameter (string == and != have
+            // returned above; ordering compares stay on the text)
+            var addr_op: bool = false;
+            match op {
+                BinOp::Add => { addr_op = true; }
+                BinOp::Sub => { addr_op = true; }
+                BinOp::Mul => { addr_op = true; }
+                BinOp::Div => { addr_op = true; }
+                BinOp::Mod => { addr_op = true; }
+                BinOp::BitAnd => { addr_op = true; }
+                BinOp::BitOr => { addr_op = true; }
+                BinOp::BitXor => { addr_op = true; }
+                BinOp::Shl => { addr_op = true; }
+                BinOp::Shr => { addr_op = true; }
+                _ => {}
+            }
+            if addr_op {
+                match l {
+                    Value::Str(_) => { l = Value::Int(Interpreter_value_word(self, l)); }
+                    Value::Ptr(lp) => { l = Value::Int(lp); }
+                    _ => {}
+                }
+                match r {
+                    Value::Str(_) => { r = Value::Int(Interpreter_value_word(self, r)); }
+                    Value::Ptr(rp) => { r = Value::Int(rp); }
+                    _ => {}
+                }
+            }
             var result: Value = Interpreter_eval_typed(self, op, l, r, ty, meta_is_u64(left_meta_opt) || meta_is_u64(right_meta_opt));
             if value_is_void(result) {
                 var msg: str = "Arithmetic error";
@@ -1738,7 +1793,7 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                         if int_or_q(r) != "0" { msg = "Integer overflow on division"; }
                     }
                     BinOp::Mod => { msg = "Modulo by zero"; }
-                    _ => { msg = "Arithmetic error"; }
+                    _ => { msg = "Arithmetic error (" + interp_value_kind(l) + ", " + interp_value_kind(r) + ")"; }
                 }
                 return ExecOutcome::Panic(msg);
             }
@@ -3102,6 +3157,12 @@ pub fn Interpreter_is_runtime_func_uncached(self: &Interpreter, name: str) -> bo
     if name == "p_memset" { return true; }
     if name == "p_str_zeroize" { return true; }
     if name == "p_vec_zeroize" { return true; }
+    if name == "p_sensitive_mark" { return true; }
+    if name == "p_sensitive_check" { return true; }
+    if name == "p_sensitive_unmark" { return true; }
+    if name == "p_sensitive_remark" { return true; }
+    if name == "p_sensitive_free" { return true; }
+    if name == "p_sensitive_wipes" { return true; }
     return false;
 }
 
@@ -5003,6 +5064,13 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
     // @zeroize heap wipe: interpreter strings and Vecs are managed values, not
     // raw memory, so there is nothing to wipe.
     if name == "p_str_zeroize" || name == "p_vec_zeroize" {
+        return ExecOutcome::Value(Value::Void);
+    }
+    // J8: interpreter Vecs are managed values — no raw buffers to track
+    if name == "p_sensitive_check" { return ExecOutcome::Value(Value::Int(0)); }
+    if name == "p_sensitive_wipes" { return ExecOutcome::Value(Value::Int(0)); }
+    if name == "p_sensitive_mark" || name == "p_sensitive_unmark"
+        || name == "p_sensitive_remark" || name == "p_sensitive_free" {
         return ExecOutcome::Value(Value::Void);
     }
     // ─── Memset (simplified — just return ptr) ───

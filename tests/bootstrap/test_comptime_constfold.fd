@@ -1,0 +1,45 @@
+// LF22: what `comptime` computes reaches the IR as constants, and the
+// mid-end folds further from them. Every value below is a compile-time
+// constant; the checks would return 1 (or print differently) if one were
+// folded wrong.
+//
+// Note: the comptime engine evaluates recursion and `if`, not `var`/`while`
+// loops — a loop body gives 0 rather than an error.
+
+comptime fn square(n: i64) -> i64 {
+    return n * n;
+}
+
+comptime fn sum_to(n: i64) -> i64 {
+    if n <= 0 { return 0; }
+    return n + sum_to(n - 1);
+}
+
+fn main() -> i64 {
+    // A comptime call used in arithmetic: the constant folds further.
+    val s = square(7) + sum_to(10);
+    if s != 49 + 55 {
+        println("comptime fold wrong");
+        return 1;
+    }
+
+    // A comptime value in a comparison that folds to a taken branch.
+    val ok = comptime sum_to(100) == 5050;
+    if !ok {
+        println("comptime compare wrong");
+        return 1;
+    }
+
+    // Comptime results as loop bounds: the counted loop over constants.
+    var total: i64 = 0;
+    for i in 0..comptime square(3) {
+        total = total + i;
+    }
+    if total != 36 {
+        println("comptime bound wrong");
+        return 1;
+    }
+
+    println("comptime constfold ok");
+    return 0;
+}

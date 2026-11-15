@@ -190,7 +190,10 @@ pub fn http_parse_head(head: str) -> HttpRequest {
 
 fn hs_free(s: str) {
     if str_len(s) > 0 {
-        p_free(s as i64);
+        // Not p_free(s): request strings are counted (p_str_buf), so their
+        // block starts 16 bytes back. p_str_free covers counted strings,
+        // literals, and plain blocks alike.
+        p_str_free(s as i64);
     }
 }
 
@@ -384,9 +387,11 @@ fn hc_fill(c: i64, timeout_ms: i64) -> i64 {
 
 /// The bytes at addr as a string.
 fn hc_text(addr: i64, n: i64) -> str {
-    val copy: i64 = p_malloc(n + 1);
+    // A counted string, not a bare buffer: an unheadered copy makes every
+    // str_len on the body count to the first NUL, truncating binary bodies
+    // (Content-Length is the real length; p_str_buf keeps it).
+    val copy: i64 = p_str_buf(n);
     hc_copy(copy, addr, n);
-    hc_set_byte(copy + n, 0);
     return copy as str;
 }
 
@@ -449,6 +454,11 @@ fn hc_line(c: i64, timeout_ms: i64) -> str {
 
 /// Was this string allocated, as opposed to a constant in the program?
 fn hs_allocated(s: str) -> bool {
+    if s as i64 == 0 { return false; }
+    // A counted string (headered: p_str_buf/str_slice/concat): p_str_free
+    // still no-ops on P_STR_STATIC literals, so counting them here is safe.
+    if p_str_hdr_len(s as i64) >= 0 { return true; }
+    // A plain allocator block (unheadered), detected by the block magic.
     return ((hc_get(s as i64, -1) >> 48) & 65535) == 61918 && ((hc_get(s as i64, -1) >> 40) & 255) == 90;
 }
 
@@ -654,12 +664,9 @@ pub fn http_conn_task(c: i64) -> i64 {
             response = handler(req);
         }
         val sent: bool = http_conn_write(c, response);
-        if http_scoped {
-            http_request_free(req);
-            if hs_allocated(response) {
-                p_free(response as i64);
-            }
-        }
+        // The request and the response are dropped by their variables at
+        // the end of this turn (proposal 0004); freeing them here as well
+        // was a double free (known-bugs 2g.35)
         if !sent || !keep {
             break;
         }

@@ -659,12 +659,16 @@ touching them.
    between the stages.
 
 27. **The Nov 9 module audit** (docs/file-analysis/<module>.md for all 68
-   modules, docs/reference/known-bugs.md §2g for the open bugs). Two reach
-   the shipped compiler: csplit.fd `cs_strip_static` removes `static` from
-   function locals of the split C (`p_process_run`, `p_net_connect`), and
-   iropt's SCCP folds narrow integer types with 64-bit arithmetic (a lost
-   overflow panic). `fid veil`, `fid lsp` symbol requests and `fid fmt` are
-   broken (2g.2, 2g.5, 2g.6).
+   modules, docs/reference/known-bugs.md §2g). Fixed Nov 15: the split C's
+   `static` locals (2g.1), SCCP on narrow/unsigned types (2g.11), NaN in
+   branch facts (2g.12), `fid veil`/`fid lsp`/`fid fmt` (2g.2, 2g.5, 2g.6),
+   and 2g.3, 2g.7–2g.10, 2g.14, 2g.18, 2f.11. Still open in §2g: see the
+   table. Two traps the fixes rely on: a struct literal's type for
+   lowering stays `i64` unless the struct is generic (other lowering
+   decisions depend on it: changing it broke the compiler's own parser), and
+   a function parameter has no instruction, so its type is in
+   `func.params`, not `IrFunction_get_meta` (`peir_operand_ty`,
+   `ng_meta_ty`).
 
 ## NEVER DO THESE (Hard Rules)
 

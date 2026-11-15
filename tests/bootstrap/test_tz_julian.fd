@@ -1,0 +1,92 @@
+// stdlib/tz: the Julian forms of POSIX TZ rule dates (competitive SL8).
+// "Jn" counts 1..365 and never February 29 (J60 is March 1 in every
+// year); "n" counts 0..365 from January 1 and does count February 29 (59
+// is March 1 in a common year, February 29 in a leap year). Each instant
+// below is one second before and at a change; the expected local times
+// come from glibc (`TZ=<rule> date -d @<seconds>` in WSL Ubuntu).
+// Python's zoneinfo (CPython 3.14, its C and its Python implementation)
+// disagrees on two points: it reads "n" as one-based (each change one day
+// early) and puts J59 on February 29 in a leap year; POSIX and glibc do
+// what this module does. "<+0330>-3:30<+0430>,J79/24,J263/24" is the rule
+// Asia/Tehran had from 2008 to 2022.
+use tz;
+use time;
+
+fn at(z: Tz, secs: i64, want: str) {
+    val got: str = tz_format(time_from_timestamp(secs), z, "%Y-%m-%d %H:%M:%S %Z %z");
+    println(z.name + " @" + int_to_str(secs) + " " + got);
+    if !str_equal(got, want) { p_panic("tz julian: got " + got + ", want " + want); }
+}
+
+fn check_s(label: str, got: str, want: str) {
+    println(label + " = " + got);
+    if !str_equal(got, want) { p_panic("tz julian: " + label + " gave " + got + ", want " + want); }
+}
+
+fn when_str(w: TzWhen) -> str {
+    return int_to_str(w.month) + "/" + int_to_str(w.week) + "/" + int_to_str(w.weekday) + "@" + int_to_str(w.secs);
+}
+
+fn main() -> i64 {
+    val z0: Tz = tz_from_posix("Tehran-2008", "<+0330>-3:30<+0430>,J79/24,J263/24");
+    at(z0, 1553113799, "2019-03-20 23:59:59 +0330 +03:30");   // 2019-03-20 20:29:59 UTC
+    at(z0, 1553113800, "2019-03-21 01:00:00 +0430 +04:30");   // 2019-03-20 20:30:00 UTC
+    at(z0, 1569007799, "2019-09-20 23:59:59 +0430 +04:30");   // 2019-09-20 19:29:59 UTC
+    at(z0, 1569007800, "2019-09-20 23:00:00 +0330 +03:30");   // 2019-09-20 19:30:00 UTC
+    at(z0, 1584736199, "2020-03-20 23:59:59 +0330 +03:30");   // 2020-03-20 20:29:59 UTC
+    at(z0, 1584736200, "2020-03-21 01:00:00 +0430 +04:30");   // 2020-03-20 20:30:00 UTC
+    at(z0, 1600630199, "2020-09-20 23:59:59 +0430 +04:30");   // 2020-09-20 19:29:59 UTC
+    at(z0, 1600630200, "2020-09-20 23:00:00 +0330 +03:30");   // 2020-09-20 19:30:00 UTC
+    val z1: Tz = tz_from_posix("zero-based", "XST3XDT,59/2,304/2");
+    at(z1, 1551416399, "2019-03-01 01:59:59 XST -03:00");   // 2019-03-01 04:59:59 UTC
+    at(z1, 1551416400, "2019-03-01 03:00:00 XDT -02:00");   // 2019-03-01 05:00:00 UTC
+    at(z1, 1572580799, "2019-11-01 01:59:59 XDT -02:00");   // 2019-11-01 03:59:59 UTC
+    at(z1, 1572580800, "2019-11-01 01:00:00 XST -03:00");   // 2019-11-01 04:00:00 UTC
+    at(z1, 1582952399, "2020-02-29 01:59:59 XST -03:00");   // 2020-02-29 04:59:59 UTC
+    at(z1, 1582952400, "2020-02-29 03:00:00 XDT -02:00");   // 2020-02-29 05:00:00 UTC
+    at(z1, 1604116799, "2020-10-31 01:59:59 XDT -02:00");   // 2020-10-31 03:59:59 UTC
+    at(z1, 1604116800, "2020-10-31 01:00:00 XST -03:00");   // 2020-10-31 04:00:00 UTC
+    val z2: Tz = tz_from_posix("J60-J365", "YST-2YDT,J60/0,J365/0");
+    at(z2, 1583013599, "2020-02-29 23:59:59 YST +02:00");   // 2020-02-29 21:59:59 UTC
+    at(z2, 1583013600, "2020-03-01 01:00:00 YDT +03:00");   // 2020-02-29 22:00:00 UTC
+    at(z2, 1609361999, "2020-12-30 23:59:59 YDT +03:00");   // 2020-12-30 20:59:59 UTC
+    at(z2, 1609362000, "2020-12-30 23:00:00 YST +02:00");   // 2020-12-30 21:00:00 UTC
+    at(z2, 1614549599, "2021-02-28 23:59:59 YST +02:00");   // 2021-02-28 21:59:59 UTC
+    at(z2, 1614549600, "2021-03-01 01:00:00 YDT +03:00");   // 2021-02-28 22:00:00 UTC
+    at(z2, 1640897999, "2021-12-30 23:59:59 YDT +03:00");   // 2021-12-30 20:59:59 UTC
+    at(z2, 1640898000, "2021-12-30 23:00:00 YST +02:00");   // 2021-12-30 21:00:00 UTC
+    val z3: Tz = tz_from_posix("J59", "WST-2WDT,J59/0,J300");
+    at(z3, 1582840799, "2020-02-27 23:59:59 WST +02:00");   // 2020-02-27 21:59:59 UTC
+    at(z3, 1582840800, "2020-02-28 01:00:00 WDT +03:00");   // 2020-02-27 22:00:00 UTC
+    at(z3, 1603753199, "2020-10-27 01:59:59 WDT +03:00");   // 2020-10-26 22:59:59 UTC
+    at(z3, 1603753200, "2020-10-27 01:00:00 WST +02:00");   // 2020-10-26 23:00:00 UTC
+    at(z3, 1614463199, "2021-02-27 23:59:59 WST +02:00");   // 2021-02-27 21:59:59 UTC
+    at(z3, 1614463200, "2021-02-28 01:00:00 WDT +03:00");   // 2021-02-27 22:00:00 UTC
+    at(z3, 1635289199, "2021-10-27 01:59:59 WDT +03:00");   // 2021-10-26 22:59:59 UTC
+    at(z3, 1635289200, "2021-10-27 01:00:00 WST +02:00");   // 2021-10-26 23:00:00 UTC
+    val z4: Tz = tz_from_posix("0-365", "ZST0ZDT,0/0,365/0");
+    at(z4, 1577836799, "2019-12-31 23:59:59 ZST +00:00");   // 2019-12-31 23:59:59 UTC
+    at(z4, 1577836800, "2020-01-01 01:00:00 ZDT +01:00");   // 2020-01-01 00:00:00 UTC
+    at(z4, 1609369199, "2020-12-30 23:59:59 ZDT +01:00");   // 2020-12-30 22:59:59 UTC
+    at(z4, 1609369200, "2020-12-30 23:00:00 ZST +00:00");   // 2020-12-30 23:00:00 UTC
+    val z5: Tz = tz_from_posix("M-and-J", "EST5EDT,M3.2.0,J310/1:30");
+    at(z5, 1793942999, "2026-11-06 01:29:59 EDT -04:00");   // 2026-11-06 05:29:59 UTC
+    at(z5, 1793943000, "2026-11-06 00:30:00 EST -05:00");   // 2026-11-06 05:30:00 UTC
+    // the parsed rule dates: month 0 = a day of the year, week 1 = "Jn", 0 = "n"
+    check_s("J79/24", when_str(z0.start), "0/1/79@86400");
+    check_s("59/2", when_str(z1.start), "0/0/59@7200");
+    check_s("J300 (default 02:00)", when_str(z3.end), "0/1/300@7200");
+    check_s("mixed with M", when_str(z5.start), "3/2/0@7200");
+    // the local clock back to UTC inside daylight time
+    check_s("from local", int_to_str(tz_from_local(time_new(2020, 6, 1, 12, 0, 0), z0).seconds),
+            int_to_str(time_new(2020, 6, 1, 7, 30, 0).seconds));
+    // dates out of range are not read
+    check_s("J0", tz_from_posix("x", "XST3XDT,J0,J100").name, "");
+    check_s("J366", tz_from_posix("x", "XST3XDT,J10,J366").name, "");
+    check_s("366", tz_from_posix("x", "XST3XDT,366,10").name, "");
+    check_s("J with dots", tz_from_posix("x", "XST3XDT,J60.1,J100").name, "");
+    check_s("no digits", tz_from_posix("x", "XST3XDT,J,J100").name, "");
+    check_s("M13", tz_from_posix("x", "XST3XDT,M13.1.0,M3.1.0").name, "");
+    println("tz julian ok");
+    return 0;
+}

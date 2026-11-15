@@ -85,12 +85,16 @@ build_one() {
     case "$TARGET" in *-windows*) nat=--nat ;; esac
     timeout 600 "$FID" emit "$f" --target "$TARGET" $nat -o "$OUT/$b.$EXT" > "$OUT/$b.build.log" 2>&1
   else
-    timeout 600 "$FID" ccompile "$f" --target "$TARGET" --cc-opt 0 --no-cache -o "$OUT/$b.$EXT" > "$OUT/$b.build.log" 2>&1
+    # on a Mac its own macOS target is a host build (CC, not zig's cross
+    # target); everywhere else `--target` cross-compiles
+    local tflag=(--target "$TARGET")
+    if [ "$HOST" = macos ] && [ "$OS" = macos ]; then tflag=(); fi
+    timeout 600 "$FID" ccompile "$f" "${tflag[@]}" --cc-opt 0 --no-cache -o "$OUT/$b.$EXT" > "$OUT/$b.build.log" 2>&1
   fi
   echo $? > "$OUT/$b.build_rc"
 }
 export -f build_one
-export FID TARGET OUT EXT REUSE NATIVE
+export FID TARGET OUT EXT REUSE NATIVE HOST OS
 # One build first: zig builds the target's libc into its cache on first use,
 # and parallel first builds race on that cache (CacheCheckFailed)
 build_one "${TESTS[0]}"

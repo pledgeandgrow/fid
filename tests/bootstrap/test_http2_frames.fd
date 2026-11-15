@@ -1,0 +1,281 @@
+// stdlib/http2 (competitive SL1): the frame layer of RFC 9113 without a
+// network. Every frame type is encoded, printed, decoded and encoded again;
+// the checks of section 6 reject bad frames with the right error code; the
+// bytes a real implementation (python-h2 4.x) sends are decoded, header
+// blocks included; and a server connection is driven by hand (no socket):
+// two requests on two streams at once, flow-controlled responses, PING,
+// and connection errors answered with GOAWAY.
+//
+// Expected output: every "round trip" line ends in "same", every "check"
+// line names the error the RFC requires.
+use http;
+use http2;
+use hpack;
+use vec;
+use string;
+use encoding;
+
+fn hex(b: Vec<i64>) -> str {
+    return hex_encode_bytes(b);
+}
+
+fn round(label: str, f: H2Frame) {
+    val bytes: Vec<i64> = h2_frame_encode(f);
+    val back: H2Frame = h2_frame_decode(bytes, 0);
+    var same: str = "DIFFERENT";
+    if back.ftype >= 0 && hex(h2_frame_encode(back)) == hex(bytes) {
+        same = "same";
+    }
+    println(label + ": " + hex(bytes));
+    println("  " + h2_frame_describe(back) + "; round trip " + same);
+}
+
+fn frames() {
+    println("preface: " + hex(h2_preface()));
+    round("DATA", h2_data_frame(1, str_bytes("hello"), true, 0));
+    round("DATA padded", h2_data_frame(3, str_bytes("hi"), false, 3));
+    var block: Vec<i64> = hex_decode_bytes("8286 8441 0f77 7777 2e65 7861 6d70 6c65 2e63 6f6d");
+    round("HEADERS", h2_headers_frame(1, block, true, true));
+    val pr: H2Priority = h2_priority(true, 3, 201);
+    round("HEADERS padded+priority", h2_headers_frame_ex(5, str_bytes("ab"), false, false, 2, true, pr));
+    round("PRIORITY", h2_priority_frame(7, h2_priority(false, 1, 16)));
+    round("RST_STREAM", h2_rst_stream_frame(1, H2_CANCEL));
+    var ids: Vec<i64> = Vec::new();
+    var vals: Vec<i64> = Vec::new();
+    ids.push(H2_SETTINGS_HEADER_TABLE_SIZE);
+    vals.push(4096);
+    ids.push(H2_SETTINGS_INITIAL_WINDOW_SIZE);
+    vals.push(65535);
+    ids.push(H2_SETTINGS_MAX_FRAME_SIZE);
+    vals.push(16384);
+    round("SETTINGS", h2_settings_frame(ids, vals));
+    round("SETTINGS ack", h2_settings_ack());
+    round("PING", h2_ping_frame(str_bytes("12345678"), false));
+    round("PING ack", h2_ping_frame(str_bytes("12345678"), true));
+    round("GOAWAY", h2_goaway_frame(7, H2_PROTOCOL_ERROR, "bad"));
+    round("WINDOW_UPDATE", h2_window_update_frame(0, 1000));
+    round("WINDOW_UPDATE stream", h2_window_update_frame(3, 2147483647));
+    round("CONTINUATION", h2_continuation_frame(5, str_bytes("cd"), true));
+    // The reserved bit of the stream id is ignored on reading (4.1)
+    val r: H2Frame = h2_frame_header(hex_decode_bytes("000000 08 00 80000003"), 0);
+    println("reserved bit dropped: stream " + int_to_str(r.stream));
+    println("incomplete header: ftype " + int_to_str(h2_frame_header(hex_decode_bytes("0000"), 0).ftype)
+        + ", incomplete payload: ftype " + int_to_str(h2_frame_decode(hex_decode_bytes("000005 00 01 00000001 6869"), 0).ftype));
+    // An unknown type is not an error (5.5)
+    println("unknown type: " + h2_frame_describe(h2_frame(250, 0, 1, str_bytes("x"))));
+}
+
+fn check(label: str, f: H2Frame) {
+    val i: H2Info = h2_parse(f);
+    var kind: str = "connection";
+    if i.stream_error {
+        kind = "stream";
+    }
+    if i.ok {
+        println("check " + label + ": accepted");
+    } else {
+        println("check " + label + ": " + kind + " error " + h2_error_name(i.error) + " (" + i.why + ")");
+    }
+}
+
+fn settings1(id: i64, v: i64) -> H2Frame {
+    var ids: Vec<i64> = Vec::new();
+    var vals: Vec<i64> = Vec::new();
+    ids.push(id);
+    vals.push(v);
+    return h2_settings_frame(ids, vals);
+}
+
+fn checks() {
+    check("DATA on stream 0", h2_data_frame(0, str_bytes("x"), false, 0));
+    check("DATA padding too long", h2_frame(H2_DATA, H2_FLAG_PADDED, 1, hex_decode_bytes("05 61 62")));
+    check("HEADERS short priority", h2_frame(H2_HEADERS, H2_FLAG_PRIORITY | H2_FLAG_END_HEADERS, 1, hex_decode_bytes("0000")));
+    check("HEADERS depends on itself", h2_headers_frame_ex(3, str_bytes("a"), false, true, 0, true,
+        h2_priority(false, 3, 16)));
+    check("PRIORITY length 4", h2_frame(H2_PRIORITY, 0, 1, hex_decode_bytes("00000000")));
+    check("PRIORITY on stream 0", h2_priority_frame(0, h2_no_priority()));
+    check("RST_STREAM length 3", h2_frame(H2_RST_STREAM, 0, 1, hex_decode_bytes("000000")));
+    check("SETTINGS on stream 1", h2_frame(H2_SETTINGS, 0, 1, Vec::new()));
+    check("SETTINGS length 5", h2_frame(H2_SETTINGS, 0, 0, hex_decode_bytes("0001000010")));
+    check("SETTINGS ack with payload", h2_frame(H2_SETTINGS, H2_FLAG_ACK, 0, hex_decode_bytes("000100001000")));
+    check("ENABLE_PUSH 2", settings1(H2_SETTINGS_ENABLE_PUSH, 2));
+    check("INITIAL_WINDOW_SIZE 2^31", settings1(H2_SETTINGS_INITIAL_WINDOW_SIZE, 2147483648));
+    check("MAX_FRAME_SIZE 100", settings1(H2_SETTINGS_MAX_FRAME_SIZE, 100));
+    check("unknown setting 99", settings1(99, 1));
+    check("PING length 7", h2_frame(H2_PING, 0, 0, str_bytes("1234567")));
+    check("PING on stream 1", h2_frame(H2_PING, 0, 1, str_bytes("12345678")));
+    check("GOAWAY length 7", h2_frame(H2_GOAWAY, 0, 0, str_bytes("1234567")));
+    check("WINDOW_UPDATE of 0 on stream 1", h2_window_update_frame(1, 0));
+    check("WINDOW_UPDATE of 0 on the connection", h2_window_update_frame(0, 0));
+    check("WINDOW_UPDATE length 5", h2_frame(H2_WINDOW_UPDATE, 0, 0, str_bytes("12345")));
+    check("CONTINUATION on stream 0", h2_continuation_frame(0, str_bytes("x"), true));
+}
+
+// Print the frames of `b` from `at`; decode header blocks with `dec`.
+fn show_frames(label: str, b: Vec<i64>, at: i64, dec: &mut Hpack) {
+    println(label + ":");
+    val fs: Vec<H2Frame> = h2_frames_decode(b, at);
+    var i: i64 = 0;
+    while i < fs.len() {
+        val f: H2Frame = fs.get(i);
+        println("  " + h2_frame_describe(f));
+        if f.ftype == H2_HEADERS {
+            val hl: HpackHeaders = hpack_decode(dec, h2_parse(f).data);
+            var k: i64 = 0;
+            while k < hl.names.len() {
+                println("    " + hl.names.get(k) + ": " + hl.vals.get(k));
+                k = k + 1;
+            }
+            if !hl.ok {
+                println("    HPACK ERROR " + hl.error);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// What python-h2 4.4.1 sends (captured from H2Connection.data_to_send()).
+fn real_bytes() {
+    val pre: Vec<i64> = hex_decode_bytes("505249202a20485454502f322e300d0a0d0a534d0d0a0d0a00002a04000000000000010000100000020000000100040000ffff000500004000000800000000000300000064000600010000");
+    var is_preface: bool = true;
+    val magic: Vec<i64> = h2_preface();
+    var i: i64 = 0;
+    while i < 24 {
+        if pre.get(i) != magic.get(i) {
+            is_preface = false;
+        }
+        i = i + 1;
+    }
+    println("python-h2 client starts with the preface: " + bool_to_str(is_preface));
+    var dec: Hpack = hpack_new(4096);
+    show_frames("python-h2 client SETTINGS", pre, 24, &mut dec);
+    show_frames("python-h2 client GET", hex_decode_bytes("0000210105000000018286418a089d5c0b8170dc780f0344886272d141ffcf30077a87afd2673d4b4e2f"), 0, &mut dec);
+    show_frames("python-h2 client POST, DATA, PING, WINDOW_UPDATE", hex_decode_bytes("00000c0104000000038386c0448460a49cff5c816f00000500010000000368656c6c6f0000080600000000003132333435363738000004080000000000000003e8"), 0, &mut dec);
+    var dec2: Hpack = hpack_new(4096);
+    show_frames("python-h2 server SETTINGS and ack", hex_decode_bytes("00002a04000000000000010000100000020000000000040000ffff000500004000000800000000000300000064000600010000000000040100000000"), 0, &mut dec2);
+}
+
+fn handler(req: HttpRequest) -> str {
+    if req.path == "/echo" {
+        return build_response(200, "text/plain", "echo: " + req.body);
+    }
+    if req.path == "/big" {
+        return build_response(200, "text/plain", "0123456789abcdefghijklmnopqrstuvwxyz");
+    }
+    return build_response(404, "text/plain", "no " + req.path + " (query " + req.query + ", host "
+        + http_header(req, "host") + ", version " + req.version + ")\n");
+}
+
+// Feed frames to a server connection and print what it answers.
+fn feed(c: &mut H2Conn, label: str, b: Vec<i64>, dec: &mut Hpack) {
+    val fs: Vec<H2Frame> = h2_frames_decode(b, 0);
+    var i: i64 = 0;
+    var alive: bool = true;
+    while i < fs.len() && alive {
+        alive = h2_process(c, fs.get(i));
+        if alive {
+            h2_server_step(c);
+        }
+        i = i + 1;
+    }
+    val out: Vec<i64> = c.out;
+    c.out = Vec::new();
+    show_frames(label + " -> server answers", out, 0, dec);
+    println("  connection ok " + bool_to_str(c.ok) + ", open streams " + int_to_str(c.streams.len())
+        + ", send window " + int_to_str(c.send_window));
+}
+
+fn server() {
+    http2_set_handler(handler);
+    var c: H2Conn = h2_conn_new(-1, false, "");
+    var dec: Hpack = hpack_new(4096);
+    h2_conn_start(&mut c);
+    val start: Vec<i64> = c.out;
+    c.out = Vec::new();
+    show_frames("server starts with", start, 0, &mut dec);
+    // A client whose streams take 10 bytes at a time
+    var enc: Hpack = hpack_new(4096);
+    var b: Vec<i64> = Vec::new();
+    h2_put_frame(&mut b, settings1(H2_SETTINGS_INITIAL_WINDOW_SIZE, 10));
+    feed(&mut c, "client SETTINGS (window 10)", b, &mut dec);
+    // Two requests at once: stream 1 a POST whose body comes in two DATA
+    // frames, interleaved with stream 3's HEADERS, a GET
+    var n1: Vec<str> = Vec::new();
+    var v1: Vec<str> = Vec::new();
+    n1.push(":method"); v1.push("POST");
+    n1.push(":scheme"); v1.push("http");
+    n1.push(":authority"); v1.push("example.org");
+    n1.push(":path"); v1.push("/echo");
+    var n2: Vec<str> = Vec::new();
+    var v2: Vec<str> = Vec::new();
+    n2.push(":method"); v2.push("GET");
+    n2.push(":scheme"); v2.push("http");
+    n2.push(":authority"); v2.push("example.org");
+    n2.push(":path"); v2.push("/big?x=1");
+    var b2: Vec<i64> = Vec::new();
+    h2_put_frame(&mut b2, h2_headers_frame(1, hpack_encode(&mut enc, n1, v1), false, true));
+    h2_put_frame(&mut b2, h2_data_frame(1, str_bytes("ping "), false, 0));
+    h2_put_frame(&mut b2, h2_headers_frame(3, hpack_encode(&mut enc, n2, v2), true, true));
+    h2_put_frame(&mut b2, h2_data_frame(1, str_bytes("pong"), true, 4));
+    feed(&mut c, "two streams", b2, &mut dec);
+    // More window: the rest of both bodies, sharing the connection
+    var b3: Vec<i64> = Vec::new();
+    h2_put_frame(&mut b3, h2_window_update_frame(1, 100));
+    h2_put_frame(&mut b3, h2_window_update_frame(3, 100));
+    feed(&mut c, "WINDOW_UPDATE 1 and 3", b3, &mut dec);
+    // A 404 split over HEADERS + CONTINUATION, and a PING
+    var n3: Vec<str> = Vec::new();
+    var v3: Vec<str> = Vec::new();
+    n3.push(":method"); v3.push("GET");
+    n3.push(":scheme"); v3.push("http");
+    n3.push(":authority"); v3.push("example.org");
+    n3.push(":path"); v3.push("/nothing?q=2");
+    val blk: Vec<i64> = hpack_encode(&mut enc, n3, v3);
+    var first: Vec<i64> = Vec::new();
+    var rest: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < blk.len() {
+        if i < 3 { first.push(blk.get(i)); } else { rest.push(blk.get(i)); }
+        i = i + 1;
+    }
+    var b4: Vec<i64> = Vec::new();
+    h2_put_frame(&mut b4, h2_settings_frame(Vec::new(), Vec::new()));
+    h2_put_frame(&mut b4, h2_headers_frame(5, first, true, false));
+    h2_put_frame(&mut b4, h2_continuation_frame(5, rest, true));
+    h2_put_frame(&mut b4, h2_ping_frame(str_bytes("abcdefgh"), false));
+    h2_put_frame(&mut b4, h2_window_update_frame(5, 100));
+    feed(&mut c, "CONTINUATION, PING", b4, &mut dec);
+    // Errors: a request without :path is a stream error; DATA on a
+    // closed stream gets RST_STREAM; a reused stream id ends the connection
+    var n5: Vec<str> = Vec::new();
+    var v5: Vec<str> = Vec::new();
+    n5.push(":method"); v5.push("GET");
+    n5.push(":scheme"); v5.push("http");
+    var b5: Vec<i64> = Vec::new();
+    h2_put_frame(&mut b5, h2_headers_frame(7, hpack_encode(&mut enc, n5, v5), true, true));
+    h2_put_frame(&mut b5, h2_data_frame(1, str_bytes("late"), true, 0));
+    h2_put_frame(&mut b5, h2_headers_frame(3, hpack_encode(&mut enc, n2, v2), true, true));
+    feed(&mut c, "errors", b5, &mut dec);
+    // A frame inside a header block is a connection error, as is a client
+    // that does not start with SETTINGS
+    var c2: H2Conn = h2_conn_new(-1, false, "");
+    var b6: Vec<i64> = Vec::new();
+    h2_put_frame(&mut b6, h2_ping_frame(Vec::new(), false));
+    var d2: Hpack = hpack_new(4096);
+    feed(&mut c2, "PING before SETTINGS", b6, &mut d2);
+    var c3: H2Conn = h2_conn_new(-1, false, "");
+    var b7: Vec<i64> = Vec::new();
+    h2_put_frame(&mut b7, settings1(H2_SETTINGS_MAX_FRAME_SIZE, 16384));
+    h2_put_frame(&mut b7, h2_headers_frame(1, str_bytes("82"), false, false));
+    h2_put_frame(&mut b7, h2_data_frame(1, str_bytes("x"), true, 0));
+    var d3: Hpack = hpack_new(4096);
+    feed(&mut c3, "DATA inside a header block", b7, &mut d3);
+}
+
+fn main() -> i64 {
+    frames();
+    checks();
+    real_bytes();
+    server();
+    return 0;
+}

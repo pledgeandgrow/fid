@@ -50,6 +50,7 @@ extern "C" {
     fn fflush as pe_c_fflush(f: i64) -> i32;
     fn strlen as pe_c_strlen(s: i64) -> i64;
     fn memcmp as pe_c_memcmp(a: i64, b: i64, n: i64) -> i32;
+    fn memchr as pe_c_memchr(p: i64, c: i32, n: i64) -> i64;
     // Machine-code primitives (pe.rs): a float travels as its bits
     fn pe_f64_to_bits(x: f64) -> i64;
     fn pe_bits_to_f64(bits: i64) -> f64;
@@ -105,6 +106,29 @@ pub fn pert_str_to_int(s: str) -> i64 {
 }
 
 /// p_str_equal for this backend: compare the lengths first, then the
+/// Core's copy, compare and byte search run msvcrt's vectorized routines
+/// (competitive roadmap OP23): string building, Vec growth and copies,
+/// `==` on byte runs and substring search no longer go a byte at a time.
+pub fn pert_mem_copy(dst: i64, src: i64, n: i64) {
+    if n > 0 { pe_c_memcpy(dst, src, n); }
+}
+
+pub fn pert_str_copy_n(dst: i64, src: i64, n: i64) {
+    if n > 0 { pe_c_memcpy(dst, src, n); }
+}
+
+pub fn pert_bytes_eq(a: i64, b: i64, n: i64) -> bool {
+    if n <= 0 { return true; }
+    return pe_c_memcmp(a, b, n) == 0;
+}
+
+pub fn pert_mem_find_byte(p: i64, n: i64, b: i64) -> i64 {
+    if n <= 0 { return -1; }
+    var r: i64 = pe_c_memchr(p, b as i32, n);
+    if r == 0 { return -1; }
+    return r - p;
+}
+
 /// memory in one msvcrt memcmp — not byte by byte (pe-roadmap item 74).
 pub fn pert_str_equal(a: i64, b: i64) -> bool {
     if a == b { return true; }
@@ -1139,4 +1163,89 @@ pub fn pert_vec_zeroize(v: i64) {
     if data != 0 && cap > 0 {
         p_memset(data, 0, cap * vec_esz(vec_code(v)));
     }
+    pert_sensitive_unmark(v);
 }
+
+// ─── J8: sensitive-Vec registry ───────────────────────────────────────────
+// Header-keyed, mirroring the C runtime: entries are (header, current
+// buffer, element size). Core's grow/drop paths check the header and wipe
+// the outgoing buffer; remark refreshes the tracked buffer after growth.
+
+var pert_sens_tab: i64 = 0;
+var pert_sens_n: i64 = 0;
+var pert_sens_wipes: i64 = 0;
+
+fn pert_sens_table() -> i64 {
+    if pert_sens_tab == 0 {
+        pert_sens_tab = p_alloc(256 * 24);
+        p_memset(pert_sens_tab, 0, 256 * 24);
+    }
+    return pert_sens_tab;
+}
+
+fn pert_sens_ld(a: i64) -> i64 {
+    var p: *mut i64 = a;
+    var v: i64 = 0;
+    unsafe { v = *p; }
+    return v;
+}
+
+fn pert_sens_st(a: i64, val: i64) {
+    var p: *mut i64 = a;
+    unsafe { *p = val; }
+}
+
+fn pert_sens_find(hdr: i64) -> i64 {
+    var t: i64 = pert_sens_table();
+    var i: i64 = 0;
+    while i < pert_sens_n {
+        if pert_sens_ld(t + i * 24) == hdr { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn pert_sensitive_mark(v: i64) {
+    if v == 0 || pert_sens_n >= 256 || pert_sens_find(v) >= 0 { return; }
+    var e: i64 = pert_sens_table() + pert_sens_n * 24;
+    pert_sens_st(e, v);
+    pert_sens_st(e + 8, pert_sens_ld(v));
+    pert_sens_st(e + 16, vec_esz(vec_code(v)));
+    pert_sens_n = pert_sens_n + 1;
+}
+
+pub fn pert_sensitive_remark(v: i64) {
+    var i: i64 = pert_sens_find(v);
+    if i < 0 { return; }
+    var e: i64 = pert_sens_table() + i * 24;
+    pert_sens_st(e + 8, pert_sens_ld(v));
+    pert_sens_st(e + 16, vec_esz(vec_code(v)));
+}
+
+pub fn pert_sensitive_check(v: i64) -> i64 {
+    if pert_sens_find(v) >= 0 { return 1; }
+    return 0;
+}
+
+pub fn pert_sensitive_unmark(v: i64) {
+    var i: i64 = pert_sens_find(v);
+    if i < 0 { return; }
+    var t: i64 = pert_sens_table();
+    var last: i64 = t + (pert_sens_n - 1) * 24;
+    var e: i64 = t + i * 24;
+    pert_sens_st(e, pert_sens_ld(last));
+    pert_sens_st(e + 8, pert_sens_ld(last + 8));
+    pert_sens_st(e + 16, pert_sens_ld(last + 16));
+    pert_sens_n = pert_sens_n - 1;
+}
+
+pub fn pert_sensitive_free(v: i64, buf: i64, cap: i64) {
+    var i: i64 = pert_sens_find(v);
+    if i < 0 || buf == 0 { return; }
+    var esz: i64 = pert_sens_ld(pert_sens_table() + i * 24 + 16);
+    if cap < 0 { cap = 0 - cap; }
+    p_memset(buf, 0, cap * esz);
+    pert_sens_wipes = pert_sens_wipes + 1;
+}
+
+pub fn pert_sensitive_wipes() -> i64 { return pert_sens_wipes; }

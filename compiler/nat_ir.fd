@@ -77,6 +77,9 @@ pub struct NatGen {
     pub e: NatEnc,
     // Name -> label: compiled (or queued) functions and the primitives
     pub fn_labels: i64,
+    // J7: function label -> 1 for @constant_time functions, so ng_ct_check
+    // can tell whether a MO_CALL target is itself constant-time
+    pub ct_labels: i64,
     // Every function of the module: name -> 1
     pub all_fns: i64,
     // Functions queued for compilation, in order
@@ -212,11 +215,16 @@ pub struct NatGen {
 pub var g_nat_lines_file: str = "";
 pub var g_nat_lines_names: str = "";
 
+/// --cpu <name> (TG10) and --stats (RA17), set by main.fd.
+pub var g_nat_cpu: str = "";
+pub var g_nat_stats: bool = false;
+
 pub fn NatGen_new(arch: i64) -> NatGen {
     var g: NatGen = NatGen {
         arch: arch,
         e: NatEnc_new(),
         fn_labels: HashMap_new(),
+        ct_labels: HashMap_new(),
         all_fns: HashMap_new(),
         queue: Vec::new(),
         queued: HashMap_new(),
@@ -313,6 +321,18 @@ pub fn NatGen_new(arch: i64) -> NatGen {
 
 fn ng_a64(g: &NatGen) -> bool {
     return g.arch == NAT_A64;
+}
+
+/// MI30: the one place that decides the code alignment of functions and
+/// loop heads per target. Loop heads align wider on x64; elsewhere the
+/// 4-byte instruction size is what the encoders already give. A loop head
+/// is only aligned when an unconditional jump or a trap precedes it, so
+/// the padding is never executed.
+const NG_ALIGN_FN: i64 = 0;
+const NG_ALIGN_LOOP: i64 = 1;
+fn ng_code_align(g: &NatGen, kind: i64) -> i64 {
+    if kind == NG_ALIGN_LOOP && ng_x64(g) { return 16; }
+    return 4;
 }
 
 // ===========================================================================
@@ -1061,6 +1081,13 @@ fn ng_meta_ty(func: &IrFunction, id: i64) -> IrType {
         OptValueMeta::Some(m) => { return m.ty; }
         OptValueMeta::None => {}
     }
+    // a parameter has no instruction: its declared type (a u64 parameter
+    // compared signed)
+    var pi: i64 = 0;
+    while pi < func.params.len() {
+        if func.params.get(pi).id == id { return func.params.get(pi).ty; }
+        pi = pi + 1;
+    }
     return IrType::I64;
 }
 
@@ -1566,6 +1593,7 @@ pub struct NatFnRec {
     pub nvreg: i64,
     pub base_frame: i64,
     pub slots: Vec<i64>,
+    pub is_ct: bool,  // J7: @constant_time — ng_ct_check scans the final MIR
 }
 
 /// A backend switch, on unless FID_NAT_OFF names it.
@@ -2692,6 +2720,44 @@ fn ng_reg_ok(g: &NatGen, r: i64, lo: i64, hi: i64, calls: &Vec<i64>, masks: &Vec
 /// computed afresh over every vreg; no definition may write a register
 /// another live value holds, and no call may clobber one that holds a live
 /// value. "" when the allocation is sound.
+/// J7: post-selection @constant_time check, the machine-layer counterpart
+/// of src/codegen_x64.rs's verify_constant_time_asm (which covers the
+/// x86-64 ELF path only; this runs on every native target, --nat Windows
+/// included). A @constant_time function may not contain, in its final MIR:
+///   a conditional branch (BNEZ/BEQZ) or a data-dependent check (PANICIF) —
+///     the condition is a function of the operands; @wrapping removes the
+///     overflow checks that would otherwise appear
+///   MO_DIV / MO_REM / float divide — variable-latency instructions
+///   an indirect call (CALLR)
+///   a call to a function that is not @constant_time itself
+/// Indexed memory is not checked: the address of a LOAD/STORE is an
+/// ordinary register by then and the MIR cannot tell whether it was derived
+/// from a secret — the source-level check rejects indexing on secrets.
+/// "" when the function is clean, else one line per violation.
+fn ng_ct_check(g: &NatGen, rec: &NatFnRec) -> str {
+    var errs: str = "";
+    var i: i64 = 0;
+    while i < rec.mir.len() {
+        var m: MInst = rec.mir.get(i);
+        var what: str = "";
+        if m.op == MO_BNEZ || m.op == MO_BEQZ { what = "conditional branch"; }
+        if m.op == MO_PANICIF { what = "data-dependent check"; }
+        if m.op == MO_DIV || m.op == MO_REM { what = "integer division (variable latency)"; }
+        if m.op == MO_FBIN && m.i0 == 4 { what = "float division (variable latency)"; }
+        if m.op == MO_CALLR { what = "indirect call"; }
+        if m.op == MO_CALL {
+            if HashMap_get(g.ct_labels, m.i0) == 0 {
+                what = "call to a function that is not @constant_time";
+            }
+        }
+        if what != "" {
+            errs = errs + "@constant_time function '" + rec.name + "': " + what + " at MIR " + int_to_str(i) + "\n";
+        }
+        i = i + 1;
+    }
+    return errs;
+}
+
 fn ng_mir_check(g: &NatGen, rec: &NatFnRec, mb: &MBlocks, al: &NatAlloc, calls: &Vec<i64>, masks: &Vec<i64>) -> str {
     var nv: i64 = rec.nvreg - NG_VBASE;
     var mir: Vec<MInst> = rec.mir;
@@ -2781,6 +2847,33 @@ fn ng_mir_check(g: &NatGen, rec: &NatFnRec, mb: &MBlocks, al: &NatAlloc, calls: 
 
 /// Emit a recorded function with its allocation: each operation through the
 /// architecture layer with physical registers.
+/// RA17: spills, reloads and moves per function (`fid emit --stats`).
+fn ng_mir_stats(rec: &NatFnRec, al: &NatAlloc) {
+    var nv: i64 = rec.nvreg - NG_VBASE;
+    var nsp: i64 = 0;
+    var nrl: i64 = 0;
+    var nmv: i64 = 0;
+    var i: i64 = 0;
+    while i < nv { if al.assign.get(i) == 0 - 1 { nsp = nsp + 1; } i = i + 1; }
+    var k: i64 = 0;
+    while k < rec.mir.len() {
+        var m: MInst = rec.mir.get(k);
+        if m.op == MO_MOV || m.op == MO_COPY { nmv = nmv + 1; }
+        var um: i64 = mi_use_mask(m.op);
+        var f: i64 = 0;
+        while f < 3 {
+            if (um & (1 << f)) != 0 {
+                var v: i64 = mi_field(m, f) - NG_VBASE;
+                if v >= 0 && v < nv && al.assign.get(v) < 0 { nrl = nrl + 1; }
+            }
+            f = f + 1;
+        }
+        k = k + 1;
+    }
+    p_eprint_str("[stats] " + rec.name + ": spilled " + int_to_str(nsp)
+        + ", reloads " + int_to_str(nrl) + ", moves " + int_to_str(nmv) + "\n");
+}
+
 fn ng_mir_emit(g: &mut NatGen, rec: &NatFnRec, al: &NatAlloc) {
     g.rec = false;
     g.save_regs = al.save_regs;
@@ -2798,6 +2891,25 @@ fn ng_mir_emit(g: &mut NatGen, rec: &NatFnRec, al: &NatAlloc) {
     var nv: i64 = rec.nvreg - NG_VBASE;
     g.x0_reg = 0 - 1;
     g.x1_reg = 0 - 1;
+    // MI30: the labels a later jump reaches back to (loop heads).
+    var heads: i64 = HashMap_new();
+    var place: i64 = HashMap_new();
+    var hp: i64 = 0;
+    while hp < rec.mir.len() {
+        var hm: MInst = rec.mir.get(hp);
+        if hm.op == MO_PLACE { HashMap_insert(place, int_to_str(hm.i0), hp); }
+        hp = hp + 1;
+    }
+    hp = 0;
+    while hp < rec.mir.len() {
+        var hm2: MInst = rec.mir.get(hp);
+        if (hm2.op == MO_JMP || hm2.op == MO_BNEZ || hm2.op == MO_BEQZ)
+            && HashMap_contains(place, int_to_str(hm2.i0))
+            && HashMap_get(place, int_to_str(hm2.i0)) < hp {
+            HashMap_insert(heads, int_to_str(hm2.i0), 1);
+        }
+        hp = hp + 1;
+    }
     var k: i64 = 0;
     while k < rec.mir.len() {
         var m: MInst = rec.mir.get(k);
@@ -2839,6 +2951,16 @@ fn ng_mir_emit(g: &mut NatGen, rec: &NatFnRec, al: &NatAlloc) {
             }
             if f == 0 { p0 = p; } else if f == 1 { p1 = p; } else { p2 = p; }
             f = f + 1;
+        }
+        if m.op == MO_PLACE && HashMap_contains(heads, int_to_str(m.i0)) {
+            // MI30: align a loop head only when the padding can never be
+            // executed — the previous emitting op (over MO_LINE) is an
+            // unconditional jump or a trap.
+            var pb: i64 = k - 1;
+            while pb >= 0 && rec.mir.get(pb).op == MO_LINE { pb = pb - 1; }
+            if pb >= 0 && (rec.mir.get(pb).op == MO_JMP || rec.mir.get(pb).op == MO_TRAP) {
+                NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_LOOP));
+            }
         }
         if m.op == MO_MOV {
             // Moves to and from slots directly
@@ -3115,13 +3237,17 @@ fn ng_mir_finish(g: &mut NatGen) -> str {
         var rec2: NatFnRec = g.recs.get(order.get(oi));
         g.cur_name = rec2.name;
         if ng_on("peep") { g.n_peep = g.n_peep + ng_peep(&mut rec2.mir); }
+        if rec2.is_ct {
+            var cterr: str = ng_ct_check(g, &rec2);
+            if cterr != "" { return "native backend: @constant_time violated: " + cterr; }
+        }
         var hix: i64 = nc_hit_at(g, rec2.name);
         if hix != 0 {
             // CS6: a cache hit — the recorded bytes replay at this offset and
             // their symbolic fixups re-register against this image's labels.
             var ent: NcEntry = g.nc_old.get(hix - 1);
             var label2: i64 = HashMap_get(g.fn_labels, rec2.name);
-            NatEnc_align(&mut g.e, 4);
+            NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
             NatEnc_place(&mut g.e, label2);
             g.placed_fns.push(rec2.name);
             var fbase: i64 = g.e.code.len();
@@ -3139,6 +3265,7 @@ fn ng_mir_finish(g: &mut NatGen) -> str {
         } else {
             var al: NatAlloc = ng_mir_alloc(g, &rec2);
             if al.err != "" { return "native backend: register allocation check failed: " + al.err; }
+            if g_nat_stats { ng_mir_stats(&rec2, &al); }
             HashMap_insert(g.fn_mask, rec2.name, al.mask);
             var label: i64 = HashMap_get(g.fn_labels, rec2.name);
             var key: str = "";
@@ -3148,7 +3275,7 @@ fn ng_mir_finish(g: &mut NatGen) -> str {
                 g.e.labels.set(label, HashMap_get(folded, key));
                 g.n_folded = g.n_folded + 1;
             } else {
-                NatEnc_align(&mut g.e, 4);
+                NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
                 NatEnc_place(&mut g.e, label);
                 if fold_on { HashMap_insert(folded, key, g.e.code.len()); }
                 g.placed_fns.push(rec2.name);
@@ -3485,7 +3612,7 @@ fn ng_gen_primitives_x64_linux(g: &mut NatGen) {
     // Signals: the handler (sig, info, uc) calls pe_on_signal(sig, info);
     // the restorer returns through rt_sigreturn (x86-64 has no vdso one)
     var sig_entry: i64 = NatEnc_label(&mut g.e);
-    NatEnc_align(&mut g.e, 4);
+    NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
     NatEnc_place(&mut g.e, sig_entry);
     if ng_has_fn(g, "pe_on_signal") {
         x64_push(&mut g.e, 5);
@@ -3500,7 +3627,7 @@ fn ng_gen_primitives_x64_linux(g: &mut NatGen) {
     ng_prim(g, "nat_sig_handler");
     x64_lea_label(&mut g.e, 7, sig_entry); x64_ret(&mut g.e);
     var restorer: i64 = NatEnc_label(&mut g.e);
-    NatEnc_align(&mut g.e, 4);
+    NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
     NatEnc_place(&mut g.e, restorer);
     x64_li(&mut g.e, 0, 15);                     // rt_sigreturn
     x64_syscall(&mut g.e);
@@ -3562,7 +3689,7 @@ fn ng_gen_primitives_x64_common(g: &mut NatGen) {
     x64_ret(&mut g.e);
     // The first switch to a task returns here: [rsp] entry, [rsp + 8] arg
     g.tramp_label = NatEnc_label(&mut g.e);
-    NatEnc_align(&mut g.e, 4);
+    NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
     NatEnc_place(&mut g.e, g.tramp_label);
     x64_load(&mut g.e, 0, 4, 0, 8, true);
     x64_load(&mut g.e, 6, 4, 8, 8, true);
@@ -4579,7 +4706,7 @@ fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModu
     // allocation); the direct path places and encodes it now
     var mir_on: bool = NG_MIR && (ng_on("mir") || ng_x64(g));
     if !mir_on {
-        NatEnc_align(&mut g.e, 4);
+        NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
         NatEnc_place(&mut g.e, HashMap_get(g.fn_labels, name));
         g.placed_fns.push(name);
     }
@@ -4747,7 +4874,9 @@ fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModu
         g.rec = false;
         // WP17: panic paths — segments containing MO_TRAP — go to the end of
         // the function's code so the hot path stays compact and contiguous.
-        g.recs.push(NatFnRec { name: name, mir: ng_cold_last(&g.mir), nvreg: g.nvreg, base_frame: base_frame, slots: g.slots });
+        var is_ct: bool = func.is_constant_time;
+        g.recs.push(NatFnRec { name: name, mir: ng_cold_last(&g.mir), nvreg: g.nvreg, base_frame: base_frame, slots: g.slots, is_ct: is_ct });
+        if is_ct { HashMap_insert(g.ct_labels, ng_fn_label(g, name), 1); }
         g.mir = Vec::new();
         g.t0 = saved_t.get(0);
         g.t1 = saved_t.get(1);
@@ -4816,7 +4945,7 @@ fn ng_gen_primitives(g: &mut NatGen) {
     var sys: i64 = NatEnc_label(&mut g.e);
     HashMap_insert(g.fn_labels, "nat_syscall", sys);
     g.fn_label_names.push("nat_syscall");
-    NatEnc_align(&mut g.e, 4);
+    NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
     NatEnc_place(&mut g.e, sys);
     if ng_a64(g) {
         a64_mov(&mut g.e, 8, 0);
@@ -4855,7 +4984,7 @@ fn ng_prim(g: &mut NatGen, name: str) -> i64 {
     var l: i64 = NatEnc_label(&mut g.e);
     HashMap_insert(g.fn_labels, name, l);
     g.fn_label_names.push(name);
-    NatEnc_align(&mut g.e, 4);
+    NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
     NatEnc_place(&mut g.e, l);
     return l;
 }
@@ -4951,7 +5080,7 @@ fn ng_gen_primitives2(g: &mut NatGen) {
     // The first switch to a new task "returns" here, with [sp] = entry and
     // [sp + 8] = its argument: entry(env 0, arg), which never returns
     g.tramp_label = NatEnc_label(&mut g.e);
-    NatEnc_align(&mut g.e, 4);
+    NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
     NatEnc_place(&mut g.e, g.tramp_label);
     if a64 {
         a64_ldr(&mut g.e, 9, A64_SP, 0);
@@ -5070,7 +5199,7 @@ fn ng_gen_primitives2(g: &mut NatGen) {
     // defines its own (ng_gen_primitives_mac).
     if !g.mac {
     var sig_entry: i64 = NatEnc_label(&mut g.e);
-    NatEnc_align(&mut g.e, 4);
+    NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
     NatEnc_place(&mut g.e, sig_entry);
     if ng_has_fn(g, "pe_on_signal") {
         var on_sig: i64 = ng_fn_label(g, "pe_on_signal");
@@ -5269,7 +5398,7 @@ fn ng_gen_panic_line_stubs(g: &mut NatGen) {
     while i + 2 < g.pl_list.len() {
         var which: i64 = g.pl_list.get(i);
         var line: i64 = g.pl_list.get(i + 1);
-        NatEnc_align(&mut g.e, 4);
+        NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
         NatEnc_place(&mut g.e, g.pl_list.get(i + 2));
         ng_panic_stub_body(g, msgs.get(which) + " at line " + int_to_str(line));
         i = i + 3;
@@ -5298,7 +5427,7 @@ fn ng_gen_panic_stubs(g: &mut NatGen) {
     var msgs: Vec<str> = nat_panic_messages();
     var i: i64 = 0;
     while i < msgs.len() {
-        NatEnc_align(&mut g.e, 4);
+        NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
         NatEnc_place(&mut g.e, g.panic_labels.get(i));
         // A frame record, so the trace walk sees the caller
         if ng_x64(g) {
@@ -5453,6 +5582,37 @@ pub fn nat_target_arch(target: str) -> i64 {
     return 0;
 }
 
+/// TG10: `--cpu <name>` per target, with safe defaults — x86-64-v3 (the
+/// runtime's fma uses FMA3), armv8.0-a, rv64gc. Instruction selection does
+/// not consult it yet beyond that baseline: accepted names are validated
+/// and recorded in `g_nat_cpu` for the selections that will.
+pub fn nat_cpu_default(arch: i64) -> str {
+    if arch == NAT_X64 { return "x86-64-v3"; }
+    if arch == NAT_A64 { return "armv8.0-a"; }
+    return "rv64gc";
+}
+
+/// "" when `cpu` is a name target `arch` accepts, an error message else.
+pub fn nat_cpu_check(arch: i64, cpu: str) -> str {
+    if cpu == "native" || cpu == "baseline" { return ""; }
+    if arch == NAT_X64 {
+        if cpu == "x86-64-v3" || cpu == "x86-64-v4" { return ""; }
+        if cpu == "x86-64-v1" || cpu == "x86-64-v2" {
+            return "--cpu " + cpu + ": not supported on x86-64 — the runtime's fma needs FMA3 (x86-64-v3)";
+        }
+        return "Unknown --cpu '" + cpu + "' for x86-64: use x86-64-v3, x86-64-v4, baseline or native";
+    }
+    if arch == NAT_A64 {
+        if cpu == "armv8.0-a" || cpu == "armv8.1-a" || cpu == "armv8.2-a" || cpu == "armv8.4-a" || cpu == "armv9-a" { return ""; }
+        return "Unknown --cpu '" + cpu + "' for AArch64: use armv8.0-a through armv9-a, baseline or native";
+    }
+    if arch == NAT_RV64 {
+        if cpu == "rv64gc" || cpu == "rv64g" || cpu == "rv64imafdc" { return ""; }
+        return "Unknown --cpu '" + cpu + "' for RISC-V 64: use rv64gc, baseline or native";
+    }
+    return "Unknown --cpu '" + cpu + "'";
+}
+
 /// A static Linux executable for `arch` from an IR module that has the
 /// Linux runtime (stdlib/linux_runtime) merged in.
 pub fn nat_generate_elf(module: IrModule, arch: i64) -> ResultBytes {
@@ -5569,7 +5729,7 @@ fn nat_generate_image(module: IrModule, arch: i64, win: bool, mac: bool) -> Resu
     p_eprint_str("[prof] native: lower " + int_to_str(t_rec - t_start) + "ms, allocate and emit "
         + int_to_str(t_emit - t_rec) + "ms, " + int_to_str(g.recs.len()) + " functions, "
         + int_to_str(g.n_folded) + " folded, " + int_to_str(g.n_peep) + " peep\n");
-    NatEnc_align(&mut g.e, 4);
+    NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
     NatEnc_place(&mut g.e, g.code_end_label);
     // Windows: the data on pages of its own (a read/execute .text, a
     // read/write .data: one RWX section looks packed to scanners)
@@ -5801,7 +5961,7 @@ fn ng_gen_primitives_win(g: &mut NatGen) {
     // A thread's start routine (Windows: rcx = its parameter):
     // pe_win_thread_main(env 0, parameter), which never returns
     var tramp: i64 = NatEnc_label(&mut g.e);
-    NatEnc_align(&mut g.e, 4);
+    NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
     NatEnc_place(&mut g.e, tramp);
     x64_li(&mut g.e, 5, 0);
     x64_mov(&mut g.e, 6, 1);
@@ -5834,7 +5994,7 @@ fn ng_gen_primitives_win(g: &mut NatGen) {
     // pe_win_on_exception(env 0, pointers): 0 continue the search, -1
     // continue execution
     var veh: i64 = NatEnc_label(&mut g.e);
-    NatEnc_align(&mut g.e, 4);
+    NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
     NatEnc_place(&mut g.e, veh);
     x64_push(&mut g.e, 5);
     x64_push(&mut g.e, 7);
@@ -6648,7 +6808,7 @@ fn nc_replay(g: &mut NatGen, e: &NcEntry) -> str {
 /// shape; allocation/emission is skipped for it.
 fn nc_skel_fn(g: &mut NatGen, name: str, ix: i64) {
     var e: NcEntry = g.nc_old.get(ix - 1);
-    var rec2: NatFnRec = NatFnRec { name: name, mir: Vec::new(), nvreg: 0, base_frame: 0, slots: Vec::new() };
+    var rec2: NatFnRec = NatFnRec { name: name, mir: Vec::new(), nvreg: 0, base_frame: 0, slots: Vec::new(), is_ct: false };
     var i: i64 = 0;
     while i < e.n_traps {
         rec2.mir.push(MInst { op: MO_TRAP, r0: 0, r1: 0, r2: 0, i0: 0, i1: 0, i2: 0 });
@@ -6823,6 +6983,10 @@ fn nc_start(g: &mut NatGen, m: &IrModule) {
 fn ng_mac_imports(x64: bool) -> Vec<str> {
     var fstatat: str = "_fstatat";
     if x64 { fstatat = "_fstatat$INODE64"; }
+    // x86-64 macOS has the 64-bit-inode directory calls under $INODE64
+    var fdopendir: str = "_fdopendir";
+    var readdir: str = "_readdir";
+    if x64 { fdopendir = "_fdopendir$INODE64"; readdir = "_readdir$INODE64"; }
     var v: Vec<str> = Vec::new();
     v.push("_write"); v.push("_read"); v.push("_close"); v.push("_exit");
     v.push("_mmap"); v.push("_munmap"); v.push("_mprotect"); v.push("_openat");
@@ -6834,6 +6998,9 @@ fn ng_mac_imports(x64: bool) -> Vec<str> {
     v.push("_mkdirat"); v.push("_renameat"); v.push("_getdirentries"); v.push("_ftruncate");
     v.push("_kill"); v.push("_sigaltstack"); v.push("_pthread_attr_init");
     v.push("_pthread_attr_setstacksize"); v.push("_pthread_attr_setdetachstate"); v.push("_abort");
+    // stdlib/linux_runtime/darwin.fd PE_M_ERROR.. (errno, directory listing)
+    v.push("___error"); v.push(fdopendir); v.push(readdir); v.push("_telldir");
+    v.push("_seekdir"); v.push("_closedir"); v.push("_dup");
     return v;
 }
 
@@ -6971,7 +7138,7 @@ fn ng_gen_primitives_mac(g: &mut NatGen) {
 
     // The pthread trampoline: pe_mac_thread_main(env0, arg)
     var tramp: i64 = NatEnc_label(&mut g.e);
-    NatEnc_align(&mut g.e, 4);
+    NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
     NatEnc_place(&mut g.e, tramp);
     if ng_x64(g) {
         x64_push(&mut g.e, 5);
@@ -7032,19 +7199,22 @@ fn ng_gen_primitives_mac(g: &mut NatGen) {
     ng_li(g, ng_argreg(g, 0), 2);
     if ng_x64(g) { x64_ret(&mut g.e); } else { a64_ret(&mut g.e); }
 
-    // The signal handler (sig, info, uctx) -> pe_on_signal(env0, sig, info);
-    // the restorer is unused on macOS (0).
+    // The signal handler (sig, info, uctx) -> pe_mac_on_signal(env0, sig,
+    // info) (darwin.fd: macOS numbers and siginfo to Linux ones), else
+    // pe_on_signal; the restorer is unused on macOS (0).
     var sig_entry: i64 = NatEnc_label(&mut g.e);
-    NatEnc_align(&mut g.e, 4);
+    NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
     NatEnc_place(&mut g.e, sig_entry);
-    if ng_has_fn(g, "pe_on_signal") {
+    var sig_fn: str = "pe_on_signal";
+    if ng_has_fn(g, "pe_mac_on_signal") { sig_fn = "pe_mac_on_signal"; }
+    if ng_has_fn(g, sig_fn) {
         if ng_x64(g) {
             x64_push(&mut g.e, 5);
             x64_mov(&mut g.e, 5, 4);
             x64_mov(&mut g.e, 2, 6);                 // rdx = info
             x64_mov(&mut g.e, 6, 7);                 // rsi = sig
             x64_li(&mut g.e, 7, 0);                  // rdi = env0
-            x64_call(&mut g.e, ng_fn_label(g, "pe_on_signal"));
+            x64_call(&mut g.e, ng_fn_label(g, sig_fn));
             x64_pop(&mut g.e, 5);
             x64_ret(&mut g.e);
         } else {
@@ -7053,7 +7223,7 @@ fn ng_gen_primitives_mac(g: &mut NatGen) {
             a64_mov(&mut g.e, 2, 1);                 // x2 = info
             a64_mov(&mut g.e, 1, 0);                 // x1 = sig
             a64_li(&mut g.e, 0, 0);                  // x0 = env0
-            a64_bl(&mut g.e, ng_fn_label(g, "pe_on_signal"));
+            a64_bl(&mut g.e, ng_fn_label(g, sig_fn));
             NatEnc_word(&mut g.e, 0xA8C17BFD);
             a64_ret(&mut g.e);
         }

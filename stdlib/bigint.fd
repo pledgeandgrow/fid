@@ -21,6 +21,12 @@ use string;
 
 /// A big integer: little-endian base-1e9 limbs + sign.
 /// Invariant: no trailing zero limbs (except the value 0 → limbs [0]).
+///
+/// Example:
+///   var a = bigint_from_str("123456789012345678901234567890");
+///   var b = bigint_mul(a, a);
+///   println(bigint_to_str(b));
+///   assert_eq(bigint_to_str(b), "15241578753238836750495351562536198787501905199875019052100");
 pub struct BigInt {
     pub limbs: Vec,   // Vec<i64>, little-endian
     pub neg: bool,
@@ -40,18 +46,30 @@ struct LimbDiv {
 
 fn bi_base() -> i64 { return 1000000000; }
 
+/// The BigInt 0.
+///
+/// Example:
+///   assert(bigint_is_zero(bigint_zero()));
 pub fn bigint_zero() -> BigInt {
     var l: Vec = Vec::new();
     l.push(0);
     return BigInt { limbs: l, neg: false };
 }
 
+/// The BigInt 1.
+///
+/// Example:
+///   assert_eq(bigint_to_i64(bigint_one()), 1);
 pub fn bigint_one() -> BigInt {
     var l: Vec = Vec::new();
     l.push(1);
     return BigInt { limbs: l, neg: false };
 }
 
+/// The BigInt holding `x`.
+///
+/// Example:
+///   assert_eq(bigint_to_str(bigint_from_i64(-42)), "-42");
 pub fn bigint_from_i64(x: i64) -> BigInt {
     var l: Vec = Vec::new();
     var neg: bool = false;
@@ -71,6 +89,10 @@ fn bi_norm(l: &mut Vec) -> void {
     while l.len() > 1 && l.get(l.len() - 1) == 0 { l.pop(); }
 }
 
+/// Whether the value is 0.
+///
+/// Example:
+///   assert(bigint_is_zero(bigint_sub(bigint_from_i64(5), bigint_from_i64(5))));
 pub fn bigint_is_zero(a: BigInt) -> bool {
     return a.limbs.len() == 1 && a.limbs.get(0) == 0;
 }
@@ -78,6 +100,10 @@ pub fn bigint_is_zero(a: BigInt) -> bool {
 // ─── Parsing / formatting ───────────────────────────────────────────────
 
 /// Parse a decimal string (optional leading '-'). Invalid input → 0.
+///
+/// Example:
+///   var n = bigint_from_str("-1000000000000");
+///   assert_eq(bigint_to_str(n), "-1000000000000");
 pub fn bigint_from_str(s: str) -> BigInt {
     var t: str = str_trim(s);
     var neg: bool = false;
@@ -102,6 +128,9 @@ pub fn bigint_from_str(s: str) -> BigInt {
 }
 
 /// Decimal string form.
+///
+/// Example:
+///   assert_eq(bigint_to_str(bigint_pow(bigint_from_i64(2), 64)), "18446744073709551616");
 pub fn bigint_to_str(a: BigInt) -> str {
     if bigint_is_zero(a) { return "0"; }
     var b: i64 = bi_base();
@@ -116,6 +145,10 @@ pub fn bigint_to_str(a: BigInt) -> str {
 }
 
 /// Hex string form ("0x..." or "-0x...").
+///
+/// Example:
+///   assert_eq(bigint_to_hex(bigint_from_i64(255)), "0xff");
+///   assert_eq(bigint_to_hex(bigint_from_i64(-16)), "-0x10");
 pub fn bigint_to_hex(a: BigInt) -> str {
     if bigint_is_zero(a) { return "0x0"; }
     var digits: str = "0123456789abcdef";
@@ -134,6 +167,9 @@ pub fn bigint_to_hex(a: BigInt) -> str {
 }
 
 /// Lossy small-int conversion (clamps into i64 range naturally via mod).
+///
+/// Example:
+///   assert_eq(bigint_to_i64(bigint_from_str("9000000000")), 9000000000);
 pub fn bigint_to_i64(a: BigInt) -> i64 {
     var v: i64 = 0;
     var b: i64 = bi_base();
@@ -164,6 +200,10 @@ fn bi_cmp_abs(a: BigInt, b: BigInt) -> i64 {
 }
 
 /// Compare a and b: -1, 0, 1.
+///
+/// Example:
+///   assert_eq(bigint_cmp(bigint_from_i64(-5), bigint_from_i64(3)), -1);
+///   assert_eq(bigint_cmp(bigint_from_i64(7), bigint_from_i64(7)), 0);
 pub fn bigint_cmp(a: BigInt, b: BigInt) -> i64 {
     if a.neg && !b.neg { if bigint_is_zero(a) && bigint_is_zero(b) { return 0; } return -1; }
     if !a.neg && b.neg { if bigint_is_zero(a) && bigint_is_zero(b) { return 0; } return 1; }
@@ -172,8 +212,20 @@ pub fn bigint_cmp(a: BigInt, b: BigInt) -> i64 {
     return c;
 }
 
+/// Whether a == b.
+///
+/// Example:
+///   assert(bigint_eq(bigint_from_str("10"), bigint_from_i64(10)));
 pub fn bigint_eq(a: BigInt, b: BigInt) -> bool { return bigint_cmp(a, b) == 0; }
+/// Whether a < b.
+///
+/// Example:
+///   assert(bigint_lt(bigint_from_i64(-1), bigint_zero()));
 pub fn bigint_lt(a: BigInt, b: BigInt) -> bool { return bigint_cmp(a, b) < 0; }
+/// Whether a > b.
+///
+/// Example:
+///   assert(bigint_gt(bigint_from_str("100000000000000000000"), bigint_from_i64(1)));
 pub fn bigint_gt(a: BigInt, b: BigInt) -> bool { return bigint_cmp(a, b) > 0; }
 
 // ─── Unsigned limb arithmetic ───────────────────────────────────────────
@@ -223,6 +275,10 @@ fn bi_sub_abs(a: Vec, b: Vec) -> Vec {
 // ─── Public arithmetic ──────────────────────────────────────────────────
 
 /// a + b
+///
+/// Example:
+///   var s = bigint_add(bigint_from_str("999999999999999999"), bigint_one());
+///   assert_eq(bigint_to_str(s), "1000000000000000000");
 pub fn bigint_add(a: BigInt, b: BigInt) -> BigInt {
     if a.neg == b.neg {
         return BigInt { limbs: bi_add_abs(a.limbs, b.limbs), neg: a.neg };
@@ -234,6 +290,9 @@ pub fn bigint_add(a: BigInt, b: BigInt) -> BigInt {
 }
 
 /// a - b
+///
+/// Example:
+///   assert_eq(bigint_to_str(bigint_sub(bigint_from_i64(3), bigint_from_i64(10))), "-7");
 pub fn bigint_sub(a: BigInt, b: BigInt) -> BigInt {
     var nb: BigInt = BigInt { limbs: b.limbs, neg: !b.neg };
     if bigint_is_zero(b) { nb.neg = false; }
@@ -241,17 +300,26 @@ pub fn bigint_sub(a: BigInt, b: BigInt) -> BigInt {
 }
 
 /// -a
+///
+/// Example:
+///   assert_eq(bigint_to_str(bigint_neg(bigint_from_i64(4))), "-4");
 pub fn bigint_neg(a: BigInt) -> BigInt {
     if bigint_is_zero(a) { return a; }
     return BigInt { limbs: a.limbs, neg: !a.neg };
 }
 
 /// |a|
+///
+/// Example:
+///   assert_eq(bigint_to_str(bigint_abs(bigint_from_i64(-4))), "4");
 pub fn bigint_abs(a: BigInt) -> BigInt {
     return BigInt { limbs: a.limbs, neg: false };
 }
 
 /// a * b (schoolbook — products stay < 10^18, safely in i64).
+///
+/// Example:
+///   assert_eq(bigint_to_str(bigint_mul(bigint_from_i64(-3), bigint_from_i64(4))), "-12");
 pub fn bigint_mul(a: BigInt, b: BigInt) -> BigInt {
     if bigint_is_zero(a) || bigint_is_zero(b) { return bigint_zero(); }
     var bse: i64 = bi_base();
@@ -286,6 +354,9 @@ pub fn bigint_mul(a: BigInt, b: BigInt) -> BigInt {
 
 /// a * small (|small| < 2^62 or so; products < 10^18 for |small| < 10^9
 /// guaranteed, larger smalls work but multiply limb-wise).
+///
+/// Example:
+///   assert_eq(bigint_to_str(bigint_mul_i64(bigint_from_str("500000000000"), 4)), "2000000000000");
 pub fn bigint_mul_i64(a: BigInt, small: i64) -> BigInt {
     if small == 0 || bigint_is_zero(a) { return bigint_zero(); }
     var s: i64 = small;
@@ -309,6 +380,9 @@ pub fn bigint_mul_i64(a: BigInt, small: i64) -> BigInt {
 }
 
 /// a + small
+///
+/// Example:
+///   assert_eq(bigint_to_str(bigint_add_i64(bigint_from_i64(1), 2)), "3");
 pub fn bigint_add_i64(a: BigInt, small: i64) -> BigInt {
     return bigint_add(a, bigint_from_i64(small));
 }
@@ -335,6 +409,11 @@ fn bi_divmod_small(u: Vec, d: i64) -> LimbDiv {
 
 /// divmod: a = q*b + r, 0 <= |r| < |b| (r takes a's sign).
 /// Division by zero → {0, 0}.
+///
+/// Example:
+///   var d = bigint_divmod(bigint_from_i64(17), bigint_from_i64(5));
+///   assert_eq(bigint_to_i64(d.q), 3);
+///   assert_eq(bigint_to_i64(d.r), 2);
 pub fn bigint_divmod(a: BigInt, b: BigInt) -> BigDiv {
     if bigint_is_zero(b) {
         return BigDiv { q: bigint_zero(), r: bigint_zero() };
@@ -446,11 +525,18 @@ pub fn bigint_divmod(a: BigInt, b: BigInt) -> BigDiv {
 }
 
 /// a / b (truncated toward zero).
+///
+/// Example:
+///   var q = bigint_div(bigint_from_str("100000000000000000000"), bigint_from_i64(7));
+///   assert_eq(bigint_to_str(q), "14285714285714285714");
 pub fn bigint_div(a: BigInt, b: BigInt) -> BigInt {
     return bigint_divmod(a, b).q;
 }
 
 /// a mod b — result takes a's sign (truncated division).
+///
+/// Example:
+///   assert_eq(bigint_to_i64(bigint_mod(bigint_from_str("100000000000000000000"), bigint_from_i64(7))), 2);
 pub fn bigint_mod(a: BigInt, b: BigInt) -> BigInt {
     return bigint_divmod(a, b).r;
 }
@@ -458,6 +544,9 @@ pub fn bigint_mod(a: BigInt, b: BigInt) -> BigInt {
 // ─── Powers ─────────────────────────────────────────────────────────────
 
 /// a^e for e >= 0 (binary exponentiation).
+///
+/// Example:
+///   assert_eq(bigint_to_str(bigint_pow(bigint_from_i64(10), 20)), "100000000000000000000");
 pub fn bigint_pow(a: BigInt, e: i64) -> BigInt {
     var base: BigInt = a;
     var exp: i64 = e;
@@ -471,6 +560,10 @@ pub fn bigint_pow(a: BigInt, e: i64) -> BigInt {
 }
 
 /// (a^e) mod m — the workhorse for RSA-style crypto.
+///
+/// Example:
+///   var r = bigint_modpow(bigint_from_i64(4), bigint_from_i64(13), bigint_from_i64(497));
+///   assert_eq(bigint_to_i64(r), 445);
 pub fn bigint_modpow(base_in: BigInt, e_in: BigInt, m: BigInt) -> BigInt {
     if bigint_is_zero(m) { return bigint_zero(); }
     var base: BigInt = bigint_mod(base_in, m);

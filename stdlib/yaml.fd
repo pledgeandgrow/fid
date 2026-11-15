@@ -1,19 +1,60 @@
 // Fides YAML standard library
 //
-// YAML parsing — the config-file subset:
-//   nested maps by indentation, lists ("- item"), scalars
-//   (quoted/plain strings, ints, floats, bools, null), comments (#),
-//   document markers (---), and inline flow values ([a, b], {k: v}).
-// Not supported: anchors/aliases, multi-line | > blocks, tags, complex keys.
+// YAML 1.2.2 (https://yaml.org/spec/1.2.2/), the subset configuration
+// files use, read into flat dotted-path entries (like toml.fd): list
+// elements get numeric path segments — "spec.containers.0.name".
 //
-// Values are stored as flat dotted-path entries (like toml.fd):
-// list elements get numeric path segments — "spec.containers.0.name".
+// Two entry points share one parser:
+//   yaml_load(text) -> YamlDoc          one document, strictly: ok = false
+//                                       and an error naming the line for
+//                                       what it rejects (see below)
+//   yaml_load_all(text) -> Vec<YamlDoc> every document of a stream
+//   yaml_parse(text) -> Vec<YamlEntry>  the lenient form older code uses:
+//                                       lines it cannot read are skipped,
+//                                       every document goes into one list
+//                                       (a repeated path: the last wins),
+//                                       and a flow collection ([a, b],
+//                                       {k: v}) is kept as one string
+//
+// Read:
+//   - block mappings and sequences by indentation, a sequence at its key's
+//     own indentation ("key:\n- a"), compact forms ("- k: v", "- - a")
+//   - flow sequences and mappings ([a, b], {k: v, k2}), nested, over
+//     several lines, with a trailing comma
+//   - plain scalars, also over several lines (folded into one); single-
+//     quoted ('' is a quote) and double-quoted scalars with every escape
+//     of YAML 1.2 (\0 \a \b \t \n \v \f \r \e \" \/ \\ \N \_ \L \P, a
+//     tab or space after \, \xXX \uXXXX \UXXXXXXXX, an escaped line
+//     break), folded when they span lines
+//   - literal (|) and folded (>) block scalars with chomping (- + or
+//     clip) and an indentation indicator (1-9)
+//   - comments (# after whitespace), "---" and "..." document markers,
+//     "%" directives (skipped), a byte order mark
+//   - anchors (&a) and aliases (*a): an alias copies the anchored node
+//   - core-schema typing: null (~ null Null NULL or nothing), bool (true
+//     True TRUE false False FALSE), int (decimal, 0o octal, 0x hex), float
+//     (1.5 1e3 .5 .inf -.inf .nan), anything else str; the tags !!str
+//     !!int !!float !!bool !!null set the kind, other tags are ignored
+// Not supported (yaml_load rejects them; yaml_parse skips the line):
+//   explicit "? " keys and other complex keys, "<<" merge keys (kept as an
+//   ordinary key), a mapping inside a flow sequence ("[a: b]"), tabs used
+//   as indentation. YAML 1.1 forms are read as YAML 1.2 reads them: yes,
+//   no, on, off and 1_000 are strings, 0777 is the decimal 777.
+// Rejected by yaml_load: a duplicate key, bad indentation, a key or "- "
+// where a scalar continues, unterminated quotes or flow collections,
+// unknown escapes, an alias with no anchor, text after a closed value.
+//
+// kind: "str" | "int" | "float" | "bool" | "null" | "map" | "list"; a
+// mapping or sequence marks its path, its children are other entries
+// under a longer path. `sval` holds a scalar as text (decoded), for an
+// int its digits as written ("0x1F" stays "0x1F": yaml_get_int reads it).
 //
 // Usage:
 //   use yaml;
-//   val doc = yaml_parse("a:\n  b: 1\n  list:\n    - x\n    - y");
-//   println(yaml_get_str(doc, "a.b"));          // "1"
-//   println(yaml_get_str(doc, "a.list.1"));     // "y"
+//   val doc = yaml_load("a:\n  b: 1\n  list: [x, y]");
+//   if !doc.ok { println(doc.error); }
+//   println(yaml_get_str(doc.entries, "a.b"));          // "1"
+//   println(yaml_get_str(doc.entries, "a.list.1"));     // "y"
 
 module yaml;
 
@@ -36,17 +77,38 @@ pub struct YamlEntry {
     pub value: YamlValue,
 }
 
-/// Stack frame while parsing: an open container.
-struct YFrame {
-    indent: i64,
-    path: str,      // path of this container ("" = root)
-    is_list: bool,
-    counter: i64,   // next list index
+/// One document: its entries, or ok = false and the error.
+pub struct YamlDoc {
+    pub ok: bool,
+    pub error: str,
+    pub entries: Vec<YamlEntry>,
+}
+
+// Parser state of one document.
+struct YP {
+    lines: Vec<str>,
+    li: i64,
+    base: i64,          // line number of lines[0] minus one
+    entries: Vec<YamlEntry>,
+    ok: bool,
+    error: str,
+    strict: bool,
+    flow: bool,
+    anames: Vec<str>,
+    apaths: Vec<str>,
 }
 
 // ─── Scalar helpers ─────────────────────────────────────────────────────
 
 fn y_is_digit(c: i64) -> bool { return c >= 48 && c <= 57; }
+fn y_is_hex(c: i64) -> bool {
+    return y_is_digit(c) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102);
+}
+
+fn y_at(s: str, j: i64) -> i64 {
+    if j < 0 || j >= str_len(s) { return -1; }
+    return str_byte_at(s, j);
+}
 
 // Find '#' starting a comment: preceded by whitespace, outside quotes.
 fn y_comment_end(s: str) -> i64 {
@@ -62,49 +124,181 @@ fn y_comment_end(s: str) -> i64 {
         } else if in_s {
             if c == 39 { in_s = false; }
         } else {
-            if c == 34 { in_d = true; }
-            else if c == 39 { in_s = true; }
-            else if c == 35 && (i == 0 || str_byte_at(s, i - 1) == 32) { return i; }
+            if c == 34 && (i == 0 || y_space_at(s, i - 1) || y_flow_ind(str_byte_at(s, i - 1))) { in_d = true; }
+            else if c == 39 && (i == 0 || y_space_at(s, i - 1) || y_flow_ind(str_byte_at(s, i - 1))) { in_s = true; }
+            else if c == 35 && (i == 0 || y_space_at(s, i - 1)) { return i; }
         }
         i = i + 1;
     }
     return n;
 }
 
-fn y_decode_quoted(s: str) -> str {
-    var n: i64 = str_len(s);
-    if n < 2 { return s; }
-    var q: i64 = str_byte_at(s, 0);
-    if q != 34 && q != 39 { return s; }
-    var body: str = str_slice(s, 1, n - 1);
-    if q == 39 {
-        // literal: '' → '
-        return str_replace(body, "''", "'");
+fn y_space_at(s: str, i: i64) -> bool {
+    var c: i64 = y_at(s, i);
+    return c == 32 || c == 9;
+}
+
+fn y_flow_ind(c: i64) -> bool {
+    return c == 91 || c == 93 || c == 123 || c == 125 || c == 44;
+}
+
+fn y_utf8(cp: i64) -> str {
+    var bytes: Vec<i64> = Vec::new();
+    if cp < 128 { bytes.push(cp); }
+    else if cp < 2048 {
+        bytes.push(192 | (cp >> 6)); bytes.push(128 | (cp & 63));
+    } else if cp < 65536 {
+        bytes.push(224 | (cp >> 12));
+        bytes.push(128 | ((cp >> 6) & 63)); bytes.push(128 | (cp & 63));
+    } else {
+        bytes.push(240 | (cp >> 18));
+        bytes.push(128 | ((cp >> 12) & 63));
+        bytes.push(128 | ((cp >> 6) & 63)); bytes.push(128 | (cp & 63));
     }
-    // basic escapes
+    return str_from_bytes(bytes);
+}
+
+fn y_hexval(c: i64) -> i64 {
+    if c <= 57 { return c - 48; }
+    if c <= 70 { return c - 55; }
+    return c - 87;
+}
+
+// Drop spaces and tabs at the end of `s`.
+fn y_rtrim_ws(s: str) -> str {
+    var e: i64 = str_len(s);
+    while e > 0 && (str_byte_at(s, e - 1) == 32 || str_byte_at(s, e - 1) == 9) { e = e - 1; }
+    return str_slice(s, 0, e);
+}
+
+// The body of a quoted scalar (between the quotes, line breaks as "\n")
+// decoded: escapes (double quotes) and line folding. "" in `bad` when
+// fine, else what is wrong.
+fn y_unquote(body: str, dq: bool, bad: &mut Vec<str>) -> str {
     var out: str = "";
     var i: i64 = 0;
-    var m: i64 = str_len(body);
-    while i < m {
+    var n: i64 = str_len(body);
+    while i < n {
         var c: i64 = str_byte_at(body, i);
-        if c == 92 && i + 1 < m {
-            var e: i64 = str_byte_at(body, i + 1);
-            if e == 110 { out = out + "\n"; }
-            else if e == 116 { out = out + "\t"; }
-            else if e == 114 { out = out + "\r"; }
-            else if e == 34 { out = out + "\""; }
-            else if e == 92 { out = out + "\\"; }
-            else if e == 48 { out = out + str_slice("\0 ", 0, 0); }
-            else { out = out + str_slice(body, i, i + 2); }
+        if c == 10 {
+            // a line break with the white space around it: one space, or
+            // one "\n" per empty line that follows
+            out = y_rtrim_ws(out);
+            var empties: i64 = 0;
             i = i + 1;
-        } else {
-            out = out + str_slice(body, i, i + 1);
+            while i < n {
+                var w: i64 = str_byte_at(body, i);
+                if w == 32 || w == 9 { i = i + 1; }
+                else if w == 10 { empties = empties + 1; i = i + 1; }
+                else { break; }
+            }
+            if empties == 0 { out = out + " "; }
+            else {
+                var k: i64 = 0;
+                while k < empties { out = out + "\n"; k = k + 1; }
+            }
+            continue;
         }
+        if !dq && c == 39 && y_at(body, i + 1) == 39 {
+            out = out + "'";
+            i = i + 2;
+            continue;
+        }
+        if dq && c == 92 && i + 1 < n {
+            var e: i64 = str_byte_at(body, i + 1);
+            var rep: str = "";
+            var used: i64 = 2;
+            var known: bool = true;
+            if e == 48 { rep = y_nul(); }
+            else if e == 97 { rep = y_utf8(7); }
+            else if e == 98 { rep = y_utf8(8); }
+            else if e == 116 || e == 9 { rep = y_utf8(9); }
+            else if e == 110 { rep = "\n"; }
+            else if e == 118 { rep = y_utf8(11); }
+            else if e == 102 { rep = y_utf8(12); }
+            else if e == 114 { rep = y_utf8(13); }
+            else if e == 101 { rep = y_utf8(27); }
+            else if e == 32 { rep = " "; }
+            else if e == 34 { rep = "\""; }
+            else if e == 47 { rep = "/"; }
+            else if e == 92 { rep = "\\"; }
+            else if e == 78 { rep = y_utf8(133); }
+            else if e == 95 { rep = y_utf8(160); }
+            else if e == 76 { rep = y_utf8(8232); }
+            else if e == 80 { rep = y_utf8(8233); }
+            else if e == 120 || e == 117 || e == 85 {
+                var digits: i64 = 2;
+                if e == 117 { digits = 4; }
+                if e == 85 { digits = 8; }
+                var cp: i64 = 0;
+                var k2: i64 = 0;
+                while k2 < digits {
+                    var h: i64 = y_at(body, i + 2 + k2);
+                    if !y_is_hex(h) { known = false; break; }
+                    cp = cp * 16 + y_hexval(h);
+                    k2 = k2 + 1;
+                }
+                if known && ((cp >= 55296 && cp <= 57343) || cp > 1114111) { known = false; }
+                if known {
+                    if cp == 0 { rep = y_nul(); } else { rep = y_utf8(cp); }
+                    used = 2 + digits;
+                }
+            }
+            else if e == 10 {
+                // escaped line break: joined without a space, leading
+                // white space of the next line dropped
+                i = i + 2;
+                while i < n && (str_byte_at(body, i) == 32 || str_byte_at(body, i) == 9) { i = i + 1; }
+                continue;
+            }
+            else { known = false; }
+            if !known {
+                if bad.len() == 0 { bad.push("invalid escape \\" + str_slice(body, i + 1, i + 2)); }
+                out = out + str_slice(body, i, i + 2);
+                i = i + 2;
+                continue;
+            }
+            out = out + rep;
+            i = i + used;
+            continue;
+        }
+        out = out + str_slice(body, i, i + 1);
         i = i + 1;
     }
     return out;
 }
 
+fn y_nul() -> str {
+    var b: Vec<i64> = Vec::new();
+    b.push(0);
+    return str_from_bytes(b);
+}
+
+// A whole quoted scalar (with its quotes, on one line) decoded.
+fn y_decode_quoted(s: str) -> str {
+    var n: i64 = str_len(s);
+    if n < 2 { return s; }
+    var q: i64 = str_byte_at(s, 0);
+    if (q != 34 && q != 39) || str_byte_at(s, n - 1) != q { return s; }
+    var bad: Vec<str> = Vec::new();
+    return y_unquote(str_slice(s, 1, n - 1), q == 34, &mut bad);
+}
+
+fn y_all(s: str, from: i64, kind: i64) -> bool {
+    // kind 10: decimal digits, 16: hex, 8: octal
+    if from >= str_len(s) { return false; }
+    var i: i64 = from;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if kind == 10 && !y_is_digit(c) { return false; }
+        if kind == 16 && !y_is_hex(c) { return false; }
+        if kind == 8 && !(c >= 48 && c <= 55) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Core-schema type of a plain scalar.
 fn y_scalar(s: str) -> YamlValue {
     var v: str = str_trim(s);
     var n: i64 = str_len(v);
@@ -122,7 +316,17 @@ fn y_scalar(s: str) -> YamlValue {
     if str_equal(v, "null") || str_equal(v, "~") || str_equal(v, "Null") || str_equal(v, "NULL") {
         return YamlValue { kind: "null", sval: "" };
     }
-    // flow sequence [a, b] — store as list entries? Keep joined scalar.
+    if str_starts_with(v, "0x") && y_all(v, 2, 16) { return YamlValue { kind: "int", sval: v }; }
+    if str_starts_with(v, "0o") && y_all(v, 2, 8) { return YamlValue { kind: "int", sval: v }; }
+    var body: str = v;
+    if c0 == 43 || c0 == 45 { body = str_slice(v, 1, n); }
+    if str_equal(body, ".inf") || str_equal(body, ".Inf") || str_equal(body, ".INF") {
+        if c0 == 45 { return YamlValue { kind: "float", sval: "-.inf" }; }
+        return YamlValue { kind: "float", sval: ".inf" };
+    }
+    if str_equal(v, ".nan") || str_equal(v, ".NaN") || str_equal(v, ".NAN") {
+        return YamlValue { kind: "float", sval: ".nan" };
+    }
     // number? [-+]? (digits [. digits?] | . digits) ([eE] [-+]? digits)?
     var i: i64 = 0;
     var is_num: bool = true;
@@ -167,135 +371,827 @@ fn y_join(prefix: str, seg: str) -> str {
     return prefix + "." + seg;
 }
 
-// ─── Parser ─────────────────────────────────────────────────────────────
-
-/// Parse YAML text into Vec<YamlEntry> in document order.
-pub fn yaml_parse(text: str) -> Vec<YamlEntry> {
-    var entries: Vec<YamlEntry> = Vec::new();
-    var stack: Vec<YFrame> = Vec::new();
-    stack.push(YFrame { indent: -1, path: "", is_list: false, counter: 0 });
-
-    var lines: Vec<str> = str_lines(text);
-    var li: i64 = 0;
-    while li < lines.len() {
-        var raw: str = lines.get(li);
-        li = li + 1;
-        var no_comment: str = str_slice(raw, 0, y_comment_end(raw));
-        var trimmed: str = str_trim(no_comment);
-        if str_len(trimmed) == 0 { continue; }
-        if str_equal(trimmed, "---") || str_equal(trimmed, "...") { continue; }
-
-        var indent: i64 = y_indent_of(no_comment);
-
-        // Pop frames deeper-or-equal to this line's content level.
-        // A list item ("-") at the same indent stays in its list frame.
-        var is_item: bool = str_starts_with(trimmed, "- ") || str_equal(trimmed, "-");
-        while stack.len() > 1 {
-            var top: YFrame = stack.get(stack.len() - 1);
-            if is_item && top.is_list && indent == top.indent { break; }
-            // "- x" lines at the same indent as their "key:" belong to the key
-            if is_item && !top.is_list && indent == top.indent && top.counter == -1 { break; }
-            if indent <= top.indent { stack.pop(); }
-            else { break; }
-        }
-        var parent: YFrame = stack.get(stack.len() - 1);
-        var base: str = parent.path;
-
-        if is_item {
-            // Ensure parent frame is a list at this indent.
-            if !parent.is_list {
-                var owner: i64 = y_find(entries, base);
-                if owner >= 0 {
-                    entries.set(owner, YamlEntry { path: base,
-                        value: YamlValue { kind: "list", sval: "" } });
-                }
-                stack.push(YFrame {
-                    indent: indent, path: base, is_list: true, counter: 0 });
-                parent = stack.get(stack.len() - 1);
-            }
-            var idx: i64 = parent.counter;
-            stack.get(stack.len() - 1).counter = idx + 1;
-            var ipath: str = y_join(base, int_to_str(idx));
-            var rest: str = str_trim(str_slice(trimmed, 1, str_len(trimmed)));
-
-            if str_len(rest) == 0 {
-                // "-\n  ..." — bare item opening a container
-                entries.push(YamlEntry { path: ipath,
-                    value: YamlValue { kind: "map", sval: "" } });
-                stack.push(YFrame { indent: indent + 1, path: ipath,
-                    is_list: false, counter: 0 });
-                continue;
-            }
-            // "- key: value" — inline map start inside the item
-            var kc: i64 = y_key_colon(rest);
-            if kc > 0 {
-                var key: str = y_decode_quoted(str_trim(str_slice(rest, 0, kc)));
-                var val: str = str_trim(str_slice(rest, kc + 1, str_len(rest)));
-                var kvpath: str = y_join(ipath, key);
-                entries.push(YamlEntry { path: ipath,
-                    value: YamlValue { kind: "map", sval: "" } });
-                if str_len(val) == 0 {
-                    entries.push(YamlEntry { path: kvpath,
-                        value: YamlValue { kind: "map", sval: "" } });
-                    stack.push(YFrame { indent: indent + 1, path: ipath,
-                        is_list: false, counter: 0 });
-                    stack.push(YFrame { indent: indent + 2, path: kvpath,
-                        is_list: false, counter: -1 });
-                } else {
-                    entries.push(YamlEntry { path: kvpath, value: y_scalar(val) });
-                    stack.push(YFrame { indent: indent + 1, path: ipath,
-                        is_list: false, counter: 0 });
-                }
-            } else {
-                entries.push(YamlEntry { path: ipath, value: y_scalar(rest) });
-            }
-            continue;
-        }
-
-        // key: or key: value
-        var cpos: i64 = y_key_colon(trimmed);
-        if cpos <= 0 { continue; }    // junk / unsupported line
-        var key2: str = y_decode_quoted(str_trim(str_slice(trimmed, 0, cpos)));
-        var val2: str = str_trim(str_slice(trimmed, cpos + 1, str_len(trimmed)));
-        var kpath: str = y_join(base, key2);
-        if str_len(val2) == 0 {
-            // opens a nested container (kind fixed by first child; map default)
-            entries.push(YamlEntry { path: kpath,
-                value: YamlValue { kind: "map", sval: "" } });
-            // counter -1 marks a frame opened by "key:" (see the pop loop)
-            stack.push(YFrame { indent: indent, path: kpath,
-                is_list: false, counter: -1 });
-        } else {
-            entries.push(YamlEntry { path: kpath, value: y_scalar(val2) });
-        }
-    }
-    return entries;
+fn y_spaces(n: i64) -> str {
+    var out: str = "";
+    var k: i64 = 0;
+    while k < n { out = out + " "; k = k + 1; }
+    return out;
 }
 
 // Position of the ':' that separates key from value (outside quotes),
 // requiring end-of-line or a following space. -1 when none.
 fn y_key_colon(s: str) -> i64 {
-    var in_d: bool = false;
-    var in_s: bool = false;
     var i: i64 = 0;
     var n: i64 = str_len(s);
-    while i < n {
-        var c: i64 = str_byte_at(s, i);
-        if in_d {
-            if c == 92 { i = i + 1; }
-            else if c == 34 { in_d = false; }
-        } else if in_s {
-            if c == 39 { in_s = false; }
-        } else {
-            if c == 34 { in_d = true; }
-            else if c == 39 { in_s = true; }
-            else if c == 58 {
-                if i + 1 >= n || str_byte_at(s, i + 1) == 32 { return i; }
+    var c0: i64 = y_at(s, 0);
+    if c0 == 34 || c0 == 39 {
+        // a quoted key: the colon must follow its closing quote
+        var j: i64 = 1;
+        while j < n {
+            var c: i64 = str_byte_at(s, j);
+            if c0 == 34 && c == 92 { j = j + 2; continue; }
+            if c == c0 {
+                if c0 == 39 && y_at(s, j + 1) == 39 { j = j + 2; continue; }
+                break;
             }
+            j = j + 1;
         }
+        i = j + 1;
+        while y_space_at(s, i) { i = i + 1; }
+        if y_at(s, i) == 58 && (i + 1 >= n || y_space_at(s, i + 1)) { return i; }
+        return -1;
+    }
+    if c0 == 91 || c0 == 123 { return -1; }
+    while i < n {
+        var c2: i64 = str_byte_at(s, i);
+        if c2 == 58 {
+            if i + 1 >= n || y_space_at(s, i + 1) { return i; }
+        }
+        if c2 == 35 && i > 0 && y_space_at(s, i - 1) { return -1; }
         i = i + 1;
     }
     return -1;
+}
+
+// ─── Parser ─────────────────────────────────────────────────────────────
+
+// Record an error; true when parsing must stop (yaml_load), false when the
+// lenient form goes on.
+fn yp_fail(p: &mut YP, msg: str) -> bool {
+    if !p.strict { return false; }
+    if p.ok {
+        p.ok = false;
+        p.error = "line " + int_to_str(p.base + p.li + 1) + ": " + msg;
+    }
+    return true;
+}
+
+fn yp_push(p: &mut YP, path: str, kind: str, sval: str) {
+    p.entries.push(YamlEntry { path: path, value: YamlValue { kind: kind, sval: sval } });
+}
+
+fn yp_line(p: &mut YP) -> str {
+    return p.lines.get(p.li);
+}
+
+// Is this line empty or only a comment?
+fn y_blank(line: str) -> bool {
+    var i: i64 = 0;
+    while i < str_len(line) && (str_byte_at(line, i) == 32 || str_byte_at(line, i) == 9) { i = i + 1; }
+    return i >= str_len(line) || str_byte_at(line, i) == 35;
+}
+
+fn yp_skip_blank(p: &mut YP) {
+    while p.li < p.lines.len() && y_blank(p.lines.get(p.li)) { p.li = p.li + 1; }
+}
+
+// Tabs before the first character are not indentation in YAML.
+fn yp_check_tabs(p: &mut YP, line: str) -> bool {
+    var i: i64 = 0;
+    while i < str_len(line) && str_byte_at(line, i) == 32 { i = i + 1; }
+    if i < str_len(line) && str_byte_at(line, i) == 9 && !y_blank(line) {
+        return yp_fail(p, "a tab cannot be used as indentation");
+    }
+    return false;
+}
+
+fn y_is_item(content: str) -> bool {
+    return str_equal(content, "-") || str_starts_with(content, "- ") || str_starts_with(content, "-\t");
+}
+
+// A node whose lines are indented more than `parent`; li at the line
+// after the one that introduced it.
+fn yp_node(p: &mut YP, path: str, parent: i64) {
+    yp_skip_blank(p);
+    if p.li >= p.lines.len() || !p.ok {
+        yp_push(p, path, "null", "");
+        return;
+    }
+    var line: str = yp_line(p);
+    if yp_check_tabs(p, line) { return; }
+    var ind: i64 = y_indent_of(line);
+    if ind <= parent {
+        yp_push(p, path, "null", "");
+        return;
+    }
+    var content: str = str_slice(line, ind, str_len(line));
+    if y_is_item(content) { yp_seq(p, path, ind); return; }
+    var nc: str = str_slice(content, 0, y_comment_end(content));
+    var c0: i64 = y_at(content, 0);
+    if c0 == 63 && (str_len(content) == 1 || y_space_at(content, 1)) {
+        if yp_fail(p, "explicit '? ' keys are not supported") { return; }
+    }
+    if y_key_colon(nc) > 0 || (c0 == 58 && y_space_at(content, 1)) { yp_map(p, path, ind); return; }
+    yp_value(p, path, content, ind, parent);
+}
+
+// A block sequence at indentation `ind`.
+fn yp_seq(p: &mut YP, path: str, ind: i64) {
+    yp_mark(p, path, "list");
+    var idx: i64 = 0;
+    while p.ok {
+        yp_skip_blank(p);
+        if p.li >= p.lines.len() { return; }
+        var line: str = yp_line(p);
+        if yp_check_tabs(p, line) { return; }
+        var li_ind: i64 = y_indent_of(line);
+        if li_ind < ind { return; }
+        var content: str = str_slice(line, li_ind, str_len(line));
+        if li_ind > ind || !y_is_item(content) {
+            if li_ind == ind {
+                if y_key_colon(str_slice(content, 0, y_comment_end(content))) > 0 { return; }
+            }
+            if yp_fail(p, "bad indentation of a sequence entry") { return; }
+            p.li = p.li + 1;
+            continue;
+        }
+        var ipath: str = y_join(path, int_to_str(idx));
+        idx = idx + 1;
+        var rest: str = str_slice(content, 1, str_len(content));
+        var lead: i64 = 0;
+        while lead < str_len(rest) && (str_byte_at(rest, lead) == 32 || str_byte_at(rest, lead) == 9) { lead = lead + 1; }
+        rest = str_slice(rest, lead, str_len(rest));
+        if y_blank(rest) {
+            p.li = p.li + 1;
+            yp_node(p, ipath, ind);
+            continue;
+        }
+        // the item's content starts at its own column: read it as if it
+        // began a line there ("- k: v" is a mapping at that column)
+        p.lines.set(p.li, y_spaces(ind + 1 + lead) + rest);
+        yp_node(p, ipath, ind);
+    }
+}
+
+// Set the kind of the container at `path` (the entry just pushed for it,
+// or a new one).
+fn yp_mark(p: &mut YP, path: str, kind: str) {
+    var n: i64 = p.entries.len();
+    if n > 0 && str_equal(p.entries.get(n - 1).path, path) && str_equal(p.entries.get(n - 1).value.kind, "null")
+       && !str_equal(path, "") {
+        p.entries.set(n - 1, YamlEntry { path: path, value: YamlValue { kind: kind, sval: "" } });
+        return;
+    }
+    if str_len(path) > 0 { yp_push(p, path, kind, ""); }
+}
+
+fn yp_has_key(p: &mut YP, path: str, from: i64) -> bool {
+    var i: i64 = from;
+    while i < p.entries.len() {
+        if str_equal(p.entries.get(i).path, path) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// A block mapping at indentation `ind`.
+fn yp_map(p: &mut YP, path: str, ind: i64) {
+    yp_mark(p, path, "map");
+    var start: i64 = p.entries.len();
+    while p.ok {
+        yp_skip_blank(p);
+        if p.li >= p.lines.len() { return; }
+        var line: str = yp_line(p);
+        if yp_check_tabs(p, line) { return; }
+        var li_ind: i64 = y_indent_of(line);
+        if li_ind < ind { return; }
+        var content: str = str_slice(line, li_ind, str_len(line));
+        if li_ind == ind && y_is_item(content) { return; }
+        var nc: str = str_slice(content, 0, y_comment_end(content));
+        var kc: i64 = y_key_colon(nc);
+        if li_ind > ind || kc <= 0 {
+            var msg: str = "expected a key ('key: value')";
+            if li_ind > ind { msg = "bad indentation of a mapping entry"; }
+            if str_starts_with(content, "? ") || str_equal(nc, "?") { msg = "explicit '? ' keys are not supported"; }
+            if yp_fail(p, msg) { return; }
+            p.li = p.li + 1;
+            continue;
+        }
+        var key: str = y_decode_quoted(str_trim(str_slice(nc, 0, kc)));
+        var kpath: str = y_join(path, key);
+        if p.strict && yp_has_key(p, kpath, start) {
+            if yp_fail(p, "duplicate key '" + key + "'") { return; }
+        }
+        var rest: str = str_slice(content, kc + 1, str_len(content));
+        var lead: i64 = 0;
+        while lead < str_len(rest) && (str_byte_at(rest, lead) == 32 || str_byte_at(rest, lead) == 9) { lead = lead + 1; }
+        rest = str_slice(rest, lead, str_len(rest));
+        if y_blank(rest) {
+            p.li = p.li + 1;
+            yp_skip_blank(p);
+            if p.li < p.lines.len() {
+                var nl: str = yp_line(p);
+                var ni: i64 = y_indent_of(nl);
+                if ni == ind && y_is_item(str_slice(nl, ni, str_len(nl))) {
+                    yp_seq(p, kpath, ind);
+                    continue;
+                }
+            }
+            yp_node(p, kpath, ind);
+            continue;
+        }
+        yp_value(p, kpath, rest, li_ind + kc + 1 + lead, ind);
+    }
+}
+
+// Take an anchor (&a) or tag (!t) in front of `text`: [what, rest].
+fn y_prop(text: str, out: &mut Vec<str>) {
+    var j: i64 = 1;
+    while j < str_len(text) && !y_space_at(text, j) { j = j + 1; }
+    out.push(str_slice(text, 1, j));
+    while j < str_len(text) && y_space_at(text, j) { j = j + 1; }
+    out.push(str_slice(text, j, str_len(text)));
+}
+
+// Copy what anchor `name` holds to `path`.
+fn yp_alias(p: &mut YP, path: str, name: str) {
+    var k: i64 = p.anames.len() - 1;
+    while k >= 0 && !str_equal(p.anames.get(k), name) { k = k - 1; }
+    if k < 0 {
+        if yp_fail(p, "alias '*" + name + "' has no anchor") { return; }
+        yp_push(p, path, "null", "");
+        return;
+    }
+    var src: str = p.apaths.get(k);
+    var n: i64 = p.entries.len();
+    var i: i64 = 0;
+    var found: bool = false;
+    while i < n {
+        var e: YamlEntry = p.entries.get(i);
+        if str_equal(e.path, src) {
+            yp_push(p, path, e.value.kind, e.value.sval);
+            found = true;
+        } else if str_starts_with(e.path, src + ".") || str_equal(src, "") {
+            var rest: str = e.path;
+            if str_len(src) > 0 { rest = str_slice(e.path, str_len(src) + 1, str_len(e.path)); }
+            yp_push(p, y_join(path, rest), e.value.kind, e.value.sval);
+        }
+        i = i + 1;
+    }
+    if !found && str_len(src) > 0 { yp_push(p, path, "null", ""); }
+}
+
+// The value `text` (the rest of the current line from column `col`) of a
+// node at `path` whose parent has indentation `parent`.
+fn yp_value(p: &mut YP, path: str, text: str, col: i64, parent: i64) {
+    var t: str = text;
+    var tag: str = "";
+    // properties: &anchor and !tag, in either order
+    var guard: i64 = 0;
+    while guard < 2 && (y_at(t, 0) == 38 || y_at(t, 0) == 33) {
+        var pr: Vec<str> = Vec::new();
+        y_prop(t, &mut pr);
+        if y_at(t, 0) == 38 {
+            p.anames.push(pr.get(0));
+            p.apaths.push(path);
+        } else {
+            tag = pr.get(0);
+        }
+        t = pr.get(1);
+        guard = guard + 1;
+    }
+    if y_blank(t) {
+        // the node itself is on the next lines
+        p.li = p.li + 1;
+        var mark: i64 = p.entries.len();
+        yp_node(p, path, parent);
+        yp_tag(p, mark, tag);
+        return;
+    }
+    var c0: i64 = y_at(t, 0);
+    if c0 == 42 {
+        var al: Vec<str> = Vec::new();
+        y_prop(t, &mut al);
+        if !y_blank(al.get(1)) {
+            if yp_fail(p, "text after an alias") { return; }
+        }
+        yp_alias(p, path, al.get(0));
+        p.li = p.li + 1;
+        return;
+    }
+    var mark2: i64 = p.entries.len();
+    if c0 == 124 || c0 == 62 {
+        yp_block(p, path, t, parent);
+    } else if (c0 == 91 || c0 == 123) && p.flow {
+        yp_flow_value(p, path, t);
+    } else if c0 == 34 || c0 == 39 {
+        yp_quoted(p, path, t);
+    } else {
+        yp_plain(p, path, t, parent);
+    }
+    yp_tag(p, mark2, tag);
+}
+
+// A core tag on the entry made at `mark`.
+fn yp_tag(p: &mut YP, mark: i64, tag: str) {
+    if str_len(tag) == 0 || mark >= p.entries.len() { return; }
+    var e: YamlEntry = p.entries.get(mark);
+    var kind: str = "";
+    if str_equal(tag, "!!str") { kind = "str"; }
+    else if str_equal(tag, "!!int") { kind = "int"; }
+    else if str_equal(tag, "!!float") { kind = "float"; }
+    else if str_equal(tag, "!!bool") { kind = "bool"; }
+    else if str_equal(tag, "!!null") { kind = "null"; }
+    if str_len(kind) == 0 || str_equal(e.value.kind, "map") || str_equal(e.value.kind, "list") { return; }
+    p.entries.set(mark, YamlEntry { path: e.path, value: YamlValue { kind: kind, sval: e.value.sval } });
+}
+
+// A plain scalar starting with `t` on the current line; lines after it
+// indented more than `parent` continue it.
+fn yp_plain(p: &mut YP, path: str, t: str, parent: i64) {
+    var first: str = str_trim(str_slice(t, 0, y_comment_end(t)));
+    var had_comment: bool = y_comment_end(t) < str_len(t);
+    var value: str = first;
+    if y_key_colon(first) > 0 {
+        if yp_fail(p, "a mapping value cannot start on the line of its key") { return; }
+    }
+    p.li = p.li + 1;
+    var empties: i64 = 0;
+    while p.li < p.lines.len() && !had_comment {
+        var line: str = yp_line(p);
+        var tl: str = str_trim(line);
+        if str_len(tl) == 0 { empties = empties + 1; p.li = p.li + 1; continue; }
+        var ind: i64 = y_indent_of(line);
+        if ind <= parent || str_byte_at(tl, 0) == 35 { break; }
+        var nc: str = str_slice(tl, 0, y_comment_end(tl));
+        if y_key_colon(nc) > 0 || y_is_item(tl) {
+            if yp_fail(p, "a key or '- ' cannot continue a plain scalar") { return; }
+            break;
+        }
+        if empties == 0 { value = value + " "; }
+        else {
+            var k: i64 = 0;
+            while k < empties { value = value + "\n"; k = k + 1; }
+        }
+        empties = 0;
+        value = value + str_trim(nc);
+        if y_comment_end(tl) < str_len(tl) { had_comment = true; }
+        p.li = p.li + 1;
+    }
+    var v: YamlValue = y_scalar(value);
+    yp_push(p, path, v.kind, v.sval);
+}
+
+// A quoted scalar starting at `t`; it may span lines.
+fn yp_quoted(p: &mut YP, path: str, t: str) {
+    var q: i64 = str_byte_at(t, 0);
+    var body: str = "";
+    var cur: str = t;
+    var j: i64 = 1;
+    var closed: i64 = -1;
+    while true {
+        var n: i64 = str_len(cur);
+        while j < n {
+            var c: i64 = str_byte_at(cur, j);
+            if q == 34 && c == 92 { j = j + 2; continue; }
+            if c == q {
+                if q == 39 && y_at(cur, j + 1) == 39 { j = j + 2; continue; }
+                closed = j;
+                break;
+            }
+            j = j + 1;
+        }
+        if closed >= 0 { break; }
+        p.li = p.li + 1;
+        if p.li >= p.lines.len() {
+            p.li = p.li - 1;
+            if yp_fail(p, "unterminated quoted scalar") { return; }
+            yp_push(p, path, "str", str_slice(cur, 1, str_len(cur)));
+            p.li = p.li + 1;
+            return;
+        }
+        cur = cur + "\n" + yp_line(p);
+    }
+    body = str_slice(cur, 1, closed);
+    var after: str = str_slice(cur, closed + 1, str_len(cur));
+    if !y_blank(after) {
+        if yp_fail(p, "text after a quoted scalar") { return; }
+    }
+    var bad: Vec<str> = Vec::new();
+    var v: str = y_unquote(body, q == 34, &mut bad);
+    if bad.len() > 0 {
+        if yp_fail(p, bad.get(0)) { return; }
+    }
+    yp_push(p, path, "str", v);
+    p.li = p.li + 1;
+}
+
+// A literal or folded block scalar; `header` is "|", ">-", "|2+" ...
+fn yp_block(p: &mut YP, path: str, header: str, parent: i64) {
+    var folded: bool = str_byte_at(header, 0) == 62;
+    var chomp: i64 = 0;              // -1 strip, 0 clip, 1 keep
+    var explicit: i64 = 0;
+    var h: str = str_slice(header, 0, y_comment_end(header));
+    h = str_trim(h);
+    var k: i64 = 1;
+    while k < str_len(h) {
+        var c: i64 = str_byte_at(h, k);
+        if c == 45 { chomp = -1; }
+        else if c == 43 { chomp = 1; }
+        else if c >= 49 && c <= 57 { explicit = c - 48; }
+        else {
+            if yp_fail(p, "invalid block scalar header") { return; }
+        }
+        k = k + 1;
+    }
+    p.li = p.li + 1;
+    var base: i64 = parent;
+    if base < 0 { base = -1; }
+    var cind: i64 = -1;
+    if explicit > 0 { cind = base + explicit; if parent < 0 { cind = explicit - 1; } }
+    var lines: Vec<str> = Vec::new();
+    while p.li < p.lines.len() {
+        var line: str = yp_line(p);
+        var ind: i64 = y_indent_of(line);
+        var empty: bool = ind >= str_len(line);
+        if !empty && cind < 0 {
+            if ind <= parent { break; }
+            cind = ind;
+        }
+        if !empty && ind < cind { break; }
+        if empty {
+            if cind >= 0 && str_len(line) > cind { lines.push(str_slice(line, cind, str_len(line))); }
+            else { lines.push(""); }
+        } else {
+            lines.push(str_slice(line, cind, str_len(line)));
+        }
+        p.li = p.li + 1;
+    }
+    // trailing empty lines
+    var last: i64 = lines.len();
+    while last > 0 && str_len(lines.get(last - 1)) == 0 { last = last - 1; }
+    var trailing: i64 = lines.len() - last;
+    var body: str = "";
+    if folded {
+        var prev: i64 = 0;          // 0 none, 1 normal, 2 more indented
+        var pend: i64 = 0;
+        var i: i64 = 0;
+        while i < last {
+            var l: str = lines.get(i);
+            if str_len(l) == 0 { pend = pend + 1; i = i + 1; continue; }
+            var kind: i64 = 1;
+            if str_byte_at(l, 0) == 32 || str_byte_at(l, 0) == 9 { kind = 2; }
+            if prev == 0 {
+                body = body + y_newlines(pend) + l;
+            } else if prev == 1 && kind == 1 {
+                if pend == 0 { body = body + " " + l; } else { body = body + y_newlines(pend) + l; }
+            } else {
+                body = body + "\n" + y_newlines(pend) + l;
+            }
+            pend = 0;
+            prev = kind;
+            i = i + 1;
+        }
+    } else {
+        var i2: i64 = 0;
+        while i2 < last {
+            if i2 > 0 { body = body + "\n"; }
+            body = body + lines.get(i2);
+            i2 = i2 + 1;
+        }
+    }
+    if last > 0 {
+        if chomp >= 0 { body = body + "\n"; }
+        if chomp == 1 { body = body + y_newlines(trailing); }
+    } else if chomp == 1 {
+        body = y_newlines(trailing);
+    }
+    yp_push(p, path, "str", body);
+}
+
+fn y_newlines(n: i64) -> str {
+    var out: str = "";
+    var k: i64 = 0;
+    while k < n { out = out + "\n"; k = k + 1; }
+    return out;
+}
+
+// ─── Flow collections ───────────────────────────────────────────────────
+
+// Gather a flow collection starting at `t` (more lines while brackets are
+// open) and read it.
+fn yp_flow_value(p: &mut YP, path: str, t: str) {
+    var text: str = t;
+    var depth: i64 = 0;
+    var j: i64 = 0;
+    var in_q: i64 = 0;
+    var end: i64 = -1;
+    while true {
+        var n: i64 = str_len(text);
+        while j < n {
+            var c: i64 = str_byte_at(text, j);
+            if in_q != 0 {
+                if in_q == 34 && c == 92 { j = j + 2; continue; }
+                if c == in_q {
+                    if in_q == 39 && y_at(text, j + 1) == 39 { j = j + 2; continue; }
+                    in_q = 0;
+                }
+            } else if c == 34 || c == 39 {
+                in_q = c;
+            } else if c == 35 && j > 0 && y_space_at(text, j - 1) {
+                // a comment: drop the rest of this line
+                var e: i64 = j;
+                while e < n && str_byte_at(text, e) != 10 { e = e + 1; }
+                text = str_slice(text, 0, j) + str_slice(text, e, n);
+                n = str_len(text);
+                continue;
+            } else if c == 91 || c == 123 {
+                depth = depth + 1;
+            } else if c == 93 || c == 125 {
+                depth = depth - 1;
+                if depth == 0 { end = j + 1; break; }
+            }
+            j = j + 1;
+        }
+        if end >= 0 { break; }
+        p.li = p.li + 1;
+        if p.li >= p.lines.len() {
+            p.li = p.li - 1;
+            if yp_fail(p, "unterminated flow collection") { return; }
+            yp_push(p, path, "str", t);
+            p.li = p.li + 1;
+            return;
+        }
+        text = text + "\n" + yp_line(p);
+    }
+    var after: str = str_slice(text, end, str_len(text));
+    if !y_blank(after) {
+        if yp_fail(p, "text after a flow collection") { return; }
+    }
+    var r: i64 = yf_value(p, str_slice(text, 0, end), 0, path);
+    p.li = p.li + 1;
+    if r < 0 { return; }
+}
+
+fn yf_ws(s: str, i: i64) -> i64 {
+    var j: i64 = i;
+    while true {
+        var c: i64 = y_at(s, j);
+        if c == 32 || c == 9 || c == 10 || c == 13 { j = j + 1; } else { return j; }
+    }
+    return j;
+}
+
+// A flow node at i in `s`; returns the position after it, or -1.
+fn yf_value(p: &mut YP, s: str, i: i64, path: str) -> i64 {
+    var j: i64 = yf_ws(s, i);
+    var c: i64 = y_at(s, j);
+    if c == 38 || c == 33 {
+        var k: i64 = j;
+        while k < str_len(s) && !y_space_at(s, k) && y_at(s, k) != 10 && !y_flow_ind(y_at(s, k)) { k = k + 1; }
+        var nm: str = str_slice(s, j + 1, k);
+        if c == 38 { p.anames.push(nm); p.apaths.push(path); }
+        var mark: i64 = p.entries.len();
+        var r0: i64 = yf_value(p, s, k, path);
+        if c == 33 { yp_tag(p, mark, "!" + nm); }
+        return r0;
+    }
+    if c == 42 {
+        var k2: i64 = j + 1;
+        while k2 < str_len(s) && !y_space_at(s, k2) && y_at(s, k2) != 10 && !y_flow_ind(y_at(s, k2)) { k2 = k2 + 1; }
+        yp_alias(p, path, str_slice(s, j + 1, k2));
+        return k2;
+    }
+    if c == 91 {
+        yp_push(p, path, "list", "");
+        var idx: i64 = 0;
+        j = j + 1;
+        while true {
+            j = yf_ws(s, j);
+            if y_at(s, j) == 93 { return j + 1; }
+            if y_at(s, j) == 44 { if yp_fail(p, "unexpected ',' in a flow sequence") { return -1; } j = j + 1; continue; }
+            j = yf_value(p, s, j, y_join(path, int_to_str(idx)));
+            if j < 0 { return -1; }
+            idx = idx + 1;
+            j = yf_ws(s, j);
+            var d: i64 = y_at(s, j);
+            if d == 44 { j = j + 1; continue; }
+            if d == 93 { return j + 1; }
+            if d == 58 {
+                if yp_fail(p, "a mapping inside a flow sequence is not supported") { return -1; }
+            } else {
+                if yp_fail(p, "expected ',' or ']' in a flow sequence") { return -1; }
+            }
+            return str_len(s);
+        }
+    }
+    if c == 123 {
+        yp_push(p, path, "map", "");
+        var start: i64 = p.entries.len();
+        j = j + 1;
+        while true {
+            j = yf_ws(s, j);
+            if y_at(s, j) == 125 { return j + 1; }
+            // key
+            var key: str = "";
+            var kc: i64 = y_at(s, j);
+            if kc == 34 || kc == 39 {
+                var e: i64 = yf_quoted_end(s, j);
+                if e < 0 { if yp_fail(p, "unterminated quoted key") { return -1; } return str_len(s); }
+                var bad: Vec<str> = Vec::new();
+                key = y_unquote(str_slice(s, j + 1, e - 1), kc == 34, &mut bad);
+                j = e;
+            } else {
+                var e2: i64 = j;
+                while e2 < str_len(s) {
+                    var ch: i64 = str_byte_at(s, e2);
+                    if ch == 44 || ch == 125 || ch == 123 || ch == 91 || ch == 93 { break; }
+                    if ch == 58 && (y_space_at(s, e2 + 1) || y_at(s, e2 + 1) == 10 || y_flow_ind(y_at(s, e2 + 1)) || e2 + 1 >= str_len(s)) { break; }
+                    e2 = e2 + 1;
+                }
+                key = str_trim(str_slice(s, j, e2));
+                j = e2;
+            }
+            var kpath: str = y_join(path, key);
+            if p.strict && yp_has_key(p, kpath, start) {
+                if yp_fail(p, "duplicate key '" + key + "'") { return -1; }
+            }
+            j = yf_ws(s, j);
+            if y_at(s, j) == 58 {
+                j = yf_ws(s, j + 1);
+                if y_at(s, j) == 44 || y_at(s, j) == 125 { yp_push(p, kpath, "null", ""); }
+                else {
+                    j = yf_value(p, s, j, kpath);
+                    if j < 0 { return -1; }
+                }
+            } else {
+                yp_push(p, kpath, "null", "");
+            }
+            j = yf_ws(s, j);
+            var d2: i64 = y_at(s, j);
+            if d2 == 44 { j = j + 1; continue; }
+            if d2 == 125 { return j + 1; }
+            if yp_fail(p, "expected ',' or '}' in a flow mapping") { return -1; }
+            return str_len(s);
+        }
+    }
+    if c == 34 || c == 39 {
+        var e3: i64 = yf_quoted_end(s, j);
+        if e3 < 0 { if yp_fail(p, "unterminated quoted scalar") { return -1; } return str_len(s); }
+        var bad2: Vec<str> = Vec::new();
+        var v: str = y_unquote(str_slice(s, j + 1, e3 - 1), c == 34, &mut bad2);
+        if bad2.len() > 0 { if yp_fail(p, bad2.get(0)) { return -1; } }
+        yp_push(p, path, "str", v);
+        return e3;
+    }
+    // plain scalar: up to , ] } or ": "
+    var e4: i64 = j;
+    while e4 < str_len(s) {
+        var ch2: i64 = str_byte_at(s, e4);
+        if ch2 == 44 || ch2 == 93 || ch2 == 125 || ch2 == 91 || ch2 == 123 { break; }
+        if ch2 == 58 && (y_space_at(s, e4 + 1) || y_at(s, e4 + 1) == 10 || y_flow_ind(y_at(s, e4 + 1))) { break; }
+        e4 = e4 + 1;
+    }
+    var raw: str = str_slice(s, j, e4);
+    // folded over lines
+    var parts: Vec<str> = str_split(raw, "\n");
+    var text: str = "";
+    var k3: i64 = 0;
+    while k3 < parts.len() {
+        var part: str = str_trim(parts.get(k3));
+        if str_len(part) > 0 {
+            if str_len(text) > 0 { text = text + " "; }
+            text = text + part;
+        }
+        k3 = k3 + 1;
+    }
+    var sv: YamlValue = y_scalar(text);
+    yp_push(p, path, sv.kind, sv.sval);
+    return e4;
+}
+
+// End (after the closing quote) of the quoted scalar at i, or -1.
+fn yf_quoted_end(s: str, i: i64) -> i64 {
+    var q: i64 = str_byte_at(s, i);
+    var j: i64 = i + 1;
+    while j < str_len(s) {
+        var c: i64 = str_byte_at(s, j);
+        if q == 34 && c == 92 { j = j + 2; continue; }
+        if c == q {
+            if q == 39 && y_at(s, j + 1) == 39 { j = j + 2; continue; }
+            return j + 1;
+        }
+        j = j + 1;
+    }
+    return -1;
+}
+
+// ─── Documents ──────────────────────────────────────────────────────────
+
+fn y_marker(line: str, m: str) -> bool {
+    if !str_starts_with(line, m) { return false; }
+    return str_len(line) == 3 || y_space_at(line, 3);
+}
+
+fn y_parse_doc(lines: Vec<str>, base: i64, strict: bool, flow: bool) -> YamlDoc {
+    var p: YP = YP { lines: lines, li: 0, base: base, entries: Vec::new(), ok: true, error: "",
+        strict: strict, flow: flow, anames: Vec::new(), apaths: Vec::new() };
+    yp_skip_blank(&mut p);
+    if p.li < p.lines.len() {
+        yp_node(&mut p, "", -1);
+        if p.ok {
+            yp_skip_blank(&mut p);
+            if p.li < p.lines.len() {
+                yp_fail(&mut p, "unexpected text after the document's root node");
+            }
+        }
+        // the lenient form reads what follows as more of the root
+        while !p.strict && p.li < p.lines.len() {
+            yp_node(&mut p, "", -1);
+            yp_skip_blank(&mut p);
+        }
+    }
+    // a root scalar has path "": drop a null one (an empty document)
+    if p.entries.len() == 1 && str_equal(p.entries.get(0).path, "") && str_equal(p.entries.get(0).value.kind, "null") {
+        p.entries.pop();
+    }
+    return YamlDoc { ok: p.ok, error: p.error, entries: p.entries };
+}
+
+// Split a stream into documents and parse each.
+fn y_stream(text: str, strict: bool, flow: bool) -> Vec<YamlDoc> {
+    var docs: Vec<YamlDoc> = Vec::new();
+    var all: Vec<str> = str_lines(text);
+    var cur: Vec<str> = Vec::new();
+    var base: i64 = 0;
+    var started: bool = false;     // an explicit "---" or content seen
+    var i: i64 = 0;
+    while i < all.len() {
+        var line: str = all.get(i);
+        if str_ends_with(line, "\r") { line = str_slice(line, 0, str_len(line) - 1); }
+        if i == 0 && str_len(line) >= 3 && str_byte_at(line, 0) == 239 && str_byte_at(line, 1) == 187 && str_byte_at(line, 2) == 191 {
+            line = str_slice(line, 3, str_len(line));
+        }
+        if y_marker(line, "---") {
+            if started { docs.push(y_parse_doc(cur, base, strict, flow)); }
+            cur = Vec::new();
+            base = i;
+            started = true;
+            cur.push("   " + str_slice(line, 3, str_len(line)));
+            i = i + 1;
+            continue;
+        }
+        if y_marker(line, "...") {
+            if started { docs.push(y_parse_doc(cur, base, strict, flow)); }
+            cur = Vec::new();
+            base = i + 1;
+            started = false;
+            i = i + 1;
+            continue;
+        }
+        if !started && str_starts_with(line, "%") {
+            i = i + 1;
+            base = i;
+            continue;
+        }
+        if !started && !y_blank(line) { started = true; }
+        if !started && cur.len() == 0 { base = i; }
+        cur.push(line);
+        i = i + 1;
+    }
+    if started { docs.push(y_parse_doc(cur, base, strict, flow)); }
+    return docs;
+}
+
+/// Every document of a YAML stream, strictly (see the module header).
+pub fn yaml_load_all(text: str) -> Vec<YamlDoc> {
+    return y_stream(text, true, true);
+}
+
+/// One YAML document, strictly; an empty text gives no entries. A stream
+/// of more than one document is an error (use yaml_load_all).
+pub fn yaml_load(text: str) -> YamlDoc {
+    var docs: Vec<YamlDoc> = y_stream(text, true, true);
+    if docs.len() == 0 { return YamlDoc { ok: true, error: "", entries: Vec::new() }; }
+    var d: YamlDoc = docs.get(0);
+    if !d.ok { return d; }
+    var k: i64 = 1;
+    while k < docs.len() {
+        if !docs.get(k).ok { return docs.get(k); }
+        k = k + 1;
+    }
+    if docs.len() > 1 {
+        return YamlDoc { ok: false, error: "the stream holds " + int_to_str(docs.len()) + " documents (use yaml_load_all)", entries: d.entries };
+    }
+    return d;
+}
+
+/// Parse YAML text into Vec<YamlEntry> in document order, leniently (see
+/// the module header): all documents together, flow collections as text.
+pub fn yaml_parse(text: str) -> Vec<YamlEntry> {
+    var docs: Vec<YamlDoc> = y_stream(text, false, false);
+    var entries: Vec<YamlEntry> = Vec::new();
+    var k: i64 = 0;
+    while k < docs.len() {
+        var es: Vec<YamlEntry> = docs.get(k).entries;
+        var i: i64 = 0;
+        while i < es.len() {
+            entries.push(es.get(i));
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    return entries;
 }
 
 // ─── Accessors ──────────────────────────────────────────────────────────
@@ -329,15 +1225,31 @@ pub fn yaml_get_str(doc: Vec<YamlEntry>, path: str) -> str {
     return yaml_get(doc, path).sval;
 }
 
+/// Int at `path` (decimal, 0o octal or 0x hex), `default` when absent or
+/// not an int.
 pub fn yaml_get_int(doc: Vec<YamlEntry>, path: str, default: i64) -> i64 {
     var v: YamlValue = yaml_get(doc, path);
-    if str_equal(v.kind, "int") { return str_parse_int(v.sval); }
-    return default;
+    if !str_equal(v.kind, "int") { return default; }
+    var s: str = v.sval;
+    if str_starts_with(s, "0x") || str_starts_with(s, "0o") {
+        var base: i64 = 16;
+        if str_starts_with(s, "0o") { base = 8; }
+        var r: i64 = 0;
+        var i: i64 = 2;
+        while i < str_len(s) {
+            r = r * base + y_hexval(str_byte_at(s, i));
+            i = i + 1;
+        }
+        return r;
+    }
+    if str_starts_with(s, "+") { s = str_slice(s, 1, str_len(s)); }
+    return str_parse_int(s);
 }
 
 pub fn yaml_get_float(doc: Vec<YamlEntry>, path: str, default: f64) -> f64 {
     var v: YamlValue = yaml_get(doc, path);
-    if str_equal(v.kind, "float") || str_equal(v.kind, "int") {
+    if str_equal(v.kind, "int") { return yaml_get_int(doc, path, 0) as f64; }
+    if str_equal(v.kind, "float") && !str_contains(v.sval, "inf") && !str_contains(v.sval, "nan") {
         return str_parse_float(v.sval);
     }
     return default;
@@ -352,11 +1264,12 @@ pub fn yaml_get_bool(doc: Vec<YamlEntry>, path: str, default: bool) -> bool {
 /// Number of items in the list at `path` (0 if not a list).
 pub fn yaml_list_len(doc: Vec<YamlEntry>, path: str) -> i64 {
     var prefix: str = path + ".";
+    if str_len(path) == 0 { prefix = ""; }
     var count: i64 = 0;
     var i: i64 = 0;
     while i < doc.len() {
         var p: str = doc.get(i).path;
-        if str_starts_with(p, prefix) {
+        if str_starts_with(p, prefix) && str_len(p) > str_len(prefix) {
             var rest: str = str_slice(p, str_len(prefix), str_len(p));
             if !str_contains(rest, ".") && str_is_numeric(rest) { count = count + 1; }
         }

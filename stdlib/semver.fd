@@ -86,6 +86,14 @@ fn sv_valid_idents(s: str, numeric_rules: bool) -> bool {
 
 /// Parse a SemVer string. Returns a SemVer with major == -1 on failure;
 /// check with semver_is_valid(v) or semver_is_valid_str(s) first.
+///
+/// Example:
+///   var v = semver_parse("1.4.2-beta.1+build.7");
+///   assert_eq(v.major, 1);
+///   assert_eq(v.patch, 2);
+///   assert_eq(v.pre, "beta.1");
+///   assert_eq(v.build, "build.7");
+///   assert(!semver_is_valid(semver_parse("1.x")));
 pub fn semver_parse(s: str) -> SemVer {
     var work: str = str_trim(s);
     var build: str = "";
@@ -125,16 +133,26 @@ pub fn semver_parse(s: str) -> SemVer {
 }
 
 /// True if `v` is a successfully parsed version.
+///
+/// Example:
+///   assert(semver_is_valid(semver_parse("0.1.0")));
 pub fn semver_is_valid(v: SemVer) -> bool {
     return v.major >= 0;
 }
 
 /// True if `s` parses as a valid SemVer string.
+///
+/// Example:
+///   assert(semver_is_valid_str("2.0.0-rc.1"));
+///   assert(!semver_is_valid_str("01.0.0"));
 pub fn semver_is_valid_str(s: str) -> bool {
     return semver_is_valid(semver_parse(s));
 }
 
 /// Format back to canonical SemVer text (build metadata preserved).
+///
+/// Example:
+///   assert_eq(semver_to_str(semver_parse(" 1.2.3+meta ")), "1.2.3+meta");
 pub fn semver_to_str(v: SemVer) -> str {
     if v.major < 0 { return "invalid"; }
     var s: str = int_to_str(v.major) + "." + int_to_str(v.minor) + "." + int_to_str(v.patch);
@@ -184,6 +202,10 @@ fn sv_pre_compare(a: str, b: str) -> i64 {
 }
 
 /// Compare two versions: -1 if a < b, 0 if equal precedence, 1 if a > b.
+///
+/// Example:
+///   assert_eq(semver_compare(semver_parse("1.0.0-alpha"), semver_parse("1.0.0")), -1);
+///   assert_eq(semver_compare(semver_parse("1.10.0"), semver_parse("1.9.9")), 1);
 pub fn semver_compare(a: SemVer, b: SemVer) -> i64 {
     if a.major < b.major { return -1; }
     if a.major > b.major { return 1; }
@@ -195,18 +217,33 @@ pub fn semver_compare(a: SemVer, b: SemVer) -> i64 {
 }
 
 /// Compare two version strings. Invalid versions sort before all valid ones.
+///
+/// Example:
+///   assert_eq(semver_compare_str("2.0.0", "2.0.0+build"), 0);
 pub fn semver_compare_str(a: str, b: str) -> i64 {
     return semver_compare(semver_parse(a), semver_parse(b));
 }
 
+/// Whether the versions have equal precedence (build metadata ignored).
+///
+/// Example:
+///   assert(semver_eq(semver_parse("1.0.0+a"), semver_parse("1.0.0+b")));
 pub fn semver_eq(a: SemVer, b: SemVer) -> bool {
     return semver_compare(a, b) == 0;
 }
 
+/// Whether `a` has lower precedence than `b`.
+///
+/// Example:
+///   assert(semver_lt(semver_parse("1.0.0-rc.1"), semver_parse("1.0.0")));
 pub fn semver_lt(a: SemVer, b: SemVer) -> bool {
     return semver_compare(a, b) < 0;
 }
 
+/// Whether `a` has higher precedence than `b`.
+///
+/// Example:
+///   assert(semver_gt(semver_parse("2.0.0"), semver_parse("1.99.99")));
 pub fn semver_gt(a: SemVer, b: SemVer) -> bool {
     return semver_compare(a, b) > 0;
 }
@@ -263,6 +300,13 @@ fn sv_pad(version_text: str) -> str {
 
 /// True if version `v` satisfies range expression `range`.
 /// Examples: "*", "1.2.3", "^1.2", "~1.4.0", ">=1.0 <2.0".
+///
+/// Example:
+///   var v = semver_parse("1.4.7");
+///   assert(semver_satisfies(v, "^1.2"));
+///   assert(semver_satisfies(v, "~1.4.0"));
+///   assert(semver_satisfies(v, ">=1.0 <2.0"));
+///   assert(!semver_satisfies(v, "^2"));
 pub fn semver_satisfies(v: SemVer, range: str) -> bool {
     if v.major < 0 { return false; }
     var r: str = str_trim(range);
@@ -281,6 +325,9 @@ pub fn semver_satisfies(v: SemVer, range: str) -> bool {
 }
 
 /// Convenience: semver_satisfies(semver_parse(v), range).
+///
+/// Example:
+///   assert(semver_satisfies_str("0.3.1", "*"));
 pub fn semver_satisfies_str(v: str, range: str) -> bool {
     return semver_satisfies(semver_parse(v), range);
 }
@@ -387,6 +434,11 @@ fn sv_match_token(v: SemVer, t: str) -> bool {
 
 /// Highest-precedence version in a list of version strings.
 /// Returns "" when the list is empty or contains no valid versions.
+///
+/// Example:
+///   var vs: Vec<str> = Vec::new();
+///   vs.push("1.2.0"); vs.push("1.10.0"); vs.push("bogus"); vs.push("1.9.3");
+///   assert_eq(semver_max(vs), "1.10.0");
 pub fn semver_max(versions: Vec) -> str {
     var best: SemVer = sv_invalid();
     var best_s: str = "";
@@ -406,6 +458,12 @@ pub fn semver_max(versions: Vec) -> str {
 }
 
 /// Highest-precedence version satisfying `range`, or "" if none.
+///
+/// Example:
+///   var vs: Vec<str> = Vec::new();
+///   vs.push("1.2.0"); vs.push("1.10.0"); vs.push("2.0.0");
+///   assert_eq(semver_max_satisfying(vs, "<2"), "1.10.0");
+///   assert_eq(semver_max_satisfying(vs, ">3"), "");
 pub fn semver_max_satisfying(versions: Vec, range: str) -> str {
     var best: SemVer = sv_invalid();
     var best_s: str = "";

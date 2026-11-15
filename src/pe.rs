@@ -11546,7 +11546,7 @@ mod tests {
         e.lea_label(Reg::Rax, l2); e.lea_label(Reg::R14, l1);
         e.place_label(l2); e.jmp_label(l2);
         e.place_label(l1); e.jmp_label(l1);
-        e.resolve_labels();
+        e.resolve_labels(&std::collections::HashMap::new());
         // RIP-relative refs into .rdata (patched below).
         e.lea_rip(Reg::Rax, 16); e.lea_rip(Reg::R15, 0);
         e.call_rip(64); e.call_rip(128);

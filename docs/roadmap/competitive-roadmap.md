@@ -279,9 +279,11 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       (L).
       Already in `stdlib/core.fd`: open addressing with linear probing,
       tombstones (`-1` slots), 75%-load growth, FNV-1a string hash (PE
-      overrides with `pert_str_hash`'s word-at-a-time loop). Left: SIMD
-      control-byte probe groups and a stronger finalizer (FNV mixes weakly
-      in the low bits).
+      overrides with `pert_str_hash`'s word-at-a-time loop). The stronger
+      finalizer is in (checked Nov 15): string hashes go through `hm_mix`
+      (murmur3's fmix) and integer keys through `hm_int_hash` (a splitmix
+      finalizer) before `hm_index` masks them. Left: SIMD control-byte probe
+      groups.
 - [ ] RT5. `HashMap<K, V>` with unboxed keys and values (L).
 - [~] RT6. Generics fully monomorphized, so a `Vec<f64>` holds floats as floats (L).
       Done (Nov 3, verified): `val x: f64 = v.get(0)` round-trips 1.5 — the
@@ -334,9 +336,11 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       kqueue on macOS and BSD, one registration per wait (a reader and a
       writer can share a socket; a second waiter the same way uses the poll
       set); its connect no longer blocks the thread. 200 clients and a task
-      per connection: native 0.37 s (was 1.3-7 s). Left: native Linux
-      (`stdlib/linux_runtime`), the C path on Windows (WSAPoll), 1M idle
-      connections not measured.
+      per connection: native 0.37 s (was 1.3-7 s). Since then (checked
+      Nov 15): native Linux waits in epoll (`stdlib/linux_runtime/conc.fd`,
+      `pe_ep_*`, an eventfd to end a wait), and the C path on Windows uses
+      the same AFD poll as native (`P_EV`, WSAPoll only without
+      `\Device\Afd`). Left: 1M idle connections not measured.
 - [~] RT12. A timer heap, so 100,000 sleeping tasks cost nothing (M).
       Done on the PE path: `pe_runtime/conc.fd` arms deadlines in a min-heap
       (indexed removal, so finishing tasks can't dangle) and keeps fd/join/
@@ -344,7 +348,11 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       task blocks to find expirations. `tests/bootstrap/bench_sleepers.fd`
       arms 100,000 sleeping tasks and awaits them all: passes (~56 s wall,
       dominated by fiber spawn, not polling). Full suite green on all three
-      backends. Left: interp/C-path schedulers still use their own waits.
+      backends. Native Linux has the same heap (`linux_runtime/conc.fd`,
+      checked Nov 15). Left: the C path's scheduler (`__p_co_round`,
+      `__p_co_wait` in codegen_c.fd) still scans every task on each pass;
+      the interpreter runs tasks one after another, so it has no timers to
+      order.
 - [x] RT13. Growable task stacks, or checked stack limits with a clear panic (L).
       Done: a guard page under every task stack on all backends (native
       Windows: the system's own stack growth, through the TEB fields the
@@ -820,10 +828,15 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       C++11 model (SeqCst default; Acquire/Release/AcqRel/Relaxed orders
       exposed); ops verify on `--nat` (cas/xchg/fetch-add correct).
 - [~] LG13. Inline assembly on every native target (M).
-      Done (existing, verified Nov 13): `asm!` parses, lowers to `Inst::Asm`
-      and emits on PE `--nat` (x86-64) and `emit --target aarch64-linux`.
-      Left: RISC-V encoding path untested; no constraint syntax beyond the
-      fixed register set the lowerer exposes.
+      Done: `asm!` parses and lowers to `Inst::Asm` everywhere, and runs in
+      bare builds (`emit --bare`, pe_ir_stubs `pe_asm_encode`: 50+ x86-64
+      instructions, `in`/`out` registers). Corrected Nov 15 (the Nov 13 note
+      was wrong): in a normal process no back end runs the template — pe_ir,
+      nat_ir (every Linux target, `--nat`) and C all give 0 for `asm!`, and
+      the interpreter too; `test_asm.fd` relies on it (it writes `hlt` and
+      `cli`). Left: a decision on running `asm!` in processes (the C path
+      could hand the template to the C compiler's assembler on every target;
+      nat_ir would need an assembler per ISA), then AArch64/RISC-V encoders.
 - [~] LG14. `async` for every argument type, and async traits (release H9) (L).
       Done (H9): an `async fn` with `f64` or struct arguments or results runs as
       a task on the interpreter and C paths. Left: reference arguments, native
@@ -861,10 +874,29 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
 Go's lesson: a deep stdlib replaces a thousand packages. It suits our rule of
 owning what we ship.
 
-- [ ] SL1. HTTP/2 client and server (L).
-      `stdlib/http.fd` + `stdlib/http_client.fd` are HTTP/1.1 only
-      (Content-Length + chunked, keep-alive, task-per-connection); no
-      HPACK, frames, or streams exist.
+- [~] SL1. HTTP/2 client and server (L).
+      Done (Nov 15), cleartext h2c with prior knowledge: `stdlib/hpack.fd`
+      (RFC 7541: static and dynamic tables, size updates and eviction,
+      integer and string coding, Huffman both ways from the full Appendix B
+      table) and `stdlib/http2.fd` (RFC 9113: every frame type with the
+      section 6 checks, preface, SETTINGS/ACK, PING, GOAWAY, RST_STREAM,
+      stream states, connection and stream flow control, CONTINUATION).
+      `http2_serve(port, handler)` takes `http`'s handlers, many streams per
+      connection, a task per connection; client `http2_get`, `http2_post`,
+      `http2_get_many` (several streams on one connection).
+      `tests/bootstrap/test_hpack.fd` decodes every Appendix C example and
+      encodes it back to the same bytes; `test_http2_frames.fd` round-trips
+      every frame, rejects 21 malformed ones with the RFC's error codes,
+      decodes bytes captured from python-h2 and drives a connection by hand
+      (flow control, CONTINUATION, stream and connection errors).
+      Interpreter, C and native Windows give the same output. Live:
+      python-h2 and httpx (`http2=True`) against `examples/http2_server.fd`
+      (21 concurrent streams, 6 connections, 188 KB bodies under flow
+      control) and our client against our server. Left: TLS with ALPN "h2"
+      (the tls modules expose no ALPN), the h2c Upgrade from HTTP/1.1, server
+      push, acting on priorities, a SETTINGS timeout, checking content-length
+      and MAX_HEADER_LIST_SIZE, handlers on their own tasks, and native
+      `emit` of a server (pe_ir has no `p_signal_*`, which `http` uses).
 - [ ] SL2. HTTP/3 and QUIC (XL).
       Unstarted — also gated on real TLS 1.3 (SL4) since QUIC carries
       its own handshake.
@@ -1199,9 +1231,29 @@ Only this produces true production years. It starts now, at small scale.
       `ng_gen_call_std`). Windows `veil.exe` via the PE backend needs more
       RAM than a small machine has (deterministic 2 MB alloc OOM at PE
       emission). Shipped binaries are still the Rust ones.
-- [ ] AD2. The project website served by a Fides program (M).
+- [~] AD2. The project website served by a Fides program (M).
+      Done (Nov 15): `tools/site.fd` renders README, the book, cookbook,
+      guides and reference when requested, through `stdlib/markdown.fd`
+      (fixed: `_` inside words, indented fences, list continuations,
+      backslash escapes, `<https://..>` autolinks) plus tables and raw HTML,
+      with its own layout and stylesheet and no external assets; only
+      listed Markdown files are read and any path that would leave the site
+      is refused (403: `..`, encoded and doubly encoded forms, backslashes,
+      drive letters, `//`, NUL); `--port`, `--get <path>`, and `--build DIR
+      --base /fid/` for GitHub Pages (53 files, every relative link and
+      anchor resolved). `tests/bootstrap/test_site_render.fd`;
+      `docs/website.md`. Left: hosting it (a Pages workflow or a server of
+      ours), and `http_serve_scoped` once its double free is fixed
+      (known-bugs 2g.35; `http_serve` keeps about 130 KB per request).
 - [ ] AD3. `fides-os` as a standing test of bare-metal work (release G4) (M).
-- [ ] AD4. Every internal tool that can be in Fides is (M).
+- [~] AD4. Every internal tool that can be in Fides is (M).
+      Done (Nov 15): `docs/internal-tools.md` lists every script and tool
+      and what keeps it out of Fides. Ported, with the same output as the
+      originals (kept): `tools/release_notes.fd` (scripts/release-notes.py)
+      and `tools/release_checksums.fd` (scripts/release-checksums.sh). Left:
+      most drivers need a process API with timeouts, kill and parallel
+      children; `macho-check.py` and `fuzz/triage.py` can move now; the
+      shipped ark, scribe and veil are still the Rust ones (AD1).
 - [ ] AD5. A real production service of ours, on Fides, with its incidents written up
       (L).
 
@@ -1230,7 +1282,13 @@ Only this produces true production years. It starts now, at small scale.
 **Earning users**
 
 - [ ] AD12. A public launch once the beta gate is met, with honest limits (M).
-- [ ] AD13. Publish the benchmarks (BM10), and invite corrections (S).
+- [~] AD13. Publish the benchmarks (BM10), and invite corrections (S).
+      Done (Nov 15): `docs/benchmarks.md` (a page of the site): what is
+      measured and how to reproduce it, every result in the repo (Nov 2,
+      Nov 3, a Nov 15 run through C on a busy machine), where Fides loses,
+      and a corrections section pointing to GitHub issues. Left: putting it
+      online (AD2's hosting), a quiet-machine run with native numbers and
+      the spread (BM8), results kept over time (BM10).
 - [ ] AD14. Ten external projects built on Fides (XL, not only effort).
 - [ ] AD15. Ten contributors outside the core (XL, not only effort).
 - [ ] AD16. A first company running Fides in production (XL, not only effort).

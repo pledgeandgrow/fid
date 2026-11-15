@@ -31,6 +31,13 @@ pub const DEC_FLOOR: i64 = 4;
 pub const DEC_CEILING: i64 = 5;
 
 /// mantissa / 10^scale
+///
+/// Example:
+///   var price = dec_parse("19.99");
+///   var total = dec_mul(price, dec_from_i64(3));
+///   println(dec_to_str(total));
+///   assert_eq(dec_to_str(total), "59.97");
+///   assert_eq(dec_to_str(dec_add(dec_parse("0.1"), dec_parse("0.2"))), "0.3");
 pub struct Decimal {
     pub m: BigInt,
     pub scale: i64,
@@ -41,16 +48,26 @@ fn dec_pow10(k: i64) -> BigInt {
     return bigint_pow(bigint_from_i64(10), k);
 }
 
+/// The decimal 0.
+///
+/// Example:
+///   assert_eq(dec_sign(dec_zero()), 0);
 pub fn dec_zero() -> Decimal {
     return Decimal { m: bigint_zero(), scale: 0 };
 }
 
 /// The integer n as a decimal (scale 0).
+///
+/// Example:
+///   assert_eq(dec_to_str(dec_from_i64(-7)), "-7");
 pub fn dec_from_i64(n: i64) -> Decimal {
     return Decimal { m: bigint_from_i64(n), scale: 0 };
 }
 
 /// units / 10^scale: dec_from_units(1250, 2) is 12.50.
+///
+/// Example:
+///   assert_eq(dec_to_str(dec_from_units(1250, 2)), "12.50");
 pub fn dec_from_units(units: i64, scale: i64) -> Decimal {
     var s: i64 = scale;
     if s < 0 { s = 0; }
@@ -58,6 +75,10 @@ pub fn dec_from_units(units: i64, scale: i64) -> Decimal {
 }
 
 /// Parse "[-+]digits[.digits][e[-+]digits]"; anything else is 0.
+///
+/// Example:
+///   assert_eq(dec_to_str(dec_parse("-3.140")), "-3.140");
+///   assert_eq(dec_to_str(dec_parse("1.5e2")), "150");
 pub fn dec_parse(text: str) -> Decimal {
     var t: str = str_trim(text);
     var n: i64 = str_len(t);
@@ -111,6 +132,9 @@ pub fn dec_parse(text: str) -> Decimal {
 }
 
 /// The decimal as text, with exactly `scale` digits after the point.
+///
+/// Example:
+///   assert_eq(dec_to_str(dec_from_units(5, 3)), "0.005");
 pub fn dec_to_str(d: Decimal) -> str {
     var neg: bool = bigint_lt(d.m, bigint_zero());
     var digits: str = bigint_to_str(bigint_abs(d.m));
@@ -131,6 +155,10 @@ fn dec_rescale_up(d: Decimal, scale: i64) -> Decimal {
     return Decimal { m: bigint_mul(d.m, dec_pow10(scale - d.scale)), scale: scale };
 }
 
+/// a + b, exact (the scale of the result is the larger scale).
+///
+/// Example:
+///   assert_eq(dec_to_str(dec_add(dec_parse("1.25"), dec_parse("0.5"))), "1.75");
 pub fn dec_add(a: Decimal, b: Decimal) -> Decimal {
     var s: i64 = a.scale;
     if b.scale > s { s = b.scale; }
@@ -139,23 +167,42 @@ pub fn dec_add(a: Decimal, b: Decimal) -> Decimal {
     return Decimal { m: bigint_add(x.m, y.m), scale: s };
 }
 
+/// a - b, exact.
+///
+/// Example:
+///   assert_eq(dec_to_str(dec_sub(dec_parse("1"), dec_parse("0.01"))), "0.99");
 pub fn dec_sub(a: Decimal, b: Decimal) -> Decimal {
     return dec_add(a, dec_neg(b));
 }
 
+/// a * b, exact (the scales add up).
+///
+/// Example:
+///   assert_eq(dec_to_str(dec_mul(dec_parse("1.5"), dec_parse("1.5"))), "2.25");
 pub fn dec_mul(a: Decimal, b: Decimal) -> Decimal {
     return Decimal { m: bigint_mul(a.m, b.m), scale: a.scale + b.scale };
 }
 
+/// The value with its sign flipped.
+///
+/// Example:
+///   assert_eq(dec_to_str(dec_neg(dec_parse("2.5"))), "-2.5");
 pub fn dec_neg(a: Decimal) -> Decimal {
     return Decimal { m: bigint_neg(a.m), scale: a.scale };
 }
 
+/// The value without its sign.
+///
+/// Example:
+///   assert_eq(dec_to_str(dec_abs(dec_parse("-2.5"))), "2.5");
 pub fn dec_abs(a: Decimal) -> Decimal {
     return Decimal { m: bigint_abs(a.m), scale: a.scale };
 }
 
 /// -1, 0 or 1
+///
+/// Example:
+///   assert_eq(dec_sign(dec_parse("-0.1")), -1);
 pub fn dec_sign(a: Decimal) -> i64 {
     if bigint_is_zero(a.m) { return 0; }
     if bigint_lt(a.m, bigint_zero()) { return -1; }
@@ -163,12 +210,28 @@ pub fn dec_sign(a: Decimal) -> i64 {
 }
 
 /// -1, 0 or 1 by value (2.50 equals 2.5)
+///
+/// Example:
+///   assert_eq(dec_cmp(dec_parse("2.50"), dec_parse("2.5")), 0);
+///   assert_eq(dec_cmp(dec_parse("1"), dec_parse("1.01")), -1);
 pub fn dec_cmp(a: Decimal, b: Decimal) -> i64 {
     return dec_sign(dec_sub(a, b));
 }
 
+/// Whether a == b in value (2.50 equals 2.5).
+///
+/// Example:
+///   assert(dec_eq(dec_parse("2.50"), dec_parse("2.5")));
 pub fn dec_eq(a: Decimal, b: Decimal) -> bool { return dec_cmp(a, b) == 0; }
+/// Whether a < b.
+///
+/// Example:
+///   assert(dec_lt(dec_parse("0.09"), dec_parse("0.1")));
 pub fn dec_lt(a: Decimal, b: Decimal) -> bool { return dec_cmp(a, b) < 0; }
+/// Whether a > b.
+///
+/// Example:
+///   assert(dec_gt(dec_parse("0"), dec_parse("-0.5")));
 pub fn dec_gt(a: Decimal, b: Decimal) -> bool { return dec_cmp(a, b) > 0; }
 
 /// n / d (n, d >= 0, d > 0) rounded by `mode`; `neg` is the sign of the
@@ -203,6 +266,11 @@ fn dec_div_round(n: BigInt, d: BigInt, mode: i64, neg: bool) -> BigInt {
 }
 
 /// a rounded to `scale` digits after the point.
+///
+/// Example:
+///   assert_eq(dec_to_str(dec_round(dec_parse("2.345"), 2, DEC_HALF_UP)), "2.35");
+///   assert_eq(dec_to_str(dec_round(dec_parse("2.345"), 2, DEC_HALF_EVEN)), "2.34");
+///   assert_eq(dec_to_str(dec_round(dec_parse("2.349"), 2, DEC_DOWN)), "2.34");
 pub fn dec_round(a: Decimal, scale: i64, mode: i64) -> Decimal {
     if scale >= a.scale { return dec_rescale_up(a, scale); }
     var neg: bool = dec_sign(a) < 0;
@@ -213,6 +281,10 @@ pub fn dec_round(a: Decimal, scale: i64, mode: i64) -> Decimal {
 
 /// a / b with `scale` digits after the point, rounded by `mode`. Division
 /// by zero panics.
+///
+/// Example:
+///   var third = dec_div(dec_from_i64(1), dec_from_i64(3), 4, DEC_HALF_EVEN);
+///   assert_eq(dec_to_str(third), "0.3333");
 pub fn dec_div(a: Decimal, b: Decimal, scale: i64, mode: i64) -> Decimal {
     if bigint_is_zero(b.m) { panic("decimal division by zero"); }
     // a.m / 10^as / (b.m / 10^bs) = a.m * 10^(bs - as) / b.m
@@ -228,6 +300,9 @@ pub fn dec_div(a: Decimal, b: Decimal, scale: i64, mode: i64) -> Decimal {
 }
 
 /// The same value with no trailing zeros after the point (2.500 -> 2.5).
+///
+/// Example:
+///   assert_eq(dec_to_str(dec_normalize(dec_parse("2.500"))), "2.5");
 pub fn dec_normalize(a: Decimal) -> Decimal {
     var m: BigInt = a.m;
     var s: i64 = a.scale;
@@ -242,6 +317,9 @@ pub fn dec_normalize(a: Decimal) -> Decimal {
 }
 
 /// The integer part, rounded toward zero, if it fits in an i64.
+///
+/// Example:
+///   assert_eq(dec_to_i64(dec_parse("-12.9")), -12);
 pub fn dec_to_i64(a: Decimal) -> i64 {
     return bigint_to_i64(dec_round(a, 0, DEC_DOWN).m);
 }

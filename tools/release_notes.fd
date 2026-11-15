@@ -1,0 +1,130 @@
+// tools/release_notes.fd — release notes from docs/reference/changelog.md
+// (CU6), the Fides port of scripts/release-notes.py (roadmap AD4). Same
+// arguments, same output:
+//
+//   fid run tools/release_notes.fd [--all] [changelog-path]
+//
+// Prints the newest '## ' section (the upcoming release) as Markdown. Lines
+// mentioning 'breaking' (any case) are collected into a "Breaking changes"
+// section at the top, matching stability.md's promise to name them. With
+// --all, every section, each followed by a blank line.
+//
+// One difference: Python's splitlines() also breaks lines at form feeds and
+// Unicode line separators; this splits at "\n" only ("\r" is dropped).
+
+use core;
+use args;
+use fs;
+use io;
+
+/// The '## ' sections of `lines`: each starts with its heading line;
+/// lines before the first heading are dropped.
+pub fn rn_sections(lines: Vec<str>) -> Vec<Vec<str>> {
+    var out: Vec<Vec<str>> = Vec::new();
+    var cur: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < lines.len() {
+        val l: str = lines.get(i);
+        if str_starts_with(l, "## ") && cur.len() > 0 {
+            out.push(cur);
+            cur = Vec::new();
+            cur.push(l);
+        } else if cur.len() > 0 || str_starts_with(l, "## ") {
+            cur.push(l);
+        }
+        i = i + 1;
+    }
+    if cur.len() > 0 { out.push(cur); }
+    return out;
+}
+
+/// `parts` joined by `sep`, pairwise (no quadratic copying).
+pub fn rn_join(parts: Vec<str>, sep: str) -> str {
+    if parts.len() == 0 { return ""; }
+    var cur: Vec<str> = parts;
+    while cur.len() > 1 {
+        var next: Vec<str> = Vec::new();
+        var i: i64 = 0;
+        while i + 1 < cur.len() {
+            next.push(cur.get(i) + sep + cur.get(i + 1));
+            i = i + 2;
+        }
+        if i < cur.len() { next.push(cur.get(i)); }
+        cur = next;
+    }
+    return cur.get(0);
+}
+
+fn rn_breaking(l: str) -> bool {
+    return str_contains(str_to_lower(l), "breaking");
+}
+
+/// One section as release notes, ending in a single "\n".
+pub fn rn_render(sec: Vec<str>) -> str {
+    val title: str = str_trim(str_slice(str_trim_end(sec.get(0)), 3, str_len(str_trim_end(sec.get(0)))));
+    var out: Vec<str> = Vec::new();
+    out.push("# Release notes — " + title);
+    out.push("");
+    var breaking: Vec<str> = Vec::new();
+    var keep: Vec<str> = Vec::new();
+    var i: i64 = 1;
+    while i < sec.len() {
+        val l: str = str_trim_end(sec.get(i));
+        if rn_breaking(l) { breaking.push(l); } else { keep.push(l); }
+        i = i + 1;
+    }
+    if breaking.len() > 0 {
+        out.push("## Breaking changes");
+        out.push("");
+        i = 0;
+        while i < breaking.len() {
+            out.push(breaking.get(i));
+            i = i + 1;
+        }
+        out.push("");
+    }
+    i = 0;
+    while i < keep.len() {
+        out.push(keep.get(i));
+        i = i + 1;
+    }
+    // '\n'.join(out).rstrip() + '\n'
+    return str_trim_end(rn_join(out, "\n")) + "\n";
+}
+
+fn main() -> i64 {
+    val av: Vec<str> = args_all();
+    var path: str = "docs/reference/changelog.md";
+    var all: bool = false;
+    var found: bool = false;
+    var i: i64 = 1;
+    while i < av.len() {
+        val a: str = av.get(i);
+        if a == "--all" { all = true; }
+        if !found && !str_starts_with(a, "-") {
+            path = a;
+            found = true;
+        }
+        i = i + 1;
+    }
+    if !fs_is_file(path) {
+        io_eprintln("release_notes: cannot read " + path);
+        return 1;
+    }
+    val text: str = str_replace(fs_read_text(path), "\r", "");
+    val secs: Vec<Vec<str>> = rn_sections(str_lines(text));
+    if secs.len() == 0 {
+        io_eprintln("no sections in " + path);
+        return 1;
+    }
+    if all {
+        i = 0;
+        while i < secs.len() {
+            print(rn_render(secs.get(i)) + "\n");
+            i = i + 1;
+        }
+    } else {
+        print(rn_render(secs.get(0)));
+    }
+    return 0;
+}

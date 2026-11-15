@@ -643,7 +643,7 @@ fn pe_resolve6(host: i64, out: i64) -> bool {
     var n: i64 = pe_len(host);
     if pe_parse_ipv6(host, n, out) { return true; }
     var text: i64 = pert_file_read("/etc/hosts" as i64) as i64;
-    if text == 0 { return false; }
+    if text == 0 { return nat_os() != 1 && pe_dns_query(host, 28, out); }
     var tl: i64 = pe_len(text);
     var at: i64 = 0;
     var found: bool = false;
@@ -676,10 +676,176 @@ fn pe_resolve6(host: i64, out: i64) -> bool {
     }
     pert_free(addr);
     p_str_free(text);
+    if !found && nat_os() != 1 { found = pe_dns_query(host, 28, out); }
     return found;
 }
 
-/// The IPv4 address of host, or -1: a dotted quad, localhost, /etc/hosts.
+// ─── DNS (competitive SL5) ──────────────────────────────────────────────
+// A name /etc/hosts does not have is asked of the first IPv4 nameserver in
+// /etc/resolv.conf: one UDP query (recursion desired) for an A or AAAA
+// record, two tries of 2 s each, the first answer record of that type.
+// CNAME chains are followed by the resolver, which puts the address
+// records after them in the same answer. No cache (stdlib/dns.fd has one).
+// The wait blocks the thread (pe_poll_fd), as /etc/hosts reading does.
+
+/// The first IPv4 nameserver of /etc/resolv.conf, as a word of wire bytes,
+/// or -1.
+fn pe_dns_server() -> i64 {
+    var text: i64 = pert_file_read("/etc/resolv.conf" as i64) as i64;
+    if text == 0 { return 0 - 1; }
+    var tl: i64 = pe_len(text);
+    var at: i64 = 0;
+    var found: i64 = 0 - 1;
+    while at < tl && found < 0 {
+        var eol: i64 = at;
+        while eol < tl && pe_ldb(text + eol) != 10 { eol = eol + 1; }
+        var a: i64 = at;
+        while a < eol && (pe_ldb(text + a) == 32 || pe_ldb(text + a) == 9) { a = a + 1; }
+        // "nameserver", blanks, the address
+        if eol - a > 11 && pe_ldb(text + a) == 110 && pe_ldb(text + a + 4) == 115
+            && pe_ldb(text + a + 9) == 114 {
+            var b: i64 = a + 10;
+            while b < eol && (pe_ldb(text + b) == 32 || pe_ldb(text + b) == 9) { b = b + 1; }
+            var c: i64 = b;
+            while c < eol && pe_ldb(text + c) != 32 && pe_ldb(text + c) != 9 && pe_ldb(text + c) != 13 && pe_ldb(text + c) != 35 { c = c + 1; }
+            found = pe_parse_ipv4(text + b, c - b);
+        }
+        at = eol + 1;
+    }
+    p_str_free(text);
+    return found;
+}
+
+/// The end of the (possibly compressed) name at pos in the message of n
+/// bytes, or -1 when it runs past the end.
+fn pe_dns_skip_name(m: i64, n: i64, pos: i64) -> i64 {
+    var p: i64 = pos;
+    var guard: i64 = 0;
+    while p < n && guard < 128 {
+        var len: i64 = pe_ldb(m + p);
+        if len == 0 { return p + 1; }
+        if (len & 192) == 192 {
+            if p + 2 > n { return 0 - 1; }
+            return p + 2;
+        }
+        if (len & 192) != 0 { return 0 - 1; }
+        p = p + 1 + len;
+        guard = guard + 1;
+    }
+    return 0 - 1;
+}
+
+/// The first answer of type qtype (1 A, 28 AAAA) for host, its 4 or 16
+/// address bytes at out: true when there is one.
+fn pe_dns_query(host: i64, qtype: i64, out: i64) -> bool {
+    var hl: i64 = pe_len(host);
+    if hl == 0 || hl > 253 { return false; }
+    var ns: i64 = pe_dns_server();
+    if ns < 0 { return false; }
+    var q: i64 = pe_zeroed(64);                     // 512 bytes
+    var id: i64 = pe_now_ns() & 65535;
+    pe_stb(q, id >> 8);
+    pe_stb(q + 1, id & 255);
+    pe_stb(q + 2, 1);                               // RD
+    pe_stb(q + 5, 1);                               // one question
+    // the name as labels
+    var w: i64 = 12;
+    var i: i64 = 0;
+    var ok: bool = true;
+    while i < hl && ok {
+        var j: i64 = i;
+        while j < hl && pe_ldb(host + j) != 46 { j = j + 1; }
+        var ll: i64 = j - i;
+        if ll == 0 || ll > 63 {
+            ok = false;
+        } else {
+            pe_stb(q + w, ll);
+            var k: i64 = 0;
+            while k < ll {
+                pe_stb(q + w + 1 + k, pe_ldb(host + i + k));
+                k = k + 1;
+            }
+            w = w + 1 + ll;
+        }
+        i = j + 1;
+    }
+    if !ok {
+        pert_free(q);
+        return false;
+    }
+    pe_stb(q + w, 0);
+    pe_stb(q + w + 2, qtype);
+    pe_stb(q + w + 4, 1);                           // class IN
+    var qlen: i64 = w + 5;
+    var s: i64 = pe_sys(PE_SYS_SOCKET, 2, 2, 0);    // AF_INET, SOCK_DGRAM
+    if s < 0 {
+        pert_free(q);
+        return false;
+    }
+    var sa: i64 = pe_sockaddr(ns, 53);
+    var found: bool = false;
+    if pe_sys(PE_SYS_CONNECT, s, sa, 16) == 0 {
+        var r: i64 = pe_zeroed(64);
+        var tries: i64 = 0;
+        while tries < 2 && !found {
+            tries = tries + 1;
+            if nat_syscall(PE_SYS_SENDTO, s, q, qlen, 0, 0, 0) == qlen && pe_poll_fd(s, 0, 2000) == 1 {
+                var n: i64 = nat_syscall(PE_SYS_RECVFROM, s, r, 512, 0, 0, 0);
+                var rid: i64 = 0;
+                if n >= 12 { rid = (pe_ldb(r) << 8) | pe_ldb(r + 1); }
+                // our id, a response, no error
+                if n >= 12 && rid == id && (pe_ldb(r + 2) & 128) != 0 && (pe_ldb(r + 3) & 15) == 0 {
+                    var qd: i64 = (pe_ldb(r + 4) << 8) | pe_ldb(r + 5);
+                    var an: i64 = (pe_ldb(r + 6) << 8) | pe_ldb(r + 7);
+                    var p: i64 = 12;
+                    var qi: i64 = 0;
+                    while qi < qd && p >= 0 {
+                        p = pe_dns_skip_name(r, n, p);
+                        if p >= 0 { p = p + 4; }
+                        qi = qi + 1;
+                    }
+                    var ai: i64 = 0;
+                    while ai < an && p >= 0 && !found {
+                        p = pe_dns_skip_name(r, n, p);
+                        if p >= 0 && p + 10 <= n {
+                            var ty: i64 = (pe_ldb(r + p) << 8) | pe_ldb(r + p + 1);
+                            var rdl: i64 = (pe_ldb(r + p + 8) << 8) | pe_ldb(r + p + 9);
+                            p = p + 10;
+                            if p + rdl > n {
+                                p = 0 - 1;
+                            } else {
+                                var want: i64 = 4;
+                                if qtype == 28 { want = 16; }
+                                if ty == qtype && rdl == want {
+                                    var k2: i64 = 0;
+                                    while k2 < want {
+                                        pe_stb(out + k2, pe_ldb(r + p + k2));
+                                        k2 = k2 + 1;
+                                    }
+                                    found = true;
+                                }
+                                p = p + rdl;
+                            }
+                        } else {
+                            p = 0 - 1;
+                        }
+                        ai = ai + 1;
+                    }
+                    // an answer without the record is final: no second try
+                    tries = 2;
+                }
+            }
+        }
+        pert_free(r);
+    }
+    pe_sys(PE_SYS_CLOSE, s, 0, 0);
+    pert_free(sa);
+    pert_free(q);
+    return found;
+}
+
+/// The IPv4 address of host, or -1: a dotted quad, localhost, /etc/hosts,
+/// then DNS.
 fn pe_resolve(host: i64) -> i64 {
     // Windows: the system resolver, through win.fd (its syscall 1001)
     if nat_os() == 1 { return nat_syscall(1001, host, 0, 0, 0, 0, 0); }
@@ -688,7 +854,7 @@ fn pe_resolve(host: i64) -> i64 {
     if direct >= 0 { return direct; }
     if pert_str_equal(host, "localhost" as i64) { return 16777343; }   // 127.0.0.1
     var text: i64 = pert_file_read("/etc/hosts" as i64) as i64;
-    if text == 0 { return 0 - 1; }
+    if text == 0 { return pe_dns4(host); }
     var tl: i64 = pe_len(text);
     var at: i64 = 0;
     var found: i64 = 0 - 1;
@@ -716,6 +882,16 @@ fn pe_resolve(host: i64) -> i64 {
         at = eol + 1;
     }
     p_str_free(text);
+    if found < 0 { found = pe_dns4(host); }
+    return found;
+}
+
+/// The IPv4 address DNS gives for host, or -1.
+fn pe_dns4(host: i64) -> i64 {
+    var found: i64 = 0 - 1;
+    var a4: i64 = pe_zeroed(1);
+    if pe_dns_query(host, 1, a4) { found = pe_ld(a4) & 4294967295; }
+    pert_free(a4);
     return found;
 }
 
